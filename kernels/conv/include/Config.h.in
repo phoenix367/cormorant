@@ -68,9 +68,10 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
 //                  replayed in (r,mt,m1) order.
 //   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds one
-//                  output CHUNK's chunk_oh_count*out_w*out_ch AccData_t
-//                  accumulators that survive across ic-tiles within the
-//                  chunk; initialised from bias at chunk start and
+//                  output CHUNK's chunk_oh_count*out_w*out_ch_padded
+//                  AccData_t accumulators (out_ch padded up to a multiple
+//                  of kTileM so each m-tile is one aligned reshaped word)
+//                  that survive across ic-tiles within the chunk; initialised from bias at chunk start and
 //                  drained to acc_stream at chunk end.  Chunking along
 //                  the oh axis lets the kernel handle outputs larger
 //                  than the buffer; see compute_oh_chunking() in
@@ -84,7 +85,8 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //   out_ch   <= kMaxOutCh
 //   (kh-1)*dilation_h + 1 <= kMaxLineBufRows   (kernel-height window fits)
 //   (kw-1)*dilation_w + 1 <= kMaxLineBufCols   (kernel-width window fits)
-//   out_w * out_ch <= kMaxAccPersistEntries     (one output row fits)
+//   out_w * ceil(out_ch/kTileM)*kTileM <= kMaxAccPersistEntries
+//                                              (one kTileM-padded output row fits)
 //
 // in_h, in_w, and out_h are NOT capped by the kernel — wider/taller layers
 // are handled by oh-chunking and ow-tiling, which split those axes into

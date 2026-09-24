@@ -79,7 +79,7 @@ If Vitis HLS headers are unavailable at CMake configure time, both types fall ba
 - `in_ch ≤ kMaxInCh`, `out_ch ≤ kMaxOutCh`
 - `(kh-1)·dilation_h + 1 ≤ kMaxLineBufRows` *(one kernel-height window must fit)*
 - `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(one kernel-width window must fit)*
-- `out_w · out_ch ≤ kMaxAccPersistEntries` *(was the stricter `out_h · out_w · out_ch ≤ …` before oh-chunking)*
+- `out_w · ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries` *(one kTileM-padded output row fits; was `out_w · out_ch` before the §2.23 padded layout, and the stricter `out_h · out_w · out_ch ≤ …` before oh-chunking)*
 
 `in_h`, `in_w`, and `out_h` are NOT capped — wider / taller layers are handled by transparent tiling:
 
@@ -88,6 +88,14 @@ If Vitis HLS headers are unavailable at CMake configure time, both types fall ba
 - `m_tiles > kMaxMperGroup` triggers **M-grouping** (weight cache holds one M-group at a time; §5.5).
 
 All three split axes accept duplicate DDR reads at tile/chunk boundaries — the explicit trade-off in exchange for unbounded layer dimensions.
+
+**Chunk-height cap under M-grouping (kernel-internal, not a scheduler constraint).**  With more than one M-group the patch producer replays each chunk's `(oh, ow)` sweep from `line_buf` once per group without touching DDR, so every input row the chunk needs must still be resident when the second group restarts at the chunk's first `oh`.  `line_buf` holds only `kMaxLineBufRows` rows (circular slot `ih & (kMaxLineBufRows-1)`), hence `compute_conv_geometry()` additionally clamps
+
+```
+(oh_per_chunk - 1)·stride_h + (kh-1)·dilation_h + 1  ≤  kMaxLineBufRows      (standard path, num_m_groups > 1)
+```
+
+i.e. `oh_per_chunk ≤ (kMaxLineBufRows - ((kh-1)·dilation_h + 1)) / stride_h + 1`.  Layers that hit this cap run more, shorter chunks (weights and bias re-streamed per chunk) but keep the read-`x`-once property.  Depthwise runs a single group and is unaffected.  Before this cap existed, any layer with `out_ch > kTileM·kMaxMperGroup` and a chunk spanning more than `kMaxLineBufRows` input rows (e.g. every ResNet-18 stage-1 conv, the 7×7 stem) silently produced wrong outputs for groups ≥ 1; see CONV_OPTIMISATION.md §2.21.
 
 ---
 

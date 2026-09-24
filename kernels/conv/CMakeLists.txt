@@ -175,7 +175,18 @@ target_link_libraries(TestConvRef PRIVATE conv_kernel)
 target_compile_options(TestConvRef PRIVATE -Wall -Wextra -O2)
 
 enable_testing()
-add_test(NAME TestConvRef COMMAND TestConvRef)
+add_test(NAME TestConvRef   COMMAND TestConvRef)
+
+# TestConvGrid — MAC-array unit test on include/ConvMacGrid.h alone (no
+# geometry, no DDR model); the gate for changes to the grid itself.
+add_executable(TestConvGrid test/TestConvGrid.cpp)
+target_link_libraries(TestConvGrid PRIVATE conv_kernel)
+target_compile_options(TestConvGrid PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
+add_test(NAME TestConvGrid  COMMAND TestConvGrid)
+# Randomised-geometry sweep (bit-exact vs the naive oracle) — covers the
+# interactions between chunking / M-grouping / ow-tiling / padding that the
+# named cases exercise one at a time.  ~1 min.
+add_test(NAME TestConvSweep COMMAND TestConvRef --sweep 300)
 
 # ---------------------------------------------------------------------------
 # gen_conv_test_data — regenerate hex fixtures for the HDL testbench.

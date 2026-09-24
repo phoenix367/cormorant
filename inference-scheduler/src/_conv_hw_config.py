@@ -47,13 +47,17 @@ Platform selection (lower entries override higher ones):
 Missing / malformed fields raise ``ConvHwConfigError`` rather than
 silently falling back to defaults.
 
-``tile_m``, ``tile_ic``, ``max_kh``, ``max_kw`` are read but not
-exported to the validator: ``kTileM`` / ``kTileIC`` are pure unrolling
-factors (any out_ch / in_ch is residual-padded), and the kernel-size
-bounds are already validated against weight tensor rank earlier in
-ConvNode.  The five bounds exported here are the ones the scheduler
-must enforce ahead of codegen — see ``doc/CONV_KERNEL.md`` §3
-"Runtime constraints validated by the inference scheduler".
+``tile_ic``, ``max_kh``, ``max_kw`` are read but not exported to the
+validator: ``kTileIC`` is a pure unrolling factor (any in_ch is
+residual-padded), and the kernel-size bounds are already validated
+against weight tensor rank earlier in ConvNode.  ``tile_m`` IS exported
+(``CONV_TILE_M``) because the kernel's persistent accumulator pads
+out_ch up to a multiple of kTileM (ConvKernel.cpp §2.23 layout), so the
+capacity rule the scheduler must enforce is
+``out_w * ceil(out_ch / kTileM) * kTileM <= kMaxAccPersistEntries``.
+The bounds exported here are the ones the scheduler must enforce ahead
+of codegen — see ``doc/CONV_KERNEL.md`` §3 "Runtime constraints
+validated by the inference scheduler".
 """
 
 from __future__ import annotations
@@ -80,6 +84,7 @@ _REQUIRED: Tuple[Tuple[str, str], ...] = (
     ("max_line_buf_rows",       "CONV_MAX_LINE_BUF_ROWS"),
     ("max_line_buf_cols",       "CONV_MAX_LINE_BUF_COLS"),
     ("max_acc_persist_entries", "CONV_MAX_ACC_PERSIST_ENTRIES"),
+    ("tile_m",                  "CONV_TILE_M"),
 )
 
 
@@ -158,6 +163,7 @@ CONV_MAX_OUT_CH              : int = _CFG["CONV_MAX_OUT_CH"]
 CONV_MAX_LINE_BUF_ROWS       : int = _CFG["CONV_MAX_LINE_BUF_ROWS"]
 CONV_MAX_LINE_BUF_COLS       : int = _CFG["CONV_MAX_LINE_BUF_COLS"]
 CONV_MAX_ACC_PERSIST_ENTRIES : int = _CFG["CONV_MAX_ACC_PERSIST_ENTRIES"]
+CONV_TILE_M                  : int = _CFG["CONV_TILE_M"]
 
 
 __all__ = (
@@ -166,6 +172,7 @@ __all__ = (
     "CONV_MAX_LINE_BUF_ROWS",
     "CONV_MAX_LINE_BUF_COLS",
     "CONV_MAX_ACC_PERSIST_ENTRIES",
+    "CONV_TILE_M",
     "ConvHwConfigError",
     "resolve",
 )

@@ -23,10 +23,13 @@
 //     buffers the patch on-chip, then broadcasts it m_tiles times into
 //     patch_stream — eliminating the m_tiles× DDR re-read of x.
 //   * bias_producer loads the entire bias vector once into bias_buf and
-//     streams it in (r, mt, m1) order to match the consumer's new nest.
+//     streams one kTileM-lane BiasVec per (r, mt) — one padded accumulator
+//     word per beat (§2.25).
 //   * process_conv_kernel_tile iterates (ni, oh, ow, mt) — same patch is
 //     consumed by every output-channel tile back-to-back.
-//   * write_output_tile drains acc_stream in (ni, oh, ow, mt, m1) order.
+//   * write_output_tile drains acc_stream in (ni, chunk, mt, m1, oh, ow)
+//     order — channel-major so each channel's chunk rows are one
+//     contiguous DDR run (write bursts, §2.22).
 //
 // Loop structure — standard conv (is_depthwise=0):
 //
@@ -62,6 +65,7 @@
 #include "hls_task.h"
 
 #include "ConvKernel.h"
+#include "ConvMacGrid.h"
 
 #ifndef __SYNTHESIS__
 #define DEBUG_LOAD_DATA_CACHING
@@ -86,7 +90,22 @@ struct PatchVec {
     Data_t lane[kTileIC];
 };
 
+// ---------------------------------------------------------------------------
+// BiasVec — one m-tile of initial accumulator values per stream beat (§2.25).
+//
+// bias_producer used to push one AccData_t per (pixel, mt, m1); the
+// consumer's Phase 1 then spent m_valid cycles per (pixel, mt) filling the
+// padded accumulator word lane by lane.  With the §2.23 word layout Phase 1
+// wants exactly one kTileM-lane word per (pixel, mt), so the stream now
+// carries it pre-packed: lanes >= m_valid are zero (the padding lanes).
+// ---------------------------------------------------------------------------
+struct BiasVec {
+    AccData_t lane[kTileM];
+};
+
 #ifdef DEBUG_LOAD_DATA_CACHING
+#include <cassert>
+#include <cstdlib>
 #include <map>
 #include <list>
 #include <iostream>
@@ -132,8 +151,14 @@ typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
 // catastrophe), the kernel splits the output along the oh axis into chunks
 // whose footprint fits the buffer:
 //
-//     oh_per_chunk = max(1, kMaxAccPersistEntries / (out_w · out_ch))
+//     oh_per_chunk = max(1, kMaxAccPersistEntries / (out_w · out_ch_padded))
 //     num_chunks   = ceil(out_h / oh_per_chunk)
+//
+// where out_ch_padded = ceil(out_ch / kTileM)·kTileM is the accumulator
+// buffer's channel stride (§2.23): partial_outputs is laid out
+// [pixel][m_tile][kTileM] so every m-tile's 8 lanes form one aligned,
+// reshaped 256-bit word and the consumer loads / stores a whole tile's
+// accumulators in ONE cycle instead of m_valid cycles.
 //
 // Each chunk runs the full Option-A pipeline for its oh sub-range; between
 // chunks the patch producer's line_buf is invalidated so the kh-row sliding
@@ -144,8 +169,23 @@ typedef std::map<size_t, std::list<CycleCounters>> AddressMap_t;
 // bandwidth); for the depthwise path the small weight slice is reloaded
 // num_chunks times per (ni, mt).
 //
-// Relaxed constraint: out_w · out_ch  ≤  kMaxAccPersistEntries
-// (was: out_h · out_w · out_ch  ≤  kMaxAccPersistEntries).
+// Relaxed constraint: out_w · ceil(out_ch/kTileM)·kTileM  ≤  kMaxAccPersistEntries
+// (was: out_h · out_w · out_ch  ≤  kMaxAccPersistEntries; the kTileM
+// padding is the §2.23 layout and is mirrored by the scheduler validator).
+//
+// Second bound — line_buf residency under M-grouping (standard path only):
+// when num_m_groups > 1 the patch producer replays a chunk's whole
+// (oh, ow) sweep from line_buf once per M-group WITHOUT re-reading DDR.
+// line_buf holds only kMaxLineBufRows rows (circular slot = ih & mask),
+// so every input row the chunk touches must still be resident when the
+// second group restarts at the chunk's first oh:
+//
+//     (oh_per_chunk - 1)·stride_h + (kh-1)·dilation_h + 1  ≤  kMaxLineBufRows
+//
+// compute_conv_geometry() clamps oh_per_chunk to that bound whenever more
+// than one M-group is in play.  The cost is more chunks (weights and bias
+// are re-streamed per chunk); the alternative — reloading x per M-group —
+// would give up the read-x-once property the grouping exists for.
 //
 // When out_w · out_ch > kMaxAccPersistEntries the buffer cannot hold even
 // one output row.  oh_per_chunk is clamped to 1 in that case so the kernel
@@ -157,7 +197,8 @@ static inline void compute_oh_chunking(
     unsigned out_h, unsigned out_w, unsigned out_ch,
     unsigned& oh_per_chunk, unsigned& num_chunks
 ) {
-    const unsigned row_size = out_w * out_ch;
+    const unsigned m_tiles  = (out_ch + kTileM - 1) / kTileM;
+    const unsigned row_size = out_w * (m_tiles * kTileM);   // padded stride
     unsigned per = (row_size > 0) ? (kMaxAccPersistEntries / row_size) : out_h;
     if (per == 0)        per = 1;
     if (per > out_h)     per = out_h;
@@ -264,7 +305,10 @@ struct ConvGeometry {
 
 static inline ConvGeometry compute_conv_geometry(
     unsigned out_h, unsigned out_w, unsigned out_ch,
-    unsigned kw, unsigned stride_w, unsigned dilation_w
+    unsigned kh, unsigned kw,
+    unsigned stride_h, unsigned stride_w,
+    unsigned dilation_h, unsigned dilation_w,
+    unsigned is_depthwise
 ) {
     // Runs once per invocation (~129 cycles).  A #pragma HLS DATAFLOW here
     // to overlap the three independent divider chains was tried and dropped:
@@ -277,156 +321,109 @@ static inline ConvGeometry compute_conv_geometry(
     compute_m_grouping (out_ch, g.mt_per_group, g.num_m_groups);
     compute_ow_tiling  (out_w, kw, stride_w, dilation_w,
                         g.ow_per_tile, g.num_ow_tiles);
+
+    // line_buf residency bound (see compute_oh_chunking header).  Only the
+    // standard path replays patches per M-group; depthwise runs one group
+    // and reloads rows as it sweeps, so it needs no cap.
+    if (!is_depthwise && g.num_m_groups > 1) {
+        const unsigned window_h = (kh - 1) * dilation_h + 1;
+        unsigned cap = 1;
+        if (window_h < kMaxLineBufRows) {
+            cap = (kMaxLineBufRows - window_h)
+                / (stride_h > 0 ? stride_h : 1) + 1;
+        }
+        if (cap < g.oh_per_chunk) {
+            g.oh_per_chunk = cap;
+            g.num_chunks   = (out_h + cap - 1) / cap;
+        }
+    }
     return g;
 }
 
 // ---------------------------------------------------------------------------
-// Standard: II=1 pipelined K-reduction with PN-wide input-channel parallelism.
+// Write outputs to DDR (§2.22: channel-major runs; §2.27: explicit
+// hls::burst_maxi write bursts).
 //
-// Each PIPELINE iteration fires kTileIC parallel MACs that share (khi_cnt,
-// kwi_cnt, m1) and reduce across the input-channel axis through a PN-wide
-// adder tree.  Outer counter ri = (khi, kwi, m1) with m1 cycling 0..kTileM-1
-// via the bit mask; the lane rotation keeps the per-lane RAW distance on
-// acc[m1] at kTileM cycles (≥ MAC pipeline depth incl. the log2(kTileIC)
-// adder tree), avoiding any DEPENDENCE escape.
-//
-// X-propagation guard on partial IC tiles:
-//   When ic_valid < kTileIC the stream_load_weights producer only writes
-//   m_valid·ic_valid·kh·kw cells into w_buf — cells at ic_l >= ic_valid are
-//   uninitialised BRAM, which is 'X' in RTL.  Multiplying patch·X yields X
-//   (C-sim would have given 0 because patch is producer-padded with zeros,
-//   so this is an RTL-only failure mode).  The ic_l < ic_valid guard MUXes
-//   the BRAM read to 0 on invalid lanes, so the product is 0·0 = 0 and no
-//   X reaches the adder tree.  HLS keeps the multiplier — the MUX adds a
-//   single LUT per lane on the weight input, no DSP cost.
-//
-// Throughput: kTileIC MACs / cycle (vs 1 MAC / cycle previously);
-// loop bound shrinks from ic_valid·kh·kw·kTileM to kh·kw·kTileM.
-// ---------------------------------------------------------------------------
-static void accumulate_standard(
-    const Data_t patch[kTileIC][kMaxKH][kMaxKW],
-    const Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
-    AccData_t    acc[kTileM],
-    unsigned     ic_valid,
-    unsigned     kh,
-    unsigned     kw
-) {
-    #pragma HLS INLINE
-
-    unsigned kwi_cnt = 0, khi_cnt = 0;
-    const unsigned ri_bound = kh * kw * kTileM;
-    for (unsigned ri = 0; ri < ri_bound; ri++) {
-        #pragma HLS PIPELINE II=1
-        const unsigned m1 = ri & (kTileM - 1);
-
-        AccData_t lane_sum = 0;
-        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-            #pragma HLS UNROLL
-            const Data_t w_val = (ic_l < ic_valid)
-                ? w_buf[m1][ic_l][khi_cnt][kwi_cnt]
-                : Data_t(0);
-            // Multiply Data_t × Data_t (16×16 → a single DSP48).  The
-            // ap_fixed product of two ap_fixed<16,8> is natively
-            // ap_fixed<32,16> = AccData_t and holds patch·w exactly, so
-            // widening the OPERANDS to AccData_t first — which forced a
-            // 32×32 DSP cascade and lengthened the MAC critical path —
-            // is unnecessary.  Result is bit-identical.
-            lane_sum += patch[ic_l][khi_cnt][kwi_cnt] * w_val;
-        }
-        acc[m1] += lane_sum;
-
-        if ((ri & (kTileM - 1)) == kTileM - 1) {
-            if (++kwi_cnt == kw) {
-                kwi_cnt = 0;
-                if (++khi_cnt == kh) {
-                    khi_cnt = 0;
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Depthwise: II=1 kH×kW reduction with PM-wide channel-parallel lanes.
-//
-// Each PIPELINE iteration fires kTileM independent MACs — one per output
-// channel lane.  Depthwise has no input-channel reduction, so per-lane
-// accumulators acc[m1] are pairwise independent.  Loop bound shrinks from
-// kh·kw·kTileM (1 MAC / cycle) to kh·kw (kTileM MACs / cycle).
-//
-// Per-lane RAW distance on acc[m1] is 1 cycle (each iteration writes every
-// lane); the ap_fixed<32,16> adder schedules single-cycle at 300 MHz so the
-// recurrence closes without an II bump.  Pattern matches Bai et al. FPGA'18
-// channel-parallel depthwise micro-architecture.
-// ---------------------------------------------------------------------------
-static void accumulate_depthwise(
-    const Data_t patch[kTileIC][kMaxKH][kMaxKW],
-    const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
-    AccData_t    acc[kTileM],
-    unsigned     kh,
-    unsigned     kw
-) {
-    #pragma HLS INLINE
-
-    unsigned kwi_cnt = 0, khi_cnt = 0;
-    const unsigned ri_bound_dw = kh * kw;
-    for (unsigned ri = 0; ri < ri_bound_dw; ri++) {
-        #pragma HLS PIPELINE II=1
-        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-            #pragma HLS UNROLL
-            // 16×16 Data_t multiply (single DSP48) — see the operand-
-            // width note in accumulate_standard.
-            acc[m1] += patch[m1][khi_cnt][kwi_cnt]
-                     * w_buf[m1][khi_cnt][kwi_cnt];
-        }
-
-        if (++kwi_cnt == kw) {
-            kwi_cnt = 0;
-            ++khi_cnt;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Write outputs to DDR.
-//
-// Loop nest matches the new consumer's drain order — (ni, oh, ow, mt, m1).
-// For each (ni, oh, ow) the m_tiles × m_valid lanes are written in
-// channel-major order; y_addr advances by ohw between m1 lanes.
+// Loop nest matches the consumer's Phase-3 drain order —
+// (ni, chunk, mt, m1, oh_local, ow).  For each (ni, chunk, channel) the
+// chunk_oh_count·out_w outputs are CONTIGUOUS in y (NCHW: a channel's
+// rows are adjacent), so the inner pipelined loop walks a single
+// sequential run and HLS infers an AXI write burst.  The previous
+// pixel-major order strode by out_h·out_w between consecutive stores, so
+// every 16-bit output was a lone single-beat transaction — measured at
+// 11.7 cycles each and ~45 % of a 64-channel layer's runtime (see
+// CONV_2D_GRID_PLAN.md §2).
 //
 // acc_stream already carries saturated Data_t — the AccData_t→Data_t
 // saturate_cast was hoisted into process_conv_kernel_tile's Phase-3
 // drain (so the inter-stage FIFO is Data_t-wide, not AccData_t-wide).
 // This stage is therefore a pure stream→DDR copy.
 // ---------------------------------------------------------------------------
+// Max write_request()s in flight before a write_response() is collected
+// (must stay <= the port's num_write_outstanding).
+static constexpr unsigned kWriteInFlight = 8;
+
 static void write_output_tile(
-    Data_t*                 y,
+    hls::burst_maxi<Data_t> y,
     hls::stream<Data_t>&    acc_stream,
     unsigned                out_ch,
     unsigned                out_h,
     unsigned                out_w,
-    unsigned                batch
+    unsigned                batch,
+    ConvGeometry            geom
 ) {
-    const unsigned m_tiles = (out_ch + kTileM - 1) / kTileM;
-    const unsigned ohw     = out_h * out_w;
+    const unsigned m_tiles      = (out_ch + kTileM - 1) / kTileM;
+    const unsigned oh_per_chunk = geom.oh_per_chunk;
+    const unsigned num_chunks   = geom.num_chunks;
+    // write_request()s whose write_response() is still owed.  Responses are
+    // collected in a sliding window of kWriteInFlight so several runs' bursts
+    // stay in flight (num_write_outstanding=16 on the port); blocking on the
+    // previous run's response right after each run was traced to serialise
+    // drain → transfer → response per run (1.77 cycles/element).
+    unsigned pending = 0;
 
     for (unsigned ni = 0; ni < batch; ni++) {
-        for (unsigned oh = 0; oh < out_h; oh++) {
-            for (unsigned ow = 0; ow < out_w; ow++) {
-                const unsigned base = ni * out_ch * ohw + oh * out_w + ow;
-                for (unsigned mt = 0; mt < m_tiles; mt++) {
-                    const unsigned m_off   = mt * kTileM;
-                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-                    unsigned       y_addr  = base + m_off * ohw;
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        #pragma HLS PIPELINE II=1
-                        y[y_addr] = acc_stream.read();
-                        y_addr += ohw;
-                    }
-                } // m_tile loop
-            } // ow loop
-        } // oh loop
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start       = chunk * oh_per_chunk;
+        const unsigned oh_end         = std::min(out_h, oh_start + oh_per_chunk);
+        const unsigned run_len        = (oh_end - oh_start) * out_w;
+
+        for (unsigned mt = 0; mt < m_tiles; mt++) {
+            const unsigned m_off   = mt * kTileM;
+            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                // First element of this channel's rows [oh_start, oh_end).
+                const unsigned base =
+                    ((ni * out_ch + m_off + m1) * out_h + oh_start) * out_w;
+                // §2.27 explicit bursts (hls::burst_maxi).  Burst
+                // inference on a plain pointer was traced in RTL and never
+                // overlapped draining with transmitting: with long bursts
+                // the adapter buffered a whole burst at the 1-element/cycle
+                // drain rate before sending it; with 16-beat bursts it
+                // deferred every run's last burst to an end-of-kernel flush
+                // and paused ~21 cycles between bursts.  write_request()
+                // issues the address up front, write() streams the data as
+                // it arrives from acc_stream, and the response is collected
+                // in a sliding window so up to kWriteInFlight runs' bursts
+                // are outstanding at once.
+                y.write_request(base, run_len);
+                for (unsigned i = 0; i < run_len; i++) {
+                    #pragma HLS PIPELINE II=1
+                    y.write(acc_stream.read());
+                }
+                pending++;
+                if (pending == kWriteInFlight) {
+                    y.write_response();
+                    pending--;
+                }
+            }
+        } // m_tile loop
+      } // chunk loop
     } // batch loop
+    while (pending > 0) {
+        y.write_response();
+        pending--;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,23 +433,26 @@ static void write_output_tile(
 // reads them after the mt-hoist optimisation:
 //
 //     for (r in batch*out_h*out_w):
-//         for (mt in m_tiles):
-//             for (m1 in m_valid): write(bias[m_off+m1])
+//         for (mt in m_tiles): write(BiasVec{bias[m_off..m_off+kTileM)})
 //
-// Because the consumer's mt loop now lives INSIDE the spatial nest, the
+// Because the consumer's mt loop lives INSIDE the spatial nest, the
 // producer needs all m_tiles' bias slices available simultaneously per
 // `r` iteration.  The entire bias vector is therefore loaded once into
 // bias_buf[kMaxOutCh] and replayed `reps` times.  When has_bias=0 no DDR
-// transactions are issued and the producer pushes AccData_t(0) directly.
+// transactions are issued and the producer pushes zero vectors directly.
 // ---------------------------------------------------------------------------
 static void bias_producer(
     const Data_t*           bias,
-    hls::stream<AccData_t>& bias_stream,
+    hls::stream<BiasVec>&   bias_stream,
     unsigned                out_ch,
     unsigned                reps,
     unsigned                has_bias
 ) {
     Data_t bias_buf[kMaxOutCh];
+    // §2.25: one BiasVec (kTileM lanes) per beat — the gather below reads
+    // lanes m_off..m_off+kTileM-1 in one cycle, so bank the buffer by the
+    // lane index (m_off is a multiple of kTileM → lane m1 lives in bank m1).
+    #pragma HLS ARRAY_PARTITION variable=bias_buf cyclic factor=kTileM dim=1
 
     if (has_bias) {
         for (unsigned m = 0; m < out_ch; m++) {
@@ -465,14 +465,18 @@ static void bias_producer(
 
     for (unsigned r = 0; r < reps; r++) {
         for (unsigned mt = 0; mt < m_tiles; mt++) {
+            #pragma HLS PIPELINE II=1
             const unsigned m_off   = mt * kTileM;
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                #pragma HLS PIPELINE II=1
-                bias_stream.write(has_bias
-                                  ? AccData_t(bias_buf[m_off + m1])
-                                  : AccData_t(0));
+            BiasVec v;
+            #pragma HLS aggregate variable=v compact=byte
+            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                #pragma HLS UNROLL
+                v.lane[m1] = (has_bias && m1 < m_valid)
+                           ? AccData_t(bias_buf[m_off + m1])
+                           : AccData_t(0);
             }
+            bias_stream.write(v);
         }
     }
 }
@@ -525,7 +529,7 @@ static void bias_producer(
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
 // ---------------------------------------------------------------------------
 static void input_patch_producer(
-    const Data_t*           x,
+    hls::burst_maxi<Data_t> x,
     hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
     unsigned             in_ch,
@@ -571,7 +575,21 @@ static void input_patch_producer(
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 
 #ifdef DEBUG_LOAD_DATA_CACHING
+    // Optional duplicate-read report (CONV_DEBUG_READS=1 in the env).
+    const bool debug_reads = std::getenv("CONV_DEBUG_READS") != nullptr;
     AddressMap_t read_addresses;
+    // C-sim residency invariant: which absolute (ih, iw) each line_buf
+    // cell currently holds.  Phase 2 asserts the cell it reads holds the
+    // pixel it thinks it does — a circular-slot overwrite (the §2.21 bug
+    // class) then fails loudly instead of silently corrupting outputs.
+    static long line_tag[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
+    for (unsigned a = 0; a < kTileIC; a++)
+        for (unsigned r = 0; r < kMaxLineBufRows; r++)
+            for (unsigned c = 0; c < kMaxLineBufCols; c++)
+                line_tag[a][r][c] = -1;
+    auto tag_of = [&](unsigned ch_l_, int ih_, int iw_) -> long {
+        return ((long)ch_l_ << 40) | ((long)ih_ << 20) | (long)iw_;
+    };
 #endif
 
     for (unsigned ni = 0; ni < batch; ni++) {
@@ -598,7 +616,11 @@ static void input_patch_producer(
             // chunk triggers a fresh kh-row load.  line_buf is reloaded once
             // per ow_tile (different iw range); within an ow_tile rows are
             // retained across groups (grp>0 sees last_loaded_row already at
-            // the chunk's max and Phase 1 loads nothing).
+            // the chunk's max and Phase 1 loads nothing).  That replay is
+            // only valid because compute_conv_geometry() caps oh_per_chunk
+            // so the chunk's full input-row span fits kMaxLineBufRows when
+            // num_groups > 1 — otherwise circular slot reuse would have
+            // overwritten the first oh's rows before grp 1 re-reads them.
             int last_loaded_row =
                 (int)(oh_start * stride_h) - (int)pad_top - 1;
 
@@ -626,9 +648,34 @@ static void input_patch_producer(
                 if (iw_clipped_last >= (int)in_w)
                     iw_clipped_last = (int)in_w - 1;
 
+                // Number of input columns this ow_tile needs from each row
+                // (0 when the whole window is in the padding).
+                const int iw_count_i = iw_clipped_last - iw_clipped_start + 1;
+                const unsigned iw_count = (iw_count_i > 0) ? (unsigned)iw_count_i : 0u;
+
                 for (int ih = load_start; ih <= load_end; ih++) {
                     const unsigned slot =
                         (unsigned)ih & (kMaxLineBufRows - 1);
+                    // §2.28 explicit read bursts: request every channel's
+                    // run of this row FIRST, then drain the data.  With a
+                    // plain pointer each (row, channel) run was one inferred
+                    // burst issued only after the previous one completed —
+                    // the RTL trace showed 69 cycles per 16-element burst
+                    // with a single read in flight, which made depthwise
+                    // layers read-bound at ~4.3 cycles/element.  Up to
+                    // ch_valid (<= kTileIC = num_read_outstanding) requests
+                    // are now in flight while the first one's data streams
+                    // in.
+                    if (iw_count > 0) {
+                        for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
+                            #pragma HLS PIPELINE II=1
+                            const unsigned c     = ch_off + ch_l;
+                            const unsigned x_row = (ni * in_ch + c) * in_hw
+                                                 + (unsigned)ih * in_w;
+                            x.read_request(x_row + (unsigned)iw_clipped_start,
+                                           iw_count);
+                        }
+                    }
                     for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
                         const unsigned c     = ch_off + ch_l;
                         const unsigned x_row = (ni * in_ch + c) * in_hw
@@ -639,9 +686,11 @@ static void input_patch_producer(
                             const size_t addr = x_row + (unsigned)iw;
                             const unsigned col_slot =
                                 (unsigned)iw & (kMaxLineBufCols - 1);
-                            line_buf[ch_l][slot][col_slot] = x[addr];
+                            line_buf[ch_l][slot][col_slot] = x.read();
 
 #ifdef DEBUG_LOAD_DATA_CACHING
+                            line_tag[ch_l][slot][col_slot] = tag_of(ch_l, ih, iw);
+                            if (debug_reads) {
                             CycleCounters counters;
                             counters.mt   = is_depthwise ? ct : 0u;
                             counters.ni   = ni;
@@ -652,6 +701,7 @@ static void input_patch_producer(
                             counters.khi  = (unsigned)ih;
                             counters.kwi  = (unsigned)iw;
                             read_addresses[addr].push_back(counters);
+                            }
 #endif /* DEBUG_LOAD_DATA_CACHING */
                         }
                     }
@@ -695,6 +745,19 @@ static void input_patch_producer(
                                 v.lane[ic_l] = (ch_ok && ih_ok && iw_ok)
                                     ? line_buf[ic_l][slot][col_slot]
                                     : Data_t(0);
+#ifdef DEBUG_LOAD_DATA_CACHING
+                                if (ch_ok && ih_ok && iw_ok &&
+                                    line_tag[ic_l][slot][col_slot] != tag_of(ic_l, ih, iw)) {
+                                    std::cerr << "line_buf residency violated: ch_l=" << ic_l
+                                              << " wants (ih=" << ih << ", iw=" << iw
+                                              << ") slot(" << slot << "," << col_slot
+                                              << ") holds tag " << line_tag[ic_l][slot][col_slot]
+                                              << " at ni=" << ni << " chunk=" << chunk
+                                              << " ct=" << ct << " owt=" << owt << " grp=" << grp
+                                              << " oh=" << oh << " ow=" << ow << std::endl;
+                                    assert(!"line_buf residency invariant");
+                                }
+#endif
                             }
                             patch_stream.write(v);
                         }
@@ -708,7 +771,7 @@ static void input_patch_producer(
     } // batch loop
 
 #ifdef DEBUG_LOAD_DATA_CACHING
-    for (auto it : read_addresses) {
+    if (debug_reads) for (auto it : read_addresses) {
         if (it.second.size() > 1) {
             std::cout << it.first << " --> " << std::endl;
 
@@ -845,8 +908,8 @@ static void stream_load_weights(
 // sub-range:
 //
 //   Per (ni, chunk):
-//     Phase 1 (init):  drain chunk_oh_count*out_w*out_ch bias values into
-//                      partial_outputs[] (BRAM-resident), indexed by
+//     Phase 1 (init):  drain chunk_oh_count*out_w*m_tiles BiasVec words
+//                      into partial_outputs[] (URAM-resident), indexed by
 //                      oh_local = oh - oh_start.
 //     Phase 2 (accum): standard   — for ict OUTER, (oh_in_chunk, ow, mt)
 //                                   inner; load patch[kTileIC][kh][kw],
@@ -857,21 +920,30 @@ static void stream_load_weights(
 //                                   load w_buf[kTileM][kh][kw] ONCE per
 //                                   (chunk, mt), reduce kh*kw*kTileM at II=1.
 //     Phase 3 (drain): saturate_cast partial_outputs to Data_t and push
-//                      to acc_stream in (oh_in_chunk, ow, mt, m1) order.
-//                      Concatenated across chunks this is
-//                      (ni, oh, ow, mt, m1) — exactly what
-//                      write_output_tile expects.
+//                      to acc_stream in (mt, m1, oh_in_chunk, ow) order —
+//                      channel-major, so write_output_tile's matching nest
+//                      writes each channel's chunk rows as one contiguous
+//                      burst (§2.22).
 //
 //   Both producers read each x pixel from DDR once per (ni, c, chunk):
 //   line_buf is retained across oh WITHIN a (chunk, ict|mt) but reloads
 //   the (kh-1)-row overlap at chunk boundaries.
 //
-// Memory constraint: out_w*out_ch <= kMaxAccPersistEntries  (one row fits).
+// partial_outputs layout (§2.23): [pixel][m_tile][kTileM] — flat index
+//     word = (oh_local·out_w + ow)·m_tiles + mt,  entry = word·kTileM + m1
+// so each m-tile's kTileM accumulators are one aligned word of the
+// cyclic-factor-kTileM RESHAPEd array and Phase 2's acc load / store is a
+// single wide access.  Lanes m1 ≥ m_valid of the last tile are padding:
+// written (zero at init, whatever the grid leaves there after) but never
+// drained.
+//
+// Memory constraint: out_w * m_tiles*kTileM <= kMaxAccPersistEntries
+// (one padded row fits).
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<PatchVec>&  patch_stream,
     hls::stream<Data_t>&    weight_stream,
-    hls::stream<AccData_t>& bias_stream,
+    hls::stream<BiasVec>&   bias_stream,
     hls::stream<Data_t>&    acc_stream,
     unsigned                batch,
     unsigned                in_ch,
@@ -908,6 +980,10 @@ static void process_conv_kernel_tile(
     // sub-loops, so two ports suffice and there is no tight RAW
     // recurrence that URAM's extra read latency could stall.
     #pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM
+    // §2.23: kTileM consecutive entries → one 256-bit word, so an aligned
+    // m-tile is loaded / stored per cycle (UG1399: reshape "combines
+    // elements into wider words instead of creating separate arrays").
+    #pragma HLS ARRAY_RESHAPE variable=partial_outputs cyclic factor=kTileM dim=1
 
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
@@ -917,16 +993,21 @@ static void process_conv_kernel_tile(
         const unsigned chunk_oh_count  = oh_end - oh_start;
 
         // -------- Phase 1: init partial_outputs from bias_stream --------
+        // One BiasVec beat = one padded accumulator word per (pixel, mt):
+        // the producer already zeroed the padding lanes (§2.25).
         for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
             for (unsigned ow = 0; ow < out_w; ow++) {
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
-                    const unsigned m_off   = mt * kTileM;
-                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        #pragma HLS PIPELINE II=1
-                        const unsigned idx = (oh_local * out_w + ow) * out_ch
-                                             + m_off + m1;
-                        partial_outputs[idx] = bias_stream.read();
+                    #pragma HLS PIPELINE II=1
+                    const unsigned word = (oh_local * out_w + ow) * m_tiles + mt;
+#ifdef DEBUG_LOAD_DATA_CACHING
+                    assert(word * kTileM + kTileM <= kMaxAccPersistEntries &&
+                           "partial_outputs capacity (padded row) exceeded");
+#endif
+                    const BiasVec v = bias_stream.read();
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        partial_outputs[word * kTileM + m1] = v.lane[m1];
                     }
                 }
             }
@@ -967,7 +1048,13 @@ static void process_conv_kernel_tile(
                 // per bank per cycle.
                 Data_t w_cache[kMaxMperGroup][kTileM][kTileIC]
                               [kMaxKH][kMaxKW];
-                #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=3
+                // §2.24 grid banking: the 2-D grid reads all kTileM × kTileIC
+                // weights of one (mt_in_group, khi, kwi) per cycle.  Partition
+                // the m axis into kTileM RAMs and RESHAPE the ic axis so each
+                // RAM word carries all kTileIC lanes (256 bits) — 128 values
+                // per cycle from kTileM ports (CONV_2D_GRID_PLAN.md §5.1).
+                #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=2
+                #pragma HLS ARRAY_RESHAPE   variable=w_cache complete dim=3
 
                 for (unsigned mt_in_group = 0;
                      mt_in_group < mt_in_group_count; mt_in_group++) {
@@ -989,65 +1076,81 @@ static void process_conv_kernel_tile(
                     }
                 }
 
-                // ---- Spatial sweep: read patch ONCE per (oh, ow_in_tile),
-                //      then iterate mt_in_group against the cached weights ----
+                // ---- Spatial sweep (§2.29): per (oh, ow_in_tile) ONE fused
+                //      II=1 loop over (tile-in-group, khi, kwi) ----
+                // Tile 0 consumes each PatchVec beat straight from the
+                // stream and parks it in `patch`; tiles 1..G-1 replay it
+                // from `patch`.  All G tiles' accumulators live in registers
+                // for the whole pixel, so the per-tile acc load / store and
+                // the separate drain loop (and their pipeline ramps) are
+                // gone: a pixel costs G·kh·kw + ~G·2 + latency cycles
+                // instead of kh·kw + G·(kh·kw + ~12).
                 for (unsigned oh_local = 0; oh_local < chunk_oh_count;
                      oh_local++) {
                     for (unsigned ow = ow_start; ow < ow_end; ow++) {
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
                         // Banked register file: partition only the bank
                         // dim → kTileIC banks for the ic_l UNROLL's
-                        // parallel reads, with (khi,kwi) as a RAM address.
-                        // This keeps khi/kwi driving kTileIC RAM address
-                        // ports rather than the high-fanout combinational
-                        // read mux the fully-partitioned-FF form created
-                        // (DAC'20 control-broadcast — the mis-scheduled
-                        // MUXF8 on the routed critical path).
+                        // parallel reads, with (khi,kwi) as a RAM address
+                        // (DAC'20 control-broadcast note, §2.18).
                         #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
                         #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
-                        // Drain kh*kw channel-packed PatchVec beats and
-                        // unpack each into the kTileIC ic-lanes.
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const PatchVec v = patch_stream.read();
+                        AccData_t acc[kMaxMperGroup][kTileM];
+                        #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
+                        const unsigned pix_word = (oh_local * out_w + ow) * m_tiles;
+
+                        // Load every tile's padded accumulator word (§2.23).
+                        for (unsigned g = 0; g < mt_in_group_count; g++) {
+                            #pragma HLS PIPELINE II=1
+                            const unsigned word = pix_word + mt_base + g;
+                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                #pragma HLS UNROLL
+                                acc[g][m1] = partial_outputs[word * kTileM + m1];
+                            }
+                        }
+
+                        // Fused (g, khi, kwi) sweep.
+                        const unsigned n_steps = mt_in_group_count * kh * kw;
+                        unsigned g = 0, khi = 0, kwi = 0;
+                        for (unsigned ri = 0; ri < n_steps; ri++) {
+                            #pragma HLS PIPELINE II=1
+                            Data_t p[kTileIC];
+                            #pragma HLS ARRAY_PARTITION variable=p complete dim=0
+                            if (g == 0) {
+                                const PatchVec v = patch_stream.read();
                                 for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                                     #pragma HLS UNROLL
+                                    p[ic_l]              = v.lane[ic_l];
                                     patch[ic_l][khi][kwi] = v.lane[ic_l];
+                                }
+                            } else {
+                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                                    #pragma HLS UNROLL
+                                    p[ic_l] = patch[ic_l][khi][kwi];
+                                }
+                            }
+                            const unsigned m_valid_g =
+                                std::min(kTileM, out_ch - (mt_base + g) * kTileM);
+                            mac_grid_step(p, w_cache[g], khi, kwi, acc[g],
+                                          ic_valid, m_valid_g);
+                            if (++kwi == kw) {
+                                kwi = 0;
+                                if (++khi == kh) {
+                                    khi = 0;
+                                    g++;
                                 }
                             }
                         }
 
-                        for (unsigned mt_in_group = 0;
-                             mt_in_group < mt_in_group_count; mt_in_group++) {
-                            const unsigned mt     = mt_base + mt_in_group;
-                            const unsigned m_off  = mt * kTileM;
-                            const unsigned m_valid =
-                                std::min(kTileM, out_ch - m_off);
-
-                            AccData_t acc[kTileM];
-                            #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
-
-                            const unsigned idx_base =
-                                (oh_local * out_w + ow) * out_ch + m_off;
+                        // Store every tile's word back.
+                        for (unsigned g2 = 0; g2 < mt_in_group_count; g2++) {
+                            #pragma HLS PIPELINE II=1
+                            const unsigned word = pix_word + mt_base + g2;
                             for (unsigned m1 = 0; m1 < kTileM; m1++) {
                                 #pragma HLS UNROLL
-                                acc[m1] = AccData_t(0);
-                            }
-                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                                #pragma HLS PIPELINE II=1
-                                acc[m1] = partial_outputs[idx_base + m1];
-                            }
-
-                            accumulate_standard(
-                                patch, w_cache[mt_in_group], acc,
-                                ic_valid, kh, kw);
-
-                            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                                #pragma HLS PIPELINE II=1
-                                partial_outputs[idx_base + m1] = acc[m1];
+                                partial_outputs[word * kTileM + m1] = acc[g2][m1];
                             }
                         }
                     }
@@ -1089,45 +1192,35 @@ static void process_conv_kernel_tile(
                 for (unsigned oh_local = 0; oh_local < chunk_oh_count;
                      oh_local++) {
                     for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                        Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        // Banked register file — see the Phase 2a note.
-                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-                        #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
-
+                        // §2.29: depthwise has a single tile per pixel, so
+                        // the PatchVec beats feed the lanes straight from
+                        // the stream — no patch buffer, no drain loop.
                         AccData_t acc[kTileM];
                         #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-                        // Drain kh*kw channel-packed PatchVec beats and
-                        // unpack the kTileM depthwise m-lanes (lanes
-                        // kTileM..kTileIC-1 carry the producer's zero pad
-                        // and are unused by accumulate_depthwise).
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const PatchVec v = patch_stream.read();
-                                for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                    #pragma HLS UNROLL
-                                    patch[m1][khi][kwi] = v.lane[m1];
-                                }
+                        // §2.23: one aligned word per (pixel, mt).
+                        const unsigned word =
+                            (oh_local * out_w + ow) * m_tiles + mt;
+                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            #pragma HLS UNROLL
+                            acc[m1] = partial_outputs[word * kTileM + m1];
+                        }
+
+                        const unsigned n_steps_dw = kh * kw;
+                        unsigned khi = 0, kwi = 0;
+                        for (unsigned ri = 0; ri < n_steps_dw; ri++) {
+                            #pragma HLS PIPELINE II=1
+                            const PatchVec v = patch_stream.read();
+                            mac_dw_step(v.lane, w_buf, khi, kwi, acc);
+                            if (++kwi == kw) {
+                                kwi = 0;
+                                ++khi;
                             }
                         }
 
-                        const unsigned idx_base =
-                            (oh_local * out_w + ow) * out_ch + m_off;
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
-                            acc[m1] = AccData_t(0);
-                        }
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            #pragma HLS PIPELINE II=1
-                            acc[m1] = partial_outputs[idx_base + m1];
-                        }
-
-                        accumulate_depthwise(patch, w_buf, acc, kh, kw);
-
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            #pragma HLS PIPELINE II=1
-                            partial_outputs[idx_base + m1] = acc[m1];
+                            partial_outputs[word * kTileM + m1] = acc[m1];
                         }
                     }
                 }
@@ -1138,15 +1231,20 @@ static void process_conv_kernel_tile(
         // -------- Phase 3: drain partial_outputs to acc_stream --------
         // saturate_cast AccData_t→Data_t here (hoisted out of
         // write_output_tile) so acc_stream is a Data_t-wide FIFO.
-        for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
-            for (unsigned ow = 0; ow < out_w; ow++) {
-                for (unsigned mt = 0; mt < m_tiles; mt++) {
-                    const unsigned m_off   = mt * kTileM;
-                    const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
+        // Order is CHANNEL-major — (mt, m1, oh_local, ow) — so that
+        // write_output_tile sees one contiguous run of
+        // chunk_oh_count·out_w elements per channel and can burst (§2.22).
+        // The partial_outputs reads become out_ch-strided, which is free
+        // on the on-chip URAM.
+        for (unsigned mt = 0; mt < m_tiles; mt++) {
+            const unsigned m_off   = mt * kTileM;
+            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+            for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
+                    for (unsigned ow = 0; ow < out_w; ow++) {
                         #pragma HLS PIPELINE II=1
-                        const unsigned idx = (oh_local * out_w + ow) * out_ch
-                                             + m_off + m1;
+                        const unsigned idx =
+                            ((oh_local * out_w + ow) * m_tiles + mt) * kTileM + m1;
                         acc_stream.write(
                             saturate_cast<Data_t>(partial_outputs[idx]));
                     }
@@ -1158,10 +1256,10 @@ static void process_conv_kernel_tile(
 }
 
 void ConvKernel(
-    const Data_t* x,
+    hls::burst_maxi<Data_t> x,
     const Data_t* weight,
     const Data_t* bias,
-    Data_t*       y,
+    hls::burst_maxi<Data_t> y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,
@@ -1212,10 +1310,15 @@ void ConvKernel(
     //   m_axi kernel aborts without depth ("a depth specification is
     //   required for interface port 'x'").
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X
-    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT
-    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS
-    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y
+    // §2.27: the burst-length / outstanding options described above were
+    // documented but never actually on the pragmas (csynth showed the
+    // defaults).  Same settings as VectorOP.cpp; y is an hls::burst_maxi
+    // port driven by explicit write_request/write/write_response (see
+    // write_output_tile).
+    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X      max_read_burst_length=256  num_read_outstanding=16
+    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT max_read_burst_length=256  num_read_outstanding=16
+    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS   max_read_burst_length=256  num_read_outstanding=16
+    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y      max_write_burst_length=256 num_write_outstanding=16
 
     #pragma HLS INTERFACE s_axilite port=x            bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=weight       bundle=ctrl
@@ -1294,9 +1397,12 @@ void ConvKernel(
     // (oh-chunking / M-grouping / ow-tiling) synthesise a single shared
     // divider set instead of one per dataflow stage (§2.19).
     const ConvGeometry geom = compute_conv_geometry(
-        out_h, out_w, out_ch, kw, stride_w, dilation_w);
+        out_h, out_w, out_ch, kh, kw, stride_h, stride_w,
+        dilation_h, dilation_w, is_depthwise);
 
-    hls_thread_local hls::stream<AccData_t> bias_stream;
+    // bias_stream carries one BiasVec (a whole m-tile of initial
+    // accumulators) per beat (§2.25); depth covers one pixel's m-tiles.
+    hls_thread_local hls::stream<BiasVec> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
 
     // patch_stream carries the producer's channel-packed PatchVec
@@ -1311,8 +1417,20 @@ void ConvKernel(
     // applies saturate_cast in its Phase-3 drain, so this inter-stage FIFO
     // is Data_t-wide (not AccData_t-wide) and write_output_tile is a plain
     // stream→DDR copy.
+    //
+    // §2.26 write overlap: the FIFO is one full chunk deep and lives in the
+    // otherwise idle URAM (UG1399 bind_storage: type=fifo, impl=uram), so
+    // Phase 3 drains a finished chunk at 1 element/cycle without ever
+    // blocking on the writer, and the consumer moves on to the next
+    // chunk's Phase 1/2 while write_output_tile is still bursting the
+    // previous chunk to DDR.  Measured after §2.22 the writer costs ~2.3
+    // cycles/element; with the 8-deep FIFO that time was fully serial
+    // with compute.  Single-chunk layers gain nothing here (there is no
+    // next chunk to overlap with) — see the min-chunks note in
+    // CONV_OPTIMISATION.md §2.26.
     hls_thread_local hls::stream<Data_t> acc_stream;
-    #pragma HLS STREAM variable=acc_stream depth=kTileM
+    #pragma HLS STREAM variable=acc_stream depth=kMaxAccPersistEntries
+    #pragma HLS BIND_STORAGE variable=acc_stream type=fifo impl=uram
 
     // weight_stream carries one Data_t per cycle from stream_load_weights
     // to process_conv_kernel_tile.  Depth is one full max-tile (kTileM *
@@ -1341,5 +1459,20 @@ void ConvKernel(
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise, geom);
 
-    write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch);
+    write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch, geom);
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    // C-sim token accounting.  The four DATAFLOW stages run sequentially in
+    // C-sim, so any producer/consumer beat-count mismatch shows up here as
+    // leftover tokens (or earlier as a read-on-empty inside the consumer)
+    // instead of as a DATAFLOW hang in RTL.
+    if (!patch_stream.empty() || !weight_stream.empty() ||
+        !bias_stream.empty()  || !acc_stream.empty()) {
+        std::cerr << "ConvKernel: leftover stream tokens after run — patch="
+                  << patch_stream.size() << " weight=" << weight_stream.size()
+                  << " bias=" << bias_stream.size() << " acc=" << acc_stream.size()
+                  << std::endl;
+        assert(!"stream token accounting");
+    }
+#endif
 }

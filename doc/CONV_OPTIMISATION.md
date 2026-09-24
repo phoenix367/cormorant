@@ -892,7 +892,331 @@ DSP 155, BRAM 78, URAM 16 unchanged.
 
 ---
 
-## 3. Current architecture (post-§2.20)
+### 2.21. M-group line_buf residency cap (correctness fix)
+
+**Problem.**  §2.10 M-grouping made the patch producer replay a
+chunk's whole `(oh, ow)` sweep from `line_buf` once per M-group with
+no DDR re-read (`last_loaded_row` is kept across the `grp` loop, so
+Phase 1 loads nothing for `grp > 0`).  That silently assumed
+`line_buf` holds the entire chunk.  It holds only `kMaxLineBufRows`
+(16) rows, circularly indexed by `ih & 15`, so whenever a chunk's
+input-row span exceeded 16 the rows the first `oh` needs were already
+overwritten by the time group 1 re-read them — groups ≥ 1 of the
+affected output rows were computed from the wrong input rows.
+Trigger: standard path, `out_ch > kTileM·kMaxMperGroup = 32`, and
+`(oh_per_chunk-1)·stride_h + (kh-1)·dilation_h + 1 > 16`.  With
+`kMaxAccPersistEntries = 65536` the uncapped `oh_per_chunk` is
+typically 9–18 rows, so any stride or kernel taller than 1 tripped
+it.  12 of ResNet-18's 20 convs (stem + all of stage 1/2) were
+affected; MobileNet v1/v2 and the MNIST models escaped only because
+their chunks happen to be short.  The C-sim M-grouping case (test 28)
+used `in_h = 16` — exactly the buffer depth, where the `in_h-1` clamp
+keeps every row resident — so it could not see the overwrite.
+
+**Change.**  `compute_conv_geometry()` now takes `kh`, `stride_h`,
+`dilation_h`, `is_depthwise` and, when `!is_depthwise &&
+num_m_groups > 1`, clamps
+`oh_per_chunk ≤ (kMaxLineBufRows - ((kh-1)·dilation_h + 1)) / stride_h + 1`
+and recomputes `num_chunks`.  The alternative — resetting
+`last_loaded_row` per `grp` and re-reading `x` per M-group — was
+verified to fix the same cases but gives up the read-`x`-once
+property the grouping exists for.  Three regression cases added to
+`TestConvSim.cpp` (`in_h = 17` 3×3, ResNet-style 7×7 s2 stem with
+40 ch on 32×32, batch 2 dilation 2 stride 2); all three FAIL on the
+pre-§2.21 kernel and PASS after.
+
+**Result.**  Correctness fix; throughput on layers that were already
+correct is unchanged (the cap only binds where the old code produced
+garbage).  The checked-in RTL fixtures under `hw/test_data/conv_test_data/`
+were regenerated (`make gen_conv_test_data`) from 30 to 39 cases so the
+RTL run now covers oh-chunking, M-grouping, ow-tiling and the three
+§2.21 regression cases.  The larger fixtures made simulated time the
+bottleneck (the old 30-case set ran 1.8 ms of sim time; the ResNet-18
+stem at 64 ch / 64×64 alone needed >40 ms), so the two biggest
+regression cases were shrunk to the smallest geometry that still trips
+the cap, and the test stand gained a batch mode (no `add_wave /`
+waveform logging; testbench per-beat AXI/DDR monitors behind
+`+VERBOSE`; `TS_WAVES=1` / `TS_VERBOSE=1` restore the old behaviour).
+`--debug off` elaboration was tried too and dropped: no measurable
+gain, and it breaks any .wcfg attached to the project.  Regenerated-fixture RTL run: **39/39 PASS**, 42.16 ms of
+simulated time (was 1.78 ms for the 30-case set), 35 min wall-clock.
+The 30 pre-existing cases' per-test durations are unchanged (sum
+1,775,995 → 1,773,810 ns, -0.1 %) — the cap only binds on the new
+cases, which were previously computing garbage.  Measured batch-mode
+gain was modest (~1.1–1.3× per simulated ns): xsim is CPU-bound in
+the design itself (Zynq VIP + interconnect + kernel), not in log or
+waveform I/O, so the wall-clock reduction came mostly from shrinking
+the two biggest regression fixtures.  Further RTL speed-up would need
+sharded parallel xsim runs, not less logging.
+
+**Synthesis impact.**  No II violations; top-level slack stays
+**0.00 ns**.  `compute_conv_geometry` latency 129 → **201 cycles**
+(one more divider chain, once per invocation).  Resources:
+FF **27,487 → 28,638** (+4.2 %); LUT **36,341 → 37,656** (+3.6 %,
+still 32 %); DSP 155, URAM 16 unchanged; BRAM 78 → 79.
+
+---
+
+### 2.22. Channel-major output drain → write bursts
+
+**Problem.**  The 39-case RTL timing (§2.21) checked against the
+ideal-II cycle model (CONV_2D_GRID_PLAN.md §2) showed the OUTPUT WRITE
+PATH, not the MAC array, as the first wall: `write_output_tile` strode
+`y_addr += out_h·out_w` between consecutive stores, so every 16-bit
+output was a lone single-beat AXI transaction (all 133 896 `gmem3`
+writes in the verbose log had `LEN=0`; `gmem3` was absent from the
+csynth burst table).  Measured cost 11.7 cycles per element — 45 % of
+the `M-grouping 64ch 16x16` case, 50 % of the 32×32×32 chunking case —
+and serialised with compute because Phase 3 and the writer run per
+chunk with an 8-deep FIFO between them.
+
+**Change.**  Phase 3 drains `partial_outputs` in channel-major order
+`(mt, m1, oh_local, ow)` and `write_output_tile` mirrors it
+`(ni, chunk, mt, m1, run)`, so each `(chunk, channel)` is one
+contiguous run of `chunk_oh_count·out_w` elements in NCHW `y`.
+`write_output_tile` takes the `ConvGeometry` to know the chunk bounds.
+The URAM reads become `out_ch`-strided, which is free on-chip.
+
+**Result.** **-14 701 470 ns (-34.9 %)** over the 39 cases, 39/39 RTL
+PASS, bit-exact (39 named + 300-case sweep).  Biggest movers:
+`DW oh-chunking 32ch 32x32` **-52.5 %**, `oh-chunking standard 32x32x32`
+**-39.9 %**, `M-grouping in_h=17` -38.5 %, `M-grouping 64ch` -38.4 %
+(434 k → 267 k cycles), `1x1 IC*2 M*2` -32.9 %.  The 30 pre-§2.21 cases
+moved 0–20 % (their outputs are small).
+
+**Synthesis impact.**  `gmem3` now appears in the burst table as a
+variable-length write burst on `VITIS_LOOP_471_5`.  No II violations;
+slack 0.00 ns.  FF 28 638 → 29 986, LUT 37 656 → 39 531 (33 %), DSP
+155 → 168 (chunk/run address arithmetic), BRAM 79, URAM 16.
+
+**Also in this step (test net, CONV_2D_GRID_PLAN.md §6):**
+`TestConvSim.cpp --sweep N [--seed S]` draws N random scheduler-admissible
+geometries and checks them bit-exact against the oracle (300 cases in
+10 s; registered as ctest `TestConvSweep`).  Against the pre-§2.21
+kernel it fails 99/300 — it would have caught that bug on the first run.
+C-sim-only invariants: a line_buf residency tag asserts that every
+Phase-2 read returns the pixel it expects (the §2.21 bug class becomes an
+assert), and ConvKernel asserts all four streams are empty on return
+(producer/consumer beat-count mismatches surface as an assert instead of
+an RTL hang).  The debug duplicate-read report is now opt-in via
+`CONV_DEBUG_READS=1`.
+
+---
+
+### 2.23. Padded accumulator layout — one word per m-tile
+
+**Problem.**  With the grid about to cut the reduction 8×, the per-mt
+accumulator load and writeback loops (`m_valid` cycles each at one
+element per cycle from `partial_outputs`) would dominate: for a 1×1
+they were already 16 of 24 cycles per tile.  A vector access needs the
+tile's `kTileM` lanes in one aligned word, but the flat
+`(pixel·out_ch + m)` layout is aligned only when `out_ch % kTileM == 0`.
+
+**Change.**  `partial_outputs` is laid out `[pixel][m_tile][kTileM]`
+(`word = (oh_local·out_w + ow)·m_tiles + mt`, entry `word·kTileM + m1`)
+and `ARRAY_RESHAPE cyclic factor=kTileM dim=1` (still URAM), so Phase 2
+loads and stores a whole tile in one access; lanes `m1 ≥ m_valid` of the
+last tile are padding (zero at init, never drained).  Phase 1 writes
+whole words, Phase 3 reads single lanes.  `compute_oh_chunking` uses the
+padded row `out_w · m_tiles·kTileM`; the scheduler validator mirrors it
+(`_conv_hw_config.py` now exports `CONV_TILE_M`, `nodes.py` checks
+`out_w · ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries`; the
+overflow test's expected product updated; 1300/1300 scheduler tests).
+Also extracted the two accumulate functions into
+`include/ConvMacGrid.h` (§2.24's plan step 3) with a dedicated unit test
+`TestConvGrid` (ctest; 12 642 tile cases, every `(kh, kw, ic_valid,
+m_valid)`, bit-exact vs a scalar loop).
+
+**Result.**  Gated together with §2.24/§2.25 below (one synthesis + RTL
+run; each step was verified bit-exact in C-sim on its own — 39 named +
+300-sweep — before the next was applied).
+
+### 2.24. 16 × 8 MAC grid (IC × M) — plan CONV_2D_GRID_PLAN.md §4
+
+**Problem.**  The standard-conv MAC array was 16 × 1: input channels
+spatial (16 DSPs), output channels rotated over TIME (`m1 = ri &
+(kTileM-1)`) purely to give `acc[m1]` a RAW distance ≥ MAC latency.
+One output tile cost `kh·kw·kTileM` cycles per ic-tile.
+
+**Change.**  `accumulate_standard` fires all `kTileM × kTileIC = 128`
+products per kernel position: the patch column is read once and
+broadcast across 8 output-channel columns, each with a private 16-input
+adder tree feeding `acc[m1] += tree` (distance-1 recurrence, closes at
+II=1 exactly as the depthwise grid already did).  Loop bound
+`kh·kw·kTileM → kh·kw`.  Weight masks on both `ic_l ≥ ic_valid` and the
+new `m1 ≥ m_valid` keep RTL 'X' out of the padded word.  `w_cache` is
+banked `ARRAY_PARTITION complete dim=2` (m) + `ARRAY_RESHAPE complete
+dim=3` (ic → 256-bit words): 128 values/cycle from 8 ports; the
+ic-serial fill loop kept II=1 on the reshaped words (plan §5.1 option 1
+held, no LUTRAM fallback needed).  Broadcast grid, not a systolic array
+— see plan §3 for why at this scale.
+
+### 2.25. BiasVec — one accumulator word per bias beat
+
+Phase 1 read `bias_stream` one `AccData_t` per lane; with §2.23 it wants
+one padded word per `(pixel, mt)`.  `bias_producer` now emits a
+`BiasVec{AccData_t lane[kTileM]}` per `(pixel, mt)` (`bias_buf`
+partitioned `cyclic factor=kTileM`; padding lanes zero) and Phase 1
+writes it as one word at II=1 — 8× fewer cycles.
+
+**Result (§2.23–§2.25 together).** **-17 267 060 ns (-63.0 %)** vs
+§2.22, **-75.9 % cumulative** vs the §2.21 snapshot; 39/39 RTL PASS
+(753 s wall vs 1 448 s), bit-exact.  Per case:
+`7x7 s2 stem` **-76.3 %**, `oh-chunking 32x32x32` **-73.1 %**,
+`M-grouping in_h=17` -69.8 %, `M-grouping 64ch` -69.3 %
+(267 k → **82 k cycles**; 434 k at §2.21 → 5.3×; plan projected ~70 k),
+`14x14 multi-tile` -64.1 %, `ow-tiling` -61.0 %,
+`partial_M_tile` -53.5 %.  Depthwise cases moved only 8–25 %: the
+depthwise grid is unchanged and its chunking case is now write-bound
+(§2.26).  `batch_3 ResNet-style` -4.7 % and `1x1 IC*2 M*2` -3.5 % are
+tiny layers dominated by weight fill and DDR latency.
+
+**Synthesis impact.**  Grid loop (`ConvMacGrid.h:68`) iteration
+latency 5, **II=1**; no II violations anywhere; slack 0.00 ns
+(process_conv_kernel_tile 0.26).  DSP **168 → 278** (22 %; the grid's
+128 plus address arithmetic), BRAM **79 → 132** (45 %; `w_cache` as
+8 × 256-bit-word RAMs — the plan's ~24 BRAM36 estimate), URAM
+**16 → 8** (the reshaped 256-bit accumulator words pack 4× denser),
+FF 29 986 → 30 581, LUT 39 531 → 44 735 (38 %; the 8 adder trees).
+
+---
+
+### 2.26. Chunk-deep URAM output FIFO (write overlap) — small win, kept
+
+**Problem.**  After §2.25 the cycle model puts the 64-ch case at
+compute 42 k + fill 4.6 k + Phase 1 2 k + Phase 3/write 38 k (measured
+82 k): the writer is ~2.3 cycles/element and its time is serial with
+compute because `acc_stream` was 8 deep — Phase 3 blocks on it and the
+consumer cannot start the next chunk until the writer has drained.
+
+**Change.**  `acc_stream` depth `kTileM → kMaxAccPersistEntries`
+(65 536) with `BIND_STORAGE type=fifo impl=uram` (UG1399 chunk `…_chunk_3/4`:
+FIFO type, URAM impl): the FIFO absorbs a whole chunk, so Phase 3 never
+blocks and `write_output_tile` bursts chunk *c* to DDR while the
+consumer computes chunk *c+1*.
+
+**Result.** **-174 510 ns (-1.7 %)**, 39/39 RTL PASS.  Only multi-chunk
+layers move (`M-grouping batch=2 dil=2` -5.0 %, `in_h=17` -4.3 %,
+`64ch` -4.4 %, `stem` -3.3 %); the 32×32×32 chunking cases are
+single-chunk at `kMaxAccPersistEntries = 65536` and move 0.0 % — with
+nothing to overlap, the write phase still costs 2.3 cycles/element
+after compute.  Kept because the URAM was idle (**8 → 24 of 64**, no
+other resource change, no II change) and because it is the
+prerequisite for a min-chunks policy (force ≥ N chunks per layer so
+single-chunk layers overlap too — only worth it once `w_cache` is
+ping-ponged, since each extra chunk re-streams the group's weights:
+4.6 k cycles per chunk on the 64-ch case).  The lever that matters
+first is the writer's 2.3 cycles/element itself — investigated next.
+
+---
+
+### 2.27. Explicit write bursts (hls::burst_maxi on y)
+
+**Problem.**  A per-beat RTL trace of the `gmem3` write channel on the
+64-ch case (testbench `+VERBOSE` W/AW/B probes, added this step) showed
+the write phase at 1.9 cycles/element although both the Phase-3 drain
+and the writer loop schedule at II=1.  Findings, in the order they were
+ruled out:
+
+* The port options documented in the pragma comment
+  (`max_write_burst_length=256`, `num_write_outstanding=8`) had never
+  been on the pragmas — csynth showed the defaults (16-beat bursts).
+* With the writer's `m1` loop flattened into the run loop, HLS deferred
+  the LAST 16-beat burst of every channel run and flushed all 64 of them
+  after an ~8 k-cycle pause at the end of the kernel (visible as a
+  back-jump in the DDR write-address trace).
+* With `LOOP_FLATTEN off` and 256-beat bursts, the m_axi adapter
+  buffered a WHOLE burst at the 1-element/cycle drain rate before
+  transmitting it at 1 beat/cycle (32-bit beats, 2 elements each) —
+  drain and transfer never overlapped.  A constant-trip inner loop
+  (manual-burst shape) was re-merged by burst inference; 16-beat bursts
+  brought the deferral back.
+* Moving `acc_stream` from URAM to BRAM changed nothing (not the FIFO).
+
+**Change.**  `y` becomes `hls::burst_maxi<Data_t>`: `write_output_tile`
+issues `write_request(base, run_len)` per contiguous channel run,
+streams `write()`s behind it, and collects `write_response()`s in a
+sliding window of 8 (≤ `num_write_outstanding=16`).  Ports carry
+explicit `max_*_burst_length=256`, `num_*_outstanding=16` (VectorOP's
+settings).  The pointer constructor makes the C-sim / cosim harnesses'
+`Data_t*` convert implicitly; the C model also asserts request/response
+pairing.
+
+**Result.**  Internal FIFO probe: the drain and the writer both run at
+1.0 element/cycle; the remaining "stall" in the single-case trace turned
+out to be chunk 1's compute (the §2.21 residency cap splits this
+16-row layer into 14 + 2 rows) with the writer draining chunk 0
+underneath it — i.e. §2.26 working as designed.  64-ch case
+82 k → 77.2 k cycles (-6 %).
+
+### 2.28. Explicit read bursts (hls::burst_maxi on x)
+
+**Problem.**  The same trace on `gmem0`: every (row, channel) run of the
+patch producer's Phase 1 was one inferred 16-element burst issued only
+after the previous one completed — 69 cycles per burst (the VIP's
+38-cycle read latency + 16 beats + overhead) with ONE read in flight,
+4.3 cycles/element.  The cycle model put the depthwise chunking case
+(32 ch, 32×32, 23 % of the suite's simulated time) at ~141 k of its
+233 k cycles in input loads.
+
+**Change.**  `x` becomes `hls::burst_maxi<Data_t>`; Phase 1 issues
+`read_request`s for ALL `ch_valid` channel runs of a row (II=1, up to
+16 in flight) before draining any of them with `read()`.
+
+**Result (single-case traces).**  AR-to-AR spacing 690 → **30 ns**
+between a row's channel runs; `DW oh-chunking 32ch` 232.8 k →
+**181.5 k cycles (-22 %)**, now compute + write bound; 64-ch case
+77.2 k → 76.0 k.  Synthesis: no II violations, slack 0.00; DSP 278 →
+256, BRAM 132 → 151 (the deeper AXI adapter buffers), LUT 44.7 k →
+43.6 k, URAM 24.
+
+**Result (§2.27 + §2.28, full suite).** **-1 304 780 ns (-13.1 %)** vs
+§2.26, **-79.4 % cumulative** vs the §2.21 snapshot (42.1 M → 8.68 M ns);
+39/39 RTL PASS in 662 s.  Read-bound cases moved most:
+`partial_IC_tile` **-40.7 %**, `batch_3 ResNet-style` **-39.6 %**,
+`DW_ch_TILE_M*2` -33.4 %, `14x14 multi-tile` -25.7 %,
+`DW oh-chunking 32ch` -22.0 %; the compute-bound M-grouping cases
+-0.8…-3.4 %.
+
+---
+
+### 2.29. Fused (tile, khi, kwi) loop — drain folded into the grid sweep
+
+**Problem.**  After §2.24 a standard-conv pixel still ran as 1 + 3·G
+separately pipelined loops: a kh·kw patch drain, then per tile an
+accumulator-word load, the kh·kw grid loop (iteration latency 5) and a
+store — each paying its own pipeline ramp.  Cycle model per pixel per
+group at G = 4, 3×3: 9 + 2 + 4·(2 + 14 + 2) = 83 cycles for 36
+MAC-cycles of work (43 % utilisation).  Depthwise likewise: 9 drain +
+14 + 4 = 27 per pixel for 9.
+
+**Change.**  `ConvMacGrid.h` exposes the per-position PE step
+(`mac_grid_step`, `mac_dw_step`; the whole-window functions remain as
+the `TestConvGrid` surface).  The consumer runs ONE II=1 loop per pixel
+over `(g, khi, kwi)` with counters: tile 0 consumes each PatchVec beat
+straight from the stream and parks it in `patch`, tiles 1..G-1 replay
+it from `patch`; all G tiles' accumulators (`acc[kMaxMperGroup][kTileM]`,
+32 registers) are loaded before and stored after the sweep.  The
+patch write (g = 0) → read (g ≥ 1) RAW distance is kh·kw ≥ 1
+iterations; HLS scheduled it at II=1 without a DEPENDENCE pragma
+(iteration latency 6).  Depthwise has one tile, so it consumes the
+beats directly — no patch buffer at all (II=1, latency 5).
+
+**Result.** **-1 487 650 ns (-17.1 %)** vs §2.28, **-82.9 %
+cumulative** vs the §2.21 snapshot (42.1 M → 7.19 M ns); 39/39 RTL PASS
+in 608 s; bit-exact (grid 12 642 / named 39 / sweep 2×300).
+`14x14 multi-tile` -20.8 %, `7x7 stem` -20.3 %, `oh-chunking
+32x32x32` -20.1 %, `DW oh-chunking` -18.5 %, `M-grouping 64ch` -16.9 %
+(76 k → **63 k cycles**; **6.9×** vs the 434 k at §2.21).  Tiny layers
+(`batch_3 ResNet-style` -1.0 %) are weight-fill / latency bound.
+
+**Synthesis impact.**  No II violations; slack 0.00 ns.  DSP 256 →
+259, FF 29 467 → 33 087 (the 32 accumulator registers and their
+G-way muxes), LUT 43.6 k → 44.8 k (38 %), BRAM 151, URAM 24 unchanged.
+
+---
+
+## 3. Current architecture (post-§2.29)
 
 ```mermaid
 flowchart LR

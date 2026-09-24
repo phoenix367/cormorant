@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Config.h"
+#include "hls_burst_maxi.h"
 
 // ---------------------------------------------------------------------------
 // saturate_cast<T>(v)
@@ -91,15 +92,22 @@ inline T saturate_cast(From v) {
 //   y     [batch][out_ch][out_h][out_w]
 //
 // AXI interface (in ConvKernel.cpp):
-//   x, weight, bias → m_axi gmem0/1/2  (read ports)
-//   y               → m_axi gmem3      (write port)
+//   x, weight, bias → m_axi gmem0/1/2  (read ports; x is hls::burst_maxi)
+//   y               → m_axi gmem3      (write port, hls::burst_maxi)
 //   all scalars     → s_axilite, bundle=ctrl
 // ---------------------------------------------------------------------------
+// x and y are hls::burst_maxi<> ports (§2.27/§2.28): the patch producer
+// issues explicit read_requests for a whole row's channel runs ahead of
+// reading them, and write_output_tile issues one write_request per
+// contiguous channel run and streams the data behind it, instead of
+// relying on burst inference.  A plain Data_t* converts implicitly
+// (hls_burst_maxi.h's pointer constructor), so C-sim and cosim harnesses
+// keep passing pointers.
 void ConvKernel(
-    const Data_t* x,
+    hls::burst_maxi<Data_t> x,
     const Data_t* weight,
     const Data_t* bias,
-    Data_t*       y,
+    hls::burst_maxi<Data_t> y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,

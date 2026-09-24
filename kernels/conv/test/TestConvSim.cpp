@@ -27,7 +27,8 @@
 //   partial TILE_IC, partial TILE_M, dilation=2, batch>1, bias,
 //   exact tile multiples, asymmetric stride, asymmetric dilation,
 //   1×1 output, horizontal filter, ResNet-style strided block,
-//   saturation (ap_fixed only).
+//   oh-chunking, M-grouping, M-grouping with chunks taller than the
+//   line buffer (residency cap), ow-tiling, saturation (ap_fixed only).
 //
 // Test matrix (depthwise conv, is_depthwise=1):
 //   3×3 depthwise, 3×3 depthwise+bias, partial TILE_M, dilation=2,
@@ -59,6 +60,8 @@
 static std::string g_dump_dir;     // empty → verify mode (default)
 static int         g_test_idx = 0; // increments per call to run_test
 static FILE*       g_manifest = nullptr;
+static int         g_sweep_n  = 0; // --sweep N: randomised-geometry mode
+static unsigned    g_sweep_seed = 1234u;
 
 // ---------------------------------------------------------------------------
 // Scalar limits derived via saturate_cast — works for both ap_fixed and float.
@@ -412,7 +415,9 @@ static int run_test(const char* name, const ConvParams& p,
     Data_t*       y_ptr = y_got.data();
 #endif
 
-    ConvKernel(x_ptr, w_ptr, b_ptr, y_ptr,
+    // x / y are hls::burst_maxi<Data_t> ports; the pointer constructor
+    // takes a non-const Data_t* (the kernel only ever reads through x).
+    ConvKernel(const_cast<Data_t*>(x_ptr), w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
                p.kh, p.kw,
@@ -459,20 +464,107 @@ static std::vector<T> rand_vec(unsigned n, float scale, std::mt19937& rng)
 }
 
 // ---------------------------------------------------------------------------
+// --sweep N [--seed S]: randomised-geometry sweep.
+//
+// Draws N geometries uniformly from the space the inference scheduler
+// admits (kernel window fits the line buffer, one output row fits the
+// persistent accumulator, depthwise ⇒ in_ch == out_ch) and checks each
+// against the naive oracle, bit-exact.  Sizes are capped so a 300-case
+// sweep runs in about a minute of C-sim.  The named tests above cover the
+// mechanisms one at a time; the sweep covers their INTERACTIONS — the
+// §2.21 stale-line-buffer bug (out_ch > 32 with a chunk taller than the
+// line buffer) is exactly the kind of corner it exists for, and ~20 % of
+// this space would have tripped it.  Any failure is printed with its full
+// geometry so it can be re-added above as a named regression case.
+// ---------------------------------------------------------------------------
+static int run_sweep(int n, unsigned seed)
+{
+    std::mt19937 rng(seed);
+    auto U = [&](unsigned lo, unsigned hi) {
+        return std::uniform_int_distribution<unsigned>(lo, hi)(rng);
+    };
+    int failures = 0, cases = 0, attempts = 0;
+    printf("Randomised geometry sweep: %d cases, seed %u\n", n, seed);
+    printf("------------------------------------------------------------------\n");
+    while (cases < n && attempts < n * 50) {
+        attempts++;
+        ConvParams p{};
+        p.is_depthwise = (U(0, 3) == 0);
+        p.batch      = U(1, 3);
+        p.in_ch      = U(1, 40);
+        p.out_ch     = p.is_depthwise ? p.in_ch : U(1, 72);
+        p.in_h       = U(1, 70);
+        p.in_w       = U(1, 70);
+        p.kh         = U(1, kMaxKH);
+        p.kw         = U(1, kMaxKW);
+        p.stride_h   = U(1, 3);
+        p.stride_w   = U(1, 3);
+        p.dilation_h = U(1, 3);
+        p.dilation_w = U(1, 3);
+        p.pad_top    = U(0, 3);  p.pad_bottom = U(0, 3);
+        p.pad_left   = U(0, 3);  p.pad_right  = U(0, 3);
+        p.has_bias   = (U(0, 1) == 1);
+
+        // Scheduler-side admissibility (nodes.py validation).
+        if ((p.kh - 1) * p.dilation_h + 1 > kMaxLineBufRows) continue;
+        if ((p.kw - 1) * p.dilation_w + 1 > kMaxLineBufCols) continue;
+        const unsigned eff_h = p.dilation_h * (p.kh - 1) + 1;
+        const unsigned eff_w = p.dilation_w * (p.kw - 1) + 1;
+        if (p.in_h + p.pad_top  + p.pad_bottom < eff_h) continue;
+        if (p.in_w + p.pad_left + p.pad_right  < eff_w) continue;
+        const unsigned out_h = out_size(p.in_h, p.kh, p.stride_h, p.dilation_h,
+                                        p.pad_top, p.pad_bottom);
+        const unsigned out_w = out_size(p.in_w, p.kw, p.stride_w, p.dilation_w,
+                                        p.pad_left, p.pad_right);
+        const unsigned out_ch_padded = ((p.out_ch + kTileM - 1) / kTileM) * kTileM;
+        if (out_w * out_ch_padded > kMaxAccPersistEntries) continue;
+        // C-sim time cap: bound the MAC count per case.
+        const unsigned long macs = (unsigned long)p.batch * p.out_ch * out_h * out_w
+                                 * (p.is_depthwise ? 1u : p.in_ch) * p.kh * p.kw;
+        if (macs > 40000000ul) continue;
+
+        const unsigned n_w = p.is_depthwise ? p.out_ch * p.kh * p.kw
+                                            : p.out_ch * p.in_ch * p.kh * p.kw;
+        auto x = rand_vec<Data_t>(p.batch * p.in_ch * p.in_h * p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(n_w, 0.1f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        char name[64];
+        std::snprintf(name, sizeof(name), "sweep #%d", cases);
+        failures += run_test(name, p, x, w, b);
+        cases++;
+    }
+    printf("------------------------------------------------------------------\n");
+    printf("Sweep: %d cases run (%d attempts), %d element mismatch(es)\n",
+           cases, attempts, failures);
+    return failures;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv)
 {
     // Optional --dump-data <dir>: write per-test x/w/b/y_ref hex files plus
-    // a manifest, then exit (no kernel run).  Otherwise: original verify mode.
+    // a manifest, then exit (no kernel run).  --sweep N [--seed S]: run only
+    // the randomised-geometry sweep.  Otherwise: original verify mode.
     for (int i = 1; i < argc; i++) {
         const std::string a(argv[i]);
         if ((a == "--dump-data" || a == "-d") && i + 1 < argc) {
             g_dump_dir = argv[++i];
+        } else if (a == "--sweep" && i + 1 < argc) {
+            g_sweep_n = std::atoi(argv[++i]);
+        } else if (a == "--seed" && i + 1 < argc) {
+            g_sweep_seed = (unsigned)std::strtoul(argv[++i], nullptr, 10);
         } else if (a == "--help" || a == "-h") {
-            std::printf("Usage: %s [--dump-data <dir>]\n", argv[0]);
+            std::printf("Usage: %s [--dump-data <dir>] [--sweep N [--seed S]]\n", argv[0]);
             return 0;
         }
+    }
+
+    if (g_sweep_n > 0) {
+        const int f = run_sweep(g_sweep_n, g_sweep_seed);
+        printf(f == 0 ? "ALL TESTS PASSED\n" : "FAILED: %d element mismatch(es)\n", f);
+        return f == 0 ? 0 : 1;
     }
 
     if (!g_dump_dir.empty()) {
@@ -867,6 +959,73 @@ int main(int argc, char** argv)
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
         total_failures += run_test("M-grouping standard (out_ch=64, 2 M-groups)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28b: M-grouping with a chunk taller than the line buffer.
+    // Regression for the stale-row bug: the patch producer replays each
+    // chunk's (oh, ow) sweep from line_buf once per M-group without
+    // re-reading DDR, but line_buf only holds kMaxLineBufRows (16) rows.
+    // Test 28 above uses in_h=16, exactly the buffer depth, so it could
+    // never see rows being overwritten.  Here in_h=17 with 3x3/pad=1 needs
+    // input rows -1..17 in one chunk (out_h*out_w*out_ch = 17*17*64 fits
+    // kMaxAccPersistEntries in a single chunk if uncapped), so without the
+    // residency cap in compute_conv_geometry() group 1 reads rows 0..1
+    // after rows 16..17 have taken their slots — mismatches start at
+    // m=32, oh=0.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=17; p.in_w=17; p.out_ch=64;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("M-grouping, in_h=17 > line_buf rows (residency cap)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28c: ResNet-style stem geometry — 7x7 stride 2 pad 3, 3→40 ch on
+    // a 32x32 input (out 16x16).  40 ch = 5 m-tiles → two M-groups; the
+    // stride-2 sweep covers 2 input rows per output row so the uncapped
+    // chunk (16 rows) spans ~37 input rows.  The cap must shrink chunks to
+    // (16 - 7) / 2 + 1 = 5 output rows.  Also exercises the multi-chunk
+    // path that tests 27/31 lost when kMaxAccPersistEntries grew to 65536.
+    // (Kept small on purpose — this case is also an RTL fixture, and with
+    // only 3 input channels the 16-lane MAC tree runs at 3/16 utilisation,
+    // so simulated time scales badly with output size.)
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=3; p.in_h=32; p.in_w=32; p.out_ch=40;
+        p.kh=7; p.kw=7; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=3; p.pad_left=3; p.pad_bottom=3; p.pad_right=3;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("M-grouping, 7x7 s2 stem (ResNet-style conv0)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 28d: M-grouping + dilation=2 + stride 2 — the cap's window term
+    // uses (kh-1)*dilation_h, so a dilated kernel must also survive replay.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=2; p.in_ch=8; p.in_h=24; p.in_w=16; p.out_ch=40;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=1;
+        p.dilation_h=2; p.dilation_w=2;
+        p.pad_top=2; p.pad_left=2; p.pad_bottom=2; p.pad_right=2;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("M-grouping, batch=2 dil=2 s_h=2 (residency cap)", p, x, w, b);
     }
 
     // -----------------------------------------------------------------------

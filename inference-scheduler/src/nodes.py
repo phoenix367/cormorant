@@ -874,6 +874,7 @@ from ._conv_hw_config import (  # noqa: E402
     CONV_MAX_LINE_BUF_ROWS,
     CONV_MAX_LINE_BUF_COLS,
     CONV_MAX_ACC_PERSIST_ENTRIES,
+    CONV_TILE_M,
 )
 
 
@@ -1154,17 +1155,22 @@ class ConvNode:
                 f"raise 'kernels.conv.max_line_buf_cols' in the "
                 f"platform JSON (must remain a power of 2)."
             )
-        row_entries = w_out * m_val
+        # The kernel's persistent accumulator stores out_ch padded up to a
+        # multiple of kTileM (one aligned word per m-tile), so the row
+        # that must fit is out_w * ceil(out_ch/kTileM)*kTileM, not
+        # out_w * out_ch.  Mirrors compute_oh_chunking() in ConvKernel.cpp.
+        m_padded    = -(-m_val // CONV_TILE_M) * CONV_TILE_M
+        row_entries = w_out * m_padded
         if row_entries > CONV_MAX_ACC_PERSIST_ENTRIES:
             raise SchedulerError(
-                f"Conv node '{node_label}': out_w*out_ch = "
-                f"{w_out}*{m_val} = {row_entries} exceeds persistent "
-                f"accumulator capacity "
+                f"Conv node '{node_label}': out_w*out_ch (padded to the "
+                f"kTileM={CONV_TILE_M} tile) = {w_out}*{m_padded} = "
+                f"{row_entries} exceeds persistent accumulator capacity "
                 f"kMaxAccPersistEntries={CONV_MAX_ACC_PERSIST_ENTRIES} "
-                f"(one output row must fit; taller out_h is auto-chunked "
-                f"along oh).  Raise 'kernels.conv.max_acc_persist_entries' "
-                f"in the platform JSON (each 4096 entries spends one URAM "
-                f"block)."
+                f"(one padded output row must fit; taller out_h is "
+                f"auto-chunked along oh).  Raise "
+                f"'kernels.conv.max_acc_persist_entries' in the platform "
+                f"JSON (each 4096 entries spends one URAM block)."
             )
 
         return cls(

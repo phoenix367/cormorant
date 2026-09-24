@@ -174,11 +174,14 @@ class TestConvNodeHardwareBounds(unittest.TestCase):
         self.assertIn("out_w*out_ch", msg)
         self.assertIn("kMaxAccPersistEntries", msg)
         # The generator uses out_w=256 and picks the smallest out_ch that
-        # overflows the limit, so the product printed in the error is
-        # MAX // 256 * 256 + 256 = MAX rounded down to a 256-multiple + 256.
-        out_w = 256
-        expected_product = (CONV_MAX_ACC_PERSIST_ENTRIES // out_w + 1) * out_w
-        self.assertIn(str(expected_product), msg)
+        # overflows the limit (out_ch = MAX // 256 + 1).  The kernel pads
+        # out_ch up to a multiple of kTileM (§2.23 accumulator layout), and
+        # the validator reports the padded product.
+        from src._conv_hw_config import CONV_TILE_M
+        out_w  = 256
+        out_ch = CONV_MAX_ACC_PERSIST_ENTRIES // out_w + 1
+        padded = -(-out_ch // CONV_TILE_M) * CONV_TILE_M
+        self.assertIn(f"{out_w}*{padded} = {out_w * padded}", msg)
 
     def test_in_ch_at_limit_parses(self):
         """in_ch == kMaxInCh must parse — bound is `≤`, not `<`."""
