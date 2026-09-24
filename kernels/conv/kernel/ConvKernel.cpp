@@ -460,6 +460,10 @@ static void write_output_tile(
 // `r` iteration.  The entire bias vector is therefore loaded once into
 // bias_buf[kMaxOutCh] and replayed `reps` times.  When has_bias=0 no DDR
 // transactions are issued and the producer pushes zero vectors directly.
+//
+// §2.37 depthwise: the consumer's flat sweep initialises every pixel's
+// accumulator word from a per-TILE register, so it reads ONE BiasVec per
+// (ni, chunk, mt) — reps = batch * num_chunks (set by ConvKernel).
 // ---------------------------------------------------------------------------
 static void bias_producer(
     hls::burst_maxi<WeightWord> bias,
@@ -1005,17 +1009,19 @@ static void stream_load_weights(
 // sub-range:
 //
 //   Per (ni, chunk):
-//     Phase 1 (init):  drain chunk_oh_count*out_w*m_tiles BiasVec words
-//                      into partial_outputs[] (URAM-resident), indexed by
-//                      oh_local = oh - oh_start.
+//     Phase 1 (init):  standard only — drain chunk_oh_count*out_w*m_tiles
+//                      BiasVec words into partial_outputs[] (URAM-resident),
+//                      indexed by oh_local = oh - oh_start.
 //     Phase 2 (accum): standard   — for ict OUTER, (oh_in_chunk, ow, mt)
 //                                   inner; load patch[kTileIC][kh][kw],
 //                                   weight[kTileM][kTileIC][kh][kw],
 //                                   reduce ic_valid*kh*kw*kTileM at II=1.
-//                      depthwise  — for mt OUTER, (oh_in_chunk, ow) inner;
-//                                   load patch[kTileM][kh][kw],
-//                                   load w_buf[kTileM][kh][kw] ONCE per
-//                                   (chunk, mt), reduce kh*kw*kTileM at II=1.
+//                      depthwise  — for mt OUTER, one flat II=1 loop over
+//                                   (oh_in_chunk, ow_in_tile, khi*kw+kwi)
+//                                   per ow_tile (§2.37); w_buf[kTileM][kh*kw]
+//                                   loaded ONCE per (chunk, mt); the word is
+//                                   seeded from the tile's BiasVec and
+//                                   stored write-only at the window's end.
 //     Phase 3 (drain): saturate_cast partial_outputs to Data_t and push
 //                      to acc_stream in (mt, m1, oh_in_chunk, ow) order —
 //                      channel-major, so write_output_tile's matching nest
@@ -1119,6 +1125,10 @@ static void process_conv_kernel_tile(
         // -------- Phase 1: init partial_outputs from bias_stream --------
         // One BiasVec beat = one padded accumulator word per (pixel, mt):
         // the producer already zeroed the padding lanes (§2.25).
+        // Standard path only: the depthwise sweep (§2.37) touches each
+        // (pixel, mt) word exactly once, so it seeds the accumulator from a
+        // per-tile bias register and stores the word write-only.
+        if (!is_depthwise)
         for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
             for (unsigned ow = 0; ow < out_w; ow++) {
                 for (unsigned mt = 0; mt < m_tiles; mt++) {
@@ -1359,12 +1369,33 @@ static void process_conv_kernel_tile(
             } // ict
         } else {
             // -------- Phase 2b: depthwise accumulate (mt OUTER, ow_tile) --------
+            // §2.37 flat sweep: per (mt, ow_tile) ONE II=1 loop over
+            // (oh_local, ow_in_tile, ri).  Each (pixel, mt) word is visited
+            // exactly once in depthwise mode (no ic-tile reduction), so the
+            // accumulator is seeded from the tile's bias register at ri == 0
+            // and the full kTileM-lane word is stored write-only at
+            // ri == kh*kw-1 — no partial_outputs load, no Phase 1, and the
+            // pipeline ramp is paid once per (mt, ow_tile) instead of once
+            // per pixel (the per-pixel load / kh*kw-loop / store used to cost
+            // ~15 cycles for 9 MACs).
             const unsigned ow_per_tile_dw  = geom.ow_per_tile;
             const unsigned num_ow_tiles_dw = geom.num_ow_tiles;
+            const unsigned n_pos           = kh * kw;
+            const unsigned row_words       = out_w * m_tiles;
 
             for (unsigned mt = 0; mt < m_tiles; mt++) {
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
+
+                // One BiasVec per (ni, chunk, mt): the tile's initial
+                // accumulator word (padding lanes already zero, §2.25).
+                const BiasVec bv = bias_stream.read();
+                AccData_t bias_reg[kTileM];
+                #pragma HLS ARRAY_PARTITION variable=bias_reg complete dim=0
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    #pragma HLS UNROLL
+                    bias_reg[m1] = bv.lane[m1];
+                }
 
                 // Load weights ONCE per (chunk, mt) (held in BRAM across all
                 // ow_tiles and the (oh, ow_in_tile) sweep).  ow-tiling here
@@ -1374,16 +1405,27 @@ static void process_conv_kernel_tile(
                 // dim 1 complete → kTileM lanes read per cycle by the grid;
                 // dim 2 cyclic kTileIC → the kTileIC positions of one
                 // WeightVec beat land in distinct banks and are written in
-                // one cycle.
+                // one cycle.  Lanes m1 >= m_valid (padding of the last tile)
+                // are filled with zeros so no 'X' reaches the accumulator
+                // word in RTL (its padding lanes are never drained, but
+                // §2.38's Phase 3 reads whole words).
                 Data_t w_buf[kTileM][kMaxKPos];
                 #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=1
                 #pragma HLS ARRAY_PARTITION variable=w_buf cyclic factor=kTileIC dim=2
                 const unsigned dw_words = conv_dw_stride(kh, kw) / kWeightPortElems;
                 const unsigned dw_vecs  = (dw_words + kWordsPerWeightVec - 1) / kWordsPerWeightVec;
-                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
                     for (unsigned beat = 0; beat < dw_vecs; beat++) {
                         #pragma HLS PIPELINE II=1
-                        const WeightVec v = weight_stream.read();
+                        WeightVec v;
+                        if (m1 < m_valid) {
+                            v = weight_stream.read();
+                        } else {
+                            for (unsigned j = 0; j < kTileIC; j++) {
+                                #pragma HLS UNROLL
+                                v.lane[j] = Data_t(0);
+                            }
+                        }
                         for (unsigned j = 0; j < kTileIC; j++) {
                             #pragma HLS UNROLL
                             const unsigned pos = beat * kTileIC + j;
@@ -1395,35 +1437,50 @@ static void process_conv_kernel_tile(
               for (unsigned owt = 0; owt < num_ow_tiles_dw; owt++) {
                 const unsigned ow_start = owt * ow_per_tile_dw;
                 const unsigned ow_end   = std::min(out_w, ow_start + ow_per_tile_dw);
+                const unsigned tw       = ow_end - ow_start;
+                const unsigned n_iter   = chunk_oh_count * tw * n_pos;
 
-                for (unsigned oh_local = 0; oh_local < chunk_oh_count;
-                     oh_local++) {
-                    for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                        // §2.29: depthwise has a single tile per pixel, so
-                        // the PatchVec beats feed the lanes straight from
-                        // the stream — no patch buffer, no drain loop.
-                        AccData_t acc[kTileM];
-                        #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                // Running partial_outputs word cursor (§2.23 layout:
+                // word = (oh_local*out_w + ow)*m_tiles + mt) — incremented
+                // per pixel / per row so the loop carries no multiply.
+                unsigned word_row = ow_start * m_tiles + mt;
+                unsigned word     = word_row;
+                unsigned ri = 0, ow_l = 0;
 
-                        // §2.23: one aligned word per (pixel, mt).
-                        const unsigned word =
-                            (oh_local * out_w + ow) * m_tiles + mt;
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                            #pragma HLS UNROLL
-                            acc[m1] = partial_outputs[word * kTileM + m1];
-                        }
+                AccData_t acc[kTileM];
+                #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    #pragma HLS UNROLL
+                    acc[m1] = AccData_t(0);
+                }
 
-                        const unsigned n_steps_dw = kh * kw;
-                        for (unsigned ri = 0; ri < n_steps_dw; ri++) {
-                            #pragma HLS PIPELINE II=1
-                            const PatchVec v = patch_stream.read();
-                            mac_dw_step(v.lane, w_buf, ri, acc);   // ri == khi*kw + kwi
-                        }
-
+                for (unsigned it = 0; it < n_iter; it++) {
+                    #pragma HLS PIPELINE II=1
+                    // §2.29: depthwise has a single tile per pixel, so the
+                    // PatchVec beats feed the lanes straight from the stream.
+                    const PatchVec v = patch_stream.read();
+                    const bool first = (ri == 0);
+                    const bool last  = (ri + 1 == n_pos);
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        acc[m1] = first ? bias_reg[m1] : acc[m1];
+                    }
+                    mac_dw_step(v.lane, w_buf, ri, acc);   // ri == khi*kw + kwi
+                    if (last) {
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
                             partial_outputs[word * kTileM + m1] = acc[m1];
                         }
+                        ri = 0;
+                        if (++ow_l == tw) {
+                            ow_l      = 0;
+                            word_row += row_words;
+                            word      = word_row;
+                        } else {
+                            word += m_tiles;
+                        }
+                    } else {
+                        ri++;
                     }
                 }
               } // ow_tile
@@ -1596,7 +1653,6 @@ void ConvKernel(
     // while the consumer is still in the previous iteration's compute.
     // -----------------------------------------------------------------------
     #pragma HLS DATAFLOW
-    const unsigned bias_rep_count   = batch * out_h * out_w;
     const unsigned ic_tiles         = (in_ch  + kTileIC - 1) / kTileIC;
     const unsigned m_tiles          = (out_ch + kTileM  - 1) / kTileM;
 
@@ -1606,6 +1662,12 @@ void ConvKernel(
     const ConvGeometry geom = compute_conv_geometry(
         out_h, out_w, out_ch, kh, kw, stride_h, stride_w,
         dilation_h, dilation_w, is_depthwise);
+
+    // Bias replay: standard Phase 1 wants one BiasVec per (pixel, mt);
+    // the depthwise flat sweep (§2.37) one per (ni, chunk, mt).
+    const unsigned bias_rep_count   = is_depthwise
+                                    ? batch * geom.num_chunks
+                                    : batch * out_h * out_w;
 
     // bias_stream carries one BiasVec (a whole m-tile of initial
     // accumulators) per beat (§2.25); depth covers one pixel's m-tiles.

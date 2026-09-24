@@ -382,6 +382,7 @@ becomes a JSON-knob decision rather than an architecture one.
 | 7 (weights) | §2.32 128-bit weight/bias ports, tile-major `[M][ict][kH][kW][16]` layout packed by the scheduler, one w_cache word per cycle | 40/40 RTL, scheduler 1301/1301 | 63 k → 52.7 k | -3.1 % (fill-bound cases -12…-31 %) |
 | 7 (weights) | §2.34 half tile (8 lanes) for a last ic-tile with ≤ 8 channels | 40/40 RTL, scheduler 1302/1302 | 52.7 k → 51.6 k | -3.5 % (stem -17 %) |
 | 7 (w_cache ping-pong) | §2.35 next-slab prefetch into a second bank under the fused sweep; per-m1 RAM columns with a flat power-of-two address (7 synthesis rounds to reach II=1 at BRAM 158) | 40/40 RTL, II=1 depth 7 | 51.6 k → 50.9 k | -2.3 % (stem -14 %) |
+| B1 (THROUGHPUT_PLAN §3) | §2.37 flat depthwise sweep — one II=1 loop per (mt, ow_tile), bias-seeded, write-only word store, no Phase 1 | 40/40 RTL, II=1 lat 5 | (standard case unchanged; DW chunking 145.7 k → 114.4 k) | -4.0 % (DW chunking -21.5 %) |
 
 Cumulative after §2.32: **-79.7 %** of the suite's simulated time (42.1 M
 → 8.56 M ns — the suite gained a 40th, 1.6 M-ns case in §2.30); the

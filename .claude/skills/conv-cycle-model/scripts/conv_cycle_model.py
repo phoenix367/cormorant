@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.34).
+"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.37).
 See SKILL.md for usage.  Constants come from platforms/<AXI_PLATFORM>.json."""
 import argparse, json, math, os, sys
 
@@ -28,6 +28,7 @@ def geom(P, in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw, dwise):
 
 INVOKE_OVERHEAD = 1000   # geometry dividers, bias load, DATAFLOW start-up, first-burst latencies
 ROW_LOAD_LATENCY = 40    # first read data after a row's requests are issued
+DW_TILE_RAMP     = 10    # §2.37: one pipeline ramp per (mt, ow_tile) flat depthwise sweep
 
 def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise):
     """Cycle model.  The patch producer is SEQUENTIAL per row: it loads a row's
@@ -39,7 +40,8 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
     sweep = fill = ph1 = ph3 = loads = 0
     for c in range(chunks):
         rows = min(per, oh - c * per)
-        ph1 += rows * ow * m_tiles
+        if not dwise:
+            ph1 += rows * ow * m_tiles                  # §2.37: depthwise seeds acc from a bias register
         ph3 += rows * ow * out_ch                       # 1 element/cycle drain (+ writer at same rate)
         r0 = c * per * sh - pt
         r1 = (c * per + rows - 1) * sh + (kh - 1) * dh - pt
@@ -51,7 +53,8 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
-                    sweep += rows * tw * (kh * kw + 6)
+                    # §2.37 flat sweep: kh*kw cycles per pixel, one ramp per (mt, ow_tile)
+                    sweep += rows * tw * kh * kw + DW_TILE_RAMP
                     loads += in_rows * (mv * cols + ROW_LOAD_LATENCY)
         else:
             for ict in range(ic_tiles):

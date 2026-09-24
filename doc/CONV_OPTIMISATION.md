@@ -66,6 +66,8 @@ after running the full TestConvRef case list.
 | + tile-geometry hoist (§2.19) | 30 | 1,775,995 | -0.4 % | -63.9 % |
 | + STABLE arguments (§2.20, this snapshot) | 30 | 1,775,775 | -0.0 % | **-63.9 %** |
 | **Current state (post-§2.20, captured 2026-05-16)** | **30** | **1,775,775** | — | **-63.9 %** |
+| Snapshot post-§2.36 (40 tests, captured 2026-09-25 on `perf/dwconv`) | 40 | 7,982,735 | — | — |
+| + flat depthwise sweep (§2.37) | 40 | 7,666,615 | **-4.0 %** | — |
 
 **Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
@@ -1508,6 +1510,50 @@ port speed only shows on 1-pixel (fully-connected) layers.  Matmul and
 Pooling keep their 16-bit ports and are unaffected either way; making
 them faster needs native wide ports in their C++, as MATMUL_OPTIMISATION
 §3 already lists.  Bitstream WNS +1.85 ns.
+
+---
+
+### 2.37. Flat depthwise sweep — one II=1 loop per (mt, ow_tile), no Phase 1
+
+**Problem.**  The depthwise consumer (§2.29) ran, per pixel and tile, a
+1-cycle `partial_outputs` word load, a `kh·kw`-iteration II=1 loop with a
+5-deep ramp, and a word store: ~15 cycles per 8-lane pixel for 9 MACs on
+a 3×3 (the cycle model's `kh·kw + 6`), plus Phase 1's
+`chunk_rows·out_w·m_tiles` cycles of bias init.  On the board's dw-3×3
+64-ch 56×56 layer that sweep was 44 % of the time
+(THROUGHPUT_PLAN.md §3).
+
+**Change.**  Depthwise visits each `(pixel, mt)` accumulator word exactly
+once (no ic-tile reduction), so the sweep needs neither the load nor
+Phase 1: per `(mt, ow_tile)` the consumer runs ONE II=1 loop over
+`(oh_local, ow_in_tile, ri)` with running counters; at `ri == 0` the lane
+accumulators are seeded from a per-tile bias register (`acc = first ?
+bias_reg : acc` in front of `mac_dw_step`), at `ri == kh·kw-1` the whole
+kTileM-lane word is stored write-only through an incremental word cursor
+(no multiply in the loop).  `bias_producer` emits one BiasVec per
+`(ni, chunk, mt)` for depthwise (`reps = batch·num_chunks`) instead of
+one per `(pixel, mt)`; Phase 1 is skipped when `is_depthwise`.  The
+`w_buf` fill zeroes lanes `m1 ≥ m_valid` so the padding lanes of the last
+tile's word are X-free (Phase 3 reads whole words from §2.38 on).  The
+patch producer and `mac_dw_step` are untouched.
+
+**Traps.**  None this time: the `first ? bias : acc` mux sits in front of
+the distance-1 `acc += p·w` recurrence and HLS closed it at II=1 with the
+same 5-stage iteration latency as the old per-pixel loop.
+
+**Result.**  **-316 120 ns (-4.0 %)** over the 40-case suite (7 982 735 →
+7 666 615 ns), 40/40 RTL PASS, bit-exact (grid 18 963 / named 40 / sweep
+2×300).  `DW oh-chunking 32ch 32x32` **-21.5 %** (145.7 k → 114.4 k
+cycles — the plan projected -20 %), every other depthwise case -1.5…-6.2 %
+(they are tiny: one ramp per tile is most of their sweep), every standard
+case within ±0.5 % (noise: the standard path is untouched).  Synthesis:
+II=1 on every loop, the flat loop at iteration latency 5, slack 0.00,
+BRAM 158, DSP 248, FF 36.9 k, LUT 51.7 k (+1.3 k for the counters and the
+bias mux).  Cycle model: depthwise sweep = `rows·tw·kh·kw + 10` per
+`(mt, ow_tile)`, no Phase 1 for depthwise; validation 6.0 % mean error,
+DW cases -3…-9 %.
+
+---
 
 ---
 

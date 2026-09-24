@@ -141,8 +141,8 @@ flowchart TB
     WC -->|PN-wide weights| AC
     WB -->|PM-wide weights| AC
     PA -->|PN/PM MACs| AC
-    BB -->|Phase 1 init| PO
-    AC <-->|Phase 2 read-modify-write| PO
+    BB -->|Phase 1 init, standard only| PO
+    AC <-->|Phase 2 read-modify-write standard / write-only depthwise| PO
     PO -->|Phase 3 drain + saturate| Yd
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
@@ -318,32 +318,37 @@ factors are 1 in the common case).
 ```
 for ni in [0, batch)
   for chunk in [0, num_chunks)
-    // PHASE 1: identical to standard
+    // NO PHASE 1 (§2.37): every (pixel, mt) word is written exactly once
+    // by the sweep below, seeded from the tile's bias register.
 
-    // PHASE 2b: accumulate
+    // PHASE 2b: accumulate — one flat II=1 loop per (mt, ow_tile)
     for mt in [0, ceil(out_ch / kTileM))
-      // Load w_buf[kTileM][kh][kw] ONCE per (chunk, mt) — PIPELINE II=1
+      bias_reg[0..kTileM-1] := bias_stream.read()      // one BiasVec per (ni, chunk, mt)
+      // Load w_buf[kTileM][kh·kw] ONCE per (chunk, mt) — PIPELINE II=1
+      //   (lanes m1 ≥ m_valid zero-filled: X-clean padding word)
       for ow_tile in [0, num_ow_tiles)                  // §5.4 ow-tiling
         ow_start = ow_tile · ow_per_tile
         ow_end   = min(out_w, ow_start + ow_per_tile)
-        for oh_local in [0, chunk_oh)
-          for ow in [ow_start, ow_end)
-            // Drain kh × kw channel-packed PatchVec beats from
-            //   patch_stream (kTileM lanes used, rest zero-pad) — II=1
-            // acc[0..kTileM-1] := partial_outputs[idx_base + …]   (II=1)
-            // accumulate_depthwise():
-            //   for ri in [0, kh · kw):                            PIPELINE II=1
-            //     for m1 in [0, kTileM), UNROLL:
-            //       acc[m1] += patch[m1][khi][kwi] · w_buf[m1][khi][kwi]
-            // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+        for it in [0, chunk_oh · (ow_end - ow_start) · kh·kw):   PIPELINE II=1
+          // counters (oh_local, ow, ri) advance per iteration; the
+          // partial_outputs word cursor is incremental (no multiply)
+          v = patch_stream.read()                        // one PatchVec per (khi, kwi)
+          for m1 in [0, kTileM), UNROLL:
+            acc[m1] = (ri == 0) ? bias_reg[m1] : acc[m1]
+            acc[m1] += v.lane[m1] · w_buf[m1][ri]        // mac_dw_step
+          if ri == kh·kw - 1:
+            partial_outputs[word·kTileM + 0..kTileM-1] := acc[]   // full word, write-only
 
     // PHASE 3: drain — identical to standard
 ```
 
 **Inner-MAC throughput is `kTileM` MACs/cycle** (PM-wide channel-parallel
-lanes; depthwise has no input-channel reduction).  Loop bound shrinks from
-`kh · kw · kTileM` to `kh · kw`.  Depthwise weights stay cached across
-all ow_tiles within an mt — only patches see the per-ow_tile re-emission.
+lanes; depthwise has no input-channel reduction).  A pixel costs exactly
+`kh · kw` cycles: the accumulator-word load, the per-pixel pipeline ramp
+and the store loop of the pre-§2.37 form are gone (one ramp per
+`(mt, ow_tile)` instead of one per pixel).  Depthwise weights stay cached
+across all ow_tiles within an mt — only patches see the per-ow_tile
+re-emission.
 
 ### 5.3 oh-chunking
 
