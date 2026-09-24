@@ -1,65 +1,52 @@
 {
   "_comment": "Copy this file to remote_config.json and fill in your KV260 details.",
-
   "ssh": {
     "host": "kv260.local",
     "user": "root",
     "port": 22,
-
     "key_file": "~/.ssh/id_rsa",
     "_key_file_note": "Path to SSH private key. Set to null to use password auth instead.",
-
     "password": null,
     "_password_note": "SSH password. Leave null when using key-based auth.",
-
     "connect_timeout": 15
   },
-
   "remote": {
     "work_dir": "/tmp/inference_hw_tests",
     "_work_dir_note": "Base directory on the remote machine. Created automatically. Cleaned up after each run unless --no-cleanup is set.",
-
     "uio_devices": {
       "VectorOPKernel": "fabric_vecop",
-      "MatmulKernel":   "fabric_matmul",
-      "ConvKernel":     "fabric_conv",
-      "PoolingKernel":  "fabric_pool"
+      "MatmulKernel": "fabric_matmul",
+      "ConvKernel": "fabric_conv",
+      "PoolingKernel": "fabric_pool"
     },
-    "_uio_devices_note": "Per-kernel UIO sysfs names — the node labels from dts/kv260/cormorant.dts. Verify on the board with: cat /sys/class/uio/uio*/name. To find names for a different bitstream run: grep -B3 generic-uio dts/<platform>/<stem>.dts. Remove kernels not present in your bitstream.",
-
+    "_uio_devices_note": "Per-kernel UIO sysfs names \u2014 the node labels from dts/kv260/cormorant.dts. Verify on the board with: cat /sys/class/uio/uio*/name. To find names for a different bitstream run: grep -B3 generic-uio dts/<platform>/<stem>.dts. Remove kernels not present in your bitstream.",
     "driver_dir": null,
     "_driver_dir_note": "Path on the REMOTE machine to copy XVectoropkernel driver sources from. Takes precedence over local.driver_dir when set.",
-
     "cmake_args": []
   },
-
   "local": {
     "driver_dir": null,
     "_driver_dir_note": "Single local path containing ALL kernel driver files to bundle into each project before upload. Use for single-kernel models or a pre-merged directory.",
     "driver_dirs": {
       "VectorOPKernel": "../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
-      "MatmulKernel":   "../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "MatmulKernel": "../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
       "ConvKernel": "../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
       "PoolKernel": "../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel local paths for multi-kernel models, e.g. {\"VectorOPKernel\": \"../build/.../VectorOPKernel_v1_0/src\", \"MatmulKernel\": \"../matmul/build/.../MatmulKernel_v1_0/src\"}. Files are merged automatically before upload."
   },
-
   "build": {
     "jobs": 4,
     "_jobs_note": "Parallel make jobs on the remote machine.",
     "timeout": 180
   },
-
   "run": {
     "timeout": 120,
     "use_sudo": true,
     "_use_sudo_note": "Run test_inference with 'sudo -n'. Requires passwordless sudo configured on the target (visudo: 'root ALL=(ALL) NOPASSWD: ALL' or equivalent)."
   },
-
   "cleanup": true,
   "_cleanup_note": "Remove remote work_dir after all tests finish. Set false (or use --no-cleanup) to inspect build artifacts.",
-
   "_models_excluded_note": "The following models intentionally raise SchedulerError and are excluded: unsupported.onnx, gemm_transA_unsupported.onnx, conv_grouped_invalid.onnx",
   "models": [
     "test/models/asymmetric_nested_branches.onnx",
@@ -73,11 +60,14 @@
     "test/models/broadcast_unaligned.onnx",
     "test/models/chunk_one.onnx",
     "test/models/clip_opset10.onnx",
+    "test/models/conv_1x1_classifier_1024.onnx",
     "test/models/conv_auto_pad_valid.onnx",
     "test/models/conv_batch2.onnx",
     "test/models/conv_depthwise.onnx",
     "test/models/conv_depthwise_bias.onnx",
     "test/models/conv_dilation.onnx",
+    "test/models/conv_fc_7x7_64to256.onnx",
+    "test/models/conv_mgroups_prefetch.onnx",
     "test/models/conv_mnist_first_layer.onnx",
     "test/models/conv_mnist_second_layer.onnx",
     "test/models/conv_padded.onnx",
@@ -135,13 +125,23 @@
     "test/models/mm_exact_tile.onnx",
     "test/models/mm_large_k.onnx",
     "test/models/mm_nlp_proj.onnx",
+    "test/models/mm_packed_4d_3d_const.onnx",
+    "test/models/mm_packed_batch_const.onnx",
+    "test/models/mm_packed_fc_1280x1001.onnx",
+    "test/models/mm_packed_fc_256x10.onnx",
+    "test/models/mm_packed_fc_512x1000.onnx",
+    "test/models/mm_packed_then_activation.onnx",
+    "test/models/mm_packed_two_layer_odd.onnx",
     "test/models/mm_partial_k.onnx",
     "test/models/mm_partial_m.onnx",
     "test/models/mm_partial_n.onnx",
+    "test/models/mm_relu_then_packed_odd.onnx",
     "test/models/mm_sat_neg.onnx",
     "test/models/mm_sat_pos.onnx",
+    "test/models/mm_shared_const_row_major.onnx",
     "test/models/mm_three_layer.onnx",
     "test/models/mm_two_layer.onnx",
+    "test/models/mm_unaligned_rows.onnx",
     "test/models/nop_asymmetric_branch.onnx",
     "test/models/nop_chain_dropout_fork.onnx",
     "test/models/nop_dropout_fork.onnx",
@@ -157,13 +157,18 @@
     "test/models/pool_avgpool_count_pad.onnx",
     "test/models/pool_avgpool_simple.onnx",
     "test/models/pool_batch2.onnx",
+    "test/models/pool_batch3_odd_offsets.onnx",
+    "test/models/pool_c24_w17_maxpool.onnx",
     "test/models/pool_global_avg.onnx",
+    "test/models/pool_global_avg_w7.onnx",
     "test/models/pool_global_max.onnx",
     "test/models/pool_lp_p1.onnx",
     "test/models/pool_lp_p2.onnx",
     "test/models/pool_maxpool_padded.onnx",
     "test/models/pool_maxpool_simple.onnx",
     "test/models/pool_then_relu.onnx",
+    "test/models/pool_w13_maxpool.onnx",
+    "test/models/pool_w77_avgpool_tiled.onnx",
     "test/models/relu_chain.onnx",
     "test/models/relu_dropout_relu.onnx",
     "test/models/reshape_flatten.onnx",
