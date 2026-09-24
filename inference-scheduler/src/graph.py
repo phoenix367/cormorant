@@ -26,7 +26,8 @@ from onnx import shape_inference, TensorProto
 
 from typing import Union
 from .tensor import TensorInfo
-from .nodes  import (_pack_matmul_b, ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
+from .nodes  import (
+    ACT_NONE, _pack_matmul_b, ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
                      POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
 
@@ -235,7 +236,15 @@ class OnnxGraph:
         return new_model, gemm_counter[0]
 
     def __init__(self, model_path: str,
-                 dtype: DataType = None) -> None:
+                 dtype: DataType = None,
+                 fuse_act: bool = False) -> None:
+        """
+        fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
+        produces its input (the kernel's `act` register) when the producer's
+        output has no other consumer and is not a graph output.  Off by
+        default so generated code is unchanged unless asked for; the CLI
+        enables it.  ``self.act_fused_count`` reports how many were folded.
+        """
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
         _dtype      = dtype if dtype is not None else AP_FIXED_16_8
@@ -346,7 +355,70 @@ class OnnxGraph:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
 
+        self.act_fused_count = self._fuse_activations() if fuse_act else 0
         self._pack_matmul_weights()
+
+    # ------------------------------------------------------------------ #
+    # Activation fusion (VectorOPKernel `act` register)                    #
+    # ------------------------------------------------------------------ #
+
+    def _fuse_activations(self) -> int:
+        """Fold Relu / Clip(0,6) nodes into their producing VectorOP node.
+
+        A unary activation node R with input T is folded into the
+        ScheduledNode P that produces T when
+          * P is a VectorOP ScheduledNode with no activation fused yet,
+          * T is not a graph output (it must not be materialised),
+          * R is T's only consumer, and
+          * R's output has the same element count as T (unary nodes are
+            validated that way already).
+        P then writes R's output directly with ``act`` set, R disappears
+        from the node list and node indices are renumbered.  Returns the
+        number of folded nodes.
+        """
+        consumers: Dict[str, List[int]] = {}
+        for pos, sn in enumerate(self._nodes):
+            for t in sn.inputs:
+                consumers.setdefault(t.onnx_name, []).append(pos)
+        producer_pos: Dict[str, int] = {
+            sn.output.onnx_name: pos for pos, sn in enumerate(self._nodes)
+        }
+        graph_outputs = set(self._output_names)
+
+        removed: set = set()
+        fused = 0
+        for pos, sn in enumerate(self._nodes):
+            if not isinstance(sn, ScheduledNode):
+                continue
+            act = sn.fusable_act
+            if act is None:
+                continue
+            src = sn.inputs[0]
+            ppos = producer_pos.get(src.onnx_name)
+            if ppos is None:
+                continue                                 # graph input / weight
+            prod = self._nodes[ppos]
+            if not isinstance(prod, ScheduledNode) or prod.act != ACT_NONE:
+                continue
+            if src.onnx_name in graph_outputs:
+                continue
+            if consumers.get(src.onnx_name, []) != [pos]:
+                continue
+            if src.numel != sn.output.numel:
+                continue
+            prod.act    = act
+            prod.output = sn.output
+            prod.fused_nodes.append(sn.onnx_node)
+            producer_pos[sn.output.onnx_name] = ppos
+            removed.add(pos)
+            fused += 1
+
+        if fused:
+            self._nodes = [sn for pos, sn in enumerate(self._nodes)
+                           if pos not in removed]
+            for idx, sn in enumerate(self._nodes):
+                sn.index = idx
+        return fused
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #

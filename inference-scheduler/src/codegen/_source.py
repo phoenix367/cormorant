@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes    import OP_NAMES, MatmulNode, ScheduledNode
+from ..nodes    import ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode
 from ._banners  import _banner, _file_banner
 
 
@@ -67,6 +67,10 @@ class _SourceMixin:
             return ""
         lines = [_banner("VectorOPKernel operation codes (must match VectorOP.h)")]
         for code, name in sorted(OP_NAMES.items()):
+            lines.append(f"#define {name:<20} {code}u")
+        lines.append("")
+        lines.append("/* Fused activation applied after the op (VectorOP.h Act enum) */")
+        for code, name in sorted(ACT_NAMES.items()):
             lines.append(f"#define {name:<20} {code}u")
         return "\n".join(lines)
 
@@ -257,6 +261,9 @@ class _SourceMixin:
         nodes          = self._graph.nodes
         # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
         need_run_op    = any(isinstance(sn, ScheduledNode) for sn in nodes)
+        need_run_op_act = any(
+            isinstance(sn, ScheduledNode) and sn.act != 0 for sn in nodes
+        )
         need_run_matmul = self._has_matmul_nodes
         need_run_matmul_at = any(
             isinstance(sn, MatmulNode) and sn.outer_count > 1
@@ -266,7 +273,9 @@ class _SourceMixin:
         need_run_pool = self._has_pool_nodes
 
         titles = []
-        if need_run_op:
+        if need_run_op and need_run_op_act:
+            titles.append("run_op() / run_op_act() — VectorOPKernel dispatch helpers")
+        elif need_run_op:
             titles.append("run_op() — VectorOPKernel dispatch helper")
         if need_run_matmul and need_run_matmul_at:
             titles.append("run_matmul() / run_matmul_at() — MatmulKernel dispatch helpers")
@@ -322,6 +331,17 @@ class _SourceMixin:
                 " *   outer  number of outer broadcasting iterations (1 = no broadcast)\n"
                 " *   a_inc  element stride for a per outer step (0 = a repeats)\n"
                 " *   b_inc  element stride for b per outer step (0 = b repeats)\n"
+                " *\n"
+                " * run_op writes act = 0 (no fused activation; the register keeps its\n"
+                " * last value across runs, so it is written every call).  A node with\n"
+                " * a fused Relu / Clip(0,6) uses run_op_act, which takes the act code.\n"
+                " *\n"
+                " * Alignment contract (VectorOP.h): every run start of a, b and c is\n"
+                " * 16-byte aligned (buffer bases are 64-byte aligned, a_inc / b_inc\n"
+                " * are 0 or a multiple of INFERENCE_ALIGN_ELEMS); the kernel reads\n"
+                " * whole 16-byte words and writes the last word of every run whole,\n"
+                " * i.e. c may be written up to the next 16-byte boundary past size\n"
+                " * (into the stride gap / the buffer's 64-byte allocation padding).\n"
                 " */\n"
                 "static void run_op(\n"
                 "    inference_buf_t *a,\n"
@@ -341,6 +361,38 @@ class _SourceMixin:
                 f"    XVectoropkernel_Set_outer(&{vop_var}, outer);\n"
                 f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
                 f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
+                f"    XVectoropkernel_Set_act(&{vop_var}, VECTOROP_ACT_NONE);\n"
+                f"    XVectoropkernel_Start(&{vop_var});\n"
+                "}\n"
+            )
+
+        if need_run_op_act:
+            parts.append(
+                "/*\n"
+                " * run_op_act() — run_op() with a fused activation: the kernel applies\n"
+                " * VECTOROP_ACT_RELU / VECTOROP_ACT_RELU6 to the op result before\n"
+                " * writing c, so Add -> Relu is one pass over the data.\n"
+                " */\n"
+                "static void run_op_act(\n"
+                "    inference_buf_t *a,\n"
+                "    inference_buf_t *b,\n"
+                "    inference_buf_t *c,\n"
+                "    unsigned         size,\n"
+                "    unsigned         op,\n"
+                "    unsigned         outer,\n"
+                "    unsigned         a_inc,\n"
+                "    unsigned         b_inc,\n"
+                "    unsigned         act)\n"
+                "{\n"
+                f"    XVectoropkernel_Set_a(&{vop_var}, inference_buf_phys(a));\n"
+                f"    XVectoropkernel_Set_b(&{vop_var}, b ? inference_buf_phys(b) : (u64)0);\n"
+                f"    XVectoropkernel_Set_c(&{vop_var}, inference_buf_phys(c));\n"
+                f"    XVectoropkernel_Set_size(&{vop_var}, size);\n"
+                f"    XVectoropkernel_Set_op(&{vop_var}, op);\n"
+                f"    XVectoropkernel_Set_outer(&{vop_var}, outer);\n"
+                f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
+                f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
+                f"    XVectoropkernel_Set_act(&{vop_var}, act);\n"
                 f"    XVectoropkernel_Start(&{vop_var});\n"
                 "}\n"
             )

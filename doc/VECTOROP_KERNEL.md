@@ -22,15 +22,25 @@ primed it sustains one element per clock.
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `a` | Read | First operand array |
-| `gmem1` | `b` | Read | Second operand array (no AXI transactions for unary ops) |
-| `gmem2` | `c` | Write | Result array |
+| `gmem0` | `a` | Read | First operand array (`hls::burst_maxi<VecWord>`, 128-bit) |
+| `gmem1` | `b` | Read | Second operand array (128-bit; no AXI transactions for unary ops) |
+| `gmem2` | `c` | Write | Result array (128-bit) |
 
-Each `m_axi` port is declared with `num_read/write_outstanding=16`,
-`max_read/write_burst_length=256`, and `max_widen_bitwidth=512` — HLS
-coalesces sequential `Data_t` accesses into bursts up to 512 bits wide
-(32 × `ap_fixed<16,8>` per beat); on a narrower physical bus (e.g. the KV260
-128-bit HPC port) HLS applies the lower cap.
+All three ports are `hls::burst_maxi<VecWord>` with `VecWord =
+ap_uint<128>` — `kVecLanes = 8` elements of `ap_fixed<16,8>` per beat
+(VECTOROP_OPTIMISATION.md §2).  The DDR layout is a plain element array;
+the kernel requests whole word ranges (`read_request` of ≤ 64 words on
+`a` / `b`, `num_read_outstanding=16`; `write_request` of ≤ 256 words on
+`c`, `num_write_outstanding=16`, ≤ 8 responses outstanding) and extracts /
+packs the lanes itself.  **Alignment contract** (asserted by
+`TestSimulation`, guaranteed by the scheduler): every run start of `a`,
+`b` and `c` is 16-byte aligned — the base registers are 16-byte aligned and
+`a_inc` / `b_inc` are 0 or a multiple of 8 elements; `size` is arbitrary.
+Input lanes past the end of a run are read and masked to zero; the last
+word of every output run is written whole, so `c[size .. ceil8(size))`
+of a run receives `op(0, 0) = 0` and the caller's buffer (or stride gap)
+must cover it.  The block-design instance widths must equal the IP defaults
+(128 on all three ports).
 
 **AXI-Lite control registers (`s_axilite bundle=ctrl`):**
 
@@ -42,10 +52,13 @@ coalesces sequential `Data_t` accesses into bursts up to 512 bits wide
 | `outer` | `unsigned` | Number of outer broadcast iterations (1 = non-broadcast) |
 | `a_inc` | `unsigned` | Element stride for `a` per outer iteration (0 = `a` repeats) |
 | `b_inc` | `unsigned` | Element stride for `b` per outer iteration (0 = `b` repeats) |
+| `act` | `unsigned` | Fused activation applied after the op: 0 none, 1 relu, 2 relu6 (`Act` enum; register offset 0x5C, appended last) |
 | `return` | — | `ap_ctrl_hs` (start / done / idle / ready) |
 
 The kernel processes `outer × size` elements:
-`c[o·(a_inc+b_inc) + i] = op(a[o·a_inc + i], b[o·b_inc + i])`.
+`c[o·(a_inc+b_inc) + i] = act(op(a[o·a_inc + i], b[o·b_inc + i]))`.
+The scheduler uses `act` to fold a following `Relu` / `Clip(0,6)` into the
+producing call (one pass over the data instead of two).
 
 ---
 
@@ -63,13 +76,14 @@ The operation is chosen at runtime by the `op` register (`Op` enum in
 | 4 | `OP_RELU` | `max(a[i], 0)` | unary |
 | 5 | `OP_RELU6` | `min(max(a[i], 0), 6)` | unary |
 
-For the two unary ops (`op ≥ OP_RELU`), `load_b` issues **no** AXI reads on
-`gmem1` — it feeds zeros into the `b` stream so the compute stage still
-receives a balanced item count, and `b`'s base address is ignored.
+For the two unary ops (`op ≥ OP_RELU`), the `b` loader issues **no** AXI
+reads on `gmem1` and pushes nothing; the compute stage reads `b_s` only for
+binary ops, and `b`'s base address is ignored.
 
 `OP_MUL` computes the full-precision `2W`-bit product and lets
-`saturate_cast` clip it back to `Data_t`. `OP_DIV` uses an iterative
-fixed-point divider, so its initiation interval is greater than 1 (the only
+`saturate_cast` clip it back to `Data_t`. `OP_DIV` uses one iterative
+fixed-point divider fed one lane per cycle (`compute_div`, II=1 per lane,
+i.e. one element per cycle instead of eight — the only
 op that is not II=1).
 
 ---
@@ -97,15 +111,16 @@ not a reduction.
 ## 4. Loop Structure and DATAFLOW Architecture
 
 The top-level kernel is a `#pragma HLS DATAFLOW` region with four concurrent
-sub-functions connected by `hls::stream` FIFOs:
+sub-functions connected by `hls::stream<VecWord>` FIFOs (one 128-bit word =
+8 elements per token):
 
 ```mermaid
 flowchart LR
-    Ad[("a · gmem0")] --> LA["load_a"]
-    Bd[("b · gmem1")] --> LB["load_b"]
-    LA -->|"a_s (depth 32)"| CP["compute"]
-    LB -->|"b_s (depth 32)"| CP
-    CP -->|"c_s (depth 32)"| SC["store_c"]
+    Ad[("a · gmem0")] --> LA["load_words (a)"]
+    Bd[("b · gmem1")] --> LB["load_words (b)"]
+    LA -->|"a_s (depth 64)"| CP["compute_words"]
+    LB -->|"b_s (depth 64)"| CP
+    CP -->|"c_s (depth 64)"| SC["store_words"]
     SC --> Cd[("c · gmem2")]
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
@@ -114,36 +129,38 @@ flowchart LR
     class LA,LB,CP,SC fn
 ```
 
-The three streams (`a_s`, `b_s`, `c_s`) are `static`, depth 32 — deep enough
-to let the DDR-burst load stages run ahead of `compute` and hide read
-latency behind active computation.
+The three streams (`a_s`, `b_s`, `c_s`) are `static`, depth 64 in LUTRAM —
+deep enough to let the loaders run a burst ahead of `compute_words` and
+hide read latency behind active computation.
 
-**Stage loop nest** (identical `outer × size` bounds in all four stages):
+**Stage loops.**  Every stage is ONE flattened `PIPELINE II=1` loop over
+all `outer × ceil(size / 8)` words (VECTOROP_OPTIMISATION.md §2):
 
-```
-for o in [0, outer)
-  for i in [0, size)                       // PIPELINE II=1
-    load_a : a_s.write(a[o·a_inc + i])
-    load_b : b_s.write((op < OP_RELU) ? b[o·b_inc + i] : 0)
-    compute: c_s.write(op(a_s.read(), b_s.read()))
-    store_c: c[o·c_inc + i] = c_s.read()    // c_inc = a_inc + b_inc
-```
-
-Every inner loop carries `#pragma HLS PIPELINE II=1` plus
-`LOOP_TRIPCOUNT` hints (`size` ≤ 65536, `outer` ≤ 1024) for the synthesis
-report. The compute stage is a `switch (op)` over the six scalar helpers
-(`sub_add`, `sub_sub`, `sub_mul`, `sub_div`, `sub_relu`, `sub_relu6`).
+- `load_words` classifies the operand: `outer == 1` or `inc == size` on
+  whole words → one contiguous word range; `inc == 0` and ≤ 256 words
+  (2048 elements) → read once into `rep_buf[256]` and replayed `outer`
+  times; otherwise every run is its own word range at stride `inc / 8`.
+  Read requests are ≤ 64 words and 8 of them are kept in flight ahead of
+  the `read()` cursor; lanes past `size` in a run's last word are zeroed.
+- `compute_words` applies the `switch (op)` to all 8 lanes of a word per
+  cycle (`op_lane`), then `apply_act` (the `act` register).  `OP_DIV` goes
+  through `compute_div`, a lane-serial loop around one divider.
+- `store_words` issues a `write_request` per ≤ 256-word piece, streams the
+  words, and collects `write_response()` in a sliding window of 8 (the
+  CONV_OPTIMISATION.md §2.30 bound), writing every run's last word whole.
 
 ### HLS pragmas applied
 
 | Pragma | Location | Effect |
 |--------|----------|--------|
 | `DATAFLOW` | top-level | Four concurrent load / compute / store stages |
-| `INTERFACE m_axi … bundle=gmem0/1/2` | top-level | AXI memory ports; burst + width-widening hints |
+| `INTERFACE m_axi … bundle=gmem0/1/2` | top-level | 128-bit `burst_maxi` ports: `max_read_burst_length=64 num_read_outstanding=16` (a, b), `max_write_burst_length=256 num_write_outstanding=16` (c) |
 | `INTERFACE s_axilite … bundle=ctrl` | every scalar + `return` | AXI-Lite register file |
 | `INLINE off` | each stage function | Keeps the four stages as distinct dataflow processes |
-| `STREAM depth=32` | `a_s`, `b_s`, `c_s` | FIFO depth between stages |
-| `PIPELINE II=1` | every inner loop | One element per clock (except `OP_DIV`) |
+| `STREAM depth=64` + `BIND_STORAGE fifo lutram` | `a_s`, `b_s`, `c_s` | 128-bit word FIFOs between stages (LUTRAM, not 8 BRAM18 each) |
+| `PIPELINE II=1` | every stage loop | One 8-lane word per clock (`OP_DIV`: one lane per clock) |
+| `UNROLL` | lane loops | 8 lanes of a word in one cycle |
+| `ARRAY_PARTITION complete` | `compute_div::res` | per-lane result registers |
 | `LOOP_TRIPCOUNT` | every loop | Latency-report hints only — no hardware effect |
 
 ---
@@ -242,8 +259,8 @@ an IP-catalog archive.
 
 | File | Purpose |
 |------|---------|
-| `kernels/vectorop/kernel/VectorOP.cpp` | HLS kernel — four DATAFLOW stages |
-| `kernels/vectorop/include/VectorOP.h` | Kernel declaration, `Op` enum, `saturate_cast<T>` |
+| `kernels/vectorop/kernel/VectorOP.cpp` | HLS kernel — four DATAFLOW stages on 128-bit words |
+| `kernels/vectorop/include/VectorOP.h` | Kernel declaration, `Op` / `Act` enums, `VecWord` lane helpers, alignment contract, `saturate_cast<T>` |
 | `kernels/vectorop/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`) |
 | `kernels/vectorop/test/TestSimulation.cpp` | C simulation tests (GCC) |
 | `kernels/vectorop/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
@@ -259,14 +276,15 @@ an IP-catalog archive.
 | **Supported ONNX ops** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
 | **Operations** | 6, runtime-selected via the `op` AXI-Lite register |
 | **Data type** | `ap_fixed<16,8>` (default; configurable via `VA_DATA_TYPE`) |
-| **Architecture** | 4-stage `HLS DATAFLOW` pipeline (load A, load B, compute, store C) |
-| **Initiation interval** | II=1 for all ops except `OP_DIV` (iterative divider) |
-| **Inter-stage FIFOs** | `a_s` / `b_s` / `c_s`, depth 32 |
+| **Architecture** | 4-stage `HLS DATAFLOW` pipeline (load A, load B, compute, store C) on 128-bit words, 8 elements per cycle |
+| **Initiation interval** | II=1 on every loop; 8 elements/cycle for all ops except `OP_DIV` (1 element/cycle, one divider) |
+| **Inter-stage FIFOs** | `a_s` / `b_s` / `c_s`, 128-bit, depth 64 (LUTRAM) |
 | **Vector length** | Pure runtime register — no compile-time bound |
-| **Broadcasting** | `outer` / `a_inc` / `b_inc` registers; stride-0 operand re-streamed |
+| **Broadcasting** | `outer` / `a_inc` / `b_inc` registers; stride-0 operand ≤ 2048 elements replayed from on-chip RAM, contiguous runs streamed as one range |
+| **Fused activation** | `act` register: none / relu / relu6 after the op |
 | **Unary ops** | `OP_RELU` / `OP_RELU6` issue no `gmem1` reads |
-| **AXI master ports** | 3 (gmem0 `a`, gmem1 `b`, gmem2 `c`) |
-| **AXI-Lite registers** | 8 scalars/pointers + `return` |
+| **AXI master ports** | 3 × 128-bit `burst_maxi` (gmem0 `a`, gmem1 `b`, gmem2 `c`); run starts 16-byte aligned, tail word of `c` written whole |
+| **AXI-Lite registers** | 9 scalars/pointers + `return` |
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` on every result |
 | **AXI-Lite base address** | `0xA000_0000` |
 | **Driver prefix** | `xvectoropkernel` |

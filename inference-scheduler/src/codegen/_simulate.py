@@ -39,6 +39,7 @@ import numpy as np
 
 from ..nodes  import (
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
+    ACT_RELU, ACT_RELU6,
     MatmulNode, ConvNode, PoolNode, ReshapeNode,
     POOL_MAX, POOL_AVG,
 )
@@ -506,6 +507,10 @@ class _SimulateMixin:
 
             a = arrays[sn.inputs[0].onnx_name]
 
+            # DIV: HLS computes a_int / b_int (C integer division =
+            # truncation toward zero), so use truncate_div instead of
+            # the default truncate (floor toward −∞).
+            truncate_fn = dtype.truncate
             if sn.op_code == OP_ADD:
                 result = a + arrays[sn.inputs[1].onnx_name]
             elif sn.op_code == OP_SUB:
@@ -514,13 +519,7 @@ class _SimulateMixin:
                 result = a * arrays[sn.inputs[1].onnx_name]
             elif sn.op_code == OP_DIV:
                 result = a / arrays[sn.inputs[1].onnx_name]
-                # DIV: HLS computes a_int / b_int (C integer division =
-                # truncation toward zero), so use truncate_div instead of
-                # the default truncate (floor toward −∞).
-                _store_quant(sn.output.onnx_name, result,
-                             truncate_fn=dtype.truncate_div,
-                             shape=sn.output.shape)
-                continue
+                truncate_fn = dtype.truncate_div
             elif sn.op_code == OP_RELU:
                 result = np.maximum(a, 0.0)
             elif sn.op_code == OP_RELU6:
@@ -531,7 +530,16 @@ class _SimulateMixin:
                     f"in node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
                 )
 
-            _store_quant(sn.output.onnx_name, result, shape=sn.output.shape)
+            # Fused activation (kernel `act` register).  Clipping commutes
+            # with the saturating truncation (0 and 6 are representable),
+            # so applying it before quantisation matches the hardware.
+            if sn.act == ACT_RELU:
+                result = np.maximum(result, 0.0)
+            elif sn.act == ACT_RELU6:
+                result = np.minimum(np.maximum(result, 0.0), 6.0)
+
+            _store_quant(sn.output.onnx_name, result,
+                         truncate_fn=truncate_fn, shape=sn.output.shape)
 
         return arrays
 

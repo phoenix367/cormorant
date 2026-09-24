@@ -71,12 +71,12 @@ Adding a new platform requires only a JSON file and a re-run of cmake.
 ### Kernel Interface
 
 ```
-DDR/PL ──► m_axi_gmem0 (a, read)  ─┐
-DDR/PL ──► m_axi_gmem1 (b, read)  ─┤  VectorOPKernel  ├──► m_axi_gmem2 (c, write) ──► DDR/PL
-           s_axi_ctrl: a_addr, b_addr, c_addr, size, op, ap_ctrl_hs
+DDR/PL ──► m_axi_gmem0 (a, read,  128-bit burst_maxi) ─┐
+DDR/PL ──► m_axi_gmem1 (b, read,  128-bit burst_maxi) ─┤  VectorOPKernel  ├──► m_axi_gmem2 (c, write, 128-bit burst_maxi) ──► DDR/PL
+           s_axi_ctrl: a_addr, b_addr, c_addr, size, op, outer, a_inc, b_inc, act, ap_ctrl_hs
 ```
 
-HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2`. The loop body is pipelined at II=1. For unary ops (Relu, Relu6) no AXI transactions are issued on `gmem1`.
+All three ports are `hls::burst_maxi<ap_uint<128>>` (8 elements per beat); the kernel issues explicit word-range requests (reads ≤ 64 words / 16 outstanding, writes ≤ 256 words / 8 responses in flight) and processes 8 lanes per cycle in one flattened II=1 loop per stage (`OP_DIV`: 1 lane per cycle). For unary ops (Relu, Relu6) no AXI transactions are issued on `gmem1`. `act` (0 none / 1 relu / 2 relu6) applies an activation after the op so the scheduler fuses Add→Relu. **Alignment contract:** every run start of a, b, c is 16-byte aligned (`a_inc`/`b_inc` are 0 or a multiple of 8 elements); `size` is arbitrary; the last word of every output run is written whole (tail lanes = 0), so the caller's buffer / stride gap must cover it (the scheduler's `CHUNK_STRIDE` and 64-byte allocations do). Block-design instance widths must equal the IP defaults (128 on all three ports); see `doc/VECTOROP_OPTIMISATION.md`.
 
 ### Supported Operations
 
@@ -91,10 +91,10 @@ HLS infers sequential burst reads on `gmem0`/`gmem1` and a burst write on `gmem2
 
 ### Key Files
 
-- **`kernels/vectorop/kernel/VectorOP.cpp`** — HLS kernel. Single pipelined loop over `a[]`, `b[]`, `c[]` with a switch on `op`. Three `m_axi` ports (`gmem0/1/2`) with `offset=slave`; all registers (addresses, `size`, `op`, return) are in `s_axi_ctrl`.
-- **`kernels/vectorop/include/VectorOP.h`** — Kernel declaration, `Op` enum (OP_ADD … OP_RELU6), and `saturate_cast<T>` template.
+- **`kernels/vectorop/kernel/VectorOP.cpp`** — HLS kernel. DATAFLOW of `load_words` (a, b) → `compute_words` → `store_words` on 128-bit `VecWord` streams; each stage is one flattened II=1 loop over all `outer × ceil(size/8)` words (contiguous fast path when `inc == size`, on-chip replay of a stride-0 operand ≤ 2048 elements). Three `m_axi` `burst_maxi` ports (`gmem0/1/2`) with `offset=slave`; all registers are in `s_axi_ctrl`.
+- **`kernels/vectorop/include/VectorOP.h`** — Kernel declaration, `Op` enum (OP_ADD … OP_RELU6), `Act` enum, `VecWord` / `kVecLanes` lane helpers, the alignment contract, and `saturate_cast<T>` template.
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
-- **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across multiple sizes plus saturation boundary cases. Tolerance: relative 1e-5 for FP, exact for integers.
+- **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across sizes 1…4097 (tail words), saturation boundary cases, and geometry / `act` cases (broadcast chunk 12 stride 16, outer 1000 × 16, stride-0 operands at and past the replay bound, runs > 16 × 256 words); asserts the alignment contract (`inc % 8 == 0`, tail lanes 0, gaps untouched). `--dump-data` writes the RTL fixtures (`hw/test_data/vecop_test_data`, manifest with an `act` column).
 - **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
 - **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.conv` / `kernels.matmul` / `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
@@ -127,7 +127,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run all tests (1306 tests)
+# Run all tests (1324 tests)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -143,7 +143,7 @@ See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `inference
 
 ### HLS Pragmas Used
 
-`#pragma HLS INTERFACE m_axi offset=slave` (three data ports, one bundle each), `#pragma HLS INTERFACE s_axilite` (pointer addresses + size + return, all in `bundle=ctrl`), `#pragma HLS PIPELINE II=1` (loop body).
+`#pragma HLS INTERFACE m_axi offset=slave` (three 128-bit `burst_maxi` data ports, one bundle each, explicit burst length / outstanding counts), `#pragma HLS INTERFACE s_axilite` (pointer addresses + scalars + return, all in `bundle=ctrl`), `#pragma HLS dataflow`, `#pragma HLS PIPELINE II=1` (one flattened loop per stage), `#pragma HLS UNROLL` (8 lanes), `#pragma HLS bind_storage … fifo impl=lutram` (word FIFOs).
 
 ## Dependencies
 

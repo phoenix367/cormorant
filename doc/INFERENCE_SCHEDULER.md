@@ -20,7 +20,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
-| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, II=1 |
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
 | **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply |
 | **ConvKernel** | `Conv` | 2-D NCHW convolution with optional bias |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
@@ -29,6 +29,12 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 - `Reshape` — output pointer is aliased to the source buffer; no data copy.
 - `Gemm` — decomposed to `MatMul` + optional `Add` at model load time
   (`alpha=1, beta=1, transA=0, transB=0` required).
+- `Relu` / `Clip(0,6)` after a VectorOP node — folded into that node's
+  call via the kernel's `act` register (`run_op_act()`), when the producer's
+  output has no other consumer and is not a graph output
+  (`OnnxGraph(fuse_act=True)`, the CLI default; `--no-fuse-act` disables
+  it; `OnnxGraph.act_fused_count` reports the number folded).  A `Relu`
+  after a Conv / MatMul / Pool node or on a graph input stays a call.
 
 ---
 
@@ -93,6 +99,16 @@ inference_scheduler.py          CLI, argument parsing
 4. Build tensor registry (weights, inputs, intermediates, outputs).
 5. Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` / `ReshapeNode`
    / `ScheduledNode` based on `op_type`.
+6. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
+   into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
+   re-pointed) and renumbers node indices.
+
+**VectorOPKernel alignment contract** (kernel ports are 128-bit words):
+every DMA buffer base is 64-byte aligned, every broadcast `CHUNK_STRIDE`
+is `INFERENCE_ALIGN_UP(CHUNK)` (a multiple of 8 elements), and
+`inference_buf_alloc()` rounds allocations up to 64 bytes, so the kernel's
+whole-word reads and its whole last-word write per run stay inside the
+buffer / stride gap (`test/test_act_fusion.py::TestAlignmentContract`).
 
 ### Key data flow
 

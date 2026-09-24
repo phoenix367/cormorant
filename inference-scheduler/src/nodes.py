@@ -95,6 +95,25 @@ OP_NAMES = {
     OP_RELU6: "VECTOROP_RELU6",
 }
 
+# Fused-activation codes for the kernel's `act` register (must match the
+# Act enum in VectorOP.h).  Applied by the kernel after the op, so
+# Add -> Relu / Clip(0,6) collapses into one run_op() call.
+ACT_NONE  = 0
+ACT_RELU  = 1
+ACT_RELU6 = 2
+
+ACT_NAMES = {
+    ACT_NONE:  "VECTOROP_ACT_NONE",
+    ACT_RELU:  "VECTOROP_ACT_RELU",
+    ACT_RELU6: "VECTOROP_ACT_RELU6",
+}
+
+# op_code of a unary activation node -> act code it fuses into
+_ACT_FOR_OP = {
+    OP_RELU:  ACT_RELU,
+    OP_RELU6: ACT_RELU6,
+}
+
 # ONNX op_type → (op_code, arity)
 # arity 2 = binary (reads a and b), arity 1 = unary (reads a only)
 _ONNX_OP_MAP = {
@@ -261,6 +280,20 @@ class ScheduledNode:
     a_advances:         bool = field(default=True, init=False)
     b_advances:         bool = field(default=True, init=False)
 
+    # Fused activation (ACT_*) applied by the kernel after the op — set by
+    # OnnxGraph._fuse_activations() when a following Relu / Clip(0,6) was
+    # folded into this node; the folded ONNX nodes are kept for the report.
+    act:                int  = field(default=ACT_NONE, init=False)
+    fused_nodes:        List[onnx.NodeProto] = field(default_factory=list, init=False)
+
+    @property
+    def fusable_act(self) -> Optional[int]:
+        """The act code this node would contribute if fused into its
+        producer (Relu -> ACT_RELU, Clip(0,6) -> ACT_RELU6), else None."""
+        if self.arity != 1:
+            return None
+        return _ACT_FOR_OP.get(self.op_code)
+
     # ------------------------------------------------------------------ #
     # Factory                                                              #
     # ------------------------------------------------------------------ #
@@ -413,8 +446,9 @@ class ScheduledNode:
             f"  (broadcast \u00d7{self.outer_count})"
             if self.outer_count > 1 else ""
         )
+        fused = "".join(f" + {n.op_type}" for n in self.fused_nodes)
         return (
-            f"    /* [{self.index}] {self.onnx_node.op_type}"
+            f"    /* [{self.index}] {self.onnx_node.op_type}{fused}"
             f"({in_names}) -> {self.output.onnx_name}"
             f"  shape={self.output.shape}{broadcast} */"
         )
@@ -437,11 +471,15 @@ class ScheduledNode:
         b  = self.inputs[1].c_name if self.arity == 2 else "NULL"
         c  = self.output.c_name
         op = OP_NAMES[self.op_code]
+        # run_op() programs act = VECTOROP_ACT_NONE; a node with a fused
+        # activation goes through run_op_act() with the act code appended.
+        fn  = "run_op" if self.act == ACT_NONE else "run_op_act"
+        act = "" if self.act == ACT_NONE else f", {ACT_NAMES[self.act]}"
 
         if self.outer_count == 1:
             y_lay = layouts.get(self.output.onnx_name)
             size  = y_lay.alloc if y_lay is not None else self.chunk_size
-            return f"    run_op({a}, {b}, {c}, {size}u, {op}, 1u, 0u, 0u);"
+            return f"    {fn}({a}, {b}, {c}, {size}u, {op}, 1u, 0u, 0u{act});"
 
         # Broadcasting: single run_op() call with outer, a_inc, b_inc.
         # VectorOPKernel handles the outer loop internally, advancing a/b/c
@@ -455,9 +493,9 @@ class ScheduledNode:
         b_inc = (stride_macro if self.b_advances else "0u") \
                 if self.arity == 2 else "0u"
         return (
-            f"    run_op({a}, {b}, {c},"
+            f"    {fn}({a}, {b}, {c},"
             f" {chunk_macro}, {op},"
-            f" {n}u, {a_inc}, {b_inc});"
+            f" {n}u, {a_inc}, {b_inc}{act});"
         )
 
 

@@ -117,6 +117,17 @@ def parse_args(argv=None):
         default=False,
         help="Skip writing report.md (the human-readable model summary).",
     )
+    p.add_argument(
+        "--no-fuse-act",
+        dest="fuse_act",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not fold Relu / Clip(0,6) nodes into the VectorOP call that "
+            "produces their input (the kernel's `act` register).  Fusion is "
+            "on by default: it halves the traffic of every Add->Relu pair."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -161,7 +172,7 @@ def main(argv=None):
     # 2. Parse and validate the ONNX model                             #
     # ---------------------------------------------------------------- #
     try:
-        graph = OnnxGraph(args.model)
+        graph = OnnxGraph(args.model, fuse_act=args.fuse_act)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
