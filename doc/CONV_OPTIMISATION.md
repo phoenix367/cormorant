@@ -68,6 +68,7 @@ after running the full TestConvRef case list.
 | **Current state (post-§2.20, captured 2026-05-16)** | **30** | **1,775,775** | — | **-63.9 %** |
 | Snapshot post-§2.36 (40 tests, captured 2026-09-25 on `perf/dwconv`) | 40 | 7,982,735 | — | — |
 | + flat depthwise sweep (§2.37) | 40 | 7,666,615 | **-4.0 %** | — |
+| + 8-lane drain, 128-bit y with byte strobes (§2.38) | 43 (39 common) | 6,093,330 (common) | **-20.4 %** | — |
 
 **Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
@@ -1552,6 +1553,87 @@ BRAM 158, DSP 248, FF 36.9 k, LUT 51.7 k (+1.3 k for the counters and the
 bias mux).  Cycle model: depthwise sweep = `rows·tw·kh·kw + 10` per
 `(mt, ow_tile)`, no Phase 1 for depthwise; validation 6.0 % mean error,
 DW cases -3…-9 %.
+
+---
+
+---
+
+### 2.38. 8-lane Phase-3 drain and 128-bit `y` writes with byte strobes
+
+**Problem.**  Phase 3 read one `AccData_t` lane per cycle from the
+`[pixel][mt][kTileM]` URAM word and the writer pushed one 16-bit beat
+per cycle: outputs cost one cycle each on both sides, 24 % of the
+dw-64ch-56×56 layer and 11–23 % of the 1×1 layers (plan §3), and the
+adapter's 32-bit beats used a quarter of the 128-bit fabric.
+
+**Change.**  `y` becomes `hls::burst_maxi<YWord>` (`ap_uint<128>`, 8
+lanes; NCHW layout unchanged).  Phase 3 transposes in segments of
+`kDrainSeg = 256` pixels through two LUTRAM ping-pong buffers of 8 banks:
+while segment *n* of a tile is read from the URAM one word (8 channels of
+one pixel) per cycle and scattered into buffer *n&1*, segment *n−1* is
+gathered from the other buffer one word (8 pixels of one channel) per
+cycle onto a 128-bit `acc_stream`.  Bank rotation — pixel *p* of channel
+*m1* in bank `(m1+p)%8` at address `m1·32 + p/8` — makes a pixel's 8
+channels land in 8 distinct banks and a channel's 8 consecutive pixels
+come from 8 distinct banks at ONE shared address.  Stream order is
+`(ni, chunk, mt, segment, m1, word)`.  The writer re-aligns each
+`(channel, segment)` run (start = `m·out_h·out_w + chunk offset`, any lane)
+with a 2-word barrel shift, issues one `write_request(start/8,
+conv_y_words_for(start, len))` per run (≤ 33 beats, one burst) and writes
+the run's first / last DDR words with `write(word, byte_enable_mask)`
+covering only the run's own lanes — a neighbouring channel's lanes in the
+same word and the pad lanes past the tensor's end are never touched (the
+masked lanes are also zeroed in WDATA so no X leaves the kernel).  Port
+options `max_write_burst_length=64 num_write_outstanding=8`, sliding
+response window `kWriteInFlight = 4` (§2.30 rule).  `acc_stream` keeps
+its chunk-deep capacity in 8× fewer, 8× wider URAM entries (URAM 24 → 12).
+C-sim: `y` is a `YWord` buffer pre-filled with a 0xDEAD sentinel and the
+pad lanes are checked after every case; the RTL bench checks the poisoned
+tail lanes of the y region the same way.  New fixtures: `1x1 8->8 on
+121x75` (every channel run starts at a different lane, chunks of 8175 /
+900 elements = 32 + 4 segment requests per channel, > 8·64 words per
+run) and two odd-geometry depthwise cases (§2.39).
+
+**Traps.**  (1) The stream order: Phase 3 emits a tile's segment for all
+its channels before the next segment — a writer walking `(m1, segment)`
+mismatched from element 256 on (caught by C-sim).  (2) `ap_uint<1> pp ^=
+1` draws "Bitsize mismatch" warnings from the ap_int library in C-sim —
+write `pp = (ap_uint<1>)(pp ^ 1)`.  (3) The two transposer buffers are
+separate arrays with the ping-pong side chosen by an explicit compare
+(`if (pp == 0) tA[b][adr] = v; else tB[b][adr] = v`), never a runtime
+index into a partitioned dimension (§2.35), and carry `DEPENDENCE inter
+dependent=false` because within one execution of the step loop each
+buffer is either only written or only read — HLS scheduled the merged
+fill/drain loop at II=1 (iteration latency 2) and the writer at II=1
+(latency 6) on the first synthesis.
+
+**Board-verification item.**  Partial-strobe 128-bit beats are standard
+AXI4 and the crossbar is a 128-bit pass-through (unlike the §2.36 narrow
+adapter case), but the KV260 PS has not yet seen them from this kernel:
+the first bitstream with this kernel must be checked on runs that start
+and end mid-word (the 121×75 and 33×37 fixtures' geometries, and every
+model whose `out_h·out_w % 8 ≠ 0`, e.g. the 7×7 / 14×14 / 28×28 layers).
+
+**Result.**  **-1 557 460 ns (-20.4 %)** on the 39 cases common with §2.37
+(7 650 790 → 6 093 330 ns; -23.5 % vs the §2.36 snapshot), 43/43 RTL
+PASS (the three new fixtures included; a first run flagged one case
+because the bench's pad read started on an 8-byte boundary — a VIP
+artefact, fixed in the bench, the case re-proven alone), bit-exact
+(grid / named 43 / sweep 2×300 with the y sentinel check).  Every case
+with a long output run moved: `oh-chunking standard 32x32x32` **-28.3 %**,
+`M-grouping 64ch` / `in_h=17` **-27.9 %**, `batch=2 dil=2` -24.9 %,
+`DW oh-chunking 32ch` **-24.7 %** (114.4 k → 86.1 k cycles), `1x1 32->16
+on 40x64` -22.0 %, `ow-tiling` -15.8 %, `7x7 stem` -9.5 %, the small cases
+-5…-12 %.  New cases: `1x1 8->8 on 121x75` 1.84 M ns, `DW 12ch 33x37`
+453 k ns, `DW s2 16ch 27x29` 219 k ns.  Synthesis: II=1 on every loop
+(transposer inner loop latency 2, writer 6), slack 0.00, gmem3
+`128 -> 128`, BRAM 158 → 165 (the wider y adapter: 8 BRAM18), DSP 251,
+FF 38.2 k, LUT 57.8 k (+6.1 k: the two 8-bank LUTRAM buffers, the
+barrel shifter and the strobe logic), URAM 24 → 12.  Cycle model: Phase 3
+= `m_tiles·L + min(L, 256) + 6·steps` per chunk; validation 7.3 % mean
+(`--arch 38`), DW cases -2…-11 %, the 1×1 40×64 case is over-predicted
+by 26 % (its input loads overlap more than the serial model assumes —
+resolved by §2.39's loader split).
 
 ---
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.37).
+"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.39;
+--arch 37/38 reproduces the earlier steps for re-validating their reports).
 See SKILL.md for usage.  Constants come from platforms/<AXI_PLATFORM>.json."""
 import argparse, json, math, os, sys
 
@@ -29,6 +30,10 @@ def geom(P, in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw, dwise):
 INVOKE_OVERHEAD = 1000   # geometry dividers, bias load, DATAFLOW start-up, first-burst latencies
 ROW_LOAD_LATENCY = 40    # first read data after a row's requests are issued
 DW_TILE_RAMP     = 10    # §2.37: one pipeline ramp per (mt, ow_tile) flat depthwise sweep
+DRAIN_SEG        = 256   # §2.38: Phase-3 transposer segment (pixels); one extra segment + ramps per chunk
+DRAIN_STEP_RAMP  = 6
+ARCH             = 39    # newest step modelled; overridden by --arch
+ROW_FILL_LATENCY = 12    # §2.39: per-row Phase-1 entry (the loader has the words parked in the FIFO)
 
 def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise):
     """Cycle model.  The patch producer is SEQUENTIAL per row: it loads a row's
@@ -42,7 +47,14 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
         rows = min(per, oh - c * per)
         if not dwise:
             ph1 += rows * ow * m_tiles                  # §2.37: depthwise seeds acc from a bias register
-        ph3 += rows * ow * out_ch                       # 1 element/cycle drain (+ writer at same rate)
+        if ARCH >= 38:
+            # §2.38: one URAM word (8 channels of a pixel) per cycle through the segment
+            # transposer, the writer at 8 elements/beat underneath; the last segment's
+            # drain and one ramp per step are exposed.
+            L = rows * ow; nseg = -(-L // DRAIN_SEG)
+            ph3 += m_tiles * L + min(L, DRAIN_SEG) + DRAIN_STEP_RAMP * (m_tiles * nseg + 1)
+        else:
+            ph3 += rows * ow * out_ch                   # 1 element/cycle drain (+ writer at same rate)
         r0 = c * per * sh - pt
         r1 = (c * per + rows - 1) * sh + (kh - 1) * dh - pt
         in_rows = max(0, min(r1, in_h - 1) - max(r0, 0) + 1)   # rows actually fetched for this chunk
@@ -55,7 +67,11 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
                     # §2.37 flat sweep: kh*kw cycles per pixel, one ramp per (mt, ow_tile)
                     sweep += rows * tw * kh * kw + DW_TILE_RAMP
-                    loads += in_rows * (mv * cols + ROW_LOAD_LATENCY)
+                    if ARCH >= 39:
+                        # §2.39: Phase 1 writes one column of all channels per cycle
+                        loads += in_rows * (cols + ROW_FILL_LATENCY)
+                    else:
+                        loads += in_rows * (mv * cols + ROW_LOAD_LATENCY)
         else:
             for ict in range(ic_tiles):
                 icv = min(T, in_ch - ict * T)
@@ -63,7 +79,10 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
-                    loads += in_rows * (icv * cols + ROW_LOAD_LATENCY)   # grp 0 only
+                    if ARCH >= 39:
+                        loads += in_rows * (cols + ROW_FILL_LATENCY)         # §2.39, grp 0 only
+                    else:
+                        loads += in_rows * (icv * cols + ROW_LOAD_LATENCY)   # grp 0 only
                     for g in range(groups):
                         mt0 = g * mtg; G = min(mtg, m_tiles - mt0)
                         mv_sum = sum(min(P["TILE_M"], out_ch - (mt0 + i) * P["TILE_M"]) for i in range(G))
@@ -127,12 +146,15 @@ def run_validate(P, report):
     print(f"mean |error| all: {100*sum(errs)/len(errs):.1f} %   cases > 20 k cycles: {100*sum(big)/max(1,len(big)):.1f} %")
 
 def main():
+    global ARCH
     ap = argparse.ArgumentParser()
     ap.add_argument("models", nargs="*")
     ap.add_argument("--platform", default=os.environ.get("AXI_PLATFORM", "kv260"))
     ap.add_argument("--case", nargs="+", type=int, metavar="N", help="C M H W kh kw [sh sw dh dw pt pl pb pr dw]")
     ap.add_argument("--validate", metavar="conv_test_report.json")
+    ap.add_argument("--arch", type=int, default=ARCH, help="model the kernel as of §2.<N> (37, 38, 39)")
     a = ap.parse_args(); P = load_platform(a.platform)
+    ARCH = a.arch
     if a.case:
         v = a.case + [1, 1, 1, 1, 0, 0, 0, 0, 0][len(a.case) - 6:]
         C, M, H, W, kh, kw, sh, sw, dh, dw, pt, pl, pb, pr, dwise = v[:15]

@@ -363,23 +363,34 @@ static inline ConvGeometry compute_conv_geometry(
 // drain (so the inter-stage FIFO is Data_t-wide, not AccData_t-wide).
 // This stage is therefore a pure stream→DDR copy.
 // ---------------------------------------------------------------------------
-// Output write requests are issued in pieces of at most kWriteReqElems
-// elements — one max-length AXI burst each (max_write_burst_length=256
-// beats; the burst_maxi port is 16 bits wide, one element per beat) — and
-// at most kWriteInFlight requests are left without a write_response().
-// Both limits keep the number of unacknowledged bursts below the port's
-// num_write_outstanding=16.  A single write_request for a whole channel
-// run (up to chunk_oh_count*out_w elements — 4032 on MobileNet v2's first
-// 1x1 projection, 16 bursts) deadlocked the m_axi adapter on the board:
-// its response FIFO filled before the run's data was written and the
-// writer, still inside the run, never reached write_response().
-// Reproduced in the RTL test stand by TestConvSim case 28e.
-static constexpr unsigned kWriteReqElems = 256;
-static constexpr unsigned kWriteInFlight = 8;
+// §2.38: y is a 128-bit hls::burst_maxi<YWord> port.  acc_stream carries
+// one YWord per beat = kYPortElems consecutive pixels of ONE channel, in
+// (ni, chunk, mt, m1, segment, word) order — the consumer's Phase 3
+// transposes the [pixel][mt][kTileM] accumulator words into these
+// channel-major words in segments of kDrainSeg pixels.  Each (channel,
+// segment) run starts at an arbitrary element index (m*out_h*out_w +
+// chunk offset), so the writer re-aligns the stream words onto DDR words
+// with a 2-word barrel shift and issues one write_request per run of
+// conv_y_words_for(start, len) <= kDrainSegWords + 1 words (one burst; the
+// port's max_write_burst_length is 64).  The first and last DDR words of
+// a run are written with BYTE STROBES covering only the run's own lanes
+// (hls::burst_maxi::write(word, byte_enable_mask)), so a neighbouring
+// channel's lanes in the same word — and the pad lanes past the tensor's
+// end — are left intact.  Lanes whose strobe is off are also zeroed in
+// the data so no 'X' from an unwritten transposer entry reaches WDATA.
+//
+// §2.30 bounds still apply: one burst per request and at most
+// kWriteInFlight requests without a write_response() (< the port's
+// num_write_outstanding = 8), so the adapter's response FIFO can never
+// fill while the writer is still inside a run.
+static constexpr unsigned kDrainSeg      = 256;                       // pixels per Phase-3 segment
+static constexpr unsigned kDrainSegWords = kDrainSeg / kYPortElems;   // stream words per (channel, segment)
+static constexpr unsigned kWriteInFlight = 4;
+static_assert(kDrainSeg % kYPortElems == 0, "segment must be whole words");
 
 static void write_output_tile(
-    hls::burst_maxi<Data_t> y,
-    hls::stream<Data_t>&    acc_stream,
+    hls::burst_maxi<YWord>  y,
+    hls::stream<YWord>&     acc_stream,
     unsigned                out_ch,
     unsigned                out_h,
     unsigned                out_w,
@@ -389,46 +400,61 @@ static void write_output_tile(
     const unsigned m_tiles      = (out_ch + kTileM - 1) / kTileM;
     const unsigned oh_per_chunk = geom.oh_per_chunk;
     const unsigned num_chunks   = geom.num_chunks;
-    // write_request()s whose write_response() is still owed.  Responses are
-    // collected in a sliding window of kWriteInFlight so several runs' bursts
-    // stay in flight (num_write_outstanding=16 on the port); blocking on the
-    // previous run's response right after each run was traced to serialise
-    // drain → transfer → response per run (1.77 cycles/element).
+    // write_request()s whose write_response() is still owed (sliding
+    // window, §2.27 / §2.30).
     unsigned pending = 0;
 
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
-        const unsigned oh_start       = chunk * oh_per_chunk;
-        const unsigned oh_end         = std::min(out_h, oh_start + oh_per_chunk);
-        const unsigned run_len        = (oh_end - oh_start) * out_w;
+        const unsigned oh_start = chunk * oh_per_chunk;
+        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
+        const unsigned run_len  = (oh_end - oh_start) * out_w;           // pixels per channel
+        const unsigned n_seg    = (run_len + kDrainSeg - 1) / kDrainSeg;
 
+        // Stream order is (mt, segment, m1, word): Phase 3 transposes one
+        // tile's segment at a time and emits all its channels before the
+        // next segment.
         for (unsigned mt = 0; mt < m_tiles; mt++) {
             const unsigned m_off   = mt * kTileM;
             const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                // First element of this channel's rows [oh_start, oh_end).
-                const unsigned base =
-                    ((ni * out_ch + m_off + m1) * out_h + oh_start) * out_w;
-                // §2.27 explicit bursts (hls::burst_maxi).  Burst
-                // inference on a plain pointer was traced in RTL and never
-                // overlapped draining with transmitting: with long bursts
-                // the adapter buffered a whole burst at the 1-element/cycle
-                // drain rate before sending it; with 16-beat bursts it
-                // deferred every run's last burst to an end-of-kernel flush
-                // and paused ~21 cycles between bursts.  write_request()
-                // issues the address up front, write() streams the data as
-                // it arrives from acc_stream, and the response is collected
-                // in a sliding window so up to kWriteInFlight requests'
-                // bursts are outstanding at once.  Each request covers at
-                // most kWriteReqElems elements (one burst); a run longer
-                // than that is split into consecutive requests.
-                for (unsigned off = 0; off < run_len; off += kWriteReqElems) {
-                    const unsigned rem = run_len - off;
-                    const unsigned len = (rem < kWriteReqElems) ? rem : kWriteReqElems;
-                    y.write_request(base + off, len);
-                    for (unsigned i = 0; i < len; i++) {
+            for (unsigned seg = 0; seg < n_seg; seg++) {
+                const unsigned rem = run_len - seg * kDrainSeg;
+                const unsigned len = (rem < kDrainSeg) ? rem : kDrainSeg;
+                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    // First element of this channel's rows [oh_start, oh_end)
+                    // plus the segment offset: the run start in elements.
+                    const unsigned e =
+                        ((ni * out_ch + m_off + m1) * out_h + oh_start) * out_w
+                        + seg * kDrainSeg;
+                    const unsigned shift = e % kYPortElems;                 // lanes before the run in word 0
+                    const unsigned n_in  = (len + kYPortElems - 1) / kYPortElems;
+                    const unsigned n_out = conv_y_words_for(e, len);        // n_in or n_in + 1
+                    const unsigned end   = shift + len;                     // one past the last lane
+                    const unsigned sbits = shift * kDataBits;
+
+                    y.write_request(e / kYPortElems, n_out);
+                    YWord prev = 0;
+                    for (unsigned k = 0; k < n_out; k++) {
                         #pragma HLS PIPELINE II=1
-                        y.write(acc_stream.read());
+                        YWord in = 0;
+                        if (k < n_in) in = acc_stream.read();
+                        // DDR word k = lanes [8k, 8k+8) of the shifted run.
+                        YWord out = (shift == 0)
+                                  ? in
+                                  : (YWord)((in << sbits) | (prev >> (kYPortBits - sbits)));
+                        ap_uint<2 * kYPortElems> be = 0;          // one bit per byte
+                        YWord keep = 0;
+                        for (unsigned l = 0; l < kYPortElems; l++) {
+                            #pragma HLS UNROLL
+                            const unsigned pos = k * kYPortElems + l;
+                            const bool ok = (pos >= shift) && (pos < end);
+                            be[2 * l]     = ok;
+                            be[2 * l + 1] = ok;
+                            if (ok) keep.range(kDataBits * (l + 1) - 1, kDataBits * l) =
+                                        ap_uint<kDataBits>(-1);
+                        }
+                        y.write((YWord)(out & keep), (ap_int<2 * kYPortElems>)be);
+                        prev = in;
                     }
                     pending++;
                     if (pending == kWriteInFlight) {
@@ -1047,7 +1073,7 @@ static void process_conv_kernel_tile(
     hls::stream<PatchVec>&  patch_stream,
     hls::stream<WeightVec>& weight_stream,
     hls::stream<BiasVec>&   bias_stream,
-    hls::stream<Data_t>&    acc_stream,
+    hls::stream<YWord>&     acc_stream,
     unsigned                batch,
     unsigned                in_ch,
     unsigned                in_h,
@@ -1487,28 +1513,118 @@ static void process_conv_kernel_tile(
             } // mt
         } // depthwise
 
-        // -------- Phase 3: drain partial_outputs to acc_stream --------
+        // -------- Phase 3: drain partial_outputs to acc_stream (§2.38) --------
         // saturate_cast AccData_t→Data_t here (hoisted out of
-        // write_output_tile) so acc_stream is a Data_t-wide FIFO.
-        // Order is CHANNEL-major — (mt, m1, oh_local, ow) — so that
-        // write_output_tile sees one contiguous run of
-        // chunk_oh_count·out_w elements per channel and can burst (§2.22).
-        // The partial_outputs reads become out_ch-strided, which is free
-        // on the on-chip URAM.
-        for (unsigned mt = 0; mt < m_tiles; mt++) {
-            const unsigned m_off   = mt * kTileM;
-            const unsigned m_valid = std::min(kTileM, out_ch - m_off);
-            for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                for (unsigned oh_local = 0; oh_local < chunk_oh_count; oh_local++) {
-                    for (unsigned ow = 0; ow < out_w; ow++) {
-                        #pragma HLS PIPELINE II=1
-                        const unsigned idx =
-                            ((oh_local * out_w + ow) * m_tiles + mt) * kTileM + m1;
-                        acc_stream.write(
-                            saturate_cast<Data_t>(partial_outputs[idx]));
+        // write_output_tile).  Order is CHANNEL-major — (mt, m1, segment,
+        // word) — so write_output_tile sees one contiguous run per
+        // (channel, segment) and can burst (§2.22).
+        //
+        // partial_outputs words are [pixel][mt][kTileM lanes] (one pixel,
+        // 8 channels) but the stream wants [8 pixels of one channel].  The
+        // transpose runs in segments of kDrainSeg pixels through two
+        // LUTRAM ping-pong buffers of kYPortElems banks: while segment n
+        // (one tile's kDrainSeg pixels) is read from the URAM one word per
+        // cycle and scattered into buffer n&1, segment n-1 is gathered from
+        // buffer (n-1)&1 one output word per cycle.  Bank rotation makes
+        // both sides conflict-free: pixel p of channel m1 lives in bank
+        // (m1 + p) % 8 at address m1*kDrainSegWords + p/8, so a pixel's 8
+        // channels land in 8 distinct banks and a channel's 8 consecutive
+        // pixels are read from 8 distinct banks at ONE shared address.
+        // Steady state: 8 outputs per cycle instead of one.
+        {
+        Data_t tA[kYPortElems][kDrainSeg];
+        Data_t tB[kYPortElems][kDrainSeg];
+        #pragma HLS ARRAY_PARTITION variable=tA complete dim=1
+        #pragma HLS ARRAY_PARTITION variable=tB complete dim=1
+        #pragma HLS BIND_STORAGE variable=tA type=RAM_S2P impl=LUTRAM
+        #pragma HLS BIND_STORAGE variable=tB type=RAM_S2P impl=LUTRAM
+
+        const unsigned run_len = chunk_oh_count * out_w;                    // pixels per channel
+        const unsigned n_seg   = (run_len + kDrainSeg - 1) / kDrainSeg;
+        const unsigned n_steps = m_tiles * n_seg;                          // segments in (mt, seg) order
+
+        // Fill descriptor of segment n (advanced per step) and the drain
+        // descriptor of segment n-1 (the previous fill descriptor).
+        unsigned f_mt = 0, f_seg = 0;
+        unsigned d_len = 0, d_valid = 0;
+        ap_uint<1> pp = 0;                                                  // buffer written this step
+
+        for (unsigned n = 0; n <= n_steps; n++) {
+            const bool     has_fill  = (n < n_steps);
+            const unsigned f_rem     = run_len - f_seg * kDrainSeg;
+            const unsigned fill_len  = !has_fill ? 0u
+                                     : ((f_rem < kDrainSeg) ? f_rem : kDrainSeg);
+            const unsigned f_valid   = std::min(kTileM, out_ch - f_mt * kTileM);
+            // partial_outputs word of the segment's first pixel (§2.23 layout).
+            unsigned       f_word    = (f_seg * kDrainSeg) * m_tiles + f_mt;
+
+            const unsigned d_wpc     = (d_len + kYPortElems - 1) / kYPortElems;  // words per channel
+            const unsigned drain_cnt = (n == 0) ? 0u : d_valid * d_wpc;
+            unsigned       d_m1 = 0, d_j = 0;
+
+            const unsigned trip = (fill_len > drain_cnt) ? fill_len : drain_cnt;
+            for (unsigned i = 0; i < trip; i++) {
+                #pragma HLS PIPELINE II=1
+                // Within one execution of this loop a buffer is either only
+                // written (fill) or only read (drain) — pp is fixed — so the
+                // store→load pairs HLS sees on tA / tB are never real.
+                #pragma HLS DEPENDENCE variable=tA type=inter dependent=false
+                #pragma HLS DEPENDENCE variable=tB type=inter dependent=false
+
+                // ---- fill: pixel i of segment n → 8 rotated banks ----
+                if (i < fill_len) {
+                    Data_t sat[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=sat complete dim=0
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        sat[m1] = saturate_cast<Data_t>(partial_outputs[f_word * kTileM + m1]);
+                    }
+                    const ap_uint<3> rot  = i & (kYPortElems - 1);
+                    const unsigned   wrow = i >> 3;
+                    for (unsigned b = 0; b < kYPortElems; b++) {
+                        #pragma HLS UNROLL
+                        const ap_uint<3> m1  = (ap_uint<3>)(b - rot);            // lane in bank b
+                        const unsigned   adr = (unsigned)m1 * kDrainSegWords + wrow;
+                        const Data_t     v   = sat[m1];
+                        if (pp == 0) tA[b][adr] = v; else tB[b][adr] = v;
+                    }
+                    f_word += m_tiles;
+                }
+
+                // ---- drain: word d_j of channel d_m1 of segment n-1 ----
+                if (i < drain_cnt) {
+                    const unsigned adr = d_m1 * kDrainSegWords + d_j;
+                    Data_t bank[kYPortElems];
+                    #pragma HLS ARRAY_PARTITION variable=bank complete dim=0
+                    for (unsigned b = 0; b < kYPortElems; b++) {
+                        #pragma HLS UNROLL
+                        bank[b] = (pp == 0) ? tB[b][adr] : tA[b][adr];
+                    }
+                    YWord w = 0;
+                    const ap_uint<3> rot = d_m1;
+                    for (unsigned q = 0; q < kYPortElems; q++) {
+                        #pragma HLS UNROLL
+                        const ap_uint<3> b = (ap_uint<3>)(rot + q);              // bank holding pixel q
+                        w.range(kDataBits * (q + 1) - 1, kDataBits * q) =
+                            conv_data_to_lane(bank[b]);
+                    }
+                    acc_stream.write(w);
+                    if (++d_j == d_wpc) {
+                        d_j = 0;
+                        d_m1++;
                     }
                 }
             }
+
+            // Segment n becomes the drain of step n+1.
+            d_len   = fill_len;
+            d_valid = f_valid;
+            if (++f_seg == n_seg) {
+                f_seg = 0;
+                f_mt++;
+            }
+            pp = (ap_uint<1>)(pp ^ 1);
+        }
         }
       } // chunk
     } // ni
@@ -1518,7 +1634,7 @@ void ConvKernel(
     hls::burst_maxi<Data_t>     x,
     hls::burst_maxi<WeightWord> weight,
     hls::burst_maxi<WeightWord> bias,
-    hls::burst_maxi<Data_t>     y,
+    hls::burst_maxi<YWord>      y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,
@@ -1582,7 +1698,10 @@ void ConvKernel(
     // of <= kMaxOutCh/8 = 160 beats.
     #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT_WORDS max_read_burst_length=128 num_read_outstanding=8
     #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS_WORDS   max_read_burst_length=256 num_read_outstanding=2
-    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y      max_write_burst_length=256 num_write_outstanding=16
+    // y is a 128-bit port (§2.38): one write_request per (channel, segment)
+    // run of <= kDrainSegWords + 1 = 33 beats, at most kWriteInFlight = 4
+    // unacknowledged (§2.30), so 64 x 8 bounds the adapter buffer.
+    #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y_WORDS max_write_burst_length=64 num_write_outstanding=8
 
     #pragma HLS INTERFACE s_axilite port=x            bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=weight       bundle=ctrl
@@ -1682,10 +1801,10 @@ void ConvKernel(
     hls_thread_local hls::stream<PatchVec> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
 
-    // acc_stream carries already-saturated Data_t — process_conv_kernel_tile
+    // acc_stream carries already-saturated Data_t lanes — process_conv_kernel_tile
     // applies saturate_cast in its Phase-3 drain, so this inter-stage FIFO
-    // is Data_t-wide (not AccData_t-wide) and write_output_tile is a plain
-    // stream→DDR copy.
+    // is Data_t-based (not AccData_t) and write_output_tile is a
+    // re-aligning stream→DDR copy.
     //
     // §2.26 write overlap: the FIFO is one full chunk deep and lives in the
     // otherwise idle URAM (UG1399 bind_storage: type=fifo, impl=uram), so
@@ -1697,8 +1816,10 @@ void ConvKernel(
     // with compute.  Single-chunk layers gain nothing here (there is no
     // next chunk to overlap with) — see the min-chunks note in
     // CONV_OPTIMISATION.md §2.26.
-    hls_thread_local hls::stream<Data_t> acc_stream;
-    #pragma HLS STREAM variable=acc_stream depth=kMaxAccPersistEntries
+    // §2.38: YWord beats (8 outputs each); the same chunk-deep capacity in
+    // 8x fewer, 8x wider entries (URAM 16 -> 4 blocks).
+    hls_thread_local hls::stream<YWord> acc_stream;
+    #pragma HLS STREAM variable=acc_stream depth=kMaxAccPersistEntries/kYPortElems
     #pragma HLS BIND_STORAGE variable=acc_stream type=fifo impl=uram
 
     // weight_stream carries one Data_t per cycle from stream_load_weights

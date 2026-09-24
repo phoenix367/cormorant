@@ -84,6 +84,26 @@ static constexpr unsigned kWeightPortBits  = 128;
 static constexpr unsigned kWeightPortElems = kWeightPortBits / kDataBits;
 typedef ap_uint<kWeightPortBits> WeightWord;
 
+// ---------------------------------------------------------------------------
+// Output port (§2.38).  y is an hls::burst_maxi<YWord> port of the same
+// 128-bit width: 8 Data_t lanes per beat, lane 0 in the lowest-addressed
+// bytes.  The NCHW layout of y is UNCHANGED — the writer re-aligns each
+// channel run (which starts at an arbitrary element index m*out_h*out_w)
+// onto DDR words and writes the run's first / last words with byte
+// strobes, so the lanes of a word that belong to a neighbouring channel
+// (or lie past the tensor's end, inside the 16-byte tail pad) are never
+// touched.  The buffer handed to the kernel must be 16-byte aligned and
+// padded to a whole word (the scheduler aligns every buffer to 64 bytes).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kYPortBits  = kWeightPortBits;
+static constexpr unsigned kYPortElems = kYPortBits / kDataBits;
+typedef ap_uint<kYPortBits> YWord;
+// Number of kYPortElems-lane words touched by the element run
+// [off, off + count) — the run may start and end mid-word.
+inline unsigned conv_y_words_for(unsigned off, unsigned count) {
+    return (off + count - 1) / kYPortElems - off / kYPortElems + 1;
+}
+
 static_assert(kWeightPortBits % kDataBits == 0,
               "weight port width must be a whole number of Data_t lanes");
 static_assert((kTileIC * kDataBits) % kWeightPortBits == 0,
@@ -157,6 +177,9 @@ inline ap_uint<kDataBits> conv_data_to_lane(Data_t v) {
  * the cosim buffers) are in words: elements / kWeightPortElems. */
 #define CONV_COSIM_DEPTH_WEIGHT_WORDS (CONV_COSIM_DEPTH_WEIGHT / 8)
 #define CONV_COSIM_DEPTH_BIAS_WORDS   (CONV_COSIM_DEPTH_BIAS / 8)
+/* y is YWord-wide (§2.38): a tensor of CONV_COSIM_DEPTH_Y elements whose
+ * last run ends mid-word touches CONV_COSIM_DEPTH_Y / 8 + 1 words. */
+#define CONV_COSIM_DEPTH_Y_WORDS      (CONV_COSIM_DEPTH_Y / 8 + 1)
 
 // ---------------------------------------------------------------------------
 // ConvKernel — 2-D convolution following ONNX Conv semantics.
@@ -197,7 +220,8 @@ inline ap_uint<kDataBits> conv_data_to_lane(Data_t v) {
 // AXI interface (in ConvKernel.cpp):
 //   x, weight, bias → m_axi gmem0/1/2  (read ports; all hls::burst_maxi —
 //                     x Data_t-wide, weight/bias WeightWord-wide)
-//   y               → m_axi gmem3      (write port, hls::burst_maxi)
+//   y               → m_axi gmem3      (write port, hls::burst_maxi<YWord>,
+//                     128-bit beats with byte strobes at run ends, §2.38)
 //   all scalars     → s_axilite, bundle=ctrl
 // ---------------------------------------------------------------------------
 // All four DDR ports are hls::burst_maxi<> (§2.27/§2.28/§2.32): explicit
@@ -205,12 +229,13 @@ inline ap_uint<kDataBits> conv_data_to_lane(Data_t v) {
 // bias once) and one write_request per contiguous output run, instead of
 // burst inference.  A plain pointer converts implicitly (hls_burst_maxi.h's
 // pointer constructor); the weight / bias pointers must point at
-// WeightWord-packed buffers (see the layout note above).
+// WeightWord-packed buffers (see the layout note above) and y at a
+// 16-byte-aligned, whole-word-padded buffer (see "Output port").
 void ConvKernel(
     hls::burst_maxi<Data_t>     x,
     hls::burst_maxi<WeightWord> weight,
     hls::burst_maxi<WeightWord> bias,
-    hls::burst_maxi<Data_t>     y,
+    hls::burst_maxi<YWord>      y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,
