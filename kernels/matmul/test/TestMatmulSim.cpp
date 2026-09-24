@@ -156,9 +156,10 @@ static void dump_one_case(const char* label,
                           unsigned a_stride, unsigned b_stride,
                           const std::vector<Data_t>& a,
                           const std::vector<Data_t>& b,
-                          const std::vector<Data_t>& c_ref) {
+                          const std::vector<Data_t>& c_ref,
+                          unsigned b_packed = 0) {
 #ifndef MATMUL_HAVE_APFIXED
-    (void)label; (void)n; (void)k; (void)m;
+    (void)label; (void)n; (void)k; (void)m; (void)b_packed;
     (void)batch; (void)a_stride; (void)b_stride;
     (void)a; (void)b; (void)c_ref;
     std::fprintf(stderr, "--dump-data requires MATMUL_HAVE_APFIXED build\n");
@@ -173,8 +174,8 @@ static void dump_one_case(const char* label,
     write_hex_file(prefix + "b.hex", b);
     write_hex_file(prefix + "c.hex", c_ref);
 
-    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %s\n",
-                 idx, n, k, m, batch, a_stride, b_stride,
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %s\n",
+                 idx, n, k, m, batch, a_stride, b_stride, b_packed,
                  sanitize_label(label).c_str());
     std::printf("[DUMP] test_%02d  %-50s  N=%u K=%u M=%u batch=%u\n",
                 idx, label, n, k, m, batch);
@@ -258,6 +259,26 @@ static std::vector<MatmulWord> to_words(const std::vector<Data_t>& e)
     return out;
 }
 
+// Tile-major packed image of B (MatmulKernel.h "Packed (tile-major) B
+// layout"): every batch slice of k*m becomes k*packed_m elements.
+// Returns the packed vector and the packed batch stride.
+static std::vector<Data_t> pack_b_tile_major(const std::vector<Data_t>& B,
+                                             unsigned k, unsigned m,
+                                             unsigned batch, unsigned b_stride,
+                                             unsigned& packed_stride)
+{
+    const unsigned pm     = matmul_packed_m(m);
+    const unsigned slices = (b_stride == 0) ? 1u : batch;
+    packed_stride         = (b_stride == 0) ? 0u : k * pm;
+    std::vector<Data_t> out((size_t)slices * k * pm, Data_t(0));
+    for (unsigned s = 0; s < slices; s++)
+        for (unsigned kk = 0; kk < k; kk++)
+            for (unsigned mm = 0; mm < m; mm++)
+                out[(size_t)s * k * pm + matmul_packed_index(kk, mm, k)] =
+                    B[(size_t)s * b_stride + (size_t)kk * m + mm];
+    return out;
+}
+
 #ifdef MATMUL_COSIM
 static MatmulWord g_a[MATMUL_COSIM_DEPTH_A_WORDS];
 static MatmulWord g_b[MATMUL_COSIM_DEPTH_B_WORDS];
@@ -270,7 +291,7 @@ static bool invoke_matmul(const char* label,
                           std::vector<Data_t>&       C_got,
                           unsigned n, unsigned k, unsigned m, unsigned batch,
                           unsigned a_stride, unsigned b_stride,
-                          unsigned c_stride)
+                          unsigned c_stride, unsigned b_packed = 0)
 {
     (void)label;  // used only by the MATMUL_COSIM skip message below
 #ifdef MATMUL_COSIM
@@ -285,12 +306,12 @@ static bool invoke_matmul(const char* label,
         std::copy(aw.begin(), aw.end(), g_a);
         std::copy(bw.begin(), bw.end(), g_b);
     }
-    MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride);
+    MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride, b_packed);
     std::copy(g_c, g_c + C_got.size(), C_got.begin());
 #else
     std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
     MatmulKernel(aw.data(), bw.data(), C_got.data(),
-                 n, k, m, batch, a_stride, b_stride, c_stride);
+                 n, k, m, batch, a_stride, b_stride, c_stride, b_packed);
 #endif
     return true;
 }
@@ -302,7 +323,7 @@ static bool invoke_matmul(const char* label,
 // AccData_t range regardless of K.
 // ---------------------------------------------------------------------------
 static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
-                      unsigned seed = kSeed)
+                      unsigned seed = kSeed, unsigned b_packed = 0)
 {
     std::vector<Data_t> A(n * k), B(k * m);
     std::vector<Data_t> C_ref(n * m, Data_t(0));
@@ -315,17 +336,20 @@ static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
 
     ref_matmul_2d   (A.data(), B.data(), C_ref.data(), n, k, m);
 
+    unsigned b_stride = k * m;
+    if (b_packed) B = pack_b_tile_major(B, k, m, 1u, k * m, b_stride);
+
     if (!g_dump_dir.empty()) {
         dump_one_case(label, n, k, m, /*batch*/1u,
-                      /*a_stride*/ n * k, /*b_stride*/ k * m,
-                      A, B, C_ref);
+                      /*a_stride*/ n * k, b_stride,
+                      A, B, C_ref, b_packed);
         return true;
     }
 
     if (!invoke_matmul(label, A, B, C_got,
                        n, k, m, /*batch=*/1,
-                       /*a_stride=*/n * k, /*b_stride=*/k * m,
-                       /*c_stride=*/n * m))
+                       /*a_stride=*/n * k, b_stride,
+                       /*c_stride=*/n * m, b_packed))
         return true;  // skipped — case exceeds the cosim buffers
 
     return compare_outputs(C_ref.data(), C_got.data(), n * m, label);
@@ -338,7 +362,7 @@ static bool RunTestBatch(const char* label,
                          unsigned n, unsigned k, unsigned m,
                          unsigned batch,
                          unsigned a_stride, unsigned b_stride,
-                         unsigned seed = kSeed)
+                         unsigned seed = kSeed, unsigned b_packed = 0)
 {
     const unsigned a_total = (a_stride == 0) ? n * k : batch * a_stride;
     const unsigned b_total = (b_stride == 0) ? k * m : batch * b_stride;
@@ -356,14 +380,17 @@ static bool RunTestBatch(const char* label,
     ref_matmul_batch(A.data(), B.data(), C_ref.data(),
                      n, k, m, batch, a_stride, b_stride, c_stride);
 
+    unsigned b_stride_eff = b_stride;
+    if (b_packed) B = pack_b_tile_major(B, k, m, batch, b_stride, b_stride_eff);
+
     if (!g_dump_dir.empty()) {
-        dump_one_case(label, n, k, m, batch, a_stride, b_stride,
-                      A, B, C_ref);
+        dump_one_case(label, n, k, m, batch, a_stride, b_stride_eff,
+                      A, B, C_ref, b_packed);
         return true;
     }
 
     if (!invoke_matmul(label, A, B, C_got,
-                       n, k, m, batch, a_stride, b_stride, c_stride))
+                       n, k, m, batch, a_stride, b_stride_eff, c_stride, b_packed))
         return true;  // skipped — case exceeds the cosim buffers
 
     return compare_outputs(C_ref.data(), C_got.data(), batch * c_stride, label);
@@ -446,7 +473,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(g_manifest,
             "# MatmulKernel test fixture manifest\n"
-            "# idx n k m batch a_stride b_stride label\n");
+            "# idx n k m batch a_stride b_stride b_packed label\n");
     }
 
     bool all_ok = true;
@@ -555,6 +582,22 @@ int main(int argc, char** argv) {
     // correctness is still verified (kernel matches naive reference).
     // -----------------------------------------------------------------------
     printf("\n--- Saturation ---\n");
+
+    // Tile-major packed B (b_packed = 1) — the layout the scheduler emits
+    // for constant weights.  Same geometries as above, packed in the test.
+    run(RunTest2D("TileN x TileK x TileM  [B packed]",           kTileN, kTileK, kTileM, kSeed, 1u));
+    run(RunTest2D("(TileN+2) x (TileK+5) x (TileM+3)  [B packed, all partial]",
+                  kTileN + 2, kTileK + 5, kTileM + 3, kSeed, 1u));
+    run(RunTest2D("7 x 13 x 5  [B packed, arbitrary small]",     7, 13, 5, kSeed, 1u));
+    run(RunTest2D("1 x K x M  [B packed, N=1 row vector]",       1, kTileK, kTileM, kSeed, 1u));
+    run(RunTest2D("N x K x 1  [B packed, M=1]",                  kTileN, kTileK, 1, kSeed, 1u));
+    run(RunTest2D("3*TileN x (2*TileK+7) x (2*TileM+1)  [B packed, multi-tile]",
+                  3 * kTileN, 2 * kTileK + 7, 2 * kTileM + 1, kSeed, 1u));
+    run(RunTest2D("1 x 2*TileK x 4*TileM  [B packed, FC-like]",  1, 2 * kTileK, 4 * kTileM, kSeed, 1u));
+    run(RunTestBatch("batch=3, no broadcast  [B packed]",
+                     5, 64, 19, 3, 5 * 64, 64 * 19, kSeed, 1u));
+    run(RunTestBatch("batch=4, B broadcasts  [B packed, b_stride=0]",
+                     5, 64, 19, 4, 5 * 64, 0, kSeed, 1u));
 
     run(RunTestSaturation("sat_pos: a=100, b=100, K=3  → AP_MAX",
                            100.0, 100.0, 3, kSatMax));

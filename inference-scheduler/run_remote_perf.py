@@ -109,7 +109,7 @@ class BenchResult:
 # Field name → positional arg order for each kernel (matches binary's main() parsing)
 _CASE_FIELDS: Dict[str, List[str]] = {
     "VectorOPKernel": ["op", "size", "outer", "a_inc", "b_inc", "iters"],
-    "MatmulKernel":   ["n", "k", "m", "batch", "a_stride", "b_stride", "iters"],
+    "MatmulKernel":   ["n", "k", "m", "batch", "a_stride", "b_stride", "b_packed", "iters"],
     "ConvKernel":     ["batch", "in_ch", "in_h", "in_w", "out_ch",
                        "kh", "kw", "stride_h", "stride_w",
                        "dilation_h", "dilation_w", "pad_top", "pad_left",
@@ -132,7 +132,8 @@ def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCas
                 f"VectorOPKernel case {d.get('label', '?')!r}: "
                 f"unsupported op={op} (valid: {valid})"
             )
-    args = [str(d[f]) for f in fields]
+    # Optional fields default to 0 (e.g. MatmulKernel b_packed, MATMUL_OPTIMISATION §3b).
+    args = [str(d.get(f, 0)) for f in fields]
     warmup = int(d.get("warmup", default_warmup))
     return BenchCase(kernel=kernel, label=d["label"], args=args, warmup=warmup)
 

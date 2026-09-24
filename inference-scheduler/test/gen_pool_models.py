@@ -206,6 +206,54 @@ def gen_pool_batch2() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+
+
+# ---------------------------------------------------------------------------
+# 128-bit x port coverage (POOL_OPTIMIZATION §2.13): row segments that start
+# at every 16-byte lane offset, rows wider than the 64-column line buffer
+# (ow-tiling), several channel tiles, and batch slices at odd offsets.
+# ---------------------------------------------------------------------------
+def _pool(name, op, x_shape, y_shape, **attrs):
+    node = helper.make_node(op, inputs=["X"], outputs=["Y"], **attrs)
+    graph = helper.make_graph([node], name, inputs=[_vi("X", x_shape)], outputs=[_vi("Y", y_shape)])
+    _save(helper.make_model(graph, opset_imports=_opset()), name + ".onnx")
+
+
+def gen_pool_w13_maxpool() -> None:
+    """X[1,4,9,13] 2x2 s2 -> Y[1,4,4,6]: 13-element rows, every run starts
+    at a different lane."""
+    _pool("pool_w13_maxpool", "MaxPool", [1, 4, 9, 13], [1, 4, 4, 6],
+          kernel_shape=[2, 2], strides=[2, 2])
+
+
+def gen_pool_w77_avgpool_tiled() -> None:
+    """X[1,8,20,77] 3x3 s2 pad1 -> Y[1,8,10,39]: in_w > 64 columns forces
+    ow-tiling; one 8-channel tile."""
+    _pool("pool_w77_avgpool_tiled", "AveragePool", [1, 8, 20, 77], [1, 8, 10, 39],
+          kernel_shape=[3, 3], strides=[2, 2], pads=[1, 1, 1, 1])
+
+
+def gen_pool_c24_w17_maxpool() -> None:
+    """X[1,24,17,17] 3x3 s1 pad1 -> Y[1,24,17,17]: three channel tiles,
+    17-element rows."""
+    _pool("pool_c24_w17_maxpool", "MaxPool", [1, 24, 17, 17], [1, 24, 17, 17],
+          kernel_shape=[3, 3], strides=[1, 1], pads=[1, 1, 1, 1])
+
+
+def gen_pool_batch3_odd_offsets() -> None:
+    """X[3,5,7,30] 2x2 s2 -> Y[3,5,3,15]: 1050-element batch slices, so
+    every batch starts at a non-16-byte offset."""
+    _pool("pool_batch3_odd_offsets", "MaxPool", [3, 5, 7, 30], [3, 5, 3, 15],
+          kernel_shape=[2, 2], strides=[2, 2])
+
+
+def gen_pool_global_avg_w7() -> None:
+    """GlobalAveragePool X[1,12,7,7] -> Y[1,12,1,1]: 49-element channel
+    planes (every plane starts at a different lane), two channel tiles;
+    7 is the kernel's kMaxPoolH/W."""
+    _pool("pool_global_avg_w7", "GlobalAveragePool", [1, 12, 7, 7], [1, 12, 1, 1])
+
+
 ALL_GENERATORS = [
     gen_maxpool_simple,
     gen_avgpool_simple,
@@ -217,6 +265,11 @@ ALL_GENERATORS = [
     gen_lp_p1,
     gen_pool_then_relu,
     gen_pool_batch2,
+    gen_pool_w13_maxpool,
+    gen_pool_w77_avgpool_tiled,
+    gen_pool_c24_w17_maxpool,
+    gen_pool_batch3_odd_offsets,
+    gen_pool_global_avg_w7,
 ]
 
 

@@ -150,6 +150,23 @@ chain still drains the Pool lane before MatMul reads the alias.
 
 ---
 
+## Weight layouts
+
+Constant weights are emitted in the layout the target kernel reads
+fastest, not in ONNX row-major order; `TensorInfo.packed_data` holds the
+image and `numel` / the `.dat` file / the DMA buffer follow it, while
+`data` / `shape` stay logical for the simulator:
+
+| Kernel | Tensor | Layout |
+|---|---|---|
+| ConvKernel | weight, bias | tile-major `[M][ceil(C/16)][kH][kW][lanes]`, bias padded to 8 (CONV_OPTIMISATION §2.32 / §2.34) |
+| MatmulKernel | B (constant only) | tile-major `[ceil(M/16)][K][16]`, `b_packed = 1` on every consumer (MATMUL_OPTIMISATION §3b) |
+
+A MatMul B is packed only when every reader of the tensor is a MatMul
+using it as B with the same `(k, m)` (`OnnxGraph._pack_matmul_weights`);
+activations and shared constants stay row-major and the kernel reads them
+through its per-row path.
+
 ## Data Type
 
 Default: `ap_fixed<16,8>` — 16-bit two's complement, 8 integer bits, 8

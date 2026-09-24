@@ -706,4 +706,50 @@ if __name__ == "__main__":
     gen_in_ch_at_limit()
     gen_dil_h_at_line_buf_limit()
     gen_acc_persist_at_limit()
+    gen_conv_fc_7x7_64to256,
+    gen_conv_1x1_classifier_1024,
+    gen_conv_mgroups_prefetch,
+
+
+# ---------------------------------------------------------------------------
+# Weight-path / M-group coverage at scale (CONV_OPTIMISATION §2.32–§2.36):
+# one-pixel "fully-connected" convolutions whose time is the weight stream,
+# and a many-M-group layer that exercises the §2.35 w_cache prefetch across
+# group and ic-tile boundaries.  Small weights keep ramp inputs unsaturated.
+# ---------------------------------------------------------------------------
+def _conv_model(name, x_shape, w_shape, y_shape, scale, seed, bias=False, **attrs):
+    w = (np.random.RandomState(seed).uniform(-1.0, 1.0, size=w_shape) * scale).astype(np.float32)
+    inits = [numpy_helper.from_array(w, name="W")]
+    inputs = ["X", "W"]
+    if bias:
+        b = (np.random.RandomState(seed + 1).uniform(-1.0, 1.0, size=(w_shape[0],)) * 0.1).astype(np.float32)
+        inits.append(numpy_helper.from_array(b, name="B")); inputs.append("B")
+    node = helper.make_node("Conv", inputs=inputs, outputs=["Y"], **attrs)
+    graph = helper.make_graph([node], name, inputs=[_vi("X", x_shape)], outputs=[_vi("Y", y_shape)], initializer=inits)
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), name + ".onnx")
+
+
+def gen_conv_fc_7x7_64to256() -> None:
+    """X[1,64,7,7] * W[256,64,7,7] -> Y[1,256,1,1]: LeNet conv3-style
+    fully-connected conv (1.6 MB of packed weights, 4 ic-tiles x 8 M-groups,
+    one output pixel per slab)."""
+    _conv_model("conv_fc_7x7_64to256", [1, 64, 7, 7], [256, 64, 7, 7], [1, 256, 1, 1],
+                0.004, 21, bias=True, kernel_shape=[7, 7])
+
+
+def gen_conv_1x1_classifier_1024() -> None:
+    """X[1,128,1,1] * W[1024,128,1,1] -> Y[1,1024,1,1]: 1x1 classifier
+    (8 ic-tiles x 32 M-groups, one pixel)."""
+    _conv_model("conv_1x1_classifier_1024", [1, 128, 1, 1], [1024, 128, 1, 1], [1, 1024, 1, 1],
+                0.02, 22, bias=True, kernel_shape=[1, 1])
+
+
+def gen_conv_mgroups_prefetch() -> None:
+    """X[1,24,12,12] * W[80,24,3,3] pad1 -> Y[1,80,12,12]: 2 ic-tiles
+    (16 + 8, half-tile last) x 3 M-groups so the w_cache prefetch crosses
+    every (ict, mg) boundary with a partial last group."""
+    _conv_model("conv_mgroups_prefetch", [1, 24, 12, 12], [80, 24, 3, 3], [1, 80, 12, 12],
+                0.02, 23, bias=False, kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+
+
     print("Done.")

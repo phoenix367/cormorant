@@ -40,9 +40,11 @@ Platform selection (lower entries override higher ones):
 Missing / malformed fields raise ``MatmulHwConfigError`` rather than
 silently falling back to defaults.
 
-``tile_n``, ``tile_m``, ``tile_k`` are read but not exported to the
-validator: any ``n`` / ``m`` / ``k`` runs (residual-tile padded inside
-the kernel), so models cannot violate them.  Only ``max_k`` is the
+``tile_n``, ``tile_k`` are read but not exported to the validator: any
+``n`` / ``m`` / ``k`` runs (residual-tile padded inside the kernel), so
+models cannot violate them.  ``tile_m`` is exported because the packed
+tile-major B layout the scheduler emits for constant weights
+(``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the
 hard upper bound — see ``doc/MATMUL_KERNEL.md`` §3 "Runtime constraint
 validated by the scheduler".
 """
@@ -66,7 +68,8 @@ _DEFAULT_PLATFORM = "kv260"
 
 # Required fields and the Python attribute they get exported as.
 _REQUIRED: Tuple[Tuple[str, str], ...] = (
-    ("max_k", "MATMUL_MAX_K"),
+    ("max_k",  "MATMUL_MAX_K"),
+    ("tile_m", "MATMUL_TILE_M"),   # packed-B tile width (MATMUL_OPTIMISATION §3b)
 )
 
 
@@ -141,10 +144,12 @@ _CFG = resolve()
 
 # Exported constants — these are what `nodes.py` validates against.
 MATMUL_MAX_K : int = _CFG["MATMUL_MAX_K"]
+MATMUL_TILE_M: int = _CFG["MATMUL_TILE_M"]
 
 
 __all__ = (
     "MATMUL_MAX_K",
+    "MATMUL_TILE_M",
     "MatmulHwConfigError",
     "resolve",
 )

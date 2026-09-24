@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation (1301 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation (1306 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **Vivado behavioural sim** | Vitis, Vivado | Block-design behavioural sim against the SystemVerilog testbench (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -29,7 +29,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1301 tests
+# Run all 1306 tests
 .venv/bin/python -m pytest test/ -q
 
 # Run a specific module
@@ -151,6 +151,30 @@ For full SSH setup, config reference, and debugging guide see
 
 ---
 
+### 4.x On-board correctness set — coverage added 2026-09-25
+
+`remote_config_all_models.json` lists **144 models**.  The 18 added with
+the 128-bit port and packed-B work target what those changes touch:
+
+- **MatMul packed B** (`mm_packed_*`): the MNIST Gemm (256×10), the
+  ResNet-18 (512×1000) and MobileNet v2 (1280×1001) classifier shapes,
+  batched constant B (stride rescale), the 4D×3D outer loop over a packed
+  constant, two packed layers with `m` not a multiple of 16, and
+  `mm_packed_then_activation` — a packed MatMul followed by a row-major one
+  in the same inference, which fails if `b_packed` is not rewritten on
+  every call (the stale-register failure of 2026-09-25).
+- **Row-major guard**: `mm_shared_const_row_major` (a constant read by a
+  MatMul and an Add must stay row-major) and `mm_unaligned_rows` /
+  `mm_relu_then_packed_odd` (13- and 5-element rows so the 128-bit A/B
+  ports extract lanes at every shift; A from an intermediate tensor).
+- **Pool 128-bit x**: 13-, 17- and 77-column rows (the last forces
+  ow-tiling), three channel tiles, batch slices at odd element offsets, a
+  7×7 global pool over two channel tiles.
+- **Conv weight path at scale**: `conv_fc_7x7_64to256` (LeNet conv3-style
+  one-pixel layer, 1.6 MB packed weights), `conv_1x1_classifier_1024`
+  (8 ic-tiles × 32 M-groups) and `conv_mgroups_prefetch` (half-tile last
+  ic-tile × 3 M-groups for the §2.35 prefetch).
+
 ## 5. Performance benchmarking (KV260)
 
 `run_remote_perf.py` measures raw kernel throughput and latency.
@@ -185,9 +209,10 @@ the correctness configs with an additional `benchmarks` section.
 }
 ```
 
-The default `perf_config.json` ships with **48 benchmark cases**
-across the four kernels (15 VectorOPKernel, 12 MatmulKernel,
-10 ConvKernel, 11 PoolingKernel).
+The default `perf_config.json` ships with **55 benchmark cases**
+across the four kernels (15 VectorOPKernel, 19 MatmulKernel — including
+row-major / packed-B twins of the FC and classifier shapes, `b_packed`
+case field, MATMUL_OPTIMISATION §3b — 10 ConvKernel, 11 PoolingKernel).
 
 VectorOPKernel `op` values outside the supported range (0..5) are
 rejected at config-load time before any SSH upload or remote build —

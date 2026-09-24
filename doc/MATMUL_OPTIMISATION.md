@@ -160,7 +160,48 @@ top five) and the model from 1.06 → **0.91 ms**; no image demo has a MatMul la
 
 ---
 
-## 3a. Where the next speedup would come from
+## 3b. Packed tile-major B for constant weights (`b_packed`)
+
+**Change.**  A new AXI-Lite register `b_packed` (offset 0x6C, appended so
+the existing offsets are unchanged) selects a tile-major B layout
+(MATMUL_KERNEL.md §1, `matmul_packed_index()`): one contiguous
+`[k][kTileM]` block per m-tile, `m` zero-padded to a multiple of kTileM.
+With it a `(m_tile, k_tile)` block is one run of `k_valid · kTileM`
+elements; the kernel issues it as ≤ 8 back-to-back 64-word requests
+(`max_read_burst_length` of `b` raised 16 → 64) and streams the words
+straight into `b_tile` (word `w` → row `w / 2`, columns
+`(w % 2) · 8 …`), instead of `k_valid` requests of ≤ 3 words each.
+
+The scheduler (`OnnxGraph._pack_matmul_weights`, `MatmulNode.pack_b`)
+packs a constant B once per tensor and calls every consumer with
+`b_packed = 1`, rescaling `b_batch_stride` / `b_outer_stride` to packed
+slices — but only when every reader of the tensor is a MatMul using it
+as B with the same `(k, m)`; activations and constants shared with other
+readers stay row-major and take the §3 per-row path.  `run_matmul()` /
+`run_matmul_at()` gained the `b_packed` argument; `TensorInfo.numel`
+follows the packed image (`m` 10 → 16 for the MNIST Gemm).  Kernel C-sim
+(29 cases, 9 packed), the RTL fixtures (manifest gained a `b_packed`
+column) and 4 new scheduler tests cover both layouts.
+
+**Result (RTL, packed vs row-major twin of the same geometry).**
+`TileN × TileK × TileM` 43,470 → 25,760 ns (−41 %), all-partial
+154,890 → 81,760 (−47 %), `multi-tile all dims` 663,790 → 331,280
+(−50 %), N=1 row vector −47 %, batched −38 %; only the tiny 7×13×5 case
+is flat (−6 %).  Combined with §3 the tiled cases are now 7–8× faster
+than the §1 baseline (e.g. 197,580 → 25,760 ns).  Synthesis: II=1 on
+every loop, BRAM 64 (unchanged), slack 0.00; 29/29 RTL, 29/29 C-sim.
+
+**On board** (bitstream WNS +0.78 ns, full re-synthesis — see the
+incremental-synthesis note in hw/cormorant_hw_128/CLAUDE.md): 126/126
+scheduler models PASS, plus a 7-size constant-B sweep (k 32…512, m
+10…64, 1–8 requests per block).  MNIST convnet 0.910 → **0.898 ms**
+(its 256×10 Gemm), MobileNet v2 404 → **400 ms** and ResNet-18
+374 → **372 ms** (their Gemm classifiers, 1280×1001 and 512×1000, now
+packed); LeNet and MobileNet v1 have no MatMul and are unchanged.
+Predictions and logits identical.  Demo projects must be regenerated
+after this change: a project generated before the register existed
+inherits whatever `b_packed` value the previous run left in the kernel.
+
 
 The DATAFLOW experiment confirmed the bottleneck is **DDR bandwidth**, not
 MAC throughput. The synthesis `M_AXI Burst Information` shows the cause:

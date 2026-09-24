@@ -83,6 +83,30 @@ inline ap_uint<kMatmulDataBits> matmul_data_to_lane(Data_t v) {
 }
 #endif
 
+// ---------------------------------------------------------------------------
+// Packed (tile-major) B layout — MATMUL_OPTIMISATION.md §3b.
+//
+// With b_packed = 1 the kernel expects B stored as
+//
+//     B_packed[(mt * k + kk) * kTileM + m1]   =  B[kk][mt * kTileM + m1]
+//
+// i.e. one contiguous [k][kTileM] block per m-tile, m padded with zeros to
+// matmul_packed_m(m) = ceil(m / kTileM) * kTileM.  A (m_tile, k_tile) block
+// is then ONE contiguous run of k_valid * kTileM elements
+// (k_valid * kMatmulWordsPerTileRow words) instead of k_valid separate
+// ≤ 3-word row segments — the scheduler emits constant weights this way.
+// Batch slices are k * packed_m elements apart; b_batch_stride /
+// b_outer offsets are element counts in the PACKED image.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kMatmulWordsPerTileRow = kTileM / kMatmulPortElems;
+static_assert(kTileM % kMatmulPortElems == 0, "kTileM must be a multiple of the lanes per word");
+inline unsigned matmul_packed_m(unsigned m) {
+    return ((m + kTileM - 1) / kTileM) * kTileM;
+}
+inline unsigned matmul_packed_index(unsigned kk, unsigned mm, unsigned k) {
+    return ((mm / kTileM) * k + kk) * kTileM + (mm % kTileM);
+}
+
 // Number of words that cover `count` elements starting at element `off`.
 inline unsigned matmul_words_for(unsigned off, unsigned count) {
     const unsigned w_lo = off / kMatmulPortElems;
@@ -129,6 +153,9 @@ inline unsigned matmul_words_for(unsigned off, unsigned count) {
 //   a_batch_stride  Elements to advance 'a' per batch step (0 = broadcasts).
 //   b_batch_stride  Elements to advance 'b' per batch step (0 = broadcasts).
 //   c_batch_stride  Elements to advance 'c' per batch step.
+//   b_packed        0: B is row-major [k][m]; 1: B is in the tile-major
+//                   packed layout (matmul_packed_index), b_batch_stride in
+//                   packed elements.
 //
 // Memory layout (row-major):
 //   A[n][k] : a[row*k + col]
@@ -150,5 +177,6 @@ void MatmulKernel(
     unsigned      batch,
     unsigned      a_batch_stride,
     unsigned      b_batch_stride,
-    unsigned      c_batch_stride
+    unsigned      c_batch_stride,
+    unsigned      b_packed
 );

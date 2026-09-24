@@ -201,50 +201,50 @@ mobilenet_v1
   cmake    → OK       1.0s
   make     → OK       5.2s
     classify_images: model=mobilenet_v1 images=1 classes=1001 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=488.692 ms
+    image: greyfox-672194.JPEG  latency=488.729 ms
       1) [ 281] grey_fox                          prob= 69.06%  logit=  3034
       2) [ 278] red_fox                           prob=  4.96%  logit=  2360
       3) [ 264] Pembroke                          prob=  2.83%  logit=  2216
       4) [ 272] red_wolf                          prob=  2.32%  logit=  2165
       5) [ 279] kit_fox                           prob=  2.15%  logit=  2146
   run      → OK       5.3s
-    mean = 488.692 ms   throughput = 2.0 img/s
+    mean = 488.729 ms   throughput = 2.0 img/s
 
 mobilenet_v2
   upload   → OK       2.1s
   cmake    → OK       0.9s
   make     → OK       6.3s
     classify_images: model=mobilenet_v2 images=1 classes=1000 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=404.261 ms
+    image: greyfox-672194.JPEG  latency=399.730 ms
       1) [ 280] grey_fox                          prob= 56.47%  logit=  3550
       2) [ 277] red_fox                           prob= 22.73%  logit=  3317
       3) [ 278] kit_fox                           prob= 16.82%  logit=  3240
       4) [ 272] coyote                            prob=  1.23%  logit=  2571
       5) [ 274] dhole                             prob=  0.71%  logit=  2431
   run      → OK       4.0s
-    mean = 404.261 ms   throughput = 2.5 img/s
+    mean = 399.730 ms   throughput = 2.5 img/s
 
 resnet18
   upload   → OK       5.7s
   cmake    → OK       0.9s
   make     → OK       4.0s
     classify_images: model=resnet18 images=1 classes=1000 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=373.791 ms
+    image: greyfox-672194.JPEG  latency=371.997 ms
       1) [ 280] grey_fox                          prob= 83.10%  logit=  3057
       2) [ 277] red_fox                           prob=  8.59%  logit=  2476
       3) [ 278] kit_fox                           prob=  3.48%  logit=  2245
       4) [ 279] Arctic_fox                        prob=  0.58%  logit=  1788
       5) [ 272] coyote                            prob=  0.48%  logit=  1738
   run      → OK       5.2s
-    mean = 373.791 ms   throughput = 2.7 img/s
+    mean = 371.997 ms   throughput = 2.7 img/s
 
   ── IMAGE CLASSIFICATION KV260 ──
 
   Model         Status   Images   mean(ms)    p50(ms)    p99(ms)        IPS
   ─────────────────────────────────────────────────────────────────────────
-  mobilenet_v1  OK           1    488.692    488.692    488.692        2.0
-  mobilenet_v2  OK           1    404.261    404.261    404.261        2.5
-  resnet18      OK           1    373.791    373.791    373.791        2.7
+  mobilenet_v1  OK           1    488.729    488.729    488.729        2.0
+  mobilenet_v2  OK           1    399.730    399.730    399.730        2.5
+  resnet18      OK           1    371.997    371.997    371.997        2.7
 ```
 
 Notable behaviour visible in the run:

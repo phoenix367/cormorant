@@ -41,12 +41,28 @@ writes concurrently.
 | `a_batch_stride` | `unsigned` | Elements to advance `a` per batch step (0 = broadcast) |
 | `b_batch_stride` | `unsigned` | Elements to advance `b` per batch step (0 = broadcast) |
 | `c_batch_stride` | `unsigned` | Elements to advance `c` per batch step |
+| `b_packed` | `unsigned` | 0: `b` is row-major `[k][m]`; 1: `b` holds the tile-major packed image (below); `b_batch_stride` is then in packed elements |
 | `return` | — | `ap_ctrl_hs` (start / done / idle / ready) |
 
 Memory layout is row-major: `A[row·k + col]`, `B[row·m + col]`,
 `C[row·m + col]`.  `a` and `b` must be 16-byte aligned base addresses;
 the kernel derives every row's covering 128-bit word range itself, so
 batch strides and tile offsets are ordinary element offsets.
+
+**Packed B (`b_packed = 1`, MATMUL_OPTIMISATION §3b).**  Constant
+weights are emitted by the scheduler as
+
+```
+B_packed[(mt · k + kk) · kTileM + m1] = B[kk][mt · kTileM + m1]      (m1 < kTileM)
+```
+
+with `m` zero-padded to `ceil(m / kTileM) · kTileM`, i.e. one contiguous
+`[k][kTileM]` block per m-tile (`matmul_packed_index()` in
+`MatmulKernel.h`).  A `(m_tile, k_tile)` block is then a single run of
+`k_valid · kTileM` elements that the kernel fetches with ≤ 8 back-to-back
+64-word requests instead of `k_valid` separate ≤ 3-word row segments.
+Each batch slice is `k · packed_m` elements.  Activations as B keep the
+row-major layout (`b_packed = 0`).
 
 ---
 

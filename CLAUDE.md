@@ -127,7 +127,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run all tests (1301 tests)
+# Run all tests (1306 tests)
 .venv/bin/python -m pytest test/ -v
 ```
 

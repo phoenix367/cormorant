@@ -160,3 +160,88 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Packed tile-major B (MATMUL_OPTIMISATION §3b)
+#
+# A constant B is emitted in MatmulKernel's [ceil(M/kTileM)][K][kTileM]
+# layout and the node is called with b_packed = 1; activations and
+# constants shared with non-MatMul readers stay row-major.
+# ---------------------------------------------------------------------------
+import tempfile
+import numpy as np
+import onnx
+from onnx import helper as oh, TensorProto as TP
+from src._matmul_hw_config import MATMUL_TILE_M
+from src.nodes import matmul_packed_m
+
+
+def _build(nodes, inputs, outputs, inits):
+    g = oh.make_graph(nodes, "t", inputs, outputs, initializer=inits)
+    m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 13)]); m.ir_version = 8
+    d = tempfile.mkdtemp(); path = os.path.join(d, "m.onnx"); onnx.save(m, path)
+    return path
+
+
+def _const(name, arr):
+    return oh.make_tensor(name, TP.FLOAT, arr.shape, arr.astype(np.float32).flatten().tolist())
+
+
+class TestMatmulPackedB(unittest.TestCase):
+    def test_constant_b_is_packed(self):
+        k, m = 20, 10
+        w = np.arange(k * m, dtype=np.float32).reshape(k, m) / 64.0
+        path = _build([oh.make_node("MatMul", ["A", "W"], ["Y"])],
+                      [oh.make_tensor_value_info("A", TP.FLOAT, [1, k])],
+                      [oh.make_tensor_value_info("Y", TP.FLOAT, [1, m])], [_const("W", w)])
+        g = OnnxGraph(path)
+        node = [n for n in g.nodes if isinstance(n, MatmulNode)][0]
+        self.assertTrue(node.b_packed)
+        pm = matmul_packed_m(m)
+        self.assertEqual(pm, MATMUL_TILE_M)
+        packed = node.inputs[1].packed_data
+        self.assertEqual(packed.size, k * pm)
+        img = packed.reshape(pm // MATMUL_TILE_M, k, MATMUL_TILE_M)
+        for kk in range(k):
+            for mm in range(m):
+                self.assertEqual(img[mm // MATMUL_TILE_M, kk, mm % MATMUL_TILE_M], w[kk, mm])
+            for mm in range(m, pm):
+                self.assertEqual(img[0, kk, mm], 0.0)
+        self.assertIn(f"{int(node.b_packed)}u);", node.emit_call({}))
+        self.assertTrue(node.emit_call({}).rstrip().endswith("1u);"))
+
+    def test_batched_constant_b_strides_rescaled(self):
+        b, k, m = 3, 8, 20
+        w = np.random.RandomState(0).rand(b, k, m)
+        path = _build([oh.make_node("MatMul", ["A", "W"], ["Y"])],
+                      [oh.make_tensor_value_info("A", TP.FLOAT, [b, 2, k])],
+                      [oh.make_tensor_value_info("Y", TP.FLOAT, [b, 2, m])], [_const("W", w)])
+        node = [n for n in OnnxGraph(path).nodes if isinstance(n, MatmulNode)][0]
+        self.assertTrue(node.b_packed)
+        self.assertEqual(node.b_batch_stride, k * matmul_packed_m(m))
+        self.assertEqual(node.inputs[1].packed_data.size, b * k * matmul_packed_m(m))
+
+    def test_activation_b_stays_row_major(self):
+        k, m = 8, 8
+        path = _build([oh.make_node("MatMul", ["A", "B"], ["Y"])],
+                      [oh.make_tensor_value_info("A", TP.FLOAT, [1, k]),
+                       oh.make_tensor_value_info("B", TP.FLOAT, [k, m])],
+                      [oh.make_tensor_value_info("Y", TP.FLOAT, [1, m])], [])
+        node = [n for n in OnnxGraph(path).nodes if isinstance(n, MatmulNode)][0]
+        self.assertFalse(node.b_packed)
+        self.assertIsNone(node.inputs[1].packed_data)
+        self.assertTrue(node.emit_call({}).rstrip().endswith("0u);"))
+
+    def test_constant_shared_with_vectorop_stays_row_major(self):
+        k, m = 8, 8
+        w = np.ones((k, m), dtype=np.float32)
+        path = _build([oh.make_node("MatMul", ["A", "W"], ["Y"]),
+                       oh.make_node("Add", ["W", "X2"], ["Z"])],
+                      [oh.make_tensor_value_info("A", TP.FLOAT, [1, k]),
+                       oh.make_tensor_value_info("X2", TP.FLOAT, [k, m])],
+                      [oh.make_tensor_value_info("Y", TP.FLOAT, [1, m]),
+                       oh.make_tensor_value_info("Z", TP.FLOAT, [k, m])], [_const("W", w)])
+        node = [n for n in OnnxGraph(path).nodes if isinstance(n, MatmulNode)][0]
+        self.assertFalse(node.b_packed)
+        self.assertIsNone(node.inputs[1].packed_data)

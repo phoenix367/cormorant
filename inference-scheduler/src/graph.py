@@ -26,7 +26,7 @@ from onnx import shape_inference, TensorProto
 
 from typing import Union
 from .tensor import TensorInfo
-from .nodes  import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
+from .nodes  import (_pack_matmul_b, ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
                      POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
 
@@ -346,9 +346,42 @@ class OnnxGraph:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
 
+        self._pack_matmul_weights()
+
     # ------------------------------------------------------------------ #
     # Public API                                                           #
     # ------------------------------------------------------------------ #
+
+    def _pack_matmul_weights(self) -> None:
+        """Emit constant MatMul B operands in MatmulKernel's tile-major packed
+        layout (MATMUL_OPTIMISATION §3b, MatmulNode.b_packed).
+
+        A constant is packed only when EVERY node that reads it is a MatMul
+        using it as B with the same (k, m): the packed image is a different
+        byte layout, so a tensor also consumed elsewhere (a VectorOP, a
+        Reshape alias, the A side of another MatMul) must keep its row-major
+        form.  Such tensors, and non-constant Bs (activations), stay
+        row-major and the kernel reads them through its per-row path.
+        """
+        readers: dict = {}
+        for sn in self._nodes:
+            for t in getattr(sn, "inputs", []):
+                readers.setdefault(t.onnx_name, []).append(sn)
+        done: set = set()
+        for sn in self._nodes:
+            if not isinstance(sn, MatmulNode):
+                continue
+            b = sn.inputs[1]
+            if b.data is None or b.onnx_name in done:
+                continue
+            users = readers.get(b.onnx_name, [])
+            if not all(isinstance(u, MatmulNode) and u.inputs[1] is b
+                       and u.k == sn.k and u.m == sn.m for u in users):
+                continue
+            _pack_matmul_b(b, sn.k, sn.m)
+            for u in users:
+                u.pack_b()
+            done.add(b.onnx_name)
 
     @property
     def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode]]:

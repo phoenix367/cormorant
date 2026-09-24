@@ -762,6 +762,132 @@ def make_mm_k_at_limit(out_dir: str) -> None:
 # Entry point                                                          #
 # ------------------------------------------------------------------ #
 
+
+
+# ------------------------------------------------------------------ #
+# Packed tile-major B and 128-bit A/B port coverage (MATMUL_OPTIMISATION #
+# §3 / §3b).  Constant Bs below are emitted packed (b_packed = 1);       #
+# activation Bs and shared constants stay row-major.  Weights are small   #
+# so ramp inputs never saturate the ap_fixed<16,8> output.                #
+# ------------------------------------------------------------------ #
+
+def _w(shape, scale, seed):
+    return (np.random.RandomState(seed).uniform(-1.0, 1.0, size=shape) * scale).astype(np.float32)
+
+
+def make_mm_packed_fc_256x10(out_dir: str) -> None:
+    """A[1,256] @ W[256,10] -> Y[1,10]: the MNIST convnet's Gemm geometry.
+    One m-tile (m padded 10 -> 16), one k-tile, 8 back-to-back 64-word
+    requests per block."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "W"], ["Y"])], "mm_packed_fc_256x10",
+                          [_float32("A", [1, 256])], [_float32("Y", [1, 10])],
+                          initializer=[_initializer("W", _w((256, 10), 0.02, 11))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_fc_256x10.onnx"))
+
+
+def make_mm_packed_fc_512x1000(out_dir: str) -> None:
+    """A[1,512] @ W[512,1000] -> Y[1,1000]: ResNet-18 classifier geometry
+    (2 k-tiles x 63 m-tiles, m padded to 1008; 1 MB packed weight .dat)."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "W"], ["Y"])], "mm_packed_fc_512x1000",
+                          [_float32("A", [1, 512])], [_float32("Y", [1, 1000])],
+                          initializer=[_initializer("W", _w((512, 1000), 0.01, 12))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_fc_512x1000.onnx"))
+
+
+def make_mm_packed_fc_1280x1001(out_dir: str) -> None:
+    """A[1,1280] @ W[1280,1001] -> Y[1,1001]: MobileNet v2 classifier
+    geometry (5 k-tiles x 63 m-tiles)."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "W"], ["Y"])], "mm_packed_fc_1280x1001",
+                          [_float32("A", [1, 1280])], [_float32("Y", [1, 1001])],
+                          initializer=[_initializer("W", _w((1280, 1001), 0.005, 13))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_fc_1280x1001.onnx"))
+
+
+def make_mm_packed_batch_const(out_dir: str) -> None:
+    """A[3,2,8] @ W[3,8,20] -> Y[3,2,20]: batched CONSTANT B.  Every slice
+    is packed; b_batch_stride is rescaled from 8*20 to 8*32 packed elements."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "W"], ["Y"])], "mm_packed_batch_const",
+                          [_float32("A", [3, 2, 8])], [_float32("Y", [3, 2, 20])],
+                          initializer=[_initializer("W", _w((3, 8, 20), 0.1, 14))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_batch_const.onnx"))
+
+
+def make_mm_packed_4d_3d_const(out_dir: str) -> None:
+    """A[2,3,4,8] @ W[3,8,20] -> Y[2,3,4,20]: outer loop (run_matmul_at)
+    over a CONSTANT packed B; b_outer_stride stays 0, b_batch_stride is
+    rescaled to packed slices."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "W"], ["Y"])], "mm_packed_4d_3d_const",
+                          [_float32("A", [2, 3, 4, 8])], [_float32("Y", [2, 3, 4, 20])],
+                          initializer=[_initializer("W", _w((3, 8, 20), 0.1, 15))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_4d_3d_const.onnx"))
+
+
+def make_mm_shared_const_row_major(out_dir: str) -> None:
+    """W[8,8] feeds BOTH a MatMul (as B) and an Add: the scheduler must keep
+    it row-major (b_packed = 0) or the Add would read a packed image."""
+    graph = oh.make_graph(
+        [oh.make_node("MatMul", ["A", "W"], ["Y"]),
+         oh.make_node("Add", ["X2", "W"], ["Z"])],
+        "mm_shared_const_row_major",
+        [_float32("A", [4, 8]), _float32("X2", [8, 8])],
+        [_float32("Y", [4, 8]), _float32("Z", [8, 8])],
+        initializer=[_initializer("W", _w((8, 8), 0.2, 16))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_shared_const_row_major.onnx"))
+
+
+def make_mm_unaligned_rows(out_dir: str) -> None:
+    """A[3,5,13] @ B[3,13,5] -> Y[3,5,5], both runtime inputs: k=13 and m=5
+    put every row segment and batch slice (65 elements) at a non-16-byte
+    offset, so the 128-bit A/B ports must extract lanes at all 8 shifts."""
+    graph = oh.make_graph([oh.make_node("MatMul", ["A", "B"], ["Y"])], "mm_unaligned_rows",
+                          [_float32("A", [3, 5, 13]), _float32("B", [3, 13, 5])],
+                          [_float32("Y", [3, 5, 5])])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_unaligned_rows.onnx"))
+
+
+def make_mm_relu_then_packed_odd(out_dir: str) -> None:
+    """Relu(A[1,7,13]) @ W[13,9] -> Y[1,7,9]: A is an intermediate tensor
+    (VectorOP output) with 13-element rows, B is a packed constant with
+    k=13, m=9 (m padded to 16)."""
+    graph = oh.make_graph(
+        [oh.make_node("Relu", ["A"], ["R"]),
+         oh.make_node("MatMul", ["R", "W"], ["Y"])],
+        "mm_relu_then_packed_odd",
+        [_float32("A", [1, 7, 13])], [_float32("Y", [1, 7, 9])],
+        initializer=[_initializer("W", _w((13, 9), 0.1, 17))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_relu_then_packed_odd.onnx"))
+
+
+def make_mm_packed_then_activation(out_dir: str) -> None:
+    """MatMul(A, W const) -> MatMul(., B input): two MatmulKernel calls in
+    one inference with b_packed = 1 then 0.  Regression for the register
+    being rewritten on every call — a stale b_packed = 1 would make the
+    second (row-major) product wrong."""
+    graph = oh.make_graph(
+        [oh.make_node("MatMul", ["A", "W"], ["T"]),
+         oh.make_node("MatMul", ["T", "B"], ["Y"])],
+        "mm_packed_then_activation",
+        [_float32("A", [2, 24]), _float32("B", [20, 6])],
+        [_float32("Y", [2, 6])],
+        initializer=[_initializer("W", _w((24, 20), 0.1, 18))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_then_activation.onnx"))
+
+
+def make_mm_packed_two_layer_odd(out_dir: str) -> None:
+    """[1,40] @ W1[40,24] -> Relu -> @ W2[24,10]: two packed constants whose
+    m (24, 10) are not multiples of 16 and whose k (40, 24) are partial
+    k-tiles."""
+    graph = oh.make_graph(
+        [oh.make_node("MatMul", ["A", "W1"], ["T"]),
+         oh.make_node("Relu", ["T"], ["R"]),
+         oh.make_node("MatMul", ["R", "W2"], ["Y"])],
+        "mm_packed_two_layer_odd",
+        [_float32("A", [1, 40])], [_float32("Y", [1, 10])],
+        initializer=[_initializer("W1", _w((40, 24), 0.1, 19)),
+                     _initializer("W2", _w((24, 10), 0.1, 20))])
+    _save(_make_model(graph), os.path.join(out_dir, "mm_packed_two_layer_odd.onnx"))
+
+
 _ALL_MAKERS = [
     make_mm_1x1,
     make_mm_exact_tile,
@@ -788,6 +914,16 @@ _ALL_MAKERS = [
     make_mm_sat_neg,
     make_mm_unsupported_k_too_large,
     make_mm_k_at_limit,
+    make_mm_packed_fc_256x10,
+    make_mm_packed_fc_512x1000,
+    make_mm_packed_fc_1280x1001,
+    make_mm_packed_batch_const,
+    make_mm_packed_4d_3d_const,
+    make_mm_shared_const_row_major,
+    make_mm_unaligned_rows,
+    make_mm_relu_then_packed_odd,
+    make_mm_packed_then_activation,
+    make_mm_packed_two_layer_odd,
 ]
 
 

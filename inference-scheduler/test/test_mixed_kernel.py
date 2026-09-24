@@ -1566,10 +1566,13 @@ class TestSpatialMatmulRelu(unittest.TestCase):
         self.assertEqual(y_lay.alloc,   6720)
 
     def test_w_flat(self):
+        # W[224,10] is a constant MatMul B: the scheduler emits it in
+        # MatmulKernel's tile-major packed layout, m padded 10 -> 16
+        # (MATMUL_OPTIMISATION §3b), so the DMA buffer is 224 * 16 elements.
         w_lay = self.gen._layouts["W"]
         self.assertEqual(w_lay.n_chunks, 1)
-        self.assertEqual(w_lay.numel,   224 * 10)  # 2240
-        self.assertEqual(w_lay.alloc,   2240)
+        self.assertEqual(w_lay.numel,   224 * 16)  # 3584 (packed)
+        self.assertEqual(w_lay.alloc,   3584)
 
     # ---- Generated source ----
 

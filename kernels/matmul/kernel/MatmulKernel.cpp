@@ -38,7 +38,8 @@ void MatmulKernel(
     unsigned      batch,
     unsigned      a_batch_stride,
     unsigned      b_batch_stride,
-    unsigned      c_batch_stride
+    unsigned      c_batch_stride,
+    unsigned      b_packed
 ) {
     // -----------------------------------------------------------------------
     // HLS AXI interface pragmas.
@@ -58,7 +59,7 @@ void MatmulKernel(
     // into <= 256-word requests); B tile rows are <= 3 words each and are
     // requested kBReqAhead rows ahead so their DDR latency overlaps.
     #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0 depth=MATMUL_COSIM_DEPTH_A_WORDS max_read_burst_length=256 num_read_outstanding=4
-    #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1 depth=MATMUL_COSIM_DEPTH_B_WORDS max_read_burst_length=16  num_read_outstanding=16
+    #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1 depth=MATMUL_COSIM_DEPTH_B_WORDS max_read_burst_length=64  num_read_outstanding=16
     #pragma HLS INTERFACE m_axi port=c offset=slave bundle=gmem2 depth=MATMUL_COSIM_DEPTH_C
     #pragma HLS INTERFACE s_axilite port=a              bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=b              bundle=ctrl
@@ -70,6 +71,7 @@ void MatmulKernel(
     #pragma HLS INTERFACE s_axilite port=a_batch_stride bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=b_batch_stride bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=c_batch_stride bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=b_packed       bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return         bundle=ctrl
 
     // -----------------------------------------------------------------------
@@ -119,6 +121,7 @@ void MatmulKernel(
 
     static constexpr unsigned kAReqWords  = 256;   // max_read_burst_length of a
     static constexpr unsigned kBReqAhead  = 16;    // num_read_outstanding of b
+    static constexpr unsigned kBReqWords  = 64;    // max_read_burst_length of b
 
     // -----------------------------------------------------------------------
     // Batch loop — stride=0 on a or b means that pointer stays fixed (broadcasts).
@@ -210,6 +213,35 @@ void MatmulKernel(
                     // Partial last M-tile: only m_valid columns are loaded;
                     // remaining b_tile columns are stale (never read for C).
                     // -------------------------------------------------------
+                    if (b_packed) {
+                        // Tile-major B: the (m_tile, k_tile) block is one
+                        // contiguous run of k_valid * kTileM elements
+                        // (matmul_packed_index).  Request it in <= kBReqWords
+                        // pieces (all in flight at once: <= 512 / 64 = 8 <=
+                        // num_read_outstanding), then stream the words: word
+                        // w is row w / kMatmulWordsPerTileRow, columns
+                        // (w % kMatmulWordsPerTileRow) * E .. + E - 1.
+                        const unsigned blk_off = b_base + (m_tile * k + k_off) * kTileM;
+                        const unsigned n_words = k_valid * kMatmulWordsPerTileRow;
+                        for (unsigned w0 = 0; w0 < n_words; w0 += kBReqWords) {
+                            #pragma HLS PIPELINE II=1
+                            b.read_request(blk_off / E + w0, std::min(kBReqWords, n_words - w0));
+                        }
+                        for (unsigned w = 0; w < n_words; w++) {
+                            #pragma HLS PIPELINE II=1
+                            const MatmulWord word = b.read();
+                            const unsigned   k1   = w / kMatmulWordsPerTileRow;
+                            const unsigned   part = w % kMatmulWordsPerTileRow;
+                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                #pragma HLS UNROLL
+                                if (m1 / E == part) {
+                                    const unsigned l = m1 % E;
+                                    b_tile[k1][m1] = matmul_lane_to_data(word.range(
+                                        kMatmulDataBits * (l + 1) - 1, kMatmulDataBits * l));
+                                }
+                            }
+                        }
+                    } else
                     // Each tile row is one element run of m_valid <= kTileM
                     // elements at row_off = (k_off + k1) * m + m_off, i.e. at
                     // most ceil((E - 1 + kTileM) / E) words.  Requests for

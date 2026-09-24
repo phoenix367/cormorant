@@ -472,7 +472,37 @@ class ScheduledNode:
 # ``_matmul_hw_config`` reads the same file the C++ CMake build consumes
 # via ``matmul_load_constants()`` in kernels/matmul/CMakeLists.txt.
 # ---------------------------------------------------------------------------
-from ._matmul_hw_config import MATMUL_MAX_K  # noqa: E402
+from ._matmul_hw_config import MATMUL_MAX_K, MATMUL_TILE_M  # noqa: E402
+
+
+def matmul_packed_m(m: int) -> int:
+    """m padded to a multiple of the kernel's kTileM (packed-B layout)."""
+    return -(-m // MATMUL_TILE_M) * MATMUL_TILE_M
+
+
+def _pack_matmul_b(t: TensorInfo, k: int, m: int) -> None:
+    """Emit a constant B in MatmulKernel's tile-major packed layout
+    (MatmulKernel.h "Packed (tile-major) B layout", MATMUL_OPTIMISATION §3b):
+
+        packed[s][(mt * k + kk) * kTileM + m1] = B[s][kk][mt * kTileM + m1]
+
+    for every leading batch slice s, with m zero-padded to matmul_packed_m(m),
+    so a (m_tile, k_tile) block is one contiguous DDR run.  `data` / `shape`
+    stay logical for the simulator; the ROM / .dat / DMA size follow the
+    packed image (TensorInfo.numel / emit_data).
+    """
+    tm  = MATMUL_TILE_M
+    pm  = matmul_packed_m(m)
+    b   = np.asarray(t.data).reshape(-1, k, m)          # [slices][k][m]
+    sl  = b.shape[0]
+    mt  = pm // tm
+    packed = np.zeros((sl, mt, k, tm), dtype=b.dtype)
+    for i in range(mt):
+        c0, c1 = i * tm, min(m, (i + 1) * tm)
+        packed[:, i, :, :c1 - c0] = b[:, :, c0:c1]
+    t.packed_data = np.ascontiguousarray(packed).reshape(-1)
+    t.packed_note = (f"MatmulKernel tile-major B [slices][ceil(M/{tm})][K][{tm}]"
+                     f" = [{sl}][{mt}][{k}][{tm}] (M {m} -> {pm})")
 
 
 @dataclass
@@ -525,6 +555,11 @@ class MatmulNode:
     a_outer_stride: int = 0   # A elements advanced per outer iteration
     b_outer_stride: int = 0   # B elements advanced per outer iteration (0 if B broadcasts)
     c_outer_stride: int = 0   # Y elements advanced per outer iteration
+    # B layout (MATMUL_OPTIMISATION §3b): True when this node's B was emitted
+    # in the kernel's tile-major packed layout (OnnxGraph packs a constant B
+    # after node creation, see pack_b()); b_batch_stride / b_outer_stride are
+    # then counts in the PACKED image.
+    b_packed:       bool = False
 
     # Compatibility shims for _compute_alloc_sizes / _broadcast_io_map.
     # These are always derived constants — never set by callers.
@@ -804,6 +839,22 @@ class MatmulNode:
             f"{batch_str}{outer_str} */"
         )
 
+    def pack_b(self) -> None:
+        """Switch this node to the packed B layout (the tensor image itself is
+        packed once by OnnxGraph; every node sharing it calls this)."""
+        if self.b_packed:
+            return
+        scale   = matmul_packed_m(self.m) * self.k       # packed slice size
+        logical = self.k * self.m
+        # B strides are whole (k x m) slices; rescale them to packed slices.
+        if self.b_batch_stride:
+            assert self.b_batch_stride % logical == 0
+            self.b_batch_stride = self.b_batch_stride // logical * scale
+        if self.b_outer_stride:
+            assert self.b_outer_stride % logical == 0
+            self.b_outer_stride = self.b_outer_stride // logical * scale
+        self.b_packed = True
+
     def emit_call(self, layouts: dict) -> str:
         """Emit the run_matmul() or run_matmul_at() call for this node.
 
@@ -833,14 +884,15 @@ class MatmulNode:
                 return (
                     f"    run_matmul({a}, {b}, {c},\n"
                     f"               1u, {self.k}u, {self.m}u, {self.n}u,\n"
-                    f"               {eff_a}u, {self.b_batch_stride}u, {eff_c}u);"
+                    f"               {eff_a}u, {self.b_batch_stride}u, {eff_c}u,"
+                    f" {int(self.b_packed)}u);"
                 )
             return (
                 f"    run_matmul({a}, {b}, {c},\n"
                 f"               {self.n}u, {self.k}u, {self.m}u, {self.batch}u,\n"
                 f"               {self.a_batch_stride}u,"
                 f" {self.b_batch_stride}u,"
-                f" {self.c_batch_stride}u);"
+                f" {self.c_batch_stride}u, {int(self.b_packed)}u);"
             )
 
         # 4D×3D broadcasting: outer loop over the b1 dimension.
@@ -852,7 +904,7 @@ class MatmulNode:
             f"                      {c}, _i * {self.c_outer_stride}u,",
             f"                      {self.n}u, {self.k}u, {self.m}u, {self.batch}u,",
             f"                      {self.a_batch_stride}u, {self.b_batch_stride}u,"
-            f" {self.c_batch_stride}u);",
+            f" {self.c_batch_stride}u, {int(self.b_packed)}u);",
             "    }",
         ])
 

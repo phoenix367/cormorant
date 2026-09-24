@@ -37,7 +37,13 @@ make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth all 4 kernels + 
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 
-WNS must be positive.  Post-synthesis utilisation:
+WNS must be positive.  `synth_1` must NOT run incrementally
+(`INCREMENTAL_CHECKPOINT` empty, `AUTO_INCREMENTAL_CHECKPOINT` 0): an
+incremental run against a stale reference checkpoint reused the old
+MatmulKernel control block and dropped a newly added AXI-Lite register
+(2026-09-25) while the HWH and drivers showed it.  After an IP register
+change, prove it on the board: write the new register via /dev/mem and
+read it back (a register that is not there reads 0).  Post-synthesis utilisation:
 `hw/cormorant_hw_128/cormorant_hw_128.runs/synth_1/design_cormorant_wrapper_utilization_synth.rpt`;
 per-kernel numbers need `report_utilization -hierarchical` on the synth
 checkpoint (see CONV_OPTIMISATION.md §2.31 for the last set).
@@ -78,7 +84,7 @@ and unbinds such a device before applying ours (2026-09-24); if
 ## 3. Run
 
 ```bash
-.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 126 models, ~9 min
+.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 144 models, ~10 min
 cd ../demo/image_classification && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
     && ../../inference-scheduler/.venv/bin/python scripts/deploy_and_run.py --verbose
 cd ../mnist && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
@@ -86,7 +92,12 @@ cd ../mnist && ../../inference-scheduler/.venv/bin/python scripts/generate_proje
 ```
 
 Regenerate demo projects whenever the scheduler's emitted layouts
-changed (weights are packed for the kernel since §2.32).  Run the demos
+changed (weights are packed for the kernel since §2.32; MatMul B since
+MATMUL_OPTIMISATION §3b) — and ALWAYS after a kernel gains an AXI-Lite
+register: a register keeps its last written value across runs, so a
+project generated before the register exists inherits whatever the
+previous project left there (2026-09-25: stale demo projects ran with
+`b_packed = 1` left by the model set and mispredicted).  Run the demos
 and the model set SEQUENTIALLY — they share the kernels.  Local configs
 must name the VectorOP UIO `fabric_vecop` (the overlay's name after a
 clean boot; older boards showed `fabric`).
