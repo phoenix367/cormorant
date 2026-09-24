@@ -673,43 +673,6 @@ def gen_acc_persist_at_limit() -> None:
           "conv_acc_persist_at_limit.onnx")
 
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", default=OUT_DIR)
-    args = parser.parse_args()
-    OUT_DIR = args.out_dir
-    os.makedirs(OUT_DIR, exist_ok=True)
-
-    print("Generating Conv test models...")
-    gen_conv_simple()
-    gen_conv_with_bias()
-    gen_conv_stride2()
-    gen_conv_padded()
-    gen_conv_batch2()
-    gen_conv_mnist_first_layer()
-    gen_conv_mnist_second_layer()
-    gen_conv_then_relu()
-    gen_conv_then_add_flat()
-    gen_conv_relu_chain()
-    gen_conv_depthwise()
-    gen_conv_depthwise_bias()
-    gen_conv_grouped_invalid()
-    gen_conv_dilation()
-    gen_conv_auto_pad_valid()
-    gen_conv_two_layer_vgg()
-    gen_unsupported_in_ch_too_large()
-    gen_unsupported_out_ch_too_large()
-    gen_unsupported_dil_h_overflows_line_buf()
-    gen_unsupported_dil_w_overflows_line_buf()
-    gen_unsupported_acc_persist()
-    gen_in_ch_at_limit()
-    gen_dil_h_at_line_buf_limit()
-    gen_acc_persist_at_limit()
-    gen_conv_fc_7x7_64to256,
-    gen_conv_1x1_classifier_1024,
-    gen_conv_mgroups_prefetch,
-
 
 # ---------------------------------------------------------------------------
 # Weight-path / M-group coverage at scale (CONV_OPTIMISATION §2.32–§2.36):
@@ -753,3 +716,41 @@ def gen_conv_mgroups_prefetch() -> None:
 
 
     print("Done.")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", default=OUT_DIR)
+    args = parser.parse_args()
+    OUT_DIR = args.out_dir
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    print("Generating Conv test models...")
+    gen_conv_simple()
+    gen_conv_with_bias()
+    gen_conv_stride2()
+    gen_conv_padded()
+    gen_conv_batch2()
+    gen_conv_mnist_first_layer()
+    gen_conv_mnist_second_layer()
+    gen_conv_then_relu()
+    gen_conv_then_add_flat()
+    gen_conv_relu_chain()
+    gen_conv_depthwise()
+    gen_conv_depthwise_bias()
+    gen_conv_grouped_invalid()
+    gen_conv_dilation()
+    gen_conv_auto_pad_valid()
+    gen_conv_two_layer_vgg()
+    gen_unsupported_in_ch_too_large()
+    gen_unsupported_out_ch_too_large()
+    gen_unsupported_dil_h_overflows_line_buf()
+    gen_unsupported_dil_w_overflows_line_buf()
+    gen_unsupported_acc_persist()
+    gen_in_ch_at_limit()
+    gen_dil_h_at_line_buf_limit()
+    gen_acc_persist_at_limit()
+    gen_conv_fc_7x7_64to256,
+    gen_conv_1x1_classifier_1024,
+    gen_conv_mgroups_prefetch,
