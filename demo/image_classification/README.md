@@ -201,50 +201,50 @@ mobilenet_v1
   cmake    → OK       1.0s
   make     → OK       5.2s
     classify_images: model=mobilenet_v1 images=1 classes=1001 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=2463.143 ms
+    image: greyfox-672194.JPEG  latency=736.556 ms
       1) [ 281] grey_fox                          prob= 69.06%  logit=  3034
       2) [ 278] red_fox                           prob=  4.96%  logit=  2360
       3) [ 264] Pembroke                          prob=  2.83%  logit=  2216
       4) [ 272] red_wolf                          prob=  2.32%  logit=  2165
       5) [ 279] kit_fox                           prob=  2.15%  logit=  2146
   run      → OK       5.3s
-    mean = 2463.144 ms   throughput = 0.4 img/s
+    mean = 736.556 ms   throughput = 1.4 img/s
 
 mobilenet_v2
   upload   → OK       2.1s
   cmake    → OK       0.9s
   make     → OK       6.3s
     classify_images: model=mobilenet_v2 images=1 classes=1000 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=1876.401 ms
+    image: greyfox-672194.JPEG  latency=539.096 ms
       1) [ 280] grey_fox                          prob= 56.47%  logit=  3550
       2) [ 277] red_fox                           prob= 22.73%  logit=  3317
       3) [ 278] kit_fox                           prob= 16.82%  logit=  3240
       4) [ 272] coyote                            prob=  1.23%  logit=  2571
       5) [ 274] dhole                             prob=  0.71%  logit=  2431
   run      → OK       4.0s
-    mean = 1876.401 ms   throughput = 0.5 img/s
+    mean = 539.096 ms   throughput = 1.9 img/s
 
 resnet18
   upload   → OK       5.7s
   cmake    → OK       0.9s
   make     → OK       4.0s
     classify_images: model=resnet18 images=1 classes=1000 warmup=1 top_k=5
-    image: greyfox-672194.JPEG  latency=2459.372 ms
-      1) [ 368] gibbon                            prob= 29.62%  logit=  2328
-      2) [ 381] spider_monkey                     prob=  7.97%  logit=  1992
-      3) [  77] wolf_spider                       prob=  3.54%  logit=  1784
-      4) [ 616] knot                              prob=  3.05%  logit=  1746
-      5) [ 374] langur                            prob=  2.94%  logit=  1737
+    image: greyfox-672194.JPEG  latency=567.080 ms
+      1) [ 280] grey_fox                          prob= 83.10%  logit=  3057
+      2) [ 277] red_fox                           prob=  8.59%  logit=  2476
+      3) [ 278] kit_fox                           prob=  3.48%  logit=  2245
+      4) [ 279] Arctic_fox                        prob=  0.58%  logit=  1788
+      5) [ 272] coyote                            prob=  0.48%  logit=  1738
   run      → OK       5.2s
-    mean = 2459.372 ms   throughput = 0.4 img/s
+    mean = 567.080 ms   throughput = 1.8 img/s
 
   ── IMAGE CLASSIFICATION KV260 ──
 
   Model         Status   Images   mean(ms)    p50(ms)    p99(ms)        IPS
   ─────────────────────────────────────────────────────────────────────────
-  mobilenet_v1  OK           1   2463.144   2463.144   2463.144        0.4
-  mobilenet_v2  OK           1   1876.401   1876.401   1876.401        0.5
-  resnet18      OK           1   2459.372   2459.372   2459.372        0.4
+  mobilenet_v1  OK           1    736.556    736.556    736.556        1.4
+  mobilenet_v2  OK           1    539.096    539.096    539.096        1.9
+  resnet18      OK           1    567.080    567.080    567.080        1.8
 ```
 
 Notable behaviour visible in the run:
@@ -265,12 +265,16 @@ Notable behaviour visible in the run:
 - **All three models externalise weights to `weights/*.dat`.**  The
   large FC / final-Conv weight tensors exceed the inline-array
   threshold and are loaded at runtime via `fread()`.
-- **`resnet18` mispredicts.**  The bundled `resnet18-simplified-fused.onnx`
-  was produced by a fusion pipeline whose BN-folding doesn't reproduce
-  cleanly under the current `ap_fixed<16,8>` quantisation, so the
-  top-K is garbage.  This is a known caveat — see
-  [`MODEL_PREPARATION.md`](../../inference-scheduler/doc/MODEL_PREPARATION.md)
-  for the ResNet-18 BN-fusion notes.
+- **`resnet18` used to mispredict; it doesn't any more.**  Earlier runs
+  of this demo produced garbage top-K for ResNet-18 and blamed the
+  BN-fusion of `resnet18-simplified-fused.onnx`.  The actual cause was a
+  ConvKernel bug (line-buffer rows overwritten between M-group replays,
+  `doc/CONV_OPTIMISATION.md` §2.21) that corrupted 12 of its 20 conv
+  layers; MobileNet v1/v2 escaped only because their chunk geometry
+  happened to fit.  With the fix the same ONNX file classifies
+  correctly (83 % grey_fox above).  The latencies in this transcript are
+  from the §2.22–§2.30 ConvKernel (2-D MAC grid, explicit AXI bursts);
+  the previous transcript showed 2 463 / 1 876 / 2 459 ms.
 
 The full per-image top-K table is also written to `build/results.json`.
 

@@ -359,8 +359,18 @@ static inline ConvGeometry compute_conv_geometry(
 // drain (so the inter-stage FIFO is Data_t-wide, not AccData_t-wide).
 // This stage is therefore a pure stream→DDR copy.
 // ---------------------------------------------------------------------------
-// Max write_request()s in flight before a write_response() is collected
-// (must stay <= the port's num_write_outstanding).
+// Output write requests are issued in pieces of at most kWriteReqElems
+// elements — one max-length AXI burst each (max_write_burst_length=256
+// beats; the burst_maxi port is 16 bits wide, one element per beat) — and
+// at most kWriteInFlight requests are left without a write_response().
+// Both limits keep the number of unacknowledged bursts below the port's
+// num_write_outstanding=16.  A single write_request for a whole channel
+// run (up to chunk_oh_count*out_w elements — 4032 on MobileNet v2's first
+// 1x1 projection, 16 bursts) deadlocked the m_axi adapter on the board:
+// its response FIFO filled before the run's data was written and the
+// writer, still inside the run, never reached write_response().
+// Reproduced in the RTL test stand by TestConvSim case 28e.
+static constexpr unsigned kWriteReqElems = 256;
 static constexpr unsigned kWriteInFlight = 8;
 
 static void write_output_tile(
@@ -404,17 +414,23 @@ static void write_output_tile(
                 // and paused ~21 cycles between bursts.  write_request()
                 // issues the address up front, write() streams the data as
                 // it arrives from acc_stream, and the response is collected
-                // in a sliding window so up to kWriteInFlight runs' bursts
-                // are outstanding at once.
-                y.write_request(base, run_len);
-                for (unsigned i = 0; i < run_len; i++) {
-                    #pragma HLS PIPELINE II=1
-                    y.write(acc_stream.read());
-                }
-                pending++;
-                if (pending == kWriteInFlight) {
-                    y.write_response();
-                    pending--;
+                // in a sliding window so up to kWriteInFlight requests'
+                // bursts are outstanding at once.  Each request covers at
+                // most kWriteReqElems elements (one burst); a run longer
+                // than that is split into consecutive requests.
+                for (unsigned off = 0; off < run_len; off += kWriteReqElems) {
+                    const unsigned rem = run_len - off;
+                    const unsigned len = (rem < kWriteReqElems) ? rem : kWriteReqElems;
+                    y.write_request(base + off, len);
+                    for (unsigned i = 0; i < len; i++) {
+                        #pragma HLS PIPELINE II=1
+                        y.write(acc_stream.read());
+                    }
+                    pending++;
+                    if (pending == kWriteInFlight) {
+                        y.write_response();
+                        pending--;
+                    }
                 }
             }
         } // m_tile loop

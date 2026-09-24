@@ -1216,7 +1216,83 @@ G-way muxes), LUT 43.6 k → 44.8 k (38 %), BRAM 151, URAM 24 unchanged.
 
 ---
 
-## 3. Current architecture (post-§2.29)
+### 2.30. On-board hang: bounded write requests (correctness fix)
+
+**Problem.**  First on-board run of the §2.29 bitstream: all 126
+scheduler models passed, MobileNet v1 classified correctly at 736 ms
+(README: 2 463 ms), but MobileNet v2 hung in ConvKernel (ctrl idle=0,
+done=0 read over /dev/mem) on its first 1×1 projection, 32 → 16 ch on
+112×112.  That layer chunks into 36 rows, so each channel's Phase-3 run
+is 4 032 elements = 16 max-length AXI bursts, and §2.27's
+`write_request(base, run_len)` issued the WHOLE run as one request
+while collecting responses only every 8 requests.  The m_axi adapter's
+response FIFO (`num_write_outstanding=16`) filled before the run's data
+was written; the writer, still inside the run, blocked on `write()`
+and never reached `write_response()` — deadlock.  MobileNet v1's longest
+runs were 8 bursts, which is why it passed.  Reproduced in the RTL test
+stand with a scaled fixture (1×1 32 → 16 on 40×64, 2 560-element runs):
+the AXI VIP's forward-progress watchdog fired on a pending AW with no
+data, and no report was written.
+
+**Change.**  `write_output_tile` splits every run into requests of at
+most `kWriteReqElems = 256` elements (one burst at the 16-bit
+burst_maxi width) and keeps `kWriteInFlight = 8` unacknowledged
+requests, so unacknowledged bursts never exceed 8 < 16.  New named C-sim
+case 28e ("1x1 32->16 on 40x64: 2560-element output runs") is also an
+RTL fixture (40 cases now).
+
+**Result.**  The scaled fixture passes in RTL (1.62 ms simulated);
+full suite 40/40 RTL PASS with the 39 previous cases unchanged
+(≤ +0.6 %, the split requests cost nothing measurable).  ResNet-18 had
+hung on the same bitstream too — on its 7×7 stem (1 008-element runs =
+4 bursts × 8 pending = 32 > 16).  Synthesis: no II change, slack 0.00,
+LUT +390.  On-board re-run recorded in §2.31.
+
+**Lesson for the test net.**  The C-sim burst_maxi model checks
+request/response pairing but not the adapter's outstanding limits, and
+the 39 RTL fixtures all had runs ≤ 256 elements.  Any future change to
+the AXI request pattern needs a fixture whose run length exceeds
+`num_write_outstanding × max_write_burst_length`.
+
+---
+
+### 2.31. On-board verification (KV260, 128-bit design) + upload-tool fix
+
+Bitstream: `build_hw128` (`-DAXI_BUS_WIDTH=128`), all four kernels
+re-synthesised, Vivado synth + impl 30 min, WNS +1.78 ns, 0 failing
+endpoints.  Post-synthesis utilisation: LUT 41.5 %, FF 25 %, BRAM
+60.8 % (ConvKernel 56.5 of 87.5 tiles), URAM 37.5 % (all ConvKernel),
+DSP 40.3 % (ConvKernel 293 of 503).
+
+**Results (§2.30 kernel):**
+* `run_remote_tests.py`, all **126 scheduler models: 126/126 PASS**
+  against the numpy oracle (9 min end to end).
+* Image-classification demo, grey-fox image, top-1 / latency:
+  MobileNet v1 **grey_fox 69 %**, 737 ms (README before: 2 463 ms);
+  MobileNet v2 **grey_fox 56 %**, 539 ms (1 876 ms);
+  ResNet-18 **grey_fox 83 %**, 567 ms (2 459 ms — and it mispredicted
+  before; the README's BN-fusion explanation was wrong, §2.21 was the
+  cause).  3.3× / 3.5× / 4.3× end-to-end, the rest of each pipeline
+  (matmul, pool, vectorop, host) unchanged.
+
+**Board-setup bug found on the way (not a kernel bug).**  After a clean
+reboot the same bitstream failed every model and mispredicted all
+three demos.  The AFIFM width registers read 0 (32-bit) on every PS
+slave port under the 128-bit design: `dts/kv260/pl.dtbo`'s `afi0`
+node (`xlnx,afi-fpga`, all-zero `config-afi`) is applied by the kernel
+AFI driver and resets the widths, and `upload_bitstream.py` wrote the
+HWH-derived widths BEFORE applying the overlay.  It had worked on the
+long-running board only because the stale boot-time `pynq` overlay
+already owned the `afi0` node.  Fix: `src/bitstream/loader.py` now
+writes the widths as the last step (after the overlay is verified).
+Also: after killing a hung inference, reload the PL only after a
+reboot — reprogramming under in-flight AXI transactions wedged HPC0
+and the next kernel to use it (VectorOP) hung.  Local configs updated
+to the overlay's UIO name `fabric_vecop`.
+
+---
+
+## 3. Current architecture (post-§2.31)
 
 ```mermaid
 flowchart LR

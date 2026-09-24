@@ -1029,6 +1029,29 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 28e: long contiguous output runs.  1x1, 32 -> 16 ch on 40x64:
+    // out_w*out_ch_padded = 1024 so one chunk holds 40 rows and each
+    // channel's Phase-3 run is 40*64 = 2560 elements — more than 16
+    // max-length AXI write bursts per write_request.  Regression for the
+    // on-board hang of MobileNet v2's first 1x1 projection (32 -> 16 on
+    // 112x112: 4032-element runs), where the burst_maxi writer's
+    // sliding-window response collection deadlocked the m_axi adapter.
+    // Bit-exact in C-sim regardless; the RTL fixture is what catches it.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=32; p.in_h=40; p.in_w=64; p.out_ch=16;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("1x1 32->16 on 40x64: 2560-element output runs", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Test 29: wide-input ow-tiling.  in_w=128 > kMaxLineBufCols (64), so
     // the producers split the output column axis into multiple ow_tiles
     // (3 at default kw=3, stride=1: ow_per_tile = 64 - 3 + 1 = 62; 128/62

@@ -41,11 +41,19 @@ def upload_bitstream(
       5  Remove any existing configfs DTBO overlay
       6  Load bitstream via fpga_manager
       7  Verify fpga_manager state == "operating"
-      8  Write PS SLCR / AXIFM registers (set_axi_port_width)
-      9  Load xclbin into zocl DRM driver
-      10 Upload and apply DTBO via configfs
-      11 Verify overlay status == "applied"
+      8  Load xclbin into zocl DRM driver
+      9  Upload and apply DTBO via configfs
+      10 Verify overlay status == "applied"
+      11 Write PS SLCR / AXIFM registers (set_axi_port_width)
       12 List /dev/uio* devices
+
+    The AXI port widths are written AFTER the overlay is applied on
+    purpose: the overlay's `afi0` node (`xlnx,afi-fpga`, `config-afi`
+    table) is itself applied by the kernel's AFI driver and resets the
+    AFIFM width fields — on a freshly booted board the old order left
+    every PS slave port at 32 bits under a 128-bit design, and every
+    kernel then read/wrote garbage (all scheduler models failed, models
+    that had passed earlier mispredicted).
     """
     bin_name    = f"{overlay_name}.bin"
     remote_bin  = f"{_FIRMWARE_DIR}/{bin_name}"
@@ -91,20 +99,16 @@ def upload_bitstream(
             f"FPGA manager state is '{state}' (expected 'operating').\n"
             f"Check dmesg on the board for details.")
 
-    print(f"\n{_bold('Step 8')}   Setting PS AXI port widths ({len(axi_writes)} register writes)")
-    set_axi_port_widths(session, axi_writes)
-    print("          done")
-
-    print(f"\n{_bold('Step 9')}   Loading xclbin into zocl DRM driver")
+    print(f"\n{_bold('Step 8')}   Loading xclbin into zocl DRM driver")
     load_xclbin(session, xclbin_data)
     print("          done")
 
-    print(f"\n{_bold('Step 10')}  Uploading DTBO → {remote_dtbo}")
+    print(f"\n{_bold('Step 9')}   Uploading DTBO → {remote_dtbo}")
     upload_file(session, dtbo_path, remote_dtbo)
     print(f"          Applying overlay '{overlay_name}'")
     apply_dtbo(session, remote_dtbo, overlay_name)
 
-    print(f"\n{_bold('Step 11')}  Verifying overlay status")
+    print(f"\n{_bold('Step 10')}  Verifying overlay status")
     status = overlay_status(session, overlay_name)
     if status == "applied":
         print(f"          {_green('applied')}  ✓")
@@ -112,6 +116,12 @@ def upload_bitstream(
         raise RuntimeError(
             f"Overlay status is '{status}' (expected 'applied').\n"
             f"Check dmesg on the board for device tree errors.")
+
+    # After the overlay: its afi0 node resets the AFIFM width fields (see
+    # the docstring), so the HWH-derived widths must be written last.
+    print(f"\n{_bold('Step 11')}  Setting PS AXI port widths ({len(axi_writes)} register writes)")
+    set_axi_port_widths(session, axi_writes)
+    print("          done")
 
     print(f"\n{_bold('Step 12')}  UIO devices")
     devices = list_uio_devices(session)
