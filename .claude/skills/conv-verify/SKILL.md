@@ -25,16 +25,45 @@ If `BUILD_DIR` ends up empty, ask the user where the build tree is and stop. Oth
 
 Note `BUILD_DIR` in your scratch state for Gate 4's report-path argument.
 
-## Gate 1 — C-simulation
+## Gate 1 — C-simulation (three nets)
 
 ```bash
 cd "$BUILD_DIR"
-make TestConvRef
-./kernels/conv/TestConvRef
+make TestConvRef TestConvGrid
+ctest -R TestConv --output-on-failure
 ```
 
-- The build must finish with `[100%] Built target TestConvRef`.
-- The test run must end with `ALL TESTS PASSED`. **Any `FAILED: N element mismatch(es) …` line, or any per-test line ending in `FAIL`, is a regression** — scan the full output for either pattern before continuing, even if the final line looks OK.
+`ctest -R TestConv` runs all three C-sim nets: `TestConvRef` (the named
+cases, bit-exact vs the naive oracle), `TestConvGrid` (the MAC array in
+isolation — every (kh, kw, ic_valid, m_valid) tile against a scalar loop)
+and `TestConvSweep` (`TestConvRef --sweep 300`: random scheduler-admissible
+geometries; this is the net that catches interactions such as the §2.21
+stale-line-buffer bug).  All three must pass.  If the sweep fails, re-run
+it with `--seed <n>` for a second sample and add the failing geometry to
+TestConvSim.cpp as a named case before fixing anything.
+
+- Every named line must end in `PASS`; **any `FAIL` line or `FAILED: N
+  element mismatch(es)` is a regression**, even if the final line looks OK.
+- A `line_buf residency` or `stream token accounting` assert (C-sim only
+  invariants) is a regression too.
+
+## Gate 1b — fixtures (only when the bench or a DDR layout changed)
+
+The RTL run reads the CHECKED-IN fixtures under `hw/test_data/conv_test_data/`.
+They must be regenerated when a named case was added / changed, or when
+the packed weight / bias layout changed (ConvKernel.h "Weight / bias port
+width and DDR layout"):
+
+```bash
+make gen_conv_test_data
+rm -f ../hw/test_data/conv_test_data/test_*.hex ../hw/test_data/conv_test_data/manifest.txt
+cp conv_test_data/* ../hw/test_data/conv_test_data/
+```
+
+Keep new fixtures SMALL (xsim ≈ 20 µs simulated per wall-clock second;
+the 40-case set runs in ~12 min).  If the layout changed, the testbench's
+element-count formulas in `hw/cormorant_test_stand/.../conv_tb.sv` must
+match `conv_weight_numel` / `conv_bias_numel`.
 
 ## Gate 2 — HLS synthesis
 
@@ -53,11 +82,21 @@ make synthesize_conv_kv260
   (The conv build uses the Vitis unified component flow, so reports live
   under `<component>/hls/syn/report/`, not the legacy `solution1/syn/report/`.)
 
-  Report any of these against the prior run:
-  - **Top-level slack** drift beyond the baseline `-0.93 ns` on `ConvKernel`. Per-loop sub-blocks have their own slacks (e.g. `VITIS_LOOP_207_11_VITIS_LOOP_213_12` at `-0.93`, `VITIS_LOOP_232_13` at `-0.74`) — call out anything that worsened.
-  - **New** `II Violation Information` entries (II larger than 1 on previously II=1 loops).
-  - `m_axi_gmem0` / `gmem1` / `gmem2` / `gmem3` data-width column changes (`16 -> N`). Conv has four ports — `gmem0/1/2` are READ_ONLY (x, w, b) and `gmem3` is WRITE_ONLY (y) — so widening can show up on any of them independently.
-  - Resource jumps (BRAM / DSP / FF / LUT % columns on the top-level `ConvKernel` row) — flag anything >10 % of the previous value.
+  Report any of these against the prior run (baseline as of §2.34:
+  top-level slack **0.00 ns**, **no** II violations, ports
+  `gmem0 16 -> 16`, `gmem1 128 -> 128`, `gmem2 128 -> 128`, `gmem3 16 -> 16`,
+  BRAM 158 (54 %), DSP 248, FF ~34.9 k, LUT ~47.3 k (40 %), URAM 24):
+  - **Top-level slack** going negative, or any sub-block slack that worsened.
+  - **Any** `II Violation Information` entry — the design has none; the
+    grid loop (`ConvMacGrid.h`, iteration latency 6) and the fused consumer
+    loops are all II=1.
+  - `m_axi_gmem0..3` data-width column changes.  `gmem0/1/2` are READ_ONLY
+    (x, w, b), `gmem3` is WRITE_ONLY (y); x and y are 16-bit burst_maxi
+    ports, weight and bias 128-bit burst_maxi ports — a change here means
+    the port type or the layout contract moved.
+  - Resource jumps (BRAM / DSP / FF / LUT % columns on the top-level
+    `ConvKernel` row) — flag anything >10 % of the previous value.  BRAM is
+    the tight resource on the full 128-bit design (56 % placed).
 
   Don't fail the gate on these — the user wants to see them in the report — but list any change clearly.
 
@@ -90,6 +129,14 @@ The script reads the freshly-written `conv_test_report.json`, compares per-test 
 
 - First-ever run: there's no baseline yet, the script prints absolute values and saves a snapshot. Note this in your reply so the user knows the next run will produce a real diff.
 - Add `--no-save` if you want a one-off comparison without overwriting the baseline (e.g. to keep a known-good reference while testing a speculative change). Use this when the user explicitly says "don't update the baseline".
+
+## When a timing delta is unexplained
+
+Run the `conv-cycle-model` skill on the moved cases first (it predicts the
+RTL within ~10 %); if the model disagrees with the measurement, trace ONE
+scaled case with the `conv-rtl-trace` skill before touching the kernel —
+the write path, the read path and a chunk-boundary "stall" all looked
+like compute problems until traced.
 
 ## Reporting back to the user
 
