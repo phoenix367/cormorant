@@ -65,6 +65,8 @@ from typing import ClassVar, List, Optional, Tuple
 
 import onnx
 
+import numpy as np
+
 from .tensor import TensorInfo
 
 
@@ -875,7 +877,55 @@ from ._conv_hw_config import (  # noqa: E402
     CONV_MAX_LINE_BUF_COLS,
     CONV_MAX_ACC_PERSIST_ENTRIES,
     CONV_TILE_M,
+    CONV_TILE_IC,
+    CONV_WEIGHT_PORT_ELEMS,
 )
+
+
+# ---------------------------------------------------------------------------
+# ConvKernel packed DDR layouts (ConvKernel.h, "Weight / bias port width and
+# DDR layout", CONV_OPTIMISATION.md §2.32).  The kernel's 128-bit weight port
+# fills one 16-input-channel-lane cache word per beat pair, so the lanes of
+# a kernel position must be adjacent in DDR:
+#
+#   standard : weight[M][ceil(C/16)][kH][kW][16]   (lanes >= C of the last
+#              tile are zero)
+#   depthwise: weight[M][roundup(kH*kW, 8)]
+#   bias     : bias[roundup(M, 8)]
+#
+# The logical ONNX arrays stay on TensorInfo.data (the simulator uses them);
+# only the emitted ROM / .dat image and the DMA buffer size are packed.
+# ---------------------------------------------------------------------------
+def _pack_conv_weight(t: TensorInfo, out_ch: int, in_ch: int,
+                      kh: int, kw: int, is_depthwise: bool) -> None:
+    w = np.asarray(t.data)
+    lanes = CONV_WEIGHT_PORT_ELEMS
+    if is_depthwise:
+        stride = -(-(kh * kw) // lanes) * lanes
+        packed = np.zeros((out_ch, stride), dtype=w.dtype)
+        packed[:, :kh * kw] = w.reshape(out_ch, kh * kw)
+        t.packed_note = (f"ConvKernel depthwise [M][roundup(kH*kW,{lanes})]"
+                         f" = [{out_ch}][{stride}]")
+    else:
+        tile     = CONV_TILE_IC
+        ic_tiles = -(-in_ch // tile)
+        wide = np.zeros((out_ch, ic_tiles * tile, kh, kw), dtype=w.dtype)
+        wide[:, :in_ch] = w.reshape(out_ch, in_ch, kh, kw)
+        # [M][C_pad][kH][kW] -> [M][ict][ic_l][kH][kW] -> [M][ict][kH][kW][ic_l]
+        packed = wide.reshape(out_ch, ic_tiles, tile, kh, kw).transpose(0, 1, 3, 4, 2)
+        t.packed_note = (f"ConvKernel tile-major [M][ceil(C/{tile})][kH][kW][{tile}]"
+                         f" = [{out_ch}][{ic_tiles}][{kh}][{kw}][{tile}]")
+    t.packed_data = np.ascontiguousarray(packed).reshape(-1)
+
+
+def _pad_conv_bias(t: TensorInfo, out_ch: int) -> None:
+    lanes = CONV_WEIGHT_PORT_ELEMS
+    b = np.asarray(t.data).reshape(-1)
+    n = -(-out_ch // lanes) * lanes
+    packed = np.zeros(n, dtype=b.dtype)
+    packed[:out_ch] = b[:out_ch]
+    t.packed_data = packed
+    t.packed_note = f"ConvKernel bias [roundup(M,{lanes})] = [{n}]"
 
 
 @dataclass
@@ -1172,6 +1222,11 @@ class ConvNode:
                 f"'kernels.conv.max_acc_persist_entries' in the platform "
                 f"JSON (each 4096 entries spends one URAM block)."
             )
+
+        # §2.32: emit the weight / bias in the kernel's packed DDR layout.
+        _pack_conv_weight(w_info, m_val, c_in, kh_val, kw_val, is_dw)
+        if has_b:
+            _pad_conv_bias(b_info, m_val)
 
         return cls(
             onnx_node=node,

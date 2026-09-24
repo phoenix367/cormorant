@@ -378,20 +378,25 @@ becomes a JSON-knob decision rather than an architecture one.
 | write path (unplanned) | §2.27 `hls::burst_maxi` y: traced adapter buffering / deferred-tail / serialised-response behaviours (see log) | single-case traces + 39/39 RTL | drain and writer now 1.0 element/cycle | (with §2.28) -13.1 % |
 | read path (unplanned) | §2.28 `hls::burst_maxi` x, row-ahead `read_request`s | 39/39 RTL | AR spacing 690 → 30 ns; DW chunking case -22 % | |
 | 6b / 7 | §2.29 fused (tile, khi, kwi) loop, all G tiles' accumulators in registers, depthwise straight from the stream | 39/39 RTL, II=1 (lat 6) | 76 k → 63 k | -17.1 % |
+| board fix | §2.30 write requests bounded to one burst (MobileNet v2 / ResNet-18 hung on >8-burst runs) | 40/40 RTL, 126/126 on board, demo correct | — | — |
+| 7 (weights) | §2.32 128-bit weight/bias ports, tile-major `[M][ict][kH][kW][16]` layout packed by the scheduler, one w_cache word per cycle | 40/40 RTL, scheduler 1301/1301 | 63 k → 52.7 k | -3.1 % (fill-bound cases -12…-31 %) |
 
-Cumulative after §2.29: **-82.9 %** of the suite's simulated time (42.1 M
-→ 7.19 M ns); the 64-ch reference case is **6.9×** faster than at §2.21.  What the plan got wrong: §5.4's "1 beat/element at bus
+Cumulative after §2.32: **-79.7 %** of the suite's simulated time (42.1 M
+→ 8.56 M ns — the suite gained a 40th, 1.6 M-ns case in §2.30); the
+64-ch reference case is **8.2×** faster than at §2.21 (434 k → 52.7 k).  What the plan got wrong: §5.4's "1 beat/element at bus
 width 16" assumed burst inference would overlap draining and
 transmitting — it does not (§2.27); and the read side (§2.28) was not
 in the plan at all but was the depthwise layers' actual wall.  The
 cycle model (§2) stayed within 6 % of RTL at every step and was what
 located both.
 
-Still open from §7: `w_cache` ping-pong (fill is now ~10 % of the
-64-ch case and is paid per chunk), a min-chunks policy on top of §2.26
-so single-chunk layers overlap their write phase, 2-elements/cycle
-Phase-3 drain (URAM `RAM_T2P` + 32-bit `burst_maxi` writes with
-byte-enables for odd run starts), and the `kTileM` 8 → 16 scale-up.
+Still open from §7: `w_cache` ping-pong (worth ≤ 10–15 % on pixel-rich
+layers now that the fill itself is 8–16× shorter), a half-word weight
+mode for `ic_valid <= 8` (the 3-channel stem lost 16 % to lane padding),
+a min-chunks policy on top of §2.26 so single-chunk layers overlap their
+write phase, a 2-elements/cycle Phase-3 drain (URAM `RAM_T2P` + 32-bit
+`burst_maxi` writes with byte-enables for odd run starts), and the
+`kTileM` 8 → 16 scale-up.
 
 ## 8. Risks
 

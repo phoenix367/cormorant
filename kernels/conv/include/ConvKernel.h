@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Config.h"
+#include "ap_int.h"
 #include "hls_burst_maxi.h"
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,86 @@ inline T saturate_cast(From v) {
 }
 
 // ---------------------------------------------------------------------------
+// Weight / bias port width and DDR layout (§2.32).
+//
+// The weight and bias ports are hls::burst_maxi<WeightWord> with
+// WeightWord = ap_uint<kWeightPortBits> (128 bits = kWeightPortElems
+// Data_t lanes per beat, lane 0 in the lowest-addressed bytes).  The
+// consumer's weight cache stores one 256-bit word per (m-tile, m1, khi,
+// kwi) holding all kTileIC input-channel lanes, so the DDR layout keeps
+// those lanes ADJACENT:
+//
+//   standard (is_depthwise=0), tile-major:
+//     weight[out_ch][ic_tiles][kh][kw][kTileIC]
+//       elem((m, ict, khi, kwi, ic_l)) =
+//         ((m*ic_tiles + ict)*kh*kw + khi*kw + kwi)*kTileIC + ic_l
+//     ic_tiles = ceil(in_ch / kTileIC); lanes ic_l >= in_ch - ict*kTileIC of
+//     the last tile are zero (the kernel masks them anyway).  One
+//     (m, ict) slab is kh*kw*kTileIC contiguous elements = one burst.
+//   depthwise (is_depthwise=1):
+//     weight[out_ch][conv_dw_stride(kh, kw)]
+//       elem((m, khi, kwi)) = m*conv_dw_stride + khi*kw + kwi
+//     conv_dw_stride = kh*kw rounded up to kWeightPortElems so every
+//     channel starts on a port-word boundary.
+//   bias[conv_bias_numel(out_ch)] — out_ch rounded up to kWeightPortElems
+//     (the kernel reads whole words; the pad lanes are ignored).
+//
+// The inference scheduler emits exactly this layout
+// (inference-scheduler/src/nodes.py, ConvNode packing) and the C-sim /
+// RTL fixtures are packed by TestConvSim.cpp's pack_conv_weights().
+// The buffers handed to the kernel must be 16-byte aligned.
+// ---------------------------------------------------------------------------
+template<typename T> struct ConvDataBits;   // undefined for unsupported Data_t
+template<> struct ConvDataBits<float> { static constexpr unsigned value = 32; };
+#ifdef CONV_HAVE_APFIXED
+template<int W, int I, ap_q_mode Q, ap_o_mode O, int N>
+struct ConvDataBits<ap_fixed<W, I, Q, O, N>> { static constexpr unsigned value = W; };
+#endif
+
+static constexpr unsigned kDataBits        = ConvDataBits<Data_t>::value;
+static constexpr unsigned kWeightPortBits  = 128;
+static constexpr unsigned kWeightPortElems = kWeightPortBits / kDataBits;
+typedef ap_uint<kWeightPortBits> WeightWord;
+
+static_assert(kWeightPortBits % kDataBits == 0,
+              "weight port width must be a whole number of Data_t lanes");
+static_assert((kTileIC * kDataBits) % kWeightPortBits == 0,
+              "one kTileIC-lane weight word must be a whole number of port beats");
+static_assert(kWeightPortElems <= kTileM && kTileM % kWeightPortElems == 0,
+              "bias_buf banking assumes a port beat covers at most one m-tile");
+
+inline unsigned conv_round_up(unsigned v, unsigned q) { return ((v + q - 1) / q) * q; }
+inline unsigned conv_ic_tiles(unsigned in_ch)          { return (in_ch + kTileIC - 1) / kTileIC; }
+inline unsigned conv_dw_stride(unsigned kh, unsigned kw){ return conv_round_up(kh * kw, kWeightPortElems); }
+inline unsigned conv_bias_numel(unsigned out_ch)       { return conv_round_up(out_ch, kWeightPortElems); }
+inline unsigned conv_weight_numel(unsigned out_ch, unsigned in_ch,
+                                  unsigned kh, unsigned kw, bool is_depthwise) {
+    return is_depthwise ? out_ch * conv_dw_stride(kh, kw)
+                        : out_ch * conv_ic_tiles(in_ch) * kh * kw * kTileIC;
+}
+inline unsigned conv_weight_index(unsigned m, unsigned ict, unsigned khi, unsigned kwi,
+                                  unsigned ic_l, unsigned ic_tiles, unsigned kh, unsigned kw) {
+    return ((m * ic_tiles + ict) * kh * kw + khi * kw + kwi) * kTileIC + ic_l;
+}
+
+// Data_t <-> raw lane bits (the byte image the port carries).
+#ifdef CONV_HAVE_APFIXED
+inline Data_t conv_lane_to_data(ap_uint<kDataBits> bits) {
+    Data_t v; v.range(kDataBits - 1, 0) = bits; return v;
+}
+inline ap_uint<kDataBits> conv_data_to_lane(Data_t v) {
+    return v.range(kDataBits - 1, 0);
+}
+#else
+inline Data_t conv_lane_to_data(ap_uint<kDataBits> bits) {
+    union { unsigned u; float f; } c; c.u = bits.to_uint(); return c.f;
+}
+inline ap_uint<kDataBits> conv_data_to_lane(Data_t v) {
+    union { unsigned u; float f; } c; c.f = v; return ap_uint<kDataBits>(c.u);
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // C/RTL co-simulation transfer depths — single source of truth.
 //
 // cosim of an m_axi kernel needs a fixed transfer depth per pointer port.
@@ -49,9 +130,13 @@ inline T saturate_cast(From v) {
 // plain C-sim); bump a port's value here to pull a larger case into cosim.
 // ---------------------------------------------------------------------------
 #define CONV_COSIM_DEPTH_X       8192
-#define CONV_COSIM_DEPTH_WEIGHT  16384
-#define CONV_COSIM_DEPTH_BIAS    256
+#define CONV_COSIM_DEPTH_WEIGHT  16384   /* Data_t elements */
+#define CONV_COSIM_DEPTH_BIAS    256     /* Data_t elements */
 #define CONV_COSIM_DEPTH_Y       8192
+/* The weight / bias ports are WeightWord-wide, so their depth= hints (and
+ * the cosim buffers) are in words: elements / kWeightPortElems. */
+#define CONV_COSIM_DEPTH_WEIGHT_WORDS (CONV_COSIM_DEPTH_WEIGHT / 8)
+#define CONV_COSIM_DEPTH_BIAS_WORDS   (CONV_COSIM_DEPTH_BIAS / 8)
 
 // ---------------------------------------------------------------------------
 // ConvKernel — 2-D convolution following ONNX Conv semantics.
@@ -84,30 +169,28 @@ inline T saturate_cast(From v) {
 //
 // Memory layout (row-major, NCHW):
 //   x     [batch][in_ch][in_h ][in_w ]
-//   Standard (is_depthwise=0):
-//     weight[out_ch][in_ch][kh][kw]  → (m*in_ch + c)*kh*kw + khi*kw + kwi
-//   Depthwise (is_depthwise=1):
-//     weight[out_ch][1][kh][kw]      → m*kh*kw + khi*kw + kwi
-//   bias  [out_ch]
+//   weight, bias: tile-major packed layout — see "Weight / bias port width
+//                 and DDR layout" above (conv_weight_index / conv_dw_stride /
+//                 conv_bias_numel).
 //   y     [batch][out_ch][out_h][out_w]
 //
 // AXI interface (in ConvKernel.cpp):
-//   x, weight, bias → m_axi gmem0/1/2  (read ports; x is hls::burst_maxi)
+//   x, weight, bias → m_axi gmem0/1/2  (read ports; all hls::burst_maxi —
+//                     x Data_t-wide, weight/bias WeightWord-wide)
 //   y               → m_axi gmem3      (write port, hls::burst_maxi)
 //   all scalars     → s_axilite, bundle=ctrl
 // ---------------------------------------------------------------------------
-// x and y are hls::burst_maxi<> ports (§2.27/§2.28): the patch producer
-// issues explicit read_requests for a whole row's channel runs ahead of
-// reading them, and write_output_tile issues one write_request per
-// contiguous channel run and streams the data behind it, instead of
-// relying on burst inference.  A plain Data_t* converts implicitly
-// (hls_burst_maxi.h's pointer constructor), so C-sim and cosim harnesses
-// keep passing pointers.
+// All four DDR ports are hls::burst_maxi<> (§2.27/§2.28/§2.32): explicit
+// read_requests ahead of the data (x per row, weight per (m, ic-tile) slab,
+// bias once) and one write_request per contiguous output run, instead of
+// burst inference.  A plain pointer converts implicitly (hls_burst_maxi.h's
+// pointer constructor); the weight / bias pointers must point at
+// WeightWord-packed buffers (see the layout note above).
 void ConvKernel(
-    hls::burst_maxi<Data_t> x,
-    const Data_t* weight,
-    const Data_t* bias,
-    hls::burst_maxi<Data_t> y,
+    hls::burst_maxi<Data_t>     x,
+    hls::burst_maxi<WeightWord> weight,
+    hls::burst_maxi<WeightWord> bias,
+    hls::burst_maxi<Data_t>     y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,

@@ -42,16 +42,31 @@ class TensorInfo:
     dtype:     str             # 'float32', 'int8', …  (ONNX dtype string)
     data:      Optional[np.ndarray] = field(default=None, repr=False)
 
+    # Kernel-specific packed image of `data` (float, flat), when the hardware
+    # wants a layout other than the ONNX row-major one — e.g. ConvKernel's
+    # tile-major weights and word-padded bias (ConvNode.from_onnx sets it).
+    # `data`/`shape` stay logical for the simulator; `numel`, the ROM array,
+    # the .dat file and the DMA buffer size follow the packed image.
+    packed_data: Optional[np.ndarray] = field(default=None, repr=False)
+    packed_note: str = ""
+
     # ------------------------------------------------------------------ #
     # Derived properties                                                   #
     # ------------------------------------------------------------------ #
 
     @property
     def numel(self) -> int:
+        if self.packed_data is not None:
+            return max(int(self.packed_data.size), 1)
         n = 1
         for d in self.shape:
             n *= d
         return max(n, 1)
+
+    @property
+    def emit_data(self) -> Optional[np.ndarray]:
+        """The array actually written to the ROM / .dat (packed if present)."""
+        return self.packed_data if self.packed_data is not None else self.data
 
     @property
     def c_name(self) -> str:
@@ -85,7 +100,7 @@ class TensorInfo:
         if not self.is_weight:
             raise ValueError(f"Tensor '{self.onnx_name}' has no data")
 
-        literals = dtype.encode_weight(self.data)
+        literals = dtype.encode_weight(self.emit_data)
         n        = len(literals)
         c_type   = dtype.c_array_type
 
@@ -95,9 +110,10 @@ class TensorInfo:
             rows.append("    " + ", ".join(literals[i:i+8]))
         inner = ",\n".join(rows)
 
+        packed = f"  packed: {self.packed_note}\n" if self.packed_data is not None else ""
         return (
             f"/* ROM data for weight '{self.onnx_name}'"
-            f"  shape={self.shape}  dtype={self.dtype}\n"
+            f"  shape={self.shape}  dtype={self.dtype}\n{packed}"
             f" * Copied into a DMA-capable buffer at inference_init(). */\n"
             f"static const {c_type} _rom_{self.c_name}[{n}] = {{\n"
             f"{inner}\n"
@@ -128,6 +144,10 @@ class TensorInfo:
         """
         if not self.is_weight:
             raise ValueError(f"Tensor '{self.onnx_name}' has no data")
+        if self.packed_data is not None:
+            raise ValueError(
+                f"Tensor '{self.onnx_name}' has a kernel-packed layout and "
+                f"cannot also be emitted in strided broadcast layout")
 
         chunk_size = self.numel // outer_count
         gap        = aligned_chunk_size - chunk_size
@@ -186,7 +206,7 @@ class TensorInfo:
         """
         if not self.is_weight:
             raise ValueError(f"Tensor '{self.onnx_name}' has no data")
-        return dtype.dat_bytes(self.data)
+        return dtype.dat_bytes(self.emit_data)
 
     def emit_buffer_decl(self) -> str:
         """

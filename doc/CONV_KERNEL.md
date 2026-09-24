@@ -40,13 +40,13 @@
 
 ### Standard Convolution (`is_depthwise=0`)
 
-- Weight layout: `[out_ch][in_ch][kh][kw]`
+- Weight layout in DDR (§2.32, tile-major, packed by the scheduler): `[out_ch][ceil(in_ch/kTileIC)][kh][kw][kTileIC]` — the 16 input-channel lanes of one kernel position are adjacent so the 128-bit weight port fills one 256-bit cache word per two beats; lanes beyond `in_ch` in the last tile are zero.  Element index: `((m·ic_tiles + ict)·kh·kw + khi·kw + kwi)·kTileIC + ic_l` (`conv_weight_index()` in ConvKernel.h).
 - Each output channel is the inner product of the full input-channel stack against the corresponding filter
 - Supported: bias, padding, stride, dilation, multi-tile M and IC
 
 ### Depthwise Convolution (`is_depthwise=1`)
 
-- Weight layout: `[out_ch][1][kh][kw]`
+- Weight layout in DDR (§2.32): `[out_ch][conv_dw_stride(kh,kw)]` with `conv_dw_stride = kh·kw` rounded up to the port's 8 lanes, so every channel starts on a 128-bit word; position index `khi·kw + kwi`.
 - Each output channel convolves with exactly one input channel (group=in_ch)
 - No IC-tile loop; each tile lane operates on its own input channel slice
 - Supported: bias, padding, stride, dilation
@@ -572,9 +572,10 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Persistent acc constraint** | `out_w·out_ch ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
 | **Persistent acc storage** | `partial_outputs[]` bound to URAM (`bind_storage impl=URAM`) — off BRAM, into the idle URAM pool |
 | **Line-buffer column constraint** | `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(in_w no longer capped — wider inputs auto-tiled along ow)* |
-| **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag |
-| **Weight layout (standard)** | `[out_ch][in_ch][kh][kw]` |
-| **Weight layout (depthwise)** | `[out_ch][1][kh][kw]` |
+| **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag; padded to `roundup(out_ch, 8)` elements (whole 128-bit words) |
+| **Weight layout (standard)** | `[out_ch][ceil(in_ch/16)][kh][kw][16]` tile-major, 16-byte aligned (§2.32) |
+| **Weight layout (depthwise)** | `[out_ch][roundup(kh·kw, 8)]` (§2.32) |
+| **Weight / bias ports** | `hls::burst_maxi<ap_uint<128>>` — 8 lanes per beat; x / y ports are 16-bit `burst_maxi` |
 | **AXI-Lite base address** | `0xA002_0000` |
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` |

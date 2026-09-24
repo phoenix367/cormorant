@@ -85,6 +85,7 @@ _REQUIRED: Tuple[Tuple[str, str], ...] = (
     ("max_line_buf_cols",       "CONV_MAX_LINE_BUF_COLS"),
     ("max_acc_persist_entries", "CONV_MAX_ACC_PERSIST_ENTRIES"),
     ("tile_m",                  "CONV_TILE_M"),
+    ("tile_ic",                 "CONV_TILE_IC"),
 )
 
 
@@ -164,6 +165,14 @@ CONV_MAX_LINE_BUF_ROWS       : int = _CFG["CONV_MAX_LINE_BUF_ROWS"]
 CONV_MAX_LINE_BUF_COLS       : int = _CFG["CONV_MAX_LINE_BUF_COLS"]
 CONV_MAX_ACC_PERSIST_ENTRIES : int = _CFG["CONV_MAX_ACC_PERSIST_ENTRIES"]
 CONV_TILE_M                  : int = _CFG["CONV_TILE_M"]
+CONV_TILE_IC                 : int = _CFG["CONV_TILE_IC"]
+
+# ConvKernel's weight / bias ports are hls::burst_maxi<ap_uint<128>>:
+# kWeightPortBits / kDataBits = 128 / 16 Data_t lanes per beat
+# (ConvKernel.h, "Weight / bias port width and DDR layout").  The packed
+# weight layout pads each input-channel tile to CONV_TILE_IC lanes and each
+# depthwise channel / the bias to a multiple of this many elements.
+CONV_WEIGHT_PORT_ELEMS       : int = 128 // 16
 
 
 __all__ = (
@@ -173,6 +182,8 @@ __all__ = (
     "CONV_MAX_LINE_BUF_COLS",
     "CONV_MAX_ACC_PERSIST_ENTRIES",
     "CONV_TILE_M",
+    "CONV_TILE_IC",
+    "CONV_WEIGHT_PORT_ELEMS",
     "ConvHwConfigError",
     "resolve",
 )

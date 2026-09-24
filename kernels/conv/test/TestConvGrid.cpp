@@ -68,7 +68,7 @@ static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m
 static int test_depthwise(unsigned kh, unsigned kw)
 {
     Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-    Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
+    Data_t    w_buf[kTileM][kMaxKPos];     // flat over the window: pos = i*kw + j
     AccData_t acc[kTileM], ref[kTileM];
 
     for (unsigned c = 0; c < kTileIC; c++)
@@ -76,16 +76,15 @@ static int test_depthwise(unsigned kh, unsigned kw)
             for (unsigned j = 0; j < kMaxKW; j++)
                 patch[c][i][j] = rnd(2.0f);
     for (unsigned m = 0; m < kTileM; m++) {
-        for (unsigned i = 0; i < kMaxKH; i++)
-            for (unsigned j = 0; j < kMaxKW; j++)
-                w_buf[m][i][j] = rnd(1.0f);
+        for (unsigned q = 0; q < kMaxKPos; q++)
+            w_buf[m][q] = rnd(1.0f);
         acc[m] = AccData_t(rnd(8.0f));
         ref[m] = acc[m];
     }
     for (unsigned m = 0; m < kTileM; m++)
         for (unsigned i = 0; i < kh; i++)
             for (unsigned j = 0; j < kw; j++)
-                ref[m] += patch[m][i][j] * w_buf[m][i][j];
+                ref[m] += patch[m][i][j] * w_buf[m][i * kw + j];
 
     accumulate_depthwise(patch, w_buf, acc, kh, kw);
 

@@ -113,20 +113,24 @@ inline void accumulate_standard(
 
 // ---------------------------------------------------------------------------
 // mac_dw_step — ONE kernel position of the depthwise grid: kTileM
-// independent lanes, acc[m1] += p[m1] * w[m1][khi][kwi].  Per-lane RAW
+// independent lanes, acc[m1] += p[m1] * w[m1][pos], pos = khi*kw + kwi.
+// The depthwise weight buffer is FLAT over the kernel window (§2.32: it is
+// filled kWeightPortElems positions per beat straight from the packed DDR
+// layout), so the caller keeps a running pos counter.  Per-lane RAW
 // distance is 1 cycle; the ap_fixed<32,16> adder closes it at II=1.
 // ---------------------------------------------------------------------------
+static constexpr unsigned kMaxKPos = kMaxKH * kMaxKW;
+
 inline void mac_dw_step(
     const Data_t p[kTileIC],
-    const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
-    unsigned     khi,
-    unsigned     kwi,
+    const Data_t w_buf[kTileM][kMaxKPos],
+    unsigned     pos,
     AccData_t    acc[kTileM]
 ) {
     #pragma HLS INLINE
     for (unsigned m1 = 0; m1 < kTileM; m1++) {
         #pragma HLS UNROLL
-        acc[m1] += p[m1] * w_buf[m1][khi][kwi];
+        acc[m1] += p[m1] * w_buf[m1][pos];
     }
 }
 
@@ -136,7 +140,7 @@ inline void mac_dw_step(
 // ---------------------------------------------------------------------------
 inline void accumulate_depthwise(
     const Data_t patch[kTileIC][kMaxKH][kMaxKW],
-    const Data_t w_buf[kTileM][kMaxKH][kMaxKW],
+    const Data_t w_buf[kTileM][kMaxKPos],
     AccData_t    acc[kTileM],
     unsigned     kh,
     unsigned     kw
@@ -153,7 +157,7 @@ inline void accumulate_depthwise(
             #pragma HLS UNROLL
             p[m1] = patch[m1][khi_cnt][kwi_cnt];
         }
-        mac_dw_step(p, w_buf, khi_cnt, kwi_cnt, acc);
+        mac_dw_step(p, w_buf, ri, acc);
         if (++kwi_cnt == kw) {
             kwi_cnt = 0;
             ++khi_cnt;

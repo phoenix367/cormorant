@@ -214,6 +214,57 @@ struct ConvParams {
 };
 
 // ---------------------------------------------------------------------------
+// §2.32 packed DDR layouts (ConvKernel.h "Weight / bias port width and DDR
+// layout").  The naive oracles above use the logical ONNX layouts; the
+// kernel reads the packed ones, so every case is packed here before the
+// call (and before being dumped as an RTL fixture).
+// ---------------------------------------------------------------------------
+static std::vector<Data_t> pack_conv_weights(const ConvParams& p,
+                                             const std::vector<Data_t>& w)
+{
+    std::vector<Data_t> out(conv_weight_numel(p.out_ch, p.in_ch, p.kh, p.kw,
+                                              p.is_depthwise), Data_t(0));
+    if (p.is_depthwise) {
+        const unsigned stride = conv_dw_stride(p.kh, p.kw);
+        for (unsigned m = 0; m < p.out_ch; m++)
+            for (unsigned q = 0; q < p.kh * p.kw; q++)
+                out[m * stride + q] = w[m * p.kh * p.kw + q];
+    } else {
+        const unsigned ic_tiles = conv_ic_tiles(p.in_ch);
+        for (unsigned m = 0; m < p.out_ch; m++)
+            for (unsigned c = 0; c < p.in_ch; c++)
+                for (unsigned khi = 0; khi < p.kh; khi++)
+                    for (unsigned kwi = 0; kwi < p.kw; kwi++)
+                        out[conv_weight_index(m, c / kTileIC, khi, kwi, c % kTileIC,
+                                              ic_tiles, p.kh, p.kw)]
+                            = w[((m * p.in_ch + c) * p.kh + khi) * p.kw + kwi];
+    }
+    return out;
+}
+
+static std::vector<Data_t> pad_conv_bias(const std::vector<Data_t>& b, unsigned out_ch)
+{
+    std::vector<Data_t> out(conv_bias_numel(out_ch), Data_t(0));
+    for (unsigned m = 0; m < out_ch && m < b.size(); m++) out[m] = b[m];
+    return out;
+}
+
+// Pack Data_t elements into the WeightWord beats the 128-bit ports read
+// (lane 0 in the low bits, i.e. the lowest DDR address).
+static std::vector<WeightWord> to_weight_words(const std::vector<Data_t>& e)
+{
+    std::vector<WeightWord> out((e.size() + kWeightPortElems - 1) / kWeightPortElems);
+    for (auto& wd : out) wd = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        const unsigned lane = (unsigned)(i % kWeightPortElems);
+        out[i / kWeightPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane)
+            = conv_data_to_lane(e[i]);
+    }
+    return out;
+}
+
+
+// ---------------------------------------------------------------------------
 // cosim m_axi buffers (only the cosim build, -DCONV_COSIM).
 //
 // Every pointer handed to ConvKernel must be a fixed allocation >= the
@@ -224,10 +275,10 @@ struct ConvParams {
 // single source of truth that feeds the depth= hints on ConvKernel.cpp.
 // ---------------------------------------------------------------------------
 #ifdef CONV_COSIM
-static Data_t g_x[CONV_COSIM_DEPTH_X];
-static Data_t g_w[CONV_COSIM_DEPTH_WEIGHT];
-static Data_t g_b[CONV_COSIM_DEPTH_BIAS];
-static Data_t g_y[CONV_COSIM_DEPTH_Y];
+static Data_t     g_x[CONV_COSIM_DEPTH_X];
+static WeightWord g_w[CONV_COSIM_DEPTH_WEIGHT_WORDS];
+static WeightWord g_b[CONV_COSIM_DEPTH_BIAS_WORDS];
+static Data_t     g_y[CONV_COSIM_DEPTH_Y];
 #endif
 
 // ---------------------------------------------------------------------------
@@ -319,9 +370,13 @@ static void dump_test_data(const std::string&         dir,
     char idx_buf[16];
     std::snprintf(idx_buf, sizeof(idx_buf), "%02d", idx);
     const std::string prefix = dir + "/test_" + idx_buf + "_";
+    // w / b are dumped in the kernel's packed DDR layout (the HDL testbench
+    // sizes them with the same formulas — conv_weight_numel / conv_bias_numel).
+    const std::vector<Data_t> w_packed = pack_conv_weights(p, w);
+    const std::vector<Data_t> b_packed = pad_conv_bias(b, p.out_ch);
     write_hex_file(prefix + "x.hex", x);
-    write_hex_file(prefix + "w.hex", w);
-    write_hex_file(prefix + "b.hex", b);
+    write_hex_file(prefix + "w.hex", w_packed);
+    write_hex_file(prefix + "b.hex", b_packed);
     write_hex_file(prefix + "y.hex", y_ref);
 
     std::fprintf(g_manifest,
@@ -337,9 +392,9 @@ static void dump_test_data(const std::string&         dir,
                  p.is_depthwise ? 1u : 0u,
                  sanitize_label(label).c_str());
 
-    std::printf("[DUMP] test_%02d  %-50s  x=%zu w=%zu b=%zu y=%u\n",
+    std::printf("[DUMP] test_%02d  %-50s  x=%zu w=%zu(packed) b=%zu y=%u\n",
                 idx, label,
-                x.size(), w.size(), b.size(), y_size);
+                x.size(), w_packed.size(), b_packed.size(), y_size);
 #endif
 }
 
@@ -392,31 +447,35 @@ static int run_test(const char* name, const ConvParams& p,
     // per-test std::vector storage directly.  b_ptr is always a valid pointer
     // (the kernel guards bias reads by has_bias).
     // -----------------------------------------------------------------------
+    // Pack weights / bias into the kernel's DDR layout and port words.
+    const std::vector<WeightWord> w_words = to_weight_words(pack_conv_weights(p, w_data));
+    const std::vector<WeightWord> b_words = to_weight_words(pad_conv_bias(b_data, p.out_ch));
+
 #ifdef CONV_COSIM
     if (x_data.size() > CONV_COSIM_DEPTH_X ||
-        w_data.size() > CONV_COSIM_DEPTH_WEIGHT ||
-        b_data.size() > CONV_COSIM_DEPTH_BIAS ||
+        w_words.size() > CONV_COSIM_DEPTH_WEIGHT_WORDS ||
+        b_words.size() > CONV_COSIM_DEPTH_BIAS_WORDS ||
         y_size        > CONV_COSIM_DEPTH_Y) {
         printf("%-55s SKIP (exceeds cosim buffers)\n", name);
         return 0;
     }
     std::copy(x_data.begin(), x_data.end(), g_x);
-    std::copy(w_data.begin(), w_data.end(), g_w);
-    std::copy(b_data.begin(), b_data.end(), g_b);
-    const Data_t* x_ptr = g_x;
-    const Data_t* w_ptr = g_w;
-    const Data_t* b_ptr = g_b;
-    Data_t*       y_ptr = g_y;
+    std::copy(w_words.begin(), w_words.end(), g_w);
+    std::copy(b_words.begin(), b_words.end(), g_b);
+    const Data_t*     x_ptr = g_x;
+    WeightWord*       w_ptr = g_w;
+    WeightWord*       b_ptr = g_b;
+    Data_t*           y_ptr = g_y;
 #else
     std::vector<Data_t> y_got(y_size, Data_t(0));
-    const Data_t* x_ptr = x_data.data();
-    const Data_t* w_ptr = w_data.data();
-    const Data_t* b_ptr = b_data.data();
-    Data_t*       y_ptr = y_got.data();
+    const Data_t*     x_ptr = x_data.data();
+    WeightWord*       w_ptr = const_cast<WeightWord*>(w_words.data());
+    WeightWord*       b_ptr = const_cast<WeightWord*>(b_words.data());
+    Data_t*           y_ptr = y_got.data();
 #endif
 
-    // x / y are hls::burst_maxi<Data_t> ports; the pointer constructor
-    // takes a non-const Data_t* (the kernel only ever reads through x).
+    // All four ports are hls::burst_maxi<>; the pointer constructors take
+    // non-const pointers (the kernel only ever reads through x / w / b).
     ConvKernel(const_cast<Data_t*>(x_ptr), w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,

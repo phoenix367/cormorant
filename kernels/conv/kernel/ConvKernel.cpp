@@ -103,6 +103,21 @@ struct BiasVec {
     AccData_t lane[kTileM];
 };
 
+// ---------------------------------------------------------------------------
+// WeightVec — one kTileIC-lane weight word per stream beat (§2.32).
+//
+// The consumer's w_cache stores a 256-bit word per (m-tile, m1, khi, kwi)
+// (ARRAY_RESHAPE over ic_l), so the weight stream now carries exactly that
+// word: stream_load_weights assembles it from kTileIC / kWeightPortElems
+// consecutive port beats of the tile-major DDR layout (ConvKernel.h) and
+// the fill loop writes one w_cache word per cycle.  Depthwise packs
+// kTileIC consecutive kernel positions of one channel per beat instead.
+// ---------------------------------------------------------------------------
+struct WeightVec {
+    Data_t lane[kTileIC];
+};
+static constexpr unsigned kWordsPerWeightVec = kTileIC / kWeightPortElems;
+
 #ifdef DEBUG_LOAD_DATA_CACHING
 #include <cassert>
 #include <cstdlib>
@@ -458,7 +473,7 @@ static void write_output_tile(
 // transactions are issued and the producer pushes zero vectors directly.
 // ---------------------------------------------------------------------------
 static void bias_producer(
-    const Data_t*           bias,
+    hls::burst_maxi<WeightWord> bias,
     hls::stream<BiasVec>&   bias_stream,
     unsigned                out_ch,
     unsigned                reps,
@@ -471,9 +486,22 @@ static void bias_producer(
     #pragma HLS ARRAY_PARTITION variable=bias_buf cyclic factor=kTileM dim=1
 
     if (has_bias) {
-        for (unsigned m = 0; m < out_ch; m++) {
+        // §2.32: the bias buffer in DDR is conv_bias_numel(out_ch) elements
+        // (out_ch rounded up to a port word); read it as whole words,
+        // kWeightPortElems lanes per cycle.
+        const unsigned n_words = conv_bias_numel(out_ch) / kWeightPortElems;
+        bias.read_request(0, n_words);
+        for (unsigned w = 0; w < n_words; w++) {
             #pragma HLS PIPELINE II=1
-            bias_buf[m] = bias[m];
+            const WeightWord word = bias.read();
+            for (unsigned j = 0; j < kWeightPortElems; j++) {
+                #pragma HLS UNROLL
+                const unsigned idx = w * kWeightPortElems + j;
+                if (idx < kMaxOutCh) {
+                    bias_buf[idx] = conv_lane_to_data(
+                        word.range(kDataBits * (j + 1) - 1, kDataBits * j));
+                }
+            }
         }
     }
 
@@ -831,8 +859,8 @@ static void input_patch_producer(
 //   (kTileM·kh·kw values) so this overhead is negligible.
 // ---------------------------------------------------------------------------
 static void stream_load_weights(
-    const Data_t*           weight,
-    hls::stream<Data_t>&    weight_stream,
+    hls::burst_maxi<WeightWord> weight,
+    hls::stream<WeightVec>& weight_stream,
     unsigned ic_tiles,
     unsigned m_tiles,
     unsigned in_ch,
@@ -855,14 +883,20 @@ static void stream_load_weights(
     const unsigned num_m_groups = geom.num_m_groups;
     const unsigned num_ow_tiles = geom.num_ow_tiles;
 
+    // §2.32 packed layout (ConvKernel.h): one (m, ict) slab is
+    // kh*kw*kTileIC contiguous elements = slab_words port beats, and every
+    // kWordsPerWeightVec beats form one WeightVec (all kTileIC ic-lanes of
+    // one kernel position).  Depthwise: one channel is dw_words beats of
+    // kernel positions, emitted as dw_vecs WeightVecs (the last one padded).
+    const unsigned slab_words = kh * kw * kTileIC / kWeightPortElems;
+    const unsigned dw_words   = conv_dw_stride(kh, kw) / kWeightPortElems;
+    const unsigned dw_vecs    = (dw_words + kWordsPerWeightVec - 1) / kWordsPerWeightVec;
+
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
         if (!is_depthwise) {
             // ---- Standard: once per (ni, chunk, ict, ow_tile, mg) ----
             for (unsigned ict = 0; ict < ic_tiles; ict++) {
-                const unsigned ic_off   = ict * kTileIC;
-                const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
-
               for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
                 for (unsigned mg = 0; mg < num_m_groups; mg++) {
                     const unsigned mt_base = mg * mt_per_group;
@@ -871,8 +905,6 @@ static void stream_load_weights(
                             ? mt_per_group
                             : (m_tiles - mt_base);
 
-                    // Push mt_in_group_count tile-slices in
-                    // (mt_in_group, m1, ic_l, khi, kwi) order — kwi fastest.
                     for (unsigned mt_in_group = 0;
                          mt_in_group < mt_in_group_count; mt_in_group++) {
                         const unsigned mt     = mt_base + mt_in_group;
@@ -880,14 +912,39 @@ static void stream_load_weights(
                         const unsigned m_valid =
                             std::min(kTileM, out_ch - m_off);
 
+                        // Request every m1's slab of this tile up front
+                        // (m_valid <= kTileM <= num_read_outstanding), then
+                        // drain them in the same order.
                         for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                            const Data_t* w_ptr = weight
-                                + (m_off + m1) * in_ch * kh * kw
-                                + ic_off * kh * kw;
-                            const unsigned wt_len = ic_valid * kh * kw;
-                            for (unsigned r = 0; r < wt_len; r++) {
+                            #pragma HLS PIPELINE II=1
+                            const unsigned word_off =
+                                ((m_off + m1) * ic_tiles + ict) * slab_words;
+                            weight.read_request(word_off, slab_words);
+                        }
+                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                            WeightVec v;
+                            #pragma HLS aggregate variable=v compact=byte
+                            for (unsigned w = 0; w < slab_words; w++) {
                                 #pragma HLS PIPELINE II=1
-                                weight_stream.write(w_ptr[r]);
+                                const WeightWord word = weight.read();
+                                const unsigned part = w % kWordsPerWeightVec;
+                                for (unsigned j = 0; j < kWeightPortElems; j++) {
+                                    #pragma HLS UNROLL
+                                    // Lane (part*kWeightPortElems + j) of the
+                                    // vector comes from beat `part`; only that
+                                    // beat's lanes are updated each cycle.
+                                    for (unsigned q = 0; q < kWordsPerWeightVec; q++) {
+                                        #pragma HLS UNROLL
+                                        if (q == part) {
+                                            v.lane[q * kWeightPortElems + j] =
+                                                conv_lane_to_data(word.range(
+                                                    kDataBits * (j + 1) - 1, kDataBits * j));
+                                        }
+                                    }
+                                }
+                                if (part == kWordsPerWeightVec - 1) {
+                                    weight_stream.write(v);
+                                }
                             }
                         }
                     }
@@ -900,13 +957,32 @@ static void stream_load_weights(
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-                // Push m_valid * kh * kw values in (m1, khi, kwi) order.
                 for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                    const Data_t* w_ptr = weight + (m_off + m1) * kh * kw;
-                    const unsigned wt_len = kh * kw;
-                    for (unsigned r = 0; r < wt_len; r++) {
+                    #pragma HLS PIPELINE II=1
+                    weight.read_request((m_off + m1) * dw_words, dw_words);
+                }
+                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                    WeightVec v;
+                    #pragma HLS aggregate variable=v compact=byte
+                    for (unsigned w = 0; w < dw_vecs * kWordsPerWeightVec; w++) {
                         #pragma HLS PIPELINE II=1
-                        weight_stream.write(w_ptr[r]);
+                        const unsigned part = w % kWordsPerWeightVec;
+                        WeightWord word = 0;
+                        if (w < dw_words) word = weight.read();   // pad beats stay 0
+                        for (unsigned j = 0; j < kWeightPortElems; j++) {
+                            #pragma HLS UNROLL
+                            for (unsigned q = 0; q < kWordsPerWeightVec; q++) {
+                                #pragma HLS UNROLL
+                                if (q == part) {
+                                    v.lane[q * kWeightPortElems + j] =
+                                        conv_lane_to_data(word.range(
+                                            kDataBits * (j + 1) - 1, kDataBits * j));
+                                }
+                            }
+                        }
+                        if (part == kWordsPerWeightVec - 1) {
+                            weight_stream.write(v);
+                        }
                     }
                 }
             } // mt
@@ -958,7 +1034,7 @@ static void stream_load_weights(
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
     hls::stream<PatchVec>&  patch_stream,
-    hls::stream<Data_t>&    weight_stream,
+    hls::stream<WeightVec>& weight_stream,
     hls::stream<BiasVec>&   bias_stream,
     hls::stream<Data_t>&    acc_stream,
     unsigned                batch,
@@ -1072,6 +1148,10 @@ static void process_conv_kernel_tile(
                 #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=2
                 #pragma HLS ARRAY_RESHAPE   variable=w_cache complete dim=3
 
+                // §2.32: one WeightVec beat = one reshaped w_cache word (all
+                // kTileIC ic-lanes of one (m1, khi, kwi)), written per cycle —
+                // the fill is kTileIC× shorter than the former one-element
+                // stream.  Lanes >= ic_valid arrive zero-padded from DDR.
                 for (unsigned mt_in_group = 0;
                      mt_in_group < mt_in_group_count; mt_in_group++) {
                     const unsigned mt     = mt_base + mt_in_group;
@@ -1080,12 +1160,13 @@ static void process_conv_kernel_tile(
                         std::min(kTileM, out_ch - m_off);
 
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        for (unsigned ic_l = 0; ic_l < ic_valid; ic_l++) {
-                            for (unsigned khi = 0; khi < kh; khi++) {
-                                for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                    #pragma HLS PIPELINE II=1
-                                    w_cache[mt_in_group][m1][ic_l][khi][kwi]
-                                        = weight_stream.read();
+                        for (unsigned khi = 0; khi < kh; khi++) {
+                            for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                #pragma HLS PIPELINE II=1
+                                const WeightVec v = weight_stream.read();
+                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                                    #pragma HLS UNROLL
+                                    w_cache[mt_in_group][m1][ic_l][khi][kwi] = v.lane[ic_l];
                                 }
                             }
                         }
@@ -1187,16 +1268,24 @@ static void process_conv_kernel_tile(
                 // ow_tiles and the (oh, ow_in_tile) sweep).  ow-tiling here
                 // doesn't add weight DDR replay — weight slice is small and
                 // shared across the full ow sweep.
-                Data_t w_buf[kTileM][kMaxKH][kMaxKW];
-                // PM-wide read: accumulate_depthwise unrolls
-                // m1 = 0..kTileM-1 every cycle, so the channel dim of
-                // w_buf must give kTileM parallel banks.
+                // Flat over the kernel window (pos = khi*kw + kwi, §2.32).
+                // dim 1 complete → kTileM lanes read per cycle by the grid;
+                // dim 2 cyclic kTileIC → the kTileIC positions of one
+                // WeightVec beat land in distinct banks and are written in
+                // one cycle.
+                Data_t w_buf[kTileM][kMaxKPos];
                 #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=1
+                #pragma HLS ARRAY_PARTITION variable=w_buf cyclic factor=kTileIC dim=2
+                const unsigned dw_words = conv_dw_stride(kh, kw) / kWeightPortElems;
+                const unsigned dw_vecs  = (dw_words + kWordsPerWeightVec - 1) / kWordsPerWeightVec;
                 for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                    for (unsigned khi = 0; khi < kh; khi++) {
-                        for (unsigned kwi = 0; kwi < kw; kwi++) {
-                            #pragma HLS PIPELINE II=1
-                            w_buf[m1][khi][kwi] = weight_stream.read();
+                    for (unsigned beat = 0; beat < dw_vecs; beat++) {
+                        #pragma HLS PIPELINE II=1
+                        const WeightVec v = weight_stream.read();
+                        for (unsigned j = 0; j < kTileIC; j++) {
+                            #pragma HLS UNROLL
+                            const unsigned pos = beat * kTileIC + j;
+                            if (pos < kMaxKPos) w_buf[m1][pos] = v.lane[j];
                         }
                     }
                 }
@@ -1223,15 +1312,10 @@ static void process_conv_kernel_tile(
                         }
 
                         const unsigned n_steps_dw = kh * kw;
-                        unsigned khi = 0, kwi = 0;
                         for (unsigned ri = 0; ri < n_steps_dw; ri++) {
                             #pragma HLS PIPELINE II=1
                             const PatchVec v = patch_stream.read();
-                            mac_dw_step(v.lane, w_buf, khi, kwi, acc);
-                            if (++kwi == kw) {
-                                kwi = 0;
-                                ++khi;
-                            }
+                            mac_dw_step(v.lane, w_buf, ri, acc);   // ri == khi*kw + kwi
                         }
 
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
@@ -1272,10 +1356,10 @@ static void process_conv_kernel_tile(
 }
 
 void ConvKernel(
-    hls::burst_maxi<Data_t> x,
-    const Data_t* weight,
-    const Data_t* bias,
-    hls::burst_maxi<Data_t> y,
+    hls::burst_maxi<Data_t>     x,
+    hls::burst_maxi<WeightWord> weight,
+    hls::burst_maxi<WeightWord> bias,
+    hls::burst_maxi<Data_t>     y,
     unsigned      batch,
     unsigned      in_ch,
     unsigned      in_h,
@@ -1332,8 +1416,13 @@ void ConvKernel(
     // port driven by explicit write_request/write/write_response (see
     // write_output_tile).
     #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X      max_read_burst_length=256  num_read_outstanding=16
-    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT max_read_burst_length=256  num_read_outstanding=16
-    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS   max_read_burst_length=256  num_read_outstanding=16
+    // weight / bias are 128-bit ports (§2.32).  Their adapter buffers scale
+    // with burst_length × outstanding × 16 B, so they are sized to what the
+    // producers actually issue: a weight slab request is <= 2*kMaxKH*kMaxKW
+    // = 98 beats with at most kTileM = 8 in flight; the bias is one request
+    // of <= kMaxOutCh/8 = 160 beats.
+    #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT_WORDS max_read_burst_length=128 num_read_outstanding=8
+    #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS_WORDS   max_read_burst_length=256 num_read_outstanding=2
     #pragma HLS INTERFACE m_axi port=y       offset=slave bundle=gmem3 depth=CONV_COSIM_DEPTH_Y      max_write_burst_length=256 num_write_outstanding=16
 
     #pragma HLS INTERFACE s_axilite port=x            bundle=ctrl
@@ -1453,8 +1542,10 @@ void ConvKernel(
     // kTileIC * kMaxKH * kMaxKW = 6272 at defaults) so the producer can
     // pre-fetch the next iteration's weight slice while the consumer is
     // still in accumulate — full producer/consumer overlap.
-    hls_thread_local hls::stream<Data_t> weight_stream;
-    #pragma HLS STREAM variable=weight_stream depth=kTileM*kTileIC*kMaxKH*kMaxKW
+    // §2.32: WeightVec beats (kTileIC lanes each); depth = one full m-tile's
+    // worth of vectors — the same bytes the former element stream held.
+    hls_thread_local hls::stream<WeightVec> weight_stream;
+    #pragma HLS STREAM variable=weight_stream depth=kTileM*kMaxKH*kMaxKW
 
     bias_producer(bias, bias_stream,
                   out_ch, bias_rep_count, has_bias);

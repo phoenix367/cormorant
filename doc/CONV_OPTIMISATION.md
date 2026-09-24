@@ -1292,7 +1292,74 @@ to the overlay's UIO name `fabric_vecop`.
 
 ---
 
-## 3. Current architecture (post-§2.31)
+### 2.32. Weight / bias path widening — 128-bit ports, tile-major layout
+
+**Problem.**  After §2.29 the cycle model (CONV_2D_GRID_PLAN.md §2)
+put the weight FILL — `weight_stream` → `w_cache`, one Data_t per cycle,
+serial with compute — at 18 % (MobileNet v1), 11 % (v2) and 33 %
+(ResNet-18) of conv time, and at 65 % of ResNet-18's stage-4 layers.
+The fill was bound by a 16-bit port delivering one element per cycle
+(~300 MB/s); w_cache already stores one 256-bit word (all kTileIC
+ic-lanes of a kernel position) per entry, but those lanes sit kh·kw
+apart in the ONNX `[M][C][kH][kW]` layout, so no wider read could feed
+a word.
+
+**Change.**  Weight and bias become `hls::burst_maxi<ap_uint<128>>`
+ports (8 lanes per beat; `x`/`y` stay 16-bit).  The DDR layout is now
+kernel-defined (ConvKernel.h "Weight / bias port width and DDR
+layout"): standard `[M][ceil(C/16)][kH][kW][16]` tile-major with zero
+lanes past C, depthwise `[M][roundup(kH·kW, 8)]`, bias
+`[roundup(M, 8)]`.  `stream_load_weights` requests one contiguous
+(m, ic-tile) slab per m1 (up to 8 in flight) and assembles a
+16-lane `WeightVec` from every two beats; the consumer fill writes one
+reshaped w_cache word per cycle (16× fewer fill iterations).  Depthwise
+`w_buf` is flat over the window (`mac_dw_step(pos)`), filled 16
+positions per beat; the bias buffer is filled 8 lanes per beat.  The
+scheduler packs the layouts at ConvNode construction
+(`nodes.py::_pack_conv_weight/_pad_conv_bias` → `TensorInfo.packed_data`;
+logical `data`/`shape` untouched for the simulator; `numel`, ROM, .dat
+and DMA sizes follow the packed image; `CONV_TILE_IC` and
+`CONV_WEIGHT_PORT_ELEMS` exported).  `TestConvSim.cpp` packs every case
+(`pack_conv_weights`, `pad_conv_bias`, `to_weight_words`) and dumps the
+packed fixtures; `conv_tb.sv` sizes w/b with the same formulas.  Port
+adapter buffers trimmed (weight 128×8, bias 256×2) after a first
+synthesis at 256×16 cost 51 BRAM.
+
+**Result.** **-277 630 ns (-3.1 %)** over the 40-case suite, 40/40 RTL
+PASS, bit-exact (grid / named / 2×300 sweep); scheduler 1301/1301.
+Fill-bound cases: `1x1 IC*2 M*2` **-31.1 %**, `batch_3 ResNet-style`
+-18.9 %, `M-grouping 64ch` **-16.3 %** (63 k → 52.7 k cycles; 434 k at
+§2.21 → **8.2×**), `batch=2 dil=2` -14.2 %, `in_h=17` -13.8 %,
+`14x14 multi-tile` -11.8 %.  Compute- or write-bound cases ±3 %.
+`7x7 s2 stem` **+16.3 %**: with in_ch = 3 the single ic-tile is padded
+to 16 lanes, so the stem moves 5.3× the weight bytes it used to; for
+the real networks that is one layer.  A half-word mode for
+`ic_valid <= 8` (one beat per position) would recover it — noted, not
+done.  Synthesis: gmem1/gmem2 `128 -> 128`, no II violations, slack
+0.00; BRAM 151 → 158, DSP 259 → 245, FF 33.1 k → 34.7 k, LUT 44.8 k →
+46.4 k (39 %).  On-board run in §2.33.
+
+---
+
+### 2.33. On-board verification of §2.32 (KV260)
+
+Bitstream rebuilt (30 min, WNS +1.81 ns; placed BRAM 81 tiles = 56 %,
+down from 87.5 with the trimmed adapters, DSP 491, LUT 40 %), loaded
+with the §2.31 loader (HPC0 width fields read 2/2 afterwards).
+Demo projects regenerated so the .dat / ROM weights carry the packed
+layout.
+
+* `run_remote_tests.py`: **126/126 PASS** (9.5 min).
+* Demo, grey-fox image, top-1 unchanged and bit-identical logits to
+  §2.31; latency: MobileNet v1 737 → **495 ms** (-33 %), MobileNet v2
+  539 → **434 ms** (-19 %), ResNet-18 567 → **411 ms** (-28 %).
+  Against the README before this work (2 463 / 1 876 / 2 459 ms) that is
+  **5.0× / 4.3× / 6.0×** end to end, with matmul, pool, vectorop and the
+  host code untouched.
+
+---
+
+## 3. Current architecture (post-§2.33)
 
 ```mermaid
 flowchart LR

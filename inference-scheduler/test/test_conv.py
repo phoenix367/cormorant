@@ -784,11 +784,30 @@ class TestConvTwoLayerVGG(unittest.TestCase):
         names = [t.onnx_name for t in large]
         self.assertIn("W2", names)
 
-    def test_w1_is_embedded(self):
-        # W1[64,3,3,3] = 1 728 elements < threshold → not in large list
-        large = self.gen.large_weight_tensors
-        names = [t.onnx_name for t in large]
-        self.assertNotIn("W1", names)
+    def test_w1_packed_layout_size(self):
+        # W1[64,3,3,3] is 1 728 logical elements, but ConvKernel's packed
+        # tile-major layout pads the 3 input channels to one 16-lane tile:
+        # 64 * 1 * 3 * 3 * 16 = 9 216 elements (> LARGE_WEIGHT_THRESHOLD, so
+        # it is now externalised to weights/W1.dat).  The logical shape is
+        # untouched (the simulator keeps using it).
+        from src._conv_hw_config import CONV_TILE_IC
+        w1 = next(t for t in self.graph.weight_tensors if t.onnx_name == "W1")
+        self.assertEqual(w1.shape, [64, 3, 3, 3])
+        self.assertEqual(w1.numel, 64 * 1 * 3 * 3 * CONV_TILE_IC)
+        self.assertIsNotNone(w1.packed_data)
+        names = [t.onnx_name for t in self.gen.large_weight_tensors]
+        self.assertIn("W1", names)
+
+    def test_w1_packed_lane_order(self):
+        # packed[(m, ict, khi, kwi, ic_l)] == logical[m, ict*16 + ic_l, khi, kwi],
+        # zero for padded lanes.
+        from src._conv_hw_config import CONV_TILE_IC
+        w1 = next(t for t in self.graph.weight_tensors if t.onnx_name == "W1")
+        logical = w1.data.reshape(64, 3, 3, 3)
+        packed  = w1.packed_data.reshape(64, 1, 3, 3, CONV_TILE_IC)
+        for c in range(3):
+            self.assertTrue((packed[:, 0, :, :, c] == logical[:, c]).all())
+        self.assertTrue((packed[:, 0, :, :, 3:] == 0).all())
 
     # ---- Generated source -----------------------------------------------
 
