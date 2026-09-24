@@ -22,9 +22,9 @@ clock across `kTileM` parallel MAC lanes.
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major |
-| `gmem1` | `b` | Read | Matrix B `[k][m]`, row-major |
-| `gmem2` | `c` | Write | Matrix C `[n][m]`, row-major |
+| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (MATMUL_OPTIMISATION §3) |
+| `gmem1` | `b` | Read | Matrix B `[k][m]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat |
+| `gmem2` | `c` | Write | Matrix C `[n][m]`, row-major — 16-bit element port |
 
 Keeping A, B, and C on separate AXI buses lets HLS issue their reads and
 writes concurrently.
@@ -44,7 +44,9 @@ writes concurrently.
 | `return` | — | `ap_ctrl_hs` (start / done / idle / ready) |
 
 Memory layout is row-major: `A[row·k + col]`, `B[row·m + col]`,
-`C[row·m + col]`.
+`C[row·m + col]`.  `a` and `b` must be 16-byte aligned base addresses;
+the kernel derives every row's covering 128-bit word range itself, so
+batch strides and tile offsets are ordinary element offsets.
 
 ---
 

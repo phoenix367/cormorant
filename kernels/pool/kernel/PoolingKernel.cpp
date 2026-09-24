@@ -424,7 +424,7 @@ static inline PoolGeometry compute_pool_geometry(
 // are deterministic.
 // ---------------------------------------------------------------------------
 static void row_loader(
-    const Data_t*        x,
+    hls::burst_maxi<PoolWord> x,
     hls::stream<Data_t>& row_data_pipe,
     unsigned             batch,
     unsigned             channels,
@@ -484,28 +484,56 @@ static void row_loader(
                     int load_end = ih_window_max;
                     if (load_end >= (int)in_h) load_end = (int)in_h - 1;
 
+                    // Each (ih, c_l) is one contiguous element run
+                    // [run_off, run_off + run_len).  All c_valid runs of
+                    // the row are requested first (c_valid <= kTileC <=
+                    // num_read_outstanding) so their DDR latency overlaps,
+                    // then each run's words are drained and their in-range
+                    // lanes pushed one per cycle — the rate window_emitter
+                    // consumes them at.
+                    const unsigned run_len = (unsigned)(iw_load_hi - iw_load_lo + 1);
                     for (int ih = load_start; ih <= load_end; ih++) {
                         for (unsigned c_l = 0; c_l < c_valid; c_l++) {
-                            const unsigned c     = c_off + c_l;
-                            const unsigned x_row = (ni * channels + c) * in_hw
-                                                 + (unsigned)ih * in_w;
-                            for (int iw = iw_load_lo; iw <= iw_load_hi; iw++) {
+                            #pragma HLS PIPELINE II=1
+                            const unsigned run_off =
+                                (ni * channels + c_off + c_l) * in_hw
+                              + (unsigned)ih * in_w + (unsigned)iw_load_lo;
+                            x.read_request(run_off / kPoolPortElems,
+                                           pool_words_for(run_off, run_len));
+                        }
+                        for (unsigned c_l = 0; c_l < c_valid; c_l++) {
+                            const unsigned run_off =
+                                (ni * channels + c_off + c_l) * in_hw
+                              + (unsigned)ih * in_w + (unsigned)iw_load_lo;
+                            const unsigned shift   = run_off % kPoolPortElems;
+                            const unsigned n_words = pool_words_for(run_off, run_len);
+                            // Element (relative to the run) carried by lane 0
+                            // of the current word; advances by kPoolPortElems
+                            // per word.
+                            int e0 = -(int)shift;
+                            PoolWord word = 0;
+                            const unsigned n_lanes = n_words * kPoolPortElems;
+                            for (unsigned q = 0; q < n_lanes; q++) {
                                 #pragma HLS PIPELINE II=1
-                                const std::size_t addr =
-                                    (std::size_t)x_row + (unsigned)iw;
-                                row_data_pipe.write(x[addr]);
-
+                                const unsigned l = q % kPoolPortElems;
+                                if (l == 0) word = x.read();
+                                const int e = e0 + (int)l;
+                                if (e >= 0 && e < (int)run_len) {
+                                    row_data_pipe.write(pool_lane_to_data(word.range(
+                                        kPoolDataBits * (l + 1) - 1, kPoolDataBits * l)));
 #ifdef DEBUG_LOAD_DATA_CACHING
-                                PoolReadCounters c_rc;
-                                c_rc.ni  = ni;
-                                c_rc.ct  = ct;
-                                c_rc.c_l = c_l;
-                                c_rc.oh  = oh;
-                                c_rc.ow  = owt;
-                                c_rc.khi = (unsigned)ih;
-                                c_rc.kwi = (unsigned)iw;
-                                read_addresses[addr].push_back(c_rc);
+                                    PoolReadCounters c_rc;
+                                    c_rc.ni  = ni;
+                                    c_rc.ct  = ct;
+                                    c_rc.c_l = c_l;
+                                    c_rc.oh  = oh;
+                                    c_rc.ow  = owt;
+                                    c_rc.khi = (unsigned)ih;
+                                    c_rc.kwi = (unsigned)(iw_load_lo + e);
+                                    read_addresses[(std::size_t)run_off + (unsigned)e].push_back(c_rc);
 #endif /* DEBUG_LOAD_DATA_CACHING */
+                                }
+                                if (l == kPoolPortElems - 1) e0 += (int)kPoolPortElems;
                             }
                         }
                     }
@@ -1030,7 +1058,7 @@ static void write_output_tile(
 }
 
 void PoolingKernel(
-    const Data_t* x,
+    hls::burst_maxi<PoolWord> x,
     Data_t*       y,
     unsigned      batch,
     unsigned      channels,
@@ -1065,7 +1093,10 @@ void PoolingKernel(
     // m_axi kernel aborts without depth ("a depth specification is required for
     // interface port 'x'").
     // -----------------------------------------------------------------------
-    #pragma HLS INTERFACE m_axi port=x  offset=slave bundle=gmem0 depth=POOL_COSIM_DEPTH_X
+    // x: 128-bit hls::burst_maxi port (PoolingKernel.h); one request per
+    // (row, channel) run of <= kMaxLineBufCols elements (<= 9 words), up to
+    // kTileC of them in flight.
+    #pragma HLS INTERFACE m_axi port=x  offset=slave bundle=gmem0 depth=POOL_COSIM_DEPTH_X_WORDS max_read_burst_length=16 num_read_outstanding=16
     #pragma HLS INTERFACE m_axi port=y  offset=slave bundle=gmem1 depth=POOL_COSIM_DEPTH_Y
     #pragma HLS INTERFACE s_axilite port=x                 bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=y                 bundle=ctrl

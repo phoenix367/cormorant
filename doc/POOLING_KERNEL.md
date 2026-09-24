@@ -26,7 +26,7 @@ full optimisation log with measured timings lives in
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `x` | Read | Input feature map (NCHW) |
+| `gmem0` | `x` | Read | Input feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMIZATION §2.13); base must be 16-byte aligned |
 | `gmem1` | `y` | Write | Output feature map (NCHW) |
 
 **AXI-Lite control registers (`s_axilite bundle=ctrl`) — 19 scalars + return:**

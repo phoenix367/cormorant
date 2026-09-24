@@ -256,9 +256,24 @@ struct TC {
 // depth= hints on PoolingKernel.cpp.
 // ---------------------------------------------------------------------------
 #ifdef POOL_COSIM
-static Data_t g_pool_x[POOL_COSIM_DEPTH_X];
-static Data_t g_pool_y[POOL_COSIM_DEPTH_Y];
+static PoolWord g_pool_x[POOL_COSIM_DEPTH_X_WORDS];
+static Data_t   g_pool_y[POOL_COSIM_DEPTH_Y];
 #endif
+
+// x is a 128-bit word port: pack the element vector into PoolWord words
+// (NCHW layout unchanged; one spare word so the kernel's last partial-word
+// read of a row segment stays inside the buffer).
+static std::vector<PoolWord> to_pool_words(const std::vector<Data_t>& e)
+{
+    std::vector<PoolWord> out(e.size() / kPoolPortElems + 1);
+    for (auto& wd : out) wd = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        const unsigned lane = (unsigned)(i % kPoolPortElems);
+        out[i / kPoolPortElems].range(kPoolDataBits * (lane + 1) - 1, kPoolDataBits * lane)
+            = pool_data_to_lane(e[i]);
+    }
+    return out;
+}
 
 // ---------------------------------------------------------------------------
 // compute_ow_tile_ref — mirror of compute_ow_tile() inside PoolingKernel.cpp.
@@ -445,14 +460,18 @@ static bool run_test(const TC& tc)
         printf("  [SKIP] %-45s  (exceeds cosim buffers)\n", tc.name);
         return true;
     }
-    std::copy(x.begin(), x.end(), g_pool_x);
+    {
+        const std::vector<PoolWord> xw = to_pool_words(x);
+        std::copy(xw.begin(), xw.end(), g_pool_x);
+    }
     std::fill(g_pool_y, g_pool_y + out_size, Data_t(0));
-    const Data_t* x_ptr = g_pool_x;
-    Data_t*       y_ptr = g_pool_y;
+    PoolWord* x_ptr = g_pool_x;
+    Data_t*   y_ptr = g_pool_y;
 #else
     std::vector<Data_t> y(out_size, Data_t(0));
-    const Data_t* x_ptr = x.data();
-    Data_t*       y_ptr = y.data();
+    std::vector<PoolWord> xw = to_pool_words(x);
+    PoolWord* x_ptr = xw.data();
+    Data_t*   y_ptr = y.data();
 #endif
 
     PoolingKernel(
@@ -586,14 +605,18 @@ static bool run_avg_pool_strict_test()
                       "strict-test input exceeds cosim buffer");
         static_assert(N*C*out_h*out_w <= POOL_COSIM_DEPTH_Y,
                       "strict-test output exceeds cosim buffer");
-        std::copy(x.begin(), x.end(), g_pool_x);
+        {
+            const std::vector<PoolWord> xw = to_pool_words(x);
+            std::copy(xw.begin(), xw.end(), g_pool_x);
+        }
         std::fill(g_pool_y, g_pool_y + (N*C*out_h*out_w), Data_t(0));
-        const Data_t* x_ptr = g_pool_x;
-        Data_t*       y_ptr = g_pool_y;
+        PoolWord* x_ptr = g_pool_x;
+        Data_t*   y_ptr = g_pool_y;
 #else
         std::vector<Data_t> y(N*C*out_h*out_w, Data_t(0));
-        const Data_t* x_ptr = x.data();
-        Data_t*       y_ptr = y.data();
+        std::vector<PoolWord> xw = to_pool_words(x);
+        PoolWord* x_ptr = xw.data();
+        Data_t*   y_ptr = y.data();
 #endif
 
         PoolingKernel(

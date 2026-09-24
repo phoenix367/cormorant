@@ -1,6 +1,8 @@
 #pragma once
 
 #include "Config.h"
+#include "ap_int.h"
+#include "hls_burst_maxi.h"
 
 // ---------------------------------------------------------------------------
 // saturate_cast<T>(v)
@@ -47,7 +49,51 @@ inline T saturate_cast(From v) {
 // whose tensors exceed these bounds under cosim (large pools are left to
 // plain C-sim); bump a port's value here to pull a larger case into cosim.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// x port width — 128-bit words (POOL_OPTIMIZATION.md §2.13).
+//
+// x is read through an hls::burst_maxi<PoolWord> port carrying
+// kPoolPortElems elements per beat.  The NCHW layout is unchanged: the
+// row_loader requests, per input row segment, the aligned word range that
+// covers it and drops the lanes outside the segment.  The x BASE address
+// must be 16-byte aligned (the scheduler aligns every buffer); the last
+// word of a segment may extend up to kPoolPortElems - 1 elements past the
+// tensor end (bytes must be mappable — the scheduler pads buffers).
+// ---------------------------------------------------------------------------
+template<typename T> struct PoolDataBits { static constexpr unsigned value = 8 * sizeof(T); };
+#ifdef POOL_HAVE_APFIXED
+template<int W, int I, ap_q_mode Q, ap_o_mode O, int N>
+struct PoolDataBits<ap_fixed<W, I, Q, O, N>> { static constexpr unsigned value = W; };
+#endif
+static constexpr unsigned kPoolDataBits  = PoolDataBits<Data_t>::value;
+static constexpr unsigned kPoolPortBits  = 128;
+static constexpr unsigned kPoolPortElems = kPoolPortBits / kPoolDataBits;
+static_assert(kPoolPortBits % kPoolDataBits == 0, "Data_t must divide the 128-bit port");
+typedef ap_uint<kPoolPortBits> PoolWord;
+
+#ifdef POOL_HAVE_APFIXED
+inline Data_t pool_lane_to_data(ap_uint<kPoolDataBits> bits) {
+    Data_t v; v.range(kPoolDataBits - 1, 0) = bits; return v;
+}
+inline ap_uint<kPoolDataBits> pool_data_to_lane(Data_t v) {
+    return v.range(kPoolDataBits - 1, 0);
+}
+#else
+inline Data_t pool_lane_to_data(ap_uint<kPoolDataBits> bits) {
+    union { unsigned u; float f; } c; c.u = bits.to_uint(); return c.f;
+}
+inline ap_uint<kPoolDataBits> pool_data_to_lane(Data_t v) {
+    union { unsigned u; float f; } c; c.f = v; return ap_uint<kPoolDataBits>(c.u);
+}
+#endif
+
+// Number of words that cover `count` elements starting at element `off`.
+inline unsigned pool_words_for(unsigned off, unsigned count) {
+    return (off + count - 1) / kPoolPortElems - off / kPoolPortElems + 1;
+}
+
 #define POOL_COSIM_DEPTH_X  8192
+#define POOL_COSIM_DEPTH_X_WORDS  (POOL_COSIM_DEPTH_X / kPoolPortElems + 1)
 #define POOL_COSIM_DEPTH_Y  8192
 
 // ---------------------------------------------------------------------------
@@ -78,7 +124,7 @@ inline T saturate_cast(From v) {
 //   all scalars → s_axilite, bundle=ctrl
 // ---------------------------------------------------------------------------
 void PoolingKernel(
-    const Data_t* x,
+    hls::burst_maxi<PoolWord> x,
     Data_t*       y,
     unsigned      batch,
     unsigned      channels,

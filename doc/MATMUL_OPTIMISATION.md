@@ -113,7 +113,54 @@ nest described in [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 
 ---
 
-## 3. Where a real speedup would come from
+## 3. 128-bit A / B ports — implemented (§3 was the plan; 2026-09-24)
+
+**Change.**  `a` and `b` are now `hls::burst_maxi<MatmulWord>` ports
+(`ap_uint<128>`, 8 `ap_fixed<16,8>` lanes per beat; `MatmulKernel.h`).
+The DDR layout is unchanged — plain row-major, so activations as well as
+constants work as B and every batch stride / tile offset is an element
+offset handled in-kernel: for each matrix row segment the kernel computes
+the aligned word range that covers it (`matmul_words_for`), requests it,
+and scatters each word's lanes into bank-explicit buffers:
+
+- A rows: one request per row (≤ 256-word pieces); `a_buf` is
+  `[kTileN][kMaxK / 8][8]` with dims 1 and 3 partitioned complete so the 8
+  lanes of a word land in 8 banks per cycle.  Lane `l` of word `w` is
+  element `(w_lo + w)·8 + l − row_off`; lanes outside `[0, k)` are dropped.
+- B tile rows: `m_valid ≤ 16` elements are ≤ 3 words; requests for
+  `kBReqAhead = 16` rows (`num_read_outstanding`) are issued before their
+  words are drained so consecutive rows' DDR latency overlaps.  Each word's
+  lanes go to `b_tile[k1][m1]` with the bank `m1 = w·8 + l − shift`
+  explicit in the unrolled loop.
+- C stays a 16-bit element port (n × m is small; its writes were never on
+  the critical path).
+
+The only requirement on callers is a 16-byte-aligned base address for
+`a` and `b` (the scheduler aligns every buffer to `INFERENCE_ALIGN_BYTES`);
+a row's last word may over-read up to 7 elements past the matrix end.
+
+**Why not widen in Vivado or with `-m_axi_min_bitwidth`.**  See
+CONV_OPTIMISATION.md §2.36: both leave the exported IP inconsistent (4-bit
+WSTRB, or single-beat partial-strobe writes the PS drops).  Ports that
+must be wide are declared wide in the C++.
+
+**Result.**  RTL (test stand now with a 128-bit `S_AXI_HPC0_FPD` and
+crossbar, like the board): **−71.9 %** over the 20-test suite
+(7,711,175 → 2,164,935 ns), every tiled case −67…−80 %
+(`TileN × TileK × TileM` 197,580 → 43,330 ns; `multi-tile all dims`
+2,449,610 → 662,680 ns).  Only the K=1 outer product got slower
+(+12 %, one word per 1-element row).  Synthesis: II=1 on every loop,
+BRAM 28 → 64 (the 32 `a_buf` banks and the two adapter FIFOs), DSP
+unchanged, slack 0.00.  20/20 RTL, 20/20 C-sim.
+
+**On board** (bitstream WNS +1.43 ns, block-design instance widths at the
+new IP defaults): 126/126 scheduler models PASS; the MNIST convnet's
+256×10 Gemm dropped from 116 µs to below 60 µs (it left the profiler's
+top five) and the model from 1.06 → **0.91 ms**; no image demo has a MatMul layer.
+
+---
+
+## 3a. Where the next speedup would come from
 
 The DATAFLOW experiment confirmed the bottleneck is **DDR bandwidth**, not
 MAC throughput. The synthesis `M_AXI Burst Information` shows the cause:
@@ -124,9 +171,10 @@ MAC throughput. The synthesis `M_AXI Burst Information` shows the cause:
   keep rows on a wider alignment boundary, so it refuses to pack.
 - One burst is issued **per matrix row**; each pays full DDR latency.
 
-A genuine optimization would attack that directly — e.g. transfer DDR in
-wide aligned words (`ap_uint<64>`, 4 elements/beat) and coalesce row bursts —
-which is orthogonal to DATAFLOW. That work is not yet scheduled.
+The 128-bit A / B ports (§3) attacked exactly that.  What remains is
+latency per B tile row (≤ 3 words per request, 16 in flight) — a
+scheduler-packed tile-major B layout for constant weights would turn a
+(m_tile, k_tile) block into one 512-word burst — and the 16-bit C port.
 
 ---
 

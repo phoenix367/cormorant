@@ -718,7 +718,39 @@ change does not touch.
 
 ---
 
-## 3. Current architecture (post-2.12)
+### 2.13. 128-bit x port — word reads with lane extraction
+
+**Change.**  `x` is an `hls::burst_maxi<PoolWord>` port (`ap_uint<128>`,
+8 lanes per beat; `PoolingKernel.h`).  The NCHW layout is unchanged.
+`row_loader` requests, per input row, all `c_valid ≤ kTileC` channel
+runs of the row first (`num_read_outstanding = 16`) so their DDR latency
+overlaps, then drains each run's words and pushes the in-range lanes onto
+`row_data_pipe` one per cycle — the rate `window_emitter`'s Phase 1
+consumes them at, so the pipe and everything downstream are untouched.
+A run's first / last word may carry lanes outside the run (row-segment
+alignment); they are dropped.  The base address must be 16-byte aligned
+(the scheduler aligns every buffer).
+
+`y` stays a 16-bit element port: the writer's `(p, c1)` emit order is
+channel-strided, and §6.2 already showed that reordering it costs more
+than the packed beats save.
+
+**Result.**  RTL (test stand now with a 128-bit `S_AXI_HPC0_FPD` and
+crossbar, like the board): **−21.0 %** over the 31-test suite
+(1,472,005 → 1,162,425 ns); the Phase-1-bound multi-channel-tile and
+global-pool cases gain most.  31/31 RTL, 33/33 C-sim.  Synthesis: II=1 in
+`row_loader`, BRAM 38 → 44 (the adapter FIFO), LUT/FF within 1 %.
+
+**On board** (bitstream WNS +1.43 ns): 126/126 scheduler models PASS.
+MNIST LeNet pools 545 / 409 → **388 / 275 µs** (−29 / −33 %), the model
+8.28 → 7.99 ms; convnet pools 145 / 88 → 106 / 60 µs, the model
+1.06 → **0.91 ms** (with the MatMul widening).  MobileNet v2
+435 → **404 ms**, ResNet-18 386 → **374 ms**, MobileNet v1 unchanged
+(489 ms; it has no pooling on the critical path).
+
+---
+
+## 3. Current architecture (post-2.13)
 
 ```mermaid
 flowchart LR

@@ -157,6 +157,10 @@ target_include_directories(matmul_kernel_float
         ${CMAKE_CURRENT_BINARY_DIR}/float_config  # float Config.h
         ${CMAKE_CURRENT_SOURCE_DIR}/include       # MatmulKernel.h
 )
+if(_MM_HAVE_HLS)
+    # MatmulKernel.h needs ap_int.h / hls_burst_maxi.h for the 128-bit ports.
+    target_include_directories(matmul_kernel_float SYSTEM PUBLIC ${HLS_INCLUDE_DIR})
+endif()
 target_compile_options(matmul_kernel_float PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
 # ---------------------------------------------------------------------------

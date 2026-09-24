@@ -243,10 +243,25 @@ static bool compare_outputs(
 // Returns true if the kernel ran (caller then compares C_got); false if the
 // case was skipped (the caller should report it as a pass).
 // ---------------------------------------------------------------------------
+// A / B are 128-bit word ports: pack the element vectors into MatmulWord
+// arrays (row-major layout unchanged; one spare word so the kernel's last
+// partial-word read of a row stays inside the buffer).
+static std::vector<MatmulWord> to_words(const std::vector<Data_t>& e)
+{
+    std::vector<MatmulWord> out(e.size() / kMatmulPortElems + 1);
+    for (auto& wd : out) wd = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        const unsigned lane = (unsigned)(i % kMatmulPortElems);
+        out[i / kMatmulPortElems].range(kMatmulDataBits * (lane + 1) - 1, kMatmulDataBits * lane)
+            = matmul_data_to_lane(e[i]);
+    }
+    return out;
+}
+
 #ifdef MATMUL_COSIM
-static Data_t g_a[MATMUL_COSIM_DEPTH_A];
-static Data_t g_b[MATMUL_COSIM_DEPTH_B];
-static Data_t g_c[MATMUL_COSIM_DEPTH_C];
+static MatmulWord g_a[MATMUL_COSIM_DEPTH_A_WORDS];
+static MatmulWord g_b[MATMUL_COSIM_DEPTH_B_WORDS];
+static Data_t     g_c[MATMUL_COSIM_DEPTH_C];
 #endif
 
 static bool invoke_matmul(const char* label,
@@ -265,12 +280,16 @@ static bool invoke_matmul(const char* label,
         printf("  SKIP  %s  (exceeds cosim buffers)\n", label);
         return false;
     }
-    std::copy(A.begin(), A.end(), g_a);
-    std::copy(B.begin(), B.end(), g_b);
+    {
+        const std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
+        std::copy(aw.begin(), aw.end(), g_a);
+        std::copy(bw.begin(), bw.end(), g_b);
+    }
     MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride);
     std::copy(g_c, g_c + C_got.size(), C_got.begin());
 #else
-    MatmulKernel(A.data(), B.data(), C_got.data(),
+    std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
+    MatmulKernel(aw.data(), bw.data(), C_got.data(),
                  n, k, m, batch, a_stride, b_stride, c_stride);
 #endif
     return true;
