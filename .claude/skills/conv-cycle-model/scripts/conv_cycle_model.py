@@ -64,8 +64,15 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                     for g in range(groups):
                         mt0 = g * mtg; G = min(mtg, m_tiles - mt0)
                         mv_sum = sum(min(P["TILE_M"], out_ch - (mt0 + i) * P["TILE_M"]) for i in range(G))
-                        fill += mv_sum * kh * kw * lanes / E        # beats at 1/cycle
-                        sweep += rows * tw * (G * kh * kw + 2 * G + 6)
+                        f = mv_sum * kh * kw * lanes / E            # beats at 1/cycle
+                        s_ = rows * tw * (G * kh * kw + 2 * G + 6)
+                        # §2.35 ping-pong: the NEXT slab's fill overlaps this sweep
+                        # (one vector per sweep iteration, producer-bound at 2
+                        # cycles per 16-lane vector); only the part the sweep
+                        # cannot absorb is exposed.  The very first slab is not.
+                        exposed = f if (c == 0 and ict == 0 and t == 0 and g == 0) else max(0.0, f - s_ / 2)
+                        fill += exposed
+                        sweep += s_
     total = sweep + fill + ph1 + ph3 + loads + INVOKE_OVERHEAD
     return dict(total=total, sweep=sweep, fill=fill, ph1=ph1, ph3=ph3, loads=loads,
                 chunks=chunks, rows=per, groups=groups, ic_tiles=ic_tiles, owt=owt)

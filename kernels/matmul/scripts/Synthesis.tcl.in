@@ -28,6 +28,14 @@ create_clock -period @MM_TARGET_CLOCK_TCL@MHz -name default
 config_interface -m_axi_addr64
 # Set m_axi bus width (controlled by CMake AXI_BUS_WIDTH).
 config_interface -m_axi_max_widen_bitwidth @AXI_BUS_WIDTH@
+# Do NOT add `config_interface -m_axi_min_bitwidth`: for the 16-bit element
+# ports it makes the adapter emit one single-beat, partial-strobe write per
+# element (8 AW transactions per 16 bytes) and the KV260 PS dropped every
+# beat whose strobe lane was not lane 0 (2026-09-24).  Ports that must be
+# wide are declared wide in the C++ (ap_uint<128> WeightWord).  The block
+# design's C_M_AXI_*_DATA_WIDTH instance parameters must equal the exported
+# IP defaults — widening them in IP integrator leaves the wrapper's
+# C_M_AXI_*_WSTRB_WIDTH literal at 4 bits.
 config_rtl -reset_level low
 
 csynth_design

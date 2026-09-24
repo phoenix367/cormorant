@@ -14,6 +14,7 @@ from .board import (
     load_bitstream,
     fpga_state,
     set_axi_port_widths,
+    unbind_stale_uio,
     load_xclbin,
     apply_dtbo,
     overlay_status,
@@ -50,8 +51,9 @@ def upload_bitstream(
     The AXI port widths are written AFTER the overlay is applied on
     purpose: the overlay's `afi0` node (`xlnx,afi-fpga`, `config-afi`
     table) is itself applied by the kernel's AFI driver and resets the
-    AFIFM width fields — on a freshly booted board the old order left
-    every PS slave port at 32 bits under a 128-bit design, and every
+    AFIFM width fields to 0 (= 128-bit in the AFIFM encoding: 0 = 128,
+    1 = 64, 2 = 32) — on a freshly booted board the old order left every
+    PS slave port at a width that did not match the design, and every
     kernel then read/wrote garbage (all scheduler models failed, models
     that had passed earlier mispredicted).
     """
@@ -105,6 +107,14 @@ def upload_bitstream(
 
     print(f"\n{_bold('Step 9')}   Uploading DTBO → {remote_dtbo}")
     upload_file(session, dtbo_path, remote_dtbo)
+    # A `pynq` overlay may have been applied during the xclbin load (PYNQ
+    # images); its fabric@A0000000 UIO device outlives the overlay and holds
+    # the IRQ our fabric_vecop node needs.  Drop that overlay and unbind any
+    # foreign UIO device at one of our kernel addresses before applying ours.
+    remove_overlay(session, "pynq")
+    stale = unbind_stale_uio(session, dtbo_uio_nodes(dtbo_path))
+    if stale:
+        print(f"          Unbound stale UIO device(s): {', '.join(stale)}")
     print(f"          Applying overlay '{overlay_name}'")
     apply_dtbo(session, remote_dtbo, overlay_name)
 
@@ -132,3 +142,25 @@ def upload_bitstream(
         print(f"          {_yellow('none found')}  (check dmesg for DT errors)")
 
     print(f"\n{_green(_bold('Done.'))}  Bitstream loaded and overlay applied.\n")
+
+
+def dtbo_uio_nodes(dtbo_path) -> list[str]:
+    """Return 'name@addr' of every generic-uio node in the compiled overlay."""
+    import re, subprocess
+    try:
+        dts = subprocess.run(["dtc", "-I", "dtb", "-O", "dts", "-q", str(dtbo_path)],
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    nodes, stack = [], []
+    for line in dts.splitlines():
+        t = line.strip()
+        m = re.match(r"(?:\w+:\s*)?([\w-]+@[0-9a-fA-F]+|[\w-]+)\s*\{$", t)
+        if m:
+            stack.append(m.group(1))
+        elif t.startswith("};"):
+            if stack:
+                stack.pop()
+        elif t.startswith("compatible") and "generic-uio" in t and stack and "@" in stack[-1]:
+            nodes.append(stack[-1])
+    return nodes

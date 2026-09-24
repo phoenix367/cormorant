@@ -123,7 +123,7 @@ flowchart TB
 
     subgraph BRAML["BRAM layer — 288 BRAM18K · 32% used"]
         LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile</i>"]
-        WC["w_cache<br/>4·8·16·7·7 · ~50 KB · kTileIC banks<br/><i>one ict/ow_tile/M-group weight slab,<br/>reused across the spatial sweep</i>"]
+        WC["w_cache<br/>kTileM columns · 2·4·64 WeightVec words · 64 BRAM18<br/><i>two banks: the current ict/ow_tile/M-group slab,<br/>reused across the sweep, and the next one prefetched (§2.35)</i>"]
         WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
         BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
     end
@@ -180,14 +180,20 @@ Data_t    patch[kTileIC][kMaxKH][kMaxKW];
 // Depthwise: patch[m1][khi][kwi]  for current (oh, ow, m_tile);
 // the [kTileIC] depth covers kTileM lanes (kTileM ≤ kTileIC).
 
-// STANDARD-path weight cache (holds one (ict, M-group) slab):
-Data_t    w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW];
-#pragma HLS ARRAY_PARTITION variable=w_cache complete dim=3
-// dim=3 (ic_l, PN axis) partitioned complete → kTileIC parallel banks.
-// Holds mt_per_group_actual mt-tiles' weights, loaded once per
-// (chunk, ict, ow_tile, mg) and reused across the (oh, ow_in_tile) sweep.
-// accumulate_standard reads w_cache[mt_in_group][m1][0..kTileIC-1][khi][kwi]
-// — one read per bank per cycle.
+// STANDARD-path weight cache: two (ict, M-group) slabs (ping-pong, §2.35).
+WeightVec w_cache[kTileM][kWCacheWords];      // WeightVec = kTileIC lanes (256 bit)
+#pragma HLS ARRAY_PARTITION variable=w_cache complete dim=1
+#pragma HLS AGGREGATE       variable=w_cache compact=bit
+#pragma HLS BIND_STORAGE    variable=w_cache type=RAM_2P impl=BRAM
+// One RAM column per m1; the word address is w_cache_addr(bank, tile,
+// khi, kwi) = (bank·kMaxMperGroup + tile)·64 + khi·8 + kwi (ConvMacGrid.h,
+// power-of-two strides so it is a bit concatenation).  The fused sweep
+// reads all kTileM columns of bank wbank at one address per cycle
+// (mac_grid_step) while the prefetch writes the NEXT slab into bank
+// !wbank — one read + one write port per RAM_2P column.  The store
+// selects its column with an explicit unrolled `if (c == m1)`: a runtime
+// index into the partitioned dimension makes HLS emit two stores per
+// RAM (II=2) or split the bank dimension into a second RAM set.
 
 // DEPTHWISE-path weight buffer (different shape — no in_ch dimension):
 Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
@@ -267,11 +273,13 @@ for ni in [0, batch)
         ow_start = ow_tile · ow_per_tile
         ow_end   = min(out_w, ow_start + ow_per_tile)
         for mg in [0, num_m_groups)                     // §5.5 M-grouping
-          // Load mt_per_group_actual mt-tiles' weights into w_cache ONCE
-          // per (ict, ow_tile, mg) — no per-(oh, ow) replay.
-          for mt_in_group in [0, mt_per_group_actual)
-            // Drain m_valid × ic_valid × kh × kw weights from weight_stream
-            // into w_cache[mt_in_group][m1][ic_l][khi][kwi]         (II=1)
+          // The slab's weights are in w_cache bank wbank: the very first
+          // slab is loaded blocking here (one WeightVec per cycle); every
+          // later slab was prefetched into the other bank during the
+          // previous slab's sweep (§2.35).  The sweep below also reads one
+          // WeightVec of the NEXT slab per iteration (non-blocking) into
+          // bank !wbank; a short blocking tail loop after the sweep takes
+          // whatever it did not absorb, then the banks swap.
 
           for oh_local in [0, chunk_oh)
             for ow in [ow_start, ow_end)

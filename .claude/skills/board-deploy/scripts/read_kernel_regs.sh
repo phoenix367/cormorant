@@ -7,7 +7,7 @@ fd = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
 def rd(addr):
     base = addr & ~0xFFF; m = mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=base)
     v = struct.unpack("<I", m[addr-base:addr-base+4])[0]; m.close(); return v
-print("PS slave port width fields (0=32b 1=64b 2=128b):")
+print("PS slave port AFIFM width fields (0=128b 1=64b 2=32b — PYNQ/TRM encoding):")
 for a, n in [(0xFD360000,"HPC0 rd"),(0xFD360014,"HPC0 wr"),(0xFD370000,"HPC1 rd"),(0xFD370014,"HPC1 wr"),(0xFD380000,"HP0 rd"),(0xFD380014,"HP0 wr")]:
     print("  %-8s %d" % (n, rd(a) & 3))
 print("kernel control (bit0 start, bit1 done, bit2 idle):")

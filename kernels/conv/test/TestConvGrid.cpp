@@ -27,7 +27,7 @@ static Data_t rnd(float scale)
 static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m_valid)
 {
     Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-    Data_t    w_buf[kTileM][kTileIC][kMaxKH][kMaxKW];
+    WeightVec w_buf[kTileM][kWCacheWords];        // one 16-lane word per (m, khi, kwi)
     AccData_t acc[kTileM], ref[kTileM];
 
     for (unsigned c = 0; c < kTileIC; c++)
@@ -37,7 +37,7 @@ static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m
                 // kernel; here give them garbage so the ic_valid guard is tested.
                 patch[c][i][j] = (c < ic_valid) ? rnd(2.0f) : rnd(50.0f);
                 for (unsigned m = 0; m < kTileM; m++)
-                    w_buf[m][c][i][j] = rnd(1.0f);
+                    w_buf[m][w_cache_addr(0, 0, i, j)].lane[c] = rnd(1.0f);
             }
     for (unsigned m = 0; m < kTileM; m++) {
         acc[m] = AccData_t(rnd(8.0f));
@@ -50,7 +50,7 @@ static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m
         for (unsigned c = 0; c < ic_valid; c++)
             for (unsigned i = 0; i < kh; i++)
                 for (unsigned j = 0; j < kw; j++)
-                    ref[m] += patch[c][i][j] * w_buf[m][c][i][j];
+                    ref[m] += patch[c][i][j] * w_buf[m][w_cache_addr(0, 0, i, j)].lane[c];
 
     accumulate_standard(patch, w_buf, acc, ic_valid, m_valid, kh, kw);
 

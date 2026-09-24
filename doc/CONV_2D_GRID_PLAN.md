@@ -381,6 +381,7 @@ becomes a JSON-knob decision rather than an architecture one.
 | board fix | §2.30 write requests bounded to one burst (MobileNet v2 / ResNet-18 hung on >8-burst runs) | 40/40 RTL, 126/126 on board, demo correct | — | — |
 | 7 (weights) | §2.32 128-bit weight/bias ports, tile-major `[M][ict][kH][kW][16]` layout packed by the scheduler, one w_cache word per cycle | 40/40 RTL, scheduler 1301/1301 | 63 k → 52.7 k | -3.1 % (fill-bound cases -12…-31 %) |
 | 7 (weights) | §2.34 half tile (8 lanes) for a last ic-tile with ≤ 8 channels | 40/40 RTL, scheduler 1302/1302 | 52.7 k → 51.6 k | -3.5 % (stem -17 %) |
+| 7 (w_cache ping-pong) | §2.35 next-slab prefetch into a second bank under the fused sweep; per-m1 RAM columns with a flat power-of-two address (7 synthesis rounds to reach II=1 at BRAM 158) | 40/40 RTL, II=1 depth 7 | 51.6 k → 50.9 k | -2.3 % (stem -14 %) |
 
 Cumulative after §2.32: **-79.7 %** of the suite's simulated time (42.1 M
 → 8.56 M ns — the suite gained a 40th, 1.6 M-ns case in §2.30); the
@@ -391,8 +392,9 @@ in the plan at all but was the depthwise layers' actual wall.  The
 cycle model (§2) stayed within 6 % of RTL at every step and was what
 located both.
 
-Still open from §7: `w_cache` ping-pong (worth ≤ 10–15 % on pixel-rich
-layers now that the fill itself is 8–16× shorter), a min-chunks policy on top of §2.26 so single-chunk layers overlap their
+§2.35 closed the `w_cache` ping-pong item: measured -2.3 % on the
+suite and -14 % on the stem — the fill was already short after §2.32/
+§2.34, so the remaining slab-switch cost is small.  Still open from §7: a min-chunks policy on top of §2.26 so single-chunk layers overlap their
 write phase, a 2-elements/cycle Phase-3 drain (URAM `RAM_T2P` + 32-bit
 `burst_maxi` writes with byte-enables for odd run starts), and the
 `kTileM` 8 → 16 scale-up.

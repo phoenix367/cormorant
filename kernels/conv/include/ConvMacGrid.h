@@ -23,6 +23,47 @@
 #include "Config.h"
 
 // ---------------------------------------------------------------------------
+// WeightVec — one kernel position's kTileIC input-channel lanes.  It is the
+// weight stream beat (§2.32) AND the weight cache word: w_cache stores one
+// WeightVec per (bank, tile, m1, khi, kwi), AGGREGATEd into a 256-bit RAM
+// word, so a cache write is always one full-word store (§2.35: 16 separate
+// lane stores into a reshaped word were inferred as a partial write and
+// cost II=2).
+// ---------------------------------------------------------------------------
+struct WeightVec {
+    Data_t lane[kTileIC];
+};
+
+// ---------------------------------------------------------------------------
+// w_cache geometry (§2.35).  The cache is kTileM columns (one RAM per m1,
+// ARRAY_PARTITION complete on dim 1) of kWCacheWords WeightVecs; the bank,
+// tile and kernel position are folded into ONE flat word address.  Keeping
+// bank / tile / (khi, kwi) as separate array dimensions let HLS split the
+// bank dimension into a second set of RAMs (2x BRAM) and lower the runtime-
+// indexed prefetch store as two stores per RAM (II=2 on the sweep loop).
+// ---------------------------------------------------------------------------
+//
+// Strides are powers of two so the address is a bit concatenation: with the
+// natural kMaxKH * kMaxKW = 49 stride HLS built the address with a 3-cycle
+// DSP multiply in front of the RAM read and the sweep loop grew from 7 to 9
+// pipeline stages (+2 cycles per sweep drain, +4 % on 1x1 / small cases).
+// The depth is unchanged for BRAM (392 -> 512 words rounds to the same
+// 512-deep BRAM18 columns).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kWCacheRowStride = 8;                            // >= kMaxKW
+static constexpr unsigned kWCachePos       = 64;                           // >= kMaxKH * kWCacheRowStride
+static constexpr unsigned kWCacheBanks     = 2;                            // ping-pong
+static constexpr unsigned kWCacheWords     = kWCacheBanks * kMaxMperGroup * kWCachePos;
+static_assert(kMaxKW <= kWCacheRowStride,            "w_cache row stride");
+static_assert(kMaxKH * kWCacheRowStride <= kWCachePos, "w_cache tile stride");
+
+inline unsigned w_cache_addr(unsigned bank, unsigned t, unsigned khi, unsigned kwi)
+{
+    #pragma HLS INLINE
+    return (bank * kMaxMperGroup + t) * kWCachePos + khi * kWCacheRowStride + kwi;
+}
+
+// ---------------------------------------------------------------------------
 // mac_grid_step — ONE kernel position on the kTileIC × kTileM grid (§2.24,
 // §2.29).
 //
@@ -50,22 +91,22 @@
 // Both masks are one LUT per lane on the weight input; no DSP cost.
 // ---------------------------------------------------------------------------
 inline void mac_grid_step(
-    const Data_t p[kTileIC],
-    const Data_t w_tile[kTileM][kTileIC][kMaxKH][kMaxKW],
-    unsigned     khi,
-    unsigned     kwi,
-    AccData_t    acc[kTileM],
-    unsigned     ic_valid,
-    unsigned     m_valid
+    const Data_t    p[kTileIC],
+    const WeightVec w_cache[kTileM][kWCacheWords],
+    unsigned        w_addr,                        // w_cache_addr(bank, t, khi, kwi)
+    AccData_t       acc[kTileM],
+    unsigned        ic_valid,
+    unsigned        m_valid
 ) {
     #pragma HLS INLINE
     for (unsigned m1 = 0; m1 < kTileM; m1++) {
         #pragma HLS UNROLL
+        const WeightVec w = w_cache[m1][w_addr];      // one word per m1 RAM
         AccData_t tree = 0;
         for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
             #pragma HLS UNROLL
             const bool   ok    = (ic_l < ic_valid) && (m1 < m_valid);
-            const Data_t w_val = ok ? w_tile[m1][ic_l][khi][kwi] : Data_t(0);
+            const Data_t w_val = ok ? w.lane[ic_l] : Data_t(0);
             // 16×16 Data_t multiply (one DSP48); the ap_fixed product of
             // two ap_fixed<16,8> is exactly AccData_t.
             tree += p[ic_l] * w_val;
@@ -81,8 +122,8 @@ inline void mac_grid_step(
 // (tile, khi, kwi) loop since §2.29.
 // ---------------------------------------------------------------------------
 inline void accumulate_standard(
-    const Data_t patch[kTileIC][kMaxKH][kMaxKW],
-    const Data_t w_buf[kTileM][kTileIC][kMaxKH][kMaxKW],
+    const Data_t    patch[kTileIC][kMaxKH][kMaxKW],
+    const WeightVec w_buf[kTileM][kWCacheWords],   // bank 0, tile 0 used
     AccData_t    acc[kTileM],
     unsigned     ic_valid,
     unsigned     m_valid,
@@ -101,7 +142,8 @@ inline void accumulate_standard(
             #pragma HLS UNROLL
             p[ic_l] = patch[ic_l][khi_cnt][kwi_cnt];
         }
-        mac_grid_step(p, w_buf, khi_cnt, kwi_cnt, acc, ic_valid, m_valid);
+        mac_grid_step(p, w_buf, w_cache_addr(0, 0, khi_cnt, kwi_cnt),
+                      acc, ic_valid, m_valid);
         if (++kwi_cnt == kw) {
             kwi_cnt = 0;
             if (++khi_cnt == kh) {

@@ -14,8 +14,19 @@ allowed-tools: Bash Read
 
 ## 1. Build the bitstream (~30 min, Vivado)
 
-The block design is 128-bit, so the kernels must be synthesised with
-`AXI_BUS_WIDTH=128`.  Keep that in a SEPARATE build tree so the 32-bit
+The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
+128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
+exported IP's own default (32 for the 16-bit element ports, 128 for the
+conv weight/bias ports that are `ap_uint<128>` in C++).  Two things that
+look like shortcuts and are not (2026-09-24): (a) widening
+`C_M_AXI_*_DATA_WIDTH` on an instance in IP integrator — the HLS wrapper
+hard-codes `C_M_AXI_*_WSTRB_WIDTH = (<HLS bus width> / 8)` as a literal,
+the strobe port stays 4 bits (`0xzzzf` in sim) and only the low 4 bytes
+of every beat reach DDR (outputs [0],[1] right, rest zero); (b)
+`config_interface -m_axi_min_bitwidth 128` — the 16-bit ports then emit
+one single-beat partial-strobe write per element and the PS kept only
+lane-0 beats (every 8th output right, rest zero).  A port that must be
+wide is widened in the C++.  Keep that in a SEPARATE build tree so the 32-bit
 tree used by conv-verify and its timing baseline stay intact:
 
 ```bash
@@ -42,11 +53,25 @@ cd inference-scheduler
 scripts/read_kernel_regs.sh            # from this skill: widths + kernel states
 ```
 
-`read_kernel_regs.sh` must show the HPC0 width fields = 2 (128-bit) for
-the four ports the design uses.  The loader writes the widths LAST on
-purpose: the overlay's `afi0` node resets them to 32-bit when applied
-(§2.31); a 32-bit reading here means every kernel will read/write
+`read_kernel_regs.sh` must show the HPC0 width fields = **0 (128-bit)**
+— the AFIFM encoding is 0 = 128, 1 = 64, 2 = 32 (the loader's PYNQ
+table), NOT the other way round.  Until 2026-09-24 the block design
+left `S_AXI_HPC0_FPD` at 32 bits (`PSU__SAXIGP0__DATA_WIDTH`), so the
+field read 2 and every kernel's traffic was squeezed through one 32-bit
+port at 100 MHz (400 MB/s: a 128-bit weight word cost 4 cycles).  The
+loader writes the widths LAST on purpose: the overlay's `afi0` node
+resets the fields to 0 when applied (§2.31); a reading that does not
+match the handoff file's `C_SAXIGP0_DATA_WIDTH` means every kernel will read/write
 garbage.
+
+After a reboot the board applies the starter-kit overlay (dfx-mgr) and,
+during the xclbin load, a `pynq` overlay whose `fabric@A0000000` node
+takes IRQ 61 and outlives its overlay.  The loader now removes `pynq`
+and unbinds such a device before applying ours (2026-09-24); if
+`inference_init() failed: 2` still shows up, check
+`ls /sys/class/uio/*/name` — it must list `fabric_vecop`, not `fabric`
+(`rmdir` the foreign overlay, `echo a0000000.fabric >
+/sys/bus/platform/drivers/uio_pdrv_genirq/unbind`, re-apply).
 
 ## 3. Run
 
@@ -81,4 +106,5 @@ the demo READMEs' transcripts if latencies moved.
 3. In remote `pkill -f`, use a bracket pattern (`"[c]lassify_images"`) —
    a plain pattern matches the ssh shell's own command line and kills it.
 4. Everything failing / mispredicting right after a boot → step 2's width
-   registers (they read 0 when the overlay reset them).
+   registers (they must match the handoff file's port width; the
+   overlay resets them to 0 = 128-bit).

@@ -1277,8 +1277,10 @@ DSP 40.3 % (ConvKernel 293 of 503).
 
 **Board-setup bug found on the way (not a kernel bug).**  After a clean
 reboot the same bitstream failed every model and mispredicted all
-three demos.  The AFIFM width registers read 0 (32-bit) on every PS
-slave port under the 128-bit design: `dts/kv260/pl.dtbo`'s `afi0`
+three demos.  The AFIFM width registers read 0 on every PS slave port
+(0 = 128-bit in the AFIFM encoding, 1 = 64, 2 = 32 — the design's
+`S_AXI_HPC0_FPD` was in fact still 32 bits wide at the time, see
+§2.36, so 0 mismatched it): `dts/kv260/pl.dtbo`'s `afi0`
 node (`xlnx,afi-fpga`, all-zero `config-afi`) is applied by the kernel
 AFI driver and resets the widths, and `upload_bitstream.py` wrote the
 HWH-derived widths BEFORE applying the overlay.  It had worked on the
@@ -1394,7 +1396,122 @@ identical.
 
 ---
 
-## 3. Current architecture (post-§2.34)
+### 2.35. w_cache ping-pong: prefetch the next weight slab under the sweep
+
+**Problem.**  After §2.32/§2.34 the weight fill of a slab
+(`G · m_valid · kh · kw` WeightVecs, one per cycle plus the producer's
+DDR latency per `(tile, m1)` request) still ran strictly before that
+slab's spatial sweep; on M-grouped and multi-ic-tile layers the MAC grid
+idled for every slab switch (the `7x7 s2 stem` case spent ~14 % of its
+time there).
+
+**Change.**  `w_cache` is two banks.  The fused `(tile, khi, kwi)` sweep
+loop reads bank `wbank` and, in the same II=1 iteration, does one
+non-blocking `weight_stream` read into bank `!wbank` at the position of
+the NEXT slab (`f_t / f_m1 / f_khi / f_kwi` cursors, `f_total` derived
+from the producer's emission order across `(ni, chunk, ict, owt, mg)`);
+whatever the sweep did not absorb is read blocking in a short tail
+loop, then the banks swap.  Only the very first slab of an invocation is
+loaded by the old blocking fill.  Bit-exact; the C-sim stream-token
+assert (§2.22) still holds — the prefetch drains exactly the words the
+producer emits.
+
+**Getting HLS to II=1 without doubling BRAM** took seven synthesis
+rounds; the dead ends are recorded so nobody repeats them:
+
+| Form | Result |
+|---|---|
+| two arrays `w_a/w_b` + bank MUX in `mac_grid_step` | II=2 (both RAMs read every cycle), BRAM 222 |
+| + `DEPENDENCE inter dependent=false` | II=1 but HLS duplicated the RAMs: BRAM **334 (115 %)**, slack -0.01 |
+| one array `[2][G][kTileM][kH][kW]`, partition dim 3 | BRAM 158, II=2: "Inferring partial write operation" on the prefetch stores (16 lane stores into a reshaped word) |
+| element = `struct WeightVec` + `AGGREGATE compact=bit` | still partial writes, II=2 |
+| `ap_uint<1>` bank + `ap_uint<3/4>` cursors | no partial writes, but HLS split the bank dimension into a second RAM set (16 RAMs, BRAM 222) and emitted **two** stores per RAM (II=2) |
+| **`w_cache[kTileM][kWCacheWords]`: one RAM column per m1, flat `(bank, tile, khi, kwi)` address, explicit unrolled `if (c == f_m1)` column select** | II=1, BRAM 158 — but pipeline depth 7 → 9: the `× 49` (`kMaxKH·kMaxKW`) in the address became a 3-cycle DSP multiply ahead of the RAM read (+4 % on 1x1 / small cases) |
+| **+ power-of-two strides** (`kWCacheRowStride = 8`, `kWCachePos = 64`; `w_cache_addr()` in ConvMacGrid.h) | **II=1, depth 7, BRAM 158, DSP 248** — shipped |
+
+The lesson: for a runtime-indexed store into a partitioned RAM, give
+HLS one column per partition, one flat power-of-two address, and select
+the column with an explicit compare; never a runtime index into the
+partitioned dimension.
+
+**Result.** **-187 670 ns (-2.3 %)** over the suite (8.260 M → 8.073 M
+ns), 40/40 RTL PASS, bit-exact.  `7x7 s2 stem` **-14.1 %** (1.085 M →
+0.932 M ns), `batch_2 dil_2 s_h_2` -3.3 %, `in_h 17` -1.5 %,
+`out_ch 64 2 M-groups` -1.4 %; every single-slab case within ±1 %
+(unchanged pipeline depth).  Synthesis: II=1 on every loop, slack 0.00,
+BRAM 158 (54 %), DSP 248, FF 35.9 k, LUT 50.4 k (+3.1 k for the
+prefetch cursors and the column select).  Cycle model: the fill term now
+counts only the un-absorbed part (`max(0, f - sweep/2)`, first slab
+fully); validation 6.2 % mean error, the M-grouped cases are
+under-predicted by ~5 % (a residual per-slab cost the model does not
+place — the producer's per-request DDR latency when the FIFO is empty at
+a slab start is the likely candidate).
+
+**On board** (bitstream rebuilt, WNS +1.74 ns): **126/126** scheduler
+models PASS; demo top-1 and logits unchanged; ResNet-18 402 → **388 ms**
+(-3.5 %, its 7×7 stem and 3×3 M-grouped layers), MobileNet v1 495 →
+**490 ms**, MobileNet v2 434 → **432 ms** (their depthwise / 1×1 layers
+have nothing to prefetch across).  Cumulative vs the original README:
+**5.0× / 4.3× / 6.3×**.  MNIST: convnet 1.055 ms unchanged, LeNet
+20.6 → **20.5 ms**; accuracies identical.
+
+### 2.36. Board: the "128-bit" design was 32-bit end to end (LeNet 20.5 → 8.3 ms)
+
+**Symptom.**  The MNIST LeNet demo took 20.5 ms; per-layer profiling
+(`-DINFERENCE_PROFILING=ON`) put 16.4 ms in `conv3`, a 3136→1024
+fully-connected layer written as a 7×7 valid conv with 6.4 MB of
+weights.  Five synthetic variants on the board (same layer with 9× the
+MACs, a quarter of the M-groups, one ic-tile, a 3×3 kernel with the
+same request count) showed the time is a pure **4.0 cycles per 128-bit
+weight word** — neither compute nor request latency.  The MatmulKernel
+is no alternative for such layers (16-bit ports, ~45 ns/element ≈
+145 ms), and no scheduler rewrite reduces the 6.4 MB.
+
+**Cause.**  In `hw/cormorant_hw_128` every kernel instance carried
+`C_M_AXI_*_DATA_WIDTH = 32` (stale from before §2.32; an IP upgrade
+keeps user-set values), `S_AXI_HPC0_FPD` was 32 bits
+(`PSU__SAXIGP0__DATA_WIDTH`) and the interconnect crossbar was 32 bits.
+The conv kernel's native 128-bit weight port was narrowed 4:1 by its own
+HLS adapter.  The AFIFM width field the loader writes had been read
+with an inverted legend (0 = 128-bit, 2 = 32-bit in the AFIFM/PYNQ
+encoding), so the §2.31 "reset to 32-bit" note was backwards: the
+overlay resets it to 128, which mismatched the then-32-bit fabric.
+
+**Two wrong fixes, recorded so they are not retried.**
+1. Widening `C_M_AXI_*_DATA_WIDTH` on the instances in IP integrator:
+   the HLS wrapper hard-codes `C_M_AXI_*_WSTRB_WIDTH = (32 / 8)` as a
+   literal that is not a model parameter, so WSTRB stays 4 bits
+   (`0xzzzf` in the test stand) and only the low 4 bytes of every beat
+   reach DDR — every model fails with outputs [0],[1] right, rest 0.
+2. `config_interface -m_axi_min_bitwidth 128` at export: the wrapper is
+   then consistent and the PS VIP passes 61/61, but the 16-bit ports
+   emit one single-beat partial-strobe write per element (8 AWs per
+   16 B) and the real PS kept only lane-0 beats (every 8th output right).
+
+**Fix.**  `S_AXI_HPC0_FPD` and the crossbar at 128 bits; every instance
+parameter equal to the exported IP default (32 for the 16-bit element
+ports, 128 for conv weight/bias, which are `ap_uint<128>` in C++); the
+interconnect upsizes the 32-bit ports.  Also in the loader: the `pynq`
+overlay that appears during the xclbin load on PYNQ images leaves a
+`fabric@A0000000` UIO device that outlives the overlay and holds
+IRQ 61, so our `fabric_vecop` node failed to probe (EBUSY) after a
+reboot; `upload_bitstream.py` now removes that overlay and unbinds any
+foreign UIO device at a kernel address before applying ours.
+
+**Result (board).**  126/126 models PASS, demo predictions and logits
+unchanged.  `conv3` **16.44 → 4.38 ms** (weight words now ~1.1
+cycles each), LeNet **20.5 → 8.28 ms** (2.5×; 6.7× vs the original
+README's 55.5 ms), convnet 1.06 ms unchanged.  Image classification
+unchanged within noise (489 / 435 / 386 ms): their weight fills are
+already hidden under the spatial sweep by the §2.35 prefetch, so the
+port speed only shows on 1-pixel (fully-connected) layers.  Matmul and
+Pooling keep their 16-bit ports and are unaffected either way; making
+them faster needs native wide ports in their C++, as MATMUL_OPTIMISATION
+§3 already lists.  Bitstream WNS +1.85 ns.
+
+---
+
+## 3. Current architecture (post-§2.35)
 
 ```mermaid
 flowchart LR
@@ -1405,7 +1522,7 @@ flowchart LR
     IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
     SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
-    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache (§2.10)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
+    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
     WO["<i>output write</i>"]
 
     DDR_X -->|m_axi read| IPP
@@ -1461,12 +1578,14 @@ flowchart LR
    `partial_outputs[kMaxAccPersistEntries]` (URAM since §2.13 —
    `bind_storage impl=URAM`, 256 KB / 16 URAM blocks at the 65536-entry
    default) AND
-   `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` (§2.10).
+   `w_cache[kTileM][kWCacheWords]` — one RAM column per m1 holding two
+   banks of `kMaxMperGroup` tiles' `WeightVec`s (§2.10, §2.32, §2.35).
    Per `(ni, chunk)`: Phase 1 inits the chunk's
    `chunk_oh_count·out_w·out_ch` accumulators from `bias_stream`;
    Phase 2a/2b accumulates with `oh_local = oh - oh_start` indexing,
    the inner loop reading patch from `patch_stream` and weights from
-   `w_cache` (loaded once per `(ict, ow_tile, mg)`) and running:
+   `w_cache` (one slab per `(ict, ow_tile, mg)`, the next slab
+   prefetched into the other bank under the sweep since §2.35) and running:
    - Standard: an II=1 lane-rotated reduce with a `kTileIC`-wide PN
      adder tree (§2.8) → **kTileIC MACs/cycle**.
    - Depthwise: an II=1 PM-wide channel-parallel reduce (§2.8) →

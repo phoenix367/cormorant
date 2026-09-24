@@ -103,19 +103,8 @@ struct BiasVec {
     AccData_t lane[kTileM];
 };
 
-// ---------------------------------------------------------------------------
-// WeightVec — one kTileIC-lane weight word per stream beat (§2.32).
-//
-// The consumer's w_cache stores a 256-bit word per (m-tile, m1, khi, kwi)
-// (ARRAY_RESHAPE over ic_l), so the weight stream now carries exactly that
-// word: stream_load_weights assembles it from kTileIC / kWeightPortElems
-// consecutive port beats of the tile-major DDR layout (ConvKernel.h) and
-// the fill loop writes one w_cache word per cycle.  Depthwise packs
-// kTileIC consecutive kernel positions of one channel per beat instead.
-// ---------------------------------------------------------------------------
-struct WeightVec {
-    Data_t lane[kTileIC];
-};
+// WeightVec (the weight stream beat and the weight cache word) lives in
+// ConvMacGrid.h since §2.35.
 static constexpr unsigned kWordsPerWeightVec = kTileIC / kWeightPortElems;
 
 #ifdef DEBUG_LOAD_DATA_CACHING
@@ -1078,6 +1067,33 @@ static void process_conv_kernel_tile(
     const unsigned oh_per_chunk = geom.oh_per_chunk;
     const unsigned num_chunks   = geom.num_chunks;
 
+    // §2.35 w_cache ping-pong: two weight banks in ONE array, the bank being
+    // the slowest address bit (NOT partitioned).  Each of the kTileM m1-RAMs
+    // (§2.24 banking: m1 partitioned, ic reshaped into 256-bit words) is
+    // only kMaxMperGroup*kMaxKH*kMaxKW = 196 words deep, so doubling the
+    // depth to 392 still fits the same 512-deep BRAM36 columns — the second
+    // bank costs no BRAM, whereas two separate arrays cost a full second set
+    // (and, with the bank MUX needing both read every cycle, HLS duplicated
+    // them again: 334 BRAM18 = 115 % of the device).  The sweep reads bank
+    // `wbank` while the prefetch writes bank !wbank: one read + one write
+    // port per RAM.  Bank state persists across (ni, chunk, ict, owt, mg)
+    // because the prefetch crosses all of those boundaries.
+    // Layout: one RAM column per m1, flat (bank, tile, khi, kwi) word address
+    // (w_cache_addr in ConvMacGrid.h).  The prefetch store selects its column
+    // with an explicit unrolled compare so each RAM sees exactly ONE
+    // conditional store per iteration — the 5-D form with a runtime m1 index
+    // into the partitioned dimension made HLS emit two stores per RAM and
+    // split the bank dimension into a second RAM set (II=2, 2x BRAM).
+    WeightVec w_cache[kTileM][kWCacheWords];
+    #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=1
+    #pragma HLS AGGREGATE       variable=w_cache compact=bit
+    #pragma HLS BIND_STORAGE    variable=w_cache type=RAM_2P impl=BRAM
+    // 1-bit bank select and narrow prefetch cursors: with plain `unsigned`
+    // indices HLS could not bound them and lowered the prefetch stores as
+    // masked PARTIAL writes (read-modify-write on the word).
+    ap_uint<1> wbank        = 0;       // bank holding the CURRENT slab
+    bool       w_prefetched = false;   // current slab already loaded by the previous sweep
+
     AccData_t partial_outputs[kMaxAccPersistEntries];
     // Bound to URAM: this is by far the largest on-chip buffer and the
     // design is BRAM-bound, while the XCK26's 64 URAM blocks (288 Kbit
@@ -1149,63 +1165,72 @@ static void process_conv_kernel_tile(
                         ? mt_per_group
                         : (m_tiles - mt_base);
 
-                // ---- Load the m_group's weight slab from weight_stream ----
-                // w_cache[mt_in_group][m1][ic_l][khi][kwi].  Partition dim=3
-                // (ic_l) complete → kTileIC parallel banks so the inlined
-                // accumulate_standard's PN-wide adder tree gets one read
-                // per bank per cycle.
-                Data_t w_cache[kMaxMperGroup][kTileM][kTileIC]
-                              [kMaxKH][kMaxKW];
-                // §2.24 grid banking: the 2-D grid reads all kTileM × kTileIC
-                // weights of one (mt_in_group, khi, kwi) per cycle.  Partition
-                // the m axis into kTileM RAMs and RESHAPE the ic axis so each
-                // RAM word carries all kTileIC lanes (256 bits) — 128 values
-                // per cycle from kTileM ports (CONV_2D_GRID_PLAN.md §5.1).
-                #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=2
-                #pragma HLS ARRAY_RESHAPE   variable=w_cache complete dim=3
-
-                // §2.32: one WeightVec beat = one reshaped w_cache word (all
-                // kTileIC ic-lanes of one (m1, khi, kwi)), written per cycle —
-                // the fill is kTileIC× shorter than the former one-element
-                // stream.  Lanes >= ic_valid arrive zero-padded from DDR.
-                for (unsigned mt_in_group = 0;
-                     mt_in_group < mt_in_group_count; mt_in_group++) {
-                    const unsigned mt     = mt_base + mt_in_group;
-                    const unsigned m_off  = mt * kTileM;
-                    const unsigned m_valid =
-                        std::min(kTileM, out_ch - m_off);
-
-                    for (unsigned m1 = 0; m1 < m_valid; m1++) {
-                        for (unsigned khi = 0; khi < kh; khi++) {
-                            for (unsigned kwi = 0; kwi < kw; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                const WeightVec v = weight_stream.read();
-                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                    #pragma HLS UNROLL
-                                    w_cache[mt_in_group][m1][ic_l][khi][kwi] = v.lane[ic_l];
+                // ---- §2.35 w_cache ping-pong ----
+                // Slabs arrive on weight_stream in exactly this loop order
+                // (ni, chunk, ict, owt, mg).  The slab for THIS group is
+                // already in bank `wbank` unless this is the very first slab
+                // of the invocation (then it is loaded here, blocking).  The
+                // NEXT slab is prefetched into bank wbank^1 while this
+                // group's spatial sweep runs: one non-blocking WeightVec
+                // read per sweep iteration, and a blocking tail after the
+                // sweep for whatever is still missing.  The prefetch is
+                // non-blocking so a slow weight producer never stalls the
+                // MAC pipeline.
+                if (!w_prefetched) {
+                    for (unsigned t = 0; t < mt_in_group_count; t++) {
+                        const unsigned mv =
+                            std::min(kTileM, out_ch - (mt_base + t) * kTileM);
+                        for (unsigned m1 = 0; m1 < mv; m1++) {
+                            for (unsigned khi = 0; khi < kh; khi++) {
+                                for (unsigned kwi = 0; kwi < kw; kwi++) {
+                                    #pragma HLS PIPELINE II=1
+                                    const WeightVec wv = weight_stream.read();
+                                    const unsigned  wa = w_cache_addr(wbank, t, khi, kwi);
+                                    for (unsigned c = 0; c < kTileM; c++) {
+                                        #pragma HLS UNROLL
+                                        if (c == m1) w_cache[c][wa] = wv;
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
+                // Identify the next slab (same order the producer emits).
+                const bool last_slab =
+                    (ni + 1 == batch) && (chunk + 1 == num_chunks) &&
+                    (ict + 1 == ic_tiles) && (owt + 1 == num_ow_tiles) &&
+                    (mg + 1 == num_m_groups);
+                const unsigned mg_next      = (mg + 1 < num_m_groups) ? mg + 1 : 0;
+                const unsigned mt_base_next = mg_next * mt_per_group;
+                const unsigned G_next       =
+                    (mt_base_next + mt_per_group <= m_tiles)
+                        ? mt_per_group : (m_tiles - mt_base_next);
+                unsigned f_total = 0;                          // WeightVecs in the next slab
+                for (unsigned t = 0; t < kMaxMperGroup; t++) {
+                    #pragma HLS UNROLL
+                    if (t < G_next)
+                        f_total += std::min(kTileM, out_ch - (mt_base_next + t) * kTileM) * kh * kw;
+                }
+                if (last_slab) f_total = 0;
+                // Prefetch write cursor: (tile, m1, khi, kwi) in emission order.
+                unsigned   f_pos = 0;
+                ap_uint<3> f_t = 0;                 // < kMaxMperGroup
+                ap_uint<4> f_m1 = 0, f_khi = 0, f_kwi = 0;   // < kTileM / kMaxKH / kMaxKW
+                unsigned f_mv = std::min(kTileM, out_ch - mt_base_next * kTileM);
+                const ap_uint<1> nbank = wbank ^ 1;   // bank being prefetched
+
                 // ---- Spatial sweep (§2.29): per (oh, ow_in_tile) ONE fused
                 //      II=1 loop over (tile-in-group, khi, kwi) ----
                 // Tile 0 consumes each PatchVec beat straight from the
                 // stream and parks it in `patch`; tiles 1..G-1 replay it
                 // from `patch`.  All G tiles' accumulators live in registers
-                // for the whole pixel, so the per-tile acc load / store and
-                // the separate drain loop (and their pipeline ramps) are
-                // gone: a pixel costs G·kh·kw + ~G·2 + latency cycles
-                // instead of kh·kw + G·(kh·kw + ~12).
+                // for the whole pixel.  Each iteration also advances the
+                // §2.35 prefetch of the next slab into the other bank.
                 for (unsigned oh_local = 0; oh_local < chunk_oh_count;
                      oh_local++) {
                     for (unsigned ow = ow_start; ow < ow_end; ow++) {
                         Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        // Banked register file: partition only the bank
-                        // dim → kTileIC banks for the ic_l UNROLL's
-                        // parallel reads, with (khi,kwi) as a RAM address
-                        // (DAC'20 control-broadcast note, §2.18).
                         #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
                         #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
@@ -1224,11 +1249,18 @@ static void process_conv_kernel_tile(
                             }
                         }
 
-                        // Fused (g, khi, kwi) sweep.
+                        // Fused (g, khi, kwi) sweep + prefetch.
                         const unsigned n_steps = mt_in_group_count * kh * kw;
                         unsigned g = 0, khi = 0, kwi = 0;
                         for (unsigned ri = 0; ri < n_steps; ri++) {
                             #pragma HLS PIPELINE II=1
+                            // The sweep reads bank wbank and the prefetch writes
+                            // bank !wbank, so an iteration never reads what a
+                            // previous iteration wrote — without this HLS assumes
+                            // a RAW hazard through w_cache and schedules II=2
+                            // (UG1399 "pragma HLS dependence", inter /
+                            // dependent=false).
+                            #pragma HLS DEPENDENCE variable=w_cache type=inter dependent=false
                             Data_t p[kTileIC];
                             #pragma HLS ARRAY_PARTITION variable=p complete dim=0
                             if (g == 0) {
@@ -1246,8 +1278,35 @@ static void process_conv_kernel_tile(
                             }
                             const unsigned m_valid_g =
                                 std::min(kTileM, out_ch - (mt_base + g) * kTileM);
-                            mac_grid_step(p, w_cache[g], khi, kwi, acc[g],
-                                          ic_valid, m_valid_g);
+                            mac_grid_step(p, w_cache, w_cache_addr(wbank, g, khi, kwi),
+                                          acc[g], ic_valid, m_valid_g);
+
+                            // §2.35 prefetch: one WeightVec of the NEXT slab
+                            // into the other bank, if one is available.
+                            if (f_pos < f_total) {
+                                WeightVec wv;
+                                if (weight_stream.read_nb(wv)) {
+                                    const unsigned wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
+                                    for (unsigned c = 0; c < kTileM; c++) {
+                                        #pragma HLS UNROLL
+                                        if (c == f_m1) w_cache[c][wa] = wv;
+                                    }
+                                    f_pos++;
+                                    if (++f_kwi == kw) {
+                                        f_kwi = 0;
+                                        if (++f_khi == kh) {
+                                            f_khi = 0;
+                                            if (++f_m1 == f_mv) {
+                                                f_m1 = 0;
+                                                f_t++;
+                                                f_mv = std::min(kTileM,
+                                                    out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             if (++kwi == kw) {
                                 kwi = 0;
                                 if (++khi == kh) {
@@ -1268,6 +1327,33 @@ static void process_conv_kernel_tile(
                         }
                     }
                 }
+
+                // §2.35 tail: whatever of the next slab the sweep did not
+                // absorb (short sweeps, slow producer) is read blocking here.
+                for (; f_pos < f_total; f_pos++) {
+                    #pragma HLS PIPELINE II=1
+                    #pragma HLS DEPENDENCE variable=w_cache type=inter dependent=false
+                    const WeightVec wv = weight_stream.read();
+                    const unsigned  wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
+                    for (unsigned c = 0; c < kTileM; c++) {
+                        #pragma HLS UNROLL
+                        if (c == f_m1) w_cache[c][wa] = wv;
+                    }
+                    if (++f_kwi == kw) {
+                        f_kwi = 0;
+                        if (++f_khi == kh) {
+                            f_khi = 0;
+                            if (++f_m1 == f_mv) {
+                                f_m1 = 0;
+                                f_t++;
+                                f_mv = std::min(kTileM,
+                                    out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
+                            }
+                        }
+                    }
+                }
+                wbank        = nbank;           // the prefetched slab becomes current
+                w_prefetched = !last_slab;
               } // mg
               } // ow_tile
             } // ict

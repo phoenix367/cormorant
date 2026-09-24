@@ -165,6 +165,31 @@ def load_xclbin(session: RemoteSession, xclbin_data: bytes) -> None:
         raise RuntimeError(f"xclLoadXclBin failed (rc={rc}):\n{err}")
 
 
+def unbind_stale_uio(session: RemoteSession, node_names: list[str]) -> list[str]:
+    """
+    Unbind uio_pdrv_genirq platform devices that sit at one of our kernel
+    addresses but are NOT ours (e.g. `a0000000.fabric` from the `pynq`
+    overlay that appears during the xclbin load on PYNQ images).  Such a
+    device survives the removal of its overlay and keeps the shared IRQ,
+    so our node fails to probe with EBUSY ("genirq: Flags mismatch irq 61
+    (fabric_vecop) vs (fabric)") and the kernel's UIO name is wrong.
+    Returns the unbound device names.
+    """
+    drv = "/sys/bus/platform/drivers/uio_pdrv_genirq"
+    out, _, _ = session.exec(f"ls '{drv}' 2>/dev/null | grep -E '^[0-9a-f]+\\.' || true", timeout=10)
+    ours = set(node_names)
+    unbound = []
+    for dev in out.split():
+        addr, _, name = dev.partition(".")
+        if any(n.split("@")[0] == name and n.split("@")[1].lower() == addr.lower() for n in ours):
+            continue
+        if any(n.split("@")[1].lower() == addr.lower() for n in ours):
+            _, err, rc = session.exec(f"echo '{dev}' > '{drv}/unbind'", timeout=10)
+            if rc == 0:
+                unbound.append(dev)
+    return unbound
+
+
 def apply_dtbo(session: RemoteSession, remote_dtbo: str, overlay_name: str) -> None:
     """Create the configfs overlay directory and write the .dtbo into it."""
     sysfs_dir = f"{_OVERLAYS_DIR}/{overlay_name}"

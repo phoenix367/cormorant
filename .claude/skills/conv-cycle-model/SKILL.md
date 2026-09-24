@@ -1,5 +1,5 @@
 ---
-description: Analytical cycle model of ConvKernel (post-§2.34 architecture) — per-layer cycles split into MAC sweep, weight fill, bias init, drain/write and input loads, for an ONNX model or a single geometry, from the platform JSON's kernels.conv bounds. Use before choosing the next conv optimisation, to explain an RTL timing delta, or to size a fixture; re-validate against one RTL case after any kernel change.
+description: Analytical cycle model of ConvKernel (post-§2.35 architecture) — per-layer cycles split into MAC sweep, weight fill, bias init, drain/write and input loads, for an ONNX model or a single geometry, from the platform JSON's kernels.conv bounds. Use before choosing the next conv optimisation, to explain an RTL timing delta, or to size a fixture; re-validate against one RTL case after any kernel change.
 allowed-tools: Bash Read
 ---
 
