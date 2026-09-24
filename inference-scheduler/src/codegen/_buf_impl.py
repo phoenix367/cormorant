@@ -166,7 +166,10 @@ void inference_buf_pool_deinit(void)
 
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
-    size_t                 bytes = (size_t)n_elem * INFERENCE_BYTES_PER_ELEM;
+    /* Round up to 64 bytes: the kernels read / write whole 16-byte words
+     * (VectorOPKernel writes the last word of every run whole), so the
+     * allocation must cover the tail word past n_elem. */
+    size_t                 bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
     xclBufferHandle        bo;
     void                  *virt;
     struct xclBOProperties props;
@@ -252,6 +255,7 @@ void inference_buf_pool_deinit(void) {}
 
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
+    /* 64-byte multiple: covers the tail word the kernels access past n_elem. */
     size_t bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
     inference_buf_t *buf;
     void *mem;

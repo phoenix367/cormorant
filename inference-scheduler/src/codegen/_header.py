@@ -77,8 +77,11 @@ class _HeaderMixin:
             lines.append("/* Broadcast chunk macros (one set per broadcast op).\n"
                          " * CHUNK        = data elements per kernel call\n"
                          " * CHUNK_STRIDE = INFERENCE_ALIGN_UP(CHUNK) — padded stride;\n"
-                         " *               gap elements between data blocks are never\n"
-                         " *               accessed by VectorOPKernel. */")
+                         " *               the kernel's 128-bit ports read every run as\n"
+                         " *               whole 16-byte words and write the last word\n"
+                         " *               of a run whole, so the gap up to the next\n"
+                         " *               16-byte boundary receives 0 and the rest of\n"
+                         " *               the gap is never touched. */")
             for sn in broadcast_nodes:
                 c_up = sn.output.c_name.upper()
                 chunk_macro  = f"INFERENCE_{c_up}_CHUNK"

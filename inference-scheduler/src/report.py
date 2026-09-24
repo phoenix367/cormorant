@@ -109,6 +109,8 @@ def _node_notes(sn) -> str:
         bits = [OP_NAMES.get(sn.op_code, "?")]
         if sn.outer_count > 1:
             bits.append(f"broadcast×{sn.outer_count}")
+        for fused in sn.fused_nodes:
+            bits.append(f"+ {fused.op_type} (act)")
         return " · ".join(bits)
     if isinstance(sn, MatmulNode):
         bits = [f"{sn.n}×{sn.k}·{sn.k}×{sn.m}"]
@@ -505,6 +507,7 @@ class ReportGenerator:
         starts = sum(1 for ev in events if ev[0] in ("start", "start_sync"))
 
         gemm = getattr(self.graph, "gemm_decomposed_count", 0)
+        act_fused = getattr(self.graph, "act_fused_count", 0)
         reshape_count = sum(1 for sn in self.graph.nodes if isinstance(sn, ReshapeNode))
 
         # Pool reuse summary: re-derive the saving figure already shown in §4
@@ -525,6 +528,12 @@ class ReportGenerator:
         else:
             bullets.append(
                 "- **Gemm decomposition** — none (no `Gemm` nodes in the source graph)."
+            )
+        if act_fused:
+            bullets.append(
+                f"- **Activation fusion** — {act_fused} `Relu` / `Clip(0,6)` "
+                f"node{'s' if act_fused != 1 else ''} folded into the producing "
+                f"VectorOP call (kernel `act` register)."
             )
         if reshape_count:
             bullets.append(
