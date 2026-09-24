@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -19,33 +20,90 @@
 // line, suitable for $readmemh).  A manifest.txt indexes every test with
 // its geometry so an HDL testbench can load the same fixtures.  RNG state
 // is shared with verify mode (same seed, same draw order).
+//
+// Fixture extents follow the kernel's geometry: a holds (outer-1)*a_inc +
+// size elements, b (outer-1)*b_inc + size, c (outer-1)*(a_inc+b_inc) +
+// size.  c_ref carries the reference value at every valid position; gap /
+// tail positions hold 0 and the testbench only compares valid positions.
 // ---------------------------------------------------------------------------
 static std::string g_dump_dir;     // empty → verify mode (default)
 static int         g_test_idx = 0;
 static FILE*       g_manifest = nullptr;
 
 // ---------------------------------------------------------------------------
+// 16-byte-aligned element buffers.
+//
+// The kernel's ports are 128-bit words: every run start must be 16-byte
+// aligned, input words past the end of a run are read (and masked), and
+// the last word of every output run is written whole.  Buffers are
+// therefore allocated in whole words on a 64-byte boundary, exactly like
+// the scheduler's DMA buffers (VectorOP.h alignment contract).
+// ---------------------------------------------------------------------------
+struct AlignedBuf {
+    Data_t*  p     = nullptr;
+    unsigned n     = 0;        // logical element count
+    unsigned words = 0;        // allocated words (>= ceil(n / kVecLanes))
+
+    explicit AlignedBuf(unsigned n_elems, Data_t fill = Data_t(0)) { reset(n_elems, fill); }
+    AlignedBuf(const AlignedBuf&) = delete;
+    AlignedBuf& operator=(const AlignedBuf&) = delete;
+    ~AlignedBuf() { std::free(p); }
+
+    void reset(unsigned n_elems, Data_t fill) {
+        std::free(p);
+        n     = n_elems;
+        words = (n_elems + kVecLanes - 1) / kVecLanes;
+        if (words == 0) words = 1;
+        const size_t bytes = ((size_t)words * 16 + 63) & ~(size_t)63;
+        void* raw = nullptr;
+        if (posix_memalign(&raw, 64, bytes) != 0 || raw == nullptr) {
+            std::fprintf(stderr, "posix_memalign(%zu) failed\n", bytes);
+            std::exit(1);
+        }
+        std::memset(raw, 0, bytes);
+        p = static_cast<Data_t*>(raw);
+        for (unsigned i = 0; i < words * kVecLanes; ++i) p[i] = fill;
+    }
+    Data_t&       operator[](unsigned i)       { return p[i]; }
+    const Data_t& operator[](unsigned i) const { return p[i]; }
+    unsigned capacity() const { return words * kVecLanes; }
+};
+
+// Wrap the kernel call: asserts the alignment contract the scheduler
+// guarantees (16-byte-aligned bases, strides in whole words) and builds
+// the burst_maxi port objects.
+static void run_kernel(AlignedBuf& a, AlignedBuf* b, AlignedBuf& c,
+                       unsigned size, unsigned op, unsigned outer,
+                       unsigned a_inc, unsigned b_inc, unsigned act) {
+    assert(a_inc % kVecLanes == 0 && "a_inc must be a multiple of kVecLanes");
+    assert(b_inc % kVecLanes == 0 && "b_inc must be a multiple of kVecLanes");
+    assert(reinterpret_cast<uintptr_t>(a.p) % 16 == 0);
+    assert(reinterpret_cast<uintptr_t>(c.p) % 16 == 0);
+    const unsigned n_words = (size + kVecLanes - 1) / kVecLanes;
+    const unsigned c_inc   = a_inc + b_inc;
+    assert((outer - 1) * (a_inc / kVecLanes) + n_words <= a.words && "a buffer too small");
+    assert((outer - 1) * (c_inc / kVecLanes) + n_words <= c.words && "c buffer too small");
+    Data_t* bp = a.p;   // unary ops never read b; hand them a valid address anyway
+    if (b != nullptr) {
+        assert(reinterpret_cast<uintptr_t>(b->p) % 16 == 0);
+        assert((outer - 1) * (b_inc / kVecLanes) + n_words <= b->words && "b buffer too small");
+        bp = b->p;
+    }
+    hls::burst_maxi<VecWord> pa(reinterpret_cast<VecWord*>(a.p));
+    hls::burst_maxi<VecWord> pb(reinterpret_cast<VecWord*>(bp));
+    hls::burst_maxi<VecWord> pc(reinterpret_cast<VecWord*>(c.p));
+    VectorOPKernel(pa, pb, pc, size, op, outer, a_inc, b_inc, act);
+}
+
+// ---------------------------------------------------------------------------
 // Reference model
 //
-// ref_sat() derives its clamp range from std::numeric_limits<Data_t> so that
-// it matches the kernel's saturate_cast<Data_t> for every supported type:
+// ref_sat() derives its clamp range from saturate_cast<Data_t> so that it
+// matches the kernel for every supported type:
 //
-//   ap_fixed<W,I>  → limits reflect the fixed-point range; saturation clips.
-//   float / double → limits are FLT_MAX / DBL_MAX; no practical saturation
-//                    occurs for the inputs we use, matching the kernel's
-//                    pass-through behaviour.
-//
-// This removes the hardcoded ap_fixed<16,8> constants from the reference and
-// ensures the random-value tests are correct for any configured Data_t.
+//   ap_fixed<W,I>  → AP_SAT clips to the representable extreme.
+//   float / double → identity cast, value stays ~1e38 (no practical clamp).
 // ---------------------------------------------------------------------------
-
-// Saturation limits for Data_t, derived via saturate_cast rather than
-// std::numeric_limits.  The Vitis ap_fixed numeric_limits specialisation
-// references an internal 'Type' alias that only resolves inside the HLS
-// synthesis frontend; it fails to compile under regular GCC (C-sim build).
-// saturate_cast<Data_t>(±1e38) gives the same result without that dependency:
-//   ap_fixed<W,I,...>  →  AP_SAT clips to the representable extreme
-//   float / double     →  identity cast, value stays ~1e38 (no practical clamp)
 static const double kSatMax = static_cast<double>(saturate_cast<Data_t>( 1e38));
 static const double kSatMin = static_cast<double>(saturate_cast<Data_t>(-1e38));
 
@@ -53,17 +111,29 @@ static double ref_sat(double v) {
     return std::max(kSatMin, std::min(kSatMax, v));
 }
 
-static double ref_op(Op op, double a, double b) {
-    switch (op) {
-        case OP_ADD:   return ref_sat(a + b);
-        case OP_SUB:   return ref_sat(a - b);
-        case OP_MUL:   return ref_sat(a * b);
-        case OP_DIV:   return (b == 0.0) ? 0.0 : ref_sat(a / b);
-        case OP_RELU:  return std::max(0.0, a);
-        case OP_RELU6: return std::min(std::max(0.0, a), 6.0);
-        default:       return a;
+static double ref_act(double v, unsigned act) {
+    switch (act) {
+        case ACT_RELU:  return std::max(0.0, v);
+        case ACT_RELU6: return std::min(std::max(0.0, v), 6.0);
+        default:        return v;
     }
 }
+
+static double ref_op(unsigned op, double a, double b, unsigned act = ACT_NONE) {
+    double r;
+    switch (op) {
+        case OP_ADD:   r = ref_sat(a + b); break;
+        case OP_SUB:   r = ref_sat(a - b); break;
+        case OP_MUL:   r = ref_sat(a * b); break;
+        case OP_DIV:   r = (b == 0.0) ? 0.0 : ref_sat(a / b); break;
+        case OP_RELU:  r = std::max(0.0, a); break;
+        case OP_RELU6: r = std::min(std::max(0.0, a), 6.0); break;
+        default:       r = a; break;
+    }
+    return ref_act(r, act);
+}
+
+static bool is_unary(unsigned op) { return op >= OP_RELU; }
 
 // ---------------------------------------------------------------------------
 // Dump-mode helpers (only meaningful for fixed-point builds — the HDL
@@ -74,15 +144,14 @@ static uint16_t data_to_raw16(const Data_t& v) {
     return static_cast<uint16_t>(v.range().to_uint());
 }
 
-static void write_hex_file(const std::string& path,
-                           const std::vector<Data_t>& vec) {
+static void write_hex_file(const std::string& path, const Data_t* vec, unsigned n) {
     FILE* f = std::fopen(path.c_str(), "w");
     if (!f) {
         std::fprintf(stderr, "Failed to open %s for writing\n", path.c_str());
         std::exit(1);
     }
-    for (const auto& v : vec)
-        std::fprintf(f, "%04x\n", data_to_raw16(v));
+    for (unsigned i = 0; i < n; ++i)
+        std::fprintf(f, "%04x\n", data_to_raw16(vec[i]));
     std::fclose(f);
 }
 #endif
@@ -98,17 +167,21 @@ static std::string sanitize_label(const std::string& s) {
     return out;
 }
 
-// Materialise c_ref (as Data_t) and write a/b/c hex files plus a manifest
-// row.  Caller has already computed the reference output as doubles.
+// Extents of the a / b / c arrays for a geometry (elements).
+static unsigned extent(unsigned size, unsigned outer, unsigned inc) {
+    return (outer - 1) * inc + size;
+}
+
+// Write a/b/c hex files plus a manifest row.  c_ref holds one double per
+// c position (gaps = 0).
 static void dump_one_case(const char* label,
                           unsigned size, unsigned op_code,
-                          unsigned outer, unsigned a_inc, unsigned b_inc,
-                          const std::vector<Data_t>& a,
-                          const std::vector<Data_t>& b,
+                          unsigned outer, unsigned a_inc, unsigned b_inc, unsigned act,
+                          const AlignedBuf& a, const AlignedBuf& b,
                           const std::vector<double>& c_ref_d) {
 #ifndef VA_HAVE_APFIXED
     (void)label; (void)size; (void)op_code;
-    (void)outer; (void)a_inc; (void)b_inc;
+    (void)outer; (void)a_inc; (void)b_inc; (void)act;
     (void)a; (void)b; (void)c_ref_d;
     std::fprintf(stderr, "--dump-data requires VA_HAVE_APFIXED build\n");
     std::exit(1);
@@ -122,26 +195,35 @@ static void dump_one_case(const char* label,
     for (size_t i = 0; i < c_ref_d.size(); ++i)
         c_ref[i] = saturate_cast<Data_t>(c_ref_d[i]);
 
-    write_hex_file(prefix + "a.hex", a);
-    write_hex_file(prefix + "b.hex", b);
-    write_hex_file(prefix + "c.hex", c_ref);
+    const unsigned a_n = extent(size, outer, a_inc);
+    const unsigned b_n = extent(size, outer, b_inc);
+    write_hex_file(prefix + "a.hex", a.p, a_n);
+    write_hex_file(prefix + "b.hex", b.p, b_n);
+    write_hex_file(prefix + "c.hex", c_ref.data(), (unsigned)c_ref.size());
 
-    std::fprintf(g_manifest, "%d %u %u %u %u %u %s\n",
-                 idx, size, op_code, outer, a_inc, b_inc,
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %s\n",
+                 idx, size, op_code, outer, a_inc, b_inc, act,
                  sanitize_label(label).c_str());
-    std::printf("[DUMP] test_%02d  %-30s  size=%u op=%u outer=%u a_inc=%u b_inc=%u\n",
-                idx, label, size, op_code, outer, a_inc, b_inc);
+    std::printf("[DUMP] test_%02d  %-34s  size=%u op=%u outer=%u a_inc=%u b_inc=%u act=%u\n",
+                idx, label, size, op_code, outer, a_inc, b_inc, act);
 #endif
 }
 
 // ---------------------------------------------------------------------------
-// RunTest — random values across a range that includes overflow.
-// Tolerance: 1 LSB for ap_fixed types; relative 1e-5 for float/double.
+// Generic case runner.
+//
+// Fills a / b with random values for the op, computes the reference over
+// the full c extent (gaps marked don't-care), runs the kernel and checks:
+//   * every valid position matches the reference (1 LSB for ap_fixed,
+//     relative 1e-5 for float);
+//   * the tail lanes of every run's last word (positions [size, ceil8(size))
+//     within the run) read 0 — the contract's op(0, 0);
+//   * every other gap position still holds the pre-fill poison (never
+//     written).
 // ---------------------------------------------------------------------------
-
 struct Range { double lo, hi; };
 
-static Range input_range(Op op) {
+static Range input_range(unsigned op) {
     switch (op) {
         case OP_ADD:
         case OP_SUB:  return { -80.0,  80.0 };   // sums/diffs can exceed ±128
@@ -151,55 +233,80 @@ static Range input_range(Op op) {
     }
 }
 
-static bool RunTest(Op op, const char* opName, unsigned size, unsigned seed) {
+static const Data_t kPoison = Data_t(-77.5);
+
+static bool RunCase(const char* label, unsigned op, unsigned size, unsigned outer,
+                    unsigned a_inc, unsigned b_inc, unsigned act, unsigned seed,
+                    bool verbose = true) {
     std::default_random_engine rng(seed);
     Range ra = input_range(op);
     Range rb = (op == OP_DIV) ? Range{1.0, 10.0} : input_range(op);
     std::uniform_real_distribution<double> distA(ra.lo, ra.hi);
     std::uniform_real_distribution<double> distB(rb.lo, rb.hi);
 
-    std::vector<Data_t> a(size), b(size), c(size);
-    std::vector<double> c_ref(size);
-    for (unsigned i = 0; i < size; ++i) {
-        a[i]     = Data_t(distA(rng));
-        b[i]     = Data_t(distB(rng));
-        c[i]     = Data_t(0);
-        c_ref[i] = ref_op(op, static_cast<double>(a[i]),
-                               static_cast<double>(b[i]));
+    const unsigned c_inc = a_inc + b_inc;
+    const unsigned a_n   = extent(size, outer, a_inc);
+    const unsigned b_n   = extent(size, outer, b_inc);
+    const unsigned c_n   = extent(size, outer, c_inc);
+    const unsigned n_w   = (size + kVecLanes - 1) / kVecLanes;
+
+    // Inputs: data at every position of their extent (gaps included, so an
+    // operand that is read past `size` sees non-zero bytes there).
+    AlignedBuf a(a_n), b(b_n), c(c_n, kPoison);
+    for (unsigned i = 0; i < a.capacity(); ++i) a[i] = Data_t(distA(rng));
+    for (unsigned i = 0; i < b.capacity(); ++i) b[i] = Data_t(distB(rng));
+
+    std::vector<double> c_ref(c_n, 0.0);
+    std::vector<char>   kind(c.capacity(), 'g');   // 'v' valid, 't' tail word, 'g' gap
+    for (unsigned o = 0; o < outer; ++o) {
+        for (unsigned i = 0; i < size; ++i) {
+            const double av = static_cast<double>(a[o * a_inc + i]);
+            const double bv = static_cast<double>(b[o * b_inc + i]);
+            c_ref[o * c_inc + i] = ref_op(op, av, bv, act);
+            kind [o * c_inc + i] = 'v';
+        }
+        for (unsigned i = size; i < n_w * kVecLanes; ++i) {
+            const unsigned pos = o * c_inc + i;
+            if (pos < c.capacity() && kind[pos] != 'v') kind[pos] = 't';
+        }
     }
 
     if (!g_dump_dir.empty()) {
-        dump_one_case(opName, size, static_cast<unsigned>(op),
-                      /*outer*/ 1u, /*a_inc*/ 0u, /*b_inc*/ 0u,
-                      a, b, c_ref);
+        dump_one_case(label, size, op, outer, a_inc, b_inc, act, a, b, c_ref);
         return true;
     }
 
-    VectorOPKernel(a.data(), b.data(), c.data(), size, static_cast<unsigned>(op), 1u, 0u, 0u);
+    run_kernel(a, is_unary(op) ? nullptr : &b, c, size, op, outer, a_inc, b_inc, act);
 
-    const bool isFloat = std::is_floating_point<Data_t>::value;
-    const double absTol = 1.0 / 256.0;
-    const double relTol = 1e-5;
+    const bool   isFloat = std::is_floating_point<Data_t>::value;
+    const double absTol  = 1.0 / 256.0;
+    const double relTol  = 1e-5;
 
     unsigned mismatches = 0;
-    for (unsigned i = 0; i < size; ++i) {
-        const double got  = static_cast<double>(c[i]);
-        const double ref  = c_ref[i];
-        const double diff = std::abs(got - ref);
-        bool bad;
-        if (isFloat) {
-            const double absRef = std::abs(ref);
-            bad = (absRef > 1e-9) ? (diff / absRef > relTol) : (diff > relTol);
+    for (unsigned i = 0; i < c.capacity(); ++i) {
+        const double got = static_cast<double>(c[i]);
+        bool bad = false;
+        double ref = 0.0;
+        if (kind[i] == 'v') {
+            ref = c_ref[i];
+            const double diff = std::abs(got - ref);
+            if (isFloat) {
+                const double absRef = std::abs(ref);
+                bad = (absRef > 1e-9) ? (diff / absRef > relTol) : (diff > relTol);
+            } else {
+                bad = (diff > absTol);
+            }
+        } else if (kind[i] == 't') {
+            bad = (got != 0.0);                     // op(0, 0) == 0 for every op
         } else {
-            bad = (diff > absTol);
+            ref = static_cast<double>(kPoison);
+            bad = (got != ref);                     // gap never written
         }
         if (bad) {
             ++mismatches;
-            if (mismatches <= 3)
-                std::cerr << "  [" << opName << "] MISMATCH at [" << i << "]: "
-                          << "got=" << got << "  ref=" << ref
-                          << "  a=" << static_cast<double>(a[i])
-                          << "  b=" << static_cast<double>(b[i]) << "\n";
+            if (mismatches <= 3 && verbose)
+                std::cerr << "  [" << label << "] MISMATCH at [" << i << "] (" << kind[i] << "): "
+                          << "got=" << got << "  ref=" << ref << "\n";
         }
     }
     return mismatches == 0;
@@ -210,24 +317,17 @@ static bool RunTest(Op op, const char* opName, unsigned size, unsigned seed) {
 //
 // Uses a fixed-size vector so every element receives the same constant values.
 // Comparison tolerance is zero for fixed-point types (ap_fixed results are
-// exact when converted to double) and 1 LSB for float (float rounding can
-// introduce sub-LSB error when the result happens to land on a boundary).
-//
-// Two kinds of cases are tested:
-//   OVERFLOW  — inputs that arithmetically exceed the representable range;
-//               the output must be exactly sat_max or sat_min, not wrapped.
-//   BOUNDARY  — inputs whose result lands exactly at the extreme value or
-//               one LSB inside it; the output must match precisely.
+// exact when converted to double) and 1 LSB for float.
 // ---------------------------------------------------------------------------
-static bool RunSatTest(Op op, double a_val, double b_val, const char* desc) {
+static bool RunSatTest(unsigned op, double a_val, double b_val, const char* desc) {
     static const unsigned kSize = 8;
     static const double   kTol  = std::is_floating_point<Data_t>::value
                                   ? 1.0 / 256.0
                                   : 0.0;
 
-    std::vector<Data_t> a(kSize, Data_t(a_val));
-    std::vector<Data_t> b(kSize, Data_t(b_val));
-    std::vector<Data_t> c(kSize, Data_t(0));
+    AlignedBuf a(kSize, Data_t(a_val));
+    AlignedBuf b(kSize, Data_t(b_val));
+    AlignedBuf c(kSize, Data_t(0));
 
     // Reference uses the same saturate-cast semantics as the kernel.
     const double expected = ref_op(op,
@@ -236,13 +336,11 @@ static bool RunSatTest(Op op, double a_val, double b_val, const char* desc) {
 
     if (!g_dump_dir.empty()) {
         std::vector<double> c_ref(kSize, expected);
-        dump_one_case(desc, kSize, static_cast<unsigned>(op),
-                      /*outer*/ 1u, /*a_inc*/ 0u, /*b_inc*/ 0u,
-                      a, b, c_ref);
+        dump_one_case(desc, kSize, op, 1u, 0u, 0u, ACT_NONE, a, b, c_ref);
         return true;
     }
 
-    VectorOPKernel(a.data(), b.data(), c.data(), kSize, static_cast<unsigned>(op), 1u, 0u, 0u);
+    run_kernel(a, is_unary(op) ? nullptr : &b, c, kSize, op, 1u, 0u, 0u, ACT_NONE);
 
     bool ok = true;
     for (unsigned i = 0; i < kSize; ++i) {
@@ -269,79 +367,51 @@ static bool RunSatTest(Op op, double a_val, double b_val, const char* desc) {
 // One LSB of ap_fixed<16,8> = 1/256 = 0.00390625.
 // MAX =  127.99609375 = 0x7FFF.
 // MIN = -128.0        = 0x8000.
-//
-// Each row:  op, a, b, description
-//
-// OVERFLOW tests:  arithmetic result is well outside the representable range;
-//                  the kernel must clamp, not wrap.
-//
-// BOUNDARY tests:  result lands exactly at MAX/MIN or one LSB away, probing
-//                  the precise edge of the saturation logic.
-//
-// NO-SAT tests:    inputs that produce a result within range; confirm that
-//                  clamping does NOT fire when it shouldn't.
-//
-// RELU/RELU6:      clipping at 0 and 6 — probed at ±1 LSB around each fence.
 // ---------------------------------------------------------------------------
 struct SatEntry {
-    Op          op;
+    unsigned    op;
     double      a, b;
     const char* desc;
 };
 
 static const SatEntry kSatTests[] = {
     // ── ADD ─────────────────────────────────────────────────────────────────
-    // overflow →  sat_max
     { OP_ADD,  100.0,          100.0,         "ADD  100+100=200    → sat_max" },
     { OP_ADD,   64.0,           64.0,         "ADD   64+64=128     → sat_max" },
     { OP_ADD,  127.99609375,     0.00390625,  "ADD  max+1LSB=128   → sat_max" },
-    // overflow →  sat_min
     { OP_ADD, -100.0,          -100.0,        "ADD -100-100=-200   → sat_min" },
     { OP_ADD, -128.0,            -0.00390625, "ADD  min-1LSB       → sat_min" },
-    // result exactly at boundary (no saturation should fire)
     { OP_ADD,   64.0,           63.99609375,  "ADD   64+63.996=max (no clip)" },
     { OP_ADD,  -64.0,          -64.0,         "ADD  -64-64=-128=min (no clip)" },
 
     // ── SUB ─────────────────────────────────────────────────────────────────
-    // overflow →  sat_max
     { OP_SUB,  100.0,          -100.0,        "SUB  100-(-100)=200 → sat_max" },
     { OP_SUB,  127.99609375,    -0.00390625,  "SUB  max-(-1LSB)    → sat_max" },
-    // overflow →  sat_min
     { OP_SUB, -100.0,           100.0,        "SUB -100-100=-200   → sat_min" },
     { OP_SUB, -128.0,             0.00390625, "SUB  min-1LSB       → sat_min" },
 
     // ── MUL ─────────────────────────────────────────────────────────────────
-    // overflow →  sat_max  (positive × positive)
     { OP_MUL,   16.0,           16.0,         "MUL  16×16=256      → sat_max" },
     { OP_MUL,   12.0,           12.0,         "MUL  12×12=144      → sat_max" },
-    // overflow →  sat_max  (negative × negative)
     { OP_MUL,  -16.0,          -16.0,         "MUL -16×-16=256     → sat_max" },
-    // overflow →  sat_min  (positive × negative)
     { OP_MUL,  -16.0,           16.0,         "MUL -16×16=-256     → sat_min" },
-    // result within range (no saturation should fire)
     { OP_MUL,   11.0,           11.0,         "MUL  11×11=121 (no clip)"      },
 
     // ── RELU  (clipping at 0) ────────────────────────────────────────────────
-    // just below 0 → 0
     { OP_RELU,  -0.00390625,     0.0,         "RELU -1LSB → 0"                },
     { OP_RELU,  -1.0,            0.0,         "RELU -1.0  → 0"                },
-    // exactly 0 → 0
     { OP_RELU,   0.0,            0.0,         "RELU  0    → 0"                },
-    // just above 0 → pass through
     { OP_RELU,   0.00390625,     0.0,         "RELU +1LSB → +1LSB (no clip)"  },
     { OP_RELU,   3.5,            0.0,         "RELU  3.5  → 3.5 (no clip)"    },
 
     // ── RELU6 (clipping at 0 and 6) ─────────────────────────────────────────
-    // below 0 → 0
     { OP_RELU6, -1.0,            0.0,         "RELU6 -1    → 0"               },
     { OP_RELU6, -0.00390625,     0.0,         "RELU6 -1LSB → 0"               },
-    // in range [0, 6] → pass through
     { OP_RELU6,  0.0,            0.0,         "RELU6  0    → 0 (no clip)"     },
     { OP_RELU6,  0.00390625,     0.0,         "RELU6 +1LSB → +1LSB (no clip)" },
     { OP_RELU6,  3.0,            0.0,         "RELU6  3.0  → 3.0 (no clip)"   },
     { OP_RELU6,  5.99609375,     0.0,         "RELU6  6-1LSB → 6-1LSB (no clip)" },
     { OP_RELU6,  6.0,            0.0,         "RELU6  6.0  → 6.0 (no clip)"   },
-    // above 6 → 6
     { OP_RELU6,  6.00390625,     0.0,         "RELU6  6+1LSB → 6"             },
     { OP_RELU6,  8.0,            0.0,         "RELU6  8    → 6"               },
     { OP_RELU6, 20.0,            0.0,         "RELU6 20    → 6"               },
@@ -364,84 +434,72 @@ static bool RunSatTests() {
 }
 
 // ---------------------------------------------------------------------------
-// RunBroadcastTests — verify the outer/a_inc/b_inc broadcasting path.
+// Geometry / activation table — broadcast, stride-0, flattened-loop and
+// act cases (all dumped as RTL fixtures too).
 //
-// Two cases are tested:
-//   a_advances: a strides through the output by a_inc per outer step;
-//               b repeats at offset 0 each step (b_inc=0).
-//   b_advances: b strides through the output; a repeats (a_inc=0).
+//   inc == size on whole words → one contiguous stream (fast path);
+//   inc == 0, <= 2048 elements → replay buffer; > 2048 → re-read per run;
+//   otherwise separately requested runs with the tail lanes masked.
 // ---------------------------------------------------------------------------
-static bool RunBroadcastTests() {
+struct GeomEntry {
+    unsigned    op;
+    unsigned    size, outer, a_inc, b_inc, act;
+    const char* desc;
+};
+
+static const GeomEntry kGeomTests[] = {
+    // Broadcast: chunk 12 at stride 16 (masked tail word, 1 piece per run)
+    { OP_ADD,   12,    5,  16,    0, ACT_NONE,  "bcast_b chunk12 stride16 ADD"          },
+    { OP_MUL,   12,    5,   0,   16, ACT_NONE,  "bcast_a chunk12 stride16 MUL"          },
+    { OP_SUB,   13,    9,  16,    0, ACT_NONE,  "bcast_b chunk13 stride16 SUB"          },
+    { OP_DIV,    9,    4,   0,   16, ACT_NONE,  "bcast_a chunk9 stride16 DIV"           },
+    // Contiguous outer loop (inc == size): 1000 x 16 (the dw chunk-16 pattern)
+    { OP_MUL,   16, 1000,  16,    0, ACT_NONE,  "outer1000 x size16 MUL"                },
+    { OP_ADD,   16, 1000,   0,   16, ACT_NONE,  "outer1000 x size16 ADD a-bcast"        },
+    // Stride-0 operand at / past the replay-buffer bound
+    { OP_ADD, 2048,    3,   0, 2048, ACT_NONE,  "stride0 a 2048 (replay max)"           },
+    { OP_SUB, 2100,    3,   0, 2104, ACT_NONE,  "stride0 a 2100 (> replay, re-read)"    },
+    { OP_MUL, 2100,    3, 2104,   0, ACT_NONE,  "stride0 b 2100 (> replay, re-read)"    },
+    // Multi-piece runs (> 64 read words / > 256 write words per run)
+    { OP_ADD, 1000,    3, 1008,   0, ACT_NONE,  "size1000 stride1008 (2 read pieces)"   },
+    { OP_SUB, 3000,    2,   0, 3008, ACT_NONE,  "size3000 stride3008 (2 write pieces)"  },
+    // Unary with an outer loop (c_inc == a_inc)
+    { OP_RELU,  12,    4,  16,    0, ACT_NONE,  "unary bcast-shaped RELU"               },
+    { OP_RELU6, 20,    3,  24,    0, ACT_NONE,  "unary outer3 size20 RELU6"             },
+    // Long contiguous runs: > 16 x 256 words (§2.30 bound), 40000 elements
+    { OP_ADD, 40000,   1,   0,    0, ACT_NONE,  "run 5000 words ADD"                    },
+    { OP_RELU,40000,   1,   0,    0, ACT_NONE,  "run 5000 words RELU"                   },
+    // Fused activation
+    { OP_ADD,  255,    1,   0,    0, ACT_RELU,  "ADD + act RELU"                        },
+    { OP_ADD, 1023,    1,   0,    0, ACT_RELU6, "ADD + act RELU6"                       },
+    { OP_SUB,   64,    1,   0,    0, ACT_RELU,  "SUB + act RELU"                        },
+    { OP_MUL,   12,    5,  16,    0, ACT_RELU6, "MUL bcast + act RELU6"                 },
+    { OP_DIV,  100,    1,   0,    0, ACT_RELU6, "DIV + act RELU6"                       },
+    { OP_RELU,  33,    1,   0,    0, ACT_RELU6, "RELU + act RELU6"                      },
+    { OP_ADD,   16, 1000,   0,   16, ACT_RELU,  "outer1000 x size16 ADD + act RELU"     },
+};
+
+static bool RunGeomTests(unsigned seed_base) {
+    const unsigned n = sizeof(kGeomTests) / sizeof(kGeomTests[0]);
     bool allPassed = true;
-    std::cout << "\n--- Broadcast tests (2) ---\n";
 
-    // Case 1: a advances (a_inc=size), b repeats (b_inc=0)
-    // outer=2, size=4 → c[8]; a[8] strides, b[4] repeats, OP_ADD
-    {
-        const unsigned outer = 2, size = 4;
-        std::vector<Data_t> a = {
-            Data_t(1), Data_t(2), Data_t(3), Data_t(4),
-            Data_t(5), Data_t(6), Data_t(7), Data_t(8)
-        };
-        std::vector<Data_t> b = { Data_t(1), Data_t(1), Data_t(1), Data_t(1) };
-        std::vector<Data_t> c(8, Data_t(0));
-        VectorOPKernel(a.data(), b.data(), c.data(), size, OP_ADD, outer, size, 0u);
-
-        bool ok = true;
-        for (unsigned o = 0; o < outer; ++o) {
-            for (unsigned i = 0; i < size; ++i) {
-                const double got = static_cast<double>(c[o * size + i]);
-                const double exp = ref_op(OP_ADD,
-                                          static_cast<double>(a[o * size + i]),
-                                          static_cast<double>(b[i]));
-                if (std::abs(got - exp) > 1.0 / 256.0) {
-                    std::cerr << "  a_advances FAIL c[" << o*size+i << "]: "
-                              << "got=" << got << " exp=" << exp << "\n";
-                    ok = false;
-                }
-            }
-        }
-        std::cout << "[1/2] a_advances outer=2 size=4 OP_ADD ... "
-                  << (ok ? "PASS" : "FAIL") << "\n";
+    std::cout << "\n--- Geometry / activation tests (" << n << ") ---\n";
+    for (unsigned i = 0; i < n; ++i) {
+        const GeomEntry& t = kGeomTests[i];
+        std::cout << "[" << (i + 1) << "/" << n << "] " << t.desc
+                  << " ... " << std::flush;
+        const bool ok = RunCase(t.desc, t.op, t.size, t.outer,
+                                t.a_inc, t.b_inc, t.act, seed_base + i);
+        std::cout << (ok ? "PASS" : "FAIL") << "\n";
         allPassed &= ok;
     }
-
-    // Case 2: b advances (b_inc=size), a repeats (a_inc=0)
-    // outer=3, size=4 → c[12]; a[4] repeats, b[12] strides, OP_MUL
-    {
-        const unsigned outer = 3, size = 4;
-        std::vector<Data_t> a = { Data_t(2), Data_t(2), Data_t(2), Data_t(2) };
-        std::vector<Data_t> b;
-        for (int i = 0; i < 12; ++i) b.push_back(Data_t(i + 1));
-        std::vector<Data_t> c(12, Data_t(0));
-        VectorOPKernel(a.data(), b.data(), c.data(), size, OP_MUL, outer, 0u, size);
-
-        bool ok = true;
-        for (unsigned o = 0; o < outer; ++o) {
-            for (unsigned i = 0; i < size; ++i) {
-                const double got = static_cast<double>(c[o * size + i]);
-                const double exp = ref_op(OP_MUL,
-                                          static_cast<double>(a[i]),
-                                          static_cast<double>(b[o * size + i]));
-                if (std::abs(got - exp) > 1.0 / 256.0) {
-                    std::cerr << "  b_advances FAIL c[" << o*size+i << "]: "
-                              << "got=" << got << " exp=" << exp << "\n";
-                    ok = false;
-                }
-            }
-        }
-        std::cout << "[2/2] b_advances outer=3 size=4 OP_MUL ... "
-                  << (ok ? "PASS" : "FAIL") << "\n";
-        allPassed &= ok;
-    }
-
     return allPassed;
 }
 
 // ---------------------------------------------------------------------------
 // Ops table (used by RunAllTests and single-run mode)
 // ---------------------------------------------------------------------------
-struct OpEntry { Op op; const char* name; };
+struct OpEntry { unsigned op; const char* name; };
 
 static const OpEntry kOps[] = {
     { OP_ADD,   "ADD"   },
@@ -456,7 +514,7 @@ static const OpEntry kOps[] = {
 // Full test suite
 // ---------------------------------------------------------------------------
 static bool RunAllTests() {
-    const unsigned sizes[] = { 1, 8, 64, 256, 1024 };
+    const unsigned sizes[] = { 1, 3, 8, 9, 13, 64, 255, 256, 1023, 1024, 4097 };
     const unsigned nSizes  = sizeof(sizes) / sizeof(sizes[0]);
     const unsigned nOps    = sizeof(kOps)  / sizeof(kOps[0]);
     const unsigned nRandom = nSizes * nOps;
@@ -471,22 +529,19 @@ static bool RunAllTests() {
             std::cout << "[" << idx << "/" << nRandom << "] "
                       << kOps[o].name << "  size=" << sizes[s]
                       << " ... " << std::flush;
-            const bool ok = RunTest(kOps[o].op, kOps[o].name,
-                                    sizes[s], kSeed + idx);
+            const bool ok = RunCase(kOps[o].name, kOps[o].op, sizes[s],
+                                    1u, 0u, 0u, ACT_NONE, kSeed + idx);
             std::cout << (ok ? "PASS" : "FAIL") << "\n";
             allPassed &= ok;
         }
     }
 
     allPassed &= RunSatTests();
-    if (g_dump_dir.empty()) {
-        // Broadcast tests stage their own constants and call the kernel
-        // inline; they're skipped in dump mode.  The HDL testbench can
-        // exercise broadcasting via the random/saturation fixtures.
-        allPassed &= RunBroadcastTests();
-    }
+    allPassed &= RunGeomTests(kSeed + 1000);
 
-    const unsigned nTotal = nRandom + sizeof(kSatTests) / sizeof(kSatTests[0]) + 2u;
+    const unsigned nTotal = nRandom
+                          + sizeof(kSatTests)  / sizeof(kSatTests[0])
+                          + sizeof(kGeomTests) / sizeof(kGeomTests[0]);
     std::cout << "\n"
               << (allPassed ? "All " : "FAILED — ")
               << nTotal << " tests"
@@ -525,7 +580,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(g_manifest,
             "# VectorOPKernel test fixture manifest\n"
-            "# idx size op outer a_inc b_inc label\n");
+            "# idx size op outer a_inc b_inc act label\n");
 
         std::cout << "VectorOP test data dump → " << g_dump_dir << "\n";
         const bool ok = RunAllTests();
@@ -545,7 +600,8 @@ int main(int argc, char** argv) {
         }
         std::cout << "Single test: op=" << kOps[opCode].name
                   << "  size=" << size << "\n";
-        const bool ok = RunTest(kOps[opCode].op, kOps[opCode].name, size, kSeed);
+        const bool ok = RunCase(kOps[opCode].name, kOps[opCode].op, size,
+                                1u, 0u, 0u, ACT_NONE, kSeed);
         std::cout << (ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     }

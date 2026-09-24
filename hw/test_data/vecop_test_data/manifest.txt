@@ -1,63 +1,121 @@
 # VectorOPKernel test fixture manifest
-# idx size op outer a_inc b_inc label
-0 1 0 1 0 0 ADD
-1 8 0 1 0 0 ADD
-2 64 0 1 0 0 ADD
-3 256 0 1 0 0 ADD
-4 1024 0 1 0 0 ADD
-5 1 1 1 0 0 SUB
-6 8 1 1 0 0 SUB
-7 64 1 1 0 0 SUB
-8 256 1 1 0 0 SUB
-9 1024 1 1 0 0 SUB
-10 1 2 1 0 0 MUL
-11 8 2 1 0 0 MUL
-12 64 2 1 0 0 MUL
-13 256 2 1 0 0 MUL
-14 1024 2 1 0 0 MUL
-15 1 3 1 0 0 DIV
-16 8 3 1 0 0 DIV
-17 64 3 1 0 0 DIV
-18 256 3 1 0 0 DIV
-19 1024 3 1 0 0 DIV
-20 1 4 1 0 0 RELU
-21 8 4 1 0 0 RELU
-22 64 4 1 0 0 RELU
-23 256 4 1 0 0 RELU
-24 1024 4 1 0 0 RELU
-25 1 5 1 0 0 RELU6
-26 8 5 1 0 0 RELU6
-27 64 5 1 0 0 RELU6
-28 256 5 1 0 0 RELU6
-29 1024 5 1 0 0 RELU6
-30 8 0 1 0 0 ADD__100_100_200________sat_max
-31 8 0 1 0 0 ADD___64_64_128_________sat_max
-32 8 0 1 0 0 ADD__max_1LSB_128_______sat_max
-33 8 0 1 0 0 ADD_-100-100_-200_______sat_min
-34 8 0 1 0 0 ADD__min-1LSB___________sat_min
-35 8 0 1 0 0 ADD___64_63_996_max__no_clip_
-36 8 0 1 0 0 ADD__-64-64_-128_min__no_clip_
-37 8 1 1 0 0 SUB__100-_-100__200_____sat_max
-38 8 1 1 0 0 SUB__max-_-1LSB_________sat_max
-39 8 1 1 0 0 SUB_-100-100_-200_______sat_min
-40 8 1 1 0 0 SUB__min-1LSB___________sat_min
-41 8 2 1 0 0 MUL__16__16_256__________sat_max
-42 8 2 1 0 0 MUL__12__12_144__________sat_max
-43 8 2 1 0 0 MUL_-16__-16_256_________sat_max
-44 8 2 1 0 0 MUL_-16__16_-256_________sat_min
-45 8 2 1 0 0 MUL__11__11_121__no_clip_
-46 8 4 1 0 0 RELU_-1LSB_____0
-47 8 4 1 0 0 RELU_-1_0______0
-48 8 4 1 0 0 RELU__0________0
-49 8 4 1 0 0 RELU__1LSB______1LSB__no_clip_
-50 8 4 1 0 0 RELU__3_5______3_5__no_clip_
-51 8 5 1 0 0 RELU6_-1________0
-52 8 5 1 0 0 RELU6_-1LSB_____0
-53 8 5 1 0 0 RELU6__0________0__no_clip_
-54 8 5 1 0 0 RELU6__1LSB______1LSB__no_clip_
-55 8 5 1 0 0 RELU6__3_0______3_0__no_clip_
-56 8 5 1 0 0 RELU6__6-1LSB_____6-1LSB__no_clip_
-57 8 5 1 0 0 RELU6__6_0______6_0__no_clip_
-58 8 5 1 0 0 RELU6__6_1LSB_____6
-59 8 5 1 0 0 RELU6__8________6
-60 8 5 1 0 0 RELU6_20________6
+# idx size op outer a_inc b_inc act label
+0 1 0 1 0 0 0 ADD
+1 3 0 1 0 0 0 ADD
+2 8 0 1 0 0 0 ADD
+3 9 0 1 0 0 0 ADD
+4 13 0 1 0 0 0 ADD
+5 64 0 1 0 0 0 ADD
+6 255 0 1 0 0 0 ADD
+7 256 0 1 0 0 0 ADD
+8 1023 0 1 0 0 0 ADD
+9 1024 0 1 0 0 0 ADD
+10 4097 0 1 0 0 0 ADD
+11 1 1 1 0 0 0 SUB
+12 3 1 1 0 0 0 SUB
+13 8 1 1 0 0 0 SUB
+14 9 1 1 0 0 0 SUB
+15 13 1 1 0 0 0 SUB
+16 64 1 1 0 0 0 SUB
+17 255 1 1 0 0 0 SUB
+18 256 1 1 0 0 0 SUB
+19 1023 1 1 0 0 0 SUB
+20 1024 1 1 0 0 0 SUB
+21 4097 1 1 0 0 0 SUB
+22 1 2 1 0 0 0 MUL
+23 3 2 1 0 0 0 MUL
+24 8 2 1 0 0 0 MUL
+25 9 2 1 0 0 0 MUL
+26 13 2 1 0 0 0 MUL
+27 64 2 1 0 0 0 MUL
+28 255 2 1 0 0 0 MUL
+29 256 2 1 0 0 0 MUL
+30 1023 2 1 0 0 0 MUL
+31 1024 2 1 0 0 0 MUL
+32 4097 2 1 0 0 0 MUL
+33 1 3 1 0 0 0 DIV
+34 3 3 1 0 0 0 DIV
+35 8 3 1 0 0 0 DIV
+36 9 3 1 0 0 0 DIV
+37 13 3 1 0 0 0 DIV
+38 64 3 1 0 0 0 DIV
+39 255 3 1 0 0 0 DIV
+40 256 3 1 0 0 0 DIV
+41 1023 3 1 0 0 0 DIV
+42 1024 3 1 0 0 0 DIV
+43 4097 3 1 0 0 0 DIV
+44 1 4 1 0 0 0 RELU
+45 3 4 1 0 0 0 RELU
+46 8 4 1 0 0 0 RELU
+47 9 4 1 0 0 0 RELU
+48 13 4 1 0 0 0 RELU
+49 64 4 1 0 0 0 RELU
+50 255 4 1 0 0 0 RELU
+51 256 4 1 0 0 0 RELU
+52 1023 4 1 0 0 0 RELU
+53 1024 4 1 0 0 0 RELU
+54 4097 4 1 0 0 0 RELU
+55 1 5 1 0 0 0 RELU6
+56 3 5 1 0 0 0 RELU6
+57 8 5 1 0 0 0 RELU6
+58 9 5 1 0 0 0 RELU6
+59 13 5 1 0 0 0 RELU6
+60 64 5 1 0 0 0 RELU6
+61 255 5 1 0 0 0 RELU6
+62 256 5 1 0 0 0 RELU6
+63 1023 5 1 0 0 0 RELU6
+64 1024 5 1 0 0 0 RELU6
+65 4097 5 1 0 0 0 RELU6
+66 8 0 1 0 0 0 ADD__100_100_200________sat_max
+67 8 0 1 0 0 0 ADD___64_64_128_________sat_max
+68 8 0 1 0 0 0 ADD__max_1LSB_128_______sat_max
+69 8 0 1 0 0 0 ADD_-100-100_-200_______sat_min
+70 8 0 1 0 0 0 ADD__min-1LSB___________sat_min
+71 8 0 1 0 0 0 ADD___64_63_996_max__no_clip_
+72 8 0 1 0 0 0 ADD__-64-64_-128_min__no_clip_
+73 8 1 1 0 0 0 SUB__100-_-100__200_____sat_max
+74 8 1 1 0 0 0 SUB__max-_-1LSB_________sat_max
+75 8 1 1 0 0 0 SUB_-100-100_-200_______sat_min
+76 8 1 1 0 0 0 SUB__min-1LSB___________sat_min
+77 8 2 1 0 0 0 MUL__16__16_256__________sat_max
+78 8 2 1 0 0 0 MUL__12__12_144__________sat_max
+79 8 2 1 0 0 0 MUL_-16__-16_256_________sat_max
+80 8 2 1 0 0 0 MUL_-16__16_-256_________sat_min
+81 8 2 1 0 0 0 MUL__11__11_121__no_clip_
+82 8 4 1 0 0 0 RELU_-1LSB_____0
+83 8 4 1 0 0 0 RELU_-1_0______0
+84 8 4 1 0 0 0 RELU__0________0
+85 8 4 1 0 0 0 RELU__1LSB______1LSB__no_clip_
+86 8 4 1 0 0 0 RELU__3_5______3_5__no_clip_
+87 8 5 1 0 0 0 RELU6_-1________0
+88 8 5 1 0 0 0 RELU6_-1LSB_____0
+89 8 5 1 0 0 0 RELU6__0________0__no_clip_
+90 8 5 1 0 0 0 RELU6__1LSB______1LSB__no_clip_
+91 8 5 1 0 0 0 RELU6__3_0______3_0__no_clip_
+92 8 5 1 0 0 0 RELU6__6-1LSB_____6-1LSB__no_clip_
+93 8 5 1 0 0 0 RELU6__6_0______6_0__no_clip_
+94 8 5 1 0 0 0 RELU6__6_1LSB_____6
+95 8 5 1 0 0 0 RELU6__8________6
+96 8 5 1 0 0 0 RELU6_20________6
+97 12 0 5 16 0 0 bcast_b_chunk12_stride16_ADD
+98 12 2 5 0 16 0 bcast_a_chunk12_stride16_MUL
+99 13 1 9 16 0 0 bcast_b_chunk13_stride16_SUB
+100 9 3 4 0 16 0 bcast_a_chunk9_stride16_DIV
+101 16 2 1000 16 0 0 outer1000_x_size16_MUL
+102 16 0 1000 0 16 0 outer1000_x_size16_ADD_a-bcast
+103 2048 0 3 0 2048 0 stride0_a_2048__replay_max_
+104 2100 1 3 0 2104 0 stride0_a_2100____replay__re-read_
+105 2100 2 3 2104 0 0 stride0_b_2100____replay__re-read_
+106 1000 0 3 1008 0 0 size1000_stride1008__2_read_pieces_
+107 3000 1 2 0 3008 0 size3000_stride3008__2_write_pieces_
+108 12 4 4 16 0 0 unary_bcast-shaped_RELU
+109 20 5 3 24 0 0 unary_outer3_size20_RELU6
+110 40000 0 1 0 0 0 run_5000_words_ADD
+111 40000 4 1 0 0 0 run_5000_words_RELU
+112 255 0 1 0 0 1 ADD___act_RELU
+113 1023 0 1 0 0 2 ADD___act_RELU6
+114 64 1 1 0 0 1 SUB___act_RELU
+115 12 2 5 16 0 2 MUL_bcast___act_RELU6
+116 100 3 1 0 0 2 DIV___act_RELU6
+117 33 4 1 0 0 2 RELU___act_RELU6
+118 16 0 1000 0 16 1 outer1000_x_size16_ADD___act_RELU
