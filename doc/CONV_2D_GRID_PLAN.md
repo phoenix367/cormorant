@@ -380,6 +380,7 @@ becomes a JSON-knob decision rather than an architecture one.
 | 6b / 7 | §2.29 fused (tile, khi, kwi) loop, all G tiles' accumulators in registers, depthwise straight from the stream | 39/39 RTL, II=1 (lat 6) | 76 k → 63 k | -17.1 % |
 | board fix | §2.30 write requests bounded to one burst (MobileNet v2 / ResNet-18 hung on >8-burst runs) | 40/40 RTL, 126/126 on board, demo correct | — | — |
 | 7 (weights) | §2.32 128-bit weight/bias ports, tile-major `[M][ict][kH][kW][16]` layout packed by the scheduler, one w_cache word per cycle | 40/40 RTL, scheduler 1301/1301 | 63 k → 52.7 k | -3.1 % (fill-bound cases -12…-31 %) |
+| 7 (weights) | §2.34 half tile (8 lanes) for a last ic-tile with ≤ 8 channels | 40/40 RTL, scheduler 1302/1302 | 52.7 k → 51.6 k | -3.5 % (stem -17 %) |
 
 Cumulative after §2.32: **-79.7 %** of the suite's simulated time (42.1 M
 → 8.56 M ns — the suite gained a 40th, 1.6 M-ns case in §2.30); the
@@ -391,9 +392,7 @@ cycle model (§2) stayed within 6 % of RTL at every step and was what
 located both.
 
 Still open from §7: `w_cache` ping-pong (worth ≤ 10–15 % on pixel-rich
-layers now that the fill itself is 8–16× shorter), a half-word weight
-mode for `ic_valid <= 8` (the 3-channel stem lost 16 % to lane padding),
-a min-chunks policy on top of §2.26 so single-chunk layers overlap their
+layers now that the fill itself is 8–16× shorter), a min-chunks policy on top of §2.26 so single-chunk layers overlap their
 write phase, a 2-elements/cycle Phase-3 drain (URAM `RAM_T2P` + 32-bit
 `burst_maxi` writes with byte-enables for odd run starts), and the
 `kTileM` 8 → 16 scale-up.

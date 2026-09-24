@@ -230,13 +230,12 @@ static std::vector<Data_t> pack_conv_weights(const ConvParams& p,
             for (unsigned q = 0; q < p.kh * p.kw; q++)
                 out[m * stride + q] = w[m * p.kh * p.kw + q];
     } else {
-        const unsigned ic_tiles = conv_ic_tiles(p.in_ch);
         for (unsigned m = 0; m < p.out_ch; m++)
             for (unsigned c = 0; c < p.in_ch; c++)
                 for (unsigned khi = 0; khi < p.kh; khi++)
                     for (unsigned kwi = 0; kwi < p.kw; kwi++)
                         out[conv_weight_index(m, c / kTileIC, khi, kwi, c % kTileIC,
-                                              ic_tiles, p.kh, p.kw)]
+                                              p.in_ch, p.kh, p.kw)]
                             = w[((m * p.in_ch + c) * p.kh + khi) * p.kw + kwi];
     }
     return out;

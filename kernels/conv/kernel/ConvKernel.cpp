@@ -884,19 +884,28 @@ static void stream_load_weights(
     const unsigned num_ow_tiles = geom.num_ow_tiles;
 
     // §2.32 packed layout (ConvKernel.h): one (m, ict) slab is
-    // kh*kw*kTileIC contiguous elements = slab_words port beats, and every
-    // kWordsPerWeightVec beats form one WeightVec (all kTileIC ic-lanes of
-    // one kernel position).  Depthwise: one channel is dw_words beats of
-    // kernel positions, emitted as dw_vecs WeightVecs (the last one padded).
-    const unsigned slab_words = kh * kw * kTileIC / kWeightPortElems;
-    const unsigned dw_words   = conv_dw_stride(kh, kw) / kWeightPortElems;
-    const unsigned dw_vecs    = (dw_words + kWordsPerWeightVec - 1) / kWordsPerWeightVec;
+    // kh*kw*lanes contiguous elements = slab_words port beats, and every
+    // lanes/kWeightPortElems beats form one WeightVec (all ic-lanes of one
+    // kernel position; §2.34: the last ic-tile may be a HALF tile of
+    // kWeightPortElems lanes = one beat per position, lanes above it zero).
+    // Depthwise: one channel is dw_words beats of kernel positions, emitted
+    // as dw_vecs WeightVecs (the last one padded).
+    const unsigned per_m_words = conv_weight_per_m(in_ch, kh, kw) / kWeightPortElems;
+    const unsigned last_lanes  = conv_last_tile_lanes(in_ch);
+    const unsigned dw_words    = conv_dw_stride(kh, kw) / kWeightPortElems;
+    const unsigned dw_vecs     = (dw_words + kWordsPerWeightVec - 1) / kWordsPerWeightVec;
 
     for (unsigned ni = 0; ni < batch; ni++) {
       for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
         if (!is_depthwise) {
             // ---- Standard: once per (ni, chunk, ict, ow_tile, mg) ----
             for (unsigned ict = 0; ict < ic_tiles; ict++) {
+                // Half tile (§2.34): one beat per kernel position.
+                const unsigned lanes         = (ict + 1 == ic_tiles) ? last_lanes : kTileIC;
+                const unsigned words_per_pos = lanes / kWeightPortElems;      // 1 or 2
+                const unsigned slab_words    = kh * kw * words_per_pos;
+                const unsigned tile_word_off = ict * kh * kw * kTileIC / kWeightPortElems;
+
               for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
                 for (unsigned mg = 0; mg < num_m_groups; mg++) {
                     const unsigned mt_base = mg * mt_per_group;
@@ -918,16 +927,20 @@ static void stream_load_weights(
                         for (unsigned m1 = 0; m1 < m_valid; m1++) {
                             #pragma HLS PIPELINE II=1
                             const unsigned word_off =
-                                ((m_off + m1) * ic_tiles + ict) * slab_words;
+                                (m_off + m1) * per_m_words + tile_word_off;
                             weight.read_request(word_off, slab_words);
                         }
                         for (unsigned m1 = 0; m1 < m_valid; m1++) {
                             WeightVec v;
                             #pragma HLS aggregate variable=v compact=byte
+                            for (unsigned l = 0; l < kTileIC; l++) {
+                                #pragma HLS UNROLL
+                                v.lane[l] = Data_t(0);   // half tile: upper lanes stay 0
+                            }
+                            unsigned part = 0;
                             for (unsigned w = 0; w < slab_words; w++) {
                                 #pragma HLS PIPELINE II=1
                                 const WeightWord word = weight.read();
-                                const unsigned part = w % kWordsPerWeightVec;
                                 for (unsigned j = 0; j < kWeightPortElems; j++) {
                                     #pragma HLS UNROLL
                                     // Lane (part*kWeightPortElems + j) of the
@@ -942,8 +955,11 @@ static void stream_load_weights(
                                         }
                                     }
                                 }
-                                if (part == kWordsPerWeightVec - 1) {
+                                if (part + 1 == words_per_pos) {
                                     weight_stream.write(v);
+                                    part = 0;
+                                } else {
+                                    part++;
                                 }
                             }
                         }

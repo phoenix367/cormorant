@@ -1359,7 +1359,42 @@ layout.
 
 ---
 
-## 3. Current architecture (post-§2.33)
+### 2.34. Half-tile weight mode for the last ic-tile (≤ 8 lanes)
+
+**Problem.**  §2.32 padded every ic-tile to 16 lanes in DDR.  For the
+3-channel stems that is 5.3× the weight bytes of the logical tensor and
+the `7x7 s2 stem` case got 16 % slower than before the widening; layers
+with `in_ch % 16 ∈ 1..8` (MobileNet v2's 24-channel blocks) paid a
+smaller tax on their last tile.
+
+**Change.**  Only the LAST ic-tile can be a half tile: when its valid
+lane count is ≤ kWeightPortElems (8) it stores 8 lanes per kernel
+position — one port beat — instead of 16 (`conv_last_tile_lanes`,
+`conv_tile_lanes`, `conv_weight_per_m` in ConvKernel.h; every slab base
+stays 16-byte aligned).  `stream_load_weights` derives words-per-position
+(1 or 2) per tile and zeroes the WeightVec's upper lanes for half tiles;
+the consumer is untouched (its ic_valid mask already ignores those
+lanes).  Scheduler packer, C-sim packer and `conv_tb.sv` follow the same
+formula; scheduler 1302/1302 (new full-tile lane-order test).
+
+**Result.** **-302 800 ns (-3.5 %)** over the suite, 40/40 RTL PASS,
+bit-exact.  `7x7 s2 stem` **-17.1 %** (1.309 M → 1.085 M ns — now 3.5 %
+faster than before §2.32 instead of 16 % slower); everything else
+within ±4 %.  Synthesis: no II violations, slack 0.00, BRAM 158, DSP
+248, FF 34.9 k, LUT 47.3 k (+0.9 k for the per-tile word counters).
+
+**On board** (bitstream rebuilt, WNS +1.58 ns): **126/126** scheduler
+models PASS; demo top-1 and logits unchanged; ResNet-18 411 → **402 ms**
+(its 7×7 stem is the one layer this touches), MobileNet v1/v2 unchanged
+at 495 / 434 ms (their stems are a small share).  Cumulative vs the
+original README: **5.0× / 4.3× / 6.1×**.  MNIST demo on the same
+bitstream: convnet 98.92 % at **1.06 ms** (README before: 4.55 ms,
+4.3×), LeNet 97.35 % at **20.6 ms** (55.5 ms, 2.7×); accuracies
+identical.
+
+---
+
+## 3. Current architecture (post-§2.34)
 
 ```mermaid
 flowchart LR

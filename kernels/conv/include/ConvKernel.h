@@ -46,12 +46,19 @@ inline T saturate_cast(From v) {
 // those lanes ADJACENT:
 //
 //   standard (is_depthwise=0), tile-major:
-//     weight[out_ch][ic_tiles][kh][kw][kTileIC]
+//     weight[out_ch][ic_tiles][kh][kw][lanes(ict)]
+//       lanes(ict) = kTileIC, except the LAST tile is a half tile of
+//                    kWeightPortElems lanes when its valid lane count is
+//                    <= kWeightPortElems (conv_last_tile_lanes) — §2.34:
+//                    a 3-channel stem then moves 8 lanes per kernel
+//                    position instead of 16.
 //       elem((m, ict, khi, kwi, ic_l)) =
-//         ((m*ic_tiles + ict)*kh*kw + khi*kw + kwi)*kTileIC + ic_l
+//         m*conv_weight_per_m(in_ch,kh,kw) + ict*kh*kw*kTileIC
+//         + (khi*kw + kwi)*lanes(ict) + ic_l
 //     ic_tiles = ceil(in_ch / kTileIC); lanes ic_l >= in_ch - ict*kTileIC of
 //     the last tile are zero (the kernel masks them anyway).  One
-//     (m, ict) slab is kh*kw*kTileIC contiguous elements = one burst.
+//     (m, ict) slab is kh*kw*lanes(ict) contiguous elements = one burst,
+//     and every slab starts on a port-word boundary.
 //   depthwise (is_depthwise=1):
 //     weight[out_ch][conv_dw_stride(kh, kw)]
 //       elem((m, khi, kwi)) = m*conv_dw_stride + khi*kw + kwi
@@ -88,14 +95,27 @@ inline unsigned conv_round_up(unsigned v, unsigned q) { return ((v + q - 1) / q)
 inline unsigned conv_ic_tiles(unsigned in_ch)          { return (in_ch + kTileIC - 1) / kTileIC; }
 inline unsigned conv_dw_stride(unsigned kh, unsigned kw){ return conv_round_up(kh * kw, kWeightPortElems); }
 inline unsigned conv_bias_numel(unsigned out_ch)       { return conv_round_up(out_ch, kWeightPortElems); }
+// Lanes stored per kernel position in the LAST ic-tile (§2.34 half tile).
+inline unsigned conv_last_tile_lanes(unsigned in_ch) {
+    const unsigned rem = in_ch - (conv_ic_tiles(in_ch) - 1) * kTileIC;   // 1..kTileIC
+    return (rem <= kWeightPortElems) ? kWeightPortElems : kTileIC;
+}
+inline unsigned conv_tile_lanes(unsigned in_ch, unsigned ict) {
+    return (ict + 1 == conv_ic_tiles(in_ch)) ? conv_last_tile_lanes(in_ch) : kTileIC;
+}
+// Elements per output channel m in the packed standard layout.
+inline unsigned conv_weight_per_m(unsigned in_ch, unsigned kh, unsigned kw) {
+    return kh * kw * ((conv_ic_tiles(in_ch) - 1) * kTileIC + conv_last_tile_lanes(in_ch));
+}
 inline unsigned conv_weight_numel(unsigned out_ch, unsigned in_ch,
                                   unsigned kh, unsigned kw, bool is_depthwise) {
     return is_depthwise ? out_ch * conv_dw_stride(kh, kw)
-                        : out_ch * conv_ic_tiles(in_ch) * kh * kw * kTileIC;
+                        : out_ch * conv_weight_per_m(in_ch, kh, kw);
 }
 inline unsigned conv_weight_index(unsigned m, unsigned ict, unsigned khi, unsigned kwi,
-                                  unsigned ic_l, unsigned ic_tiles, unsigned kh, unsigned kw) {
-    return ((m * ic_tiles + ict) * kh * kw + khi * kw + kwi) * kTileIC + ic_l;
+                                  unsigned ic_l, unsigned in_ch, unsigned kh, unsigned kw) {
+    return m * conv_weight_per_m(in_ch, kh, kw) + ict * kh * kw * kTileIC
+         + (khi * kw + kwi) * conv_tile_lanes(in_ch, ict) + ic_l;
 }
 
 // Data_t <-> raw lane bits (the byte image the port carries).

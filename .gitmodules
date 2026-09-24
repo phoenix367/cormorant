@@ -1,8 +1,8 @@
 [submodule "hw/cormorant_hw_128"]
 	path = hw/cormorant_hw_128
-	url = git@github.com:GradeBuilderSL/cormorant_hw_128.git
+	url = git@github.com:phoenix367/cormorant_hw_128.git
 	branch = main
 [submodule "hw/cormorant_test_stand"]
 	path = hw/cormorant_test_stand
-	url = git@github.com:GradeBuilderSL/cormorant_test_stand.git
+	url = git@github.com:phoenix367/cormorant_test_stand.git
 	branch = main

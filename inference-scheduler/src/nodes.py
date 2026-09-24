@@ -888,8 +888,9 @@ from ._conv_hw_config import (  # noqa: E402
 # fills one 16-input-channel-lane cache word per beat pair, so the lanes of
 # a kernel position must be adjacent in DDR:
 #
-#   standard : weight[M][ceil(C/16)][kH][kW][16]   (lanes >= C of the last
-#              tile are zero)
+#   standard : weight[M][ceil(C/16)][kH][kW][lanes]  — 16 lanes per tile,
+#              except the LAST tile is a half tile of 8 lanes when it has
+#              <= 8 valid channels (§2.34); lanes >= C are zero
 #   depthwise: weight[M][roundup(kH*kW, 8)]
 #   bias     : bias[roundup(M, 8)]
 #
@@ -909,12 +910,21 @@ def _pack_conv_weight(t: TensorInfo, out_ch: int, in_ch: int,
     else:
         tile     = CONV_TILE_IC
         ic_tiles = -(-in_ch // tile)
-        wide = np.zeros((out_ch, ic_tiles * tile, kh, kw), dtype=w.dtype)
-        wide[:, :in_ch] = w.reshape(out_ch, in_ch, kh, kw)
-        # [M][C_pad][kH][kW] -> [M][ict][ic_l][kH][kW] -> [M][ict][kH][kW][ic_l]
-        packed = wide.reshape(out_ch, ic_tiles, tile, kh, kw).transpose(0, 1, 3, 4, 2)
-        t.packed_note = (f"ConvKernel tile-major [M][ceil(C/{tile})][kH][kW][{tile}]"
-                         f" = [{out_ch}][{ic_tiles}][{kh}][{kw}][{tile}]")
+        last_rem   = in_ch - (ic_tiles - 1) * tile          # 1..tile
+        last_lanes = lanes if last_rem <= lanes else tile   # §2.34 half tile
+        w4 = w.reshape(out_ch, in_ch, kh, kw)
+        per_m = kh * kw * ((ic_tiles - 1) * tile + last_lanes)
+        packed = np.zeros((out_ch, per_m), dtype=w.dtype)
+        for ict in range(ic_tiles):
+            t_lanes = last_lanes if ict == ic_tiles - 1 else tile
+            c0, c1 = ict * tile, min(in_ch, (ict + 1) * tile)
+            blk = np.zeros((out_ch, kh, kw, t_lanes), dtype=w.dtype)
+            # [M][c][kH][kW] -> [M][kH][kW][ic_l]
+            blk[:, :, :, :c1 - c0] = w4[:, c0:c1].transpose(0, 2, 3, 1)
+            base = ict * kh * kw * tile
+            packed[:, base:base + kh * kw * t_lanes] = blk.reshape(out_ch, -1)
+        t.packed_note = (f"ConvKernel tile-major [M][ceil(C/{tile})][kH][kW][lanes]"
+                         f" = [{out_ch}][{ic_tiles}][{kh}][{kw}][{tile}|{last_lanes} last]")
     t.packed_data = np.ascontiguousarray(packed).reshape(-1)
 
 

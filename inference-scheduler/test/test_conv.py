@@ -786,28 +786,40 @@ class TestConvTwoLayerVGG(unittest.TestCase):
 
     def test_w1_packed_layout_size(self):
         # W1[64,3,3,3] is 1 728 logical elements, but ConvKernel's packed
-        # tile-major layout pads the 3 input channels to one 16-lane tile:
-        # 64 * 1 * 3 * 3 * 16 = 9 216 elements (> LARGE_WEIGHT_THRESHOLD, so
-        # it is now externalised to weights/W1.dat).  The logical shape is
-        # untouched (the simulator keeps using it).
-        from src._conv_hw_config import CONV_TILE_IC
+        # tile-major layout pads the 3 input channels to one HALF tile of 8
+        # lanes (§2.34): 64 * 1 * 3 * 3 * 8 = 4 608 elements
+        # (> LARGE_WEIGHT_THRESHOLD, so it is externalised to weights/W1.dat).
+        # The logical shape is untouched (the simulator keeps using it).
+        from src._conv_hw_config import CONV_WEIGHT_PORT_ELEMS
         w1 = next(t for t in self.graph.weight_tensors if t.onnx_name == "W1")
         self.assertEqual(w1.shape, [64, 3, 3, 3])
-        self.assertEqual(w1.numel, 64 * 1 * 3 * 3 * CONV_TILE_IC)
+        self.assertEqual(w1.numel, 64 * 1 * 3 * 3 * CONV_WEIGHT_PORT_ELEMS)
         self.assertIsNotNone(w1.packed_data)
         names = [t.onnx_name for t in self.gen.large_weight_tensors]
         self.assertIn("W1", names)
 
     def test_w1_packed_lane_order(self):
         # packed[(m, ict, khi, kwi, ic_l)] == logical[m, ict*16 + ic_l, khi, kwi],
-        # zero for padded lanes.
-        from src._conv_hw_config import CONV_TILE_IC
+        # zero for padded lanes; W1's single tile is a half tile (8 lanes).
+        from src._conv_hw_config import CONV_WEIGHT_PORT_ELEMS
         w1 = next(t for t in self.graph.weight_tensors if t.onnx_name == "W1")
         logical = w1.data.reshape(64, 3, 3, 3)
-        packed  = w1.packed_data.reshape(64, 1, 3, 3, CONV_TILE_IC)
+        packed  = w1.packed_data.reshape(64, 1, 3, 3, CONV_WEIGHT_PORT_ELEMS)
         for c in range(3):
             self.assertTrue((packed[:, 0, :, :, c] == logical[:, c]).all())
         self.assertTrue((packed[:, 0, :, :, 3:] == 0).all())
+
+    def test_w2_full_tile_lane_order(self):
+        # W2[64,64,3,3]: 4 full 16-lane tiles, no half tile; check a middle
+        # tile's lane order and the per-m stride.
+        from src._conv_hw_config import CONV_TILE_IC
+        w2 = next(t for t in self.graph.weight_tensors if t.onnx_name == "W2")
+        logical = w2.data.reshape(64, 64, 3, 3)
+        self.assertEqual(w2.numel, 64 * 4 * 3 * 3 * CONV_TILE_IC)
+        packed = w2.packed_data.reshape(64, 4, 3, 3, CONV_TILE_IC)
+        for ict in range(4):
+            for c in range(CONV_TILE_IC):
+                self.assertTrue((packed[:, ict, :, :, c] == logical[:, ict * CONV_TILE_IC + c]).all())
 
     # ---- Generated source -----------------------------------------------
 
