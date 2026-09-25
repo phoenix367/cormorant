@@ -283,6 +283,7 @@ class TestRewrite(_ModelDir):
         self.assertEqual(g.nodes[4].inputs[0].onnx_name, "X")  # the Relu still reads X
         src = cg.generate_source()
         self.assertEqual(src.count("*dst++ = s[cc * 2u];"), 1)
+        self.assertEqual(src.count("= (Data_t *)malloc("), 1)
 
     def test_native_space_to_depth(self):
         g, cg = self._gen(self.native, False)
@@ -384,8 +385,25 @@ class TestCodegen(_ModelDir):
         self.assertIn("/* [0] SpaceToDepth(X) -> X_s2d  [1, 3, 16, 16] → [1, 12, 8, 8]"
                       "  blocksize=2  (host CPU reorder, no hardware call) */", src)
         loop = src[src.index("INFERENCE_PROF_BEGIN(0u);"):src.index("INFERENCE_PROF_END(0u);")]
-        self.assertIn("const Data_t *src = inference_buf_ptr(X);", loop)
-        self.assertIn("Data_t       *dst = inference_buf_ptr(X_s2d);", loop)
+        # staged through cached host memory: the DMA (BO) buffers are only
+        # touched by two sequential memcpys, never by the strided loads
+        self.assertIn("const Data_t *src = _s2d_stage_X_s2d;", loop)
+        self.assertIn("Data_t       *dst = _s2d_stage_X_s2d + 768u;", loop)
+        self.assertIn("memcpy(_s2d_stage_X_s2d, inference_buf_ptr(X), 768u * INFERENCE_BYTES_PER_ELEM);", loop)
+        self.assertIn("memcpy(inference_buf_ptr(X_s2d), _s2d_stage_X_s2d + 768u, 768u * INFERENCE_BYTES_PER_ELEM);", loop)
+        self.assertLess(loop.index("memcpy(_s2d_stage_X_s2d,"), loop.index("*dst++"))
+        self.assertLess(loop.index("*dst++"), loop.index("memcpy(inference_buf_ptr(X_s2d)"))
+        self.assertLess(loop.index("memcpy(inference_buf_ptr(X_s2d)"), loop.index("inference_buf_sync_to_device(X_s2d);"))
+        self.assertNotIn("inference_buf_ptr(X)[", loop)
+        self.assertIn("non-cacheable", loop)
+        # the staging block is malloc'd in init and freed in deinit
+        self.assertIn("#include <stdlib.h>", src)
+        self.assertIn("static Data_t *_s2d_stage_X_s2d = NULL;", src)
+        init = src[src.index("int inference_init("):src.index("void inference_deinit(void)")]
+        self.assertIn("_s2d_stage_X_s2d = (Data_t *)malloc(2u * 768u * INFERENCE_BYTES_PER_ELEM);", init)
+        self.assertIn("if (!_s2d_stage_X_s2d) { rc = -1; goto fail; }", init)
+        deinit = src[src.index("void inference_deinit(void)"):]
+        self.assertIn("free(_s2d_stage_X_s2d); _s2d_stage_X_s2d = NULL;", deinit)
         self.assertIn("for (c = 0u; c < 3u; c++)", loop)
         self.assertIn("for (r = 0u; r < 8u; r++) {", loop)
         self.assertIn("const Data_t *s = src + ((n * 3u + c) * 16u + r * 2u + ph) * 16u + pw;", loop)
@@ -408,6 +426,7 @@ class TestCodegen(_ModelDir):
         _, cg0 = self._gen(self.stem7, False)
         _, cg1 = self._gen(self.stem7, True)
         h0, h1 = cg0.generate_header(), cg1.generate_header()
+        self.assertNotIn("<stdlib.h>", cg0.generate_source())   # no host op: no staging
         for h in (h0, h1):
             self.assertIn("#define INFERENCE_X_SIZE", h)
             self.assertIn("768u  /* shape=[1, 3, 16, 16] */", h)

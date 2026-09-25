@@ -47,7 +47,9 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   7×7 stem ran at 3/16 lane utilisation; the rewrite gives it 12 lanes and
   16 taps instead of 49.  The reorder runs on the host CPU as a
   `SpaceToDepthNode` (a C loop inside `inference_run()`, ~150 k elements
-  for 224²); the model's public input stays `[1, C, H, W]`.  Details in
+  for 224², staged through cached host memory because the DMA buffers are
+  mapped non-cacheable — measured 16.3 ms when it read the BO directly);
+  the model's public input stays `[1, C, H, W]`.  Details in
   [§Space-to-depth stem](#space-to-depth-stem) below.  A model that
   already contains an ONNX `SpaceToDepth` node is accepted the same way.
 
@@ -249,6 +251,16 @@ liveness interval starts and ends at that event, so it never shares a
 slot with its source.  Profiling brackets the loop like a synchronous
 node.  The `<W>_s2d` weight goes through the normal ConvNode tile-major
 packing and ROM / `.dat` emission.
+
+The loop never reads the DMA buffers element-wise.  On the KV260 the DMA
+pool is an XRT BO whose CPU mapping is non-cacheable, so the strided
+2-byte source loads of the reorder cost ~100 ns each (16.3 ms for the
+ResNet-18 stem on the board).  `inference_init()` mallocs one cached
+staging block per node (`_s2d_stage_<out>`, 2 × source numel, freed in
+`inference_deinit()`); at run time the node does `memcpy(BO → stage_in)`,
+reorders `stage_in → stage_out` entirely in cached memory, `memcpy(stage_out
+→ BO)` and then `inference_buf_sync_to_device(out)` — the only DMA-memory
+traffic is two wide sequential copies (~0.1–0.3 ms for 300 KB).
 
 ---
 
