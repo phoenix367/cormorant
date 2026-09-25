@@ -60,4 +60,12 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
 
 ## 3. Measured outcome
 
-(to be filled per step)
+- **Step 1 (space-to-depth stem): implemented** on `perf/stem` —
+  scheduler transform `OnnxGraph(s2d_stem=True)` / CLI default, host-side
+  `SpaceToDepthNode`, ResNet-18 stem becomes `SpaceToDepth(2)` + Conv
+  4×4 s1 pad(2,2) 12→64 on 112² (16 taps × 12 of 16 lanes instead of
+  49 taps × 3 lanes; MAC-sweep work ≈ ×0.33 per output pixel).  Expected
+  57 → ~20–27 ms plus ~0.3 ms host reorder; board measurement pending.
+  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
+  typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/INFERENCE_SCHEDULER.md`
+  §Space-to-depth stem.

@@ -113,6 +113,7 @@ The codegen emits a linear stream of events into `inference_run()`:
 ('wait',       kid, drained_idx)    # kernel_wait(KERNEL_*) drains a node
 ('drain',      kid, drained_idx)    # final drain before output cache sync
 ('reshape',    node_idx)            # ReshapeNode (no kernel work)
+('cpu',        node_idx)            # SpaceToDepthNode: host loop, synchronous
 ```
 
 The walker keeps `pending: dict[lane → node_idx]`: which node has been
@@ -347,6 +348,14 @@ self-draining: it emits `start_sync`, then immediately removes the
 target lane from `pending` (it is never observed in flight).
 
 `run_matmul_at` is the **only** synchronous helper today.
+
+A `SpaceToDepthNode` (the space-to-depth stem's host-side reorder) is
+synchronous in the same sense but occupies no lane: it waits on its
+effective predecessors like a kernel start would, emits `('cpu', idx)`,
+runs inline, and is never waited on.  Its `start_event` and `drain_event`
+are the same index (§5), so the tensor it reads is held until the loop
+runs and the tensor it writes becomes live at the same event — the two
+never share a pool slot.
 
 ---
 

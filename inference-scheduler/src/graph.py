@@ -27,12 +27,16 @@ from onnx import shape_inference, TensorProto
 from typing import Union
 from .tensor import TensorInfo
 from .nodes  import (
-    ACT_NONE, _pack_matmul_b, ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
-                     POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SchedulerError)
+    ACT_NONE, _pack_matmul_b, _s2d_stem_geometry, _s2d_stem_weight,
+    ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+    POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SPACE_TO_DEPTH_OP_TYPES,
+    SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
+from ._conv_hw_config import CONV_TILE_IC
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm"} | POOL_OP_TYPES | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES
+    | SPACE_TO_DEPTH_OP_TYPES
 )
 
 
@@ -235,15 +239,198 @@ class OnnxGraph:
         new_model.ir_version = model.ir_version
         return new_model, gemm_counter[0]
 
+    # ------------------------------------------------------------------ #
+    # Space-to-depth stem (ConvKernel IC-lane utilisation)                 #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _space_to_depth_stems(model: onnx.ModelProto):
+        """Rewrite every stride-2 Conv with few input channels as
+        ``SpaceToDepth(blocksize=2)`` + stride-1 Conv over 4x the channels.
+
+        ConvKernel multiplies kTileIC (16) input-channel lanes per cycle, so
+        an RGB stem (ResNet-18: 7x7 s2 p3, 3 -> 64) keeps 3 of 16 lanes busy.
+        Moving the 2x2 stride phase into the channel dimension gives the
+        kernel 4*C lanes and a quarter of the taps:
+
+          x'[n][(ph*2+pw)*C + c][r][cc] = x[n][c][2r+ph][2cc+pw]
+          w'[m][(ph*2+pw)*C + c][R][Cc] = w[m][c][2R+ph+off_h][2Cc+pw+off_w]
+              (zero when the source tap is outside the kh x kw window)
+          K'  = (k - 1 - off) // 2 + 1,   P' = ceil(pad / 2),   off = pad - 2P'
+
+        per axis (``_s2d_stem_geometry``): a stride-1 tap (R, ph) of the
+        new conv with pad P' reads original row 2o + 2R + ph - 2P', i.e.
+        original tap t = 2R + ph + off, so the two convolutions read the
+        same products and the output is bit-for-bit identical (the
+        scheduler's own fixed-point simulation truncates once, after the
+        whole accumulation, in both cases).  7x7 p3 -> 4x4 P'=2 (off -1,
+        one zero tap row/column); 5x5 p2 -> 3x3 P'=1; 3x3 p1 -> 2x2 P'=1.
+        The ONNX ``pads`` of the new conv are [P't, P'l, Pb', Pr'] with the
+        bottom/right values chosen so shape inference reproduces the
+        original output size; ConvKernel only takes pad_top / pad_left and
+        zero-pads bottom/right by its bounds check, which is exactly the
+        implicit-padding semantics the identity above relies on.
+
+        A Conv is rewritten when it has group 1, dilations 1, strides
+        [2, 2], explicit pads (``auto_pad`` absent or NOTSET), a constant
+        4-D weight, a 4-D input of known shape with EVEN H and W (odd sizes
+        are left alone: the ONNX SpaceToDepth op requires divisibility, and
+        the reorder loop stays branch-free), and ``4 * C <= kTileIC`` so the
+        widened channel count still fits one IC tile (C <= 4 on the KV260).
+        The reorder itself runs on the host CPU (``SpaceToDepthNode``); one
+        SpaceToDepth output is shared by every rewritten Conv reading the
+        same tensor.  The weight is appended as a new ``<W>_s2d`` initializer
+        (the original is left for any other consumer), so it flows through
+        the normal ConvNode weight packing / ROM / .dat path.
+
+        Returns ``(rewritten_model, stem_count)``; the model is returned
+        unmodified when nothing qualifies.
+        """
+        graph = model.graph
+        shape_map: Dict[str, List[int]] = {}
+        for init in graph.initializer:
+            shape_map[init.name] = list(init.dims)
+        for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
+            shape_map[vi.name] = _shape_from_type_proto(vi.type)
+        inits = {init.name: init for init in graph.initializer}
+
+        new_nodes:      List[onnx.NodeProto]      = []
+        new_value_info: List[onnx.ValueInfoProto] = []
+        new_inits:      List[onnx.TensorProto]    = []
+        s2d_out_for:  Dict[str, str]   = {}   # x name -> SpaceToDepth output
+        weight_for:   Dict[tuple, str] = {}   # (W, pad_t, pad_l) -> W' name
+        count = 0
+
+        for node in graph.node:
+            geo = OnnxGraph._s2d_stem_candidate(node, shape_map, inits)
+            if geo is None:
+                new_nodes.append(node)
+                continue
+            x, w_name, b_name, y = geo["x"], geo["w"], geo["b"], geo["y"]
+            n_val, c_in, h_in, w_in = shape_map[x]
+            count += 1
+
+            x_s2d = s2d_out_for.get(x)
+            if x_s2d is None:
+                x_s2d = f"{x}_s2d"
+                while x_s2d in shape_map:
+                    x_s2d += "_"
+                s2d_out_for[x] = x_s2d
+                s2d_shape = [n_val, 4 * c_in, h_in // 2, w_in // 2]
+                shape_map[x_s2d] = s2d_shape
+                new_nodes.append(onnx_helper.make_node(
+                    "SpaceToDepth", inputs=[x], outputs=[x_s2d],
+                    name=f"_s2d_stem_{count}", blocksize=2))
+                new_value_info.append(onnx_helper.make_tensor_value_info(
+                    x_s2d, TensorProto.FLOAT, s2d_shape))
+
+            key = (w_name, geo["src_pad_top"], geo["src_pad_left"])
+            w_s2d = weight_for.get(key)
+            if w_s2d is None:
+                w_s2d = f"{w_name}_s2d"
+                while w_s2d in shape_map:
+                    w_s2d += "_"
+                weight_for[key] = w_s2d
+                w_arr = nph.to_array(inits[w_name])
+                w_new = _s2d_stem_weight(w_arr, geo["src_pad_top"], geo["src_pad_left"])
+                new_inits.append(nph.from_array(np.ascontiguousarray(w_new), name=w_s2d))
+                shape_map[w_s2d] = list(w_new.shape)
+
+            conv_inputs = [x_s2d, w_s2d] + ([b_name] if b_name else [])
+            new_nodes.append(onnx_helper.make_node(
+                "Conv", inputs=conv_inputs, outputs=[y], name=node.name,
+                kernel_shape=[geo["kh"], geo["kw"]],
+                strides=[1, 1], dilations=[1, 1], group=1,
+                pads=[geo["pad_top"], geo["pad_left"],
+                      geo["pad_bottom"], geo["pad_right"]]))
+
+        if count == 0:
+            return model, 0
+
+        new_graph = onnx_helper.make_graph(
+            new_nodes,
+            graph.name,
+            list(graph.input),
+            list(graph.output),
+            initializer=list(graph.initializer) + new_inits,
+            value_info=list(graph.value_info) + new_value_info,
+        )
+        new_model = onnx_helper.make_model(
+            new_graph, opset_imports=list(model.opset_import)
+        )
+        new_model.ir_version = model.ir_version
+        return new_model, count
+
+    @staticmethod
+    def _s2d_stem_candidate(node: onnx.NodeProto, shape_map: dict, inits: dict):
+        """Geometry of the rewritten Conv for a qualifying stride-2 stem, or
+        None when ``node`` is left alone (see ``_space_to_depth_stems``)."""
+        if node.op_type != "Conv" or len(node.input) < 2 or not node.output:
+            return None
+        attrs = {a.name: a for a in node.attribute}
+
+        def _ints(name, default):
+            return list(attrs[name].ints) if name in attrs else default
+
+        if (attrs["group"].i if "group" in attrs else 1) != 1:
+            return None
+        if "auto_pad" in attrs and attrs["auto_pad"].s.decode("utf-8") != "NOTSET":
+            return None
+        if _ints("strides", [1, 1]) != [2, 2]:
+            return None
+        if any(d != 1 for d in _ints("dilations", [1, 1])):
+            return None
+        pads = _ints("pads", [0, 0, 0, 0])
+        if len(pads) != 4 or min(pads) < 0:
+            return None
+
+        x, w_name = node.input[0], node.input[1]
+        b_name = node.input[2] if len(node.input) >= 3 and node.input[2] else None
+        y = node.output[0]
+        if w_name not in inits or x not in shape_map or y not in shape_map:
+            return None
+        x_shape, w_shape, y_shape = shape_map[x], list(inits[w_name].dims), shape_map[y]
+        if len(x_shape) != 4 or len(w_shape) != 4 or len(y_shape) != 4:
+            return None
+        if min(x_shape) <= 0 or min(y_shape) <= 0:
+            return None                                  # symbolic dims
+        _, c_in, h_in, w_in = x_shape
+        m_val, c_w, kh, kw = w_shape
+        if c_w != c_in or 4 * c_in > CONV_TILE_IC:
+            return None
+        if h_in % 2 or w_in % 2:
+            return None
+        if _ints("kernel_shape", [kh, kw]) != [kh, kw]:
+            return None
+        _, _, out_h, out_w = y_shape
+
+        kh2, pt2, _ = _s2d_stem_geometry(kh, pads[0])
+        kw2, pl2, _ = _s2d_stem_geometry(kw, pads[1])
+        # bottom / right pads that make ONNX shape inference reproduce the
+        # original out_h / out_w for the stride-1 conv over the H/2 x W/2 map
+        pb2 = out_h - 1 + kh2 - h_in // 2 - pt2
+        pr2 = out_w - 1 + kw2 - w_in // 2 - pl2
+        if pb2 < 0 or pr2 < 0:
+            return None
+        return dict(x=x, w=w_name, b=b_name, y=y, kh=kh2, kw=kw2,
+                    pad_top=pt2, pad_left=pl2, pad_bottom=pb2, pad_right=pr2,
+                    src_pad_top=pads[0], src_pad_left=pads[1])
+
     def __init__(self, model_path: str,
                  dtype: DataType = None,
-                 fuse_act: bool = False) -> None:
+                 fuse_act: bool = False,
+                 s2d_stem: bool = False) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
         output has no other consumer and is not a graph output.  Off by
         default so generated code is unchanged unless asked for; the CLI
         enables it.  ``self.act_fused_count`` reports how many were folded.
+
+        s2d_stem: rewrite stride-2 Convs with 4*C <= kTileIC input channels
+        as a host-side SpaceToDepth(2) + stride-1 Conv over 4*C channels
+        (``_space_to_depth_stems``).  Off by default; the CLI enables it.
+        ``self.s2d_stem_count`` reports how many Convs were rewritten.
         """
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
@@ -261,6 +448,12 @@ class OnnxGraph:
         # ``self.gemm_decomposed_count`` so the report generator can list it
         # as an applied transformation.
         model, self.gemm_decomposed_count = OnnxGraph._preprocess_model(model)
+
+        # Space-to-depth stems (opt-in): stride-2 Conv on <= kTileIC/4
+        # channels -> SpaceToDepth + stride-1 Conv, see _space_to_depth_stems.
+        model, self.s2d_stem_count = (
+            OnnxGraph._space_to_depth_stems(model) if s2d_stem else (model, 0)
+        )
 
         graph = model.graph
 
@@ -335,7 +528,7 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
-        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode]] = []
+        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode]] = []
         for idx, node in enumerate(graph.node):
             if node.op_type == "MatMul":
                 sn = MatmulNode.from_onnx_node(node, self._tensors, idx, align_elems)
@@ -345,6 +538,9 @@ class OnnxGraph:
                 sn = PoolNode.from_onnx_node(node, self._tensors, idx, align_elems)
             elif node.op_type in RESHAPE_OP_TYPES:
                 sn = ReshapeNode.from_onnx_node(node, self._tensors, idx, align_elems)
+            elif node.op_type in SPACE_TO_DEPTH_OP_TYPES:
+                sn = SpaceToDepthNode.from_onnx_node(node, self._tensors, idx, align_elems)
+                sn.src_is_graph_input = node.input[0] in self._input_names
             else:
                 if node.op_type not in VECTOROP_OP_TYPES:
                     raise SchedulerError(
@@ -456,7 +652,7 @@ class OnnxGraph:
             done.add(b.onnx_name)
 
     @property
-    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode]]:
+    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode]]:
         return self._nodes
 
     @property

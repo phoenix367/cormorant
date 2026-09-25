@@ -914,6 +914,29 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 13b: space-to-depth stem geometry (RESNET18_15FPS_PLAN step 1).
+    // The scheduler rewrites a 7x7 s2 p3 RGB stem as SpaceToDepth(2) +
+    // 4x4 s1 conv over 12 channels with pad_top/left = 2 and an IMPLICIT
+    // bottom/right pad of 1 (out_h = in_h): the last output row/column
+    // reads one row/column past the input, which the kernel must zero.
+    // 12 channels also exercise a partial 16-lane tile with > 8 valid
+    // lanes (full-width last tile, not the §2.34 half tile).  C-sim only:
+    // guarded so the RTL fixture set (--dump-data) is unchanged.
+    // -----------------------------------------------------------------------
+    if (g_dump_dir.empty()) {
+        ConvParams p{};
+        p.batch=1; p.in_ch=12; p.in_h=16; p.in_w=16; p.out_ch=16;
+        p.kh=4; p.kw=4; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=2; p.pad_left=2; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.25f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 1.0f, rng);
+        total_failures += run_test("s2d stem: 12ch 4x4 s1 pad [2,2,1,1] (implicit bottom/right)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Test 21: 1×1 kernel, exact IC and M tile multiples (no partial tile)
     // Pure channel projection; exercises the IC reduction with two full tiles.
     // -----------------------------------------------------------------------

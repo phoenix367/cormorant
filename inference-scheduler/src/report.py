@@ -29,7 +29,7 @@ import numpy as np
 
 from .dtype import ApFixed
 from .nodes import (ConvNode, MatmulNode, PoolNode, ReshapeNode,
-                    ScheduledNode, OP_NAMES)
+                    SpaceToDepthNode, ScheduledNode, OP_NAMES)
 from .codegen._simulate import _residual_stats
 
 
@@ -149,6 +149,8 @@ def _node_notes(sn) -> str:
         return " · ".join(bits)
     if isinstance(sn, ReshapeNode):
         return "buffer alias · no kernel call"
+    if isinstance(sn, SpaceToDepthNode):
+        return f"host CPU reorder · blocksize={sn.blocksize} · no kernel call"
     return ""
 
 
@@ -184,10 +186,10 @@ def _count_overlapping_starts(events: list) -> int:
             if in_flight:
                 overlapping += 1
             in_flight.add(ev[1])
-        elif kind == "start_sync":
+        elif kind in ("start_sync", "cpu"):
             if in_flight:
                 overlapping += 1
-            # the synchronous helper drains itself — never goes in-flight
+            # the synchronous helper / host op drains itself — never in-flight
         elif kind in ("wait", "drain"):
             in_flight.discard(ev[2])
     return overlapping
@@ -496,7 +498,7 @@ class ReportGenerator:
             tick = "✓" if kn in active else "–"
             rows.append(f"| `{kn}` | {tick} | {_grouped(per_lane.get(kn, 0))} |")
         if per_lane["(no lane)"]:
-            rows.append(f"| Reshape (no lane) | – | {_grouped(per_lane['(no lane)'])} |")
+            rows.append(f"| Reshape / host op (no lane) | – | {_grouped(per_lane['(no lane)'])} |")
         return "\n".join(rows)
 
     # ----- §6 transformations --------------------------------------- #
@@ -508,6 +510,7 @@ class ReportGenerator:
 
         gemm = getattr(self.graph, "gemm_decomposed_count", 0)
         act_fused = getattr(self.graph, "act_fused_count", 0)
+        s2d = getattr(self.graph, "s2d_stem_count", 0)
         reshape_count = sum(1 for sn in self.graph.nodes if isinstance(sn, ReshapeNode))
 
         # Pool reuse summary: re-derive the saving figure already shown in §4
@@ -534,6 +537,13 @@ class ReportGenerator:
                 f"- **Activation fusion** — {act_fused} `Relu` / `Clip(0,6)` "
                 f"node{'s' if act_fused != 1 else ''} folded into the producing "
                 f"VectorOP call (kernel `act` register)."
+            )
+        if s2d:
+            bullets.append(
+                f"- **Space-to-depth stem** — {s2d} stride-2 `Conv`"
+                f"{'s' if s2d != 1 else ''} rewritten as a host-side "
+                f"`SpaceToDepth(2)` + stride-1 `Conv` over 4× the input "
+                f"channels (ConvKernel IC-lane utilisation)."
             )
         if reshape_count:
             bullets.append(

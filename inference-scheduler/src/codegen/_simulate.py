@@ -40,7 +40,7 @@ import numpy as np
 from ..nodes  import (
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
     ACT_RELU, ACT_RELU6,
-    MatmulNode, ConvNode, PoolNode, ReshapeNode,
+    MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
     POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
@@ -483,6 +483,15 @@ class _SimulateMixin:
             if isinstance(sn, ReshapeNode):
                 src = arrays[sn.inputs[0].onnx_name]
                 arrays[sn.output.onnx_name] = src.reshape(sn.output.shape)
+                continue
+
+            if isinstance(sn, SpaceToDepthNode):
+                # Pure reorder (ONNX SpaceToDepth channel order), no truncation.
+                bs = sn.blocksize
+                src = arrays[sn.inputs[0].onnx_name].reshape(
+                    sn.batch, sn.in_ch, sn.in_h // bs, bs, sn.in_w // bs, bs)
+                arrays[sn.output.onnx_name] = np.ascontiguousarray(
+                    src.transpose(0, 3, 5, 1, 2, 4)).reshape(sn.output.shape)
                 continue
 
             if isinstance(sn, PoolNode):
