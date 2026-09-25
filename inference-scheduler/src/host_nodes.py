@@ -45,6 +45,10 @@ Performance (BERT_PLAN phase 2B), all without changing a single output bit:
     difference (``x - max`` is exactly ``-k / 2^F``); both are filled at
     init by the same double code / libm call, so the lookup returns the
     same bits as the per-element computation.
+  * Threads.  Every helper splits its rows (Softmax, LayerNorm, copy,
+    Gather, OneHot) or elements (GELU, Cast) into contiguous ranges run by
+    the caller plus ``INFERENCE_HOST_THREADS - 1`` pthread workers; the
+    per-row / per-element arithmetic and order are unchanged.
 """
 
 from __future__ import annotations
@@ -270,23 +274,191 @@ static void host_out_done(inference_buf_t *dst, Data_t *out,
 """
 
 HOST_C_POOL = r"""/*
- * Every helper is a range function run through host_parallel(fn, arg, n,
- * grain, align) over its rows / elements.  This build runs the whole range
- * on the calling thread.
+ * Host thread pool.  Every helper splits its rows / elements into at most
+ * s_host_nthreads contiguous ranges; the calling thread runs range 0 and
+ * INFERENCE_HOST_THREADS - 1 pthread workers (created in inference_init,
+ * joined in inference_deinit) run the others.  Each row / element is still
+ * computed by exactly the same code in the same order, so the results are
+ * bit-identical for any thread count.
+ *
+ *   -DINFERENCE_HOST_THREADS=N   default thread count (4 = the four A53
+ *                                cores; 1 compiles the pool out)
+ *   env INFERENCE_HOST_THREADS   runtime override, 1 .. 64 (Linux)
  */
-typedef void (*host_task_fn)(void *arg, unsigned begin, unsigned end);
-
-#ifndef INFERENCE_HOST_MIN_ELEMS
-#  define INFERENCE_HOST_MIN_ELEMS 16384u   /* smallest range worth splitting */
+#ifndef INFERENCE_HOST_THREADS
+#  define INFERENCE_HOST_THREADS 4
+#endif
+#if defined(__linux__) && INFERENCE_HOST_THREADS > 1
+#  include <pthread.h>
+#  define HOST_POOL 1
+#else
+#  define HOST_POOL 0
 #endif
 
+typedef void (*host_task_fn)(void *arg, unsigned begin, unsigned end);
+
+static unsigned s_host_nthreads = 1u;
+
+#ifndef INFERENCE_HOST_MIN_ELEMS
+#  define INFERENCE_HOST_MIN_ELEMS 16384u   /* smallest range worth a thread */
+#endif
+
+#if HOST_POOL
+/* Range t of nt over n items; inner boundaries rounded down to `align`. */
+static void host_range(unsigned n, unsigned t, unsigned nt, unsigned align,
+                       unsigned *b, unsigned *e)
+{
+    unsigned long long lo = (unsigned long long)n * t / nt;
+    unsigned long long hi = (unsigned long long)n * (t + 1u) / nt;
+    lo -= lo % align;
+    if (t + 1u < nt)
+        hi -= hi % align;
+    else
+        hi = n;
+    *b = (unsigned)lo;
+    *e = (unsigned)hi;
+}
+
+static struct {
+    pthread_t      *th;
+    unsigned        n_started;
+    int             sync_ok;
+    pthread_mutex_t mu;
+    pthread_cond_t  go, done;
+    unsigned long   gen;
+    unsigned        busy;
+    int             quit;
+    host_task_fn    fn;
+    void           *arg;
+    unsigned        n, nt, align;
+} s_hp;
+
+static void *host_worker(void *p)
+{
+    unsigned      id = (unsigned)(uintptr_t)p;
+    unsigned long seen = 0ul;
+    for (;;) {
+        host_task_fn fn;
+        void        *arg;
+        unsigned     n, nt, align, b = 0u, e = 0u;
+        pthread_mutex_lock(&s_hp.mu);
+        while (!s_hp.quit && s_hp.gen == seen)
+            pthread_cond_wait(&s_hp.go, &s_hp.mu);
+        if (s_hp.quit) {
+            pthread_mutex_unlock(&s_hp.mu);
+            return NULL;
+        }
+        seen = s_hp.gen;
+        fn = s_hp.fn; arg = s_hp.arg; n = s_hp.n; nt = s_hp.nt; align = s_hp.align;
+        pthread_mutex_unlock(&s_hp.mu);
+        if (id < nt) {
+            host_range(n, id, nt, align, &b, &e);
+            if (b < e)
+                fn(arg, b, e);
+        }
+        pthread_mutex_lock(&s_hp.mu);
+        if (--s_hp.busy == 0u)
+            pthread_cond_signal(&s_hp.done);
+        pthread_mutex_unlock(&s_hp.mu);
+    }
+}
+#endif
+
+/* Run fn over [0, n): at most one range per thread and at least `grain`
+ * items per range; range boundaries are multiples of `align` items. */
 static void host_parallel(host_task_fn fn, void *arg, unsigned n,
                           unsigned grain, unsigned align)
 {
+#if HOST_POOL
+    unsigned nt = s_host_nthreads;
+    if (grain == 0u) grain = 1u;
+    if (align == 0u) align = 1u;
+    if (n / grain < nt) nt = n / grain;
+    if (nt > s_hp.n_started + 1u) nt = s_hp.n_started + 1u;
+    if (nt > 1u) {
+        unsigned b, e;
+        pthread_mutex_lock(&s_hp.mu);
+        s_hp.fn = fn; s_hp.arg = arg; s_hp.n = n; s_hp.nt = nt; s_hp.align = align;
+        s_hp.busy = s_hp.n_started;
+        s_hp.gen++;
+        pthread_cond_broadcast(&s_hp.go);
+        pthread_mutex_unlock(&s_hp.mu);
+        host_range(n, 0u, nt, align, &b, &e);
+        if (b < e)
+            fn(arg, b, e);
+        pthread_mutex_lock(&s_hp.mu);
+        while (s_hp.busy != 0u)
+            pthread_cond_wait(&s_hp.done, &s_hp.mu);
+        pthread_mutex_unlock(&s_hp.mu);
+        return;
+    }
+#else
     (void)grain;
     (void)align;
+#endif
     if (n > 0u)
         fn(arg, 0u, n);
+}
+
+static void host_pool_deinit(void)
+{
+#if HOST_POOL
+    unsigned i;
+    if (s_hp.sync_ok) {
+        pthread_mutex_lock(&s_hp.mu);
+        s_hp.quit = 1;
+        pthread_cond_broadcast(&s_hp.go);
+        pthread_mutex_unlock(&s_hp.mu);
+        for (i = 0u; i < s_hp.n_started; i++)
+            pthread_join(s_hp.th[i], NULL);
+        pthread_cond_destroy(&s_hp.done);
+        pthread_cond_destroy(&s_hp.go);
+        pthread_mutex_destroy(&s_hp.mu);
+    }
+    free(s_hp.th);
+    memset(&s_hp, 0, sizeof s_hp);
+#endif
+    s_host_nthreads = 1u;
+}
+
+static int host_pool_init(void)
+{
+    unsigned n = INFERENCE_HOST_THREADS;
+#if HOST_POOL
+    unsigned    i;
+    const char *env = getenv("INFERENCE_HOST_THREADS");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 1 && v <= 64) n = (unsigned)v;
+    }
+    host_pool_deinit();
+    s_hp.th = (pthread_t *)calloc(n, sizeof(pthread_t));
+    if (!s_hp.th) return -1;
+    if (pthread_mutex_init(&s_hp.mu, NULL) != 0) return -1;
+    if (pthread_cond_init(&s_hp.go, NULL) != 0) {
+        pthread_mutex_destroy(&s_hp.mu);
+        return -1;
+    }
+    if (pthread_cond_init(&s_hp.done, NULL) != 0) {
+        pthread_cond_destroy(&s_hp.go);
+        pthread_mutex_destroy(&s_hp.mu);
+        return -1;
+    }
+    s_hp.sync_ok = 1;
+    for (i = 1u; i < n; i++) {
+        if (pthread_create(&s_hp.th[i - 1u], NULL, host_worker, (void *)(uintptr_t)i) != 0)
+            break;
+        s_hp.n_started++;
+    }
+    if (s_hp.n_started + 1u < n)
+        fprintf(stderr, "inference: started %u of %u host worker threads\n",
+                s_hp.n_started, n - 1u);
+    n = s_hp.n_started + 1u;
+#else
+    n = 1u;
+#endif
+    s_host_nthreads = n;
+    return 0;
 }
 
 /* Rows per range so that every range holds >= INFERENCE_HOST_MIN_ELEMS. */
@@ -302,6 +474,7 @@ typedef struct {
     unsigned      n;
 } host_rows_t;
 """
+
 
 def host_c_lut_map() -> str:
     return r"""/* y[i] = lut[bits of x[i]] — an elementwise op tabulated over every Data_t

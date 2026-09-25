@@ -168,8 +168,10 @@ class TestGeneratedC(_Tiny):
     def test_host_emulated_run_matches_simulation(self):
         """inference.c + test_inference.c compiled unchanged against software
         kernel models: every output bit-identical to the simulator — host ops
-        in place (cacheable buffers, the default) and staged (non-cacheable)."""
-        configs = [dict(), dict(cached=False)]
+        in place (cacheable buffers, the default) and staged (non-cacheable),
+        and with every host op split over 1 / 3 / 4 threads."""
+        configs = [dict(), dict(cached=False), dict(threads=1, min_elems=1),
+                   dict(threads=3, min_elems=1), dict(cached=False, threads=4, min_elems=1)]
         for fname, m in self.models.items():
             _, cg = self.gen(m["path"])
             for cfg in configs:
@@ -215,7 +217,8 @@ class TestGeneratedC(_Tiny):
         cmake = cg.generate_cmake()
         self.assertIn("target_compile_options(inference PRIVATE -ffp-contract=off)", cmake)
         self.assertIn("target_link_libraries(inference PUBLIC m)", cmake)
-
+        self.assertIn("target_link_libraries(inference PUBLIC Threads::Threads)", cmake)
+        self.assertIn("INFERENCE_HOST_THREADS=${INFERENCE_HOST_THREADS}", cmake)
 
     def test_event_stream_and_liveness(self):
         for m in self.models.values():

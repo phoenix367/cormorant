@@ -173,13 +173,16 @@ def which_cc():
     return shutil.which("cc") or shutil.which("gcc")
 
 
-def build_and_run(cg, workdir, timeout=600, cached=True):
+def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems=None):
     """Write the project of CodeGenerator ``cg`` into ``workdir``, compile it
     against the software kernels and run test_inference.  Returns
     (returncode, combined output).
 
-    ``cached``  buffers report a cacheable mapping (in-place host ops) or not
-                (staging through s_host_stage)."""
+    ``cached``    buffers report a cacheable mapping (in-place host ops) or not
+                  (staging through s_host_stage);
+    ``threads``   INFERENCE_HOST_THREADS for the run (None: the default, 4);
+    ``min_elems`` -DINFERENCE_HOST_MIN_ELEMS (1 splits even tiny host ops
+                  over the threads)."""
     from src._matmul_hw_config import MATMUL_TILE_M
     for kd in cg._active_kernels:
         if kd.name not in ("VectorOPKernel", "MatmulKernel"):
@@ -215,6 +218,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True):
     cmd = [which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
            "-Wno-unused-function", "-Wno-error=parentheses",
            f"-DEMU_TILE_M={MATMUL_TILE_M}", f"-DEMU_BUF_CACHED={1 if cached else 0}",
+           *([f"-DINFERENCE_HOST_MIN_ELEMS={min_elems}u"] if min_elems else []), "-pthread",
            f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', f'-DINFERENCE_EXPECTED_DIR="{workdir}"',
            "-I", inc, "-I", emu,
            os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
@@ -222,7 +226,11 @@ def build_and_run(cg, workdir, timeout=600, cached=True):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return r.returncode, "COMPILE FAILED\n" + r.stdout + r.stderr
-    r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout, cwd=workdir)
+    env = dict(os.environ)
+    if threads is not None:
+        env["INFERENCE_HOST_THREADS"] = str(threads)
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout, cwd=workdir,
+                       env=env)
     return r.returncode, r.stdout + r.stderr
 
 

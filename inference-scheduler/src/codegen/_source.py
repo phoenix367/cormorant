@@ -201,8 +201,9 @@ class _SourceMixin:
             " * each computes in double precision straight from / into the DMA buffers\n"
             " * (cacheable mapping; else via the cached staging arena s_host_stage),\n"
             " * rounds half to even + saturates on write-back, and flushes its output\n"
-            " * for the consuming kernel.  GELU and Softmax's exp() are lookup tables\n"
-            " * filled at init by the same code path.  The scheduler's simulator (_simulate.py /\n"
+            " * for the consuming kernel.  Rows / elements are split over the host\n"
+            " * thread pool, GELU and Softmax's exp() are lookup tables filled at init\n"
+            " * by the same code path.  The scheduler's simulator (_simulate.py /\n"
             " * host_nodes.py) implements the same operations in the same order, so\n"
             " * test_inference.c expects bit-identical results.\n"
             " *\n"
@@ -230,8 +231,8 @@ class _SourceMixin:
         return "\n".join(parts)
 
     def _host_runtime_functions(self) -> str:
-        """host_runtime_init() / host_runtime_deinit(): the lookup tables
-        (called by inference_init / inference_deinit)."""
+        """host_runtime_init() / host_runtime_deinit(): the thread pool and
+        the lookup tables (called by inference_init / inference_deinit)."""
         luts = self._host_luts()
         decl = [f"static Data_t *{name} = NULL;" for name, _ in luts
                 if name != "s_host_exp_lut"]          # declared with its helper
@@ -240,10 +241,11 @@ class _SourceMixin:
         return (
             ("/* Lookup tables (filled in host_runtime_init) */\n" + "\n".join(decl) + "\n\n"
              if decl else "") +
-            "/* Host-op runtime: the lookup tables.  Called by inference_init() /\n"
-            " * inference_deinit(). */\n"
+            "/* Host-op runtime: worker threads, then the lookup tables (filled by\n"
+            " * the pool).  Called by inference_init() / inference_deinit(). */\n"
             "static int host_runtime_init(void)\n"
-            "{\n" +
+            "{\n"
+            "    if (host_pool_init() != 0) return -1;\n" +
             "".join(ln + "\n" for ln in init) +
             "    return 0;\n"
             "}\n"
@@ -251,6 +253,7 @@ class _SourceMixin:
             "static void host_runtime_deinit(void)\n"
             "{\n" +
             "".join(ln + "\n" for ln in free) +
+            "    host_pool_deinit();\n"
             "}\n"
         )
 
@@ -1027,7 +1030,7 @@ class _SourceMixin:
             )
             alloc_lines.append("    if (!s_host_stage) { rc = -1; goto fail; }")
             alloc_lines.append("")
-            alloc_lines.append("    /* Host-op lookup tables */")
+            alloc_lines.append("    /* Host-op worker threads + lookup tables */")
             alloc_lines.append("    if (host_runtime_init() != 0) { rc = -1; goto fail; }")
             alloc_lines.append("")
 

@@ -46,14 +46,17 @@ static inline int inference_buf_is_cached(const inference_buf_t *b) { return b->
 static void inference_buf_sync_to_device(inference_buf_t *b) { (void)b; }
 """
 
-# Thread counts every C case runs with (serial build: one).
-_THREADS = (1,)
+# Thread counts every C case runs with (the binary is built with
+# -DINFERENCE_HOST_MIN_ELEMS=1 so even these tiny ops are split): serial, an
+# odd split (uneven ranges), and the default four.
+_THREADS = (1, 3, 4)
 
 
 def _cc(src_path, exe, extra=()):
-    """Compile a harness with -Werror."""
+    """Compile a harness: -Werror, pthreads, every host op split to the
+    thread count even for tiny inputs."""
     r = subprocess.run([_CC, "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
-                        "-Wno-unused-function", "-DINFERENCE_HOST_MIN_ELEMS=1u",
+                        "-Wno-unused-function", "-pthread", "-DINFERENCE_HOST_MIN_ELEMS=1u",
                         *extra, src_path, "-lm", "-o", exe], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
 
@@ -96,8 +99,8 @@ def _storage(t, v, dt=DT):
 
 def _run_c(cg, sn, ins, dt=DT):
     """Compile the generated host section + a harness around ``sn.c_call``
-    (after host_runtime_init: lookup tables); returns the raw output
-    storage."""
+    (after host_runtime_init: thread pool + lookup tables); runs it with 1,
+    3 and 4 threads and returns the raw output storage."""
     staged = sn.staged_inputs()
     direct = sn.direct_inputs()
     bpe = dt.bytes_per_elem
@@ -149,8 +152,9 @@ class _Base(unittest.TestCase):
         cls._tmp.cleanup()
 
     def check(self, path, feeds, kind=HostNode, dt=DT, mutate=None, **graph_kw):
-        """Every host node of the model: C output == reference, bitwise.
-        ``mutate(graph)`` may adjust the nodes before code generation."""
+        """Every host node of the model: C output == reference, bitwise
+        (with 1, 3 and 4 threads).  ``mutate(graph)`` may adjust the nodes
+        before code generation."""
         g = OnnxGraph(path, dtype=dt, **graph_kw)
         if mutate:
             mutate(g)
@@ -440,7 +444,7 @@ class TestLookupTables(_Base):
 
 
 class TestFloat32(_Base):
-    """A float32 Data_t has no tables: the per-element code path."""
+    """A float32 Data_t has no tables: the per-element code path, threaded."""
 
     def test_non_lut_path(self):
         from src.dtype import FLOAT32
@@ -495,7 +499,7 @@ class TestStagingHelpers(_Base):
             c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
             with open(c, "w") as f:
                 f.write("\n".join(prog))
-            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", c, "-lm",
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", "-pthread", c, "-lm",
                             "-o", exe], check=True)
             out = subprocess.run([exe], capture_output=True, check=True, text=True).stdout
         # cached = 0: staged in / out (copied back); cached = 1: in place
@@ -518,7 +522,7 @@ class TestStagingHelpers(_Base):
             c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
             with open(c, "w") as f:
                 f.write("\n".join(prog))
-            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", c, "-lm",
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", "-pthread", c, "-lm",
                             "-o", exe], check=True)
             out = np.frombuffer(subprocess.run([exe], capture_output=True, check=True).stdout, "<u2")
         compact = np.array([c * 8 + j + 1 for c in range(5) for j in range(3)])

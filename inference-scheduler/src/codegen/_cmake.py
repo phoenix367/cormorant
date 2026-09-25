@@ -295,5 +295,18 @@ class _CmakeMixin:
             "# contraction so results match the scheduler's simulation bit for bit.\n"
             "target_compile_options(inference PRIVATE -ffp-contract=off)\n"
             "target_link_libraries(inference PUBLIC m)\n"
+            "\n"
+            "# Host-op threads: the caller + (N - 1) pthread workers split every host\n"
+            "# op's rows (bit-identical for any N; 1 = no threads).  The environment\n"
+            "# variable INFERENCE_HOST_THREADS overrides N at run time.\n"
+            "set(INFERENCE_HOST_THREADS 4 CACHE STRING\n"
+            "    \"Threads that run a host-CPU op (caller + N-1 workers)\")\n"
+            "target_compile_definitions(inference PRIVATE\n"
+            "    INFERENCE_HOST_THREADS=${INFERENCE_HOST_THREADS})\n"
+            "if(INFERENCE_TARGET STREQUAL \"LINUX\")\n"
+            "    set(THREADS_PREFER_PTHREAD_FLAG ON)\n"
+            "    find_package(Threads REQUIRED)\n"
+            "    target_link_libraries(inference PUBLIC Threads::Threads)\n"
+            "endif()\n"
         )
 
