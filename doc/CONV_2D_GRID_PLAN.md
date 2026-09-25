@@ -384,6 +384,7 @@ becomes a JSON-knob decision rather than an architecture one.
 | 7 (w_cache ping-pong) | §2.35 next-slab prefetch into a second bank under the fused sweep; per-m1 RAM columns with a flat power-of-two address (7 synthesis rounds to reach II=1 at BRAM 158) | 40/40 RTL, II=1 depth 7 | 51.6 k → 50.9 k | -2.3 % (stem -14 %) |
 | B1 (THROUGHPUT_PLAN §3) | §2.37 flat depthwise sweep — one II=1 loop per (mt, ow_tile), bias-seeded, write-only word store, no Phase 1 | 40/40 RTL, II=1 lat 5 | (standard case unchanged; DW chunking 145.7 k → 114.4 k) | -4.0 % (DW chunking -21.5 %) |
 | B2 (THROUGHPUT_PLAN §3) | §2.38 segmented 8×8 bank-rotated LUTRAM transposer in Phase 3, 128-bit `y` with re-aligned runs and byte-strobed run ends | 43/43 RTL (3 new fixtures), II=1 | 63 k-class case: `M-grouping 64ch` 50.8 k → 36.6 k | -20.4 % on the common cases (chunking -28 %, DW chunking -25 %) |
+| B3 (THROUGHPUT_PLAN §3) | §2.39 128-bit `x`, `x_row_loader` DATAFLOW split with a ping-pong row buffer emitting 16-channel column vectors, line_buf unchanged | 43/43 RTL (tail-pad strobe check), II=1 (an unpipelined loader loop found by FSM trace and fixed) | `M-grouping 64ch` 36.6 k → 36.7 k (loads already hidden); DW chunking 86.1 k → 49.1 k | -10.0 % vs §2.38; **-30.5 % vs §2.36** (DW chunking -66 %, DW s2 -64 % vs §2.38) |
 
 Cumulative after §2.32: **-79.7 %** of the suite's simulated time (42.1 M
 → 8.56 M ns — the suite gained a 40th, 1.6 M-ns case in §2.30); the

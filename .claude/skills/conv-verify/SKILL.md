@@ -61,7 +61,7 @@ cp conv_test_data/* ../hw/test_data/conv_test_data/
 ```
 
 Keep new fixtures SMALL (xsim ≈ 20 µs simulated per wall-clock second;
-the 40-case set runs in ~12 min).  If the layout changed, the testbench's
+the 43-case set runs in ~18 min).  If the layout changed, the testbench's
 element-count formulas in `hw/cormorant_test_stand/.../conv_tb.sv` must
 match `conv_weight_numel` / `conv_bias_numel`.
 
@@ -73,6 +73,13 @@ make synthesize_conv_kv260
 
 - Wait for it (~60–90 s on this machine, sometimes longer — conv has more loops than pool). The final line must be `[100%] Built target synthesize_conv_kv260`.
 - The bash exit code must be 0. Any `ERROR:` line in the tool output is a hard failure.
+- Grep the tool output for `Unable to satisfy pipeline directive` (`SCHED 204-65`),
+  `II Violation` and `Inferring partial write`.  A loop whose PIPELINE
+  directive could not be honoured (e.g. it contains a variable-trip
+  subloop) is left as FSM states and shows up in csynth.rpt only as
+  `Pipelined = no` with NO II entry — the II-violation scan alone missed
+  one in §2.39 (5.5 cycles per iteration instead of 1).  Every loop that
+  carries a `#pragma HLS PIPELINE` must show `yes` in the Pipelined column.
 - After it succeeds, glance at the synthesis summary for new violations (path is relative to the build directory):
 
   ```bash
@@ -82,18 +89,19 @@ make synthesize_conv_kv260
   (The conv build uses the Vitis unified component flow, so reports live
   under `<component>/hls/syn/report/`, not the legacy `solution1/syn/report/`.)
 
-  Report any of these against the prior run (baseline as of §2.34:
-  top-level slack **0.00 ns**, **no** II violations, ports
-  `gmem0 16 -> 16`, `gmem1 128 -> 128`, `gmem2 128 -> 128`, `gmem3 16 -> 16`,
-  BRAM 158 (54 %), DSP 248, FF ~34.9 k, LUT ~47.3 k (40 %), URAM 24):
+  Report any of these against the prior run (baseline as of §2.39:
+  top-level slack **0.00 ns**, **no** II violations, all four ports
+  `128 -> 128` (`gmem0` x, `gmem1` weight, `gmem2` bias read; `gmem3` y write),
+  BRAM 165 (57 %), DSP 262, FF ~46 k, LUT ~68 k (58 %), URAM 16):
   - **Top-level slack** going negative, or any sub-block slack that worsened.
   - **Any** `II Violation Information` entry — the design has none; the
     grid loop (`ConvMacGrid.h`, iteration latency 6) and the fused consumer
     loops are all II=1.
   - `m_axi_gmem0..3` data-width column changes.  `gmem0/1/2` are READ_ONLY
-    (x, w, b), `gmem3` is WRITE_ONLY (y); x and y are 16-bit burst_maxi
-    ports, weight and bias 128-bit burst_maxi ports — a change here means
-    the port type or the layout contract moved.
+    (x, w, b), `gmem3` is WRITE_ONLY (y); all four are 128-bit
+    `hls::burst_maxi<ap_uint<128>>` ports since §2.38/§2.39 — a change
+    here means the port type or the layout contract moved (and the block
+    designs' `C_M_AXI_GMEMn_DATA_WIDTH` instance parameters must follow).
   - Resource jumps (BRAM / DSP / FF / LUT % columns on the top-level
     `ConvKernel` row) — flag anything >10 % of the previous value.  BRAM is
     the tight resource on the full 128-bit design (56 % placed).

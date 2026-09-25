@@ -545,7 +545,305 @@ static void bias_producer(
 }
 
 // ---------------------------------------------------------------------------
-// input_patch_producer — unified input patch ASSEMBLER (DATAFLOW source).
+// Row-load descriptor (§2.39) — shared by x_row_loader and
+// input_patch_producer so the words the loader pushes and the words the
+// producer pops are computed by the SAME arithmetic.  For one
+// (ni, chunk, ct, ow_tile, oh) step: the input rows that are not yet
+// resident ([load_start, load_end], possibly empty) and the tile's clipped
+// column range [iw_start, iw_start + iw_count).
+// ---------------------------------------------------------------------------
+struct RowLoad {
+    int      load_start;
+    int      load_end;
+    int      iw_start;
+    unsigned iw_count;
+};
+
+static inline RowLoad row_load_descriptor(
+    int last_loaded_row, unsigned oh, unsigned stride_h, unsigned pad_top,
+    unsigned kh, unsigned dilation_h, unsigned in_h,
+    int iw_load_start, int iw_load_last, unsigned in_w)
+{
+    #pragma HLS INLINE
+    RowLoad r;
+    const int ih_window_max = (int)(oh * stride_h) - (int)pad_top
+                            + (int)((kh - 1) * dilation_h);
+    r.load_start = last_loaded_row + 1;
+    if (r.load_start < 0) r.load_start = 0;
+    r.load_end = ih_window_max;
+    if (r.load_end >= (int)in_h) r.load_end = (int)in_h - 1;
+
+    int iw_clipped_start = iw_load_start;
+    if (iw_clipped_start < 0) iw_clipped_start = 0;
+    int iw_clipped_last  = iw_load_last;
+    if (iw_clipped_last >= (int)in_w) iw_clipped_last = (int)in_w - 1;
+    const int cnt = iw_clipped_last - iw_clipped_start + 1;
+    r.iw_start = iw_clipped_start;
+    r.iw_count = (cnt > 0) ? (unsigned)cnt : 0u;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// x_row_loader — DATAFLOW source owning the x port (§2.39).
+//
+// Walks exactly the producer's (ni, chunk, ct, ow_tile, grp, oh) schedule
+// and, for every input row the producer's Phase 1 will fill, requests the
+// ch_valid channel runs of that row FIRST (up to kTileIC = the port's
+// num_read_outstanding in flight, §2.28), drains their 128-bit words into
+// a ping-pong row buffer, and re-emits the row as COLUMN vectors: one
+// ColVec (all kTileIC channels of one input column) per cycle on
+// col_stream.  The producer's Phase 1 then writes one column into all 16
+// line_buf channel banks per cycle — 16 (standard) / 8 (depthwise)
+// elements per cycle into the SAME 16-bank BRAM line buffer as before,
+// no re-banking.  The drain of row r+1 overlaps the emission of row r
+// (the two halves of rowbuf), and the whole loader runs ahead of the
+// producer by col_stream's depth, so DDR latency and word traffic hide
+// under the MAC sweep instead of being serial with it.
+//
+// Each channel's run starts at its own lane (run_off % 8 differs per
+// channel unless in_h*in_w % 8 == 0), so the loader keeps a per-channel
+// lane shift and word count for the row being drained and for the row
+// being emitted.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kRowBufWords = 16;          // >= kMaxLineBufCols/8 + 1 words per (channel, row)
+static_assert(kMaxLineBufCols / kXPortElems + 1 <= kRowBufWords, "row buffer words");
+
+typedef PatchVec ColVec;                             // kTileIC lanes of one input column
+
+static void x_row_loader(
+    hls::burst_maxi<XWord>  x,
+    hls::stream<ColVec>&    col_stream,
+    unsigned             batch,
+    unsigned             in_ch,
+    unsigned             in_h,
+    unsigned             in_w,
+    unsigned             out_ch,
+    unsigned             out_h,
+    unsigned             out_w,
+    unsigned             kh,
+    unsigned             kw,
+    unsigned             stride_h,
+    unsigned             stride_w,
+    unsigned             dilation_h,
+    unsigned             dilation_w,
+    unsigned             pad_top,
+    unsigned             pad_left,
+    unsigned             is_depthwise,
+    ConvGeometry         geom
+) {
+    const unsigned in_hw    = in_h * in_w;
+    const unsigned ct_width = is_depthwise ? kTileM : kTileIC;
+    const unsigned total_ch = is_depthwise ? out_ch : in_ch;
+    const unsigned ct_tiles = (total_ch + ct_width - 1) / ct_width;
+    const unsigned oh_per_chunk = geom.oh_per_chunk;
+    const unsigned num_chunks   = geom.num_chunks;
+    const unsigned num_groups   = is_depthwise ? 1u : geom.num_m_groups;
+    const unsigned ow_per_tile  = geom.ow_per_tile;
+    const unsigned num_ow_tiles = geom.num_ow_tiles;
+    (void)out_w;
+
+    // Ping-pong row buffer: one RAM column per channel, flat address
+    // half*kRowBufWords + word (§2.35 rule: flat power-of-two address,
+    // explicit channel compare on the store).
+    XWord rowbuf[kTileIC][2 * kRowBufWords];
+    #pragma HLS ARRAY_PARTITION variable=rowbuf complete dim=1
+    #pragma HLS BIND_STORAGE variable=rowbuf type=RAM_S2P impl=LUTRAM
+
+    // Row being emitted (loaded one step earlier).
+    bool       pend       = false;
+    unsigned   pend_cols  = 0;
+    unsigned   pend_valid = 0;
+    ap_uint<3> pend_shift[kTileIC];
+    #pragma HLS ARRAY_PARTITION variable=pend_shift complete dim=0
+    ap_uint<1> pp = 0;                                  // half being drained into
+    for (unsigned c = 0; c < kTileIC; c++) {
+        #pragma HLS UNROLL
+        pend_shift[c] = 0;
+    }
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    const bool debug_reads = std::getenv("CONV_DEBUG_READS") != nullptr;
+    AddressMap_t read_addresses;
+#endif
+
+    for (unsigned ni = 0; ni < batch; ni++) {
+      for (unsigned chunk = 0; chunk < num_chunks; chunk++) {
+        const unsigned oh_start = chunk * oh_per_chunk;
+        const unsigned oh_end   = std::min(out_h, oh_start + oh_per_chunk);
+        for (unsigned ct = 0; ct < ct_tiles; ct++) {
+            const unsigned ch_off   = ct * ct_width;
+            const unsigned ch_valid = std::min(ct_width, total_ch - ch_off);
+          for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
+            const unsigned ow_start = owt * ow_per_tile;
+            const unsigned ow_end   = std::min(out_w, ow_start + ow_per_tile);
+            const int iw_load_start = (int)(ow_start * stride_w) - (int)pad_left;
+            const int iw_load_last  = (int)((ow_end - 1) * stride_w
+                                            + (kw - 1) * dilation_w)
+                                      - (int)pad_left;
+            int last_loaded_row = (int)(oh_start * stride_h) - (int)pad_top - 1;
+          for (unsigned grp = 0; grp < num_groups; grp++) {
+            for (unsigned oh = oh_start; oh < oh_end; oh++) {
+                const RowLoad rl = row_load_descriptor(
+                    last_loaded_row, oh, stride_h, pad_top, kh, dilation_h,
+                    in_h, iw_load_start, iw_load_last, in_w);
+
+                for (int ih = rl.load_start; ih <= rl.load_end; ih++) {
+                    // ---- this row: per-channel run geometry + requests ----
+                    ap_uint<3> shift[kTileIC];
+                    #pragma HLS ARRAY_PARTITION variable=shift complete dim=0
+                    ap_uint<5> nw[kTileIC];
+                    #pragma HLS ARRAY_PARTITION variable=nw complete dim=0
+                    for (unsigned c = 0; c < kTileIC; c++) {
+                        #pragma HLS UNROLL
+                        shift[c] = 0;
+                        nw[c]    = 0;
+                    }
+                    unsigned total_words = 0;
+                    for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
+                        #pragma HLS PIPELINE II=1
+                        const unsigned c       = ch_off + ch_l;
+                        const unsigned run_off = (ni * in_ch + c) * in_hw
+                                               + (unsigned)ih * in_w
+                                               + (unsigned)rl.iw_start;
+                        const unsigned n_words = (rl.iw_count > 0)
+                            ? conv_x_words_for(run_off, rl.iw_count) : 0u;
+                        for (unsigned cc = 0; cc < kTileIC; cc++) {
+                            #pragma HLS UNROLL
+                            if (cc == ch_l) {
+                                shift[cc] = (ap_uint<3>)(run_off % kXPortElems);
+                                nw[cc]    = (ap_uint<5>)n_words;
+                            }
+                        }
+                        total_words += n_words;
+                        if (n_words > 0)
+                            x.read_request(run_off / kXPortElems, n_words);
+#ifdef DEBUG_LOAD_DATA_CACHING
+                        if (debug_reads) {
+                            for (unsigned e = 0; e < rl.iw_count; e++) {
+                                CycleCounters counters;
+                                counters.mt   = is_depthwise ? ct : 0u;
+                                counters.ni   = ni;
+                                counters.ict  = is_depthwise ? (unsigned)-1 : ct;
+                                counters.ic_l = ch_l;
+                                counters.oh   = oh;
+                                counters.ow   = owt;
+                                counters.khi  = (unsigned)ih;
+                                counters.kwi  = (unsigned)rl.iw_start + e;
+                                read_addresses[run_off + e].push_back(counters);
+                            }
+                        }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+                    }
+
+                    // ---- merged step: drain this row into half pp while
+                    //      emitting the pending row from half !pp ----
+                    const unsigned emit_cols = pend ? pend_cols : 0u;
+                    const unsigned trip = (total_words > emit_cols) ? total_words : emit_cols;
+                    unsigned d_ch = 0, d_q = 0;
+                    for (unsigned i = 0; i < trip; i++) {
+                        #pragma HLS PIPELINE II=1
+                        // Within one execution of this loop half pp is only
+                        // written and half !pp only read.
+                        #pragma HLS DEPENDENCE variable=rowbuf type=inter dependent=false
+                        if (i < total_words) {
+                            const XWord w = x.read();
+                            const unsigned adr = (unsigned)pp * kRowBufWords + d_q;
+                            for (unsigned cc = 0; cc < kTileIC; cc++) {
+                                #pragma HLS UNROLL
+                                if (cc == d_ch) rowbuf[cc][adr] = w;
+                            }
+                            // Every channel of a row with iw_count > 0 has at
+                            // least one word, so one compare advances the
+                            // channel cursor.  (A `while` that skipped empty
+                            // channels here was a variable-trip subloop: HLS
+                            // silently left the whole merged loop
+                            // unpipelined — 5.5 cycles per word, §2.39.)
+                            if (++d_q == (unsigned)nw[d_ch]) {
+                                d_ch++;
+                                d_q = 0;
+                            }
+                        }
+                        if (i < emit_cols) {
+                            ColVec v;
+                            #pragma HLS aggregate variable=v compact=byte
+                            for (unsigned cc = 0; cc < kTileIC; cc++) {
+                                #pragma HLS UNROLL
+                                const unsigned   e    = (unsigned)pend_shift[cc] + i;   // lane offset in the run
+                                const unsigned   adr  = (unsigned)(pp ^ 1) * kRowBufWords + (e >> 3);
+                                const ap_uint<3> lane = (ap_uint<3>)e;
+                                const XWord      w    = rowbuf[cc][adr];
+                                Data_t lanes[kXPortElems];
+                                #pragma HLS ARRAY_PARTITION variable=lanes complete dim=0
+                                for (unsigned l = 0; l < kXPortElems; l++) {
+                                    #pragma HLS UNROLL
+                                    lanes[l] = conv_lane_to_data(w.range(
+                                        kDataBits * (l + 1) - 1, kDataBits * l));
+                                }
+                                v.lane[cc] = (cc < pend_valid) ? lanes[lane] : Data_t(0);
+                            }
+                            col_stream.write(v);
+                        }
+                    }
+
+                    // This row becomes the pending one.
+                    pend       = true;
+                    pend_cols  = rl.iw_count;
+                    pend_valid = ch_valid;
+                    for (unsigned c = 0; c < kTileIC; c++) {
+                        #pragma HLS UNROLL
+                        pend_shift[c] = shift[c];
+                    }
+                    pp = (ap_uint<1>)(pp ^ 1);
+                }
+                if (rl.load_end > last_loaded_row) {
+                    last_loaded_row = rl.load_end;
+                }
+            } // oh
+          } // grp
+          } // ow_tile
+        } // ct
+      } // chunk
+    } // ni
+
+    // Flush: emit the last loaded row.
+    if (pend) {
+        for (unsigned i = 0; i < pend_cols; i++) {
+            #pragma HLS PIPELINE II=1
+            ColVec v;
+            #pragma HLS aggregate variable=v compact=byte
+            for (unsigned cc = 0; cc < kTileIC; cc++) {
+                #pragma HLS UNROLL
+                const unsigned   e    = (unsigned)pend_shift[cc] + i;
+                const unsigned   adr  = (unsigned)(pp ^ 1) * kRowBufWords + (e >> 3);
+                const ap_uint<3> lane = (ap_uint<3>)e;
+                const XWord      w    = rowbuf[cc][adr];
+                Data_t lanes[kXPortElems];
+                #pragma HLS ARRAY_PARTITION variable=lanes complete dim=0
+                for (unsigned l = 0; l < kXPortElems; l++) {
+                    #pragma HLS UNROLL
+                    lanes[l] = conv_lane_to_data(w.range(
+                        kDataBits * (l + 1) - 1, kDataBits * l));
+                }
+                v.lane[cc] = (cc < pend_valid) ? lanes[lane] : Data_t(0);
+            }
+            col_stream.write(v);
+        }
+    }
+
+#ifdef DEBUG_LOAD_DATA_CACHING
+    if (debug_reads) for (auto it : read_addresses) {
+        if (it.second.size() > 1) {
+            std::cout << it.first << " --> " << std::endl;
+            for (auto l_item : it.second) {
+                std::cout << "\t" << l_item << std::endl;
+            }
+        }
+    }
+#endif /* DEBUG_LOAD_DATA_CACHING */
+}
+
+// ---------------------------------------------------------------------------
+// input_patch_producer — unified input patch ASSEMBLER (DATAFLOW stage).
 //
 // Standard and depthwise convolution share one producer (§2.14): their
 // patch assembly differs only in the channel-parallelism axis and the
@@ -559,9 +857,6 @@ static void bias_producer(
 // A single kTileIC-wide line_buf serves both modes; depthwise uses only
 // banks [0, kTileM) and the PatchVec gather masks the rest to 0 — the
 // same X-clean mask the standard partial-IC tail already relies on.
-// Merging the former input_patch_producer_standard / _depthwise pair
-// reclaims the depthwise producer's duplicate line_buf BRAM and control
-// logic.
 //
 // Tiled-IC/M (Option-A) + M-grouping + ow-tiling.  Loop nest:
 //
@@ -582,9 +877,11 @@ static void bias_producer(
 // row overlap re-fetched at each chunk transition.
 //
 // Per (ni, chunk, ct, ow_tile, grp, oh):
-//   Phase 1 — load new rows × this ow_tile's iw range from DDR
-//             (ch_valid channels at ch_off).  Only grp=0 loads;
-//             grp>0 re-streams the cached rows from line_buf.
+//   Phase 1 — pop the column vectors x_row_loader emits for the rows the
+//             window needs that are not yet in line_buf (§2.39: one
+//             ColVec = one column of all kTileIC channels per cycle,
+//             written into the 16 channel banks at once).  grp>0 loads
+//             nothing.
 // Per (ni, chunk, ct, ow_tile, grp, oh, ow):
 //   Phase 2 — stream kh × kw channel-packed PatchVecs into patch_stream.
 //
@@ -592,7 +889,7 @@ static void bias_producer(
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
 // ---------------------------------------------------------------------------
 static void input_patch_producer(
-    hls::burst_maxi<Data_t> x,
+    hls::stream<ColVec>&    col_stream,
     hls::stream<PatchVec>&  patch_stream,
     unsigned             batch,
     unsigned             in_ch,
@@ -612,7 +909,7 @@ static void input_patch_producer(
     unsigned             is_depthwise,
     ConvGeometry         geom
 ) {
-    const unsigned in_hw    = in_h * in_w;
+    (void)in_ch;
 
     // Channel-parallelism axis: standard tiles in_ch by kTileIC, depthwise
     // tiles out_ch by kTileM (in_ch == out_ch in depthwise mode).
@@ -627,20 +924,17 @@ static void input_patch_producer(
     // Depthwise caches its weight slice once per (chunk, mt) — no M-group
     // replay — so it runs a single group.
     const unsigned num_groups   = is_depthwise ? 1u : geom.num_m_groups;
-
     const unsigned ow_per_tile  = geom.ow_per_tile;
     const unsigned num_ow_tiles = geom.num_ow_tiles;
 
     // One kTileIC-wide line buffer for both modes; depthwise uses banks
     // [0, kTileM).  dim=1 partitioned complete → kTileIC independent
-    // banks so Phase 2 can gather a full PatchVec per cycle.
+    // banks: Phase 1 writes one column into all of them per cycle, Phase 2
+    // gathers a full PatchVec from them per cycle.
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
 
 #ifdef DEBUG_LOAD_DATA_CACHING
-    // Optional duplicate-read report (CONV_DEBUG_READS=1 in the env).
-    const bool debug_reads = std::getenv("CONV_DEBUG_READS") != nullptr;
-    AddressMap_t read_addresses;
     // C-sim residency invariant: which absolute (ih, iw) each line_buf
     // cell currently holds.  Phase 2 asserts the cell it reads holds the
     // pixel it thinks it does — a circular-slot overwrite (the §2.21 bug
@@ -663,6 +957,7 @@ static void input_patch_producer(
         for (unsigned ct = 0; ct < ct_tiles; ct++) {
             const unsigned ch_off   = ct * ct_width;
             const unsigned ch_valid = std::min(ct_width, total_ch - ch_off);
+            (void)ch_off;
 
           for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
             const unsigned ow_start = owt * ow_per_tile;
@@ -689,88 +984,34 @@ static void input_patch_producer(
 
           for (unsigned grp = 0; grp < num_groups; grp++) {
             for (unsigned oh = oh_start; oh < oh_end; oh++) {
-                const int ih_window_max = (int)(oh * stride_h)
-                                        - (int)pad_top
-                                        + (int)((kh - 1) * dilation_h);
-
                 // -------------------------------------------------------
-                // Phase 1: load any rows the current (oh, ct) window
-                // needs that are not yet in line_buf.  Only ch_valid
-                // channels are loaded here (ch_off..ch_off+ch_valid-1),
-                // and only this ow_tile's iw range (clamped to [0,in_w)).
+                // Phase 1: fill any rows the current (oh, ct) window needs
+                // that are not yet in line_buf from the column vectors
+                // x_row_loader emits (same descriptor arithmetic on both
+                // sides).
                 // -------------------------------------------------------
-                int load_start = last_loaded_row + 1;
-                if (load_start < 0) load_start = 0;
-                int load_end = ih_window_max;
-                if (load_end >= (int)in_h) load_end = (int)in_h - 1;
+                const RowLoad rl = row_load_descriptor(
+                    last_loaded_row, oh, stride_h, pad_top, kh, dilation_h,
+                    in_h, iw_load_start, iw_load_last, in_w);
 
-                // Clip the ow_tile's iw range to valid input columns.
-                int iw_clipped_start = iw_load_start;
-                if (iw_clipped_start < 0) iw_clipped_start = 0;
-                int iw_clipped_last  = iw_load_last;
-                if (iw_clipped_last >= (int)in_w)
-                    iw_clipped_last = (int)in_w - 1;
-
-                // Number of input columns this ow_tile needs from each row
-                // (0 when the whole window is in the padding).
-                const int iw_count_i = iw_clipped_last - iw_clipped_start + 1;
-                const unsigned iw_count = (iw_count_i > 0) ? (unsigned)iw_count_i : 0u;
-
-                for (int ih = load_start; ih <= load_end; ih++) {
-                    const unsigned slot =
-                        (unsigned)ih & (kMaxLineBufRows - 1);
-                    // §2.28 explicit read bursts: request every channel's
-                    // run of this row FIRST, then drain the data.  With a
-                    // plain pointer each (row, channel) run was one inferred
-                    // burst issued only after the previous one completed —
-                    // the RTL trace showed 69 cycles per 16-element burst
-                    // with a single read in flight, which made depthwise
-                    // layers read-bound at ~4.3 cycles/element.  Up to
-                    // ch_valid (<= kTileIC = num_read_outstanding) requests
-                    // are now in flight while the first one's data streams
-                    // in.
-                    if (iw_count > 0) {
-                        for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned c     = ch_off + ch_l;
-                            const unsigned x_row = (ni * in_ch + c) * in_hw
-                                                 + (unsigned)ih * in_w;
-                            x.read_request(x_row + (unsigned)iw_clipped_start,
-                                           iw_count);
-                        }
-                    }
-                    for (unsigned ch_l = 0; ch_l < ch_valid; ch_l++) {
-                        const unsigned c     = ch_off + ch_l;
-                        const unsigned x_row = (ni * in_ch + c) * in_hw
-                                             + (unsigned)ih * in_w;
-                        for (int iw = iw_clipped_start;
-                             iw <= iw_clipped_last; iw++) {
-                            #pragma HLS PIPELINE II=1
-                            const size_t addr = x_row + (unsigned)iw;
-                            const unsigned col_slot =
-                                (unsigned)iw & (kMaxLineBufCols - 1);
-                            line_buf[ch_l][slot][col_slot] = x.read();
-
+                for (int ih = rl.load_start; ih <= rl.load_end; ih++) {
+                    const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
+                    for (unsigned j = 0; j < rl.iw_count; j++) {
+                        #pragma HLS PIPELINE II=1
+                        const ColVec   v  = col_stream.read();
+                        const int      iw = rl.iw_start + (int)j;
+                        const unsigned cs = (unsigned)iw & (kMaxLineBufCols - 1);
+                        for (unsigned cc = 0; cc < kTileIC; cc++) {
+                            #pragma HLS UNROLL
+                            line_buf[cc][slot][cs] = v.lane[cc];
 #ifdef DEBUG_LOAD_DATA_CACHING
-                            line_tag[ch_l][slot][col_slot] = tag_of(ch_l, ih, iw);
-                            if (debug_reads) {
-                            CycleCounters counters;
-                            counters.mt   = is_depthwise ? ct : 0u;
-                            counters.ni   = ni;
-                            counters.ict  = is_depthwise ? (unsigned)-1 : ct;
-                            counters.ic_l = ch_l;
-                            counters.oh   = oh;
-                            counters.ow   = owt;
-                            counters.khi  = (unsigned)ih;
-                            counters.kwi  = (unsigned)iw;
-                            read_addresses[addr].push_back(counters);
-                            }
-#endif /* DEBUG_LOAD_DATA_CACHING */
+                            if (cc < ch_valid) line_tag[cc][slot][cs] = tag_of(cc, ih, iw);
+#endif
                         }
                     }
                 }
-                if (load_end > last_loaded_row) {
-                    last_loaded_row = load_end;
+                if (rl.load_end > last_loaded_row) {
+                    last_loaded_row = rl.load_end;
                 }
 
                 for (unsigned ow = ow_start; ow < ow_end; ow++) {
@@ -832,18 +1073,6 @@ static void input_patch_producer(
         } // channel-tile loop
       } // chunk loop
     } // batch loop
-
-#ifdef DEBUG_LOAD_DATA_CACHING
-    if (debug_reads) for (auto it : read_addresses) {
-        if (it.second.size() > 1) {
-            std::cout << it.first << " --> " << std::endl;
-
-            for (auto l_item : it.second) {
-                std::cout << "\t" << l_item << std::endl;
-            }
-        }
-    }
-#endif /* DEBUG_LOAD_DATA_CACHING */
 }
 
 // ---------------------------------------------------------------------------
@@ -1631,7 +1860,7 @@ static void process_conv_kernel_tile(
 }
 
 void ConvKernel(
-    hls::burst_maxi<Data_t>     x,
+    hls::burst_maxi<XWord>      x,
     hls::burst_maxi<WeightWord> weight,
     hls::burst_maxi<WeightWord> bias,
     hls::burst_maxi<YWord>      y,
@@ -1690,7 +1919,9 @@ void ConvKernel(
     // defaults).  Same settings as VectorOP.cpp; y is an hls::burst_maxi
     // port driven by explicit write_request/write/write_response (see
     // write_output_tile).
-    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X      max_read_burst_length=256  num_read_outstanding=16
+    // x is a 128-bit port (§2.39): one read_request per (row, channel) run
+    // of <= kMaxLineBufCols/8 + 1 = 9 words, up to kTileIC = 16 in flight.
+    #pragma HLS INTERFACE m_axi port=x       offset=slave bundle=gmem0 depth=CONV_COSIM_DEPTH_X_WORDS max_read_burst_length=16 num_read_outstanding=16
     // weight / bias are 128-bit ports (§2.32).  Their adapter buffers scale
     // with burst_length × outstanding × 16 B, so they are sized to what the
     // producers actually issue: a weight slab request is <= 2*kMaxKH*kMaxKW
@@ -1832,10 +2063,23 @@ void ConvKernel(
     hls_thread_local hls::stream<WeightVec> weight_stream;
     #pragma HLS STREAM variable=weight_stream depth=kTileM*kMaxKH*kMaxKW
 
+    // col_stream carries one input column of all kTileIC channels per
+    // beat from x_row_loader to the producer's Phase 1 (§2.39).  Depth =
+    // four rows of the widest tile (kMaxLineBufCols) so the loader runs
+    // ahead of the producer by several rows.
+    hls_thread_local hls::stream<ColVec> col_stream;
+    #pragma HLS STREAM variable=col_stream depth=4*kMaxLineBufCols
+    // 256 x 256-bit in BRAM cost 15 BRAM18; the URAM pool is idle (§2.26).
+    #pragma HLS BIND_STORAGE variable=col_stream type=fifo impl=uram
+
     bias_producer(bias, bias_stream,
                   out_ch, bias_rep_count, has_bias);
 
-    input_patch_producer(x, patch_stream, batch, in_ch, in_h, in_w,
+    x_row_loader(x, col_stream, batch, in_ch, in_h, in_w,
+        out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
+        dilation_w, pad_top, pad_left, is_depthwise, geom);
+
+    input_patch_producer(col_stream, patch_stream, batch, in_ch, in_h, in_w,
         out_ch, out_h, out_w, kh, kw, stride_h, stride_w, dilation_h,
         dilation_w, pad_top, pad_left, is_depthwise, geom
     );
@@ -1859,10 +2103,11 @@ void ConvKernel(
     // leftover tokens (or earlier as a read-on-empty inside the consumer)
     // instead of as a DATAFLOW hang in RTL.
     if (!patch_stream.empty() || !weight_stream.empty() ||
-        !bias_stream.empty()  || !acc_stream.empty()) {
+        !bias_stream.empty()  || !acc_stream.empty() || !col_stream.empty()) {
         std::cerr << "ConvKernel: leftover stream tokens after run — patch="
                   << patch_stream.size() << " weight=" << weight_stream.size()
                   << " bias=" << bias_stream.size() << " acc=" << acc_stream.size()
+                  << " col=" << col_stream.size()
                   << std::endl;
         assert(!"stream token accounting");
     }

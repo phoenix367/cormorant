@@ -248,11 +248,12 @@ static std::vector<Data_t> pad_conv_bias(const std::vector<Data_t>& b, unsigned 
     return out;
 }
 
-// Pack Data_t elements into the WeightWord beats the 128-bit ports read
-// (lane 0 in the low bits, i.e. the lowest DDR address).
+// Pack Data_t elements into the 128-bit beats the ports read (lane 0 in
+// the low bits, i.e. the lowest DDR address).  One spare word so a run
+// that ends mid-word never reads past the buffer (x, §2.39).
 static std::vector<WeightWord> to_weight_words(const std::vector<Data_t>& e)
 {
-    std::vector<WeightWord> out((e.size() + kWeightPortElems - 1) / kWeightPortElems);
+    std::vector<WeightWord> out(e.size() / kWeightPortElems + 1);
     for (auto& wd : out) wd = 0;
     for (size_t i = 0; i < e.size(); i++) {
         const unsigned lane = (unsigned)(i % kWeightPortElems);
@@ -274,7 +275,7 @@ static std::vector<WeightWord> to_weight_words(const std::vector<Data_t>& e)
 // single source of truth that feeds the depth= hints on ConvKernel.cpp.
 // ---------------------------------------------------------------------------
 #ifdef CONV_COSIM
-static Data_t     g_x[CONV_COSIM_DEPTH_X];
+static XWord      g_x[CONV_COSIM_DEPTH_X_WORDS];
 static WeightWord g_w[CONV_COSIM_DEPTH_WEIGHT_WORDS];
 static WeightWord g_b[CONV_COSIM_DEPTH_BIAS_WORDS];
 static YWord      g_y[CONV_COSIM_DEPTH_Y_WORDS];
@@ -455,9 +456,11 @@ static int run_test(const char* name, const ConvParams& p,
     // per-test std::vector storage directly.  b_ptr is always a valid pointer
     // (the kernel guards bias reads by has_bias).
     // -----------------------------------------------------------------------
-    // Pack weights / bias into the kernel's DDR layout and port words.
+    // Pack weights / bias into the kernel's DDR layout and port words; x
+    // keeps its NCHW element order, packed 8 lanes per word (§2.39).
     const std::vector<WeightWord> w_words = to_weight_words(pack_conv_weights(p, w_data));
     const std::vector<WeightWord> b_words = to_weight_words(pad_conv_bias(b_data, p.out_ch));
+    const std::vector<XWord>      x_words = to_weight_words(x_data);
 
     // y: whole words (§2.38), every lane pre-set to the sentinel.
     const unsigned y_words = y_size / kYPortElems + 1;
@@ -466,24 +469,24 @@ static int run_test(const char* name, const ConvParams& p,
         sentinel_word.range(kDataBits * (l + 1) - 1, kDataBits * l) = kYSentinel;
 
 #ifdef CONV_COSIM
-    if (x_data.size() > CONV_COSIM_DEPTH_X ||
+    if (x_words.size() > CONV_COSIM_DEPTH_X_WORDS ||
         w_words.size() > CONV_COSIM_DEPTH_WEIGHT_WORDS ||
         b_words.size() > CONV_COSIM_DEPTH_BIAS_WORDS ||
         y_words       > CONV_COSIM_DEPTH_Y_WORDS) {
         printf("%-55s SKIP (exceeds cosim buffers)\n", name);
         return 0;
     }
-    std::copy(x_data.begin(), x_data.end(), g_x);
+    std::copy(x_words.begin(), x_words.end(), g_x);
     std::copy(w_words.begin(), w_words.end(), g_w);
     std::copy(b_words.begin(), b_words.end(), g_b);
     for (unsigned i = 0; i < y_words; i++) g_y[i] = sentinel_word;
-    const Data_t*     x_ptr = g_x;
+    XWord*            x_ptr = g_x;
     WeightWord*       w_ptr = g_w;
     WeightWord*       b_ptr = g_b;
     YWord*            y_ptr = g_y;
 #else
     std::vector<YWord> y_got(y_words, sentinel_word);
-    const Data_t*     x_ptr = x_data.data();
+    XWord*            x_ptr = const_cast<XWord*>(x_words.data());
     WeightWord*       w_ptr = const_cast<WeightWord*>(w_words.data());
     WeightWord*       b_ptr = const_cast<WeightWord*>(b_words.data());
     YWord*            y_ptr = y_got.data();
@@ -491,7 +494,7 @@ static int run_test(const char* name, const ConvParams& p,
 
     // All four ports are hls::burst_maxi<>; the pointer constructors take
     // non-const pointers (the kernel only ever reads through x / w / b).
-    ConvKernel(const_cast<Data_t*>(x_ptr), w_ptr, b_ptr, y_ptr,
+    ConvKernel(x_ptr, w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
                p.kh, p.kw,

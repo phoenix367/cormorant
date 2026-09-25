@@ -69,6 +69,7 @@ after running the full TestConvRef case list.
 | Snapshot post-§2.36 (40 tests, captured 2026-09-25 on `perf/dwconv`) | 40 | 7,982,735 | — | — |
 | + flat depthwise sweep (§2.37) | 40 | 7,666,615 | **-4.0 %** | — |
 | + 8-lane drain, 128-bit y with byte strobes (§2.38) | 43 (39 common) | 6,093,330 (common) | **-20.4 %** | — |
+| + 128-bit x, `x_row_loader` split (§2.39) | 43 (39 common) | 5,537,890 (common; 7,744,540 all 43) | **-9.1 %** (-10.0 % on the 42 common with §2.38) | -30.5 % vs the §2.36 snapshot |
 
 **Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
@@ -1639,7 +1640,121 @@ resolved by §2.39's loader split).
 
 ---
 
-## 3. Current architecture (post-§2.35)
+### 2.39. 128-bit `x` port, `x_row_loader` split, LUTRAM line buffer
+
+**Problem.**  Phase 1 of the patch producer read `x` one 16-bit element
+per cycle AND did so serially with its own patch emission (the same
+process), so a depthwise layer spent 28 % of its time (60 % for stride-2
+layers) waiting for rows it could have prefetched (plan §3).
+
+**Change.**  `x` becomes `hls::burst_maxi<XWord>` (`ap_uint<128>`).  A new
+DATAFLOW process `x_row_loader` owns the port: it walks the producer's
+`(ni, chunk, ct, ow_tile, grp, oh)` schedule with the same
+`row_load_descriptor()` (shared inline helper, so both sides count the
+same words), requests all `ch_valid` channel runs of a row first (≤ 16 in
+flight, §2.28) and drains their whole words onto a 512-deep 128-bit
+`row_stream`.  The producer's Phase 1 pops one word per cycle and writes
+its 8 lanes into `line_buf` re-banked as
+`[channel][column bank][row_slot·8 + column word]` — 16 × 8 = 128 LUTRAMs
+of 128 entries (`RAM_S2P impl=LUTRAM`): the lanes are rotated by the
+word's first column so bank *b* takes the lane whose column ≡ *b* (mod 8),
+out-of-run lanes of the first / last word are dropped by a per-lane
+enable, and the channel is selected by an unrolled 16-way compare so every
+RAM sees exactly one conditional store (§2.35's rule).  Phase 2 reads one
+column of all 16 channels per cycle — 16 RAMs, bank = `col_slot & 7`,
+address `slot·8 + col_slot/8`.  Port options `max_read_burst_length=16
+num_read_outstanding=16` (a run is ≤ 64 columns + 7 = 9 words).  The
+loader runs ahead of the producer by the FIFO depth, so the DDR latency
+and most of the word traffic overlap the MAC sweep.  x is packed by the
+C-sim bench with the same `to_weight_words` (NCHW order, 8 lanes per
+word); the RTL fixtures are unchanged (x.hex is element order at an
+aligned base).  New fixtures: `DW 3x3 12ch 33x37` (in_w % 8 = 5, every x
+row starts mid-word, output runs of 1221) and `DW 3x3 s2 16ch 27x29`
+(stride 2, unaligned odd-length rows).
+
+**Traps.**  (1) A `word.range(hi, lo)` with a RUNTIME lane index is a
+128-bit barrel shifter per use — the first loader synthesised sixteen of
+them at 423 LUT each (9.7 k LUT in one loop); split the word into lanes
+with constant ranges first and select with an 8:1 16-bit mux.
+(2) **Tried and rejected — line_buf as 128 LUTRAM column banks** (the
+plan's `cyclic factor=8 dim=3` form, one RAM per (channel, column
+bank), 8 lanes written per cycle with an explicit rotate + 16-way
+channel compare): II=1 and BRAM 157 (the 16 line_buf BRAM18 freed), but
+LUT 71.0 k (+13 k over §2.38: the 128 RAMs are 4 k LUT of memory plus
+their write/read muxing) — LUT is the design's tight resource.  The
+column-vector loader above keeps line_buf in its 16 BRAM18 channel
+banks, needs only a 32-word-per-channel LUTRAM row buffer, and is FASTER
+on standard tiles (16 elements per cycle instead of 8).
+(3) `col_stream` (256 beats × 256 bits) in BRAM cost 15 BRAM18 —
+`BIND_STORAGE type=fifo impl=uram` puts it in the idle URAM pool for
+4 blocks.
+(4) **A variable-trip subloop silently un-pipelines its parent.**  The
+first merged drain/emit loop skipped zero-word channels with a
+`while (d_q >= nw[d_ch]) { d_ch++; ... }`; HLS reported
+`WARNING: [SCHED 204-65] Unable to satisfy pipeline directive ...
+contains subloop(s) that are not unrolled or flattened`, left the loop
+as plain FSM states (5.5 cycles per word — an FSM-state trace of the
+loader in the RTL bench showed states 16→20 cycling once per word), and
+the csynth summary showed it only as `Pipelined = no` with no II entry,
+so a scan for II violations missed it.  The stride-2 depthwise case was
+loader-bound at 220 cycles per input row.  Fix: one compare per word
+(every channel of a non-empty row has ≥ 1 word).  Lesson for
+`conv-verify`: grep the synthesis log for `SCHED 204-65` / `Unable to
+satisfy pipeline directive`, and check every `PIPELINE` loop's
+`Pipelined` column, not only the II column.
+
+**Result.**  **-859 740 ns (-10.0 %)** on the 42 cases common with
+§2.38 (8 604 280 → 7 744 540 ns), **-30.5 %** vs the §2.36 snapshot on its
+39 cases (7 966 950 → 5 537 890 ns), **43/43 RTL PASS** with the
+tail-pad strobe check on every case, bit-exact (grid / named 43 / sweep
+2×300).  The depthwise layers are where the input loads were:
+`DW oh-chunking 32ch 32x32` **-42.9 %** (86.1 k → 49.1 k cycles;
+**-66 %** since the §2.36 snapshot, 145.7 k → 49.1 k), `DW s2 16ch 27x29`
+**-64.5 %** (stride 2 loads two rows per output row), `DW 12ch 33x37`
+**-36.0 %**, the small depthwise cases -16…-25 %; `ow-tiling in_w=128`
+-17.8 % (per-tile row reloads), `batch_3 ResNet-style s2` -19.7 %,
+`partial_IC_tile` -7.5 %, `14x14 multi-tile` -2.4 %, the M-grouped 3×3
+cases -0.6…-2.5 % and `1x1 32->16 40x64` -3.3 % (their loads were a
+small share and now overlap the sweep); the 1-channel 25-output cases
+±5 %.  Synthesis: II=1 on every PIPELINE loop (merged loader loop
+latency 5, `Pipelined = yes` verified for all), slack 0.00, all four
+ports `128 -> 128`, BRAM 165 (unchanged: the 16 line_buf BRAM18 stay,
+the column FIFO is in URAM), DSP 262, FF 46.1 k, LUT 68.4 k (+10.6 k over
+§2.38: the row buffer, its 16 lane muxes twice — merged loop and flush —
+and the per-row descriptors), URAM 16.  Cycle model: loads = producer
+fill (`cols + 12` per row) + the loader's excess over `sweep + fill`
+with `loader_row = ch·(words + 1) + ch + 64` (request loop, ~49 cycles
+of DDR latency, ramp); the standard per-pixel overhead constant raised
+6 → 12 (the three per-pixel loop ramps were under-counted since §2.29);
+validation 6.2 % mean over all 43 cases, 4.1 % on the > 20 k-cycle
+cases, every DW_* case within 10 % except the 1–2 k-cycle stubs.
+
+**Bench.**  The first suite run flagged one case on the new tail-pad
+check although the kernel's beat carried `WSTRB = 0x00ff` (probe): the
+PS VIP's racing DDRC write had deposited the line's pre-poison contents
+(a previous case's outputs at the same DDR line) into the unstrobed
+bytes.  `conv_tb.sv` now restores unstrobed bytes from a shadow of
+every byte the bench or a strobed beat wrote (`ddrc_wr_fix`), so the
+check is a true test of the kernel's strobes; a +VERBOSE FSM-state
+trace of `x_row_loader` was added (it located trap 4).
+
+**Board-verification items.**  Partial-strobe 128-bit beats on runs
+that start / end mid-word (§2.38), and the 128-bit `x` reads with
+unaligned row starts (`in_w % 8 ≠ 0`, `in_h·in_w % 8 ≠ 0`); the
+`hw/cormorant_hw_128` `ConvKernel_0` instance must carry
+`C_M_AXI_GMEM0_DATA_WIDTH = 128` and `C_M_AXI_GMEM3_DATA_WIDTH = 128`
+(all four ports at the IP default) — see §2.36 for why a stale 32 would
+still "work" slowly with partial strobes the PS may drop.
+
+**Not done (next levers, model-based).**  A §2.37-style flat sweep for
+the standard path with `G = 1` (1×1 layers: ~20 cycles per pixel of
+which 1 is a MAC — 44 % of MobileNet v2's conv time), and issuing row
+r+1's requests before draining row r in the loader (the ~49-cycle DDR
+latency is paid once per input row).
+
+---
+
+## 3. Current architecture (post-§2.39)
 
 ```mermaid
 flowchart LR
@@ -1647,35 +1762,43 @@ flowchart LR
     DDR_W[("weight<br/>gmem1")]
     DDR_B[("bias<br/>gmem2")]
     DDR_Y[("y<br/>gmem3")]
-    IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
+    XRL["x_row_loader<br/><i>128-bit x words → 16-channel column vectors (§2.39)</i><br/>owns the ping-pong row buffer"]
+    IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf, one column of all channels written per cycle (§2.39)<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
     SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
-    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
-    WO["<i>output write</i>"]
+    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35) + Phase-3 transposer (§2.38)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); flat depthwise sweep (§2.37); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
+    WO["<i>output write</i><br/><i>128-bit words re-aligned per run, byte strobes at run ends (§2.38)</i>"]
 
-    DDR_X -->|m_axi read| IPP
+    DDR_X -->|m_axi read, 128-bit| XRL
+    XRL -->|col_stream| IPP
     DDR_W -->|m_axi read| SLW
     DDR_B -->|m_axi read| BP
     IPP -->|patch_stream| PCT
     SLW -->|weight_stream| PCT
     BP -->|bias_stream| PCT
-    PCT -->|acc_stream| WO
-    WO -->|m_axi write| DDR_Y
+    PCT -->|acc_stream, 128-bit| WO
+    WO -->|m_axi write, 128-bit| DDR_Y
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
     classDef stage fill:#e6f7ff,stroke:#1890ff,color:#003a8c
     class DDR_X,DDR_W,DDR_B,DDR_Y ddr
-    class IPP,SLW,BP,PCT,WO stage
+    class XRL,IPP,SLW,BP,PCT,WO stage
 ```
 
 > Verify against `csynth.rpt`: the top-level `ConvKernel*` row reports
 > `Pipelined = dataflow` and the immediate children are `entry_proc`,
-> `Block_entry_proc`, `input_patch_producer`, `bias_producer`,
-> `stream_load_weights`, `process_conv_kernel_tile`.
+> `Block_entry_proc`, `x_row_loader`, `input_patch_producer`,
+> `bias_producer`, `stream_load_weights`, `process_conv_kernel_tile`,
+> `write_output_tile`.
 
-**Five dataflow stages** (was six before §2.15 removed
-`broadcast_patches`), all running concurrently:
+**Six dataflow stages** (five from §2.15 to §2.38; §2.39 split the DDR
+reader out of the patch producer), all running concurrently:
 
+0. **`x_row_loader`** (§2.39) — owns `gmem0` (128-bit
+   `hls::burst_maxi<XWord>`).  Walks the producer's row schedule, requests
+   all `ch_valid` channel runs of a row up front, drains their words into
+   a ping-pong LUTRAM row buffer and emits the row as one 16-channel
+   column vector per cycle on `col_stream` (URAM FIFO, 4 rows deep).
 1. **`input_patch_producer`** — one assembler for both modes (§2.14).
    Owns a single `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]`
    partitioned `complete dim=1` (§2.12) with circular indexing on row

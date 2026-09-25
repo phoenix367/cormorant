@@ -34,6 +34,13 @@ DRAIN_SEG        = 256   # §2.38: Phase-3 transposer segment (pixels); one extr
 DRAIN_STEP_RAMP  = 6
 ARCH             = 39    # newest step modelled; overridden by --arch
 ROW_FILL_LATENCY = 12    # §2.39: per-row Phase-1 entry (the loader has the words parked in the FIFO)
+ROW_LOADER_SETUP = 64    # §2.39: per-row request loop + first-data DDR latency (~49) + merged-step ramp
+PIXEL_OVERHEAD   = 12    # standard path: per-(pixel, group) load / sweep / store loop ramps (was 6)
+
+def loader_row_cycles(ch, cols):
+    """§2.39 x_row_loader time per input row: one 128-bit word per cycle for the
+    ch channel runs (each up to ceil(cols/8)+1 words when unaligned) + setup."""
+    return ch * (-(-cols // 8) + 1) + ch + ROW_LOADER_SETUP
 
 def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise):
     """Cycle model.  The patch producer is SEQUENTIAL per row: it loads a row's
@@ -69,7 +76,11 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                     sweep += rows * tw * kh * kw + DW_TILE_RAMP
                     if ARCH >= 39:
                         # §2.39: Phase 1 writes one column of all channels per cycle
-                        loads += in_rows * (cols + ROW_FILL_LATENCY)
+                        # (serial with the sweep); the loader runs in parallel and
+                        # only its excess over sweep + fill is exposed.
+                        fill_c = in_rows * (cols + ROW_FILL_LATENCY)
+                        ldr    = in_rows * loader_row_cycles(mv, cols)
+                        loads += fill_c + max(0, ldr - (rows * tw * kh * kw + fill_c))
                     else:
                         loads += in_rows * (mv * cols + ROW_LOAD_LATENCY)
         else:
@@ -79,15 +90,20 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
+                    sweep_blk = sum(rows * tw * (min(mtg, m_tiles - g * mtg) * kh * kw
+                                                 + 2 * min(mtg, m_tiles - g * mtg) + PIXEL_OVERHEAD)
+                                    for g in range(groups))
                     if ARCH >= 39:
-                        loads += in_rows * (cols + ROW_FILL_LATENCY)         # §2.39, grp 0 only
+                        fill_c = in_rows * (cols + ROW_FILL_LATENCY)         # §2.39, grp 0 only
+                        ldr    = in_rows * loader_row_cycles(icv, cols)
+                        loads += fill_c + max(0, ldr - (sweep_blk + fill_c))
                     else:
                         loads += in_rows * (icv * cols + ROW_LOAD_LATENCY)   # grp 0 only
                     for g in range(groups):
                         mt0 = g * mtg; G = min(mtg, m_tiles - mt0)
                         mv_sum = sum(min(P["TILE_M"], out_ch - (mt0 + i) * P["TILE_M"]) for i in range(G))
                         f = mv_sum * kh * kw * lanes / E            # beats at 1/cycle
-                        s_ = rows * tw * (G * kh * kw + 2 * G + 6)
+                        s_ = rows * tw * (G * kh * kw + 2 * G + PIXEL_OVERHEAD)
                         # §2.35 ping-pong: the NEXT slab's fill overlaps this sweep
                         # (one vector per sweep iteration, producer-bound at 2
                         # cycles per 16-lane vector); only the part the sweep
