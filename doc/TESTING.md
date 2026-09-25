@@ -44,9 +44,14 @@ Some tests run generated C on the host: `test/host_emu.py` compiles a
 project's `inference.c` + `test_inference.c` unchanged against software
 models of the VectorOP / Matmul drivers (register semantics of the kernels,
 executed at Start) and a malloc-backed buffer pool, runs it, and requires
-`test_inference PASSED` — the generated host-op code, its staging and the
-kernel call parameters must reproduce the scheduler simulation bit for bit
-(`test_bert_tiny.py`, `test_split_int.py`).  `test_bert_base.py` does the
+`test_inference PASSED` — the generated host-op code (in place on cacheable
+buffers and staged on non-cacheable ones, lookup tables, 1 / 3 / 4 host
+threads) and the kernel call parameters must reproduce the scheduler
+simulation bit for bit (`test_bert_tiny.py`, `test_split_int.py`).
+`test_cache_coherency.py` walks the emitted `inference_run()` of every model
+with a per-buffer cache-state model and fails on any missing flush /
+invalidate at a CPU ↔ kernel hand-off (the DMA buffers are mapped cacheable
+on the board).  `test_bert_base.py` does the
 same for BERT-base and checks the simulation against the BERT study's
 independent emulation; it is opt-in (435 MB model, ~2 min):
 
