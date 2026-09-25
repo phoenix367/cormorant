@@ -163,7 +163,7 @@ residual-lane padding for any `out_w`).
       "max_m_per_group":         4
     },
     "matmul": {
-      "tile_n":   4, "tile_m":  16, "tile_k": 256, "max_k": 2048
+      "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 2048
     },
     "pool": {
       "tile_c":            8,

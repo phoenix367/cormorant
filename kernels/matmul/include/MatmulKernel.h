@@ -94,7 +94,8 @@ inline ap_uint<kMatmulDataBits> matmul_data_to_lane(Data_t v) {
 // matmul_packed_m(m) = ceil(m / kTileM) * kTileM.  A (m_tile, k_tile) block
 // is then ONE contiguous run of k_valid * kTileM elements
 // (k_valid * kMatmulWordsPerTileRow words) instead of k_valid separate
-// ≤ 3-word row segments — the scheduler emits constant weights this way.
+// ≤ kMatmulMaxRowWords-word row segments — the scheduler emits constant
+// weights this way.
 // Batch slices are k * packed_m elements apart; b_batch_stride /
 // b_outer offsets are element counts in the PACKED image.
 // ---------------------------------------------------------------------------
@@ -106,6 +107,36 @@ inline unsigned matmul_packed_m(unsigned m) {
 inline unsigned matmul_packed_index(unsigned kk, unsigned mm, unsigned k) {
     return ((mm / kTileM) * k + kk) * kTileM + (mm % kTileM);
 }
+
+// Rotate the lanes of a port word right by `shift` lanes: lane j of the
+// result is lane (j + shift) mod kMatmulPortElems of the input.  Written as
+// a chain of constant rotates selected by `shift` so HLS builds ONE
+// kMatmulPortElems-way mux of the whole word; a per-lane / per-column
+// variable part-select (`word.range(16 * (l + 1) - 1, 16 * l)` with a
+// runtime l) costs a full 128-bit barrel shifter per destination
+// (MATMUL_OPTIMISATION.md §6: 17.9 k + 9 k LUT in the two scatter loops).
+inline MatmulWord matmul_rotate_lanes(MatmulWord w, unsigned shift) {
+    #pragma HLS INLINE
+    MatmulWord r = w;
+    for (unsigned s = 1; s < kMatmulPortElems; s++) {
+        #pragma HLS UNROLL
+        if (shift == s)
+            r = (w >> (kMatmulDataBits * s)) |
+                (w << (kMatmulPortBits - kMatmulDataBits * s));
+    }
+    return r;
+}
+
+// Lane j (a compile-time constant at every use) of a port word.
+inline Data_t matmul_word_lane(MatmulWord w, unsigned j) {
+    #pragma HLS INLINE
+    return matmul_lane_to_data(w.range(kMatmulDataBits * (j + 1) - 1, kMatmulDataBits * j));
+}
+
+// Bits needed to hold the value v (e.g. 9 for 256): narrow HLS counters.
+constexpr unsigned matmul_bits_for(unsigned v) { return v == 0 ? 0 : 1 + matmul_bits_for(v >> 1); }
+// Most words a run of kTileM elements at any lane offset can span.
+static constexpr unsigned kMatmulMaxRowWords = (kTileM + kMatmulPortElems - 1) / kMatmulPortElems + 1;
 
 // Number of words that cover `count` elements starting at element `off`.
 inline unsigned matmul_words_for(unsigned off, unsigned count) {
