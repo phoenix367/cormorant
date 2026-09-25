@@ -24,7 +24,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
                             OneHotNode, SliceNode, SoftmaxNode, TransposeNode)
-from src.nodes import MatmulNode, ScheduledNode, SchedulerError
+from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode, SchedulerError
 from src.report import ReportGenerator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +84,9 @@ class TestPartition(_Tiny):
             self.assertEqual(kinds[CastNode], 1, fname)
             self.assertEqual(kinds[SliceNode], 2, fname)
             # 6 Gemm per layer + head Gemm, QK^T and PV, OneHot x token-type
-            self.assertEqual(kinds[MatmulNode], 6 * L + 1 + 2 * L + 1, fname)
+            # (on MatmulKernel or lowered onto ConvKernel, test_matmul_engines)
+            self.assertEqual(kinds[MatmulNode] + kinds[MatmulConvNode],
+                             6 * L + 1 + 2 * L + 1, fname)
             # Gemm biases, residual / embedding / mask Adds, mask Sub / Muls, scale Mul
             self.assertEqual(kinds[ScheduledNode], (6 * L + 1) + 2 * L + 2 + 3 + L + L, fname)
             fused = m["style"] != "native"
@@ -98,13 +100,39 @@ class TestPartition(_Tiny):
                                  ("ReduceMean", "Pow", "Sqrt", "Reciprocal", "Tanh", "Erf"))
 
     def test_attention_matmuls_batched(self):
-        m = self.models["bert_tiny_h64_l2.onnx"]
+        for fname in ("bert_tiny_h64_l2.onnx", "bert_tiny_h128_s64.onnx"):
+            m = self.models[fname]
+            g, _ = self.gen(m["path"])
+            att = [sn for sn in g.nodes
+                   if isinstance(sn, (MatmulNode, MatmulConvNode)) and sn.batch > 1]
+            self.assertEqual(len(att), 2 * m["layers"])
+            S, dh = m["seq"], m["hidden"] // m["heads"]
+            self.assertEqual({(sn.n, sn.k, sn.m, sn.batch) for sn in att},
+                             {(S, dh, S, m["heads"]), (S, S, dh, m["heads"])})
+
+    def test_matmul_engines(self):
+        """Default engine choice (BERT_PLAN 2A): seq 8 keeps every MatMul on
+        MatmulKernel (fewer rows than one ConvKernel output-channel tile);
+        at seq 64 every linear and attention MatMul runs on ConvKernel —
+        the linears as 1x2 convs over re-laid-out constant weights, the
+        attention as one call per head — and only the K = 2 token-type
+        MatMul and the M = 2 head Gemm stay on MatmulKernel."""
+        g, _ = self.gen(self.models["bert_tiny_h32_l1.onnx"]["path"])
+        self.assertFalse(any(isinstance(sn, MatmulConvNode) for sn in g.nodes))
+        m = self.models["bert_tiny_h128_s64.onnx"]
         g, _ = self.gen(m["path"])
-        att = [sn for sn in g.nodes if isinstance(sn, MatmulNode) and sn.batch > 1]
-        self.assertEqual(len(att), 2 * m["layers"])
-        S, dh = m["seq"], m["hidden"] // m["heads"]
-        self.assertEqual({(sn.n, sn.k, sn.m, sn.batch) for sn in att},
-                         {(S, dh, S, m["heads"]), (S, S, dh, m["heads"])})
+        low = [sn for sn in g.nodes if isinstance(sn, MatmulConvNode)]
+        kept = [sn for sn in g.nodes if isinstance(sn, MatmulNode)]
+        self.assertEqual(len(low), 8 * m["layers"])
+        self.assertEqual(sorted((sn.k, sn.m) for sn in kept), [(2, 128), (128, 2)])
+        lin = [sn for sn in low if sn.batch == 1]
+        att = [sn for sn in low if sn.batch > 1]
+        self.assertTrue(all(sn.kw > 1 and sn.b_relayout for sn in lin))
+        self.assertTrue(all(sn.kw == 1 and sn.calls == m["heads"] for sn in att))
+        self.assertEqual(g.matmul_conv_stats["lowered"], 8)
+        self.assertEqual(g.matmul_conv_stats["conv_calls"], 6 + 2 * m["heads"])
+        g, _ = self.gen(m["path"], matmul_on_conv="off")
+        self.assertFalse(any(isinstance(sn, MatmulConvNode) for sn in g.nodes))
 
     def test_fusion_off_is_rejected(self):
         # without the pre-pass the first failure is the ones x mask broadcast

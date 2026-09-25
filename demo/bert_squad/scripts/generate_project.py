@@ -7,7 +7,8 @@ for the BERT-SQuAD demo.
      activation fusion) -> CMake C project in build/project/, with the
      76 large weight tensors as build/project/weights/*.dat (208 MB).
   2. driver/ populated from local.driver_dirs for the active kernels
-     (VectorOPKernel, MatmulKernel).
+     (VectorOPKernel, ConvKernel — the MatMuls, BERT_PLAN 2A — and
+     MatmulKernel for the two MatMuls that stay there).
   3. src/squad_bench.c copied to test/, plus a generated test/bench_glue.h:
      the buffer order of inference_run(), each buffer's numel macro and the
      index of each role (input_ids, segment_ids, input_mask, unique_ids,
@@ -42,7 +43,7 @@ from src.graph import OnnxGraph                # noqa: E402
 from src.host_nodes import (GeluNode, HostNode, LayerNormNode,  # noqa: E402
                             SoftmaxNode, TransposeNode)
 from src.kernels import KERNEL_REGISTRY        # noqa: E402
-from src.nodes import MatmulNode, ScheduledNode  # noqa: E402
+from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode  # noqa: E402
 
 SRC_DIR = DEMO_DIR / "src"
 
@@ -52,7 +53,7 @@ KINDS = ("MatMul linear", "MatMul attention", "VectorOP", "LayerNorm", "GELU",
 
 
 def node_kind(sn) -> str:
-    if isinstance(sn, MatmulNode):
+    if isinstance(sn, (MatmulNode, MatmulConvNode)):
         return "MatMul linear" if sn.inputs[1].is_weight else "MatMul attention"
     if isinstance(sn, ScheduledNode):
         return "VectorOP"
@@ -237,9 +238,14 @@ def write_layers(project_dir: Path, g: OnnxGraph) -> List[dict]:
         rec = {"i": sn.index, "name": sn.onnx_node.name or sn.output.onnx_name,
                "op": sn.onnx_node.op_type, "engine": node_engine(sn),
                "kind": node_kind(sn), "out_numel": sn.output.numel}
-        if isinstance(sn, MatmulNode):
+        if isinstance(sn, (MatmulNode, MatmulConvNode)):
             rec["macs"] = sn.n * sn.k * sn.m * sn.batch * sn.outer_count
             rec["nkm"] = [sn.n, sn.k, sn.m, sn.batch * sn.outer_count]
+        if isinstance(sn, MatmulConvNode):
+            # the engine cost model's estimate, for model-vs-board per kind
+            rec["conv"] = {"kw": sn.kw, "out_h": sn.out_h, "out_w": sn.out_w,
+                           "calls": sn.calls, "est_cycles": sn.est_conv_cycles,
+                           "est_matmul_cycles": sn.est_matmul_cycles}
         layers.append(rec)
     (project_dir / "layers.json").write_text(json.dumps(layers, indent=0))
     return layers
@@ -259,7 +265,7 @@ def preflight(cfg: dict) -> bool:
             continue
         if not demo_path(p).is_dir():
             log(f"warning: local.driver_dirs.{k}: {demo_path(p)} not found "
-                f"(make synthesize_{'vectorop' if k == 'VectorOPKernel' else 'matmul'}_kv260)")
+                f"(make synthesize_{ {'VectorOPKernel': 'vectorop', 'ConvKernel': 'conv'}.get(k, 'matmul')}_kv260)")
     return ok
 
 

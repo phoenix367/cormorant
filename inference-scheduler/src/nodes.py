@@ -1405,6 +1405,173 @@ class ConvNode:
 
 
 # ------------------------------------------------------------------ #
+# MatmulConvNode — a MatMul lowered onto ConvKernel                    #
+# ------------------------------------------------------------------ #
+
+def conv_lowered_k_index(c: np.ndarray, j: np.ndarray, kw: int) -> np.ndarray:
+    """K index of input channel ``c`` at kernel column ``j`` of the lowered
+    conv (1 x kw kernel, in_ch = K / kw): the packed weight layout
+    ``[N][K/(16 kw)][1][kw][16]`` read row-major IS A's row, so channel ``c``
+    at column ``j`` multiplies ``A[n][(c/16)·16·kw + j·16 + c%16]``."""
+    t = CONV_TILE_IC
+    return (c // t) * t * kw + j * t + c % t
+
+
+def conv_lowered_b_image(b: np.ndarray, k: int, m: int, kw: int) -> np.ndarray:
+    """ConvKernel ``x`` image of a lowered MatMul's B (BERT_PLAN.md §2 2A).
+
+    ``b`` is ``[..., k, m]`` (any leading batch dims, one image per slice).
+    The conv reads ``x[c][h][kw·ow + j]`` with ``in_h = out_h``, ``in_w =
+    kw·out_w`` and ``out_h·out_w = m``, i.e. ``x[c][kw·p + j]`` for output
+    position ``p = h·out_w + ow`` — independent of the (out_h, out_w) split:
+
+        x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p],   c < k / kw
+
+    For ``kw == 1`` this is B itself (row-major ``[k][m]``).  Returns the
+    flat image (``b.size`` elements, slices concatenated)."""
+    b3 = np.asarray(b).reshape(-1, k, m)
+    if kw == 1:
+        return np.ascontiguousarray(b3).reshape(-1)
+    in_ch = k // kw
+    c = np.arange(in_ch)[:, None]
+    j = np.arange(kw)[None, :]
+    kidx = conv_lowered_k_index(c, j, kw)                    # [in_ch][kw]
+    # img[s][c][p][j] = b3[s][kidx[c][j]][p]
+    img = b3[:, kidx, :]                                     # [s][in_ch][kw][m]
+    img = img.transpose(0, 1, 3, 2)                          # [s][in_ch][m][kw]
+    return np.ascontiguousarray(img).reshape(-1)
+
+
+@dataclass
+class MatmulConvNode:
+    """One ONNX MatMul (or the MatMul half of a Gemm) run on ConvKernel
+    with swapped operand roles (doc/BERT_PLAN.md §2 2A, doc/INFERENCE_
+    SCHEDULER.md "MatMul on ConvKernel").
+
+    For ``C[N][M] = A[N][K] · B[K][M]`` one ConvKernel call computes
+
+        conv out_ch = N, in_ch = K/kw, kernel 1 x kw, stride (1, kw), no pad,
+        output out_h x out_w = M, in_h = out_h, in_w = kw·out_w, no bias,
+        weight = A (row-major [N][K] IS the packed tile-major layout
+                    [N][K/(16 kw)][1][kw][16] when K % (16 kw) == 0),
+        x      = B in the layout of conv_lowered_b_image() (kw == 1: B as is;
+                 kw > 1: a constant B emitted in that layout at codegen),
+        y      = C row-major [N][M].
+
+    Both kernels multiply Q8.8 operands exactly, accumulate in
+    ap_fixed<32,16> (wrap) and floor + saturate the output, so the result
+    is bit-identical to MatmulKernel's — the simulator treats this node
+    exactly like a MatmulNode (np.matmul, then truncate).
+
+    Batch handling (``outer_count`` is always 1, see matmul_lowering.py):
+      * A shared (a_batch_stride == 0), B batched: ONE call with the conv
+        batch = ``batch`` (ConvKernel's batch shares the weights);
+      * B shared, A batched: the batch folds into the rows — ONE call with
+        out_ch = batch·N (A and C are contiguous [batch·N][K] / [batch·N][M]);
+      * both batched (attention): ``calls`` = batch calls, one per item,
+        each at element offsets i·a/b/c_call_stride (run_conv_at); call i
+        waits for call i-1, the last one is left in flight like any start.
+
+    kernel_name routes the node to the ConvKernel lane.
+    """
+
+    kernel_name: ClassVar[str] = "ConvKernel"
+
+    onnx_node:   onnx.NodeProto
+    inputs:      List[TensorInfo]   # [A, B] — A is the conv weight, B the conv x
+    output:      TensorInfo
+    index:       int = 0
+    align_elems: int = 8
+
+    # MatMul semantics (same meaning as MatmulNode's)
+    n:              int = 0
+    k:              int = 0
+    m:              int = 0
+    batch:          int = 1
+    a_batch_stride: int = 0
+    b_batch_stride: int = 0
+    c_batch_stride: int = 0
+
+    # Conv geometry of one call
+    kw:          int = 1
+    out_h:       int = 1
+    out_w:       int = 1
+    conv_n:      int = 0     # out_ch of one call (n, or batch*n when folded)
+    conv_batch:  int = 1     # ConvKernel batch of one call
+    calls:       int = 1     # ConvKernel calls issued for this node
+    a_call_stride: int = 0   # element offsets advanced per call
+    b_call_stride: int = 0
+    c_call_stride: int = 0
+    b_relayout:  bool = False   # B was emitted in the kw > 1 x layout
+
+    # Engine choice (cost_model.py cycles, for the report)
+    est_conv_cycles:   float = 0.0
+    est_matmul_cycles: float = 0.0
+
+    # Compatibility shims — never set by callers.
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=2,    init=False)
+
+    @property
+    def in_ch(self) -> int:
+        return self.k // self.kw
+
+    @property
+    def in_h(self) -> int:
+        return self.out_h
+
+    @property
+    def in_w(self) -> int:
+        return self.kw * self.out_w
+
+    def conv_args(self) -> str:
+        """The geometry arguments of run_conv() / run_conv_at() after the
+        pointers: batch, in_ch, in_h, in_w, out_ch, out_h, out_w, kh, kw,
+        stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left,
+        has_bias, is_depthwise."""
+        return (f"{self.conv_batch}u, {self.in_ch}u, {self.in_h}u, {self.in_w}u,\n"
+                f"             {self.conv_n}u, {self.out_h}u, {self.out_w}u,\n"
+                f"             1u, {self.kw}u, 1u, {self.kw}u,\n"
+                f"             1u, 1u, 0u, 0u, 0u, 0u")
+
+    def emit_comment(self) -> str:
+        a = self.inputs[0].onnx_name
+        b = self.inputs[1].onnx_name
+        batch_str = f", batch={self.batch}" if self.batch > 1 else ""
+        calls_str = f", {self.calls} calls" if self.calls > 1 else ""
+        return (
+            f"    /* [{self.index}] MatMul({a}, {b}) -> {self.output.onnx_name}"
+            f"  [{self.n},{self.k}]x[{self.k},{self.m}]->[{self.n},{self.m}]"
+            f"{batch_str}  on ConvKernel: weight=A x=B{' (kw layout)' if self.b_relayout else ''}"
+            f" out_ch={self.conv_n} in_ch={self.in_ch} 1x{self.kw} s(1,{self.kw})"
+            f" out {self.out_h}x{self.out_w}{calls_str} */"
+        )
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        a = self.inputs[0].c_name
+        b = self.inputs[1].c_name
+        c = self.output.c_name
+        args = self.conv_args()
+        if self.calls == 1:
+            return (f"    run_conv({b}, {a}, NULL, {c},\n"
+                    f"             {args});")
+        body = args.replace("\n             ", "\n                    ")
+        return "\n".join([
+            f"    for (unsigned _i = 0u; _i < {self.calls}u; _i++) {{",
+            "        if (_i) kernel_wait(KERNEL_CONV);   /* one ConvKernel call per batch item */",
+            f"        run_conv_at({b}, _i * {self.b_call_stride}u,"
+            f" {a}, _i * {self.a_call_stride}u,",
+            f"                    {c}, _i * {self.c_call_stride}u,",
+            f"                    {body});",
+            "    }",
+        ])
+
+
+# ------------------------------------------------------------------ #
 # PoolNode                                                             #
 # ------------------------------------------------------------------ #
 

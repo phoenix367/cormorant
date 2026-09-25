@@ -106,8 +106,8 @@ emits a complete C project that drives up to four hardware kernels:
 | Kernel | ONNX ops |
 |--------|----------|
 | VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
-| MatmulKernel | `MatMul` |
-| ConvKernel | `Conv` |
+| MatmulKernel | `MatMul` — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster) |
+| ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/BERT_PLAN.md` §2 2A) |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
 | (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
@@ -131,14 +131,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run all tests (1400 tests; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1426 tests; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 
 Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
-- **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `PoolNode`, `ReshapeNode`
+- **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`
+- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry; ConvKernel (conv-cycle-model port) and MatmulKernel (board-calibrated) cycle estimates
 - **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side
 - **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations

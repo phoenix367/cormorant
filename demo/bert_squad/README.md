@@ -3,8 +3,10 @@
 Extractive question answering with **BERT-base** (ONNX model zoo
 `bertsquad-12`: 12 layers, hidden 768, 12 heads, sequence 256, 108.7 M
 parameters, fine-tuned on SQuAD 1.1) running on the KV260's
-**MatmulKernel** and **VectorOPKernel**, with LayerNorm / GELU / Softmax /
-Transpose / embedding lookup on the A53 host.  The demo
+**ConvKernel** (the MatMuls, with swapped operand roles — BERT_PLAN §2 2A),
+**MatmulKernel** (the two MatMuls ConvKernel cannot take) and
+**VectorOPKernel**, with LayerNorm / GELU / Softmax / Transpose / embedding
+lookup on the A53 host.  The demo
 
   1. tokenizes SQuAD 1.1 dev questions (WordPiece, one 256-token window),
   2. schedules the model with `inference-scheduler` into a C project,
@@ -62,16 +64,20 @@ demo/bert_squad/
 
 * The scheduler's virtualenv (`inference-scheduler/.venv`, see the top-level
   `CLAUDE.md`): numpy, onnx, paramiko.  All commands below use it.
-* HLS driver sources for VectorOPKernel and MatmulKernel (from `build/`:
-  `make synthesize_vectorop_kv260 synthesize_matmul_kv260`).
+* HLS driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
+  `build/`: `make synthesize_vectorop_kv260 synthesize_matmul_kv260
+  synthesize_conv_kv260`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.
 
 ### KV260 board
 
-* A bitstream whose MatmulKernel has `kernels.matmul.max_k` ≥ 3072 (the FFN
-  down-projection has K = 3072; `platforms/kv260.json` has 4096), loaded with
-  `fabric_vecop` / `fabric_matmul` UIO devices.
+* The all-kernels bitstream, loaded with `fabric_vecop` / `fabric_matmul` /
+  `fabric_conv` UIO devices.  With the scheduler's default
+  `--matmul-on-conv auto` every MatMul with K ≥ 16 runs on ConvKernel; with
+  `--no-matmul-on-conv` (phase 1) MatmulKernel needs `kernels.matmul.max_k`
+  ≥ 3072 (the FFN down-projection has K = 3072; `platforms/kv260.json` has
+  4096).
 * `gcc`, `cmake ≥ 3.19`, `make`, XRT, root or passwordless `sudo`.
 * ~220 MiB of free CMA (the pool BO is 215 MiB) and 210 MB of disk for the
   persistent weights directory.
@@ -247,6 +253,15 @@ page cache.  Per-layer profile, per inference:
 | VectorOP (bias / residual / mask adds, scale) | 126 | 97 | 0.8 % | 0.4–0.8 G element/s |
 | other (Gather, OneHot, Cast, Slice) | 5 | 3 | 0.0 % | |
 
+**Phase 2A — MatMuls on ConvKernel** (scheduler default since
+`feat/bertconv`, same bitstream; BERT_PLAN §3): **4.337 s per inference**
+(min 4.334, max 4.341 over 20, 2.80× faster), logits still bit-exact with
+the simulation (3 / 3) and the emulation (20 / 20), EM / F1 90.0 / 91.7
+unchanged.  MatMul linears 7661 → **492 ms** (ConvKernel 1×4 convs,
+~44 GMAC/s), attention MatMuls 750 → **136 ms** (one ConvKernel call per
+head); the host ops (GELU 2046 ms, Softmax 1070, LayerNorm 338, Transpose
+165) are now 83 % of the time.
+
 ## Options (`deploy_and_run.py`)
 
 | Flag | Effect |
@@ -276,7 +291,10 @@ board logits differ from the simulation, 1 = a step failed.
   arguments from the graph, so the C names are never hard-coded.
 * **`remote.weights_dir`** — persistent; `weights/*.dat` plus a
   `MANIFEST.json` of sizes and SHA-1s.  A file is uploaded again only when
-  its size or checksum changes (e.g. a new MatmulKernel packing).
+  its size or checksum changes (e.g. a new MatmulKernel packing, or the
+  ConvKernel x layout of a MatMul's constant B).  Point different schedules
+  (e.g. `--no-matmul-on-conv`) at different directories: the files keep
+  their names across layouts.
 * **`reference.bitexact_examples`** (K) — the first K board results are
   compared with `CodeGenerator._forward_pass`, the simulation the generated
   `test_inference.c` expectations come from; with `reference.emulation` every

@@ -26,7 +26,7 @@ import host_emu
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
-from src.nodes import MatmulNode, ScheduledNode
+from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode
 
 MODEL = os.environ.get("BERT_SQUAD_MODEL", "")
 ASSETS = os.environ.get("BERT_SQUAD_ASSETS", "")
@@ -47,10 +47,19 @@ class TestBertBase(unittest.TestCase):
         self.assertEqual(self.g.fusion_counts, {"layernorm": 25, "gelu": 12, "const_bcast": 15})
         self.assertEqual((k[LayerNormNode], k[GeluNode], k[SoftmaxNode], k[TransposeNode]),
                          (25, 12, 12, 49))
-        self.assertEqual((k[MatmulNode], k[ScheduledNode]), (98, 126))
-        att = [sn for sn in self.g.nodes if isinstance(sn, MatmulNode) and sn.batch == 12]
+        self.assertEqual((k[MatmulNode] + k[MatmulConvNode], k[ScheduledNode]), (98, 126))
+        mms = [sn for sn in self.g.nodes if isinstance(sn, (MatmulNode, MatmulConvNode))]
+        att = [sn for sn in mms if sn.batch == 12]
         self.assertEqual(len(att), 24)
-        self.assertLessEqual(max(sn.k for sn in self.g.nodes if isinstance(sn, MatmulNode)), 3072)
+        self.assertLessEqual(max(sn.k for sn in mms), 3072)
+        # BERT_PLAN 2A: the 72 encoder linears and the 24 attention MatMuls
+        # run on ConvKernel (one call per head for attention); the K = 2
+        # token-type MatMul and the M = 2 span head stay on MatmulKernel.
+        self.assertEqual(k[MatmulConvNode], 96)
+        self.assertEqual(sorted((sn.k, sn.m) for sn in mms if isinstance(sn, MatmulNode)),
+                         [(2, 768), (768, 2)])
+        self.assertTrue(all(sn.kw == 1 and sn.calls == 12 for sn in att))
+        self.assertEqual(self.g.matmul_conv_stats["conv_calls"], 72 + 24 * 12)
 
     def test_generated_c_compiles(self):
         with tempfile.TemporaryDirectory() as td:

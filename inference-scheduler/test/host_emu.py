@@ -1,19 +1,22 @@
 """Run a generated project on the HOST: the generated inference.c and
 test/test_inference.c are compiled unchanged against
 
-  * software models of the VectorOPKernel and MatmulKernel drivers — the
-    AXI-Lite register semantics of kernels/vectorop/include/VectorOP.h and
-    kernels/matmul/include/MatmulKernel.h (ap_fixed<16,8>: exact products /
+  * software models of the VectorOPKernel, MatmulKernel and ConvKernel
+    drivers — the AXI-Lite register semantics of
+    kernels/vectorop/include/VectorOP.h, kernels/matmul/include/MatmulKernel.h
+    and kernels/conv/include/ConvKernel.h (ap_fixed<16,8>: exact products /
     sums, AP_TRN floor + AP_SAT on the result, C-style division; packed-B
-    tile-major layout; whole-word tail writes zeroed) executed synchronously
-    at Start;
+    tile-major layout; ConvKernel's packed tile-major weights with the §2.34
+    half last tile, depthwise stride, word-padded bias; NCHW x / y with
+    implicit zero padding; whole-word tail writes zeroed) executed
+    synchronously at Start;
   * a malloc-backed inference_buf implementation (phys == virt).
 
 The harness fills the inputs, runs inference_run() and compares every output
 bit for bit with the scheduler simulation's expected arrays, exactly as on
 the board — so a PASS proves the generated host-op C code, its staging /
 layout handling and the kernel call parameters all agree with _simulate.py.
-Conv / Pool models are not supported (no software model).
+Pool models are not supported (no software model).
 """
 
 import os
@@ -159,6 +162,82 @@ static inline void XMatmulkernel_Start(XMatmulkernel *p)
 }
 """
 
+_CONV = r"""
+#include "emu_common.h"
+#include <stdlib.h>
+#ifndef EMU_CONV_TILE_IC
+#error EMU_CONV_TILE_IC
+#endif
+typedef struct { u64 x, weight, bias, y;
+                 uint32_t batch, in_ch, in_h, in_w, out_ch, out_h, out_w, kh, kw,
+                          stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left,
+                          has_bias, is_depthwise; } XConvkernel;
+static inline int XConvkernel_Initialize(XConvkernel *p, const char *n)
+{ (void)n; memset(p, 0, sizeof *p); return 0; }
+static inline void XConvkernel_Set_x(XConvkernel *p, u64 v)      { p->x = v; }
+static inline void XConvkernel_Set_weight(XConvkernel *p, u64 v) { p->weight = v; }
+static inline void XConvkernel_Set_bias(XConvkernel *p, u64 v)   { p->bias = v; }
+static inline void XConvkernel_Set_y(XConvkernel *p, u64 v)      { p->y = v; }
+#define CV_SET(f) static inline void XConvkernel_Set_##f(XConvkernel *p, u64 v) { p->f = (uint32_t)v; }
+CV_SET(batch) CV_SET(in_ch) CV_SET(in_h) CV_SET(in_w) CV_SET(out_ch) CV_SET(out_h)
+CV_SET(out_w) CV_SET(kh) CV_SET(kw) CV_SET(stride_h) CV_SET(stride_w) CV_SET(dilation_h)
+CV_SET(dilation_w) CV_SET(pad_top) CV_SET(pad_left) CV_SET(has_bias) CV_SET(is_depthwise)
+static inline int XConvkernel_IsDone(XConvkernel *p) { (void)p; return 1; }
+/* ConvKernel.h: y[n][m][oh][ow] = sat(floor((bias[m] + sum x * w) / 256)) with
+ * x NCHW (zero outside [0,in_h) x [0,in_w)), the standard weight packed
+ * tile-major [M][ceil(C/T)][kh][kw][lanes] (lanes = T, the last tile 8 when
+ * it holds <= 8 channels), the depthwise one [M][roundup(kh*kw, 8)]. */
+static inline void XConvkernel_Start(XConvkernel *p)
+{
+    const unsigned T = EMU_CONV_TILE_IC, KK = p->kh * p->kw;
+    const unsigned tiles = (p->in_ch + T - 1u) / T;
+    const unsigned last  = (p->in_ch - (tiles - 1u) * T) <= 8u ? 8u : T;
+    const size_t per_m = p->is_depthwise ? (size_t)((KK + 7u) / 8u * 8u)
+                                         : (size_t)KK * ((tiles - 1u) * T + last);
+    const unsigned P = p->out_h * p->out_w;
+    const int16_t *X = (const int16_t *)(uintptr_t)p->x;
+    const int16_t *W = (const int16_t *)(uintptr_t)p->weight;
+    const int16_t *B = (const int16_t *)(uintptr_t)p->bias;
+    int16_t *Y = (int16_t *)(uintptr_t)p->y;
+    int64_t *acc = (int64_t *)malloc((size_t)(P ? P : 1u) * sizeof *acc);
+    unsigned n, m, c, khi, kwi, oh, ow;
+    for (n = 0; n < p->batch; n++)
+        for (m = 0; m < p->out_ch; m++) {
+            const int64_t b0 = p->has_bias ? (int64_t)B[m] * 256 : 0;
+            for (oh = 0; oh < P; oh++) acc[oh] = b0;
+            for (c = 0; c < (p->is_depthwise ? 1u : p->in_ch); c++) {
+                const unsigned ch = p->is_depthwise ? m : c;
+                const unsigned ict = c / T;
+                const unsigned lanes = ict + 1u == tiles ? last : T;
+                const int16_t *xc = X + ((size_t)n * p->in_ch + ch) * p->in_h * p->in_w;
+                for (khi = 0; khi < p->kh; khi++)
+                    for (kwi = 0; kwi < p->kw; kwi++) {
+                        const size_t wi = p->is_depthwise
+                            ? (size_t)m * per_m + khi * p->kw + kwi
+                            : (size_t)m * per_m + (size_t)ict * KK * T
+                              + (size_t)(khi * p->kw + kwi) * lanes + c % T;
+                        const int64_t wv = W[wi];
+                        if (!wv) continue;
+                        for (oh = 0; oh < p->out_h; oh++) {
+                            const int ih = (int)(oh * p->stride_h + khi * p->dilation_h)
+                                         - (int)p->pad_top;
+                            if (ih < 0 || ih >= (int)p->in_h) continue;
+                            for (ow = 0; ow < p->out_w; ow++) {
+                                const int iw = (int)(ow * p->stride_w + kwi * p->dilation_w)
+                                             - (int)p->pad_left;
+                                if (iw < 0 || iw >= (int)p->in_w) continue;
+                                acc[oh * p->out_w + ow] += wv * xc[(size_t)ih * p->in_w + iw];
+                            }
+                        }
+                    }
+            }
+            for (oh = 0; oh < P; oh++)
+                Y[((size_t)n * p->out_ch + m) * P + oh] = emu_sat(emu_floor_shift(acc[oh], 8));
+        }
+    free(acc);
+}
+"""
+
 
 def which_cc():
     return shutil.which("cc") or shutil.which("gcc")
@@ -168,9 +247,10 @@ def build_and_run(cg, workdir, timeout=600):
     """Write the project of CodeGenerator ``cg`` into ``workdir``, compile it
     against the software kernels and run test_inference.  Returns
     (returncode, combined output)."""
+    from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
     for kd in cg._active_kernels:
-        if kd.name not in ("VectorOPKernel", "MatmulKernel"):
+        if kd.name not in ("VectorOPKernel", "MatmulKernel", "ConvKernel"):
             raise RuntimeError(f"host emulation has no model of {kd.name}")
     inc, src, tst, emu = (os.path.join(workdir, d) for d in ("include", "src", "test", "emu"))
     for d in (inc, src, tst, emu):
@@ -187,6 +267,7 @@ def build_and_run(cg, workdir, timeout=600):
     w(os.path.join(emu, "emu_common.h"), _COMMON)
     w(os.path.join(emu, "xvectoropkernel.h"), _VOP)
     w(os.path.join(emu, "xmatmulkernel.h"), _MM)
+    w(os.path.join(emu, "xconvkernel.h"), _CONV)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)
     if cg.large_weight_tensors:
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
@@ -202,7 +283,7 @@ def build_and_run(cg, workdir, timeout=600):
     exe = os.path.join(workdir, "test_inference")
     cmd = [which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
            "-Wno-unused-function", "-Wno-error=parentheses",
-           f"-DEMU_TILE_M={MATMUL_TILE_M}",
+           f"-DEMU_TILE_M={MATMUL_TILE_M}", f"-DEMU_CONV_TILE_IC={CONV_TILE_IC}",
            f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', f'-DINFERENCE_EXPECTED_DIR="{workdir}"',
            "-I", inc, "-I", emu,
            os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),

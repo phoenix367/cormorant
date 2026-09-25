@@ -556,6 +556,184 @@ static std::vector<T> rand_vec(unsigned n, float scale, std::mt19937& rng)
 }
 
 // ---------------------------------------------------------------------------
+// MatMul lowered onto ConvKernel with swapped operand roles (BERT_PLAN.md
+// §2 2A; the inference scheduler's MatmulConvNode).  C[N][M] = A[N][K]·B[K][M]
+// runs as a conv with
+//
+//   out_ch = N, in_ch = K/kw, kernel 1×kw, stride (1, kw), no pad, dil 1,
+//   out_h × out_w = M, in_h = out_h, in_w = kw·out_w,
+//   weight = A, row-major — which IS the packed tile-major image
+//            [N][K/(16·kw)][1][kw][16] when K % (16·kw) == 0 (no packing),
+//   x      = B laid out x[c][h][kw·ow + j] = B[(c/16)·16·kw + j·16 + c%16][h·out_w + ow]
+//            (kw == 1: B's own row-major [K][out_h][out_w]),
+//   y      = C row-major [N][M].
+//
+// mm_lowered_x / mm_lowered_w build the conv operands from A / B exactly as
+// the scheduler does (the weight in ONNX [M][C][kh][kw] order, so that
+// run_test() packs it the normal way); ref_matmul is the MatmulKernel-side
+// oracle (exact AccData_t sum, floor + saturate).
+// ---------------------------------------------------------------------------
+static inline unsigned mm_k_index(unsigned c, unsigned j, unsigned kw)
+{
+    return (c / kTileIC) * kTileIC * kw + j * kTileIC + c % kTileIC;
+}
+
+static std::vector<Data_t> mm_lowered_x(const std::vector<Data_t>& B,
+                                        unsigned K, unsigned M, unsigned kw)
+{
+    const unsigned in_ch = K / kw;
+    std::vector<Data_t> x((size_t)K * M);
+    for (unsigned c = 0; c < in_ch; c++)
+        for (unsigned m = 0; m < M; m++)
+            for (unsigned j = 0; j < kw; j++)
+                x[(size_t)c * kw * M + (size_t)kw * m + j] = B[(size_t)mm_k_index(c, j, kw) * M + m];
+    return x;
+}
+
+static std::vector<Data_t> mm_lowered_w(const std::vector<Data_t>& A,
+                                        unsigned N, unsigned K, unsigned kw)
+{
+    const unsigned in_ch = K / kw;
+    std::vector<Data_t> w((size_t)N * K);
+    for (unsigned n = 0; n < N; n++)
+        for (unsigned c = 0; c < in_ch; c++)
+            for (unsigned j = 0; j < kw; j++)
+                w[((size_t)n * in_ch + c) * kw + j] = A[(size_t)n * K + mm_k_index(c, j, kw)];
+    return w;
+}
+
+static void ref_matmul(const Data_t* A, const Data_t* B, Data_t* C,
+                       unsigned N, unsigned K, unsigned M)
+{
+    for (unsigned n = 0; n < N; n++)
+        for (unsigned m = 0; m < M; m++) {
+            AccData_t acc = 0;
+            for (unsigned k = 0; k < K; k++)
+                acc += AccData_t(A[(size_t)n * K + k]) * AccData_t(B[(size_t)k * M + m]);
+            C[(size_t)n * M + m] = saturate_cast<Data_t>(acc);
+        }
+}
+
+static bool same_bits(const Data_t& a, const Data_t& b)
+{
+    return conv_data_to_lane(a) == conv_data_to_lane(b);
+}
+
+static ConvParams mm_lowered_params(unsigned N, unsigned K, unsigned M,
+                                    unsigned kw, unsigned out_w)
+{
+    ConvParams p{};
+    p.batch = 1; p.in_ch = K / kw; p.in_h = M / out_w; p.in_w = kw * out_w;
+    p.out_ch = N; p.kh = 1; p.kw = kw; p.stride_h = 1; p.stride_w = kw;
+    p.dilation_h = 1; p.dilation_w = 1;
+    p.pad_top = p.pad_left = p.pad_bottom = p.pad_right = 0;
+    p.has_bias = false; p.is_depthwise = false;
+    return p;
+}
+
+// One lowered MatMul as a named ConvKernel case.  Besides the usual kernel-vs-
+// conv-oracle check (run_test, also the RTL fixture in --dump-data mode) it
+// proves the two identities the lowering rests on: the packed weight image of
+// the lowered filter is A itself, and the conv oracle equals the MatMul oracle.
+static int run_matmul_case(const char* name, unsigned N, unsigned K, unsigned M,
+                           unsigned kw, unsigned out_w,
+                           float a_scale, float b_scale, std::mt19937& rng)
+{
+    if (K % (kTileIC * kw) != 0 || M % out_w != 0) {
+        printf("%-55s FAIL  (bad lowered geometry)\n", name);
+        return 1;
+    }
+    const ConvParams p = mm_lowered_params(N, K, M, kw, out_w);
+    auto A = rand_vec<Data_t>(N * K, a_scale, rng);
+    auto B = rand_vec<Data_t>(K * M, b_scale, rng);
+    const auto x = mm_lowered_x(B, K, M, kw);
+    const auto w = mm_lowered_w(A, N, K, kw);
+    const std::vector<Data_t> b;                       // no conv bias
+
+    int bad = 0;
+    if (g_dump_dir.empty()) {
+        const auto packed = pack_conv_weights(p, w);
+        if (packed.size() != A.size()) {
+            printf("  packed weight has %zu elements, A has %zu\n", packed.size(), A.size());
+            bad++;
+        } else {
+            for (size_t i = 0; i < A.size(); i++)
+                if (!same_bits(packed[i], A[i])) {
+                    if (bad < 3) printf("  packed weight [%zu] != A\n", i);
+                    bad++;
+                }
+        }
+        std::vector<Data_t> c_mm((size_t)N * M), c_conv((size_t)N * M);
+        ref_matmul(A.data(), B.data(), c_mm.data(), N, K, M);
+        ref_conv(x.data(), w.data(), nullptr, c_conv.data(), 1, p.in_ch, p.in_h, p.in_w,
+                 N, p.in_h, out_w, 1, kw, 1, kw, 1, 1, 0, 0, 0u);
+        for (size_t i = 0; i < c_mm.size(); i++)
+            if (!same_bits(c_mm[i], c_conv[i])) {
+                if (bad < 3) printf("  conv oracle [%zu] != matmul oracle\n", i);
+                bad++;
+            }
+        if (bad) printf("%-55s FAIL  (lowering identity, %d)\n", name, bad);
+    }
+    return bad + run_test(name, p, x, w, b);
+}
+
+#ifndef CONV_COSIM
+// Batched attention the way the scheduler issues it: one ConvKernel call per
+// batch item with the x / weight / y pointers OFFSET into shared [H][..]
+// buffers (run_conv_at), weights read straight out of an activation buffer.
+// Every head is compared with the MatMul oracle and every lane of y outside
+// the head's own [N][M] block must keep the sentinel (the byte-strobe edges
+// of a head's first / last run must not touch its neighbours).  Plain C-sim
+// only (cosim needs the fixed-size global buffers).
+static int run_matmul_heads_case(const char* name, unsigned H, unsigned N, unsigned K,
+                                 unsigned M, unsigned out_w, std::mt19937& rng)
+{
+    const unsigned kw = 1;
+    const ConvParams p = mm_lowered_params(N, K, M, kw, out_w);
+    auto A = rand_vec<Data_t>(H * N * K, 0.5f, rng);
+    auto B = rand_vec<Data_t>(H * K * M, 0.5f, rng);
+    const auto a_words = to_weight_words(A);
+    const auto b_words = to_weight_words(B);            // kw = 1: x == B
+    YWord sentinel_word = 0;
+    for (unsigned l = 0; l < kYPortElems; l++)
+        sentinel_word.range(kDataBits * (l + 1) - 1, kDataBits * l) = kYSentinel;
+    int bad = 0;
+    for (unsigned h = 0; h < H; h++) {
+        const size_t a_off = (size_t)h * N * K, b_off = (size_t)h * K * M,
+                     c_off = (size_t)h * N * M;
+        if (a_off % kWeightPortElems || b_off % kXPortElems || c_off % kYPortElems) {
+            printf("%-55s FAIL  (head offsets not word aligned)\n", name);
+            return 1;
+        }
+        std::vector<YWord> y(H * N * M / kYPortElems + 1, sentinel_word);
+        WeightWord dummy_bias[1] = {0};
+        ConvKernel(const_cast<XWord*>(b_words.data()) + b_off / kXPortElems,
+                   const_cast<WeightWord*>(a_words.data()) + a_off / kWeightPortElems,
+                   dummy_bias,
+                   y.data() + c_off / kYPortElems,
+                   1, p.in_ch, p.in_h, p.in_w, N, p.in_h, out_w, 1, kw, 1, kw, 1, 1, 0, 0, 0, 0);
+        std::vector<Data_t> c_ref((size_t)N * M);
+        ref_matmul(A.data() + a_off, B.data() + b_off, c_ref.data(), N, K, M);
+        for (size_t i = 0; i < (size_t)(y.size() * kYPortElems); i++) {
+            const unsigned lane = i % kYPortElems;
+            const ap_uint<kDataBits> bits =
+                y[i / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane);
+            const bool inside = i >= c_off && i < c_off + (size_t)N * M;
+            if (inside ? bits != conv_data_to_lane(c_ref[i - c_off]) : bits != kYSentinel) {
+                if (bad < 5) printf("  head %u elem %zu: %s\n", h, i,
+                                    inside ? "mismatch" : "outside lane overwritten");
+                bad++;
+            }
+        }
+    }
+    printf("%-55s %s", name, bad ? "FAIL" : "PASS");
+    if (bad) printf("  (%d mismatches)", bad);
+    printf("  [MM-heads H=%u N=%u K=%u M=%u out=%ux%u]\n", H, N, K, M, M / out_w, out_w);
+    return bad;
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // --sweep N [--seed S]: randomised-geometry sweep.
 //
 // Draws N geometries uniformly from the space the inference scheduler
@@ -1729,6 +1907,78 @@ int main(int argc, char** argv)
         total_failures += run_test("DW saturation: positive overflow → AP_MAX", p, x, w, b);
     }
 #endif
+
+    // -----------------------------------------------------------------------
+    // MatMul lowered onto ConvKernel (BERT_PLAN §2 2A, MatmulConvNode):
+    // 1×kw kernels with stride (1, kw) and weights that are a row-major
+    // activation matrix.  Appended at the end so the RTL fixture indices of
+    // the cases above do not move.  RTL fixtures (small — xsim is CPU-bound):
+    // -----------------------------------------------------------------------
+    {
+        std::mt19937 mm_rng(kSeed + 2);
+        // 1×2 s(1,2), 3 m-tiles (partial), 2 ic-tiles, out 3×16.
+        total_failures += run_matmul_case("mm-on-conv 1x2 s(1,2): N=40 K=64 M=48 (out 3x16)",
+                                          40, 64, 48, 2, 16, 0.5f, 0.5f, mm_rng);
+        // 1×3 s(1,3), stride_w 3 is RTL-new; out_w 24 -> ow-tiles 20 + 4 (in_w 72).
+        total_failures += run_matmul_case("mm-on-conv 1x3 s(1,3): N=24 K=96 M=48 (out 2x24, 2 ow-tiles)",
+                                          24, 96, 48, 3, 24, 0.5f, 0.5f, mm_rng);
+        // 1×4 s(1,4), stride_w 4 is RTL-new; out_w 20 -> ow-tiles 16 + 4 (in_w 80).
+        total_failures += run_matmul_case("mm-on-conv 1x4 s(1,4): N=20 K=128 M=40 (out 2x20, 2 ow-tiles)",
+                                          20, 128, 40, 4, 20, 0.5f, 0.5f, mm_rng);
+        // 1×1, 5 m-tiles -> 2 M-groups (4 + 1), 4 ic-tiles, out_h > 1.
+        total_failures += run_matmul_case("mm-on-conv 1x1: N=80 K=64 M=64 (out 2x32, 2 M-groups)",
+                                          80, 64, 64, 1, 32, 0.5f, 0.5f, mm_rng);
+        // 1×2 with the accumulator full: out_w·N = 64·256 -> oh chunks of 4 rows,
+        // out_h 6 -> 2 chunks (A re-streamed per chunk), 2 ow-tiles, 4 M-groups.
+        total_failures += run_matmul_case("mm-on-conv 1x2: N=256 K=32 M=384 (out 6x64, 2 oh-chunks)",
+                                          256, 32, 384, 2, 64, 0.5f, 0.5f, mm_rng);
+    }
+
+    // C-sim only (too slow for xsim): the BERT-base geometry classes at full
+    // width or scaled along M, the max_in_ch bound, and the per-head offset
+    // pointers of batched attention.
+    if (g_dump_dir.empty()) {
+        std::mt19937 mm_rng(kSeed + 3);
+        total_failures += run_matmul_case("mm-on-conv QK^T head: 1x1 N=256 K=64 M=256 (out 4x64)",
+                                          256, 64, 256, 1, 64, 1.0f, 1.0f, mm_rng);
+        total_failures += run_matmul_case("mm-on-conv PV head: 1x1 N=256 K=256 M=64 (out 1x64)",
+                                          256, 256, 64, 1, 64, 0.25f, 1.0f, mm_rng);
+        total_failures += run_matmul_case("mm-on-conv linear 768: 1x2 N=256 K=768 M=128 (out 4x32)",
+                                          256, 768, 128, 2, 32, 0.25f, 0.25f, mm_rng);
+        total_failures += run_matmul_case("mm-on-conv FFN-down: 1x3 in_ch=1024 N=48 K=3072 M=40 (out 2x20)",
+                                          48, 3072, 40, 3, 20, 0.125f, 0.125f, mm_rng);
+        total_failures += run_matmul_case("mm-on-conv 1x4 in_ch=768: N=64 K=3072 M=32 (out 2x16)",
+                                          64, 3072, 32, 4, 16, 0.125f, 0.125f, mm_rng);
+        total_failures += run_matmul_case("mm-on-conv 1x1 in_ch=1024: N=272 K=1024 M=16 (out 1x16)",
+                                          272, 1024, 16, 1, 16, 0.125f, 0.125f, mm_rng);
+        // Saturation through the lowered path: |A·B| far above 128.
+        total_failures += run_matmul_case("mm-on-conv saturation: 1x2 N=32 K=64 M=32",
+                                          32, 64, 32, 2, 16, 64.0f, 64.0f, mm_rng);
+#ifndef CONV_COSIM
+        total_failures += run_matmul_heads_case("mm-on-conv heads: 3 x (N=48 K=32 M=40), offset pointers",
+                                                3, 48, 32, 40, 20, mm_rng);
+        total_failures += run_matmul_heads_case("mm-on-conv heads: 2 x (N=40 K=48 M=24), odd blocks",
+                                                2, 40, 48, 24, 8, mm_rng);
+#endif
+        // Random admissible lowered geometries (kw 1..4).
+        int mm_cases = 0;
+        while (mm_cases < 24) {
+            std::uniform_int_distribution<unsigned> U(0, 1u << 30);
+            const unsigned kw  = 1 + U(mm_rng) % 4;
+            const unsigned K   = kTileIC * kw * (1 + U(mm_rng) % 6);
+            const unsigned N   = 1 + U(mm_rng) % 72;
+            const unsigned out_w = 1 + U(mm_rng) % 40;
+            const unsigned out_h = 1 + U(mm_rng) % 5;
+            const unsigned M   = out_w * out_h;
+            const unsigned n_pad = (N + kTileM - 1) / kTileM * kTileM;
+            if (out_w * n_pad > kMaxAccPersistEntries || K / kw > kMaxInCh) continue;
+            char label[96];
+            std::snprintf(label, sizeof(label), "mm-on-conv random #%d: 1x%u N=%u K=%u M=%u (out %ux%u)",
+                          mm_cases, kw, N, K, M, out_h, out_w);
+            total_failures += run_matmul_case(label, N, K, M, kw, out_w, 0.5f, 0.5f, mm_rng);
+            mm_cases++;
+        }
+    }
 
     printf("------------------------------------------------------------------\n");
     if (!g_dump_dir.empty()) {

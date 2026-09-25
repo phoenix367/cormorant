@@ -28,7 +28,7 @@ from typing import List, Optional
 import numpy as np
 
 from .dtype import ApFixed
-from .nodes import (ConvNode, MatmulNode, PoolNode, ReshapeNode,
+from .nodes import (ConvNode, MatmulConvNode, MatmulNode, PoolNode, ReshapeNode,
                     SpaceToDepthNode, ScheduledNode, OP_NAMES)
 from .host_nodes import HostNode, SliceNode
 from .codegen._simulate import _residual_stats
@@ -119,6 +119,15 @@ def _node_notes(sn) -> str:
             bits.append(f"batch={sn.batch}")
         if sn.outer_count > 1:
             bits.append(f"outer-loop×{sn.outer_count}")
+        return " · ".join(bits)
+    if isinstance(sn, MatmulConvNode):
+        bits = [f"{sn.n}×{sn.k}·{sn.k}×{sn.m}"]
+        if sn.batch > 1:
+            bits.append(f"batch={sn.batch}")
+        bits.append(f"on ConvKernel 1×{sn.kw} s(1,{sn.kw}) out {sn.out_h}×{sn.out_w}"
+                    + (f" ×{sn.calls} calls" if sn.calls > 1 else ""))
+        bits.append(f"est {sn.est_conv_cycles / 1e5:.2f} ms vs MatmulKernel "
+                    f"{sn.est_matmul_cycles / 1e5:.2f} ms @100 MHz")
         return " · ".join(bits)
     if isinstance(sn, ConvNode):
         bits = [
@@ -256,6 +265,8 @@ class ReportGenerator:
         """
         if isinstance(sn, ConvNode):
             return ("x", "weight", "bias")[position] if position < 3 else "?"
+        if isinstance(sn, MatmulConvNode):
+            return ("a (conv weight)", "b (conv x)")[position] if position < 2 else "?"
         if isinstance(sn, MatmulNode):
             return ("a", "b")[position] if position < 2 else "?"
         if isinstance(sn, ScheduledNode):
@@ -543,6 +554,16 @@ class ReportGenerator:
                 f"- **Activation fusion** — {act_fused} `Relu` / `Clip(0,6)` "
                 f"node{'s' if act_fused != 1 else ''} folded into the producing "
                 f"VectorOP call (kernel `act` register)."
+            )
+        mc = getattr(self.graph, "matmul_conv_stats", None) or {}
+        if mc.get("lowered"):
+            bullets.append(
+                f"- **MatMul on ConvKernel** — {mc['lowered']} `MatMul` "
+                f"node{'s' if mc['lowered'] != 1 else ''} run as ConvKernel calls "
+                f"with swapped operand roles ({mc['conv_calls']} calls; cost model "
+                f"{mc['conv_cycles'] / 1e5:.1f} ms against "
+                f"{mc['matmul_cycles'] / 1e5:.1f} ms on MatmulKernel at 100 MHz); "
+                f"{mc.get('kept', 0)} stay on MatmulKernel."
             )
         if s2d:
             bullets.append(

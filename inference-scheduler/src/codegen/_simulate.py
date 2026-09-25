@@ -40,7 +40,7 @@ import numpy as np
 from ..nodes  import (
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
     ACT_RELU, ACT_RELU6,
-    MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+    MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
     POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
@@ -486,7 +486,11 @@ class _SimulateMixin:
 
         # Node-by-node forward pass
         for sn in self._graph.nodes:
-            if isinstance(sn, MatmulNode):
+            if isinstance(sn, (MatmulNode, MatmulConvNode)):
+                # A MatMul lowered onto ConvKernel (MatmulConvNode) computes
+                # exactly what MatmulKernel computes: exact Q8.8 products,
+                # an ap_fixed<32,16> sum, floor + saturate — one model for
+                # both engines (test_matmul_on_conv.py checks the conv view).
                 a = arrays[sn.inputs[0].onnx_name]
                 b = arrays[sn.inputs[1].onnx_name]
                 _store_quant(sn.output.onnx_name, np.matmul(a, b),
