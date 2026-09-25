@@ -248,11 +248,12 @@ static std::vector<Data_t> pad_conv_bias(const std::vector<Data_t>& b, unsigned 
     return out;
 }
 
-// Pack Data_t elements into the WeightWord beats the 128-bit ports read
-// (lane 0 in the low bits, i.e. the lowest DDR address).
+// Pack Data_t elements into the 128-bit beats the ports read (lane 0 in
+// the low bits, i.e. the lowest DDR address).  One spare word so a run
+// that ends mid-word never reads past the buffer (x, §2.39).
 static std::vector<WeightWord> to_weight_words(const std::vector<Data_t>& e)
 {
-    std::vector<WeightWord> out((e.size() + kWeightPortElems - 1) / kWeightPortElems);
+    std::vector<WeightWord> out(e.size() / kWeightPortElems + 1);
     for (auto& wd : out) wd = 0;
     for (size_t i = 0; i < e.size(); i++) {
         const unsigned lane = (unsigned)(i % kWeightPortElems);
@@ -274,11 +275,20 @@ static std::vector<WeightWord> to_weight_words(const std::vector<Data_t>& e)
 // single source of truth that feeds the depth= hints on ConvKernel.cpp.
 // ---------------------------------------------------------------------------
 #ifdef CONV_COSIM
-static Data_t     g_x[CONV_COSIM_DEPTH_X];
+static XWord      g_x[CONV_COSIM_DEPTH_X_WORDS];
 static WeightWord g_w[CONV_COSIM_DEPTH_WEIGHT_WORDS];
 static WeightWord g_b[CONV_COSIM_DEPTH_BIAS_WORDS];
-static Data_t     g_y[CONV_COSIM_DEPTH_Y];
+static YWord      g_y[CONV_COSIM_DEPTH_Y_WORDS];
 #endif
+
+// §2.38: y is written through a 128-bit port with byte strobes at the run
+// ends.  The bench hands the kernel a word buffer pre-filled with this
+// sentinel in every lane; after the run every lane past y_size (the
+// whole-word tail pad) must still hold it — a wrong strobe on the last
+// word of a run would overwrite it.  Lanes INSIDE the tensor are covered by
+// the element compare (a wrong head / tail strobe clobbers the
+// neighbouring channel's run).
+static const ap_uint<kDataBits> kYSentinel = 0xDEAD;
 
 // ---------------------------------------------------------------------------
 // Dump-mode helpers (only meaningful for fixed-point builds — the HDL
@@ -446,36 +456,45 @@ static int run_test(const char* name, const ConvParams& p,
     // per-test std::vector storage directly.  b_ptr is always a valid pointer
     // (the kernel guards bias reads by has_bias).
     // -----------------------------------------------------------------------
-    // Pack weights / bias into the kernel's DDR layout and port words.
+    // Pack weights / bias into the kernel's DDR layout and port words; x
+    // keeps its NCHW element order, packed 8 lanes per word (§2.39).
     const std::vector<WeightWord> w_words = to_weight_words(pack_conv_weights(p, w_data));
     const std::vector<WeightWord> b_words = to_weight_words(pad_conv_bias(b_data, p.out_ch));
+    const std::vector<XWord>      x_words = to_weight_words(x_data);
+
+    // y: whole words (§2.38), every lane pre-set to the sentinel.
+    const unsigned y_words = y_size / kYPortElems + 1;
+    YWord sentinel_word = 0;
+    for (unsigned l = 0; l < kYPortElems; l++)
+        sentinel_word.range(kDataBits * (l + 1) - 1, kDataBits * l) = kYSentinel;
 
 #ifdef CONV_COSIM
-    if (x_data.size() > CONV_COSIM_DEPTH_X ||
+    if (x_words.size() > CONV_COSIM_DEPTH_X_WORDS ||
         w_words.size() > CONV_COSIM_DEPTH_WEIGHT_WORDS ||
         b_words.size() > CONV_COSIM_DEPTH_BIAS_WORDS ||
-        y_size        > CONV_COSIM_DEPTH_Y) {
+        y_words       > CONV_COSIM_DEPTH_Y_WORDS) {
         printf("%-55s SKIP (exceeds cosim buffers)\n", name);
         return 0;
     }
-    std::copy(x_data.begin(), x_data.end(), g_x);
+    std::copy(x_words.begin(), x_words.end(), g_x);
     std::copy(w_words.begin(), w_words.end(), g_w);
     std::copy(b_words.begin(), b_words.end(), g_b);
-    const Data_t*     x_ptr = g_x;
+    for (unsigned i = 0; i < y_words; i++) g_y[i] = sentinel_word;
+    XWord*            x_ptr = g_x;
     WeightWord*       w_ptr = g_w;
     WeightWord*       b_ptr = g_b;
-    Data_t*           y_ptr = g_y;
+    YWord*            y_ptr = g_y;
 #else
-    std::vector<Data_t> y_got(y_size, Data_t(0));
-    const Data_t*     x_ptr = x_data.data();
+    std::vector<YWord> y_got(y_words, sentinel_word);
+    XWord*            x_ptr = const_cast<XWord*>(x_words.data());
     WeightWord*       w_ptr = const_cast<WeightWord*>(w_words.data());
     WeightWord*       b_ptr = const_cast<WeightWord*>(b_words.data());
-    Data_t*           y_ptr = y_got.data();
+    YWord*            y_ptr = y_got.data();
 #endif
 
     // All four ports are hls::burst_maxi<>; the pointer constructors take
     // non-const pointers (the kernel only ever reads through x / w / b).
-    ConvKernel(const_cast<Data_t*>(x_ptr), w_ptr, b_ptr, y_ptr,
+    ConvKernel(x_ptr, w_ptr, b_ptr, y_ptr,
                p.batch, p.in_ch, p.in_h, p.in_w,
                p.out_ch, out_h, out_w,
                p.kh, p.kw,
@@ -487,11 +506,26 @@ static int run_test(const char* name, const ConvParams& p,
 
     int mismatches = 0;
     for (unsigned i = 0; i < y_size; i++) {
+        const unsigned lane = i % kYPortElems;
+        const Data_t got_v = conv_lane_to_data(
+            y_ptr[i / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane));
         const double r = static_cast<double>(y_ref[i]);
-        const double g = static_cast<double>(y_ptr[i]);
+        const double g = static_cast<double>(got_v);
         if (!vals_close(r, g)) {
             if (mismatches < 5) {
                 printf("  [%u] ref=%.6f got=%.6f\n", i, r, g);
+            }
+            mismatches++;
+        }
+    }
+    // Tail pad lanes (past y_size, inside the last word) must be untouched.
+    for (unsigned i = y_size; i < y_words * kYPortElems; i++) {
+        const unsigned lane = i % kYPortElems;
+        const ap_uint<kDataBits> bits =
+            y_ptr[i / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane);
+        if (bits != kYSentinel) {
+            if (mismatches < 5) {
+                printf("  [pad %u] sentinel overwritten: 0x%04x\n", i, (unsigned)bits.to_uint());
             }
             mismatches++;
         }
@@ -1110,6 +1144,26 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Test 28f (§2.38): channel runs that start and end mid-word, two
+    // chunks, and a run longer than kWriteInFlight x 64 words.
+    // out_h*out_w = 121*75 = 9075 (% 8 = 3): every channel's run starts at
+    // a different lane; chunks of 109 + 12 rows -> runs of 8175 (% 8 = 7)
+    // and 900 (% 8 = 4) elements, 32 + 4 segment requests per channel.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=121; p.in_w=75; p.out_ch=8;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("1x1 8->8 on 121x75: mid-word runs, 8175-elem chunks", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Test 29: wide-input ow-tiling.  in_w=128 > kMaxLineBufCols (64), so
     // the producers split the output column axis into multiple ow_tiles
     // (3 at default kw=3, stride=1: ow_per_tile = 64 - 3 + 1 = 62; 128/62
@@ -1296,6 +1350,41 @@ int main(int argc, char** argv)
         auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.3f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
         total_failures += run_test("DW oh-chunking (32ch, 32x32 out, 2 chunks)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test DW-11 (§2.38 / §2.39): odd geometry — in_w = 37 (% 8 != 0, every
+    // x row starts mid-word), out = 33x37 = 1221 (% 8 = 5) so the channel
+    // runs start and end mid-word, 12 ch = a full + a partial tile.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=12; p.in_h=33; p.in_w=37; p.out_ch=12;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,          0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW 3x3 pad=1, 12ch, 33x37 (odd runs, in_w%8!=0)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test DW-12 (§2.39): stride 2 with in_w = 29 — unaligned, odd-length
+    // input rows read at half rate; out = 14x15 = 210 (% 8 = 2).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=16; p.in_h=27; p.in_w=29; p.out_ch=16;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,          0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW 3x3 s2 pad=1, 16ch, 27x29 (unaligned x rows)", p, x, w, b);
     }
 
 #ifdef CONV_HAVE_APFIXED

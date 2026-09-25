@@ -12,10 +12,15 @@
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `x` | Read | Input feature map `[batch][in_ch][in_h][in_w]` |
-| `gmem1` | `weight` | Read | Filter weights (layout depends on mode) |
-| `gmem2` | `bias` | Read | Per-channel bias `[out_ch]` (not accessed when `has_bias=0`) |
-| `gmem3` | `y` | Write | Output feature map `[batch][out_ch][out_h][out_w]` |
+| `gmem0` | `x` | Read | Input feature map `[batch][in_ch][in_h][in_w]` — `hls::burst_maxi<ap_uint<128>>`, 8 lanes per beat; a (row, channel) run is requested as the whole words that cover it, the out-of-run lanes of its first / last word are dropped (§2.39) |
+| `gmem1` | `weight` | Read | Filter weights (layout depends on mode) — 128-bit `burst_maxi` (§2.32) |
+| `gmem2` | `bias` | Read | Per-channel bias `[out_ch]` (not accessed when `has_bias=0`) — 128-bit `burst_maxi` |
+| `gmem3` | `y` | Write | Output feature map `[batch][out_ch][out_h][out_w]` — `hls::burst_maxi<ap_uint<128>>`; each channel run is re-aligned onto DDR words and its first / last word is written with byte strobes so neighbouring lanes stay intact (§2.38) |
+
+All four buffers must be 16-byte aligned (the scheduler aligns every
+buffer to 64 bytes); `y` may be read by the kernel's writer only through
+its strobes — lanes past the tensor's end inside the last word are never
+written.
 
 **AXI-Lite control registers (`s_axilite bundle=ctrl`) — 21 registers total:**
 
@@ -141,8 +146,8 @@ flowchart TB
     WC -->|PN-wide weights| AC
     WB -->|PM-wide weights| AC
     PA -->|PN/PM MACs| AC
-    BB -->|Phase 1 init| PO
-    AC <-->|Phase 2 read-modify-write| PO
+    BB -->|Phase 1 init, standard only| PO
+    AC <-->|Phase 2 read-modify-write standard / write-only depthwise| PO
     PO -->|Phase 3 drain + saturate| Yd
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
@@ -246,12 +251,13 @@ zero-pads the rest.
 
 ## 5. Loop Structure and HLS Pragmas
 
-The kernel is a top-level `#pragma HLS DATAFLOW` region with five concurrent
+The kernel is a top-level `#pragma HLS DATAFLOW` region with six concurrent
 sub-functions (see §3 of [CONV_OPTIMISATION.md](CONV_OPTIMISATION.md) for the
 dataflow diagram).  Each function owns its own m_axi port (or stream) and
-implements one of the five pipeline stages: input patch assembly, weight
-streaming, bias streaming, the conv compute consumer, and the saturating
-output writer.
+implements one of the six pipeline stages: the input row loader
+(`x_row_loader`, owns `gmem0`, emits one 16-channel column per cycle,
+§2.39), input patch assembly, weight streaming, bias streaming, the conv
+compute consumer, and the re-aligning output writer.
 
 ### 5.1 Standard Convolution — consumer loop nest
 
@@ -297,9 +303,15 @@ for ni in [0, batch)
                 //     acc[m1] += lane_sum
                 // partial_outputs[idx_base + …] := acc[m1]              (II=1)
 
-    // PHASE 3: drain partial_outputs to acc_stream — PIPELINE II=1
-    for oh_local, ow, mt, m1:
-      acc_stream.write(saturate_cast<Data_t>(partial_outputs[…]))  // §2.16
+    // PHASE 3 (§2.38): transpose + drain, 8 outputs per cycle — PIPELINE II=1
+    for mt, segment in (chunk pixels / kDrainSeg):        // step n
+      for i in [0, max(fill_len, drain_words)):
+        // fill: pixel i of segment n → saturate the 8 lanes of
+        //   partial_outputs[(p·m_tiles + mt)·kTileM ..] and scatter them
+        //   into 8 LUTRAM banks (bank (m1+p)%8, addr m1·32 + p/8) of buffer n&1
+        // drain: word i of segment n-1 from buffer (n-1)&1 — 8 consecutive
+        //   pixels of channel m1 read from 8 distinct banks at one address —
+        //   acc_stream.write(YWord)     // order (mt, segment, m1, word)
 ```
 
 **Inner-MAC throughput is `kTileIC` MACs/cycle** (PN-wide adder tree fed by
@@ -318,32 +330,37 @@ factors are 1 in the common case).
 ```
 for ni in [0, batch)
   for chunk in [0, num_chunks)
-    // PHASE 1: identical to standard
+    // NO PHASE 1 (§2.37): every (pixel, mt) word is written exactly once
+    // by the sweep below, seeded from the tile's bias register.
 
-    // PHASE 2b: accumulate
+    // PHASE 2b: accumulate — one flat II=1 loop per (mt, ow_tile)
     for mt in [0, ceil(out_ch / kTileM))
-      // Load w_buf[kTileM][kh][kw] ONCE per (chunk, mt) — PIPELINE II=1
+      bias_reg[0..kTileM-1] := bias_stream.read()      // one BiasVec per (ni, chunk, mt)
+      // Load w_buf[kTileM][kh·kw] ONCE per (chunk, mt) — PIPELINE II=1
+      //   (lanes m1 ≥ m_valid zero-filled: X-clean padding word)
       for ow_tile in [0, num_ow_tiles)                  // §5.4 ow-tiling
         ow_start = ow_tile · ow_per_tile
         ow_end   = min(out_w, ow_start + ow_per_tile)
-        for oh_local in [0, chunk_oh)
-          for ow in [ow_start, ow_end)
-            // Drain kh × kw channel-packed PatchVec beats from
-            //   patch_stream (kTileM lanes used, rest zero-pad) — II=1
-            // acc[0..kTileM-1] := partial_outputs[idx_base + …]   (II=1)
-            // accumulate_depthwise():
-            //   for ri in [0, kh · kw):                            PIPELINE II=1
-            //     for m1 in [0, kTileM), UNROLL:
-            //       acc[m1] += patch[m1][khi][kwi] · w_buf[m1][khi][kwi]
-            // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+        for it in [0, chunk_oh · (ow_end - ow_start) · kh·kw):   PIPELINE II=1
+          // counters (oh_local, ow, ri) advance per iteration; the
+          // partial_outputs word cursor is incremental (no multiply)
+          v = patch_stream.read()                        // one PatchVec per (khi, kwi)
+          for m1 in [0, kTileM), UNROLL:
+            acc[m1] = (ri == 0) ? bias_reg[m1] : acc[m1]
+            acc[m1] += v.lane[m1] · w_buf[m1][ri]        // mac_dw_step
+          if ri == kh·kw - 1:
+            partial_outputs[word·kTileM + 0..kTileM-1] := acc[]   // full word, write-only
 
-    // PHASE 3: drain — identical to standard
+    // PHASE 3: transpose + drain — identical to standard (§2.38)
 ```
 
 **Inner-MAC throughput is `kTileM` MACs/cycle** (PM-wide channel-parallel
-lanes; depthwise has no input-channel reduction).  Loop bound shrinks from
-`kh · kw · kTileM` to `kh · kw`.  Depthwise weights stay cached across
-all ow_tiles within an mt — only patches see the per-ow_tile re-emission.
+lanes; depthwise has no input-channel reduction).  A pixel costs exactly
+`kh · kw` cycles: the accumulator-word load, the per-pixel pipeline ramp
+and the store loop of the pre-§2.37 form are gone (one ramp per
+`(mt, ow_tile)` instead of one per pixel).  Depthwise weights stay cached
+across all ow_tiles within an mt — only patches see the per-ow_tile
+re-emission.
 
 ### 5.3 oh-chunking
 
@@ -435,7 +452,10 @@ reduction would be stream-rate-bound on `weight_stream`.
 
 | Pragma | Location | Effect |
 |--------|----------|--------|
-| `DATAFLOW` | top-level | Five concurrent producers/consumers |
+| `DATAFLOW` | top-level | Six concurrent producers/consumers |
+| `BIND_STORAGE variable=tA/tB type=RAM_S2P impl=LUTRAM` + `ARRAY_PARTITION complete dim=1` + `DEPENDENCE inter dependent=false` | Phase-3 transposer buffers (§2.38) | 8-bank ping-pong; within one step a buffer is only written or only read |
+| `BIND_STORAGE variable=rowbuf type=RAM_S2P impl=LUTRAM` + `ARRAY_PARTITION complete dim=1` + `DEPENDENCE inter dependent=false` | `x_row_loader` row buffer (§2.39) | per-channel RAM columns, flat `half·16 + word` address, ping-pong between rows |
+| `BIND_STORAGE variable=col_stream / acc_stream type=fifo impl=uram` | top-level streams | the 256-bit column FIFO and the chunk-deep 128-bit output FIFO live in the idle URAM pool |
 | `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable=…` | top-level — `x`/`weight`/`bias` pointers + every scalar argument (§2.20) | Invariant for the whole invocation, so HLS forwards each as a stable signal instead of a per-consumer channel FIFO (`y`, the write port, is left unmarked) |
@@ -565,11 +585,13 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Inner-MAC parallelism (standard)** | PN-wide adder tree: kTileIC=16 MACs/cycle, lane-rotated on m1 |
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=8 MACs/cycle |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
-| **Dataflow stages** | 5 (input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
+| **Dataflow stages** | 6 (x_row_loader, input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
 | **Patch buffer storage** | `patch[kTileIC][kMaxKH][kMaxKW]` is a banked register file — kTileIC LUTRAMs partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18) |
-| **Accumulator stream** | `acc_stream` is `Data_t`-wide; `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
+| **Accumulator stream** | `acc_stream` carries 128-bit words of 8 saturated outputs of one channel (§2.38); `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
+| **Output drain rate** | 8 outputs per cycle: Phase 3 reads one 8-channel URAM word per cycle through a segmented 8×8 bank-rotated LUTRAM transposer (§2.38) |
+| **Input fill rate** | 16 (standard) / 8 (depthwise) elements per cycle: `x_row_loader` drains 128-bit words into a ping-pong row buffer and emits one column of all channels per cycle (§2.39) |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **Tile geometry** | oh-chunking / M-grouping / ow-tiling resolved once by `compute_conv_geometry()` and passed to every stage as a `ConvGeometry` struct — one shared divider set, not one per stage (§2.19) |
@@ -583,7 +605,8 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag; padded to `roundup(out_ch, 8)` elements (whole 128-bit words) |
 | **Weight layout (standard)** | `[out_ch][ceil(in_ch/16)][kh][kw][16]` tile-major, 16-byte aligned (§2.32); last tile is 8 lanes when ≤ 8 channels remain (§2.34) |
 | **Weight layout (depthwise)** | `[out_ch][roundup(kh·kw, 8)]` (§2.32) |
-| **Weight / bias ports** | `hls::burst_maxi<ap_uint<128>>` — 8 lanes per beat; x / y ports are 16-bit `burst_maxi` |
+| **Weight / bias ports** | `hls::burst_maxi<ap_uint<128>>` — 8 lanes per beat (§2.32) |
+| **x / y ports** | `hls::burst_maxi<ap_uint<128>>` too (§2.38 / §2.39): NCHW layout unchanged, runs re-aligned in the kernel, y run ends written with byte strobes; buffers 16-byte aligned |
 | **AXI-Lite base address** | `0xA002_0000` |
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` |
