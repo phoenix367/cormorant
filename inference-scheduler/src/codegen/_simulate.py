@@ -44,7 +44,7 @@ from ..nodes  import (
     POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
-from ..host_nodes import HostNode
+from ..host_nodes import GatherNode, HostNode, OneHotNode
 
 # Expected GT arrays larger than this threshold are written to external
 
@@ -382,6 +382,12 @@ class _SimulateMixin:
         ramp_inputs: Dict[str, np.ndarray] = {}
         for t in self._graph.input_tensors:
             idx = np.arange(t.numel, dtype=np.int64)
+            if t.is_int:
+                # Integer inputs (ids, masks): p[i] = i % R, a valid index
+                # for every Gather / OneHot that reads them.
+                r = self._int_fill_range(t)
+                ramp_inputs[t.onnx_name] = (idx % r).astype(np.float64).reshape(t.shape)
+                continue
             lay = self._layouts.get(t.onnx_name)
             if lay and lay.n_chunks > 1:
                 positions = (idx // lay.chunk) * lay.stride + (idx % lay.chunk)
@@ -389,6 +395,31 @@ class _SimulateMixin:
                 positions = idx
             ramp_inputs[t.onnx_name] = dtype.ramp_to_float(positions).reshape(t.shape)
         return ramp_inputs
+
+    def _int_fill_range(self, t: TensorInfo) -> int:
+        """R of the test-harness fill ``p[i] = i % R`` for integer graph input
+        ``t``: the smallest table size (Gather rows / OneHot depth) among the
+        host ops that read it through Reshape aliases, else 2 (a 0/1 pattern,
+        right for masks); capped to the positive range of the storage."""
+        names, frontier = {t.onnx_name}, [t.onnx_name]
+        children: Dict[str, List[str]] = {}
+        for sn in self._graph.nodes:
+            if self._is_alias_node(sn):
+                children.setdefault(sn.inputs[0].onnx_name, []).append(sn.output.onnx_name)
+        while frontier:
+            for c in children.get(frontier.pop(), []):
+                if c not in names:
+                    names.add(c)
+                    frontier.append(c)
+        bounds = []
+        for sn in self._graph.nodes:
+            if isinstance(sn, GatherNode) and sn.inputs[1].onnx_name in names:
+                bounds.append(sn.rows)
+            elif isinstance(sn, OneHotNode) and sn.inputs[0].onnx_name in names:
+                bounds.append(sn.depth)
+        r = min(bounds) if bounds else 2
+        cap = (1 << (8 * self._dtype.bytes_per_elem - 1)) - 1
+        return max(1, min(r, cap))
 
     def _simulate(self) -> Dict[str, np.ndarray]:
         """
@@ -591,7 +622,11 @@ class _SimulateMixin:
         alloc = lay.alloc if lay is not None else len(logical.flatten())
         buf   = np.zeros(alloc, dtype=dtype.np_storage)
         flat  = logical.flatten()
-        encoded = dtype.float_to_storage(flat.astype(np.float64))
+        t = self._graph._tensors.get(name)
+        if t is not None and t.is_int:
+            encoded = dtype.int_to_storage(flat.astype(np.float64))   # raw integers
+        else:
+            encoded = dtype.float_to_storage(flat.astype(np.float64))
 
         if lay and lay.n_chunks > 1:
             idx      = np.arange(len(flat), dtype=np.int64)

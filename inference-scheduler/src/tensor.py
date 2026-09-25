@@ -34,6 +34,13 @@ def _sanitize_c_name(name: str) -> str:
 # 4096 elements = 8 KB in ap_fixed<16,8>; keeps generated C files small.
 LARGE_WEIGHT_THRESHOLD = 4096
 
+# ONNX element types (as numpy dtype names, see graph._ONNX_DTYPE_MAP) that
+# are integers: stored as raw integers in Data_t-sized DMA elements.
+INT_DTYPE_NAMES = frozenset({
+    "int8", "int16", "int32", "int64",
+    "uint8", "uint16", "uint32", "uint64", "bool",
+})
+
 
 @dataclass
 class TensorInfo:
@@ -75,6 +82,16 @@ class TensorInfo:
     @property
     def is_weight(self) -> bool:
         return self.data is not None
+
+    @property
+    def is_int(self) -> bool:
+        """True for integer / bool ONNX tensors (token ids, masks, ...).
+
+        Integer tensors are stored in DMA buffers as RAW signed integers of
+        the element width (int16 for ap_fixed<16,8>), not in the fixed-point
+        encoding; only host ops (Gather / OneHot / Cast / data movement)
+        read or write them."""
+        return self.dtype in INT_DTYPE_NAMES
 
     @property
     def is_large_weight(self) -> bool:

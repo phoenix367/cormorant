@@ -78,6 +78,20 @@ class _TestMixin:
         # (alignment padding between data blocks) are left untouched.
         fill_lines = []
         for t in inputs:
+            if t.is_int:
+                # Integer tensor (token ids, masks): raw integer values, a
+                # pattern that is a valid index for every Gather / OneHot
+                # reading it (the simulator uses the same values).
+                r     = self._int_fill_range(t)
+                macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
+                fill_lines += [
+                    f"    {{  /* '{t.c_name}' — integer tensor: p[i] = i % {r} */",
+                    f"        Data_t *p = inference_buf_ptr({t.c_name});",
+                    f"        for (i = 0u; i < {macro}; i++)",
+                    f"            p[i] = (Data_t)(i % {r}u);",
+                    "    }",
+                ]
+                continue
             if t.onnx_name in bcast_map:
                 n, chunk_macro, stride_macro = bcast_map[t.onnx_name]
                 rhs = dtype.c_fill_rhs("_off + i")
@@ -111,6 +125,20 @@ class _TestMixin:
         for t in outputs:
             display = dtype.c_display("p", "_off + i") if t.onnx_name in bcast_map \
                       else dtype.c_display("p", "i")
+            if t.is_int:
+                macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
+                print_lines += [
+                    "    {",
+                    f"        Data_t   *p   = inference_buf_ptr({t.c_name});",
+                    f"        unsigned  lim = ({macro} < 8u) ? {macro} : 8u;",
+                    f"        printf(\"Output '{t.onnx_name}'"
+                    f" (%u elem, integer, first %u):\\n\", (unsigned){macro}, lim);",
+                    "        for (i = 0u; i < lim; i++) {",
+                    f"            printf(\"  [%u] %d\\n\", i, {dtype.c_int_display('p', 'i')});",
+                    "        }",
+                    "    }",
+                ]
+                continue
             if t.onnx_name in bcast_map:
                 n, chunk_macro, stride_macro = bcast_map[t.onnx_name]
                 print_lines += [
@@ -173,6 +201,23 @@ class _TestMixin:
                     f"                            {exp_disp});",
                     "                    rc = 1;",
                     "                }",
+                    "            }",
+                    "        }",
+                    "    }",
+                ]
+            elif t.is_int:
+                alloc_size = self._alloc_sizes[t.onnx_name]
+                verify_lines += [
+                    f"    {{  /* [GT] '{t.c_name}' — integer tensor, exact */",
+                    f"        const Data_t *p = (const Data_t *)inference_buf_ptr({t.c_name});",
+                    "        unsigned k;",
+                    f"        for (k = 0u; k < {alloc_size}u; k++) {{",
+                    f"            if (p[k] != expected_{t.c_name}[k]) {{",
+                    "                fprintf(stderr,",
+                    f"                        \"FAIL {t.onnx_name}[%u]: got %d expected %d\\n\",",
+                    f"                        k, {dtype.c_int_display('p', 'k')},",
+                    f"                        {dtype.c_int_display(f'expected_{t.c_name}', 'k')});",
+                    "                rc = 1;",
                     "            }",
                     "        }",
                     "    }",

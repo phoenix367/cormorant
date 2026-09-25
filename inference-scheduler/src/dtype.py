@@ -214,8 +214,25 @@ class DataType(ABC):
         x = np.asarray(x, dtype=np.float64)
         return self.quantize(np.where(np.isnan(x), 0.0, x))
 
+    def int_quantize(self, x: np.ndarray) -> np.ndarray:
+        """Integer value a host op stores for the double ``x`` into an
+        integer tensor: truncate toward zero, saturate to the storage range,
+        NaN -> 0.  Mirrors the generated C ``host_st_int()``."""
+        raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
+
+    def int_to_storage(self, x: np.ndarray) -> np.ndarray:
+        """Encode integer VALUES (float64 holding integers) as the raw
+        storage of an integer tensor (np_storage dtype)."""
+        raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
+
+    def c_int_display(self, ptr: str, idx: str) -> str:
+        """C expression (an int) for printing element ``ptr[idx]`` of an
+        integer tensor with ``%d``."""
+        raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
+
     def c_host_conversions(self) -> str:
-        """C source of the ``host_ld`` / ``host_st`` (Data_t <-> double)
+        """C source of the ``host_ld`` / ``host_st`` (Data_t <-> double) and
+        ``host_ld_int`` / ``host_st_int`` (raw integer element <-> double)
         helpers every host op is written in terms of."""
         raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
 
@@ -337,15 +354,36 @@ class ApFixed(DataType):
             f" value = ({int_t})bits / {scale} */"
         )
 
-    # Host ops.
+    # Host ops / integer tensors: raw two's-complement integers of width W.
+    @property
+    def _int_lo(self) -> float:
+        return -float(1 << (self._W - 1))
+
+    @property
+    def _int_hi(self) -> float:
+        return float((1 << (self._W - 1)) - 1)
+
+    def int_quantize(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        x = np.trunc(np.where(np.isnan(x), 0.0, x))
+        return np.clip(x, self._int_lo, self._int_hi)
+
+    def int_to_storage(self, x: np.ndarray) -> np.ndarray:
+        v = self.int_quantize(x)
+        return v.astype(self._np_int).view(self._np_uint)
+
+    def c_int_display(self, ptr: str, idx: str) -> str:
+        return f"(int)(int{self._W}_t){ptr}[{idx}]"
+
     def c_host_conversions(self) -> str:
         int_t = f"int{self._W}_t"
         scale = f"{self._scale:.1f}"
-        lo, hi = f"{-float(1 << (self._W - 1)):.1f}", f"{float((1 << (self._W - 1)) - 1):.1f}"
+        lo, hi = f"{self._int_lo:.1f}", f"{self._int_hi:.1f}"
         return (
             f"/* Element conversions ({self.name}: value = ({int_t})bits / {scale}).\n"
             " * host_st rounds half to even (nearbyint under the default FE_TONEAREST\n"
-            " * mode, identical to numpy's np.round) and saturates; NaN -> 0. */\n"
+            " * mode, identical to numpy's np.round) and saturates; NaN -> 0.\n"
+            f" * Integer tensors (ids, masks) hold raw {int_t} values instead. */\n"
             f"static inline double host_ld(Data_t b) {{ return (double)({int_t})b / {scale}; }}\n"
             "static inline Data_t host_st(double v)\n"
             "{\n"
@@ -355,6 +393,15 @@ class ApFixed(DataType):
             f"    if (r > {hi}) r = {hi};\n"
             f"    if (r < {lo}) r = {lo};\n"
             f"    return (Data_t)({int_t})r;\n"
+            "}\n"
+            f"static inline double host_ld_int(Data_t b) {{ return (double)({int_t})b; }}\n"
+            "static inline Data_t host_st_int(double v)\n"
+            "{\n"
+            "    if (v != v) return (Data_t)0u;\n"
+            "    v = trunc(v);\n"
+            f"    if (v > {hi}) v = {hi};\n"
+            f"    if (v < {lo}) v = {lo};\n"
+            f"    return (Data_t)({int_t})v;\n"
             "}\n"
         )
 
@@ -420,12 +467,24 @@ class Float32(DataType):
     def c_typedef_comment(self) -> str:
         return "/* float32: IEEE 754 single precision */"
 
-    # Host ops.
+    # Host ops / integer tensors: integers are stored as float values.
+    def int_quantize(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        return np.trunc(np.where(np.isnan(x), 0.0, x)).astype(np.float32).astype(np.float64)
+
+    def int_to_storage(self, x: np.ndarray) -> np.ndarray:
+        return self.int_quantize(x).astype(np.float32)
+
+    def c_int_display(self, ptr: str, idx: str) -> str:
+        return f"(int){ptr}[{idx}]"
+
     def c_host_conversions(self) -> str:
         return (
-            "/* Element conversions (float32). */\n"
+            "/* Element conversions (float32).  Integer tensors hold integer values. */\n"
             "static inline double host_ld(Data_t b) { return (double)b; }\n"
             "static inline Data_t host_st(double v) { return (v != v) ? 0.0f : (Data_t)v; }\n"
+            "static inline double host_ld_int(Data_t b) { return (double)b; }\n"
+            "static inline Data_t host_st_int(double v) { return (v != v) ? 0.0f : (Data_t)trunc(v); }\n"
         )
 
 

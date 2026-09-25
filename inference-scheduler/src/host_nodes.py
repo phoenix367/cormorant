@@ -2,8 +2,9 @@
 Host-CPU operator nodes (BERT_PLAN phase 1b).
 
 Ops the PL kernels cannot run are executed on the A53 inside
-``inference_run()``: Softmax, LayerNormalization, Gelu, Transpose and Slice
-(lowered ``Split``).  ``SpaceToDepthNode`` (nodes.py) was the first host op; these nodes
+``inference_run()``: Softmax, fused LayerNormalization and Gelu (see
+``fusion.py``), Transpose, Slice (lowered ``Split``), Gather, OneHot and
+Cast.  ``SpaceToDepthNode`` (nodes.py) was the first host op; these nodes
 generalise it and share its event-stream treatment: no lane
 (``kernel_name == ""``), one synchronous ``('cpu', idx)`` event that waits
 on in-flight producers first, liveness interval that starts and ends at
@@ -13,7 +14,8 @@ Numeric contract (identical in the generated C and in ``reference()``,
 which the scheduler's fixed-point simulator runs):
 
   * inputs are read as double: ``Data_t`` elements through ``host_ld``
-    (``(int16_t)bits / 256.0`` for ap_fixed<16,8>, exact);
+    (``(int16_t)bits / 256.0`` for ap_fixed<16,8>, exact), integer tensors
+    (token ids, masks) as raw ``int16_t`` values through ``host_ld_int``;
   * all arithmetic is IEEE double, in the operation order written in the
     helper (reductions accumulate left to right; the generated project is
     compiled with ``-ffp-contract=off`` so no FMA contraction); exp / tanh /
@@ -21,7 +23,8 @@ which the scheduler's fixed-point simulator runs):
     same glibc), never numpy's SIMD variants (``libm()`` below);
   * outputs are written back with ``host_st``: round half to even
     (``nearbyint`` under the default FE_TONEAREST mode == ``np.round``) and
-    saturation to the Data_t range, NaN -> 0.
+    saturation to the Data_t range, NaN -> 0; integer outputs with
+    ``host_st_int`` (truncate toward zero, saturate).
 
 Data movement never touches the DMA buffers element-wise: on the KV260 the
 buffer pool is an XRT BO mapped NON-CACHEABLE (a strided 2-byte read costs
@@ -31,6 +34,8 @@ malloc'd cached staging arena per input (``host_load``), computes
 stage -> stage, and one ``memcpy`` back (``host_store``, followed by a
 cache flush for the consuming kernel).  The arena is shared by all host
 ops (they run one at a time on the CPU) and sized to the largest one.
+Gather is the one exception: it copies whole embedding rows straight out
+of the (possibly huge) table buffer, one wide memcpy per row.
 """
 
 from __future__ import annotations
@@ -41,7 +46,9 @@ from typing import ClassVar, Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
-from .nodes import SchedulerError
+from onnx import TensorProto
+
+from .nodes import ReshapeNode, SchedulerError
 from .tensor import TensorInfo
 
 
@@ -309,11 +316,61 @@ static void host_copy_nd(const Data_t *src, Data_t *dst,
     }
 }
 """,
+    "gather_rows": r"""/* Gather, axis 0: dst row i = table row idx[i] (row_len elements, one
+ * wide memcpy per row straight from the table buffer).  A negative index
+ * counts from the end (ONNX); an index still outside [0, rows) is CLAMPED
+ * to the nearest valid row (ONNX leaves it undefined). */
+static void host_gather_rows(const Data_t *table, unsigned rows, unsigned row_len,
+                             const Data_t *idx, unsigned n_idx, Data_t *dst)
+{
+    unsigned i;
+    for (i = 0u; i < n_idx; i++) {
+        long k = (long)host_ld_int(idx[i]);
+        if (k < 0) k += (long)rows;
+        if (k < 0) k = 0;
+        if (k >= (long)rows) k = (long)rows - 1;
+        memcpy(dst + (size_t)i * row_len, table + (size_t)k * row_len,
+               (size_t)row_len * sizeof(Data_t));
+    }
+}
+""",
+    "onehot": r"""/* OneHot, axis -1: row i = `off` everywhere, `on` at idx[i] (negative
+ * indices count from the end; out-of-range indices give an all-off row). */
+static void host_onehot(const Data_t *idx, unsigned n, unsigned depth,
+                        Data_t off, Data_t on, Data_t *dst)
+{
+    unsigned i, j;
+    for (i = 0u; i < n; i++, dst += depth) {
+        long k = (long)host_ld_int(idx[i]);
+        if (k < 0) k += (long)depth;
+        for (j = 0u; j < depth; j++)
+            dst[j] = off;
+        if (k >= 0 && k < (long)depth)
+            dst[k] = on;
+    }
+}
+""",
+    "cast": r"""/* Cast.  mode 0: integer -> Data_t (round/saturate)   1: Data_t -> integer
+ * (truncate toward zero, saturate)   2: Data_t -> bool   3: integer -> bool */
+static void host_cast(const Data_t *x, Data_t *y, unsigned n, unsigned mode)
+{
+    unsigned i;
+    for (i = 0u; i < n; i++) {
+        switch (mode) {
+        case 0u:  y[i] = host_st(host_ld_int(x[i]));                     break;
+        case 1u:  y[i] = host_st_int(host_ld(x[i]));                     break;
+        case 2u:  y[i] = host_st_int(host_ld(x[i]) != 0.0 ? 1.0 : 0.0);  break;
+        default:  y[i] = host_st_int(host_ld_int(x[i]) != 0.0 ? 1.0 : 0.0); break;
+        }
+    }
+}
+""",
 }
 
-# Helpers that need <math.h> (exp / sqrt / tanh / erf); host_st uses
-# nearbyint, so math.h is included whenever any host node exists.
-HOST_C_HELPER_ORDER = ("softmax", "layernorm", "gelu_tanh", "gelu_erf", "copy_nd")
+# Helpers that need <math.h> (exp / sqrt / tanh / erf); host_st / host_st_int
+# use nearbyint / trunc, so math.h is included whenever any host node exists.
+HOST_C_HELPER_ORDER = ("softmax", "layernorm", "gelu_tanh", "gelu_erf",
+                       "copy_nd", "gather_rows", "onehot", "cast")
 
 
 # ------------------------------------------------------------------ #
@@ -325,9 +382,9 @@ class HostNode:
     """Common part of every host-CPU node (see module docstring).
 
     ``inputs`` are the RUNTIME tensors the node reads (DMA buffers: graph
-    inputs, kernel / host outputs, or a weight read at run time).  Constant
-    operands (LayerNorm gamma / beta, Slice starts / ends, ...) are baked
-    into the node at
+    inputs, kernel / host outputs, or a weight read at run time such as a
+    Gather table).  Constant operands (LayerNorm gamma / beta, OneHot depth
+    / values, Slice starts / ends, ...) are baked into the node at
     construction and emitted as C literals, never as DMA weights.
     """
 
@@ -355,7 +412,7 @@ class HostNode:
         return list(self.inputs)
 
     def direct_inputs(self) -> List[TensorInfo]:
-        """Inputs read in place from their DMA buffer (e.g. whole rows)."""
+        """Inputs read in place from their DMA buffer (whole-row memcpys)."""
         return []
 
     def scratch_bytes(self) -> int:
@@ -396,6 +453,12 @@ class HostNode:
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         raise RuntimeError("host nodes are emitted by CodeGenerator._emit_host_block")
 
+    def _reject_int(self, t: TensorInfo, what: str = "input") -> None:
+        if t.is_int:
+            raise SchedulerError(
+                f"{self.onnx_node.op_type} node '{_label(self.onnx_node)}': {what} "
+                f"'{t.onnx_name}' is an integer tensor ({t.dtype}); this host op "
+                f"computes on Data_t values only.")
 
 
 # ------------------------------------------------------------------ #
@@ -434,6 +497,7 @@ class SoftmaxNode(HostNode):
         n = _prod(x.shape[axis:]) if rank else 1
         sn = cls(onnx_node=node, inputs=[x], output=y, index=index,
                  align_elems=align_elems, rows=max(x.numel // max(n, 1), 1), n=n)
+        sn._reject_int(x)
         if y.numel != x.numel:
             raise SchedulerError(f"Softmax node '{_label(node)}': output numel "
                                  f"{y.numel} != input numel {x.numel}.")
@@ -506,6 +570,7 @@ class LayerNormNode(HostNode):
                  align_elems=align_elems, rows=x.numel // n, n=n,
                  eps=float(a.get("epsilon", 1e-5)), tf_form=int(a.get("axi_tf_form", 0)),
                  gamma=_param(1, "scale (gamma)"), beta=_param(2, "bias (beta)"))
+        sn._reject_int(x)
         if len(node.output) > 1 and any(node.output[1:]):
             raise SchedulerError(f"LayerNormalization node '{_label(node)}': only "
                                  f"the Y output is supported (Mean / InvStdDev requested).")
@@ -590,6 +655,7 @@ class GeluNode(HostNode):
                  align_elems=align_elems, n=x.numel, approximate=approx,
                  c1=float(a.get("axi_c1", GELU_C1)), c2=float(a.get("axi_c2", GELU_C2)),
                  k=float(a.get("axi_k", SQRT2)), div=int(a.get("axi_div", 1)))
+        sn._reject_int(x)
         return sn
 
     @property
@@ -757,6 +823,186 @@ class SliceNode(_CopyNode):
 
 
 # ------------------------------------------------------------------ #
+# Gather / OneHot / Cast                                               #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class GatherNode(HostNode):
+    """ONNX Gather, axis 0, runtime integer indices (token ids).  Row i of
+    the output is row ``idx[i]`` of the table (``prod(shape[1:])``
+    elements), copied with one memcpy per row straight from the table's DMA
+    buffer.  Negative indices count from the end; any index still outside
+    ``[0, rows)`` is clamped (documented deviation — ONNX leaves it
+    undefined)."""
+    helpers: ClassVar[Tuple[str, ...]] = ("gather_rows",)
+    rows:    int = 1
+    row_len: int = 1
+    n_idx:   int = 1
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        data = _resolve(tensors, node.input[0], node)
+        idx = _resolve(tensors, node.input[1], node)
+        y = _resolve(tensors, node.output[0], node)
+        rank = len(data.shape)
+        axis = int(_attrs(node).get("axis", 0))
+        if axis < 0:
+            axis += rank
+        if axis != 0 or rank < 1:
+            raise SchedulerError(f"Gather node '{_label(node)}': axis={axis}; only "
+                                 f"axis 0 is supported.")
+        if not idx.is_int or idx.is_weight:
+            raise SchedulerError(
+                f"Gather node '{_label(node)}': indices '{idx.onnx_name}' must be a "
+                f"runtime integer tensor (got {'constant ' if idx.is_weight else ''}{idx.dtype}).")
+        row_len = _prod(data.shape[1:])
+        if y.numel != idx.numel * row_len:
+            raise SchedulerError(f"Gather node '{_label(node)}': output numel {y.numel} "
+                                 f"!= {idx.numel} x {row_len}.")
+        return cls(onnx_node=node, inputs=[data, idx], output=y, index=index,
+                   align_elems=align_elems, rows=int(data.shape[0]), row_len=row_len,
+                   n_idx=idx.numel)
+
+    def staged_inputs(self):
+        return [self.inputs[1]]
+
+    def direct_inputs(self):
+        return [self.inputs[0]]
+
+    def describe(self) -> str:
+        return f"{self.n_idx} rows of {self.row_len} from a [{self.rows}] table"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        return [f"host_gather_rows(inference_buf_ptr({direct[0]}), {self.rows}u, "
+                f"{self.row_len}u, {ins[0]}, {self.n_idx}u, {out});"]
+
+    def reference(self, ins, dtype):
+        table = np.asarray(ins[0], np.float64).reshape(self.rows, self.row_len)
+        k = np.asarray(ins[1], np.float64).reshape(-1).astype(np.int64)
+        k = np.where(k < 0, k + self.rows, k)
+        k = np.clip(k, 0, self.rows - 1)
+        return table[k].reshape(self.output.shape)
+
+
+@dataclass
+class OneHotNode(HostNode):
+    """ONNX OneHot, axis -1, runtime integer indices, constant depth and
+    ``values = [off, on]`` (written back once with the output's
+    encoding)."""
+    helpers: ClassVar[Tuple[str, ...]] = ("onehot",)
+    n:     int = 1
+    depth: int = 1
+    off:   float = 0.0
+    on:    float = 1.0
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        idx = _resolve(tensors, node.input[0], node)
+        y = _resolve(tensors, node.output[0], node)
+        depth = int(np.asarray(_const(ctx, tensors, node.input[1], node, "depth")).reshape(-1)[0])
+        vals = np.asarray(_const(ctx, tensors, node.input[2], node, "values"),
+                          np.float64).reshape(-1)
+        axis = int(_attrs(node).get("axis", -1))
+        out_rank = len(y.shape)
+        if axis not in (-1, out_rank - 1):
+            raise SchedulerError(f"OneHot node '{_label(node)}': axis={axis}; only the "
+                                 f"last axis (-1) is supported.")
+        if not idx.is_int or idx.is_weight:
+            raise SchedulerError(f"OneHot node '{_label(node)}': indices must be a "
+                                 f"runtime integer tensor.")
+        if depth < 1 or vals.size != 2 or y.numel != idx.numel * depth:
+            raise SchedulerError(f"OneHot node '{_label(node)}': depth={depth}, "
+                                 f"values={vals.tolist()}, output {y.shape}.")
+        return cls(onnx_node=node, inputs=[idx], output=y, index=index,
+                   align_elems=align_elems, n=idx.numel, depth=depth,
+                   off=float(vals[0]), on=float(vals[1]))
+
+    def _encoded(self, dtype):
+        v = np.array([self.off, self.on], np.float64)
+        if self.output.is_int:
+            q = dtype.int_quantize(v)
+            return q, dtype.int_to_storage(q)
+        q = dtype.host_quantize(v)
+        return q, dtype.float_to_storage(q)
+
+    def describe(self) -> str:
+        return f"depth={self.depth} values=[{self.off:g}, {self.on:g}]"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        q, st = self._encoded(dtype)
+        return [f"host_onehot({ins[0]}, {self.n}u, {self.depth}u, "
+                f"(Data_t){dtype.format_literal(st[0])}, (Data_t){dtype.format_literal(st[1])},"
+                f" {out});  /* off {q[0]:g}, on {q[1]:g} */"]
+
+    def reference(self, ins, dtype):
+        q, _ = self._encoded(dtype)
+        k = np.asarray(ins[0], np.float64).reshape(-1).astype(np.int64)
+        k = np.where(k < 0, k + self.depth, k)
+        y = np.full((self.n, self.depth), q[0], np.float64)
+        ok = (k >= 0) & (k < self.depth)
+        y[np.nonzero(ok)[0], k[ok]] = q[1]
+        return y.reshape(self.output.shape)
+
+
+_FLOAT_TYPES = {TensorProto.FLOAT, TensorProto.DOUBLE, TensorProto.FLOAT16,
+                TensorProto.BFLOAT16}
+CAST_INT_TO_DATA, CAST_DATA_TO_INT, CAST_DATA_TO_BOOL, CAST_INT_TO_BOOL = 0, 1, 2, 3
+
+
+@dataclass
+class CastNode(HostNode):
+    """ONNX Cast between the two storage kinds (Data_t <-> raw integer).
+    Casts within a kind (float -> float, int -> int, bool -> int) change no
+    bits and become ``ReshapeNode`` aliases instead (see
+    ``make_cast_node``)."""
+    helpers: ClassVar[Tuple[str, ...]] = ("cast",)
+    n:    int = 1
+    mode: int = CAST_INT_TO_DATA
+
+    def describe(self) -> str:
+        return {CAST_INT_TO_DATA: "int -> Data_t", CAST_DATA_TO_INT: "Data_t -> int",
+                CAST_DATA_TO_BOOL: "Data_t -> bool", CAST_INT_TO_BOOL: "int -> bool"}[self.mode]
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        return [f"host_cast({ins[0]}, {out}, {self.n}u, {self.mode}u);  /* {self.describe()} */"]
+
+    def reference(self, ins, dtype):
+        v = np.asarray(ins[0], np.float64).reshape(-1)
+        if self.mode == CAST_INT_TO_DATA:
+            y = dtype.host_quantize(v)
+        elif self.mode == CAST_DATA_TO_INT:
+            y = dtype.int_quantize(v)
+        else:
+            y = (v != 0.0).astype(np.float64)
+        return y.reshape(self.output.shape)
+
+
+def make_cast_node(node, tensors, index, align_elems, ctx: HostContext):
+    """Cast factory: a host ``CastNode`` when the storage kind changes, a
+    zero-cost ``ReshapeNode`` alias when it does not."""
+    x = _resolve(tensors, node.input[0], node)
+    y = _resolve(tensors, node.output[0], node)
+    to = int(_attrs(node).get("to", TensorProto.FLOAT))
+    dst_float = to in _FLOAT_TYPES
+    dst_bool = to == TensorProto.BOOL
+    if x.numel != y.numel:
+        raise SchedulerError(f"Cast node '{_label(node)}': numel mismatch.")
+    if x.is_int:
+        if dst_float:
+            mode = CAST_INT_TO_DATA
+        elif dst_bool and x.dtype != "bool":
+            mode = CAST_INT_TO_BOOL
+        else:
+            return ReshapeNode.from_onnx_node(node, tensors, index, align_elems)
+    else:
+        if dst_float:
+            return ReshapeNode.from_onnx_node(node, tensors, index, align_elems)
+        mode = CAST_DATA_TO_BOOL if dst_bool else CAST_DATA_TO_INT
+    return CastNode(onnx_node=node, inputs=[x], output=y, index=index,
+                    align_elems=align_elems, n=x.numel, mode=mode)
+
+
+# ------------------------------------------------------------------ #
 # Registry                                                             #
 # ------------------------------------------------------------------ #
 
@@ -766,6 +1012,9 @@ HOST_OP_FACTORIES = {
     "Gelu":               GeluNode.from_onnx_node,
     "Transpose":          TransposeNode.from_onnx_node,
     "Slice":              SliceNode.from_onnx_node,
+    "Gather":             GatherNode.from_onnx_node,
+    "OneHot":             OneHotNode.from_onnx_node,
+    "Cast":               make_cast_node,
 }
 
 HOST_OP_TYPES: frozenset = frozenset(HOST_OP_FACTORIES)

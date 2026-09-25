@@ -593,13 +593,29 @@ class OnnxGraph:
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)
 
+        self._check_integer_inputs()
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
         self._pack_matmul_weights()
         self._choose_slice_views()
 
     # ------------------------------------------------------------------ #
-    # Slice views                                                          #
+    # Integer tensors / Slice views                                        #
     # ------------------------------------------------------------------ #
+
+    def _check_integer_inputs(self) -> None:
+        """Integer tensors (ids, masks) hold raw integers, not Data_t values:
+        only host ops and buffer aliases may read them."""
+        for sn in self._nodes:
+            if not isinstance(sn, (ScheduledNode, MatmulNode, ConvNode, PoolNode,
+                                   SpaceToDepthNode)):
+                continue
+            for t in sn.inputs:
+                if t.is_int and not t.is_weight:
+                    raise SchedulerError(
+                        f"Node '{sn.onnx_node.name or sn.onnx_node.op_type}' "
+                        f"({sn.onnx_node.op_type}) reads integer tensor "
+                        f"'{t.onnx_name}' ({t.dtype}); integer tensors are stored "
+                        f"as raw integers and must go through a Cast first.")
 
     def _choose_slice_views(self) -> None:
         """Turn contiguous Slice pieces into zero-cost sub-buffer views where

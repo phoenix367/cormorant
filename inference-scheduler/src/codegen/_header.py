@@ -59,6 +59,19 @@ class _HeaderMixin:
             "    (((n) + INFERENCE_ALIGN_ELEMS - 1u) & ~(INFERENCE_ALIGN_ELEMS - 1u))"
         )
         lines.append("")
+        int_io = [t for t in inputs + outputs if t.is_int]
+        if int_io:
+            int_t = f"int{8 * dtype.bytes_per_elem}_t"
+            lines.append(
+                "/* Integer tensors (token ids, segment ids, masks, ...) are NOT stored\n"
+                f" * in the {dtype.name} encoding: every Data_t element holds the raw\n"
+                f" * signed integer value ({int_t}), e.g.\n"
+                f" *     inference_buf_ptr(buf)[i] = (Data_t)({int_t})token_id;\n"
+                f" * Values must fit in {int_t} (a 30522-entry vocabulary does).  Here:\n"
+                + "".join(f" *   {t.c_name} ({t.dtype} {t.shape})\n" for t in int_io)
+                + " */"
+            )
+            lines.append("")
 
         # ---- collect broadcast info for the SIZE-macro section ----
         # Only VectorOP ScheduledNodes produce CHUNK/STRIDE alignment macros.
@@ -354,15 +367,17 @@ class _HeaderMixin:
             " *   Fill input buffers via inference_buf_ptr() before calling.",
             " *",
         ]
+        def _kind(t):
+            return f", raw {t.dtype} values" if t.is_int else ""
         for t in inputs:
             doc_lines.append(
                 f" *   {t.c_name:<22} [in]   inference_buf_t*  "
-                f"({t.numel} elem, shape={t.shape})"
+                f"({t.numel} elem, shape={t.shape}{_kind(t)})"
             )
         for t in outputs:
             doc_lines.append(
                 f" *   {t.c_name:<22} [out]  inference_buf_t*  "
-                f"({t.numel} elem, shape={t.shape})"
+                f"({t.numel} elem, shape={t.shape}{_kind(t)})"
             )
         doc_lines.append(" */")
 
