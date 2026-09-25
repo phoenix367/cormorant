@@ -110,6 +110,7 @@ emits a complete C project that drives up to four hardware kernels:
 | ConvKernel | `Conv` |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape` (buffer alias), `Gemm` (decomposed → MatMul + Add) |
+| (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
 
 ```bash
 cd inference-scheduler
@@ -127,7 +128,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run all tests (1324 tests)
+# Run all tests (1350 tests)
 .venv/bin/python -m pytest test/ -v
 ```
 
