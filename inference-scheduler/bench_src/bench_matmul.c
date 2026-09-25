@@ -62,7 +62,11 @@ int main(int argc, char **argv)
     }
 
     unsigned a_n = (as > 0u) ? batch * n * kd : n * kd;
-    const unsigned m_pk = b_packed ? ((m + 15u) / 16u) * 16u : m;   /* packed: m padded to kTileM */
+    /* packed: m padded to kTileM (platforms/kv260.json kernels.matmul.tile_m; 32 since MATMUL_OPTIMISATION §8) */
+    #ifndef MATMUL_TILE_M
+    #define MATMUL_TILE_M 32u
+    #endif
+    const unsigned m_pk = b_packed ? ((m + MATMUL_TILE_M - 1u) / MATMUL_TILE_M) * MATMUL_TILE_M : m;
     if (b_packed && bs > 0u) bs = kd * m_pk;                          /* stride in packed elements */
     unsigned b_n = (bs > 0u) ? batch * kd * m_pk : kd * m_pk;
     unsigned c_n = batch * n * m;
