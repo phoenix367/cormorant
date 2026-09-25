@@ -296,21 +296,16 @@ for ni in [0, batch)
           // bank !wbank; a short blocking tail loop after the sweep takes
           // whatever it did not absorb, then the banks swap.
 
-          for oh_local in [0, chunk_oh)
-            for ow in [ow_start, ow_end)
-              // Drain kh × kw channel-packed PatchVec beats from
-              //   patch_stream (1 beat = kTileIC lanes) — II=1
-              for mt_in_group in [0, mt_per_group_actual)
-                // acc[0..kTileM-1] := partial_outputs[idx_base + …]    (II=1)
-                // accumulate_standard(patch, w_cache[mt_in_group], …):
-                //   for ri in [0, kh · kw · kTileM):                   PIPELINE II=1
-                //     m1 = ri & (kTileM - 1)                           // lane rotation
-                //     lane_sum = Σ_{ic_l = 0..kTileIC-1, UNROLL}
-                //                  patch[ic_l][khi][kwi]
-                //                · w_cache[mt_in_group][m1][ic_l][khi][kwi]
-                //                  // weight masked to 0 for ic_l ≥ ic_valid (X-prop guard)
-                //     acc[m1] += lane_sum
-                // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+          // §2.41: ONE flat II=1 loop over (oh_local, ow_in_tile, g, khi, kwi)
+          for it in [0, chunk_oh · tw · G · kh · kw):                 PIPELINE II=1
+            // g == 0: PatchVec beat from patch_stream → p[], parked in patch[][khi][kwi]
+            // g  > 0: p[] replayed from patch[][khi][kwi]
+            // a[m1] = (khi, kwi) == (0, 0) ? partial_outputs[word·kTileM + m1] : acc[g][m1]
+            // mac_grid_step: a[m1] += Σ_{ic_l, UNROLL} p[ic_l] · w_cache[g][m1][khi][kwi]   // 16 × 16 products
+            // acc[g][m1] = a[m1]
+            // (khi, kwi) == (kh-1, kw-1): partial_outputs[word·kTileM + m1] := a[m1]
+            // + one non-blocking WeightVec of the next slab into bank !wbank (§2.35)
+            // counters advance (kwi, khi) → g → pixel (word cursor: no multiply)
 
     // PHASE 3 (§2.38, §2.40): transpose + drain, 8 outputs per cycle — PIPELINE II=1
     for mt, segment in (chunk pixels / kDrainSeg):        // step n
@@ -324,10 +319,11 @@ for ni in [0, batch)
         //   acc_stream.write(YWord)     // order (mt, segment, m1, word)
 ```
 
-**Inner-MAC throughput is `kTileIC` MACs/cycle** (PN-wide adder tree fed by
-the unrolled `ic_l` loop).  Loop bound shrinks from
-`ic_valid · kh · kw · kTileM` to `kh · kw · kTileM`; lane rotation on `m1`
-preserves the kTileM-cycle RAW distance on `acc[m1]`.
+**Inner-MAC throughput is `kTileIC × kTileM` = 256 MACs/cycle** (§2.24,
+§2.40: 16 columns, each a private 16-input adder tree into a distance-1
+`acc[m1] += tree`).  A pixel costs exactly `G · kh · kw` cycles per
+M-group (§2.41: the accumulator load / store and the three per-pixel loop
+ramps of the earlier form are gone; one ramp per `(ict, ow_tile, mg)`).
 
 **Weight DDR replay is eliminated for `(oh, ow)`** — weights for one
 `(ict, ow_tile, M-group)` are loaded once into `w_cache` and reused

@@ -1919,6 +1919,105 @@ sweep efficiency holds.
 
 ---
 
+### 2.41. Flat standard sweep — one II=1 loop per (ict, ow_tile, M-group); loader skips unused rows
+
+**Problem.**  ResNet-18's three 1×1 stride-2 downsamples (6.4 MMAC each)
+took 3.6 ms on the board = 14 % of the 128-MAC grid, and the 1×1 s1 perf
+cases (`1x1-64to128-56x56` 14.6 ms, `1x1-128to256-28x28` 14.2 ms) were as
+poor (RESNET18_15FPS_PLAN.md step 3).  Traced with the cycle model
+first: at `kTileM = 8` it reproduces the board within 6 % (342 k cycles
+= 3.4 ms at 100 MHz for the 64→128 @56² s2 layer; 1 324 k = 13.2 ms for
+the s1 case), and its "MAC" bucket for these layers is the §2.29
+per-pixel structure — for every pixel and M-group the consumer ran an
+accumulator-load loop (G cycles), the fused (g, khi, kwi) sweep (G·kh·kw
+cycles) and a store loop (G cycles), three pipeline ramps (~12 cycles):
+`2G + 12 + G·kh·kw` = 24 cycles per pixel and group for a 1×1 with G = 4,
+of which 4 are MACs.  Not the loader (the rows a stride-2 1×1 never
+touches were loaded, but under the sweep), not the drain, not the slab
+switches.  The same overhead is the 64 % utilisation of the 3×3 layers
+(36 useful cycles of 56).
+
+**Change.**  (1) The standard consumer's sweep is ONE flat II=1 loop per
+`(ict, ow_tile, mg)` over `(oh_local, ow_in_tile, g, khi, kwi)` with
+running counters and an incremental `partial_outputs` word cursor — the
+§2.37 depthwise recipe applied to the grid path.  A tile's accumulator
+word is read from the URAM at the window's first position (`a = first ?
+word : acc[g]`, in front of the distance-1 `a += tree`; the read is
+unconditional so it uses one port at a fixed address per iteration) and
+stored write-only at the last position; `DEPENDENCE inter dependent=false`
+on `partial_outputs` because every (pixel, tile) word is loaded and
+stored exactly once per sweep.  Tile 0 of a pixel still parks each
+PatchVec in the LUTRAM `patch` and tiles 1..G−1 replay it (the same
+distance-`kh·kw` RAW the §2.29 loop had, including distance 1 for a 1×1
+— HLS schedules it at II=1, iteration latency 8).  The per-pixel
+load / store loops are gone; the §2.35 prefetch and tail are unchanged.
+The pipeline now ramps once per `(ict, ow_tile, mg)` instead of three
+times per pixel: a 1×1 costs G cycles per pixel and group, a 3×3 costs
+9G.  (2) `row_load_descriptor()` (shared by `x_row_loader` and the
+producer) starts a load at `max(last_loaded_row + 1, oh·stride_h −
+pad_top)`: rows above the current window that are not resident are never
+needed by any later output row, so with `stride_h > (kh−1)·dilation_h + 1`
+(the 1×1 s2 downsample) every other input row is neither fetched nor
+pushed through `col_stream`.
+
+**First attempt, rejected.**  A separate flat loop for `kh == kw == 1`
+next to the general per-pixel nest (the plan's literal step 3) passed
+every gate but HLS instantiated a SECOND 256-multiplier grid for it: DSP
+409 → 668, LUT 84 k → 96 k.  Two pipelined loops that each inline
+`mac_grid_step` do not share DSPs; the single flat loop above is what
+keeps one grid — and it removes the per-pixel overhead for every kernel
+size, which was plan step 7.
+
+**Tests.**  Two pointwise fixtures added: `1x1 s2 24→80 on 24×20` (2
+M-groups with a partial last group, the skipped rows) and `1x1 s1 40→21 on
+9×13 batch 2` (3 ic-tiles, partial M).  The first version of the flat
+loop advanced the word cursor by `m_tiles` at a pixel step without
+stepping back the `G − 1` tiles it had walked — caught by the named
+cases and the sweep (every 1×1 with more than one tile per group failed).
+
+**Synthesis.**  II=1 on every PIPELINE loop, slack 0.00 (the consumer
+block 0.05), one grid: DSP **409 → 407**, LUT 84.3 k → **87.0 k**
+(+2.6 k: the flat loop is 17.6 k against the fused loop's 14.3 k + the
+two per-pixel loops' 2.5 k), FF 56.7 k → 62.2 k, BRAM18 **127** and URAM
+**48** unchanged, all four ports `128 -> 128`.
+
+**Result.**  **48/48 RTL PASS**, bit-exact (grid / named 48 / sweep
+300 + a second seed), **−41.3 %** on the suite (7 488 000 → 4 393 960 ns
+vs the §2.40 run; −43.3 % vs §2.39's 7 744 540 ns on its 43 cases).  RTL,
+same fixture geometry, §2.40 → §2.41:
+
+| Case | §2.40 | §2.41 | Δ |
+|---|---:|---:|---:|
+| 1×1 32→16 on 40×64 | 1 033 230 | 257 390 | **−75.1 %** |
+| 1×1 8→8 on 121×75 | 1 842 160 | 467 350 | **−74.6 %** |
+| ow-tiling in_w=128 (3×3, 3 tiles) | 302 930 | 139 560 | **−53.9 %** |
+| oh-chunking standard 32×32×32 (3×3) | 472 740 | 277 650 | **−41.3 %** |
+| 14×14 multi-tile M and IC (3×3, 33 ch) | 318 230 | 194 170 | **−39.0 %** |
+| M-grouping 80ch batch=2 dil=2 s_h=2 | 422 100 | 268 210 | −36.5 % |
+| M-grouping 80ch in_h=17 | 321 710 | 206 490 | −35.8 % |
+| M-grouping standard (64 ch 3×3, 16×16) | 208 630 | 149 530 | **−28.3 %** |
+| M-grouping in_h=17 (64 ch 3×3) | 242 770 | 176 080 | −27.5 % |
+| 7×7 s2 stem 3→40 / 3→80 | 489 160 / 496 270 | 435 160 / 443 730 | −11 % |
+| small 3×3 stubs | | | −13 … −29 % |
+| depthwise cases | | | ±0 … −5 % (untouched path) |
+
+New fixtures: `1x1 s2 24→80 on 24×20` 75 560 ns, `1x1 s1 40→21 on 9×13
+batch 2` 91 400 ns.  Cumulative on the 3×3 64-ch anchor since §2.39:
+366 520 → 149 530 ns (**−59 %**, 2.45×); the 121×75 1×1 case is now
+write-bound (46.7 k cycles for 9 075 outputs × 1 channel-run per row).
+The 7×7 stem moved only 11 % because its 49-position windows already
+amortised the per-pixel ramps.  Cycle model (`--arch 41`: `G·kh·kw` per
+pixel + one ramp per group, skipped rows): 8.1 % mean error over 48
+cases, **3.1 %** on the > 20 k-cycle cases (the 3×3 anchors within 4 %);
+the new 1×1 s2 stub is under-predicted 19 % (a 7.6 k-cycle case with 4
+groups × 2 ic-tiles of ramps).  Model-based ResNet-18 (100 MHz): the
+sixteen 3×3 layers 220 ms (§2.39) → ~110 ms (§2.40) → **~75 ms**; each 1×1
+s2 downsample 3.6 → 0.54 / 0.41 / 0.39 ms; `1x1-64to128-56x56` 14.6 →
+1.95 ms, `1x1-128to256-28x28` 14.2 → 1.5 ms (the plan asked ≤ 1 ms and
+×3).  Board numbers pending integration.
+
+---
+
 ### On board after §2.37–§2.39 (2026-09-26, bitstream WNS +1.06 ns, ConvKernel_0 x/y instances at 128)
 
 144/144 scheduler models PASS, including the partial-strobe run edges

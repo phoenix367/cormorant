@@ -1190,6 +1190,42 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
+    // Tests 28i/28j (§2.41): pointwise geometries — the flat 1x1 sweep with
+    // M-grouping (a partial last group) and, for stride 2, the loader's
+    // skipped rows.  Kept small (they are RTL fixtures).
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=24; p.in_h=24; p.in_w=20; p.out_ch=mg_out_ch;
+        p.kh=1; p.kw=1; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "1x1 s2 downsample 24->%uch on 24x20 (2 M-groups)", mg_out_ch);
+        total_failures += run_test(label, p, x, w, b);
+    }
+    {
+        ConvParams p{};
+        p.batch=2; p.in_ch=40; p.in_h=9; p.in_w=13; p.out_ch=kTileM + 5;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "1x1 s1 40->%uch on 9x13 batch 2 (3 ic-tiles, partial M)", kTileM + 5);
+        total_failures += run_test(label, p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
     // Test 28e: long contiguous output runs.  1x1, 32 -> 16 ch on 40x64:
     // out_w*out_ch_padded = 1024 so one chunk holds 40 rows and each
     // channel's Phase-3 run is 40*64 = 2560 elements — more than 16

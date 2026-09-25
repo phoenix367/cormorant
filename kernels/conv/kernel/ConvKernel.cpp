@@ -584,9 +584,15 @@ static inline RowLoad row_load_descriptor(
 {
     #pragma HLS INLINE
     RowLoad r;
-    const int ih_window_max = (int)(oh * stride_h) - (int)pad_top
-                            + (int)((kh - 1) * dilation_h);
+    const int ih_window_min = (int)(oh * stride_h) - (int)pad_top;
+    const int ih_window_max = ih_window_min + (int)((kh - 1) * dilation_h);
+    // Rows above this window that are not resident yet are never needed by
+    // any later oh either (windows only move down), so skip them: with
+    // stride_h > (kh-1)*dilation_h + 1 (§2.41: a 1x1 s2 downsample) every
+    // other input row is neither loaded from DDR nor pushed through the
+    // column stream.
     r.load_start = last_loaded_row + 1;
+    if (r.load_start < ih_window_min) r.load_start = ih_window_min;
     if (r.load_start < 0) r.load_start = 0;
     r.load_end = ih_window_max;
     if (r.load_end >= (int)in_h) r.load_end = (int)in_h - 1;
@@ -1531,108 +1537,139 @@ static void process_conv_kernel_tile(
                 unsigned f_mv = std::min(kTileM, out_ch - mt_base_next * kTileM);
                 const ap_uint<1> nbank = wbank ^ 1;   // bank being prefetched
 
-                // ---- Spatial sweep (§2.29): per (oh, ow_in_tile) ONE fused
-                //      II=1 loop over (tile-in-group, khi, kwi) ----
-                // Tile 0 consumes each PatchVec beat straight from the
-                // stream and parks it in `patch`; tiles 1..G-1 replay it
-                // from `patch`.  All G tiles' accumulators live in registers
-                // for the whole pixel.  Each iteration also advances the
-                // §2.35 prefetch of the next slab into the other bank.
-                for (unsigned oh_local = 0; oh_local < chunk_oh_count;
-                     oh_local++) {
-                    for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                        Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-                        #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
+                // ---- §2.41 flat spatial sweep: per (ict, ow_tile, mg) ONE
+                //      II=1 loop over (oh_local, ow_in_tile, g, khi, kwi) ----
+                // The §2.29 form re-entered three loops per pixel (a G-word
+                // accumulator load, the fused (g, khi, kwi) sweep, a G-word
+                // store: ~2G + 12 cycles of ramps around G*kh*kw useful
+                // ones — 64 % utilisation on a 3x3, 17 % on a 1x1).  Here
+                // the pixel loop is folded in with running counters, as the
+                // depthwise sweep does (§2.37): a tile's accumulator word is
+                // read from partial_outputs at its first kernel position
+                // (`first ? word : acc`, in front of the distance-1
+                // `acc += tree` recurrence) and stored write-only at its
+                // last, so the pipeline ramps once per sweep.  Tile 0 of a
+                // pixel takes each PatchVec beat from the stream and parks
+                // it in `patch`; tiles 1..G-1 replay it from there (the same
+                // LUTRAM RAW at distance kh*kw the §2.29 loop had).  Every
+                // (pixel, tile) word is loaded and stored exactly once per
+                // sweep, so the URAM load and store never alias across
+                // iterations.  Each iteration also advances the §2.35
+                // prefetch of the next slab into the other bank.
+                const unsigned tw        = ow_end - ow_start;
+                const unsigned n_pos     = kh * kw;
+                const unsigned n_iter    = chunk_oh_count * tw * mt_in_group_count * n_pos;
+                const unsigned row_words = out_w * m_tiles;
+                unsigned word_row = ow_start * m_tiles + mt_base;     // (pixel, tile 0) word of the row
+                unsigned word     = word_row;
+                unsigned g = 0, khi = 0, kwi = 0, pos = 0, ow_l = 0;
 
-                        AccData_t acc[kMaxMperGroup][kTileM];
-                        #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                Data_t patch[kTileIC][kMaxKH][kMaxKW];
+                #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+                #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
-                        const unsigned pix_word = (oh_local * out_w + ow) * m_tiles;
+                AccData_t acc[kMaxMperGroup][kTileM];
+                #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-                        // Load every tile's padded accumulator word (§2.23).
-                        for (unsigned g = 0; g < mt_in_group_count; g++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned word = pix_word + mt_base + g;
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                #pragma HLS UNROLL
-                                acc[g][m1] = partial_outputs[word * kTileM + m1];
-                            }
+                for (unsigned it = 0; it < n_iter; it++) {
+                    #pragma HLS PIPELINE II=1
+                    // The sweep reads bank wbank and the prefetch writes
+                    // bank !wbank (UG1399 "pragma HLS dependence").
+                    #pragma HLS DEPENDENCE variable=w_lo type=inter dependent=false
+                    #pragma HLS DEPENDENCE variable=w_hi type=inter dependent=false
+                    // One load (first position) and one store (last
+                    // position) per (pixel, tile) word, never the same word
+                    // in two different iterations of one sweep.
+                    #pragma HLS DEPENDENCE variable=partial_outputs type=inter dependent=false
+                    const bool first = (pos == 0);
+                    const bool last  = (pos + 1 == n_pos);
+
+                    Data_t p[kTileIC];
+                    #pragma HLS ARRAY_PARTITION variable=p complete dim=0
+                    if (g == 0) {
+                        const PatchVec v = patch_stream.read();
+                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                            #pragma HLS UNROLL
+                            p[ic_l]               = v.lane[ic_l];
+                            patch[ic_l][khi][kwi] = v.lane[ic_l];
                         }
+                    } else {
+                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                            #pragma HLS UNROLL
+                            p[ic_l] = patch[ic_l][khi][kwi];
+                        }
+                    }
 
-                        // Fused (g, khi, kwi) sweep + prefetch.
-                        const unsigned n_steps = mt_in_group_count * kh * kw;
-                        unsigned g = 0, khi = 0, kwi = 0;
-                        for (unsigned ri = 0; ri < n_steps; ri++) {
-                            #pragma HLS PIPELINE II=1
-                            // The sweep reads bank wbank and the prefetch writes
-                            // bank !wbank, so an iteration never reads what a
-                            // previous iteration wrote — without this HLS assumes
-                            // a RAW hazard through w_cache and schedules II=2
-                            // (UG1399 "pragma HLS dependence", inter /
-                            // dependent=false).
-                            #pragma HLS DEPENDENCE variable=w_lo type=inter dependent=false
-                            #pragma HLS DEPENDENCE variable=w_hi type=inter dependent=false
-                            Data_t p[kTileIC];
-                            #pragma HLS ARRAY_PARTITION variable=p complete dim=0
-                            if (g == 0) {
-                                const PatchVec v = patch_stream.read();
-                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                    #pragma HLS UNROLL
-                                    p[ic_l]              = v.lane[ic_l];
-                                    patch[ic_l][khi][kwi] = v.lane[ic_l];
-                                }
-                            } else {
-                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                    #pragma HLS UNROLL
-                                    p[ic_l] = patch[ic_l][khi][kwi];
-                                }
-                            }
-                            const unsigned m_valid_g =
-                                std::min(kTileM, out_ch - (mt_base + g) * kTileM);
-                            mac_grid_step(p, w_lo, w_hi, w_cache_addr(wbank, g, khi, kwi),
-                                          acc[g], ic_valid, m_valid_g);
+                    // Seed from the URAM word at the window's first position
+                    // (read unconditionally — one port, address = word).
+                    AccData_t a[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=a complete dim=0
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        const AccData_t w_in = partial_outputs[word * kTileM + m1];
+                        a[m1] = first ? w_in : acc[g][m1];
+                    }
+                    const unsigned m_valid_g =
+                        std::min(kTileM, out_ch - (mt_base + g) * kTileM);
+                    mac_grid_step(p, w_lo, w_hi, w_cache_addr(wbank, g, khi, kwi),
+                                  a, ic_valid, m_valid_g);
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        acc[g][m1] = a[m1];
+                    }
+                    if (last) {
+                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            #pragma HLS UNROLL
+                            partial_outputs[word * kTileM + m1] = a[m1];
+                        }
+                    }
 
-                            // §2.35 prefetch: one WeightVec of the NEXT slab
-                            // into the other bank, if one is available.
-                            if (f_pos < f_total) {
-                                WeightVec wv;
-                                if (weight_stream.read_nb(wv)) {
-                                    const unsigned wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
-                                    w_cache_store(w_lo, w_hi, f_m1, wa, wv);
-                                    f_pos++;
-                                    if (++f_kwi == kw) {
-                                        f_kwi = 0;
-                                        if (++f_khi == kh) {
-                                            f_khi = 0;
-                                            if (++f_m1 == f_mv) {
-                                                f_m1 = 0;
-                                                f_t++;
-                                                f_mv = std::min(kTileM,
-                                                    out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
-                                            }
-                                        }
+                    // §2.35 prefetch: one WeightVec of the NEXT slab
+                    // into the other bank, if one is available.
+                    if (f_pos < f_total) {
+                        WeightVec wv;
+                        if (weight_stream.read_nb(wv)) {
+                            const unsigned wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
+                            w_cache_store(w_lo, w_hi, f_m1, wa, wv);
+                            f_pos++;
+                            if (++f_kwi == kw) {
+                                f_kwi = 0;
+                                if (++f_khi == kh) {
+                                    f_khi = 0;
+                                    if (++f_m1 == f_mv) {
+                                        f_m1 = 0;
+                                        f_t++;
+                                        f_mv = std::min(kTileM,
+                                            out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
                                     }
                                 }
                             }
-
-                            if (++kwi == kw) {
-                                kwi = 0;
-                                if (++khi == kh) {
-                                    khi = 0;
-                                    g++;
-                                }
-                            }
                         }
+                    }
 
-                        // Store every tile's word back.
-                        for (unsigned g2 = 0; g2 < mt_in_group_count; g2++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned word = pix_word + mt_base + g2;
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                #pragma HLS UNROLL
-                                partial_outputs[word * kTileM + m1] = acc[g2][m1];
+                    // Counters: (kwi, khi) over the window, then the tile,
+                    // then the pixel (the word cursor carries no multiply).
+                    if (last) {
+                        pos = 0; kwi = 0; khi = 0;
+                        if (++g == mt_in_group_count) {
+                            g = 0;
+                            if (++ow_l == tw) {
+                                ow_l      = 0;
+                                word_row += row_words;
+                                word      = word_row;
+                            } else {
+                                // word is at tile G-1 of this pixel; the next
+                                // pixel's tile 0 is m_tiles further from tile 0.
+                                word += m_tiles - (mt_in_group_count - 1);
                             }
+                        } else {
+                            word++;
+                        }
+                    } else {
+                        pos++;
+                        if (++kwi == kw) {
+                            kwi = 0;
+                            khi++;
                         }
                     }
                 }
