@@ -18,7 +18,7 @@ The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
 128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
 exported IP's own default (32 for the 16-bit element ports; 128 for the
 ports that are `ap_uint<128>` in C++: conv weight/bias, matmul a/b, pool
-x).  The test stand's three block designs use the same widths with a
+x, VectorOP a/b/c since Track C of THROUGHPUT_PLAN.md).  The test stand's three block designs use the same widths with a
 128-bit PS port since 2026-09-24, so RTL timing matches the board.  Two things that
 look like shortcuts and are not (2026-09-24): (a) widening
 `C_M_AXI_*_DATA_WIDTH` on an instance in IP integrator — the HLS wrapper

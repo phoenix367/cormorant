@@ -281,6 +281,30 @@ correct, just unfused).
 
 ---
 
+### On board (2026-09-25, bitstream WNS +1.88 ns, VectorOPKernel_0 instance widths 128)
+
+144/144 scheduler models PASS; the `act` register (0x5C) proven by a
+write-then-read.  `run_remote_perf.py`, before → after:
+
+| Case | before | after | |
+|---|---:|---:|---:|
+| ADD-1K | 19 µs | 9 µs | 2.1× |
+| ADD-16K | 0.175 ms | 0.048 ms | 3.6× |
+| ADD-256K | 2.653 ms / 0.59 GB/s | 0.663 ms / 2.37 GB/s | 4.0× |
+| MUL-64K | 0.671 ms | 0.171 ms | 3.9× |
+| RELU-64K | 0.668 ms / 0.39 GB/s | 0.090 ms / 2.90 GB/s | 7.4× |
+| RELU6-16K | 0.173 ms | 0.028 ms | 6.2× |
+| ADD-bcast-8x16K | 1.376 ms | 0.338 ms | 4.1× |
+| MUL-bcast-dw-12544x16 | 6.135 ms / 0.20 GB/s | 0.261 ms / 4.61 GB/s | 23.5× |
+| DIV-4K | 0.051 ms | 0.049 ms | (lane-serial by design) |
+
+Binary ops reach 2.3–2.4 GB/s of the 2.4 GB/s port-bound ideal (the two
+read streams share the 1.6 GB/s read channel); unary ops 2.9–3.0 GB/s.
+Demos with Relu/Clip fusion enabled in their generators (`fuse_act=True`):
+MobileNet v2 400 → **344 ms**, ResNet-18 372 → **345 ms**, MobileNet v1
+489 → **444 ms**, MNIST convnet 0.898 → **0.813 ms**, LeNet 7.99 →
+**7.65 ms**; predictions and logits identical.
+
 ## 3. Scheduler: `act` register and Relu / Clip(0,6) fusion (C4)
 
 `inference-scheduler`: `run_op()` now writes `act = VECTOROP_ACT_NONE`

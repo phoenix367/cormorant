@@ -73,7 +73,7 @@ def _run_scheduler(model_path: Path, out_dir: Path) -> Tuple[OnnxGraph,
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
 
-    graph = OnnxGraph(str(model_path))
+    graph = OnnxGraph(str(model_path), fuse_act=True)   # Relu/Clip(0,6) fused into the producing VectorOP call (VECTOROP_OPTIMISATION §3)
     gen   = CodeGenerator(graph=graph, model_path=str(model_path))
 
     # Reuse the CLI generator to write all files (header, source, buf_impl,
