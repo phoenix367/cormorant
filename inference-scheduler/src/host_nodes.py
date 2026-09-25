@@ -143,6 +143,11 @@ def libm(name: str, x) -> np.ndarray:
     return _LIBM[name](x) if x.size else x.copy()
 
 
+def _num(v) -> float:
+    """Float from a numeric or (fusion-recorded, exact repr) string attribute."""
+    return float(v.decode() if isinstance(v, bytes) else v)
+
+
 def _c_float(v: float) -> str:
     """float32 literal that round-trips exactly."""
     v = float(np.float32(v))
@@ -566,9 +571,12 @@ class LayerNormNode(HostNode):
                     f"elements, expected {n} (= prod(shape[axis:])).")
             return v.reshape(-1).copy()
 
+        # a fused pattern also records eps as a string: the float attribute is
+        # float32, the graph's constant may not be
+        eps = _num(a.get("axi_epsilon", a.get("epsilon", 1e-5)))
         sn = cls(onnx_node=node, inputs=[x], output=y, index=index,
                  align_elems=align_elems, rows=x.numel // n, n=n,
-                 eps=float(a.get("epsilon", 1e-5)), tf_form=int(a.get("axi_tf_form", 0)),
+                 eps=eps, tf_form=int(a.get("axi_tf_form", 0)),
                  gamma=_param(1, "scale (gamma)"), beta=_param(2, "bias (beta)"))
         sn._reject_int(x)
         if len(node.output) > 1 and any(node.output[1:]):
@@ -653,8 +661,8 @@ class GeluNode(HostNode):
             raise SchedulerError(f"Gelu node '{_label(node)}': approximate='{approx}'.")
         sn = cls(onnx_node=node, inputs=[x], output=y, index=index,
                  align_elems=align_elems, n=x.numel, approximate=approx,
-                 c1=float(a.get("axi_c1", GELU_C1)), c2=float(a.get("axi_c2", GELU_C2)),
-                 k=float(a.get("axi_k", SQRT2)), div=int(a.get("axi_div", 1)))
+                 c1=_num(a.get("axi_c1", GELU_C1)), c2=_num(a.get("axi_c2", GELU_C2)),
+                 k=_num(a.get("axi_k", SQRT2)), div=int(a.get("axi_div", 1)))
         sn._reject_int(x)
         return sn
 
