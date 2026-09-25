@@ -6,8 +6,11 @@ opset 12): 12 layers, hidden 768, 12 heads, FFN 3072, sequence 256,
 108.7 M parameters.  Inputs `input_ids`, `segment_ids`, `input_mask`
 (int64 [1,256]) and `unique_ids_raw_output___9` (int64 [1], passed
 through); outputs `unstack:0` / `unstack:1` = start / end logits [1,256].
-Status: **phase 1 in progress** — scheduler side (1b–1f) implemented on
-`feat/bert-sched` (§3); bitstream (1a), demo (1g) and the board run open.
+Status: **phase 1 done** — scheduler side (1b–1f) on `feat/bert-sched`,
+demo (1g) on `feat/bert-demo`; on the `max_k` 4096 bitstream (1a) BERT-base
+runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
+scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
+Phase 2 (performance) open.
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -63,7 +66,7 @@ inference in phase 1**.  ConvKernel's 512-MAC grid does 1×1 convs at
 | 1d | Integer tensors (token ids, segment ids, mask): stored as raw int16 in `inference_buf_t` (values must fit; vocab 30522 does), documented in `inference.h` | graph / codegen / harness — **done** (§3) |
 | 1e | `_simulate` covers every new op with the same semantics as the C host code, so generated `test_inference.c` expected outputs stay meaningful | `src/codegen/_simulate.py` — **done** (§3) |
 | 1f | Tiny transformer fixtures (hidden 32–64, 1–2 layers, seq 8–16, both LN/GELU pattern styles) in a new `test/gen_bert_models.py`; unit tests per host op; added to the on-board model suite | tests, `remote_config_all_models.json` — **done** except the on-board suite entry (§3) |
-| 1g | `demo/bert_squad/`: WordPiece tokenizer + SQuAD feature builder (from the study), project generation, deploy-and-run, span decoding and EM/F1 against the emulation | new demo |
+| 1g | `demo/bert_squad/`: WordPiece tokenizer + SQuAD feature builder (from the study), project generation, deploy-and-run, span decoding and EM/F1 against the emulation | new demo — **done** (§3) |
 
 **Gates.**  Scheduler simulation of BERT-base reproduces the study's
 plain-Q8.8 emulation (logits within a few LSB; identical spans on the
@@ -147,7 +150,7 @@ one example whose span moves (#52) moves under both policies.
 → ~0.06 s; host ops ~0.7 s single-threaded (placeholder rates) → **~10.8 s
 per inference** before any phase-2 work.
 
-**Board steps left for phase 1:** bitstream with `max_k` 4096 (1a); a demo
+**Board steps left for phase 1** (all done 2026-09-26, next subsection)**:** bitstream with `max_k` 4096 (1a); a demo
 runner (1g) that fills the four integer inputs as raw int16
 (`inference_buf_ptr(input_ids_0)[i] = (Data_t)(int16_t)id`) and reads the
 logits as `(int16_t)bits / 256.0`; a 215 MiB contiguous BO plus
@@ -164,3 +167,74 @@ inference.  Gather reads the 47 MB word-embedding table in place (256 rows,
 384 KB per inference); the table could live in host memory to save CMA.
 `INFERENCE_BUF_POOL_SIZE_BYTES` in `inference.h` is the naive
 no-reuse sum (462 MB); the real pool BO is 215 MiB.
+
+### Phase 1 on the board (1a, 1g) — 2026-09-26, branch `feat/bert-demo`
+
+KV260 at 100 MHz, bitstream with `kernels.matmul.max_k` 4096 (the same
+bitstream passes the 148-model board suite including the four
+`bert_tiny_*` fixtures), `demo/bert_squad/` (README there): the first 50
+single-window SQuAD 1.1 dev questions (all from the "Super Bowl 50"
+article), 208 MB of weights uploaded once to `/root/bert_squad_weights`,
+project built on the board in 16 s.
+
+* **Smoke test** — the generated `test_inference` (ramp inputs, expected
+  logits from the simulation): **PASSED** (12.6 s including init).
+* **Bit-exactness** — board start / end logits equal the scheduler
+  simulation (`CodeGenerator._forward_pass`) **bit for bit on 3 / 3**
+  checked examples and the study's `sched` emulation on **50 / 50**.  No
+  tolerance anywhere: the aarch64 glibc 2.35 `exp` / `tanh` under
+  `-ffp-contract=off` and the kernels' integer arithmetic reproduce the
+  host's numpy + glibc 2.39 simulation exactly (a last-ulp libm difference
+  would only matter where a host-op result lies within an ulp of a Q8.8
+  rounding boundary — none reached the logits of the 50 inferences).
+* **Accuracy** (official SQuAD normalisation):
+
+| N | float32 EM / F1 | Q8.8 emulation EM / F1 | **KV260 EM / F1** | same span as float |
+|---:|---:|---:|---:|---:|
+| 20 | 90.0 / 91.7 | 90.0 / 91.7 | **90.0 / 91.7** | 19 / 20 |
+| 50 | 88.0 / 90.3 | 88.0 / 90.3 | **88.0 / 90.3** | 49 / 50 |
+
+  The one moved span (#16) answers "2015" where float says "2016," — both
+  gold answers.
+* **Latency** — **12.13 s per inference** (mean 12130.9 ms, min 12128.0,
+  max 12134.0 over 50; per-layer profiling costs < 0.1 %),
+  `inference_init` 0.3 s.  Per-layer profile (`--profile-layers`, N = 20,
+  per inference; the sum, 12.14 s, equals the wall time — the schedule is
+  effectively serial):
+
+| kind | layers | time | share | measured rate |
+|---|---:|---:|---:|---|
+| MatMul linears | 74 | 7.66 s | 63.1 % | 2.78 GMAC/s (768², 768×3072), 2.97 (3072×768) |
+| GELU (host) | 12 | 2.05 s | 16.9 % | 217 ns / element (171 ms per layer) |
+| Softmax (host) | 12 | 1.07 s | 8.8 % | 114 ns / element (89 ms per layer) |
+| attention MatMuls | 24 | 0.75 s | 6.2 % | QKᵀ 1.28 GMAC/s (K = 64), P·V 2.16 |
+| LayerNorm (host) | 25 | 0.34 s | 2.8 % | 69 ns / element |
+| Transpose (host) | 49 | 0.17 s | 1.4 % | 18 ns / element (≈ 220 MB/s BO read + write) |
+| VectorOP | 126 | 0.10 s | 0.8 % | 0.4–0.8 G element/s |
+| other host (Gather, OneHot, Cast, Slice) | 5 | 0.003 s | 0.0 % | |
+
+  Against the gate (c) estimate (10.8 s): the MatmulKernel is faster than
+  assumed (8.4 s at 2.8 GMAC/s instead of 10.0 s at 2.3) and the host ops
+  are 5× slower (3.6 s instead of 0.7 s: double-precision `tanh` / `exp`
+  on one A53 plus reads from the non-cacheable BOs).
+
+**What phase 2 should attack first, by the measured profile:**
+
+1. **The linears (7.66 s, 63 %).**  73 Gemms at 2.8 GMAC/s.  As 1×1 convs on
+   ConvKernel (15–40 GMAC/s on 1×1, §0) they would take 0.55–1.45 s —
+   −6.2 to −7.1 s, the single biggest item; needs `max_in_ch` ≥ 3072 (or a
+   K-split) and the feature-major activation layout.
+2. **GELU + Softmax on the host (3.12 s, 26 %) — cheap and bit-exact.**
+   `host_gelu_tanh` is a pure function of its 16-bit Q8.8 input, so a
+   65 536-entry `Data_t` table filled at init with the same double formula
+   gives the same bits by construction (−~1.9 s).  Softmax's `exp` argument
+   `x − max` is an exact multiple of 1/256 in [−256, 0], so a 65 536-entry
+   `double` table of `exp` is exact too (the per-row sum and division stay).
+   The simulation needs no change.  Then split rows of LayerNorm / Softmax
+   over the four A53 cores (same per-element arithmetic, still bit-exact).
+3. **Attention (0.75 s MatMul + 0.17 s Transpose, 7.6 %)** — row-stride /
+   transposed-B modes on MatmulKernel remove the 48 transposes and the short
+   K = 64 QKᵀ calls run at half the linears' rate.
+
+VectorOP (0.8 %) is not worth touching.  With 1 and 2 done the model would
+be at roughly 2.5–3.5 s per inference.

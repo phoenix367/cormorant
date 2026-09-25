@@ -535,7 +535,13 @@ def main(argv=None) -> int:
         session = RemoteSession(cfg["ssh"])
         print(f"\n{_bold('Connecting')} to {cfg['ssh']['user']}@{cfg['ssh']['host']}:"
               f"{cfg['ssh'].get('port', 22)} ...")
-        session.connect()
+        try:
+            session.connect()
+        except Exception as exc:                              # noqa: BLE001
+            print(_red(f"  connection failed: {exc}"))
+            if ref_proc:
+                ref_proc.terminate()
+            return 1
         try:
             if not preflight_remote(session, cfg):
                 print(_red("\npreflight: remote prerequisites missing"))
