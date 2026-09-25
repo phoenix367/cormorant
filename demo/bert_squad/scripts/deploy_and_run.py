@@ -59,6 +59,7 @@ KINDS = ("MatMul linear", "MatMul attention", "VectorOP", "LayerNorm", "GELU",
 _REQUIRED_DRIVER_HEADERS = {
     "VectorOPKernel": ["xvectoropkernel.h", "xvectoropkernel_hw.h"],
     "MatmulKernel":   ["xmatmulkernel.h", "xmatmulkernel_hw.h"],
+    "ConvKernel":     ["xconvkernel.h", "xconvkernel_hw.h"],
 }
 
 

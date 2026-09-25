@@ -18,18 +18,20 @@
     "_weights_dir_note": "Persistent directory for the 208 MB weights/*.dat. Uploaded once; later runs upload only files whose size or checksum changed.",
     "uio_devices": {
       "VectorOPKernel": "fabric_vecop",
-      "MatmulKernel":   "fabric_matmul"
+      "MatmulKernel":   "fabric_matmul",
+      "ConvKernel":     "fabric_conv"
     },
-    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses only these two kernels.",
+    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs the MatMuls, MatmulKernel the two it cannot; --no-matmul-on-conv in generate_project's scheduler options would drop ConvKernel).",
     "cmake_args": []
   },
 
   "local": {
     "driver_dirs": {
       "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
-      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src"
+      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
     },
-    "_driver_dirs_note": "HLS-generated driver sources, copied into the project. Build with make synthesize_vectorop_kv260 synthesize_matmul_kv260."
+    "_driver_dirs_note": "HLS-generated driver sources, copied into the project. Build with make synthesize_vectorop_kv260 synthesize_matmul_kv260 synthesize_conv_kv260."
   },
 
   "model": "assets/models/bertsquad-12-simplified.onnx",
