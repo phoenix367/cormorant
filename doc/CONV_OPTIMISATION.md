@@ -1754,6 +1754,171 @@ latency is paid once per input row).
 
 ---
 
+### 2.40. 16 × 16 MAC grid — `tile_m` 8 → 16, weight cache split BRAM / URAM
+
+**Problem.**  ResNet-18's sixteen 3×3 convs took 220 ms of 310 ms on the
+board at 59–60 % utilisation of the 128-MAC grid on every layer
+(RESNET18_15FPS_PLAN.md §0): the per-pixel cost is `G·kh·kw` sweep
+iterations plus a fixed ~20 cycles of accumulator load / store / loop
+ramps per M-group, and a 64-channel layer needed two groups of four
+8-channel tiles.  The array's ceiling was 1814 MMAC / 128 = 142 ms per
+image.
+
+**Change.**  `platforms/kv260.json` `kernels.conv.tile_m` 8 → 16; the
+grid is `kTileIC × kTileM = 16 × 16 = 256` products per cycle (`mac_grid_step`
+is unchanged in form — 16 columns, one 256-bit weight word each, private
+16-input adder trees, distance-1 `acc[m1] += tree`).  Everything that
+scales with `kTileM` followed through `Config.h`: the padded accumulator
+word (`partial_outputs` reshaped to 512-bit words — still 8 URAM), the
+`BiasVec`, Phase 1, the per-tile `acc[g][16]`, the depthwise lanes
+(`w_buf[16][49]`, 16 MACs/cycle), the line-buffer channel tile of the
+depthwise producer (`ct_width = kTileM = 16 = kTileIC`).  Four things
+did not scale for free:
+
+1. **Weight cache bandwidth.**  The sweep reads all `kTileM` columns
+   every cycle — 16 × 256 bits = 4096 bits — and every BRAM36 / URAM port
+   is 72 bits wide, so the RAM count is set by the column count, not the
+   depth: 4 BRAM36 (8 BRAM18) or 4 URAM per column whatever
+   `kMaxMperGroup` is.  Doubling the columns in BRAM would have added 32
+   BRAM36 to a design at 119/144; all 16 columns in URAM would be 64 = the
+   whole pool (partial_outputs and the two URAM FIFOs need 16).  The cache
+   is therefore two arrays of identical shape and addressing —
+   `w_lo[8][512]` (BRAM, the same 64 BRAM18 the 8-column cache used) and
+   `w_hi[8][512]` (URAM, 32 blocks) — with `w_cache_store()` doing the
+   §2.35 explicit column compare across both.  `ConvMacGrid.h` keeps the
+   flat power-of-two address; the ping-pong bank bit, the prefetch cursors
+   and the `DEPENDENCE inter dependent=false` (now on both arrays) are as
+   in §2.35.  Alternatives considered and rejected: both URAM ports
+   reading (halves the count but leaves no write port for the in-sweep
+   prefetch, so every slab fill would be serial again — 65 % of a 7² 512-ch
+   layer); a 2-pixel-per-word time-multiplexed grid (keeps the cache but
+   needs a skewed column pipeline and wastes 12.5 % on odd 7-wide rows).
+2. **Weight-port requests.**  `stream_load_weights` requested all `m_valid`
+   slabs of a tile before draining any; at 16 that exceeds the port's
+   `num_read_outstanding = 8` and the request loop would stall with the
+   data of the first slabs still undrained.  It now keeps a sliding window
+   of `kWeightReqWindow = 8` requests (slab `m1 + 8` is requested when slab
+   `m1` has been drained; same for the depthwise producer) — the port
+   options and the adapter buffer are unchanged.
+3. **Phase-3 fill.**  A tile word now holds 16 channels but the transposer
+   has 8 banks and `y` is 8 lanes.  The fill scatters one word in
+   `kFillSteps = kTileM/8 = 2` sub-steps (channels 8h..8h+7 in sub-step h;
+   bank `(m1+p) % 8` is unchanged since `8h ≡ 0`), which is exactly the
+   drain's `kTileM/8` words per pixel, so both sides stay balanced at 8
+   outputs per cycle; the bank depth doubles to `kTileM · kDrainSegWords`
+   = 512 entries (LUTRAM).
+4. **Cursor widths.**  The prefetch's `f_m1` was `ap_uint<4>`: at
+   `f_mv = 16` the compare `++f_m1 == f_mv` could never fire (the C-sim
+   sweep would have caught it: it is `ap_uint<5>` now).
+
+Three storage bindings were changed because the first synthesis showed
+BRAM 165 → 187 with nothing new in BRAM: `bias_stream` (16 × 512-bit
+beats) had become a 29-BRAM18 "memory" FIFO (it was 15 at 8 × 256) —
+`impl=srl`; `patch_stream` (49 × 256 bits) had always cost 15 BRAM18 —
+`impl=lutram`; `bias_buf` re-banked by 16 was 16 BRAM18 of 80 entries —
+`impl=LUTRAM`.  Net BRAM is now BELOW the 8-column kernel.  The per-lane
+weight masks (`ic_l < ic_valid && m1 < m_valid` on 256 × 16-bit lanes)
+lost their `ic_valid` term: the ic pad lanes need none (every cache word
+read was written with all 16 lanes defined — the producer zero-initialises
+the vector and the packed layout carries zeros past `in_ch`, now a stated
+contract in ConvKernel.h — and the patch lanes are zero), and the `m1 <
+m_valid` mask only has to keep 'X' from the never-written columns of a
+partial last tile out of the accumulator (it stays on the weight input,
+see trap 3).  `TestConvGrid` gives the pad lanes the contract's zero
+weights against garbage patch lanes.  The Phase-3 fill scatters a tile
+with ≤ 8 valid channels in ONE sub-step (`f_steps = ceil(f_valid / 8)`),
+so every `out_ch ≤ 8` layer and the last tile of an `out_ch % 16 ≤ 8`
+layer drain at the old rate.
+
+**Tests.**  The named cases that were sized to trigger M-grouping at
+`kTileM = 8` (out_ch 64 / 40 → 8 / 5 tiles) are single-group at 16; their
+labels are kept (they are the 3×3 64-ch timing anchors) and three cases
+derived from the constants were added — `out_ch = kTileM·kMaxMperGroup +
+kTileM = 80`: 3×3 with `in_h = 17` (the §2.21 residency cap), the 7×7 s2
+stem on 24×24, and batch 2 / dilation 2 / stride_h 2 — so the prefetch
+still crosses a partial last group and the cap is still exercised.  The
+random sweep's standard `out_ch` bound is now `2·kTileM·kMaxMperGroup +
+kTileM/2` (136) instead of 72 so `num_m_groups > 1` is sampled at any tile
+size.  The RTL fixtures were regenerated (46 cases).  The scheduler
+follows the JSON (`CONV_TILE_M` only enters the padded
+`out_w · ceil(out_ch/16)·16 ≤ max_acc_persist_entries` rule; the packed
+weight layout is tiled on IC only and does not change); its models were
+regenerated and 1285 tests pass.
+
+**Traps.**  (1) The FIFO "memory" implementation for anything wider than
+a BRAM18 column is 15+ BRAM18 regardless of a 16-deep depth — bind small
+wide FIFOs to `srl` / `lutram` explicitly.  (2) `ARRAY_PARTITION cyclic
+factor=16` on a 1280-entry `Data_t` array makes 16 BRAM18 of 80 entries;
+bind to LUTRAM.  (3) The m-mask must stay on the WEIGHT INPUT.  Masking each
+column's adder-tree result instead (`acc[m1] += m1 < m_valid ? tree : 0`,
+a single 32-bit mux per column) looked cheaper but put a mux stage in
+front of the accumulator add: the fused sweep loop went from iteration
+latency 6 to 7 — one more ramp cycle per pixel, which the first RTL run
+showed as +1 cycle/pixel on every case (+5 % on `1x1 8->8 on 121x75`,
++1…3 % on the 3×3 cases).  With the mask back on the 16 weight lanes of
+each column (folded into the DSP input registers) the latency is 6 again
+and the sweep loop's LUT is 14.3 k (16.8 k with the old per-lane ic+m
+masks): the 16 adder trees (~7.7 k) plus the runtime-`g` accumulator read
+/ write muxes (`acc[4][16]`, ~6 k) — the latter is what a §2.37-style flat
+sweep (plan step 7) would remove.  (4) The 2-cycle fill on a ≤ 8-channel
+tile doubled Phase 3 on the small-channel cases (the other +5 % on the
+121×75 case, +1…7 % on the 1–4-channel stubs) — `f_steps` above.
+(5) URAM columns behave exactly like the BRAM ones for the prefetch (no
+partial-write inference with the full-word `WeightVec` store).
+
+**Synthesis.**  II=1 on every PIPELINE loop (fused sweep iteration
+latency 6 as before, accumulator load 2 / store 1, fill / drain 2, writer
+6), slack 0.00, all four ports `128 -> 128`, no partial writes, no RAM
+duplication (w_lo 8 × 8 BRAM18, w_hi 8 × 4 URAM, partial_outputs 8 URAM).
+Resources (csynth, kv260 @150 MHz target), §2.39 → §2.40: BRAM18 **165 →
+127** (57 % → 44 %: w_lo 64 unchanged, −29 bias_stream, −15 patch_stream,
+−8 bias_buf), DSP **262 → 409** (+147: 128 multipliers, the wider
+accumulate / address paths), FF 46.1 k → 56.7 k, LUT **68.4 k → 84.3 k**
+(+15.9 k: process_conv_kernel_tile 28.8 k → 43.0 k, of which the sweep
+loop 5.5 k → 14.3 k and the load / store / fill loops +3 k), URAM **16 →
+48** (w_hi 32).  Bitstream impact to expect: LUT ≈ 62 % → ~76 %, BRAM
+tiles −19, DSP 535 → ~680, URAM 16 → 48 of 64.
+
+**Result.**  **46/46 RTL PASS**, bit-exact (grid / named 46 / sweep 300 +
+two extra seeds), **−3.3 %** on the suite total (7 744 540 → 7 488 000 ns)
+— the suite is dominated by the 1×1 121×75 writer-bound case and by
+stubs that are one pipeline ramp long; the cases the change is for
+moved as the cycle model predicted (RTL, same fixture geometry):
+
+| Case | §2.39 | §2.40 | Δ |
+|---|---:|---:|---:|
+| M-grouping standard (out_ch=64 3×3, 16×16) | 366 520 | 208 630 | **−43.1 %** |
+| DW 3×3 12ch 33×37 | 289 640 | 167 470 | **−42.2 %** |
+| DW oh-chunking 32ch 32×32 | 491 390 | 284 800 | **−42.0 %** |
+| M-grouping in_h=17 (64ch 3×3) | 412 620 | 242 770 | **−41.2 %** |
+| M-grouping 7×7 s2 stem 3→40 | 790 490 | 489 160 | **−38.1 %** |
+| M-grouping batch=2 dil=2 s_h=2 (40ch) | 388 240 | 240 240 | **−38.1 %** |
+| oh-chunking standard 32×32×32 | 716 290 | 472 740 | **−34.0 %** |
+| DW 3×3 s2 16ch 27×29 | 77 580 | 64 560 | −16.8 % |
+| 1×1 32→16 on 40×64 | 1 209 940 | 1 033 230 | −14.6 % |
+| 1×1 8→8 on 121×75 | 1 839 430 | 1 842 160 | +0.1 % |
+| ow-tiling in_w=128 | 303 100 | 302 930 | −0.1 % |
+| every 1–4-channel stub | | | 0 … −2 % |
+
+New fixtures: `M-grouping 80ch in_h=17` 321 710 ns, `80ch 7×7 s2 stem
+24×24` 496 270 ns, `80ch batch=2 dil=2 s_h=2` 422 100 ns.  The cases whose
+geometry is written in terms of `kTileM` grew with it (`partial M tile
+out_ch=TILE_M+3` is now 19 channels, `14x14 multi-tile` 33, `DW
+ch=TILE_M*2` 32, …) and are +3 … +40 % for 2× the channels — not
+comparable, listed in the compare script's output for completeness.  The
+64-channel 3×3 cases are −41…−43 %: one group of four 16-wide tiles per
+pixel instead of two groups of four 8-wide ones, the same ~20-cycle
+per-group overhead paid once (the remaining gap to −50 % is that overhead,
+plan step 7).  Depthwise moved as much because its grid is `kTileM` lanes
+too.  Cycle model (`--arch 40`, fill sub-steps added): 7.2 % mean error
+over 46 cases, 5.6 % on the > 20 k-cycle cases; the 3×3 64-ch anchors are
+under-predicted 5–8 % (the per-group ramps once more), the 1×1 cases
+over-predicted 9–11 % as before.  Model-based ResNet-18: the sixteen 3×3
+layers 1475 k → 748 k cycles each, 220 → ~110 ms on the board if the
+sweep efficiency holds.
+
+---
+
 ### On board after §2.37–§2.39 (2026-09-26, bitstream WNS +1.06 ns, ConvKernel_0 x/y instances at 128)
 
 144/144 scheduler models PASS, including the partial-strobe run edges

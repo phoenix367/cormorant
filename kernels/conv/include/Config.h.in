@@ -27,10 +27,13 @@ using AccData_t = @CONV_ACC_DATA_TYPE@;
 // ---------------------------------------------------------------------------
 // Tile-size constants — compile-time parameters for the HLS kernel.
 //
-// kTileM   Output channel tile.  Must be a power of two so that
-//          ri & (kTileM-1) compiles to a bitwise AND for the II=1 lane
-//          rotation, and so that the dependency distance for acc[m1] equals
-//          kTileM ≥ MAC latency (~3 cycles for ap_fixed<16,8>).
+// kTileM   Output channel tile = the M (column) dimension of the MAC grid
+//          (kTileIC x kTileM products per cycle, §2.24; 16 x 16 = 256 since
+//          §2.40).  Power of two, a multiple of the 8-lane y port word, and
+//          <= kTileIC (the depthwise path reuses the kTileIC-lane patch).
+//          Sizes the weight-cache column count (kWCacheBramCols in BRAM +
+//          kWCacheUramCols in URAM), the accumulator word (kTileM x 32 bit)
+//          and the Phase-3 fill sub-steps (kTileM / 8 per word).
 //
 // kTileIC  Input channel tile.  Power of two; sets the w_buf and patch
 //          buffer depth in the IC dimension.
@@ -121,14 +124,16 @@ static constexpr unsigned kMaxAccPersistEntries = @CONV_MAX_ACC_PERSIST_ENTRIES@
 //   mt_per_group = min(kMaxMperGroup, m_tiles)
 //   num_m_groups = ceil(m_tiles / mt_per_group)
 //
-// Compile-time buffer size:
-//   w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]
-//   = kMaxMperGroup · 8 · 16 · 7 · 7 = 6272·kMaxMperGroup entries.
+// Compile-time buffer size (ConvMacGrid.h): kTileM RAM columns of
+//   kWCacheBanks · kMaxMperGroup · 64 WeightVec words (2 · 4 · 64 = 512 at
+//   the defaults) — the RAM count is set by the column count (one 256-bit
+//   word per column per cycle), so kMaxMperGroup only changes the depth,
+//   which is free up to 512 words per BRAM18 column set / 4096 per URAM.
 //
 // Trade-off: larger kMaxMperGroup → more layers run in a single group
-// (zero weight replay) but consumes more BRAM/LUT for w_cache.  When
-// m_tiles ≤ kMaxMperGroup the kernel single-groups; larger m_tiles
-// split into ceil(m_tiles / kMaxMperGroup) groups.
+// (zero weight replay, no §2.21 chunk cap).  When m_tiles ≤ kMaxMperGroup
+// the kernel single-groups; larger m_tiles split into
+// ceil(m_tiles / kMaxMperGroup) groups.
 // ---------------------------------------------------------------------------
 static constexpr unsigned kMaxMperGroup        = @CONV_MAX_M_PER_GROUP@;
 

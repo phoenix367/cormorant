@@ -3,7 +3,7 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **steps 1–4 in progress** (three parallel agents); 5–7 not started.
+Status: **steps 1–2 in progress**, step 4 implemented on `perf/convgrid` (§3), step 3 not started; 5–7 not started.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 
@@ -61,3 +61,13 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
 ## 3. Measured outcome
 
 (to be filled per step)
+
+- **Step 4 — implemented on `perf/convgrid` (CONV_OPTIMISATION.md §2.40),
+  RTL −41…−43 % on the 64-channel 3×3 fixtures, −38 % on the 7×7 s2
+  stem, −42 % on the depthwise cases, 46/46 RTL PASS; csynth BRAM18
+  165 → 127, DSP 262 → 409, LUT 68.4 k → 84.3 k, URAM 16 → 48 (w_cache
+  half in URAM).  Board numbers pending integration.**
+- **Step 3 — not started** (budget went to step 4's gates); the
+  cycle model already puts the 1×1 s2 downsamples at 179 k cycles
+  (1.2 ms) with the 16×16 grid, i.e. the flat-sweep fix is worth
+  another ~2× on top.

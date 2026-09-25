@@ -32,7 +32,7 @@ ROW_LOAD_LATENCY = 40    # first read data after a row's requests are issued
 DW_TILE_RAMP     = 10    # §2.37: one pipeline ramp per (mt, ow_tile) flat depthwise sweep
 DRAIN_SEG        = 256   # §2.38: Phase-3 transposer segment (pixels); one extra segment + ramps per chunk
 DRAIN_STEP_RAMP  = 6
-ARCH             = 39    # newest step modelled; overridden by --arch
+ARCH             = 40    # newest step modelled; overridden by --arch
 ROW_FILL_LATENCY = 12    # §2.39: per-row Phase-1 entry (the loader has the words parked in the FIFO)
 ROW_LOADER_SETUP = 64    # §2.39: per-row request loop + first-data DDR latency (~49) + merged-step ramp
 PIXEL_OVERHEAD   = 12    # standard path: per-(pixel, group) load / sweep / store loop ramps (was 6)
@@ -59,7 +59,10 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
             # transposer, the writer at 8 elements/beat underneath; the last segment's
             # drain and one ramp per step are exposed.
             L = rows * ow; nseg = -(-L // DRAIN_SEG)
-            ph3 += m_tiles * L + min(L, DRAIN_SEG) + DRAIN_STEP_RAMP * (m_tiles * nseg + 1)
+            # §2.40: a kTileM-lane tile word is scattered in ceil(m_valid / 8)
+            # sub-steps (8 channels per cycle), so a tile costs L * steps.
+            fill_steps = sum(-(-min(P["TILE_M"], out_ch - t * P["TILE_M"]) // E) for t in range(m_tiles))
+            ph3 += fill_steps * L + min(L, DRAIN_SEG) + DRAIN_STEP_RAMP * (m_tiles * nseg + 1)
         else:
             ph3 += rows * ow * out_ch                   # 1 element/cycle drain (+ writer at same rate)
         r0 = c * per * sh - pt

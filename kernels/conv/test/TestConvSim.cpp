@@ -584,7 +584,11 @@ static int run_sweep(int n, unsigned seed)
         p.is_depthwise = (U(0, 3) == 0);
         p.batch      = U(1, 3);
         p.in_ch      = U(1, 40);
-        p.out_ch     = p.is_depthwise ? p.in_ch : U(1, 72);
+        // Standard out_ch reaches two full M-groups plus a partial tile so
+        // num_m_groups > 1 (and the §2.21 residency cap) is sampled often
+        // whatever kTileM * kMaxMperGroup is (136 at the kv260 defaults).
+        p.out_ch     = p.is_depthwise ? p.in_ch
+                                      : U(1, 2 * kTileM * kMaxMperGroup + kTileM / 2);
         p.in_h       = U(1, 70);
         p.in_w       = U(1, 70);
         p.kh         = U(1, kMaxKH);
@@ -1033,12 +1037,11 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
-    // Test 28: M-grouping standard.  out_ch=64 → m_tiles=8.  With default
-    // kMaxMperGroup=4 this triggers num_m_groups=2: weights for tiles
-    // 0..3 are cached together, processed across the entire (oh, ow)
-    // sweep, then the cache is refilled for tiles 4..7.  out_h*out_w*out_ch
-    // = 16*16*64 = 16384 = kMaxAccPersistEntries, so num_chunks=1 (this
-    // test isolates the M-grouping behaviour from chunking).
+    // Test 28: 64-channel 3x3 (the ResNet-18 stage-1 shape).  At kTileM=8 this
+    // was m_tiles=8 → 2 M-groups; since §2.40 (kTileM=16) it is 4 tiles in a
+    // single group — the M-grouping coverage moved to tests 28f–28h below,
+    // whose geometry is derived from kTileM * kMaxMperGroup.  The label is
+    // kept so the RTL timing history of this case stays comparable.
     // -----------------------------------------------------------------------
     {
         ConvParams p{};
@@ -1054,7 +1057,8 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
-    // Test 28b: M-grouping with a chunk taller than the line buffer.
+    // Test 28b: (was) M-grouping with a chunk taller than the line buffer;
+    // single-group at kTileM=16 — see 28f for the live regression case.
     // Regression for the stale-row bug: the patch producer replays each
     // chunk's (oh, ow) sweep from line_buf once per M-group without
     // re-reading DDR, but line_buf only holds kMaxLineBufRows (16) rows.
@@ -1081,7 +1085,8 @@ int main(int argc, char** argv)
 
     // -----------------------------------------------------------------------
     // Test 28c: ResNet-style stem geometry — 7x7 stride 2 pad 3, 3→40 ch on
-    // a 32x32 input (out 16x16).  40 ch = 5 m-tiles → two M-groups; the
+    // a 32x32 input (out 16x16).  40 ch = 5 m-tiles → two M-groups at
+    // kTileM=8 (3 tiles, one group since §2.40; see 28g); the
     // stride-2 sweep covers 2 input rows per output row so the uncapped
     // chunk (16 rows) spans ~37 input rows.  The cap must shrink chunks to
     // (16 - 7) / 2 + 1 = 5 output rows.  Also exercises the multi-chunk
@@ -1104,8 +1109,9 @@ int main(int argc, char** argv)
     }
 
     // -----------------------------------------------------------------------
-    // Test 28d: M-grouping + dilation=2 + stride 2 — the cap's window term
-    // uses (kh-1)*dilation_h, so a dilated kernel must also survive replay.
+    // Test 28d: (was) M-grouping + dilation=2 + stride 2 — the cap's window
+    // term uses (kh-1)*dilation_h, so a dilated kernel must also survive
+    // replay (single-group at kTileM=16; see 28h).
     // -----------------------------------------------------------------------
     {
         ConvParams p{};
@@ -1118,6 +1124,69 @@ int main(int argc, char** argv)
         auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
         auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
         total_failures += run_test("M-grouping, batch=2 dil=2 s_h=2 (residency cap)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests 28f–28h (§2.40): the M-grouping / residency-cap coverage of
+    // 28–28d re-derived from the constants so it survives any kTileM or
+    // kMaxMperGroup change.  out_ch = kTileM * kMaxMperGroup + kTileM is one
+    // full group plus a single-tile second group (80 at the kv260 defaults):
+    // the w_cache prefetch crosses a partial last group and every chunk's
+    // sweep is replayed once per group from line_buf.
+    // -----------------------------------------------------------------------
+    const unsigned mg_out_ch = kTileM * kMaxMperGroup + kTileM;
+    {
+        // 28f: 3x3 pad 1 with in_h=17 > kMaxLineBufRows — the §2.21 stale-row
+        // regression at the current tile size (uncapped chunk would span
+        // rows -1..17; the cap shrinks it to 14 output rows).
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=17; p.in_w=17; p.out_ch=mg_out_ch;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "M-grouping %uch (%u+1 tiles), in_h=17 residency cap", mg_out_ch, kMaxMperGroup);
+        total_failures += run_test(label, p, x, w, b);
+    }
+    {
+        // 28g: 7x7 s2 pad 3 stem, 3 -> mg_out_ch on 24x24 (out 12x12): the
+        // stride-2 window cap ((16 - 7) / 2 + 1 = 5 output rows per chunk)
+        // across two groups, half-tile (3-lane) weights.
+        ConvParams p{};
+        p.batch=1; p.in_ch=3; p.in_h=24; p.in_w=24; p.out_ch=mg_out_ch;
+        p.kh=7; p.kw=7; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=3; p.pad_left=3; p.pad_bottom=3; p.pad_right=3;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "M-grouping %uch, 7x7 s2 stem 24x24", mg_out_ch);
+        total_failures += run_test(label, p, x, w, b);
+    }
+    {
+        // 28h: batch=2, dilation 2, stride_h 2 across two groups — the cap's
+        // (kh-1)*dilation_h window term with replay.
+        ConvParams p{};
+        p.batch=2; p.in_ch=8; p.in_h=24; p.in_w=16; p.out_ch=mg_out_ch;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=1;
+        p.dilation_h=2; p.dilation_w=2;
+        p.pad_top=2; p.pad_left=2; p.pad_bottom=2; p.pad_right=2;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        char label[96];
+        std::snprintf(label, sizeof(label),
+                      "M-grouping %uch, batch=2 dil=2 s_h=2 (residency cap)", mg_out_ch);
+        total_failures += run_test(label, p, x, w, b);
     }
 
     // -----------------------------------------------------------------------
