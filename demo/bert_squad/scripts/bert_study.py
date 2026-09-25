@@ -9,21 +9,28 @@ window:
             Q8.8 inputs, accumulate exactly, floor + saturate on output (AP_TRN,
             AP_SAT); host CPU regions (embeddings, LayerNorm, GELU, Softmax, mask
             prep) compute in float and round-to-nearest + saturate on output.
+  sched   — the partition the phase-1 inference scheduler generates (host
+            regions: fused LayerNorm / GELU, Softmax, Gather / OneHot / Cast;
+            the word-embedding table is Q8.8 in DDR; everything else on the
+            kernels).  bert_sched_check.py compares it bit for bit with the
+            scheduler's own simulation.
   variants selected with --policies (see POLS in main()).
 
 Assets (not in git): demo/bert_squad/assets/vocab.txt (bert-base-uncased) and
 dev-v1.1.json (SQuAD 1.1 dev).  Run with inference-scheduler/.venv/bin/python.
 Reports EM/F1 vs ground truth, agreement with float, per-tensor ranges.
 """
-import argparse, collections, json, re, string, sys, time, unicodedata
+import argparse, collections, json, math, re, string, sys, time, unicodedata
 import numpy as np
 import onnx
 from onnx import numpy_helper
 
 import os
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-HERE = os.path.join(REPO, "demo", "bert_squad", "assets")          # vocab.txt, dev-v1.1.json
-MODEL = os.path.join(REPO, "inference-scheduler", "bertsquad-12-simplified.onnx")
+HERE = os.environ.get("BERT_SQUAD_ASSETS",                          # vocab.txt, dev-v1.1.json
+                      os.path.join(REPO, "demo", "bert_squad", "assets"))
+MODEL = os.environ.get("BERT_SQUAD_MODEL",
+                       os.path.join(REPO, "inference-scheduler", "bertsquad-12-simplified.onnx"))
 SEQ = 256
 
 # ----------------------------------------------------------------- tokenizer
@@ -158,8 +165,32 @@ def q_rnd(x):   # host CPU write-back / weight encoding: round + saturate
     return np.clip(np.round(np.asarray(x, np.float64) * 256.0), LO, HI) / 256.0
 
 # ----------------------------------------------------------------- regions
+def region_of_sched(n):
+    """Partition of the phase-1 inference scheduler (policy "sched"), derived
+    independently from the ONNX graph: host CPU regions compute in float and
+    round half-to-even + saturate on write-back — the fused LayerNorm and
+    GELU subgraphs, Softmax, and the Gather / OneHot / Cast host ops; every
+    other arithmetic op (Gemm = MatMul + bias Add, MatMul incl. the
+    OneHot x token-type MatMul, embedding / residual / mask Adds, the mask
+    Sub / Mul incl. ones x mask, the 1/8 scale Mul) runs on the PL kernels
+    (floor + saturate); Reshape / Transpose / Split / Squeeze / Identity move
+    data without changing it."""
+    name, op = n.name, n.op_type
+    if "/LayerNorm/" in name:
+        return "cpu:ln:" + name.split("/LayerNorm/")[0]
+    if "/intermediate/dense/" in name and op != "Gemm":
+        return "cpu:gelu:" + name.split("/intermediate/dense/")[0]
+    if op in ("Softmax", "Gather", "OneHot", "Cast"):
+        return f"cpu:{op.lower()}:" + name
+    if op in ("Identity", "Split", "Squeeze", "Unsqueeze", "Reshape", "Transpose"):
+        return "move"
+    return "kernel"
+
+
 def region_of(n, pol):
     name, op = n.name, n.op_type
+    if pol.get("sched"):
+        return region_of_sched(n)
     if name.startswith("bert/embeddings/"):
         return "cpu:emb"
     if "/LayerNorm/" in name:
@@ -181,6 +212,10 @@ def region_of(n, pol):
     return "kernel"            # Gemm, MatMul, Add, Mul, Sub on the PL kernels
 
 # ----------------------------------------------------------------- interpreter
+_libm_tanh = np.vectorize(math.tanh, otypes=[np.float64])
+_libm_exp = np.vectorize(math.exp, otypes=[np.float64])
+
+
 class Bert:
     def __init__(self, path, pol=None, base=None):
         pol = pol or {}
@@ -208,6 +243,10 @@ class Bert:
         self.outputs = {o.name for o in self.g.output}
         # constants read by PL kernels are Data_t weights; host-CPU regions keep float parameters
         kernel_inputs = {i for n in self.nodes if self.region[id(n)] == "kernel" for i in n.input}
+        if pol.get("sched"):
+            # the scheduler keeps the word-embedding table in DDR as Data_t (Q8.8);
+            # the host Gather copies its rows
+            kernel_inputs |= {n.input[0] for n in self.nodes if n.op_type == "Gather"}
         mm_weights = {n.input[1] for n in self.nodes if n.op_type in ("Gemm", "MatMul") and n.input[1] in self.init}
         def qw(k, v):
             if v.dtype.kind != "f" or k not in kernel_inputs:
@@ -258,12 +297,16 @@ class Bert:
                 outs = [f(x, y)]
             elif op == "Sqrt": outs = [np.sqrt(ins[0])]
             elif op == "Reciprocal": outs = [1.0 / ins[0]]
-            elif op == "Tanh": outs = [np.tanh(ins[0])]
+            elif op == "Tanh":
+                # policy "sched": the host C calls libm's tanh (numpy's SIMD tanh
+                # differs by up to 3 ulp); Python's math module is that libm
+                outs = [_libm_tanh(ins[0]) if self.pol.get("sched") else np.tanh(ins[0])]
             elif op == "ReduceMean":
                 outs = [np.mean(ins[0], axis=tuple(a["axes"]), keepdims=bool(a.get("keepdims", 1)))]
             elif op == "Softmax":
                 x = ins[0]; ax = a.get("axis", 1)
-                xm = x - x.max(axis=ax, keepdims=True); e = np.exp(xm)
+                xm = x - x.max(axis=ax, keepdims=True)
+                e = _libm_exp(xm) if self.pol.get("sched") else np.exp(xm)
                 outs = [e / e.sum(axis=ax, keepdims=True)]
             elif op == "Reshape":
                 shp = [int(s) for s in ins[1]]
@@ -316,13 +359,20 @@ class Bert:
             return q_rnd(v * scale) / scale if scale != 1.0 else q_rnd(v)
         return q_trn(v)
 
-# ----------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=40)
-    ap.add_argument("--check-ort", action="store_true")
-    ap.add_argument("--policies", default="q88,fused,fused+w,fused+w+p7,fused+fw")
-    args = ap.parse_args()
+# ----------------------------------------------------------------- policies
+POLS = {
+    "q88":        {},
+    "fused":      {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1},
+    "fused+w":    {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "w_shift": 1},
+    "fused+w+p7": {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "w_shift": 1, "p_shift": 7},
+    "fused+fw":   {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "float_weights": 1},
+    "sched":      {"sched": 1},   # exactly the phase-1 scheduler partition (bert_sched_check.py)
+}
+
+# ----------------------------------------------------------------- examples
+def pick_examples(n):
+    """The study's example set: n single-window SQuAD dev questions drawn
+    (seed 0) from the first 4n that fit one 256-token window."""
     tok = Tokenizer(f"{HERE}/vocab.txt")
     data = json.load(open(f"{HERE}/dev-v1.1.json"))["data"]
     exs = []
@@ -332,10 +382,24 @@ def main():
                 f = build_feature(tok, qa["question"], para["context"])
                 if f is not None:
                     exs.append((qa, f))
-            if len(exs) >= 4 * args.n: break
-        if len(exs) >= 4 * args.n: break
+            if len(exs) >= 4 * n: break
+        if len(exs) >= 4 * n: break
     rng = np.random.default_rng(0)
-    pick = [exs[i] for i in sorted(rng.choice(len(exs), args.n, replace=False))]
+    return tok, [exs[i] for i in sorted(rng.choice(len(exs), n, replace=False))]
+
+
+def feeds_of(f):
+    return {"unique_ids_raw_output___9:0": np.array([0], np.int64), "segment_ids:0": f["seg"],
+            "input_mask:0": f["mask"], "input_ids:0": f["ids"]}
+
+# ----------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=40)
+    ap.add_argument("--check-ort", action="store_true")
+    ap.add_argument("--policies", default="q88,fused,fused+w,fused+w+p7,fused+fw")
+    args = ap.parse_args()
+    tok, pick = pick_examples(args.n)
     bert = Bert(MODEL)
     if args.check_ort:
         import onnxruntime as ort
@@ -347,13 +411,6 @@ def main():
         env = bert.run(feeds, "float")
         print("ORT vs numpy float max|diff| start %.2e end %.2e" % (
             np.abs(r[0] - env["unstack:0"]).max(), np.abs(r[1] - env["unstack:1"]).max()))
-    POLS = {
-        "q88":        {},
-        "fused":      {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1},
-        "fused+w":    {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "w_shift": 1},
-        "fused+w+p7": {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "w_shift": 1, "p_shift": 7},
-        "fused+fw":   {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "float_weights": 1},
-    }
     sel = args.policies.split(",")
     models = {k: Bert(MODEL, POLS[k], base=bert) for k in sel}
     tot = collections.Counter(); stats = {k: {} for k in sel}
