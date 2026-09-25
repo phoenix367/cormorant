@@ -56,7 +56,8 @@ inline T saturate_cast(From v) {
 //         m*conv_weight_per_m(in_ch,kh,kw) + ict*kh*kw*kTileIC
 //         + (khi*kw + kwi)*lanes(ict) + ic_l
 //     ic_tiles = ceil(in_ch / kTileIC); lanes ic_l >= in_ch - ict*kTileIC of
-//     the last tile are zero (the kernel masks them anyway).  One
+//     the last tile MUST be zero (§2.40: the MAC grid multiplies them
+//     unmasked against the producer's zero patch lanes).  One
 //     (m, ict) slab is kh*kw*lanes(ict) contiguous elements = one burst,
 //     and every slab starts on a port-word boundary.
 //   depthwise (is_depthwise=1):

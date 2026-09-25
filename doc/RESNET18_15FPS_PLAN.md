@@ -3,7 +3,7 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **steps 1–4 in progress** (three parallel agents); 5–7 not started.
+Status: **steps 1–2 in progress**, steps 4 and 3 implemented on `perf/convgrid` (§3; step 3 also delivers most of step 7); 5–6 not started.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 
@@ -90,3 +90,17 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   in 48.6 µs, ≈ 1.3 ms for the full 112²×64 layer by the cycle model (board
   figure pending integration).  HLS estimate BRAM 44 → 11, LUT +4.9 k.  The
   `PoolingKernel_0` instance needs `C_M_AXI_GMEM1_DATA_WIDTH = 128`.
+
+- **Step 4 — implemented on `perf/convgrid` (CONV_OPTIMISATION.md §2.40),
+  RTL −41…−43 % on the 64-channel 3×3 fixtures, −38 % on the 7×7 s2
+  stem, −42 % on the depthwise cases, 46/46 RTL PASS; csynth BRAM18
+  165 → 127, DSP 262 → 409, LUT 68.4 k → 84.3 k, URAM 16 → 48 (w_cache
+  half in URAM).  Board numbers pending integration.**
+- **Step 3 — implemented on `perf/convgrid` (CONV_OPTIMISATION.md §2.41),
+  as ONE flat II=1 sweep per (ict, ow_tile, M-group) for every kernel
+  size (a 1×1-only loop duplicated the DSP grid) plus skipped rows in the
+  x loader for stride > window: RTL −75 % on the 1×1 fixtures, a further
+  −28 … −54 % on the 3×3 fixtures (this is also step 7's lever), 48/48
+  RTL PASS; DSP 407, LUT 87.0 k, BRAM / URAM unchanged.  Model: each
+  1×1 s2 downsample 3.6 → 0.4–0.5 ms, `1x1-64to128-56x56` 14.6 → ~2 ms,
+  the 3×3 layers 220 → ~75 ms.  Board numbers pending integration.**

@@ -106,6 +106,16 @@ struct BiasVec {
 // WeightVec (the weight stream beat and the weight cache word) lives in
 // ConvMacGrid.h since §2.35.
 static constexpr unsigned kWordsPerWeightVec = kTileIC / kWeightPortElems;
+// Weight-port read requests kept in flight by stream_load_weights (== the
+// port's num_read_outstanding; one request per m1 slab, §2.40).
+static constexpr unsigned kWeightReqWindow   = 8;
+// weight_stream FIFO depth: 392 WeightVecs (256-bit) fill one 512-deep
+// BRAM18 column set exactly; scaling it with kTileM (§2.40: 16 * 49 = 784)
+// would double the FIFO's BRAM for no throughput gain — the producer is
+// port-bound at half a vector per cycle and the consumer prefetches the next
+// slab under the sweep (§2.35), so depth only sets how far ahead the
+// producer may run.
+static constexpr unsigned kWeightStreamDepth = 8 * kMaxKH * kMaxKW;
 
 #ifdef DEBUG_LOAD_DATA_CACHING
 #include <cassert>
@@ -386,7 +396,12 @@ static inline ConvGeometry compute_conv_geometry(
 static constexpr unsigned kDrainSeg      = 256;                       // pixels per Phase-3 segment
 static constexpr unsigned kDrainSegWords = kDrainSeg / kYPortElems;   // stream words per (channel, segment)
 static constexpr unsigned kWriteInFlight = 4;
+// §2.40: 8-channel sub-steps per kTileM-lane accumulator word in the
+// Phase-3 fill (2 at kTileM = 16).
+static constexpr unsigned kFillSteps     = kTileM / kYPortElems;
+static constexpr unsigned kFillStepBits  = (kFillSteps >= 4) ? 2 : 1;
 static_assert(kDrainSeg % kYPortElems == 0, "segment must be whole words");
+static_assert(kTileM % kYPortElems == 0 && kFillSteps <= 4, "fill sub-steps");
 
 static void write_output_tile(
     hls::burst_maxi<YWord>  y,
@@ -503,6 +518,9 @@ static void bias_producer(
     // lanes m_off..m_off+kTileM-1 in one cycle, so bank the buffer by the
     // lane index (m_off is a multiple of kTileM → lane m1 lives in bank m1).
     #pragma HLS ARRAY_PARTITION variable=bias_buf cyclic factor=kTileM dim=1
+    // kTileM banks of kMaxOutCh/kTileM entries: LUTRAM (§2.40 — as 16 BRAM18
+    // of 80 entries each it cost twice the 8-bank form's BRAM for 2.5 KB).
+    #pragma HLS BIND_STORAGE variable=bias_buf type=RAM_1P impl=LUTRAM
 
     if (has_bias) {
         // §2.32: the bias buffer in DDR is conv_bias_numel(out_ch) elements
@@ -566,9 +584,15 @@ static inline RowLoad row_load_descriptor(
 {
     #pragma HLS INLINE
     RowLoad r;
-    const int ih_window_max = (int)(oh * stride_h) - (int)pad_top
-                            + (int)((kh - 1) * dilation_h);
+    const int ih_window_min = (int)(oh * stride_h) - (int)pad_top;
+    const int ih_window_max = ih_window_min + (int)((kh - 1) * dilation_h);
+    // Rows above this window that are not resident yet are never needed by
+    // any later oh either (windows only move down), so skip them: with
+    // stride_h > (kh-1)*dilation_h + 1 (§2.41: a 1x1 s2 downsample) every
+    // other input row is neither loaded from DDR nor pushed through the
+    // column stream.
     r.load_start = last_loaded_row + 1;
+    if (r.load_start < ih_window_min) r.load_start = ih_window_min;
     if (r.load_start < 0) r.load_start = 0;
     r.load_end = ih_window_max;
     if (r.load_end >= (int)in_h) r.load_end = (int)in_h - 1;
@@ -1169,10 +1193,15 @@ static void stream_load_weights(
                         const unsigned m_valid =
                             std::min(kTileM, out_ch - m_off);
 
-                        // Request every m1's slab of this tile up front
-                        // (m_valid <= kTileM <= num_read_outstanding), then
-                        // drain them in the same order.
-                        for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                        // Request the first kWeightReqWindow m1 slabs of this
+                        // tile up front, then keep that many in flight: slab
+                        // m1 + kWeightReqWindow is requested as soon as slab
+                        // m1 has been drained (§2.40: m_valid <= kTileM = 16
+                        // exceeds the port's num_read_outstanding = 8, and a
+                        // request past that limit stalls the request loop
+                        // before any data is drained).
+                        const unsigned n_req0 = std::min(m_valid, kWeightReqWindow);
+                        for (unsigned m1 = 0; m1 < n_req0; m1++) {
                             #pragma HLS PIPELINE II=1
                             const unsigned word_off =
                                 (m_off + m1) * per_m_words + tile_word_off;
@@ -1210,6 +1239,12 @@ static void stream_load_weights(
                                     part++;
                                 }
                             }
+                            if (m1 + kWeightReqWindow < m_valid) {
+                                const unsigned word_off =
+                                    (m_off + m1 + kWeightReqWindow) * per_m_words
+                                    + tile_word_off;
+                                weight.read_request(word_off, slab_words);
+                            }
                         }
                     }
                 } // mg
@@ -1221,7 +1256,9 @@ static void stream_load_weights(
                 const unsigned m_off   = mt * kTileM;
                 const unsigned m_valid = std::min(kTileM, out_ch - m_off);
 
-                for (unsigned m1 = 0; m1 < m_valid; m1++) {
+                // Same kWeightReqWindow sliding window as the standard path.
+                const unsigned n_req0_dw = std::min(m_valid, kWeightReqWindow);
+                for (unsigned m1 = 0; m1 < n_req0_dw; m1++) {
                     #pragma HLS PIPELINE II=1
                     weight.read_request((m_off + m1) * dw_words, dw_words);
                 }
@@ -1248,6 +1285,9 @@ static void stream_load_weights(
                             weight_stream.write(v);
                         }
                     }
+                    // Slab m1 drained: keep kWeightReqWindow requests in flight.
+                    if (m1 + kWeightReqWindow < m_valid)
+                        weight.read_request((m_off + m1 + kWeightReqWindow) * dw_words, dw_words);
                 }
             } // mt
         } // depthwise
@@ -1345,10 +1385,23 @@ static void process_conv_kernel_tile(
     // conditional store per iteration — the 5-D form with a runtime m1 index
     // into the partitioned dimension made HLS emit two stores per RAM and
     // split the bank dimension into a second RAM set (II=2, 2x BRAM).
-    WeightVec w_cache[kTileM][kWCacheWords];
-    #pragma HLS ARRAY_PARTITION variable=w_cache complete dim=1
-    #pragma HLS AGGREGATE       variable=w_cache compact=bit
-    #pragma HLS BIND_STORAGE    variable=w_cache type=RAM_2P impl=BRAM
+    // §2.40 (kTileM = 16): the sweep reads kTileM x 256 bits per cycle and
+    // a BRAM36 / URAM port is 72 bits wide, so the column count sets the
+    // RAM count regardless of depth (4 BRAM36 or 4 URAM per column).  The
+    // cache is split into two identically-shaped arrays: columns
+    // [0, kWCacheBramCols) in BRAM (the same 64 BRAM18 the 8-column cache
+    // used) and columns [kWCacheBramCols, kTileM) in URAM (32 blocks of the
+    // otherwise idle pool; all 16 columns in URAM would be the whole pool).
+    // Both are read at the same word address every sweep cycle and written
+    // by the column-selecting w_cache_store (ConvMacGrid.h).
+    WeightVec w_lo[kWCacheBramCols][kWCacheWords];
+    WeightVec w_hi[kWCacheUramCols][kWCacheWords];
+    #pragma HLS ARRAY_PARTITION variable=w_lo complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=w_hi complete dim=1
+    #pragma HLS AGGREGATE       variable=w_lo compact=bit
+    #pragma HLS AGGREGATE       variable=w_hi compact=bit
+    #pragma HLS BIND_STORAGE    variable=w_lo type=RAM_2P impl=BRAM
+    #pragma HLS BIND_STORAGE    variable=w_hi type=RAM_2P impl=URAM
     // 1-bit bank select and narrow prefetch cursors: with plain `unsigned`
     // indices HLS could not bound them and lowered the prefetch stores as
     // masked PARTIAL writes (read-modify-write on the word).
@@ -1451,10 +1504,7 @@ static void process_conv_kernel_tile(
                                     #pragma HLS PIPELINE II=1
                                     const WeightVec wv = weight_stream.read();
                                     const unsigned  wa = w_cache_addr(wbank, t, khi, kwi);
-                                    for (unsigned c = 0; c < kTileM; c++) {
-                                        #pragma HLS UNROLL
-                                        if (c == m1) w_cache[c][wa] = wv;
-                                    }
+                                    w_cache_store(w_lo, w_hi, m1, wa, wv);
                                 }
                             }
                         }
@@ -1480,115 +1530,146 @@ static void process_conv_kernel_tile(
                 if (last_slab) f_total = 0;
                 // Prefetch write cursor: (tile, m1, khi, kwi) in emission order.
                 unsigned   f_pos = 0;
-                ap_uint<3> f_t = 0;                 // < kMaxMperGroup
-                ap_uint<4> f_m1 = 0, f_khi = 0, f_kwi = 0;   // < kTileM / kMaxKH / kMaxKW
+                ap_uint<3> f_t = 0;                 // <= kMaxMperGroup
+                ap_uint<5> f_m1 = 0;                // <= kTileM (the compare against
+                                                    // f_mv == kTileM needs the extra bit)
+                ap_uint<4> f_khi = 0, f_kwi = 0;    // < kMaxKH / kMaxKW
                 unsigned f_mv = std::min(kTileM, out_ch - mt_base_next * kTileM);
                 const ap_uint<1> nbank = wbank ^ 1;   // bank being prefetched
 
-                // ---- Spatial sweep (§2.29): per (oh, ow_in_tile) ONE fused
-                //      II=1 loop over (tile-in-group, khi, kwi) ----
-                // Tile 0 consumes each PatchVec beat straight from the
-                // stream and parks it in `patch`; tiles 1..G-1 replay it
-                // from `patch`.  All G tiles' accumulators live in registers
-                // for the whole pixel.  Each iteration also advances the
-                // §2.35 prefetch of the next slab into the other bank.
-                for (unsigned oh_local = 0; oh_local < chunk_oh_count;
-                     oh_local++) {
-                    for (unsigned ow = ow_start; ow < ow_end; ow++) {
-                        Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                        #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-                        #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
+                // ---- §2.41 flat spatial sweep: per (ict, ow_tile, mg) ONE
+                //      II=1 loop over (oh_local, ow_in_tile, g, khi, kwi) ----
+                // The §2.29 form re-entered three loops per pixel (a G-word
+                // accumulator load, the fused (g, khi, kwi) sweep, a G-word
+                // store: ~2G + 12 cycles of ramps around G*kh*kw useful
+                // ones — 64 % utilisation on a 3x3, 17 % on a 1x1).  Here
+                // the pixel loop is folded in with running counters, as the
+                // depthwise sweep does (§2.37): a tile's accumulator word is
+                // read from partial_outputs at its first kernel position
+                // (`first ? word : acc`, in front of the distance-1
+                // `acc += tree` recurrence) and stored write-only at its
+                // last, so the pipeline ramps once per sweep.  Tile 0 of a
+                // pixel takes each PatchVec beat from the stream and parks
+                // it in `patch`; tiles 1..G-1 replay it from there (the same
+                // LUTRAM RAW at distance kh*kw the §2.29 loop had).  Every
+                // (pixel, tile) word is loaded and stored exactly once per
+                // sweep, so the URAM load and store never alias across
+                // iterations.  Each iteration also advances the §2.35
+                // prefetch of the next slab into the other bank.
+                const unsigned tw        = ow_end - ow_start;
+                const unsigned n_pos     = kh * kw;
+                const unsigned n_iter    = chunk_oh_count * tw * mt_in_group_count * n_pos;
+                const unsigned row_words = out_w * m_tiles;
+                unsigned word_row = ow_start * m_tiles + mt_base;     // (pixel, tile 0) word of the row
+                unsigned word     = word_row;
+                unsigned g = 0, khi = 0, kwi = 0, pos = 0, ow_l = 0;
 
-                        AccData_t acc[kMaxMperGroup][kTileM];
-                        #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                Data_t patch[kTileIC][kMaxKH][kMaxKW];
+                #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
+                #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
 
-                        const unsigned pix_word = (oh_local * out_w + ow) * m_tiles;
+                AccData_t acc[kMaxMperGroup][kTileM];
+                #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
 
-                        // Load every tile's padded accumulator word (§2.23).
-                        for (unsigned g = 0; g < mt_in_group_count; g++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned word = pix_word + mt_base + g;
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                #pragma HLS UNROLL
-                                acc[g][m1] = partial_outputs[word * kTileM + m1];
+                for (unsigned it = 0; it < n_iter; it++) {
+                    #pragma HLS PIPELINE II=1
+                    // The sweep reads bank wbank and the prefetch writes
+                    // bank !wbank (UG1399 "pragma HLS dependence").
+                    #pragma HLS DEPENDENCE variable=w_lo type=inter dependent=false
+                    #pragma HLS DEPENDENCE variable=w_hi type=inter dependent=false
+                    // One load (first position) and one store (last
+                    // position) per (pixel, tile) word, never the same word
+                    // in two different iterations of one sweep.
+                    #pragma HLS DEPENDENCE variable=partial_outputs type=inter dependent=false
+                    const bool first = (pos == 0);
+                    const bool last  = (pos + 1 == n_pos);
+
+                    Data_t p[kTileIC];
+                    #pragma HLS ARRAY_PARTITION variable=p complete dim=0
+                    if (g == 0) {
+                        const PatchVec v = patch_stream.read();
+                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                            #pragma HLS UNROLL
+                            p[ic_l]               = v.lane[ic_l];
+                            patch[ic_l][khi][kwi] = v.lane[ic_l];
+                        }
+                    } else {
+                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                            #pragma HLS UNROLL
+                            p[ic_l] = patch[ic_l][khi][kwi];
+                        }
+                    }
+
+                    // Seed from the URAM word at the window's first position
+                    // (read unconditionally — one port, address = word).
+                    AccData_t a[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=a complete dim=0
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        const AccData_t w_in = partial_outputs[word * kTileM + m1];
+                        a[m1] = first ? w_in : acc[g][m1];
+                    }
+                    const unsigned m_valid_g =
+                        std::min(kTileM, out_ch - (mt_base + g) * kTileM);
+                    mac_grid_step(p, w_lo, w_hi, w_cache_addr(wbank, g, khi, kwi),
+                                  a, ic_valid, m_valid_g);
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        acc[g][m1] = a[m1];
+                    }
+                    if (last) {
+                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            #pragma HLS UNROLL
+                            partial_outputs[word * kTileM + m1] = a[m1];
+                        }
+                    }
+
+                    // §2.35 prefetch: one WeightVec of the NEXT slab
+                    // into the other bank, if one is available.
+                    if (f_pos < f_total) {
+                        WeightVec wv;
+                        if (weight_stream.read_nb(wv)) {
+                            const unsigned wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
+                            w_cache_store(w_lo, w_hi, f_m1, wa, wv);
+                            f_pos++;
+                            if (++f_kwi == kw) {
+                                f_kwi = 0;
+                                if (++f_khi == kh) {
+                                    f_khi = 0;
+                                    if (++f_m1 == f_mv) {
+                                        f_m1 = 0;
+                                        f_t++;
+                                        f_mv = std::min(kTileM,
+                                            out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
+                                    }
+                                }
                             }
                         }
+                    }
 
-                        // Fused (g, khi, kwi) sweep + prefetch.
-                        const unsigned n_steps = mt_in_group_count * kh * kw;
-                        unsigned g = 0, khi = 0, kwi = 0;
-                        for (unsigned ri = 0; ri < n_steps; ri++) {
-                            #pragma HLS PIPELINE II=1
-                            // The sweep reads bank wbank and the prefetch writes
-                            // bank !wbank, so an iteration never reads what a
-                            // previous iteration wrote — without this HLS assumes
-                            // a RAW hazard through w_cache and schedules II=2
-                            // (UG1399 "pragma HLS dependence", inter /
-                            // dependent=false).
-                            #pragma HLS DEPENDENCE variable=w_cache type=inter dependent=false
-                            Data_t p[kTileIC];
-                            #pragma HLS ARRAY_PARTITION variable=p complete dim=0
-                            if (g == 0) {
-                                const PatchVec v = patch_stream.read();
-                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                    #pragma HLS UNROLL
-                                    p[ic_l]              = v.lane[ic_l];
-                                    patch[ic_l][khi][kwi] = v.lane[ic_l];
-                                }
+                    // Counters: (kwi, khi) over the window, then the tile,
+                    // then the pixel (the word cursor carries no multiply).
+                    if (last) {
+                        pos = 0; kwi = 0; khi = 0;
+                        if (++g == mt_in_group_count) {
+                            g = 0;
+                            if (++ow_l == tw) {
+                                ow_l      = 0;
+                                word_row += row_words;
+                                word      = word_row;
                             } else {
-                                for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-                                    #pragma HLS UNROLL
-                                    p[ic_l] = patch[ic_l][khi][kwi];
-                                }
+                                // word is at tile G-1 of this pixel; the next
+                                // pixel's tile 0 is m_tiles further from tile 0.
+                                word += m_tiles - (mt_in_group_count - 1);
                             }
-                            const unsigned m_valid_g =
-                                std::min(kTileM, out_ch - (mt_base + g) * kTileM);
-                            mac_grid_step(p, w_cache, w_cache_addr(wbank, g, khi, kwi),
-                                          acc[g], ic_valid, m_valid_g);
-
-                            // §2.35 prefetch: one WeightVec of the NEXT slab
-                            // into the other bank, if one is available.
-                            if (f_pos < f_total) {
-                                WeightVec wv;
-                                if (weight_stream.read_nb(wv)) {
-                                    const unsigned wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
-                                    for (unsigned c = 0; c < kTileM; c++) {
-                                        #pragma HLS UNROLL
-                                        if (c == f_m1) w_cache[c][wa] = wv;
-                                    }
-                                    f_pos++;
-                                    if (++f_kwi == kw) {
-                                        f_kwi = 0;
-                                        if (++f_khi == kh) {
-                                            f_khi = 0;
-                                            if (++f_m1 == f_mv) {
-                                                f_m1 = 0;
-                                                f_t++;
-                                                f_mv = std::min(kTileM,
-                                                    out_ch - (mt_base_next + (unsigned)f_t) * kTileM);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (++kwi == kw) {
-                                kwi = 0;
-                                if (++khi == kh) {
-                                    khi = 0;
-                                    g++;
-                                }
-                            }
+                        } else {
+                            word++;
                         }
-
-                        // Store every tile's word back.
-                        for (unsigned g2 = 0; g2 < mt_in_group_count; g2++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned word = pix_word + mt_base + g2;
-                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                                #pragma HLS UNROLL
-                                partial_outputs[word * kTileM + m1] = acc[g2][m1];
-                            }
+                    } else {
+                        pos++;
+                        if (++kwi == kw) {
+                            kwi = 0;
+                            khi++;
                         }
                     }
                 }
@@ -1597,13 +1678,11 @@ static void process_conv_kernel_tile(
                 // absorb (short sweeps, slow producer) is read blocking here.
                 for (; f_pos < f_total; f_pos++) {
                     #pragma HLS PIPELINE II=1
-                    #pragma HLS DEPENDENCE variable=w_cache type=inter dependent=false
+                    #pragma HLS DEPENDENCE variable=w_lo type=inter dependent=false
+                    #pragma HLS DEPENDENCE variable=w_hi type=inter dependent=false
                     const WeightVec wv = weight_stream.read();
                     const unsigned  wa = w_cache_addr(nbank, f_t, f_khi, f_kwi);
-                    for (unsigned c = 0; c < kTileM; c++) {
-                        #pragma HLS UNROLL
-                        if (c == f_m1) w_cache[c][wa] = wv;
-                    }
+                    w_cache_store(w_lo, w_hi, f_m1, wa, wv);
                     if (++f_kwi == kw) {
                         f_kwi = 0;
                         if (++f_khi == kh) {
@@ -1749,20 +1828,27 @@ static void process_conv_kernel_tile(
         // (channel, segment) and can burst (§2.22).
         //
         // partial_outputs words are [pixel][mt][kTileM lanes] (one pixel,
-        // 8 channels) but the stream wants [8 pixels of one channel].  The
-        // transpose runs in segments of kDrainSeg pixels through two
+        // kTileM channels) but the stream wants [8 pixels of one channel].
+        // The transpose runs in segments of kDrainSeg pixels through two
         // LUTRAM ping-pong buffers of kYPortElems banks: while segment n
-        // (one tile's kDrainSeg pixels) is read from the URAM one word per
-        // cycle and scattered into buffer n&1, segment n-1 is gathered from
-        // buffer (n-1)&1 one output word per cycle.  Bank rotation makes
-        // both sides conflict-free: pixel p of channel m1 lives in bank
-        // (m1 + p) % 8 at address m1*kDrainSegWords + p/8, so a pixel's 8
-        // channels land in 8 distinct banks and a channel's 8 consecutive
+        // (one tile's kDrainSeg pixels) is read from the URAM and scattered
+        // into buffer n&1, segment n-1 is gathered from buffer (n-1)&1 one
+        // output word per cycle.  Bank rotation makes both sides
+        // conflict-free: pixel p of channel m1 lives in bank (m1 + p) % 8
+        // at address m1*kDrainSegWords + p/8, so the 8 channels written in
+        // one cycle land in 8 distinct banks and a channel's 8 consecutive
         // pixels are read from 8 distinct banks at ONE shared address.
-        // Steady state: 8 outputs per cycle instead of one.
+        // §2.40 (kTileM = 16): a tile word carries kFillSteps = kTileM / 8
+        // groups of 8 channels, scattered in kFillSteps consecutive fill
+        // cycles (channels 8h..8h+7 in sub-step h; the bank rotation is
+        // unchanged since 8h ≡ 0 mod 8).  The fill therefore takes
+        // kFillSteps cycles per (pixel, tile) — exactly the drain's
+        // kTileM/8 words per pixel, so the two sides stay balanced at 8
+        // outputs per cycle with the same 8-bank buffers, now kTileM *
+        // kDrainSegWords entries deep.
         {
-        Data_t tA[kYPortElems][kDrainSeg];
-        Data_t tB[kYPortElems][kDrainSeg];
+        Data_t tA[kYPortElems][kTileM * kDrainSegWords];
+        Data_t tB[kYPortElems][kTileM * kDrainSegWords];
         #pragma HLS ARRAY_PARTITION variable=tA complete dim=1
         #pragma HLS ARRAY_PARTITION variable=tB complete dim=1
         #pragma HLS BIND_STORAGE variable=tA type=RAM_S2P impl=LUTRAM
@@ -1791,7 +1877,17 @@ static void process_conv_kernel_tile(
             const unsigned drain_cnt = (n == 0) ? 0u : d_valid * d_wpc;
             unsigned       d_m1 = 0, d_j = 0;
 
-            const unsigned trip = (fill_len > drain_cnt) ? fill_len : drain_cnt;
+            // Sub-steps actually needed by this tile: a tile with <= 8 valid
+            // channels (every out_ch <= 8 layer, the last tile of out_ch % 16
+            // <= 8 layers) is scattered in ONE cycle — its upper 8 lanes are
+            // padding and are never drained.
+            const unsigned f_steps  = (f_valid + kYPortElems - 1) / kYPortElems;   // 1..kFillSteps
+            const unsigned fill_cnt = fill_len * f_steps;                        // fill cycles
+            const unsigned trip = (fill_cnt > drain_cnt) ? fill_cnt : drain_cnt;
+            // Fill cursor: pixel index within the segment and the 8-channel
+            // sub-step of the current tile word.
+            unsigned   f_pix = 0;
+            ap_uint<kFillStepBits + 1> f_h = 0;
             for (unsigned i = 0; i < trip; i++) {
                 #pragma HLS PIPELINE II=1
                 // Within one execution of this loop a buffer is either only
@@ -1800,24 +1896,40 @@ static void process_conv_kernel_tile(
                 #pragma HLS DEPENDENCE variable=tA type=inter dependent=false
                 #pragma HLS DEPENDENCE variable=tB type=inter dependent=false
 
-                // ---- fill: pixel i of segment n → 8 rotated banks ----
-                if (i < fill_len) {
-                    Data_t sat[kTileM];
+                // ---- fill: channels 8h..8h+7 of pixel f_pix of segment n
+                //      → 8 rotated banks ----
+                if (i < fill_cnt) {
+                    Data_t sat[kYPortElems];
                     #pragma HLS ARRAY_PARTITION variable=sat complete dim=0
-                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    for (unsigned j = 0; j < kYPortElems; j++) {
                         #pragma HLS UNROLL
-                        sat[m1] = saturate_cast<Data_t>(partial_outputs[f_word * kTileM + m1]);
+                        // Lane 8h + j of the tile word (h runtime, j constant):
+                        // select among the kFillSteps candidates per lane.
+                        AccData_t lane_v = 0;
+                        for (unsigned h = 0; h < kFillSteps; h++) {
+                            #pragma HLS UNROLL
+                            if (h == (unsigned)f_h)
+                                lane_v = partial_outputs[f_word * kTileM + h * kYPortElems + j];
+                        }
+                        sat[j] = saturate_cast<Data_t>(lane_v);
                     }
-                    const ap_uint<3> rot  = i & (kYPortElems - 1);
-                    const unsigned   wrow = i >> 3;
+                    const ap_uint<3> rot  = f_pix & (kYPortElems - 1);
+                    const unsigned   wrow = ((unsigned)f_h * kYPortElems) * kDrainSegWords
+                                          + (f_pix >> 3);              // m1*kDrainSegWords + p/8, m1 = 8h + j
                     for (unsigned b = 0; b < kYPortElems; b++) {
                         #pragma HLS UNROLL
-                        const ap_uint<3> m1  = (ap_uint<3>)(b - rot);            // lane in bank b
-                        const unsigned   adr = (unsigned)m1 * kDrainSegWords + wrow;
-                        const Data_t     v   = sat[m1];
+                        const ap_uint<3> j   = (ap_uint<3>)(b - rot);            // lane (within the 8) in bank b
+                        const unsigned   adr = (unsigned)j * kDrainSegWords + wrow;
+                        const Data_t     v   = sat[j];
                         if (pp == 0) tA[b][adr] = v; else tB[b][adr] = v;
                     }
-                    f_word += m_tiles;
+                    if ((unsigned)f_h + 1 == f_steps) {
+                        f_h = 0;
+                        f_pix++;
+                        f_word += m_tiles;
+                    } else {
+                        f_h++;
+                    }
                 }
 
                 // ---- drain: word d_j of channel d_m1 of segment n-1 ----
@@ -1925,8 +2037,9 @@ void ConvKernel(
     // weight / bias are 128-bit ports (§2.32).  Their adapter buffers scale
     // with burst_length × outstanding × 16 B, so they are sized to what the
     // producers actually issue: a weight slab request is <= 2*kMaxKH*kMaxKW
-    // = 98 beats with at most kTileM = 8 in flight; the bias is one request
-    // of <= kMaxOutCh/8 = 160 beats.
+    // = 98 beats with at most kWeightReqWindow = 8 in flight (the producer
+    // keeps a sliding window of that many m1 slabs, §2.40); the bias is one
+    // request of <= kMaxOutCh/8 = 160 beats.
     #pragma HLS INTERFACE m_axi port=weight  offset=slave bundle=gmem1 depth=CONV_COSIM_DEPTH_WEIGHT_WORDS max_read_burst_length=128 num_read_outstanding=8
     #pragma HLS INTERFACE m_axi port=bias    offset=slave bundle=gmem2 depth=CONV_COSIM_DEPTH_BIAS_WORDS   max_read_burst_length=256 num_read_outstanding=2
     // y is a 128-bit port (§2.38): one write_request per (channel, segment)
@@ -2023,6 +2136,9 @@ void ConvKernel(
     // accumulators) per beat (§2.25); depth covers one pixel's m-tiles.
     hls_thread_local hls::stream<BiasVec> bias_stream;
     #pragma HLS STREAM variable=bias_stream depth=kTileM
+    // §2.40: 16 x 512-bit beats — as a "memory" FIFO HLS spent 29 BRAM18 on
+    // it (15 at 8 x 256); SRLs hold it for a few hundred LUT.
+    #pragma HLS BIND_STORAGE variable=bias_stream type=fifo impl=srl
 
     // patch_stream carries the producer's channel-packed PatchVec
     // emissions straight to the consumer (no intermediate stage since
@@ -2031,6 +2147,8 @@ void ConvKernel(
     // drains it as the assembler fills it under DATAFLOW.
     hls_thread_local hls::stream<PatchVec> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
+    // §2.40: 49 x 256-bit beats cost 15 BRAM18 as a "memory" FIFO; LUTRAM.
+    #pragma HLS BIND_STORAGE variable=patch_stream type=fifo impl=lutram
 
     // acc_stream carries already-saturated Data_t lanes — process_conv_kernel_tile
     // applies saturate_cast in its Phase-3 drain, so this inter-stage FIFO
@@ -2061,7 +2179,7 @@ void ConvKernel(
     // §2.32: WeightVec beats (kTileIC lanes each); depth = one full m-tile's
     // worth of vectors — the same bytes the former element stream held.
     hls_thread_local hls::stream<WeightVec> weight_stream;
-    #pragma HLS STREAM variable=weight_stream depth=kTileM*kMaxKH*kMaxKW
+    #pragma HLS STREAM variable=weight_stream depth=kWeightStreamDepth
 
     // col_stream carries one input column of all kTileIC channels per
     // beat from x_row_loader to the producer's Phase 1 (§2.39).  Depth =

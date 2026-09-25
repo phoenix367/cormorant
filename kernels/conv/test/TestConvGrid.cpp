@@ -27,17 +27,27 @@ static Data_t rnd(float scale)
 static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m_valid)
 {
     Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-    WeightVec w_buf[kTileM][kWCacheWords];        // one 16-lane word per (m, khi, kwi)
+    // One 16-lane word per (m, khi, kwi); the cache is two column arrays
+    // (BRAM / URAM halves, §2.40) with identical addressing.
+    WeightVec w_lo[kWCacheBramCols][kWCacheWords];
+    WeightVec w_hi[kWCacheUramCols][kWCacheWords];
+    auto wcol = [&](unsigned m, unsigned a) -> WeightVec& {
+        return (m < kWCacheBramCols) ? w_lo[m][a] : w_hi[m - kWCacheBramCols][a];
+    };
     AccData_t acc[kTileM], ref[kTileM];
 
     for (unsigned c = 0; c < kTileIC; c++)
         for (unsigned i = 0; i < kMaxKH; i++)
             for (unsigned j = 0; j < kMaxKW; j++) {
-                // Lanes >= ic_valid carry the producer's zero pad in the real
-                // kernel; here give them garbage so the ic_valid guard is tested.
+                // Lanes >= ic_valid: the producer zero-pads the PATCH lanes
+                // and the packed layout / weight producer zero the WEIGHT
+                // lanes (§2.40: the grid multiplies them unmasked).  Give the
+                // patch garbage and the weight the contract's zero so the
+                // product is 0 exactly as in the kernel.
                 patch[c][i][j] = (c < ic_valid) ? rnd(2.0f) : rnd(50.0f);
                 for (unsigned m = 0; m < kTileM; m++)
-                    w_buf[m][w_cache_addr(0, 0, i, j)].lane[c] = rnd(1.0f);
+                    wcol(m, w_cache_addr(0, 0, i, j)).lane[c] =
+                        (c < ic_valid) ? rnd(1.0f) : Data_t(0);
             }
     for (unsigned m = 0; m < kTileM; m++) {
         acc[m] = AccData_t(rnd(8.0f));
@@ -50,9 +60,9 @@ static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m
         for (unsigned c = 0; c < ic_valid; c++)
             for (unsigned i = 0; i < kh; i++)
                 for (unsigned j = 0; j < kw; j++)
-                    ref[m] += patch[c][i][j] * w_buf[m][w_cache_addr(0, 0, i, j)].lane[c];
+                    ref[m] += patch[c][i][j] * wcol(m, w_cache_addr(0, 0, i, j)).lane[c];
 
-    accumulate_standard(patch, w_buf, acc, ic_valid, m_valid, kh, kw);
+    accumulate_standard(patch, w_lo, w_hi, acc, ic_valid, m_valid, kh, kw);
 
     int bad = 0;
     for (unsigned m = 0; m < kTileM; m++)

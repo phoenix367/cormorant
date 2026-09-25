@@ -155,7 +155,7 @@ residual-lane padding for any `out_w`).
   "clock": 150,
   "kernels": {
     "conv": {
-      "tile_m":                  8,  "tile_ic":               16,
+      "tile_m":                  16, "tile_ic":               16,
       "max_kh":                  7,  "max_kw":                 7,
       "max_in_ch":            1024,  "max_out_ch":          1280,
       "max_line_buf_cols":      64,  "max_line_buf_rows":     16,

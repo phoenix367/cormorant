@@ -66,7 +66,7 @@ written.
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `AccData_t` | `ap_fixed<32,16>` | Accumulator type (wider range, avoids overflow) |
-| `kTileM` | 8 | Output-channel tile width; must be a power of 2; also the depthwise PM unroll factor |
+| `kTileM` | 16 | Output-channel tile width = the M dimension of the MAC grid (16 × 16 = 256 MACs/cycle since §2.40; 8 before); power of 2, multiple of the 8-lane `y` word, ≤ `kTileIC`; also the depthwise PM unroll factor |
 | `kTileIC` | 16 | Input-channel tile width; must be a power of 2; also the standard PN unroll factor |
 | `kMaxKH` | 7 | Maximum compile-time kernel height |
 | `kMaxKW` | 7 | Maximum compile-time kernel width |
@@ -123,12 +123,13 @@ flowchart TB
     end
 
     subgraph URAML["URAM layer — 64 blocks · 2.25 MB · 25% used"]
-        PO["partial_outputs<br/>65536 entries · 256 KB · 16 URAM blocks<br/><i>persistent accumulator — survives every<br/>ic-tile / mt-tile of one oh-chunk</i>"]
+        PO["partial_outputs<br/>65536 entries · 256 KB · 8 URAM blocks<br/><i>persistent accumulator — survives every<br/>ic-tile / mt-tile of one oh-chunk</i>"]
+        WH["w_hi<br/>kTileM/2 columns · 512 WeightVec words · 32 URAM blocks<br/><i>the other half of the weight cache (§2.40):<br/>same addressing and ping-pong as w_lo</i>"]
     end
 
     subgraph BRAML["BRAM layer — 288 BRAM18K · 32% used"]
         LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile</i>"]
-        WC["w_cache<br/>kTileM columns · 2·4·64 WeightVec words · 64 BRAM18<br/><i>two banks: the current ict/ow_tile/M-group slab,<br/>reused across the sweep, and the next one prefetched (§2.35)</i>"]
+        WC["w_lo<br/>kTileM/2 columns · 2·4·64 WeightVec words · 64 BRAM18<br/><i>two banks: the current ict/ow_tile/M-group slab,<br/>reused across the sweep, and the next one prefetched (§2.35)</i>"]
         WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
         BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
     end
@@ -140,6 +141,8 @@ flowchart TB
 
     Xd -->|burst read| LB
     Wd -->|burst read| WC
+    Wd -->|burst read| WH
+    WH -->|PN-wide weights| AC
     Wd -->|burst read| WB
     Bd -->|loaded once| BB
     LB -->|PatchVec gather| PA
@@ -155,7 +158,7 @@ flowchart TB
     classDef bram fill:#e6f7ff,stroke:#1890ff,color:#003a8c
     classDef reg fill:#f6ffed,stroke:#52c41a,color:#135200
     class Xd,Wd,Bd,Yd ddr
-    class PO uram
+    class PO,WH uram
     class LB,WC,WB,BB bram
     class PA,AC reg
 ```
@@ -185,20 +188,26 @@ Data_t    patch[kTileIC][kMaxKH][kMaxKW];
 // Depthwise: patch[m1][khi][kwi]  for current (oh, ow, m_tile);
 // the [kTileIC] depth covers kTileM lanes (kTileM ≤ kTileIC).
 
-// STANDARD-path weight cache: two (ict, M-group) slabs (ping-pong, §2.35).
-WeightVec w_cache[kTileM][kWCacheWords];      // WeightVec = kTileIC lanes (256 bit)
-#pragma HLS ARRAY_PARTITION variable=w_cache complete dim=1
-#pragma HLS AGGREGATE       variable=w_cache compact=bit
-#pragma HLS BIND_STORAGE    variable=w_cache type=RAM_2P impl=BRAM
+// STANDARD-path weight cache: two (ict, M-group) slabs (ping-pong, §2.35),
+// split into a BRAM half and a URAM half of identical shape (§2.40).
+WeightVec w_lo[kWCacheBramCols][kWCacheWords];   // columns [0, 8)  — 64 BRAM18
+WeightVec w_hi[kWCacheUramCols][kWCacheWords];   // columns [8, 16) — 32 URAM
+#pragma HLS ARRAY_PARTITION variable=w_lo complete dim=1   // (same for w_hi)
+#pragma HLS AGGREGATE       variable=w_lo compact=bit
+#pragma HLS BIND_STORAGE    variable=w_lo type=RAM_2P impl=BRAM
+#pragma HLS BIND_STORAGE    variable=w_hi type=RAM_2P impl=URAM
 // One RAM column per m1; the word address is w_cache_addr(bank, tile,
 // khi, kwi) = (bank·kMaxMperGroup + tile)·64 + khi·8 + kwi (ConvMacGrid.h,
 // power-of-two strides so it is a bit concatenation).  The fused sweep
 // reads all kTileM columns of bank wbank at one address per cycle
 // (mac_grid_step) while the prefetch writes the NEXT slab into bank
 // !wbank — one read + one write port per RAM_2P column.  The store
-// selects its column with an explicit unrolled `if (c == m1)`: a runtime
-// index into the partitioned dimension makes HLS emit two stores per
-// RAM (II=2) or split the bank dimension into a second RAM set.
+// (w_cache_store) selects its column with an explicit unrolled
+// `if (c == m1)` across both arrays: a runtime index into the partitioned
+// dimension makes HLS emit two stores per RAM (II=2) or split the bank
+// dimension into a second RAM set.  Every port is 72 bits wide, so the 16
+// × 256-bit words read per cycle need 4 BRAM36 or 4 URAM per column
+// whatever the depth — the split keeps BRAM at the 8-column count.
 
 // DEPTHWISE-path weight buffer (different shape — no in_ch dimension):
 Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
@@ -287,37 +296,34 @@ for ni in [0, batch)
           // bank !wbank; a short blocking tail loop after the sweep takes
           // whatever it did not absorb, then the banks swap.
 
-          for oh_local in [0, chunk_oh)
-            for ow in [ow_start, ow_end)
-              // Drain kh × kw channel-packed PatchVec beats from
-              //   patch_stream (1 beat = kTileIC lanes) — II=1
-              for mt_in_group in [0, mt_per_group_actual)
-                // acc[0..kTileM-1] := partial_outputs[idx_base + …]    (II=1)
-                // accumulate_standard(patch, w_cache[mt_in_group], …):
-                //   for ri in [0, kh · kw · kTileM):                   PIPELINE II=1
-                //     m1 = ri & (kTileM - 1)                           // lane rotation
-                //     lane_sum = Σ_{ic_l = 0..kTileIC-1, UNROLL}
-                //                  patch[ic_l][khi][kwi]
-                //                · w_cache[mt_in_group][m1][ic_l][khi][kwi]
-                //                  // weight masked to 0 for ic_l ≥ ic_valid (X-prop guard)
-                //     acc[m1] += lane_sum
-                // partial_outputs[idx_base + …] := acc[m1]              (II=1)
+          // §2.41: ONE flat II=1 loop over (oh_local, ow_in_tile, g, khi, kwi)
+          for it in [0, chunk_oh · tw · G · kh · kw):                 PIPELINE II=1
+            // g == 0: PatchVec beat from patch_stream → p[], parked in patch[][khi][kwi]
+            // g  > 0: p[] replayed from patch[][khi][kwi]
+            // a[m1] = (khi, kwi) == (0, 0) ? partial_outputs[word·kTileM + m1] : acc[g][m1]
+            // mac_grid_step: a[m1] += Σ_{ic_l, UNROLL} p[ic_l] · w_cache[g][m1][khi][kwi]   // 16 × 16 products
+            // acc[g][m1] = a[m1]
+            // (khi, kwi) == (kh-1, kw-1): partial_outputs[word·kTileM + m1] := a[m1]
+            // + one non-blocking WeightVec of the next slab into bank !wbank (§2.35)
+            // counters advance (kwi, khi) → g → pixel (word cursor: no multiply)
 
-    // PHASE 3 (§2.38): transpose + drain, 8 outputs per cycle — PIPELINE II=1
+    // PHASE 3 (§2.38, §2.40): transpose + drain, 8 outputs per cycle — PIPELINE II=1
     for mt, segment in (chunk pixels / kDrainSeg):        // step n
-      for i in [0, max(fill_len, drain_words)):
-        // fill: pixel i of segment n → saturate the 8 lanes of
-        //   partial_outputs[(p·m_tiles + mt)·kTileM ..] and scatter them
+      for i in [0, max(fill_len·kTileM/8, drain_words)):
+        // fill: channels 8h..8h+7 (h = i % (kTileM/8)) of pixel i/(kTileM/8) of
+        //   segment n → saturate the 8 lanes of
+        //   partial_outputs[(p·m_tiles + mt)·kTileM + 8h ..] and scatter them
         //   into 8 LUTRAM banks (bank (m1+p)%8, addr m1·32 + p/8) of buffer n&1
         // drain: word i of segment n-1 from buffer (n-1)&1 — 8 consecutive
         //   pixels of channel m1 read from 8 distinct banks at one address —
         //   acc_stream.write(YWord)     // order (mt, segment, m1, word)
 ```
 
-**Inner-MAC throughput is `kTileIC` MACs/cycle** (PN-wide adder tree fed by
-the unrolled `ic_l` loop).  Loop bound shrinks from
-`ic_valid · kh · kw · kTileM` to `kh · kw · kTileM`; lane rotation on `m1`
-preserves the kTileM-cycle RAW distance on `acc[m1]`.
+**Inner-MAC throughput is `kTileIC × kTileM` = 256 MACs/cycle** (§2.24,
+§2.40: 16 columns, each a private 16-input adder tree into a distance-1
+`acc[m1] += tree`).  A pixel costs exactly `G · kh · kw` cycles per
+M-group (§2.41: the accumulator load / store and the three per-pixel loop
+ramps of the earlier form are gone; one ramp per `(ict, ow_tile, mg)`).
 
 **Weight DDR replay is eliminated for `(oh, ow)`** — weights for one
 `(ict, ow_tile, M-group)` are loaded once into `w_cache` and reused
@@ -581,16 +587,16 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Data type** | `ap_fixed<16,8>` (default) or `float` |
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `float` |
 | **MAC operand width** | `Data_t × Data_t` 16×16 multiply → single DSP48 per lane; operands are *not* pre-widened to `AccData_t` (§2.17) |
-| **Tiling** | kTileM=8 output channels × kTileIC=16 input channels |
-| **Inner-MAC parallelism (standard)** | PN-wide adder tree: kTileIC=16 MACs/cycle, lane-rotated on m1 |
-| **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=8 MACs/cycle |
+| **Tiling** | kTileM=16 output channels × kTileIC=16 input channels (§2.40; 8 × 16 before) |
+| **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid: kTileIC × kTileM = 256 MACs/cycle (§2.24, §2.40) |
+| **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=16 MACs/cycle |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
 | **Dataflow stages** | 6 (x_row_loader, input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
 | **Patch buffer storage** | `patch[kTileIC][kMaxKH][kMaxKW]` is a banked register file — kTileIC LUTRAMs partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18) |
 | **Accumulator stream** | `acc_stream` carries 128-bit words of 8 saturated outputs of one channel (§2.38); `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
-| **Output drain rate** | 8 outputs per cycle: Phase 3 reads one 8-channel URAM word per cycle through a segmented 8×8 bank-rotated LUTRAM transposer (§2.38) |
+| **Output drain rate** | 8 outputs per cycle: Phase 3 reads one 16-channel URAM word per two cycles (8 channels per cycle) through a segmented 8-bank rotated LUTRAM transposer (§2.38, §2.40) |
 | **Input fill rate** | 16 (standard) / 8 (depthwise) elements per cycle: `x_row_loader` drains 128-bit words into a ping-pong row buffer and emits one column of all channels per cycle (§2.39) |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |

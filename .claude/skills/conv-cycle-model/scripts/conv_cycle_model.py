@@ -32,7 +32,7 @@ ROW_LOAD_LATENCY = 40    # first read data after a row's requests are issued
 DW_TILE_RAMP     = 10    # §2.37: one pipeline ramp per (mt, ow_tile) flat depthwise sweep
 DRAIN_SEG        = 256   # §2.38: Phase-3 transposer segment (pixels); one extra segment + ramps per chunk
 DRAIN_STEP_RAMP  = 6
-ARCH             = 39    # newest step modelled; overridden by --arch
+ARCH             = 41    # newest step modelled; overridden by --arch
 ROW_FILL_LATENCY = 12    # §2.39: per-row Phase-1 entry (the loader has the words parked in the FIFO)
 ROW_LOADER_SETUP = 64    # §2.39: per-row request loop + first-data DDR latency (~49) + merged-step ramp
 PIXEL_OVERHEAD   = 12    # standard path: per-(pixel, group) load / sweep / store loop ramps (was 6)
@@ -59,12 +59,19 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
             # transposer, the writer at 8 elements/beat underneath; the last segment's
             # drain and one ramp per step are exposed.
             L = rows * ow; nseg = -(-L // DRAIN_SEG)
-            ph3 += m_tiles * L + min(L, DRAIN_SEG) + DRAIN_STEP_RAMP * (m_tiles * nseg + 1)
+            # §2.40: a kTileM-lane tile word is scattered in ceil(m_valid / 8)
+            # sub-steps (8 channels per cycle), so a tile costs L * steps.
+            fill_steps = sum(-(-min(P["TILE_M"], out_ch - t * P["TILE_M"]) // E) for t in range(m_tiles))
+            ph3 += fill_steps * L + min(L, DRAIN_SEG) + DRAIN_STEP_RAMP * (m_tiles * nseg + 1)
         else:
             ph3 += rows * ow * out_ch                   # 1 element/cycle drain (+ writer at same rate)
         r0 = c * per * sh - pt
         r1 = (c * per + rows - 1) * sh + (kh - 1) * dh - pt
         in_rows = max(0, min(r1, in_h - 1) - max(r0, 0) + 1)   # rows actually fetched for this chunk
+        if ARCH >= 41 and sh > (kh - 1) * dh + 1:
+            # §2.41: rows between two windows are skipped by the loader.
+            in_rows = sum(1 for r in range(max(r0, 0), min(r1, in_h - 1) + 1)
+                          if (r + pt) % sh <= (kh - 1) * dh)
         if dwise:
             for mt in range(m_tiles):
                 mv = min(P["TILE_M"], out_ch - mt * P["TILE_M"])
@@ -90,9 +97,14 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
-                    sweep_blk = sum(rows * tw * (min(mtg, m_tiles - g * mtg) * kh * kw
-                                                 + 2 * min(mtg, m_tiles - g * mtg) + PIXEL_OVERHEAD)
-                                    for g in range(groups))
+                    if ARCH >= 41:
+                        # §2.41 flat sweep: G*kh*kw cycles per pixel, one ramp per (ict, owt, group)
+                        sweep_blk = sum(rows * tw * min(mtg, m_tiles - g * mtg) * kh * kw + PIXEL_OVERHEAD
+                                        for g in range(groups))
+                    else:
+                        sweep_blk = sum(rows * tw * (min(mtg, m_tiles - g * mtg) * kh * kw
+                                                     + 2 * min(mtg, m_tiles - g * mtg) + PIXEL_OVERHEAD)
+                                        for g in range(groups))
                     if ARCH >= 39:
                         fill_c = in_rows * (cols + ROW_FILL_LATENCY)         # §2.39, grp 0 only
                         ldr    = in_rows * loader_row_cycles(icv, cols)
@@ -103,7 +115,8 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                         mt0 = g * mtg; G = min(mtg, m_tiles - mt0)
                         mv_sum = sum(min(P["TILE_M"], out_ch - (mt0 + i) * P["TILE_M"]) for i in range(G))
                         f = mv_sum * kh * kw * lanes / E            # beats at 1/cycle
-                        s_ = rows * tw * (G * kh * kw + 2 * G + PIXEL_OVERHEAD)
+                        s_ = (rows * tw * G * kh * kw + PIXEL_OVERHEAD) if ARCH >= 41 \
+                             else rows * tw * (G * kh * kw + 2 * G + PIXEL_OVERHEAD)
                         # §2.35 ping-pong: the NEXT slab's fill overlaps this sweep
                         # (one vector per sweep iteration, producer-bound at 2
                         # cycles per 16-lane vector); only the part the sweep
