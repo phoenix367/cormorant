@@ -9,6 +9,7 @@ lands in inference.c), compiles it into a tiny harness that runs the node's
 (round half to even + saturation) is tested on exact ties.
 """
 
+import math
 import os
 import shutil
 import subprocess
@@ -37,12 +38,41 @@ _HARNESS_HEAD = r"""
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-typedef uint16_t Data_t;
-#define INFERENCE_BYTES_PER_ELEM 2u
-typedef struct { void *virt; } inference_buf_t;
+typedef DATA_T Data_t;
+#define INFERENCE_BYTES_PER_ELEM ((unsigned)sizeof(Data_t))
+typedef struct { void *virt; unsigned count; uint8_t cached; } inference_buf_t;
 static Data_t *inference_buf_ptr(inference_buf_t *b) { return (Data_t *)b->virt; }
+static inline int inference_buf_is_cached(const inference_buf_t *b) { return b->cached; }
 static void inference_buf_sync_to_device(inference_buf_t *b) { (void)b; }
 """
+
+# Thread counts every C case runs with (the binary is built with
+# -DINFERENCE_HOST_MIN_ELEMS=1 so even these tiny ops are split): serial, an
+# odd split (uneven ranges), and the default four.
+_THREADS = (1, 3, 4)
+
+
+def _cc(src_path, exe, extra=()):
+    """Compile a harness: -Werror, pthreads, every host op split to the
+    thread count even for tiny inputs."""
+    r = subprocess.run([_CC, "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", "-pthread", "-DINFERENCE_HOST_MIN_ELEMS=1u",
+                        *extra, src_path, "-lm", "-o", exe], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def _run_threads(exe, blob=b""):
+    """Run ``exe`` once per thread count; every run must print the same
+    bytes.  Returns the output."""
+    outs = []
+    for n in _THREADS:
+        r = subprocess.run([exe], input=blob, capture_output=True,
+                           env={**os.environ, "INFERENCE_HOST_THREADS": str(n)})
+        assert r.returncode == 0, r.stderr
+        outs.append(r.stdout)
+    for n, o in zip(_THREADS[1:], outs[1:], strict=True):
+        assert o == outs[0], f"{n} threads differ from 1 thread"
+    return outs[0]
 
 
 def _vi(name, shape, et=TensorProto.FLOAT):
@@ -63,48 +93,50 @@ def _grid(rng, shape, lo, hi):
     return np.round(rng.uniform(lo, hi, shape) * 256) / 256
 
 
-def _storage(t, v):
-    return DT.int_to_storage(v) if t.is_int else DT.float_to_storage(v)
+def _storage(t, v, dt=DT):
+    return dt.int_to_storage(v) if t.is_int else dt.float_to_storage(v)
 
 
-def _run_c(cg, sn, ins):
-    """Compile the generated host section + a harness around ``sn.c_call``;
-    returns the raw output storage."""
+def _run_c(cg, sn, ins, dt=DT):
+    """Compile the generated host section + a harness around ``sn.c_call``
+    (after host_runtime_init: thread pool + lookup tables); runs it with 1,
+    3 and 4 threads and returns the raw output storage."""
     staged = sn.staged_inputs()
     direct = sn.direct_inputs()
+    bpe = dt.bytes_per_elem
+    st = np.dtype(dt.np_storage).newbyteorder("<")
     by_name = {t.onnx_name: v for t, v in zip(sn.inputs, ins, strict=True)}
-    lines = [_HARNESS_HEAD, cg._host_ops_section(), "int main(void)", "{"]
+    lines = [_HARNESS_HEAD.replace("DATA_T", dt.c_type), cg._host_ops_section(),
+             "int main(void)", "{"]
     for i, t in enumerate(staged):
         lines.append(f"    static Data_t in{i}[{max(t.numel, 1)}];")
     for i, t in enumerate(direct):
         lines.append(f"    static Data_t dd{i}[{max(t.numel, 1)}];")
-        lines.append(f"    inference_buf_t db{i} = {{ dd{i} }};")
+        lines.append(f"    inference_buf_t db{i} = {{ dd{i}, {t.numel}u, 1u }};")
     lines.append(f"    static Data_t out[{max(sn.output.numel, 1)}];")
     lines.append(f"    static double tmp_d[{max(sn.scratch_bytes() // 8, 1)}];")
     lines.append("    void *tmp = tmp_d;")
+    lines.append("    if (host_runtime_init() != 0) return 3;")
     for i, t in enumerate(staged):
-        lines.append(f"    if (fread(in{i}, 2, {t.numel}, stdin) != {t.numel}u) return 2;")
+        lines.append(f"    if (fread(in{i}, {bpe}, {t.numel}, stdin) != {t.numel}u) return 2;")
     for i, t in enumerate(direct):
-        lines.append(f"    if (fread(dd{i}, 2, {t.numel}, stdin) != {t.numel}u) return 2;")
+        lines.append(f"    if (fread(dd{i}, {bpe}, {t.numel}, stdin) != {t.numel}u) return 2;")
     lines += ["    " + ln for ln in sn.c_call([f"in{i}" for i in range(len(staged))], "out",
                                               "tmp", [f"(&db{i})" for i in range(len(direct))],
-                                              DT)]
+                                              dt)]
     lines += ["    (void)tmp;",
-              f"    fwrite(out, 2, {sn.output.numel}, stdout);", "    return 0;", "}"]
-    blob = b"".join(_storage(t, by_name[t.onnx_name]).astype("<u2").tobytes()
+              f"    fwrite(out, {bpe}, {sn.output.numel}, stdout);",
+              "    host_runtime_deinit();", "    return 0;", "}"]
+    blob = b"".join(_storage(t, by_name[t.onnx_name], dt).astype(st).tobytes()
                     for t in staged + direct)
     with tempfile.TemporaryDirectory() as td:
         c = os.path.join(td, "h.c")
         with open(c, "w") as f:
             f.write("\n".join(lines))
         exe = os.path.join(td, "h")
-        r = subprocess.run([_CC, "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
-                            "-Wno-unused-function", c, "-lm", "-o", exe],
-                           capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr
-        r = subprocess.run([exe], input=blob, capture_output=True)
-        assert r.returncode == 0, r.stderr
-    return np.frombuffer(r.stdout, dtype="<u2")
+        _cc(c, exe)
+        out = _run_threads(exe, blob)
+    return np.frombuffer(out, dtype=st)
 
 
 @unittest.skipUnless(_CC, "C compiler not available on host")
@@ -119,17 +151,21 @@ class _Base(unittest.TestCase):
     def tearDownClass(cls):
         cls._tmp.cleanup()
 
-    def check(self, path, feeds, kind=HostNode, **graph_kw):
-        """Every host node of the model: C output == reference, bitwise."""
-        g = OnnxGraph(path, **graph_kw)
-        cg = CodeGenerator(g, model_path=path)
+    def check(self, path, feeds, kind=HostNode, dt=DT, mutate=None, **graph_kw):
+        """Every host node of the model: C output == reference, bitwise
+        (with 1, 3 and 4 threads).  ``mutate(graph)`` may adjust the nodes
+        before code generation."""
+        g = OnnxGraph(path, dtype=dt, **graph_kw)
+        if mutate:
+            mutate(g)
+        cg = CodeGenerator(g, model_path=path, dtype=dt)
         arrays = cg._forward_pass({k: np.asarray(v, np.float64) for k, v in feeds.items()})
         nodes = [sn for sn in g.nodes if isinstance(sn, kind)]
         self.assertTrue(nodes)
         for sn in nodes:
             ins = [arrays[t.onnx_name] for t in sn.inputs]
-            ref = _storage(sn.output, arrays[sn.output.onnx_name].reshape(-1))
-            got = _run_c(cg, sn, ins)
+            ref = _storage(sn.output, arrays[sn.output.onnx_name].reshape(-1), dt)
+            got = _run_c(cg, sn, ins, dt)
             np.testing.assert_array_equal(got, ref, err_msg=f"{sn.onnx_node.op_type} [{sn.index}]")
         return g, cg, arrays
 
@@ -142,7 +178,8 @@ class TestRounding(_Base):
         vals = np.array([0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 3.49, 3.51,
                          255.0 * 256 / 256 + 0.5, 32767.4, 32767.5, 32768.0, -32768.5,
                          -40000.0, 1e300, -1e300, np.nan, 0.0, -0.0]) / 256.0
-        prog = [_HARNESS_HEAD, DT.c_host_conversions(), "int main(void)", "{",
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), DT.c_host_conversions(),
+                "int main(void)", "{",
                 "    double v; Data_t d;",
                 "    while (fread(&v, 8, 1, stdin) == 1) { d = host_st(v); fwrite(&d, 2, 1, stdout);",
                 "        d = host_st_int(v * 256.0); fwrite(&d, 2, 1, stdout); }",
@@ -329,14 +366,151 @@ class TestDataMovement(_Base):
             OnnxGraph(p)
 
 
+# Every ap_fixed<16,8> value, as a [256, 256] tensor.
+_ALL_Q88 = (np.arange(65536, dtype=np.uint32).astype(np.uint16).view(np.int16)
+            .astype(np.float64) / 256.0).reshape(256, 256)
+
+
+class TestLookupTables(_Base):
+    """GELU is a table over all 2^16 inputs and Softmax's exp() a table over
+    all 2^16 (max - x) differences (phase 2B); both must reproduce the
+    per-element double computation (== the simulator) bit for bit."""
+
+    def test_gelu_exhaustive(self):
+        bert_c = (float(np.float32(0.044715)), float(np.float32(math.sqrt(2 / math.pi))))
+
+        def bert_consts(g):
+            g.nodes[0].c1, g.nodes[0].c2 = bert_c
+
+        def erf_mul(g):                 # x * (1/sqrt2) instead of x / sqrt2
+            g.nodes[0].k, g.nodes[0].div = float(np.float32(1 / math.sqrt(2))), 0
+
+        for approx, mutate in (("tanh", None), ("tanh", bert_consts),
+                               ("none", None), ("none", erf_mul)):
+            p = _save(self.d, [oh.make_node("Gelu", ["X"], ["Y"], approximate=approx)],
+                      [_vi("X", [256, 256])], [_vi("Y", [256, 256])], opset=20,
+                      name=f"gelu_all_{approx}")
+            with self.subTest(approx=approx, consts=mutate.__name__ if mutate else "exact"):
+                g, cg, _ = self.check(p, {"X": _ALL_Q88}, mutate=mutate)
+                src = cg._host_ops_section()
+                self.assertIn("host_lut_map(", g.nodes[0].c_call(["in0"], "out", "tmp", [], DT)[0])
+                self.assertIn(f"static Data_t *{g.nodes[0].lut_name} = NULL;", src)
+
+    def test_gelu_lut_shared_by_equal_constants(self):
+        p = _save(self.d, [oh.make_node("Gelu", ["X"], ["A"], approximate="tanh"),
+                           oh.make_node("Gelu", ["A"], ["B"], approximate="tanh"),
+                           oh.make_node("Gelu", ["B"], ["Y"], approximate="none")],
+                  [_vi("X", [4, 8])], [_vi("Y", [4, 8])], opset=20, name="gelu3")
+        cg = CodeGenerator(OnnxGraph(p), model_path=p)
+        luts = cg._host_luts()
+        self.assertEqual(len(luts), 2)
+        self.assertEqual(sorted(n.split("_lut_")[0] for n, _ in luts),
+                         ["s_host_gelu_none", "s_host_gelu_tanh"])
+
+    def test_softmax_full_range(self):
+        rng = np.random.default_rng(9)
+        n = 300
+        x = _grid(rng, (12, n), -128, 127.99)
+        x[0, :2] = [-128.0, 32767 / 256]                    # max - min = 65535 LSB
+        x[1, :] = -128.0                                    # all equal (minimum)
+        x[2, :] = 5.0                                       # all equal
+        x[3, :] = np.where(np.arange(n) % 2, -128.0, 32767 / 256)
+        x[4, :] = _grid(rng, n, -0.1, 0.1)                  # tiny range
+        p = _save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                  [_vi("X", [12, n])], [_vi("Y", [12, n])], name="sm_range")
+        self.check(p, {"X": x})
+        p1 = _save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                   [_vi("X", [7, 1])], [_vi("Y", [7, 1])], name="sm_n1")
+        self.check(p1, {"X": _grid(rng, (7, 1), -128, 127)})
+
+    def test_exp_table_equals_libm(self):
+        g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                            [_vi("X", [2, 4])], [_vi("Y", [2, 4])], name="sm_tbl"))
+        cg = CodeGenerator(g, model_path="sm_tbl")
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), cg._host_ops_section(),
+                "int main(void)", "{",
+                "    if (host_runtime_init() != 0) return 3;",
+                "    fwrite(s_host_exp_lut, sizeof(double), HOST_LUT_SIZE, stdout);",
+                "    host_runtime_deinit();", "    return 0;", "}"]
+        with tempfile.TemporaryDirectory() as td:
+            c, exe = os.path.join(td, "t.c"), os.path.join(td, "t")
+            with open(c, "w") as f:
+                f.write("\n".join(prog))
+            _cc(c, exe)
+            tbl = np.frombuffer(_run_threads(exe), "<f8")
+        ref = np.array([math.exp(-k / 256.0) for k in range(65536)])
+        self.assertEqual(tbl.size, 65536)
+        np.testing.assert_array_equal(tbl.view(np.uint64), ref.view(np.uint64))
+
+
+class TestFloat32(_Base):
+    """A float32 Data_t has no tables: the per-element code path, threaded."""
+
+    def test_non_lut_path(self):
+        from src.dtype import FLOAT32
+        rng = np.random.default_rng(12)
+        g_ = nph.from_array(rng.normal(1, 0.2, 24).astype(np.float32), "g")
+        cases = [
+            ("f_sm", [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)], [], 13),
+            ("f_ln", [oh.make_node("LayerNormalization", ["X", "g"], ["Y"], axis=-1)], [g_], 17),
+            ("f_gt", [oh.make_node("Gelu", ["X"], ["Y"], approximate="tanh")], [], 20),
+            ("f_ge", [oh.make_node("Gelu", ["X"], ["Y"], approximate="none")], [], 20),
+        ]
+        for name, nodes, inits, opset in cases:
+            p = _save(self.d, nodes, [_vi("X", [5, 24])], [_vi("Y", [5, 24])], inits,
+                      opset=opset, name=name)
+            with self.subTest(case=name):
+                x = rng.normal(0, 3, (5, 24)).astype(np.float32).astype(np.float64)
+                g, cg, _ = self.check(p, {"X": x}, dt=FLOAT32)
+                src = cg._host_ops_section()
+                self.assertNotIn("HOST_LUT_SIZE", src)
+                self.assertNotIn("host_lut_map", src)
+
+
 class TestStagingHelpers(_Base):
-    """host_load / host_store compact and re-expand advancing-strided layouts."""
+    """host_load / host_store compact and re-expand advancing-strided layouts;
+    host_in / host_out / host_out_done work in place on a cacheable flat
+    buffer and stage otherwise."""
+
+    def test_direct_or_staged(self):
+        g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                            [_vi("X", [2, 4])], [_vi("Y", [2, 4])], name="stage2"))
+        cg = CodeGenerator(g, model_path="stage2")
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), cg._host_ops_section(),
+                "int main(void)", "{",
+                "    static Data_t buf[40], st[40], out[40]; unsigned i, c;",
+                "    for (c = 0; c < 2u; c++) {",
+                "        inference_buf_t b = { buf, 40u, (uint8_t)c }, o = { out, 40u, (uint8_t)c };",
+                "        const Data_t *in; Data_t *y;",
+                "        for (i = 0; i < 40u; i++) { buf[i] = (Data_t)(i + 1u); out[i] = 0xAAAAu; }",
+                "        memset(st, 0, sizeof st);",
+                "        in = host_in(&b, st, 1u, 40u, 40u);            /* flat */",
+                "        printf(\"%d \", in == buf);",
+                "        in = host_in(&b, st, 5u, 3u, 8u);              /* strided: always staged */",
+                "        printf(\"%d %u \", in == st, (unsigned)in[3]);",
+                "        y = host_out(&o, st, 1u, 40u, 40u);",
+                "        printf(\"%d \", y == out);",
+                "        for (i = 0; i < 40u; i++) y[i] = (Data_t)(100u + i);",
+                "        host_out_done(&o, y, 1u, 40u, 40u);",
+                "        printf(\"%u %u\\n\", (unsigned)out[0], (unsigned)out[39]);",
+                "    }",
+                "    return 0;", "}"]
+        with tempfile.TemporaryDirectory() as td:
+            c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
+            with open(c, "w") as f:
+                f.write("\n".join(prog))
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", "-pthread", c, "-lm",
+                            "-o", exe], check=True)
+            out = subprocess.run([exe], capture_output=True, check=True, text=True).stdout
+        # cached = 0: staged in / out (copied back); cached = 1: in place
+        self.assertEqual(out.splitlines(), ["0 1 9 0 100 139", "1 1 9 1 100 139"])
 
     def test_strided_round_trip(self):
         g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
                             [_vi("X", [2, 4])], [_vi("Y", [2, 4])], name="stage"))
         cg = CodeGenerator(g, model_path="stage")
-        prog = [_HARNESS_HEAD, cg._host_ops_section(), "int main(void)", "{",
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), cg._host_ops_section(),
+                "int main(void)", "{",
                 "    static Data_t buf[40], st[40], out[40]; unsigned i;",
                 "    inference_buf_t b = { buf }, o = { out };",
                 "    for (i = 0; i < 40u; i++) { buf[i] = (Data_t)(i + 1u); out[i] = 0xAAAAu; }",
@@ -348,8 +522,8 @@ class TestStagingHelpers(_Base):
             c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
             with open(c, "w") as f:
                 f.write("\n".join(prog))
-            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", c, "-lm", "-o", exe],
-                           check=True)
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", "-pthread", c, "-lm",
+                            "-o", exe], check=True)
             out = np.frombuffer(subprocess.run([exe], capture_output=True, check=True).stdout, "<u2")
         compact = np.array([c * 8 + j + 1 for c in range(5) for j in range(3)])
         np.testing.assert_array_equal(out[:15], compact)

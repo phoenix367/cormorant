@@ -54,9 +54,11 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   7×7 stem ran at 3/16 lane utilisation; the rewrite gives it 12 lanes and
   16 taps instead of 49.  The reorder runs on the host CPU as a
   `SpaceToDepthNode` (a C loop inside `inference_run()`, ~150 k elements
-  for 224², staged through cached host memory because the DMA buffers are
-  mapped non-cacheable — measured 16.3 ms when it read the BO directly);
-  the model's public input stays `[1, C, H, W]`.  Details in
+  for 224², in place in the cacheable DMA buffers — see
+  [§Cache coherency](#cache-coherency); with the non-cacheable fallback it
+  is staged through cached host memory, since strided loads from a
+  non-cacheable mapping measured 16.3 ms); the model's public input stays
+  `[1, C, H, W]`.  Details in
   [§Space-to-depth stem](#space-to-depth-stem) below.  A model that
   already contains an ONNX `SpaceToDepth` node is accepted the same way.
 
@@ -211,14 +213,54 @@ chain still drains the Pool lane before MatMul reads the alias.
   that drains a consumer's lane (consumers reached via Reshape aliases
   count). Two tensors share a slot only if their event intervals are
   strictly disjoint — necessary for correctness under cross-lane parallelism.
-- `inference_run()` flushes all graph inputs to DDR at the top, drains
-  every still-pending lane, and invalidates all graph outputs at the bottom.
-  Internal intermediate buffers are never synced — the PL kernels access
-  DDR directly via their AXI master ports — except around a host op
-  (`SpaceToDepthNode`, `HostNode`), which invalidates a kernel-written
-  source before reading it and flushes its own output before the consuming
-  kernel starts.
+- `inference_run()` flushes all graph inputs to DDR at the top, cleans all
+  graph outputs (below), drains every still-pending lane, and invalidates
+  all graph outputs at the bottom.  Internal intermediate buffers are never
+  synced — the PL kernels access DDR directly via their AXI master ports —
+  except around a host op (`SpaceToDepthNode`, `HostNode`), which
+  invalidates a kernel-written source before reading it and flushes its own
+  output before the consuming kernel starts.
 - Weights are synced once at init; they never change.
+
+### Cache coherency
+
+The PL kernels' AXI masters do not snoop the A53 caches.  On Linux every
+DMA buffer is an XRT buffer object (`xclAllocBO`) and, since BERT_PLAN phase
+2B, it is mapped **cacheable** (`XCL_BO_FLAGS_CACHEABLE`, what PYNQ's
+`allocate(cacheable=True)` does): CPU reads of a BO run at cached speed
+(sequential 2.3 GB/s vs 0.14 GB/s for the old non-cacheable write-combine
+mapping, measured on the KV260) and `xclSyncBO` performs real cache
+maintenance on exactly the requested range (views pass their byte offset /
+size; zocl 2.13 → `dma_sync_single_for_{device,cpu}`, ~65 µs per MiB).
+The generated code brackets every CPU ↔ kernel hand-off (Linux DMA-API
+rules):
+
+| hand-off | call | where |
+|---|---|---|
+| CPU wrote → kernel reads | `inference_buf_sync_to_device` (clean) | graph inputs at the top of `inference_run()`; weights once in `inference_init()`; every host-op output (`host_out_done`, SpaceToDepth) |
+| CPU wrote → kernel **writes** | `inference_buf_sync_to_device` (clean) | graph outputs at the top of `inference_run()` — a caller's `memset` of an output buffer would otherwise leave dirty lines whose later eviction overwrites the kernel's result; freshly allocated BOs are cleaned once in `inference_buf_alloc()` |
+| kernel wrote → CPU reads | `inference_buf_sync_from_device` (invalidate) **after** the lane drained | a host op's kernel-written inputs (inside its block, after the event stream's `kernel_wait`); graph outputs after the final drain |
+| kernel ↔ kernel | none | intermediates never touch the CPU caches |
+
+Pool slots are 64-byte (cache-line) aligned and never share a line, a host
+op's output never shares a slot with one of its inputs (liveness), and the
+CPU never touches a buffer a kernel in flight uses, so a range sync can
+never write back or drop another buffer's data.  `test/test_cache_coherency.py`
+checks the emitted `inference_run()` of every test model, the tiny BERT
+fixtures, the SpaceToDepth stems and a kernel → host → kernel → output model
+against these rules (a dirty / stale state per buffer, Slice views as
+sub-ranges); removing any single required sync makes it fail.  On the board
+a micro-test (`xclSyncBO` omitted → the kernel reads stale data / the CPU
+reads stale lines; with it → exact) and the 148-model suite confirm the
+behaviour.
+
+`inference_buf_is_cached(buf)` (inference.h) reports the mapping; the host
+ops compute in place when it is 1.  Fallback: `cmake
+-DINFERENCE_BUF_CACHEABLE=OFF` (compile time) or the environment variable
+`INFERENCE_BUF_CACHEABLE=0` (run time, read in `inference_init()`) maps the
+BOs non-cacheable as before; the host ops then stage through cached
+`malloc` memory again.  Bare-metal buffers are `malloc`'d cached DDR with
+`Xil_DCacheFlushRange` / `Xil_DCacheInvalidateRange`.
 
 ### Space-to-depth stem
 
@@ -283,15 +325,18 @@ slot with its source.  Profiling brackets the loop like a synchronous
 node.  The `<W>_s2d` weight goes through the normal ConvNode tile-major
 packing and ROM / `.dat` emission.
 
-The loop never reads the DMA buffers element-wise.  On the KV260 the DMA
-pool is an XRT BO whose CPU mapping is non-cacheable, so the strided
-2-byte source loads of the reorder cost ~100 ns each (16.3 ms for the
-ResNet-18 stem on the board).  `inference_init()` mallocs one cached
+With the (default) cacheable DMA mapping the loop reads the source BO and
+writes the output BO in place, then `inference_buf_sync_to_device(out)`
+(after `inference_buf_sync_from_device(src)` when a kernel wrote the
+source) — 0.50 ms for the ResNet-18 / MobileNet stems (150 k elements) on
+the board.  With the non-cacheable fallback (`INFERENCE_BUF_CACHEABLE=0`) the
+strided 2-byte source loads would cost ~100 ns each (16.3 ms for the
+ResNet-18 stem on the board), so `inference_init()` also mallocs one cached
 staging block per node (`_s2d_stage_<out>`, 2 × source numel, freed in
-`inference_deinit()`); at run time the node does `memcpy(BO → stage_in)`,
-reorders `stage_in → stage_out` entirely in cached memory, `memcpy(stage_out
-→ BO)` and then `inference_buf_sync_to_device(out)` — the only DMA-memory
-traffic is two wide sequential copies (~0.1–0.3 ms for 300 KB).
+`inference_deinit()`) and that case does `memcpy(BO → stage_in)`, reorders
+`stage_in → stage_out` in cached memory and `memcpy(stage_out → BO)` — the
+only DMA-memory traffic is two wide sequential copies (measured 2.6 ms for
+ResNet-18's 300 KB, dominated by the non-cacheable read).
 
 ### Host-CPU ops
 
@@ -339,19 +384,47 @@ AP_SAT on the output), so a model's data path mixes floor (kernels) and
 round-half-even (host) write-backs; the BERT study's `sched` policy emulates
 exactly this mix.
 
-**Staging.**  On the KV260 the buffer pool is an XRT BO mapped
-non-cacheable (a strided 2-byte read costs ~100 ns).  Every host op does one
-wide `memcpy` per input from the BO into `s_host_stage` — a malloc'd
-(cached) arena shared by all host ops, since they run one at a time — then
-computes stage → stage and copies the result back with one `memcpy`
-followed by `inference_buf_sync_to_device()`; a kernel-written input is
-invalidated (`inference_buf_sync_from_device`) first.  `host_load` /
-`host_store` also compact / re-expand an advancing-strided layout (a
-broadcast VectorOP neighbour with an unaligned chunk), e.g. BERT's
-`[256, 2]` logits (chunk 2, stride 8) before the final Transpose.  Gather
-copies whole table rows straight from the (weight) BO instead.  The arena
-is sized to the largest op (BERT-base: 1 573 888 elements, 3 MiB — a
-softmax input + output + one row of doubles).
+**Host-op performance** (BERT_PLAN phase 2B — none of it changes an output
+bit; the simulator is unchanged):
+
+- *Memory.*  With the cacheable DMA mapping ([§Cache
+  coherency](#cache-coherency)) a host op computes straight from its input
+  BOs into its output BO: `host_in()` returns the BO pointer,
+  `host_out()` the output BO, and `host_out_done()` flushes the output
+  range; a kernel-written input is invalidated first.  A non-cacheable
+  buffer (`INFERENCE_BUF_CACHEABLE=0`) or an advancing-strided layout (a
+  broadcast VectorOP neighbour with an unaligned chunk, e.g. BERT's
+  `[256, 2]` logits, chunk 2 / stride 8) goes through `s_host_stage` — a
+  malloc'd arena shared by all host ops, sized to the largest one
+  (BERT-base: 3 MiB) — with one wide `memcpy` per buffer (`host_load`
+  compacts, `host_store` re-expands with zeroed gaps and flushes).  Gather
+  copies whole table rows straight from the (weight) BO either way.
+- *Lookup tables* (element types of ≤ 16 bits, `DataType.host_lut_bits`).
+  GELU's output is a function of one 16-bit input, so `host_runtime_init()`
+  fills a 65 536-entry `Data_t` table per distinct (form, constants) by
+  running the per-element double code (`host_gelu_tanh_f` / `_erf_f` +
+  `host_st`) on every bit pattern; the op becomes `y[i] = lut[x[i]]`.
+  Softmax's `x − max` is exactly `−k / 256` with
+  `k = bits(max) − bits(x) ∈ [0, 65535]`, so `s_host_exp_lut[k] =
+  exp((double)−k / 256.0)` (512 KiB, the same libm call) replaces the
+  per-element `exp`; the max, the left-to-right sum and the division are
+  unchanged.  Both are proven bit-exact exhaustively in
+  `test/test_host_ops.py` (all 65 536 GELU inputs for both forms and both
+  constant styles; the whole exp table against Python's `math.exp`).  A
+  wider type (float32, 32-bit fixed point) keeps the per-element code.
+- *Threads.*  `host_parallel(fn, arg, n, grain, align)` splits every
+  helper's rows (Softmax, LayerNorm, Transpose / Slice copies, Gather,
+  OneHot) or elements (GELU, Cast) into contiguous ranges: the calling
+  thread runs one, `INFERENCE_HOST_THREADS − 1` pthread workers (created in
+  `inference_init()`, joined in `inference_deinit()`) the others; each row
+  / element runs exactly the code it ran single-threaded.  Ranges hold at
+  least `INFERENCE_HOST_MIN_ELEMS` (16 K) elements, so small ops stay on the
+  caller.  `cmake -DINFERENCE_HOST_THREADS=N` sets the default (4 = the
+  A53 cores; 1 compiles the pool out, also on bare metal); the environment
+  variable `INFERENCE_HOST_THREADS` overrides it at run time.  The unit
+  tests run every helper with 1, 3 and 4 threads and even tiny ops split
+  (`-DINFERENCE_HOST_MIN_ELEMS=1`); `test/host_emu.py` runs the tiny BERT
+  fixtures cached / staged × 1 / 3 / 4 threads.
 
 **Scheduling.**  Like `SpaceToDepthNode`: no lane, one synchronous
 `('cpu', idx)` event that first waits for in-flight producers, liveness
@@ -547,7 +620,22 @@ int  inference_init(const char *vectoropkernel_instance
 // All graph inputs, then all graph outputs (integer tensors hold raw int16):
 void inference_run(inference_buf_t *<input...>, inference_buf_t *<output...>);
 void inference_deinit(void);
+
+// DMA buffers (inference_buf.c): XRT buffer objects on Linux
+inference_buf_t *inference_buf_alloc(unsigned n_elem);
+Data_t  *inference_buf_ptr(inference_buf_t *buf);
+int      inference_buf_is_cached(const inference_buf_t *buf);  // 1: cacheable mapping
+void     inference_buf_sync_to_device(inference_buf_t *buf);    // clean (before a kernel reads / writes)
+void     inference_buf_sync_from_device(inference_buf_t *buf);  // invalidate (after a kernel wrote)
 ```
+
+Build / run-time knobs of the generated project:
+
+| CMake | environment (read in `inference_init()`) | default | effect |
+|---|---|---|---|
+| `-DINFERENCE_BUF_CACHEABLE=ON/OFF` | `INFERENCE_BUF_CACHEABLE=1/0` | ON | cacheable vs non-cacheable XRT BO mapping ([§Cache coherency](#cache-coherency)) |
+| `-DINFERENCE_HOST_THREADS=N` | `INFERENCE_HOST_THREADS=N` (1–64) | 4 | threads per host op (caller + N − 1 workers); models with host ops only |
+| `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
 
 BERT-base (`bertsquad-12-simplified.onnx`) for example:
 

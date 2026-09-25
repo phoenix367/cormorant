@@ -10,9 +10,9 @@ Status: **phase 1 done and merged to main (2026-09-26)** — scheduler side
 (1b–1f), demo (1g) and the `max_k` 4096 bitstream (1a); BERT-base
 runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
-Phase 2 (performance) in progress — 2B host ops (§2); **2A (MatMuls on
-ConvKernel) done on branch `feat/bertconv`: 4.34 s per inference**, still
-bit-exact (§3 "Phase 2A").
+Phase 2 (performance): **2A (MatMuls on ConvKernel) 12.13 → 4.34 s** and
+**2B (host ops) 12.13 → 8.79 s** measured separately, both bit-exact (§3);
+combined measurement in §3 "Phase 2A + 2B".
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -108,15 +108,16 @@ MatmulKernel.  Cycle model (§2.42 kernel), per call, converted at the board's
 
 → linears ≈ 0.57 s, attention ≈ 0.08 s per inference (from 8.4 s).
 
-**2B — host ops.**  Cacheable buffer pool (the generated code already
-syncs at every CPU↔kernel hand-off); 65 536-entry GELU table and a Softmax
-`exp` table indexed by the 16-bit input / the exact 1/256-grid argument
-(filled at init with the same double formula → bit-identical); rows split
-over the 4 A53 cores (per-row arithmetic unchanged → bit-identical).
+**2B — host ops (done, §3 "Phase 2B").**  Cacheable buffer pool (the
+generated code already syncs at every CPU↔kernel hand-off; graph outputs are
+now also cleaned before the kernels write them); 65 536-entry GELU table and
+a Softmax `exp` table indexed by the 16-bit input / the exact 1/256-grid
+argument (filled at init with the same double formula → bit-identical); rows
+split over the 4 A53 cores (per-row arithmetic unchanged → bit-identical).
 
 **Later:** row-stride / transposed-B MatmulKernel modes or conv-friendly
-transposes (host transposes are ~0.17 s now, less once memory is
-cacheable); GELU fused into the conv drain; KV-cache / step graphs for
+transposes (host transposes are 35 ms since 2B); GELU fused into the conv
+drain; KV-cache / step graphs for
 autoregressive decoders (a different, bandwidth-bound problem).
 
 ## 3. Measured outcome
@@ -380,3 +381,88 @@ transposes (halves the 1×1 sweep); more weight requests in flight in
 `stream_load_weights` (it keeps 8 two-beat per-m-row requests outstanding
 for P·V's slabs) — a kernel change.  No bound needs raising
 for BERT-base: `max_in_ch` 1024 suffices with `kw = 4`.
+
+### Phase 2B on the board — host ops (2026-09-26, branch `feat/berthost`)
+
+What changed (`doc/INFERENCE_SCHEDULER.md` §Cache coherency and §Host-CPU
+ops → *Host-op performance*): the XRT buffer objects are mapped
+**cacheable** (`XCL_BO_FLAGS_CACHEABLE`; `INFERENCE_BUF_CACHEABLE=0` falls
+back) and host ops compute in place in them; GELU is a 65 536-entry table
+and Softmax's `exp(x − max)` a 65 536-entry table of `exp(−k/256)`, both
+filled at init by the per-element code; every host op's rows / elements are
+split over the caller + 3 pthread workers (`INFERENCE_HOST_THREADS`, default
+4).  No arithmetic changed: the simulator is untouched, and all 65 536 GELU
+inputs (both forms, both constant styles) and the whole exp table are
+proven bit-exact on the host.
+
+Coherency check on the board (micro-test, VectorOPKernel as the DMA
+master): without `xclSyncBO` the kernel reads stale DDR (4 128 / 32 768
+elements) and the CPU reads stale lines (32 192 / 32 768); with the flush /
+invalidate — also on half ranges (views) — 0 errors.  Cacheable BO reads run
+at 2.3 GB/s (non-cacheable: 0.14 GB/s); a sync costs ~65 µs per MiB.
+
+**Result** (N = 20, `--profile-layers`, KV260 100 MHz, same bitstream as
+phase 1): **8.79 s per inference** (mean 8786.2 ms, min 8766.8, max
+8823.4), from 12.13 s; start / end logits **bit-exact** with the scheduler
+simulation (3 / 3) and the study's `sched` emulation (20 / 20); EM / F1
+**90.0 / 91.7**, unchanged (19 / 20 spans as float); `inference_init`
+0.4 s (0.3 s in phase 1).
+
+| kind | phase 1 | NC + tables, 1 thread | NC + tables, 4 threads | cacheable + tables, 1 thread | **2B: cacheable + tables, 4 threads** |
+|---|---:|---:|---:|---:|---:|
+| GELU (12) | 2048.7 ms | 195.7 | 158.6 | 56.6 | **19.6** (105×) |
+| Softmax (12) | 1071.6 ms | 604.3 | 321.8 | 468.1 | **140.1** (7.6×) |
+| LayerNorm (25) | 339.9 ms | 374.3 | 155.4 | 305.4 | **92.1** (3.7×) |
+| Transpose (49) | 169.4 ms | 169.0 | 158.4 | 68.5 | **34.7** (4.9×) |
+| other host (5) | 3.0 ms | 3.2 | 1.7 | 0.3 | **0.3** |
+| **host total** | **3632.6 ms** | 1346.5 | 795.9 | 898.9 | **286.8** (12.7×) |
+| wall per inference | 12131 ms | 9846 | 9296 | 9398 | **8786** |
+
+(The ablation columns are single-example runs with the environment
+variables `INFERENCE_BUF_CACHEABLE` / `INFERENCE_HOST_THREADS`; the 2B column
+is the N = 20 run — its N = 1 run gave 19.7 / 120.6 / 92.3 / 33.3 ms;
+LayerNorm in the non-cacheable single-thread column is 10 % slower than in
+phase 1, not investigated.)
+The tables remove GELU's `tanh` and Softmax's `exp`; the cacheable mapping
+removes the 127.5 MiB of non-cacheable BO copies (≈ 0.14 GB/s) that
+dominated Transpose and a large part of GELU / LayerNorm; the threads divide
+what is left — Softmax (a double division + rounding per element) and
+LayerNorm (three passes of double arithmetic) are now compute-bound.  The
+MatMul linears (7.66 s, 87 %) are all that is left: phase 2A.
+
+**Other models** (the cacheable pool touches every model; same bitstream):
+the 148-model board suite passes 148 / 148; the CNN demos predict
+identically (top-5 classes *and* logits; MNIST 9892 / 9735 correct of
+10 000).  Every image-classification model has a SpaceToDepth stem, the only
+host op there, which now reorders in place: 2.60 → 0.50 ms (warm call,
+ResNet-18; MobileNet v1 2.60 → 0.52, v2 3.18 → 0.50).
+
+| model | main / phase 1 | 2B, `INFERENCE_BUF_CACHEABLE=0` | **2B (cacheable)** |
+|---|---:|---:|---:|
+| ResNet-18 | 62.38 ms | 62.33 | **60.31** |
+| MobileNet v1 | 83.14 ms | 83.09 | **81.2–81.6** |
+| MobileNet v2 | 66.28 ms | 65.98 | **63.86–63.89** |
+| MNIST convnet | 0.2656 ms | 0.2678 | 0.2685 |
+| MNIST LeNet | 5.442 ms | 5.444 | 5.447 |
+
+(Image models: one image after one warm-up, two runs; MNIST: 10 000
+images.)  MNIST pays ~2–3 µs per inference (+1 %) for the one extra
+`xclSyncBO` call that cleans the output buffer before the kernels write it
+(both mappings; required for correctness with a cacheable mapping).
+
+**Incident.**  During the first N = 20 run on this branch the board's
+userspace starved: its journal shows dbus service activations timing out
+from ~90 s into the run, systemd's 3-minute watchdogs killing systemd-logind
+and -resolved (i.e. unresponsive from about the same time), and the
+per-inference latency stepping from 8.76 to 8.96 s at that moment; no kernel
+message (no oops, soft lockup, RCU stall, OOM).  `squad_bench` itself
+finished all 20 inferences and exited normally within the second
+(`zocl_destroy_client`, sudo session closed); the board needed a power
+cycle afterwards.  That run was on a board up 10.5 h that had just run the
+148-model suite and the CNN demos; the later runs used the same generated
+code and configuration (cacheable pool, 4 threads, profiling, N = 20) on a
+freshly booted board.  It did not reproduce in five single-example ablations (cacheable
+on / off × 1 / 4 threads × profiling) nor in two repeat N = 20 profile runs
+with telemetry (per-CPU liveness probe every 2 s, PSI cpu ≤ 6 %, io ≤ 3.5 %,
+memory 0, no blocked daemons, no journal watchdog / dbus timeouts, 1.33 GHz
+throughout, AMS ≤ 34 °C, latency flat).  Root cause unknown.

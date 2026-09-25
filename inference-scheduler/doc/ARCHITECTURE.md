@@ -870,7 +870,13 @@ The encoded storage array is then either:
 The KV260 has a Cortex-A53 CPU with L1/L2 data caches and a Xilinx FPGA PL
 (Programmable Logic) fabric. They share DDR but **the PL is not cache-coherent
 with the CPU caches** — the CPU's view of memory may be stale if the PL has
-written to DDR, and vice versa.
+written to DDR, and vice versa.  On Linux the DMA buffers are XRT buffer
+objects mapped **cacheable** by default (`XCL_BO_FLAGS_CACHEABLE`; build with
+`-DINFERENCE_BUF_CACHEABLE=OFF` or run with `INFERENCE_BUF_CACHEABLE=0` for
+the old non-cacheable mapping), so the syncs below are real cache
+maintenance on the buffer's byte range.  The full hand-off table, including
+host-CPU ops, is in `doc/INFERENCE_SCHEDULER.md` §Cache coherency and is
+checked by `test/test_cache_coherency.py`.
 
 Two operations maintain coherency:
 
@@ -946,7 +952,10 @@ inference_init():
 inference_run(X1, X2, Yadd, Yrelu):
   sync_to_device(X1)       ← flush all graph inputs
   sync_to_device(X2)
-  [all kernel calls]
+  sync_to_device(Yadd)     ← clean all graph outputs: no CPU-dirty line (e.g. a
+  sync_to_device(Yrelu)      caller's memset) may be evicted over a kernel's result
+  [all kernel calls; a host op invalidates its kernel-written inputs after
+   the producing lane drained and flushes its output]
   sync_from_device(Yadd)   ← invalidate all graph outputs
   sync_from_device(Yrelu)
 ```

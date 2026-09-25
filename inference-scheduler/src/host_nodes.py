@@ -26,21 +26,36 @@ which the scheduler's fixed-point simulator runs):
     saturation to the Data_t range, NaN -> 0; integer outputs with
     ``host_st_int`` (truncate toward zero, saturate).
 
-Data movement never touches the DMA buffers element-wise: on the KV260 the
-buffer pool is an XRT BO mapped NON-CACHEABLE (a strided 2-byte read costs
-~100 ns; the SpaceToDepth stem measured 16 ms for 300 KB when it read the
-BO directly).  Every host op therefore does one wide ``memcpy`` BO -> a
-malloc'd cached staging arena per input (``host_load``), computes
-stage -> stage, and one ``memcpy`` back (``host_store``, followed by a
-cache flush for the consuming kernel).  The arena is shared by all host
-ops (they run one at a time on the CPU) and sized to the largest one.
-Gather is the one exception: it copies whole embedding rows straight out
-of the (possibly huge) table buffer, one wide memcpy per row.
+Performance (BERT_PLAN phase 2B), all without changing a single output bit:
+
+  * Memory.  The XRT buffer objects are mapped CACHEABLE by default
+    (``inference_buf.c``), so a host op reads its inputs and writes its
+    output in place in the BO; ``inference_buf_sync_from_device`` invalidates
+    a kernel-written input first and ``host_out_done`` flushes the output
+    for the consuming kernel.  With the non-cacheable fallback
+    (``INFERENCE_BUF_CACHEABLE=0``: a strided 2-byte read of a
+    write-combine mapping costs ~100 ns) — and for advancing-strided
+    layouts — the op goes through a malloc'd cached staging arena
+    (``s_host_stage``, sized to the largest op) with one wide ``memcpy`` per
+    buffer instead.  Gather always copies whole table rows straight out of
+    the (possibly huge) table buffer.
+  * Tables.  For an element type with <= 16 bits (``dtype.host_lut_bits``)
+    GELU is a table over every Data_t bit pattern and Softmax's
+    ``exp(x - max)`` a table over every possible ``(max - x)`` bit
+    difference (``x - max`` is exactly ``-k / 2^F``); both are filled at
+    init by the same double code / libm call, so the lookup returns the
+    same bits as the per-element computation.
+  * Threads.  Every helper splits its rows (Softmax, LayerNorm, copy,
+    Gather, OneHot) or elements (GELU, Cast) into contiguous ranges run by
+    the caller plus ``INFERENCE_HOST_THREADS - 1`` pthread workers; the
+    per-row / per-element arithmetic and order are unchanged.
 """
 
 from __future__ import annotations
 
 import math
+import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict, List, Optional, Tuple
 
@@ -175,14 +190,28 @@ def _c_double(v: float) -> str:
 # ------------------------------------------------------------------ #
 
 HOST_C_COMMON = r"""/*
- * host_load  — one wide memcpy DMA buffer -> cached stage.  A buffer with an
- *              advancing-strided layout (n_chunks blocks of `stride`
- *              elements, the first `chunk` valid) is compacted in place.
+ * DMA-buffer access.  inference_buf.c maps the XRT buffer objects CACHEABLE by
+ * default (buf->cached == 1; INFERENCE_BUF_CACHEABLE=0 selects the old
+ * non-cacheable write-combine mapping).  A host op then computes straight
+ * from / into the BO memory and the only extra work is the cache maintenance
+ * at the hand-offs; with a non-cacheable mapping (or an advancing-strided
+ * layout, which the helpers cannot index) it goes through the cached staging
+ * arena with one wide memcpy per buffer:
+ *
+ *   host_in       — the input's elements, flat: the BO itself, or a compacted
+ *                   copy in the stage (host_load).  A kernel-written input
+ *                   must be invalidated (inference_buf_sync_from_device)
+ *                   BEFORE host_in.
+ *   host_out      — where the helper writes the output: the BO or the stage.
+ *   host_out_done — a staged output is expanded + copied into its BO
+ *                   (host_store); either way the BO range is then flushed
+ *                   (inference_buf_sync_to_device) for the consuming kernel.
+ *
+ * host_load  — one wide memcpy DMA buffer -> stage.  An advancing-strided
+ *              layout (n_chunks blocks of `stride` elements, the first `chunk`
+ *              valid) is compacted in place.
  * host_store — the inverse (expand back to front, zero the gaps), one wide
- *              memcpy stage -> DMA buffer, then flush the CPU cache so the
- *              consuming kernel reads the new data.
- * The DMA buffers are an XRT BO mapped non-cacheable on the KV260: these two
- * sequential copies are the only accesses a host op makes to them.
+ *              memcpy stage -> DMA buffer, then the flush.
  */
 static void host_load(Data_t *dst, inference_buf_t *src,
                       unsigned n_chunks, unsigned chunk, unsigned stride)
@@ -211,45 +240,372 @@ static void host_store(inference_buf_t *dst, Data_t *src,
     memcpy(inference_buf_ptr(dst), src, n * INFERENCE_BYTES_PER_ELEM);
     inference_buf_sync_to_device(dst);
 }
+
+/* 1 when the helper can use the BO memory itself: cacheable, flat layout. */
+static int host_direct(const inference_buf_t *b,
+                       unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    return inference_buf_is_cached(b) && (n_chunks <= 1u || stride == chunk);
+}
+
+static const Data_t *host_in(inference_buf_t *src, Data_t *stage,
+                             unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    if (host_direct(src, n_chunks, chunk, stride))
+        return inference_buf_ptr(src);
+    host_load(stage, src, n_chunks, chunk, stride);
+    return stage;
+}
+
+static Data_t *host_out(inference_buf_t *dst, Data_t *stage,
+                        unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    return host_direct(dst, n_chunks, chunk, stride) ? inference_buf_ptr(dst) : stage;
+}
+
+static void host_out_done(inference_buf_t *dst, Data_t *out,
+                          unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    if (out != inference_buf_ptr(dst))
+        host_store(dst, out, n_chunks, chunk, stride);        /* copy + flush */
+    else
+        inference_buf_sync_to_device(dst);
+}
 """
 
-HOST_C_HELPERS: Dict[str, str] = {
-    "softmax": r"""/* Softmax over rows of n elements (ONNX Softmax, last axis; opset < 13
+HOST_C_POOL = r"""/*
+ * Host thread pool.  Every helper splits its rows / elements into at most
+ * s_host_nthreads contiguous ranges; the calling thread runs range 0 and
+ * INFERENCE_HOST_THREADS - 1 pthread workers (created in inference_init,
+ * joined in inference_deinit) run the others.  Each row / element is still
+ * computed by exactly the same code in the same order, so the results are
+ * bit-identical for any thread count.
+ *
+ *   -DINFERENCE_HOST_THREADS=N   default thread count (4 = the four A53
+ *                                cores; 1 compiles the pool out)
+ *   env INFERENCE_HOST_THREADS   runtime override, 1 .. 64 (Linux)
+ */
+#ifndef INFERENCE_HOST_THREADS
+#  define INFERENCE_HOST_THREADS 4
+#endif
+#if defined(__linux__) && INFERENCE_HOST_THREADS > 1
+#  include <pthread.h>
+#  define HOST_POOL 1
+#else
+#  define HOST_POOL 0
+#endif
+
+typedef void (*host_task_fn)(void *arg, unsigned begin, unsigned end);
+
+static unsigned s_host_nthreads = 1u;
+
+#ifndef INFERENCE_HOST_MIN_ELEMS
+#  define INFERENCE_HOST_MIN_ELEMS 16384u   /* smallest range worth a thread */
+#endif
+
+#if HOST_POOL
+/* Range t of nt over n items; inner boundaries rounded down to `align`. */
+static void host_range(unsigned n, unsigned t, unsigned nt, unsigned align,
+                       unsigned *b, unsigned *e)
+{
+    unsigned long long lo = (unsigned long long)n * t / nt;
+    unsigned long long hi = (unsigned long long)n * (t + 1u) / nt;
+    lo -= lo % align;
+    if (t + 1u < nt)
+        hi -= hi % align;
+    else
+        hi = n;
+    *b = (unsigned)lo;
+    *e = (unsigned)hi;
+}
+
+static struct {
+    pthread_t      *th;
+    unsigned        n_started;
+    int             sync_ok;
+    pthread_mutex_t mu;
+    pthread_cond_t  go, done;
+    unsigned long   gen;
+    unsigned        busy;
+    int             quit;
+    host_task_fn    fn;
+    void           *arg;
+    unsigned        n, nt, align;
+} s_hp;
+
+static void *host_worker(void *p)
+{
+    unsigned      id = (unsigned)(uintptr_t)p;
+    unsigned long seen = 0ul;
+    for (;;) {
+        host_task_fn fn;
+        void        *arg;
+        unsigned     n, nt, align, b = 0u, e = 0u;
+        pthread_mutex_lock(&s_hp.mu);
+        while (!s_hp.quit && s_hp.gen == seen)
+            pthread_cond_wait(&s_hp.go, &s_hp.mu);
+        if (s_hp.quit) {
+            pthread_mutex_unlock(&s_hp.mu);
+            return NULL;
+        }
+        seen = s_hp.gen;
+        fn = s_hp.fn; arg = s_hp.arg; n = s_hp.n; nt = s_hp.nt; align = s_hp.align;
+        pthread_mutex_unlock(&s_hp.mu);
+        if (id < nt) {
+            host_range(n, id, nt, align, &b, &e);
+            if (b < e)
+                fn(arg, b, e);
+        }
+        pthread_mutex_lock(&s_hp.mu);
+        if (--s_hp.busy == 0u)
+            pthread_cond_signal(&s_hp.done);
+        pthread_mutex_unlock(&s_hp.mu);
+    }
+}
+#endif
+
+/* Run fn over [0, n): at most one range per thread and at least `grain`
+ * items per range; range boundaries are multiples of `align` items. */
+static void host_parallel(host_task_fn fn, void *arg, unsigned n,
+                          unsigned grain, unsigned align)
+{
+#if HOST_POOL
+    unsigned nt = s_host_nthreads;
+    if (grain == 0u) grain = 1u;
+    if (align == 0u) align = 1u;
+    if (n / grain < nt) nt = n / grain;
+    if (nt > s_hp.n_started + 1u) nt = s_hp.n_started + 1u;
+    if (nt > 1u) {
+        unsigned b, e;
+        pthread_mutex_lock(&s_hp.mu);
+        s_hp.fn = fn; s_hp.arg = arg; s_hp.n = n; s_hp.nt = nt; s_hp.align = align;
+        s_hp.busy = s_hp.n_started;
+        s_hp.gen++;
+        pthread_cond_broadcast(&s_hp.go);
+        pthread_mutex_unlock(&s_hp.mu);
+        host_range(n, 0u, nt, align, &b, &e);
+        if (b < e)
+            fn(arg, b, e);
+        pthread_mutex_lock(&s_hp.mu);
+        while (s_hp.busy != 0u)
+            pthread_cond_wait(&s_hp.done, &s_hp.mu);
+        pthread_mutex_unlock(&s_hp.mu);
+        return;
+    }
+#else
+    (void)grain;
+    (void)align;
+#endif
+    if (n > 0u)
+        fn(arg, 0u, n);
+}
+
+static void host_pool_deinit(void)
+{
+#if HOST_POOL
+    unsigned i;
+    if (s_hp.sync_ok) {
+        pthread_mutex_lock(&s_hp.mu);
+        s_hp.quit = 1;
+        pthread_cond_broadcast(&s_hp.go);
+        pthread_mutex_unlock(&s_hp.mu);
+        for (i = 0u; i < s_hp.n_started; i++)
+            pthread_join(s_hp.th[i], NULL);
+        pthread_cond_destroy(&s_hp.done);
+        pthread_cond_destroy(&s_hp.go);
+        pthread_mutex_destroy(&s_hp.mu);
+    }
+    free(s_hp.th);
+    memset(&s_hp, 0, sizeof s_hp);
+#endif
+    s_host_nthreads = 1u;
+}
+
+static int host_pool_init(void)
+{
+    unsigned n = INFERENCE_HOST_THREADS;
+#if HOST_POOL
+    unsigned    i;
+    const char *env = getenv("INFERENCE_HOST_THREADS");
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+        if (v >= 1 && v <= 64) n = (unsigned)v;
+    }
+    host_pool_deinit();
+    s_hp.th = (pthread_t *)calloc(n, sizeof(pthread_t));
+    if (!s_hp.th) return -1;
+    if (pthread_mutex_init(&s_hp.mu, NULL) != 0) return -1;
+    if (pthread_cond_init(&s_hp.go, NULL) != 0) {
+        pthread_mutex_destroy(&s_hp.mu);
+        return -1;
+    }
+    if (pthread_cond_init(&s_hp.done, NULL) != 0) {
+        pthread_cond_destroy(&s_hp.go);
+        pthread_mutex_destroy(&s_hp.mu);
+        return -1;
+    }
+    s_hp.sync_ok = 1;
+    for (i = 1u; i < n; i++) {
+        if (pthread_create(&s_hp.th[i - 1u], NULL, host_worker, (void *)(uintptr_t)i) != 0)
+            break;
+        s_hp.n_started++;
+    }
+    if (s_hp.n_started + 1u < n)
+        fprintf(stderr, "inference: started %u of %u host worker threads\n",
+                s_hp.n_started, n - 1u);
+    n = s_hp.n_started + 1u;
+#else
+    n = 1u;
+#endif
+    s_host_nthreads = n;
+    return 0;
+}
+
+/* Rows per range so that every range holds >= INFERENCE_HOST_MIN_ELEMS. */
+static inline unsigned host_row_grain(unsigned row_len)
+{
+    unsigned m = INFERENCE_HOST_MIN_ELEMS;
+    return row_len >= m ? 1u : m / (row_len ? row_len : 1u);
+}
+
+typedef struct {
+    const Data_t *x;
+    Data_t       *y;
+    unsigned      n;
+} host_rows_t;
+"""
+
+
+def host_c_lut_map() -> str:
+    return r"""/* y[i] = lut[bits of x[i]] — an elementwise op tabulated over every Data_t
+ * bit pattern at init with the op's own double code path (bit-identical). */
+typedef struct {
+    const Data_t *x;
+    Data_t       *y;
+    const Data_t *lut;
+} host_lut_map_t;
+
+static void host_lut_map_range(void *p, unsigned i0, unsigned i1)
+{
+    const host_lut_map_t *a = (const host_lut_map_t *)p;
+    unsigned i;
+    for (i = i0; i < i1; i++)
+        a->y[i] = a->lut[a->x[i]];
+}
+
+static void host_lut_map(const Data_t *x, Data_t *y, unsigned n, const Data_t *lut)
+{
+    host_lut_map_t a;
+    a.x = x; a.y = y; a.lut = lut;
+    host_parallel(host_lut_map_range, &a, n, INFERENCE_HOST_MIN_ELEMS, 64u);
+}
+"""
+
+
+def _softmax_c(lut: bool) -> str:
+    if lut:
+        body = r"""        int    m = (int)(host_sint_t)x[0];
+        double s = 0.0;
+        for (j = 1u; j < n; j++) {
+            int v = (int)(host_sint_t)x[j];
+            if (v > m) m = v;
+        }
+        for (j = 0u; j < n; j++)
+            s += e[m - (int)(host_sint_t)x[j]];
+        for (j = 0u; j < n; j++)
+            y[j] = host_st(e[m - (int)(host_sint_t)x[j]] / s);"""
+        head = r"""/* Softmax over rows of n elements (ONNX Softmax, last axis; opset < 13
  * "coerce to 2-D" with n = prod(shape[axis:])):
  *   y[j] = exp(x[j] - max) / sum_k exp(x[k] - max),  sum left to right.
- * e: n doubles of scratch. */
-static void host_softmax(const Data_t *x, Data_t *y, unsigned rows, unsigned n,
-                         double *e)
+ * x and max are multiples of 1/HOST_LUT_SCALE, so x[j] - max is exactly
+ * -k / HOST_LUT_SCALE with k = bits(max) - bits(x[j]) in [0, HOST_LUT_SIZE):
+ * s_host_exp_lut[k] holds exp() of exactly that double, filled at init with
+ * the same libm call — bit-identical to calling exp() per element. */
+static double *s_host_exp_lut = NULL;
+
+static void host_exp_lut_fill(void *p, unsigned k0, unsigned k1)
 {
-    unsigned r, j;
-    for (r = 0u; r < rows; r++, x += n, y += n) {
-        double m = host_ld(x[0]), s = 0.0;
+    unsigned k;
+    (void)p;
+    for (k = k0; k < k1; k++)
+        s_host_exp_lut[k] = exp((double)(0 - (int)k) / HOST_LUT_SCALE);
+}
+
+static int host_exp_lut_init(void)
+{
+    s_host_exp_lut = (double *)malloc(HOST_LUT_SIZE * sizeof(double));
+    if (!s_host_exp_lut) return -1;
+    host_parallel(host_exp_lut_fill, NULL, HOST_LUT_SIZE, 1024u, 8u);
+    return 0;
+}
+
+static void host_softmax_rows(void *p, unsigned r0, unsigned r1)
+{
+    const host_rows_t *a = (const host_rows_t *)p;
+    const double      *e = s_host_exp_lut;
+    unsigned           r, j, n = a->n;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * n;
+        Data_t       *y = a->y + (size_t)r * n;
+"""
+    else:
+        body = r"""        double m = host_ld(x[0]), s = 0.0;
         for (j = 1u; j < n; j++) {
             double v = host_ld(x[j]);
             if (v > m) m = v;
         }
-        for (j = 0u; j < n; j++) {
-            e[j] = exp(host_ld(x[j]) - m);
-            s += e[j];
-        }
         for (j = 0u; j < n; j++)
-            y[j] = host_st(e[j] / s);
+            s += exp(host_ld(x[j]) - m);
+        for (j = 0u; j < n; j++)                /* same exp() argument -> same value */
+            y[j] = host_st(exp(host_ld(x[j]) - m) / s);"""
+        head = r"""/* Softmax over rows of n elements (ONNX Softmax, last axis; opset < 13
+ * "coerce to 2-D" with n = prod(shape[axis:])):
+ *   y[j] = exp(x[j] - max) / sum_k exp(x[k] - max),  sum left to right. */
+static void host_softmax_rows(void *p, unsigned r0, unsigned r1)
+{
+    const host_rows_t *a = (const host_rows_t *)p;
+    unsigned           r, j, n = a->n;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * n;
+        Data_t       *y = a->y + (size_t)r * n;
+"""
+    return head + body + r"""
     }
 }
-""",
-    "layernorm": r"""/* LayerNormalization over rows of n elements, gamma / beta float32
+
+static void host_softmax(const Data_t *x, Data_t *y, unsigned rows, unsigned n)
+{
+    host_rows_t a;
+    a.x = x; a.y = y; a.n = n;
+    host_parallel(host_softmax_rows, &a, rows, host_row_grain(n), 1u);
+}
+"""
+
+
+_LAYERNORM_C = r"""/* LayerNormalization over rows of n elements, gamma / beta float32
  * (NULL = 1 / 0):
  *   mean = sum(x) / n,  var = sum((x - mean)^2) / n   (sums left to right)
  *   inv  = 1 / sqrt(var + eps)
  *   tf_form 1 (TensorFlow / BERT graph):  g = inv * gamma;
  *                                          y = x * g + (beta - mean * g)
  *   tf_form 0 (ONNX op):                   y = (x - mean) * inv * gamma + beta */
-static void host_layernorm(const Data_t *x, Data_t *y, unsigned rows, unsigned n,
-                           const float *gamma, const float *beta, double eps,
-                           int tf_form)
+typedef struct {
+    const Data_t *x;
+    Data_t       *y;
+    unsigned      n;
+    const float  *gamma, *beta;
+    double        eps;
+    int           tf_form;
+} host_layernorm_t;
+
+static void host_layernorm_rows(void *p, unsigned r0, unsigned r1)
 {
-    unsigned r, j;
-    for (r = 0u; r < rows; r++, x += n, y += n) {
+    const host_layernorm_t *a = (const host_layernorm_t *)p;
+    const float            *gamma = a->gamma, *beta = a->beta;
+    unsigned                r, j, n = a->n;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * n;
+        Data_t       *y = a->y + (size_t)r * n;
         double sum = 0.0, var = 0.0, mean, inv;
         for (j = 0u; j < n; j++)
             sum += host_ld(x[j]);
@@ -259,12 +615,12 @@ static void host_layernorm(const Data_t *x, Data_t *y, unsigned rows, unsigned n
             var += d * d;
         }
         var = var / (double)n;
-        inv = 1.0 / sqrt(var + eps);
+        inv = 1.0 / sqrt(var + a->eps);
         for (j = 0u; j < n; j++) {
             double xv = host_ld(x[j]);
             double ga = gamma ? (double)gamma[j] : 1.0;
             double be = beta  ? (double)beta[j]  : 0.0;
-            if (tf_form) {
+            if (a->tf_form) {
                 double g = inv * ga;
                 y[j] = host_st(xv * g + (be - mean * g));
             } else {
@@ -273,95 +629,222 @@ static void host_layernorm(const Data_t *x, Data_t *y, unsigned rows, unsigned n
         }
     }
 }
-""",
-    "gelu_tanh": r"""/* GELU, tanh approximation (BERT's graph form, constants as found):
+
+static void host_layernorm(const Data_t *x, Data_t *y, unsigned rows, unsigned n,
+                           const float *gamma, const float *beta, double eps,
+                           int tf_form)
+{
+    host_layernorm_t a;
+    a.x = x; a.y = y; a.n = n; a.gamma = gamma; a.beta = beta;
+    a.eps = eps; a.tf_form = tf_form;
+    host_parallel(host_layernorm_rows, &a, rows, host_row_grain(n), 1u);
+}
+"""
+
+
+def _gelu_c(form: str, lut: bool) -> str:
+    """GELU element function + (LUT) table fill / (no LUT) threaded loop."""
+    if form == "tanh":
+        f = r"""/* GELU, tanh approximation (BERT's graph form, constants as found):
  *   y = x * (0.5 * (1 + tanh(c2 * (x + c1 * x^3)))) */
-static void host_gelu_tanh(const Data_t *x, Data_t *y, unsigned n,
-                           double c1, double c2)
+static double host_gelu_tanh_f(double v, double p1, double p2)
 {
-    unsigned i;
-    for (i = 0u; i < n; i++) {
-        double v = host_ld(x[i]);
-        double u = c2 * (v + c1 * (v * v * v));
-        y[i] = host_st(v * (0.5 * (1.0 + tanh(u))));
-    }
+    double u = p2 * (v + p1 * (v * v * v));
+    return v * (0.5 * (1.0 + tanh(u)));
 }
-""",
-    "gelu_erf": r"""/* GELU, exact form:  y = x * (0.5 * (1 + erf(u))),  u = x / k (div) or x * k */
-static void host_gelu_erf(const Data_t *x, Data_t *y, unsigned n,
-                          double k, int div)
+"""
+    else:
+        f = r"""/* GELU, exact form:  y = x * (0.5 * (1 + erf(u))),  u = x / k (div != 0) or x * k */
+static double host_gelu_erf_f(double v, double p1, double p2)
 {
-    unsigned i;
-    for (i = 0u; i < n; i++) {
-        double v = host_ld(x[i]);
-        double u = div ? v / k : v * k;
-        y[i] = host_st(v * (0.5 * (1.0 + erf(u))));
-    }
+    double u = (p2 != 0.0) ? v / p1 : v * p1;
+    return v * (0.5 * (1.0 + erf(u)));
 }
-""",
-    "copy_nd": r"""/* Strided gather-copy (Transpose / Slice / non-contiguous Split): dst is
- * written sequentially in output order, dst[i0..i4] = src[sum ik * s[k]]. */
-static void host_copy_nd(const Data_t *src, Data_t *dst,
-                         const unsigned d[5], const unsigned s[5])
+"""
+    fn = f"host_gelu_{form}_f"
+    if lut:
+        return f + rf"""
+/* The input is a Data_t, so the whole op is a table of HOST_LUT_SIZE outputs,
+ * filled at init by {fn} + host_st — the per-element code path. */
+typedef struct {{
+    Data_t *lut;
+    double  p1, p2;
+}} host_gelu_{form}_fill_t;
+
+static void host_gelu_{form}_fill(void *p, unsigned b0, unsigned b1)
+{{
+    const host_gelu_{form}_fill_t *a = (const host_gelu_{form}_fill_t *)p;
+    unsigned b;
+    for (b = b0; b < b1; b++)
+        a->lut[b] = host_st({fn}(host_ld((Data_t)b), a->p1, a->p2));
+}}
+
+static int host_gelu_{form}_lut(Data_t **lut, double p1, double p2)
+{{
+    host_gelu_{form}_fill_t a;
+    *lut = (Data_t *)malloc(HOST_LUT_SIZE * sizeof(Data_t));
+    if (!*lut) return -1;
+    a.lut = *lut; a.p1 = p1; a.p2 = p2;
+    host_parallel(host_gelu_{form}_fill, &a, HOST_LUT_SIZE, 1024u, 64u);
+    return 0;
+}}
+"""
+    return f + rf"""
+typedef struct {{
+    const Data_t *x;
+    Data_t       *y;
+    double        p1, p2;
+}} host_gelu_{form}_t;
+
+static void host_gelu_{form}_range(void *p, unsigned i0, unsigned i1)
+{{
+    const host_gelu_{form}_t *a = (const host_gelu_{form}_t *)p;
+    unsigned i;
+    for (i = i0; i < i1; i++)
+        a->y[i] = host_st({fn}(host_ld(a->x[i]), a->p1, a->p2));
+}}
+
+static void host_gelu_{form}(const Data_t *x, Data_t *y, unsigned n, double p1, double p2)
+{{
+    host_gelu_{form}_t a;
+    a.x = x; a.y = y; a.p1 = p1; a.p2 = p2;
+    host_parallel(host_gelu_{form}_range, &a, n, INFERENCE_HOST_MIN_ELEMS / 4u + 1u, 64u);
+}}
+"""
+
+
+_COPY_ND_C = r"""/* Strided gather-copy (Transpose / Slice / non-contiguous Split): dst is
+ * written sequentially in output order, dst[i0..i4] = src[sum ik * s[k]].
+ * Split over the d[0]*d[1]*d[2]*d[3] output rows of d[4] elements. */
+typedef struct {
+    const Data_t   *src;
+    Data_t         *dst;
+    const unsigned *d, *s;
+} host_copy_nd_t;
+
+static void host_copy_nd_rows(void *p, unsigned r0, unsigned r1)
 {
-    unsigned i0, i1, i2, i3, i4;
-    for (i0 = 0u; i0 < d[0]; i0++)
-    for (i1 = 0u; i1 < d[1]; i1++)
-    for (i2 = 0u; i2 < d[2]; i2++)
-    for (i3 = 0u; i3 < d[3]; i3++) {
-        const Data_t *p = src + (size_t)i0 * s[0] + (size_t)i1 * s[1]
-                              + (size_t)i2 * s[2] + (size_t)i3 * s[3];
+    const host_copy_nd_t *a = (const host_copy_nd_t *)p;
+    const unsigned       *d = a->d, *s = a->s;
+    Data_t               *dst = a->dst + (size_t)r0 * d[4];
+    unsigned              r, t, i0, i1, i2, i3, i4;
+    i3 = r0 % d[3]; t = r0 / d[3];
+    i2 = t % d[2];  t /= d[2];
+    i1 = t % d[1];  i0 = t / d[1];
+    for (r = r0; r < r1; r++) {
+        const Data_t *q = a->src + (size_t)i0 * s[0] + (size_t)i1 * s[1]
+                                 + (size_t)i2 * s[2] + (size_t)i3 * s[3];
         if (s[4] == 1u) {
-            memcpy(dst, p, (size_t)d[4] * sizeof(Data_t));
+            memcpy(dst, q, (size_t)d[4] * sizeof(Data_t));
             dst += d[4];
         } else {
             for (i4 = 0u; i4 < d[4]; i4++)
-                *dst++ = p[(size_t)i4 * s[4]];
+                *dst++ = q[(size_t)i4 * s[4]];
+        }
+        if (++i3 == d[3]) {
+            i3 = 0u;
+            if (++i2 == d[2]) {
+                i2 = 0u;
+                if (++i1 == d[1]) { i1 = 0u; i0++; }
+            }
         }
     }
 }
-""",
-    "gather_rows": r"""/* Gather, axis 0: dst row i = table row idx[i] (row_len elements, one
+
+static void host_copy_nd(const Data_t *src, Data_t *dst,
+                         const unsigned d[5], const unsigned s[5])
+{
+    host_copy_nd_t a;
+    unsigned rows = d[0] * d[1] * d[2] * d[3];
+    if (rows == 0u)
+        return;
+    a.src = src; a.dst = dst; a.d = d; a.s = s;
+    host_parallel(host_copy_nd_rows, &a, rows, host_row_grain(d[4]), 1u);
+}
+"""
+
+_GATHER_C = r"""/* Gather, axis 0: dst row i = table row idx[i] (row_len elements, one
  * wide memcpy per row straight from the table buffer).  A negative index
  * counts from the end (ONNX); an index still outside [0, rows) is CLAMPED
  * to the nearest valid row (ONNX leaves it undefined). */
+typedef struct {
+    const Data_t *table, *idx;
+    Data_t       *dst;
+    unsigned      rows, row_len;
+} host_gather_t;
+
+static void host_gather_range(void *p, unsigned i0, unsigned i1)
+{
+    const host_gather_t *a = (const host_gather_t *)p;
+    unsigned i;
+    for (i = i0; i < i1; i++) {
+        long k = (long)host_ld_int(a->idx[i]);
+        if (k < 0) k += (long)a->rows;
+        if (k < 0) k = 0;
+        if (k >= (long)a->rows) k = (long)a->rows - 1;
+        memcpy(a->dst + (size_t)i * a->row_len, a->table + (size_t)k * a->row_len,
+               (size_t)a->row_len * sizeof(Data_t));
+    }
+}
+
 static void host_gather_rows(const Data_t *table, unsigned rows, unsigned row_len,
                              const Data_t *idx, unsigned n_idx, Data_t *dst)
 {
-    unsigned i;
-    for (i = 0u; i < n_idx; i++) {
-        long k = (long)host_ld_int(idx[i]);
-        if (k < 0) k += (long)rows;
-        if (k < 0) k = 0;
-        if (k >= (long)rows) k = (long)rows - 1;
-        memcpy(dst + (size_t)i * row_len, table + (size_t)k * row_len,
-               (size_t)row_len * sizeof(Data_t));
+    host_gather_t a;
+    a.table = table; a.idx = idx; a.dst = dst; a.rows = rows; a.row_len = row_len;
+    host_parallel(host_gather_range, &a, n_idx, host_row_grain(row_len), 1u);
+}
+"""
+
+_ONEHOT_C = r"""/* OneHot, axis -1: row i = `off` everywhere, `on` at idx[i] (negative
+ * indices count from the end; out-of-range indices give an all-off row). */
+typedef struct {
+    const Data_t *idx;
+    Data_t       *dst;
+    unsigned      depth;
+    Data_t        off, on;
+} host_onehot_t;
+
+static void host_onehot_range(void *p, unsigned i0, unsigned i1)
+{
+    const host_onehot_t *a = (const host_onehot_t *)p;
+    unsigned i, j;
+    for (i = i0; i < i1; i++) {
+        Data_t *dst = a->dst + (size_t)i * a->depth;
+        long    k = (long)host_ld_int(a->idx[i]);
+        if (k < 0) k += (long)a->depth;
+        for (j = 0u; j < a->depth; j++)
+            dst[j] = a->off;
+        if (k >= 0 && k < (long)a->depth)
+            dst[k] = a->on;
     }
 }
-""",
-    "onehot": r"""/* OneHot, axis -1: row i = `off` everywhere, `on` at idx[i] (negative
- * indices count from the end; out-of-range indices give an all-off row). */
+
 static void host_onehot(const Data_t *idx, unsigned n, unsigned depth,
                         Data_t off, Data_t on, Data_t *dst)
 {
-    unsigned i, j;
-    for (i = 0u; i < n; i++, dst += depth) {
-        long k = (long)host_ld_int(idx[i]);
-        if (k < 0) k += (long)depth;
-        for (j = 0u; j < depth; j++)
-            dst[j] = off;
-        if (k >= 0 && k < (long)depth)
-            dst[k] = on;
-    }
+    host_onehot_t a;
+    a.idx = idx; a.dst = dst; a.depth = depth; a.off = off; a.on = on;
+    host_parallel(host_onehot_range, &a, n, host_row_grain(depth), 1u);
 }
-""",
-    "cast": r"""/* Cast.  mode 0: integer -> Data_t (round/saturate)   1: Data_t -> integer
+"""
+
+_CAST_C = r"""/* Cast.  mode 0: integer -> Data_t (round/saturate)   1: Data_t -> integer
  * (truncate toward zero, saturate)   2: Data_t -> bool   3: integer -> bool */
-static void host_cast(const Data_t *x, Data_t *y, unsigned n, unsigned mode)
+typedef struct {
+    const Data_t *x;
+    Data_t       *y;
+    unsigned      mode;
+} host_cast_t;
+
+static void host_cast_range(void *p, unsigned i0, unsigned i1)
 {
-    unsigned i;
-    for (i = 0u; i < n; i++) {
-        switch (mode) {
+    const host_cast_t *a = (const host_cast_t *)p;
+    const Data_t      *x = a->x;
+    Data_t            *y = a->y;
+    unsigned           i;
+    for (i = i0; i < i1; i++) {
+        switch (a->mode) {
         case 0u:  y[i] = host_st(host_ld_int(x[i]));                     break;
         case 1u:  y[i] = host_st_int(host_ld(x[i]));                     break;
         case 2u:  y[i] = host_st_int(host_ld(x[i]) != 0.0 ? 1.0 : 0.0);  break;
@@ -369,13 +852,34 @@ static void host_cast(const Data_t *x, Data_t *y, unsigned n, unsigned mode)
         }
     }
 }
-""",
-}
 
-# Helpers that need <math.h> (exp / sqrt / tanh / erf); host_st / host_st_int
-# use nearbyint / trunc, so math.h is included whenever any host node exists.
-HOST_C_HELPER_ORDER = ("softmax", "layernorm", "gelu_tanh", "gelu_erf",
+static void host_cast(const Data_t *x, Data_t *y, unsigned n, unsigned mode)
+{
+    host_cast_t a;
+    a.x = x; a.y = y; a.mode = mode;
+    host_parallel(host_cast_range, &a, n, INFERENCE_HOST_MIN_ELEMS, 64u);
+}
+"""
+
+
+# Helper kinds in emission order.  ``lut_map`` is pulled in by the GELU kinds
+# when the element type has lookup tables (``dtype.host_lut_bits``).
+HOST_C_HELPER_ORDER = ("lut_map", "softmax", "layernorm", "gelu_tanh", "gelu_erf",
                        "copy_nd", "gather_rows", "onehot", "cast")
+
+
+def host_c_helper(kind: str, lut: bool) -> str:
+    """C source of one helper kind; ``lut``: the element type is tabulated."""
+    if kind == "lut_map":
+        return host_c_lut_map()
+    if kind == "softmax":
+        return _softmax_c(lut)
+    if kind == "gelu_tanh":
+        return _gelu_c("tanh", lut)
+    if kind == "gelu_erf":
+        return _gelu_c("erf", lut)
+    return {"layernorm": _LAYERNORM_C, "copy_nd": _COPY_ND_C, "gather_rows": _GATHER_C,
+            "onehot": _ONEHOT_C, "cast": _CAST_C}[kind]
 
 
 # ------------------------------------------------------------------ #
@@ -439,8 +943,14 @@ class HostNode:
         return ""
 
     def c_helpers(self) -> Tuple[str, ...]:
-        """Names of the HOST_C_HELPERS this node calls."""
+        """Helper kinds (``host_c_helper``) this node calls."""
         return type(self).helpers
+
+    def c_luts(self, dtype) -> List[Tuple[str, str]]:  # noqa: ARG002
+        """Lookup tables this node reads: ``[(c_name, init_call)]``, where
+        ``init_call`` is a C expression that allocates + fills ``c_name`` at
+        init and returns 0 (tables of equal name are shared)."""
+        return []
 
     @property
     def c_prefix(self) -> str:
@@ -508,14 +1018,15 @@ class SoftmaxNode(HostNode):
                                  f"{y.numel} != input numel {x.numel}.")
         return sn
 
-    def scratch_bytes(self) -> int:
-        return 8 * self.n
-
     def describe(self) -> str:
         return f"rows={self.rows} n={self.n}"
 
+    def c_luts(self, dtype):
+        # exp() of every possible (x - max) of a tabulated element type
+        return [("s_host_exp_lut", "host_exp_lut_init()")] if dtype.host_lut_bits else []
+
     def c_call(self, ins, out, scratch, direct, dtype):
-        return [f"host_softmax({ins[0]}, {out}, {self.rows}u, {self.n}u, (double *){scratch});"]
+        return [f"host_softmax({ins[0]}, {out}, {self.rows}u, {self.n}u);"]
 
     def reference(self, ins, dtype):
         x = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
@@ -676,11 +1187,36 @@ class GeluNode(HostNode):
     def describe(self) -> str:
         return ("tanh approximation" if self.approximate == "tanh" else "erf form") + f" n={self.n}"
 
-    def c_call(self, ins, out, scratch, direct, dtype):
+    @property
+    def _params(self) -> Tuple[float, float]:
+        """(p1, p2) of ``host_gelu_<form>_f``: (c1, c2) or (k, div)."""
         if self.approximate == "tanh":
-            return [f"host_gelu_tanh({ins[0]}, {out}, {self.n}u, "
-                    f"{_c_double(self.c1)}, {_c_double(self.c2)});"]
-        return [f"host_gelu_erf({ins[0]}, {out}, {self.n}u, {_c_double(self.k)}, {self.div});"]
+            return (self.c1, self.c2)
+        return (self.k, float(self.div))
+
+    @property
+    def lut_name(self) -> str:
+        """C name of this node's output table; nodes with the same form and
+        constants share it."""
+        tag = "_".join(f"{struct.unpack('<Q', struct.pack('<d', v))[0]:016x}"
+                       for v in self._params)
+        return f"s_host_gelu_{self.approximate}_lut_{zlib.crc32(tag.encode()):08x}"
+
+    def c_luts(self, dtype):
+        if not dtype.host_lut_bits:
+            return []
+        p1, p2 = self._params
+        form = "tanh" if self.approximate == "tanh" else "erf"
+        return [(self.lut_name,
+                 f"host_gelu_{form}_lut(&{self.lut_name}, {_c_double(p1)}, {_c_double(p2)})")]
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        if dtype.host_lut_bits:
+            return [f"host_lut_map({ins[0]}, {out}, {self.n}u, {self.lut_name});"
+                    f"  /* {self.describe()} */"]
+        p1, p2 = self._params
+        return [f"{self.helper.replace('gelu_', 'host_gelu_')}({ins[0]}, {out}, {self.n}u, "
+                f"{_c_double(p1)}, {_c_double(p2)});"]
 
     def reference(self, ins, dtype):
         v = np.asarray(ins[0], np.float64).reshape(-1)

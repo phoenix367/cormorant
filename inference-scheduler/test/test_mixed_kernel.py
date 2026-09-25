@@ -1350,10 +1350,17 @@ class TestTwoOutput(unittest.TestCase):
         self.assertIn("sync_from_device(Yrelu)", src)
 
     def test_one_sync_to_device(self):
-        """Only X is flushed before the first kernel call."""
+        """X is flushed and the two outputs are cleaned (no CPU-dirty line may
+        be evicted over a kernel's result) once, before the first kernel
+        call; nothing is flushed between kernels."""
         src = self.gen.generate_source()
-        self.assertIn("sync_to_device(X)", src)
-        self.assertNotIn("sync_to_device(Y", src)
+        body = src[src.index("void inference_run("):]
+        first_run = min(body.index(k) for k in ("run_op(", "run_op_act(", "run_matmul(")
+                        if k in body)
+        for b in ("X", "Yadd", "Yrelu"):
+            self.assertEqual(body.count(f"sync_to_device({b})"), 1, b)
+            self.assertLess(body.index(f"sync_to_device({b})"), first_run, b)
+        self.assertEqual(body.count("sync_to_device("), 3)
 
     def test_header_yrelu_size_uses_yadd_stride_macro(self):
         """INFERENCE_YRELU_SIZE must reference INFERENCE_YADD_CHUNK_STRIDE."""

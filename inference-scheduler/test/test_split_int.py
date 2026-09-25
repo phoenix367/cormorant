@@ -139,7 +139,7 @@ class TestSplitViews(_Base):
         g, cg = self.gen(p)
         a = next(sn for sn in g.nodes if isinstance(sn, SliceNode) and sn.output.onnx_name == "A")
         self.assertFalse(a.is_view)
-        self.assertIn("host_store(A, out, 4u, 6u, 8u);", cg.generate_source())
+        self.assertIn("host_out_done(A, out, 4u, 6u, 8u);", cg.generate_source())
         self.emu_pass(cg)
 
 

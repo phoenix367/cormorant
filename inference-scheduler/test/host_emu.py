@@ -10,7 +10,12 @@ test/test_inference.c are compiled unchanged against
     half last tile, depthwise stride, word-padded bias; NCHW x / y with
     implicit zero padding; whole-word tail writes zeroed) executed
     synchronously at Start;
-  * a malloc-backed inference_buf implementation (phys == virt).
+  * a malloc-backed inference_buf implementation (phys == virt), whose
+    buffers report ``cached`` = EMU_BUF_CACHED (default 1, the board's
+    default: host ops work in place in the buffers; 0 exercises the
+    non-cacheable staging path).  sync_to_device / sync_from_device are
+    no-ops here (``test_host_ops.TestCoherency`` checks the emitted sync
+    sequence instead).
 
 The harness fills the inputs, runs inference_run() and compares every output
 bit for bit with the scheduler simulation's expected arrays, exactly as on
@@ -30,6 +35,9 @@ _BUF_EMU = r"""
 #include "inference.h"
 #include <stdlib.h>
 #include <string.h>
+#ifndef EMU_BUF_CACHED
+#define EMU_BUF_CACHED 1
+#endif
 Data_t  *inference_buf_ptr(inference_buf_t *b)          { return (Data_t *)b->virt; }
 uint64_t inference_buf_phys(const inference_buf_t *b)   { return b->phys; }
 unsigned inference_buf_count(const inference_buf_t *b)  { return b->count; }
@@ -40,6 +48,7 @@ void inference_buf_init_view(inference_buf_t *v, inference_buf_t *base,
     v->virt  = (char *)base->virt + (size_t)off * INFERENCE_BYTES_PER_ELEM;
     v->phys  = base->phys + (uint64_t)off * INFERENCE_BYTES_PER_ELEM;
     v->count = count;
+    v->cached = base->cached;
 }
 int  inference_buf_pool_init(void)   { return 0; }
 void inference_buf_pool_deinit(void) {}
@@ -51,7 +60,7 @@ inference_buf_t *inference_buf_alloc(unsigned n)
     if (!b || posix_memalign(&m, 64, bytes ? bytes : 64)) { free(b); return NULL; }
     memset(m, 0xA5, bytes);            /* poison: nothing may rely on zeroed memory */
     b->virt = m; b->phys = (uint64_t)(uintptr_t)m; b->count = n;
-    b->refcount = 1u; b->is_owner = 1u;
+    b->refcount = 1u; b->is_owner = 1u; b->cached = EMU_BUF_CACHED;
     return b;
 }
 void inference_buf_retain(inference_buf_t *b)  { if (b && b->is_owner) b->refcount++; }
@@ -243,10 +252,16 @@ def which_cc():
     return shutil.which("cc") or shutil.which("gcc")
 
 
-def build_and_run(cg, workdir, timeout=600):
+def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems=None):
     """Write the project of CodeGenerator ``cg`` into ``workdir``, compile it
     against the software kernels and run test_inference.  Returns
-    (returncode, combined output)."""
+    (returncode, combined output).
+
+    ``cached``    buffers report a cacheable mapping (in-place host ops) or not
+                  (staging through s_host_stage);
+    ``threads``   INFERENCE_HOST_THREADS for the run (None: the default, 4);
+    ``min_elems`` -DINFERENCE_HOST_MIN_ELEMS (1 splits even tiny host ops
+                  over the threads)."""
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
     for kd in cg._active_kernels:
@@ -284,6 +299,8 @@ def build_and_run(cg, workdir, timeout=600):
     cmd = [which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
            "-Wno-unused-function", "-Wno-error=parentheses",
            f"-DEMU_TILE_M={MATMUL_TILE_M}", f"-DEMU_CONV_TILE_IC={CONV_TILE_IC}",
+           f"-DEMU_BUF_CACHED={1 if cached else 0}",
+           *([f"-DINFERENCE_HOST_MIN_ELEMS={min_elems}u"] if min_elems else []), "-pthread",
            f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', f'-DINFERENCE_EXPECTED_DIR="{workdir}"',
            "-I", inc, "-I", emu,
            os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
@@ -291,7 +308,11 @@ def build_and_run(cg, workdir, timeout=600):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return r.returncode, "COMPILE FAILED\n" + r.stdout + r.stderr
-    r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout, cwd=workdir)
+    env = dict(os.environ)
+    if threads is not None:
+        env["INFERENCE_HOST_THREADS"] = str(threads)
+    r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout, cwd=workdir,
+                       env=env)
     return r.returncode, r.stdout + r.stderr
 
 

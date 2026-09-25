@@ -385,12 +385,17 @@ class TestCodegen(_ModelDir):
         self.assertIn("/* [0] SpaceToDepth(X) -> X_s2d  [1, 3, 16, 16] → [1, 12, 8, 8]"
                       "  blocksize=2  (host CPU reorder, no hardware call) */", src)
         loop = src[src.index("INFERENCE_PROF_BEGIN(0u);"):src.index("INFERENCE_PROF_END(0u);")]
-        # staged through cached host memory: the DMA (BO) buffers are only
-        # touched by two sequential memcpys, never by the strided loads
-        self.assertIn("const Data_t *src = _s2d_stage_X_s2d;", loop)
-        self.assertIn("Data_t       *dst = _s2d_stage_X_s2d + 768u;", loop)
-        self.assertIn("memcpy(_s2d_stage_X_s2d, inference_buf_ptr(X), 768u * INFERENCE_BYTES_PER_ELEM);", loop)
-        self.assertIn("memcpy(inference_buf_ptr(X_s2d), _s2d_stage_X_s2d + 768u, 768u * INFERENCE_BYTES_PER_ELEM);", loop)
+        # a cacheable DMA buffer is reordered in place; a non-cacheable one is
+        # staged through cached host memory (only two sequential memcpys
+        # touch it, never the strided loads)
+        self.assertIn("if (inference_buf_is_cached(X)) {\n            src = inference_buf_ptr(X);", loop)
+        self.assertIn("memcpy(_s2d_stage_X_s2d, inference_buf_ptr(X), 768u * INFERENCE_BYTES_PER_ELEM);\n"
+                      "            src = _s2d_stage_X_s2d;", loop)
+        self.assertIn("dst0 = inference_buf_is_cached(X_s2d) ? inference_buf_ptr(X_s2d)"
+                      " : _s2d_stage_X_s2d + 768u;", loop)
+        self.assertIn("if (dst0 != inference_buf_ptr(X_s2d))\n"
+                      "            memcpy(inference_buf_ptr(X_s2d), dst0, 768u * INFERENCE_BYTES_PER_ELEM);",
+                      loop)
         self.assertLess(loop.index("memcpy(_s2d_stage_X_s2d,"), loop.index("*dst++"))
         self.assertLess(loop.index("*dst++"), loop.index("memcpy(inference_buf_ptr(X_s2d)"))
         self.assertLess(loop.index("memcpy(inference_buf_ptr(X_s2d)"), loop.index("inference_buf_sync_to_device(X_s2d);"))

@@ -78,6 +78,8 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   (memcpy-in from the non-cacheable BO mapping is the remaining cost, ~0.2
   GB/s), **ResNet-18 310 → 279.2 ms**, MobileNet v1 348.7 / v2 221.5 ms
   (unchanged: −2.5 ms stem, +3.0 ms reorder), predictions identical.
+  (Since BERT_PLAN phase 2B the BOs are mapped cacheable and the reorder
+  runs in place: 0.50 ms; ResNet-18 62.3 → 60.3 ms with the current bitstream.)
   Remaining lever for the 3 ms: allocate the buffer pool cacheable
   (XCL_BO_FLAGS_CACHEABLE, syncs already emitted) — decide separately, it
   changes every buffer's coherency model.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
