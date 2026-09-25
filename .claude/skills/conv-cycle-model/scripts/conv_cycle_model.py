@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.39;
---arch 37/38 reproduces the earlier steps for re-validating their reports).
+"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.42;
+--arch 37/38/39/40/41 reproduces the earlier steps for re-validating their reports).
 See SKILL.md for usage.  Constants come from platforms/<AXI_PLATFORM>.json."""
 import argparse, json, math, os, sys
 
@@ -24,6 +24,8 @@ def geom(P, in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw, dwise):
     chunks = -(-oh // per)
     winw = (kw - 1) * dw + 1
     owpt = min(ow, (P["COLS"] - winw) // sw + 1 if winw < P["COLS"] else 1)
+    if ARCH >= 42 and owpt > 1:
+        owpt = min(ow, owpt & ~1)                  # §2.42: even tile widths (pair boundaries)
     owt = -(-ow // owpt)
     return m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt
 
@@ -32,10 +34,20 @@ ROW_LOAD_LATENCY = 40    # first read data after a row's requests are issued
 DW_TILE_RAMP     = 10    # §2.37: one pipeline ramp per (mt, ow_tile) flat depthwise sweep
 DRAIN_SEG        = 256   # §2.38: Phase-3 transposer segment (pixels); one extra segment + ramps per chunk
 DRAIN_STEP_RAMP  = 6
-ARCH             = 41    # newest step modelled; overridden by --arch
+ARCH             = 42    # newest step modelled; overridden by --arch
 ROW_FILL_LATENCY = 12    # §2.39: per-row Phase-1 entry (the loader has the words parked in the FIFO)
 ROW_LOADER_SETUP = 64    # §2.39: per-row request loop + first-data DDR latency (~49) + merged-step ramp
 PIXEL_OVERHEAD   = 12    # standard path: per-(pixel, group) load / sweep / store loop ramps (was 6)
+
+def tile_pixel_units(ow, owpt, t, kh, kw):
+    """Sweep iterations per (row, tile) per m-tile: §2.42 processes output
+    columns in PAIRS aligned to even ow over max(kh*kw, 2) positions; before
+    that one pixel over kh*kw positions."""
+    ow_start = t * owpt; ow_end = min(ow, ow_start + owpt); tw = ow_end - ow_start
+    if ARCH >= 42:
+        n_pairs = ((ow_end - 1) >> 1) - (ow_start >> 1) + 1
+        return n_pairs * max(kh * kw, 2)
+    return tw * kh * kw
 
 def loader_row_cycles(ch, cols):
     """§2.39 x_row_loader time per input row: one 128-bit word per cycle for the
@@ -79,15 +91,17 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
-                    # §2.37 flat sweep: kh*kw cycles per pixel, one ramp per (mt, ow_tile)
-                    sweep += rows * tw * kh * kw + DW_TILE_RAMP
+                    # §2.37 flat sweep: kh*kw cycles per pixel, one ramp per (mt, ow_tile);
+                    # §2.42: max(kh*kw, 2) cycles per PAIR of pixels
+                    units = tile_pixel_units(ow, owpt, t, kh, kw)
+                    sweep += rows * units + DW_TILE_RAMP
                     if ARCH >= 39:
                         # §2.39: Phase 1 writes one column of all channels per cycle
                         # (serial with the sweep); the loader runs in parallel and
                         # only its excess over sweep + fill is exposed.
                         fill_c = in_rows * (cols + ROW_FILL_LATENCY)
                         ldr    = in_rows * loader_row_cycles(mv, cols)
-                        loads += fill_c + max(0, ldr - (rows * tw * kh * kw + fill_c))
+                        loads += fill_c + max(0, ldr - (rows * units + fill_c))
                     else:
                         loads += in_rows * (mv * cols + ROW_LOAD_LATENCY)
         else:
@@ -97,9 +111,11 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                 for t in range(owt):
                     tw = min(owpt, ow - t * owpt)
                     cols = min(in_w, (tw - 1) * sw + (kw - 1) * dw + 1)
+                    units = tile_pixel_units(ow, owpt, t, kh, kw)
                     if ARCH >= 41:
-                        # §2.41 flat sweep: G*kh*kw cycles per pixel, one ramp per (ict, owt, group)
-                        sweep_blk = sum(rows * tw * min(mtg, m_tiles - g * mtg) * kh * kw + PIXEL_OVERHEAD
+                        # §2.41 flat sweep: G*kh*kw cycles per pixel, one ramp per (ict, owt, group);
+                        # §2.42: G*max(kh*kw, 2) cycles per PAIR of pixels
+                        sweep_blk = sum(rows * units * min(mtg, m_tiles - g * mtg) + PIXEL_OVERHEAD
                                         for g in range(groups))
                     else:
                         sweep_blk = sum(rows * tw * (min(mtg, m_tiles - g * mtg) * kh * kw
@@ -115,7 +131,7 @@ def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt
                         mt0 = g * mtg; G = min(mtg, m_tiles - mt0)
                         mv_sum = sum(min(P["TILE_M"], out_ch - (mt0 + i) * P["TILE_M"]) for i in range(G))
                         f = mv_sum * kh * kw * lanes / E            # beats at 1/cycle
-                        s_ = (rows * tw * G * kh * kw + PIXEL_OVERHEAD) if ARCH >= 41 \
+                        s_ = (rows * units * G + PIXEL_OVERHEAD) if ARCH >= 41 \
                              else rows * tw * (G * kh * kw + 2 * G + PIXEL_OVERHEAD)
                         # §2.35 ping-pong: the NEXT slab's fill overlaps this sweep
                         # (one vector per sweep iteration, producer-bound at 2
@@ -181,7 +197,7 @@ def main():
     ap.add_argument("--platform", default=os.environ.get("AXI_PLATFORM", "kv260"))
     ap.add_argument("--case", nargs="+", type=int, metavar="N", help="C M H W kh kw [sh sw dh dw pt pl pb pr dw]")
     ap.add_argument("--validate", metavar="conv_test_report.json")
-    ap.add_argument("--arch", type=int, default=ARCH, help="model the kernel as of §2.<N> (37, 38, 39)")
+    ap.add_argument("--arch", type=int, default=ARCH, help="model the kernel as of §2.<N> (37 … 42)")
     a = ap.parse_args(); P = load_platform(a.platform)
     ARCH = a.arch
     if a.case:

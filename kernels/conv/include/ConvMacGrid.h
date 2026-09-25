@@ -99,40 +99,100 @@ inline void w_cache_store(
 }
 
 // ---------------------------------------------------------------------------
-// mac_grid_step — ONE kernel position on the kTileIC × kTileM grid (§2.24,
-// §2.29).
+// w_cache_read — the kTileM weight words of ONE kernel position (§2.42).
 //
-// Fires all kTileIC × kTileM products for the patch column p[] against the
-// weights of position (khi, kwi) of one m-tile: p[ic_l] is broadcast across
-// the kTileM output-channel columns, each column reduces its kTileIC
-// products through a private adder tree and adds the result into its own
-// accumulator acc[m1].  Both grid axes are spatial.
-//
-// The caller pipelines over kernel positions (and, since §2.29, over the
-// m-tiles of a group as well) at II=1: the only loop-carried recurrence is
-// acc[m1] += tree — a lone AccData_t add at distance 1 (the depthwise step
-// closes exactly the same recurrence).  The multiply + tree in front of it
-// is feed-forward.
-//
-// Bit-exactness: AccData_t is wrap-around fixed point, so the per-column
-// tree order gives results identical to any serial order.
-//
-// X-propagation guard (an RTL-only failure mode, C-sim would see zeros):
-// columns m1 >= m_valid of a partial last M tile are never written by the
-// fill, so their RAM words are 'X' in RTL.  The column's weight lanes are
-// MUXed to 0 on the way into the multipliers (m1 is a compile-time lane
-// number, m_valid a per-tile scalar: one 16-way AND per column that HLS
-// folds into the DSP input registers) so acc[m1] keeps its defined value;
-// those lanes are padding in the §2.23 word layout and are never drained.
-// Masking the column's TREE instead (a 32-bit mux in front of the
-// accumulator add) cost one more pipeline stage on the fused sweep loop
-// (iteration latency 6 -> 7 = +1 cycle per pixel ramp) — §2.40 trap.
+// Reads one WeightVec per m1 column (the array is a compile-time choice) at
+// the flat address w_addr and applies the X-propagation guard: columns
+// m1 >= m_valid of a partial last M tile are never written by the fill, so
+// their RAM words are 'X' in RTL.  The column's weight lanes are MUXed to 0
+// on the way into the multipliers (m1 is a compile-time lane number, m_valid
+// a per-tile scalar: one 16-way AND per column that HLS folds into the DSP
+// input registers) so the accumulator keeps its defined value; those lanes
+// are padding in the §2.23 word layout and are never drained.  Masking the
+// column's TREE instead (a 32-bit mux in front of the accumulator add) cost
+// one more pipeline stage on the sweep loop — §2.40 trap.
 // Input-channel pad lanes need no mask (§2.40): every w_cache word that is
 // ever read was written with all kTileIC lanes defined — the producer
 // zero-initialises the vector and the packed DDR layout carries zeros in
 // the lanes past in_ch (ConvKernel.h) — and the patch producer zero-pads
-// its lanes >= ch_valid, so those products are 0·0.  The per-lane mask the
-// 8-column grid carried cost 16 LUT per lane (4 k LUT at 256 lanes).
+// its lanes >= ch_valid, so those products are 0·0.
+//
+// §2.42: the read is separate from the multiply so the TWO output pixels
+// of one sweep iteration share a single RAM read per column — calling a
+// read-and-multiply step twice would be two reads per RAM per cycle (II=2
+// or a duplicated cache).
+// ---------------------------------------------------------------------------
+inline void w_cache_read(
+    const WeightVec w_lo[kWCacheBramCols][kWCacheWords],   // columns [0, kWCacheBramCols)
+    const WeightVec w_hi[kWCacheUramCols][kWCacheWords],   // columns [kWCacheBramCols, kTileM)
+    unsigned        w_addr,                        // w_cache_addr(bank, t, khi, kwi)
+    unsigned        m_valid,
+    WeightVec       w[kTileM]                      // masked words, one per column
+) {
+    #pragma HLS INLINE
+    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+        #pragma HLS UNROLL
+        WeightVec raw;
+        if (m1 < kWCacheBramCols) raw = w_lo[m1][w_addr];
+        else                      raw = w_hi[m1 - kWCacheBramCols][w_addr];
+        const bool col_ok = (m1 < m_valid);
+        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+            #pragma HLS UNROLL
+            w[m1].lane[ic_l] = col_ok ? raw.lane[ic_l] : Data_t(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mac_grid_column_step — ONE kernel position of ONE pixel on the
+// kTileIC × kTileM grid (§2.24, §2.29, §2.42).
+//
+// Fires all kTileIC × kTileM products for the patch column p[] against the
+// (already read and masked) weight words w[] of one kernel position: p[ic_l]
+// is broadcast across the kTileM output-channel columns, each column
+// reduces its kTileIC products through a private adder tree and adds the
+// result into its own accumulator acc[m1].  Both grid axes are spatial.
+//
+// seed / use_seed (§2.42): the accumulator word read from partial_outputs
+// enters the column's adder tree as one more leaf when use_seed is set,
+// instead of being muxed into the recurrence.  AccData_t is wrap-around
+// fixed point, so adding the seed at ANY position of the window gives the
+// same bits — the two pixels of an iteration can therefore take their
+// seeds at different positions (pixel 0 at position 0, pixel 1 at position
+// 1) and share the single URAM read port.
+//
+// The caller pipelines over kernel positions (and the m-tiles of a group)
+// at II=1: the only loop-carried recurrence is acc[m1] += tree — a lone
+// AccData_t add at distance 1 (the depthwise step closes exactly the same
+// recurrence).  The multiply + tree in front of it is feed-forward.
+//
+// Bit-exactness: AccData_t is wrap-around fixed point, so the per-column
+// tree order gives results identical to any serial order.
+// ---------------------------------------------------------------------------
+inline void mac_grid_column_step(
+    const Data_t    p[kTileIC],
+    const WeightVec w[kTileM],
+    const AccData_t seed[kTileM],
+    bool            use_seed,
+    AccData_t       acc[kTileM]
+) {
+    #pragma HLS INLINE
+    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+        #pragma HLS UNROLL
+        AccData_t tree = use_seed ? seed[m1] : AccData_t(0);
+        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+            #pragma HLS UNROLL
+            // 16×16 Data_t multiply (one DSP48); the ap_fixed product of
+            // two ap_fixed<16,8> is exactly AccData_t.
+            tree += p[ic_l] * w[m1].lane[ic_l];
+        }
+        acc[m1] += tree;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mac_grid_step — read + one pixel's column step (the pre-§2.42 form; the
+// unit-test surface below and any single-pixel caller).
 // ---------------------------------------------------------------------------
 inline void mac_grid_step(
     const Data_t    p[kTileIC],
@@ -145,23 +205,16 @@ inline void mac_grid_step(
 ) {
     #pragma HLS INLINE
     (void)ic_valid;
+    WeightVec w[kTileM];
+    #pragma HLS ARRAY_PARTITION variable=w complete dim=0
+    w_cache_read(w_lo, w_hi, w_addr, m_valid, w);
+    AccData_t no_seed[kTileM];
+    #pragma HLS ARRAY_PARTITION variable=no_seed complete dim=0
     for (unsigned m1 = 0; m1 < kTileM; m1++) {
         #pragma HLS UNROLL
-        // One word per m1 RAM column; the array is a compile-time choice.
-        WeightVec w;
-        if (m1 < kWCacheBramCols) w = w_lo[m1][w_addr];
-        else                      w = w_hi[m1 - kWCacheBramCols][w_addr];
-        const bool col_ok = (m1 < m_valid);
-        AccData_t tree = 0;
-        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
-            #pragma HLS UNROLL
-            const Data_t w_val = col_ok ? w.lane[ic_l] : Data_t(0);
-            // 16×16 Data_t multiply (one DSP48); the ap_fixed product of
-            // two ap_fixed<16,8> is exactly AccData_t.
-            tree += p[ic_l] * w_val;
-        }
-        acc[m1] += tree;
+        no_seed[m1] = AccData_t(0);
     }
+    mac_grid_column_step(p, w, no_seed, false, acc);
 }
 
 // ---------------------------------------------------------------------------

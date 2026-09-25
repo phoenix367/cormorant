@@ -1515,6 +1515,163 @@ int main(int argc, char** argv)
         total_failures += run_test("DW 3x3 s2 pad=1, 16ch, 27x29 (unaligned x rows)", p, x, w, b);
     }
 
+    // -----------------------------------------------------------------------
+    // §2.42 pair-sweep cases (RTL fixtures, kept small).  The consumer
+    // processes output columns in pairs aligned to even ow; these cover
+    // every way a pair can be half outside the tile: odd out_w (the last
+    // pair's odd pixel past the row), out_w = 1, an odd ow_start (a tile
+    // width that is forced to 1), stride 2 with odd and even out_w, the
+    // ow-tile rounding to an even width, dilation, and the space-to-depth
+    // stem geometry with an odd row length.
+    // -----------------------------------------------------------------------
+    {
+        // 3x3 s2 pad 1, 16 -> 32 ch on 15x13: out 8x7 (odd ow, 2 m-tiles).
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileIC; p.in_h=15; p.in_w=13; p.out_ch=kTileM*2;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: 3x3 s2 16->32ch on 15x13 -> 8x7 (odd ow)", p, x, w, b);
+    }
+    {
+        // 3x3 s2 pad 1, 8 -> 8 ch on 12x16: out 6x8 (even ow, stride 2).
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=12; p.in_w=16; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=false; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: 3x3 s2 8->8ch on 12x16 -> 6x8 (even ow)", p, x, w, b);
+    }
+    {
+        // out_w = 1 with 3 ic-tiles and 2 m-tiles: every pair is a half pair.
+        ConvParams p{};
+        p.batch=1; p.in_ch=40; p.in_h=6; p.in_w=3; p.out_ch=kTileM+5;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.05f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: out_w=1, 40->21ch 3x3 on 6x3", p, x, w, b);
+    }
+    {
+        // 3x3 s2 on in_w=128: ow_per_tile = (64-3)/2+1 = 31, rounded to 30
+        // -> 3 tiles (30, 30, 4) of out_w = 64; in_h 6 -> out_h 3.
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=6; p.in_w=128; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: ow-tiling 3x3 s2 in_w=128 (tiles 30+30+4)", p, x, w, b);
+    }
+    {
+        // 1x1 on in_w=130: ow_per_tile = 64 -> tiles (64, 64, 2); the 1x1
+        // dummy position with M-grouping and tile boundaries.
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=4; p.in_w=130; p.out_ch=8;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.2f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: 1x1 ow-tiling in_w=130 (tiles 64+64+2)", p, x, w, b);
+    }
+    {
+        // Dilation 2 with stride 2 and an odd out_w: in 13x17 pad 2 -> 6x8...
+        // pad (2,2): out_w = (17 + 4 - 5)/2 + 1 = 9 (odd), out_h = 7.
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=13; p.in_w=17; p.out_ch=kTileM+1;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=2; p.dilation_w=2;
+        p.pad_top=2; p.pad_left=2; p.pad_bottom=2; p.pad_right=2;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.25f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.1f,  rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+        total_failures += run_test("pairs: 3x3 s2 d2 8->17ch on 13x17 -> 7x9", p, x, w, b);
+    }
+    {
+        // Space-to-depth stem shape (RESNET18_15FPS_PLAN step 1): 12 ch,
+        // 4x4 s1, pad top/left 2, implicit bottom/right 1, on an ODD-width
+        // 11x13 input -> 11x13 output, 16 ch.
+        ConvParams p{};
+        p.batch=1; p.in_ch=12; p.in_h=11; p.in_w=13; p.out_ch=16;
+        p.kh=4; p.kw=4; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=2; p.pad_left=2; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f,  rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.15f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.2f, rng);
+        total_failures += run_test("pairs: s2d stem 12ch 4x4 s1 pad [2,2,1,1] on 11x13", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.42 depthwise pair cases: a 1x1 depthwise (the dummy second
+    // position of the pair window, odd out_w) and a 3x3 s2 with odd out_w
+    // on a partial tile.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=kTileM+3; p.in_h=5; p.in_w=7; p.out_ch=kTileM+3;
+        p.kh=1; p.kw=1; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=true; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW pairs: 1x1 19ch on 5x7 (dummy position, odd ow)", p, x, w, b);
+    }
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=8; p.in_h=9; p.in_w=11; p.out_ch=8;
+        p.kh=3; p.kw=3; p.stride_h=2; p.stride_w=2;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+        p.has_bias=false; p.is_depthwise=true;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 1.0f, rng);
+        auto w = rand_vec<Data_t>(p.out_ch*1*p.kh*p.kw,           0.5f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.5f, rng);
+        total_failures += run_test("DW pairs: 3x3 s2 8ch on 9x11 -> 4x5 (odd ow)", p, x, w, b);
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.42 sweep-bound anchor: 3x3 64 -> 64 ch on 28x28 pad 1 (the ResNet-18
+    // stage-2 layer class at a quarter of its size).  The older 64-channel
+    // anchors have in_ch = 8 on 16x16, where the MAC sweep is only ~60 % of
+    // the case; here it is ~85 %, so this fixture is what a MAC-grid change
+    // must move by its full factor (the cycle model predicts -44 % for two
+    // pixels per cycle).  ~29 M MACs; ~0.5 ms of simulated time.
+    // -----------------------------------------------------------------------
+    {
+        ConvParams p{};
+        p.batch=1; p.in_ch=64; p.in_h=28; p.in_w=28; p.out_ch=64;
+        p.kh=3; p.kw=3; p.stride_h=1; p.stride_w=1;
+        p.dilation_h=1; p.dilation_w=1;
+        p.pad_top=1; p.pad_left=1; p.pad_bottom=1; p.pad_right=1;
+        p.has_bias=true; p.is_depthwise=false;
+        auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.2f,  rng);
+        auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.02f, rng);
+        auto b = rand_vec<Data_t>(p.out_ch, 0.05f, rng);
+        total_failures += run_test("3x3 64->64ch on 28x28 pad 1 (sweep-bound anchor)", p, x, w, b);
+    }
+
 #ifdef CONV_HAVE_APFIXED
     // -----------------------------------------------------------------------
     // Test 19: Saturation — positive overflow

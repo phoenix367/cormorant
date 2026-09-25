@@ -75,6 +75,71 @@ static int test_standard(unsigned kh, unsigned kw, unsigned ic_valid, unsigned m
     return bad;
 }
 
+// §2.42: two pixels against one weight read, with the accumulator seeds
+// entering the adder trees at DIFFERENT positions (pixel 0 at position 0,
+// pixel 1 at position 1).  The result must equal the plain seeded sweep.
+static int test_pair(unsigned kh, unsigned kw, unsigned m_valid)
+{
+    Data_t    patch[2][kTileIC][kMaxKH][kMaxKW];
+    WeightVec w_lo[kWCacheBramCols][kWCacheWords];
+    WeightVec w_hi[kWCacheUramCols][kWCacheWords];
+    auto wcol = [&](unsigned m, unsigned a) -> WeightVec& {
+        return (m < kWCacheBramCols) ? w_lo[m][a] : w_hi[m - kWCacheBramCols][a];
+    };
+    AccData_t seed[2][kTileM], acc[2][kTileM], ref[2][kTileM];
+
+    for (unsigned c = 0; c < kTileIC; c++)
+        for (unsigned i = 0; i < kMaxKH; i++)
+            for (unsigned j = 0; j < kMaxKW; j++) {
+                patch[0][c][i][j] = rnd(2.0f);
+                patch[1][c][i][j] = rnd(2.0f);
+                for (unsigned m = 0; m < kTileM; m++)
+                    wcol(m, w_cache_addr(0, 0, i, j)).lane[c] = rnd(1.0f);
+            }
+    for (unsigned h = 0; h < 2; h++)
+        for (unsigned m = 0; m < kTileM; m++) {
+            seed[h][m] = AccData_t(rnd(8.0f));
+            // Lanes >= m_valid: the masked columns add nothing, so the
+            // accumulator keeps the seed (as the kernel's word does).
+            ref[h][m]  = seed[h][m];
+            acc[h][m]  = 0;
+        }
+    for (unsigned h = 0; h < 2; h++)
+        for (unsigned m = 0; m < m_valid; m++)
+            for (unsigned c = 0; c < kTileIC; c++)
+                for (unsigned i = 0; i < kh; i++)
+                    for (unsigned j = 0; j < kw; j++)
+                        ref[h][m] += patch[h][c][i][j] * wcol(m, w_cache_addr(0, 0, i, j)).lane[c];
+
+    // The kernel's pair window: max(kh*kw, 2) positions, seeds at 0 / 1.
+    const unsigned n_pos = kh * kw, n_win = (n_pos < 2) ? 2 : n_pos;
+    unsigned khi = 0, kwi = 0;
+    for (unsigned pos = 0; pos < n_win; pos++) {
+        const bool at_pos = pos < n_pos;
+        Data_t p0[kTileIC], p1[kTileIC];
+        for (unsigned c = 0; c < kTileIC; c++) {
+            p0[c] = at_pos ? patch[0][c][khi][kwi] : Data_t(0);
+            p1[c] = at_pos ? patch[1][c][khi][kwi] : Data_t(0);
+        }
+        WeightVec w[kTileM];
+        w_cache_read(w_lo, w_hi, w_cache_addr(0, 0, khi, kwi), m_valid, w);
+        mac_grid_column_step(p0, w, seed[0], pos == 0, acc[0]);
+        mac_grid_column_step(p1, w, seed[1], pos == 1, acc[1]);
+        if (pos + 1 < n_pos && ++kwi == kw) { kwi = 0; khi++; }
+    }
+
+    int bad = 0;
+    for (unsigned h = 0; h < 2; h++)
+        for (unsigned m = 0; m < kTileM; m++)
+            if (acc[h][m] != ref[h][m]) {
+                if (bad < 3)
+                    std::printf("  PAIR kh=%u kw=%u m_valid=%u px %u lane %u: got %f ref %f\n",
+                                kh, kw, m_valid, h, m, (double)acc[h][m], (double)ref[h][m]);
+                bad++;
+            }
+    return bad;
+}
+
 static int test_depthwise(unsigned kh, unsigned kw)
 {
     Data_t    patch[kTileIC][kMaxKH][kMaxKW];
@@ -123,6 +188,9 @@ int main(int argc, char** argv)
                         failures += test_standard(kh, kw, icv, mv); cases++;
                     }
                 failures += test_depthwise(kh, kw); cases++;
+                for (unsigned mv = 1; mv <= kTileM; mv++) {
+                    failures += test_pair(kh, kw, mv); cases++;
+                }
             }
     }
     std::printf("%d grid cases, %d lane mismatch(es)\n", cases, failures);

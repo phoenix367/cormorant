@@ -70,6 +70,9 @@ after running the full TestConvRef case list.
 | + flat depthwise sweep (§2.37) | 40 | 7,666,615 | **-4.0 %** | — |
 | + 8-lane drain, 128-bit y with byte strobes (§2.38) | 43 (39 common) | 6,093,330 (common) | **-20.4 %** | — |
 | + 128-bit x, `x_row_loader` split (§2.39) | 43 (39 common) | 5,537,890 (common; 7,744,540 all 43) | **-9.1 %** (-10.0 % on the 42 common with §2.38) | -30.5 % vs the §2.36 snapshot |
+| + 16 × 16 MAC grid (§2.40) | 46 | 7,488,000 | -3.3 % (the 64-ch 3×3 anchors -41…-43 %) | — |
+| + flat standard sweep (§2.41) | 48 | 4,393,960 (4,408,535 re-measured on `perf/conv2px`) | **-41.3 %** | — |
+| + two output pixels per cycle (§2.42) | 58 (47 common) | 3,385,480 (common; 3,683,195 all 57 of the first run) | **-23.0 %** on the 47 common cases | — |
 
 **Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
@@ -2018,6 +2021,171 @@ s2 downsample 3.6 → 0.54 / 0.41 / 0.39 ms; `1x1-64to128-56x56` 14.6 →
 
 ---
 
+### 2.42. Two output pixels per cycle — 512 MACs/cycle against one weight word
+
+**Problem.**  After §2.40/§2.41 the sixteen 3×3 layers of ResNet-18 run
+at 89–97 % of the 256-MAC grid (70 ms of 91 ms on the board,
+RESNET18_15FPS_PLAN.md §3.1), so the only lever left below 150 MHz is
+more MACs per cycle.  The grid cannot grow along M: the weight cache is
+width-bound — every column costs 4 BRAM36 or 4 URAM (72-bit ports)
+whatever its depth — and the routed design has 32 BRAM tiles and 16 URAM
+left.  Along IC it cannot grow either (the packed weight layout and the
+line buffer are 16-lane).  What is free is **the second use of every
+weight word**: two horizontally adjacent output pixels need the same
+weight at the same kernel position, so multiplying both against ONE
+cache read doubles the MAC count while the cache, the accumulator URAM
+and the line buffer keep their size.
+
+**Change.**
+
+1. **Patch stream of pixel pairs.**  The producer's Phase 2 iterates
+   `(pair, khi, kwi)` instead of `(ow, khi, kwi)` and emits a `PatchPair
+   { PatchVec px[2]; }` (512 bits) per position: the 16 channel lanes of
+   output columns `ow_a` (even) and `ow_a + 1`, whose input columns are
+   `stride_w` apart.  Both columns are read from `line_buf` in the same
+   cycle through the two ports of each channel bank (`BIND_STORAGE
+   type=RAM_T2P impl=BRAM`; a 1024 × 16-bit bank is one BRAM18 in TDP
+   mode, so the 16 BRAM18 are unchanged — Phase 1 writes through one
+   port in its own loop).  Pairs are aligned to EVEN output columns,
+   `ow_per_tile` is rounded down to an even number so tile boundaries
+   are pair boundaries (`compute_ow_tiling`; 3×3 s2 tiles are 30 wide
+   instead of 31), and a pixel of a pair outside `[ow_start, ow_end)` —
+   the odd column past an odd `out_w`, or the even column before the
+   odd `ow_start` a width-1 tile can have — is emitted as zeros.  Beats
+   per pair and group: `kh·kw`, as one pixel used to cost, so the
+   producer's rate is unchanged and the stream FIFO is twice as wide
+   (49 × 512 bits, still LUTRAM).
+2. **Sweep over pairs.**  The flat standard loop (§2.41) iterates
+   `(oh_local, pair, g, pos)` with `pos` over `n_win = max(kh·kw, 2)`
+   positions.  Per iteration: ONE masked weight word per column
+   (`w_cache_read`, the `m1 < m_valid` guard applied once and shared),
+   two column steps (`mac_grid_column_step` — 2 × 16 private 16-input
+   adder trees into distance-1 `acc0[m1] += tree0`, `acc1[m1] += tree1`;
+   the grid's read and multiply were split so the second pixel is not a
+   second RAM read), and the §2.35 prefetch as before.  Tile 0 of a
+   pair parks both patch columns in `patch0` / `patch1` (2 × 16 LUTRAM
+   banks), tiles 1..G−1 replay them.  Only one tile's accumulators are
+   live at a time (the g loop is inside the pair loop), so the
+   runtime-`g` `acc[4][16]` of §2.41 became plain `acc0/acc1[16]` — the
+   ~6 k LUT of accumulator muxes §2.40 trap 3 identified are gone,
+   which pays for most of the second set of trees.
+3. **One URAM read and one URAM write per iteration.**  `partial_outputs`
+   keeps its one-pixel 512-bit word layout (§2.23: Phase 1, Phase 3 and
+   the 8 URAM are untouched) and its `RAM_2P` binding, so the two
+   pixels' accumulator words are STAGGERED over the window: pixel 0's
+   word is read at position 0 and pixel 1's at position 1; each enters
+   its pixel's adder trees as a 17th leaf at that position (`seed`,
+   `use_seed` in `mac_grid_column_step` — AccData_t is wrap-around fixed
+   point, so where in the window the seed is added does not change a
+   single bit, TestConvGrid checks it lane-exact).  Pixel 0's word is
+   stored at the last position; pixel 1's result is captured in `hold`
+   and stored at the NEXT block's position 0 (one muxed store per
+   iteration; a tail store after the loop for the last block).  A 1×1
+   gets a dummy second position (zero patches against the position-0
+   weights, which are written and X-free) so its two loads and two
+   stores still spread over two cycles: a 1×1 costs the same one cycle
+   per pixel as before — those layers are drain-bound anyway and were
+   not the target.  Every (pixel, tile) word is still loaded once and
+   stored once per sweep, the store after the load, so the `DEPENDENCE
+   inter dependent=false` of §2.41 stands.
+4. **Depthwise** got the same treatment (`mac_dw_step` twice per beat,
+   seeds from the bias register, the same held second store): 32 MACs
+   per cycle, `max(kh·kw, 2)` cycles per pair.
+5. **Producer / loader / weights / bias / Phase 1 / Phase 3 / ports /
+   registers / scheduler**: unchanged.  The drain keeps up: a 3×3 64-ch
+   sweep finishes 128 outputs per 36 cycles (3.6 per cycle) against the
+   8-per-cycle Phase-3 path; for 1×1 layers Phase 3 was and remains the
+   bound (cycle model: `1x1-64to128-56x56` unchanged at ~195 k cycles).
+
+**Waste.**  One pixel of the last pair of every row when `out_w` is odd
+(≤ 1/out_w: 1/7 on the 7×7 layers, 1/13 on 13-wide, 0 on the 56², 28²,
+14² layers), and one pixel-step per tile boundary when `ow_per_tile`
+has to be 1.
+
+**Traps.**  None cost a synthesis round this time; three were designed
+around: (1) calling the read-and-multiply `mac_grid_step` twice would
+have been two reads per weight RAM per cycle (II=2 or a duplicated
+cache) — split the read out; (2) two conditional stores to
+`partial_outputs` in one loop body can make HLS allocate two write
+ports — the hold store and the pixel-0 store are ONE store with a muxed
+address / data; (3) the 1×1 dummy position must not advance `(khi,
+kwi)` onto a never-written cache word (`0 · X = X` in RTL) — the
+counters advance only onto a real position.
+
+**Synthesis** (kv260 @ 150 MHz target).  II=1 on every PIPELINE loop,
+the pair sweep at iteration latency **8** (unchanged from §2.41), top
+slack 0.00 (consumer block 0.01), all four ports `128 -> 128`, no
+partial writes, no `SCHED 204-65`, no RAM duplication.  §2.41 → §2.42:
+DSP **407 → 679** (+272: 256 grid + 16 depthwise multipliers), LUT
+**87.0 k → 99.4 k** (+12.4 k csynth — the sweep loop 17.6 k → 25.9 k,
+the producer 5.5 k → 6.1 k), FF 62.2 k → 66.5 k, BRAM18 **127**
+unchanged (line_buf 16 as RAM_T2P, w_lo 64), URAM **48** unchanged.
+Routed-equivalent estimate (csynth over-estimates ConvKernel LUT ~2.4×,
+35.7 k routed vs 87 k estimated): ConvKernel ≈ **35.7 k → 41 k LUT**
+(+5 k), design ≈ 85.1 k → 90 k of 117.1 k (77 %); DSP 661 → **933** of
+1248 (the plan's "≈ 930"); BRAM 111.5 and URAM 48 tiles unchanged.
+
+**Result.**  **58/58 RTL PASS** (the 57-case suite plus the sweep-bound anchor below),
+bit-exact (grid 40 131 cases incl. the pair step / named 58 / sweep 300 ×
+2 seeds), **−23.0 %** on the 47 cases common with §2.41 (4 393 960 →
+3 385 480 ns; the suite is dominated by the two write-bound 1×1 cases and
+by one-ramp stubs).  RTL, same fixture geometry, §2.41 → §2.42:
+
+| Case | §2.41 | §2.42 | Δ | model §2.42 |
+|---|---:|---:|---:|---:|
+| **3×3 64→64 on 28×28 (sweep-bound anchor, new; run alone on both IPs)** | 1 274 695 | 710 225 | **−44.3 %** | +2.6 % |
+| M-grouping 7×7 s2 stem 3→40 | 435 160 | 247 030 | **−43.2 %** | +3 % |
+| 14×14 multi-tile M and IC (3×3, 35→33 ch) | 194 170 | 114 790 | **−40.9 %** | +8 % |
+| oh-chunking standard 32×32×32 (3×3) | 277 650 | 185 520 | −33.2 % | −1 % |
+| M-grouping 80ch 7×7 s2 stem 24×24 | 443 730 | 296 800 | −33.1 % | −5 % |
+| ow-tiling in_w=128 (3×3, 3 tiles) | 139 560 | 93 430 | −33.1 % | +5 % |
+| M-grouping batch=2 dil=2 s_h=2 (40 ch) | 159 280 | 107 480 | −32.5 % | +10 % |
+| DW oh-chunking 32ch 32×32 | 285 050 | 192 950 | −32.3 % | −9 % |
+| DW 3×3 12ch 33×37 | 167 190 | 113 720 | −32.0 % | +24 % |
+| M-grouping standard (64 ch 3×3, 16×16, in_ch 8) | 149 530 | 103 420 | −30.8 % | −3 % |
+| M-grouping 80ch batch=2 dil=2 s_h=2 | 268 210 | 186 140 | −30.6 % | 0 % |
+| M-grouping 80ch in_h=17 | 206 490 | 145 320 | −29.6 % | +9 % |
+| M-grouping in_h=17 (64 ch 3×3, in_ch 8) | 176 080 | 127 160 | −27.8 % | −2 % |
+| DW 3×3 s2 16ch 27×29 | 64 370 | 63 150 | −1.9 % (loader-bound) | |
+| 1×1 32→16 on 40×64 / 1×1 8→8 on 121×75 | 257 390 / 467 350 | 255 540 / 463 570 | −0.7 / −0.8 % (write-bound) | |
+| 1×1 s2 24→80 / 1×1 s1 40→21 / 1×1 IC·2 M·2 | | | ±0 % (1 cycle per pixel as before) | |
+| small 3×3 / 5×5 stubs (one ramp long) | | | −1 … −9 % | |
+| saturation stubs (3×3 of 1 channel) | ~10 k | ~10.3 k | +3 … +5 % (one dummy position per 1×1 pair) | |
+
+New pair fixtures: `3x3 s2 16→32 on 15x13 → 8x7` 41 710 ns, `3x3 s2 8→8 on
+12x16 → 6x8` 22 090, `out_w=1 40→21` 39 890, `ow-tiling 3x3 s2 in_w=128
+(30+30+4)` 36 800, `1x1 ow-tiling in_w=130 (64+64+2)` 34 660, `3x3 s2 d2
+8→17 on 13x17 → 7x9` 28 190, `s2d stem 12ch 4x4 on 11x13` 37 380, `DW 1x1
+19ch on 5x7` 24 260, `DW 3x3 s2 8ch on 9x11 → 4x5` 18 160.
+
+**Why the old 64-channel anchors move −28 … −31 % and not −44 %.**  They
+are 16×16 / 17×17 layers with `in_ch = 8`: one half-filled ic-tile, so
+their sweep was only ~63 % of the case (cycle model, `--arch 41`) and the
+rest — Phase 1 (1 024 cycles), Phase 3 (2 048 + ramps), the first slab's
+weight fill (576), the row loads — is unchanged by this step; halving
+the 63 % gives −31 %, which is exactly what the RTL shows and what the
+`--arch 42` model predicts within 3 % on both.  The cases whose sweep
+dominates moved by the full factor: the 7×7 stem (85 % MAC) −43 %, the
+14×14 multi-tile −41 %, and the new sweep-bound anchor above (87 % MAC,
+the ResNet-18 stage-2 class at a quarter size) −44.3 %.  There is no
+new bottleneck: the model's residual on the > 20 k-cycle cases is 5.0 %
+(`--validate`, 3.3 % on the 64-ch anchor) and every 1×1 case is
+unchanged by construction.  Cycle model (`--arch 42`: `G · max(kh·kw, 2)`
+cycles per pixel PAIR, even `ow_per_tile`): 22.6 % mean error over all 57
+cases (the sub-2 k-cycle stubs are now dominated by the fixed
+`INVOKE_OVERHEAD`), **5.0 %** on the > 20 k-cycle cases.
+
+**Model-based board outcome (100 MHz).**  ResNet-18's sixteen 3×3
+layers 70.4 ms (§3.1 board) → **~40 ms** (`64→64 @56²`: 509.6 k → 284.4 k
+cycles, −44 %; the 512-ch 7² layers with odd `out_w = 7` waste 1/7 of
+their pairs, −40 %); the stem 4×4 12→64 on 112² −45 %; the depthwise
+layers −36 % (`dw-3x3-64ch-56x56` 157.7 k → 101.3 k cycles); the 1×1
+layers unchanged.  Perf cases: `3x3-64ch-56x56` 4.94 → ~2.8 ms,
+`3x3-64ch-28x28` 1.27 → ~0.75, `dw-3x3-64ch-56x56` 1.58 → ~1.05,
+`1x1-64to128-56x56` 1.84 → 1.84.  Board numbers pending integration.
+
+---
+
 ### On board after §2.37–§2.39 (2026-09-26, bitstream WNS +1.06 ns, ConvKernel_0 x/y instances at 128)
 
 144/144 scheduler models PASS, including the partial-strobe run edges
@@ -2041,7 +2209,7 @@ v1 444 → **349 ms**, ResNet-18 345 → **311 ms**, MNIST convnet 0.813 →
 Cumulative vs the original README: MobileNet v1 7.1×, v2 8.3×, ResNet-18
 7.9×.
 
-## 3. Current architecture (post-§2.39)
+## 3. Current architecture (post-§2.42)
 
 ```mermaid
 flowchart LR
@@ -2050,7 +2218,7 @@ flowchart LR
     DDR_B[("bias<br/>gmem2")]
     DDR_Y[("y<br/>gmem3")]
     XRL["x_row_loader<br/><i>128-bit x words → 16-channel column vectors (§2.39)</i><br/>owns the ping-pong row buffer"]
-    IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf, one column of all channels written per cycle (§2.39)<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchVec out (§2.12)</i>"]
+    IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf (RAM_T2P), one column of all channels written per cycle (§2.39), two columns read per cycle (§2.42)<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchPair out (§2.12, §2.42)</i>"]
     SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
     PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35) + Phase-3 transposer (§2.38)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); flat depthwise sweep (§2.37); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
@@ -2124,21 +2292,28 @@ reader out of the patch producer), all running concurrently:
    the inner loop reading patch from `patch_stream` and weights from
    `w_cache` (one slab per `(ict, ow_tile, mg)`, the next slab
    prefetched into the other bank under the sweep since §2.35) and running:
-   - Standard: an II=1 lane-rotated reduce with a `kTileIC`-wide PN
-     adder tree (§2.8) → **kTileIC MACs/cycle**.
-   - Depthwise: an II=1 PM-wide channel-parallel reduce (§2.8) →
-     **kTileM MACs/cycle**.
+   - Standard: ONE flat II=1 sweep per `(ict, ow_tile, mg)` over
+     `(oh_local, ow pair, g, pos)` (§2.41, §2.42): 16 weight columns read
+     once per cycle, 2 × 16 private 16-input adder trees →
+     **2 × kTileIC × kTileM = 512 MACs/cycle**.
+   - Depthwise: ONE flat II=1 sweep per `(mt, ow_tile)` over
+     `(oh_local, ow pair, pos)` (§2.37, §2.42) → **2 × kTileM = 32
+     MACs/cycle**.
    Phase 3 drains the chunk's `partial_outputs` to `acc_stream`.
 5. **`write_output_tile`** — saturates `AccData_t → Data_t` and writes
    to `gmem3` in `(ni, oh, ow, mt, m1)` order.  Chunk-/tile-agnostic —
    the consumer's drain phase concatenates the per-chunk sub-ranges
    into the linear stream order this stage expects.
 
-**Loop nest** (consumer, standard path, post-§2.11):
-`(ni, chunk, ict, ow_tile, mg, oh_in_chunk, ow_in_tile, mt_in_group)`
-with a PN-wide lane-rotated inner reduction reading from `w_cache`.
-Depthwise consumer: `(ni, chunk, mt, ow_tile, oh_in_chunk, ow_in_tile)`
-with a PM-wide parallel reduce and `w_buf` cached across all ow_tiles.
+**Loop nest** (consumer, standard path, post-§2.42):
+`(ni, chunk, ict, ow_tile, mg) × [flat: oh_in_chunk, ow pair,
+mt_in_group, pos]` with the 2 × 16 × 16 grid reading one word per
+`w_cache` column per cycle.  Depthwise consumer: `(ni, chunk, mt,
+ow_tile) × [flat: oh_in_chunk, ow pair, pos]` with `w_buf` cached across
+all ow_tiles.  (The per-`(oh, ow)` cycle tables below describe the
+pre-§2.29 per-pixel loops and are kept for the history of §2.7–§2.12;
+since §2.41 a pixel pair costs `G · max(kh·kw, 2)` cycles per M-group
+and nothing else.)
 
 **Cycle counts per `(oh, ow)` iteration** at the consumer's hot loop
 (standard path, post-§2.12):
@@ -2461,6 +2636,8 @@ until the next behavior-test sweep.
 | `platforms/<name>.json` | TODO — add `kernels.conv` section once the migration lands. |
 | `inference-scheduler/src/_conv_hw_config.py` | TODO — does not yet exist; create when the JSON migration lands.  Mirror `_pool_hw_config.py::resolve(platform_name)`. |
 | `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds.  **§2.9:** persistent-accumulator constraint relaxed to `out_w·out_ch ≤ kMaxAccPersistEntries`.  **§2.11:** `in_w ≤ kMaxInW` constraint REMOVED — replaced by `(kw-1)·dil_w + 1 ≤ kMaxLineBufCols`.  Scheduler validator should be updated to match. |
-| `kernels/conv/test/TestConvSim.cpp` | 34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
-| `hw/test_data/conv_test_data/` | 30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
+| `kernels/conv/include/ConvMacGrid.h` | **§2.42:** `mac_grid_step` split into `w_cache_read` (one masked word per column) + `mac_grid_column_step` (one pixel's 16 trees, with the accumulator seed as an optional 17th leaf); the old `mac_grid_step` is a wrapper kept for `accumulate_standard` / TestConvGrid. |
+| `kernels/conv/test/TestConvGrid.cpp` | **§2.42:** + `test_pair` — two pixels against one weight read with the seeds injected at positions 0 and 1 (and the 1×1 dummy position), lane-exact against the scalar loop for every `(kh, kw, m_valid)`. |
+| `kernels/conv/test/TestConvSim.cpp` | **§2.42:** + 10 named cases (7 standard pair cases: odd / even `out_w` at stride 2, `out_w = 1`, even-rounded ow-tiles 30+30+4 and 64+64+2, stride-2 dilation-2, the s2d stem on 11×13; 2 depthwise: 1×1 and 3×3 s2 with odd `out_w`; the sweep-bound 3×3 64→64 28×28 anchor), appended after the existing RNG consumers so fixtures 0–44 are byte-identical.  34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
+| `hw/test_data/conv_test_data/` | **§2.42:** 58 fixtures (48 + 10; the three saturation stubs moved to indices 55–57).  30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
 | `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row), §2.14 (unified patch producer — §4 single shared `line_buf`, memory-hierarchy diagram), §2.15 (`broadcast_patches` removal — §4 patch-path text, §5 stage count 6→5, §11 dataflow-stages row), §2.16 (`saturate_cast` at the Phase-3 drain — §5.1 drain pseudo-code, §6 saturation text, §11 accumulator-stream row), §2.17 (16×16 MAC operands — §11 MAC-operand-width row), §2.18 (patch register file — §4 `patch` declaration, §5.6 pragma table, §11 patch-buffer-storage row), §2.19 (tile-geometry hoist — §5 dataflow-stage notes on the `ConvGeometry` arg, §11 tile-geometry row), §2.20 (STABLE arguments — §5.6 pragma table row). |

@@ -3,7 +3,7 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **steps 1–4 landed and measured on the board (2026-09-26): ResNet-18 310 → 91.2 ms (11.0 FPS)**; step 3 also delivered most of step 7; steps 5–6 not started and are now the lever for the last 25 ms.
+Status: **steps 1–4 landed and measured on the board (2026-09-26): ResNet-18 310 → 91.2 ms (11.0 FPS)**; step 3 also delivered most of step 7; step 6 landed (neutral at 100 MHz); step 8 (two pixels per cycle) implemented on `perf/conv2px`, pending integration; step 5 not started.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 
@@ -36,7 +36,8 @@ second PS port becomes necessary once steps 4–5 land (step 6).
 | 4 | **Conv grid 16×8 → 16×16** (`tile_m` 8 → 16 in `platforms/kv260.json` + whatever the kernel needs): w_cache moves to URAM (16/64 used) since BRAM is at 119/144; drain/write path must keep up with 16 output channels | `kernels/conv/*`, `platforms/kv260.json`, `gen_conv_models.py` (fixtures re-derive), `doc/CONV_OPTIMISATION.md` | 3×3 convs 220 → ~115–130 ms if sweep efficiency holds | DSP 155 → ~285 (of 1248), LUT +15–20 k (design 62 % → ~77 %), BRAM must not grow |
 | 5 | 150 MHz (Track D: reset-net fix, conv DSP chain re-pipelining) | BD, all kernels | ×1.5 | not started |
 | 6 | Second PS port for conv w/b (block-design wiring only) | `hw/cormorant_hw_128` | needed after 4–5 | **done 2026-09-26, neutral at 100 MHz (§3.2)** |
-| 7 | Sweep efficiency 60 → 80 %+ (cycle-level trace on a 56² fixture) | `kernels/conv/*` | 3×3 convs −25 % | not started |
+| 7 | Sweep efficiency 60 → 80 %+ (cycle-level trace on a 56² fixture) | `kernels/conv/*` | 3×3 convs −25 % | delivered by step 3's flat sweep (§2.41): 89–97 % on the board |
+| 8 | **Two output pixels per cycle** on the 16×16 grid (512 MACs/cycle): each sweep iteration multiplies the patch columns of `(ow, ow+1)` against the SAME weight-cache word, so the MAC count doubles without touching w_cache (the width-bound BRAM/URAM resource); patch supply, accumulators, adder trees and the drain rate are what double | `kernels/conv/*`, `doc/CONV_OPTIMISATION.md` §2.42 | 3×3 convs −40…−48 %, depthwise −35 %; 1×1 layers unchanged (drain-bound) | DSP +272 (≈ 930 of 1248 routed), LUT ≤ +15 k routed, BRAM / URAM must not grow |
 
 Model-based outcome: steps 1–6 at 60 % efficiency ≈ 92 ms (11 FPS); with
 step 7 at 80 % ≈ 74 ms (13.5 FPS); 15 FPS needs ≥ 85 %.  Int8 (2 MACs per
@@ -104,6 +105,20 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   RTL PASS; DSP 407, LUT 87.0 k, BRAM / URAM unchanged.  Model: each
   1×1 s2 downsample 3.6 → 0.4–0.5 ms, `1x1-64to128-56x56` 14.6 → ~2 ms,
   the 3×3 layers 220 → ~75 ms.  Board numbers pending integration.**
+
+- **Step 8 — implemented on `perf/conv2px` (CONV_OPTIMISATION.md
+  §2.42), RTL −44.3 % on the sweep-bound 3×3 64→64 28×28 anchor
+  (1 274 695 → 710 225 ns), −43 % on the 7×7 stem, −41 % on the 14×14
+  multi-tile case, −32 % on the depthwise chunking case, −23 % on the 47
+  common cases (the suite is dominated by write-bound 1×1 cases, which
+  are unchanged by design); 58/58 RTL PASS, bit-exact.  Each sweep
+  iteration multiplies the patch columns of two adjacent output pixels
+  against ONE weight-cache word (512 MACs/cycle); the accumulator URAM
+  keeps its single read / write port by staggering the two pixels'
+  words over the window.  csynth: DSP 407 → 679, LUT 87.0 k → 99.4 k
+  (routed-equivalent ≈ +5 k), BRAM 127 / URAM 48 unchanged, II=1,
+  slack 0.00.  Model: the sixteen 3×3 layers 70.4 → ~40 ms, ResNet-18
+  ≈ 60 ms (~16 FPS) before step 5.  Board numbers pending integration.**
 
 ### 3.1. Board results, steps 1–4 together (2026-09-26)
 

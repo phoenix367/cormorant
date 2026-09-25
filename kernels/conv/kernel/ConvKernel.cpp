@@ -91,6 +91,22 @@ struct PatchVec {
 };
 
 // ---------------------------------------------------------------------------
+// PatchPair — the §2.42 patch stream beat: the SAME kernel position of TWO
+// horizontally adjacent output pixels, px[0] for the even output column
+// ow_a and px[1] for ow_a + 1 (in input columns they are stride_w apart).
+// The consumer multiplies both against ONE weight cache word per cycle, so
+// the grid does 2 × kTileIC × kTileM products per iteration without a
+// second weight read.  Pairs are aligned to EVEN output columns (ow_a is
+// even); a pixel of the pair that lies outside the tile's [ow_start,
+// ow_end) — the odd column past an odd out_w, or the even column before
+// an odd ow_start — is emitted as zeros and its accumulator word is left
+// untouched by the consumer.  512 bits at the defaults.
+// ---------------------------------------------------------------------------
+struct PatchPair {
+    PatchVec px[2];
+};
+
+// ---------------------------------------------------------------------------
 // BiasVec — one m-tile of initial accumulator values per stream beat (§2.25).
 //
 // bias_producer used to push one AccData_t per (pixel, mt, m1); the
@@ -289,6 +305,13 @@ static inline void compute_ow_tiling(
         per = (kMaxLineBufCols - window_w) / (stride_w > 0 ? stride_w : 1) + 1;
         if (per == 0) per = 1;
     }
+    // §2.42: the sweep processes output columns in pairs aligned to even
+    // ow, so an EVEN tile width keeps every tile boundary on a pair
+    // boundary — an odd width would make both neighbouring tiles spend a
+    // whole pair on the half pair they share.  (per == 1 stays 1: a
+    // window that fills the whole line buffer; the pair logic then masks
+    // the pixel outside the tile.)
+    if (per > 1) per &= ~1u;
     if (per > out_w) per = out_w;
     ow_per_tile = per;
     num_ow_tiles = (out_w + per - 1) / per;
@@ -906,15 +929,16 @@ static void x_row_loader(
 //             ColVec = one column of all kTileIC channels per cycle,
 //             written into the 16 channel banks at once).  grp>0 loads
 //             nothing.
-// Per (ni, chunk, ct, ow_tile, grp, oh, ow):
-//   Phase 2 — stream kh × kw channel-packed PatchVecs into patch_stream.
+// Per (ni, chunk, ct, ow_tile, grp, oh, ow pair):
+//   Phase 2 — stream kh × kw channel-packed PatchPairs (two output
+//             columns per beat, §2.42) into patch_stream.
 //
 // Constraints: (kh-1)*dilation_h + 1 <= kMaxLineBufRows,
 //              (kw-1)*dilation_w + 1 <= kMaxLineBufCols.
 // ---------------------------------------------------------------------------
 static void input_patch_producer(
     hls::stream<ColVec>&    col_stream,
-    hls::stream<PatchVec>&  patch_stream,
+    hls::stream<PatchPair>& patch_stream,
     unsigned             batch,
     unsigned             in_ch,
     unsigned             in_h,
@@ -957,6 +981,11 @@ static void input_patch_producer(
     // gathers a full PatchVec from them per cycle.
     Data_t line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+    // §2.42: Phase 2 reads TWO columns of every channel bank per cycle (the
+    // two pixels of a pair) while Phase 1 writes one; the two phases are
+    // separate loops, so a true dual-port BRAM18 (1024 x 16 bits fits one
+    // BRAM18 in TDP mode) serves both without duplicating the banks.
+    #pragma HLS BIND_STORAGE variable=line_buf type=RAM_T2P impl=BRAM
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     // C-sim residency invariant: which absolute (ih, iw) each line_buf
@@ -1038,12 +1067,22 @@ static void input_patch_producer(
                     last_loaded_row = rl.load_end;
                 }
 
-                for (unsigned ow = ow_start; ow < ow_end; ow++) {
+                // §2.42: output columns go out in PAIRS aligned to even ow
+                // (ow_a, ow_a + 1); a pixel outside [ow_start, ow_end) is a
+                // zero patch (see PatchPair).
+                const unsigned pair_base = ow_start & ~1u;
+                const unsigned n_pairs   = ((ow_end - 1) >> 1) - (ow_start >> 1) + 1;
+                for (unsigned pair_l = 0; pair_l < n_pairs; pair_l++) {
+                    const unsigned ow_a = pair_base + 2 * pair_l;
+                    const bool     ok_a = (ow_a >= ow_start);      // even pixel inside the tile
+                    const bool     ok_b = (ow_a + 1 < ow_end);     // odd pixel inside the tile
 
                     // ---------------------------------------------------
-                    // Phase 2: stream a kh × kw block of PatchVecs into
+                    // Phase 2: stream a kh × kw block of PatchPairs into
                     // patch_stream — one beat per (khi, kwi), each beat
-                    // packing all kTileIC lanes.  Lanes ic_l >= ch_valid
+                    // packing all kTileIC lanes of BOTH pixels (their
+                    // input columns are stride_w apart, read from the two
+                    // ports of each channel bank).  Lanes ic_l >= ch_valid
                     // are zero-padded (the partial-IC tail for standard,
                     // the kTileM..kTileIC-1 tail for depthwise); the
                     // consumer's accumulate ignores the padding.
@@ -1057,40 +1096,48 @@ static void input_patch_producer(
                             : 0u;
                         for (unsigned kwi = 0; kwi < kw; kwi++) {
                             #pragma HLS PIPELINE II=1
-                            const int iw = (int)(ow * stride_w + kwi * dilation_w)
-                                        - (int)pad_left;
-                            const bool iw_ok = (iw >= 0 && (unsigned)iw < in_w);
-                            const unsigned col_slot = iw_ok
-                                ? ((unsigned)iw & (kMaxLineBufCols - 1))
-                                : 0u;
+                            const int iw0 = (int)(ow_a * stride_w + kwi * dilation_w)
+                                          - (int)pad_left;
+                            const int iw1 = iw0 + (int)stride_w;
+                            const bool iw0_ok = ok_a && (iw0 >= 0 && (unsigned)iw0 < in_w);
+                            const bool iw1_ok = ok_b && (iw1 >= 0 && (unsigned)iw1 < in_w);
+                            const unsigned cs0 = iw0_ok
+                                ? ((unsigned)iw0 & (kMaxLineBufCols - 1)) : 0u;
+                            const unsigned cs1 = iw1_ok
+                                ? ((unsigned)iw1 & (kMaxLineBufCols - 1)) : 0u;
 
-                            PatchVec v;
+                            PatchPair v;
                             #pragma HLS aggregate variable=v compact=byte
 
                             for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                                 #pragma HLS UNROLL
                                 const bool ch_ok = (ic_l < ch_valid);
-                                v.lane[ic_l] = (ch_ok && ih_ok && iw_ok)
-                                    ? line_buf[ic_l][slot][col_slot]
-                                    : Data_t(0);
+                                const bool r0 = ch_ok && ih_ok && iw0_ok;
+                                const bool r1 = ch_ok && ih_ok && iw1_ok;
+                                v.px[0].lane[ic_l] = r0 ? line_buf[ic_l][slot][cs0] : Data_t(0);
+                                v.px[1].lane[ic_l] = r1 ? line_buf[ic_l][slot][cs1] : Data_t(0);
 #ifdef DEBUG_LOAD_DATA_CACHING
-                                if (ch_ok && ih_ok && iw_ok &&
-                                    line_tag[ic_l][slot][col_slot] != tag_of(ic_l, ih, iw)) {
-                                    std::cerr << "line_buf residency violated: ch_l=" << ic_l
-                                              << " wants (ih=" << ih << ", iw=" << iw
-                                              << ") slot(" << slot << "," << col_slot
-                                              << ") holds tag " << line_tag[ic_l][slot][col_slot]
-                                              << " at ni=" << ni << " chunk=" << chunk
-                                              << " ct=" << ct << " owt=" << owt << " grp=" << grp
-                                              << " oh=" << oh << " ow=" << ow << std::endl;
-                                    assert(!"line_buf residency invariant");
+                                for (unsigned h = 0; h < 2; h++) {
+                                    const bool     rr = h ? r1 : r0;
+                                    const unsigned cs = h ? cs1 : cs0;
+                                    const int      iw = h ? iw1 : iw0;
+                                    if (rr && line_tag[ic_l][slot][cs] != tag_of(ic_l, ih, iw)) {
+                                        std::cerr << "line_buf residency violated: ch_l=" << ic_l
+                                                  << " wants (ih=" << ih << ", iw=" << iw
+                                                  << ") slot(" << slot << "," << cs
+                                                  << ") holds tag " << line_tag[ic_l][slot][cs]
+                                                  << " at ni=" << ni << " chunk=" << chunk
+                                                  << " ct=" << ct << " owt=" << owt << " grp=" << grp
+                                                  << " oh=" << oh << " ow=" << ow_a + h << std::endl;
+                                        assert(!"line_buf residency invariant");
+                                    }
                                 }
 #endif
                             }
                             patch_stream.write(v);
                         }
                     }
-                } // ow loop
+                } // pair loop
             } // oh loop
           } // group loop
           } // ow_tile loop
@@ -1339,7 +1386,7 @@ static void stream_load_weights(
 // (one padded row fits).
 // ---------------------------------------------------------------------------
 static void process_conv_kernel_tile(
-    hls::stream<PatchVec>&  patch_stream,
+    hls::stream<PatchPair>& patch_stream,
     hls::stream<WeightVec>& weight_stream,
     hls::stream<BiasVec>&   bias_stream,
     hls::stream<YWord>&     acc_stream,
@@ -1471,6 +1518,7 @@ static void process_conv_kernel_tile(
             for (unsigned ict = 0; ict < ic_tiles; ict++) {
                 const unsigned ic_off   = ict * kTileIC;
                 const unsigned ic_valid = std::min(kTileIC, in_ch - ic_off);
+                (void)ic_valid;   // no ic mask since §2.40 (see w_cache_read)
 
               for (unsigned owt = 0; owt < num_ow_tiles; owt++) {
                 const unsigned ow_start = owt * ow_per_tile;
@@ -1538,38 +1586,78 @@ static void process_conv_kernel_tile(
                 const ap_uint<1> nbank = wbank ^ 1;   // bank being prefetched
 
                 // ---- §2.41 flat spatial sweep: per (ict, ow_tile, mg) ONE
-                //      II=1 loop over (oh_local, ow_in_tile, g, khi, kwi) ----
+                //      II=1 loop over (oh_local, ow PAIR, g, khi, kwi) ----
                 // The §2.29 form re-entered three loops per pixel (a G-word
                 // accumulator load, the fused (g, khi, kwi) sweep, a G-word
                 // store: ~2G + 12 cycles of ramps around G*kh*kw useful
                 // ones — 64 % utilisation on a 3x3, 17 % on a 1x1).  Here
                 // the pixel loop is folded in with running counters, as the
-                // depthwise sweep does (§2.37): a tile's accumulator word is
-                // read from partial_outputs at its first kernel position
-                // (`first ? word : acc`, in front of the distance-1
-                // `acc += tree` recurrence) and stored write-only at its
-                // last, so the pipeline ramps once per sweep.  Tile 0 of a
-                // pixel takes each PatchVec beat from the stream and parks
-                // it in `patch`; tiles 1..G-1 replay it from there (the same
-                // LUTRAM RAW at distance kh*kw the §2.29 loop had).  Every
-                // (pixel, tile) word is loaded and stored exactly once per
-                // sweep, so the URAM load and store never alias across
-                // iterations.  Each iteration also advances the §2.35
-                // prefetch of the next slab into the other bank.
-                const unsigned tw        = ow_end - ow_start;
+                // depthwise sweep does (§2.37), so the pipeline ramps once
+                // per sweep.  Tile 0 of a pair takes each PatchPair beat
+                // from the stream and parks it in `patch0/1`; tiles 1..G-1
+                // replay it from there (the same LUTRAM RAW at distance
+                // kh*kw the §2.29 loop had).  Each iteration also advances
+                // the §2.35 prefetch of the next slab into the other bank.
+                //
+                // §2.42 — TWO output pixels per iteration.  The pair
+                // (ow_a, ow_a + 1), ow_a even, is multiplied against ONE
+                // weight word per column (w_cache_read once, two column
+                // steps): 2 x 256 products per cycle, the cache untouched.
+                // partial_outputs keeps its one-pixel word layout (§2.23)
+                // and its single read + single write port, so the two
+                // pixels' accumulator words are staggered over the window:
+                //   pos 0        : read pixel 0's word, seed it into pixel
+                //                  0's adder trees (a 17th leaf, §2.42 —
+                //                  wrap-around fixed point makes the seed
+                //                  position irrelevant); store the PREVIOUS
+                //                  block's pixel-1 word held in `hold`.
+                //   pos 1        : read pixel 1's word, seed it into pixel
+                //                  1's trees.
+                //   pos n_win-1  : store pixel 0's word; capture pixel 1's
+                //                  result in `hold` for the next block's pos
+                //                  0 (a tail store after the loop for the
+                //                  last block).
+                // n_win = max(kh*kw, 2): a 1x1 gets one extra "dummy"
+                // position (zero patches, position-0 weights) so the two
+                // loads and two stores still spread over two cycles — the
+                // 1x1 sweep costs the same one cycle per pixel as before.
+                // Every (pixel, tile) word is loaded once and stored once
+                // per sweep, the store always after the load, so the URAM
+                // accesses never alias across iterations.  A pixel outside
+                // the tile (odd out_w, odd ow_start) is a zero patch from
+                // the producer and its word is never stored (the read is
+                // clamped to a valid word).  Only one tile's accumulators
+                // are live at a time (the g loop is inside the pair loop),
+                // so acc0/acc1 carry no runtime-g index (§2.40 trap 3's
+                // ~6 k LUT of muxes are gone).
+                const unsigned pair_base = ow_start & ~1u;
+                const unsigned n_pairs   = ((ow_end - 1) >> 1) - (ow_start >> 1) + 1;
                 const unsigned n_pos     = kh * kw;
-                const unsigned n_iter    = chunk_oh_count * tw * mt_in_group_count * n_pos;
+                const unsigned n_win     = (n_pos < 2) ? 2u : n_pos;
+                const unsigned n_iter    = chunk_oh_count * n_pairs * mt_in_group_count * n_win;
                 const unsigned row_words = out_w * m_tiles;
-                unsigned word_row = ow_start * m_tiles + mt_base;     // (pixel, tile 0) word of the row
-                unsigned word     = word_row;
-                unsigned g = 0, khi = 0, kwi = 0, pos = 0, ow_l = 0;
+                unsigned word_row = pair_base * m_tiles + mt_base;    // (pair 0 pixel 0, tile 0) word of the row
+                unsigned word     = word_row;                         // (current pair pixel 0, tile g)
+                unsigned ow_a = pair_base;
+                unsigned g = 0, khi = 0, kwi = 0, pos = 0, pair_l = 0;
 
-                Data_t patch[kTileIC][kMaxKH][kMaxKW];
-                #pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-                #pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
+                Data_t patch0[kTileIC][kMaxKH][kMaxKW];
+                Data_t patch1[kTileIC][kMaxKH][kMaxKW];
+                #pragma HLS ARRAY_PARTITION variable=patch0 complete dim=1
+                #pragma HLS ARRAY_PARTITION variable=patch1 complete dim=1
+                #pragma HLS BIND_STORAGE variable=patch0 type=RAM_2P impl=lutram
+                #pragma HLS BIND_STORAGE variable=patch1 type=RAM_2P impl=lutram
 
-                AccData_t acc[kMaxMperGroup][kTileM];
-                #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                AccData_t acc0[kTileM], acc1[kTileM], hold[kTileM];
+                #pragma HLS ARRAY_PARTITION variable=acc0 complete dim=0
+                #pragma HLS ARRAY_PARTITION variable=acc1 complete dim=0
+                #pragma HLS ARRAY_PARTITION variable=hold complete dim=0
+                unsigned hold_word = 0;
+                bool     hold_en   = false;
+                for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                    #pragma HLS UNROLL
+                    acc0[m1] = 0; acc1[m1] = 0; hold[m1] = 0;
+                }
 
                 for (unsigned it = 0; it < n_iter; it++) {
                     #pragma HLS PIPELINE II=1
@@ -1577,51 +1665,98 @@ static void process_conv_kernel_tile(
                     // bank !wbank (UG1399 "pragma HLS dependence").
                     #pragma HLS DEPENDENCE variable=w_lo type=inter dependent=false
                     #pragma HLS DEPENDENCE variable=w_hi type=inter dependent=false
-                    // One load (first position) and one store (last
-                    // position) per (pixel, tile) word, never the same word
-                    // in two different iterations of one sweep.
+                    // One load and one store per (pixel, tile) word, never
+                    // the same word in two different iterations of one
+                    // sweep (see above).
                     #pragma HLS DEPENDENCE variable=partial_outputs type=inter dependent=false
-                    const bool first = (pos == 0);
-                    const bool last  = (pos + 1 == n_pos);
+                    const bool first  = (pos == 0);
+                    const bool second = (pos == 1);
+                    const bool last   = (pos + 1 == n_win);
+                    const bool at_pos = (pos < n_pos);          // false only at a 1x1's dummy position
+                    const bool valid0 = (ow_a >= ow_start);
+                    const bool valid1 = (ow_a + 1 < ow_end);
 
-                    Data_t p[kTileIC];
-                    #pragma HLS ARRAY_PARTITION variable=p complete dim=0
-                    if (g == 0) {
-                        const PatchVec v = patch_stream.read();
+                    Data_t p0[kTileIC], p1[kTileIC];
+                    #pragma HLS ARRAY_PARTITION variable=p0 complete dim=0
+                    #pragma HLS ARRAY_PARTITION variable=p1 complete dim=0
+                    if (!at_pos) {
                         for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                             #pragma HLS UNROLL
-                            p[ic_l]               = v.lane[ic_l];
-                            patch[ic_l][khi][kwi] = v.lane[ic_l];
+                            p0[ic_l] = Data_t(0);
+                            p1[ic_l] = Data_t(0);
+                        }
+                    } else if (g == 0) {
+                        const PatchPair v = patch_stream.read();
+                        for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
+                            #pragma HLS UNROLL
+                            p0[ic_l]               = v.px[0].lane[ic_l];
+                            p1[ic_l]               = v.px[1].lane[ic_l];
+                            patch0[ic_l][khi][kwi] = v.px[0].lane[ic_l];
+                            patch1[ic_l][khi][kwi] = v.px[1].lane[ic_l];
                         }
                     } else {
                         for (unsigned ic_l = 0; ic_l < kTileIC; ic_l++) {
                             #pragma HLS UNROLL
-                            p[ic_l] = patch[ic_l][khi][kwi];
+                            p0[ic_l] = patch0[ic_l][khi][kwi];
+                            p1[ic_l] = patch1[ic_l][khi][kwi];
                         }
                     }
 
-                    // Seed from the URAM word at the window's first position
-                    // (read unconditionally — one port, address = word).
-                    AccData_t a[kTileM];
-                    #pragma HLS ARRAY_PARTITION variable=a complete dim=0
+                    // ONE URAM read per iteration (one port, muxed address):
+                    // pixel 0's word at pos 0, pixel 1's at pos 1; clamped
+                    // to pixel 0's word when pixel 1 is outside the tile
+                    // (its word may lie past the chunk's last entry).
+                    const unsigned word1   = word + m_tiles;
+                    const unsigned rd_word = (second && valid1) ? word1 : word;
+                    AccData_t seed[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=seed complete dim=0
                     for (unsigned m1 = 0; m1 < kTileM; m1++) {
                         #pragma HLS UNROLL
-                        const AccData_t w_in = partial_outputs[word * kTileM + m1];
-                        a[m1] = first ? w_in : acc[g][m1];
+                        seed[m1] = partial_outputs[rd_word * kTileM + m1];
                     }
+
+                    // One masked weight word per column, shared by both pixels.
                     const unsigned m_valid_g =
                         std::min(kTileM, out_ch - (mt_base + g) * kTileM);
-                    mac_grid_step(p, w_lo, w_hi, w_cache_addr(wbank, g, khi, kwi),
-                                  a, ic_valid, m_valid_g);
+                    WeightVec w[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=w complete dim=0
+                    w_cache_read(w_lo, w_hi, w_cache_addr(wbank, g, khi, kwi), m_valid_g, w);
+
+                    AccData_t a0[kTileM], a1[kTileM];
+                    #pragma HLS ARRAY_PARTITION variable=a0 complete dim=0
+                    #pragma HLS ARRAY_PARTITION variable=a1 complete dim=0
                     for (unsigned m1 = 0; m1 < kTileM; m1++) {
                         #pragma HLS UNROLL
-                        acc[g][m1] = a[m1];
+                        a0[m1] = first ? AccData_t(0) : acc0[m1];
+                        a1[m1] = first ? AccData_t(0) : acc1[m1];
+                    }
+                    mac_grid_column_step(p0, w, seed, first,  a0);
+                    mac_grid_column_step(p1, w, seed, second, a1);
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        acc0[m1] = a0[m1];
+                        acc1[m1] = a1[m1];
+                    }
+
+                    // ONE URAM store per iteration (one port, muxed address
+                    // and data): the previous block's pixel-1 word at pos 0,
+                    // this block's pixel-0 word at the last position.
+                    const bool st_hold = first && hold_en;
+                    const bool st_now  = last && valid0;
+                    if (st_hold || st_now) {
+                        const unsigned st_word = st_hold ? hold_word : word;
+                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            #pragma HLS UNROLL
+                            partial_outputs[st_word * kTileM + m1] = st_hold ? hold[m1] : a0[m1];
+                        }
                     }
                     if (last) {
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
-                            partial_outputs[word * kTileM + m1] = a[m1];
+                            hold[m1] = a1[m1];
                         }
+                        hold_word = word1;
+                        hold_en   = valid1;
                     }
 
                     // §2.35 prefetch: one WeightVec of the NEXT slab
@@ -1648,29 +1783,44 @@ static void process_conv_kernel_tile(
                     }
 
                     // Counters: (kwi, khi) over the window, then the tile,
-                    // then the pixel (the word cursor carries no multiply).
+                    // then the pair (the word cursor carries no multiply).
                     if (last) {
                         pos = 0; kwi = 0; khi = 0;
                         if (++g == mt_in_group_count) {
                             g = 0;
-                            if (++ow_l == tw) {
-                                ow_l      = 0;
+                            if (++pair_l == n_pairs) {
+                                pair_l    = 0;
+                                ow_a      = pair_base;
                                 word_row += row_words;
                                 word      = word_row;
                             } else {
-                                // word is at tile G-1 of this pixel; the next
-                                // pixel's tile 0 is m_tiles further from tile 0.
-                                word += m_tiles - (mt_in_group_count - 1);
+                                // word is at tile G-1 of this pair's pixel 0;
+                                // the next pair's pixel 0 is 2*m_tiles from it.
+                                ow_a += 2;
+                                word += 2 * m_tiles - (mt_in_group_count - 1);
                             }
                         } else {
                             word++;
                         }
                     } else {
                         pos++;
-                        if (++kwi == kw) {
-                            kwi = 0;
-                            khi++;
+                        // (khi, kwi) only advance onto a REAL position: a
+                        // 1x1's dummy position keeps position (0, 0) so the
+                        // weight word it reads (against zero patches) is a
+                        // written, X-free one.
+                        if (pos < n_pos) {
+                            if (++kwi == kw) {
+                                kwi = 0;
+                                khi++;
+                            }
                         }
+                    }
+                }
+                // §2.42 tail: the last block's pixel-1 word.
+                if (hold_en) {
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        partial_outputs[hold_word * kTileM + m1] = hold[m1];
                     }
                 }
 
@@ -1771,50 +1921,101 @@ static void process_conv_kernel_tile(
               for (unsigned owt = 0; owt < num_ow_tiles_dw; owt++) {
                 const unsigned ow_start = owt * ow_per_tile_dw;
                 const unsigned ow_end   = std::min(out_w, ow_start + ow_per_tile_dw);
-                const unsigned tw       = ow_end - ow_start;
-                const unsigned n_iter   = chunk_oh_count * tw * n_pos;
+                // §2.42: two pixels per iteration (the pair (ow_a, ow_a + 1)
+                // of one PatchPair beat, 2 x kTileM MACs), both seeded from
+                // the bias register at ri == 0.  Only one URAM write port:
+                // pixel 0's word is stored at the window's last position,
+                // pixel 1's is held and stored at the next pair's ri == 0
+                // (tail store after the loop); n_win = max(kh*kw, 2) so a
+                // 1x1 has a dummy position for that second store.
+                const unsigned pair_base = ow_start & ~1u;
+                const unsigned n_pairs   = ((ow_end - 1) >> 1) - (ow_start >> 1) + 1;
+                const unsigned n_win     = (n_pos < 2) ? 2u : n_pos;
+                const unsigned n_iter    = chunk_oh_count * n_pairs * n_win;
 
                 // Running partial_outputs word cursor (§2.23 layout:
                 // word = (oh_local*out_w + ow)*m_tiles + mt) — incremented
-                // per pixel / per row so the loop carries no multiply.
-                unsigned word_row = ow_start * m_tiles + mt;
+                // per pair / per row so the loop carries no multiply.
+                unsigned word_row = pair_base * m_tiles + mt;
                 unsigned word     = word_row;
-                unsigned ri = 0, ow_l = 0;
+                unsigned ow_a     = pair_base;
+                unsigned ri = 0, pair_l = 0;
 
-                AccData_t acc[kTileM];
-                #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+                AccData_t acc0[kTileM], acc1[kTileM], hold[kTileM];
+                #pragma HLS ARRAY_PARTITION variable=acc0 complete dim=0
+                #pragma HLS ARRAY_PARTITION variable=acc1 complete dim=0
+                #pragma HLS ARRAY_PARTITION variable=hold complete dim=0
+                unsigned hold_word = 0;
+                bool     hold_en   = false;
                 for (unsigned m1 = 0; m1 < kTileM; m1++) {
                     #pragma HLS UNROLL
-                    acc[m1] = AccData_t(0);
+                    acc0[m1] = AccData_t(0);
+                    acc1[m1] = AccData_t(0);
+                    hold[m1] = AccData_t(0);
                 }
 
                 for (unsigned it = 0; it < n_iter; it++) {
                     #pragma HLS PIPELINE II=1
+                    // Every (pixel, mt) word is written exactly once per
+                    // sweep (write-only), never read here.
+                    #pragma HLS DEPENDENCE variable=partial_outputs type=inter dependent=false
+                    const bool first  = (ri == 0);
+                    const bool last   = (ri + 1 == n_win);
+                    const bool at_pos = (ri < n_pos);
+                    const bool valid0 = (ow_a >= ow_start);
+                    const bool valid1 = (ow_a + 1 < ow_end);
                     // §2.29: depthwise has a single tile per pixel, so the
-                    // PatchVec beats feed the lanes straight from the stream.
-                    const PatchVec v = patch_stream.read();
-                    const bool first = (ri == 0);
-                    const bool last  = (ri + 1 == n_pos);
+                    // PatchPair beats feed the lanes straight from the stream.
+                    PatchPair v;
+                    for (unsigned m1 = 0; m1 < kTileIC; m1++) {
+                        #pragma HLS UNROLL
+                        v.px[0].lane[m1] = Data_t(0);
+                        v.px[1].lane[m1] = Data_t(0);
+                    }
+                    if (at_pos) v = patch_stream.read();
                     for (unsigned m1 = 0; m1 < kTileM; m1++) {
                         #pragma HLS UNROLL
-                        acc[m1] = first ? bias_reg[m1] : acc[m1];
+                        acc0[m1] = first ? bias_reg[m1] : acc0[m1];
+                        acc1[m1] = first ? bias_reg[m1] : acc1[m1];
                     }
-                    mac_dw_step(v.lane, w_buf, ri, acc);   // ri == khi*kw + kwi
+                    const unsigned ri_w = at_pos ? ri : 0u;   // ri == khi*kw + kwi
+                    mac_dw_step(v.px[0].lane, w_buf, ri_w, acc0);
+                    mac_dw_step(v.px[1].lane, w_buf, ri_w, acc1);
+
+                    const bool st_hold = first && hold_en;
+                    const bool st_now  = last && valid0;
+                    if (st_hold || st_now) {
+                        const unsigned st_word = st_hold ? hold_word : word;
+                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                            #pragma HLS UNROLL
+                            partial_outputs[st_word * kTileM + m1] = st_hold ? hold[m1] : acc0[m1];
+                        }
+                    }
                     if (last) {
                         for (unsigned m1 = 0; m1 < kTileM; m1++) {
                             #pragma HLS UNROLL
-                            partial_outputs[word * kTileM + m1] = acc[m1];
+                            hold[m1] = acc1[m1];
                         }
+                        hold_word = word + m_tiles;
+                        hold_en   = valid1;
                         ri = 0;
-                        if (++ow_l == tw) {
-                            ow_l      = 0;
+                        if (++pair_l == n_pairs) {
+                            pair_l    = 0;
+                            ow_a      = pair_base;
                             word_row += row_words;
                             word      = word_row;
                         } else {
-                            word += m_tiles;
+                            ow_a += 2;
+                            word += 2 * m_tiles;
                         }
                     } else {
                         ri++;
+                    }
+                }
+                if (hold_en) {
+                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        #pragma HLS UNROLL
+                        partial_outputs[hold_word * kTileM + m1] = hold[m1];
                     }
                 }
               } // ow_tile
@@ -2140,14 +2341,15 @@ void ConvKernel(
     // it (15 at 8 x 256); SRLs hold it for a few hundred LUT.
     #pragma HLS BIND_STORAGE variable=bias_stream type=fifo impl=srl
 
-    // patch_stream carries the producer's channel-packed PatchVec
+    // patch_stream carries the producer's channel-packed PatchPair
     // emissions straight to the consumer (no intermediate stage since
-    // §2.15).  Each beat is one kTileIC-lane column; depth is one
-    // kernel window's worth of beats (kMaxKH*kMaxKW) so the consumer
-    // drains it as the assembler fills it under DATAFLOW.
-    hls_thread_local hls::stream<PatchVec> patch_stream;
+    // §2.15).  Each beat is one kTileIC-lane column of TWO output pixels
+    // (§2.42); depth is one kernel window's worth of beats (kMaxKH*kMaxKW)
+    // so the consumer drains it as the assembler fills it under DATAFLOW.
+    hls_thread_local hls::stream<PatchPair> patch_stream;
     #pragma HLS STREAM variable=patch_stream depth=kMaxKH*kMaxKW
-    // §2.40: 49 x 256-bit beats cost 15 BRAM18 as a "memory" FIFO; LUTRAM.
+    // §2.40: 49 x 256-bit beats cost 15 BRAM18 as a "memory" FIFO; LUTRAM
+    // (49 x 512 bits since §2.42).
     #pragma HLS BIND_STORAGE variable=patch_stream type=fifo impl=lutram
 
     // acc_stream carries already-saturated Data_t lanes — process_conv_kernel_tile

@@ -66,7 +66,7 @@ written.
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `AccData_t` | `ap_fixed<32,16>` | Accumulator type (wider range, avoids overflow) |
-| `kTileM` | 16 | Output-channel tile width = the M dimension of the MAC grid (16 × 16 = 256 MACs/cycle since §2.40; 8 before); power of 2, multiple of the 8-lane `y` word, ≤ `kTileIC`; also the depthwise PM unroll factor |
+| `kTileM` | 16 | Output-channel tile width = the M dimension of the MAC grid (16 × 16 = 256 MACs per pixel-column since §2.40, 8 before; two output pixels per cycle since §2.42 = 512 MACs/cycle); power of 2, multiple of the 8-lane `y` word, ≤ `kTileIC`; also the depthwise PM unroll factor |
 | `kTileIC` | 16 | Input-channel tile width; must be a power of 2; also the standard PN unroll factor |
 | `kMaxKH` | 7 | Maximum compile-time kernel height |
 | `kMaxKW` | 7 | Maximum compile-time kernel width |
@@ -128,15 +128,15 @@ flowchart TB
     end
 
     subgraph BRAML["BRAM layer — 288 BRAM18K · 32% used"]
-        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile</i>"]
+        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks (RAM_T2P)<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile;<br/>two columns read per cycle — one pixel pair (§2.42)</i>"]
         WC["w_lo<br/>kTileM/2 columns · 2·4·64 WeightVec words · 64 BRAM18<br/><i>two banks: the current ict/ow_tile/M-group slab,<br/>reused across the sweep, and the next one prefetched (§2.35)</i>"]
         WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
         BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
     end
 
     subgraph REGL["Register layer — FF/LUT · fully ARRAY_PARTITIONed"]
-        PA["patch<br/>kTileIC·7·7 · every cell a register<br/><i>current oh,ow kernel window</i>"]
-        AC["acc<br/>kTileM lanes · registers<br/><i>MAC lane accumulators</i>"]
+        PA["patch0 / patch1<br/>2 × kTileIC·7·7 LUTRAM banks<br/><i>current (oh, ow_a) and (oh, ow_a+1) kernel windows (§2.42)</i>"]
+        AC["acc0 / acc1 / hold<br/>3 × kTileM lanes · registers<br/><i>one m-tile's accumulators for the two pixels of the pair</i>"]
     end
 
     Xd -->|burst read| LB
@@ -145,7 +145,7 @@ flowchart TB
     WH -->|PN-wide weights| AC
     Wd -->|burst read| WB
     Bd -->|loaded once| BB
-    LB -->|PatchVec gather| PA
+    LB -->|PatchPair gather| PA
     WC -->|PN-wide weights| AC
     WB -->|PM-wide weights| AC
     PA -->|PN/PM MACs| AC
@@ -175,18 +175,20 @@ Buffers are declared inside `process_conv_kernel_tile` (re-allocated per inner
 iteration; HLS hoists them to BRAM/registers).
 
 ```cpp
-// Per-(oh, ow, mt) scratch — a banked register file (§2.18).
+// Per-(oh, ow pair, mt) scratch — a banked register file (§2.18), one
+// per pixel of the pair (§2.42).
 
-Data_t    patch[kTileIC][kMaxKH][kMaxKW];
-#pragma HLS ARRAY_PARTITION variable=patch complete dim=1
-#pragma HLS BIND_STORAGE variable=patch type=RAM_2P impl=lutram
+Data_t    patch0[kTileIC][kMaxKH][kMaxKW];   // pixel (oh, ow_a)
+Data_t    patch1[kTileIC][kMaxKH][kMaxKW];   // pixel (oh, ow_a + 1)
+#pragma HLS ARRAY_PARTITION variable=patch0 complete dim=1   // (same for patch1)
+#pragma HLS BIND_STORAGE variable=patch0 type=RAM_2P impl=lutram
 // Only the bank dim is partitioned → kTileIC independent LUTRAMs, one
 // per ic-lane, so the ic_l UNROLL reads every bank in parallel while
 // (khi,kwi) addresses the RAM. Fully partitioning all three dims (the
 // pre-§2.18 form) made (khi,kwi) drive a wide combinational read mux.
-// Standard: patch[ic_l][khi][kwi] for current (oh, ow, ic_tile).
-// Depthwise: patch[m1][khi][kwi]  for current (oh, ow, m_tile);
-// the [kTileIC] depth covers kTileM lanes (kTileM ≤ kTileIC).
+// Standard only: tile 0 of a pair parks each PatchPair beat here, tiles
+// 1..G-1 replay it.  Depthwise reads its PatchPair beats straight from
+// the stream (one tile per pixel).
 
 // STANDARD-path weight cache: two (ict, M-group) slabs (ping-pong, §2.35),
 // split into a BRAM half and a URAM half of identical shape (§2.40).
@@ -215,9 +217,14 @@ Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
 // dim=1 (m1, PM axis) partitioned complete → kTileM parallel banks.
 // accumulate_depthwise reads kTileM weights per cycle along the m1 axis.
 
-AccData_t acc[kTileM];
-#pragma HLS ARRAY_PARTITION variable=acc complete dim=0
-// All kTileM accumulators in registers (independent).
+AccData_t acc0[kTileM], acc1[kTileM], hold[kTileM];
+#pragma HLS ARRAY_PARTITION variable=acc0 complete dim=0   // (same for acc1, hold)
+// One m-tile's accumulators for the two pixels of the pair, in
+// registers (§2.42).  Only one tile is live at a time (the g loop is
+// inside the pair loop), so there is no runtime-g index.  `hold` keeps
+// pixel 1's finished word for one iteration: partial_outputs has a
+// single write port, so pixel 0's word is stored at the window's last
+// position and pixel 1's at the next block's first position.
 
 // Per-(ni, chunk) persistent state — chunk-scoped, lives in the consumer:
 AccData_t partial_outputs[kMaxAccPersistEntries];
@@ -236,8 +243,12 @@ AccData_t partial_outputs[kMaxAccPersistEntries];
 //     col_slot = iw & (kMaxLineBufCols - 1)
 Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
 #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
+#pragma HLS BIND_STORAGE variable=line_buf type=RAM_T2P impl=BRAM
 // dim=1 partitioned complete → kTileIC independent banks so Phase 2
-// can gather a full PatchVec (all kTileIC channel lanes) in one cycle.
+// can gather a full PatchVec (all kTileIC channel lanes) in one cycle;
+// true dual-port (§2.42) so it gathers the TWO columns of a pixel pair
+// per cycle from the same 16 BRAM18 (Phase 1 writes through one port
+// in its own loop).
 // One buffer serves both modes: standard fills all kTileIC banks,
 // depthwise fills only banks [0, kTileM) and the gather masks the
 // rest to 0.  Within (chunk, ct, ow_tile) each input pixel in the
@@ -255,6 +266,18 @@ the local `patch[][][]` array.  This collapses the consumer's patch
 drain from `kTileIC·kh·kw` cycles to `kh·kw`.  The depthwise path packs
 its `kTileM` m-lanes into the first `kTileM` PatchVec lanes and
 zero-pads the rest.
+
+**Pixel-pair patch stream (§2.42).**  Since §2.42 the beat is a
+`PatchPair { PatchVec px[2]; }` (512-bit): the same `(khi, kwi)`
+position of two horizontally adjacent output pixels `ow_a` (even) and
+`ow_a + 1`, whose input columns are `stride_w` apart and are read from
+the two ports of every `line_buf` bank in one cycle.  Pairs are aligned
+to even output columns; a pixel of the pair outside the tile's
+`[ow_start, ow_end)` (the odd column past an odd `out_w`, or the even
+column before an odd `ow_start`) is emitted as zeros and the consumer
+never stores its accumulator word.  `ow_per_tile` is rounded down to an
+even number (§5.4) so tile boundaries fall on pair boundaries.  Beats
+per `(pair, group)`: `kh·kw`, the same as one pixel used to cost.
 
 ---
 
@@ -296,16 +319,26 @@ for ni in [0, batch)
           // bank !wbank; a short blocking tail loop after the sweep takes
           // whatever it did not absorb, then the banks swap.
 
-          // §2.41: ONE flat II=1 loop over (oh_local, ow_in_tile, g, khi, kwi)
-          for it in [0, chunk_oh · tw · G · kh · kw):                 PIPELINE II=1
-            // g == 0: PatchVec beat from patch_stream → p[], parked in patch[][khi][kwi]
-            // g  > 0: p[] replayed from patch[][khi][kwi]
-            // a[m1] = (khi, kwi) == (0, 0) ? partial_outputs[word·kTileM + m1] : acc[g][m1]
-            // mac_grid_step: a[m1] += Σ_{ic_l, UNROLL} p[ic_l] · w_cache[g][m1][khi][kwi]   // 16 × 16 products
-            // acc[g][m1] = a[m1]
-            // (khi, kwi) == (kh-1, kw-1): partial_outputs[word·kTileM + m1] := a[m1]
+          // §2.41 / §2.42: ONE flat II=1 loop over (oh_local, ow PAIR, g, pos),
+          // pos over n_win = max(kh·kw, 2) positions; pixel 0 = ow_a (even),
+          // pixel 1 = ow_a + 1; word0 / word1 = their (pixel, tile g) words
+          for it in [0, chunk_oh · n_pairs · G · n_win):              PIPELINE II=1
+            // pos < kh·kw, g == 0: PatchPair beat from patch_stream → p0[], p1[],
+            //                      parked in patch0/1[][khi][kwi]
+            // pos < kh·kw, g  > 0: p0[], p1[] replayed from patch0/1[][khi][kwi]
+            // pos == kh·kw (1x1 dummy position only): p0 = p1 = 0, position (0, 0)
+            // seed[m1] = partial_outputs[(pos == 1 ? word1 : word0)·kTileM + m1]   // ONE read
+            // w[m1]    = w_cache[g][m1][khi][kwi] masked by m1 < m_valid           // ONE read per column
+            // a0[m1] = (pos == 0 ? 0 : acc0[m1]) + (pos == 0 ? seed[m1] : 0) + Σ_{ic_l} p0[ic_l] · w[m1][ic_l]
+            // a1[m1] = (pos == 0 ? 0 : acc1[m1]) + (pos == 1 ? seed[m1] : 0) + Σ_{ic_l} p1[ic_l] · w[m1][ic_l]
+            //                                                          // 2 × 16 × 16 products, 32 adder trees
+            // acc0 = a0; acc1 = a1
+            // ONE store: pos == 0 && hold pending → partial_outputs[hold_word] := hold
+            //            pos == n_win-1 && pixel 0 in tile → partial_outputs[word0] := a0
+            // pos == n_win-1: hold := a1, hold_word := word1 (stored at the next block's pos 0;
+            //                 a tail store after the loop for the last block)
             // + one non-blocking WeightVec of the next slab into bank !wbank (§2.35)
-            // counters advance (kwi, khi) → g → pixel (word cursor: no multiply)
+            // counters advance pos (kwi, khi) → g → pair (word cursor: no multiply)
 
     // PHASE 3 (§2.38, §2.40): transpose + drain, 8 outputs per cycle — PIPELINE II=1
     for mt, segment in (chunk pixels / kDrainSeg):        // step n
@@ -319,11 +352,17 @@ for ni in [0, batch)
         //   acc_stream.write(YWord)     // order (mt, segment, m1, word)
 ```
 
-**Inner-MAC throughput is `kTileIC × kTileM` = 256 MACs/cycle** (§2.24,
-§2.40: 16 columns, each a private 16-input adder tree into a distance-1
-`acc[m1] += tree`).  A pixel costs exactly `G · kh · kw` cycles per
-M-group (§2.41: the accumulator load / store and the three per-pixel loop
-ramps of the earlier form are gone; one ramp per `(ict, ow_tile, mg)`).
+**Inner-MAC throughput is `2 × kTileIC × kTileM` = 512 MACs/cycle**
+(§2.24, §2.40, §2.42: 16 weight columns read once per cycle, each
+feeding two private 16-input adder trees — one per pixel of the pair —
+into distance-1 `acc0[m1] += tree0`, `acc1[m1] += tree1`).  A PAIR of
+pixels costs exactly `G · max(kh·kw, 2)` cycles per M-group (§2.41: the
+accumulator load / store and the three per-pixel loop ramps of the
+earlier form are gone; one ramp per `(ict, ow_tile, mg)`); an odd
+`out_w` wastes one pixel's worth per row (≤ 1/out_w), a 1×1 costs the
+same one cycle per pixel as before (its pair window has a dummy second
+position so the two accumulator words can still use the single URAM
+read and write port).
 
 **Weight DDR replay is eliminated for `(oh, ow)`** — weights for one
 `(ict, ow_tile, M-group)` are loaded once into `w_cache` and reused
@@ -347,24 +386,27 @@ for ni in [0, batch)
       for ow_tile in [0, num_ow_tiles)                  // §5.4 ow-tiling
         ow_start = ow_tile · ow_per_tile
         ow_end   = min(out_w, ow_start + ow_per_tile)
-        for it in [0, chunk_oh · (ow_end - ow_start) · kh·kw):   PIPELINE II=1
-          // counters (oh_local, ow, ri) advance per iteration; the
+        for it in [0, chunk_oh · n_pairs · max(kh·kw, 2)):       PIPELINE II=1
+          // counters (oh_local, pair, ri) advance per iteration; the
           // partial_outputs word cursor is incremental (no multiply)
-          v = patch_stream.read()                        // one PatchVec per (khi, kwi)
+          v = ri < kh·kw ? patch_stream.read() : zeros   // one PatchPair per (khi, kwi) (§2.42)
           for m1 in [0, kTileM), UNROLL:
-            acc[m1] = (ri == 0) ? bias_reg[m1] : acc[m1]
-            acc[m1] += v.lane[m1] · w_buf[m1][ri]        // mac_dw_step
-          if ri == kh·kw - 1:
-            partial_outputs[word·kTileM + 0..kTileM-1] := acc[]   // full word, write-only
+            acc0[m1] = (ri == 0) ? bias_reg[m1] : acc0[m1];  acc1 likewise
+            acc0[m1] += v.px[0].lane[m1] · w_buf[m1][ri]     // mac_dw_step, pixel ow_a
+            acc1[m1] += v.px[1].lane[m1] · w_buf[m1][ri]     // mac_dw_step, pixel ow_a + 1
+          ONE store per iteration (write-only words):
+            ri == 0 && hold pending → partial_outputs[hold_word] := hold
+            ri == n_win-1          → partial_outputs[word0] := acc0; hold := acc1 (word1)
 
     // PHASE 3: transpose + drain — identical to standard (§2.38)
 ```
 
-**Inner-MAC throughput is `kTileM` MACs/cycle** (PM-wide channel-parallel
-lanes; depthwise has no input-channel reduction).  A pixel costs exactly
-`kh · kw` cycles: the accumulator-word load, the per-pixel pipeline ramp
-and the store loop of the pre-§2.37 form are gone (one ramp per
-`(mt, ow_tile)` instead of one per pixel).  Depthwise weights stay cached
+**Inner-MAC throughput is `2 × kTileM` MACs/cycle** (PM-wide
+channel-parallel lanes for the two pixels of a pair, §2.42; depthwise has
+no input-channel reduction).  A pair of pixels costs exactly
+`max(kh · kw, 2)` cycles: the accumulator-word load, the per-pixel
+pipeline ramp and the store loop of the pre-§2.37 form are gone (one
+ramp per `(mt, ow_tile)` instead of one per pixel).  Depthwise weights stay cached
 across all ow_tiles within an mt — only patches see the per-ow_tile
 re-emission.
 
@@ -414,6 +456,7 @@ output column axis into `ow_tile`s whose iw window fits the buffer:
 ```
 window_w     = (kw - 1) · dilation_w + 1
 ow_per_tile  = max(1, (kMaxLineBufCols - window_w) / stride_w + 1)
+ow_per_tile  = ow_per_tile > 1 ? ow_per_tile & ~1 : 1          // §2.42: even, pair-aligned tiles
 num_ow_tiles = ceil(out_w / ow_per_tile)
 ```
 
@@ -465,7 +508,9 @@ reduction would be stream-rate-bound on `weight_stream`.
 | `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable=…` | top-level — `x`/`weight`/`bias` pointers + every scalar argument (§2.20) | Invariant for the whole invocation, so HLS forwards each as a stable signal instead of a per-consumer channel FIFO (`y`, the write port, is left unmarked) |
-| `ARRAY_PARTITION variable=patch complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` | `patch[kTileIC][kMaxKH][kMaxKW]` | Banked register file: kTileIC LUTRAMs, `(khi,kwi)` is a RAM address (§2.18) |
+| `ARRAY_PARTITION variable=patch0/patch1 complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` | `patch0/1[kTileIC][kMaxKH][kMaxKW]` | Banked register files, one per pixel of the pair: kTileIC LUTRAMs each, `(khi,kwi)` is a RAM address (§2.18, §2.42) |
+| `ARRAY_PARTITION variable=line_buf complete dim=1` + `BIND_STORAGE type=RAM_T2P impl=BRAM` | `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]` | 16 true-dual-port BRAM18 banks: Phase 2 reads two columns (a pixel pair) per cycle, Phase 1 writes one column per cycle in its own loop (§2.42) |
+| `DEPENDENCE variable=partial_outputs inter dependent=false` | the flat standard / depthwise sweeps | Every (pixel, tile) word is read once and written once per sweep, the write after the read (§2.41, §2.42) |
 | `ARRAY_PARTITION variable=w_cache complete dim=3` | standard `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks on the ic_l axis for the PN unroll |
 | `ARRAY_PARTITION variable=w_buf complete dim=1` | depthwise `w_buf[kTileM][kMaxKH][kMaxKW]` | kTileM banks for the PM unroll |
 | `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileM]` | All accumulators in registers |
@@ -475,13 +520,15 @@ reduction would be stream-rate-bound on `weight_stream`.
 
 ### 5.7 II=1 achievability in the reduce loops
 
-**Standard (`accumulate_standard`).**  Each PIPELINE iteration fires a
-`kTileIC`-wide PN adder tree feeding one `acc[m1] += lane_sum` per cycle.
-The lane rotation `m1 = ri & (kTileM-1)` cycles through `kTileM` lanes, so
-the RAW distance on any individual `acc[m1]` is `kTileM` cycles — enough to
-cover the multiplier latency (1 DSP cycle) + adder-tree depth
-`log2(kTileIC) = 4` + final accumulator add.  HLS schedules II=1 without
-needing a `DEPENDENCE` escape.
+**Standard (flat pair sweep, §2.41 / §2.42).**  Each PIPELINE iteration
+fires 2 × 16 private `kTileIC`-wide adder trees (one per output column
+per pixel; the accumulator seed word is a 17th leaf at the pixel's seed
+position) feeding distance-1 `acc0[m1] += tree0`, `acc1[m1] += tree1`
+recurrences.  The multiply + tree is feed-forward, so only a lone
+32-bit add sits in the recurrence and HLS schedules II=1 at iteration
+latency 8 (the same as the one-pixel §2.41 loop).  `partial_outputs`
+carries `DEPENDENCE inter dependent=false`: its one read and one write
+per iteration never touch the same word twice in one sweep.
 
 **Depthwise (`accumulate_depthwise`).**  Each PIPELINE iteration writes
 *all* `kTileM` accumulators (PM-wide unroll).  The per-lane RAW distance on
@@ -508,7 +555,7 @@ weight input; no DSP impact.
 
 ## 7. Test Coverage (`TestConvSim.cpp`)
 
-34 test cases compiled with GCC (no Vitis required). Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench currently uses pre-baked fixtures for 30 of these (the §2.9 chunking, §2.10 M-grouping, and §2.11 wide-input tests are C-sim-only until `make gen_conv_test_data` is re-run).
+59 named test cases compiled with GCC (no Vitis required), plus `TestConvGrid` (the MAC array in isolation, including the §2.42 two-pixel / staggered-seed step) and the `--sweep N` randomised-geometry net. Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench uses pre-baked fixtures for 58 of these (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture).
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
@@ -527,6 +574,7 @@ weight input; no DSP impact.
 | **Standard conv — ow-tiling** | **in_w=128 (3 ow-tiles; exercises §5.4)** |
 | Depthwise conv | 3×3 no-bias; 3×3 pad=1+bias; partial TILE_M+3; dilation=2; stride=2 pad=1; batch=2; exact TILE_M×2 + bias; 5×5 kernel; asymmetric stride |
 | **Depthwise conv — oh-chunking** | **32 ch / 32×32 out (2 chunks)** |
+| **Pixel pairs (§2.42)** | **3×3 s2 with odd (8×7) and even (6×8) out_w; out_w = 1 with 3 ic-tiles; ow-tiling with the tile width rounded to even (3×3 s2 in_w=128 → 30+30+4) and a 1×1 on in_w=130 (64+64+2); 3×3 s2 dilation 2 → 7×9; the space-to-depth stem 12ch 4×4 s1 pad [2,2,1,1] on 11×13; depthwise 1×1 (dummy position) and 3×3 s2 → 4×5; the sweep-bound 3×3 64→64 on 28×28 anchor** |
 | Saturation (ap_fixed only) | std positive overflow → AP_MAX; std negative overflow → AP_MIN; DW positive overflow → AP_MAX |
 
 ---
@@ -588,18 +636,18 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `float` |
 | **MAC operand width** | `Data_t × Data_t` 16×16 multiply → single DSP48 per lane; operands are *not* pre-widened to `AccData_t` (§2.17) |
 | **Tiling** | kTileM=16 output channels × kTileIC=16 input channels (§2.40; 8 × 16 before) |
-| **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid: kTileIC × kTileM = 256 MACs/cycle (§2.24, §2.40) |
-| **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel: kTileM=16 MACs/cycle |
+| **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid × 2 output pixels: 2 × kTileIC × kTileM = 512 MACs/cycle against one weight word per column (§2.24, §2.40, §2.42) |
+| **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel × 2 pixels: 2 × kTileM = 32 MACs/cycle (§2.42) |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
 | **Dataflow stages** | 6 (x_row_loader, input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
-| **Channel-packed patch stream** | `PatchVec` carries kTileIC lanes per beat; consumer patch drain is `kh·kw` beats instead of `kTileIC·kh·kw` |
-| **Patch buffer storage** | `patch[kTileIC][kMaxKH][kMaxKW]` is a banked register file — kTileIC LUTRAMs partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18) |
+| **Channel-packed patch stream** | `PatchPair` carries kTileIC lanes of TWO adjacent output pixels per beat (§2.12, §2.42); consumer patch drain is `kh·kw` beats per pixel pair |
+| **Patch buffer storage** | `patch0/1[kTileIC][kMaxKH][kMaxKW]` are banked register files (one per pixel of the pair) — kTileIC LUTRAMs each, partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18, §2.42) |
 | **Accumulator stream** | `acc_stream` carries 128-bit words of 8 saturated outputs of one channel (§2.38); `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
 | **Output drain rate** | 8 outputs per cycle: Phase 3 reads one 16-channel URAM word per two cycles (8 channels per cycle) through a segmented 8-bank rotated LUTRAM transposer (§2.38, §2.40) |
 | **Input fill rate** | 16 (standard) / 8 (depthwise) elements per cycle: `x_row_loader` drains 128-bit words into a ping-pong row buffer and emits one column of all channels per cycle (§2.39) |
 | **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
-| **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; (kw-1)·dilation_w cols re-fetched at tile boundaries |
+| **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; tile width rounded to even (pair-aligned, §2.42); (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **Tile geometry** | oh-chunking / M-grouping / ow-tiling resolved once by `compute_conv_geometry()` and passed to every stage as a `ConvGeometry` struct — one shared divider set, not one per stage (§2.19) |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
 | **AXI-Lite registers** | 21 scalars |
@@ -616,4 +664,4 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **AXI-Lite base address** | `0xA002_0000` |
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` |
-| **Test coverage** | 34 C-sim cases (30 covered by RTL fixtures; 4 newer §2.9–§2.11 tests are C-sim-only pending fixture regen) |
+| **Test coverage** | 59 named C-sim cases (58 RTL fixtures) + `TestConvGrid` + the 300-case random sweep |
