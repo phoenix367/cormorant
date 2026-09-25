@@ -236,6 +236,17 @@ class DataType(ABC):
         helpers every host op is written in terms of."""
         raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
 
+    @property
+    def host_lut_bits(self) -> int:
+        """Bits of a Data_t element when host ops may tabulate a function of
+        one element over every bit pattern (GELU, Softmax's exp), else 0."""
+        return 0
+
+    def c_host_lut_defs(self) -> str:
+        """C definitions the table-based host helpers use (``host_lut_bits``
+        != 0): HOST_LUT_SIZE, HOST_LUT_SCALE, ``host_sint_t``."""
+        return ""
+
 
 # ------------------------------------------------------------------ #
 # ap_fixed<W, I>                                                      #
@@ -374,6 +385,20 @@ class ApFixed(DataType):
 
     def c_int_display(self, ptr: str, idx: str) -> str:
         return f"(int)(int{self._W}_t){ptr}[{idx}]"
+
+    @property
+    def host_lut_bits(self) -> int:
+        return self._W if self._W <= 16 else 0
+
+    def c_host_lut_defs(self) -> str:
+        if not self.host_lut_bits:
+            return ""
+        return (
+            f"/* Lookup tables over every {self.name} bit pattern (value = bits / HOST_LUT_SCALE). */\n"
+            f"#define HOST_LUT_SIZE   {1 << self._W}u\n"
+            f"#define HOST_LUT_SCALE  {self._scale:.1f}\n"
+            f"typedef int{self._W}_t host_sint_t;   /* signed view of the Data_t bits */\n"
+        )
 
     def c_host_conversions(self) -> str:
         int_t = f"int{self._W}_t"

@@ -169,11 +169,12 @@ class TestGeneratedC(_Tiny):
         """inference.c + test_inference.c compiled unchanged against software
         kernel models: every output bit-identical to the simulator — host ops
         in place (cacheable buffers, the default) and staged (non-cacheable)."""
+        configs = [dict(), dict(cached=False)]
         for fname, m in self.models.items():
             _, cg = self.gen(m["path"])
-            for cached in (True, False):
-                with self.subTest(model=fname, cached=cached), tempfile.TemporaryDirectory() as td:
-                    rc, out = host_emu.build_and_run(cg, td, cached=cached)
+            for cfg in configs:
+                with self.subTest(model=fname, **cfg), tempfile.TemporaryDirectory() as td:
+                    rc, out = host_emu.build_and_run(cg, td, **cfg)
                     self.assertEqual(rc, 0, f"{fname}\n{out}")
                     self.assertIn("test_inference PASSED", out)
                     self.assertEqual(host_emu.failures(out), [])
@@ -184,12 +185,21 @@ class TestGeneratedC(_Tiny):
         src = cg.generate_source()
         self.assertIn("#include <math.h>", src)
         self.assertIn('#  pragma GCC optimize ("fp-contract=off")', src)
-        for fn in ("host_softmax", "host_layernorm", "host_gelu_tanh", "host_copy_nd",
+        for fn in ("host_softmax", "host_layernorm", "host_lut_map", "host_copy_nd",
                    "host_gather_rows", "host_onehot", "host_cast", "host_load", "host_store",
-                   "host_out_done"):
+                   "host_out_done", "host_parallel"):
             self.assertIn(f"static void {fn}(", src)
-        self.assertNotIn("static void host_gelu_erf(", src)       # only the kinds in use
+        self.assertIn("static int host_gelu_tanh_lut(", src)
+        self.assertNotIn("host_gelu_erf", src)                 # only the kinds in use
         self.assertIn("static Data_t *s_host_stage = NULL;", src)
+        # tables + threads set up in init, torn down in deinit
+        init = src[src.index("int inference_init("):src.index("void inference_deinit(void)")]
+        self.assertIn("if (host_runtime_init() != 0) { rc = -1; goto fail; }", init)
+        self.assertIn("host_runtime_deinit();", src[src.index("void inference_deinit(void)"):])
+        rt = src[src.index("static int host_runtime_init(void)"):]
+        self.assertIn("if (host_exp_lut_init() != 0) return -1;", rt)
+        self.assertRegex(rt, r"if \(host_gelu_tanh_lut\(&s_host_gelu_tanh_lut_[0-9a-f]{8}, "
+                             r"0\.04471499\d*, 0\.79788\d*\) != 0\) return -1;")
         self.assertRegex(src, r"s_host_stage = \(Data_t \*\)malloc\(\d+u \* INFERENCE_BYTES_PER_ELEM\);")
         self.assertIn("free(s_host_stage); s_host_stage = NULL;", src)
         # LN parameters stay float32 host constants, not DMA weights
@@ -205,6 +215,7 @@ class TestGeneratedC(_Tiny):
         cmake = cg.generate_cmake()
         self.assertIn("target_compile_options(inference PRIVATE -ffp-contract=off)", cmake)
         self.assertIn("target_link_libraries(inference PUBLIC m)", cmake)
+
 
     def test_event_stream_and_liveness(self):
         for m in self.models.values():
@@ -275,7 +286,7 @@ class TestGeneratedC(_Tiny):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("Gelu", r.stderr)
             with open(os.path.join(td, "src", "inference.c")) as f:
-                self.assertIn("host_gelu_erf(", f.read())
+                self.assertIn("host_gelu_erf_lut(", f.read())
             r = subprocess.run([sys.executable, os.path.join(_ROOT, "inference_scheduler.py"),
                                 m["path"], "--out-dir", td, "--no-fuse-patterns"],
                                capture_output=True, text=True)

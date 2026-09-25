@@ -5,8 +5,8 @@ from typing import List
 
 from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode, SchedulerError,
                         SpaceToDepthNode)
-from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_HELPERS, HostNode,
-                          SliceNode)
+from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
+                          SliceNode, host_c_helper)
 from ._banners  import _banner, _file_banner
 
 
@@ -40,8 +40,8 @@ class _SourceMixin:
         return "\n".join(parts) + "\n"
 
     def _source_includes(self) -> str:
-        stdio = '#include <stdio.h>    /* fopen, fread, snprintf */\n' \
-                if self.large_weight_tensors else ''
+        stdio = '#include <stdio.h>    /* fopen, fread, snprintf, fprintf */\n' \
+                if (self.large_weight_tensors or self._host_nodes) else ''
         stdlib = '#include <stdlib.h>   /* malloc, free (host staging buffers) */\n' \
                 if (self._host_op_nodes or self._host_nodes) else ''
         mathh = '#include <math.h>     /* host ops: exp, sqrt, tanh, erf, nearbyint */\n' \
@@ -176,13 +176,24 @@ class _SourceMixin:
                 return bool(getattr(type(sn), "kernel_name", ""))
         return False
 
+    def _host_luts(self) -> List[tuple]:
+        """Distinct lookup tables of the host nodes: [(c_name, init_call)]."""
+        luts: dict = {}
+        for sn in self._host_nodes:
+            for name, init in sn.c_luts(self._dtype):
+                luts.setdefault(name, init)
+        return list(luts.items())
+
     def _host_ops_section(self) -> str:
         host = self._host_nodes
         if not host:
             return ""
+        lut = bool(self._dtype.host_lut_bits)
         used = set()
         for sn in host:
             used.update(sn.c_helpers())
+        if lut and used & {"gelu_tanh", "gelu_erf"}:
+            used.add("lut_map")
         parts = [
             _banner("Host-CPU ops (no hardware kernel)"),
             "/*\n"
@@ -190,7 +201,8 @@ class _SourceMixin:
             " * each computes in double precision straight from / into the DMA buffers\n"
             " * (cacheable mapping; else via the cached staging arena s_host_stage),\n"
             " * rounds half to even + saturates on write-back, and flushes its output\n"
-            " * for the consuming kernel.  The scheduler's simulator (_simulate.py /\n"
+            " * for the consuming kernel.  GELU and Softmax's exp() are lookup tables\n"
+            " * filled at init by the same code path.  The scheduler's simulator (_simulate.py /\n"
             " * host_nodes.py) implements the same operations in the same order, so\n"
             " * test_inference.c expects bit-identical results.\n"
             " *\n"
@@ -202,17 +214,45 @@ class _SourceMixin:
             "#  pragma GCC optimize (\"fp-contract=off\")\n"
             "#endif\n",
             self._dtype.c_host_conversions(),
-            HOST_C_COMMON,
         ]
+        if lut:
+            parts.append(self._dtype.c_host_lut_defs())
+        parts += [HOST_C_COMMON, HOST_C_POOL]
         for kind in HOST_C_HELPER_ORDER:
             if kind in used:
-                parts.append(HOST_C_HELPERS[kind])
+                parts.append(host_c_helper(kind, lut))
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))
         if consts:
             parts.append("/* Per-node host-op constants */\n" + "\n".join(consts) + "\n")
+        parts.append(self._host_runtime_functions())
         return "\n".join(parts)
+
+    def _host_runtime_functions(self) -> str:
+        """host_runtime_init() / host_runtime_deinit(): the lookup tables
+        (called by inference_init / inference_deinit)."""
+        luts = self._host_luts()
+        decl = [f"static Data_t *{name} = NULL;" for name, _ in luts
+                if name != "s_host_exp_lut"]          # declared with its helper
+        init = [f"    if ({call} != 0) return -1;" for _, call in luts]
+        free = [f"    free({name}); {name} = NULL;" for name, _ in luts]
+        return (
+            ("/* Lookup tables (filled in host_runtime_init) */\n" + "\n".join(decl) + "\n\n"
+             if decl else "") +
+            "/* Host-op runtime: the lookup tables.  Called by inference_init() /\n"
+            " * inference_deinit(). */\n"
+            "static int host_runtime_init(void)\n"
+            "{\n" +
+            "".join(ln + "\n" for ln in init) +
+            "    return 0;\n"
+            "}\n"
+            "\n"
+            "static void host_runtime_deinit(void)\n"
+            "{\n" +
+            "".join(ln + "\n" for ln in free) +
+            "}\n"
+        )
 
     def _emit_host_block(self, sn) -> str:
         """One host op inside inference_run(): invalidate kernel-written
@@ -987,6 +1027,9 @@ class _SourceMixin:
             )
             alloc_lines.append("    if (!s_host_stage) { rc = -1; goto fail; }")
             alloc_lines.append("")
+            alloc_lines.append("    /* Host-op lookup tables */")
+            alloc_lines.append("    if (host_runtime_init() != 0) { rc = -1; goto fail; }")
+            alloc_lines.append("")
 
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
@@ -998,6 +1041,7 @@ class _SourceMixin:
                 f"    free({sn.stage_c_name}); {sn.stage_c_name} = NULL;"
             )
         if self._host_nodes:
+            deinit_free.append("    host_runtime_deinit();")
             deinit_free.append("    free(s_host_stage); s_host_stage = NULL;")
         for t in weights + intermediates:
             if t.onnx_name in reshape_aliases:
