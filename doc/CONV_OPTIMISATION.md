@@ -1754,6 +1754,29 @@ latency is paid once per input row).
 
 ---
 
+### On board after §2.37–§2.39 (2026-09-26, bitstream WNS +1.06 ns, ConvKernel_0 x/y instances at 128)
+
+144/144 scheduler models PASS, including the partial-strobe run edges
+(7×7 / 14×14 / 28×28 outputs, the 121×75 and 33×37 geometries) and the
+unaligned-row x reads the RTL fixtures cover.  `run_remote_perf.py`,
+before → after:
+
+| Case | before | after | |
+|---|---:|---:|---:|
+| dw-3x3-64ch-56x56 | 9.005 ms / 0.40 GOps/s | 2.858 ms / 1.26 GOps/s | 3.15× |
+| dw-3x3-32ch-28x28 | 1.091 ms | 0.384 ms | 2.8× |
+| 3x3-64ch-56x56 | 18.61 ms / 12.4 GOps/s | 15.43 ms / 15.0 GOps/s | 1.21× |
+| 3x3-64ch-56x56-s2 | 6.05 ms | 3.87 ms | 1.56× |
+| 1x1-64to128-56x56 | 18.13 ms | 14.64 ms | 1.24× |
+| 1x1-128to256-28x28 | 15.93 ms | 14.17 ms | 1.12× |
+| 3x3-1ch-28x28-32out | 0.771 ms | 0.555 ms | 1.39× |
+
+Demos (with Track C already in): MobileNet v2 344 → **225 ms**, MobileNet
+v1 444 → **349 ms**, ResNet-18 345 → **311 ms**, MNIST convnet 0.813 →
+**0.732 ms**, LeNet 7.65 → **7.29 ms**; predictions and logits identical.
+Cumulative vs the original README: MobileNet v1 7.1×, v2 8.3×, ResNet-18
+7.9×.
+
 ## 3. Current architecture (post-§2.39)
 
 ```mermaid
