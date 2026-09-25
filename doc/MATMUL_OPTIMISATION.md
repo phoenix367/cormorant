@@ -352,7 +352,102 @@ untouched here, noted for the record.
 
 ---
 
-## 5. Verification matrix
+## 5. K-split across the row lanes when `n_valid < kTileN` (Track A2, 2026-09-25)
+
+**Problem.**  The K-loop rotates over `kTileN = 4` row lanes so that each
+`acc[n1]` register is written every 4 cycles (§5 of MATMUL_KERNEL.md).
+With fewer than 4 valid rows in the n_tile the idle lanes still take their
+turn: a fully-connected layer (`n = 1`, e.g. the classifier `1×1280×1001`
+of MobileNet v2 or the `1×256×256` bench case) spends 75 % of its K-loop
+cycles on lanes that compute nothing — 0.49 GOps/s on the board against
+a 3.2 GOps/s peak (THROUGHPUT_PLAN.md §0).
+
+**Change.**  Lane `n1` now works on row `n1 / lpr`, K-segment `n1 % lpr`,
+with `lpr` (lanes per row) the largest power of two such that
+`lpr · n_valid ≤ kTileN` — 4 / 2 / 1 for `n_valid = 1 / 2 / 3–4`.  Per
+k_tile, `seg_len = ceil(k_valid / lpr)`, the loop runs `seg_len · kTileN`
+iterations (`kk = ki / kTileN` is the offset inside the segment, `kl =
+seg · seg_len + kk` the K index inside the tile) and the guard
+`kl < k_valid` idles the lanes whose segment overruns the tile when `lpr`
+does not divide `k_valid`.  Each iteration still reads exactly one `a_buf`
+element and one `b_tile` row — the same ports as before — so II=1 is
+untouched.  After the k_tile loop a `log2(kTileN)`-stage tree folds the
+segment lanes of each row into lane `row · lpr` (`acc[n1] += acc[n1 +
+stride]` for `stride = 1, 2, …` while `lpr > stride`, fully unrolled, one
+cycle) and the C writer reads lane `n1 << lpr_log`.  Bit-exact: the
+fixed-point accumulate is modular, so the order of the partial sums
+cannot change the bits (C-sim 39/39 exact, including the three tail-guard
+geometries added for this step).
+
+**Traps hit.**  None in HLS — II=1 first time, no partial writes.  The
+cost is the reduction tree and its lane muxes: LUT 43.4 k → 45.9 k, FF
+10.3 k → 12.3 k (the plan's "~300 LUT" was optimistic; the tree is 48
+32-bit adders plus 2:1 selects on the acc registers).  `seg · seg_len` is
+kept out of the pipeline as four precomputed `seg_base[]` registers.
+
+**Result (RTL, 39 cases; before = §3b kernel).**
+
+| # | Test | n×k×m×batch | B | before | after | Δ |
+|--:|---|---|---|---:|---:|---:|
+| 0 | 1x1x1 | 1×1×1×1 | row-major | 6,065 | 6,095 | +0.5 % |
+| 1 | TileN x TileK x TileM | 4×256×16×1 | row-major | 43,470 | 41,830 | -3.8 % |
+| 2 | 2 TileN x TileK x TileM | 8×256×16×1 | row-major | 83,300 | 56,450 | -32.2 % |
+| 3 | TileN x 2 TileK x TileM | 4×512×16×1 | row-major | 78,050 | 76,410 | -2.1 % |
+| 4 | TileN x TileK x 2 TileM | 4×256×32×1 | row-major | 79,340 | 77,700 | -2.1 % |
+| 5 | TileN 2 x TileK x TileM partial N | 6×256×16×1 | row-major | 80,470 | 49,640 | -38.3 % |
+| 6 | TileN x TileK 5 x TileM partial K | 4×261×16×1 | row-major | 44,740 | 43,050 | -3.8 % |
+| 7 | TileN x TileK x TileM 3  partial M | 4×256×19×1 | row-major | 79,050 | 77,410 | -2.1 % |
+| 8 | TileN 2 x TileK 5 x TileM 3  all partial | 6×261×19×1 | row-major | 154,890 | 142,240 | -8.2 % |
+| 9 | 7 x 13 x 5 arbitrary small | 7×13×5×1 | row-major | 15,280 | 11,480 | -24.9 % |
+| 10 | N x 1 x M K 1 outer product | 5×1×17×1 | row-major | 13,200 | 11,760 | -10.9 % |
+| 11 | 1 x K x M N 1 row vector | 1×256×16×1 | row-major | 38,920 | 31,250 | -19.7 % |
+| 12 | N x K x 1 M 1 column vector | 4×256×1×1 | row-major | 40,830 | 39,200 | -4.0 % |
+| 13 | 3 TileN x 2 TileK 7 x 2 TileM 1  multi-tile all | 12×519×33×1 | row-major | 663,790 | 658,530 | -0.8 % |
+| 14 | batch 3 no broadcast | 5×64×19×3 | row-major | 129,960 | 113,570 | -12.6 % |
+| 15 | batch 4 A broadcasts a stride 0 | 5×64×19×4 | row-major | 172,390 | 150,540 | -12.7 % |
+| 16 | batch 4 B broadcasts b stride 0 | 5×64×19×4 | row-major | 172,290 | 150,360 | -12.7 % |
+| 17 | batch 6 both strided multi-dim flat | 5×64×19×6 | row-major | 256,650 | 223,790 | -12.8 % |
+| 18 | TileN x TileK x TileM B packed | 4×256×16×1 | packed | 25,760 | 24,090 | -6.5 % |
+| 19 | TileN 2 x TileK 5 x TileM 3  B packed all partial | 6×261×19×1 | packed | 81,760 | 69,080 | -15.5 % |
+| 20 | 7 x 13 x 5 B packed arbitrary small | 7×13×5×1 | packed | 14,310 | 11,060 | -22.7 % |
+| 21 | 1 x K x M B packed N 1 row vector | 1×256×16×1 | packed | 20,840 | 13,230 | -36.5 % |
+| 22 | N x K x 1 B packed M 1 | 4×256×1×1 | packed | 24,310 | 22,650 | -6.8 % |
+| 23 | 3 TileN x 2 TileK 7 x 2 TileM 1  B packed multi-tile | 12×519×33×1 | packed | 331,280 | 326,020 | -1.6 % |
+| 24 | 1 x 2 TileK x 4 TileM B packed FC-like | 1×512×64×1 | packed | 135,400 | 73,920 | -45.4 % |
+| 25 | batch 3 no broadcast B packed | 5×64×19×3 | packed | 80,690 | 64,280 | -20.3 % |
+| 26 | batch 4 B broadcasts B packed b stride 0 | 5×64×19×4 | packed | 106,750 | 84,830 | -20.5 % |
+| 27 | 1 x 261 x 19 K-split n 1 | 1×261×19×1 | row-major | 76,670 | 61,040 | -20.4 % |
+| 28 | 1 x 261 x 19 B packed K-split n 1 | 1×261×19×1 | packed | 39,910 | 24,320 | -39.1 % |
+| 29 | 2 x 13 x 5 K-split n 2 | 2×13×5×1 | row-major | 8,440 | 7,690 | -8.9 % |
+| 30 | 2 x 13 x 5 B packed K-split n 2 | 2×13×5×1 | packed | 7,420 | 6,760 | -8.9 % |
+| 31 | 3 x 517 x 33 K-split n 3 multi-tile | 3×517×33×1 | row-major | 221,060 | 219,870 | -0.5 % |
+| 32 | 3 x 517 x 33 B packed K-split n 3 | 3×517×33×1 | packed | 109,490 | 108,300 | -1.1 % |
+| 33 | batch 3 6 x 517 x 35 prefetch crosses tiles | 6×517×35×3 | row-major | 1,312,140 (was FAIL) | 1,212,130 **FAIL** | -7.6 % |
+| 34 | batch 3 6 x 517 x 35 B packed prefetch crosses tiles | 6×517×35×3 | packed | 643,760 | 543,810 | -15.5 % |
+| 35 | batch 3 6 x 517 x 35 B broadcasts b stride 0 | 6×517×35×3 | row-major | 1,312,195 | 1,212,020 | -7.6 % |
+| 36 | batch 3 6 x 517 x 35 B broadcasts B packed b stride 0 | 6×517×35×3 | packed | 643,590 | 543,440 | -15.6 % |
+| 37 | sat pos a 100 b 100 K 3  AP MAX | 4×3×16×1 | row-major | 9,670 | 7,910 | -18.2 % |
+| 38 | sat neg a 100 b -100 K 3  AP MIN | 4×3×16×1 | row-major | 9,510 | 7,730 | -18.7 % |
+| | **Σ duration_ns (common cases)** | | | **7,367,640** | **6,605,485** | **-10.3 %** |
+
+
+Σ over the 37 common cases **−10.4 %** (−7.8 % on top of §4).  The K-split
+does what it was built for: `1 × 2·TileK × 4·TileM packed` (the FC shape,
+`n = 1`) **−45 %** (135,400 → 73,920 ns), `1 × K × M packed` −37 %,
+`1×261×19 packed` −39 %; the row-major twins gain less (`1×261×19` −20 %,
+`1×K×M` −20 %) because their B load, not the K-loop, dominates.  Every
+case whose last n_tile is short gains too: `partial N` (6 rows → 4 + 2)
+−38 %, `all partial` −8 %, the `5×64×19` batch cases (rows 4 + 1)
+−13 …−21 %, `6×517×35 batch 3` −8 % / −16 %.  Full n_tiles are unchanged
+(`4×256×16` −3.8 %, unchanged since §4); nothing regressed.  The
+`6×517×35` row-major case still shows the §4 stand artifact.
+
+Synthesis: II=1 on every loop, slack 0.00 ns (K-loop 0.04), BRAM 64,
+DSP 35, FF 12.3 k, LUT 45.9 k.
+
+---
+
+## 6. Verification matrix
 
 | Gate | Command | Baseline result |
 |---|---|---|
@@ -362,7 +457,7 @@ untouched here, noted for the record.
 
 ---
 
-## 6. Related files
+## 7. Related files
 
 | File | Purpose |
 |---|---|

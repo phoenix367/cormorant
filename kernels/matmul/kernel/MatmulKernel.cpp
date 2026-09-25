@@ -238,6 +238,21 @@ void MatmulKernel(
             const unsigned n_off   = n_tile * kTileN;
             const unsigned n_valid = std::min(kTileN, n - n_off);
 
+            // K-split across lanes (MATMUL_OPTIMISATION.md §5).  When the
+            // n_tile has fewer than kTileN valid rows, the idle row lanes
+            // take K-segments of the valid rows instead: lane n1 works on
+            // row n1 / lpr, K-segment n1 % lpr, with lpr = lanes per row the
+            // largest power of two with lpr * n_valid <= kTileN (4 / 2 / 1
+            // for n_valid = 1 / 2 / 3-4).  The segment lanes of a row are
+            // summed after the k_tile loop (exact: fixed-point adds are
+            // modular, so the order of the K-sum does not change the bits).
+            unsigned lpr_log = 0;
+            for (unsigned c = 1; (1u << c) <= kTileN; c++) {
+                #pragma HLS UNROLL
+                if ((n_valid << c) <= kTileN) lpr_log = c;
+            }
+            const unsigned lpr = 1u << lpr_log;
+
             // ---------------------------------------------------------------
             // Load a_buf: n_valid rows × k columns from A.
             //
@@ -354,16 +369,57 @@ void MatmulKernel(
                     // bit-identical to widening both operands first — and
                     // costs one 16×16 DSP instead of a 32×32 multiply.
                     // -------------------------------------------------------
-                    const unsigned ki_bound = k_valid * kTileN;
+                    // With the K-split, lane n1 = (row n1 >> lpr_log,
+                    // segment n1 & (lpr - 1)) covers the local K range
+                    // [seg * seg_len, seg * seg_len + seg_len) of this tile,
+                    // seg_len = ceil(k_valid / lpr); the loop runs seg_len
+                    // × kTileN iterations and the guard `kl < k_valid` idles
+                    // the lanes whose segment overruns the tile (the last
+                    // segment when lpr does not divide k_valid).  Each
+                    // iteration still reads ONE a_buf element and ONE
+                    // b_tile row (the same lane and RAM ports as without
+                    // the split), so II=1 is unchanged.
+                    const unsigned seg_len  = (k_valid + lpr - 1) >> lpr_log;
+                    unsigned seg_base[kTileN];
+                    #pragma HLS ARRAY_PARTITION variable=seg_base complete dim=0
+                    for (unsigned s = 0; s < kTileN; s++) {
+                        #pragma HLS UNROLL
+                        seg_base[s] = s * seg_len;
+                    }
+                    const unsigned ki_bound = seg_len * kTileN;
                     for (unsigned ki = 0; ki < ki_bound; ki++) {
                         #pragma HLS PIPELINE II=1
                         const unsigned n1  = ki % kTileN;
                         const unsigned kk  = ki / kTileN;
-                        const unsigned kidx  = k_off + kk;
-                        const Data_t   a_val = a_buf[n1][kidx / E][kidx % E];
-                        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                        const unsigned row = n1 >> lpr_log;
+                        const unsigned seg = n1 & (lpr - 1);
+                        const unsigned kl  = seg_base[seg] + kk;   // K index local to this tile
+                        if (kl < k_valid) {
+                            const unsigned kidx  = k_off + kl;
+                            const Data_t   a_val = a_buf[row][kidx / E][kidx % E];
+                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                #pragma HLS UNROLL
+                                acc[n1][m1] += a_val * b_tile[kl][m1];
+                            }
+                        }
+                    }
+                }
+
+                // -----------------------------------------------------------
+                // K-split reduction: fold the segment lanes of every row into
+                // lane row * lpr — a log2(kTileN)-stage tree on the acc
+                // registers, each stage active only when lpr > stride
+                // (all in one cycle, fully unrolled).
+                // -----------------------------------------------------------
+                for (unsigned stride = 1; stride < kTileN; stride *= 2) {
+                    #pragma HLS UNROLL
+                    if (lpr > stride) {
+                        for (unsigned n1 = 0; n1 < kTileN; n1 += 2 * stride) {
                             #pragma HLS UNROLL
-                            acc[n1][m1] += a_val * b_tile[kk][m1];
+                            for (unsigned m1 = 0; m1 < kTileM; m1++) {
+                                #pragma HLS UNROLL
+                                acc[n1][m1] += acc[n1 + stride][m1];
+                            }
                         }
                     }
                 }
@@ -372,12 +428,14 @@ void MatmulKernel(
                 // Write output block: saturate_cast acc → C.
                 // n_valid sequential burst writes of m_valid elements each;
                 // the inner m1 loop pipelines at II=1 for burst AXI writes.
+                // Row n1's sum sits in lane n1 * lpr.
                 // -----------------------------------------------------------
                 for (unsigned n1 = 0; n1 < n_valid; n1++) {
+                    const unsigned lane = n1 << lpr_log;
                     for (unsigned m1 = 0; m1 < m_valid; m1++) {
                         #pragma HLS PIPELINE II=1
                         c_ptr[(n_off + n1) * m + (m_off + m1)] =
-                            saturate_cast<Data_t>(acc[n1][m1]);
+                            saturate_cast<Data_t>(acc[lane][m1]);
                     }
                 }
             }

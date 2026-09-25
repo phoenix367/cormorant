@@ -157,17 +157,25 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
         // b_batch_stride == 0 — instead of per (n_tile, m_tile, k_tile).
         if load_b: load_b_tile(m_tile, k_tile)                       PIPELINE II=1
 
-        // K-REDUCTION — iterates k_valid·kTileN times                    PIPELINE II=1
-        for ki in [0, k_valid·kTileN):
-          n1 = ki % kTileN          // row lane — rotates 0..kTileN-1
-          kk = ki / kTileN          // K index local to this k_tile
-          a_val = a_buf[n1][k_off + kk]
-          for m1 in [0, kTileM) UNROLL:
-            acc[n1][m1] += a_val · b_tile[kk][m1]      // Data_t × Data_t → AccData_t
+        // K-REDUCTION — iterates seg_len·kTileN times                     PIPELINE II=1
+        // (§5: lpr = lanes per row = 4 / 2 / 1 for n_valid = 1 / 2 / 3–4,
+        //  seg_len = ceil(k_valid / lpr))
+        for ki in [0, seg_len·kTileN):
+          n1  = ki % kTileN                 // lane — rotates 0..kTileN-1
+          row = n1 / lpr, seg = n1 % lpr    // row and K-segment of the lane
+          kl  = seg·seg_len + ki / kTileN   // K index local to this k_tile
+          if kl < k_valid:
+            a_val = a_buf[row][k_off + kl]
+            for m1 in [0, kTileM) UNROLL:
+              acc[n1][m1] += a_val · b_tile[kl][m1]    // Data_t × Data_t → AccData_t
+
+      // K-SPLIT REDUCTION — fold the segment lanes into lane row·lpr   (1 cycle, UNROLL)
+      for stride in 1, 2, …, kTileN/2: if lpr > stride:
+        for n1 in 0, 2·stride, …: acc[n1] += acc[n1 + stride]
 
       // WRITE C — saturate_cast acc → C, burst write per row             PIPELINE II=1
       for n1 in [0, n_valid): for m1 in [0, m_valid):
-        c[(n_off + n1)·m + (m_off + m1)] = saturate_cast<Data_t>(acc[n1][m1])
+        c[(n_off + n1)·m + (m_off + m1)] = saturate_cast<Data_t>(acc[n1·lpr][m1])
 ```
 
 `A` is loaded once per `n_tile` and reused across every `m_tile`/`k_tile`;
@@ -210,6 +218,22 @@ II=1. Since `kTileN` is a power of two, `ki % kTileN` is a bitwise AND and
 The inner `m1` loop is fully unrolled, so `kTileM` MAC units fire every
 cycle (one per output column). **Inner-loop throughput is `kTileM`
 MACs/cycle**, sustained at II=1.
+
+**K-split for short n_tiles (MATMUL_OPTIMISATION.md §5).**  When the
+n_tile has fewer than `kTileN` valid rows, the idle lanes would still take
+their turn in the rotation.  Instead, lane `n1` works on row `n1 / lpr`
+and K-segment `n1 % lpr` of that row, with `lpr` the largest power of two
+such that `lpr · n_valid ≤ kTileN` (4 / 2 / 1 lanes per row for
+`n_valid = 1 / 2 / 3–4`).  A k_tile is split into `lpr` segments of
+`seg_len = ceil(k_valid / lpr)` K indices; the loop runs
+`seg_len · kTileN` iterations and a guard idles the lanes whose segment
+overruns `k_valid`.  Each iteration still reads one `a_buf` element and
+one `b_tile` row, so II=1 is unchanged, and the rotation still writes every
+`acc[n1]` only every `kTileN` cycles.  After the k_tile loop a one-cycle
+tree folds the segment lanes into lane `row · lpr`, which the C writer
+reads.  Fixed-point accumulation is modular, so the result is bit-identical
+to the unsplit order.  A row vector (`n = 1`) thus runs its K-loop in
+`k / 4` iterations instead of `k`.
 
 ---
 
@@ -342,6 +366,7 @@ an IP-catalog archive.
 | **Inner-loop parallelism** | `kTileM=16` MACs/cycle (unrolled `m1` lanes) |
 | **Initiation interval** | II=1 in every load / reduce / write loop |
 | **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
+| **Short n_tiles** | K-split: 4 / 2 lanes per row when `n_valid = 1 / 2`, lanes folded after the k_tile loop |
 | **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`) |
 | **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM), `acc` (registers) |
 | **A reuse** | `a_buf` loaded once per `n_tile` (row requests batched 4 deep), reused across all `m_tile`/`k_tile` |
