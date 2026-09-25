@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes    import ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode
+from ..nodes    import ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode, SpaceToDepthNode
 from ._banners  import _banner, _file_banner
 
 
@@ -34,6 +34,8 @@ class _SourceMixin:
     def _source_includes(self) -> str:
         stdio = '#include <stdio.h>    /* fopen, fread, snprintf */\n' \
                 if self.large_weight_tensors else ''
+        stdlib = '#include <stdlib.h>   /* malloc, free (host staging buffers) */\n' \
+                if self._host_op_nodes else ''
         kernel_headers = "".join(
             f'#include "{kd.driver_prefix}.h"\n'
             for kd in self._active_kernels
@@ -46,6 +48,7 @@ class _SourceMixin:
             f'{kernel_headers}'
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
+            f'{stdlib}'
             '\n'
             '/*\n'
             ' * Cache coherency between the CPU and the AXI DMA master is handled by\n'
@@ -92,6 +95,11 @@ class _SourceMixin:
             parts.append("")
         return "\n".join(parts)
 
+    @property
+    def _host_op_nodes(self) -> List[SpaceToDepthNode]:
+        """Host-side ops that need a cached staging block (SpaceToDepthNode)."""
+        return [sn for sn in self._graph.nodes if isinstance(sn, SpaceToDepthNode)]
+
     def _buffer_declarations(self) -> str:
         lines = [_banner("Mutable intermediate buffers")]
 
@@ -128,6 +136,21 @@ class _SourceMixin:
             )
             for t in pool_tensors:
                 lines.append(f"static inference_buf_t _s_buf_{t.c_name};")
+
+        host_ops = self._host_op_nodes
+        if host_ops:
+            lines.append("")
+            lines.append(
+                "/* Cached host staging blocks for the SpaceToDepth reorders (2 x source\n"
+                " * numel each: stage_in | stage_out).  The DMA buffers are mapped\n"
+                " * non-cacheable, so the reorder runs on a plain malloc'd copy and only\n"
+                " * sequential memcpys touch the DMA memory.  malloc'd in inference_init(). */"
+            )
+            for sn in host_ops:
+                lines.append(
+                    f"static Data_t *{sn.stage_c_name} = NULL;"
+                    f"  /* [{sn.index}] {sn.numel} elem x 2 */"
+                )
 
         return "\n".join(lines)
 
@@ -763,11 +786,28 @@ class _SourceMixin:
                     )
                 alloc_lines.append("")
 
+        host_ops = self._host_op_nodes
+        if host_ops:
+            alloc_lines.append("    /* Cached host staging for the SpaceToDepth reorders */")
+            for sn in host_ops:
+                alloc_lines.append(
+                    f"    {sn.stage_c_name} = (Data_t *)malloc(2u * {sn.numel}u"
+                    f" * INFERENCE_BYTES_PER_ELEM);"
+                )
+                alloc_lines.append(
+                    f"    if (!{sn.stage_c_name}) {{ rc = -1; goto fail; }}"
+                )
+            alloc_lines.append("")
+
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
         # inference_deinit(): null all weight and intermediate pointers,
         # free the single pool, then close pool.
         deinit_free: List[str] = []
+        for sn in host_ops:
+            deinit_free.append(
+                f"    free({sn.stage_c_name}); {sn.stage_c_name} = NULL;"
+            )
         for t in weights + intermediates:
             if t.onnx_name in reshape_aliases:
                 deinit_free.append(

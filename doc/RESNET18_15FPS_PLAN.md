@@ -64,8 +64,15 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   scheduler transform `OnnxGraph(s2d_stem=True)` / CLI default, host-side
   `SpaceToDepthNode`, ResNet-18 stem becomes `SpaceToDepth(2)` + Conv
   4×4 s1 pad(2,2) 12→64 on 112² (16 taps × 12 of 16 lanes instead of
-  49 taps × 3 lanes; MAC-sweep work ≈ ×0.33 per output pixel).  Expected
-  57 → ~20–27 ms plus ~0.3 ms host reorder; board measurement pending.
-  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
+  49 taps × 3 lanes; MAC-sweep work ≈ ×0.33 per output pixel).
+  **Board (merge c4cb9ce):** stem conv **57.5 → 23.9 ms**, logits
+  identical — but the host reorder cost **16.3 ms** (profiler layer 0),
+  not 0.3 ms: the generated loop did strided 2-byte loads straight from
+  the XRT BO, whose CPU mapping is non-cacheable (~100 ns per load), so
+  ResNet-18 only went 310 → 292.8 ms and MobileNet v1 / v2 regressed
+  (348.7 → 362.3, 221.4 → 235.1: their 3×3 s2 stems save 2.5 ms and paid
+  16.3).  Fixed on `perf/stem` by staging the reorder through a cached
+  malloc'd block (two sequential memcpys are the only BO traffic);
+  expected reorder ≤ 0.5 ms — re-measure.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
   typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/INFERENCE_SCHEDULER.md`
   §Space-to-depth stem.
