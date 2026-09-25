@@ -61,7 +61,7 @@ cd inference-scheduler
 scripts/read_kernel_regs.sh            # from this skill: widths + kernel states
 ```
 
-`read_kernel_regs.sh` must show the HPC0 width fields = **0 (128-bit)**
+`read_kernel_regs.sh` must show the HPC0 **and HPC1** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26; the loader derives both from the HWH)
 — the AFIFM encoding is 0 = 128, 1 = 64, 2 = 32 (the loader's PYNQ
 table), NOT the other way round.  Until 2026-09-24 the block design
 left `S_AXI_HPC0_FPD` at 32 bits (`PSU__SAXIGP0__DATA_WIDTH`), so the

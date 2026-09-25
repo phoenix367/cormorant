@@ -35,7 +35,7 @@ second PS port becomes necessary once steps 4–5 land (step 6).
 | 3 | **1×1 stride-2 path**: trace why the 6.4 MMAC downsamples take 3.6 ms (14 %); expected fix is a flat II=1 sweep for kh = kw = 1 (the §2.37 recipe for depthwise) with stride handled in the x loader | `kernels/conv/*` | 11 → 2–3 ms | after step 4 in the same worktree |
 | 4 | **Conv grid 16×8 → 16×16** (`tile_m` 8 → 16 in `platforms/kv260.json` + whatever the kernel needs): w_cache moves to URAM (16/64 used) since BRAM is at 119/144; drain/write path must keep up with 16 output channels | `kernels/conv/*`, `platforms/kv260.json`, `gen_conv_models.py` (fixtures re-derive), `doc/CONV_OPTIMISATION.md` | 3×3 convs 220 → ~115–130 ms if sweep efficiency holds | DSP 155 → ~285 (of 1248), LUT +15–20 k (design 62 % → ~77 %), BRAM must not grow |
 | 5 | 150 MHz (Track D: reset-net fix, conv DSP chain re-pipelining) | BD, all kernels | ×1.5 | not started |
-| 6 | Second PS port for conv w/b (block-design wiring only) | `hw/cormorant_hw_128` | needed after 4–5 | not started |
+| 6 | Second PS port for conv w/b (block-design wiring only) | `hw/cormorant_hw_128` | needed after 4–5 | **done 2026-09-26, neutral at 100 MHz (§3.2)** |
 | 7 | Sweep efficiency 60 → 80 %+ (cycle-level trace on a 56² fixture) | `kernels/conv/*` | 3×3 convs −25 % | not started |
 
 Model-based outcome: steps 1–6 at 60 % efficiency ≈ 92 ms (11 FPS); with
@@ -152,4 +152,27 @@ platform bound is 7; the scheduler rejects such models).  The old kernel
 tolerated it; the new one hangs and wedges the HPC port until a reboot.
 Replaced by `GlobalMaxPool-7x7-256`; a kernel-side clamp of the window
 to `kMaxPoolH/W` is a robustness follow-up (needs a bitstream).
+
+### 3.2. Step 6: second PS port (2026-09-26)
+
+Block design: `S_AXI_HPC1_FPD` enabled at 128 bits, a second 128-bit
+`axi_interconnect` (`axi_mem_intercon`, 3 masters) carries ConvKernel
+`gmem1` (w), `gmem2` (b) and MatmulKernel `gmem1` (B); `axi_interconnect_0`
+keeps the other nine masters on HPC0.  The loader programs both AFIFM
+widths from the HWH (`C_SAXIGP1_DATA_WIDTH`), `read_kernel_regs.sh` shows
+HPC0/HPC1 rd/wr = 0 (128-bit).  Vivado trap: the moved masters keep their
+HPC0 address segments, which then collide with the HPC1 ones — delete
+the stale `SEG_*HPC0*` segments before `assign_bd_address`.  Bitstream
+WNS +1.30 ns, LUT 72.7 % (+0.3 k), BRAM/URAM unchanged; 144/144.
+
+**Result: no measurable change at 100 MHz.**  ResNet-18 91.18 → 91.19 ms,
+every layer class within ±0.04 ms (stage-4 512-ch 3×3 layers 17.33 →
+17.36 ms), MobileNet v1/v2 87.4/71.1, perf cases identical (3x3-64ch
+4.941 → 4.941, 1x1-64to128 1.838 → 1.838, FC-1x1280x1001-packed 1.747 →
+1.748; row-major 256³ 7.24 → 7.39 ms, +2 %, the only mover).  The
+single HPC0 port was therefore not a bottleneck anywhere on this
+bitstream — the 3×3 layers are compute-bound at 89–97 %.  Kept in the
+design (it costs nothing) because it becomes necessary at 150 MHz, where
+the 512-channel layers' weight stream (4.7 MB per layer) would fill one
+2.4 GB/s port.
 
