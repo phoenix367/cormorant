@@ -82,3 +82,11 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   changes every buffer's coherency model.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
   typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/INFERENCE_SCHEDULER.md`
   §Space-to-depth stem.
+
+- **Step 2: implemented** on `perf/pool` (POOL_OPTIMIZATION.md §2.14) — RTL
+  −56.2 % on the 31 common pool cases (1,162,425 → 509,665 ns, every case
+  faster, −74/−78 % on the 2×2 s2 wide-W cases), 43/43 RTL and 45/45 C-sim
+  bit-exact; the ResNet-stem-shaped fixture (MaxPool 3×3 s2 on 28×112) runs
+  in 48.6 µs, ≈ 1.3 ms for the full 112²×64 layer by the cycle model (board
+  figure pending integration).  HLS estimate BRAM 44 → 11, LUT +4.9 k.  The
+  `PoolingKernel_0` instance needs `C_M_AXI_GMEM1_DATA_WIDTH = 128`.

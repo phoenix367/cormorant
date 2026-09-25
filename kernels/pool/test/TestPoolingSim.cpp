@@ -257,8 +257,45 @@ struct TC {
 // ---------------------------------------------------------------------------
 #ifdef POOL_COSIM
 static PoolWord g_pool_x[POOL_COSIM_DEPTH_X_WORDS];
-static Data_t   g_pool_y[POOL_COSIM_DEPTH_Y];
+static PoolWord g_pool_y[POOL_COSIM_DEPTH_Y_WORDS];
 #endif
+
+// ---------------------------------------------------------------------------
+// y is a 128-bit word port with byte-strobed run edges (PoolingKernel.h).
+// The bench hands the kernel a word buffer pre-filled with kYSentinel and,
+// after the run, checks every lane past the tensor end (the tail of the
+// last word plus one guard word) still holds the sentinel — the kernel's
+// strobes must never touch a byte outside the tensor.
+// ---------------------------------------------------------------------------
+static const uint16_t kYSentinel = 0xDEADu;
+
+static unsigned y_words_for(int out_size) {
+    return (unsigned)out_size / kPoolPortElems + 2u;
+}
+
+static void y_fill_sentinel(PoolWord* y, unsigned n_words) {
+    for (unsigned w = 0; w < n_words; w++)
+        for (unsigned l = 0; l < kPoolPortElems; l++)
+            y[w].range(kPoolDataBits * (l + 1) - 1, kPoolDataBits * l) = kYSentinel;
+}
+
+static Data_t y_elem(const PoolWord* y, int i) {
+    const unsigned lane = (unsigned)i % kPoolPortElems;
+    return pool_lane_to_data(y[(unsigned)i / kPoolPortElems].range(
+        kPoolDataBits * (lane + 1) - 1, kPoolDataBits * lane));
+}
+
+// Number of pad lanes (from out_size up to the end of the guard word) that
+// no longer hold the sentinel.
+static unsigned y_pad_violations(const PoolWord* y, int out_size, unsigned n_words) {
+    unsigned bad = 0;
+    for (unsigned i = (unsigned)out_size; i < n_words * kPoolPortElems; i++) {
+        const unsigned lane = i % kPoolPortElems;
+        if (y[i / kPoolPortElems].range(kPoolDataBits * (lane + 1) - 1, kPoolDataBits * lane)
+            != kYSentinel) bad++;
+    }
+    return bad;
+}
 
 // x is a 128-bit word port: pack the element vector into PoolWord words
 // (NCHW layout unchanged; one spare word so the kernel's last partial-word
@@ -464,14 +501,17 @@ static bool run_test(const TC& tc)
         const std::vector<PoolWord> xw = to_pool_words(x);
         std::copy(xw.begin(), xw.end(), g_pool_x);
     }
-    std::fill(g_pool_y, g_pool_y + out_size, Data_t(0));
+    const unsigned y_words = y_words_for(out_size);
+    y_fill_sentinel(g_pool_y, y_words);
     PoolWord* x_ptr = g_pool_x;
-    Data_t*   y_ptr = g_pool_y;
+    PoolWord* y_ptr = g_pool_y;
 #else
-    std::vector<Data_t> y(out_size, Data_t(0));
+    const unsigned y_words = y_words_for(out_size);
+    std::vector<PoolWord> y(y_words);
+    y_fill_sentinel(y.data(), y_words);
     std::vector<PoolWord> xw = to_pool_words(x);
     PoolWord* x_ptr = xw.data();
-    Data_t*   y_ptr = y.data();
+    PoolWord* y_ptr = y.data();
 #endif
 
     PoolingKernel(
@@ -505,8 +545,8 @@ static bool run_test(const TC& tc)
                         tc.dil_h, tc.dil_w,
                         tc.pool_type, tc.lp_order,
                         tc.count_include_pad);
-                    float got = to_float(y_ptr[(n * tc.C + c) * tc.out_h * tc.out_w
-                                               + oh * tc.out_w + ow]);
+                    float got = to_float(y_elem(y_ptr, (n * tc.C + c) * tc.out_h * tc.out_w
+                                                       + oh * tc.out_w + ow));
                     if (std::abs(ref - got) > kTol) {
                         if (failures < 4) {
                             printf("    FAIL [n=%d,c=%d,oh=%d,ow=%d]: "
@@ -522,12 +562,16 @@ static bool run_test(const TC& tc)
 
     const unsigned unexpected_dups =
         (dup_reads > expected_dups) ? (dup_reads - expected_dups) : 0u;
-    const bool ok = (failures == 0) && (unexpected_dups == 0);
+    const unsigned pad_bad = y_pad_violations(y_ptr, out_size, y_words);
+    const bool ok = (failures == 0) && (unexpected_dups == 0) && (pad_bad == 0);
     const char* status = ok ? "PASS" : "FAIL";
     printf("  [%s] %-45s  failures=%d/%d  dup_reads=%u/%u",
            status, tc.name, failures, out_size, dup_reads, expected_dups);
     if (unexpected_dups > 0) {
         printf("  (%u UNEXPECTED duplicate DDR read(s))", unexpected_dups);
+    }
+    if (pad_bad > 0) {
+        printf("  (%u y pad lane(s) CLOBBERED past the tensor end)", pad_bad);
     }
     printf("\n");
     return ok;
@@ -609,14 +653,15 @@ static bool run_avg_pool_strict_test()
             const std::vector<PoolWord> xw = to_pool_words(x);
             std::copy(xw.begin(), xw.end(), g_pool_x);
         }
-        std::fill(g_pool_y, g_pool_y + (N*C*out_h*out_w), Data_t(0));
+        y_fill_sentinel(g_pool_y, y_words_for(N*C*out_h*out_w));
         PoolWord* x_ptr = g_pool_x;
-        Data_t*   y_ptr = g_pool_y;
+        PoolWord* y_ptr = g_pool_y;
 #else
-        std::vector<Data_t> y(N*C*out_h*out_w, Data_t(0));
+        std::vector<PoolWord> y(y_words_for(N*C*out_h*out_w));
+        y_fill_sentinel(y.data(), (unsigned)y.size());
         std::vector<PoolWord> xw = to_pool_words(x);
         PoolWord* x_ptr = xw.data();
-        Data_t*   y_ptr = y.data();
+        PoolWord* y_ptr = y.data();
 #endif
 
         PoolingKernel(
@@ -659,7 +704,7 @@ static bool run_avg_pool_strict_test()
                             : (unsigned)valid_count;
                         const double ref_d = ref_avg_pool_fixed(acc, denom);
                         const double got_d = (double)to_float(
-                            y_ptr[(n*C + c) * out_h*out_w + oh*out_w + ow]);
+                            y_elem(y_ptr, (n*C + c) * out_h*out_w + oh*out_w + ow));
 
                         // Strict equality on the ap_fixed<16,8> grid: any
                         // 1-LSB drift indicates the kernel deviated from
@@ -819,6 +864,41 @@ int main(int argc, char** argv)
                 2,2,4,96, 4,96, 3,3, 1,1, 1,1, 1,1, 1,0,0},
         {"MaxPool wide W=128 2x2 stride2 batch=2",
                 2,4,4,128, 2,64, 2,2, 2,2, 0,0, 1,1, 0,0,0},
+        // ---------------------------------------------------------------
+        // §2.14 tail / alignment cases for the 128-bit word paths: rows
+        // and channel planes that are not whole words (in_w, out_w,
+        // out_h*out_w not multiples of 8), widths below one word, stride-2
+        // rows with odd output widths, the W-tiled stride-2 ResNet shape,
+        // the one-column-group fallback (stride_w % 8 == 0), the
+        // sequential (no-prefetch) tall-window mode, single-word-wide
+        // 1x1 pooling at the 64-column tile limit and one column past it,
+        // a channel count whose last tile has c_valid = 1, and a 7x7
+        // global pool.
+        // ---------------------------------------------------------------
+        {"MaxPool 2x2 stride2 W=7 (<1 word)",
+                1,3,7,7, 3,3, 2,2, 2,2, 0,0, 1,1, 0,0,0},
+        {"MaxPool 3x3 stride1 pad1 W=13 out_w odd",
+                1,2,6,13, 6,13, 3,3, 1,1, 1,1, 1,1, 0,0,0},
+        {"MaxPool 3x3 stride2 pad1 W=11",
+                1,3,11,11, 6,6, 3,3, 2,2, 1,1, 1,1, 0,0,0},
+        {"AvgPool 3x3 stride2 pad1 W=9 C=1 no_include",
+                1,1,9,9, 5,5, 3,3, 2,2, 1,1, 1,1, 1,0,0},
+        {"MaxPool 3x3 stride2 pad1 28x112 C=2 (ResNet stem)",
+                1,2,28,112, 14,56, 3,3, 2,2, 1,1, 1,1, 0,0,0},
+        {"AvgPool 7x7 stride8 16x16 (one-column groups)",
+                1,4,16,16, 2,2, 7,7, 8,8, 0,0, 1,1, 1,0,0},
+        {"AvgPool 7x1 dil_h2 stride4 21x8 (no prefetch)",
+                1,2,21,8, 3,8, 7,1, 4,1, 0,0, 2,1, 1,0,0},
+        {"MaxPool 1x1 stride1 4x64 (64-wide W-tile)",
+                1,2,4,64, 4,64, 1,1, 1,1, 0,0, 1,1, 0,0,0},
+        {"MaxPool 1x1 stride1 3x65 (W-tile + 1 column)",
+                1,2,3,65, 3,65, 1,1, 1,1, 0,0, 1,1, 0,0,0},
+        {"MaxPool C=9 2x2 stride2 5x6 (c_valid=1 tail tile)",
+                1,9,5,6, 2,3, 2,2, 2,2, 0,0, 1,1, 0,0,0},
+        {"LpPool p=2 batch=2 C=3 3x3 stride2 pad1 W=7",
+                2,3,7,7, 4,4, 3,3, 2,2, 1,1, 1,1, 2,2,0},
+        {"GlobalAvgPool 7x7 C=16",
+                1,16,7,7, 1,1, 7,7, 1,1, 0,0, 1,1, 1,0,0},
     };
 
     const int n_tests = (int)(sizeof(tests) / sizeof(tests[0]));

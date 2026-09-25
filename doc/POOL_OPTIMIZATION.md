@@ -31,7 +31,9 @@ after running the full TestPoolingSim case list.
 | + Fixed-point AVG reciprocal (drop FP div+mul on AVG path) | 31 | 2,214,605 | -22.5% | -68.5% |
 | + kOwParallel=2 reduce (process 2 adjacent ow's per cycle) | 31 | 1,679,945 | -24.1% | -76.1% |
 | + Cyclic line_buf banking + shared tile geometry | 31 | 1,485,975 | -11.5% | -78.8% |
-| **+ Closed-form valid_count (window_emitter LUT −2.1k)** | **31** | **1,472,005** | **-0.9%** | **-79.0%** |
+| + Closed-form valid_count (window_emitter LUT −2.1k) | 31 | 1,472,005 | -0.9% | -79.0% |
+| + 128-bit x port, word reads (§2.13) | 31 | 1,162,425 | -21.0% | -83.4% |
+| **+ 8 lanes per cycle end to end: 128-bit y, LUTRAM column-banked line buffer, flattened stages (§2.14)** | **31** (43 with the new tail cases: 696,045) | **509,665** | **-56.2%** | **-92.7%** |
 
 > **kOwParallel — shipped value is 2.** §2.10 *evaluated* `kOwParallel = 4`
 > and measured 1,513,475 ns (−9.9 % from §2.9), but that value was reverted;
@@ -750,22 +752,206 @@ MNIST LeNet pools 545 / 409 → **388 / 275 µs** (−29 / −33 %), the model
 
 ---
 
-## 3. Current architecture (post-2.13)
+### 2.14. 8 lanes per cycle end to end — 128-bit `y`, column-banked LUTRAM line buffer, flattened stages
+
+**Problem.**  After §2.13 the x *port* was 128-bit but the datapath was
+still one 16-bit element per cycle at both ends: `row_loader` pushed one
+lane per cycle, `window_emitter` wrote one element per cycle into
+`line_buf`, the writer stored one element per cycle through a 16-bit
+port, and every stage re-entered a short pipelined loop per ow-group or
+per run (a few cycles of ramp each).  On the board ResNet-18's MaxPool
+3×3 s2 on 112²×64 took 15.8 ms (0.13 GB/s).
+
+**Lane mapping.**  The tensors are NCHW, so the 8 lanes of a 128-bit
+word are 8 consecutive **columns** of one channel row — not 8 channels.
+The reduce engine already processes 8 channels × `kOwParallel = 2`
+columns per tap-cycle (§2.9); what was one element per cycle was the
+traffic into and out of it.  The rework keeps the §2.9 reduce and makes
+everything around it 8 lanes wide:
+
+* **`row_loader`** — one flattened `II=1` loop per (ni, ct, owt) chunk
+  over every 128-bit word of every (row, channel) run, requests running
+  `kReadAhead = 12` runs ahead of the drain (prologue + one request per
+  drained run, ≤ 12 × 9 words < the adapter's 256-word buffer), so the DDR
+  latency is paid once per chunk.  The loader walks rows 0 .. `rows_per_chunk`
+  once, in order, no per-oh bookkeeping; the emitter derives the same run
+  sequence (`RunCursor`: adds only, the lane shift tracked in 3-bit
+  arithmetic).
+* **`window_emitter`** — `line_buf` re-banked as `[channel][column bank]
+  [row slot · 8 + column word]`: 8 × 8 = 64 LUTRAMs of 128 × 16 b (1W1R).
+  A row word is written whole: lanes rotated by the run's alignment so
+  bank *b* takes the lane whose column ≡ *b* (mod 8), per-bank enables drop
+  the out-of-run lanes of the first / last word, an unrolled channel
+  compare gives every RAM one conditional store.  A window tap reads one
+  column of all 8 channels per position — the column picks bank and entry,
+  each bank is read once, the value is muxed out of the bank vector.
+  `kOwParallel` columns spaced by `stride_w` hit distinct banks unless
+  `stride_w` is a multiple of 8, in which case `PoolGeometry::gw` makes the
+  groups one column wide (lane 1 padded).  **One flattened `II=1` loop per
+  output row** loads the words of the rows output row `oh+1` needs (their
+  slots are disjoint from the window in use whenever
+  `(pool_h−1)·dil_h + 1 + stride_h ≤ kMaxLineBufRows`; otherwise the same
+  loop loads the current row first and emits `kSeqGap = 8` iterations
+  later) while emitting the `n_groups × pool_h × pool_w` taps of row `oh`;
+  the loop exits when both sides are done.  The denominators are separable
+  (§2.12): `kw(ow)` is tallied once per chunk into a 64-entry LUTRAM by a
+  serial (position, tap) pre-pass and `kh(oh)` once per row, so the hot
+  loop multiplies two 3-bit counts instead of running 28 bound compares.
+* **`process_pool_kernel_tile`** — one flattened `II=1` loop per output
+  row of `n_groups × slot_len` iterations, `slot_len = max(pool_h·pool_w,
+  kTileC)`: iterations `i < pool_h·pool_w` reduce one MultiWindow into
+  `acc[2][8]` (the §2.9 lanes), iterations `i < 8` finalise channel *i* of
+  the **previous** group's snapshot (`acc_done`, `inv_done`, copied at the
+  end of every slot) — AVG multiply / `poly_sqrt` / saturate — two lanes
+  (one channel's adjacent positions) per cycle onto a 32-bit `FinBundle`
+  stream.  The finalise is therefore 2 lanes wide (not the 16 of §6.2.3),
+  never stalls the reduce, and costs no loop re-entry; one extra slot
+  after the very last row flushes the last group.
+* **`write_output_tile`** — `y` becomes `hls::burst_maxi<PoolWord>`.  Two
+  ping-pong row buffers of 8 column banks × 64 LUTRAM entries transpose the
+  (group, channel) bundles into channel runs: a bundle's two columns of
+  channel `c1` land in banks `col mod 8` at entry `c1·8 + col/8`; a DDR word
+  of a channel's run is the 8 banks read at one entry (minus one for the
+  lanes that wrap), rotated by the run's alignment.  One flattened `II=1`
+  loop per row of `max(n_groups·8, c_valid·nw_max)` iterations fills buffer
+  `r&1` while draining row `r−1`: per channel one `write_request` of
+  `pool_words_for(start, len) ≤ 9` words, the first / last word written
+  with `write(word, byte_enable)` covering only the run's own lanes (masked
+  lanes zeroed in WDATA) — the conv §2.38 recipe, so a neighbouring
+  channel's lanes and the lanes past the tensor end are never modified and
+  **the y buffer needs no tail padding** (the scheduler is unchanged; x
+  keeps the §2.13 contract).  `kWriteInFlight = 4 <
+  num_write_outstanding = 8`.
+
+Port pragmas: x `max_read_burst_length=16 num_read_outstanding=16`
+(unchanged), y `max_write_burst_length=16 num_write_outstanding=8`.  The
+wide FIFOs (`row_word_pipe` 128 × 128 b, `window_pipe` 64 × 256 b,
+`acc_stream` 64 × 32 b) are `bind_storage fifo impl=lutram` — a 128-bit
+FIFO in block RAM costs 4 BRAM18 at any depth.
+
+**Alignment contract** (`PoolingKernel.h`): x and y base addresses
+16-byte aligned (the scheduler's 64-byte buffer alignment covers it); the
+last word of an x run may extend up to 7 elements past the tensor (bytes
+mappable — unchanged since §2.13); y is byte-strobed, no padding needed.
+Block-design instance widths must equal the IP defaults: **`PoolingKernel_0`
+`C_M_AXI_GMEM1_DATA_WIDTH` = 128** now, next to the existing GMEM0 = 128.
+
+**Traps hit.**
+
+| Form | Result |
+|---|---|
+| `constexpr unsigned clog2(v) { return … clog2(v/2); }` for the narrow index widths | `HLS 214-139 Recursive function calls are not supported` even for a compile-time-only helper — write it as a `while` loop |
+| "last write wins" lane select (`for l: if (l == idx) r = lanes[l]`) | a chain of 7 chained 16-bit 2:1 selects per 8:1 pick — the first synthesis had 3.9 k LUT of `select` in the emitter and 1.7 k in the writer; indexing the partitioned register array (`lanes[idx]`) is estimated as one mux |
+| 32-bit `unsigned` for structurally bounded counters (word index ≤ 9, column ≤ 64, tap < 7, channel < 8) | 117 32-bit comparators / 72 adders in the emitter loop; typed as `ap_uint<kWordBits/kColBits/kTapBits/kChBits>` the loop dropped 11.7 k → 6.3 k LUT |
+| `pool_words_for(run_off, len)` (two 32-bit divides-by-8 and a subtract) on the loop-carried chain that decides the next run boundary | `HLS 200-887 Cannot meet target clock period … store 'nw' (4.905 ns)`; tracking the run's lane shift in 3-bit arithmetic inside `RunCursor` and computing `(shift + len + 7) >> 3` cleared it (slack 0.00) |
+| Per-position `kw_lut[gpos + p]` reads with a runtime index into a `cyclic factor=2` LUTRAM | HLS reads every bank for every position → two loads per 1-read-port bank → `HLS 200-448 … II is 2`; read each bank once at an explicitly computed address and mux afterwards (the same rule as the line-buffer read path) |
+| Test geometries with `pool_h/w > kMaxPoolH/W = 7` | the unrolled `num_valid_kh/kw` counts silently cap at 7 taps (the scheduler rejects such models; the two first drafts of the new C-sim cases failed on this, not the kernel) |
+| Word 0's wrapped-lane address `k − 1` in the C-sim | out-of-bounds read of the row buffer (segfault) — the lanes are masked in hardware but the address must be clamped for the C model |
+
+**Synthesis** (kv260, 150 MHz target): II=1 on every pipelined loop,
+`Pipelined = yes` for all seven, slack 0.00, no `Inferring partial
+write`, no `SCHED 204-65`, both ports `128 -> 128`.  Resources
+§2.13 → §2.14 (HLS estimate): BRAM18 **44 → 11** (the 16 line_buf BRAM18
+and the FIFOs are LUTRAM now; 8 for the x adapter, 3 for the AVG
+reciprocal ROM), DSP 120 → 90, FF 16,498 → 19,581, LUT 30,438 →
+**35,306** (+4.9 k: 2.0 k of line-buffer LUTRAM, 0.5 k of row buffers,
+the lane rotates / muxes and the second finalise lane).
+
+**Test stand.**  `pooling_test`: IP upgraded, `PoolingKernel_0`
+`C_M_AXI_GMEM1_DATA_WIDTH` 32 → 128 (the interconnect drops its
+up-sizer); `pooling_tb.sv` gains conv_tb's y tail-pad sentinel check and
+the DDRC shadow restore of unstrobed bytes (§2.38's VIP race).  Fixtures:
+the 31 original cases bit-identical, 12 new word-tail / alignment cases
+(43 total): widths 7 / 9 / 11 / 13 / 65, the ResNet stem shape
+(3×3 s2 on 28×112, W-tiled), stride 8 (one-column groups), the
+no-prefetch mode, 1×1 pooling on a 64-column tile, `C = 9`, LpPool
+batch 2 on W = 7, GlobalAvgPool 7×7.  C-sim 45/45 (y handed over as a
+sentinel-filled word buffer, pad lanes checked).
+
+**Result (RTL, 43/43 PASS, bit-exact, tail lanes intact on every case).**
+The 31 cases common with §2.13: **1,162,425 → 509,665 ns (−56.2 %)**,
+every case faster:
+
+| # | Case | §2.13 ns | §2.14 ns | Δ |
+|--:|---|---:|---:|---:|
+| 0 | MaxPool_2x2_stride2 | 16,775 | 10,685 | -36.3 % |
+| 1 | MaxPool_3x3_stride1_pad1 | 28,980 | 13,790 | -52.4 % |
+| 2 | MaxPool_2x2_stride2_rect_6x10 | 22,960 | 10,960 | -52.3 % |
+| 3 | MaxPool_batch_3_2x2_stride2 | 30,400 | 13,270 | -56.3 % |
+| 4 | MaxPool_channels_kTileC__C_16_ | 35,230 | 16,590 | -52.9 % |
+| 5 | MaxPool_dilation_2_pool2x2 | 21,100 | 12,030 | -43.0 % |
+| 6 | GlobalMaxPool_4x4 | 14,020 | 9,890 | -29.5 % |
+| 7 | GlobalMaxPool_batch_2_C_12_6x6 | 45,170 | 17,510 | -61.2 % |
+| 8 | AvgPool_2x2_stride2_no_pad | 16,240 | 9,950 | -38.7 % |
+| 9 | AvgPool_3x3_stride1_pad1_no_include | 28,970 | 13,790 | -52.4 % |
+| 10 | AvgPool_3x3_stride1_pad1_include_pad | 28,630 | 13,470 | -53.0 % |
+| 11 | AvgPool_channels_kTileC__C_12_ | 30,070 | 15,330 | -49.0 % |
+| 12 | GlobalAvgPool_4x4_C_8 | 13,240 | 9,110 | -31.2 % |
+| 13 | GlobalAvgPool_batch_2_C_16_6x6 | 54,630 | 21,850 | -60.0 % |
+| 14 | AvgPool_rect_6x10_2x2_stride2 | 16,310 | 9,460 | -42.0 % |
+| 15 | LpPool_p_1_2x2_stride2 | 17,000 | 10,710 | -37.0 % |
+| 16 | LpPool_p_2_2x2_stride2 | 16,420 | 10,130 | -38.3 % |
+| 17 | LpPool_p_1_3x3_pad1 | 28,940 | 13,740 | -52.5 % |
+| 18 | LpPool_p_2_3x3_pad1 | 28,670 | 13,490 | -52.9 % |
+| 19 | GlobalLpPool_p_1_4x4_C_8 | 13,400 | 9,300 | -30.6 % |
+| 20 | GlobalLpPool_p_2_4x4_C_8 | 14,460 | 10,260 | -29.0 % |
+| 21 | GlobalLpPool_p_2_batch_2_C_16_6x6 | 54,530 | 21,690 | -60.2 % |
+| 22 | MaxPool_1x1_pool_full_5x5 | 13,510 | 9,070 | -32.9 % |
+| 23 | AvgPool_corner_padding_3x3_pad1_on_2x2 | 8,850 | 7,940 | -10.3 % |
+| 24 | MaxPool_C_32_2x2_stride2 | 60,910 | 24,540 | -59.7 % |
+| 25 | MaxPool_wide_W_128_3x3_stride1_pad1 | 51,290 | 24,010 | -53.2 % |
+| 26 | AvgPool_wide_W_96_3x3_stride1_pad1 | 71,240 | 28,860 | -59.5 % |
+| 27 | MaxPool_wide_W_128_2x2_stride2 | 55,860 | 14,560 | -73.9 % |
+| 28 | MaxPool_wide_W_128_3x3_stride1_pad1_batch_2 | 92,220 | 41,030 | -55.5 % |
+| 29 | AvgPool_wide_W_96_3x3_stride1_pad1_batch_2 | 131,460 | 50,180 | -61.8 % |
+| 30 | MaxPool_wide_W_128_2x2_stride2_batch_2 | 100,940 | 22,470 | -77.7 % |
+| 31 | MaxPool_2x2_stride2_W_7___1_word_ | — | 8,560 | new |
+| 32 | MaxPool_3x3_stride1_pad1_W_13_out_w_odd | — | 11,860 | new |
+| 33 | MaxPool_3x3_stride2_pad1_W_11 | — | 9,680 | new |
+| 34 | AvgPool_3x3_stride2_pad1_W_9_C_1_no_include | — | 9,430 | new |
+| 35 | MaxPool_3x3_stride2_pad1_28x112_C_2__ResNet_stem_ | — | 48,580 | new |
+| 36 | AvgPool_7x7_stride8_16x16__one-column_groups_ | — | 12,460 | new |
+| 37 | AvgPool_7x1_dil_h2_stride4_21x8__no_prefetch_ | — | 10,230 | new |
+| 38 | MaxPool_1x1_stride1_4x64__64-wide_W-tile_ | — | 18,360 | new |
+| 39 | MaxPool_1x1_stride1_3x65__W-tile___1_column_ | — | 16,420 | new |
+| 40 | MaxPool_C_9_2x2_stride2_5x6__c_valid_1_tail_tile_ | — | 11,770 | new |
+| 41 | LpPool_p_2_batch_2_C_3_3x3_stride2_pad1_W_7 | — | 11,080 | new |
+| 42 | GlobalAvgPool_7x7_C_16 | — | 15,750 | new |
+
+The 2×2 s2 wide-W cases gain most (−74 / −78 %: they were loader- and
+writer-bound at one element per cycle), the 3×3 groups −52 … −62 %, the
+global pools −29 … −61 %, the 8-element corner case −10 % (testbench
+fill dominates).  `MaxPool 3x3 s2 pad1 28x112 C=2`, the ResNet stem
+shape, runs in 48.6 µs at the 100 MHz sim clock; the reduce is the
+bound (9 cycles per group of 16 outputs, ≈ 2.25 cycles per 8 outputs),
+so the full 112²×64 layer scales to ≈ 1.3 ms (≈ 125 k cycles by the
+§4.9 model) against 15.8 ms on the board today — to be measured by the
+coordinator with the integrated bitstream.
+
+**Not done (next levers).**  `kOwParallel = 4` (the §2.10 code path is
+gone: the column banks now serve any `gw ≤ 8` with distinct strides, and
+the finalise / writer scale with it), which would halve the 3×3 reduce
+bound; a 4-lane finalise for 2×2 pools (the consumer's `kTileC = 8`
+cycles per group is their bound).
+
+---
+
+## 3. Current architecture (post-2.14)
 
 ```mermaid
 flowchart LR
-    DDR_IN[("x<br/>gmem0")]
-    DDR_OUT[("y<br/>gmem1")]
-    RL["row_loader<br/><i>DDR reader</i>"]
-    WE["window_emitter<br/><i>owns line_buf</i><br/>kTileC × kMaxLineBufRows × kMaxLineBufCols"]
-    PP["process_pool_kernel_tile<br/><i>owns acc[kTileC]</i><br/>reduce + finalize"]
-    WO["write_output_tile<br/><i>saturate AccData_t → Data_t</i>"]
+    DDR_IN[("x<br/>gmem0 · 128 b")]
+    DDR_OUT[("y<br/>gmem1 · 128 b")]
+    RL["row_loader<br/><i>burst_maxi words, 12 runs in flight</i>"]
+    WE["window_emitter<br/><i>owns line_buf: 8 ch × 8 column banks of LUTRAM</i>"]
+    PP["process_pool_kernel_tile<br/><i>acc / acc_done [kOwParallel][kTileC]</i><br/>reduce ‖ finalise(prev group)"]
+    WO["write_output_tile<br/><i>ping-pong row buffers → byte-strobed bursts</i>"]
 
     DDR_IN -->|m_axi read| RL
-    RL -->|row_data_pipe| WE
+    RL -->|row_word_pipe · 128 b| WE
     WE -->|window_pipe<br/>MultiWindow<br/>= kOwParallel × kTileC pixels| PP
     WE -->|denom_pipe<br/>MultiDenom × kOwParallel| PP
-    PP -->|acc_stream<br/>kOwParallel × c_valid<br/>AccData_t per group| WO
+    PP -->|acc_stream<br/>FinBundle = kOwParallel outputs<br/>of one channel| WO
     WO -->|m_axi write| DDR_OUT
 
     classDef ddr fill:#fff7e6,stroke:#d48806,color:#874d00
@@ -774,69 +960,50 @@ flowchart LR
     class RL,WE,PP,WO stage
 ```
 
-**Four DATAFLOW stages**, all running concurrently:
+**Four DATAFLOW stages**, all running concurrently, each with ONE
+flattened `II=1` loop per (ni, ct, owt) chunk or per output row (§2.14):
 
-1. **`row_loader`** — DDR reader; iterates `(ni, ct, owt, oh, ih, c_l, iw)`.
-2. **`window_emitter`** — owns `line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols]`
-   (partitioned `complete dim=1`, `BIND_STORAGE ram_t2p`, ~16 KB).  For
-   each ow-group (size kOwParallel) emits one MultiWindow per (khi, kwi)
-   gathering kOwParallel × kTileC pixels in parallel from the dual-port
-   per-channel banks; emits one MultiDenom (kOwParallel valid_counts) per
-   group via the separable closed form `num_valid_kh × num_valid_kw`
-   (§2.12).
-3. **`process_pool_kernel_tile`** — owns `acc[kOwParallel][kTileC]`
-   (both dims partitioned `complete dim=0`). Vectorized II=1 reduce on
-   the MultiWindow stream — every cycle updates ALL kOwParallel × kTileC
-   accumulators in parallel.  Finalizes per lane (AVG: multiply by
-   `inv_denom_lookup(denom)` — fixed-point ROM reciprocal, see §2.8;
-   LP-2: `poly_sqrt`, see §2.7) and pushes kOwParallel × c_valid AccData_t
-   to acc_stream in (p, c1) order.
-4. **`write_output_tile`** — saturates AccData_t → Data_t and writes to
-   y, with a conditional `ow < ow_hi` gate that drops the producer's
-   identity-padded residual lanes (kept off DDR but still drained in
-   pipeline).
+1. **`row_loader`** — one 128-bit word per cycle over the chunk's run
+   sequence `(ih, c_l)`, requests 12 runs ahead.
+2. **`window_emitter`** — owns `line_buf[kTileC][8 banks][16 slots × 8
+   words]` (64 LUTRAMs) and the per-chunk `kw_lut`.  Per output row: the
+   next row's words in (8 lanes per cycle) while this row's `n_groups ×
+   pool_h × pool_w` taps go out (kOwParallel columns × kTileC channels per
+   cycle) plus one MultiDenom (`kh(oh) × kw(ow)`, §2.12) per group.
+3. **`process_pool_kernel_tile`** — per row `n_groups × max(pool_h·pool_w,
+   kTileC)` iterations: reduce one MultiWindow per cycle into
+   `acc[kOwParallel][kTileC]`, finalise the previous group's snapshot two
+   lanes per cycle (AVG: `inv_denom_lookup` ROM multiply, §2.8; LP-2:
+   `poly_sqrt`, §2.7), saturate, push a FinBundle.
+4. **`write_output_tile`** — per row, fill one row buffer from the
+   FinBundles while draining the other as 128-bit words: one burst per
+   (row, channel) run, byte strobes on the run's first / last words.
 
 **Loop nest** (all stages in lockstep): `(ni, ct, owt, oh, ow_group)`.
-Each ow_group covers kOwParallel adjacent ow positions; the W-tile
-dimension `owt` is collapsed to a single iteration when
-`in_w ≤ kMaxLineBufCols`.
+Each ow_group covers `gw` adjacent ow positions (`gw = kOwParallel`, or 1
+when `stride_w` is a multiple of 8); the W-tile dimension `owt` collapses
+to a single iteration when `in_w ≤ kMaxLineBufCols`.
 
-**Per-invocation tile geometry.** `compute_pool_geometry()` runs once at the
-top of `PoolingKernel` and fills a `PoolGeometry { c_tiles, ow_tile,
-ow_tiles_w }` struct passed by value to all four stages (§2.11).  The two
-runtime-divisor divisions — `÷ stride_w` inside `compute_ow_tile` and
-`÷ ow_tile` for `ow_tiles_w` — are therefore each synthesised once, in a
-shared `compute_pool_geometry` block, instead of being replicated per stage.
+**Per-invocation geometry.** `compute_pool_geometry()` runs once at the
+top of `PoolingKernel` and fills `PoolGeometry { c_tiles, ow_tile,
+ow_tiles_w, gw, rows_per_chunk, red_len, slot_len, prefetch }` passed to
+all four stages (§2.11, §2.14); per-chunk values come from `chunk_geom()`,
+identical in every stage.
 
-**Cycle counts per output position** at the consumer's reduce loop
-(post-§2.11 — shipped kOwParallel = 2 reduce, §2.8 FP-unit removal):
+**Cycle counts** per output row of a chunk (`c_valid` channels,
+`n_groups` groups):
 
-| Pool type | II | Cycles per **kOwParallel = 2** outputs |
-|---|---:|---:|
-| MaxPool | 1 | `pool_h × pool_w` |
-| AveragePool | 1 (post-§2.8 — was 2–3 with FP div+mul) | `pool_h × pool_w` |
-| LpPool p=1 | 1 | `pool_h × pool_w` |
-| LpPool p=2 | 1–2 (poly_sqrt finalize once per output) | `pool_h × pool_w` |
+| Stage | cycles |
+|---|---|
+| row_loader | `new_rows × c_valid × (run_len/8 + 1)` words |
+| window_emitter | `max(loader words, n_groups × pool_h × pool_w)` |
+| process_pool_kernel_tile | `n_groups × max(pool_h × pool_w, kTileC)` |
+| write_output_tile | `max(n_groups × kTileC, c_valid × (ow_span/8 + 1))` |
 
-Per-position cost is therefore `pool_h × pool_w / kOwParallel` cycles —
-e.g. 4.5 cycles on a 3×3 pool at the shipped `kOwParallel = 2`. (§2.10
-evaluated `kOwParallel = 4`, which would halve this to 2.25 cycles, but that
-value was reverted — see §2.10.)
-
-The producer is matched at `pool_h × pool_w` cycles per ow-group for
-`emit_phase 2`, with Phase 1 row loads overlapped via the dataflow split.
-`line_buf` is partitioned `complete dim=1` (per channel) + `cyclic
-dim=3 factor=kOwParallel` (per column-bank) and `BIND_STORAGE ram_t2p`,
-so kOwParallel reads/cycle/channel are delivered for every stride_w
-with `gcd(stride_w, kOwParallel) ≤ 2` — see §2.10's banking table.
-
-**Writer drain and reduce are balanced at kOwParallel = 2.** The writer
-emits `kOwParallel × c_valid` AccData_t per ow-group (= 8 cycles for the
-typical c_valid = 4), just under the 9-cycle 3×3 reduce — so consumer-bound
-3×3 tests stay reduce-bound. Raising kOwParallel to 4 would push the writer
-drain to 16 cycles and make it the bottleneck on those narrow tests (§6).
-
----
+3×3 pools are reduce-bound at 9 cycles per group of 16 outputs (the
+emitter and consumer are matched); 2×2 s2 pools are bound by the
+consumer's 8 cycles per group; global pools by the loader's one word per
+cycle.
 
 ## 4. Knobs
 
@@ -977,9 +1144,21 @@ nibble at the residual consumer fraction.
 
 ## 6. Where the floor is now
 
-The shipped kernel runs the consumer reduce at `pool_h × pool_w` cycles
+> Updated for §2.14.  The loader, line-buffer fill and writer now move 8
+> elements per cycle and every stage runs one flattened II=1 loop per
+> output row, so the per-group and per-run loop re-entries and the
+> one-element-per-cycle DDR paths of the analysis below are gone.  The
+> remaining floor is the consumer: `max(pool_h × pool_w, kTileC)` cycles
+> per group of `kOwParallel × kTileC` outputs — 9 cycles per 16 outputs on
+> a 3×3 pool, 8 per 16 on a 2×2.  Raising `kOwParallel` to 4 (banks serve
+> any stride not a multiple of 4; FinBundle, row buffers and the consumer
+> scale with it) is the next lever; the §6.2 writer-side conclusions are
+> superseded by the 128-bit byte-strobed writer.  The text below is kept
+> as the record of the §2.13 state.
+
+The §2.13 kernel ran the consumer reduce at `pool_h × pool_w` cycles
 per **kOwParallel = 2** outputs across all pool types.  The wall-clock
-critical path splits by test geometry:
+critical path split by test geometry:
 
 - **Wide-W consumer-bound tests** (out_w ≥ 64) — reduce-bound:
   per-position cost is `pool_h × pool_w / kOwParallel = 9/2 = 4.5` cycles
@@ -1147,14 +1326,15 @@ interconnect matches — outside the scope of pool-only optimisation.
 
 | Configuration | C-sim (TestPoolingSim) | RTL sim (behavior_test_pool) |
 |---|---|---|
-| Default (kMaxLineBufCols=64) | 33/33 PASS | 31/31 PASS |
+| Default (kMaxLineBufCols=64), post-§2.14 | 45/45 PASS (y pad lanes checked) | 43/43 PASS (y tail lanes checked) |
+| Default (kMaxLineBufCols=64), §2.13 | 33/33 PASS | 31/31 PASS |
 | Reduced cache (kMaxLineBufCols=8) | 33/33 PASS, dup_reads tracks predictor | (not run) |
 | Increased cache (kMaxLineBufCols=256) | 33/33 PASS, dup_reads = 0 throughout | (not run) |
 
 The cache-aware predictor in `TestPoolingSim.cpp` ensures the dup_reads
 column in test output is meaningful at any cache size.
 
-The C-sim count is 33 (vs 31 RTL): 31 geometry cases against the float64
+The C-sim count is 45 (vs 43 RTL): 43 geometry cases against the float64
 reference at `kTol = 0.02` (≈ 5 Data_t LSBs) plus 2 strict-equality
 sub-cases (`run_avg_pool_strict_test`, `count_include_pad ∈ {0, 1}`)
 that pin the AVG path's bit-accurate match to `ref_avg_pool_fixed`.  The
@@ -1177,13 +1357,14 @@ kOwParallel (Global pool variants and `MaxPool 1x1 pool_full 5x5`,
 |---|---|
 | `kernels/pool/kernel/PoolingKernel.cpp` | Full rewrite into 4 dataflow stages; `poly_sqrt` (§2.7); `inv_denom_lookup` constexpr ROM LUT for AVG-Pool reciprocal divide (§2.8); `MultiWindow` / `MultiDenom` structs and kOwParallel-wide reduce + line_buf `BIND_STORAGE ram_t2p` (§2.9); `cyclic factor=kOwParallel dim=3` partition on line_buf to support kOwParallel ≥ 4 reads/cycle (§2.10); `PoolGeometry` struct + `compute_pool_geometry()` — per-invocation tile geometry (`c_tiles` / `ow_tile` / `ow_tiles_w`) computed once and passed to all four stages, collapsing the per-stage `ow_tiles_w` divider (§2.11); closed-form
 `valid_count` — separable `num_valid_kh × num_valid_kw` replacing the
-98-lane unrolled bounds-count (§2.12) |
+98-lane unrolled bounds-count (§2.12); §2.14: 128-bit `burst_maxi` y, word-wide `row_loader` with `kReadAhead` requests, LUTRAM column-banked `line_buf` written 8 lanes per cycle, per-chunk `kw_lut`, flattened per-row loops in every stage, overlapped 2-lane finalise, ping-pong row-buffer writer with byte-strobed bursts, narrow index types |
 | `kernels/pool/include/Config.h.in` | Templates `kTileC`, `kMaxPoolH`, `kMaxPoolW`, `kMaxLineBufRows`, `kMaxLineBufCols`, `kOwParallel` from CMake-side variables (sourced from the platform JSON, §4) |
 | `kernels/pool/CMakeLists.txt` | `pool_load_constants(platform_json prefix)` reads `kernels.pool.*` from `platforms/<AXI_PLATFORM>.json` via `string(JSON …)`; default-platform values drive C-sim Config.h, per-platform values drive per-platform synthesis Config.h's; `CMAKE_CONFIGURE_DEPENDS` on every platform JSON so edits auto-trigger reconfigure on next `make` |
 | `platforms/<name>.json` | Single source of truth for kernel-side bounds — `kernels.pool` object holds all six values (§4.1).  The C++ build and the Python validator both read from here. |
 | `CMakeLists.txt` (top-level) | `AXI_PLATFORM` cache var (default `kv260`) selects which platform JSON drives C-sim builds; `AXI_DEFAULT_PLATFORM_JSON` is the resolved path |
 | `inference-scheduler/src/_pool_hw_config.py` | `resolve(platform_name=None)` reads `platforms/<AXI_PLATFORM>.json` (env override → `kv260` default); raises `PoolHwConfigError` on missing file / missing section / missing field / wrong type — no silent fallbacks |
 | `inference-scheduler/src/nodes.py` | `PoolNode.from_onnx_node` validates `pool_h ≤ kMaxPoolH`, `pool_w ≤ kMaxPoolW`, dilated vertical span ≤ `kMaxLineBufRows`, dilated horizontal span ≤ `kMaxLineBufCols` against values resolved from the platform JSON; raises `SchedulerError` with an actionable message naming the bound and the JSON field to bump |
-| `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added; `quantize_trn` + `ref_poly_sqrt` mirror kernel's fixed-point sqrt bit-exactly; `ref_avg_pool_fixed` mirrors `inv_denom_lookup` bit-exactly; `ref_pool_elem`'s AVG branch routed through it; new `run_avg_pool_strict_test` (2 strict-equality subtests for AVG path) |
+| `kernels/pool/test/TestPoolingSim.cpp` | Cache-aware `expected_dup_reads_for()`; 6 wide-W tests added; §2.14: y as a sentinel-filled `PoolWord` buffer with a pad-lane check, 12 word-tail / alignment cases; `quantize_trn` + `ref_poly_sqrt` mirror kernel's fixed-point sqrt bit-exactly; `ref_avg_pool_fixed` mirrors `inv_denom_lookup` bit-exactly; `ref_pool_elem`'s AVG branch routed through it; new `run_avg_pool_strict_test` (2 strict-equality subtests for AVG path) |
 | `inference-scheduler/src/codegen/_simulate.py` | `_quantize_trn` + `_pool_poly_sqrt` so generated `expected/*.dat` fixtures match the kernel's RTL output for LP-Pool p=2; `_pool2d_ref` AVG branch updated to use the same encoded reciprocal as the kernel so AVG cells match byte-for-byte under `test_inference.c`'s strict equality check |
-| `hw/test_data/pool_test_data/` | 31-test fixtures regenerated for kv260 RTL sim; AVG cases (`test_{09,10,26,29}_y.hex`) refreshed for §2.8 reciprocal change (4 files, 306 cells changed total, all by exactly 1 LSB) |
+| `hw/cormorant_test_stand/kernels/pooling_test/` | §2.14: `PoolingKernel_0` `C_M_AXI_GMEM1_DATA_WIDTH` 128 (IP default), `pooling_tb.sv` y tail-pad check + DDRC shadow restore |
+| `hw/test_data/pool_test_data/` | 43-test fixtures (§2.14: 12 word-tail cases added, the 31 originals bit-identical); 31-test fixtures regenerated for kv260 RTL sim; AVG cases (`test_{09,10,26,29}_y.hex`) refreshed for §2.8 reciprocal change (4 files, 306 cells changed total, all by exactly 1 LSB) |

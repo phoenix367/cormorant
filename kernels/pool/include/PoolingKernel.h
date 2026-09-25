@@ -50,15 +50,23 @@ inline T saturate_cast(From v) {
 // plain C-sim); bump a port's value here to pull a larger case into cosim.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// x port width — 128-bit words (POOL_OPTIMIZATION.md §2.13).
+// 128-bit x and y ports (POOL_OPTIMIZATION.md §2.13 / §2.14).
 //
-// x is read through an hls::burst_maxi<PoolWord> port carrying
-// kPoolPortElems elements per beat.  The NCHW layout is unchanged: the
-// row_loader requests, per input row segment, the aligned word range that
-// covers it and drops the lanes outside the segment.  The x BASE address
-// must be 16-byte aligned (the scheduler aligns every buffer); the last
-// word of a segment may extend up to kPoolPortElems - 1 elements past the
-// tensor end (bytes must be mappable — the scheduler pads buffers).
+// Both ports are hls::burst_maxi<PoolWord> carrying kPoolPortElems elements
+// per beat.  The NCHW layout is unchanged.
+//
+//   x: the row_loader requests, per (input row, channel) run, the aligned
+//      word range that covers it and drops the lanes outside the run.  The
+//      x BASE address must be 16-byte aligned (the scheduler aligns every
+//      buffer); the last word of a run may extend up to kPoolPortElems - 1
+//      elements past the tensor end (bytes must be mappable — the
+//      scheduler pads buffers).
+//   y: the writer issues one burst per (output row, channel) run and writes
+//      the run's first / last words with BYTE STROBES covering only the
+//      run's own lanes (hls::burst_maxi::write(word, byte_enable)), so a
+//      neighbouring channel's lanes in the same word and the lanes past the
+//      tensor end are never modified.  The y BASE address must be 16-byte
+//      aligned; no tail padding of the y buffer is required.
 // ---------------------------------------------------------------------------
 template<typename T> struct PoolDataBits { static constexpr unsigned value = 8 * sizeof(T); };
 #ifdef POOL_HAVE_APFIXED
@@ -95,6 +103,7 @@ inline unsigned pool_words_for(unsigned off, unsigned count) {
 #define POOL_COSIM_DEPTH_X  8192
 #define POOL_COSIM_DEPTH_X_WORDS  (POOL_COSIM_DEPTH_X / kPoolPortElems + 1)
 #define POOL_COSIM_DEPTH_Y  8192
+#define POOL_COSIM_DEPTH_Y_WORDS  (POOL_COSIM_DEPTH_Y / kPoolPortElems + 1)
 
 // ---------------------------------------------------------------------------
 // PoolingKernel — 2-D pooling following ONNX semantics.
@@ -119,13 +128,13 @@ inline unsigned pool_words_for(unsigned off, unsigned count) {
 //   y[batch][channels][out_h][out_w]
 //
 // AXI interface (in PoolingKernel.cpp):
-//   x → m_axi gmem0  (read)
-//   y → m_axi gmem1  (write)
+//   x → m_axi gmem0  (read,  hls::burst_maxi<PoolWord>)
+//   y → m_axi gmem1  (write, hls::burst_maxi<PoolWord>, byte-strobed tails)
 //   all scalars → s_axilite, bundle=ctrl
 // ---------------------------------------------------------------------------
 void PoolingKernel(
     hls::burst_maxi<PoolWord> x,
-    Data_t*       y,
+    hls::burst_maxi<PoolWord> y,
     unsigned      batch,
     unsigned      channels,
     unsigned      in_h,

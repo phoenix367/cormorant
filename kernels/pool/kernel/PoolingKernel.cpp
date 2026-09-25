@@ -5,50 +5,46 @@
 // Global variants) in a channel-tiled structure that maps cleanly to Vitis
 // HLS synthesis.
 //
-// Top-level dataflow (HLS DATAFLOW):
+// Top-level dataflow (HLS DATAFLOW) — post-§2.14 (128-bit x AND y, 8 lanes
+// per cycle through every stage):
 //
-//   PoolingKernel
-//     input_window_producer  ──window_pipe──►  process_pool_kernel_tile
-//                            ──denom_pipe ──►          │
-//                                                      └──acc_stream──► write_output_tile
-//                                                                              │
-//     x (DDR gmem0)                                                           ▼
-//                                                                       y (DDR gmem1)
+//   x (DDR gmem0, 128-bit)
+//     │ burst_maxi read: one request per (row, channel) run, kReadAhead in flight
+//     ▼
+//   row_loader ──row_word_pipe (128-bit words)──► window_emitter
+//                                                   │ owns line_buf (LUTRAM column banks)
+//                                                   │ writes 8 lanes / cycle, reads
+//                                                   │ kOwParallel columns × kTileC channels / cycle
+//                                                   ├──window_pipe (MultiWindow)──► process_pool_kernel_tile
+//                                                   └──denom_pipe  (MultiDenom) ──►   │ reduce ‖ finalise(prev group)
+//                                                                                     ▼
+//                                     acc_stream (FinBundle = kOwParallel outputs of one channel)
+//                                                                                     ▼
+//                                                   write_output_tile ── ping-pong row buffer, one
+//                                                   byte-strobed burst per (row, channel) run ──► y (DDR gmem1, 128-bit)
 //
-// Stage responsibilities (post-§2.9 — kOwParallel-wide reduce):
-//   * row_loader              — pure DDR reader, emits raw input pixels onto
-//                              row_data_pipe (no on-chip buffer).
-//   * window_emitter          — owns line_buf.  For each ow-group of size
-//                              kOwParallel, gathers kOwParallel × kTileC
-//                              pixels per (khi, kwi) into a MultiWindow and
-//                              pushes it to window_pipe; pushes one
-//                              MultiDenom (kOwParallel denom values) per
-//                              group to denom_pipe.  Out-of-bounds spatial
-//                              positions and channel-padding lanes are
-//                              filled with the pool-type identity so the
-//                              consumer's reduce needs no bounds check.
-//                              Residual ow positions (when (ow_hi - ow_lo)
-//                              is not a multiple of kOwParallel) are
-//                              identity-padded — producer always emits
-//                              exactly ceil((ow_hi-ow_lo)/kOwParallel) groups
-//                              per (oh).
-//   * process_pool_kernel_tile — drains pool_h*pool_w MultiWindows per
-//                              ow-group into a parallel reducer running on
-//                              acc[kOwParallel][kTileC]; one MultiDenom per
-//                              group feeds kOwParallel inv_denom_lookup
-//                              calls.  After reduction emits kOwParallel ×
-//                              c_valid AccData_t results to acc_stream.
-//   * write_output_tile      — saturates AccData_t → Data_t and writes to y
-//                              with channel-major addressing.  Skips writes
-//                              for ow ≥ ow_hi so the producer's identity
-//                              padding never reaches DDR.
-//
-// Vectorised reduction (process_pool_kernel_tile):
-//   The reduce loop runs ri ∈ [0, pool_h*pool_w) at II=1.  Each cycle reads
-//   one MultiWindow (kOwParallel × kTileC pixels), and the inner update is
-//   fully unrolled: acc[p][c1] receives one new value per cycle for every
-//   (p, c1) ∈ [0, kOwParallel) × [0, kTileC).  Per-lane RAW distance is 1
-//   cycle, covered by ap_fixed<32,16> compare/add/mul latency at 300 MHz.
+// Stage responsibilities:
+//   * row_loader              — pure DDR reader; pushes every word of every
+//                              (row, channel) run of a chunk in one flattened
+//                              II=1 loop with requests running ahead.
+//   * window_emitter          — owns line_buf.  One flattened II=1 loop per
+//                              output row loads the NEXT row's input words
+//                              (8 lanes per cycle into column banks) while
+//                              emitting the current row's pool_h*pool_w
+//                              MultiWindows per ow-group and one MultiDenom
+//                              per group.  Out-of-bounds positions, padded
+//                              lanes and channel-padding lanes carry the
+//                              pool-type identity.
+//   * process_pool_kernel_tile — one flattened II=1 loop per output row:
+//                              reduces one MultiWindow per cycle into
+//                              acc[kOwParallel][kTileC] and, in the same
+//                              iterations, finalises the PREVIOUS group's
+//                              snapshot kOwParallel lanes per cycle onto
+//                              acc_stream (saturated Data_t).
+//   * write_output_tile      — one flattened II=1 loop per output row fills
+//                              a row buffer with the row's bundles while
+//                              draining the previous row as 128-bit words
+//                              with byte strobes on the run edges.
 //
 // Global pool support:
 //   No special code.  Caller passes pool_h=in_h, pool_w=in_w, stride=1,
@@ -373,31 +369,58 @@ static inline unsigned compute_ow_tile(
 }
 
 // ---------------------------------------------------------------------------
-// Per-invocation tile geometry.
+// Per-invocation geometry (§2.11 / §2.14).
 //
-// Both the W-tile width (compute_ow_tile divides by the runtime stride_w) and
-// the W-tile count (ow_tiles_w divides by the runtime ow_tile) need an integer
-// division by a RUNTIME divisor, which HLS synthesises as a multi-cycle
-// sequential divider.  The geometry is invariant for a whole kernel
-// invocation, yet each dataflow stage used to recompute ow_tiles_w (and
-// c_tiles) itself — so the same divider was instantiated once per stage (four
-// copies across the kernel).
+// Computed ONCE in PoolingKernel and passed to every stage, so the runtime-
+// divisor divisions (÷ stride_w in compute_ow_tile, ÷ ow_tile) are
+// synthesised once.  The §2.14 fields:
 //
-// PoolingKernel now computes the geometry ONCE and passes this struct to every
-// stage, collapsing the divider count to a single shared set.  The struct
-// crosses the DATAFLOW process boundaries as one stable scalar channel.
+//   gw            ow positions per group.  kOwParallel, unless the stride
+//                 maps the group's columns onto the same line-buffer column
+//                 bank (stride_w a multiple of 2·kLanes/kOwParallel), in
+//                 which case groups are one column wide and lane p ≥ 1 is
+//                 identity-padded (the bank is 1W1R LUTRAM: one read per
+//                 bank per cycle).
+//   rows_per_chunk input rows loaded per (ni, ct, owt) chunk — every row from
+//                 0 up to the last one any output row needs, each once.
+//   red_len       pool_h · pool_w window reads per group.
+//   slot_len      consumer iterations per group: max(red_len, kTileC) — the
+//                 finalise of the previous group (kTileC steps of kOwParallel
+//                 lanes) overlaps the reduce of the current one.
+//   prefetch      the rows of output row oh+1 are loaded while oh is emitted;
+//                 needs (pool_h-1)·dil_h + 1 + stride_h ≤ kMaxLineBufRows so
+//                 the incoming slots never alias the window in use.  Otherwise
+//                 each row's loads precede its emit inside the same loop.
 // ---------------------------------------------------------------------------
+static constexpr unsigned kLanes   = kPoolPortElems;              // elements per port word
+static constexpr unsigned kLbWords = kMaxLineBufCols / kLanes;    // line-buffer words per row slot
+static_assert(kMaxLineBufCols % kLanes == 0, "kMaxLineBufCols must be a whole number of port words");
+static_assert(kOwParallel <= kLanes && (kOwParallel & (kOwParallel - 1)) == 0,
+              "kOwParallel must be a power of two <= the port lane count");
+static_assert((kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0, "kMaxLineBufRows must be a power of two");
+
 struct PoolGeometry {
-    unsigned c_tiles;     // (channels + kTileC - 1) / kTileC
-    unsigned ow_tile;     // W-tile chunk width (compute_ow_tile)
-    unsigned ow_tiles_w;  // number of W-tiles spanning out_w
+    unsigned c_tiles;
+    unsigned ow_tile;
+    unsigned ow_tiles_w;
+    unsigned gw;
+    unsigned rows_per_chunk;
+    unsigned red_len;
+    unsigned slot_len;
+    bool     prefetch;
 };
 
 static inline PoolGeometry compute_pool_geometry(
     unsigned channels,
+    unsigned in_h,
+    unsigned out_h,
     unsigned out_w,
+    unsigned pool_h,
     unsigned pool_w,
+    unsigned stride_h,
     unsigned stride_w,
+    unsigned pad_top,
+    unsigned dil_h,
     unsigned dil_w
 ) {
     PoolGeometry g;
@@ -406,139 +429,264 @@ static inline PoolGeometry compute_pool_geometry(
     g.ow_tiles_w = (g.ow_tile > 0)
         ? ((out_w + g.ow_tile - 1) / g.ow_tile)
         : 1u;
+    // Column banks are (column mod kLanes); kOwParallel columns spaced by
+    // stride_w land on distinct banks iff gcd(stride_w, kLanes) <= kLanes /
+    // kOwParallel, i.e. stride_w is not a multiple of 2·kLanes/kOwParallel.
+    g.gw = (stride_w % (2u * kLanes / kOwParallel) != 0u) ? kOwParallel : 1u;
+    const int ih_last = (int)((out_h - 1) * stride_h + (pool_h - 1) * dil_h) - (int)pad_top;
+    g.rows_per_chunk = (ih_last < 0) ? 0u
+                     : ((unsigned)ih_last >= in_h ? in_h : (unsigned)ih_last + 1u);
+    g.red_len  = pool_h * pool_w;
+    g.slot_len = (g.red_len > kTileC) ? g.red_len : kTileC;
+    const unsigned span_h = (pool_h - 1) * dil_h + 1;
+    g.prefetch = (span_h + stride_h <= kMaxLineBufRows);
     return g;
 }
 
 // ---------------------------------------------------------------------------
-// row_loader — DATAFLOW source (Phase 1).
-//
-// Reads input rows from DDR and pushes them onto row_data_pipe in the order
-// the window_emitter consumes them.  Owns no on-chip buffer: it's a thin DDR
-// reader that lets the window_emitter run concurrently with row fetching
-// (Phase 1 of oh+1 overlaps Phase 2 of oh).
-//
-// Loop nest is (ni, ct, owt, oh, ih, c_l, iw) with the SAME load_start /
-// load_end / iw_load_lo / iw_load_hi schedule the window_emitter mirrors.
-// Both functions derive these values from the geometry parameters
-// independently — no metadata stream is needed because per-oh row counts
-// are deterministic.
+// Per-chunk geometry — one (ni, ct, owt) chunk = one channel tile × one
+// W-tile.  Derived identically by every stage.
 // ---------------------------------------------------------------------------
+struct ChunkGeom {
+    unsigned c_off;
+    unsigned c_valid;
+    unsigned ow_lo;
+    unsigned ow_hi;
+    unsigned ow_span;
+    unsigned n_groups;
+    unsigned iw_lo;      // first input column loaded (>= 0)
+    unsigned run_len;    // input columns loaded per row
+};
+
+static inline ChunkGeom chunk_geom(
+    unsigned ct, unsigned owt,
+    unsigned channels, unsigned in_w, unsigned out_w,
+    unsigned pool_w, unsigned stride_w, unsigned pad_left, unsigned dil_w,
+    const PoolGeometry& geom
+) {
+    #pragma HLS INLINE
+    ChunkGeom c;
+    c.c_off   = ct * kTileC;
+    c.c_valid = std::min(kTileC, channels - c.c_off);
+    c.ow_lo   = owt * geom.ow_tile;
+    c.ow_hi   = std::min(c.ow_lo + geom.ow_tile, out_w);
+    c.ow_span = c.ow_hi - c.ow_lo;
+    c.n_groups = (geom.gw == 1u) ? c.ow_span
+               : ((c.ow_span + kOwParallel - 1u) / kOwParallel);
+    const int iw_start = (int)(c.ow_lo * stride_w) - (int)pad_left;
+    const int iw_end   = (int)((c.ow_hi - 1) * stride_w + (pool_w - 1) * dil_w) - (int)pad_left;
+    const int iw_load_lo = (iw_start < 0) ? 0 : iw_start;
+    const int iw_load_hi = (iw_end >= (int)in_w) ? (int)in_w - 1 : iw_end;
+    c.iw_lo   = (unsigned)iw_load_lo;
+    c.run_len = (unsigned)(iw_load_hi - iw_load_lo + 1);
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// RunCursor — position in a chunk's (ih, c_l) run sequence.  Each run is
+// the contiguous element range [run_off, run_off + run_len) of one input
+// row of one channel; advancing is adds only (no multiply in the loop-
+// carried path of the II=1 loops that step it).
+// ---------------------------------------------------------------------------
+struct RunCursor {
+    unsigned            ih;
+    unsigned            c_l;
+    unsigned            row_off;    // element offset of (ih, c_l = 0)
+    unsigned            run_off;    // element offset of (ih, c_l)
+    ap_uint<kPoolPortElems == 8 ? 3 : (kPoolPortElems == 4 ? 2 : 1)> row_shift;  // row_off % kLanes
+    ap_uint<kPoolPortElems == 8 ? 3 : (kPoolPortElems == 4 ? 2 : 1)> run_shift;  // run_off % kLanes
+};
+
+// The lane shift is tracked separately in kLaneBits-bit arithmetic: the
+// run's word count (next iteration's loop bound) depends only on it, and
+// deriving it from the 32-bit offset add put the whole adder on the II=1
+// loop-carried chain.
+static inline RunCursor run_cursor_start(unsigned chunk_base) {
+    #pragma HLS INLINE
+    RunCursor c;
+    c.ih = 0; c.c_l = 0; c.row_off = chunk_base; c.run_off = chunk_base;
+    c.row_shift = chunk_base % kPoolPortElems;
+    c.run_shift = c.row_shift;
+    return c;
+}
+
+static inline void run_cursor_advance(RunCursor& c, unsigned c_valid,
+                                      unsigned in_w, unsigned in_hw) {
+    #pragma HLS INLINE
+    if (c.c_l + 1 == c_valid) {
+        c.c_l = 0;
+        c.ih++;
+        c.row_off += in_w;
+        c.run_off = c.row_off;
+        c.row_shift = c.row_shift + (in_w % kPoolPortElems);
+        c.run_shift = c.row_shift;
+    } else {
+        c.c_l++;
+        c.run_off += in_hw;
+        c.run_shift = c.run_shift + (in_hw % kPoolPortElems);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Narrow index types.  Every counter that is structurally bounded by a
+// compile-time constant is declared at that width so the II=1 loops' adders,
+// comparators and muxes are sized to it (a 32-bit `unsigned` costs ~4× the
+// LUT of a 7-bit one and lengthens the loop-carried chain).
+// ---------------------------------------------------------------------------
+// Bits needed to hold 0 .. v-1 (non-recursive: HLS rejects recursive
+// constexpr functions even when only evaluated at compile time).
+constexpr unsigned pool_clog2(unsigned v) {
+    unsigned b = 0;
+    while ((1u << b) < v) b++;
+    return b;
+}
+
+static constexpr unsigned kLaneBits = pool_clog2(kLanes);                       // lane / bank index
+static constexpr unsigned kWordBits = pool_clog2(kLbWords + 2u);                // words per run: 0 .. kLbWords + 1
+static constexpr unsigned kColBits  = pool_clog2(kMaxLineBufCols + 1u);         // local column: 0 .. kMaxLineBufCols
+static constexpr unsigned kSlotBits = pool_clog2(kMaxLineBufRows);
+static constexpr unsigned kChBits   = pool_clog2(kTileC + 1u);
+static constexpr unsigned kTapBits  = pool_clog2((kMaxPoolH > kMaxPoolW ? kMaxPoolH : kMaxPoolW) + 1u);
+static constexpr unsigned kRbBits   = pool_clog2(kTileC * kLbWords);            // row-buffer entry
+
+typedef ap_uint<kPoolDataBits> Lane;
+typedef ap_uint<kLaneBits>     LaneIdx;
+typedef ap_uint<kWordBits>     WordIdx;
+typedef ap_uint<kColBits>      ColIdx;
+typedef ap_uint<kSlotBits>     SlotIdx;
+typedef ap_uint<kChBits>       ChIdx;
+typedef ap_uint<kTapBits>      TapIdx;
+
+// Words covering `count` elements whose first element sits at lane `shift`
+// of its word: (shift + count + kLanes - 1) / kLanes.  Same value as
+// pool_words_for(off, count) with shift = off % kLanes, but computed on
+// (kLaneBits + kColBits)-bit operands — this sits on the loop-carried chain
+// of the loader and emitter loops.
+static inline WordIdx pool_run_words(LaneIdx shift, ColIdx count) {
+    #pragma HLS INLINE
+    const ap_uint<kColBits + kLaneBits + 1> s = (ap_uint<kColBits + kLaneBits + 1>)shift
+                                              + (ap_uint<kColBits + kLaneBits + 1>)count
+                                              + (ap_uint<kColBits + kLaneBits + 1>)(kLanes - 1);
+    return (WordIdx)(s >> kLaneBits);
+}
+
+// A word is always split with CONSTANT ranges (a word.range() with a runtime
+// lane index is a barrel shifter per use); lanes are then picked by indexing
+// the partitioned register array, which HLS maps to a mux.
+static inline void pool_split_lanes(PoolWord w, Lane lanes[kLanes]) {
+    #pragma HLS INLINE
+    for (unsigned l = 0; l < kLanes; l++) {
+        #pragma HLS UNROLL
+        lanes[l] = w.range(kPoolDataBits * (l + 1) - 1, kPoolDataBits * l);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// row_loader — DATAFLOW source (§2.14).
+//
+// Pure DDR reader.  Per (ni, ct, owt) chunk it walks the run sequence
+// (ih = 0 .. rows_per_chunk - 1, c_l = 0 .. c_valid - 1) and pushes every
+// WORD of every run onto row_word_pipe (one word per cycle, one flattened
+// II=1 loop per chunk).  Requests run ahead of the drain: a prologue issues
+// the first kReadAhead runs' requests, then one further request is issued
+// each time a run has been drained, so up to kReadAhead runs (≤ kReadAhead ×
+// (kLbWords + 1) words < the adapter's num_read_outstanding ×
+// max_read_burst_length buffer) are in flight and the DDR latency is paid
+// once per chunk rather than once per row.  The window_emitter derives the
+// same run sequence (shift / word count per run) itself, so no descriptor
+// travels with the words.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kReadAhead = 12;
+static_assert(kReadAhead <= 16, "kReadAhead must not exceed num_read_outstanding");
+
 static void row_loader(
     hls::burst_maxi<PoolWord> x,
-    hls::stream<Data_t>& row_data_pipe,
+    hls::stream<PoolWord>&    row_word_pipe,
     unsigned             batch,
     unsigned             channels,
     unsigned             in_h,
     unsigned             in_w,
-    unsigned             out_h,
     unsigned             out_w,
-    unsigned             pool_h,
     unsigned             pool_w,
-    unsigned             stride_h,
     unsigned             stride_w,
-    unsigned             pad_top,
     unsigned             pad_left,
-    unsigned             dil_h,
     unsigned             dil_w,
     const PoolGeometry&  geom
 ) {
     const unsigned c_tiles    = geom.c_tiles;
     const unsigned in_hw      = in_h * in_w;
-    const unsigned ow_tile    = geom.ow_tile;
     const unsigned ow_tiles_w = geom.ow_tiles_w;
+    const unsigned n_rows     = geom.rows_per_chunk;
 
 #ifdef DEBUG_LOAD_DATA_CACHING
-    // Local to one kernel invocation — collects every DDR cell read.
-    // Walked at function exit; any address with more than one record bumps
-    // the global duplicate counter.  When in_w > kMaxLineBufCols, W-tile
-    // boundary columns appear multiple times — the documented relaxation.
     PoolAddressMap_t read_addresses;
 #endif
 
     for (unsigned ni = 0; ni < batch; ni++) {
         for (unsigned ct = 0; ct < c_tiles; ct++) {
-            const unsigned c_off   = ct * kTileC;
-            const unsigned c_valid = std::min(kTileC, channels - c_off);
-
             for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
-                const unsigned ow_lo = owt * ow_tile;
-                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+                const ChunkGeom cg = chunk_geom(ct, owt, channels, in_w, out_w,
+                                                pool_w, stride_w, pad_left, dil_w, geom);
+                const unsigned chunk_base = (ni * channels + cg.c_off) * in_hw + cg.iw_lo;
+                const unsigned total_runs = n_rows * cg.c_valid;
+                const ColIdx   run_len    = (ColIdx)cg.run_len;
+                if (total_runs == 0) continue;
 
-                const int iw_start =
-                    (int)(ow_lo * stride_w) - (int)pad_left;
-                const int iw_end =
-                    (int)((ow_hi - 1) * stride_w + (pool_w - 1) * dil_w)
-                  - (int)pad_left;
-                const int iw_load_lo = (iw_start < 0) ? 0 : iw_start;
-                const int iw_load_hi = (iw_end >= (int)in_w)
-                                     ? (int)in_w - 1 : iw_end;
+                // Prologue: the first min(kReadAhead, total_runs) requests.
+                RunCursor rq = run_cursor_start(chunk_base);
+                const unsigned n_pro = (total_runs < kReadAhead) ? total_runs : kReadAhead;
+                for (unsigned k = 0; k < n_pro; k++) {
+                    #pragma HLS PIPELINE II=1
+                    #pragma HLS LOOP_TRIPCOUNT min=1 max=12
+                    x.read_request(rq.run_off / kLanes,
+                                   pool_run_words((LaneIdx)rq.run_shift, run_len));
+                    run_cursor_advance(rq, cg.c_valid, in_w, in_hw);
+                }
+                unsigned issued = n_pro;
 
-                int last_loaded_row = -1;
-
-                for (unsigned oh = 0; oh < out_h; oh++) {
-                    const int ih_window_max = (int)(oh * stride_h)
-                                            - (int)pad_top
-                                            + (int)((pool_h - 1) * dil_h);
-                    int load_start = last_loaded_row + 1;
-                    if (load_start < 0) load_start = 0;
-                    int load_end = ih_window_max;
-                    if (load_end >= (int)in_h) load_end = (int)in_h - 1;
-
-                    // Each (ih, c_l) is one contiguous element run
-                    // [run_off, run_off + run_len).  All c_valid runs of
-                    // the row are requested first (c_valid <= kTileC <=
-                    // num_read_outstanding) so their DDR latency overlaps,
-                    // then each run's words are drained and their in-range
-                    // lanes pushed one per cycle — the rate window_emitter
-                    // consumes them at.
-                    const unsigned run_len = (unsigned)(iw_load_hi - iw_load_lo + 1);
-                    for (int ih = load_start; ih <= load_end; ih++) {
-                        for (unsigned c_l = 0; c_l < c_valid; c_l++) {
-                            #pragma HLS PIPELINE II=1
-                            const unsigned run_off =
-                                (ni * channels + c_off + c_l) * in_hw
-                              + (unsigned)ih * in_w + (unsigned)iw_load_lo;
-                            x.read_request(run_off / kPoolPortElems,
-                                           pool_words_for(run_off, run_len));
-                        }
-                        for (unsigned c_l = 0; c_l < c_valid; c_l++) {
-                            const unsigned run_off =
-                                (ni * channels + c_off + c_l) * in_hw
-                              + (unsigned)ih * in_w + (unsigned)iw_load_lo;
-                            const unsigned shift   = run_off % kPoolPortElems;
-                            const unsigned n_words = pool_words_for(run_off, run_len);
-                            // Element (relative to the run) carried by lane 0
-                            // of the current word; advances by kPoolPortElems
-                            // per word.
-                            int e0 = -(int)shift;
-                            PoolWord word = 0;
-                            const unsigned n_lanes = n_words * kPoolPortElems;
-                            for (unsigned q = 0; q < n_lanes; q++) {
-                                #pragma HLS PIPELINE II=1
-                                const unsigned l = q % kPoolPortElems;
-                                if (l == 0) word = x.read();
-                                const int e = e0 + (int)l;
-                                if (e >= 0 && e < (int)run_len) {
-                                    row_data_pipe.write(pool_lane_to_data(word.range(
-                                        kPoolDataBits * (l + 1) - 1, kPoolDataBits * l)));
+                // Drain: one word per cycle over every run of the chunk.
+                RunCursor rd = run_cursor_start(chunk_base);
+                WordIdx  q         = 0;
+                WordIdx  nw        = pool_run_words((LaneIdx)rd.run_shift, run_len);
+                unsigned runs_done = 0;
+                for (;;) {
+                    #pragma HLS PIPELINE II=1
+                    #pragma HLS LOOP_TRIPCOUNT min=1 max=65536
+                    const PoolWord word = x.read();
+                    row_word_pipe.write(word);
 #ifdef DEBUG_LOAD_DATA_CACHING
-                                    PoolReadCounters c_rc;
-                                    c_rc.ni  = ni;
-                                    c_rc.ct  = ct;
-                                    c_rc.c_l = c_l;
-                                    c_rc.oh  = oh;
-                                    c_rc.ow  = owt;
-                                    c_rc.khi = (unsigned)ih;
-                                    c_rc.kwi = (unsigned)(iw_load_lo + e);
-                                    read_addresses[(std::size_t)run_off + (unsigned)e].push_back(c_rc);
-#endif /* DEBUG_LOAD_DATA_CACHING */
-                                }
-                                if (l == kPoolPortElems - 1) e0 += (int)kPoolPortElems;
+                    {
+                        const unsigned shift = rd.run_off % kLanes;
+                        for (unsigned l = 0; l < kLanes; l++) {
+                            const int e = (int)((unsigned)q * kLanes + l) - (int)shift;
+                            if (e >= 0 && e < (int)cg.run_len) {
+                                PoolReadCounters c_rc;
+                                c_rc.ni  = ni;
+                                c_rc.ct  = ct;
+                                c_rc.c_l = rd.c_l;
+                                c_rc.oh  = 0;
+                                c_rc.ow  = owt;
+                                c_rc.khi = rd.ih;
+                                c_rc.kwi = cg.iw_lo + (unsigned)e;
+                                read_addresses[(std::size_t)rd.run_off + (unsigned)e].push_back(c_rc);
                             }
                         }
                     }
-                    if (load_end > last_loaded_row) {
-                        last_loaded_row = load_end;
+#endif
+                    if (q + 1 == nw) {
+                        q = 0;
+                        runs_done++;
+                        if (issued < total_runs) {
+                            x.read_request(rq.run_off / kLanes,
+                                           pool_run_words((LaneIdx)rq.run_shift, run_len));
+                            run_cursor_advance(rq, cg.c_valid, in_w, in_hw);
+                            issued++;
+                        }
+                        run_cursor_advance(rd, cg.c_valid, in_w, in_hw);
+                        nw = pool_run_words((LaneIdx)rd.run_shift, run_len);
+                        if (runs_done == total_runs) break;
+                    } else {
+                        q++;
                     }
                 }
             }
@@ -559,35 +707,40 @@ static void row_loader(
 }
 
 // ---------------------------------------------------------------------------
-// window_emitter — DATAFLOW stage (Phase 2).
+// window_emitter — DATAFLOW stage (§2.14).
 //
-// Owns line_buf.  Drains row_data_pipe into line_buf, then for each ow-group
-// of size kOwParallel emits one MultiWindow vector per (khi, kwi) into
-// window_pipe and one MultiDenom (kOwParallel denom values) into denom_pipe.
-// Mirrors the row_loader's (ni, ct, owt, oh) schedule so stream consumption
-// matches production.
+// Owns line_buf, re-banked as [channel][column bank][row slot · kLbWords +
+// column word]: kTileC × kLanes LUTRAMs (1 write + 1 read port each).  A
+// row word from row_word_pipe is written whole in one cycle — its lanes are
+// rotated by the run's word alignment so bank b takes the lane whose local
+// column ≡ b (mod kLanes), lanes outside the run are dropped by a per-bank
+// enable, and the channel is selected by an unrolled compare so every RAM
+// sees exactly one conditional store.  A window read fetches, for each of
+// the kOwParallel positions, one column of all kTileC channels: the column
+// picks the bank and the address, and the position's value is muxed out of
+// the bank vector (columns spaced by stride_w hit distinct banks — see
+// PoolGeometry::gw).
 //
-// MultiDenom (kOwParallel valid_counts) is computed in closed form: a
-// window position is in-bounds iff its row AND its column are in-bounds,
-// and the two tests are independent, so the valid set is the rectangle
-// product {valid khi} × {valid kwi} and valid_count = num_valid_kh *
-// num_valid_kw.  num_valid_kh is counted once per group (it does not
-// depend on the ow position); num_valid_kw is counted per p.
+// Per (ni, ct, owt) chunk, per output row: ONE flattened II=1 loop that
+// (a) drains the words of the rows the NEXT output row needs into line_buf
+// (prefetch mode — the slots are disjoint from the window in use) and
+// (b) emits the pool_h·pool_w MultiWindows of every ow-group of the current
+// row plus one MultiDenom per group.  When the vertical span leaves no slot
+// headroom (PoolGeometry::prefetch == false) the same loop loads the current
+// row's rows first and starts emitting kSeqGap iterations after the last
+// word landed.  Both sides finish at their own pace; the loop exits when
+// both are done, so no cycle is spent on either side's padding.
 //
-// Residual handling — when (ow_hi - ow_lo) is not a multiple of kOwParallel,
-// the last group covers padded positions ow ≥ ow_hi.  Padded lanes get
-// pool-type identity values so the consumer's reduce produces correct
-// results for the in-range positions; the writer skips writes for ow ≥ ow_hi
-// so the padded results never reach DDR.
-//
-// Constraints (validated by the inference scheduler):
-//   (pool_w - 1) * dil_w + 1 <= kMaxLineBufCols   (single window fits)
-//   (pool_h - 1) * dil_h + 1 <= kMaxLineBufRows   (vertical span fits)
-//   kMaxLineBufRows is a power of two (slot = ih & (kMaxLineBufRows-1)).
-//   kOwParallel is a power of two (group rounding compiles to bitwise AND).
+// Denominators: the in-bounds tap count is separable (§2.12), kh(oh) ×
+// kw(ow).  kw(ow) is tallied once per chunk into a kMaxLineBufCols-entry
+// LUTRAM by a serial (position, tap) pre-pass — one bounds test per cycle
+// instead of kOwParallel × kMaxPoolW of them in the hot loop — and kh(oh)
+// once per row.
 // ---------------------------------------------------------------------------
+static constexpr unsigned kSeqGap = 8;   // iterations between the last load and the first emit (sequential mode)
+
 static void window_emitter(
-    hls::stream<Data_t>&       row_data_pipe,
+    hls::stream<PoolWord>&     row_word_pipe,
     hls::stream<MultiWindow>&  window_pipe,
     hls::stream<MultiDenom>&   denom_pipe,
     unsigned                  batch,
@@ -608,382 +761,459 @@ static void window_emitter(
     unsigned                  count_include_pad,
     const PoolGeometry&       geom
 ) {
-    const unsigned c_tiles    = geom.c_tiles;
-    const unsigned ow_tile    = geom.ow_tile;
-    const unsigned ow_tiles_w = geom.ow_tiles_w;
-
-    // line_buf:  kTileC * kMaxLineBufRows * kMaxLineBufCols * sizeof(Data_t)
-    //         =      8  *       16        *       64        *      2     =  16 KB
-    //
-    // Partitioning has two axes (both required for kOwParallel reads/cycle):
-    //
-    //   * ARRAY_PARTITION dim=1 complete → kTileC independent BRAMs of
-    //     [kMaxLineBufRows][kMaxLineBufCols], one per channel lane.  Lets
-    //     the consumer's reduce update kTileC accumulators in parallel.
-    //
-    //   * ARRAY_PARTITION dim=3 cyclic factor=kOwParallel → each per-
-    //     channel bank is column-cyclic-split into kOwParallel sub-banks,
-    //     so kOwParallel adjacent ow positions land in different banks.
-    //     Required at kOwParallel ≥ 4: ram_t2p alone (2 ports) cannot
-    //     service 4 column reads from a single bank when stride_w=1.
-    //
-    //   * BIND_STORAGE type=ram_t2p → each sub-bank is a true-dual-port
-    //     BRAM, so when stride_w=2 makes kOwParallel cols collide on
-    //     fewer cyclic banks (gcd(stride_w, factor) > 1), the dual ports
-    //     still deliver 2 reads per bank — together cyclic+ram_t2p
-    //     handles every stride_w with gcd(stride_w, kOwParallel) ≤ 2.
-    //     For stride_w=1: kOwParallel cols → kOwParallel distinct banks,
-    //     1 port each.  For stride_w=2 at kOwParallel=4: 4 cols → 2
-    //     banks × 2 ports = 4 reads.
-    //
-    // Resource cost at kOwParallel=4: kTileC × kOwParallel = 32 sub-
-    // banks, each [kMaxLineBufRows][kMaxLineBufCols / kOwParallel] = 16×16
-    // × 16 b ≈ 4 Kb → fits in 1 BRAM18 (or LUT-RAM) per sub-bank.
-    static Data_t line_buf[kTileC][kMaxLineBufRows][kMaxLineBufCols];
+    // kTileC × kLanes column banks of kMaxLineBufRows × kLbWords lanes each
+    // (8 × 8 × 128 × 16 b = 128 Kb of LUTRAM at the defaults).  One write
+    // (the incoming word's rotated lane) and one read (a window column) per
+    // bank per cycle.  Loads and window reads inside one loop instance
+    // touch different row slots (prefetch) or are kSeqGap iterations apart
+    // (sequential), so no intra-loop dependence needs guarding.
+    static Lane line_buf[kTileC][kLanes][kMaxLineBufRows * kLbWords];
     #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=1
-    #pragma HLS ARRAY_PARTITION variable=line_buf cyclic factor=kOwParallel dim=3
-    #pragma HLS BIND_STORAGE variable=line_buf type=ram_t2p
+    #pragma HLS ARRAY_PARTITION variable=line_buf complete dim=2
+    #pragma HLS BIND_STORAGE variable=line_buf type=ram_s2p impl=lutram
+    #pragma HLS DEPENDENCE variable=line_buf inter false
 
-    const Data_t pad_val = (pool_type == kPoolMax)
+    // kw(ow) for the chunk's positions, filled by the per-chunk pre-pass.
+    // kOwParallel banks (position mod kOwParallel): a group's consecutive
+    // positions are read in one cycle and each bank has one read port, so
+    // every bank is read exactly once at an explicitly computed address and
+    // the position's value is muxed out afterwards (a runtime bank index
+    // would make HLS read every bank per position: II=2).
+    static TapIdx kw_lut[kOwParallel][kMaxLineBufCols / kOwParallel];
+    #pragma HLS ARRAY_PARTITION variable=kw_lut complete dim=1
+    #pragma HLS BIND_STORAGE variable=kw_lut type=ram_s2p impl=lutram
+    #pragma HLS DEPENDENCE variable=kw_lut inter false
+
+    const unsigned c_tiles    = geom.c_tiles;
+    const unsigned ow_tiles_w = geom.ow_tiles_w;
+    const unsigned in_hw      = in_h * in_w;
+    const unsigned gw         = geom.gw;
+    const unsigned red_len    = geom.red_len;
+    const bool     prefetch   = geom.prefetch;
+    const unsigned denom_all  = pool_h * pool_w;
+    const unsigned gw_stride  = gw * stride_w;
+    const TapIdx   pool_h_t   = (TapIdx)pool_h;
+    const TapIdx   pool_w_t   = (TapIdx)pool_w;
+
+    const Lane pad_lane = pool_data_to_lane((pool_type == kPoolMax)
         ? Data_t(kDataMin)
-        : Data_t(0);
+        : Data_t(0));
 
     for (unsigned ni = 0; ni < batch; ni++) {
         for (unsigned ct = 0; ct < c_tiles; ct++) {
-            const unsigned c_off   = ct * kTileC;
-            const unsigned c_valid = std::min(kTileC, channels - c_off);
-
             for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
-                const unsigned ow_lo = owt * ow_tile;
-                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
+                const ChunkGeom cg = chunk_geom(ct, owt, channels, in_w, out_w,
+                                                pool_w, stride_w, pad_left, dil_w, geom);
+                const unsigned chunk_base = (ni * channels + cg.c_off) * in_hw + cg.iw_lo;
+                const unsigned n_emit     = cg.n_groups * red_len;
+                const ColIdx   run_len    = (ColIdx)cg.run_len;
+                const ChIdx    c_valid    = (ChIdx)cg.c_valid;
+                // Local column of output position ow_lo for tap kwi = 0.
+                const int col_base = (int)(cg.ow_lo * stride_w) - (int)pad_left - (int)cg.iw_lo;
 
-                const int iw_start =
-                    (int)(ow_lo * stride_w) - (int)pad_left;
-                const int iw_end =
-                    (int)((ow_hi - 1) * stride_w + (pool_w - 1) * dil_w)
-                  - (int)pad_left;
-                const int iw_load_lo = (iw_start < 0) ? 0 : iw_start;
-                const int iw_load_hi = (iw_end >= (int)in_w)
-                                     ? (int)in_w - 1 : iw_end;
-
-                int last_loaded_row = -1;
-
-                for (unsigned oh = 0; oh < out_h; oh++) {
-                    const int ih_window_max = (int)(oh * stride_h)
-                                            - (int)pad_top
-                                            + (int)((pool_h - 1) * dil_h);
-
-                    // -----------------------------------------------
-                    // Phase 1 drain: pull row pixels from row_data_pipe
-                    // into line_buf using the same (ih, c_l, iw) order
-                    // the row_loader emits them.
-                    // -----------------------------------------------
-                    int load_start = last_loaded_row + 1;
-                    if (load_start < 0) load_start = 0;
-                    int load_end = ih_window_max;
-                    if (load_end >= (int)in_h) load_end = (int)in_h - 1;
-
-                    for (int ih = load_start; ih <= load_end; ih++) {
-                        const unsigned slot = (unsigned)ih & (kMaxLineBufRows - 1);
-                        for (unsigned c_l = 0; c_l < c_valid; c_l++) {
-                            for (int iw = iw_load_lo; iw <= iw_load_hi; iw++) {
-                                #pragma HLS PIPELINE II=1
-                                const unsigned local_iw =
-                                    (unsigned)(iw - iw_load_lo);
-                                line_buf[c_l][slot][local_iw] =
-                                    row_data_pipe.read();
+                // ------------------------------------------------------
+                // Per-chunk pre-pass: kw(ow) = |{kwi : 0 <= iw(ow, kwi) < in_w}|
+                // for every position of the tile, one (position, tap) per
+                // cycle.
+                // ------------------------------------------------------
+                {
+                    const unsigned n_pre = cg.ow_span * pool_w;
+                    ColIdx   pos = 0;
+                    TapIdx   k   = 0;
+                    TapIdx   cnt = 0;
+                    int      iw_pos = (int)(cg.ow_lo * stride_w) - (int)pad_left;   // tap 0 of position pos
+                    int      iw_v   = iw_pos;
+                    for (unsigned t = 0; t < n_pre; t++) {
+                        #pragma HLS PIPELINE II=1
+                        #pragma HLS LOOP_TRIPCOUNT min=1 max=448
+                        const TapIdx c_next = (iw_v >= 0 && (unsigned)iw_v < in_w) ? (TapIdx)(cnt + 1) : cnt;
+                        if (k + 1 == pool_w_t) {
+                            for (unsigned b = 0; b < kOwParallel; b++) {
+                                #pragma HLS UNROLL
+                                if ((unsigned)(pos & (kOwParallel - 1)) == b)
+                                    kw_lut[b][pos >> pool_clog2(kOwParallel)] = c_next;
                             }
+                            pos++;
+                            k = 0;
+                            cnt = 0;
+                            iw_pos += (int)stride_w;
+                            iw_v = iw_pos;
+                        } else {
+                            k++;
+                            cnt = c_next;
+                            iw_v += (int)dil_w;
                         }
                     }
-                    if (load_end > last_loaded_row) {
-                        last_loaded_row = load_end;
+                }
+
+                // Load cursor — continues across the output rows of the chunk.
+                RunCursor lc = run_cursor_start(chunk_base);
+                WordIdx   lq  = 0;
+                WordIdx   lnw = pool_run_words((LaneIdx)lc.run_shift, run_len);
+                unsigned  loaded_rows = 0;
+
+                for (int oh = -1; oh < (int)out_h; oh++) {
+                    // Rows to load in this loop instance: those output row
+                    // oh_t needs beyond the ones already resident.
+                    const int oh_t = prefetch ? oh + 1 : oh;
+                    unsigned n_load_runs = 0;
+                    if (oh_t >= 0 && oh_t < (int)out_h) {
+                        int load_hi = (int)((unsigned)oh_t * stride_h + (pool_h - 1) * dil_h) - (int)pad_top;
+                        if (load_hi >= (int)in_h) load_hi = (int)in_h - 1;
+                        if (load_hi + 1 > (int)loaded_rows) {
+                            n_load_runs = ((unsigned)(load_hi + 1) - loaded_rows) * cg.c_valid;
+                            loaded_rows = (unsigned)(load_hi + 1);
+                        }
                     }
+                    const bool emit = (oh >= 0);
 
-                    // -----------------------------------------------
-                    // Phase 2 emit (§2.9 — kOwParallel-wide):
-                    //
-                    // Iterate the ow range as ceil((ow_hi - ow_lo) /
-                    // kOwParallel) groups; each group emits one
-                    // MultiDenom and pool_h * pool_w MultiWindows.
-                    //
-                    // n_groups is derived rather than predicated on
-                    // (ow < ow_hi) so the inner pipeline stays II=1.
-                    // For the residual last group (when ow_hi - ow_lo
-                    // is not a multiple of kOwParallel) the padded
-                    // lanes (ow_g + p ≥ ow_hi) get pool-type identity
-                    // values for the pixel data; the writer skips
-                    // writes on those lanes so DDR never sees them.
-                    // -----------------------------------------------
-                    const unsigned ow_span  = ow_hi - ow_lo;
-                    const unsigned n_groups =
-                        (ow_span + kOwParallel - 1u) / kOwParallel;
-
-                    for (unsigned g = 0; g < n_groups; g++) {
-                        const unsigned ow_g = ow_lo + g * kOwParallel;
-
-                        // -----------------------------------------------
-                        // Per-position valid_count, closed form.
-                        //
-                        // A window position (khi, kwi) is in-bounds iff
-                        // its row is in-bounds AND its column is — the row
-                        // test depends only on khi, the column test only
-                        // on kwi.  So the in-bounds set is the rectangle
-                        // product {valid khi} × {valid kwi} and
-                        //   valid_count = num_valid_kh * num_valid_kw.
-                        // num_valid_kh does not depend on the ow position,
-                        // so it is counted once per group; num_valid_kw is
-                        // counted per p.  This replaces the former
-                        // kOwParallel × kMaxPoolH × kMaxPoolW (98-lane)
-                        // bounds-count with kMaxPoolH + kOwParallel ×
-                        // kMaxPoolW (21-lane) counting plus kOwParallel
-                        // multiplies.  Padded positions (ow_g + p ≥ ow_hi)
-                        // compute a nominal count; the writer drops them.
-                        // -----------------------------------------------
-                        unsigned num_valid_kh = 0;
+                    // Per-row window constants: first input row of the window
+                    // and kh(oh).
+                    const int ih0 = (int)((unsigned)(oh < 0 ? 0 : oh) * stride_h) - (int)pad_top;
+                    unsigned num_valid_kh = 0;
+                    {
+                        int ih_v = ih0;
                         for (unsigned khi = 0; khi < kMaxPoolH; khi++) {
                             #pragma HLS UNROLL
-                            if (khi < pool_h) {
-                                const int ih_v = (int)(oh * stride_h + khi * dil_h)
-                                               - (int)pad_top;
-                                if (ih_v >= 0 && (unsigned)ih_v < in_h)
-                                    num_valid_kh++;
-                            }
+                            if (khi < pool_h && ih_v >= 0 && (unsigned)ih_v < in_h) num_valid_kh++;
+                            ih_v += (int)dil_h;
                         }
+                    }
 
-                        MultiDenom md;
-                        for (unsigned p = 0; p < kOwParallel; p++) {
-                            #pragma HLS UNROLL
-                            const unsigned ow_p = ow_g + p;
-                            unsigned num_valid_kw = 0;
-                            for (unsigned kwi = 0; kwi < kMaxPoolW; kwi++) {
+                    // Loop state.
+                    unsigned ld_runs = 0;
+                    bool     ld_done = (n_load_runs == 0);
+                    ap_uint<4> gap   = 0;
+                    unsigned em_i    = 0;
+                    unsigned g       = 0;
+                    TapIdx   khi = 0, kwi = 0;
+                    unsigned ow_g    = cg.ow_lo;
+                    ColIdx   gpos    = 0;             // ow_g - ow_lo
+                    int      gcol    = col_base;      // local column of (ow_g, kwi = 0)
+                    int      tap_col = 0;             // kwi * dil_w
+                    int      ih      = ih0;           // ih0 + khi * dil_h
+                    bool     em_done = !emit || (n_emit == 0);
+
+                    for (;;) {
+                        #pragma HLS PIPELINE II=1
+                        #pragma HLS LOOP_TRIPCOUNT min=1 max=4096
+                        const bool ld_now = !ld_done;
+                        const bool em_now = !em_done && (prefetch || (ld_done && gap >= kSeqGap));
+
+                        // ------------------------------------------------
+                        // (a) one row word → line_buf
+                        // ------------------------------------------------
+                        if (ld_now) {
+                            const PoolWord word  = row_word_pipe.read();
+                            const LaneIdx  shift = (LaneIdx)lc.run_shift;
+                            const SlotIdx  slot  = (SlotIdx)lc.ih;
+                            const ChIdx    ch    = (ChIdx)lc.c_l;
+                            Lane lanes[kLanes];
+                            #pragma HLS ARRAY_PARTITION variable=lanes complete
+                            pool_split_lanes(word, lanes);
+                            for (unsigned b = 0; b < kLanes; b++) {
                                 #pragma HLS UNROLL
-                                if (kwi < pool_w) {
-                                    const int iw_v = (int)(ow_p * stride_w + kwi * dil_w)
-                                                   - (int)pad_left;
-                                    if (iw_v >= 0 && (unsigned)iw_v < in_w)
-                                        num_valid_kw++;
+                                // Bank b receives lane (b + shift) mod kLanes;
+                                // that lane's local column is lq·kLanes + b,
+                                // minus kLanes when the lane index wrapped.
+                                const ap_uint<kLaneBits + 1> bs   = (ap_uint<kLaneBits + 1>)b + (ap_uint<kLaneBits + 1>)shift;
+                                const bool    wrap = bs[kLaneBits];
+                                const LaneIdx src  = (LaneIdx)bs;
+                                const ap_int<kColBits + kLaneBits + 2> col =
+                                    (ap_int<kColBits + kLaneBits + 2>)(((unsigned)lq << kLaneBits) + b)
+                                  - (wrap ? (ap_int<kColBits + kLaneBits + 2>)kLanes : (ap_int<kColBits + kLaneBits + 2>)0);
+                                const bool ok = (col >= 0) && (col < (ap_int<kColBits + kLaneBits + 2>)run_len);
+                                const WordIdx w = (wrap && lq > 0) ? (WordIdx)(lq - 1) : (wrap ? (WordIdx)0 : lq);
+                                const unsigned addr = ((unsigned)slot << pool_clog2(kLbWords)) + (unsigned)w;
+                                const Lane v = lanes[src];
+                                for (unsigned c = 0; c < kTileC; c++) {
+                                    #pragma HLS UNROLL
+                                    if (ok && ch == c) line_buf[c][b][addr] = v;
                                 }
                             }
-                            md.d[p] = count_include_pad
-                                ? (pool_h * pool_w)
-                                : (num_valid_kh * num_valid_kw);
+                            if (lq + 1 == lnw) {
+                                lq = 0;
+                                ld_runs++;
+                                run_cursor_advance(lc, cg.c_valid, in_w, in_hw);
+                                lnw = pool_run_words((LaneIdx)lc.run_shift, run_len);
+                                if (ld_runs == n_load_runs) ld_done = true;
+                            } else {
+                                lq++;
+                            }
+                        } else if (!em_done && gap < kSeqGap) {
+                            gap++;
                         }
-                        denom_pipe.write(md);
 
-                        // -----------------------------------------------
-                        // pool_h * pool_w MultiWindow emits per group.
-                        // Each MultiWindow carries kOwParallel × kTileC
-                        // pixels in parallel — line_buf reads execute on
-                        // both ports of the per-channel ram_t2p banks
-                        // (kOwParallel = 2 fits in two BRAM ports).
-                        // -----------------------------------------------
-                        for (unsigned khi = 0; khi < pool_h; khi++) {
-                            const int ih =
-                                (int)(oh * stride_h + khi * dil_h) - (int)pad_top;
-                            const bool ih_ok = (ih >= 0 && (unsigned)ih < in_h);
-                            const unsigned slot = ih_ok
-                                ? ((unsigned)ih & (kMaxLineBufRows - 1))
-                                : 0u;
-
-                            for (unsigned kwi = 0; kwi < pool_w; kwi++) {
-                                #pragma HLS PIPELINE II=1
-                                MultiWindow mw;
+                        // ------------------------------------------------
+                        // (b) one (khi, kwi) tap of the current ow-group
+                        // ------------------------------------------------
+                        if (em_now) {
+                            if (khi == 0 && kwi == 0) {
+                                // Bank b holds position gpos + ((b - gpos) mod kOwParallel).
+                                TapIdx kwv[kOwParallel];
+                                #pragma HLS ARRAY_PARTITION variable=kwv complete
+                                for (unsigned b = 0; b < kOwParallel; b++) {
+                                    #pragma HLS UNROLL
+                                    const ColIdx pos_b = (ColIdx)(gpos + (unsigned)((b - (unsigned)gpos) & (kOwParallel - 1)));
+                                    kwv[b] = kw_lut[b][pos_b >> pool_clog2(kOwParallel)];
+                                }
+                                MultiDenom md;
                                 for (unsigned p = 0; p < kOwParallel; p++) {
                                     #pragma HLS UNROLL
-                                    const unsigned ow_p = ow_g + p;
-                                    const int iw =
-                                        (int)(ow_p * stride_w + kwi * dil_w)
-                                      - (int)pad_left;
-                                    const bool ow_ok = (ow_p < ow_hi);
-                                    const bool spatial_ok =
-                                        ih_ok && iw >= 0 &&
-                                        (unsigned)iw < in_w && ow_ok;
-                                    const unsigned local_iw = spatial_ok
-                                        ? (unsigned)(iw - iw_load_lo)
-                                        : 0u;
-
-                                    for (unsigned c_l = 0; c_l < kTileC; c_l++) {
-                                        #pragma HLS UNROLL
-                                        const bool valid = spatial_ok && (c_l < c_valid);
-                                        mw.lanes[p].lanes[c_l] = valid
-                                            ? line_buf[c_l][slot][local_iw]
-                                            : pad_val;
-                                    }
+                                    const ap_uint<pool_clog2(kOwParallel) == 0 ? 1 : pool_clog2(kOwParallel)> bank =
+                                        (unsigned)(gpos + p) & (kOwParallel - 1);
+                                    const unsigned kw = (unsigned)kwv[bank];
+                                    md.d[p] = count_include_pad ? denom_all : (num_valid_kh * kw);
                                 }
-                                window_pipe.write(mw);
+                                denom_pipe.write(md);
                             }
+
+                            const bool    ih_ok = (ih >= 0 && (unsigned)ih < in_h);
+                            const SlotIdx slot  = ih_ok ? (SlotIdx)ih : (SlotIdx)0;
+                            const int     col0  = gcol + tap_col;          // local column of position 0
+
+                            LaneIdx  bank_p[kOwParallel];
+                            unsigned addr_p[kOwParallel];
+                            bool     ok_p[kOwParallel];
+                            #pragma HLS ARRAY_PARTITION variable=bank_p complete
+                            #pragma HLS ARRAY_PARTITION variable=addr_p complete
+                            #pragma HLS ARRAY_PARTITION variable=ok_p complete
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                const int col = col0 + (int)(p * stride_w);
+                                const bool spatial_ok = ih_ok && ((unsigned)col < cg.run_len)
+                                                     && (ow_g + p < cg.ow_hi) && (p < gw);
+                                const ColIdx ucol = spatial_ok ? (ColIdx)col : (ColIdx)0;
+                                bank_p[p] = (LaneIdx)ucol;
+                                addr_p[p] = ((unsigned)slot << pool_clog2(kLbWords)) + (unsigned)(ucol >> kLaneBits);
+                                ok_p[p]   = spatial_ok;
+                            }
+
+                            // One read per bank: the address of whichever
+                            // position maps to it (position 0 wins on a
+                            // collision — only possible when p ≥ 1 is padded).
+                            Lane rv[kTileC][kLanes];
+                            #pragma HLS ARRAY_PARTITION variable=rv complete dim=0
+                            for (unsigned b = 0; b < kLanes; b++) {
+                                #pragma HLS UNROLL
+                                unsigned addr = addr_p[kOwParallel - 1];
+                                for (int p = (int)kOwParallel - 2; p >= 0; p--) {
+                                    #pragma HLS UNROLL
+                                    if (bank_p[p] == b) addr = addr_p[p];
+                                }
+                                for (unsigned c = 0; c < kTileC; c++) {
+                                    #pragma HLS UNROLL
+                                    rv[c][b] = line_buf[c][b][addr];
+                                }
+                            }
+
+                            MultiWindow mw;
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                for (unsigned c = 0; c < kTileC; c++) {
+                                    #pragma HLS UNROLL
+                                    const Lane v = rv[c][bank_p[p]];
+                                    const bool valid = ok_p[p] && (c < cg.c_valid);
+                                    mw.lanes[p].lanes[c] = pool_lane_to_data(valid ? v : pad_lane);
+                                }
+                            }
+                            window_pipe.write(mw);
+
+                            // Advance (kwi, khi, g) and the incremental columns / row.
+                            em_i++;
+                            if (kwi + 1 == pool_w_t) {
+                                kwi = 0;
+                                tap_col = 0;
+                                if (khi + 1 == pool_h_t) {
+                                    khi = 0;
+                                    ih = ih0;
+                                    g++;
+                                    ow_g += gw;
+                                    gpos += (ColIdx)gw;
+                                    gcol += (int)gw_stride;
+                                } else {
+                                    khi++;
+                                    ih += (int)dil_h;
+                                }
+                            } else {
+                                kwi++;
+                                tap_col += (int)dil_w;
+                            }
+                            if (em_i == n_emit) em_done = true;
                         }
-                    } // ow_group loop (within W-tile)
-                } // oh loop
+
+                        if (ld_done && em_done) break;
+                    }
+                } // oh loop (-1 = prologue)
             } // owt loop
         } // c_tile loop
     } // batch loop
 }
 
 // ---------------------------------------------------------------------------
-// process_pool_kernel_tile — DATAFLOW processor (post-§2.9 — kOwParallel).
+// process_pool_kernel_tile — DATAFLOW processor (§2.14).
 //
-// Loop nest matches the producer: (ni, ct, owt, oh, ow_group) with ct OUTER
-// of oh AND a W-tile dimension owt OUTER of oh.  ow_tile = out_w yields a
-// single tile; ow_tile < out_w processes ow chunks in turn so the producer's
-// line buffer stays bounded.
+// Per (ni, ct, owt, oh) row: ONE flattened II=1 loop of n_groups × slot_len
+// iterations (plus one extra slot after the very last row).  In slot g,
+// iterations i < red_len read one MultiWindow and update all kOwParallel ×
+// kTileC accumulators (the §2.9 reduce); iterations i < kTileC finalise
+// channel i of the PREVIOUS group's snapshot — kOwParallel lanes per cycle
+// (AVG: × inv_denom, LP-2: poly_sqrt), saturate to Data_t and push one
+// FinBundle to acc_stream.  At the end of the slot the accumulators and the
+// group's reciprocals are copied into the snapshot registers.  slot_len =
+// max(red_len, kTileC), so the finalise never trails by more than one slot
+// and the reduce never waits for it; the finalise hardware is kOwParallel
+// lanes wide instead of the §6.2.3 kOwParallel × kTileC.
 //
-// Per (ni, ct, owt, oh, ow_group):
-//   * Read MultiDenom (kOwParallel denom values) from denom_pipe; one
-//     inv_denom_lookup per lane → kOwParallel ap_ufixed<24,1> reciprocals
-//     ready before the reduce starts.
-//   * Reduce: pool_h*pool_w iterations, each reading one MultiWindow from
-//     window_pipe and updating ALL kOwParallel × kTileC accumulators in
-//     parallel (fully unrolled inner double loop).  acc[p][c1] has 1-cycle
-//     RAW distance per lane so HLS schedules at II=1 for MAX and at II≈L
-//     for AVG/LP (L = ap_fixed<32,16> add latency).  Total reduce cost
-//     drops from `pool_h * pool_w` cycles per output to `pool_h * pool_w`
-//     per kOwParallel outputs.
-//   * Finalise: per-lane multiply by inv_denom for AVG, poly_sqrt for LP-2,
-//     identity otherwise; push kOwParallel × c_valid lanes to acc_stream as
-//     AccData_t in (p, c1) order.  Writer saturates AccData_t → Data_t at
-//     the boundary and skips writes for out-of-range positions (ow ≥ ow_hi).
+// acc_stream order: (ni, ct, owt, oh, group, c1) with kOwParallel adjacent
+// ow positions of channel c1 per bundle — exactly the writer's row-buffer
+// fill order.
 // ---------------------------------------------------------------------------
+typedef ap_uint<kOwParallel * kPoolDataBits> FinBundle;
+static constexpr unsigned kSlotCntBits = pool_clog2(kMaxPoolH * kMaxPoolW + kTileC + 1u);
+typedef ap_uint<kSlotCntBits> SlotCnt;
+
 static void process_pool_kernel_tile(
     hls::stream<MultiWindow>& window_pipe,
     hls::stream<MultiDenom>&  denom_pipe,
-    hls::stream<AccData_t>&   acc_stream,
+    hls::stream<FinBundle>&   acc_stream,
     unsigned                batch,
     unsigned                channels,
+    unsigned                in_w,
     unsigned                out_h,
     unsigned                out_w,
-    unsigned                pool_h,
     unsigned                pool_w,
+    unsigned                stride_w,
+    unsigned                pad_left,
+    unsigned                dil_w,
     unsigned                pool_type,
     unsigned                lp_order,
     const PoolGeometry&     geom
 ) {
-    // acc[kOwParallel][kTileC] — both dimensions fully partitioned so the
-    // unrolled reduce can update all kOwParallel * kTileC lanes in one
-    // cycle.  dim=0 (= "all dims") gives the maximally-partitioned layout.
     AccData_t acc[kOwParallel][kTileC];
-    #pragma HLS ARRAY_PARTITION variable=acc complete dim=0
+    AccData_t acc_done[kOwParallel][kTileC];
+    InvDenom_t inv[kOwParallel];
+    InvDenom_t inv_done[kOwParallel];
+    #pragma HLS ARRAY_PARTITION variable=acc      complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=acc_done complete dim=0
+    #pragma HLS ARRAY_PARTITION variable=inv      complete
+    #pragma HLS ARRAY_PARTITION variable=inv_done complete
 
     const unsigned c_tiles    = geom.c_tiles;
-    const unsigned ow_tile    = geom.ow_tile;
     const unsigned ow_tiles_w = geom.ow_tiles_w;
+    const SlotCnt  red_len    = (SlotCnt)geom.red_len;
+    const SlotCnt  slot_len   = (SlotCnt)geom.slot_len;
+    const bool     is_max     = (pool_type == kPoolMax);
+    const bool     is_avg     = (pool_type == kPoolAvg);
+    const bool     lp1        = (lp_order == 1u);
+    const AccData_t init_val  = is_max ? AccData_t(kAccMin) : AccData_t(0);
+
+    for (unsigned p = 0; p < kOwParallel; p++) {
+        #pragma HLS UNROLL
+        inv[p] = inv_denom_lookup(1u);
+        inv_done[p] = inv[p];
+        for (unsigned c1 = 0; c1 < kTileC; c1++) {
+            #pragma HLS UNROLL
+            acc[p][c1] = AccData_t(0);
+            acc_done[p][c1] = AccData_t(0);
+        }
+    }
+    bool fin_pending = false;
 
     for (unsigned ni = 0; ni < batch; ni++) {
         for (unsigned ct = 0; ct < c_tiles; ct++) {
-            const unsigned c_off   = ct * kTileC;
-            const unsigned c_valid = std::min(kTileC, channels - c_off);
-
             for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
-                const unsigned ow_lo = owt * ow_tile;
-                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
-                const unsigned ow_span  = ow_hi - ow_lo;
-                const unsigned n_groups =
-                    (ow_span + kOwParallel - 1u) / kOwParallel;
+                const ChunkGeom cg = chunk_geom(ct, owt, channels, in_w, out_w,
+                                                pool_w, stride_w, pad_left, dil_w, geom);
+                const bool last_chunk = (ni + 1 == batch) && (ct + 1 == c_tiles)
+                                     && (owt + 1 == ow_tiles_w);
 
                 for (unsigned oh = 0; oh < out_h; oh++) {
-                    for (unsigned g = 0; g < n_groups; g++) {
+                    const bool     last_row = last_chunk && (oh + 1 == out_h);
+                    const unsigned n_slots  = cg.n_groups + (last_row ? 1u : 0u);
+                    const unsigned trip     = n_slots * (unsigned)slot_len;
+                    unsigned g = 0;
+                    SlotCnt  i = 0;
 
-                    // -----------------------------------------------
-                    // Per-group reciprocal LUT lookups for kOwParallel
-                    // positions in parallel.  inv_denom values feed the
-                    // AVG finalize multiply (other pool types ignore).
-                    // -----------------------------------------------
-                    const MultiDenom md = denom_pipe.read();
-                    InvDenom_t inv_denom[kOwParallel];
-                    #pragma HLS ARRAY_PARTITION variable=inv_denom complete
-                    for (unsigned p = 0; p < kOwParallel; p++) {
-                        #pragma HLS UNROLL
-                        inv_denom[p] = inv_denom_lookup(md.d[p]);
-                    }
-
-                    // -----------------------------------------------
-                    // Initialise kOwParallel × kTileC accumulators
-                    // (1 cycle, fully unrolled).
-                    //   MAX: kAccMin sentinel (any valid input beats
-                    //        it on the first comparison).
-                    //   AVG / LP: 0 (sum starts at zero).
-                    // -----------------------------------------------
-                    for (unsigned p = 0; p < kOwParallel; p++) {
-                        #pragma HLS UNROLL
-                        for (unsigned c1 = 0; c1 < kTileC; c1++) {
-                            #pragma HLS UNROLL
-                            acc[p][c1] = (pool_type == kPoolMax)
-                                ? AccData_t(kAccMin)
-                                : AccData_t(0);
-                        }
-                    }
-
-                    // -----------------------------------------------
-                    // Vectorised reduce: one MultiWindow per cycle
-                    // updates ALL kOwParallel × kTileC accumulators.
-                    //
-                    // ri runs 0 .. pool_h*pool_w - 1 (no kOwParallel
-                    // factor — that's exactly what the second
-                    // vectorisation axis buys).  All lane updates
-                    // happen on the same cycle, fully unrolled.
-                    //
-                    // Per-lane RAW distance on acc[p][c1] is 1 cycle,
-                    // so HLS schedules the reduce loop at II=1 for
-                    // MAX and II≈L for AVG/LP (L = ap_fixed<32,16>
-                    // add latency).  Cycle count per output drops by
-                    // ~kOwParallel vs the §2.5 single-position reduce.
-                    // -----------------------------------------------
-                    const unsigned ri_bound = pool_h * pool_w;
-                    for (unsigned ri = 0; ri < ri_bound; ri++) {
+                    for (unsigned t = 0; t < trip; t++) {
                         #pragma HLS PIPELINE II=1
-                        const MultiWindow mw = window_pipe.read();
-                        for (unsigned p = 0; p < kOwParallel; p++) {
-                            #pragma HLS UNROLL
-                            for (unsigned c1 = 0; c1 < kTileC; c1++) {
-                                #pragma HLS UNROLL
-                                const AccData_t val =
-                                    AccData_t(mw.lanes[p].lanes[c1]);
+                        #pragma HLS LOOP_TRIPCOUNT min=1 max=4096
+                        const bool red   = (g < cg.n_groups) && (i < red_len);
+                        const bool first = (i == 0);
 
-                                if (pool_type == kPoolMax) {
-                                    if (val > acc[p][c1]) acc[p][c1] = val;
-                                } else if (pool_type == kPoolAvg) {
-                                    acc[p][c1] += val;
-                                } else {
-                                    // LP: p_order=1 → |val|, p_order=2 → val²
-                                    const AccData_t contrib = (lp_order == 1u)
-                                        ? (val < AccData_t(0)
-                                            ? AccData_t(-val) : val)
-                                        : AccData_t(val * val);
-                                    acc[p][c1] += contrib;
+                        // ---- reduce step i of group g ----
+                        if (red) {
+                            if (first) {
+                                const MultiDenom md = denom_pipe.read();
+                                for (unsigned p = 0; p < kOwParallel; p++) {
+                                    #pragma HLS UNROLL
+                                    inv[p] = inv_denom_lookup(md.d[p]);
+                                }
+                            }
+                            const MultiWindow mw = window_pipe.read();
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                for (unsigned c1 = 0; c1 < kTileC; c1++) {
+                                    #pragma HLS UNROLL
+                                    const AccData_t val = AccData_t(mw.lanes[p].lanes[c1]);
+                                    const AccData_t cur = first ? init_val : acc[p][c1];
+                                    AccData_t nxt;
+                                    if (is_max) {
+                                        nxt = (val > cur) ? val : cur;
+                                    } else {
+                                        const AccData_t contrib = is_avg ? val
+                                            : (lp1 ? (val < AccData_t(0) ? AccData_t(-val) : val)
+                                                   : AccData_t(val * val));
+                                        nxt = cur + contrib;
+                                    }
+                                    acc[p][c1] = nxt;
                                 }
                             }
                         }
-                    }
 
-                    // -----------------------------------------------
-                    // Finalise and push kOwParallel × c_valid lanes
-                    // to acc_stream in (p outer, c1 inner) order so
-                    // the writer drains them naturally per group.
-                    //
-                    //   MAX: identity — acc[p][c1] is the max.
-                    //   AVG: multiply by precomputed ap_ufixed<24,1>
-                    //        reciprocal of denom for lane p.
-                    //   LP p_order=1: identity (Σ|x_i|).
-                    //   LP p_order=2: poly_sqrt — fixed-point sqrt.
-                    // -----------------------------------------------
-                    for (unsigned p = 0; p < kOwParallel; p++) {
-                        for (unsigned c1 = 0; c1 < c_valid; c1++) {
-                            #pragma HLS PIPELINE II=1
-                            AccData_t result;
-                            if (pool_type == kPoolMax) {
-                                result = acc[p][c1];
-                            } else if (pool_type == kPoolAvg) {
-                                result = AccData_t(acc[p][c1] * inv_denom[p]);
-                            } else {
-                                result = (lp_order == 1u)
-                                    ? acc[p][c1]
-                                    : poly_sqrt(acc[p][c1]);
+                        // ---- finalise channel i of the previous group ----
+                        if (fin_pending && i < kTileC) {
+                            const ChIdx ci = (ChIdx)i;
+                            FinBundle fb = 0;
+                            for (unsigned p = 0; p < kOwParallel; p++) {
+                                #pragma HLS UNROLL
+                                const AccData_t a = acc_done[p][ci];
+                                AccData_t r;
+                                if (is_max) {
+                                    r = a;
+                                } else if (is_avg) {
+                                    r = AccData_t(a * inv_done[p]);
+                                } else {
+                                    r = lp1 ? a : poly_sqrt(a);
+                                }
+                                const Data_t d = saturate_cast<Data_t>(r);
+                                fb.range(kPoolDataBits * (p + 1) - 1, kPoolDataBits * p) =
+                                    pool_data_to_lane(d);
                             }
-                            acc_stream.write(result);
+                            acc_stream.write(fb);
+                        }
+
+                        // ---- slot bookkeeping ----
+                        if (i + 1 == slot_len) {
+                            if (g < cg.n_groups) {
+                                for (unsigned p = 0; p < kOwParallel; p++) {
+                                    #pragma HLS UNROLL
+                                    inv_done[p] = inv[p];
+                                    for (unsigned c1 = 0; c1 < kTileC; c1++) {
+                                        #pragma HLS UNROLL
+                                        acc_done[p][c1] = acc[p][c1];
+                                    }
+                                }
+                                fin_pending = true;
+                            } else {
+                                fin_pending = false;
+                            }
+                            i = 0;
+                            g++;
+                        } else {
+                            i++;
                         }
                     }
-
-                    } // ow_group loop (within W-tile)
                 } // oh loop
             } // owt loop
         } // c_tile loop
@@ -991,75 +1221,215 @@ static void process_pool_kernel_tile(
 }
 
 // ---------------------------------------------------------------------------
-// write_output_tile — DATAFLOW sink (post-§2.9 — kOwParallel groups).
+// write_output_tile — DATAFLOW sink (§2.14).
 //
-// Drains acc_stream in the consumer's emit order — (ni, ct, owt, oh,
-// ow_group, p, c1) where p ∈ [0, kOwParallel), c1 ∈ [0, c_valid).  Each
-// ow-group covers kOwParallel adjacent ow positions.  Output addresses are
-// non-contiguous in C (stride = out_h * out_w per channel); y_addr is
-// advanced by a counter to avoid a multiplier inside the pipeline.
+// Transposes the consumer's (group, channel) bundles into per-channel
+// output-row runs and writes them through the 128-bit y port.  Two row
+// buffers (ping-pong), each kLanes column banks × (kTileC · kLbWords)
+// entries of LUTRAM: a bundle's kOwParallel adjacent columns of channel c1
+// go to banks (col mod kLanes) at entry c1·kLbWords + col / kLanes; a DDR
+// word of channel c's run is the kLanes banks read at entry c·kLbWords + k
+// (or k − 1 for the lanes that wrap), rotated by the run's alignment.
 //
-// Residual handling — when (ow_hi - ow_lo) is not a multiple of kOwParallel,
-// the last group has padded lanes (ow ≥ ow_hi).  Their values flow through
-// acc_stream in the same shape as in-range positions but we MUST NOT write
-// them to DDR — masking the write with `ow < ow_hi` keeps the read off
-// acc_stream un-conditional (so II=1 holds) while the conditional write
-// merely gates the m_axi store.
-//
-// Saturates AccData_t → Data_t at the boundary.
+// Per (ni, ct, owt, oh) row r: ONE flattened II=1 loop of max(fill, drain)
+// iterations that fills buffer r&1 with row r's bundles (masking the
+// identity-padded lanes past ow_hi and channels ≥ c_valid) while draining
+// row r−1 from the other buffer: per channel one write_request of
+// pool_words_for(start, len) ≤ kLbWords + 1 words, and the run's first /
+// last words written with byte strobes covering only the run's own lanes
+// (masked lanes are also zeroed in WDATA).  A final row-loop iteration
+// drains the last row.  At most kWriteInFlight requests are un-acknowledged
+// (< num_write_outstanding, the §2.30 rule).
 // ---------------------------------------------------------------------------
+static constexpr unsigned kWriteInFlight = 4;
+static constexpr unsigned kRbEntries     = kTileC * kLbWords;
+static constexpr unsigned kBeBits        = kLanes * (kPoolDataBits / 8);
+typedef ap_uint<kBeBits> ByteEn;
+
+struct RowDesc {
+    bool     valid;
+    ChIdx    c_valid;
+    ColIdx   len;        // ow_span
+    WordIdx  nw_max;     // drain iterations per channel: words_for worst case
+    unsigned e_base;     // element index of (channel c_off, ow_lo)
+};
+
 static void write_output_tile(
-    Data_t*                 y,
-    hls::stream<AccData_t>& acc_stream,
+    hls::burst_maxi<PoolWord> y,
+    hls::stream<FinBundle>&   acc_stream,
     unsigned                batch,
     unsigned                channels,
+    unsigned                in_w,
     unsigned                out_h,
     unsigned                out_w,
+    unsigned                pool_w,
+    unsigned                stride_w,
+    unsigned                pad_left,
+    unsigned                dil_w,
     const PoolGeometry&     geom
 ) {
+    static Lane rbA[kLanes][kRbEntries];
+    static Lane rbB[kLanes][kRbEntries];
+    #pragma HLS ARRAY_PARTITION variable=rbA complete dim=1
+    #pragma HLS ARRAY_PARTITION variable=rbB complete dim=1
+    #pragma HLS BIND_STORAGE variable=rbA type=ram_s2p impl=lutram
+    #pragma HLS BIND_STORAGE variable=rbB type=ram_s2p impl=lutram
+    #pragma HLS DEPENDENCE variable=rbA inter false
+    #pragma HLS DEPENDENCE variable=rbB inter false
+
     const unsigned c_tiles    = geom.c_tiles;
-    const unsigned hw_stride  = out_h * out_w;
-    const unsigned ow_tile    = geom.ow_tile;
     const unsigned ow_tiles_w = geom.ow_tiles_w;
+    const unsigned hw         = out_h * out_w;
+    const ColIdx   gw         = (ColIdx)geom.gw;
+    const unsigned n_rows     = batch * c_tiles * ow_tiles_w * out_h;
 
-    for (unsigned ni = 0; ni < batch; ni++) {
-        for (unsigned ct = 0; ct < c_tiles; ct++) {
-            const unsigned c_off   = ct * kTileC;
-            const unsigned c_valid = std::min(kTileC, channels - c_off);
-            const unsigned y_base  = (ni * channels + c_off) * hw_stride;
+    unsigned ni = 0, ct = 0, owt = 0, oh = 0;
+    RowDesc  prev;
+    prev.valid = false; prev.c_valid = 0; prev.len = 0; prev.nw_max = 0; prev.e_base = 0;
+    unsigned pending = 0;
 
-            for (unsigned owt = 0; owt < ow_tiles_w; owt++) {
-                const unsigned ow_lo = owt * ow_tile;
-                const unsigned ow_hi = std::min(ow_lo + ow_tile, out_w);
-                const unsigned ow_span  = ow_hi - ow_lo;
-                const unsigned n_groups =
-                    (ow_span + kOwParallel - 1u) / kOwParallel;
+    for (unsigned r = 0; r <= n_rows; r++) {
+        // Row r's descriptor (fill side).
+        const ChunkGeom cg = chunk_geom(ct, owt, channels, in_w, out_w,
+                                        pool_w, stride_w, pad_left, dil_w, geom);
+        RowDesc cur;
+        cur.valid   = (r < n_rows);
+        cur.c_valid = (ChIdx)cg.c_valid;
+        cur.len     = (ColIdx)cg.ow_span;
+        cur.nw_max  = (WordIdx)((cg.ow_span + kLanes - 1) / kLanes + 1);
+        cur.e_base  = ((ni * channels + cg.c_off) * out_h + oh) * out_w + cg.ow_lo;
 
-                for (unsigned oh = 0; oh < out_h; oh++) {
-                    for (unsigned g = 0; g < n_groups; g++) {
-                        const unsigned ow_g = ow_lo + g * kOwParallel;
-                        for (unsigned p = 0; p < kOwParallel; p++) {
-                            const unsigned ow      = ow_g + p;
-                            const bool     ow_ok   = (ow < ow_hi);
-                            unsigned y_addr = y_base + oh * out_w + ow;
-                            for (unsigned c1 = 0; c1 < c_valid; c1++) {
-                                #pragma HLS PIPELINE II=1
-                                const Data_t v = saturate_cast<Data_t>(
-                                    acc_stream.read());
-                                if (ow_ok) y[y_addr] = v;
-                                y_addr += hw_stride;
-                            }
+        const unsigned fill_len  = cur.valid  ? cg.n_groups * kTileC : 0u;
+        const unsigned drain_len = prev.valid ? (unsigned)prev.c_valid * (unsigned)prev.nw_max : 0u;
+        const unsigned trip      = (fill_len > drain_len) ? fill_len : drain_len;
+        const bool     pp        = (r & 1u) != 0u;   // fill rbB / drain rbA when set
+
+        ChIdx    fc = 0;                             // fill: channel
+        ColIdx   fcol = 0;                           // fill: first column of the group
+        ChIdx    dc = 0;                             // drain: channel
+        WordIdx  dk = 0;                             // drain: word
+        unsigned de = prev.e_base;                   // drain: run start element of channel dc
+        WordIdx  d_nout = 0;                         // words of the current drain run
+
+        for (unsigned t = 0; t < trip; t++) {
+            #pragma HLS PIPELINE II=1
+            #pragma HLS LOOP_TRIPCOUNT min=1 max=4096
+
+            // ---- fill: one bundle = kOwParallel columns of channel fc ----
+            if (t < fill_len) {
+                const FinBundle fb = acc_stream.read();
+                Lane    fv[kOwParallel];
+                LaneIdx fbank[kOwParallel];
+                bool    fok[kOwParallel];
+                #pragma HLS ARRAY_PARTITION variable=fv    complete
+                #pragma HLS ARRAY_PARTITION variable=fbank complete
+                #pragma HLS ARRAY_PARTITION variable=fok   complete
+                for (unsigned p = 0; p < kOwParallel; p++) {
+                    #pragma HLS UNROLL
+                    const ColIdx col = (ColIdx)(fcol + p);
+                    fv[p]    = fb.range(kPoolDataBits * (p + 1) - 1, kPoolDataBits * p);
+                    fbank[p] = (LaneIdx)col;
+                    fok[p]   = (p < gw) && (col < cur.len) && (fc < cur.c_valid);
+                }
+                // All kOwParallel columns share the word index (fcol is a
+                // multiple of gw and gw divides kLanes).
+                const unsigned faddr = ((unsigned)fc << pool_clog2(kLbWords)) + (unsigned)(fcol >> kLaneBits);
+                for (unsigned b = 0; b < kLanes; b++) {
+                    #pragma HLS UNROLL
+                    Lane v  = 0;
+                    bool en = false;
+                    for (unsigned p = 0; p < kOwParallel; p++) {
+                        #pragma HLS UNROLL
+                        if (fok[p] && fbank[p] == b) { v = fv[p]; en = true; }
+                    }
+                    if (en) {
+                        if (pp) rbB[b][faddr] = v;
+                        else    rbA[b][faddr] = v;
+                    }
+                }
+                if (fc + 1 == kTileC) { fc = 0; fcol += gw; }
+                else                  { fc++; }
+            }
+
+            // ---- drain: word dk of channel dc's run (previous row) ----
+            if (t < drain_len) {
+                const LaneIdx shift = (LaneIdx)(de % kLanes);
+                if (dk == 0) {
+                    d_nout = pool_run_words(shift, prev.len);
+                    y.write_request(de / kLanes, (unsigned)d_nout);
+                }
+                if (dk < d_nout) {
+                    Lane rv[kLanes];
+                    #pragma HLS ARRAY_PARTITION variable=rv complete
+                    for (unsigned b = 0; b < kLanes; b++) {
+                        #pragma HLS UNROLL
+                        const ap_uint<kLaneBits + 1> bs = (ap_uint<kLaneBits + 1>)b + (ap_uint<kLaneBits + 1>)shift;
+                        const bool wrap = bs[kLaneBits];
+                        // Word 0's wrapped lanes lie before the run (masked
+                        // below); clamp their address so the read stays in
+                        // bounds.
+                        const WordIdx w = (wrap && dk > 0) ? (WordIdx)(dk - 1) : (wrap ? (WordIdx)0 : dk);
+                        const unsigned addr = ((unsigned)dc << pool_clog2(kLbWords)) + (unsigned)w;
+                        const Lane a  = rbA[b][addr];
+                        const Lane bb = rbB[b][addr];
+                        rv[b] = pp ? a : bb;
+                    }
+                    PoolWord out = 0;
+                    ByteEn   be  = 0;
+                    for (unsigned l = 0; l < kLanes; l++) {
+                        #pragma HLS UNROLL
+                        // Lane l of DDR word dk holds local column dk·kLanes + l − shift.
+                        const ap_int<kColBits + kLaneBits + 2> col =
+                            (ap_int<kColBits + kLaneBits + 2>)(((unsigned)dk << kLaneBits) + l)
+                          - (ap_int<kColBits + kLaneBits + 2>)shift;
+                        const bool ok = (col >= 0) && (col < (ap_int<kColBits + kLaneBits + 2>)prev.len);
+                        const LaneIdx src = (LaneIdx)((ap_uint<kLaneBits + 1>)l - (ap_uint<kLaneBits + 1>)shift);
+                        const Lane v  = ok ? rv[src] : Lane(0);
+                        out.range(kPoolDataBits * (l + 1) - 1, kPoolDataBits * l) = v;
+                        for (unsigned q = 0; q < kPoolDataBits / 8; q++) {
+                            #pragma HLS UNROLL
+                            be[l * (kPoolDataBits / 8) + q] = ok;
                         }
-                    } // ow_group loop (within W-tile)
-                } // oh loop
-            } // owt loop
-        } // c_tile loop
-    } // batch loop
+                    }
+                    y.write(out, (ap_int<kBeBits>)be);
+                }
+                if (dk + 1 == prev.nw_max) {
+                    dk = 0;
+                    dc++;
+                    de += hw;
+                    if (pending == kWriteInFlight - 1) y.write_response();
+                    else                               pending++;
+                } else {
+                    dk++;
+                }
+            }
+        }
+
+        prev = cur;
+        // Advance (ni, ct, owt, oh).
+        if (oh + 1 == out_h) {
+            oh = 0;
+            if (owt + 1 == ow_tiles_w) {
+                owt = 0;
+                if (ct + 1 == c_tiles) { ct = 0; ni++; }
+                else                   { ct++; }
+            } else {
+                owt++;
+            }
+        } else {
+            oh++;
+        }
+    }
+
+    while (pending > 0) {
+        y.write_response();
+        pending--;
+    }
 }
 
 void PoolingKernel(
     hls::burst_maxi<PoolWord> x,
-    Data_t*       y,
+    hls::burst_maxi<PoolWord> y,
     unsigned      batch,
     unsigned      channels,
     unsigned      in_h,
@@ -1081,23 +1451,20 @@ void PoolingKernel(
     // -----------------------------------------------------------------------
     // HLS AXI interface pragmas.
     //
-    // Two m_axi ports: gmem0 for the read-only input, gmem1 for the write-
-    // only output.  All scalar arguments go into the s_axilite ctrl register
-    // file accessed by the PS driver.
+    // Two 128-bit hls::burst_maxi ports (PoolingKernel.h): gmem0 for the
+    // read-only input, gmem1 for the write-only output.  All scalar
+    // arguments go into the s_axilite ctrl register file.
     //
-    // depth=<N> is a C/RTL co-simulation hint only — it sizes the verification
-    // adapter FIFO cosim builds for each m_axi port.  It does NOT constrain the
-    // synthesised AXI master (runtime addresses) or the exported IP.  The
-    // POOL_COSIM_DEPTH_* macros (PoolingKernel.h) are the single source of
-    // truth shared with the test/TestPoolingSim.cpp cosim buffers.  cosim of an
-    // m_axi kernel aborts without depth ("a depth specification is required for
-    // interface port 'x'").
+    // x: one request per (row, channel) run of <= kMaxLineBufCols elements
+    //    (<= kLbWords + 1 words), up to kReadAhead of them in flight.
+    // y: one request per (output row, channel) run of <= kLbWords + 1 words,
+    //    at most kWriteInFlight un-acknowledged.
+    //
+    // depth=<N> is a C/RTL co-simulation hint only (POOL_COSIM_DEPTH_* in
+    // PoolingKernel.h, shared with test/TestPoolingSim.cpp's cosim buffers).
     // -----------------------------------------------------------------------
-    // x: 128-bit hls::burst_maxi port (PoolingKernel.h); one request per
-    // (row, channel) run of <= kMaxLineBufCols elements (<= 9 words), up to
-    // kTileC of them in flight.
     #pragma HLS INTERFACE m_axi port=x  offset=slave bundle=gmem0 depth=POOL_COSIM_DEPTH_X_WORDS max_read_burst_length=16 num_read_outstanding=16
-    #pragma HLS INTERFACE m_axi port=y  offset=slave bundle=gmem1 depth=POOL_COSIM_DEPTH_Y
+    #pragma HLS INTERFACE m_axi port=y  offset=slave bundle=gmem1 depth=POOL_COSIM_DEPTH_Y_WORDS max_write_burst_length=16 num_write_outstanding=8
     #pragma HLS INTERFACE s_axilite port=x                 bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=y                 bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=batch             bundle=ctrl
@@ -1122,11 +1489,8 @@ void PoolingKernel(
     // -----------------------------------------------------------------------
     // STABLE: read-only m_axi base pointer x and every s_axilite scalar are
     // latched at ap_start and never written during the DATAFLOW region's
-    // execution.  Marking them STABLE tells HLS not to insert auto-generated
-    // synchronization stages or fan-out FIFOs into the producers — see the
-    // ConvKernel.cpp note for the full rationale.  `y` is intentionally NOT
-    // listed because write_output_tile writes through it during the dataflow
-    // region.
+    // execution.  `y` is intentionally NOT listed because write_output_tile
+    // writes through it during the dataflow region.
     // -----------------------------------------------------------------------
     #pragma HLS STABLE variable=x
     #pragma HLS STABLE variable=batch
@@ -1148,70 +1512,49 @@ void PoolingKernel(
     #pragma HLS STABLE variable=count_include_pad
 
     // -----------------------------------------------------------------------
-    // Top-level DATAFLOW region.
-    //
-    //   window_pipe  carries kTileC * pool_h * pool_w pixels per output
-    //                position; depth covers one full window block so the
-    //                producer can stage the next tile while the consumer
-    //                is reducing.
-    //   denom_pipe   one entry per output position — small FIFO is enough.
-    //   acc_stream   c_valid AccData_t entries per (ni, ct, owt, oh, ow);
-    //                depth kTileC matches the writer's per-tile drain burst.
-    //
-    // geom bundles the per-invocation tile geometry (c_tiles, ow_tile,
-    // ow_tiles_w) — computed ONCE here so the runtime-divisor divisions land
-    // in a single shared divider set instead of one per dataflow stage.  It is
-    // the single source of truth, passed to all four stages so they iterate
-    // (ni, ct, owt, oh, ow) in lockstep.  When in_w <= kMaxLineBufCols the
-    // formula yields ow_tile = out_w and the owt loop runs once: the kernel
-    // matches the zero-duplication path.  When in_w > kMaxLineBufCols,
-    // ow_tile < out_w and boundary input columns are re-read once per W-tile
-    // transition — the documented relaxation.
+    // Top-level DATAFLOW region.  geom is computed ONCE here (the runtime-
+    // divisor divisions land in one shared divider set) and passed to all
+    // four stages, which iterate (ni, ct, owt, oh, group) in lockstep.
     // -----------------------------------------------------------------------
     const PoolGeometry geom = compute_pool_geometry(
-        channels, out_w, pool_w, stride_w, dil_w);
+        channels, in_h, out_h, out_w, pool_h, pool_w,
+        stride_h, stride_w, pad_top, dil_h, dil_w);
 
     #pragma HLS DATAFLOW
 
-    // row_data_pipe carries raw input pixels from row_loader (DDR) to
-    // window_emitter (line_buf cache).  Depth holds enough rows for the
-    // window_emitter to lag a full Phase-1 row load behind the row_loader,
-    // so Phase 1 of oh+1 overlaps Phase 2 of oh.  kTileC * kMaxLineBufRows
-    // * kMaxLineBufCols (= 16 KB / 8 lanes * 64 cols ≈ 8192 entries at
-    // depth, but FIFO stores a single Data_t per slot so HLS will use
-    // BRAM/LUTRAM as appropriate).
-    hls::stream<Data_t> row_data_pipe;
-    #pragma HLS STREAM variable=row_data_pipe depth=kTileC*kMaxLineBufCols*4
+    // row_word_pipe: whole 128-bit row words, loader → emitter.  Deep enough
+    // for the loader to run a few runs ahead of the emitter's row change.
+    // LUTRAM: a 128-bit-wide FIFO in block RAM costs 4 BRAM18 for any depth
+    // up to 512 (width-limited packing).
+    hls::stream<PoolWord> row_word_pipe;
+    #pragma HLS STREAM variable=row_word_pipe depth=128
+    #pragma HLS BIND_STORAGE variable=row_word_pipe type=fifo impl=lutram
 
-    // window_pipe carries one MultiWindow struct (kOwParallel × kTileC
-    // scalar lanes packed) per (khi, kwi) — pool_h*pool_w writes per
-    // ow-group of kOwParallel adjacent output positions.  Depth holds a
-    // full window block so the producer can stage the next ow-group while
-    // the consumer is still reducing the current one.
+    // window_pipe: one MultiWindow per (khi, kwi) tap; a full window block
+    // of slack lets the emitter stage the next group while the consumer
+    // reduces the current one.
     hls::stream<MultiWindow> window_pipe;
-    #pragma HLS STREAM variable=window_pipe depth=kMaxPoolH*kMaxPoolW
+    #pragma HLS STREAM variable=window_pipe depth=64
+    #pragma HLS BIND_STORAGE variable=window_pipe type=fifo impl=lutram
 
-    // denom_pipe carries one MultiDenom (kOwParallel valid_count values)
-    // per ow-group — small FIFO is enough.
+    // denom_pipe: one MultiDenom per ow-group.
     hls::stream<MultiDenom> denom_pipe;
-    #pragma HLS STREAM variable=denom_pipe depth=4
+    #pragma HLS STREAM variable=denom_pipe depth=8
 
-    // acc_stream carries kOwParallel × c_valid AccData_t entries per
-    // (ni, ct, owt, oh, ow_group) — depth covers a full group's drain
-    // burst so the consumer's finalise loop never stalls on writer back-
-    // pressure.
-    hls::stream<AccData_t> acc_stream;
-    #pragma HLS STREAM variable=acc_stream depth=kOwParallel*kTileC
+    // acc_stream: kTileC FinBundles (kOwParallel saturated outputs each)
+    // per group; a few groups of slack between the consumer and the writer.
+    hls::stream<FinBundle> acc_stream;
+    #pragma HLS STREAM variable=acc_stream depth=64
+    #pragma HLS BIND_STORAGE variable=acc_stream type=fifo impl=lutram
 
     row_loader(
-        x, row_data_pipe,
-        batch, channels, in_h, in_w, out_h, out_w,
-        pool_h, pool_w, stride_h, stride_w,
-        pad_top, pad_left, dil_h, dil_w,
+        x, row_word_pipe,
+        batch, channels, in_h, in_w, out_w,
+        pool_w, stride_w, pad_left, dil_w,
         geom);
 
     window_emitter(
-        row_data_pipe, window_pipe, denom_pipe,
+        row_word_pipe, window_pipe, denom_pipe,
         batch, channels, in_h, in_w, out_h, out_w,
         pool_h, pool_w, stride_h, stride_w,
         pad_top, pad_left, dil_h, dil_w,
@@ -1219,10 +1562,13 @@ void PoolingKernel(
 
     process_pool_kernel_tile(
         window_pipe, denom_pipe, acc_stream,
-        batch, channels, out_h, out_w,
-        pool_h, pool_w, pool_type, lp_order, geom);
+        batch, channels, in_w, out_h, out_w,
+        pool_w, stride_w, pad_left, dil_w,
+        pool_type, lp_order, geom);
 
     write_output_tile(
         y, acc_stream,
-        batch, channels, out_h, out_w, geom);
+        batch, channels, in_w, out_h, out_w,
+        pool_w, stride_w, pad_left, dil_w,
+        geom);
 }
