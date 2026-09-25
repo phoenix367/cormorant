@@ -447,7 +447,96 @@ DSP 35, FF 12.3 k, LUT 45.9 k.
 
 ---
 
-## 6. Verification matrix
+## 6. Rotate-then-wire lane scatter for the A and row-major B loads (Track A4, 2026-09-25)
+
+Landed *before* the ping-pong of §7 (the plan's order is A3 → A4) because
+§7 instantiates the row-major B scatter twice — under the K-loop and in
+the first-block drain — and with the §3 scatter that would have meant
++18 k LUT and a meaningless resource delta for §7.
+
+**Problem.**  The two word-to-bank scatter loops of §3 selected, for every
+destination bank / column, its lane with a *runtime* part-select
+(`word.range(16·(l+1)−1, 16·l)`, `l = (j + shift) % 8` for A, `l = m1 −
+c0` for B).  HLS builds a 128-bit barrel shifter per destination: the A
+scatter was **9.1 k LUT** (8 banks × 4 row RAMs) and the row-major B
+scatter **17.9 k LUT** (16 columns) — 61 % of the kernel's 44 k LUT, all
+"Expression" in the loop reports.
+
+**Change.**  `matmul_rotate_lanes(word, shift)` (MatmulKernel.h) rotates
+the word right by `shift` lanes once — a chain of the seven constant
+rotates selected by `shift`, i.e. one 8-way 128-bit mux — after which
+bank / column `j` always takes lane `j % 8` of the rotated word (fixed
+wiring, `matmul_word_lane` with a constant index).  Only the *enable*
+depends on the geometry:
+
+- A: bank `j` holds element `w·8 + j` of the row when `j + shift < 8`,
+  else `(w−1)·8 + j`; write iff that element index is `< k` (and `w > 0`
+  for the wrapped half of the first word);
+- B: column `m1` (`j = m1 % 8`, `p = m1 / 8`) belongs to word `w` iff
+  `p == w && j + shift < 8` or `p == w − 1 && j + shift ≥ 8`; write iff
+  that holds and `m1 < m_valid`.
+
+The packed path needs no rotate (`shift = 0`, `part = w % 2` selects the
+column half).  C-sim 39/39 bit-exact.
+
+**Result.**  LUT **45.9 k → 21.7 k** (A scatter 9 095 → 1 566, B
+scatter 17 916 → 1 125), FF 12.4 k, DSP 35, BRAM 64, II=1 everywhere,
+slack 0.00.  On the RTL stand the loops issue the same words per cycle,
+so the per-case timings are expected to be within noise of §5:
+
+| # | Test | n×k×m×batch | B | before | after | Δ |
+|--:|---|---|---|---:|---:|---:|
+| 0 | 1x1x1 | 1×1×1×1 | row-major | 6,065 | 6,095 | +0.5 % |
+| 1 | TileN x TileK x TileM | 4×256×16×1 | row-major | 43,470 | 41,830 | -3.8 % |
+| 2 | 2 TileN x TileK x TileM | 8×256×16×1 | row-major | 83,300 | 56,380 | -32.3 % |
+| 3 | TileN x 2 TileK x TileM | 4×512×16×1 | row-major | 78,050 | 76,370 | -2.2 % |
+| 4 | TileN x TileK x 2 TileM | 4×256×32×1 | row-major | 79,340 | 77,700 | -2.1 % |
+| 5 | TileN 2 x TileK x TileM partial N | 6×256×16×1 | row-major | 80,470 | 49,600 | -38.4 % |
+| 6 | TileN x TileK 5 x TileM partial K | 4×261×16×1 | row-major | 44,740 | 43,050 | -3.8 % |
+| 7 | TileN x TileK x TileM 3  partial M | 4×256×19×1 | row-major | 79,050 | 77,350 | -2.2 % |
+| 8 | TileN 2 x TileK 5 x TileM 3  all partial | 6×261×19×1 | row-major | 154,890 | 142,200 | -8.2 % |
+| 9 | 7 x 13 x 5 arbitrary small | 7×13×5×1 | row-major | 15,280 | 11,520 | -24.6 % |
+| 10 | N x 1 x M K 1 outer product | 5×1×17×1 | row-major | 13,200 | 11,760 | -10.9 % |
+| 11 | 1 x K x M N 1 row vector | 1×256×16×1 | row-major | 38,920 | 31,250 | -19.7 % |
+| 12 | N x K x 1 M 1 column vector | 4×256×1×1 | row-major | 40,830 | 39,190 | -4.0 % |
+| 13 | 3 TileN x 2 TileK 7 x 2 TileM 1  multi-tile all | 12×519×33×1 | row-major | 663,790 | 658,470 | -0.8 % |
+| 14 | batch 3 no broadcast | 5×64×19×3 | row-major | 129,960 | 113,570 | -12.6 % |
+| 15 | batch 4 A broadcasts a stride 0 | 5×64×19×4 | row-major | 172,390 | 150,540 | -12.7 % |
+| 16 | batch 4 B broadcasts b stride 0 | 5×64×19×4 | row-major | 172,290 | 150,360 | -12.7 % |
+| 17 | batch 6 both strided multi-dim flat | 5×64×19×6 | row-major | 256,650 | 223,790 | -12.8 % |
+| 18 | TileN x TileK x TileM B packed | 4×256×16×1 | packed | 25,760 | 24,080 | -6.5 % |
+| 19 | TileN 2 x TileK 5 x TileM 3  B packed all partial | 6×261×19×1 | packed | 81,760 | 69,090 | -15.5 % |
+| 20 | 7 x 13 x 5 B packed arbitrary small | 7×13×5×1 | packed | 14,310 | 11,060 | -22.7 % |
+| 21 | 1 x K x M B packed N 1 row vector | 1×256×16×1 | packed | 20,840 | 13,230 | -36.5 % |
+| 22 | N x K x 1 B packed M 1 | 4×256×1×1 | packed | 24,310 | 22,640 | -6.9 % |
+| 23 | 3 TileN x 2 TileK 7 x 2 TileM 1  B packed multi-tile | 12×519×33×1 | packed | 331,280 | 325,960 | -1.6 % |
+| 24 | 1 x 2 TileK x 4 TileM B packed FC-like | 1×512×64×1 | packed | 135,400 | 73,920 | -45.4 % |
+| 25 | batch 3 no broadcast B packed | 5×64×19×3 | packed | 80,690 | 64,280 | -20.3 % |
+| 26 | batch 4 B broadcasts B packed b stride 0 | 5×64×19×4 | packed | 106,750 | 84,830 | -20.5 % |
+| 27 | 1 x 261 x 19 K-split n 1 | 1×261×19×1 | row-major | 76,670 | 61,040 | -20.4 % |
+| 28 | 1 x 261 x 19 B packed K-split n 1 | 1×261×19×1 | packed | 39,910 | 24,320 | -39.1 % |
+| 29 | 2 x 13 x 5 K-split n 2 | 2×13×5×1 | row-major | 8,440 | 7,690 | -8.9 % |
+| 30 | 2 x 13 x 5 B packed K-split n 2 | 2×13×5×1 | packed | 7,420 | 6,760 | -8.9 % |
+| 31 | 3 x 517 x 33 K-split n 3 multi-tile | 3×517×33×1 | row-major | 221,060 | 219,870 | -0.5 % |
+| 32 | 3 x 517 x 33 B packed K-split n 3 | 3×517×33×1 | packed | 109,490 | 108,260 | -1.1 % |
+| 33 | batch 3 6 x 517 x 35 prefetch crosses tiles | 6×517×35×3 | row-major | 1,312,140 (was FAIL) | 1,212,010 **FAIL** | -7.6 % |
+| 34 | batch 3 6 x 517 x 35 B packed prefetch crosses tiles | 6×517×35×3 | packed | 643,760 | 543,690 | -15.5 % |
+| 35 | batch 3 6 x 517 x 35 B broadcasts b stride 0 | 6×517×35×3 | row-major | 1,312,195 | 1,211,920 | -7.6 % |
+| 36 | batch 3 6 x 517 x 35 B broadcasts B packed b stride 0 | 6×517×35×3 | packed | 643,590 | 543,260 | -15.6 % |
+| 37 | sat pos a 100 b 100 K 3  AP MAX | 4×3×16×1 | row-major | 9,670 | 7,910 | -18.2 % |
+| 38 | sat neg a 100 b -100 K 3  AP MIN | 4×3×16×1 | row-major | 9,510 | 7,730 | -18.7 % |
+| | **Σ duration_ns (common cases)** | | | **7,367,640** | **6,604,575** | **-10.4 %** |
+
+
+Timing unchanged versus §5 within ±0.1 % on every case (Σ 4,850,025 →
+4,849,395 ns): the rewrite is purely structural.  The `6×517×35`
+row-major case fails in sequence exactly as in §4 — the new scatter reads
+the same stale DDR value — which is what proved the artifact sits in the
+stand's memory model and not in the load path.
+
+---
+
+## 7. Verification matrix
 
 | Gate | Command | Baseline result |
 |---|---|---|
@@ -457,7 +546,7 @@ DSP 35, FF 12.3 k, LUT 45.9 k.
 
 ---
 
-## 7. Related files
+## 8. Related files
 
 | File | Purpose |
 |---|---|

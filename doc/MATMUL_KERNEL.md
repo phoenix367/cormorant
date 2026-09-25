@@ -47,7 +47,11 @@ writes concurrently.
 Memory layout is row-major: `A[row·k + col]`, `B[row·m + col]`,
 `C[row·m + col]`.  `a` and `b` must be 16-byte aligned base addresses;
 the kernel derives every row's covering 128-bit word range itself, so
-batch strides and tile offsets are ordinary element offsets.
+batch strides and tile offsets are ordinary element offsets.  A word
+whose lane 0 is not the row's first element is rotated once by the row's
+lane shift (`matmul_rotate_lanes`), after which bank / column `j` always
+takes lane `j % 8` — fixed wiring, only the write enables depend on the
+geometry (MATMUL_OPTIMISATION.md §6).
 
 **Packed B (`b_packed = 1`, MATMUL_OPTIMISATION §3b).**  Constant
 weights are emitted by the scheduler as

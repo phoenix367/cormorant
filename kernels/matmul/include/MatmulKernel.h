@@ -107,6 +107,31 @@ inline unsigned matmul_packed_index(unsigned kk, unsigned mm, unsigned k) {
     return ((mm / kTileM) * k + kk) * kTileM + (mm % kTileM);
 }
 
+// Rotate the lanes of a port word right by `shift` lanes: lane j of the
+// result is lane (j + shift) mod kMatmulPortElems of the input.  Written as
+// a chain of constant rotates selected by `shift` so HLS builds ONE
+// kMatmulPortElems-way mux of the whole word; a per-lane / per-column
+// variable part-select (`word.range(16 * (l + 1) - 1, 16 * l)` with a
+// runtime l) costs a full 128-bit barrel shifter per destination
+// (MATMUL_OPTIMISATION.md §6: 17.9 k + 9 k LUT in the two scatter loops).
+inline MatmulWord matmul_rotate_lanes(MatmulWord w, unsigned shift) {
+    #pragma HLS INLINE
+    MatmulWord r = w;
+    for (unsigned s = 1; s < kMatmulPortElems; s++) {
+        #pragma HLS UNROLL
+        if (shift == s)
+            r = (w >> (kMatmulDataBits * s)) |
+                (w << (kMatmulPortBits - kMatmulDataBits * s));
+    }
+    return r;
+}
+
+// Lane j (a compile-time constant at every use) of a port word.
+inline Data_t matmul_word_lane(MatmulWord w, unsigned j) {
+    #pragma HLS INLINE
+    return matmul_lane_to_data(w.range(kMatmulDataBits * (j + 1) - 1, kMatmulDataBits * j));
+}
+
 // Number of words that cover `count` elements starting at element `off`.
 inline unsigned matmul_words_for(unsigned off, unsigned count) {
     const unsigned w_lo = off / kMatmulPortElems;

@@ -79,11 +79,7 @@ void load_b_tile(hls::burst_maxi<MatmulWord>& b,
             const unsigned   part = w % kMatmulWordsPerTileRow;
             for (unsigned m1 = 0; m1 < kTileM; m1++) {
                 #pragma HLS UNROLL
-                if (m1 / E == part) {
-                    const unsigned l = m1 % E;
-                    b_tile[k1][m1] = matmul_lane_to_data(word.range(
-                        kMatmulDataBits * (l + 1) - 1, kMatmulDataBits * l));
-                }
+                if (m1 / E == part) b_tile[k1][m1] = matmul_word_lane(word, m1 % E);
             }
         }
     } else {
@@ -101,15 +97,20 @@ void load_b_tile(hls::burst_maxi<MatmulWord>& b,
                 const unsigned n_words = matmul_words_for(row_off, m_valid);
                 for (unsigned w = 0; w < n_words; w++) {
                     #pragma HLS PIPELINE II=1
-                    const MatmulWord word = b.read();
-                    const int c0 = (int)(w * E) - (int)shift;
+                    // Lane l of word w is tile column w * E + l - shift.
+                    // After rotating the word by `shift` lanes, column m1
+                    // (j = m1 % E, p = m1 / E) always takes lane j — fixed
+                    // wiring; it belongs to THIS word iff p == w and
+                    // j + shift < E, or p == w - 1 and j + shift >= E.
+                    const MatmulWord rot = matmul_rotate_lanes(b.read(), shift);
                     for (unsigned m1 = 0; m1 < kTileM; m1++) {
                         #pragma HLS UNROLL
-                        const int l = (int)m1 - c0;
-                        if (l >= 0 && l < (int)E && m1 < m_valid) {
-                            b_tile[k1][m1] = matmul_lane_to_data(word.range(
-                                kMatmulDataBits * ((unsigned)l + 1) - 1,
-                                kMatmulDataBits * (unsigned)l));
+                        const unsigned j    = m1 % E;
+                        const unsigned p    = m1 / E;
+                        const bool     wrap = (j + shift) >= E;
+                        const bool     hit  = wrap ? (p + 1 == w) : (p == w);
+                        if (hit && m1 < m_valid) {
+                            b_tile[k1][m1] = matmul_word_lane(rot, j);
                         }
                     }
                 }
@@ -293,16 +294,18 @@ void MatmulKernel(
                     const unsigned n_words = matmul_words_for(row_off, k);
                     for (unsigned w = 0; w < n_words; w++) {
                         #pragma HLS PIPELINE II=1
-                        const MatmulWord word = a.read();
-                        // Element index of lane 0 of this word, relative to the row.
-                        const int e0 = (int)(w * E) - (int)shift;
+                        // Rotating the word by `shift` lanes once puts the
+                        // element feeding bank j into lane j (fixed wiring
+                        // from there); that element is the row's element
+                        // w * E + j when j + shift < E, else (w - 1) * E + j.
+                        const MatmulWord rot = matmul_rotate_lanes(a.read(), shift);
                         for (unsigned j = 0; j < E; j++) {
                             #pragma HLS UNROLL
-                            const unsigned l = (j + shift) % E;           // lane feeding bank j
-                            const int      e = e0 + (int)l;               // element index, e % E == j
-                            if (e >= 0 && e < (int)k) {
-                                a_buf[n1][(unsigned)e / E][j] = matmul_lane_to_data(
-                                    word.range(kMatmulDataBits * (l + 1) - 1, kMatmulDataBits * l));
+                            const bool     wrap = (j + shift) >= E;
+                            const unsigned widx = wrap ? w - 1 : w;   // word index within the row
+                            const unsigned e    = widx * E + j;       // element index, e % E == j
+                            if ((!wrap || w > 0) && e < k) {
+                                a_buf[n1][widx][j] = matmul_word_lane(rot, j);
                             }
                         }
                     }
