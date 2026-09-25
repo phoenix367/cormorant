@@ -94,7 +94,8 @@ inline ap_uint<kMatmulDataBits> matmul_data_to_lane(Data_t v) {
 // matmul_packed_m(m) = ceil(m / kTileM) * kTileM.  A (m_tile, k_tile) block
 // is then ONE contiguous run of k_valid * kTileM elements
 // (k_valid * kMatmulWordsPerTileRow words) instead of k_valid separate
-// ≤ 3-word row segments — the scheduler emits constant weights this way.
+// ≤ kMatmulMaxRowWords-word row segments — the scheduler emits constant
+// weights this way.
 // Batch slices are k * packed_m elements apart; b_batch_stride /
 // b_outer offsets are element counts in the PACKED image.
 // ---------------------------------------------------------------------------

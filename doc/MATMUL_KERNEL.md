@@ -63,8 +63,8 @@ B_packed[(mt · k + kk) · kTileM + m1] = B[kk][mt · kTileM + m1]      (m1 < kT
 with `m` zero-padded to `ceil(m / kTileM) · kTileM`, i.e. one contiguous
 `[k][kTileM]` block per m-tile (`matmul_packed_index()` in
 `MatmulKernel.h`).  A `(m_tile, k_tile)` block is then a single run of
-`k_valid · kTileM` elements that the kernel fetches with ≤ 8 back-to-back
-64-word requests instead of `k_valid` separate ≤ 3-word row segments.
+`k_valid · kTileM` elements that the kernel fetches with ≤ 16 back-to-back
+64-word requests instead of `k_valid` separate ≤ 5-word row segments.
 Each batch slice is `k · packed_m` elements.  Activations as B keep the
 row-major layout (`b_packed = 0`).
 
@@ -79,7 +79,7 @@ CMake substitutes the data types and tile constants into `Config.h`:
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `AccData_t` | `ap_fixed<32,16>` | Accumulator type (wider range, avoids overflow) |
 | `kTileN` | 4 | Output-row tile / accumulator-lane interleave depth. Power of 2; must be ≥ MAC latency (≈3) for II=1 |
-| `kTileM` | 16 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2 |
+| `kTileM` | 32 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2 (16 until MATMUL_OPTIMISATION.md §8) |
 | `kTileK` | 256 | On-chip B-buffer K-slice depth. Power of 2 (so `k_tile` indexing needs no divider) |
 | `kMaxK` | 2048 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf`. Models with `K > kMaxK` are rejected by the scheduler |
 
@@ -384,8 +384,8 @@ an IP-catalog archive.
 | **Operation** | `C = A × B`, batched, row-major |
 | **Data type** | `ap_fixed<16,8>` (default) or `float` |
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `double` |
-| **Tiling** | `kTileN=4` rows × `kTileM=16` columns × `kTileK=256` inner |
-| **Inner-loop parallelism** | `kTileM=16` MACs/cycle (unrolled `m1` lanes) |
+| **Tiling** | `kTileN=4` rows × `kTileM=32` columns × `kTileK=256` inner |
+| **Inner-loop parallelism** | `kTileM=32` MACs/cycle (unrolled `m1` lanes) |
 | **Initiation interval** | II=1 in every load / reduce / write loop |
 | **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
 | **Short n_tiles** | K-split: 4 / 2 lanes per row when `n_valid = 1 / 2`, lanes folded after the k_tile loop |

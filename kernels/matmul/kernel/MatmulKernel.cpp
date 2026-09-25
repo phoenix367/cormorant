@@ -41,6 +41,10 @@ constexpr unsigned kBReqWords       = 64;   // max_read_burst_length of b
 // batching below must always be able to admit at least one row.
 static_assert((kMaxK / E + 1 + kAReqWords - 1) / kAReqWords <= kAReqOutstanding,
               "one A row must fit in the outstanding request window");
+// A packed B block (kTileK rows of kMatmulWordsPerTileRow words) is requested
+// all at once in kBReqWords pieces; they must all fit in flight.
+static_assert(kTileK * kMatmulWordsPerTileRow <= kBReqAhead * kBReqWords,
+              "a packed B block must fit in the outstanding request window");
 
 // ---------------------------------------------------------------------------
 // B block fetch cursor — b_tile ping-pong (MATMUL_OPTIMISATION.md §7).
@@ -49,7 +53,7 @@ static_assert((kMaxK / E + 1 + kAReqWords - 1) / kAReqWords <= kAReqOutstanding,
 // block needed by the NEXT (bi, n_tile, m_tile, k_tile) iteration that loads
 // B is streamed into bank !cur, one word per K-loop iteration.  The cursor
 // below is that stream's state.  Rows are the unit of progress for both
-// layouts: a row-major block is k_valid DDR rows of <= 3 words each (one
+// layouts: a row-major block is k_valid DDR rows of <= kMatmulMaxRowWords each (one
 // read request per row, <= kBReqAhead rows in flight); a packed block is
 // one contiguous run whose requests are all issued up front, drained as
 // k_valid "rows" of kMatmulWordsPerTileRow words.  A word's lanes are
@@ -77,7 +81,8 @@ struct BFetch {
 };
 
 // Point the cursor at block (bi, mt, kt) and, for the packed layout, issue
-// all of its read requests (<= 512 words in <= 8 pieces of kBReqWords).
+// all of its read requests (kTileK * kMatmulWordsPerTileRow words in
+// <= kBReqAhead pieces of kBReqWords — 1024 words in 16 pieces at kTileM = 32).
 inline void b_fetch_start(hls::burst_maxi<MatmulWord>& b, BFetch& f,
                           unsigned bi, unsigned nt, unsigned mt, unsigned kt,
                           unsigned k, unsigned m, unsigned b_batch_stride,
@@ -196,7 +201,7 @@ void MatmulKernel(
     // a / b: 128-bit hls::burst_maxi ports (MatmulKernel.h).  A rows are
     // requested as whole word ranges (up to kMaxK / lanes + 1 words, split
     // into <= 256-word requests, at most num_read_outstanding requests in
-    // flight); B tile rows are <= 3 words each and are requested kBReqAhead
+    // flight); B tile rows are <= kMatmulMaxRowWords each and are requested kBReqAhead
     // rows ahead so their DDR latency overlaps.
     #pragma HLS INTERFACE m_axi port=a offset=slave bundle=gmem0 depth=MATMUL_COSIM_DEPTH_A_WORDS max_read_burst_length=256 num_read_outstanding=4
     #pragma HLS INTERFACE m_axi port=b offset=slave bundle=gmem1 depth=MATMUL_COSIM_DEPTH_B_WORDS max_read_burst_length=64  num_read_outstanding=16

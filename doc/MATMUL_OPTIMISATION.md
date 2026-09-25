@@ -7,11 +7,13 @@ experiment, the rationale, and the measured HW behavior-simulation
 
 For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 
-> **Status (2026-05-19).** §1 is the **current performance baseline** — the
-> shipped single-sequential-loop-nest kernel. §2 records a DATAFLOW
-> restructuring that was **tried and rejected** (measured regression). §3
-> notes where a real speedup would have to come from. No optimization has
-> landed yet; the kernel is unchanged from its initial implementation.
+> **Status (2026-09-25).** §1 is the original single-sequential-loop-nest
+> kernel; §2 records a DATAFLOW restructuring that was **tried and
+> rejected**; §3 / §3b (128-bit ports, packed B) and §4–§8 (Track A of
+> `doc/THROUGHPUT_PLAN.md`: 16×16 MAC, K-split, rotate scatter, `b_tile`
+> ping-pong prefetch, `kTileM = 32`) have **landed**.  The RTL stand runs
+> 39 fixtures; every §4–§8 table compares against the §3b kernel on the
+> same 39 cases.
 
 ---
 
@@ -659,17 +661,116 @@ each), DSP 34, FF 17.4 k, LUT **29.3 k** (baseline 44.3 k).
 
 ---
 
-## 8. Verification matrix
+## 8. `kTileM` 16 → 32 (Track A5, 2026-09-25)
 
-| Gate | Command | Baseline result |
-|---|---|---|
-| C-simulation | `ctest -R Matmul` | `TestMatmulRef`, `TestMatmulBlas` pass |
-| HLS synthesis | `make synthesize_matmul_kv260` | II=1 all loops; Fmax 205.47 MHz |
-| RTL behavior test | `make behavior_test_matmul` | 20/20 pass; sim_time 7,713,375 ns |
+**Problem.**  With the B block prefetched under the K-loop (§7) and the
+lanes fully used for short n_tiles (§5), the K-loop itself is the bound:
+16 MACs per cycle, 3.2 GOps/s peak at 100 MHz.  Doubling `kTileM` doubles
+the MACs per cycle at the same II, the same A traffic and the same number
+of B words per MAC; doubling `kTileN` instead would keep the peak and halve
+the utilisation of FC layers (THROUGHPUT_PLAN.md §2).
+
+**Change.**  `platforms/kv260.json` `kernels.matmul.tile_m` 16 → 32 — the
+kernel source is generic in `kTileM` (the §7 cursor types, the §6 column
+rule, the packed word count `kMatmulWordsPerTileRow = 4` and the request
+count `≤ 16 × 64 words = num_read_outstanding` all follow the constant).
+The packed B layout changes with it (`matmul_packed_m(m)` now pads to 32),
+so every packed image is regenerated: the C-sim / RTL fixtures here, and —
+by the coordinator — every packed constant the scheduler emits
+(`MATMUL_TILE_M` is read from the same JSON by
+`inference-scheduler/src/_matmul_hw_config.py`, so the generated projects
+follow automatically once regenerated).  The test-stand testbench's
+packed-broadcast slice size is now a `TILE_M` localparam instead of a
+literal 16.
+
+**Result (RTL, 39 cases; before = the §7 kernel at `kTileM = 16`, after
+= `kTileM = 32`; the geometry column is the *after* fixture — the
+`TileM`-relative cases (`TileN × TileK × TileM` is now `4×256×32`,
+`FC-like` `1×512×128`, …) compare different amounts of work, the
+literal-size cases compare the same).**
+
+| # | Test | n×k×m×batch | B | before | after | Δ |
+|--:|---|---|---|---:|---:|---:|
+| 0 | 1x1x1 | 1×1×1×1 | row-major | 6,205 | 6,205 | +0.0 % |
+| 1 | TileN x TileK x TileM | 4×256×32×1 | row-major | 34,480 | 35,810 | +3.9 % |
+| 2 | 2 TileN x TileK x TileM | 8×256×32×1 | row-major | 49,210 | 51,170 | +4.0 % |
+| 3 | TileN x 2 TileK x TileM | 4×512×32×1 | row-major | 56,480 | 53,360 | -5.5 % |
+| 4 | TileN x TileK x 2 TileM | 4×256×64×1 | row-major | 57,760 | 55,350 | -4.2 % |
+| 5 | TileN 2 x TileK x TileM partial N | 6×256×32×1 | row-major | 42,410 | 44,090 | +4.0 % |
+| 6 | TileN x TileK 5 x TileM partial K | 4×261×32×1 | row-major | 35,440 | 36,840 | +4.0 % |
+| 7 | TileN x TileK x TileM 3  partial M | 4×256×35×1 | row-major | 58,980 | 60,850 | +3.2 % |
+| 8 | TileN 2 x TileK 5 x TileM 3  all partial | 6×261×35×1 | row-major | 110,760 | 114,080 | +3.0 % |
+| 9 | 7 x 13 x 5 arbitrary small | 7×13×5×1 | row-major | 11,710 | 11,700 | -0.1 % |
+| 10 | N x 1 x M K 1 outer product | 5×1×33×1 | row-major | 11,830 | 12,970 | +9.6 % |
+| 11 | 1 x K x M N 1 row vector | 1×256×32×1 | row-major | 23,890 | 24,780 | +3.7 % |
+| 12 | N x K x 1 M 1 column vector | 4×256×1×1 | row-major | 33,800 | 33,800 | +0.0 % |
+| 13 | 3 TileN x 2 TileK 7 x 2 TileM 1  multi-tile all | 12×519×65×1 | row-major | 467,810 | 466,830 | -0.2 % |
+| 14 | batch 3 no broadcast | 5×64×35×3 | row-major | 83,930 | 87,180 | +3.9 % |
+| 15 | batch 4 A broadcasts a stride 0 | 5×64×35×4 | row-major | 110,620 | 114,860 | +3.8 % |
+| 16 | batch 4 B broadcasts b stride 0 | 5×64×35×4 | row-major | 110,840 | 114,790 | +3.6 % |
+| 17 | batch 6 both strided multi-dim flat | 5×64×35×6 | row-major | 164,090 | 170,040 | +3.6 % |
+| 18 | TileN x TileK x TileM B packed | 4×256×32×1 | packed | 24,170 | 29,950 | +23.9 % |
+| 19 | TileN 2 x TileK 5 x TileM 3  B packed all partial | 6×261×35×1 | packed | 68,380 | 90,390 | +32.2 % |
+| 20 | 7 x 13 x 5 B packed arbitrary small | 7×13×5×1 | packed | 11,280 | 11,590 | +2.7 % |
+| 21 | 1 x K x M B packed N 1 row vector | 1×256×32×1 | packed | 13,360 | 18,630 | +39.4 % |
+| 22 | N x K x 1 B packed M 1 | 4×256×1×1 | packed | 22,800 | 27,900 | +22.4 % |
+| 23 | 3 TileN x 2 TileK 7 x 2 TileM 1  B packed multi-tile | 12×519×65×1 | packed | 277,050 | 329,130 | +18.8 % |
+| 24 | 1 x 2 TileK x 4 TileM B packed FC-like | 1×512×128×1 | packed | 56,320 | 97,900 | +73.8 % |
+| 25 | batch 3 no broadcast B packed | 5×64×19×3 | packed | 53,710 | 32,830 | -38.9 % |
+| 26 | batch 4 B broadcasts B packed b stride 0 | 5×64×19×4 | packed | 70,590 | 40,650 | -42.4 % |
+| 27 | 1 x 261 x 19 K-split n 1 | 1×261×19×1 | row-major | 45,460 | 25,920 | -43.0 % |
+| 28 | 1 x 261 x 19 B packed K-split n 1 | 1×261×19×1 | packed | 24,230 | 19,900 | -17.9 % |
+| 29 | 2 x 13 x 5 K-split n 2 | 2×13×5×1 | row-major | 7,860 | 7,860 | +0.0 % |
+| 30 | 2 x 13 x 5 B packed K-split n 2 | 2×13×5×1 | packed | 6,810 | 7,080 | +4.0 % |
+| 31 | 3 x 517 x 33 K-split n 3 multi-tile | 3×517×33×1 | row-major | 157,070 | 107,940 | -31.3 % |
+| 32 | 3 x 517 x 33 B packed K-split n 3 | 3×517×33×1 | packed | 92,520 | 74,240 | -19.8 % |
+| 33 | batch 3 6 x 517 x 35 prefetch crosses tiles | 6×517×35×3 | row-major | 828,580 (was FAIL) | 567,070 | -31.6 % |
+| 34 | batch 3 6 x 517 x 35 B packed prefetch crosses tiles | 6×517×35×3 | packed | 448,130 | 400,390 | -10.7 % |
+| 35 | batch 3 6 x 517 x 35 B broadcasts b stride 0 | 6×517×35×3 | row-major | 828,640 | 567,330 | -31.5 % |
+| 36 | batch 3 6 x 517 x 35 B broadcasts B packed b stride 0 | 6×517×35×3 | packed | 447,740 | 399,860 | -10.7 % |
+| 37 | sat pos a 100 b 100 K 3  AP MAX | 4×3×32×1 | row-major | 7,930 | 8,570 | +8.1 % |
+| 38 | sat neg a 100 b -100 K 3  AP MIN | 4×3×32×1 | row-major | 7,820 | 8,480 | +8.4 % |
+| | **Σ duration_ns (common cases)** | | | **4,970,695** | **4,368,315** | **-12.1 %** |
+
+
+39/39 pass, Σ over the 39 cases **−12.1 %** although 20 of them now carry
+twice the M (their "before" is half the work).  Same-geometry cases show
+the doubled MAC width directly: `3×517×33` row-major 157,070 →
+**107,940 ns** (−31 %), `6×517×35 batch 3` row-major −32 %, `1×261×19`
+row-major −43 %, the packed `5×64×19` batch cases −39 …−42 % (m = 19 is
+now one m_tile instead of two); their packed twins gain less
+(`6×517×35` −11 %, `3×517×33` −20 %) because a packed block is now 1 024
+words for 1 024 K-loop iterations — the prefetch just fits and the B
+port, not the MACs, is the bound.  The `TileM`-relative rows do twice the
+work in +3 …+4 % (row-major, i.e. ~1.9× throughput) or +19 …+32 % (packed,
+~1.6×); the packed FC-like `1×512×128` takes +74 % for 2× the work —
+at `n = 1` it is purely B-bandwidth bound now (8 192 words in 97.9 µs),
+as THROUGHPUT_PLAN.md §2 predicted ("then port-bound").  `1×1×1`,
+`2×13×5`, `M = 1` are unchanged; the K = 3 saturation cases +8 % (twice
+the C writes).  Integration: every packed weight image and generated
+project must be regenerated (`MATMUL_TILE_M` follows the JSON); the one
+scheduler test that hard-codes the padding, `test_mixed_kernel.py::
+TestSpatialMatmulRelu::test_w_flat` (`224 * 16`), needs `MATMUL_TILE_M`.
+
+Synthesis: II=1 on every loop, slack 0.00 ns, BRAM 64 → **80** (the 16
+extra `b_tile` column RAMs; +8 BRAM36 tiles, as budgeted in
+THROUGHPUT_PLAN.md §6), DSP 34 → **49**, FF 17.4 k → 24.9 k, LUT
+29.3 k → **41.8 k** (K-loop 8.5 k → 14.6 k) — still below the 44.3 k the
+kernel had before this track.
 
 ---
 
-## 9. Related files
+## 9. Verification matrix
+
+| Gate | Command | Result after §8 |
+|---|---|---|
+| C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` does not compile since §3 — it still passes `float*` to the `burst_maxi` ports) |
+| HLS synthesis | `make synthesize_matmul_kv260` | II=1 on every loop, slack 0.00 ns at 150 MHz; BRAM 80, DSP 49, LUT 41.8 k |
+| RTL behavior test | `make behavior_test_matmul` | 39/39 pass (test stand with per-test alternating DDR base); per-case timings in the §4–§8 tables |
+
+---
+
+## 10. Related files
 
 | File | Purpose |
 |---|---|
