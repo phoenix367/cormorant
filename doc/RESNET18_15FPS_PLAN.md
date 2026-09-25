@@ -3,7 +3,7 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **steps 1–2 in progress**, steps 4 and 3 implemented on `perf/convgrid` (§3; step 3 also delivers most of step 7); 5–6 not started.
+Status: **steps 1–4 landed and measured on the board (2026-09-26): ResNet-18 310 → 91.2 ms (11.0 FPS)**; step 3 also delivered most of step 7; steps 5–6 not started and are now the lever for the last 25 ms.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 
@@ -104,3 +104,52 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   RTL PASS; DSP 407, LUT 87.0 k, BRAM / URAM unchanged.  Model: each
   1×1 s2 downsample 3.6 → 0.4–0.5 ms, `1x1-64to128-56x56` 14.6 → ~2 ms,
   the 3×3 layers 220 → ~75 ms.  Board numbers pending integration.**
+
+### 3.1. Board results, steps 1–4 together (2026-09-26)
+
+Pool bitstream (steps 1+2): WNS +1.46 ns, LUT 65.9 %, BRAM 111.5/144,
+URAM 16; 144/144 models.  Final bitstream (steps 1–4): WNS +1.18 ns,
+**LUT 72.4 %, BRAM 111.5/144, URAM 48/64, DSP ≈ 680**; 144/144 models,
+predictions identical on every demo.
+
+| Demo | before | after | |
+|---|---:|---:|---:|
+| ResNet-18 | 310.1 ms | **91.2 ms** | 3.4× (11.0 FPS) |
+| MobileNet v1 | 348.7 ms | 87.4 ms | 4.0× |
+| MobileNet v2 | 221.4 ms | 71.3 ms | 3.1× |
+| MNIST convnet / LeNet | 0.729 / 7.29 ms | 0.388 / 5.83 ms | |
+
+Perf cases (before → after): 3x3-64ch-56x56 15.43 → **4.94 ms (46.8
+GOPS, 91 % of the 256-MAC grid)**, 3x3-64ch-28x28 3.88 → 1.27, 1x1-64to128-56x56
+14.64 → 1.84, 1x1-128to256-28x28 14.17 → 1.64, 5x5-16ch 0.60 → 0.25,
+dw-3x3-64ch-56x56 2.86 → 1.58, dw-3x3-32ch 0.39 → 0.23; MaxPool/AvgPool
+2x2/3x3 56x56 3.82 → 0.34, AvgPool-2x2-3x3-32-112 7.57 → 0.68,
+GlobalAvgPool-7x7-1024 1.74 → 0.28.
+
+ResNet-18 per layer after steps 1–4 (91.5 ms sum):
+
+| Layer class | time | share | grid utilisation (256 MAC) |
+|---|---:|---:|---:|
+| 3×3 convs, 16 layers | 70.4 ms | 77 % | 89–97 % |
+| stem 4×4 12→64 (s2d) | 9.7 ms | 11 % | 62 % |
+| host reorder | 3.0 ms | 3 % | non-cacheable BO memcpy |
+| Relu ×9 + Add ×8 | 4.0 ms | 4 % | |
+| 1×1 s2 downsamples ×3 | 2.3 ms | 3 % | 21–51 % (drain-bound, tiny) |
+| MaxPool | 1.35 ms | 1.5 % | was 15.8 |
+| FC, global pool, rest | 0.9 ms | 1 % | |
+
+The 3×3 layers now sit at the 100 MHz compute floor (1696 MMAC / 25.6
+GMAC/s = 66 ms at 100 %), so the remaining 25 ms to 15 FPS can only come
+from the clock: **step 5 (150 MHz) projects 3×3 ≈ 47 ms, stem ≈ 6.5 ms,
+total ≈ 63 ms ≈ 16 FPS**, with step 6 (second PS port for weights)
+needed because the 512-channel layers' 4.7 MB of weights then take 2 ms
+of a 2 ms layer on one 2.4 GB/s port.  Secondary levers: cacheable buffer
+pool (−3 ms), Relu/Add fusion into the conv drain (−4 ms), stem lane
+utilisation (12 of 16 lanes).
+
+Incident: the perf case `GlobalMaxPool-14x14` used a 14×14 window (the
+platform bound is 7; the scheduler rejects such models).  The old kernel
+tolerated it; the new one hangs and wedges the HPC port until a reboot.
+Replaced by `GlobalMaxPool-7x7-256`; a kernel-side clamp of the window
+to `kMaxPoolH/W` is a robustness follow-up (needs a bitstream).
+

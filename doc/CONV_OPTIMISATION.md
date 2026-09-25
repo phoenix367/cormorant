@@ -2404,6 +2404,19 @@ complexity.  **Status:** dropped — superseded, not worth the rework.
 
 ---
 
+### 6.3. On board: §2.40 + §2.41 (2026-09-26)
+
+Bitstream with steps 1–4 of RESNET18_15FPS_PLAN.md: WNS +1.18 ns, LUT
+72.4 %, BRAM 111.5/144, URAM 48/64; 144/144 models; demo predictions
+identical.  Perf: 3x3-64ch-56x56 15.43 → **4.94 ms** (46.8 GOPS = 91 %
+of the 16×16 grid), 3x3-64ch-28x28 3.88 → 1.27, 3x3-64ch-56x56-s2 3.87 →
+1.27, 1x1-64to128-56x56 14.64 → 1.84, 1x1-128to256-28x28 14.17 → 1.64,
+5x5-16ch-28x28 0.60 → 0.25, 3x3-1ch-28x28-32out 0.56 → 0.22, dw-3x3-64ch-56x56
+2.86 → 1.58 ms.  ResNet-18: every 3×3 layer at 89–97 % grid utilisation
+(220 → 70 ms for the 16 layers), 1×1 s2 downsamples 3.6 → 0.5–1.2 ms,
+model 310 → 91.2 ms; MobileNet v1 349 → 87 ms, v2 221 → 71 ms.  The
+cycle model's prediction (3×3 layers ~75 ms) held within 7 %.
+
 ## 7. Verification matrix
 
 | Configuration | C-sim (TestConvRef) | RTL sim (behavior_test_conv) |

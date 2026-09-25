@@ -936,6 +936,26 @@ cycles per group is their bound).
 
 ---
 
+#### 2.14.1. On board (2026-09-26)
+
+Bitstream with `PoolingKernel_0` `C_M_AXI_GMEM1_DATA_WIDTH = 128`
+(IP default), WNS +1.46 ns, design BRAM 119 → 111.5 tiles; 144/144
+models.  Perf (before → after): MaxPool-2x2-56x56 3.82 → **0.335 ms**
+(1.50 GB/s), MaxPool-3x3-56x56 3.84 → 0.339, MaxPool-2x2-28x28 0.77 →
+0.117, MaxPool-3x3-14x14 0.28 → 0.050, AvgPool-2x2-56x56 3.82 → 0.335,
+AvgPool-3x3-28x28 0.77 → 0.116, GlobalAvgPool-7x7-64 0.115 → 0.025,
+GlobalAvgPool-7x7-1024 1.74 → 0.283, AvgPool-2x2-7x7-1024 1.74 → 0.283,
+AvgPool-2x2-3x3-32-112 7.57 → 0.679 ms.  ResNet-18's MaxPool 3×3 s2 on
+112²×64: 15.8 → **1.35 ms** (cycle model said 1.3).
+
+Incident: the perf case `GlobalMaxPool-14x14` (pool 14×14 on a 14×14
+input, i.e. `pool_h > kMaxPoolH = 7`, outside the platform contract that
+the scheduler enforces) ran on the old kernel but hangs the new one and
+wedges the HPC port (all later kernel calls time out; reboot before
+reloading the PL).  The case was replaced by `GlobalMaxPool-7x7-256`.
+Follow-up: clamp `pool_h/pool_w` to `kMaxPoolH/W` in the kernel so an
+out-of-contract call returns instead of hanging.
+
 ## 3. Current architecture (post-2.14)
 
 ```mermaid

@@ -1,54 +1,35 @@
 {
-  "_comment": "Copy this file to perf_config.json and fill in your KV260 details.",
+  "_comment": "Config for run_remote_perf.py \u2014 benchmarks all four kernels on KV260.",
   "ssh": {
-    "host": "kv260.local",
+    "host": "192.168.100.8",
     "user": "root",
     "port": 22,
-    "key_file": "~/.ssh/id_rsa",
-    "_key_file_note": "Path to SSH private key. Set to null to use password auth instead.",
+    "key_file": "~/.ssh/kv260-testkey",
     "password": null,
-    "_password_note": "SSH password. Leave null when using key-based auth.",
     "connect_timeout": 15
   },
   "remote": {
     "work_dir": "/tmp/kernel_perf",
-    "_work_dir_note": "Temporary build directory on the remote machine. Created automatically. Cleaned up after the run unless --no-cleanup is set.",
     "uio_devices": {
-      "VectorOPKernel": "VectorOPKernel_0",
-      "MatmulKernel": "MatmulKernel_0",
-      "ConvKernel": "ConvKernel_0",
-      "PoolingKernel": "PoolingKernel_0"
+      "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel": "fabric_matmul",
+      "ConvKernel": "fabric_conv",
+      "PoolingKernel": "fabric_pool"
     },
-    "_uio_devices_note": "Per-kernel UIO sysfs names \u2014 the strings in /sys/class/uio/uio*/name, NOT /dev/uioN paths. Verify after loading the DTBO: cat /sys/class/uio/uio*/name. Only list kernels present in the active bitstream.",
     "driver_dir": null,
     "driver_dirs": {},
-    "_driver_dirs_note": "Per-kernel paths ON THE BOARD to copy driver sources from. Takes precedence over local.driver_dirs only when local.driver_dirs is empty.",
     "cmake_args": []
   },
   "local": {
     "driver_dir": null,
     "driver_dirs": {
-      "VectorOPKernel": "/path/to/axi_demo/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
-      "MatmulKernel": "/path/to/axi_demo/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
-      "ConvKernel": "/path/to/axi_demo/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
-      "PoolingKernel": "/path/to/axi_demo/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
-    },
-    "_driver_dirs_note": "Per-kernel local HLS driver source paths. Merged and bundled before upload. Standard Vitis HLS output location shown; adjust to your build directory."
+      "VectorOPKernel": "/home/ivan/projects/axi_demo/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "MatmulKernel": "/home/ivan/projects/axi_demo/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src",
+      "ConvKernel": "/home/ivan/projects/axi_demo/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
+      "PoolingKernel": "/home/ivan/projects/axi_demo/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
+    }
   },
-  "build": {
-    "jobs": 4,
-    "timeout": 300,
-    "_timeout_note": "Combined cmake + make timeout in seconds. 300s is recommended for the four-kernel benchmark project."
-  },
-  "run": {
-    "timeout": 120,
-    "use_sudo": true,
-    "_use_sudo_note": "Run each benchmark binary with 'sudo -n'. Requires passwordless sudo on the board."
-  },
-  "cleanup": true,
-  "_cleanup_note": "Remove remote work_dir after all benchmarks finish. Set false (or use --no-cleanup) to keep the build for manual invocation.",
   "benchmarks": {
-    "_note": "Kernels without a 'cases' array are skipped. Set 'enabled' to false to skip a kernel without removing its cases.",
     "VectorOPKernel": {
       "enabled": true,
       "warmup": 10,
@@ -802,5 +783,14 @@
         }
       ]
     }
-  }
+  },
+  "build": {
+    "jobs": 4,
+    "timeout": 300
+  },
+  "run": {
+    "timeout": 120,
+    "use_sudo": true
+  },
+  "cleanup": true
 }
