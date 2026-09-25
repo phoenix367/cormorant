@@ -23,6 +23,9 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#ifndef __SYNTHESIS__
+#include <cassert>
+#endif
 #include "MatmulKernel.h"
 
 namespace {
@@ -40,81 +43,124 @@ static_assert((kMaxK / E + 1 + kAReqWords - 1) / kAReqWords <= kAReqOutstanding,
               "one A row must fit in the outstanding request window");
 
 // ---------------------------------------------------------------------------
-// load_b_tile — fetch the (m_tile, k_tile) block of B into b_tile.
+// B block fetch cursor — b_tile ping-pong (MATMUL_OPTIMISATION.md §7).
 //
-// Packed (tile-major) B: the block is one contiguous run of k_valid * kTileM
-// elements (matmul_packed_index); it is requested in <= kBReqWords pieces
-// (all in flight at once: <= 512 / 64 = 8 <= num_read_outstanding) and the
-// words are streamed straight in: word w is row w / kMatmulWordsPerTileRow,
-// columns (w % kMatmulWordsPerTileRow) * E ...
-//
-// Row-major B: each tile row is one element run of m_valid <= kTileM
-// elements at row_off = (k_off + k1) * m + m_off, i.e. at most
-// ceil((E - 1 + kTileM) / E) words.  Requests for kBReqAhead rows are
-// issued before their words are drained so consecutive rows' DDR latency
-// overlaps.  Lane l of word w is tile column (w * E + l - shift).
+// b_tile has two banks; while the K-loop multiplies out of bank `cur`, the
+// block needed by the NEXT (bi, n_tile, m_tile, k_tile) iteration that loads
+// B is streamed into bank !cur, one word per K-loop iteration.  The cursor
+// below is that stream's state.  Rows are the unit of progress for both
+// layouts: a row-major block is k_valid DDR rows of <= 3 words each (one
+// read request per row, <= kBReqAhead rows in flight); a packed block is
+// one contiguous run whose requests are all issued up front, drained as
+// k_valid "rows" of kMatmulWordsPerTileRow words.  A word's lanes are
+// scattered into the column RAMs after ONE rotate by the row's lane shift
+// (0 for packed), with fixed lane -> column wiring (§6).
 // ---------------------------------------------------------------------------
-void load_b_tile(hls::burst_maxi<MatmulWord>& b,
-                 Data_t b_tile[kTileK][kTileM],
-                 unsigned b_base, unsigned m_tile, unsigned k_tile,
-                 unsigned k, unsigned m, unsigned b_packed)
+// The counters are bounded ap_uint types: with plain `unsigned` HLS keeps
+// 32-bit compares / adds and pipeline registers for each of them in the
+// K-loop (CONV_OPTIMISATION.md §2.35 "narrow prefetch cursors").
+typedef ap_uint<matmul_bits_for(kTileK)>             BRowCnt;   // 0 .. kTileK
+typedef ap_uint<matmul_bits_for(kTileM)>             BColCnt;   // 0 .. kTileM
+typedef ap_uint<matmul_bits_for(kMatmulMaxRowWords)> BWordCnt;  // 0 .. words per row
+typedef ap_uint<matmul_bits_for(E - 1)>              BShift;    // 0 .. E - 1
+struct BFetch {
+    unsigned bi, nt, mt, kt;     // iteration whose block is being fetched (C-sim check only)
+    BRowCnt  k_valid;            // rows in the block
+    BColCnt  m_valid;            // valid columns in the block
+    BRowCnt  rows_req;           // rows requested so far (packed: k_valid at once)
+    BRowCnt  rows_done;          // rows fully drained into b_tile
+    unsigned req_off;            // element offset of the next row to request
+    unsigned drain_off;          // element offset of the row being drained
+    unsigned row_stride;         // elements between consecutive rows
+    BWordCnt w, rwords;          // word cursor within the row being drained / its word count
+    BShift   shift;              // lane shift of the row being drained (0 for packed)
+};
+
+// Point the cursor at block (bi, mt, kt) and, for the packed layout, issue
+// all of its read requests (<= 512 words in <= 8 pieces of kBReqWords).
+inline void b_fetch_start(hls::burst_maxi<MatmulWord>& b, BFetch& f,
+                          unsigned bi, unsigned nt, unsigned mt, unsigned kt,
+                          unsigned k, unsigned m, unsigned b_batch_stride,
+                          unsigned b_packed)
 {
     #pragma HLS INLINE
-    const unsigned m_off   = m_tile * kTileM;
-    const unsigned m_valid = std::min(kTileM, m - m_off);
-    const unsigned k_off   = k_tile * kTileK;
-    const unsigned k_valid = std::min(kTileK, k - k_off);
-
+    f.bi = bi; f.nt = nt; f.mt = mt; f.kt = kt;
+    const unsigned b_base = bi * b_batch_stride;
+    const unsigned k_off  = kt * kTileK;
+    const unsigned m_off  = mt * kTileM;
+    f.k_valid   = std::min(kTileK, k - k_off);
+    f.m_valid   = std::min(kTileM, m - m_off);
+    f.rows_done = 0;
+    f.w         = 0;
     if (b_packed) {
-        const unsigned blk_off = b_base + (m_tile * k + k_off) * kTileM;
-        const unsigned n_words = k_valid * kMatmulWordsPerTileRow;
+        // Tile-major B: the block is one contiguous run of k_valid * kTileM
+        // elements (matmul_packed_index); word w is row w / kMatmulWordsPerTileRow.
+        const unsigned blk_off = b_base + (mt * k + k_off) * kTileM;
+        const unsigned n_words = (unsigned)f.k_valid * kMatmulWordsPerTileRow;
         for (unsigned w0 = 0; w0 < n_words; w0 += kBReqWords) {
             #pragma HLS PIPELINE II=1
             b.read_request(blk_off / E + w0, std::min(kBReqWords, n_words - w0));
         }
-        for (unsigned w = 0; w < n_words; w++) {
-            #pragma HLS PIPELINE II=1
-            const MatmulWord word = b.read();
-            const unsigned   k1   = w / kMatmulWordsPerTileRow;
-            const unsigned   part = w % kMatmulWordsPerTileRow;
-            for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                #pragma HLS UNROLL
-                if (m1 / E == part) b_tile[k1][m1] = matmul_word_lane(word, m1 % E);
-            }
-        }
+        f.rows_req   = f.k_valid;
+        f.req_off    = blk_off;
+        f.drain_off  = blk_off;
+        f.row_stride = kTileM;
+        f.rwords     = kMatmulWordsPerTileRow;
+        f.shift      = 0;
     } else {
-        for (unsigned r0 = 0; r0 < k_valid; r0 += kBReqAhead) {
-            const unsigned rn = std::min(kBReqAhead, k_valid - r0);
-            for (unsigned r = 0; r < rn; r++) {
-                #pragma HLS PIPELINE II=1
-                const unsigned row_off = b_base + (k_off + r0 + r) * m + m_off;
-                b.read_request(row_off / E, matmul_words_for(row_off, m_valid));
-            }
-            for (unsigned r = 0; r < rn; r++) {
-                const unsigned k1      = r0 + r;
-                const unsigned row_off = b_base + (k_off + k1) * m + m_off;
-                const unsigned shift   = row_off % E;
-                const unsigned n_words = matmul_words_for(row_off, m_valid);
-                for (unsigned w = 0; w < n_words; w++) {
-                    #pragma HLS PIPELINE II=1
-                    // Lane l of word w is tile column w * E + l - shift.
-                    // After rotating the word by `shift` lanes, column m1
-                    // (j = m1 % E, p = m1 / E) always takes lane j — fixed
-                    // wiring; it belongs to THIS word iff p == w and
-                    // j + shift < E, or p == w - 1 and j + shift >= E.
-                    const MatmulWord rot = matmul_rotate_lanes(b.read(), shift);
-                    for (unsigned m1 = 0; m1 < kTileM; m1++) {
-                        #pragma HLS UNROLL
-                        const unsigned j    = m1 % E;
-                        const unsigned p    = m1 / E;
-                        const bool     wrap = (j + shift) >= E;
-                        const bool     hit  = wrap ? (p + 1 == w) : (p == w);
-                        if (hit && m1 < m_valid) {
-                            b_tile[k1][m1] = matmul_word_lane(rot, j);
-                        }
-                    }
-                }
-            }
+        // Row-major B: row k1 of the block is the element run
+        // [off + k1 * m, + m_valid), requested row by row in b_fetch_step.
+        const unsigned off = b_base + k_off * m + m_off;
+        f.rows_req   = 0;
+        f.req_off    = off;
+        f.drain_off  = off;
+        f.row_stride = m;
+        f.rwords     = matmul_words_for(off, (unsigned)f.m_valid);
+        f.shift      = off % E;
+    }
+}
+
+// One step of the fetch: (row-major) request the next row if fewer than
+// kBReqAhead rows are in flight, then drain ONE word of the current row
+// into bank `bank` of b_tile.  Called once per K-loop iteration; b.read()
+// blocks only when the word has not arrived yet.
+inline void b_fetch_step(hls::burst_maxi<MatmulWord>& b, BFetch& f,
+                         Data_t b_tile[kTileM][2 * kTileK], ap_uint<1> bank,
+                         unsigned b_packed)
+{
+    #pragma HLS INLINE
+    if (!b_packed && f.rows_req < f.k_valid &&
+        (unsigned)(f.rows_req - f.rows_done) < kBReqAhead) {
+        b.read_request(f.req_off / E, matmul_words_for(f.req_off, (unsigned)f.m_valid));
+        f.rows_req++;
+        f.req_off += f.row_stride;
+    }
+    if (f.rows_done < f.rows_req) {
+        // Lane l of word w is tile column w * E + l - shift.  After the
+        // rotate, column m1 (j = m1 % E, p = m1 / E) always takes lane j;
+        // it belongs to THIS word iff p == w and j + shift < E, or
+        // p == w - 1 and j + shift >= E.  One conditional store per column
+        // RAM per step, at the flat (bank, row) address.
+        const MatmulWord rot  = matmul_rotate_lanes(b.read(), f.shift);
+        const unsigned   addr = (unsigned)bank * kTileK + (unsigned)f.rows_done;
+        const unsigned   fw   = f.w;
+        const unsigned   fsh  = f.shift;
+        const unsigned   fmv  = f.m_valid;
+        for (unsigned m1 = 0; m1 < kTileM; m1++) {
+            #pragma HLS UNROLL
+            const unsigned j    = m1 % E;
+            const unsigned p    = m1 / E;
+            const bool     wrap = (j + fsh) >= E;
+            const bool     hit  = wrap ? (p + 1 == fw) : (p == fw);
+            if (hit && m1 < fmv) b_tile[m1][addr] = matmul_word_lane(rot, j);
+        }
+        if (++f.w == f.rwords) {
+            f.w = 0;
+            f.rows_done++;
+            f.drain_off += f.row_stride;
+            f.rwords = b_packed ? kMatmulWordsPerTileRow
+                                : matmul_words_for(f.drain_off, (unsigned)f.m_valid);
+            f.shift  = b_packed ? 0u : f.drain_off % E;
         }
     }
 }
@@ -200,13 +246,19 @@ void MatmulKernel(
     //          iterations share an acc element.
     // -----------------------------------------------------------------------
     static Data_t    a_buf [kTileN][kMaxK / E][E];
-    static Data_t    b_tile[kTileK][kTileM];
+    static Data_t    b_tile[kTileM][2 * kTileK];
     static AccData_t acc   [kTileN][kTileM];
 
     #pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=1
     #pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=3
-    #pragma HLS ARRAY_PARTITION variable=b_tile complete dim=2
+    // One RAM column per m1 with a flat (bank, k1) address: the K-loop reads
+    // bank cur_bank and the prefetch writes bank !cur_bank in the same
+    // iteration — one read + one write port per RAM (CONV_OPTIMISATION.md
+    // §2.35: never a runtime index into the partitioned dimension).
+    #pragma HLS ARRAY_PARTITION variable=b_tile complete dim=1
+    #pragma HLS BIND_STORAGE    variable=b_tile type=RAM_2P impl=BRAM
     #pragma HLS ARRAY_PARTITION variable=acc    complete dim=0
+    static_assert((kTileK & (kTileK - 1)) == 0, "kTileK must be a power of two (flat bank address)");
 
     const unsigned n_tiles = (n + kTileN - 1) / kTileN;
     const unsigned m_tiles = (m + kTileM - 1) / kTileM;
@@ -217,6 +269,14 @@ void MatmulKernel(
     // once per (n_tile, m_tile, k_tile); with b_batch_stride == 0 (B
     // broadcasts) it is loaded once per call.
     const bool b_resident = (m_tiles == 1) && (k_tiles == 1);
+
+    // b_tile ping-pong state (§7): the bank holding the block of the
+    // current iteration, whether any block has been loaded yet in this call,
+    // and the fetch cursor of the next block (active while one is pending).
+    ap_uint<1> cur_bank   = 0;
+    bool       have_block = false;
+    bool       f_active   = false;
+    BFetch     f;
 
     // -----------------------------------------------------------------------
     // Batch loop — stride=0 on a or b means that pointer stays fixed (broadcasts).
@@ -338,14 +398,50 @@ void MatmulKernel(
                     const unsigned k_off   = k_tile * kTileK;
                     const unsigned k_valid = std::min(kTileK, k - k_off);
 
-                    // ONE call site: load_b_tile is inlined and its
-                    // row-major scatter is the largest LUT consumer of the
-                    // kernel (~18 k); a second call site for the fast path
-                    // duplicated it (44 k -> 64 k LUT).
                     const bool load_b = !b_resident ||
                                         (n_tile == 0 && load_b_this_slice);
-                    if (load_b)
-                        load_b_tile(b, b_tile, b_base, m_tile, k_tile, k, m, b_packed);
+                    if (load_b) {
+                        if (!have_block) {
+                            // Very first block of the call: fetch it into
+                            // cur_bank, blocking (nothing to overlap with).
+                            b_fetch_start(b, f, bi, n_tile, m_tile, k_tile,
+                                          k, m, b_batch_stride, b_packed);
+                            while (f.rows_done < f.k_valid) {
+                                #pragma HLS PIPELINE II=1
+                                b_fetch_step(b, f, b_tile, cur_bank, b_packed);
+                            }
+                            have_block = true;
+                        } else {
+                            // This iteration's block was prefetched into
+                            // !cur_bank by the previous K-loop, which does
+                            // not exit before its prefetch is complete.
+#ifndef __SYNTHESIS__
+                            assert(f_active && f.bi == bi && f.mt == m_tile &&
+                                   f.kt == k_tile && f.rows_done == f.k_valid &&
+                                   "b_tile prefetch cursor out of step");
+#endif
+                            cur_bank = ~cur_bank;
+                        }
+                        // Point the cursor at the next block that will be
+                        // loaded, in consumption order (k_tile fastest, then
+                        // m_tile, n_tile, batch; the B-resident fast path
+                        // only reloads at the next batch slice, never when
+                        // B broadcasts), and issue its requests (packed).
+                        unsigned nb = bi, nn = n_tile, nm = m_tile, nk = k_tile;
+                        if (b_resident) {
+                            nn = 0; nm = 0; nk = 0;
+                            nb = (b_batch_stride == 0) ? batch : bi + 1;
+                        } else if (++nk == k_tiles) {
+                            nk = 0;
+                            if (++nm == m_tiles) {
+                                nm = 0;
+                                if (++nn == n_tiles) { nn = 0; nb++; }
+                            }
+                        }
+                        f_active = nb < batch;
+                        if (f_active)
+                            b_fetch_start(b, f, nb, nn, nm, nk, k, m, b_batch_stride, b_packed);
+                    }
 
                     // -------------------------------------------------------
                     // K-reduction: II=1 pipelined loop.
@@ -389,22 +485,42 @@ void MatmulKernel(
                         #pragma HLS UNROLL
                         seg_base[s] = s * seg_len;
                     }
+                    //
+                    // The loop also carries the prefetch of the next B
+                    // block (§7): one b_fetch_step per iteration into bank
+                    // !cur_bank, and it keeps iterating (MACs idle) until
+                    // that block is complete, so the next iteration that
+                    // loads B can simply swap banks.
                     const unsigned ki_bound = seg_len * kTileN;
-                    for (unsigned ki = 0; ki < ki_bound; ki++) {
+                    const unsigned b_row0   = (unsigned)cur_bank * kTileK;
+                    const ap_uint<1> nbank  = ~cur_bank;
+                    for (unsigned ki = 0; ; ki++) {
                         #pragma HLS PIPELINE II=1
-                        const unsigned n1  = ki % kTileN;
-                        const unsigned kk  = ki / kTileN;
-                        const unsigned row = n1 >> lpr_log;
-                        const unsigned seg = n1 & (lpr - 1);
-                        const unsigned kl  = seg_base[seg] + kk;   // K index local to this tile
-                        if (kl < k_valid) {
-                            const unsigned kidx  = k_off + kl;
-                            const Data_t   a_val = a_buf[row][kidx / E][kidx % E];
+                        const bool mac  = ki < ki_bound;
+                        const bool pend = f_active && f.rows_done < f.k_valid;
+                        if (!mac && !pend) break;
+                        // The accumulate itself is unconditional: an idle
+                        // lane (drain-only iteration, or a K-segment tail
+                        // past k_valid) multiplies a zero A operand, which
+                        // leaves acc bit-identical.  Predicating the acc
+                        // update instead made HLS wrap the lane mux in
+                        // 33-bit compare / select logic (+5 k LUT).
+                        {
+                            const unsigned n1  = ki % kTileN;
+                            const unsigned kk  = ki / kTileN;
+                            const unsigned row = n1 >> lpr_log;
+                            const unsigned seg = n1 & (lpr - 1);
+                            const unsigned kl  = seg_base[seg] + kk;   // K index local to this tile
+                            const bool     ok  = mac && kl < k_valid;
+                            const unsigned kr  = ok ? kl : 0u;         // clamp: kl may reach kTileK + lpr - 1
+                            const unsigned kidx  = k_off + kr;
+                            const Data_t   a_val = ok ? a_buf[row][kidx / E][kidx % E] : Data_t(0);
                             for (unsigned m1 = 0; m1 < kTileM; m1++) {
                                 #pragma HLS UNROLL
-                                acc[n1][m1] += a_val * b_tile[kl][m1];
+                                acc[n1][m1] += a_val * b_tile[m1][b_row0 + kr];
                             }
                         }
+                        if (pend) b_fetch_step(b, f, b_tile, nbank, b_packed);
                     }
                 }
 

@@ -536,7 +536,130 @@ stand's memory model and not in the load path.
 
 ---
 
-## 7. Verification matrix
+## 7. `b_tile` ping-pong: prefetch the next B block under the K-loop (Track A3, 2026-09-25)
+
+**Problem.**  After §3b a `(m_tile, k_tile)` block of B (≤ 512 words) was
+still loaded strictly *before* its K-loop (`k_valid · kTileN` ≥ 1 024
+cycles for a full n_tile): on `256³ packed` the block loads were 29 % of
+the kernel time and none of it overlapped with the MACs
+(THROUGHPUT_PLAN.md §0).  The §2 DATAFLOW attempt had shown that a
+generic producer/consumer split costs more than it saves here; the
+CONV_OPTIMISATION.md §2.35 recipe — two banks in one RAM column set, the
+prefetch cursor advanced inside the compute loop — does not.
+
+**Change.**
+
+- `b_tile` is `[kTileM][2·kTileK]`, partitioned on dim 1, `RAM_2P`: one
+  RAM column per `m1`, flat `(bank, k1)` address (`bank·kTileK + k1`,
+  `kTileK` a power of two).  The K-loop reads bank `cur_bank`, the
+  prefetch writes bank `!cur_bank` — one read and one write port per RAM.
+- A fetch cursor (`BFetch`) describes the block the *next* B-loading
+  iteration will consume — the iteration order is `k_tile` fastest, then
+  `m_tile`, `n_tile`, batch, with the §4 B-resident rule (reload only at
+  the next batch slice, never when B broadcasts).  Progress is counted in
+  rows for both layouts: a row-major block is `k_valid` rows of ≤ 3 words,
+  each its own read request, ≤ `kBReqAhead = 16` rows in flight; a packed
+  block issues its ≤ 8 × 64-word requests up front and is drained as
+  `k_valid` rows of 2 words.  One `b_fetch_step` per K-loop iteration:
+  (row-major) request the next row if the window allows, then drain ONE
+  word — `b.read()` blocks only when it has not arrived — and scatter it
+  with the §6 rotate + fixed wiring into `b_tile[m1][!cur_bank·kTileK +
+  rows_done]` (one conditional store per column RAM).
+- The K-loop runs `while (ki < ki_bound || prefetch pending)`: MACs stop
+  at `ki_bound`, the loop keeps draining until the next block is complete,
+  so every B-loading iteration but the first simply swaps banks (a C-sim
+  `assert` checks the cursor is in step).  Only the first block of a call
+  is loaded by a blocking drain loop.  There is no separate tail loop and
+  no second instance of the MAC.
+- The accumulate is unconditional: an idle lane (drain-only iteration, or
+  the §5 segment tail) multiplies a zero A operand — bit-identical.
+
+C-sim 39/39 bit-exact, including the four `6×517×35` batch-3 cases added
+for this step (the cursor crosses `k_tile`, `m_tile`, `n_tile` and batch
+boundaries, with and without broadcast) and the packed FC-like case.
+
+**Traps hit** (three synthesis rounds, all II=1; no `DEPENDENCE` pragma
+was needed — HLS proved the two banks disjoint from the flat address):
+
+| Form | Result |
+|---|---|
+| first version, cursor fields `unsigned`, accumulate under `if (mac)` | II=1, latency 13, but K-loop 3.5 k → **11.9 k LUT**, FF +7 k: 32-bit compares / adds and pipeline registers for every cursor field, and HLS wrapped the predicated `acc +=` in a 33-bit compare / select per column |
+| cursor fields as bounded `ap_uint` (`BRowCnt`, `BColCnt`, `BWordCnt`, `BShift`; §2.35 "narrow prefetch cursors") | K-loop 10.5 k LUT, FF −1.8 k |
+| **+ unconditional accumulate with a zeroed operand** (indices clamped for the idle lanes) | **K-loop 8.5 k LUT**, design 29.3 k LUT — shipped |
+
+The K-loop's remaining +5 k LUT over §6 is the rotate (0.7 k), the 16
+conditional column stores with their enables, the row-request address /
+word-count arithmetic and the loop's two exit conditions; iteration
+latency 4 → 13 (the blocking read and the rotate sit ahead of the store),
+which costs ~9 cycles per K-loop entry — invisible next to the ≥ 1 024
+cycles of a block.
+
+**Result (RTL, 39 cases; before = §3b kernel).**
+
+| # | Test | n×k×m×batch | B | before | after | Δ |
+|--:|---|---|---|---:|---:|---:|
+| 0 | 1x1x1 | 1×1×1×1 | row-major | 6,065 | 6,205 | +2.3 % |
+| 1 | TileN x TileK x TileM | 4×256×16×1 | row-major | 43,470 | 34,480 | -20.7 % |
+| 2 | 2 TileN x TileK x TileM | 8×256×16×1 | row-major | 83,300 | 49,210 | -40.9 % |
+| 3 | TileN x 2 TileK x TileM | 4×512×16×1 | row-major | 78,050 | 56,480 | -27.6 % |
+| 4 | TileN x TileK x 2 TileM | 4×256×32×1 | row-major | 79,340 | 57,760 | -27.2 % |
+| 5 | TileN 2 x TileK x TileM partial N | 6×256×16×1 | row-major | 80,470 | 42,410 | -47.3 % |
+| 6 | TileN x TileK 5 x TileM partial K | 4×261×16×1 | row-major | 44,740 | 35,440 | -20.8 % |
+| 7 | TileN x TileK x TileM 3  partial M | 4×256×19×1 | row-major | 79,050 | 58,980 | -25.4 % |
+| 8 | TileN 2 x TileK 5 x TileM 3  all partial | 6×261×19×1 | row-major | 154,890 | 110,760 | -28.5 % |
+| 9 | 7 x 13 x 5 arbitrary small | 7×13×5×1 | row-major | 15,280 | 11,710 | -23.4 % |
+| 10 | N x 1 x M K 1 outer product | 5×1×17×1 | row-major | 13,200 | 11,830 | -10.4 % |
+| 11 | 1 x K x M N 1 row vector | 1×256×16×1 | row-major | 38,920 | 23,890 | -38.6 % |
+| 12 | N x K x 1 M 1 column vector | 4×256×1×1 | row-major | 40,830 | 33,800 | -17.2 % |
+| 13 | 3 TileN x 2 TileK 7 x 2 TileM 1  multi-tile all | 12×519×33×1 | row-major | 663,790 | 467,810 | -29.5 % |
+| 14 | batch 3 no broadcast | 5×64×19×3 | row-major | 129,960 | 83,930 | -35.4 % |
+| 15 | batch 4 A broadcasts a stride 0 | 5×64×19×4 | row-major | 172,390 | 110,620 | -35.8 % |
+| 16 | batch 4 B broadcasts b stride 0 | 5×64×19×4 | row-major | 172,290 | 110,840 | -35.7 % |
+| 17 | batch 6 both strided multi-dim flat | 5×64×19×6 | row-major | 256,650 | 164,090 | -36.1 % |
+| 18 | TileN x TileK x TileM B packed | 4×256×16×1 | packed | 25,760 | 24,170 | -6.2 % |
+| 19 | TileN 2 x TileK 5 x TileM 3  B packed all partial | 6×261×19×1 | packed | 81,760 | 68,380 | -16.4 % |
+| 20 | 7 x 13 x 5 B packed arbitrary small | 7×13×5×1 | packed | 14,310 | 11,280 | -21.2 % |
+| 21 | 1 x K x M B packed N 1 row vector | 1×256×16×1 | packed | 20,840 | 13,360 | -35.9 % |
+| 22 | N x K x 1 B packed M 1 | 4×256×1×1 | packed | 24,310 | 22,800 | -6.2 % |
+| 23 | 3 TileN x 2 TileK 7 x 2 TileM 1  B packed multi-tile | 12×519×33×1 | packed | 331,280 | 277,050 | -16.4 % |
+| 24 | 1 x 2 TileK x 4 TileM B packed FC-like | 1×512×64×1 | packed | 135,400 | 56,320 | -58.4 % |
+| 25 | batch 3 no broadcast B packed | 5×64×19×3 | packed | 80,690 | 53,710 | -33.4 % |
+| 26 | batch 4 B broadcasts B packed b stride 0 | 5×64×19×4 | packed | 106,750 | 70,590 | -33.9 % |
+| 27 | 1 x 261 x 19 K-split n 1 | 1×261×19×1 | row-major | 76,670 | 45,460 | -40.7 % |
+| 28 | 1 x 261 x 19 B packed K-split n 1 | 1×261×19×1 | packed | 39,910 | 24,230 | -39.3 % |
+| 29 | 2 x 13 x 5 K-split n 2 | 2×13×5×1 | row-major | 8,440 | 7,860 | -6.9 % |
+| 30 | 2 x 13 x 5 B packed K-split n 2 | 2×13×5×1 | packed | 7,420 | 6,810 | -8.2 % |
+| 31 | 3 x 517 x 33 K-split n 3 multi-tile | 3×517×33×1 | row-major | 221,060 | 157,070 | -28.9 % |
+| 32 | 3 x 517 x 33 B packed K-split n 3 | 3×517×33×1 | packed | 109,490 | 92,520 | -15.5 % |
+| 33 | batch 3 6 x 517 x 35 prefetch crosses tiles | 6×517×35×3 | row-major | 1,312,140 (was FAIL) | 828,580 **FAIL** | -36.9 % |
+| 34 | batch 3 6 x 517 x 35 B packed prefetch crosses tiles | 6×517×35×3 | packed | 643,760 | 448,130 | -30.4 % |
+| 35 | batch 3 6 x 517 x 35 B broadcasts b stride 0 | 6×517×35×3 | row-major | 1,312,195 | 828,640 | -36.9 % |
+| 36 | batch 3 6 x 517 x 35 B broadcasts B packed b stride 0 | 6×517×35×3 | packed | 643,590 | 447,740 | -30.4 % |
+| 37 | sat pos a 100 b 100 K 3  AP MAX | 4×3×16×1 | row-major | 9,670 | 7,930 | -18.0 % |
+| 38 | sat neg a 100 b -100 K 3  AP MIN | 4×3×16×1 | row-major | 9,510 | 7,820 | -17.8 % |
+| | **Σ duration_ns (common cases)** | | | **7,367,640** | **4,970,695** | **-32.5 %** |
+
+
+Σ over the 39 cases **−32.5 %** versus the §3b kernel (−24.7 % on top of
+§5/§6).  Every multi-block case now overlaps its B loads with the MACs:
+`TileN × TileK × TileM` row-major 43,470 → **34,480 ns** (−21 %),
+`TileN × 2·TileK` −28 %, `multi-tile all` −30 % (663,790 → 467,810),
+`6×517×35 batch 3` −37 % row-major / −30 % packed, the `5×64×19` batch
+cases −33 …−36 %, `1 × 2·TileK × 4·TileM packed` (FC) 135,400 →
+**56,320 ns** (−58 %, of which −23 % is this step).  Single-block packed
+cases, whose one block cannot be overlapped with anything, are unchanged
+(`TileN × TileK × TileM packed` −6 %, all from §4/§5); `1×1×1` +2 %
+(140 ns — the longer K-loop pipeline).  Nothing regressed.  The
+`6×517×35` row-major case still fails in sequence with the same stale
+value as §4–§6 (run before the test-stand fix).
+
+Synthesis: II=1 on every loop, slack 0.00 ns, BRAM 64 (unchanged — the
+16 column RAMs simply grow from 256 to 512 entries, still one BRAM18
+each), DSP 34, FF 17.4 k, LUT **29.3 k** (baseline 44.3 k).
+
+---
+
+## 8. Verification matrix
 
 | Gate | Command | Baseline result |
 |---|---|---|
@@ -546,7 +669,7 @@ stand's memory model and not in the load path.
 
 ---
 
-## 8. Related files
+## 9. Related files
 
 | File | Purpose |
 |---|---|

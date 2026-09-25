@@ -107,27 +107,37 @@ it is read within a call):
 
 | Buffer | Shape | Storage | Holds |
 |--------|-------|---------|-------|
-| `a_buf` | `[kTileN][kMaxK]` | `kTileN` BRAMs (partition dim 1) | `kTileN` full rows of A for the current `n_tile`; loaded once, reused across all `m_tile`s and `k_tile`s |
-| `b_tile` | `[kTileK][kTileM]` | `kTileM` BRAMs (partition dim 2) | One `kTileK × kTileM` block of B; reloaded from DDR per `(m_tile, k_tile)` |
+| `a_buf` | `[kTileN][kMaxK / 8][8]` | `kTileN × 8` BRAMs (partition dims 1 and 3) | `kTileN` full rows of A for the current `n_tile`, element `ki` of row `n1` at `[n1][ki / 8][ki % 8]` so the 8 lanes of a port word land in 8 banks per cycle; loaded once, reused across all `m_tile`s and `k_tile`s |
+| `b_tile` | `[kTileM][2 · kTileK]` | `kTileM` BRAMs (partition dim 1), `RAM_2P` | Two banks of one `kTileK × kTileM` block of B, flat `(bank, k1)` address: the K-loop reads the current bank while the next block is prefetched into the other (MATMUL_OPTIMISATION.md §7) |
 | `acc` | `[kTileN][kTileM]` | registers (partition dim 0) | `kTileN × kTileM` partial dot products; cleared per `m_tile` |
 
 ```cpp
-static Data_t    a_buf [kTileN][kMaxK];
-static Data_t    b_tile[kTileK][kTileM];
+static Data_t    a_buf [kTileN][kMaxK / 8][8];
+static Data_t    b_tile[kTileM][2 * kTileK];
 static AccData_t acc   [kTileN][kTileM];
-#pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=1   // kTileN parallel row banks
-#pragma HLS ARRAY_PARTITION variable=b_tile complete dim=2   // kTileM parallel column banks
+#pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=1   // kTileN row banks …
+#pragma HLS ARRAY_PARTITION variable=a_buf  complete dim=3   // … × 8 lane banks
+#pragma HLS ARRAY_PARTITION variable=b_tile complete dim=1   // one RAM column per m1
+#pragma HLS BIND_STORAGE    variable=b_tile type=RAM_2P impl=BRAM
 #pragma HLS ARRAY_PARTITION variable=acc    complete dim=0   // all kTileN·kTileM in registers
 ```
 
-`a_buf` is partitioned on dim 1 so all `kTileN` rows can be read in the same
-cycle — the II=1 K-reduction reads `a_buf[n1][…]` for a different `n1` each
-iteration. `b_tile` is partitioned on dim 2 so the `kTileM`-wide unrolled
-inner loop reads one element per column bank per cycle. `acc` is fully
-partitioned so all `kTileN·kTileM` accumulators are independent registers.
+`a_buf` is partitioned on dims 1 and 3 so a whole 128-bit A word is
+scattered in one cycle and the II=1 K-reduction reads `a_buf[row][…]` for a
+different row each iteration. `b_tile` is one RAM column per `m1` with a
+flat `bank · kTileK + k1` address — the `kTileM`-wide unrolled inner loop
+reads one element per column per cycle from the current bank, and the
+prefetch writes one conditional store per column into the other bank (a
+runtime index into the partitioned dimension, or two separate arrays, is
+what makes HLS duplicate the RAMs or fall to II=2 — CONV_OPTIMISATION.md
+§2.35). `acc` is fully partitioned so all `kTileN·kTileM` accumulators are
+independent registers.
 
 The kernel is **not** a `DATAFLOW` design — it is a single sequential loop
-nest with each load / reduce / write loop pipelined at II=1.
+nest with each load / reduce / write loop pipelined at II=1; the B
+prefetch overlaps DDR traffic with the MACs *inside* the K-loop rather
+than through a second process (the DATAFLOW form was measured and
+rejected, MATMUL_OPTIMISATION.md §2).
 
 ---
 
@@ -154,24 +164,27 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
       for k_tile in [0, ceil(k / kTileK))
         k_off, k_valid = k_tile·kTileK, min(kTileK, k - k_off)
 
-        // LOAD b_tile — the (m_tile, k_tile) block (row-major: k_valid row
-        // requests, 16 in flight; packed: ≤ 8 × 64-word requests).  When
-        // B is a single block (m_tiles == k_tiles == 1) it is loaded only
-        // at the first n_tile of a batch slice — once per call if
-        // b_batch_stride == 0 — instead of per (n_tile, m_tile, k_tile).
-        if load_b: load_b_tile(m_tile, k_tile)                       PIPELINE II=1
+        // B BLOCK (§7 ping-pong) — the block for this iteration is already
+        // in b_tile[cur_bank] (prefetched by the previous K-loop), except
+        // for the very first block of the call, which is drained here,
+        // blocking.  Then the cursor is pointed at the NEXT block that will
+        // be loaded (k_tile fastest, then m_tile, n_tile, batch; a
+        // single-block B — m_tiles == k_tiles == 1 — is reloaded only at
+        // the next batch slice, never when it broadcasts) and, for the
+        // packed layout, its ≤ 8 × 64-word requests are issued.
+        if load_b: (first block ? drain into cur_bank : cur_bank ^= 1); start fetch of next block
 
         // K-REDUCTION — iterates seg_len·kTileN times                     PIPELINE II=1
         // (§5: lpr = lanes per row = 4 / 2 / 1 for n_valid = 1 / 2 / 3–4,
         //  seg_len = ceil(k_valid / lpr))
-        for ki in [0, seg_len·kTileN):
+        for ki = 0; ki < seg_len·kTileN or prefetch pending; ki++:
           n1  = ki % kTileN                 // lane — rotates 0..kTileN-1
           row = n1 / lpr, seg = n1 % lpr    // row and K-segment of the lane
           kl  = seg·seg_len + ki / kTileN   // K index local to this k_tile
-          if kl < k_valid:
-            a_val = a_buf[row][k_off + kl]
-            for m1 in [0, kTileM) UNROLL:
-              acc[n1][m1] += a_val · b_tile[kl][m1]    // Data_t × Data_t → AccData_t
+          a_val = (ki < seg_len·kTileN and kl < k_valid) ? a_buf[row][k_off + kl] : 0
+          for m1 in [0, kTileM) UNROLL:
+            acc[n1][m1] += a_val · b_tile[m1][cur_bank·kTileK + kl]   // Data_t × Data_t → AccData_t
+          if prefetch pending: b_fetch_step()   // ≤ 1 row request, 1 word drained into bank !cur_bank
 
       // K-SPLIT REDUCTION — fold the segment lanes into lane row·lpr   (1 cycle, UNROLL)
       for stride in 1, 2, …, kTileN/2: if lpr > stride:
@@ -183,9 +196,14 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
 ```
 
 `A` is loaded once per `n_tile` and reused across every `m_tile`/`k_tile`;
-`B` is reloaded per `(m_tile, k_tile)`. Partial last tiles load only the
-valid rows/columns — unused `a_buf`/`b_tile` lanes hold stale data but feed
-`acc` lanes that are never written out to `C`.
+`B` is fetched per `(m_tile, k_tile)` block, one block ahead of its use:
+the K-loop of one block drains the next block's words — one per iteration,
+requests issued row by row with ≤ 16 in flight (row-major) or all up front
+(packed) — into the other `b_tile` bank, and keeps iterating (MACs idle)
+until that block is complete, so the next B-loading iteration only swaps
+banks.  Partial last tiles load only the valid rows/columns — unused
+`a_buf`/`b_tile` lanes hold stale data but feed `acc` lanes that are never
+written out to `C`.
 
 ### HLS pragmas applied
 
@@ -193,10 +211,10 @@ valid rows/columns — unused `a_buf`/`b_tile` lanes hold stale data but feed
 |--------|----------|--------|
 | `INTERFACE m_axi … bundle=gmem0/1/2` | top-level | AXI memory ports for A / B / C |
 | `INTERFACE s_axilite … bundle=ctrl` | every scalar + `return` | AXI-Lite register file |
-| `ARRAY_PARTITION variable=a_buf complete dim=1` | `a_buf[kTileN][kMaxK]` | `kTileN` parallel row banks |
-| `ARRAY_PARTITION variable=b_tile complete dim=2` | `b_tile[kTileK][kTileM]` | `kTileM` parallel column banks |
+| `ARRAY_PARTITION variable=a_buf complete dim=1` / `dim=3` | `a_buf[kTileN][kMaxK/8][8]` | `kTileN × 8` parallel banks (one A word scattered per cycle) |
+| `ARRAY_PARTITION variable=b_tile complete dim=1` + `BIND_STORAGE RAM_2P` | `b_tile[kTileM][2·kTileK]` | `kTileM` column RAMs, two banks each (read one, prefetch the other) |
 | `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileN][kTileM]` | all accumulators in registers |
-| `PIPELINE II=1` | a_buf load / b_tile load / K-reduction / C write | One iteration per clock |
+| `PIPELINE II=1` | a_buf load / first-block b_tile drain / K-reduction (+ prefetch) / C write | One iteration per clock |
 | `UNROLL` | inner `m1` loop + the `acc` clear | `kTileM` parallel MAC lanes |
 
 ---
@@ -371,8 +389,8 @@ an IP-catalog archive.
 | **Initiation interval** | II=1 in every load / reduce / write loop |
 | **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
 | **Short n_tiles** | K-split: 4 / 2 lanes per row when `n_valid = 1 / 2`, lanes folded after the k_tile loop |
-| **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`) |
-| **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM), `acc` (registers) |
+| **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`); B block prefetch folded into the K-loop |
+| **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM, two banks — next block prefetched under the K-loop), `acc` (registers) |
 | **A reuse** | `a_buf` loaded once per `n_tile` (row requests batched 4 deep), reused across all `m_tile`/`k_tile` |
 | **B reuse** | single-block B (`m ≤ kTileM`, `k ≤ kTileK`) loaded once per batch slice (once per call when it broadcasts) |
 | **Batch broadcasting** | `a_batch_stride` / `b_batch_stride` = 0 reuses A / B |

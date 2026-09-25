@@ -132,6 +132,11 @@ inline Data_t matmul_word_lane(MatmulWord w, unsigned j) {
     return matmul_lane_to_data(w.range(kMatmulDataBits * (j + 1) - 1, kMatmulDataBits * j));
 }
 
+// Bits needed to hold the value v (e.g. 9 for 256): narrow HLS counters.
+constexpr unsigned matmul_bits_for(unsigned v) { return v == 0 ? 0 : 1 + matmul_bits_for(v >> 1); }
+// Most words a run of kTileM elements at any lane offset can span.
+static constexpr unsigned kMatmulMaxRowWords = (kTileM + kMatmulPortElems - 1) / kMatmulPortElems + 1;
+
 // Number of words that cover `count` elements starting at element `off`.
 inline unsigned matmul_words_for(unsigned off, unsigned count) {
     const unsigned w_lo = off / kMatmulPortElems;
