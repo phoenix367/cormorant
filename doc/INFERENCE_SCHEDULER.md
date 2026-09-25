@@ -21,8 +21,8 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
-| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply |
-| **ConvKernel** | `Conv` | 2-D NCHW convolution with optional bias |
+| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster) |
+| **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias; also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
 
 **Zero-cost transformations (no hardware call):**
@@ -102,6 +102,7 @@ inference_scheduler.py          CLI, argument parsing
     ├── nodes.py                ScheduledNode  (VectorOPKernel)
     │                           MatmulNode     (MatmulKernel)
     │                           ConvNode       (ConvKernel)
+    │                           MatmulConvNode (a MatMul on ConvKernel)
     │                           PoolNode       (PoolingKernel)
     │                           ReshapeNode    (buffer alias)
     │                           SpaceToDepthNode (host reorder)
@@ -110,6 +111,8 @@ inference_scheduler.py          CLI, argument parsing
     │                           numpy reference + C helper library
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
+    ├── matmul_lowering.py      MatMul -> ConvKernel engine choice and geometry
+    ├── cost_model.py           ConvKernel / MatmulKernel cycle estimates
     ├── schedule.py Dag         data-flow DAG: predecessors, successors,
     │                           topological order, independent pairs
     └── codegen/    CodeGenerator
@@ -139,8 +142,13 @@ inference_scheduler.py          CLI, argument parsing
 10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
    into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
    re-pointed) and renumbers node indices.
-11. `_pack_matmul_weights()`, then `_choose_slice_views()` (contiguous
-   Slice pieces that may alias their source).
+11. `matmul_lowering.lower_matmuls()` (`matmul_on_conv="auto"`, the
+   default) — MatMuls estimated faster on ConvKernel become
+   `MatmulConvNode`s, their constant B re-laid out when `kw > 1`
+   ([§MatMul on ConvKernel](#matmul-on-convkernel)).
+12. `_pack_matmul_weights()` (the remaining MatmulNodes), then
+   `_choose_slice_views()` (contiguous Slice pieces that may alias their
+   source).
 
 `_space_to_depth_stems()` (when `s2d_stem=True`) runs on the ONNX model
 like the Gemm rewrite: it inserts the `SpaceToDepth`
@@ -414,6 +422,81 @@ fills an integer input with `p[i] = i % R` — R the smallest Gather table /
 OneHot depth that reads it, else 2 (a 0/1 mask) — and compares integer
 outputs exactly (printed with `%d`).
 
+### MatMul on ConvKernel
+
+[`BERT_PLAN.md`](BERT_PLAN.md) §2 2A.  ConvKernel's 16 × 16 MAC grid runs
+two output pixels per cycle (512 MACs, CONV_OPTIMISATION §2.42) against
+MatmulKernel's 32; a MatMul runs on it with **swapped operand roles**.  For
+`C[N][M] = A[N][K] · B[K][M]` (per batch item) one ConvKernel call has
+
+| conv | = |
+|---|---|
+| `out_ch` | `N` (tokens, for a transformer linear) |
+| `in_ch`, kernel, stride | `K / kw`, `1 × kw`, `(1, kw)`; no padding, dilation 1, no bias |
+| output `out_h × out_w` | `M`; `in_h = out_h`, `in_w = kw · out_w` |
+| weight | **A** — row-major `[N][K]` *is* the packed tile-major `[N][K/(16 kw)][1][kw][16]` when `K % (16 kw) == 0`: no packing, no copy |
+| x | **B** — `x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p]` (`p = h·out_w + ow`); for `kw = 1` that is B's own row-major `[K][M]` |
+| y | **C** row-major `[N][M]` |
+
+A Gemm's bias stays the VectorOP Add.  Both kernels multiply Q8.8 operands
+exactly, sum in `ap_fixed<32,16>` and floor + saturate, so the result is
+**bit-identical** to MatmulKernel's: `_simulate` runs a `MatmulConvNode`
+exactly like a `MatmulNode` (`np.matmul`, truncate), and
+`test/test_matmul_on_conv.py` proves the mapping (A read through
+ConvKernel.h's packed-weight formula and B's image read as NCHW `x` give
+`A · B` through the conv reference; the generated C run on the host
+against a software ConvKernel reproduces the simulation bit for bit —
+also for BERT-base, `test/test_bert_base.py`).  The kernel side is
+covered by `TestConvSim.cpp`'s `mm-on-conv` cases (C-sim and RTL: 1×2 /
+1×3 / 1×4 with stride = kw, 1×1 with out_h > 1, M-groups and oh-chunks,
+in_ch 1024, weights read at offsets inside a shared buffer).
+
+**Eligibility** (`matmul_lowering.ineligible_reason`): ap_fixed<16,8>;
+`outer_count == 1`; `N > 1`; `K % 16 == 0` (no pad lanes in the weight
+tile) and `M % 8 == 0` (every row / batch slice of B and C starts on a
+16-byte word, so no broadcast consumer can give A, B or C a gapped
+layout — `_compute_tensor_layouts` still checks); ConvKernel's bounds
+(`out_ch ≤ max_out_ch`, `K/kw ≤ max_in_ch`, `out_w · ceil(N/16)·16 ≤
+max_acc_persist_entries`, `kw ≤ max_kw`).
+
+**Kernel width.**  B is used as is (`kw = 1`) when it is an activation or
+a constant something else also reads.  A constant B read only by this
+MatMul is emitted in the `kw` layout above (`nodes.conv_lowered_b_image`
+→ `TensorInfo.packed_data`, the `.dat` / ROM image; `data` stays logical)
+and every `kw` with `K % (16 kw) == 0` is a candidate: the §2.42 sweep
+spends `max(kh·kw, 2)` cycles per pixel pair, so `kw ≥ 2` halves a 1×1's
+sweep (which pays a dummy second position).
+
+**Engine choice** (`--matmul-on-conv auto`, the default): every
+`(kw, out_w | M)` geometry is costed with `cost_model.conv_cycles` — the
+standard path of the conv-cycle-model skill (§2.42), kept equal to the
+skill script by a test — plus `CALL_OVERHEAD` (1 500 cycles) per call;
+the cheapest is compared with `cost_model.matmul_cycles`, a block model of
+MatmulKernel calibrated on the board (256³, the BERT linears, attention
+QKᵀ within 1–4 %).  The MatMul is lowered when the conv estimate is below
+0.9 × MatmulKernel's and the conv has at least one full 16-row output tile
+(`out_ch ≥ kTileM`; below that both kernels are dominated by fixed
+per-call costs).  `--matmul-on-conv always` lowers every eligible MatMul
+(tests), `--no-matmul-on-conv` / `off` none.  The CNN models' only
+MatMuls are batch-1 classifier FCs (`N = 1`), so their generated projects
+are byte-identical with and without the pass.
+
+**Batches** (`matmul_lowering._batch_mode`, always `outer_count == 1`):
+A shared and B batched → one call with ConvKernel's `batch` (its batch
+shares the weights); B shared and A batched → the batch folds into the rows
+(`out_ch = batch·N`, one call); both batched (attention, one weight matrix
+per head) → one call per item, `run_conv_at()` with element offsets, each
+waiting on `KERNEL_CONV` for the previous one; the last call is left in
+flight like any other start, so the event stream / liveness are unchanged.
+
+BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
+— the 72 encoder linears as 1×4 convs (`in_ch` 192 / 768, output 48×16 or
+192×16) and the 24 attention MatMuls as 12 per-head 1×1 calls each — in 360
+ConvKernel calls; the K = 2 token-type MatMul and the M = 2 span head stay
+on MatmulKernel.  Cost model at 100 MHz: 0.62 s of MatMul per inference
+against 8.37 s on MatmulKernel (the phase-1 board measured 8.41 s).
+Board results: BERT_PLAN §3.
+
 ---
 
 ## Weight layouts
@@ -426,7 +509,8 @@ image and `numel` / the `.dat` file / the DMA buffer follow it, while
 | Kernel | Tensor | Layout |
 |---|---|---|
 | ConvKernel | weight, bias | tile-major `[M][ceil(C/16)][kH][kW][lanes]`, bias padded to 8 (CONV_OPTIMISATION §2.32 / §2.34); a space-to-depth stem's re-indexed `<W>_s2d` initializer is packed the same way |
-| MatmulKernel | B (constant only) | tile-major `[ceil(M/16)][K][16]`, `b_packed = 1` on every consumer (MATMUL_OPTIMISATION §3b) |
+| MatmulKernel | B (constant only) | tile-major `[ceil(M/32)][K][32]`, `b_packed = 1` on every consumer (MATMUL_OPTIMISATION §3b, §8) |
+| ConvKernel (MatMul on ConvKernel) | B (constant, read only by that MatMul, `kw > 1`) | `x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p]` per batch slice ([§MatMul on ConvKernel](#matmul-on-convkernel)); A needs none |
 
 A MatMul B is packed only when every reader of the tensor is a MatMul
 using it as B with the same `(k, m)` (`OnnxGraph._pack_matmul_weights`);

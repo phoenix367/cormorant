@@ -27,6 +27,12 @@ Variants:
   bert_tiny_native.onnx      hidden 32, 2 heads, 1 layer,  seq 8,  native
                              LayerNormalization / Gelu(tanh) / Softmax(-1),
                              opset 20 (Split num_outputs)
+  bert_tiny_h128_s64.onnx    hidden 128, 2 heads, 1 layer, seq 64, opset 12 —
+                             large enough that the scheduler's default engine
+                             choice runs every linear and attention MatMul on
+                             ConvKernel (BERT_PLAN 2A): 1x2 kernels over the
+                             re-laid-out constant weights, and one ConvKernel
+                             call per head for QK^T / P.V
 
 Usage:  .venv/bin/python test/gen_bert_models.py [--out-dir test/models]
 """
@@ -50,6 +56,7 @@ VARIANTS = [
     ("bert_tiny_h64_l2.onnx", 64, 4, 2, 16, "tanh", "tf", 12),
     ("bert_tiny_erf.onnx", 32, 2, 1, 8, "erf", "tf", 13),
     ("bert_tiny_native.onnx", 32, 2, 1, 8, "tanh", "native", 20),
+    ("bert_tiny_h128_s64.onnx", 128, 2, 1, 64, "tanh", "tf", 12),
 ]
 VOCAB = 50
 EPS = np.float32(9.999999960041972e-13)          # bertsquad-12's epsilon

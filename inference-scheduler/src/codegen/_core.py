@@ -41,8 +41,8 @@ from __future__ import annotations
 from typing import List, Optional
 
 from ..graph   import OnnxGraph
-from ..nodes    import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
-                        SpaceToDepthNode, SchedulerError)
+from ..nodes    import (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
+                        ReshapeNode, SpaceToDepthNode, SchedulerError)
 from ..host_nodes import HostNode, SliceNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
@@ -182,8 +182,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
-                               HostNode)):
+            if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
+                               SpaceToDepthNode, HostNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -240,8 +240,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
-                               HostNode)):
+            if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
+                               SpaceToDepthNode, HostNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -306,6 +306,19 @@ class _CoreMixin:
                         f"is not supported. Use the Conv operator's built-in bias "
                         f"input (3rd Conv input) instead."
                     )
+            elif isinstance(sn, MatmulConvNode):
+                # A MatMul on ConvKernel reads A (weight) and B (x) and writes
+                # C (y) as dense row-major arrays; matmul_lowering admits only
+                # K % 16 == 0 and M % 8 == 0, so no broadcast consumer can
+                # give them an alignment-gapped layout.  Checked, not assumed.
+                for t in (sn.inputs[0], sn.inputs[1], sn.output):
+                    lay = layouts.get(t.onnx_name)
+                    if lay is not None and lay.n_chunks > 1 and lay.is_strided:
+                        raise SchedulerError(
+                            f"MatMul node [{sn.index}] runs on ConvKernel but "
+                            f"'{t.onnx_name}' got an alignment-gapped layout "
+                            f"(chunk {lay.chunk}, stride {lay.stride}); rerun with "
+                            f"--no-matmul-on-conv.")
             elif isinstance(sn, PoolNode):
                 lay = layouts.get(sn.output.onnx_name)
                 if lay is not None and lay.n_chunks > 1:
@@ -668,8 +681,9 @@ class _CoreMixin:
 
     @property
     def _has_conv_nodes(self) -> bool:
-        """True when the graph contains at least one ConvNode."""
-        return any(isinstance(sn, ConvNode) for sn in self._graph.nodes)
+        """True when the graph contains at least one ConvNode (or a MatMul
+        lowered onto ConvKernel)."""
+        return any(isinstance(sn, (ConvNode, MatmulConvNode)) for sn in self._graph.nodes)
 
     @property
     def _has_pool_nodes(self) -> bool:
@@ -854,8 +868,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
-                               HostNode)):
+            if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
+                               SpaceToDepthNode, HostNode)):
                 continue
             c_up = sn.output.c_name.upper()
             canonical[sn.output.onnx_name] = c_up
@@ -868,8 +882,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
-                               HostNode)):
+            if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
+                               SpaceToDepthNode, HostNode)):
                 continue
             if sn.output.onnx_name in canonical:
                 continue

@@ -44,6 +44,10 @@ Options:
   --driver-dir DIR           Copy XVectoropkernel driver sources from this path
   --embed-large-weights      Inline all weights as C arrays (skip .dat files)
   --embed-large-expected     Inline all GT arrays in test_inference.c
+  --matmul-on-conv {auto,always,off}
+                             Run MatMuls on ConvKernel with swapped operand roles
+                             (default auto: where the cost model says it is faster)
+  --no-matmul-on-conv        Same as --matmul-on-conv off
 ```
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
@@ -110,7 +114,10 @@ src/
   dtype.py               DataType abstraction (ap_fixed<W,I>, float32)
   layout.py              TensorLayout frozen dataclass (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo: metadata + C declaration emitters
-  nodes.py               ScheduledNode: ONNX op → VectorOPKernel call
+  nodes.py               ScheduledNode: ONNX op → VectorOPKernel call (+ MatmulNode,
+                         ConvNode, MatmulConvNode, PoolNode, ReshapeNode, …)
+  matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry)
+  cost_model.py          ConvKernel / MatmulKernel cycle estimates
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes; topological order,
                          predecessors/successors, independent-pair queries
@@ -186,6 +193,20 @@ batched matmul and row-strided decomposition for alignment-gapped buffers.
 
 **ConvNode** — ConvKernel: `Conv`. NCHW 2-D convolution with optional bias,
 configurable kernel/stride/pad/dilation. `groups=1` only.
+
+**MatmulConvNode** — ConvKernel: a `MatMul` lowered by
+`src/matmul_lowering.py` (`OnnxGraph(matmul_on_conv="auto")`, the default)
+with swapped operand roles: `C[N][M] = A[N][K]·B[K][M]` is a conv with
+`out_ch = N`, `in_ch = K/kw`, a `1×kw` kernel with stride `(1, kw)`, output
+`out_h × out_w = M`, A (row-major = the packed weight layout when
+`K % (16·kw) == 0`) as the weight and B as `x` (as is for `kw = 1`; a
+constant B read only by this MatMul is re-imaged by
+`nodes.conv_lowered_b_image` for `kw > 1`).  Engine and `(kw, out_w)` are
+chosen with `src/cost_model.py` (conv-cycle-model port vs a board-calibrated
+MatmulKernel model).  Batched MatMuls with per-item weights (attention)
+emit one `run_conv_at()` per item.  The simulator treats it exactly like a
+`MatmulNode` — the two kernels are bit-identical.  See
+`../doc/INFERENCE_SCHEDULER.md` §"MatMul on ConvKernel".
 
 **PoolNode** — PoolingKernel: `MaxPool`, `AveragePool`, `LpPool` (p=1 or 2),
 `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`. Full 2-D NCHW geometry

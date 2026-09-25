@@ -28,13 +28,15 @@ from typing import Union
 from .tensor import TensorInfo
 from .nodes  import (
     ACT_NONE, _pack_matmul_b, _s2d_stem_geometry, _s2d_stem_weight,
-    ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+    ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
+    SpaceToDepthNode,
     POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SPACE_TO_DEPTH_OP_TYPES,
     SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
 from ._conv_hw_config import CONV_TILE_IC
 from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
 from . import fusion
+from . import matmul_lowering
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
@@ -427,7 +429,8 @@ class OnnxGraph:
                  dtype: DataType = None,
                  fuse_act: bool = False,
                  s2d_stem: bool = False,
-                 fuse_patterns: bool = True) -> None:
+                 fuse_patterns: bool = True,
+                 matmul_on_conv="auto") -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -448,6 +451,15 @@ class OnnxGraph:
         that contain these patterns — every graph without a transformer
         block generates exactly as before.  ``self.fusion_counts`` reports
         ``{"layernorm", "gelu", "const_bcast"}``.
+
+        matmul_on_conv: run MatMuls on ConvKernel with swapped operand roles
+        where the engine cost model says it is faster (``matmul_lowering``,
+        doc/BERT_PLAN.md §2 2A).  "auto" (default, also ``True``), "always"
+        (every eligible MatMul) or "off" (``False``; CLI
+        ``--no-matmul-on-conv``).  Batch-1 FC layers — the only MatMuls of
+        the CNN models — are never eligible, so their projects are unchanged.
+        ``self.matmul_conv_stats`` reports ``{"lowered", "kept",
+        "conv_calls", "conv_cycles", "matmul_cycles"}``.
 
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
@@ -565,7 +577,8 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
-        self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode]] = []
+        self._nodes: List[Union[ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
+                                ReshapeNode, SpaceToDepthNode]] = []
         host_ctx = HostContext(opset=self.opset, consts=self._raw_consts)
         for idx, node in enumerate(graph.node):
             if node.op_type in HOST_OP_FACTORIES:
@@ -595,6 +608,10 @@ class OnnxGraph:
 
         self._check_integer_inputs()
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
+        self._nodes, self.matmul_conv_stats = matmul_lowering.lower_matmuls(
+            self._nodes, mode=matmul_on_conv,
+            is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
+            graph_io=self._input_names + self._output_names)
         self._pack_matmul_weights()
         self._choose_slice_views()
 
@@ -606,8 +623,8 @@ class OnnxGraph:
         """Integer tensors (ids, masks) hold raw integers, not Data_t values:
         only host ops and buffer aliases may read them."""
         for sn in self._nodes:
-            if not isinstance(sn, (ScheduledNode, MatmulNode, ConvNode, PoolNode,
-                                   SpaceToDepthNode)):
+            if not isinstance(sn, (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode,
+                                   PoolNode, SpaceToDepthNode)):
                 continue
             for t in sn.inputs:
                 if t.is_int and not t.is_weight:
@@ -764,7 +781,8 @@ class OnnxGraph:
             done.add(b.onnx_name)
 
     @property
-    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode]]:
+    def nodes(self) -> List[Union[ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
+                                  ReshapeNode, SpaceToDepthNode]]:
         return self._nodes
 
     @property

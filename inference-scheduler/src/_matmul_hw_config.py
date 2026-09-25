@@ -70,6 +70,7 @@ _DEFAULT_PLATFORM = "kv260"
 _REQUIRED: Tuple[Tuple[str, str], ...] = (
     ("max_k",  "MATMUL_MAX_K"),
     ("tile_m", "MATMUL_TILE_M"),   # packed-B tile width (MATMUL_OPTIMISATION §3b)
+    ("tile_n", "MATMUL_TILE_N"),   # row lanes — only the engine cost model uses it
 )
 
 
@@ -145,11 +146,13 @@ _CFG = resolve()
 # Exported constants — these are what `nodes.py` validates against.
 MATMUL_MAX_K : int = _CFG["MATMUL_MAX_K"]
 MATMUL_TILE_M: int = _CFG["MATMUL_TILE_M"]
+MATMUL_TILE_N: int = _CFG["MATMUL_TILE_N"]
 
 
 __all__ = (
     "MATMUL_MAX_K",
     "MATMUL_TILE_M",
+    "MATMUL_TILE_N",
     "MatmulHwConfigError",
     "resolve",
 )

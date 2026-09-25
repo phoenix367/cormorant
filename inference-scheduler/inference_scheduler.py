@@ -153,6 +153,27 @@ def parse_args(argv=None):
             "on by default; it only changes graphs that contain these patterns."
         ),
     )
+    p.add_argument(
+        "--matmul-on-conv",
+        dest="matmul_on_conv",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help=(
+            "Run MatMuls on ConvKernel with swapped operand roles (A = conv "
+            "weight, B = conv input, 1 x kw kernel with stride (1, kw); "
+            "doc/BERT_PLAN.md 2A): 'auto' (default) wherever the engine cost "
+            "model estimates ConvKernel faster than MatmulKernel, 'always' for "
+            "every eligible MatMul, 'off' for none.  Batch-1 FC layers never "
+            "qualify.  Bit-identical results either way."
+        ),
+    )
+    p.add_argument(
+        "--no-matmul-on-conv",
+        dest="matmul_on_conv",
+        action="store_const",
+        const="off",
+        help="Same as --matmul-on-conv off: every MatMul stays on MatmulKernel.",
+    )
     return p.parse_args(argv)
 
 
@@ -198,7 +219,8 @@ def main(argv=None):
     # ---------------------------------------------------------------- #
     try:
         graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
-                          fuse_patterns=args.fuse_patterns)
+                          fuse_patterns=args.fuse_patterns,
+                          matmul_on_conv=args.matmul_on_conv)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -227,6 +249,12 @@ def main(argv=None):
             f" {' x '.join(in_shapes)} -> {sn.output.shape}",
             file=sys.stderr,
         )
+    mc = graph.matmul_conv_stats
+    if mc["lowered"]:
+        print(f"MatMul->Conv: {mc['lowered']} MatMul(s) on ConvKernel "
+              f"({mc['conv_calls']} calls, est {mc['conv_cycles'] / 1e5:.1f} ms vs "
+              f"{mc['matmul_cycles'] / 1e5:.1f} ms on MatmulKernel @100 MHz), "
+              f"{mc['kept']} on MatmulKernel", file=sys.stderr)
     print(f"Output dir : {out_dir}", file=sys.stderr)
 
     # ---------------------------------------------------------------- #
