@@ -10,7 +10,7 @@ Status: **phase 1 done and merged to main (2026-09-26)** — scheduler side
 (1b–1f), demo (1g) and the `max_k` 4096 bitstream (1a); BERT-base
 runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
-Phase 2 (performance) open.
+Phase 2 (performance) in progress — 2A conv lowering, 2B host ops (§2).
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -75,18 +75,46 @@ tiny-BERT cases pass; BERT-base runs on the board with logits matching the
 simulation and EM/F1 matching the emulation on the demo set; latency
 measured.
 
-## 2. Phase 2 — performance (after phase 1 runs on the board)
+## 2. Phase 2 — performance (started 2026-09-26)
 
-Candidates, to be sized with the phase-1 per-layer profile:
-- Linears on ConvKernel as 1×1 convs in a feature-major activation layout
-  (Xᵀ [768][256]: every Gemm is a 1×1 conv with packed constant weights,
-  LayerNorm reduces over channels, per-head Q/K/V slices are contiguous);
-  needs `max_in_ch` ≥ 3072 or K-split.  ~21.7 GMAC at 15–40 GMAC/s.
-- Attention matmuls without host transposes: row-stride registers and a
-  transposed-B mode on MatmulKernel (removes all 48 Transposes).
-- Host ops multithreaded (4 × A53) and a cacheable buffer pool.
-- MatmulKernel B-stationary 4-row array (128 MACs/cycle) if attention
-  stays on it.
+Phase-1 board breakdown (12.13 s): MatMul linears 7.66 s, host GELU 2.05 s,
+host softmax 1.07 s, attention MatMuls 0.75 s, LayerNorm 0.34 s, host
+transposes 0.17 s, VectorOP 0.10 s.  Host ops move 127.5 MiB of BO data per
+inference through a non-cacheable mapping (~0.1–0.2 GB/s).
+
+**2A — MatMul on ConvKernel with swapped operand roles.**  For
+C[N][M] = A[N][K]·B[K][M]: conv `out_ch := N` (tokens), `in_ch := K/kw`,
+kernel 1×kw, stride (1, kw), output spatial := M (out_h × out_w), **conv
+weights := A** (row-major [N][K] *is* the packed tile-major
+`[N][ict][1][kw][16]` layout when K is a multiple of 16·kw), **conv input
+:= B** arranged `[K/kw][out_h][kw·out_w]` (free at codegen for constant B;
+kw = 1 is B's natural row-major layout, used for activation×activation
+attention).  Output = C row-major.  Activations stay row-major as in the
+ONNX graph; the Gemm bias stays a VectorOP Add; both kernels accumulate
+exactly in `ap_fixed<32,16>` and floor + saturate the same way, so results
+stay **bit-identical** with phase 1.  Batch-1 FC layers (N = 1) stay on
+MatmulKernel.  Cycle model (§2.42 kernel, 100 MHz), per call:
+
+| layer | mapping | model | MatmulKernel today |
+|---|---|---:|---:|
+| Q/K/V/out 768→768 | C=384 M=256, 1×2 s2, out 12×64 | 2.56 ms (79 % MAC) | ~53 ms |
+| FFN up 768→3072 | C=384 M=256, out 48×64 | 10.2 ms | ~212 ms |
+| FFN down 3072→768 | C=1024 M=256, 1×3 s3 | 11.3 ms (C=1536 1×2: 9.5 ms, needs max_in_ch 2048) | ~212 ms |
+| QKᵀ per head | C=64 M=256, 1×1, out 4×64 | 0.21 ms | ~2.6 ms |
+| P·V per head | C=256 M=256, 1×1, out 1×64 | 0.15 ms | ~1.5 ms |
+
+→ linears ≈ 0.38 s, attention ≈ 0.05 s per inference (from 8.4 s).
+
+**2B — host ops.**  Cacheable buffer pool (the generated code already
+syncs at every CPU↔kernel hand-off); 65 536-entry GELU table and a Softmax
+`exp` table indexed by the 16-bit input / the exact 1/256-grid argument
+(filled at init with the same double formula → bit-identical); rows split
+over the 4 A53 cores (per-row arithmetic unchanged → bit-identical).
+
+**Later:** row-stride / transposed-B MatmulKernel modes or conv-friendly
+transposes (host transposes are ~0.17 s now, less once memory is
+cacheable); GELU fused into the conv drain; KV-cache / step graphs for
+autoregressive decoders (a different, bandwidth-bound problem).
 
 ## 3. Measured outcome
 
