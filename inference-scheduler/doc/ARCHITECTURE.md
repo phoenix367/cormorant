@@ -96,6 +96,12 @@ src/
                            ConvNode      (ConvKernel: Conv)
                            PoolNode      (PoolingKernel: MaxPool/AveragePool/LpPool/Global*)
                            ReshapeNode   (buffer alias — no hardware call)
+                           SpaceToDepthNode (host-CPU reorder)
+  host_nodes.py          HostNode family — ops run on the CPU inside inference_run():
+                           Softmax, LayerNorm, Gelu, Transpose, Slice (Split), Gather,
+                           OneHot, Cast; numpy reference + C helper library side by side
+  fusion.py              ONNX passes: Constant folding, Split lowering, LayerNorm / GELU
+                           pattern fusion, VectorOP constant-broadcast normalisation
   graph.py               OnnxGraph — ONNX loading, shape inference, Gemm preprocessing, node dispatch
   codegen/
     __init__.py          CodeGenerator class (assembles all mixins via MRO)

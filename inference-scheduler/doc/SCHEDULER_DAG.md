@@ -112,8 +112,8 @@ The codegen emits a linear stream of events into `inference_run()`:
 ('start_sync', node_idx)            # blocking helper (run_matmul_at loop)
 ('wait',       kid, drained_idx)    # kernel_wait(KERNEL_*) drains a node
 ('drain',      kid, drained_idx)    # final drain before output cache sync
-('reshape',    node_idx)            # ReshapeNode (no kernel work)
-('cpu',        node_idx)            # SpaceToDepthNode: host loop, synchronous
+('reshape',    node_idx)            # ReshapeNode / Slice view (no work)
+('cpu',        node_idx)            # SpaceToDepthNode / HostNode: host code, synchronous
 ```
 
 The walker keeps `pending: dict[lane → node_idx]`: which node has been
@@ -356,6 +356,14 @@ runs inline, and is never waited on.  Its `start_event` and `drain_event`
 are the same index (§5), so the tensor it reads is held until the loop
 runs and the tensor it writes becomes live at the same event — the two
 never share a pool slot.
+
+Every other host-CPU node (`HostNode`: Softmax, LayerNorm, Gelu,
+Transpose, Slice copies, Gather, OneHot, Cast — `src/host_nodes.py`) is
+treated exactly the same way.  A `SliceNode` emitted as a zero-cost
+sub-buffer view instead behaves like a `ReshapeNode`: a `('reshape', idx)`
+event, and predecessor analysis / liveness walk through it to the buffer
+that owns the memory (`_alias_source_map`), so the view's consumers keep
+that root buffer alive.
 
 ---
 

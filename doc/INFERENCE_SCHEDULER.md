@@ -36,7 +36,14 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   it; `OnnxGraph.act_fused_count` reports the number folded).  A `Relu`
   after a Conv / MatMul / Pool node or on a graph input stays a call.
 
-**Host-side transformation (CPU loop, no hardware call):**
+**Host-CPU ops (C code inside `inference_run()`, no hardware call):**
+- **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Gather,
+  OneHot, Cast** — `src/host_nodes.py`, see [§Host-CPU ops](#host-cpu-ops)
+  below.  TensorFlow-style LayerNorm and GELU (tanh / erf) subgraphs are
+  fused into single host nodes first ([§Pattern fusion](#pattern-fusion));
+  integer tensors (token ids, masks) are supported as raw int16
+  ([§Integer tensors](#integer-tensors)).  This is what makes BERT-base
+  (bertsquad-12) schedulable — [`BERT_PLAN.md`](BERT_PLAN.md).
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -73,6 +80,7 @@ python3 -m venv .venv
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
 .venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
+.venv/bin/python test/gen_bert_models.py        # tiny BERT-like models (host ops, fusion)
 
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
@@ -96,6 +104,12 @@ inference_scheduler.py          CLI, argument parsing
     │                           ConvNode       (ConvKernel)
     │                           PoolNode       (PoolingKernel)
     │                           ReshapeNode    (buffer alias)
+    │                           SpaceToDepthNode (host reorder)
+    ├── host_nodes.py           HostNode family (Softmax, LayerNorm, Gelu,
+    │                           Transpose, Slice, Gather, OneHot, Cast):
+    │                           numpy reference + C helper library
+    ├── fusion.py               Constant folding, Split lowering, LayerNorm /
+    │                           GELU fusion, constant-broadcast normalisation
     ├── schedule.py Dag         data-flow DAG: predecessors, successors,
     │                           topological order, independent pairs
     └── codegen/    CodeGenerator
@@ -112,16 +126,24 @@ inference_scheduler.py          CLI, argument parsing
 
 1. `onnx.load()` + `onnx.checker.check_model()` — structural validation.
 2. `shape_inference.infer_shapes()` — fills intermediate tensor shapes.
-3. `_preprocess_model()` — rewrites `Gemm` → `MatMul` + optional `Add`.
-4. Build tensor registry (weights, inputs, intermediates, outputs).
-5. Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` / `ReshapeNode`
-   / `ScheduledNode` based on `op_type`.
-6. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
+3. `fusion.fold_constant_nodes()` — `Constant` nodes become initializers.
+4. `_preprocess_model()` — rewrites `Gemm` → `MatMul` + optional `Add`.
+5. `fusion.lower_split()` — `Split` becomes one `Slice` per output.
+6. `_space_to_depth_stems()` (when `s2d_stem=True`, see below).
+7. `fusion.fuse_patterns()` (when `fuse_patterns=True`, the default) —
+   LayerNorm / GELU fusion and VectorOP constant-broadcast normalisation.
+8. Build tensor registry (weights, inputs, intermediates, outputs).
+9. Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` / `ReshapeNode`
+   / `ScheduledNode` / a host node (`host_nodes.HOST_OP_FACTORIES`) based on
+   `op_type`; kernel nodes reading an integer tensor are rejected.
+10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
    into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
    re-pointed) and renumbers node indices.
+11. `_pack_matmul_weights()`, then `_choose_slice_views()` (contiguous
+   Slice pieces that may alias their source).
 
-`_space_to_depth_stems()` (when `s2d_stem=True`) runs between steps 3 and
-4, on the ONNX model like the Gemm rewrite: it inserts the `SpaceToDepth`
+`_space_to_depth_stems()` (when `s2d_stem=True`) runs on the ONNX model
+like the Gemm rewrite: it inserts the `SpaceToDepth`
 node, appends the `<W>_s2d` initializer and replaces the Conv, so the
 tensor registry, `ConvNode` validation / weight packing and the report see
 an ordinary graph.
@@ -185,8 +207,9 @@ chain still drains the Pool lane before MatMul reads the alias.
   every still-pending lane, and invalidates all graph outputs at the bottom.
   Internal intermediate buffers are never synced — the PL kernels access
   DDR directly via their AXI master ports — except around a host op
-  (`SpaceToDepthNode`), which invalidates a kernel-written source before
-  reading it and flushes its own output before the consuming kernel starts.
+  (`SpaceToDepthNode`, `HostNode`), which invalidates a kernel-written
+  source before reading it and flushes its own output before the consuming
+  kernel starts.
 - Weights are synced once at init; they never change.
 
 ### Space-to-depth stem
@@ -262,6 +285,135 @@ reorders `stage_in → stage_out` entirely in cached memory, `memcpy(stage_out
 → BO)` and then `inference_buf_sync_to_device(out)` — the only DMA-memory
 traffic is two wide sequential copies (~0.1–0.3 ms for 300 KB).
 
+### Host-CPU ops
+
+`src/host_nodes.py`.  Ops no PL kernel implements run on the A53 inside
+`inference_run()`:
+
+| ONNX op | Node | Semantics / restrictions |
+|---|---|---|
+| `Softmax` | `SoftmaxNode` | opset ≥ 13: last axis only; opset < 13: "coerce to 2-D", i.e. rows of `prod(shape[axis:])` (BERT's `axis = 3` on rank 4 is the last axis) |
+| `LayerNormalization` | `LayerNormNode` | over `prod(shape[axis:])`; scale / bias must be constants (kept float32, emitted as C arrays, never DMA weights); only the `Y` output |
+| `Gelu` | `GeluNode` | `approximate = "tanh"` / `"none"` (erf) |
+| `Transpose` | `TransposeNode` | any perm, ≤ 5 non-mergeable dims |
+| `Slice` (and every `Split` output) | `SliceNode` | constant starts / ends / axes, positive steps; zero-cost view when possible (below) |
+| `Gather` | `GatherNode` | axis 0, runtime integer indices, any table (a constant table stays a DMA weight; rows are copied straight out of it, one memcpy per row).  Negative indices count from the end; an index still outside `[0, rows)` is **clamped** (ONNX leaves it undefined) |
+| `OneHot` | `OneHotNode` | axis −1, runtime integer indices, constant depth and `[off, on]`; out-of-range index → all-off row |
+| `Cast` | `CastNode` | integer → Data_t, Data_t → integer (truncate toward zero), → bool; a cast within one storage kind (float → float, int → int) is a zero-cost `ReshapeNode` alias |
+
+**Numeric contract** (the generated C and `HostNode.reference()`, which
+`_simulate` runs, implement the same operations in the same order):
+
+- inputs are read as double — Data_t via `host_ld` (`(int16_t)bits / 256.0`,
+  exact), integer tensors via `host_ld_int` (raw int16);
+- all arithmetic in IEEE double; reductions accumulate left to right
+  (`np.cumsum` in the simulator); the host section of `inference.c` starts
+  with `#pragma GCC optimize ("fp-contract=off")` (GNU C modes otherwise
+  fuse `a*b + c` into an FMA on the A53) and CMake adds `-ffp-contract=off`;
+- `exp` / `tanh` / `erf` come from libm; the simulator calls Python's
+  `math` module — the platform's glibc — elementwise, not numpy: `np.tanh`
+  differs from glibc's `tanh` by up to 3 ulp on ~26 % of inputs (numpy 2.x),
+  and `np.exp` switches to SVML on AVX-512 hosts;
+- outputs are written back with `host_st`: `nearbyint(v * 256)` under the
+  default FE_TONEAREST mode — **round half to even**, identical to numpy's
+  `np.round` — then saturation to `[-128, 127.996]`; NaN → 0.  Integer
+  outputs use `host_st_int` (truncate toward zero, saturate to int16);
+- formulas: Softmax `exp(x − max) / Σ exp(x − max)`; LayerNorm TF form
+  (fused BERT pattern) `g = gamma / sqrt(var + eps)`,
+  `y = x·g + (beta − mean·g)`, ONNX form `(x − mean)·inv·gamma + beta`, with
+  `mean = Σx/n`, `var = Σ(x − mean)²/n`; GELU tanh
+  `x·(0.5·(1 + tanh(c2·(x + c1·x³))))`, erf `x·(0.5·(1 + erf(x/k)))` with the
+  constants found in the graph (native `Gelu`: exact `√(2/π)`, `0.044715`,
+  `√2`).
+
+Kernel ops keep their semantics (products / sums exact, AP_TRN floor +
+AP_SAT on the output), so a model's data path mixes floor (kernels) and
+round-half-even (host) write-backs; the BERT study's `sched` policy emulates
+exactly this mix.
+
+**Staging.**  On the KV260 the buffer pool is an XRT BO mapped
+non-cacheable (a strided 2-byte read costs ~100 ns).  Every host op does one
+wide `memcpy` per input from the BO into `s_host_stage` — a malloc'd
+(cached) arena shared by all host ops, since they run one at a time — then
+computes stage → stage and copies the result back with one `memcpy`
+followed by `inference_buf_sync_to_device()`; a kernel-written input is
+invalidated (`inference_buf_sync_from_device`) first.  `host_load` /
+`host_store` also compact / re-expand an advancing-strided layout (a
+broadcast VectorOP neighbour with an unaligned chunk), e.g. BERT's
+`[256, 2]` logits (chunk 2, stride 8) before the final Transpose.  Gather
+copies whole table rows straight from the (weight) BO instead.  The arena
+is sized to the largest op (BERT-base: 1 573 888 elements, 3 MiB — a
+softmax input + output + one row of doubles).
+
+**Scheduling.**  Like `SpaceToDepthNode`: no lane, one synchronous
+`('cpu', idx)` event that first waits for in-flight producers, liveness
+interval that starts and ends at that event (so its output never shares a
+pool slot with its input), profiled with `INFERENCE_PROF_BEGIN/END`.  Host
+ops run in graph order; kernel work that does not depend on them is not
+yet hoisted around them (phase-2 item).
+
+**Slice views.**  `OnnxGraph._choose_slice_views` turns a `Slice` piece
+into a zero-cost `inference_buf_init_view()` of its source (set up once in
+`inference_init()`, no pool slot, liveness through the root like a Reshape
+alias) when the piece is contiguous, its byte offset is a multiple of 64,
+the source's root buffer is an internal pool buffer (not a graph input /
+weight / output and not redirected to a graph output at run time), and the
+piece itself never reaches a graph output.  The codegen demotes a view to
+a host copy when a broadcast consumer gives the piece or its root a strided
+layout.  BERT's final `Split` feeds the graph outputs, so it is copied.
+
+### Pattern fusion
+
+`src/fusion.py`, `OnnxGraph(fuse_patterns=True)` — ON by default in the
+library and the CLI (`--no-fuse-patterns`); it only changes graphs that
+contain these patterns (all 147 generatable existing test models produce
+byte-identical projects).  Matching is structural — producer / consumer
+links, op types and constant values — never node names; every
+intermediate of a match must have no consumer outside it and must not be a
+graph output.
+
+| Pattern | Matched arrangement | Fused to |
+|---|---|---|
+| TF LayerNorm (bertsquad-12, 12 nodes) | `mean = ReduceMean(x, last, keepdims)`, `d = Sub(x, mean)`, `Mul(d, d)` \| `Pow(d, 2)`, `ReduceMean`, `Add(eps)`, `Sqrt`, `Reciprocal` \| `Div(1, ·)`, `g = Mul(inv, gamma)`, `Mul(mean, g)`, `Sub(beta, ·)`, `Mul(x, g)`, `Add` — commutative operands in any order, gamma / beta constant `[n]`, eps constant scalar | `LayerNormalization` (TF form) |
+| GELU tanh (BERT, 8 nodes) | `Pow(x, 3)` \| `x·(x·x)`, `Mul(c1≈0.044715)`, `Add(x)`, `Mul(c2≈√(2/π))`, `Tanh`, `Add(1)`, then `x·(0.5·a)` \| `(x·a)·0.5` \| `(x·0.5)·a` | `Gelu(approximate="tanh")` with the graph's c1 / c2 |
+| GELU erf (PyTorch export) | `Div(x, k≈√2)` \| `Mul(x, k≈1/√2)`, `Erf`, `Add(1)`, then the same three tails | `Gelu(approximate="none")` with the graph's k |
+| native `LayerNormalization` / `Gelu` | — | dispatched directly (ONNX form / exact constants) |
+
+Constants are compared with a relative tolerance of 1e-5 (c1, c2, k) or
+exactly (0.5, 1, 2, 3).  A near miss is left alone and its `ReduceMean` /
+`Pow` / `Sqrt` / `Reciprocal` / `Tanh` / `Erf` fails node dispatch with a
+hint (lowering them op by op would saturate Q8.8: x² and x³ overflow at
+|x| ≥ 11.3 / 5.04).  Because the fused nodes carry the graph's float32
+constants and evaluate the graph's own formula in double, a fused region
+computes exactly what the subgraph computes op by op in float64
+(`test/test_fusion.py` checks it bit for bit).
+
+**Constant broadcast normalisation** (same flag; values unchanged):
+a scalar constant operand of a VectorOP `Add` / `Sub` / `Mul` / `Div` on a
+tensor whose last dim L is a multiple of 8 and ≤ 2048 becomes an `[L]`
+vector — one repeating chunk of L instead of L one-element chunks at
+stride 8 (BERT's ×1/8 score scale, `1 − mask`, `× −10000`); and when the
+runtime operand is itself broadcast (the kernel repeats one side only), a
+constant the kernel cannot broadcast is pre-broadcast to the output shape
+(BERT's `ones[1,S,1] · mask[1,1,S]`).  VectorOP's broadcast rule also
+treats size-1 output dims as neutral now, so `[1,1,S,S]` onto `[1,H,S,S]`
+(the attention mask) is a plain repeating chunk.
+
+### Integer tensors
+
+Integer / bool ONNX tensors (`TensorInfo.is_int`) — BERT's `input_ids`,
+`segment_ids`, `input_mask`, `unique_ids` — are stored in `inference_buf_t`
+as **raw signed integers** of the element width (`int16_t` for
+ap_fixed<16,8>, i.e. `(Data_t)(int16_t)id`), not in the fixed-point
+encoding; values must fit (a 30 522-entry vocabulary does).  The generated
+`inference.h` lists them.  Only host ops (Gather, OneHot, Cast, data
+movement) and buffer aliases may read them; a kernel node reading one is
+rejected ("must go through a Cast").  `Identity` of an integer input to an
+output is a copy (`unique_ids` passthrough).  The generated test harness
+fills an integer input with `p[i] = i % R` — R the smallest Gather table /
+OneHot depth that reads it, else 2 (a 0/1 mask) — and compares integer
+outputs exactly (printed with `%d`).
+
 ---
 
 ## Weight layouts
@@ -306,7 +458,21 @@ int  inference_init(const char *vectoropkernel_instance
                     [, const char *convkernel_instance]
                     [, const char *poolkernel_instance]);
 
-// All graph inputs, then all graph outputs:
+// All graph inputs, then all graph outputs (integer tensors hold raw int16):
 void inference_run(inference_buf_t *<input...>, inference_buf_t *<output...>);
 void inference_deinit(void);
+```
+
+BERT-base (`bertsquad-12-simplified.onnx`) for example:
+
+```c
+int  inference_init(const char *vectoropkernel_instance,
+                    const char *matmulkernel_instance);
+void inference_run(inference_buf_t *unique_ids_raw_output_9_0,   /* int64 [1]      */
+                   inference_buf_t *segment_ids_0,               /* int64 [1, 256] */
+                   inference_buf_t *input_mask_0,                /* int64 [1, 256] */
+                   inference_buf_t *input_ids_0,                 /* int64 [1, 256] */
+                   inference_buf_t *unstack_1,                   /* end logits   [1, 256] */
+                   inference_buf_t *unstack_0,                   /* start logits [1, 256] */
+                   inference_buf_t *unique_ids_0);               /* int64 [1]      */
 ```

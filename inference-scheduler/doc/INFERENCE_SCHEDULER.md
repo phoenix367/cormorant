@@ -167,6 +167,8 @@ python3 -m venv .venv
 .venv/bin/python test/gen_pool_models.py              # Pooling models
 .venv/bin/python test/gen_reshape_gemm_models.py      # Reshape + Gemm models
 .venv/bin/python test/gen_mixed_all_kernels_models.py # All-kernel combination models
+.venv/bin/python test/gen_parallel_models.py          # Parallel + NOP corner cases
+.venv/bin/python test/gen_bert_models.py              # Tiny BERT-like models (host ops)
 ```
 
 Dependencies (from `requirements.txt`): `onnx`, `numpy`, `paramiko`
@@ -191,6 +193,7 @@ python inference_scheduler.py <model.onnx> [options]
 | `--embed-large-weights` | off | Inline all weight tensors as C arrays, even those exceeding the 4096-element threshold that would normally be written to external `.dat` files. |
 | `--embed-large-expected` | off | Inline all GT expected arrays in `test_inference.c` instead of writing them to `expected/*.dat` files. |
 | `--no-report` | off | Skip writing `report.md`. Default is to always emit a human-readable model summary alongside the C project — see [§11](#11-generated-report-reportmd). |
+| `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
 
 ### Examples
 

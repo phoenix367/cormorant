@@ -109,8 +109,9 @@ emits a complete C project that drives up to four hardware kernels:
 | MatmulKernel | `MatMul` |
 | ConvKernel | `Conv` |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
-| (zero-cost) | `Reshape` (buffer alias), `Gemm` (decomposed → MatMul + Add) |
+| (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
 | (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
+| (host CPU) | `Softmax` (last axis; opset < 13 coerce-to-2-D), `LayerNormalization`, `Gelu` (tanh / erf), `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0, int ids), `OneHot`, `Cast` (int ↔ Data_t) — `src/host_nodes.py`: double math, round-half-even + saturate write-back, staged through cached memory.  TF-style LayerNorm and GELU tanh / erf subgraphs are fused into single host nodes by `src/fusion.py` (`OnnxGraph(fuse_patterns=True)`, library + CLI default); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` / `Tanh` / `Erf` is rejected.  Integer tensors (ids, masks) are raw int16 in `inference_buf_t`.  BERT-base (bertsquad-12) generates — see `doc/BERT_PLAN.md` |
 
 ```bash
 cd inference-scheduler
@@ -124,11 +125,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_pool_models.py
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
+.venv/bin/python test/gen_parallel_models.py
+.venv/bin/python test/gen_bert_models.py      # tiny BERT-like fixtures (host ops, fusion)
 
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
 
-# Run all tests (1350 tests)
+# Run all tests (1400 tests; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -136,6 +139,8 @@ Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
 - **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `PoolNode`, `ReshapeNode`
+- **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side
+- **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations
 - **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (predecessors, topological order, independent pairs)
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake)
