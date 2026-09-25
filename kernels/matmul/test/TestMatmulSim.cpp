@@ -599,6 +599,28 @@ int main(int argc, char** argv) {
     run(RunTestBatch("batch=4, B broadcasts  [B packed, b_stride=0]",
                      5, 64, 19, 4, 5 * 64, 0, kSeed, 1u));
 
+    // K-split across lanes (MATMUL_OPTIMISATION.md §5): n_valid < kTileN
+    // splits K over 4 / 2 lanes per row with a tail guard.  Geometries chosen
+    // so k_valid is not a multiple of lanes_per_row and K spans two tiles.
+    run(RunTest2D("1 x 261 x 19  [K-split n=1]",                 1, 261, 19));
+    run(RunTest2D("1 x 261 x 19  [B packed, K-split n=1]",       1, 261, 19, kSeed, 1u));
+    run(RunTest2D("2 x 13 x 5  [K-split n=2]",                   2, 13, 5));
+    run(RunTest2D("2 x 13 x 5  [B packed, K-split n=2]",         2, 13, 5, kSeed, 1u));
+    run(RunTest2D("3 x 517 x 33  [K-split n=3, multi-tile]",     3, 517, 33));
+    run(RunTest2D("3 x 517 x 33  [B packed, K-split n=3]",       3, 517, 33, kSeed, 1u));
+
+    // b_tile prefetch (MATMUL_OPTIMISATION.md §7): the next block's cursor
+    // crosses k_tile, m_tile, n_tile and batch boundaries (k_tiles = 3,
+    // m_tiles = 3, n_tiles = 2, batch = 3), with and without B broadcast.
+    run(RunTestBatch("batch=3, 6 x 517 x 35  [prefetch crosses tiles]",
+                     6, 517, 35, 3, 6 * 517, 517 * 35));
+    run(RunTestBatch("batch=3, 6 x 517 x 35  [B packed, prefetch crosses tiles]",
+                     6, 517, 35, 3, 6 * 517, 517 * 35, kSeed, 1u));
+    run(RunTestBatch("batch=3, 6 x 517 x 35, B broadcasts (b_stride=0)",
+                     6, 517, 35, 3, 6 * 517, 0));
+    run(RunTestBatch("batch=3, 6 x 517 x 35, B broadcasts  [B packed, b_stride=0]",
+                     6, 517, 35, 3, 6 * 517, 0, kSeed, 1u));
+
     run(RunTestSaturation("sat_pos: a=100, b=100, K=3  → AP_MAX",
                            100.0, 100.0, 3, kSatMax));
     run(RunTestSaturation("sat_neg: a=100, b=-100, K=3 → AP_MIN",

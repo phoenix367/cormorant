@@ -219,7 +219,140 @@ scheduler-packed tile-major B layout for constant weights would turn a
 
 ---
 
-## 4. Verification matrix
+## 4. 16×16 MAC, batched A-row requests, B-resident fast path (Track A1, 2026-09-25)
+
+Track A of `doc/THROUGHPUT_PLAN.md` starts here.  Every step of the track
+is measured against the §3b kernel on the kv260 RTL stand, with the fixture
+list extended first (this step) from 29 to 39 cases: the K-split geometries
+of §5 (`1×261×19`, `2×13×5`, `3×517×33`, each row-major and packed) and the
+prefetch geometries of §7 (`6×517×35` batch 3 with `k_tiles = 3`,
+`m_tiles = 3`, `n_tiles = 2`, with and without B broadcast, each layout).
+The "before" column of every table in §4–§7 is the **unchanged §3b kernel
+run on the 39-case list** (its exported IP was kept and re-run on the new
+fixtures), so the new cases have a real baseline too.
+
+**Problem.**  Three small inefficiencies of the §3b kernel, none of them
+visible on the shipped models but all in the way of the later steps:
+
+- the K-loop multiplied `AccData_t(a) * AccData_t(b)` — a 32×32 multiply
+  per column, 2 DSP48 each (51 DSP in the design, 32 in the K-loop);
+- the `kTileN` A rows of an n_tile were requested and drained one row at
+  a time, so each row paid the full DDR round trip (`num_read_outstanding
+  = 4` allowed all four in flight);
+- when B is a single `(m_tile, k_tile)` block (`m ≤ 16`, `k ≤ 256` — every
+  depthwise-as-matmul and small-FC shape) it was reloaded for every n_tile
+  of every batch slice.
+
+**Change.**
+
+- `acc[n1][m1] += a_val * b_tile[..]` with `Data_t × Data_t` operands.
+  For `ap_fixed<16,8>` the product type *is* `ap_fixed<32,16>` — exact,
+  no rounding — so accumulating it into `AccData_t` is bit-identical to
+  widening first (C-sim bit-exact on all 39 cases) and costs one 16×16
+  DSP per column: DSP **51 → 38** (K-loop 32 → 16).
+- The A-row loader issues the requests of as many rows as fit in the
+  `kAReqOutstanding = 4` window (a row is ≤ 257 words, i.e. one or two
+  ≤ 256-word requests; `static_assert` that one row always fits) *before*
+  draining any of them, then drains them in order.  Issuing more than the
+  window holds would stall the adapter before the first drain — a deadlock
+  in this sequential loop — hence the explicit window.
+- `b_resident = (m_tiles == 1 && k_tiles == 1)`: the block is loaded at
+  the first n_tile of a batch slice only, and with `b_batch_stride == 0`
+  once per call.  The B loader moved into `load_b_tile()` (inlined).
+
+**Traps hit.**  Calling the inlined `load_b_tile()` from two sites (the
+fast path before the n_tile loop and the normal site in the k_tile loop)
+made HLS instantiate its row-major scatter twice: LUT **44.3 k → 63.6 k**.
+Folding the fast-path condition into the single call site
+(`load_b = !b_resident || (n_tile == 0 && (bi == 0 || b_batch_stride))`)
+restored 43.4 k.  Lesson for the rest of the track: the scatter loops are
+the kernel's LUT budget; never give them a second call site.
+
+**Test-stand artifact found by the new fixtures.**  In the 39-case
+*sequence* the new row-major case `batch=3, 6×517×35` fails — on the §3b
+kernel and on every kernel of this track alike, with byte-identical wrong
+outputs (6/630, all in column 12 of batch 2) — while each of them passes
+the same case run alone, and C-sim is exact.  The wrong outputs are
+reproduced exactly by replacing one B element, `B[392][12]` of batch 2
+(element 49 922, DDR address `0x1002CEC4`), with **the last C element of
+the preceding test** (`C[98] = −388` of `3×517×33 packed`, whose C region
+ends at that address): the DDR model of the stand commits the kernel's
+final partial-strobe C write late enough that the next test's backdoor
+`write_mem` of B at the same address is overwritten by it.  A kernel
+cannot cause this (it reads what the model returns).  A 20 µs settle
+between tests did not help (the commit is triggered by later activity,
+not time); `matmul_tb.sv` now alternates the DDR base address between
+consecutive tests so a test's inputs never occupy addresses the previous
+kernel wrote (test-stand commit after §7).  The coordinator should know
+the stand has this hazard whenever one test's C region overlaps the next
+test's inputs.  The case is reported as FAIL in the §4–§7 tables (runs
+made before the fix); its timing is valid.
+
+**Result (RTL, 39 cases; before = §3b kernel).**
+
+| # | Test | n×k×m×batch | B | before | after | Δ |
+|--:|---|---|---|---:|---:|---:|
+| 0 | 1x1x1 | 1×1×1×1 | row-major | 6,065 | 6,095 | +0.5 % |
+| 1 | TileN x TileK x TileM | 4×256×16×1 | row-major | 43,470 | 41,830 | -3.8 % |
+| 2 | 2 TileN x TileK x TileM | 8×256×16×1 | row-major | 83,300 | 56,450 | -32.2 % |
+| 3 | TileN x 2 TileK x TileM | 4×512×16×1 | row-major | 78,050 | 76,410 | -2.1 % |
+| 4 | TileN x TileK x 2 TileM | 4×256×32×1 | row-major | 79,340 | 77,700 | -2.1 % |
+| 5 | TileN 2 x TileK x TileM partial N | 6×256×16×1 | row-major | 80,470 | 54,760 | -31.9 % |
+| 6 | TileN x TileK 5 x TileM partial K | 4×261×16×1 | row-major | 44,740 | 43,040 | -3.8 % |
+| 7 | TileN x TileK x TileM 3  partial M | 4×256×19×1 | row-major | 79,050 | 77,410 | -2.1 % |
+| 8 | TileN 2 x TileK 5 x TileM 3  all partial | 6×261×19×1 | row-major | 154,890 | 152,630 | -1.5 % |
+| 9 | 7 x 13 x 5 arbitrary small | 7×13×5×1 | row-major | 15,280 | 11,520 | -24.6 % |
+| 10 | N x 1 x M K 1 outer product | 5×1×17×1 | row-major | 13,200 | 11,760 | -10.9 % |
+| 11 | 1 x K x M N 1 row vector | 1×256×16×1 | row-major | 38,920 | 38,920 | +0.0 % |
+| 12 | N x K x 1 M 1 column vector | 4×256×1×1 | row-major | 40,830 | 39,160 | -4.1 % |
+| 13 | 3 TileN x 2 TileK 7 x 2 TileM 1  multi-tile all | 12×519×33×1 | row-major | 663,790 | 658,530 | -0.8 % |
+| 14 | batch 3 no broadcast | 5×64×19×3 | row-major | 129,960 | 125,050 | -3.8 % |
+| 15 | batch 4 A broadcasts a stride 0 | 5×64×19×4 | row-major | 172,390 | 165,940 | -3.7 % |
+| 16 | batch 4 B broadcasts b stride 0 | 5×64×19×4 | row-major | 172,290 | 165,730 | -3.8 % |
+| 17 | batch 6 both strided multi-dim flat | 5×64×19×6 | row-major | 256,650 | 246,850 | -3.8 % |
+| 18 | TileN x TileK x TileM B packed | 4×256×16×1 | packed | 25,760 | 24,090 | -6.5 % |
+| 19 | TileN 2 x TileK 5 x TileM 3  B packed all partial | 6×261×19×1 | packed | 81,760 | 79,510 | -2.8 % |
+| 20 | 7 x 13 x 5 B packed arbitrary small | 7×13×5×1 | packed | 14,310 | 11,060 | -22.7 % |
+| 21 | 1 x K x M B packed N 1 row vector | 1×256×16×1 | packed | 20,840 | 20,900 | +0.3 % |
+| 22 | N x K x 1 B packed M 1 | 4×256×1×1 | packed | 24,310 | 22,680 | -6.7 % |
+| 23 | 3 TileN x 2 TileK 7 x 2 TileM 1  B packed multi-tile | 12×519×33×1 | packed | 331,280 | 326,020 | -1.6 % |
+| 24 | 1 x 2 TileK x 4 TileM B packed FC-like | 1×512×64×1 | packed | 135,400 | 135,350 | -0.0 % |
+| 25 | batch 3 no broadcast B packed | 5×64×19×3 | packed | 80,690 | 75,780 | -6.1 % |
+| 26 | batch 4 B broadcasts B packed b stride 0 | 5×64×19×4 | packed | 106,750 | 100,230 | -6.1 % |
+| 27 | 1 x 261 x 19 K-split n 1 | 1×261×19×1 | row-major | 76,670 | 76,660 | -0.0 % |
+| 28 | 1 x 261 x 19 B packed K-split n 1 | 1×261×19×1 | packed | 39,910 | 39,920 | +0.0 % |
+| 29 | 2 x 13 x 5 K-split n 2 | 2×13×5×1 | row-major | 8,440 | 7,960 | -5.7 % |
+| 30 | 2 x 13 x 5 B packed K-split n 2 | 2×13×5×1 | packed | 7,420 | 6,990 | -5.8 % |
+| 31 | 3 x 517 x 33 K-split n 3 multi-tile | 3×517×33×1 | row-major | 221,060 | 219,870 | -0.5 % |
+| 32 | 3 x 517 x 33 B packed K-split n 3 | 3×517×33×1 | packed | 109,490 | 108,300 | -1.1 % |
+| 33 | batch 3 6 x 517 x 35 prefetch crosses tiles | 6×517×35×3 | row-major | 1,312,140 (was FAIL) | 1,305,010 **FAIL** | -0.5 % |
+| 34 | batch 3 6 x 517 x 35 B packed prefetch crosses tiles | 6×517×35×3 | packed | 643,760 | 636,710 | -1.1 % |
+| 35 | batch 3 6 x 517 x 35 B broadcasts b stride 0 | 6×517×35×3 | row-major | 1,312,195 | 1,304,900 | -0.6 % |
+| 36 | batch 3 6 x 517 x 35 B broadcasts B packed b stride 0 | 6×517×35×3 | packed | 643,590 | 636,340 | -1.1 % |
+| 37 | sat pos a 100 b 100 K 3  AP MAX | 4×3×16×1 | row-major | 9,670 | 7,910 | -18.2 % |
+| 38 | sat neg a 100 b -100 K 3  AP MIN | 4×3×16×1 | row-major | 9,510 | 7,730 | -18.7 % |
+| | **Σ duration_ns (common cases)** | | | **7,367,640** | **7,203,705** | **-2.2 %** |
+
+
+Σ over the 37 common cases **−2.8 %**.  The gain is where the change
+applies: every geometry whose B is a single block and has more than one
+n_tile no longer reloads it — `2·TileN × TileK × TileM` **−32 %**
+(83,300 → 56,450 ns), `partial N` −32 %; the small cases gain the batched
+A-row requests (`7×13×5` −25 %, saturation cases −18 %, `K=1` outer
+product −11 %); the batch cases −4 …−6 % (the B-resident block is loaded
+once per slice instead of per n_tile).  Cases with one n_tile or multi-tile
+B are unchanged within noise (±0.5 %); nothing regressed.  DSP 51 → 38 at
+the same RTL timing confirms the 16×16 multiply is free.
+
+Synthesis: II=1 on every loop, slack 0.00 ns (K-loop 0.04), BRAM 64,
+DSP **51 → 38**, FF 10.8 k → 10.3 k, LUT 44.3 k → 43.4 k.  C-sim 39/39.
+`TestMatmulBlas` (the `float` build against `cblas_sgemm`) has not compiled
+since §3 changed the ports to `hls::burst_maxi` (it still passes `float*`);
+untouched here, noted for the record.
+
+---
+
+## 5. Verification matrix
 
 | Gate | Command | Baseline result |
 |---|---|---|
@@ -229,7 +362,7 @@ scheduler-packed tile-major B layout for constant weights would turn a
 
 ---
 
-## 5. Related files
+## 6. Related files
 
 | File | Purpose |
 |---|---|

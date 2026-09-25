@@ -134,9 +134,12 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
   for n_tile in [0, ceil(n / kTileN))
     n_off, n_valid = n_tile·kTileN, min(kTileN, n - n_off)
 
-    // LOAD a_buf — n_valid rows × k columns, one burst read per row   PIPELINE II=1
-    for n1 in [0, n_valid): for ki in [0, k):
-      a_buf[n1][ki] = a[(n_off + n1)·k + ki]
+    // LOAD a_buf — n_valid rows × k columns (§3 word ports): the requests
+    // of as many rows as fit in the 4-request window are issued first,
+    // then the rows are drained and scattered into a_buf   PIPELINE II=1
+    for n1 in [0, n_valid): a.read_request(row n1's word range)
+    for n1 in [0, n_valid): for w in words of row n1:
+      a_buf[n1][...] ← lanes of a.read()
 
     for m_tile in [0, ceil(m / kTileM))
       m_off, m_valid = m_tile·kTileM, min(kTileM, m - m_off)
@@ -147,9 +150,12 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
       for k_tile in [0, ceil(k / kTileK))
         k_off, k_valid = k_tile·kTileK, min(kTileK, k - k_off)
 
-        // LOAD b_tile — k_valid rows × m_valid cols, burst read per row  PIPELINE II=1
-        for k1 in [0, k_valid): for m1 in [0, m_valid):
-          b_tile[k1][m1] = b[(k_off + k1)·m + (m_off + m1)]
+        // LOAD b_tile — the (m_tile, k_tile) block (row-major: k_valid row
+        // requests, 16 in flight; packed: ≤ 8 × 64-word requests).  When
+        // B is a single block (m_tiles == k_tiles == 1) it is loaded only
+        // at the first n_tile of a batch slice — once per call if
+        // b_batch_stride == 0 — instead of per (n_tile, m_tile, k_tile).
+        if load_b: load_b_tile(m_tile, k_tile)                       PIPELINE II=1
 
         // K-REDUCTION — iterates k_valid·kTileN times                    PIPELINE II=1
         for ki in [0, k_valid·kTileN):
@@ -157,7 +163,7 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
           kk = ki / kTileN          // K index local to this k_tile
           a_val = a_buf[n1][k_off + kk]
           for m1 in [0, kTileM) UNROLL:
-            acc[n1][m1] += AccData_t(a_val) · AccData_t(b_tile[kk][m1])
+            acc[n1][m1] += a_val · b_tile[kk][m1]      // Data_t × Data_t → AccData_t
 
       // WRITE C — saturate_cast acc → C, burst write per row             PIPELINE II=1
       for n1 in [0, n_valid): for m1 in [0, m_valid):
@@ -233,8 +239,11 @@ builds. The `ap_fixed` specialisation is guarded by `MATMUL_HAVE_APFIXED` so
 the matmul subdirectory stays self-contained (it does not depend on the
 VectorOPKernel headers).
 
-MAC operands are widened to `AccData_t` before the multiply
-(`AccData_t(a_val) · AccData_t(b_tile[kk][m1])`).
+The MAC multiplies the two `Data_t` operands directly
+(`a_val · b_tile[kk][m1]`): for `ap_fixed<16,8>` the product type is
+exactly `ap_fixed<32,16>`, so the sum into `AccData_t` is bit-identical to
+widening the operands first, at one 16×16 DSP per column instead of two
+(MATMUL_OPTIMISATION.md §4).
 
 ---
 
@@ -253,7 +262,10 @@ results are bitwise-identical (exact comparison); `float` builds allow a
 | Partial last tile | partial N (`kTileN+2`); partial M (`kTileM+3`); partial K (`kTileK+5`, spans 2 K-tiles) |
 | Multi-tile | all dims span 2 tiles; `kTileN·… × kTileK·2+7 × kTileM·2+1` |
 | Arbitrary | `7×13×5` (all dims below the tile sizes) |
-| Batch | `batch=3` without broadcast |
+| Batch | `batch=3` without broadcast; `batch=4` with A / B broadcast; `batch=6` |
+| Packed B | the tile-major layout on the same geometries (9 cases) |
+| K-split (§5 of the optimisation log) | `1×261×19`, `2×13×5`, `3×517×33`, row-major and packed |
+| B prefetch (§7) | `batch=3, 6×517×35` (`k_tiles=3`, `m_tiles=3`, `n_tiles=2`), with and without B broadcast, both layouts |
 
 A second test, **`TestMatmulBlas.cpp`**, validates the `float` build of the
 kernel against `cblas_sgemm` when a BLAS library is found at configure time.
@@ -332,7 +344,8 @@ an IP-catalog archive.
 | **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
 | **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`) |
 | **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM), `acc` (registers) |
-| **A reuse** | `a_buf` loaded once per `n_tile`, reused across all `m_tile`/`k_tile` |
+| **A reuse** | `a_buf` loaded once per `n_tile` (row requests batched 4 deep), reused across all `m_tile`/`k_tile` |
+| **B reuse** | single-block B (`m ≤ kTileM`, `k ≤ kTileK`) loaded once per batch slice (once per call when it broadcasts) |
 | **Batch broadcasting** | `a_batch_stride` / `b_batch_stride` = 0 reuses A / B |
 | **Inner-dimension limit** | `k ≤ kMaxK` (2048, compile-time); `n` / `m` / `batch` unbounded |
 | **AXI master ports** | 3 (gmem0 `a`, gmem1 `b`, gmem2 `c`) |

@@ -27,5 +27,15 @@
 24 1 512 64 1 512 32768 1 1_x_2_TileK_x_4_TileM___B_packed__FC-like_
 25 5 64 19 3 320 2048 1 batch_3__no_broadcast___B_packed_
 26 5 64 19 4 320 0 1 batch_4__B_broadcasts___B_packed__b_stride_0_
-27 4 3 16 1 12 48 0 sat_pos__a_100__b_100__K_3______AP_MAX
-28 4 3 16 1 12 48 0 sat_neg__a_100__b_-100__K_3_____AP_MIN
+27 1 261 19 1 261 4959 0 1_x_261_x_19___K-split_n_1_
+28 1 261 19 1 261 8352 1 1_x_261_x_19___B_packed__K-split_n_1_
+29 2 13 5 1 26 65 0 2_x_13_x_5___K-split_n_2_
+30 2 13 5 1 26 208 1 2_x_13_x_5___B_packed__K-split_n_2_
+31 3 517 33 1 1551 17061 0 3_x_517_x_33___K-split_n_3__multi-tile_
+32 3 517 33 1 1551 24816 1 3_x_517_x_33___B_packed__K-split_n_3_
+33 6 517 35 3 3102 18095 0 batch_3__6_x_517_x_35___prefetch_crosses_tiles_
+34 6 517 35 3 3102 24816 1 batch_3__6_x_517_x_35___B_packed__prefetch_crosses_tiles_
+35 6 517 35 3 3102 0 0 batch_3__6_x_517_x_35__B_broadcasts__b_stride_0_
+36 6 517 35 3 3102 0 1 batch_3__6_x_517_x_35__B_broadcasts___B_packed__b_stride_0_
+37 4 3 16 1 12 48 0 sat_pos__a_100__b_100__K_3______AP_MAX
+38 4 3 16 1 12 48 0 sat_neg__a_100__b_-100__K_3_____AP_MIN
