@@ -33,11 +33,18 @@ from .nodes  import (
     SchedulerError)
 from .dtype  import DataType, AP_FIXED_16_8
 from ._conv_hw_config import CONV_TILE_IC
+from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
+from . import fusion
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
-    {"MatMul", "Conv", "Gemm"} | POOL_OP_TYPES | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES
-    | SPACE_TO_DEPTH_OP_TYPES
+    {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
+    | RESHAPE_OP_TYPES | SPACE_TO_DEPTH_OP_TYPES | HOST_OP_TYPES
 )
+
+# Raw (original-dtype) copies are kept for initializers up to this size so
+# host-op factories can read integer constants (Slice starts / ends, ...)
+# exactly; TensorInfo.data is always float32.
+_RAW_CONST_MAX = 1 << 16
 
 
 # ------------------------------------------------------------------ #
@@ -431,6 +438,10 @@ class OnnxGraph:
         as a host-side SpaceToDepth(2) + stride-1 Conv over 4*C channels
         (``_space_to_depth_stems``).  Off by default; the CLI enables it.
         ``self.s2d_stem_count`` reports how many Convs were rewritten.
+
+        Always applied (these ops were unsupported before): ``Constant``
+        nodes become initializers and ``Split`` is lowered to one ``Slice``
+        per output (``self.split_lowered_count``).
         """
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
@@ -443,17 +454,24 @@ class OnnxGraph:
 
         # Run shape inference so every intermediate tensor gets a shape
         model = shape_inference.infer_shapes(model)
+        self.opset = fusion.default_opset(model)
+        self.constant_nodes_folded = fusion.fold_constant_nodes(model)
 
         # Simplify: decompose Gemm → MatMul + Add.  The count is exposed via
         # ``self.gemm_decomposed_count`` so the report generator can list it
         # as an applied transformation.
         model, self.gemm_decomposed_count = OnnxGraph._preprocess_model(model)
 
+        # Split -> one Slice per output (host copy or zero-cost view).
+        self.split_lowered_count = fusion.lower_split(model)
+
         # Space-to-depth stems (opt-in): stride-2 Conv on <= kTileIC/4
         # channels -> SpaceToDepth + stride-1 Conv, see _space_to_depth_stems.
         model, self.s2d_stem_count = (
             OnnxGraph._space_to_depth_stems(model) if s2d_stem else (model, 0)
         )
+
+        self._dtype = _dtype
 
         graph = model.graph
 
@@ -463,8 +481,11 @@ class OnnxGraph:
         self._tensors: Dict[str, TensorInfo] = {}
 
         # 1. Constant weights / initializers
+        self._raw_consts: Dict[str, np.ndarray] = {}
         for init in graph.initializer:
             arr = nph.to_array(init).copy()
+            if arr.size <= _RAW_CONST_MAX:
+                self._raw_consts[init.name] = arr
             ti  = TensorInfo(
                 onnx_name=init.name,
                 shape=list(arr.shape),
@@ -529,8 +550,12 @@ class OnnxGraph:
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
         self._nodes: List[Union[ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode]] = []
+        host_ctx = HostContext(opset=self.opset, consts=self._raw_consts)
         for idx, node in enumerate(graph.node):
-            if node.op_type == "MatMul":
+            if node.op_type in HOST_OP_FACTORIES:
+                sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
+                                                     host_ctx)
+            elif node.op_type == "MatMul":
                 sn = MatmulNode.from_onnx_node(node, self._tensors, idx, align_elems)
             elif node.op_type == "Conv":
                 sn = ConvNode.from_onnx_node(node, self._tensors, idx, align_elems)
@@ -553,6 +578,60 @@ class OnnxGraph:
 
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
         self._pack_matmul_weights()
+        self._choose_slice_views()
+
+    # ------------------------------------------------------------------ #
+    # Slice views                                                          #
+    # ------------------------------------------------------------------ #
+
+    def _choose_slice_views(self) -> None:
+        """Turn contiguous Slice pieces into zero-cost sub-buffer views where
+        that is safe (``SliceNode.is_view``); everything else stays a host
+        copy.  A view needs: a contiguous piece whose byte offset is a
+        multiple of 64 (every DMA base the kernels see stays aligned); a
+        source whose root buffer (through Reshape aliases) is an internal
+        pool buffer — not a graph input, weight or output, and not aliased
+        to a graph output (those buffers are swapped for the caller's at run
+        time); and a piece that itself never reaches a graph output (the
+        caller's buffer must receive a copy).  Chains of views are not
+        formed.  The codegen demotes a view back to a copy if a broadcast
+        consumer gives the piece or its root a strided layout."""
+        bpe = self._dtype.bytes_per_elem
+        reshape_src = {sn.output.onnx_name: sn.inputs[0].onnx_name
+                       for sn in self._nodes if isinstance(sn, ReshapeNode)}
+        children: Dict[str, List[str]] = {}
+        for out, src in reshape_src.items():
+            children.setdefault(src, []).append(out)
+        producer = {sn.output.onnx_name: sn for sn in self._nodes}
+        outputs, inputs = set(self._output_names), set(self._input_names)
+
+        def reaches_output(name: str) -> bool:
+            stack = [name]
+            while stack:
+                cur = stack.pop()
+                if cur in outputs:
+                    return True
+                stack.extend(children.get(cur, []))
+            return False
+
+        for sn in self._nodes:
+            if not isinstance(sn, SliceNode):
+                continue
+            sn.is_view = False
+            if not sn.is_contiguous or (sn.offset * bpe) % 64:
+                continue
+            root = sn.inputs[0].onnx_name
+            while root in reshape_src:
+                root = reshape_src[root]
+            prod = producer.get(root)
+            if (prod is None or isinstance(prod, ReshapeNode)
+                    or (isinstance(prod, SliceNode) and prod.is_view)
+                    or root in inputs or root in outputs
+                    or self._tensors[root].is_weight
+                    or reaches_output(root)
+                    or reaches_output(sn.output.onnx_name)):
+                continue
+            sn.is_view = True
 
     # ------------------------------------------------------------------ #
     # Activation fusion (VectorOPKernel `act` register)                    #

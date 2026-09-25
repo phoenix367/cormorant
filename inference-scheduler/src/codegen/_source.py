@@ -3,7 +3,10 @@
 from __future__ import annotations
 from typing import List
 
-from ..nodes    import ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode, SpaceToDepthNode
+from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulNode, ScheduledNode, SchedulerError,
+                        SpaceToDepthNode)
+from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_HELPERS, HostNode,
+                          SliceNode)
 from ._banners  import _banner, _file_banner
 
 
@@ -26,6 +29,11 @@ class _SourceMixin:
             self._kernel_wait_helper(),
             self._layer_names_table(),
             self._run_op_helper(),
+        ]
+        host_section = self._host_ops_section()
+        if host_section:
+            parts.append(host_section)
+        parts += [
             self._init_function(),
             self._inference_function(),
         ]
@@ -35,7 +43,9 @@ class _SourceMixin:
         stdio = '#include <stdio.h>    /* fopen, fread, snprintf */\n' \
                 if self.large_weight_tensors else ''
         stdlib = '#include <stdlib.h>   /* malloc, free (host staging buffers) */\n' \
-                if self._host_op_nodes else ''
+                if (self._host_op_nodes or self._host_nodes) else ''
+        mathh = '#include <math.h>     /* host ops: exp, sqrt, tanh, erf, nearbyint */\n' \
+                if self._host_nodes else ''
         kernel_headers = "".join(
             f'#include "{kd.driver_prefix}.h"\n'
             for kd in self._active_kernels
@@ -49,6 +59,7 @@ class _SourceMixin:
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
             f'{stdlib}'
+            f'{mathh}'
             '\n'
             '/*\n'
             ' * Cache coherency between the CPU and the AXI DMA master is handled by\n'
@@ -99,6 +110,141 @@ class _SourceMixin:
     def _host_op_nodes(self) -> List[SpaceToDepthNode]:
         """Host-side ops that need a cached staging block (SpaceToDepthNode)."""
         return [sn for sn in self._graph.nodes if isinstance(sn, SpaceToDepthNode)]
+
+    @property
+    def _host_nodes(self) -> List[HostNode]:
+        """Host-CPU nodes that run code (all HostNodes except Slice views);
+        they share the cached staging arena s_host_stage."""
+        return [sn for sn in self._graph.nodes
+                if isinstance(sn, HostNode) and not self._is_view(sn)]
+
+    # ------------------------------------------------------------------ #
+    # Host-CPU ops (Softmax, LayerNorm, GELU, Transpose, Gather, ...)       #
+    # ------------------------------------------------------------------ #
+
+    def _host_io_layout(self, t) -> tuple:
+        """(n_chunks, chunk, stride) of the buffer holding ``t``: the layout
+        of the Reshape-alias root (a reshape never changes the bytes), flat
+        unless a broadcast VectorOP consumer / producer made it strided."""
+        lay = self._layouts.get(self._reshape_root(t.onnx_name))
+        if lay is None or lay.n_chunks <= 1 or lay.stride == lay.chunk:
+            return (1, t.numel, t.numel)
+        if lay.n_chunks * lay.chunk != t.numel:
+            raise SchedulerError(
+                f"host op: tensor '{t.onnx_name}' layout {lay} does not cover its "
+                f"{t.numel} elements.")
+        return (lay.n_chunks, lay.chunk, lay.stride)
+
+    @staticmethod
+    def _staged_count(io: tuple) -> int:
+        nc, ch, st = io
+        return nc * st if nc > 1 else ch
+
+    def _host_stage_plan(self, sn) -> tuple:
+        """Offsets (Data_t elements, 16-byte aligned) of a host node's staged
+        inputs, output and scratch inside s_host_stage.
+        Returns (inputs=[(tensor, off, count, io)], (off, count, io),
+        scratch_off | None, total)."""
+        bpe = self._dtype.bytes_per_elem
+        a8 = lambda n: (n + 7) & ~7  # noqa: E731
+        off, ins = 0, []
+        for t in sn.staged_inputs():
+            io = self._host_io_layout(t)
+            cnt = self._staged_count(io)
+            ins.append((t, off, cnt, io))
+            off += a8(cnt)
+        io = self._host_io_layout(sn.output)
+        cnt = self._staged_count(io)
+        out = (off, cnt, io)
+        off += a8(cnt)
+        scratch = None
+        if sn.scratch_bytes():
+            scratch = off
+            off += a8(-(-sn.scratch_bytes() // bpe))
+        return ins, out, scratch, off
+
+    @property
+    def _host_stage_elems(self) -> int:
+        return max((self._host_stage_plan(sn)[3] for sn in self._host_nodes), default=0)
+
+    def _written_by_kernel(self, t) -> bool:
+        """True when the buffer behind ``t`` (through aliases / views) is
+        written by a PL kernel, i.e. the CPU must invalidate before reading."""
+        root = self._alias_root(t.onnx_name)
+        for sn in self._graph.nodes:
+            if sn.output.onnx_name == root:
+                return bool(getattr(type(sn), "kernel_name", ""))
+        return False
+
+    def _host_ops_section(self) -> str:
+        host = self._host_nodes
+        if not host:
+            return ""
+        used = set()
+        for sn in host:
+            used.update(sn.c_helpers())
+        parts = [
+            _banner("Host-CPU ops (no hardware kernel)"),
+            "/*\n"
+            " * Ops the PL kernels cannot run execute here, inline in inference_run():\n"
+            " * each reads its inputs with one wide memcpy into the cached staging\n"
+            " * arena s_host_stage, computes in double precision, rounds half to even\n"
+            " * + saturates on write-back and copies the result out with one memcpy\n"
+            " * (+ cache flush).  The scheduler's simulator (_simulate.py /\n"
+            " * host_nodes.py) implements the same operations in the same order, so\n"
+            " * test_inference.c expects bit-identical results.\n"
+            " *\n"
+            " * No FMA contraction (GCC's GNU modes default to -ffp-contract=fast and\n"
+            " * would fuse a*b + c on the A53): */\n"
+            "#if defined(__clang__)\n"
+            "#  pragma clang fp contract(off)\n"
+            "#elif defined(__GNUC__)\n"
+            "#  pragma GCC optimize (\"fp-contract=off\")\n"
+            "#endif\n",
+            self._dtype.c_host_conversions(),
+            HOST_C_COMMON,
+        ]
+        for kind in HOST_C_HELPER_ORDER:
+            if kind in used:
+                parts.append(HOST_C_HELPERS[kind])
+        consts = []
+        for sn in host:
+            consts.extend(sn.c_file_consts(self._dtype))
+        if consts:
+            parts.append("/* Per-node host-op constants */\n" + "\n".join(consts) + "\n")
+        return "\n".join(parts)
+
+    def _emit_host_block(self, sn) -> str:
+        ins, (o_off, o_cnt, o_io), scratch, _ = self._host_stage_plan(sn)
+        lines = ["    {"]
+        for i, (t, off, cnt, _io) in enumerate(ins):
+            lines.append(f"        Data_t *in{i} = s_host_stage + {off}u;"
+                         f"  /* '{t.onnx_name}': {cnt} elem */")
+        lines.append(f"        Data_t *out = s_host_stage + {o_off}u;"
+                     f"  /* '{sn.output.onnx_name}': {o_cnt} elem */")
+        if scratch is not None:
+            lines.append(f"        void   *tmp = s_host_stage + {scratch}u;"
+                         f"  /* {sn.scratch_bytes()} B scratch */")
+        seen = set()
+        for t in list(sn.staged_inputs()) + list(sn.direct_inputs()):
+            if t.c_name not in seen and self._written_by_kernel(t):
+                seen.add(t.c_name)
+                lines.append(f"        inference_buf_sync_from_device({t.c_name});"
+                             f"  /* written by a kernel */")
+        for t in sn.direct_inputs():
+            lay = self._layouts.get(self._reshape_root(t.onnx_name))
+            if lay is not None and (lay.n_chunks > 1 or lay.alloc != lay.numel):
+                raise SchedulerError(
+                    f"host op [{sn.index}]: '{t.onnx_name}' must have a flat layout.")
+        for i, (t, _off, _cnt, (nc, ch, st)) in enumerate(ins):
+            lines.append(f"        host_load(in{i}, {t.c_name}, {nc}u, {ch}u, {st}u);")
+        for ln in sn.c_call([f"in{i}" for i in range(len(ins))], "out", "tmp",
+                            [t.c_name for t in sn.direct_inputs()], self._dtype):
+            lines.append("        " + ln)
+        nc, ch, st = o_io
+        lines.append(f"        host_store({sn.output.c_name}, out, {nc}u, {ch}u, {st}u);")
+        lines.append("    }")
+        return "\n".join(lines)
 
     def _buffer_declarations(self) -> str:
         lines = [_banner("Mutable intermediate buffers")]
@@ -151,6 +297,17 @@ class _SourceMixin:
                     f"static Data_t *{sn.stage_c_name} = NULL;"
                     f"  /* [{sn.index}] {sn.numel} elem x 2 */"
                 )
+
+        if self._host_nodes:
+            n = self._host_stage_elems
+            lines.append("")
+            lines.append(
+                "/* Cached staging arena shared by the host-CPU ops (they run one at a\n"
+                " * time): largest op's inputs + output + scratch, "
+                f"{n} elem ({n * self._dtype.bytes_per_elem} B).\n"
+                " * malloc'd in inference_init(). */"
+            )
+            lines.append("static Data_t *s_host_stage = NULL;")
 
         return "\n".join(lines)
 
@@ -752,9 +909,11 @@ class _SourceMixin:
             alloc_lines.append("    inference_buf_sync_to_device(s_alloc_pool);")
             alloc_lines.append("")
 
+        views = self._view_aliases                       # Slice pieces (sub-buffers)
         if intermediates:
             # Emit reshape aliases last (they reference other intermediate/weight c_name pointers)
-            non_alias = [t for t in intermediates if t.onnx_name not in reshape_aliases]
+            non_alias = [t for t in intermediates
+                         if t.onnx_name not in reshape_aliases and t.onnx_name not in views]
             alias_tensors = [t for t in intermediates if t.onnx_name in reshape_aliases]
 
             if non_alias:
@@ -768,6 +927,18 @@ class _SourceMixin:
                     alloc_lines.append(
                         f"    {t.c_name} = &_s_buf_{t.c_name};"
                     )
+                alloc_lines.append("")
+
+            view_tensors = [t for t in intermediates if t.onnx_name in views]
+            if view_tensors:
+                alloc_lines.append("    /* Slice views: contiguous pieces of a pool buffer (no copy) */")
+                for t in view_tensors:
+                    root_c, off, count = views[t.onnx_name]
+                    alloc_lines.append(
+                        f"    inference_buf_init_view(&_s_buf_{t.c_name}, {root_c},"
+                        f" {off}u, {count}u);"
+                    )
+                    alloc_lines.append(f"    {t.c_name} = &_s_buf_{t.c_name};")
                 alloc_lines.append("")
 
             if alias_tensors:
@@ -799,6 +970,15 @@ class _SourceMixin:
                 )
             alloc_lines.append("")
 
+        if self._host_nodes:
+            alloc_lines.append("    /* Cached staging arena for the host-CPU ops */")
+            alloc_lines.append(
+                f"    s_host_stage = (Data_t *)malloc({self._host_stage_elems}u"
+                f" * INFERENCE_BYTES_PER_ELEM);"
+            )
+            alloc_lines.append("    if (!s_host_stage) { rc = -1; goto fail; }")
+            alloc_lines.append("")
+
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
         # inference_deinit(): null all weight and intermediate pointers,
@@ -808,6 +988,8 @@ class _SourceMixin:
             deinit_free.append(
                 f"    free({sn.stage_c_name}); {sn.stage_c_name} = NULL;"
             )
+        if self._host_nodes:
+            deinit_free.append("    free(s_host_stage); s_host_stage = NULL;")
         for t in weights + intermediates:
             if t.onnx_name in reshape_aliases:
                 deinit_free.append(
@@ -934,7 +1116,9 @@ class _SourceMixin:
             elif kind == 'reshape':
                 sn = nodes_by_idx[ev[1]]
                 # ReshapeNode emits an empty call — keep blank for readability.
-                body_lines.append(sn.emit_call(self._layouts))
+                # A Slice view was set up once in inference_init().
+                if not isinstance(sn, SliceNode):
+                    body_lines.append(sn.emit_call(self._layouts))
                 body_lines.append("")
 
             elif kind == 'wait':
@@ -956,11 +1140,15 @@ class _SourceMixin:
                 body_lines.append("")
 
             elif kind == 'cpu':
-                # Host-side op (SpaceToDepthNode): runs inline on the CPU and
-                # syncs its own buffers; profiled like a synchronous node.
+                # Host-side op (SpaceToDepthNode / HostNode): runs inline on
+                # the CPU and syncs its own buffers; profiled like a
+                # synchronous node.
                 sn = nodes_by_idx[ev[1]]
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
-                body_lines.append(sn.emit_call(self._layouts))
+                if isinstance(sn, HostNode):
+                    body_lines.append(self._emit_host_block(sn))
+                else:
+                    body_lines.append(sn.emit_call(self._layouts))
                 body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")
                 body_lines.append("")
 

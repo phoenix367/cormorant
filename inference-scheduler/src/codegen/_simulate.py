@@ -44,6 +44,7 @@ from ..nodes  import (
     POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
+from ..host_nodes import HostNode
 
 # Expected GT arrays larger than this threshold are written to external
 
@@ -483,6 +484,14 @@ class _SimulateMixin:
             if isinstance(sn, ReshapeNode):
                 src = arrays[sn.inputs[0].onnx_name]
                 arrays[sn.output.onnx_name] = src.reshape(sn.output.shape)
+                continue
+
+            if isinstance(sn, HostNode):
+                # Host-CPU op: double arithmetic, round-half-even + saturate
+                # on write-back — the same operations, in the same order, as
+                # the generated C helper (host_nodes.py).
+                arrays[sn.output.onnx_name] = sn.reference(
+                    [arrays[t.onnx_name] for t in sn.inputs], dtype)
                 continue
 
             if isinstance(sn, SpaceToDepthNode):

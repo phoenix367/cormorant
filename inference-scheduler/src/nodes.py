@@ -134,6 +134,7 @@ RESHAPE_OP_TYPES: frozenset = frozenset({
     "Unsqueeze",
     "Dropout",
     "Flatten",   # axis-N split is irrelevant for a buffer alias — same numel
+    "Identity",  # e.g. BERT's unique_ids passthrough (int64 input -> output)
 })
 
 # ------------------------------------------------------------------ #

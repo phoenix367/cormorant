@@ -203,6 +203,22 @@ class DataType(ABC):
         """One-line comment for the Data_t typedef in the generated header."""
         return f"/* {self.name} */"
 
+    # ------------------------------------------------------------------ #
+    # Host-CPU ops and integer tensors                                     #
+    # ------------------------------------------------------------------ #
+
+    def host_quantize(self, x: np.ndarray) -> np.ndarray:
+        """Value a host op writes back for the double result ``x``: round
+        half to even + saturate (``quantize``), NaN -> 0.  Mirrors the
+        generated C ``host_st()`` (``nearbyint`` under FE_TONEAREST)."""
+        x = np.asarray(x, dtype=np.float64)
+        return self.quantize(np.where(np.isnan(x), 0.0, x))
+
+    def c_host_conversions(self) -> str:
+        """C source of the ``host_ld`` / ``host_st`` (Data_t <-> double)
+        helpers every host op is written in terms of."""
+        raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
+
 
 # ------------------------------------------------------------------ #
 # ap_fixed<W, I>                                                      #
@@ -321,6 +337,27 @@ class ApFixed(DataType):
             f" value = ({int_t})bits / {scale} */"
         )
 
+    # Host ops.
+    def c_host_conversions(self) -> str:
+        int_t = f"int{self._W}_t"
+        scale = f"{self._scale:.1f}"
+        lo, hi = f"{-float(1 << (self._W - 1)):.1f}", f"{float((1 << (self._W - 1)) - 1):.1f}"
+        return (
+            f"/* Element conversions ({self.name}: value = ({int_t})bits / {scale}).\n"
+            " * host_st rounds half to even (nearbyint under the default FE_TONEAREST\n"
+            " * mode, identical to numpy's np.round) and saturates; NaN -> 0. */\n"
+            f"static inline double host_ld(Data_t b) {{ return (double)({int_t})b / {scale}; }}\n"
+            "static inline Data_t host_st(double v)\n"
+            "{\n"
+            "    double r;\n"
+            "    if (v != v) return (Data_t)0u;\n"
+            f"    r = nearbyint(v * {scale});\n"
+            f"    if (r > {hi}) r = {hi};\n"
+            f"    if (r < {lo}) r = {lo};\n"
+            f"    return (Data_t)({int_t})r;\n"
+            "}\n"
+        )
+
 
 # ------------------------------------------------------------------ #
 # float32                                                             #
@@ -382,6 +419,14 @@ class Float32(DataType):
 
     def c_typedef_comment(self) -> str:
         return "/* float32: IEEE 754 single precision */"
+
+    # Host ops.
+    def c_host_conversions(self) -> str:
+        return (
+            "/* Element conversions (float32). */\n"
+            "static inline double host_ld(Data_t b) { return (double)b; }\n"
+            "static inline Data_t host_st(double v) { return (v != v) ? 0.0f : (Data_t)v; }\n"
+        )
 
 
 # ------------------------------------------------------------------ #

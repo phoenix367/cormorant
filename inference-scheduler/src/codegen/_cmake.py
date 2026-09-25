@@ -195,6 +195,7 @@ class _CmakeMixin:
             f")\n"
             f"\n"
             f"target_compile_options(inference PRIVATE -Wall -Wextra -O2)\n"
+            f"{self._cmake_host_ops()}"
             f"\n"
             f"if(DEFINED _TARGET_LIBS)\n"
             f"    target_link_libraries(inference PUBLIC ${{_TARGET_LIBS}})\n"
@@ -266,3 +267,19 @@ class _CmakeMixin:
             f"        \"(disable: -DINFERENCE_BUILD_TEST=OFF)\")\n"
             f"endif()\n"
         )
+
+    def _cmake_host_ops(self) -> str:
+        """Extra build settings when the model has host-CPU ops: libm, and no
+        FMA contraction so the double arithmetic rounds exactly like the
+        scheduler's simulation (the source also carries a pragma).  Empty
+        for models without host ops, so their CMakeLists is unchanged."""
+        if not getattr(self, "_host_nodes", None):
+            return ""
+        return (
+            "\n"
+            "# Host-CPU ops (Softmax / LayerNorm / GELU / ...): libm, and no FMA\n"
+            "# contraction so results match the scheduler's simulation bit for bit.\n"
+            "target_compile_options(inference PRIVATE -ffp-contract=off)\n"
+            "target_link_libraries(inference PUBLIC m)\n"
+        )
+

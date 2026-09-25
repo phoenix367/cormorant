@@ -43,6 +43,7 @@ from typing import List, Optional
 from ..graph   import OnnxGraph
 from ..nodes    import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
                         SpaceToDepthNode, SchedulerError)
+from ..host_nodes import HostNode, SliceNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
 from ..tensor  import TensorInfo
@@ -71,6 +72,74 @@ class _CoreMixin:
         # only need the flat {name: alloc_elements} view.
         self._layouts             = self._compute_tensor_layouts()
         self._alloc_sizes         = {k: v.alloc for k, v in self._layouts.items()}
+        self._demote_strided_views()
+
+    # ------------------------------------------------------------------
+    # Buffer aliases: Reshape-family nodes and Slice views
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_view(sn) -> bool:
+        """A Slice piece emitted as a zero-cost sub-buffer view."""
+        return isinstance(sn, SliceNode) and sn.is_view
+
+    @classmethod
+    def _is_alias_node(cls, sn) -> bool:
+        """Nodes that do no work at run time: their output shares (part of)
+        the source's buffer (ReshapeNode, Slice view)."""
+        return isinstance(sn, ReshapeNode) or cls._is_view(sn)
+
+    def _alias_source_map(self) -> dict:
+        """{output onnx_name: source onnx_name} for every alias node."""
+        return {sn.output.onnx_name: sn.inputs[0].onnx_name
+                for sn in self._graph.nodes if self._is_alias_node(sn)}
+
+    def _alias_root(self, name: str) -> str:
+        """Follow Reshape aliases and Slice views down to the buffer that
+        owns the memory."""
+        src = self._alias_source_map()
+        seen = set()
+        while name in src and name not in seen:
+            seen.add(name)
+            name = src[name]
+        return name
+
+    def _reshape_root(self, name: str) -> str:
+        """Follow ReshapeNode aliases only (same bytes, same layout)."""
+        src = {sn.output.onnx_name: sn.inputs[0].onnx_name
+               for sn in self._graph.nodes if isinstance(sn, ReshapeNode)}
+        seen = set()
+        while name in src and name not in seen:
+            seen.add(name)
+            name = src[name]
+        return name
+
+    @property
+    def _view_aliases(self) -> dict:
+        """{view onnx_name: (root c_name, element offset, numel)} for every
+        Slice view.  The source is resolved through Reshape aliases to the
+        pool buffer that owns the memory (OnnxGraph guarantees one exists)."""
+        result: dict = {}
+        tensors = {t.onnx_name: t for t in self._graph.intermediate_tensors}
+        for sn in self._graph.nodes:
+            if self._is_view(sn):
+                root = self._reshape_root(sn.inputs[0].onnx_name)
+                result[sn.output.onnx_name] = (tensors[root].c_name, sn.offset,
+                                               sn.output.numel)
+        return result
+
+    def _demote_strided_views(self) -> None:
+        """A view can only share memory with a flat (gap-free) buffer and be
+        flat itself; if a broadcast consumer gave either a strided layout the
+        piece is copied on the host instead."""
+        def flat(name):
+            lay = self._layouts.get(name)
+            return lay is None or (lay.n_chunks == 1 and lay.alloc == lay.numel)
+        for sn in self._graph.nodes:
+            if self._is_view(sn):
+                root = self._reshape_root(sn.inputs[0].onnx_name)
+                if not (flat(root) and flat(sn.output.onnx_name)):
+                    sn.is_view = False
 
     def _compute_tensor_layouts(self) -> dict:
         """
@@ -113,7 +182,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+                               HostNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -170,7 +240,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+                               HostNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -282,7 +353,7 @@ class _CoreMixin:
     def _kernel_id_of(self, sched) -> Optional[str]:
         """Return the kernel_id_t enum literal for sched's lane, or None
         if sched does not occupy a hardware lane (ReshapeNode,
-        SpaceToDepthNode)."""
+        SpaceToDepthNode, HostNode)."""
         kn = getattr(type(sched), "kernel_name", "")
         return self._KERNEL_ID_ENUM.get(kn) if kn else None
 
@@ -305,9 +376,11 @@ class _CoreMixin:
                                                its own lane internally)
           ('drain',   kid, drained_idx)     — final kernel_wait before
                                                output cache sync
-          ('reshape', node_idx)             — ReshapeNode: no kernel work
-          ('cpu',     node_idx)             — SpaceToDepthNode: host loop,
-                                               synchronous, occupies no lane
+          ('reshape', node_idx)             — ReshapeNode / Slice view: no
+                                               work (buffer alias)
+          ('cpu',     node_idx)             — SpaceToDepthNode / HostNode:
+                                               host code, synchronous,
+                                               occupies no lane
 
         ReshapeNodes are emitted as no-ops, but predecessor-wait analysis
         walks *through* them: a consumer of a Reshape alias must wait on
@@ -332,7 +405,7 @@ class _CoreMixin:
                     continue
                 seen.add(p)
                 p_sched = dag.by_index[p].sched
-                if isinstance(p_sched, ReshapeNode):
+                if self._is_alias_node(p_sched):
                     stack.extend(dag.predecessors(p))
                 else:
                     out.add(p)
@@ -344,12 +417,12 @@ class _CoreMixin:
         for sn in graph.nodes:
             events.append(('comment', sn.index))
 
-            if isinstance(sn, ReshapeNode):
+            if self._is_alias_node(sn):
                 events.append(('reshape', sn.index))
                 continue
 
             target = self._kernel_id_of(sn)
-            is_cpu = isinstance(sn, SpaceToDepthNode)
+            is_cpu = isinstance(sn, (SpaceToDepthNode, HostNode))
 
             # 1. Wait on each effective predecessor whose lane is still in flight.
             waits: list = []
@@ -401,31 +474,22 @@ class _CoreMixin:
         Weights and graph inputs/outputs are excluded — they live for the
         entire inference call and are never candidates for buffer reuse.
         """
-        reshape_aliases = self._reshape_aliases
+        alias_src = self._alias_source_map()      # Reshape aliases + Slice views
         intermediates = {
             t.onnx_name
             for t in self._graph.intermediate_tensors
-            if t.onnx_name not in reshape_aliases
+            if t.onnx_name not in alias_src
         }
 
         # Build alias-resolution map: tensor_name → underlying intermediate.
-        # A consumer of a Reshape alias contributes to the source tensor's
-        # live interval, since both share the same DMA buffer.
+        # A consumer of a Reshape alias (or of a Slice view) contributes to
+        # the source tensor's live interval, since both share the same DMA
+        # buffer.
         def resolve(name: str) -> str:
             seen = set()
-            while name in reshape_aliases and name not in seen:
+            while name in alias_src and name not in seen:
                 seen.add(name)
-                # _reshape_aliases maps onnx output name → source c_name.
-                # Walk via onnx names for the live-interval graph.
-                src_node = next(
-                    (sn for sn in self._graph.nodes
-                     if isinstance(sn, ReshapeNode)
-                     and sn.output.onnx_name == name),
-                    None,
-                )
-                if src_node is None:
-                    break
-                name = src_node.inputs[0].onnx_name
+                name = alias_src[name]
             return name
 
         events = self._compute_event_stream()
@@ -448,7 +512,7 @@ class _CoreMixin:
         producer_of: dict = {}
         consumers_of: dict = {n: [] for n in intermediates}
         for sn in self._graph.nodes:
-            if isinstance(sn, ReshapeNode):
+            if self._is_alias_node(sn):
                 continue
             out = sn.output.onnx_name
             if out in intermediates:
@@ -515,9 +579,11 @@ class _CoreMixin:
         alloc_sizes = self._alloc_sizes
 
         # Preserve graph order for tensors without an interval entry (fallback).
+        # Slice views own no memory either (they point into their root).
+        views = self._view_aliases
         cand_names = [
             t.onnx_name for t in self._graph.intermediate_tensors
-            if t.onnx_name not in reshape_aliases
+            if t.onnx_name not in reshape_aliases and t.onnx_name not in views
         ]
 
         # Sort candidates by start time; break ties largest-first so that the
@@ -788,7 +854,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+                               HostNode)):
                 continue
             c_up = sn.output.c_name.upper()
             canonical[sn.output.onnx_name] = c_up
@@ -801,7 +868,8 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
+                               HostNode)):
                 continue
             if sn.output.onnx_name in canonical:
                 continue

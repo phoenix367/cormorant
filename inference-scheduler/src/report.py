@@ -30,6 +30,7 @@ import numpy as np
 from .dtype import ApFixed
 from .nodes import (ConvNode, MatmulNode, PoolNode, ReshapeNode,
                     SpaceToDepthNode, ScheduledNode, OP_NAMES)
+from .host_nodes import HostNode, SliceNode
 from .codegen._simulate import _residual_stats
 
 
@@ -151,6 +152,11 @@ def _node_notes(sn) -> str:
         return "buffer alias · no kernel call"
     if isinstance(sn, SpaceToDepthNode):
         return f"host CPU reorder · blocksize={sn.blocksize} · no kernel call"
+    if isinstance(sn, SliceNode) and sn.is_view:
+        return f"sub-buffer view @{sn.offset} · no copy"
+    if isinstance(sn, HostNode):
+        det = sn.describe()
+        return f"host CPU{' · ' + det if det else ''} · no kernel call"
     return ""
 
 
@@ -544,6 +550,14 @@ class ReportGenerator:
                 f"{'s' if s2d != 1 else ''} rewritten as a host-side "
                 f"`SpaceToDepth(2)` + stride-1 `Conv` over 4× the input "
                 f"channels (ConvKernel IC-lane utilisation)."
+            )
+        n_host = sum(1 for sn in self.graph.nodes
+                     if isinstance(sn, HostNode) and not (isinstance(sn, SliceNode) and sn.is_view))
+        if n_host:
+            bullets.append(
+                f"- **Host-CPU ops** — {n_host} node{'s' if n_host != 1 else ''} run on "
+                f"the CPU (double precision, round-half-even write-back, staged "
+                f"through cached memory)."
             )
         if reshape_count:
             bullets.append(
