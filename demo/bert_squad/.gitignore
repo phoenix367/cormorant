@@ -1,0 +1,10 @@
+# User-local config — copy from bert_squad_config.json.example and edit.
+bert_squad_config.json
+
+# Downloaded assets (vocab, SQuAD dev set, ONNX model) and tokenized inputs.
+assets/
+
+# Generated inference project, reference cache, logits, results, logs.
+build/
+
+__pycache__/
