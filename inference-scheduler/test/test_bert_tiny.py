@@ -167,14 +167,16 @@ class TestGeneratedC(_Tiny):
 
     def test_host_emulated_run_matches_simulation(self):
         """inference.c + test_inference.c compiled unchanged against software
-        kernel models: every output bit-identical to the simulator."""
+        kernel models: every output bit-identical to the simulator — host ops
+        in place (cacheable buffers, the default) and staged (non-cacheable)."""
         for fname, m in self.models.items():
             _, cg = self.gen(m["path"])
-            with tempfile.TemporaryDirectory() as td:
-                rc, out = host_emu.build_and_run(cg, td)
-            self.assertEqual(rc, 0, f"{fname}\n{out}")
-            self.assertIn("test_inference PASSED", out)
-            self.assertEqual(host_emu.failures(out), [])
+            for cached in (True, False):
+                with self.subTest(model=fname, cached=cached), tempfile.TemporaryDirectory() as td:
+                    rc, out = host_emu.build_and_run(cg, td, cached=cached)
+                    self.assertEqual(rc, 0, f"{fname}\n{out}")
+                    self.assertIn("test_inference PASSED", out)
+                    self.assertEqual(host_emu.failures(out), [])
 
     def test_source_structure(self):
         m = self.models["bert_tiny_h32_l1.onnx"]
@@ -183,7 +185,8 @@ class TestGeneratedC(_Tiny):
         self.assertIn("#include <math.h>", src)
         self.assertIn('#  pragma GCC optimize ("fp-contract=off")', src)
         for fn in ("host_softmax", "host_layernorm", "host_gelu_tanh", "host_copy_nd",
-                   "host_gather_rows", "host_onehot", "host_cast", "host_load", "host_store"):
+                   "host_gather_rows", "host_onehot", "host_cast", "host_load", "host_store",
+                   "host_out_done"):
             self.assertIn(f"static void {fn}(", src)
         self.assertNotIn("static void host_gelu_erf(", src)       # only the kinds in use
         self.assertIn("static Data_t *s_host_stage = NULL;", src)
@@ -195,9 +198,10 @@ class TestGeneratedC(_Tiny):
         # a kernel-written source is invalidated before the host op reads it
         ln = src[src.index("host_layernorm(in0"):]
         blk = src[:src.index("host_layernorm(in0")]
-        blk = blk[blk.rindex("{"):]
+        blk = blk[blk.rindex("    {"):]
         self.assertIn("inference_buf_sync_from_device(", blk)
-        self.assertIn("host_store(", ln[:600])
+        self.assertLess(blk.index("inference_buf_sync_from_device("), blk.index("in0 = host_in("))
+        self.assertIn("host_out_done(", ln[:600])
         cmake = cg.generate_cmake()
         self.assertIn("target_compile_options(inference PRIVATE -ffp-contract=off)", cmake)
         self.assertIn("target_link_libraries(inference PUBLIC m)", cmake)

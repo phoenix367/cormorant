@@ -39,8 +39,9 @@ _HARNESS_HEAD = r"""
 #include <math.h>
 typedef uint16_t Data_t;
 #define INFERENCE_BYTES_PER_ELEM 2u
-typedef struct { void *virt; } inference_buf_t;
+typedef struct { void *virt; unsigned count; uint8_t cached; } inference_buf_t;
 static Data_t *inference_buf_ptr(inference_buf_t *b) { return (Data_t *)b->virt; }
+static inline int inference_buf_is_cached(const inference_buf_t *b) { return b->cached; }
 static void inference_buf_sync_to_device(inference_buf_t *b) { (void)b; }
 """
 
@@ -78,7 +79,7 @@ def _run_c(cg, sn, ins):
         lines.append(f"    static Data_t in{i}[{max(t.numel, 1)}];")
     for i, t in enumerate(direct):
         lines.append(f"    static Data_t dd{i}[{max(t.numel, 1)}];")
-        lines.append(f"    inference_buf_t db{i} = {{ dd{i} }};")
+        lines.append(f"    inference_buf_t db{i} = {{ dd{i}, {t.numel}u, 1u }};")
     lines.append(f"    static Data_t out[{max(sn.output.numel, 1)}];")
     lines.append(f"    static double tmp_d[{max(sn.scratch_bytes() // 8, 1)}];")
     lines.append("    void *tmp = tmp_d;")
@@ -330,7 +331,9 @@ class TestDataMovement(_Base):
 
 
 class TestStagingHelpers(_Base):
-    """host_load / host_store compact and re-expand advancing-strided layouts."""
+    """host_load / host_store compact and re-expand advancing-strided layouts;
+    host_in / host_out / host_out_done work in place on a cacheable flat
+    buffer and stage otherwise."""
 
     def test_strided_round_trip(self):
         g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
@@ -357,6 +360,67 @@ class TestStagingHelpers(_Base):
         for c in range(5):
             expanded[c * 8:c * 8 + 3] = compact[c * 3:c * 3 + 3]
         np.testing.assert_array_equal(out[15:], expanded)      # gaps zeroed
+
+    def test_direct_or_staged(self):
+        g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                            [_vi("X", [2, 4])], [_vi("Y", [2, 4])], name="stage2"))
+        cg = CodeGenerator(g, model_path="stage2")
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), cg._host_ops_section(),
+                "int main(void)", "{",
+                "    static Data_t buf[40], st[40], out[40]; unsigned i, c;",
+                "    for (c = 0; c < 2u; c++) {",
+                "        inference_buf_t b = { buf, 40u, (uint8_t)c }, o = { out, 40u, (uint8_t)c };",
+                "        const Data_t *in; Data_t *y;",
+                "        for (i = 0; i < 40u; i++) { buf[i] = (Data_t)(i + 1u); out[i] = 0xAAAAu; }",
+                "        memset(st, 0, sizeof st);",
+                "        in = host_in(&b, st, 1u, 40u, 40u);            /* flat */",
+                "        printf(\"%d \", in == buf);",
+                "        in = host_in(&b, st, 5u, 3u, 8u);              /* strided: always staged */",
+                "        printf(\"%d %u \", in == st, (unsigned)in[3]);",
+                "        y = host_out(&o, st, 1u, 40u, 40u);",
+                "        printf(\"%d \", y == out);",
+                "        for (i = 0; i < 40u; i++) y[i] = (Data_t)(100u + i);",
+                "        host_out_done(&o, y, 1u, 40u, 40u);",
+                "        printf(\"%u %u\\n\", (unsigned)out[0], (unsigned)out[39]);",
+                "    }",
+                "    return 0;", "}"]
+        with tempfile.TemporaryDirectory() as td:
+            c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
+            with open(c, "w") as f:
+                f.write("\n".join(prog))
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", c, "-lm",
+                            "-o", exe], check=True)
+            out = subprocess.run([exe], capture_output=True, check=True, text=True).stdout
+        # cached = 0: staged in / out (copied back); cached = 1: in place
+        self.assertEqual(out.splitlines(), ["0 1 9 0 100 139", "1 1 9 1 100 139"])
+
+    def test_strided_round_trip(self):
+        g = OnnxGraph(_save(self.d, [oh.make_node("Softmax", ["X"], ["Y"], axis=-1)],
+                            [_vi("X", [2, 4])], [_vi("Y", [2, 4])], name="stage"))
+        cg = CodeGenerator(g, model_path="stage")
+        prog = [_HARNESS_HEAD.replace("DATA_T", "uint16_t"), cg._host_ops_section(),
+                "int main(void)", "{",
+                "    static Data_t buf[40], st[40], out[40]; unsigned i;",
+                "    inference_buf_t b = { buf }, o = { out };",
+                "    for (i = 0; i < 40u; i++) { buf[i] = (Data_t)(i + 1u); out[i] = 0xAAAAu; }",
+                "    host_load(st, &b, 5u, 3u, 8u);        /* 5 chunks of 3 at stride 8 */",
+                "    fwrite(st, 2, 15, stdout);",
+                "    host_store(&o, st, 5u, 3u, 8u);",
+                "    fwrite(out, 2, 40, stdout);", "    return 0;", "}"]
+        with tempfile.TemporaryDirectory() as td:
+            c, exe = os.path.join(td, "s.c"), os.path.join(td, "s")
+            with open(c, "w") as f:
+                f.write("\n".join(prog))
+            subprocess.run([_CC, "-O2", "-Wall", "-Wno-unused-function", c, "-lm",
+                            "-o", exe], check=True)
+            out = np.frombuffer(subprocess.run([exe], capture_output=True, check=True).stdout, "<u2")
+        compact = np.array([c * 8 + j + 1 for c in range(5) for j in range(3)])
+        np.testing.assert_array_equal(out[:15], compact)
+        expanded = np.zeros(40, np.uint16)
+        for c in range(5):
+            expanded[c * 8:c * 8 + 3] = compact[c * 3:c * 3 + 3]
+        np.testing.assert_array_equal(out[15:], expanded)      # gaps zeroed
+
 
 
 if __name__ == "__main__":

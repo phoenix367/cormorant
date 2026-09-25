@@ -174,6 +174,8 @@ class _HeaderMixin:
             "    unsigned  count;      /* number of Data_t elements allocated */\n"
             "    unsigned  refcount;   /* reference count; 0 for views, >=1 for owners */\n"
             "    uint8_t   is_owner;   /* 1 = owns the allocation; 0 = view (alias) */\n"
+            "    uint8_t   cached;     /* 1 = CPU mapping is cacheable (sync_* do real cache\n"
+            "                           * maintenance); 0 = non-cacheable mapping */\n"
             "#ifdef __linux__\n"
             "    unsigned  bo;         /* XRT buffer object handle */\n"
             "    uint64_t  bo_offset;  /* byte offset within the BO (0 for owners) */\n"
@@ -225,6 +227,20 @@ class _HeaderMixin:
         lines.append("unsigned inference_buf_count(const inference_buf_t *buf);")
         lines.append("")
         lines.append(
+            "/* 1 when the CPU mapping of buf is cacheable (fast CPU access; the\n"
+            " * sync_* calls below then write back / drop the CPU cache lines), 0 for\n"
+            " * a non-cacheable (write-combine) mapping.  Linux: XRT buffer objects\n"
+            " * are cacheable unless built with -DINFERENCE_BUF_CACHEABLE=OFF or run\n"
+            " * with the environment variable INFERENCE_BUF_CACHEABLE=0. */"
+        )
+        lines.append(
+            "static inline int inference_buf_is_cached(const inference_buf_t *buf)\n"
+            "{\n"
+            "    return buf->cached != 0u;\n"
+            "}"
+        )
+        lines.append("")
+        lines.append(
             "/* Initialise *view as a sub-buffer of *base starting at offset_elems\n"
             " * elements.  The view shares the same physical memory as base; it does NOT\n"
             " * own any allocation and must not be passed to inference_buf_free().\n"
@@ -238,13 +254,15 @@ class _HeaderMixin:
         )
         lines.append("")
         lines.append(
-            "/* Sync buffer to device — flush CPU cache before the PL kernel reads.\n"
+            "/* Sync buffer to device — write back (clean) the CPU cache lines of\n"
+            " * the buffer's range before a PL kernel reads OR writes it.\n"
             " * Called automatically by inference_run(); exposed for manual control. */"
         )
         lines.append("void inference_buf_sync_to_device(inference_buf_t *buf);")
         lines.append("")
         lines.append(
-            "/* Sync buffer from device — invalidate CPU cache after the PL kernel writes.\n"
+            "/* Sync buffer from device — drop (invalidate) the CPU cache lines of the\n"
+            " * buffer's range AFTER a PL kernel wrote it, before the CPU reads it.\n"
             " * Called automatically by inference_run(); exposed for manual control. */"
         )
         lines.append("void inference_buf_sync_from_device(inference_buf_t *buf);")

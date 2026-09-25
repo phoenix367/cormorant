@@ -26,16 +26,17 @@ which the scheduler's fixed-point simulator runs):
     saturation to the Data_t range, NaN -> 0; integer outputs with
     ``host_st_int`` (truncate toward zero, saturate).
 
-Data movement never touches the DMA buffers element-wise: on the KV260 the
-buffer pool is an XRT BO mapped NON-CACHEABLE (a strided 2-byte read costs
-~100 ns; the SpaceToDepth stem measured 16 ms for 300 KB when it read the
-BO directly).  Every host op therefore does one wide ``memcpy`` BO -> a
-malloc'd cached staging arena per input (``host_load``), computes
-stage -> stage, and one ``memcpy`` back (``host_store``, followed by a
-cache flush for the consuming kernel).  The arena is shared by all host
-ops (they run one at a time on the CPU) and sized to the largest one.
-Gather is the one exception: it copies whole embedding rows straight out
-of the (possibly huge) table buffer, one wide memcpy per row.
+Memory (BERT_PLAN phase 2B): the XRT buffer objects are mapped CACHEABLE by
+default (``inference_buf.c``), so a host op reads its inputs and writes its
+output in place in the BO (``host_in`` / ``host_out``);
+``inference_buf_sync_from_device`` invalidates a kernel-written input first
+and ``host_out_done`` flushes the output for the consuming kernel.  With the
+non-cacheable fallback (``INFERENCE_BUF_CACHEABLE=0``: a strided 2-byte read
+of a write-combine mapping costs ~100 ns) — and for advancing-strided
+layouts — the op goes through a malloc'd cached staging arena
+(``s_host_stage``, shared by all host ops and sized to the largest one) with
+one wide ``memcpy`` per buffer instead.  Gather always copies whole table
+rows straight out of the (possibly huge) table buffer.
 """
 
 from __future__ import annotations
@@ -175,14 +176,28 @@ def _c_double(v: float) -> str:
 # ------------------------------------------------------------------ #
 
 HOST_C_COMMON = r"""/*
- * host_load  — one wide memcpy DMA buffer -> cached stage.  A buffer with an
- *              advancing-strided layout (n_chunks blocks of `stride`
- *              elements, the first `chunk` valid) is compacted in place.
+ * DMA-buffer access.  inference_buf.c maps the XRT buffer objects CACHEABLE by
+ * default (buf->cached == 1; INFERENCE_BUF_CACHEABLE=0 selects the old
+ * non-cacheable write-combine mapping).  A host op then computes straight
+ * from / into the BO memory and the only extra work is the cache maintenance
+ * at the hand-offs; with a non-cacheable mapping (or an advancing-strided
+ * layout, which the helpers cannot index) it goes through the cached staging
+ * arena with one wide memcpy per buffer:
+ *
+ *   host_in       — the input's elements, flat: the BO itself, or a compacted
+ *                   copy in the stage (host_load).  A kernel-written input
+ *                   must be invalidated (inference_buf_sync_from_device)
+ *                   BEFORE host_in.
+ *   host_out      — where the helper writes the output: the BO or the stage.
+ *   host_out_done — a staged output is expanded + copied into its BO
+ *                   (host_store); either way the BO range is then flushed
+ *                   (inference_buf_sync_to_device) for the consuming kernel.
+ *
+ * host_load  — one wide memcpy DMA buffer -> stage.  An advancing-strided
+ *              layout (n_chunks blocks of `stride` elements, the first `chunk`
+ *              valid) is compacted in place.
  * host_store — the inverse (expand back to front, zero the gaps), one wide
- *              memcpy stage -> DMA buffer, then flush the CPU cache so the
- *              consuming kernel reads the new data.
- * The DMA buffers are an XRT BO mapped non-cacheable on the KV260: these two
- * sequential copies are the only accesses a host op makes to them.
+ *              memcpy stage -> DMA buffer, then the flush.
  */
 static void host_load(Data_t *dst, inference_buf_t *src,
                       unsigned n_chunks, unsigned chunk, unsigned stride)
@@ -210,6 +225,37 @@ static void host_store(inference_buf_t *dst, Data_t *src,
     }
     memcpy(inference_buf_ptr(dst), src, n * INFERENCE_BYTES_PER_ELEM);
     inference_buf_sync_to_device(dst);
+}
+
+/* 1 when the helper can use the BO memory itself: cacheable, flat layout. */
+static int host_direct(const inference_buf_t *b,
+                       unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    return inference_buf_is_cached(b) && (n_chunks <= 1u || stride == chunk);
+}
+
+static const Data_t *host_in(inference_buf_t *src, Data_t *stage,
+                             unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    if (host_direct(src, n_chunks, chunk, stride))
+        return inference_buf_ptr(src);
+    host_load(stage, src, n_chunks, chunk, stride);
+    return stage;
+}
+
+static Data_t *host_out(inference_buf_t *dst, Data_t *stage,
+                        unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    return host_direct(dst, n_chunks, chunk, stride) ? inference_buf_ptr(dst) : stage;
+}
+
+static void host_out_done(inference_buf_t *dst, Data_t *out,
+                          unsigned n_chunks, unsigned chunk, unsigned stride)
+{
+    if (out != inference_buf_ptr(dst))
+        host_store(dst, out, n_chunks, chunk, stride);        /* copy + flush */
+    else
+        inference_buf_sync_to_device(dst);
 }
 """
 

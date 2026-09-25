@@ -48,6 +48,7 @@ void inference_buf_init_view(inference_buf_t *view,
     view->count        = count_elems;
     view->refcount     = 0u;
     view->is_owner     = 0u;
+    view->cached       = base->cached;
 #ifdef __linux__
     view->bo           = base->bo;
     view->bo_offset    = base->bo_offset + byte_off;
@@ -124,13 +125,28 @@ void inference_buf_read_float(const inference_buf_t *buf,
 ////////////////////////////////////////////////////////////////////////
 /* Linux — XRT Buffer Object (BO) API                                 */
 /*                                                                     */
-/* xclAllocBO allocates DMA-coherent memory managed by the XRT        */
-/* runtime.  xclGetBOProperties.paddr is the physical device address  */
-/* to program into the AXI-Lite DMA registers.                         */
+/* xclAllocBO allocates physically contiguous (CMA) memory managed by  */
+/* the XRT zocl driver; xclGetBOProperties.paddr is the physical       */
+/* address to program into the kernels' AXI-Lite address registers.   */
 /*                                                                     */
-/* xclSyncBO handles cache coherency via the XRT DMA engine:           */
-/*   XCL_BO_SYNC_BO_TO_DEVICE   — flush before kernel reads inputs    */
-/*   XCL_BO_SYNC_BO_FROM_DEVICE — invalidate after kernel writes out  */
+/* The PL kernels' AXI masters do not snoop the CPU caches.  The BOs   */
+/* are mapped CACHEABLE by default (XCL_BO_FLAGS_CACHEABLE, as PYNQ's  */
+/* allocate(cacheable=True)): CPU access runs at cached speed and      */
+/* xclSyncBO does the cache maintenance on the requested range only:   */
+/*   XCL_BO_SYNC_BO_TO_DEVICE   — clean: CPU writes reach DDR; must    */
+/*                                precede any kernel read or write of  */
+/*                                the range                            */
+/*   XCL_BO_SYNC_BO_FROM_DEVICE — invalidate: drop stale lines after a */
+/*                                kernel wrote the range, before the   */
+/*                                CPU reads it                         */
+/* Views (inference_buf_init_view) sync their own byte range of the    */
+/* parent BO (size / offset arguments of xclSyncBO).                   */
+/*                                                                     */
+/* Fallback: -DINFERENCE_BUF_CACHEABLE=0 at build time, or the         */
+/* environment variable INFERENCE_BUF_CACHEABLE=0 at run time, maps    */
+/* the BOs non-cacheable (write-combine) as before: every CPU read of  */
+/* a BO then goes to DDR (~7x slower sequential, ~100 ns per scattered */
+/* 2-byte load), and the host ops stage through malloc'd memory.       */
 /*                                                                     */
 /* Mirrors PYNQ xrt_device.py allocate_bo / map_bo /                  */
 /*   get_device_address / flush / invalidate.                          */
@@ -144,10 +160,23 @@ void inference_buf_read_float(const inference_buf_t *buf,
 #include <stdio.h>
 #include <xrt.h>
 
-static xclDeviceHandle s_xrt_dev = NULL;
+#ifndef INFERENCE_BUF_CACHEABLE
+#  define INFERENCE_BUF_CACHEABLE 1
+#endif
+#ifndef XCL_BO_FLAGS_CACHEABLE
+#  define XCL_BO_FLAGS_CACHEABLE (1U << 24)       /* xrt_mem.h */
+#endif
+
+static xclDeviceHandle s_xrt_dev   = NULL;
+static int             s_cacheable = INFERENCE_BUF_CACHEABLE;
 
 int inference_buf_pool_init(void)
 {
+    const char *env = getenv("INFERENCE_BUF_CACHEABLE");
+    if (env && *env)
+        s_cacheable = (strcmp(env, "0") != 0);
+    if (s_xrt_dev)
+        return 0;
     s_xrt_dev = xclOpen(0, NULL, (enum xclVerbosityLevel)XCL_QUIET);
     if (s_xrt_dev == NULL) {
         fprintf(stderr, "inference: xclOpen(0) failed — is XRT loaded?\n");
@@ -164,12 +193,30 @@ void inference_buf_pool_deinit(void)
     }
 }
 
+static void _inference_buf_sync(inference_buf_t *buf, enum xclBOSyncDirection dir)
+{
+    static int reported = 0;
+    size_t     bytes = (size_t)buf->count * INFERENCE_BYTES_PER_ELEM;
+    int        rc;
+    if (bytes == 0u)
+        return;
+    rc = xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo, dir, bytes, (size_t)buf->bo_offset);
+    if (rc != 0 && !reported) {
+        reported = 1;
+        fprintf(stderr, "inference: xclSyncBO(%s, %zu bytes at offset %llu) failed: %d"
+                " — CPU / kernel data may be incoherent\n",
+                dir == XCL_BO_SYNC_BO_TO_DEVICE ? "to device" : "from device",
+                bytes, (unsigned long long)buf->bo_offset, rc);
+    }
+}
+
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
     /* Round up to 64 bytes: the kernels read / write whole 16-byte words
      * (VectorOPKernel writes the last word of every run whole), so the
      * allocation must cover the tail word past n_elem. */
     size_t                 bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
+    unsigned               flags = s_cacheable ? XCL_BO_FLAGS_CACHEABLE : 0u;
     xclBufferHandle        bo;
     void                  *virt;
     struct xclBOProperties props;
@@ -178,8 +225,8 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf = (inference_buf_t *)malloc(sizeof(inference_buf_t));
     if (!buf) return NULL;
 
-    /* flags = 0: XCL_BO_FLAGS_NONE — regular DMA-coherent host buffer */
-    bo = xclAllocBO(s_xrt_dev, bytes, 0, 0);
+    /* flags: memory bank 0 | XCL_BO_FLAGS_CACHEABLE (default) */
+    bo = xclAllocBO(s_xrt_dev, bytes ? bytes : 64u, 0, flags);
     if (bo == (xclBufferHandle)NULLBO) {
         fprintf(stderr, "inference: xclAllocBO(%zu bytes) failed\n", bytes);
         free(buf);
@@ -211,7 +258,12 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->bo        = (unsigned)bo;
     buf->refcount  = 1u;
     buf->is_owner  = 1u;
+    buf->cached    = (uint8_t)(s_cacheable != 0);
     buf->bo_offset = 0;
+    /* Start clean: no CPU-dirty line may exist in a range a kernel writes
+     * before the CPU ever touched it (~15 ms per 216 MiB on the KV260). */
+    if (buf->cached)
+        _inference_buf_sync(buf, XCL_BO_SYNC_BO_TO_DEVICE);
     return buf;
 }
 
@@ -222,20 +274,19 @@ static void _inference_buf_dealloc(inference_buf_t *buf)
     free(buf);
 }
 
-/* Flush: write dirty CPU cache lines to DDR before the AXI master reads. */
+/* Flush (clean): write dirty CPU cache lines of the range to DDR — before a
+ * kernel reads the range, and before a kernel writes it (a dirty line
+ * evicted later would overwrite the kernel's data). */
 void inference_buf_sync_to_device(inference_buf_t *buf)
 {
-    xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
-              XCL_BO_SYNC_BO_TO_DEVICE,
-              buf->count * INFERENCE_BYTES_PER_ELEM, buf->bo_offset);
+    _inference_buf_sync(buf, XCL_BO_SYNC_BO_TO_DEVICE);
 }
 
-/* Invalidate: drop CPU cache lines after the AXI master has written. */
+/* Invalidate: drop the CPU cache lines of the range after a kernel wrote it
+ * (and its lane drained), before the CPU reads it. */
 void inference_buf_sync_from_device(inference_buf_t *buf)
 {
-    xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo,
-              XCL_BO_SYNC_BO_FROM_DEVICE,
-              buf->count * INFERENCE_BYTES_PER_ELEM, buf->bo_offset);
+    _inference_buf_sync(buf, XCL_BO_SYNC_BO_FROM_DEVICE);
 }
 
 #else  /* bare-metal */
@@ -272,6 +323,8 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->count    = n_elem;
     buf->refcount = 1u;
     buf->is_owner = 1u;
+    buf->cached   = 1u;          /* standalone DDR is cached (Xil_DCache*) */
+    Xil_DCacheFlushRange((INTPTR)mem, (INTPTR)bytes);
     return buf;
 }
 
@@ -420,10 +473,11 @@ class _BufImplMixin:
 
         Platform-independent public API (accessors) plus two platform
         implementations selected at compile time by __linux__:
-          - Linux:      posix_memalign + mlock + /proc/self/pagemap (root).
-                        No special device needed; each buffer is independent.
+          - Linux:      XRT buffer objects (xclAllocBO / xclMapBO), mapped
+                        cacheable by default (INFERENCE_BUF_CACHEABLE), with
+                        xclSyncBO range flush / invalidate.
           - Bare-metal: malloc (virtual address == physical address on Xilinx
-                        standalone/FreeRTOS BSP).
+                        standalone/FreeRTOS BSP), Xil_DCache* maintenance.
         """
         return (
             _file_banner("inference_buf.c", self._graph, self._model_path) +

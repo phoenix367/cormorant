@@ -1908,14 +1908,15 @@ class SpaceToDepthNode:
     event stream emits it as a ``('cpu', idx)`` event and its liveness
     interval starts and ends at that event.
 
-    The loop never touches the DMA buffers element-wise: on the board the
-    DMA pool is an XRT BO with a NON-CACHEABLE CPU mapping, so the strided
-    2-byte source loads of the reorder were ~100 ns each (16 ms for the
-    ResNet-18 stem, measured).  inference_init() therefore mallocs a cached
-    staging block per node (``stage_c_name``, 2 x source numel); the run
-    does memcpy(BO -> stage_in), reorder stage_in -> stage_out in cached
-    memory, memcpy(stage_out -> BO): the only BO traffic is two wide
-    sequential copies.
+    With the default cacheable DMA mapping the reorder reads the source BO
+    and writes the output BO in place (then flushes the output).  With a
+    NON-CACHEABLE mapping (``INFERENCE_BUF_CACHEABLE=0``) the strided
+    2-byte source loads would cost ~100 ns each (16 ms for the ResNet-18
+    stem, measured), so inference_init() also mallocs a cached staging
+    block per node (``stage_c_name``, 2 x source numel) and that case does
+    memcpy(BO -> stage_in), reorder stage_in -> stage_out in cached memory,
+    memcpy(stage_out -> BO): the only BO traffic is two wide sequential
+    copies.
 
     Created by ``OnnxGraph._space_to_depth_stems`` (the ``s2d_stem`` graph
     transform) in front of a re-indexed stride-1 Conv; models that carry a
@@ -2039,15 +2040,23 @@ class SpaceToDepthNode:
             f"        /* y[n][(ph*{bs}+pw)*C + c][r][cc] = x[n][c][{bs}*r+ph][{bs}*cc+pw]"
             f"  (N={self.batch}, C={self.in_ch}, H={self.in_h}, W={self.in_w});\n"
             "         * dst advances in output order, so it is written sequentially.\n"
-            "         * Staged through cached host memory: the DMA buffers are mapped\n"
-            "         * non-cacheable (XRT BO), so the strided source loads of the reorder\n"
-            "         * must not hit them — only two wide sequential memcpys do. */\n"
+            "         * A cacheable DMA buffer is read / written in place; a non-cacheable\n"
+            "         * one (INFERENCE_BUF_CACHEABLE=0) is staged through cached host\n"
+            "         * memory so that only two wide sequential memcpys touch it. */\n"
             f"{sync_src}"
-            f"        const Data_t *src = {stage};\n"
-            f"        Data_t       *dst = {stage} + {n_el}u;\n"
+            "        const Data_t *src;\n"
+            "        Data_t       *dst0, *dst;\n"
             "        unsigned n, ph, pw, c, r, cc;\n"
-            f"        memcpy({stage}, inference_buf_ptr({x}),"
+            f"        if (inference_buf_is_cached({x})) {{\n"
+            f"            src = inference_buf_ptr({x});\n"
+            "        } else {\n"
+            f"            memcpy({stage}, inference_buf_ptr({x}),"
             f" {n_el}u * INFERENCE_BYTES_PER_ELEM);\n"
+            f"            src = {stage};\n"
+            "        }\n"
+            f"        dst0 = inference_buf_is_cached({y}) ? inference_buf_ptr({y})"
+            f" : {stage} + {n_el}u;\n"
+            "        dst  = dst0;\n"
             f"        for (n = 0u; n < {self.batch}u; n++)\n"
             f"        for (ph = 0u; ph < {bs}u; ph++)\n"
             f"        for (pw = 0u; pw < {bs}u; pw++)\n"
@@ -2058,7 +2067,8 @@ class SpaceToDepthNode:
             f"            for (cc = 0u; cc < {ow}u; cc++)\n"
             f"                *dst++ = s[cc * {bs}u];\n"
             "        }\n"
-            f"        memcpy(inference_buf_ptr({y}), {stage} + {n_el}u,"
+            f"        if (dst0 != inference_buf_ptr({y}))\n"
+            f"            memcpy(inference_buf_ptr({y}), dst0,"
             f" {n_el}u * INFERENCE_BYTES_PER_ELEM);\n"
             f"        inference_buf_sync_to_device({y});\n"
             "    }"

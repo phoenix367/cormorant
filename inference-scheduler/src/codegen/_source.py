@@ -187,10 +187,10 @@ class _SourceMixin:
             _banner("Host-CPU ops (no hardware kernel)"),
             "/*\n"
             " * Ops the PL kernels cannot run execute here, inline in inference_run():\n"
-            " * each reads its inputs with one wide memcpy into the cached staging\n"
-            " * arena s_host_stage, computes in double precision, rounds half to even\n"
-            " * + saturates on write-back and copies the result out with one memcpy\n"
-            " * (+ cache flush).  The scheduler's simulator (_simulate.py /\n"
+            " * each computes in double precision straight from / into the DMA buffers\n"
+            " * (cacheable mapping; else via the cached staging arena s_host_stage),\n"
+            " * rounds half to even + saturates on write-back, and flushes its output\n"
+            " * for the consuming kernel.  The scheduler's simulator (_simulate.py /\n"
             " * host_nodes.py) implements the same operations in the same order, so\n"
             " * test_inference.c expects bit-identical results.\n"
             " *\n"
@@ -215,15 +215,19 @@ class _SourceMixin:
         return "\n".join(parts)
 
     def _emit_host_block(self, sn) -> str:
+        """One host op inside inference_run(): invalidate kernel-written
+        inputs, get flat input / output pointers (the BO itself when the
+        mapping is cacheable and the layout flat, else the staging arena),
+        compute, and hand the output back (store if staged + flush)."""
         ins, (o_off, o_cnt, o_io), scratch, _ = self._host_stage_plan(sn)
         lines = ["    {"]
         for i, (t, off, cnt, _io) in enumerate(ins):
-            lines.append(f"        Data_t *in{i} = s_host_stage + {off}u;"
-                         f"  /* '{t.onnx_name}': {cnt} elem */")
-        lines.append(f"        Data_t *out = s_host_stage + {o_off}u;"
-                     f"  /* '{sn.output.onnx_name}': {o_cnt} elem */")
+            lines.append(f"        const Data_t *in{i};  /* '{t.onnx_name}': {cnt} elem"
+                         f" (stage +{off}) */")
+        lines.append(f"        Data_t       *out;  /* '{sn.output.onnx_name}': {o_cnt} elem"
+                     f" (stage +{o_off}) */")
         if scratch is not None:
-            lines.append(f"        void   *tmp = s_host_stage + {scratch}u;"
+            lines.append(f"        void         *tmp = s_host_stage + {scratch}u;"
                          f"  /* {sn.scratch_bytes()} B scratch */")
         seen = set()
         for t in list(sn.staged_inputs()) + list(sn.direct_inputs()):
@@ -236,13 +240,16 @@ class _SourceMixin:
             if lay is not None and (lay.n_chunks > 1 or lay.alloc != lay.numel):
                 raise SchedulerError(
                     f"host op [{sn.index}]: '{t.onnx_name}' must have a flat layout.")
-        for i, (t, _off, _cnt, (nc, ch, st)) in enumerate(ins):
-            lines.append(f"        host_load(in{i}, {t.c_name}, {nc}u, {ch}u, {st}u);")
+        for i, (t, off, _cnt, (nc, ch, st)) in enumerate(ins):
+            lines.append(f"        in{i} = host_in({t.c_name}, s_host_stage + {off}u,"
+                         f" {nc}u, {ch}u, {st}u);")
+        nc, ch, st = o_io
+        lines.append(f"        out = host_out({sn.output.c_name}, s_host_stage + {o_off}u,"
+                     f" {nc}u, {ch}u, {st}u);")
         for ln in sn.c_call([f"in{i}" for i in range(len(ins))], "out", "tmp",
                             [t.c_name for t in sn.direct_inputs()], self._dtype):
             lines.append("        " + ln)
-        nc, ch, st = o_io
-        lines.append(f"        host_store({sn.output.c_name}, out, {nc}u, {ch}u, {st}u);")
+        lines.append(f"        host_out_done({sn.output.c_name}, out, {nc}u, {ch}u, {st}u);")
         lines.append("    }")
         return "\n".join(lines)
 
@@ -288,9 +295,10 @@ class _SourceMixin:
             lines.append("")
             lines.append(
                 "/* Cached host staging blocks for the SpaceToDepth reorders (2 x source\n"
-                " * numel each: stage_in | stage_out).  The DMA buffers are mapped\n"
-                " * non-cacheable, so the reorder runs on a plain malloc'd copy and only\n"
-                " * sequential memcpys touch the DMA memory.  malloc'd in inference_init(). */"
+                " * numel each: stage_in | stage_out), used when a DMA buffer is mapped\n"
+                " * non-cacheable (INFERENCE_BUF_CACHEABLE=0): the reorder then runs on a\n"
+                " * plain malloc'd copy and only sequential memcpys touch the DMA memory.\n"
+                " * malloc'd in inference_init(). */"
             )
             for sn in host_ops:
                 lines.append(
@@ -305,6 +313,7 @@ class _SourceMixin:
                 "/* Cached staging arena shared by the host-CPU ops (they run one at a\n"
                 " * time): largest op's inputs + output + scratch, "
                 f"{n} elem ({n * self._dtype.bytes_per_elem} B).\n"
+                " * Only touched for a non-cacheable DMA buffer or a strided layout.\n"
                 " * malloc'd in inference_init(). */"
             )
             lines.append("static Data_t *s_host_stage = NULL;")
@@ -1069,24 +1078,37 @@ class _SourceMixin:
         param_str = ",\n".join(params)
 
         # ---- Cache sync strategy ------------------------------------------ #
-        # The FPGA kernel accesses DDR directly; CPU cache coherency is only
-        # needed at the user-visible boundary:
+        # The FPGA kernels access DDR directly (non-coherent); the CPU mapping
+        # of the buffers is cacheable by default (inference_buf.c).  Every
+        # CPU <-> kernel hand-off is therefore bracketed (Linux DMA-API rules):
         #   1. Flush user inputs (graph inputs, CPU-written) to DDR once before
         #      the first kernel invocation.  Weights are already flushed in
-        #      inference_init() and never change.  Internal buffers are only
-        #      written by the CPU inside a host op (SpaceToDepthNode), which
-        #      flushes its own output (and invalidates a kernel-written
-        #      source) at its position in the schedule.
-        #   2. Invalidate graph outputs from DDR once after all ops complete,
-        #      so the caller can read the results via the CPU virtual address.
+        #      inference_init() and never change.
+        #   2. Clean graph outputs before any kernel writes them: a caller that
+        #      wrote into an output buffer (e.g. a memset) leaves dirty cache
+        #      lines whose eviction would overwrite the kernel's result.
+        #   3. Internal buffers are only written by the CPU inside a host op
+        #      (SpaceToDepthNode / HostNode), which invalidates a kernel-written
+        #      source before reading it and flushes its own output, at its
+        #      position in the schedule (after the producer's lane drained).
+        #   4. Invalidate graph outputs once after all ops complete, so the
+        #      caller reads the results through the CPU virtual address.
         #      Internal (kernel-to-kernel) buffers are skipped entirely.
         # -------------------------------------------------------------------
-        sync_in_lines = [
+        sync_in_lines = ([
             "    /* Flush user inputs to DDR (CPU → FPGA) */",
         ] + [
             f"    inference_buf_sync_to_device({t.c_name});"
             for t in inputs
-        ]
+        ]) if inputs else []
+        if outputs:
+            sync_in_lines += [
+                "    /* Clean graph outputs: no CPU-dirty cache line may be evicted over a",
+                "     * kernel's result (the caller may have written these buffers). */",
+            ] + [
+                f"    inference_buf_sync_to_device({t.c_name});"
+                for t in outputs
+            ]
 
         sync_out_lines = [
             "    /* Invalidate graph outputs in CPU cache (FPGA → CPU) */",
@@ -1247,7 +1269,7 @@ class _SourceMixin:
             sections.append("\n".join(run_alias_assign_lines))
         if alias_redirect_lines:
             sections.append("\n".join(alias_redirect_lines))
-        if inputs:
+        if inputs or outputs:
             sections.append("\n".join(sync_in_lines))
         if body_lines:
             sections.append("\n".join(body_lines))
