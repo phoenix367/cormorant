@@ -7,9 +7,8 @@
 //
 //   * each product a*b is a multiple of 2^-16 with |a*b| <= 2^-4,
 //   * every partial sum over K <= kMaxK (2048) terms is a multiple of 2^-16
-//     with magnitude <= 2048 * 2^-4 = 128, i.e. an integer of magnitude
-//     <= 2^23 in units of 2^-16, which float (24-bit significand) holds
-//     exactly, so cblas_sgemm's result is exact whatever its summation
+//     with magnitude <= K * 2^-4 (256 at K = 4096), i.e. an integer of
+//     magnitude <= 2^24 in units of 2^-16, which float holds exactly, so cblas_sgemm's result is exact whatever its summation
 //     order or FMA usage,
 //   * the kernel's AccData_t (ap_fixed<32,16>) holds the same values
 //     exactly, so its accumulation is exact too.
@@ -49,7 +48,9 @@
 
 #include "MatmulKernel.h"
 
-static_assert(kMaxK <= 2048, "exactness bound: K * 64 * 64 must stay below 2^24");
+// Every partial sum is an integer of magnitude <= K * 64 * 64 in units of 2^-16;
+// float holds every integer up to 2^24 exactly.
+static_assert(kMaxK * 64u * 64u <= (1u << 24), "exactness bound: K * 64 * 64 must not exceed 2^24");
 
 // Inputs are i * 2^-8 with |i| <= kInputMaxUnits.
 static constexpr int kInputMaxUnits = 64;
@@ -259,10 +260,12 @@ int main()
     // -----------------------------------------------------------------------
     printf("\n--- Saturation ---\n");
 
-    run(RunTest2D("3 x kMaxK x 5  [sum = +kMaxK/16, saturates]",
-                  3, kMaxK, 5, 0, Fill::ConstPos));
-    run(RunTest2D("3 x kMaxK x 5  [sum = -kMaxK/16]",
-                  3, kMaxK, 5, 0, Fill::ConstNeg));
+    // K = 2048 puts the sums exactly on the Data_t limits (-128 stored,
+    // +128 saturated); K = kMaxK (> 2048) saturates both ways.
+    const unsigned KSAT = kMaxK < 2048u ? kMaxK : 2048u;
+    run(RunTest2D("3 x 2048 x 5  [sum = +128, saturates]",   3, KSAT, 5, 0, Fill::ConstPos));
+    run(RunTest2D("3 x 2048 x 5  [sum = -128, stored]",      3, KSAT, 5, 0, Fill::ConstNeg));
+    run(RunTest2D("3 x kMaxK x 5  [sum = -kMaxK/16]",         3, kMaxK, 5, 0, Fill::ConstNeg));
 
     // -----------------------------------------------------------------------
     // Batch tests

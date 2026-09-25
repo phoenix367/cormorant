@@ -20,7 +20,7 @@
       "tile_n":   4,
       "tile_m":  32,
       "tile_k": 256,
-      "max_k": 2048
+      "max_k": 4096
     },
     "pool": {
       "tile_c":            8,
