@@ -192,7 +192,11 @@
     "test/models/two_input_chain.onnx",
     "test/models/two_output_chain.onnx",
     "test/models/two_output_tap.onnx",
-    "test/models/unsqueeze_then_relu.onnx"
+    "test/models/unsqueeze_then_relu.onnx",
+    "test/models/bert_tiny_h32_l1.onnx",
+    "test/models/bert_tiny_h64_l2.onnx",
+    "test/models/bert_tiny_erf.onnx",
+    "test/models/bert_tiny_native.onnx"
   ],
   "_models_note": "Model paths relative to the inference-scheduler directory. Overridden by --models on the command line."
 }
