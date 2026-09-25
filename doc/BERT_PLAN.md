@@ -93,17 +93,18 @@ attention).  Output = C row-major.  Activations stay row-major as in the
 ONNX graph; the Gemm bias stays a VectorOP Add; both kernels accumulate
 exactly in `ap_fixed<32,16>` and floor + saturate the same way, so results
 stay **bit-identical** with phase 1.  Batch-1 FC layers (N = 1) stay on
-MatmulKernel.  Cycle model (§2.42 kernel, 100 MHz), per call:
+MatmulKernel.  Cycle model (§2.42 kernel), per call, converted at the board's
+100 MHz (the model prints ms at the platform JSON's 150 MHz — divide its ms by 1.5):
 
 | layer | mapping | model | MatmulKernel today |
 |---|---|---:|---:|
-| Q/K/V/out 768→768 | C=384 M=256, 1×2 s2, out 12×64 | 2.56 ms (79 % MAC) | ~53 ms |
-| FFN up 768→3072 | C=384 M=256, out 48×64 | 10.2 ms | ~212 ms |
-| FFN down 3072→768 | C=1024 M=256, 1×3 s3 | 11.3 ms (C=1536 1×2: 9.5 ms, needs max_in_ch 2048) | ~212 ms |
-| QKᵀ per head | C=64 M=256, 1×1, out 4×64 | 0.21 ms | ~2.6 ms |
-| P·V per head | C=256 M=256, 1×1, out 1×64 | 0.15 ms | ~1.5 ms |
+| Q/K/V/out 768→768 | C=384 M=256, 1×2 s2, out 12×64 | 3.84 ms (79 % MAC) | ~53 ms |
+| FFN up 768→3072 | C=384 M=256, out 48×64 | 15.3 ms | ~212 ms |
+| FFN down 3072→768 | C=1024 M=256, 1×3 s3 | 17.0 ms (C=1536 1×2: 14.2 ms, needs max_in_ch 2048) | ~212 ms |
+| QKᵀ per head | C=64 M=256, 1×1, out 4×64 | 0.32 ms | ~2.6 ms |
+| P·V per head | C=256 M=256, 1×1, out 1×64 | 0.23 ms | ~1.5 ms |
 
-→ linears ≈ 0.38 s, attention ≈ 0.05 s per inference (from 8.4 s).
+→ linears ≈ 0.57 s, attention ≈ 0.08 s per inference (from 8.4 s).
 
 **2B — host ops.**  Cacheable buffer pool (the generated code already
 syncs at every CPU↔kernel hand-off); 65 536-entry GELU table and a Softmax
