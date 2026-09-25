@@ -128,6 +128,19 @@ def parse_args(argv=None):
             "on by default: it halves the traffic of every Add->Relu pair."
         ),
     )
+    p.add_argument(
+        "--no-s2d-stem",
+        dest="s2d_stem",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not rewrite stride-2 Conv layers with <= 4 input channels "
+            "(e.g. an RGB 7x7 s2 stem) as a host-side SpaceToDepth(2) plus a "
+            "stride-1 Conv over 4x the channels.  The rewrite is on by "
+            "default: it fills 4x more ConvKernel input-channel lanes and "
+            "cuts the taps to a quarter."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -172,7 +185,7 @@ def main(argv=None):
     # 2. Parse and validate the ONNX model                             #
     # ---------------------------------------------------------------- #
     try:
-        graph = OnnxGraph(args.model, fuse_act=args.fuse_act)
+        graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

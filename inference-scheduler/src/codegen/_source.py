@@ -851,8 +851,10 @@ class _SourceMixin:
         # needed at the user-visible boundary:
         #   1. Flush user inputs (graph inputs, CPU-written) to DDR once before
         #      the first kernel invocation.  Weights are already flushed in
-        #      inference_init() and never change.  Internal buffers are never
-        #      written by the CPU so they need no flush.
+        #      inference_init() and never change.  Internal buffers are only
+        #      written by the CPU inside a host op (SpaceToDepthNode), which
+        #      flushes its own output (and invalidates a kernel-written
+        #      source) at its position in the schedule.
         #   2. Invalidate graph outputs from DDR once after all ops complete,
         #      so the caller can read the results via the CPU virtual address.
         #      Internal (kernel-to-kernel) buffers are skipped entirely.
@@ -907,6 +909,15 @@ class _SourceMixin:
                 body_lines.append("")
 
             elif kind == 'start_sync':
+                sn = nodes_by_idx[ev[1]]
+                body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
+                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")
+                body_lines.append("")
+
+            elif kind == 'cpu':
+                # Host-side op (SpaceToDepthNode): runs inline on the CPU and
+                # syncs its own buffers; profiled like a synchronous node.
                 sn = nodes_by_idx[ev[1]]
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
                 body_lines.append(sn.emit_call(self._layouts))

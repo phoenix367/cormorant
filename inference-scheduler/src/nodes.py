@@ -1833,3 +1833,197 @@ class ReshapeNode:
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         return ""
+
+
+# ------------------------------------------------------------------ #
+# SpaceToDepthNode — host-side block reorder (space-to-depth stem)     #
+# ------------------------------------------------------------------ #
+
+SPACE_TO_DEPTH_OP_TYPES: frozenset = frozenset({"SpaceToDepth"})
+
+
+def _s2d_stem_geometry(k: int, pad: int) -> Tuple[int, int, int]:
+    """One axis of the stride-2 → space-to-depth rewrite.
+
+    A stride-2 conv tap ``t`` (0..k-1) on the original axis reads input row
+    ``2o + t - pad``.  After a block-2 space-to-depth the same row is
+    ``(r, ph)`` with ``2r + ph = 2o + t - pad``; a stride-1 conv over the
+    reordered tensor with pad ``P`` reads rows ``o + R - P``, so
+    ``t = 2R + ph + pad - 2P``.  ``P = ceil(pad/2)`` makes ``t >= 0`` for
+    every ``(R, ph)`` reach ``t = 0``; the last tap then fixes the new
+    kernel extent.  Returns ``(K, P, off)`` with ``off = pad - 2P`` (0 or
+    -1) so that ``t = 2R + ph + off``; taps outside ``0..k-1`` are zero.
+    """
+    P   = -(-pad // 2)
+    off = pad - 2 * P
+    K   = (k - 1 - off) // 2 + 1
+    return K, P, off
+
+
+def _s2d_stem_weight(w: np.ndarray, pad_top: int, pad_left: int) -> np.ndarray:
+    """Re-index a ``[M, C, kh, kw]`` stride-2 filter for the block-2
+    space-to-depth input (ONNX SpaceToDepth channel order: output channel
+    ``(ph*2 + pw)*C + c`` holds ``x[c][2r+ph][2cc+pw]``).
+
+    ``w'[m][(ph*2+pw)*C + c][R][Cc] = w[m][c][2R+ph+off_h][2Cc+pw+off_w]``
+    with ``off`` from :func:`_s2d_stem_geometry`; source taps outside the
+    original window are zero.
+    """
+    M, C, kh, kw = w.shape
+    Kh, _, off_h = _s2d_stem_geometry(kh, pad_top)
+    Kw, _, off_w = _s2d_stem_geometry(kw, pad_left)
+    out = np.zeros((M, 4 * C, Kh, Kw), dtype=w.dtype)
+    for ph in range(2):
+        for pw in range(2):
+            for R in range(Kh):
+                a = 2 * R + ph + off_h
+                if not 0 <= a < kh:
+                    continue
+                for Cc in range(Kw):
+                    b = 2 * Cc + pw + off_w
+                    if not 0 <= b < kw:
+                        continue
+                    out[:, (ph * 2 + pw) * C:(ph * 2 + pw + 1) * C, R, Cc] = w[:, :, a, b]
+    return out
+
+
+@dataclass
+class SpaceToDepthNode:
+    """ONNX SpaceToDepth — a block reorder run on the host CPU, no hardware call.
+
+    ``y[n][(ph*bs + pw)*C + c][r][cc] = x[n][c][bs*r + ph][bs*cc + pw]``
+    (the ONNX channel order).  Emitted as a C loop inside inference_run():
+    it reads the source buffer after the producing lane has drained
+    (invalidating the CPU cache first when the source is a kernel output),
+    writes the reordered tensor into its own DMA buffer and flushes it so
+    the consuming kernel sees it.  The node is synchronous — it occupies
+    no lane and its output is complete when the loop returns — so the
+    event stream emits it as a ``('cpu', idx)`` event and its liveness
+    interval starts and ends at that event.
+
+    Created by ``OnnxGraph._space_to_depth_stems`` (the ``s2d_stem`` graph
+    transform) in front of a re-indexed stride-1 Conv; models that carry a
+    native SpaceToDepth are accepted the same way.
+    """
+
+    kernel_name: ClassVar[str] = ""  # no hardware kernel
+
+    onnx_node:   onnx.NodeProto
+    inputs:      List[TensorInfo]   # [source]
+    output:      TensorInfo
+    index:       int = 0
+    align_elems: int = 8
+
+    batch:     int = 1
+    in_ch:     int = 0
+    in_h:      int = 0
+    in_w:      int = 0
+    blocksize: int = 2
+    # Set by OnnxGraph: True when the source is a graph input (already
+    # flushed by the caller, nothing to invalidate before the CPU reads it).
+    src_is_graph_input: bool = field(default=False, init=False)
+
+    # Compatibility shims
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=1,    init=False)
+
+    @classmethod
+    def from_onnx_node(
+        cls,
+        node:        onnx.NodeProto,
+        tensors:     dict,
+        index:       int,
+        align_elems: int = 8,
+    ) -> "SpaceToDepthNode":
+        label = node.name or node.op_type
+        if node.op_type not in SPACE_TO_DEPTH_OP_TYPES:
+            raise SchedulerError(
+                f"SpaceToDepthNode.from_onnx_node() called with op_type='{node.op_type}'"
+            )
+        src_name = node.input[0]
+        out_name = node.output[0]
+        if src_name not in tensors:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': source tensor '{src_name}' not found."
+            )
+        if out_name not in tensors:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': output tensor '{out_name}' not found."
+            )
+        src = tensors[src_name]
+        out = tensors[out_name]
+        attrs = {a.name: a for a in node.attribute}
+        if "blocksize" not in attrs:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': 'blocksize' attribute is required."
+            )
+        bs = int(attrs["blocksize"].i)
+        if bs < 1:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': blocksize={bs} must be >= 1."
+            )
+        if len(src.shape) != 4:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': input must be 4-D (NCHW), "
+                f"got shape {src.shape}."
+            )
+        n, c, h, w = src.shape
+        if h % bs != 0 or w % bs != 0:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': input H={h}, W={w} must be "
+                f"multiples of blocksize={bs}."
+            )
+        expect = [n, c * bs * bs, h // bs, w // bs]
+        if list(out.shape) != expect:
+            raise SchedulerError(
+                f"SpaceToDepth node '{label}': output shape {out.shape} != "
+                f"expected {expect} for input {src.shape}, blocksize={bs}."
+            )
+        return cls(onnx_node=node, inputs=[src], output=out,
+                   index=index, align_elems=align_elems,
+                   batch=n, in_ch=c, in_h=h, in_w=w, blocksize=bs)
+
+    def emit_comment(self) -> str:
+        return (
+            f"    /* [{self.index}] SpaceToDepth({self.inputs[0].onnx_name})"
+            f" -> {self.output.onnx_name}"
+            f"  {self.inputs[0].shape} → {self.output.shape}"
+            f"  blocksize={self.blocksize}"
+            f"  (host CPU reorder, no hardware call) */"
+        )
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        x, y = self.inputs[0].c_name, self.output.c_name
+        bs = self.blocksize
+        oh, ow = self.in_h // bs, self.in_w // bs
+        sync_src = (
+            "" if self.src_is_graph_input else
+            f"        /* '{x}' was written by a kernel: drop stale CPU cache lines. */\n"
+            f"        inference_buf_sync_from_device({x});\n"
+        )
+        return (
+            "    {\n"
+            f"        /* y[n][(ph*{bs}+pw)*C + c][r][cc] = x[n][c][{bs}*r+ph][{bs}*cc+pw]"
+            f"  (N={self.batch}, C={self.in_ch}, H={self.in_h}, W={self.in_w});\n"
+            "         * dst advances in output order, so it is written sequentially. */\n"
+            f"{sync_src}"
+            f"        const Data_t *src = inference_buf_ptr({x});\n"
+            f"        Data_t       *dst = inference_buf_ptr({y});\n"
+            "        unsigned n, ph, pw, c, r, cc;\n"
+            f"        for (n = 0u; n < {self.batch}u; n++)\n"
+            f"        for (ph = 0u; ph < {bs}u; ph++)\n"
+            f"        for (pw = 0u; pw < {bs}u; pw++)\n"
+            f"        for (c = 0u; c < {self.in_ch}u; c++)\n"
+            f"        for (r = 0u; r < {oh}u; r++) {{\n"
+            f"            const Data_t *s = src + ((n * {self.in_ch}u + c) * {self.in_h}u"
+            f" + r * {bs}u + ph) * {self.in_w}u + pw;\n"
+            f"            for (cc = 0u; cc < {ow}u; cc++)\n"
+            f"                *dst++ = s[cc * {bs}u];\n"
+            "        }\n"
+            f"        inference_buf_sync_to_device({y});\n"
+            "    }"
+        )

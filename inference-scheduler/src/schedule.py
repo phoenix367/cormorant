@@ -23,6 +23,12 @@ still appears in the DAG as a normal node so any downstream consumer of
 the reshaped tensor is correctly ordered after the producer of the
 underlying source. The event emitter ignores nodes whose ``kernel_name``
 is the empty string.
+
+Host ops
+--------
+``SpaceToDepthNode`` also has an empty ``kernel_name`` (it runs on the
+CPU), but unlike a Reshape it produces a new buffer: it is an ordinary
+DAG node with a real producer edge to its consumer.
 """
 
 from __future__ import annotations

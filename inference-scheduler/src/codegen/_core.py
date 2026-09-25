@@ -41,7 +41,8 @@ from __future__ import annotations
 from typing import List, Optional
 
 from ..graph   import OnnxGraph
-from ..nodes    import ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode, SchedulerError
+from ..nodes    import (ScheduledNode, MatmulNode, ConvNode, PoolNode, ReshapeNode,
+                        SpaceToDepthNode, SchedulerError)
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
 from ..tensor  import TensorInfo
@@ -112,7 +113,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -169,7 +170,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -280,7 +281,8 @@ class _CoreMixin:
 
     def _kernel_id_of(self, sched) -> Optional[str]:
         """Return the kernel_id_t enum literal for sched's lane, or None
-        if sched does not occupy a hardware lane (ReshapeNode)."""
+        if sched does not occupy a hardware lane (ReshapeNode,
+        SpaceToDepthNode)."""
         kn = getattr(type(sched), "kernel_name", "")
         return self._KERNEL_ID_ENUM.get(kn) if kn else None
 
@@ -304,10 +306,16 @@ class _CoreMixin:
           ('drain',   kid, drained_idx)     — final kernel_wait before
                                                output cache sync
           ('reshape', node_idx)             — ReshapeNode: no kernel work
+          ('cpu',     node_idx)             — SpaceToDepthNode: host loop,
+                                               synchronous, occupies no lane
 
         ReshapeNodes are emitted as no-ops, but predecessor-wait analysis
         walks *through* them: a consumer of a Reshape alias must wait on
         the real producing kernel of the underlying source.
+
+        A 'cpu' node waits on its producers like a kernel start would, then
+        runs to completion inline, so its consumers never wait on it (it
+        has no lane) and the tensors it produced are complete at the event.
         """
         graph = self._graph
         dag   = Dag.from_graph(graph)
@@ -341,6 +349,7 @@ class _CoreMixin:
                 continue
 
             target = self._kernel_id_of(sn)
+            is_cpu = isinstance(sn, SpaceToDepthNode)
 
             # 1. Wait on each effective predecessor whose lane is still in flight.
             waits: list = []
@@ -362,7 +371,9 @@ class _CoreMixin:
                 events.append(('wait', k, drained))
                 pending.pop(k, None)
 
-            if self._is_synchronous_node(sn):
+            if is_cpu:
+                events.append(('cpu', sn.index))
+            elif self._is_synchronous_node(sn):
                 events.append(('start_sync', sn.index))
                 if target is not None:
                     pending.pop(target, None)
@@ -419,17 +430,17 @@ class _CoreMixin:
 
         events = self._compute_event_stream()
 
-        # Map node_idx → event index of its Start (or start_sync).
+        # Map node_idx → event index of its Start (or start_sync / cpu).
         start_event: dict = {}
         # Map node_idx → event index of the wait that drained it.  For a
-        # synchronous node the helper drains the lane itself; we record
-        # the same event index as the Start so the interval doesn't extend
-        # past the call.
+        # synchronous node the helper drains the lane itself (a 'cpu' node
+        # runs inline); we record the same event index as the Start so the
+        # interval doesn't extend past the call.
         drain_event: dict = {}
         for ei, ev in enumerate(events):
-            if ev[0] in ('start', 'start_sync'):
+            if ev[0] in ('start', 'start_sync', 'cpu'):
                 start_event[ev[1]] = ei
-                if ev[0] == 'start_sync':
+                if ev[0] in ('start_sync', 'cpu'):
                     drain_event[ev[1]] = ei
             elif ev[0] in ('wait', 'drain'):
                 drain_event[ev[2]] = ei
@@ -777,7 +788,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count <= 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
                 continue
             c_up = sn.output.c_name.upper()
             canonical[sn.output.onnx_name] = c_up
@@ -790,7 +801,7 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if sn.outer_count > 1:
                 continue
-            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode)):
+            if isinstance(sn, (MatmulNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode)):
                 continue
             if sn.output.onnx_name in canonical:
                 continue
