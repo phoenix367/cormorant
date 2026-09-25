@@ -2186,6 +2186,52 @@ layers unchanged.  Perf cases: `3x3-64ch-56x56` 4.94 → ~2.8 ms,
 
 ---
 
+### MatMul-on-ConvKernel geometries (BERT_PLAN.md §2 2A) — tests only, kernel unchanged
+
+The inference scheduler now runs MatMuls on this kernel with swapped
+operand roles (doc/INFERENCE_SCHEDULER.md "MatMul on ConvKernel"): for
+`C[N][M] = A[N][K]·B[K][M]` a conv with `out_ch = N`, `in_ch = K/kw`, a
+`1×kw` kernel with **stride (1, kw)**, no padding, output `out_h × out_w
+= M`, the weight port reading **A row-major** (the packed tile-major image
+when `K % (16·kw) == 0`) and `x` reading B in the layout
+`x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p]`.  Stride 3 / 4 and a
+`1×kw` kernel with stride = kw were new to the RTL fixtures, so
+`TestConvSim.cpp` got `run_matmul_case()` (builds the conv operands from A
+/ B exactly as the scheduler does and checks, besides the kernel, that the
+packed filter IS A and that the conv oracle equals the MatMul oracle) and
+`run_matmul_heads_case()` (per-head calls with the x / weight / y pointers
+offset into shared buffers — the scheduler's `run_conv_at()` for
+attention — with every lane outside the head's block checked untouched):
+
+* RTL fixtures 58–62 (appended; 0–57 byte-identical): 1×2 s(1,2) N=40
+  K=64 M=48; 1×3 s(1,3) N=24 K=96 M=48 (ow-tiles 20+4); 1×4 s(1,4) N=20
+  K=128 M=40 (ow-tiles 16+4); 1×1 N=80 K=64 M=64 (2 M-groups); 1×2 N=256
+  K=32 M=384 (4 M-groups, 2 oh-chunks, 2 ow-tiles).
+* C-sim only: the BERT-base classes (QKᵀ / P·V per head at full size,
+  768-wide 1×2, FFN-down 1×3 with `in_ch = 1024 = max_in_ch`, 1×4 with
+  in_ch 768, 1×1 in_ch 1024 with 17 m-tiles), a saturating case, two
+  offset-pointer head cases and 24 random lowered geometries (kw 1–4).
+
+**Result.**  C-sim all PASS (named + 300-case sweep + grid), **63/63 RTL
+PASS** (18 min); the unchanged cases reproduce §2.42 (sweep-bound anchor
+710 010 ns against 710 225).  New cases, RTL vs `--arch 42` model:
+
+| Case | RTL (ns) | model (cycles) | Δ |
+|---|---:|---:|---:|
+| 1×2 s(1,2) N=40 K=64 M=48 | 31 600 | 2.7 k | −16 % |
+| 1×3 s(1,3) N=24 K=96 M=48 (2 ow-tiles) | 32 800 | 3.2 k | −3 % |
+| 1×4 s(1,4) N=20 K=128 M=40 (2 ow-tiles) | 31 710 | 3.2 k | +1 % |
+| 1×1 N=80 K=64 M=64 (2 M-groups) | 73 810 | 3.9 k | −47 % |
+| 1×2 N=256 K=32 M=384 (2 oh-chunks) | 341 290 | 28.5 k | −17 % |
+
+The small cases are start-up dominated (the model's fixed 1 000-cycle
+invocation term); the two under-predictions are M-grouped layers with a
+tiny `in_ch` (1 and 4 ic-tiles), where the per-slab weight fill and the
+per-group ramps are not hidden.  The BERT-sized layers (12–48 ic-tiles,
+thousands of cycles per slab) are measured on the board in BERT_PLAN §3.
+
+---
+
 ### On board after §2.37–§2.39 (2026-09-26, bitstream WNS +1.06 ns, ConvKernel_0 x/y instances at 128)
 
 144/144 scheduler models PASS, including the partial-strobe run edges
@@ -2650,6 +2696,6 @@ until the next behavior-test sweep.
 | `inference-scheduler/src/nodes.py` | TODO — `ConvNode.from_onnx_node` validation against compile-time bounds.  **§2.9:** persistent-accumulator constraint relaxed to `out_w·out_ch ≤ kMaxAccPersistEntries`.  **§2.11:** `in_w ≤ kMaxInW` constraint REMOVED — replaced by `(kw-1)·dil_w + 1 ≤ kMaxLineBufCols`.  Scheduler validator should be updated to match. |
 | `kernels/conv/include/ConvMacGrid.h` | **§2.42:** `mac_grid_step` split into `w_cache_read` (one masked word per column) + `mac_grid_column_step` (one pixel's 16 trees, with the accumulator seed as an optional 17th leaf); the old `mac_grid_step` is a wrapper kept for `accumulate_standard` / TestConvGrid. |
 | `kernels/conv/test/TestConvGrid.cpp` | **§2.42:** + `test_pair` — two pixels against one weight read with the seeds injected at positions 0 and 1 (and the 1×1 dummy position), lane-exact against the scalar loop for every `(kh, kw, m_valid)`. |
-| `kernels/conv/test/TestConvSim.cpp` | **§2.42:** + 10 named cases (7 standard pair cases: odd / even `out_w` at stride 2, `out_w = 1`, even-rounded ow-tiles 30+30+4 and 64+64+2, stride-2 dilation-2, the s2d stem on 11×13; 2 depthwise: 1×1 and 3×3 s2 with odd `out_w`; the sweep-bound 3×3 64→64 28×28 anchor), appended after the existing RNG consumers so fixtures 0–44 are byte-identical.  34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
-| `hw/test_data/conv_test_data/` | **§2.42:** 58 fixtures (48 + 10; the three saturation stubs moved to indices 55–57).  30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
+| `kernels/conv/test/TestConvSim.cpp` | **BERT_PLAN 2A:** `run_matmul_case` / `run_matmul_heads_case` + 5 RTL and 9 + 24 C-sim-only MatMul-on-ConvKernel cases, appended after every existing RNG consumer.  **§2.42:** + 10 named cases (7 standard pair cases: odd / even `out_w` at stride 2, `out_w = 1`, even-rounded ow-tiles 30+30+4 and 64+64+2, stride-2 dilation-2, the s2d stem on 11×13; 2 depthwise: 1×1 and 3×3 s2 with odd `out_w`; the sweep-bound 3×3 64→64 28×28 anchor), appended after the existing RNG consumers so fixtures 0–44 are byte-identical.  34 tests (was 30 pre-§2.9).  **§2.9:** + `oh-chunking standard` + `DW oh-chunking`.  **§2.10:** + `M-grouping standard (out_ch=64)`.  **§2.11:** + `wide input ow-tiling (in_w=128)`.  **§2.12:** unchanged — channel-packing is transparent to the reference test.  **§2.13:** unchanged, but the two oh-chunking tests no longer chunk at the raised cap (see §7 †) — dims should grow to restore multi-chunk coverage. |
+| `hw/test_data/conv_test_data/` | **BERT_PLAN 2A:** 63 fixtures (+5 MatMul-on-ConvKernel geometries, 58–62).  **§2.42:** 58 fixtures (48 + 10; the three saturation stubs moved to indices 55–57).  30-test fixtures for kv260 RTL sim.  Four §2.9–§2.11 tests not yet captured; regenerate via `make gen_conv_test_data` to extend RTL coverage to 34/34. |
 | `doc/CONV_KERNEL.md` | Implementation reference — kept in sync with §2.8 (PN/PM unroll), §2.9 (oh-chunking), §2.10 (M-grouping + w_cache), §2.11 (ow-tiling, kMaxLineBufCols rename, relaxed constraint set), §2.12 (PatchVec channel-packed patch stream — §4 line_buf partition, §5.1/§5.2 patch-read pseudo-code, §11 summary row), §2.13 (URAM accumulator — §3 knob table, §4 `bind_storage` pragma, §11 summary row), §2.14 (unified patch producer — §4 single shared `line_buf`, memory-hierarchy diagram), §2.15 (`broadcast_patches` removal — §4 patch-path text, §5 stage count 6→5, §11 dataflow-stages row), §2.16 (`saturate_cast` at the Phase-3 drain — §5.1 drain pseudo-code, §6 saturation text, §11 accumulator-stream row), §2.17 (16×16 MAC operands — §11 MAC-operand-width row), §2.18 (patch register file — §4 `patch` declaration, §5.6 pragma table, §11 patch-buffer-storage row), §2.19 (tile-geometry hoist — §5 dataflow-stage notes on the `ConvGeometry` arg, §11 tile-geometry row), §2.20 (STABLE arguments — §5.6 pragma table row). |

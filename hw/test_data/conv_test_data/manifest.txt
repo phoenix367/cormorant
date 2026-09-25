@@ -58,3 +58,8 @@
 55 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 saturation__positive_overflow_____AP_MAX
 56 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 saturation__negative_overflow_____AP_MIN
 57 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 1 DW_saturation__positive_overflow_____AP_MAX
+58 1 32 3 32 40 3 16 1 2 1 2 1 1 0 0 0 0 mm-on-conv_1x2_s_1_2___N_40_K_64_M_48__out_3x16_
+59 1 32 2 72 24 2 24 1 3 1 3 1 1 0 0 0 0 mm-on-conv_1x3_s_1_3___N_24_K_96_M_48__out_2x24__2_ow-tiles_
+60 1 32 2 80 20 2 20 1 4 1 4 1 1 0 0 0 0 mm-on-conv_1x4_s_1_4___N_20_K_128_M_40__out_2x20__2_ow-tiles_
+61 1 64 2 32 80 2 32 1 1 1 1 1 1 0 0 0 0 mm-on-conv_1x1__N_80_K_64_M_64__out_2x32__2_M-groups_
+62 1 16 6 128 256 6 64 1 2 1 2 1 1 0 0 0 0 mm-on-conv_1x2__N_256_K_32_M_384__out_6x64__2_oh-chunks_
