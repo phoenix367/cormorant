@@ -30,7 +30,7 @@ second PS port becomes necessary once steps 4–5 land (step 6).
 
 | # | Step | Files | Expected | Cost / risk |
 |---|---|---|---|---|
-| 1 | **Stem via space-to-depth** (scheduler transform + host-side reorder in the generated C): Conv 7×7 s2 pad 3 with ic ≤ 4 → block-2 space-to-depth of the input (ic×4 channels, H/2×W/2) + Conv 4×4 s1 pads [top 2, left 2, bottom 1, right 1] with re-indexed weights (`w'[m][ic·4+ph·2+pw][r][c] = w[m][ic][2r+ph−3][2c+pw−3]`, zero where out of the 7×7 range).  The kernel already takes `pad_top/pad_left` explicitly and zero-pads bottom/right by bounds check. | `inference-scheduler/src/graph.py`, `nodes.py`, `codegen/*`, tests, `doc/INFERENCE_SCHEDULER.md` | 57 → ~27 ms now (12/16 lanes, 16 taps instead of 49), < 10 ms after 4–5 | scheduler only; reorder runs on the A53 (150 k elements, ~0.3 ms) |
+| 1 | **Stem via space-to-depth** (scheduler transform + host-side reorder in the generated C): Conv 7×7 s2 pad 3 with ic ≤ 4 → block-2 space-to-depth of the input (ic×4 channels, H/2×W/2) + Conv 4×4 s1 pads [top 2, left 2, bottom 1, right 1] with re-indexed weights (`w'[m][(ph·2+pw)·ic+c][R][C] = w[m][c][2R+ph−1][2C+pw−1] (pad 3; general `2R+ph+p−2·ceil(p/2)`)`, zero where out of the 7×7 range).  The kernel already takes `pad_top/pad_left` explicitly and zero-pads bottom/right by bounds check. | `inference-scheduler/src/graph.py`, `nodes.py`, `codegen/*`, tests, `doc/INFERENCE_SCHEDULER.md` | 57 → ~27 ms now (12/16 lanes, 16 taps instead of 49), < 10 ms after 4–5 | scheduler only; reorder runs on the A53 (150 k elements, ~0.3 ms) |
 | 2 | **PoolingKernel 8 lanes/cycle** (Track-C-style): 128-bit x is already there; process a full 128-bit word (8 channels) per cycle through window/reduce/write, 128-bit y with byte strobes for tails | `kernels/pool/*`, pool test stand project, `doc/POOL_OPTIMIZATION.md` | 16 → 2–3 ms (MaxPool 3×3 s2 112²×64); all pool cases ×4–6 | pool kernel only |
 | 3 | **1×1 stride-2 path**: trace why the 6.4 MMAC downsamples take 3.6 ms (14 %); expected fix is a flat II=1 sweep for kh = kw = 1 (the §2.37 recipe for depthwise) with stride handled in the x loader | `kernels/conv/*` | 11 → 2–3 ms | after step 4 in the same worktree |
 | 4 | **Conv grid 16×8 → 16×16** (`tile_m` 8 → 16 in `platforms/kv260.json` + whatever the kernel needs): w_cache moves to URAM (16/64 used) since BRAM is at 119/144; drain/write path must keep up with 16 output channels | `kernels/conv/*`, `platforms/kv260.json`, `gen_conv_models.py` (fixtures re-derive), `doc/CONV_OPTIMISATION.md` | 3×3 convs 220 → ~115–130 ms if sweep efficiency holds | DSP 155 → ~285 (of 1248), LUT +15–20 k (design 62 % → ~77 %), BRAM must not grow |
@@ -73,6 +73,12 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   (348.7 → 362.3, 221.4 → 235.1: their 3×3 s2 stems save 2.5 ms and paid
   16.3).  Fixed on `perf/stem` by staging the reorder through a cached
   malloc'd block (two sequential memcpys are the only BO traffic);
-  expected reorder ≤ 0.5 ms — re-measure.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
+  **re-measured after the staging fix (merge 58de431): reorder 3.0 ms**
+  (memcpy-in from the non-cacheable BO mapping is the remaining cost, ~0.2
+  GB/s), **ResNet-18 310 → 279.2 ms**, MobileNet v1 348.7 / v2 221.5 ms
+  (unchanged: −2.5 ms stem, +3.0 ms reorder), predictions identical.
+  Remaining lever for the 3 ms: allocate the buffer pool cacheable
+  (XCL_BO_FLAGS_CACHEABLE, syncs already emitted) — decide separately, it
+  changes every buffer's coherency model.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
   typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/INFERENCE_SCHEDULER.md`
   §Space-to-depth stem.
