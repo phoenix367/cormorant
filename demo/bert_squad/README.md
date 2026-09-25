@@ -253,6 +253,15 @@ page cache.  Per-layer profile, per inference:
 | VectorOP (bias / residual / mask adds, scale) | 126 | 97 | 0.8 % | 0.4–0.8 G element/s |
 | other (Gather, OneHot, Cast, Slice) | 5 | 3 | 0.0 % | |
 
+**Phase 2A — MatMuls on ConvKernel** (scheduler default since
+`feat/bertconv`, same bitstream; BERT_PLAN §3): **4.337 s per inference**
+(min 4.334, max 4.341 over 20, 2.80× faster), logits still bit-exact with
+the simulation (3 / 3) and the emulation (20 / 20), EM / F1 90.0 / 91.7
+unchanged.  MatMul linears 7661 → **492 ms** (ConvKernel 1×4 convs,
+~44 GMAC/s), attention MatMuls 750 → **136 ms** (one ConvKernel call per
+head); the host ops (GELU 2046 ms, Softmax 1070, LayerNorm 338, Transpose
+165) are now 83 % of the time.
+
 ## Options (`deploy_and_run.py`)
 
 | Flag | Effect |

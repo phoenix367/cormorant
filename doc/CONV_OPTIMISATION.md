@@ -2227,8 +2227,31 @@ PASS** (18 min); the unchanged cases reproduce §2.42 (sweep-bound anchor
 The small cases are start-up dominated (the model's fixed 1 000-cycle
 invocation term); the two under-predictions are M-grouped layers with a
 tiny `in_ch` (1 and 4 ic-tiles), where the per-slab weight fill and the
-per-group ramps are not hidden.  The BERT-sized layers (12–48 ic-tiles,
-thousands of cycles per slab) are measured on the board in BERT_PLAN §3.
+per-group ramps are not hidden.
+
+BERT-base geometries, one-off RTL run (fixtures written by a script, not
+checked in — 0.6–1 M-line hex files), against the model:
+
+| Case | RTL (cycles) | model | Δ |
+|---|---:|---:|---:|
+| Q/K/V class, one 16-row chunk: N 256, K 768, 1×4, in_ch 192, out 16×16 | 123.9 k | 127.6 k | +3 % |
+| QKᵀ head: N 256, K 64, 1×1, out 4×64 | 33.6 k | 31.6 k | −6 % |
+| P·V head: N 256, K 256, 1×1, out 1×64 | 67.6 k | 22.7 k | **−66 %** |
+
+The P·V head is **weight-request bound**: with a 1×64 output a slab (4
+m-tiles × 16 m-rows × 16 lanes) is swept in 268 cycles, but
+`stream_load_weights` issues it as 64 separate two-beat requests (one per
+m-row, 8 outstanding), ~1 000 cycles of request latency per slab that the
+model's bandwidth-only fill term (`f − s/2`) does not see — 64 slabs ×
+~700 exposed cycles is the gap.  A per-request term (≈ 15 cycles × m-rows,
+exposed beyond the sweep) fits this case to 1 % but moves several small
+suite cases the wrong way, so the model is unchanged for now.  On the
+board (BERT_PLAN §3) the same classes measure 0.90 (linears), 1.01 (QKᵀ)
+and 2.5 (P·V) × the model.  Removing it takes longer or more
+concurrent weight requests: the m-rows of a slab are `K` elements apart in
+the `[M][ict][kh][kw][16]` layout, so one request per slab needs an
+ict-major layout (for a lowered MatMul that is a re-layout of the
+activation A), or a deeper request window than 8.
 
 ---
 

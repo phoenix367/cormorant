@@ -98,7 +98,7 @@ def main():
               f" {c['cyc'] / CLOCK_HZ * 1e3:7.1f} ms {c['mm_cyc'] / CLOCK_HZ * 1e3:10.1f} ms")
     if geo:
         print("  ConvKernel geometries (per node: model ms on ConvKernel / on MatmulKernel):")
-        for (kind, shape, conv), c in sorted(geo.items()):
+        for (_kind, shape, conv), c in sorted(geo.items()):
             print(f"    {c['nodes']:3d} x {shape:24s} {conv:42s}"
                   f" {c['cyc'] / c['nodes'] / CLOCK_HZ * 1e3:7.2f} / "
                   f"{c['mm_cyc'] / c['nodes'] / CLOCK_HZ * 1e3:7.2f} ms")

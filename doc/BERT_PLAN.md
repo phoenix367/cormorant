@@ -10,7 +10,9 @@ Status: **phase 1 done and merged to main (2026-09-26)** — scheduler side
 (1b–1f), demo (1g) and the `max_k` 4096 bitstream (1a); BERT-base
 runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
-Phase 2 (performance) in progress — 2A conv lowering, 2B host ops (§2).
+Phase 2 (performance) in progress — 2B host ops (§2); **2A (MatMuls on
+ConvKernel) done on branch `feat/bertconv`: 4.34 s per inference**, still
+bit-exact (§3 "Phase 2A").
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -266,3 +268,114 @@ project built on the board in 16 s.
 
 VectorOP (0.8 %) is not worth touching.  With 1 and 2 done the model would
 be at roughly 2.5–3.5 s per inference.
+
+### Phase 2A — MatMul on ConvKernel (2026-09-26, branch `feat/bertconv`)
+
+No kernel or bitstream change: the scheduler lowers MatMuls onto ConvKernel
+with swapped operand roles (`src/matmul_lowering.py`, `MatmulConvNode`;
+doc/INFERENCE_SCHEDULER.md "MatMul on ConvKernel"), choosing the engine and
+the `(kw, out_w)` geometry with `src/cost_model.py` — the conv-cycle-model
+skill's standard path against a MatmulKernel block model calibrated on the
+phase-1 board numbers (it predicts phase 1's MatMuls at 8.37 s, measured
+8.41 s).  Rules on top of the cost: `K % 16 == 0`, `M % 8 == 0`, `N > 1`,
+at least one 16-row output tile, 10 % margin.
+
+**Schedule.**  96 of the 98 MatMuls run on ConvKernel in 360 calls; the
+K = 2 token-type MatMul and the M = 2 span head stay on MatmulKernel.  The
+cost model picked **1×4 kernels** for all 72 encoder linears, not the §2
+table's 1×2 / 1×3: `kw = 4` gives `in_ch = K/4` (192 / 768 — the FFN-down
+fits `max_in_ch = 1024` without the 2048 bump) and a 64-column input row
+that is exactly one 16-wide ow-tile, and every `kw ≥ 2` costs the same
+sweep (the §2.42 sweep's dummy second position only hurts `kw = 1`).
+Attention: `kw = 1` (B is an activation), one `run_conv_at()` per head.
+
+| MatMul | conv | model / call (100 MHz) | MatmulKernel model |
+|---|---|---:|---:|
+| Q/K/V/out 256×768·768×768 | in_ch 192, 1×4 s(1,4), out 48×16 | 3.81 ms | 54.5 ms |
+| FFN up 256×768·768×3072 | in_ch 192, 1×4, out 192×16 | 15.16 ms | 217.8 ms |
+| FFN down 256×3072·3072×768 | in_ch 768, 1×4, out 48×16 | 14.03 ms | 200.3 ms |
+| QKᵀ 256×64·64×256, 12 heads | in_ch 64, 1×1, out 4×64, 12 calls | 3.97 ms | 39.6 ms |
+| P·V 256×256·256×64, 12 heads | in_ch 256, 1×1, out 1×64, 12 calls | 2.91 ms | 22.1 ms |
+
+Cost model total: 0.62 s of MatMul per inference (0.53 linears + 0.08
+attention + 8 ms on MatmulKernel).
+
+**Gates.**  (1) ConvKernel C-sim (named + 300-case sweep + grid) and RTL
+**63/63** with five new `mm-on-conv` fixtures (1×2 / 1×3 / 1×4 with stride
+= kw, 1×1 with M-groups, 1×2 with oh-chunks); CONV_OPTIMISATION.md "MatMul-
+on-ConvKernel geometries".  (2) Scheduler: 1426 tests (layout vs an
+explicit loop, conv-vs-matmul identity through ConvKernel.h's weight
+formula, engine choice, simulation equal with the lowering on and off,
+emission, `-Werror` compile, host runs against a software ConvKernel);
+146 of the 148 board-suite projects and the ResNet-18 / MobileNet v1 / v2 /
+MNIST / LeNet demo projects are byte-identical to main's (the two that
+change, `mm_5d_2d` and `bert_tiny_h64_l2`, now lower MatMuls); new fixture
+`bert_tiny_h128_s64` lowers every linear (1×2 over re-laid-out weights) and
+attention MatMul.  (3) BERT-base: the generated project's `test_inference`
+passes on the host against the software kernels (bit-exact), and
+`bert_sched_check.py --n 5` is bit-exact on 5/5 (313/313 DDR tensors).
+(4) Board: tiny BERT 5/5 PASS (incl. `bert_tiny_h128_s64`); the
+148-model suite **148/148 PASS** with this scheduler.
+
+**Board** (same bitstream as phase 1, `deploy_and_run.py --n 20
+--profile-layers`): **4.337 s per inference** (min 4.334, max 4.341; from
+12.13 s, **2.80×**), `inference_init` 0.4 s; start / end logits
+**bit-exact** with the simulation on 3 / 3 checked examples and with the
+emulation on 20 / 20; **EM / F1 90.0 / 91.7** (unchanged, 19 / 20 same span
+as float).  Per inference:
+
+| kind | phase 1 | phase 2A | |
+|---|---:|---:|---:|
+| MatMul linears (74) | 7661 ms | **492 ms** | 15.6× |
+| attention MatMuls (24) | 750 ms | **136 ms** | 5.5× |
+| GELU (host) | 2049 ms | 2046 ms | |
+| Softmax (host) | 1072 ms | 1070 ms | |
+| LayerNorm (host) | 340 ms | 338 ms | |
+| Transpose (host) | 169 ms | 165 ms | |
+| VectorOP | 97 ms | 97 ms | |
+| other host | 3 ms | 3 ms | |
+| **sum / wall** | 12140 / 12132 ms | **4345 / 4337 ms** | |
+
+Cycle model against the board, per MatMul class (board = profiler window
+per layer, host call overhead included; model = `cost_model` incl. 1 500
+cycles per call):
+
+| class | layers | board / layer | model / layer | board / model |
+|---|---:|---:|---:|---:|
+| Q/K/V/out (1×4, out 48×16) | 48 | 3.43 ms | 3.81 ms | 0.90 |
+| FFN up (1×4, out 192×16) | 12 | 13.56 ms | 15.16 ms | 0.89 |
+| FFN down (1×4, in_ch 768) | 12 | 12.50 ms | 14.03 ms | 0.89 |
+| QKᵀ (12 × 1×1, out 4×64) | 12 | 4.01 ms | 3.97 ms | 1.01 |
+| P·V (12 × 1×1, out 1×64) | 12 | 7.31 ms | 2.91 ms | **2.51** |
+| token-type / span head (MatmulKernel) | 2 | 5.5 / 8.7 ms | — | |
+
+The linears run at ~44 GMAC/s (440 of the grid's 512 MACs per cycle at
+100 MHz: 151 MMAC in 3.43 ms), the model over-predicts them by 10 % (its
+known bias on long 1×1-class output runs), and the RTL behavior test of one
+full-height 16-row chunk of the Q/K/V class (N 256, K 768, out 16×16:
+123.9 k cycles, model 127.6 k) agrees.  **P·V is 2.5× slower than the
+model**, and the RTL shows the same (one head: 67.6 k cycles against a
+22.7 k model; QKᵀ 33.6 k against 31.6 k): with `out = 1×64` a weight slab
+(16 m-rows × 4 tiles × 16 lanes) is swept in only 268 cycles, while
+`stream_load_weights` fetches it as 64 separate two-beat requests (one per
+m-row, 8 outstanding) — ~1 000 cycles of DDR request latency per slab that
+the model's bandwidth-only fill term does not see.  It does not change a
+decision — P·V is still 3.2× faster than on MatmulKernel (7.3 against 23 ms
+per layer) and M = 64 leaves no other geometry — so the skill model was
+left as is; a
+per-request term (≈ 15 cycles × m-rows per slab, exposed beyond the sweep)
+fits P·V but moves several small RTL cases the wrong way — to be revisited
+with the next conv kernel change.
+
+**What is left.**  MatMuls are now 14 % of the inference (0.63 s); the
+host ops are 83 % (GELU 2.05 s, Softmax 1.07 s, LayerNorm 0.34 s,
+Transpose 0.17 s) — phase 2B.  Further MatMul gains, in order of size: P·V
+in the transposed form (Cᵀ = Vᵀ·Pᵀ: 64 output channels in one M-group, 256
+output pixels, so each slab is swept 4× longer — needs Pᵀ from the Softmax
+host op, Vᵀ from V's transpose and the context transpose to read Cᵀ, all
+free to produce there); `kw = 2`
+layouts for the attention operands written directly by the host
+transposes (halves the 1×1 sweep); more weight requests in flight in
+`stream_load_weights` (it keeps 8 two-beat per-m-row requests outstanding
+for P·V's slabs) — a kernel change.  No bound needs raising
+for BERT-base: `max_in_ch` 1024 suffices with `kw = 4`.

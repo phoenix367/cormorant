@@ -494,8 +494,10 @@ BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
 192×16) and the 24 attention MatMuls as 12 per-head 1×1 calls each — in 360
 ConvKernel calls; the K = 2 token-type MatMul and the M = 2 span head stay
 on MatmulKernel.  Cost model at 100 MHz: 0.62 s of MatMul per inference
-against 8.37 s on MatmulKernel (the phase-1 board measured 8.41 s).
-Board results: BERT_PLAN §3.
+against 8.37 s on MatmulKernel (the phase-1 board measured 8.41 s).  On
+the board the MatMuls take 0.63 s (linears 0.49 s at ~44 GMAC/s, attention
+0.14 s) and BERT-base 4.34 s per inference instead of 12.13 s, logits
+bit-exact — BERT_PLAN §3 "Phase 2A".
 
 ---
 
