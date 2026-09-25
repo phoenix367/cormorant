@@ -1,0 +1,85 @@
+{
+  "_comment": "Copy to bert_squad_config.json and edit. Relative paths are relative to demo/bert_squad/.",
+
+  "ssh": {
+    "host": "kv260.local",
+    "user": "root",
+    "port": 22,
+    "key_file": "~/.ssh/id_rsa",
+    "_key_file_note": "Path to the SSH private key; null for password auth.",
+    "password": null,
+    "connect_timeout": 15
+  },
+
+  "remote": {
+    "work_dir": "/tmp/bert_squad_demo",
+    "_work_dir_note": "Per-run directory on the board (project sources, build, inputs, logits).",
+    "weights_dir": "/root/bert_squad_weights",
+    "_weights_dir_note": "Persistent directory for the 208 MB weights/*.dat. Uploaded once; later runs upload only files whose size or checksum changed.",
+    "uio_devices": {
+      "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel":   "fabric_matmul"
+    },
+    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses only these two kernels.",
+    "cmake_args": []
+  },
+
+  "local": {
+    "driver_dirs": {
+      "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "MatmulKernel":   "../../build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src"
+    },
+    "_driver_dirs_note": "HLS-generated driver sources, copied into the project. Build with make synthesize_vectorop_kv260 synthesize_matmul_kv260."
+  },
+
+  "model": "assets/models/bertsquad-12-simplified.onnx",
+  "_model_note": "bertsquad-12 from the ONNX model zoo with pinned input shapes, see README.md.",
+
+  "io": {
+    "input_ids":      "input_ids:0",
+    "segment_ids":    "segment_ids:0",
+    "input_mask":     "input_mask:0",
+    "unique_ids":     "unique_ids_raw_output___9:0",
+    "start_logits":   "unstack:0",
+    "end_logits":     "unstack:1",
+    "unique_ids_out": "unique_ids:0"
+  },
+  "_io_note": "ONNX tensor name of each role. The C buffer names are derived from the graph.",
+
+  "inputs": {
+    "vocab":        "assets/vocab.txt",
+    "squad_dev":    "assets/dev-v1.1.json",
+    "num_examples": 50,
+    "selection":    "first",
+    "_selection_note": "'first' = the first N single-window dev questions; 'study' = bert_study.py's set (N drawn with seed 0 from the first 4N).",
+    "out_dir":      "assets/preprocessed"
+  },
+
+  "build": {
+    "jobs": 4,
+    "timeout": 1800
+  },
+
+  "run": {
+    "timeout": 3600,
+    "use_sudo": true,
+    "warmup": 1,
+    "smoke_test": true,
+    "_smoke_test_note": "Build and run the generated test_inference (expected: PASSED) before the benchmark.",
+    "profile_layers": false,
+    "env": {}
+  },
+
+  "reference": {
+    "bitexact_examples": 3,
+    "_bitexact_examples_note": "The first K examples are compared bit for bit with the scheduler's simulation (CodeGenerator._forward_pass).",
+    "emulation": true,
+    "_emulation_note": "Also run bert_study.py's float model and 'sched' emulation on every example (EM / F1 side by side). ~10 s per example per worker.",
+    "workers": 2
+  },
+
+  "board_lock": null,
+  "_board_lock_note": "Optional lock file; deploy_and_run.py holds flock() on it for the whole board session (serialises with other jobs sharing the board).",
+
+  "cleanup": true
+}

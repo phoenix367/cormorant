@@ -13,6 +13,7 @@ SSH details).
 |------|-------|-------|---------------|
 | [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split |
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency |
+| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (12.1 s per inference) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Real-time classification; annotated frames stream back over SSH with inference latency and whole-board power |
 
 ## Common workflow
