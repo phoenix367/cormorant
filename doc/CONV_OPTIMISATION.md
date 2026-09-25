@@ -2592,6 +2592,18 @@ of the 16×16 grid), 3x3-64ch-28x28 3.88 → 1.27, 3x3-64ch-56x56-s2 3.87 →
 model 310 → 91.2 ms; MobileNet v1 349 → 87 ms, v2 221 → 71 ms.  The
 cycle model's prediction (3×3 layers ~75 ms) held within 7 %.
 
+### 6.4. On board: §2.42 two pixels per cycle (2026-09-26)
+
+Bitstream WNS +1.18 ns, LUT 73 %, DSP 1009/1248, BRAM/URAM unchanged;
+144/144 models, demo predictions identical.  Perf: 3x3-64ch-56x56 4.94 →
+**2.68 ms** (86 GOPS, 84 % of 512 MACs), 3x3-64ch-28x28 / -56x56-s2 1.27 →
+0.71, 5x5-16ch 0.253 → 0.155, 3x3-1ch-28x28-32out 0.223 → 0.149 (b16
+3.20 → 2.07), dw-3x3-64ch-56x56 1.58 → 1.01, dw-3x3-32ch 0.224 → 0.154,
+1x1 cases unchanged.  ResNet-18: sixteen 3×3 layers 70.4 → 45.6 ms
+(73 % of the grid; the cycle model said ~40 ms), stem 9.7 → 5.7 ms,
+model **91.2 → 62.3 ms = 16.0 FPS**, MobileNet v1 87.4 → 83.1, v2 71.3 →
+65.9 ms.
+
 ## 7. Verification matrix
 
 | Configuration | C-sim (TestConvRef) | RTL sim (behavior_test_conv) |

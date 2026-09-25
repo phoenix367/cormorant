@@ -3,7 +3,7 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **steps 1–4 landed and measured on the board (2026-09-26): ResNet-18 310 → 91.2 ms (11.0 FPS)**; step 3 also delivered most of step 7; step 6 landed (neutral at 100 MHz); step 8 (two pixels per cycle) implemented on `perf/conv2px`, pending integration; step 5 not started.
+Status: **TARGET MET 2026-09-26 — ResNet-18 62.3 ms = 16.0 FPS at 100 MHz** (steps 1–4, 6 and 8; step 5 not needed, kept as an option).
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 
@@ -190,4 +190,44 @@ bitstream — the 3×3 layers are compute-bound at 89–97 %.  Kept in the
 design (it costs nothing) because it becomes necessary at 150 MHz, where
 the 512-channel layers' weight stream (4.7 MB per layer) would fill one
 2.4 GB/s port.
+
+### 3.3. Step 8 on the board: two pixels per cycle (2026-09-26) — target met
+
+Bitstream: WNS +1.18 ns, LUT 85.5 k (73 %), **DSP 1009/1248 (81 %)**,
+BRAM 111.5/144, URAM 48/64 (the +5 k routed LUT estimate was right: the
+sweep's runtime-g accumulator muxes went away); 144/144 models; demo
+predictions identical.
+
+| Demo | before (§3.1) | after | |
+|---|---:|---:|---:|
+| ResNet-18 | 91.2 ms | **62.3 ms** | **16.0 FPS** |
+| MobileNet v1 | 87.4 ms | 83.1 ms | |
+| MobileNet v2 | 71.3 ms | 65.9 ms | |
+| MNIST convnet / LeNet | 0.388 / 5.83 ms | 0.266 / 5.44 ms | |
+
+Perf: 3x3-64ch-56x56 4.94 → **2.68 ms (86 GOPS = 84 % of the 512-MAC
+grid)**, 3x3-64ch-28x28 1.27 → 0.71, 3x3-64ch-56x56-s2 1.27 → 0.71,
+5x5-16ch 0.253 → 0.155, 3x3-1ch-28x28-32out 0.223 → 0.149, dw-3x3-64ch
+1.58 → 1.01, dw-3x3-32ch 0.224 → 0.154; 1x1 cases unchanged (write-bound
+by design).
+
+ResNet-18 per layer (91.5 → 62.7 ms):
+
+| Layer class | before | after | share |
+|---|---:|---:|---:|
+| 3×3 convs ×16 | 70.41 ms | 45.60 ms | 73 % |
+| stem 4×4 12→64 | 9.67 ms | 5.65 ms | 9 % |
+| host reorder | 2.96 ms | 2.92 ms | 5 % |
+| 1×1 s2 downsamples ×3 | 2.31 ms | 2.31 ms | 4 % |
+| Relu ×9 | 2.04 ms | 2.04 ms | 3 % |
+| Add ×8 | 1.92 ms | 1.92 ms | 3 % |
+| MaxPool | 1.35 ms | 1.35 ms | 2 % |
+| FC, global pool, other | 0.87 ms | 0.87 ms | 1 % |
+
+The 3×3 layers run at 73 % of the 512-MAC grid.  What is left: the
+stem (5.7 ms at 12 of 16 lanes and 4×4 taps — a 3-channel-aware stem
+or 16-lane repack is the next single lever), the host reorder (2.9 ms,
+cacheable BO), Relu/Add (4 ms, fusable into the conv drain), the 1×1
+downsamples (5 ms, drain-bound).  Step 5 (150 MHz) would now be a
+further ×1.4 on the conv layers but needs timing work at DSP 81 %.
 
