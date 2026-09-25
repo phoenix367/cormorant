@@ -6,8 +6,8 @@ opset 12): 12 layers, hidden 768, 12 heads, FFN 3072, sequence 256,
 108.7 M parameters.  Inputs `input_ids`, `segment_ids`, `input_mask`
 (int64 [1,256]) and `unique_ids_raw_output___9` (int64 [1], passed
 through); outputs `unstack:0` / `unstack:1` = start / end logits [1,256].
-Status: **phase 1 done** — scheduler side (1b–1f) on `feat/bert-sched`,
-demo (1g) on `feat/bert-demo`; on the `max_k` 4096 bitstream (1a) BERT-base
+Status: **phase 1 done and merged to main (2026-09-26)** — scheduler side
+(1b–1f), demo (1g) and the `max_k` 4096 bitstream (1a); BERT-base
 runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
 Phase 2 (performance) open.
