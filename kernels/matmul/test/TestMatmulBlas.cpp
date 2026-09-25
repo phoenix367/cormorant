@@ -1,16 +1,28 @@
 // ---------------------------------------------------------------------------
-// TestMatmulBlas.cpp — validates MatmulKernel (float build) against cblas_sgemm.
+// TestMatmulBlas.cpp — validates MatmulKernel (the configured Data_t build,
+// ap_fixed<16,8> by default) against cblas_sgemm, bit-exactly.
 //
-// Both implementations receive identical float input arrays.  Outputs are
-// compared with an element-wise absolute tolerance derived from floating-point
-// error analysis for a length-K dot product:
+// Exactness argument.  Every input is an integer multiple of 2^-8 with
+// magnitude <= kInputMax = 64 * 2^-8 = 0.25, so
 //
-//   atol(i) = k * 8 * FLT_EPSILON * max(|ref[i]|, |got[i]|, 1e-6f)
+//   * each product a*b is a multiple of 2^-16 with |a*b| <= 2^-4,
+//   * every partial sum over K <= kMaxK (2048) terms is a multiple of 2^-16
+//     with magnitude <= 2048 * 2^-4 = 128, i.e. an integer of magnitude
+//     <= 2^23 in units of 2^-16, which float (24-bit significand) holds
+//     exactly, so cblas_sgemm's result is exact whatever its summation
+//     order or FMA usage,
+//   * the kernel's AccData_t (ap_fixed<32,16>) holds the same values
+//     exactly, so its accumulation is exact too.
 //
-// The factor of 8 gives headroom for BLAS implementations that may reorder
-// operations or use FMA instructions, producing slightly different rounding.
-// For inputs drawn from [-1,1] and typical K values this bound is never
-// exceeded in practice; failures indicate real disagreement.
+// The only inexact step is the kernel's final narrowing to Data_t
+// (saturate_cast: AP_TRN / AP_SAT).  The reference applies the same
+// saturate_cast to the exact float sum, after which the two results must be
+// bit-identical.  Two dedicated cases drive the sum to exactly -128 (the
+// most negative Data_t value, stored as is) and +128 (saturated to the
+// largest positive value) to cover the saturation path.
+//
+// With Data_t = float the same bound makes the kernel's own accumulation
+// exact, so the comparison stays bit-exact for that configuration as well.
 //
 // cblas_sgemm call convention (row-major, no transpose):
 //   C[n×m] = alpha * A[n×k] * B[k×m] + beta * C[n×m]
@@ -20,14 +32,15 @@
 // Test matrix:
 //   2D shapes  : 1×1×1, tile-exact, partial-tile (N/M/K independently and
 //                all together), arbitrary small, unit N, unit M, multi-tile
-//   Large K    : N=8, K=512, M=32  (stress-tests accumulation precision)
+//   Large K    : N=8, K=512, M=32; K=kMaxK/2; K=kMaxK
+//   Saturation : constant inputs, K=kMaxK, sums of exactly -128 and +128
 //   Batch      : no broadcast, A broadcasts, B broadcasts
+//   Packed B   : tile-major constant-weight layout (b_packed=1)
 // ---------------------------------------------------------------------------
 
 #include <cblas.h>
 
 #include <algorithm>
-#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -36,38 +49,89 @@
 
 #include "MatmulKernel.h"
 
-// Tolerance multiplier: k * kFactor * FLT_EPSILON * |value|
-static constexpr float kFactor = 8.0f;
+static_assert(kMaxK <= 2048, "exactness bound: K * 64 * 64 must stay below 2^24");
+
+// Inputs are i * 2^-8 with |i| <= kInputMaxUnits.
+static constexpr int kInputMaxUnits = 64;
+static constexpr float kInputUnit    = 1.0f / 256.0f;
+
+enum class Fill { Random, ConstPos, ConstNeg };
 
 // ---------------------------------------------------------------------------
-// Element comparison with a k-dependent absolute tolerance.
+// Element helpers.
 // ---------------------------------------------------------------------------
-static bool is_close(float ref_val, float got_val, unsigned k)
+static void fill_inputs(std::vector<float>& v, Fill fill, std::default_random_engine& rng)
 {
-    const float scale = std::max({std::abs(ref_val), std::abs(got_val), 1e-6f});
-    const float atol  = static_cast<float>(k) * kFactor * FLT_EPSILON * scale;
-    return std::abs(ref_val - got_val) <= atol;
+    std::uniform_int_distribution<int> dist(-kInputMaxUnits, kInputMaxUnits);
+    for (auto& x : v) {
+        switch (fill) {
+            case Fill::Random:   x = static_cast<float>(dist(rng)) * kInputUnit; break;
+            case Fill::ConstPos: x = static_cast<float>(kInputMaxUnits) * kInputUnit; break;
+            case Fill::ConstNeg: x = -static_cast<float>(kInputMaxUnits) * kInputUnit; break;
+        }
+    }
+}
+
+static std::vector<Data_t> to_data(const std::vector<float>& v)
+{
+    std::vector<Data_t> out(v.size());
+    for (size_t i = 0; i < v.size(); i++) out[i] = Data_t(v[i]);
+    return out;
+}
+
+// The kernel's exact accumulator value, narrowed exactly as the kernel does.
+static Data_t quantise_like_kernel(float exact_sum)
+{
+    return saturate_cast<Data_t>(AccData_t(exact_sum));
+}
+
+// A / B are 128-bit word ports: pack the element vectors into MatmulWord
+// arrays (row-major layout unchanged; one spare word so the kernel's last
+// partial-word read of a row stays inside the buffer).
+static std::vector<MatmulWord> to_words(const std::vector<Data_t>& e)
+{
+    std::vector<MatmulWord> out(e.size() / kMatmulPortElems + 1);
+    for (auto& wd : out) wd = 0;
+    for (size_t i = 0; i < e.size(); i++) {
+        const unsigned lane = (unsigned)(i % kMatmulPortElems);
+        out[i / kMatmulPortElems].range(kMatmulDataBits * (lane + 1) - 1, kMatmulDataBits * lane)
+            = matmul_data_to_lane(e[i]);
+    }
+    return out;
+}
+
+// Tile-major packed image of B (MatmulKernel.h "Packed (tile-major) B
+// layout"): every batch slice of k*m becomes k*packed_m elements.
+static std::vector<Data_t> pack_b_tile_major(const std::vector<Data_t>& B,
+                                             unsigned k, unsigned m,
+                                             unsigned batch, unsigned b_stride,
+                                             unsigned& packed_stride)
+{
+    const unsigned pm     = matmul_packed_m(m);
+    const unsigned slices = (b_stride == 0) ? 1u : batch;
+    packed_stride         = (b_stride == 0) ? 0u : k * pm;
+    std::vector<Data_t> out((size_t)slices * k * pm, Data_t(0));
+    for (unsigned s = 0; s < slices; s++)
+        for (unsigned kk = 0; kk < k; kk++)
+            for (unsigned mm = 0; mm < m; mm++)
+                out[(size_t)s * k * pm + matmul_packed_index(kk, mm, k)] =
+                    B[(size_t)s * b_stride + (size_t)kk * m + mm];
+    return out;
 }
 
 // ---------------------------------------------------------------------------
-// Compare two float arrays and report the first mismatch.
+// Bit-exact comparison; reports the first mismatch.
 // ---------------------------------------------------------------------------
-static bool compare_outputs(
-    const float* ref,
-    const float* got,
-    unsigned     count,
-    unsigned     k,
-    const char*  label)
+static bool compare_outputs(const std::vector<Data_t>& ref,
+                            const std::vector<Data_t>& got,
+                            const char* label)
 {
     unsigned mismatches = 0;
-    for (unsigned i = 0; i < count; i++) {
-        if (!is_close(ref[i], got[i], k)) {
+    for (size_t i = 0; i < ref.size(); i++) {
+        if (matmul_data_to_lane(ref[i]) != matmul_data_to_lane(got[i])) {
             if (mismatches == 0) {
-                printf("  FAIL  [%u] blas=%.8f  kernel=%.8f  diff=%.3e\n",
-                       i,
-                       static_cast<double>(ref[i]),
-                       static_cast<double>(got[i]),
-                       static_cast<double>(std::abs(ref[i] - got[i])));
+                printf("  FAIL  [%zu] blas=%.8f  kernel=%.8f\n",
+                       i, static_cast<double>(ref[i]), static_cast<double>(got[i]));
             }
             mismatches++;
         }
@@ -76,55 +140,20 @@ static bool compare_outputs(
         printf("  PASS  %s\n", label);
         return true;
     }
-    printf("  FAIL  %s  (%u/%u elements exceed tolerance)\n",
-           label, mismatches, count);
+    printf("  FAIL  %s  (%u/%zu elements differ)\n", label, mismatches, ref.size());
     return false;
 }
 
 // ---------------------------------------------------------------------------
-// RunTest2D — 2D matrix product via cblas_sgemm vs MatmulKernel (float).
+// RunTest — batched product via cblas_sgemm (looped) vs MatmulKernel.
+// a_stride / b_stride of 0 broadcast that operand across the batch.
 // ---------------------------------------------------------------------------
-static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
-                      unsigned seed = kSeed)
-{
-    std::vector<float> A(n * k), B(k * m);
-    std::vector<float> C_blas(n * m, 0.0f);
-    std::vector<float> C_kern(n * m, 0.0f);
-
-    std::default_random_engine rng(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto& v : A) v = dist(rng);
-    for (auto& v : B) v = dist(rng);
-
-    // BLAS reference: C = 1·A·B + 0·C  (row-major, no transpose)
-    cblas_sgemm(CblasRowMajor,
-                CblasNoTrans, CblasNoTrans,
-                static_cast<int>(n),
-                static_cast<int>(m),
-                static_cast<int>(k),
-                1.0f,
-                A.data(), static_cast<int>(k),
-                B.data(), static_cast<int>(m),
-                0.0f,
-                C_blas.data(), static_cast<int>(m));
-
-    // Tiled kernel
-    MatmulKernel(A.data(), B.data(), C_kern.data(),
-                 n, k, m,
-                 /*batch=*/1,
-                 /*a_stride=*/n * k, /*b_stride=*/k * m, /*c_stride=*/n * m);
-
-    return compare_outputs(C_blas.data(), C_kern.data(), n * m, k, label);
-}
-
-// ---------------------------------------------------------------------------
-// RunTestBatch — batched products via cblas_sgemm (looped) vs MatmulKernel.
-// ---------------------------------------------------------------------------
-static bool RunTestBatch(const char* label,
-                         unsigned n, unsigned k, unsigned m,
-                         unsigned batch,
-                         unsigned a_stride, unsigned b_stride,
-                         unsigned seed = kSeed)
+static bool RunTest(const char* label,
+                    unsigned n, unsigned k, unsigned m,
+                    unsigned batch, unsigned a_stride, unsigned b_stride,
+                    unsigned b_packed = 0,
+                    Fill fill = Fill::Random,
+                    unsigned seed = kSeed)
 {
     const unsigned a_total  = (a_stride == 0) ? n * k : batch * a_stride;
     const unsigned b_total  = (b_stride == 0) ? k * m : batch * b_stride;
@@ -132,35 +161,44 @@ static bool RunTestBatch(const char* label,
 
     std::vector<float> A(a_total), B(b_total);
     std::vector<float> C_blas(batch * c_stride, 0.0f);
-    std::vector<float> C_kern(batch * c_stride, 0.0f);
 
     std::default_random_engine rng(seed);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (auto& v : A) v = dist(rng);
-    for (auto& v : B) v = dist(rng);
+    // Constant fills: A is +0.25 everywhere, B is +0.25 (ConstPos) or -0.25
+    // (ConstNeg), so every sum is +(K/16) or -(K/16).
+    fill_inputs(A, fill == Fill::Random ? Fill::Random : Fill::ConstPos, rng);
+    fill_inputs(B, fill, rng);
 
     // BLAS reference: one call per batch element (cblas_sgemm is not batched).
     for (unsigned bi = 0; bi < batch; bi++) {
-        const float* a_ptr = A.data() + bi * a_stride;
-        const float* b_ptr = B.data() + bi * b_stride;
-        float*       c_ptr = C_blas.data() + bi * c_stride;
-
-        cblas_sgemm(CblasRowMajor,
-                    CblasNoTrans, CblasNoTrans,
-                    static_cast<int>(n),
-                    static_cast<int>(m),
-                    static_cast<int>(k),
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
                     1.0f,
-                    a_ptr, static_cast<int>(k),
-                    b_ptr, static_cast<int>(m),
+                    A.data() + bi * a_stride, static_cast<int>(k),
+                    B.data() + bi * b_stride, static_cast<int>(m),
                     0.0f,
-                    c_ptr, static_cast<int>(m));
+                    C_blas.data() + bi * c_stride, static_cast<int>(m));
     }
+    std::vector<Data_t> C_ref(C_blas.size());
+    for (size_t i = 0; i < C_blas.size(); i++) C_ref[i] = quantise_like_kernel(C_blas[i]);
 
-    MatmulKernel(A.data(), B.data(), C_kern.data(),
-                 n, k, m, batch, a_stride, b_stride, c_stride);
+    // Kernel: element vectors → 128-bit words, optional tile-major B.
+    std::vector<Data_t> A_d = to_data(A), B_d = to_data(B);
+    unsigned b_stride_eff = b_stride;
+    if (b_packed) B_d = pack_b_tile_major(B_d, k, m, batch, b_stride, b_stride_eff);
+    std::vector<MatmulWord> aw = to_words(A_d), bw = to_words(B_d);
+    std::vector<Data_t> C_kern(batch * c_stride, Data_t(0));
 
-    return compare_outputs(C_blas.data(), C_kern.data(), batch * c_stride, k, label);
+    MatmulKernel(aw.data(), bw.data(), C_kern.data(),
+                 n, k, m, batch, a_stride, b_stride_eff, c_stride, b_packed);
+
+    return compare_outputs(C_ref, C_kern, label);
+}
+
+static bool RunTest2D(const char* label, unsigned n, unsigned k, unsigned m,
+                      unsigned b_packed = 0, Fill fill = Fill::Random)
+{
+    return RunTest(label, n, k, m, /*batch=*/1,
+                   /*a_stride=*/n * k, /*b_stride=*/k * m, b_packed, fill);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,8 +210,9 @@ int main()
     int  total  = 0;
     int  passed = 0;
 
-    printf("MatmulKernel BLAS comparison tests (float)\n");
-    printf("  Data_t=float  AccData_t=float\n");
+    printf("MatmulKernel BLAS comparison tests (bit-exact, inputs i * 2^-8, |i| <= %d)\n",
+           kInputMaxUnits);
+    printf("  Data_t=%u bits  kMatmulPortElems=%u\n", kMatmulDataBits, kMatmulPortElems);
     printf("  kTileN=%u  kTileM=%u  kTileK=%u  kMaxK=%u\n\n",
            kTileN, kTileM, kTileK, kMaxK);
 
@@ -205,16 +244,25 @@ int main()
                   kTileN * 3,   kTileK * 2 + 7,  kTileM * 2 + 1));
 
     // -----------------------------------------------------------------------
-    // Large-K test — stresses accumulation order differences.
-    //
-    // K=512 means 512 multiply-add operations per output element.  Reordering
-    // these (as BLAS may do with SIMD) produces FP rounding differences
-    // proportional to K * FLT_EPSILON.  The test tolerance is set to cover this.
+    // Large-K tests — long accumulations, still exact (see header).
     // -----------------------------------------------------------------------
-    printf("\n--- Large K (precision stress) ---\n");
+    printf("\n--- Large K ---\n");
 
     run(RunTest2D("8 x 512 x 32  [large K]",    8,  512, 32));
-    run(RunTest2D("16 x 1024 x 16  [K=kMaxK/2]", 16, kMaxK / 2, 16));
+    run(RunTest2D("16 x kMaxK/2 x 16",          16, kMaxK / 2, 16));
+    run(RunTest2D("4 x kMaxK x 40  [K=kMaxK]",  4,  kMaxK, 40));
+
+    // -----------------------------------------------------------------------
+    // Saturation — constant inputs +-0.25, K=kMaxK: every sum is
+    // +-(kMaxK / 16).  With kMaxK = 2048 that is -128 (representable, stored
+    // as is) and +128 (saturated to the largest Data_t).
+    // -----------------------------------------------------------------------
+    printf("\n--- Saturation ---\n");
+
+    run(RunTest2D("3 x kMaxK x 5  [sum = +kMaxK/16, saturates]",
+                  3, kMaxK, 5, 0, Fill::ConstPos));
+    run(RunTest2D("3 x kMaxK x 5  [sum = -kMaxK/16]",
+                  3, kMaxK, 5, 0, Fill::ConstNeg));
 
     // -----------------------------------------------------------------------
     // Batch tests
@@ -223,20 +271,33 @@ int main()
 
     const unsigned BN = kTileN + 1, BK = kTileK / 4, BM = kTileM + 3;
 
-    run(RunTestBatch("batch=3, no broadcast",
-                     BN, BK, BM,
-                     /*batch=*/3,
-                     /*a_stride=*/BN * BK, /*b_stride=*/BK * BM));
+    run(RunTest("batch=3, no broadcast",
+                BN, BK, BM, /*batch=*/3,
+                /*a_stride=*/BN * BK, /*b_stride=*/BK * BM));
+    run(RunTest("batch=4, A broadcasts (a_stride=0)",
+                BN, BK, BM, /*batch=*/4,
+                /*a_stride=*/0, /*b_stride=*/BK * BM));
+    run(RunTest("batch=4, B broadcasts (b_stride=0)",
+                BN, BK, BM, /*batch=*/4,
+                /*a_stride=*/BN * BK, /*b_stride=*/0));
 
-    run(RunTestBatch("batch=4, A broadcasts (a_stride=0)",
-                     BN, BK, BM,
-                     /*batch=*/4,
-                     /*a_stride=*/0, /*b_stride=*/BK * BM));
+    // -----------------------------------------------------------------------
+    // Packed (tile-major) B
+    // -----------------------------------------------------------------------
+    printf("\n--- Packed B ---\n");
 
-    run(RunTestBatch("batch=4, B broadcasts (b_stride=0)",
-                     BN, BK, BM,
-                     /*batch=*/4,
-                     /*a_stride=*/BN * BK, /*b_stride=*/0));
+    run(RunTest2D("TileN x TileK x TileM  [packed]",
+                  kTileN, kTileK, kTileM, 1));
+    run(RunTest2D("(TileN+2) x (TileK+5) x (TileM+3)  [packed, all partial]",
+                  kTileN + 2, kTileK + 5, kTileM + 3, 1));
+    run(RunTest2D("1 x kMaxK x 1001  [packed, FC-style]",
+                  1, kMaxK, 1001, 1));
+    run(RunTest("batch=3, packed, no broadcast",
+                BN, BK, BM, /*batch=*/3,
+                /*a_stride=*/BN * BK, /*b_stride=*/BK * BM, 1));
+    run(RunTest("batch=4, packed, B broadcasts (b_stride=0)",
+                BN, BK, BM, /*batch=*/4,
+                /*a_stride=*/BN * BK, /*b_stride=*/0, 1));
 
     // -----------------------------------------------------------------------
     // Summary

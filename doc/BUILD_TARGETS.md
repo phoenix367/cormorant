@@ -34,7 +34,7 @@ synthesis targets. Rarely built directly.
 |--------|-------------|
 | `vadd_kernel` | VectorOPKernel object library |
 | `conv_kernel` / `conv_kernel_float` | ConvKernel — configured type / forced-`float` builds |
-| `matmul_kernel` / `matmul_kernel_float` | MatmulKernel — configured type / forced-`float` builds |
+| `matmul_kernel` | MatmulKernel — configured type (`ap_fixed<16,8>` by default) |
 | `pool_kernel` / `pool_kernel_float` | PoolingKernel — configured type / forced-`float` builds |
 
 The `*_float` variants force `Data_t=float` regardless of HLS availability;
@@ -51,7 +51,7 @@ Compile and run with plain GCC — no Vitis, no hardware.
 | `TestSimulation` | VectorOPKernel | All 6 ops across sizes + saturation cases |
 | `TestConvRef` | ConvKernel | Kernel vs naive reference oracle |
 | `TestMatmulRef` | MatmulKernel | Kernel vs `ref_matmul` oracle, all shape cases |
-| `TestMatmulBlas` | MatmulKernel | `float` build vs `cblas_sgemm` — only if BLAS is found |
+| `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolingSim` | PoolingKernel | Max/Average/Lp pooling + global variants |
 
 | Aggregate | Description |

@@ -118,52 +118,6 @@ endif()
 target_compile_options(matmul_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
 # ---------------------------------------------------------------------------
-# Float kernel library — same MatmulKernel.cpp but always compiled with
-# Data_t=float / AccData_t=float regardless of HLS availability.
-#
-# Used by TestMatmulBlas so that cblas_sgemm (float) can serve as the oracle.
-# A separate float_config/Config.h is generated into the build directory so
-# the include path override works without touching the primary Config.h.
-# ---------------------------------------------------------------------------
-
-# Generate float_config/Config.h by temporarily swapping the type variables.
-set(_SAVE_DATA_TYPE          "${MM_DATA_TYPE}")
-set(_SAVE_ACC_DATA_TYPE      "${MM_ACC_DATA_TYPE}")
-set(_SAVE_DATA_TYPE_INCLUDE  "${MM_DATA_TYPE_INCLUDE}")
-set(_SAVE_HAVE_APFIXED_DEFINE "${MM_HAVE_APFIXED_DEFINE}")
-
-set(MM_DATA_TYPE          "float")
-set(MM_ACC_DATA_TYPE      "float")
-set(MM_DATA_TYPE_INCLUDE  "")
-set(MM_HAVE_APFIXED_DEFINE "")
-
-configure_file(
-    include/Config.h.in
-    ${CMAKE_CURRENT_BINARY_DIR}/float_config/Config.h
-    @ONLY
-)
-
-set(MM_DATA_TYPE          "${_SAVE_DATA_TYPE}")
-set(MM_ACC_DATA_TYPE      "${_SAVE_ACC_DATA_TYPE}")
-set(MM_DATA_TYPE_INCLUDE  "${_SAVE_DATA_TYPE_INCLUDE}")
-set(MM_HAVE_APFIXED_DEFINE "${_SAVE_HAVE_APFIXED_DEFINE}")
-
-add_library(matmul_kernel_float STATIC
-    kernel/MatmulKernel.cpp
-)
-# float_config must come before include/ so its Config.h shadows the primary one.
-target_include_directories(matmul_kernel_float
-    PUBLIC
-        ${CMAKE_CURRENT_BINARY_DIR}/float_config  # float Config.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/include       # MatmulKernel.h
-)
-if(_MM_HAVE_HLS)
-    # MatmulKernel.h needs ap_int.h / hls_burst_maxi.h for the 128-bit ports.
-    target_include_directories(matmul_kernel_float SYSTEM PUBLIC ${HLS_INCLUDE_DIR})
-endif()
-target_compile_options(matmul_kernel_float PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
-
-# ---------------------------------------------------------------------------
 # TestMatmulRef — C++ simulation test, no Vitis HLS synthesis required.
 #
 # Compiles and runs entirely with standard GCC.  The name "Ref" reflects that
@@ -206,7 +160,9 @@ if(_MM_HAVE_HLS)
 endif()
 
 # ---------------------------------------------------------------------------
-# TestMatmulBlas — validates the float kernel against cblas_sgemm.
+# TestMatmulBlas — validates the configured kernel (ap_fixed<16,8> by
+# default) bit-exactly against cblas_sgemm on inputs chosen so that both
+# sides accumulate exactly (see the header of test/TestMatmulBlas.cpp).
 #
 # Requires libblas-dev (provides cblas.h and libblas.so).  Skipped silently
 # if BLAS is not found so the build remains self-contained on bare systems.
@@ -225,15 +181,15 @@ if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
     add_executable(TestMatmulBlas
         test/TestMatmulBlas.cpp
     )
-    target_link_libraries(TestMatmulBlas PRIVATE matmul_kernel_float ${BLAS_LIBRARIES})
+    target_link_libraries(TestMatmulBlas PRIVATE matmul_kernel ${BLAS_LIBRARIES})
     target_include_directories(TestMatmulBlas PRIVATE ${CBLAS_INCLUDE_DIR})
-    target_compile_options(TestMatmulBlas PRIVATE -Wall -Wextra -O2)
+    target_compile_options(TestMatmulBlas PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
     add_test(NAME TestMatmulBlas COMMAND TestMatmulBlas)
 else()
     message(STATUS "MatmulKernel: BLAS not found — TestMatmulBlas skipped")
 endif()
 
-message(STATUS "MatmulKernel: targets — matmul_kernel, matmul_kernel_float, TestMatmulRef")
+message(STATUS "MatmulKernel: targets — matmul_kernel, TestMatmulRef")
 message(STATUS "MatmulKernel: Data_t=${MM_DATA_TYPE}  "
                "AccData_t=${MM_ACC_DATA_TYPE}  "
                "TILE_N=${MM_TILE_N}  TILE_M=${MM_TILE_M}  "

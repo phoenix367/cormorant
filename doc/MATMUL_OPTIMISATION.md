@@ -348,9 +348,9 @@ the same RTL timing confirms the 16×16 multiply is free.
 
 Synthesis: II=1 on every loop, slack 0.00 ns (K-loop 0.04), BRAM 64,
 DSP **51 → 38**, FF 10.8 k → 10.3 k, LUT 44.3 k → 43.4 k.  C-sim 39/39.
-`TestMatmulBlas` (the `float` build against `cblas_sgemm`) has not compiled
-since §3 changed the ports to `hls::burst_maxi` (it still passes `float*`);
-untouched here, noted for the record.
+`TestMatmulBlas` (the `float` build against `cblas_sgemm`) had not compiled
+since §3 changed the ports to `hls::burst_maxi` (it still passed `float*`);
+rewritten after Track A (§9a) to drive the configured kernel bit-exactly.
 
 ---
 
@@ -764,11 +764,25 @@ kernel had before this track.
 
 | Gate | Command | Result after §8 |
 |---|---|---|
-| C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` does not compile since §3 — it still passes `float*` to the `burst_maxi` ports) |
+| C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` 23/23 bit-exact against `cblas_sgemm`, §9a) |
 | HLS synthesis | `make synthesize_matmul_kv260` | II=1 on every loop, slack 0.00 ns at 150 MHz; BRAM 80, DSP 49, LUT 41.8 k |
 | RTL behavior test | `make behavior_test_matmul` | 39/39 pass (test stand with per-test alternating DDR base); per-case timings in the §4–§8 tables |
 
 ---
+
+### 9a. `TestMatmulBlas` restored
+
+The float variant of the kernel (`matmul_kernel_float`) is gone: with 32-bit
+lanes a packed B tile row is 8 words, so A5's `kTileM = 32` pushed a block
+past the 16 × 64-word request window (`static_assert` in MatmulKernel.cpp),
+and the test itself still called the pre-§3 pointer signature.  The test
+now drives the configured `ap_fixed<16,8>` kernel through the 128-bit word
+ports (`b_packed` covered too) and compares **bit-exactly** with
+`cblas_sgemm`: inputs are multiples of 2^-8 with |x| ≤ 0.25, so every
+partial sum over K ≤ 2048 terms is an integer ≤ 2^23 in units of 2^-16 and
+exact in both float and `AccData_t`; the reference applies the kernel's
+`saturate_cast` to the exact sum.  Two constant-input cases hit sums of
+exactly -128 (stored) and +128 (saturated).  23/23.
 
 ## 10. Related files
 

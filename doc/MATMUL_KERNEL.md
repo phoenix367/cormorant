@@ -313,8 +313,12 @@ results are bitwise-identical (exact comparison); `float` builds allow a
 | K-split (§5 of the optimisation log) | `1×261×19`, `2×13×5`, `3×517×33`, row-major and packed |
 | B prefetch (§7) | `batch=3, 6×517×35` (`k_tiles=3`, `m_tiles=3`, `n_tiles=2`), with and without B broadcast, both layouts |
 
-A second test, **`TestMatmulBlas.cpp`**, validates the `float` build of the
-kernel against `cblas_sgemm` when a BLAS library is found at configure time.
+A second test, **`TestMatmulBlas.cpp`**, validates the configured kernel
+(`ap_fixed<16,8>`) bit-exactly against `cblas_sgemm` when a BLAS library is
+found at configure time: inputs are multiples of 2^-8 with |x| ≤ 0.25, so
+every partial sum is exact in both float and `AccData_t`, and the reference
+applies the kernel's own `saturate_cast` before comparing (shapes,
+K = kMaxK, ±128 saturation, batches, packed B); 23 cases.
 `make gen_matmul_test_data` re-runs the reference in `--dump-data` mode to
 emit hex fixtures for the HDL testbench.
 
@@ -368,7 +372,7 @@ an IP-catalog archive.
 | `kernels/matmul/include/MatmulKernel.h` | Kernel declaration, `saturate_cast<T>` |
 | `kernels/matmul/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `AccData_t`, tile constants) |
 | `kernels/matmul/test/TestMatmulSim.cpp` | C simulation tests (GCC) |
-| `kernels/matmul/test/TestMatmulBlas.cpp` | `float` build validated against `cblas_sgemm` |
+| `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
 | `kernels/matmul/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |
 | `inference-scheduler/src/codegen/_source.py` | `run_matmul()` / `run_matmul_at()` code generation |
