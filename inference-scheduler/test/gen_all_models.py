@@ -57,6 +57,7 @@ def _run_gen_funcs(mod: types.ModuleType, out_dir: str) -> None:
 _ARGPARSE_MAIN = [
     "gen_test_models",
     "gen_matmul_models",
+    "gen_bert_models",
 ]
 # Pattern B — main() uses global OUT_DIR
 _GLOBAL_MAIN = [
