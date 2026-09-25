@@ -42,8 +42,8 @@ _ALL_SUPPORTED_OP_TYPES: frozenset = (
 )
 
 # Raw (original-dtype) copies are kept for initializers up to this size so
-# host-op factories can read integer constants (Slice starts / ends, ...)
-# exactly; TensorInfo.data is always float32.
+# host-op factories can read integer constants (Slice starts / ends, OneHot
+# depth, ...) exactly; TensorInfo.data is always float32.
 _RAW_CONST_MAX = 1 << 16
 
 
@@ -426,7 +426,8 @@ class OnnxGraph:
     def __init__(self, model_path: str,
                  dtype: DataType = None,
                  fuse_act: bool = False,
-                 s2d_stem: bool = False) -> None:
+                 s2d_stem: bool = False,
+                 fuse_patterns: bool = True) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -438,6 +439,15 @@ class OnnxGraph:
         as a host-side SpaceToDepth(2) + stride-1 Conv over 4*C channels
         (``_space_to_depth_stems``).  Off by default; the CLI enables it.
         ``self.s2d_stem_count`` reports how many Convs were rewritten.
+
+        fuse_patterns: run ``fusion.fuse_patterns`` — TF-style LayerNorm and
+        GELU (tanh / erf) subgraphs become single host-op nodes, and
+        constant operands the VectorOP kernel cannot broadcast efficiently
+        are reshaped (scalar -> [last dim], or pre-broadcast).  ON by default
+        (library and CLI, ``--no-fuse-patterns``): it only changes graphs
+        that contain these patterns — every graph without a transformer
+        block generates exactly as before.  ``self.fusion_counts`` reports
+        ``{"layernorm", "gelu", "const_bcast"}``.
 
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
@@ -471,6 +481,12 @@ class OnnxGraph:
             OnnxGraph._space_to_depth_stems(model) if s2d_stem else (model, 0)
         )
 
+        # Transformer patterns (LayerNorm / GELU) and VectorOP constant
+        # broadcast normalisation, see fusion.py.
+        self.fusion_counts = (
+            fusion.fuse_patterns(model, align_elems) if fuse_patterns
+            else {"layernorm": 0, "gelu": 0, "const_bcast": 0}
+        )
         self._dtype = _dtype
 
         graph = model.graph
@@ -572,6 +588,7 @@ class OnnxGraph:
                         f"Node '{node.name or node.op_type}' "
                         f"(op_type='{node.op_type}') is not supported.\n"
                         f"Supported ops: {sorted(_ALL_SUPPORTED_OP_TYPES)}"
+                        f"{fusion.pattern_hint(node.op_type)}"
                     )
                 sn = ScheduledNode.from_onnx_node(node, self._tensors, idx, align_elems)
             self._nodes.append(sn)

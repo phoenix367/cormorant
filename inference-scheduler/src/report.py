@@ -551,6 +551,20 @@ class ReportGenerator:
                 f"`SpaceToDepth(2)` + stride-1 `Conv` over 4× the input "
                 f"channels (ConvKernel IC-lane utilisation)."
             )
+        fc = getattr(self.graph, "fusion_counts", {}) or {}
+        if fc.get("layernorm") or fc.get("gelu"):
+            bullets.append(
+                f"- **Pattern fusion** — {fc.get('layernorm', 0)} LayerNorm and "
+                f"{fc.get('gelu', 0)} GELU subgraph(s) fused into host-CPU ops "
+                f"(float regions; their x²/x³ intermediates would saturate "
+                f"op by op)."
+            )
+        if fc.get("const_bcast"):
+            bullets.append(
+                f"- **Constant broadcast normalisation** — {fc['const_bcast']} "
+                f"constant VectorOP operand(s) reshaped for the kernel's "
+                f"broadcast (values unchanged)."
+            )
         n_host = sum(1 for sn in self.graph.nodes
                      if isinstance(sn, HostNode) and not (isinstance(sn, SliceNode) and sn.is_view))
         if n_host:

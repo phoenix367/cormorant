@@ -225,6 +225,12 @@ def _broadcast_info(
     # no matching dim may appear before a broadcast dim.
     found_match = False
     for td, od in zip(t_aligned, output.shape, strict=False):
+        if td == od == 1:
+            # A size-1 output dim is neither a broadcast nor a matching dim
+            # (it contributes nothing to the linear layout), so it must not
+            # end the leading broadcast block: [1,1,S,S] onto [1,H,S,S]
+            # (BERT's attention mask) is a plain repeating chunk of S*S.
+            continue
         if td == od:
             found_match = True
         elif td == 1:

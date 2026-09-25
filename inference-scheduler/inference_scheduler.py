@@ -141,6 +141,18 @@ def parse_args(argv=None):
             "cuts the taps to a quarter."
         ),
     )
+    p.add_argument(
+        "--no-fuse-patterns",
+        dest="fuse_patterns",
+        action="store_false",
+        default=True,
+        help=(
+            "Do not fuse transformer subgraphs (TensorFlow-style LayerNorm, "
+            "GELU tanh / erf) into single host-CPU ops, and do not reshape "
+            "constant VectorOP operands for the kernel's broadcast.  Fusion is "
+            "on by default; it only changes graphs that contain these patterns."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -185,7 +197,8 @@ def main(argv=None):
     # 2. Parse and validate the ONNX model                             #
     # ---------------------------------------------------------------- #
     try:
-        graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem)
+        graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
+                          fuse_patterns=args.fuse_patterns)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
