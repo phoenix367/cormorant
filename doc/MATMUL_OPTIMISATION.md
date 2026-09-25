@@ -778,3 +778,30 @@ kernel had before this track.
 | `doc/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
 | `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
 | `build/kernels/matmul/kv260/matmul_op_test_report.json` | Per-test behavior-test report |
+
+## 9. On board after Track A (2026-09-26)
+
+Bitstream with Tracks C, B and A merged (WNS +1.39 ns; design LUT 62 %,
+BRAM 119/144 tiles, DSP 43 %).  144/144 scheduler models PASS with the
+packed-B layout at `tile_m = 32`.  `run_remote_perf.py`, before (§3b)
+→ after:
+
+| Case | before | after | |
+|---|---:|---:|---:|
+| 256x256x256 row-major | 32.36 ms / 1.04 GOps/s | 7.24 ms / 4.63 GOps/s | 4.5× |
+| 256x256x256 packed | 18.49 ms / 1.82 GOps/s | 7.17 ms / 4.68 GOps/s | 2.6× |
+| 128x128x128 | 4.34 ms | 1.17 ms | 3.7× |
+| 64x64x64 | 0.638 ms | 0.219 ms | 2.9× |
+| FC 1x256x256 packed | 0.268 ms / 0.49 GOps/s | 0.101 ms / 1.30 GOps/s | 2.7× |
+| FC 4x256x256 packed | 0.293 ms | 0.127 ms | 2.3× |
+| FC 1x512x1000 packed | 2.04 ms | 0.720 ms | 2.8× |
+| FC 1x1280x1001 packed | 5.02 ms | 1.75 ms | 2.9× |
+| batch4 64^3 | 2.54 ms | 0.857 ms | 3.0× |
+| dw-12544x16x1 | 12.2 ms | 6.94 ms | 1.8× |
+
+The square cases reach 4.6–4.7 GOps/s of the 6.4 GOps/s peak of the
+32-wide array; one-row FC layers sit at the B-port bound (1.28 MB / 1.75
+ms ≈ 1.5 GB/s of the 1.6 GB/s read channel).  Demos: MNIST convnet
+0.732 → 0.729 ms (its Gemm is now ~40 µs), MobileNet v2 225 → 221 ms and
+ResNet-18 311 → 310 ms through their classifiers; predictions identical.
+

@@ -1,6 +1,6 @@
 # Throughput plan — MatmulKernel, depthwise ConvKernel, VectorOPKernel
 
-Date: 2026-09-25.  Status: **proposal, not yet executed.**
+Date: 2026-09-25.  Status: **executed 2026-09-25/26** — Tracks A (A1–A5), B (B1–B3; B4 deferred) and C (C1–C4) landed and measured; see §8.  Track D (clock) not started.
 Baseline bitstream: main a7d0bce / 56fc2eb (hw_128 f432a24), PL clock 100 MHz,
 all four kernels on one 128-bit `S_AXI_HPC0_FPD` port through
 `axi_interconnect_0` (≈ 1.6 GB/s per direction).
@@ -174,3 +174,29 @@ Decisions needed before execution: (i) A5's `tile_m` change (regenerates
 every packed model and fixture) — include or defer; (ii) B4 (high risk,
 largest depthwise gain) — include in this round or after B1–B3 are measured;
 (iii) whether to reserve a second PS port now or wait for the perf run.
+
+## 8. Measured outcome (board, 2026-09-26, all three tracks merged)
+
+| Case | before | projected | measured |
+|---|---:|---:|---:|
+| Matmul 256³ packed | 18.5 ms | ~12 ms (~6–7 with A5) | **7.17 ms** |
+| Matmul FC 1×1280×1001 packed | 5.0 ms | ~1.9 ms | **1.75 ms** |
+| Conv dw 3×3 64ch 56×56 | 9.0 ms | ~2.9 ms | **2.86 ms** |
+| Conv 3×3 64ch 56×56 | 18.6 ms | (side effect of B2/B3) | **15.4 ms** |
+| VectorOP ADD 256K | 2.65 ms | ~0.8–0.95 ms | **0.66 ms** |
+| VectorOP RELU 64K | 0.67 ms | ~0.12–0.17 ms | **0.09 ms** |
+| VectorOP MUL bcast 12544×16 | 6.1 ms | ~0.3 ms | **0.26 ms** |
+| MobileNet v2 | 400 ms | ~220–250 ms | **221 ms** |
+| MobileNet v1 | 489 ms | ~350 ms | **349 ms** |
+| ResNet-18 | 372 ms | ~330 ms | **310 ms** |
+| MNIST convnet / LeNet | 0.90 / 7.99 ms | — | **0.73 / 7.29 ms** |
+
+Design after the merge: LUT 62 %, BRAM 119/144 tiles (83 %), DSP 43 %,
+WNS +1.39 ns at 100 MHz; 144/144 models, predictions identical to the
+baseline.  B4 (depthwise on the grid) stays deferred: BRAM headroom is
+25 tiles and LUT 38 %, so it needs its own budget check.  Next levers in
+priority order: Track D (reset-net fix → 120 MHz), the §2.37-style flat
+sweep for the standard 1×1 path (~44 % of MobileNet v2's conv time), the
+Pooling writer (unchanged at 0.13 GB/s), and a second PS port if the perf
+run shows lane contention.
+

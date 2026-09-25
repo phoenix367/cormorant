@@ -209,7 +209,7 @@ mnist_convnet
                  input_numel=784, output_numel=10, classes=10
     progress: 10000/10000 (100.0%) acc=98.92% mean=4.546ms rate=219.8ips
   run      → OK                7.5s
-    accuracy = 98.92%   mean = 0.732 ms   throughput = 1366.8 img/s
+    accuracy = 98.92%   mean = 0.729 ms   throughput = 1371.5 img/s
 
 mnist_lenet
   upload   → OK       2.0s
@@ -218,8 +218,8 @@ mnist_lenet
     bench_mnist: dataset=10000 images, iters=10000, warmup=50
                  input_numel=784, output_numel=10, classes=10
     progress: 10000/10000 (100.0%) acc=97.35% mean=55.503ms rate=18.0ips
-  run      → OK               73.1s
-    accuracy = 97.35%   mean = 7.293 ms   throughput = 137.1 img/s
+  run      → OK               73.3s
+    accuracy = 97.35%   mean = 7.292 ms   throughput = 137.1 img/s
 
 cleanup /tmp/mnist_demo
 per-step logs written to demo/mnist/build/logs
@@ -228,8 +228,8 @@ per-step logs written to demo/mnist/build/logs
 
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
-  mnist_convnet  OK       98.92%      0.732      0.731      0.739     1366.8
-  mnist_lenet    OK       97.35%      7.293      7.292      7.310      137.1
+  mnist_convnet  OK       98.92%      0.729      0.729      0.735     1371.5
+  mnist_lenet    OK       97.35%      7.292      7.292      7.310      137.1
 ```
 
 Notable behaviour visible in the run:
