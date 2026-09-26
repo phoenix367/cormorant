@@ -92,12 +92,14 @@ def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[st
     return out
 
 
-# Board cost of one prefill call per bucket, ms, without the host attention
-# (it covers only the valid rows, so it does not depend on the split) and the
-# head (run once per llm_prefill): KV260, 100 MHz, hw_128 bitstream, profiled
-# 2026-09-26 (CHAT_PLAN §13.4).  The ConvKernel MatMuls stream the weights
-# once per call, so a padded 64-row call costs little more than a 16-row one.
-BUCKET_COST_MS = {16: 304, 64: 364, 256: 930}
+# Board cost of one prefill call per bucket, ms, without the head (run once
+# per llm_prefill): KV260, 100 MHz, hw_128 bitstream, FPGA prefill attention
+# (CHAT_PLAN §16; a call at position 1, so the attention covers bucket + 1
+# keys), profiled 2026-09-26.  The ConvKernel MatMuls stream the weights once
+# per call, so a padded 64-row call costs little more than a 16-row one.
+# (Phase 3's host-attention table, CHAT_PLAN §13.4: {16: 304, 64: 364, 256: 930}
+# without the attention, which then covered only the valid rows.)
+BUCKET_COST_MS = {16: 326, 64: 427, 256: 1275}
 
 
 def bucket_costs(buckets: Sequence[int] = BUCKETS) -> List[int]:

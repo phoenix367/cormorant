@@ -155,8 +155,8 @@ def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buck
 #define LLM_MAX_BUCKET  {max(buckets)}u
 
 static const unsigned llm_buckets[LLM_N_BUCKETS] = {{ {", ".join(f"{b}u" for b in buckets)} }};
-/* Cost of one call per bucket (ms on the board without the host attention and
- * the head, llm_project.py BUCKET_COST_MS): llm_prefill's least-cost split. */
+/* Cost of one call per bucket (ms on the board without the head,
+ * llm_project.py BUCKET_COST_MS): llm_prefill's least-cost split. */
 static const unsigned llm_bucket_cost[LLM_N_BUCKETS] = {{ {", ".join(f"{c}u" for c in costs)} }};
 
 static inline int llm_glue_init(void)

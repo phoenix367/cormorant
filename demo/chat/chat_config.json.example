@@ -56,7 +56,7 @@
     "loop_guard": true,
     "_loop_guard_note": "End an answer whose generated tokens end in one block repeated verbatim 3 times (>= 24 tokens); finish_reason stop, kv260.finish 'loop'.",
     "_sampling_note": "Server defaults for requests that do not set them (the model card's 0.2 / 0.9, HF's top_k 50).",
-    "cma_mb": 360
+    "cma_mb": 510
   },
   "build": {
     "jobs": 4,

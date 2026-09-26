@@ -258,12 +258,13 @@ messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, blo
   `library_decode_ms`, `sampler_ms`, `trimmed_messages`, `context_size`,
   `seed`, `sampler` (the settings used).  Log line:
   `... reuse=135/152 prefill=17tok/185ms decode=10.9tok/s why=max_tokens ...`.
-* **Expected speed** (CHAT_PLAN §7, §10.6; not measured yet — phase 3):
-  decode **~5 tokens/s** (weight-bandwidth bound, ~195–205 ms per token);
-  prefill ~0.7 s for 256 new tokens, so the first answer of a chat takes
-  ~0.3–1 s to start and follow-ups start after a few tens of prefilled
-  tokens.  Host overhead per token on the board's A53: sampling 0.8–2 ms
-  (C; greedy / the default settings), detokenizing 6 µs.
+* **Speed** (measured on the board, CHAT_PLAN §13.4, §16.3): decode
+  **~5 tokens/s** (weight-bandwidth bound, ~200–204 ms per token); prefill
+  0.37 / 0.47 / 1.32 s for 16 / 64 / 256 new tokens (prefill attention on
+  the FPGA since phase 5; 3.6 s for 256 before), so the first answer of a
+  chat starts after ~0.45–1.3 s and a follow-up turn of a few tens of new
+  tokens after ~0.45 s.  Host overhead per token on the board's A53:
+  sampling 0.8–2 ms (C; greedy / the default settings), detokenizing 6 µs.
 * **Quality.**  A 135M model: fluent, often wrong on facts and arithmetic
   (CHAT_PLAN §10.4); temperature 0 gives the most stable answers.
 
@@ -281,8 +282,9 @@ The capital of France is Paris.
 
 ### Two models, one FPGA — residency
 
-BERT holds ~224 MB of CMA, SmolLM2 ~360 MB (estimate: weights + the second
-embedding copy + KV cache); idle CmaFree on the board was 626–813 MB of
+BERT holds ~224 MB of CMA, SmolLM2 ~490 MB (a 488 MiB pool: both weight
+copies, the LM head, the KV caches and the intermediates, CHAT_PLAN §16.3;
+set `smollm2.cma_mb` to ~510); idle CmaFree on the board was 626–813 MB of
 1000.  `--resident` decides what stays loaded:
 
 | mode | behaviour |

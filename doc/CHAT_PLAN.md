@@ -1174,3 +1174,261 @@ Board, the conversation that looped, seeds 1–3: no loops (0–3 % repeated
 trigrams; two end at <|im_end|>, one runs to the 500-token cap with 1 %);
 factual / list / code answers still correct (the code block is identical,
 the prose is reworded).  Chat tests 121 pass.
+
+## 16. Phase 5 — prefill attention on the FPGA (2026-09-26, branch `feat/prefill-attn`)
+
+**Result.**  The prefill's attention runs on ConvKernel with the p12 softmax
+on the host; decode keeps the xattn host region.  On the board the 256-token
+prefill takes **1317 ms instead of 3575 ms** (2.7×; attention 310 ms
+instead of 2600 ms), the 64-token prefill 466 ms instead of 604 ms, and the
+first logits of the three chat prompts arrive after 461 / 1259 / 901 ms
+instead of 484 / 2176 / 1198 ms.  Decode is unchanged (203.7 ms per token).
+The logits are bit-exact with the scheduler simulation, which equals the
+study emulation of the new mixed policy `pow2+sink+p12+mix` bit for bit —
+over first prefills, 32 greedy decode steps, a multi-bucket split and a
+second chat turn prefilled at position 69.  No kernel or bitstream change;
+the §11 C API and `llm_prefill` semantics are unchanged.
+
+### 16.1 Design
+
+* **Numerics: `pow2+sink+p12+mix`** (`llm_study.py`): prefill calls use the
+  pow2+sink+p12 attention of §10.5 item 5 — RoPE(q) rounded at the per-head
+  q exponent, q·Kᵀ and P·V as kernel MatMuls (exact sums, floor, saturate),
+  the softmax on the host with P at 2⁻¹²; decode steps use the xattn region
+  of §13.1.  Both read and write the same K / V caches at the same
+  exponents (the p12 formats JSON, unchanged).  `Model.forward(...,
+  phase=)` selects the path per call; every teacher-forced run is a prefill.
+* **Runtime key count, not key-length buckets.**  A prefill call at
+  position `pos` with `n` valid rows attends to `pos + n` keys.  The two
+  ConvKernel calls per KV head run over `keys = roundup(pos + n, 64)` keys:
+  the C computes it from the entry's `pos` / `n` inputs (`llm_keys`) and
+  writes it into the AXI-Lite registers (`out_ch` of q·Kᵀ, `in_ch` of P·V);
+  the rest of the geometry is fixed at codegen by the cost model.  The
+  scheduler's simulation evaluates the same integer semantics over the
+  actual count.  Key-length buckets (e.g. 64 … 1024) would have multiplied
+  the prefill entries by five — inference.c is 4.2 MB with three and cc1
+  already peaks at 300 MB — and padded the keys by up to 2×; runtime
+  registers cost nothing.
+* **Calls per KV head, heads of a group batched.**  GQA 9 / 3: the three q
+  heads sharing a KV head form one call.  q·Kᵀ: `s[j][p] = Σ_d K[j][d] q[d][p]`
+  as a MatMul on ConvKernel (BERT_PLAN §2 2A) with the K cache rows as the
+  weight (`out_ch = keys`) and the three heads' queries as the x image
+  (`p = (h', t)`, 3T pixels, 1×2 kernel — the host writes the image, so the
+  cost model's kw is free).  P·V: P (3T rows, written by the softmax in the
+  weight layout) × the V cache (`in_ch = keys / 4`, 1×4).  Per layer: 3 q·Kᵀ
+  + 3 P·V calls, one prep, three softmaxes and a merge on the host.  Cost
+  model per group (T 256, 256 keys, 100 MHz): q·Kᵀ 0.68 ms, P·V 0.49 ms,
+  against 9.9 and 5.5 ms on MatmulKernel.
+* **The V cache is the P·V conv's 1×4 x image.**  P·V streams P as the conv
+  weight, one 2-beat request per P row and input-channel tile: 64 requests
+  per slab, latency-bound (BERT's P·V was 2.5× its cycle model).  Storing
+  each KV head's V rows as the x image of a 1×4 lowered MatMul
+  (`numeric` layout `[KV, HD, 4]`) makes each P row of a slab one 8-beat
+  request.  Measured alone on the board: 768 × 320 · 320 × 64 takes 2.26 ms
+  with kw 1, 1.40 with kw 2, **0.97 ms with kw 4**; 768 × 1024 · 1024 × 64
+  6.93 / 4.24 / 2.68 ms (the cycle model, blind to request latency, predicts
+  0.78 / 0.61 / 0.60 ms).  The 256-token prefill gained 44 ms from it.  The
+  xattn decode reads the interleaved rows with stride 4: its attention went
+  from 6.6 to 7.3 ms per token (+0.3 % of a decode step).
+* **KV caches in the CMA pool.**  The caches are DMA states (a new scheduler
+  notion: persistent pool buffers after the weights, never shared,
+  initialised with the sink row), stored group-major `[KV][C][HD]` so each
+  KV head's first `keys` rows are one dense conv weight / input.  Host ops
+  write them in place through the cacheable BO mapping; `LlmAttnPrep`
+  flushes rows `[0, keys)` of both caches before the kernels read them
+  (~6 syncs of ≤ 128 KiB per layer).  Decode steps write their row without a
+  sync — it stays dirty until the next prefill flushes it — so decode pays
+  nothing.  Kernels never write the caches, so no invalidation is needed.
+* **Host work overlaps the kernel.**  The node order q·Kᵀ 0, q·Kᵀ 1,
+  softmax 0, P·V 0, then softmax g, q·Kᵀ g+1, P·V g issues every softmax right
+  after a ConvKernel call it can hide behind.  The softmax reads each
+  32-column block of the scores once (transposed into a stack buffer),
+  multiplies by `2^12 / sum` instead of dividing (the exact quotient within
+  1e-7 of a rounding tie: identical integers) and balances causal rows over
+  the threads: 1.5 ms per group call at T 256 (2.5 ms at first).  The prep
+  writes the q image in whole cache lines.
+* **Least-cost split.**  The bucket costs now include the attention:
+  326 / 427 / 1275 ms per 16 / 64 / 256-row call (at position 1, head
+  excluded).  The chat prompts split as before (36 → 64; 168 → 256;
+  96 → 64 + 32/64).
+
+### 16.2 Numerics (`llm_study.py study`, same data as §10.1)
+
+| policy | top-1 prompt set (all / answers) | top-1 held-out | top-5 held-out | KL held-out | KL prompt set | ppl held-out | identical answers | mean match |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| float (numpy f64) | – | – | – | – | – | 15.598 | – | – |
+| `pow2+sink+p12` (§10) | 0.976 / 0.980 | 0.969 | 1.000 | 0.0024 | 0.0021 | 15.616 | 2/12 | 15.9 |
+| `pow2+sink+p12+xattn` (phase 3, shipped until now) | 0.976 / 0.982 | 0.968 | 1.000 | 0.0023 | 0.0022 | 15.612 | 3/12 | 27.9 |
+| **`pow2+sink+p12+mix` (ships now)** | **0.976 / 0.980** | **0.969** | **1.000** | **0.0024** | **0.0021** | **15.616** | **3/12** | **21.8** |
+
+Teacher-forced metrics are prefill-only, so the mixed policy's equal p12's
+by construction; its greedy answers mix both attentions.  The answers read
+like float's — for example (all 12 in the study output's
+`generations.txt`):
+
+```
+summarise  float: The honeybee colony is a complex, interconnected system of workers, drones, and queens that
+                  work together to maintain the colony's food source.
+           mix:   The honeybee colony is a complex, interconnected system of workers, drones, and queens that
+                  work together to maintain the colony's food source and survival.
+           xattn: The paragraph summarizes the characteristics of a honeybee colony, including the diverse
+                  workforce of workers, sterile female bees, and the unique dance of the waggle dance ...
+factual    float: The capital of France is Paris.
+           mix / xattn: The capital of France is Paris. It is a city known for its historical landmarks, ...
+code       float / xattn: Here's a Python function that checks whether a number is prime: (identical code)
+           mix:   Here is a Python function that checks whether a number is prime: (identical code)
+```
+
+**Bit-exactness** (`llm_sched_check.py`, SmolLM2-135M): the scheduler
+simulation equals the study emulation of the mixed policy on the logits of
+every step:
+
+| prompt | prefill | calls (rows / bucket) | decode steps | result |
+|---|---|---|---:|---|
+| factual | 36 tokens at position 1 | 36 / 64 | 32 | bit-exact |
+| factual, second turn | 19 tokens at position 69 (after the 32 decoded tokens) | 19 / 64 | 32 | bit-exact |
+| summarise | 168 at 1 | 168 / 256 | 32 | bit-exact |
+| multi-turn | 96 at 1 | 64 / 64 + 32 / 64 | 32 | bit-exact |
+
+The generated project on the host emulation (`llm_host_emu.py
+--incoherent`: separate CPU and DDR copies of every buffer, so a missing or
+too-narrow cache sync changes the result) equals the simulation on all
+4 × 33 logits vectors; its greedy tokens equal the study emulation's; close
+/ re-open reproduces the logits.
+
+### 16.3 Board (KV260, hw_128 bitstream, 100 MHz; `llm_board.py --profile --reopen`)
+
+Before = the phase-3 library, measured in the same session.
+
+| | before | after |
+|---|---:|---:|
+| prefill 16 tokens | 365.5 ms | 366.7 ms |
+| prefill 64 tokens | 603.6 ms | 466.3 ms |
+| prefill 256 tokens | 3575.2 ms | **1317.0 ms** |
+| first logits: factual (36 tokens) | 484.1 ms | 460.5 ms |
+| first logits: summarise (168) | 2176.5 ms | 1258.9 ms |
+| first logits: multi-turn (96) | 1197.7 ms | 901.0 ms |
+| first logits: factual, second turn (19 at position 69) | – | 457.1 ms |
+| decode | 203.0 ms / token | 203.7 ms / token |
+| `llm_open` (weights cached) | 1107 ms | 1041 ms (close → open 975 ms) |
+| pool BO | 461.3 MiB | 488.2 MiB (+22.5 KV caches, intermediates 2.3 → 6.75) |
+| CmaFree drop on open | 519.6 MB | 522.6 MB (page-cache noise ±30 MB) |
+
+Prefill per call after (profile; attention = the wall time of its nodes —
+the softmax windows overlap the ConvKernel windows):
+
+| ms | 16 | 64 | 256 |
+|---|---:|---:|---:|
+| total | 367 | 466 | 1317 |
+| MatMul linear (ConvKernel) | 237 | 257 | 670 |
+| **attention** (before: host) | **24** (27) | **61** (201) | **310** (2600) |
+| · prep (host) | 12 | 25 | 84 |
+| · q·Kᵀ / P·V windows (ConvKernel, softmax inside) | 11 | 37 | 217 |
+| SiLU·up | 38 | 44 | 161 |
+| RMSNorm | 19 | 41 | 84 |
+| residual add | 10 | 23 | 52 |
+| LM head (once) | 39 | 39 | 39 |
+
+The 16-row bucket gains nothing (its host attention was 27 ms); the 256-row
+prefill is now 51 % linears and 24 % attention.
+
+**Board gates.**  Logits bit-exact with the simulation on all 4 × 33 vectors
+(the 3 prompts + the second turn), greedy tokens equal to the study
+emulation's; the library through ctypes (`llm_lib_check.py`): only `llm_*`
+exported, chunked prefill = one call, threads identical, close / re-open
+identical.  Board build: cc1 peak 284 MB (-O2, gcc 11, -j1, 77 s; aarch64
+gcc 13 on the host: 312 MB), MemAvailable ≥ 3.2 GB throughout.
+
+**Late positions** (the key count follows the position: a 672-token
+conversation, then new tokens; `llm_bench` continuation prompts):
+
+| new tokens at position 673 | FPGA prefill attention | host attention (phase 3, estimated*) |
+|---:|---:|---:|
+| 16 | 482 ms | ~1.2 s |
+| 64 | 732 ms | ~4 s |
+| 256 | 2085 ms | ~17 s |
+
+\* the phase-3 host attention scaled linearly in rows × keys (2.6 s for
+256 rows over 1–257 keys; §13.4).  The 672-token prompt itself (256 + 256 +
+160/256 calls) takes 4.6 s.  At these positions the host softmax dominates
+the attention (see §16.5).
+
+**Board suite** (`run_remote_tests.py`, the 148 models + the three tiny
+Llama fixtures, which now run the FPGA prefill attention and DMA-state
+caches): **151 / 151 pass**.
+
+**Chat server** (library installed with `llm_board.py --install-only`,
+server restarted with `deploy.py` from the main checkout; both models
+resident, CmaFree 266 MB after both loaded — after `drop_caches`; with a
+warm page cache in CMA, `auto` left BERT for its first request).  A 4-turn
+conversation through the OpenAI API, temperature 0 (the server's default
+repetition penalty and DRY apply):
+
+| turn | cached / prefilled tokens | TTFT | decode |
+|---|---|---:|---:|
+| "What is the capital of France?" | 1 / 36 | 457 ms | 4.9 tok/s |
+| "What is a famous museum there?" | 116 / 19 | 462 ms | 4.8 tok/s |
+| "Tell me one more fact about that city." | 214 / 21 | 480 ms | 4.6 tok/s |
+| "Thanks! Now summarise our conversation in one sentence." | 302 / 22 | 502 ms | 4.5 tok/s |
+
+("… The Louvre is home to thousands of works of art including the Mona
+Lisa, Venus de Milo …"; "Paris is a city renowned for its art,
+architecture, culture, history, and cuisine, …".)
+
+### 16.4 Scheduler and tests
+
+* New scheduler notions (doc/INFERENCE_SCHEDULER.md): **DMA states** (pool
+  buffers that persist across calls and entries; host ops write them in
+  place, kernels read them after `llm_cache_flush`), the **group-major /
+  interleaved state layout** (`numeric` `layout`), and a **runtime
+  dimension** of a kernel call (`LlmAttnConvNode`: the key count from the
+  entry's `pos` / `n`).  New ops `LlmAttnPrep`, `LlmAttnScores`,
+  `LlmAttnSoftmax`, `LlmAttnPV`, `LlmAttnMerge`; `LlmAttention` reads the
+  new cache layout.  `LlamaFrontend(prefill_attn="host")` keeps phase 3's
+  graphs (bit-exact with `pow2+sink+p12+xattn`).
+* Tests: **1487 pass** (5 skips).  New: the prep → q·Kᵀ → softmax → P·V →
+  merge chain on the host emulation (kernel widths 1 / 2 / 4, V interleave
+  1 / 2 / 4, context clamp, no valid row, MHA, 4 groups), against an
+  independent p12 computation; the key count and the softmax exp tables C
+  == Python; the V image equals `conv_lowered_b_image`; the tiny Llama
+  simulation == the study for both policies incl. a second turn after
+  decode steps and a truncate; the SmolLM2-360M layer shape on the host
+  emulation; a library-style call sequence of the multi-entry project run
+  in C; the **incoherent host emulation** (separate CPU / DDR copies of every
+  buffer: dropping the cache flush, a host op's output flush or an
+  invalidate each makes the outputs differ); the coherency audit per entry
+  of the multi-entry project with its `noinline` parts inlined (it saw only
+  the part calls before) and DMA states starting dirty.
+* Every existing model's generated project is byte-identical to main's
+  (timestamp line excluded): 166 / 166 — the 155 test models that generate,
+  BERT-SQuAD, ResNet-18, MobileNet v1 / v2 and 7 MNIST / LeNet models; the
+  13 models that exist to fail fail identically; only the three tiny Llama
+  fixtures change.
+
+### 16.5 Open issues
+
+* **The host softmax at late positions.**  It scales with rows × keys: 1.5
+  ms per group call for 256 rows at position 1, ~10 ms at position ~700
+  (board microbenchmark), where it outweighs the ConvKernel calls it hides
+  behind — 2.1 s for 256 new tokens at position 673.  Options: keep it in
+  float32 (a numeric change for the study), or have the q·Kᵀ call write the
+  scores query-major (a transposed K cache, which decode would read with a
+  stride).
+* **The prep is serial** (84 ms of the 256-token prefill): its q part could
+  run while the k / v projections are on ConvKernel (split the op,
+  ~ −35 ms).
+* **P·V is still ~1.6× its cycle model** with kw 4 (request latency);
+  deeper weight-request pipelining in `stream_load_weights` is a kernel
+  change.
+* **The 16-row bucket gains nothing** (host attention was 27 of its 366 ms);
+  short follow-up turns still take ~0.45 s, bound by the linears (237 ms)
+  and the LM head.
+* **CMA** grew by 26.9 MiB (pool 488.2 MiB).  The server's `smollm2.cma_mb`
+  should be ~510 (the example config now says so; the board's local config
+  still has 480).  `auto` residency judges by CmaFree, which page cache in
+  CMA depresses: after many `llm_open`s it left BERT unloaded until its
+  first request; after `drop_caches` both fit.  One `llm_open` failed
+  transiently (`xclAllocBO` of 488 MiB with 825 MB CmaFree — page migration)
+  and succeeded on retry.
+* The whole-buffer syncs of the softmax input / output (1.5 MiB each at
+  T 256) could be limited to the run-time extent (~0.4 ms per layer).
