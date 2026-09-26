@@ -5,7 +5,11 @@ SmolLM2-135M-Instruct, server on the board, existing CLIs + `chat.py`, context
 1024.**  Phase 1 (server + CLI + backend A) **done** (branch `feat/chatsrv`, §9).
 **Phase 2 done: GO for SmolLM2-135M on today's bitstream with the numeric
 policy `pow2+sink+p12` (§10)** — a float residual, a precomputed position-0
-sink, per-channel power-of-two exponents, and softmax P at 2^-12.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
+sink, per-channel power-of-two exponents, and softmax P at 2^-12.
+**Phase 4 server side done (branch `feat/llmsrv`, §12)** — tokenizer, chat
+template, sampling, the `smollm2` backend with prefix-cache reuse and
+two-model residency, tested against fakes of the §11 library; the board gate
+waits for phase 3's `libsmollm2.so`.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
 inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
@@ -661,3 +665,152 @@ callers pass the conversation's token ids **after** that leading token, and
 reuse the cache across turns by `llm_truncate` to the common prefix and
 prefilling only the new tokens.  Logits are the LM head's output converted
 from its fixed-point exponent to float.  Sampling is not in this library.
+
+## 12. Phase 4 outcome — server side (2026-09-26, branch `feat/llmsrv`)
+
+Everything above `libsmollm2.so`, built and tested on the host against fakes
+of the §11 contract; no FPGA used (the board only for CPU timing).  Files in
+[`demo/chat/`](../demo/chat/) (README section "Generative chat"):
+
+* **`smollm2_tokenizer.py`** (stdlib, ~300 lines + Unicode tables): the
+  `tokenizer.json` pipeline — special tokens matched first (never split),
+  `Digits(individual_digits)`, GPT-2's ByteLevel regex with Oniguruma's
+  `\s` (White_Space) and embedded Unicode 15.0 `\p{L}` / `\p{N}` tables (the
+  board's Python 3.10 has Unicode 13; the tables make it split like the
+  host), byte-level alphabet (21 byte symbols missing from the vocabulary are
+  dropped, as `tokenizers` does without an unk token), BPE by merge rank with
+  a word cache; `decode` = UTF-8 with U+FFFD like `from_utf8_lossy`;
+  `IncrementalDecoder` holds back incomplete UTF-8 for streaming.
+* **`chatml.py`**: the template exactly as `apply_chat_template` renders it
+  (default system prompt when the first message is not `system`); prompts are
+  tokenized block by block with a cache (every block starts with the special
+  `<|im_start|>`, so ids concatenate) — a follow-up turn tokenizes only its
+  new blocks; `fit()` trims the history (§3.2 B4): drop the oldest messages,
+  an assistant message left at the front goes with them, the system message
+  and the last message always stay, `ContextTooLong` if they alone do not
+  fit.
+* **`src/sampler.{h,c}` → `libsampler.so`, `sampler.py`**: penalties
+  (repetition HF-style, presence / frequency OpenAI-style, over the last
+  `repeat_last_n` tokens of prompt + answer) → greedy (temperature 0 or
+  top-k 1: first argmax) → temperature → top-k (heap) → softmax → top-p (exact
+  nucleus via a provably safe prefilter `e ≥ (1 − p)·Z / V` and a sort of the
+  survivors) → draw with splitmix64.  All in double in a fixed order, so the
+  pure-Python fallback returns the same token for the same seed.
+* **`smollm2_backend.py`**: `LibLlmEngine` (ctypes, exactly §11) and
+  `Smollm2Backend`.  `prepare()` (no FPGA): `developer` → `system`, template,
+  trim to `context − min(max_tokens, --llm-reserve 256)`, sampling parameters
+  (request, extras `top_k` / `repetition_penalty` / `repeat_last_n`, server
+  defaults temperature 0.2 / top-p 0.9 / top-k 50), a random seed if none.
+  `generate()` (FPGA lock): **prefix-cache reuse** — the token list in the KV
+  cache is kept; `llm_truncate(1 + common prefix)` and `llm_prefill` of the
+  rest only (at least the last token, for its logits; the `<|im_start|>` sink
+  is never passed); then sample → detokenize → stop strings → `Delta`, and
+  `llm_decode` of the token unless the answer is done.  Ends at `<|im_end|>` /
+  `<|endoftext|>` / `<|im_start|>`, a stop string, `max_tokens` or a full
+  context (`length`).  `cancel.check()` before every library call; the cache
+  list is updated only after a call succeeds, cleared (full prefill next
+  time) if one fails.  `Finish.info`: cached / prefilled tokens, prefill ms,
+  TTFT, decode tok/s, library and sampler ms, finish detail, seed, settings.
+* **Server**: `--backend smollm2` and `--llm-*` options; **residency**
+  (`--resident auto` default / `one` / `all`) for two FPGA models in the
+  tight CMA pool: backends declare `cma_mb` (BERT 224, SmolLM2 360 —
+  estimate); `auto` loads the first backend at startup and the others when
+  CmaFree allows or on first request, evicting least-recently-used models
+  while CmaFree < need + 32 MB and once more if a load still fails (not on a
+  dlopen failure); `one` swaps.  Loads / evictions happen under the FIFO FPGA
+  lock.  Backend interface: `load_host()` (tokenizer; at startup, so
+  `prepare()` works for unloaded models), `load()`, `unload()`.  `/health`
+  reports `loaded`, `resident`, `cma_free_mb`, `loads` / `unloads`.
+  A backend that fails to load lazily answers 503 `model_not_loaded` and is
+  retried on the next request.
+* **deploy.py**: uploads the new modules, `src/sampler.[ch]` and
+  `tokenizer.json`; builds `lib/libsampler.so` on the board (skipped when
+  unchanged); passes `server.resident` and the `smollm2` block (`lib`,
+  `weights_dir`, sampling defaults, `cma_mb`); the preflight checks for
+  `libsmollm2.so` and a C compiler.
+* **Fakes**: `tests/fake_llm.py` — `ScriptedEngine` (fast, scripted logits,
+  call log, error / delay injection) and `FloatModelEngine` (`llm_study.py`'s
+  float64 model with its KV cache — exact, ~10 tok/s on the host);
+  `tests/fake_libsmollm2.c` — the §11 C API with scripted logits, driven
+  through the real ctypes binding.  `kv260_chat_server.py --llm-fake
+  float|scripted` serves them.
+
+**Gates.**
+1. *Bit-identical text side.*  `scripts/validate_text.py` against
+   transformers 5.17 `TokenizersBackend` (the `tokenizer.json` pipeline):
+   **2960 / 2960** diverse strings (held-out text, 25 scripts, emoji / ZWJ,
+   combining marks, number forms, code, whitespace and control characters,
+   special tokens in text, random code points of all planes) identical in
+   ids, decode with and without special tokens and incremental decode;
+   2000 / 2000 random id sequences decode identically; **68 / 68** template
+   renderings (34 conversations × generation prompt on / off) identical in
+   text and ids.  Finding: transformers **5.x `AutoTokenizer`** returns a
+   `GPT2Tokenizer` that **drops the `Digits` pre-tokenizer** of
+   `tokenizer.json` — it disagrees on 249 strings, every one explained by
+   that (a numeral after ≥ 2 whitespace characters, non-ASCII numerals).
+   The model was trained with the `tokenizer.json` pipeline (transformers
+   4.x gives it), so that is the reference; the B0 study used `tokenizers`
+   directly and is unaffected.
+2. *Unit tests* (stdlib `unittest`, 59 new, **107 total**, ~40 s):
+   tokenizer / template against a 500-string + 34-conversation fixture,
+   trimming rules; sampler (greedy = argmax, penalties, top-k / top-p masks
+   against independent references, frequencies over 20 000 seeded draws
+   within 5σ, determinism, C == Python on 54 cases); backend against both
+   fakes — streaming schema, multi-turn reuse (**exactly the new tokens
+   prefilled**, the sink never), repeat of the same prompt (1 token
+   prefilled), edited history (truncated to the common prefix), stop strings
+   across tokens, `max_tokens` → `length`, cancellation mid-generation (the
+   cache stays consistent and is reused), context full, trimming, UTF-8
+   across tokens, seeds, library errors (500 / SSE error, cache cleared),
+   client disconnect; residency `one` / `auto` (fits both / evicts by CmaFree
+   / retries after a failed load) / `all` between `bert-squad` and `smollm2`
+   with fake engines and a fake CMA pool, 503 and recovery.  The 48 phase-1
+   tests pass unchanged.
+3. *End to end* (`scripts/e2e_check.py`): `chat.py` → server
+   (`--llm-fake float`) → **9 / 9 answers identical to transformers
+   `generate(do_sample=False)`** (6 one-shot incl. a system prompt, code and
+   an emoji prompt; a 3-turn REPL chat whose turns 2 and 3 prefilled 17 and
+   23 tokens, reusing 135 / 152 and 247 / 270 positions — the re-tokenized
+   answers matched the generated ids).
+
+**Measured on the board's A53** (CPU only, Python 3.10): tokenizer load
+1.45 s; 996-token prompt 39 ms cold / 13 ms warm; template + trim of a
+14-message chat 69 ms, next turn 2.7 ms; detokenizer 6 µs / token;
+`libsampler.so` 0.8 ms greedy, 1.9 ms with the defaults (top-k 50, top-p 0.9),
+6.7 ms top-p alone, 5.1 ms plain temperature (the pure-Python fallback
+25–205 ms).  So ~2 ms of host work per ~200 ms decode step; no tokenizer
+accelerator needed.
+
+**What integration with phase 3's `libsmollm2.so` needs.**
+* The library at `<dir>/lib/libsmollm2.so` on the board (or `smollm2.lib`
+  in `chat_config.json`), built by the decoder project; `weights_dir` in the
+  config if `llm_open(NULL)` does not find the weights by itself.  Export only
+  the `llm_*` symbols (like `bert_*`, §9) — both libraries live in one
+  process.
+* `llm_open` must work again after `llm_close` (eviction under `--resident
+  auto` / `one`), and `llm_close` must return the CMA (pool BO, KV cache).
+* Calls come from the server's handler threads — one at a time (FIFO lock)
+  but not always the same OS thread.
+* `llm_vocab_size()` must be 49 152 (checked at load) and
+  `llm_context_size()` is used for trimming once loaded (`--llm-context` only
+  until then).  Logits as float in token-id order; `llm_position()` must stay
+  consistent after an error (or the server just re-truncates to 1).
+* Measure the loaded model's CMA and set `smollm2.cma_mb` (360 is the §10.6
+  estimate); with BERT at ~224 MB both fit only at the high end of idle
+  CmaFree, so `auto` will usually swap.
+* Board gate of phase 4 then: `deploy.py` with `["bert-squad", "smollm2"]`,
+  multi-turn chats through `llm`, `aichat`, `chat.py`; measure tokens/s and
+  TTFT; compare greedy board answers with the emulation's
+  (`llm_study.py`'s `pow2+sink+p12` policy) — they should be identical if
+  the library is bit-exact with it.
+
+**Open issues.**
+* Nothing measured on the FPGA yet (TTFT, tok/s, load time, CMA).
+* `--llm-prefill-chunk` (split long prefills so a disconnect cancels between
+  chunks) is off by default: every extra call costs an LM head (~40 ms).
+* Special-token text inside user messages is parsed as special tokens (as
+  transformers does); a user can inject `<|im_end|>` / `<|im_start|>`.
+* The server's default sampling (temperature 0.2) is not OpenAI's 1.0; clients
+  that send their own temperature are unaffected.
+* The pure-Python sampler fallback is too slow for sampling on the A53
+  (25–205 ms per token); deploy builds the C one.
