@@ -1117,3 +1117,30 @@ Notes for the server (§12):
 - CmaFree after close sits a few MiB below its value before open.  This is
   page cache in CMA pageblocks, not a leak: repeated cycles do not
   accumulate beyond that noise.
+
+## 14. Integration on the board (2026-09-26, main dba302e)
+
+`demo/chat/deploy.py` with `server.backends = ["smollm2", "bert-squad"]`,
+`resident: auto`, `smollm2.cma_mb = 480`: both models load at startup
+(SmolLM2 1.0 s from the page cache → CmaFree 411 MB; BERT 14.3 s cold →
+CmaFree 199 MB), so no swapping was needed on this boot.  Measured through
+the OpenAI API (`chat.py`, stdlib `urllib`):
+
+| request | result |
+|---|---|
+| "What is the capital of France?", greedy | "The capital of France is Paris. It is a city known for its historical landmarks, …" — the study's Q8.8 greedy text word for word (§10.4); first token 0.5 s, **5.0 tok/s** |
+| "Three tips for learning a new language", default sampling (T 0.2, top-p 0.9) | coherent 3-item list, first token 0.4 s, 4.9 tok/s, 99 tokens in 20.7 s |
+| 3-turn conversation | prefix reuse 24/45 → 124/141 → 220/238 cached positions; only 21 / 17 / 18 new tokens prefilled; TTFT 0.48 / 0.60 / 0.72 s; 4.6–4.95 tok/s |
+| switch to `bert-squad` ("How much memory does the K26 have?" over a 2-sentence document) | "4 GB", 1.0 s |
+| back to `smollm2` | TTFT 0.38 s (cache reused 24/35) |
+
+**Quality is the model's.**  The float model (transformers, float32, greedy,
+same template) gives the same weak answers on the PC: it forgets the user's
+name in turn 3 ("My name is Alex Chen …" in both), and "Say hello in French"
+degenerates the same way ("Bonjour, merci pour notre aide. Je suis de
+nombreux, …" in both).  SmolLM2-360M is the same code path (regenerate with
+its safetensors; ~2 tok/s, needs BERT unloaded or `resident: one`).
+
+**Next levers (phase 5):** prefill attention on the FPGA (256-token prefill
+3.6 → ~1.1 s), q/k/v and gate/up fusion (−90 of 211 calls per token), and
+dual-port weight streaming for decode (~2×).
