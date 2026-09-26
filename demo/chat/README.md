@@ -197,13 +197,41 @@ messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, blo
   | `repetition_penalty` (extra) | 1.0 | HF / CTRL: `l > 0 ? l / r : l * r` for recent tokens |
   | `presence_penalty`, `frequency_penalty` | 0 | OpenAI: `l -= a + f · count` |
   | `repeat_last_n` (extra) | 64 | penalty window over prompt + answer; 0 off, −1 all |
+  | `dry_multiplier` (extra) | 0.8 | DRY: a token that would extend a run already in the context loses `multiplier · base^(run − allowed_length)`; 0 = off |
+  | `dry_base`, `dry_allowed_length` (extra) | 1.75, 2 | growth per matched token; runs shorter than allowed_length are free |
+  | `dry_penalty_last_n` (extra) | −1 | DRY window over prompt + answer; −1 the whole context, 0 off |
+  | `dry_sequence_breakers` (extra) | `["\n", ":", "\"", "*"]` | a token containing one of these (and every special token) cuts a run, so lists, dialogue and markdown are not penalised |
   | `seed` | random | the used seed is returned as `kv260.seed`; same seed + same logits → same answer |
 
-  Defaults are the model card's (temperature 0.2, top_p 0.9) and HF
-  generate's top_k 50; change them with `--llm-temperature`, `--llm-top-p`,
-  `--llm-top-k`, `--llm-repetition-penalty` (or `smollm2.*` in
-  `chat_config.json`).  The order is HF's: penalties → temperature → top-k
-  → top-p → draw (details in `src/sampler.h`).
+  Defaults are the model card's (temperature 0.2, top_p 0.9), HF
+  generate's top_k 50 and DRY on at the text-generation-webui / llama.cpp
+  values (0.8 / 1.75 / 2); change them with `--llm-temperature`,
+  `--llm-top-p`, `--llm-top-k`, `--llm-repetition-penalty`,
+  `--llm-dry-multiplier` … (or `smollm2.*` in `chat_config.json`).  The
+  order is HF's plus DRY: penalties → DRY → temperature → top-k → top-p →
+  draw (details in `src/sampler.h`).  DRY is what stops the 135M model's
+  repetition loops at the default low temperature (see "Repetition (DRY)" below).
+* **Repetition (DRY).**  At the default low temperature the 135M model
+  falls into verbatim loops ("I think I might have found a cat … But I
+  don't know if I can catch it." again and again until `max_tokens`).  The
+  sampler applies DRY ("Don't Repeat Yourself"): a token that would extend a
+  run already present in the context is penalised by
+  `0.8 · 1.75^(run − 2)`, which grows fast enough to leave any loop after a
+  few repeated tokens; tokens containing a newline, `:`, `"` or `*` (and
+  every special token) cut runs, so lists, dialogue, markdown and code keep
+  their structure.  Measured on the board (seed 7, same prompts):
+
+  | prompt | repeated word-trigrams, DRY off → on | text |
+  |---|---|---|
+  | "Write a small story about cats" (300 tokens) | 20 % → 5 %, 1 → 0 repeated sentences | the loop is gone; still formulaic (the model) |
+  | "What is the capital of France?" | 6 % → 6 % | identical |
+  | "Three tips for learning a new language" | 2 % → 2 % | identical (a markdown list) |
+  | "Python function that checks primes" | 10 % → 6 % | identical code block, reworded explanation |
+
+  Cost: ~2.5 ms of sampler time per token (≈ 1 % of a decode step).
+  Per request: `"dry_multiplier": 0` turns it off; stronger settings
+  (`dry_multiplier` 1–2, or adding `"repetition_penalty": 1.1`) trade some
+  coherence for less repetition.
 * **Stop.**  Generation ends at `<|im_end|>` (also `<|endoftext|>` or a new
   `<|im_start|>`), at a `stop` string (up to 4; matched across token
   boundaries, the stop string itself is not sent) or at `max_tokens`.

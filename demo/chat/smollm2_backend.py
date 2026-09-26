@@ -24,9 +24,14 @@ generate() (FPGA lock) prefix-cache reuse: the token list currently in the
 Parameters: temperature (0 = greedy), top_p, seed, stop, max_tokens,
 presence_penalty, frequency_penalty (OpenAI fields), and the extra fields
 top_k and repetition_penalty (HF semantics) and repeat_last_n (the penalty
-window: 64 recent tokens of prompt + answer; 0 = off, -1 = everything).
-Unset ones take the server defaults (the model card's temperature 0.2,
-top_p 0.9; top_k 50 as HF generate; no penalties).  Without a seed a random
+window: 64 recent tokens of prompt + answer; 0 = off, -1 = everything), and
+the DRY fields dry_multiplier, dry_base, dry_allowed_length,
+dry_penalty_last_n (the DRY window over prompt + answer; -1 = the whole
+context, 0 = off) and dry_sequence_breakers (strings; a token containing any
+of them cuts a repeat match; special tokens always do).  Unset ones take the
+server defaults (the model card's temperature 0.2, top_p 0.9; top_k 50 as HF
+generate; DRY on at the usual 0.8 / 1.75 / 2 over the whole context with
+breakers "\n", ":", "\"", "*"; no other penalties).  Without a seed a random
 one is drawn and returned in kv260.seed, so any answer can be reproduced.
 
 usage.prompt_tokens = prompt ids incl. the leading <|im_start|>;
@@ -44,12 +49,15 @@ import random
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import chatml
 from chat_backend import (Backend, BackendError, Cancelled, CancelToken, ChatRequest, Delta,
                           Finish, StopStream)
 from sampler import SamplerParams, make_sampler
+
+# the usual DRY sequence breakers (text-generation-webui / llama.cpp defaults)
+DRY_BREAKERS = ("\n", ":", "\"", "*")
 from smollm2_tokenizer import Tokenizer
 
 MODEL_ID = "smollm2-135m-instruct"
@@ -160,6 +168,8 @@ class Job:
     max_tokens: Optional[int]
     stops: List[str]
     last_n: int
+    dry_last_n: int = -1
+    breakers: Optional[Tuple[str, ...]] = None       # None: the backend's defaults
     dropped: int = 0
     prepare_ms: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -182,11 +192,17 @@ class Smollm2Backend(Backend):
     def __init__(self, engine, tokenizer_path: str, *, sampler_lib: Optional[str] = None,
                  defaults: Optional[SamplerParams] = None, context_size: int = 1024,
                  reserve: int = 256, repeat_last_n: int = 64, prefill_chunk: int = 0,
-                 cma_mb: Optional[float] = None):
+                 cma_mb: Optional[float] = None, dry_penalty_last_n: int = -1,
+                 dry_sequence_breakers: Sequence[str] = DRY_BREAKERS):
         self.engine = engine
         self.tokenizer_path = tokenizer_path
         self.sampler_lib = sampler_lib
-        self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50)
+        self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50,
+                                                  dry_multiplier=0.8)
+        self.dry_last_n = dry_penalty_last_n
+        self.dry_breakers = tuple(dry_sequence_breakers)
+        self._breaker_ids: Dict[Tuple[str, ...], List[int]] = {}
+        self._breakers_set: Optional[Tuple[str, ...]] = None      # what the sampler holds
         self.ctx = context_size
         self.reserve = reserve
         self.repeat_last_n = repeat_last_n
@@ -212,7 +228,27 @@ class Smollm2Backend(Backend):
         self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
         self.eog = frozenset(self.tok.special[t] for t in EOG_TOKENS if t in self.tok.special)
         self.bos = self.tok.special["<|im_start|>"]
+        self._set_breakers(self.dry_breakers)
         self.host_load_s = time.monotonic() - t0
+
+    def breaker_ids(self, breakers: Tuple[str, ...]) -> List[int]:
+        """Token ids that cut a DRY match: every special token, and every token
+        whose bytes contain one of the breaker strings (byte-level BPE merges
+        "\n" into many tokens, so a per-token substring test, not one id)."""
+        ids = self._breaker_ids.get(breakers)
+        if ids is None:
+            pats = [b.encode("utf-8") for b in breakers if b]
+            ids = [i for i in range(self.tok.vocab_size)
+                   if self.tok.is_special(i) or any(pt in self.tok.token_bytes(i) for pt in pats)]
+            if len(self._breaker_ids) > 8:
+                self._breaker_ids.clear()
+            self._breaker_ids[breakers] = ids
+        return ids
+
+    def _set_breakers(self, breakers: Tuple[str, ...]) -> None:
+        if breakers != self._breakers_set:
+            self.sampler.set_breakers(self.breaker_ids(breakers))
+            self._breakers_set = breakers
 
     def load(self) -> None:
         self.load_host()
@@ -263,12 +299,31 @@ class Smollm2Backend(Backend):
         rep = self._extra(raw, "repetition_penalty", 0.01, 10.0)
         pres = self._extra(raw, "presence_penalty", -2.0, 2.0)
         freq = self._extra(raw, "frequency_penalty", -2.0, 2.0)
+        dmul = self._extra(raw, "dry_multiplier", 0.0, 10.0)
+        dbase = self._extra(raw, "dry_base", 1.0, 10.0)
+        dlen = self._extra(raw, "dry_allowed_length", 1, 64, integer=True)
         return SamplerParams(temperature=float(pick(req.temperature, d.temperature)),
                              top_p=float(pick(req.top_p, d.top_p)),
                              top_k=int(pick(top_k, d.top_k)),
                              repetition_penalty=float(pick(rep, d.repetition_penalty)),
                              presence_penalty=float(pick(pres, d.presence_penalty)),
-                             frequency_penalty=float(pick(freq, d.frequency_penalty)))
+                             frequency_penalty=float(pick(freq, d.frequency_penalty)),
+                             dry_multiplier=float(pick(dmul, d.dry_multiplier)),
+                             dry_base=float(pick(dbase, d.dry_base)),
+                             dry_allowed_length=int(pick(dlen, d.dry_allowed_length)),
+                             dry_max_match=d.dry_max_match)
+
+    @staticmethod
+    def _breakers_field(raw: dict) -> Optional[Tuple[str, ...]]:
+        v = raw.get("dry_sequence_breakers")
+        if v is None:
+            return None
+        if (not isinstance(v, list) or len(v) > 32
+                or any(not isinstance(x, str) or not x or len(x) > 32 for x in v)):
+            raise BackendError("Invalid 'dry_sequence_breakers': expected a list of at most 32 "
+                               "non-empty strings of at most 32 characters.", "dry_sequence_breakers",
+                               code="invalid_value")
+        return tuple(v)
 
     def prepare(self, req: ChatRequest) -> Job:
         t0 = time.monotonic()
@@ -277,6 +332,9 @@ class Smollm2Backend(Backend):
         params = self.sampler_params(req)
         last_n = self._extra(req.raw or {}, "repeat_last_n", -1, None, integer=True)
         last_n = self.repeat_last_n if last_n is None else last_n
+        dry_n = self._extra(req.raw or {}, "dry_penalty_last_n", -1, None, integer=True)
+        dry_n = self.dry_last_n if dry_n is None else dry_n
+        breakers = self._breakers_field(req.raw or {})
         msgs = [{"role": "system" if m["role"] == "developer" else m["role"], "content": m["content"]}
                 for m in req.messages]
         reserve = min(req.max_tokens, self.reserve) if req.max_tokens else self.reserve
@@ -290,8 +348,8 @@ class Smollm2Backend(Backend):
         if not ids or ids[0] != self.bos or len(ids) < 2:
             raise BackendError("internal: the chat template must start with <|im_start|>", "messages")
         seed = req.seed if req.seed is not None else random.SystemRandom().getrandbits(63)
-        return Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dropped,
-                   (time.monotonic() - t0) * 1000.0)
+        return Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
+                   breakers, dropped, (time.monotonic() - t0) * 1000.0)
 
     # ── prompt -> tokens (FPGA) ──
 
@@ -336,8 +394,10 @@ class Smollm2Backend(Backend):
         t_prefill = time.monotonic()
         prefill_ms = (t_prefill - t0) * 1000.0
         smp.seed(job.seed)
+        self._set_breakers(job.breakers if job.breakers is not None else self.dry_breakers)
         history = list(prompt)
         last_n = job.last_n
+        dry_n = job.dry_last_n
         dec = tok.incremental_decoder()
         ss = StopStream(job.stops)
         n_gen, n_decode, lib_ms, smp_ms = 0, 0, 0.0, 0.0
@@ -346,7 +406,8 @@ class Smollm2Backend(Backend):
         while True:
             ts = time.monotonic()
             recent = history if last_n < 0 else (history[-last_n:] if last_n > 0 else ())
-            t = smp.sample(logits, recent, p)
+            hist = history if dry_n < 0 else (history[-dry_n:] if dry_n > 0 else ())
+            t = smp.sample(logits, recent, p, hist=hist)
             smp_ms += (time.monotonic() - ts) * 1000.0
             if t_first is None:
                 t_first = time.monotonic()
@@ -402,7 +463,9 @@ class Smollm2Backend(Backend):
                 "decode_tok_s": round(rate, 2), "library_decode_ms": round(lib_ms, 1),
                 "sampler_ms": round(smp_ms, 1), "prepare_ms": round(job.prepare_ms, 1),
                 "trimmed_messages": job.dropped, "context_size": ctx, "seed": job.seed,
-                "sampler": dict(p.as_dict(), repeat_last_n=last_n, impl=getattr(smp, "kind", "?")),
+                "sampler": dict(p.as_dict(), repeat_last_n=last_n, dry_penalty_last_n=dry_n,
+                                dry_sequence_breakers=list(self._breakers_set or ()),
+                                impl=getattr(smp, "kind", "?")),
                 "log": {"reuse": f"{reuse + 1}/{len(prompt)}", "prefill": f"{len(new)}tok/{prefill_ms:.0f}ms",
                         "decode": f"{rate:.1f}tok/s", "why": finish}}
         if job.dropped:

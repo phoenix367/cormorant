@@ -18,11 +18,14 @@ struct smp_state {
     cand_t  *c;       /* candidate list */
     int32_t *cnt;     /* occurrences in `recent` (zero between calls) */
     int32_t *seen;    /* distinct ids of `recent` */
+    uint8_t *brk;     /* DRY sequence breakers */
+    int32_t *dml;     /* DRY: longest match per candidate (zero between calls) */
+    int32_t *dseen;   /* DRY: candidates with a match, in first-seen order */
 };
 
 const char *smp_version(void)
 {
-    return "kv260-sampler 1";
+    return "kv260-sampler 2 (dry)";
 }
 
 smp_state *smp_new(int32_t n_vocab)
@@ -40,7 +43,10 @@ smp_state *smp_new(int32_t n_vocab)
     s->c = (cand_t *)malloc(sizeof(cand_t) * (size_t)n_vocab);
     s->cnt = (int32_t *)calloc((size_t)n_vocab, sizeof(int32_t));
     s->seen = (int32_t *)malloc(sizeof(int32_t) * (size_t)n_vocab);
-    if (!s->l || !s->e || !s->c || !s->cnt || !s->seen) {
+    s->brk = (uint8_t *)calloc((size_t)n_vocab, 1);
+    s->dml = (int32_t *)calloc((size_t)n_vocab, sizeof(int32_t));
+    s->dseen = (int32_t *)malloc(sizeof(int32_t) * (size_t)n_vocab);
+    if (!s->l || !s->e || !s->c || !s->cnt || !s->seen || !s->brk || !s->dml || !s->dseen) {
         smp_free(s);
         return NULL;
     }
@@ -57,6 +63,9 @@ void smp_free(smp_state *s)
     free(s->c);
     free(s->cnt);
     free(s->seen);
+    free(s->brk);
+    free(s->dml);
+    free(s->dseen);
     free(s);
 }
 
@@ -122,15 +131,73 @@ static void sift_up(cand_t *h, int32_t i)
 }
 
 static int bad_args(const smp_state *s, const float *logits, const int32_t *recent,
-                    int32_t n_recent, const smp_params *p)
+                    int32_t n_recent, const int32_t *hist, int32_t n_hist, const smp_params *p)
 {
-    return !s || !logits || !p || n_recent < 0 || (n_recent > 0 && !recent);
+    return !s || !logits || !p || n_recent < 0 || (n_recent > 0 && !recent)
+        || n_hist < 0 || (n_hist > 0 && !hist);
+}
+
+int32_t smp_set_breakers(smp_state *s, const int32_t *ids, int32_t n)
+{
+    int32_t i, k = 0;
+
+    if (!s || n < 0 || (n > 0 && !ids))
+        return -1;
+    memset(s->brk, 0, (size_t)s->n);
+    for (i = 0; i < n; i++)
+        if (ids[i] >= 0 && ids[i] < s->n && !s->brk[ids[i]]) {
+            s->brk[ids[i]] = 1;
+            k++;
+        }
+    return k;
+}
+
+/* step 1b: DRY over hist (see sampler.h) */
+static void dry(smp_state *s, double *l, const int32_t *hist, int32_t n_hist, const smp_params *p)
+{
+    const int32_t n = s->n;
+    int32_t       i, nd = 0, last, maxm, al;
+
+    if (!(p->dry_multiplier > 0.0) || n_hist < 2)
+        return;
+    last = hist[n_hist - 1];
+    if (last < 0 || last >= n || s->brk[last])
+        return;
+    maxm = p->dry_max_match > 0 ? p->dry_max_match : 50;
+    al = p->dry_allowed_length > 0 ? p->dry_allowed_length : 1;
+    for (i = 0; i + 1 < n_hist; i++) {
+        int32_t nx, len = 1;
+        if (hist[i] != last)
+            continue;
+        nx = hist[i + 1];
+        if (nx < 0 || nx >= n || s->brk[nx])
+            continue;
+        while (len < maxm) {
+            int32_t j = i - len, prev;
+            if (j < 0)
+                break;
+            prev = hist[n_hist - 1 - len];
+            if (hist[j] != prev || prev < 0 || prev >= n || s->brk[prev])
+                break;
+            len++;
+        }
+        if (s->dml[nx] == 0)
+            s->dseen[nd++] = nx;
+        if (len > s->dml[nx])
+            s->dml[nx] = len;
+    }
+    for (i = 0; i < nd; i++) {
+        int32_t t = s->dseen[i], len = s->dml[t];
+        if (len >= al)
+            l[t] = l[t] - p->dry_multiplier * pow(p->dry_base, (double)(len - al));
+        s->dml[t] = 0;
+    }
 }
 
 /* steps 1-6; returns the candidate count (list in s->c / s->e, total mass in *z),
  * or -(id + 1) for a greedy pick */
 static int32_t filter(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
-                      const smp_params *p, double *z)
+                      const int32_t *hist, int32_t n_hist, const smp_params *p, double *z)
 {
     const int32_t n = s->n;
     double       *l = s->l, *e = s->e, m, acc;
@@ -162,6 +229,8 @@ static int32_t filter(smp_state *s, const float *logits, const int32_t *recent, 
             s->cnt[t] = 0;
         }
     }
+    /* 1b. DRY */
+    dry(s, l, hist, n_hist, p);
     /* 2. greedy */
     greedy = !(p->temperature > 0.0) || k == 1;
     if (greedy) {
@@ -248,15 +317,15 @@ static int32_t filter(smp_state *s, const float *logits, const int32_t *recent, 
     return nc;
 }
 
-int32_t smp_sample(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
-                   const smp_params *p)
+int32_t smp_sample_ex(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
+                      const int32_t *hist, int32_t n_hist, const smp_params *p)
 {
     double  z, target, acc = 0.0;
     int32_t nc, i;
 
-    if (bad_args(s, logits, recent, n_recent, p))
+    if (bad_args(s, logits, recent, n_recent, hist, n_hist, p))
         return -1;
-    nc = filter(s, logits, recent, n_recent, p, &z);
+    nc = filter(s, logits, recent, n_recent, hist, n_hist, p, &z);
     if (nc < 0)
         return -nc - 1;
     target = smp_rng_uniform(s) * z;
@@ -268,15 +337,23 @@ int32_t smp_sample(smp_state *s, const float *logits, const int32_t *recent, int
     return s->c[nc - 1].id;
 }
 
-int32_t smp_candidates(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
-                       const smp_params *p, int32_t *out_ids, double *out_probs, int32_t max_out)
+int32_t smp_sample(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
+                   const smp_params *p)
+{
+    return smp_sample_ex(s, logits, recent, n_recent, recent, n_recent, p);
+}
+
+int32_t smp_candidates_ex(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
+                          const int32_t *hist, int32_t n_hist, const smp_params *p,
+                          int32_t *out_ids, double *out_probs, int32_t max_out)
 {
     double  z;
     int32_t nc, i;
 
-    if (bad_args(s, logits, recent, n_recent, p) || max_out < 0 || (max_out > 0 && (!out_ids || !out_probs)))
+    if (bad_args(s, logits, recent, n_recent, hist, n_hist, p) || max_out < 0
+        || (max_out > 0 && (!out_ids || !out_probs)))
         return -1;
-    nc = filter(s, logits, recent, n_recent, p, &z);
+    nc = filter(s, logits, recent, n_recent, hist, n_hist, p, &z);
     if (nc < 0) {
         if (max_out > 0) {
             out_ids[0] = -nc - 1;
@@ -289,4 +366,11 @@ int32_t smp_candidates(smp_state *s, const float *logits, const int32_t *recent,
         out_probs[i] = s->e[i] / z;
     }
     return nc;
+}
+
+int32_t smp_candidates(smp_state *s, const float *logits, const int32_t *recent, int32_t n_recent,
+                       const smp_params *p, int32_t *out_ids, double *out_probs, int32_t max_out)
+{
+    return smp_candidates_ex(s, logits, recent, n_recent, recent, n_recent, p, out_ids, out_probs,
+                             max_out);
 }

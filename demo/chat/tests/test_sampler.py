@@ -27,6 +27,32 @@ def softmax(vals):
     return [x / s for x in e]
 
 
+def dry_reference(hist, n, breakers, mult, base, allowed, max_match=50):
+    """text-generation-webui's DRY processor (p-e-w, 2024), transcribed:
+    token -> penalty subtracted from its logit."""
+    if mult <= 0 or len(hist) < 2:
+        return {}
+    last = hist[-1]
+    if last in breakers or not 0 <= last < n:
+        return {}
+    match_lengths = {}
+    for i in [k for k in range(len(hist) - 1) if hist[k] == last]:
+        nxt = hist[i + 1]
+        if nxt in breakers or not 0 <= nxt < n:
+            continue
+        ml = 1
+        while ml < max_match:
+            j = i - ml
+            if j < 0:
+                break
+            prev = hist[-(ml + 1)]
+            if hist[j] != prev or prev in breakers or not 0 <= prev < n:
+                break
+            ml += 1
+        match_lengths[nxt] = max(ml, match_lengths.get(nxt, 0))
+    return {t: mult * base ** (ml - allowed) for t, ml in match_lengths.items() if ml >= allowed}
+
+
 class SamplerCases:
     """Mixed into one TestCase per implementation (self.make(n) -> sampler)."""
 
@@ -174,6 +200,88 @@ class SamplerCases:
         self.assertEqual(s.sample(a, [], SamplerParams(temperature=0.0)), 2)
         self.assertEqual(s.sample(list(lg), [], SamplerParams(temperature=0.0)), 2)
 
+    def test_dry_matches_reference(self):
+        """Penalties recovered from the candidate distribution (zero logits,
+        temperature 1: log p_i - log p_j = pen_j - pen_i) equal the reference."""
+        rng = random.Random(11)
+        n = 40
+        s = self.make(n)
+        zeros = (ctypes.c_float * n)(*([0.0] * n))
+        for trial in range(200):
+            alphabet = rng.randint(2, 8)
+            hist = [rng.randrange(alphabet) for _ in range(rng.randint(2, 120))]
+            if trial % 3 == 0:                       # plant a long repeat
+                k = rng.randint(3, 20)
+                seg = hist[-k:] if len(hist) >= k else hist
+                hist = hist + [rng.randrange(alphabet)] + seg
+            brk = set(rng.sample(range(alphabet), rng.randint(0, 2)))
+            s.set_breakers(sorted(brk) + [n + 5, -1])            # out-of-range ids ignored
+            mult, base, allowed = rng.choice([0.8, 0.5, 2.0]), rng.choice([1.75, 1.1, 2.0]), rng.randint(1, 4)
+            p = SamplerParams(temperature=1.0, dry_multiplier=mult, dry_base=base, dry_allowed_length=allowed)
+            want = dry_reference(hist, n, brk, mult, base, allowed)
+            cands = dict(s.candidates(zeros, [], p, hist=hist))
+            ref = softmax([-want.get(t, 0.0) for t in range(n)])       # zero logits, temperature 1
+            for t in range(n):
+                self.assertAlmostEqual(cands.get(t, 0.0), ref[t], delta=1e-12 + 1e-9 * ref[t],
+                                       msg=(trial, t, hist[-12:], brk))
+
+    def test_dry_semantics(self):
+        n = 10
+        s = self.make(n)
+        s.set_breakers([9])
+        lg = (ctypes.c_float * n)(*([0.0] * n))
+        p = SamplerParams(temperature=0.0, dry_multiplier=1.0, dry_base=2.0, dry_allowed_length=2)
+        # 1 2 3 4 ... 1 2 3: token 4 would extend a run of 3 -> 1 * 2^(3-2) = 2
+        hist = [1, 2, 3, 4, 5, 6, 1, 2, 3]
+        c = dict(s.candidates(lg, [], SamplerParams(temperature=1.0, dry_multiplier=1.0, dry_base=2.0,
+                                                    dry_allowed_length=2), hist=hist))
+        self.assertAlmostEqual(math.log(c[4]) - math.log(c[0]), -2.0, places=12)
+        self.assertNotEqual(s.sample(lg, [], p, hist=hist), 4)      # greedy avoids extending it
+        # a run of 1 (< allowed_length) is free
+        c = dict(s.candidates(lg, [], SamplerParams(temperature=1.0, dry_multiplier=1.0, dry_allowed_length=2),
+                              hist=[1, 4, 5, 1]))
+        self.assertAlmostEqual(c[4], c[0], places=15)
+        # a breaker inside the earlier occurrence cuts the run: 1 9 3 ... 1 9 3 -> only "3" matches
+        c = dict(s.candidates(lg, [], SamplerParams(temperature=1.0, dry_multiplier=1.0, dry_base=2.0,
+                                                    dry_allowed_length=1), hist=[1, 9, 3, 4, 1, 9, 3]))
+        self.assertAlmostEqual(math.log(c[4]) - math.log(c[0]), -1.0, places=12)   # L = 1: 2^0
+        # the last token is a breaker: no penalty at all
+        c = dict(s.candidates(lg, [], SamplerParams(temperature=1.0, dry_multiplier=1.0, dry_allowed_length=1),
+                              hist=[9, 4, 9]))
+        self.assertAlmostEqual(c[4], c[0], places=15)
+        # dry_multiplier 0 and n_hist < 2: off
+        for h, m in (([1, 2, 1], 0.0), ([1], 1.0), ([], 1.0)):
+            c = dict(s.candidates(lg, [], SamplerParams(temperature=1.0, dry_multiplier=m, dry_allowed_length=1),
+                                  hist=h))
+            self.assertAlmostEqual(c[2], c[0], places=15)
+        # hist defaults to recent; an explicit hist is used for DRY only
+        rp = SamplerParams(temperature=1.0, dry_multiplier=1.0, dry_base=2.0, dry_allowed_length=1)
+        c1 = dict(s.candidates(lg, [1, 2, 1], rp))
+        c2 = dict(s.candidates(lg, [5], rp, hist=[1, 2, 1]))
+        self.assertEqual(c1, c2)
+
+    def test_dry_breaks_a_greedy_loop(self):
+        """A model that always prefers continuing the cycle 0 1 2 3 4 0 1 2 ...
+        by a margin of 4: greedy loops forever; with DRY the cycle breaks."""
+        n = 16
+        s = self.make(n)
+        s.set_breakers([])
+
+        def run(p, steps=60):
+            hist = [0]
+            for _ in range(steps):
+                lg = (ctypes.c_float * n)(*([0.0] * n))
+                lg[(hist[-1] + 1) % 5] = 4.0
+                hist.append(s.sample(lg, [], p, hist=hist))
+            return hist
+        loop = run(SamplerParams(temperature=0.0))
+        self.assertEqual(loop, [i % 5 for i in range(61)])
+        broke = run(SamplerParams(temperature=0.0, dry_multiplier=0.8, dry_base=1.75, dry_allowed_length=2))
+        self.assertNotEqual(broke, loop)
+        # after the first repeat grows past allowed_length + log_1.75(4 / 0.8) ~ 5 tokens it deviates
+        first_dev = next(i for i, (a, b) in enumerate(zip(broke, loop)) if a != b)
+        self.assertLess(first_dev, 15)
+
 
 class TestPySampler(SamplerCases, unittest.TestCase):
     def make(self, n):
@@ -191,7 +299,12 @@ class TestCSampler(SamplerCases, unittest.TestCase):
         params = [SamplerParams(0.0), SamplerParams(0.0, repetition_penalty=1.3),
                   SamplerParams(0.2, 0.9, 50), SamplerParams(0.7, 0.9, 0, 1.1),
                   SamplerParams(1.0, 0.95), SamplerParams(1.3, 1.0, 0, 1.0, 0.5, 0.2),
-                  SamplerParams(0.8, 0.5, 40), SamplerParams(2.0, 0.999), SamplerParams(1.0, 1.0, 0)]
+                  SamplerParams(0.8, 0.5, 40), SamplerParams(2.0, 0.999), SamplerParams(1.0, 1.0, 0),
+                  SamplerParams(0.0, dry_multiplier=0.8), SamplerParams(0.2, 0.9, 50, dry_multiplier=0.8),
+                  SamplerParams(1.0, 0.95, 0, 1.1, dry_multiplier=2.0, dry_base=1.3, dry_allowed_length=1)]
+        brk = [rng.randrange(V) for _ in range(40)] + [3]
+        c.set_breakers(brk)
+        py.set_breakers(brk)
         n = 0
         for trial in range(6):
             lg = rand_logits(rng)
@@ -199,13 +312,16 @@ class TestCSampler(SamplerCases, unittest.TestCase):
                 for i in range(0, V, 7):
                     lg[i] = lg[3]                                  # many ties
             recent = [rng.randrange(V) for _ in range(rng.randint(0, 64))] + [3, 3]
+            base = [rng.randrange(60) for _ in range(rng.randint(10, 300))]
+            hist = base + base[: rng.randint(2, 40)]                     # a planted repeat
             for p in params:
                 seed = rng.getrandbits(64)
                 c.seed(seed)
                 py.seed(seed)
-                self.assertEqual([c.sample(lg, recent, p) for _ in range(4)],
-                                 [py.sample(lg, recent, p) for _ in range(4)], p)
-                self.assertEqual(c.candidates(lg, recent, p), py.candidates(lg, recent, p), p)
+                self.assertEqual([c.sample(lg, recent, p, hist=hist) for _ in range(4)],
+                                 [py.sample(lg, recent, p, hist=hist) for _ in range(4)], p)
+                self.assertEqual(c.candidates(lg, recent, p, hist=hist),
+                                 py.candidates(lg, recent, p, hist=hist), p)
                 n += 1
         self.assertEqual(n, 6 * len(params))
 

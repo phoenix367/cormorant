@@ -10,8 +10,9 @@ picks the C one when the library loads.
 
 The pipeline and its conventions are documented in src/sampler.h:
 penalties over the recent tokens (repetition: HF / CTRL style; presence /
-frequency: OpenAI style) -> greedy if temperature <= 0 or top_k == 1 ->
-temperature -> top-k -> softmax -> top-p -> draw with a splitmix64 RNG.
+frequency: OpenAI style) -> DRY over the ordered history (sequence breakers
+cut matches) -> greedy if temperature <= 0 or top_k == 1 -> temperature ->
+top-k -> softmax -> top-p -> draw with a splitmix64 RNG.
 """
 
 from __future__ import annotations
@@ -34,6 +35,10 @@ class SamplerParams:
     repetition_penalty: float = 1.0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    dry_multiplier: float = 0.0          # 0: DRY off
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_max_match: int = 50
 
     @property
     def greedy(self) -> bool:
@@ -43,19 +48,29 @@ class SamplerParams:
         return {"temperature": self.temperature, "top_p": self.top_p, "top_k": self.top_k,
                 "repetition_penalty": self.repetition_penalty,
                 "presence_penalty": self.presence_penalty,
-                "frequency_penalty": self.frequency_penalty}
+                "frequency_penalty": self.frequency_penalty,
+                "dry_multiplier": self.dry_multiplier, "dry_base": self.dry_base,
+                "dry_allowed_length": self.dry_allowed_length}
 
 
 class _CParams(ctypes.Structure):
     _fields_ = [("temperature", ctypes.c_double), ("top_p", ctypes.c_double),
                 ("repetition_penalty", ctypes.c_double), ("presence_penalty", ctypes.c_double),
                 ("frequency_penalty", ctypes.c_double), ("top_k", ctypes.c_int32),
-                ("reserved", ctypes.c_int32)]
+                ("reserved", ctypes.c_int32), ("dry_multiplier", ctypes.c_double),
+                ("dry_base", ctypes.c_double), ("dry_allowed_length", ctypes.c_int32),
+                ("dry_max_match", ctypes.c_int32)]
 
 
 def _cparams(p: SamplerParams) -> _CParams:
     return _CParams(float(p.temperature), float(p.top_p), float(p.repetition_penalty),
-                    float(p.presence_penalty), float(p.frequency_penalty), int(p.top_k), 0)
+                    float(p.presence_penalty), float(p.frequency_penalty), int(p.top_k), 0,
+                    float(p.dry_multiplier), float(p.dry_base), int(p.dry_allowed_length),
+                    int(p.dry_max_match))
+
+
+def _i32(seq: Sequence[int]):
+    return (ctypes.c_int32 * len(seq))(*seq)
 
 
 class CSampler:
@@ -76,12 +91,15 @@ class CSampler:
         lib.smp_rng_next.restype = ctypes.c_uint64
         lib.smp_rng_uniform.argtypes = [ctypes.c_void_p]
         lib.smp_rng_uniform.restype = ctypes.c_double
-        lib.smp_sample.argtypes = [ctypes.c_void_p, pf, pi, ctypes.c_int32, ctypes.POINTER(_CParams)]
-        lib.smp_sample.restype = ctypes.c_int32
-        lib.smp_candidates.argtypes = [ctypes.c_void_p, pf, pi, ctypes.c_int32,
-                                       ctypes.POINTER(_CParams), pi,
-                                       ctypes.POINTER(ctypes.c_double), ctypes.c_int32]
-        lib.smp_candidates.restype = ctypes.c_int32
+        lib.smp_sample_ex.argtypes = [ctypes.c_void_p, pf, pi, ctypes.c_int32, pi, ctypes.c_int32,
+                                      ctypes.POINTER(_CParams)]
+        lib.smp_sample_ex.restype = ctypes.c_int32
+        lib.smp_candidates_ex.argtypes = [ctypes.c_void_p, pf, pi, ctypes.c_int32, pi, ctypes.c_int32,
+                                          ctypes.POINTER(_CParams), pi,
+                                          ctypes.POINTER(ctypes.c_double), ctypes.c_int32]
+        lib.smp_candidates_ex.restype = ctypes.c_int32
+        lib.smp_set_breakers.argtypes = [ctypes.c_void_p, pi, ctypes.c_int32]
+        lib.smp_set_breakers.restype = ctypes.c_int32
         lib.smp_version.restype = ctypes.c_char_p
         self.lib, self.n, self.path = lib, n_vocab, lib_path
         self.h = lib.smp_new(n_vocab)
@@ -114,21 +132,33 @@ class CSampler:
     def uniform(self) -> float:
         return self.lib.smp_rng_uniform(self.h)
 
-    def sample(self, logits, recent: Sequence[int], p: SamplerParams) -> int:
-        rec = (ctypes.c_int32 * len(recent))(*recent)
-        t = self.lib.smp_sample(self.h, self._logits(logits), rec, len(recent),
-                                ctypes.byref(_cparams(p)))
+    def set_breakers(self, ids: Sequence[int]) -> int:
+        """DRY sequence-breaker token ids (replaces the previous set)."""
+        k = self.lib.smp_set_breakers(self.h, _i32(ids), len(ids))
+        if k < 0:
+            raise ValueError("smp_set_breakers: bad arguments")
+        return k
+
+    def sample(self, logits, recent: Sequence[int], p: SamplerParams,
+               hist: Optional[Sequence[int]] = None) -> int:
+        """hist: the ordered token history for DRY (default: recent)."""
+        rec = _i32(recent)
+        h = rec if hist is None else _i32(hist)
+        t = self.lib.smp_sample_ex(self.h, self._logits(logits), rec, len(recent), h,
+                                   len(h), ctypes.byref(_cparams(p)))
         if t < 0:
             raise ValueError("smp_sample: bad arguments")
         return t
 
     def candidates(self, logits, recent: Sequence[int], p: SamplerParams,
-                   max_out: Optional[int] = None) -> List[Tuple[int, float]]:
+                   max_out: Optional[int] = None,
+                   hist: Optional[Sequence[int]] = None) -> List[Tuple[int, float]]:
         m = self.n if max_out is None else max_out
         ids, probs = (ctypes.c_int32 * m)(), (ctypes.c_double * m)()
-        rec = (ctypes.c_int32 * len(recent))(*recent)
-        k = self.lib.smp_candidates(self.h, self._logits(logits), rec, len(recent),
-                                    ctypes.byref(_cparams(p)), ids, probs, m)
+        rec = _i32(recent)
+        h = rec if hist is None else _i32(hist)
+        k = self.lib.smp_candidates_ex(self.h, self._logits(logits), rec, len(recent), h,
+                                       len(h), ctypes.byref(_cparams(p)), ids, probs, m)
         if k < 0:
             raise ValueError("smp_candidates: bad arguments")
         return [(ids[i], probs[i]) for i in range(min(k, m))]
@@ -138,11 +168,49 @@ class PySampler:
     """The same algorithm in pure Python (see src/sampler.h)."""
 
     kind = "python"
-    version = "kv260-sampler 1 (python)"
+    version = "kv260-sampler 2 (dry) (python)"
 
     def __init__(self, n_vocab: int):
         self.n = n_vocab
         self.state = 0
+        self.breakers = frozenset()
+
+    def set_breakers(self, ids: Sequence[int]) -> int:
+        self.breakers = frozenset(i for i in ids if 0 <= i < self.n)
+        return len(self.breakers)
+
+    def _dry(self, l: list, hist: Sequence[int], p: SamplerParams) -> None:
+        """step 1b (src/sampler.h), in place."""
+        n_h = len(hist)
+        if not p.dry_multiplier > 0.0 or n_h < 2:
+            return
+        n, brk = self.n, self.breakers
+        last = hist[-1]
+        if not 0 <= last < n or last in brk:
+            return
+        maxm = p.dry_max_match if p.dry_max_match > 0 else 50
+        al = p.dry_allowed_length if p.dry_allowed_length > 0 else 1
+        ml = {}                                          # first-seen order, as in C
+        for i in range(n_h - 1):
+            if hist[i] != last:
+                continue
+            nx = hist[i + 1]
+            if not 0 <= nx < n or nx in brk:
+                continue
+            ln = 1
+            while ln < maxm:
+                j = i - ln
+                if j < 0:
+                    break
+                prev = hist[n_h - 1 - ln]
+                if hist[j] != prev or not 0 <= prev < n or prev in brk:
+                    break
+                ln += 1
+            if ln > ml.get(nx, 0):
+                ml[nx] = ln
+        for t, ln in ml.items():
+            if ln >= al:
+                l[t] = l[t] - p.dry_multiplier * math.pow(p.dry_base, float(ln - al))
 
     def seed(self, seed: int) -> None:
         self.state = seed & MASK64
@@ -157,7 +225,8 @@ class PySampler:
     def uniform(self) -> float:
         return (self.rng_next() >> 11) * (1.0 / 9007199254740992.0)
 
-    def _filter(self, logits, recent: Sequence[int], p: SamplerParams):
+    def _filter(self, logits, recent: Sequence[int], p: SamplerParams,
+                hist: Optional[Sequence[int]] = None):
         """-> ('greedy', id) or ('cands', [(id, e)], z)"""
         n = self.n
         try:
@@ -184,6 +253,7 @@ class PySampler:
                     v = v / rep if v > 0.0 else v * rep
                 v -= p.presence_penalty + p.frequency_penalty * float(cnt[t])
                 l[t] = v
+        self._dry(l, recent if hist is None else hist, p)
         if not p.temperature > 0.0 or p.top_k == 1:
             return "greedy", l.index(max(l))                   # the first maximum
         temp = float(p.temperature)
@@ -227,8 +297,9 @@ class PySampler:
             ids, e, z = ids[:cut], e[:cut], acc
         return "cands", list(zip(ids, e)), z
 
-    def sample(self, logits, recent: Sequence[int], p: SamplerParams) -> int:
-        r = self._filter(logits, recent, p)
+    def sample(self, logits, recent: Sequence[int], p: SamplerParams,
+               hist: Optional[Sequence[int]] = None) -> int:
+        r = self._filter(logits, recent, p, hist)
         if r[0] == "greedy":
             return r[1]
         _, cands, z = r
@@ -241,8 +312,9 @@ class PySampler:
         return cands[-1][0]
 
     def candidates(self, logits, recent: Sequence[int], p: SamplerParams,
-                   max_out: Optional[int] = None) -> List[Tuple[int, float]]:
-        r = self._filter(logits, recent, p)
+                   max_out: Optional[int] = None,
+                   hist: Optional[Sequence[int]] = None) -> List[Tuple[int, float]]:
+        r = self._filter(logits, recent, p, hist)
         if r[0] == "greedy":
             return [(r[1], 1.0)]
         _, cands, z = r

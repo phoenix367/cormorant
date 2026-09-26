@@ -842,7 +842,12 @@ def build_backends(args) -> Dict[str, Backend]:
                 llm_engine(args), args.llm_tokenizer, sampler_lib=args.llm_sampler_lib,
                 defaults=SamplerParams(temperature=args.llm_temperature, top_p=args.llm_top_p,
                                        top_k=args.llm_top_k,
-                                       repetition_penalty=args.llm_repetition_penalty),
+                                       repetition_penalty=args.llm_repetition_penalty,
+                                       dry_multiplier=args.llm_dry_multiplier,
+                                       dry_base=args.llm_dry_base,
+                                       dry_allowed_length=args.llm_dry_allowed_length),
+                dry_penalty_last_n=args.llm_dry_penalty_last_n,
+                dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
                 context_size=args.llm_context, reserve=args.llm_reserve,
                 repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk,
                 cma_mb=args.llm_cma_mb)
@@ -898,6 +903,15 @@ def main(argv=None) -> int:
     g.add_argument("--llm-top-p", type=float, default=0.9, help="default top_p")
     g.add_argument("--llm-top-k", type=int, default=50, help="default top_k (0: off)")
     g.add_argument("--llm-repetition-penalty", type=float, default=1.0, help="default (1: off)")
+    g.add_argument("--llm-dry-multiplier", type=float, default=0.8,
+                   help="default DRY multiplier (0: off) — penalises extending an already repeated run")
+    g.add_argument("--llm-dry-base", type=float, default=1.75, help="default DRY base (growth per matched token)")
+    g.add_argument("--llm-dry-allowed-length", type=int, default=2,
+                   help="default DRY allowed length (repeats shorter than this are free)")
+    g.add_argument("--llm-dry-penalty-last-n", type=int, default=-1,
+                   help="DRY window in tokens of prompt + answer (-1: the whole context, 0: off)")
+    g.add_argument("--llm-dry-sequence-breakers", default=json.dumps(["\n", ":", "\"", "*"]),
+                   help="JSON list of strings; a token containing one cuts a DRY match")
     g.add_argument("--llm-repeat-last-n", type=int, default=64,
                    help="penalty window in tokens (0: off, -1: the whole context)")
     g.add_argument("--llm-prefill-chunk", type=int, default=0,

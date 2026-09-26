@@ -1,25 +1,23 @@
 {
   "_comment": "Copy to chat_config.json and edit. Relative paths are relative to demo/chat/.",
-
   "bert_squad_config": "../bert_squad/bert_squad_config.json",
   "_bert_squad_config_note": "The BERT-SQuAD demo config: model, io roles, HLS driver dirs, remote.uio_devices, remote.weights_dir, ssh and board_lock are taken from it (the project is generated with demo/bert_squad/scripts/generate_project.py).",
-
   "ssh": null,
   "_ssh_note": "null = the ssh block of bert_squad_config; or {host, user, port, key_file, password, connect_timeout}.",
-
   "remote": {
     "dir": "/root/kv260_chat",
     "_dir_note": "Persistent install directory on the board: server files, vocab.txt, lib/libbert_squad.so, project/ (sources + build).",
     "weights_dir": null,
     "_weights_dir_note": "null = bert_squad_config remote.weights_dir (/root/bert_squad_weights); weights/*.dat are uploaded only when their size or SHA-1 changed."
   },
-
   "server": {
     "host": "0.0.0.0",
     "port": 8000,
     "api_key": null,
     "_api_key_note": "null = no authentication; otherwise clients send 'Authorization: Bearer <key>' (stored on the board in <dir>/api_key, mode 600).",
-    "backends": ["bert-squad"],
+    "backends": [
+      "bert-squad"
+    ],
     "_backends_note": "Any of bert-squad, smollm2, echo; the first is the default model. smollm2 needs libsmollm2.so on the board (see the smollm2 block).",
     "resident": "auto",
     "_resident_note": "auto = keep both FPGA models loaded when CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
@@ -31,7 +29,6 @@
     "_launcher_note": "systemd = a transient unit 'kv260-chat' (systemd-run; logs: journalctl -u kv260-chat; not started at boot); nohup = a detached process (<dir>/server.log, <dir>/server.pid).",
     "env": {}
   },
-
   "smollm2": {
     "lib": null,
     "_lib_note": "libsmollm2.so on the board (CHAT_PLAN phase 3 builds it); null = <remote.dir>/lib/libsmollm2.so.",
@@ -46,17 +43,25 @@
     "top_p": 0.9,
     "top_k": 50,
     "repetition_penalty": 1.0,
+    "dry_multiplier": 0.8,
+    "dry_base": 1.75,
+    "dry_allowed_length": 2,
+    "dry_penalty_last_n": -1,
+    "dry_sequence_breakers": [
+      "\n",
+      ":",
+      "\"",
+      "*"
+    ],
+    "_dry_note": "DRY (\"Don't Repeat Yourself\"): penalises a token that would extend a run already seen in the context, by multiplier * base^(run - allowed_length); a token containing a breaker string (and every special token) cuts a run, so lists / dialogue / markdown are not penalised. dry_penalty_last_n -1 = the whole context, 0 = off. Stops the small model's repetition loops.",
     "_sampling_note": "Server defaults for requests that do not set them (the model card's 0.2 / 0.9, HF's top_k 50).",
     "cma_mb": 360
   },
-
   "build": {
     "jobs": 4,
     "timeout": 1800
   },
-
   "board_lock": null,
   "_board_lock_note": "null = bert_squad_config board_lock. deploy.py holds flock() on it while it deploys (and with --hold until the server is stopped).",
-
   "health_timeout": 180
 }

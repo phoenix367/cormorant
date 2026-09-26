@@ -1144,3 +1144,21 @@ its safetensors; ~2 tok/s, needs BERT unloaded or `resident: one`).
 **Next levers (phase 5):** prefill attention on the FPGA (256-token prefill
 3.6 → ~1.1 s), q/k/v and gate/up fusion (−90 of 211 calls per token), and
 dual-port weight streaming for decode (~2×).
+
+## 15. Repetition: DRY sampling (2026-09-26)
+
+The 135M model loops verbatim at the default temperature 0.2 (e.g. a
+story repeating "My toys are all in the big room." until `max_tokens`).
+The sampler (`src/sampler.{h,c}`, `sampler.py`) now implements DRY
+(p-e-w's "Don't Repeat Yourself", as in text-generation-webui and
+llama.cpp): after the repetition penalties, a token that would extend a run
+already in the context by L matched tokens loses
+`dry_multiplier · dry_base^(L − dry_allowed_length)`; sequence breakers cut
+runs.  Breakers for byte-level BPE are *every token whose bytes contain*
+"\n", ":", "\"" or "*", plus all special tokens.  Defaults on the server:
+0.8 / 1.75 / 2 over the whole context; every parameter is a request field
+(`dry_*`).  C and Python are identical token for token and match a
+transcription of the reference algorithm on 200 random histories.  Board:
+the cat-story loop is gone (repeated trigrams 20 % → 5 %), answers without
+repeats (facts, lists, code blocks) are unchanged, ~2.5 ms per token.
+

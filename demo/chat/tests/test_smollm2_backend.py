@@ -20,7 +20,7 @@ import chatml
 from chat_backend import BackendError, Cancelled, CancelToken, ChatRequest, Delta, Finish
 from fake_llm import GEN_PROMPT, IM_END, FakeLibraryError, ScriptedEngine
 from sampler import SamplerParams
-from smollm2_backend import LibLlmEngine, LlmLibraryError, Smollm2Backend
+from smollm2_backend import DRY_BREAKERS, LibLlmEngine, LlmLibraryError, Smollm2Backend
 from smollm2_tokenizer import Tokenizer
 from test_protocol import SchemaMixin
 
@@ -275,6 +275,94 @@ class TestGenerate(unittest.TestCase):
         job = b.prepare(req([("developer", "Be terse."), ("user", "hi")]))
         self.assertEqual(job.ids, tok().encode(chatml.render([{"role": "system", "content": "Be terse."},
                                                               {"role": "user", "content": "hi"}])))
+
+
+@unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
+class TestDry(unittest.TestCase):
+    """DRY in the backend: request fields, breaker tokens from the tokenizer,
+    the default, per-request breakers, and a scripted repetition loop."""
+
+    CYCLE_TEXT = " the old man lives in a big house"
+
+    def cycle_engine(self, margin=4.0):
+        cyc = tok().encode(self.CYCLE_TEXT)
+        V = tok().vocab_size
+
+        def logits(seq):
+            vals = [0.0] * V
+            last = seq[-1]
+            nxt = cyc[(cyc.index(last) + 1) % len(cyc)] if last in cyc else cyc[0]
+            vals[nxt] = margin                               # never <|im_end|>: loops until max_tokens
+            return vals
+        return ScriptedEngine(logits_fn=logits), cyc
+
+    def test_request_fields(self):
+        b = backend(ScriptedEngine(tok().encode("ok")))
+        good = b.prepare(req([("user", "hi")], raw={"dry_multiplier": 1.5, "dry_base": 2.0,
+                                                    "dry_allowed_length": 3, "dry_penalty_last_n": 128,
+                                                    "dry_sequence_breakers": ["\n", "."]}))
+        self.assertEqual((good.params.dry_multiplier, good.params.dry_base, good.params.dry_allowed_length),
+                         (1.5, 2.0, 3))
+        self.assertEqual((good.dry_last_n, good.breakers), (128, ("\n", ".")))
+        for bad in ({"dry_multiplier": -1}, {"dry_multiplier": "a"}, {"dry_base": 0.5},
+                    {"dry_allowed_length": 0}, {"dry_allowed_length": 1.5}, {"dry_penalty_last_n": -2},
+                    {"dry_sequence_breakers": "x"}, {"dry_sequence_breakers": [""]},
+                    {"dry_sequence_breakers": ["a"] * 33}, {"dry_sequence_breakers": [1]}):
+            with self.assertRaises(BackendError, msg=bad):
+                b.prepare(req([("user", "hi")], raw=bad))
+
+    def test_breaker_ids(self):
+        b = backend(ScriptedEngine(tok().encode("ok")))
+        t = tok()
+        ids = set(b.breaker_ids(DRY_BREAKERS))
+        for text in ("\n", "\n\n", ":", "*", "**", '"', ".\n", "):"):
+            for i in t.encode(text, special=False):
+                if any(x.encode() in t.token_bytes(i) for x in DRY_BREAKERS):
+                    self.assertIn(i, ids, (text, i, t.token_bytes(i)))
+        self.assertTrue(t.special_ids <= ids)
+        for text in (" cat", " the", "Paris", "."):
+            for i in t.encode(text, special=False):
+                self.assertNotIn(i, ids, (text, i))
+        self.assertEqual(ids, set(i for i in range(t.vocab_size)
+                                  if t.is_special(i) or any(x.encode() in t.token_bytes(i)
+                                                            for x in DRY_BREAKERS)))
+        self.assertIn(t.encode("\n", special=False)[0], ids)
+
+    def test_dry_breaks_the_loop(self):
+        eng, cyc = self.cycle_engine()
+        off = backend(eng, defaults=SamplerParams(temperature=0.0))
+        text_off, fin_off = run(off, req([("user", "tell me")], max_tokens=60))
+        self.assertEqual(fin_off.reason, "length")
+        self.assertGreaterEqual("".join(text_off).count(self.CYCLE_TEXT.strip()), 4)     # a loop
+
+        eng2, _ = self.cycle_engine()
+        on = backend(eng2, defaults=SamplerParams(temperature=0.0, dry_multiplier=0.8))
+        text_on, fin_on = run(on, req([("user", "tell me")], max_tokens=60))
+        joined = "".join(text_on)
+        self.assertLess(joined.count(self.CYCLE_TEXT.strip()), 2, joined)
+        smp = fin_on.info["sampler"]
+        self.assertEqual((smp["dry_multiplier"], smp["dry_penalty_last_n"]), (0.8, -1))
+        self.assertEqual(smp["dry_sequence_breakers"], list(DRY_BREAKERS))
+        # per request: DRY off again -> the loop
+        eng3, _ = self.cycle_engine()
+        on3 = backend(eng3, defaults=SamplerParams(temperature=0.0, dry_multiplier=0.8))
+        text_req, _ = run(on3, req([("user", "tell me")], max_tokens=60, raw={"dry_multiplier": 0}))
+        self.assertEqual(text_req, text_off)
+
+    def test_per_request_breakers_and_restore(self):
+        b = backend(ScriptedEngine(tok().encode("ok")), defaults=SamplerParams(temperature=0.0,
+                                                                                dry_multiplier=0.8))
+        run(b, req([("user", "hi")], raw={"dry_sequence_breakers": [" cat"]}))
+        self.assertEqual(b._breakers_set, (" cat",))
+        run(b, req([("user", "hi")]))
+        self.assertEqual(b._breakers_set, DRY_BREAKERS)
+
+    def test_server_default_is_on(self):
+        b = Smollm2Backend(ScriptedEngine(tok().encode("ok")), TOKENIZER,
+                           sampler_lib=sampler_lib() or "/nonexistent")
+        self.assertEqual((b.defaults.dry_multiplier, b.defaults.dry_base, b.defaults.dry_allowed_length),
+                         (0.8, 1.75, 2))
+        self.assertEqual((b.dry_last_n, b.dry_breakers), (-1, DRY_BREAKERS))
 
 
 @unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
