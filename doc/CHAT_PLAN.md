@@ -631,3 +631,33 @@ the same cache at 1.5 GB/s (15 ms).  Measure both in phase 3.
 **Runtimes.**  On 8 host cores the study takes 42 min for the full set
 (12 policies), `ablate` 12.5 min, `validate` 2 min and `formats` 22 s.
 Disk: `.venv-export` 1.2 GB and assets 272 MB, both untracked.
+
+## 11. Phases 3 and 4 — split and the library contract (2026-09-26)
+
+Phase 3 (decoder on the FPGA: frontend, exponent machinery, host ops, KV
+cache, multi-entry project, `libsmollm2.so`) and phase 4 (server side:
+tokenizer, chat template, sampling, `smollm2` backend) run in parallel
+against this C API.  Phase 3 owns the library; phase 4 owns everything above
+it and tests against a fake with the same interface.
+
+```c
+/* libsmollm2.so — every int function returns >= 0 on success, < 0 on error */
+int         llm_open(const char *weights_dir);   /* weights, sink rows, KV cache, pool BO */
+void        llm_close(void);
+const char *llm_last_error(void);
+int         llm_vocab_size(void);                /* 49152 */
+int         llm_context_size(void);              /* 1024 (cache positions incl. the sink) */
+int         llm_position(void);                  /* positions filled, incl. the sink at 0 */
+int         llm_truncate(int n);                 /* keep positions [0, n), n >= 1 (1 = sink only) */
+int         llm_prefill(const int32_t *tokens, int n, float *logits);
+                  /* append n >= 1 tokens (the library splits over its prefill buckets);
+                     writes the next-token logits after the last one (vocab floats) */
+int         llm_decode(int32_t token, float *logits);
+                  /* append one token; next-token logits */
+```
+
+Position 0 is always `<|im_start|>` (the precomputed sink, §10.5 item 4):
+callers pass the conversation's token ids **after** that leading token, and
+reuse the cache across turns by `llm_truncate` to the common prefix and
+prefilling only the new tokens.  Logits are the LM head's output converted
+from its fixed-point exponent to float.  Sampling is not in this library.
