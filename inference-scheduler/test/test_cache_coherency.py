@@ -13,7 +13,9 @@ must be bracketed by the right cache maintenance (Linux DMA-API rules):
     CPU reads stale (possibly speculatively prefetched) lines;
   * the CPU never touches a buffer a kernel in flight reads or writes.
 
-``CoherencyChecker`` walks the generated C of inference_run() in order —
+``CoherencyChecker`` walks the generated C of inference_run() (or of one
+entry's inference_run_<entry>() of a multi-entry project, noinline parts
+inlined) in order —
 kernel starts (``run_*`` argument roles), ``kernel_wait``, host-op blocks
 (``host_in`` / ``host_out_done`` / raw ``inference_buf_ptr`` accesses of the
 node's inputs and output), the input-to-output reshape copies, pointer
@@ -23,6 +25,15 @@ from "the caller wrote every input and output buffer", and reports every
 violated rule.  It runs over every generated test model, the tiny BERT
 fixtures, the SpaceToDepth stems and a purpose-built kernel -> host ->
 kernel -> output model; mutated sources (one sync removed) must fail.
+
+DMA states (src/numeric.py: the KV caches the FPGA prefill attention reads)
+persist across calls and entries: they start every walk CPU-DIRTY (another
+entry — a decode step — may have written rows without flushing), host ops
+that write them in place (``state_writes()``) make them dirty again, and
+``llm_cache_flush(state, ...)`` cleans them; a kernel may read one only after
+such a flush within the same call.  Which ROWS are flushed is a run-time
+property the static walk cannot see — the incoherent host emulation
+(host_emu.build_and_run(incoherent=True)) checks it.
 """
 
 import glob
@@ -68,6 +79,7 @@ _TOKEN = re.compile(
     r"|if\s*\(\s*_i\s*\)\s*kernel_wait\((?P<cwait>KERNEL_\w+)\)"
     r"|kernel_wait\((?P<wait>KERNEL_\w+)\)"
     r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool))\((?P<args>[^;]*)\);"
+    r"|\bllm_cache_flush\(\s*(?P<sflush>\w+)\s*,"
     r"|INFERENCE_PROF_BEGIN\((?P<begin>\d+)u\)"
     r"|INFERENCE_PROF_END\((?P<end>\d+)u\)"
     r"|\bhost_in\(\s*(?P<hin>\w+)\s*,"
@@ -95,24 +107,41 @@ def _split_args(s):
     return out
 
 
-def run_body(src):
-    """Text of the inference_run() function body."""
-    i = src.index("\nvoid inference_run(")
+def _fn_body(src, name, prefix):
+    i = src.index(f"{prefix}{name}(")
     j = src.index("\n{\n", i)
     k = src.index("\n}\n", j)
     return src[j + 3:k]
 
 
-class CoherencyChecker:
-    """Per-buffer cache-state model over the emitted inference_run()."""
+def run_body(src, name="inference_run"):
+    """Text of the run function ``name`` (inference_run, or a multi-entry
+    project's inference_run_<entry>) with the calls of its noinline parts
+    (compact codegen) replaced by the parts' bodies."""
+    body = _fn_body(src, name, "\nvoid ")
+    part = re.compile(rf"^    ({re.escape(name)}_part\d+)\([^;]*\);$", re.M)
 
-    def __init__(self, cg, src=None):
+    def inline(m):
+        b = _fn_body(src, m.group(1), "static void __attribute__((noinline)) ")
+        return "\n".join(ln for ln in b.splitlines() if not re.fullmatch(r"\s*\(void\)\w+;", ln))
+    return part.sub(inline, body)
+
+
+class CoherencyChecker:
+    """Per-buffer cache-state model over the emitted inference_run() (or
+    ``run_name``, an entry's run function; ``cg`` is then that entry's
+    CodeGenerator and ``src`` the project's inference.c)."""
+
+    def __init__(self, cg, src=None, run_name="inference_run"):
         self.cg = cg
         self.src = src if src is not None else cg.generate_source()
+        self.run_name = run_name
         g = cg._graph
         self.nodes = {sn.index: sn for sn in g.nodes}
+        self.states = [t.c_name for t in g.state_tensors if not t.is_host]
         tensors = {t.onnx_name: t for t in (g.input_tensors + g.output_tensors
-                                            + g.weight_tensors + g.intermediate_tensors)}
+                                            + g.weight_tensors + g.intermediate_tensors
+                                            + [t for t in g.state_tensors if not t.is_host])}
         c_of = {n: t.c_name for n, t in tensors.items()}
         # pointer variable -> buffer id; views -> parent buffer id
         self.ptr = {t.c_name: t.c_name for t in tensors.values()}
@@ -147,12 +176,13 @@ class CoherencyChecker:
     # --- the walk -------------------------------------------------------- #
     def check(self):
         errors = []
-        body = run_body(self.src)
+        body = run_body(self.src, self.run_name)
         dirty = set()           # CPU-written, not flushed since
         stale = set()           # kernel-written, not invalidated (after drain) since
         in_flight = {}          # lane -> (reads, writes)
         for b in self.inputs + self.outputs:
             dirty.add(self.ptr[b])          # the caller wrote them (fill / memset)
+        dirty.update(self.states)           # another entry / call may have written rows
         cur_node = None
 
         def buf(name):
@@ -201,6 +231,15 @@ class CoherencyChecker:
                 cur_node = None
             elif m.group("flush"):
                 flush(buf(m.group("fb")))
+            elif m.group("sflush"):
+                name = m.group("sflush")
+                sn = self.nodes.get(cur_node)
+                if name not in self.states:
+                    errors.append(f"{where}: llm_cache_flush of '{name}', not a DMA state")
+                elif sn is None or name not in {t.c_name for t in sn.state_writes()}:
+                    errors.append(f"{where}: llm_cache_flush of '{name}' outside a host op "
+                                  f"that writes it")
+                flush(buf(name))
             elif m.group("inval"):
                 inval(buf(m.group("ib")), where)
             elif m.group("cwait"):
@@ -247,7 +286,10 @@ class CoherencyChecker:
                 if sn is None or cur_node not in self.cpu_nodes:
                     errors.append(f"{where}: CPU access to '{name}' outside a host op")
                     continue
-                if name in {t.c_name for t in sn.inputs}:
+                if name in {t.c_name for t in getattr(sn, "state_writes", list)()}:
+                    cpu_read(buf(name), where)
+                    cpu_write(buf(name), where)
+                elif name in {t.c_name for t in sn.inputs}:
                     cpu_read(buf(name), where)
                 elif name == sn.output.c_name:
                     cpu_write(buf(name), where)

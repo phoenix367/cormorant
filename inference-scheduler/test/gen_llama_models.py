@@ -37,7 +37,8 @@ from src.llama import (Formats, LlamaConfig,   # noqa: E402
                        LlamaFrontend)
 
 OUT_DIR = os.path.join(HERE, "models")   # gen_all_models.py sets it
-POLICY = "pow2+sink+p12+xattn"
+POLICY = "pow2+sink+p12+xattn"      # the calibration (p12 formats) and host-attention policy
+MIX_POLICY = "pow2+sink+p12+mix"    # the default frontend (FPGA prefill attention)
 TINY = dict(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
             head_dim=16, intermediate_size=128, vocab_size=256, rms_norm_eps=1e-5,
             rope_theta=10000.0, tie_word_embeddings=True)
@@ -120,9 +121,11 @@ def study_model(cfg: dict, W: dict, formats: dict, policy: str = POLICY):
     return study.Model(W, sc, study.POLICIES[policy], fmt, sink_model=fm), sc
 
 
-def frontend(cfg: dict, W: dict, formats: dict, ctx: int = TINY_CTX, name: str = "llama_tiny"):
+def frontend(cfg: dict, W: dict, formats: dict, ctx: int = TINY_CTX, name: str = "llama_tiny",
+             prefill_attn: str = "fpga"):
     lc = LlamaConfig.from_dict(cfg)
-    return LlamaFrontend(lc, W, Formats(formats, lc), ctx=ctx, name=name)
+    return LlamaFrontend(lc, W, Formats(formats, lc), ctx=ctx, name=name,
+                         prefill_attn=prefill_attn)
 
 
 def tiny(seed: int = 0):
