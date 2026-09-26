@@ -20,6 +20,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import onnx
@@ -174,10 +175,26 @@ class TestOpsOnHost(unittest.TestCase):
         for kw in ({}, {"n": 2}, {"pos": 10, "T": 4}, {"H": 3, "KV": 3}, {"HD": 8, "H": 2, "KV": 1},
                    {"dma": True}, {"dma": True, "n": 2},
                    {"dma": True, "vk": 4, "C": 64, "pos": 40, "T": 5},   # V rows interleaved x4
-                   {"vk": 2, "C": 64, "pos": 30}):
+                   {"vk": 2, "C": 64, "pos": 30},
+                   # decode steps (llm_attn_decode): G = 3 / 2 / 1, VK = 1 / 2 / 4,
+                   # first and last row, key quarters of 1 .. 13 rows
+                   {"T": 1, "pos": 0}, {"T": 1, "H": 6, "KV": 2, "pos": 11},
+                   {"T": 1, "H": 6, "KV": 2, "dma": True, "vk": 4, "C": 64, "pos": 50},
+                   {"T": 1, "H": 6, "KV": 2, "vk": 4, "C": 64, "pos": 63, "HD": 8},
+                   {"T": 1, "H": 4, "KV": 2, "vk": 2, "C": 64, "pos": 37},
+                   {"T": 3, "n": 1, "H": 3, "KV": 3, "pos": 7}):
             m, _ = self._attention(**kw)
             with self.subTest(**kw):
                 emulate(self, m, "attention", incoherent=kw.get("dma", False))
+
+    def test_attention_decode_modes(self):
+        """INFERENCE_LLM_DECODE_PAR: 0 (the per-head code) and 2 (the phases on the
+        calling thread) give the same bits as the reference, like the default 1."""
+        m, _ = self._attention(T=1, H=6, KV=2, dma=True, vk=4, C=64, pos=50)
+        for mode in ("0", "2"):
+            with self.subTest(mode=mode), \
+                    mock.patch.dict(os.environ, {"INFERENCE_LLM_DECODE_PAR": mode}):
+                emulate(self, m, "attention_mode" + mode, incoherent=True)
 
     def test_attention_semantics(self):
         m, d = self._attention(T=3, pos=4)

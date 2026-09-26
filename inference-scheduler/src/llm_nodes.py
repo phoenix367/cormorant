@@ -1605,7 +1605,8 @@ static void llm_dequant(const Data_t *x, const double *sx, unsigned count, unsig
  * exponent, v[t] re-rounded -> V cache row.  The cache rows the queries read
  * (0 .. pos + n - 1) are converted once to their exact double values
  * (raw * 2^-f, the same bits the per-pair expression gives) into a scratch
- * when n > 1 (prefill; a decode step converts inline — one query per row).
+ * when n > 1 (prefill; a decode step, n == 1, runs llm_attn_decode below —
+ * the same values, split across all host threads).
  * Then per (t, head h), over the keys j <= pos + t: RoPE(q0[t,h]) in double,
  * s_j = dot8(q, k_j) * scale, e_j = exp(s_j - max), sum left to right,
  * p_j = e_j / sum, o[d] = sum_j p_j v_j[d] -> pv[t][h*HD + d].  Rows t >= n
@@ -1654,12 +1655,15 @@ static int llm_attn_reserve(unsigned n)
     return _llm_attn_cap ? 0 : -1;
 }
 
+static void llm_dec_release(void);
+
 static void llm_attn_release(void)
 {
     free(_llm_attn_kd);
     free(_llm_attn_vd);
     _llm_attn_kd = _llm_attn_vd = NULL;
     _llm_attn_cap = 0u;
+    llm_dec_release();
 }
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -1765,6 +1769,448 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
 #  pragma GCC pop_options
 #endif
 
+/* ---- LlmAttention decode step (n == 1) on all host threads ----
+ * One pool dispatch; the phases are split into units and separated by spin
+ * barriers (a thread-pool wake-up per phase would cost more than it saves):
+ *   A  scores, unit = (KV group, key quarter): the group's G heads share
+ *      each K row load and conversion; a partial max per quarter
+ *   B  e = exp(s - max), unit = (group, key quarter)
+ *   C  sum of e left to right, unit = head
+ *   D  p = e / sum, unit = (group, key quarter)
+ *   E  P.V, unit = (group, lane quarter)
+ * The power-of-two cache scales are folded out exactly: the scores use
+ * (q * 2^-f_k[d]) against the raw K row (the same product, one rounding),
+ * and P.V sums p * raw v and scales once — 2^-f commutes with every
+ * rounding while all terms stay normal, i.e. while p >= 2^-900; a head with
+ * a smaller non-zero p keeps the per-term scale.  Every value is therefore
+ * the per-head code's (llm_attn_items) bit for bit, for any thread count;
+ * the NEON kernels use separate multiplies and adds (no FMA). */
+#define LLM_DEC_NQ 4u
+#ifndef LLM_MAX_G
+#  define LLM_MAX_G 8u
+#endif
+#if HOST_POOL
+#  include <sched.h>
+#endif
+
+static double  *_llm_dec_p = NULL, *_llm_dec_qs = NULL, *_llm_dec_u = NULL;
+static unsigned _llm_dec_pcap = 0u, _llm_dec_hcap = 0u;
+
+static int llm_dec_reserve(unsigned n_p, unsigned n_h)
+{
+    if (n_p > _llm_dec_pcap) {
+        free(_llm_dec_p);
+        _llm_dec_p = (double *)malloc((size_t)n_p * sizeof(double));
+        _llm_dec_pcap = _llm_dec_p ? n_p : 0u;
+    }
+    if (n_h > _llm_dec_hcap) {
+        free(_llm_dec_qs);
+        free(_llm_dec_u);
+        _llm_dec_qs = (double *)malloc((size_t)n_h * sizeof(double));
+        _llm_dec_u = (double *)malloc((size_t)n_h * sizeof(double));
+        _llm_dec_hcap = (_llm_dec_qs && _llm_dec_u) ? n_h : 0u;
+    }
+    return (n_p <= _llm_dec_pcap && n_h <= _llm_dec_hcap) ? 0 : -1;
+}
+
+static void llm_dec_release(void)
+{
+    free(_llm_dec_p);
+    free(_llm_dec_qs);
+    free(_llm_dec_u);
+    _llm_dec_p = _llm_dec_qs = _llm_dec_u = NULL;
+    _llm_dec_pcap = _llm_dec_hcap = 0u;
+}
+
+typedef struct {
+    const llm_attn_t  *a;
+    double             mq[64][LLM_DEC_NQ];   /* partial max per head and key quarter */
+    double             sum[64];
+    unsigned long long tiny;                 /* heads with 0 < p < 2^-900 */
+    unsigned           nt, G, nk;
+    unsigned           bar_count, bar_gen;
+} llm_dec_t;
+
+static void llm_dec_barrier(llm_dec_t *s)
+{
+#if HOST_POOL
+    const unsigned gen = __atomic_load_n(&s->bar_gen, __ATOMIC_ACQUIRE);
+    if (__atomic_add_fetch(&s->bar_count, 1u, __ATOMIC_ACQ_REL) == s->nt) {
+        __atomic_store_n(&s->bar_count, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&s->bar_gen, gen + 1u, __ATOMIC_RELEASE);
+    } else {
+        unsigned spins = 0u;
+        while (__atomic_load_n(&s->bar_gen, __ATOMIC_ACQUIRE) == gen)
+            if (++spins == 2048u) {
+                sched_yield();
+                spins = 0u;
+            }
+    }
+#else
+    (void)s;
+#endif
+}
+
+static inline unsigned llm_dec_part(unsigned n, unsigned q)
+{
+    return (unsigned)((unsigned long long)n * q / LLM_DEC_NQ);
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC push_options
+#  pragma GCC optimize ("O3")                /* lane-wise only: bits unchanged */
+#endif
+/* Scores of G heads against K rows [j0, j1): S[i * C + j], max into m[i].
+ * Lane l of a head sums d = l, l + 8, ... in order (dot8). */
+static inline __attribute__((always_inline))
+void llm_dec_scores(const double *qs, const int16_t *K, unsigned j0, unsigned j1, unsigned HD,
+                    double scale, double *S, unsigned C, double *m, const unsigned G)
+{
+    unsigned j, d, l, i;
+    for (j = j0; j < j1; j++) {
+        const int16_t *kr = K + (size_t)j * HD;
+        double         acc[LLM_MAX_G][8];
+        for (i = 0u; i < G; i++)
+            for (l = 0u; l < 8u; l++)
+                acc[i][l] = qs[i * HD + l] * (double)kr[l];
+        for (d = 8u; d < HD; d += 8u)
+            for (l = 0u; l < 8u; l++) {
+                const double x = (double)kr[d + l];
+                for (i = 0u; i < G; i++)
+                    acc[i][l] += qs[i * HD + d + l] * x;
+            }
+        for (i = 0u; i < G; i++) {
+            const double *c = acc[i];
+            const double  s = (((c[0] + c[1]) + (c[2] + c[3]))
+                               + ((c[4] + c[5]) + (c[6] + c[7]))) * scale;
+            S[(size_t)i * C + j] = s;
+            if (s > m[i]) m[i] = s;
+        }
+    }
+}
+
+/* o[i * HD + d] = sum_j p[i][j] * raw v_j[d] (j ascending), d in [d0, d0 + 8).
+ * Key j = (b * VK + ln) * 16 + r is element ln of image row b * 16 + r. */
+static inline __attribute__((always_inline))
+void llm_dec_pv8(const double *P, unsigned C, const int16_t *V, unsigned nk, unsigned HD,
+                 unsigned VK, unsigned d0, double *o, const unsigned G)
+{
+    double         acc[LLM_MAX_G][8] = { { 0.0 } };
+    const size_t   rs = (size_t)HD * VK;
+    const int16_t *blk = V + (size_t)d0 * VK;
+    unsigned       j = 0u, l, i;
+    for (; j < nk; blk += 16u * rs) {
+        unsigned ln;
+        for (ln = 0u; ln < VK && j < nk; ln++) {
+            const int16_t *vr = blk + ln;
+            unsigned       r;
+            for (r = 0u; r < 16u && j < nk; r++, j++, vr += rs) {
+                double x[8];
+                for (l = 0u; l < 8u; l++)
+                    x[l] = (double)vr[(size_t)l * VK];
+                for (i = 0u; i < G; i++) {
+                    const double p = P[(size_t)i * C + j];
+                    if (j == 0u)
+                        for (l = 0u; l < 8u; l++) acc[i][l] = p * x[l];
+                    else
+                        for (l = 0u; l < 8u; l++) acc[i][l] += p * x[l];
+                }
+            }
+        }
+    }
+    for (i = 0u; i < G; i++)
+        for (l = 0u; l < 8u; l++)
+            o[i * HD + d0 + l] = acc[i][l];
+}
+
+/* P.V with the per-term scale (llm_attn_items' expression), lanes d0 .. d0 + 7 */
+static void llm_dec_pv8_scaled(const double *P, unsigned C, const int16_t *V, unsigned nk,
+                               unsigned HD, unsigned VK, unsigned d0, const double *sv,
+                               double *o, unsigned G)
+{
+    unsigned i, j, l;
+    for (i = 0u; i < G; i++) {
+        double acc[8] = { 0.0 };
+        for (j = 0u; j < nk; j++) {
+            const int16_t *vr = V + llm_vrow(0u, HD, VK, 0u, j) + (size_t)d0 * VK;
+            const double   p = P[(size_t)i * C + j];
+            for (l = 0u; l < 8u; l++) {
+                const double t = p * ((double)vr[(size_t)l * VK] * sv[d0 + l]);
+                acc[l] = j == 0u ? t : acc[l] + t;
+            }
+        }
+        for (l = 0u; l < 8u; l++)
+            o[i * HD + d0 + l] = acc[l];
+    }
+}
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#  include <arm_neon.h>
+#  define LLM_DEC_NEON 1
+/* int16 x 8 -> 4 x float64x2 (exact: int16 -> f32 -> f64) */
+static inline __attribute__((always_inline)) void llm_dec_cvt8(int16x8_t k, float64x2_t x[4])
+{
+    const float32x4_t lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(k)));
+    const float32x4_t hi = vcvtq_f32_s32(vmovl_high_s16(k));
+    x[0] = vcvt_f64_f32(vget_low_f32(lo));
+    x[1] = vcvt_high_f64_f32(lo);
+    x[2] = vcvt_f64_f32(vget_low_f32(hi));
+    x[3] = vcvt_high_f64_f32(hi);
+}
+
+/* llm_dec_scores for G = 3: lanes as 4 x float64x2 per head */
+static void llm_dec_scores3(const double *qs, const int16_t *K, unsigned j0, unsigned j1,
+                            unsigned HD, double scale, double *S, unsigned C, double *m)
+{
+    unsigned j, d, i, v;
+    for (j = j0; j < j1; j++) {
+        const int16_t *kr = K + (size_t)j * HD;
+        float64x2_t    a[3][4], x[4];
+        llm_dec_cvt8(vld1q_s16(kr), x);
+        for (i = 0u; i < 3u; i++)
+            for (v = 0u; v < 4u; v++)
+                a[i][v] = vmulq_f64(vld1q_f64(qs + i * HD + 2u * v), x[v]);
+        for (d = 8u; d < HD; d += 8u) {
+            llm_dec_cvt8(vld1q_s16(kr + d), x);
+            for (i = 0u; i < 3u; i++)
+                for (v = 0u; v < 4u; v++)
+                    a[i][v] = vaddq_f64(a[i][v],
+                                        vmulq_f64(vld1q_f64(qs + i * HD + d + 2u * v), x[v]));
+        }
+        for (i = 0u; i < 3u; i++) {
+            /* ((c0 + c1) + (c2 + c3)) + ((c4 + c5) + (c6 + c7)) */
+            const double lo = vaddvq_f64(vpaddq_f64(a[i][0], a[i][1]));
+            const double hi = vaddvq_f64(vpaddq_f64(a[i][2], a[i][3]));
+            const double s = (lo + hi) * scale;
+            S[(size_t)i * C + j] = s;
+            if (s > m[i]) m[i] = s;
+        }
+    }
+}
+
+/* llm_dec_pv8 for G = 3 and VK = 1 or 4 */
+static void llm_dec_pv8_3(const double *P, unsigned C, const int16_t *V, unsigned nk,
+                          unsigned HD, unsigned VK, unsigned d0, double *o)
+{
+    float64x2_t    a[3][4], x[4];
+    const size_t   rs = (size_t)HD * VK;
+    const int16_t *blk = V + (size_t)d0 * VK;
+    unsigned       j = 0u, i, v;
+    for (i = 0u; i < 3u; i++)
+        for (v = 0u; v < 4u; v++)
+            a[i][v] = vdupq_n_f64(0.0);
+    for (; j < nk; blk += 16u * rs) {
+        unsigned ln;
+        for (ln = 0u; ln < VK && j < nk; ln++) {
+            const int16_t *vr = blk;
+            unsigned       r;
+            for (r = 0u; r < 16u && j < nk; r++, j++, vr += rs) {
+                int16x8_t k8;
+                if (VK == 1u) {
+                    k8 = vld1q_s16(vr);
+                } else {
+                    const int16x8x4_t q4 = vld4q_s16(vr);     /* one 64-byte image row piece */
+                    k8 = ln == 0u ? q4.val[0] : ln == 1u ? q4.val[1]
+                       : ln == 2u ? q4.val[2] : q4.val[3];
+                }
+                llm_dec_cvt8(k8, x);
+                for (i = 0u; i < 3u; i++) {
+                    const float64x2_t p = vld1q_dup_f64(P + (size_t)i * C + j);
+                    if (j == 0u)
+                        for (v = 0u; v < 4u; v++) a[i][v] = vmulq_f64(p, x[v]);
+                    else
+                        for (v = 0u; v < 4u; v++) a[i][v] = vaddq_f64(a[i][v], vmulq_f64(p, x[v]));
+                }
+            }
+        }
+    }
+    for (i = 0u; i < 3u; i++)
+        for (v = 0u; v < 4u; v++)
+            vst1q_f64(o + i * HD + d0 + 2u * v, a[i][v]);
+}
+#else
+#  define LLM_DEC_NEON 0
+#endif
+
+static void llm_dec_phase_scores(llm_dec_t *s, unsigned t, unsigned step)
+{
+    const llm_attn_t *a = s->a;
+    const unsigned    G = s->G, HD = a->HD;
+    unsigned          w, i;
+    for (w = t; w < a->KV * LLM_DEC_NQ; w += step) {
+        const unsigned g = w / LLM_DEC_NQ, q = w % LLM_DEC_NQ;
+        const unsigned j0 = llm_dec_part(s->nk, q), j1 = llm_dec_part(s->nk, q + 1u);
+        const int16_t *K = a->ck + (size_t)g * a->C * HD;
+        double        *S = _llm_dec_p + (size_t)g * G * a->C;
+        const double  *qs = _llm_dec_qs + (size_t)g * G * HD;
+        double         m[LLM_MAX_G];
+        for (i = 0u; i < G; i++) m[i] = -INFINITY;
+#if LLM_DEC_NEON
+        if (G == 3u) llm_dec_scores3(qs, K, j0, j1, HD, a->scale, S, a->C, m);
+        else
+#endif
+        if (G == 3u) llm_dec_scores(qs, K, j0, j1, HD, a->scale, S, a->C, m, 3u);
+        else if (G == 1u) llm_dec_scores(qs, K, j0, j1, HD, a->scale, S, a->C, m, 1u);
+        else llm_dec_scores(qs, K, j0, j1, HD, a->scale, S, a->C, m, G);
+        for (i = 0u; i < G; i++) s->mq[g * G + i][q] = m[i];
+    }
+}
+
+static void llm_dec_phase_exp(llm_dec_t *s, unsigned t, unsigned step)
+{
+    const llm_attn_t *a = s->a;
+    unsigned          w, i, j, q;
+    for (w = t; w < a->KV * LLM_DEC_NQ; w += step) {
+        const unsigned g = w / LLM_DEC_NQ, qq = w % LLM_DEC_NQ;
+        const unsigned j0 = llm_dec_part(s->nk, qq), j1 = llm_dec_part(s->nk, qq + 1u);
+        for (i = 0u; i < s->G; i++) {
+            const unsigned h = g * s->G + i;
+            double        *e = _llm_dec_p + (size_t)h * a->C, m = -INFINITY;
+            for (q = 0u; q < LLM_DEC_NQ; q++)
+                if (s->mq[h][q] > m) m = s->mq[h][q];
+            for (j = j0; j < j1; j++)
+                e[j] = exp(e[j] - m);
+        }
+    }
+}
+
+static void llm_dec_phase_sum(llm_dec_t *s, unsigned t, unsigned step)
+{
+    unsigned h, j;
+    for (h = t; h < s->a->H; h += step) {
+        const double *e = _llm_dec_p + (size_t)h * s->a->C;
+        double        sum = 0.0;
+        for (j = 0u; j < s->nk; j++)
+            sum += e[j];
+        s->sum[h] = sum;
+    }
+}
+
+static void llm_dec_phase_div(llm_dec_t *s, unsigned t, unsigned step)
+{
+    const llm_attn_t *a = s->a;
+    unsigned          w, i, j;
+    for (w = t; w < a->KV * LLM_DEC_NQ; w += step) {
+        const unsigned g = w / LLM_DEC_NQ, q = w % LLM_DEC_NQ;
+        const unsigned j0 = llm_dec_part(s->nk, q), j1 = llm_dec_part(s->nk, q + 1u);
+        for (i = 0u; i < s->G; i++) {
+            const unsigned h = g * s->G + i;
+            double        *e = _llm_dec_p + (size_t)h * a->C;
+            const double   sum = s->sum[h];
+            unsigned       tiny = 0u;
+            for (j = j0; j < j1; j++) {
+                e[j] = e[j] / sum;
+                tiny |= e[j] != 0.0 && e[j] < 0x1p-900;
+            }
+            if (tiny) __atomic_fetch_or(&s->tiny, 1ull << h, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+static void llm_dec_phase_pv(llm_dec_t *s, unsigned t, unsigned step)
+{
+    const llm_attn_t *a = s->a;
+    const unsigned    G = s->G, HD = a->HD, nb = HD / 8u;
+    unsigned          w, i, b, l;
+    for (w = t; w < a->KV * LLM_DEC_NQ; w += step) {
+        const unsigned g = w / LLM_DEC_NQ, q = w % LLM_DEC_NQ;
+        const unsigned b0 = llm_dec_part(nb, q), b1 = llm_dec_part(nb, q + 1u);
+        const int16_t *V = a->cv + (size_t)g * a->C * HD;
+        const double  *P = _llm_dec_p + (size_t)g * G * a->C, *sv = a->scv + (size_t)g * HD;
+        double        *u = _llm_dec_u + (size_t)g * G * HD;
+        const unsigned long long gm = ((1ull << G) - 1ull) << (g * G);
+        const unsigned scaled = (__atomic_load_n(&s->tiny, __ATOMIC_RELAXED) & gm) != 0ull;
+        for (b = b0; b < b1; b++) {
+            const unsigned d0 = 8u * b;
+            if (scaled)
+                llm_dec_pv8_scaled(P, a->C, V, s->nk, HD, a->VK, d0, sv, u, G);
+#if LLM_DEC_NEON
+            else if (G == 3u && (a->VK == 1u || a->VK == 4u))
+                llm_dec_pv8_3(P, a->C, V, s->nk, HD, a->VK, d0, u);
+#endif
+            else if (G == 3u) llm_dec_pv8(P, a->C, V, s->nk, HD, a->VK, d0, u, 3u);
+            else if (G == 1u) llm_dec_pv8(P, a->C, V, s->nk, HD, a->VK, d0, u, 1u);
+            else llm_dec_pv8(P, a->C, V, s->nk, HD, a->VK, d0, u, G);
+            for (i = 0u; i < G; i++) {
+                const unsigned h = g * G + i;
+                Data_t        *y = a->pv + (size_t)h * HD;
+                const double  *iy = a->ipv + (size_t)h * HD;
+                for (l = d0; l < d0 + 8u; l++)
+                    y[l] = llm_st(scaled ? u[i * HD + l] : u[i * HD + l] * sv[l], iy[l]);
+            }
+        }
+    }
+}
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC pop_options
+#endif
+
+/* One range per pool thread (n = nt items): phases with barriers; a single
+ * range [0, nt) (no pool) runs them in turn. */
+static void llm_dec_run(void *p, unsigned b, unsigned e)
+{
+    llm_dec_t     *s = (llm_dec_t *)p;
+    const unsigned par = e - b < s->nt, t = par ? b : 0u, step = par ? s->nt : 1u;
+    llm_dec_phase_scores(s, t, step);
+    if (par) llm_dec_barrier(s);
+    llm_dec_phase_exp(s, t, step);
+    if (par) llm_dec_barrier(s);
+    llm_dec_phase_sum(s, t, step);
+    if (par) llm_dec_barrier(s);
+    llm_dec_phase_div(s, t, step);
+    if (par) llm_dec_barrier(s);
+    llm_dec_phase_pv(s, t, step);
+}
+
+/* Env INFERENCE_LLM_DECODE_PAR (read once): 0 = the per-head code
+ * (llm_attn_items), 1 = the phases on all host threads (default), 2 = the
+ * phases on the calling thread only (no pool dispatch, no spin barriers).
+ * The results are the same bits in every mode. */
+static int llm_dec_mode = -1;
+
+/* The decode step's attention (query row 0 at a->pos; the cache rows are
+ * already written).  0 = not handled here (mode 0, geometry, scratch, or a
+ * q * 2^-f below the normal range): the caller runs the per-head code. */
+static int llm_attn_decode(const llm_attn_t *a)
+{
+    const unsigned HD = a->HD, half = HD / 2u, G = a->KV ? a->H / a->KV : 0u, pp = a->pos;
+    const float   *cs = a->cos + (size_t)pp * half, *sn = a->sin + (size_t)pp * half;
+    llm_dec_t      s;
+    unsigned       h, d;
+    if (llm_dec_mode < 0) {
+        const char *e = getenv("INFERENCE_LLM_DECODE_PAR");
+        llm_dec_mode = (e && (e[0] == '0' || e[0] == '2')) ? e[0] - '0' : 1;
+    }
+    if (llm_dec_mode == 0 || G == 0u || G > LLM_MAX_G || a->H > 64u || a->H != G * a->KV || HD % 8u
+            || HD > LLM_MAX_HD || llm_dec_reserve(a->H * a->C, a->H * HD) != 0)
+        return 0;
+    for (h = 0u; h < a->H; h++) {                /* RoPE(q) * 2^-f_k (exact) */
+        const Data_t *qr = a->q0 + (size_t)h * HD;
+        const double *sq = a->sq + (size_t)h * HD, *sk = a->sck + (size_t)(h / G) * HD;
+        double       *qs = _llm_dec_qs + (size_t)h * HD;
+        for (d = 0u; d < HD; d++) {
+            double x = llm_ld(qr[d], sq[d]);
+            double r = d < half ? -llm_ld(qr[d + half], sq[d + half])
+                                :  llm_ld(qr[d - half], sq[d - half]);
+            double q = x * (double)cs[d % half] + r * (double)sn[d % half];
+            qs[d] = q * sk[d];
+            if (q != 0.0 && fabs(qs[d]) < 0x1p-1000) return 0;
+        }
+    }
+    s.a = a;
+    s.tiny = 0ull;
+    s.G = G;
+    s.nk = pp + 1u;
+    s.nt = llm_dec_mode == 2 ? 1u : s_host_nthreads;
+    s.bar_count = 0u;
+    s.bar_gen = 0u;
+    if (s.nt > 1u)
+        host_parallel(llm_dec_run, &s, s.nt, 1u, 1u);
+    else
+        llm_dec_run(&s, 0u, 1u);
+    return 1;
+}
+
 static void llm_attention(llm_attn_t *a)
 {
     const unsigned HD = a->HD, half = HD / 2u, kvhd = a->KV * HD;
@@ -1795,7 +2241,9 @@ static void llm_attention(llm_attn_t *a)
         }
     }
     a->n = n;
-    if (n) {
+    if (n == 1u && llm_attn_decode(a)) {
+        /* decode step: all host threads, bit-identical to the per-head code */
+    } else if (n) {
         if (n > 1u)                  /* prefill: each key row serves n queries */
             host_parallel(llm_attn_convert, a, a->KV * (a->pos + n), 32u, 1u);
         host_parallel(llm_attn_items, a, n * a->H, 1u, 1u);
