@@ -5,9 +5,13 @@ checkpoint with a formats JSON) into the multi-entry KV260 project behind
 libsmollm2.so (doc/CHAT_PLAN.md phase 3).
 
   1. src/llama.py frontend: config.json + model.safetensors + the calibrated
-     formats (llm_study.py formats, policy pow2+sink+p12; the shipped
-     attention is xattn) -> entry graphs decode, prefill_<P> per bucket,
-     head.
+     formats (llm_study.py formats, policy pow2+sink+p12) -> entry graphs
+     decode, prefill_<P> per bucket, head.  --prefill-attn fpga (default,
+     policy pow2+sink+p12+mix, CHAT_PLAN §16): prefill attention q.K^T / P.V
+     on ConvKernel over the runtime key count with the p12 host softmax,
+     decode attention the xattn host region, the KV caches DMA states in the
+     CMA pool; --prefill-attn host: phase 3's xattn everywhere
+     (pow2+sink+p12+xattn), host-memory caches.
   2. inference-scheduler: OnnxGraph per entry (the decode step and the head
      are N = 1 MatMuls -> MatmulKernel with packed B; the prefill buckets use
      the MatMul-on-ConvKernel lowering where the cost model says it wins,
@@ -25,7 +29,8 @@ libsmollm2.so (doc/CHAT_PLAN.md phase 3).
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/generate_llm_project.py
            [--out-dir demo/chat/build/llm_project] [--buckets 16,64,256]
-           [--prefill-engine conv|matmul] [--no-weights] [--driver-dirs JSON]
+           [--prefill-engine conv|matmul] [--prefill-attn fpga|host] [--no-weights]
+           [--driver-dirs JSON]
 """
 
 from __future__ import annotations
@@ -46,8 +51,9 @@ from src.codegen.multi import MultiEntryGenerator                  # noqa: E402
 from src.graph import OnnxGraph                                    # noqa: E402
 from src.host_nodes import HostNode                                # noqa: E402
 from src.kernels import KERNEL_REGISTRY                            # noqa: E402
-from src.llm_nodes import (LlmAttentionNode, LlmDequantNode,       # noqa: E402
-                           LlmEmbedNode, LlmResAddNode, LlmRMSNormNode,
+from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode,      # noqa: E402
+                           LlmAttnMergeNode, LlmAttnPrepNode, LlmAttnSoftmaxNode,
+                           LlmDequantNode, LlmEmbedNode, LlmResAddNode, LlmRMSNormNode,
                            LlmSelectRowNode, LlmSiluMulNode)
 from src.nodes import MatmulConvNode, MatmulNode                   # noqa: E402
 
@@ -56,15 +62,22 @@ SRC = os.path.join(CHAT, "src")
 C_SOURCES = ("llm_api.c", "llm_api.h", "llm_bench.c")
 DEFAULT_OUT = os.path.join(CHAT, "build", "llm_project")
 
-KINDS = ("MatMul linear", "LM head", "attention (host)", "RMSNorm", "residual add",
-         "SiLU*up", "embedding", "other host")
+KINDS = ("MatMul linear", "LM head", "attention (host)", "attention q.K^T (FPGA)",
+         "attention P.V (FPGA)", "attention softmax (host)", "attention prep (host)",
+         "attention merge (host)", "RMSNorm", "residual add", "SiLU*up", "embedding",
+         "other host")
 
 
 def node_kind(sn) -> str:
     if isinstance(sn, (MatmulNode, MatmulConvNode)):
         return "LM head" if sn.m >= 4096 and sn.inputs[1].is_weight and \
             "lm_head" in sn.inputs[1].onnx_name else "MatMul linear"
-    for cls, kind in ((LlmAttentionNode, "attention (host)"), (LlmRMSNormNode, "RMSNorm"),
+    if isinstance(sn, LlmAttnConvNode):
+        return "attention q.K^T (FPGA)" if sn.kind == "qk" else "attention P.V (FPGA)"
+    for cls, kind in ((LlmAttentionNode, "attention (host)"),
+                      (LlmAttnSoftmaxNode, "attention softmax (host)"),
+                      (LlmAttnPrepNode, "attention prep (host)"),
+                      (LlmAttnMergeNode, "attention merge (host)"), (LlmRMSNormNode, "RMSNorm"),
                       (LlmResAddNode, "residual add"), (LlmSiluMulNode, "SiLU*up"),
                       (LlmEmbedNode, "embedding")):
         if isinstance(sn, cls):
@@ -259,6 +272,8 @@ def main(argv=None) -> int:
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
     ap.add_argument("--context", type=int, default=lp.CONTEXT)
     ap.add_argument("--prefill-engine", choices=("conv", "matmul"), default="conv")
+    ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN,
+                    help="prefill attention on ConvKernel (fpga) or the host xattn region")
     ap.add_argument("--model-name", default="smollm2-135m-instruct")
     ap.add_argument("--no-weights", action="store_true", help="skip writing weights/*.dat")
     ap.add_argument("--driver-dirs", default=None,
@@ -268,10 +283,11 @@ def main(argv=None) -> int:
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
     cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name)
+    fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
+                     prefill_attn=args.prefill_attn)
     print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
-          f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}",
-          flush=True)
+          f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
+          f"prefill attention {args.prefill_attn}", flush=True)
     models = lp.entry_models(fe, buckets)
     del W
     entries = build_entries(models, args.prefill_engine,
@@ -300,7 +316,8 @@ def main(argv=None) -> int:
     layers = write_layers(out, mg)
     summary.update({
         "model": args.model_name, "context": args.context, "buckets": buckets,
-        "prefill_engine": args.prefill_engine, "policy": lp.POLICY,
+        "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
+        "policy": lp.POLICIES[args.prefill_attn],
         "formats": os.path.abspath(args.formats or lp.default_formats(args.assets)),
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,
                    "head_dim": cfg.HD, "ffn": cfg.FF, "vocab": cfg.V},
@@ -311,6 +328,7 @@ def main(argv=None) -> int:
         json.dump(summary, f, indent=2)
     print(f"project: {out}")
     print(f"  pool {summary['pool_bytes'] / 2**20:.1f} MiB (weights {summary['weights_bytes'] / 2**20:.1f},"
+          f" KV caches {summary['dma_state_bytes'] / 2**20:.1f},"
           f" intermediates {summary['intermediate_region_bytes'] / 2**20:.2f}), host tables "
           f"{summary['host_table_bytes'] / 2**20:.1f} MiB, states {summary['state_bytes'] / 2**20:.1f} MiB,"
           f" host arena {summary['host_arena_bytes'] / 2**20:.2f} MiB")

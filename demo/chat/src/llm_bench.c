@@ -4,7 +4,10 @@
  *
  *   1. llm_open() (timed; CmaFree before / after from /proc/meminfo).
  *   2. For every prompt of prompts.bin: llm_truncate(1), llm_prefill(prompt),
- *      then -k greedy steps (argmax, first maximum) of llm_decode(); every
+ *      then -k greedy steps (argmax, first maximum) of llm_decode() — a
+ *      CONTINUATION prompt (negative count in prompts.bin, e.g. a chat's
+ *      second turn) skips the truncate and is prefilled at the position the
+ *      previous prompt's decode steps reached; every
  *      logits vector (1 + k per prompt, vocab float32 each) is appended to
  *      logits.bin for the host's bit-exact comparison with the scheduler
  *      simulation (demo/chat/scripts/llm_board.py), with an FNV-1a checksum
@@ -18,8 +21,9 @@
  *   5. Re-open (-r): llm_close(), CmaFree, llm_open() again, the first
  *      prompt's prefill + 2 decode steps compared bit for bit with step 2's.
  *
- * prompts.bin: int32 count, then per prompt int32 n and n int32 token ids
- * (the ids AFTER the leading <|im_start|>, which is the cache's sink).
+ * prompts.bin: int32 count, then per prompt int32 n and |n| int32 token ids
+ * (the ids AFTER the leading <|im_start|>, which is the cache's sink; n < 0:
+ * a continuation of the previous prompt).
  * Result lines on stdout: "LLM_OPEN: {...}", "LLM_PROMPT: {...}" per prompt,
  * "LLM_PREFILL: {...}" per length, "LLM_REOPEN: {...}", "LLM_SUMMARY: {...}",
  * and with profiling "PROFILE_PHASE: <phase>" + the profiler's "LAYERS_JSON: {...}".
@@ -129,9 +133,12 @@ int main(int argc, char **argv)
         return 1;
     }
     int32_t **prompts = calloc((size_t)np, sizeof *prompts), *plen = calloc((size_t)np, 4);
+    int      *cont = calloc((size_t)np, sizeof *cont);
     int p;
     for (p = 0; p < np; p++) {
-        if (fread(&plen[p], 4, 1, fin) != 1 || plen[p] < 1) return 1;
+        if (fread(&plen[p], 4, 1, fin) != 1 || plen[p] == 0) return 1;
+        cont[p] = plen[p] < 0 && p > 0;
+        if (plen[p] < 0) plen[p] = -plen[p];
         prompts[p] = malloc((size_t)plen[p] * 4);
         if (fread(prompts[p], 4, (size_t)plen[p], fin) != (size_t)plen[p]) return 1;
     }
@@ -172,9 +179,10 @@ int main(int argc, char **argv)
     printf("]}\n");
     fflush(stdout);
     for (p = 0; p < np; p++) {
-        int     s, tok;
+        int     s, tok, pos0;
         double  pre_ms;
-        if (llm_truncate(1) != 0) return 1;
+        if (!cont[p] && llm_truncate(1) != 0) return 1;
+        pos0 = llm_position();
         t = now_ms();
         if (llm_prefill(prompts[p], plen[p], lg) != 0) {
             fprintf(stderr, "error: llm_prefill: %s\n", llm_last_error());
@@ -184,9 +192,11 @@ int main(int argc, char **argv)
         fwrite(lg, sizeof(float), (size_t)V, fout);
         if (p == 0) memcpy(ref, lg, (size_t)V * sizeof(float));
         tok = argmax(lg, V);
-        printf("LLM_PROMPT: {\"i\":%d,\"n\":%d,\"prefill_ms\":%.2f,\"steps\":[{\"tok\":%d,\"fnv\":%u}",
-               p, plen[p], pre_ms, tok, (unsigned)fnv1a(lg, V));
-        fprintf(stderr, "prompt %d: %d tokens, prefill %.1f ms, next %d\n", p, plen[p], pre_ms, tok);
+        printf("LLM_PROMPT: {\"i\":%d,\"n\":%d,\"cont\":%d,\"pos0\":%d,\"prefill_ms\":%.2f,"
+               "\"steps\":[{\"tok\":%d,\"fnv\":%u}",
+               p, plen[p], cont[p], pos0, pre_ms, tok, (unsigned)fnv1a(lg, V));
+        fprintf(stderr, "prompt %d: %d tokens at position %d, prefill %.1f ms, next %d\n", p,
+                plen[p], pos0, pre_ms, tok);
         if (p == 0) prof_reset();
         for (s = 0; s < k; s++) {
             double d;

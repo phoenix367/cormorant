@@ -70,12 +70,17 @@ def bert_config(path=None) -> dict:
 
 
 def write_prompts(path: str, ids: dict) -> list:
+    """prompts.bin for llm_bench: the ids after the sink <|im_start|>; a
+    "<name>/turn2" entry (llm_project.with_second_turns) is a continuation
+    (negative count: no truncate, prefilled after the previous prompt's
+    decode steps)."""
     names = list(ids)
     with open(path, "wb") as f:
         f.write(struct.pack("<i", len(names)))
         for n in names:
-            t = ids[n][1:]                       # after the sink <|im_start|>
-            f.write(struct.pack("<i", len(t)))
+            cont = n.endswith("/turn2")
+            t = ids[n] if cont else ids[n][1:]
+            f.write(struct.pack("<i", -len(t) if cont else len(t)))
             f.write(np.asarray(t, "<i4").tobytes())
     return names
 
@@ -222,16 +227,21 @@ def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: s
     """Replay the board's tokens on SimSession; compare every logits vector."""
     cfg, W, fmt, fd = lp.load_model()
     summary = json.load(open(os.path.join(project, "project.json")))
-    fe = lp.frontend(cfg, W, fmt, ctx=summary["context"])
+    fe = lp.frontend(cfg, W, fmt, ctx=summary["context"],
+                     prefill_attn=summary.get("prefill_attn", "host"))
     cgs = {n: lp.make_codegen(m, n, "off") for n, m in lp.entry_models(fe, summary["buckets"]).items()}
     raw = np.fromfile(logits_path, "<f4").reshape(-1, cfg.V)
     study = json.load(open(study_json)) if study_json and os.path.exists(study_json) else {}
     rep, k = {}, 0
+    sess = None
     for pi, name in enumerate(names):
         pr = res["prompts"][pi]
         toks = [s["tok"] for s in pr["steps"]]
-        sess = lp.SimSession(cgs, ctx=summary["context"], buckets=summary["buckets"])
-        a = sess.prefill(ids[name][1:])
+        if name.endswith("/turn2"):          # continuation: on top of the previous prompt
+            a = sess.prefill(ids[name])
+        else:
+            sess = lp.SimSession(cgs, ctx=summary["context"], buckets=summary["buckets"])
+            a = sess.prefill(ids[name][1:])
         exact, first_bad = 0, None
         for s in range(decode + 1):
             b = raw[k]
@@ -242,7 +252,8 @@ def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: s
                 first_bad = s
             if s < decode:
                 a = sess.decode(toks[s])
-        st = study.get(name, {}).get("generated")
+        base, _, turn = name.partition("/")
+        st = study.get(base, {}).get("turn2_generated" if turn else "generated")
         rep[name] = {"steps": decode + 1, "bit_exact_steps": exact, "first_mismatch": first_bad,
                      "tokens": toks,
                      "study_tokens_equal": (toks == st[:len(toks)]) if st else None}
@@ -259,6 +270,8 @@ def main(argv=None) -> int:
     ap.add_argument("--project", default=DEFAULT_PROJECT)
     ap.add_argument("--bert-config", default=None)
     ap.add_argument("--prompts", default="factual,summarise,multi-turn")
+    ap.add_argument("--second-turn", default="factual",
+                    help="prompts followed by a second-turn continuation ('' = none)")
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--prefill-lens", default="16,64,256")
     ap.add_argument("--reps", type=int, default=3)
@@ -282,7 +295,8 @@ def main(argv=None) -> int:
         ap.error("--install-only builds; it cannot be combined with --skip-build")
     local_prompts = os.path.join(args.project, "prompts.bin")
     if not args.install_only:
-        ids = lp.tokenize_prompts(args.prompts.split(","))
+        ids = lp.with_second_turns(lp.tokenize_prompts(args.prompts.split(",")),
+                                   [n for n in args.second_turn.split(",") if n])
         names = write_prompts(local_prompts, ids)
     results = {"project": summary, "prompts": [] if args.install_only else names}
     with board_lock(args.board_lock or cfg.get("board_lock")):
