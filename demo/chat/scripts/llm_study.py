@@ -64,6 +64,7 @@ Usage (.venv-export: torch CPU, transformers, safetensors, numpy):
   $PY demo/chat/scripts/llm_study.py validate     # numpy float64 vs torch float32 (+ template, greedy)
   $PY demo/chat/scripts/llm_study.py study [--policies q88,...] [--quick] [--nogreedy] [--windows N]
   $PY demo/chat/scripts/llm_study.py ablate [--base fit+sink]   # error per tensor class
+  $PY demo/chat/scripts/llm_study.py formats [--base pow2+sink+p12]  # exponents + sink K/V -> JSON
   $PY demo/chat/scripts/llm_study.py costs        # decode / prefill bytes and MACs per token
 
 Assets (not in git, see demo/chat/assets/.gitignore): SMOLLM_ASSETS or
@@ -1073,6 +1074,37 @@ def cmd_ablate(args):
         del m
 
 
+def cmd_formats(args):
+    """Write a policy's calibrated exponents (and the position-0 sink K / V at the
+    cache exponents) as JSON — the input the phase-3 scheduler needs to reproduce
+    the emulation.  Keys "<class>@<layer>" (layer 30 = final norm / LM head);
+    values an int or a per-channel list (per head for q, k, p).  Weight exponents
+    are implied: fw[i][j] = f_out[j] + 8 - f_in[i]."""
+    cfg, W = load_all(args.assets)
+    tok = Tok(args.assets)
+    _, _, calib = build_data(args.assets, tok, False)
+    pol = POLICIES[args.base]
+    fm = Model(W, cfg, None)
+    cm = Model(W, cfg, None, base=fm, sink=bool(pol.get("sink")), sink_model=fm, record_ch=True)
+    for c in calib:
+        teacher_forced(cm, c)
+    fmt = make_formats(pol, cm.stats.ch, W, cfg)
+    out = {"policy": args.base, "spec": POLICIES[args.base], "margin": MARGIN,
+           "exponents": {f"{k[0]}@{k[1]}": np.asarray(v).tolist() for k, v in fmt.items()}}
+    if pol.get("sink"):
+        m = Model(W, cfg, pol, fmt, sink_model=fm)
+        s = Seq(cfg, 1)
+        m._write_sink(s, 1)
+        out["sink_token"] = 1
+        out["sink_k_raw"] = [np.rint(s.k[l][:, 0] * p2(m.Eh("k", l, cfg.KV))[:, None]).astype(int).tolist() for l in range(cfg.L)]
+        out["sink_v_raw"] = [np.rint(s.v[l][:, 0] * p2(m.Ev("vc", l, cfg.KV * cfg.HD).reshape(cfg.KV, cfg.HD))).astype(int).tolist()
+                             for l in range(cfg.L)]
+    path = args.out or os.path.join(os.path.dirname(args.assets), "study", f"formats_{args.base}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(out, open(path, "w"))
+    print(f"{path}: {len(fmt)} exponent entries")
+
+
 # ------------------------------------------------------------------ validation vs torch
 def cmd_validate(args):
     import torch
@@ -1147,8 +1179,9 @@ def cmd_costs(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "costs"])
-    ap.add_argument("--base", default="fit+sink", help="ablate: the policy whose formats are ablated")
+    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "formats", "costs"])
+    ap.add_argument("--base", default="pow2+sink+p12",
+                    help="ablate: the policy whose formats are ablated; formats: the policy to export")
     ap.add_argument("--assets", default=default_assets())
     ap.add_argument("--policies", default=DEFAULT_POLICIES)
     ap.add_argument("--max-new", type=int, default=MAX_NEW)
@@ -1158,7 +1191,7 @@ def main():
     ap.add_argument("--nogreedy", action="store_true", help="skip the policies' greedy generations")
     args = ap.parse_args()
     {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate,
-     "costs": cmd_costs}[args.cmd](args)
+     "formats": cmd_formats, "costs": cmd_costs}[args.cmd](args)
 
 
 if __name__ == "__main__":

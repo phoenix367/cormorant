@@ -3,7 +3,10 @@
 Date: 2026-09-26.  Status: **approved 2026-09-26 — decisions: A then B,
 SmolLM2-135M-Instruct, server on the board, existing CLIs + `chat.py`, context
 1024.**  Phase 1 (server + CLI + backend A) and phase 2 (B0 numeric study)
-started in parallel.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
+started in parallel.  **Phase 2 done: GO for SmolLM2-135M on today's bitstream
+with the numeric policy `pow2+sink+p12` (§9).**  That policy is a float
+residual, a precomputed position-0 sink, per-channel power-of-two exponents,
+and softmax P at 2^-12.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
 inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
@@ -102,6 +105,10 @@ weights that produce the outliers and undo them in the float residual add,
 and per-weight power-of-two scaling if an accumulator-shift register is
 ever added.  Exit criterion: greedy answers indistinguishable in quality
 from float on the prompt set (I will show you examples side by side).
+**Done 2026-09-26: GO (§9).**  The reference is a numpy Llama forward from the
+safetensors weights, validated against transformers / torch rather than
+onnxruntime.  Plain Q8.8 fails: a 25 982 attention-sink activation and
+softmax P at 1/256.  The fix is host-side only (§9.5).
 
 **B1. Export.**  Two fixed-shape ONNX graphs from the Hugging Face model
 (host-side export with torch / transformers in a separate venv):
@@ -110,7 +117,10 @@ from float on the prompt set (I will show you examples side by side).
 - `decode(id[1,1], pos, K_cache[L][C], V_cache[L][C], mask[1,C]) → logits, k_new[L], v_new[L]`
   with the cache as ordinary graph inputs (C = context length).  The host
   writes `k_new / v_new` into the cache at `pos` (23 KB per token for 135M),
-  so the cache never moves.
+  so the cache never moves.  The host re-rounds V to the cache exponent as it
+  writes it (§9.5).
+- Cache row 0 (`<|im_start|>`, the attention sink) is a precomputed constant
+  and prefill starts at position 1 (§9.3).
 
 **B2. Scheduler.**
 - Host ops / fusion patterns: RMSNorm (fused float region, like LayerNorm),
@@ -125,6 +135,14 @@ from float on the prompt set (I will show you examples side by side).
   lowering.  The existing cost model already decides this.
 - The tied embedding is used twice: a Gather table (row-major) and the LM
   head (packed B) — two copies, +57 MB.
+- **Numerics from B0 (§9.5):**
+  - per-tensor / per-channel power-of-two exponents (host `ld` / `st` scale
+    vectors, rank-1 weight exponents);
+  - a float32 residual host tensor, with the adds fused into the RMSNorm
+    regions;
+  - the position-0 sink;
+  - softmax P at 2^-12, with the V cache re-rounded by the host;
+  - calibrated exponents from `llm_study.py formats`.
 
 **B3. Generation loop (in the library, C):** prefill the prompt, then per
 token decode → logits → sampling (greedy, temperature, top-k, top-p,
@@ -180,7 +198,7 @@ History is trimmed from the oldest turn to fit the context.
 | # | Phase | Deliverable | Gate |
 |---|---|---|---|
 | 1 | Server + CLI + backend A | shared-library build of the BERT project, `kv260_chat_server.py`, `chat.py`, sliding-window QA, docs with `llm` / `aichat` configs | OpenAI SDK + `llm` + `aichat` + `chat.py` against the board; streaming and non-streaming; answers identical to the demo's spans (bit-exact path); long-document QA |
-| 2 | B0 numeric study | study script + report | go / no-go with side-by-side float vs Q8.8 generations |
+| 2 | B0 numeric study | study script + report | go / no-go with side-by-side float vs Q8.8 generations — **done, GO (§9)** |
 | 3 | B1–B3 decoder | export, scheduler ops, multi-entry project, generation loop; tiny random Llama fixtures in the 148-model board suite | scheduler simulation bit-exact with the study emulation; board logits bit-exact on prefill and 32 decode steps; greedy text identical to the emulation |
 | 4 | B4 + server integration | tokenizer, chat template, sampling, streaming | multi-turn chat through `llm`, `aichat`, `chat.py`; tokens/s and TTFT measured |
 | 5 | Performance (optional) | split packed-B streaming over HPC0 + HPC1 (~2× decode, bitstream), overlap sampling with the next step, int8 weights (large) | measured tokens/s |
@@ -191,16 +209,18 @@ Each phase lands as its own branch and board run, like BERT phases 1–2.
 
 | | 135M | 360M |
 |---|---:|---:|
-| decode, per token (weights / 1.5 GB/s + ~5 ms of calls and host ops) | ~185 ms (5.4 tok/s) | ~490 ms (2 tok/s) |
+| decode, per token (weights + KV / 1.5 GB/s + calls and host ops; 135M: 270–293 MB → 180–195 ms + 391 calls, §9.6) | ~195–205 ms (~5 tok/s) | ~490 ms (2 tok/s) |
 | prefill, 256-token prompt (ConvKernel, ~40 GMAC/s) | ~0.7 s | ~2 s |
 | with weights split over two HPC ports (phase 5) | ~10 tok/s | ~4 tok/s |
 | BERT-QA answer, one 256-token window | ~1.0 s | |
 
 ## 8. Risks
 
-- **Q8.8 numerics on the decoder** — the reason phase 2 is a go / no-go; if
-  the study fails, the fallback is wider activations on the host path or an
-  accumulator-shift register (bitstream).
+- **Q8.8 numerics on the decoder** — resolved by B0 (§9) without a bitstream.
+  Residual risks:
+  - calibration coverage: 433 of 4.0 G values saturate on the evaluation data;
+    widen the margin or the calibration set if chats show more;
+  - the size of the exponent machinery in the scheduler (§9.5).
 - **Small-model quality** — 135M chats plausibly but gets facts wrong; that
   is the model, not the port.  360M is the same code.
 - **Decode speed** is bound by weight bandwidth, not compute; the conv grid
@@ -208,3 +228,315 @@ Each phase lands as its own branch and board run, like BERT phases 1–2.
 - **Static shapes** — prefill buckets and a fixed context length; longer
   conversations are trimmed.
 - **One FPGA** — requests are serialised; fine for a demo, not a service.
+
+## 9. B0 results — numeric study (2026-09-26)
+
+**Verdict: GO, with policy `pow2+sink+p12`, on today's bitstream.**  Plain
+Q8.8 (the BERT partition) is unusable for this model: top-1 agreement is
+10 % and the output is word salad.  Three host-side changes fix it, with no
+kernel or bitstream change:
+
+1. a float residual stream;
+2. a precomputed position-0 attention sink;
+3. power-of-two exponents per tensor and per channel, which put softmax P at 2^-12.
+
+With those, the Q8.8 datapath agrees with float about as closely as bf16
+inference does.  Top-1 is 97.6 % on the prompt set and 96.9 % on held-out
+text; bf16 gets 98.4 % / 98.0 %.  Perplexity is 15.616, against 15.607 for
+bf16 and 15.598 for float.  The greedy answers read like the float model's;
+see §9.4 and the 12 full side-by-sides in `generations.txt`.
+
+Script: `demo/chat/scripts/llm_study.py` (`.venv-export`; `validate`, `study`,
+`ablate`, `formats`, `costs`; semantics in its docstring).  Assets and results
+stay untracked under `demo/chat/assets/` (`study/results.json`,
+`study/generations.txt`, `study/formats_pow2+sink+p12.json`).
+
+### 9.1 Method
+
+- **Float reference.**  A numpy float64 Llama forward, written from the
+  safetensors weights (bf16 upcast exactly): RMSNorm, RoPE θ = 100 000 with
+  rotate-half, GQA with 9 / 3 heads, SwiGLU, tied LM head, KV cache.  Checked
+  against transformers 5.17 / torch float32 (eager attention):
+  - logits max |diff| 7e-5 on the prompts and 1.15e-4 on a 1024-token window;
+  - greedy 128-token generations identical on 12/12 prompts;
+  - our ChatML formatter + `tokenizers` gives the same ids as HF
+    `apply_chat_template` on 15/15 conversations.
+- **Data.**
+  - *Chat prompts.*  12 prompts through SmolLM2's ChatML template (default
+    system prompt unless given): 2 short factual, instruction, poem,
+    summarise-a-paragraph, arithmetic, word problem, code, explanation,
+    translation, custom system prompt, 3-turn chat.
+  - *Prompt set.*  Each prompt followed by float's greedy answer,
+    teacher-forced: 1 639 positions, 990 of them in answers.
+  - *Held-out text.*  WikiText-2 test, 3 windows of `<|im_start|>` + 1 023
+    tokens (the context length): 3 069 positions.
+  - *Calibration (separate data).*  WikiText-2 validation (1 023 tokens) plus 3
+    other prompts.
+  - Position 0 is excluded from every metric.
+- **Emulation.**  Every DDR tensor is int16 with a power-of-two exponent f
+  (value = raw · 2^-f; Q8.8 is f = 8).  f is either a scalar or a vector
+  over the last-axis channels.
+  - *Kernels are unchanged.*  Raw operands, exact products summed into
+    ap_fixed<32,16> (the int32 wrap is emulated), `floor(acc / 2^8)` + saturate.
+    So f_out = f_in + f_w − 8, and every weight is encoded, round-half-even +
+    saturate, at `f_w[i][j] = f_out[j] + 8 − f_in[i]`.
+  - *Host regions.*  RMSNorm (+ residual add), RoPE, softmax (+ 1/8 scale,
+    causal mask), SiLU·up and the V-cache write compute in double.  They read
+    `raw · 2^-f[c]` and write `round_half_even(v · 2^f[c])`, saturated.
+    Softmax exp and SiLU are 65 536-entry libm tables per exponent (built from
+    the same double arithmetic, so bit-identical).
+- **Exponents.**  Chosen from the float calibration maxima with one bit of
+  headroom (`make_formats`).
+- **Yardstick.**  `bf16` rounds every tensor at the same boundaries to bf16
+  and keeps the residual in bf16 (as torch bf16 inference does); the math is
+  float.  It shows how much disagreement a numerically benign format already
+  causes.  Even bf16 reproduces float's greedy text exactly on only 5 of 12
+  prompts, because near-tie tokens flip and the text then diverges.  So the
+  criterion is answer quality, not exact match.
+
+### 9.2 Results
+
+Top-1 = argmax equal to float's; KL = mean KL(float ‖ policy) per position;
+match = leading tokens identical to float's greedy answer (of ≤ 128).
+
+| policy | top-1 prompt set (all / answers) | top-1 held-out | top-5 held-out | KL held-out | KL prompt set | ppl held-out | identical answers | mean match |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| float (numpy f64) | – | – | – | – | – | 15.598 | – | – |
+| bf16 (yardstick) | 0.984 / 0.981 | 0.980 | 1.000 | 0.0007 | 0.0010 | 15.607 | 5/12 | 28.6 |
+| `q88` (BERT partition: Q8.8, VectorOP residual adds) | 0.100 / 0.108 | 0.062 | 0.143 | 7.26 | 7.74 | 22 856 | 0/12 | 0 |
+| `res_float` (float residual, all Q8.8) | 0.170 / 0.208 | 0.073 | 0.198 | 8.09 | 6.66 | 61 014 | 0/12 | 0 |
+| `res_float+sink` | 0.734 / 0.747 | 0.666 | 0.913 | 0.757 | 0.617 | 32.90 | 0/12 | 1.1 |
+| `fit+sink` (Q8.8 unless the range needs coarser, per channel) | 0.962 / 0.964 | 0.885 | 0.995 | 0.061 | 0.0071 | 16.47 | 3/12 | 20.8 |
+| `pow2+sink` | 0.966 / 0.968 | 0.890 | 0.995 | 0.056 | 0.0043 | 16.29 | 1/12 | 25.1 |
+| **`pow2+sink+p12` (recommended)** | **0.976 / 0.980** | **0.969** | **1.000** | **0.0024** | **0.0021** | **15.616** | **2/12** | **15.9** |
+| `pow2+sink+hattn` (float host attention) | 0.977 / 0.982 | 0.970 | 1.000 | 0.0022 | 0.0025 | 15.648 | 4/12 | 32.6 |
+| `pow2+p12` (no sink) | 0.964 / 0.964 | 0.956 | 1.000 | 0.0065 | 0.0063 | 15.72 | 2/12 | 8.4 |
+| `pow2_tensor+sink+p12` (per-tensor exponents) | 0.929 / 0.940 | 0.908 | 0.998 | 0.025 | 0.027 | 16.04 | 2/12 | 15.9 |
+| `pow2+sink+p12+emb_q88` (Gather from a Q8.8 table) | 0.974 / 0.979 | 0.967 | 1.000 | 0.0024 | 0.0024 | 15.621 | 4/12 | 26.1 |
+| `pow2+sink+p12+fw` (diagnostic: float weights) | 0.983 / 0.988 | 0.987 | 1.000 | 0.0007 | 0.0007 | 15.595 | 3/12 | 34.1 |
+
+`fit` / `pow2` differ only in where the kernel outputs' exponents go.
+`fit` caps them at 8.  `pow2` gives every kernel output that the host
+reads (q, k, v, o, gate, up, down, logits) the finest exponent its range
+allows, and the weights inherit those bits.  In both, host-written inputs
+(RMSNorm outputs, silu·up, K / V cache) stay ≤ 8.  `p12` writes P at 2^-12.
+To keep P·V inside int16, the host re-rounds the V cache when it writes it
+(2^-8 on 91 % of the channels, 2^-7 / 2^-6 on the rest).  Matmul accumulators peak at 295 in
+Q16.16 units (the wrap is at 32 768).  Under the recommended policy 433 of
+4.0 G quantised values saturate: o / up / gate / down / q / P·V channels that exceeded
+their calibration maximum by more than the one-bit headroom.
+
+### 9.3 What breaks Q8.8, and what fixes it
+
+- **Massive activation at the attention sink.**  Position 0 (`<|im_start|>`,
+  the first token of every chat) builds a residual value of **25 982**
+  (channel 507) in layer 11's MLP.  There, silu·up reaches 3 164 and
+  down_proj 25 937; the residual stays above 10 000 through layer 29.
+  Saturating these kernel outputs at ±128 destroys the sink.  Every later
+  attention layer depends on it, which is why even a float residual (`res_float`) fails.  Two
+  observations lead to the fix:
+  - position 0's K / V rows depend only on that one token, so they are
+    constants of the application;
+  - K / V are all that later positions see of position 0.
+  **Sink:** precompute those rows in float, write them once into the cache
+  (23 KB), and start prefill at position 1.  The massive activation then
+  never exists on the datapath.  Without the sink, per-channel exponents
+  cope, but at 2.7× the KL (`pow2+p12`).
+- **Other outliers, excluding position 0.**  The residual reaches 1 442.
+  down_proj reaches 994 (layer 29, and 692 in layer 2); o_proj 204; silu·up
+  185; raw q·k 723.  Per-channel exponents handle all of them: down_proj's
+  outlier channels get 2^-3 … 2^-7, and q is lowered per head (2^-5 … 2^-7)
+  so that q·k fits.  Per-tensor exponents cost 10× the KL.  The residual
+  stream itself must be float.
+- **Softmax P is the dominant error once the ranges fit.**  At 1/256
+  resolution, a 1024-key row loses every probability below 0.002.  Per-class
+  ablation of `fit+sink` (one class quantised at a time, float weights;
+  first held-out window + prompt set; `llm_study.py ablate --base fit+sink`):
+
+  | quantised (everything else float) | KL held-out | KL prompt set |
+  |---|---:|---:|
+  | everything | 0.0579 | 0.0071 |
+  | weights only | 0.0030 | 0.0028 |
+  | activations only | 0.0567 | 0.0045 |
+  | **only P** | **0.0558** | 0.0018 |
+  | only o / P·V / V | 0.0004 / 0.0003 / 0.0002 | 0.0005 / 0.0004 / 0.0002 |
+  | only x2 / silu·up / down / gate+up | 0.0003 / 0.0001 / 0.0001 / 0.0001 | 0.0004 / 0.0001 / 0.0001 / 0.0001 |
+  | only x / q0,k0 / RoPE q,k / scores / final norm / logits | ≤ 0.0001 | ≤ 0.0001 |
+
+- **The fixed `>> 8` couples exponents.**  f_P + f_Vcache − 8 = f_PV, and
+  f_PV + f_Wo − 8 = f_o.  So bits given to P come out of V or of W_o unless
+  o's exponent can rise.  Under `fit` (outputs capped at 8), P at 2^-11 /
+  2^-12 / 2^-13 improved the held-out KL only to 0.011 / 0.025 / 0.084.  The
+  prompt-set KL got *worse* (0.014 / 0.047 / 0.12, first-window run),
+  because W_o lost the bits.  `pow2` lets the outputs use
+  their range (o at 2^-10 … 2^-12), so P can have 12 bits.  Host float
+  attention (`hattn`) avoids the question and scores the same.
+- **What remains is weight precision.**  With float weights KL falls from
+  0.0024 to 0.0007, the bf16 level.  That is the most an accumulator-shift
+  register (a bitstream change) could buy.  It is not needed.
+- **No effect (first-window / quick runs):**
+  - adding ½ LSB to compensate the kernels' floor bias (`+ff`: KL
+    0.0579 → 0.0560 under `fit+sink`, 0.0033 → 0.0034 under
+    `pow2+sink+p12`);
+  - a Q8.8 Gather table instead of bf16 (`+emb_q88`, full run above);
+  - lowering the cap on host-written exponents to 7 or 6 (better on one set,
+    worse on the other).
+
+Value ranges (max |x| before quantisation, all data; the policy column
+excludes position 0 through the sink; "≥ 128" is the fraction that would
+saturate plain Q8.8):
+
+| tensor | float max (layer) | ≥ 128 | `pow2+sink+p12` max | exponents used (share of channels) |
+|---|---:|---:|---:|---|
+| residual h | 25 982 (L11) | 0.107 % | 1 442 | float32 host tensor |
+| RMSNorm out x / x2 | 11.8 / 32.0 | 0 | 11.8 / 8.6 | 8 |
+| q = x·Wq, k = x·Wk | 24.6 / 25.6 | 0 | 24.7 / 25.7 | 9–15 (mostly 11–12) |
+| RoPE q / k (K cache) | 24.5 / 25.5 | 0 | 24.6 / 25.6 | q 5–8 per head, k 8 |
+| scores q·k (before 1/8) | 717 (L18) | 1.4 % | 723 | f_q + f_k − 8 = 5–8 per head |
+| P | 1.0 | 0 | 1.0 | 12 |
+| v (V cache) | 14.8 | 0 | 14.8 | v out 10–15; cache 8 (7 / 6 on 9 %) |
+| P·V | 12.6 | 0 | 12.5 | 12 (11 / 10 on 9 %) |
+| o_proj out | 202 (L24) | 0.006 % | 204 | 8–15 (mostly 10–12) |
+| gate / up | 50.6 / 78.5 | 0 | 37.9 / 40.5 | 10–13 |
+| silu·up | 3 164 (L11) | 0.0001 % | 185 | 8 (7 on 9 channels) |
+| down_proj out | 25 937 (L11) | 0.016 % | 981 | 3–13 (mostly 9–11) |
+| final RMSNorm out | 52.0 | 0 | 51.8 | 8 |
+| logits | 46.3 | 0 | 45.6 | 9 |
+
+### 9.4 Side by side (float → `pow2+sink+p12`; all 12 in `generations.txt`)
+
+*Code* — same function, different wording after it:
+```
+float:  Here's a Python function that checks whether a number is prime:
+        def is_prime(n): if n < 2: return False / for i in range(2, int(n**0.5) + 1): if n % i == 0: return False / return True
+        This function works by checking divisibility from 2 to the square root of the number. If the number is
+        divisible by any of these values, it's not prime. If it's not divisible by any of these values, it's prime.
+q8.8:   Here is a Python function that checks whether a number is prime:
+        (identical code)
+        This function works by checking if the input number `n` is divisible by any number from 2 to the square
+        root of `n`. If `n` is divisible by any of these numbers, it is not prime. If `n` is not divisible by any
+```
+*Factual* — same answer, then keeps going (float stops):
+```
+float:  The capital of France is Paris.
+q8.8:   The capital of France is Paris. It is a city known for its historical landmarks, cultural institutions, and
+        cultural attractions. Paris is a major global city, and it is the political, economic, and cultural center of France.
+```
+*Summarise* (169-token prompt) — a different, equally valid summary:
+```
+float:  The honeybee colony is a complex, interconnected system of workers, drones, and queens that work together to
+        maintain the colony's food source.
+q8.8:   The paragraph summarizes the characteristics of a honeybee colony, including the diverse workforce of workers,
+        sterile female bees, and the unique dance that communicates the location of food sources.
+```
+*Instruction* — the same three tips, reworded:
+```
+float:  1. Create a Dedicated Study Space: Choose a quiet and comfortable place where you can focus without distractions. …
+        2. Set Clear Goals: Before each study session, set specific, measurable, achievable, relevant, and time-bound (SMART) goals …
+        3. Take Regular Breaks: Regular breaks are crucial for maintaining focus and preventing burnout. Try to take short breaks …
+q8.8:   1. Create a Dedicated Study Space: Find a quiet and comfortable place to study where you can focus without distractions. …
+        2. Set Clear Goals: Before starting your study sessions, set specific, measurable, achievable, relevant, and time-bound (SMART) goals …
+        3. Take Regular Breaks: Regular breaks are crucial for maintaining focus and preventing burnout. Try to take short breaks …
+```
+The arithmetic ("17 + 25 = 42.") and custom-system-prompt answers are
+identical.  The word problem is wrong in both, as in float: the 135M model
+cannot do it.  For contrast, the failing policies on "What is the capital of
+France?":
+
+- `q88`: " even at us / even at them / the none them one them one …"
+- `res_float`: " I. No. no. no. Rep. No. other other …"
+- `res_float+sink`: "Paris, the City of Light, is the capital of the Kingdom of the Netherlands."
+
+### 9.5 What phase 3 (B1–B3) must implement for `pow2+sink+p12`
+
+The emulation is the spec.  The phase-3 gate "scheduler simulation bit-exact
+with the study emulation" refers to this policy.
+`llm_study.py formats` writes its exponents and the sink rows to
+`formats_pow2+sink+p12.json` (422 entries `class@layer`, per-channel lists;
+sink K / V as raw int16).
+
+1. **Exponents per tensor.**  An int, or an int vector over the last-axis
+   channels (per head for q, k, P), in place of the implicit Q8.8.
+   - Host ops read `raw · 2^-f[c]` and write
+     `round_half_even(v · 2^f[c])`, saturated: a per-channel scale vector in
+     `host_ld` / `host_st`.
+   - The kernels and their `>> 8` are unchanged.
+   - Kernel-to-kernel tensors (P·V → o_proj) carry the derived exponent
+     `f_P + f_Vcache − 8`.
+2. **Weight encoding with a rank-1 exponent**,
+   `f_w[i][j] = f_out[j] + 8 − f_in[i]`: round-half-even, saturate (none
+   saturate).  The tied embedding is encoded twice: a Q8.8 Gather table
+   (row-major; no measurable loss, §9.2) and an LM head at 2^-9 (packed B).
+3. **Float residual stream.**  A new float32 host tensor type (not in the
+   CMA pool).  Every residual Add fuses into the next RMSNorm region
+   (`h = float32(h + delta)`, then RMSNorm), and the last into the final norm.
+   RMSNorm is `ss` left to right, `r = 1 / sqrt(ss/576 + 1e-5)`,
+   `y = (h·r)·γ`, with γ as float32.
+4. **Position-0 sink.**  Cache row 0 of every layer is a constant (float run
+   of `<|im_start|>`, rounded at the cache exponents), written at init.
+   Prefill buckets start at position 1, and the chat template must always
+   begin with `<|im_start|>` (it does).
+5. **Attention.**
+   - q·Kᵀ per head, or per KV group if the 3 heads share a q exponent (taking
+     the group minimum costs nothing measurable: quantising q, k has KL
+     0.0000).
+   - Softmax host region: `k = raw_max − raw`, `e = exp(−k·2^-f_s·0.125)`
+     from a 65 536-entry table per score exponent, sum left to right, P
+     written at 2^-12.
+   - P·V on the kernel.
+   - The host writes K (after RoPE) and V into the cache, re-rounding V to
+     the cache exponent.  In decode the host copies `k_new` / `v_new` anyway;
+     in prefill this is a host op over P × 192 values per layer.
+   - Alternative: decode attention as one float host region (`hattn`,
+     numerically equivalent; see §9.6).
+6. **Other host regions.**  RoPE with float32 cos / sin tables (formulas in
+   the script docstring).  SiLU·up with a 65 536-entry silu table per gate
+   exponent (gate exponents 8–14: at most 7 tables, 3.5 MiB of doubles, or
+   compute with libm).
+7. **Calibration.**  The exponents come from a float run over calibration data
+   with one bit of headroom.  Phase 3 can consume the JSON, or port
+   `make_formats` (70 lines).  Its map is `class@layer` to ONNX tensors
+   and weights.
+8. **Export (B1).**  Two constraints on the graphs:
+   - they must expose RMSNorm, RoPE, SiLU·gate, the residual adds and the KV
+     cache writes as fusable patterns;
+   - the Gemms must be separable per layer and class, so that exponents can
+     be attached.
+
+   The study's `Model` class (float forward + emulation, with KV cache) is a
+   complete numeric spec of the Llama block.  A direct safetensors + config.json
+   frontend for the scheduler may be less work than ONNX export plus pattern
+   fusion; decide at the start of phase 3.  The HF repo also ships
+   `onnx/model.onnx` (transformers.js, dynamic `past_key_values`), which is
+   not usable as-is.  `.venv-export` (torch 2.14 CPU, transformers 5.17,
+   1.2 GB) is in place.  torch's default dynamo exporter would also need
+   `onnxscript`.
+
+### 9.6 Cost refresh (`llm_study.py costs`; feeds §7)
+
+| | value |
+|---|---|
+| parameters | 134.5 M: layers 106.2 M (3.54 M / layer) + tied embedding 28.3 M |
+| weights | 269 MB, + 57 MB second copy of the embedding |
+| KV cache | 22.5 KiB per token → 22.5 MiB at 1024 |
+| decode MACs per token | 137 M (ctx 64) … 170 M (ctx 1024); attention is 1.2 M per layer at 1024 |
+| decode bytes per token | 270 … 293 MB → **180 … 195 ms at 1.5 GB/s** before call and host-op overhead |
+| kernel calls per token | 391: per layer q, k, v, 3 × q·Kᵀ, 3 × P·V (per KV group), o, gate, up, down; + LM head |
+| host ops per token | 152 |
+| prefill, P = 64 / 128 / 256 / 512 | 7.0 / 14.2 / 29.5 / 63.5 GMAC → 0.17 / 0.35 / 0.74 / 1.6 s at 40 GMAC/s (ConvKernel) |
+
+**Per-call overhead.**  §7's "~5 ms of calls and host ops" assumed far fewer
+calls than 391.  At an assumed 10–20 µs per call (not measured), 391 calls
+alone take 4–8 ms.  Fusing
+q / k / v and gate / up (same input, concatenated weights, per-column
+exponents already supported) saves 90 calls per token.
+
+**Decode attention on the host (`hattn`).**  Numerically equivalent, as
+§9.2 shows, and it removes the 180 attention calls.  The cost is about
+35 M MAC per token on the A53s at full context (~9 ms on 4 cores at an
+assumed 4 GMAC/s), plus reading the 22.5 MiB cache from cacheable memory.  The kernel path streams
+the same cache at 1.5 GB/s (15 ms).  Measure both in phase 3.
+
+**Runtimes.**  On 8 host cores the study takes 42 min for the full set
+(12 policies), `ablate` 12.5 min, `validate` 2 min and `formats` 22 s.
+Disk: `.venv-export` 1.2 GB and assets 272 MB, both untracked.
