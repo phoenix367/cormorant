@@ -40,18 +40,24 @@ demo/bert_squad/
 │   ├── reference.py                — host reference logits (float / emulation / simulation)
 │   ├── deploy_and_run.py           — upload, build, smoke test, run, score, report
 │   ├── _common.py                  — config / paths / input readers
-│   ├── bert_study.py               — tokenizer, feature builder, span decoding, EM/F1,
-│   │                                 numpy float model + Q8.8 emulation (the study)
+│   ├── squad_text.py               — WordPiece tokenizer, SQuAD features (one window or
+│   │                                 sliding windows), span decoding, EM/F1 — stdlib only,
+│   │                                 shared with the chat server (demo/chat/)
+│   ├── bert_study.py               — numpy float model + Q8.8 emulation (the study);
+│   │                                 re-exports squad_text
 │   ├── bert_sched_check.py         — scheduler simulation vs study emulation (gate b)
 │   └── bert_schedule_stats.py      — work per engine in the generated schedule
 ├── src/
+│   ├── bert_api.h / bert_api.c     — C API over the generated project (bert_open / bert_run /
+│   │                                 bert_close); squad_bench and libbert_squad.so use it
 │   └── squad_bench.c               — board-side runner (compiled on the board)
 ├── assets/                         — not in git
 │   ├── vocab.txt, dev-v1.1.json
 │   ├── models/bertsquad-12-simplified.onnx
 │   └── preprocessed/{inputs.bin, features.json}
 └── build/                          — not in git
-    ├── project/                    — generated CMake project (+ weights/, layers.json)
+    ├── project/                    — generated CMake project (+ weights/, layers.json);
+    │                                 targets squad_bench and bert_squad (libbert_squad.so)
     ├── project.json                — project summary (roles -> buffers, kernels)
     ├── reference/                  — reference.npz + per-example cache
     ├── logits.bin, results.json
@@ -330,8 +336,10 @@ board logits differ from the simulation, 1 = a step failed.
   `unique_ids` to the example index and checks the pass-through output.
 * **Logits** are Q8.8: `squad_bench` writes the raw int16 bits
   (`logits.bin`, start[256] then end[256] per example); the host divides by
-  256 and decodes the best span (`bert_study.best_span`: top-20 start / end
-  candidates inside the context, length ≤ 30).
+  256 and decodes the best span (`squad_text.best_span`: top-20 start / end
+  candidates inside the context, length ≤ 30; equal logits are ranked by
+  position, the order of a stable argsort — the former `np.argsort` gave the
+  same spans on every real logit set checked, see `demo/chat/README.md`).
 * **Bit-exactness.**  The host ops compute in double with
   `-ffp-contract=off` and libm's `exp` / `tanh`, round half to even on
   write-back; the scheduler's simulation mirrors that in numpy with Python's

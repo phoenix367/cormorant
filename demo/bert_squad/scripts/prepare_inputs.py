@@ -4,8 +4,8 @@ prepare_inputs.py — tokenize SQuAD 1.1 dev questions for the KV260 BERT demo.
 
 Takes the first N questions (config inputs.num_examples, default 50) of
 SQuAD 1.1 dev whose question + context fit one 256-token window, tokenizes
-them with the WordPiece tokenizer and feature builder of bert_study.py
-(imported, not copied), and writes
+them with the WordPiece tokenizer and feature builder of squad_text.py
+(through bert_study.py; imported, not copied), and writes
 
   assets/preprocessed/inputs.bin     int16 little-endian, per example:
                                      input_ids[256], segment_ids[256],

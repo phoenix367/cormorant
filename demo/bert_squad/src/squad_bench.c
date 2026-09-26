@@ -20,8 +20,10 @@
  * and, when built with -DINFERENCE_PROFILING=ON, the LAYERS_JSON: and
  * DDR_JSON: lines of the per-layer profiler (warm-up excluded).
  *
- * Model-specific glue (buffer order / sizes / roles, inference_init
- * arguments) comes from the generated bench_glue.h.
+ * Model setup (inference_init with the UIO instances, the I/O buffers,
+ * raw int16 inputs / Q8.8 logit bits) is bert_api.c — the same code the
+ * chat server's libbert_squad.so runs; model-specific glue comes from the
+ * generated bench_glue.h through it.
  *
  * usage: squad_bench [-i inputs.bin] [-o logits.bin] [-n N] [-w warmup]
  *        -n 0 (default) = every example in inputs.bin
@@ -40,9 +42,7 @@
 #include "inference.h"
 #include "inference_prof.h"
 #include "inference_ddr.h"
-#include "bench_glue.h"
-
-#define REC_ELEMS  (3u * BENCH_SEQ_LEN)
+#include "bert_api.h"
 
 static double now_ms(void)
 {
@@ -57,21 +57,11 @@ static int cmp_double(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
-/* Copy one inputs.bin record into the model's input buffers (raw int16). */
-static void fill_inputs(inference_buf_t *const *b, const int16_t *rec, unsigned uid)
+/* One inputs.bin record (input_ids, segment_ids, input_mask) through the
+ * model; logits -> lg[0 .. 2*seq). */
+static void run_record(const int16_t *rec, unsigned seq, unsigned uid, int16_t *lg, int *uid_out)
 {
-    const int roles[3] = { BENCH_IDX_INPUT_IDS, BENCH_IDX_SEGMENT_IDS, BENCH_IDX_INPUT_MASK };
-    unsigned r, i;
-    for (r = 0; r < 3u; r++) {
-        Data_t *p = inference_buf_ptr(b[roles[r]]);
-        for (i = 0; i < BENCH_SEQ_LEN; i++)
-            p[i] = (Data_t)rec[r * BENCH_SEQ_LEN + i];
-    }
-#if BENCH_IDX_UNIQUE_IDS >= 0
-    inference_buf_ptr(b[BENCH_IDX_UNIQUE_IDS])[0] = (Data_t)(int16_t)uid;
-#else
-    (void)uid;
-#endif
+    bert_run_ex(rec, rec + seq, rec + 2u * seq, (int)uid, lg, lg + seq, uid_out);
 }
 
 static unsigned argmax16(const int16_t *v, unsigned n)
@@ -111,10 +101,12 @@ int main(int argc, char **argv)
     fseek(fin, 0, SEEK_END);
     long in_bytes = ftell(fin);
     rewind(fin);
-    const size_t rec_bytes = (size_t)REC_ELEMS * sizeof(int16_t);
+    const unsigned seq       = bert_seq_len();
+    const size_t   rec_elems = 3u * (size_t)seq;
+    const size_t   rec_bytes = rec_elems * sizeof(int16_t);
     if (in_bytes <= 0 || (size_t)in_bytes % rec_bytes != 0) {
         fprintf(stderr, "error: %s: %ld bytes is not a multiple of %zu (3 x %u int16)\n",
-                in_path, in_bytes, rec_bytes, BENCH_SEQ_LEN);
+                in_path, in_bytes, rec_bytes, seq);
         return 1;
     }
     unsigned n_avail = (unsigned)((size_t)in_bytes / rec_bytes);
@@ -133,12 +125,12 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr, "squad_bench: model=%s examples=%u (of %u) seq_len=%u warmup=%u\n",
-            BENCH_MODEL_NAME, n, n_avail, BENCH_SEQ_LEN, warmup);
+            bert_model_name(), n, n_avail, seq, warmup);
 
-    /* ---- init -------------------------------------------------------- */
+    /* ---- init (inference_init + I/O buffers) ------------------------- */
     double t_init = now_ms();
-    if (bench_inference_init() != 0) {
-        fprintf(stderr, "error: inference_init failed\n");
+    if (bert_open(NULL) != 0) {
+        fprintf(stderr, "error: %s\n", bert_last_error());
         return 1;
     }
     t_init = now_ms() - t_init;
@@ -153,24 +145,17 @@ int main(int argc, char **argv)
     (void)inference_ddr_init();
 #endif
 
-    inference_buf_t *bufs[BENCH_N_BUFS];
-    unsigned k;
-    for (k = 0; k < BENCH_N_BUFS; k++) {
-        bufs[k] = inference_buf_alloc(bench_buf_numel[k]);
-        if (!bufs[k]) {
-            fprintf(stderr, "error: inference_buf_alloc(%u) failed for '%s'\n",
-                    bench_buf_numel[k], bench_buf_name[k]);
-            return 1;
-        }
-        memset(inference_buf_ptr(bufs[k]), 0, (size_t)bench_buf_numel[k] * sizeof(Data_t));
+    int16_t *lg = (int16_t *)malloc(sizeof(int16_t) * 2u * seq);
+    if (!lg) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
     }
 
     /* ---- warm-up (example 0) ----------------------------------------- */
     unsigned w;
     for (w = 0; w < warmup; w++) {
         double t0 = now_ms();
-        fill_inputs(bufs, recs, 0u);
-        bench_inference_run(bufs);
+        run_record(recs, seq, 0u, lg, NULL);
         fprintf(stderr, "warmup %u/%u: %.1f ms\n", w + 1u, warmup, now_ms() - t0);
     }
 #if INFERENCE_PROFILING
@@ -180,45 +165,33 @@ int main(int argc, char **argv)
 
     /* ---- timed run --------------------------------------------------- */
     double  *lat = (double *)malloc(sizeof(double) * (n ? n : 1u));
-    int16_t *lg  = (int16_t *)malloc(sizeof(int16_t) * 2u * BENCH_SEQ_LEN);
-    if (!lat || !lg) {
+    if (!lat) {
         fprintf(stderr, "error: out of memory\n");
         return 1;
     }
     double   t_total = 0.0;
     unsigned uid_ok  = 0, i;
     for (i = 0; i < n; i++) {
-        fill_inputs(bufs, recs + (size_t)i * REC_ELEMS, i);
-
+        int uid_out = BERT_NO_UID;
         double t0 = now_ms();
-        bench_inference_run(bufs);
+        run_record(recs + (size_t)i * rec_elems, seq, i, lg, &uid_out);
         double dt = now_ms() - t0;
 
 #if INFERENCE_PROFILING
         inference_ddr_sample();
 #endif
-        const Data_t *ps = inference_buf_ptr(bufs[BENCH_IDX_START_LOGITS]);
-        const Data_t *pe = inference_buf_ptr(bufs[BENCH_IDX_END_LOGITS]);
-        memcpy(lg, ps, sizeof(int16_t) * BENCH_SEQ_LEN);
-        memcpy(lg + BENCH_SEQ_LEN, pe, sizeof(int16_t) * BENCH_SEQ_LEN);
-        if (fwrite(lg, sizeof(int16_t), 2u * BENCH_SEQ_LEN, fout) != 2u * BENCH_SEQ_LEN) {
+        if (fwrite(lg, sizeof(int16_t), 2u * seq, fout) != 2u * seq) {
             fprintf(stderr, "error: write %s failed\n", out_path);
             return 1;
         }
         fflush(fout);
 
-        int uid_out = -1;
-#if BENCH_IDX_UNIQUE_IDS_OUT >= 0
-        uid_out = (int)(int16_t)inference_buf_ptr(bufs[BENCH_IDX_UNIQUE_IDS_OUT])[0];
-        uid_ok += (uid_out == (int)i);
-#else
-        uid_ok++;
-#endif
+        uid_ok += (uid_out == BERT_NO_UID || uid_out == (int)i);
         lat[i] = dt;
         t_total += dt;
-        unsigned s = argmax16(lg, BENCH_SEQ_LEN), e = argmax16(lg + BENCH_SEQ_LEN, BENCH_SEQ_LEN);
+        unsigned s = argmax16(lg, seq), e = argmax16(lg + seq, seq);
         fprintf(stderr, "example %u/%u: latency=%.1f ms  argmax start=%u (%.2f) end=%u (%.2f)  uid=%d\n",
-                i + 1u, n, dt, s, lg[s] / 256.0, e, lg[BENCH_SEQ_LEN + e] / 256.0, uid_out);
+                i + 1u, n, dt, s, lg[s] / 256.0, e, lg[seq + e] / 256.0, uid_out);
     }
     fclose(fout);
 
@@ -235,7 +208,7 @@ int main(int argc, char **argv)
     printf("{\"model\":\"%s\",\"examples\":%u,\"warmup\":%u,\"seq_len\":%u,"
            "\"init_ms\":%.1f,\"mean_ms\":%.3f,\"min_ms\":%.3f,\"max_ms\":%.3f,"
            "\"p50_ms\":%.3f,\"total_s\":%.3f,\"uid_ok\":%u,\"latencies_ms\":[",
-           BENCH_MODEL_NAME, n, warmup, BENCH_SEQ_LEN, t_init, mean,
+           bert_model_name(), n, warmup, seq, t_init, mean,
            n ? sorted[0] : 0.0, n ? sorted[n - 1u] : 0.0, n ? sorted[n / 2u] : 0.0,
            t_total / 1000.0, uid_ok);
     for (i = 0; i < n; i++)
@@ -250,12 +223,10 @@ int main(int argc, char **argv)
     inference_ddr_deinit();
 #endif
 
-    for (k = 0; k < BENCH_N_BUFS; k++)
-        inference_buf_free(bufs[k]);
     free(sorted);
     free(lat);
     free(lg);
     free(recs);
-    inference_deinit();
+    bert_close();
     return 0;
 }

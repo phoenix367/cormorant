@@ -9,13 +9,17 @@ for the BERT-SQuAD demo.
   2. driver/ populated from local.driver_dirs for the active kernels
      (VectorOPKernel, ConvKernel — the MatMuls, BERT_PLAN 2A — and
      MatmulKernel for the two MatMuls that stay there).
-  3. src/squad_bench.c copied to test/, plus a generated test/bench_glue.h:
-     the buffer order of inference_run(), each buffer's numel macro and the
-     index of each role (input_ids, segment_ids, input_mask, unique_ids,
-     start / end logits), all read from OnnxGraph — no hard-coded C names.
-  4. CMakeLists.txt patched: squad_bench target added, the generated
-     test_inference smoke test kept but off by default
-     (-DINFERENCE_BUILD_TEST=ON builds it).
+  3. src/squad_bench.c and src/bert_api.{c,h} copied to test/, plus a
+     generated test/bench_glue.h: the buffer order of inference_run(), each
+     buffer's numel macro and the index of each role (input_ids,
+     segment_ids, input_mask, unique_ids, start / end logits), all read
+     from OnnxGraph — no hard-coded C names.
+  4. CMakeLists.txt patched: squad_bench (bert_api.c + the static
+     inference library) and bert_squad — the shared library
+     libbert_squad.so (bert_api.c over a position-independent build of the
+     same library, only the bert_* symbols exported) that the chat server
+     (demo/chat/) loads with ctypes; the generated test_inference smoke
+     test kept but off by default (-DINFERENCE_BUILD_TEST=ON builds it).
   5. build/project/layers.json: every scheduled node (profile index, name,
      op, engine, kind) for the per-kind latency breakdown, and
      build/project.json: the summary deploy_and_run.py reads.
@@ -46,6 +50,8 @@ from src.kernels import KERNEL_REGISTRY        # noqa: E402
 from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode  # noqa: E402
 
 SRC_DIR = DEMO_DIR / "src"
+# Board-side C sources copied into the project's test/ directory.
+C_SOURCES = ("squad_bench.c", "bert_api.c", "bert_api.h")
 
 # Kinds of the per-layer breakdown, in report order.
 KINDS = ("MatMul linear", "MatMul attention", "VectorOP", "LayerNorm", "GELU",
@@ -114,20 +120,33 @@ def patch_cmake(project_dir: Path, gen: CodeGenerator) -> None:
     text += (
         "\n"
         "# -----------------------------------------------------------------------\n"
-        "# squad_bench — BERT-SQuAD demo runner (added by\n"
-        "# demo/bert_squad/scripts/generate_project.py).  UIO instance macros take\n"
-        "# the same quoted form as test_inference: -DINFERENCE_..._INSTANCE=\\\"name\\\"\n"
+        "# squad_bench — BERT-SQuAD demo runner, and bert_squad — the shared\n"
+        "# library libbert_squad.so for the KV260 chat server (demo/chat/), both\n"
+        "# over test/bert_api.c (added by demo/bert_squad/scripts/generate_project.py).\n"
+        "# UIO instance macros take the same quoted form as test_inference:\n"
+        "# -DINFERENCE_..._INSTANCE=\\\"name\\\"\n"
         "# -----------------------------------------------------------------------\n"
         "if(INFERENCE_TARGET STREQUAL \"LINUX\")\n"
-        "    add_executable(squad_bench test/squad_bench.c)\n"
+        "    # the static library also goes into the shared one\n"
+        "    set_property(TARGET inference PROPERTY POSITION_INDEPENDENT_CODE ON)\n"
+        "    add_executable(squad_bench test/squad_bench.c test/bert_api.c)\n"
         "    target_link_libraries(squad_bench PRIVATE inference m)\n"
-        "    target_include_directories(squad_bench PRIVATE test)\n"
-        "    target_compile_options(squad_bench PRIVATE -Wall -Wextra -O2)\n"
-        "    foreach(_macro IN ITEMS\n"
+        "    add_library(bert_squad SHARED test/bert_api.c)\n"
+        "    target_link_libraries(bert_squad PRIVATE inference m)\n"
+        "    # export only bert_*: a second generated library (another model) can\n"
+        "    # live in the same process without inference_* symbol clashes\n"
+        "    target_link_options(bert_squad PRIVATE -Wl,--exclude-libs,ALL -Wl,--no-undefined)\n"
+        "    foreach(_tgt IN ITEMS squad_bench bert_squad)\n"
+        "        target_include_directories(${_tgt} PRIVATE test)\n"
+        "        target_compile_options(${_tgt} PRIVATE -Wall -Wextra -O2)\n"
+        "        target_compile_definitions(${_tgt} PRIVATE\n"
+        "            BERT_API_WEIGHTS_DIR=\"${INFERENCE_WEIGHTS_DIR}\")\n"
+        "        foreach(_macro IN ITEMS\n"
         f"{macros})\n"
-        "        if(DEFINED ${_macro})\n"
-        "            target_compile_definitions(squad_bench PRIVATE ${_macro}=${${_macro}})\n"
-        "        endif()\n"
+        "            if(DEFINED ${_macro})\n"
+        "                target_compile_definitions(${_tgt} PRIVATE ${_macro}=${${_macro}})\n"
+        "            endif()\n"
+        "        endforeach()\n"
         "    endforeach()\n"
         "endif()\n")
     cmake.write_text(text)
@@ -191,7 +210,8 @@ def emit_glue(project_dir: Path, *, model_name: str, g: OnnxGraph,
                       for r in INPUT_ROLES + OUTPUT_ROLES)
     glue = f"""/*
  * bench_glue.h — generated by demo/bert_squad/scripts/generate_project.py:
- *                bridge between squad_bench.c and this model's inference API.
+ *                bridge between bert_api.c (squad_bench, libbert_squad.so)
+ *                and this model's inference API.
  *
  * Model          : {model_name}
  * Active kernels : {", ".join(kd.name for kd in active)}
@@ -257,9 +277,10 @@ def preflight(cfg: dict) -> bool:
     if not m.exists():
         log(f"error: model {m} not found — see README.md 'Assets'")
         ok = False
-    if not (SRC_DIR / "squad_bench.c").exists():
-        log(f"error: {SRC_DIR / 'squad_bench.c'} missing")
-        ok = False
+    for name in C_SOURCES:
+        if not (SRC_DIR / name).exists():
+            log(f"error: {SRC_DIR / name} missing")
+            ok = False
     for k, p in (cfg.get("local", {}).get("driver_dirs") or {}).items():
         if k.startswith("_"):
             continue
@@ -304,7 +325,8 @@ def main(argv=None) -> int:
             log(f"    {m}")
 
     patch_cmake(out, gen)
-    shutil.copy2(SRC_DIR / "squad_bench.c", out / "test" / "squad_bench.c")
+    for name in C_SOURCES:
+        shutil.copy2(SRC_DIR / name, out / "test" / name)
     emit_glue(out, model_name=model.stem, g=g, gen=gen, io_map=io_map)
     layers = write_layers(out, g)
 
@@ -323,6 +345,7 @@ def main(argv=None) -> int:
         "weights":       {"files": len(weights),
                           "bytes": sum(p.stat().st_size for p in weights)},
         "kinds":         {k: sum(1 for L in layers if L["kind"] == k) for k in KINDS},
+        "targets":       ["squad_bench", "bert_squad"],
         "generated_s":   round(time.time() - t0, 1),
     }
     PROJECT_SUMMARY.parent.mkdir(parents=True, exist_ok=True)

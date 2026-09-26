@@ -20,7 +20,7 @@ Assets (not in git): demo/bert_squad/assets/vocab.txt (bert-base-uncased) and
 dev-v1.1.json (SQuAD 1.1 dev).  Run with inference-scheduler/.venv/bin/python.
 Reports EM/F1 vs ground truth, agreement with float, per-tensor ranges.
 """
-import argparse, collections, json, math, re, string, sys, time, unicodedata
+import argparse, collections, json, math, re, sys, time
 import numpy as np
 import onnx
 from onnx import numpy_helper
@@ -31,128 +31,30 @@ HERE = os.environ.get("BERT_SQUAD_ASSETS",                          # vocab.txt,
                       os.path.join(REPO, "demo", "bert_squad", "assets"))
 MODEL = os.environ.get("BERT_SQUAD_MODEL",
                        os.path.join(REPO, "inference-scheduler", "bertsquad-12-simplified.onnx"))
-SEQ = 256
 
-# ----------------------------------------------------------------- tokenizer
-def _is_punct(ch):
-    cp = ord(ch)
-    if 33 <= cp <= 47 or 58 <= cp <= 64 or 91 <= cp <= 96 or 123 <= cp <= 126:
-        return True
-    return unicodedata.category(ch).startswith("P")
+# ----------------------------------------------------------------- text side
+# Tokenizer, SQuAD features, span decoding and metrics live in the stdlib-only
+# squad_text.py (shared with the KV260 chat server); re-exported here so that
+# bert_study.Tokenizer / build_feature / best_span / em / f1 keep working.
+_SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+import squad_text  # noqa: E402
+from squad_text import (Tokenizer, _is_ctrl, _is_punct, _is_ws, _norm,  # noqa: E402,F401
+                        best_span, em, f1, whitespace_tokens)
 
-def _is_ws(ch):
-    return ch in " \t\n\r" or unicodedata.category(ch) == "Zs"
+SEQ = squad_text.SEQ
 
-def _is_ctrl(ch):
-    if ch in "\t\n\r":
-        return False
-    return unicodedata.category(ch) in ("Cc", "Cf")
-
-class Tokenizer:
-    def __init__(self, vocab_path):
-        self.vocab = {}
-        for i, line in enumerate(open(vocab_path, encoding="utf-8")):
-            self.vocab[line.rstrip("\n")] = i
-
-    def basic(self, text):
-        text = "".join(" " if _is_ws(c) else c for c in text
-                       if not (ord(c) == 0 or ord(c) == 0xFFFD or _is_ctrl(c)))
-        out = []
-        for tok in text.strip().split():
-            tok = unicodedata.normalize("NFD", tok.lower())
-            tok = "".join(c for c in tok if unicodedata.category(c) != "Mn")
-            cur = ""
-            for c in tok:
-                if _is_punct(c):
-                    if cur: out.append(cur); cur = ""
-                    out.append(c)
-                else:
-                    cur += c
-            if cur: out.append(cur)
-        return out
-
-    def wordpiece(self, token):
-        if len(token) > 100:
-            return ["[UNK]"]
-        out, start = [], 0
-        while start < len(token):
-            end, cur = len(token), None
-            while start < end:
-                sub = token[start:end]
-                if start > 0: sub = "##" + sub
-                if sub in self.vocab: cur = sub; break
-                end -= 1
-            if cur is None:
-                return ["[UNK]"]
-            out.append(cur); start = end
-        return out
-
-    def tokenize(self, text):
-        return [p for t in self.basic(text) for p in self.wordpiece(t)]
-
-# ----------------------------------------------------------------- features
-def whitespace_tokens(context):
-    doc, char_to_word, prev_ws = [], [], True
-    for c in context:
-        if _is_ws(c):
-            prev_ws = True
-        else:
-            if prev_ws: doc.append(c)
-            else: doc[-1] += c
-            prev_ws = False
-        char_to_word.append(len(doc) - 1)
-    return doc
 
 def build_feature(tok, question, context):
-    q = tok.tokenize(question)[:64]
-    doc = whitespace_tokens(context)
-    sub_to_orig, ctx = [], []
-    for i, w in enumerate(doc):
-        for p in tok.tokenize(w):
-            sub_to_orig.append(i); ctx.append(p)
-    room = SEQ - len(q) - 3
-    if len(ctx) > room:
-        return None                      # single-window examples only
-    tokens = ["[CLS]"] + q + ["[SEP]"] + ctx + ["[SEP]"]
-    seg = [0] * (len(q) + 2) + [1] * (len(ctx) + 1)
-    ids = [tok.vocab.get(t, tok.vocab["[UNK]"]) for t in tokens]
-    n = len(ids)
-    ids += [0] * (SEQ - n); seg += [0] * (SEQ - n); mask = [1] * n + [0] * (SEQ - n)
-    ctx_off = len(q) + 2
-    return dict(ids=np.array([ids], np.int64), seg=np.array([seg], np.int64),
-                mask=np.array([mask], np.int64), ctx_off=ctx_off, n_ctx=len(ctx),
-                sub_to_orig=sub_to_orig, doc=doc)
-
-def best_span(f, start, end, n_best=20, max_len=30):
-    lo, hi = f["ctx_off"], f["ctx_off"] + f["n_ctx"]
-    s_idx = [i for i in np.argsort(start)[::-1] if lo <= i < hi][:n_best]
-    e_idx = [i for i in np.argsort(end)[::-1] if lo <= i < hi][:n_best]
-    best, score = (lo, lo), -1e30
-    for s in s_idx:
-        for e in e_idx:
-            if s <= e < s + max_len and start[s] + end[e] > score:
-                score, best = start[s] + end[e], (s, e)
-    s, e = best
-    o0 = f["sub_to_orig"][s - lo]; o1 = f["sub_to_orig"][e - lo]
-    return best, " ".join(f["doc"][o0:o1 + 1])
-
-# SQuAD official normalisation / metrics
-def _norm(s):
-    s = s.lower()
-    s = "".join(ch for ch in s if ch not in set(string.punctuation))
-    s = re.sub(r"\b(a|an|the)\b", " ", s)
-    return " ".join(s.split())
-
-def f1(pred, gold):
-    p, g = _norm(pred).split(), _norm(gold).split()
-    common = collections.Counter(p) & collections.Counter(g)
-    ns = sum(common.values())
-    if ns == 0: return 0.0
-    pr, rc = ns / len(p), ns / len(g)
-    return 2 * pr * rc / (pr + rc)
-
-def em(pred, gold):
-    return float(_norm(pred) == _norm(gold))
+    """squad_text.build_feature with ids / seg / mask as int64 [1, SEQ]
+    arrays (the ONNX feeds); None when question + context need more than
+    one window."""
+    f = squad_text.build_feature(tok, question, context, SEQ)
+    if f is None:
+        return None
+    return dict(f, ids=np.array([f["ids"]], np.int64), seg=np.array([f["seg"]], np.int64),
+                mask=np.array([f["mask"]], np.int64))
 
 # ----------------------------------------------------------------- quantisers
 FRAC = 8

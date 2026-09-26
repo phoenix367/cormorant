@@ -2,9 +2,11 @@
 (with a copy-pasteable bootstrap message when the config is missing), the
 study module import, and the preprocessed-input readers.
 
-The tokenizer, SQuAD feature builder, span decoding, SQuAD EM / F1 and the
-numpy reference interpreter all live in bert_study.py; the demo imports
-them from there rather than keeping a second copy.
+The tokenizer, SQuAD feature builder, span decoding and SQuAD EM / F1 live
+in the stdlib-only squad_text.py (shared with the chat server in demo/chat/)
+and are re-exported by bert_study.py, which holds the numpy reference
+interpreter; the demo imports them through bert_study rather than keeping a
+second copy.
 """
 
 from __future__ import annotations
