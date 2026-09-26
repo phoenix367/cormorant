@@ -53,9 +53,9 @@ class CombinedGraph:
         for _, g in self.entries:
             for k, t in g._tensors.items():
                 self._tensors.setdefault(k, t)
-        self.numeric = {"exp": {}, "host": {}, "state": [], "test_fill": {}}
+        self.numeric = {"exp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}}
         for _, g in self.entries:
-            for k in ("exp", "host", "test_fill"):
+            for k in ("exp", "host", "test_fill", "layout"):
                 self.numeric[k].update(g.numeric.get(k, {}))
             for s in g.numeric.get("state", []):
                 if s not in self.numeric["state"]:
@@ -236,6 +236,8 @@ class MultiEntryGenerator:
                 if f is t:
                     continue
                 if (list(f.shape) != list(t.shape) or f.host != t.host
+                        or f.group_layout != t.group_layout
+                        or f.group_kw != t.group_kw
                         or not np.array_equal(f.exp_full(8), t.exp_full(8))):
                     raise SchedulerError(f"state '{t.onnx_name}' differs between entries")
                 if t.init_data is not None:
@@ -246,14 +248,20 @@ class MultiEntryGenerator:
 
     # ---- layouts ----------------------------------------------------------- #
     def pool_layout(self):
-        """Weights (deduplicated, sequential), then ONE intermediates region
-        in which every entry's own slots start at the same base."""
+        """Weights (deduplicated, sequential), the DMA states (shared,
+        sequential), then ONE intermediates region in which every entry's
+        own slots start at the same base."""
         if self._pool is None:
             bpe = self._dtype.bytes_per_elem
             a = 64 // bpe
             up = lambda n: (n + a - 1) & ~(a - 1)  # noqa: E731
             layout, off = [], 0
             for t in self.combined.weight_tensors:
+                alloc = self.cg._alloc_sizes[t.onnx_name]
+                layout.append((t.onnx_name, off, alloc))
+                off += up(alloc)
+            self.weights_only_elems = off
+            for t in self.cg._dma_states:
                 alloc = self.cg._alloc_sizes[t.onnx_name]
                 layout.append((t.onnx_name, off, alloc))
                 off += up(alloc)
@@ -525,7 +533,8 @@ class MultiEntryGenerator:
             "entries": [n for n, _ in self.entries],
             "nodes": {n: len(g.nodes) for n, g in self.entries},
             "pool_bytes": total * bpe,
-            "weights_bytes": self.weights_elems * bpe,
+            "weights_bytes": self.weights_only_elems * bpe,
+            "dma_state_bytes": (self.weights_elems - self.weights_only_elems) * bpe,
             "intermediate_region_bytes": self.region_elems * bpe,
             "weights": len(self.combined.weight_tensors),
             "renamed_weights": self.renamed,

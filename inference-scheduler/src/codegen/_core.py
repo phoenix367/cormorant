@@ -44,6 +44,7 @@ from ..graph   import OnnxGraph
 from ..nodes    import (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
                         ReshapeNode, SpaceToDepthNode, SchedulerError)
 from ..host_nodes import HostNode, SliceNode
+from ..llm_nodes import LlmAttnConvNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
 from ..tensor  import TensorInfo
@@ -172,6 +173,7 @@ class _CoreMixin:
             + self._graph.intermediate_tensors
             + self._graph.input_tensors
             + self._graph.output_tensors
+            + self._dma_states
         )
 
         # Phase 1: seed all tensors as flat.
@@ -183,7 +185,7 @@ class _CoreMixin:
             if sn.outer_count <= 1:
                 continue
             if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                               SpaceToDepthNode, HostNode)):
+                               SpaceToDepthNode, HostNode, LlmAttnConvNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -241,7 +243,7 @@ class _CoreMixin:
             if sn.outer_count > 1:
                 continue
             if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                               SpaceToDepthNode, HostNode)):
+                               SpaceToDepthNode, HostNode, LlmAttnConvNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -585,6 +587,12 @@ class _CoreMixin:
             alloc = self._alloc_sizes[t.onnx_name]
             layout.append((t.onnx_name, offset, alloc))
             offset += align_up(alloc)
+        # DMA states (a KV cache the FPGA prefill attention reads): persistent
+        # across calls, sequential, never shared.
+        for t in self._dma_states:
+            alloc = self._alloc_sizes[t.onnx_name]
+            layout.append((t.onnx_name, offset, alloc))
+            offset += align_up(alloc)
 
         inter, total = self._compute_intermediate_layout()
         layout.extend((name, offset + off, alloc) for name, off, alloc in inter)
@@ -746,8 +754,15 @@ class _CoreMixin:
     @property
     def _has_conv_nodes(self) -> bool:
         """True when the graph contains at least one ConvNode (or a MatMul
-        lowered onto ConvKernel)."""
-        return any(isinstance(sn, (ConvNode, MatmulConvNode)) for sn in self._graph.nodes)
+        lowered onto ConvKernel, or an FPGA attention call)."""
+        return any(isinstance(sn, (ConvNode, MatmulConvNode, LlmAttnConvNode))
+                   for sn in self._graph.nodes)
+
+    @property
+    def _dma_states(self) -> List[TensorInfo]:
+        """States kept in the DMA pool (no host kind): persistent buffers
+        host ops write and kernels read (src/numeric.py)."""
+        return [t for t in self._graph.state_tensors if not t.is_host]
 
     @property
     def _has_pool_nodes(self) -> bool:

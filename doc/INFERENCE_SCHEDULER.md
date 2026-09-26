@@ -126,8 +126,11 @@ inference_scheduler.py          CLI, argument parsing
     ├── host_nodes.py           HostNode family (Softmax, LayerNorm, Gelu,
     │                           Transpose, Slice, Gather, OneHot, Cast):
     │                           numpy reference + C helper library
-    ├── llm_nodes.py            axi.llm host ops of Llama decoders (Embed,
-    │                           RMSNorm, ResAdd, Attention, SiluMul, ...)
+    ├── llm_nodes.py            axi.llm ops of Llama decoders: host ops (Embed,
+    │                           RMSNorm, ResAdd, Attention, SiluMul, AttnPrep,
+    │                           AttnSoftmax, AttnMerge, ...) and the FPGA
+    │                           prefill-attention ConvKernel calls with a
+    │                           runtime key count (LlmAttnConvNode)
     ├── numeric.py              axi.numeric metadata: power-of-two exponents,
     │                           host tensors, states; rank-1 weight encoding
     ├── llama.py                Llama frontend: config + safetensors +
@@ -274,6 +277,7 @@ rules):
 | CPU wrote → kernel **writes** | `inference_buf_sync_to_device` (clean) | graph outputs at the top of `inference_run()` — a caller's `memset` of an output buffer would otherwise leave dirty lines whose later eviction overwrites the kernel's result; freshly allocated BOs are cleaned once in `inference_buf_alloc()` |
 | kernel wrote → CPU reads | `inference_buf_sync_from_device` (invalidate) **after** the lane drained | a host op's kernel-written inputs (inside its block, after the event stream's `kernel_wait`); graph outputs after the final drain |
 | kernel ↔ kernel | none | intermediates never touch the CPU caches |
+| CPU wrote a **DMA state** → kernel reads | `llm_cache_flush` (clean the rows the kernels read) | the KV caches of the FPGA prefill attention: `LlmAttnPrep` flushes rows `[0, keys)` of every KV head after writing its rows; decode steps write their row without a sync (it stays dirty until the next prefill flushes it) |
 
 Pool slots are 64-byte (cache-line) aligned and never share a line, a host
 op's output never shares a slot with one of its inputs (liveness), and the
@@ -286,6 +290,21 @@ sub-ranges); removing any single required sync makes it fail.  On the board
 a micro-test (`xclSyncBO` omitted → the kernel reads stale data / the CPU
 reads stale lines; with it → exact) and the 148-model suite confirm the
 behaviour.
+
+**DMA states** (the KV caches, [§Numerics](#numerics-beyond-the-element-type))
+persist across calls and entries, so the audit lets every run function start
+with them CPU-dirty (another entry may have written rows) and requires a
+flush between a host op's write and any kernel read in the same call; which
+rows are flushed is a run-time range it cannot see.  That, and every other
+sync, is checked dynamically by the **incoherent host emulation**
+(`test/host_emu.py`, `build_and_run(incoherent=True)` / `-DEMU_INCOHERENT`):
+each allocation gets a separate "DDR" copy that the software kernels read and
+write, a flush copies the bytes the CPU changed since its last sync (the dirty
+data of a write-back cache) and an invalidate reloads the CPU copy — a
+missing or too-narrow sync then changes the outputs (the tests remove the
+cache flush, a host op's output flush and an invalidate, and each fails).
+The audit also walks multi-entry run functions (`run_name`) with their
+`noinline` parts inlined.
 
 `inference_buf_is_cached(buf)` (inference.h) reports the mapping; the host
 ops compute in place when it is 1.  Fallback: `cmake
@@ -537,6 +556,7 @@ outputs exactly (printed with `%d`).
 {"exp":       {"tensor": 11, "other": [9, 10, 12, ...]},
  "host":      {"tensor": "f32" | "i32" | "i16"},
  "state":     ["kv.k.l0", "h_last", ...],
+ "layout":    {"kv.k.l0": [3, 64]},
  "test_fill": {"pos": 3}}
 ```
 
@@ -590,7 +610,28 @@ the DAG (like weights), excluded from buffer reuse (`OnnxGraph.state_tensors`),
 allocated in `inference_init()` and freed in `inference_deinit()`; the
 simulator keeps them in a dict it updates in place
 (`_forward_pass(..., states=)`, `initial_states()`).  Only host states are
-supported (a DMA state would need range syncs around every write).
+supported by the host ops alone; a state **without** a host kind is a **DMA
+state**: a persistent buffer in the CMA pool (after the weights, never shared
+by liveness), initialised in `inference_init()` from its non-zero prefix and
+flushed with the pool, that host ops read / write in place through the BO
+pointer and kernels read (the FPGA prefill attention's KV caches).  Host ops
+declare the DMA states they write (`state_writes()`); the rows a kernel will
+read must be flushed first (`llm_cache_flush`, [§Cache
+coherency](#cache-coherency)).
+
+**Group-major layout (`layout`).**  `{"t": [G, D]}` stores a state of logical
+shape `[R][G·D]` as `[G][R][D]` (`TensorInfo.group_layout`): every group's
+rows are contiguous — a KV cache `[C][KV·HD]` becomes `[KV][C][HD]`, so the
+first `keys` rows of one KV head are a dense ConvKernel weight / input.
+`[G, D, K]` additionally stores each group's rows as the x image of a 1 × K
+lowered MatMul (`TensorInfo.group_kw`; `nodes.conv_lowered_b_image`): row r,
+element d at `((r / 16K)·16 + r mod 16)·D·K + d·K + (r / 16) mod K` inside
+the group (`R % 16K == 0`) — the V cache, which P·V reads with kernel width K.
+The first `keys` rows (keys a multiple of 16K) are still the prefix
+`[0, keys·D)` of the group.  The simulator keeps the logical array; the init
+image (the logical non-zero prefix, whole rows) is scattered at init
+(`_state_scatter`), and the LLM ops index the physical layout
+(`llm_vrow`).
 
 **Test harness.**  Host inputs are filled with `test_fill` constants or
 `i % R` (ids: R = the embedding rows), f32 as `(i % 17 − 8) · 0.25`;
@@ -617,12 +658,46 @@ a regeneration).  Entries (T rows, C = context incl. the sink):
 | `prefill_<T>` | `ids[T]`, `pos[1]`, `n[1]` | state `h_last` | rows ≥ n are padding (computed, never written to the cache) |
 | `head` | state `h_last` | `logits[1][V]` | final RMSNorm + LM head |
 
-Per layer: `x = RMSNorm(h)`, `q0 / k0 / v = MatMul(x)`,
-`pv = LlmAttention(q0, k0, v, pos, n, kv.k.l, kv.v.l)`, `o = MatMul(pv)`,
-`h1 = ResAdd(h, o)`, `x2 = RMSNorm(h1)`, `g / u = MatMul(x2)`,
-`a = SiluMul(g, u)`, `d = MatMul(a)`, `h2 = ResAdd(h1, d)`; `h` (f32) is the
-residual stream.  The KV caches are i16 host states `[C][KV·HD]` whose row 0
-is the precomputed position-0 sink; `pos` ≥ 1.
+Per layer: `x = RMSNorm(h)`, `q0 / k0 / v = MatMul(x)`, attention (below)
+`-> pv`, `o = MatMul(pv)`, `h1 = ResAdd(h, o)`, `x2 = RMSNorm(h1)`,
+`g / u = MatMul(x2)`, `a = SiluMul(g, u)`, `d = MatMul(a)`,
+`h2 = ResAdd(h1, d)`; `h` (f32) is the residual stream.  The KV caches are
+logical `[C][KV·HD]` int16 states stored group-major `[KV][C][HD]` whose row
+0 is the precomputed position-0 sink; `pos` ≥ 1.
+
+**Attention** (`LlamaFrontend(prefill_attn=...)`, doc/CHAT_PLAN.md §16):
+
+* `"fpga"` (default; study policy `pow2+sink+p12+mix`): decode steps run
+  `pv = LlmAttention(q0, k0, v, pos, kv.k.l, kv.v.l)` (the xattn host
+  region); **prefill** runs `LlmAttnPrep` (host), then per KV head g a
+  q·Kᵀ call on ConvKernel, the p12 softmax on the host and a P·V call on
+  ConvKernel, then `LlmAttnMerge` — node order q·Kᵀ 0, q·Kᵀ 1, softmax 0,
+  P·V 0, then softmax g, q·Kᵀ g+1, P·V g: the host issues the (one at a
+  time) ConvKernel calls in order, so each softmax follows a call it hides
+  behind — softmax 0 the short q·Kᵀ 1, every later one the previous group's
+  long P·V.  The caches are DMA states.
+* `"host"` (phase 3, `pow2+sink+p12+xattn`): `LlmAttention` in every entry,
+  the caches i16 host states.
+
+**Runtime dimension.**  A prefill call attends to `pos + n` keys (sink,
+earlier turns / chunks, its own causal rows), not to the C-row cache.  The
+two ConvKernel calls (`LlmAttnConvNode`, one per KV head and kind) run over
+`keys = roundup(pos + n, Q)` keys (n clamped like LlmAttention; ≥ Q, ≤ C;
+`Q = 16·K`, attribute `key_quantum`), computed in the run function from the
+entry's `pos` / `n` inputs (`llm_keys`) and written into the AXI-Lite
+registers — `out_ch` of q·Kᵀ, `in_ch = keys / K` of P·V.  Everything else of
+the geometry is fixed at codegen: the output split `out_h × out_w` (cost
+model at C/2 keys), q·Kᵀ's kernel width (the frontend writes the q image, so
+any kw with `HD % 16kw == 0` is free; cost model) and P·V's `K` (the V
+cache's interleave, `LlamaFrontend(pv_kw=)`, default 4: each P row of a
+weight slab is then one 8-beat request instead of four 2-beat ones — P·V
+runs 2.3–2.6× faster on the board, which the cycle model, blind to request
+latency, does not predict).  Buffers are sized for C keys; P's row stride
+is `keys` at run time.  The simulator evaluates the same integer semantics
+over the actual key count (`LlmAttnConvNode.reference`).  Key-length buckets
+were the alternative: five key buckets per prefill bucket would multiply the
+prefill entries (and inference.c, already 4.2 MB) by five and pad the keys
+by up to 2× — the register values cost nothing.
 
 **Host ops** (numeric contract as for the other host ops — double
 arithmetic, left-to-right sums, no FMA contraction, libm exp, round half to
@@ -639,18 +714,26 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
 | `LlmSelectRow` | `h_last = h[n − 1]` |
 | `LlmDequant` | `y = float32(raw · 2^-f[c])` |
+| `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches |
+| `LlmAttnScores` (ConvKernel) | `s_g[j][p] = floor(Σ_d K_g[j][d]·q_g[d][p] / 2^8)`, j < keys: MatMul on ConvKernel ([§MatMul on ConvKernel](#matmul-on-convkernel)) with weight = the K cache rows `[keys][HD]` of KV head g (`out_ch = keys`), x = the q image (`in_ch = HD/kw`, 1×kw), output `G·T` pixels |
+| `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
+| `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
+| `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw) |
 
 RoPE uses float32 cos / sin tables `[C][HD/2]` computed by the frontend
 exactly as `llm_study.rope_tables` (host tables).  The ops are the numeric
-policy `pow2+sink+p12+xattn` of the study; `demo/chat/scripts/llm_sched_check.py`
-shows the scheduler's simulation of SmolLM2-135M equal to the study's
-emulation bit for bit.
+policy `pow2+sink+p12+mix` of the study (`pow2+sink+p12+xattn` with
+`prefill_attn="host"`); `demo/chat/scripts/llm_sched_check.py` shows the
+scheduler's simulation of SmolLM2-135M equal to the study's emulation bit
+for bit, over a first prefill, decode steps and a second turn.
 
 ### Multi-entry projects
 
 `src/codegen/multi.py` (`MultiEntryGenerator`; CLI `--entry NAME=MODEL.onnx`
 repeated).  One `inference.c` with `inference_run_<name>()` per entry graph:
 
+* **pool** = the weights, then the DMA states (shared by name), then one
+  intermediates region;
 * **weights deduplicated** by name AND emitted image: entries that read an
   initializer in the same layout share one DMA buffer; an entry that needs
   another layout (the MatmulKernel packed image vs a MatMul-on-ConvKernel

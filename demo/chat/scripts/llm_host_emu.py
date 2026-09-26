@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.join(lp.SCHED, "test"))
 import host_emu                                                     # noqa: E402
 
 
-def build(project: str, work: str) -> str:
+def build(project: str, work: str, incoherent: bool = False) -> str:
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
     emu = os.path.join(work, "emu")
@@ -46,6 +46,7 @@ def build(project: str, work: str) -> str:
     exe = os.path.join(work, "llm_bench_host")
     cmd = [host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
            "-Wno-unused-function", "-pthread", f"-DEMU_TILE_M={MATMUL_TILE_M}",
+           *(["-DEMU_INCOHERENT"] if incoherent else []),
            f"-DEMU_CONV_TILE_IC={CONV_TILE_IC}", f'-DINFERENCE_WEIGHTS_DIR="{project}"',
            f'-DLLM_API_WEIGHTS_DIR="{project}"', "-I", os.path.join(project, "include"),
            "-I", os.path.join(project, "test"), "-I", emu,
@@ -67,12 +68,17 @@ def main(argv=None) -> int:
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--work", default=None)
     ap.add_argument("--study-json", default=None)
+    ap.add_argument("--second-turn", default="factual",
+                    help="prompts followed by a second-turn continuation ('' = none)")
+    ap.add_argument("--incoherent", action="store_true",
+                    help="separate CPU / DDR buffer copies: every cache sync must be right")
     args = ap.parse_args(argv)
     project = os.path.abspath(args.project)
     work = args.work or os.path.join(project, "host_emu")
     os.makedirs(work, exist_ok=True)
-    exe = build(project, work)
-    ids = lp.tokenize_prompts(args.prompts.split(","))
+    exe = build(project, work, args.incoherent)
+    ids = lp.with_second_turns(lp.tokenize_prompts(args.prompts.split(",")),
+                               [n for n in args.second_turn.split(",") if n])
     prompts = os.path.join(work, "prompts.bin")
     names = llm_board.write_prompts(prompts, ids)
     logits = os.path.join(work, "logits_host.bin")

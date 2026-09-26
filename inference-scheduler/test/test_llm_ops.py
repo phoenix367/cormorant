@@ -7,7 +7,11 @@ against the software kernels (test/host_emu.py): the C helper must equal
 buffers and 1 / 4 host threads.  Plus: the SiLU table of every relevant gate
 exponent exhaustively (C vs Python, all 65 536 inputs); the references
 against independent formulas; the attention op's causality, padded rows
-and context clamp.
+and context clamp.  The FPGA prefill attention (LlmAttnPrep -> q.K^T /
+P.V ConvKernel calls with a runtime key count -> the p12 softmax ->
+LlmAttnMerge) as one chain over DMA-state caches, for several pos / n /
+kernel widths, on the host emulation (also with separate CPU / DDR copies,
+so every sync matters), its softmax exp tables exhaustively, and keys16.
 """
 
 import json
@@ -29,7 +33,8 @@ from src.codegen import CodeGenerator
 from src.dtype import AP_FIXED_16_8 as Q
 from src.graph import OnnxGraph
 from src.host_nodes import HOST_C_POOL
-from src.llm_nodes import LLM_DOMAIN, dot8, llm_c_helpers, rope, silu_table
+from src.llm_nodes import (KEY_QUANTUM, LLM_DOMAIN, LlmAttnConvNode, attn_keys, dot8,
+                           llm_c_helpers, rope, sexp_table, silu_table, v_row_base)
 from src.nodes import SchedulerError
 
 vi = oh.make_tensor_value_info
@@ -52,11 +57,14 @@ def node(op, ins, outs, **attrs):
     return oh.make_node(op, ins, outs, name=op.lower(), domain=LLM_DOMAIN, **attrs)
 
 
-def emulate(testcase, m, name):
+def emulate(testcase, m, name, incoherent=False):
     cg = CodeGenerator(OnnxGraph(m, fuse_act=True), model_path=name + ".onnx")
-    for cached, threads in ((True, 4), (False, 1)):
-        with testcase.subTest(cached=cached, threads=threads), tempfile.TemporaryDirectory() as td:
-            rc, out = host_emu.build_and_run(cg, td, cached=cached, threads=threads, min_elems=1)
+    runs = ((True, 4, False), (False, 1, False)) + (((True, 3, True),) if incoherent else ())
+    for cached, threads, inc in runs:
+        with testcase.subTest(cached=cached, threads=threads, incoherent=inc), \
+                tempfile.TemporaryDirectory() as td:
+            rc, out = host_emu.build_and_run(cg, td, cached=cached, threads=threads, min_elems=1,
+                                             incoherent=inc)
             testcase.assertEqual(rc, 0, out[-3000:])
             testcase.assertIn("test_inference PASSED", out)
     return cg
@@ -126,7 +134,7 @@ class TestOpsOnHost(unittest.TestCase):
         np.testing.assert_array_equal(sn.reference([h, [0]], Q), h[0:1])
         np.testing.assert_array_equal(sn.reference([h, [99]], Q), h[5:6])
 
-    def _attention(self, T=3, H=4, KV=2, HD=16, C=12, pos=4, n=None, seed=0):
+    def _attention(self, T=3, H=4, KV=2, HD=16, C=12, pos=4, n=None, seed=0, dma=False, vk=1):
         rng = np.random.default_rng(seed)
         half = HD // 2
         cos = rng.uniform(-1, 1, (C, half)).astype(np.float32)
@@ -142,7 +150,10 @@ class TestOpsOnHost(unittest.TestCase):
                 "exp": {"q": exps(H * HD, 10, 12), "k": exps(KV * HD, 10, 12),
                         "v": exps(KV * HD, 10, 12), "ck": fk.tolist(), "cv": fv.tolist(),
                         "pv": fpv.tolist()},
+                "layout": {"ck": [KV, HD], "cv": [KV, HD] + ([vk] if vk > 1 else [])},
                 "test_fill": {"pos": pos}}
+        if dma:                            # the caches as DMA states in the pool
+            del meta["host"]["ck"], meta["host"]["cv"]
         ins = [vi("q", F32, [T, H * HD]), vi("k", F32, [T, KV * HD]), vi("v", F32, [T, KV * HD]),
                vi("pos", I32, [1])]
         nin = ""
@@ -160,10 +171,13 @@ class TestOpsOnHost(unittest.TestCase):
         return m, dict(cos=cos, sin=sin, ck0=ck0, cv0=cv0, grp=grp)
 
     def test_attention_on_host(self):
-        for kw in ({}, {"n": 2}, {"pos": 10, "T": 4}, {"H": 3, "KV": 3}, {"HD": 8, "H": 2, "KV": 1}):
+        for kw in ({}, {"n": 2}, {"pos": 10, "T": 4}, {"H": 3, "KV": 3}, {"HD": 8, "H": 2, "KV": 1},
+                   {"dma": True}, {"dma": True, "n": 2},
+                   {"dma": True, "vk": 4, "C": 64, "pos": 40, "T": 5},   # V rows interleaved x4
+                   {"vk": 2, "C": 64, "pos": 30}):
             m, _ = self._attention(**kw)
             with self.subTest(**kw):
-                emulate(self, m, "attention")
+                emulate(self, m, "attention", incoherent=kw.get("dma", False))
 
     def test_attention_semantics(self):
         m, d = self._attention(T=3, pos=4)
@@ -213,9 +227,245 @@ class TestOpsOnHost(unittest.TestCase):
         m, _ = self._attention()
         d = json.loads(m.metadata_props[0].value)
         d["state"] = ["cv"]                                     # cache_k not a state
+        del d["layout"]["ck"]
         m.metadata_props[0].value = json.dumps(d)
         with self.assertRaisesRegex(SchedulerError, "must be a state"):
             OnnxGraph(m)
+        m, _ = self._attention()
+        d = json.loads(m.metadata_props[0].value)
+        del d["layout"]                                         # row-major caches
+        m.metadata_props[0].value = json.dumps(d)
+        with self.assertRaisesRegex(SchedulerError, "group-major"):
+            OnnxGraph(m)
+
+
+def fpga_attention_model(T=8, H=6, KV=2, HD=64, C=48, pos=5, n=None, kw=1, seed=0,
+                         order="pipelined", vk=1):
+    """LlmAttnPrep -> per group LlmAttnScores / LlmAttnSoftmax / LlmAttnPV ->
+    LlmAttnMerge over DMA-state caches (group-major) holding random rows,
+    output pv (DMA) — one layer of the frontend's FPGA prefill attention."""
+    rng = np.random.default_rng(seed)
+    G = H // KV
+    half = HD // 2
+    cos = rng.uniform(-1, 1, (C, half)).astype(np.float32)
+    sin = rng.uniform(-1, 1, (C, half)).astype(np.float32)
+    fq = rng.integers(5, 8, H)
+    fk = rng.integers(7, 9, KV)
+    fvc = rng.integers(6, 9, KV * HD)
+    grp = np.arange(H) // G
+    fs = fq + fk[grp] - 8
+    fp = np.full(H, 12)
+    fpv = (fp[:, None] + fvc.reshape(KV, HD)[grp] - 8).reshape(-1)
+    ck0 = np.round(rng.normal(0, 900, (C, KV * HD))) / 2.0 ** np.repeat(fk, HD)
+    cv0 = np.round(rng.normal(0, 900, (C, KV * HD))) / 2.0 ** fvc
+    common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=16 * vk)
+    nodes = [node("LlmAttnPrep", ["q", "k", "v", "pos", "n", "ck", "cv", "cos", "sin"], ["qx"],
+                  qk_kw=kw, q_exp=[int(x) for x in fq], **common)]
+    nodes[0].name = "prep"
+
+    def qk(g):
+        nd = node("LlmAttnScores", ["ck", "qx", "pos", "n"], [f"s{g}"], group=g, qk_kw=kw, **common)
+        nd.name = f"qk{g}"
+        nodes.append(nd)
+
+    def sm_pv(g):
+        hs = slice(g * G, (g + 1) * G)
+        a = node("LlmAttnSoftmax", [f"s{g}", "pos", "n"], [f"p{g}"], group=g,
+                 s_exp=[int(x) for x in fs[hs]], p_exp=[int(x) for x in fp[hs]], **common)
+        b = node("LlmAttnPV", [f"p{g}", "cv", "pos", "n"], [f"o{g}"], group=g, **common)
+        a.name, b.name = f"sm{g}", f"pv{g}"
+        nodes.extend([a, b])
+        return a, b
+    if order == "pipelined":               # the frontend's order (src/llama.py)
+        qk(0)
+        if KV > 1:
+            qk(1)
+        sm_pv(0)
+        for g in range(1, KV):
+            a, b = sm_pv(g)
+            if g + 1 < KV:
+                nodes.pop(), nodes.pop()
+                nodes.append(a)
+                qk(g + 1)
+                nodes.append(b)
+    else:
+        for g in range(KV):
+            qk(g)
+            sm_pv(g)
+    nodes.append(node("LlmAttnMerge", [f"o{g}" for g in range(KV)], ["pv"], num_heads=H,
+                      num_kv_heads=KV, head_dim=HD))
+    meta = {"host": {"pos": "i32", "n": "i32"}, "state": ["ck", "cv"],
+            "layout": {"ck": [KV, HD], "cv": [KV, HD] + ([vk] if vk > 1 else [])},
+            "exp": {"q": exps(H * HD, 10, 12), "k": exps(KV * HD, 10, 12),
+                    "v": exps(KV * HD, 10, 12), "ck": np.repeat(fk, HD).tolist(),
+                    "cv": fvc.tolist(), "pv": fpv.tolist(), "qx": 0,
+                    **{f"{x}{g}": 0 for x in "spo" for g in range(KV)}},
+            "test_fill": {"pos": pos, "n": T - 1 if n is None else n}}
+    vis = ([vi("qx", F32, [KV, HD, G * T])]
+           + [vi(f"s{g}", F32, [C, G * T]) for g in range(KV)]
+           + [vi(f"p{g}", F32, [G * T, C]) for g in range(KV)]
+           + [vi(f"o{g}", F32, [G * T, HD]) for g in range(KV)])
+    inits = [nph.from_array(ck0.astype(np.float32), "ck"),
+             nph.from_array(cv0.astype(np.float32), "cv"),
+             nph.from_array(cos, "cos"), nph.from_array(sin, "sin")]
+    ins = [vi("q", F32, [T, H * HD]), vi("k", F32, [T, KV * HD]), vi("v", F32, [T, KV * HD]),
+           vi("pos", I32, [1]), vi("n", I32, [1])]
+    return model(nodes, ins, [vi("pv", F32, [T, H * HD])], inits, meta, vis)
+
+
+class TestFpgaAttention(unittest.TestCase):
+    """The FPGA prefill attention chain: C (software ConvKernel for the two
+    runtime-dimension calls) == simulation, the simulation == an independent
+    float computation of the p12 formulas, keys16, the exp tables."""
+
+    def test_chain_on_host(self):
+        cases = ({}, {"kw": 2}, {"kw": 4}, {"pos": 1, "n": 8}, {"pos": 40, "n": 3},
+                 {"H": 8, "KV": 4, "T": 40, "kw": 2},     # 4 groups, row blocks of 16 + 8
+                 {"pos": 44, "n": 8},                     # context clamp: 4 rows, keys = C
+                 {"n": 0}, {"H": 4, "KV": 4, "HD": 32, "kw": 2},
+                 {"H": 3, "KV": 1, "T": 16, "order": "serial"},
+                 # the V cache as the P.V conv's 1 x K image (key quantum 16K)
+                 {"vk": 4, "C": 128, "pos": 70, "kw": 2}, {"vk": 2, "C": 64, "pos": 3},
+                 {"vk": 4, "C": 64, "pos": 60, "n": 8})   # clamp with K = 4
+        for kw in cases:
+            with self.subTest(**kw):
+                emulate(self, fpga_attention_model(**kw), "fpga_attn", incoherent=True)
+
+    def test_chain_semantics(self):
+        """sim of the chain == the p12 attention written independently (the
+        llm_study.Model policy pow2+sink+p12 formulas) on random rows."""
+        T, H, KV, HD, C, pos, n = 8, 6, 2, 64, 64, 5, 6
+        m = fpga_attention_model(T=T, H=H, KV=KV, HD=HD, C=C, pos=pos, n=n, kw=2, vk=4)
+        cg = CodeGenerator(OnnxGraph(m), model_path="c.onnx")
+        g = cg._graph
+        meta = json.loads(m.metadata_props[0].value)
+        prep = g.nodes[0]
+        states = cg.initial_states()
+        ck0, cv0 = states["ck"].copy(), states["cv"].copy()
+        q = RNG.integers(-2000, 2000, (T, H * HD)) / 2.0 ** np.asarray(meta["exp"]["q"])
+        k = RNG.integers(-2000, 2000, (T, KV * HD)) / 2.0 ** np.asarray(meta["exp"]["k"])
+        v = RNG.integers(-2000, 2000, (T, KV * HD)) / 2.0 ** np.asarray(meta["exp"]["v"])
+        out = cg._forward_pass({"q": q, "k": k, "v": v, "pos": np.array([pos]),
+                                "n": np.array([n])}, states=states)["pv"]
+        # independent: caches, then per head q.K^T (floor), softmax p12, P.V (floor)
+        ck, cv = states["ck"], states["cv"]
+        fk = np.asarray(meta["exp"]["ck"])
+        fvc = np.asarray(meta["exp"]["cv"])
+        for t in range(n):
+            kr = rope(k[t].reshape(KV, HD), prep.cos[pos + t], prep.sin[pos + t]).reshape(-1)
+            np.testing.assert_array_equal(ck[pos + t], Q.quantize_exp(kr, fk))
+            np.testing.assert_array_equal(cv[pos + t], Q.quantize_exp(v[t], fvc))
+        np.testing.assert_array_equal(ck[:pos], ck0[:pos])
+        np.testing.assert_array_equal(ck[pos + n:], ck0[pos + n:])
+        G, S = H // KV, pos + n
+        fq = prep.fq
+        fpv = np.asarray(meta["exp"]["pv"]).reshape(H, HD)
+        for t in range(n):
+            for h in range(H):
+                gq = h // G
+                qr = rope(q[t].reshape(H, HD)[h], prep.cos[pos + t], prep.sin[pos + t])
+                qraw = np.clip(np.round(qr * 2.0 ** fq[h]), -32768, 32767)
+                kraw = ck[:pos + t + 1, gq * HD:(gq + 1) * HD] * 2.0 ** fk[gq * HD]
+                sraw = np.floor(kraw @ qraw / 256.0)
+                fs = int(fq[h] + fk[gq * HD] - 8)
+                kk = (sraw.max() - sraw).astype(int)
+                e = np.array([math.exp(-x / 2.0 ** fs * (1 / math.sqrt(HD))) for x in kk])
+                praw = np.round(e / np.cumsum(e)[-1] * 4096.0)
+                vraw = cv[:pos + t + 1, gq * HD:(gq + 1) * HD] * 2.0 ** fvc[gq * HD:(gq + 1) * HD]
+                o = np.clip(np.floor(praw @ vraw / 256.0), -32768, 32767)
+                np.testing.assert_array_equal(out[t].reshape(H, HD)[h], o / 2.0 ** fpv[h])
+        self.assertTrue((out[n:] == 0).all())
+        del S
+
+    def test_runtime_geometry(self):
+        """The q.K^T / P.V calls' registers: keys16 goes into out_ch / in_ch,
+        the rest is fixed at codegen; the plan's estimates favour ConvKernel."""
+        cg = CodeGenerator(OnnxGraph(fpga_attention_model(T=16, kw=2)), model_path="g.onnx")
+        convs = [sn for sn in cg._graph.nodes if isinstance(sn, LlmAttnConvNode)]
+        self.assertEqual([sn.kind for sn in convs], ["qk", "qk", "pv", "pv"])
+        src = cg.generate_source()
+        for sn in convs:
+            call = sn.emit_call({})
+            self.assertIn("llm_keys((unsigned)pos[0], (unsigned)n[0], 16u, 48u, 16u)", call)
+            self.assertIn(call, src)
+            for keys, conv, mm in sn.est_cycles:
+                self.assertLess(conv, mm, (sn.kind, keys))
+        qk, pv = convs[0], convs[2]
+        self.assertIn("1u, 32u, ", qk.conv_regs("_keys"))                 # in_ch = HD / kw
+        self.assertIn("_keys, ", qk.conv_regs("_keys").split("\n")[1])    # out_ch
+        self.assertTrue(pv.conv_regs("_keys").startswith("1u, _keys, 1u, 64u"))
+        self.assertEqual((pv.out_h, pv.out_w), (1, 64))
+
+    def test_v_interleave_layout(self):
+        """The V cache image (group_kw = K) is exactly the ConvKernel x image
+        of a 1 x K lowered MatMul whose B is the group's rows
+        (nodes.conv_lowered_b_image), and the P.V node uses kernel width K."""
+        from src.nodes import conv_lowered_b_image
+        C, HD, KV = 128, 64, 2
+        for K in (1, 2, 4):
+            rows = np.arange(C * HD).reshape(C, HD)
+            img = conv_lowered_b_image(rows, C, HD, K)          # [C/K][HD*K] flat
+            for g in range(KV):
+                for k in (0, 1, 15, 16, 17, 63, 64, 100, 127):
+                    base = v_row_base(C, HD, K, g, k) - g * C * HD
+                    for d in (0, 1, 63):
+                        self.assertEqual(img[base + d * K], rows[k, d], (K, g, k, d))
+        cg = CodeGenerator(OnnxGraph(fpga_attention_model(C=64, vk=4)), model_path="v.onnx")
+        pv = [sn for sn in cg._graph.nodes if isinstance(sn, LlmAttnConvNode) and sn.kind == "pv"]
+        self.assertTrue(all(sn.kw == 4 and sn.Q == 64 for sn in pv))
+        self.assertIn("_keys / 4u", pv[0].conv_regs("_keys"))
+        self.assertIn("rows interleaved x4", cg.generate_source())
+
+    def test_keys_c_equals_python(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "k.c")
+            with open(src, "w") as f:
+                f.write("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
+                        "#include <string.h>\n#include <math.h>\ntypedef uint16_t Data_t;\n"
+                        + HOST_C_POOL + llm_c_helpers() +
+                        "int main(void) {\n    unsigned p, n, T, q;\n"
+                        "    for (q = 16; q <= 64; q *= 2) for (T = 1; T <= 40; T += 13)"
+                        " for (p = 0; p <= 70; p++) for (n = 0; n <= 45; n++)\n"
+                        "        printf(\"%u\\n\", llm_keys(p, n, T, 64u, q));\n    return 0;\n}\n")
+            exe = os.path.join(td, "k")
+            r = subprocess.run([host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Werror",
+                                "-Wno-unused-function", "-pthread", src, "-lm", "-o", exe],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            c = [int(x) for x in subprocess.run([exe], capture_output=True,
+                                                text=True).stdout.split()]
+            py = [attn_keys(p, n, T, 64, q)[1] for q in (16, 32, 64) for T in range(1, 41, 13)
+                  for p in range(71) for n in range(46)]
+            self.assertEqual(c, py)
+            self.assertTrue(all(KEY_QUANTUM <= k <= 64 and k % KEY_QUANTUM == 0 for k in py))
+
+    def test_sexp_tables(self):
+        """The softmax exp tables (C fill over 4 threads == Python), all
+        65 536 entries, for the score exponents and head dims in use."""
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "sexp.c")
+            with open(src, "w") as f:
+                f.write("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
+                        "#include <string.h>\n#include <math.h>\ntypedef uint16_t Data_t;\n"
+                        + HOST_C_POOL + llm_c_helpers() +
+                        "int main(int argc, char **argv) {\n"
+                        "    int f = atoi(argv[1]); double sc = atof(argv[2]);\n"
+                        "    if (host_pool_init() != 0 || llm_sexp_table(f, sc) != 0) return 1;\n"
+                        "    fwrite(_llm_sexp_tab[f - LLM_SEXP_EMIN], sizeof(double), 65536u, stdout);\n"
+                        "    llm_sexp_free(f); host_pool_deinit(); return 0;\n}\n")
+            exe = os.path.join(td, "sexp")
+            r = subprocess.run([host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Werror",
+                                "-Wno-unused-function", "-pthread", "-ffp-contract=off", src,
+                                "-lm", "-o", exe], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for f, hd in ((5, 64), (6, 64), (8, 64), (9, 16), (7, 80)):
+                sc = 1.0 / math.sqrt(hd)
+                with self.subTest(f=f, hd=hd):
+                    out = subprocess.run([exe, str(f), repr(sc)], capture_output=True,
+                                         env=dict(os.environ, INFERENCE_HOST_THREADS="4"))
+                    c = np.frombuffer(out.stdout, np.float64)
+                    np.testing.assert_array_equal(c.view(np.uint64),
+                                                  sexp_table(f, sc).view(np.uint64))
 
 
 class TestSiluTableExhaustive(unittest.TestCase):

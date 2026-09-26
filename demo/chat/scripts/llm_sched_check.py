@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Phase-3 gate 2 (doc/CHAT_PLAN.md): the inference scheduler's fixed-point
-simulation of SmolLM2-135M must equal the study's emulation of the shipped
-policy (llm_study.py pow2+sink+p12+xattn) BIT FOR BIT on the logits — for a
-prefill of real chat prompts and greedy decode steps.
+"""Phase-3 / phase-5 gate 2 (doc/CHAT_PLAN.md §13, §16): the inference
+scheduler's fixed-point simulation of SmolLM2-135M must equal the study's
+emulation of the shipped policy BIT FOR BIT on the logits — for a prefill of
+real chat prompts and greedy decode steps, and for a SECOND TURN (the next
+user message prefilled at position > 1 on top of the decoded answer).  The
+policy follows --prefill-attn: "fpga" (default) = llm_study.py
+pow2+sink+p12+mix (FPGA prefill attention, xattn decode), "host" =
+pow2+sink+p12+xattn (phase 3).
 
 The scheduler side is exactly what the generated library computes: the
 frontend's entry graphs (src/llama.py) through OnnxGraph + CodeGenerator's
@@ -16,7 +20,7 @@ float32 — exact); the greedy tokens follow.
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_sched_check.py
            [--prompts factual,code,multi-turn] [--decode 32] [--buckets 16,64,256]
-           [--save out.json]
+           [--second-turn factual] [--prefill-attn fpga|host] [--save out.json]
 """
 import argparse
 import json
@@ -33,9 +37,7 @@ import llm_project as lp                                   # noqa: E402
 import llm_study as study                                  # noqa: E402
 
 DEFAULT_PROMPTS = "factual,summarise,multi-turn"
-
-
-def study_model(W, fd, cfg):
+def study_model(W, fd, cfg, policy=None):
     """llm_study.Model of the shipped policy with the formats JSON."""
     sc = study.Cfg.__new__(study.Cfg)
     sc.L, sc.D, sc.H, sc.KV, sc.F, sc.V, sc.HD = cfg.L, cfg.D, cfg.H, cfg.KV, cfg.FF, cfg.V, cfg.HD
@@ -45,7 +47,7 @@ def study_model(W, fd, cfg):
         c, l = k.split("@")
         fmt[(c, int(l))] = v if isinstance(v, int) else np.asarray(v, np.int64)
     fm = study.Model(W, sc, None)
-    return study.Model(W, sc, study.POLICIES[lp.POLICY], fmt, sink_model=fm), sc
+    return study.Model(W, sc, study.POLICIES[policy or lp.POLICY], fmt, sink_model=fm), sc
 
 
 def main():
@@ -55,16 +57,23 @@ def main():
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
     ap.add_argument("--assets", default=None)
     ap.add_argument("--formats", default=None)
+    ap.add_argument("--second-turn", default="factual",
+                    help="prompts continued by a second turn after their decode steps "
+                         "(comma list, '' = none)")
+    ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN)
     ap.add_argument("--save", default=None, help="write tokens / logits checksums as JSON")
     args = ap.parse_args()
     t0 = time.time()
     buckets = tuple(int(b) for b in args.buckets.split(","))
     ids = lp.tokenize_prompts(args.prompts.split(","))
+    turn2 = lp.second_turn_ids() if args.second_turn else []
+    cont = set(filter(None, args.second_turn.split(",")))
+    policy = lp.POLICIES[args.prefill_attn]
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt)
+    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn)
     cgs = {name: lp.make_codegen(m, name) for name, m in lp.entry_models(fe, buckets).items()}
-    sm, sc = study_model(W, fd, cfg)
-    print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {lp.POLICY}, "
+    sm, sc = study_model(W, fd, cfg, policy)
+    print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "
           f"weights saturated {sum(sum(cg._graph.weights_saturated.values()) for cg in cgs.values())}",
           flush=True)
     bad, report = 0, {}
@@ -72,29 +81,42 @@ def main():
         t1 = time.time()
         assert toks[0] == 1, "chat prompts start with <|im_start|> (the sink)"
         sess = lp.SimSession(cgs, buckets=buckets)
-        seq = study.Seq(sc, len(toks) + args.decode + 1)
-        a = sess.prefill(toks[1:])
-        b = sm.forward([seq], [np.asarray(toks, np.int64)])[0][-1]
-        steps, gen = [], []
-        for step in range(args.decode + 1):
-            eq = np.array_equal(a, b)
-            steps.append((eq, float(np.abs(a - b).max())))
-            if not eq:
-                break
-            nxt = int(np.argmax(a))
-            gen.append(nxt)
-            if step == args.decode:
-                break
-            a = sess.decode(nxt)
-            b = sm.forward([seq], [np.array([nxt])])[0][-1]
-        ok = all(e for e, _ in steps) and len(steps) == args.decode + 1
-        bad += not ok
-        first_bad = next((i for i, (e, _) in enumerate(steps) if not e), None)
-        print(f"[{name}] prompt {len(toks)} tokens, {len(steps) - 1} decode steps: "
-              f"{'BIT-EXACT' if ok else f'MISMATCH at step {first_bad} (max |diff| {steps[first_bad][1]})'}"
-              f"  ({time.time() - t1:.0f} s)  greedy ids {gen[:12]}{'...' if len(gen) > 12 else ''}",
-              flush=True)
-        report[name] = {"prompt_tokens": len(toks), "generated": gen, "bit_exact": ok}
+        seq = study.Seq(sc, len(toks) + len(turn2) + 2 * args.decode + 2)
+        rec = {"prompt_tokens": len(toks)}
+        turns = [("prompt", toks[1:])] + ([("turn2", turn2)] if name in cont else [])
+        ok_all = True
+        for ti, (tname, tt) in enumerate(turns):
+            pos0 = sess.pos
+            a = sess.prefill(tt)
+            b = sm.forward([seq], [np.asarray(([1] if ti == 0 else []) + list(tt), np.int64)])[0][-1]
+            steps, gen = [], []
+            for step in range(args.decode + 1):
+                eq = np.array_equal(a, b)
+                steps.append((eq, float(np.abs(a - b).max())))
+                if not eq:
+                    break
+                nxt = int(np.argmax(a))
+                gen.append(nxt)
+                if step == args.decode:
+                    break
+                a = sess.decode(nxt)
+                b = sm.forward([seq], [np.array([nxt])], phase="decode")[0][-1]
+            ok = all(e for e, _ in steps) and len(steps) == args.decode + 1
+            ok_all &= ok
+            first_bad = next((i for i, (e, _) in enumerate(steps) if not e), None)
+            split = lp.split_prefill(len(tt), buckets)
+            print(f"[{name}/{tname}] prefill {len(tt)} tokens at position {pos0} "
+                  f"(calls {' + '.join(f'{k}/{B}' for k, B in split)}), {len(steps) - 1} decode "
+                  f"steps: "
+                  f"{'BIT-EXACT' if ok else f'MISMATCH at step {first_bad} (max |diff| {steps[first_bad][1]})'}"
+                  f"  ({time.time() - t1:.0f} s)  greedy ids {gen[:12]}{'...' if len(gen) > 12 else ''}",
+                  flush=True)
+            if ti == 0:
+                rec.update(generated=gen, bit_exact=ok)
+            else:
+                rec.update(turn2_tokens=len(tt), turn2_generated=gen, turn2_bit_exact=ok)
+        bad += not ok_all
+        report[name] = rec
     print(f"{len(ids) - bad}/{len(ids)} prompts bit-exact ({time.time() - t0:.0f} s)")
     if args.save:
         with open(args.save, "w") as f:

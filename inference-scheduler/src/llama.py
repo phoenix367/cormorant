@@ -26,9 +26,20 @@ Entries (T = rows per call, C = context incl. the position-0 sink):
 ``pos`` is the cache position of the first new token (the number of
 positions already filled, >= 1: row 0 is the sink), ``n <= T`` the number of
 valid rows of a padded prefill (rows >= n are computed but write nothing
-and are never read).  The KV caches (``kv.k.l<i>`` / ``kv.v.l<i>``,
-[C][KV*HD] raw int16 host states) start with the sink row: the float run
-of the position-0 token, rounded at the cache exponents (formats JSON).
+and are never read).  The KV caches (``kv.k.l<i>`` / ``kv.v.l<i>``, logical
+[C][KV*HD] raw int16 states stored group-major [KV][C][HD]) start with the
+sink row: the float run of the position-0 token, rounded at the cache
+exponents (formats JSON).
+
+Attention (``prefill_attn``):
+  "fpga" (default, policy pow2+sink+p12+mix, doc/CHAT_PLAN.md §16): decode
+         steps run the xattn host region (LlmAttention); prefill runs q.K^T
+         and P.V on ConvKernel per KV group with the p12 host softmax
+         (LlmAttnPrep / LlmAttnScores / LlmAttnSoftmax / LlmAttnPV /
+         LlmAttnMerge) over keys16 = roundup(pos + n, 16) keys — a runtime
+         dimension.  The caches are DMA states in the CMA pool.
+  "host" (phase 3, pow2+sink+p12+xattn): LlmAttention everywhere, the caches
+         host-memory i16 states.
 """
 
 from __future__ import annotations
@@ -195,12 +206,29 @@ class LlamaFrontend:
     tensors by Hugging Face name (float32), ``formats``: see Formats."""
 
     def __init__(self, cfg: LlamaConfig, weights: Dict[str, np.ndarray], formats: Formats,
-                 ctx: int = 1024, name: str = "llama"):
+                 ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
+                 qk_kw: Optional[int] = None, pv_kw: Optional[int] = None):
         self.cfg = cfg
         self.W = weights
         self.fmt = formats
         self.C = int(ctx)
         self.name = name
+        if prefill_attn not in ("fpga", "host"):
+            raise ValueError(f"prefill_attn must be 'fpga' or 'host', got {prefill_attn!r}")
+        self.prefill_attn = prefill_attn
+        self.qk_kw = qk_kw
+        # The V cache's interleave K = the P.V call's kernel width: the cache
+        # is stored as that conv's input image, so each P row of a weight slab
+        # is one 16K-lane request (K = 4: 2.3-2.6x faster P.V on the board than
+        # K = 1, CHAT_PLAN §16).  Needs context % 16K == 0; host mode: 1.
+        if pv_kw is None:
+            pv_kw = next(k for k in (4, 2, 1) if self.C % (16 * k) == 0) \
+                if prefill_attn == "fpga" else 1
+        if self.C % (16 * int(pv_kw)):
+            raise ValueError(f"pv_kw {pv_kw}: context {self.C} must be a multiple of {16 * pv_kw}")
+        self.pv_kw = int(pv_kw)
+        if prefill_attn == "fpga" and self.C % 16:
+            raise ValueError(f"FPGA prefill attention: context {self.C} must be a multiple of 16")
         if formats.sink_k is None or formats.sink_v is None:
             raise ValueError("formats: sink_k_raw / sink_v_raw missing (policy with a sink)")
         self._cos, self._sin = rope_tables(cfg, self.C)
@@ -286,6 +314,90 @@ class LlamaFrontend:
                    axi_eps=repr(float(self.cfg.eps)))
         return y
 
+    def choose_qk_kw(self, T: int) -> int:
+        """Kernel width of the q.K^T calls' q image (the frontend writes the
+        image, so any kw with head_dim % (16 kw) == 0 is free): the cheapest
+        by cost_model.conv_cycles at C / 2 keys."""
+        if self.qk_kw is not None:
+            return int(self.qk_kw)
+        from .cost_model import conv_cycles
+        c = self.cfg
+        M = (c.H // c.KV) * T
+        keys = max(16, (self.C // 2) // 16 * 16)
+        best = None
+        for kw in (1, 2, 4):
+            if c.HD % (16 * kw):
+                continue
+            for ow in [d for d in range(8, 65) if M % d == 0] or [M]:
+                cyc = conv_cycles(in_ch=c.HD // kw, out_ch=keys, in_h=M // ow, in_w=kw * ow,
+                                  oh=M // ow, ow=ow, kh=1, kw=kw, sw=kw)["total"]
+                if best is None or cyc < best[0]:
+                    best = (cyc, kw)
+        return best[1]
+
+    def _caches(self, l):
+        c, fm = self.cfg, self.fmt
+        host = "i16" if self.prefill_attn == "host" else None
+        kc = self._t(f"kv.k.l{l}", [self.C, c.KV * c.HD], exp=fm.k_cache(l), host=host, state=True)
+        vc = self._t(f"kv.v.l{l}", [self.C, c.KV * c.HD], exp=fm.v_cache(l), host=host, state=True)
+        self._meta["layout"][kc] = [c.KV, c.HD]
+        self._meta["layout"][vc] = [c.KV, c.HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
+        self._init(kc, self._cache_init(l, "k"))
+        self._init(vc, self._cache_init(l, "v"))
+        return kc, vc
+
+    def _fpga_attention(self, l, q0, k0, v, T, pos, n, kc, vc):
+        """Per layer: LlmAttnPrep, then per KV group q.K^T (ConvKernel), the
+        p12 softmax (host) and P.V (ConvKernel), then LlmAttnMerge.  Node
+        order q.K^T 0, q.K^T 1, softmax 0, P.V 0, then per group g >= 1
+        softmax g, q.K^T g+1, P.V g: the ConvKernel runs one call at a time
+        and the host issues them in order, so each softmax follows a call it
+        can hide behind — softmax 0 the short q.K^T 1, every later one the
+        long P.V of the previous group."""
+        c, fm, e = self.cfg, self.fmt, self._e
+        G, KV, HD, H = c.H // c.KV, c.KV, c.HD, c.H
+        grp = np.arange(H) // G
+        fq = fm.heads("q", l, H)
+        fk = fm.heads("k", l, KV)
+        fs = (fm.heads("s", l, H) if f"s@{l}" in fm.exp else fq + fk[grp] - F)
+        fp = fm.heads("p", l, H)
+        kw = self.choose_qk_kw(T)
+        common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=16 * self.pv_kw)
+        qx = self._t(f"{e}.l{l}.qx", [KV, HD, G * T], exp=0)
+        self._node("LlmAttnPrep", [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"], [qx],
+                   f"{e}.l{l}.attn_prep", domain=LLM_DOMAIN, qk_kw=kw,
+                   q_exp=[int(x) for x in fq], **common)
+        s = [self._t(f"{e}.l{l}.s{g}", [self.C, G * T], exp=0) for g in range(KV)]
+        p = [self._t(f"{e}.l{l}.p{g}", [G * T, self.C], exp=0) for g in range(KV)]
+        o = [self._t(f"{e}.l{l}.o{g}", [G * T, HD], exp=0) for g in range(KV)]
+
+        def qk(g):
+            self._node("LlmAttnScores", [kc, qx, pos, n], [s[g]], f"{e}.l{l}.qk{g}",
+                       domain=LLM_DOMAIN, group=g, qk_kw=kw, **common)
+        def softmax(g):
+            hs = slice(g * G, (g + 1) * G)
+            self._node("LlmAttnSoftmax", [s[g], pos, n], [p[g]], f"{e}.l{l}.softmax{g}",
+                       domain=LLM_DOMAIN, group=g, s_exp=[int(x) for x in fs[hs]],
+                       p_exp=[int(x) for x in fp[hs]], **common)
+
+        def pv_(g):
+            self._node("LlmAttnPV", [p[g], vc, pos, n], [o[g]], f"{e}.l{l}.pv{g}",
+                       domain=LLM_DOMAIN, group=g, **common)
+        qk(0)
+        if KV > 1:
+            qk(1)
+        softmax(0)
+        pv_(0)
+        for g in range(1, KV):
+            softmax(g)
+            if g + 1 < KV:
+                qk(g + 1)
+            pv_(g)
+        pv = self._t(f"{e}.l{l}.pv", [T, H * HD], exp=fm.pv(l))
+        self._node("LlmAttnMerge", o, [pv], f"{e}.l{l}.attn_merge", domain=LLM_DOMAIN,
+                   num_heads=H, num_kv_heads=KV, head_dim=HD)
+        return pv
+
     def _layers(self, h, T, pos, n):
         c, fm, e = self.cfg, self.fmt, self._e
         self._init("rope.cos", self._cos)
@@ -296,16 +408,15 @@ class LlamaFrontend:
             q0 = self._matmul(l, "q", x, T, fm.get("q0", l, c.H * c.HD))
             k0 = self._matmul(l, "k", x, T, fm.get("k0", l, c.KV * c.HD))
             v = self._matmul(l, "v", x, T, fm.get("v", l, c.KV * c.HD))
-            kc = self._t(f"kv.k.l{l}", [self.C, c.KV * c.HD], exp=fm.k_cache(l), host="i16",
-                         state=True)
-            vc = self._t(f"kv.v.l{l}", [self.C, c.KV * c.HD], exp=fm.v_cache(l), host="i16",
-                         state=True)
-            self._init(kc, self._cache_init(l, "k"))
-            self._init(vc, self._cache_init(l, "v"))
-            pv = self._t(f"{e}.l{l}.pv", [T, c.H * c.HD], exp=fm.pv(l))
-            self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc, "rope.cos", "rope.sin"],
-                       [pv], f"{e}.l{l}.attn", domain=LLM_DOMAIN,
-                       num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
+            kc, vc = self._caches(l)
+            if n is not None and self.prefill_attn == "fpga":
+                pv = self._fpga_attention(l, q0, k0, v, T, pos, n, kc, vc)
+            else:
+                pv = self._t(f"{e}.l{l}.pv", [T, c.H * c.HD], exp=fm.pv(l))
+                self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc, "rope.cos",
+                                            "rope.sin"],
+                           [pv], f"{e}.l{l}.attn", domain=LLM_DOMAIN,
+                           num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
             o = self._matmul(l, "o", pv, T, fm.get("o", l, c.D))
             h1 = self._t(f"{e}.l{l}.h1", [T, c.D], host="f32")
             self._node("LlmResAdd", [h, o], [h1], f"{e}.l{l}.res_attn", domain=LLM_DOMAIN)
@@ -381,6 +492,7 @@ class LlamaFrontend:
         p = m.metadata_props.add()
         p.key = "axi.llm.entry"
         p.value = json.dumps({"entry": ename, "model": self.name, "context": self.C,
+                              "prefill_attn": self.prefill_attn, "pv_kw": self.pv_kw,
                               "layers": self.cfg.L, "hidden": self.cfg.D, "heads": self.cfg.H,
                               "kv_heads": self.cfg.KV, "head_dim": self.cfg.HD,
                               "vocab": self.cfg.V})

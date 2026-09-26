@@ -15,7 +15,13 @@ test/test_inference.c are compiled unchanged against
     default: host ops work in place in the buffers; 0 exercises the
     non-cacheable staging path).  sync_to_device / sync_from_device are
     no-ops here (``test_host_ops.TestCoherency`` checks the emitted sync
-    sequence instead).
+    sequence instead) — unless ``incoherent=True`` (-DEMU_INCOHERENT): then
+    every allocation has a separate "DDR" copy that the kernels read and
+    write (phys) next to the CPU's copy (virt), a flush writes the bytes the
+    CPU changed since its last sync (the dirty data of a write-back cache)
+    into DDR and an invalidate reloads the CPU copy from DDR — so a missing
+    or too-narrow sync (e.g. a DMA state's row range) makes a kernel read
+    stale data or the CPU read a stale result, and the outputs differ.
 
 The harness fills the inputs, runs inference_run() and compares every output
 bit for bit with the scheduler simulation's expected arrays, exactly as on
@@ -52,6 +58,22 @@ void inference_buf_init_view(inference_buf_t *v, inference_buf_t *base,
 }
 int  inference_buf_pool_init(void)   { return 0; }
 void inference_buf_pool_deinit(void) {}
+#ifdef EMU_INCOHERENT
+/* CPU copy (virt), DDR copy (phys: what the kernels access) and the CPU copy
+ * as of its last sync (snap: bytes that differ are the CPU's dirty data). */
+typedef struct { unsigned char *cpu, *ddr, *snap; size_t bytes; } emu_alloc_t;
+static emu_alloc_t emu_allocs[4096];
+static unsigned    emu_nalloc;
+static emu_alloc_t *emu_find(const void *p)
+{
+    unsigned i;
+    for (i = 0; i < emu_nalloc; i++)
+        if (emu_allocs[i].cpu && (const unsigned char *)p >= emu_allocs[i].cpu
+                && (const unsigned char *)p < emu_allocs[i].cpu + emu_allocs[i].bytes)
+            return &emu_allocs[i];
+    return NULL;
+}
+#endif
 inference_buf_t *inference_buf_alloc(unsigned n)
 {
     size_t bytes = ((size_t)n * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
@@ -61,16 +83,62 @@ inference_buf_t *inference_buf_alloc(unsigned n)
     memset(m, 0xA5, bytes);            /* poison: nothing may rely on zeroed memory */
     b->virt = m; b->phys = (uint64_t)(uintptr_t)m; b->count = n;
     b->refcount = 1u; b->is_owner = 1u; b->cached = EMU_BUF_CACHED;
+#ifdef EMU_INCOHERENT
+    {
+        emu_alloc_t *a = NULL;
+        unsigned i;
+        for (i = 0; i < emu_nalloc && !a; i++)
+            if (!emu_allocs[i].cpu) a = &emu_allocs[i];
+        if (!a && emu_nalloc < 4096u) a = &emu_allocs[emu_nalloc++];
+        if (!a) { free(m); free(b); return NULL; }
+        a->bytes = bytes ? bytes : 64;
+        a->cpu = (unsigned char *)m;
+        a->ddr = (unsigned char *)malloc(a->bytes);
+        a->snap = (unsigned char *)malloc(a->bytes);
+        if (!a->ddr || !a->snap) return NULL;
+        memset(a->ddr, 0xA5, a->bytes);
+        memset(a->snap, 0xA5, a->bytes);
+        b->phys = (uint64_t)(uintptr_t)a->ddr;
+    }
+#endif
     return b;
 }
 void inference_buf_retain(inference_buf_t *b)  { if (b && b->is_owner) b->refcount++; }
 void inference_buf_release(inference_buf_t *b)
 {
-    if (b && b->is_owner && --b->refcount == 0u) { free(b->virt); free(b); }
+    if (b && b->is_owner && --b->refcount == 0u) {
+#ifdef EMU_INCOHERENT
+        emu_alloc_t *a = emu_find(b->virt);
+        if (a) { free(a->ddr); free(a->snap); memset(a, 0, sizeof *a); }
+#endif
+        free(b->virt); free(b);
+    }
 }
 void inference_buf_free(inference_buf_t *b) { inference_buf_release(b); }
+#ifdef EMU_INCOHERENT
+void inference_buf_sync_to_device(inference_buf_t *b)
+{
+    emu_alloc_t *a = emu_find(b->virt);
+    size_t o, i, n = (size_t)b->count * INFERENCE_BYTES_PER_ELEM;
+    if (!a) return;
+    o = (size_t)((unsigned char *)b->virt - a->cpu);
+    for (i = o; i < o + n && i < a->bytes; i++)
+        if (a->cpu[i] != a->snap[i]) { a->ddr[i] = a->cpu[i]; a->snap[i] = a->cpu[i]; }
+}
+void inference_buf_sync_from_device(inference_buf_t *b)
+{
+    emu_alloc_t *a = emu_find(b->virt);
+    size_t o, n = (size_t)b->count * INFERENCE_BYTES_PER_ELEM;
+    if (!a) return;
+    o = (size_t)((unsigned char *)b->virt - a->cpu);
+    if (o + n > a->bytes) n = a->bytes - o;
+    memcpy(a->cpu + o, a->ddr + o, n);
+    memcpy(a->snap + o, a->ddr + o, n);
+}
+#else
 void inference_buf_sync_to_device(inference_buf_t *b)   { (void)b; }
 void inference_buf_sync_from_device(inference_buf_t *b) { (void)b; }
+#endif
 void inference_buf_fill_float(inference_buf_t *b, const float *s, unsigned n)
 { unsigned i; for (i = 0; i < n; i++) ((Data_t *)b->virt)[i] = (Data_t)s[i]; }
 void inference_buf_read_float(const inference_buf_t *b, float *d, unsigned n)
@@ -255,7 +323,8 @@ def which_cc():
     return shutil.which("cc") or shutil.which("gcc")
 
 
-def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems=None):
+def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems=None,
+                  incoherent=False):
     """Write the project of CodeGenerator ``cg`` into ``workdir``, compile it
     against the software kernels and run test_inference.  Returns
     (returncode, combined output).
@@ -264,7 +333,9 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
                   (staging through s_host_stage);
     ``threads``   INFERENCE_HOST_THREADS for the run (None: the default, 4);
     ``min_elems`` -DINFERENCE_HOST_MIN_ELEMS (1 splits even tiny host ops
-                  over the threads)."""
+                  over the threads);
+    ``incoherent`` -DEMU_INCOHERENT: separate CPU / DDR copies, the syncs
+                  move the data (see the module docstring)."""
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
     for kd in cg._active_kernels:
@@ -309,6 +380,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
            "-Wno-unused-function", "-Wno-error=parentheses",
            f"-DEMU_TILE_M={MATMUL_TILE_M}", f"-DEMU_CONV_TILE_IC={CONV_TILE_IC}",
            f"-DEMU_BUF_CACHED={1 if cached else 0}",
+           *(["-DEMU_INCOHERENT"] if incoherent else []),
            *([f"-DINFERENCE_HOST_MIN_ELEMS={min_elems}u"] if min_elems else []), "-pthread",
            f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', f'-DINFERENCE_EXPECTED_DIR="{workdir}"',
            "-I", inc, "-I", emu,

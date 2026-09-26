@@ -32,8 +32,14 @@ from src.codegen import CodeGenerator                             # noqa: E402
 from src.graph import OnnxGraph                                   # noqa: E402
 from src.llama import Formats, LlamaConfig, LlamaFrontend, load_safetensors  # noqa: E402
 
-POLICY = "pow2+sink+p12+xattn"          # the shipped numeric policy (llm_study.py)
-FORMATS_POLICY = "pow2+sink+p12"        # its exponents (xattn uses the p12 formats)
+# The shipped numeric policy (llm_study.py) per prefill-attention mode of the
+# frontend (src/llama.py): "fpga" (phase 5, CHAT_PLAN §16) — q.K^T / P.V of the
+# prefill on ConvKernel with the p12 host softmax, decode attention the xattn
+# host region; "host" (phase 3) — xattn everywhere.
+POLICIES = {"fpga": "pow2+sink+p12+mix", "host": "pow2+sink+p12+xattn"}
+PREFILL_ATTN = "fpga"
+POLICY = POLICIES[PREFILL_ATTN]
+FORMATS_POLICY = "pow2+sink+p12"        # their exponents (both use the p12 formats)
 CONTEXT = 1024                          # positions incl. the sink (CHAT_PLAN decision)
 BUCKETS = (16, 64, 256)                 # prefill entries (rows per call)
 
@@ -72,8 +78,9 @@ def load_model(assets: Optional[str] = None, formats: Optional[str] = None):
     return cfg, W, Formats(fd, cfg), fd
 
 
-def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2") -> LlamaFrontend:
-    return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name)
+def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
+             prefill_attn: str = PREFILL_ATTN) -> LlamaFrontend:
+    return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn)
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[str, object]:
@@ -85,12 +92,14 @@ def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[st
     return out
 
 
-# Board cost of one prefill call per bucket, ms, without the host attention
-# (it covers only the valid rows, so it does not depend on the split) and the
-# head (run once per llm_prefill): KV260, 100 MHz, hw_128 bitstream, profiled
-# 2026-09-26 (CHAT_PLAN §13.4).  The ConvKernel MatMuls stream the weights
-# once per call, so a padded 64-row call costs little more than a 16-row one.
-BUCKET_COST_MS = {16: 304, 64: 364, 256: 930}
+# Board cost of one prefill call per bucket, ms, without the head (run once
+# per llm_prefill): KV260, 100 MHz, hw_128 bitstream, FPGA prefill attention
+# (CHAT_PLAN §16; a call at position 1, so the attention covers bucket + 1
+# keys), profiled 2026-09-26.  The ConvKernel MatMuls stream the weights once
+# per call, so a padded 64-row call costs little more than a 16-row one.
+# (Phase 3's host-attention table, CHAT_PLAN §13.4: {16: 304, 64: 364, 256: 930}
+# without the attention, which then covered only the valid rows.)
+BUCKET_COST_MS = {16: 326, 64: 427, 256: 1275}
 
 
 def bucket_costs(buckets: Sequence[int] = BUCKETS) -> List[int]:
@@ -198,6 +207,40 @@ class SimSession:
         out = self._run("decode", {"decode.ids": [int(token)], "decode.pos": [self.pos]})
         self.pos += 1
         return out["decode.logits"].reshape(-1)
+
+
+# A chat's second turn (phase 5 gates): appended to a prompt's decoded answer —
+# the answer's <|im_end|>, a new user message and the assistant header — and
+# prefilled at the position the decode steps reached.
+SECOND_TURN = [{"role": "user", "content": "Tell me one more fact about it."}]
+
+
+def second_turn_ids(cache: Optional[str] = None) -> List[int]:
+    """Token ids of "<|im_end|>\\n" + the SECOND_TURN user block + the
+    generation prompt (tokenized once with .venv-export's tokenizers, cached)."""
+    cache = cache or os.path.join(os.path.dirname(default_assets()), "study",
+                                  "phase5_second_turn_ids.json")
+    if not os.path.exists(cache):
+        code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
+                "t = s.Tok(s.default_assets()); "
+                "txt = '<|im_end|>\\n' + ''.join('<|im_start|>' + m['role'] + '\\n' + m['content'] "
+                "+ '<|im_end|>\\n' for m in %r) + '<|im_start|>assistant\\n'; "
+                "json.dump([int(i) for i in t.encode(txt)], open(%r, 'w'))"
+                % (HERE, SECOND_TURN, cache))
+        subprocess.run([EXPORT_PY, "-c", code], check=True)
+    with open(cache) as f:
+        return json.load(f)
+
+
+def with_second_turns(ids: Dict[str, List[int]], names: Sequence[str]) -> Dict[str, List[int]]:
+    """ids plus a "<name>/turn2" continuation right after each prompt in names."""
+    out: Dict[str, List[int]] = {}
+    t2 = second_turn_ids() if names else []
+    for n, t in ids.items():
+        out[n] = t
+        if n in names:
+            out[n + "/turn2"] = list(t2)
+    return out
 
 
 def tokenize_prompts(names: Optional[Sequence[str]] = None, cache: Optional[str] = None

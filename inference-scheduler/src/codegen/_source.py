@@ -9,8 +9,30 @@ from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulConvNode, MatmulNode, Schedul
                         SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
-from ..llm_nodes import RUNTIME_GROUPS, LlmNode, llm_c_helpers
+from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
+                         llm_c_helpers)
 from ._banners  import _banner, _file_banner
+
+
+# A group-major state [G][R][D] (TensorInfo.group_layout, rows interleaved by
+# K = group_kw) from its logical init image [rows][G*D] (the non-zero prefix,
+# whole rows).
+_STATE_SCATTER_C = """/* A group-major state [G][R][D] from its logical initial image [rows][G*D];
+ * K > 1: each group's rows interleaved as a 1 x K conv input image, row r,
+ * element d at ((r / 16K) * 16 + r % 16) * D*K + d*K + (r / 16) % K. */
+static void _state_scatter(int16_t *dst, const int16_t *init, unsigned rows,
+                           unsigned R, unsigned G, unsigned D, unsigned K)
+{
+    unsigned r, g, d;
+    for (r = 0u; r < rows; r++)
+        for (g = 0u; g < G; g++) {
+            int16_t *o = dst + (size_t)g * R * D
+                       + ((size_t)(r / (16u * K)) * 16u + r % 16u) * D * K + (r / 16u) % K;
+            for (d = 0u; d < D; d++)
+                o[(size_t)d * K] = init[((size_t)r * G + g) * D + d];
+        }
+}
+"""
 
 
 class _SourceMixin:
@@ -230,6 +252,8 @@ class _SourceMixin:
                 parts.append(host_c_helper(kind, lut))
         if "llm" in used:
             parts.append(llm_c_helpers())
+            if self._dma_states:
+                parts.append(LLM_C_DMA)
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))
@@ -351,8 +375,14 @@ class _SourceMixin:
             nc, ch, st = o_io
             lines.append(f"        out = host_out({sn.output.c_name}, s_host_stage + {o_off}u,"
                          f" {nc}u, {ch}u, {st}u);")
-        args = [f"in{staged[t.onnx_name][0]}" if t.onnx_name in staged else t.c_name
-                for t in sn.inputs]
+        args = []
+        for t in sn.inputs:
+            if t.onnx_name in staged:
+                args.append(f"in{staged[t.onnx_name][0]}")
+            elif t.is_state and not t.is_host:      # a DMA state, read / updated in place
+                args.append(f"(int16_t *)inference_buf_ptr({t.c_name})")
+            else:
+                args.append(t.c_name)
         out = "out" if not sn.output.is_host else sn.output.c_name
         for ln in sn.c_call(args, out, "NULL", [], self._dtype):
             lines.append("        " + ln)
@@ -419,11 +449,23 @@ class _SourceMixin:
         else:
             lines.append("/* (no intermediate buffers) */")
 
+        dma_states = self._dma_states
+        if dma_states:
+            lines.append("")
+            lines.append("/* DMA states (src/numeric.py): persistent buffers in the pool that host\n"
+                         " * ops write (flushing the rows a kernel reads) and kernels read */")
+            for t in dma_states:
+                lay = (f" group-major [{t.group_layout[0]}][{t.shape[0]}][{t.group_layout[1]}]"
+                       + (f" rows interleaved x{t.group_kw}" if t.group_kw > 1 else "")
+                       if t.group_layout else "")
+                lines.append(f"static inference_buf_t *{t.c_name} = NULL;"
+                             f"  /* STATE '{t.onnx_name}' {t.shape}{lay} */")
+
         # Pool pointer and static view-struct backing storage
         weights       = self._graph.weight_tensors
         reshape_aliases = self._reshape_aliases
         pool_tensors  = (
-            list(weights) +
+            list(weights) + list(dma_states) +
             [t for t in intermediates if t.onnx_name not in reshape_aliases]
         )
         if pool_tensors:
@@ -458,7 +500,8 @@ class _SourceMixin:
 
         host_t = self._graph.host_tensors
         states = self._graph.state_tensors
-        if host_t or states:
+        host_states = [t for t in states if t.is_host]
+        if host_t or host_states:
             lines.append("")
             lines.append("/* Host-memory tensors (src/numeric.py): never in a DMA buffer, only the\n"
                          " * host ops touch them.  Intermediates live in s_host_arena (slots reused\n"
@@ -468,16 +511,19 @@ class _SourceMixin:
             for t in host_t:
                 lines.append(f"static {self._host_c_type(t)} *{t.c_name} = NULL;"
                              f"  /* '{t.onnx_name}' {t.host} {t.shape} */")
-            for t in states:
-                if not t.is_host:
-                    raise SchedulerError(f"state '{t.onnx_name}': DMA states are not "
-                                         f"supported (declare it as a host tensor)")
+            for t in host_states:
+                lay = (f" group-major [{t.group_layout[0]}][{t.shape[0]}][{t.group_layout[1]}]"
+                       + (f" rows interleaved x{t.group_kw}" if t.group_kw > 1 else "")
+                       if t.group_layout else "")
                 lines.append(f"static {self._host_c_type(t)} *{t.c_name} = NULL;"
-                             f"  /* STATE '{t.onnx_name}' {t.host} {t.shape} */")
+                             f"  /* STATE '{t.onnx_name}' {t.host} {t.shape}{lay} */")
+        if states:
             for t in states:
                 pre = self._state_init_prefix(t)
                 if pre is not None:
                     lines.append(pre[0])
+            if any(t.group_layout and self._state_init_prefix(t) is not None for t in states):
+                lines.append(_STATE_SCATTER_C)
 
         if self._host_nodes:
             n = self._host_stage_elems
@@ -495,7 +541,8 @@ class _SourceMixin:
 
     def _state_init_prefix(self, t):
         """(C declaration, element count) of the raw image of a state's
-        non-zero prefix (its initial value), or None when it starts at 0."""
+        non-zero prefix (its initial value, LOGICAL order — whole rows for a
+        group-major state, which init scatters), or None when it starts at 0."""
         if t.init_data is None:
             return None
         v = np.asarray(t.init_data, np.float64).reshape(-1)
@@ -503,7 +550,10 @@ class _SourceMixin:
         if nz.size == 0:
             return None
         n = int(nz[-1]) + 1
-        if t.host == "i16":
+        if t.group_layout:
+            row = int(t.shape[1])
+            n = -(-n // row) * row
+        if t.host == "i16" or not t.is_host:
             raw = self._dtype.exp_to_storage(
                 v[:n], t.exp_full(self._dtype.frac_bits).reshape(-1)[:n]).view(np.int16)
             lits = [str(int(x)) for x in raw]
@@ -513,7 +563,8 @@ class _SourceMixin:
             from ..host_nodes import _c_float
             lits = [_c_float(float(x)) for x in v[:n]]
         rows = ",\n".join("    " + ", ".join(lits[i:i + 12]) for i in range(0, n, 12))
-        return (f"static const {self._host_c_type(t)} _state_init_{t.c_name}[{n}] = {{\n"
+        ctype = self._host_c_type(t) if t.is_host else "int16_t"
+        return (f"static const {ctype} _state_init_{t.c_name}[{n}] = {{\n"
                 f"{rows}\n}};  /* initial value of '{t.onnx_name}' (non-zero prefix) */", n)
 
     def _kernel_instance(self) -> str:
@@ -658,10 +709,12 @@ class _SourceMixin:
         # run_conv_at: MatMuls on ConvKernel issued as one call per batch item.
         need_run_conv = self._has_conv_nodes and any(
             not (isinstance(sn, MatmulConvNode) and sn.calls > 1)
+            and not isinstance(sn, LlmAttnConvNode)
             for sn in nodes if sn.kernel_name == "ConvKernel"
         )
         need_run_conv_at = any(
-            isinstance(sn, MatmulConvNode) and sn.calls > 1 for sn in nodes
+            (isinstance(sn, MatmulConvNode) and sn.calls > 1)
+            or isinstance(sn, LlmAttnConvNode) for sn in nodes
         )
         need_run_pool = self._has_pool_nodes
 
@@ -1304,14 +1357,20 @@ class _SourceMixin:
                 alloc_lines.append(f"    {t.c_name} = ({self._host_c_type(t)} *)"
                                    f"(s_host_arena + {off}u);")
             alloc_lines.append("")
-        states = self._graph.state_tensors
+        states = [t for t in self._graph.state_tensors if t.is_host]
         if states:
             alloc_lines.append("    /* Persistent states: zeroed, then their initial non-zero prefix */")
             for t in states:
                 ct = self._host_c_type(t)
                 alloc_lines.append(f"    {t.c_name} = ({ct} *)calloc({t.numel}u, sizeof({ct}));")
                 alloc_lines.append(f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}")
-                if self._state_init_prefix(t) is not None:
+                pre = self._state_init_prefix(t)
+                if pre is not None and t.group_layout:
+                    G, D = t.group_layout
+                    alloc_lines.append(f"    _state_scatter({t.c_name}, _state_init_{t.c_name},"
+                                       f" {pre[1] // (G * D)}u, {t.shape[0]}u, {G}u, {D}u,"
+                                       f" {t.group_kw}u);")
+                elif pre is not None:
                     alloc_lines.append(f"    memcpy({t.c_name}, _state_init_{t.c_name},"
                                        f" sizeof _state_init_{t.c_name});")
             alloc_lines.append("")
@@ -1328,6 +1387,53 @@ class _SourceMixin:
             alloc_lines.append("    if (host_runtime_init() != 0) { rc = -1; goto fail; }")
             alloc_lines.append("")
 
+        dma_states = self._dma_states
+        if dma_states:
+            rows = []
+            for t in dma_states:
+                off, alloc = pool_map[t.onnx_name]
+                pre = self._state_init_prefix(t)
+                G, D = t.group_layout or (0, 0)
+                init = f"_state_init_{t.c_name}" if pre is not None else "NULL"
+                n_init = (pre[1] // (G * D) if G else pre[1]) if pre is not None else 0
+                rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u, {init},"
+                            f" {n_init}u, {t.shape[0]}u, {G}u, {D}u, {t.group_kw}u }},")
+            slot_tables.append(
+                "typedef struct {\n"
+                "    inference_buf_t  *view;\n"
+                "    inference_buf_t **var;\n"
+                "    unsigned          off, count;\n"
+                "    const int16_t    *init;        /* logical non-zero prefix, or NULL */\n"
+                "    unsigned          n_init;      /* its rows (group-major) / elements */\n"
+                "    unsigned          R, G, D, K;  /* group-major [G][R][D] (rows x K); G = 0: flat */\n"
+                "} _state_slot_t;\n\n"
+                f"static const _state_slot_t _s_state_slots[{len(rows)}] = {{\n"
+                + "\n".join(rows) + "\n};")
+            state_lines = [
+                "    /* DMA states: zeroed, then their initial value (the KV caches' sink row) */",
+                "    {",
+                "        unsigned _i;",
+                f"        for (_i = 0u; _i < {len(rows)}u; _i++) {{",
+                "            const _state_slot_t *s = &_s_state_slots[_i];",
+                "            Data_t *p;",
+                "            inference_buf_init_view(s->view, s_alloc_pool, s->off, s->count);",
+                "            *s->var = s->view;",
+                "            p = inference_buf_ptr(s->view);",
+                "            memset(p, 0, (size_t)s->count * INFERENCE_BYTES_PER_ELEM);",
+                "            if (s->init && s->G)",
+                "                _state_scatter((int16_t *)p, s->init, s->n_init, s->R, s->G, s->D, s->K);",
+                "            else if (s->init)",
+                "                memcpy(p, s->init, (size_t)s->n_init * INFERENCE_BYTES_PER_ELEM);",
+                "        }",
+                "    }",
+                ""]
+            sync = "    inference_buf_sync_to_device(s_alloc_pool);"
+            if sync in alloc_lines:
+                i = alloc_lines.index(sync)
+                alloc_lines[i:i] = state_lines
+            else:
+                i = alloc_lines.index("    if (!s_alloc_pool) { rc = -1; goto fail; }") + 1
+                alloc_lines[i:i] = [""] + state_lines + [sync]
         alloc_str = ("\n".join(alloc_lines) + "\n") if alloc_lines else ""
 
         # inference_deinit(): null all weight and intermediate pointers,
@@ -1341,7 +1447,12 @@ class _SourceMixin:
             deinit_free.append("    host_runtime_deinit();")
             deinit_free.append("    free(s_host_stage); s_host_stage = NULL;")
         for t in self._graph.state_tensors:
-            deinit_free.append(f"    free({t.c_name}); {t.c_name} = NULL;")
+            if t.is_host:
+                deinit_free.append(f"    free({t.c_name}); {t.c_name} = NULL;")
+        if self._dma_states:
+            deinit_free.append(
+                "    { unsigned _i; for (_i = 0u; _i < sizeof _s_state_slots / sizeof _s_state_slots[0];"
+                " _i++) *_s_state_slots[_i].var = NULL; }")
         if self._graph.host_tensors:
             for t in self._graph.host_tensors:
                 deinit_free.append(f"    {t.c_name} = NULL;")
