@@ -23,7 +23,8 @@ first (demo/chat/deploy.py --stop) — it owns the FPGA.
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py
            [--project demo/chat/build/llm_project] [--prompts factual,summarise,multi-turn]
-           [--decode 32] [--prefill-lens 16,64,256] [--profile] [--reopen]
+           [--decode 32] [--prefill-lens 16,64,256] [--decode-at 32,256,512,768,1000]
+           [--decode-at-steps 8] [--profile] [--reopen]
            [--study-json gate2.json] [--board-lock FILE] [--skip-build]
        ... llm_board.py --install-only      (deploy: upload, build, install; no bench)
 """
@@ -177,6 +178,8 @@ def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int
 
 def run_bench(session, remote_proj: str, bdir: str, args, tag: str) -> str:
     extra = f"-P {args.prefill_lens} -R {args.reps}" if args.prefill_lens else ""
+    if args.decode_at and tag == "main":
+        extra += f" -D {args.decode_at} -S {args.decode_at_steps}"
     cmd = (f"mkdir -p {RUN_DIR} && cd {RUN_DIR} && "
            f"{remote_proj}/{bdir}/llm_bench -i prompts.bin -o logits_{tag}.bin -k {args.decode} "
            f"{extra} {'-r' if args.reopen and tag == 'main' else ''}")
@@ -191,16 +194,19 @@ def run_bench(session, remote_proj: str, bdir: str, args, tag: str) -> str:
 
 
 def parse(out: str) -> dict:
-    res = {"prompts": [], "prefill": [], "profiles": {}}
+    res = {"prompts": [], "prefill": [], "decode_at": [], "profiles": {}}
     phase = None
     for line in out.splitlines():
-        for key in ("LLM_OPEN", "LLM_PROMPT", "LLM_PREFILL", "LLM_REOPEN", "LLM_SUMMARY"):
+        for key in ("LLM_OPEN", "LLM_PROMPT", "LLM_PREFILL", "LLM_DECODE_AT", "LLM_REOPEN",
+                    "LLM_SUMMARY"):
             if line.startswith(key + ":"):
                 d = json.loads(line[len(key) + 1:])
                 if key == "LLM_PROMPT":
                     res["prompts"].append(d)
                 elif key == "LLM_PREFILL":
                     res["prefill"].append(d)
+                elif key == "LLM_DECODE_AT":
+                    res["decode_at"].append(d)
                 else:
                     res[key.lower()] = d
         if line.startswith("PROFILE_PHASE:"):
@@ -275,6 +281,9 @@ def main(argv=None) -> int:
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--prefill-lens", default="16,64,256")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--decode-at", default="",
+                    help="decode ms / token at these positions (prefill to each, then steps)")
+    ap.add_argument("--decode-at-steps", type=int, default=8)
     ap.add_argument("--profile", action="store_true", help="also build and run with the profiler")
     ap.add_argument("--reopen", action="store_true", help="llm_close + llm_open cycle")
     ap.add_argument("--study-json", default=None, help="llm_sched_check.py --save output")
@@ -365,6 +374,9 @@ def main(argv=None) -> int:
           f"({(o.get('cma_free_kb_before', 0) - o.get('cma_free_kb_after', 0)) / 1024:.1f} MB)")
     print(f"decode {res.get('llm_summary', {}).get('decode_ms_mean')} ms/token; prefill "
           + ", ".join(f"{p['n']}: {p['best_ms']:.0f} ms" for p in res["prefill"]))
+    if res["decode_at"]:
+        print("decode by position: " + ", ".join(
+            f"{d['pos']}: {d['mean_ms']:.1f} ms (fnv {d['fnv']})" for d in res["decode_at"]))
     if "llm_reopen" in res:
         print(f"re-open: {res['llm_reopen']}")
     for ph, bd in results.get("profile", {}).items():

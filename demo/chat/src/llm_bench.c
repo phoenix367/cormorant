@@ -18,18 +18,23 @@
  *   4. Prefill timing (-P 16,64,256): llm_truncate(1) + llm_prefill of that
  *      many tokens (the first prompt's ids, repeated), -R repetitions,
  *      LAYERS_JSON:prefill_<n> per length when profiling.
- *   5. Re-open (-r): llm_close(), CmaFree, llm_open() again, the first
+ *   5. Decode timing by position (-D 32,256,512,768,1000): llm_truncate(1),
+ *      llm_prefill of pos - 1 tokens (the first prompt's ids, repeated), then
+ *      -S greedy llm_decode() steps from that position, timed; an FNV-1a
+ *      over the steps' logits bits (compare two library builds bit for bit).
+ *   6. Re-open (-r): llm_close(), CmaFree, llm_open() again, the first
  *      prompt's prefill + 2 decode steps compared bit for bit with step 2's.
  *
  * prompts.bin: int32 count, then per prompt int32 n and |n| int32 token ids
  * (the ids AFTER the leading <|im_start|>, which is the cache's sink; n < 0:
  * a continuation of the previous prompt).
  * Result lines on stdout: "LLM_OPEN: {...}", "LLM_PROMPT: {...}" per prompt,
- * "LLM_PREFILL: {...}" per length, "LLM_REOPEN: {...}", "LLM_SUMMARY: {...}",
+ * "LLM_PREFILL: {...}" per length, "LLM_DECODE_AT: {...}" per position,
+ * "LLM_REOPEN: {...}", "LLM_SUMMARY: {...}",
  * and with profiling "PROFILE_PHASE: <phase>" + the profiler's "LAYERS_JSON: {...}".
  *
  * usage: llm_bench [-w weights_dir] [-i prompts.bin] [-o logits.bin] [-k 32]
- *                  [-P 16,64,256] [-R 3] [-r]
+ *                  [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r]
  */
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime, getopt */
 
@@ -107,9 +112,9 @@ static void prof_reset(void)
 int main(int argc, char **argv)
 {
     const char *wdir = NULL, *in_path = "prompts.bin", *out_path = "logits.bin";
-    const char *plens = "";
-    int         k = 32, reps = 3, reopen = 0, c;
-    while ((c = getopt(argc, argv, "w:i:o:k:P:R:r")) != -1) {
+    const char *plens = "", *dpos = "";
+    int         k = 32, reps = 3, dsteps = 8, reopen = 0, c;
+    while ((c = getopt(argc, argv, "w:i:o:k:P:R:D:S:r")) != -1) {
         switch (c) {
         case 'w': wdir = optarg; break;
         case 'i': in_path = optarg; break;
@@ -117,10 +122,12 @@ int main(int argc, char **argv)
         case 'k': k = atoi(optarg); break;
         case 'P': plens = optarg; break;
         case 'R': reps = atoi(optarg); break;
+        case 'D': dpos = optarg; break;
+        case 'S': dsteps = atoi(optarg); break;
         case 'r': reopen = 1; break;
         default:
             fprintf(stderr, "usage: %s [-w weights_dir] [-i prompts.bin] [-o logits.bin] [-k 32]"
-                            " [-P 16,64,256] [-R 3] [-r]\n", argv[0]);
+                            " [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r]\n", argv[0]);
             return 2;
         }
     }
@@ -253,6 +260,46 @@ int main(int argc, char **argv)
                 prof_dump(tag);
             }
             free(ids);
+            while (*q && *q != ',') q++;
+            if (*q == ',') q++;
+        }
+    }
+
+    /* ---- decode timing by position ----------------------------------- */
+    {
+        const char *q = dpos;
+        while (*q) {
+            int P = atoi(q), r, s2, tok;
+            if (P >= 2 && dsteps > 0 && P - 1 + dsteps <= llm_context_size()) {
+                int32_t *ids = malloc((size_t)(P - 1) * 4);
+                double   sum = 0.0, best = 1e30;
+                uint32_t h = 2166136261u;
+                for (r = 0; r < P - 1; r++)
+                    ids[r] = prompts[0][r % plen[0]];
+                if (llm_truncate(1) != 0 || llm_prefill(ids, P - 1, lg) != 0) {
+                    fprintf(stderr, "error: prefill to %d: %s\n", P, llm_last_error());
+                    return 1;
+                }
+                tok = argmax(lg, V);
+                for (s2 = 0; s2 < dsteps; s2++) {
+                    t = now_ms();
+                    if (llm_decode(tok, lg) != 0) {
+                        fprintf(stderr, "error: llm_decode at %d: %s\n", llm_position(),
+                                llm_last_error());
+                        return 1;
+                    }
+                    t = now_ms() - t;
+                    sum += t;
+                    if (t < best) best = t;
+                    h = (h ^ fnv1a(lg, V)) * 16777619u;
+                    tok = argmax(lg, V);
+                }
+                printf("LLM_DECODE_AT: {\"pos\":%d,\"steps\":%d,\"mean_ms\":%.2f,"
+                       "\"best_ms\":%.2f,\"fnv\":%u}\n", P, dsteps, sum / dsteps, best, (unsigned)h);
+                fflush(stdout);
+                fprintf(stderr, "decode at %d: %.1f ms/token (best %.1f)\n", P, sum / dsteps, best);
+                free(ids);
+            }
             while (*q && *q != ',') q++;
             if (*q == ',') q++;
         }
