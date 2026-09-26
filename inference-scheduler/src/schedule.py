@@ -70,6 +70,11 @@ class Dag:
         """
         externals: Set[str] = {t.onnx_name for t in graph.input_tensors}
         externals.update(t.onnx_name for t in graph.weight_tensors)
+        # persistent states (src/numeric.py) that no node of this graph
+        # produces are always available, like weights
+        produced = {sn.output.onnx_name for sn in graph.nodes}
+        externals.update(t.onnx_name for t in getattr(graph, "state_tensors", [])
+                         if t.onnx_name not in produced)
 
         producer: Dict[str, int] = {}
         for sn in graph.nodes:

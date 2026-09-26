@@ -76,6 +76,8 @@ class HostContext:
     """Model-level facts a host-node factory needs besides the tensors."""
     opset: int                                   # default-domain opset
     consts: Dict[str, np.ndarray]                # raw initializer arrays (original dtype)
+    frac_bits: int = 8                           # element type's fractional bits (the
+                                                 # default power-of-two exponent)
 
 
 def _attrs(node: onnx.NodeProto) -> dict:

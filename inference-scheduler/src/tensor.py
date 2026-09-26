@@ -57,9 +57,50 @@ class TensorInfo:
     packed_data: Optional[np.ndarray] = field(default=None, repr=False)
     packed_note: str = ""
 
+    # ---- Numerics beyond the element type (doc/CHAT_PLAN.md §10.5, set from
+    # the model's "axi.numeric" metadata, see src/numeric.py) -------------
+    # exp: power-of-two exponent f of a fixed-point DMA / host-int16 tensor
+    #      (value = raw * 2^-f) — None = the element type's own (8 for
+    #      ap_fixed<16,8>), else an int64 array broadcastable to `shape`
+    #      (a scalar, or one exponent per last-axis channel).
+    exp:       Optional[np.ndarray] = field(default=None, repr=False)
+    # wexp: a constant MatMul weight encoded at the rank-1 exponent
+    #      f_w[i][j] = f_out[j] + F - f_in[i] (F = the kernels' output shift);
+    #      `data` then holds raw / 2^F so every existing encode / pack path
+    #      emits the raw bits unchanged, and the simulator's value is
+    #      data * 2^(F - wexp).
+    wexp:      Optional[np.ndarray] = field(default=None, repr=False)
+    # host: tensor lives in host memory, never in a DMA buffer: "f32"
+    #      (float32, e.g. a transformer's residual stream), "i32" (int32
+    #      token ids / positions) or "i16" (raw int16 at `exp`, e.g. a KV
+    #      cache only host ops touch).  None = a DMA buffer (the default).
+    host:      Optional[str] = None
+    # is_state: persistent across inference_run() calls (and shared by the
+    #      entries of a multi-entry project); init_data = its initial VALUE
+    #      (None = zeros).  Excluded from buffer reuse.
+    is_state:  bool = False
+    init_data: Optional[np.ndarray] = field(default=None, repr=False)
+
     # ------------------------------------------------------------------ #
     # Derived properties                                                   #
     # ------------------------------------------------------------------ #
+
+    @property
+    def is_host(self) -> bool:
+        """True for a host-memory tensor (``host`` set): no DMA buffer."""
+        return self.host is not None
+
+    def exp_full(self, default: int) -> np.ndarray:
+        """Exponent of every element in the logical shape (int64)."""
+        e = np.asarray(default if self.exp is None else self.exp, np.int64)
+        return np.broadcast_to(e, tuple(self.shape) if self.shape else ())
+
+    def exp_channels(self, default: int) -> np.ndarray:
+        """Exponent per last-axis channel (length shape[-1]).  ``exp`` is a
+        scalar or a vector over the last axis (src/numeric.py validates)."""
+        n = int(self.shape[-1]) if self.shape else 1
+        e = np.asarray(default if self.exp is None else self.exp, np.int64)
+        return np.broadcast_to(e, (n,)).copy()
 
     @property
     def numel(self) -> int:

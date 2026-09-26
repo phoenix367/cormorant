@@ -242,6 +242,48 @@ class DataType(ABC):
         one element over every bit pattern (GELU, Softmax's exp), else 0."""
         return 0
 
+    # ------------------------------------------------------------------ #
+    # Power-of-two exponents (doc/CHAT_PLAN.md §10.5; fixed point only)    #
+    # ------------------------------------------------------------------ #
+    # A tensor with an exponent f stores raw W-bit integers with value
+    # raw * 2^-f (f = frac_bits is the element type itself).  f is an int
+    # or an int array broadcastable to the value array.
+
+    @property
+    def frac_bits(self) -> int:
+        """F: fractional bits of the element type — also the kernels'
+        fixed output shift (floor(acc / 2^F))."""
+        raise NotImplementedError(f"{self.name}: no power-of-two exponents")
+
+    @property
+    def raw_range(self):
+        """(lo, hi) of the raw signed storage integer."""
+        raise NotImplementedError(f"{self.name}: no power-of-two exponents")
+
+    def quantize_exp(self, x: np.ndarray, f) -> np.ndarray:
+        """Round half to even at 2^-f, saturate (NaN -> 0): what a host op
+        writes back (C ``llm_st``); also the weight / state encoding."""
+        lo, hi = self.raw_range
+        s = np.power(2.0, np.asarray(f, np.float64))
+        x = np.asarray(x, np.float64)
+        r = np.round(np.where(np.isnan(x), 0.0, x) * s)
+        return np.clip(r, lo, hi) / s
+
+    def truncate_exp(self, x: np.ndarray, f) -> np.ndarray:
+        """Floor at 2^-f + saturate (a kernel output, AP_TRN + AP_SAT)."""
+        lo, hi = self.raw_range
+        s = np.power(2.0, np.asarray(f, np.float64))
+        return np.clip(np.floor(np.asarray(x, np.float64) * s), lo, hi) / s
+
+    def exp_to_storage(self, x: np.ndarray, f) -> np.ndarray:
+        """Raw storage (np_storage) of values x that lie on the 2^-f grid."""
+        raise NotImplementedError(f"{self.name}: no power-of-two exponents")
+
+    def ramp_to_float_exp(self, positions: np.ndarray, f) -> np.ndarray:
+        """Value of the test harness's ramp fill ``p[pos] = (Data_t)pos`` at
+        exponent f."""
+        raise NotImplementedError(f"{self.name}: no power-of-two exponents")
+
     def c_host_lut_defs(self) -> str:
         """C definitions the table-based host helpers use (``host_lut_bits``
         != 0): HOST_LUT_SIZE, HOST_LUT_SCALE, ``host_sint_t``."""
@@ -373,6 +415,23 @@ class ApFixed(DataType):
     @property
     def _int_hi(self) -> float:
         return float((1 << (self._W - 1)) - 1)
+
+    @property
+    def frac_bits(self) -> int:
+        return self._F
+
+    @property
+    def raw_range(self):
+        return (self._int_lo, self._int_hi)
+
+    def exp_to_storage(self, x: np.ndarray, f) -> np.ndarray:
+        s = np.power(2.0, np.asarray(f, np.float64))
+        r = np.clip(np.round(np.asarray(x, np.float64) * s), self._int_lo, self._int_hi)
+        return r.astype(self._np_int).view(self._np_uint)
+
+    def ramp_to_float_exp(self, positions: np.ndarray, f) -> np.ndarray:
+        raw = (positions & self._mask).astype(self._np_uint).view(self._np_int)
+        return raw.astype(np.float64) / np.power(2.0, np.asarray(f, np.float64))
 
     def int_quantize(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)

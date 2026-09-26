@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import numpy as np
+
 from ..nodes  import _ALIGN_BYTES, MatmulNode, ReshapeNode
 from ._banners import _banner
 
@@ -33,10 +35,18 @@ class _HeaderMixin:
         return "\n#ifdef __cplusplus\n}\n#endif\n"
 
     def _header_api(self) -> str:
-        graph   = self._graph
-        inputs  = graph.input_tensors
-        outputs = graph.output_tensors
+        lines = (self._header_types(self._graph.input_tensors + self._graph.output_tensors)
+                 + self._header_sizes()
+                 + self._header_pool(self._compute_pool_bytes())
+                 + self._header_buf_api()
+                 + self._header_uio()
+                 + self._header_init()
+                 + self._header_layers(len(self._layer_display_names()))
+                 + self._header_run())
+        return "\n".join(lines)
 
+    def _header_types(self, io_tensors) -> list:
+        """Data type section (+ the integer-tensor note for ``io_tensors``)."""
         dtype = self._dtype
         lines = [_banner("Data type")]
         lines.append(dtype.c_typedef_comment())
@@ -59,7 +69,7 @@ class _HeaderMixin:
             "    (((n) + INFERENCE_ALIGN_ELEMS - 1u) & ~(INFERENCE_ALIGN_ELEMS - 1u))"
         )
         lines.append("")
-        int_io = [t for t in inputs + outputs if t.is_int]
+        int_io = [t for t in io_tensors if t.is_int and not t.is_host]
         if int_io:
             int_t = f"int{8 * dtype.bytes_per_elem}_t"
             lines.append(
@@ -72,6 +82,14 @@ class _HeaderMixin:
                 + " */"
             )
             lines.append("")
+        return lines
+
+    def _header_sizes(self, banner: bool = True) -> list:
+        """Broadcast chunk macros and one SIZE macro per graph input / output."""
+        graph   = self._graph
+        inputs  = graph.input_tensors
+        outputs = graph.output_tensors
+        lines: list = []
 
         # ---- collect broadcast info for the SIZE-macro section ----
         # Only VectorOP ScheduledNodes produce CHUNK/STRIDE alignment macros.
@@ -85,7 +103,8 @@ class _HeaderMixin:
 
         # ---- Array-size macros ----
         # Emit CHUNK / CHUNK_STRIDE macros first (referenced by SIZE macros below).
-        lines.append(_banner("Array size constants"))
+        if banner:
+            lines.append(_banner("Array size constants"))
         if broadcast_nodes:
             lines.append("/* Broadcast chunk macros (one set per broadcast op).\n"
                          " * CHUNK        = data elements per kernel call\n"
@@ -135,9 +154,11 @@ class _HeaderMixin:
                 lines.append(
                     f"#define {macro:<40} {t.numel}u  /* shape={t.shape} */"
                 )
+        return lines
 
+    def _header_pool(self, pool_bytes: int) -> list:
+        lines = []
         # DMA buffer pool size
-        pool_bytes = self._compute_pool_bytes()
         lines.append(_banner("DMA buffer pool"))
         lines.append(
             "/*\n"
@@ -154,7 +175,10 @@ class _HeaderMixin:
             f"#define INFERENCE_BUF_POOL_SIZE_BYTES  {pool_bytes}u"
         )
         lines.append("")
+        return lines
 
+    def _header_buf_api(self) -> list:
+        lines = []
         # DMA buffer API
         lines.append(_banner("DMA-capable buffer API"))
         lines.append(
@@ -287,7 +311,10 @@ class _HeaderMixin:
             " float *dst, unsigned n);"
         )
         lines.append("")
+        return lines
 
+    def _header_uio(self) -> list:
+        lines = []
         # UIO device name defaults — one macro per active kernel
         lines.append(_banner("UIO device name defaults"))
         lines.append(
@@ -308,7 +335,10 @@ class _HeaderMixin:
                 f"#endif"
             )
         lines.append("")
+        return lines
 
+    def _header_init(self) -> list:
+        lines = []
         # inference_init()
         lines.append(_banner("Inference API"))
         # Build init signature
@@ -350,11 +380,13 @@ class _HeaderMixin:
         )
         lines.append("void inference_deinit(void);")
         lines.append("")
+        return lines
 
+    def _header_layers(self, n_layers: int) -> list:
+        lines = []
         # Per-layer profiling introspection — exposes the layer-name table
         # baked into inference.c.  The host benchmark feeds these into
         # inference_prof_init() when INFERENCE_PROFILING is enabled.
-        n_layers = len(self._layer_display_names())
         lines.append(_banner("Per-layer profiling introspection"))
         lines.append(
             "/*\n"
@@ -369,41 +401,49 @@ class _HeaderMixin:
         lines.append("unsigned             inference_num_layers(void);")
         lines.append("const char *const   *inference_layer_names_ptr(void);")
         lines.append("")
+        return lines
 
+    def _header_run(self) -> list:
+        lines = []
+        inputs  = self._graph.input_tensors
+        outputs = self._graph.output_tensors
         # inference_run()
-        params = []
-        for t in inputs:
-            params.append(f"    inference_buf_t *{t.c_name}")
-        for t in outputs:
-            params.append(f"    inference_buf_t *{t.c_name}")
+        params = self._run_params()
 
         doc_lines = [
             "/*",
-            " * inference_run() — execute the full inference graph.",
+            f" * {self._run_name}() — execute the full inference graph.",
             " *",
             " *   Buffers must be allocated with inference_buf_alloc().",
             " *   Fill input buffers via inference_buf_ptr() before calling.",
             " *",
         ]
         def _kind(t):
+            if t.is_host:
+                return f", host {self._host_c_type(t)}"
+            if t.exp is not None:
+                e = np.asarray(t.exp)
+                return (f", raw int16 at 2^-{int(e)}" if e.ndim == 0
+                        else ", raw int16 at per-channel 2^-f")
             return f", raw {t.dtype} values" if t.is_int else ""
         for t in inputs:
+            ptype = f"const {self._host_c_type(t)}*" if t.is_host else "inference_buf_t*"
             doc_lines.append(
-                f" *   {t.c_name:<22} [in]   inference_buf_t*  "
+                f" *   {t.c_name:<22} [in]   {ptype:<18}"
                 f"({t.numel} elem, shape={t.shape}{_kind(t)})"
             )
         for t in outputs:
+            ptype = f"{self._host_c_type(t)}*" if t.is_host else "inference_buf_t*"
             doc_lines.append(
-                f" *   {t.c_name:<22} [out]  inference_buf_t*  "
+                f" *   {t.c_name:<22} [out]  {ptype:<18}"
                 f"({t.numel} elem, shape={t.shape}{_kind(t)})"
             )
         doc_lines.append(" */")
 
         lines.append("\n".join(doc_lines))
         lines.append(
-            "void inference_run(\n"
-            + ",\n".join(params)
+            f"void {self._run_name}(\n"
+            + (",\n".join(params) or "    void")
             + ");"
         )
-
-        return "\n".join(lines)
+        return lines

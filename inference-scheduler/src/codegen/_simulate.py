@@ -45,6 +45,7 @@ from ..nodes  import (
 )
 from ..tensor import TensorInfo
 from ..host_nodes import GatherNode, HostNode, OneHotNode
+from ..llm_nodes import LlmEmbedNode
 
 # Expected GT arrays larger than this threshold are written to external
 
@@ -382,6 +383,13 @@ class _SimulateMixin:
         ramp_inputs: Dict[str, np.ndarray] = {}
         for t in self._graph.input_tensors:
             idx = np.arange(t.numel, dtype=np.int64)
+            if t.is_host:
+                ramp_inputs[t.onnx_name] = self._host_fill_values(t).reshape(t.shape)
+                continue
+            if t.exp is not None:
+                ramp_inputs[t.onnx_name] = dtype.ramp_to_float_exp(
+                    idx, t.exp_full(dtype.frac_bits).reshape(-1)).reshape(t.shape)
+                continue
             if t.is_int:
                 # Integer inputs (ids, masks): p[i] = i % R, a valid index
                 # for every Gather / OneHot that reads them.
@@ -395,6 +403,34 @@ class _SimulateMixin:
                 positions = idx
             ramp_inputs[t.onnx_name] = dtype.ramp_to_float(positions).reshape(t.shape)
         return ramp_inputs
+
+    def _host_fill_values(self, t: TensorInfo) -> np.ndarray:
+        """Values the test harness writes into a host-memory graph input
+        (C: ``_host_fill_c``): i32 — the ``test_fill`` constant of the
+        model's numeric metadata, else ``i % R`` (R as for integer tensors);
+        f32 — ``(i % 17 - 8) * 0.25``; i16 — raw ``i`` at the exponent."""
+        i = np.arange(t.numel, dtype=np.int64)
+        if t.host == "i32":
+            fill = self._graph.numeric.get("test_fill", {}).get(t.onnx_name)
+            if fill is not None:
+                return np.full(t.numel, float(int(fill)))
+            return (i % self._int_fill_range(t)).astype(np.float64)
+        if t.host == "f32":
+            return ((i % 17) - 8).astype(np.float64) * 0.25
+        return self._dtype.ramp_to_float_exp(i, t.exp_full(self._dtype.frac_bits).reshape(-1))
+
+    def _host_fill_c(self, t: TensorInfo, ptr: str) -> List[str]:
+        """C lines filling host graph input ``t`` (see _host_fill_values)."""
+        n = t.numel
+        if t.host == "i32":
+            fill = self._graph.numeric.get("test_fill", {}).get(t.onnx_name)
+            rhs = f"(int32_t){int(fill)}" if fill is not None else \
+                f"(int32_t)(i % {self._int_fill_range(t)}u)"
+            return [f"    for (i = 0u; i < {n}u; i++) {ptr}[i] = {rhs};"]
+        if t.host == "f32":
+            return [f"    for (i = 0u; i < {n}u; i++) {ptr}[i] = "
+                    f"(float)((int)(i % 17u) - 8) * 0.25f;"]
+        return [f"    for (i = 0u; i < {n}u; i++) {ptr}[i] = (int16_t)(uint16_t)(i & 0xFFFFu);"]
 
     def _int_fill_range(self, t: TensorInfo) -> int:
         """R of the test-harness fill ``p[i] = i % R`` for integer graph input
@@ -414,6 +450,8 @@ class _SimulateMixin:
         bounds = []
         for sn in self._graph.nodes:
             if isinstance(sn, GatherNode) and sn.inputs[1].onnx_name in names:
+                bounds.append(sn.rows)
+            elif isinstance(sn, LlmEmbedNode) and sn.inputs[0].onnx_name in names:
                 bounds.append(sn.rows)
             elif isinstance(sn, OneHotNode) and sn.inputs[0].onnx_name in names:
                 bounds.append(sn.depth)
@@ -448,6 +486,7 @@ class _SimulateMixin:
         self,
         input_arrays: Dict[str, np.ndarray],
         errors_out: Optional[Dict[str, "tuple"]] = None,
+        states: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Run every ScheduledNode in topological order, quantizing outputs with
@@ -459,10 +498,17 @@ class _SimulateMixin:
         truncation residual at that node — i.e. ``full_precision_result -
         dtype.truncate(...)``.  ReshapeNodes (no truncation) are skipped.
 
+        ``states`` ({name: float64 array}) holds the persistent state
+        tensors (src/numeric.py); they are updated IN PLACE, so a caller can
+        run several passes (and several entries of a multi-entry project)
+        over the same states.  Default: fresh copies of the initial values.
+
         Returns {onnx_name: float64 ndarray} for every tensor visited.
         """
         dtype   = self._dtype
         arrays: Dict[str, np.ndarray] = {}
+        if states is None:
+            states = self.initial_states()
 
         def _store_quant(name, full, truncate_fn=dtype.truncate, shape=None):
             quant = truncate_fn(full)
@@ -474,12 +520,20 @@ class _SimulateMixin:
                 errors_out[name] = _residual_stats(full_r, quant)
             return quant
 
-        # Seed with quantized weights (mirrors the ROM encoding written to C)
+        # Seed with quantized weights (mirrors the ROM encoding written to C);
+        # a weight encoded at a rank-1 exponent holds raw / 2^F in `data`
         for t in self._graph.weight_tensors:
             if t.data is not None:
                 arrays[t.onnx_name] = dtype.quantize(
                     t.data.reshape(t.shape).astype(np.float64)
                 )
+                if t.wexp is not None:
+                    arrays[t.onnx_name] = arrays[t.onnx_name] * np.power(
+                        2.0, (dtype.frac_bits - t.wexp).astype(np.float64))
+
+        # Persistent states (updated in place by the host ops)
+        for t in self._graph.state_tensors:
+            arrays[t.onnx_name] = states[t.onnx_name]
 
         # Seed with caller-supplied inputs (already quantized by convention)
         arrays.update(input_arrays)
@@ -493,6 +547,10 @@ class _SimulateMixin:
                 # both engines (test_matmul_on_conv.py checks the conv view).
                 a = arrays[sn.inputs[0].onnx_name]
                 b = arrays[sn.inputs[1].onnx_name]
+                if any(t.exp is not None or t.wexp is not None
+                       for t in (sn.inputs[0], sn.inputs[1], sn.output)):
+                    self._matmul_exp(sn, a, b, arrays, errors_out)
+                    continue
                 _store_quant(sn.output.onnx_name, np.matmul(a, b),
                              shape=sn.output.shape)
                 continue
@@ -524,9 +582,13 @@ class _SimulateMixin:
             if isinstance(sn, HostNode):
                 # Host-CPU op: double arithmetic, round-half-even + saturate
                 # on write-back — the same operations, in the same order, as
-                # the generated C helper (host_nodes.py).
-                arrays[sn.output.onnx_name] = sn.reference(
-                    [arrays[t.onnx_name] for t in sn.inputs], dtype)
+                # the generated C helper (host_nodes.py / llm_nodes.py).
+                y = sn.reference([arrays[t.onnx_name] for t in sn.inputs], dtype)
+                if sn.output.is_state:                 # written in place
+                    arrays[sn.output.onnx_name][...] = np.asarray(y).reshape(
+                        arrays[sn.output.onnx_name].shape)
+                else:
+                    arrays[sn.output.onnx_name] = y
                 continue
 
             if isinstance(sn, SpaceToDepthNode):
@@ -597,6 +659,42 @@ class _SimulateMixin:
         return arrays
 
     # ------------------------------------------------------------------ #
+    # Power-of-two exponents and states (src/numeric.py)                   #
+    # ------------------------------------------------------------------ #
+
+    def initial_states(self) -> Dict[str, np.ndarray]:
+        """Fresh float64 copies of every state tensor's initial value."""
+        out = {}
+        for t in self._graph.state_tensors:
+            init = t.init_data
+            out[t.onnx_name] = (np.zeros(t.shape) if init is None
+                                else np.array(init, np.float64).reshape(t.shape))
+        return out
+
+    def _matmul_exp(self, sn, a, b, arrays, errors_out) -> None:
+        """A MatMul whose tensors carry power-of-two exponents: the kernel
+        sums raw products exactly in ap_fixed<32,16> — an int32 that wraps —
+        and writes floor(acc / 2^F) saturated; the value is raw * 2^-f_out.
+        Every column's products share the scale 2^-(f_out[j] + F) (the
+        rank-1 weight exponent), so the float64 value sum is exact."""
+        dtype = self._dtype
+        F = dtype.frac_bits
+        full = np.matmul(a, b)
+        fo = sn.output.exp_full(F).astype(np.float64)
+        acc = full * np.power(2.0, fo + F)                     # raw Q16.16-like units
+        if not np.array_equal(acc, np.round(acc)):
+            raise ValueError(f"MatMul '{sn.onnx_node.name}': exponents are inconsistent "
+                             f"(accumulator not on the 2^-(f_out+F) grid)")
+        big = np.abs(acc) >= 2.0 ** 31
+        if big.any():                                          # ap_fixed<32,16> wraps
+            acc = np.where(big, np.mod(acc + 2.0 ** 31, 2.0 ** 32) - 2.0 ** 31, acc)
+        lo, hi = dtype.raw_range
+        q = np.clip(np.floor(acc / float(1 << F)), lo, hi) / np.power(2.0, fo)
+        arrays[sn.output.onnx_name] = q.reshape(sn.output.shape)
+        if errors_out is not None:
+            errors_out[sn.output.onnx_name] = _residual_stats(full.reshape(q.shape), q)
+
+    # ------------------------------------------------------------------ #
     # Helpers: convert simulated output → C array                         #
     # ------------------------------------------------------------------ #
 
@@ -622,13 +720,22 @@ class _SimulateMixin:
         ndarray with dtype == self._dtype.np_storage, length _alloc_sizes[name]
         """
         dtype = self._dtype
+        t = self._graph._tensors.get(name)
+        flat  = logical.flatten()
+        if t is not None and t.is_host:
+            if t.host == "f32":
+                return flat.astype(np.float32)
+            if t.host == "i32":
+                return flat.astype(np.int32)
+            return dtype.exp_to_storage(flat, t.exp_full(dtype.frac_bits).reshape(-1)) \
+                .view(np.int16)
         lay   = self._layouts.get(name)
         alloc = lay.alloc if lay is not None else len(logical.flatten())
         buf   = np.zeros(alloc, dtype=dtype.np_storage)
-        flat  = logical.flatten()
-        t = self._graph._tensors.get(name)
         if t is not None and t.is_int:
             encoded = dtype.int_to_storage(flat.astype(np.float64))   # raw integers
+        elif t is not None and t.exp is not None:
+            encoded = dtype.exp_to_storage(flat, t.exp_full(dtype.frac_bits).reshape(-1))
         else:
             encoded = dtype.float_to_storage(flat.astype(np.float64))
 
@@ -665,6 +772,19 @@ class _SimulateMixin:
             f"{inner}\n"
             f"}};\n"
         )
+
+    def _emit_expected_host_c(self, t, values) -> str:
+        """``static const <ctype> expected_<c>[N]`` for a host-memory output
+        (float32 literals that round-trip exactly, or integers)."""
+        from ..host_nodes import _c_float
+        ctype = self._host_c_type(t)
+        v = np.asarray(values).reshape(-1)
+        if t.host == "f32":
+            lits = [_c_float(float(x)) for x in v.astype(np.float32)]
+        else:
+            lits = [str(int(x)) for x in v]
+        rows = ",\n".join("    " + ", ".join(lits[i:i + 8]) for i in range(0, len(lits), 8))
+        return f"static const {ctype} expected_{t.c_name}[{len(lits)}] = {{\n{rows}\n}};\n"
 
     # ------------------------------------------------------------------ #
     # Large expected: external .dat files                                  #
