@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import List, Optional
 
 CHAT = Path(__file__).resolve().parent
+CPU_PD_RULE = CHAT.parent.parent / "board" / "kv260" / "kv260-no-cpu-powerdown.conf"   # CHAT_PLAN §18
 DEMO = CHAT.parent
 BERT_SCRIPTS = DEMO / "bert_squad" / "scripts"
 if str(BERT_SCRIPTS) not in sys.path:
@@ -201,6 +202,29 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     out, _, _ = session.exec("grep -E 'CmaFree|CmaTotal' /proc/meminfo | tr -s ' ' | tr '\\n' ' '",
                              timeout=15)
     print(f"    {_dim('info   ')} {'CMA':<36} {_dim(out.strip())}  (the BERT pool BO needs ~216 MiB)")
+    # A core in the PSCI core power-down idle state can be parked forever by a
+    # lost TF-A / PMU firmware handshake (doc/CHAT_PLAN.md §18): every task
+    # queued on it stalls, then all-CPU cross-calls hang the board.  Keep the
+    # cores out of it: install board/kv260/kv260-no-cpu-powerdown.conf as a
+    # tmpfiles.d rule (applied at every boot) and apply it now.
+    rule = CPU_PD_RULE.read_text()
+    dst = f"/etc/tmpfiles.d/{CPU_PD_RULE.name}"
+    out, _, _ = session.exec(f"cat {dst} 2>/dev/null", timeout=15)
+    installed = out == rule
+    if not installed:
+        session.exec(f"printf %s {shlex.quote(rule)} | {sudo(cfg)}tee {dst} > /dev/null", timeout=15)
+    out, _, _ = session.exec(
+        "n=0; for f in /sys/devices/system/cpu/cpu*/cpuidle/state1/disable; do "
+        "[ -f \"$f\" ] && [ \"$(cat $f)\" != 1 ] && n=$((n + 1)); done; "
+        f"{sudo(cfg)}systemd-tmpfiles --create {dst} > /dev/null 2>&1; "
+        "m=0; for f in /sys/devices/system/cpu/cpu*/cpuidle/state1/disable; do "
+        "[ -f \"$f\" ] && [ \"$(cat $f)\" != 1 ] && m=$((m + 1)); done; echo $n $m", timeout=15)
+    was_on, still_on = (out.split() + ["?", "?"])[:2]
+    good = still_on == "0"
+    note = ("already off" if installed and was_on == "0" else
+            f"{'installed ' + dst + ', ' if not installed else ''}disabled on {was_on} cores (CHAT_PLAN §18)")
+    print(f"    {(_green('OK     ') if installed and was_on == '0' else _yellow('FIXED  ')) if good else _red('FAILED ')} "
+          f"{'cpuidle core power-down off':<36} {_dim(note if good else f'{still_on} cores still enabled')}")
     out, _, rc = session.exec("command -v cc || command -v gcc", timeout=15)
     print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'C compiler (libsampler.so)':<36} "
           f"{_dim(out.strip() or 'none: the server samples in Python (slower)')}")
