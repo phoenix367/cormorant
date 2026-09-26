@@ -143,6 +143,7 @@ class BertSquadBackend(Backend):
     model_id = "bert-squad"
     owned_by = "kv260"
     fingerprint = "kv260-bertsquad12-q8.8"
+    cma_mb = 224.0                          # pool BO + buffers (CmaFree 811 -> 590 MB, §9)
 
     def __init__(self, engine, vocab_path: str, *, max_windows: int = 8,
                  doc_stride: int = squad_text.DOC_STRIDE, n_best: int = squad_text.N_BEST,
@@ -162,11 +163,18 @@ class BertSquadBackend(Backend):
 
     # ── lifecycle ──
 
+    def load_host(self) -> None:
+        if self.tok is None:
+            self.tok = squad_text.Tokenizer(self.vocab_path)
+
     def load(self) -> None:
-        self.tok = squad_text.Tokenizer(self.vocab_path)
+        self.load_host()
         self.engine.open()
         seq = getattr(self.engine, "seq", 0) or squad_text.SEQ
         self.seq = seq
+
+    def unload(self) -> None:
+        self.engine.close()
 
     def close(self) -> None:
         self.engine.close()

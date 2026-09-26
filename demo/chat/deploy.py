@@ -11,11 +11,20 @@ host with inference-scheduler/.venv/bin/python).
               <dir>/lib/libbert_squad.so (skipped when the sources and the
               cmake options are unchanged since the last build)
   server   -> kv260_chat_server.py, chat_backend.py, bert_squad_backend.py,
-              squad_text.py, chat.py, vocab.txt to <dir>
+              squad_text.py, chat.py, vocab.txt, and the smollm2 side
+              (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
+              src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/) to <dir>
+  sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
+              (skipped when unchanged; without it the server samples in Python)
   start    -> transient systemd unit 'kv260-chat' (systemd-run: survives the
               ssh session, not started at boot, logs in journalctl -u
               kv260-chat) or, with server.launcher = "nohup", a detached
               process; then waits for GET /health from the host
+
+The smollm2 backend (server.backends containing "smollm2") needs
+libsmollm2.so on the board at smollm2.lib (default <dir>/lib/libsmollm2.so;
+built by the decoder project of CHAT_PLAN phase 3, not by this script);
+preflight reports whether it is there.
 
 The board lock (flock on board_lock) is held while deploying.  The running
 server owns the FPGA: other board jobs must wait until `deploy.py --stop`.
@@ -58,7 +67,10 @@ CONFIG = CHAT / "chat_config.json"
 EXAMPLE = CHAT / "chat_config.json.example"
 UNIT = "kv260-chat"
 SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
-                CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py"]
+                CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py",
+                CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
+                CHAT / "sampler.py"]
+SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
 def step(name: str, ok: bool, t0: float, msg: str = "") -> bool:
@@ -101,13 +113,26 @@ def load_config(path: Optional[str]) -> dict:
     srv = cfg.setdefault("server", {})
     for k, v in (("host", "0.0.0.0"), ("port", 8000), ("api_key", None), ("backends", ["bert-squad"]),
                  ("max_windows", 8), ("doc_stride", 128), ("queue_timeout", 120), ("max_queue", 16),
-                 ("launcher", "systemd"), ("env", {})):
+                 ("launcher", "systemd"), ("env", {}), ("resident", "auto")):
         srv.setdefault(k, v)
+    llm = cfg.setdefault("smollm2", {})
+    for k, v in (("lib", None), ("weights_dir", None),
+                 ("tokenizer", "assets/smollm2-135m-instruct/tokenizer.json"), ("context", 1024),
+                 ("reserve", 256), ("temperature", 0.2), ("top_p", 0.9), ("top_k", 50),
+                 ("repetition_penalty", 1.0), ("cma_mb", 360)):
+        if llm.get(k) is None:
+            llm[k] = v
+    if not llm["lib"]:
+        llm["lib"] = f"{rem['dir']}/lib/libsmollm2.so"
     cfg.setdefault("build", {}).setdefault("jobs", 4)
     cfg["build"].setdefault("timeout", 1800)
     cfg["board_lock"] = cfg.get("board_lock") or bcfg.get("board_lock")
     cfg.setdefault("health_timeout", 180)
     return cfg
+
+
+def uses_llm(cfg: dict) -> bool:
+    return any(b in ("smollm2", "smollm2-135m-instruct") for b in cfg["server"]["backends"])
 
 
 def sudo(cfg: dict) -> str:
@@ -174,6 +199,20 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     out, _, _ = session.exec("grep -E 'CmaFree|CmaTotal' /proc/meminfo | tr -s ' ' | tr '\\n' ' '",
                              timeout=15)
     print(f"    {_dim('info   ')} {'CMA':<36} {_dim(out.strip())}  (the BERT pool BO needs ~216 MiB)")
+    out, _, rc = session.exec("command -v cc || command -v gcc", timeout=15)
+    print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'C compiler (libsampler.so)':<36} "
+          f"{_dim(out.strip() or 'none: the server samples in Python (slower)')}")
+    if uses_llm(cfg):
+        lib = cfg["smollm2"]["lib"]
+        _, _, rc = session.exec(f"test -f {shlex.quote(lib)}", timeout=15)
+        good = rc == 0
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'libsmollm2.so (smollm2 backend)':<36} "
+              f"{_dim(lib if good else lib + ' - build it with the decoder project (CHAT_PLAN phase 3)')}")
+        ok &= good
+        tok = chat_path(cfg["smollm2"]["tokenizer"])
+        good = tok.exists()
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'tokenizer.json (host)':<36} {_dim(str(tok))}")
+        ok &= good
     return ok
 
 
@@ -263,7 +302,39 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
     finally:
         sftp.close()
     session.exec(f"chmod +x {d}/kv260_chat_server.py {d}/chat.py", timeout=15)
-    return step("server", True, t0, f"{len(SERVER_FILES)} files + vocab.txt -> {d}")
+    extra = ""
+    session.exec_checked(f"mkdir -p {d}/src {d}/lib", timeout=15)
+    sftp = session._client.open_sftp()                          # noqa: SLF001
+    try:
+        for p in SAMPLER_SRC:
+            sftp.put(str(p), f"{d}/src/{p.name}")
+        if uses_llm(cfg):
+            session.exec_checked(f"mkdir -p {d}/smollm2", timeout=15)
+            sftp.put(str(chat_path(cfg["smollm2"]["tokenizer"])), f"{d}/smollm2/tokenizer.json")
+            extra = " + smollm2/tokenizer.json"
+    finally:
+        sftp.close()
+    return step("server", True, t0, f"{len(SERVER_FILES)} files + vocab.txt + src/sampler.[ch]{extra} -> {d}")
+
+
+def build_sampler(session: RemoteSession, cfg: dict) -> bool:
+    """lib/libsampler.so from src/sampler.c (a second; skipped when unchanged).
+    Not fatal: without it the server samples in pure Python."""
+    t0 = time.monotonic()
+    d = cfg["remote"]["dir"]
+    stamp = hashlib.sha1(b"".join(p.read_bytes() for p in SAMPLER_SRC)).hexdigest()
+    out, _, _ = session.exec(f"cat {d}/lib/SAMPLER_STAMP 2>/dev/null; test -f {d}/lib/libsampler.so "
+                             f"&& echo have-lib", timeout=15)
+    if stamp in out and "have-lib" in out:
+        return step("sampler", True, t0, "unchanged (lib/libsampler.so kept)")
+    cmd = (f"cc -O2 -shared -fPIC -o {d}/lib/libsampler.so {d}/src/sampler.c -lm 2>&1 && "
+           f"echo {stamp} > {d}/lib/SAMPLER_STAMP")
+    out, _, rc = session.exec(cmd, timeout=120)
+    if rc != 0:
+        step("sampler", True, t0, _yellow("cc failed - the server will sample in Python"))
+        tail(out)
+        return False
+    return step("sampler", True, t0, "lib/libsampler.so")
 
 
 def server_argv(cfg: dict) -> List[str]:
@@ -275,6 +346,17 @@ def server_argv(cfg: dict) -> List[str]:
             "--queue-timeout", str(s["queue_timeout"]), "--max-queue", str(s["max_queue"])]
     for b in s["backends"]:
         argv += ["--backend", b]
+    argv += ["--resident", str(s["resident"])]
+    if uses_llm(cfg):
+        llm = cfg["smollm2"]
+        argv += ["--llm-lib", llm["lib"], "--llm-tokenizer", f"{d}/smollm2/tokenizer.json",
+                 "--llm-sampler-lib", f"{d}/lib/libsampler.so", "--llm-context", str(llm["context"]),
+                 "--llm-reserve", str(llm["reserve"]), "--llm-temperature", str(llm["temperature"]),
+                 "--llm-top-p", str(llm["top_p"]), "--llm-top-k", str(llm["top_k"]),
+                 "--llm-repetition-penalty", str(llm["repetition_penalty"]),
+                 "--llm-cma-mb", str(llm["cma_mb"])]
+        if llm.get("weights_dir"):
+            argv += ["--llm-weights", llm["weights_dir"]]
     if s.get("api_key"):
         argv += ["--api-key-file", f"{d}/api_key"]
     return argv
@@ -381,6 +463,8 @@ def print_ready(cfg: dict, h: dict) -> None:
     print(f"    models            {', '.join(m['id'] for m in h['models'])}")
     print(f"    API key           {key}")
     print(f"    try               python3 demo/chat/chat.py --url {url} --doc some.txt")
+    if any(m["id"] == "smollm2-135m-instruct" for m in h["models"]):
+        print(f"                      python3 demo/chat/chat.py --url {url} --model smollm2-135m-instruct")
     print(f"    logs              ssh {cfg['ssh']['user']}@{cfg['ssh']['host']} journalctl -fu {UNIT}")
     print(f"    stop              demo/chat/deploy.py --stop   (the server owns the FPGA until then)\n")
 
@@ -442,6 +526,7 @@ def main(argv=None) -> int:
             if not upload_and_build(session, cfg, summary, args.rebuild, args.verbose):
                 return 1
             upload_server(session, cfg)
+            build_sampler(session, cfg)
             if not start_server(session, cfg):
                 return 1
             h = wait_health(session, cfg)

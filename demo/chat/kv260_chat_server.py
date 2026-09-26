@@ -15,8 +15,23 @@ Endpoints
 Backends (chat_backend.Backend; one model id each)
   bert-squad   extractive question answering over a document with BERT-base
                SQuAD on the FPGA (bert_squad_backend.py, libbert_squad.so)
+  smollm2      model id smollm2-135m-instruct: generative chat with
+               SmolLM2-135M-Instruct on the FPGA (smollm2_backend.py,
+               libsmollm2.so; tokenizer, template and sampling on the host)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
+
+Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
+BERT holds ~224 MB, SmolLM2 ~360 MB, idle CmaFree was 626-813 MB).
+  auto (default)  the first backend loads at startup, the others when first
+                  requested; before a load, models are evicted (least recently
+                  used first) while CmaFree < the new model's cma_mb +
+                  --cma-margin-mb, and once more if the load fails anyway —
+                  so both stay resident when they fit, else they swap
+  one             at most one FPGA model at a time: switching models unloads
+                  the current one (a swap costs a load, seconds)
+  all             everything loads at startup and stays (the old behaviour)
+Loads and evictions happen under the FPGA lock, between requests.
 
 Request parameters honoured: model, messages, stream, stream_options
 .include_usage, max_tokens / max_completion_tokens, temperature, top_p, stop,
@@ -33,9 +48,12 @@ BERT window, a decoder token).  One log line per request on stderr.
 usage:
   kv260_chat_server.py [--host 0.0.0.0] [--port 8000]
                        [--api-key KEY | --api-key-file FILE]
-                       [--backend bert-squad] [--backend echo] ...
+                       [--backend bert-squad] [--backend smollm2] [--backend echo] ...
+                       [--resident auto|one|all] [--cma-margin-mb 32]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]
+                       [--llm-lib lib/libsmollm2.so] [--llm-weights DIR]
+                       [--llm-tokenizer tokenizer.json] [--llm-* sampling defaults]
                        [--queue-timeout 120] [--max-queue 16]
 """
 
@@ -43,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import hmac
 import json
 import os
@@ -229,6 +248,7 @@ class EchoBackend(Backend):
 
     model_id = "echo"
     fingerprint = "kv260-echo"
+    uses_fpga = False
 
     def __init__(self, delay: float = 0.0):
         self.delay = delay
@@ -258,6 +278,20 @@ class EchoBackend(Backend):
         yield Finish("stop", prompt, n)
 
 
+# ── residency (CMA) ──────────────────────────────────────────────────────────
+
+def read_cma_free_mb(path: str = "/proc/meminfo") -> Optional[float]:
+    """CmaFree in MB (None where the kernel has no CMA, e.g. a host PC)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("CmaFree:"):
+                    return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
 class ChatServer(ThreadingHTTPServer):
@@ -266,8 +300,11 @@ class ChatServer(ThreadingHTTPServer):
     request_queue_size = 32
 
     def __init__(self, addr, backends: Dict[str, Backend], *, api_key: Optional[str] = None,
-                 queue_timeout: float = 120.0, max_queue: int = 16, max_body: int = MAX_BODY):
+                 queue_timeout: float = 120.0, max_queue: int = 16, max_body: int = MAX_BODY,
+                 resident: str = "all", cma_margin_mb: float = 32.0, cma_free=read_cma_free_mb):
         super().__init__(addr, ChatHandler)
+        if resident not in ("all", "one", "auto"):
+            raise ValueError(f"resident: {resident!r}")
         self.backends = backends
         self.default_model = next(iter(backends))
         self.api_key = api_key or None
@@ -278,6 +315,101 @@ class ChatServer(ThreadingHTTPServer):
         self.n_requests = 0
         self.count_lock = threading.Lock()
         self.load_errors: Dict[str, str] = {}
+        self.resident = resident
+        self.cma_margin_mb = cma_margin_mb
+        self.cma_free = cma_free
+        self.loaded: Dict[str, bool] = {m: False for m in backends}
+        self.last_used: Dict[str, float] = {}
+        self.n_loads = self.n_unloads = 0
+
+    # Loads and unloads run at startup / shutdown or under the FPGA lock.
+
+    def load_model(self, mid: str, evict: bool = True) -> float:
+        """Make `mid` resident (evicting others per --resident); returns the
+        seconds spent (0 if it already was).  Raises what load() raises.
+        With --resident auto a failed load is retried once after evicting the
+        other FPGA models (CmaFree may be unknown or the estimate short) —
+        not when the library itself cannot be opened (OSError from dlopen)."""
+        b = self.backends[mid]
+        if self.loaded[mid]:
+            return 0.0
+        t0 = time.monotonic()
+        others = [m for m, on in self.loaded.items()
+                  if on and m != mid and self.backends[m].uses_fpga]
+        if b.uses_fpga and others and self.resident == "one":
+            for m in others:
+                self.unload_model(m, "one model at a time")
+        elif b.uses_fpga and others and self.resident == "auto":
+            need = b.cma_mb + self.cma_margin_mb
+            for m in sorted(others, key=lambda m: self.last_used.get(m, 0.0)):
+                free = self.cma_free()
+                if free is None or free >= need:
+                    break
+                self.unload_model(m, f"CmaFree {free:.0f} MB < {need:.0f} MB for '{mid}'")
+        try:
+            b.load()
+        except Exception as e:                                 # noqa: BLE001
+            still = [m for m, on in self.loaded.items()
+                     if on and m != mid and self.backends[m].uses_fpga]
+            if not (evict and b.uses_fpga and still and self.resident == "auto") \
+                    or isinstance(e, OSError):
+                raise
+            log(f"loading '{mid}' failed ({e}); unloading {', '.join(still)} and retrying")
+            with contextlib.suppress(Exception):
+                b.unload()
+            for m in still:
+                self.unload_model(m, f"'{mid}' did not load beside it")
+            b.load()
+        self.loaded[mid] = True
+        self.load_errors.pop(mid, None)
+        self.n_loads += 1
+        dt = time.monotonic() - t0
+        free = self.cma_free()
+        log(f"loaded '{mid}' in {dt:.1f} s" + (f" (CmaFree {free:.0f} MB)" if free is not None else ""))
+        return dt
+
+    def unload_model(self, mid: str, why: str = "") -> None:
+        if not self.loaded.get(mid):
+            return
+        try:
+            self.backends[mid].unload()
+        finally:
+            self.loaded[mid] = False
+            self.n_unloads += 1
+        log(f"unloaded '{mid}'" + (f": {why}" if why else ""))
+
+    def startup_models(self) -> list:
+        """The models to load before listening: all (resident all), else the
+        first FPGA model and the non-FPGA ones; with auto, further FPGA
+        models while CmaFree allows (the rest load on first request)."""
+        if self.resident == "all":
+            return list(self.backends)
+        first = next((m for m, b in self.backends.items() if b.uses_fpga), None)
+        return [m for m, b in self.backends.items() if not b.uses_fpga or m == first]
+
+    def load_startup(self) -> None:
+        for mid in self.startup_models():
+            self.load_model(mid)
+        if self.resident == "auto":
+            for mid, b in self.backends.items():
+                if self.loaded[mid]:
+                    continue
+                free = self.cma_free()
+                if free is not None and free >= b.cma_mb + self.cma_margin_mb:
+                    try:
+                        self.load_model(mid, evict=False)
+                    except Exception as e:                     # noqa: BLE001
+                        with contextlib.suppress(Exception):
+                            b.unload()
+                        log(f"'{mid}' did not load at startup ({e}); it loads on first request")
+
+    def close_models(self) -> None:
+        for mid, b in self.backends.items():
+            try:
+                b.close()
+            except Exception as e:                             # noqa: BLE001
+                log(f"closing '{mid}': {e}")
+            self.loaded[mid] = False
 
     def model_obj(self, mid: str) -> dict:
         return {"id": mid, "object": "model", "created": int(self.started),
@@ -412,14 +544,20 @@ class ChatHandler(BaseHTTPRequestHandler):
         srv = self.server
         models = []
         for mid, b in srv.backends.items():
-            m = {"id": mid, "ready": mid not in srv.load_errors}
+            m = {"id": mid, "ready": mid not in srv.load_errors, "loaded": srv.loaded.get(mid, False)}
             if mid in srv.load_errors:
                 m["error"] = srv.load_errors[mid]
-            m.update(b.health())
+            try:
+                m.update(b.health())
+            except Exception as e:                             # noqa: BLE001
+                m["health_error"] = str(e)
             models.append(m)
         ok = all(m["ready"] for m in models)
+        free = srv.cma_free()
         self._send_json(200 if ok else 503, {
             "status": "ok" if ok else "error", "version": VERSION, "models": models,
+            "resident": srv.resident, "cma_free_mb": None if free is None else round(free, 1),
+            "loads": srv.n_loads, "unloads": srv.n_unloads,
             "busy": srv.fpga.busy, "waiting": srv.fpga.waiting,
             "requests": srv.n_requests, "uptime_s": round(time.time() - srv.started, 1)})
 
@@ -451,10 +589,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             if backend is None:
                 return self._error(404, f"The model '{req.model}' does not exist or you do not "
                                    f"have access to it.", param="model", code="model_not_found")
-            if req.model in srv.load_errors:
-                return self._error(503, f"The model '{req.model}' is not available: "
-                                   f"{srv.load_errors[req.model]}", "server_error",
-                                   code="model_not_loaded")
             try:
                 job = backend.prepare(req)
             except BackendError as e:
@@ -475,6 +609,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                                    f"time and {why}. Retry later.", "server_error",
                                    code="server_busy", headers={"Retry-After": "5"})
             try:
+                srv.last_used[req.model] = time.monotonic()
+                if not srv.loaded.get(req.model):
+                    try:
+                        rec["load_ms"] = srv.load_model(req.model) * 1000.0
+                    except Exception as e:                     # noqa: BLE001
+                        log(f"error: loading '{req.model}' failed: {e}")
+                        srv.load_errors[req.model] = str(e)
+                        return self._error(503, f"The model '{req.model}' is not available: {e}",
+                                           "server_error", code="model_not_loaded")
                 gen = backend.generate(job, cancel)
                 if req.stream:
                     self._stream(req, backend, gen, cancel, rec, t0)
@@ -643,6 +786,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             parts += [f"{k}={v}" for k, v in (fin.info.get("log") or {}).items()]
         if "queue_ms" in rec:
             parts.append(f"queue={rec['queue_ms']:.0f}ms")
+        if "load_ms" in rec:
+            parts.append(f"load={rec['load_ms']:.0f}ms")
         if "ttft_ms" in rec:
             parts.append(f"ttft={rec['ttft_ms']:.0f}ms")
             if fin is not None and fin.completion_tokens > 1 and total > rec["ttft_ms"]:
@@ -663,6 +808,24 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+def llm_engine(args):
+    """libsmollm2.so, or with --llm-fake a stand-in from tests/fake_llm.py
+    (development without the FPGA: 'float' = the float reference model,
+    exact and slow, needs numpy + the safetensors weights; 'scripted' =
+    a fixed reply)."""
+    if args.llm_fake:
+        sys.path.insert(0, os.path.join(HERE, "tests"))
+        import fake_llm
+        if args.llm_fake == "float":
+            return fake_llm.FloatModelEngine(context_size=args.llm_context)
+        from smollm2_tokenizer import Tokenizer
+        reply = Tokenizer(args.llm_tokenizer).encode(
+            "This is the scripted fake of libsmollm2.so (kv260_chat_server.py --llm-fake scripted).")
+        return fake_llm.ScriptedEngine(reply, context_size=args.llm_context, delay=args.echo_delay)
+    from smollm2_backend import LibLlmEngine
+    return LibLlmEngine(args.llm_lib, args.llm_weights)
+
+
 def build_backends(args) -> Dict[str, Backend]:
     out: Dict[str, Backend] = {}
     for name in args.backend or ["bert-squad"]:
@@ -672,10 +835,25 @@ def build_backends(args) -> Dict[str, Backend]:
             from bert_squad_backend import BertSquadBackend, LibBertEngine
             b = BertSquadBackend(LibBertEngine(args.bert_lib, args.bert_weights), args.vocab,
                                  max_windows=args.max_windows, doc_stride=args.doc_stride)
+        elif name in ("smollm2", "smollm2-135m-instruct"):
+            from sampler import SamplerParams
+            from smollm2_backend import Smollm2Backend
+            b = Smollm2Backend(
+                llm_engine(args), args.llm_tokenizer, sampler_lib=args.llm_sampler_lib,
+                defaults=SamplerParams(temperature=args.llm_temperature, top_p=args.llm_top_p,
+                                       top_k=args.llm_top_k,
+                                       repetition_penalty=args.llm_repetition_penalty),
+                context_size=args.llm_context, reserve=args.llm_reserve,
+                repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk,
+                cma_mb=args.llm_cma_mb)
         else:
-            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, echo)")
+            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, echo)")
         out[b.model_id] = b
     return out
+
+
+def _first_existing(*paths: str) -> str:
+    return next((p for p in paths if os.path.exists(p)), paths[0])
 
 
 def main(argv=None) -> int:
@@ -686,8 +864,13 @@ def main(argv=None) -> int:
     ap.add_argument("--api-key", default=os.environ.get("KV260_CHAT_API_KEY"),
                     help="require 'Authorization: Bearer KEY' on /v1/* (env KV260_CHAT_API_KEY)")
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
-    ap.add_argument("--backend", action="append", choices=("bert-squad", "echo"),
+    ap.add_argument("--backend", action="append",
+                    choices=("bert-squad", "smollm2", "smollm2-135m-instruct", "echo"),
                     help="backend(s) to serve (default: bert-squad); the first is the default model")
+    ap.add_argument("--resident", choices=("auto", "one", "all"), default="auto",
+                    help="which FPGA models stay loaded (see above; default auto)")
+    ap.add_argument("--cma-margin-mb", type=float, default=32.0,
+                    help="--resident auto: CmaFree to keep beyond a model's own need")
     ap.add_argument("--bert-lib", default=os.path.join(HERE, "lib", "libbert_squad.so"))
     ap.add_argument("--bert-weights", default=None,
                     help="weights directory (holds weights/*.dat); default: the one the library was built for")
@@ -698,6 +881,31 @@ def main(argv=None) -> int:
     ap.add_argument("--max-windows", type=int, default=8,
                     help="256-token windows per question at most (latency cap, ~1 s each)")
     ap.add_argument("--doc-stride", type=int, default=128)
+    g = ap.add_argument_group("smollm2 (generative chat)")
+    g.add_argument("--llm-lib", default=os.path.join(HERE, "lib", "libsmollm2.so"))
+    g.add_argument("--llm-weights", default=None,
+                   help="weights directory for llm_open(); default: the one the library was built for")
+    g.add_argument("--llm-tokenizer", default=_first_existing(
+        os.path.join(HERE, "smollm2", "tokenizer.json"),
+        os.path.join(HERE, "assets", "smollm2-135m-instruct", "tokenizer.json")))
+    g.add_argument("--llm-sampler-lib", default=None,
+                   help="libsampler.so (default lib/libsampler.so; pure Python if it is missing)")
+    g.add_argument("--llm-context", type=int, default=1024,
+                   help="context size for trimming before the library is loaded (it reports its own)")
+    g.add_argument("--llm-reserve", type=int, default=256,
+                   help="answer tokens to keep free when trimming the history (max_tokens if smaller)")
+    g.add_argument("--llm-temperature", type=float, default=0.2, help="default temperature (0: greedy)")
+    g.add_argument("--llm-top-p", type=float, default=0.9, help="default top_p")
+    g.add_argument("--llm-top-k", type=int, default=50, help="default top_k (0: off)")
+    g.add_argument("--llm-repetition-penalty", type=float, default=1.0, help="default (1: off)")
+    g.add_argument("--llm-repeat-last-n", type=int, default=64,
+                   help="penalty window in tokens (0: off, -1: the whole context)")
+    g.add_argument("--llm-prefill-chunk", type=int, default=0,
+                   help="split prefills into calls of at most N tokens (cancellable between them); 0: one call")
+    g.add_argument("--llm-cma-mb", type=float, default=360.0,
+                   help="CMA the loaded model holds (MB), for --resident auto")
+    g.add_argument("--llm-fake", choices=("float", "scripted"), default=None,
+                   help="development without the FPGA: tests/fake_llm.py instead of libsmollm2.so")
     ap.add_argument("--queue-timeout", type=float, default=120.0,
                     help="seconds a request may wait for the FPGA before a 503")
     ap.add_argument("--max-queue", type=int, default=16, help="requests waiting at most")
@@ -708,19 +916,22 @@ def main(argv=None) -> int:
             args.api_key = f.read().strip()
 
     backends = build_backends(args)
-    for mid, b in backends.items():
-        t0 = time.monotonic()
-        try:
-            b.load()
-        except Exception as e:                                 # noqa: BLE001
-            log(f"error: loading '{mid}' failed: {e}")
-            for other in backends.values():
-                other.close()
-            return 1
-        log(f"loaded '{mid}' in {time.monotonic() - t0:.1f} s")
-
     srv = ChatServer((args.host, args.port), backends, api_key=args.api_key,
-                     queue_timeout=args.queue_timeout, max_queue=args.max_queue)
+                     queue_timeout=args.queue_timeout, max_queue=args.max_queue,
+                     resident=args.resident, cma_margin_mb=args.cma_margin_mb)
+    try:
+        for mid, b in backends.items():
+            t0 = time.monotonic()
+            b.load_host()
+            if time.monotonic() - t0 > 0.05:
+                log(f"'{mid}': host side ready in {time.monotonic() - t0:.1f} s")
+        srv.load_startup()
+    except Exception as e:                                     # noqa: BLE001
+        traceback.print_exc()
+        log(f"error: loading failed: {e}")
+        srv.close_models()
+        srv.server_close()
+        return 1
 
     def stop(signum, _frame):
         log(f"signal {signum}: shutting down")
@@ -729,7 +940,8 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log(f"kv260-chat {VERSION} listening on http://{args.host}:{args.port}/v1  "
-        f"models: {', '.join(backends)}  api key: {'required' if args.api_key else 'none'}")
+        f"models: {', '.join(m + ('' if srv.loaded[m] else ' (loads on request)') for m in backends)}"
+        f"  resident: {args.resident}  api key: {'required' if args.api_key else 'none'}")
     try:
         srv.serve_forever(poll_interval=0.5)
     finally:
@@ -737,8 +949,7 @@ def main(argv=None) -> int:
         # let a running request finish before the model goes away
         if srv.fpga.acquire(60.0) != "ok":
             log("warning: a request is still running; closing anyway")
-        for b in backends.values():
-            b.close()
+        srv.close_models()
         log("stopped")
     return 0
 

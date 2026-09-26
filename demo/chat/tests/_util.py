@@ -81,3 +81,41 @@ def wait_until(pred, timeout=5.0, step=0.01):
             return True
         time.sleep(step)
     return pred()
+
+
+# ── C helpers built on the host for the tests (libsampler.so, the fake libsmollm2) ──
+
+_BUILD = {}
+
+
+def build_c(src: str, name: str):
+    """Compile src into a shared library in a temporary directory (once per
+    process); None when there is no C compiler."""
+    import atexit
+    import shutil
+    import subprocess
+    import tempfile
+    if name in _BUILD:
+        return _BUILD[name]
+    cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("gcc")
+    out = None
+    if cc:
+        if "_dir" not in _BUILD:
+            d = tempfile.mkdtemp(prefix="kv260_chat_tests_")
+            atexit.register(shutil.rmtree, d, True)
+            _BUILD["_dir"] = d
+        out = os.path.join(_BUILD["_dir"], name)
+        r = subprocess.run([cc, "-O2", "-Wall", "-shared", "-fPIC", "-o", out, src, "-lm"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"{cc} {src}: {r.stderr}")
+    _BUILD[name] = out
+    return out
+
+
+def sampler_lib():
+    return build_c(os.path.join(CHAT, "src", "sampler.c"), "libsampler.so")
+
+
+def fake_llm_lib():
+    return build_c(os.path.join(HERE, "fake_libsmollm2.c"), "libfakellm.so")
