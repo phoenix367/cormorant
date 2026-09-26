@@ -317,8 +317,11 @@ def main(argv=None) -> int:
                 pargs.reopen = False
                 ptext = run_bench(session, remote_proj, "build_prof", pargs, "prof")
                 pres = parse(ptext)
+                # decode: the profile covers the first prompt's decode steps;
+                # prefill_<n>: llm_bench resets it before each repetition, so
+                # it holds exactly one call
                 results["profile"] = {
-                    ph: breakdown(p, layers, per=(args.decode if ph == "decode" else args.reps))
+                    ph: breakdown(p, layers, per=(args.decode if ph == "decode" else 1))
                     for ph, p in pres["profiles"].items()}
                 results["profile_runs"] = {"prompts": pres["prompts"], "prefill": pres["prefill"],
                                            "summary": pres.get("llm_summary")}

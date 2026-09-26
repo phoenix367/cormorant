@@ -87,6 +87,11 @@ RUNTIME_GROUPS = {
               "_llm_silu_slots", "llm_silu_slot_t",
               "if (llm_silu_table(T->f) != 0) return -1;",
               "llm_silu_free(T->f);"),
+    "attn":  ("typedef struct {\n    unsigned n;                     /* cache values of one layer */\n"
+              "} llm_attn_slot_t;",
+              "_llm_attn_slots", "llm_attn_slot_t",
+              "if (llm_attn_reserve(T->n) != 0) return -1;",
+              "(void)T; llm_attn_release();"),
 }
 
 
@@ -589,6 +594,8 @@ class LlmAttentionNode(LlmNode):
         items = super().c_runtime()
         for t in (self.q0, self.k0, self.v, self.ck, self.cv, self.output):
             items.append(self._scales(t)[2])
+        n = self.C * self.KV * self.HD
+        items.append(RuntimeItem(key=f"attn:{n}", decl="", group="attn", row=f"{{ {n}u }}"))
         return items
 
     def describe(self):
@@ -983,10 +990,17 @@ static void llm_dequant(const Data_t *x, const double *sx, unsigned count, unsig
 
 /* ---- LlmAttention (xattn) ----
  * Rows t < n (pos + t < C): RoPE(k0[t]) -> K cache row pos + t at its
- * exponent, v[t] re-rounded -> V cache row.  Then per (t, head h), over the
- * keys j <= pos + t: RoPE(q0[t,h]) in double, s_j = dot8(q, k_j) * scale,
- * e_j = exp(s_j - max), sum left to right, p_j = e_j / sum,
- * o[d] = sum_j p_j v_j[d] -> pv[t][h*HD + d].  Rows t >= n get pv = 0. */
+ * exponent, v[t] re-rounded -> V cache row.  The cache rows the queries read
+ * (0 .. pos + n - 1) are converted once to their exact double values
+ * (raw * 2^-f, the same bits the per-pair expression gives) into a scratch
+ * when n > 1 (prefill; a decode step converts inline — one query per row).
+ * Then per (t, head h), over the keys j <= pos + t: RoPE(q0[t,h]) in double,
+ * s_j = dot8(q, k_j) * scale, e_j = exp(s_j - max), sum left to right,
+ * p_j = e_j / sum, o[d] = sum_j p_j v_j[d] -> pv[t][h*HD + d].  Rows t >= n
+ * get pv = 0.  Work items are ordered head-major with the rows interleaved
+ * (item k: h = k / n, t = k % n), so the host threads' contiguous ranges get
+ * equal shares of the causal work.  Every sum keeps its order: the result
+ * does not depend on the thread count or on vectorisation (lanes only). */
 typedef struct {
     const Data_t *q0, *k0, *v;
     const double *sq, *sk, *sv;
@@ -1005,6 +1019,47 @@ typedef struct {
 #  define LLM_MAX_HD 256u
 #endif
 
+static double  *_llm_attn_kd = NULL, *_llm_attn_vd = NULL;   /* exact K / V values */
+static unsigned _llm_attn_cap = 0u;
+
+static int llm_attn_reserve(unsigned n)
+{
+    if (n <= _llm_attn_cap) return 0;
+    free(_llm_attn_kd);
+    free(_llm_attn_vd);
+    _llm_attn_kd = (double *)malloc((size_t)n * sizeof(double));
+    _llm_attn_vd = (double *)malloc((size_t)n * sizeof(double));
+    _llm_attn_cap = (_llm_attn_kd && _llm_attn_vd) ? n : 0u;
+    return _llm_attn_cap ? 0 : -1;
+}
+
+static void llm_attn_release(void)
+{
+    free(_llm_attn_kd);
+    free(_llm_attn_vd);
+    _llm_attn_kd = _llm_attn_vd = NULL;
+    _llm_attn_cap = 0u;
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC push_options
+#  pragma GCC optimize ("tree-vectorize")    /* lane-wise only: bits unchanged */
+#endif
+static void llm_attn_convert(void *p, unsigned r0, unsigned r1)
+{
+    const llm_attn_t *a = (const llm_attn_t *)p;
+    const unsigned    kvhd = a->KV * a->HD;
+    unsigned          r, c;
+    for (r = r0; r < r1; r++) {
+        const int16_t *kr = a->ck + (size_t)r * kvhd, *vr = a->cv + (size_t)r * kvhd;
+        double        *kd = _llm_attn_kd + (size_t)r * kvhd, *vd = _llm_attn_vd + (size_t)r * kvhd;
+        for (c = 0u; c < kvhd; c++) {
+            kd[c] = (double)kr[c] * a->sck[c];
+            vd[c] = (double)vr[c] * a->scv[c];
+        }
+    }
+}
+
 static void llm_attn_items(void *p, unsigned i0, unsigned i1)
 {
     const llm_attn_t *a = (const llm_attn_t *)p;
@@ -1012,7 +1067,7 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
     double            q[LLM_MAX_HD], o[LLM_MAX_HD], e[LLM_MAX_KEYS];
     unsigned          it;
     for (it = i0; it < i1; it++) {
-        const unsigned t = it / a->H, h = it % a->H, g = h / grp, pp = a->pos + t;
+        const unsigned t = it % a->n, h = it / a->n, g = h / grp, pp = a->pos + t;
         const Data_t  *qr = a->q0 + (size_t)t * a->H * HD + (size_t)h * HD;
         const double  *sq = a->sq + (size_t)h * HD;
         const float   *cs = a->cos + (size_t)pp * half, *sn = a->sin + (size_t)pp * half;
@@ -1026,14 +1081,23 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
             q[d] = x * (double)cs[d % half] + r * (double)sn[d % half];
         }
         for (j = 0u; j < nk; j++) {
-            const int16_t *kr = a->ck + (size_t)j * kvhd + (size_t)g * HD;
-            const double  *sk = a->sck + (size_t)g * HD;
-            double         acc[8], s;
-            for (l = 0u; l < 8u; l++)
-                acc[l] = q[l] * ((double)kr[l] * sk[l]);
-            for (d = 8u; d < HD; d += 8u)
+            double acc[8], s;
+            if (a->n > 1u) {                        /* prefill: converted rows */
+                const double *kr = _llm_attn_kd + (size_t)j * kvhd + (size_t)g * HD;
                 for (l = 0u; l < 8u; l++)
-                    acc[l] += q[d + l] * ((double)kr[d + l] * sk[d + l]);
+                    acc[l] = q[l] * kr[l];
+                for (d = 8u; d < HD; d += 8u)
+                    for (l = 0u; l < 8u; l++)
+                        acc[l] += q[d + l] * kr[d + l];
+            } else {                                /* decode: the int16 cache row */
+                const int16_t *kr = a->ck + (size_t)j * kvhd + (size_t)g * HD;
+                const double  *sk = a->sck + (size_t)g * HD;
+                for (l = 0u; l < 8u; l++)
+                    acc[l] = q[l] * ((double)kr[l] * sk[l]);
+                for (d = 8u; d < HD; d += 8u)
+                    for (l = 0u; l < 8u; l++)
+                        acc[l] += q[d + l] * ((double)kr[d + l] * sk[d + l]);
+            }
             s = (((acc[0] + acc[1]) + (acc[2] + acc[3]))
                  + ((acc[4] + acc[5]) + (acc[6] + acc[7]))) * a->scale;
             e[j] = s;
@@ -1044,15 +1108,25 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
             sum += e[j];
         }
         for (j = 0u; j < nk; j++) {
-            const int16_t *vr = a->cv + (size_t)j * kvhd + (size_t)g * HD;
-            const double  *sv = a->scv + (size_t)g * HD;
-            const double   pj = e[j] / sum;
-            if (j == 0u)
-                for (d = 0u; d < HD; d++)
-                    o[d] = pj * ((double)vr[d] * sv[d]);
-            else
-                for (d = 0u; d < HD; d++)
-                    o[d] += pj * ((double)vr[d] * sv[d]);
+            const double pj = e[j] / sum;
+            if (a->n > 1u) {
+                const double *vr = _llm_attn_vd + (size_t)j * kvhd + (size_t)g * HD;
+                if (j == 0u)
+                    for (d = 0u; d < HD; d++)
+                        o[d] = pj * vr[d];
+                else
+                    for (d = 0u; d < HD; d++)
+                        o[d] += pj * vr[d];
+            } else {
+                const int16_t *vr = a->cv + (size_t)j * kvhd + (size_t)g * HD;
+                const double  *sv = a->scv + (size_t)g * HD;
+                if (j == 0u)
+                    for (d = 0u; d < HD; d++)
+                        o[d] = pj * ((double)vr[d] * sv[d]);
+                else
+                    for (d = 0u; d < HD; d++)
+                        o[d] += pj * ((double)vr[d] * sv[d]);
+            }
         }
         {
             Data_t       *y = a->pv + (size_t)t * a->H * HD + (size_t)h * HD;
@@ -1062,6 +1136,9 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
         }
     }
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC pop_options
+#endif
 
 static void llm_attention(llm_attn_t *a)
 {
@@ -1070,9 +1147,10 @@ static void llm_attention(llm_attn_t *a)
     if (n > a->T) n = a->T;
     if (a->pos >= a->C) n = 0u;
     else if (n > a->C - a->pos) n = a->C - a->pos;
-    if (a->pos + n > LLM_MAX_KEYS || HD > LLM_MAX_HD) {
-        fprintf(stderr, "llm_attention: %u keys / head_dim %u above LLM_MAX_KEYS / LLM_MAX_HD\n",
-                a->pos + n, HD);
+    if (a->pos + n > LLM_MAX_KEYS || HD > LLM_MAX_HD
+            || (size_t)(a->pos + n) * kvhd > _llm_attn_cap) {
+        fprintf(stderr, "llm_attention: %u keys / head_dim %u above LLM_MAX_KEYS / LLM_MAX_HD"
+                " or the scratch\n", a->pos + n, HD);
         n = 0u;
     }
     for (t = 0u; t < n; t++) {
@@ -1091,7 +1169,11 @@ static void llm_attention(llm_attn_t *a)
         }
     }
     a->n = n;
-    host_parallel(llm_attn_items, a, n * a->H, 1u, 1u);
+    if (n) {
+        if (n > 1u)                  /* prefill: each key row serves n queries */
+            host_parallel(llm_attn_convert, a, a->pos + n, 32u, 1u);
+        host_parallel(llm_attn_items, a, n * a->H, 1u, 1u);
+    }
     if (n < a->T)
         memset(a->pv + (size_t)n * a->H * HD, 0, (size_t)(a->T - n) * a->H * HD * sizeof(Data_t));
 }
