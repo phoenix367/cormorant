@@ -44,6 +44,14 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   integer tensors (token ids, masks) are supported as raw int16
   ([§Integer tensors](#integer-tensors)).  This is what makes BERT-base
   (bertsquad-12) schedulable — [`BERT_PLAN.md`](BERT_PLAN.md).
+- **Llama-family decoder ops** (custom domain `axi.llm`, `src/llm_nodes.py`)
+  — `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd`, `LlmAttention` (RoPE + KV cache
+  + causal GQA attention as one float region), `LlmSiluMul`,
+  `LlmSelectRow`, `LlmDequant`; the graphs come from the Llama frontend
+  (`src/llama.py`, [§Llama-family decoders](#llama-family-decoders)) with
+  power-of-two exponents, float / int host tensors and persistent states
+  ([§Numerics beyond the element type](#numerics-beyond-the-element-type)).
+  This is what runs SmolLM2-135M-Instruct — [`CHAT_PLAN.md`](CHAT_PLAN.md) §13.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -84,8 +92,15 @@ python3 -m venv .venv
 .venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 .venv/bin/python test/gen_bert_models.py        # tiny BERT-like models (host ops, fusion)
 
+.venv/bin/python test/gen_llama_models.py       # tiny random Llama (decoder ops, exponents)
+
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
+
+# A multi-entry project: one library, inference_run_<name>() per graph,
+# one weight pool (weights deduplicated), shared states
+.venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
+    --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
 # Run the full test suite
 .venv/bin/python -m pytest test/ -v
@@ -111,6 +126,12 @@ inference_scheduler.py          CLI, argument parsing
     ├── host_nodes.py           HostNode family (Softmax, LayerNorm, Gelu,
     │                           Transpose, Slice, Gather, OneHot, Cast):
     │                           numpy reference + C helper library
+    ├── llm_nodes.py            axi.llm host ops of Llama decoders (Embed,
+    │                           RMSNorm, ResAdd, Attention, SiluMul, ...)
+    ├── numeric.py              axi.numeric metadata: power-of-two exponents,
+    │                           host tensors, states; rank-1 weight encoding
+    ├── llama.py                Llama frontend: config + safetensors +
+    │                           formats -> fixed-shape entry graphs
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
     ├── matmul_lowering.py      MatMul -> ConvKernel engine choice and geometry
@@ -125,11 +146,15 @@ inference_scheduler.py          CLI, argument parsing
                     _simulate.py  fixed-point forward simulation
                     _test.py    test/test_inference.c  (on-device smoke test)
                     _cmake.py   CMakeLists.txt
+                    multi.py    MultiEntryGenerator (several graphs, one
+                                weight pool, shared states)
 ```
 
 ### OnnxGraph loading sequence
 
-1. `onnx.load()` + `onnx.checker.check_model()` — structural validation.
+1. `onnx.load()` (or an in-memory `onnx.ModelProto`, e.g. from
+   `src/llama.py`) + `onnx.checker.check_model()` — structural validation;
+   the `axi.numeric` metadata is parsed (`src/numeric.py`).
 2. `shape_inference.infer_shapes()` — fills intermediate tensor shapes.
 3. `fusion.fold_constant_nodes()` — `Constant` nodes become initializers.
 4. `_preprocess_model()` — rewrites `Gemm` → `MatMul` + optional `Add`.
@@ -138,16 +163,24 @@ inference_scheduler.py          CLI, argument parsing
 7. `fusion.fuse_patterns()` (when `fuse_patterns=True`, the default) —
    LayerNorm / GELU fusion and VectorOP constant-broadcast normalisation.
 8. Build tensor registry (weights, inputs, intermediates, outputs).
-9. Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` / `ReshapeNode`
-   / `ScheduledNode` / a host node (`host_nodes.HOST_OP_FACTORIES`) based on
-   `op_type`; kernel nodes reading an integer tensor are rejected.
+9. The numeric annotations are applied to the tensor registry
+   (exponents, host tensors, states — states leave the input / weight
+   lists).  Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` /
+   `ReshapeNode` / `ScheduledNode` / a host node (`host_nodes.HOST_OP_FACTORIES`,
+   or `llm_nodes.LLM_OP_FACTORIES` for the `axi.llm` domain) based on
+   `op_type`; kernel nodes reading an integer tensor are rejected; then
+   `numeric.check` (only MatMuls and the LLM ops touch exponent / host /
+   state tensors) and `numeric.encode_matmul_weights` (rank-1 weight
+   exponents, before any packing or re-layout).
 10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
    into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
    re-pointed) and renumbers node indices.
 11. `matmul_lowering.lower_matmuls()` (`matmul_on_conv="auto"`, the
    default) — MatMuls estimated faster on ConvKernel become
    `MatmulConvNode`s, their constant B re-laid out when `kw > 1`
-   ([§MatMul on ConvKernel](#matmul-on-convkernel)).
+   ([§MatMul on ConvKernel](#matmul-on-convkernel)); `matmul_conv_kw`
+   ({weight: kw}) pins kernel widths (a multi-entry project's prefill
+   buckets must re-lay out a shared weight identically).
 12. `_pack_matmul_weights()` (the remaining MatmulNodes), then
    `_choose_slice_views()` (contiguous Slice pieces that may alias their
    source).
@@ -495,6 +528,165 @@ fills an integer input with `p[i] = i % R` — R the smallest Gather table /
 OneHot depth that reads it, else 2 (a 0/1 mask) — and compares integer
 outputs exactly (printed with `%d`).
 
+### Numerics beyond the element type
+
+`src/numeric.py` (doc/CHAT_PLAN.md §10.5).  A model may carry, in its
+`metadata_props` under the key `axi.numeric`, a JSON object
+
+```json
+{"exp":       {"tensor": 11, "other": [9, 10, 12, ...]},
+ "host":      {"tensor": "f32" | "i32" | "i16"},
+ "state":     ["kv.k.l0", "h_last", ...],
+ "test_fill": {"pos": 3}}
+```
+
+Models without it are unaffected (every existing generated project is
+byte-identical).
+
+**Power-of-two exponents (`exp`).**  A fixed-point tensor stores raw int16
+with value `raw · 2^-f`; `f` is an int or one int per last-axis channel
+(`TensorInfo.exp`; 8 is ap_fixed<16,8> itself, the default).  The kernels
+never see `f`: MatmulKernel / ConvKernel multiply raw operands, sum exactly
+in ap_fixed<32,16> — an int32 raw sum that wraps — and write
+`floor(acc / 2^8)` saturated.  So a MatMul keeps
+`f_out[j] = f_in[i] + f_w[i][j] − 8` for every `i`, and its constant B is
+encoded (round half to even, saturate) at the **rank-1 weight exponent**
+`f_w[i][j] = f_out[j] + 8 − f_in[i]` (`numeric.encode_matmul_weights`,
+before any packing: `TensorInfo.data` then holds `raw / 256`, so every
+existing encode / pack / re-layout path emits the raw bits unchanged, and
+`TensorInfo.wexp` gives the simulator the values `data · 2^(8 − wexp)`).
+Only MatMuls (constant B) and the LLM host ops may touch exponent tensors;
+a weight read by two MatMuls with different exponents, an exponent on a
+VectorOP / Conv / Pool tensor, or a Reshape that changes a per-channel
+exponent's channels is rejected.  Simulation (`_SimulateMixin._matmul_exp`):
+`acc = (A·B) · 2^(f_out + 8)` is an exact integer in float64 (every column's
+products share one scale), the int32 wrap is applied, then
+`floor(acc / 256)`, saturate, `/ 2^f_out`; host ops read `raw · 2^-f[c]`
+(exact) and write `round_half_even(v · 2^f[c])` saturated, NaN → 0
+(`DataType.quantize_exp`; C `llm_ld` / `llm_st` with per-channel `double`
+scale arrays built at init by `ldexp` from int8 exponent tables).
+`test/test_numeric.py` checks the encoding and the simulation against
+explicit integer arithmetic (incl. a wrapping accumulator) and the generated
+C on the host emulation.
+
+**Host tensors (`host`).**  `f32` (float32 — a transformer's residual
+stream), `i32` (token ids, positions, valid-row counts) and `i16` (raw int16
+at its exponent — a KV cache only host ops read) tensors live in host
+memory, never in a DMA buffer: intermediates in one malloc'd arena
+(`s_host_arena`, 64-byte slots reused by the same event-stream liveness
+colouring as the DMA pool, `_compute_host_layout`), graph inputs / outputs
+as plain pointers in `inference_run()`'s signature (`const int32_t *ids`,
+`float *logits`).  Only the LLM host ops read or write them; kernels,
+syncs and `host_in` / `host_out` never see them (the coherency audit
+checks it).  `TensorInfo.is_host`, `OnnxGraph.host_tensors`.
+
+**States (`state`).**  Persistent across `inference_run()` calls and shared
+by the entries of a multi-entry project: an initializer (its initial VALUE —
+the C init image is the raw encoding of its non-zero prefix, e.g. a KV
+cache's sink row; the rest is zeroed) or a node output written in place
+(e.g. `h_last`, a prefill's last row handed to the head entry).  Host ops
+also update states in place (the KV cache rows).  States are external to
+the DAG (like weights), excluded from buffer reuse (`OnnxGraph.state_tensors`),
+allocated in `inference_init()` and freed in `inference_deinit()`; the
+simulator keeps them in a dict it updates in place
+(`_forward_pass(..., states=)`, `initial_states()`).  Only host states are
+supported (a DMA state would need range syncs around every write).
+
+**Test harness.**  Host inputs are filled with `test_fill` constants or
+`i % R` (ids: R = the embedding rows), f32 as `(i % 17 − 8) · 0.25`;
+exponent inputs with the raw ramp; host outputs are compared bit for bit
+(`memcmp`, float literals that round-trip).
+
+### Llama-family decoders
+
+`src/llama.py` + `src/llm_nodes.py` (doc/CHAT_PLAN.md §3.2 B1–B2, §12).
+The **frontend** writes fixed-shape ONNX entry graphs directly from a
+checkpoint — `config.json` (layers, hidden, heads, KV heads, head_dim, FFN,
+vocab, RoPE θ, RMSNorm ε, tied embedding) + `model.safetensors` + the
+calibrated formats JSON of `demo/chat/scripts/llm_study.py formats`
+(exponents per `class@layer`, the sink K / V rows) — with one standard
+`MatMul` per linear (weights `w.l<i>.<q|k|v|o|g|u|d>` = Wᵀ, shared by name
+across entries) and `axi.llm` host ops for the rest; every tensor except
+weights / states is prefixed with the entry name.  Nothing beyond
+config.json is model specific (SmolLM2-360M or another Llama checkpoint is
+a regeneration).  Entries (T rows, C = context incl. the sink):
+
+| entry | inputs | outputs | |
+|---|---|---|---|
+| `decode` | `ids[1]`, `pos[1]` (i32) | `logits[1][V]` (f32) | one token; KV cache += 1 row |
+| `prefill_<T>` | `ids[T]`, `pos[1]`, `n[1]` | state `h_last` | rows ≥ n are padding (computed, never written to the cache) |
+| `head` | state `h_last` | `logits[1][V]` | final RMSNorm + LM head |
+
+Per layer: `x = RMSNorm(h)`, `q0 / k0 / v = MatMul(x)`,
+`pv = LlmAttention(q0, k0, v, pos, n, kv.k.l, kv.v.l)`, `o = MatMul(pv)`,
+`h1 = ResAdd(h, o)`, `x2 = RMSNorm(h1)`, `g / u = MatMul(x2)`,
+`a = SiluMul(g, u)`, `d = MatMul(a)`, `h2 = ResAdd(h1, d)`; `h` (f32) is the
+residual stream.  The KV caches are i16 host states `[C][KV·HD]` whose row 0
+is the precomputed position-0 sink; `pos` ≥ 1.
+
+**Host ops** (numeric contract as for the other host ops — double
+arithmetic, left-to-right sums, no FMA contraction, libm exp, round half to
+even on write-back, NaN → 0 — with per-channel exponents; each op's C and
+`reference()` are checked against each other on the host emulation,
+`test/test_llm_ops.py`):
+
+| op | semantics |
+|---|---|
+| `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32; `weights/<name>.dat` when > 64 KiB), index clamped |
+| `LlmResAdd` | `h' = float32((double)h + d)` |
+| `LlmRMSNorm` | `ss = Σ h²`, `r = 1 / sqrt(ss / n + ε)`, `y = (h·r)·γ` (γ float32) |
+| `LlmAttention` | rows t < n: `RoPE(k0[t])` → K cache row `pos + t` at its exponent, `v[t]` re-rounded into the V cache; per (t, head): `RoPE(q)` in double, `s_j = dot8(q, k_j) · HD^-½` over keys `j ≤ pos + t` (8 lane sums over d ascending, combined `((0+1)+(2+3))+((4+5)+(6+7))`), `e_j = exp(s_j − max)`, `p_j = e_j / Σe`, `o = Σ_j p_j v_j`; rows ≥ n → 0; 4 host threads over (row, head) |
+| `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
+| `LlmSelectRow` | `h_last = h[n − 1]` |
+| `LlmDequant` | `y = float32(raw · 2^-f[c])` |
+
+RoPE uses float32 cos / sin tables `[C][HD/2]` computed by the frontend
+exactly as `llm_study.rope_tables` (host tables).  The ops are the numeric
+policy `pow2+sink+p12+xattn` of the study; `demo/chat/scripts/llm_sched_check.py`
+shows the scheduler's simulation of SmolLM2-135M equal to the study's
+emulation bit for bit.
+
+### Multi-entry projects
+
+`src/codegen/multi.py` (`MultiEntryGenerator`; CLI `--entry NAME=MODEL.onnx`
+repeated).  One `inference.c` with `inference_run_<name>()` per entry graph:
+
+* **weights deduplicated** by name AND emitted image: entries that read an
+  initializer in the same layout share one DMA buffer; an entry that needs
+  another layout (the MatmulKernel packed image vs a MatMul-on-ConvKernel
+  image) gets its own copy renamed `<name>@<k>`;
+* **states shared by name** (shape, host kind and exponents must agree);
+* entries never run concurrently, so the **intermediates of all entries
+  overlap** in one pool region (each entry keeps its own liveness-coloured
+  slots inside it) — likewise the host arena and the host-op staging arena;
+* **node indices are global** (entry after entry): the per-layer profiler and
+  `inference_layer_names_ptr()` cover every entry
+  (`INFERENCE_ENTRY_<NAME>_FIRST_LAYER`);
+* `inference_deinit()` also releases the kernel drivers (UIO `munmap` /
+  `close` via `X*_Release()` on Linux), so init / deinit can cycle (the
+  generated test runs every entry once over shared states, then deinit,
+  init and the first entry again).
+
+**Compact form** (every multi-entry project and every project with numeric
+metadata; existing models keep the straight-line form byte for byte): the
+pool views of `inference_init()` / `inference_deinit()` and the host-op
+runtime objects (exponent-scale arrays, silu tables) are set up from
+constant descriptor tables by one loop each, silu tables are indexed by the
+gate exponent at run time, and run functions are split into `noinline`
+parts of 40 nodes.  Straight-line init code taking the addresses of
+thousands of statics that the run functions read drove GCC's integrated
+register allocator past 3 GB for SmolLM2 (the KV260's gcc 11 at -O2 starved
+the board; aarch64 gcc 13 -O1 on the host: 2.59 GB); the compact form
+peaks at 124 / 196 MB (aarch64 -O1 / -O2).
+
+The union-level parts (weights, kernel instances, run helpers, host-op
+helpers and tables, init / deinit) come from a `CodeGenerator` over a
+`CombinedGraph` facade (the entries' node lists concatenated), each run
+function from its entry's own `CodeGenerator` — its event stream, waits,
+liveness and cache maintenance are exactly those of a single-entry project
+of that graph.  `test/test_llama.py` builds a four-entry tiny-Llama project
+and runs it on the host emulation.
+
 ### MatMul on ConvKernel
 
 [`BERT_PLAN.md`](BERT_PLAN.md) §2 2A.  ConvKernel's 16 × 16 MAC grid runs
@@ -617,8 +809,11 @@ int  inference_init(const char *vectoropkernel_instance
                     [, const char *convkernel_instance]
                     [, const char *poolkernel_instance]);
 
-// All graph inputs, then all graph outputs (integer tensors hold raw int16):
+// All graph inputs, then all graph outputs (integer tensors hold raw int16;
+// host-memory tensors are plain pointers: const int32_t *ids, float *logits):
 void inference_run(inference_buf_t *<input...>, inference_buf_t *<output...>);
+// multi-entry project: one per entry instead
+void inference_run_<entry>(...);
 void inference_deinit(void);
 
 // DMA buffers (inference_buf.c): XRT buffer objects on Linux

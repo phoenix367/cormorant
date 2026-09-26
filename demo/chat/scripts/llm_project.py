@@ -88,7 +88,7 @@ def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[st
 # Board cost of one prefill call per bucket, ms, without the host attention
 # (it covers only the valid rows, so it does not depend on the split) and the
 # head (run once per llm_prefill): KV260, 100 MHz, hw_128 bitstream, profiled
-# 2026-09-26 (CHAT_PLAN §12.4).  The ConvKernel MatMuls stream the weights
+# 2026-09-26 (CHAT_PLAN §13.4).  The ConvKernel MatMuls stream the weights
 # once per call, so a padded 64-row call costs little more than a 16-row one.
 BUCKET_COST_MS = {16: 304, 64: 364, 256: 930}
 
