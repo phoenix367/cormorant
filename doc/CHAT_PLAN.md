@@ -1432,3 +1432,138 @@ architecture, culture, history, and cuisine, …".)
   and succeeded on retry.
 * The whole-buffer syncs of the softmax input / output (1.5 MiB each at
   T 256) could be limited to the run-time extent (~0.4 ms per layer).
+
+## 17. Decode attention on all host threads (2026-09-27)
+
+**Symptom.**  In a long chat every answer came out slower: 5.0 tokens/s at
+~40 cached positions, 3.7 at ~710 (server log `decode=`).  The decode step's
+attention (`LlmAttention`, policy xattn: exact double on the host) reads every
+cached key for every token, so its cost grows linearly with the position,
+while the rest of the step (weight streaming, ~195 ms) does not.
+
+**Where the time went** (board microbenchmark of the generated C, 30 layers,
+H 9 / KV 3 / HD 64, VK 4, realistic score ranges):
+
+| position | per-head code, 4 threads | single thread |
+|---|---|---|
+| 32 | 4.4 ms / token | |
+| 512 | 39 ms | |
+| 1000 | 75 ms | 215 ms (~8 cycles per multiply-add) |
+
+* 9 heads over 4 threads → the busiest thread runs 3 heads (1.33× the mean).
+* Each head re-reads and re-converts its group's K / V rows (3 heads per KV
+  group read the same rows).
+* gcc 11 at `-O2` emitted scalar code with the query pointers spilled (the
+  `tree-vectorize` pragma did not vectorise these loops); per key the V row
+  address took two integer divisions by the run-time interleave.
+* The A53 does about one double operation per cycle, so a multiply-add
+  (separate multiply and add — no FMA, for bit-exactness) costs ≥ 2 cycles.
+
+**Change (`src/llm_nodes.py`, `llm_attn_decode`, used when n = 1).**  One
+pool dispatch per call (a pool wake-up is ~80 µs, too much per phase); inside
+it, phases separated by spin barriers:
+
+1. scores per (KV group, key quarter): the G = 3 heads of a group share each
+   K row load and int16 → double conversion; partial max per quarter;
+2. `exp(s − max)` per (group, key quarter);
+3. `Σe` per head, left to right (the reference order);
+4. `p = e / Σe` per (group, key quarter);
+5. P·V per (group, lane quarter): 8 lanes × 3 heads of accumulators stay in
+   registers across all keys, the keys walked block / lane / row (no
+   divisions).
+
+The power-of-two cache scales are folded out exactly: `q · 2^-f_k[d]` is
+exact, so the score terms are the same products; P·V sums `p · raw v` and
+multiplies by `2^-f_v` once — power-of-two scaling commutes with rounding
+while every term is normal, which holds for `p ≥ 2^-900` (a head with a
+smaller non-zero p keeps the per-term scale; a `q · 2^-f` below 2^-1000
+falls back to the per-head code).  On aarch64 the score and P·V kernels are
+NEON (`vmulq_f64` + `vaddq_f64`, int16 → f32 → f64 conversions, `vld4q_s16`
+for the ×4-interleaved V rows).  Every value is the per-head code's bit for
+bit for any thread count; prefill (n > 1) is unchanged.
+
+Env `INFERENCE_LLM_DECODE_PAR` (read once): `0` = the per-head code, `1` = the
+phases on all host threads (default), `2` = the phases on the calling thread
+only (no pool dispatch, no spin barriers) — the same bits in every mode
+(board, 950 decode steps each: 238 / 216 / 249 ms per token on average).
+
+Microbenchmark (same data, 4 threads; bit-exact against the per-head code on
+240 random cases incl. extreme score ranges, at 1–4 threads):
+
+| position | before | after | |
+|---|---|---|---|
+| 32 | 4.4 ms | 3.8 ms | 1.2× |
+| 256 | 20.5 ms | 10.4 ms | 2.0× |
+| 512 | 39.3 ms | 17.7 ms | 2.2× |
+| 768 | 57.9 ms | 25.5 ms | 2.3× |
+| 1000 | 74.6 ms | 32.7 ms | 2.3× |
+
+**Board** (`llm_board.py --decode-at 32,128,256,512,768,1000 --decode-at-steps
+8`: prefill to the position, then 8 greedy decode steps; the old library's
+bench rebuilt with the same `-D` for the baseline):
+
+| position | before | after | tokens / s |
+|---|---|---|---|
+| 32 | 197.3 ms | 197.7 ms | 5.07 → 5.06 |
+| 128 | 204.7 ms | 199.9 ms | 4.89 → 5.00 |
+| 256 | 214.4 ms | 204.2 ms | 4.66 → 4.90 |
+| 512 | 234.8 ms | 212.3 ms | 4.26 → 4.71 |
+| 768 | 253.8 ms | 220.2 ms | 3.94 → 4.54 |
+| 1000 | 270.9 ms | 227.8 ms | 3.69 → 4.39 |
+
+The growth over the context fell from ~74 to ~30 ms per token.  The FNV of
+every position's decode logits is identical before and after (bit-exact on
+the real model up to position 1000); the gate's logits are bit-exact with the
+simulation (4 prompts × 33), `threads_identical`, re-open identical;
+prefill 364 / 466 / 1314 ms and CMA unchanged.  The scheduler tests gained
+decode cases (G 1 / 2 / 3, VK 1 / 2 / 4, first / last row; a perturbed
+decode output fails 11 of them).
+
+**What is left of the slope** (~30 ms at 1000): the P·V and score kernels at
+~3 cycles per multiply-add (FP64 on the A53), 270 k `exp` + divisions per
+token.  Float32 attention would halve it but is a numeric-policy change (the
+study and the emulator define xattn in double).
+
+## 18. Board "hangs": a core parked in the PSCI power-down idle state (2026-09-26)
+
+**Symptom.**  During chat generation the token stream stopped, and some time
+later (0 – 3 minutes) the board stopped answering ping and SSH; three times in
+one evening (and likely the BERT-phase "userspace starvation" incident, §BERT
+phase 2).  Memory, CMA, power (INA260, 4.2 W) and temperature (≤ 35 °C) were
+normal up to the moment; the local journal showed other userspace still
+running for minutes after the network died.  The decode attention change of
+§17 was suspected first: it is not the cause (950-step `llm_bench` runs in all
+three `INFERENCE_LLM_DECODE_PAR` modes passed; the hangs are random in time).
+
+**Root cause (serial console + JTAG, the user's report of 2026-09-27).**  CPU1
+entered cpuidle state 1, `cpu-sleep-0` (PSCI core power-down).  TF-A v2.8
+(`xlnx_rebase_v2.8_2023.2`) set `APU.PWRCTL.CPUPWRDWNREQ` and parked the core
+on the final `wfi` of `psci_power_down_wfi` (EL3, GIC CPU interface off); the
+PMU firmware never powered it down (`PMU_GLOBAL.PWR_STATE` still shows it on),
+so it never wakes.  Its timer and IPI counters freeze; every task queued on it
+(a chat-server thread, `netwatch`, kthreads) never runs — the stream stops;
+later any all-CPU cross-call (`kick_all_cpus_sync`, e.g. `sshd`'s seccomp BPF
+JIT) spins forever on the caller's CPU (soft lockups, RCU stalls), each new
+SSH connection taking another core.  Each core powers down ~10 times a second
+when idle, so the lost handshake is a matter of time.
+
+**Workaround (applied on the board).**  Keep the cores out of the power-down
+state; WFI idle stays:
+
+```
+# /etc/tmpfiles.d/kv260-no-cpu-powerdown.conf   (applied at boot)
+w /sys/devices/system/cpu/cpu*/cpuidle/state1/disable - - - - 1
+```
+
+The rule is `board/kv260/kv260-no-cpu-powerdown.conf`; `demo/chat/deploy.py`'s
+preflight installs it when missing, applies it at once and says so.
+The rule applies a few seconds into boot (a few hundred power-downs happen
+before it); `cpuidle.off=1` on the kernel command line closes that window.
+The fix proper is newer boot firmware (`xmutil bootfw_update`: TF-A + PMU
+firmware) — then re-test with the state enabled.
+
+**Diagnosing the next one.**  Do not open SSH sessions to a board in this
+state (each one locks a core); use the serial console (FT4232H channel B,
+115200) — `/proc/interrupts` twice (a frozen `arch_timer` column), SysRq-l (a
+core that prints no backtrace).  Do not read PMU RAM over JTAG on a live
+system: it wedged the PMU and then CPU0.
