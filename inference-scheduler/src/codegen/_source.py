@@ -3,10 +3,13 @@
 from __future__ import annotations
 from typing import List
 
+import numpy as np
+
 from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulConvNode, MatmulNode, ScheduledNode,
                         SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
+from ..llm_nodes import RUNTIME_GROUPS, LlmNode, llm_c_helpers
 from ._banners  import _banner, _file_banner
 
 
@@ -153,10 +156,13 @@ class _SourceMixin:
             cnt = self._staged_count(io)
             ins.append((t, off, cnt, io))
             off += a8(cnt)
-        io = self._host_io_layout(sn.output)
-        cnt = self._staged_count(io)
-        out = (off, cnt, io)
-        off += a8(cnt)
+        if sn.output.is_host:
+            out = (off, 0, None)                  # host-memory output: no staging
+        else:
+            io = self._host_io_layout(sn.output)
+            cnt = self._staged_count(io)
+            out = (off, cnt, io)
+            off += a8(cnt)
         scratch = None
         if sn.scratch_bytes():
             scratch = off
@@ -222,13 +228,62 @@ class _SourceMixin:
         for kind in HOST_C_HELPER_ORDER:
             if kind in used:
                 parts.append(host_c_helper(kind, lut))
+        if "llm" in used:
+            parts.append(llm_c_helpers())
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))
         if consts:
             parts.append("/* Per-node host-op constants */\n" + "\n".join(consts) + "\n")
+        items = self._llm_runtime_items()
+        if items:
+            groups = self._llm_runtime_groups(items)
+            parts.append("/* LLM host-op runtime objects: exponent scales, tables (built in\n"
+                         " * host_runtime_init) */\n"
+                         + "\n".join(it.decl for it in items if it.decl) + "\n")
+            for g, rows in groups.items():
+                struct, table, ctype, _i, _f = RUNTIME_GROUPS[g]
+                parts.append(f"{struct}\nstatic const {ctype} {table}[{len(rows)}] = {{\n"
+                             + ",\n".join("    " + r for r in rows) + "\n};\n")
         parts.append(self._host_runtime_functions())
         return "\n".join(parts)
+
+    def _llm_runtime_items(self) -> list:
+        """Distinct runtime items (llm_nodes.RuntimeItem) of the LLM host ops,
+        in first-use order."""
+        seen: dict = {}
+        for sn in self._host_nodes:
+            if isinstance(sn, LlmNode):
+                for it in sn.c_runtime():
+                    if it.key in seen:
+                        if seen[it.key] != it:
+                            raise SchedulerError(f"host runtime item {it.key}: conflicting "
+                                                 f"definitions")
+                        continue
+                    seen[it.key] = it
+        return list(seen.values())
+
+    @staticmethod
+    def _llm_runtime_groups(items) -> dict:
+        """{group: [row, ...]} of the grouped runtime items (RUNTIME_GROUPS order)."""
+        out: dict = {}
+        for g in RUNTIME_GROUPS:
+            rows = [it.row for it in items if it.group == g]
+            if rows:
+                out[g] = rows
+        return out
+
+    def host_table_files(self) -> list:
+        """[(weights/<name>.dat, bytes)] of the LLM host tables that are
+        loaded from files at init (llm_nodes.HostTable.is_file)."""
+        out, seen = [], set()
+        for sn in self._host_nodes:
+            if isinstance(sn, LlmNode):
+                for tb in sn.tables():
+                    if tb.is_file and tb.name not in seen:
+                        seen.add(tb.name)
+                        out.append((tb.name, tb))
+        return out
 
     def _host_runtime_functions(self) -> str:
         """host_runtime_init() / host_runtime_deinit(): the thread pool and
@@ -238,6 +293,18 @@ class _SourceMixin:
                 if name != "s_host_exp_lut"]          # declared with its helper
         init = [f"    if ({call} != 0) return -1;" for _, call in luts]
         free = [f"    free({name}); {name} = NULL;" for name, _ in luts]
+        items = self._llm_runtime_items()
+        for it in items:
+            if it.init:
+                init.append(it.init)
+            if it.free:
+                free.append(it.free)
+        for g, rows in self._llm_runtime_groups(items).items():
+            _s, table, ctype, gi, gf = RUNTIME_GROUPS[g]
+            loop = (f"    {{\n        unsigned _i;\n        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                    f"            const {ctype} *T = &{table}[_i];\n")
+            init.append(loop + f"            {gi}\n        }}\n    }}")
+            free.append(loop + f"            {gf}\n        }}\n    }}")
         return (
             ("/* Lookup tables (filled in host_runtime_init) */\n" + "\n".join(decl) + "\n\n"
              if decl else "") +
@@ -257,11 +324,51 @@ class _SourceMixin:
             "}\n"
         )
 
+    def _emit_llm_block(self, sn) -> str:
+        """An LLM host op (llm_nodes.py): its DMA inputs / output go through
+        host_in / host_out / host_out_done like every host op (invalidate a
+        kernel-written input first); host-memory tensors and states are
+        plain pointers passed by name."""
+        ins, (o_off, o_cnt, o_io), _scratch, _ = self._host_stage_plan(sn)
+        staged = {t.onnx_name: (i, off, cnt, io) for i, (t, off, cnt, io) in enumerate(ins)}
+        lines = ["    {"]
+        for i, (t, off, cnt, _io) in enumerate(ins):
+            lines.append(f"        const Data_t *in{i};  /* '{t.onnx_name}': {cnt} elem"
+                         f" (stage +{off}) */")
+        if not sn.output.is_host:
+            lines.append(f"        Data_t       *out;  /* '{sn.output.onnx_name}': {o_cnt} elem"
+                         f" (stage +{o_off}) */")
+        seen = set()
+        for t in sn.dma_inputs():
+            if t.c_name not in seen and self._written_by_kernel(t):
+                seen.add(t.c_name)
+                lines.append(f"        inference_buf_sync_from_device({t.c_name});"
+                             f"  /* written by a kernel */")
+        for i, (t, off, _cnt, (nc, ch, st)) in enumerate(ins):
+            lines.append(f"        in{i} = host_in({t.c_name}, s_host_stage + {off}u,"
+                         f" {nc}u, {ch}u, {st}u);")
+        if not sn.output.is_host:
+            nc, ch, st = o_io
+            lines.append(f"        out = host_out({sn.output.c_name}, s_host_stage + {o_off}u,"
+                         f" {nc}u, {ch}u, {st}u);")
+        args = [f"in{staged[t.onnx_name][0]}" if t.onnx_name in staged else t.c_name
+                for t in sn.inputs]
+        out = "out" if not sn.output.is_host else sn.output.c_name
+        for ln in sn.c_call(args, out, "NULL", [], self._dtype):
+            lines.append("        " + ln)
+        if not sn.output.is_host:
+            nc, ch, st = o_io
+            lines.append(f"        host_out_done({sn.output.c_name}, out, {nc}u, {ch}u, {st}u);")
+        lines.append("    }")
+        return "\n".join(lines)
+
     def _emit_host_block(self, sn) -> str:
         """One host op inside inference_run(): invalidate kernel-written
         inputs, get flat input / output pointers (the BO itself when the
         mapping is cacheable and the layout flat, else the staging arena),
         compute, and hand the output back (store if staged + flush)."""
+        if isinstance(sn, LlmNode):
+            return self._emit_llm_block(sn)
         ins, (o_off, o_cnt, o_io), scratch, _ = self._host_stage_plan(sn)
         lines = ["    {"]
         for i, (t, off, cnt, _io) in enumerate(ins):
@@ -349,6 +456,29 @@ class _SourceMixin:
                     f"  /* [{sn.index}] {sn.numel} elem x 2 */"
                 )
 
+        host_t = self._graph.host_tensors
+        states = self._graph.state_tensors
+        if host_t or states:
+            lines.append("")
+            lines.append("/* Host-memory tensors (src/numeric.py): never in a DMA buffer, only the\n"
+                         " * host ops touch them.  Intermediates live in s_host_arena (slots reused\n"
+                         " * by liveness); states persist across inference_run() calls. */")
+            if host_t:
+                lines.append("static unsigned char *s_host_arena = NULL;")
+            for t in host_t:
+                lines.append(f"static {self._host_c_type(t)} *{t.c_name} = NULL;"
+                             f"  /* '{t.onnx_name}' {t.host} {t.shape} */")
+            for t in states:
+                if not t.is_host:
+                    raise SchedulerError(f"state '{t.onnx_name}': DMA states are not "
+                                         f"supported (declare it as a host tensor)")
+                lines.append(f"static {self._host_c_type(t)} *{t.c_name} = NULL;"
+                             f"  /* STATE '{t.onnx_name}' {t.host} {t.shape} */")
+            for t in states:
+                pre = self._state_init_prefix(t)
+                if pre is not None:
+                    lines.append(pre[0])
+
         if self._host_nodes:
             n = self._host_stage_elems
             lines.append("")
@@ -362,6 +492,29 @@ class _SourceMixin:
             lines.append("static Data_t *s_host_stage = NULL;")
 
         return "\n".join(lines)
+
+    def _state_init_prefix(self, t):
+        """(C declaration, element count) of the raw image of a state's
+        non-zero prefix (its initial value), or None when it starts at 0."""
+        if t.init_data is None:
+            return None
+        v = np.asarray(t.init_data, np.float64).reshape(-1)
+        nz = np.nonzero(v)[0]
+        if nz.size == 0:
+            return None
+        n = int(nz[-1]) + 1
+        if t.host == "i16":
+            raw = self._dtype.exp_to_storage(
+                v[:n], t.exp_full(self._dtype.frac_bits).reshape(-1)[:n]).view(np.int16)
+            lits = [str(int(x)) for x in raw]
+        elif t.host == "i32":
+            lits = [str(int(x)) for x in v[:n]]
+        else:
+            from ..host_nodes import _c_float
+            lits = [_c_float(float(x)) for x in v[:n]]
+        rows = ",\n".join("    " + ", ".join(lits[i:i + 12]) for i in range(0, n, 12))
+        return (f"static const {self._host_c_type(t)} _state_init_{t.c_name}[{n}] = {{\n"
+                f"{rows}\n}};  /* initial value of '{t.onnx_name}' (non-zero prefix) */", n)
 
     def _kernel_instance(self) -> str:
         lines = [_banner("Kernel driver instances (one per hardware IP)")]
@@ -981,6 +1134,8 @@ class _SourceMixin:
         need_pool = bool(pool_layout)
 
         alloc_lines: List[str] = []
+        compact = self._use_compact_init()
+        slot_tables: List[str] = []            # file-scope descriptor tables (compact form)
 
         if need_pool:
             alloc_lines.append(
@@ -996,7 +1151,38 @@ class _SourceMixin:
             )
             alloc_lines.append("")
 
-        if weights:
+        if weights and compact:
+            rows = []
+            for t in weights:
+                off, alloc = pool_map[t.onnx_name]
+                if t.onnx_name in external:
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u, NULL, 0u,"
+                                f" \"{t.c_name}\", {t.numel}u }},")
+                else:
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u,"
+                                f" _rom_{t.c_name}, (unsigned)sizeof(_rom_{t.c_name}), NULL, 0u }},")
+            slot_tables.append(f"static const _pool_slot_t _s_weight_slots[{len(rows)}] = {{\n"
+                               + "\n".join(rows) + "\n};")
+            load = ("            else if (_load_weight(s->view, s->name, s->n_elem) != 0) "
+                    "{ rc = -1; goto fail; }\n" if external else "")
+            alloc_lines.append(
+                "    /* Weights: one table-driven loop (thousands of straight-line views make\n"
+                "     * the compiler's register allocator explode on these projects) */\n"
+                "    {\n"
+                "        unsigned _i;\n"
+                f"        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                "            const _pool_slot_t *s = &_s_weight_slots[_i];\n"
+                "            inference_buf_init_view(s->view, s_alloc_pool, s->off, s->count);\n"
+                "            *s->var = s->view;\n"
+                "            if (s->rom)\n"
+                "                memcpy(inference_buf_ptr(s->view), s->rom, s->rom_bytes);\n"
+                + load +
+                "        }\n"
+                "    }")
+            alloc_lines.append("")
+            alloc_lines.append("    inference_buf_sync_to_device(s_alloc_pool);")
+            alloc_lines.append("")
+        elif weights:
             alloc_lines.append("    /* Weights */")
             for t in weights:
                 off, alloc = pool_map[t.onnx_name]
@@ -1033,7 +1219,26 @@ class _SourceMixin:
                          if t.onnx_name not in reshape_aliases and t.onnx_name not in views]
             alias_tensors = [t for t in intermediates if t.onnx_name in reshape_aliases]
 
-            if non_alias:
+            if non_alias and compact:
+                rows = []
+                for t in non_alias:
+                    off, alloc = pool_map[t.onnx_name]
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u,"
+                                f" NULL, 0u, NULL, 0u }},")
+                slot_tables.append(f"static const _pool_slot_t _s_inter_slots[{len(rows)}] = {{\n"
+                                   + "\n".join(rows) + "\n};")
+                alloc_lines.append(
+                    "    /* Intermediate buffers (table-driven) */\n"
+                    "    {\n"
+                    "        unsigned _i;\n"
+                    f"        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                    "            const _pool_slot_t *s = &_s_inter_slots[_i];\n"
+                    "            inference_buf_init_view(s->view, s_alloc_pool, s->off, s->count);\n"
+                    "            *s->var = s->view;\n"
+                    "        }\n"
+                    "    }")
+                alloc_lines.append("")
+            elif non_alias:
                 alloc_lines.append("    /* Intermediate buffers */")
                 for t in non_alias:
                     off, alloc = pool_map[t.onnx_name]
@@ -1087,6 +1292,30 @@ class _SourceMixin:
                 )
             alloc_lines.append("")
 
+        host_layout, host_bytes = self._compute_host_layout()
+        if host_layout:
+            alloc_lines.append(f"    /* Host-memory intermediates ({host_bytes} B, slots reused by"
+                               f" liveness) */")
+            alloc_lines.append(f"    s_host_arena = (unsigned char *)malloc({host_bytes}u);")
+            alloc_lines.append("    if (!s_host_arena) { rc = -1; goto fail; }")
+            by_name = {t.onnx_name: t for t in self._graph.host_tensors}
+            for name, off, _nb in host_layout:
+                t = by_name[name]
+                alloc_lines.append(f"    {t.c_name} = ({self._host_c_type(t)} *)"
+                                   f"(s_host_arena + {off}u);")
+            alloc_lines.append("")
+        states = self._graph.state_tensors
+        if states:
+            alloc_lines.append("    /* Persistent states: zeroed, then their initial non-zero prefix */")
+            for t in states:
+                ct = self._host_c_type(t)
+                alloc_lines.append(f"    {t.c_name} = ({ct} *)calloc({t.numel}u, sizeof({ct}));")
+                alloc_lines.append(f"    if (!{t.c_name}) {{ rc = -1; goto fail; }}")
+                if self._state_init_prefix(t) is not None:
+                    alloc_lines.append(f"    memcpy({t.c_name}, _state_init_{t.c_name},"
+                                       f" sizeof _state_init_{t.c_name});")
+            alloc_lines.append("")
+
         if self._host_nodes:
             alloc_lines.append("    /* Cached staging arena for the host-CPU ops */")
             alloc_lines.append(
@@ -1111,7 +1340,25 @@ class _SourceMixin:
         if self._host_nodes:
             deinit_free.append("    host_runtime_deinit();")
             deinit_free.append("    free(s_host_stage); s_host_stage = NULL;")
+        for t in self._graph.state_tensors:
+            deinit_free.append(f"    free({t.c_name}); {t.c_name} = NULL;")
+        if self._graph.host_tensors:
+            for t in self._graph.host_tensors:
+                deinit_free.append(f"    {t.c_name} = NULL;")
+            deinit_free.append("    free(s_host_arena); s_host_arena = NULL;")
+        tabled = set()
+        if compact:
+            for tab, n in (("_s_weight_slots", "weight"), ("_s_inter_slots", "inter")):
+                if any(tab in t for t in slot_tables):
+                    deinit_free.append(
+                        f"    {{ unsigned _i; for (_i = 0u; _i < sizeof {tab} / sizeof {tab}[0];"
+                        f" _i++) *{tab}[_i].var = NULL; }}")
+            tabled = ({t.onnx_name for t in weights}
+                      | {t.onnx_name for t in intermediates
+                         if t.onnx_name not in reshape_aliases and t.onnx_name not in views})
         for t in weights + intermediates:
+            if t.onnx_name in tabled:
+                continue
             if t.onnx_name in reshape_aliases:
                 deinit_free.append(
                     f"    {t.c_name} = NULL;  /* reshape alias — not owned */"
@@ -1145,9 +1392,25 @@ class _SourceMixin:
             )
         init_calls_str = "\n".join(init_calls)
 
+        tables = ""
+        if slot_tables:
+            tables = (
+                "/* Pool views of the weights and intermediates: one descriptor per buffer,\n"
+                " * set up by a loop in inference_init() (compact form, see\n"
+                " * _use_compact_init). */\n"
+                "typedef struct {\n"
+                "    inference_buf_t  *view;\n"
+                "    inference_buf_t **var;\n"
+                "    unsigned          off, count;\n"
+                "    const void       *rom;         /* inline weight image, or NULL */\n"
+                "    unsigned          rom_bytes;\n"
+                "    const char       *name;        /* weights/<name>.dat when rom == NULL */\n"
+                "    unsigned          n_elem;\n"
+                "} _pool_slot_t;\n\n" + "\n\n".join(slot_tables) + "\n")
         return (
             load_helper +
             _banner("inference_init() / inference_deinit()") +
+            tables +
             "/* Internal: pool lifecycle — defined in inference_buf.c */\n"
             "int  inference_buf_pool_init(void);\n"
             "void inference_buf_pool_deinit(void);\n"
@@ -1177,17 +1440,25 @@ class _SourceMixin:
             "}\n"
         )
 
+    def _use_compact_init(self) -> bool:
+        """Table-driven pool views in inference_init() / deinit() (LLM and
+        multi-entry projects): a straight-line view per buffer — thousands
+        of them — sends GCC's integrated register allocator past 2.5 GB
+        (aarch64 gcc 13 -O1; gcc 11 -O2 on the KV260).  Existing models keep
+        the straight-line form (byte-identical projects)."""
+        from ..numeric import is_active
+        return bool(getattr(self, "_compact_init", False)
+                    or is_active(getattr(self._graph, "numeric", None) or
+                                 {"exp": {}, "host": {}, "state": []}))
+
     def _inference_function(self) -> str:
         graph   = self._graph
         inputs  = graph.input_tensors
         outputs = graph.output_tensors
 
-        params = []
-        for t in inputs:
-            params.append(f"    inference_buf_t *{t.c_name}")
-        for t in outputs:
-            params.append(f"    inference_buf_t *{t.c_name}")
-        param_str = ",\n".join(params)
+        param_str = ",\n".join(self._run_params())
+        inputs  = [t for t in inputs if not t.is_host]      # DMA I/O: the cache syncs
+        outputs = [t for t in outputs if not t.is_host]
 
         # ---- Cache sync strategy ------------------------------------------ #
         # The FPGA kernels access DDR directly (non-coherent); the CPU mapping
@@ -1298,6 +1569,9 @@ class _SourceMixin:
 
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
+        parts_src = ""
+        if self._use_compact_init():
+            body_lines, parts_src = self._split_run_body(body_lines)
 
         # ---- Run-time input reshape aliases ----------------------------------- #
         # Intermediate tensors that are reshape aliases of graph inputs cannot be
@@ -1397,9 +1671,59 @@ class _SourceMixin:
 
         return (
             _banner("inference_run()") +
-            "void inference_run(\n"
-            f"{param_str})\n"
+            parts_src +
+            f"void {self._run_name}(\n"
+            f"{param_str or '    void'})\n"
             "{\n"
             f"{body}\n"
             "}\n"
         )
+
+    _RUN_PART_NODES = 40
+
+    def _split_run_body(self, body_lines: List[str]):
+        """Split a long run body at node boundaries into noinline static
+        functions of about _RUN_PART_NODES nodes (compact-form projects:
+        thousand-line straight-line functions are what makes the compiler's
+        memory explode).  Returns (body calling the parts, their source)."""
+        chunks, cur, nodes = [], [], 0
+        for ln in body_lines:
+            if ln.startswith("    /* [") and nodes >= self._RUN_PART_NODES:
+                chunks.append(cur)
+                cur, nodes = [], 0
+            if ln.startswith("    /* ["):
+                nodes += 1
+            cur.append(ln)
+        if cur:
+            chunks.append(cur)
+        if len(chunks) <= 1:
+            return body_lines, ""
+        params = self._run_params()
+        names = [p.split("*")[-1].strip() for p in params]
+        src, calls = [], []
+        for k, ch in enumerate(chunks):
+            fn = f"{self._run_name}_part{k}"
+            while ch and ch[-1] == "":
+                ch = ch[:-1]
+            src.append(f"static void __attribute__((noinline)) {fn}(\n"
+                       + (",\n".join(params) or "    void") + ")\n{\n"
+                       + "".join(f"    (void){n};\n" for n in names)
+                       + "\n".join(ch) + "\n}\n\n")
+            calls.append(f"    {fn}({', '.join(names)});")
+        return calls, "".join(src)
+
+    @property
+    def _run_name(self) -> str:
+        return getattr(self, "_run_fn_name", "inference_run")
+
+    def _run_params(self) -> List[str]:
+        """inference_run() parameters: DMA buffers, and plain pointers for
+        host-memory graph inputs (const) / outputs."""
+        out = []
+        for t in self._graph.input_tensors:
+            out.append(f"    const {self._host_c_type(t)} *{t.c_name}" if t.is_host
+                       else f"    inference_buf_t *{t.c_name}")
+        for t in self._graph.output_tensors:
+            out.append(f"    {self._host_c_type(t)} *{t.c_name}" if t.is_host
+                       else f"    inference_buf_t *{t.c_name}")
+        return out

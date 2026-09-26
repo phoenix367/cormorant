@@ -814,3 +814,306 @@ accelerator needed.
   that send their own temperature are unaffected.
 * The pure-Python sampler fallback is too slow for sampling on the A53
   (25–205 ms per token); deploy builds the C one.
+
+## 13. Phase 3 outcome — SmolLM2-135M on the FPGA kernels (2026-09-26, branch `feat/llmdec`)
+
+**Result.**  `libsmollm2.so` implements the §11 C API.  The scheduler
+simulation of SmolLM2-135M-Instruct equals the study emulation of the
+shipped policy **bit for bit**, and so does the generated C on the host
+emulation.  On the board:
+- the logits of 3 chat prompts (prefill + 32 greedy decode steps) are
+  bit-exact with the simulation, and the greedy text equals the study
+  emulation's;
+- decode takes 203 ms / token (4.9 tokens / s), bound by weight bandwidth;
+- prefilling 16 / 64 / 256 tokens takes 0.37 / 0.60 / 3.6 s;
+- `llm_open` takes 1.0 s warm and 36 s cold;
+- the model occupies 461 MiB of CMA.
+
+The library closes and reopens cleanly.  The full board suite passes
+151 / 151.
+
+### 13.1 Decisions
+
+* **Frontend: direct safetensors + config.json → fixed-shape ONNX
+  (`inference-scheduler/src/llama.py`), not a torch export.**  An exported
+  graph would have to be pattern-matched back into the structure the study
+  already specifies: RMSNorm as `Pow / ReduceMean / Add / Sqrt / Div / Mul`,
+  RoPE as `Slice / Neg / Concat / Mul / Add` over cos / sin, GQA as
+  `Expand / Reshape`, masks as `Where`, and the KV cache as dynamic
+  `past_key_values` concats.  It would also need `onnxscript`, a
+  fixed-shape re-export per bucket, and exponents attached to fused nodes
+  by name matching.  The frontend writes what the scheduler runs instead:
+  one standard `MatMul` per linear (per layer and class, weights shared by
+  name across entries, so the existing engine choice, packing and
+  MatMul-on-ConvKernel lowering apply unchanged) and host ops of a custom
+  domain `axi.llm` for the float regions.  Exponents, host tensors and
+  states ride in the model's `axi.numeric` metadata.  Nothing beyond
+  config.json is model specific; SmolLM2-360M needs `llm_study.py formats`
+  and a regeneration.
+* **Shipped numeric policy: `pow2+sink+p12+xattn`** (new in
+  `llm_study.py`).  These are the p12 formats of §10.5 with attention as
+  one float host region (the `hattn` idea) whose operation order is fixed
+  so that C reproduces it bit for bit:
+  - RoPE(q) stays in double;
+  - scores are `dot8` (8 lane sums over d ascending, combined
+    ((0+1)+(2+3))+((4+5)+(6+7))) × 1/√HD;
+  - `exp` comes from libm; sums run left to right;
+  - P·V accumulates from the first product;
+  - P is never quantised, and pv is written at f_p + f_vc − 8.
+
+  One region per layer replaces 6 kernel calls, 2 host ops and their cache
+  hand-offs.  §13.4 measures the FPGA alternative.
+* **Residual stream, ids and KV cache in host memory.**  h is a float32 host
+  tensor, ids / pos / n are int32 host inputs, and the KV cache is an int16
+  host state `[C][KV·HD]` per layer (22.5 MiB, not CMA).  No syncs are
+  needed, since only host ops touch them.  Row 0 is the sink.
+* **Embedding.**  A bf16 host table (57 MB of normal memory, exact — the
+  policy's `emb = float`); the LM head is the second copy, packed for
+  MatmulKernel at the logits exponents.
+* **Entries.**  `decode` (1 token → logits), `prefill_16 / 64 / 256`
+  (padded rows, n valid; leaves the last valid row in the `h_last` state)
+  and `head` (h_last → logits).  llm_prefill() splits n tokens into the
+  least-cost sequence of bucket calls, using the board cost per call (§13.4:
+  a padded 64-row call costs 364 ms and a 16-row call 304 ms, because the
+  MatMuls stream the weights once per call).  The last call is padded, and
+  the logits do not depend on the split.  llm_prefill() runs the head once,
+  so several calls may precede a decode.  Context 1024 including the sink.
+* **Engines.**  decode and head are N = 1 → MatmulKernel with packed B
+  (211 calls per token).  prefill → ConvKernel through the §2A lowering
+  (cost model: 210 of 210 MatMuls, at every bucket).  **The two need
+  different weight layouts** (MatmulKernel's packed tile-major B, ConvKernel's
+  kw image), and no single layout serves both.  A conv batch over the packed
+  32-column tiles is weight-request-latency bound, like BERT's P·V; conv
+  decode in the standard orientation costs 1.5× by the cost model and
+  fetches weight slabs row by row.  So the multi-entry project keeps **two
+  copies of the layer weights**: the decode copy (212 MB) and one conv copy
+  shared by all three buckets (kernel widths pinned by the largest bucket,
+  212 MB), plus the LM head (57 MB).  `--prefill-engine matmul` keeps one
+  copy, but the cost model puts the prefill MatMuls on MatmulKernel at
+  0.63 / 2.5 / 9.9 s for 16 / 64 / 256 rows.  On ConvKernel it predicts
+  0.24 / 0.26 / 0.70 s, and the board measures 0.24 / 0.26 / 0.67 s.
+
+### 13.2 Scheduler features (doc/INFERENCE_SCHEDULER.md)
+
+- **Numerics beyond the element type** (`src/numeric.py`):
+  - per-tensor / per-channel power-of-two exponents;
+  - rank-1 weight encoding f_w = f_out + 8 − f_in;
+  - the simulator's MatMul exponent path (exact sums, int32 wrap, floor at f_out);
+  - host tensors (f32 / i32 / i16) in a liveness-coloured host arena;
+  - states: persistent, shared across entries, initialised from their non-zero prefix.
+- **Host ops** (`src/llm_nodes.py`):
+  - LlmEmbed, LlmResAdd, LlmRMSNorm, LlmAttention (RoPE + KV write with V
+    re-rounding + causal GQA xattn, threaded over rows × heads);
+  - LlmSiluMul (silu tables per gate exponent, filled at init by the same
+    libm code), LlmSelectRow, LlmDequant.
+- **Multi-entry projects** (`src/codegen/multi.py`, CLI `--entry`):
+  - weights deduplicated by name + image; states shared;
+  - intermediates / host arena / staging overlapping;
+  - global layer indices for the profiler;
+  - driver release in deinit, so the library can be closed and reopened.
+- **Compact codegen** for LLM / multi-entry projects: pool views and
+  runtime items come from descriptor tables with loops, and run functions
+  are split into `noinline` parts.  The straight-line form made gcc's
+  register allocator need 2.6 GB for SmolLM2's inference.c and hung the
+  board (§13.4); the compact form needs 0.18 GB.
+- **Byte-identical** for every existing model: 179 / 179 projects equal
+  main's, file by file (the 168 test models and the 11 demo models:
+  BERT-SQuAD, ResNet-18, MobileNet v1 / v2 and 7 MNIST models).
+
+### 13.3 Gates
+
+1. **Scheduler tests.**  1474 pass (5 opt-in / HLS skips).  New:
+   - `test_numeric.py`;
+   - `test_llm_ops.py`, incl. every op on the host emulation and the silu
+     tables C vs Python on all 65 536 inputs;
+   - `test_llama.py`: a tiny random Llama (hidden 64, 2 layers, GQA 4/2,
+     vocab 256, context 32) whose simulation equals the study emulation bit
+     for bit over one-call / split / padded prefills, decode, truncate and
+     re-prefill, plus every entry and a 4-entry project on the host
+     emulation (-Werror, cached / staged, 1 / 3 / 4 threads, re-open).
+2. **Bit-exactness, SmolLM2-135M** (`demo/chat/scripts/llm_sched_check.py`):
+   the scheduler simulation equals the study emulation of
+   pow2+sink+p12+xattn on the logits of every step:
+
+   | prompt | tokens (incl. sink) | prefill calls: rows / bucket | decode steps | result |
+   |---|---:|---|---:|---|
+   | factual | 37 | 36 / 64 | 32 | bit-exact |
+   | summarise | 169 | 168 / 256 | 32 | bit-exact |
+   | multi-turn | 97 | 64 / 64 + 32 / 64 | 32 | bit-exact |
+
+   An earlier split (16 + 16 + 4 / 16; 64 + 64 + 16 + 16 + 8 / 16;
+   64 + 16 + 16) was bit-exact too: the logits do not depend on the split.
+   The generated project on the host emulation (`llm_host_emu.py`:
+   inference.c + llm_api.c + llm_bench.c against the software kernels)
+   equals the simulation on all 3 × 33 logits vectors, its greedy tokens
+   equal the study emulation's, and a close / re-open reproduces the
+   logits.  Weights saturated: 0.
+3. **Board** (`demo/chat/scripts/llm_board.py --profile --reopen`; KV260,
+   hw_128 bitstream, 100 MHz):
+   - the 3 tiny Llama fixtures pass in the board suite, and the full suite
+     passes 151 / 151 (the 148 existing models + 3);
+   - SmolLM2's logits are bit-exact with the simulation on all 3 × 33
+     vectors (prefill + 32 greedy decode steps per prompt), and the greedy
+     tokens equal the study emulation's;
+   - the library through ctypes (`llm_lib_check.py`) behaves as required:
+     - it exports only `llm_*`;
+     - `llm_vocab_size()` is 49152 and `llm_context_size()` is 1024;
+     - chunked prefill calls give the same logits as one call;
+     - calls from different threads give the same logits as one thread;
+     - close → open reproduces the logits.
+
+### 13.4 Board numbers
+
+**Decode: 203 ms / token (4.9 tokens / s)** at positions 37–201.  It is
+bound by weight bandwidth:
+
+| decode, per token | ms | |
+|---|---:|---|
+| MatMul linear (210 calls, MatmulKernel, packed B) | 145.3 | 212 MB of weights at 1.46 GB/s, 91 % of the 128-bit port |
+| LM head (1 call) | 38.8 | 57 MB, also 1.46 GB/s |
+| attention (host xattn, 30 layers) | 6.7 | 37–200 cached keys |
+| SiLU·up | 4.7 | |
+| RMSNorm | 1.4 | |
+| residual add | 0.9 | |
+| other host (embedding, row select, logits dequant) | 0.8 | |
+
+**Prefill**: one call with n = bucket tokens, in ms:
+
+| | 16 | 64 | 256 |
+|---|---:|---:|---:|
+| **total** | **366** | **604** | **3588** |
+| MatMul linear (ConvKernel) | 237 | 257 | 670 |
+| attention (host) | 27 | 201 | 2600 |
+| SiLU·up | 39 | 45 | 163 |
+| RMSNorm | 19 | 41 | 87 |
+| residual add | 10 | 24 | 54 |
+| LM head (once) | 39 | 39 | 39 |
+
+The llm_prefill() cost table (§13.1) is these totals minus the attention
+(which covers only the valid rows) and the head: 304 / 364 / 930 ms, from
+the previous profile run (within 2 % of this one).  With the least-cost
+split, the chat prompts of 36 / 168 / 96 tokens reach their first logits
+in **497 / 2164 / 1196 ms**.  The first split (the largest bucket the tokens
+fill, the rest padded into the smallest) took 1042 / 2883 / 1442 ms.
+
+**llm_open**: 1.0 s with the weights in the page cache, 35.6 s cold (538 MB
+from the SD card).  close → open: 0.95 s, identical logits.
+
+**Memory**:
+- CMA: one pool BO of 461.3 MiB — weights 459.0 MiB (the decode copy, the
+  conv copy and the LM head) and intermediates 2.3 MiB.  CmaFree drops by
+  440–486 MiB on open.  The spread is page cache, which Linux keeps in
+  movable CMA pages and migrates out when the BO is allocated.  After
+  `llm_close`, CmaFree comes back within a few MiB of its value before
+  `llm_open`.  **`cma_mb` for the server: 480.**
+- Normal memory: host tables 54.2 MiB (the bf16 embedding, RoPE), KV cache
+  states 22.5 MiB, host arena 1.1 MiB.
+
+**Board build and the hang.**  The first board session built the
+straight-line inference.c (3.7 MB) with `make -j4`.  cc1 grew to 3.0 GB,
+MemAvailable fell to 232 MB (the board has no swap), the board hung, and
+it had to be power-cycled.  On the host, aarch64 gcc 13 at -O1 peaked at
+2.59 GB, 2.19 GB of it in the register allocator.  The cause was
+straight-line init code that took the addresses of the statics the run
+functions read.  The compact codegen (§13.2) cuts the peak to 124 MB (-O1)
+/ 196 MB (-O2) on the host.  On the board, inference.c is now 3.1 MB and
+the -O2 build takes 42 s with a cc1 peak of 178 MB.
+`llm_board.py` builds with `-j1` and compiles inference.c once for both
+targets.  It starts only with ≥ 1.5 GB MemAvailable, and a guard kills
+make if MemAvailable drops below 400 MB or the memory PSI (some avg10)
+exceeds 50.
+
+**Decode attention: FPGA p12 vs host xattn, measured.**  The alternative,
+`pow2+sink+p12`, works per layer and KV group:
+- q·Kᵀ on MatmulKernel against a tile-packed transposed K cache;
+- a host softmax quantised to p12;
+- P·V on the row-major V cache.
+
+`llm_attn_kernel_bench.py` timed its kernel calls on the board:
+
+| cached keys | FPGA kernel calls / token | FPGA incl. host softmax + ~360 cache syncs (est.) | host xattn / token |
+|---:|---:|---:|---:|
+| 64 | 3.1 ms | ~9 ms | ~4 ms |
+| 256 | 8.1 ms | ~14 ms | ~16 ms |
+| 512 | 14.1 ms | ~20 ms | ~32 ms |
+| 1024 | 25.9 ms | ~32 ms | ~65 ms |
+
+Host xattn was measured at 1.69 ms / layer with 800 keys (51 ms / token)
+and at 6.7 ms / token over 37–200 keys; the other rows scale linearly with
+the keys.  The crossover is about 250 keys.  **Host xattn ships.**  It is
+the faster path below ~250 keys, where every conversation starts.  At full
+context the FPGA path would save ~33 ms of ~260 ms per token (13 %).  In
+return it needs:
+- a second numeric policy (P quantised to p12);
+- K / V caches in CMA, including a transposed K written at every step;
+- an emulation that switches policy at the same length.
+
+§13.6 keeps it as an option.  The host attention itself was made 3× faster
+without changing its output (items balanced over the threads, prefill K / V
+rows converted once, lane-wise vectorisation).
+
+### 13.5 Building and deploying libsmollm2.so (for phase 4)
+
+```bash
+# assets (not in git, see llm_study.py): demo/chat/assets/smollm2-135m-instruct
+# and demo/chat/assets/study/formats_pow2+sink+p12.json (llm_study.py formats)
+inference-scheduler/.venv/bin/python demo/chat/scripts/generate_llm_project.py
+#   -> demo/chat/build/llm_project (~100 s; 538 MB weights/*.dat, 3.1 MB inference.c)
+inference-scheduler/.venv/bin/python demo/chat/deploy.py --stop   # the server owns the FPGA
+inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py --install-only
+#   the full gate instead: llm_sched_check.py --save gate2.json, then
+#   llm_board.py --profile --reopen --study-json gate2.json
+```
+
+`llm_board.py` takes the SSH settings and driver directories from
+`demo/bert_squad/bert_squad_config.json` and holds the board lock.  It
+uploads the sources, syncs only the changed weight files, builds on the
+board under the memory guard and installs the library.  On the board:
+
+| path | contents |
+|---|---|
+| `/root/kv260_chat/lib/libsmollm2.so` | the library (the server's default path); exports `llm_*` only |
+| `/root/smollm2_weights/weights/*.dat` | 424 files, 538 MB; `INFERENCE_WEIGHTS_DIR` of the build, so `llm_open(NULL)` uses `/root/smollm2_weights` (`llm_weights_dir()`) |
+| `/root/kv260_chat/llm_project` | the generated sources; `build/` (library + `llm_bench`), `build_prof/` (profiler) |
+
+`llm_open(dir)` takes the directory that holds `weights/`.  The library
+keeps no thread-local state, so calls may come from any thread as long as
+they are serialised.  The standalone benchmark is `llm_bench [-w dir]
+[-i prompts.bin] [-o logits.bin] [-k 32] [-P 16,64,256] [-R reps] [-r]`,
+where `-r` adds a close / re-open.  The `build_prof/` build also prints
+`PROFILE_PHASE` / `LAYERS_JSON` lines.
+
+Notes for the server (§12):
+- `smollm2.cma_mb`: 480.  With BERT (~224 MB) the two need ~705 MB of the
+  1000 MiB CMA; the idle CmaFree was 905–1014 MiB in this session.
+- The greedy reference is the study emulation of **`pow2+sink+p12+xattn`**
+  (`llm_study.py`), not `pow2+sink+p12`: the attention is the C-exact
+  float region (§13.1).
+- Every `llm_prefill` runs the LM head once (39 ms), so `--llm-prefill-chunk`
+  costs that per extra chunk.  Otherwise a chunk costs what the least-cost
+  split of its tokens costs.
+- Errors (not open, context full, token out of range, bad arguments) are
+  detected before any state changes, so `llm_position()` is unchanged after
+  a failed call.
+
+### 13.6 Open issues
+
+- **Prefill attention** is 72 % of a 256-token prefill (2.6 of 3.6 s).
+  Running q·Kᵀ / P·V for the prefill rows on the FPGA under a mixed policy
+  (p12 in prefill, xattn in decode, the emulation following suit) should
+  bring the 256-token prefill to ~1.1 s.  The host loop is also well below
+  the A53's peak (~1.2 µs per head and query-key pair per thread).
+- **Decode** is at the 128-bit port's weight bandwidth (1.46 GB/s).  The
+  way forward is phase 5's dual-port / HPC1 weight streaming.  Fusing
+  q / k / v and gate / up into single MatMuls would remove 90 of the 211
+  calls per token and their fixed overhead.
+- **Decode attention at long context**: the FPGA path above ~250 keys
+  (§13.4), up to −13 % per token at 1024.
+- **Two weight copies** (459 MiB of CMA).  A layout that both engines can
+  read, or `--prefill-engine matmul` (one copy, prefill MatMuls 0.63 / 2.5 /
+  9.9 s by the cost model), would free ~210 MiB.
+- **Cold `llm_open`** reads 538 MB from the SD card (35.6 s).  The server
+  should open once at start-up.
+- CmaFree after close sits a few MiB below its value before open.  This is
+  page cache in CMA pageblocks, not a leak: repeated cycles do not
+  accumulate beyond that noise.

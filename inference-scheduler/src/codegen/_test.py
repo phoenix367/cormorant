@@ -45,6 +45,15 @@ class _TestMixin:
         for t in outputs:
             storage_buf = self._expected_storage(t.onnx_name, sim_arrays[t.onnx_name])
             alloc_size  = len(storage_buf)
+            if t.is_host:
+                ctype = self._host_c_type(t)
+                if t.onnx_name in large_names:
+                    expected_decls.append(
+                        f"static {ctype} *expected_{t.c_name} = NULL;"
+                        f"  /* {alloc_size} {ctype} — loaded from expected/{t.c_name}.dat */")
+                else:
+                    expected_decls.append(self._emit_expected_host_c(t, storage_buf))
+                continue
             if t.onnx_name in large_names:
                 # Heap pointer — loaded from file at runtime
                 expected_decls.append(
@@ -58,11 +67,21 @@ class _TestMixin:
         # --- Variable declarations at top of main() ---------------------- #
         decl_lines = []
         for t in inputs + outputs:
+            if t.is_host:
+                continue
             decl_lines.append(f"    inference_buf_t *{t.c_name} = NULL;")
+        host_io = [t for t in inputs + outputs if t.is_host]
+        if host_io:
+            expected_str = "\n".join(
+                [f"static {self._host_c_type(t)} io_{t.c_name}[{t.numel}];"
+                 f"  /* host-memory {'input' if t in inputs else 'output'} '{t.onnx_name}' */"
+                 for t in host_io]) + "\n\n" + expected_str
 
         # --- Buffer allocations with goto-cleanup error handling ---------- #
         alloc_lines = []
         for t in inputs + outputs:
+            if t.is_host:
+                continue
             macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
             alloc_lines.append(f"    {t.c_name} = inference_buf_alloc({macro});")
             alloc_lines.append(f"    if (!{t.c_name}) {{")
@@ -78,6 +97,20 @@ class _TestMixin:
         # (alignment padding between data blocks) are left untouched.
         fill_lines = []
         for t in inputs:
+            if t.is_host:
+                fill_lines += [f"    /* '{t.c_name}' — host-memory input */"]
+                fill_lines += self._host_fill_c(t, f"io_{t.c_name}")
+                continue
+            if t.exp is not None:
+                macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
+                fill_lines += [
+                    f"    {{  /* '{t.c_name}' — raw int16 ramp (power-of-two exponent) */",
+                    f"        Data_t *p = inference_buf_ptr({t.c_name});",
+                    f"        for (i = 0u; i < {macro}; i++)",
+                    "            p[i] = (Data_t)(i & 0xFFFFu);",
+                    "    }",
+                ]
+                continue
             if t.is_int:
                 # Integer tensor (token ids, masks): raw integer values, a
                 # pattern that is a valid index for every Gather / OneHot
@@ -118,13 +151,28 @@ class _TestMixin:
                 ]
 
         # --- inference_run() call ---------------------------------------- #
-        run_args = ", ".join(t.c_name for t in inputs + outputs)
+        run_args = ", ".join((f"io_{t.c_name}" if t.is_host else t.c_name)
+                             for t in inputs + outputs)
 
         # --- Print first ≤8 elements of each output ---------------------- #
         print_lines = []
         for t in outputs:
             display = dtype.c_display("p", "_off + i") if t.onnx_name in bcast_map \
                       else dtype.c_display("p", "i")
+            if t.is_host:
+                fmt, cast = (("%.6f", "(double)") if t.host == "f32" else ("%d", "(int)"))
+                print_lines += [
+                    "    {",
+                    f"        unsigned lim = {t.numel}u < 8u ? {t.numel}u : 8u;",
+                    f"        printf(\"Output '{t.onnx_name}' ({t.numel} elem, host {t.host},"
+                    f" first %u):\\n\", lim);",
+                    "        for (i = 0u; i < lim; i++)",
+                    f"            printf(\"  [%u] {fmt}\\n\", i, {cast}io_{t.c_name}[i]);",
+                    "    }",
+                ]
+                continue
+            if t.exp is not None:
+                display = f"(double)(int16_t)p[i] /* raw */"
             if t.is_int:
                 macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
                 print_lines += [
@@ -181,6 +229,23 @@ class _TestMixin:
         # Non-broadcast outputs: compare every element (alloc == numel).
         verify_lines = []
         for t in outputs:
+            if t.is_host:
+                verify_lines += [
+                    f"    {{  /* [GT] '{t.c_name}' — host-memory {t.host}, bit-exact */",
+                    "        unsigned k;",
+                    f"        for (k = 0u; k < {t.numel}u; k++) {{",
+                    f"            if (memcmp(&io_{t.c_name}[k], &expected_{t.c_name}[k],"
+                    f" sizeof io_{t.c_name}[k]) != 0) {{",
+                    "                fprintf(stderr,",
+                    f"                        \"FAIL {t.onnx_name}[%u]: got %.9g expected %.9g\\n\",",
+                    f"                        k, (double)io_{t.c_name}[k],"
+                    f" (double)expected_{t.c_name}[k]);",
+                    "                rc = 1;",
+                    "            }",
+                    "        }",
+                    "    }",
+                ]
+                continue
             if t.onnx_name in bcast_map:
                 n, chunk_macro, stride_macro = bcast_map[t.onnx_name]
                 got_disp = dtype.c_display("p", "_off + j")
@@ -250,6 +315,14 @@ class _TestMixin:
             for t in outputs:
                 if t.onnx_name not in large_names:
                     continue
+                if t.is_host:
+                    ctype = self._host_c_type(t)
+                    load_lines += [
+                        f"    if (_load_expected_raw((void **)&expected_{t.c_name},"
+                        f" \"{t.c_name}\", {t.numel}u * sizeof({ctype})) != 0)"
+                        f" {{ rc = 1; goto cleanup; }}",
+                    ]
+                    continue
                 alloc_size = self._alloc_sizes[t.onnx_name]
                 load_lines += [
                     f"    if (_load_expected(&expected_{t.c_name},"
@@ -260,6 +333,8 @@ class _TestMixin:
         # --- Cleanup: free I/O buffers + heap expected arrays ------------ #
         cleanup_lines = []
         for t in inputs + outputs:
+            if t.is_host:
+                continue
             cleanup_lines.append(f"    inference_buf_free({t.c_name});")
         for t in outputs:
             if t.onnx_name in large_names:
@@ -312,8 +387,37 @@ class _TestMixin:
                 "    return 0;\n"
                 "}\n"
             )
+            if any(t.is_host for t in outputs if t.onnx_name in large_names):
+                load_expected_helper += (
+                    "\n"
+                    "static int _load_expected_raw(void **out, const char *name, size_t bytes)\n"
+                    "{\n"
+                    "    char   path[512];\n"
+                    "    FILE  *f;\n"
+                    "    size_t n_read;\n"
+                    "    snprintf(path, sizeof(path),\n"
+                    "             INFERENCE_EXPECTED_DIR \"/expected/%s.dat\", name);\n"
+                    "    f = fopen(path, \"rb\");\n"
+                    "    if (!f) {\n"
+                    "        fprintf(stderr, \"GT: cannot open expected file '%s'\\n\", path);\n"
+                    "        return -1;\n"
+                    "    }\n"
+                    "    *out = malloc(bytes);\n"
+                    "    if (!*out) { fclose(f); return -1; }\n"
+                    "    n_read = fread(*out, 1u, bytes, f);\n"
+                    "    fclose(f);\n"
+                    "    if (n_read != bytes) {\n"
+                    "        fprintf(stderr, \"GT: short read from '%s'\\n\", path);\n"
+                    "        free(*out); *out = NULL;\n"
+                    "        return -1;\n"
+                    "    }\n"
+                    "    return 0;\n"
+                    "}\n"
+                )
 
         stdlib_include = "#include <stdlib.h>\n" if has_large else ""
+        if host_io:
+            stdlib_include += "#include <string.h>\n"
 
         gt_load_block = (
             "\n"
@@ -393,6 +497,9 @@ class _TestMixin:
             "\n"
             "    /* 4. Run inference */\n"
             f"    inference_run({run_args});\n"
+            + ("    if (rc != 0) goto cleanup;   /* (keeps the label used) */\n"
+               if not any(not t.is_host for t in inputs + outputs) and not has_large else "")
+            +
             "\n"
             "    /* 5. Print first 8 output elements */\n"
             f"{print_str}\n"

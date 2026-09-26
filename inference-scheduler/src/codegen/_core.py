@@ -474,9 +474,10 @@ class _CoreMixin:
 
         return events
 
-    def _compute_live_intervals(self) -> dict:
+    def _compute_live_intervals(self, names=None) -> dict:
         """Return {onnx_name: (start_event_idx, end_event_idx)} for every
-        non-reshape-alias intermediate tensor.
+        non-reshape-alias intermediate tensor (or for the tensors ``names``,
+        e.g. the host-memory intermediates).
 
         Intervals are expressed in event-stream index space (not node-index
         space) so that pool-slot colouring respects the actual execution
@@ -492,7 +493,7 @@ class _CoreMixin:
             t.onnx_name
             for t in self._graph.intermediate_tensors
             if t.onnx_name not in alias_src
-        }
+        } if names is None else set(names)
 
         # Build alias-resolution map: tensor_name → underlying intermediate.
         # A consumer of a Reshape alias (or of a Slice view) contributes to
@@ -576,7 +577,6 @@ class _CoreMixin:
         def align_up(n):
             return (n + align_to - 1) & ~(align_to - 1)
 
-        reshape_aliases = self._reshape_aliases
         layout  = []
         offset  = 0
 
@@ -585,6 +585,23 @@ class _CoreMixin:
             alloc = self._alloc_sizes[t.onnx_name]
             layout.append((t.onnx_name, offset, alloc))
             offset += align_up(alloc)
+
+        inter, total = self._compute_intermediate_layout()
+        layout.extend((name, offset + off, alloc) for name, off, alloc in inter)
+        return layout, offset + total
+
+    def _compute_intermediate_layout(self):
+        """The intermediates' part of the pool, relative to its start:
+        ([(onnx_name, offset, alloc)], total_elems) — slots from the
+        event-stream liveness colouring (see _compute_pool_layout)."""
+        bpe       = self._dtype.bytes_per_elem
+        align_to  = 64 // bpe   # elements per 64-byte boundary
+        def align_up(n):
+            return (n + align_to - 1) & ~(align_to - 1)
+
+        reshape_aliases = self._reshape_aliases
+        layout  = []
+        offset  = 0
 
         # Intermediates: greedy interval-graph colouring.
         # Two tensors may share a slot only when their live intervals are disjoint.
@@ -636,6 +653,51 @@ class _CoreMixin:
 
         return layout, offset
 
+    # ------------------------------------------------------------------
+    # Host-memory tensors (src/numeric.py): one malloc'd arena, slots
+    # reused by liveness exactly like the DMA pool
+    # ------------------------------------------------------------------
+
+    _HOST_ELEM_BYTES = {"f32": 4, "i32": 4, "i16": 2}
+    _HOST_C_TYPES = {"f32": "float", "i32": "int32_t", "i16": "int16_t"}
+
+    def _host_c_type(self, t) -> str:
+        return self._HOST_C_TYPES[t.host]
+
+    def _compute_host_layout(self):
+        """(layout [(onnx_name, byte_offset, bytes)], total_bytes) of the
+        host arena holding the host-memory intermediates; 64-byte slots,
+        tensors with disjoint liveness share a slot."""
+        tensors = self._graph.host_tensors
+        if not tensors:
+            return [], 0
+        size = {t.onnx_name: t.numel * self._HOST_ELEM_BYTES[t.host] for t in tensors}
+        a64 = lambda n: (n + 63) & ~63  # noqa: E731
+        intervals = self._compute_live_intervals(names=list(size))
+        order = sorted([n for n in size if n in intervals],
+                       key=lambda n: (intervals[n][0], -size[n]))
+        slots: list = []
+        for name in order:
+            start, end = intervals[name]
+            for slot in slots:
+                if slot[0] < start:
+                    slot[0] = end
+                    slot[1] = max(slot[1], a64(size[name]))
+                    slot[2].append(name)
+                    break
+            else:
+                slots.append([end, a64(size[name]), [name]])
+        layout, off = [], 0
+        for _end, nbytes, names in slots:
+            for n in names:
+                layout.append((n, off, size[n]))
+            off += nbytes
+        for n in size:
+            if n not in intervals:
+                layout.append((n, off, size[n]))
+                off += a64(size[n])
+        return layout, off
+
     def _compute_pool_bytes(self) -> int:
         """
         Total DMA memory needed for all model buffers, with 64-byte alignment
@@ -651,9 +713,11 @@ class _CoreMixin:
             return (n + 63) & ~63
 
         bpe   = self._dtype.bytes_per_elem
+        host  = {t.onnx_name for t in self._graph.input_tensors + self._graph.output_tensors
+                 if t.is_host}
         total = sum(
             _align64(lay.alloc * bpe)
-            for lay in self._layouts.values()
+            for name, lay in self._layouts.items() if name not in host
         )
         page = 4096
         return (total + page - 1) & ~(page - 1)

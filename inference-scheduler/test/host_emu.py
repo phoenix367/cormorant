@@ -99,6 +99,7 @@ static inline void XVectoropkernel_Set_b(XVectoropkernel *p, u64 v) { p->b = v; 
 static inline void XVectoropkernel_Set_c(XVectoropkernel *p, u64 v) { p->c = v; }
 VOP_SET(size) VOP_SET(op) VOP_SET(outer) VOP_SET(a_inc) VOP_SET(b_inc) VOP_SET(act)
 static inline int XVectoropkernel_IsDone(XVectoropkernel *p) { (void)p; return 1; }
+static inline int XVectoropkernel_Release(XVectoropkernel *p) { (void)p; return 0; }
 /* c[o*(a_inc+b_inc) + i] = act(op(a[o*a_inc+i], b[o*b_inc+i])); the last
  * 8-lane word of every run is written whole, tail lanes = op(0,0) = 0. */
 static inline void XVectoropkernel_Start(XVectoropkernel *p)
@@ -147,6 +148,7 @@ static inline void XMatmulkernel_Set_c(XMatmulkernel *p, u64 v) { p->c = v; }
 MM_SET(n) MM_SET(k) MM_SET(m) MM_SET(batch) MM_SET(a_batch_stride) MM_SET(b_batch_stride)
 MM_SET(c_batch_stride) MM_SET(b_packed)
 static inline int XMatmulkernel_IsDone(XMatmulkernel *p) { (void)p; return 1; }
+static inline int XMatmulkernel_Release(XMatmulkernel *p) { (void)p; return 0; }
 /* C = sat(floor(A.B / 256)); B row-major [k][m] or packed tile-major
  * [ceil(m/T)][k][T] per batch slice (MatmulKernel.h). */
 static inline void XMatmulkernel_Start(XMatmulkernel *p)
@@ -192,6 +194,7 @@ CV_SET(batch) CV_SET(in_ch) CV_SET(in_h) CV_SET(in_w) CV_SET(out_ch) CV_SET(out_
 CV_SET(out_w) CV_SET(kh) CV_SET(kw) CV_SET(stride_h) CV_SET(stride_w) CV_SET(dilation_h)
 CV_SET(dilation_w) CV_SET(pad_top) CV_SET(pad_left) CV_SET(has_bias) CV_SET(is_depthwise)
 static inline int XConvkernel_IsDone(XConvkernel *p) { (void)p; return 1; }
+static inline int XConvkernel_Release(XConvkernel *p) { (void)p; return 0; }
 /* ConvKernel.h: y[n][m][oh][ow] = sat(floor((bias[m] + sum x * w) / 256)) with
  * x NCHW (zero outside [0,in_h) x [0,in_w)), the standard weight packed
  * tile-major [M][ceil(C/T)][kh][kw][lanes] (lanes = T, the last tile 8 when
@@ -289,6 +292,12 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
         for t in cg.large_weight_tensors:
             with open(os.path.join(workdir, "weights", f"{t.c_name}.dat"), "wb") as f:
                 f.write(cg.generate_weight_dat(t))
+    host_tables = cg.host_table_files() if hasattr(cg, "host_table_files") else []
+    if host_tables:
+        os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
+        for name, tb in host_tables:
+            with open(os.path.join(workdir, "weights", f"{name}.dat"), "wb") as f:
+                f.write(tb.dat_bytes())
     if cg.large_expected_tensors:
         os.makedirs(os.path.join(workdir, "expected"), exist_ok=True)
         for t in cg.large_expected_tensors:

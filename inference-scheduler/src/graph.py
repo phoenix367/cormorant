@@ -35,8 +35,10 @@ from .nodes  import (
 from .dtype  import DataType, AP_FIXED_16_8
 from ._conv_hw_config import CONV_TILE_IC
 from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
+from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES
 from . import fusion
 from . import matmul_lowering
+from . import numeric
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
@@ -425,12 +427,13 @@ class OnnxGraph:
                     pad_top=pt2, pad_left=pl2, pad_bottom=pb2, pad_right=pr2,
                     src_pad_top=pads[0], src_pad_left=pads[1])
 
-    def __init__(self, model_path: str,
+    def __init__(self, model_path: "Union[str, onnx.ModelProto]",
                  dtype: DataType = None,
                  fuse_act: bool = False,
                  s2d_stem: bool = False,
                  fuse_patterns: bool = True,
-                 matmul_on_conv="auto") -> None:
+                 matmul_on_conv="auto",
+                 matmul_conv_kw: "Dict[str, int]" = None) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -464,15 +467,25 @@ class OnnxGraph:
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
         per output (``self.split_lowered_count``).
+
+        ``model_path`` may also be an ``onnx.ModelProto`` (a frontend's
+        in-memory graph, e.g. src/llama.py).  Numeric annotations in the
+        model's ``axi.numeric`` metadata (power-of-two exponents, host
+        tensors, states — src/numeric.py) are applied to the tensors; nodes
+        of the ``axi.llm`` domain are the host ops of src/llm_nodes.py.
         """
-        if not os.path.isfile(model_path):
-            raise FileNotFoundError(f"ONNX model not found: {model_path}")
+        if isinstance(model_path, onnx.ModelProto):
+            model = model_path
+        else:
+            if not os.path.isfile(model_path):
+                raise FileNotFoundError(f"ONNX model not found: {model_path}")
+            model = onnx.load(model_path)
         _dtype      = dtype if dtype is not None else AP_FIXED_16_8
         align_elems = _dtype.align_elems
 
-        # Load and validate
-        model = onnx.load(model_path)
+        # Validate
         onnx.checker.check_model(model)
+        self.numeric = numeric.parse(model)
 
         # Run shape inference so every intermediate tensor gets a shape
         model = shape_inference.infer_shapes(model)
@@ -577,11 +590,25 @@ class OnnxGraph:
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
         # ---------------------------------------------------------- #
+        numeric.apply(self._tensors, self.numeric, _dtype)
+        self._input_names = [n for n in self._input_names if not self._tensors[n].is_state]
+
         self._nodes: List[Union[ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
                                 ReshapeNode, SpaceToDepthNode]] = []
-        host_ctx = HostContext(opset=self.opset, consts=self._raw_consts)
+        try:
+            frac_bits = _dtype.frac_bits
+        except NotImplementedError:
+            frac_bits = 8
+        host_ctx = HostContext(opset=self.opset, consts=self._raw_consts, frac_bits=frac_bits)
         for idx, node in enumerate(graph.node):
-            if node.op_type in HOST_OP_FACTORIES:
+            if node.domain == LLM_DOMAIN:
+                if node.op_type not in LLM_OP_FACTORIES:
+                    raise SchedulerError(
+                        f"Node '{node.name or node.op_type}': unknown {LLM_DOMAIN} op "
+                        f"'{node.op_type}' (known: {sorted(LLM_OP_FACTORIES)})")
+                sn = LLM_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
+                                                    host_ctx)
+            elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
                                                      host_ctx)
             elif node.op_type == "MatMul":
@@ -607,11 +634,15 @@ class OnnxGraph:
             self._nodes.append(sn)
 
         self._check_integer_inputs()
+        numeric.check(self._nodes, _dtype)
+        self.weights_saturated = numeric.encode_matmul_weights(self._nodes, _dtype) \
+            if numeric.is_active(self.numeric) else {}
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
         self._nodes, self.matmul_conv_stats = matmul_lowering.lower_matmuls(
             self._nodes, mode=matmul_on_conv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
-            graph_io=self._input_names + self._output_names)
+            graph_io=self._input_names + self._output_names,
+            kw_override=matmul_conv_kw)
         self._pack_matmul_weights()
         self._choose_slice_views()
 
@@ -807,7 +838,9 @@ class OnnxGraph:
 
     @property
     def intermediate_tensors(self) -> List[TensorInfo]:
-        """Non-constant, non-input, non-output tensors (writable buffers)."""
+        """Non-constant, non-input, non-output DMA tensors (writable buffers).
+        Host-memory tensors and states are listed by ``host_tensors`` /
+        ``state_tensors`` instead."""
         boundary = (
             {t.onnx_name for t in self.input_tensors}
             | {t.onnx_name for t in self.output_tensors}
@@ -817,7 +850,35 @@ class OnnxGraph:
         result = []
         for sn in self._nodes:
             for t in [sn.output] + sn.inputs:
-                if t.onnx_name not in boundary and t.onnx_name not in seen:
+                if (t.onnx_name not in boundary and t.onnx_name not in seen
+                        and not t.is_host and not t.is_state):
+                    seen.add(t.onnx_name)
+                    result.append(t)
+        return result
+
+    @property
+    def host_tensors(self) -> List[TensorInfo]:
+        """Host-memory intermediates (not graph inputs / outputs, not states):
+        the float residual stream and friends (src/numeric.py)."""
+        boundary = ({t.onnx_name for t in self.input_tensors}
+                    | {t.onnx_name for t in self.output_tensors})
+        seen, result = set(), []
+        for sn in self._nodes:
+            for t in [sn.output] + sn.inputs:
+                if (t.is_host and not t.is_state and t.onnx_name not in boundary
+                        and t.onnx_name not in seen):
+                    seen.add(t.onnx_name)
+                    result.append(t)
+        return result
+
+    @property
+    def state_tensors(self) -> List[TensorInfo]:
+        """Persistent tensors (src/numeric.py): read / updated in place by
+        host ops, kept across inference_run() calls."""
+        seen, result = set(), []
+        for sn in self._nodes:
+            for t in [sn.output] + sn.inputs:
+                if t.is_state and t.onnx_name not in seen:
                     seen.add(t.onnx_name)
                     result.append(t)
         return result

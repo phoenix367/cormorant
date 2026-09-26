@@ -194,14 +194,20 @@ def _readers(nodes) -> Dict[str, list]:
 
 
 def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = True,
-                  graph_io: Sequence[str] = ()) -> Tuple[list, dict]:
+                  graph_io: Sequence[str] = (),
+                  kw_override: Optional[Dict[str, int]] = None) -> Tuple[list, dict]:
     """Return ``(new_nodes, stats)``: ``nodes`` with every MatmulNode that
     should run on ConvKernel replaced by a MatmulConvNode (same index,
     inputs and output), and the constant Bs that use a ``kw > 1`` layout
     re-imaged (``TensorInfo.packed_data``).  ``stats`` =
     ``{"lowered", "kept", "conv_calls", "conv_cycles", "matmul_cycles"}``
-    (cycles of the lowered nodes on either engine)."""
+    (cycles of the lowered nodes on either engine).
+
+    ``kw_override`` ({constant B name: kw}) pins the kernel width of the
+    listed weights — a multi-entry project's graphs must re-lay out a
+    shared weight identically for it to stay one buffer."""
     mode = normalize_mode(mode)
+    kw_override = kw_override or {}
     stats = {"lowered": 0, "kept": 0, "conv_calls": 0,
              "conv_cycles": 0.0, "matmul_cycles": 0.0}
     if mode == "off":
@@ -226,7 +232,10 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
         relayout_ok = (b.data is not None and b.packed_data is None
                        and b.onnx_name not in io
                        and len(readers.get(b.onnx_name, [])) == 1)
-        plans = conv_plans(sn, range(1, CONV_MAX_KW + 1) if relayout_ok else (1,))
+        kws = range(1, CONV_MAX_KW + 1) if relayout_ok else (1,)
+        if b.onnx_name in kw_override:
+            kws = [k for k in kws if k == kw_override[b.onnx_name]]
+        plans = conv_plans(sn, kws)
         mm_cyc = matmul_plan_cycles(sn)
         if not plans or (mode == "auto" and plans[0].cycles >= LOWER_MARGIN * mm_cyc):
             stats["kept"] += 1
