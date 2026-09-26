@@ -64,6 +64,7 @@ _GLOBAL_MAIN = [
     "gen_pool_models",
     "gen_reshape_gemm_models",
     "gen_parallel_models",
+    "gen_llama_models",
 ]
 # Pattern C/D — no main(); global OUT_DIR + gen_* functions
 _GEN_FUNCS = [
