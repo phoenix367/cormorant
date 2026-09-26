@@ -10,7 +10,7 @@ only) for the KV260 chat server; runs on a laptop or on the board.
 Interactive commands:
   /doc FILE      use FILE as the document (the system message; bert-squad)
   /system TEXT   set the system message (/system alone clears it)
-  /model [M]     list the server's models / switch to M
+  /model [M]     list the server's models / switch to M (the history is kept)
   /reset         forget the conversation (keeps the system message)
   /help, /quit
 
@@ -111,6 +111,10 @@ def ask(args, messages):
             info.append("document truncated: the server's --max-windows")
         if "confidence" in extra:
             info.append(f"confidence {extra['confidence']:.2f}")
+        if extra.get("decode_tokens"):
+            info.append(f"first token {extra.get('ttft_ms', 0) / 1000:.1f} s, {extra.get('decode_tok_s', 0):.1f} tok/s")
+        if extra.get("trimmed_messages"):
+            info.append(f"{extra['trimmed_messages']} oldest messages trimmed to fit the context")
         if usage:
             info.append(f"{usage.get('prompt_tokens')} + {usage.get('completion_tokens')} tokens")
         if finish and finish != "stop":

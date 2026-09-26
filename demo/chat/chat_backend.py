@@ -8,8 +8,11 @@ backend only turns a validated ChatRequest into text:
     class MyBackend(Backend):
         model_id = "smollm2-135m-instruct"
 
-        def load(self):                    # once, before the server listens
-            ...                            # dlopen the library, init the model
+        def load_host(self):               # at startup: host-only resources
+            ...                            # prepare() needs (tokenizer); no FPGA
+        def load(self):                    # before the first request (under the
+            ...                            # FPGA lock): dlopen, init the model
+        def unload(self): ...              # free the FPGA / CMA; load() again later
         def prepare(self, req):            # outside the FPGA lock: tokenize,
             return job                     # apply the chat template, validate
         def generate(self, job, cancel):   # under the FPGA lock
@@ -20,6 +23,11 @@ backend only turns a validated ChatRequest into text:
         def close(self): ...
 
 Contract:
+  * load_host() runs once at startup for every backend; load() / unload()
+    run at startup or under the FPGA lock, when the server makes the model
+    resident or evicts it for another one (--resident; a backend's cma_mb
+    says how much CMA it holds when loaded, uses_fpga = False backends are
+    always resident).  load() may run again after unload().
   * prepare() may raise BackendError (-> an OpenAI-style 4xx JSON error);
     it must not touch the FPGA.
   * generate() yields zero or more Delta(text) and then exactly one Finish.
@@ -121,9 +129,20 @@ class Backend:
     model_id: str = "?"
     owned_by: str = "kv260"
     fingerprint: Optional[str] = None      # -> "system_fingerprint"
+    uses_fpga: bool = True                 # False: no device state, always resident
+    cma_mb: float = 0.0                    # CMA held while loaded (MB), for --resident auto
+
+    def load_host(self) -> None:
+        """Host-only resources prepare() needs (tokenizer, template); once,
+        at startup, before any load().  Must not touch the FPGA."""
 
     def load(self) -> None:
         pass
+
+    def unload(self) -> None:
+        """Release the FPGA and its CMA; host resources stay (prepare() keeps
+        working) and load() may be called again.  Default: close()."""
+        self.close()
 
     def close(self) -> None:
         pass
