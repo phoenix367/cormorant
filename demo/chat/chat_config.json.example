@@ -1,0 +1,41 @@
+{
+  "_comment": "Copy to chat_config.json and edit. Relative paths are relative to demo/chat/.",
+
+  "bert_squad_config": "../bert_squad/bert_squad_config.json",
+  "_bert_squad_config_note": "The BERT-SQuAD demo config: model, io roles, HLS driver dirs, remote.uio_devices, remote.weights_dir, ssh and board_lock are taken from it (the project is generated with demo/bert_squad/scripts/generate_project.py).",
+
+  "ssh": null,
+  "_ssh_note": "null = the ssh block of bert_squad_config; or {host, user, port, key_file, password, connect_timeout}.",
+
+  "remote": {
+    "dir": "/root/kv260_chat",
+    "_dir_note": "Persistent install directory on the board: server files, vocab.txt, lib/libbert_squad.so, project/ (sources + build).",
+    "weights_dir": null,
+    "_weights_dir_note": "null = bert_squad_config remote.weights_dir (/root/bert_squad_weights); weights/*.dat are uploaded only when their size or SHA-1 changed."
+  },
+
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "api_key": null,
+    "_api_key_note": "null = no authentication; otherwise clients send 'Authorization: Bearer <key>' (stored on the board in <dir>/api_key, mode 600).",
+    "backends": ["bert-squad"],
+    "max_windows": 8,
+    "doc_stride": 128,
+    "queue_timeout": 120,
+    "max_queue": 16,
+    "launcher": "systemd",
+    "_launcher_note": "systemd = a transient unit 'kv260-chat' (systemd-run; logs: journalctl -u kv260-chat; not started at boot); nohup = a detached process (<dir>/server.log, <dir>/server.pid).",
+    "env": {}
+  },
+
+  "build": {
+    "jobs": 4,
+    "timeout": 1800
+  },
+
+  "board_lock": null,
+  "_board_lock_note": "null = bert_squad_config board_lock. deploy.py holds flock() on it while it deploys (and with --hold until the server is stopped).",
+
+  "health_timeout": 180
+}

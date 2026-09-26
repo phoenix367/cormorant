@@ -2,8 +2,8 @@
 
 Date: 2026-09-26.  Status: **approved 2026-09-26 — decisions: A then B,
 SmolLM2-135M-Instruct, server on the board, existing CLIs + `chat.py`, context
-1024.**  Phase 1 (server + CLI + backend A) and phase 2 (B0 numeric study)
-started in parallel.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
+1024.**  Phase 1 (server + CLI + backend A) **done** (branch `feat/chatsrv`,
+§9); phase 2 (B0 numeric study) started in parallel.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
 inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
@@ -208,3 +208,96 @@ Each phase lands as its own branch and board run, like BERT phases 1–2.
 - **Static shapes** — prefill buckets and a fixed context length; longer
   conversations are trimmed.
 - **One FPGA** — requests are serialised; fine for a demo, not a service.
+
+## 9. Phase 1 outcome (2026-09-26, branch `feat/chatsrv`)
+
+Delivered as [`demo/chat/`](../demo/chat/) (README there: deploy, the
+client recipes with transcripts, the API and backend reference).
+
+* **Shared library.**  `demo/bert_squad/src/bert_api.{h,c}` — `bert_open(weights_dir)`,
+  `bert_run(ids, seg, mask, start_logits, end_logits)` (raw int16 in, raw
+  Q8.8 bits out), `bert_run_ex` (+ the pass-through unique id), `bert_close`,
+  `bert_seq_len`, `bert_model_name`, `bert_weights_dir`, `bert_last_error`:
+  the init / buffer / UIO-instance code `squad_bench.c` had inline, now used
+  by `squad_bench` and by `libbert_squad.so`.  `generate_project.py` adds
+  the `bert_squad` shared-library target (the `inference` static library
+  built position-independent; `-Wl,--exclude-libs,ALL` exports only the 8
+  `bert_*` symbols, so a second generated library — the decoder — can live
+  in the same process without `inference_*` clashes).  No change to the
+  generated inference API.  `weights_dir` must be the build's
+  `INFERENCE_WEIGHTS_DIR` (the generated `_load_weight()` resolves it at
+  compile time; a relative build directory is `chdir`'d into instead).
+* **Text module.**  `demo/bert_squad/scripts/squad_text.py` (stdlib only):
+  WordPiece tokenizer, `build_feature` (one window), `build_features`
+  (sliding 256-token windows, question ≤ 64 tokens, stride 128, per-token
+  max-context flags), `best_span` and `best_span_windows` (cross-window,
+  n-best with softmax probabilities, answer ≤ 30 tokens), SQuAD EM / F1;
+  `bert_study.py` re-imports it.  Only change in behaviour: equal logits are
+  ranked by position (stable) instead of by numpy's unstable argsort —
+  unchanged results on all real data checked (demo inputs byte-identical,
+  60 / 60 spans over the demo's board / float / emulation logits, study
+  `--policies q88,sched --n 5` and `bert_sched_check.py --n 2` identical).
+* **Server** `kv260_chat_server.py` (stdlib `ThreadingHTTPServer`, HTTP/1.1
+  keep-alive, chunked SSE): `/health`, `/v1/models[/{id}]`,
+  `/v1/chat/completions` (stream / non-stream, `stream_options.include_usage`,
+  `usage`, `finish_reason`), OpenAI-style 400 / 401 / 404 / 413 / 503
+  errors, optional API key, FIFO FPGA queue with timeout and length limit,
+  cancellation on client disconnect (socket peek between steps), one log
+  line per request.  Backend interface `chat_backend.py`: `load / prepare
+  (no FPGA) / generate (yields Delta…, Finish; checks cancel between steps)
+  / health / close`.  Backend A as §3.1 with an 8-window cap; an `echo`
+  backend for protocol testing without the FPGA.
+* **Client** `chat.py` (stdlib, streaming, history, `/doc /system /model
+  /reset`, one-shot `-q`).  **Deploy** `deploy.py`: generate if needed,
+  weights by checksum, cached build, transient systemd unit `kv260-chat`,
+  `/health` wait, `--status`, `--stop`, `--hold` (keeps the board lock and
+  stops the server on exit).
+
+**Gates.**
+1. Host: 48 unit tests (stdlib `unittest`): chat.completion and chunk
+   schema field by field, errors, queue order / timeout / overflow,
+   disconnect while streaming, while computing and while queued; windows,
+   max-context and cross-window spans against independent references; the
+   backend's mapping, windows, cap, `max_tokens` / `stop`, cancellation, and
+   a replay of the demo's board logits giving the demo's spans.
+2. Board (under the lock; same bitstream as BERT phase 2): the demo with
+   the refactored `squad_bench` (`deploy_and_run.py --n 12`) bit-exact with
+   the simulation 3 / 3 and the emulation 12 / 12, 966.7 ms per inference,
+   logits byte-identical to main's run; the server gives **the demo's spans
+   for 12 / 12 questions**; **971 ms FPGA time per window**, 1027 ms per
+   single-window request end to end, startup 1.6 s; long document (1048
+   tokens, 8 windows) EM 90.0 / F1 94.2 over 10 questions at 7.8–8.0 s each;
+   a 19-window document truncated to 8 and reported; a dropped 8-window
+   request frees the FPGA after the current window.
+3. Clients against the board: `chat.py` (one-shot, scripted REPL),
+   `curl` (stream / non-stream / errors), `openai` 3.19.2 (models, create,
+   stream with usage, 404 / 400 exceptions), `llm` 0.36 (`-m`, `--no-stream`,
+   `-c`, `llm chat`), `aichat` 0.30.0 (one-shot, `-S`, `Context:`, REPL with
+   `.prompt`) — all work unchanged; transcripts in the README.
+
+**For phases 3–4.**
+* *Memory.*  The BERT server process holds ~221 MB of CMA (CmaFree 811 →
+  590 MB); idle CmaFree on the board was 626–813 MB of 1000 MB today (1013 MB
+  after a fresh boot in BERT phase 1; the display stack and earlier jobs
+  take some).  A 135M decoder pool (~270 MB of
+  weights + the embedding's second copy + KV cache + activations) fits
+  beside BERT only when CmaFree is at the high end — plan to load one
+  backend at a time or check CmaFree at `load()`; 360M needs BERT unloaded.
+* *Two libraries in one process* are safe symbol-wise (only `bert_*` /
+  the decoder's own exports are visible); each opens its own XRT device
+  handle and pool BO and maps the same UIO devices; the server's single FIFO
+  lock serialises them — keep all kernel work under it.
+* *Streaming* works token by token already (`Delta` per yield; `StopStream`
+  for stop strings); TTFT and tok/s are in the log line.  The decoder's
+  `prepare()` should apply the chat template and tokenize outside the lock.
+* *Lock etiquette.*  The running server owns the FPGA; `deploy.py --hold`
+  ties the host board lock to the server's lifetime, otherwise stop it
+  before other board jobs.
+
+**Open issues.**  Answers keep the punctuation of the document's
+whitespace words (SQuAD convention, same as the demo: "February 7, 2016,");
+`FIFO` means order of reaching the queue after host preparation (a request
+with a long, not yet cached document can be overtaken by a short one);
+`temperature` / `top_p` / `seed` are ignored by the extractive backend; no
+`/v1/completions` and no Ollama shim.
+
