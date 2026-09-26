@@ -192,6 +192,46 @@ class TestSimVsStudy(unittest.TestCase):
         np.testing.assert_array_equal(a, b)
 
 
+class TestOtherShapes(unittest.TestCase):
+    """Llama-generic: the SmolLM2-360M layer shape (hidden 960, 15 / 5 heads,
+    head_dim 64, FFN 2560 — its K = 2560 down-projection needs kw >= 3 on
+    ConvKernel) and plain multi-head attention, 2 random layers each."""
+
+    def _run(self, cfg, seed):
+        W = G.tiny_weights(cfg, seed)
+        formats = G.calibrate(cfg, W, n_seq=2, length=20)
+        fe = G.frontend(cfg, W, formats, ctx=48, name="shape")
+        gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_16": ("prefill", 16, False),
+                         "head": ("head", 1, False)})
+        cgs = {n: CodeGenerator(g, model_path=n) for n, g in gs.items()}
+        sm, sc = G.study_model(cfg, W, formats)
+        rng = np.random.default_rng(seed)
+        prompt = rng.integers(2, cfg["vocab_size"], 12)
+        ses = Session(cgs, [16])
+        a = [ses.prefill(list(prompt))]
+        s = study.Seq(sc, 32)
+        b = [sm.forward([s], [np.concatenate([[1], prompt])])[0][-1]]
+        for _ in range(3):
+            tok = int(np.argmax(a[-1]))
+            a.append(ses.decode(tok))
+            b.append(sm.forward([s], [np.array([tok])])[0][-1])
+        for i, (x, y) in enumerate(zip(a, b)):
+            np.testing.assert_array_equal(x, y, err_msg=f"step {i}")
+        return gs
+
+    def test_smollm2_360m_layer_shape(self):
+        cfg = dict(G.TINY, hidden_size=960, num_attention_heads=15, num_key_value_heads=5,
+                   head_dim=64, intermediate_size=2560, vocab_size=1024, rope_theta=100000.0)
+        gs = self._run(cfg, 3)
+        down = [sn for sn in gs["prefill_16"].nodes
+                if isinstance(sn, MatmulConvNode) and sn.k == 2560]
+        self.assertEqual(len(down), 2)
+        self.assertTrue(all(sn.kw >= 3 and sn.in_ch <= 1024 for sn in down))
+
+    def test_multi_head_attention(self):
+        self._run(dict(G.TINY, num_key_value_heads=4), 4)
+
+
 class TestHostEmulation(unittest.TestCase):
     """Generated C (-Werror) against the software kernels == simulation."""
 
@@ -242,6 +282,35 @@ class TestHostEmulation(unittest.TestCase):
         forced = {k: 2 for k in kw}
         small = OnnxGraph(fe.entry("prefill", 8), matmul_on_conv="always", matmul_conv_kw=forced)
         self.assertTrue(all(sn.kw == 2 for sn in small.nodes if isinstance(sn, MatmulConvNode)))
+
+
+class TestCli(unittest.TestCase):
+
+    def test_multi_entry_cli(self):
+        """inference_scheduler.py --entry NAME=MODEL.onnx ... writes one project
+        with one run function per entry; a model plus --entry is an error."""
+        from inference_scheduler import main
+        _cfg, _W, _f, fe = tiny()
+        import onnx
+        with tempfile.TemporaryDirectory() as td:
+            paths = {}
+            for name, (kind, T) in {"decode": ("decode", 1), "head": ("head", 1)}.items():
+                paths[name] = os.path.join(td, f"{name}.onnx")
+                onnx.save(fe.entry(kind, T), paths[name])
+            out = os.path.join(td, "proj")
+            rc = main(["--entry", f"decode={paths['decode']}", "--entry", f"head={paths['head']}",
+                       "--out-dir", out])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "include", "inference.h")) as f:
+                h = f.read()
+            self.assertIn("void inference_run_decode(", h)
+            self.assertIn("void inference_run_head(", h)
+            self.assertIn("#define INFERENCE_NUM_ENTRIES  2u", h)
+            for rel in ("CMakeLists.txt", "src/inference.c", "src/inference_buf.c",
+                        "test/test_inference.c", "driver/README.md"):
+                self.assertTrue(os.path.exists(os.path.join(out, rel)), rel)
+            self.assertEqual(main([paths["decode"], "--entry", f"head={paths['head']}"]), 1)
+            self.assertEqual(main(["--entry", "nonsense"]), 1)
 
 
 class TestCoherency(unittest.TestCase):

@@ -115,6 +115,7 @@ class _CombinedCG(CodeGenerator):
 
     def __init__(self, multi: "MultiEntryGenerator", **kw):
         self._multi = multi
+        self._compact_init = True
         super().__init__(multi.combined, model_path=multi.model_name + ".onnx", **kw)
 
     def _compute_pool_layout(self):

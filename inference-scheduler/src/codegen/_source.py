@@ -9,7 +9,7 @@ from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulConvNode, MatmulNode, Schedul
                         SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
-from ..llm_nodes import LlmNode, llm_c_helpers
+from ..llm_nodes import RUNTIME_GROUPS, LlmNode, llm_c_helpers
 from ._banners  import _banner, _file_banner
 
 
@@ -237,8 +237,14 @@ class _SourceMixin:
             parts.append("/* Per-node host-op constants */\n" + "\n".join(consts) + "\n")
         items = self._llm_runtime_items()
         if items:
+            groups = self._llm_runtime_groups(items)
             parts.append("/* LLM host-op runtime objects: exponent scales, tables (built in\n"
-                         " * host_runtime_init) */\n" + "\n".join(it.decl for it in items) + "\n")
+                         " * host_runtime_init) */\n"
+                         + "\n".join(it.decl for it in items if it.decl) + "\n")
+            for g, rows in groups.items():
+                struct, table, ctype, _i, _f = RUNTIME_GROUPS[g]
+                parts.append(f"{struct}\nstatic const {ctype} {table}[{len(rows)}] = {{\n"
+                             + ",\n".join("    " + r for r in rows) + "\n};\n")
         parts.append(self._host_runtime_functions())
         return "\n".join(parts)
 
@@ -256,6 +262,16 @@ class _SourceMixin:
                         continue
                     seen[it.key] = it
         return list(seen.values())
+
+    @staticmethod
+    def _llm_runtime_groups(items) -> dict:
+        """{group: [row, ...]} of the grouped runtime items (RUNTIME_GROUPS order)."""
+        out: dict = {}
+        for g in RUNTIME_GROUPS:
+            rows = [it.row for it in items if it.group == g]
+            if rows:
+                out[g] = rows
+        return out
 
     def host_table_files(self) -> list:
         """[(weights/<name>.dat, bytes)] of the LLM host tables that are
@@ -277,11 +293,18 @@ class _SourceMixin:
                 if name != "s_host_exp_lut"]          # declared with its helper
         init = [f"    if ({call} != 0) return -1;" for _, call in luts]
         free = [f"    free({name}); {name} = NULL;" for name, _ in luts]
-        for it in self._llm_runtime_items():
+        items = self._llm_runtime_items()
+        for it in items:
             if it.init:
                 init.append(it.init)
             if it.free:
                 free.append(it.free)
+        for g, rows in self._llm_runtime_groups(items).items():
+            _s, table, ctype, gi, gf = RUNTIME_GROUPS[g]
+            loop = (f"    {{\n        unsigned _i;\n        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                    f"            const {ctype} *T = &{table}[_i];\n")
+            init.append(loop + f"            {gi}\n        }}\n    }}")
+            free.append(loop + f"            {gf}\n        }}\n    }}")
         return (
             ("/* Lookup tables (filled in host_runtime_init) */\n" + "\n".join(decl) + "\n\n"
              if decl else "") +
@@ -1111,6 +1134,8 @@ class _SourceMixin:
         need_pool = bool(pool_layout)
 
         alloc_lines: List[str] = []
+        compact = self._use_compact_init()
+        slot_tables: List[str] = []            # file-scope descriptor tables (compact form)
 
         if need_pool:
             alloc_lines.append(
@@ -1126,7 +1151,38 @@ class _SourceMixin:
             )
             alloc_lines.append("")
 
-        if weights:
+        if weights and compact:
+            rows = []
+            for t in weights:
+                off, alloc = pool_map[t.onnx_name]
+                if t.onnx_name in external:
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u, NULL, 0u,"
+                                f" \"{t.c_name}\", {t.numel}u }},")
+                else:
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u,"
+                                f" _rom_{t.c_name}, (unsigned)sizeof(_rom_{t.c_name}), NULL, 0u }},")
+            slot_tables.append(f"static const _pool_slot_t _s_weight_slots[{len(rows)}] = {{\n"
+                               + "\n".join(rows) + "\n};")
+            load = ("            else if (_load_weight(s->view, s->name, s->n_elem) != 0) "
+                    "{ rc = -1; goto fail; }\n" if external else "")
+            alloc_lines.append(
+                "    /* Weights: one table-driven loop (thousands of straight-line views make\n"
+                "     * the compiler's register allocator explode on these projects) */\n"
+                "    {\n"
+                "        unsigned _i;\n"
+                f"        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                "            const _pool_slot_t *s = &_s_weight_slots[_i];\n"
+                "            inference_buf_init_view(s->view, s_alloc_pool, s->off, s->count);\n"
+                "            *s->var = s->view;\n"
+                "            if (s->rom)\n"
+                "                memcpy(inference_buf_ptr(s->view), s->rom, s->rom_bytes);\n"
+                + load +
+                "        }\n"
+                "    }")
+            alloc_lines.append("")
+            alloc_lines.append("    inference_buf_sync_to_device(s_alloc_pool);")
+            alloc_lines.append("")
+        elif weights:
             alloc_lines.append("    /* Weights */")
             for t in weights:
                 off, alloc = pool_map[t.onnx_name]
@@ -1163,7 +1219,26 @@ class _SourceMixin:
                          if t.onnx_name not in reshape_aliases and t.onnx_name not in views]
             alias_tensors = [t for t in intermediates if t.onnx_name in reshape_aliases]
 
-            if non_alias:
+            if non_alias and compact:
+                rows = []
+                for t in non_alias:
+                    off, alloc = pool_map[t.onnx_name]
+                    rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u,"
+                                f" NULL, 0u, NULL, 0u }},")
+                slot_tables.append(f"static const _pool_slot_t _s_inter_slots[{len(rows)}] = {{\n"
+                                   + "\n".join(rows) + "\n};")
+                alloc_lines.append(
+                    "    /* Intermediate buffers (table-driven) */\n"
+                    "    {\n"
+                    "        unsigned _i;\n"
+                    f"        for (_i = 0u; _i < {len(rows)}u; _i++) {{\n"
+                    "            const _pool_slot_t *s = &_s_inter_slots[_i];\n"
+                    "            inference_buf_init_view(s->view, s_alloc_pool, s->off, s->count);\n"
+                    "            *s->var = s->view;\n"
+                    "        }\n"
+                    "    }")
+                alloc_lines.append("")
+            elif non_alias:
                 alloc_lines.append("    /* Intermediate buffers */")
                 for t in non_alias:
                     off, alloc = pool_map[t.onnx_name]
@@ -1271,7 +1346,19 @@ class _SourceMixin:
             for t in self._graph.host_tensors:
                 deinit_free.append(f"    {t.c_name} = NULL;")
             deinit_free.append("    free(s_host_arena); s_host_arena = NULL;")
+        tabled = set()
+        if compact:
+            for tab, n in (("_s_weight_slots", "weight"), ("_s_inter_slots", "inter")):
+                if any(tab in t for t in slot_tables):
+                    deinit_free.append(
+                        f"    {{ unsigned _i; for (_i = 0u; _i < sizeof {tab} / sizeof {tab}[0];"
+                        f" _i++) *{tab}[_i].var = NULL; }}")
+            tabled = ({t.onnx_name for t in weights}
+                      | {t.onnx_name for t in intermediates
+                         if t.onnx_name not in reshape_aliases and t.onnx_name not in views})
         for t in weights + intermediates:
+            if t.onnx_name in tabled:
+                continue
             if t.onnx_name in reshape_aliases:
                 deinit_free.append(
                     f"    {t.c_name} = NULL;  /* reshape alias — not owned */"
@@ -1305,9 +1392,25 @@ class _SourceMixin:
             )
         init_calls_str = "\n".join(init_calls)
 
+        tables = ""
+        if slot_tables:
+            tables = (
+                "/* Pool views of the weights and intermediates: one descriptor per buffer,\n"
+                " * set up by a loop in inference_init() (compact form, see\n"
+                " * _use_compact_init). */\n"
+                "typedef struct {\n"
+                "    inference_buf_t  *view;\n"
+                "    inference_buf_t **var;\n"
+                "    unsigned          off, count;\n"
+                "    const void       *rom;         /* inline weight image, or NULL */\n"
+                "    unsigned          rom_bytes;\n"
+                "    const char       *name;        /* weights/<name>.dat when rom == NULL */\n"
+                "    unsigned          n_elem;\n"
+                "} _pool_slot_t;\n\n" + "\n\n".join(slot_tables) + "\n")
         return (
             load_helper +
             _banner("inference_init() / inference_deinit()") +
+            tables +
             "/* Internal: pool lifecycle — defined in inference_buf.c */\n"
             "int  inference_buf_pool_init(void);\n"
             "void inference_buf_pool_deinit(void);\n"
@@ -1336,6 +1439,17 @@ class _SourceMixin:
             "    inference_buf_pool_deinit();\n"
             "}\n"
         )
+
+    def _use_compact_init(self) -> bool:
+        """Table-driven pool views in inference_init() / deinit() (LLM and
+        multi-entry projects): a straight-line view per buffer — thousands
+        of them — sends GCC's integrated register allocator past 2.5 GB
+        (aarch64 gcc 13 -O1; gcc 11 -O2 on the KV260).  Existing models keep
+        the straight-line form (byte-identical projects)."""
+        from ..numeric import is_active
+        return bool(getattr(self, "_compact_init", False)
+                    or is_active(getattr(self._graph, "numeric", None) or
+                                 {"exp": {}, "host": {}, "state": []}))
 
     def _inference_function(self) -> str:
         graph   = self._graph
@@ -1455,6 +1569,9 @@ class _SourceMixin:
 
         if body_lines and body_lines[-1] == "":
             body_lines.pop()
+        parts_src = ""
+        if self._use_compact_init():
+            body_lines, parts_src = self._split_run_body(body_lines)
 
         # ---- Run-time input reshape aliases ----------------------------------- #
         # Intermediate tensors that are reshape aliases of graph inputs cannot be
@@ -1554,12 +1671,46 @@ class _SourceMixin:
 
         return (
             _banner("inference_run()") +
+            parts_src +
             f"void {self._run_name}(\n"
             f"{param_str or '    void'})\n"
             "{\n"
             f"{body}\n"
             "}\n"
         )
+
+    _RUN_PART_NODES = 40
+
+    def _split_run_body(self, body_lines: List[str]):
+        """Split a long run body at node boundaries into noinline static
+        functions of about _RUN_PART_NODES nodes (compact-form projects:
+        thousand-line straight-line functions are what makes the compiler's
+        memory explode).  Returns (body calling the parts, their source)."""
+        chunks, cur, nodes = [], [], 0
+        for ln in body_lines:
+            if ln.startswith("    /* [") and nodes >= self._RUN_PART_NODES:
+                chunks.append(cur)
+                cur, nodes = [], 0
+            if ln.startswith("    /* ["):
+                nodes += 1
+            cur.append(ln)
+        if cur:
+            chunks.append(cur)
+        if len(chunks) <= 1:
+            return body_lines, ""
+        params = self._run_params()
+        names = [p.split("*")[-1].strip() for p in params]
+        src, calls = [], []
+        for k, ch in enumerate(chunks):
+            fn = f"{self._run_name}_part{k}"
+            while ch and ch[-1] == "":
+                ch = ch[:-1]
+            src.append(f"static void __attribute__((noinline)) {fn}(\n"
+                       + (",\n".join(params) or "    void") + ")\n{\n"
+                       + "".join(f"    (void){n};\n" for n in names)
+                       + "\n".join(ch) + "\n}\n\n")
+            calls.append(f"    {fn}({', '.join(names)});")
+        return calls, "".join(src)
 
     @property
     def _run_name(self) -> str:

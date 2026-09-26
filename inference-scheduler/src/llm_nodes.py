@@ -60,11 +60,34 @@ TABLE_FILE_BYTES = 64 * 1024
 class RuntimeItem:
     """A file-scope object a host op needs at run time, created in
     host_runtime_init() and released in host_runtime_deinit().  Items with
-    the same ``key`` are emitted once (their text must then be equal)."""
+    the same ``key`` are emitted once (their text must then be equal).
+
+    ``group`` / ``row``: instead of per-item init / free statements, the item
+    is one row of a descriptor table of that group (RUNTIME_GROUPS) set up by
+    one loop — hundreds of straight-line calls taking addresses of statics
+    make the compiler's register allocator explode (2.6 GB, aarch64 gcc)."""
     key:   str
     decl:  str
     init:  str = ""
     free:  str = ""
+    group: str = ""
+    row:   str = ""
+
+
+# group -> (row struct, table name, init loop body, free loop body); in the
+# loop bodies T is the row pointer
+RUNTIME_GROUPS = {
+    "scale": ("typedef struct {\n    double           **s, **inv;   /* 2^-f, 2^f per channel */\n"
+              "    const signed char *e;\n    unsigned           n;\n} llm_scale_slot_t;",
+              "_llm_scale_slots", "llm_scale_slot_t",
+              "if (llm_scales(T->s, T->inv, T->e, T->n) != 0) return -1;",
+              "free(*T->s); free(*T->inv); *T->s = NULL; *T->inv = NULL;"),
+    "silu":  ("typedef struct {\n    int f;                          /* a gate exponent */\n"
+              "} llm_silu_slot_t;",
+              "_llm_silu_slots", "llm_silu_slot_t",
+              "if (llm_silu_table(T->f) != 0) return -1;",
+              "llm_silu_free(T->f);"),
+}
 
 
 @dataclass
@@ -130,28 +153,32 @@ def table_kind(values: np.ndarray) -> str:
 def scale_item(exps: np.ndarray) -> Tuple[str, str, RuntimeItem]:
     """(scale name, inverse-scale name, runtime item) for a per-channel
     exponent vector: two double arrays 2^-f and 2^f built at init with ldexp
-    (exact) from an int8 exponent array in the source."""
+    (exact) from an int8 exponent array ``_llm_e_<tag>`` in the source."""
     e = np.asarray(exps, np.int64).reshape(-1)
     if (e < -127).any() or (e > 127).any():
         raise SchedulerError("exponent out of the int8 range")
-    tag = f"{zlib.crc32(e.astype(np.int8).tobytes()):08x}_{e.size}"
+    tag = exp_tag(e)
     s, i = f"_llm_s_{tag}", f"_llm_i_{tag}"
     lits = [str(int(v)) for v in e]
     rows = ",\n".join("    " + ", ".join(lits[k:k + 24]) for k in range(0, len(lits), 24))
     decl = (f"static const signed char _llm_e_{tag}[{e.size}] = {{\n{rows}\n}};\n"
             f"static double *{s} = NULL, *{i} = NULL;   /* 2^-f, 2^f per channel */")
-    init = (f"    if (llm_scales(&{s}, &{i}, _llm_e_{tag}, {e.size}u) != 0) return -1;")
-    free = f"    free({s}); free({i}); {s} = {i} = NULL;"
-    return s, i, RuntimeItem(key=f"scale:{tag}", decl=decl, init=init, free=free)
+    return s, i, RuntimeItem(key=f"scale:{tag}", decl=decl, group="scale",
+                             row=f"{{ &{s}, &{i}, _llm_e_{tag}, {e.size}u }}")
 
 
-def silu_item(f: int) -> Tuple[str, RuntimeItem]:
-    name = f"_llm_silu_{'m' if f < 0 else ''}{abs(int(f))}"
-    return name, RuntimeItem(
-        key=f"silu:{f}",
-        decl=f"static double *{name} = NULL;   /* silu table, gate exponent {f} */",
-        init=f"    if (llm_silu_table(&{name}, {int(f)}) != 0) return -1;",
-        free=f"    free({name}); {name} = NULL;")
+def exp_tag(e: np.ndarray) -> str:
+    e = np.asarray(e, np.int64).reshape(-1)
+    return f"{zlib.crc32(e.astype(np.int8).tobytes()):08x}_{e.size}"
+
+
+SILU_EMIN, SILU_NE = -32, 80          # _llm_silu_tab[f - SILU_EMIN] for f in [-32, 48)
+
+
+def silu_item(f: int) -> RuntimeItem:
+    if not SILU_EMIN <= int(f) < SILU_EMIN + SILU_NE:
+        raise SchedulerError(f"gate exponent {f} outside [{SILU_EMIN}, {SILU_EMIN + SILU_NE})")
+    return RuntimeItem(key=f"silu:{f}", decl="", group="silu", row=f"{{ {int(f)} }}")
 
 
 # ------------------------------------------------------------------ #
@@ -439,28 +466,10 @@ class LlmSiluMulNode(LlmNode):
         _require(g.shape == u.shape and y.numel == g.numel, node, "shapes")
         return sn
 
-    @property
-    def tabs_name(self) -> str:
-        fg = self.inputs[0].exp_channels(self.F)
-        return f"_llm_st_{zlib.crc32(fg.astype(np.int8).tobytes()):08x}_{fg.size}"
-
     def c_runtime(self):
         fg = self.inputs[0].exp_channels(self.F)
-        items = []
-        names = {}
-        for f in sorted(set(int(v) for v in fg)):
-            names[f], it = silu_item(f)
-            items.append(it)
-        # per-channel table pointers (filled after the tables)
-        lits = ", ".join(names[int(f)] for f in fg)
-        tn = self.tabs_name
-        items.append(RuntimeItem(
-            key=f"silutabs:{tn}",
-            decl=f"static const double *{tn}[{fg.size}];   /* silu table per gate channel */",
-            init="    {\n"
-                 f"        const double *_t[{fg.size}] = {{ {lits} }};\n"
-                 f"        memcpy((void *){tn}, _t, sizeof _t);\n"
-                 "    }"))
+        items = [silu_item(int(f)) for f in sorted(set(int(v) for v in fg))]
+        items.append(self._scales(self.inputs[0])[2])        # _llm_e_<tag> of the gate
         items.append(self._scales(self.inputs[1])[2])
         items.append(self._scales(self.output)[2])
         return items
@@ -472,7 +481,8 @@ class LlmSiluMulNode(LlmNode):
     def c_call(self, ins, out, scratch, direct, dtype):
         su = self._scales(self.inputs[1])[0]
         ia = self._scales(self.output)[1]
-        return [f"llm_silu_mul({ins[0]}, {ins[1]}, {self.tabs_name}, {su}, {ia}, "
+        eg = "_llm_e_" + exp_tag(self.inputs[0].exp_channels(self.F))
+        return [f"llm_silu_mul({ins[0]}, {ins[1]}, {eg}, {su}, {ia}, "
                 f"{self.rows}u, {self.n}u, {out});"]
 
     def reference(self, ins, dtype):
@@ -903,9 +913,16 @@ static void llm_silu_fill(void *p, unsigned i0, unsigned i1)
     }
 }
 
-static int llm_silu_table(double **t, int f)
+/* One silu table per gate exponent f, _llm_silu_tab[f - LLM_SILU_EMIN]. */
+#define LLM_SILU_EMIN  (SILU_EMIN_VALUE)
+#define LLM_SILU_NE    (SILU_NE_VALUE)
+static double *_llm_silu_tab[LLM_SILU_NE];
+
+static int llm_silu_table(int f)
 {
     llm_silu_fill_t a;
+    double        **t = &_llm_silu_tab[f - LLM_SILU_EMIN];
+    if (*t) return 0;
     *t = (double *)malloc(65536u * sizeof(double));
     if (!*t) return -1;
     a.t = *t; a.d = ldexp(1.0, f);
@@ -913,9 +930,15 @@ static int llm_silu_table(double **t, int f)
     return 0;
 }
 
+static void llm_silu_free(int f)
+{
+    free(_llm_silu_tab[f - LLM_SILU_EMIN]);
+    _llm_silu_tab[f - LLM_SILU_EMIN] = NULL;
+}
+
 typedef struct {
     const Data_t        *g, *u;
-    const double *const *tabs;
+    const signed char   *fg;            /* gate exponent per channel */
     const double        *su, *ia;
     unsigned             n;
     Data_t              *y;
@@ -930,17 +953,17 @@ static void llm_silu_rows(void *p, unsigned r0, unsigned r1)
         const Data_t *u = a->u + (size_t)r * a->n;
         Data_t       *y = a->y + (size_t)r * a->n;
         for (c = 0u; c < a->n; c++)
-            y[c] = llm_st(a->tabs[c][(int)(int16_t)g[c] + 32768] * llm_ld(u[c], a->su[c]),
-                          a->ia[c]);
+            y[c] = llm_st(_llm_silu_tab[a->fg[c] - LLM_SILU_EMIN][(int)(int16_t)g[c] + 32768]
+                          * llm_ld(u[c], a->su[c]), a->ia[c]);
     }
 }
 
-static void llm_silu_mul(const Data_t *g, const Data_t *u, const double *const *tabs,
+static void llm_silu_mul(const Data_t *g, const Data_t *u, const signed char *fg,
                          const double *su, const double *ia, unsigned rows, unsigned n,
                          Data_t *y)
 {
     llm_silu_t a;
-    a.g = g; a.u = u; a.tabs = tabs; a.su = su; a.ia = ia; a.n = n; a.y = y;
+    a.g = g; a.u = u; a.fg = fg; a.su = su; a.ia = ia; a.n = n; a.y = y;
     host_parallel(llm_silu_rows, &a, rows, host_row_grain(n), 1u);
 }
 
@@ -1076,7 +1099,7 @@ static void llm_attention(llm_attn_t *a)
 
 
 def llm_c_helpers() -> str:
-    return LLM_C
+    return LLM_C.replace("SILU_EMIN_VALUE", str(SILU_EMIN)).replace("SILU_NE_VALUE", str(SILU_NE))
 
 
 __all__ = ("LLM_DOMAIN", "LLM_OP_FACTORIES", "LlmNode", "LlmEmbedNode", "LlmResAddNode",

@@ -29,7 +29,7 @@ from src.codegen import CodeGenerator
 from src.dtype import AP_FIXED_16_8 as Q
 from src.graph import OnnxGraph
 from src.host_nodes import HOST_C_POOL
-from src.llm_nodes import (LLM_C, LLM_DOMAIN, dot8, rope, silu_table)
+from src.llm_nodes import LLM_DOMAIN, dot8, llm_c_helpers, rope, silu_table
 from src.nodes import SchedulerError
 
 vi = oh.make_tensor_value_info
@@ -228,12 +228,12 @@ class TestSiluTableExhaustive(unittest.TestCase):
             with open(src, "w") as f:
                 f.write("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
                         "#include <string.h>\n#include <math.h>\ntypedef uint16_t Data_t;\n"
-                        + HOST_C_POOL + LLM_C +
+                        + HOST_C_POOL + llm_c_helpers() +
                         "int main(int argc, char **argv) {\n"
-                        "    double *t; int f = argc > 1 ? atoi(argv[1]) : 8;\n"
-                        "    if (host_pool_init() != 0 || llm_silu_table(&t, f) != 0) return 1;\n"
-                        "    fwrite(t, sizeof(double), 65536u, stdout);\n"
-                        "    host_pool_deinit(); free(t); return 0;\n}\n")
+                        "    int f = argc > 1 ? atoi(argv[1]) : 8;\n"
+                        "    if (host_pool_init() != 0 || llm_silu_table(f) != 0) return 1;\n"
+                        "    fwrite(_llm_silu_tab[f - LLM_SILU_EMIN], sizeof(double), 65536u, stdout);\n"
+                        "    llm_silu_free(f); host_pool_deinit(); return 0;\n}\n")
             exe = os.path.join(td, "silu")
             r = subprocess.run([host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra",
                                 "-Werror", "-Wno-unused-function", "-pthread",
