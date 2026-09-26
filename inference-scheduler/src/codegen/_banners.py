@@ -8,6 +8,7 @@ from ..graph import OnnxGraph
 from ..nodes import (OP_NAMES, MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
                      SpaceToDepthNode)
 from ..host_nodes import HostNode
+from ..llm_nodes import LlmAttnConvNode
 
 
 def _banner(title: str) -> str:
@@ -25,7 +26,8 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
         "MatMul"   if isinstance(sn, (MatmulNode, MatmulConvNode))
         else "Conv"    if isinstance(sn, ConvNode)
         else "Reshape" if isinstance(sn, ReshapeNode)
-        else sn.onnx_node.op_type if isinstance(sn, (PoolNode, SpaceToDepthNode, HostNode))
+        else sn.onnx_node.op_type if isinstance(sn, (PoolNode, SpaceToDepthNode, HostNode,
+                                                     LlmAttnConvNode))
         else OP_NAMES[sn.op_code]
         for sn in graph.nodes
     })
@@ -33,11 +35,12 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
 
     # Identify which kernel(s) are used
     has_matmul   = any(isinstance(sn, MatmulNode)  for sn in graph.nodes)
-    has_conv     = any(isinstance(sn, (ConvNode, MatmulConvNode)) for sn in graph.nodes)
+    has_conv     = any(isinstance(sn, (ConvNode, MatmulConvNode, LlmAttnConvNode))
+                       for sn in graph.nodes)
     has_pool     = any(isinstance(sn, PoolNode)    for sn in graph.nodes)
     has_vectorop = any(
         not isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                            SpaceToDepthNode, HostNode))
+                            SpaceToDepthNode, HostNode, LlmAttnConvNode))
         for sn in graph.nodes
     )
     kernel_parts = []

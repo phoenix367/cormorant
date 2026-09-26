@@ -166,6 +166,12 @@ def _node_notes(sn) -> str:
     if isinstance(sn, HostNode):
         det = sn.describe()
         return f"host CPU{' · ' + det if det else ''} · no kernel call"
+    from .llm_nodes import LlmAttnConvNode
+    if isinstance(sn, LlmAttnConvNode):
+        est = ", ".join(f"{k} keys {c / 1e5:.2f} ms (MatmulKernel {m / 1e5:.2f})"
+                        for k, c, m in sn.est_cycles)
+        return (f"{'q.K^T' if sn.kind == 'qk' else 'P.V'} group {sn.group} on ConvKernel · "
+                f"keys16 = roundup(pos + n, 16) at run time · est {est} @100 MHz")
     return ""
 
 

@@ -7,6 +7,7 @@ a JSON object
     {"exp":       {tensor: f | [f per last-axis channel]},
      "host":      {tensor: "f32" | "i32" | "i16"},
      "state":     [tensor, ...],
+     "layout":    {tensor: [G, D]},
      "test_fill": {tensor: int}}
 
 * ``exp`` — power-of-two exponents: a fixed-point tensor stores raw int16
@@ -31,6 +32,11 @@ a JSON object
   host ops also update states in place (the KV cache rows).
 * ``test_fill`` — the constant the generated test harness writes into an
   integer host input (e.g. a start position); ids default to ``i % rows``.
+* ``layout`` — a state of logical shape ``[R][G*D]`` stored group-major,
+  ``[G][R][D]`` (``TensorInfo.group_layout``): a KV cache whose KV heads'
+  rows must each be contiguous for the FPGA prefill attention.  A state
+  without a host kind is a DMA state: a persistent buffer in the CMA pool
+  that host ops write (flushing what a kernel will read) and kernels read.
 
 Models without the key are unaffected (every generated project of a model
 without it is byte-identical to before).
@@ -54,7 +60,7 @@ class NumericError(SchedulerError):
 
 
 def empty() -> dict:
-    return {"exp": {}, "host": {}, "state": [], "test_fill": {}}
+    return {"exp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}}
 
 
 def parse(model) -> dict:
@@ -118,6 +124,14 @@ def apply(tensors: dict, meta: dict, dtype) -> None:
             t.packed_data = None
     for name in meta["test_fill"]:
         _get(tensors, name, "test_fill")
+    for name, gd in meta.get("layout", {}).items():
+        t = _get(tensors, name, "layout")
+        g, d = (int(x) for x in gd)
+        if not t.is_state or len(t.shape) != 2 or t.shape[1] != g * d or g < 1 or d < 1:
+            raise NumericError(f"layout of '{name}': a group-major layout [G={g}][R][D={d}] "
+                               f"needs a 2-D state [R][G*D] (got shape {t.shape}, "
+                               f"state {t.is_state})")
+        t.group_layout = (g, d)
 
 
 def _get(tensors, name, what):
@@ -173,14 +187,15 @@ def encode_matmul_weights(nodes, dtype) -> Dict[str, int]:
 
 
 def check(nodes, dtype) -> None:
-    """Only MatMuls (constant B) and the LLM host ops may touch tensors with
-    exponents; only the LLM host ops touch host tensors and states."""
+    """Only MatMuls (constant B) and the LLM ops (host ops and the FPGA
+    attention kernel calls) may touch tensors with exponents; only the LLM
+    ops touch host tensors and states."""
     from .nodes import MatmulNode, ReshapeNode
     from .llm_nodes import LlmNode
     for sn in nodes:
         label = f"{sn.onnx_node.op_type} node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
         ts = list(sn.inputs) + [sn.output]
-        if isinstance(sn, LlmNode):
+        if isinstance(sn, LlmNode) or getattr(sn, "is_llm_op", False):
             continue
         if any(t.is_host or t.is_state for t in ts):
             raise NumericError(f"{label}: host / state tensors are only read or written "

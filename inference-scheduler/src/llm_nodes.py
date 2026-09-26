@@ -22,6 +22,28 @@ demo/chat/scripts/llm_study.py, whose ``Model`` is the specification:
   LlmSelectRow h (f32) [T][D], n (i32) -> row n-1 (f32 [1][D], a state)
   LlmDequant   x (int16) -> float32(raw * 2^-f)
 
+FPGA prefill attention (policy pow2+sink+p12+mix, doc/CHAT_PLAN.md §16): per
+layer one host op, then per KV group g two ConvKernel calls and a host
+softmax, then a host merge — the K / V caches are DMA states in the CMA pool
+(group-major [KV][C][HD]) that the host writes and the kernels read:
+
+  LlmAttnPrep    q0, k0, v, pos, n, caches -> qx: RoPE(k0) / v written into
+                 the cache rows pos .. pos+n-1 (as LlmAttention), the cache
+                 rows [0, keys16) flushed for the kernels; RoPE(q0) rounded
+                 at the per-head q exponents, written as the q.K^T conv
+                 input image of every group (raw int16)
+  LlmAttnScores  (ConvKernel) s_g[j][p] = floor(sum_d K_g[j][d] q_g[d][p] / 2^8)
+                 over the keys j < keys16 = roundup(pos + n, 16) — a RUNTIME
+                 dimension (out_ch = keys16 from pos / n at run time)
+  LlmAttnSoftmax s_g -> P_g[p][j] (raw at 2^-f_p): per query column p =
+                 (head, row t < n), keys j <= pos + t: k = raw_max - raw,
+                 e = exp(-k * 2^-f_s * scale) (a 65 536-entry table per score
+                 exponent), sum left to right, p = e / sum, round half even;
+                 masked keys and rows t >= n get 0; row stride keys16
+  LlmAttnPV      (ConvKernel) o_g[p][d] = floor(sum_j P_g[p][j] V_g[j][d] / 2^8),
+                 in_ch = keys16 (runtime)
+  LlmAttnMerge   o_0 .. o_{KV-1} -> pv [T][H*HD] (raw copy into head order)
+
 Numeric contract (C and ``reference()``, which the simulator runs): an
 int16 element is read as ``(double)raw * 2^-f[c]`` (exact), every result is
 written back with ``nearbyint(v * 2^f[c])`` (round half to even, the default
@@ -50,6 +72,11 @@ LLM_DOMAIN = "axi.llm"
 # Host tables above this many bytes are written to weights/<name>.dat and
 # loaded into malloc'd memory at init; smaller ones are C arrays.
 TABLE_FILE_BYTES = 64 * 1024
+
+# The FPGA prefill attention runs over keys16 = roundup(pos + n, KEY_QUANTUM)
+# keys: the P.V call's in_ch (ConvKernel input-channel tile) — every row of
+# P / K / V the kernels read is a whole tile, no pad lanes.
+KEY_QUANTUM = 16
 
 
 # ------------------------------------------------------------------ #
@@ -92,6 +119,12 @@ RUNTIME_GROUPS = {
               "_llm_attn_slots", "llm_attn_slot_t",
               "if (llm_attn_reserve(T->n) != 0) return -1;",
               "(void)T; llm_attn_release();"),
+    "sexp":  ("typedef struct {\n    int    f;                       /* a score exponent */\n"
+              "    double scale;                   /* 1 / sqrt(head_dim) */\n"
+              "} llm_sexp_slot_t;",
+              "_llm_sexp_slots", "llm_sexp_slot_t",
+              "if (llm_sexp_table(T->f, T->scale) != 0) return -1;",
+              "llm_sexp_free(T->f);"),
 }
 
 
@@ -178,6 +211,15 @@ def exp_tag(e: np.ndarray) -> str:
 
 
 SILU_EMIN, SILU_NE = -32, 80          # _llm_silu_tab[f - SILU_EMIN] for f in [-32, 48)
+SEXP_EMIN, SEXP_NE = -32, 80          # _llm_sexp_tab[f - SEXP_EMIN]: softmax exp per score exponent
+
+
+def sexp_item(f: int, scale: float) -> RuntimeItem:
+    """The softmax exp table of score exponent f (LlmAttnSoftmax)."""
+    if not SEXP_EMIN <= int(f) < SEXP_EMIN + SEXP_NE:
+        raise SchedulerError(f"score exponent {f} outside [{SEXP_EMIN}, {SEXP_EMIN + SEXP_NE})")
+    return RuntimeItem(key=f"sexp:{int(f)}", decl="", group="sexp",
+                       row=f"{{ {int(f)}, {_c_double(scale)} }}")
 
 
 def silu_item(f: int) -> RuntimeItem:
@@ -232,6 +274,17 @@ def silu_table(f: int) -> np.ndarray:
 
 
 _SILU_CACHE: Dict[int, np.ndarray] = {}
+_SEXP_CACHE: Dict[Tuple[int, float], np.ndarray] = {}
+
+
+def sexp_table(f: int, scale: float) -> np.ndarray:
+    """e[k] = exp(-k * 2^-f * scale) for k = raw_max - raw in [0, 65535]
+    (libm exp, the operation order of llm_study.exp_table and the C fill)."""
+    key = (int(f), float(scale))
+    if key not in _SEXP_CACHE:
+        d = 2.0 ** int(f)
+        _SEXP_CACHE[key] = np.array([math.exp(-k / d * scale) for k in range(65536)])
+    return _SEXP_CACHE[key]
 
 
 def _silu(f: int) -> np.ndarray:
@@ -254,13 +307,20 @@ class LlmNode(HostNode):
     F:       int = 8                              # kernel output shift
 
     def dma_inputs(self) -> List:
-        return [t for t in self.inputs if not t.is_host]
+        """DMA inputs read through host_in (a DMA state is passed as a
+        pointer into its buffer instead)."""
+        return [t for t in self.inputs if not t.is_host and not t.is_state]
 
     def staged_inputs(self):
         return self.dma_inputs()
 
     def state_inputs(self) -> List:
         return [t for t in self.inputs if t.is_state]
+
+    def state_writes(self) -> List:
+        """DMA states this op writes in place (the coherency audit marks them
+        CPU-dirty: a kernel may read them only after a flush)."""
+        return []
 
     def tables(self) -> List[HostTable]:
         return []
@@ -509,9 +569,11 @@ class LlmSiluMulNode(LlmNode):
 
 @dataclass
 class LlmAttentionNode(LlmNode):
-    """Causal GQA attention over a host KV cache, one float host region
+    """Causal GQA attention over the KV cache, one float host region
     (policy xattn).  inputs = [q0, k0, v, pos, n?, cache_k, cache_v]; the
-    caches ([C][KV*HD] raw int16, host states) receive the new rows."""
+    caches (logical [C][KV*HD] raw int16 states stored group-major
+    [KV][C][HD]: i16 host states, or DMA states in the pool when the FPGA
+    prefill attention reads them) receive the new rows."""
     T:        int = 1
     H:        int = 1
     KV:       int = 1
@@ -556,9 +618,14 @@ class LlmAttentionNode(LlmNode):
         if n is not None:
             sn._want(n, "i32", "n")
         for t, w in ((ck, "cache_k"), (cv, "cache_v")):
-            sn._want(t, "i16", w)
-            _require(t.is_state, node, f"{w} '{t.onnx_name}' must be a state")
+            _require(t.host in ("i16", None) and t.is_state, node,
+                     f"{w} '{t.onnx_name}' must be a state (i16 host or DMA)")
+            _require(t.group_layout == (KV, HD), node,
+                     f"{w} '{t.onnx_name}' must be stored group-major [{KV}][{C}][{HD}]")
         return sn
+
+    def state_writes(self):
+        return [t for t in (self.ck, self.cv) if not t.is_host]
 
     @property
     def q0(self):
@@ -658,6 +725,511 @@ class LlmAttentionNode(LlmNode):
 
 
 # ------------------------------------------------------------------ #
+# FPGA prefill attention: LlmAttnPrep / LlmAttnConvNode (scores, P.V)  #
+# / LlmAttnSoftmax / LlmAttnMerge                                      #
+# ------------------------------------------------------------------ #
+
+def keys16(pos: int, n: int, T: int, C: int) -> Tuple[int, int]:
+    """(valid rows n, keys16) of an FPGA prefill-attention call: n clamped
+    like LlmAttention (0 <= n <= T, pos + n <= C); the kernels run over
+    keys16 = roundup(pos + n, KEY_QUANTUM) keys (>= KEY_QUANTUM, <= C) — the
+    runtime dimension (C: llm_keys16)."""
+    n = max(0, min(int(n), T, C - int(pos))) if int(pos) < C else 0
+    k = -(-(int(pos) + n) // KEY_QUANTUM) * KEY_QUANTUM
+    return n, max(KEY_QUANTUM, min(k, C))
+
+
+def _i32(a) -> int:
+    return int(np.asarray(a).reshape(-1)[0])
+
+
+def _attr_ints(a, name, node, n=None):
+    v = a.get(name)
+    _require(v is not None, node, f"attribute '{name}' missing")
+    v = [int(x) for x in v]
+    if n is not None:
+        _require(len(v) == n, node, f"attribute '{name}': {n} values expected, got {len(v)}")
+    return v
+
+
+def _raw(t, arr, F):
+    """Raw integers of a tensor's simulator values (value * 2^f per channel)."""
+    return np.asarray(arr, np.float64) * np.power(2.0, t.exp_channels(F).astype(np.float64))
+
+
+def _kernel_out(acc: np.ndarray, F: int) -> np.ndarray:
+    """ConvKernel / MatmulKernel output of exact raw sums: the ap_fixed<32,16>
+    accumulator wraps (int32), then floor(acc / 2^F) saturated to int16."""
+    big = np.abs(acc) >= 2.0 ** 31
+    if big.any():
+        acc = np.where(big, np.mod(acc + 2.0 ** 31, 2.0 ** 32) - 2.0 ** 31, acc)
+    return np.clip(np.floor(acc / float(1 << F)), -32768, 32767)
+
+
+def _heads_attrs(node):
+    a = _attrs(node)
+    H, KV, HD = int(a["num_heads"]), int(a["num_kv_heads"]), int(a["head_dim"])
+    _require(H % KV == 0 and HD % KEY_QUANTUM == 0, node, "heads % kv_heads, head_dim % 16")
+    return a, H, KV, HD
+
+
+@dataclass
+class LlmAttnPrepNode(LlmNode):
+    """FPGA prefill attention, host part 1.  inputs = [q0, k0, v, pos, n,
+    cache_k, cache_v] (the caches DMA states, group-major [KV][C][HD]);
+    output qx = the q.K^T conv input image of every KV group (raw int16):
+    logically B_g[d][p] = round_half_even(RoPE(q0)[t][h][d] * 2^f_q[h]),
+    p = h' * T + t for head h = g * G + h' (G = H / KV), rows t >= n zero;
+    in memory the ConvKernel x image of a 1 x kw lowered MatMul
+    (nodes.conv_lowered_b_image): x_g[c][kw*p + j] = B_g[(c/16)*16kw + j*16 + c%16][p].
+    Rows t < n: RoPE(k0) and v go into the cache rows pos + t (as
+    LlmAttention); then the rows [0, keys16) of both caches are flushed —
+    the kernels read them (decode steps write cache rows without flushing)."""
+    T:   int = 1
+    H:   int = 1
+    KV:  int = 1
+    HD:  int = 16
+    C:   int = 16
+    kw:  int = 1
+    fq:  Optional[np.ndarray] = field(default=None, repr=False)     # [H]
+    cos: Optional[np.ndarray] = field(default=None, repr=False)
+    sin: Optional[np.ndarray] = field(default=None, repr=False)
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        ins = _llm_inputs(node, tensors)
+        _require(len(ins) == 9, node, "inputs: q0, k0, v, pos, n, cache_k, cache_v, cos, sin")
+        q0, k0, v, pos, n, ck, cv = ins[:7]
+        y = _resolve(tensors, node.output[0], node)
+        a, H, KV, HD = _heads_attrs(node)
+        kw = int(a.get("qk_kw", 1))
+        _require(HD % (16 * kw) == 0, node, f"head_dim {HD} % (16 * qk_kw {kw})")
+        cos = _const_array(ctx, tensors, node.input[7], node, "cos").astype(np.float32)
+        sin = _const_array(ctx, tensors, node.input[8], node, "sin").astype(np.float32)
+        C = int(ck.shape[0])
+        T = q0.numel // (H * HD)
+        G = H // KV
+        _require(C % KEY_QUANTUM == 0, node, f"cache rows {C} % {KEY_QUANTUM}")
+        _require(q0.numel == T * H * HD and k0.numel == T * KV * HD and v.numel == k0.numel,
+                 node, "q / k / v shapes")
+        _require(cos.shape == (C, HD // 2) and sin.shape == cos.shape, node, "cos / sin shape")
+        _require(list(y.shape) == [KV, HD, G * T], node, f"qx must be [{KV}][{HD}][{G * T}]")
+        fq = np.asarray(_attr_ints(a, "q_exp", node, H), np.int64)
+        sn = cls(onnx_node=node, inputs=[q0, k0, v, pos, n, ck, cv], output=y, index=index,
+                 align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, C=C, kw=kw, fq=fq,
+                 cos=cos, sin=sin, F=ctx.frac_bits)
+        for t, w in ((q0, "q"), (k0, "k"), (v, "v"), (y, "output")):
+            sn._want(t, None, w)
+        sn._want(pos, "i32", "pos")
+        sn._want(n, "i32", "n")
+        for t, w in ((ck, "cache_k"), (cv, "cache_v")):
+            sn._want(t, None, w)
+            _require(t.is_state and t.group_layout == (KV, HD), node,
+                     f"{w} must be a DMA state stored group-major [{KV}][{C}][{HD}]")
+        return sn
+
+    @property
+    def ck(self):
+        return self.inputs[5]
+
+    @property
+    def cv(self):
+        return self.inputs[6]
+
+    def state_writes(self):
+        return [self.ck, self.cv]
+
+    @property
+    def table_prefix(self) -> str:
+        tag = zlib.crc32(self.cos.tobytes() + self.sin.tobytes())
+        return f"_llm_rope_{tag:08x}_{self.C}x{self.HD // 2}"
+
+    def tables(self):
+        p = self.table_prefix
+        return [HostTable(p + "_cos", "f32", self.cos.reshape(-1)),
+                HostTable(p + "_sin", "f32", self.sin.reshape(-1))]
+
+    def c_runtime(self):
+        items = super().c_runtime()
+        for t in self.inputs[:3] + [self.ck, self.cv]:
+            items.append(self._scales(t)[2])
+        items.append(scale_item(self.fq)[2])
+        return items
+
+    def describe(self):
+        return (f"T={self.T} heads {self.H}/{self.KV} head_dim {self.HD}, cache {self.C} rows, "
+                f"q.K^T input image kw={self.kw} (FPGA prefill attention)")
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        s = {k: self._scales(t) for k, t in (("q", self.inputs[0]), ("k", self.inputs[1]),
+                                             ("v", self.inputs[2]), ("ck", self.ck),
+                                             ("cv", self.cv))}
+        iq = scale_item(self.fq)[1]
+        p = self.table_prefix
+        return [
+            "{",
+            "    llm_prep_t _a;",
+            f"    _a.q0 = {ins[0]}; _a.k0 = {ins[1]}; _a.v = {ins[2]};",
+            f"    _a.sq = {s['q'][0]}; _a.sk = {s['k'][0]}; _a.sv = {s['v'][0]};",
+            f"    _a.ck = {ins[5]}; _a.cv = {ins[6]};",
+            f"    _a.ick = {s['ck'][1]}; _a.icv = {s['cv'][1]}; _a.iq = {iq};",
+            f"    _a.qx = {out}; _a.cos = {p}_cos; _a.sin = {p}_sin;",
+            f"    _a.pos = (unsigned){ins[3]}[0]; _a.n = (unsigned){ins[4]}[0]; _a.T = {self.T}u;",
+            f"    _a.H = {self.H}u; _a.KV = {self.KV}u; _a.HD = {self.HD}u; _a.C = {self.C}u;"
+            f" _a.kw = {self.kw}u;",
+            "    llm_attn_prep(&_a);",
+            f"    llm_cache_flush({self.ck.c_name}, _a.keys, {self.KV}u, {self.C}u, {self.HD}u);",
+            f"    llm_cache_flush({self.cv.c_name}, _a.keys, {self.KV}u, {self.C}u, {self.HD}u);",
+            "}",
+        ]
+
+    def reference(self, ins, dtype):
+        H, KV, HD, T = self.H, self.KV, self.HD, self.T
+        G = H // KV
+        q0 = np.asarray(ins[0], np.float64).reshape(T, H, HD)
+        k0 = np.asarray(ins[1], np.float64).reshape(T, KV, HD)
+        v = np.asarray(ins[2], np.float64).reshape(T, KV * HD)
+        pos = _i32(ins[3])
+        n, _k = keys16(pos, _i32(ins[4]), T, self.C)
+        ck, cv = ins[5], ins[6]                         # logical state arrays, in place
+        fk = self.ck.exp_channels(self.F)
+        fvc = self.cv.exp_channels(self.F)
+        for t in range(n):
+            p = pos + t
+            ck[p] = _st(dtype, rope(k0[t], self.cos[p], self.sin[p]).reshape(-1), fk)
+            cv[p] = _st(dtype, v[t], fvc)
+        qx = np.zeros((KV, HD, G * T))
+        s = np.power(2.0, self.fq.astype(np.float64))
+        for t in range(n):
+            qr = rope(q0[t], self.cos[pos + t], self.sin[pos + t])          # [H][HD]
+            raw = np.clip(np.round(qr * s[:, None]), -32768, 32767)
+            for h in range(H):
+                g, hh = divmod(h, G)
+                qx[g, :, hh * T + t] = raw[h]
+        return qx
+
+
+@dataclass
+class LlmAttnConvNode:
+    """One ConvKernel call of the FPGA prefill attention (KV group ``group``)
+    whose key count is a RUNTIME dimension: keys16 = roundup(pos + n, 16),
+    computed in the run function from the entry's pos / n inputs (C
+    llm_keys16) and programmed into the AXI-Lite registers — out_ch of q.K^T,
+    in_ch of P.V — so the work follows the real conversation length, not the
+    C-row cache (buffers are sized for C).
+
+      kind "qk":  s_g[j][p] = sum_d K_g[j][d] * B_g[d][p]   (MatMul on
+                  ConvKernel, doc/BERT_PLAN.md §2 2A: weight = A = the K cache
+                  rows [keys16][HD] of group g, x = qx_g in the 1 x kw image,
+                  out_ch = keys16, output p = G*T pixels = out_h x out_w)
+      kind "pv":  o_g[p][d] = sum_j P_g[p][j] * V_g[j][d]   (weight = P_g
+                  [G*T][keys16] rows of stride keys16, x = the V cache rows
+                  [keys16][HD] of group g, in_ch = keys16, 1 x 1, out HD pixels)
+
+    Both write floor(sum / 2^8) saturated (ap_fixed<32,16> accumulator), raw
+    integers.  inputs = [weight, x, pos, n]; the geometry (kw, out_h, out_w)
+    is fixed at codegen by the cost model."""
+
+    kernel_name: ClassVar[str] = "ConvKernel"
+    is_llm_op:   ClassVar[bool] = True
+
+    onnx_node:   object
+    inputs:      List
+    output:      object
+    index:       int = 0
+    align_elems: int = 8
+    kind:        str = "qk"
+    group:       int = 0
+    T:           int = 1
+    H:           int = 1
+    KV:          int = 1
+    HD:          int = 16
+    C:           int = 16
+    kw:          int = 1
+    out_h:       int = 1
+    out_w:       int = 1
+    F:           int = 8
+    est_cycles:  Tuple = ()           # ((keys, conv cycles, MatmulKernel cycles), ...)
+
+    # Compatibility shims (read by the layout / header passes)
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=2,    init=False)
+
+    @property
+    def G(self) -> int:
+        return self.H // self.KV
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        from ._conv_hw_config import (CONV_MAX_ACC_PERSIST_ENTRIES, CONV_MAX_IN_CH,
+                                      CONV_MAX_OUT_CH)
+        ins = _llm_inputs(node, tensors)
+        _require(len(ins) == 4, node, "inputs: weight, x, pos, n")
+        y = _resolve(tensors, node.output[0], node)
+        a, H, KV, HD = _heads_attrs(node)
+        kind = "qk" if node.op_type == "LlmAttnScores" else "pv"
+        g = int(a["group"])
+        G = H // KV
+        _require(0 <= g < KV, node, f"group {g} of {KV}")
+        w, x, pos, n = ins
+        cache = w if kind == "qk" else x
+        C = int(cache.shape[0])
+        _require(cache.is_state and not cache.is_host and cache.group_layout == (KV, HD), node,
+                 "the cache must be a DMA state stored group-major")
+        _require(C % KEY_QUANTUM == 0, node, f"cache rows {C} % {KEY_QUANTUM}")
+        if kind == "qk":
+            T = x.numel // (KV * HD * G)
+            kw = int(a.get("qk_kw", 1))
+            _require(list(x.shape) == [KV, HD, G * T], node, "qx shape")
+            _require(list(y.shape) == [C, G * T], node, f"scores must be [{C}][{G * T}]")
+            M = G * T
+        else:
+            T = w.numel // (G * C)
+            kw = 1
+            _require(list(w.shape) == [G * T, C], node, f"P must be [{G * T}][{C}]")
+            _require(list(y.shape) == [G * T, HD], node, f"output must be [{G * T}][{HD}]")
+            M = HD
+        _require(HD % (16 * kw) == 0, node, f"head_dim % (16 * kw {kw})")
+        # ConvKernel bounds at the largest runtime extent (keys16 = C)
+        out_ch_max = C if kind == "qk" else G * T
+        in_ch_max = HD // kw if kind == "qk" else C
+        _require(out_ch_max <= CONV_MAX_OUT_CH and in_ch_max <= CONV_MAX_IN_CH, node,
+                 f"out_ch {out_ch_max} / in_ch {in_ch_max} beyond ConvKernel's bounds")
+        m_pad = -(-out_ch_max // 16) * 16
+        oh, ow, est = cls._plan(kind, T, G, HD, C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES)
+        sn = cls(onnx_node=node, inputs=[w, x, pos, n], output=y, index=index,
+                 align_elems=align_elems, kind=kind, group=g, T=T, H=H, KV=KV, HD=HD, C=C,
+                 kw=kw, out_h=oh, out_w=ow, F=ctx.frac_bits, est_cycles=est)
+        for t, what in ((pos, "pos"), (n, "n")):
+            _require(t.host == "i32", node, f"{what} must be an i32 host tensor")
+        for t in ((x, y) if kind == "qk" else (w, y)):
+            _require(t.host is None, node, f"'{t.onnx_name}' must be a DMA tensor")
+        return sn
+
+    @staticmethod
+    def _plan(kind, T, G, HD, C, kw, M, m_pad, max_acc):
+        """(out_h, out_w, estimates): the output split out_h x out_w = M of the
+        cheapest conv by cost_model.conv_cycles at keys16 = C / 2 (the
+        geometry is fixed at codegen; keys16 varies at run time), and the
+        conv / MatmulKernel estimates at T + 1 and C keys (report)."""
+        from .cost_model import CALL_OVERHEAD, conv_cycles, matmul_cycles
+
+        def cyc(keys, oh, ow):
+            if kind == "qk":
+                return conv_cycles(in_ch=HD // kw, out_ch=keys, in_h=oh, in_w=kw * ow,
+                                   oh=oh, ow=ow, kh=1, kw=kw, sw=kw)["total"] + CALL_OVERHEAD
+            return conv_cycles(in_ch=keys, out_ch=G * T, in_h=oh, in_w=ow, oh=oh, ow=ow,
+                               kh=1, kw=1)["total"] + CALL_OVERHEAD
+        cands = [d for d in range(1, M + 1) if M % d == 0 and d <= 64 and d * m_pad <= max_acc]
+        wide = [d for d in cands if d >= 8] or cands
+        ref = max(KEY_QUANTUM, (C // 2) // KEY_QUANTUM * KEY_QUANTUM)
+        ow = min(wide, key=lambda d: (cyc(ref, M // d, d), -d))
+        oh = M // ow
+        est = []
+        for keys in sorted({max(KEY_QUANTUM, -(-(T + 1) // KEY_QUANTUM) * KEY_QUANTUM), C}):
+            mm = (matmul_cycles(keys, HD, G * T) if kind == "qk"
+                  else matmul_cycles(G * T, keys, HD)) + CALL_OVERHEAD
+            est.append((keys, float(cyc(keys, oh, ow)), float(mm)))
+        return oh, ow, tuple(est)
+
+    # ---- geometry ------------------------------------------------------ #
+    def conv_regs(self, keys: str) -> str:
+        """run_conv_at() geometry arguments with the runtime key count
+        ``keys`` (a C expression)."""
+        if self.kind == "qk":
+            return (f"1u, {self.HD // self.kw}u, {self.out_h}u, {self.kw * self.out_w}u,\n"
+                    f"                    {keys}, {self.out_h}u, {self.out_w}u,\n"
+                    f"                    1u, {self.kw}u, 1u, {self.kw}u, 1u, 1u, 0u, 0u, 0u, 0u")
+        return (f"1u, {keys}, {self.out_h}u, {self.out_w}u,\n"
+                f"                    {self.G * self.T}u, {self.out_h}u, {self.out_w}u,\n"
+                f"                    1u, 1u, 1u, 1u, 1u, 1u, 0u, 0u, 0u, 0u")
+
+    def emit_comment(self) -> str:
+        w, x = self.inputs[0].onnx_name, self.inputs[1].onnx_name
+        if self.kind == "qk":
+            what = (f"q.K^T group {self.group}: [keys16][{self.HD}]x[{self.HD}][{self.G * self.T}]"
+                    f" on ConvKernel: weight=K cache rows x=q image (kw={self.kw})"
+                    f" out_ch=keys16 in_ch={self.HD // self.kw} 1x{self.kw}"
+                    f" out {self.out_h}x{self.out_w}")
+        else:
+            what = (f"P.V group {self.group}: [{self.G * self.T}][keys16]x[keys16][{self.HD}]"
+                    f" on ConvKernel: weight=P x=V cache rows out_ch={self.G * self.T}"
+                    f" in_ch=keys16 1x1 out {self.out_h}x{self.out_w}")
+        return (f"    /* [{self.index}] {self.onnx_node.op_type}({w}, {x}) -> "
+                f"{self.output.onnx_name}  {what}; keys16 = roundup(pos + n, 16) at run time */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        w, x, pos, n = self.inputs
+        GTHD = self.G * self.T * self.HD
+        if self.kind == "qk":
+            xo, wo = self.group * GTHD, self.group * self.C * self.HD
+        else:
+            xo, wo = self.group * self.C * self.HD, 0
+        return "\n".join([
+            "    {",
+            f"        const unsigned _keys = llm_keys16((unsigned){pos.c_name}[0],"
+            f" (unsigned){n.c_name}[0], {self.T}u, {self.C}u);",
+            f"        run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
+            f"                    {self.conv_regs('_keys')});",
+            "    }",
+        ])
+
+    # ---- simulation ------------------------------------------------------ #
+    def reference(self, ins, dtype):
+        w, x = ins[0], ins[1]
+        _n, keys = keys16(_i32(ins[2]), _i32(ins[3]), self.T, self.C)
+        g, HD, F = self.group, self.HD, self.F
+        if self.kind == "qk":
+            kc = _raw(self.inputs[0], w, F)[:keys, g * HD:(g + 1) * HD]     # [keys][HD]
+            B = np.asarray(x, np.float64)[g]                                 # [HD][G*T] raw
+            out = np.zeros((self.C, self.G * self.T))
+            out[:keys] = _kernel_out(kc @ B, F)
+            return out
+        P = np.asarray(w, np.float64)[:, :keys]                              # [G*T][keys] raw
+        vc = _raw(self.inputs[1], x, F)[:keys, g * HD:(g + 1) * HD]         # [keys][HD]
+        return _kernel_out(P @ vc, F)
+
+
+@dataclass
+class LlmAttnSoftmaxNode(LlmNode):
+    """FPGA prefill attention, host part 2 (group g): the p12 softmax of
+    pow2+sink+p12 over the q.K^T output s_g [C][G*T] (raw at the score
+    exponent f_s[h] = f_q[h] + f_k[g] - 8, rows j < keys16 valid) into P_g,
+    the P.V call's weight [G*T][keys16] (raw at f_p, row stride keys16 — a
+    runtime stride; the tensor is sized [G*T][C]).  Column p = h'*T + t,
+    rows t < n: keys j <= pos + t, k = raw_max - raw, e = sexp_f_s[k], sum
+    left to right, P = round_half_even(e / sum * 2^f_p); other entries 0."""
+    T:     int = 1
+    G:     int = 1
+    C:     int = 16
+    group: int = 0
+    scale: float = 1.0
+    fs:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
+    fp:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        ins = _llm_inputs(node, tensors)
+        _require(len(ins) == 3, node, "inputs: scores, pos, n")
+        s, pos, n = ins
+        y = _resolve(tensors, node.output[0], node)
+        a, H, KV, HD = _heads_attrs(node)
+        G = H // KV
+        C = int(s.shape[0])
+        T = s.numel // (C * G)
+        _require(list(s.shape) == [C, G * T] and list(y.shape) == [G * T, C], node,
+                 f"scores [{C}][{G * T}] -> P [{G * T}][{C}]")
+        sn = cls(onnx_node=node, inputs=[s, pos, n], output=y, index=index,
+                 align_elems=align_elems, T=T, G=G, C=C, group=int(a["group"]),
+                 scale=1.0 / math.sqrt(HD),
+                 fs=np.asarray(_attr_ints(a, "s_exp", node, G), np.int64),
+                 fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits)
+        sn._want(s, None, "scores")
+        sn._want(y, None, "output")
+        sn._want(pos, "i32", "pos")
+        sn._want(n, "i32", "n")
+        return sn
+
+    def c_runtime(self):
+        items = [sexp_item(int(f), self.scale) for f in sorted(set(int(v) for v in self.fs))]
+        items.append(scale_item(self.fp)[2])
+        items.append(scale_item(self.fs)[2])          # _llm_e_<tag>: f_s per head
+        return items
+
+    def describe(self):
+        return (f"group {self.group}: {self.G}x{self.T} query columns, score exponents "
+                f"{[int(v) for v in self.fs]}, P at 2^-{[int(v) for v in self.fp]}")
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        ip = scale_item(self.fp)[1]
+        return [
+            "{",
+            "    llm_smx_t _a;",
+            f"    _a.s = {ins[0]}; _a.p = {out}; _a.fs = _llm_e_{exp_tag(self.fs)}; _a.ip = {ip};",
+            f"    _a.pos = (unsigned){ins[1]}[0]; _a.n = (unsigned){ins[2]}[0];",
+            f"    _a.T = {self.T}u; _a.G = {self.G}u; _a.C = {self.C}u;",
+            "    llm_attn_softmax(&_a);",
+            "}",
+        ]
+
+    def reference(self, ins, dtype):
+        T, G, C = self.T, self.G, self.C
+        s = np.asarray(ins[0], np.float64)
+        pos = _i32(ins[1])
+        n, keys = keys16(pos, _i32(ins[2]), T, C)
+        P = np.zeros((G * T, C))
+        if n == 0:
+            return P
+        S = pos + n
+        j = np.arange(S)[None, :]
+        t = np.arange(n)[:, None]
+        mask = j <= pos + t                                     # [n][S]
+        for hh in range(G):
+            raw = s[:S, hh * T:hh * T + n].T.astype(np.int64)   # [n][S]
+            m = np.where(mask, raw, -(1 << 20)).max(-1, keepdims=True)
+            k = np.where(mask, m - raw, 0)
+            e = np.where(mask, sexp_table(int(self.fs[hh]), self.scale)[k], 0.0)
+            p = e / np.cumsum(e, -1)[..., -1:]
+            P[hh * T:hh * T + n, :S] = np.clip(np.round(p * 2.0 ** int(self.fp[hh])),
+                                               -32768, 32767)
+        return P
+
+
+@dataclass
+class LlmAttnMergeNode(LlmNode):
+    """FPGA prefill attention, host part 3: the P.V outputs o_g [G*T][HD]
+    (raw) -> pv [T][H*HD] in head order, pv[t][(g*G + h')*HD + d] =
+    o_g[h'*T + t][d] (raw, at pv's exponent f_p + f_vc - 8)."""
+    T:  int = 1
+    H:  int = 1
+    KV: int = 1
+    HD: int = 16
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        ins = _llm_inputs(node, tensors)
+        y = _resolve(tensors, node.output[0], node)
+        a, H, KV, HD = _heads_attrs(node)
+        G = H // KV
+        _require(len(ins) == KV, node, f"{KV} inputs (one per KV group)")
+        T = y.numel // (H * HD)
+        for t in ins:
+            _require(list(t.shape) == [G * T, HD], node, f"inputs must be [{G * T}][{HD}]")
+        _require(list(y.shape) == [T, H * HD], node, f"output must be [{T}][{H * HD}]")
+        sn = cls(onnx_node=node, inputs=list(ins), output=y, index=index,
+                 align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, F=ctx.frac_bits)
+        for t in ins + [y]:
+            sn._want(t, None, "tensor")
+        return sn
+
+    def describe(self):
+        return f"{self.KV} groups x {self.H // self.KV} heads x {self.T} rows -> [{self.T}][{self.H * self.HD}]"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        return [
+            "{",
+            f"    const Data_t *_o[{self.KV}] = {{ {', '.join(ins)} }};",
+            f"    llm_attn_merge(_o, {self.KV}u, {self.H // self.KV}u, {self.T}u, {self.HD}u, {out});",
+            "}",
+        ]
+
+    def reference(self, ins, dtype):
+        T, H, KV, HD = self.T, self.H, self.KV, self.HD
+        G = H // KV
+        raw = np.zeros((T, H, HD))
+        for g in range(KV):
+            o = np.asarray(ins[g], np.float64).reshape(G, T, HD)
+            for hh in range(G):
+                raw[:, g * G + hh] = o[hh]
+        f = self.output.exp_channels(self.F).astype(np.float64)
+        return (raw.reshape(T, H * HD) / np.power(2.0, f)[None, :])
+
+
+# ------------------------------------------------------------------ #
 # LlmSelectRow / LlmDequant                                            #
 # ------------------------------------------------------------------ #
 
@@ -733,6 +1305,11 @@ LLM_OP_FACTORIES = {
     "LlmAttention": LlmAttentionNode.from_onnx_node,
     "LlmSelectRow": LlmSelectRowNode.from_onnx_node,
     "LlmDequant":   LlmDequantNode.from_onnx_node,
+    "LlmAttnPrep":    LlmAttnPrepNode.from_onnx_node,
+    "LlmAttnScores":  LlmAttnConvNode.from_onnx_node,
+    "LlmAttnSoftmax": LlmAttnSoftmaxNode.from_onnx_node,
+    "LlmAttnPV":      LlmAttnConvNode.from_onnx_node,
+    "LlmAttnMerge":   LlmAttnMergeNode.from_onnx_node,
 }
 
 
@@ -989,6 +1566,10 @@ static void llm_dequant(const Data_t *x, const double *sx, unsigned count, unsig
 }
 
 /* ---- LlmAttention (xattn) ----
+ * The caches are stored group-major, [KV][C][HD] (row j of KV head g at
+ * (g * C + j) * HD): host states, or DMA states the FPGA prefill attention
+ * reads (written here without a flush — LlmAttnPrep flushes the rows the
+ * kernels read).
  * Rows t < n (pos + t < C): RoPE(k0[t]) -> K cache row pos + t at its
  * exponent, v[t] re-rounded -> V cache row.  The cache rows the queries read
  * (0 .. pos + n - 1) are converted once to their exact double values
@@ -1048,14 +1629,17 @@ static void llm_attn_release(void)
 static void llm_attn_convert(void *p, unsigned r0, unsigned r1)
 {
     const llm_attn_t *a = (const llm_attn_t *)p;
-    const unsigned    kvhd = a->KV * a->HD;
-    unsigned          r, c;
-    for (r = r0; r < r1; r++) {
-        const int16_t *kr = a->ck + (size_t)r * kvhd, *vr = a->cv + (size_t)r * kvhd;
-        double        *kd = _llm_attn_kd + (size_t)r * kvhd, *vd = _llm_attn_vd + (size_t)r * kvhd;
-        for (c = 0u; c < kvhd; c++) {
-            kd[c] = (double)kr[c] * a->sck[c];
-            vd[c] = (double)vr[c] * a->scv[c];
+    const unsigned    HD = a->HD, nk = a->pos + a->n;
+    unsigned          r, d;
+    for (r = r0; r < r1; r++) {              /* item r: KV head r / nk, key row r % nk */
+        const unsigned g = r / nk, j = r % nk;
+        const size_t   o = ((size_t)g * a->C + j) * HD;
+        const int16_t *kr = a->ck + o, *vr = a->cv + o;
+        double        *kd = _llm_attn_kd + o, *vd = _llm_attn_vd + o;
+        const double  *sk = a->sck + (size_t)g * HD, *sv = a->scv + (size_t)g * HD;
+        for (d = 0u; d < HD; d++) {
+            kd[d] = (double)kr[d] * sk[d];
+            vd[d] = (double)vr[d] * sv[d];
         }
     }
 }
@@ -1063,7 +1647,7 @@ static void llm_attn_convert(void *p, unsigned r0, unsigned r1)
 static void llm_attn_items(void *p, unsigned i0, unsigned i1)
 {
     const llm_attn_t *a = (const llm_attn_t *)p;
-    const unsigned    HD = a->HD, half = HD / 2u, kvhd = a->KV * HD, grp = a->H / a->KV;
+    const unsigned    HD = a->HD, half = HD / 2u, grp = a->H / a->KV;
     double            q[LLM_MAX_HD], o[LLM_MAX_HD], e[LLM_MAX_KEYS];
     unsigned          it;
     for (it = i0; it < i1; it++) {
@@ -1083,14 +1667,14 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
         for (j = 0u; j < nk; j++) {
             double acc[8], s;
             if (a->n > 1u) {                        /* prefill: converted rows */
-                const double *kr = _llm_attn_kd + (size_t)j * kvhd + (size_t)g * HD;
+                const double *kr = _llm_attn_kd + ((size_t)g * a->C + j) * HD;
                 for (l = 0u; l < 8u; l++)
                     acc[l] = q[l] * kr[l];
                 for (d = 8u; d < HD; d += 8u)
                     for (l = 0u; l < 8u; l++)
                         acc[l] += q[d + l] * kr[d + l];
             } else {                                /* decode: the int16 cache row */
-                const int16_t *kr = a->ck + (size_t)j * kvhd + (size_t)g * HD;
+                const int16_t *kr = a->ck + ((size_t)g * a->C + j) * HD;
                 const double  *sk = a->sck + (size_t)g * HD;
                 for (l = 0u; l < 8u; l++)
                     acc[l] = q[l] * ((double)kr[l] * sk[l]);
@@ -1110,7 +1694,7 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
         for (j = 0u; j < nk; j++) {
             const double pj = e[j] / sum;
             if (a->n > 1u) {
-                const double *vr = _llm_attn_vd + (size_t)j * kvhd + (size_t)g * HD;
+                const double *vr = _llm_attn_vd + ((size_t)g * a->C + j) * HD;
                 if (j == 0u)
                     for (d = 0u; d < HD; d++)
                         o[d] = pj * vr[d];
@@ -1118,7 +1702,7 @@ static void llm_attn_items(void *p, unsigned i0, unsigned i1)
                     for (d = 0u; d < HD; d++)
                         o[d] += pj * vr[d];
             } else {
-                const int16_t *vr = a->cv + (size_t)j * kvhd + (size_t)g * HD;
+                const int16_t *vr = a->cv + ((size_t)g * a->C + j) * HD;
                 const double  *sv = a->scv + (size_t)g * HD;
                 if (j == 0u)
                     for (d = 0u; d < HD; d++)
@@ -1158,33 +1742,281 @@ static void llm_attention(llm_attn_t *a)
         const Data_t  *k = a->k0 + (size_t)t * kvhd;
         const Data_t  *v = a->v + (size_t)t * kvhd;
         const float   *cs = a->cos + (size_t)pp * half, *sn = a->sin + (size_t)pp * half;
-        int16_t       *kc = a->ck + (size_t)pp * kvhd, *vc = a->cv + (size_t)pp * kvhd;
         for (c = 0u; c < kvhd; c++) {
             const unsigned d = c % HD, b = c - d;
+            const size_t   o = ((size_t)(c / HD) * a->C + pp) * HD + d;   /* group-major */
             double x = llm_ld(k[c], a->sk[c]);
             double r = d < half ? -llm_ld(k[b + d + half], a->sk[b + d + half])
                                 :  llm_ld(k[b + d - half], a->sk[b + d - half]);
-            kc[c] = llm_st16(x * (double)cs[d % half] + r * (double)sn[d % half], a->ick[c]);
-            vc[c] = llm_st16(llm_ld(v[c], a->sv[c]), a->icv[c]);
+            a->ck[o] = llm_st16(x * (double)cs[d % half] + r * (double)sn[d % half], a->ick[c]);
+            a->cv[o] = llm_st16(llm_ld(v[c], a->sv[c]), a->icv[c]);
         }
     }
     a->n = n;
     if (n) {
         if (n > 1u)                  /* prefill: each key row serves n queries */
-            host_parallel(llm_attn_convert, a, a->pos + n, 32u, 1u);
+            host_parallel(llm_attn_convert, a, a->KV * (a->pos + n), 32u, 1u);
         host_parallel(llm_attn_items, a, n * a->H, 1u, 1u);
     }
     if (n < a->T)
         memset(a->pv + (size_t)n * a->H * HD, 0, (size_t)(a->T - n) * a->H * HD * sizeof(Data_t));
 }
+
+/* ---- FPGA prefill attention (policy pow2+sink+p12+mix) ----
+ * keys16 = roundup(pos + n, 16) keys (n clamped as in llm_attention): the
+ * runtime dimension of the q.K^T / P.V ConvKernel calls (out_ch / in_ch). */
+#define LLM_KEY_QUANTUM  KEY_QUANTUM_VALUE
+static unsigned llm_keys16(unsigned pos, unsigned n, unsigned T, unsigned C)
+{
+    unsigned k;
+    if (n > T) n = T;
+    if (pos >= C) n = 0u;
+    else if (n > C - pos) n = C - pos;
+    k = (pos + n + LLM_KEY_QUANTUM - 1u) / LLM_KEY_QUANTUM * LLM_KEY_QUANTUM;
+    if (k > C) k = C;
+    if (k < LLM_KEY_QUANTUM) k = LLM_KEY_QUANTUM;
+    return k;
+}
+
+/* LlmAttnPrep: rows t < n -> the cache rows pos + t (RoPE(k0), v re-rounded,
+ * group-major); RoPE(q0) rounded at the per-head q exponent -> the q.K^T conv
+ * input image of every KV group, qx_g[c][kw*p + j] = q[t][h][(c/16)*16kw +
+ * j*16 + c%16], p = (h % G) * T + t (0 for t >= n). */
+typedef struct {
+    const Data_t *q0, *k0, *v;
+    const double *sq, *sk, *sv;
+    int16_t      *ck, *cv;
+    const double *ick, *icv, *iq;
+    Data_t       *qx;
+    const float  *cos, *sin;
+    unsigned      pos, n, T, H, KV, HD, C, kw, keys;
+} llm_prep_t;
+
+static void llm_prep_kv_rows(void *p, unsigned t0, unsigned t1)
+{
+    const llm_prep_t *a = (const llm_prep_t *)p;
+    const unsigned    HD = a->HD, half = HD / 2u, kvhd = a->KV * HD;
+    unsigned          t, c;
+    for (t = t0; t < t1; t++) {
+        const unsigned pp = a->pos + t;
+        const Data_t  *k = a->k0 + (size_t)t * kvhd;
+        const Data_t  *v = a->v + (size_t)t * kvhd;
+        const float   *cs = a->cos + (size_t)pp * half, *sn = a->sin + (size_t)pp * half;
+        for (c = 0u; c < kvhd; c++) {
+            const unsigned d = c % HD, b = c - d;
+            const size_t   o = ((size_t)(c / HD) * a->C + pp) * HD + d;
+            double x = llm_ld(k[c], a->sk[c]);
+            double r = d < half ? -llm_ld(k[b + d + half], a->sk[b + d + half])
+                                :  llm_ld(k[b + d - half], a->sk[b + d - half]);
+            a->ck[o] = llm_st16(x * (double)cs[d % half] + r * (double)sn[d % half], a->ick[c]);
+            a->cv[o] = llm_st16(llm_ld(v[c], a->sv[c]), a->icv[c]);
+        }
+    }
+}
+
+static void llm_prep_q_items(void *p, unsigned i0, unsigned i1)
+{
+    const llm_prep_t *a = (const llm_prep_t *)p;
+    const unsigned    HD = a->HD, half = HD / 2u, G = a->H / a->KV, GT = G * a->T;
+    const unsigned    kw = a->kw, plane = GT * kw;
+    unsigned          it, d;
+    for (it = i0; it < i1; it++) {           /* item: row t = it % T of head h = it / T */
+        const unsigned t = it % a->T, h = it / a->T, pc = (h % G) * a->T + t;
+        Data_t        *xg = a->qx + (size_t)(h / G) * HD * GT;
+        if (t < a->n) {
+            const unsigned pp = a->pos + t;
+            const Data_t  *qr = a->q0 + (size_t)t * a->H * HD + (size_t)h * HD;
+            const double  *sq = a->sq + (size_t)h * HD;
+            const float   *cs = a->cos + (size_t)pp * half, *sn = a->sin + (size_t)pp * half;
+            for (d = 0u; d < HD; d++) {
+                double x = llm_ld(qr[d], sq[d]);
+                double r = d < half ? -llm_ld(qr[d + half], sq[d + half])
+                                    :  llm_ld(qr[d - half], sq[d - half]);
+                const unsigned c = (d / (16u * kw)) * 16u + d % 16u, j = (d / 16u) % kw;
+                xg[(size_t)c * plane + kw * pc + j] =
+                    llm_st(x * (double)cs[d % half] + r * (double)sn[d % half], a->iq[h]);
+            }
+        } else {
+            for (d = 0u; d < HD; d++) {
+                const unsigned c = (d / (16u * kw)) * 16u + d % 16u, j = (d / 16u) % kw;
+                xg[(size_t)c * plane + kw * pc + j] = 0;
+            }
+        }
+    }
+}
+
+static void llm_attn_prep(llm_prep_t *a)
+{
+    unsigned n = a->n;
+    if (n > a->T) n = a->T;
+    if (a->pos >= a->C) n = 0u;
+    else if (n > a->C - a->pos) n = a->C - a->pos;
+    a->n = n;
+    host_parallel(llm_prep_kv_rows, a, n, host_row_grain(a->KV * a->HD), 1u);
+    host_parallel(llm_prep_q_items, a, a->T * a->H, host_row_grain(a->HD), 1u);
+    a->keys = llm_keys16(a->pos, n, a->T, a->C);
+}
+
+/* LlmAttnSoftmax: s [keys16][G*T] raw scores (row stride G*T) -> P [G*T][keys16]
+ * raw at 2^-f_p (row stride keys16, the P.V weight).  Column c = h' * T + t,
+ * rows t < n: keys j <= pos + t, m = max raw, e_j = sexp_{f_s[h']}[m - raw_j],
+ * sum left to right, P = round_half_even(e / sum * 2^f_p); other entries 0.
+ * Work items are blocks of LLM_SMX_CB columns, zig-zag ordered (light and
+ * heavy causal rows alternate) so that the threads' ranges balance; every
+ * column's sums keep their order (bits independent of the thread count). */
+#define LLM_SEXP_EMIN  (SEXP_EMIN_VALUE)
+#define LLM_SEXP_NE    (SEXP_NE_VALUE)
+#define LLM_SMX_CB     8u
+static double *_llm_sexp_tab[LLM_SEXP_NE];
+
+typedef struct {
+    double *t;
+    double  d, scale;
+} llm_sexp_fill_t;
+
+static void llm_sexp_fill(void *p, unsigned i0, unsigned i1)
+{
+    const llm_sexp_fill_t *a = (const llm_sexp_fill_t *)p;
+    unsigned i;
+    for (i = i0; i < i1; i++)
+        a->t[i] = exp(-(double)i / a->d * a->scale);
+}
+
+static int llm_sexp_table(int f, double scale)
+{
+    llm_sexp_fill_t a;
+    double        **t = &_llm_sexp_tab[f - LLM_SEXP_EMIN];
+    if (*t) return 0;
+    *t = (double *)malloc(65536u * sizeof(double));
+    if (!*t) return -1;
+    a.t = *t; a.d = ldexp(1.0, f); a.scale = scale;
+    host_parallel(llm_sexp_fill, &a, 65536u, 1024u, 8u);
+    return 0;
+}
+
+static void llm_sexp_free(int f)
+{
+    free(_llm_sexp_tab[f - LLM_SEXP_EMIN]);
+    _llm_sexp_tab[f - LLM_SEXP_EMIN] = NULL;
+}
+
+typedef struct {
+    const Data_t      *s;
+    Data_t            *p;
+    const signed char *fs;          /* score exponent per head of the group */
+    const double      *ip;          /* 2^f_p per head of the group */
+    unsigned           pos, n, T, G, C, keys, nblk;
+} llm_smx_t;
+
+static void llm_smx_items(void *pp, unsigned i0, unsigned i1)
+{
+    const llm_smx_t *a = (const llm_smx_t *)pp;
+    const unsigned   GT = a->G * a->T, keys = a->keys, nb = a->nblk;
+    unsigned         it;
+    for (it = i0; it < i1; it++) {
+        const unsigned b = (it & 1u) ? nb - 1u - it / 2u : it / 2u;
+        const unsigned c0 = b * LLM_SMX_CB, c1 = c0 + LLM_SMX_CB < GT ? c0 + LLM_SMX_CB : GT;
+        const double  *tab[LLM_SMX_CB];
+        double         sum[LLM_SMX_CB], ip[LLM_SMX_CB];
+        int            mx[LLM_SMX_CB];
+        unsigned       last[LLM_SMX_CB], valid[LLM_SMX_CB], c, j, jend = 0u;
+        for (c = c0; c < c1; c++) {
+            const unsigned k = c - c0, t = c % a->T, hh = c / a->T;
+            tab[k] = _llm_sexp_tab[a->fs[hh] - LLM_SEXP_EMIN];
+            ip[k] = a->ip[hh];
+            valid[k] = t < a->n;
+            last[k] = a->pos + t;
+            sum[k] = 0.0;
+            mx[k] = 0;
+            if (valid[k] && last[k] + 1u > jend) jend = last[k] + 1u;
+        }
+        for (j = 0u; j < jend; j++) {                    /* max over the causal keys */
+            const Data_t *row = a->s + (size_t)j * GT;
+            for (c = c0; c < c1; c++) {
+                const unsigned k = c - c0;
+                const int      r = (int)(int16_t)row[c];
+                if (valid[k] && j <= last[k] && (j == 0u || r > mx[k])) mx[k] = r;
+            }
+        }
+        for (j = 0u; j < jend; j++) {                    /* sum, keys left to right */
+            const Data_t *row = a->s + (size_t)j * GT;
+            for (c = c0; c < c1; c++) {
+                const unsigned k = c - c0;
+                if (valid[k] && j <= last[k])
+                    sum[k] += tab[k][mx[k] - (int)(int16_t)row[c]];
+            }
+        }
+        for (j = 0u; j < keys; j++) {                    /* P, zeros outside the mask */
+            const Data_t *row = a->s + (size_t)j * GT;
+            for (c = c0; c < c1; c++) {
+                const unsigned k = c - c0;
+                a->p[(size_t)c * keys + j] = (valid[k] && j <= last[k])
+                    ? llm_st(tab[k][mx[k] - (int)(int16_t)row[c]] / sum[k], ip[k]) : (Data_t)0;
+            }
+        }
+    }
+}
+
+static void llm_attn_softmax(llm_smx_t *a)
+{
+    unsigned n = a->n;
+    if (n > a->T) n = a->T;
+    if (a->pos >= a->C) n = 0u;
+    else if (n > a->C - a->pos) n = a->C - a->pos;
+    a->n = n;
+    a->keys = llm_keys16(a->pos, n, a->T, a->C);
+    a->nblk = (a->G * a->T + LLM_SMX_CB - 1u) / LLM_SMX_CB;
+    host_parallel(llm_smx_items, a, a->nblk, 1u, 1u);
+}
+
+/* LlmAttnMerge: o_g [G*T][HD] (row h' * T + t) -> pv [T][H*HD] (raw copy). */
+static void llm_attn_merge(const Data_t *const *o, unsigned KV, unsigned G, unsigned T,
+                           unsigned HD, Data_t *pv)
+{
+    const unsigned H = KV * G;
+    unsigned       g, hh, t;
+    for (g = 0u; g < KV; g++)
+        for (hh = 0u; hh < G; hh++)
+            for (t = 0u; t < T; t++)
+                memcpy(pv + ((size_t)t * H + g * G + hh) * HD,
+                       o[g] + ((size_t)hh * T + t) * HD, (size_t)HD * sizeof(Data_t));
+}
+"""
+
+
+# DMA-state helpers (need inference_buf_t): emitted when a project has DMA states.
+LLM_C_DMA = r"""
+/* Flush (clean) rows [0, rows) of every group of a group-major [G][C][D]
+ * DMA state: the rows the next kernels read (host writes of earlier calls,
+ * e.g. decode steps, stay dirty until then). */
+static void llm_cache_flush(inference_buf_t *cache, unsigned rows, unsigned G, unsigned C,
+                            unsigned D)
+{
+    inference_buf_t v;
+    unsigned        g;
+    if (rows > C) rows = C;
+    if (!rows) return;
+    if (rows == C) {
+        inference_buf_sync_to_device(cache);
+        return;
+    }
+    for (g = 0u; g < G; g++) {
+        inference_buf_init_view(&v, cache, g * C * D, rows * D);
+        inference_buf_sync_to_device(&v);
+    }
+}
 """
 
 
 def llm_c_helpers() -> str:
-    return LLM_C.replace("SILU_EMIN_VALUE", str(SILU_EMIN)).replace("SILU_NE_VALUE", str(SILU_NE))
+    return (LLM_C.replace("SILU_EMIN_VALUE", str(SILU_EMIN)).replace("SILU_NE_VALUE", str(SILU_NE))
+            .replace("SEXP_EMIN_VALUE", str(SEXP_EMIN)).replace("SEXP_NE_VALUE", str(SEXP_NE))
+            .replace("KEY_QUANTUM_VALUE", f"{KEY_QUANTUM}u"))
 
 
 __all__ = ("LLM_DOMAIN", "LLM_OP_FACTORIES", "LlmNode", "LlmEmbedNode", "LlmResAddNode",
            "LlmRMSNormNode", "LlmSiluMulNode", "LlmAttentionNode", "LlmSelectRowNode",
-           "LlmDequantNode", "RuntimeItem", "HostTable", "llm_c_helpers", "dot8", "rope",
-           "silu_table", "TABLE_FILE_BYTES")
+           "LlmDequantNode", "LlmAttnPrepNode", "LlmAttnConvNode", "LlmAttnSoftmaxNode",
+           "LlmAttnMergeNode", "RuntimeItem", "HostTable", "llm_c_helpers", "dot8", "rope",
+           "silu_table", "sexp_table", "keys16", "KEY_QUANTUM", "TABLE_FILE_BYTES",
+           "LLM_C_DMA")

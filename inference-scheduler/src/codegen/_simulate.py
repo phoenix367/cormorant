@@ -45,7 +45,7 @@ from ..nodes  import (
 )
 from ..tensor import TensorInfo
 from ..host_nodes import GatherNode, HostNode, OneHotNode
-from ..llm_nodes import LlmEmbedNode
+from ..llm_nodes import LlmAttnConvNode, LlmEmbedNode
 
 # Expected GT arrays larger than this threshold are written to external
 
@@ -577,6 +577,14 @@ class _SimulateMixin:
             if isinstance(sn, ReshapeNode):
                 src = arrays[sn.inputs[0].onnx_name]
                 arrays[sn.output.onnx_name] = src.reshape(sn.output.shape)
+                continue
+
+            if isinstance(sn, LlmAttnConvNode):
+                # FPGA prefill attention call (q.K^T / P.V on ConvKernel): raw
+                # integer operands, exact sums, int32 wrap, floor + saturate —
+                # over the runtime key count of this call's pos / n
+                arrays[sn.output.onnx_name] = sn.reference(
+                    [arrays[t.onnx_name] for t in sn.inputs], dtype)
                 continue
 
             if isinstance(sn, HostNode):

@@ -80,6 +80,13 @@ class TensorInfo:
     #      (None = zeros).  Excluded from buffer reuse.
     is_state:  bool = False
     init_data: Optional[np.ndarray] = field(default=None, repr=False)
+    # group_layout: (G, D) — a state whose logical shape is [R][G*D] (a KV
+    #      cache [positions][kv_heads * head_dim]) stored GROUP-MAJOR as
+    #      [G][R][D] in memory, so every group's rows are contiguous (the
+    #      FPGA prefill attention reads one KV head's rows as a conv weight /
+    #      input).  The simulator keeps the logical array; the C init image
+    #      and the LLM ops index the physical layout.  None = row-major.
+    group_layout: Optional[tuple] = None
 
     # ------------------------------------------------------------------ #
     # Derived properties                                                   #
