@@ -1,7 +1,9 @@
 # Chat app on the KV260 — plan (for review)
 
-Date: 2026-09-26.  Status: **proposal — nothing implemented; decisions in §1
-are open.**  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
+Date: 2026-09-26.  Status: **approved 2026-09-26 — decisions: A then B,
+SmolLM2-135M-Instruct, server on the board, existing CLIs + `chat.py`, context
+1024.**  Phase 1 (server + CLI + backend A) and phase 2 (B0 numeric study)
+started in parallel.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
 inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything

@@ -111,3 +111,6 @@ Thumbs.db
 # Claude Code settings (local overrides — not project config)
 # -----------------------------------------------------------------------
 .claude/settings.local.json
+
+# host-side model export environment (torch / transformers), see doc/CHAT_PLAN.md
+.venv-export/
