@@ -68,7 +68,22 @@ def parse_args(argv=None):
     p.add_argument(
         "model",
         metavar="model.onnx",
-        help="Input ONNX model file",
+        nargs="?",
+        default=None,
+        help="Input ONNX model file (omit with --entry)",
+    )
+    p.add_argument(
+        "--entry",
+        dest="entries",
+        metavar="NAME=MODEL.onnx",
+        action="append",
+        default=[],
+        help=(
+            "Multi-entry project (src/codegen/multi.py): one library with "
+            "inference_run_NAME() per graph over ONE weight pool (weights "
+            "deduplicated by name and image, states shared by name).  Repeat "
+            "for every entry; replaces the positional model."
+        ),
     )
     p.add_argument(
         "--out-dir",
@@ -202,8 +217,62 @@ def _copy_driver(src_dir: str, dst_dir: str, files: list = None) -> list:
     return missing
 
 
+def main_multi(args) -> int:
+    """--entry NAME=MODEL.onnx ...: a multi-entry project."""
+    from src.codegen.multi import MultiEntryGenerator
+    entries = []
+    for spec in args.entries:
+        name, sep, path = spec.partition("=")
+        if not sep:
+            print(f"error: --entry {spec!r}: expected NAME=MODEL.onnx", file=sys.stderr)
+            return 1
+        try:
+            g = OnnxGraph(path, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
+                          fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv)
+        except (FileNotFoundError, SchedulerError) as e:
+            print(f"error: entry {name}: {e}", file=sys.stderr)
+            return 1
+        entries.append((name, g))
+        print(f"Entry {name:<10}: {path}  ({len(g.nodes)} nodes)", file=sys.stderr)
+    out_dir = os.path.abspath(args.out_dir or "multi_inference")
+    try:
+        gen = MultiEntryGenerator(entries, os.path.basename(out_dir.rstrip("/")),
+                                  embed_large_weights=args.embed_large_weights)
+        summary = gen.write_project(out_dir)
+    except SchedulerError as e:
+        print(f"error: code generation failed — {e}", file=sys.stderr)
+        return 1
+    active = gen._active_kernels
+    files = []
+    for kd in active:
+        files += [f for f in kd.driver_files if f not in files]
+    driver_dir = os.path.join(out_dir, "driver")
+    if args.driver_dir:
+        missing = _copy_driver(os.path.abspath(args.driver_dir), driver_dir, files)
+        if missing:
+            print(f"  warning: missing driver files: {missing}", file=sys.stderr)
+    else:
+        os.makedirs(driver_dir, exist_ok=True)
+        with open(os.path.join(driver_dir, "README.md"), "w") as f:
+            f.write(active[0].driver_readme if len(active) == 1
+                    else mixed_driver_readme([kd.name for kd in active]))
+    print(f"Output dir : {out_dir}\n"
+          f"Pool       : {summary['pool_bytes']} B (weights {summary['weights_bytes']} B, shared "
+          f"intermediates {summary['intermediate_region_bytes']} B), "
+          f"{summary['weights']} weight buffers", file=sys.stderr)
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
+    if args.entries:
+        if args.model:
+            print("error: give either a model or --entry NAME=MODEL.onnx ...", file=sys.stderr)
+            return 1
+        return main_multi(args)
+    if not args.model:
+        print("error: no model (positional model.onnx or --entry)", file=sys.stderr)
+        return 1
 
     # ---------------------------------------------------------------- #
     # 1. Resolve output directory                                       #
@@ -316,6 +385,14 @@ def main(argv=None):
                 f.write(gen.generate_weight_dat(t))
         print(f"Weights    : {len(large_weights)} large weight(s) written to"
               f" {weights_dir}/", file=sys.stderr)
+    host_tables = gen.host_table_files()
+    if host_tables:
+        weights_dir = os.path.join(out_dir, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+        for name, tb in host_tables:
+            with open(os.path.join(weights_dir, f"{name}.dat"), "wb") as f:
+                f.write(tb.dat_bytes())
+        print(f"Host tables: {len(host_tables)} written to {weights_dir}/", file=sys.stderr)
 
     # ---------------------------------------------------------------- #
     # 5c. External expected GT .dat files (large outputs)               #
