@@ -14,17 +14,23 @@ from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
 from ._banners  import _banner, _file_banner
 
 
-# A group-major state [G][R][D] (TensorInfo.group_layout) from its logical
-# init image [rows][G*D] (the non-zero prefix, whole rows).
-_STATE_SCATTER_C = """/* A group-major state [G][R][D] from its logical initial image [rows][G*D]. */
+# A group-major state [G][R][D] (TensorInfo.group_layout, rows interleaved by
+# K = group_kw) from its logical init image [rows][G*D] (the non-zero prefix,
+# whole rows).
+_STATE_SCATTER_C = """/* A group-major state [G][R][D] from its logical initial image [rows][G*D];
+ * K > 1: each group's rows interleaved as a 1 x K conv input image, row r,
+ * element d at ((r / 16K) * 16 + r % 16) * D*K + d*K + (r / 16) % K. */
 static void _state_scatter(int16_t *dst, const int16_t *init, unsigned rows,
-                           unsigned R, unsigned G, unsigned D)
+                           unsigned R, unsigned G, unsigned D, unsigned K)
 {
-    unsigned r, g;
+    unsigned r, g, d;
     for (r = 0u; r < rows; r++)
-        for (g = 0u; g < G; g++)
-            memcpy(dst + ((size_t)g * R + r) * D, init + ((size_t)r * G + g) * D,
-                   (size_t)D * sizeof(int16_t));
+        for (g = 0u; g < G; g++) {
+            int16_t *o = dst + (size_t)g * R * D
+                       + ((size_t)(r / (16u * K)) * 16u + r % 16u) * D * K + (r / 16u) % K;
+            for (d = 0u; d < D; d++)
+                o[(size_t)d * K] = init[((size_t)r * G + g) * D + d];
+        }
 }
 """
 
@@ -450,6 +456,7 @@ class _SourceMixin:
                          " * ops write (flushing the rows a kernel reads) and kernels read */")
             for t in dma_states:
                 lay = (f" group-major [{t.group_layout[0]}][{t.shape[0]}][{t.group_layout[1]}]"
+                       + (f" rows interleaved x{t.group_kw}" if t.group_kw > 1 else "")
                        if t.group_layout else "")
                 lines.append(f"static inference_buf_t *{t.c_name} = NULL;"
                              f"  /* STATE '{t.onnx_name}' {t.shape}{lay} */")
@@ -506,6 +513,7 @@ class _SourceMixin:
                              f"  /* '{t.onnx_name}' {t.host} {t.shape} */")
             for t in host_states:
                 lay = (f" group-major [{t.group_layout[0]}][{t.shape[0]}][{t.group_layout[1]}]"
+                       + (f" rows interleaved x{t.group_kw}" if t.group_kw > 1 else "")
                        if t.group_layout else "")
                 lines.append(f"static {self._host_c_type(t)} *{t.c_name} = NULL;"
                              f"  /* STATE '{t.onnx_name}' {t.host} {t.shape}{lay} */")
@@ -1360,7 +1368,8 @@ class _SourceMixin:
                 if pre is not None and t.group_layout:
                     G, D = t.group_layout
                     alloc_lines.append(f"    _state_scatter({t.c_name}, _state_init_{t.c_name},"
-                                       f" {pre[1] // (G * D)}u, {t.shape[0]}u, {G}u, {D}u);")
+                                       f" {pre[1] // (G * D)}u, {t.shape[0]}u, {G}u, {D}u,"
+                                       f" {t.group_kw}u);")
                 elif pre is not None:
                     alloc_lines.append(f"    memcpy({t.c_name}, _state_init_{t.c_name},"
                                        f" sizeof _state_init_{t.c_name});")
@@ -1388,7 +1397,7 @@ class _SourceMixin:
                 init = f"_state_init_{t.c_name}" if pre is not None else "NULL"
                 n_init = (pre[1] // (G * D) if G else pre[1]) if pre is not None else 0
                 rows.append(f"    {{ &_s_buf_{t.c_name}, &{t.c_name}, {off}u, {alloc}u, {init},"
-                            f" {n_init}u, {t.shape[0]}u, {G}u, {D}u }},")
+                            f" {n_init}u, {t.shape[0]}u, {G}u, {D}u, {t.group_kw}u }},")
             slot_tables.append(
                 "typedef struct {\n"
                 "    inference_buf_t  *view;\n"
@@ -1396,7 +1405,7 @@ class _SourceMixin:
                 "    unsigned          off, count;\n"
                 "    const int16_t    *init;        /* logical non-zero prefix, or NULL */\n"
                 "    unsigned          n_init;      /* its rows (group-major) / elements */\n"
-                "    unsigned          R, G, D;     /* group-major [G][R][D]; G = 0: flat */\n"
+                "    unsigned          R, G, D, K;  /* group-major [G][R][D] (rows x K); G = 0: flat */\n"
                 "} _state_slot_t;\n\n"
                 f"static const _state_slot_t _s_state_slots[{len(rows)}] = {{\n"
                 + "\n".join(rows) + "\n};")
@@ -1412,7 +1421,7 @@ class _SourceMixin:
                 "            p = inference_buf_ptr(s->view);",
                 "            memset(p, 0, (size_t)s->count * INFERENCE_BYTES_PER_ELEM);",
                 "            if (s->init && s->G)",
-                "                _state_scatter((int16_t *)p, s->init, s->n_init, s->R, s->G, s->D);",
+                "                _state_scatter((int16_t *)p, s->init, s->n_init, s->R, s->G, s->D, s->K);",
                 "            else if (s->init)",
                 "                memcpy(p, s->init, (size_t)s->n_init * INFERENCE_BYTES_PER_ELEM);",
                 "        }",

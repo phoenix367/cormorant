@@ -237,6 +237,7 @@ class MultiEntryGenerator:
                     continue
                 if (list(f.shape) != list(t.shape) or f.host != t.host
                         or f.group_layout != t.group_layout
+                        or f.group_kw != t.group_kw
                         or not np.array_equal(f.exp_full(8), t.exp_full(8))):
                     raise SchedulerError(f"state '{t.onnx_name}' differs between entries")
                 if t.init_data is not None:

@@ -87,6 +87,12 @@ class TensorInfo:
     #      input).  The simulator keeps the logical array; the C init image
     #      and the LLM ops index the physical layout.  None = row-major.
     group_layout: Optional[tuple] = None
+    # group_kw: K > 1 additionally interleaves the rows of every group as the
+    #      ConvKernel x image of a 1 x K lowered MatMul whose B is the
+    #      group's [R][D] (nodes.conv_lowered_b_image): row r, element d at
+    #      ((r / 16K) * 16 + r % 16) * D*K + d*K + (r / 16) % K within the
+    #      group (the V cache P.V reads with kw = K: 4x fewer weight requests).
+    group_kw: int = 1
 
     # ------------------------------------------------------------------ #
     # Derived properties                                                   #

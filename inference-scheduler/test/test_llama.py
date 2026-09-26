@@ -197,9 +197,9 @@ class TestFrontend(unittest.TestCase):
         self.assertEqual([t.onnx_name for t in g.output_tensors], [])
 
     def test_prefill_fpga_attention(self):
-        """Per layer: LlmAttnPrep, per KV group q.K^T / softmax / P.V with the
-        next q.K^T issued before each softmax (host softmax overlaps the
-        ConvKernel), LlmAttnMerge; no host attention in prefill."""
+        """Per layer: LlmAttnPrep, per KV group q.K^T / softmax / P.V, each
+        softmax issued behind a ConvKernel call it overlaps, LlmAttnMerge; no
+        host attention in prefill."""
         cfg, _W, _f, fe = tiny()
         g = OnnxGraph(fe.entry("prefill", 16))
         L, KV = cfg["num_hidden_layers"], cfg["num_key_value_heads"]

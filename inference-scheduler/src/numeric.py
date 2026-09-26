@@ -32,9 +32,11 @@ a JSON object
   host ops also update states in place (the KV cache rows).
 * ``test_fill`` — the constant the generated test harness writes into an
   integer host input (e.g. a start position); ids default to ``i % rows``.
-* ``layout`` — a state of logical shape ``[R][G*D]`` stored group-major,
-  ``[G][R][D]`` (``TensorInfo.group_layout``): a KV cache whose KV heads'
-  rows must each be contiguous for the FPGA prefill attention.  A state
+* ``layout`` — ``[G, D]`` or ``[G, D, K]``: a state of logical shape
+  ``[R][G*D]`` stored group-major, ``[G][R][D]`` (``TensorInfo.group_layout``):
+  a KV cache whose KV heads' rows must each be contiguous for the FPGA
+  prefill attention; K > 1 interleaves each group's rows as a 1 x K conv
+  input image (``TensorInfo.group_kw``, R % 16K == 0).  A state
   without a host kind is a DMA state: a persistent buffer in the CMA pool
   that host ops write (flushing what a kernel will read) and kernels read.
 
@@ -126,12 +128,19 @@ def apply(tensors: dict, meta: dict, dtype) -> None:
         _get(tensors, name, "test_fill")
     for name, gd in meta.get("layout", {}).items():
         t = _get(tensors, name, "layout")
-        g, d = (int(x) for x in gd)
+        if len(gd) not in (2, 3):
+            raise NumericError(f"layout of '{name}': [G, D] or [G, D, K], got {gd}")
+        g, d = int(gd[0]), int(gd[1])
+        k = int(gd[2]) if len(gd) == 3 else 1
         if not t.is_state or len(t.shape) != 2 or t.shape[1] != g * d or g < 1 or d < 1:
             raise NumericError(f"layout of '{name}': a group-major layout [G={g}][R][D={d}] "
                                f"needs a 2-D state [R][G*D] (got shape {t.shape}, "
                                f"state {t.is_state})")
+        if k < 1 or (k > 1 and t.shape[0] % (16 * k)):
+            raise NumericError(f"layout of '{name}': interleave K={k} needs rows % 16K == 0 "
+                               f"(rows {t.shape[0]})")
         t.group_layout = (g, d)
+        t.group_kw = k
 
 
 def _get(tensors, name, what):
