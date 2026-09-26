@@ -5,11 +5,12 @@
  * INFERENCE_WEIGHTS_DIR (both set by demo/chat/scripts/generate_llm_project.py).
  *
  * Prefill split (identical to demo/chat/scripts/llm_project.py split_prefill,
- * which the bit-exactness check drives): the largest bucket the remaining
- * tokens fill completely, and the last remainder padded into the smallest
- * bucket (rows >= n are computed but write nothing into the cache and are
- * never read).  Every call to a prefill entry leaves the last valid row in
- * the h_last state; llm_prefill() then runs the head entry once.
+ * which the bit-exactness check drives): the least-cost sequence of bucket
+ * calls by llm_bucket_cost (a padded 64-row call costs little more than a
+ * 16-row one), the last call padded to its bucket (rows >= n are computed
+ * but write nothing into the cache and are never read).  The logits do not
+ * depend on the split.  Every call to a prefill entry leaves the last valid
+ * row in the h_last state; llm_prefill() then runs the head entry once.
  */
 
 #define _POSIX_C_SOURCE 200809L   /* fchdir, realpath */
@@ -35,6 +36,30 @@ static int     s_open;
 static int     s_pos;                       /* positions filled, incl. the sink */
 static char    s_err[512];
 static int32_t s_ids[LLM_MAX_BUCKET];
+
+/* s_pick[r]: the bucket of the first prefill call for r remaining tokens on
+ * the least-cost split; s_cost[r] its total cost.  Constant, filled once. */
+static unsigned      s_pick[LLM_CONTEXT + 1];
+static unsigned long s_cost[LLM_CONTEXT + 1];
+
+static void plan_split(void)
+{
+    unsigned r, j;
+    s_cost[0] = 0;
+    s_pick[0] = llm_buckets[LLM_N_BUCKETS - 1];
+    for (r = 1; r <= LLM_CONTEXT; r++) {
+        unsigned long best = 0;
+        for (j = LLM_N_BUCKETS; j-- > 0;) {        /* larger buckets win ties */
+            unsigned      b = llm_buckets[j];
+            unsigned long v = llm_bucket_cost[j] + s_cost[r > b ? r - b : 0];
+            if (j == LLM_N_BUCKETS - 1 || v < best) {
+                best = v;
+                s_pick[r] = b;
+            }
+        }
+        s_cost[r] = best;
+    }
+}
 
 static void set_err(const char *fmt, ...)
 {
@@ -92,6 +117,7 @@ int llm_open(const char *weights_dir)
                 weights_dir && *weights_dir ? weights_dir : LLM_API_WEIGHTS_DIR);
         return -4;
     }
+    plan_split();
     s_open = 1;
     s_pos = 1;                              /* the sink */
     return 0;
@@ -162,11 +188,8 @@ int llm_prefill(const int32_t *tokens, int n, float *logits)
     if (check_tokens(tokens, n) != 0)
         return -4;
     while (done < n) {
-        unsigned b = llm_buckets[0], k, j;
+        unsigned b = s_pick[n - done], k;
         int32_t  pos, nv;
-        for (j = 0; j < LLM_N_BUCKETS; j++)
-            if ((int)llm_buckets[j] <= n - done)
-                b = llm_buckets[j];
         k = (unsigned)(n - done) < b ? (unsigned)(n - done) : b;
         memset(s_ids, 0, sizeof s_ids);
         memcpy(s_ids, tokens + done, (size_t)k * sizeof(int32_t));

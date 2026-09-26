@@ -25,6 +25,7 @@ usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py
            [--project demo/chat/build/llm_project] [--prompts factual,summarise,multi-turn]
            [--decode 32] [--prefill-lens 16,64,256] [--profile] [--reopen]
            [--study-json gate2.json] [--board-lock FILE] [--skip-build]
+       ... llm_board.py --install-only      (deploy: upload, build, install; no bench)
 """
 
 from __future__ import annotations
@@ -266,6 +267,8 @@ def main(argv=None) -> int:
     ap.add_argument("--study-json", default=None, help="llm_sched_check.py --save output")
     ap.add_argument("--board-lock", default=None)
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--install-only", action="store_true",
+                    help="upload, build and install libsmollm2.so; no bench or checks")
     ap.add_argument("--jobs", type=int, default=1, help="make -j on the board (default 1)")
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--no-lib-check", action="store_true",
@@ -275,10 +278,13 @@ def main(argv=None) -> int:
     cfg = bert_config(args.bert_config)
     summary = json.load(open(os.path.join(args.project, "project.json")))
     layers = json.load(open(os.path.join(args.project, "layers.json")))
-    ids = lp.tokenize_prompts(args.prompts.split(","))
+    if args.install_only and args.skip_build:
+        ap.error("--install-only builds; it cannot be combined with --skip-build")
     local_prompts = os.path.join(args.project, "prompts.bin")
-    names = write_prompts(local_prompts, ids)
-    results = {"project": summary, "prompts": names}
+    if not args.install_only:
+        ids = lp.tokenize_prompts(args.prompts.split(","))
+        names = write_prompts(local_prompts, ids)
+    results = {"project": summary, "prompts": [] if args.install_only else names}
     with board_lock(args.board_lock or cfg.get("board_lock")):
         session = RemoteSession(cfg["ssh"])
         session.connect()
@@ -304,6 +310,9 @@ def main(argv=None) -> int:
                 syms = [s for s in out.split() if s]
                 results["exported"] = syms
                 print(f"  libsmollm2.so exports: {syms}", flush=True)
+                if args.install_only:
+                    print(f"installed {REMOTE_DIR}/lib/libsmollm2.so (weights {WEIGHTS_DIR})")
+                    return 0
             sftp = session._client.open_sftp()                   # noqa: SLF001
             session.exec_checked(f"mkdir -p {RUN_DIR}", timeout=15)
             sftp.put(local_prompts, f"{RUN_DIR}/prompts.bin")

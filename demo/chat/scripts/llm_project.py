@@ -85,15 +85,61 @@ def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[st
     return out
 
 
-def split_prefill(n: int, buckets: Sequence[int] = BUCKETS) -> List[Tuple[int, int]]:
-    """The library's split of n new tokens into prefill calls: [(rows, bucket)],
-    the largest bucket that the remaining tokens fill completely, and the last
-    remainder padded into the smallest bucket (llm_api.c llm_prefill)."""
+# Board cost of one prefill call per bucket, ms, without the host attention
+# (it covers only the valid rows, so it does not depend on the split) and the
+# head (run once per llm_prefill): KV260, 100 MHz, hw_128 bitstream, profiled
+# 2026-09-26 (CHAT_PLAN §12.4).  The ConvKernel MatMuls stream the weights
+# once per call, so a padded 64-row call costs little more than a 16-row one.
+BUCKET_COST_MS = {16: 304, 64: 364, 256: 930}
+
+
+def bucket_costs(buckets: Sequence[int] = BUCKETS) -> List[int]:
+    """Cost per call of each bucket (sorted order), ms: the measured table,
+    linear inter- / extrapolation over it for other bucket sizes."""
+    pts = sorted(BUCKET_COST_MS.items())
+    out = []
+    for b in sorted(buckets):
+        if b in BUCKET_COST_MS:
+            out.append(BUCKET_COST_MS[b])
+            continue
+        lo = max([p for p in pts if p[0] < b], default=pts[0])
+        hi = min([p for p in pts if p[0] > b], default=pts[-1])
+        if lo == hi:
+            lo, hi = (pts[-2], pts[-1]) if b > pts[-1][0] else (pts[0], pts[1])
+        out.append(max(1, round(lo[1] + (hi[1] - lo[1]) * (b - lo[0]) / (hi[0] - lo[0]))))
+    return out
+
+
+def split_plan(ctx: int = CONTEXT, buckets: Sequence[int] = BUCKETS,
+               costs: Optional[Sequence[int]] = None) -> List[int]:
+    """pick[r] = the bucket of the first prefill call for r remaining tokens
+    (r = 1 .. ctx) on the least-cost split: cost[r] = min over buckets b of
+    cost_b + cost[max(0, r - b)], larger buckets winning ties (llm_api.c
+    plan_split, the same integer recurrence)."""
     b = sorted(buckets)
+    c = list(costs) if costs is not None else bucket_costs(b)
+    cost = [0] * (ctx + 1)
+    pick = [b[-1]] * (ctx + 1)
+    for r in range(1, ctx + 1):
+        best = None
+        for j in range(len(b) - 1, -1, -1):
+            v = c[j] + cost[max(0, r - b[j])]
+            if best is None or v < best:
+                best, pick[r] = v, b[j]
+        cost[r] = best
+    return pick
+
+
+def split_prefill(n: int, buckets: Sequence[int] = BUCKETS,
+                  costs: Optional[Sequence[int]] = None) -> List[Tuple[int, int]]:
+    """The library's split of n new tokens into prefill calls: [(rows, bucket)]
+    on the least-cost plan (split_plan; the last call's rows padded to its
+    bucket).  The logits do not depend on the split (every row is computed
+    independently of the others in its call), only the time does."""
+    pick = split_plan(max(n, 1), buckets, costs)
     out = []
     while n > 0:
-        fit = [x for x in b if x <= n]
-        B = fit[-1] if fit else b[0]
+        B = pick[n]
         k = min(n, B)
         out.append((k, B))
         n -= k

@@ -91,9 +91,11 @@ def build_entries(models: dict, prefill_engine: str, log=print):
             kw = {sn.inputs[1].onnx_name: sn.kw for sn in g.nodes
                   if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight}
         graphs[name] = g
+        st = g.matmul_conv_stats
+        est = (f", est. {st['conv_cycles'] / 1e6:.1f} M cycles vs {st['matmul_cycles'] / 1e6:.1f} M "
+               f"on MatmulKernel" if st["lowered"] else "")
         log(f"  {name}: {len(g.nodes)} nodes, MatMul on ConvKernel "
-            f"{g.matmul_conv_stats['lowered']} / kept {g.matmul_conv_stats['kept']} "
-            f"({time.time() - t0:.0f} s)")
+            f"{st['lowered']} / kept {st['kept']}{est} ({time.time() - t0:.0f} s)")
     graphs["head"] = OnnxGraph(models["head"], fuse_act=True, s2d_stem=True)
     order = ["decode"] + sorted(prefills, key=lambda n: int(n.split("_")[1])) + ["head"]
     return [(n, graphs[n]) for n in order]
@@ -116,6 +118,8 @@ def populate_drivers(out: str, driver_dirs: dict, active) -> list:
 
 def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buckets) -> None:
     active = mg._active_kernels
+    buckets = sorted(buckets)
+    costs = lp.bucket_costs(buckets)
     cases = "\n".join(
         f"    case {b}u: inference_run_prefill_{b}(ids, pos, n); break;" for b in buckets)
     glue = f"""/*
@@ -138,6 +142,9 @@ def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buck
 #define LLM_MAX_BUCKET  {max(buckets)}u
 
 static const unsigned llm_buckets[LLM_N_BUCKETS] = {{ {", ".join(f"{b}u" for b in buckets)} }};
+/* Cost of one call per bucket (ms on the board without the host attention and
+ * the head, llm_project.py BUCKET_COST_MS): llm_prefill's least-cost split. */
+static const unsigned llm_bucket_cost[LLM_N_BUCKETS] = {{ {", ".join(f"{c}u" for c in costs)} }};
 
 static inline int llm_glue_init(void)
 {{
