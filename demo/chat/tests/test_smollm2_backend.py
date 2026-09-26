@@ -20,7 +20,7 @@ import chatml
 from chat_backend import BackendError, Cancelled, CancelToken, ChatRequest, Delta, Finish
 from fake_llm import GEN_PROMPT, IM_END, FakeLibraryError, ScriptedEngine
 from sampler import SamplerParams
-from smollm2_backend import DRY_BREAKERS, LibLlmEngine, LlmLibraryError, Smollm2Backend
+from smollm2_backend import DRY_BREAKERS, LibLlmEngine, LlmLibraryError, Smollm2Backend, loop_period
 from smollm2_tokenizer import Tokenizer
 from test_protocol import SchemaMixin
 
@@ -38,6 +38,7 @@ def tok():
 
 def backend(engine, **kw):
     kw.setdefault("defaults", SamplerParams(temperature=0.0))
+    kw.setdefault("loop_guard", False)          # scripted replies repeat on purpose; TestLoopGuard turns it on
     b = Smollm2Backend(engine, TOKENIZER, sampler_lib=sampler_lib() or "/nonexistent", **kw)
     b.load_host()
     b.load()
@@ -320,13 +321,13 @@ class TestDry(unittest.TestCase):
                 if any(x.encode() in t.token_bytes(i) for x in DRY_BREAKERS):
                     self.assertIn(i, ids, (text, i, t.token_bytes(i)))
         self.assertTrue(t.special_ids <= ids)
-        for text in (" cat", " the", "Paris", "."):
+        for text in (" cat", " the", "Paris", ".", "\n", "\n\n"):
             for i in t.encode(text, special=False):
                 self.assertNotIn(i, ids, (text, i))
         self.assertEqual(ids, set(i for i in range(t.vocab_size)
                                   if t.is_special(i) or any(x.encode() in t.token_bytes(i)
                                                             for x in DRY_BREAKERS)))
-        self.assertIn(t.encode("\n", special=False)[0], ids)
+        self.assertIn(t.encode(":", special=False)[0], ids)
 
     def test_dry_breaks_the_loop(self):
         eng, cyc = self.cycle_engine()
@@ -346,7 +347,8 @@ class TestDry(unittest.TestCase):
         # per request: DRY off again -> the loop
         eng3, _ = self.cycle_engine()
         on3 = backend(eng3, defaults=SamplerParams(temperature=0.0, dry_multiplier=0.8))
-        text_req, _ = run(on3, req([("user", "tell me")], max_tokens=60, raw={"dry_multiplier": 0}))
+        text_req, _ = run(on3, req([("user", "tell me")], max_tokens=60,
+                                   raw={"dry_multiplier": 0, "loop_guard": False}))
         self.assertEqual(text_req, text_off)
 
     def test_per_request_breakers_and_restore(self):
@@ -360,9 +362,52 @@ class TestDry(unittest.TestCase):
     def test_server_default_is_on(self):
         b = Smollm2Backend(ScriptedEngine(tok().encode("ok")), TOKENIZER,
                            sampler_lib=sampler_lib() or "/nonexistent")
-        self.assertEqual((b.defaults.dry_multiplier, b.defaults.dry_base, b.defaults.dry_allowed_length),
-                         (0.8, 1.75, 2))
-        self.assertEqual((b.dry_last_n, b.dry_breakers), (-1, DRY_BREAKERS))
+        self.assertEqual((b.defaults.dry_multiplier, b.defaults.dry_base, b.defaults.dry_allowed_length,
+                          b.defaults.repetition_penalty), (0.8, 1.75, 2, 1.1))
+        self.assertEqual((b.dry_last_n, b.dry_breakers, b.loop_guard), (-1, (":", "\"", "*"), True))
+
+
+@unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
+class TestLoopGuard(unittest.TestCase):
+
+    def test_loop_period(self):
+        self.assertEqual(loop_period([1, 2, 3] * 8), 3)                 # 24 tokens, period 3
+        self.assertEqual(loop_period([7] * 24), 1)
+        self.assertEqual(loop_period([7] * 23), 0)                      # shorter than 24
+        self.assertEqual(loop_period(list(range(40)) + list(range(10, 30)) * 2), 0)   # 2 repeats of 20: no
+        blk = list(range(100, 116))                                     # 16 tokens x 3 = 48
+        self.assertEqual(loop_period([5, 6] + blk * 3), 16)
+        self.assertEqual(loop_period([5, 6] + blk * 2 + blk[:-1]), 0)   # not complete yet
+        self.assertEqual(loop_period(list(range(200))), 0)
+        self.assertEqual(loop_period(list(range(500, 700)) * 3), 0)     # period 200 > 128: not checked
+
+    def test_backend_stops_a_loop(self):
+        cyc = tok().encode(" the old man lives in a big house")
+        V = tok().vocab_size
+
+        def logits(seq):
+            vals = [0.0] * V
+            vals[cyc[(cyc.index(seq[-1]) + 1) % len(cyc)] if seq[-1] in cyc else cyc[0]] = 30.0
+            return vals
+        # sampling cannot break it (margin 30), the guard must
+        b = backend(ScriptedEngine(logits_fn=logits), loop_guard=True,
+                    defaults=SamplerParams(temperature=0.0))
+        text, fin = run(b, req([("user", "go")], max_tokens=200))
+        self.assertEqual((fin.reason, fin.info["finish"], fin.info["loop_period"]), ("stop", "loop", len(cyc)))
+        self.assertLess(fin.completion_tokens, 60)
+        self.assertEqual("".join(text).count("old man"), 3)
+        # per request off -> runs to max_tokens
+        text, fin = run(b, req([("user", "go")], max_tokens=80, raw={"loop_guard": False}))
+        self.assertEqual((fin.reason, fin.info["finish"]), ("length", "max_tokens"))
+        with self.assertRaises(BackendError):
+            b.prepare(req([("user", "go")], raw={"loop_guard": "yes"}))
+
+    def test_normal_text_is_not_a_loop(self):
+        t = tok()
+        for text in ("1. **Read**: read a lot.\n2. **Write**: write a lot.\n3. **Talk**: talk a lot.\n",
+                     "def f(x):\n    return x\n\ndef g(x):\n    return x\n\ndef h(x):\n    return x\n",
+                     "Paris is the capital of France. " * 2):
+            self.assertEqual(loop_period(t.encode(text, special=False)), 0, text)
 
 
 @unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")

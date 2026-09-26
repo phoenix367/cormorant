@@ -119,9 +119,9 @@ def load_config(path: Optional[str]) -> dict:
     for k, v in (("lib", None), ("weights_dir", None),
                  ("tokenizer", "assets/smollm2-135m-instruct/tokenizer.json"), ("context", 1024),
                  ("reserve", 256), ("temperature", 0.2), ("top_p", 0.9), ("top_k", 50),
-                 ("repetition_penalty", 1.0), ("cma_mb", 360), ("dry_multiplier", 0.8),
+                 ("repetition_penalty", 1.1), ("cma_mb", 360), ("dry_multiplier", 0.8),
                  ("dry_base", 1.75), ("dry_allowed_length", 2), ("dry_penalty_last_n", -1),
-                 ("dry_sequence_breakers", ["\n", ":", "\"", "*"])):
+                 ("dry_sequence_breakers", [":", "\"", "*"]), ("loop_guard", True)):
         if llm.get(k) is None:
             llm[k] = v
     if not llm["lib"]:
@@ -361,6 +361,7 @@ def server_argv(cfg: dict) -> List[str]:
                  "--llm-dry-allowed-length", str(llm["dry_allowed_length"]),
                  "--llm-dry-penalty-last-n", str(llm["dry_penalty_last_n"]),
                  "--llm-dry-sequence-breakers", json.dumps(llm["dry_sequence_breakers"]),
+                 *([] if llm["loop_guard"] else ["--llm-no-loop-guard"]),
                  "--llm-cma-mb", str(llm["cma_mb"])]
         if llm.get("weights_dir"):
             argv += ["--llm-weights", llm["weights_dir"]]

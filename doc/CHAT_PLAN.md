@@ -1162,3 +1162,15 @@ transcription of the reference algorithm on 200 random histories.  Board:
 the cat-story loop is gone (repeated trigrams 20 % → 5 %), answers without
 repeats (facts, lists, code blocks) are unchanged, ~2.5 ms per token.
 
+
+**Follow-up (same day): loops of short lines.**  DRY with the stock breaker
+set still let a line-level loop through ("The cat loves her adventures /
+This is a short story." repeated to `max_tokens`): "\n" cut every run at the
+line end, so the strongest penalty any loop token met was 4.3 (mean 1.1).
+New defaults: breakers `: " *` (newline dropped), repetition_penalty 1.1
+over the last 64 tokens, and a loop guard (stop when the answer ends in a
+block repeated verbatim 3 times, >= 24 tokens; `kv260.finish` "loop").
+Board, the conversation that looped, seeds 1–3: no loops (0–3 % repeated
+trigrams; two end at <|im_end|>, one runs to the 500-token cap with 1 %);
+factual / list / code answers still correct (the code block is identical,
+the prose is reworded).  Chat tests 121 pass.

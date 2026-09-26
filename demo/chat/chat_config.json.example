@@ -42,18 +42,19 @@
     "temperature": 0.2,
     "top_p": 0.9,
     "top_k": 50,
-    "repetition_penalty": 1.0,
+    "repetition_penalty": 1.1,
     "dry_multiplier": 0.8,
     "dry_base": 1.75,
     "dry_allowed_length": 2,
     "dry_penalty_last_n": -1,
     "dry_sequence_breakers": [
-      "\n",
       ":",
       "\"",
       "*"
     ],
-    "_dry_note": "DRY (\"Don't Repeat Yourself\"): penalises a token that would extend a run already seen in the context, by multiplier * base^(run - allowed_length); a token containing a breaker string (and every special token) cuts a run, so lists / dialogue / markdown are not penalised. dry_penalty_last_n -1 = the whole context, 0 = off. Stops the small model's repetition loops.",
+    "_dry_note": "DRY (\"Don't Repeat Yourself\"): penalises a token that would extend a run already seen in the context, by multiplier * base^(run - allowed_length); a token containing a breaker string (and every special token) cuts a run. Newline is deliberately NOT a breaker (unlike text-generation-webui / llama.cpp): with it, loops of short lines slip through (CHAT_PLAN §15). dry_penalty_last_n -1 = the whole context, 0 = off.",
+    "loop_guard": true,
+    "_loop_guard_note": "End an answer whose generated tokens end in one block repeated verbatim 3 times (>= 24 tokens); finish_reason stop, kv260.finish 'loop'.",
     "_sampling_note": "Server defaults for requests that do not set them (the model card's 0.2 / 0.9, HF's top_k 50).",
     "cma_mb": 360
   },

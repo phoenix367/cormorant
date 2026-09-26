@@ -31,7 +31,11 @@ context, 0 = off) and dry_sequence_breakers (strings; a token containing any
 of them cuts a repeat match; special tokens always do).  Unset ones take the
 server defaults (the model card's temperature 0.2, top_p 0.9; top_k 50 as HF
 generate; DRY on at the usual 0.8 / 1.75 / 2 over the whole context with
-breakers "\n", ":", "\"", "*"; no other penalties).  Without a seed a random
+breakers ":", "\"", "*"; repetition_penalty 1.1 over the last 64 tokens;
+no presence / frequency penalty).  A loop guard (extra field `loop_guard`,
+default true) ends the answer with finish_reason "stop" (kv260.finish
+"loop") when the generated tokens end in a block repeated verbatim
+(3 times, >= 24 tokens) — the last resort if sampling still loops.  Without a seed a random
 one is drawn and returned in kv260.seed, so any answer can be reproduced.
 
 usage.prompt_tokens = prompt ids incl. the leading <|im_start|>;
@@ -56,8 +60,36 @@ from chat_backend import (Backend, BackendError, Cancelled, CancelToken, ChatReq
                           Finish, StopStream)
 from sampler import SamplerParams, make_sampler
 
-# the usual DRY sequence breakers (text-generation-webui / llama.cpp defaults)
-DRY_BREAKERS = ("\n", ":", "\"", "*")
+# DRY sequence breakers.  text-generation-webui / llama.cpp also break at "\n",
+# but then a loop of short lines ("The cat loves her adventures\n\nThis is a
+# short story.\n\n" ...) never builds a run longer than a line and slips
+# through (CHAT_PLAN §15); without it, lists and code were unchanged on the
+# board because ':' / '"' / '*' still cut their structure.
+DRY_BREAKERS = (":", "\"", "*")
+
+# loop guard: stop when the last max(LOOP_REPEATS * p, LOOP_MIN_TOKENS)
+# generated tokens repeat one block of p tokens (1 <= p <= LOOP_MAX_PERIOD)
+LOOP_REPEATS = 3
+LOOP_MIN_TOKENS = 24
+LOOP_MAX_PERIOD = 128
+
+
+def loop_period(gen: Sequence[int]) -> int:
+    """The period p of a verbatim loop at the end of gen, or 0."""
+    n = len(gen)
+    if n < LOOP_MIN_TOKENS:
+        return 0
+    last = gen[-1]
+    for p in range(1, min(LOOP_MAX_PERIOD, n // LOOP_REPEATS) + 1):
+        if gen[-1 - p] != last:                            # cheap necessary condition
+            continue
+        span = max(LOOP_REPEATS * p, LOOP_MIN_TOKENS)
+        if span > n:
+            break
+        tail = gen[-span:]
+        if tail[p:] == tail[:-p]:
+            return p
+    return 0
 from smollm2_tokenizer import Tokenizer
 
 MODEL_ID = "smollm2-135m-instruct"
@@ -170,6 +202,7 @@ class Job:
     last_n: int
     dry_last_n: int = -1
     breakers: Optional[Tuple[str, ...]] = None       # None: the backend's defaults
+    loop_guard: bool = True
     dropped: int = 0
     prepare_ms: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -193,12 +226,13 @@ class Smollm2Backend(Backend):
                  defaults: Optional[SamplerParams] = None, context_size: int = 1024,
                  reserve: int = 256, repeat_last_n: int = 64, prefill_chunk: int = 0,
                  cma_mb: Optional[float] = None, dry_penalty_last_n: int = -1,
-                 dry_sequence_breakers: Sequence[str] = DRY_BREAKERS):
+                 dry_sequence_breakers: Sequence[str] = DRY_BREAKERS, loop_guard: bool = True):
         self.engine = engine
         self.tokenizer_path = tokenizer_path
         self.sampler_lib = sampler_lib
         self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50,
-                                                  dry_multiplier=0.8)
+                                                  repetition_penalty=1.1, dry_multiplier=0.8)
+        self.loop_guard = loop_guard
         self.dry_last_n = dry_penalty_last_n
         self.dry_breakers = tuple(dry_sequence_breakers)
         self._breaker_ids: Dict[Tuple[str, ...], List[int]] = {}
@@ -335,6 +369,11 @@ class Smollm2Backend(Backend):
         dry_n = self._extra(req.raw or {}, "dry_penalty_last_n", -1, None, integer=True)
         dry_n = self.dry_last_n if dry_n is None else dry_n
         breakers = self._breakers_field(req.raw or {})
+        lg = (req.raw or {}).get("loop_guard")
+        if lg is not None and not isinstance(lg, bool):
+            raise BackendError("Invalid type for 'loop_guard': expected a boolean.", "loop_guard",
+                               code="invalid_type")
+        loop_guard = self.loop_guard if lg is None else lg
         msgs = [{"role": "system" if m["role"] == "developer" else m["role"], "content": m["content"]}
                 for m in req.messages]
         reserve = min(req.max_tokens, self.reserve) if req.max_tokens else self.reserve
@@ -349,7 +388,7 @@ class Smollm2Backend(Backend):
             raise BackendError("internal: the chat template must start with <|im_start|>", "messages")
         seed = req.seed if req.seed is not None else random.SystemRandom().getrandbits(63)
         return Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
-                   breakers, dropped, (time.monotonic() - t0) * 1000.0)
+                   breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
 
     # ── prompt -> tokens (FPGA) ──
 
@@ -401,6 +440,7 @@ class Smollm2Backend(Backend):
         dec = tok.incremental_decoder()
         ss = StopStream(job.stops)
         n_gen, n_decode, lib_ms, smp_ms = 0, 0, 0.0, 0.0
+        loop_p = 0
         t_first: Optional[float] = None
         finish = None
         while True:
@@ -423,6 +463,11 @@ class Smollm2Backend(Backend):
                     yield Delta(out)
                 if stopped:
                     finish = "stop_string"
+                    break
+            if job.loop_guard:
+                per = loop_period(history[len(prompt):])
+                if per:
+                    finish, loop_p = "loop", per
                     break
             if job.max_tokens is not None and n_gen >= job.max_tokens:
                 finish = "max_tokens"
@@ -463,6 +508,7 @@ class Smollm2Backend(Backend):
                 "decode_tok_s": round(rate, 2), "library_decode_ms": round(lib_ms, 1),
                 "sampler_ms": round(smp_ms, 1), "prepare_ms": round(job.prepare_ms, 1),
                 "trimmed_messages": job.dropped, "context_size": ctx, "seed": job.seed,
+                "loop_period": loop_p, "loop_guard": job.loop_guard,
                 "sampler": dict(p.as_dict(), repeat_last_n=last_n, dry_penalty_last_n=dry_n,
                                 dry_sequence_breakers=list(self._breakers_set or ()),
                                 impl=getattr(smp, "kind", "?")),
