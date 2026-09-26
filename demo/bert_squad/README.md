@@ -262,6 +262,25 @@ unchanged.  MatMul linears 7661 → **492 ms** (ConvKernel 1×4 convs,
 head); the host ops (GELU 2046 ms, Softmax 1070, LayerNorm 338, Transpose
 165) are now 83 % of the time.
 
+**Phase 2A + 2B — current main** (MatMuls on ConvKernel, cacheable buffer
+pool, GELU / exp tables, 4 host threads; same bitstream; BERT_PLAN §3):
+**971 ms per inference** (min 963, max 997 over 20; **12.5× faster than
+phase 1**, ~1.03 inferences/s), logits bit-exact with the simulation
+(3 / 3) and the emulation (20 / 20), EM / F1 90.0 / 91.7 unchanged.
+Per inference:
+
+| kind | layers | phase 1 | now |
+|---|---:|---:|---:|
+| MatMul linears (ConvKernel) | 74 | 7661 ms | 492 ms |
+| attention MatMuls (ConvKernel, per head) | 24 | 750 ms | 136 ms |
+| Softmax (host, exp table, 4 threads) | 12 | 1072 ms | 125 ms |
+| VectorOP | 126 | 97 ms | 94 ms |
+| LayerNorm (host, 4 threads) | 25 | 340 ms | 83 ms |
+| Transpose (host, cacheable) | 49 | 169 ms | 31 ms |
+| GELU (host, table) | 12 | 2049 ms | 17 ms |
+| other | 5 | 3 ms | 0.2 ms |
+| **wall** | | **12131 ms** | **971 ms** |
+
 ## Options (`deploy_and_run.py`)
 
 | Flag | Effect |

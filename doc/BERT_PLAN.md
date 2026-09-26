@@ -10,9 +10,9 @@ Status: **phase 1 done and merged to main (2026-09-26)** — scheduler side
 (1b–1f), demo (1g) and the `max_k` 4096 bitstream (1a); BERT-base
 runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
-Phase 2 (performance): **2A (MatMuls on ConvKernel) 12.13 → 4.34 s** and
-**2B (host ops) 12.13 → 8.79 s** measured separately, both bit-exact (§3);
-combined measurement in §3 "Phase 2A + 2B".
+Phase 2 (performance): **2A + 2B merged — 12.13 s → 971 ms per inference
+(12.5×)**, logits bit-exact, EM / F1 unchanged (§3 "Phase 2A + 2B").  2A
+alone 4.34 s, 2B alone 8.79 s.
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -466,3 +466,35 @@ on / off × 1 / 4 threads × profiling) nor in two repeat N = 20 profile runs
 with telemetry (per-CPU liveness probe every 2 s, PSI cpu ≤ 6 %, io ≤ 3.5 %,
 memory 0, no blocked daemons, no journal watchdog / dbus timeouts, 1.33 GHz
 throughout, AMS ≤ 34 °C, latency flat).  Root cause unknown.
+
+### Phase 2A + 2B combined on the board (2026-09-26, main af350ca)
+
+Same bitstream (MatmulKernel max_k 4096).  `deploy_and_run.py --n 20
+--profile-layers`: **971.3 ms per inference** (min 963.0, max 996.9;
+1.03 inferences/s; `inference_init` 0.4 s) — **12.5× phase 1**.  Logits
+bit-exact with the scheduler simulation (3 / 3) and the emulation (20 / 20);
+EM / F1 90.0 / 91.7, 19 / 20 same span as float (unchanged).
+
+| kind | layers | phase 1 | 2A | 2B | **2A + 2B** |
+|---|---:|---:|---:|---:|---:|
+| MatMul linears | 74 | 7661 | 492 | 7661 | **492** |
+| attention MatMuls | 24 | 750 | 136 | 750 | **136** |
+| Softmax | 12 | 1072 | 1070 | 140 | **125** |
+| VectorOP | 126 | 97 | 97 | 97 | **94** |
+| LayerNorm | 25 | 340 | 338 | 92 | **83** |
+| Transpose | 49 | 169 | 165 | 35 | **31** |
+| GELU | 12 | 2049 | 2046 | 20 | **17** |
+| **wall (ms)** | | **12131** | **4337** | **8790** | **971** |
+
+The merge needed one test fix: phase 2B's coherency audit did not know
+phase 2A's per-head `run_conv_at()` loop (`if (_i) kernel_wait(...)`); it
+does now, and a mutation check shows it still reports a dropped flush or
+invalidate around those calls.  Same session: 148 / 148 board models; CNN
+demos ResNet-18 60.3 ms, MobileNet v1 81.0, v2 63.9, MNIST 0.268 / 5.445 ms,
+predictions identical.
+
+**What is left** (per inference): linears 492 ms at ~44 GMAC/s (86 % of the
+512-MAC grid at 100 MHz) — the clock or int8 would be next; attention
+136 ms (P·V is weight-request-latency bound, §3 Phase 2A); softmax 125 ms
+and LayerNorm 83 ms (double arithmetic); VectorOP 94 ms (bias / residual /
+mask adds — fusable into the conv drain).
