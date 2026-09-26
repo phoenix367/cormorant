@@ -43,8 +43,8 @@ channels (per head for q, k, P); the kernels never see it:
                   a = float32(float32(pos) * inv_j), cos = float32(cos(a)), sin likewise
     V cache write (p_bits policies) v re-rounded to the cache's exponent
     Softmax       over the causal row (keys 0..pos): k = raw_max - raw_j (integer),
-                  e_j = exp(-k * 2^-f_s * 0.125)  (the 1/sqrt(64) lives here; a
-                  65 536-entry table per f_s, filled with libm exp),
+                  e_j = exp(-k * 2^-f_s * scale), scale = 1/sqrt(head_dim) (0.125 for
+                  SmolLM2; a 65 536-entry table per f_s, filled with libm exp),
                   p_j = e_j / sum(e) (left to right), written at f_p
     SiLU*up       a = silu(g) * u, silu(g) = g / (1 + exp(-g)) (a 65 536-entry
                   double table per f_g, libm exp), written at f_a
@@ -59,6 +59,11 @@ channels (per head for q, k, P); the kernels never see it:
                   e_j = exp(s_j - max s) (libm), sum left to right, p_j = e_j / sum,
                   o[d] = sum_j p_j·v_j[d] (j ascending, from the first product),
                   written at f_pv = f_p + f_vc - 8 (the p12 formats; P is never quantised)
+    mixed         (pow2+sink+p12+mix, phase 5): prefill calls (forward(phase="prefill"),
+                  also every teacher-forced run) use the p12 attention above (q.K^T and
+                  P.V as kernel MatMuls, softmax P at 2^-12 on the host; the FPGA
+                  kernels in the library), decode steps (phase="decode") the xattn
+                  region; both read / write the same K / V caches at the same exponents
   float residual  float32 host tensor (policies other than q88).
   sink            position 0 (<|im_start|>) is not run on the datapath: its K / V
                   rows (a float run of that token, written at the cache exponents)
@@ -260,11 +265,13 @@ def dot8(prod):
             + ((acc[:, 4] + acc[:, 5]) + (acc[:, 6] + acc[:, 7])))
 
 
-def exp_table(f_s):
-    """e[k] = exp(-k * 2^-f_s * 0.125), k = raw_max - raw in [0, 65535] (libm exp)."""
-    if f_s not in _exp_tab:
-        _exp_tab[f_s] = np.array([math.exp(-k / 2.0 ** f_s * 0.125) for k in range(65536)])
-    return _exp_tab[f_s]
+def exp_table(f_s, scale=0.125):
+    """e[k] = exp(-k * 2^-f_s * scale), k = raw_max - raw in [0, 65535] (libm exp);
+    scale = 1/sqrt(head_dim) (0.125 for head_dim 64: the values of the study's
+    first runs, which hard-coded it)."""
+    if (f_s, scale) not in _exp_tab:
+        _exp_tab[(f_s, scale)] = np.array([math.exp(-k / 2.0 ** f_s * scale) for k in range(65536)])
+    return _exp_tab[(f_s, scale)]
 
 
 def silu_table(f_g, off=0.0):
@@ -363,7 +370,10 @@ class Model:
         self.bf = bool(self.pol.get("bf16"))               # yardstick: float path, bf16 at every boundary
         self.floor_fix = bool(self.pol.get("floor_fix"))
         self.hattn = bool(self.pol.get("hattn"))           # attention as one float host region
-        self.xattn = bool(self.pol.get("xattn"))           # ... with a fixed operation order (C-exact)
+        # ... with a fixed operation order (C-exact): True = always; "decode" = only in
+        # decode steps, prefill attention per the p_bits formats (the mixed policy)
+        self.xattn_mode = self.pol.get("xattn") or False
+        self.phase = "prefill"                             # forward(..., phase=)
         if self.bf:
             self.q = False
         self.fmt = fmt or {}
@@ -498,6 +508,12 @@ class Model:
         r = 1.0 / np.sqrt(ss / h.shape[1] + self.cfg.eps)
         return self.host((h * r[:, None]) * gamma, cls, l, self.E(cls, l))
 
+    @property
+    def xattn(self):
+        """xattn applies to this forward call (policy xattn, or the mixed policy's
+        decode steps)."""
+        return self.xattn_mode is True or (self.xattn_mode == "decode" and self.phase == "decode")
+
     def rope(self, x, pos, cls, l):                      # x [T, nh, HD]
         T, nh, HD = x.shape
         c, s = self.cos[pos][:, None, :], self.sin[pos][:, None, :]
@@ -533,7 +549,7 @@ class Model:
             raw = np.rint(s * p2(fs)).astype(np.int64)
             m = np.where(mask, raw, -(1 << 20)).max(-1, keepdims=True)
             k = np.where(mask, m - raw, 0)
-            e = np.where(mask, exp_table(int(fs))[k], 0.0)
+            e = np.where(mask, exp_table(int(fs), 1.0 / math.sqrt(self.cfg.HD))[k], 0.0)
         return self.host(e / np.cumsum(e, -1)[..., -1:], "p", l, fp, record=False)
 
     def silu_mul(self, g, u, l):
@@ -615,11 +631,14 @@ class Model:
         s.n = 1
         return lg
 
-    def forward(self, seqs, toks, want="last"):
+    def forward(self, seqs, toks, want="last", phase="prefill"):
         """Run the new tokens toks[i] of every sequence seqs[i] (prefill: one
         sequence, many tokens; batched decode: many sequences, one token each —
         numerically identical, every row is independent).  Returns per sequence
-        the logits of its last position or of all its new positions."""
+        the logits of its last position or of all its new positions.
+        phase: "prefill" or "decode" — only the mixed policy (xattn "decode")
+        computes them differently: p12 attention in prefill, xattn in decode."""
+        self.phase = phase
         if not self.sink:
             return self._forward(seqs, toks, want)
         pre, new = [], []
@@ -692,7 +711,8 @@ def greedy(model, prompts, max_new=MAX_NEW):
         active = [i for i in active if nxt[i] != EOS and len(out[i]) < max_new]
         if not active:
             break
-        lg = model.forward([seqs[i] for i in active], [np.array([nxt[i]]) for i in active])
+        lg = model.forward([seqs[i] for i in active], [np.array([nxt[i]]) for i in active],
+                           phase="decode")
         for i, x in zip(active, lg):
             nxt[i] = int(np.argmax(x[-1]))
     return out
@@ -759,6 +779,10 @@ POLICIES = {
     "pow2+sink+hattn":       dict(_RF, sink=True, fmt="pow2", hattn=True),
     # phase 3's shipped policy: the p12 formats, attention as the C-exact host region
     "pow2+sink+p12+xattn":   dict(_RF, sink=True, fmt="pow2", p_bits=12, xattn=True),
+    # phase 5 (CHAT_PLAN §16): prefill attention on the FPGA kernels as in pow2+sink+p12
+    # (q.K^T and P.V on ConvKernel, P at 2^-12 on the host), decode attention the xattn
+    # host region; the same formats and caches
+    "pow2+sink+p12+mix":     dict(_RF, sink=True, fmt="pow2", p_bits=12, xattn="decode"),
 }
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")
