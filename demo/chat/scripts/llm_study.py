@@ -49,6 +49,16 @@ channels (per head for q, k, P); the kernels never see it:
     SiLU*up       a = silu(g) * u, silu(g) = g / (1 + exp(-g)) (a 65 536-entry
                   double table per f_g, libm exp), written at f_a
     attention     (hattn policies only) q.K^T, softmax, P.V in double, one write-back
+                  (numpy / BLAS order).  xattn (the shipped policy of phase 3,
+                  pow2+sink+p12+xattn): the same region with every operation order
+                  fixed so that C reproduces it bit for bit — per query row t and
+                  head h over the keys j <= pos(t): RoPE(q) unquantised,
+                  s_j = dot8(q, k_j) * (1/sqrt(HD)) with dot8 = 8 lane sums
+                  acc_l = sum_a q[8a+l]·k[8a+l] (a ascending, starting from the first
+                  product) combined ((acc0+acc1)+(acc2+acc3))+((acc4+acc5)+(acc6+acc7)),
+                  e_j = exp(s_j - max s) (libm), sum left to right, p_j = e_j / sum,
+                  o[d] = sum_j p_j·v_j[d] (j ascending, from the first product),
+                  written at f_pv = f_p + f_vc - 8 (the p12 formats; P is never quantised)
   float residual  float32 host tensor (policies other than q88).
   sink            position 0 (<|im_start|>) is not run on the datapath: its K / V
                   rows (a float run of that token, written at the cache exponents)
@@ -237,6 +247,17 @@ def rope_tables(cfg, n):
 # ------------------------------------------------------------------ numerics
 I16_LO, I16_HI = -32768, 32767
 _exp_tab, _silu_tab = {}, {}
+libm_exp = np.vectorize(math.exp, otypes=[np.float64])   # glibc exp, elementwise (not numpy's SIMD)
+
+
+def dot8(prod):
+    """Row sums of prod [n, HD] in the xattn order: 8 lanes acc_l = sum over a
+    (ascending, starting from the first product) of prod[:, 8a + l], combined
+    ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))."""
+    n, hd = prod.shape
+    acc = np.cumsum(prod.reshape(n, hd // 8, 8), axis=1)[:, -1, :]
+    return (((acc[:, 0] + acc[:, 1]) + (acc[:, 2] + acc[:, 3]))
+            + ((acc[:, 4] + acc[:, 5]) + (acc[:, 6] + acc[:, 7])))
 
 
 def exp_table(f_s):
@@ -342,6 +363,7 @@ class Model:
         self.bf = bool(self.pol.get("bf16"))               # yardstick: float path, bf16 at every boundary
         self.floor_fix = bool(self.pol.get("floor_fix"))
         self.hattn = bool(self.pol.get("hattn"))           # attention as one float host region
+        self.xattn = bool(self.pol.get("xattn"))           # ... with a fixed operation order (C-exact)
         if self.bf:
             self.q = False
         self.fmt = fmt or {}
@@ -484,7 +506,7 @@ class Model:
         e = self.E(cls, l)
         e = np.repeat(np.asarray(e, np.int64), HD) if np.ndim(e) else e
         y = (x * c + rot * s).reshape(T, nh * HD)
-        if self.hattn and cls == "q":                   # RoPE(q) stays inside the float attention region
+        if (self.hattn or self.xattn) and cls == "q":   # RoPE(q) stays inside the float attention region
             self.stats.add(cls, l, float(np.abs(y).max()), 0, y.size)
             return y.reshape(T, nh, HD)
         return self.host(y, cls, l, e).reshape(T, nh, HD)
@@ -532,6 +554,19 @@ class Model:
         T, S, HD = q.shape[0], K.shape[1], cfg.HD
         mask = np.arange(S)[None, :] <= (n0 + np.arange(T))[:, None]
         out = np.empty((T, cfg.H, HD))
+        if self.q and self.xattn:
+            # host region with a fixed operation order (the phase-3 C code):
+            # see the module docstring (xattn); values double, one write-back
+            scale = 1.0 / math.sqrt(HD)
+            for h in range(cfg.H):
+                g = self.grp[h]
+                for t in range(T):
+                    n = n0 + t + 1                          # keys 0 .. pos(t)
+                    s = dot8(q[t, h][None, :] * K[g, :n]) * scale
+                    e = libm_exp(s - s.max())
+                    p = e / np.cumsum(e)[-1]
+                    out[t, h] = np.cumsum(p[:, None] * V[g, :n], axis=0)[-1]
+            return self.host(out.reshape(T, -1), "pv", l, self.E("pv", l)).reshape(T, cfg.H, HD)
         if self.q and self.hattn:
             # host region: s = q.k (exact in double), softmax in double, P.V in double,
             # one round-half-even write-back of the [T, H*HD] output at f_pv
@@ -722,6 +757,8 @@ POLICIES = {
     "pow2+sink+p12+in6":     dict(_RF, sink=True, fmt="pow2", p_bits=12, in_cap=6),
     "pow2+sink+p12+fw":      dict(_RF, sink=True, fmt="pow2", p_bits=12, float_weights=True),
     "pow2+sink+hattn":       dict(_RF, sink=True, fmt="pow2", hattn=True),
+    # phase 3's shipped policy: the p12 formats, attention as the C-exact host region
+    "pow2+sink+p12+xattn":   dict(_RF, sink=True, fmt="pow2", p_bits=12, xattn=True),
 }
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")
