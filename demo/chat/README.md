@@ -353,6 +353,34 @@ serialised with inference; the request that triggers a load logs
 `load=…ms`.  `/health` shows `loaded` per model, `resident`, `cma_free_mb`,
 `loads` / `unloads`.  After an eviction the prefix cache starts empty.
 
+### SmolLM2-360M-Instruct instead of 135M
+
+The same backend runs SmolLM2-360M-Instruct (CHAT_PLAN §20): bit-exact on
+the board, ~3.9 tokens/s decode (135M: ~10), TTFT ~1 s, better answers; its
+pool is 740 MiB, so it and BERT swap under `--resident auto`.
+
+```bash
+cd demo/chat
+D=assets/smollm2-360m-instruct; mkdir -p $D     # the Hugging Face checkpoint (Apache-2.0)
+R=https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main
+for f in config.json generation_config.json model.safetensors tokenizer.json \
+         tokenizer_config.json special_tokens_map.json vocab.json merges.txt; do
+    curl -sSfL -o $D/$f $R/$f; done           # the tokenizer files equal 135M's
+cp assets/smollm2-135m-instruct/*_wikitext2_*.txt $D/
+../../.venv-export/bin/python scripts/llm_study.py formats --assets assets/smollm2-360m-instruct
+                                          # -> assets/study/smollm2-360m-instruct/ (2 min)
+$PY scripts/generate_llm_project.py --assets assets/smollm2-360m-instruct \
+    --model-name smollm2-360m-instruct   # -> build/llm_project_smollm2_360m (~6 min, 32 GB RAM)
+$PY deploy.py --stop
+$PY scripts/llm_board.py --install-only --project build/llm_project_smollm2_360m
+                                          # -> lib/libsmollm2_360m.so, /root/smollm2_360m_weights
+```
+
+Then point `smollm2.lib` at `/root/kv260_chat/lib/libsmollm2_360m.so`, set
+`smollm2.cma_mb` to 760 and run `deploy.py`: the server serves the model the
+library names (`llm_model_name()`), `smollm2-360m-instruct`
+(`smollm2.model_id` / `--llm-model-id` override it).
+
 ### Without the FPGA
 
 ```bash

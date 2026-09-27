@@ -30,6 +30,7 @@ KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26/27):
 | MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
 | BERT-base SQuAD (bertsquad-12, 256 tokens) | **971 ms** per inference, EM/F1 equal to float32 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
+| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md) |
 
 The BERT and SmolLM2 logits are bit-exact with the scheduler's simulation.
 The FPGA design uses 81 % of the DSPs (1009 / 1248), 73 % of the LUTs,

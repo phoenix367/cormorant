@@ -8,8 +8,9 @@ on the FPGA, 256-token prefill 3.6 → 1.3 s (§16); decode attention on all hos
 threads, 5.06 tok/s at position 32 and 4.39 at 1000 (§17).  Board-hang
 workaround in §18.  Dual-port weight streaming (MatmulKernel's GEMV mode):
 one weight copy, decode **10.07 tok/s** at position 32 and 7.67 at 1000,
-CMA pool 488 → 286 MiB (§19).  Not done: q/k/v + gate/up fusion, int8
-weights.  §7 is the pre-implementation estimate; measured numbers are in
+CMA pool 488 → 286 MiB (§19).  SmolLM2-360M-Instruct: bit-exact on the
+board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  Not done:
+q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
 
@@ -1624,4 +1625,79 @@ BERT (`libbert_squad.so`) had to be regenerated with the new code generator:
 its `run_matmul()` now writes `gemv_kw` / `a_to_b` on every call — a library
 generated before the registers existed would inherit the `gemv_kw` a
 SmolLM2 decode left in the kernel (`deploy.py --regenerate --rebuild`).
+
+## 20. SmolLM2-360M-Instruct (2026-09-28)
+
+**Model.**  `HuggingFaceTB/SmolLM2-360M-Instruct` (Apache-2.0, revision
+a10cc15): 32 layers, hidden 960, 15 / 5 heads of 64, FFN 2560, vocab 49152,
+tied embedding, RoPE theta 100000 — the same Llama graph as 135M, and a
+byte-identical tokenizer (tokenizer, template and prompt sets carry over).
+Assets in `demo/chat/assets/smollm2-360m-instruct/` (not in git, 724 MB).
+The study and the formats of a model other than 135M live in
+`assets/study/<model dir>/` (`llm_study.study_dir`).
+
+**Numerics** (`llm_study.py study --assets assets/smollm2-360m-instruct`,
+the §10 data, 38 min):
+
+| policy | top-1 all | top-1 resp | top-1 held | top-5 held | KL held | ppl (float 12.373) | greedy identical |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bf16 | 0.9923 | 0.9873 | 0.9782 | 1.0000 | 0.0006 | 12.395 | 6 / 12 |
+| pow2+sink+p12 | 0.9777 | 0.9936 | 0.9759 | 0.9997 | 0.0018 | 12.394 | 8 / 12 |
+| **pow2+sink+p12+mix** (shipped) | 0.9777 | 0.9936 | 0.9759 | 0.9997 | 0.0018 | **12.394** | 8 / 12 |
+
+360M keeps the float perplexity as well as bf16 does (135M: 15.616 vs
+15.598).  `validate`: numpy float64 = torch float32 to 1.5e-4 in the
+logits, greedy identical 12 / 12.  Formats: 450 exponent entries, no weight
+saturates.
+
+**Project** (`generate_llm_project.py --assets assets/smollm2-360m-instruct
+--model-name smollm2-360m-instruct` → `build/llm_project_smollm2_360m`):
+prefill 224 / 224 MatMuls on ConvKernel (kw = 4), decode 225 on the GEMV
+path in the same images (§19): one copy of every weight.  Pool **740.2
+MiB** (weights 690.0, KV caches 40.0, intermediates 10.25) — inside
+`cma=1000M` — host tables 90.2 MiB, weight files 818 MB.
+
+Generating it first ran out of the host's 46 GB (the kernel killed it at
+40 GB): every scheduled node held its NodeProto, which pins the whole
+shape-inferred ModelProto with its initializers, and each of the five
+entries kept its own copy of every weight array.  Fixed in the scheduler —
+`OnnxGraph` keeps detached NodeProto copies, `src/llm_entries.entry_graphs`
+consumes the entry models one at a time and shares equal weight arrays
+between the entries: SmolLM2-135M's generation peaks at 12.6 GB instead of
+17.9, 360M's at 31.9 GB.  `llm_project.make_codegens` builds the checks'
+simulations the same way.
+
+**Gates.**  `llm_sched_check.py --assets ...`: the scheduler simulation
+equals the study emulation bit for bit (3 prompts × 32 decode steps and a
+second turn at position 69; 23 min, 27 GB).  Board (`llm_board.py --project
+build/llm_project_smollm2_360m --study-json .../gate2.json --reopen`): logits
+bit-exact on all 4 × 33 vectors, greedy tokens = the study emulation's,
+chunked prefill / threads / re-open identical.  `llm_lib_check.py`'s
+4 MB CMA rule missed by 0.4 MB (page cache, as in §19).
+
+**Board** (same bitstream as §19):
+
+| | SmolLM2-360M | SmolLM2-135M (§19) |
+|---|---:|---:|
+| decode at position 32 / 256 / 1000 | 256 / 270 / 306 ms (3.9 / 3.7 / 3.3 tok/s) | 99 / 107 / 130 ms |
+| prefill 16 / 64 / 256 tokens | 0.83 / 1.00 / 2.90 s | 0.34 / 0.44 / 1.28 s |
+| `llm_open` cached / cold (SD card) | 1.5–1.7 s / 58.8 s | 0.6–0.7 s |
+| CMA used | 736–740 MB | ~300 MB |
+
+Decode is weight-bandwidth bound as for 135M: 690 MiB per token at ~3.1 GB/s
+≈ 233 ms of the 256.  Through the chat API (the §19 conversation,
+temperature 0): TTFT 0.97–1.00 s, decode 3.87–3.97 tok/s; the answers are
+short and on topic (the Louvre, Notre-Dame, and a one-sentence summary
+naming three landmarks) where 135M's ran to the 64-token limit.
+With both models resident the 740 MiB pool and BERT's ~224 MB do not fit
+together: `--resident auto` swaps them (a BERT question after a SmolLM2
+turn took 15.1 s, the next SmolLM2 turn 10.3 s, both including the swap).
+
+**Deploying it.**  `llm_board.py` installs a model other than 135M next to
+it: `lib/libsmollm2_360m.so`, `/root/smollm2_360m_weights`,
+`llm_project_smollm2_360m` (`board_paths`).  The server serves the model
+the library names (`llm_model_name()`; `smollm2.model_id` /
+`--llm-model-id` override): set `smollm2.lib` to
+`/root/kv260_chat/lib/libsmollm2_360m.so` and `smollm2.cma_mb` to 760 in
+`chat_config.json`.  The board runs 135M by default.
 

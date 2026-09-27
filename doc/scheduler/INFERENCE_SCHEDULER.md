@@ -903,6 +903,10 @@ smaller buckets reuse them, and decode / head read the same images with
 `matmul_gemv_kw`.  SmolLM2-135M: all 211 decode MatMuls on the GEMV path
 (210 in the prefill's `kw = 4` image, the LM head row-major), 421 → 211
 weight buffers, CMA pool 488.2 → 285.8 MiB, weight files 538 → 326 MB.
+`entry_graphs` also consumes the entry models one at a time and points
+equal weight arrays of the entries at one copy (and `OnnxGraph` keeps
+detached NodeProto copies, which do not pin their ModelProto): generating
+SmolLM2-360M peaks at 32 GB of host memory instead of running out of 46.
 `test/test_matmul_gemv.py` covers the pass; `test/test_llama.py` builds
 the four-entry tiny project this way and runs it on the host emulation,
 whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
