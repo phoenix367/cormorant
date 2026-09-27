@@ -582,6 +582,7 @@ The reported **GB/s** accounts for this: `ports × size × outer × 2B / lat`.
 | `a_stride` | Elements between A batch slices (`n×k` for batched, `0` to broadcast A) |
 | `b_stride` | Elements between B batch slices (`k×m` for batched, `0` to broadcast B) |
 | `b_packed` | Optional (default 0): 1 = B is in the packed tile-major layout `[ceil(m/32)][k][32]` (MATMUL_OPTIMISATION §3b) |
+| `gemv_kw` | Optional (default 0): 1 / 2 / 4 / 8 = the GEMV streaming path with B in the ConvKernel image of that kernel width (MATMUL_OPTIMISATION §8b); `b_packed` is then ignored |
 | `iters` | Timed iterations |
 
 Reported metric: **GOps/s** = `2 × batch × n × k × m / lat`.
@@ -680,7 +681,7 @@ After all cases run, the script prints a per-kernel table.  The sample below
 was recorded on the board in May 2026 (commit 56b60cb, before the 128-bit
 kernel ports, the packed-B MatmulKernel and the ConvKernel 2-D grid) with the
 48-case config of that time; the format is current, the numbers are not
-(today's `perf_config.json` has 55 cases):
+(today's `perf_config.json` has 60 cases):
 
 ```
   VectorOPKernel
@@ -910,7 +911,7 @@ Tracked templates (copy, then edit the copy):
 |-------------|--------|---------|
 | `bitstream_config_kv260.json.example` | `upload_bitstream.py` | Load Cormorant bitstream + xclbin + DTBO onto the board |
 | `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 148 models over all four kernels |
-| `perf_config.json` / `perf_config.json.example` | `run_remote_perf.py` | Performance benchmarks — 55 cases |
+| `perf_config.json` / `perf_config.json.example` | `run_remote_perf.py` | Performance benchmarks — 60 cases |
 
 Per-subset copies such as `remote_config_vectorop.json`, `remote_config_conv.json`
 or `remote_config_all_models.json` are local working files (not tracked):

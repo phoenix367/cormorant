@@ -14,7 +14,8 @@ For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 > ping-pong prefetch, `kTileM = 32`) have **landed**, followed by
 > `max_k` 2048 → 4096 (§9).  The RTL stand runs 39 fixtures; every §4–§8
 > table compares against the §3b kernel on the same 39 cases.  §9b has
-> the on-board numbers after Track A.
+> the on-board numbers after Track A.  §8b (2026-09-27) adds a second
+> datapath, the GEMV streaming mode for one-row MatMuls.
 
 ---
 
@@ -767,6 +768,103 @@ kernel had before this track.
 
 ---
 
+## 8b. GEMV streaming mode (`gemv_kw`, `a_to_b`, 2026-09-27)
+
+**Why.**  After Track A a one-row MatMul (batch-1 FC layer, LLM decode
+linear, LM head) sits at the B-port bound: the tiled path takes one B word
+per cycle (§9b: FC 1×1280×1001 at ≈ 1.5 GB/s of the 1.6 GB/s read
+channel), while port `a` idles after the one A row.  And a Llama project
+kept every linear twice in CMA — the packed copy the tiled path reads for
+decode and ConvKernel's x image for prefill (CHAT_PLAN §13.1: 202 MiB of
+the SmolLM2-135M pool; for SmolLM2-360M the two copies alone are 1.2 GiB,
+more than the board's CMA).
+
+**Change.**  Two AXI-Lite registers appended after `b_packed`: `gemv_kw`
+(0x74) and `a_to_b` (0x7C, 64-bit).  `gemv_kw = 1 / 2 / 4 / 8` routes the
+call to `gemv_run()`, a DATAFLOW region (MATMUL_KERNEL.md §1 and §4):
+
+* B is read in the image ConvKernel reads for a MatMul lowered with kernel
+  width `kw` (`img[(c·m + p)·kw + j] = B[(c/16)·16·kw + j·16 + c%16][p]`;
+  `kw = 1` is row-major B), so decode and prefill share one buffer;
+* each A row streams the image once, planes `[0, ⌈P/2⌉)` through port `a`
+  (reaching B at `a_to_b` bytes from its base — an `m_axi` port only knows
+  its own base register) and the rest through port `b`, one word per port
+  per cycle, requests ≤ 256 / ≤ 64 words with 4 / 16 in flight;
+* two MAC processes (8 products, group-sum tree by `kw`, one accumulator
+  word per plane word) keep all `m` columns on chip — `kGemvMaxM` (JSON
+  `gemv_max_m`, 4096) per pass, wider `m` in equal column chunks — and the
+  writer adds the two partial sums (modular adds: bit-identical to the
+  tiled path) and writes C in one burst per row;
+* requirements: `k % 8 == 0` (`k % (16 kw) == 0` for `kw > 1`),
+  `m % 8 == 0`, `m · kw ≥ 64` (a plane is ≥ 8 words: time for the next
+  plane's taps and the accumulator RMW distance), aligned `a`, `b` and
+  batch strides.
+
+**Iteration.**  The first version kept the A row in plane order in 8 BRAM
+banks per MAC, the accumulators in 8 BRAM banks, word FIFOs in BRAM, and
+computed request addresses in the request cycle: BRAM 80 → 144 BRAM18
+(the whole design had ~65 BRAM18 left), slack −1.55 ns at 150 MHz in the
+request loop.  The final version keeps the A row in natural order (one
+128-bit word per 8 elements) and fetches the next plane's `kw` taps over
+the current plane's first `kw` words, packs 8 accumulators into one URAM
+word addressed by the word's index in its plane (no collisions between
+neighbouring words), puts the word FIFOs in LUTRAM and precomputes the
+next request in registers.
+
+**Result (HLS, 150 MHz).**  II=1 on every GEMV loop, slack 0.00 ns.  Whole
+kernel BRAM 80 → 88 BRAM18, URAM 0 → 8, DSP 49 → 86, FF 24.9 → 35.6 k,
+LUT 41.8 → 60.9 k (HLS estimates; the GEMV region alone: 8 BRAM18, 8 URAM,
+37 DSP, 18.7 k LUT).  C-sim 58/58 (19 GEMV cases, B built as the kw image
+of the reference's row-major B: every kw, the SmolLM2-135M / 360M decode
+shapes, `K = kMaxK`, several rows, batches with A or B broadcast, 2 and 3
+column chunks, saturation); a mutated tap selection fails all kw > 1
+cases.  C/RTL co-simulation PASS with 15 GEMV cases in RTL (the four
+largest exceed the cosim buffers; the cosim depths were raised for these
+cases, which put A and B in one buffer handed to both ports) and no
+deadlock.  Co-simulated time per call (150 MHz) is within 3–5 % of two
+words per cycle:
+
+| Case | cosim | ideal (words / 2) |
+|---|---:|---:|
+| 1 × 576 × 192, kw = 4 | 7,288 cycles | 6,912 |
+| 1 × 960 × 320, kw = 4 | 19,748 | 19,200 |
+| 1 × 4096 × 64, kw = 8 | 17,055 | 16,384 |
+
+**Scheduler.**  `src/matmul_gemv.py` moves single-row MatmulNodes to the
+path (`--matmul-gemv auto`), `src/llm_entries.py` makes a Llama project's
+decode read the prefill images: SmolLM2-135M keeps 211 weight buffers
+instead of 421, CMA pool 488.2 → 285.8 MiB, weight files 538 → 326 MB
+(INFERENCE_SCHEDULER.md §MatMul GEMV streaming).
+
+**On board** (bitstream WNS +0.671 ns, WHS +0.010 ns at 100 MHz; placed
+LUT 85.5 k → 93.3 k (79.7 %), BRAM 111.5 → 115.5 tiles, URAM 48 → 56, DSP
+1009 → 1058).  The new registers read back after a write (0x74, 0x7C /
+0x80).  `run_remote_tests.py`: 148 / 148 PASS (one model on the GEMV
+path, `mm_packed_fc_512x1000`; everything else unchanged on the tiled
+path).  `run_remote_perf.py`, one-row MatMuls, packed tiled → GEMV:
+
+| 1 × K × M | tiled (packed) | GEMV kw = 1 | GEMV kw = 4 | |
+|---|---:|---:|---:|---:|
+| 576 × 192 | 0.158 ms | 0.078 ms | 0.078 ms | 2.0× |
+| 576 × 1536 (SmolLM2 gate / up) | 1.219 ms | 0.577 ms | 0.577 ms | 2.1× |
+| 1536 × 576 (SmolLM2 down) | 1.180 ms | 0.568 ms | 0.568 ms | 2.1× |
+| 960 × 2560 (360M gate / up) | 3.291 ms | 1.572 ms | 1.573 ms | 2.1× |
+| 2560 × 960 (360M down) | 3.245 ms | 1.557 ms | 1.556 ms | 2.1× |
+| 512 × 1000 (ResNet-18 classifier) | 0.720 ms | 0.338 ms | 0.338 ms | 2.1× |
+| 576 × 49152 (SmolLM2 LM head, 12 chunks) | 38.78 ms | 18.26 ms | — | 2.1× |
+
+B streams at 3.07–3.16 GB/s (the tiled path 1.40–1.52), 96–99 % of the two
+128-bit read ports at 100 MHz; kw = 1 and kw = 4 cost the same.  The tiled
+cases are unchanged (64³ 0.225 ms, 256³ packed 7.17 ms).  SmolLM2-135M
+(CHAT_PLAN §19): one weight copy, logits bit-exact on every board gate,
+decode 197 → 99 ms per token at position 32 (5.1 → 10.1 tokens / s).
+
+A project generated before these registers existed never writes them: run
+after a GEMV call it would inherit `gemv_kw != 0`.  Regenerate the demo
+projects and libraries with the new bitstream (as for `b_packed`, §3b).
+
+---
+
 ## 9. Verification matrix
 
 | Gate | Command | Result after §8 |
@@ -774,6 +872,12 @@ kernel had before this track.
 | C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` 23/23 bit-exact against `cblas_sgemm`, §9a; 24/24 since `max_k = 4096`) |
 | HLS synthesis | `make synthesize_matmul_kv260` | II=1 on every loop, slack 0.00 ns at 150 MHz; BRAM 80, DSP 49, LUT 41.8 k |
 | RTL behavior test | `make behavior_test_matmul` | 39/39 pass (test stand with per-test alternating DDR base); per-case timings in the §4–§8 tables |
+
+**After §8b (GEMV, 2026-09-27):** C-simulation 58/58 (19 GEMV cases), C/RTL
+co-simulation PASS (15 GEMV cases in RTL), synthesis II=1 / slack 0.00 ns
+with BRAM 88, URAM 8, DSP 86, LUT 60.9 k; the test stand's `matmul_tb`
+reads manifests with the new `gemv_kw` column and programs `gemv_kw` /
+`a_to_b` (the checked-in 39 fixtures are unchanged).
 
 **`max_k` 2048 → 4096 (2026-09-25).**  `platforms/kv260.json`
 `kernels.matmul.max_k` doubled for BERT's FFN down-projection (`K = 3072`).
@@ -835,7 +939,7 @@ ResNet-18 311 → 310 ms through their classifiers; predictions identical.
 
 | File | Purpose |
 |---|---|
-| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (single sequential loop nest) |
+| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (tiled loop nest + the §8b GEMV dataflow) |
 | `doc/kernels/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
 | `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
 | `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (39 cases, `manifest.txt`) |

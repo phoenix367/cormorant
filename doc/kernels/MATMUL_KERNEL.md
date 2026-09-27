@@ -14,6 +14,12 @@ an II=1 K-reduction loop. Row-lane rotation (`n1 = ki % kTileN`) breaks the
 accumulator read-after-write hazard so the inner loop sustains one K-step per
 clock across `kTileM` parallel MAC lanes.
 
+A second datapath, the **GEMV streaming mode** (`gemv_kw != 0`, below and
+MATMUL_OPTIMISATION.md §8b), serves one A row against a large B — batch-1
+FC layers and LLM decode — by streaming B once per row through **both**
+read ports, in the ConvKernel input image a MatMul lowered onto ConvKernel
+reads, so a weight both kernels use needs one DDR copy.
+
 ---
 
 ## 1. AXI Interface
@@ -22,7 +28,7 @@ clock across `kTileM` parallel MAC lanes.
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (MATMUL_OPTIMISATION §3); requests ≤ 256 words, 4 outstanding |
+| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (MATMUL_OPTIMISATION §3); requests ≤ 256 words, 4 outstanding.  GEMV mode: then half of B's image, at `a_to_b` bytes from `a` |
 | `gmem1` | `b` | Read | Matrix B `[k][m]`, row-major or packed (below) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat; requests ≤ 64 words, 16 outstanding |
 | `gmem2` | `c` | Write | Matrix C `[n][m]`, row-major — 16-bit element port (`Data_t*`; HLS reports `Widen Fail` for it, the runtime row stride `m` gives no alignment guarantee) |
 
@@ -42,7 +48,14 @@ writes concurrently.
 | `b_batch_stride` | `unsigned` | Elements to advance `b` per batch step (0 = broadcast) |
 | `c_batch_stride` | `unsigned` | Elements to advance `c` per batch step |
 | `b_packed` | `unsigned` | 0: `b` is row-major `[k][m]`; 1: `b` holds the tile-major packed image (below); `b_batch_stride` is then in packed elements |
+| `gemv_kw` | `unsigned` | 0: the tiled path; 1 / 2 / 4 / 8: the GEMV streaming path, `b` in the kernel-width-`gemv_kw` image (below; `b_packed` ignored).  Offset 0x74 |
+| `a_to_b` | `int64_t` | GEMV only: address of `b` minus address of `a`, in bytes — port `a` reaches its half of B through it (an `m_axi` port only knows its own base).  Offset 0x7C |
 | `return` | — | `ap_ctrl_hs` (start / done / idle / ready) |
+
+`gemv_kw` and `a_to_b` keep their values across calls like every register:
+a program must write them on every call (the scheduler's `run_matmul()`
+does), and a project generated before they existed must be regenerated to
+run after one that set them.
 
 Memory layout is row-major: `A[row·k + col]`, `B[row·m + col]`,
 `C[row·m + col]`.  `a` and `b` must be 16-byte aligned base addresses;
@@ -71,6 +84,31 @@ with `m` zero-padded to `ceil(m / kTileM) · kTileM`, i.e. one contiguous
 Each batch slice is `k · packed_m` elements.  Activations as B keep the
 row-major layout (`b_packed = 0`).
 
+**GEMV streaming mode (`gemv_kw != 0`, MATMUL_OPTIMISATION §8b).**  B is
+read in the image ConvKernel reads for a MatMul lowered with kernel width
+`kw` (`conv_lowered_b_image` in the scheduler, `matmul_gemv_index()` in
+`MatmulKernel.h`):
+
+```
+img[(c · m + p) · kw + j] = B[(c / 16) · 16 · kw + j · 16 + c % 16][p]     (c < k / kw, p < m, j < kw)
+```
+
+`kw = 1` is plain row-major B.  A 128-bit word holds 8 consecutive `(p, j)`
+of one "plane" `c`: `8 / kw` output columns times `kw` taps.  Each A row
+streams the whole image once — planes `[0, ⌈P/2⌉)` through port `a` (after
+the A row itself), the rest through port `b` — at one word per port per
+cycle; each half multiplies a word by its plane's `kw` x values, sums the
+lanes in groups of `kw` and accumulates `8 / kw` columns per cycle on chip
+(URAM, one word per word of a plane).  The writer adds the two partial
+sums (modular fixed-point adds, so the result equals the tiled path's) and
+writes C row-major with the same saturation.  `m` wider than `kGemvMaxM`
+is split into equal column chunks (one run per plane each).
+Requirements (the scheduler's `matmul_gemv.ineligible_reason`): `kw ∈ {1,
+2, 4, 8}`; `k % 8 == 0`, `k % (16 · kw) == 0` for `kw > 1`, `k ≤ kMaxK`;
+`m % 8 == 0` and `m · kw ≥ 64` (a plane spans ≥ 8 words: the next plane's
+taps are fetched and the accumulator read-modify-write completes within
+it); 16-byte aligned `a`, `b` and batch strides that are multiples of 8.
+
 ---
 
 ## 2. Compile-Time Configuration (`Config.h.in`)
@@ -78,8 +116,8 @@ row-major layout (`b_packed = 0`).
 CMake substitutes the data types (`MM_DATA_TYPE`, `MM_ACC_DATA_TYPE` cache
 variables) and the tile constants into `Config.h`.  The tile constants have
 no CMake defaults: they are read from `kernels.matmul` (`tile_n`, `tile_m`,
-`tile_k`, `max_k`) of `platforms/<AXI_PLATFORM>.json` (values below are
-`kv260.json`); the scheduler reads the same fields through
+`tile_k`, `max_k`, `gemv_max_m`) of `platforms/<AXI_PLATFORM>.json` (values
+below are `kv260.json`); the scheduler reads the same fields through
 `inference-scheduler/src/_matmul_hw_config.py`.
 
 | Constant | Default | Purpose |
@@ -90,6 +128,7 @@ no CMake defaults: they are read from `kernels.matmul` (`tile_n`, `tile_m`,
 | `kTileM` | 32 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2, multiple of 8 (16 until MATMUL_OPTIMISATION.md §8) |
 | `kTileK` | 256 | On-chip B-buffer K-slice depth. Power of 2 (so `k_tile` indexing needs no divider) |
 | `kMaxK` | 4096 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf`. Models with `K > kMaxK` are rejected by the scheduler (2048 until BERT's `K = 3072` FFN down-projection) |
+| `kGemvMaxM` | 4096 | GEMV mode (`gemv_max_m`): output columns one pass over B accumulates on chip per read stream; a wider `m` is split into column chunks, so it is not a bound.  Multiple of 8; 0 builds no GEMV path (the scheduler then never selects it) |
 
 If CMake cannot find `ap_fixed.h` it still falls back to `float` /
 `double`, but that configuration no longer builds: `MatmulKernel.h`
@@ -229,6 +268,31 @@ written out to `C`.
 | `PIPELINE II=1` | a_buf load / first-block b_tile drain / K-reduction (+ prefetch) / C write | One iteration per clock |
 | `UNROLL` | inner `m1` loop + the `acc` clear | `kTileM` parallel MAC lanes |
 
+### GEMV streaming path (`gemv_kw != 0`)
+
+`gemv_run()` computes the geometry (`planes = k / kw`, the plane split, the
+column chunks) and calls one `DATAFLOW` region of five processes that all
+loop over the same jobs (batch slice × A row × column chunk):
+
+| Process | Port | Work (II=1 loops) |
+|---|---|---|
+| `gemv_read_a` | `a` | the A row (≤ 2 requests) → `xs0` and `xs1`; then planes `[0, ⌈P/2⌉)` of B → `ws0` |
+| `gemv_read_b` | `b` | planes `[⌈P/2⌉, P)` → `ws1` |
+| `gemv_mac<0/1>` | — | A row into `xn` (one word per cycle); per B word: 8 products with the plane's taps, a group-sum tree, read-modify-write of one accumulator word; then the chunk's columns → `ps0/1` |
+| `gemv_write` | `c` | `ps0 + ps1`, `saturate_cast`, one sequential burst per job |
+
+The read processes issue ≤ 256- / ≤ 64-word requests (the ports' burst
+lengths) with at most 4 / 16 in flight, from the same loop that drains the
+words; the next request's address and length sit in registers, so
+`read_request` costs no arithmetic in its cycle.  A MAC keeps the A row in
+natural order (`xn[kMaxK / 8]`, BRAM) and fetches the next plane's `kw` taps
+over the current plane's first `kw` words; its accumulator (`acc[kGemvMaxM]`
+of 8 × 32 bits, `AGGREGATE`d into one URAM word) takes word `q` of a plane at
+address `q`, so consecutive words never collide and address `q` recurs one
+plane — ≥ 8 cycles — later (`DEPENDENCE inter false`).  The first plane of a
+stream overwrites instead of accumulating (no clear pass).  The word FIFOs
+are LUTRAM (depth 32).
+
 ---
 
 ## 5. II=1 Strategy — Accumulator Lane Rotation
@@ -307,7 +371,7 @@ widening the operands first, at one 16×16 DSP per column instead of two
 
 ## 8. Test Coverage (`TestMatmulSim.cpp`)
 
-C-simulation tests compiled with GCC (CTest name `TestMatmulRef`, 39
+C-simulation tests compiled with GCC (CTest name `TestMatmulRef`, 58
 cases). Each case runs `MatmulKernel` against `ref_matmul_2d()` — a naive
 triple-nested-loop oracle that uses the same `AccData_t` accumulation and
 `saturate_cast<Data_t>` output, so results are bitwise-identical (exact
@@ -325,6 +389,7 @@ comparison).
 | K-split (§5 of the optimisation log) | `1×261×19`, `2×13×5`, `3×517×33`, row-major and packed |
 | B prefetch (§7) | `batch=3, 6×517×35` (`k_tiles=3`, `m_tiles=3`, `n_tiles=2`), with and without B broadcast, both layouts |
 | Saturation | `a=100`, `b=±100`, `K=3` → `AP_MAX` / `AP_MIN` |
+| GEMV streaming (19) | `kw` 1 / 2 / 4 / 8 at the minimum plane (`m · kw = 64`); SmolLM2-135M / 360M decode shapes (`576×192`, `576×1536`, `1536×576`, `960×320`, `2560×960`); `K = kMaxK`; odd word counts; three A rows; 2 and 3 column chunks (`m > kGemvMaxM`); batch with both / B / A advancing; saturation at `K = 8` — B built as the kw image of the reference's row-major B |
 
 A second test, **`TestMatmulBlas.cpp`**, validates the configured kernel
 (`ap_fixed<16,8>`) bit-exactly against `cblas_sgemm` when a BLAS library is
@@ -335,9 +400,14 @@ kernel's own `saturate_cast` before comparing (shapes, large K up to
 `kMaxK`, sums of exactly −128 / +128 at `K = 2048` plus a `K = kMaxK`
 saturation case, batches, packed B); 24 cases.
 `make gen_matmul_test_data` re-runs the reference in `--dump-data` mode to
-emit hex fixtures (A / B / C_ref per case plus a `manifest.txt` with a
-`b_packed` column) into `build/matmul_test_data/`; the RTL behaviour test
-reads the checked-in copy under `hw/test_data/matmul_test_data/`.
+emit hex fixtures (A / B / C_ref per case plus a `manifest.txt` with
+`b_packed` and `gemv_kw` columns; GEMV cases with B over 64 k elements are
+left out) into `build/matmul_test_data/`; the RTL behaviour test reads the
+checked-in copy under `hw/test_data/matmul_test_data/` (manifests with or
+without the `gemv_kw` column).  `make cosim_matmul_kv260` runs the same
+cases in C/RTL co-simulation; GEMV cases put A and B in one buffer (port
+`a` reaches B at `a_to_b`) and those larger than the cosim depths are
+skipped.
 
 ---
 
@@ -350,6 +420,17 @@ reads the checked-in copy under `hw/test_data/matmul_test_data/`.
 - Enforces `k ≤ kMaxK`.
 - Supports batched matmul and stride-0 batch broadcasting; a row-strided
   decomposition handles alignment-gapped buffers.
+
+**GEMV (`src/matmul_gemv.py`, `MatmulNode.gemv_kw`).**  After the
+ConvKernel lowering, single-row MatmulNodes (`n == 1`, any batch) that meet
+the GEMV requirements above switch to the streaming path where
+`cost_model.gemv_cycles` beats the tiled `matmul_cycles` (`--matmul-gemv
+auto`, the default; `always` / `off`): a constant B then stays row-major
+(`kw = 1`, never packed) or, when `OnnxGraph(matmul_gemv_kw={name: kw})`
+names it, is emitted in ConvKernel's kw image.  `src/llm_entries.py` uses
+that for the Llama projects: the prefill buckets choose power-of-two kernel
+widths, the decode and head graphs read the same images, and the project
+keeps one copy of every weight (SmolLM2-135M: CMA pool 488 → 286 MiB).
 
 `Gemm` is **not** a matmul node directly — `OnnxGraph._preprocess_model()`
 decomposes `Gemm` into `MatMul` + optional `Add` at model-load time, so the
@@ -406,9 +487,11 @@ uses is `build/kernels/matmul/<name>/matmul_<name>/hls/impl/ip`).
 | `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
 | `kernels/matmul/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
 | `kernels/matmul/scripts/Cosim.tcl.in` | csynth + C/RTL co-simulation TCL template |
-| `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`) |
+| `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`, `gemv_max_m`) |
 | `inference-scheduler/src/_matmul_hw_config.py` | Scheduler-side reader of the same bounds |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |
+| `inference-scheduler/src/matmul_gemv.py` | GEMV selection pass (eligibility, cost, B image) |
+| `inference-scheduler/src/llm_entries.py` | Llama entry graphs sharing one image per weight |
 | `inference-scheduler/src/codegen/_source.py` | `run_matmul()` / `run_matmul_at()` code generation |
 | `inference-scheduler/src/graph.py` | `Gemm` → `MatMul` + `Add` decomposition |
 

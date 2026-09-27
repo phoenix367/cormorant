@@ -6,9 +6,11 @@ server (§9); phase 2 numeric study GO (§10); phase 3 SmolLM2-135M
 backends on the board (§12, §14), DRY sampling (§15); phase 5 prefill attention
 on the FPGA, 256-token prefill 3.6 → 1.3 s (§16); decode attention on all host
 threads, 5.06 tok/s at position 32 and 4.39 at 1000 (§17).  Board-hang
-workaround in §18.  Not done: dual-port weight streaming, q/k/v + gate/up
-fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers
-are in §13.4, §16.3 and §17.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
+workaround in §18.  Dual-port weight streaming (MatmulKernel's GEMV mode):
+one weight copy, decode **10.07 tok/s** at position 32 and 7.67 at 1000,
+CMA pool 488 → 286 MiB (§19).  Not done: q/k/v + gate/up fusion, int8
+weights.  §7 is the pre-implementation estimate; measured numbers are in
+§13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
@@ -1566,3 +1568,60 @@ state (each one locks a core); use the serial console (FT4232H channel B,
 115200) — `/proc/interrupts` twice (a frozen `arch_timer` column), SysRq-l (a
 core that prints no backtrace).  Do not read PMU RAM over JTAG on a live
 system: it wedged the PMU and then CPU0.
+
+## 19. One weight copy and dual-port decode: MatmulKernel GEMV (2026-09-27)
+
+**What.**  MatmulKernel gained a GEMV streaming mode (`gemv_kw`, `a_to_b`;
+MATMUL_KERNEL.md §1, MATMUL_OPTIMISATION.md §8b) for one-row MatMuls: B is
+streamed once per A row through **both** read ports, in the image ConvKernel
+reads for the prefill MatMuls (kernel width `kw`).  The scheduler's
+`src/llm_entries.py` builds the prefill buckets first (power-of-two kernel
+widths, `kw = 4` for every SmolLM2 linear), then the decode and head graphs
+reading the same images (`OnnxGraph(matmul_gemv_kw=...)`); multi.py keeps one
+buffer per weight.  This is the "dual-port / HPC1 weight streaming" of §13.6
+and removes its "Two weight copies" item.
+
+**Pool.**  421 → 211 weight buffers (210 linears + the LM head, none
+renamed), weights 459.0 → 256.5 MiB, CMA pool 488.2 → 285.8 MiB, weight
+files 538 → 326 MB.  `smollm2.cma_mb` 510 → 330 (example config, deploy
+default, `--llm-cma-mb`).  SmolLM2-360M by the same arithmetic: layer
+weights 600 MiB + LM head 90 + KV caches 40 + ~12 ≈ 742 MiB, inside
+`cma=1000M`.
+
+**Board** (new bitstream, WNS +0.671 ns; `llm_bench -D 32,256,1000 -S 8`
+and `llm_board.py --skip-build --reopen`):
+
+| | before (§17) | GEMV |
+|---|---:|---:|
+| decode at position 32 | 197.3 ms (5.07 tok/s) | **99.3 ms (10.07 tok/s)** |
+| decode at 256 | 203.2 ms | 106.5 ms |
+| decode at 1000 | 228.3 ms (4.38 tok/s) | 130.4 ms (7.67 tok/s) |
+| prefill 16 / 64 / 256 | 367 / 466 / 1317 ms | 340 / 444 / 1279 ms |
+| `llm_open` (weights cached) | 1.0 s | 0.6–0.7 s |
+
+The decode checksums are identical to the pre-GEMV build (FNV 186711104 /
+3694798025 / 1483111907), the logits bit-exact with the simulation on all
+4 × 33 vectors, chunked prefill / threads / close → open identical.  Decode
+is still weight-bandwidth bound: 256 MiB per token at ~3.1 GB/s (the two
+read ports at 100 MHz) ≈ 87 ms of the 99; the prefill gain is the LM head
+of the head entry (39 → 18 ms).  `llm_lib_check.py`'s `abs(CmaFree after
+close − before open) < 4 MB` rule failed on 2 of 3 runs by 10 MB: the value
+after close stays at 872–875 MB over four cycles while the one before open
+moves with the page cache (the newly uploaded weight files) — no drift, no
+leak.
+
+Through the chat API (temperature 0, both models resident; the first turn
+had 24 tokens in the prefix cache from an earlier request):
+
+| turn | cached / prefilled tokens | TTFT | decode |
+|---|---|---:|---:|
+| "What is the capital of France?" | 24 / 13 | 348 ms | 9.8 tok/s |
+| "What is a famous museum there?" | 100 / 19 | 434 ms | 9.6 tok/s |
+| "Tell me one more fact about that city." | 182 / 21 | 456 ms | 9.3 tok/s |
+| "Thanks! Now summarise our conversation in one sentence." | 266 / 23 | 468 ms | 9.1 tok/s |
+
+BERT (`libbert_squad.so`) had to be regenerated with the new code generator:
+its `run_matmul()` now writes `gemv_kw` / `a_to_b` on every call — a library
+generated before the registers existed would inherit the `gemv_kw` a
+SmolLM2 decode left in the kernel (`deploy.py --regenerate --rebuild`).
+

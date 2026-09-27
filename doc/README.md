@@ -91,4 +91,4 @@ line at the top says what is done.
 | [CONV_2D_GRID_PLAN](plans/CONV_2D_GRID_PLAN.md) | The 2-D MAC grid for ConvKernel: executed, then grown further by RESNET18_15FPS_PLAN |
 | [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (60.3 ms = 16.6 FPS) |
 | [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference, accuracy equal to float32 |
-| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~5 tokens/s), sampling, attention, and the board-hang workaround (§18) |
+| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18) and the one-copy GEMV decode (§19) |

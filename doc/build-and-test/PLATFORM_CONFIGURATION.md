@@ -128,10 +128,15 @@ and the B block buffer `b_tile[tile_m][2·tile_k]` at compile time. See
 | `tile_m` | power of 2, multiple of 8; any `M` works (residual-padded) | Column tile / unroll factor; also the width of the packed-B DDR layout |
 | `tile_k` | power of 2; any `K` works (residual-padded) | K-loop tile (B block rows) |
 | `max_k` | `k ≤ max_k`; multiple of 8 | Hard upper bound on the inner dimension; sizes the row staging buffer. `MatMul` nodes with `k > max_k` are rejected at scheduling |
+| `gemv_max_m` | multiple of 8; 0 = no GEMV path | GEMV streaming mode (`gemv_kw`, MATMUL_KERNEL.md §1): output columns one pass over B accumulates on chip per read stream (one URAM word per 8 columns); a wider `m` is split into column chunks inside the kernel, so it bounds nothing |
 
 The Python side reads `max_k` (validation), `tile_m` (the packed-B
-layout the scheduler emits for constant B operands) and `tile_n` (engine
-cost model only). `tile_k` is a pure C++ tiling factor.
+layout the scheduler emits for constant B operands), `tile_n` (engine
+cost model only) and `gemv_max_m` (whether the GEMV path exists, and the
+cost model's column chunks). `tile_k` is a pure C++ tiling factor.
+Setting `gemv_max_m` to 0 also changes the generated `run_matmul()`: it
+then does not write the `gemv_kw` / `a_to_b` registers, so projects
+build against drivers without them.
 
 ---
 

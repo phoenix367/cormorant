@@ -18,7 +18,7 @@ Two backends:
 * **`smollm2-135m-instruct`** (phases 3–5, [below](#generative-chat--smollm2-135m-instruct)):
   **generative chat** with SmolLM2-135M-Instruct — multi-turn, streamed token
   by token.  `libsmollm2.so` runs the model on the FPGA kernels and the A53
-  (~5 tokens/s decode, 256-token prefill 1.3 s, logits bit-exact with the
+  (~10 tokens/s decode, 256-token prefill 1.3 s, logits bit-exact with the
   scheduler simulation); tokenizer, chat template, sampling and prefix
   cache run in the server process.
 
@@ -307,14 +307,15 @@ messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, blo
   `context_size`, `seed`, `loop_period`, `loop_guard`, `sampler` (the
   settings used).  Log line:
   `... reuse=135/152 prefill=17tok/185ms decode=10.9tok/s why=max_tokens ...`.
-* **Speed** (measured on the board, CHAT_PLAN §13.4, §16.3, §17): decode
-  **~5 tokens/s** at short context — 198 ms per token at position 32, 204 at
-  256, 212 at 512, 228 at 1000 (weight-bandwidth bound, ~195 ms; the host
-  attention adds the rest and grows with the position); prefill
-  0.37 / 0.47 / 1.32 s for 16 / 64 / 256 new tokens (prefill attention on
-  the FPGA since phase 5; 3.6 s for 256 before), so the first answer of a
-  chat starts after ~0.45–1.3 s and a follow-up turn of a few tens of new
-  tokens after ~0.45 s.  Host overhead per token on the board's A53:
+* **Speed** (measured on the board, CHAT_PLAN §13.4, §16.3, §17, §19):
+  decode **~10 tokens/s** at short context — 99 ms per token at position
+  32, 107 at 256, 130 at 1000 (weight-bandwidth bound: MatmulKernel's GEMV
+  mode streams the 256 MiB of weights through both read ports at ~3.1 GB/s,
+  ~87 ms; the host attention adds the rest and grows with the position;
+  ~5 tokens/s before §19); prefill 0.34 / 0.44 / 1.28 s for 16 / 64 / 256
+  new tokens (prefill attention on the FPGA since phase 5; 3.6 s for 256
+  before), so the first answer of a chat starts after ~0.35–1.3 s and a
+  follow-up turn of a few tens of new tokens after ~0.45 s.  Host overhead per token on the board's A53:
   sampling 0.8–2 ms (C; greedy / the default settings; ~2.5 ms with DRY),
   detokenizing 6 µs.
 * **Quality.**  A 135M model: fluent, often wrong on facts and arithmetic
@@ -334,11 +335,12 @@ The capital of France is Paris.
 
 ### Two models, one FPGA — residency
 
-BERT holds ~224 MB of CMA, SmolLM2 ~490 MB (a 488 MiB pool: both weight
-copies, the LM head, the KV caches and the intermediates, CHAT_PLAN §16.3;
-`smollm2.cma_mb` is 510 in the example config — the server's own
-`--llm-cma-mb` default, 360, is too low for `auto`); idle CmaFree on the
-board was 626–813 MB of 1000.  `--resident` decides what stays loaded:
+BERT holds ~224 MB of CMA, SmolLM2 ~300 MB (a 286 MiB pool: one copy of
+every weight — decode reads the prefill image through MatmulKernel's GEMV
+path, MATMUL_OPTIMISATION §8b — the LM head, the KV caches and the
+intermediates; 488 MiB before, with a second weight copy for decode;
+`smollm2.cma_mb` is 330 in the example config, pool plus page-cache
+margin); idle CmaFree on the board was 626–813 MB of 1000.  `--resident` decides what stays loaded:
 
 | mode | behaviour |
 |---|---|
@@ -702,25 +704,30 @@ queue and disconnects.
   frees the FPGA after the current window (request logged at 2.9 s,
   cancelled); the three requests queued behind it ran next.
 
-### smollm2 on the FPGA (2026-09-26 / 27; CHAT_PLAN §16.3, §17)
+### smollm2 on the FPGA (2026-09-26 / 27; CHAT_PLAN §16.3, §17, §19)
 
 A 4-turn conversation through the OpenAI API, temperature 0 (the default
-repetition penalty and DRY apply), both models resident:
+repetition penalty and DRY apply), both models resident — with the GEMV
+decode of CHAT_PLAN §19 (the first turn found 24 tokens in the prefix cache
+from an earlier request):
 
 | turn | cached / prefilled tokens | TTFT | decode |
 |---|---|---:|---:|
-| "What is the capital of France?" | 1 / 36 | 457 ms | 4.9 tok/s |
-| "What is a famous museum there?" | 116 / 19 | 462 ms | 4.8 tok/s |
-| "Tell me one more fact about that city." | 214 / 21 | 480 ms | 4.6 tok/s |
-| "Thanks! Now summarise our conversation in one sentence." | 302 / 22 | 502 ms | 4.5 tok/s |
+| "What is the capital of France?" | 24 / 13 | 348 ms | 9.8 tok/s |
+| "What is a famous museum there?" | 100 / 19 | 434 ms | 9.6 tok/s |
+| "Tell me one more fact about that city." | 182 / 21 | 456 ms | 9.3 tok/s |
+| "Thanks! Now summarise our conversation in one sentence." | 266 / 23 | 468 ms | 9.1 tok/s |
 
-These decode rates predate the decode-attention change of CHAT_PLAN §17
-(2026-09-27), which cut the growth with the position: `llm_bench` decode
-at positions 32 / 256 / 512 / 1000 now takes 198 / 204 / 212 / 228 ms per
-token (before: 197 / 214 / 235 / 271 ms), logits unchanged bit for bit.
+Before §19 (2026-09-26: two weight copies, decode on the tiled path) the same turns
+ran at 4.9 / 4.8 / 4.6 / 4.5 tok/s with TTFT 457–502 ms.  `llm_bench`
+decode at positions 32 / 256 / 1000 now takes 99 / 107 / 130 ms per token
+(§17: 198 / 204 / 228; before §17: 197 / 214 / 271 ms), logits unchanged
+bit for bit.
 Library: logits bit-exact with the scheduler simulation (4 prompts × 33
-vectors); `llm_open` 1.0 s with the weights in the page cache (35.6 s cold
-from the SD card); pool BO 488 MiB.
+vectors); `llm_open` 0.6–0.7 s with the weights in the page cache (35.6 s
+cold from the SD card before §19, when the weight files were 538 MB; now
+326 MB); pool BO 286 MiB (488 MiB with the second weight copy before
+CHAT_PLAN §19).
 
 ### smollm2 server side (2026-09-26; board CPU only, no FPGA)
 

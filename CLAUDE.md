@@ -107,7 +107,7 @@ emits a complete C project that drives up to four hardware kernels:
 | Kernel | ONNX ops |
 |--------|----------|
 | VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
-| MatmulKernel | `MatMul` — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster) |
+| MatmulKernel | `MatMul` — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster); single-row MatMuls on its GEMV streaming path (`--matmul-gemv`, B through both read ports, in ConvKernel's image where a prefill shares the weight — `doc/kernels/MATMUL_OPTIMISATION.md` §8b) |
 | ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/plans/BERT_PLAN.md` §2 2A) |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
@@ -138,7 +138,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1497 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1507 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -147,6 +147,7 @@ Key source files:
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
 - **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`
 - **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry; ConvKernel (conv-cycle-model port) and MatmulKernel (board-calibrated) cycle estimates
+- **`inference-scheduler/src/matmul_gemv.py`** / **`src/llm_entries.py`** — MatmulKernel GEMV streaming pass (`MatmulNode.gemv_kw`); the Llama entry graphs that let decode read the prefill weight images (one copy per weight)
 - **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side
 - **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations

@@ -71,12 +71,16 @@ Options:
                              Run MatMuls on ConvKernel with swapped operand roles
                              (default auto: where the cost model says it is faster)
   --no-matmul-on-conv        Same as --matmul-on-conv off
+  --matmul-gemv {auto,always,off}
+                             Single-row MatMuls on MatmulKernel's GEMV streaming path
+                             (both read ports; default auto: where the cost model says
+                             it is faster)
 ```
 
-The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns` and
-`matmul_on_conv="auto"`; the `OnnxGraph` library defaults are
-`fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
-`matmul_on_conv="auto"`. The `argparse` epilog (module docstring) of
+The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
+`matmul_on_conv="auto"` and `matmul_gemv="auto"`; the `OnnxGraph` library
+defaults are `fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
+`matmul_on_conv="auto"`, `matmul_gemv="auto"`. The `argparse` epilog (module docstring) of
 `inference_scheduler.py` still describes the original VectorOP-only tool.
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
@@ -170,7 +174,10 @@ src/
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
                          constant-broadcast normalisation
   matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry)
-  cost_model.py          ConvKernel / MatmulKernel cycle estimates
+  matmul_gemv.py         MatmulKernel GEMV streaming pass (single-row MatMuls, B image)
+  llm_entries.py         Llama entry graphs: prefill kernel widths shared with the
+                         GEMV decode, one copy of every weight
+  cost_model.py          ConvKernel / MatmulKernel (tiled + GEMV) cycle estimates
   _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
                          platform JSON resolvers (kernels.{conv,matmul,pool})
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
@@ -201,7 +208,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              61 pytest modules, 1497 tests collected (1492 pass, 5 skip;
+  test_*.py              62 pytest modules, 1507 tests collected (1502 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -259,7 +266,14 @@ With `OnnxGraph(fuse_act=True)` (CLI default) a following `Relu` /
 
 **MatmulNode** — MatmulKernel: `MatMul`. Tiled 2-D matrix multiply; supports
 batched matmul and row-strided decomposition for alignment-gapped buffers.
-A constant B read only by MatMuls is packed tile-major (`b_packed = 1`).
+A constant B read only by tiled MatMuls is packed tile-major (`b_packed = 1`).
+Single-row MatMuls take the kernel's GEMV streaming path (`gemv_kw`,
+`src/matmul_gemv.py`): B through both read ports, row-major or — with
+`OnnxGraph(matmul_gemv_kw={name: kw})` — in ConvKernel's kw image, which is
+how a Llama project's decode shares the prefill weights
+(`src/llm_entries.py`).  `run_matmul()` writes `gemv_kw` and `a_to_b` on
+every call; `kernels.matmul.gemv_max_m = 0` turns the path (and those
+register writes) off.
 
 **ConvNode** — ConvKernel: `Conv`. NCHW 2-D convolution with optional bias,
 configurable kernel/stride/pad (incl. `auto_pad`)/dilation. `group=1` or
@@ -584,7 +598,7 @@ Three scripts drive KV260 hardware over SSH:
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (148 models) |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` (55 cases) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` (60 cases) |
 
 All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
 the full reference including the `benchmarks` config section and per-kernel

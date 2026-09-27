@@ -20,7 +20,7 @@ takes its board settings from `bert_squad/bert_squad_config.json`.
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 62.3 ms = 16 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (971 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M-Instruct | chat messages over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming): question answering over a user-supplied document (`bert-squad`, ~1 s per 256-token window) and generative multi-turn chat (`smollm2-135m-instruct`, ~5 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M-Instruct | chat messages over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming): question answering over a user-supplied document (`bert-squad`, ~1 s per 256-token window) and generative multi-turn chat (`smollm2-135m-instruct`, ~10 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
 
 ## Common workflow
 

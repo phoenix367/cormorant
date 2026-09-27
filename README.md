@@ -29,7 +29,7 @@ KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26/27):
 | MobileNet V1 / V2, 224×224 | 81.0 / 63.9 ms per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
 | MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
 | BERT-base SQuAD (bertsquad-12, 256 tokens) | **971 ms** per inference, EM/F1 equal to float32 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
-| SmolLM2-135M-Instruct | **5.06 tokens/s** decode (4.39 at 1000 cached tokens), 256-token prefill 1.31 s | [CHAT_PLAN §17](doc/plans/CHAT_PLAN.md) |
+| SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
 
 The BERT and SmolLM2 logits are bit-exact with the scheduler's simulation.
 The FPGA design uses 81 % of the DSPs (1009 / 1248), 73 % of the LUTs,
@@ -132,7 +132,7 @@ ctest
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1497 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1507 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -188,7 +188,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1497 tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1507 tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (121 tests) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make TestSimulation TestConvRef TestConvGrid TestMatmulRef TestPoolingSim && ctest` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |

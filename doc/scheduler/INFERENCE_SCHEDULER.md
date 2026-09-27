@@ -23,7 +23,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
-| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster) |
+| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); single-row MatMuls take its GEMV streaming path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
 
@@ -111,7 +111,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1497 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1507 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -198,8 +198,13 @@ inference_scheduler.py          CLI, argument parsing
    `MatmulConvNode`s, their constant B re-laid out when `kw > 1`
    ([§MatMul on ConvKernel](#matmul-on-convkernel)); `matmul_conv_kw`
    ({weight: kw}) pins kernel widths (a multi-entry project's prefill
-   buckets must re-lay out a shared weight identically).
-12. `_pack_matmul_weights()` (the remaining MatmulNodes), then
+   buckets must re-lay out a shared weight identically), `matmul_conv_kws`
+   limits the widths it may choose.
+12. `matmul_gemv.choose_gemv()` (`matmul_gemv="auto"`, the default) —
+   single-row MatmulNodes switch to MatmulKernel's GEMV streaming path
+   (`gemv_kw`); `matmul_gemv_kw` ({weight: kw}) reads those weights in
+   ConvKernel's kw image ([§MatMul GEMV streaming](#matmul-gemv-streaming)).
+13. `_pack_matmul_weights()` (the remaining tiled MatmulNodes), then
    `_choose_slice_views()` (contiguous Slice pieces that may alias their
    source).
 
@@ -752,7 +757,10 @@ repeated).  One `inference.c` with `inference_run_<name>()` per entry graph:
 * **weights deduplicated** by name AND emitted image: entries that read an
   initializer in the same layout share one DMA buffer; an entry that needs
   another layout (the MatmulKernel packed image vs a MatMul-on-ConvKernel
-  image) gets its own copy renamed `<name>@<k>`;
+  image) gets its own copy renamed `<name>@<k>` — `src/llm_entries.py`
+  schedules the Llama entries so that decode reads the prefill image
+  through the GEMV path and no copy is needed
+  ([§MatMul GEMV streaming](#matmul-gemv-streaming));
 * **states shared by name** (shape, host kind and exponents must agree);
 * entries never run concurrently, so the **intermediates of all entries
   overlap** in one pool region (each entry keeps its own liveness-coloured
@@ -862,6 +870,43 @@ the board the MatMuls take 0.63 s (linears 0.49 s at ~44 GMAC/s, attention
 0.14 s) and BERT-base 4.34 s per inference instead of 12.13 s, logits
 bit-exact — BERT_PLAN §3 "Phase 2A".
 
+### MatMul GEMV streaming
+
+MatmulKernel's second datapath (MATMUL_KERNEL.md §1, MATMUL_OPTIMISATION
+§8b): `gemv_kw != 0` streams B once per A row through both of the kernel's
+read ports (port `a` reaches its half of B through the `a_to_b` register)
+at one 128-bit word per port per cycle, accumulating every output column
+on chip; the tiled path takes one B word per cycle.  B is read in the
+image ConvKernel reads for a MatMul lowered with kernel width `kw`
+(`conv_lowered_b_image`; `kw = 1` is row-major B), so the prefill and
+decode graphs of a Llama project read the same buffer.
+
+`src/matmul_gemv.py` (`OnnxGraph(matmul_gemv=...)`, CLI `--matmul-gemv
+{auto,always,off}`) runs after the ConvKernel lowering.  A MatmulNode takes
+the path when the platform's kernel has it (`kernels.matmul.gemv_max_m >
+0`), the element type is `ap_fixed<16,8>`, `outer_count == 1`, `n == 1`,
+`k % 8 == 0` (`k % (16 kw) == 0` for `kw > 1`), `m % 8 == 0`, `m · kw ≥
+64`, the batch strides are multiples of 8 and — in `auto` —
+`cost_model.gemv_cycles` is below the tiled `matmul_cycles`.  The kernel
+width comes from `matmul_gemv_kw` ({constant B: kw}) when that B is read by
+this MatMul only; a B this graph's ConvKernel lowering already re-imaged is
+read in that image; everything else uses `kw = 1`.  A B read by a GEMV node
+is never packed.  `run_matmul()` / `run_matmul_at()` write `gemv_kw` and
+`a_to_b` on every call (the registers persist), which is also why a project
+generated before the registers existed must be regenerated to run after a
+GEMV one.
+
+**Llama projects** (`src/llm_entries.entry_graphs`, used by
+`demo/chat/scripts/generate_llm_project.py`): the largest prefill bucket
+chooses power-of-two kernel widths (`matmul_conv_kws = (1, 2, 4, 8)`), the
+smaller buckets reuse them, and decode / head read the same images with
+`matmul_gemv_kw`.  SmolLM2-135M: all 211 decode MatMuls on the GEMV path
+(210 in the prefill's `kw = 4` image, the LM head row-major), 421 → 211
+weight buffers, CMA pool 488.2 → 285.8 MiB, weight files 538 → 326 MB.
+`test/test_matmul_gemv.py` covers the pass; `test/test_llama.py` builds
+the four-entry tiny project this way and runs it on the host emulation,
+whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
+
 ---
 
 ## Weight layouts
@@ -875,10 +920,11 @@ image and `numel` / the `.dat` file / the DMA buffer follow it, while
 |---|---|---|
 | ConvKernel | weight, bias | tile-major `[M][ceil(C/16)][kH][kW][lanes]`, bias padded to 8 (CONV_OPTIMISATION §2.32 / §2.34); a space-to-depth stem's re-indexed `<W>_s2d` initializer is packed the same way |
 | MatmulKernel | B (constant only) | tile-major `[ceil(M/32)][K][32]`, `b_packed = 1` on every consumer (MATMUL_OPTIMISATION §3b, §8) |
+| MatmulKernel GEMV (`gemv_kw`) | B | row-major for `kw = 1`; for `kw > 1` (a constant named in `matmul_gemv_kw`) the ConvKernel x image of the row below — the same buffer ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | ConvKernel (MatMul on ConvKernel) | B (constant, read only by that MatMul, `kw > 1`) | `x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p]` per batch slice ([§MatMul on ConvKernel](#matmul-on-convkernel)); A needs none |
 
-A MatMul B is packed only when every reader of the tensor is a MatMul
-using it as B with the same `(k, m)` (`OnnxGraph._pack_matmul_weights`);
+A MatMul B is packed only when every reader of the tensor is a tiled
+MatMul using it as B with the same `(k, m)` (`OnnxGraph._pack_matmul_weights`);
 activations and shared constants stay row-major and the kernel reads them
 through its per-row path.
 
