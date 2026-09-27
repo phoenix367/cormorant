@@ -403,10 +403,18 @@ class TestHostEmulation(unittest.TestCase):
         _cfg, _W, _f, fe = tiny()
         kinds = {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),
                  "prefill_16": ("prefill", 16, False), "head": ("head", 1, False)}
-        entries = entry_graphs({n: fe.entry(kind, T, with_head=wh)
-                                for n, (kind, T, wh) in kinds.items()},
-                               matmul_on_conv="always")
+        models = {n: fe.entry(kind, T, with_head=wh) for n, (kind, T, wh) in kinds.items()}
+        entries = entry_graphs(models, matmul_on_conv="always")
         gs = dict(entries)
+        # entry_graphs consumes the models and shares the entries' weight
+        # arrays: one copy per weight in memory
+        self.assertEqual(models, {})
+        w_dec = {t.onnx_name: t for t in gs["decode"].weight_tensors}
+        w_pre = {t.onnx_name: t for t in gs["prefill_16"].weight_tensors}
+        shared = [n for n in w_dec if n in w_pre and w_dec[n].data is not None
+                  and w_dec[n].data.nbytes >= 4096]
+        self.assertTrue(shared)
+        self.assertTrue(all(w_dec[n].data is w_pre[n].data for n in shared))
         self.assertEqual([n for n, _ in entries], ["decode", "prefill_8", "prefill_16", "head"])
         mg = MultiEntryGenerator(entries, "llama_tiny")
         s = mg.summary()

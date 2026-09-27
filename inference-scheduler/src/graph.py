@@ -93,6 +93,13 @@ def _shape_from_type_proto(tp: onnx.TypeProto) -> List[int]:
     return dims
 
 
+def _detached_node(node: onnx.NodeProto) -> onnx.NodeProto:
+    """A standalone copy of ``node``: it keeps no reference to its model."""
+    out = onnx.NodeProto()
+    out.CopyFrom(node)
+    return out
+
+
 class OnnxGraph:
     """Parsed, validated, and resolved ONNX computation graph."""
 
@@ -622,6 +629,11 @@ class OnnxGraph:
             frac_bits = 8
         host_ctx = HostContext(opset=self.opset, consts=self._raw_consts, frac_bits=frac_bits)
         for idx, node in enumerate(graph.node):
+            # A detached copy: a NodeProto taken from graph.node keeps the
+            # whole ModelProto — initializers included — alive for as long as
+            # the scheduled node holds it (the Python protobuf runtime pins a
+            # message's root); a Llama project holds five graphs.
+            node = _detached_node(node)
             if node.domain == LLM_DOMAIN:
                 if node.op_type not in LLM_OP_FACTORIES:
                     raise SchedulerError(
