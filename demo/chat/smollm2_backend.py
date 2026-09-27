@@ -133,11 +133,21 @@ class LibLlmEngine:
         for name, (args, res) in sig.items():
             f = getattr(lib, name)
             f.argtypes, f.restype = args, res
+        if hasattr(lib, "llm_model_name"):             # optional: older / fake libraries
+            lib.llm_model_name.argtypes, lib.llm_model_name.restype = [], ctypes.c_char_p
         return lib
 
     def _err(self, what: str, rc: int) -> LlmLibraryError:
         msg = self.lib.llm_last_error() if self.lib is not None else None
         return LlmLibraryError(f"{what}: {(msg or b'').decode('utf-8', 'replace') or 'error'} (rc {rc})")
+
+    def model_name(self) -> str:
+        """The model the library was generated for (llm_model_name(); the
+        library is loaded, the model is not opened)."""
+        lib = self.lib if self.lib is not None else self._bind()
+        if not hasattr(lib, "llm_model_name"):
+            return ""
+        return (lib.llm_model_name() or b"").decode("utf-8", "replace")
 
     def open(self) -> None:
         if self.lib is not None:
@@ -227,8 +237,19 @@ class Smollm2Backend(Backend):
                  defaults: Optional[SamplerParams] = None, context_size: int = 1024,
                  reserve: int = 256, repeat_last_n: int = 64, prefill_chunk: int = 0,
                  cma_mb: Optional[float] = None, dry_penalty_last_n: int = -1,
-                 dry_sequence_breakers: Sequence[str] = DRY_BREAKERS, loop_guard: bool = True):
+                 dry_sequence_breakers: Sequence[str] = DRY_BREAKERS, loop_guard: bool = True,
+                 model_id: Optional[str] = None):
         self.engine = engine
+        # The served model id: explicit, else the library's own name
+        # (libsmollm2_360m.so reports smollm2-360m-instruct), else MODEL_ID.
+        if model_id is None and callable(getattr(engine, "model_name", None)):
+            try:
+                model_id = engine.model_name() or None
+            except (OSError, AttributeError):
+                model_id = None
+        if model_id:
+            self.model_id = model_id
+            self.fingerprint = f"kv260-{model_id.removesuffix('-instruct')}-pow2+sink+p12"
         self.tokenizer_path = tokenizer_path
         self.sampler_lib = sampler_lib
         self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50,

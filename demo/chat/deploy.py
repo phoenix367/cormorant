@@ -389,6 +389,8 @@ def server_argv(cfg: dict) -> List[str]:
                  "--llm-cma-mb", str(llm["cma_mb"])]
         if llm.get("weights_dir"):
             argv += ["--llm-weights", llm["weights_dir"]]
+        if llm.get("model_id"):
+            argv += ["--llm-model-id", llm["model_id"]]
     if s.get("api_key"):
         argv += ["--api-key-file", f"{d}/api_key"]
     return argv

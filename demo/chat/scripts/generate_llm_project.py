@@ -244,7 +244,9 @@ def driver_dirs_from_config(path: str) -> dict:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-dir", default=DEFAULT_OUT)
+    ap.add_argument("--out-dir", default=None,
+                    help="default: build/llm_project (SmolLM2-135M), "
+                         "build/llm_project_<model> for another --model-name")
     ap.add_argument("--assets", default=None)
     ap.add_argument("--formats", default=None)
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
@@ -258,6 +260,10 @@ def main(argv=None) -> int:
                     help="JSON {kernel: dir}; default: local.driver_dirs of "
                          "demo/bert_squad/bert_squad_config.json")
     args = ap.parse_args(argv)
+    if args.out_dir is None:
+        tag = args.model_name.removesuffix("-instruct").replace("-", "_").replace(".", "_")
+        args.out_dir = (DEFAULT_OUT if args.model_name == "smollm2-135m-instruct"
+                        else f"{DEFAULT_OUT}_{tag}")
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
     cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats)
@@ -296,6 +302,7 @@ def main(argv=None) -> int:
         "model": args.model_name, "context": args.context, "buckets": buckets,
         "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
         "policy": lp.POLICIES[args.prefill_attn],
+        "assets": os.path.abspath(args.assets or lp.default_assets()),
         "formats": os.path.abspath(args.formats or lp.default_formats(args.assets)),
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,
                    "head_dim": cfg.HD, "ffn": cfg.FF, "vocab": cfg.V},

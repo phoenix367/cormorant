@@ -30,6 +30,7 @@ for _p in (HERE, SCHED):
 import llm_study as study                                         # noqa: E402
 from src.codegen import CodeGenerator                             # noqa: E402
 from src.graph import OnnxGraph                                   # noqa: E402
+from src.llm_entries import entry_graphs                         # noqa: E402
 from src.llama import Formats, LlamaConfig, LlamaFrontend, load_safetensors  # noqa: E402
 
 # The shipped numeric policy (llm_study.py) per prefill-attention mode of the
@@ -64,7 +65,7 @@ def default_assets() -> str:
 
 def default_formats(assets: Optional[str] = None) -> str:
     assets = assets or default_assets()
-    return os.path.join(os.path.dirname(assets), "study", f"formats_{FORMATS_POLICY}.json")
+    return os.path.join(study.study_dir(assets), f"formats_{FORMATS_POLICY}.json")
 
 
 def load_model(assets: Optional[str] = None, formats: Optional[str] = None):
@@ -158,6 +159,16 @@ def split_prefill(n: int, buckets: Sequence[int] = BUCKETS,
 def make_codegen(model, name: str, matmul_on_conv="auto") -> CodeGenerator:
     g = OnnxGraph(model, fuse_act=True, s2d_stem=True, matmul_on_conv=matmul_on_conv)
     return CodeGenerator(g, model_path=f"{name}.onnx")
+
+
+def make_codegens(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[str, CodeGenerator]:
+    """{entry: CodeGenerator} of every entry, scheduled like the generated
+    library (src/llm_entries.entry_graphs): one model at a time and the
+    weight arrays shared across entries — per-entry make_codegen holds every
+    weight once per entry, too much for SmolLM2-360M on a 46 GB host.  The
+    simulation does not depend on the engine choices."""
+    return {n: CodeGenerator(g, model_path=f"{n}.onnx")
+            for n, g in entry_graphs(entry_models(fe, buckets))}
 
 
 class SimSession:

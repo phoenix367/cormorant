@@ -11,7 +11,9 @@ times, llm_open time, CMA, and the close / re-open cycle.
   weights weights/*.dat -> <weights_dir>/weights (only changed files)
   build   cmake -DINFERENCE_WEIGHTS_DIR=<weights_dir> + make llm_bench smollm2
           (and build_prof/ with -DINFERENCE_PROFILING=ON when --profile)
-  install <remote dir>/lib/libsmollm2.so (the chat server's default path)
+  install <remote dir>/lib/libsmollm2.so (the chat server's default path);
+          another model (project.json "model") gets its own library, project
+          and weights directory on the board (board_paths)
   run     llm_bench on prompts.bin (the chat prompts' token ids after the
           leading <|im_start|>); logits.bin downloaded
   check   every logits vector against SimSession (llm_project.py), replaying
@@ -56,6 +58,21 @@ DEFAULT_PROJECT = os.path.join(os.path.dirname(HERE), "build", "llm_project")
 REMOTE_DIR = "/root/kv260_chat"
 WEIGHTS_DIR = "/root/smollm2_weights"
 RUN_DIR = "/tmp/llm_bench"
+DEFAULT_MODEL = "smollm2-135m-instruct"
+
+
+def board_paths(model: str) -> dict:
+    """Board locations of a model's library, project sources and weights.
+    SmolLM2-135M keeps the original ones (the chat server's defaults); any
+    other model gets its own, named after it — smollm2-360m-instruct:
+    <remote dir>/lib/libsmollm2_360m.so, <remote dir>/llm_project_smollm2_360m,
+    /root/smollm2_360m_weights."""
+    if model == DEFAULT_MODEL:
+        return {"lib": f"{REMOTE_DIR}/lib/libsmollm2.so", "proj": f"{REMOTE_DIR}/llm_project",
+                "weights": WEIGHTS_DIR}
+    tag = model.removesuffix("-instruct").replace("-", "_").replace(".", "_")
+    return {"lib": f"{REMOTE_DIR}/lib/lib{tag}.so", "proj": f"{REMOTE_DIR}/llm_project_{tag}",
+            "weights": f"/root/{tag}_weights"}
 
 
 def bert_config(path=None) -> dict:
@@ -138,6 +155,7 @@ exit $(cat "$B.rc")
 
 
 def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int,
+          weights_dir: str = WEIGHTS_DIR,
           min_avail_mb: int = 1500, limit_mb: int = 400, psi_max: float = 50.0) -> None:
     """cmake + make llm_bench smollm2 on the board under a memory guard: the
     build starts only with >= min_avail_mb MemAvailable, and is killed when
@@ -159,7 +177,7 @@ def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int
             raise SystemExit(f"build {bdir}: MemAvailable {avail} MB < {min_avail_mb} MB, not building")
         b = f"{remote_proj}/{bdir}"
         cmd = (f"mkdir -p {b} && cmake -S {remote_proj} -B {b} -DCMAKE_BUILD_TYPE=Release "
-               f"-DINFERENCE_TARGET=LINUX -DINFERENCE_WEIGHTS_DIR={WEIGHTS_DIR} "
+               f"-DINFERENCE_TARGET=LINUX -DINFERENCE_WEIGHTS_DIR={weights_dir} "
                f"-DINFERENCE_PROFILING={'ON' if prof else 'OFF'} {defs} > {b}.cmake.log 2>&1 && "
                f"make -C {b} -j{jobs} llm_bench smollm2 > {b}.make.log 2>&1")
         t0 = time.monotonic()
@@ -231,11 +249,11 @@ def breakdown(profile: dict, layers: list, per: int = 1) -> dict:
 def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: str,
                  decode: int, study_json: str = None) -> dict:
     """Replay the board's tokens on SimSession; compare every logits vector."""
-    cfg, W, fmt, fd = lp.load_model()
     summary = json.load(open(os.path.join(project, "project.json")))
+    cfg, W, fmt, fd = lp.load_model(summary.get("assets"), summary.get("formats"))
     fe = lp.frontend(cfg, W, fmt, ctx=summary["context"],
                      prefill_attn=summary.get("prefill_attn", "host"))
-    cgs = {n: lp.make_codegen(m, n, "off") for n, m in lp.entry_models(fe, summary["buckets"]).items()}
+    cgs = lp.make_codegens(fe, summary["buckets"])
     raw = np.fromfile(logits_path, "<f4").reshape(-1, cfg.V)
     study = json.load(open(study_json)) if study_json and os.path.exists(study_json) else {}
     rep, k = {}, 0
@@ -314,27 +332,28 @@ def main(argv=None) -> int:
         try:
             out, _, _ = session.exec("grep -E 'CmaFree|CmaTotal' /proc/meminfo | tr -s ' '", timeout=15)
             print(f"board: {out.strip()}", flush=True)
-            remote_proj = f"{REMOTE_DIR}/llm_project"
+            paths = board_paths(summary.get("model", DEFAULT_MODEL))
+            remote_proj, lib, weights_dir = paths["proj"], paths["lib"], paths["weights"]
             if not args.skip_build:
                 t0 = time.monotonic()
                 n = upload_project(session, args.project, remote_proj)
                 print(f"  upload: {n} files ({time.monotonic() - t0:.0f} s)", flush=True)
-                s = sync_weights(session, Path(args.project) / "weights", WEIGHTS_DIR)
+                s = sync_weights(session, Path(args.project) / "weights", weights_dir)
                 print(f"  weights: {'OK' if s.ok else 'FAIL'} {s.output} ({s.duration:.0f} s)",
                       flush=True)
                 if not s.ok:
                     return 1
                 build(session, remote_proj, cfg, summary["active_kernels"], args.profile,
-                      args.jobs)
+                      args.jobs, weights_dir)
                 session.exec_checked(f"mkdir -p {REMOTE_DIR}/lib && cp {remote_proj}/build/libsmollm2.so "
-                                     f"{REMOTE_DIR}/lib/libsmollm2.so", timeout=30)
-                out, _, _ = session.exec(f"nm -D --defined-only {REMOTE_DIR}/lib/libsmollm2.so "
+                                     f"{lib}", timeout=30)
+                out, _, _ = session.exec(f"nm -D --defined-only {lib} "
                                          f"| awk '{{print $3}}' | sort", timeout=30)
                 syms = [s for s in out.split() if s]
                 results["exported"] = syms
-                print(f"  libsmollm2.so exports: {syms}", flush=True)
+                print(f"  {os.path.basename(lib)} exports: {syms}", flush=True)
                 if args.install_only:
-                    print(f"installed {REMOTE_DIR}/lib/libsmollm2.so (weights {WEIGHTS_DIR})")
+                    print(f"installed {lib} (weights {weights_dir})")
                     return 0
             sftp = session._client.open_sftp()                   # noqa: SLF001
             session.exec_checked(f"mkdir -p {RUN_DIR}", timeout=15)
@@ -360,7 +379,7 @@ def main(argv=None) -> int:
             if not args.no_lib_check:
                 sftp.put(os.path.join(HERE, "llm_lib_check.py"), f"{RUN_DIR}/llm_lib_check.py")
                 out, err, rc = session.exec(f"cd {RUN_DIR} && python3 llm_lib_check.py "
-                                            f"{REMOTE_DIR}/lib/libsmollm2.so", timeout=1800)
+                                            f"{lib}", timeout=1800)
                 line = next((ln for ln in out.splitlines() if ln.startswith("LLM_LIB_CHECK:")), None)
                 results["lib_check"] = json.loads(line.split(":", 1)[1]) if line else {
                     "error": (out + err)[-2000:]}

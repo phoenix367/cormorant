@@ -86,7 +86,10 @@ Assets (not in git, see demo/chat/assets/.gitignore): SMOLLM_ASSETS or
 demo/chat/assets/smollm2-135m-instruct/ (config.json, model.safetensors,
 tokenizer.json, tokenizer_config.json, generation_config.json; `fetch` adds
 heldout_wikitext2_test.txt and calib_wikitext2_valid.txt).  From a git
-worktree the main checkout's assets are used.  Results: <assets>/../study/.
+worktree the main checkout's assets are used; --assets / SMOLLM_ASSETS pick
+another Llama checkpoint (e.g. assets/smollm2-360m-instruct).  Results:
+<assets>/../study/ for SmolLM2-135M, <assets>/../study/<model dir>/ for
+others (study_dir).
 Deterministic: greedy decoding only, no sampling, fixed data.
 """
 import argparse, collections, json, math, os, struct, subprocess, sys, time
@@ -94,7 +97,18 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-REL = os.path.join("demo", "chat", "assets", "smollm2-135m-instruct")
+DEFAULT_MODEL = "smollm2-135m-instruct"
+REL = os.path.join("demo", "chat", "assets", DEFAULT_MODEL)
+
+
+def study_dir(assets):
+    """Where the study results and formats of the model in ``assets`` live:
+    <assets>/../study for the default SmolLM2-135M (its original place),
+    <assets>/../study/<model dir> for any other checkpoint (the tokenizer-only
+    prompt caches of llm_project.py stay in <assets>/../study)."""
+    base = os.path.join(os.path.dirname(os.path.abspath(assets)), "study")
+    name = os.path.basename(os.path.normpath(assets))
+    return base if name == DEFAULT_MODEL else os.path.join(base, name)
 
 
 def default_assets():
@@ -977,7 +991,7 @@ CLASS_DOC = [
 
 def cmd_study(args):
     assets = args.assets
-    out_dir = args.out or os.path.join(os.path.dirname(assets), "study")
+    out_dir = args.out or study_dir(assets)
     os.makedirs(out_dir, exist_ok=True)
     logf = open(os.path.join(out_dir, "study.log"), "a")
 
@@ -1105,7 +1119,7 @@ def cmd_ablate(args):
     the weights alone, the activations alone, and everything; teacher-forced
     metrics on the prompt set and the first held-out window."""
     assets = args.assets
-    out_dir = args.out or os.path.join(os.path.dirname(assets), "study")
+    out_dir = args.out or study_dir(assets)
     os.makedirs(out_dir, exist_ok=True)
     cfg, W = load_all(assets)
     tok = Tok(assets)
@@ -1160,7 +1174,7 @@ def cmd_formats(args):
         out["sink_k_raw"] = [np.rint(s.k[l][:, 0] * p2(m.Eh("k", l, cfg.KV))[:, None]).astype(int).tolist() for l in range(cfg.L)]
         out["sink_v_raw"] = [np.rint(s.v[l][:, 0] * p2(m.Ev("vc", l, cfg.KV * cfg.HD).reshape(cfg.KV, cfg.HD))).astype(int).tolist()
                              for l in range(cfg.L)]
-    path = args.out or os.path.join(os.path.dirname(args.assets), "study", f"formats_{args.base}.json")
+    path = args.out or os.path.join(study_dir(args.assets), f"formats_{args.base}.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     json.dump(out, open(path, "w"))
     print(f"{path}: {len(fmt)} exponent entries")

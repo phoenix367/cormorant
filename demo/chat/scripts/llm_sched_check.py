@@ -71,7 +71,7 @@ def main():
     policy = lp.POLICIES[args.prefill_attn]
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
     fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn)
-    cgs = {name: lp.make_codegen(m, name) for name, m in lp.entry_models(fe, buckets).items()}
+    cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "
           f"weights saturated {sum(sum(cg._graph.weights_saturated.values()) for cg in cgs.values())}",

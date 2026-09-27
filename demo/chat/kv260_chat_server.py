@@ -851,7 +851,7 @@ def build_backends(args) -> Dict[str, Backend]:
                 loop_guard=not args.llm_no_loop_guard,
                 context_size=args.llm_context, reserve=args.llm_reserve,
                 repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk,
-                cma_mb=args.llm_cma_mb)
+                cma_mb=args.llm_cma_mb, model_id=args.llm_model_id)
         else:
             raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, echo)")
         out[b.model_id] = b
@@ -889,6 +889,9 @@ def main(argv=None) -> int:
     ap.add_argument("--doc-stride", type=int, default=128)
     g = ap.add_argument_group("smollm2 (generative chat)")
     g.add_argument("--llm-lib", default=os.path.join(HERE, "lib", "libsmollm2.so"))
+    g.add_argument("--llm-model-id", default=None,
+                   help="model id to serve (default: the library's llm_model_name(), e.g. "
+                        "smollm2-360m-instruct for libsmollm2_360m.so)")
     g.add_argument("--llm-weights", default=None,
                    help="weights directory for llm_open(); default: the one the library was built for")
     g.add_argument("--llm-tokenizer", default=_first_existing(
