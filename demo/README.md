@@ -1,23 +1,30 @@
 # KV260 demos
 
-End-to-end demos that take an ONNX model, compile it to a self-contained C
-inference project with `inference-scheduler`, build it on a KV260 board over
-SSH, and run it on this repo's HLS kernels (Conv / Pool / MatMul / VectorOP).
+End-to-end demos that take an ONNX model (or, for the chat, a Hugging Face
+checkpoint), compile it to a C inference project with `inference-scheduler`,
+build it on a KV260 board over SSH, and run it on this repo's HLS kernels
+(Conv / Pool / MatMul / VectorOP) plus host-CPU ops on the board's A53 cores.
 
-Each demo follows the same three stages — **download → generate → deploy** —
-driven by a one-shot `run_demo.py` orchestrator and configured by a single
-`<demo>_config.json` (copy the bundled `.example` and fill in your board's
-SSH details).
+The CNN demos (`mnist/`, `image_classification/`, `camera/`) follow the same
+three stages — **download → generate → deploy** — driven by a one-shot
+`run_demo.py` orchestrator and configured by a single `<demo>_config.json`
+(copy the bundled `.example` and fill in your board's SSH details).
+`bert_squad/` runs **prepare → generate → deploy** the same way, with the
+model, vocabulary and SQuAD file downloaded by hand (see its README).
+`chat/` installs a long-running server on the board with `deploy.py` and
+takes its board settings from `bert_squad/bert_squad_config.json`.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split |
-| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency |
-| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (12.1 s per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12) | chat messages over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming): question answering over a user-supplied document with sliding 256-token windows (~1 s each); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
-| [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Real-time classification; annotated frames stream back over SSH with inference latency and whole-board power |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.27 / 5.4 ms per image) |
+| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 62.3 ms = 16 FPS at 100 MHz) |
+| [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
+| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (971 ms per inference) |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M-Instruct | chat messages over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming): question answering over a user-supplied document (`bert-squad`, ~1 s per 256-token window) and generative multi-turn chat (`smollm2-135m-instruct`, ~5 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
 
 ## Common workflow
+
+CNN demos:
 
 ```bash
 cd demo/<name>
@@ -28,24 +35,36 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python run_demo.py
 ```
 
-`run_demo.py --check-only` runs every stage's preflight (SSH reachability,
+`bert_squad/` and `chat/` have no `requirements.txt`: they run with the
+scheduler's virtualenv, `../../inference-scheduler/.venv/bin/python`.
+
+`run_demo.py --check-only` runs the preflight checks (SSH reachability,
 kernel UIO devices, board-side dependencies) without uploading anything —
-the fastest way to confirm a board is ready.
+the fastest way to confirm a board is ready (`deploy.py --check-only` for
+`chat/`).
 
 ## Prerequisites (shared)
 
-- **Host:** Python 3.10+ and each demo's `requirements.txt`.
+- **Host:** Python 3.10+ and each demo's `requirements.txt` (or the
+  scheduler's `.venv`, see above).
 - **HLS drivers:** build the kernel IP from the repo root first —
-  `cmake -DAXI_BUS_WIDTH=32 .. && make synthesize_kv260` — and point
-  `local.driver_dirs` at the result.
-- **KV260 board:** Linux with the cormorant overlay loaded (`/dev/uio*`
-  kernels), `gcc` / `cmake` / `make`, the XRT runtime, and passwordless
-  `sudo`. The `camera/` demo additionally needs an Intel RealSense camera
-  plus `pyrealsense2` / OpenCV on the board — see its README.
+  `cmake .. && make synthesize_kv260` in `build/` — and point
+  `local.driver_dirs` at the result.  The driver sources only describe the
+  AXI-Lite registers, so they are the same for every `AXI_BUS_WIDTH`.
+- **KV260 board:** Linux with the bitstream and overlay loaded
+  (`inference-scheduler/upload_bitstream.py`, see *Deploy and run on the
+  KV260* in the [root README](../README.md); UIO devices `fabric_vecop` /
+  `fabric_matmul` / `fabric_conv` / `fabric_pool`), `gcc` / `cmake` /
+  `make`, the XRT runtime, and passwordless `sudo`.  The numbers in the
+  demo READMEs were measured with the 128-bit block design
+  (`hw/cormorant_hw_128`, `-DAXI_BUS_WIDTH=128`) at 100 MHz.  The
+  `camera/` demo additionally needs an Intel RealSense camera plus
+  `pyrealsense2` / OpenCV on the board — see its README.
 
 See each demo's own `README.md` for model sources, config-field reference,
 sample output, and troubleshooting. The generated-project internals are
-documented in
-[`../inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md)
-(canonical scheduler reference; `doc/INFERENCE_SCHEDULER.md` is a thin
-pointer to it) and [`../doc/PROFILER.md`](../doc/PROFILER.md).
+documented in [`../doc/INFERENCE_SCHEDULER.md`](../doc/INFERENCE_SCHEDULER.md)
+(scheduler technical reference),
+[`../inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md)
+(CLI, generated project layout and C API) and
+[`../doc/PROFILER.md`](../doc/PROFILER.md).

@@ -2,9 +2,17 @@
 
 Python code-generator that parses an ONNX model and emits a complete C project
 that runs inference on the Xilinx KV260 FPGA using up to four hardware kernels:
-VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv),
-and PoolingKernel (2-D pooling). Reshape is handled as a buffer alias with no
-hardware call; Gemm is decomposed to MatMul + Add at load time.
+VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv,
+incl. depthwise, and MatMuls lowered with swapped operand roles), and
+PoolingKernel (2-D pooling). Ops no kernel implements (Softmax, LayerNorm,
+Gelu, Transpose, Slice / Split copies, Gather, OneHot, Cast, SpaceToDepth and
+the `axi.llm` Llama decoder ops) run as host-CPU code inside
+`inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
+Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
+library and weight pool (multi-entry projects, `--entry`).
+
+The technical reference is `../doc/INFERENCE_SCHEDULER.md`; the user guide is
+`doc/USER_GUIDE.md`.
 
 ## Quick Start
 
@@ -13,6 +21,8 @@ cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Generate all test ONNX models (required before running tests)
+.venv/bin/python test/gen_all_models.py      # runs every gen_*_models.py below
+# or individually:
 .venv/bin/python test/gen_test_models.py
 .venv/bin/python test/gen_matmul_models.py
 .venv/bin/python test/gen_mixed_kernel_models.py
@@ -20,6 +30,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_pool_models.py
 .venv/bin/python test/gen_reshape_gemm_models.py
 .venv/bin/python test/gen_mixed_all_kernels_models.py
+.venv/bin/python test/gen_parallel_models.py
+.venv/bin/python test/gen_bert_models.py
+.venv/bin/python test/gen_llama_models.py    # imports ../demo/chat/scripts/llm_study.py
 
 # Run all tests
 .venv/bin/python -m pytest test/ -v
@@ -38,17 +51,33 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ```
 python inference_scheduler.py <model.onnx> [options]
+python inference_scheduler.py --entry NAME=MODEL.onnx [--entry ...] [options]
 
 Options:
-  --out-dir DIR              Output directory (default: ./<stem>_inference/)
-  --driver-dir DIR           Copy XVectoropkernel driver sources from this path
+  --entry NAME=MODEL.onnx    Multi-entry project (src/codegen/multi.py): one library,
+                             inference_run_NAME() per graph, one weight pool; repeat
+                             per entry, replaces the positional model
+  --out-dir DIR              Output directory (default: ./<stem>_inference/,
+                             ./multi_inference/ with --entry)
+  --driver-dir DIR           Copy the drivers of every active kernel from this path
   --embed-large-weights      Inline all weights as C arrays (skip .dat files)
   --embed-large-expected     Inline all GT arrays in test_inference.c
+  --no-report                Skip report.md
+  --no-fuse-act              Keep Relu / Clip(0,6) as separate VectorOP calls
+  --no-s2d-stem              Keep stride-2 Convs on <= 4 channels as they are
+  --no-fuse-patterns         No LayerNorm / GELU fusion, no constant-broadcast
+                             normalisation
   --matmul-on-conv {auto,always,off}
                              Run MatMuls on ConvKernel with swapped operand roles
                              (default auto: where the cost model says it is faster)
   --no-matmul-on-conv        Same as --matmul-on-conv off
 ```
+
+The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns` and
+`matmul_on_conv="auto"`; the `OnnxGraph` library defaults are
+`fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
+`matmul_on_conv="auto"`. The `argparse` epilog (module docstring) of
+`inference_scheduler.py` still describes the original VectorOP-only tool.
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
 
@@ -80,28 +109,37 @@ e.g. resnet50-v1-12 collapses from 175 to 122 nodes with all 53 BNs
 absorbed into the preceding Convs.
 
 `--batch N` errors out on non-batch dynamic dims rather than guessing —
-use `--input-shape NAME=D1,D2,…` for those.  All `*-simplified.onnx` and
-`*_simplified.onnx` files in this directory were produced by (or can be
-regenerated with) this script.
+use `--input-shape NAME=D1,D2,…` for those.  The `*-simplified.onnx` and
+`*_simplified.onnx` model files in this directory (local, not tracked) were
+produced by (or can be regenerated with) this script; `resnet18-simplified-fused.onnx`
+came from a different BN-fusion pipeline (see `doc/MODEL_PREPARATION.md` §1).
 
 See `doc/MODEL_PREPARATION.md` for the full workflow, including handling
-of unsupported ops that survive simplification (e.g. tail `Softmax` /
-`Cast`, grouped Conv) and a worked example on `resnet50-v1-12.onnx`.
+of unsupported ops that survive simplification (e.g. `BatchNormalization`
+left in place, non-depthwise grouped Conv) and a worked example on
+`resnet50-v1-12.onnx`.
 
 ## Generated Project Layout
 
 ```
 <out_dir>/
-├── CMakeLists.txt            INFERENCE_TARGET=BARE_METAL|LINUX
-├── include/inference.h       Public API: Data_t, size macros, init/run declarations
+├── CMakeLists.txt            INFERENCE_TARGET=BARE_METAL (default)|LINUX
+├── include/
+│   ├── inference.h           Public API: Data_t, size macros, DMA buffer API,
+│   │                         init/run/deinit declarations, UIO instance defaults
+│   ├── inference_prof.h      Per-layer profiler (-DINFERENCE_PROFILING=ON)
+│   └── inference_ddr.h       DDR-traffic counters for the profiler
 ├── src/
-│   ├── inference.c           Weight ROM arrays, run_op() helper, init/run bodies
-│   └── inference_buf.c       DMA buffer alloc/sync (Linux XRT or bare-metal Xil)
+│   ├── inference.c           Weight ROM arrays, run_*() helpers, kernel_wait(),
+│   │                         host-op helpers, init/deinit/run bodies
+│   ├── inference_buf.c       DMA buffer alloc/sync (Linux XRT BOs or bare-metal Xil)
+│   ├── inference_prof.c, inference_ddr.c, inference_ddr_backend.h, ddr/zuplus_apm.c
 ├── test/test_inference.c     On-device test: ramp fill → run → compare vs GT
 ├── scripts/check_inference_setup.sh
-├── driver/                   XVectoropkernel sources (copied or stub README)
-├── weights/                  External .dat files for large weight tensors (> 4096 elems)
-└── expected/                 External .dat files for large GT expected arrays (> 4096 elems)
+├── driver/                   Kernel driver sources, flat (copied or stub README.md)
+├── weights/                  External .dat files: weights > 4096 elems, host tables > 64 KiB
+├── expected/                 External .dat files for large GT expected arrays (> 4096 elems)
+└── report.md                 Model summary (unless --no-report; single-entry only)
 ```
 
 ## Source Layout
@@ -109,39 +147,67 @@ of unsupported ops that survive simplification (e.g. tail `Softmax` /
 ```
 inference_scheduler.py   CLI entry point — ONNX → C project
 simplify_onnx.py         CLI entry point — ONNX → ONNX (onnxsim + BN-fusion)
-requirements.txt
+run_remote_tests.py      On-board correctness runner (SSH)
+run_remote_perf.py       On-board kernel benchmark runner (SSH; bench_src/)
+upload_bitstream.py      Load .bit + xclbin + .dtbo on the board (src/bitstream/)
+requirements.txt, pyproject.toml (ruff)
+runtime/                 inference_prof / inference_ddr sources copied into projects
+bench_src/               C benchmark project used by run_remote_perf.py
 src/
   dtype.py               DataType abstraction (ap_fixed<W,I>, float32)
   layout.py              TensorLayout frozen dataclass (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo: metadata + C declaration emitters
-  nodes.py               ScheduledNode: ONNX op → VectorOPKernel call (+ MatmulNode,
-                         ConvNode, MatmulConvNode, PoolNode, ReshapeNode, …)
+  kernels.py             KERNEL_REGISTRY: per-kernel driver files, UIO default, init param
+  nodes.py               ScheduledNode (VectorOP), MatmulNode, ConvNode, MatmulConvNode,
+                         PoolNode, ReshapeNode, SpaceToDepthNode
+  host_nodes.py          HostNode family (Softmax, LayerNorm, Gelu, Transpose, Slice,
+                         Gather, OneHot, Cast): numpy reference + C helpers
+  llm_nodes.py           axi.llm ops (LlmEmbed, LlmRMSNorm, LlmResAdd, LlmAttention,
+                         LlmSiluMul, LlmSelectRow, LlmDequant, LlmAttnPrep /
+                         LlmAttnSoftmax / LlmAttnMerge) + LlmAttnConvNode (FPGA q·Kᵀ / P·V)
+  llama.py               Llama frontend: config.json + safetensors + formats → entry graphs
+  numeric.py             axi.numeric metadata: power-of-two exponents, host tensors, states
+  fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
+                         constant-broadcast normalisation
   matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry)
   cost_model.py          ConvKernel / MatmulKernel cycle estimates
+  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
+                         platform JSON resolvers (kernels.{conv,matmul,pool})
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes; topological order,
                          predecessors/successors, independent-pair queries
+  report.py              ReportGenerator → report.md
+  bitstream/             upload_bitstream.py implementation (convert, hwh, xclbin,
+                         board, loader, platforms/kv260.py)
+  remote/                SSH session, config defaults, preflight checks (shared by
+                         run_remote_tests.py / run_remote_perf.py / upload_bitstream.py)
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
-    _core.py             _compute_event_stream() → list of Start/Wait/Drain events
+    _core.py             _compute_event_stream() → list of comment/start/wait/drain/cpu events
                          _compute_live_intervals() → event-stream-based intervals
                          _compute_tensor_layouts() → TensorLayout; pool slot colouring
     _header.py           generate_header()  → include/inference.h
     _source.py           generate_source()  → src/inference.c
-    _buf_impl.py         generate_buf_impl() → src/inference_buf.c
+    _buf_impl.py         generate_buf_impl() → src/inference_buf.c; generate_setup_script()
     _simulate.py         Fixed-point forward simulation; generate_expected_dat()
     _test.py             generate_test()    → test/test_inference.c
     _cmake.py            generate_cmake()   → CMakeLists.txt
     _banners.py          File-header banner helpers
+    multi.py             MultiEntryGenerator (--entry): several graphs, one weight pool
 test/
-  gen_test_models.py     Build all test ONNX models
+  gen_*_models.py        Test ONNX model generators; gen_all_models.py runs them all
   helpers.py             _model(), _models_exist() shared by test modules
-  models/                Pre-generated ONNX models (single_add.onnx, etc.)
-  test_*.py              pytest test modules (1301 tests total)
-                         — includes test_dag.py (DAG correctness),
-                           test_parallel_waits.py (split start/wait emission),
-                           test_nop_corner_cases.py (NOP-layer corner cases),
-                           test_profiler_overlap.py (overlapping bracket support)
+  host_emu.py            Builds a generated project on the host against software
+                         VectorOP / Matmul / Conv kernels and runs test_inference
+  models/                Generated ONNX models (single_add.onnx, etc.)
+  c/                     C harness for test_profiler_overlap.py
+  test_*.py              61 pytest modules, 1497 tests collected (1492 pass, 5 skip;
+                         test_bert_base.py needs BERT_SQUAD_MODEL) — includes
+                         test_dag.py (DAG correctness), test_parallel_waits.py (split
+                         start/wait emission), test_nop_corner_cases.py (NOP-layer
+                         corner cases), test_profiler_overlap.py (overlapping brackets),
+                         test_cache_coherency.py (sync audit), test_host_ops.py,
+                         test_llm_ops.py, test_llama.py, test_matmul_on_conv.py
 ```
 
 ## Key Abstractions
@@ -163,7 +229,8 @@ cg = CodeGenerator(g, "model.onnx", dtype=AP_FIXED_16_8)
 | `FLOAT32` | `float32` | 4 | 4 | IEEE 754 |
 
 Key methods:
-- `quantize(x)` — round float64 array to representable grid (used in simulation)
+- `quantize(x)` — round-to-nearest onto the representable grid (weights, inputs)
+- `truncate(x)` / `truncate_div(x)` — floor (AP_TRN) / toward zero (Div): kernel outputs in simulation
 - `encode_weight(data)` → list of C literal strings (`"0x0100"`)
 - `float_to_storage(x)` → numpy array with `np_storage` dtype
 - `dat_bytes(data)` → little-endian bytes for external `.dat` files
@@ -173,9 +240,7 @@ Key methods:
 Adding a new type: subclass `DataType`, implement all abstract methods, pass
 the instance to `OnnxGraph` and `CodeGenerator`.
 
-### Node Classes (`src/nodes.py`)
-
-Five node classes cover all supported ONNX operators:
+### Node Classes (`src/nodes.py`, `src/host_nodes.py`, `src/llm_nodes.py`)
 
 **ScheduledNode** — VectorOPKernel element-wise ops:
 
@@ -188,11 +253,17 @@ Five node classes cover all supported ONNX operators:
 | `Relu` | `OP_RELU` (4) | unary | b=NULL |
 | `Clip(min=0,max=6)` | `OP_RELU6` (5) | unary | exact bounds required |
 
+With `OnnxGraph(fuse_act=True)` (CLI default) a following `Relu` /
+`Clip(0,6)` is folded into the producing ScheduledNode (`act`, emitted as
+`run_op_act()`).
+
 **MatmulNode** — MatmulKernel: `MatMul`. Tiled 2-D matrix multiply; supports
 batched matmul and row-strided decomposition for alignment-gapped buffers.
+A constant B read only by MatMuls is packed tile-major (`b_packed = 1`).
 
 **ConvNode** — ConvKernel: `Conv`. NCHW 2-D convolution with optional bias,
-configurable kernel/stride/pad/dilation. `groups=1` only.
+configurable kernel/stride/pad (incl. `auto_pad`)/dilation. `group=1` or
+depthwise (`group=in_ch`); other grouped convolutions are rejected.
 
 **MatmulConvNode** — ConvKernel: a `MatMul` lowered by
 `src/matmul_lowering.py` (`OnnxGraph(matmul_on_conv="auto")`, the default)
@@ -210,19 +281,19 @@ emit one `run_conv_at()` per item.  The simulator treats it exactly like a
 
 **PoolNode** — PoolingKernel: `MaxPool`, `AveragePool`, `LpPool` (p=1 or 2),
 `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`. Full 2-D NCHW geometry
-including dilation and `count_include_pad`.
+including dilation and `count_include_pad`; `ceil_mode=1` is rejected.
 
 `PoolNode.from_onnx_node` validates the model against the kernel's
-compile-time bounds (`pool_h ≤ kMaxPoolH`, `pool_w ≤ kMaxPoolW`,
-`(pool_h - 1) * dil_h + 1 ≤ kMaxLineBufRows`,
-`(pool_w - 1) * dil_w + 1 ≤ kMaxLineBufCols`) and raises `SchedulerError`
+compile-time bounds (`pool_h ≤ POOL_MAX_KH`, `pool_w ≤ POOL_MAX_KW`,
+`(pool_h - 1) * dil_h + 1 ≤ POOL_MAX_LINE_BUF_ROWS`,
+`(pool_w - 1) * dil_w + 1 ≤ POOL_MAX_LINE_BUF_COLS`) and raises `SchedulerError`
 naming the violated bound + the JSON field to bump.  The bounds come
 from the **same platform JSON the C++ build reads**
 (`platforms/<AXI_PLATFORM>.json`, `kernels.pool` object — see
 [`../doc/PLATFORM_CONFIGURATION.md`](../doc/PLATFORM_CONFIGURATION.md)
 for the full field reference across all three kernels, and
-`doc/POOL_OPTIMIZATION.md` §4 for the pool-specific architectural
-context).
+[`../doc/POOL_OPTIMIZATION.md`](../doc/POOL_OPTIMIZATION.md) §4 for the
+pool-specific knobs).
 `src/_pool_hw_config.py::resolve(platform_name)` is the resolver:
 
 - `platform_name=None` (default) reads `AXI_PLATFORM` env var (defaults
@@ -235,27 +306,46 @@ context).
 
 `tile_c` and `ow_parallel` are not validated: any C runs (channel
 tiling) and any out_w runs (residual-lane padding) inside the kernel,
-so models cannot violate them.
+so models cannot violate them.  `MatmulNode` checks `K ≤ MATMUL_MAX_K`
+(`kernels.matmul.max_k`) the same way; ConvNode checks the
+`kernels.conv` bounds.
 
-**ReshapeNode** — zero-cost buffer alias: `Reshape`. `emit_call()` returns `""`.
-Output pointer is assigned `= source` in `inference_init()`; NULLed without free
-in `inference_deinit()`. Requires equal `numel` between source and output.
+**ReshapeNode** — zero-cost buffer alias: `Reshape`, `Squeeze`, `Unsqueeze`,
+`Flatten`, `Dropout`, `Identity` (`RESHAPE_OP_TYPES`) and a `Cast` within one
+storage kind. `emit_call()` returns `""`. Output pointer is assigned
+`= source` in `inference_init()`; NULLed without free in `inference_deinit()`.
+Requires equal `numel` between source and output.
+
+**SpaceToDepthNode** — host-CPU reorder: ONNX `SpaceToDepth`, and the
+stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default).
+
+**HostNode** (`src/host_nodes.py`) — `Softmax`, `LayerNormalization`, `Gelu`,
+`Transpose`, `Slice` (every `Split` output), `Gather`, `OneHot`, `Cast`:
+C helpers run inside `inference_run()`, numpy `reference()` for the
+simulator; a contiguous 64-byte-aligned `Slice` piece becomes a zero-cost
+sub-buffer view instead (`OnnxGraph._choose_slice_views`).
+**LlmNode** / **LlmAttnConvNode** (`src/llm_nodes.py`) — the `axi.llm`
+domain ops of the Llama frontend.
 
 `Gemm` is decomposed to `MatMul` + optional `Add` by `OnnxGraph._preprocess_model()`
-at load time, before any node class sees it.
+at load time, before any node class sees it (`alpha=1, beta=1, transA=0`;
+`transB=1` only with a constant 2-D B, transposed into a `<B>_T` initializer).
+`Constant` nodes are folded into initializers and `Split` is lowered to one
+`Slice` per output before dispatch.
 
 **Broadcasting**: One input per binary op may broadcast. Rules:
 - Right-align input shape to output shape
 - All broadcast dimensions (size 1) must form a **contiguous leading block**
+  (size-1 output dims are neutral)
 - Valid: `[1, 1, 64]` broadcasts to `[4, 32, 64]` (dims 0,1 broadcast)
 - Invalid: `[4, 1, 64]` to `[4, 32, 64]` (broadcast dim between matching dims)
 
-When broadcasting, `emit_call()` generates a for-loop calling `run_op_at()`:
+When broadcasting, `emit_call()` emits one `run_op()` call; the kernel runs
+the outer loop itself (`outer`, `a_inc`, `b_inc` registers; an input that
+repeats has increment 0):
 ```c
-for (unsigned _i = 0u; _i < 4u; _i++) {
-    run_op_at(X, _i * INFERENCE_Y_CHUNK_STRIDE, bias, 0u,
-              Y, _i * INFERENCE_Y_CHUNK_STRIDE, INFERENCE_Y_CHUNK, VECTOROP_ADD);
-}
+run_op(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD,
+       128u, INFERENCE_Y_CHUNK_STRIDE, 0u);
 ```
 
 ### CodeGenerator (`src/codegen/`)
@@ -276,22 +366,25 @@ Pool-slot colouring uses interval-graph greedy first-fit. The
 order, so two tensors share a slot only when one is fully drained
 before the other's producer starts under the parallel-wait emission.
 
-For each non-Reshape intermediate tensor `T`:
+For each intermediate tensor `T` that is not an alias (Reshape alias or
+Slice view):
 
-- `start_event` = event index of `T`'s producer Start
+- `start_event` = event index of `T`'s producer Start (or `cpu` event)
 - `end_event`   = max event index of any `kernel_wait` that drains a
-  consumer on its lane
-- Consumers reached via a ReshapeNode chain (Squeeze, Unsqueeze,
-  Reshape, Dropout, Flatten — all `RESHAPE_OP_TYPES`) extend `T`'s
-  interval through the alias: a `Pool → Squeeze → MatMul` chain keeps
-  Pool's output buffer live until the Matmul lane drains.
+  consumer on its lane (a host consumer's own `cpu` event)
+- Consumers reached via a ReshapeNode chain (`RESHAPE_OP_TYPES`) or a
+  Slice view extend `T`'s interval through the alias: a
+  `Pool → Squeeze → MatMul` chain keeps Pool's output buffer live until the
+  Matmul lane drains.
 
 This is what makes parallel branches correct: in `parallel_two_chains`,
 `ca1` (consumed by Pool) and `cb0` (written by Conv-B in parallel) have
 overlapping event intervals, so the colouring places them in different
 slots even though their node indices look disjoint. Coloring is still
 valid for the strictly-sequential case — every node-index interval is
-also an event-index interval.
+also an event-index interval.  Weights, then DMA states, precede the slot
+region; host-memory intermediates get their own arena coloured the same way
+(`_compute_host_layout`).
 
 The Dag invariant *"if two tensors share a pool offset, their event
 intervals must be strictly disjoint"* is enforced by
@@ -306,14 +399,13 @@ event-timeline liveness, slot coloring, worked examples on
 `parallel_two_chains`, `squeeze_then_matmul`,
 `asymmetric_nested_branches`, and the invariants tested in CI).
 
-
 `Dag.from_graph(OnnxGraph)` builds a producer/consumer DAG over the
 scheduled node list:
 
 - Edge `u → v` iff some intermediate tensor produced by `u` is consumed
-  by `v`. Graph inputs and constant initializers are **external** —
-  they impose no edges (they're already available before
-  `inference_run()` enters its body).
+  by `v`. Graph inputs, constant initializers and persistent states no
+  node of the graph produces are **external** — they impose no edges
+  (they're already available before `inference_run()` enters its body).
 - ReshapeNodes appear as ordinary DAG nodes (`kernel_name == ""`), so
   consumers of an alias are correctly ordered after the producer of the
   underlying source. The event-stream walker traverses through them
@@ -329,13 +421,16 @@ scheduler — it answers "which nodes have all their data ready" and
 
 Each kernel-bearing node lives on exactly one hardware lane (`Conv`,
 `Pool`, `Matmul`, `VectorOP`); only one of each IP exists on the FPGA.
-The codegen overlaps work across **different** lanes.
+The codegen overlaps work across **different** lanes.  Host nodes have no
+lane: they wait for their producers, run inline and are never waited on.
 
-**Helpers** are non-blocking: `run_op()` / `run_matmul()` / `run_conv()`
-/ `run_pool()` program the AXI-Lite registers, call `XKernel_Start()`,
-and return immediately. (`run_matmul_at()` — used only inside the 4D×3D
-outer loop where iterations would race on the same Matmul registers —
-remains synchronous.)
+**Helpers** are non-blocking: `run_op()` / `run_op_act()` / `run_matmul()` /
+`run_conv()` / `run_pool()` program the AXI-Lite registers, call
+`XKernel_Start()`, and return immediately. (`run_matmul_at()` — used only
+inside the 4D×3D outer loop where iterations would race on the same Matmul
+registers — remains synchronous; the per-item `run_conv_at()` loop of a
+batched MatMul on ConvKernel waits on `KERNEL_CONV` before each call after
+the first and leaves the last in flight.)
 
 **Sync** funnels through a single weak-symbol primitive emitted into the
 generated source:
@@ -362,7 +457,8 @@ source of truth for the schedule. It walks `graph.nodes` once, tracks
 ('start_sync', node_idx)           ─ Start whose helper drains internally
 ('wait',    kid, drained_idx)      ─ kernel_wait(KERNEL_*) call
 ('drain',   kid, drained_idx)      ─ final wait before output cache sync
-('reshape', node_idx)              ─ ReshapeNode (no kernel work)
+('reshape', node_idx)              ─ ReshapeNode / Slice view (no kernel work)
+('cpu',     node_idx)              ─ SpaceToDepthNode / HostNode (host code, inline)
 ```
 
 Both the body emitter (`_inference_function`) and the live-interval
@@ -378,16 +474,22 @@ producing kernel.
 ### Cache Coherency Model
 
 The kernel's AXI master reads/writes DDR using **physical addresses** programmed
-into AXI-Lite registers. CPU cache must be explicitly managed:
+into AXI-Lite registers. CPU cache must be explicitly managed (on Linux the
+XRT buffer objects are mapped cacheable by default):
 
-- `inference_buf_sync_to_device(buf)` — flush CPU cache → DDR (before kernel reads)
-- `inference_buf_sync_from_device(buf)` — invalidate CPU cache (after kernel writes)
+- `inference_buf_sync_to_device(buf)` — clean CPU cache → DDR (before a kernel reads **or writes**)
+- `inference_buf_sync_from_device(buf)` — invalidate CPU cache (after a kernel wrote)
 
-**Contract**:
-- `inference_init()`: syncs each weight buffer **once** after `memcpy` from ROM
-- `inference_run()`: syncs all graph **inputs** at the top, all graph **outputs** at the bottom; `kernel_wait` calls drain in-flight kernels before the output sync
+**Contract** (full table: `../doc/INFERENCE_SCHEDULER.md` §Cache coherency):
+- `inference_init()`: syncs the weight pool **once** after `memcpy` from ROM
+- `inference_run()`: cleans all graph **inputs and outputs** at the top, invalidates all graph **outputs** at the bottom; `kernel_wait` calls drain in-flight kernels before the output sync
+- Host ops: invalidate a kernel-written input after its lane drained, flush their output before a kernel reads it; KV-cache DMA states are flushed with `llm_cache_flush`
 - `run_*()` helpers: pure AXI-Lite register writes + Start (no sync, no poll)
 - Internal kernel-to-kernel buffers (intermediates): **no sync ever needed**
+
+`test/test_cache_coherency.py` audits every test model's `inference_run()`
+against these rules; `test/host_emu.py` (`incoherent=True`) checks them
+dynamically.
 
 ### Large Tensor Handling
 
@@ -398,39 +500,54 @@ loaded at runtime via `fread()`:
 |-----------|----------|-------|
 | `LARGE_WEIGHT_THRESHOLD = 4096` | in `tensor.py` | `weights/<c_name>.dat` |
 | `LARGE_EXPECTED_THRESHOLD = 4096` | in `codegen/_simulate.py` | `expected/<c_name>.dat` |
+| `TABLE_FILE_BYTES = 64 KiB` | in `llm_nodes.py` | `weights/<name>.dat` (host tables) |
 
-Both `.dat` files contain little-endian elements in the strided DMA-buffer layout
-(alignment gaps are zero-filled for broadcast tensors).
+Both `.dat` files contain little-endian elements in the DMA-buffer layout
+(packed images for Conv weights / MatMul B; alignment gaps are zero-filled
+for broadcast tensors).
 
 ## Generated C API
 
 ```c
 // inference.h
-typedef uint16_t Data_t;              // ap_fixed<16,8>
+typedef uint16_t Data_t;              // ap_fixed<16,8> raw bits
 #define INFERENCE_BYTES_PER_ELEM  2u
 #define INFERENCE_ALIGN_BYTES     16u
-#define INFERENCE_ALIGN_ELEMS     8u
-#define INFERENCE_INPUT_SIZE      N   // alloc size for graph input(s)
-#define INFERENCE_OUTPUT_SIZE     N   // alloc size for graph output(s)
+#define INFERENCE_ALIGN_ELEMS     (INFERENCE_ALIGN_BYTES / INFERENCE_BYTES_PER_ELEM)
+#define INFERENCE_<TENSOR>_SIZE   N   // alloc elements, one per graph input / output
+#define INFERENCE_BUF_POOL_SIZE_BYTES N  // advisory upper bound (no slot reuse)
 
 // For broadcast nodes only:
 #define INFERENCE_<TENSOR>_CHUNK        chunk_size
-#define INFERENCE_<TENSOR>_CHUNK_STRIDE INFERENCE_ALIGN_UP(chunk_size, align)
+#define INFERENCE_<TENSOR>_CHUNK_STRIDE INFERENCE_ALIGN_UP(INFERENCE_<TENSOR>_CHUNK)
 
-int  inference_init(const char *instance_name);  // alloc DMA bufs, load weights
+// One instance name per active kernel, registry order (VectorOP, Matmul, Conv, Pool);
+// defaults INFERENCE_<KERNEL>_INSTANCE ("VectorOPKernel_0", ...)
+int  inference_init(const char *vectoropkernel_instance /*, ... */);
 void inference_run(inference_buf_t *in, inference_buf_t *out);
-// signature lists all graph inputs then all graph outputs;
-// models may have multiple of each.
+// signature lists all graph inputs then all graph outputs; host-memory tensors
+// (axi.numeric) are plain pointers; --entry projects: inference_run_<name>()
 void inference_deinit(void);
+unsigned           inference_num_layers(void);
+const char *const *inference_layer_names_ptr(void);
 
 // inference_buf.c (platform-specific)
-inference_buf_t *inference_buf_alloc(unsigned size_elements);
-void             inference_buf_free(inference_buf_t *buf);
-void            *inference_buf_ptr(inference_buf_t *buf);   // virtual address (CPU)
-uint64_t         inference_buf_phys(inference_buf_t *buf);  // physical address (AXI)
+inference_buf_t *inference_buf_alloc(unsigned n_elem);
+void             inference_buf_free(inference_buf_t *buf);     // == release (refcounted)
+void             inference_buf_init_view(inference_buf_t *view, inference_buf_t *base,
+                                         unsigned offset_elems, unsigned count_elems);
+Data_t          *inference_buf_ptr(inference_buf_t *buf);         // virtual address (CPU)
+uint64_t         inference_buf_phys(const inference_buf_t *buf);  // physical address (AXI)
+unsigned         inference_buf_count(const inference_buf_t *buf);
+int              inference_buf_is_cached(const inference_buf_t *buf);  // static inline
 void             inference_buf_sync_to_device(inference_buf_t *buf);
 void             inference_buf_sync_from_device(inference_buf_t *buf);
 ```
+
+Build knobs: `-DINFERENCE_TARGET=BARE_METAL|LINUX`, `-DINFERENCE_BUF_CACHEABLE=ON|OFF`
+(env `INFERENCE_BUF_CACHEABLE`), `-DINFERENCE_HOST_THREADS=N` (env
+`INFERENCE_HOST_THREADS`, host ops only), `-DINFERENCE_PROFILING=ON`,
+`-DINFERENCE_WEIGHTS_DIR=...`, `-DINFERENCE_<KERNEL>_INSTANCE=...`.
 
 ## Testing
 
@@ -441,6 +558,8 @@ Tests live in `test/`. Run with `pytest`:
 .venv/bin/python -m pytest test/test_source.py -v          # generated inference.c
 .venv/bin/python -m pytest test/test_broadcast.py -v       # broadcast logic
 .venv/bin/python -m pytest test/ -k "test_relu" -v         # filter by name
+BERT_SQUAD_MODEL=bertsquad-12-simplified.onnx \
+    .venv/bin/python -m pytest test/test_bert_base.py -v   # opt-in BERT-base check
 ```
 
 Most test classes are decorated `@unittest.skipUnless(_models_exist(), ...)` —
@@ -450,7 +569,7 @@ run all `gen_*.py` scripts first if tests are skipped (see Quick Start).
 and `gen_pool_models.py` "must raise" / "at_limit" generators read their
 geometry constants from the platform JSON via the same `_<kernel>_hw_config`
 resolvers the scheduler uses (`MATMUL_MAX_K`, `POOL_MAX_KH/KW/LINE_BUF_*`,
-`CONV_MAX_IN_CH/OUT_CH/LINE_BUF_*/ACC_PERSIST_ENTRIES`). The matching
+`CONV_MAX_IN_CH/OUT_CH/KH/KW/LINE_BUF_*/ACC_PERSIST_ENTRIES`). The matching
 `test_*.py` assertions read the same constants. Don't hard-code a bound
 literal in a fixture or its assertion — a JSON bump (e.g. `max_k: 2048 →
 4096`) would otherwise silently turn a "must raise" model into a legal
@@ -459,28 +578,32 @@ one, masking validator regressions. Re-run the generator after any
 
 ## On-Device Testing and Benchmarking
 
-Two scripts drive KV260 hardware over SSH:
+Three scripts drive KV260 hardware over SSH:
 
 | Script | Purpose | Config |
 |--------|---------|--------|
-| `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config_*.json` |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` |
+| `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
+| `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (148 models) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` (55 cases) |
 
-Both share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
+All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
 the full reference including the `benchmarks` config section and per-kernel
-case field definitions.
+case field definitions.  `run_remote_tests.py` keys `remote.uio_devices` by
+the `KERNEL_REGISTRY` names (`PoolKernel`); `run_remote_perf.py` uses
+`PoolingKernel`.
 
 `run_remote_perf.py` validates each `VectorOPKernel` case's `op` against the
-kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) at config-load time and exits
-with `config error: VectorOPKernel case '<label>': unsupported op=…` before
-any SSH upload or remote build — same fail-fast contract as the scheduler's
-hardware-bound check, but for the perf benchmark cases.
+kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) when it loads the cases and
+exits with `config error: VectorOPKernel case '<label>': unsupported op=…`
+before any benchmark runs.  Note: `_load_cases()` is called after the SSH
+connection, the preflight check and the remote build, not at config-load
+time, so a bad case still costs one build.
 
 ## Driver Sources
 
 Each hardware kernel has its own driver generated by Vitis HLS synthesis.
-When `--driver-dir` is omitted, `driver/` sub-directories are left empty with
-stub `README.md` files.
+When `--driver-dir` is omitted, `driver/` is left empty except for a stub
+`README.md` listing the files the model's kernels need.
 
 | Kernel | Driver prefix | Required files |
 |--------|--------------|----------------|

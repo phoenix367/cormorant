@@ -9,9 +9,11 @@ is the single technical reference for anyone modifying:
 - `src/codegen/_source.py`     (body emission consuming the events)
 
 For a higher-level orientation see the sibling
-[`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md) and
-[`ARCHITECTURE.md`](ARCHITECTURE.md); for the profiler that piggybacks
-on the same brackets see [`PROFILER.md`](../../doc/PROFILER.md).
+[`USER_GUIDE.md`](USER_GUIDE.md) (user guide),
+[`ARCHITECTURE.md`](ARCHITECTURE.md) and the technical reference
+[`doc/INFERENCE_SCHEDULER.md`](../../doc/INFERENCE_SCHEDULER.md); for the
+profiler that piggybacks on the same brackets see
+[`PROFILER.md`](../../doc/PROFILER.md).
 
 ## Pipeline overview
 
@@ -24,7 +26,7 @@ disagree about what is in flight on each lane at any point.
 flowchart TD
     M([model.onnx]) --> OG["OnnxGraph<br/>src/graph.py<br/>parse · shape inference · Gemm rewrite"]
     OG --> DAG["Dag<br/>src/schedule.py<br/>producer/consumer edges<br/>(§3)"]
-    DAG --> EVS["Event stream<br/>_compute_event_stream<br/>start · wait · drain · reshape<br/>(§4)"]
+    DAG --> EVS["Event stream<br/>_compute_event_stream<br/>start · wait · drain · reshape · cpu<br/>(§4)"]
     EVS --> LI["Live intervals<br/>_compute_live_intervals<br/>(start_event, end_event) per tensor<br/>(§5)"]
     EVS --> EM["inference_run() body<br/>_inference_function<br/>(consumed verbatim)"]
     LI --> POOL["Pool slot coloring<br/>_compute_pool_layout<br/>greedy first-fit on event intervals<br/>(§6)"]
@@ -75,32 +77,37 @@ event stream described in §3.
 
 ### 2.1 Nodes
 
-Every ONNX op becomes one of five `ScheduledNode` subclasses, each with
-a `kernel_name: ClassVar[str]`:
+Every ONNX op becomes one node object; the node classes are independent
+dataclasses (not subclasses of `ScheduledNode`) that share a
+`kernel_name: ClassVar[str]`:
 
-| Subclass        | `kernel_name`        | Lane                |
+| Class           | `kernel_name`        | Lane                |
 |-----------------|----------------------|---------------------|
 | `ScheduledNode` | `"VectorOPKernel"`   | `KERNEL_VECTOROP`   |
 | `MatmulNode`    | `"MatmulKernel"`     | `KERNEL_MATMUL`     |
-| `ConvNode`      | `"ConvKernel"`       | `KERNEL_CONV`       |
+| `ConvNode`, `MatmulConvNode`, `LlmAttnConvNode` | `"ConvKernel"` | `KERNEL_CONV` |
 | `PoolNode`      | `"PoolKernel"`       | `KERNEL_POOL`       |
 | `ReshapeNode`   | `""` (none)          | —                   |
+| `SpaceToDepthNode`, `HostNode` family (incl. the `axi.llm` `LlmNode`s) | `""` (none) | — (host CPU) |
 
 `ReshapeNode` covers `Reshape` / `Squeeze` / `Unsqueeze` / `Dropout` /
-`Flatten` (collectively `RESHAPE_OP_TYPES`). It emits no kernel call;
-its output buffer is a pointer alias of its input.
+`Flatten` / `Identity` (collectively `RESHAPE_OP_TYPES`) and a `Cast`
+within one storage kind. It emits no kernel call; its output buffer is a
+pointer alias of its input.  A `SliceNode` chosen as a sub-buffer view
+behaves the same way (`_is_alias_node`).
 
 ### 2.2 Tensors
 
 Three flavours, distinguished at DAG construction:
 
-- **External** — graph inputs and constant initializers. They have no
-  producing node and impose no edges.
+- **External** — graph inputs, constant initializers, and persistent
+  states (`src/numeric.py`) that no node of the graph produces. They have
+  no producing node and impose no edges.
 - **Intermediate** — produced by some node, consumed by zero or more.
   Candidates for buffer-pool reuse.
-- **Alias** — output of a `ReshapeNode`. Excluded from the buffer pool
-  (it shares its source's slot). Its onnx-name is in
-  `_reshape_aliases`.
+- **Alias** — output of a `ReshapeNode` or a Slice view. Excluded from the
+  buffer pool (it shares its source's slot). Its onnx-name is in
+  `_alias_source_map()` (`_reshape_aliases` / `_view_aliases`).
 
 ### 2.3 Lanes and events
 
@@ -131,6 +138,7 @@ by `v`. Construction is one pass:
 ```python
 producer:   dict[onnx_name → producing_node_idx]
 externals:  set[onnx_name]   = graph_inputs ∪ initializers
+                               ∪ (states not produced by any node)
 
 for sn in graph.nodes:
     producer[sn.output.onnx_name] = sn.index
@@ -205,9 +213,9 @@ they cannot disagree about which lanes are in flight at any point.
 
 ### 4.1 Effective predecessors (Reshape pass-through)
 
-A direct DAG predecessor on a `ReshapeNode` carries no kernel
-information. The walker traverses through Reshape chains until it
-lands on a kernel-bearing producer:
+A direct DAG predecessor on a `ReshapeNode` (or a Slice view) carries no
+kernel information. The walker traverses through alias chains until it
+lands on a producer that is not an alias:
 
 ```python
 def effective_preds(idx):
@@ -217,12 +225,15 @@ def effective_preds(idx):
         p = stack.pop()
         if p in seen: continue
         seen.add(p)
-        if isinstance(dag.by_index[p].sched, ReshapeNode):
+        if _is_alias_node(dag.by_index[p].sched):   # ReshapeNode or Slice view
             stack.extend(dag.predecessors(p))
         else:
             out.add(p)
     return out
 ```
+
+A host-CPU producer is returned too, but has no lane, so it never
+generates a wait (it completed inline).
 
 Without this pass-through, a `Pool → Squeeze → MatMul` chain would
 leave the Pool lane unwaited when MatMul starts — exactly the
@@ -242,8 +253,9 @@ flowchart LR
 ```
 
 The same machine handles arbitrarily-deep alias chains
-(`Conv → Squeeze → Unsqueeze → Reshape → MatMul`) — see
-`nop_chain_dropout_fork.onnx` for a 3-deep test case.
+(e.g. `Conv → Squeeze → Unsqueeze → Reshape → MatMul`) — see
+`nop_chain_dropout_fork.onnx` (`Conv → Dropout → Dropout → Dropout`,
+then MaxPool and Mul on the alias) for a 3-deep test case.
 
 ### 4.2 Per-node procedure
 
@@ -251,11 +263,11 @@ For each `sn` in `graph.nodes` (graph order):
 
 ```
 emit ('comment', sn.index)
-if sn is ReshapeNode:
+if sn is ReshapeNode or a Slice view:
     emit ('reshape', sn.index)
     continue                                 # no kernel work, no events
 
-target = lane(sn)
+target = lane(sn)                            # None for host-CPU nodes
 
 # 1. Wait on each effective predecessor whose lane is still in flight.
 waits = []
@@ -275,8 +287,10 @@ for (lane_, drained) in waits:
     emit ('wait', lane_, drained)
     pending.pop(lane_, None)
 
-# 3. Start the kernel.
-if is_synchronous(sn):                       # MatmulNode 4D×3D outer loop
+# 3. Start the kernel (or run the host code).
+if sn is SpaceToDepthNode or HostNode:       # §4.3
+    emit ('cpu', sn.index)
+elif is_synchronous(sn):                     # MatmulNode 4D×3D outer loop
     emit ('start_sync', sn.index)
     pending.pop(target, None)
 else:
@@ -386,19 +400,19 @@ stream's index space.
 
 ```python
 events     = compute_event_stream()
-start_event[node_idx]    = index of ('start' | 'start_sync', node_idx)
-drain_event[drained_idx] = index of the corresponding ('wait' | 'drain' | 'start_sync')
+start_event[node_idx]    = index of ('start' | 'start_sync' | 'cpu', node_idx)
+drain_event[drained_idx] = index of the corresponding ('wait' | 'drain' | 'start_sync' | 'cpu')
 
 intermediates = { t for t in graph.intermediate_tensors
-                  if t.onnx_name not in reshape_aliases }
+                  if t.onnx_name not in alias_source_map }   # Reshape aliases, Slice views
 
 # Walk producers/consumers; resolve consumer reads through alias chains.
 producer_of[name]   = idx that wrote the tensor
 consumers_of[name]  = []   # nodes that read the tensor (or one of its aliases)
 for sn in graph.nodes:
-    if isinstance(sn, ReshapeNode): continue
+    if is_alias_node(sn): continue
     for inp in sn.inputs:
-        src = resolve_alias_chain(inp.onnx_name)   # walks through ReshapeNodes
+        src = resolve_alias_chain(inp.onnx_name)   # walks through Reshape aliases / Slice views
         if src in intermediates and src != sn.output.onnx_name:
             consumers_of[src].append(sn.index)
 
@@ -418,7 +432,7 @@ Three details that matter:
   long Reshape chain would orphan the source's interval and break the
   consumer's lane wait.
 - **Synchronous nodes** have `start_event == drain_event` (the
-  `start_sync` event itself), giving them a degenerate interval and
+  `start_sync` or `cpu` event itself), giving them a degenerate interval and
   preventing any cross-lane reuse during the call.
 - **No-consumer tensors** fall back to `drain_event[producer]`, which
   is set by the final drain sweep. That covers the niche case of a
@@ -429,7 +443,9 @@ Three details that matter:
 ## 6. Pool-slot coloring (`_compute_pool_layout`)
 
 Standard interval-graph greedy first-fit with one twist: the input
-intervals are the event-stream-based ones from §5.
+intervals are the event-stream-based ones from §5.  The colouring itself
+lives in `_compute_intermediate_layout()`; `_compute_pool_layout()` places
+its slot region after the weights and the DMA states.
 
 ```python
 slots = []   # each: [end_event, allocated_elems, [tensor_name, ...]]
@@ -451,7 +467,15 @@ for name, (start_ei, end_ei) in sort_by_start_then_neg_alloc(intervals):
 
 Each slot is padded up to a 64-byte boundary so every sub-buffer is
 cache-line aligned. Weights are placed before the slot region in
-declaration order (they live for the entire call and never share).
+declaration order (they live for the entire call and never share),
+followed by the DMA states (persistent across calls, never shared).
+Host-memory intermediates (`axi.numeric` `host` tensors) are coloured the
+same way into a separate malloc'd arena (`_compute_host_layout`, 64-byte
+slots).  In a multi-entry project each entry is coloured on its own and
+all entries' slot regions overlap in one pool region.
+
+Tensors are sorted by start event, ties broken largest-alloc first, so the
+biggest buffer claims a slot and smaller ones only reuse it.
 
 ---
 
@@ -459,19 +483,19 @@ declaration order (they live for the entire call and never share).
 
 ### 7.1 Linear chain — control case
 
-`relu_chain.onnx`: X → Relu → a → Relu → b → Relu → Y.
+`relu_chain.onnx`: X + bias → Add → add_Y → Relu → relu_Y.
 
-- Three nodes, all on `KERNEL_VECTOROP`.
-- Each predecessor is on the same lane as its consumer, so each step
+- Two nodes, both on `KERNEL_VECTOROP` (with `OnnxGraph(fuse_act=False)`,
+  the library default; the CLI folds the Relu into the Add's `act`).
+- The predecessor is on the same lane as its consumer, so the step
   emits one wait, one start.
 - Final drain handles the last node.
-- All intervals are short and disjoint; one slot suffices.
+- The only intermediate, `add_Y`, has interval `[1, 5]`; one slot.
 
 ```
 Start(0)              pending {V:0}
 Wait(V,0); Start(1)   pending {V:1}
-Wait(V,1); Start(2)   pending {V:2}
-Drain(V,2)
+Drain(V,1)
 ```
 
 This is the strict-chain baseline that any future scheduler change
@@ -517,13 +541,14 @@ Event-stream intervals:
 
 | Tensor | Producer | start | end | Slot |
 |--------|----------|-------|-----|------|
-| ca0    | convA    |   1   |  3  |  0   |
+| ca0    | convA    |   1   |  6  |  0   |
 | ca1    | reluA    |   4   | 14  |  1   |
 | ca2    | poolA    |   7   | 17  |  0   |
 | cb0    | convB    |   9   | 15  |  2   |
 | cb1    | reluB    |  12   | 17  |  3   |
 
-`ca1 [4,14]` and `cb0 [9,15]` overlap — distinct slots. `ca0 [1,3]`
+`ca0` is held until its consumer reluA drains (the wait at event 6).
+`ca1 [4,14]` and `cb0 [9,15]` overlap — distinct slots. `ca0 [1,6]`
 ends before `ca2 [7,17]` starts → reuse slot 0. Correct on hardware
 and locked in by `TestEventTimelineLiveness`.
 
@@ -563,7 +588,7 @@ gantt
     axisFormat %s
 
     section Slot 0 (shared)
-    ca0   :done,   1, 3
+    ca0   :done,   1, 6
     ca2   :done,   7, 17
 
     section Slot 1
@@ -576,7 +601,7 @@ gantt
     cb1   :crit,   12, 17
 ```
 
-Slot 0 reuse is safe (`ca0` ends at 3, `ca2` starts at 7). Every
+Slot 0 reuse is safe (`ca0` ends at 6, `ca2` starts at 7). Every
 other tensor needs its own slot because its interval overlaps with at
 least one already-placed tenant.
 

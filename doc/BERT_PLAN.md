@@ -16,8 +16,7 @@ alone 4.34 s, 2B alone 8.79 s.
 
 ## 0. Feasibility (measured 2026-09-26)
 
-**Numerics — no blocker.**  `scratchpad/bert/bert_study.py` (to be moved
-to `demo/bert_squad/scripts/`) runs the model through a numpy interpreter
+**Numerics — no blocker.**  `demo/bert_squad/scripts/bert_study.py` runs the model through a numpy interpreter
 (matches onnxruntime to 4e-6) and a bit-level emulation of this project's
 datapath: every tensor that lives in DDR is `ap_fixed<16,8>`; MatMul/Gemm
 take Q8.8 inputs, accumulate exactly (`ap_fixed<32,16>`) and floor +
@@ -465,7 +464,9 @@ freshly booted board.  It did not reproduce in five single-example ablations (ca
 on / off × 1 / 4 threads × profiling) nor in two repeat N = 20 profile runs
 with telemetry (per-CPU liveness probe every 2 s, PSI cpu ≤ 6 %, io ≤ 3.5 %,
 memory 0, no blocked daemons, no journal watchdog / dbus timeouts, 1.33 GHz
-throughout, AMS ≤ 34 °C, latency flat).  Root cause unknown.
+throughout, AMS ≤ 34 °C, latency flat).  Root cause unknown.  *Update 2026-09-27:* most likely
+the PSCI core power-down hang, see CHAT_PLAN.md §18 (workaround
+`board/kv260/kv260-no-cpu-powerdown.conf`).
 
 ### Phase 2A + 2B combined on the board (2026-09-26, main af350ca)
 

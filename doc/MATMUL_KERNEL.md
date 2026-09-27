@@ -22,9 +22,9 @@ clock across `kTileM` parallel MAC lanes.
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (MATMUL_OPTIMISATION §3) |
-| `gmem1` | `b` | Read | Matrix B `[k][m]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat |
-| `gmem2` | `c` | Write | Matrix C `[n][m]`, row-major — 16-bit element port |
+| `gmem0` | `a` | Read | Matrix A `[n][k]`, row-major — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (MATMUL_OPTIMISATION §3); requests ≤ 256 words, 4 outstanding |
+| `gmem1` | `b` | Read | Matrix B `[k][m]`, row-major or packed (below) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat; requests ≤ 64 words, 16 outstanding |
+| `gmem2` | `c` | Write | Matrix C `[n][m]`, row-major — 16-bit element port (`Data_t*`; HLS reports `Widen Fail` for it, the runtime row stride `m` gives no alignment guarantee) |
 
 Keeping A, B, and C on separate AXI buses lets HLS issue their reads and
 writes concurrently.
@@ -47,7 +47,10 @@ writes concurrently.
 Memory layout is row-major: `A[row·k + col]`, `B[row·m + col]`,
 `C[row·m + col]`.  `a` and `b` must be 16-byte aligned base addresses;
 the kernel derives every row's covering 128-bit word range itself, so
-batch strides and tile offsets are ordinary element offsets.  A word
+batch strides and tile offsets are ordinary element offsets.  The last
+word of a row segment may extend up to 7 elements past the matrix end;
+those lanes are discarded, but the bytes must be mappable (the scheduler
+aligns and pads every buffer to `INFERENCE_ALIGN_BYTES`).  A word
 whose lane 0 is not the row's first element is rotated once by the row's
 lane shift (`matmul_rotate_lanes`), after which bank / column `j` always
 takes lane `j % 8` — fixed wiring, only the write enables depend on the
@@ -72,23 +75,32 @@ row-major layout (`b_packed = 0`).
 
 ## 2. Compile-Time Configuration (`Config.h.in`)
 
-CMake substitutes the data types and tile constants into `Config.h`:
+CMake substitutes the data types (`MM_DATA_TYPE`, `MM_ACC_DATA_TYPE` cache
+variables) and the tile constants into `Config.h`.  The tile constants have
+no CMake defaults: they are read from `kernels.matmul` (`tile_n`, `tile_m`,
+`tile_k`, `max_k`) of `platforms/<AXI_PLATFORM>.json` (values below are
+`kv260.json`); the scheduler reads the same fields through
+`inference-scheduler/src/_matmul_hw_config.py`.
 
 | Constant | Default | Purpose |
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `AccData_t` | `ap_fixed<32,16>` | Accumulator type (wider range, avoids overflow) |
 | `kTileN` | 4 | Output-row tile / accumulator-lane interleave depth. Power of 2; must be ≥ MAC latency (≈3) for II=1 |
-| `kTileM` | 32 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2 (16 until MATMUL_OPTIMISATION.md §8) |
+| `kTileM` | 32 | Output columns processed per cycle — one DSP accumulator lane each. Power of 2, multiple of 8 (16 until MATMUL_OPTIMISATION.md §8) |
 | `kTileK` | 256 | On-chip B-buffer K-slice depth. Power of 2 (so `k_tile` indexing needs no divider) |
-| `kMaxK` | 2048 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf`. Models with `K > kMaxK` are rejected by the scheduler |
+| `kMaxK` | 4096 | Compile-time upper bound on the inner dimension `K`; sizes `a_buf`. Models with `K > kMaxK` are rejected by the scheduler (2048 until BERT's `K = 3072` FFN down-projection) |
 
-If Vitis HLS headers are unavailable at configure time, the types fall back
-to `float` / `double`.
+If CMake cannot find `ap_fixed.h` it still falls back to `float` /
+`double`, but that configuration no longer builds: `MatmulKernel.h`
+includes `ap_int.h` and `hls_burst_maxi.h`, and with 32-bit lanes (4 per
+word) an A row and a packed B block exceed the request windows
+(`static_assert`s in `MatmulKernel.cpp`).  The Vitis HLS headers are
+required; the only configuration built and tested is `ap_fixed<16,8>`.
 
 **`AccData_t` overflow budget.** With `ap_fixed<16,8>` operands the
-worst-case product is `127.996² ≈ 16383`; `ap_fixed<32,16>` saturates near
-`32767`, so accumulation is exact for `K ≤ 2` at full-scale inputs and for
+worst-case product is `127.996² ≈ 16383`; `ap_fixed<32,16>` tops out near
+`32767` (and wraps beyond it — default `AP_WRAP`), so accumulation is exact for `K ≤ 2` at full-scale inputs and for
 `K ≤ ~200` at the typical neural-net range `|v| ≤ 8`. Larger `K` budgets
 need a wider accumulator (`-DMM_ACC_DATA_TYPE=ap_fixed<40,24>`).
 
@@ -171,7 +183,7 @@ for bi in [0, batch)                              // a/b/c advanced by *_batch_s
         // be loaded (k_tile fastest, then m_tile, n_tile, batch; a
         // single-block B — m_tiles == k_tiles == 1 — is reloaded only at
         // the next batch slice, never when it broadcasts) and, for the
-        // packed layout, its ≤ 8 × 64-word requests are issued.
+        // packed layout, its ≤ 16 × 64-word requests are issued.
         if load_b: (first block ? drain into cur_bank : cur_bank ^= 1); start fetch of next block
 
         // K-REDUCTION — iterates seg_len·kTileN times                     PIPELINE II=1
@@ -278,15 +290,15 @@ without copying the broadcast operand in DDR.
 
 `saturate_cast<Data_t>(v)` (defined in `MatmulKernel.h`) converts an
 `AccData_t` accumulator back to `Data_t`. For `ap_fixed` it routes through
-`ap_fixed<W,I,AP_TRN,AP_SAT>` — truncation toward zero, then saturation
-clamping — matching ONNX fixed-point semantics; it is applied in the C-write
-loop. The primary template is an identity pass-through for `float` / `double`
-builds. The `ap_fixed` specialisation is guarded by `MATMUL_HAVE_APFIXED` so
+`ap_fixed<W,I,AP_TRN,AP_SAT>` — truncation toward −∞ (floor), then
+saturation clamping; it is applied in the C-write loop. The primary
+template is an identity pass-through for non-`ap_fixed` types. The
+`ap_fixed` specialisation is guarded by `MATMUL_HAVE_APFIXED` so
 the matmul subdirectory stays self-contained (it does not depend on the
 VectorOPKernel headers).
 
 The MAC multiplies the two `Data_t` operands directly
-(`a_val · b_tile[kk][m1]`): for `ap_fixed<16,8>` the product type is
+(`a_val · b_tile[m1][…]`): for `ap_fixed<16,8>` the product type is
 exactly `ap_fixed<32,16>`, so the sum into `AccData_t` is bit-identical to
 widening the operands first, at one 16×16 DSP per column instead of two
 (MATMUL_OPTIMISATION.md §4).
@@ -295,32 +307,37 @@ widening the operands first, at one 16×16 DSP per column instead of two
 
 ## 8. Test Coverage (`TestMatmulSim.cpp`)
 
-C-simulation tests compiled with GCC. Each case runs `MatmulKernel` against
-`ref_matmul_2d()` — a naive triple-nested-loop oracle that uses the same
-`AccData_t` accumulation and `saturate_cast<Data_t>` output, so fixed-point
-results are bitwise-identical (exact comparison); `float` builds allow a
-1-ULP tolerance for reordered tile sums.
+C-simulation tests compiled with GCC (CTest name `TestMatmulRef`, 39
+cases). Each case runs `MatmulKernel` against `ref_matmul_2d()` — a naive
+triple-nested-loop oracle that uses the same `AccData_t` accumulation and
+`saturate_cast<Data_t>` output, so results are bitwise-identical (exact
+comparison).
 
 | Category | Cases |
 |----------|-------|
-| Degenerate | `1×1×1`; unit-N (`1×K×M`); unit-M (`N×K×1`) |
-| Exact tiles | `kTileN × kTileK × kTileM` — one full tile in every dimension |
-| Partial last tile | partial N (`kTileN+2`); partial M (`kTileM+3`); partial K (`kTileK+5`, spans 2 K-tiles) |
-| Multi-tile | all dims span 2 tiles; `kTileN·… × kTileK·2+7 × kTileM·2+1` |
+| Degenerate | `1×1×1`; `K=1` outer product (`(kTileN+1)×1×(kTileM+1)`); unit-N (`1×K×M`); unit-M (`N×K×1`) |
+| Exact tiles | `kTileN × kTileK × kTileM` — one full tile in every dimension; each dimension doubled on its own (2 full tiles) |
+| Partial last tile | partial N (`kTileN+2`); partial M (`kTileM+3`); partial K (`kTileK+5`, spans 2 K-tiles); all three at once |
+| Multi-tile | `3·kTileN × (2·kTileK+7) × (2·kTileM+1)` |
 | Arbitrary | `7×13×5` (all dims below the tile sizes) |
 | Batch | `batch=3` without broadcast; `batch=4` with A / B broadcast; `batch=6` |
-| Packed B | the tile-major layout on the same geometries (9 cases) |
+| Packed B | the tile-major layout on the same geometries plus a `1 × 2·kTileK × 4·kTileM` FC-like case (9 cases) |
 | K-split (§5 of the optimisation log) | `1×261×19`, `2×13×5`, `3×517×33`, row-major and packed |
 | B prefetch (§7) | `batch=3, 6×517×35` (`k_tiles=3`, `m_tiles=3`, `n_tiles=2`), with and without B broadcast, both layouts |
+| Saturation | `a=100`, `b=±100`, `K=3` → `AP_MAX` / `AP_MIN` |
 
 A second test, **`TestMatmulBlas.cpp`**, validates the configured kernel
 (`ap_fixed<16,8>`) bit-exactly against `cblas_sgemm` when a BLAS library is
 found at configure time: inputs are multiples of 2^-8 with |x| ≤ 0.25, so
-every partial sum is exact in both float and `AccData_t`, and the reference
-applies the kernel's own `saturate_cast` before comparing (shapes,
-K = kMaxK, ±128 saturation, batches, packed B); 23 cases.
+every partial sum over `K ≤ kMaxK` terms is an integer ≤ 2^24 in units of
+2^-16 and exact in both float and `AccData_t`, and the reference applies the
+kernel's own `saturate_cast` before comparing (shapes, large K up to
+`kMaxK`, sums of exactly −128 / +128 at `K = 2048` plus a `K = kMaxK`
+saturation case, batches, packed B); 24 cases.
 `make gen_matmul_test_data` re-runs the reference in `--dump-data` mode to
-emit hex fixtures for the HDL testbench.
+emit hex fixtures (A / B / C_ref per case plus a `manifest.txt` with a
+`b_packed` column) into `build/matmul_test_data/`; the RTL behaviour test
+reads the checked-in copy under `hw/test_data/matmul_test_data/`.
 
 ---
 
@@ -338,6 +355,14 @@ emit hex fixtures for the HDL testbench.
 decomposes `Gemm` into `MatMul` + optional `Add` at model-load time, so the
 MatmulKernel only ever sees plain `MatMul`.
 
+Not every `MatMul` runs here: `src/matmul_lowering.py` replaces a
+`MatmulNode` by a `MatmulConvNode` (ConvKernel with swapped operand roles)
+wherever the cost model estimates ConvKernel to be faster
+(`--matmul-on-conv auto`, the default; `always` / `off`), bit-identical
+either way.  Batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16
+rows and the 4-D × 3-D outer loops stay on MatmulKernel
+(`doc/BERT_PLAN.md` §2 2A).
+
 The code-generated `run_matmul()` writes the AXI-Lite registers and calls
 `XMatmulkernel_Start()` non-blocking; `run_matmul_at()` (used inside the
 4-D × 3-D outer loop, where iterations would otherwise race on the shared
@@ -350,17 +375,23 @@ the result.
 ## 10. Build Targets
 
 ```bash
-# C simulation (GCC, no Vitis)
-make TestMatmulRef && ctest
+# C simulation (GCC + the Vitis HLS headers; no HLS tool run)
+make TestMatmulRef && ctest -R Matmul    # TestMatmulBlas too when BLAS is found
+make gen_matmul_test_data                # RTL fixtures → build/matmul_test_data/
 
 # HLS synthesis + IP export for KV260
 make synthesize_matmul_kv260
+make cosim_matmul_kv260                  # csynth + C/RTL co-simulation (slow)
+make behavior_test_matmul                # Vivado xsim on the test stand (hw/cormorant_test_stand)
 ```
 
 The synthesis target reads a `platforms/<name>.json` (part, optional board
-and clock) and invokes Vitis HLS via `Synthesis.tcl.in`, which configures the
-project, sets 64-bit AXI and the bus width, runs `csynth_design`, and exports
-an IP-catalog archive.
+and clock) and invokes Vitis HLS via `Synthesis.tcl.in` (Vitis unified
+component flow, `open_component`), which sets the part and clock, enables
+64-bit AXI addresses and `-m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}`, runs
+`csynth_design`, and exports an IP-catalog archive
+(`build/kernels/matmul/<name>/ip_catalog.zip`; the IP repository Vivado
+uses is `build/kernels/matmul/<name>/matmul_<name>/hls/impl/ip`).
 
 ---
 
@@ -374,6 +405,9 @@ an IP-catalog archive.
 | `kernels/matmul/test/TestMatmulSim.cpp` | C simulation tests (GCC) |
 | `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
 | `kernels/matmul/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
+| `kernels/matmul/scripts/Cosim.tcl.in` | csynth + C/RTL co-simulation TCL template |
+| `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`) |
+| `inference-scheduler/src/_matmul_hw_config.py` | Scheduler-side reader of the same bounds |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |
 | `inference-scheduler/src/codegen/_source.py` | `run_matmul()` / `run_matmul_at()` code generation |
 | `inference-scheduler/src/graph.py` | `Gemm` → `MatMul` + `Add` decomposition |
@@ -384,10 +418,10 @@ an IP-catalog archive.
 
 | Aspect | Details |
 |--------|---------|
-| **Supported ONNX op** | `MatMul` (`Gemm` decomposed to `MatMul` + `Add` at load time) |
+| **Supported ONNX op** | `MatMul` (`Gemm` decomposed to `MatMul` + `Add` at load time); those not lowered onto ConvKernel (§9) |
 | **Operation** | `C = A × B`, batched, row-major |
-| **Data type** | `ap_fixed<16,8>` (default) or `float` |
-| **Accumulator type** | `ap_fixed<32,16>` (default) or `double` |
+| **Data type** | `ap_fixed<16,8>` (the only built / tested configuration, §2) |
+| **Accumulator type** | `ap_fixed<32,16>` (default) |
 | **Tiling** | `kTileN=4` rows × `kTileM=32` columns × `kTileK=256` inner |
 | **Inner-loop parallelism** | `kTileM=32` MACs/cycle (unrolled `m1` lanes) |
 | **Initiation interval** | II=1 in every load / reduce / write loop |
@@ -398,10 +432,10 @@ an IP-catalog archive.
 | **A reuse** | `a_buf` loaded once per `n_tile` (row requests batched 4 deep), reused across all `m_tile`/`k_tile` |
 | **B reuse** | single-block B (`m ≤ kTileM`, `k ≤ kTileK`) loaded once per batch slice (once per call when it broadcasts) |
 | **Batch broadcasting** | `a_batch_stride` / `b_batch_stride` = 0 reuses A / B |
-| **Inner-dimension limit** | `k ≤ kMaxK` (2048, compile-time); `n` / `m` / `batch` unbounded |
-| **AXI master ports** | 3 (gmem0 `a`, gmem1 `b`, gmem2 `c`) |
-| **AXI-Lite registers** | 10 scalars/pointers + `return` |
+| **Inner-dimension limit** | `k ≤ kMaxK` (4096, compile-time); `n` / `m` / `batch` unbounded |
+| **AXI master ports** | 3 (gmem0 `a` and gmem1 `b`: 128-bit `burst_maxi`; gmem2 `c`: 16-bit) |
+| **AXI-Lite registers** | 11 scalars/pointers (`b_packed` last, offset `0x6C`) + `return` |
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` at the C-write |
 | **AXI-Lite base address** | `0xA001_0000` |
 | **Driver prefix** | `xmatmulkernel` |
-| **UIO device name** | `MatmulKernel_0` |
+| **UIO device name** | `fabric_matmul` with the KV260 overlay (`dts/kv260/cormorant.dts`); generated code defaults to `MatmulKernel_0` (`INFERENCE_MATMULKERNEL_INSTANCE`) |

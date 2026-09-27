@@ -7,17 +7,20 @@ experiment, the rationale, and the measured HW behavior-simulation
 
 For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 
-> **Status (2026-09-25).** §1 is the original single-sequential-loop-nest
+> **Status (2026-09-27).** §1 is the original single-sequential-loop-nest
 > kernel; §2 records a DATAFLOW restructuring that was **tried and
 > rejected**; §3 / §3b (128-bit ports, packed B) and §4–§8 (Track A of
 > `doc/THROUGHPUT_PLAN.md`: 16×16 MAC, K-split, rotate scatter, `b_tile`
-> ping-pong prefetch, `kTileM = 32`) have **landed**.  The RTL stand runs
-> 39 fixtures; every §4–§8 table compares against the §3b kernel on the
-> same 39 cases.
+> ping-pong prefetch, `kTileM = 32`) have **landed**, followed by
+> `max_k` 2048 → 4096 (§9).  The RTL stand runs 39 fixtures; every §4–§8
+> table compares against the §3b kernel on the same 39 cases.  §9b has
+> the on-board numbers after Track A.
 
 ---
 
 ## 1. Current performance baseline
+
+> Superseded by §3–§8; kept as the reference point of the original kernel.
 
 All numbers are `sim_time_ns` reported by the kv260 behavior testbench
 (`matmul_op_test`) over the full 20-test fixture list. The testbench runs at a
@@ -204,6 +207,9 @@ Predictions and logits identical.  Demo projects must be regenerated
 after this change: a project generated before the register existed
 inherits whatever `b_packed` value the previous run left in the kernel.
 
+> The next two paragraphs predate §3 / §3b (the analysis that motivated
+> them).  The packed layout they propose is §3b, the B-latency overlap is
+> §7; the 16-bit C port remains.
 
 The DATAFLOW experiment confirmed the bottleneck is **DDR bandwidth**, not
 MAC throughput. The synthesis `M_AXI Burst Information` shows the cause:
@@ -749,8 +755,9 @@ as THROUGHPUT_PLAN.md §2 predicted ("then port-bound").  `1×1×1`,
 `2×13×5`, `M = 1` are unchanged; the K = 3 saturation cases +8 % (twice
 the C writes).  Integration: every packed weight image and generated
 project must be regenerated (`MATMUL_TILE_M` follows the JSON); the one
-scheduler test that hard-codes the padding, `test_mixed_kernel.py::
-TestSpatialMatmulRelu::test_w_flat` (`224 * 16`), needs `MATMUL_TILE_M`.
+scheduler test that hard-coded the padding, `test_mixed_kernel.py::
+TestSpatialMatmulRelu::test_w_flat` (`224 * 16`), now derives it from
+`MATMUL_TILE_M`.
 
 Synthesis: II=1 on every loop, slack 0.00 ns, BRAM 64 → **80** (the 16
 extra `b_tile` column RAMs; +8 BRAM36 tiles, as budgeted in
@@ -764,9 +771,18 @@ kernel had before this track.
 
 | Gate | Command | Result after §8 |
 |---|---|---|
-| C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` 23/23 bit-exact against `cblas_sgemm`, §9a) |
+| C-simulation | `ctest -R Matmul` | `TestMatmulRef` 39/39 bit-exact (`TestMatmulBlas` 23/23 bit-exact against `cblas_sgemm`, §9a; 24/24 since `max_k = 4096`) |
 | HLS synthesis | `make synthesize_matmul_kv260` | II=1 on every loop, slack 0.00 ns at 150 MHz; BRAM 80, DSP 49, LUT 41.8 k |
 | RTL behavior test | `make behavior_test_matmul` | 39/39 pass (test stand with per-test alternating DDR base); per-case timings in the §4–§8 tables |
+
+**`max_k` 2048 → 4096 (2026-09-25).**  `platforms/kv260.json`
+`kernels.matmul.max_k` doubled for BERT's FFN down-projection (`K = 3072`).
+The `a_buf` banks go from 256 to 512 entries inside the same BRAM18s and
+the A-row request window still holds (a 4096-element row is 513 words,
+3 of the 4 outstanding requests).  Synthesis at 150 MHz unchanged: BRAM 80,
+DSP 49, FF 24.9 k, LUT 41.8 k, slack 0.00 ns.  C-sim 39/39;
+`TestMatmulBlas` gained a `K = kMaxK` saturation case (24/24, §9a).  The
+scheduler's `k ≤ kMaxK` check follows the JSON.
 
 ---
 
@@ -784,16 +800,12 @@ exact in both float and `AccData_t`; the reference applies the kernel's
 `saturate_cast` to the exact sum.  Two constant-input cases hit sums of
 exactly -128 (stored) and +128 (saturated).  23/23.
 
-## 10. Related files
+> Since `max_k = 4096` (§9): the bound is `K · 64 · 64 ≤ 2^24` (partial sums
+> ≤ 2^24 in units of 2^-16, still exact in float); the two ±128 cases stay
+> at `K = 2048` and a third constant-input case at `K = kMaxK` saturates;
+> 24/24.
 
-| File | Purpose |
-|---|---|
-| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (single sequential loop nest) |
-| `doc/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
-| `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
-| `build/kernels/matmul/kv260/matmul_op_test_report.json` | Per-test behavior-test report |
-
-## 9. On board after Track A (2026-09-26)
+## 9b. On board after Track A (2026-09-26)
 
 Bitstream with Tracks C, B and A merged (WNS +1.39 ns; design LUT 62 %,
 BRAM 119/144 tiles, DSP 43 %).  144/144 scheduler models PASS with the
@@ -818,4 +830,14 @@ The square cases reach 4.6–4.7 GOps/s of the 6.4 GOps/s peak of the
 ms ≈ 1.5 GB/s of the 1.6 GB/s read channel).  Demos: MNIST convnet
 0.732 → 0.729 ms (its Gemm is now ~40 µs), MobileNet v2 225 → 221 ms and
 ResNet-18 311 → 310 ms through their classifiers; predictions identical.
+
+## 10. Related files
+
+| File | Purpose |
+|---|---|
+| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (single sequential loop nest) |
+| `doc/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
+| `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
+| `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (39 cases, `manifest.txt`) |
+| `build/kernels/matmul/kv260/matmul_op_test_report.json` | Per-test behavior-test report |
 

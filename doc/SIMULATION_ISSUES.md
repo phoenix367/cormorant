@@ -1,6 +1,9 @@
 # MPSoC PS VIP Simulation — API Internals and Known Issues
 
-Vivado 2025.2 / `zynq_ultra_ps_e_vip_v1_0` / xsim
+Vivado 2025.2 / `zynq_ultra_ps_e_vip_v1_0` (module prefix `zynq_ultra_ps_e_vip_v1_0_22_`) / xsim
+
+The testbenches this applies to are the four `cormorant_test_stand` benches
+driven by `make behavior_test_<k>` (see §8).
 
 ---
 
@@ -14,13 +17,15 @@ Vivado 2025.2 / `zynq_ultra_ps_e_vip_v1_0` / xsim
 
 | Parameter   | Type                    | Notes |
 |-------------|-------------------------|-------|
-| `buf_mem`   | `logic [CHUNK_BITS-1:0]`| Source buffer. `CHUNK_BITS = CHUNK_SIZE * 8 = 8192`. |
-| `base_addr` | `[39:0]`                | Byte address in PS DDR space. |
-| `nbytes`    | `int unsigned`          | Number of bytes to transfer. **Must not exceed `CHUNK_SIZE`**. |
+| `buf_mem`   | `logic [CHUNK_BITS-1:0]`| Source buffer. `CHUNK_BITS = CHUNK_SIZE * 8 = 8192` in the test-stand benches. |
+| `base_addr` | `[39:0]`                | Byte address in PS DDR space. Must be 4-byte aligned (otherwise the VIP prints an error and `$stop`s under `set_stop_on_error(1)`). |
+| `nbytes`    | `int unsigned`          | Number of bytes to transfer. **Must not exceed the bytes actually filled in `buf_mem` (`CHUNK_SIZE`)**. |
 
-**Hard limit: `CHUNK_SIZE = 1024` bytes per call.**
+`write_mem` is a backdoor load: it goes straight to `ddrc.ddr.write_mem()` (the sparse memory model, §7.6) with all strobes set, without any AXI transaction.
 
-Calling `write_mem` with `nbytes > 1024` does NOT split the transfer internally. It reads bits beyond index `8191` of `buf_mem`, which are undriven (`X`), and writes `X` values into DDR. The simulation continues without an immediate error; the `X` propagates into AXI read data later, causing a fatal `AXI4_ERRS_RDATA_X` assertion at the point the kernel reads those addresses.
+**Hard limit per call: the bench buffer, `CHUNK_SIZE = 1024` bytes.** The VIP's own `data` argument is `max_burst_bits` = 32768 bits wide (4096 bytes, §7.3), so the VIP accepts any `nbytes` up to 4096 without complaint.
+
+Calling `write_mem` with `nbytes > CHUNK_SIZE` does NOT split the transfer. The VIP copies `nbytes` bytes of its 32768-bit argument, so the bytes past what the bench filled carry whatever the upper bits hold (`X` for a wider, partially filled buffer). The simulation continues without an immediate error; the `X` propagates into AXI read data later, causing a fatal `AXI4_ERRS_RDATA_X` assertion at the point the kernel reads those addresses.
 
 **Correct pattern for large buffers — chunk loop:**
 
@@ -61,12 +66,14 @@ end
 
 ## 2. DDR Memory Array Addressing
 
-The PS VIP internal DDR model is split into two 2 GB banks:
+The PS VIP internal DDR model is split into two sparse 1 GB banks (2^28 32-bit words each):
 
 ```
-dut.<ps_inst>.inst.ddrc.ddr.ddr_mem0[index]   // word_addr[28] == 0
-dut.<ps_inst>.inst.ddrc.ddr.ddr_mem1[index]   // word_addr[28] == 1
+dut.<ps_inst>.inst.ddrc.ddr.ddr_mem0[index]   // word_addr[28] == 0  (byte 0x0000_0000–0x3FFF_FFFF)
+dut.<ps_inst>.inst.ddrc.ddr.ddr_mem1[index]   // word_addr[28] == 1  (byte 0x4000_0000–0x7FFF_FFFF)
 ```
+
+Word-address bits above 28 are ignored by the indexing, so higher byte addresses alias onto these two banks.
 
 Each array element is a **32-bit word** (4 bytes). Index computation from a byte address:
 
@@ -106,20 +113,21 @@ end
 
 `prt_req = 1` fires in the **active event region** of `posedge sw_clk`. The DDRC's `always @(posedge sw_clk)` block also fires in the same active region. Depending on elaboration/evaluation order, DDRC may sample `wr_req` high while `wr_addr`, `wr_bytes`, `wr_strb`, and `wr_data` still hold the **previous burst's values** (the `#0`-delayed assignments have not yet executed).
 
-The result is that narrow writes — specifically any burst where `WSTRB != 0xF` — are silently written to the wrong address or dropped. This affects the last element of any odd-count vector when `ap_fixed<16,8>` elements are 2 bytes wide (last beat carries only 2 of 4 bytes → WSTRB = `0x3`).
+The result is that narrow writes — any beat whose WSTRB is not all ones — are silently written to the wrong address or dropped, and the racing write can also deposit stale data in the bytes such a beat leaves *unstrobed*.
 
 ### Effect on Simulation
 
-- Vectors of even count (e.g., 32, 64) pass correctly.
-- Vectors of any count where the last AXI word is only partially written (odd count with 2-byte elements) lose their last element.
-- The kernel writes the correct value, but DDR contains stale data from the previous burst for that last word.
+- Originally found with 32-bit ports: the last element of an odd-count `ap_fixed<16,8>` vector (last beat WSTRB = `0x3`) was lost; even counts passed.
+- With the current 128-bit ports, partial-strobe beats come from the ConvKernel and PoolingKernel `y` ports (byte-strobed run edges, `doc/CONV_OPTIMISATION.md` §2.38 / `doc/POOL_OPTIMIZATION.md` §2.14) and from the MatmulKernel `c` writes (a 16-bit port — HLS does not widen it — so every beat is a partial strobe once upsized to the 128-bit PS port). VectorOPKernel writes every output word whole (tail lanes = 0), so it no longer produces partial beats.
+- Stale-byte variant (`doc/CONV_OPTIMISATION.md` §2.38): a `y` beat with `WSTRB = 0x00ff` landed the line's pre-poison contents (a previous case's outputs at the same DDR line) in bytes 8..15. Single-case reruns hide it — it needs an earlier AXI write to the same line, so run the whole suite.
+- In all cases the kernel's beat is correct; the DDR model holds the wrong bytes.
 
 ### Fix Option A — Patch `arb_wr_6` (VIP source edit)
 
 Move `prt_req = 1` to **after** `prt_bytes` in every dispatch block. With `prt_req` last, it fires in the inactive event region (after all `#0` suspensions resolve), so DDRC sees `wr_req=0` on the current posedge and samples the fully-settled parameters at the **next** posedge.
 
-A Python script to apply this to the Xilinx installed file:
-`/home/ivan/vivado_projects/fix_arb_wr6_prt_req.py`
+A Python script (outside this repository) applies this to the Xilinx installed file:
+`/home/ivan/vivado_projects/fix_arb_wr6_prt_req.py`.  The installed VIP source is currently unpatched; the test-stand benches rely on Option B instead.
 
 Target file:
 `/mnt/data/xilinx/2025.2/data/ip/xilinx/zynq_ultra_ps_e_vip_v1_0/hdl/zynq_ultra_ps_e_vip_v1_0_vl_rfs.sv`
@@ -162,7 +170,13 @@ initial begin : ddrc_wr_fix
 end
 ```
 
-This does not modify any Xilinx IP source and survives IP regeneration.
+This does not modify any Xilinx IP source and survives IP regeneration. All four test-stand benches carry this block.
+
+**Shadow variant (ConvKernel, PoolingKernel benches).** The block above only re-applies strobed bytes, so it cannot undo stale data the racing write put into *unstrobed* bytes. `conv_tb.sv` and `pooling_tb.sv` keep a byte shadow (`logic [7:0] shadow_mem [longint unsigned]`) filled by every bench `write_mem` chunk (`shadow_store()`) and every strobed beat; for an unstrobed byte that has a shadow entry, the fix block writes the shadow value back instead of skipping it. This makes the benches' `y` tail-pad checks a true test of the kernel's WSTRB.
+
+### Related: late commit of the last write
+
+The DDR model can commit a kernel's final (partial-strobe) write late enough that it lands on top of the *next* test's backdoor-loaded inputs at the same address (MatmulKernel, 2026-09-25: `B[49922]` of test 33 read back as `C[98]` of test 32, never when the case ran alone; a 20 µs settle did not help). `matmul_tb.sv` alternates the DDR base between consecutive tests (`addr_a = 0x1000_0000 + (index % 2) · 0x0400_0000`) so a test's inputs never occupy addresses the previous kernel wrote. See `doc/MATMUL_OPTIMISATION.md`.
 
 ---
 
@@ -181,19 +195,19 @@ The arb_wr_6 bug exploits this: DDRC's sampling of `wr_req` is in the active reg
 
 ## 5. AXI Beat Alignment Requirement
 
-The PS VIP burst read engine issues full 16-byte (128-bit) aligned beats. If the DDR buffer is not padded to a 16-byte boundary, the last partial beat reads uninitialized bytes from adjacent memory, which may be `X` or stale data from a previous test. This manifests as `AXI4_ERRS_RDATA_X` or incorrect output values at the tail of the vector.
+The PS VIP burst read engine issues full 16-byte (128-bit) aligned beats, and all four kernels now read through 128-bit ports in whole 16-byte words. If the DDR buffer is not padded to a 16-byte boundary, the last partial beat reads uninitialized bytes from adjacent memory, which may be `X` or stale data from a previous test. This manifests as `AXI4_ERRS_RDATA_X` or incorrect output values at the tail of the vector.
 
-**Fix:** Round the fill size up to the next 16-byte boundary before calling `fill_const_ddr` / `fill_pattern_ddr`:
+**Fix:** Round the region size up to the next 16-byte boundary before calling `fill_const_ddr` / `write_data_ddr` (as every test-stand bench does):
 
 ```systemverilog
 function automatic int unsigned align_up(int unsigned v, int unsigned a);
     return (v + a - 1) & ~(a - 1);
 endfunction
 
-a_bytes = align_up(item.size * ELEM_BYTES, 16);
+a_bytes = align_up(this.a_count * ELEM_BYTES, 16);
 ```
 
-The extra bytes (beyond `item.size * ELEM_BYTES`) should be filled with a known value (e.g., zero) so the kernel's over-read does not inject garbage into results.
+The extra bytes (beyond `this.a_count * ELEM_BYTES`) should be filled with a known value (e.g., zero) so the kernel's over-read does not inject garbage into results.
 
 ---
 
@@ -209,9 +223,9 @@ The extra bytes (beyond `item.size * ELEM_BYTES`) should be filled with a known 
 | max     | 32767      | `0x7FFF` |
 | min     | −32768     | `0x8000` |
 
-Conversion: `raw = (int)(value * 256)` (AP_RND mode rounds toward +inf at the LSB).
+Conversion: `raw = value × 256`, rounded and saturated to int16. The scheduler's encoder (`inference-scheduler/src/dtype.py`) rounds half to even; a C++ assignment to `ap_fixed<16,8>` (default `AP_TRN`) truncates toward −∞.
 
-**Arithmetic reference model (integer, matches HLS AP_TRN truncation):**
+**Arithmetic reference model (integer, matches HLS AP_TRN truncation).** Historical: an earlier VectorOPKernel bench computed expected values with this function, which predates the `act` register. The current benches compare against C-simulation goldens under `hw/test_data/{vecop,matmul,conv,pool}_test_data/` (VectorOP: `TestSimulation --dump-data`, target `gen_vectorop_test_data`), so `compute_op_result` no longer exists in any bench.
 
 ```systemverilog
 function automatic logic [15:0] compute_op_result(
@@ -257,9 +271,9 @@ Hierarchy path from a testbench DUT named `dut` with a PS instance `zynq_ultra_p
 dut.zynq_ultra_ps_e_0.inst.ddrc               ← DDRC module
 dut.zynq_ultra_ps_e_0.inst.ddrc.wr_req        ← arbiter output (write-request to DDRC)
 dut.zynq_ultra_ps_e_0.inst.ddrc.wr_addr       ← 40-bit byte address
-dut.zynq_ultra_ps_e_0.inst.ddrc.wr_data       ← 4096-bit burst data
-dut.zynq_ultra_ps_e_0.inst.ddrc.wr_strb       ← 512-bit byte strobe
-dut.zynq_ultra_ps_e_0.inst.ddrc.wr_bytes      ← 12-bit byte count
+dut.zynq_ultra_ps_e_0.inst.ddrc.wr_data       ← 32768-bit (4096-byte) burst data
+dut.zynq_ultra_ps_e_0.inst.ddrc.wr_strb       ← 4096-bit byte strobe
+dut.zynq_ultra_ps_e_0.inst.ddrc.wr_bytes      ← 13-bit byte count [12:0]
 dut.zynq_ultra_ps_e_0.inst.ddrc.wr_ack        ← DDRC → arbiter acknowledge
 dut.zynq_ultra_ps_e_0.inst.ddrc.ddr.ddr_mem0  ← sparse 32-bit array, bank 0
 dut.zynq_ultra_ps_e_0.inst.ddrc.ddr.ddr_mem1  ← sparse 32-bit array, bank 1
@@ -289,7 +303,7 @@ module zynq_ultra_ps_e_vip_v1_0_22_ddrc(
 );
 ```
 
-### 7.3 Key Internal Parameters (~lines 4233–4327, from local_params.sv)
+### 7.3 Key Internal Parameters (`zynq_ultra_ps_e_vip_v1_0_22_local_params.sv`, ~lines 21–116)
 
 | Parameter              | Value     | Meaning |
 |------------------------|-----------|---------|
@@ -299,7 +313,7 @@ module zynq_ultra_ps_e_vip_v1_0_22_ddrc(
 | `max_data_width`       | 128       | AXI data bus width (bits) |
 | `max_burst_bits`       | 32768     | Max burst data buffer: 256 × 128 |
 | `max_burst_bytes`      | 4096      | Max burst data in bytes |
-| `max_burst_bytes_width`| 12        | Width of byte-count field (log2 4096) |
+| `max_burst_bytes_width`| 12        | log2(4096); byte-count fields are declared `[max_burst_bytes_width:0]` = 13 bits |
 | `mem_width`            | 4         | Bytes per memory word |
 | `shft_addr_bits`       | 2         | log2(mem_width): word address shift |
 
@@ -312,7 +326,7 @@ wire                       wr_req;                      // write request (from a
 wire [max_burst_bits-1:0]  wr_data;                     // 32768-bit burst payload
 wire [max_burst_bytes-1:0] wr_strb;                     // 4096-bit byte-enable mask
 wire [addr_width-1:0]      wr_addr;                     // 40-bit byte address
-wire [max_burst_bytes_width:0] wr_bytes;                // 12-bit byte count
+wire [max_burst_bytes_width:0] wr_bytes;                // 13-bit byte count [12:0]
 reg                        wr_ack;                      // acknowledge back to arbiter
 
 reg  [max_burst_bits-1:0]  rd_data;                     // read result
@@ -370,7 +384,8 @@ reg /*sparse*/ [data_width-1:0] ddr_mem0 [0:(mem_size/mem_width)-1];
 // Covers byte range 0x0_0000_0000 – 0x0_3FFF_FFFF (268,435,456 × 32-bit words)
 
 reg /*sparse*/ [data_width-1:0] ddr_mem1 [0:(mem_size/mem_width)-1];
-// Covers byte range 0x8_0000_0000 – 0x8_3FFF_FFFF
+// VIP source comment says 0x8_0000_0000 – 0x8_3FFF_FFFF, but the indexing
+// below (word_addr[28]) maps byte range 0x4000_0000 – 0x7FFF_FFFF here
 ```
 
 Both arrays are declared `/*sparse*/` — xsim allocates storage only for written addresses, so unwritten locations return `X` (not 0) when read back.
@@ -420,10 +435,10 @@ Six-port priority-round-robin arbiter. Each port presents:
 | Port-N signal | Direction | Meaning |
 |---------------|-----------|---------|
 | `prt_dvN`     | input     | Data valid / write request |
-| `prt_dataN`   | input     | Burst write data (4096 bit) |
-| `prt_strbN`   | input     | Byte strobes (512 bit) |
+| `prt_dataN`   | input     | Burst write data (32768 bit) |
+| `prt_strbN`   | input     | Byte strobes (4096 bit) |
 | `prt_addrN`   | input     | 40-bit byte address |
-| `prt_bytesN`  | input     | 12-bit byte count |
+| `prt_bytesN`  | input     | 13-bit byte count |
 | `prt_qosN`    | input     | 4-bit QoS |
 | `prt_ackN`    | output    | Acknowledge (pulse) |
 
@@ -460,6 +475,10 @@ The `sw_clk` driving the DDRC is produced by `zynq_ultra_ps_e_vip_v1_0_22_gen_cl
 | File | Purpose |
 |------|---------|
 | `/mnt/data/xilinx/2025.2/data/ip/xilinx/zynq_ultra_ps_e_vip_v1_0/hdl/zynq_ultra_ps_e_vip_v1_0_vl_rfs.sv` | PS VIP source — contains `arb_wr_6` |
-| `/home/ivan/vivado_projects/fix_arb_wr6_prt_req.py` | Python patch script for Fix Option A |
-| `/home/ivan/vivado_projects/cormorant_hw/cormorant_hw.srcs/sim_1/new/cormorant_tb.sv` | VectorOPKernel testbench with `ddrc_wr_fix`, chunk-safe fill tasks, per-test scoreboard |
-| `/home/ivan/vivado_projects/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` | ConvKernel testbench — reference implementation of `ddrc_wr_fix` and per-test scoreboard pattern |
+| `/mnt/data/xilinx/2025.2/data/ip/xilinx/zynq_ultra_ps_e_vip_v1_0/hdl/zynq_ultra_ps_e_vip_v1_0_22_local_params.sv` | VIP parameters (§7.3) |
+| `/home/ivan/vivado_projects/fix_arb_wr6_prt_req.py` | Python patch script for Fix Option A (outside the repo; not applied) |
+| `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` | VectorOPKernel bench — `ddrc_wr_fix`, chunked `fill_const_ddr` / `write_data_ddr`, per-test scoreboard |
+| `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | MatmulKernel bench — `ddrc_wr_fix`, alternating DDR base (§3) |
+| `hw/cormorant_test_stand/kernels/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` | ConvKernel bench — `ddrc_wr_fix` with shadow restore of unstrobed bytes, `y` tail-pad check |
+| `hw/cormorant_test_stand/kernels/pooling_test/pooling_test.srcs/sim_1/new/pooling_tb.sv` | PoolingKernel bench — `ddrc_wr_fix` with shadow restore, `y` tail-pad check |
+| `hw/test_data/{vecop,matmul,conv,pool}_test_data/` | Golden fixtures the benches read (`make behavior_test_<k>`) |

@@ -1,21 +1,21 @@
 # Testing
 
-Cormorant has four distinct testing layers, each independent of the
+Cormorant has five distinct testing layers, each independent of the
 next. You can validate everything except final hardware on a host
 machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops (1400 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama ops (1497 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
-| 3. **Vivado behavioural sim** | Vitis, Vivado | Block-design behavioural sim against the SystemVerilog testbench (no board) |
+| 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
 
 Layers 1–3 run on the host. Layers 4–5 run on the KV260 over SSH and
 require the Cormorant bitstream to be loaded first
-(see [Quick Start](../README.md#6-deploy-and-run-on-the-kv260) step 6
-or [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload)).
+(see the [Quick start](../README.md#quick-start) in the README
+or [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
 
 ---
 
@@ -29,7 +29,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1400 tests
+# Run all 1497 tests (1492 pass, 5 skip without BERT_SQUAD_MODEL)
 .venv/bin/python -m pytest test/ -q
 
 # Run a specific module
@@ -38,16 +38,22 @@ cd inference-scheduler
 
 `gen_all_models.py` runs every generator, including `gen_bert_models.py`
 (tiny BERT-like fixtures in bertsquad-12's exact node arrangement, plus an
-erf-GELU and a native-op opset-20 variant).
+erf-GELU and a native-op opset-20 variant) and `gen_llama_models.py` (a
+tiny random Llama: decode / prefill / head entries, which imports
+`demo/chat/scripts/llm_study.py`).
 
 Some tests run generated C on the host: `test/host_emu.py` compiles a
 project's `inference.c` + `test_inference.c` unchanged against software
-models of the VectorOP / Matmul drivers (register semantics of the kernels,
-executed at Start) and a malloc-backed buffer pool, runs it, and requires
-`test_inference PASSED` — the generated host-op code (in place on cacheable
-buffers and staged on non-cacheable ones, lookup tables, 1 / 3 / 4 host
-threads) and the kernel call parameters must reproduce the scheduler
-simulation bit for bit (`test_bert_tiny.py`, `test_split_int.py`).
+models of the VectorOP / Matmul / Conv drivers (register semantics of the
+kernels, executed at Start; no Pool model) and a malloc-backed buffer pool,
+runs it, and requires `test_inference PASSED` — the generated host-op code
+(in place on cacheable buffers and staged on non-cacheable ones, lookup
+tables, 1 / 3 / 4 host threads) and the kernel call parameters must
+reproduce the scheduler simulation bit for bit (`test_bert_tiny.py`,
+`test_split_int.py`, `test_matmul_on_conv.py`, `test_numeric.py`,
+`test_llm_ops.py`, `test_llama.py`).  With `incoherent=True` it also gives
+every buffer a separate "DDR" copy, so a missing cache sync changes the
+output.
 `test_cache_coherency.py` walks the emitted `inference_run()` of every model
 with a per-buffer cache-state model and fails on any missing flush /
 invalidate at a CPU ↔ kernel hand-off (the DMA buffers are mapped cacheable
@@ -80,8 +86,12 @@ make TestSimulation   # VectorOPKernel
 make TestConvRef      # ConvKernel
 make TestMatmulRef    # MatmulKernel
 make TestPoolingSim   # PoolingKernel
-ctest                 # run all four
+ctest                 # run all registered tests
 ```
+
+`ctest` also runs `TestConvGrid` (MAC-grid unit test), `TestConvSweep`
+(`TestConvRef --sweep 300`, randomised geometries, ~1 min) and, when a BLAS
+is found at configure time, `TestMatmulBlas`.
 
 These tests exercise the kernel C++ source directly without HLS
 synthesis, so they catch logic regressions in seconds.
@@ -90,10 +100,8 @@ synthesis, so they catch logic regressions in seconds.
 
 ## 3. Hardware simulation (Vivado, no board)
 
-Behavioural simulation of the full block design against the
-SystemVerilog testbench. Runs entirely in Vivado xsim — no board
-required, but the per-kernel IP archives produced by HLS synthesis
-must exist first.
+RTL behavioural simulation in Vivado xsim — no board required, but the
+per-kernel IP archives produced by HLS synthesis must exist first.
 
 ```bash
 cd build
@@ -102,18 +110,36 @@ cd build
 source <Xilinx install dir>/settings64.sh
 make synthesize_kv260
 
-# Behavioural sim against the SystemVerilog testbench
+# Per-kernel RTL behaviour tests (hw/cormorant_test_stand submodule):
+# checked-in golden fixtures under hw/test_data/<kernel>_test_data/
+make behavior_test_vectorop   # also: behavior_test_conv / _matmul / _pool
+make behavior_test            # all four in sequence
+
+# Block-design behavioural sim against the SystemVerilog testbench
+# (hw/cormorant_hw_128 submodule)
 make sim_hw_kv260
 ```
 
-Expected testbench output:
+Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` and fails when
+the scoreboard report records any mismatch (see
+[`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
+manifests currently hold 119 VectorOP, 63 Conv, 39 Matmul and 43 Pool cases.
+
+`sim_hw_kv260` ends with a summary in this format (one line per kernel
+scoreboard; counts depend on the testbench's test lists):
 
 ```
-##  VectorOPKernel     12 /  12  (0 failed)
-##  ConvKernel         18 /  18  (0 failed)
-##  MatmulKernel        8 /   8  (0 failed)
-##  PoolingKernel      10 /  10  (0 failed)
-##  TOTAL: 48 / 48 passed  —  ALL TESTS PASSED
+##########################################################
+##  CORMORANT TESTBENCH — OVERALL RESULTS
+##########################################################
+##  VectorOPKernel         N /   N  (0 failed)
+##  ConvKernel             N /   N  (0 failed)
+##  MatmulKernel           N /   N  (0 failed)
+##  PoolingKernel          N /   N  (0 failed)
+##########################################################
+##  TOTAL: N / N passed
+##  ALL TESTS PASSED
+##########################################################
 ```
 
 For PS-VIP / xsim quirks observed during simulation development see
@@ -129,17 +155,18 @@ the board, executes the test binary, and compares every output element
 against Python-simulated ground truth.
 
 **Prerequisite:** the Cormorant bitstream must be loaded on the board.
-Use `upload_bitstream.py` (see Quick Start step 6 or
-[`REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload)).
+Use `upload_bitstream.py` (see the README Quick start or
+[`REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
 
-Each example config in `inference-scheduler/` targets a specific set
-of kernels. Copy the one that matches your loaded bitstream and fill
-in your board details:
+The tracked template `inference-scheduler/remote_config.json.example`
+lists every on-board test model (148; narrow the list, or pass
+`--models`, to test a subset of kernels). Copy it and fill in your board
+details:
 
 ```bash
 cd inference-scheduler
 
-cp remote_config_all_models.json remote_config.json
+cp remote_config.json.example remote_config.json
 $EDITOR remote_config.json
 ```
 
@@ -150,14 +177,17 @@ The two fields you must set are:
   Vitis-HLS-generated driver sources for each kernel, e.g.:
 
   ```
-  "VectorOPKernel": "<cormorant_base>/build/kernels/vectorop/kv260/<target>/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
+  "VectorOPKernel": "<cormorant_base>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
+  "ConvKernel":     "<cormorant_base>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
   ```
 
 The `remote.uio_devices` map must list the UIO sysfs name for every
 kernel in the config. After loading the `design_cormorant.dtbo`
 overlay all four names are `fabric_vecop`, `fabric_matmul`,
-`fabric_conv`, and `fabric_pool` — the example configs already have
-these set correctly for the full-Cormorant bitstream.
+`fabric_conv`, and `fabric_pool`.  `run_remote_tests.py` keys the map by
+the scheduler's kernel names — `VectorOPKernel`, `MatmulKernel`,
+`ConvKernel`, **`PoolKernel`** (the example's `PoolingKernel` key is not
+picked up; rename it).
 
 ```bash
 # Verify board prerequisites before running
@@ -178,8 +208,10 @@ For full SSH setup, config reference, and debugging guide see
 
 ### 4.x On-board correctness set — coverage added 2026-09-25
 
-`remote_config_all_models.json` lists **144 models**.  The 18 added with
-the 128-bit port and packed-B work target what those changes touch:
+The on-board set had **144 models** on 2026-09-25 (`remote_config.json.example`
+now lists 148: those plus the four tiny-BERT fixtures `bert_tiny_*`).  The
+18 added with the 128-bit port and packed-B work target what those changes
+touch:
 
 - **MatMul packed B** (`mm_packed_*`): the MNIST Gemm (256×10), the
   ResNet-18 (512×1000) and MobileNet v2 (1280×1001) classifier shapes,
@@ -209,9 +241,9 @@ parameter cases.
 
 The script uploads a single self-contained C benchmark project,
 builds all four kernel binaries in one pass, then runs each case
-and reports results. Kernels whose driver files are absent are
-silently skipped, so you can benchmark only what is currently
-deployed.
+and reports results. Kernels whose driver files are absent are not
+built (their cases fail), so benchmark only what is currently
+deployed with `--kernels` or `"enabled": false`.
 
 Copy the example config and fill in your board details before the
 first run:
@@ -229,7 +261,7 @@ the correctness configs with an additional `benchmarks` section.
 "benchmarks": {
   "VectorOPKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] },
   "MatmulKernel":   { "enabled": true, "warmup": 10, "cases": [ ... ] },
-  "ConvKernel":     { "enabled": false, "warmup": 10, "cases": [ ... ] },
+  "ConvKernel":     { "enabled": true,  "warmup": 10, "cases": [ ... ] },
   "PoolingKernel":  { "enabled": true,  "warmup": 10, "cases": [ ... ] }
 }
 ```
@@ -240,8 +272,9 @@ row-major / packed-B twins of the FC and classifier shapes, `b_packed`
 case field, MATMUL_OPTIMISATION §3b — 10 ConvKernel, 11 PoolingKernel).
 
 VectorOPKernel `op` values outside the supported range (0..5) are
-rejected at config-load time before any SSH upload or remote build —
-see the *Config File* reference in `REMOTE_TESTING.md`.
+rejected when the cases are loaded, before any case runs (currently
+after the connection, preflight and build) — see the *Case fields*
+reference in `REMOTE_TESTING.md`.
 
 ```bash
 cd inference-scheduler
@@ -263,7 +296,9 @@ cd inference-scheduler
 .venv/bin/python run_remote_perf.py --config perf_config.json --check-only
 ```
 
-**Sample output:**
+**Sample output** (recorded on the board in May 2026 with the 48-case
+config of that time, before the 128-bit ports, packed-B MatmulKernel and
+the ConvKernel 2-D grid — the format is current, the numbers are not):
 
 ```
   VectorOPKernel
@@ -276,13 +311,10 @@ cd inference-scheduler
   ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
   ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
   ...
-  SOFTMAX-16K-1row         6      size=16384   outer=1        0.1728     0.379
-  SOFTMAX-1K-8rows         6      size=1024    outer=8        0.1098     0.298
-  SOFTMAX-4K-4rows         6      size=4096    outer=4        0.1811     0.362
   ───────────────────────────────────────────────────────────────────────────────────
                                                  peak GB/s                0.593
                                                min latency     0.0181
-  20/20 OK
+  15/15 OK
 
   MatmulKernel
   ─────────────────────────────────────────────────────────────────────────────
@@ -324,7 +356,7 @@ cd inference-scheduler
                                                   peak GB/s                0.133
                                                 min latency     0.1039
   11/11 OK
-  ── OVERALL: All 53 cases passed ──
+  ── OVERALL: All 48 cases passed ──
 ```
 
 | Metric | Meaning |

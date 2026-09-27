@@ -31,12 +31,13 @@ flowchart TD
 
     subgraph GRAPH["OnnxGraph · src/graph.py"]
         direction TB
-        G1["① Load ONNX proto, validate with onnx.checker"]
+        G1["① Load ONNX proto (or in-memory ModelProto), validate with onnx.checker,\nparse axi.numeric metadata"]
         G2["② Shape inference — infer_shapes fills intermediate shapes"]
-        G3["③ _preprocess_model — Gemm → MatMul + optional Add"]
-        G4["④ Build tensor registry\nweights · inputs · intermediates · outputs"]
-        G5["⑤ Dispatch each node to a typed class\nMatMul→MatmulNode · Conv→ConvNode · Pool→PoolNode\nReshape→ReshapeNode · others→ScheduledNode"]
-        G1 --> G2 --> G3 --> G4 --> G5
+        G3["③ Graph rewrites — Constant folding · Gemm → MatMul + optional Add ·\nSplit → Slice · space-to-depth stem · LayerNorm / GELU fusion"]
+        G4["④ Build tensor registry\nweights · inputs · intermediates · outputs · numeric annotations"]
+        G5["⑤ Dispatch each node to a typed class\nMatMul→MatmulNode · Conv→ConvNode · Pool→PoolNode\nReshape-class→ReshapeNode · SpaceToDepth→SpaceToDepthNode\nhost ops→HostNode · axi.llm→LlmNode · others→ScheduledNode"]
+        G6["⑥ Activation fusion · MatMul → ConvKernel lowering ·\nMatMul B packing · Slice views"]
+        G1 --> G2 --> G3 --> G4 --> G5 --> G6
     end
 
     subgraph CORE["_CoreMixin · src/codegen/_core.py"]
@@ -64,9 +65,15 @@ The pipeline has three stages:
 
 1. **OnnxGraph** parses the model file into a typed Python representation. It
    validates the structure, runs ONNX shape inference to fill in intermediate
-   tensor shapes, rewrites `Gemm` nodes into `MatMul + Add`, and dispatches
-   each graph node to the appropriate typed class (`ScheduledNode`,
-   `MatmulNode`, `ConvNode`, `PoolNode`, or `ReshapeNode`).
+   tensor shapes, applies the load-time rewrites (`Gemm` → `MatMul + Add`,
+   `Constant` folding, `Split` lowering, the optional space-to-depth stem and
+   LayerNorm / GELU fusion), and dispatches each graph node to the
+   appropriate typed class (`ScheduledNode`, `MatmulNode`, `ConvNode`,
+   `PoolNode`, `ReshapeNode`, `SpaceToDepthNode`, a `HostNode` or an
+   `LlmNode`); it then folds activations into VectorOP nodes, lowers
+   MatMuls onto ConvKernel where the cost model says so (`MatmulConvNode`)
+   and packs constant MatMul weights.  The exact order is listed in
+   [`doc/INFERENCE_SCHEDULER.md` §OnnxGraph loading sequence](../../doc/INFERENCE_SCHEDULER.md#onnxgraph-loading-sequence).
 
 2. **_CoreMixin** computes a `TensorLayout` for every tensor in the graph.
    Layouts capture how much DMA memory each tensor actually needs — they may
@@ -90,22 +97,36 @@ src/
   dtype.py               DataType ABC + ApFixed, Float32 implementations
   layout.py              TensorLayout frozen dataclass — DMA buffer geometry (numel, alloc, n_chunks, chunk, stride)
   tensor.py              TensorInfo dataclass — metadata + C code emitters
+  kernels.py             KERNEL_REGISTRY — KernelDesc per hardware kernel (driver files,
+                           C type, UIO default, inference_init() parameter)
   nodes.py               Node classes — op mapping, validation, C call emitters:
                            ScheduledNode (VectorOPKernel: Add/Sub/Mul/Div/Relu/Clip)
                            MatmulNode    (MatmulKernel: MatMul)
-                           ConvNode      (ConvKernel: Conv)
+                           ConvNode      (ConvKernel: Conv, standard or depthwise)
+                           MatmulConvNode (ConvKernel: a MatMul with swapped operand roles)
                            PoolNode      (PoolingKernel: MaxPool/AveragePool/LpPool/Global*)
                            ReshapeNode   (buffer alias — no hardware call)
                            SpaceToDepthNode (host-CPU reorder)
   host_nodes.py          HostNode family — ops run on the CPU inside inference_run():
                            Softmax, LayerNorm, Gelu, Transpose, Slice (Split), Gather,
                            OneHot, Cast; numpy reference + C helper library side by side
+  llm_nodes.py           axi.llm ops of Llama decoders (LlmNode host ops) and
+                           LlmAttnConvNode (FPGA prefill attention on ConvKernel)
+  llama.py               Llama frontend: checkpoint → fixed-shape ONNX entry graphs
+  numeric.py             axi.numeric metadata: exponents, host tensors, states
   fusion.py              ONNX passes: Constant folding, Split lowering, LayerNorm / GELU
                            pattern fusion, VectorOP constant-broadcast normalisation
+  matmul_lowering.py     MatMul → ConvKernel engine choice and geometry
+  cost_model.py          ConvKernel / MatmulKernel cycle estimates
+  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
+                         platform JSON bounds (platforms/<AXI_PLATFORM>.json)
   graph.py               OnnxGraph — ONNX loading, shape inference, Gemm preprocessing, node dispatch
+  schedule.py            Dag — data-flow DAG over the scheduled nodes (SCHEDULER_DAG.md)
+  report.py              ReportGenerator — report.md
   codegen/
     __init__.py          CodeGenerator class (assembles all mixins via MRO)
-    _core.py             _CoreMixin: __init__, tensor layouts, pool size, helpers
+    _core.py             _CoreMixin: __init__, tensor layouts, event stream, live
+                           intervals, pool layout / size, helpers
     _header.py           _HeaderMixin: generate_header()
     _source.py           _SourceMixin: generate_source()
     _buf_impl.py         _BufImplMixin: generate_buf_impl(), generate_setup_script()
@@ -113,6 +134,7 @@ src/
     _test.py             _TestMixin: generate_test()
     _cmake.py            _CmakeMixin: generate_cmake()
     _banners.py          _banner(), _file_banner() — section header helpers
+    multi.py             MultiEntryGenerator — several graphs, one weight pool (--entry)
 ```
 
 ---
@@ -125,10 +147,14 @@ clean, typed view of the computation graph.
 ### Loading and Shape Inference
 
 ```python
-model = onnx.load(model_path)
+model = onnx.load(model_path)                # or an onnx.ModelProto (src/llama.py)
 onnx.checker.check_model(model)              # validate structural correctness
+self.numeric = numeric.parse(model)          # axi.numeric metadata, if any
 model = shape_inference.infer_shapes(model)  # fill in intermediate shapes
-model = OnnxGraph._preprocess_model(model)   # decompose Gemm → MatMul + Add
+fusion.fold_constant_nodes(model)            # Constant → initializer
+model, n = OnnxGraph._preprocess_model(model)   # decompose Gemm → MatMul + Add
+fusion.lower_split(model)                    # Split → one Slice per output
+# optional: _space_to_depth_stems(model), fusion.fuse_patterns(model, align_elems)
 ```
 
 The shape inference step is critical. Without it, intermediate tensors (the
@@ -143,9 +169,11 @@ Before the tensor registry is built, `_preprocess_model()` rewrites every
 - `Gemm(A, B, C)` → `MatMul(A, B) → tmp` + `Add(tmp, C) → Y`
 - `Gemm(A, B)` (no bias) → `MatMul(A, B) → Y`
 
-Supported constraints: `alpha=1`, `beta=1`, `transA=0`, `transB=0`. Any
-deviation raises `SchedulerError`. The new intermediate tensor `tmp` (for the
-bias case) is inserted into `graph.value_info` so the subsequent tensor registry
+Supported constraints: `alpha=1`, `beta=1`, `transA=0`; `transB=1` is
+accepted when B is a constant 2-D initializer, which is transposed offline
+into a new `<B>_T` initializer. Any other deviation raises `SchedulerError`.
+The new intermediate tensor `tmp` (named `_gemm_mm_out_<n>`, for the bias
+case) is inserted into `graph.value_info` so the subsequent tensor registry
 pass can assign it a proper shape.
 
 This design keeps `MatmulNode` and `ScheduledNode` unaware of `Gemm` — the
@@ -179,15 +207,23 @@ class TensorInfo:
     onnx_name: str          # original ONNX tensor name
     shape:     List[int]    # e.g. [1, 64, 32, 32]
     dtype:     str          # ONNX dtype string, e.g. 'float32'
-    data:      np.ndarray   # None for non-constant tensors
+    data:      np.ndarray   # None for non-constant tensors (logical values)
+    packed_data: np.ndarray # kernel-layout image of a weight (Conv tile-major,
+                            # MatMul B packed, MatMul-on-Conv B image), or None
+    # numeric annotations (src/numeric.py): exp, wexp, host, is_state,
+    # init_data, group_layout, group_kw
 ```
 
 Key derived properties:
 
-- **`numel`**: total number of elements (`product(shape)`)
+- **`numel`**: number of elements in the buffer — `product(shape)`, or the
+  size of `packed_data` when the weight is re-laid out for its kernel
 - **`c_name`**: C identifier derived from `onnx_name` — non-alphanumeric characters
-  are replaced with underscores, leading digits get a `t_` prefix
+  are replaced with underscores (runs collapsed, leading / trailing ones
+  stripped), leading digits get a `t_` prefix
 - **`is_weight`**: `data is not None`
+- **`is_int`**: integer / bool ONNX dtype (raw int16 in the buffer)
+- **`is_host`**: lives in host memory (`host` set by `axi.numeric`)
 - **`is_large_weight`**: `is_weight and numel > LARGE_WEIGHT_THRESHOLD (4096)`
 
 ### Code Emission Methods
@@ -228,40 +264,52 @@ _ONNX_OP_MAP = {
 `arity=2` means the kernel reads two input arrays (`gmem0` and `gmem1`).
 `arity=1` means the kernel reads only one input (`gmem0`); `gmem1` is left
 unprogrammed and no AXI transaction is issued on that port. All other ONNX ops
-(`MatMul`, `Conv`, pooling variants, `Reshape`) are handled by dedicated node
-classes and never reach `_ONNX_OP_MAP`.
+(`MatMul`, `Conv`, pooling variants, reshape-class ops, host ops) are handled
+by dedicated node classes and never reach `_ONNX_OP_MAP`.
 
 ### Node Dispatch
 
 ```mermaid
 flowchart TD
     N["ONNX NodeProto"]
-    N --> D{op_type?}
+    N --> D{domain / op_type?}
+    D -->|"domain axi.llm"| LN["LlmNode / LlmAttnConvNode\nLLM_OP_FACTORIES (llm_nodes.py)"]
+    D -->|"Softmax · LayerNormalization · Gelu\nTranspose · Slice · Gather · OneHot · Cast"| HN["HostNode\nHOST_OP_FACTORIES (host_nodes.py)\nhost-CPU code (same-kind Cast → ReshapeNode)"]
     D -->|MatMul| MN["MatmulNode\ndrives MatmulKernel\ntiled GEMM, batched"]
-    D -->|Conv| CN["ConvNode\ndrives ConvKernel\nNHCW 2-D convolution"]
-    D -->|"MaxPool · AveragePool\nLpPool · Global variants"| PN["PoolNode\ndrives PoolingKernel\nNHCW 2-D pooling"]
-    D -->|Reshape| RN["ReshapeNode\nbuffer alias — no hardware call\noutput ptr = source ptr"]
+    D -->|Conv| CN["ConvNode\ndrives ConvKernel\nNCHW 2-D convolution, standard / depthwise"]
+    D -->|"MaxPool · AveragePool\nLpPool · Global variants"| PN["PoolNode\ndrives PoolingKernel\nNCHW 2-D pooling"]
+    D -->|"Reshape · Squeeze · Unsqueeze\nFlatten · Dropout · Identity"| RN["ReshapeNode\nbuffer alias — no hardware call\noutput ptr = source ptr"]
+    D -->|SpaceToDepth| SD["SpaceToDepthNode\nhost-CPU reorder"]
     D -->|"Add · Sub · Mul · Div\nRelu · Clip(min=0, max=6)"| SN["ScheduledNode\ndrives VectorOPKernel\nelement-wise op"]
     D -->|other| ERR(["SchedulerError\nunsupported operator"])
 ```
 
 Dispatch happens in `OnnxGraph.__init__()` as it iterates over the nodes in the
-ONNX graph in topological order. Each node's `op_type` string selects one of
-five paths:
+ONNX graph in topological order. Each node's domain / `op_type` selects one
+of these paths:
 
+- **LlmNode** (`axi.llm` domain) — the Llama decoder ops of `src/llm_nodes.py`.
+- **HostNode** — ops that run on the CPU inside `inference_run()`
+  (`src/host_nodes.py`); a `Cast` within one storage kind becomes a
+  `ReshapeNode` alias instead.
 - **MatmulNode** — wraps a single `MatMul` node. Handles batched matmul and
-  tiles large matrices across multiple kernel calls.
+  tiles large matrices across multiple kernel calls.  After dispatch,
+  `matmul_lowering.lower_matmuls()` may replace it with a `MatmulConvNode`.
 - **ConvNode** — wraps a single `Conv` node, including optional fused bias.
-  Only `groups=1` 2-D NCHW convolution is supported.
+  2-D NCHW convolution with `group=1` or depthwise (`group=in_channels`);
+  other grouped convolutions are rejected.
 - **PoolNode** — wraps `MaxPool`, `AveragePool`, `LpPool`, and their `Global*`
   variants. The pooling type is encoded as an integer opcode in the kernel's
   AXI-Lite register.
 - **ReshapeNode** — produces no hardware call at all. It records an alias
   (`output_ptr = source_ptr`) that is emitted during `inference_init()`.
+- **SpaceToDepthNode** — ONNX `SpaceToDepth` (also inserted by the
+  space-to-depth stem rewrite); a host-CPU loop.
 - **ScheduledNode** — used for all six element-wise VectorOPKernel ops listed
   in the Op Mapping Table above.
 
-Any `op_type` not in this set raises a `SchedulerError` immediately, so models
+Any `op_type` not in this set raises a `SchedulerError` immediately (with a
+hint when it is part of an unmatched LayerNorm / GELU pattern), so models
 containing unsupported ops are rejected at parse time rather than producing
 silently incorrect code.
 
@@ -289,35 +337,41 @@ class ScheduledNode:
     align_elems:        int            # ALIGN_BYTES / bytes_per_elem
 
     # Set by validate():
-    outer_count:        int   # > 1 = broadcasting; loop iteration count
-    chunk_size:         int   # data elements per kernel call
+    outer_count:        int   # > 1 = broadcasting; outer iteration count
+    chunk_size:         int   # data elements per inner run
     aligned_chunk_size: int   # chunk_size rounded up to align_elems
     a_advances:         bool  # True if input A strides through the output
     b_advances:         bool  # True if input B strides through the output
+
+    # Set by OnnxGraph._fuse_activations():
+    act:                int   # ACT_NONE / ACT_RELU / ACT_RELU6 (kernel `act` register)
+    fused_nodes:        List[onnx.NodeProto]   # the folded Relu / Clip, for the report
 ```
 
 ### Code Emission
 
-`emit_call()` produces the C kernel invocation:
+`emit_call()` produces the C kernel invocation.  `run_op()` takes
+`(a, b, c, size, op, outer, a_inc, b_inc)`; a node with a fused activation
+calls `run_op_act()` with the act code appended.
 
 **Non-broadcast case** (`outer_count == 1`):
 ```c
-    run_op(X, bias, Y, 256u, VECTOROP_ADD);
+    run_op(X, bias, Y, 256u, VECTOROP_ADD, 1u, 0u, 0u);
 ```
 
-**Broadcast case** (`outer_count > 1`):
+**Broadcast case** (`outer_count > 1`) — still one call; the kernel runs the
+outer loop itself, advancing `a` / `b` by `a_inc` / `b_inc` and `c` by
+`a_inc + b_inc` (the chunk stride — the repeating input's increment is 0)
+per iteration:
 ```c
-    for (unsigned _i = 0u; _i < 4u; _i++) {
-        run_op_at(X, _i * INFERENCE_Y_CHUNK_STRIDE,
-                  bias, 0u,
-                  Y,  _i * INFERENCE_Y_CHUNK_STRIDE,
-                  INFERENCE_Y_CHUNK, VECTOROP_ADD);
-    }
+    run_op(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD,
+           4u, INFERENCE_Y_CHUNK_STRIDE, 0u);
 ```
 
-Here `bias` does not advance (`b_advances = False`) — it repeats at offset 0
-every iteration (a single-row bias added to each of 4 output rows). `X` and `Y`
-both advance — they each hold 4 chunks strided by `CHUNK_STRIDE`.
+Here `bias` does not advance (`b_advances = False`, `b_inc = 0`) — it
+repeats at offset 0 every iteration (a single-row bias added to each of 4
+output rows). `X` and `Y` both advance — they each hold 4 chunks strided by
+`CHUNK_STRIDE`.
 
 ### MatmulNode
 
@@ -326,17 +380,25 @@ MatMul operations are handled by a separate `MatmulNode` class (also in
 (matrix dimensions), `outer_count`, `b_batch_stride`. `emit_call(layouts)`
 checks `TensorLayout.gap` on A and Y to choose between:
 
-- Natural form: `run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride)`
+- Natural form: `run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride, b_packed)`
 - Row-strided form: when A or Y has alignment gaps — decomposes into `batch=N, n=1` to walk each row independently
+
+A constant B read only by MatMuls (same `(k, m)`) is emitted tile-major
+(`TensorInfo.packed_data`) and called with `b_packed = 1`
+(`OnnxGraph._pack_matmul_weights`).  MatMuls that `matmul_lowering` moves to
+ConvKernel become `MatmulConvNode`s (`run_conv()` / per-item
+`run_conv_at()`; see the technical reference, §MatMul on ConvKernel).
 
 ### ConvNode
 
 `ConvNode` drives `ConvKernel` for 2-D NCHW convolution. Key fields: `batch`,
-`in_channels`, `out_channels`, `in_h/w`, `out_h/w`, `kernel_h/w`,
-`stride_h/w`, `pad_top/left`, `dil_h/w`, `has_bias`. `emit_call()` emits a
-`run_conv(x, w, bias_or_null, y, ...)` call with 17+ register-level parameters.
+`in_ch`, `out_ch`, `in_h/w`, `out_h/w`, `kh/kw`,
+`stride_h/w`, `pad_top/left`, `dilation_h/w`, `has_bias`, `is_depthwise`.
+`emit_call()` emits a `run_conv(x, w, bias_or_null, y, ...)` call with 17
+register-level scalar parameters after the four buffers.
 `has_bias` is determined at `from_onnx_node()` time: a Conv node with three
-inputs has a bias tensor fused into the same kernel dispatch.
+inputs has a bias tensor fused into the same kernel dispatch.  The weight
+(and bias) are emitted in ConvKernel's tile-major layout.
 
 ConvNode is excluded from Phase 2/3 layout propagation — it writes a flat
 NCHW output buffer with `n_chunks = 1`.
@@ -346,9 +408,10 @@ NCHW output buffer with `n_chunks = 1`.
 `PoolNode` drives `PoolingKernel` for 2-D NCHW pooling. Supported ONNX op
 types: `MaxPool`, `AveragePool`, `LpPool` (p=1 or 2), and the `Global*`
 variants. Key fields: `pool_type` (0=MAX, 1=AVG, 2=LP), `lp_order`,
-`count_include_pad`, full spatial geometry (same fields as ConvNode).
-`emit_call()` emits a `run_pool(x, y, ...)` call with 19 register-level
-parameters.
+`count_include_pad`, full spatial geometry (`channels`, `pool_h/w`,
+`stride_h/w`, `pad_top/left`, `dil_h/w`).
+`emit_call()` emits a `run_pool(x, y, ...)` call with 17 register-level
+scalar parameters after the two buffers.
 
 PoolNode is excluded from Phase 2/3 layout propagation — it writes a flat
 NCHW output buffer with `n_chunks = 1`.
@@ -370,6 +433,24 @@ Key mechanics:
   `Z = NULL;  /* reshape alias — not owned */`
 - `_reshape_aliases` in `_CoreMixin` maps `{output_onnx_name → source_c_name}`
   for use by `_SourceMixin` during init/deinit code generation.
+- `RESHAPE_OP_TYPES` = `Reshape`, `Squeeze`, `Unsqueeze`, `Dropout`,
+  `Flatten`, `Identity`; a same-kind `Cast` is also a `ReshapeNode`.  A
+  graph-input source is aliased at the top of `inference_run()`
+  (`_run_reshape_aliases`) instead of in `inference_init()`.
+
+### Host nodes
+
+`SpaceToDepthNode` (`nodes.py`), the `HostNode` family (`host_nodes.py`)
+and the `LlmNode` family (`llm_nodes.py`) have `kernel_name == ""`: they
+emit C code that runs inline in `inference_run()` (a `('cpu', idx)` event,
+see [SCHEDULER_DAG.md](SCHEDULER_DAG.md) §4.3), and each provides a numpy
+`reference()` that `_simulate` runs.  A `SliceNode` whose piece is a
+contiguous, 64-byte-aligned part of an internal buffer is emitted as a
+sub-buffer view (`inference_buf_init_view()`) instead of a copy.
+`LlmAttnConvNode` is the exception: a ConvKernel call (`kernel_name =
+"ConvKernel"`) whose key count is computed at run time.  Semantics:
+[`doc/INFERENCE_SCHEDULER.md`](../../doc/INFERENCE_SCHEDULER.md) §Host-CPU ops,
+§Llama-family decoders.
 
 ---
 
@@ -393,10 +474,13 @@ ONNX multidirectional broadcasting would compute `Y[b,r,c] = X[b,r,c] + bias[0,0
 
 ### The Trailing-Contiguous Constraint
 
-VectorOPKernel processes a flat 1-D array per call. It cannot do arbitrary
-striding or gather/scatter. To map ONNX broadcasting to sequential flat calls,
-the scheduler requires that broadcast dimensions form a **contiguous leading block**
-after right-aligning the shapes.
+VectorOPKernel processes one flat 1-D chunk per outer iteration; each input
+either advances by a fixed increment or repeats (increment 0). It cannot do
+arbitrary striding or gather/scatter. To map ONNX broadcasting onto that
+outer loop, the scheduler requires that broadcast dimensions form a
+**contiguous leading block** after right-aligning the shapes (size-1 output
+dimensions are neutral: `[1,1,S,S]` onto `[1,H,S,S]` is a plain repeating
+chunk).
 
 **Right-alignment**: a shorter shape is left-padded with 1s to match the output rank.
 
@@ -432,7 +516,7 @@ Given a valid broadcast, `_broadcast_info()` computes:
 
 ```python
 outer_count = output.numel // t.numel   # how many times to repeat t
-chunk_size  = t.numel                   # elements per kernel call
+chunk_size  = t.numel                   # elements per outer iteration
 aligned_chunk_size = ceil_to(chunk_size, align_elems)
                      # round up to 16-byte alignment boundary
 ```
@@ -454,20 +538,23 @@ gap_elements       = 2          (slots 6 and 7 are zero-padded)
 
 ### Physical Memory Layout
 
-When `aligned_chunk_size > chunk_size`, the DMA buffer has gap elements between
-data blocks:
+When `aligned_chunk_size > chunk_size`, the advancing buffers (here `X` and
+`Y`) have gap elements between data blocks, while the repeating `bias` is
+stored once as a single padded block of 8 elements:
 
 ```
-Buffer for bias [6], allocated as 128 × 8 = 1024 elements:
+Buffer for Y [4, 32, 6], allocated as 128 × 8 = 1024 elements:
 
-offset 0:  [ data[0] data[1] data[2] data[3] data[4] data[5]  0  0 ]  ← block 0
-offset 8:  [ data[0] data[1] data[2] data[3] data[4] data[5]  0  0 ]  ← block 1
-offset 16: [ data[0] data[1] data[2] data[3] data[4] data[5]  0  0 ]  ← block 2
+offset 0:  [ y[0]   y[1]   y[2]   y[3]   y[4]   y[5]    0  0 ]  ← block 0
+offset 8:  [ y[6]   y[7]   y[8]   y[9]   y[10]  y[11]   0  0 ]  ← block 1
+offset 16: [ y[12]  y[13]  y[14]  y[15]  y[16]  y[17]   0  0 ]  ← block 2
 ...
 ```
 
 Each block starts at a 16-byte-aligned physical address. The kernel is told
-`size = 6` so it reads only the 6 data elements and ignores the 2 gap slots.
+`size = 6` so it uses only the 6 data elements of each block; it reads whole
+16-byte words and writes the last word of every output run whole (tail
+lanes = 0), which the gap slots absorb (VectorOP alignment contract).
 
 The Python `_simulate.py` and `_test.py` modules both use the same strided layout
 when filling inputs and comparing expected outputs, ensuring CPU-side simulation
@@ -508,15 +595,16 @@ Returns `{onnx_name: TensorLayout}`. Three phases:
 ```mermaid
 flowchart LR
     P1["Phase 1 — Seed all tensors flat\nTensorLayout.flat(numel) for every tensor in graph"]
-    P2["Phase 2 — Broadcast VectorOP nodes\noutput → advancing layout\nadvancing inputs → advancing layout\nrepeating input → repeating layout\n(MatmulNode / ConvNode / PoolNode / ReshapeNode excluded)"]
+    P2["Phase 2 — Broadcast VectorOP nodes\noutput → advancing layout\nadvancing inputs → advancing layout\nrepeating input → repeating layout\n(every non-VectorOP node class excluded)"]
     P3["Phase 3 — Forward propagation\nnon-broadcast ScheduledNodes in topological order\nraise output and co-inputs to match\ndominant input allocation size"]
     P1 --> P2 --> P3
 ```
 
 **Phase 1 — Seed all tensors as flat**: every tensor starts with `TensorLayout.flat(numel)`.
 
-**Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`, MatmulNode /
-ConvNode / PoolNode / ReshapeNode excluded):
+**Phase 2 — Broadcast VectorOP nodes** (`outer_count > 1`; MatmulNode,
+MatmulConvNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode, HostNode
+and LlmAttnConvNode excluded):
 - Output → `advancing(numel, outer_count, aligned_chunk_size)`
 - Advancing inputs (stride through the output) → same advancing layout
 - Repeating input (bias at offset 0 each iteration) → `repeating(numel, aligned_chunk_size)`
@@ -529,20 +617,28 @@ For each ScheduledNode that is not a broadcast node, find the dominant input
 raise the output (inheriting dominant stride/n_chunks). Then raise every
 co-input below the output alloc to match.
 
-MatmulNode, ConvNode, PoolNode, and ReshapeNode are all excluded from Phase 3:
+The same node classes are excluded from Phase 3:
 - MatmulNode reads A and Y with per-row strides derived from `TensorLayout.gap`
   at emit time, not via alloc propagation.
-- ConvNode and PoolNode always produce flat NCHW outputs (`n_chunks = 1`), so
-  there is nothing to propagate.
+- ConvNode, MatmulConvNode and PoolNode always produce flat outputs
+  (`n_chunks = 1`), so there is nothing to propagate; a post-pass rejects a
+  graph in which a broadcast consumer would give their output a gapped layout.
 - ReshapeNode aliases its input buffer — the input's layout is already correct.
+- Host nodes read and write through `host_in()` / `host_out()`, which stage a
+  strided buffer through cached memory when needed.
 
 **Why propagate into non-broadcast nodes?** Gap slots in advancing buffers contain zeros (DMA memory is zeroed at allocation, ROM arrays pad gaps with zero). Passing `size = alloc` to run_op() processes data + gaps in one call; the gap slots produce correct zero outputs (Relu(0)=0, Add(x,0)=x, etc.) without needing per-chunk loops.
 
 ### Pool Size Calculation
 
-`_compute_pool_bytes()` sums `align64(alloc × bytes_per_elem)` over all tensors,
-then rounds up to a 4 KiB page boundary. This is the minimum contiguous DMA
-region needed and is exposed as `INFERENCE_BUF_POOL_SIZE_BYTES`.
+`_compute_pool_bytes()` sums `align64(alloc × bytes_per_elem)` over all
+tensors (weights, intermediates and graph I/O, without slot reuse), then
+rounds up to a 4 KiB page boundary. This conservative upper bound is exposed
+as `INFERENCE_BUF_POOL_SIZE_BYTES` and printed by
+`scripts/check_inference_setup.sh`.  The pool `inference_init()` actually
+allocates comes from `_compute_pool_layout()`: weights, then DMA states,
+then the intermediate slots coloured by event-stream liveness
+([SCHEDULER_DAG.md](SCHEDULER_DAG.md) §5–§6).
 
 ---
 
@@ -572,6 +668,9 @@ classDiagram
     class _CoreMixin {
         __init__()
         _compute_tensor_layouts()
+        _compute_event_stream()
+        _compute_live_intervals()
+        _compute_pool_layout()
         _compute_pool_bytes()
     }
     class _HeaderMixin {
@@ -579,15 +678,15 @@ classDiagram
     }
     class _SourceMixin {
         generate_source()
+        _kernel_wait_helper()
         _run_op_helper()
-        _run_matmul_helper()
-        _run_conv_helper()
-        _run_pool_helper()
+        _host_ops_section()
         _init_function()
         _inference_function()
     }
     class _BufImplMixin {
         generate_buf_impl()
+        generate_setup_script()
     }
     class _SimulateMixin {
         simulate()
@@ -623,67 +722,63 @@ The source file is assembled from sections:
 _file_banner()                     ← auto-generated header with model info
 _source_includes()                 ← #include "inference.h", per-kernel driver headers, string.h
 _source_op_defines()               ← #define VECTOROP_ADD 0u …
-_weight_arrays()                   ← ROM arrays + DMA pointers for each weight
-_buffer_declarations()             ← comments for I/O, DMA pointers for intermediates
-_kernel_instance()                 ← static XVectoropkernel s_kernel; static XMatmulkernel s_matmulkernel; …
-_run_op_helper()                   ← static void run_op(…) and/or run_op_at(…)    [VectorOP nodes]
-_run_matmul_helper()               ← static void run_matmul(…)                     [MatMul nodes]
-_run_conv_helper()                 ← static void run_conv(…)                       [Conv nodes]
-_run_pool_helper()                 ← static void run_pool(…)                       [Pool nodes]
-[_load_weight_helper()]            ← only when large weights exist
-_init_function()                   ← inference_init() + inference_deinit()
-_inference_function()              ← inference_run()
+_weight_arrays()                   ← ROM arrays for each (small) weight
+_buffer_declarations()             ← comments for I/O, DMA pointers / static views
+_kernel_instance()                 ← static XVectoropkernel s_vectoropkernel; static XMatmulkernel s_matmulkernel; …
+_kernel_wait_helper()              ← kernel_id_t enum + weak kernel_wait()
+_layer_names_table()               ← inference_num_layers() / inference_layer_names_ptr()
+_run_op_helper()                   ← every run_*() helper the graph needs:
+                                     run_op / run_op_act      [VectorOP nodes]
+                                     run_matmul / run_matmul_at [MatMul nodes]
+                                     run_conv / run_conv_at   [Conv, MatMul-on-Conv, LLM attention]
+                                     run_pool                 [Pool nodes]
+[_host_ops_section()]              ← host-op C helpers, tables, thread pool   [host nodes]
+_init_function()                   ← [_load_weight() when large weights exist]
+                                     inference_init() + inference_deinit()
+_inference_function()              ← inference_run() (or inference_run_<entry>())
 ```
 
 Each `run_*()` helper is only emitted when the model contains at least one node
 of the corresponding type; it encapsulates all AXI-Lite register writes and the
-poll loop for its kernel.
+Start of its kernel.  Helpers do not wait: `inference_run()` calls
+`kernel_wait(KERNEL_*)` where the event stream says so
+([SCHEDULER_DAG.md](SCHEDULER_DAG.md) §4).
 
-### _SourceMixin — run_op() and run_op_at()
+### _SourceMixin — run_op() and run_op_act()
 
-`run_op()` is emitted when any node uses a single flat kernel call
-(`outer_count == 1`). `run_op_at()` is emitted when any node broadcasts
-(`outer_count > 1`). Both may be emitted in the same file if the graph
-contains a mix of regular and broadcast ops.
+`run_op()` is emitted when any VectorOP node has no fused activation;
+`run_op_act()` (the same plus an `act` argument) when any node has one.
+Broadcast nodes use the same helpers with `outer > 1`.
 
 ```c
-/* run_op(): whole-buffer dispatch */
+/* run_op(): one kernel invocation; the kernel runs the outer loop */
 static void run_op(inference_buf_t *a, inference_buf_t *b,
-                   inference_buf_t *c, unsigned size, unsigned op)
+                   inference_buf_t *c, unsigned size, unsigned op,
+                   unsigned outer, unsigned a_inc, unsigned b_inc)
 {
-    XVectoropkernel_Set_a(&s_kernel, inference_buf_phys(a));
-    XVectoropkernel_Set_b(&s_kernel, b ? inference_buf_phys(b) : (u64)0);
-    XVectoropkernel_Set_c(&s_kernel, inference_buf_phys(c));
-    XVectoropkernel_Set_size(&s_kernel, size);
-    XVectoropkernel_Set_op(&s_kernel, op);
-    XVectoropkernel_Start(&s_kernel);
-    while (!XVectoropkernel_IsDone(&s_kernel)) {}
-}
-
-/* run_op_at(): offset-based dispatch for broadcasting loops */
-static void run_op_at(inference_buf_t *a, unsigned a_off,
-                      inference_buf_t *b, unsigned b_off,
-                      inference_buf_t *c, unsigned c_off,
-                      unsigned size, unsigned op)
-{
-    XVectoropkernel_Set_a(&s_kernel,
-        inference_buf_phys(a) + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM);
-    /* … same for b and c … */
-    XVectoropkernel_Start(&s_kernel);
-    while (!XVectoropkernel_IsDone(&s_kernel)) {}
+    XVectoropkernel_Set_a(&s_vectoropkernel, inference_buf_phys(a));
+    XVectoropkernel_Set_b(&s_vectoropkernel, b ? inference_buf_phys(b) : (u64)0);
+    XVectoropkernel_Set_c(&s_vectoropkernel, inference_buf_phys(c));
+    XVectoropkernel_Set_size(&s_vectoropkernel, size);
+    XVectoropkernel_Set_op(&s_vectoropkernel, op);
+    XVectoropkernel_Set_outer(&s_vectoropkernel, outer);
+    XVectoropkernel_Set_a_inc(&s_vectoropkernel, a_inc);
+    XVectoropkernel_Set_b_inc(&s_vectoropkernel, b_inc);
+    XVectoropkernel_Set_act(&s_vectoropkernel, VECTOROP_ACT_NONE);
+    XVectoropkernel_Start(&s_vectoropkernel);   /* non-blocking */
 }
 ```
 
 Notice that `run_op()` passes **physical addresses** to the kernel registers.
 The kernel's AXI master ports use these physical addresses to read/write DDR
 directly. The CPU never sees these transfers — it only writes to the AXI-Lite
-control registers and polls the done flag.
+control registers and later waits for the done flag in `kernel_wait()`.
 
 ### _SourceMixin — run_matmul() and run_matmul_at()
 
 Emitted when the graph contains `MatmulNode` operations.
 
-`run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride)` — programs the `XMatmulkernel` AXI-Lite registers and polls for completion. Row strides are in elements; zero means batch=1 (no striding).
+`run_matmul(a, b, c, n, k, m, batch, a_stride, b_stride, c_stride, b_packed)` — programs the `XMatmulkernel` AXI-Lite registers and starts the kernel (non-blocking). Batch strides are in elements; `b_packed = 1` when B is the tile-major packed constant.
 
 `run_matmul_at(a, a_off, b, b_off, c, c_off, ...)` — offset-based variant for the outer-loop decomposition when one operand has a leading dimension absent from the other.
 
@@ -710,7 +805,9 @@ class DataType(ABC):
     @property
     def np_storage(self) -> np.dtype: ...    # numpy dtype matching raw DMA storage
 
-    def quantize(self, x: np.ndarray) -> np.ndarray: ...     # float64 → float64 (rounded)
+    def quantize(self, x: np.ndarray) -> np.ndarray: ...     # float64 → float64 (round to nearest)
+    def truncate(self, x) -> np.ndarray: ...                 # floor (AP_TRN) — kernel outputs
+    def truncate_div(self, x) -> np.ndarray: ...             # toward zero — Div outputs
     def ramp_to_float(self, positions) -> np.ndarray: ...    # C test ramp → float64
     def float_to_storage(self, x) -> np.ndarray: ...         # float64 → raw storage dtype
     def encode_weight(self, data) -> List[str]: ...          # float array → C literal list
@@ -718,6 +815,8 @@ class DataType(ABC):
     def c_display(self, ptr, idx) -> str: ...                # C printf display expression
     def c_fill_rhs(self, pos_expr) -> str: ...               # C ramp-fill RHS expression
     def format_literal(self, storage_val) -> str: ...        # single value → C literal
+    # plus host-op / numeric helpers: host_quantize, int_quantize, frac_bits,
+    # quantize_exp / truncate_exp (power-of-two exponents), host_lut_bits, …
 ```
 
 ### ap_fixed<16,8> (default)
@@ -735,7 +834,9 @@ class DataType(ABC):
 | bytes_per_elem | 2 |
 | align_elems | 8 (16 bytes / 2 bytes per elem) |
 
-Quantization: `encoded = round(clip(x, -128, 127.996) * 256)` stored as `int16_t`.
+Quantization (weights, inputs): `encoded = round(clip(x, -128, 127.996) * 256)`
+(round half to even) stored as `int16_t`.  Kernel outputs are truncated
+instead (floor, or toward zero for Div) — see §10.
 
 ### float32
 
@@ -780,8 +881,8 @@ always match what the hardware will produce.
 ## 10. Fixed-Point Simulation (_SimulateMixin)
 
 The simulation in `src/codegen/_simulate.py` forward-passes the ONNX graph using
-numpy, quantizing intermediate results at each node boundary to mimic the
-hardware's element-wise saturate-and-round behavior.
+numpy, truncating intermediate results at each node boundary to mimic the
+hardware's saturate-and-truncate (AP_TRN / AP_SAT) behavior.
 
 ### Simulation Flow
 
@@ -793,12 +894,13 @@ flowchart TD
     I --> LOOP
     LOOP["For each node in topological order"]
     LOOP --> SW{node type}
-    SW -->|ScheduledNode| SN["numpy element-wise op\na+b · a-b · a*b · a/b · max(a,0) · clip(a,0,6)\nthen quantize(result)"]
-    SW -->|MatmulNode| MN["np.matmul(A, B)\nthen quantize(result)"]
-    SW -->|ConvNode| CN["_conv2d_ref() sliding-window reference\nthen quantize(result)"]
-    SW -->|PoolNode| PN["_pool2d_ref() sliding-window reference\nno quantize — reduction, not arithmetic"]
+    SW -->|ScheduledNode| SN["numpy element-wise op\na+b · a-b · a*b · a/b · max(a,0) · clip(a,0,6)\n(+ fused act) then truncate(result)\n(Div: truncate_div)"]
+    SW -->|"MatmulNode · MatmulConvNode"| MN["np.matmul(A, B)\nthen truncate(result)\n(_matmul_exp with exponents)"]
+    SW -->|ConvNode| CN["_conv2d_ref() / _depthwise_conv2d_ref()\nthen truncate(result)"]
+    SW -->|PoolNode| PN["_pool2d_ref() sliding-window reference\nthen truncate(result)"]
     SW -->|ReshapeNode| RN["arrays[output] = arrays[source].reshape(shape)\nzero cost — shares the numpy array"]
-    SN & MN & CN & PN & RN --> NEXT{more nodes?}
+    SW -->|"HostNode · LlmNode · LlmAttnConvNode\nSpaceToDepthNode"| HN["node.reference(...)\n(double math, round-half-even write-back)\nor a pure reorder"]
+    SN & MN & CN & PN & RN & HN --> NEXT{more nodes?}
     NEXT -->|yes| LOOP
     NEXT -->|no| OUT["Return all arrays\ninputs · weights · intermediates · outputs"]
 ```
@@ -816,18 +918,24 @@ The graph is then walked in topological order. Each node type has its own
 evaluation path:
 
 - **ScheduledNode** — runs the matching numpy scalar op (`+`, `-`, `*`, `/`,
-  `maximum`, `clip`) over flat arrays, then calls `quantize()` to snap the
-  result to the representable fixed-point grid. This mirrors the hardware's
-  `saturate_cast<Data_t>` after every element-wise operation.
-- **MatmulNode** — calls `np.matmul`. Result is quantized because the hardware
-  accumulates in a fixed-point type.
-- **ConvNode** — calls the `_conv2d_ref()` sliding-window reference
-  implementation, then quantizes.
-- **PoolNode** — calls `_pool2d_ref()`. Pooling is a reduction (min/max/avg),
-  not an arithmetic operation, so the result is **not** quantized again — the
-  output precision is determined by the input precision.
+  `maximum`, `clip`) over flat arrays (plus a fused `act`), then calls
+  `truncate()` (floor; `truncate_div()` — toward zero — for Div) to snap the
+  result to the representable fixed-point grid with saturation. This mirrors
+  the hardware's `saturate_cast<Data_t>` after every element-wise operation.
+- **MatmulNode / MatmulConvNode** — call `np.matmul`, then truncate; the two
+  engines are bit-identical, so one model serves both. Tensors with
+  power-of-two exponents go through `_matmul_exp` (exact integer
+  accumulation with the int32 wrap).
+- **ConvNode** — calls the `_conv2d_ref()` (or `_depthwise_conv2d_ref()`)
+  sliding-window reference implementation, then truncates.
+- **PoolNode** — calls `_pool2d_ref()`, then truncates (average and Lp
+  pooling produce off-grid values; max pooling stays on the grid).
 - **ReshapeNode** — zero-cost numpy view (`reshape`). No data is copied; the
   output array shares memory with its source.
+- **SpaceToDepthNode** — a pure reorder (no truncation).
+- **HostNode / LlmNode / LlmAttnConvNode** — `node.reference()`, the numpy
+  twin of the generated C (double arithmetic, round-half-even write-back for
+  host ops; exact integer sums and floor for the attention ConvKernel calls).
 
 After all nodes have been processed, the full dict of arrays (inputs, weights,
 intermediates, and outputs) is returned so that callers can extract ground-truth
@@ -839,16 +947,21 @@ The hardware VectorOPKernel applies `saturate_cast<Data_t>` after every
 element-wise operation. In `ap_fixed<16,8>` arithmetic:
 
 ```
-add(0x7F00, 0x0100) = 0x8000  (128 + 0.5... but wait, 128 overflows)
+add(0x7F00, 0x0100) = 127.0 + 1.0 = 128.0  → out of range
 → saturate to max: 0x7FFF  (127.996)
 ```
 
-The Python `quantize()` method mirrors this exactly:
+Products carry 16 fractional bits; the AP_TRN cast back to `ap_fixed<16,8>`
+drops the lower 8 (floor toward −∞). The Python `truncate()` method mirrors
+this exactly:
 ```python
-def quantize(self, x):
+def truncate(self, x):
     clipped = np.clip(x.astype(np.float64), self._min_val, self._max_val)
-    return np.round(clipped * self._scale) / self._scale
+    return np.floor(clipped * self._scale) / self._scale
 ```
+
+`quantize()` (the same with `np.round`) is used only to encode weights and
+inputs, matching the ROM / `.dat` encoding.
 
 ### Expected Storage Layout
 
@@ -875,7 +988,7 @@ objects mapped **cacheable** by default (`XCL_BO_FLAGS_CACHEABLE`; build with
 `-DINFERENCE_BUF_CACHEABLE=OFF` or run with `INFERENCE_BUF_CACHEABLE=0` for
 the old non-cacheable mapping), so the syncs below are real cache
 maintenance on the buffer's byte range.  The full hand-off table, including
-host-CPU ops, is in `doc/INFERENCE_SCHEDULER.md` §Cache coherency and is
+host-CPU ops, is in [`doc/INFERENCE_SCHEDULER.md` §Cache coherency](../../doc/INFERENCE_SCHEDULER.md#cache-coherency) and is
 checked by `test/test_cache_coherency.py`.
 
 Two operations maintain coherency:
@@ -970,10 +1083,15 @@ Syncing intermediates would be wasteful and is architecturally unnecessary.
 **Weights are synced once at init.** They are read-only after initialization, so
 there is no need to flush them before every `inference_run()` call.
 
-**`run_op()` and `run_op_at()` perform no sync.** They are pure dispatch helpers:
-write registers, start, poll. The comment at the top of `run_op()` in the
-generated code explicitly states this contract so callers know what to expect
-if they ever call `run_op` manually.
+**The `run_*()` helpers perform no sync.** They are pure dispatch helpers:
+write registers, start (the wait is a separate `kernel_wait()`). The comment
+at the top of `run_op()` in the generated code explicitly states this
+contract so callers know what to expect if they ever call `run_op` manually.
+
+**Host ops are the exception inside `inference_run()`**: a host op
+invalidates a kernel-written input after that lane has drained and flushes
+its own output before a kernel reads it; KV-cache DMA states are flushed by
+`llm_cache_flush`.  The full table is in the technical reference.
 
 ---
 
@@ -995,8 +1113,8 @@ logic in `_broadcast_info()` already handles the general case.
 
 ### Adding a New Hardware Kernel
 
-Use ConvNode or PoolNode as a template. The pattern requires changes in exactly
-five places:
+Use ConvNode or PoolNode as a template. The pattern requires changes in these
+places:
 
 1. **`src/nodes.py`** — add a new dataclass (e.g. `FooNode`) with:
    - `kernel_name: ClassVar[str] = "FooKernel"` — must match an entry in `KERNEL_REGISTRY`
@@ -1029,11 +1147,15 @@ five places:
    - `_broadcast_io_map()` Pass 1 exclusion
    - `_broadcast_io_map()` Pass 2 exclusion
    - Post-validation check (if node has `outer_count > 1`, raise error)
-   - Also add `_has_foo_nodes` property and update `_active_kernels`
+   - Add the lane to `_KERNEL_ID_ENUM` (mirrored in `_source.py`) and, if
+     useful, a `_has_foo_nodes` property; `_active_kernels` follows
+     `kernel_name` automatically
 
-5. **`src/codegen/_source.py`** — add a `_run_foo_helper()` method and call it
-   in `generate_source()`; add `FooNode` to `isinstance` guards in
-   `_init_function()` (intermediate buffer alloc section) if needed.
+5. **`src/codegen/_source.py`** — emit `run_foo()` from `_run_op_helper()`
+   (gated on the node type) and add the lane to the `kernel_id_t` enum /
+   `kernel_wait()` emitted by `_kernel_wait_helper()`; add `FooNode` to
+   `isinstance` guards in `_init_function()` (intermediate buffer alloc
+   section) if needed.
 
 6. **`src/codegen/_simulate.py`** — add a `FooNode` branch in `_forward_pass()`
    using a numpy reference implementation.

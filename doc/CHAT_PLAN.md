@@ -1,16 +1,15 @@
-# Chat app on the KV260 — plan (for review)
+# Chat app on the KV260 — plan and log
 
-Date: 2026-09-26.  Status: **approved 2026-09-26 — decisions: A then B,
-SmolLM2-135M-Instruct, server on the board, existing CLIs + `chat.py`, context
-1024.**  Phase 1 (server + CLI + backend A) **done** (branch `feat/chatsrv`, §9).
-**Phase 2 done: GO for SmolLM2-135M on today's bitstream with the numeric
-policy `pow2+sink+p12` (§10)** — a float residual, a precomputed position-0
-sink, per-channel power-of-two exponents, and softmax P at 2^-12.
-**Phase 4 server side done (branch `feat/llmsrv`, §12)** — tokenizer, chat
-template, sampling, the `smollm2` backend with prefix-cache reuse and
-two-model residency, tested against fakes of the §11 library; the board gate
-waits for phase 3's `libsmollm2.so`.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at 971 ms per
-inference on the board, bit-exact with the scheduler simulation).
+Status (2026-09-27): **all planned phases done, on main.**  Phase 1 BERT-QA
+server (§9); phase 2 numeric study GO (§10); phase 3 SmolLM2-135M
+`libsmollm2.so`, bit-exact (§13); phase 4 server integration with both
+backends on the board (§12, §14), DRY sampling (§15); phase 5 prefill attention
+on the FPGA, 256-token prefill 3.6 → 1.3 s (§16); decode attention on all host
+threads, 5.06 tok/s at position 32 and 4.39 at 1000 (§17).  Board-hang
+workaround in §18.  Not done: dual-port weight streaming, q/k/v + gate/up
+fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers
+are in §13.4, §16.3 and §17.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at
+971 ms per inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
 

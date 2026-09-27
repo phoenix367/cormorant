@@ -1,6 +1,13 @@
 # Throughput plan — MatmulKernel, depthwise ConvKernel, VectorOPKernel
 
 Date: 2026-09-25.  Status: **executed 2026-09-25/26** — Tracks A (A1–A5), B (B1–B3; B4 deferred) and C (C1–C4) landed and measured; see §8.  Track D (clock) not started.
+
+> **Follow-up (2026-09-27).** The §8 next levers were taken by
+> doc/RESNET18_15FPS_PLAN.md: flat standard sweep (CONV_OPTIMISATION §2.41),
+> 8-lane PoolingKernel writer (POOL_OPTIMIZATION §2.14), second PS port HPC1
+> (neutral at 100 MHz).  Still not done: Track D (the board runs at 100 MHz),
+> B4 (depthwise on the grid), A6 / A7.  Latest demo numbers: BERT_PLAN.md §3
+> "Phase 2A + 2B combined".
 Baseline bitstream: main a7d0bce / 56fc2eb (hw_128 f432a24), PL clock 100 MHz,
 all four kernels on one 128-bit `S_AXI_HPC0_FPD` port through
 `axi_interconnect_0` (≈ 1.6 GB/s per direction).

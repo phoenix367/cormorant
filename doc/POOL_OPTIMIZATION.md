@@ -43,12 +43,9 @@ after running the full TestPoolingSim case list.
 > The `kOwParallel = 4` figure is kept in §2.10 for the record but is not
 > part of the shipped progression.
 
-**Net result on the 31-test suite: ~4.77× faster than the post-baseline
-(line-buffer-only) implementation; ~79% reduction in total HW sim time.**
-
-For the 25 tests common to every stage the same kernel runs **~7.8× faster**
-than the pre-optimization baseline (line-buffer-only equivalent on the same
-test list).
+**Net result on the 31-test suite after §2.14: 509,665 ns vs 7,021,605 ns
+for the line-buffer-only kernel — 13.8× (−92.7 %); −56.2 % vs §2.13.**
+(The ~4.77× / ~7.8× figures were the §2.12 state.)
 
 ---
 

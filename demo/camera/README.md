@@ -30,10 +30,15 @@ flowchart LR
     end
 ```
 
-> **Expect ~0.4 FPS.** MobileNetV1 inference on the FPGA takes a few seconds
-> per frame, so the live view updates slowly — that is the kernel cost, not a
-> pipeline stall. The overlay shows inference latency, display refresh rate,
-> and whole-board (SOM) power draw.
+> **Frame rate.** The pipeline keeps one frame in flight, so the display rate
+> is bounded by the per-frame inference time.  The transcript below (May 2026)
+> was recorded with an early ConvKernel: 2.46 s per frame, ~0.4 FPS.  The
+> current kernels run MobileNetV1 in ~81–83 ms (the
+> [`image_classification/`](../image_classification/) demo); the camera demo
+> has not been re-measured with them, and at that speed the capture,
+> preprocessing, JPEG encoding and the host's SFTP pull
+> (`display.poll_interval_ms`) also count.  The overlay shows inference
+> latency, display refresh rate, and whole-board (SOM) power draw.
 
 ## Layout
 
@@ -46,13 +51,15 @@ demo/camera/
 ├── scripts/
 │   ├── download_assets.py                — fetch ONNX + labels
 │   ├── generate_project.py               — schedule the model into a CMake project
-│   └── deploy_and_run.py                 — upload, build, run, display
+│   ├── deploy_and_run.py                 — upload, build, run, display
+│   └── _config_help.py                   — "config missing" help text
 ├── src/
 │   ├── classify_stream.c                 — persistent board-side inference host
 │   └── board/                            — uploaded to the KV260
 │       ├── camera_loop.py                —   RealSense capture + annotate loop
 │       ├── preprocessing.py              —   NCHW ap_fixed<16,8> frame encoder
-│       └── visualization.py              —   OpenCV overlay helpers
+│       ├── visualization.py              —   OpenCV overlay helpers
+│       └── power_monitor.py              —   whole-board power sampling thread
 ├── assets/
 │   ├── labels/imagenet_1001_labels.txt   — populated by download_assets.py
 │   └── models/                           — ONNX downloads
@@ -89,18 +96,21 @@ expensive. So the board runs a **persistent** inference host:
   ```bash
   # from the repo root
   mkdir -p build && cd build
-  cmake -DAXI_BUS_WIDTH=32 ..
+  cmake ..
   make synthesize_kv260
   ```
 
-  `AXI_BUS_WIDTH` must match the AXI master width of the cormorant overlay
-  loaded on the board. Override `local.driver_dirs` if you keep the build
-  tree elsewhere.
+  The driver sources only describe the kernels' AXI-Lite registers, so they
+  are the same for every `AXI_BUS_WIDTH` (the bitstream on the board is the
+  128-bit block design, `-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`).
+  Override `local.driver_dirs` if you keep the build tree elsewhere.
 
 ### KV260 board
 
-* Linux with the cormorant overlay loaded (so `/dev/uio*` exposes
-  `fabric_vecop` / `fabric_matmul` / `fabric_conv` / `fabric_pool`).
+* Linux with the cormorant bitstream and overlay loaded
+  (`inference-scheduler/upload_bitstream.py`, see the root README), so
+  `/dev/uio*` exposes `fabric_vecop` / `fabric_conv` / `fabric_pool` (the
+  three kernels this model uses).
 * `gcc`, `cmake ≥ 3.19`, `make`.
 * XRT runtime via `pkg-config xrt` or `/opt/xilinx/xrt`.
 * Passwordless `sudo` for the SSH user (XRT requires root).
@@ -169,7 +179,9 @@ A window opens showing the live annotated camera feed. Press **`q`** (or
 shut down cleanly and the remote scratch directory is removed.
 
 Sample output (host `~/projects/axi_demo/demo/camera`, board at
-`192.168.100.8` with a RealSense D435):
+`192.168.100.8` with a RealSense D435; May 2026, with the ConvKernel of that
+time — the scheduler now also emits a host `SpaceToDepth` stem node, 59
+nodes in all, see the image-classification README):
 
 ```
 $ ./run_demo.py
@@ -257,10 +269,10 @@ Notable behaviour visible in the run:
 - **Power source picked automatically.**  `xlnx_platformstats` (the SOM
   INA260 sensor, 3.18 W idle) was selected at startup; see *Power
   measurement* below for the fallback chain.
-- **Per-frame inference latency ≈ 2.46 s.**  Same as the
-  image-classification demo's MobileNetV1 column — that's pure HLS
-  kernel cost; the pipeline is one-frame-in-flight, so display refresh
-  caps at ~0.4 fps.
+- **Per-frame inference latency ≈ 2.46 s** in this run — the
+  image-classification demo's MobileNetV1 time with the ConvKernel of
+  that date (it is ~81–83 ms now); the pipeline is one-frame-in-flight,
+  so display refresh capped at ~0.4 fps.
 
 ### Power measurement
 
@@ -284,10 +296,12 @@ with `run.power_poll_s`.
 | Flag | Effect |
 |------|--------|
 | `--skip-download` | reuse cached ONNX + labels |
+| `--skip-generate` | reuse the generated project under `build/projects/` |
 | `--skip-deploy` | only regenerate the local CMake project |
 | `--force-download` | re-fetch all assets |
 | `--save-only` | headless host: save frames to `build/stream/` instead of a window |
 | `--check-only` | run preflight checks for every stage and exit |
+| `--no-cleanup` (deploy script) | leave the remote work_dir for inspection |
 
 `--check-only` is the fastest way to confirm the board is ready — it probes
 SSH, the kernels' UIO devices, and the board-side RealSense / OpenCV
@@ -300,5 +314,5 @@ dependencies without uploading anything.
 | `board python deps … MISSING` | install pyrealsense2 / opencv / numpy on the board — see *Board setup* |
 | `RealSense camera detected … MISSING` | check the USB 3.0 connection; run `rs-enumerate-devices` on the board |
 | `opencv-python not installed on the host` | `pip install -r requirements.txt`, or run with `--save-only` |
-| display window never updates | the first FPGA inference takes a few seconds; watch the per-frame log on the console |
+| display window never updates | the board loop loads the weights and starts the camera before the first frame; watch the per-frame log on the console |
 | every prediction looks wrong | usually a normalize mismatch — `preprocess.normalize` must match how the model was trained (`tf` for the stock MobileNetV1) |

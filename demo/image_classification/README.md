@@ -1,10 +1,10 @@
 # Image classification KV260 demo
 
 End-to-end ImageNet classification demo for the KV260 FPGA platform.  The
-default `image_classification_config.json` runs three pre-trained models —
-**MobileNetV1 1.0/224**, **MobileNetV2**, and **ResNet-18** — each with its
-own preprocessing recipe and label-offset convention.  Drop a few JPG/PNG
-files into `assets/images/`, run the orchestrator, and the demo will
+bundled `image_classification_config.json.example` runs three pre-trained
+models — **MobileNetV1 1.0/224**, **MobileNetV2**, and **ResNet-18** — each
+with its own preprocessing recipe and label-offset convention.  Drop a few
+JPG/PNG files into `assets/images/`, run the orchestrator, and the demo will
 
   1. download the ONNX models from a shared Google Drive folder,
   2. fetch the ImageNet 1001-class label list,
@@ -33,17 +33,21 @@ demo/image_classification/
 ├── run_demo.py                             — one-shot orchestrator
 ├── scripts/
 │   ├── download_assets.py                  — fetch ONNX + labels, preprocess images
-│   ├── generate_project.py                 — schedule the model into a CMake project
-│   └── deploy_and_run.py                   — upload, build, classify on KV260
+│   ├── generate_project.py                 — schedule each model into a CMake project
+│   ├── deploy_and_run.py                   — upload, build, classify on KV260
+│   └── _config_help.py                     — "config missing" help text
 ├── src/
 │   └── classify_images.c                   — board-side host (compiled on the board)
 ├── assets/                                 — populated by you + download_assets.py
 │   ├── images/                             — drop JPG/PNG inputs here
 │   ├── labels/imagenet_1001_labels.txt     — derived from imagenet_class_index.json
 │   ├── models/                             — ONNX downloads
-│   └── preprocessed/                       — images.bin + manifest.txt
+│   └── preprocessed/<model>/               — images.bin + manifest.txt per model
+│                                             (uploaded to the board before its run)
 └── build/
+    ├── projects/projects.json              — summary of the generated projects
     ├── projects/<model>/                   — generated CMake project per model
+    │   ├── weights/*.dat                   —   large weight tensors, read at runtime
     │   ├── driver/                         —   HLS driver sources copied in
     │   └── test/
     │       ├── classify_images.c           —   copied from demo/image_classification/src/
@@ -62,18 +66,22 @@ demo/image_classification/
   ```bash
   # from the repo root
   mkdir -p build && cd build
-  cmake -DAXI_BUS_WIDTH=32 ..
+  cmake ..
   make synthesize_kv260
   ```
 
-  `AXI_BUS_WIDTH` must match the AXI master width of the cormorant overlay
-  loaded on the board; the sample numbers below were measured at 32-bit.
+  The driver sources only describe the kernels' AXI-Lite registers, so they
+  are the same for every `AXI_BUS_WIDTH`; the bitstream on the board is the
+  128-bit block design (`-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`), which
+  the sample numbers below were measured with.
   Override `local.driver_dirs` if you keep the build tree elsewhere.
 
 ### KV260 board
 
-* Linux with the cormorant overlay loaded (so `/dev/uio*` exposes
-  `fabric_vecop` / `fabric_matmul` / `fabric_conv` / `fabric_pool`).
+* Linux with the cormorant bitstream and overlay loaded
+  (`inference-scheduler/upload_bitstream.py`, see the root README), so
+  `/dev/uio*` exposes `fabric_vecop` / `fabric_matmul` / `fabric_conv` /
+  `fabric_pool`.
 * `gcc`, `cmake ≥ 3.19`, `make`.
 * XRT runtime via `pkg-config xrt` or `/opt/xilinx/xrt`.
 * Passwordless `sudo` for the SSH user (XRT requires root for buffer allocation).
@@ -108,7 +116,9 @@ Or step-by-step (lets you iterate without re-downloading):
 ```
 
 Sample output (host `~/projects/axi_demo/demo/image_classification`, board
-at `192.168.100.8`, one image: `greyfox-672194.JPEG`):
+at `192.168.100.8`, one image: `greyfox-672194.JPEG`).  The generate stage
+is the current scheduler's output (abridged); the deploy stage is the board
+run behind `doc/RESNET18_15FPS_PLAN.md` §3.3 (2026-09-26, 100 MHz):
 
 ```
 $ ./run_demo.py
@@ -129,43 +139,46 @@ done
 Model      : assets/models/mobilenet_v1_1.0_224_no_softmax.onnx
 Inputs     : ['input:0[1, 3, 224, 224]']
 Outputs    : ['MobilenetV1/Logits/SpatialSqueeze:0[1, 1001]']
-Nodes      : 58
-  [  0] Conv         [1, 3, 224, 224] x [32, 3, 3, 3] x [32] -> [1, 32, 112, 112]
-  [  1] Clip         [1, 32, 112, 112] -> [1, 32, 112, 112]
-  [  2] Conv         [1, 32, 112, 112] x [32, 1, 3, 3] x [32] -> [1, 32, 112, 112]
+Nodes      : 59
+  [  0] SpaceToDepth [1, 3, 224, 224] -> [1, 12, 112, 112]
+  [  1] Conv         [1, 12, 112, 112] x [32, 12, 2, 2] x [32] -> [1, 32, 112, 112]
+  [  2] Clip         [1, 32, 112, 112] -> [1, 32, 112, 112]
+  [  3] Conv         [1, 32, 112, 112] x [32, 1, 3, 3] x [32] -> [1, 32, 112, 112]
   …  (depthwise-separable Conv / Clip blocks repeating to 14×14, 7×7) …
-  [ 54] AveragePool  [1, 1024, 7, 7]   -> [1, 1024, 1, 1]
-  [ 55] Conv         [1, 1024, 1, 1]   x [1001, 1024, 1, 1] x [1001] -> [1, 1001, 1, 1]
-  [ 56] Reshape      [1, 1001, 1, 1]   -> [1, 1, 1, 1001]
-  [ 57] Squeeze      [1, 1, 1, 1001]   -> [1, 1001]
+  [ 55] AveragePool  [1, 1024, 7, 7]   -> [1, 1024, 1, 1]
+  [ 56] Conv         [1, 1024, 1, 1]   x [1001, 1024, 1, 1] x [1001] -> [1, 1001, 1, 1]
+  [ 57] Reshape      [1, 1001, 1, 1]   -> [1, 1, 1, 1001]
+  [ 58] Squeeze      [1, 1, 1, 1001]   -> [1, 1001]
 Weights    : 20 large weight(s) written to build/projects/mobilenet_v1/weights/
 [mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel
 
 [mobilenet_v2] scheduling mobilenetv2-12_simplified.onnx
 Inputs     : ['input[1, 3, 224, 224]']
 Outputs    : ['output[1, 1000]']
-Nodes      : 101
-  [  0] Conv         [1, 3, 224, 224] x [32, 3, 3, 3] x [32] -> [1, 32, 112, 112]
+Nodes      : 102
+  [  0] SpaceToDepth [1, 3, 224, 224] -> [1, 12, 112, 112]
+  [  1] Conv         [1, 12, 112, 112] x [32, 12, 2, 2] x [32] -> [1, 32, 112, 112]
   …  (inverted-residual blocks; expansion + depthwise + projection + Add) …
-  [ 97] GlobalAveragePool [1, 1280, 7, 7] -> [1, 1280, 1, 1]
-  [ 98] Reshape      [1, 1280, 1, 1]   -> [1, 1280]
-  [ 99] MatMul       [1, 1280] x [1280, 1000] -> [1, 1000]
-  [100] Add          [1, 1000] x [1000] -> [1, 1000]
-Weights    : 35 large weight(s) written to build/projects/mobilenet_v2/weights/
+  [ 98] GlobalAveragePool [1, 1280, 7, 7] -> [1, 1280, 1, 1]
+  [ 99] Reshape      [1, 1280, 1, 1]   -> [1, 1280]
+  [100] MatMul       [1, 1280] x [1280, 1000] -> [1, 1000]
+  [101] Add          [1, 1000] x [1000] -> [1, 1000]
+Weights    : 39 large weight(s) written to build/projects/mobilenet_v2/weights/
 [mobilenet_v2] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
 
 [resnet18] scheduling resnet18-simplified-fused.onnx
 Inputs     : ['data[1, 3, 224, 224]']
 Outputs    : ['resnetv15_dense0_fwd[1, 1000]']
-Nodes      : 50
-  [  0] Conv         [1, 3, 224, 224] x [64, 3, 7, 7] x [64] -> [1, 64, 112, 112]
-  [  1] Relu
-  [  2] MaxPool      [1, 64, 112, 112] -> [1, 64, 56, 56]
-  …  (basic-block residuals; Conv→Conv→Add→Relu, two per stage, four stages) …
-  [ 46] GlobalAveragePool [1, 512, 7, 7] -> [1, 512, 1, 1]
-  [ 47] Flatten      [1, 512, 1, 1]   -> [1, 512]
-  [ 48] MatMul       [1, 512] x [512, 1000] -> [1, 1000]
-  [ 49] Add          [1, 1000] x [1000] -> [1, 1000]
+Nodes      : 43
+  [  0] SpaceToDepth [1, 3, 224, 224] -> [1, 12, 112, 112]
+  [  1] Conv         [1, 12, 112, 112] x [64, 12, 4, 4] x [64] -> [1, 64, 112, 112]
+  [  2] Relu         [1, 64, 112, 112] -> [1, 64, 112, 112]
+  [  3] MaxPool      [1, 64, 112, 112] -> [1, 64, 56, 56]
+  …  (basic-block residuals, two per stage, four stages; the Relu after each Add is fused into the Add) …
+  [ 39] GlobalAveragePool [1, 512, 7, 7] -> [1, 512, 1, 1]
+  [ 40] Flatten      [1, 512, 1, 1]   -> [1, 512]
+  [ 41] MatMul       [1, 512] x [512, 1000] -> [1, 1000]
+  [ 42] Add          [1, 1000] x [1000] -> [1, 1000]
 Weights    : 21 large weight(s) written to build/projects/resnet18/weights/
 [resnet18] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
 wrote 3 project(s) under demo/image_classification/build/projects
@@ -249,6 +262,11 @@ resnet18
 
 Notable behaviour visible in the run:
 
+- **Space-to-depth stem.**  The scheduler rewrites each stride-2 RGB
+  stem (ResNet-18's 7×7, the MobileNets' 3×3) as a host-side
+  `SpaceToDepth(2)` reorder plus a stride-1 Conv over 12 channels, so the
+  stem uses 12 of ConvKernel's 16 input lanes instead of 3; the output is
+  bit-identical (`doc/RESNET18_15FPS_PLAN.md` step 1).
 - **Per-model preprocessing.**  `download_assets.py` writes one
   `images.bin` per model under `assets/preprocessed/<model>/`, each
   encoded with the model's own `normalize` recipe: `tf` for
@@ -273,9 +291,14 @@ Notable behaviour visible in the run:
   layers; MobileNet v1/v2 escaped only because their chunk geometry
   happened to fit.  With the fix the same ONNX file classifies
   correctly (83 % grey_fox above).  The latencies in this transcript are
-  from the §2.22–§2.34 ConvKernel (2-D MAC grid, explicit AXI bursts,
-  128-bit packed weight path); the previous transcript showed
+  from the ConvKernel of `doc/CONV_OPTIMISATION.md` §2.22–§2.42 (2-D MAC
+  grid, explicit AXI bursts, 128-bit packed weight path, 16 × 16 grid,
+  two output pixels per cycle); the previous transcript showed
   2 463 / 1 876 / 2 459 ms.
+- **Later: cacheable buffer pool.**  Since BERT phase 2B the generated
+  code maps its buffers cacheable and the SpaceToDepth reorder runs in
+  place: ResNet-18 60.3 ms, MobileNet v1 81.0 ms, v2 63.9 ms with the same
+  predictions (`doc/BERT_PLAN.md` §3, "Phase 2A + 2B combined").
 
 The full per-image top-K table is also written to `build/results.json`.
 
@@ -283,13 +306,15 @@ The full per-image top-K table is also written to `build/results.json`.
 
 | Flag | Effect |
 |------|--------|
+| `--models resnet18` | restrict generate/deploy to a subset of models (names from `models[].name`) |
 | `--skip-download` | reuse cached ONNX + preprocessed images |
-| `--skip-deploy` | only regenerate the local CMake project |
+| `--skip-generate` | reuse the generated projects under `build/projects/` |
+| `--skip-deploy` | only regenerate the local CMake projects |
 | `--force-download` | re-fetch ONNX, labels, and rebuild `images.bin` |
 | `--check-only` | run preflight checks for every stage and exit |
 | `--profile-layers` | enable per-layer wall-clock profiling on the board |
 | `--no-cleanup` (deploy) | leave the remote work_dir for inspection |
-| `--verbose` | print full build / run output for failed steps |
+| `--verbose` | also print the cmake / make output of steps that succeed (a failed step always prints its output) |
 
 ## Tuning the run
 

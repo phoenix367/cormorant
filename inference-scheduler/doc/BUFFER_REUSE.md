@@ -7,6 +7,14 @@ analyses when each tensor is first written and last read, then uses **greedy
 interval-graph colouring** to pack non-overlapping tensors into the same slot —
 reducing the pool without any change to the generated kernel calls.
 
+> **Status (2026-09-27).** When kernel starts became non-blocking
+> (`kernel_wait()`, cross-lane overlap) the live intervals moved from
+> node indices to **event-stream indices**; the colouring, slot sizing and
+> alignment rules below are unchanged.  The authoritative description of
+> the intervals is [SCHEDULER_DAG.md](SCHEDULER_DAG.md) §5–§6; this
+> document keeps the background, the pool-layout arithmetic and the
+> MobileNetV1 illustration.
+
 ---
 
 ## Table of Contents
@@ -27,9 +35,9 @@ reducing the pool without any change to the generated kernel calls.
 ## 1. Background
 
 The scheduler emits a single `inference_buf_alloc(N)` call that allocates the
-entire DMA pool upfront.  Every weight and intermediate tensor is carved out of
-this pool via `inference_buf_init_view()` — a zero-copy view that sets a base
-pointer and element count without any additional allocation.
+entire DMA pool upfront.  Every weight, DMA state and intermediate tensor is
+carved out of this pool via `inference_buf_init_view()` — a zero-copy view
+that sets a base pointer and element count without any additional allocation.
 
 ```
  Physical DDR
@@ -54,47 +62,64 @@ Not all tensors are candidates for reuse:
 | Category | Lifetime | Reuse eligible? |
 |----------|----------|-----------------|
 | **Weight** (`is_weight=True`) | Entire `inference_init()` → `inference_deinit()` | No — always live |
+| **DMA state** (`axi.numeric` state without a host kind, e.g. a KV cache) | Persistent across `inference_run()` calls | No — placed after the weights |
 | **Graph input / output** | Passed in by the caller per `inference_run()` call | No — not in pool |
-| **Reshape alias** | Points to the same memory as its source | No — no backing storage |
+| **Reshape alias / Slice view** | Points to (part of) the memory of its source | No — no backing storage |
+| **Host-memory tensor** (`axi.numeric` `host`) | Intermediate in host memory | Yes — in a separate malloc'd arena, same colouring |
 | **Intermediate** | Produced by one node, consumed by one or more later nodes | **Yes** |
 
-Only intermediates are candidates.  Reshape aliases are already zero-cost (they
-alias an existing buffer and have no `inference_buf_init_view` entry), so they
-are excluded from the interval analysis.
+Only intermediates are candidates.  Reshape aliases and Slice views are
+already zero-cost (they alias an existing buffer and own no slot), so they
+are excluded from the interval analysis; their consumers extend the interval
+of the buffer they alias.
 
 ---
 
 ## 3. Live Interval Analysis
 
-A tensor's **live interval** is the closed range of node indices `[produce, consume]`
-during which the tensor must exist in memory:
+A tensor's **live interval** is the closed range `[start, end]` of positions
+in the `inference_run()` **event stream** (the sequence of kernel starts,
+`kernel_wait()` calls and host-op blocks, `_compute_event_stream`) during
+which the tensor must exist in memory:
 
-- **`produce`** — the index of the node whose output _is_ this tensor.
-- **`consume`** — the index of the _last_ node that reads this tensor as an input.
+- **`start`** — the event index of the Start (or host-op `cpu` event) of the
+  node whose output _is_ this tensor.
+- **`end`** — the latest event index at which a consumer is known to be
+  finished: the `kernel_wait()` / final drain that drains the consumer's lane
+  (for a host-op consumer, its own `cpu` event).
+
+The original implementation used node indices (`[produce_idx,
+last_consume_idx]`), which was correct only while every `run_*()` helper
+polled `IsDone` before returning.  With non-blocking starts a consumer may
+still be reading a buffer after later nodes have started on other lanes, so
+the interval has to extend to the drain of the consumer's lane.
 
 ```mermaid
 flowchart LR
-    subgraph "Graph traversal (single pass)"
-        N0["Node 0\n(produces A)"] --> N1["Node 1\n(consumes A, produces B)"]
-        N1 --> N2["Node 2\n(consumes B, produces C)"]
-        N2 --> N3["Node 3\n(consumes C → graph output)"]
+    subgraph "Event stream of a 3-node chain on one lane"
+        E1["[1] start(0)\n(produces A)"] --> E3["[3] wait(0) · [4] start(1)\n(consumes A, produces B)"]
+        E3 --> E6["[6] wait(1) · [7] start(2)\n(consumes B → graph output)"]
+        E6 --> E8["[8] drain(2)"]
     end
 
-    A["A: produce=0  consume=1"]
-    B["B: produce=1  consume=2"]
-    C["C: produce=2  consume=3\n(graph output — not intermediate)"]
+    A["A: start=1  end=6"]
+    B["B: start=4  end=8"]
 ```
 
-In code (`src/codegen/_core.py : _compute_live_intervals`):
+In code (`src/codegen/_core.py : _compute_live_intervals`, full derivation in
+[SCHEDULER_DAG.md](SCHEDULER_DAG.md) §5.2):
 
 ```python
-for idx, sn in enumerate(self._graph.nodes):
-    out = sn.output.onnx_name
-    if out in intermediate_names:
-        produced_at[out] = idx          # set once on first write
-    for inp in sn.inputs:
-        if inp.onnx_name in intermediate_names:
-            last_consumed_at[inp.onnx_name] = idx   # overwritten → last wins
+for ei, ev in enumerate(events):
+    if ev[0] in ('start', 'start_sync', 'cpu'):
+        start_event[ev[1]] = ei
+    if ev[0] in ('start_sync', 'cpu'):
+        drain_event[ev[1]] = ei           # completes at its own event
+    elif ev[0] in ('wait', 'drain'):
+        drain_event[ev[2]] = ei           # lane of node ev[2] drained here
+
+intervals[name] = (start_event[producer],
+                   max(drain_event[c] for c in consumers))   # through aliases
 ```
 
 Two tensors **conflict** (cannot share a slot) when their intervals overlap:
@@ -141,53 +166,59 @@ so the slot is always large enough for whichever tensor occupies it at runtime.
 
 ## 5. Worked Example — gemm\_chain
 
-`gemm_chain.onnx` is a three-layer fully-connected network:
+`gemm_chain.onnx` is a two-layer fully-connected network (two `Gemm`s,
+`X[1,32]` → 16 → `Y[1,8]`):
 
 ```
-input ──► Matmul0 ──► Add0 ──► Matmul1 ──► Add1 ──► Matmul2 ──► Add2 ──► output
+X ──► MatMul0 ──► Add0 ──► MatMul1 ──► Add1 ──► Y
 ```
 
 After Gemm decomposition the scheduler sees four nodes (indices 0–3):
 
 | Node | Op | Inputs | Output |
 |------|----|--------|--------|
-| 0 | MatMul | `input`, `W1` | `_gemm_mm_out_1` |
+| 0 | MatMul | `X`, `W1` | `_gemm_mm_out_1` |
 | 1 | Add | `_gemm_mm_out_1`, `B1` | `H` |
 | 2 | MatMul | `H`, `W2` | `_gemm_mm_out_2` |
-| 3 | Add | `_gemm_mm_out_2`, `B2` | `output` (graph output) |
+| 3 | Add | `_gemm_mm_out_2`, `B2` | `Y` (graph output) |
 
-Weights `W1`, `B1`, `W2`, `B2` and `output` are excluded from interval analysis.
+Weights `W1`, `B1`, `W2`, `B2` and `Y` are excluded from interval analysis.
 `_gemm_mm_out_1`, `H`, and `_gemm_mm_out_2` are the three intermediates.
 
 ### Computed live intervals
 
+The event stream alternates the Matmul and VectorOP lanes:
+`[1] start(0)`, `[3] wait(Matmul,0)`, `[4] start(1)`, `[6] wait(VectorOP,1)`,
+`[7] start(2)`, `[9] wait(Matmul,2)`, `[10] start(3)`, `[11] drain(VectorOP,3)`
+(the even-numbered events in between are node comments).
+
 ```mermaid
 gantt
-    title Intermediate tensor live intervals (node index = time unit)
+    title Intermediate tensor live intervals (event index = time unit)
     dateFormat  X
     axisFormat  %s
 
     section Slot 0  (shared)
-    _gemm_mm_out_1  :done,    0, 2
-    _gemm_mm_out_2  :done,    2, 4
+    _gemm_mm_out_1  :done,    1, 6
+    _gemm_mm_out_2  :done,    7, 11
 
     section Slot 1
-    H               :active,  1, 3
+    H               :active,  4, 9
 ```
 
-- `_gemm_mm_out_1` is produced at node 0 and last consumed at node 1 → interval **[0, 1]**.
-- `H` is produced at node 1 and last consumed at node 2 → interval **[1, 2]**.
-- `_gemm_mm_out_2` is produced at node 2 and last consumed at node 3 → interval **[2, 3]**.
+- `_gemm_mm_out_1` starts with node 0 (event 1) and is held until node 1's lane drains (event 6) → **[1, 6]**.
+- `H` starts with node 1 (event 4), held until node 2 drains (event 9) → **[4, 9]**.
+- `_gemm_mm_out_2` starts with node 2 (event 7), held until the final drain (event 11) → **[7, 11]**.
 
 ### Greedy colouring trace
 
-Sorted by start (all have size 16, 16, 8 elements respectively):
+Sorted by start (sizes 16, 16, 8 elements respectively):
 
 | Step | Tensor | Interval | Free slot? | Action |
 |------|--------|----------|-----------|--------|
-| 1 | `_gemm_mm_out_1` | [0, 1] | none | **create slot 0** (alloc=32) |
-| 2 | `H` | [1, 2] | slot 0: end=1, not < 1 | **create slot 1** (alloc=32) |
-| 3 | `_gemm_mm_out_2` | [2, 3] | slot 0: end=1 < 2 ✓ | **reuse slot 0** (alloc=max(32,32)=32) |
+| 1 | `_gemm_mm_out_1` | [1, 6] | none | **create slot 0** (alloc=32) |
+| 2 | `H` | [4, 9] | slot 0: end=6, not < 4 | **create slot 1** (alloc=32) |
+| 3 | `_gemm_mm_out_2` | [7, 11] | slot 0: end=6 < 7 ✓ | **reuse slot 0** (alloc=max(32,32)=32) |
 
 Result: **2 slots** instead of 3.
 
@@ -196,36 +227,42 @@ Result: **2 slots** instead of 3.
 ## 6. Pool Layout Before and After
 
 For `ap_fixed<16,8>` (2 bytes/element), the 64-byte alignment boundary is
-32 elements.
+32 elements.  The MatMul weights are stored in MatmulKernel's packed
+tile-major layout `[ceil(M/32)][K][32]`, so `W1 [32,16]` occupies
+1 × 32 × 32 = 1024 elements and `W2 [16,8]` 1 × 16 × 32 = 512.
 
 ### Before (sequential, no reuse)
 
 ```
-offset  0   →  512   : W1          (512 elems)
-offset  512 →  528   : B1          (16 elems, padded to 32)
-offset  544 →  672   : W2          (128 elems, padded to 160)  ← align_up(128)
-offset  704 →  720   : _gemm_mm_out_1  (16 elems, padded to 32)
-offset  736 →  752   : H               (16 elems, padded to 32)
-offset  768 →  776   : _gemm_mm_out_2  (8 elems,  padded to 32)
+offset     0 → 1024  : W1          (1024 elems, packed)
+offset  1024 → 1040  : B1          (16 elems, padded to 32)
+offset  1056 → 1568  : W2          (512 elems, packed)
+offset  1568 → 1576  : B2          (8 elems, padded to 32)
+offset  1600 → 1616  : _gemm_mm_out_1  (16 elems, padded to 32)
+offset  1632 → 1648  : H               (16 elems, padded to 32)
+offset  1664 → 1672  : _gemm_mm_out_2  (8 elems,  padded to 32)
                                                                 ────────────────
-Total: 800 elements (1600 bytes)
+Total: 1696 elements (3392 bytes)
 ```
 
 ### After (live-interval reuse)
 
 ```
-offset  0   →  512   : W1          (512 elems)
-offset  512 →  528   : B1          (16 elems, padded to 32)
-offset  544 →  672   : W2          (128 elems)
-offset  672 →  680   : B2          (8 elems, padded to 32)
+offset     0 → 1024  : W1          (1024 elems, packed)
+offset  1024 → 1040  : B1          (16 elems, padded to 32)
+offset  1056 → 1568  : W2          (512 elems, packed)
+offset  1568 → 1576  : B2          (8 elems, padded to 32)
                                                                 ── slot 0 ──
-offset  704 →  736   : _gemm_mm_out_1  (alloc=16)  ┐ share
+offset  1600 → 1632  : _gemm_mm_out_1  (alloc=16)  ┐ share
                        _gemm_mm_out_2  (alloc=8)   ┘ slot 0 (slot_alloc=32)
                                                                 ── slot 1 ──
-offset  736 →  768   : H               (alloc=16)     slot 1 (slot_alloc=32)
+offset  1632 → 1664  : H               (alloc=16)     slot 1 (slot_alloc=32)
                                                                 ────────────────
-Total: 768 elements (1536 bytes) — saving 32 elements (64 bytes, 4%)
+Total: 1664 elements (3328 bytes) — saving 32 elements (64 bytes, 2%)
 ```
+
+(`report.md` of this model: "Pool slots after coloring 2", "Pool size
+(total incl. weights) 1 664 elem".)
 
 At runtime only one of `_gemm_mm_out_1` or `_gemm_mm_out_2` is live at any
 given node boundary, so the hardware never reads stale data from the shared slot.
@@ -250,41 +287,47 @@ the distinction matters when tenants differ in size: the slot must fit the
 
 ## 8. Implementation Reference
 
-### `_compute_live_intervals() → dict`
+### `_compute_live_intervals(names=None) → dict`
 
 ```
 src/codegen/_core.py — _CoreMixin._compute_live_intervals
 ```
 
-**Returns** `{onnx_name: (produce_idx, last_consume_idx)}` for every
-non-alias intermediate tensor.  The dictionary is keyed by ONNX tensor name.
+**Returns** `{onnx_name: (start_event_idx, end_event_idx)}` for every
+non-alias intermediate tensor (or for the tensors `names`, e.g. the
+host-memory intermediates).  The dictionary is keyed by ONNX tensor name.
 
 Tensors excluded:
-- Weight tensors (`t.is_weight`)
+- Weight tensors (`t.is_weight`) and states
 - Graph inputs and outputs
-- Reshape aliases (keys of `_reshape_aliases`)
+- Reshape aliases and Slice views (keys of `_alias_source_map()`)
 
 Edge case: if a tensor is produced but never consumed (dead code), its
-`consume_idx` is set equal to `produce_idx`.
+end is the drain event of its producer.
 
 ### `_compute_pool_layout() → (layout, total_elems)`
 
 ```
 src/codegen/_core.py — _CoreMixin._compute_pool_layout
+                        (slots: _CoreMixin._compute_intermediate_layout)
 ```
 
 **Returns**
 - `layout` — `list[(onnx_name, offset_in_elems, alloc_in_elems)]`
-  One entry per weight + one per non-alias intermediate.  Shared-slot tenants
-  appear consecutively and have the **same** `offset`.  `alloc_in_elems` is the
-  individual tensor's allocation (passed to `inference_buf_init_view`), not the
-  slot's padded footprint.
+  One entry per weight, per DMA state and per non-alias intermediate.
+  Shared-slot tenants appear consecutively and have the **same** `offset`.
+  `alloc_in_elems` is the individual tensor's allocation (passed to
+  `inference_buf_init_view`), not the slot's padded footprint.
 - `total_elems` — total pool size in elements.
 
-Layout order: all weights first (graph order), then intermediates grouped by
-slot (slot 0 tenants first, then slot 1, …).
+Layout order: all weights first (graph order), then DMA states, then
+intermediates grouped by slot (slot 0 tenants first, then slot 1, …).
 
-### `_reshape_aliases` (unchanged)
+`INFERENCE_BUF_POOL_SIZE_BYTES` in the generated header is **not** this
+total: `_compute_pool_bytes()` sums every buffer without reuse (see
+ARCHITECTURE.md §7).  `report.md` "Activation memory" shows the reused size.
+
+### `_reshape_aliases`
 
 Reshape outputs continue to be excluded from the pool layout entirely.  Their
 pointer is assigned directly in `inference_init()`:
@@ -305,7 +348,7 @@ flat_view = mm_out;   // zero-cost alias
 | **Slot alloc fits all tenants** | `slot.alloc = max(align_up(tenant.alloc))` across all tenants |
 | **All offsets 64-byte aligned** | `offset` advances by `align_up(slot_alloc)` after each slot |
 | **Weights never shared** | Weights are emitted sequentially before interval analysis runs |
-| **Aliases have no layout entry** | The `if t.onnx_name not in reshape_aliases` guard is applied before colouring |
+| **Aliases have no layout entry** | Reshape aliases and Slice views (`_reshape_aliases`, `_view_aliases`) are filtered out before colouring |
 | **Pool never larger than sequential baseline** | Fewer or equal slots → smaller or equal total |
 
 ### Test coverage
@@ -316,7 +359,9 @@ Previously asserted that **no two layout entries share any pool range**.  Now
 asserts that any pair with overlapping pool ranges must have non-overlapping live
 intervals, allowing intentional sharing while still catching erroneous overlap.
 
-`test/test_live_intervals.py` — 12 new tests:
+`test/test_live_intervals.py` — 12 tests (the event-stream intervals are
+additionally covered by `test_parallel_waits.py::TestEventTimelineLiveness`
+and `test_nop_corner_cases.py::TestNopFixturesNoSlotAliasing`):
 
 | Test | What it checks |
 |------|---------------|
@@ -338,8 +383,8 @@ intervals, allowing intentional sharing while still catching erroneous overlap.
 ## 10. Real-World Example — MobileNetV1
 
 MobileNetV1 (1.0, 224×224, 1001 classes) is a representative deployment model
-for the KV260: it fits entirely within the supported operator set (Conv, Relu6,
-GlobalAveragePool, Reshape) and its strict linear-chain topology makes the
+for the KV260: it fits entirely within the supported operator set (Conv, Clip(0,6),
+AveragePool, Reshape, Squeeze) and its strict linear-chain topology makes the
 ping-pong reuse pattern immediately visible.
 
 All measurements use `ap_fixed<16,8>` (2 bytes per element), which is the
@@ -351,8 +396,11 @@ Source model: `mobilenet_v1_1.0_224_no_softmax.onnx`
 ### Model Structure
 
 The graph is a pure linear pipeline of 58 nodes: a first standard convolution
-followed by 13 depthwise-separable blocks and a final global-average-pool +
-reshape to the 1 001-class logit vector.
+followed by 13 depthwise-separable blocks and a final 7×7 average pool,
+1×1 classifier Conv and Reshape + Squeeze to the 1 001-class logit vector.
+Figures below use the library defaults (`OnnxGraph()`; the CLI's
+space-to-depth stem rewrite adds one intermediate and leaves the two slots
+unchanged).
 
 ```
 input [N×3×224×224]
@@ -362,7 +410,7 @@ Conv2d_0  ──Relu6──►  DWConv2d_1  ──Relu6──►  PWConv2d_1  �
   ▼
 DWConv2d_2  ──Relu6──►  PWConv2d_2  ──Relu6──►  …  (13 DW-sep blocks)
   ▼
-GlobalAvgPool  ──►  Conv2d_logits  ──►  Reshape  ──►  output [N×1001]
+AvgPool 7×7  ──►  Conv2d_logits  ──►  Reshape + Squeeze  ──►  output [N×1001]
 ```
 
 | Property | Value |
@@ -425,7 +473,7 @@ the first spatial downsampling step.
 
 | Slot | Tenants | Largest tenant shape | Slot alloc (batch=1) | Slot alloc (batch=16) |
 |------|---------|---------------------|---------------------|-----------------------|
-| 0 | 28 (Conv, DWConv, GlobalAvgPool outputs) | [N, 64, 112, 112] | 802 816 elem = 1 568 KiB | 12 845 056 elem = 24.5 MiB |
+| 0 | 28 (Conv, DWConv, AveragePool outputs) | [N, 64, 112, 112] | 802 816 elem = 1 568 KiB | 12 845 056 elem = 24.5 MiB |
 | 1 | 28 (Relu6, final Conv outputs)            | [N, 64, 112, 112] | 802 816 elem = 1 568 KiB | 12 845 056 elem = 24.5 MiB |
 
 The slot size is the same for both slots because both happen to accommodate the
@@ -438,18 +486,18 @@ holds the post-activation output of the same spatial resolution).
 
 | Region | Naive (sequential) | Optimised (2 slots) | Saving |
 |--------|-------------------|---------------------|--------|
-| Weights | 8.05 MiB | 8.05 MiB | — |
+| Weights | 8.12 MiB | 8.12 MiB | — |
 | Intermediates | **19.24 MiB** | **3.06 MiB** | **16.18 MiB (84.1 %)** |
-| **Total pool** | **27.29 MiB** | **11.11 MiB** | **16.18 MiB (59.3 %)** |
+| **Total pool** | **27.36 MiB** | **11.18 MiB** | **16.18 MiB (59.1 %)** |
 
 Pool layout (batch=1, weights at offset 0):
 
 ```
- offset 0                  4.2 M                  5.0 M        5.8 M
+ offset 0                  4.3 M                  5.1 M        5.9 M
  │──────────────────────────│────────────────────────│──────────────│
  │        Weights           │       Slot 0            │   Slot 1    │
  │  56 weight tensors       │  28 conv outputs        │ 28 post-act │
- │  8.05 MiB                │  802 816 elem / 1.5 MiB │ 1.5 MiB     │
+ │  8.12 MiB                │  802 816 elem / 1.5 MiB │ 1.5 MiB     │
  └──────────────────────────┴─────────────────────────┴─────────────┘
 ```
 
@@ -457,18 +505,18 @@ Pool layout (batch=1, weights at offset 0):
 
 | Region | Naive (sequential) | Optimised (2 slots) | Saving |
 |--------|-------------------|---------------------|--------|
-| Weights | 8.05 MiB | 8.05 MiB | — |
-| Intermediates | **307.9 MiB** | **49.0 MiB** | **258.9 MiB (84.1 %)** |
-| **Total pool** | **315.9 MiB** | **57.1 MiB** | **258.8 MiB (81.9 %)** |
+| Weights | 8.12 MiB | 8.12 MiB | — |
+| Intermediates | **307.8 MiB** | **49.0 MiB** | **258.8 MiB (84.1 %)** |
+| **Total pool** | **316.0 MiB** | **57.1 MiB** | **258.8 MiB (81.9 %)** |
 
 Pool layout (batch=16, weights at offset 0):
 
 ```
- offset 0                  4.2 M               17.1 M          29.9 M
+ offset 0                  4.3 M               17.1 M          29.9 M
  │──────────────────────────│───────────────────────│─────────────────│
  │        Weights           │       Slot 0           │    Slot 1       │
  │  56 weight tensors       │  28 conv outputs       │  28 post-act    │
- │  8.05 MiB                │  12 845 056 elem        │  12 845 056 elem │
+ │  8.12 MiB                │  12 845 056 elem        │  12 845 056 elem │
  │                          │  24.5 MiB               │  24.5 MiB       │
  └──────────────────────────┴────────────────────────┴─────────────────┘
 ```
@@ -510,36 +558,26 @@ region from which the framework's DMA pool is carved — kernels access
 DDR by physical address through their AXI master ports and cannot
 follow Linux page tables.
 
-The framework allocates DMA-capable memory through
-[u-dma-buf](https://github.com/ikwzm/udmabuf), which exposes one of
-two backing paths chosen at module-load / device-tree time:
+On Linux the generated `inference_buf.c` allocates DMA-capable memory as
+XRT buffer objects (`xclAllocBO` through the zocl driver, the path PYNQ's
+`allocate()` uses), which are physically contiguous and come from the
+kernel's
+[Contiguous Memory Allocator](https://www.kernel.org/doc/html/latest/admin-guide/mm/cma_debugfs.html)
+(CMA).  The CMA pool size is set at boot via the
+[`cma=N`](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)
+kernel parameter (or the `CONFIG_CMA_SIZE_MBYTES` build default); lifting
+the cap only requires a kernel-cmdline change and a reboot.  Bare-metal
+builds `malloc()` the buffers from the standalone heap instead.
 
-1. **CMA-backed (default).** `u_dma_buf` calls `dma_alloc_coherent()`,
-   which on ARM64 Linux pulls from the kernel's
-   [Contiguous Memory Allocator](https://www.kernel.org/doc/html/latest/admin-guide/mm/cma_debugfs.html).
-   The CMA pool size is set at boot via the
-   [`cma=N`](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)
-   kernel parameter (or the `CONFIG_CMA_SIZE_MBYTES` build default).
-   PetaLinux/Yocto images for the KV260 commonly default to a few
-   hundred MiB; lifting the cap only requires a kernel-cmdline change
-   and a reboot.
-2. **Reserved-memory region.** When the device-tree overlay points the
-   `u_dma_buf` node at a `reserved-memory` block (carved out via
-   `no-map` in DT), allocations come from that fixed region instead.
-   This is what the upstream
-   [`udmabuf` README](https://github.com/ikwzm/udmabuf#device-tree-overlay)
-   calls a "reserved memory area" device node.
-
-Either path can be sized to whatever the bitstream needs — there is no
+The CMA can be sized to whatever the model needs — there is no
 hardware-imposed cap of "16 MiB" or "256 MiB".  What pool reuse buys
 is **portability**: a smaller pool fits within typical default CMA
-sizes and modest DT reservations without anyone having to change boot
-parameters or re-flash a device tree.
+sizes without anyone having to change boot parameters.
 
 | Scenario | Naive pool | Reused pool | Practical implication |
 |----------|-----------:|------------:|-----------------------|
-| batch=1   | 27.3 MiB  | 11.1 MiB    | fits within a 16 MiB DT reservation; reuse is convenient but not strictly required |
-| batch=16  | 315.9 MiB | 57.1 MiB    | naive needs CMA / DT reservation enlarged past common defaults; reused fits within ~256 MiB |
+| batch=1   | 27.4 MiB  | 11.2 MiB    | reused fits within a 16 MiB region; reuse is convenient but not strictly required |
+| batch=16  | 316.0 MiB | 57.1 MiB    | naive needs the CMA enlarged past common defaults; reused fits within ~256 MiB |
 
 The numbers above are not a hardware ceiling — they describe how much
 *reconfiguration* the deployer would otherwise need to do.  Reuse is

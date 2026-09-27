@@ -15,11 +15,12 @@ Two backends:
   extractive model — it cannot write free text — so the chat is **question
   answering over a document you supply**: the reply is the passage of the
   document that answers the question.
-* **`smollm2-135m-instruct`** (phase 4, [below](#generative-chat--smollm2-135m-instruct)):
+* **`smollm2-135m-instruct`** (phases 3–5, [below](#generative-chat--smollm2-135m-instruct)):
   **generative chat** with SmolLM2-135M-Instruct — multi-turn, streamed token
-  by token.  The server side (tokenizer, chat template, sampling, prefix
-  cache) is done and tested against fakes of the decoder library;
-  `libsmollm2.so`, the model on the FPGA, comes from CHAT_PLAN phase 3.
+  by token.  `libsmollm2.so` runs the model on the FPGA kernels and the A53
+  (~5 tokens/s decode, 256-token prefill 1.3 s, logits bit-exact with the
+  scheduler simulation); tokenizer, chat template, sampling and prefix
+  cache run in the server process.
 
 ```
  laptop / board shell                          KV260 (Ubuntu 22.04, Python 3.10 stdlib)
@@ -29,10 +30,14 @@ Two backends:
  │ aichat               │                     │   FIFO: one request on the FPGA at a time   │
  └──────────────────────┘                     │ bert_squad_backend.py  (squad_text.py:      │
                                               │   WordPiece, sliding windows, best span)    │
-                                              │        │ ctypes                              │
+                                              │ smollm2_backend.py  (chatml.py, BPE         │
+                                              │   tokenizer, prefix cache, libsampler.so)   │
+                                              │        │ ctypes                             │
                                               │ lib/libbert_squad.so  (bert_api.c + the     │
                                               │   generated BERT project, weights in CMA)   │
-                                              │        │ XRT / UIO                           │
+                                              │ lib/libsmollm2.so  (llm_api.c + the         │
+                                              │   generated SmolLM2 project, CMA weights)   │
+                                              │        │ XRT / UIO                          │
                                               │ ConvKernel · MatmulKernel · VectorOPKernel  │
                                               └─────────────────────────────────────────────┘
 ```
@@ -51,7 +56,18 @@ demo/chat/
 ├── chat.py                  — stdlib REPL / one-shot client
 ├── deploy.py                — generate, upload, build, start / stop on the board (host side)
 ├── chat_config.json.example
-├── scripts/                 — llm_study.py (B0), validate_text.py, e2e_check.py (host, .venv-export)
+├── src/llm_api.{c,h}, src/llm_bench.c — libsmollm2.so's C API (§11) and its standalone benchmark
+├── scripts/
+│   ├── generate_llm_project.py — schedule SmolLM2 into build/llm_project (libsmollm2.so)
+│   ├── llm_board.py         — build / install libsmollm2.so on the board, board gate, timings
+│   ├── llm_project.py       — shared model / formats loading, library simulation (SimSession)
+│   ├── llm_sched_check.py   — scheduler simulation == study emulation, bit for bit (gate 2)
+│   ├── llm_host_emu.py      — the generated C on the host against software kernels
+│   ├── llm_lib_check.py     — libsmollm2.so through ctypes (runs on the board)
+│   ├── llm_attn_kernel_bench.py — decode attention on the FPGA vs host (CHAT_PLAN §13.4)
+│   ├── llm_study.py         — numeric study, calibrated formats JSON (.venv-export)
+│   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export)
+├── assets/                  — not in git: smollm2-135m-instruct/ (Hugging Face checkpoint), study/
 └── tests/                   — unittest: protocol, text modules, sampler, backends, fakes; board_gate.py
 ```
 
@@ -65,7 +81,8 @@ uses).
 ## Deploy
 
 Prerequisites are those of the [`bert_squad/`](../bert_squad/) demo (its
-config, the model, the HLS driver sources; the weights go to the board once).
+config, the model, the HLS driver sources; the weights go to the board once),
+plus, for the generative backend, `libsmollm2.so` on the board (see below).
 
 ```bash
 cd demo/chat
@@ -91,6 +108,12 @@ it survives the ssh session, is not started at boot, logs to
 deploy: 16 s build; startup 1.6 s (`bert_open`: pool BO + 217 MB of weights
 from the page cache).
 
+The preflight also installs `board/kv260/kv260-no-cpu-powerdown.conf` as
+`/etc/tmpfiles.d/kv260-no-cpu-powerdown.conf` when it is missing and applies
+it at once: it keeps the cores out of the PSCI core power-down idle state,
+the workaround for the board hangs of CHAT_PLAN §18 (a core parked in
+power-down stops the token stream, later SSH and ping).
+
 **The generative backend** is enabled by adding `"smollm2"` to
 `server.backends` in `chat_config.json` (e.g. `["bert-squad", "smollm2"]`;
 the first is the default model).  deploy.py then also uploads the text side
@@ -100,17 +123,40 @@ and `tokenizer.json` (from the untracked `assets/smollm2-135m-instruct/`, to
 board (under a second; without a compiler the server samples in Python), and
 passes the `smollm2` block (`lib`, `weights_dir`, sampling defaults,
 `cma_mb`) and `server.resident` to the server.  `libsmollm2.so` itself is
-built by the decoder project of CHAT_PLAN phase 3 — the preflight reports
-whether it is at `smollm2.lib` (default `<dir>/lib/libsmollm2.so`).  If it
-cannot be loaded, the server still starts with the other backends and
-answers `smollm2-135m-instruct` requests with 503 `model_not_loaded`.
+not built by `deploy.py` — the preflight reports whether it is at
+`smollm2.lib` (default `<dir>/lib/libsmollm2.so`).  If it cannot be loaded,
+the server still starts with the other backends and answers
+`smollm2-135m-instruct` requests with 503 `model_not_loaded`.
+
+**Building `libsmollm2.so`** (CHAT_PLAN §13.5).  The assets are not in
+git: the Hugging Face checkpoint `HuggingFaceTB/SmolLM2-135M-Instruct`
+(`config.json`, `model.safetensors`, `tokenizer.json`, ...) in
+`assets/smollm2-135m-instruct/`, and the calibrated exponents
+`assets/study/formats_pow2+sink+p12.json`, written by
+`scripts/llm_study.py fetch` + `formats` (the `.venv-export` virtualenv:
+torch, transformers, safetensors, numpy).
+
+```bash
+cd demo/chat
+PY=../../inference-scheduler/.venv/bin/python
+$PY scripts/generate_llm_project.py      # -> build/llm_project (~100 s; 538 MB weights/*.dat)
+$PY deploy.py --stop                     # the server owns the FPGA
+$PY scripts/llm_board.py --install-only  # upload, build on the board (-j1, memory guard),
+                                         # install <dir>/lib/libsmollm2.so; weights in /root/smollm2_weights
+$PY deploy.py                            # with "smollm2" in server.backends
+```
+
+`llm_board.py` takes ssh, driver directories and the board lock from
+`../bert_squad/bert_squad_config.json`; without `--install-only` it also
+runs the board gate (logits bit-exact with the scheduler simulation,
+prefill / decode timings, `llm_lib_check.py`).
 
 **The FPGA and the board lock.**  The running server owns the FPGA (its
-process holds the 216 MiB pool BO and the UIO mappings); nothing else may
-run kernels until it is stopped.  `deploy.py` holds the shared board lock
-(`board_lock`, `flock`) only while deploying — use `--hold` to keep it for
-as long as the server runs, or `deploy.py --stop` before handing the board
-to another job.
+process holds the loaded models' pool BOs — BERT 216 MiB, SmolLM2 488 MiB
+— and the UIO mappings); nothing else may run kernels until it is stopped.
+`deploy.py` holds the shared board lock (`board_lock`, `flock`) only while
+deploying — use `--hold` to keep it for as long as the server runs, or
+`deploy.py --stop` before handing the board to another job.
 
 By hand on the board (for development):
 
@@ -119,7 +165,8 @@ python3 /root/kv260_chat/kv260_chat_server.py --bert-lib /root/kv260_chat/lib/li
     --bert-weights /root/bert_squad_weights --vocab /root/kv260_chat/vocab.txt [--api-key KEY]
 python3 /root/kv260_chat/kv260_chat_server.py --backend smollm2 --backend bert-squad \
     --llm-lib /root/kv260_chat/lib/libsmollm2.so --llm-sampler-lib /root/kv260_chat/lib/libsampler.so \
-    --llm-tokenizer /root/kv260_chat/smollm2/tokenizer.json --bert-lib ... [--resident auto|one|all]
+    --llm-tokenizer /root/kv260_chat/smollm2/tokenizer.json --llm-cma-mb 510 --bert-lib ... \
+    [--resident auto|one|all]
 python3 kv260_chat_server.py --backend echo --port 8001     # anywhere, no FPGA: protocol only
 ```
 
@@ -154,11 +201,12 @@ python3 kv260_chat_server.py --backend echo --port 8001     # anywhere, no FPGA:
 ## Generative chat — `smollm2-135m-instruct`
 
 SmolLM2-135M-Instruct (Apache-2.0; 30 layers, hidden 576, vocabulary 49 152,
-context 1024 here) on the FPGA with the numeric policy of CHAT_PLAN §10
-(`pow2+sink+p12`: greedy answers read like the float model's).  The library
-`libsmollm2.so` (CHAT_PLAN §11: `llm_open / llm_prefill / llm_decode /
-llm_truncate / ...`) returns next-token logits; everything around it runs in
-the server process:
+context 1024 here) on the FPGA with the numeric policy of CHAT_PLAN §10 /
+§16 (`pow2+sink+p12+mix`: the p12 attention on ConvKernel in prefill, the
+exact host attention in decode; greedy answers read like the float
+model's).  The library `libsmollm2.so` (CHAT_PLAN §11: `llm_open /
+llm_prefill / llm_decode / llm_truncate / ...`) returns next-token logits;
+everything around it runs in the server process:
 
 ```
 messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, block cache)      prepare(): no FPGA
@@ -252,19 +300,23 @@ messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, blo
   `<|im_end|>`.
 * **Streaming.**  One SSE chunk per token; a character split over several
   byte tokens (emoji, CJK) is sent once it is complete.
-* **`kv260` object:** `finish` (`eos` / `stop_string` / `max_tokens` /
-  `context_full`), `cached_tokens`, `prefill_tokens`, `prefill_ms`,
-  `ttft_ms`, `decode_tokens`, `decode_ms`, `decode_tok_s`,
-  `library_decode_ms`, `sampler_ms`, `trimmed_messages`, `context_size`,
-  `seed`, `sampler` (the settings used).  Log line:
+* **`kv260` object:** `finish` (`eos` / `stop_string` / `loop` /
+  `max_tokens` / `context_full`), `cached_tokens`, `prefill_tokens`,
+  `prefill_ms`, `ttft_ms`, `decode_tokens`, `decode_ms`, `decode_tok_s`,
+  `library_decode_ms`, `sampler_ms`, `prepare_ms`, `trimmed_messages`,
+  `context_size`, `seed`, `loop_period`, `loop_guard`, `sampler` (the
+  settings used).  Log line:
   `... reuse=135/152 prefill=17tok/185ms decode=10.9tok/s why=max_tokens ...`.
-* **Speed** (measured on the board, CHAT_PLAN §13.4, §16.3): decode
-  **~5 tokens/s** (weight-bandwidth bound, ~200–204 ms per token); prefill
+* **Speed** (measured on the board, CHAT_PLAN §13.4, §16.3, §17): decode
+  **~5 tokens/s** at short context — 198 ms per token at position 32, 204 at
+  256, 212 at 512, 228 at 1000 (weight-bandwidth bound, ~195 ms; the host
+  attention adds the rest and grows with the position); prefill
   0.37 / 0.47 / 1.32 s for 16 / 64 / 256 new tokens (prefill attention on
   the FPGA since phase 5; 3.6 s for 256 before), so the first answer of a
   chat starts after ~0.45–1.3 s and a follow-up turn of a few tens of new
   tokens after ~0.45 s.  Host overhead per token on the board's A53:
-  sampling 0.8–2 ms (C; greedy / the default settings), detokenizing 6 µs.
+  sampling 0.8–2 ms (C; greedy / the default settings; ~2.5 ms with DRY),
+  detokenizing 6 µs.
 * **Quality.**  A 135M model: fluent, often wrong on facts and arithmetic
   (CHAT_PLAN §10.4); temperature 0 gives the most stable answers.
 
@@ -284,13 +336,14 @@ The capital of France is Paris.
 
 BERT holds ~224 MB of CMA, SmolLM2 ~490 MB (a 488 MiB pool: both weight
 copies, the LM head, the KV caches and the intermediates, CHAT_PLAN §16.3;
-set `smollm2.cma_mb` to ~510); idle CmaFree on the board was 626–813 MB of
-1000.  `--resident` decides what stays loaded:
+`smollm2.cma_mb` is 510 in the example config — the server's own
+`--llm-cma-mb` default, 360, is too low for `auto`); idle CmaFree on the
+board was 626–813 MB of 1000.  `--resident` decides what stays loaded:
 
 | mode | behaviour |
 |---|---|
 | `auto` (default) | the first backend loads at startup, the others too if CmaFree allows, else on their first request; before a load, other models are evicted (least recently used first) while CmaFree < the new model's `cma_mb` + `--cma-margin-mb` (32); a load that still fails is retried once after evicting the rest.  Both stay resident when they fit; otherwise they swap. |
-| `one` | at most one FPGA model; switching models unloads the other (a switch costs a load: BERT 1.6 s, SmolLM2 seconds) |
+| `one` | at most one FPGA model; switching models unloads the other (a switch costs a load: BERT 1.6 s, SmolLM2 1.0 s with the weights in the page cache; cold from the SD card BERT 14.3 s, SmolLM2 35.6 s) |
 | `all` | everything loads at startup and stays (phase 1 behaviour) |
 
 Loads and evictions run under the FPGA lock, between requests, so they are
@@ -359,7 +412,7 @@ models: bert-squad; using bert-squad
 Options: `--url` (or `KV260_CHAT_URL`), `--api-key` (or `KV260_CHAT_API_KEY`
 / `OPENAI_API_KEY`), `--model`, `--doc FILE`, `--system TEXT`, `-q QUESTION`
 (one-shot; exit code 1 on errors), `--no-stream`, `--max-tokens`,
-`--temperature`, `-v`.  Commands: `/doc FILE`, `/system [TEXT]`,
+`--temperature`, `--timeout`, `-v`.  Commands: `/doc FILE`, `/system [TEXT]`,
 `/model [M]`, `/reset`, `/help`, `/quit`.  On the board:
 `python3 /root/kv260_chat/chat.py --doc sb50.txt`.
 
@@ -571,9 +624,11 @@ OpenAI-compatible client instead.
 The paths also work without `/v1`.  Honoured: `model` (default: the first
 backend), `messages` (string content or text parts), `stream`,
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`,
-`temperature` (0–2), `top_p` (0–1), `stop` (≤ 4), `seed`, `n` (1 only);
-anything else is ignored.  Errors are OpenAI-shaped
-`{"error": {"message", "type", "param", "code"}}`: 400 invalid request
+`temperature` (0–2), `top_p` (0–1), `stop` (≤ 4), `seed`, `n` (1 only),
+and for `smollm2-135m-instruct` the sampling fields of the table above
+(`top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`,
+`repeat_last_n`, `dry_*`, `loop_guard`); anything else is ignored.  Errors
+are OpenAI-shaped `{"error": {"message", "type", "param", "code"}}`: 400 invalid request
 (`param` names the field), 401 missing / wrong API key (`invalid_api_key`),
 404 unknown model (`model_not_found`) or URL (`unknown_url`), 411 / 413 body
 without length / over 4 MB, 500 backend failure (`backend_error`; an SSE
@@ -586,14 +641,15 @@ tokenizing) for up to `--queue-timeout` (120 s) and at most `--max-queue`
 (16) at once — beyond that 503.  A client that disconnects is noticed
 without writing to it (a non-blocking peek at its socket): while queued it
 leaves the queue, while running it is cancelled at the next step (the next
-256-token window here).  One log line per request:
+256-token window for `bert-squad`; the next token, or the next prefill
+chunk with `--llm-prefill-chunk`, for `smollm2`).  One log line per request:
 
 ```
 2026-09-26 06:29:58 192.168.100.7 POST /v1/chat/completions 200 model=bert-squad stream=1 prompt=2048 completion=3 windows=8/19 fpga_ms=7751 conf=0.93 queue=297ms ttft=8062ms tok/s=1805.6 total=8063ms finish=stop
 2026-09-26 06:29:25 192.168.100.7 POST /v1/chat/completions 499 model=bert-squad stream=0 queue=31ms total=2938ms [cancelled (client disconnected)]
 ```
 
-## Backend interface (for the decoder backend)
+## Backend interface (adding a backend)
 
 `chat_backend.py` holds the contract; a backend serves one model id:
 
@@ -623,7 +679,9 @@ line).  Register the backend in `build_backends()` in
 `kv260_chat_server.py`.  The server does streaming, usage, errors, the
 queue and disconnects.
 
-## Measured (2026-09-26, KV260 at 100 MHz, bitstream of BERT phase 2)
+## Measured (KV260 at 100 MHz)
+
+### bert-squad (2026-09-26, bitstream of BERT phase 2)
 
 * **Same spans as the demo:** the 12 questions of a `bert_squad`
   `deploy_and_run.py --n 12` run sent through the server (context as the
@@ -643,6 +701,26 @@ queue and disconnects.
 * **Disconnect:** a client that drops an 8-window request after 2.5 s
   frees the FPGA after the current window (request logged at 2.9 s,
   cancelled); the three requests queued behind it ran next.
+
+### smollm2 on the FPGA (2026-09-26 / 27; CHAT_PLAN §16.3, §17)
+
+A 4-turn conversation through the OpenAI API, temperature 0 (the default
+repetition penalty and DRY apply), both models resident:
+
+| turn | cached / prefilled tokens | TTFT | decode |
+|---|---|---:|---:|
+| "What is the capital of France?" | 1 / 36 | 457 ms | 4.9 tok/s |
+| "What is a famous museum there?" | 116 / 19 | 462 ms | 4.8 tok/s |
+| "Tell me one more fact about that city." | 214 / 21 | 480 ms | 4.6 tok/s |
+| "Thanks! Now summarise our conversation in one sentence." | 302 / 22 | 502 ms | 4.5 tok/s |
+
+These decode rates predate the decode-attention change of CHAT_PLAN §17
+(2026-09-27), which cut the growth with the position: `llm_bench` decode
+at positions 32 / 256 / 512 / 1000 now takes 198 / 204 / 212 / 228 ms per
+token (before: 197 / 214 / 235 / 271 ms), logits unchanged bit for bit.
+Library: logits bit-exact with the scheduler simulation (4 prompts × 33
+vectors); `llm_open` 1.0 s with the weights in the page cache (35.6 s cold
+from the SD card); pool BO 488 MiB.
 
 ### smollm2 server side (2026-09-26; board CPU only, no FPGA)
 
@@ -668,11 +746,12 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 107 tests, ~40 s, stdlib only (a C compiler for the C parts)
+python3 -m unittest -v                  # 121 tests, ~40 s, stdlib only (a C compiler for the C parts)
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
-# host validation against transformers (the .venv-export venv: torch, transformers, numpy)
-PY=/home/ivan/projects/axi_demo/.venv-export/bin/python
+# host validation against transformers, from the repo root
+# (.venv-export: a virtualenv with torch, transformers, safetensors, numpy)
+PY=.venv-export/bin/python
 $PY demo/chat/scripts/validate_text.py  # tokenizer on 2960 strings, decode, 34 chat templates
 $PY demo/chat/scripts/e2e_check.py      # chat.py -> server (--llm-fake float) == HF greedy, 9 answers
 ```

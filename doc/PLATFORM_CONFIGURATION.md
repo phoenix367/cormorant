@@ -59,7 +59,7 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `description` | no | *(none)* | Informational only; surfaces in CMake status logs |
+| `description` | no | *(none)* | Informational only; not read by CMake or the scheduler |
 | `part` | yes | — | Xilinx device part string passed to `set_part` |
 | `board` | no | *(none)* | Board identifier passed to `set_part -board` |
 | `clock` | no | `300` | Target clock in MHz (HLS `create_clock -period`) |
@@ -68,12 +68,17 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
 
 VectorOPKernel has no per-platform constants: it is a runtime-sized,
-element-wise kernel and has no compile-time bounds to validate.
+element-wise kernel and has no compile-time bounds to validate (it reads
+only `part`, `board` and `clock`).
 
 > **`AXI_BUS_WIDTH` is not a JSON field.** It is a top-level CMake
-> cache variable (`cmake -DAXI_BUS_WIDTH=128`) so that a single
-> platform JSON can be synthesised against multiple bus widths
-> independently. See the *Key CMake parameters* table in the top-level
+> cache variable (default `32`; the KV260 hardware build uses
+> `cmake -DAXI_BUS_WIDTH=128`) so that a single platform JSON can be
+> synthesised against multiple bus widths independently. It only sets
+> `config_interface -m_axi_max_widen_bitwidth`, i.e. it caps HLS
+> auto-widening of plain-pointer ports (the only one left is
+> MatmulKernel `c`, which HLS does not widen — it stays 16-bit); every
+> `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the *Key CMake parameters* table in the top-level
 > [README.md](../README.md#key-cmake-parameters).
 
 ---
@@ -87,48 +92,55 @@ context.
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
-| `tile_m` | power of 2; any `out_ch` works (residual-padded) | Output-channel tile / unroll factor |
-| `tile_ic` | power of 2; any `in_ch` works (residual-padded) | Input-channel tile / unroll factor |
+| `tile_m` | power of 2, multiple of 8, `≤ tile_ic`; any `out_ch` works (residual-padded) | Output-channel tile = M dimension of the `tile_ic × tile_m` MAC grid |
+| `tile_ic` | power of 2; any `in_ch` works (residual-padded) | Input-channel tile = IC dimension of the MAC grid; also the lane count of the packed weight layout |
 | `max_kh` | `kh ≤ max_kh` | Hard upper bound on kernel height |
 | `max_kw` | `kw ≤ max_kw` | Hard upper bound on kernel width |
 | `max_in_ch` | `in_ch ≤ max_in_ch` | Hard upper bound on input channels |
 | `max_out_ch` | `out_ch ≤ max_out_ch` | Hard upper bound on output channels; sizes the bias buffer |
-| `max_line_buf_cols` | power of 2; caps `ow_per_tile`, **not** `in_w` | Line-buffer column capacity |
+| `max_line_buf_cols` | power of 2; `(kw-1)·dilation_w + 1 ≤ max_line_buf_cols`; caps `ow_per_tile`, **not** `in_w` | Line-buffer column capacity |
 | `max_line_buf_rows` | power of 2; `(kh-1)·dilation_h + 1 ≤ max_line_buf_rows` | Line-buffer row capacity |
-| `max_acc_persist_entries` | `out_w · out_ch ≤ max_acc_persist_entries` | URAM persistent-accumulator capacity across in-channel tiles |
+| `max_acc_persist_entries` | `out_w · ceil(out_ch / tile_m) · tile_m ≤ max_acc_persist_entries` | URAM persistent-accumulator capacity across in-channel tiles (one `tile_m`-padded output row must fit; 4096 entries per URAM block) |
 | `max_m_per_group` | — | Number of M-tiles cached together in the weight slab |
 
-`tile_m`, `tile_ic` are read by the C++ build but **not** exported to
-the Python validator — any `out_ch`/`in_ch` is residual-padded inside
-the kernel, so models cannot violate them. The other fields gate model
-acceptance: `ConvNode.from_onnx_node()` raises `SchedulerError`
-naming the violated bound.
+Models cannot violate `tile_m` / `tile_ic` (any `out_ch` / `in_ch` is
+residual-padded), but the scheduler still reads them: `tile_ic` sets the
+packed weight layout it emits (CONV_OPTIMISATION.md §2.32), `tile_m` the
+accumulator-row padding check, and both — with `max_kw` and
+`max_m_per_group` — feed the MatMul-on-ConvKernel lowering and the
+engine cost model (`matmul_lowering.py`, `cost_model.py`). Model
+acceptance is gated by `ConvNode.from_onnx_node()`, which raises
+`SchedulerError` naming the violated bound for `max_in_ch`,
+`max_out_ch`, `max_kh`, `max_kw`, `max_line_buf_rows`,
+`max_line_buf_cols` and `max_acc_persist_entries`.
 
 ---
 
 ### `kernels.matmul`
 
-Sizes the MatmulKernel's row-staging buffer `a_buf[tile_n][max_k]` at
-compile time. See [`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §3.
+Sizes the MatmulKernel's row-staging buffer `a_buf[tile_n][max_k]`
+and the B block buffer `b_tile[tile_m][2·tile_k]` at compile time. See
+[`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §2–§3.
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
 | `tile_n` | power of 2; any `N` works (residual-padded) | Row tile / unroll factor |
-| `tile_m` | power of 2; any `M` works (residual-padded) | Column tile / unroll factor |
-| `tile_k` | any `K` works (residual-padded) | K-loop tile |
-| `max_k` | `k ≤ max_k` | Hard upper bound on the inner dimension; sizes the row staging buffer. `MatMul` nodes with `k > max_k` are rejected at scheduling |
+| `tile_m` | power of 2, multiple of 8; any `M` works (residual-padded) | Column tile / unroll factor; also the width of the packed-B DDR layout |
+| `tile_k` | power of 2; any `K` works (residual-padded) | K-loop tile (B block rows) |
+| `max_k` | `k ≤ max_k`; multiple of 8 | Hard upper bound on the inner dimension; sizes the row staging buffer. `MatMul` nodes with `k > max_k` are rejected at scheduling |
 
-Only `max_k` is exported to the Python validator. `tile_n`/`tile_m`/
-`tile_k` are pure unrolling factors with runtime residual-tile
-fallbacks.
+The Python side reads `max_k` (validation), `tile_m` (the packed-B
+layout the scheduler emits for constant B operands) and `tile_n` (engine
+cost model only). `tile_k` is a pure C++ tiling factor.
 
 ---
 
 ### `kernels.pool`
 
 Sizes the PoolingKernel's line buffer and unrolled per-position
-adders at compile time. See [`POOL_OPTIMIZATION.md`](POOL_OPTIMIZATION.md)
-§4 for the full architectural context including bank/port topology.
+adders at compile time. See [`POOLING_KERNEL.md`](POOLING_KERNEL.md) §3
+and [`POOL_OPTIMIZATION.md`](POOL_OPTIMIZATION.md) §4 for the full
+architectural context including bank/port topology.
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
@@ -163,7 +175,7 @@ residual-lane padding for any `out_w`).
       "max_m_per_group":         4
     },
     "matmul": {
-      "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 2048
+      "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 4096
     },
     "pool": {
       "tile_c":            8,
@@ -204,7 +216,11 @@ residual-lane padding for any `out_w`).
 3. The new platform now has:
     - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export
     - `synthesize_<platform>` — roll-up target that builds all four kernels
-    - `dtbo_<platform>_<design>` — for any `.dts` file under `dts/<platform>/`
+    - `cosim_<kernel>_<platform>` — C synthesis + RTL co-simulation (conv, matmul, pool)
+    - `dtbo_<platform>_<stem>` — for any `<stem>.dts` file under `dts/<platform>/`
+
+    The Vivado / behavioural-test targets (`build_hw_kv260`,
+    `sim_hw_kv260`, `behavior_test_<kernel>`) stay KV260-only.
 
 4. To make the platform the **default** for C-sim tests and the
    inference scheduler, pass `AXI_PLATFORM` to CMake (and export the
@@ -239,14 +255,18 @@ AXI_PLATFORM=<platform> .venv/bin/python test/gen_pool_models.py
 AXI_PLATFORM=<platform> .venv/bin/python -m pytest test/ -q
 ```
 
-The `test_<kernel>_hw_config.py` modules cross-check the resolved
-Python constants against the JSON, so a typo or shape error surfaces
-immediately at `pytest` time.
+The `TestMatmulHwConfigResolver` (`test/test_matmul.py`) and
+`TestPoolHwConfigResolver` (`test/test_pool.py`) classes cross-check the
+resolved Python constants against the JSON, so a typo or shape error
+surfaces immediately at `pytest` time.
 
 `tile_*` / `ow_parallel` / `tile_c` changes don't require fixture
 regeneration — those fields are not validated against models — but
 they do affect HLS resource usage / II, so a re-synthesis is still
-needed before deploying.
+needed before deploying. `kernels.conv.tile_ic` and
+`kernels.matmul.tile_m` also change the packed weight layout the
+scheduler emits, so every generated project must be regenerated against
+the same JSON as the bitstream.
 
 ---
 
@@ -255,7 +275,8 @@ needed before deploying.
 | Document | Coverage |
 |----------|----------|
 | [`CONV_KERNEL.md`](CONV_KERNEL.md) §3 | Full ConvKernel architecture and tiling, including how each `kernels.conv.*` field maps to hardware resources |
-| [`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §3 | MatmulKernel tiling, `max_k` rationale |
+| [`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
+| [`POOLING_KERNEL.md`](POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
 | [`POOL_OPTIMIZATION.md`](POOL_OPTIMIZATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
 | [`VECTOROP_KERNEL.md`](VECTOROP_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds) |
 | [`../inference-scheduler/CLAUDE.md`](../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |

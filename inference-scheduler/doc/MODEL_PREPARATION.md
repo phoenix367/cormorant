@@ -2,16 +2,18 @@
 
 Stock ONNX models exported from PyTorch / TensorFlow / the ONNX Model Zoo
 rarely run through the inference scheduler unchanged. They typically ship
-with a dynamic batch dimension (`N`), training-mode `BatchNormalization`
-ops, scaffolding nodes (`Cast`, `Squeeze` / `Unsqueeze` chains, `Shape` /
-`Constant` for dynamic reshape), and tail operators the kernels don't
-implement (`Softmax`, `Identity`, `ArgMax`). The scheduler exits with a
-`SchedulerError` on the first unsupported op, so every model needs a
-preparation pass before it can be fed to `inference_scheduler.py`.
+with a dynamic batch dimension (`N`), `BatchNormalization` ops,
+dynamic-shape scaffolding (`Shape` → `Gather` / `Concat` → `Reshape`
+chains), and tail operators the scheduler doesn't implement (`ArgMax`,
+`LogSoftmax`, `TopK`). The scheduler exits with a `SchedulerError` on the
+first unsupported op, so most models need a preparation pass before they can
+be fed to `inference_scheduler.py`.  (`Constant`, `Identity`, `Dropout`,
+`Squeeze` / `Unsqueeze`, `Cast`, `Split` and last-axis `Softmax` are
+accepted as they are.)
 
 This doc covers the standard preparation flow built around
 `simplify_onnx.py`. For the full list of operators the scheduler accepts,
-see [`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md#2-supported-onnx-operators).
+see [`USER_GUIDE.md`](USER_GUIDE.md#2-supported-onnx-operators).
 
 ---
 
@@ -44,7 +46,8 @@ Pipeline:
    you can sanity-check non-trivial transforms.
 
 The script prints a node-count delta plus a per-op-type diff (changed
-counts highlighted in yellow). Examples observed on the bundled models:
+counts highlighted in yellow). Examples observed on the models kept in
+`inference-scheduler/` (downloaded locally; model files are not tracked in git):
 
 | Source | Nodes (before → after) | BN folded |
 |---|---|---|
@@ -58,8 +61,8 @@ each source.  ResNet-18 (`resnet18-v1-7.onnx` / `resnet18-v2-7.onnx`)
 is a notable exception: the script leaves it at 69 → 69 with all
 BatchNormalization nodes intact, because the BN scale/bias don't
 collapse cleanly into the preceding Convs in this export.  A working
-49-node ResNet-18 (`resnet18-simplified-fused.onnx`) exists in the
-repo but was produced by a different fusion pipeline; reproducing it
+49-node ResNet-18 (`resnet18-simplified-fused.onnx`) exists locally
+but was produced by a different fusion pipeline; reproducing it
 via `simplify_onnx.py` alone is **not currently supported**.
 
 ---
@@ -140,14 +143,15 @@ remedies are:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Softmax`, `LogSoftmax` in the tail | Classifier head | Strip the tail with `onnx.utils.extract_model(in, out, [model_input], [pre_softmax_tensor])`. The bundled `mobilenet_v1_1.0_224_no_softmax.onnx` was produced this way. |
-| `Cast`, `Identity`, `Dropout` (eval-mode no-op) | Exporter artifacts | A second `simplify_onnx.py` pass usually removes them once shapes are pinned. |
+| `LogSoftmax`, `ArgMax`, `TopK` in the tail | Classifier head | Strip the tail with `onnx.utils.extract_model(in, out, [model_input], [pre_softmax_tensor])`. A `Softmax` over the last axis runs as a host-CPU op and can stay; the local `mobilenet_v1_1.0_224_no_softmax.onnx` was cut this way before that existed. |
+| `BatchNormalization` left after simplify | BN that onnxsim / `fuse_bn_into_conv` could not fold (e.g. `resnet18-v1-7` / `-v2-7`, §1) | Fold BN into the preceding Conv with a custom pass; the scheduler has no BN op. |
+| `Shape`, `Gather` / `Concat` on shapes | Dynamic-shape scaffolding | A `simplify_onnx.py` pass with pinned input shapes (`--batch` / `--input-shape`) constant-folds them. |
 | `Pad` with non-constant pads | Dynamic padding via `Shape`/`Slice` | Re-export the model with constant padding values, or rewrite via `onnx.compose` / `onnx-graphsurgeon`. |
 | `Conv` with `group != 1 and group != in_channels` | Grouped convolution (not depthwise) | Not supported by ConvKernel. The model needs surgery to expand the grouped conv into multiple normal convs. |
 | `MatMul` with `k > kMaxK` | Inner-dim larger than the platform's `kernels.matmul.max_k` | Either bump `max_k` in `platforms/<name>.json` and re-synthesise, or split the matmul along K (manual). |
 
 `onnx.utils.extract_model` is the easiest way to keep just the
-"interesting" portion of a network — see the bundled `mobilenet_v1_*`
+"interesting" portion of a network — see the local `mobilenet_v1_*`
 sub-graph fixtures (`mobilenet_v1_input_to_avgpool.onnx`,
 `mobilenet_v1_conv13_relu6_avgpool.onnx`, etc.) for examples of
 intermediate-tensor extraction used to isolate scheduler / kernel bugs
@@ -173,7 +177,7 @@ python - <<EOF
 import onnx
 m = onnx.load("model-simplified.onnx")
 for i, n in enumerate(m.graph.node):
-    if n.op_type in {"Softmax", "Cast", "Identity"}:
+    if n.op_type in {"BatchNormalization", "ArgMax", "LogSoftmax", "Shape"}:
         print(i, n.op_type, n.name, "->", list(n.output))
 EOF
 

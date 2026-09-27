@@ -3,7 +3,10 @@
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
 KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
-Status: **TARGET MET 2026-09-26 — ResNet-18 62.3 ms = 16.0 FPS at 100 MHz** (steps 1–4, 6 and 8; step 5 not needed, kept as an option).
+Status: **TARGET MET 2026-09-26 — ResNet-18 62.3 ms = 16.0 FPS at 100 MHz** (steps 1–4, 6 and 8; step 5 not needed, kept as an option).  Since
+BERT_PLAN phase 2B (cacheable buffer pool, same bitstream): ResNet-18 60.3 ms
+(16.6 FPS), MobileNet v1 81.0 ms, v2 63.9 ms (BERT_PLAN.md §3 "Phase 2A + 2B
+combined"); host reorder 3.0 → 0.5 ms.  Step 5 (150 MHz) still not started.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 

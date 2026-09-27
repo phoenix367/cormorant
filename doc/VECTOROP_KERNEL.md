@@ -11,8 +11,9 @@ a broadcasting mode (`outer` / `a_inc` / `b_inc`) so a smaller operand can be
 re-applied across a larger one without an explicit tile copy.
 
 The kernel is a four-stage `#pragma HLS DATAFLOW` pipeline (load A, load B,
-compute, store C) with every loop pipelined at II=1, so once the streams are
-primed it sustains one element per clock.
+compute, store C) on 128-bit words with every stage loop pipelined at II=1,
+so once the streams are primed it sustains one word (8 elements) per clock
+(`OP_DIV`: one element per clock).
 
 ---
 
@@ -83,8 +84,8 @@ binary ops, and `b`'s base address is ignored.
 `OP_MUL` computes the full-precision `2W`-bit product and lets
 `saturate_cast` clip it back to `Data_t`. `OP_DIV` uses one iterative
 fixed-point divider fed one lane per cycle (`compute_div`, II=1 per lane,
-i.e. one element per cycle instead of eight — the only
-op that is not II=1).
+i.e. one element per cycle instead of eight — the only op that does not
+process a whole word per cycle).
 
 ---
 
@@ -95,13 +96,16 @@ CMake substitutes the data type into `Config.h`:
 | Constant | Default | Purpose |
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
-| `kDataWidthBits` | 16 | Bit width of one element (AXI stream TDATA sizing) |
+| `kDataWidthBits` | 16 | Bit width of one element (byte width × 8; the lane width used by the kernel is `kDataBits` in `VectorOP.h`) |
 | `kSeed` | 42 | RNG seed for `TestSimulation` |
 
-`Data_t` is set by the CMake cache variable `VA_DATA_TYPE` and may be
-`float`, `double`, `half`, `uint8_t`, or any `ap_fixed<W,I>` / `ap_ufixed<W,I>`.
-`VA_VECTOR_SIZE` (default 1024) is informational only — the vector length is
-a pure runtime register, never a compile-time bound.
+`Data_t` is set by the CMake cache variable `VA_DATA_TYPE` (default
+`ap_fixed<16,8>`) and may be `float`, `double`, `half`, `uint8_t`, or any
+`ap_fixed<W,I>` / `ap_ufixed<W,I>`; the element width must divide 128 bits
+(`static_assert` in `VectorOP.h`).  CMake falls back to `float` when it
+cannot find the Vitis HLS headers, but `VectorOP.h` includes `ap_fixed.h` /
+`ap_int.h` / `hls_burst_maxi.h` unconditionally, so every build needs them.
+The vector length is a pure runtime register, never a compile-time bound.
 
 There is no accumulator type and no tiling: VectorOP is a streaming kernel,
 not a reduction.
@@ -173,14 +177,15 @@ materialising a tiled copy of the smaller operand:
 - **Non-broadcast:** `outer=1`, `a_inc=0`, `b_inc=0` → one pass over `size`
   elements.
 - **`a` advancing, `b` repeating:** `outer=N`, `a_inc=aligned_chunk`,
-  `b_inc=0` → `b`'s `size` elements are re-read on every outer iteration
-  (stride 0 makes `load_b` revisit the same addresses).
+  `b_inc=0` → `b`'s `size` elements are reused on every outer iteration.
 - **`b` advancing, `a` repeating:** the symmetric case with `a_inc=0`.
 
 The write stride is `c_inc = a_inc + b_inc`, so the output advances whenever
-either input does. A `stride == 0` operand stays resident in DDR and is
-simply re-streamed — the line-rate cost is the repeated read, traded against
-not having to pre-expand the broadcast operand in memory.
+either input does. A stride-0 operand of ≤ 256 words (2048 elements) is
+read from DDR once into the loader's `rep_buf` and replayed `outer` times;
+a larger one stays in DDR and is re-read on every outer iteration (the
+line-rate cost is the repeated read, traded against not having to
+pre-expand the broadcast operand in memory).
 
 ---
 
@@ -188,30 +193,37 @@ not having to pre-expand the broadcast operand in memory.
 
 `saturate_cast<Data_t>(v)` (defined in `VectorOP.h`) narrows a wider
 intermediate back to `Data_t`. For `ap_fixed` it routes through
-`ap_fixed<W,I,AP_TRN,AP_SAT>` — truncation toward zero, then saturation
-clamping to \[-2^(I-1), 2^(I-1) − 2^-(W-I)\] — matching ONNX fixed-point
-semantics. The primary template is an identity pass-through, so `float` /
-`double` / integer builds carry no saturation cost. Every binary op applies
-`saturate_cast` to its result; `OP_RELU` / `OP_RELU6` clamp directly.
+`ap_fixed<W,I,AP_TRN,AP_SAT>` — truncation (toward −∞), then saturation
+clamping to \[-2^(I-1), 2^(I-1) − 2^-(W-I)\]. The primary template is an
+identity pass-through, so `float` / `double` / integer builds carry no
+saturation cost. Every binary op applies `saturate_cast` to its result
+(`OP_DIV` returns 0 for `b = 0`); `OP_RELU` / `OP_RELU6` clamp directly.
 
 ---
 
 ## 7. Test Coverage (`TestSimulation.cpp`)
 
-C-simulation tests compiled with GCC (no Vitis required). Each case runs the
-kernel against a naive scalar reference; tolerance is exact for fixed-point /
-integer types and relative `1e-5` for floating-point.
+C-simulation tests compiled with GCC against the Vitis HLS headers (no
+Vitis tools run). Each case runs the kernel against a naive scalar
+reference; tolerance is 1 LSB (1/256) for `ap_fixed`, relative `1e-5` for
+floating point, and exact for the saturation boundary cases.  Every case also checks the alignment contract: the tail
+lanes of each run's last output word read 0 and every other gap position is
+left untouched.
 
 | Category | Coverage |
 |----------|----------|
 | All six operations | `ADD`, `SUB`, `MUL`, `DIV`, `RELU`, `RELU6` |
-| Sizes | Multiple vector lengths, including non-power-of-two |
+| Sizes | 1, 3, 8, 9, 13, 64, 255, 256, 1023, 1024, 4097 (partial tail words) |
 | Saturation | Positive / negative overflow boundary cases (`ap_fixed` only) |
-| Broadcast | `outer > 1` with `a`- or `b`-advancing strides |
+| Broadcast / geometry | chunk 12–13 at stride 16 (`a`- and `b`-advancing), `outer` 1000 × 16, stride-0 operand at (2048) and past (2100) the replay bound, multi-piece runs, runs > 16 × 256 words |
+| Fused activation | `act` = relu / relu6 on binary, `DIV`, unary and broadcast calls |
 
 `make gen_vectorop_test_data` re-runs the test in `--dump-data` mode to emit
-hex fixtures for the HDL testbench (16-bit `ap_fixed` builds only), keeping
-RTL-level tests bit-identical to the C++ reference.
+hex fixtures plus a `manifest.txt` (with an `act` column) for the HDL
+testbench (16-bit `ap_fixed` builds only; output directory
+`VA_TEST_DATA_DIR`, default `<build>/vectorop_test_data`), keeping RTL-level
+tests bit-identical to the C++ reference.  The fixtures the behavioural test
+uses are the checked-in copies under `hw/test_data/vecop_test_data/`.
 
 ---
 
@@ -232,7 +244,8 @@ ONNX operators to `XVectoropkernel` invocations:
 One input of a binary op may broadcast: the broadcast dimensions must form a
 contiguous leading block, and the code generator emits an `outer`-loop call
 with `a_inc` / `b_inc` set from the tensor's chunk stride. The generated
-`run_op()` writes the AXI-Lite registers and calls `XVectoropkernel_Start()`
+`run_op()` (or `run_op_act()` for a node with a fused `Relu` / `Clip(0,6)`)
+writes the AXI-Lite registers and calls `XVectoropkernel_Start()`
 non-blocking; a later `kernel_wait(KERNEL_VECTOROP)` drains the lane only
 when a dependent op needs the result.
 
@@ -249,9 +262,12 @@ make synthesize_vectorop_kv260
 ```
 
 The synthesis target reads a `platforms/<name>.json` (part, optional board
-and clock) and invokes Vitis HLS via `Synthesis.tcl.in`, which configures the
-project, sets 64-bit AXI and the bus width, runs `csynth_design`, and exports
-an IP-catalog archive.
+and clock — `kv260.json` sets 150 MHz) and invokes Vitis HLS via
+`Synthesis.tcl.in`, which configures the project (`vadd_<platform>`,
+`solution1`), sets 64-bit AXI addresses and
+`-m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}` (no effect on the ports, which
+are declared 128-bit in the C++), runs `csynth_design`, and exports an
+IP-catalog archive to `build/kernels/vectorop/<platform>/ip_catalog`.
 
 ---
 
@@ -261,11 +277,11 @@ an IP-catalog archive.
 |------|---------|
 | `kernels/vectorop/kernel/VectorOP.cpp` | HLS kernel — four DATAFLOW stages on 128-bit words |
 | `kernels/vectorop/include/VectorOP.h` | Kernel declaration, `Op` / `Act` enums, `VecWord` lane helpers, alignment contract, `saturate_cast<T>` |
-| `kernels/vectorop/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`) |
+| `kernels/vectorop/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`, `kSeed`) |
 | `kernels/vectorop/test/TestSimulation.cpp` | C simulation tests (GCC) |
 | `kernels/vectorop/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
 | `inference-scheduler/src/nodes.py` | `ScheduledNode` class (ONNX → kernel params) |
-| `inference-scheduler/src/codegen/_source.py` | `run_op()` code generation |
+| `inference-scheduler/src/codegen/_source.py` | `run_op()` / `run_op_act()` code generation |
 
 ---
 
@@ -288,4 +304,4 @@ an IP-catalog archive.
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` on every result |
 | **AXI-Lite base address** | `0xA000_0000` |
 | **Driver prefix** | `xvectoropkernel` |
-| **UIO device name** | `VectorOPKernel_0` |
+| **UIO device name** | `VectorOPKernel_0` (scheduler default); the shipped overlay `dts/kv260/cormorant.dts` names the node `fabric_vecop` — override with `INFERENCE_VECTOROPKERNEL_INSTANCE` |

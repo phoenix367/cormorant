@@ -2,7 +2,7 @@
 
 ## Overview
 
-`ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of four hardware kernels in the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel-tiling strategy (output-channel tile kTileM × input-channel tile kTileIC) enables II=1 throughput via a flat-counter lane-rotation scheme.
+`ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of four hardware kernels in the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel tiling (output-channel tile kTileM × input-channel tile kTileIC, 16 × 16) maps onto a 16 × 16 MAC grid that one flat II=1 sweep per `(ic-tile, ow-tile, M-group)` feeds with two output pixels per cycle (§5.1). The inference scheduler also runs MatMuls on this kernel (§8).
 
 ---
 
@@ -18,9 +18,18 @@
 | `gmem3` | `y` | Write | Output feature map `[batch][out_ch][out_h][out_w]` — `hls::burst_maxi<ap_uint<128>>`; each channel run is re-aligned onto DDR words and its first / last word is written with byte strobes so neighbouring lanes stay intact (§2.38) |
 
 All four buffers must be 16-byte aligned (the scheduler aligns every
-buffer to 64 bytes); `y` may be read by the kernel's writer only through
-its strobes — lanes past the tensor's end inside the last word are never
-written.
+buffer to 64 bytes); `y` is written through byte strobes at the ends of
+every channel run, so lanes past the tensor's end inside the last word
+are never written (the buffer must still cover that whole word).
+
+Burst settings on the `INTERFACE m_axi` pragmas: `x`
+`max_read_burst_length=16 num_read_outstanding=16` (one request per
+(row, channel) run of ≤ 9 words); `weight` 128 / 8 (one request per m1
+slab, 8 kept in flight); `bias` 256 / 2 (one request for the whole
+vector); `y` `max_write_burst_length=64 num_write_outstanding=8` (one
+request per (channel, 256-pixel segment) run of ≤ 33 words, at most 4
+unacknowledged).  The Vivado block-design instance widths must equal
+the exported IP defaults — 128 bits on all four ports.
 
 **AXI-Lite control registers (`s_axilite bundle=ctrl`) — 21 registers total:**
 
@@ -33,7 +42,7 @@ written.
 | `kh`, `kw` | `unsigned` | Filter kernel size |
 | `stride_h`, `stride_w` | `unsigned` | Convolution stride |
 | `dilation_h`, `dilation_w` | `unsigned` | Dilation |
-| `pad_top`, `pad_left` | `unsigned` | Padding (top row / left column) |
+| `pad_top`, `pad_left` | `unsigned` | Padding (top row / left column); bottom / right padding is implicit — out-of-range input reads return 0 |
 | `has_bias` | `unsigned` | 0 = skip bias; 1 = add per-channel bias |
 | `is_depthwise` | `unsigned` | 0 = standard (group=1); 1 = depthwise (group=in_ch) |
 
@@ -70,25 +79,26 @@ written.
 | `kTileIC` | 16 | Input-channel tile width; must be a power of 2; also the standard PN unroll factor |
 | `kMaxKH` | 7 | Maximum compile-time kernel height |
 | `kMaxKW` | 7 | Maximum compile-time kernel width |
-| `kMaxInCh` | 1024 | Sizes `bias_buf` (line_buf is IC-tiled, doesn't depend on this) |
-| `kMaxOutCh` | 1280 | Sizes `bias_buf` in `bias_producer` |
+| `kMaxInCh` | 1024 | Validation bound only (`in_ch ≤ kMaxInCh`, also used by the MatMul lowering); no kernel buffer depends on it — `line_buf` and the weight cache are IC-tiled |
+| `kMaxOutCh` | 1280 | Sizes `bias_buf` in `bias_producer` (LUTRAM, `kTileM` banks) |
 | `kMaxLineBufCols` | 64 | Column capacity of `line_buf`; power of 2 (used as bitmask). Caps `ow_per_tile`, NOT `in_w` — wider inputs split into multiple `ow_tile`s |
 | `kMaxLineBufRows` | 16 | Row capacity of `line_buf`; power of 2 (used as bitmask) |
-| `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one output row (`out_w·out_ch`) must fit. Buffer is bound to **URAM** — each 4096 entries spends one URAM block, so this trades URAM, not BRAM |
-| `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab |
+| `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one kTileM-padded output row (`out_w·ceil(out_ch/kTileM)·kTileM`) must fit. Bound to **URAM** as 512-bit words (`kMaxAccPersistEntries/16` words: 8 URAM blocks at 65536), and the chunk-deep `acc_stream` FIFO (`kMaxAccPersistEntries/8` × 128 bit, 4 URAM) scales with it — it trades URAM, not BRAM |
+| `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab; sets the weight-cache depth (`2 banks × kMaxMperGroup × 64` words) |
 
-If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`.
+All ten values come from `kernels.conv` in `platforms/<AXI_PLATFORM>.json` (`conv_load_constants()` in `kernels/conv/CMakeLists.txt`; no CMake cache defaults).  If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`.
 
 **Runtime constraints validated by the inference scheduler:**
 
 - `in_ch ≤ kMaxInCh`, `out_ch ≤ kMaxOutCh`
+- `kh ≤ kMaxKH`, `kw ≤ kMaxKW` *(the patch buffers are `[kTileIC][kMaxKH][kMaxKW]`)*
 - `(kh-1)·dilation_h + 1 ≤ kMaxLineBufRows` *(one kernel-height window must fit)*
 - `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(one kernel-width window must fit)*
 - `out_w · ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries` *(one kTileM-padded output row fits; was `out_w · out_ch` before the §2.23 padded layout, and the stricter `out_h · out_w · out_ch ≤ …` before oh-chunking)*
 
 `in_h`, `in_w`, and `out_h` are NOT capped — wider / taller layers are handled by transparent tiling:
 
-- `out_h · out_w · out_ch > kMaxAccPersistEntries` triggers **oh-chunking** (output split into `oh_per_chunk = floor(kMaxAccPersistEntries / (out_w·out_ch))` rows; §5.3).
+- `out_h · out_w · out_ch_padded > kMaxAccPersistEntries` (`out_ch_padded = ceil(out_ch/kTileM)·kTileM`) triggers **oh-chunking** (output split into `oh_per_chunk = floor(kMaxAccPersistEntries / (out_w·out_ch_padded))` rows; §5.3).
 - `in_w > kMaxLineBufCols` triggers **ow-tiling** (output column axis split so each tile's iw window fits the line buffer; §5.4).
 - `m_tiles > kMaxMperGroup` triggers **M-grouping** (weight cache holds one M-group at a time; §5.5).
 
@@ -107,11 +117,15 @@ i.e. `oh_per_chunk ≤ (kMaxLineBufRows - ((kh-1)·dilation_h + 1)) / stride_h +
 ## 4. On-Chip Memory
 
 The kernel stages data through **four memory layers** — DDR, URAM, BRAM,
-and registers — each a smaller/faster cache of the layer below it.  The
-diagram shows every on-chip cache, the layer it is bound to, its
-capacity, and what it holds.  Post-§2.14 the design uses **48 % LUT,
-32 % BRAM, 25 % URAM** — LUT is the tightest layer; BRAM and URAM both
-keep headroom for wider tiling.
+and LUTRAM / registers — each a smaller/faster cache of the layer below
+it.  The diagram shows every on-chip cache, the layer it is bound to,
+its capacity, and what it holds.  Post-§2.42 csynth (kv260, 150 MHz
+target): **127 BRAM18 (44 %), 48 URAM (75 %), 679 DSP (54 %)**; csynth
+reports 99.4 k LUT but over-estimates ConvKernel LUT ~2.4× (routed
+estimate ≈ 41 k, CONV_OPTIMISATION.md §2.42).  The BRAM total is `line_buf` 16 + `w_lo` 64 + the
+`weight_stream` FIFO 15 + four m_axi adapters × 8; the URAM total is
+`partial_outputs` 8 + `w_hi` 32 + the `acc_stream` and `col_stream`
+FIFOs 8.
 
 ```mermaid
 flowchart TB
@@ -122,19 +136,19 @@ flowchart TB
         Yd[("y · output tensor")]
     end
 
-    subgraph URAML["URAM layer — 64 blocks · 2.25 MB · 25% used"]
+    subgraph URAML["URAM layer — 64 blocks · 2.25 MB · 48 used (75%)"]
         PO["partial_outputs<br/>65536 entries · 256 KB · 8 URAM blocks<br/><i>persistent accumulator — survives every<br/>ic-tile / mt-tile of one oh-chunk</i>"]
         WH["w_hi<br/>kTileM/2 columns · 512 WeightVec words · 32 URAM blocks<br/><i>the other half of the weight cache (§2.40):<br/>same addressing and ping-pong as w_lo</i>"]
     end
 
-    subgraph BRAML["BRAM layer — 288 BRAM18K · 32% used"]
-        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · kTileIC banks (RAM_T2P)<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile;<br/>two columns read per cycle — one pixel pair (§2.42)</i>"]
+    subgraph BRAML["BRAM layer — 288 BRAM18K · 127 used (44%)"]
+        LB["line_buf<br/>kTileIC·16·64 · ~32 KB · 16 BRAM18 banks (RAM_T2P)<br/><i>input sliding-window cache, shared by both<br/>modes (§2.14); x pixel fetched once per ow_tile;<br/>two columns read per cycle — one pixel pair (§2.42)</i>"]
         WC["w_lo<br/>kTileM/2 columns · 2·4·64 WeightVec words · 64 BRAM18<br/><i>two banks: the current ict/ow_tile/M-group slab,<br/>reused across the sweep, and the next one prefetched (§2.35)</i>"]
-        WB["w_buf<br/>kTileM·7·7 · ~0.8 KB · kTileM banks<br/><i>depthwise weight slice, once per mt</i>"]
-        BB["bias_buf<br/>kMaxOutCh · 2 KB<br/><i>full bias vector, replayed per output</i>"]
     end
 
-    subgraph REGL["Register layer — FF/LUT · fully ARRAY_PARTITIONed"]
+    subgraph REGL["LUTRAM / register layer — FF/LUT · ARRAY_PARTITIONed"]
+        WB["w_buf<br/>kTileM·49 · ~1.5 KB · 256 LUTRAM banks<br/><i>depthwise weight slice, once per (chunk, mt)</i>"]
+        BB["bias_buf<br/>kMaxOutCh · 2.5 KB · kTileM LUTRAM banks<br/><i>full bias vector, replayed per output (§2.40)</i>"]
         PA["patch0 / patch1<br/>2 × kTileIC·7·7 LUTRAM banks<br/><i>current (oh, ow_a) and (oh, ow_a+1) kernel windows (§2.42)</i>"]
         AC["acc0 / acc1 / hold<br/>3 × kTileM lanes · registers<br/><i>one m-tile's accumulators for the two pixels of the pair</i>"]
     end
@@ -150,6 +164,7 @@ flowchart TB
     WB -->|PM-wide weights| AC
     PA -->|PN/PM MACs| AC
     BB -->|Phase 1 init, standard only| PO
+    BB -->|bias_reg seed, depthwise| AC
     AC <-->|Phase 2 read-modify-write standard / write-only depthwise| PO
     PO -->|Phase 3 drain + saturate| Yd
 
@@ -159,20 +174,22 @@ flowchart TB
     classDef reg fill:#f6ffed,stroke:#52c41a,color:#135200
     class Xd,Wd,Bd,Yd ddr
     class PO,WH uram
-    class LB,WC,WB,BB bram
-    class PA,AC reg
+    class LB,WC bram
+    class WB,BB,PA,AC reg
 ```
 
 The two largest caches are the structural cost of the tiling strategy:
-`w_cache` (BRAM) holds one weight slab so DDR weight reads are amortised
+the weight cache (`w_lo` in BRAM + `w_hi` in URAM) holds the current
+weight slab and prefetches the next, so DDR weight reads are amortised
 across the spatial sweep (§5.5), and `partial_outputs` (URAM) holds one
 oh-chunk's accumulators so the input is read once across all ic-tiles
 (§5.3).  Sizes scale with the `Config.h` knobs in §3 — `kMaxMperGroup`
-sizes `w_cache`, `kMaxAccPersistEntries` sizes `partial_outputs`,
-`kMaxLineBufRows/Cols` size `line_buf`.
+sets the weight-cache depth, `kMaxAccPersistEntries` sizes
+`partial_outputs`, `kMaxLineBufRows/Cols` size `line_buf`.
 
-Buffers are declared inside `process_conv_kernel_tile` (re-allocated per inner
-iteration; HLS hoists them to BRAM/registers).
+The consumer's buffers are declared inside `process_conv_kernel_tile`;
+`line_buf` lives in `input_patch_producer`, `bias_buf` in
+`bias_producer` and the ping-pong row buffer `rowbuf` in `x_row_loader`.
 
 ```cpp
 // Per-(oh, ow pair, mt) scratch — a banked register file (§2.18), one
@@ -200,9 +217,10 @@ WeightVec w_hi[kWCacheUramCols][kWCacheWords];   // columns [8, 16) — 32 URAM
 #pragma HLS BIND_STORAGE    variable=w_hi type=RAM_2P impl=URAM
 // One RAM column per m1; the word address is w_cache_addr(bank, tile,
 // khi, kwi) = (bank·kMaxMperGroup + tile)·64 + khi·8 + kwi (ConvMacGrid.h,
-// power-of-two strides so it is a bit concatenation).  The fused sweep
+// power-of-two strides so it is a bit concatenation).  The flat sweep
 // reads all kTileM columns of bank wbank at one address per cycle
-// (mac_grid_step) while the prefetch writes the NEXT slab into bank
+// (w_cache_read — one read per column, shared by both pixels of the
+// pair, §2.42) while the prefetch writes the NEXT slab into bank
 // !wbank — one read + one write port per RAM_2P column.  The store
 // (w_cache_store) selects its column with an explicit unrolled
 // `if (c == m1)` across both arrays: a runtime index into the partitioned
@@ -211,11 +229,15 @@ WeightVec w_hi[kWCacheUramCols][kWCacheWords];   // columns [8, 16) — 32 URAM
 // × 256-bit words read per cycle need 4 BRAM36 or 4 URAM per column
 // whatever the depth — the split keeps BRAM at the 8-column count.
 
-// DEPTHWISE-path weight buffer (different shape — no in_ch dimension):
-Data_t    w_buf[kTileM][kMaxKH][kMaxKW];
+// DEPTHWISE-path weight buffer (different shape — no in_ch dimension),
+// flat over the kernel window (pos = khi·kw + kwi, kMaxKPos = kMaxKH·kMaxKW):
+Data_t    w_buf[kTileM][kMaxKPos];
 #pragma HLS ARRAY_PARTITION variable=w_buf complete dim=1
-// dim=1 (m1, PM axis) partitioned complete → kTileM parallel banks.
-// accumulate_depthwise reads kTileM weights per cycle along the m1 axis.
+#pragma HLS ARRAY_PARTITION variable=w_buf cyclic factor=kTileIC dim=2
+// dim=1 (m1, PM axis) complete → kTileM parallel lanes; mac_dw_step reads
+// kTileM weights per cycle along the m1 axis.  dim=2 cyclic kTileIC →
+// the kTileIC positions of one WeightVec beat land in distinct banks and
+// are written in one cycle.  Lanes m1 >= m_valid are zero-filled.
 
 AccData_t acc0[kTileM], acc1[kTileM], hold[kTileM];
 #pragma HLS ARRAY_PARTITION variable=acc0 complete dim=0   // (same for acc1, hold)
@@ -229,13 +251,17 @@ AccData_t acc0[kTileM], acc1[kTileM], hold[kTileM];
 // Per-(ni, chunk) persistent state — chunk-scoped, lives in the consumer:
 AccData_t partial_outputs[kMaxAccPersistEntries];
 #pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM
-// Holds chunk_oh_count·out_w·out_ch accumulators that survive across
-// ic-tiles (standard) or mt-tiles (depthwise) within a chunk.  Indexed
-// by (oh_local·out_w + ow)·out_ch + m_off + m1 where oh_local = oh - oh_start.
-// Bound to URAM — the largest on-chip buffer, moved off scarce BRAM
-// into the otherwise-idle URAM pool (16 of 64 URAM blocks at the
-// 65536-entry default).  RAM_2P: Phase 1/3 use one port, Phase 2's
-// read and write are separate II=1 sub-loops, so no port conflict.
+#pragma HLS ARRAY_RESHAPE variable=partial_outputs cyclic factor=kTileM dim=1
+// Holds chunk_oh_count·out_w·out_ch_padded accumulators that survive
+// across ic-tiles (standard) within a chunk; depthwise writes each word
+// once (§2.37).  Layout (§2.23):
+// [pixel][m_tile][kTileM] — word = (oh_local·out_w + ow)·m_tiles + mt,
+// entry = word·kTileM + m1, oh_local = oh - oh_start — so one m-tile's
+// kTileM accumulators are ONE reshaped 512-bit word, loaded / stored in
+// one cycle.  Bound to URAM (8 of 64 blocks at the 65536-entry default:
+// 4096 × 512-bit words).  RAM_2P: Phase 1 / Phase 3 use one port each;
+// the Phase-2 sweep does one read and one write per iteration (§2.42
+// staggers the two pixels' words over the window), one per port.
 
 // Per-(ni, chunk, ct, ow_tile) line buffer — lives in the unified
 // input_patch_producer (§2.14).  Both row and column dims are circular:
@@ -261,11 +287,11 @@ Data_t    line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols];
 `PatchVec` — a `kTileIC`-lane struct (`Data_t lane[kTileIC]`, 256-bit
 at defaults) — instead of one `Data_t` per beat.  The producer gathers
 all `kTileIC` channel lanes for a `(khi, kwi)` position into one beat;
-the consumer drains one beat per `(khi, kwi)` and UNROLL-unpacks into
-the local `patch[][][]` array.  This collapses the consumer's patch
-drain from `kTileIC·kh·kw` cycles to `kh·kw`.  The depthwise path packs
-its `kTileM` m-lanes into the first `kTileM` PatchVec lanes and
-zero-pads the rest.
+the consumer drains one beat per `(khi, kwi)` and UNROLL-unpacks it
+(into `patch0` / `patch1` since §2.42, below).  This collapses the
+consumer's patch drain from `kTileIC·kh·kw` cycles to `kh·kw`.  The
+depthwise path packs its `kTileM` m-lanes into the first `kTileM`
+PatchVec lanes and zero-pads the rest (none at kTileM = kTileIC = 16).
 
 **Pixel-pair patch stream (§2.42).**  Since §2.42 the beat is a
 `PatchPair { PatchVec px[2]; }` (512-bit): the same `(khi, kwi)`
@@ -300,10 +326,11 @@ for ni in [0, batch)
     oh_end    = min(out_h, oh_start + oh_per_chunk)
     chunk_oh  = oh_end - oh_start
 
-    // PHASE 1: init partial_outputs from bias_stream — PIPELINE II=1
-    for oh_local, ow, mt, m1:
-      partial_outputs[(oh_local·out_w + ow)·out_ch + m_off + m1]
-         = bias_stream.read()
+    // PHASE 1: init partial_outputs from bias_stream — PIPELINE II=1,
+    // one BiasVec (kTileM lanes, padding lanes zero) per (pixel, mt) word
+    for oh_local, ow, mt:
+      partial_outputs word (oh_local·out_w + ow)·m_tiles + mt
+         := bias_stream.read()
 
     // PHASE 2a: accumulate
     for ict in [0, ceil(in_ch / kTileIC))
@@ -328,7 +355,7 @@ for ni in [0, batch)
             // pos < kh·kw, g  > 0: p0[], p1[] replayed from patch0/1[][khi][kwi]
             // pos == kh·kw (1x1 dummy position only): p0 = p1 = 0, position (0, 0)
             // seed[m1] = partial_outputs[(pos == 1 ? word1 : word0)·kTileM + m1]   // ONE read
-            // w[m1]    = w_cache[g][m1][khi][kwi] masked by m1 < m_valid           // ONE read per column
+            // w[m1]    = column m1 at w_cache_addr(wbank, g, khi, kwi), masked by m1 < m_valid  // ONE read per column
             // a0[m1] = (pos == 0 ? 0 : acc0[m1]) + (pos == 0 ? seed[m1] : 0) + Σ_{ic_l} p0[ic_l] · w[m1][ic_l]
             // a1[m1] = (pos == 0 ? 0 : acc1[m1]) + (pos == 1 ? seed[m1] : 0) + Σ_{ic_l} p1[ic_l] · w[m1][ic_l]
             //                                                          // 2 × 16 × 16 products, 32 adder trees
@@ -342,8 +369,8 @@ for ni in [0, batch)
 
     // PHASE 3 (§2.38, §2.40): transpose + drain, 8 outputs per cycle — PIPELINE II=1
     for mt, segment in (chunk pixels / kDrainSeg):        // step n
-      for i in [0, max(fill_len·kTileM/8, drain_words)):
-        // fill: channels 8h..8h+7 (h = i % (kTileM/8)) of pixel i/(kTileM/8) of
+      for i in [0, max(fill_len·ceil(m_valid/8), drain_words)):
+        // fill: channels 8h..8h+7 (h < ceil(m_valid/8) ≤ kTileM/8) of the next pixel of
         //   segment n → saturate the 8 lanes of
         //   partial_outputs[(p·m_tiles + mt)·kTileM + 8h ..] and scatter them
         //   into 8 LUTRAM banks (bank (m1+p)%8, addr m1·32 + p/8) of buffer n&1
@@ -412,21 +439,24 @@ re-emission.
 
 ### 5.3 oh-chunking
 
-When `out_h · out_w · out_ch > kMaxAccPersistEntries` the persistent
-`partial_outputs[]` buffer cannot hold the full output.  Rather than reject
-such layers or fall back to a no-persistent-acc mode, the kernel splits the
-output along `oh` into chunks that fit:
+When `out_h · out_w · out_ch_padded > kMaxAccPersistEntries`
+(`out_ch_padded = ceil(out_ch/kTileM)·kTileM`, the §2.23 word layout) the
+persistent `partial_outputs[]` buffer cannot hold the full output.  Rather
+than reject such layers or fall back to a no-persistent-acc mode, the
+kernel splits the output along `oh` into chunks that fit:
 
 ```
-oh_per_chunk = max(1, kMaxAccPersistEntries / (out_w · out_ch))
+oh_per_chunk = min(out_h, max(1, kMaxAccPersistEntries / (out_w · out_ch_padded)))
 num_chunks   = ceil(out_h / oh_per_chunk)
 ```
 
-Each chunk runs the full three-phase pipeline above for its `oh` sub-range.
-The chunk loop is placed INNER to `ni` (and outer to everything else) in
-all producers + the consumer so the linear stream order seen by
-`bias_producer` and `write_output_tile` is the same
-`(ni, oh, ow, mt, m1)` as before — those two need no chunk-awareness.
+(further capped under M-grouping, see §3).  Each chunk runs the full
+three-phase pipeline above for its `oh` sub-range.  The chunk loop is
+placed INNER to `ni` (and outer to everything else) in the loader, the
+producers and the consumer.  `bias_producer` only needs a replay count
+(`batch·out_h·out_w` BiasVecs per m-tile for standard, `batch·num_chunks`
+for depthwise); `write_output_tile` walks `(ni, chunk, mt, segment, m1)`
+to match the Phase-3 channel-major drain.
 
 **Duplicate-read overhead** at chunk boundaries:
 
@@ -434,7 +464,7 @@ all producers + the consumer so the linear stream order seen by
 - Weights (standard path): re-emitted per `(chunk, ict, ow_tile, mg)` — `num_chunks` factor in DDR weight reads.
 - Weights (depthwise path): the small per-mt slice (`kTileM·kh·kw` values) is reloaded `num_chunks` times per `(ni, mt)`. Negligible.
 
-For the common case (`out_h · out_w · out_ch ≤ kMaxAccPersistEntries`)
+For the common case (`out_h · out_w · out_ch_padded ≤ kMaxAccPersistEntries`)
 `num_chunks = 1` and the chunk loop adds only a few cycles of wrapper
 overhead.  See `compute_oh_chunking()` in `ConvKernel.cpp`.
 
@@ -457,6 +487,7 @@ output column axis into `ow_tile`s whose iw window fits the buffer:
 window_w     = (kw - 1) · dilation_w + 1
 ow_per_tile  = max(1, (kMaxLineBufCols - window_w) / stride_w + 1)
 ow_per_tile  = ow_per_tile > 1 ? ow_per_tile & ~1 : 1          // §2.42: even, pair-aligned tiles
+ow_per_tile  = min(ow_per_tile, out_w)
 num_ow_tiles = ceil(out_w / ow_per_tile)
 ```
 
@@ -489,9 +520,10 @@ num_m_groups = ceil(m_tiles / mt_per_group)
 When `m_tiles ≤ kMaxMperGroup` the entire ic-tile's weights fit in one
 group and each weight is read from DDR exactly once per
 `(ni, chunk, ict, ow_tile)`.  Otherwise the M-axis splits into groups,
-each loaded fresh from DDR.  Patches are streamed once per
-`(ow_tile, mg, oh, ow_in_tile)` and reused across the group's
-`mt_in_group` iterations.  See `compute_m_grouping()` in `ConvKernel.cpp`.
+each loaded fresh from DDR (prefetched into the other cache bank under
+the previous slab's sweep, §2.35).  Patches are streamed once per
+`(ow_tile, mg, oh, ow pair)` and reused across the group's
+`mt_in_group` tiles.  See `compute_m_grouping()` in `ConvKernel.cpp`.
 
 This combines with §2.8's PN-wide adder tree to give the inner-MAC its
 throughput AND its bandwidth advantage: without M-grouping the inner
@@ -504,19 +536,22 @@ reduction would be stream-rate-bound on `weight_stream`.
 | `DATAFLOW` | top-level | Six concurrent producers/consumers |
 | `BIND_STORAGE variable=tA/tB type=RAM_S2P impl=LUTRAM` + `ARRAY_PARTITION complete dim=1` + `DEPENDENCE inter dependent=false` | Phase-3 transposer buffers (§2.38) | 8-bank ping-pong; within one step a buffer is only written or only read |
 | `BIND_STORAGE variable=rowbuf type=RAM_S2P impl=LUTRAM` + `ARRAY_PARTITION complete dim=1` + `DEPENDENCE inter dependent=false` | `x_row_loader` row buffer (§2.39) | per-channel RAM columns, flat `half·16 + word` address, ping-pong between rows |
-| `BIND_STORAGE variable=col_stream / acc_stream type=fifo impl=uram` | top-level streams | the 256-bit column FIFO and the chunk-deep 128-bit output FIFO live in the idle URAM pool |
-| `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports |
+| `BIND_STORAGE variable=col_stream / acc_stream type=fifo impl=uram` | top-level streams | the 256-bit column FIFO and the chunk-deep 128-bit output FIFO live in the URAM pool |
+| `BIND_STORAGE variable=patch_stream type=fifo impl=lutram`, `variable=bias_stream type=fifo impl=srl` | top-level streams | the 49 × 512-bit patch FIFO in LUTRAM, the 16 × 512-bit bias FIFO in SRLs (§2.40) |
+| `INTERFACE m_axi ... bundle=gmem0/1/2/3` | top-level | AXI memory ports (burst settings in §1) |
 | `INTERFACE s_axilite ... bundle=ctrl` | every scalar | AXI-Lite register file |
 | `STABLE variable=…` | top-level — `x`/`weight`/`bias` pointers + every scalar argument (§2.20) | Invariant for the whole invocation, so HLS forwards each as a stable signal instead of a per-consumer channel FIFO (`y`, the write port, is left unmarked) |
 | `ARRAY_PARTITION variable=patch0/patch1 complete dim=1` + `BIND_STORAGE type=RAM_2P impl=lutram` | `patch0/1[kTileIC][kMaxKH][kMaxKW]` | Banked register files, one per pixel of the pair: kTileIC LUTRAMs each, `(khi,kwi)` is a RAM address (§2.18, §2.42) |
 | `ARRAY_PARTITION variable=line_buf complete dim=1` + `BIND_STORAGE type=RAM_T2P impl=BRAM` | `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]` | 16 true-dual-port BRAM18 banks: Phase 2 reads two columns (a pixel pair) per cycle, Phase 1 writes one column per cycle in its own loop (§2.42) |
 | `DEPENDENCE variable=partial_outputs inter dependent=false` | the flat standard / depthwise sweeps | Every (pixel, tile) word is read once and written once per sweep, the write after the read (§2.41, §2.42) |
-| `ARRAY_PARTITION variable=w_cache complete dim=3` | standard `w_cache[kMaxMperGroup][kTileM][kTileIC][kMaxKH][kMaxKW]` | kTileIC banks on the ic_l axis for the PN unroll |
-| `ARRAY_PARTITION variable=w_buf complete dim=1` | depthwise `w_buf[kTileM][kMaxKH][kMaxKW]` | kTileM banks for the PM unroll |
-| `ARRAY_PARTITION variable=acc complete dim=0` | `acc[kTileM]` | All accumulators in registers |
+| `bind_storage variable=partial_outputs type=RAM_2P impl=URAM` + `ARRAY_RESHAPE cyclic factor=kTileM dim=1` | `partial_outputs[kMaxAccPersistEntries]` | One m-tile's kTileM accumulators = one 512-bit URAM word (§2.13, §2.23) |
+| `ARRAY_PARTITION variable=w_lo/w_hi complete dim=1` + `AGGREGATE compact=bit` + `BIND_STORAGE type=RAM_2P impl=BRAM` (`w_lo`) / `impl=URAM` (`w_hi`) + `DEPENDENCE inter dependent=false` | standard weight cache `w_lo[kTileM/2][kWCacheWords]`, `w_hi[kTileM/2][kWCacheWords]` (ConvMacGrid.h) | One RAM column per m1 of 256-bit `WeightVec` words, flat `(bank, tile, khi, kwi)` address; the sweep reads bank `wbank` while the prefetch writes the other (§2.35, §2.40) |
+| `ARRAY_PARTITION variable=w_buf complete dim=1` + `cyclic factor=kTileIC dim=2` | depthwise `w_buf[kTileM][kMaxKPos]` | kTileM lanes for the PM unroll; one WeightVec beat written per cycle |
+| `ARRAY_PARTITION variable=bias_buf cyclic factor=kTileM` + `BIND_STORAGE type=RAM_1P impl=LUTRAM` | `bias_buf[kMaxOutCh]` | One BiasVec gathered per cycle |
+| `ARRAY_PARTITION variable=acc0/acc1/hold complete dim=0` | `acc0/acc1/hold[kTileM]` | All accumulators in registers |
 | `PIPELINE II=1` | every load / reduce / drain loop | One iteration per clock |
-| `UNROLL` | inner `ic_l` loop (standard) / inner `m1` loop (depthwise) | Replicates MACs across the parallel axis |
-| `STREAM depth=…` | every `hls::stream` between dataflow stages | FIFO sizing (e.g. `weight_stream` = `kTileM·kTileIC·kMaxKH·kMaxKW`) |
+| `UNROLL` | `ic_l` and `m1` loops of `mac_grid_column_step` (standard) / `m1` of `mac_dw_step` (depthwise) | Replicates MACs across the parallel axes |
+| `STREAM depth=…` | every `hls::stream` between dataflow stages | FIFO sizing (e.g. `weight_stream` = `8·kMaxKH·kMaxKW` = 392 WeightVecs, `patch_stream` = `kMaxKH·kMaxKW`, `acc_stream` = `kMaxAccPersistEntries/8`, `col_stream` = `4·kMaxLineBufCols`) |
 
 ### 5.7 II=1 achievability in the reduce loops
 
@@ -530,52 +565,60 @@ latency 8 (the same as the one-pixel §2.41 loop).  `partial_outputs`
 carries `DEPENDENCE inter dependent=false`: its one read and one write
 per iteration never touch the same word twice in one sweep.
 
-**Depthwise (`accumulate_depthwise`).**  Each PIPELINE iteration writes
-*all* `kTileM` accumulators (PM-wide unroll).  The per-lane RAW distance on
-`acc[m1]` is 1 cycle.  Because `ap_fixed<32,16>` add is a single-cycle
-32-bit integer adder at 300 MHz, the single-cycle recurrence closes
-cleanly and HLS schedules II=1.
+**Depthwise (flat sweep, `mac_dw_step`).**  Each PIPELINE iteration
+writes *all* `kTileM` accumulators of both pixels (PM-wide unroll).  The
+per-lane RAW distance on `acc0[m1]` / `acc1[m1]` is 1 cycle.  Because
+the `ap_fixed<32,16>` add is a single-cycle 32-bit integer adder at the
+150 MHz target, the single-cycle recurrence closes cleanly and HLS
+schedules II=1.
 
-**X-propagation guard (standard only).**  For partial IC tiles
-(`ic_valid < kTileIC`), `w_buf[m1][ic_l ≥ ic_valid][…]` is left
-uninitialised — `X` in RTL.  C-sim sees zero (because `patch` is producer-
-zero-padded) but RTL `0 · X = X` would propagate to the AXI output.  The
-`accumulate_standard` inner loop guards the weight read with
-`ic_l < ic_valid ? w_buf[…] : 0`, MUXing the bank output to 0 on invalid
-lanes so the product is `0 · 0 = 0`.  Cost: one LUT per PN lane on the
-weight input; no DSP impact.
+**X-propagation guards.**  RTL `0 · X = X` would propagate an
+unwritten RAM word to the AXI output, so every product must see defined
+operands.  *Input-channel pad lanes* need no mask since §2.40: the
+packed DDR weight layout carries zeros in lanes past `in_ch`, the
+weight producer zero-initialises each `WeightVec`, and the patch
+producer zero-pads lanes `≥ ch_valid`.  *Output-channel pad columns*
+(`m1 ≥ m_valid` of a partial last M tile) are never written by the
+cache fill, so `w_cache_read` (ConvMacGrid.h) MUXes those columns'
+weights to 0 on the way into the multipliers (one 16-way AND per
+column, folded into the DSP input registers).  Depthwise zero-fills
+`w_buf` lanes `m1 ≥ m_valid` at load.  A 1×1's dummy second position
+(§5.1) keeps `(khi, kwi) = (0, 0)` so it reads a written weight word.
 
 ---
 
 ## 6. Data Types and Saturation
 
-`saturate_cast<Data_t>(v)` converts an `AccData_t` accumulator back to `Data_t`. It is applied in `process_conv_kernel_tile`'s Phase-3 drain (§2.16), so `acc_stream` is a `Data_t`-wide FIFO and `write_output_tile` copies finished elements straight to `y[]`. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward zero) and `AP_SAT` (saturation clamping), matching ONNX fixed-point semantics. A fallback template handles `float` builds (identity cast).
+`saturate_cast<Data_t>(v)` converts an `AccData_t` accumulator back to `Data_t`. It is applied in `process_conv_kernel_tile`'s Phase-3 drain (§2.16), so `acc_stream` carries finished `Data_t` values — 128-bit `YWord`s of 8 outputs of one channel since §2.38 — and `write_output_tile` only re-aligns them onto DDR words. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward −∞, i.e. floor) and `AP_SAT` (saturation clamping), matching the scheduler's reference (`dtype.truncate()` + clip). A fallback template handles `float` builds (identity cast).
 
 ---
 
 ## 7. Test Coverage (`TestConvSim.cpp`)
 
-59 named test cases compiled with GCC (no Vitis required), plus `TestConvGrid` (the MAC array in isolation, including the §2.42 two-pixel / staggered-seed step) and the `--sweep N` randomised-geometry net. Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench uses pre-baked fixtures for 58 of these (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture).
+`TestConvRef` runs 97 named cases compiled with GCC (no Vitis required): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvSweep` (`TestConvRef --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
 - `ref_depthwise_conv()` — naive 6-nested-loop depthwise convolution
+- `ref_matmul()` — the MatmulKernel-side oracle for the lowered MatMul cases (exact `AccData_t` sum, floor + saturate)
 
 | Category | Cases |
 |----------|-------|
-| Standard conv — basic | 1×1 kernel; 3×3 no-pad; 3×3 same-pad; 3×3 stride=2 |
+| Standard conv — basic | 1×1 kernel (twice); 3×3 no-pad; 3×3 same-pad; 3×3 stride=2 |
 | Standard conv — bias/batch | pad=1 + bias + 2 output channels; batch=2 |
-| Standard conv — partial tiles | in_ch = kTileIC+5; out_ch = kTileM+3; 1×1 exact-tile multiples |
+| Standard conv — partial tiles | in_ch = kTileIC+5; out_ch = kTileM+3; 1×1 exact-tile multiples; 3×3 input 3×3 kernel → 1×1 out |
 | Standard conv — dilation/kernel | dilation=2; 5×5 kernel; 14×14 input multi-tile; non-square 6×8 input 3×5 kernel; 1×5 horizontal |
-| Standard conv — asymmetric pad/stride/dilation | 7×7 stride=2 asymmetric pad; 3×3 stride h=2 w=1; 3×3 dilation h=1 w=2 |
+| Standard conv — asymmetric pad/stride/dilation | 7×7 input stride=2 asymmetric pad; 3×3 stride h=2 w=1; 3×3 dilation h=1 w=2; space-to-depth stem 12ch 4×4 s1 pad [2,2,1,1] on 16×16 (C-sim only) |
 | Standard conv — batch + tiling | batch=3 C=TILE_IC M=TILE_M stride=2 (ResNet-style) |
-| **Standard conv — oh-chunking** | **out=32×32×32 (2 chunks; exercises §5.3)** |
-| **Standard conv — M-grouping** | **out_ch=64 (m_tiles=8, num_m_groups=2; exercises §5.5)** |
+| Standard conv — oh-chunking | out=32×32×32 — labelled "2 chunks", but at kMaxAccPersistEntries = 65536 it runs as one chunk; multi-chunk runs are covered by the M-grouping residency-cap cases, the 1×1 8→8 on 121×75 case (3 chunks), the MatMul-on-ConvKernel N=256 case and the sweep |
+| **Standard conv — M-grouping (§5.5)** | out_ch=64 (4 m-tiles — one group since kTileM = 16; label kept for timing history); **80 channels (4 + 1 tiles → 2 groups, §3 chunk-height cap → 2–3 chunks): in_h=17, 7×7 s2 stem 24×24, batch=2 dil=2 s_h=2**; the same three geometries at 64 / 40 / 40 channels (single-group since kTileM = 16); 1×1 s2 24→80 on 24×20 (2 groups) |
+| Standard conv — 1×1 / output runs | 1×1 s1 40→21 on 9×13 batch 2 (3 ic-tiles, partial M); 1×1 32→16 on 40×64 (2560-element runs); 1×1 8→8 on 121×75 (mid-word runs) |
 | **Standard conv — ow-tiling** | **in_w=128 (3 ow-tiles; exercises §5.4)** |
-| Depthwise conv | 3×3 no-bias; 3×3 pad=1+bias; partial TILE_M+3; dilation=2; stride=2 pad=1; batch=2; exact TILE_M×2 + bias; 5×5 kernel; asymmetric stride |
-| **Depthwise conv — oh-chunking** | **32 ch / 32×32 out (2 chunks)** |
+| Depthwise conv | 3×3 no-bias; 3×3 pad=1+bias; partial TILE_M+3; dilation=2; stride=2 pad=1; batch=2; exact TILE_M×2 + bias; 5×5 kernel; asymmetric stride; 12ch 33×37 (odd runs, in_w % 8 ≠ 0); 3×3 s2 16ch 27×29 (unaligned x rows) |
+| Depthwise conv — oh-chunking | 32 ch / 32×32 out (one chunk at the current bound, as above) |
 | **Pixel pairs (§2.42)** | **3×3 s2 with odd (8×7) and even (6×8) out_w; out_w = 1 with 3 ic-tiles; ow-tiling with the tile width rounded to even (3×3 s2 in_w=128 → 30+30+4) and a 1×1 on in_w=130 (64+64+2); 3×3 s2 dilation 2 → 7×9; the space-to-depth stem 12ch 4×4 s1 pad [2,2,1,1] on 11×13; depthwise 1×1 (dummy position) and 3×3 s2 → 4×5; the sweep-bound 3×3 64→64 on 28×28 anchor** |
 | Saturation (ap_fixed only) | std positive overflow → AP_MAX; std negative overflow → AP_MIN; DW positive overflow → AP_MAX |
+| **MatMul on ConvKernel** (`run_matmul_case`, `run_matmul_heads_case`) | RTL fixtures: 1×2 s(1,2) N=40 K=64 M=48; 1×3 s(1,3) and 1×4 s(1,4) with 2 ow-tiles; 1×1 with 2 M-groups; 1×2 N=256 K=32 M=384 (2 oh-chunks). C-sim only: BERT-base classes (QKᵀ / P·V heads, 768-wide 1×2, FFN-down 1×3 with in_ch = 1024, 1×4 in_ch 768, 1×1 in_ch 1024), a saturating case, two offset-pointer head cases (neighbouring lanes checked untouched), 24 random lowered geometries (kw 1–4). Each also checks that the packed filter IS A and that the conv oracle equals the MatMul oracle |
 
 ---
 
@@ -585,13 +628,16 @@ weight input; no DSP impact.
 - Validates 4-D NCHW shapes for input, weight, bias, and output
 - Parses `group`, `strides`, `dilations`, `pads`, `auto_pad` (NOTSET/VALID/SAME_UPPER/SAME_LOWER)
 - Determines `is_depthwise`: group=1 → standard, group=in_ch → depthwise, otherwise rejected
-- Enforces `kh ≤ kMaxKH`, `kw ≤ kMaxKW`
+- Rejects layers that break the §3 runtime constraints (`in_ch`, `out_ch`, the dilated row / column spans, the padded accumulator row), with bounds from `_conv_hw_config.py` (the platform JSON's `kernels.conv`). `kh ≤ kMaxKH` / `kw ≤ kMaxKW` are not checked by `ConvNode` itself — only the dilated spans against the line buffer are — so a kernel larger than 7 in either axis currently passes validation
+- Packs the weight and bias initializers into the §2 tile-major DDR layout (`_pack_conv_weight`)
 
-**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case.
+**`MatmulConvNode` (`nodes.py`, chosen by `matmul_lowering.py`)** runs an ONNX `MatMul` on this kernel with swapped operand roles: for `C[N][M] = A[N][K]·B[K][M]`, `out_ch = N`, `in_ch = K/kw`, a `1 × kw` kernel with stride `(1, kw)`, no pad, no bias, `out_h × out_w = M`; `A` (row-major) is the weight, `B` the input. Eligibility: ap_fixed<16,8> graphs, `N > 1`, `K % 16 == 0`, `M % 8 == 0` and the §3 bounds; the engine choice (`--matmul-on-conv auto|always|off`) uses the cycle models in `cost_model.py`. Results are bit-identical to MatmulKernel. See doc/BERT_PLAN.md §2 2A.
+
+**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case. `run_conv_at()` is the same call with `x` / `weight` / `y` at element offsets into their buffers (no bias) — used for per-head MatMul-on-ConvKernel calls in attention.
 
 **Layout constraint (`_core.py`):** `ConvKernel` writes a flat NCHW output. If the output tensor feeds a broadcast `VectorOP` node that requires an advancing-strided layout (`n_chunks > 1`), the scheduler raises a `SchedulerError`. Per-channel bias must be passed as the Conv operator's 3rd input, not as a separate downstream `Add` node.
 
-**Reference simulation (`_simulate.py`):** `_conv2d_ref()` and `_depthwise_conv2d_ref()` implement float64 references matching kernel semantics (same padding, dilation, bias handling) for bit-accurate test comparison. Outputs are quantized via `dtype.truncate()` at node boundaries.
+**Reference simulation (`_simulate.py`):** `_conv2d_ref()` and `_depthwise_conv2d_ref()` implement float64 references matching kernel semantics (same padding, dilation, bias handling) for bit-accurate test comparison; a `MatmulConvNode` is simulated like a `MatmulNode`. Outputs are quantized via `dtype.truncate()` at node boundaries.
 
 ---
 
@@ -599,13 +645,20 @@ weight input; no DSP impact.
 
 ```bash
 # C simulation (GCC, no Vitis)
-make TestConvRef && ctest
+make TestConvRef TestConvGrid && ctest -R 'TestConv'   # TestConvRef, TestConvGrid, TestConvSweep
 
 # HLS synthesis + IP export for KV260
 make synthesize_conv_kv260
+
+# HLS synthesis + C/RTL co-simulation of TestConvSim.cpp (slow; separate component)
+make cosim_conv_kv260
+
+# RTL fixtures: regenerate (ad hoc) / run the xsim behavior test
+make gen_conv_test_data          # writes build/conv_test_data/
+make behavior_test_conv          # needs hw/cormorant_test_stand; reads hw/test_data/conv_test_data/
 ```
 
-The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, optional board and clock) and invokes Vitis HLS via `Synthesis.tcl.in`, which configures the project, sets 64-bit AXI and bus width, runs `csynth_design`, and exports an IP catalog archive.
+The synthesis target reads `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV260; the CMake fallback when `clock` is absent is 300) plus its `kernels.conv` bounds, generates `build/kernels/conv/kv260/Config.h` and `synthesize_kv260.tcl` from `Synthesis.tcl.in`, and runs Vitis HLS in the unified component flow (`open_component`): 64-bit AXI addresses (`config_interface -m_axi_addr64`), `-m_axi_max_widen_bitwidth` from the top-level `AXI_BUS_WIDTH` cache variable (the ports are declared 128-bit in C++; the hardware build configures with `-DAXI_BUS_WIDTH=128`), `csynth_design`, then `export_design` to `build/kernels/conv/kv260/ip_catalog.zip`.
 
 ---
 
@@ -614,13 +667,17 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | File | Purpose |
 |------|---------|
 | `kernels/conv/kernel/ConvKernel.cpp` | HLS kernel implementation |
-| `kernels/conv/include/ConvKernel.h` | Kernel declaration, `saturate_cast<T>` |
+| `kernels/conv/include/ConvKernel.h` | Kernel declaration, `saturate_cast<T>`, 128-bit port word types, packed weight / bias layout helpers (`conv_weight_index()` …), cosim depths |
+| `kernels/conv/include/ConvMacGrid.h` | MAC grid (`w_cache_read`, `mac_grid_column_step`, `mac_dw_step`) and weight-cache geometry, isolated from all tile geometry |
 | `kernels/conv/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, tile constants) |
-| `kernels/conv/test/TestConvSim.cpp` | C simulation tests (GCC) |
-| `kernels/conv/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
-| `kernels/conv/platforms/kv260.json` | KV260 platform config |
-| `inference-scheduler/src/nodes.py` | `ConvNode` class (ONNX → kernel params) |
-| `inference-scheduler/src/codegen/_source.py` | `run_conv()` code generation |
+| `kernels/conv/test/TestConvSim.cpp` | C simulation tests (GCC), `--dump-data` RTL fixtures, `--sweep N` |
+| `kernels/conv/test/TestConvGrid.cpp` | MAC-grid unit test |
+| `kernels/conv/scripts/Synthesis.tcl.in`, `Cosim.tcl.in` | Vitis HLS TCL templates (synthesis / synthesis + cosim) |
+| `platforms/kv260.json` | KV260 platform config (`kernels.conv` bounds, part, clock) |
+| `inference-scheduler/src/_conv_hw_config.py` | Scheduler-side read of `kernels.conv` |
+| `inference-scheduler/src/nodes.py` | `ConvNode` / `MatmulConvNode` classes (ONNX → kernel params, weight packing) |
+| `inference-scheduler/src/matmul_lowering.py`, `cost_model.py` | MatMul → ConvKernel eligibility, geometry and engine choice |
+| `inference-scheduler/src/codegen/_source.py` | `run_conv()` / `run_conv_at()` code generation |
 | `inference-scheduler/src/codegen/_core.py` | Conv node detection, layout validation |
 | `inference-scheduler/src/codegen/_simulate.py` | Float64 reference simulation |
 
@@ -630,7 +687,7 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 
 | Aspect | Details |
 |--------|---------|
-| **Supported ONNX op** | `Conv` (2-D, NCHW layout) |
+| **Supported ONNX op** | `Conv` (2-D, NCHW layout); `MatMul` lowered onto the kernel by the scheduler (§8) |
 | **Modes** | Standard (group=1), Depthwise (group=in_ch) |
 | **Data type** | `ap_fixed<16,8>` (default) or `float` |
 | **Accumulator type** | `ap_fixed<32,16>` (default) or `float` |
@@ -638,23 +695,24 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **Tiling** | kTileM=16 output channels × kTileIC=16 input channels (§2.40; 8 × 16 before) |
 | **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid × 2 output pixels: 2 × kTileIC × kTileM = 512 MACs/cycle against one weight word per column (§2.24, §2.40, §2.42) |
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel × 2 pixels: 2 × kTileM = 32 MACs/cycle (§2.42) |
-| **Initiation interval** | II=1 (all pipelined inner loops; see §5.5) |
+| **Initiation interval** | II=1 (all pipelined inner loops; see §5.7) |
+| **Clock** | 150 MHz synthesis target on the KV260 (`platforms/kv260.json`) |
 | **Dataflow stages** | 6 (x_row_loader, input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
-| **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into w_cache and reused across the spatial sweep; weight DDR replay across (oh, ow) eliminated |
+| **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into the weight cache (`w_lo` BRAM + `w_hi` URAM) and reused across the spatial sweep, the next slab prefetched into the other bank (§2.35); weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchPair` carries kTileIC lanes of TWO adjacent output pixels per beat (§2.12, §2.42); consumer patch drain is `kh·kw` beats per pixel pair |
 | **Patch buffer storage** | `patch0/1[kTileIC][kMaxKH][kMaxKW]` are banked register files (one per pixel of the pair) — kTileIC LUTRAMs each, partitioned on the bank dim, `(khi,kwi)` as RAM address (§2.18, §2.42) |
 | **Accumulator stream** | `acc_stream` carries 128-bit words of 8 saturated outputs of one channel (§2.38); `saturate_cast` applied at the Phase-3 drain, not the writer (§2.16) |
 | **Output drain rate** | 8 outputs per cycle: Phase 3 reads one 16-channel URAM word per two cycles (8 channels per cycle) through a segmented 8-bank rotated LUTRAM transposer (§2.38, §2.40) |
-| **Input fill rate** | 16 (standard) / 8 (depthwise) elements per cycle: `x_row_loader` drains 128-bit words into a ping-pong row buffer and emits one column of all channels per cycle (§2.39) |
-| **oh-chunking** | Auto-splits output along oh when `out_h·out_w·out_ch > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
+| **Input fill rate** | `x_row_loader` drains one 128-bit word (8 elements) per cycle into a ping-pong row buffer and, in the same loop, emits one 16-channel column per cycle; the producer writes that column into all 16 `line_buf` banks per cycle (§2.39) |
+| **oh-chunking** | Auto-splits output along oh when `out_h·out_w·ceil(out_ch/kTileM)·kTileM > kMaxAccPersistEntries`; (kh-1)·stride_h rows re-fetched at chunk boundaries |
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; tile width rounded to even (pair-aligned, §2.42); (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **Tile geometry** | oh-chunking / M-grouping / ow-tiling resolved once by `compute_conv_geometry()` and passed to every stage as a `ConvGeometry` struct — one shared divider set, not one per stage (§2.19) |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
-| **AXI-Lite registers** | 21 scalars |
+| **AXI-Lite registers** | 21 (4 DDR addresses + 17 scalars) |
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |
-| **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time) |
-| **Persistent acc constraint** | `out_w·out_ch ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
-| **Persistent acc storage** | `partial_outputs[]` bound to URAM (`bind_storage impl=URAM`) — off BRAM, into the idle URAM pool |
+| **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time; not checked by `ConvNode`, see §8) |
+| **Persistent acc constraint** | `out_w·ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
+| **Persistent acc storage** | `partial_outputs[]` bound to URAM (`bind_storage impl=URAM`, 512-bit words, 8 URAM blocks) |
 | **Line-buffer column constraint** | `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(in_w no longer capped — wider inputs auto-tiled along ow)* |
 | **Bias** | Optional 3rd DDR input; guarded by `has_bias` flag; padded to `roundup(out_ch, 8)` elements (whole 128-bit words) |
 | **Weight layout (standard)** | `[out_ch][ceil(in_ch/16)][kh][kw][16]` tile-major, 16-byte aligned (§2.32); last tile is 8 lanes when ≤ 8 channels remain (§2.34) |
@@ -663,5 +721,6 @@ The synthesis target reads `kernels/conv/platforms/kv260.json` (specifies part, 
 | **x / y ports** | `hls::burst_maxi<ap_uint<128>>` too (§2.38 / §2.39): NCHW layout unchanged, runs re-aligned in the kernel, y run ends written with byte strobes; buffers 16-byte aligned |
 | **AXI-Lite base address** | `0xA002_0000` |
 | **Driver prefix** | `xconvkernel` |
-| **UIO device name** | `ConvKernel_0` |
-| **Test coverage** | 59 named C-sim cases (58 RTL fixtures) + `TestConvGrid` + the 300-case random sweep |
+| **UIO device name** | `ConvKernel_0` (generated-code default, `INFERENCE_CONVKERNEL_INSTANCE`); the KV260 overlay `dts/kv260/cormorant.dts` names the node `fabric_conv` |
+| **Resources (csynth, post-§2.42)** | 127 BRAM18 (44 %), 48 URAM (75 %), 679 DSP (54 %) |
+| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 63 RTL fixtures) + `TestConvGrid` + the 300-case random sweep (`TestConvSweep`) |

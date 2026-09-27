@@ -6,12 +6,14 @@ on the KV260.  It reads an ONNX graph, validates that every operator can be
 executed by one of the supported hardware kernels, and emits a self-contained C
 project that drives the IP through the auto-generated Xilinx driver APIs.
 
-> **Full documentation** lives in
-> [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md)
-> and
-> [`inference-scheduler/doc/ARCHITECTURE.md`](../inference-scheduler/doc/ARCHITECTURE.md).
-> This file provides a quick orientation. For the DAG / event-stream /
-> liveness / slot-coloring algorithms in detail, see
+> This file is the technical reference for what the scheduler supports and
+> how (operator mapping, transformations, host ops, numerics, cache
+> coherency, multi-entry projects).  The user guide — CLI options, generated
+> project layout, C API walk-through, building, `report.md` — is
+> [`inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md);
+> codegen internals (node classes, layout engine, mixins) are in
+> [`inference-scheduler/doc/ARCHITECTURE.md`](../inference-scheduler/doc/ARCHITECTURE.md);
+> the DAG / event-stream / liveness / slot-coloring algorithms in
 > [`SCHEDULER_DAG.md`](../inference-scheduler/doc/SCHEDULER_DAG.md).
 
 ---
@@ -22,13 +24,20 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 |--------|-----------------|-------|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
 | **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster) |
-| **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias; also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
+| **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
 
 **Zero-cost transformations (no hardware call):**
-- `Reshape` — output pointer is aliased to the source buffer; no data copy.
+- `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity`
+  (`RESHAPE_OP_TYPES`) and a `Cast` within one storage kind — output
+  pointer is aliased to the source buffer; no data copy.
+- `Constant` — folded into an initializer at load time.
+- `Split` / `Slice` — contiguous, 64-byte-aligned pieces become sub-buffer
+  views ([§Host-CPU ops](#host-cpu-ops), "Slice views"); other pieces are
+  host copies.
 - `Gemm` — decomposed to `MatMul` + optional `Add` at model load time
-  (`alpha=1, beta=1, transA=0, transB=0` required).
+  (`alpha=1, beta=1, transA=0` required; `transB=1` is accepted for a
+  constant 2-D B, which is transposed offline into a `<B>_T` initializer).
 - `Relu` / `Clip(0,6)` after a VectorOP node — folded into that node's
   call via the kernel's `act` register (`run_op_act()`), when the producer's
   output has no other consumer and is not a graph output
@@ -91,8 +100,8 @@ python3 -m venv .venv
 .venv/bin/python test/gen_mixed_all_kernels_models.py
 .venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 .venv/bin/python test/gen_bert_models.py        # tiny BERT-like models (host ops, fusion)
-
 .venv/bin/python test/gen_llama_models.py       # tiny random Llama (decoder ops, exponents)
+# (or all of the above at once: .venv/bin/python test/gen_all_models.py)
 
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
@@ -102,7 +111,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite
+# Run the full test suite (1497 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -115,7 +124,11 @@ inference_scheduler.py          CLI, argument parsing
 └── src/
     ├── graph.py    OnnxGraph   load, shape inference, Gemm preprocessing,
     │                           tensor registry, node dispatch
+    ├── dtype.py    DataType    ap_fixed<W,I> / float32 encoding, rounding modes
+    ├── layout.py   TensorLayout  DMA buffer geometry (alloc, chunk, stride)
     ├── tensor.py   TensorInfo  weight encoding, C declarations
+    ├── kernels.py              KERNEL_REGISTRY: driver files, UIO defaults,
+    │                           inference_init() parameters per kernel
     ├── nodes.py                ScheduledNode  (VectorOPKernel)
     │                           MatmulNode     (MatmulKernel)
     │                           ConvNode       (ConvKernel)
@@ -141,11 +154,13 @@ inference_scheduler.py          CLI, argument parsing
     ├── cost_model.py           ConvKernel / MatmulKernel cycle estimates
     ├── schedule.py Dag         data-flow DAG: predecessors, successors,
     │                           topological order, independent pairs
+    ├── report.py               report.md (model summary, transformations, layers)
     └── codegen/    CodeGenerator
                     _core.py    event stream, tensor layout, DMA pool sizing,
                                 event-stream liveness intervals
                     _header.py  include/inference.h
                     _source.py  src/inference.c  (weights, init, run, kernel_wait)
+                    _buf_impl.py  src/inference_buf.c, scripts/check_inference_setup.sh
                     _simulate.py  fixed-point forward simulation
                     _test.py    test/test_inference.c  (on-device smoke test)
                     _cmake.py   CMakeLists.txt
@@ -884,7 +899,9 @@ to be plugged in without changing any other source file.
 typedef uint16_t Data_t;              // ap_fixed<16,8>
 #define INFERENCE_BYTES_PER_ELEM  2u
 #define INFERENCE_ALIGN_BYTES     16u
-#define INFERENCE_BUF_POOL_SIZE_BYTES  N
+#define INFERENCE_BUF_POOL_SIZE_BYTES  N   // advisory upper bound: every buffer incl. I/O,
+                                           // no slot reuse, 4 KiB-rounded
+#define INFERENCE_<TENSOR>_SIZE        N   // per graph input / output (alloc elements)
 
 // One per active kernel (only present kernels appear):
 int  inference_init(const char *vectoropkernel_instance
@@ -915,11 +932,13 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_HOST_THREADS=N` | `INFERENCE_HOST_THREADS=N` (1–64) | 4 | threads per host op (caller + N − 1 workers); models with host ops only |
 | `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
 
-BERT-base (`bertsquad-12-simplified.onnx`) for example:
+BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
+ConvKernel, 2 on MatmulKernel) for example:
 
 ```c
 int  inference_init(const char *vectoropkernel_instance,
-                    const char *matmulkernel_instance);
+                    const char *matmulkernel_instance,
+                    const char *convkernel_instance);
 void inference_run(inference_buf_t *unique_ids_raw_output_9_0,   /* int64 [1]      */
                    inference_buf_t *segment_ids_0,               /* int64 [1, 256] */
                    inference_buf_t *input_mask_0,                /* int64 [1, 256] */

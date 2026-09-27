@@ -9,24 +9,14 @@ For the high-level kernel description see [CONV_KERNEL.md](CONV_KERNEL.md);
 this file is a complement focused on the optimization arc and the current
 final architecture.
 
-> **Status (2026-05-16).**  §2.7 (weight streaming), §2.8 (PN/PM
-> parallel MACs + X-prop guard), §2.9 (oh-chunking), §2.10 (weight
-> caching + M-grouping), §2.11 (ow-tiling — lifted the in_w cap),
-> §2.12 (channel-packed patch stream), §2.13 (URAM accumulator),
-> §2.14 (unified patch producer), §2.15 (broadcast_patches
-> removal), §2.16 (`saturate_cast` moved to the writer), §2.17
-> (16×16 MAC operands), §2.18 (patch register file), §2.19
-> (tile-geometry hoist), and §2.20 (STABLE arguments) are written
-> up against measured `conv-verify` snapshots.
-> §2.1–§2.6
-> still have TODO cells — structural outlines reflect the optimisation
-> passes visible in the current source (dataflow stages in
-> `csynth.rpt`, the Option-A IC-tiling design in `Config.h.in`, the
-> existing branch history `conv_optimisation_1..3`); per-step numbers
-> and rationale for those earlier steps need to come from the commit
-> history and the original author's notes.  The URAM
-> *double-buffer* rework (CONV_DOUBLE_BUFFER_PLAN.md) is dropped — its
-> goals were met by §2.10/§2.12/§2.13 (see §6.2).
+> **Status (2026-09-27).**  The log runs through §2.42 (two output pixels per
+> cycle, 512 MACs/cycle) plus the MatMul-on-ConvKernel test geometries
+> (BERT_PLAN 2A); the kernel has not changed since 2026-09-25.  §3
+> (architecture) and §4 (knobs) are current; §6.3/§6.4 hold the latest board
+> numbers.  §1's first callout, §5, §6 before §6.3, §7 and the TODO rows of §8
+> are frozen at the §2.12–§2.20 state (30 RTL tests; today 63/63 RTL) and are
+> kept as history.  The URAM double-buffer plan was dropped (§6.2); w_cache
+> ping-pong landed instead as §2.35.
 
 ---
 
@@ -173,7 +163,7 @@ that loads `bias_buf[kMaxOutCh]` once per `ni` and replays it in
 `gmem1` DDR transfer was serialised with the patch read, the
 partial-accumulator read/write, and the accumulate loop — every inner
 iteration paid the full weight-load latency before MACs could start.
-This was "Bottleneck A" of [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md)
+This was "Bottleneck A" of the (unpublished, dropped) double-buffer plan
 §1, but achievable without the URAM rework.
 
 **Change.**
@@ -2631,8 +2621,8 @@ measurement that ruled them out.
 
 ### 6.2. Dropped: double-buffered URAM weight slab
 
-See [CONV_DOUBLE_BUFFER_PLAN.md](CONV_DOUBLE_BUFFER_PLAN.md).  The
-plan's headline goals have already been met by other steps: §2.7
+The plan (a loop-inverted, double-buffered URAM weight slab; never
+committed) is dropped.  Its headline goals have already been met by other steps: §2.7
 captured the *overlap* portion of "Bottleneck A", §2.8 captured the
 inner-MAC parallelism, §2.9 relaxed the output-buffer constraint,
 §2.10 eliminated the spatial weight replay (via the (ict, ow_tile,

@@ -16,55 +16,76 @@ Key configure-time cache variables:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `AXI_BUS_WIDTH` | 32 | m_axi master data width (32/64/128/256/512) |
+| `AXI_BUS_WIDTH` | 32 | `-m_axi_max_widen_bitwidth` cap (32/64/128/256/512) for HLS auto-widening of plain-pointer ports (only MatmulKernel `c`, which stays 16-bit); the `burst_maxi` data ports are 128-bit by declaration. `build_hw_kv260` expects `-DAXI_BUS_WIDTH=128` |
 | `AXI_PLATFORM` | `kv260` | Platform whose `platforms/<name>.json` bounds drive the C-sim `Config.h` |
-| `<K>_DATA_TYPE` etc. | per kernel | Element / accumulator types and tile sizes (see each kernel's `CMakeLists.txt`) |
+| `VA_DATA_TYPE`, `CONV_DATA_TYPE` / `CONV_ACC_DATA_TYPE`, `MM_DATA_TYPE` / `MM_ACC_DATA_TYPE`, `POOL_DATA_TYPE` / `POOL_ACC_DATA_TYPE` | `ap_fixed<16,8>` / `ap_fixed<32,16>` | Element / accumulator types. Tile sizes and bounds are not cache variables — they come from the platform JSON ([PLATFORM_CONFIGURATION.md](PLATFORM_CONFIGURATION.md)) |
+| `VA_ENABLE_VITIS_FLOW` | `OFF` | VectorOPKernel Vitis `hw` / `hw_emu` xclbin targets (needs an installed Vitis platform, `VA_PLATFORM`) |
 
 Synthesis / cosim / hardware targets require **Vitis 2025.2** — source
-`settings64.sh` before invoking them.
+`settings64.sh` before invoking them. The C-simulation targets need only
+the Vitis HLS headers (`ap_fixed.h`, `ap_int.h`, `hls_burst_maxi.h`, found
+via `$XILINX_HLS` / `$XILINX_VITIS` or `/mnt/data/xilinx/2025.2/Vitis/include`):
+every kernel header includes them unconditionally, so the CMake `float`
+fallback taken when they are missing no longer compiles.
 
 ---
 
 ## Kernel libraries
 
-Static libraries — intermediate build products, linked by the test and
-synthesis targets. Rarely built directly.
+Static libraries — intermediate build products, linked by the test
+targets. Rarely built directly.
 
 | Target | Description |
 |--------|-------------|
-| `vadd_kernel` | VectorOPKernel object library |
-| `conv_kernel` / `conv_kernel_float` | ConvKernel — configured type / forced-`float` builds |
+| `vadd_kernel` | VectorOPKernel library |
+| `conv_kernel` | ConvKernel — configured type (`ap_fixed<16,8>` by default) |
 | `matmul_kernel` | MatmulKernel — configured type (`ap_fixed<16,8>` by default) |
 | `pool_kernel` / `pool_kernel_float` | PoolingKernel — configured type / forced-`float` builds |
 
-The `*_float` variants force `Data_t=float` regardless of HLS availability;
-they back the BLAS oracle tests.
+`pool_kernel_float` forces `Data_t=float` regardless of HLS availability;
+no test target links it.  ConvKernel and MatmulKernel have no float
+variant: their 128-bit ports pack 16-bit elements, so the kernels only
+build with a 16-bit `Data_t` (`TestMatmulBlas` drives the configured
+`matmul_kernel`).
 
 ---
 
 ## C-simulation tests
 
-Compile and run with plain GCC — no Vitis, no hardware.
+Compile and run with GCC against the Vitis HLS headers — no Vitis tools,
+no hardware.
 
 | Target | Kernel | Description |
 |--------|--------|-------------|
-| `TestSimulation` | VectorOPKernel | All 6 ops across sizes + saturation cases |
-| `TestConvRef` | ConvKernel | Kernel vs naive reference oracle |
+| `TestSimulation` | VectorOPKernel | All 6 ops across sizes + saturation cases + broadcast / stride-0 / `act` geometry cases |
+| `TestConvRef` | ConvKernel | Kernel vs naive reference oracle; also registered as the CTest test `TestConvSweep` (`TestConvRef --sweep 300`, randomised geometries, ~1 min) |
+| `TestConvGrid` | ConvKernel | MAC-grid unit test on `include/ConvMacGrid.h` alone |
 | `TestMatmulRef` | MatmulKernel | Kernel vs `ref_matmul` oracle, all shape cases |
 | `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolingSim` | PoolingKernel | Max/Average/Lp pooling + global variants |
 
 | Aggregate | Description |
 |-----------|-------------|
-| `run_tests` | Builds every C-sim test executable above |
-| `test` | Runs them via CTest (equivalent to `ctest`) |
+| `run_tests` | Builds `TestSimulation`, `TestConvRef`, `TestMatmulRef`, `TestPoolingSim` (and `TestMatmulBlas` when present), then runs `ctest --output-on-failure` |
+| `test` | Runs the CTest tests without rebuilding (equivalent to `ctest`) |
+
+CTest registers seven tests: `TestSimulation`, `TestConvRef`,
+`TestConvGrid`, `TestConvSweep`, `TestMatmulRef`, `TestMatmulBlas` (only
+with BLAS) and `TestPoolingSim`. `run_tests` does not list `TestConvGrid`
+as a dependency — build it with `make` / `make TestConvGrid` first.
 
 ---
 
 ## HLS synthesis
 
 C synthesis + Vivado IP-catalog export, one component per kernel. Requires
-Vitis HLS. Output IP lands under `build/kernels/<k>/<platform>/<k>_<platform>/hls/impl/ip`.
+Vitis HLS. Target clock is the platform JSON's `clock` (150 MHz for
+`kv260`). The exported archive lands in `build/kernels/<k>/<platform>/ip_catalog`;
+the IP directory the test stand uses is
+`build/kernels/<k>/<platform>/<k>_<platform>/hls/impl/ip` for conv / matmul /
+pool (Vitis unified component flow) and
+`build/kernels/vectorop/<platform>/vadd_<platform>/solution1/impl/ip` for
+VectorOPKernel (legacy `open_project` flow).
 
 | Target | Description |
 |--------|-------------|
@@ -107,14 +128,26 @@ Re-run a C-sim test in `--dump-data` mode to emit hex fixtures
 | `gen_matmul_test_data` | MatmulKernel HDL fixtures |
 | `gen_pool_test_data` | PoolingKernel HDL fixtures |
 
+Output goes to `build/<dir>/` (`vectorop_test_data`, `conv_test_data`,
+`matmul_test_data`, `pool_test_data`; override with the `VA_` / `CONV_` /
+`MATMUL_` / `POOL_TEST_DATA_DIR` cache variables). The targets exist only
+when the Vitis HLS headers are found (VectorOPKernel: only for a 16-bit
+`ap_fixed` `VA_DATA_TYPE`). The behaviour tests do **not** read these —
+they use the checked-in goldens under `hw/test_data/`
+(`vecop_test_data`, `conv_test_data`, `matmul_test_data`,
+`pool_test_data`), so regenerated fixtures must be copied there.
+
 ---
 
 ## RTL behavior tests
 
 Drive the per-kernel `cormorant_test_stand` Vivado project through its xsim
 flow with the freshly-built IP catalogue and the checked-in golden fixtures
-under `hw/test_data/`. Requires Vitis and the `hw/cormorant_test_stand`
-submodule.
+under `hw/test_data/`. Requires Vivado 2025.2 and the
+`hw/cormorant_test_stand` submodule. The scoreboard is written to
+`build/kernels/<k>/kv260/<test-stand name>_test_report.json` and
+`cmake/check_test_report.py` turns its `summary.all_passed` into the
+target's exit code.
 
 | Target | Description |
 |--------|-------------|
@@ -135,7 +168,7 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 
 | Target | Description |
 |--------|-------------|
-| `synthesize_kv260` → `build_hw_kv260` | `build_hw_kv260` builds the Vivado hardware design; depends on `synthesize_kv260` |
+| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`; configure with `-DAXI_BUS_WIDTH=128` |
 | `sim_hw_kv260` | Hardware-level simulation of the integrated design |
 | `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260 |
 

@@ -1,12 +1,12 @@
 # MNIST KV260 demo
 
 End-to-end MNIST inference demo for the KV260 FPGA platform.  Downloads the
-MNIST test split and two pre-trained ONNX models (an MNIST convnet and a
-LeNet variant) from a shared Google Drive folder, generates a self-contained
-KV260 inference project for each model with `inference-scheduler`, copies
-in the HLS driver sources, builds the project on the board over SSH, and
-runs a benchmark that reports top-1 accuracy and per-image latency for
-each.
+MNIST test split (from the `ossci-datasets` S3 mirror of LeCun's files) and
+two pre-trained ONNX models (an MNIST convnet and a LeNet variant) from a
+shared Google Drive folder, generates a self-contained KV260 inference
+project for each model with `inference-scheduler`, copies in the HLS driver
+sources, builds the project on the board over SSH, and runs a benchmark
+that reports top-1 accuracy and per-image latency for each.
 
 ```mermaid
 flowchart LR
@@ -33,10 +33,12 @@ demo/mnist/
 │   ├── data/                       — MNIST IDX files
 │   └── models/                     — ONNX files from Google Drive
 └── build/                          — generator output and results.json
+    ├── projects/projects.json      — summary of the generated projects (read by deploy)
     ├── projects/<model>/           — generated CMake project per model
     │   ├── CMakeLists.txt          —   patched to build bench_mnist
-    │   ├── include/inference.h     —   from inference-scheduler
+    │   ├── include/inference*.h    —   from inference-scheduler
     │   ├── src/inference*.c        —   from inference-scheduler
+    │   ├── weights/*.dat           —   large weight tensors, read at runtime
     │   ├── driver/                 —   HLS driver sources copied in
     │   └── test/
     │       ├── bench_mnist.c       —   copied from demo/mnist/src/
@@ -65,19 +67,22 @@ static: the I/O names and active-kernel set differ per model.
   ```bash
   # from the repo root
   mkdir -p build && cd build
-  cmake -DAXI_BUS_WIDTH=32 ..
+  cmake ..
   make synthesize_kv260
   ```
 
-  `AXI_BUS_WIDTH` must match the AXI master width of the cormorant overlay
-  loaded on the board; the sample numbers below were measured at 32-bit.
+  The driver sources only describe the kernels' AXI-Lite registers, so they
+  are the same for every `AXI_BUS_WIDTH`; the bitstream on the board is the
+  128-bit block design (`-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`), which
+  the sample numbers below were measured with.
   The default `mnist_config.json.example` assumes the standard build paths;
   override `local.driver_dirs` if you keep the build elsewhere.
 
 ### KV260 board
 
-* Linux with the cormorant overlay loaded (so the four UIO devices appear).
-  Verify on the board:
+* Linux with the cormorant bitstream and overlay loaded
+  (`inference-scheduler/upload_bitstream.py`, see the root README), so the
+  four UIO devices appear.  Verify on the board:
 
   ```bash
   cat /sys/class/uio/uio*/name
@@ -240,10 +245,12 @@ Notable behaviour visible in the run:
   final classifier is a 1×1 `Conv` rather than a fully-connected layer.
   `generate_project.py` emits a different `bench_glue.h` for each so
   `inference_init()` gets the right number of UIO arguments.
-- **`mnist_lenet` writes large weights to `weights/`.** The 1024×64×7×7
-  fully-connected-equivalent `Conv` weight (~3 MB) and friends exceed
-  the inline-array threshold, so they end up as external `.dat` files
-  loaded at runtime by `fread()`.
+- **Large weights go to `weights/`.** Tensors over the inline-array
+  threshold end up as external `.dat` files loaded at runtime by
+  `fread()`: all four `mnist_lenet` conv weights (the 1024×64×7×7
+  fully-connected-equivalent `Conv` weight alone is 6.4 MB) and the
+  convnet's `MatMul` weight.  (The transcript above predates the current
+  scheduler, which writes 4 LeNet weights instead of 3.)
 - The full per-image timing series is also written to
   `build/results.json`.
 
@@ -251,13 +258,15 @@ Notable behaviour visible in the run:
 
 | Flag | Effect |
 |------|--------|
-| `--models lenet` | restrict generate/deploy to a subset of models |
+| `--models mnist_lenet` | restrict generate/deploy to a subset of models (names from `models[].name`) |
 | `--skip-download` | reuse cached MNIST + ONNX files |
+| `--skip-generate` | reuse the generated projects under `build/projects/` |
 | `--skip-deploy` | only regenerate the local CMake projects |
 | `--force-download` | re-fetch all assets |
 | `--check-only` | run preflight checks for every stage and exit (no SSH uploads, no inference) |
+| `--profile-layers` | build with `INFERENCE_PROFILING=ON` and print the per-layer wall-clock stats (also `run.profile_layers`) |
 | `--no-cleanup` (deploy script) | keep the remote work_dir for inspection |
-| `--verbose` | print full build / run output for failed steps |
+| `--verbose` | also print the cmake / make output of steps that succeed (a failed step always prints its output) |
 
 Each script also accepts `--check-only` on its own, useful for quickly
 verifying just one stage:
@@ -285,6 +294,9 @@ Edit `mnist_config.json`:
   10 000-image test set.
 * **`run.warmup`** — how many inferences to discard before the timed window.
 * **`run.use_sudo`** — set to `false` if you SSH in directly as root.
+* **`run.env`** — environment variables forwarded to `bench_mnist` on the
+  board (e.g. the `INFERENCE_DDR_*` profiler overrides, see
+  [`doc/PROFILER.md`](../../doc/PROFILER.md)).
 * **`remote.cmake_args`** — extra `-D…` flags forwarded to the cross-build,
   e.g. `["-DBENCH_INPUT_BIAS=-128"]` if your model expects centred input.
 

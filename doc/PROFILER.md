@@ -13,10 +13,12 @@ the inference loop runs on the KV260:
 It is **opt-in at compile time** via a single CMake option and degrades
 to zero-cost no-ops when off.  The two modules can be linked
 independently into any host application that uses the generated
-`inference` library — they are not specific to the MNIST demo.
+`inference` library — the MNIST, image-classification, BERT-SQuAD and
+chat benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
+`llm_bench.c`) all use them.
 
 > Companion docs:
-> [`inference-scheduler/doc/INFERENCE_SCHEDULER.md`](../inference-scheduler/doc/INFERENCE_SCHEDULER.md) (codegen),
+> [`inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md) (codegen),
 > [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md) (correctness/perf harnesses).
 
 ---
@@ -40,9 +42,9 @@ flowchart TB
 
 Three pieces:
 
-1. **`inference_prof`** — flat-API per-layer aggregator (`init/reset/begin/end/dump_json/deinit`).  Codegen wraps every kernel-backed node call with `INFERENCE_PROF_BEGIN(idx)` / `INFERENCE_PROF_END(idx)`.  Counters are aggregate-only (count / total_ns / min_ns / max_ns) plus a per-layer `begin_ns` slot for overlapping brackets — no sample reservoir, ~40 B per layer.
+1. **`inference_prof`** — flat-API per-layer aggregator (`init/reset/begin/end/dump_json/deinit`).  Codegen wraps every kernel-backed node call and every host-CPU node (SpaceToDepth, `HostNode`) with `INFERENCE_PROF_BEGIN(idx)` / `INFERENCE_PROF_END(idx)`; zero-cost alias nodes (Reshape, Slice views, …) get a name but no bracket, so they report `calls = 0`.  Counters are aggregate-only (count / total_ns / min_ns / max_ns) plus a per-layer `begin_ns` slot for overlapping brackets — no sample reservoir, ~40 B per layer.
 2. **`inference_ddr`** — dispatcher that walks a vtable registry of platform backends (`probe → start → sample* → stop → read_counts → dump_json`).  The first backend whose `probe()` succeeds wins; one env var skips probing.
-3. **Codegen integration** — emits a `static const char *const inference_layer_names[N]` table next to the kernel-driver instances, plus `inference_num_layers()` / `inference_layer_names_ptr()` accessors.  Layer names use `onnx_node.name` when present, falling back to `op_type_index`; collisions are resolved by suffixing every collider with `_index`.
+3. **Codegen integration** — emits a `static const char *const inference_layer_names[N]` table next to the kernel-driver instances, plus `inference_num_layers()` / `inference_layer_names_ptr()` accessors.  Layer names use `onnx_node.name` when present, falling back to `op_type_index`; collisions are resolved by suffixing every collider with `_index`.  A multi-entry project (`--entry NAME=MODEL.onnx`) has one table covering all entries; entry `NAME` starts at `INFERENCE_ENTRY_<NAME>_FIRST_LAYER`.
 
 ---
 
@@ -118,10 +120,11 @@ calls them directly. Brackets are placed by the event-stream walker:
 `PROF_BEGIN(N)` immediately precedes the (non-blocking) `Start` of node
 `N`, and `PROF_END(N)` is emitted right after the matching
 `kernel_wait` that drains `N`'s lane (or after the helper itself for
-synchronous nodes whose helper polls internally — currently only
-`run_matmul_at`). This means each layer's recorded duration is the
-true wall-clock from "Start fired" to "lane drained", even when the
-brackets of other layers overlap with it.
+synchronous nodes whose helper polls internally — currently only the
+4D×3D MatMul outer loop over `run_matmul_at`). Host-CPU nodes run
+inline and are bracketed around their own code. This means each
+layer's recorded duration is the true wall-clock from "Start fired" to
+"lane drained", even when the brackets of other layers overlap with it.
 
 ### DDR bandwidth
 
@@ -141,9 +144,10 @@ records the diagnostic.
 
 `sample()` exists to fold 32-bit hardware counter deltas into 64-bit
 software accumulators before the hardware wraps.  Calling it once per
-inference (≈21 ms for MNIST convnet) is sufficient for any reasonable
-DDR bandwidth.  Backends with native 64-bit counters expose a no-op
-`sample()` and can be ignored.
+inference is sufficient as long as one inference is shorter than the
+counter wrap period (~0.5–1 s at full DDR bandwidth, see
+[Counter overflow](#counter-overflow)).  Backends with native 64-bit
+counters leave `sample` NULL and the call is a no-op.
 
 ### Codegen accessors
 
@@ -151,6 +155,7 @@ DDR bandwidth.  Backends with native 64-bit counters expose a no-op
 unsigned             inference_num_layers(void);
 const char *const   *inference_layer_names_ptr(void);
 #define INFERENCE_NUM_LAYERS  N    /* baked into inference.h */
+#define INFERENCE_ENTRY_<NAME>_FIRST_LAYER  k   /* multi-entry projects only */
 ```
 
 Always emitted, even when profiling is disabled — host code that wants
@@ -188,9 +193,9 @@ typedef struct ddr_backend {
 
 ### Adding a backend
 
-1. Drop `runtime/ddr/<name>.c` exporting `const ddr_backend_t inference_ddr_backend_<name>` with all eight function pointers populated.
+1. Drop `runtime/ddr/<name>.c` exporting `const ddr_backend_t inference_ddr_backend_<name>` with `name` and the function pointers populated (`sample` and `describe` may be NULL).
 2. Add `extern const … inference_ddr_backend_<name>;` plus a registry entry to `BACKENDS[]` in `runtime/inference_ddr.c`.
-3. Add the file to `runtime_files` in `inference_scheduler.py` so it gets copied into the generated project.
+3. Add the file to `runtime_files` in `inference_scheduler.py` and to the runtime-file list in `MultiEntryGenerator.write_project()` (`src/codegen/multi.py`) so it gets copied into single- and multi-entry projects.
 
 The CMake glob in `_cmake.py` picks up any new `src/ddr/*.c` automatically; no other edits needed.
 
@@ -392,7 +397,9 @@ overrides `cfg.run.profile_layers` to true for that run.
 
 ### Reporting
 
-Per-model summary printed to stderr:
+Per-model summary printed by `deploy_and_run.py` (example from a
+2026-05 bitstream; the current one runs `mnist_convnet` at 0.266 ms —
+see `demo/mnist/README.md`):
 
 ```
 accuracy = 98.92%   mean = 4.548 ms   throughput = 219.9 img/s
@@ -434,9 +441,10 @@ Empty input + collision examples:
 | `["dup","dup"]`    | `["dup_0","dup_1"]`   |
 | `["","tail"]`      | `["Relu_0","tail"]`   |
 
-The result feeds the static `inference_layer_names[]` array; the C side
-escapes the strings on emit (handles `"`, `\`, `\n`, `\r`, `\t`, control
-chars via `\uXXXX`).
+The result feeds the static `inference_layer_names[]` array.  Codegen
+escapes each name into a C string literal (`"`, `\`, `\n`, `\r`, `\t`,
+other control chars as `\xNN`), and `inference_prof_dump_json()` escapes
+it again for JSON (control chars as `\u00XX`).
 
 ---
 
@@ -494,8 +502,9 @@ Xilinx APM metric counters are 32 bits, byte-counted.  At ZU+ DDR
 bandwidth (~4–8 GB/s), the counter wraps every ~0.5–1 second.
 `inference_ddr_sample()` reads each counter, computes the unsigned
 32-bit delta against the previous sample, and adds it to a 64-bit
-accumulator.  Calling sample() once per inference (≈21 ms for MNIST) is
-two orders of magnitude faster than wrap.
+accumulator.  Calling sample() once per inference is enough while an
+inference is shorter than the wrap period; a host running longer
+inferences at high bandwidth should call it more often.
 
 ### Aggregate-only profiling
 
@@ -544,13 +553,17 @@ inference-scheduler/runtime/
 inference-scheduler/test/
 ├── test_profiling.py        codegen wrap + name-resolution tests (12)
 ├── test_runtime_prof.py     per-layer unit tests via subprocess  (8)
-└── test_runtime_ddr.py      DDR failure-path unit tests          (6)
+├── test_runtime_ddr.py      DDR failure-path unit tests          (6)
+├── test_profiler_overlap.py overlapping-bracket regression       (5)
+└── c/profiler_overlap_harness.c  C driver for the overlap test
 
 inference-scheduler/src/codegen/
-├── _core.py                 _layer_display_names() lives here
+├── _core.py                 _layer_display_names(), event stream
 ├── _header.py               INFERENCE_NUM_LAYERS + accessors decls
 ├── _source.py               static names table + PROF_BEGIN/END wrap
-└── _cmake.py                INFERENCE_PROFILING option + glob
+├── _cmake.py                INFERENCE_PROFILING option + glob
+└── multi.py                 multi-entry projects: runtime-file copy,
+                             INFERENCE_ENTRY_<NAME>_FIRST_LAYER
 
 demo/mnist/
 ├── src/bench_mnist.c        host integration
@@ -575,7 +588,8 @@ To add a Versal NoC DDRMC backend (vaitrace-style):
    place it in `BACKENDS[]` in priority order (most-specific first).
 3. **`inference-scheduler/inference_scheduler.py`** — add
    `("ddr/versal_ddrmc.c", "src/ddr/versal_ddrmc.c")` to
-   `runtime_files`.
+   `runtime_files`, and the same pair to the runtime-file list in
+   `src/codegen/multi.py::MultiEntryGenerator.write_project()`.
 4. **Tests** — extend `runtime/test/test_inference_ddr.c` with a
    `versal_ddrmc_disabled_via_env` scenario; the existing failure-path
    tests already cover the dispatcher.

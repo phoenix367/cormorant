@@ -68,8 +68,9 @@ demo/bert_squad/
 
 ### Host
 
-* The scheduler's virtualenv (`inference-scheduler/.venv`, see the top-level
-  `CLAUDE.md`): numpy, onnx, paramiko.  All commands below use it.
+* The scheduler's virtualenv (`inference-scheduler/.venv`, from
+  `inference-scheduler/requirements.txt`, see the root README): numpy,
+  onnx, paramiko.  All commands below use it.
 * HLS driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
   `build/`: `make synthesize_vectorop_kv260 synthesize_matmul_kv260
   synthesize_conv_kv260`).
@@ -80,10 +81,12 @@ demo/bert_squad/
 
 * The all-kernels bitstream, loaded with `fabric_vecop` / `fabric_matmul` /
   `fabric_conv` UIO devices.  With the scheduler's default
-  `--matmul-on-conv auto` every MatMul with K ≥ 16 runs on ConvKernel; with
-  `--no-matmul-on-conv` (phase 1) MatmulKernel needs `kernels.matmul.max_k`
-  ≥ 3072 (the FFN down-projection has K = 3072; `platforms/kv260.json` has
-  4096).
+  `--matmul-on-conv auto` (what `generate_project.py` uses) 96 of the 98
+  MatMuls run on ConvKernel; the K = 2 token-type MatMul and the M = 2
+  span head stay on MatmulKernel.  With `--no-matmul-on-conv` (phase 1; a
+  scheduler CLI option, not exposed by `generate_project.py`) MatmulKernel
+  needs `kernels.matmul.max_k` ≥ 3072 (the FFN down-projection has
+  K = 3072; `platforms/kv260.json` has 4096).
 * `gcc`, `cmake ≥ 3.19`, `make`, XRT, root or passwordless `sudo`.
 * ~220 MiB of free CMA (the pool BO is 215 MiB) and 210 MB of disk for the
   persistent weights directory.
@@ -109,9 +112,10 @@ curl -L -o assets/models/bertsquad-12.onnx \
   --input-shape segment_ids:0=1,256 --input-shape unique_ids_raw_output___9:0=1
 ```
 
-The download is 435 852 736 bytes; the simplified model (414.8 MB, md5
-`f6818d482d18e703fbd8d7c3b609a98a`) is the file the results below were
-measured with.  Any other location works — set `model` in the config.
+The download is 435 852 736 bytes; the simplified model (434 997 241
+bytes, md5 `f6818d482d18e703fbd8d7c3b609a98a`) is the file the results
+below were measured with.  Any other location works — set `model` in the
+config.
 
 ## Run
 
@@ -125,12 +129,18 @@ $PY scripts/prepare_inputs.py           # 50 questions -> assets/preprocessed/
 $PY scripts/generate_project.py         # -> build/project/ (~30 s, 3 GB RAM)
 $PY scripts/deploy_and_run.py --n 20 --profile-layers
 $PY scripts/deploy_and_run.py           # all 50, no profiling
-# or: $PY run_demo.py [deploy_and_run options]
+# or: $PY run_demo.py [--regenerate] [deploy_and_run options]
 ```
+
+`run_demo.py` runs `prepare_inputs.py` and `generate_project.py` only when
+their outputs are missing (`--regenerate` forces both) and forwards every
+other option to `deploy_and_run.py`.
 
 ## Sample run
 
-Host `demo/bert_squad`, board at `192.168.100.8` (KV260, Ubuntu 22.04,
+**Phase 1** (2026-09-26: every MatMul on MatmulKernel, host ops unoptimised
+— the current schedule is 12.5× faster, see *Results* below).  Host
+`demo/bert_squad`, board at `192.168.100.8` (KV260, Ubuntu 22.04,
 MatmulKernel `max_k` 4096 bitstream, 100 MHz), first 50 single-window
 questions prepared.  The first run uploaded the weights (76 files, 217 MB,
 121 s); this is the second one (`--n 20 --profile-layers`):
@@ -244,7 +254,8 @@ on all 50, so the board's accuracy *is* the emulation's (the 60-question
 study set of `doc/BERT_PLAN.md` §3: float 93.3 / 96.5, emulation
 93.3 / 97.1).
 
-**Latency** — 12.13 s per inference (min 12.128 s, max 12.134 s over 50;
+**Latency, phase 1** (every MatMul on MatmulKernel) — 12.13 s per
+inference (min 12.128 s, max 12.134 s over 50;
 profiling adds < 0.1 %), `inference_init` 0.3 s with the weights in the
 page cache.  Per-layer profile, per inference:
 
@@ -292,6 +303,7 @@ Per inference:
 | Flag | Effect |
 |------|--------|
 | `--n N` | run the first N prepared examples (default: all) |
+| `--warmup N` | warm-up inferences before timing (default `run.warmup`, 1) |
 | `--profile-layers` | build with `INFERENCE_PROFILING=ON`; per-kind breakdown + top layers |
 | `--top K` | layers listed with `--profile-layers` (default 15) |
 | `--no-smoke` / `--smoke-only` | skip / only run the generated `test_inference` |
@@ -341,9 +353,11 @@ board logits differ from the simulation, 1 = a step failed.
   position, the order of a stable argsort — the former `np.argsort` gave the
   same spans on every real logit set checked, see `demo/chat/README.md`).
 * **Bit-exactness.**  The host ops compute in double with
-  `-ffp-contract=off` and libm's `exp` / `tanh`, round half to even on
-  write-back; the scheduler's simulation mirrors that in numpy with Python's
-  `math` (the host's glibc).  The kernels are exact integer arithmetic.
+  `-ffp-contract=off` and libm's `exp` / `tanh` (since phase 2B GELU and
+  Softmax's `exp` are 65 536-entry tables filled at init with the same
+  formulas), round half to even on write-back; the scheduler's simulation
+  mirrors that in numpy with Python's `math` (the host's glibc).  The
+  kernels are exact integer arithmetic.
 * **Weights** stay in `build/project/weights/` locally and are not part of
   the per-run upload; `INFERENCE_WEIGHTS_DIR` points the board build at the
   persistent copy.

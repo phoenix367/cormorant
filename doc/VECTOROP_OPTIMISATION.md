@@ -268,9 +268,9 @@ under 1.5 ns per element instead of the baseline's ~49 cycles per run
 words) 106.8 µs, `RELU` 57.9 µs; the stride-0 replay (2 048) and re-read
 (2 100) paths and the 2-piece read / write runs all pass.
 
-**Board.**  Not measured here (the coordinator integrates the bitstream);
-the projection from THROUGHPUT_PLAN.md §4 is ADD 256K 2.65 → ~0.8–0.95 ms,
-RELU 64K 0.67 → ~0.12–0.17 ms, MUL bcast 12544×16 6.1 → ~0.3 ms.  In
+**Board.**  Not measured here (the coordinator integrates the bitstream;
+superseded by the on-board measurement below); the projection from
+THROUGHPUT_PLAN.md §4 is ADD 256K 2.65 → ~0.8–0.95 ms, RELU 64K 0.67 → ~0.12–0.17 ms, MUL bcast 12544×16 6.1 → ~0.3 ms.  In
 `hw/cormorant_hw_128` the `VectorOPKernel_0` instance parameters
 `C_M_AXI_GMEM0/1/2_DATA_WIDTH` must be set to 128 (the new IP defaults)
 after the IP upgrade — an upgrade keeps user-set values (§2.36) — and the
@@ -325,5 +325,6 @@ round to 64 bytes so the whole-word tail write stays inside the allocation.
 18 new tests (`test/test_act_fusion.py`): 1 324 pass.  ResNet-18's residual
 `Add → Relu` pairs and every `Add → Clip` become one pass each once the
 demo projects are regenerated with the CLI default (the demos'
-`generate_project.py` call `OnnxGraph()` directly and need `fuse_act=True`).
+`generate_project.py` call `OnnxGraph()` directly and need `fuse_act=True`
+— since done: every demo generator under `demo/` passes it).
 

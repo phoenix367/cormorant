@@ -1,5 +1,14 @@
 # ConvKernel: 2-D parallel processing plan (v2)
 
+> **Status (2026-09-27): executed and superseded.**  Steps 0–7 landed as
+> CONV_OPTIMISATION.md §2.22–§2.35 (§7a).  THROUGHPUT_PLAN Track B added
+> §2.37–§2.39, and RESNET18_15FPS_PLAN.md grew the grid past this plan:
+> 16×16 (`tile_m` 16, §2.40), flat standard sweep (§2.41), two output pixels
+> per cycle = 512 MACs (§2.42).  Of §7a's open items, kTileM 8→16 is done and
+> the 2-element drain was superseded by §2.38; the min-chunks policy is still
+> open.  §8 risk 6 went the other way: MatMuls now run on ConvKernel
+> (BERT_PLAN.md 2A).  Current design: CONV_KERNEL.md and CONV_OPTIMISATION.md §3.
+
 Plan for widening the standard-conv MAC array from the current 1-D grid
 (16 input-channel lanes, output channels rotated over time) to a 2-D grid
 (input-channel × output-channel), **without losing the correctness that

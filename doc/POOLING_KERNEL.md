@@ -12,10 +12,11 @@ parallelism strategy for II=1 throughput.
 Compared with a naïve element-at-a-time reference, the on-board kernel
 combines six independent optimisations: a producer/consumer DATAFLOW
 split with row caching, channel-parallel reduce, a kOwParallel-wide
-output-position vector axis, cyclic-banked dual-port line buffer,
-fixed-point AVG reciprocal LUT, and a polynomial fixed-point sqrt for
-LP-pool. All six are folded into the architecture described below; the
-full optimisation log with measured timings lives in
+output-position vector axis, 128-bit word paths through a column-banked
+LUTRAM line buffer (8 elements per cycle, POOL_OPTIMIZATION §2.13 /
+§2.14), a fixed-point AVG reciprocal LUT, and a polynomial fixed-point
+sqrt for LP-pool. All six are folded into the architecture described
+below; the full optimisation log with measured timings lives in
 [POOL_OPTIMIZATION.md](POOL_OPTIMIZATION.md).
 
 ---
@@ -29,11 +30,11 @@ full optimisation log with measured timings lives in
 | `gmem0` | `x` | Read | Input feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMIZATION §2.13); base must be 16-byte aligned; the last word of a row run may extend up to 7 elements past the tensor end (bytes must be mappable) |
 | `gmem1` | `y` | Write | Output feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMIZATION §2.14); base must be 16-byte aligned; one burst per (output row, channel) run whose first / last words carry byte strobes for the run's own lanes only, so no tail padding of the y buffer is needed |
 
-**AXI-Lite control registers (`s_axilite bundle=ctrl`) — 19 scalars + return:**
+**AXI-Lite control registers (`s_axilite bundle=ctrl`) — 19 arguments (2 addresses + 17 scalars) + return:**
 
 | Register | Type | Description |
 |----------|------|-------------|
-| `x`, `y` | `uint64_t` | Physical DDR base addresses |
+| `x`, `y` | 64-bit address | Physical DDR base addresses of the two `burst_maxi` ports (`offset=slave`) |
 | `batch`, `channels` | `unsigned` | Tensor outer dimensions |
 | `in_h`, `in_w` | `unsigned` | Input spatial size |
 | `out_h`, `out_w` | `unsigned` | Output spatial size |
@@ -46,10 +47,13 @@ full optimisation log with measured timings lives in
 | `count_include_pad` | `unsigned` | 0 or 1 (only for AveragePool) |
 
 64-bit AXI addressing is configured in the synthesis TCL
-(`config_interface -m_axi_addr64`) and the bus data width is exposed
-through `AXI_BUS_WIDTH` (CMake cache var) which also drives the m_axi
-widening and base-alignment hints via `config_interface
--m_axi_max_widen_bitwidth` and `-m_axi_alignment_byte_size`.
+(`config_interface -m_axi_addr64`).  The data width of both ports is
+fixed at 128 bits by the C++ port type (`PoolWord = ap_uint<128>`,
+`kPoolPortBits` in `PoolingKernel.h`); the top-level `AXI_BUS_WIDTH`
+CMake cache variable only feeds `config_interface
+-m_axi_max_widen_bitwidth` and does not change these ports.  The block
+design's `C_M_AXI_GMEM*_DATA_WIDTH` instance parameters must equal the
+exported IP defaults (128).
 
 ---
 
@@ -57,7 +61,7 @@ widening and base-alignment hints via `config_interface
 
 | `pool_type` | Name | Pad fill | Accumulation | Finalisation |
 |-------------|------|----------|--------------|--------------|
-| 0 | MaxPool | `kAccMin` (identity) | `acc = max(acc, x[i])` | `saturate_cast<Data_t>(acc)` |
+| 0 | MaxPool | `kDataMin` (identity; accumulator starts at `kAccMin`) | `acc = max(acc, x[i])` | `saturate_cast<Data_t>(acc)` |
 | 1 | AveragePool | 0 | `acc += x[i]` | `acc × inv_denom_lookup(denom)` — fixed-point reciprocal LUT, then cast |
 | 2 | LpPool (p=1) | 0 | `acc += abs(x[i])` | cast |
 | 2 | LpPool (p=2) | 0 | `acc += x[i]²` | `poly_sqrt(acc)` — fixed-point polynomial sqrt, then cast |
@@ -67,12 +71,14 @@ Two finalisation changes vs the naïve reference:
 - **AVG reciprocal is a LUT**, not a runtime divide. `denom` ranges
   over `[1 … kMaxLineBufRows × kMaxLineBufCols]`, indexes a constexpr
   ROM that stores `1/denom` as `ap_ufixed<24,1>`, and the consumer's
-  finalise multiplies by it. Eliminates the FP divider unit and
-  associated 35-cycle sequential latency.
-- **LP-p=2 sqrt is polynomial**, not `sqrtf()`. A degree-2 Chebyshev
-  approximation in `ap_fixed<32,16>` arithmetic replaces the
-  HLS-instantiated FP square-root core. Saves the DSP slices and ~12-
-  cycle latency that the FP unit costs.
+  finalise multiplies by it. Eliminates the FP divider (~28-cycle
+  latency), the FP multiplier and the float ↔ fixed converters.
+- **LP-p=2 sqrt is polynomial**, not `sqrtf()`. `poly_sqrt` range-reduces
+  `x = m · 4^k` (`m ∈ [1, 4)`, priority encoder + shift), evaluates a
+  3rd-order polynomial through `(1,1), (2,√2), (3,√3), (4,2)` by Horner's
+  scheme (`ap_fixed<16,1>` coefficients, max error ~0.22 % on `[1, 4]`)
+  and shifts the result by `2^k`. It replaces the HLS-instantiated FP
+  square-root core and saves its DSP slices and 12+ cycles of latency.
 
 Global variants (`GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`)
 are handled by the caller passing `pool_h=in_h`, `pool_w=in_w`,
@@ -93,29 +99,38 @@ the JSON via `string(JSON …)` and emits `Config.h` from
 
 | Constant | KV260 value | Purpose |
 |----------|------------:|---------|
-| `kTileC` | 8 | Channel tile width; pool_h × pool_w channel lanes updated per cycle. Power of 2. |
-| `kOwParallel` | 2 | Output-column lanes per cycle; adjacent ow positions processed together. Power of 2. |
+| `kTileC` | 8 | Channel tile width; `kTileC` channels reduced in parallel per cycle. Power of 2. |
+| `kOwParallel` | 2 | Output-column lanes per cycle; adjacent ow positions processed together. Power of 2, ≤ 8 (the port lane count). |
 | `kMaxPoolH` | 7 | Maximum compile-time pool window height. |
 | `kMaxPoolW` | 7 | Maximum compile-time pool window width. |
 | `kMaxLineBufRows` | 16 | Line-buffer row capacity; power of 2; bounds `(pool_h-1)·dil_h + 1`. |
-| `kMaxLineBufCols` | 64 | Line-buffer column capacity; W-tiling activates when `in_w` exceeds it. |
+| `kMaxLineBufCols` | 64 | Line-buffer column capacity (multiple of 8); W-tiling activates when `in_w` exceeds it. |
 
-**Fixed kernel-level constants** (in `Config.h`):
+`kMaxPoolH/W` are a hard contract: the kernel's tap counters are sized
+to them and it does not check `pool_h/pool_w` at run time, so an
+out-of-contract call (e.g. a 14×14 pool) hangs the kernel and wedges
+the HPC port (POOL_OPTIMIZATION §2.14.1).  The scheduler rejects such
+models.
 
-| Constant | Default | Purpose |
-|----------|---------|---------|
-| `Data_t` | `ap_fixed<16,8>` | Element type (2-byte) |
-| `AccData_t` | `ap_fixed<32,16>` | Accumulator type — wider range for sum/sum-of-squares |
-| `InvDenom_t` | `ap_ufixed<24,1>` | Reciprocal LUT entry — 23 fractional bits |
-| `kMaxAvgDenom` | `kMaxLineBufRows × kMaxLineBufCols` | Upper bound of `denom`, drives LUT size |
-| `kDataMin` | `-128.0f` | `MaxPool` pad-fill / identity (Data_t min) |
-| `kAccMin` | `-32768.0f` | Sentinel in `AccData_t` range |
+**Fixed kernel-level constants:**
 
-The same JSON keys are validated by `PoolNode.from_onnx_node` in the
-inference scheduler before any kernel call is emitted; any ONNX op
-that would overflow `kMaxPoolH/W` or the dilated-window line-buffer
-extents is rejected at codegen time with an error that names the bound
-and the JSON field to bump. See
+| Constant | Default | Where | Purpose |
+|----------|---------|-------|---------|
+| `Data_t` | `ap_fixed<16,8>` | `Config.h` | Element type (2-byte); `float` when the Vitis HLS headers are not found |
+| `AccData_t` | `ap_fixed<32,16>` | `Config.h` | Accumulator type — wider range for sum/sum-of-squares |
+| `kPoolMax` / `kPoolAvg` / `kPoolLp` | 0 / 1 / 2 | `Config.h` | `pool_type` register codes |
+| `kDataMin` | `-128.0f` | `Config.h` | `MaxPool` pad-fill / identity (Data_t min) |
+| `kAccMin` | `-32768.0f` | `Config.h` | Sentinel in `AccData_t` range |
+| `kPoolPortBits` / `kPoolPortElems` | 128 / 8 | `PoolingKernel.h` | Port word width and elements per word (`PoolWord`) |
+| `InvDenom_t` | `ap_ufixed<24,1>` | `PoolingKernel.cpp` | Reciprocal LUT entry — 23 fractional bits |
+| `kMaxAvgDenom` | `kMaxLineBufRows × kMaxLineBufCols` | `PoolingKernel.cpp` | Upper bound of `denom`, drives LUT size |
+
+The window bounds (`max_kh`, `max_kw`, `max_line_buf_rows`,
+`max_line_buf_cols`) are re-read from the same JSON by the inference
+scheduler and checked in `PoolNode.from_onnx_node` before any kernel
+call is emitted; any ONNX op that would overflow `kMaxPoolH/W` or the
+dilated-window line-buffer extents is rejected at codegen time with a
+`SchedulerError` that names the violated bound. See
 [inference-scheduler/src/\_pool\_hw\_config.py](../inference-scheduler/src/_pool_hw_config.py).
 
 ---
@@ -168,7 +183,7 @@ for ni  in [0, batch):                            // batch
   for ct  in [0, ceil(channels/kTileC)):          // channel tile (outer of oh)
     for owt in [0, ow_tiles_w):                   // W-tile (handles in_w > kMaxLineBufCols)
       // "chunk" = (ni, ct, owt): the loader streams its rows 0 .. rows_per_chunk-1
-      for oh  in [0, out_h):                      // output row = one flattened II=1 loop per stage
+      for oh  in [0, out_h):                      // output row = one flattened II=1 loop per stage (loader: per chunk)
         for g   in [0, ceil(ow_span/gw)):         // gw (= kOwParallel, or 1) adjacent ow positions
           // window_emitter  : pool_h·pool_w MultiWindow + 1 MultiDenom
           // process_pool... : slot_len = max(pool_h·pool_w, kTileC) iterations
@@ -202,7 +217,7 @@ one channel — and pushes every 128-bit **word** covering a run onto
 adder).  Requests run ahead of the drain: a prologue issues the first
 `kReadAhead = 12` runs' `read_request`s, then one more is issued each
 time a run has been drained, so the DDR latency is paid once per chunk
-rather than once per row.  The words of a run's first / last word that
+rather than once per row.  The lanes of a run's first / last word that
 lie outside the run are dropped by the emitter.
 
 ### 4.4 Stage 2 — `window_emitter`
@@ -288,7 +303,8 @@ LP-p=1, `+ x²` for LP-p=2.  Because `slot_len ≥ kTileC`, the finalise
 of group `g` (kOwParallel lanes per cycle — one channel's adjacent
 positions) always completes inside slot `g+1`, so the finalise
 hardware is `kOwParallel` wide instead of `kOwParallel × kTileC`
-(the §6.2.3 attempt) and never stalls the reduce.  `acc`, `acc_done`,
+(the rejected POOL_OPTIMIZATION §6.2.3 attempt) and never stalls the
+reduce.  `acc`, `acc_done`,
 `inv`, `inv_done` are fully partitioned registers.
 
 ### 4.6 Stage 4 — `write_output_tile`
@@ -335,8 +351,8 @@ the dup-read predictor in `TestPoolingSim.cpp`.
 | `ARRAY_PARTITION variable=line_buf complete dim=1` / `dim=2` | `window_emitter` | kTileC × kLanes independent column-bank RAMs |
 | `BIND_STORAGE variable=line_buf type=ram_s2p impl=lutram` | `window_emitter` | 1W1R LUTRAM per bank |
 | `DEPENDENCE variable=line_buf inter false` | `window_emitter` | Loads and window reads in one loop instance touch different slots (or are kSeqGap apart) |
-| `ARRAY_PARTITION variable=kw_lut complete dim=1` | `window_emitter` | One denominator bank per group position |
-| `ARRAY_PARTITION variable=acc / acc_done complete dim=0` | `process_pool_kernel_tile` | kOwParallel × kTileC parallel update lanes + snapshot |
+| `ARRAY_PARTITION variable=kw_lut complete dim=1` + `ram_s2p impl=lutram` + `DEPENDENCE inter false` | `window_emitter` | One denominator bank per group position |
+| `ARRAY_PARTITION variable=acc / acc_done complete dim=0`, `inv / inv_done complete` | `process_pool_kernel_tile` | kOwParallel × kTileC parallel update lanes + snapshot |
 | `ARRAY_PARTITION variable=rbA / rbB complete dim=1` + `ram_s2p impl=lutram` + `DEPENDENCE inter false` | `write_output_tile` | Ping-pong row buffers, 8 column banks each |
 | `PIPELINE II=1` | request prologue, loader drain, denominator pre-pass, emitter row loop, consumer row loop, writer row loop | One word / tap / bundle per clock |
 | `UNROLL` | per-lane `c1`/`p`/bank/lane loops | Spatial parallelism |
@@ -353,11 +369,13 @@ writer   ≈ max(n_groups × kTileC, c_valid × (ow_span/8 + 1))
 ```
 
 The wall clock is the largest of the four, all overlapped.  For
-ResNet-18's MaxPool 3×3 s2 on 112²×64 (W-tiled in two 63/51-column
-tiles) the consumer's 9 cycles per group of 16 outputs is the bound
-(≈ 2.25 cycles per 8 outputs, ~117 k cycles); for 2×2 s2 pools the
-consumer's `kTileC = 8` cycles per group (2 outputs per cycle) is;
-for global pools the loader's one word per cycle is.
+ResNet-18's MaxPool 3×3 s2 on 112²×64 (W-tiled into 31 + 25 output
+columns, input spans of 63 / 51 columns) the consumer's 9 cycles per
+group of 16 outputs is the bound (≈ 0.56 cycles per output, ~117 k
+cycles; 1.35 ms measured on the board, POOL_OPTIMIZATION §2.14.1);
+for 2×2 s2 pools the consumer's `kTileC = 8` cycles per group (2
+outputs per cycle) is; for global pools the loader's one word per
+cycle is.
 
 ## 5. On-Chip Memory
 
@@ -550,22 +568,25 @@ case.
   `dilations`, `auto_pad` (NOTSET/VALID/SAME_UPPER/SAME_LOWER),
   `pads`, `p`, `count_include_pad`; rejects `ceil_mode=1`.
 - Normalises Global variants to `pool=in_spatial, stride=1, pad=0`.
-- Validates against the per-platform JSON bounds via
-  `_pool_hw_config.resolve(platform_name)` and raises
-  `PoolHwConfigError` / `SchedulerError` (with the bound name and JSON
-  field to bump) if `pool_h > kMaxPoolH`, `pool_w > kMaxPoolW`, or the
-  vertical/horizontal dilated spans exceed the line-buffer extents.
+- Validates against the per-platform JSON bounds resolved by
+  `_pool_hw_config.resolve(platform_name)` (which raises
+  `PoolHwConfigError` if the JSON file, the `kernels.pool` object or a
+  field is missing) and raises `SchedulerError` naming the bound if
+  `pool_h > kMaxPoolH`, `pool_w > kMaxPoolW`, or the vertical/horizontal
+  dilated spans exceed the line-buffer extents.
 
 **Code-generated `run_pool()` (`_source.py`)** sets all 19 AXI-Lite
-scalar registers and calls `XPoolingkernel_Start()` — non-blocking.
+registers (`x`, `y` physical addresses + 17 scalars) and calls
+`XPoolingkernel_Start()` — non-blocking.
 The `inference_run()` body emits a `kernel_wait(KERNEL_POOL)` later,
 only when a downstream op needs the Pool output or another op wants
 to reuse the Pool lane, which lets work on other lanes (e.g. Conv,
 VectorOP) overlap with the Pool.
 
-**Buffer layout (`_core.py`)** packs all pool tensor buffers into a
-single contiguous 64-byte-aligned DMA allocation. Slot colouring uses
-event-stream liveness intervals so two tensors share a slot only when
+**Buffer layout (`_core.py`)** packs every model buffer (weights, then
+intermediates) into a single contiguous DMA allocation with
+64-byte-aligned slots, which also covers the x port's up-to-7-element
+word overrun. Slot colouring uses event-stream liveness intervals so two tensors share a slot only when
 one is fully drained before the other's producer starts.
 
 **Reference simulation (`_simulate.py`)** implements float64
@@ -583,17 +604,24 @@ make TestPoolingSim && ctest
 # HLS synthesis + IP export for KV260.
 make synthesize_pool_kv260
 
-# RTL behavior test on Vivado xsim — depends on synthesize_pool_kv260.
+# RTL behavior test on Vivado xsim — depends on synthesize_pool_kv260;
+# reads the checked-in fixtures under hw/test_data/pool_test_data/.
 make behavior_test_pool
+
+# Optional: regenerate the RTL fixtures (TestPoolingSim --dump-data)
+# into build/pool_test_data/, and C/RTL co-simulation (slow, minutes).
+make gen_pool_test_data
+make cosim_pool_kv260
 ```
 
 The synthesis target reads `platforms/kv260.json` (specifies `part`,
-optional `board`, `clock`, and the `kernels.pool` compile-time
-constants) and invokes Vitis HLS via `Synthesis.tcl.in`, which
-configures the project, adds source files, applies directives, runs
-`csynth_design`, and exports an IP catalog archive. Adding a new
-platform is a JSON-file-plus-cmake-rerun operation; no C++ edits
-required.
+optional `board`, `clock` — 150 MHz for the KV260 — and the
+`kernels.pool` compile-time constants) and invokes Vitis HLS via
+`Synthesis.tcl.in`, which opens a Vitis unified component
+(`open_component`, directory `pool_kv260`), adds the kernel source,
+runs `csynth_design`, and exports an IP catalog archive to
+`build/kernels/pool/kv260/ip_catalog`. Adding a new platform is a
+JSON-file-plus-cmake-rerun operation; no C++ edits required.
 
 The verification workflow is also packaged as a
 [`pool-verify` skill](../.claude/skills/pool-verify/SKILL.md) that
@@ -608,10 +636,12 @@ summary.
 | File | Purpose |
 |------|---------|
 | `kernels/pool/kernel/PoolingKernel.cpp` | HLS kernel implementation — all four DATAFLOW stages, `poly_sqrt`, `inv_denom_lookup` ROM |
-| `kernels/pool/include/PoolingKernel.h` | Kernel declaration, `pool_type` enum, `saturate_cast<T>` |
-| `kernels/pool/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, all six per-platform tile constants) |
-| `kernels/pool/test/TestPoolingSim.cpp` | C simulation tests (GCC) |
+| `kernels/pool/include/PoolingKernel.h` | Kernel declaration, 128-bit `PoolWord` port type and lane helpers, cosim depths, `saturate_cast<T>` |
+| `kernels/pool/include/PoolingKernelDebug.h` | C-sim-only duplicate-DDR-read counter used by the dup-read check |
+| `kernels/pool/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, all six per-platform tile constants, `pool_type` codes, MaxPool sentinels) |
+| `kernels/pool/test/TestPoolingSim.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
 | `kernels/pool/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
+| `kernels/pool/scripts/Cosim.tcl.in` | Vitis HLS C synthesis + C/RTL co-simulation template (`cosim_pool_<platform>`) |
 | `kernels/pool/CMakeLists.txt` | Per-platform synthesis target generation; `pool_load_constants` reads `kernels.pool` from each platform JSON |
 | `platforms/<name>.json` | Per-platform FPGA part + clock + `kernels.pool` constants (single source of truth) |
 | `inference-scheduler/src/_pool_hw_config.py` | Python validator that re-reads `kernels.pool` from the same JSON |
