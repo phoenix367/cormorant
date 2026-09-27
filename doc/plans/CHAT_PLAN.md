@@ -1725,14 +1725,14 @@ with its OpenBLAS 0.3.34, tokenizers 0.23.2; torch / transformers for
 **`llm_calibrate.py`** — `fetch` (download at the pinned revision, every
 hash verified, matching files kept, texts copied from another model's
 assets or fetched by `llm_study.py fetch`), `calibrate` (formats into a
-scratch file, installed with a `formats_*.provenance.json` — input hashes,
-commit, `llm_study.py`'s hash, package / BLAS versions, CPU — only when the
-hash reproduces or with `--record` / `--force`, otherwise left as
-`formats_*.new.json`), `check` (the same without installing, plus a diff of
+scratch file, installed only when the hash reproduces or with `--record` /
+`--force`, otherwise left as `formats_*.new.json`; the provenance —
+input hashes, commit, `llm_study.py`'s hash, package / BLAS versions, CPU —
+goes to `assets/study/<model>/formats_*.provenance.json`, tracked), `check` (the same without installing, plus a diff of
 the exponents / sink values against the installed file), `study` (bf16 and
 the shipped policies → `study[/<model>]/shipped/`, metrics compared with the
 manifest), `validate`, `all`, `add` (pin a new checkpoint).  Stdlib only; the
-study steps run in the study environment.  16 tests in
+study steps run in the study environment.  17 tests in
 `tests/test_llm_calibrate.py` (file:// URLs for Hugging Face, a fake
 `llm_study.py`).
 

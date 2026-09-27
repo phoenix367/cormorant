@@ -396,7 +396,7 @@ cd demo/chat
 python3 scripts/llm_calibrate.py fetch smollm2-360m-instruct      # download at the pinned revision,
                                           # texts via the datasets server; every hash verified
 python3 scripts/llm_calibrate.py calibrate smollm2-360m-instruct  # formats; installed only if the
-                                          # hash reproduces, + formats_*.provenance.json
+                                          # hash reproduces, + the provenance
 python3 scripts/llm_calibrate.py check smollm2-135m-instruct      # recompute, compare, install nothing
 python3 scripts/llm_calibrate.py study smollm2-360m-instruct      # bf16 / p12 / p12+mix metrics
                                           # vs the manifest (-> study[/<model>]/shipped/; 360M ~40 min)
@@ -412,9 +412,10 @@ hashes (2026-09-28).  numpy's OpenBLAS selects CPU-specific kernels, so on
 another machine a sink value can round differently: `calibrate` then keeps
 the installed file, leaves the result as `formats_*.new.json` and prints
 which exponents / sink values differ (`--force` installs it anyway,
-`--record` also stores its hash).  The provenance file records the input
-hashes, the commit and `llm_study.py`'s hash, the package versions, BLAS
-and CPU.  `HF_ENDPOINT` selects a Hugging Face mirror.  A new checkpoint:
+`--record` also stores its hash).  The provenance,
+`assets/study/<model>/formats_<policy>.provenance.json` for every model (the
+only tracked files under `assets/`), records the input hashes, the commit
+and `llm_study.py`'s hash, the package versions, BLAS and CPU.  `HF_ENDPOINT` selects a Hugging Face mirror.  A new checkpoint:
 `add <name> --repo <org/repo> [--revision <branch|tag|commit>]` pins it,
 then `fetch`, `calibrate --record` and `study --record`.
 
@@ -818,7 +819,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 137 tests, ~40 s, stdlib only (a C compiler for the C parts)
+python3 -m unittest -v                  # 138 tests, ~40 s, stdlib only (a C compiler for the C parts)
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
 # host validation against transformers, from the repo root

@@ -124,6 +124,22 @@ class TestManifest(unittest.TestCase):
         root = Path("/a")
         self.assertEqual(lc.study_dir(root, lc.DEFAULT_MODEL), root / "study")
         self.assertEqual(lc.study_dir(root, "m2"), root / "study" / "m2")
+        for model in (lc.DEFAULT_MODEL, "m2"):
+            self.assertEqual(lc.provenance_path(root, model, "p"),
+                             root / "study" / model / "formats_p.provenance.json")
+
+    def test_provenance_is_tracked(self):
+        """assets/.gitignore ignores everything but the provenance files."""
+        import subprocess
+        assets = os.path.join(CHAT, "assets")
+        for path, ignored in ((f"study/{lc.DEFAULT_MODEL}/formats_p.provenance.json", False),
+                              ("study/m2/formats_p.provenance.json", False),
+                              ("study/formats_p.json", True), ("study/m2/formats_p.json", True),
+                              (f"{lc.DEFAULT_MODEL}/model.safetensors", True)):
+            r = subprocess.run(["git", "-C", assets, "check-ignore", "-q", path])
+            if r.returncode not in (0, 1):
+                self.skipTest("not a git checkout")
+            self.assertEqual(r.returncode == 0, ignored, path)
 
 
 class TestDownload(Quiet):
@@ -244,14 +260,16 @@ class TestCalibrate(Quiet):
         self.assertEqual(self.run_main("calibrate", "--record"), 0)
         self.assertEqual(self.manifest_sha(), h)
         self.assertEqual(self.installed.read_bytes(), self.fmt.read_bytes())
-        prov = json.loads(self.installed.with_name("formats_pow2+sink+p12.provenance.json").read_text())
+        prov_path = lc.provenance_path(self.t.root, "tiny", "pow2+sink+p12")
+        prov = json.loads(prov_path.read_text())
         self.assertEqual(prov["status"], "recorded")
+        self.assertEqual(prov["formats"], "study/tiny/formats_pow2+sink+p12.json")
         self.assertEqual(prov["formats_sha256"], h)
         self.assertEqual(prov["environment"]["python"], "fake")
         self.assertEqual(sorted(prov["inputs"]), sorted({**self.t.files, **self.t.texts}))
         self.assertEqual(self.run_main("check"), 0)
         self.assertEqual(self.run_main("calibrate"), 0)
-        prov = json.loads(self.installed.with_name("formats_pow2+sink+p12.provenance.json").read_text())
+        prov = json.loads(prov_path.read_text())
         self.assertEqual(prov["status"], "reproduced")
 
     def test_differs_is_not_installed(self):

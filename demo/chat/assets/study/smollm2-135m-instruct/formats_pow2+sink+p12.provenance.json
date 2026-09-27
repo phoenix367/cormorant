@@ -1,0 +1,44 @@
+{
+  "model": "smollm2-135m-instruct",
+  "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+  "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+  "policy": "pow2+sink+p12",
+  "formats": "study/formats_pow2+sink+p12.json",
+  "formats_sha256": "b870edfe590909a530b8985d79e19c4ae06b6daeafd8f704713c0ac7949a2f1a",
+  "manifest_sha256": "b870edfe590909a530b8985d79e19c4ae06b6daeafd8f704713c0ac7949a2f1a",
+  "status": "reproduced",
+  "inputs": {
+    "config.json": "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a",
+    "generation_config.json": "87b916edaaab66b3899b9d0dd0752727dff6666686da0504d89ae0a6e055a013",
+    "model.safetensors": "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c",
+    "tokenizer.json": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+    "tokenizer_config.json": "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df",
+    "special_tokens_map.json": "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52",
+    "vocab.json": "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79",
+    "merges.txt": "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510",
+    "heldout_wikitext2_test.txt": "15c9b97c8cc52e602cffc96ac0d5639232fb8e82ddfb1b00720a990aae65647d",
+    "calib_wikitext2_valid.txt": "86698efa3f4f77ba6f8bc681ce22298ed1d2549aeb459d278ef60f837fd3456f"
+  },
+  "code": {
+    "git_commit": "029cd77d0df8310594218acc0381953956cd8914",
+    "llm_study_modified": false,
+    "llm_study_sha256": "5397fefbb3b1abd6a3a116c497af6bff720cdfb13f5edee53866c8071c225784"
+  },
+  "environment": {
+    "python": "3.12.3",
+    "numpy": "2.5.3",
+    "tokenizers": "0.23.2",
+    "blas": "scipy-openblas 0.3.34.106.0",
+    "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+    "cpu": "Intel(R) Core(TM) i5-8300H CPU @ 2.30GHz"
+  },
+  "command": [
+    "llm_study.py",
+    "formats",
+    "--assets",
+    "assets/smollm2-135m-instruct",
+    "--base",
+    "pow2+sink+p12"
+  ],
+  "created": "2026-09-28T02:10:27+0400"
+}

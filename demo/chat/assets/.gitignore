@@ -1,3 +1,7 @@
-# model weights, tokenizer, held-out text and study outputs (demo/chat/scripts/llm_study.py)
+# model weights, tokenizer, held-out text and study outputs (demo/chat/scripts/llm_study.py);
+# tracked: the calibration provenance (demo/chat/scripts/llm_calibrate.py)
 *
 !.gitignore
+!study/
+!study/*/
+!study/*/formats_*.provenance.json

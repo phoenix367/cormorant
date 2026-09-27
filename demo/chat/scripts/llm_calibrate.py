@@ -16,8 +16,9 @@ llm_models.json (tracked) pins every input and the expected output:
                    (llm_study.py fetch, or a verified copy from another model's
                    assets); every SHA-256 checked, matching files kept
   calibrate MODEL  llm_study.py formats into a scratch file; installed as
-                   assets/study[/<model>]/formats_<policy>.json with a provenance
-                   JSON (input hashes, code version, environment) when its SHA-256
+                   assets/study[/<model>]/formats_<policy>.json, with the provenance
+                   assets/study/<model>/formats_<policy>.provenance.json (input hashes,
+                   code version, environment; tracked in git), when its SHA-256
                    equals the manifest's; otherwise left as formats_<policy>.new.json
                    (--force installs it; --record installs it and stores its hash:
                    a new model or an intended change)
@@ -107,6 +108,12 @@ def model_spec(m: dict, model: str) -> dict:
 def study_dir(root: Path, model: str) -> Path:
     """llm_study.study_dir for assets under ``root``."""
     return root / "study" if model == DEFAULT_MODEL else root / "study" / model
+
+
+def provenance_path(root: Path, model: str, policy: str) -> Path:
+    """assets/study/<model>/ for every model (135M's formats stay in
+    assets/study/, llm_study's legacy layout)."""
+    return root / "study" / model / f"formats_{policy}.provenance.json"
 
 
 def download(url: str, dest: Path, want: Optional[str]) -> str:
@@ -320,13 +327,15 @@ def cmd_calibrate(m: dict, model: str, root: Path, py: Optional[str], *, check: 
         installed.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(out), installed)
         prov = {"model": model, "repo": spec["repo"], "revision": spec["revision"],
-                "policy": policy, "formats": installed.name, "formats_sha256": got,
+                "policy": policy, "formats": installed.relative_to(root).as_posix(),
+                "formats_sha256": got,
                 "manifest_sha256": spec["formats"].get("sha256"), "status": status,
                 "inputs": inputs, "code": code_version(), "environment": environment(py),
                 "command": ["llm_study.py", "formats", "--assets", f"assets/{model}",
                             "--base", policy],
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-        pp = installed.with_name(installed.stem + ".provenance.json")
+        pp = provenance_path(root, model, policy)
+        pp.parent.mkdir(parents=True, exist_ok=True)
         with open(pp, "w") as f:
             json.dump(prov, f, indent=2)
             f.write("\n")
