@@ -220,7 +220,8 @@ class Smollm2Backend(Backend):
     model_id = MODEL_ID
     owned_by = "kv260"
     fingerprint = "kv260-smollm2-135m-pow2+sink+p12"
-    cma_mb = 360.0                      # CMA the loaded model holds (estimate, §10.6)
+    cma_mb = 360.0                      # fallback (the §10.6 estimate); the server passes
+                                        # --llm-cma-mb (510: the 488 MiB pool BO, CHAT_PLAN §16.3)
 
     def __init__(self, engine, tokenizer_path: str, *, sampler_lib: Optional[str] = None,
                  defaults: Optional[SamplerParams] = None, context_size: int = 1024,

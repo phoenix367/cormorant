@@ -22,7 +22,7 @@ Backends (chat_backend.Backend; one model id each)
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
-BERT holds ~224 MB, SmolLM2 ~360 MB, idle CmaFree was 626-813 MB).
+BERT holds ~224 MB, SmolLM2 ~510 MB, idle CmaFree was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -919,7 +919,7 @@ def main(argv=None) -> int:
                    help="penalty window in tokens (0: off, -1: the whole context)")
     g.add_argument("--llm-prefill-chunk", type=int, default=0,
                    help="split prefills into calls of at most N tokens (cancellable between them); 0: one call")
-    g.add_argument("--llm-cma-mb", type=float, default=360.0,
+    g.add_argument("--llm-cma-mb", type=float, default=510.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g.add_argument("--llm-fake", choices=("float", "scripted"), default=None,
                    help="development without the FPGA: tests/fake_llm.py instead of libsmollm2.so")

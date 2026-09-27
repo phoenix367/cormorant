@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-inference_scheduler.py — ONNX-to-VectorOPKernel project generator
+inference_scheduler.py — ONNX-to-C project generator for the KV260 kernels
 
-Parses an ONNX model and writes a CMake project that compiles a static
-library implementing the full inference loop on the Xilinx KV260, using
-VectorOPKernel invocations via the XVectoropkernel driver API.
+Parses an ONNX model (or several, with --entry) and writes a CMake project
+that runs the whole inference on the Xilinx KV260: VectorOPKernel,
+MatmulKernel, ConvKernel and PoolingKernel calls through their generated
+drivers, plus host-CPU code for the ops no kernel implements.  Supported ops,
+numerics and the generated code: ../doc/INFERENCE_SCHEDULER.md; CLI, project
+layout and C API: doc/USER_GUIDE.md.
 
-Supported ONNX operators:
-  Add, Sub, Mul, Div, Relu, Clip(min=0, max=6)
-
-Output project layout:
+Output project layout (main parts):
   <out_dir>/
-  ├── CMakeLists.txt              INFERENCE_TARGET=BARE_METAL|LINUX
-  ├── include/
-  │   └── inference.h             public API: Data_t, sizes, init/run
-  ├── src/
-  │   └── inference.c             generated inference loop (dual-target)
-  └── driver/                     XVectoropkernel driver sources
-      ├── xvectoropkernel.h       ┐
-      ├── xvectoropkernel_hw.h    │  copied from --driver-dir,
-      ├── xvectoropkernel.c       │  or left empty with a README
-      ├── xvectoropkernel_sinit.c │ (bare-metal)
-      └── xvectoropkernel_linux.c ┘ (Linux)
+  ├── CMakeLists.txt              INFERENCE_TARGET=BARE_METAL (default)|LINUX
+  ├── include/inference.h         public API: Data_t, sizes, buffers, init/run
+  ├── src/inference.c             weights, kernel calls, host ops, run bodies
+  ├── src/inference_buf.c         DMA buffers (XRT on Linux, Xil bare metal)
+  ├── test/test_inference.c       on-device test against the simulated outputs
+  ├── driver/                     kernel drivers (copied from --driver-dir)
+  ├── weights/, expected/         large tensors as .dat files
+  └── report.md                   model, memory and quantisation summary
 
 Usage:
-  python inference_scheduler.py model.onnx
   python inference_scheduler.py model.onnx --out-dir ./my_project
   python inference_scheduler.py model.onnx --out-dir ./my_project \\
-      --driver-dir ../build/kv260/vadd_kv260/solution1/impl/ip/\\
-                   drivers/VectorOPKernel_v1_0/src
+      --driver-dir ../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src
+  python inference_scheduler.py --entry decode=decode.onnx --entry head=head.onnx --out-dir ./multi
 """
 
 import argparse
@@ -61,7 +57,7 @@ _DRIVER_README          = _VECTOROP_DRIVER_README
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
-        description="Generate a VectorOPKernel inference project from an ONNX model.",
+        description="Generate a C inference project for the KV260 kernels from an ONNX model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )

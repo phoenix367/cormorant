@@ -13,7 +13,7 @@ Usage:
   python3 run_demo.py --config my_config.json
   python3 run_demo.py --skip-download           # use cached data + models
   python3 run_demo.py --skip-deploy             # only generate locally
-  python3 run_demo.py --models lenet            # restrict to one model
+  python3 run_demo.py --models mnist_lenet      # restrict to one model
 """
 
 from __future__ import annotations

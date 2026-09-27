@@ -21,7 +21,7 @@
       "MatmulKernel":   "fabric_matmul",
       "ConvKernel":     "fabric_conv"
     },
-    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs the MatMuls, MatmulKernel the two it cannot; --no-matmul-on-conv in generate_project's scheduler options would drop ConvKernel).",
+    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs the MatMuls, MatmulKernel the two it cannot).",
     "cmake_args": []
   },
 
