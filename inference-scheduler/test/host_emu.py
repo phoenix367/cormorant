@@ -211,26 +211,40 @@ static inline void XVectoropkernel_Start(XVectoropkernel *p)
 
 _MM = r"""
 #include "emu_common.h"
+#include <stdlib.h>
 #ifndef EMU_TILE_M
 #error EMU_TILE_M
 #endif
-typedef struct { u64 a, b, c; uint32_t n, k, m, batch, a_batch_stride, b_batch_stride,
-                 c_batch_stride, b_packed; } XMatmulkernel;
+typedef struct { u64 a, b, c, a_to_b; uint32_t n, k, m, batch, a_batch_stride, b_batch_stride,
+                 c_batch_stride, b_packed, gemv_kw; } XMatmulkernel;
 static inline int XMatmulkernel_Initialize(XMatmulkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
 static inline void XMatmulkernel_Set_a(XMatmulkernel *p, u64 v) { p->a = v; }
 static inline void XMatmulkernel_Set_b(XMatmulkernel *p, u64 v) { p->b = v; }
 static inline void XMatmulkernel_Set_c(XMatmulkernel *p, u64 v) { p->c = v; }
+static inline void XMatmulkernel_Set_a_to_b(XMatmulkernel *p, u64 v) { p->a_to_b = v; }
 #define MM_SET(f) static inline void XMatmulkernel_Set_##f(XMatmulkernel *p, u64 v) { p->f = (uint32_t)v; }
 MM_SET(n) MM_SET(k) MM_SET(m) MM_SET(batch) MM_SET(a_batch_stride) MM_SET(b_batch_stride)
-MM_SET(c_batch_stride) MM_SET(b_packed)
+MM_SET(c_batch_stride) MM_SET(b_packed) MM_SET(gemv_kw)
 static inline int XMatmulkernel_IsDone(XMatmulkernel *p) { (void)p; return 1; }
 static inline int XMatmulkernel_Release(XMatmulkernel *p) { (void)p; return 0; }
-/* C = sat(floor(A.B / 256)); B row-major [k][m] or packed tile-major
- * [ceil(m/T)][k][T] per batch slice (MatmulKernel.h). */
+/* Element offset of B[kk][j] in the GEMV image of kernel width kw
+ * (MatmulKernel.h matmul_gemv_index; kw = 1: row-major). */
+static inline size_t emu_gemv_index(unsigned kk, unsigned j, unsigned m, unsigned kw)
+{
+    unsigned c;
+    if (kw <= 1u) return (size_t)kk * m + j;
+    c = (kk / (16u * kw)) * 16u + kk % 16u;
+    return ((size_t)c * m + j) * kw + (kk / 16u) % kw;
+}
+/* C = sat(floor(A.B / 256)); B row-major [k][m], packed tile-major
+ * [ceil(m/T)][k][T], or the GEMV image of kernel width gemv_kw, per batch
+ * slice (MatmulKernel.h).  GEMV: the hardware reaches B through a_to_b on
+ * port a too; b itself is the same address. */
 static inline void XMatmulkernel_Start(XMatmulkernel *p)
 {
     unsigned bt, r, j, kk;
+    if (p->gemv_kw && p->a + p->a_to_b != p->b) abort();
     for (bt = 0; bt < p->batch; bt++) {
         const int16_t *A = (const int16_t *)(uintptr_t)p->a + (size_t)bt * p->a_batch_stride;
         const int16_t *B = (const int16_t *)(uintptr_t)p->b + (size_t)bt * p->b_batch_stride;
@@ -239,7 +253,9 @@ static inline void XMatmulkernel_Start(XMatmulkernel *p)
             for (j = 0; j < p->m; j++) {
                 int64_t acc = 0;
                 for (kk = 0; kk < p->k; kk++) {
-                    int64_t bv = p->b_packed
+                    int64_t bv = p->gemv_kw
+                        ? B[emu_gemv_index(kk, j, p->m, p->gemv_kw)]
+                        : p->b_packed
                         ? B[((size_t)(j / EMU_TILE_M) * p->k + kk) * EMU_TILE_M + j % EMU_TILE_M]
                         : B[(size_t)kk * p->m + j];
                     acc += (int64_t)A[(size_t)r * p->k + kk] * bv;

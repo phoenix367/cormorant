@@ -1,10 +1,13 @@
 /* bench_matmul.c — MatmulKernel latency / GOps/s benchmark
  *
- * args: instance label n k m batch a_batch_stride b_batch_stride b_packed iters [warmup]
+ * args: instance label n k m batch a_batch_stride b_batch_stride b_packed gemv_kw iters
+ *       [warmup]
  *
  * b_packed = 1 benchmarks MatmulKernel's tile-major packed B layout
- * (MATMUL_OPTIMISATION §3b): the B buffer is then k x roundup(m, 16) per
- * slice and b_batch_stride is in packed elements.
+ * (MATMUL_OPTIMISATION §3b): the B buffer is then k x roundup(m, 32) per
+ * slice and b_batch_stride is in packed elements.  gemv_kw = 1 / 2 / 4 / 8
+ * benchmarks the GEMV streaming path (§8b; B in the kernel-width image, the
+ * same size as row-major B; b_packed is ignored).
  */
 #include "inference.h"
 #include "xmatmulkernel.h"
@@ -17,7 +20,7 @@ static void run_once(XMatmulkernel *k,
                      uint64_t ap, uint64_t bp, uint64_t cp,
                      unsigned n, unsigned kd, unsigned m,
                      unsigned batch, unsigned as, unsigned bs,
-                     unsigned b_packed)
+                     unsigned b_packed, unsigned gemv_kw)
 {
     XMatmulkernel_Set_a(k, ap);
     XMatmulkernel_Set_b(k, bp);
@@ -30,16 +33,18 @@ static void run_once(XMatmulkernel *k,
     XMatmulkernel_Set_b_batch_stride(k, bs);
     XMatmulkernel_Set_c_batch_stride(k, n * m);
     XMatmulkernel_Set_b_packed(k, b_packed);
+    XMatmulkernel_Set_gemv_kw(k, gemv_kw);
+    XMatmulkernel_Set_a_to_b(k, bp - ap);    /* port a reaches its half of B (GEMV) */
     XMatmulkernel_Start(k);
     while (!XMatmulkernel_IsDone(k)) {}
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 11) {
+    if (argc < 12) {
         fprintf(stderr,
-            "usage: %s instance label n k m batch a_stride b_stride b_packed iters [warmup]\n",
-            argv[0]);
+            "usage: %s instance label n k m batch a_stride b_stride b_packed gemv_kw iters"
+            " [warmup]\n", argv[0]);
         return 1;
     }
     const char *inst    = argv[1];
@@ -51,8 +56,10 @@ int main(int argc, char **argv)
     unsigned as    = (unsigned)strtoul(argv[7],  NULL, 0);
     unsigned bs    = (unsigned)strtoul(argv[8],  NULL, 0);
     unsigned b_packed = (unsigned)strtoul(argv[9], NULL, 0);
-    unsigned iters  = (unsigned)strtoul(argv[10], NULL, 0);
-    unsigned warmup = (argc > 11) ? (unsigned)strtoul(argv[11], NULL, 0) : 10u;
+    unsigned gemv_kw  = (unsigned)strtoul(argv[10], NULL, 0);
+    unsigned iters  = (unsigned)strtoul(argv[11], NULL, 0);
+    unsigned warmup = (argc > 12) ? (unsigned)strtoul(argv[12], NULL, 0) : 10u;
+    if (gemv_kw) b_packed = 0u;
 
     if (inference_buf_pool_init() != 0) return 1;
 
@@ -88,7 +95,7 @@ int main(int argc, char **argv)
 
     unsigned w;
     for (w = 0; w < warmup; w++) {
-        run_once(&k, ap, bp, cp, n, kd, m, batch, as, bs, b_packed);
+        run_once(&k, ap, bp, cp, n, kd, m, batch, as, bs, b_packed, gemv_kw);
         inference_buf_sync_from_device(bc);
     }
 
@@ -96,7 +103,7 @@ int main(int argc, char **argv)
     clock_gettime(CLOCK_MONOTONIC, &t0);
     unsigned i;
     for (i = 0; i < iters; i++) {
-        run_once(&k, ap, bp, cp, n, kd, m, batch, as, bs, b_packed);
+        run_once(&k, ap, bp, cp, n, kd, m, batch, as, bs, b_packed, gemv_kw);
         inference_buf_sync_from_device(bc);
     }
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -109,9 +116,9 @@ int main(int argc, char **argv)
 
     printf("{\"kernel\":\"MatmulKernel\",\"label\":\"%s\","
            "\"n\":%u,\"k\":%u,\"m\":%u,\"batch\":%u,"
-           "\"a_str\":%u,\"b_str\":%u,\"b_packed\":%u,\"iters\":%u,"
+           "\"a_str\":%u,\"b_str\":%u,\"b_packed\":%u,\"gemv_kw\":%u,\"iters\":%u,"
            "\"lat_ms\":%.4f,\"gops\":%.4f}\n",
-           label, n, kd, m, batch, as, bs, b_packed, iters, lat, gops);
+           label, n, kd, m, batch, as, bs, b_packed, gemv_kw, iters, lat, gops);
 
     inference_buf_free(ba); inference_buf_free(bb); inference_buf_free(bc);
     XMatmulkernel_Release(&k);

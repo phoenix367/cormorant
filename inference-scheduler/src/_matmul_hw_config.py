@@ -22,7 +22,8 @@ JSON shape (only the fields this module reads)::
           "tile_n":   4,
           "tile_m":  16,
           "tile_k": 256,
-          "max_k": 2048
+          "max_k": 4096,
+          "gemv_max_m": 4096
         }
       }
     }
@@ -46,7 +47,10 @@ models cannot violate them.  ``tile_m`` is exported because the packed
 tile-major B layout the scheduler emits for constant weights
 (``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the
 hard upper bound — see ``doc/kernels/MATMUL_KERNEL.md`` §3 "Runtime constraint
-validated by the scheduler".
+validated by the scheduler".  ``gemv_max_m`` is the GEMV streaming mode's
+accumulator depth (``MatmulNode.gemv_kw``); 0 means the kernel has no GEMV
+path and the scheduler never selects it — a wider ``m`` is split into
+column chunks inside the kernel, so it is not a bound either.
 """
 
 from __future__ import annotations
@@ -71,6 +75,7 @@ _REQUIRED: Tuple[Tuple[str, str], ...] = (
     ("max_k",  "MATMUL_MAX_K"),
     ("tile_m", "MATMUL_TILE_M"),   # packed-B tile width (MATMUL_OPTIMISATION §3b)
     ("tile_n", "MATMUL_TILE_N"),   # row lanes — only the engine cost model uses it
+    ("gemv_max_m", "MATMUL_GEMV_MAX_M"),   # GEMV accumulator depth; 0 = no GEMV path
 )
 
 
@@ -147,12 +152,14 @@ _CFG = resolve()
 MATMUL_MAX_K : int = _CFG["MATMUL_MAX_K"]
 MATMUL_TILE_M: int = _CFG["MATMUL_TILE_M"]
 MATMUL_TILE_N: int = _CFG["MATMUL_TILE_N"]
+MATMUL_GEMV_MAX_M: int = _CFG["MATMUL_GEMV_MAX_M"]
 
 
 __all__ = (
     "MATMUL_MAX_K",
     "MATMUL_TILE_M",
     "MATMUL_TILE_N",
+    "MATMUL_GEMV_MAX_M",
     "MatmulHwConfigError",
     "resolve",
 )

@@ -369,6 +369,61 @@
           "b_stride": 0,
           "b_packed": 1,
           "iters": 50
+        },
+        {
+          "label": "FC-1x512x1000-gemv",
+          "n": 1,
+          "k": 512,
+          "m": 1000,
+          "batch": 1,
+          "a_stride": 0,
+          "b_stride": 0,
+          "gemv_kw": 1,
+          "iters": 100
+        },
+        {
+          "label": "FC-1x576x1536-packed",
+          "n": 1,
+          "k": 576,
+          "m": 1536,
+          "batch": 1,
+          "a_stride": 0,
+          "b_stride": 0,
+          "b_packed": 1,
+          "iters": 100
+        },
+        {
+          "label": "FC-1x576x1536-gemv-kw4",
+          "n": 1,
+          "k": 576,
+          "m": 1536,
+          "batch": 1,
+          "a_stride": 0,
+          "b_stride": 0,
+          "gemv_kw": 4,
+          "iters": 100
+        },
+        {
+          "label": "FC-1x1536x576-packed",
+          "n": 1,
+          "k": 1536,
+          "m": 576,
+          "batch": 1,
+          "a_stride": 0,
+          "b_stride": 0,
+          "b_packed": 1,
+          "iters": 100
+        },
+        {
+          "label": "FC-1x1536x576-gemv-kw4",
+          "n": 1,
+          "k": 1536,
+          "m": 576,
+          "batch": 1,
+          "a_stride": 0,
+          "b_stride": 0,
+          "gemv_kw": 4,
+          "iters": 100
         }
       ]
     },

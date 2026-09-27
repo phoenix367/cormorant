@@ -16,7 +16,7 @@ OnnxGraph
 
 from __future__ import annotations
 import os
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 import onnx
@@ -39,6 +39,7 @@ from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES
 from . import fusion
 from . import matmul_lowering
 from . import numeric
+from .matmul_gemv import choose_gemv
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
@@ -433,7 +434,10 @@ class OnnxGraph:
                  s2d_stem: bool = False,
                  fuse_patterns: bool = True,
                  matmul_on_conv="auto",
-                 matmul_conv_kw: "Dict[str, int]" = None) -> None:
+                 matmul_conv_kw: "Dict[str, int]" = None,
+                 matmul_conv_kws: "Sequence[int]" = None,
+                 matmul_gemv="auto",
+                 matmul_gemv_kw: "Dict[str, int]" = None) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -463,6 +467,23 @@ class OnnxGraph:
         the CNN models — are never eligible, so their projects are unchanged.
         ``self.matmul_conv_stats`` reports ``{"lowered", "kept",
         "conv_calls", "conv_cycles", "matmul_cycles"}``.
+        ``matmul_conv_kw`` ({constant B name: kw}) pins the kernel width of
+        a lowered weight (a multi-entry project's graphs must re-lay out a
+        shared weight identically); ``matmul_conv_kws`` limits the kernel
+        widths the lowering may choose (e.g. (1, 2, 4, 8): the widths a GEMV
+        decode can read too).
+
+        matmul_gemv: run single-row MatMuls (batch-1 FC layers, LLM decode)
+        on MatmulKernel's GEMV streaming path (``matmul_gemv``,
+        MATMUL_OPTIMISATION §8b).  "auto" (default, also ``True``: where the
+        cost model says it is faster), "always" or "off" (``False``; CLI
+        ``--matmul-gemv off``).  Never selected when the platform's kernel
+        has no GEMV path (``kernels.matmul.gemv_max_m = 0``).
+        ``matmul_gemv_kw`` ({constant B name: kw}) reads those weights in the
+        ConvKernel image of that kernel width — a multi-entry project passes
+        its prefill graphs' widths so decode and prefill share one buffer.
+        ``self.matmul_gemv_stats`` reports ``{"gemv", "kw>1",
+        "tiled_cycles", "gemv_cycles"}``.
 
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
@@ -642,7 +663,12 @@ class OnnxGraph:
             self._nodes, mode=matmul_on_conv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
             graph_io=self._input_names + self._output_names,
-            kw_override=matmul_conv_kw)
+            kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws)
+        self.matmul_gemv_stats = choose_gemv(
+            self._nodes, mode=matmul_gemv,
+            is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
+            graph_io=self._input_names + self._output_names,
+            kw_hint=matmul_gemv_kw)
         self._pack_matmul_weights()
         self._choose_slice_views()
 
@@ -803,7 +829,7 @@ class OnnxGraph:
             if b.data is None or b.onnx_name in done:
                 continue
             users = readers.get(b.onnx_name, [])
-            if not all(isinstance(u, MatmulNode) and u.inputs[1] is b
+            if not all(isinstance(u, MatmulNode) and u.inputs[1] is b and not u.gemv_kw
                        and u.k == sn.k and u.m == sn.m for u in users):
                 continue
             _pack_matmul_b(b, sn.k, sn.m)

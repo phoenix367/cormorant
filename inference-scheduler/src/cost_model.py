@@ -49,7 +49,7 @@ from ._conv_hw_config import (
     CONV_TILE_M,
     CONV_WEIGHT_PORT_ELEMS,
 )
-from ._matmul_hw_config import MATMUL_TILE_M, MATMUL_TILE_N
+from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_TILE_M, MATMUL_TILE_N
 
 # --------------------------------------------------------------------------
 # ConvKernel — constants of conv_cycle_model.py (ARCH 42), keep in sync.
@@ -67,6 +67,14 @@ PIXEL_OVERHEAD       = 12     # one sweep ramp per (ict, ow_tile, M-group)
 MM_K_CYCLE           = 1.03   # cycles per (row lane, k) step of the K-loop
 MM_BLOCK_OVERHEAD    = 380    # per (n_tile, m_tile) block
 MM_INVOKE_OVERHEAD   = 1000
+
+# MatmulKernel GEMV streaming mode (MATMUL_OPTIMISATION §8b): B streamed once
+# per A row, half through each read port at one 8-element word per cycle.
+# Not yet board-calibrated: the per-word cost is the tiled path's (the same
+# port, the same request shape), the job overhead the x load, the tap
+# preload and the pipeline ramps; the writer then drains m columns.
+GEMV_WORD_CYCLE      = 1.03
+GEMV_JOB_OVERHEAD    = 200
 
 # Host-side cost of one kernel call on the board (AXI-Lite register writes
 # through the UIO mapping, Start, the IsDone poll loop), in kernel cycles.
@@ -175,6 +183,16 @@ def matmul_cycles(n: int, k: int, m: int, batch: int = 1) -> float:
     return blocks * (MM_K_CYCLE * MATMUL_TILE_N * k + MM_BLOCK_OVERHEAD) + MM_INVOKE_OVERHEAD
 
 
+def gemv_cycles(n: int, k: int, m: int, batch: int = 1, kw: int = 1) -> float:
+    """Estimated cycles of one MatmulKernel GEMV call (``batch`` slices of
+    ``n`` A rows; B is ``k x m``, ``kw`` its image's kernel width)."""
+    chunks = max(1, -(-m // MATMUL_GEMV_MAX_M)) if MATMUL_GEMV_MAX_M else 1
+    words  = k * m / 8
+    per_row = (GEMV_WORD_CYCLE * words / 2
+               + chunks * (k / 8 + kw + GEMV_JOB_OVERHEAD) + m)
+    return batch * n * per_row + MM_INVOKE_OVERHEAD
+
+
 def cycles_to_ms(cycles: float, mhz: float = 100.0) -> float:
     return cycles / (mhz * 1e3)
 
@@ -184,5 +202,6 @@ __all__ = (
     "conv_cycles",
     "conv_batch_cycles",
     "matmul_cycles",
+    "gemv_cycles",
     "cycles_to_ms",
 )

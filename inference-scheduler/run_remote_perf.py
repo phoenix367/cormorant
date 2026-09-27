@@ -24,6 +24,7 @@ Usage:
 import argparse
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -109,7 +110,8 @@ class BenchResult:
 # Field name → positional arg order for each kernel (matches binary's main() parsing)
 _CASE_FIELDS: Dict[str, List[str]] = {
     "VectorOPKernel": ["op", "size", "outer", "a_inc", "b_inc", "iters"],
-    "MatmulKernel":   ["n", "k", "m", "batch", "a_stride", "b_stride", "b_packed", "iters"],
+    "MatmulKernel":   ["n", "k", "m", "batch", "a_stride", "b_stride", "b_packed", "gemv_kw",
+                       "iters"],
     "ConvKernel":     ["batch", "in_ch", "in_h", "in_w", "out_ch",
                        "kh", "kw", "stride_h", "stride_w",
                        "dilation_h", "dilation_w", "pad_top", "pad_left",
@@ -132,7 +134,8 @@ def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCas
                 f"VectorOPKernel case {d.get('label', '?')!r}: "
                 f"unsupported op={op} (valid: {valid})"
             )
-    # Optional fields default to 0 (e.g. MatmulKernel b_packed, MATMUL_OPTIMISATION §3b).
+    # Optional fields default to 0 (e.g. MatmulKernel b_packed / gemv_kw,
+    # MATMUL_OPTIMISATION §3b / §8b).
     args = [str(d.get(f, 0)) for f in fields]
     warmup = int(d.get("warmup", default_warmup))
     return BenchCase(kernel=kernel, label=d["label"], args=args, warmup=warmup)
@@ -312,7 +315,8 @@ def run_bench_case(session: RemoteSession, build_dir: str,
     warmup_arg = str(warmup_override) if warmup_override is not None else str(case.warmup)
 
     prefix = "sudo -n " if cfg["run"]["use_sudo"] else ""
-    cmd = f"{prefix}{binary} {instance} {case.label} {' '.join(args)} {warmup_arg}"
+    cmd = " ".join(shlex.quote(a) for a in [binary, instance, case.label, *args, warmup_arg])
+    cmd = prefix + cmd
 
     try:
         out, err, rc = session.exec(cmd, timeout=cfg["run"]["timeout"])
@@ -355,7 +359,8 @@ def _vop_detail(args: List[str]) -> str:
 def _mm_detail(args: List[str]) -> str:
     n, k, m = (int(args[i]) if len(args) > i else 0 for i in range(3))
     bat     = int(args[3]) if len(args) > 3 else 1
-    return f"N={n:<4} K={k:<4} M={m:<4} batch={bat}"
+    kw      = int(args[7]) if len(args) > 7 else 0
+    return f"N={n:<4} K={k:<4} M={m:<4} batch={bat}" + (f" GEMV kw={kw}" if kw else "")
 
 
 def _conv_detail(args: List[str]) -> str:

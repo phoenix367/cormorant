@@ -605,6 +605,12 @@ class MatmulNode:
     # after node creation, see pack_b()); b_batch_stride / b_outer_stride are
     # then counts in the PACKED image.
     b_packed:       bool = False
+    # GEMV streaming mode (MATMUL_OPTIMISATION §8b, src/matmul_gemv.py): 0 =
+    # the tiled path; 1 / 2 / 4 / 8 = B streamed once per A row through both
+    # read ports, in the ConvKernel x image of kernel width gemv_kw
+    # (conv_lowered_b_image; kw = 1 is row-major B), so a weight ConvKernel
+    # also reads needs one buffer.  Never together with b_packed.
+    gemv_kw:        int = 0
 
     # Compatibility shims for _compute_alloc_sizes / _broadcast_io_map.
     # These are always derived constants — never set by callers.
@@ -878,15 +884,17 @@ class MatmulNode:
             f"  (outer_loop\u00d7{self.outer_count})"
             if self.outer_count > 1 else ""
         )
+        gemv_str = f"  GEMV kw={self.gemv_kw}" if self.gemv_kw else ""
         return (
             f"    /* [{self.index}] MatMul({a}, {b}) -> {self.output.onnx_name}"
             f"  [{self.n},{self.k}]x[{self.k},{self.m}]->[{self.n},{self.m}]"
-            f"{batch_str}{outer_str} */"
+            f"{batch_str}{outer_str}{gemv_str} */"
         )
 
     def pack_b(self) -> None:
         """Switch this node to the packed B layout (the tensor image itself is
         packed once by OnnxGraph; every node sharing it calls this)."""
+        assert not self.gemv_kw, "a GEMV node reads B unpacked"
         if self.b_packed:
             return
         scale   = matmul_packed_m(self.m) * self.k       # packed slice size
@@ -930,14 +938,14 @@ class MatmulNode:
                     f"    run_matmul({a}, {b}, {c},\n"
                     f"               1u, {self.k}u, {self.m}u, {self.n}u,\n"
                     f"               {eff_a}u, {self.b_batch_stride}u, {eff_c}u,"
-                    f" {int(self.b_packed)}u);"
+                    f" {int(self.b_packed)}u, {self.gemv_kw}u);"
                 )
             return (
                 f"    run_matmul({a}, {b}, {c},\n"
                 f"               {self.n}u, {self.k}u, {self.m}u, {self.batch}u,\n"
                 f"               {self.a_batch_stride}u,"
                 f" {self.b_batch_stride}u,"
-                f" {self.c_batch_stride}u, {int(self.b_packed)}u);"
+                f" {self.c_batch_stride}u, {int(self.b_packed)}u, {self.gemv_kw}u);"
             )
 
         # 4D×3D broadcasting: outer loop over the b1 dimension.
@@ -949,7 +957,7 @@ class MatmulNode:
             f"                      {c}, _i * {self.c_outer_stride}u,",
             f"                      {self.n}u, {self.k}u, {self.m}u, {self.batch}u,",
             f"                      {self.a_batch_stride}u, {self.b_batch_stride}u,"
-            f" {self.c_batch_stride}u, {int(self.b_packed)}u);",
+            f" {self.c_batch_stride}u, {int(self.b_packed)}u, {self.gemv_kw}u);",
             "    }",
         ])
 

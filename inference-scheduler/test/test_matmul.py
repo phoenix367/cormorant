@@ -87,6 +87,8 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
         with (self._platforms_dir() / "kv260.json").open() as f:
             cfg = json.load(f)["kernels"]["matmul"]
         self.assertEqual(MATMUL_MAX_K, cfg["max_k"])
+        from src._matmul_hw_config import MATMUL_GEMV_MAX_M
+        self.assertEqual(MATMUL_GEMV_MAX_M, cfg["gemv_max_m"])
 
     def test_resolve_alternate_platform_picks_up_overrides(self):
         """``resolve('<name>')`` reads ``platforms/<name>.json`` — same
@@ -102,11 +104,13 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
             "kernels": {"matmul": {
                 "tile_n": 4, "tile_m": 16, "tile_k": 256,
                 "max_k": 1024,                      # <-- the override
+                "gemv_max_m": 0,
             }},
         }))
         try:
             cfg = resolve("_test_matmul_override")
             self.assertEqual(cfg["MATMUL_MAX_K"], 1024)
+            self.assertEqual(cfg["MATMUL_GEMV_MAX_M"], 0)
         finally:
             alt.unlink(missing_ok=True)
 
@@ -208,8 +212,10 @@ class TestMatmulPackedB(unittest.TestCase):
                 self.assertEqual(img[mm // MATMUL_TILE_M, kk, mm % MATMUL_TILE_M], w[kk, mm])
             for mm in range(m, pm):
                 self.assertEqual(img[0, kk, mm], 0.0)
-        self.assertIn(f"{int(node.b_packed)}u);", node.emit_call({}))
-        self.assertTrue(node.emit_call({}).rstrip().endswith("1u);"))
+        # ... b_packed, gemv_kw): m = 10 is not GEMV-eligible (m % 8 != 0)
+        self.assertEqual(node.gemv_kw, 0)
+        self.assertIn(f"{int(node.b_packed)}u, 0u);", node.emit_call({}))
+        self.assertTrue(node.emit_call({}).rstrip().endswith("1u, 0u);"))
 
     def test_batched_constant_b_strides_rescaled(self):
         b, k, m = 3, 8, 20

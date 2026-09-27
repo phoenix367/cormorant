@@ -37,6 +37,7 @@ import host_emu
 from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
+from src.llm_entries import entry_graphs
 from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode, LlmAttnMergeNode,
                            LlmAttnPrepNode, LlmAttnSoftmaxNode, LlmDequantNode, LlmEmbedNode,
                            LlmResAddNode, LlmRMSNormNode, LlmSelectRowNode, LlmSiluMulNode)
@@ -168,8 +169,17 @@ class TestFrontend(unittest.TestCase):
                             for t in g.state_tensors))
         gh = OnnxGraph(tiny_host()[3].entry("decode"))
         self.assertTrue(all(t.host == "i16" and t.group_layout for t in gh.state_tensors))
-        # decode linears: N = 1 -> MatmulKernel, packed constant B
-        self.assertTrue(all(sn.b_packed for sn in g.nodes if isinstance(sn, MatmulNode)))
+        # decode linears: N = 1 -> MatmulKernel: the GEMV streaming path where
+        # it applies (matmul_gemv.py; the k / v projections of this tiny model
+        # have m = 32 < 64 in the plain image), else the packed constant B
+        from src.matmul_gemv import ineligible_reason
+        mms = [sn for sn in g.nodes if isinstance(sn, MatmulNode)]
+        for sn in mms:
+            self.assertNotEqual(bool(sn.gemv_kw), bool(sn.b_packed), sn.onnx_node.name)
+            self.assertEqual(bool(sn.gemv_kw), ineligible_reason(sn, 1) is None,
+                             sn.onnx_node.name)
+        self.assertTrue(any(sn.gemv_kw for sn in mms))
+        self.assertTrue(any(sn.b_packed for sn in mms))
         # every MatMul weight encoded at its rank-1 exponent, none saturated
         self.assertTrue(all(sn.inputs[1].wexp is not None for sn in g.nodes
                             if isinstance(sn, MatmulNode)))
@@ -391,16 +401,35 @@ class TestHostEmulation(unittest.TestCase):
 
     def test_multi_entry_project(self):
         _cfg, _W, _f, fe = tiny()
-        gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),
-                         "prefill_16": ("prefill", 16, False), "head": ("head", 1, False)},
-                    matmul_on_conv="always")
-        mg = MultiEntryGenerator(list(gs.items()), "llama_tiny")
+        kinds = {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),
+                 "prefill_16": ("prefill", 16, False), "head": ("head", 1, False)}
+        entries = entry_graphs({n: fe.entry(kind, T, with_head=wh)
+                                for n, (kind, T, wh) in kinds.items()},
+                               matmul_on_conv="always")
+        gs = dict(entries)
+        self.assertEqual([n for n, _ in entries], ["decode", "prefill_8", "prefill_16", "head"])
+        mg = MultiEntryGenerator(entries, "llama_tiny")
         s = mg.summary()
-        # decode + head share the packed copy; both prefill buckets one conv copy
+        # Both prefill buckets read one conv image of each linear; decode reads
+        # it too through MatmulKernel's GEMV path (src/llm_entries.py) — one
+        # copy.  A decode linear GEMV cannot take keeps the packed image, and
+        # the prefill copy is renamed <name>@1.  decode and head share the LM
+        # head.
         n_lin = 7 * 2
-        self.assertEqual(len(s["renamed_weights"]), n_lin)
+        conv_w = {sn.inputs[1].onnx_name: sn.kw for sn in gs["prefill_16"].nodes
+                  if isinstance(sn, MatmulConvNode)}
+        dec = {sn.inputs[1].onnx_name: sn for sn in gs["decode"].nodes
+               if isinstance(sn, MatmulNode)}
+        self.assertEqual(len(conv_w), n_lin)
+        self.assertTrue(all(kw in (1, 2, 4, 8) for kw in conv_w.values()))
+        for w, sn in dec.items():
+            if w in conv_w and sn.gemv_kw:
+                self.assertEqual(sn.gemv_kw, conv_w[w], w)
+        packed = sorted(w for w, sn in dec.items() if w in conv_w and not sn.gemv_kw)
+        self.assertLess(len(packed), n_lin // 2)
+        self.assertEqual(sorted(s["renamed_weights"]), packed)
         self.assertTrue(all(v == [k + "@1"] for k, v in s["renamed_weights"].items()))
-        self.assertEqual(s["weights"], 2 * n_lin + 1)
+        self.assertEqual(s["weights"], n_lin + 1 + len(packed))
         self.assertEqual(sorted(t.onnx_name for t in mg.combined.state_tensors),
                          sorted([f"kv.{w}.l{l}" for w in "kv" for l in range(2)] + ["h_last"]))
         src = mg.generate_source()

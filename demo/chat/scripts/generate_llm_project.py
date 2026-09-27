@@ -48,7 +48,7 @@ sys.path.insert(0, HERE)
 
 import llm_project as lp                                           # noqa: E402
 from src.codegen.multi import MultiEntryGenerator                  # noqa: E402
-from src.graph import OnnxGraph                                    # noqa: E402
+from src.llm_entries import entry_graphs                         # noqa: E402
 from src.host_nodes import HostNode                                # noqa: E402
 from src.kernels import KERNEL_REGISTRY                            # noqa: E402
 from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode,      # noqa: E402
@@ -86,32 +86,10 @@ def node_kind(sn) -> str:
 
 
 def build_entries(models: dict, prefill_engine: str, log=print):
-    """[(name, OnnxGraph)]: decode, the prefill buckets (largest first plans
-    the conv kernel widths the smaller ones reuse), head."""
-    graphs = {}
-    t0 = time.time()
-    graphs["decode"] = OnnxGraph(models["decode"], fuse_act=True, s2d_stem=True)
-    log(f"  decode: {len(graphs['decode'].nodes)} nodes ({time.time() - t0:.0f} s)")
-    prefills = sorted((n for n in models if n.startswith("prefill_")),
-                      key=lambda n: -int(n.split("_")[1]))
-    kw = None
-    for name in prefills:
-        t0 = time.time()
-        g = OnnxGraph(models[name], fuse_act=True, s2d_stem=True,
-                      matmul_on_conv="auto" if prefill_engine == "conv" else "off",
-                      matmul_conv_kw=kw)
-        if kw is None:
-            kw = {sn.inputs[1].onnx_name: sn.kw for sn in g.nodes
-                  if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight}
-        graphs[name] = g
-        st = g.matmul_conv_stats
-        est = (f", est. {st['conv_cycles'] / 1e6:.1f} M cycles vs {st['matmul_cycles'] / 1e6:.1f} M "
-               f"on MatmulKernel" if st["lowered"] else "")
-        log(f"  {name}: {len(g.nodes)} nodes, MatMul on ConvKernel "
-            f"{st['lowered']} / kept {st['kept']}{est} ({time.time() - t0:.0f} s)")
-    graphs["head"] = OnnxGraph(models["head"], fuse_act=True, s2d_stem=True)
-    order = ["decode"] + sorted(prefills, key=lambda n: int(n.split("_")[1])) + ["head"]
-    return [(n, graphs[n]) for n in order]
+    """[(name, OnnxGraph)]: decode, the prefill buckets, head — one copy of
+    every weight where MatmulKernel's GEMV path can read the prefill image
+    (src/llm_entries.py)."""
+    return entry_graphs(models, prefill_engine=prefill_engine, log=log)
 
 
 def populate_drivers(out: str, driver_dirs: dict, active) -> list:

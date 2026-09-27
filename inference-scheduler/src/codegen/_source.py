@@ -12,6 +12,7 @@ from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostN
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
                          llm_c_helpers)
 from ._banners  import _banner, _file_banner
+from .._matmul_hw_config import MATMUL_GEMV_MAX_M
 
 
 # A group-major state [G][R][D] (TensorInfo.group_layout, rows interleaved by
@@ -847,6 +848,16 @@ class _SourceMixin:
                 "}\n"
             )
 
+        # GEMV registers (MatmulKernel.h "GEMV streaming mode"): written on
+        # every call — they persist across calls — when the platform's
+        # kernel has them; a_to_b lets port a reach its half of B.
+        def gemv_regs(a_addr: str, b_addr: str) -> str:
+            if MATMUL_GEMV_MAX_M <= 0:
+                return "    (void)gemv_kw;\n"
+            return (f"    XMatmulkernel_Set_gemv_kw(&{mm_var}, gemv_kw);\n"
+                    f"    XMatmulkernel_Set_a_to_b(&{mm_var},\n"
+                    f"        (uint64_t)(({b_addr}) - ({a_addr})));\n")
+
         if need_run_matmul:
             parts.append(
                 "/*\n"
@@ -870,6 +881,9 @@ class _SourceMixin:
                 " *   b_packed    1 when b holds the kernel's tile-major packed\n"
                 " *                weight image (constant weights, emitted by the\n"
                 " *                scheduler); 0 for a row-major [k][m] matrix\n"
+                " *   gemv_kw     0: the tiled path; 1 / 2 / 4 / 8: the GEMV streaming\n"
+                " *                path, b in the ConvKernel x image of that kernel\n"
+                " *                width (1: row-major [k][m])\n"
                 " */\n"
                 "static void run_matmul(\n"
                 "    inference_buf_t *a,\n"
@@ -877,7 +891,7 @@ class _SourceMixin:
                 "    inference_buf_t *c,\n"
                 "    uint32_t n, uint32_t k, uint32_t m, uint32_t batch,\n"
                 "    uint32_t a_stride, uint32_t b_stride, uint32_t c_stride,\n"
-                "    uint32_t b_packed)\n"
+                "    uint32_t b_packed, uint32_t gemv_kw)\n"
                 "{\n"
                 f"    XMatmulkernel_Set_a(&{mm_var}, inference_buf_phys(a));\n"
                 f"    XMatmulkernel_Set_b(&{mm_var}, inference_buf_phys(b));\n"
@@ -890,7 +904,8 @@ class _SourceMixin:
                 f"    XMatmulkernel_Set_b_batch_stride(&{mm_var}, b_stride);\n"
                 f"    XMatmulkernel_Set_c_batch_stride(&{mm_var}, c_stride);\n"
                 f"    XMatmulkernel_Set_b_packed(&{mm_var}, b_packed);\n"
-                f"    XMatmulkernel_Start(&{mm_var});\n"
+                + gemv_regs("inference_buf_phys(a)", "inference_buf_phys(b)")
+                + f"    XMatmulkernel_Start(&{mm_var});\n"
                 "}\n"
             )
 
@@ -918,7 +933,7 @@ class _SourceMixin:
                 "    inference_buf_t *c, unsigned c_off,\n"
                 "    uint32_t n, uint32_t k, uint32_t m, uint32_t batch,\n"
                 "    uint32_t a_stride, uint32_t b_stride, uint32_t c_stride,\n"
-                "    uint32_t b_packed)\n"
+                "    uint32_t b_packed, uint32_t gemv_kw)\n"
                 "{\n"
                 f"    XMatmulkernel_Set_a(&{mm_var},\n"
                 "        inference_buf_phys(a)"
@@ -937,7 +952,9 @@ class _SourceMixin:
                 f"    XMatmulkernel_Set_b_batch_stride(&{mm_var}, b_stride);\n"
                 f"    XMatmulkernel_Set_c_batch_stride(&{mm_var}, c_stride);\n"
                 f"    XMatmulkernel_Set_b_packed(&{mm_var}, b_packed);\n"
-                f"    XMatmulkernel_Start(&{mm_var});\n"
+                + gemv_regs("inference_buf_phys(a) + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM",
+                            "inference_buf_phys(b) + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM")
+                + f"    XMatmulkernel_Start(&{mm_var});\n"
                 f"    while (!XMatmulkernel_IsDone(&{mm_var})) {{}}\n"
                 "}\n"
             )

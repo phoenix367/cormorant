@@ -195,7 +195,8 @@ def _readers(nodes) -> Dict[str, list]:
 
 def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = True,
                   graph_io: Sequence[str] = (),
-                  kw_override: Optional[Dict[str, int]] = None) -> Tuple[list, dict]:
+                  kw_override: Optional[Dict[str, int]] = None,
+                  kw_choices: Optional[Sequence[int]] = None) -> Tuple[list, dict]:
     """Return ``(new_nodes, stats)``: ``nodes`` with every MatmulNode that
     should run on ConvKernel replaced by a MatmulConvNode (same index,
     inputs and output), and the constant Bs that use a ``kw > 1`` layout
@@ -205,7 +206,9 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
 
     ``kw_override`` ({constant B name: kw}) pins the kernel width of the
     listed weights — a multi-entry project's graphs must re-lay out a
-    shared weight identically for it to stay one buffer."""
+    shared weight identically for it to stay one buffer.  ``kw_choices``
+    limits the widths a re-laid-out B may take (the LLM projects pass the
+    ones MatmulKernel's GEMV decode can read as well, matmul_gemv.py)."""
     mode = normalize_mode(mode)
     kw_override = kw_override or {}
     stats = {"lowered": 0, "kept": 0, "conv_calls": 0,
@@ -233,6 +236,8 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
                        and b.onnx_name not in io
                        and len(readers.get(b.onnx_name, [])) == 1)
         kws = range(1, CONV_MAX_KW + 1) if relayout_ok else (1,)
+        if kw_choices is not None:
+            kws = [k for k in kws if k in kw_choices]
         if b.onnx_name in kw_override:
             kws = [k for k in kws if k == kw_override[b.onnx_name]]
         plans = conv_plans(sn, kws)

@@ -185,6 +185,20 @@ def parse_args(argv=None):
         const="off",
         help="Same as --matmul-on-conv off: every MatMul stays on MatmulKernel.",
     )
+    p.add_argument(
+        "--matmul-gemv",
+        dest="matmul_gemv",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help=(
+            "Run single-row MatMuls (batch-1 FC layers) on MatmulKernel's GEMV "
+            "streaming path, which reads B through both of the kernel's read "
+            "ports (MATMUL_OPTIMISATION 8b): 'auto' (default) where the cost "
+            "model estimates it faster than the tiled path, 'always' for every "
+            "eligible MatMul, 'off' for none.  Needs a kernel built with "
+            "kernels.matmul.gemv_max_m > 0.  Bit-identical results either way."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -224,7 +238,8 @@ def main_multi(args) -> int:
             return 1
         try:
             g = OnnxGraph(path, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
-                          fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv)
+                          fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv,
+                          matmul_gemv=args.matmul_gemv)
         except (FileNotFoundError, SchedulerError) as e:
             print(f"error: entry {name}: {e}", file=sys.stderr)
             return 1
@@ -285,7 +300,8 @@ def main(argv=None):
     try:
         graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns,
-                          matmul_on_conv=args.matmul_on_conv)
+                          matmul_on_conv=args.matmul_on_conv,
+                          matmul_gemv=args.matmul_gemv)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
