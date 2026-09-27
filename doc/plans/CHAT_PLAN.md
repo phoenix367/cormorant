@@ -1,6 +1,6 @@
 # Chat app on the KV260 — plan and log
 
-Status (2026-09-27): **all planned phases done, on main.**  Phase 1 BERT-QA
+Status (2026-09-28): **all planned phases done, on main.**  Phase 1 BERT-QA
 server (§9); phase 2 numeric study GO (§10); phase 3 SmolLM2-135M
 `libsmollm2.so`, bit-exact (§13); phase 4 server integration with both
 backends on the board (§12, §14), DRY sampling (§15); phase 5 prefill attention
@@ -9,7 +9,9 @@ threads, 5.06 tok/s at position 32 and 4.39 at 1000 (§17).  Board-hang
 workaround in §18.  Dual-port weight streaming (MatmulKernel's GEMV mode):
 one weight copy, decode **10.07 tok/s** at position 32 and 7.67 at 1000,
 CMA pool 488 → 286 MiB (§19).  SmolLM2-360M-Instruct: bit-exact on the
-board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  Not done:
+board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  The study
+stage is reproducible from pinned checkpoints and texts, with the formats
+hashes recorded (`llm_calibrate.py`, §21).  Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
@@ -1701,3 +1703,51 @@ the library names (`llm_model_name()`; `smollm2.model_id` /
 `/root/kv260_chat/lib/libsmollm2_360m.so` and `smollm2.cma_mb` to 760 in
 `chat_config.json`.  The board runs 135M by default.
 
+
+## 21. The study stage, reproducible (2026-09-28)
+
+The libraries' numerics are fixed by one file per model: the calibrated
+exponents and the position-0 sink K / V, `formats_pow2+sink+p12.json`, which
+`llm_study.py formats` computes from the checkpoint and the WikiText-2
+calibration text (§10).  Until now both inputs were fetched by hand from
+moving targets (`resolve/main`, the datasets server) and nothing recorded
+which bytes the shipped formats came from.
+
+**Pins** — `demo/chat/scripts/llm_models.json` (tracked): per model the
+Hugging Face repo at a commit (135M 12fd25f, 360M a10cc15), the SHA-256 of
+its eight checkpoint files, the calibration policy and the SHA-256 of the
+formats JSON, plus the shipped policy's study metrics (`pow2+sink+p12+mix`);
+the SHA-256 of both texts, which are model independent.
+`requirements-study.txt` is the environment that produced them (numpy 2.5.3
+with its OpenBLAS 0.3.34, tokenizers 0.23.2; torch / transformers for
+`validate` only).
+
+**`llm_calibrate.py`** — `fetch` (download at the pinned revision, every
+hash verified, matching files kept, texts copied from another model's
+assets or fetched by `llm_study.py fetch`), `calibrate` (formats into a
+scratch file, installed with a `formats_*.provenance.json` — input hashes,
+commit, `llm_study.py`'s hash, package / BLAS versions, CPU — only when the
+hash reproduces or with `--record` / `--force`, otherwise left as
+`formats_*.new.json`), `check` (the same without installing, plus a diff of
+the exponents / sink values against the installed file), `study` (bf16 and
+the shipped policies → `study[/<model>]/shipped/`, metrics compared with the
+manifest), `validate`, `all`, `add` (pin a new checkpoint).  Stdlib only; the
+study steps run in the study environment.  16 tests in
+`tests/test_llm_calibrate.py` (file:// URLs for Hugging Face, a fake
+`llm_study.py`).
+
+**Verified:**
+
+| | 135M | 360M |
+|---|---|---|
+| `fetch` into an empty directory | 58 s, 10 / 10 hashes (texts from the datasets server) | 135 s, 10 / 10 (texts copied) |
+| formats SHA-256 (reruns, clean directory, `check`) | b870edfe… reproduced | 7196e674… reproduced |
+| `study` (shipped policy) | ppl 15.616, top-1 0.976 / 0.980 / 0.969, KL 0.0024, 3 / 12 identical (= §16.2); 15 min | recorded from §20's run (the same code path) |
+
+The calibration is deterministic on this machine: reruns are byte
+identical.  numpy's OpenBLAS picks CPU-specific kernels at run time, so on
+another CPU a calibration maximum near a power of two, or a sink value near
+a rounding boundary, can come out differently; `check` names such
+differences, and a differing formats file is a different (not a wrong)
+library — its board gate is the bit-exactness against its own study
+emulation (§13, §20).

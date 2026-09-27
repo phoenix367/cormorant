@@ -1,0 +1,81 @@
+{
+  "_comment": "Pinned inputs and expected outputs of the exponent calibration (llm_calibrate.py, doc/plans/CHAT_PLAN.md \u00a721): per model the Hugging Face revision and the SHA-256 of every checkpoint file, the calibration policy and the SHA-256 of its formats JSON (the file libsmollm2*.so is generated from), and the shipped policy's study metrics; the WikiText-2 texts (model independent).",
+  "models": {
+    "smollm2-135m-instruct": {
+      "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+      "license": "apache-2.0",
+      "files": {
+        "config.json": "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a",
+        "generation_config.json": "87b916edaaab66b3899b9d0dd0752727dff6666686da0504d89ae0a6e055a013",
+        "model.safetensors": "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c",
+        "tokenizer.json": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+        "tokenizer_config.json": "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df",
+        "special_tokens_map.json": "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52",
+        "vocab.json": "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79",
+        "merges.txt": "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510"
+      },
+      "formats": {
+        "policy": "pow2+sink+p12",
+        "sha256": "b870edfe590909a530b8985d79e19c4ae06b6daeafd8f704713c0ac7949a2f1a"
+      },
+      "study": {
+        "policy": "pow2+sink+p12+mix",
+        "ppl": 15.616059,
+        "float_ppl": 15.598483,
+        "top1_all": 0.975595,
+        "top1_resp": 0.979798,
+        "top1_held": 0.969045,
+        "kl_held": 0.002433,
+        "identical": 3
+      }
+    },
+    "smollm2-360m-instruct": {
+      "repo": "HuggingFaceTB/SmolLM2-360M-Instruct",
+      "revision": "a10cc1512eabd3dde888204e902eca88bddb4951",
+      "license": "apache-2.0",
+      "files": {
+        "config.json": "224f72354f10d617a359cc82ad15a3c96e866b9b2ffadb81997eeea9e88e22ee",
+        "generation_config.json": "87b916edaaab66b3899b9d0dd0752727dff6666686da0504d89ae0a6e055a013",
+        "model.safetensors": "e6bffe7435d7ddc10fd3b9a9efd429dafbacb1cb17015fb5562664e7532bf86e",
+        "tokenizer.json": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c",
+        "tokenizer_config.json": "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df",
+        "special_tokens_map.json": "2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52",
+        "vocab.json": "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79",
+        "merges.txt": "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510"
+      },
+      "formats": {
+        "policy": "pow2+sink+p12",
+        "sha256": "7196e6743e7a3cff42517b21a75f226e520a4ada14e5bca5f04a75e2476ad50a"
+      },
+      "study": {
+        "policy": "pow2+sink+p12+mix",
+        "ppl": 12.393697,
+        "float_ppl": 12.373367,
+        "top1_all": 0.9777,
+        "top1_resp": 0.993639,
+        "top1_held": 0.975888,
+        "kl_held": 0.001794,
+        "identical": 8
+      }
+    }
+  },
+  "texts": {
+    "heldout_wikitext2_test.txt": {
+      "dataset": "Salesforce/wikitext",
+      "config": "wikitext-2-raw-v1",
+      "split": "test",
+      "min_chars": 24000,
+      "license": "CC BY-SA 3.0",
+      "sha256": "15c9b97c8cc52e602cffc96ac0d5639232fb8e82ddfb1b00720a990aae65647d"
+    },
+    "calib_wikitext2_valid.txt": {
+      "dataset": "Salesforce/wikitext",
+      "config": "wikitext-2-raw-v1",
+      "split": "validation",
+      "min_chars": 8000,
+      "license": "CC BY-SA 3.0",
+      "sha256": "86698efa3f4f77ba6f8bc681ce22298ed1d2549aeb459d278ef60f837fd3456f"
+    }
+  }
+}

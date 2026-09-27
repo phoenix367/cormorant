@@ -1,0 +1,20 @@
+# The study environment of llm_study.py / llm_calibrate.py (the numeric study,
+# the exponent calibration, the float reference validation) — kept apart from
+# inference-scheduler/.venv because of torch.  These are the versions that
+# reproduced the formats hashes recorded in llm_models.json (2026-09-28,
+# Python 3.12, OpenBLAS 0.3.34 from numpy's wheel).
+#
+#   python3 -m venv .venv-export
+#   PIP_CONFIG_FILE=/dev/null .venv-export/bin/pip install \
+#       --extra-index-url https://download.pytorch.org/whl/cpu \
+#       -r demo/chat/scripts/requirements-study.txt
+#
+# calibrate / study / fetch need only numpy and tokenizers; validate also
+# needs torch, transformers and safetensors (the float reference).
+numpy==2.5.3
+tokenizers==0.23.2
+safetensors==0.8.0
+torch==2.14.0+cpu
+transformers==5.17.0
+huggingface_hub==1.33.0
+Jinja2==3.1.6

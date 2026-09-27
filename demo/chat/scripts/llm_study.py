@@ -82,6 +82,11 @@ Usage (.venv-export: torch CPU, transformers, safetensors, numpy):
   $PY demo/chat/scripts/llm_study.py formats [--base pow2+sink+p12]  # exponents + sink K/V -> JSON
   $PY demo/chat/scripts/llm_study.py costs        # decode / prefill bytes and MACs per token
 
+Reproducibly: llm_calibrate.py runs fetch / formats / study / validate from
+the inputs pinned in llm_models.json (checkpoint revision, SHA-256 of every
+file and text) and checks the formats against the recorded hash; the
+environment is requirements-study.txt.
+
 Assets (not in git, see demo/chat/assets/.gitignore): SMOLLM_ASSETS or
 demo/chat/assets/smollm2-135m-instruct/ (config.json, model.safetensors,
 tokenizer.json, tokenizer_config.json, generation_config.json; `fetch` adds

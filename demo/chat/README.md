@@ -66,8 +66,11 @@ demo/chat/
 │   ├── llm_lib_check.py     — libsmollm2.so through ctypes (runs on the board)
 │   ├── llm_attn_kernel_bench.py — decode attention on the FPGA vs host (CHAT_PLAN §13.4)
 │   ├── llm_study.py         — numeric study, calibrated formats JSON (.venv-export)
+│   ├── llm_calibrate.py     — the study stage from pinned inputs: fetch, calibrate, check, study
+│   ├── llm_models.json      — pinned checkpoints / texts (SHA-256) and the expected formats hashes
+│   ├── requirements-study.txt — the .venv-export versions that reproduce those hashes
 │   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export)
-├── assets/                  — not in git: smollm2-135m-instruct/ (Hugging Face checkpoint), study/
+├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/
 └── tests/                   — unittest: protocol, text modules, sampler, backends, fakes; board_gate.py
 ```
 
@@ -130,14 +133,16 @@ the server still starts with the other backends and answers
 
 **Building `libsmollm2.so`** (CHAT_PLAN §13.5).  The assets are not in
 git: the Hugging Face checkpoint `HuggingFaceTB/SmolLM2-135M-Instruct`
-(`config.json`, `model.safetensors`, `tokenizer.json`, ...) in
-`assets/smollm2-135m-instruct/`, and the calibrated exponents
-`assets/study/formats_pow2+sink+p12.json`, written by
-`scripts/llm_study.py fetch` + `formats` (the `.venv-export` virtualenv:
-torch, transformers, safetensors, numpy).
+(`config.json`, `model.safetensors`, `tokenizer.json`, ...) and the
+WikiText-2 texts in `assets/smollm2-135m-instruct/`, and the calibrated
+exponents `assets/study/formats_pow2+sink+p12.json`.  `scripts/llm_calibrate.py`
+makes them from the inputs pinned in `scripts/llm_models.json` (revision and
+SHA-256 of every file) and checks the result against the recorded hash — see
+[Calibration](#calibration--the-study-stage-reproduced) below.
 
 ```bash
 cd demo/chat
+python3 scripts/llm_calibrate.py all smollm2-135m-instruct   # fetch + calibrate, ~1.5 min
 PY=../../inference-scheduler/.venv/bin/python
 $PY scripts/generate_llm_project.py      # -> build/llm_project (~100 s; 538 MB weights/*.dat)
 $PY deploy.py --stop                     # the server owns the FPGA
@@ -361,14 +366,8 @@ pool is 740 MiB, so it and BERT swap under `--resident auto`.
 
 ```bash
 cd demo/chat
-D=assets/smollm2-360m-instruct; mkdir -p $D     # the Hugging Face checkpoint (Apache-2.0)
-R=https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main
-for f in config.json generation_config.json model.safetensors tokenizer.json \
-         tokenizer_config.json special_tokens_map.json vocab.json merges.txt; do
-    curl -sSfL -o $D/$f $R/$f; done           # the tokenizer files equal 135M's
-cp assets/smollm2-135m-instruct/*_wikitext2_*.txt $D/
-../../.venv-export/bin/python scripts/llm_study.py formats --assets assets/smollm2-360m-instruct
-                                          # -> assets/study/smollm2-360m-instruct/ (2 min)
+python3 scripts/llm_calibrate.py all smollm2-360m-instruct   # checkpoint (Apache-2.0, 724 MB),
+                                          # texts, formats -> assets/study/smollm2-360m-instruct/
 $PY scripts/generate_llm_project.py --assets assets/smollm2-360m-instruct \
     --model-name smollm2-360m-instruct   # -> build/llm_project_smollm2_360m (~6 min, 32 GB RAM)
 $PY deploy.py --stop
@@ -380,6 +379,44 @@ Then point `smollm2.lib` at `/root/kv260_chat/lib/libsmollm2_360m.so`, set
 `smollm2.cma_mb` to 760 and run `deploy.py`: the server serves the model the
 library names (`llm_model_name()`), `smollm2-360m-instruct`
 (`smollm2.model_id` / `--llm-model-id` override it).
+
+### Calibration — the study stage, reproduced
+
+The library's numerics are fixed by one file per model, the calibrated
+power-of-two exponents `formats_pow2+sink+p12.json` (and the position-0
+sink K / V at those exponents) that `llm_study.py formats` computes from the
+checkpoint and a WikiText-2 calibration text (CHAT_PLAN §10).
+`scripts/llm_models.json` (tracked) pins the inputs — the Hugging Face repo
+at a commit, the SHA-256 of each checkpoint file and of both texts — and the
+SHA-256 of the expected formats file, plus the shipped policy's study
+metrics.  `scripts/llm_calibrate.py` runs the stage from those pins:
+
+```bash
+cd demo/chat
+python3 scripts/llm_calibrate.py fetch smollm2-360m-instruct      # download at the pinned revision,
+                                          # texts via the datasets server; every hash verified
+python3 scripts/llm_calibrate.py calibrate smollm2-360m-instruct  # formats; installed only if the
+                                          # hash reproduces, + formats_*.provenance.json
+python3 scripts/llm_calibrate.py check smollm2-135m-instruct      # recompute, compare, install nothing
+python3 scripts/llm_calibrate.py study smollm2-360m-instruct      # bf16 / p12 / p12+mix metrics
+                                          # vs the manifest (-> study[/<model>]/shipped/; 360M ~40 min)
+python3 scripts/llm_calibrate.py validate smollm2-135m-instruct   # float64 reference vs torch
+```
+
+The study steps run in `.venv-export` (`--study-python` / `STUDY_PYTHON`
+elsewhere), created from `scripts/requirements-study.txt` — the versions
+that reproduced the recorded hashes (numpy 2.5.3 with its OpenBLAS 0.3.34,
+tokenizers 0.23.2; torch / transformers only for `validate`).  Reruns are
+byte-identical, and a fetch into an empty directory reproduces both models'
+hashes (2026-09-28).  numpy's OpenBLAS selects CPU-specific kernels, so on
+another machine a sink value can round differently: `calibrate` then keeps
+the installed file, leaves the result as `formats_*.new.json` and prints
+which exponents / sink values differ (`--force` installs it anyway,
+`--record` also stores its hash).  The provenance file records the input
+hashes, the commit and `llm_study.py`'s hash, the package versions, BLAS
+and CPU.  `HF_ENDPOINT` selects a Hugging Face mirror.  A new checkpoint:
+`add <name> --repo <org/repo> [--revision <branch|tag|commit>]` pins it,
+then `fetch`, `calibrate --record` and `study --record`.
 
 ### Without the FPGA
 
@@ -781,7 +818,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 121 tests, ~40 s, stdlib only (a C compiler for the C parts)
+python3 -m unittest -v                  # 137 tests, ~40 s, stdlib only (a C compiler for the C parts)
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
 # host validation against transformers, from the repo root
@@ -815,7 +852,11 @@ new tokens prefilled, the sink never), stop strings across tokens,
 `max_tokens`, cancellation, context-full and trimming, UTF-8 across tokens,
 seeds and parameters, library errors, and residency (`one` / `auto` / `all`
 switching between `bert-squad` and `smollm2` with fake engines and a fake
-CMA pool).
+CMA pool).  `test_llm_calibrate.py` — `llm_models.json`'s schema,
+verified downloads and fetch (file:// standing in for Hugging Face: kept,
+replaced, copied and rejected files), the formats diff, and `calibrate` /
+`check` against a fake `llm_study.py` (installed only on a reproduced or
+recorded hash, provenance, `check` writing nothing).
 
 **Tokenizer reference.**  `validate_text.py` compares against transformers'
 `TokenizersBackend.from_pretrained` — the `tokenizer.json` pipeline, what
