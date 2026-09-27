@@ -80,8 +80,7 @@ Options:
 The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
 `matmul_on_conv="auto"` and `matmul_gemv="auto"`; the `OnnxGraph` library
 defaults are `fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
-`matmul_on_conv="auto"`, `matmul_gemv="auto"`. The `argparse` epilog (module docstring) of
-`inference_scheduler.py` still describes the original VectorOP-only tool.
+`matmul_on_conv="auto"`, `matmul_gemv="auto"`.
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
 
@@ -609,9 +608,8 @@ the `KERNEL_REGISTRY` names (`PoolKernel`); `run_remote_perf.py` uses
 `run_remote_perf.py` validates each `VectorOPKernel` case's `op` against the
 kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) when it loads the cases and
 exits with `config error: VectorOPKernel case '<label>': unsupported op=…`
-before any benchmark runs.  Note: `_load_cases()` is called after the SSH
-connection, the preflight check and the remote build, not at config-load
-time, so a bad case still costs one build.
+before it connects to the board (`_load_cases()` runs right after the config
+is loaded), so a bad case costs no remote build.
 
 ## Driver Sources
 
