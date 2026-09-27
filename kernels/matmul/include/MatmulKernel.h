@@ -108,6 +108,49 @@ inline unsigned matmul_packed_index(unsigned kk, unsigned mm, unsigned k) {
     return ((mm / kTileM) * k + kk) * kTileM + (mm % kTileM);
 }
 
+// ---------------------------------------------------------------------------
+// GEMV streaming mode — gemv_kw != 0 (MATMUL_OPTIMISATION.md §8b).
+//
+// For a few rows of A against a large B (batch-1 FC layers, LLM decode) the
+// tiled path is bound by ONE B word per cycle.  The GEMV path streams B
+// once per A row instead, split in two halves read through BOTH ports
+// (a carries the A row first, then half of B) at one word per port per
+// cycle, 8 MACs per port; each half accumulates every output column on
+// chip and the writer adds the two partial sums (modular fixed-point adds:
+// the result is bit-identical to the tiled path).
+//
+// B is read in the ConvKernel input image of a MatMul lowered with kernel
+// width kw (nodes.conv_lowered_b_image in the scheduler), so a weight that
+// ConvKernel reads for prefill needs no second copy for decode:
+//
+//     img[(c * m + p) * kw + j] = B[matmul_gemv_k(c, j, kw)][p]
+//         c < k / kw ("plane"), p < m, j < kw
+//     matmul_gemv_k(c, j, kw) = (c / 16) * 16 * kw + j * 16 + c % 16
+//
+// kw = 1 is plain row-major B[k][m].  Batch slices are b_batch_stride
+// elements apart as usual.  Requirements (the scheduler enforces them):
+//   gemv_kw in {1, 2, 4, 8};  k % 8 == 0, and k % (16 * kw) == 0 for kw > 1;
+//   k <= kMaxK;  m % 8 == 0 and m * kw >= kGemvMinPlane (the accumulator
+//   read-modify-write of one plane must not reach the next plane's first
+//   access within the pipeline);  a, b 16-byte aligned and
+//   a_batch_stride, b_batch_stride multiples of 8 elements.
+// Port a reaches its half of B through the register a_to_b = address of b
+// minus address of a, in bytes (two's complement): an m_axi port only
+// knows its own base address.
+// C is written row-major exactly as by the tiled path.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kGemvMinPlane = 64;   // elements (8 words) per plane
+inline unsigned matmul_gemv_k(unsigned c, unsigned j, unsigned kw) {
+    return (c / 16) * 16 * kw + j * 16 + c % 16;
+}
+// Image offset of B[kk][p] (the inverse of matmul_gemv_k).
+inline unsigned matmul_gemv_index(unsigned kk, unsigned p, unsigned m, unsigned kw) {
+    if (kw == 1) return kk * m + p;
+    const unsigned c = (kk / (16 * kw)) * 16 + kk % 16;
+    const unsigned j = (kk / 16) % kw;
+    return (c * m + p) * kw + j;
+}
+
 // Rotate the lanes of a port word right by `shift` lanes: lane j of the
 // result is lane (j + shift) mod kMatmulPortElems of the input.  Written as
 // a chain of constant rotates selected by `shift` so HLS builds ONE
@@ -161,9 +204,9 @@ inline unsigned matmul_words_for(unsigned off, unsigned count) {
 // A and B are in ELEMENTS; their *_WORDS variants (one spare word for the
 // over-read of a row's last word) size the 128-bit ports.
 // ---------------------------------------------------------------------------
-#define MATMUL_COSIM_DEPTH_A  8192
-#define MATMUL_COSIM_DEPTH_B  16384
-#define MATMUL_COSIM_DEPTH_C  4096
+#define MATMUL_COSIM_DEPTH_A  524288   // GEMV cases put A and B in the a buffer (TestMatmulSim)
+#define MATMUL_COSIM_DEPTH_B  524288
+#define MATMUL_COSIM_DEPTH_C  32768
 #define MATMUL_COSIM_DEPTH_A_WORDS  (MATMUL_COSIM_DEPTH_A / kMatmulPortElems + 1)
 #define MATMUL_COSIM_DEPTH_B_WORDS  (MATMUL_COSIM_DEPTH_B / kMatmulPortElems + 1)
 
@@ -187,6 +230,11 @@ inline unsigned matmul_words_for(unsigned off, unsigned count) {
 //   b_packed        0: B is row-major [k][m]; 1: B is in the tile-major
 //                   packed layout (matmul_packed_index), b_batch_stride in
 //                   packed elements.
+//   gemv_kw         0: the tiled path above.  1 / 2 / 4 / 8: the GEMV
+//                   streaming path with B in the kernel-width-kw image
+//                   (matmul_gemv_index; b_packed is ignored) — see "GEMV
+//                   streaming mode" above for the requirements.
+//   a_to_b          GEMV only: address of b minus address of a, in bytes.
 //
 // Memory layout (row-major):
 //   A[n][k] : a[row*k + col]
@@ -209,5 +257,7 @@ void MatmulKernel(
     unsigned      a_batch_stride,
     unsigned      b_batch_stride,
     unsigned      c_batch_stride,
-    unsigned      b_packed
+    unsigned      b_packed,
+    unsigned      gemv_kw,
+    long long     a_to_b
 );

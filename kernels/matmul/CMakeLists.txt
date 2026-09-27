@@ -56,6 +56,9 @@ endif()
 #   tile_k   on-chip B-buffer row count (power of 2)
 #   max_k    compile-time a_buf row-length limit; K > max_k is rejected at
 #            scheduling
+#   gemv_max_m  GEMV streaming mode (gemv_kw != 0): on-chip accumulator
+#            depth, the widest column chunk one pass over B covers (a
+#            multiple of 8; wider m is split into chunks).  0 = no GEMV path
 # ---------------------------------------------------------------------------
 function(matmul_load_constants platform_json out_var_prefix)
     if(NOT EXISTS "${platform_json}")
@@ -63,8 +66,8 @@ function(matmul_load_constants platform_json out_var_prefix)
             "MatmulKernel: platform file not found: ${platform_json}")
     endif()
     file(READ "${platform_json}" _pjson)
-    set(_keys "tile_n;tile_m;tile_k;max_k")
-    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K")
+    set(_keys "tile_n;tile_m;tile_k;max_k;gemv_max_m")
+    set(_var_names "TILE_N;TILE_M;TILE_K;MAX_K;GEMV_MAX_M")
     foreach(_k _vn IN ZIP_LISTS _keys _var_names)
         string(JSON _val ERROR_VARIABLE _err GET "${_pjson}" kernels matmul "${_k}")
         if(_err)
@@ -78,7 +81,7 @@ endfunction()
 matmul_load_constants("${AXI_DEFAULT_PLATFORM_JSON}" MM)
 message(STATUS "MatmulKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
                "TILE_N=${MM_TILE_N} TILE_M=${MM_TILE_M} "
-               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K}")
+               "TILE_K=${MM_TILE_K} MAX_K=${MM_MAX_K} GEMV_MAX_M=${MM_GEMV_MAX_M}")
 
 # Re-run cmake configure automatically if a platform JSON changes, so the
 # generated Config.h tracks JSON edits without a manual cmake re-run.
@@ -193,7 +196,7 @@ message(STATUS "MatmulKernel: targets — matmul_kernel, TestMatmulRef")
 message(STATUS "MatmulKernel: Data_t=${MM_DATA_TYPE}  "
                "AccData_t=${MM_ACC_DATA_TYPE}  "
                "TILE_N=${MM_TILE_N}  TILE_M=${MM_TILE_M}  "
-               "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}")
+               "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}  GEMV_MAX_M=${MM_GEMV_MAX_M}")
 
 # ---------------------------------------------------------------------------
 # HLS synthesis targets — one per platform JSON file in platforms/.
@@ -262,6 +265,7 @@ if(MM_VITIS_HLS)
         set(_save_TILE_M "${MM_TILE_M}")
         set(_save_TILE_K "${MM_TILE_K}")
         set(_save_MAX_K  "${MM_MAX_K}")
+        set(_save_GEMV_MAX_M "${MM_GEMV_MAX_M}")
 
         matmul_load_constants("${_MM_PLATFORM_FILE}" MM)
 
@@ -275,6 +279,7 @@ if(MM_VITIS_HLS)
         set(MM_TILE_M "${_save_TILE_M}")
         set(MM_TILE_K "${_save_TILE_K}")
         set(MM_MAX_K  "${_save_MAX_K}")
+        set(MM_GEMV_MAX_M "${_save_GEMV_MAX_M}")
 
         # set_part TCL command (with optional -board)
         if(_p_board)

@@ -20,12 +20,16 @@
 //   lane (n1 = ki % TILE_N) ensures that the same acc[n1] register is only
 //   written every TILE_N cycles — breaking the read-after-write hazard that
 //   would otherwise prevent II=1.
+//
+// gemv_kw != 0 takes the GEMV streaming path instead (gemv_run below,
+// MatmulKernel.h "GEMV streaming mode", MATMUL_OPTIMISATION.md §8b).
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
 #ifndef __SYNTHESIS__
 #include <cassert>
 #endif
+#include "hls_stream.h"
 #include "MatmulKernel.h"
 
 namespace {
@@ -170,6 +174,349 @@ inline void b_fetch_step(hls::burst_maxi<MatmulWord>& b, BFetch& f,
     }
 }
 
+// ---------------------------------------------------------------------------
+// GEMV streaming path (gemv_kw != 0) — MATMUL_OPTIMISATION.md §8b.
+//
+// One DATAFLOW region of five processes.  Each loops over the same jobs —
+// (batch slice bi, A row r, column chunk ch) — and exchanges words through
+// FIFOs:
+//
+//   gemv_read_a   port a: the A row (x) -> xs0 and xs1, then the planes
+//                 [0, split) of B's image -> ws0 (port a reaches B at
+//                 a_to_b bytes from its base: the host's b - a)
+//   gemv_read_b   port b: the planes [split, planes) -> ws1
+//   gemv_mac<S>   per B word E products (the kw x taps of the word's plane
+//                 times its lanes), summed in groups of kw lanes into E / kw
+//                 output columns, accumulated on chip over the stream's
+//                 planes; then the chunk's partial sums -> ps<S>
+//   gemv_write    port c: ps0 + ps1, saturated, row-major
+//
+// B's image is [plane c][column p][tap j] (MatmulKernel.h): a word holds E
+// consecutive (p, j) of ONE plane (m % E == 0), i.e. E / kw columns times kw
+// taps.  With one column chunk a stream's planes are one contiguous run of
+// DDR; with several, one run of mc * kw elements per plane.  The two
+// partial sums are exact (modular fixed-point adds), so C is bit-identical
+// to the tiled path's.
+// ---------------------------------------------------------------------------
+constexpr unsigned kGemvLogE = matmul_bits_for(E) - 1;   // log2(E)
+constexpr unsigned kGemvTile = 16;   // ConvKernel's input-channel tile: the image's lane groups
+// Accumulator words: one per word of a plane — a plane of a chunk spans
+// mc * kw / E <= kGemvMaxM words (kw <= E).
+constexpr unsigned kGemvAccWords = kGemvMaxM > 0 ? kGemvMaxM : 1;
+static_assert((1u << kGemvLogE) == E, "lanes per word must be a power of two");
+static_assert(kGemvMaxM % E == 0, "kGemvMaxM must be a multiple of the lanes per word");
+static_assert(kGemvMinPlane / E >= E,
+              "a plane must span >= E words: the next plane's taps are fetched over its "
+              "first kw words, and the accumulator RMW needs the distance");
+
+struct GemvAcc { AccData_t v[E]; };   // one accumulator word
+
+// Stream n_runs runs of run_words words (run r starts at word base + r *
+// stride) from `port` into `ws`: requests of <= ReqWords words, at most Out
+// in flight.  Issuing and draining share one II=1 loop — issuing past the
+// window before draining would block the adapter for good.  The next
+// request (address, length) is always ready in registers, so read_request
+// takes no arithmetic in its cycle.  A request ends at a multiple of
+// ReqWords words into its run or at the run's end, which the drain side
+// recognises to retire it.
+template<unsigned ReqWords, unsigned Out>
+void gemv_stream_runs(hls::burst_maxi<MatmulWord>& port, hls::stream<MatmulWord>& ws,
+                      unsigned long long base, unsigned stride, unsigned run_words,
+                      unsigned n_runs)
+{
+    #pragma HLS INLINE
+    static_assert((ReqWords & (ReqWords - 1)) == 0, "ReqWords must be a power of two");
+    const unsigned total = run_words * n_runs;
+    unsigned long long q_addr = base, run_addr = base;    // the next request
+    unsigned q_len  = std::min(ReqWords, run_words);
+    unsigned q_left = run_words - q_len;                   // words of its run after it
+    unsigned q_runs = n_runs;                              // runs not fully requested
+    unsigned pend = 0, inflight = 0;       // words requested, not read / requests not retired
+    unsigned d_off = 0;                    // read offset within its run
+    for (unsigned t = 0; t < total; ) {
+        #pragma HLS PIPELINE II=1
+        const bool     issue = q_runs != 0 && inflight < Out;
+        const bool     drain = pend != 0;
+        const unsigned len   = q_len;
+        if (issue) {
+            port.read_request(q_addr, len);
+            if (q_left != 0) {
+                const unsigned nl = std::min(ReqWords, q_left);
+                q_addr += len;
+                q_len   = nl;
+                q_left -= nl;
+            } else {
+                q_runs--;
+                run_addr += stride;
+                q_addr = run_addr;
+                q_len  = std::min(ReqWords, run_words);
+                q_left = run_words - q_len;
+            }
+        }
+        bool retire = false;
+        if (drain) {
+            ws.write(port.read());
+            t++;
+            const bool run_end = d_off + 1 == run_words;
+            retire = run_end || ((d_off + 1) & (ReqWords - 1)) == 0;
+            d_off  = run_end ? 0u : d_off + 1;
+        }
+        pend     = pend + (issue ? len : 0u) - (drain ? 1u : 0u);
+        inflight = inflight + (issue ? 1u : 0u) - (retire ? 1u : 0u);
+    }
+}
+
+// The runs of planes [c_lo, c_hi) of batch slice b_base (element offset)
+// for column chunk [p0, p0 + mcc) — see the section comment.  `to_b` is the
+// word offset of B from the port's base (a_to_b / 16 on port a, 0 on b).
+template<unsigned ReqWords, unsigned Out>
+void gemv_stream_planes(hls::burst_maxi<MatmulWord>& port, hls::stream<MatmulWord>& ws,
+                        long long to_b, unsigned b_base, unsigned m, unsigned lk,
+                        unsigned c_lo, unsigned c_hi, unsigned chunks, unsigned p0,
+                        unsigned mcc)
+{
+    #pragma HLS INLINE
+    const unsigned plane = m << lk;                 // elements per plane
+    const bool     one   = chunks == 1;
+    const unsigned np    = c_hi - c_lo;
+    const unsigned long long base =
+        (unsigned long long)(to_b + (b_base + c_lo * plane + (p0 << lk)) / E);
+    const unsigned run_w = one ? (np * plane) / E : (mcc << lk) / E;
+    gemv_stream_runs<ReqWords, Out>(port, ws, base, plane / E, run_w, one ? 1u : np);
+}
+
+static void gemv_read_a(hls::burst_maxi<MatmulWord>& a, hls::stream<MatmulWord>& xs0,
+                        hls::stream<MatmulWord>& xs1, hls::stream<MatmulWord>& ws0,
+                        long long a_to_b, unsigned n, unsigned k, unsigned m, unsigned batch,
+                        unsigned a_stride, unsigned b_stride,
+                        unsigned lk, unsigned split, unsigned chunks, unsigned mc)
+{
+    const long long to_b = a_to_b >> 4;             // B's word offset on port a
+    const unsigned  xw   = k / E;
+    for (unsigned bi = 0; bi < batch; bi++) {
+        for (unsigned r = 0; r < n; r++) {
+            for (unsigned ch = 0; ch < chunks; ch++) {
+                // The A row: <= kMaxK / E words, within the request window
+                // (static_assert at the top), requested before draining.
+                const unsigned x_base = (bi * a_stride + r * k) / E;
+                for (unsigned w0 = 0; w0 < xw; w0 += kAReqWords) {
+                    #pragma HLS PIPELINE II=1
+                    a.read_request(x_base + w0, std::min(kAReqWords, xw - w0));
+                }
+                for (unsigned w = 0; w < xw; w++) {
+                    #pragma HLS PIPELINE II=1
+                    const MatmulWord v = a.read();
+                    xs0.write(v);
+                    xs1.write(v);
+                }
+                const unsigned p0 = ch * mc;
+                gemv_stream_planes<kAReqWords, kAReqOutstanding>(
+                    a, ws0, to_b, bi * b_stride, m, lk, 0, split, chunks, p0,
+                    std::min(mc, m - p0));
+            }
+        }
+    }
+}
+
+static void gemv_read_b(hls::burst_maxi<MatmulWord>& b, hls::stream<MatmulWord>& ws1,
+                        unsigned n, unsigned m, unsigned batch, unsigned b_stride,
+                        unsigned lk, unsigned split, unsigned planes, unsigned chunks, unsigned mc)
+{
+    for (unsigned bi = 0; bi < batch; bi++) {
+        for (unsigned r = 0; r < n; r++) {
+            for (unsigned ch = 0; ch < chunks; ch++) {
+                const unsigned p0 = ch * mc;
+                gemv_stream_planes<kBReqWords, kBReqAhead>(
+                    b, ws1, 0, bi * b_stride, m, lk, split, planes, chunks, p0,
+                    std::min(mc, m - p0));
+            }
+        }
+    }
+}
+
+// Element e of the A row held in natural order, one word per E elements.
+inline Data_t gemv_x_at(const MatmulWord xn[kMaxK / E], unsigned e)
+{
+    #pragma HLS INLINE
+    const MatmulWord w = xn[e / E];
+    Data_t lanes[E];
+    #pragma HLS ARRAY_PARTITION variable=lanes complete
+    for (unsigned j = 0; j < E; j++) {
+        #pragma HLS UNROLL
+        lanes[j] = matmul_word_lane(w, j);
+    }
+    return lanes[e % E];
+}
+
+// One read stream's MACs: planes [c_lo, c_hi) of every job.
+template<int S>
+void gemv_mac(hls::stream<MatmulWord>& xs, hls::stream<MatmulWord>& ws,
+              hls::stream<AccData_t>& ps,
+              unsigned n, unsigned k, unsigned m, unsigned batch,
+              unsigned lk, unsigned c_lo, unsigned c_hi, unsigned chunks, unsigned mc)
+{
+    // xn:  the A row in natural order, one port word per E elements.
+    // acc: word q of a plane accumulates its E / kw columns q * E / kw + g
+    //      in lanes g — consecutive words never share an address, and word
+    //      q is next touched one plane (>= E words) later.
+    MatmulWord xn [kMaxK / E];
+    GemvAcc    acc[kGemvAccWords];
+    #pragma HLS AGGREGATE    variable=acc
+    #pragma HLS BIND_STORAGE variable=acc type=RAM_2P impl=URAM
+    #pragma HLS DEPENDENCE   variable=acc type=inter false
+
+    const unsigned kw  = 1u << lk;
+    const unsigned glg = kGemvLogE - lk;            // log2(columns per word)
+    for (unsigned bi = 0; bi < batch; bi++) {
+        for (unsigned r = 0; r < n; r++) {
+            for (unsigned ch = 0; ch < chunks; ch++) {
+                for (unsigned w = 0; w < k / E; w++) {
+                    #pragma HLS PIPELINE II=1
+                    xn[w] = xs.read();
+                }
+
+                const unsigned p0    = ch * mc;
+                const unsigned mcc   = std::min(mc, m - p0);
+                const unsigned wpp   = (mcc << lk) / E;       // words per plane in this chunk
+                const unsigned total = (c_hi - c_lo) * wpp;
+
+                // tap[j]: x at tap j of the current plane; ntap: the next
+                // plane's, fetched over the current plane's first kw words.
+                Data_t tap[E], ntap[E];
+                #pragma HLS ARRAY_PARTITION variable=tap  complete
+                #pragma HLS ARRAY_PARTITION variable=ntap complete
+                for (unsigned j = 0; j < kw; j++) {
+                    #pragma HLS PIPELINE II=1
+                    tap[j] = gemv_x_at(xn, matmul_gemv_k(c_lo, j, kw));
+                }
+
+                unsigned c = c_lo, q = 0;
+                for (unsigned t = 0; t < total; t++) {
+                    #pragma HLS PIPELINE II=1
+                    const MatmulWord w = ws.read();
+                    if (q < kw && c + 1 < c_hi)
+                        ntap[q] = gemv_x_at(xn, matmul_gemv_k(c + 1, q, kw));
+                    // Lane products and the group-sum tree: lvl[d][g] sums
+                    // lanes [g << d, (g + 1) << d); level lk is the columns.
+                    AccData_t lvl[kGemvLogE + 1][E];
+                    #pragma HLS ARRAY_PARTITION variable=lvl complete dim=0
+                    for (unsigned l = 0; l < E; l++) {
+                        #pragma HLS UNROLL
+                        lvl[0][l] = tap[l & (kw - 1)] * matmul_word_lane(w, l);
+                    }
+                    for (unsigned d = 1; d <= kGemvLogE; d++) {
+                        #pragma HLS UNROLL
+                        for (unsigned g = 0; g < (E >> d); g++) {
+                            #pragma HLS UNROLL
+                            lvl[d][g] = lvl[d - 1][2 * g] + lvl[d - 1][2 * g + 1];
+                        }
+                    }
+                    // The stream's first plane overwrites (no clear pass);
+                    // lanes >= E / kw of the word are unused.
+                    const bool first = c == c_lo;
+                    GemvAcc    word  = acc[q];
+                    for (unsigned g = 0; g < E; g++) {
+                        #pragma HLS UNROLL
+                        AccData_t v = lvl[0][g];
+                        for (unsigned d = 1; d <= kGemvLogE; d++) {
+                            #pragma HLS UNROLL
+                            if (lk == d) v = lvl[d][g & ((E >> d) - 1)];
+                        }
+                        word.v[g] = first ? v : AccData_t(word.v[g] + v);
+                    }
+                    acc[q] = word;
+                    if (++q == wpp) {
+                        q = 0;
+                        c++;
+                        for (unsigned j = 0; j < E; j++) {
+                            #pragma HLS UNROLL
+                            tap[j] = ntap[j];
+                        }
+                    }
+                }
+
+                // Column p of the chunk: word p / (E / kw), lane p % (E / kw).
+                for (unsigned p = 0; p < mcc; p++) {
+                    #pragma HLS PIPELINE II=1
+                    AccData_t v = AccData_t(0);
+                    if (c_hi > c_lo) v = acc[p >> glg].v[p & ((1u << glg) - 1)];
+                    ps.write(v);
+                }
+            }
+        }
+    }
+}
+
+static void gemv_write(Data_t* c, hls::stream<AccData_t>& ps0, hls::stream<AccData_t>& ps1,
+                       unsigned n, unsigned m, unsigned batch, unsigned c_stride,
+                       unsigned chunks, unsigned mc)
+{
+    for (unsigned bi = 0; bi < batch; bi++) {
+        for (unsigned r = 0; r < n; r++) {
+            for (unsigned ch = 0; ch < chunks; ch++) {
+                const unsigned p0  = ch * mc;
+                const unsigned mcc = std::min(mc, m - p0);
+                const unsigned off = bi * c_stride + r * m + p0;
+                for (unsigned p = 0; p < mcc; p++) {
+                    #pragma HLS PIPELINE II=1
+                    const AccData_t s = ps0.read() + ps1.read();   // wraps like the tiled acc
+                    c[off + p] = saturate_cast<Data_t>(s);
+                }
+            }
+        }
+    }
+}
+
+static void gemv_dataflow(hls::burst_maxi<MatmulWord>& a, hls::burst_maxi<MatmulWord>& b,
+                          Data_t* c, long long a_to_b,
+                          unsigned n, unsigned k, unsigned m, unsigned batch,
+                          unsigned a_stride, unsigned b_stride, unsigned c_stride,
+                          unsigned lk, unsigned planes, unsigned split,
+                          unsigned chunks, unsigned mc)
+{
+    #pragma HLS DATAFLOW
+    hls::stream<MatmulWord> xs0("xs0"), xs1("xs1"), ws0("ws0"), ws1("ws1");
+    hls::stream<AccData_t>  ps0("ps0"), ps1("ps1");
+    #pragma HLS STREAM       variable=xs0 depth=4
+    #pragma HLS STREAM       variable=xs1 depth=4
+    #pragma HLS STREAM       variable=ws0 depth=32
+    #pragma HLS STREAM       variable=ws1 depth=32
+    #pragma HLS STREAM       variable=ps0 depth=16
+    #pragma HLS STREAM       variable=ps1 depth=16
+    #pragma HLS BIND_STORAGE variable=ws0 type=fifo impl=lutram
+    #pragma HLS BIND_STORAGE variable=ws1 type=fifo impl=lutram
+    gemv_read_a(a, xs0, xs1, ws0, a_to_b, n, k, m, batch, a_stride, b_stride,
+                lk, split, chunks, mc);
+    gemv_read_b(b, ws1, n, m, batch, b_stride, lk, split, planes, chunks, mc);
+    gemv_mac<0>(xs0, ws0, ps0, n, k, m, batch, lk, 0, split, chunks, mc);
+    gemv_mac<1>(xs1, ws1, ps1, n, k, m, batch, lk, split, planes, chunks, mc);
+    gemv_write(c, ps0, ps1, n, m, batch, c_stride, chunks, mc);
+}
+
+// Geometry of a GEMV call, then the dataflow region.
+void gemv_run(hls::burst_maxi<MatmulWord>& a, hls::burst_maxi<MatmulWord>& b, Data_t* c,
+              long long a_to_b, unsigned n, unsigned k, unsigned m, unsigned batch,
+              unsigned a_stride, unsigned b_stride, unsigned c_stride, unsigned kw)
+{
+    #pragma HLS INLINE off
+#ifndef __SYNTHESIS__
+    assert((kw == 1 || kw == 2 || kw == 4 || kw == 8) && kw <= E && "gemv_kw");
+    assert(k % E == 0 && k <= kMaxK && (kw == 1 || k % (kGemvTile * kw) == 0) && "gemv k");
+    assert(m % E == 0 && (m == 0 || m * kw >= kGemvMinPlane) && "gemv m");
+    assert(a_stride % E == 0 && b_stride % E == 0 && "gemv strides");
+    assert(a_to_b % 16 == 0 && "gemv a_to_b: 16-byte aligned a and b");
+#endif
+    const unsigned lk     = (kw >= 2) + (kw >= 4) + (kw >= 8);
+    const unsigned planes = k >> lk;
+    const unsigned split  = (planes + 1) / 2;
+    const unsigned chunks = (m + kGemvMaxM - 1) / kGemvMaxM;
+    // Equal chunks (a narrow last chunk would break the plane-length rule).
+    const unsigned per    = chunks > 1 ? (m + chunks - 1) / chunks : m;
+    const unsigned mc     = (per + E - 1) / E * E;
+    gemv_dataflow(a, b, c, a_to_b, n, k, m, batch, a_stride, b_stride, c_stride,
+                  lk, planes, split, chunks, mc);
+}
+
 } // namespace
 
 void MatmulKernel(
@@ -183,7 +530,9 @@ void MatmulKernel(
     unsigned      a_batch_stride,
     unsigned      b_batch_stride,
     unsigned      c_batch_stride,
-    unsigned      b_packed
+    unsigned      b_packed,
+    unsigned      gemv_kw,
+    long long     a_to_b
 ) {
     // -----------------------------------------------------------------------
     // HLS AXI interface pragmas.
@@ -217,7 +566,16 @@ void MatmulKernel(
     #pragma HLS INTERFACE s_axilite port=b_batch_stride bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=c_batch_stride bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=b_packed       bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=gemv_kw        bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=a_to_b         bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return         bundle=ctrl
+
+    // GEMV streaming path (MatmulKernel.h "GEMV streaming mode").
+    if (kGemvMaxM > 0 && gemv_kw != 0) {
+        gemv_run(a, b, c, a_to_b, n, k, m, batch, a_batch_stride, b_batch_stride,
+                 c_batch_stride, gemv_kw);
+        return;
+    }
 
     // -----------------------------------------------------------------------
     // On-chip buffers (BRAM in HLS).

@@ -33,6 +33,10 @@
 //   Saturation:
 //     positive: all a=100, all b=100, K=3  → sum=30000 → saturate to AP_MAX
 //     negative: all a=100, all b=-100, K=3 → sum=-30000 → saturate to AP_MIN
+//   GEMV streaming mode (gemv_kw = 1 / 2 / 4 / 8, B in the kernel-width
+//   image of MatmulKernel.h): LLM decode shapes, several A rows, batch
+//   strides and broadcasts, column chunks (m > kGemvMaxM), K = kMaxK,
+//   the minimum plane length, saturation.
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
@@ -157,9 +161,10 @@ static void dump_one_case(const char* label,
                           const std::vector<Data_t>& a,
                           const std::vector<Data_t>& b,
                           const std::vector<Data_t>& c_ref,
-                          unsigned b_packed = 0) {
+                          unsigned b_packed = 0,
+                          unsigned gemv_kw = 0) {
 #ifndef MATMUL_HAVE_APFIXED
-    (void)label; (void)n; (void)k; (void)m; (void)b_packed;
+    (void)label; (void)n; (void)k; (void)m; (void)b_packed; (void)gemv_kw;
     (void)batch; (void)a_stride; (void)b_stride;
     (void)a; (void)b; (void)c_ref;
     std::fprintf(stderr, "--dump-data requires MATMUL_HAVE_APFIXED build\n");
@@ -174,8 +179,8 @@ static void dump_one_case(const char* label,
     write_hex_file(prefix + "b.hex", b);
     write_hex_file(prefix + "c.hex", c_ref);
 
-    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %s\n",
-                 idx, n, k, m, batch, a_stride, b_stride, b_packed,
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %u %s\n",
+                 idx, n, k, m, batch, a_stride, b_stride, b_packed, gemv_kw,
                  sanitize_label(label).c_str());
     std::printf("[DUMP] test_%02d  %-50s  N=%u K=%u M=%u batch=%u\n",
                 idx, label, n, k, m, batch);
@@ -283,6 +288,10 @@ static std::vector<Data_t> pack_b_tile_major(const std::vector<Data_t>& B,
 static MatmulWord g_a[MATMUL_COSIM_DEPTH_A_WORDS];
 static MatmulWord g_b[MATMUL_COSIM_DEPTH_B_WORDS];
 static Data_t     g_c[MATMUL_COSIM_DEPTH_C];
+// GEMV: A then B in ONE buffer handed to both ports — port a reads its half
+// of B at a_to_b, and cosim gives every port its own copy of the memory
+// (port b's model spans DEPTH_B words from its pointer, hence the size).
+static MatmulWord g_ab[MATMUL_COSIM_DEPTH_A_WORDS + MATMUL_COSIM_DEPTH_B_WORDS];
 #endif
 
 static bool invoke_matmul(const char* label,
@@ -291,27 +300,50 @@ static bool invoke_matmul(const char* label,
                           std::vector<Data_t>&       C_got,
                           unsigned n, unsigned k, unsigned m, unsigned batch,
                           unsigned a_stride, unsigned b_stride,
-                          unsigned c_stride, unsigned b_packed = 0)
+                          unsigned c_stride, unsigned b_packed = 0,
+                          unsigned gemv_kw = 0)
 {
     (void)label;  // used only by the MATMUL_COSIM skip message below
+    // GEMV (gemv_kw != 0): A's words, then B's, in one buffer; b points at
+    // B's first word and a_to_b is its byte offset from a.
+    const std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
 #ifdef MATMUL_COSIM
+    if (gemv_kw) {
+        if (aw.size() + bw.size() > MATMUL_COSIM_DEPTH_A_WORDS ||   // port a: A and its half of B
+            bw.size() > MATMUL_COSIM_DEPTH_B_WORDS ||                // port b: B from its pointer
+            C_got.size() > MATMUL_COSIM_DEPTH_C) {
+            printf("  SKIP  %s  (exceeds cosim buffers)\n", label);
+            return false;
+        }
+        std::copy(aw.begin(), aw.end(), g_ab);
+        std::copy(bw.begin(), bw.end(), g_ab + aw.size());
+        MatmulKernel(g_ab, g_ab + aw.size(), g_c, n, k, m, batch, a_stride, b_stride, c_stride,
+                     b_packed, gemv_kw, (long long)(aw.size() * sizeof(MatmulWord)));
+        std::copy(g_c, g_c + C_got.size(), C_got.begin());
+        return true;
+    }
     if (A.size() > MATMUL_COSIM_DEPTH_A ||
         B.size() > MATMUL_COSIM_DEPTH_B ||
         C_got.size() > MATMUL_COSIM_DEPTH_C) {
         printf("  SKIP  %s  (exceeds cosim buffers)\n", label);
         return false;
     }
-    {
-        const std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
-        std::copy(aw.begin(), aw.end(), g_a);
-        std::copy(bw.begin(), bw.end(), g_b);
-    }
-    MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride, b_packed);
+    std::copy(aw.begin(), aw.end(), g_a);
+    std::copy(bw.begin(), bw.end(), g_b);
+    MatmulKernel(g_a, g_b, g_c, n, k, m, batch, a_stride, b_stride, c_stride, b_packed, 0u, 0);
     std::copy(g_c, g_c + C_got.size(), C_got.begin());
 #else
-    std::vector<MatmulWord> aw = to_words(A), bw = to_words(B);
-    MatmulKernel(aw.data(), bw.data(), C_got.data(),
-                 n, k, m, batch, a_stride, b_stride, c_stride, b_packed);
+    if (gemv_kw) {
+        std::vector<MatmulWord> ab(aw);
+        ab.insert(ab.end(), bw.begin(), bw.end());
+        MatmulKernel(ab.data(), ab.data() + aw.size(), C_got.data(),
+                     n, k, m, batch, a_stride, b_stride, c_stride, b_packed, gemv_kw,
+                     (long long)(aw.size() * sizeof(MatmulWord)));
+    } else {
+        std::vector<MatmulWord> a_w(aw), b_w(bw);
+        MatmulKernel(a_w.data(), b_w.data(), C_got.data(),
+                     n, k, m, batch, a_stride, b_stride, c_stride, b_packed, 0u, 0);
+    }
 #endif
     return true;
 }
@@ -448,6 +480,64 @@ static bool RunTestSaturation(const char* label,
 }
 
 // ---------------------------------------------------------------------------
+// RunTestGemv — the GEMV streaming path (gemv_kw != 0).
+//
+// B is drawn row-major per batch slice, the reference runs on that, and the
+// kernel reads the kernel-width-kw image of every slice (matmul_gemv_index,
+// the layout the scheduler shares with ConvKernel).  a_stride / b_stride are
+// in elements of the row-major A / B (0 = broadcast); the image of a slice
+// has the same size, so b_stride carries over.  `val_a` / `val_b` != 0 fill
+// A / B with that constant instead (saturation cases).
+// ---------------------------------------------------------------------------
+static bool RunTestGemv(const char* label, unsigned n, unsigned k, unsigned m,
+                        unsigned kw, unsigned batch = 1,
+                        unsigned a_stride = ~0u, unsigned b_stride = ~0u,
+                        double val_a = 0.0, double val_b = 0.0,
+                        unsigned seed = kSeed)
+{
+    if (kw > kMatmulPortElems || kGemvMaxM == 0) {
+        printf("  SKIP  %s  (gemv_kw %u not available in this build)\n", label, kw);
+        return true;
+    }
+    if (a_stride == ~0u) a_stride = n * k;
+    if (b_stride == ~0u) b_stride = k * m;
+    const unsigned a_total  = (a_stride == 0) ? n * k : batch * a_stride;
+    const unsigned b_slices = (b_stride == 0) ? 1u : batch;
+    const unsigned c_stride = n * m;
+
+    std::vector<Data_t> A(a_total), B((size_t)b_slices * k * m);
+    std::vector<Data_t> C_ref(batch * c_stride, Data_t(0));
+    std::vector<Data_t> C_got(batch * c_stride, Data_t(0));
+
+    std::default_random_engine rng(seed);
+    std::uniform_real_distribution<double> dist(-1.0, 1.0);
+    for (auto& v : A) v = val_a != 0.0 ? Data_t(val_a) : Data_t(dist(rng));
+    for (auto& v : B) v = val_b != 0.0 ? Data_t(val_b) : Data_t(dist(rng));
+
+    ref_matmul_batch(A.data(), B.data(), C_ref.data(),
+                     n, k, m, batch, a_stride, b_stride, c_stride);
+
+    std::vector<Data_t> img(B.size());
+    for (unsigned s = 0; s < b_slices; s++)
+        for (unsigned kk = 0; kk < k; kk++)
+            for (unsigned p = 0; p < m; p++)
+                img[(size_t)s * k * m + matmul_gemv_index(kk, p, m, kw)] =
+                    B[(size_t)s * k * m + (size_t)kk * m + p];
+
+    if (!g_dump_dir.empty()) {
+        // RTL fixtures stay small (the test stand's xsim is CPU-bound).
+        if (img.size() <= 65536)
+            dump_one_case(label, n, k, m, batch, a_stride, b_stride, A, img, C_ref,
+                          /*b_packed*/0u, kw);
+        return true;
+    }
+    if (!invoke_matmul(label, A, img, C_got, n, k, m, batch,
+                       a_stride, b_stride, c_stride, /*b_packed*/0u, kw))
+        return true;  // skipped — case exceeds the cosim buffers
+    return compare_outputs(C_ref.data(), C_got.data(), batch * c_stride, label);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
@@ -473,7 +563,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(g_manifest,
             "# MatmulKernel test fixture manifest\n"
-            "# idx n k m batch a_stride b_stride b_packed label\n");
+            "# idx n k m batch a_stride b_stride b_packed gemv_kw label\n");
     }
 
     bool all_ok = true;
@@ -620,6 +710,35 @@ int main(int argc, char** argv) {
                      6, 517, 35, 3, 6 * 517, 0));
     run(RunTestBatch("batch=3, 6 x 517 x 35, B broadcasts  [B packed, b_stride=0]",
                      6, 517, 35, 3, 6 * 517, 0, kSeed, 1u));
+
+    // -----------------------------------------------------------------------
+    // GEMV streaming mode (gemv_kw != 0, MatmulKernel.h)
+    // -----------------------------------------------------------------------
+    printf("\n--- GEMV streaming ---\n");
+    run(RunTestGemv("gemv 1 x 64 x 64  [kw=1, minimum plane]",          1,   64,   64, 1));
+    run(RunTestGemv("gemv 1 x 128 x 8  [kw=8, minimum plane]",          1,  128,    8, 8));
+    run(RunTestGemv("gemv 1 x 128 x 32  [kw=2]",                        1,  128,   32, 2));
+    run(RunTestGemv("gemv 1 x 256 x 24  [kw=4]",                        1,  256,   24, 4));
+    run(RunTestGemv("gemv 1 x 576 x 192  [kw=4, SmolLM2 k / v]",        1,  576,  192, 4));
+    run(RunTestGemv("gemv 1 x 576 x 1536  [kw=4, SmolLM2 gate / up]",   1,  576, 1536, 4));
+    run(RunTestGemv("gemv 1 x 1536 x 576  [kw=4, SmolLM2 down]",        1, 1536,  576, 4));
+    run(RunTestGemv("gemv 1 x 960 x 320  [kw=4, 360M k / v]",           1,  960,  320, 4));
+    run(RunTestGemv("gemv 1 x 2560 x 960  [kw=8, 360M down]",           1, 2560,  960, 8));
+    run(RunTestGemv("gemv 1 x kMaxK x 64  [kw=8, K = kMaxK]",           1, kMaxK,  64, 8));
+    run(RunTestGemv("gemv 1 x 72 x 136  [kw=1, odd word counts]",       1,   72,  136, 1));
+    run(RunTestGemv("gemv 3 x 128 x 72  [kw=2, three A rows]",          3,  128,   72, 2));
+    run(RunTestGemv("gemv 1 x 64 x (kGemvMaxM + 64)  [kw=1, 2 chunks]", 1,   64, kGemvMaxM + 64, 1));
+    run(RunTestGemv("gemv 2 x 128 x (2 kGemvMaxM + 16)  [kw=4, 3 chunks]",
+                    2, 128, 2 * kGemvMaxM + 16, 4));
+    run(RunTestGemv("gemv batch=3 2 x 128 x 64  [kw=2, both advance]",  2,  128,   64, 2, 3));
+    run(RunTestGemv("gemv batch=3 1 x 64 x 128  [kw=1, B broadcasts]",  1,   64,  128, 1, 3,
+                    /*a_stride*/ 64, /*b_stride*/ 0));
+    run(RunTestGemv("gemv batch=2 1 x 128 x 64  [kw=4, A broadcasts]",  1,  128,   64, 4, 2,
+                    /*a_stride*/ 0, /*b_stride*/ 128 * 64));
+    run(RunTestGemv("gemv sat_pos: a=60, b=60, K=8 → AP_MAX",           1,    8,   64, 1, 1,
+                    ~0u, ~0u, 60.0, 60.0));
+    run(RunTestGemv("gemv sat_neg: a=60, b=-60, K=8 → AP_MIN",          1,    8,   64, 1, 1,
+                    ~0u, ~0u, 60.0, -60.0));
 
     run(RunTestSaturation("sat_pos: a=100, b=100, K=3  → AP_MAX",
                            100.0, 100.0, 3, kSatMax));

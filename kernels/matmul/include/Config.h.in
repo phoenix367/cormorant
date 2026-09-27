@@ -49,4 +49,12 @@ static constexpr unsigned kTileM = @MM_TILE_M@;
 static constexpr unsigned kTileK = @MM_TILE_K@;
 static constexpr unsigned kMaxK  = @MM_MAX_K@;
 
+// ---------------------------------------------------------------------------
+// kGemvMaxM  GEMV streaming mode (gemv_kw != 0, MATMUL_OPTIMISATION.md §8b):
+//            output columns one pass over B accumulates on chip (per read
+//            stream, 32-bit each); a wider m is split into column chunks.
+//            Multiple of 8.  0 = the kernel has no GEMV path.
+// ---------------------------------------------------------------------------
+static constexpr unsigned kGemvMaxM = @MM_GEMV_MAX_M@;
+
 static constexpr unsigned kSeed  = 42;

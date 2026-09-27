@@ -190,7 +190,8 @@ static bool RunTest(const char* label,
     std::vector<Data_t> C_kern(batch * c_stride, Data_t(0));
 
     MatmulKernel(aw.data(), bw.data(), C_kern.data(),
-                 n, k, m, batch, a_stride, b_stride_eff, c_stride, b_packed);
+                 n, k, m, batch, a_stride, b_stride_eff, c_stride, b_packed,
+                 /*gemv_kw=*/0u, /*a_to_b=*/0);
 
     return compare_outputs(C_ref, C_kern, label);
 }
