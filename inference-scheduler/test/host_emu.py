@@ -139,11 +139,20 @@ void inference_buf_sync_from_device(inference_buf_t *b)
 void inference_buf_sync_to_device(inference_buf_t *b)   { (void)b; }
 void inference_buf_sync_from_device(inference_buf_t *b) { (void)b; }
 #endif
+@BUF_FLOAT_CONVERSIONS@
 void inference_buf_fill_float(inference_buf_t *b, const float *s, unsigned n)
-{ unsigned i; for (i = 0; i < n; i++) ((Data_t *)b->virt)[i] = (Data_t)s[i]; }
+{ unsigned i; for (i = 0; i < n; i++) ((Data_t *)b->virt)[i] = buf_from_float(s[i]); }
 void inference_buf_read_float(const inference_buf_t *b, float *d, unsigned n)
-{ unsigned i; for (i = 0; i < n; i++) d[i] = (float)((const Data_t *)b->virt)[i]; }
+{ unsigned i; for (i = 0; i < n; i++) d[i] = buf_to_float(((const Data_t *)b->virt)[i]); }
 """
+
+def buf_emu_source(dtype=None) -> str:
+    """inference_buf_emu.c for a project whose Data_t is ``dtype`` (default
+    ap_fixed<16,8>): the float fill / read helpers use its conversions."""
+    from src.dtype import AP_FIXED_16_8
+    d = dtype if dtype is not None else AP_FIXED_16_8
+    return _BUF_EMU.replace("@BUF_FLOAT_CONVERSIONS@", d.c_buf_float_conversions())
+
 
 _COMMON = r"""
 #pragma once
@@ -352,7 +361,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     w(os.path.join(inc, "inference.h"), cg.generate_header())
     w(os.path.join(src, "inference.c"), cg.generate_source())
     w(os.path.join(tst, "test_inference.c"), cg.generate_test())
-    w(os.path.join(emu, "inference_buf_emu.c"), _BUF_EMU)
+    w(os.path.join(emu, "inference_buf_emu.c"), buf_emu_source(cg._dtype))
     w(os.path.join(emu, "emu_common.h"), _COMMON)
     w(os.path.join(emu, "xvectoropkernel.h"), _VOP)
     w(os.path.join(emu, "xmatmulkernel.h"), _MM)

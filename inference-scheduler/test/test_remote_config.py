@@ -130,3 +130,32 @@ class TestUioDevicesFromCfg(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- #
+# run_remote_perf: a bad benchmark case fails before any SSH work   #
+# ---------------------------------------------------------------- #
+
+class TestPerfCaseValidationBeforeConnect(unittest.TestCase):
+    def test_unsupported_op_is_a_config_error_before_connecting(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        import run_remote_perf
+
+        here = Path(__file__).resolve().parent.parent
+        cfg = json.loads((here / "perf_config.json.example").read_text())
+        cfg["benchmarks"]["VectorOPKernel"]["cases"][0]["op"] = 99
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "perf.json")
+            with open(path, "w") as f:
+                json.dump(cfg, f)
+            err = io.StringIO()
+            with mock.patch.object(run_remote_perf, "RemoteSession",
+                                   side_effect=AssertionError("connected")), \
+                    contextlib.redirect_stderr(err):
+                rc = run_remote_perf.main(["--config", path])
+        self.assertEqual(rc, 1)
+        self.assertIn("config error", err.getvalue())
+        self.assertIn("unsupported op=99", err.getvalue())

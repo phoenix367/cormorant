@@ -3,8 +3,8 @@
  *                    projects.
  *
  * Aggregate-only: each layer keeps a count, summed nanoseconds, min, and max.
- * No sample buffers, no percentiles — total RAM cost is ~32 bytes per layer
- * plus a name pointer.  Mean is computed from total/count at dump time.
+ * No sample buffers, no percentiles — total RAM cost is 40 bytes per layer
+ * (five uint64_t counters) plus a name pointer.  Mean is computed from total/count at dump time.
  *
  * Profiling is opt-in at compile time.  Define INFERENCE_PROFILING=1 (e.g.
  * via cmake -DINFERENCE_PROFILING=ON) to compile begin/end into real

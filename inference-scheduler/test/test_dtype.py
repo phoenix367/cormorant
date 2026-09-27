@@ -5,6 +5,10 @@ DataType-base default methods (format_literal, c_typedef_comment,
 truncate, truncate_div) are otherwise unexercised.
 """
 
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 import numpy as np
@@ -186,3 +190,63 @@ class TestSingletons(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ================================================================ #
+# inference_buf_fill_float / read_float conversions (C, compiled)   #
+# ================================================================ #
+
+_CC = shutil.which("cc") or shutil.which("gcc")
+
+
+@unittest.skipUnless(_CC, "no C compiler")
+class TestBufFloatConversionsC(unittest.TestCase):
+    """The generated buf_from_float / buf_to_float, compiled and run, match
+    float_to_storage (clip + round half to even) and the storage decode."""
+
+    def _run(self, dt, values):
+        prog = (
+            "#include <stdint.h>\n#include <stdio.h>\n"
+            f"typedef {dt.c_type} Data_t;\n" + dt.c_buf_float_conversions() +
+            "int main(void)\n{\n    float v;\n"
+            "    while (fread(&v, sizeof v, 1, stdin) == 1) {\n"
+            "        Data_t b = buf_from_float(v);\n"
+            "        float  r = buf_to_float(b);\n"
+            "        fwrite(&b, sizeof b, 1, stdout);\n"
+            "        fwrite(&r, sizeof r, 1, stdout);\n"
+            "    }\n    return 0;\n}\n")
+        with tempfile.TemporaryDirectory() as td:
+            src, exe = os.path.join(td, "t.c"), os.path.join(td, "t")
+            with open(src, "w") as f:
+                f.write(prog)
+            subprocess.run([_CC, "-O2", "-Wall", "-Werror", "-o", exe, src], check=True)
+            out = subprocess.run([exe], input=values.astype(np.float32).tobytes(),
+                                 capture_output=True, check=True).stdout
+        rec = np.dtype([("b", dt.np_storage), ("r", np.float32)])
+        return np.frombuffer(out, dtype=rec)
+
+    def test_fixed_point_matches_float_to_storage(self):
+        rng = np.random.default_rng(3)
+        for dt in (AP_FIXED_16_8, ApFixed(8, 4), ApFixed(32, 16)):
+            with self.subTest(dtype=dt.name):
+                s = 2.0 ** (dt.bytes_per_elem * 8 - dt._I)
+                span = 2.0 ** (dt._I - 1)
+                k = rng.integers(-int(span * s) - 50, int(span * s) + 50, 2000)
+                values = np.concatenate([
+                    rng.uniform(-1.5 * span, 1.5 * span, 4000),   # incl. saturation
+                    (k + 0.5) / s,                                # exact ties
+                    k / s,                                        # exact grid points
+                    [0.0, -0.0, np.inf, -np.inf, span, -span]]).astype(np.float32)
+                got = self._run(dt, values)
+                want = dt.float_to_storage(values.astype(np.float64))
+                np.testing.assert_array_equal(got["b"], want)
+                signed = got["b"].view(dt._np_int).astype(np.float64)
+                np.testing.assert_array_equal(got["r"], (signed / s).astype(np.float32))
+                nan = self._run(dt, np.array([np.nan], np.float32))
+                self.assertEqual(int(nan["b"][0]), 0)
+
+    def test_float32_is_a_cast(self):
+        values = np.array([0.1, -2.5, 1e30, -7.0], np.float32)
+        got = self._run(FLOAT32, values)
+        np.testing.assert_array_equal(got["b"], values)
+        np.testing.assert_array_equal(got["r"], values)

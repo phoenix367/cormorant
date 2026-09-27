@@ -20,12 +20,12 @@ JSON shape (only the fields this module reads)::
     {
       "kernels": {
         "conv": {
-          "tile_m":                  8,
+          "tile_m":                  16,
           "tile_ic":                 16,
           "max_kh":                  7,
           "max_kw":                  7,
           "max_in_ch":               1024,
-          "max_out_ch":              1024,
+          "max_out_ch":              1280,
           "max_line_buf_cols":       64,
           "max_line_buf_rows":       16,
           "max_acc_persist_entries": 65536,
@@ -47,11 +47,12 @@ Platform selection (lower entries override higher ones):
 Missing / malformed fields raise ``ConvHwConfigError`` rather than
 silently falling back to defaults.
 
-``tile_ic`` and ``max_kh`` are not used by the validator: ``kTileIC``
-is a pure unrolling factor (any in_ch is residual-padded), and the
-kernel-size bounds are already validated against weight tensor rank
-earlier in ConvNode.  ``max_kw`` and ``max_m_per_group`` are exported for
-the MatMul-on-ConvKernel lowering (``matmul_lowering.py``: the 1×kw kernel
+``tile_ic`` is not used by the validator: ``kTileIC`` is a pure
+unrolling factor (any in_ch is residual-padded); the weight packing reads
+it.  ``max_kh`` / ``max_kw`` bound the kernel window (the kernel's patch
+buffers are ``[kTileIC][kMaxKH][kMaxKW]``), so ConvNode rejects larger
+kernels; ``max_kw`` and ``max_m_per_group`` also serve the
+MatMul-on-ConvKernel lowering (``matmul_lowering.py``: the 1×kw kernel
 width is chosen there) and its engine cost model (``cost_model.py``).  ``tile_m`` IS exported
 (``CONV_TILE_M``) because the kernel's persistent accumulator pads
 out_ch up to a multiple of kTileM (ConvKernel.cpp §2.23 layout), so the
@@ -88,9 +89,10 @@ _REQUIRED: Tuple[Tuple[str, str], ...] = (
     ("max_acc_persist_entries", "CONV_MAX_ACC_PERSIST_ENTRIES"),
     ("tile_m",                  "CONV_TILE_M"),
     ("tile_ic",                 "CONV_TILE_IC"),
-    # Only the MatMul-on-ConvKernel lowering reads these two: kw is a free
-    # choice there (1 x kw kernel, BERT_PLAN.md 2A), and the engine cost
-    # model (cost_model.py) needs the M-group size.
+    # The kernel window bound (ConvNode); the MatMul-on-ConvKernel lowering
+    # also picks its 1 x kw kernel under max_kw (BERT_PLAN.md 2A), and the
+    # engine cost model (cost_model.py) needs the M-group size.
+    ("max_kh",                  "CONV_MAX_KH"),
     ("max_kw",                  "CONV_MAX_KW"),
     ("max_m_per_group",         "CONV_MAX_M_PER_GROUP"),
 )
@@ -173,6 +175,7 @@ CONV_MAX_LINE_BUF_COLS       : int = _CFG["CONV_MAX_LINE_BUF_COLS"]
 CONV_MAX_ACC_PERSIST_ENTRIES : int = _CFG["CONV_MAX_ACC_PERSIST_ENTRIES"]
 CONV_TILE_M                  : int = _CFG["CONV_TILE_M"]
 CONV_TILE_IC                 : int = _CFG["CONV_TILE_IC"]
+CONV_MAX_KH                  : int = _CFG["CONV_MAX_KH"]
 CONV_MAX_KW                  : int = _CFG["CONV_MAX_KW"]
 CONV_MAX_M_PER_GROUP         : int = _CFG["CONV_MAX_M_PER_GROUP"]
 
@@ -192,6 +195,7 @@ __all__ = (
     "CONV_MAX_ACC_PERSIST_ENTRIES",
     "CONV_TILE_M",
     "CONV_TILE_IC",
+    "CONV_MAX_KH",
     "CONV_MAX_KW",
     "CONV_MAX_M_PER_GROUP",
     "CONV_WEIGHT_PORT_ELEMS",

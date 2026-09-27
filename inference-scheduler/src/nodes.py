@@ -973,6 +973,8 @@ from ._conv_hw_config import (  # noqa: E402
     CONV_MAX_LINE_BUF_ROWS,
     CONV_MAX_LINE_BUF_COLS,
     CONV_MAX_ACC_PERSIST_ENTRIES,
+    CONV_MAX_KH,
+    CONV_MAX_KW,
     CONV_TILE_M,
     CONV_TILE_IC,
     CONV_WEIGHT_PORT_ELEMS,
@@ -1289,6 +1291,14 @@ class ConvNode:
                 f"'kernels.conv.max_out_ch' in the platform JSON "
                 f"(platforms/<AXI_PLATFORM>.json) and rebuild."
             )
+        if kh_val > CONV_MAX_KH or kw_val > CONV_MAX_KW:
+            raise SchedulerError(
+                f"Conv node '{node_label}': kernel {kh_val}x{kw_val} exceeds "
+                f"ConvKernel's compile-time window kMaxKH x kMaxKW = "
+                f"{CONV_MAX_KH}x{CONV_MAX_KW} (the patch buffers are sized "
+                f"for it).  Raise 'kernels.conv.max_kh' / 'max_kw' in the "
+                f"platform JSON (platforms/<AXI_PLATFORM>.json) and rebuild."
+            )
         v_span = (kh_val - 1) * dh + 1
         if v_span > CONV_MAX_LINE_BUF_ROWS:
             raise SchedulerError(
@@ -1327,7 +1337,8 @@ class ConvNode:
                 f"(one padded output row must fit; taller out_h is "
                 f"auto-chunked along oh).  Raise "
                 f"'kernels.conv.max_acc_persist_entries' in the platform "
-                f"JSON (each 4096 entries spends one URAM block)."
+                f"JSON (65536 entries take 8 URAM blocks: 4096 words of "
+                f"512 bits)."
             )
 
         # §2.32: emit the weight / bias in the kernel's packed DDR layout.
@@ -1594,11 +1605,9 @@ POOL_OP_TYPES = frozenset({
 
 # ---------------------------------------------------------------------------
 # Hardware-side bounds — re-exported here for callers that import them from
-# `nodes`, but the source of truth is the C++ CMake configuration.  The
-# resolver in `_pool_hw_config` parses kernels/pool/CMakeLists.txt for the
-# `set(POOL_<NAME> <N> CACHE ...)` defaults and overlays any active
-# build/CMakeCache.txt overrides, so `cmake -DPOOL_MAX_KH=...` flows through
-# to this validator without manual edits.  See doc/POOL_OPTIMIZATION.md §4.
+# `nodes`.  The source of truth is `kernels.pool` in
+# platforms/<AXI_PLATFORM>.json, the same file the C++ build reads
+# (`_pool_hw_config`).  See doc/POOL_OPTIMIZATION.md §4.
 # ---------------------------------------------------------------------------
 from ._pool_hw_config import (  # noqa: E402 (deferred until POOL_OP_TYPES is defined above)
     POOL_MAX_KH,
@@ -1817,8 +1826,8 @@ class PoolNode:
 
         # ------------------------------------------------------------------
         # Hardware-bound validation — see _pool_hw_config for where these
-        # constants come from (kernels/pool/CMakeLists.txt + optional
-        # build/CMakeCache.txt overrides).  PoolingKernel sizes line_buf
+        # constants come from (platforms/<AXI_PLATFORM>.json,
+        # `kernels.pool`).  PoolingKernel sizes line_buf
         # and the unrolled per-position adders at compile time, so a
         # window violating any of these bounds has no runtime fallback —
         # reject at parse time rather than emit code the kernel can't
@@ -1831,17 +1840,17 @@ class PoolNode:
             raise SchedulerError(
                 f"Pool node '{node_label}' ({op_type}): pool_h={pool_h_val} "
                 f"exceeds PoolingKernel's compile-time limit "
-                f"kMaxPoolH={POOL_MAX_KH}.  Increase POOL_MAX_KH in "
-                f"kernels/pool/CMakeLists.txt (and rebuild) to support a "
-                f"taller window."
+                f"kMaxPoolH={POOL_MAX_KH}.  Raise 'kernels.pool.max_kh' in "
+                f"the platform JSON (platforms/<AXI_PLATFORM>.json) and "
+                f"rebuild to support a taller window."
             )
         if pool_w_val > POOL_MAX_KW:
             raise SchedulerError(
                 f"Pool node '{node_label}' ({op_type}): pool_w={pool_w_val} "
                 f"exceeds PoolingKernel's compile-time limit "
-                f"kMaxPoolW={POOL_MAX_KW}.  Increase POOL_MAX_KW in "
-                f"kernels/pool/CMakeLists.txt (and rebuild) to support a "
-                f"wider window."
+                f"kMaxPoolW={POOL_MAX_KW}.  Raise 'kernels.pool.max_kw' in "
+                f"the platform JSON (platforms/<AXI_PLATFORM>.json) and "
+                f"rebuild to support a wider window."
             )
         v_span = (pool_h_val - 1) * dil_h_val + 1
         if v_span > POOL_MAX_LINE_BUF_ROWS:
@@ -1850,7 +1859,8 @@ class PoolNode:
                 f"span (pool_h-1)*dil_h + 1 = ({pool_h_val}-1)*{dil_h_val} "
                 f"+ 1 = {v_span} exceeds line-buffer row capacity "
                 f"kMaxLineBufRows={POOL_MAX_LINE_BUF_ROWS}.  Reduce dil_h "
-                f"or raise POOL_MAX_LINE_BUF_ROWS (must remain a power of 2)."
+                f"or raise 'kernels.pool.max_line_buf_rows' in the platform "
+                f"JSON (must remain a power of 2)."
             )
         h_span = (pool_w_val - 1) * dil_w_val + 1
         if h_span > POOL_MAX_LINE_BUF_COLS:
@@ -1860,7 +1870,8 @@ class PoolNode:
                 f"+ 1 = {h_span} exceeds line-buffer column capacity "
                 f"kMaxLineBufCols={POOL_MAX_LINE_BUF_COLS} (a single pool "
                 f"window must fit horizontally in the line buffer).  Reduce "
-                f"dil_w or raise POOL_MAX_LINE_BUF_COLS."
+                f"dil_w or raise 'kernels.pool.max_line_buf_cols' in the "
+                f"platform JSON."
             )
 
         return cls(

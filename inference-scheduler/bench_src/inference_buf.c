@@ -23,18 +23,35 @@ void inference_buf_init_view(inference_buf_t *view, inference_buf_t *base,
 #endif
 }
 
+/* Data_t is ap_fixed<16,8> bits: value = (int16_t)bits / 256.  Rounds half
+ * to even and saturates (the scheduler's float_to_storage); NaN -> 0. */
+static Data_t buf_from_float(float v)
+{
+    double    r = (double)v * 256.0;
+    long long i;
+    double    f;
+    if (r != r) return (Data_t)0u;
+    if (r > 32767.0) r = 32767.0;
+    if (r < -32768.0) r = -32768.0;
+    i = (long long)r;                                /* toward zero */
+    f = r - (double)i;
+    if (f > 0.5 || (f == 0.5 && (i & 1))) i++;
+    else if (f < -0.5 || (f == -0.5 && (i & 1))) i--;
+    return (Data_t)(int16_t)i;
+}
+
 void inference_buf_fill_float(inference_buf_t *buf, const float *src, unsigned n)
 {
     Data_t  *dst = (Data_t *)buf->virt;
     unsigned i;
-    for (i = 0; i < n; i++) dst[i] = (Data_t)src[i];
+    for (i = 0; i < n; i++) dst[i] = buf_from_float(src[i]);
 }
 
 void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n)
 {
     const Data_t *src = (const Data_t *)buf->virt;
     unsigned i;
-    for (i = 0; i < n; i++) dst[i] = (float)src[i];
+    for (i = 0; i < n; i++) dst[i] = (float)((double)(int16_t)src[i] / 256.0);
 }
 
 #ifdef __linux__

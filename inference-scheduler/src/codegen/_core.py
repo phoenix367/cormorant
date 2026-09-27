@@ -24,13 +24,14 @@ The generated code targets the Xilinx KV260 (bare-metal and Linux):
 
 Physical-address model
 ----------------------
-VectorOPKernel's AXI master ports read/write DDR using physical addresses
-stored in AXI-Lite registers (Set_a / Set_b / Set_c).  On Linux, virtual
-pointers from malloc/stack are NOT valid DDR addresses.
+The kernels' AXI master ports read/write DDR using physical addresses
+stored in AXI-Lite registers (e.g. VectorOPKernel Set_a / Set_b / Set_c).
+On Linux, virtual pointers from malloc/stack are NOT valid DDR addresses.
 
 inference_buf_t abstracts this:
-  - Linux:      dma-proxy pool; physical address from /proc/self/pagemap
-                (requires root; dma_alloc_coherent memory is contiguous).
+  - Linux:      XRT buffer objects from CMA (xclAllocBO; the physical address
+                from xclGetBOProperties), cacheable by default with explicit
+                xclSyncBO flush / invalidate.
   - Bare-metal: malloc (virtual == physical on Xilinx standalone).
 
 inference_buf_phys() returns the physical address to program into the kernel
@@ -714,8 +715,9 @@ class _CoreMixin:
         Covers: weight tensors + intermediate tensors + model inputs + outputs.
         Uses _layouts (which accounts for broadcast alignment padding) and
         dtype.bytes_per_elem so the result is correct regardless of the data type.
-        Used to size the u-dma-buf pool and advertised as
-        INFERENCE_BUF_POOL_SIZE_BYTES in the generated header.
+        An upper bound (no pool-slot reuse), advertised as
+        INFERENCE_BUF_POOL_SIZE_BYTES in the generated header and checked by
+        scripts/check_inference_setup.sh.
         """
         def _align64(n: int) -> int:
             return (n + 63) & ~63

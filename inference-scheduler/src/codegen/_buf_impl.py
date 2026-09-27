@@ -97,20 +97,20 @@ void inference_buf_free(inference_buf_t *buf)
 }
 
 ////////////////////////////////////////////////////////////////////////
-/* Float cast helpers (platform-independent)                           */
+/* Float value helpers (platform-independent)                          */
 /*                                                                     */
-/* Uses C's built-in implicit conversion to/from Data_t so the        */
-/* implementation is correct for any numeric Data_t (float, double,   */
-/* int8_t, int16_t, uint8_t, …) without type-specific constants.      */
+/* Convert between float values and Data_t elements in Data_t's own   */
+/* number format (fixed point: scaled, rounded, saturated).           */
 ////////////////////////////////////////////////////////////////////////
 
+@BUF_FLOAT_CONVERSIONS@
 void inference_buf_fill_float(inference_buf_t *buf,
                               const float *src, unsigned n)
 {
     Data_t  *dst = (Data_t *)buf->virt;
     unsigned i;
     for (i = 0; i < n; i++)
-        dst[i] = (Data_t)src[i];
+        dst[i] = buf_from_float(src[i]);
 }
 
 void inference_buf_read_float(const inference_buf_t *buf,
@@ -119,7 +119,7 @@ void inference_buf_read_float(const inference_buf_t *buf,
     const Data_t *src = (const Data_t *)buf->virt;
     unsigned i;
     for (i = 0; i < n; i++)
-        dst[i] = (float)src[i];
+        dst[i] = buf_to_float(src[i]);
 }
 
 ////////////////////////////////////////////////////////////////////////
@@ -481,7 +481,8 @@ class _BufImplMixin:
         """
         return (
             _file_banner("inference_buf.c", self._graph, self._model_path) +
-            _BUF_IMPL_TEMPLATE
+            _BUF_IMPL_TEMPLATE.replace("@BUF_FLOAT_CONVERSIONS@",
+                                       self._dtype.c_buf_float_conversions())
         )
 
     def generate_setup_script(self) -> str:

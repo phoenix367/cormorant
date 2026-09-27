@@ -165,6 +165,21 @@ class TestConvNodeHardwareBounds(unittest.TestCase):
         self.assertIn("kMaxLineBufCols", msg)
         self.assertIn(str(CONV_MAX_LINE_BUF_COLS + 1), msg)
 
+    def test_kernel_window_over_max_raises(self):
+        """kh > kMaxKH or kw > kMaxKW (standard and depthwise); must raise
+        although the spans fit the line buffer."""
+        from src._conv_hw_config import CONV_MAX_KH, CONV_MAX_KW
+        for fname, kh, kw in (("conv_unsupported_kh.onnx", CONV_MAX_KH + 1, 1),
+                              ("conv_unsupported_kw.onnx", 1, CONV_MAX_KW + 1),
+                              ("conv_unsupported_dw_kh.onnx", CONV_MAX_KH + 1, 3)):
+            with self.subTest(model=fname):
+                with self.assertRaises(SchedulerError) as cm:
+                    OnnxGraph(_conv_model(fname))
+                msg = str(cm.exception)
+                self.assertIn("kMaxKH x kMaxKW", msg)
+                self.assertIn(f"kernel {kh}x{kw}", msg)
+                self.assertIn(f"{CONV_MAX_KH}x{CONV_MAX_KW}", msg)
+
     def test_acc_persist_overflow_raises(self):
         """out_w * out_ch > kMaxAccPersistEntries; must raise."""
         from src._conv_hw_config import CONV_MAX_ACC_PERSIST_ENTRIES

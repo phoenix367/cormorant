@@ -21,6 +21,8 @@ from src._conv_hw_config import (   # noqa: E402
     CONV_MAX_LINE_BUF_ROWS,
     CONV_MAX_LINE_BUF_COLS,
     CONV_MAX_ACC_PERSIST_ENTRIES,
+    CONV_MAX_KH,
+    CONV_MAX_KW,
 )
 
 
@@ -596,6 +598,34 @@ def gen_unsupported_acc_persist() -> None:
           "conv_unsupported_acc_persist.onnx")
 
 
+def _gen_kernel_too_large(name: str, kh: int, kw: int, depthwise: bool) -> None:
+    """A kernel window one above kMaxKH / kMaxKW — must raise.  The spans
+    stay inside the line buffer, so only the window check can reject it."""
+    c = 4
+    w_data = np.zeros((c, 1 if depthwise else c, kh, kw), dtype=np.float32)
+    w_init = numpy_helper.from_array(w_data, name="W")
+    attrs = {"kernel_shape": [kh, kw]}
+    if depthwise:
+        attrs["group"] = c
+    conv = helper.make_node("Conv", inputs=["X", "W"], outputs=["Y"], **attrs)
+    graph = helper.make_graph(
+        [conv], name,
+        inputs=[_vi("X", [1, c, kh, kw])],
+        outputs=[_vi("Y", [1, c, 1, 1])],
+        initializer=[w_init],
+    )
+    _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
+          f"{name}.onnx")
+
+
+def gen_unsupported_kernel_too_large() -> None:
+    """kh = kMaxKH + 1, kw = kMaxKW + 1 (standard) and kh = kMaxKH + 1
+    (depthwise) — must raise."""
+    _gen_kernel_too_large("conv_unsupported_kh", CONV_MAX_KH + 1, 1, False)
+    _gen_kernel_too_large("conv_unsupported_kw", 1, CONV_MAX_KW + 1, False)
+    _gen_kernel_too_large("conv_unsupported_dw_kh", CONV_MAX_KH + 1, 3, True)
+
+
 def gen_in_ch_at_limit() -> None:
     """Boundary-case: in_ch == kMaxInCh; must parse OK.
 
@@ -748,9 +778,10 @@ if __name__ == "__main__":
     gen_unsupported_dil_h_overflows_line_buf()
     gen_unsupported_dil_w_overflows_line_buf()
     gen_unsupported_acc_persist()
+    gen_unsupported_kernel_too_large()
     gen_in_ch_at_limit()
     gen_dil_h_at_line_buf_limit()
     gen_acc_persist_at_limit()
-    gen_conv_fc_7x7_64to256,
-    gen_conv_1x1_classifier_1024,
-    gen_conv_mgroups_prefetch,
+    gen_conv_fc_7x7_64to256()
+    gen_conv_1x1_classifier_1024()
+    gen_conv_mgroups_prefetch()

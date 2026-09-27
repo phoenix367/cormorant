@@ -162,13 +162,14 @@ class _HeaderMixin:
         lines.append(_banner("DMA buffer pool"))
         lines.append(
             "/*\n"
-            " * Minimum contiguous DMA pool required for this model.\n"
+            " * DMA memory upper bound for this model: every tensor 64-byte\n"
+            " * aligned, without pool-slot reuse, rounded up to 4 KiB.\n"
+            " * inference_init() allocates the (smaller) buffer pool itself.\n"
             " *\n"
-            " * Linux:      run scripts/check_inference_setup.sh before the\n"
-            " *             application to verify root access and pagemap\n"
-            " *             availability (required for physical address lookup).\n"
-            " * Bare-metal: pool is not used; each buffer is allocated from\n"
-            " *             the heap individually.\n"
+            " * Linux:      one XRT buffer object from CMA (xclAllocBO);\n"
+            " *             scripts/check_inference_setup.sh checks the XRT\n"
+            " *             prerequisites.\n"
+            " * Bare-metal: heap memory (virtual == physical).\n"
             " */"
         )
         lines.append(
@@ -292,8 +293,8 @@ class _HeaderMixin:
         lines.append("void inference_buf_sync_from_device(inference_buf_t *buf);")
         lines.append("")
         lines.append(
-            "/* Fill n elements of buf from a float array.\n"
-            " * Each value is cast to Data_t using C's built-in conversion.\n"
+            "/* Fill n elements of buf from float values, converted to Data_t's\n"
+            " * number format (fixed point: scaled, rounded half to even, saturated).\n"
             " * n must be <= inference_buf_count(buf). */"
         )
         lines.append(
@@ -302,8 +303,7 @@ class _HeaderMixin:
         )
         lines.append("")
         lines.append(
-            "/* Read n elements from buf into a float array.\n"
-            " * Each Data_t element is cast to float using C's built-in conversion.\n"
+            "/* Read n elements from buf as float values (fixed point: bits / 2^F).\n"
             " * n must be <= inference_buf_count(buf). */"
         )
         lines.append(

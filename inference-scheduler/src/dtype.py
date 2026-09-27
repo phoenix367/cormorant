@@ -230,6 +230,17 @@ class DataType(ABC):
         integer tensor with ``%d``."""
         raise NotImplementedError(f"{self.name}: host ops / integer tensors not supported")
 
+    def c_buf_float_conversions(self) -> str:
+        """C source of the static ``buf_from_float`` / ``buf_to_float``
+        (float value <-> Data_t element) that inference_buf.c's
+        ``inference_buf_fill_float`` / ``inference_buf_read_float`` use.  The
+        default casts, which is right for a floating-point ``Data_t``."""
+        return (
+            "/* Data_t is a floating-point type: the value is the element. */\n"
+            "static Data_t buf_from_float(float v) { return (Data_t)v; }\n"
+            "static float buf_to_float(Data_t b) { return (float)b; }\n"
+        )
+
     def c_host_conversions(self) -> str:
         """C source of the ``host_ld`` / ``host_st`` (Data_t <-> double) and
         ``host_ld_int`` / ``host_st_int`` (raw integer element <-> double)
@@ -457,6 +468,33 @@ class ApFixed(DataType):
             f"#define HOST_LUT_SIZE   {1 << self._W}u\n"
             f"#define HOST_LUT_SCALE  {self._scale:.1f}\n"
             f"typedef int{self._W}_t host_sint_t;   /* signed view of the Data_t bits */\n"
+        )
+
+    def c_buf_float_conversions(self) -> str:
+        # No libm here (inference_buf.c also builds bare metal): round half to
+        # even by hand after the saturation, like float_to_storage's
+        # clip + np.round.  v * 2^F is exact in double for any float v.
+        int_t = f"int{self._W}_t"
+        scale = f"{self._scale:.1f}"
+        lo, hi = f"{self._int_lo:.1f}", f"{self._int_hi:.1f}"
+        return (
+            f"/* {self.name}: value = ({int_t})bits / {scale}.  buf_from_float rounds\n"
+            " * half to even and saturates (the scheduler's float_to_storage); NaN -> 0. */\n"
+            "static Data_t buf_from_float(float v)\n"
+            "{\n"
+            f"    double    r = (double)v * {scale};\n"
+            "    long long i;\n"
+            "    double    f;\n"
+            "    if (r != r) return (Data_t)0u;\n"
+            f"    if (r > {hi}) r = {hi};\n"
+            f"    if (r < {lo}) r = {lo};\n"
+            "    i = (long long)r;                                /* toward zero */\n"
+            "    f = r - (double)i;\n"
+            "    if (f > 0.5 || (f == 0.5 && (i & 1))) i++;\n"
+            "    else if (f < -0.5 || (f == -0.5 && (i & 1))) i--;\n"
+            f"    return (Data_t)({int_t})i;\n"
+            "}\n"
+            f"static float buf_to_float(Data_t b) {{ return (float)((double)({int_t})b / {scale}); }}\n"
         )
 
     def c_host_conversions(self) -> str:

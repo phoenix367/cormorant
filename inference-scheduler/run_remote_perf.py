@@ -502,6 +502,14 @@ def main(argv=None) -> int:
 
     cli_kernels = set(args.kernels) if args.kernels else None
 
+    # Select and validate the test cases before touching the board: a bad
+    # case (e.g. an unsupported VectorOP op) is a config error.
+    try:
+        cases = _load_cases(cfg, cli_kernels)
+    except (KeyError, ValueError) as exc:
+        print(f"\n{_red('config error')}: {exc}", file=sys.stderr)
+        return 1
+
     ssh_cfg = cfg["ssh"]
     print(f"\n{_bold('Connecting')} to "
           f"{ssh_cfg['user']}@{ssh_cfg['host']}:{ssh_cfg['port']} …")
@@ -545,12 +553,6 @@ def main(argv=None) -> int:
                 print(f"  {_dim(line)}")
             return 1
 
-        # Select test cases
-        try:
-            cases = _load_cases(cfg, cli_kernels)
-        except (KeyError, ValueError) as exc:
-            print(f"\n{_red('config error')}: {exc}", file=sys.stderr)
-            return 1
         kernels = {c.kernel for c in cases}
         print(f"\n{_bold('Running benchmarks')} "
               f"({len(cases)} cases across {len(kernels)} kernel(s))\n")

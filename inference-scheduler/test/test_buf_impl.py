@@ -5,6 +5,7 @@ import unittest
 from helpers import _model, _models_exist
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
+from src.dtype   import AP_FIXED_16_8, FLOAT32
 
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -85,20 +86,28 @@ class TestBufImpl(unittest.TestCase):
         b = self._buf("single_add.onnx")
         self.assertIn("inference_buf_read_float(", b)
 
-    def test_fill_float_uses_data_t_cast(self):
-        # Must use (Data_t) cast, not a type-specific encoding constant
+    def test_fill_float_converts_via_dtype(self):
+        # Values are converted to Data_t's number format by the data type's
+        # buf_from_float (fixed point: scaled, rounded, saturated).
         b = self._buf("single_add.onnx")
-        self.assertIn("(Data_t)src[i]", b)
+        self.assertIn("dst[i] = buf_from_float(src[i]);", b)
+        self.assertIn(AP_FIXED_16_8.c_buf_float_conversions(), b)
 
-    def test_read_float_uses_float_cast(self):
+    def test_read_float_converts_via_dtype(self):
         b = self._buf("single_add.onnx")
-        self.assertIn("(float)src[i]", b)
+        self.assertIn("dst[i] = buf_to_float(src[i]);", b)
 
-    def test_no_hardcoded_scale_in_buf(self):
-        # Must not contain ap_fixed<16,8>-specific scaling constants
-        b = self._buf("single_add.onnx")
-        self.assertNotIn("256.0f", b)
-        self.assertNotIn("127.99609375f", b)
+    def test_float_conversions_follow_dtype(self):
+        # ap_fixed<16,8>: scale 2^8, round half to even, saturate at int16;
+        # float32: a plain cast, no fixed-point constants.
+        fx = self._buf("single_add.onnx")
+        self.assertIn("(double)v * 256.0", fx)
+        self.assertIn("if (r > 32767.0) r = 32767.0;", fx)
+        g = OnnxGraph(_model("single_add.onnx"), dtype=FLOAT32)
+        fl = CodeGenerator(g, model_path=_model("single_add.onnx"),
+                           dtype=FLOAT32).generate_buf_impl()
+        self.assertIn("return (Data_t)v;", fl)
+        self.assertNotIn("256.0", fl)
 
 
 if __name__ == "__main__":

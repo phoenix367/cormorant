@@ -491,7 +491,7 @@ def run_calls(mg, workdir, calls, incoherent=False):
         os.makedirs(d, exist_ok=True)
     files = {os.path.join(inc, "inference.h"): mg.generate_header(),
              os.path.join(src, "inference.c"): mg.generate_source(),
-             os.path.join(emu, "inference_buf_emu.c"): host_emu._BUF_EMU,
+             os.path.join(emu, "inference_buf_emu.c"): host_emu.buf_emu_source(),
              os.path.join(emu, "emu_common.h"): host_emu._COMMON,
              os.path.join(emu, "xvectoropkernel.h"): host_emu._VOP,
              os.path.join(emu, "xmatmulkernel.h"): host_emu._MM,
