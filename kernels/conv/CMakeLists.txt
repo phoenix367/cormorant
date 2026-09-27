@@ -123,44 +123,9 @@ if(_CONV_HAVE_HLS)
 endif()
 target_compile_options(conv_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
-# ---------------------------------------------------------------------------
-# Float kernel library — same ConvKernel.cpp compiled with Data_t=float.
-# Used by any future float-reference tests without the ap_fixed dependency.
-#
-# A separate float_config/Config.h is generated so the include path override
-# works without touching the primary Config.h.
-# ---------------------------------------------------------------------------
-set(_SAVE_DATA_TYPE          "${CONV_DATA_TYPE}")
-set(_SAVE_ACC_DATA_TYPE      "${CONV_ACC_DATA_TYPE}")
-set(_SAVE_DATA_TYPE_INCLUDE  "${CONV_DATA_TYPE_INCLUDE}")
-set(_SAVE_HAVE_APFIXED_DEFINE "${CONV_HAVE_APFIXED_DEFINE}")
-
-set(CONV_DATA_TYPE          "float")
-set(CONV_ACC_DATA_TYPE      "float")
-set(CONV_DATA_TYPE_INCLUDE  "")
-set(CONV_HAVE_APFIXED_DEFINE "")
-
-configure_file(
-    include/Config.h.in
-    ${CMAKE_CURRENT_BINARY_DIR}/float_config/Config.h
-    @ONLY
-)
-
-set(CONV_DATA_TYPE          "${_SAVE_DATA_TYPE}")
-set(CONV_ACC_DATA_TYPE      "${_SAVE_ACC_DATA_TYPE}")
-set(CONV_DATA_TYPE_INCLUDE  "${_SAVE_DATA_TYPE_INCLUDE}")
-set(CONV_HAVE_APFIXED_DEFINE "${_SAVE_HAVE_APFIXED_DEFINE}")
-
-add_library(conv_kernel_float STATIC
-    kernel/ConvKernel.cpp
-)
-# float_config must come before include/ so its Config.h shadows the primary one.
-target_include_directories(conv_kernel_float
-    PUBLIC
-        ${CMAKE_CURRENT_BINARY_DIR}/float_config  # float Config.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/include       # ConvKernel.h
-)
-target_compile_options(conv_kernel_float PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
+# No forced-float library: the 128-bit ports pack eight 16-bit elements per
+# word (kXPortElems, the row / weight buffers and their static_asserts), so
+# ConvKernel.cpp does not build with a 32-bit Data_t.
 
 # ---------------------------------------------------------------------------
 # TestConvRef — C++ simulation test, no Vitis HLS synthesis required.
@@ -212,7 +177,7 @@ if(_CONV_HAVE_HLS)
     message(STATUS "ConvKernel: gen_conv_test_data → ${CONV_TEST_DATA_DIR}")
 endif()
 
-message(STATUS "ConvKernel: targets — conv_kernel, conv_kernel_float, TestConvRef")
+message(STATUS "ConvKernel: targets — conv_kernel, TestConvRef")
 message(STATUS "ConvKernel: Data_t=${CONV_DATA_TYPE}  "
                "AccData_t=${CONV_ACC_DATA_TYPE}  "
                "TILE_M=${CONV_TILE_M}  TILE_IC=${CONV_TILE_IC}  "

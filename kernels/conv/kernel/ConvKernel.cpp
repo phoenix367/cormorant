@@ -3,7 +3,7 @@
 //
 // Implements the ONNX Conv operator (group=1 or group=in_ch) in a tiled
 // structure that maps cleanly to Vitis HLS synthesis.
-// See doc/CONV_PLAN.md for a full explanation of the architecture, tiling
+// See doc/CONV_KERNEL.md for a full explanation of the architecture, tiling
 // strategy, and II=1 rationale.
 //
 // Top-level dataflow (HLS DATAFLOW):
@@ -640,8 +640,8 @@ static inline RowLoad row_load_descriptor(
 // a ping-pong row buffer, and re-emits the row as COLUMN vectors: one
 // ColVec (all kTileIC channels of one input column) per cycle on
 // col_stream.  The producer's Phase 1 then writes one column into all 16
-// line_buf channel banks per cycle — 16 (standard) / 8 (depthwise)
-// elements per cycle into the SAME 16-bank BRAM line buffer as before,
+// line_buf channel banks per cycle — kTileIC (standard) / kTileM (depthwise)
+// elements per cycle (16 / 16 at the KV260 bounds) into the SAME 16-bank BRAM line buffer as before,
 // no re-banking.  The drain of row r+1 overlaps the emission of row r
 // (the two halves of rowbuf), and the whole loader runs ahead of the
 // producer by col_stream's depth, so DDR latency and word traffic hide
@@ -1457,15 +1457,15 @@ static void process_conv_kernel_tile(
 
     AccData_t partial_outputs[kMaxAccPersistEntries];
     // Bound to URAM: this is by far the largest on-chip buffer and the
-    // design is BRAM-bound, while the XCK26's 64 URAM blocks (288 Kbit
-    // each, 4096 AccData_t entries) are otherwise unused.  Relocating it
-    // frees ~16 BRAM and lets kMaxAccPersistEntries grow into the idle
-    // URAM pool.  RAM_2P — Phase 1/3 touch a single port (write-only /
+    // design is BRAM-bound.  The XCK26 has 64 URAM blocks (288 Kbit each);
+    // at 65536 entries this array takes 8 of them (4096 words of 512 bits,
+    // the reshape below), w_hi 32 and acc_stream 4 (CONV_KERNEL.md §4).  RAM_2P — Phase 1/3 touch a single port (write-only /
     // read-only) and Phase 2a's read and write run in separate II=1
     // sub-loops, so two ports suffice and there is no tight RAW
     // recurrence that URAM's extra read latency could stall.
     #pragma HLS bind_storage variable=partial_outputs type=RAM_2P impl=URAM
-    // §2.23: kTileM consecutive entries → one 256-bit word, so an aligned
+    // §2.23: kTileM consecutive entries → one kTileM x 32-bit word (512
+    // bits at kTileM 16), so an aligned
     // m-tile is loaded / stored per cycle (UG1399: reshape "combines
     // elements into wider words instead of creating separate arrays").
     #pragma HLS ARRAY_RESHAPE variable=partial_outputs cyclic factor=kTileM dim=1

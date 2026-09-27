@@ -34,7 +34,7 @@ make TestPoolingSim
 ```
 
 - The build must finish with `[100%] Built target TestPoolingSim`.
-- The test run must end with a line like `33 / 33 tests passed.` — every test must pass. **Any line of the form `[FAIL] …` is a regression**, even if the summary line still reports the right pass count for the rest. Scan the output for `[FAIL]`/`failures=N/M` with N>0 before continuing.
+- The test run must end with a line like `45 / 45 tests passed.` (the count grows with the suite; it must equal the total) — every test must pass. **Any line of the form `[FAIL] …` is a regression**, even if the summary line still reports the right pass count for the rest. Scan the output for `[FAIL]`/`failures=N/M` with N>0 before continuing.
 
 ## Gate 2 — HLS synthesis
 
