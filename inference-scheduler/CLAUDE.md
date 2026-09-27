@@ -152,7 +152,8 @@ left in place, non-depthwise grouped Conv) and a worked example on
 ├── src/
 │   ├── inference.c           Weight ROM arrays, run_*() helpers, kernel_wait(),
 │   │                         host-op helpers, init/deinit/run bodies
-│   ├── inference_buf.c       DMA buffer alloc/sync (Linux XRT BOs or bare-metal Xil)
+│   ├── inference_buf.c       DMA buffer alloc/sync (Linux: XRT BOs, or
+│   │                         /dev/fpga_smmu_mem under the SMMU; bare-metal Xil)
 │   ├── inference_prof.c, inference_ddr.c, inference_ddr_backend.h, ddr/zuplus_apm.c
 ├── test/test_inference.c     On-device test: ramp fill → run → compare vs GT
 ├── scripts/check_inference_setup.sh

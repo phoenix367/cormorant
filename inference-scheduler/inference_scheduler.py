@@ -14,7 +14,7 @@ Output project layout (main parts):
   ├── CMakeLists.txt              INFERENCE_TARGET=BARE_METAL (default)|LINUX
   ├── include/inference.h         public API: Data_t, sizes, buffers, init/run
   ├── src/inference.c             weights, kernel calls, host ops, run bodies
-  ├── src/inference_buf.c         DMA buffers (XRT on Linux, Xil bare metal)
+  ├── src/inference_buf.c         DMA buffers (XRT or fpga_smmu_mem on Linux, Xil)
   ├── test/test_inference.c       on-device test against the simulated outputs
   ├── driver/                     kernel drivers (copied from --driver-dir)
   ├── weights/, expected/         large tensors as .dat files

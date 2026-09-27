@@ -153,11 +153,25 @@ void inference_buf_read_float(const inference_buf_t *buf,
 /*                                                                     */
 /* Requires XRT runtime (/opt/xilinx/xrt) and access to the XRT       */
 /* device node.                                                        */
+/*                                                                     */
+/* SMMU backend: when the board runs the kernels behind the ZynqMP     */
+/* SMMU (board/kv260/fpga-smmu-mem: arm_smmu.ko, fpga_smmu_mem.ko and  */
+/* smmu-mem.dtbo), every buffer must come from /dev/fpga_smmu_mem —    */
+/* ordinary pages at one contiguous device (IO virtual) address, not   */
+/* CMA.  Chosen automatically when that device exists; environment     */
+/* INFERENCE_BUF_BACKEND=xrt|smmu overrides.  One file per buffer:     */
+/* bo holds its descriptor; the mapping is cacheable (write-combined   */
+/* with INFERENCE_BUF_CACHEABLE=0) and FSM_IOC_SYNC does the range     */
+/* cache maintenance xclSyncBO does for the XRT BOs.                   */
 ////////////////////////////////////////////////////////////////////////
 
 #ifdef __linux__
 
+#include <fcntl.h>
 #include <stdio.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <xrt.h>
 
 #ifndef INFERENCE_BUF_CACHEABLE
@@ -167,15 +181,43 @@ void inference_buf_read_float(const inference_buf_t *buf,
 #  define XCL_BO_FLAGS_CACHEABLE (1U << 24)       /* xrt_mem.h */
 #endif
 
+/* fpga_smmu_mem user interface — a copy of
+ * board/kv260/fpga-smmu-mem/fpga_smmu_mem.h (test_buf_impl.py checks it). */
+#define FSM_DEVICE_PATH       "/dev/fpga_smmu_mem"
+#define FSM_ALLOC_WC          0x1u
+struct fsm_alloc {
+    uint64_t size;
+    uint32_t flags;
+    uint32_t pad;
+    uint64_t iova;
+};
+#define FSM_SYNC_TO_DEVICE    0u
+#define FSM_SYNC_FROM_DEVICE  1u
+struct fsm_sync {
+    uint64_t offset;
+    uint64_t size;
+    uint32_t dir;
+    uint32_t pad;
+};
+#define FSM_IOC_MAGIC         'F'
+#define FSM_IOC_ALLOC         _IOWR(FSM_IOC_MAGIC, 1, struct fsm_alloc)
+#define FSM_IOC_SYNC          _IOW(FSM_IOC_MAGIC, 2, struct fsm_sync)
+
 static xclDeviceHandle s_xrt_dev   = NULL;
 static int             s_cacheable = INFERENCE_BUF_CACHEABLE;
+static int             s_smmu      = 0;           /* 1: /dev/fpga_smmu_mem buffers */
 
 int inference_buf_pool_init(void)
 {
     const char *env = getenv("INFERENCE_BUF_CACHEABLE");
+    const char *backend = getenv("INFERENCE_BUF_BACKEND");
     if (env && *env)
         s_cacheable = (strcmp(env, "0") != 0);
-    if (s_xrt_dev)
+    if (backend && *backend)
+        s_smmu = (strcmp(backend, "smmu") == 0);
+    else
+        s_smmu = (access(FSM_DEVICE_PATH, R_OK | W_OK) == 0);
+    if (s_smmu || s_xrt_dev)
         return 0;
     s_xrt_dev = xclOpen(0, NULL, (enum xclVerbosityLevel)XCL_QUIET);
     if (s_xrt_dev == NULL) {
@@ -193,6 +235,15 @@ void inference_buf_pool_deinit(void)
     }
 }
 
+/* Allocation size: rounded up to 64 bytes, since the kernels read / write
+ * whole 16-byte words (VectorOPKernel writes the last word of every run
+ * whole), so the allocation must cover the tail word past n_elem. */
+static size_t _inference_buf_bytes(unsigned n_elem)
+{
+    size_t bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
+    return bytes ? bytes : 64u;
+}
+
 static void _inference_buf_sync(inference_buf_t *buf, enum xclBOSyncDirection dir)
 {
     static int reported = 0;
@@ -200,11 +251,21 @@ static void _inference_buf_sync(inference_buf_t *buf, enum xclBOSyncDirection di
     int        rc;
     if (bytes == 0u)
         return;
-    rc = xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo, dir, bytes, (size_t)buf->bo_offset);
+    if (s_smmu) {
+        struct fsm_sync s;
+        s.offset = buf->bo_offset;
+        s.size   = bytes;
+        s.dir    = dir == XCL_BO_SYNC_BO_TO_DEVICE ? FSM_SYNC_TO_DEVICE : FSM_SYNC_FROM_DEVICE;
+        s.pad    = 0u;
+        rc = ioctl((int)buf->bo, FSM_IOC_SYNC, &s);
+    } else {
+        rc = xclSyncBO(s_xrt_dev, (xclBufferHandle)buf->bo, dir, bytes, (size_t)buf->bo_offset);
+    }
     if (rc != 0 && !reported) {
         reported = 1;
-        fprintf(stderr, "inference: xclSyncBO(%s, %zu bytes at offset %llu) failed: %d"
+        fprintf(stderr, "inference: %s(%s, %zu bytes at offset %llu) failed: %d"
                 " — CPU / kernel data may be incoherent\n",
+                s_smmu ? "FSM_IOC_SYNC" : "xclSyncBO",
                 dir == XCL_BO_SYNC_BO_TO_DEVICE ? "to device" : "from device",
                 bytes, (unsigned long long)buf->bo_offset, rc);
     }
@@ -212,10 +273,7 @@ static void _inference_buf_sync(inference_buf_t *buf, enum xclBOSyncDirection di
 
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
-    /* Round up to 64 bytes: the kernels read / write whole 16-byte words
-     * (VectorOPKernel writes the last word of every run whole), so the
-     * allocation must cover the tail word past n_elem. */
-    size_t                 bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
+    size_t                 bytes = _inference_buf_bytes(n_elem);
     unsigned               flags = s_cacheable ? XCL_BO_FLAGS_CACHEABLE : 0u;
     xclBufferHandle        bo;
     void                  *virt;
@@ -225,8 +283,44 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf = (inference_buf_t *)malloc(sizeof(inference_buf_t));
     if (!buf) return NULL;
 
+    if (s_smmu) {
+        struct fsm_alloc a;
+        int              fd = open(FSM_DEVICE_PATH, O_RDWR | O_CLOEXEC);
+        if (fd < 0) {
+            fprintf(stderr, "inference: open(%s) failed\n", FSM_DEVICE_PATH);
+            free(buf);
+            return NULL;
+        }
+        memset(&a, 0, sizeof(a));
+        a.size  = bytes;
+        a.flags = s_cacheable ? 0u : FSM_ALLOC_WC;
+        if (ioctl(fd, FSM_IOC_ALLOC, &a) != 0) {
+            fprintf(stderr, "inference: fpga_smmu_mem allocation of %zu bytes failed\n", bytes);
+            close(fd);
+            free(buf);
+            return NULL;
+        }
+        virt = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (virt == MAP_FAILED) {
+            fprintf(stderr, "inference: mmap of an fpga_smmu_mem buffer failed\n");
+            close(fd);
+            free(buf);
+            return NULL;
+        }
+        /* The driver hands the pages out zeroed and cleaned. */
+        buf->virt      = virt;
+        buf->phys      = a.iova;
+        buf->count     = n_elem;
+        buf->bo        = (unsigned)fd;
+        buf->refcount  = 1u;
+        buf->is_owner  = 1u;
+        buf->cached    = (uint8_t)(s_cacheable != 0);
+        buf->bo_offset = 0;
+        return buf;
+    }
+
     /* flags: memory bank 0 | XCL_BO_FLAGS_CACHEABLE (default) */
-    bo = xclAllocBO(s_xrt_dev, bytes ? bytes : 64u, 0, flags);
+    bo = xclAllocBO(s_xrt_dev, bytes, 0, flags);
     if (bo == (xclBufferHandle)NULLBO) {
         fprintf(stderr, "inference: xclAllocBO(%zu bytes) failed\n", bytes);
         free(buf);
@@ -269,8 +363,13 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
 
 static void _inference_buf_dealloc(inference_buf_t *buf)
 {
-    xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
-    xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
+    if (s_smmu) {
+        munmap(buf->virt, _inference_buf_bytes(buf->count));
+        close((int)buf->bo);                     /* the driver frees the pages */
+    } else {
+        xclUnmapBO(s_xrt_dev, (xclBufferHandle)buf->bo, buf->virt);
+        xclFreeBO(s_xrt_dev, (xclBufferHandle)buf->bo);
+    }
     free(buf);
 }
 

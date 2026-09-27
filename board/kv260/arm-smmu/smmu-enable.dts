@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Enable the ZynqMP MMU-500 (the board DT has it, status "disabled").
+ * stream-match-mask: ignore stream-ID bits [6:0], so zocl's single entry
+ * 0x200 matches S_AXI_HPC0_FPD (0x200-0x23F) and S_AXI_HPC1_FPD
+ * (0x240-0x27F) with one SMR (UG1085 Tables 16-3, 16-11).
+ */
+/dts-v1/;
+/plugin/;
+/ {
+	fragment@0 {
+		target = <&smmu>;
+		__overlay__ {
+			status = "okay";
+			stream-match-mask = <0x7f>;
+		};
+	};
+};

@@ -1,0 +1,13 @@
+# kbuild outputs
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+build.log
+*.dtbo
+cormorant-smmu.dts
+fsm_test

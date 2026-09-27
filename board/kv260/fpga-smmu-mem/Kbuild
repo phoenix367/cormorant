@@ -1,0 +1,1 @@
+obj-m := fpga_smmu_mem.o

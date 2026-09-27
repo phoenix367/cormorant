@@ -1,0 +1,4 @@
+# Out-of-tree build of drivers/iommu/arm/arm-smmu (Linux v5.15.139) for the
+# Ubuntu xilinx-zynqmp 5.15 kernel, which is configured without CONFIG_ARM_SMMU.
+obj-m := arm_smmu.o
+arm_smmu-y := arm-smmu.o arm-smmu-impl.o arm-smmu-stubs.o

@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Put the PL kernels behind the ZynqMP SMMU with fpga_smmu_mem as their
+ * allocator: enable &smmu (stream-match-mask 0x7f: one SMR covers the stream
+ * IDs of S_AXI_HPC0_FPD 0x200-0x23F and S_AXI_HPC1_FPD 0x240-0x27F, UG1085
+ * Tables 16-3 / 16-11) and attach them to the fpga_smmu_mem device.
+ * Load arm_smmu.ko and fpga_smmu_mem.ko first.  zocl stays on CMA; while
+ * this overlay is applied every FPGA buffer must come from /dev/fpga_smmu_mem.
+ */
+/dts-v1/;
+/plugin/;
+/ {
+	fragment@0 {
+		target = <&smmu>;
+		__overlay__ {
+			status = "okay";
+			stream-match-mask = <0x7f>;
+		};
+	};
+
+	fragment@1 {
+		target = <&amba>;
+		__overlay__ {
+			fpga_smmu_mem {
+				compatible = "axi-demo,fpga-smmu-mem";
+				iommus = <&smmu 0x200>;
+			};
+		};
+	};
+};
