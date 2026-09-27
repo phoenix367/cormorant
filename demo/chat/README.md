@@ -5,7 +5,7 @@ standard-library Python server on the board (`kv260_chat_server.py`) that
 answers `POST /v1/chat/completions` with a model running on this repo's FPGA
 kernels, so existing clients — `curl`, the `openai` SDK, `llm`, `aichat` —
 and our own zero-install `chat.py` talk to the board directly.  Plan and
-decisions: [`doc/CHAT_PLAN.md`](../../doc/CHAT_PLAN.md).
+decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md).
 
 Two backends:
 

@@ -50,7 +50,7 @@ inline T saturate_cast(From v) {
 // plain C-sim); bump a port's value here to pull a larger case into cosim.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// 128-bit x and y ports (POOL_OPTIMIZATION.md §2.13 / §2.14).
+// 128-bit x and y ports (POOL_OPTIMISATION.md §2.13 / §2.14).
 //
 // Both ports are hls::burst_maxi<PoolWord> carrying kPoolPortElems elements
 // per beat.  The NCHW layout is unchanged.

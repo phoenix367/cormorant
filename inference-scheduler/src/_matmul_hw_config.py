@@ -45,7 +45,7 @@ silently falling back to defaults.
 models cannot violate them.  ``tile_m`` is exported because the packed
 tile-major B layout the scheduler emits for constant weights
 (``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the
-hard upper bound — see ``doc/MATMUL_KERNEL.md`` §3 "Runtime constraint
+hard upper bound — see ``doc/kernels/MATMUL_KERNEL.md`` §3 "Runtime constraint
 validated by the scheduler".
 """
 

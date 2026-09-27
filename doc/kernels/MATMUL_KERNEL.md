@@ -361,7 +361,7 @@ wherever the cost model estimates ConvKernel to be faster
 (`--matmul-on-conv auto`, the default; `always` / `off`), bit-identical
 either way.  Batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16
 rows and the 4-D × 3-D outer loops stay on MatmulKernel
-(`doc/BERT_PLAN.md` §2 2A).
+(`doc/plans/BERT_PLAN.md` §2 2A).
 
 The code-generated `run_matmul()` writes the AXI-Lite registers and calls
 `XMatmulkernel_Start()` non-blocking; `run_matmul_at()` (used inside the

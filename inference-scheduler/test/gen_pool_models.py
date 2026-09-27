@@ -209,7 +209,7 @@ def gen_pool_batch2() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 128-bit x port coverage (POOL_OPTIMIZATION §2.13): row segments that start
+# 128-bit x port coverage (POOL_OPTIMISATION §2.13): row segments that start
 # at every 16-byte lane offset, rows wider than the 64-column line buffer
 # (ow-tiling), several channel tiles, and batch slices at odd offsets.
 # ---------------------------------------------------------------------------

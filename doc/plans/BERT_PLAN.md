@@ -274,7 +274,7 @@ be at roughly 2.5–3.5 s per inference.
 
 No kernel or bitstream change: the scheduler lowers MatMuls onto ConvKernel
 with swapped operand roles (`src/matmul_lowering.py`, `MatmulConvNode`;
-doc/INFERENCE_SCHEDULER.md "MatMul on ConvKernel"), choosing the engine and
+doc/scheduler/INFERENCE_SCHEDULER.md "MatMul on ConvKernel"), choosing the engine and
 the `(kw, out_w)` geometry with `src/cost_model.py` — the conv-cycle-model
 skill's standard path against a MatmulKernel block model calibrated on the
 phase-1 board numbers (it predicts phase 1's MatMuls at 8.37 s, measured
@@ -383,7 +383,7 @@ for BERT-base: `max_in_ch` 1024 suffices with `kw = 4`.
 
 ### Phase 2B on the board — host ops (2026-09-26, branch `feat/berthost`)
 
-What changed (`doc/INFERENCE_SCHEDULER.md` §Cache coherency and §Host-CPU
+What changed (`doc/scheduler/INFERENCE_SCHEDULER.md` §Cache coherency and §Host-CPU
 ops → *Host-op performance*): the XRT buffer objects are mapped
 **cacheable** (`XCL_BO_FLAGS_CACHEABLE`; `INFERENCE_BUF_CACHEABLE=0` falls
 back) and host ops compute in place in them; GELU is a 65 536-entry table

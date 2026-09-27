@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 llm_board.py — build libsmollm2.so + llm_bench on the KV260 and run the
-phase-3 board gate (doc/CHAT_PLAN.md): logits bit-exact with the scheduler
+phase-3 board gate (doc/plans/CHAT_PLAN.md): logits bit-exact with the scheduler
 simulation on prefill + greedy decode for real chat prompts, the greedy text
 against the study emulation, decode ms / token (per-kind profile), prefill
 times, llm_open time, CMA, and the close / re-open cycle.

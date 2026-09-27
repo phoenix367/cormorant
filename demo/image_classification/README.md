@@ -118,7 +118,7 @@ Or step-by-step (lets you iterate without re-downloading):
 Sample output (host `~/projects/axi_demo/demo/image_classification`, board
 at `192.168.100.8`, one image: `greyfox-672194.JPEG`).  The generate stage
 is the current scheduler's output (abridged); the deploy stage is the board
-run behind `doc/RESNET18_15FPS_PLAN.md` §3.3 (2026-09-26, 100 MHz):
+run behind `doc/plans/RESNET18_15FPS_PLAN.md` §3.3 (2026-09-26, 100 MHz):
 
 ```
 $ ./run_demo.py
@@ -266,7 +266,7 @@ Notable behaviour visible in the run:
   stem (ResNet-18's 7×7, the MobileNets' 3×3) as a host-side
   `SpaceToDepth(2)` reorder plus a stride-1 Conv over 12 channels, so the
   stem uses 12 of ConvKernel's 16 input lanes instead of 3; the output is
-  bit-identical (`doc/RESNET18_15FPS_PLAN.md` step 1).
+  bit-identical (`doc/plans/RESNET18_15FPS_PLAN.md` step 1).
 - **Per-model preprocessing.**  `download_assets.py` writes one
   `images.bin` per model under `assets/preprocessed/<model>/`, each
   encoded with the model's own `normalize` recipe: `tf` for
@@ -287,18 +287,18 @@ Notable behaviour visible in the run:
   of this demo produced garbage top-K for ResNet-18 and blamed the
   BN-fusion of `resnet18-simplified-fused.onnx`.  The actual cause was a
   ConvKernel bug (line-buffer rows overwritten between M-group replays,
-  `doc/CONV_OPTIMISATION.md` §2.21) that corrupted 12 of its 20 conv
+  `doc/kernels/CONV_OPTIMISATION.md` §2.21) that corrupted 12 of its 20 conv
   layers; MobileNet v1/v2 escaped only because their chunk geometry
   happened to fit.  With the fix the same ONNX file classifies
   correctly (83 % grey_fox above).  The latencies in this transcript are
-  from the ConvKernel of `doc/CONV_OPTIMISATION.md` §2.22–§2.42 (2-D MAC
+  from the ConvKernel of `doc/kernels/CONV_OPTIMISATION.md` §2.22–§2.42 (2-D MAC
   grid, explicit AXI bursts, 128-bit packed weight path, 16 × 16 grid,
   two output pixels per cycle); the previous transcript showed
   2 463 / 1 876 / 2 459 ms.
 - **Later: cacheable buffer pool.**  Since BERT phase 2B the generated
   code maps its buffers cacheable and the SpaceToDepth reorder runs in
   place: ResNet-18 60.3 ms, MobileNet v1 81.0 ms, v2 63.9 ms with the same
-  predictions (`doc/BERT_PLAN.md` §3, "Phase 2A + 2B combined").
+  predictions (`doc/plans/BERT_PLAN.md` §3, "Phase 2A + 2B combined").
 
 The full per-image top-K table is also written to `build/results.json`.
 

@@ -8,7 +8,7 @@ on the FPGA, 256-token prefill 3.6 → 1.3 s (§16); decode attention on all hos
 threads, 5.06 tok/s at position 32 and 4.39 at 1000 (§17).  Board-hang
 workaround in §18.  Not done: dual-port weight streaming, q/k/v + gate/up
 fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers
-are in §13.4, §16.3 and §17.  Builds on doc/BERT_PLAN.md (BERT-base SQuAD at
+are in §13.4, §16.3 and §17.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
 
 ## 0. The constraint that shapes everything
@@ -233,7 +233,7 @@ Each phase lands as its own branch and board run, like BERT phases 1–2.
 
 ## 9. Phase 1 outcome (2026-09-26, branch `feat/chatsrv`)
 
-Delivered as [`demo/chat/`](../demo/chat/) (README there: deploy, the
+Delivered as [`demo/chat/`](../../demo/chat/) (README there: deploy, the
 client recipes with transcripts, the API and backend reference).
 
 * **Shared library.**  `demo/bert_squad/src/bert_api.{h,c}` — `bert_open(weights_dir)`,
@@ -669,7 +669,7 @@ from its fixed-point exponent to float.  Sampling is not in this library.
 
 Everything above `libsmollm2.so`, built and tested on the host against fakes
 of the §11 contract; no FPGA used (the board only for CPU timing).  Files in
-[`demo/chat/`](../demo/chat/) (README section "Generative chat"):
+[`demo/chat/`](../../demo/chat/) (README section "Generative chat"):
 
 * **`smollm2_tokenizer.py`** (stdlib, ~300 lines + Unicode tables): the
   `tokenizer.json` pipeline — special tokens matched first (never split),
@@ -892,7 +892,7 @@ The library closes and reopens cleanly.  The full board suite passes
   0.63 / 2.5 / 9.9 s for 16 / 64 / 256 rows.  On ConvKernel it predicts
   0.24 / 0.26 / 0.70 s, and the board measures 0.24 / 0.26 / 0.67 s.
 
-### 13.2 Scheduler features (doc/INFERENCE_SCHEDULER.md)
+### 13.2 Scheduler features (doc/scheduler/INFERENCE_SCHEDULER.md)
 
 - **Numerics beyond the element type** (`src/numeric.py`):
   - per-tensor / per-channel power-of-two exponents;
@@ -1376,7 +1376,7 @@ architecture, culture, history, and cuisine, …".)
 
 ### 16.4 Scheduler and tests
 
-* New scheduler notions (doc/INFERENCE_SCHEDULER.md): **DMA states** (pool
+* New scheduler notions (doc/scheduler/INFERENCE_SCHEDULER.md): **DMA states** (pool
   buffers that persist across calls and entries; host ops write them in
   place, kernels read them after `llm_cache_flush`), the **group-major /
   interleaved state layout** (`numeric` `layout`), and a **runtime

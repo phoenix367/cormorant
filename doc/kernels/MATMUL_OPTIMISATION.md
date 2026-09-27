@@ -10,7 +10,7 @@ For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 > **Status (2026-09-27).** §1 is the original single-sequential-loop-nest
 > kernel; §2 records a DATAFLOW restructuring that was **tried and
 > rejected**; §3 / §3b (128-bit ports, packed B) and §4–§8 (Track A of
-> `doc/THROUGHPUT_PLAN.md`: 16×16 MAC, K-split, rotate scatter, `b_tile`
+> `doc/plans/THROUGHPUT_PLAN.md`: 16×16 MAC, K-split, rotate scatter, `b_tile`
 > ping-pong prefetch, `kTileM = 32`) have **landed**, followed by
 > `max_k` 2048 → 4096 (§9).  The RTL stand runs 39 fixtures; every §4–§8
 > table compares against the §3b kernel on the same 39 cases.  §9b has
@@ -229,7 +229,7 @@ scheduler-packed tile-major B layout for constant weights would turn a
 
 ## 4. 16×16 MAC, batched A-row requests, B-resident fast path (Track A1, 2026-09-25)
 
-Track A of `doc/THROUGHPUT_PLAN.md` starts here.  Every step of the track
+Track A of `doc/plans/THROUGHPUT_PLAN.md` starts here.  Every step of the track
 is measured against the §3b kernel on the kv260 RTL stand, with the fixture
 list extended first (this step) from 29 to 39 cases: the K-split geometries
 of §5 (`1×261×19`, `2×13×5`, `3×517×33`, each row-major and packed) and the
@@ -836,7 +836,7 @@ ResNet-18 311 → 310 ms through their classifiers; predictions identical.
 | File | Purpose |
 |---|---|
 | `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (single sequential loop nest) |
-| `doc/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
+| `doc/kernels/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
 | `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
 | `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (39 cases, `manifest.txt`) |
 | `build/kernels/matmul/kv260/matmul_op_test_report.json` | Per-test behavior-test report |

@@ -17,7 +17,7 @@ lookup on the A53 host.  The demo
      **bit for bit** with the scheduler's simulation, and prints the latency
      and (optionally) the per-layer time by kind.
 
-Background, numerics and the phase plan: [`doc/BERT_PLAN.md`](../../doc/BERT_PLAN.md).
+Background, numerics and the phase plan: [`doc/plans/BERT_PLAN.md`](../../doc/plans/BERT_PLAN.md).
 
 ```mermaid
 flowchart LR
@@ -251,7 +251,7 @@ Super Bowl title for the third time?") answers "2015" instead of the float
 model's "2016," — both are gold answers.  The board logits equal the
 scheduler simulation bit for bit on the checked examples and the emulation
 on all 50, so the board's accuracy *is* the emulation's (the 60-question
-study set of `doc/BERT_PLAN.md` §3: float 93.3 / 96.5, emulation
+study set of `doc/plans/BERT_PLAN.md` §3: float 93.3 / 96.5, emulation
 93.3 / 97.1).
 
 **Latency, phase 1** (every MatMul on MatmulKernel) — 12.13 s per

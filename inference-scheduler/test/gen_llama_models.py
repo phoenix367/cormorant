@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny random Llama fixtures (doc/CHAT_PLAN.md phase 3, gate 1).
+"""Tiny random Llama fixtures (doc/plans/CHAT_PLAN.md phase 3, gate 1).
 
 A Llama-architecture model small enough to schedule, simulate and run in
 seconds — hidden 64, 2 layers, 4 heads over 2 KV heads (GQA), head_dim 16,

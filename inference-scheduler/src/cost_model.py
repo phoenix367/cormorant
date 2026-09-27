@@ -2,7 +2,7 @@
 Engine cost model — estimated cycles of one ConvKernel / MatmulKernel call.
 
 Used by the MatMul-on-ConvKernel lowering (``matmul_lowering.py``,
-doc/BERT_PLAN.md §2 2A) to choose, per MatMul, between MatmulKernel and a
+doc/plans/BERT_PLAN.md §2 2A) to choose, per MatMul, between MatmulKernel and a
 ConvKernel call with swapped operand roles, and to choose the lowered
 conv's kernel width / output shape.  Both models count kernel clock cycles
 (the board runs the fabric at 100 MHz); the absolute numbers matter only

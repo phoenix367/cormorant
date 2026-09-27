@@ -63,8 +63,8 @@ the fastest way to confirm a board is ready (`deploy.py --check-only` for
 
 See each demo's own `README.md` for model sources, config-field reference,
 sample output, and troubleshooting. The generated-project internals are
-documented in [`../doc/INFERENCE_SCHEDULER.md`](../doc/INFERENCE_SCHEDULER.md)
+documented in [`../doc/scheduler/INFERENCE_SCHEDULER.md`](../doc/scheduler/INFERENCE_SCHEDULER.md)
 (scheduler technical reference),
 [`../inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md)
 (CLI, generated project layout and C API) and
-[`../doc/PROFILER.md`](../doc/PROFILER.md).
+[`../doc/scheduler/PROFILER.md`](../doc/scheduler/PROFILER.md).

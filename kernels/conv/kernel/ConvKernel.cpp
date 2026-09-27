@@ -3,7 +3,7 @@
 //
 // Implements the ONNX Conv operator (group=1 or group=in_ch) in a tiled
 // structure that maps cleanly to Vitis HLS synthesis.
-// See doc/CONV_KERNEL.md for a full explanation of the architecture, tiling
+// See doc/kernels/CONV_KERNEL.md for a full explanation of the architecture, tiling
 // strategy, and II=1 rationale.
 //
 // Top-level dataflow (HLS DATAFLOW):

@@ -1,5 +1,5 @@
 """
-Host-CPU ops of a Llama-family decoder (doc/CHAT_PLAN.md §3.2 B2, §10.5).
+Host-CPU ops of a Llama-family decoder (doc/plans/CHAT_PLAN.md §3.2 B2, §10.5).
 
 ONNX nodes of the custom domain ``axi.llm`` (emitted by src/llama.py), run on
 the A53 inside inference_run() like the other host ops (``HostNode``: no
@@ -22,7 +22,7 @@ demo/chat/scripts/llm_study.py, whose ``Model`` is the specification:
   LlmSelectRow h (f32) [T][D], n (i32) -> row n-1 (f32 [1][D], a state)
   LlmDequant   x (int16) -> float32(raw * 2^-f)
 
-FPGA prefill attention (policy pow2+sink+p12+mix, doc/CHAT_PLAN.md §16): per
+FPGA prefill attention (policy pow2+sink+p12+mix, doc/plans/CHAT_PLAN.md §16): per
 layer one host op, then per KV group g two ConvKernel calls and a host
 softmax, then a host merge — the K / V caches are DMA states in the CMA pool
 (group-major [KV][C][HD]) that the host writes and the kernels read:
@@ -937,7 +937,7 @@ class LlmAttnConvNode:
     C-row cache (buffers are sized for C).
 
       kind "qk":  s_g[j][p] = sum_d K_g[j][d] * B_g[d][p]   (MatMul on
-                  ConvKernel, doc/BERT_PLAN.md §2 2A: weight = A = the K cache
+                  ConvKernel, doc/plans/BERT_PLAN.md §2 2A: weight = A = the K cache
                   rows [keys][HD] of group g, x = qx_g in the 1 x kw image,
                   out_ch = keys, output p = G*T pixels = out_h x out_w)
       kind "pv":  o_g[p][d] = sum_j P_g[p][j] * V_g[j][d]   (weight = P_g

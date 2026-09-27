@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase-3 / phase-5 gate 2 (doc/CHAT_PLAN.md §13, §16): the inference
+"""Phase-3 / phase-5 gate 2 (doc/plans/CHAT_PLAN.md §13, §16): the inference
 scheduler's fixed-point simulation of SmolLM2-135M must equal the study's
 emulation of the shipped policy BIT FOR BIT on the logits — for a prefill of
 real chat prompts and greedy decode steps, and for a SECOND TURN (the next

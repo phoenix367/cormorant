@@ -54,7 +54,7 @@ endif()
 # Tile sizes and window limits — sourced from the platform JSON
 # (platforms/<AXI_PLATFORM>.json, "kernels.pool" object).  These are the
 # kernel's compile-time bounds: pool_h ≤ POOL_MAX_KH, line_buf rows ≥
-# (pool_h-1)*dil_h+1, etc.  See doc/POOL_OPTIMIZATION.md §4.
+# (pool_h-1)*dil_h+1, etc.  See doc/kernels/POOL_OPTIMISATION.md §4.
 #
 # No CACHE defaults — the JSON is the single source of truth so the C++
 # kernel build and the Python validator (inference-scheduler) cannot drift

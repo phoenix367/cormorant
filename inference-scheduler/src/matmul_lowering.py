@@ -1,5 +1,5 @@
 """
-MatMul on ConvKernel — the lowering pass of doc/BERT_PLAN.md §2 2A.
+MatMul on ConvKernel — the lowering pass of doc/plans/BERT_PLAN.md §2 2A.
 
 ``lower_matmuls(graph_nodes, ...)`` replaces MatmulNodes by
 ``MatmulConvNode``s (nodes.py) where ConvKernel is estimated to be faster

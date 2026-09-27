@@ -1,5 +1,5 @@
 """Shared pieces of the SmolLM2 (Llama-family) decoder on the KV260 —
-doc/CHAT_PLAN.md phase 3: model / formats loading, the entry graphs of the
+doc/plans/CHAT_PLAN.md phase 3: model / formats loading, the entry graphs of the
 multi-entry project, the prefill bucket split the library uses, and a
 simulation of the library (``SimSession``: llm_prefill / llm_decode /
 llm_truncate over the scheduler's own fixed-point simulation of every entry).

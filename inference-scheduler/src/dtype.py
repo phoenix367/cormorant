@@ -254,7 +254,7 @@ class DataType(ABC):
         return 0
 
     # ------------------------------------------------------------------ #
-    # Power-of-two exponents (doc/CHAT_PLAN.md §10.5; fixed point only)    #
+    # Power-of-two exponents (doc/plans/CHAT_PLAN.md §10.5; fixed point only)    #
     # ------------------------------------------------------------------ #
     # A tensor with an exponent f stores raw W-bit integers with value
     # raw * 2^-f (f = frac_bits is the element type itself).  f is an int

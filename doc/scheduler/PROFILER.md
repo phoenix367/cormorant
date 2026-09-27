@@ -18,8 +18,8 @@ chat benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
 `llm_bench.c`) all use them.
 
 > Companion docs:
-> [`inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md) (codegen),
-> [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md) (correctness/perf harnesses).
+> [`inference-scheduler/doc/USER_GUIDE.md`](../../inference-scheduler/doc/USER_GUIDE.md) (codegen),
+> [`inference-scheduler/doc/REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md) (correctness/perf harnesses).
 
 ---
 

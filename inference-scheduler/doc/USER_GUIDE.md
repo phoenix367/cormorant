@@ -12,7 +12,7 @@ This document is the user guide (CLI, generated project, C API, building,
 testing, `report.md`).  What each operator maps to, the graph
 transformations, host ops, numerics, cache coherency and multi-entry projects
 are specified in the technical reference
-[`doc/INFERENCE_SCHEDULER.md`](../../doc/INFERENCE_SCHEDULER.md).
+[`doc/scheduler/INFERENCE_SCHEDULER.md`](../../doc/scheduler/INFERENCE_SCHEDULER.md).
 
 ---
 
@@ -30,7 +30,7 @@ are specified in the technical reference
 10. [Running Tests](#10-running-tests)
 11. [Generated Report (`report.md`)](#11-generated-report-reportmd)
 
-**Related:** [Technical reference](../../doc/INFERENCE_SCHEDULER.md) ·
+**Related:** [Technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md) ·
 [Internal Architecture](ARCHITECTURE.md) ·
 [Model Preparation — Pre-Scheduler ONNX Normalisation](MODEL_PREPARATION.md) ·
 [Scheduler DAG — Algorithm Reference](SCHEDULER_DAG.md) ·
@@ -107,7 +107,7 @@ concurrently).
 The scheduler maps ONNX operators to one of four hardware kernels, handles
 them as zero-cost CPU-side transformations, or runs them as host-CPU code
 inside `inference_run()`.  Full semantics and restrictions:
-[technical reference](../../doc/INFERENCE_SCHEDULER.md).
+[technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md).
 
 ### VectorOPKernel (element-wise, 1-D)
 
@@ -237,16 +237,16 @@ python inference_scheduler.py --entry NAME=MODEL.onnx [--entry ...] [options]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--entry NAME=MODEL.onnx` | *(none)* | Multi-entry project (`src/codegen/multi.py`): one library with `inference_run_NAME()` per graph over one weight pool (weights deduplicated by name and image, states shared by name). Repeat per entry; replaces the positional model. Default output dir `./multi_inference/`; no `report.md`. See [technical reference §Multi-entry projects](../../doc/INFERENCE_SCHEDULER.md#multi-entry-projects). |
+| `--entry NAME=MODEL.onnx` | *(none)* | Multi-entry project (`src/codegen/multi.py`): one library with `inference_run_NAME()` per graph over one weight pool (weights deduplicated by name and image, states shared by name). Repeat per entry; replaces the positional model. Default output dir `./multi_inference/`; no `report.md`. See [technical reference §Multi-entry projects](../../doc/scheduler/INFERENCE_SCHEDULER.md#multi-entry-projects). |
 | `--out-dir DIR` | `./<stem>_inference/` | Output project directory. Created if absent; existing files are overwritten. |
 | `--driver-dir DIR` | *(none)* | Copy the driver sources of every kernel the model uses (`x<kernel>.h / .c / _hw.h / _sinit.c / _linux.c`) from this directory into `driver/`. If omitted, `driver/` is left empty with a README. |
 | `--embed-large-weights` | off | Inline all weight tensors as C arrays, even those exceeding the 4096-element threshold that would normally be written to external `.dat` files. |
 | `--embed-large-expected` | off | Inline all GT expected arrays in `test_inference.c` instead of writing them to `expected/*.dat` files. |
 | `--no-report` | off | Skip writing `report.md`. Default is to always emit a human-readable model summary alongside the C project — see [§11](#11-generated-report-reportmd). |
 | `--no-fuse-act` | off | Do not fold `Relu` / `Clip(0,6)` into the VectorOP call that produces their input (the kernel's `act` register). |
-| `--no-s2d-stem` | off | Do not rewrite stride-2 `Conv` layers with ≤ 4 input channels as host `SpaceToDepth(2)` + stride-1 `Conv` ([§Space-to-depth stem](../../doc/INFERENCE_SCHEDULER.md#space-to-depth-stem)). |
-| `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
-| `--matmul-on-conv {auto,always,off}` | `auto` | Run MatMuls on ConvKernel with swapped operand roles: `auto` where the cost model estimates it faster, `always` for every eligible MatMul, `off` for none ([§MatMul on ConvKernel](../../doc/INFERENCE_SCHEDULER.md#matmul-on-convkernel)). Bit-identical either way. |
+| `--no-s2d-stem` | off | Do not rewrite stride-2 `Conv` layers with ≤ 4 input channels as host `SpaceToDepth(2)` + stride-1 `Conv` ([§Space-to-depth stem](../../doc/scheduler/INFERENCE_SCHEDULER.md#space-to-depth-stem)). |
+| `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/scheduler/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/scheduler/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
+| `--matmul-on-conv {auto,always,off}` | `auto` | Run MatMuls on ConvKernel with swapped operand roles: `auto` where the cost model estimates it faster, `always` for every eligible MatMul, `off` for none ([§MatMul on ConvKernel](../../doc/scheduler/INFERENCE_SCHEDULER.md#matmul-on-convkernel)). Bit-identical either way. |
 | `--no-matmul-on-conv` | off | Same as `--matmul-on-conv off`. |
 
 ### Examples
@@ -323,7 +323,7 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │   │     inference_init() / inference_run() / inference_deinit() declarations,
 │   │     UIO instance-name defaults, per-layer name table accessors.
 │   ├── inference_prof.h          Per-layer profiler (no-ops unless
-│   │                             -DINFERENCE_PROFILING=ON; doc/PROFILER.md)
+│   │                             -DINFERENCE_PROFILING=ON; doc/scheduler/PROFILER.md)
 │   └── inference_ddr.h           DDR-traffic counters used by the profiler
 │
 ├── src/
@@ -534,7 +534,7 @@ const char *const  *inference_layer_names_ptr(void);
 
 Build / run-time knobs of the generated library (`INFERENCE_BUF_CACHEABLE`,
 `INFERENCE_HOST_THREADS`, `INFERENCE_PROFILING`) are listed in the technical
-reference, [§Generated C API](../../doc/INFERENCE_SCHEDULER.md#generated-c-api).
+reference, [§Generated C API](../../doc/scheduler/INFERENCE_SCHEDULER.md#generated-c-api).
 
 ---
 
@@ -891,7 +891,7 @@ reshape the input graph before code generation:
 - **Activation fusion**, **MatMul on ConvKernel**, **Space-to-depth stem**,
   **Pattern fusion**, **Constant broadcast normalisation**, **Host-CPU ops**
   — counts of the load-time rewrites described in the
-  [technical reference](../../doc/INFERENCE_SCHEDULER.md) (listed only when
+  [technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md) (listed only when
   non-zero).
 - **Reshape folding** count — `ReshapeNode` outputs aliased to their
   source buffer (no kernel call, no allocation).

@@ -118,8 +118,8 @@ The result is that narrow writes — any beat whose WSTRB is not all ones — ar
 ### Effect on Simulation
 
 - Originally found with 32-bit ports: the last element of an odd-count `ap_fixed<16,8>` vector (last beat WSTRB = `0x3`) was lost; even counts passed.
-- With the current 128-bit ports, partial-strobe beats come from the ConvKernel and PoolingKernel `y` ports (byte-strobed run edges, `doc/CONV_OPTIMISATION.md` §2.38 / `doc/POOL_OPTIMIZATION.md` §2.14) and from the MatmulKernel `c` writes (a 16-bit port — HLS does not widen it — so every beat is a partial strobe once upsized to the 128-bit PS port). VectorOPKernel writes every output word whole (tail lanes = 0), so it no longer produces partial beats.
-- Stale-byte variant (`doc/CONV_OPTIMISATION.md` §2.38): a `y` beat with `WSTRB = 0x00ff` landed the line's pre-poison contents (a previous case's outputs at the same DDR line) in bytes 8..15. Single-case reruns hide it — it needs an earlier AXI write to the same line, so run the whole suite.
+- With the current 128-bit ports, partial-strobe beats come from the ConvKernel and PoolingKernel `y` ports (byte-strobed run edges, `doc/kernels/CONV_OPTIMISATION.md` §2.38 / `doc/kernels/POOL_OPTIMISATION.md` §2.14) and from the MatmulKernel `c` writes (a 16-bit port — HLS does not widen it — so every beat is a partial strobe once upsized to the 128-bit PS port). VectorOPKernel writes every output word whole (tail lanes = 0), so it no longer produces partial beats.
+- Stale-byte variant (`doc/kernels/CONV_OPTIMISATION.md` §2.38): a `y` beat with `WSTRB = 0x00ff` landed the line's pre-poison contents (a previous case's outputs at the same DDR line) in bytes 8..15. Single-case reruns hide it — it needs an earlier AXI write to the same line, so run the whole suite.
 - In all cases the kernel's beat is correct; the DDR model holds the wrong bytes.
 
 ### Fix Option A — Patch `arb_wr_6` (VIP source edit)
@@ -176,7 +176,7 @@ This does not modify any Xilinx IP source and survives IP regeneration. All four
 
 ### Related: late commit of the last write
 
-The DDR model can commit a kernel's final (partial-strobe) write late enough that it lands on top of the *next* test's backdoor-loaded inputs at the same address (MatmulKernel, 2026-09-25: `B[49922]` of test 33 read back as `C[98]` of test 32, never when the case ran alone; a 20 µs settle did not help). `matmul_tb.sv` alternates the DDR base between consecutive tests (`addr_a = 0x1000_0000 + (index % 2) · 0x0400_0000`) so a test's inputs never occupy addresses the previous kernel wrote. See `doc/MATMUL_OPTIMISATION.md`.
+The DDR model can commit a kernel's final (partial-strobe) write late enough that it lands on top of the *next* test's backdoor-loaded inputs at the same address (MatmulKernel, 2026-09-25: `B[49922]` of test 33 read back as `C[98]` of test 32, never when the case ran alone; a 20 µs settle did not help). `matmul_tb.sv` alternates the DDR base between consecutive tests (`addr_a = 0x1000_0000 + (index % 2) · 0x0400_0000`) so a test's inputs never occupy addresses the previous kernel wrote. See `doc/kernels/MATMUL_OPTIMISATION.md`.
 
 ---
 

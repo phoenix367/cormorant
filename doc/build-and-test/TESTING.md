@@ -14,8 +14,8 @@ machine without an FPGA.
 
 Layers 1–3 run on the host. Layers 4–5 run on the KV260 over SSH and
 require the Cormorant bitstream to be loaded first
-(see the [Quick start](../README.md#quick-start) in the README
-or [`inference-scheduler/doc/REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
+(see the [Quick start](../../README.md#quick-start) in the README
+or [`inference-scheduler/doc/REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
 
 ---
 
@@ -156,7 +156,7 @@ against Python-simulated ground truth.
 
 **Prerequisite:** the Cormorant bitstream must be loaded on the board.
 Use `upload_bitstream.py` (see the README Quick start or
-[`REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
+[`REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
 
 The tracked template `inference-scheduler/remote_config.json.example`
 lists every on-board test model (148; narrow the list, or pass
@@ -202,7 +202,7 @@ picked up; rename it).
 ```
 
 For full SSH setup, config reference, and debugging guide see
-[`REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md).
+[`REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md).
 
 ---
 
@@ -368,7 +368,7 @@ the ConvKernel 2-D grid — the format is current, the numbers are not):
 
 For the full config reference, per-kernel case field definitions, and
 debugging guide see the *Performance Benchmarking* section of
-[`REMOTE_TESTING.md`](../inference-scheduler/doc/REMOTE_TESTING.md).
+[`REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md).
 
 ---
 

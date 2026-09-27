@@ -1,4 +1,4 @@
-"""Llama-family decoders (doc/CHAT_PLAN.md phase 3) on the tiny random Llama
+"""Llama-family decoders (doc/plans/CHAT_PLAN.md phase 3) on the tiny random Llama
 fixture of test/gen_llama_models.py (hidden 64, 2 layers, 4 / 2 heads
 (GQA), head_dim 16, FFN 128, vocab 256, context 32):
 

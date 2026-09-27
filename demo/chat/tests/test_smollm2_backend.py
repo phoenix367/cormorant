@@ -1,5 +1,5 @@
 """The smollm2 backend (smollm2_backend.py) against fakes of libsmollm2.so
-(doc/CHAT_PLAN.md §11): tests/fake_llm.py's ScriptedEngine (Python) and
+(doc/plans/CHAT_PLAN.md §11): tests/fake_llm.py's ScriptedEngine (Python) and
 tests/fake_libsmollm2.c through the real ctypes binding (LibLlmEngine).
 Streaming schema, multi-turn prefix-cache reuse (only new tokens are
 prefilled; the sink never is), stop strings split across tokens, max_tokens,

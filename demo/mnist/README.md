@@ -296,7 +296,7 @@ Edit `mnist_config.json`:
 * **`run.use_sudo`** — set to `false` if you SSH in directly as root.
 * **`run.env`** — environment variables forwarded to `bench_mnist` on the
   board (e.g. the `INFERENCE_DDR_*` profiler overrides, see
-  [`doc/PROFILER.md`](../../doc/PROFILER.md)).
+  [`doc/scheduler/PROFILER.md`](../../doc/scheduler/PROFILER.md)).
 * **`remote.cmake_args`** — extra `-D…` flags forwarded to the cross-build,
   e.g. `["-DBENCH_INPUT_BIAS=-128"]` if your model expects centred input.
 

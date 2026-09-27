@@ -1,5 +1,5 @@
 """
-Numeric annotations beyond the element type (doc/CHAT_PLAN.md §10.5).
+Numeric annotations beyond the element type (doc/plans/CHAT_PLAN.md §10.5).
 
 A model may carry, in its ``metadata_props`` under the key ``axi.numeric``,
 a JSON object

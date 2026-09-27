@@ -11,9 +11,9 @@ is the single technical reference for anyone modifying:
 For a higher-level orientation see the sibling
 [`USER_GUIDE.md`](USER_GUIDE.md) (user guide),
 [`ARCHITECTURE.md`](ARCHITECTURE.md) and the technical reference
-[`doc/INFERENCE_SCHEDULER.md`](../../doc/INFERENCE_SCHEDULER.md); for the
+[`doc/scheduler/INFERENCE_SCHEDULER.md`](../../doc/scheduler/INFERENCE_SCHEDULER.md); for the
 profiler that piggybacks on the same brackets see
-[`PROFILER.md`](../../doc/PROFILER.md).
+[`PROFILER.md`](../../doc/scheduler/PROFILER.md).
 
 ## Pipeline overview
 

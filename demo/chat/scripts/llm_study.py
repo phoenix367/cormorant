@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """B0 numeric go / no-go study: SmolLM2-135M-Instruct on the KV260 Q8.8 datapath.
 
-doc/CHAT_PLAN.md §3.2 B0 (results in §9).  Mirrors the BERT study
-(demo/bert_squad/scripts/bert_study.py, doc/BERT_PLAN.md §0): a float
+doc/plans/CHAT_PLAN.md §3.2 B0 (results in §9).  Mirrors the BERT study
+(demo/bert_squad/scripts/bert_study.py, doc/plans/BERT_PLAN.md §0): a float
 reference, and a bit-level emulation of the planned partition (CHAT_PLAN §3.2
 B2) under several numeric policies, compared on
 
@@ -71,7 +71,7 @@ channels (per head for q, k, P); the kernels never see it:
   argmax          first maximum (np.argmax).
 Exponents come from a float calibration run over a separate set (WikiText-2
 validation + 3 extra prompts), one bit of headroom (MARGIN), see make_formats.
-Policies: POLICIES below; recommended pow2+sink+p12 (doc/CHAT_PLAN.md §9).
+Policies: POLICIES below; recommended pow2+sink+p12 (doc/plans/CHAT_PLAN.md §9).
 
 Usage (.venv-export: torch CPU, transformers, safetensors, numpy):
   PY=/home/ivan/projects/axi_demo/.venv-export/bin/python
@@ -748,7 +748,7 @@ def log_softmax(x):
 # diagnostics: float_weights (+fw), float_acts (+fa), qclasses (ablate), floor_fix
 #           (+ff: the host adds 1/2 LSB to the floored kernel outputs it reads),
 #           bf16 (yardstick: float math, bf16 tensors at the same boundaries)
-# The recommended policy (doc/CHAT_PLAN.md §9) is pow2+sink+p12.
+# The recommended policy (doc/plans/CHAT_PLAN.md §9) is pow2+sink+p12.
 _RF = dict(residual="float", emb="float")
 POLICIES = {
     "float":                 None,

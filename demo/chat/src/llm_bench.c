@@ -1,6 +1,6 @@
 /*
  * llm_bench.c — KV260 runner for libsmollm2 (llm_api.c): the phase-3 board
- * gate of doc/CHAT_PLAN.md.
+ * gate of doc/plans/CHAT_PLAN.md.
  *
  *   1. llm_open() (timed; CmaFree before / after from /proc/meminfo).
  *   2. For every prompt of prompts.bin: llm_truncate(1), llm_prefill(prompt),

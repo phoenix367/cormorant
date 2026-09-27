@@ -1,5 +1,5 @@
 """smollm2_backend.py — backend B of the KV260 chat server: generative chat
-with SmolLM2-135M-Instruct on the FPGA (libsmollm2.so, doc/CHAT_PLAN.md
+with SmolLM2-135M-Instruct on the FPGA (libsmollm2.so, doc/plans/CHAT_PLAN.md
 §11).  Python standard library only (ctypes); text side in
 smollm2_tokenizer.py and chatml.py, sampling in sampler.py (libsampler.so).
 

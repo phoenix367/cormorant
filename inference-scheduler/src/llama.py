@@ -1,7 +1,7 @@
 """
 Llama-family frontend: config.json + safetensors weights + calibrated
 formats -> fixed-shape ONNX entry graphs for the scheduler
-(doc/CHAT_PLAN.md §3.2 B1 / §10.5; decision and rationale in §12).
+(doc/plans/CHAT_PLAN.md §3.2 B1 / §10.5; decision and rationale in §12).
 
 Instead of exporting the Hugging Face model with torch and pattern-matching
 the result back into RMSNorm / RoPE / SwiGLU / KV-cache structure, the graphs
@@ -32,7 +32,7 @@ sink row: the float run of the position-0 token, rounded at the cache
 exponents (formats JSON).
 
 Attention (``prefill_attn``):
-  "fpga" (default, policy pow2+sink+p12+mix, doc/CHAT_PLAN.md §16): decode
+  "fpga" (default, policy pow2+sink+p12+mix, doc/plans/CHAT_PLAN.md §16): decode
          steps run the xattn host region (LlmAttention); prefill runs q.K^T
          and P.V on ConvKernel per KV group with the p12 host softmax
          (LlmAttnPrep / LlmAttnScores / LlmAttnSoftmax / LlmAttnPV /

@@ -3,7 +3,7 @@ question answering with BERT-base SQuAD (bertsquad-12) on the FPGA.
 Python standard library only (ctypes); the text side is
 demo/bert_squad/scripts/squad_text.py.
 
-Protocol mapping (doc/CHAT_PLAN.md §3.1)
+Protocol mapping (doc/plans/CHAT_PLAN.md §3.1)
   document  the latest system (or developer) message, or the latest user
             message that starts with "Context:" — anywhere in the
             conversation, so follow-up questions reuse it; a leading

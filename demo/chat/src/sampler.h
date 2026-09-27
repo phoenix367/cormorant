@@ -1,7 +1,7 @@
 /* sampler.h — next-token sampling for the KV260 chat server (libsampler.so).
  *
  * Operates on the float logits the decoder library returns (llm_decode /
- * llm_prefill, doc/CHAT_PLAN.md §11).  Everything is computed in double in a
+ * llm_prefill, doc/plans/CHAT_PLAN.md §11).  Everything is computed in double in a
  * fixed order, so demo/chat/sampler.py's pure-Python fallback gives the same
  * token for the same logits, parameters and seed (same libm).
  *

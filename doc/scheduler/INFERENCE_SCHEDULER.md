@@ -10,11 +10,11 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 > how (operator mapping, transformations, host ops, numerics, cache
 > coherency, multi-entry projects).  The user guide — CLI options, generated
 > project layout, C API walk-through, building, `report.md` — is
-> [`inference-scheduler/doc/USER_GUIDE.md`](../inference-scheduler/doc/USER_GUIDE.md);
+> [`inference-scheduler/doc/USER_GUIDE.md`](../../inference-scheduler/doc/USER_GUIDE.md);
 > codegen internals (node classes, layout engine, mixins) are in
-> [`inference-scheduler/doc/ARCHITECTURE.md`](../inference-scheduler/doc/ARCHITECTURE.md);
+> [`inference-scheduler/doc/ARCHITECTURE.md`](../../inference-scheduler/doc/ARCHITECTURE.md);
 > the DAG / event-stream / liveness / slot-coloring algorithms in
-> [`SCHEDULER_DAG.md`](../inference-scheduler/doc/SCHEDULER_DAG.md).
+> [`SCHEDULER_DAG.md`](../../inference-scheduler/doc/SCHEDULER_DAG.md).
 
 ---
 
@@ -52,7 +52,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   fused into single host nodes first ([§Pattern fusion](#pattern-fusion));
   integer tensors (token ids, masks) are supported as raw int16
   ([§Integer tensors](#integer-tensors)).  This is what makes BERT-base
-  (bertsquad-12) schedulable — [`BERT_PLAN.md`](BERT_PLAN.md).
+  (bertsquad-12) schedulable — [`BERT_PLAN.md`](../plans/BERT_PLAN.md).
 - **Llama-family decoder ops** (custom domain `axi.llm`, `src/llm_nodes.py`)
   — `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd`, `LlmAttention` (RoPE + KV cache
   + causal GQA attention as one float region), `LlmSiluMul`,
@@ -60,7 +60,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   (`src/llama.py`, [§Llama-family decoders](#llama-family-decoders)) with
   power-of-two exponents, float / int host tensors and persistent states
   ([§Numerics beyond the element type](#numerics-beyond-the-element-type)).
-  This is what runs SmolLM2-135M-Instruct — [`CHAT_PLAN.md`](CHAT_PLAN.md) §13.
+  This is what runs SmolLM2-135M-Instruct — [`CHAT_PLAN.md`](../plans/CHAT_PLAN.md) §13.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -564,7 +564,7 @@ outputs exactly (printed with `%d`).
 
 ### Numerics beyond the element type
 
-`src/numeric.py` (doc/CHAT_PLAN.md §10.5).  A model may carry, in its
+`src/numeric.py` (doc/plans/CHAT_PLAN.md §10.5).  A model may carry, in its
 `metadata_props` under the key `axi.numeric`, a JSON object
 
 ```json
@@ -655,7 +655,7 @@ exponent inputs with the raw ramp; host outputs are compared bit for bit
 
 ### Llama-family decoders
 
-`src/llama.py` + `src/llm_nodes.py` (doc/CHAT_PLAN.md §3.2 B1–B2, §12).
+`src/llama.py` + `src/llm_nodes.py` (doc/plans/CHAT_PLAN.md §3.2 B1–B2, §12).
 The **frontend** writes fixed-shape ONNX entry graphs directly from a
 checkpoint — `config.json` (layers, hidden, heads, KV heads, head_dim, FFN,
 vocab, RoPE θ, RMSNorm ε, tied embedding) + `model.safetensors` + the
@@ -680,7 +680,7 @@ Per layer: `x = RMSNorm(h)`, `q0 / k0 / v = MatMul(x)`, attention (below)
 logical `[C][KV·HD]` int16 states stored group-major `[KV][C][HD]` whose row
 0 is the precomputed position-0 sink; `pos` ≥ 1.
 
-**Attention** (`LlamaFrontend(prefill_attn=...)`, doc/CHAT_PLAN.md §16):
+**Attention** (`LlamaFrontend(prefill_attn=...)`, doc/plans/CHAT_PLAN.md §16):
 
 * `"fpga"` (default; study policy `pow2+sink+p12+mix`): decode steps run
   `pv = LlmAttention(q0, k0, v, pos, kv.k.l, kv.v.l)` (the xattn host
@@ -787,7 +787,7 @@ and runs it on the host emulation.
 
 ### MatMul on ConvKernel
 
-[`BERT_PLAN.md`](BERT_PLAN.md) §2 2A.  ConvKernel's 16 × 16 MAC grid runs
+[`BERT_PLAN.md`](../plans/BERT_PLAN.md) §2 2A.  ConvKernel's 16 × 16 MAC grid runs
 two output pixels per cycle (512 MACs, CONV_OPTIMISATION §2.42) against
 MatmulKernel's 32; a MatMul runs on it with **swapped operand roles**.  For
 `C[N][M] = A[N][K] · B[K][M]` (per batch item) one ConvKernel call has

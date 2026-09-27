@@ -513,7 +513,7 @@ class ScheduledNode:
 # ---------------------------------------------------------------------------
 # Hardware-side bound — single source of truth is the platform JSON
 # (platforms/<AXI_PLATFORM>.json, ``kernels.matmul`` object — see
-# doc/MATMUL_KERNEL.md §3 for the field reference).  The resolver in
+# doc/kernels/MATMUL_KERNEL.md §3 for the field reference).  The resolver in
 # ``_matmul_hw_config`` reads the same file the C++ CMake build consumes
 # via ``matmul_load_constants()`` in kernels/matmul/CMakeLists.txt.
 # ---------------------------------------------------------------------------
@@ -689,7 +689,7 @@ class MatmulNode:
         # at compile time, so a matmul with inner-dim k > kMaxK has no
         # runtime fallback — reject at parse time rather than emit code the
         # kernel can't service.  n / m / batch stay unbounded — the kernel
-        # tiles them naturally.  Reference: doc/MATMUL_KERNEL.md §3.
+        # tiles them naturally.  Reference: doc/kernels/MATMUL_KERNEL.md §3.
         # ------------------------------------------------------------------
         if k_val > MATMUL_MAX_K:
             raise SchedulerError(
@@ -961,7 +961,7 @@ class MatmulNode:
 # ---------------------------------------------------------------------------
 # Hardware-side bounds — single source of truth is the platform JSON
 # (platforms/<AXI_PLATFORM>.json, ``kernels.conv`` object — see
-# doc/CONV_KERNEL.md §3 for the field reference).  The resolver in
+# doc/kernels/CONV_KERNEL.md §3 for the field reference).  The resolver in
 # ``_conv_hw_config`` reads the same file the C++ CMake build consumes via
 # ``conv_load_constants()`` in kernels/conv/CMakeLists.txt, so a CLI
 # invocation targeting a non-default board can stay in sync with
@@ -1268,7 +1268,7 @@ class ConvNode:
         # ConvKernel sizes its bias buffer, line buffer and persistent
         # accumulator at compile time, so a layer violating any of these
         # bounds has no runtime fallback — reject at parse time rather than
-        # emit code the kernel can't service.  Reference: doc/CONV_KERNEL.md
+        # emit code the kernel can't service.  Reference: doc/kernels/CONV_KERNEL.md
         # §3 "Runtime constraints validated by the inference scheduler".
         #
         # in_h, in_w, and out_h are NOT capped — the kernel handles them
@@ -1456,7 +1456,7 @@ def conv_lowered_b_image(b: np.ndarray, k: int, m: int, kw: int) -> np.ndarray:
 @dataclass
 class MatmulConvNode:
     """One ONNX MatMul (or the MatMul half of a Gemm) run on ConvKernel
-    with swapped operand roles (doc/BERT_PLAN.md §2 2A, doc/INFERENCE_
+    with swapped operand roles (doc/plans/BERT_PLAN.md §2 2A, doc/INFERENCE_
     SCHEDULER.md "MatMul on ConvKernel").
 
     For ``C[N][M] = A[N][K] · B[K][M]`` one ConvKernel call computes
@@ -1607,7 +1607,7 @@ POOL_OP_TYPES = frozenset({
 # Hardware-side bounds — re-exported here for callers that import them from
 # `nodes`.  The source of truth is `kernels.pool` in
 # platforms/<AXI_PLATFORM>.json, the same file the C++ build reads
-# (`_pool_hw_config`).  See doc/POOL_OPTIMIZATION.md §4.
+# (`_pool_hw_config`).  See doc/kernels/POOL_OPTIMISATION.md §4.
 # ---------------------------------------------------------------------------
 from ._pool_hw_config import (  # noqa: E402 (deferred until POOL_OP_TYPES is defined above)
     POOL_MAX_KH,
@@ -1831,7 +1831,7 @@ class PoolNode:
         # and the unrolled per-position adders at compile time, so a
         # window violating any of these bounds has no runtime fallback —
         # reject at parse time rather than emit code the kernel can't
-        # service.  See doc/POOL_OPTIMIZATION.md §4 for the constraint
+        # service.  See doc/kernels/POOL_OPTIMISATION.md §4 for the constraint
         # rationale (vertical span / horizontal span fit the line buffer;
         # pool window fits the bounded reducer adder tree).
         # ------------------------------------------------------------------

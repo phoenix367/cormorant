@@ -203,7 +203,7 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
                              timeout=15)
     print(f"    {_dim('info   ')} {'CMA':<36} {_dim(out.strip())}  (the BERT pool BO needs ~216 MiB)")
     # A core in the PSCI core power-down idle state can be parked forever by a
-    # lost TF-A / PMU firmware handshake (doc/CHAT_PLAN.md §18): every task
+    # lost TF-A / PMU firmware handshake (doc/plans/CHAT_PLAN.md §18): every task
     # queued on it stalls, then all-CPU cross-calls hang the board.  Keep the
     # cores out of it: install board/kv260/kv260-no-cpu-powerdown.conf as a
     # tmpfiles.d rule (applied at every boot) and apply it now.

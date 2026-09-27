@@ -11,7 +11,7 @@ the `axi.llm` Llama decoder ops) run as host-CPU code inside
 Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
 library and weight pool (multi-entry projects, `--entry`).
 
-The technical reference is `../doc/INFERENCE_SCHEDULER.md`; the user guide is
+The technical reference is `../doc/scheduler/INFERENCE_SCHEDULER.md`; the user guide is
 `doc/USER_GUIDE.md`.
 
 ## Quick Start
@@ -277,7 +277,7 @@ chosen with `src/cost_model.py` (conv-cycle-model port vs a board-calibrated
 MatmulKernel model).  Batched MatMuls with per-item weights (attention)
 emit one `run_conv_at()` per item.  The simulator treats it exactly like a
 `MatmulNode` — the two kernels are bit-identical.  See
-`../doc/INFERENCE_SCHEDULER.md` §"MatMul on ConvKernel".
+`../doc/scheduler/INFERENCE_SCHEDULER.md` §"MatMul on ConvKernel".
 
 **PoolNode** — PoolingKernel: `MaxPool`, `AveragePool`, `LpPool` (p=1 or 2),
 `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool`. Full 2-D NCHW geometry
@@ -290,9 +290,9 @@ compile-time bounds (`pool_h ≤ POOL_MAX_KH`, `pool_w ≤ POOL_MAX_KW`,
 naming the violated bound + the JSON field to bump.  The bounds come
 from the **same platform JSON the C++ build reads**
 (`platforms/<AXI_PLATFORM>.json`, `kernels.pool` object — see
-[`../doc/PLATFORM_CONFIGURATION.md`](../doc/PLATFORM_CONFIGURATION.md)
+[`../doc/build-and-test/PLATFORM_CONFIGURATION.md`](../doc/build-and-test/PLATFORM_CONFIGURATION.md)
 for the full field reference across all three kernels, and
-[`../doc/POOL_OPTIMIZATION.md`](../doc/POOL_OPTIMIZATION.md) §4 for the
+[`../doc/kernels/POOL_OPTIMISATION.md`](../doc/kernels/POOL_OPTIMISATION.md) §4 for the
 pool-specific knobs).
 `src/_pool_hw_config.py::resolve(platform_name)` is the resolver:
 
@@ -480,7 +480,7 @@ XRT buffer objects are mapped cacheable by default):
 - `inference_buf_sync_to_device(buf)` — clean CPU cache → DDR (before a kernel reads **or writes**)
 - `inference_buf_sync_from_device(buf)` — invalidate CPU cache (after a kernel wrote)
 
-**Contract** (full table: `../doc/INFERENCE_SCHEDULER.md` §Cache coherency):
+**Contract** (full table: `../doc/scheduler/INFERENCE_SCHEDULER.md` §Cache coherency):
 - `inference_init()`: syncs the weight pool **once** after `memcpy` from ROM
 - `inference_run()`: cleans all graph **inputs and outputs** at the top, invalidates all graph **outputs** at the bottom; `kernel_wait` calls drain in-flight kernels before the output sync
 - Host ops: invalidate a kernel-written input after its lane drained, flush their output before a kernel reads it; KV-cache DMA states are flushed with `llm_cache_flush`

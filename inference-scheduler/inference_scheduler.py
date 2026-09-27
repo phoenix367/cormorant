@@ -6,7 +6,7 @@ Parses an ONNX model (or several, with --entry) and writes a CMake project
 that runs the whole inference on the Xilinx KV260: VectorOPKernel,
 MatmulKernel, ConvKernel and PoolingKernel calls through their generated
 drivers, plus host-CPU code for the ops no kernel implements.  Supported ops,
-numerics and the generated code: ../doc/INFERENCE_SCHEDULER.md; CLI, project
+numerics and the generated code: ../doc/scheduler/INFERENCE_SCHEDULER.md; CLI, project
 layout and C API: doc/USER_GUIDE.md.
 
 Output project layout (main parts):
@@ -172,7 +172,7 @@ def parse_args(argv=None):
         help=(
             "Run MatMuls on ConvKernel with swapped operand roles (A = conv "
             "weight, B = conv input, 1 x kw kernel with stride (1, kw); "
-            "doc/BERT_PLAN.md 2A): 'auto' (default) wherever the engine cost "
+            "doc/plans/BERT_PLAN.md 2A): 'auto' (default) wherever the engine cost "
             "model estimates ConvKernel faster than MatmulKernel, 'always' for "
             "every eligible MatMul, 'off' for none.  Batch-1 FC layers never "
             "qualify.  Bit-identical results either way."

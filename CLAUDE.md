@@ -8,10 +8,12 @@ AXI-stream vector operation IP core for Xilinx FPGAs, implemented in Vitis HLS. 
 
 The repository also contains **`inference-scheduler/`**, a Python code-generator that parses an ONNX model and emits a self-contained C project that drives all four hardware IPs (VectorOPKernel, MatmulKernel, ConvKernel, PoolingKernel) using the generated Xilinx driver APIs and the Xil bare-metal library. The codegen overlaps work across different kernel lanes — ops on distinct lanes (e.g. Conv ‖ Pool) run concurrently, with synchronisation funnelled through a single weak-symbol `kernel_wait()` primitive that defaults to polling but can be link-overridden for IRQ/UIO waiting. Pool-slot colouring uses event-stream liveness intervals so two tensors share a slot only when one is fully drained before the other's producer starts.
 
+Documentation index: `doc/README.md` — docs are grouped in `doc/build-and-test/`, `doc/kernels/` (reference + optimisation log per kernel), `doc/scheduler/` and `doc/plans/` (project plans and results); the scheduler's user guides are in `inference-scheduler/doc/`.
+
 ## Build System
 
 All four kernels live under `kernels/` and are built from a single top-level CMake project.
-See `doc/BUILD_TARGETS.md` for a full reference of every `make` target.
+See `doc/build-and-test/BUILD_TARGETS.md` for a full reference of every `make` target.
 
 ```bash
 mkdir build && cd build
@@ -54,7 +56,7 @@ make synthesize_vectorop_kv260
 
 Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.  The top-level `AXI_PLATFORM` cache var (default `kv260`) also selects which platform's bounds drive the C-sim Config.h for each kernel.
 
-**Schema reference: [`doc/PLATFORM_CONFIGURATION.md`](doc/PLATFORM_CONFIGURATION.md)** — full field-by-field tables for top-level keys and the `kernels.{conv,matmul,pool}` blocks (VectorOPKernel has none), with constraint formulas, the "add a new platform" workflow, and the "edit existing bounds + regenerate hardware-bound fixtures" workflow.
+**Schema reference: [`doc/build-and-test/PLATFORM_CONFIGURATION.md`](doc/build-and-test/PLATFORM_CONFIGURATION.md)** — full field-by-field tables for top-level keys and the `kernels.{conv,matmul,pool}` blocks (VectorOPKernel has none), with constraint formulas, the "add a new platform" workflow, and the "edit existing bounds + regenerate hardware-bound fixtures" workflow.
 
 Key facts to keep in mind when editing platform JSON or any code that touches it:
 
@@ -75,7 +77,7 @@ DDR/PL ──► m_axi_gmem1 (b, read,  128-bit burst_maxi) ─┤  VectorOPKern
            s_axi_ctrl: a, b, c, size, op, outer, a_inc, b_inc, act, ap_ctrl_hs
 ```
 
-All three ports are `hls::burst_maxi<ap_uint<128>>` (8 elements per beat); the kernel issues explicit word-range requests (reads ≤ 64 words / 16 outstanding, writes ≤ 256 words / 8 responses in flight) and processes 8 lanes per cycle in one flattened II=1 loop per stage (`OP_DIV`: 1 lane per cycle). For unary ops (Relu, Relu6) no AXI transactions are issued on `gmem1`. `act` (0 none / 1 relu / 2 relu6) applies an activation after the op so the scheduler fuses Add→Relu. **Alignment contract:** every run start of a, b, c is 16-byte aligned (`a_inc`/`b_inc` are 0 or a multiple of 8 elements); `size` is arbitrary; the last word of every output run is written whole (tail lanes = 0), so the caller's buffer / stride gap must cover it (the scheduler's `CHUNK_STRIDE` and 64-byte allocations do). Block-design instance widths must equal the IP defaults (128 on all three ports); see `doc/VECTOROP_OPTIMISATION.md`.
+All three ports are `hls::burst_maxi<ap_uint<128>>` (8 elements per beat); the kernel issues explicit word-range requests (reads ≤ 64 words / 16 outstanding, writes ≤ 256 words / 8 responses in flight) and processes 8 lanes per cycle in one flattened II=1 loop per stage (`OP_DIV`: 1 lane per cycle). For unary ops (Relu, Relu6) no AXI transactions are issued on `gmem1`. `act` (0 none / 1 relu / 2 relu6) applies an activation after the op so the scheduler fuses Add→Relu. **Alignment contract:** every run start of a, b, c is 16-byte aligned (`a_inc`/`b_inc` are 0 or a multiple of 8 elements); `size` is arbitrary; the last word of every output run is written whole (tail lanes = 0), so the caller's buffer / stride gap must cover it (the scheduler's `CHUNK_STRIDE` and 64-byte allocations do). Block-design instance widths must equal the IP defaults (128 on all three ports); see `doc/kernels/VECTOROP_OPTIMISATION.md`.
 
 ### Supported Operations
 
@@ -106,12 +108,12 @@ emits a complete C project that drives up to four hardware kernels:
 |--------|----------|
 | VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
 | MatmulKernel | `MatMul` — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster) |
-| ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/BERT_PLAN.md` §2 2A) |
+| ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/plans/BERT_PLAN.md` §2 2A) |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
 | (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
-| (host CPU) | `Softmax` (last axis; opset < 13 coerce-to-2-D), `LayerNormalization`, `Gelu` (tanh / erf), `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0, int ids), `OneHot`, `Cast` (int ↔ Data_t) — `src/host_nodes.py`: double math, round-half-even + saturate write-back, staged through cached memory.  TF-style LayerNorm and GELU tanh / erf subgraphs are fused into single host nodes by `src/fusion.py` (`OnnxGraph(fuse_patterns=True)`, library + CLI default); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` / `Tanh` / `Erf` is rejected.  Integer tensors (ids, masks) are raw int16 in `inference_buf_t`.  BERT-base (bertsquad-12) generates — see `doc/BERT_PLAN.md` |
-| (host CPU, Llama decoders) | domain `axi.llm`: `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd` (float32 residual), `LlmAttention` (RoPE + KV-cache write + causal GQA attention, one float region), `LlmSiluMul`, `LlmSelectRow`, `LlmDequant` — `src/llm_nodes.py`; the graphs come from the Llama frontend `src/llama.py` (config.json + safetensors + calibrated formats → decode / prefill_<T> / head entries) with power-of-two exponents, host tensors and states in the model's `axi.numeric` metadata (`src/numeric.py`).  SmolLM2-135M → `libsmollm2.so` — see `doc/CHAT_PLAN.md` §13 |
+| (host CPU) | `Softmax` (last axis; opset < 13 coerce-to-2-D), `LayerNormalization`, `Gelu` (tanh / erf), `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0, int ids), `OneHot`, `Cast` (int ↔ Data_t) — `src/host_nodes.py`: double math, round-half-even + saturate write-back, staged through cached memory.  TF-style LayerNorm and GELU tanh / erf subgraphs are fused into single host nodes by `src/fusion.py` (`OnnxGraph(fuse_patterns=True)`, library + CLI default); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` / `Tanh` / `Erf` is rejected.  Integer tensors (ids, masks) are raw int16 in `inference_buf_t`.  BERT-base (bertsquad-12) generates — see `doc/plans/BERT_PLAN.md` |
+| (host CPU, Llama decoders) | domain `axi.llm`: `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd` (float32 residual), `LlmAttention` (RoPE + KV-cache write + causal GQA attention, one float region), `LlmSiluMul`, `LlmSelectRow`, `LlmDequant` — `src/llm_nodes.py`; the graphs come from the Llama frontend `src/llama.py` (config.json + safetensors + calibrated formats → decode / prefill_<T> / head entries) with power-of-two exponents, host tensors and states in the model's `axi.numeric` metadata (`src/numeric.py`).  SmolLM2-135M → `libsmollm2.so` — see `doc/plans/CHAT_PLAN.md` §13 |
 
 ```bash
 cd inference-scheduler
@@ -153,7 +155,7 @@ Key source files:
 - **`inference-scheduler/src/llama.py`** / **`src/llm_nodes.py`** — Llama frontend and the `axi.llm` host ops (numpy reference + C helpers)
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake); `multi.py` — multi-entry projects (CLI `--entry NAME=MODEL.onnx`: weights deduplicated by name + image, states shared, intermediates overlapping)
 
-See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
+See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
 
 ### HLS Pragmas Used
 
@@ -163,4 +165,4 @@ See `doc/INFERENCE_SCHEDULER.md` for the full technical reference and `inference
 
 - **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.
-- **KV260 board**: Ubuntu 22.04 (kernel 5.15.0-xilinx-zynqmp), XRT 2.13, `cma=1000M` on the kernel command line (BERT + SmolLM2 pools), 3.9 GB RAM and no swap (build generated projects `-j1`). Keep `board/kv260/kv260-no-cpu-powerdown.conf` installed in `/etc/tmpfiles.d/` (`demo/chat/deploy.py` does it): the PSCI core power-down idle state can park a core forever and hang the board (`doc/CHAT_PLAN.md` §18).
+- **KV260 board**: Ubuntu 22.04 (kernel 5.15.0-xilinx-zynqmp), XRT 2.13, `cma=1000M` on the kernel command line (BERT + SmolLM2 pools), 3.9 GB RAM and no swap (build generated projects `-j1`). Keep `board/kv260/kv260-no-cpu-powerdown.conf` installed in `/etc/tmpfiles.d/` (`demo/chat/deploy.py` does it): the PSCI core power-down idle state can park a core forever and hang the board (`doc/plans/CHAT_PLAN.md` §18).

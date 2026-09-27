@@ -57,7 +57,7 @@ class TensorInfo:
     packed_data: Optional[np.ndarray] = field(default=None, repr=False)
     packed_note: str = ""
 
-    # ---- Numerics beyond the element type (doc/CHAT_PLAN.md §10.5, set from
+    # ---- Numerics beyond the element type (doc/plans/CHAT_PLAN.md §10.5, set from
     # the model's "axi.numeric" metadata, see src/numeric.py) -------------
     # exp: power-of-two exponent f of a fixed-point DMA / host-int16 tensor
     #      (value = raw * 2^-f) — None = the element type's own (8 for

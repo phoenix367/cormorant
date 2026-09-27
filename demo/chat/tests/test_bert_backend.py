@@ -276,7 +276,7 @@ class ReplayEngine:
 class TestDemoReplay(unittest.TestCase):
     """The backend builds the demo's exact input windows and decodes the
     demo's board logits to the demo's spans (the board run of the server
-    itself is gate 2 in doc/CHAT_PLAN.md §6)."""
+    itself is gate 2 in doc/plans/CHAT_PLAN.md §6)."""
 
     def test_same_spans_as_demo(self):
         eng = ReplayEngine(os.path.join(ASSETS, "preprocessed", "inputs.bin"),

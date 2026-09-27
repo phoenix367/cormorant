@@ -2,7 +2,7 @@
 
 Date: 2026-09-26.  Target: ResNet-18 (`demo/image_classification`,
 `resnet18-simplified-fused.onnx`, 1814 MMAC) at ≤ 66.7 ms per image on the
-KV260 at 100 MHz, from 310 ms today (after `doc/THROUGHPUT_PLAN.md`).
+KV260 at 100 MHz, from 310 ms today (after `doc/plans/THROUGHPUT_PLAN.md`).
 Status: **TARGET MET 2026-09-26 — ResNet-18 62.3 ms = 16.0 FPS at 100 MHz** (steps 1–4, 6 and 8; step 5 not needed, kept as an option).  Since
 BERT_PLAN phase 2B (cacheable buffer pool, same bitstream): ResNet-18 60.3 ms
 (16.6 FPS), MobileNet v1 81.0 ms, v2 63.9 ms (BERT_PLAN.md §3 "Phase 2A + 2B
@@ -33,14 +33,14 @@ second PS port becomes necessary once steps 4–5 land (step 6).
 
 | # | Step | Files | Expected | Cost / risk |
 |---|---|---|---|---|
-| 1 | **Stem via space-to-depth** (scheduler transform + host-side reorder in the generated C): Conv 7×7 s2 pad 3 with ic ≤ 4 → block-2 space-to-depth of the input (ic×4 channels, H/2×W/2) + Conv 4×4 s1 pads [top 2, left 2, bottom 1, right 1] with re-indexed weights (`w'[m][(ph·2+pw)·ic+c][R][C] = w[m][c][2R+ph−1][2C+pw−1] (pad 3; general `2R+ph+p−2·ceil(p/2)`)`, zero where out of the 7×7 range).  The kernel already takes `pad_top/pad_left` explicitly and zero-pads bottom/right by bounds check. | `inference-scheduler/src/graph.py`, `nodes.py`, `codegen/*`, tests, `doc/INFERENCE_SCHEDULER.md` | 57 → ~27 ms now (12/16 lanes, 16 taps instead of 49), < 10 ms after 4–5 | scheduler only; reorder runs on the A53 (150 k elements, ~0.3 ms) |
-| 2 | **PoolingKernel 8 lanes/cycle** (Track-C-style): 128-bit x is already there; process a full 128-bit word (8 channels) per cycle through window/reduce/write, 128-bit y with byte strobes for tails | `kernels/pool/*`, pool test stand project, `doc/POOL_OPTIMIZATION.md` | 16 → 2–3 ms (MaxPool 3×3 s2 112²×64); all pool cases ×4–6 | pool kernel only |
+| 1 | **Stem via space-to-depth** (scheduler transform + host-side reorder in the generated C): Conv 7×7 s2 pad 3 with ic ≤ 4 → block-2 space-to-depth of the input (ic×4 channels, H/2×W/2) + Conv 4×4 s1 pads [top 2, left 2, bottom 1, right 1] with re-indexed weights (`w'[m][(ph·2+pw)·ic+c][R][C] = w[m][c][2R+ph−1][2C+pw−1] (pad 3; general `2R+ph+p−2·ceil(p/2)`)`, zero where out of the 7×7 range).  The kernel already takes `pad_top/pad_left` explicitly and zero-pads bottom/right by bounds check. | `inference-scheduler/src/graph.py`, `nodes.py`, `codegen/*`, tests, `doc/scheduler/INFERENCE_SCHEDULER.md` | 57 → ~27 ms now (12/16 lanes, 16 taps instead of 49), < 10 ms after 4–5 | scheduler only; reorder runs on the A53 (150 k elements, ~0.3 ms) |
+| 2 | **PoolingKernel 8 lanes/cycle** (Track-C-style): 128-bit x is already there; process a full 128-bit word (8 channels) per cycle through window/reduce/write, 128-bit y with byte strobes for tails | `kernels/pool/*`, pool test stand project, `doc/kernels/POOL_OPTIMISATION.md` | 16 → 2–3 ms (MaxPool 3×3 s2 112²×64); all pool cases ×4–6 | pool kernel only |
 | 3 | **1×1 stride-2 path**: trace why the 6.4 MMAC downsamples take 3.6 ms (14 %); expected fix is a flat II=1 sweep for kh = kw = 1 (the §2.37 recipe for depthwise) with stride handled in the x loader | `kernels/conv/*` | 11 → 2–3 ms | after step 4 in the same worktree |
-| 4 | **Conv grid 16×8 → 16×16** (`tile_m` 8 → 16 in `platforms/kv260.json` + whatever the kernel needs): w_cache moves to URAM (16/64 used) since BRAM is at 119/144; drain/write path must keep up with 16 output channels | `kernels/conv/*`, `platforms/kv260.json`, `gen_conv_models.py` (fixtures re-derive), `doc/CONV_OPTIMISATION.md` | 3×3 convs 220 → ~115–130 ms if sweep efficiency holds | DSP 155 → ~285 (of 1248), LUT +15–20 k (design 62 % → ~77 %), BRAM must not grow |
+| 4 | **Conv grid 16×8 → 16×16** (`tile_m` 8 → 16 in `platforms/kv260.json` + whatever the kernel needs): w_cache moves to URAM (16/64 used) since BRAM is at 119/144; drain/write path must keep up with 16 output channels | `kernels/conv/*`, `platforms/kv260.json`, `gen_conv_models.py` (fixtures re-derive), `doc/kernels/CONV_OPTIMISATION.md` | 3×3 convs 220 → ~115–130 ms if sweep efficiency holds | DSP 155 → ~285 (of 1248), LUT +15–20 k (design 62 % → ~77 %), BRAM must not grow |
 | 5 | 150 MHz (Track D: reset-net fix, conv DSP chain re-pipelining) | BD, all kernels | ×1.5 | not started |
 | 6 | Second PS port for conv w/b (block-design wiring only) | `hw/cormorant_hw_128` | needed after 4–5 | **done 2026-09-26, neutral at 100 MHz (§3.2)** |
 | 7 | Sweep efficiency 60 → 80 %+ (cycle-level trace on a 56² fixture) | `kernels/conv/*` | 3×3 convs −25 % | delivered by step 3's flat sweep (§2.41): 89–97 % on the board |
-| 8 | **Two output pixels per cycle** on the 16×16 grid (512 MACs/cycle): each sweep iteration multiplies the patch columns of `(ow, ow+1)` against the SAME weight-cache word, so the MAC count doubles without touching w_cache (the width-bound BRAM/URAM resource); patch supply, accumulators, adder trees and the drain rate are what double | `kernels/conv/*`, `doc/CONV_OPTIMISATION.md` §2.42 | 3×3 convs −40…−48 %, depthwise −35 %; 1×1 layers unchanged (drain-bound) | DSP +272 (≈ 930 of 1248 routed), LUT ≤ +15 k routed, BRAM / URAM must not grow |
+| 8 | **Two output pixels per cycle** on the 16×16 grid (512 MACs/cycle): each sweep iteration multiplies the patch columns of `(ow, ow+1)` against the SAME weight-cache word, so the MAC count doubles without touching w_cache (the width-bound BRAM/URAM resource); patch supply, accumulators, adder trees and the drain rate are what double | `kernels/conv/*`, `doc/kernels/CONV_OPTIMISATION.md` §2.42 | 3×3 convs −40…−48 %, depthwise −35 %; 1×1 layers unchanged (drain-bound) | DSP +272 (≈ 930 of 1248 routed), LUT ≤ +15 k routed, BRAM / URAM must not grow |
 
 Model-based outcome: steps 1–6 at 60 % efficiency ≈ 92 ms (11 FPS); with
 step 7 at 80 % ≈ 74 ms (13.5 FPS); 15 FPS needs ≥ 85 %.  Int8 (2 MACs per
@@ -50,7 +50,7 @@ grid design is frozen.
 
 ## 2. Protocol
 
-Same as `doc/THROUGHPUT_PLAN.md` §6: one worktree + branch per step
+Same as `doc/plans/THROUGHPUT_PLAN.md` §6: one worktree + branch per step
 (`/home/ivan/projects/axi_demo_wt/{stem,pool,convgrid}`, branches
 `perf/stem`, `perf/pool`, `perf/convgrid`); per-agent gates are local
 (C-sim bit-exact, `make synthesize_<k>_kv260` II=1 / slack ≥ 0,
@@ -86,10 +86,10 @@ widened in Vivado.  Resource budget today (Track A bitstream): LUT 73.2 k
   Remaining lever for the 3 ms: allocate the buffer pool cacheable
   (XCL_BO_FLAGS_CACHEABLE, syncs already emitted) — decide separately, it
   changes every buffer's coherency model.  Note the weight index is `2R + ph − 1` for pad 3 (the `−3` in §1 was a
-  typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/INFERENCE_SCHEDULER.md`
+  typo): `t = 2R + ph + p − 2·ceil(p/2)`, see `doc/scheduler/INFERENCE_SCHEDULER.md`
   §Space-to-depth stem.
 
-- **Step 2: implemented** on `perf/pool` (POOL_OPTIMIZATION.md §2.14) — RTL
+- **Step 2: implemented** on `perf/pool` (POOL_OPTIMISATION.md §2.14) — RTL
   −56.2 % on the 31 common pool cases (1,162,425 → 509,665 ns, every case
   faster, −74/−78 % on the 2×2 s2 wide-W cases), 43/43 RTL and 45/45 C-sim
   bit-exact; the ResNet-stem-shaped fixture (MaxPool 3×3 s2 on 28×112) runs

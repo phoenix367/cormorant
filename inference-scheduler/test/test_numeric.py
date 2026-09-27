@@ -1,4 +1,4 @@
-"""Numeric annotations (src/numeric.py, doc/CHAT_PLAN.md §10.5): power-of-two
+"""Numeric annotations (src/numeric.py, doc/plans/CHAT_PLAN.md §10.5): power-of-two
 exponents, host-memory tensors, states — metadata parsing and validation,
 the element-type helpers, the rank-1 weight encoding and the simulator's
 MatMul exponent path (exact products, ap_fixed<32,16> wrap, floor at f_out),

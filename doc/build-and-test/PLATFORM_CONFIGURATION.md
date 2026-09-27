@@ -79,7 +79,7 @@ only `part`, `board` and `clock`).
 > auto-widening of plain-pointer ports (the only one left is
 > MatmulKernel `c`, which HLS does not widen — it stays 16-bit); every
 > `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the *Key CMake parameters* table in the top-level
-> [README.md](../README.md#key-cmake-parameters).
+> [README.md](../../README.md#key-cmake-parameters).
 
 ---
 
@@ -87,7 +87,7 @@ only `part`, `board` and `clock`).
 
 Sizes the ConvKernel's line buffer, weight cache, bias buffer, and
 persistent-accumulator at compile time. See
-[`CONV_KERNEL.md`](CONV_KERNEL.md) §3 for the full architectural
+[`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 for the full architectural
 context.
 
 | Field | Constraint | Description |
@@ -120,7 +120,7 @@ acceptance is gated by `ConvNode.from_onnx_node()`, which raises
 
 Sizes the MatmulKernel's row-staging buffer `a_buf[tile_n][max_k]`
 and the B block buffer `b_tile[tile_m][2·tile_k]` at compile time. See
-[`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §2–§3.
+[`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3.
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
@@ -138,8 +138,8 @@ cost model only). `tile_k` is a pure C++ tiling factor.
 ### `kernels.pool`
 
 Sizes the PoolingKernel's line buffer and unrolled per-position
-adders at compile time. See [`POOLING_KERNEL.md`](POOLING_KERNEL.md) §3
-and [`POOL_OPTIMIZATION.md`](POOL_OPTIMIZATION.md) §4 for the full
+adders at compile time. See [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3
+and [`POOL_OPTIMISATION.md`](../kernels/POOL_OPTIMISATION.md) §4 for the full
 architectural context including bank/port topology.
 
 | Field | Constraint | Description |
@@ -274,9 +274,9 @@ the same JSON as the bitstream.
 
 | Document | Coverage |
 |----------|----------|
-| [`CONV_KERNEL.md`](CONV_KERNEL.md) §3 | Full ConvKernel architecture and tiling, including how each `kernels.conv.*` field maps to hardware resources |
-| [`MATMUL_KERNEL.md`](MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
-| [`POOLING_KERNEL.md`](POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
-| [`POOL_OPTIMIZATION.md`](POOL_OPTIMIZATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
-| [`VECTOROP_KERNEL.md`](VECTOROP_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds) |
-| [`../inference-scheduler/CLAUDE.md`](../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |
+| [`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 | Full ConvKernel architecture and tiling, including how each `kernels.conv.*` field maps to hardware resources |
+| [`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
+| [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
+| [`POOL_OPTIMISATION.md`](../kernels/POOL_OPTIMISATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
+| [`VECTOROP_KERNEL.md`](../kernels/VECTOROP_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds) |
+| [`../inference-scheduler/CLAUDE.md`](../../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |

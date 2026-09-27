@@ -15,7 +15,7 @@ Plan for widening the standard-conv MAC array from the current 1-D grid
 the current index-heavy loop nest already guarantees**.
 
 Written against the state after §2.21 (see
-[CONV_OPTIMISATION.md](CONV_OPTIMISATION.md)); KV260 defaults `kTileIC=16`,
+[CONV_OPTIMISATION.md](../kernels/CONV_OPTIMISATION.md)); KV260 defaults `kTileIC=16`,
 `kTileM=8`, `kMaxMperGroup=4`, `kMaxLineBufRows=16`, clock 150 MHz.  This
 supersedes the v1 draft of this file: v1's micro-architecture proposal is
 kept (§4), but the measured cycle breakdown (§2) changes the order of work —
@@ -465,5 +465,5 @@ Headroom remains for `kTileM=16` (256 DSPs) after step 7.
 | `kernels/conv/test/TestConvSim.cpp` | `--sweep`, grid unit test (step 0) |
 | `inference-scheduler/src/nodes.py`, `src/_conv_hw_config.py` | padded capacity rule (step 4) |
 | `hw/test_data/conv_test_data/` | one new small fixture per step |
-| `doc/CONV_OPTIMISATION.md` | §2.22+ entries, one per step |
-| `doc/HLS_CONV_RESEARCH.md` | background: PM×PN pattern, dataflow taxonomy, DW engine notes |
+| `doc/kernels/CONV_OPTIMISATION.md` | §2.22+ entries, one per step |
+| `doc/kernels/HLS_CONV_RESEARCH.md` | background: PM×PN pattern, dataflow taxonomy, DW engine notes |

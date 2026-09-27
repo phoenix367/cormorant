@@ -25,15 +25,15 @@ KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26/27):
 
 | Model | Result | Source |
 |---|---|---|
-| ResNet-18, 224×224 | **60.3 ms (16.6 FPS)** per image | [BERT_PLAN §3](doc/BERT_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | 81.0 / 63.9 ms per image | [BERT_PLAN §3](doc/BERT_PLAN.md) |
-| MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **971 ms** per inference, EM/F1 equal to float32 | [BERT_PLAN §3](doc/BERT_PLAN.md) |
-| SmolLM2-135M-Instruct | **5.06 tokens/s** decode (4.39 at 1000 cached tokens), 256-token prefill 1.31 s | [CHAT_PLAN §17](doc/CHAT_PLAN.md) |
+| ResNet-18, 224×224 | **60.3 ms (16.6 FPS)** per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
+| MobileNet V1 / V2, 224×224 | 81.0 / 63.9 ms per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
+| MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **971 ms** per inference, EM/F1 equal to float32 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
+| SmolLM2-135M-Instruct | **5.06 tokens/s** decode (4.39 at 1000 cached tokens), 256-token prefill 1.31 s | [CHAT_PLAN §17](doc/plans/CHAT_PLAN.md) |
 
 The BERT and SmolLM2 logits are bit-exact with the scheduler's simulation.
 The FPGA design uses 81 % of the DSPs (1009 / 1248), 73 % of the LUTs,
-111.5 / 144 BRAM and 48 / 64 URAM ([RESNET18_15FPS_PLAN §3.3](doc/RESNET18_15FPS_PLAN.md)).
+111.5 / 144 BRAM and 48 / 64 URAM ([RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)).
 
 ---
 
@@ -47,10 +47,10 @@ runs the PL at 100 MHz.  Compile-time bounds come from
 
 | Kernel | ONNX ops | Highlights | Reference |
 |---|---|---|---|
-| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), fused Relu / Relu6 after an op | [VECTOROP_KERNEL](doc/VECTOROP_KERNEL.md) |
-| **MatmulKernel** | `MatMul` | tiles 4 × 32 × 256, packed-B weight layout, K ≤ 4096, batched | [MATMUL_KERNEL](doc/MATMUL_KERNEL.md) |
-| **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | 16 × 16 MAC grid, two output pixels per cycle (512 MACs), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels | [CONV_KERNEL](doc/CONV_KERNEL.md) |
-| **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | 8 channel lanes, windows ≤ 7×7, dilation, `count_include_pad` | [POOLING_KERNEL](doc/POOLING_KERNEL.md) |
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), fused Relu / Relu6 after an op | [VECTOROP_KERNEL](doc/kernels/VECTOROP_KERNEL.md) |
+| **MatmulKernel** | `MatMul` | tiles 4 × 32 × 256, packed-B weight layout, K ≤ 4096, batched | [MATMUL_KERNEL](doc/kernels/MATMUL_KERNEL.md) |
+| **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | 16 × 16 MAC grid, two output pixels per cycle (512 MACs), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels | [CONV_KERNEL](doc/kernels/CONV_KERNEL.md) |
+| **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | 8 channel lanes, windows ≤ 7×7, dilation, `count_include_pad` | [POOLING_KERNEL](doc/kernels/POOLING_KERNEL.md) |
 
 The Vivado block design (a git submodule, `hw/cormorant_hw_128`) streams the
 weights — ConvKernel `weight` / `bias` and MatmulKernel `b` — through PS port
@@ -86,7 +86,7 @@ program) for Linux with XRT buffers or for bare metal:
   memory and quantisation error.
 
 Reference (ops, numerics, generated code):
-[doc/INFERENCE_SCHEDULER.md](doc/INFERENCE_SCHEDULER.md); CLI, generated project and C
+[doc/scheduler/INFERENCE_SCHEDULER.md](doc/scheduler/INFERENCE_SCHEDULER.md); CLI, generated project and C
 API: [inference-scheduler/doc/USER_GUIDE.md](inference-scheduler/doc/USER_GUIDE.md).
 
 ---
@@ -146,7 +146,7 @@ make build_hw_kv260              # Vivado: bitstream in hw/cormorant_hw_128/.../
 make dtbo_kv260_cormorant        # device-tree overlay: build/dts/kv260/design_cormorant.dtbo
 ```
 
-See [doc/BUILD_TARGETS.md](doc/BUILD_TARGETS.md) for every target.
+See [doc/build-and-test/BUILD_TARGETS.md](doc/build-and-test/BUILD_TARGETS.md) for every target.
 
 ### 5. Prepare the board and load the bitstream
 
@@ -156,7 +156,7 @@ reserve 1 GB of CMA with `cma=1000M` on the kernel command line.
 
 Keep the cores out of the PSCI core power-down idle state.  With the board's
 boot firmware (TF-A v2.8, 2023.2) a core can be parked there for good and
-the board hangs ([CHAT_PLAN §18](doc/CHAT_PLAN.md)).  `demo/chat/deploy.py`
+the board hangs ([CHAT_PLAN §18](doc/plans/CHAT_PLAN.md)).  `demo/chat/deploy.py`
 installs the rule; by hand:
 
 ```bash
@@ -195,7 +195,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |
 
-Details: [doc/TESTING.md](doc/TESTING.md),
+Details: [doc/build-and-test/TESTING.md](doc/build-and-test/TESTING.md),
 [inference-scheduler/doc/REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md).
 
 ---
@@ -226,20 +226,23 @@ own models.
 (`1.0 = 0x0100`, range `[−128, 127.996]`), saturating.  The scheduler's
 `DataType` abstraction (`inference-scheduler/src/dtype.py`) also supports
 `float32`.  For the decoder, per-tensor / per-channel power-of-two exponents
-([CHAT_PLAN §10](doc/CHAT_PLAN.md)) scale each tensor into this format.
+([CHAT_PLAN §10](doc/plans/CHAT_PLAN.md)) scale each tensor into this format.
 
 ---
 
 ## Documentation
 
-| Topic | Documents |
+**[doc/README.md](doc/README.md)** is the index — a "where do I find…" table
+and every document with a one-line summary:
+
+| Folder | Topic |
 |---|---|
-| Build and test | [BUILD_TARGETS](doc/BUILD_TARGETS.md), [TESTING](doc/TESTING.md), [PLATFORM_CONFIGURATION](doc/PLATFORM_CONFIGURATION.md), [SIMULATION_ISSUES](doc/SIMULATION_ISSUES.md) |
-| Kernels | [VECTOROP_KERNEL](doc/VECTOROP_KERNEL.md), [MATMUL_KERNEL](doc/MATMUL_KERNEL.md), [CONV_KERNEL](doc/CONV_KERNEL.md), [POOLING_KERNEL](doc/POOLING_KERNEL.md) |
-| Kernel optimisation logs | [VECTOROP_OPTIMISATION](doc/VECTOROP_OPTIMISATION.md), [MATMUL_OPTIMISATION](doc/MATMUL_OPTIMISATION.md), [CONV_OPTIMISATION](doc/CONV_OPTIMISATION.md), [POOL_OPTIMIZATION](doc/POOL_OPTIMIZATION.md), [HLS_CONV_RESEARCH](doc/HLS_CONV_RESEARCH.md) (background survey) |
-| Scheduler | [INFERENCE_SCHEDULER](doc/INFERENCE_SCHEDULER.md) (reference), [USER_GUIDE](inference-scheduler/doc/USER_GUIDE.md), [ARCHITECTURE](inference-scheduler/doc/ARCHITECTURE.md), [SCHEDULER_DAG](inference-scheduler/doc/SCHEDULER_DAG.md), [MODEL_PREPARATION](inference-scheduler/doc/MODEL_PREPARATION.md), [REMOTE_TESTING](inference-scheduler/doc/REMOTE_TESTING.md), [PROFILER](doc/PROFILER.md) |
-| Project plans and results | [THROUGHPUT_PLAN](doc/THROUGHPUT_PLAN.md), [CONV_2D_GRID_PLAN](doc/CONV_2D_GRID_PLAN.md), [RESNET18_15FPS_PLAN](doc/RESNET18_15FPS_PLAN.md), [BERT_PLAN](doc/BERT_PLAN.md), [CHAT_PLAN](doc/CHAT_PLAN.md) |
-| Demos | [demo/README.md](demo/README.md) and each demo's README |
+| [`doc/build-and-test/`](doc/build-and-test/) | build targets, test layers, platform JSON, RTL simulation issues |
+| [`doc/kernels/`](doc/kernels/) | per kernel: a reference and an optimisation log |
+| [`doc/scheduler/`](doc/scheduler/) | the scheduler reference and the profiler |
+| [`inference-scheduler/doc/`](inference-scheduler/doc/) | scheduler user guide, architecture, DAG, model preparation, board testing |
+| [`doc/plans/`](doc/plans/) | project plans and their measured results |
+| [`demo/`](demo/README.md) | one README per demo |
 
 ---
 

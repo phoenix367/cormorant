@@ -13,11 +13,11 @@ Compared with a naïve element-at-a-time reference, the on-board kernel
 combines six independent optimisations: a producer/consumer DATAFLOW
 split with row caching, channel-parallel reduce, a kOwParallel-wide
 output-position vector axis, 128-bit word paths through a column-banked
-LUTRAM line buffer (8 elements per cycle, POOL_OPTIMIZATION §2.13 /
+LUTRAM line buffer (8 elements per cycle, POOL_OPTIMISATION §2.13 /
 §2.14), a fixed-point AVG reciprocal LUT, and a polynomial fixed-point
 sqrt for LP-pool. All six are folded into the architecture described
 below; the full optimisation log with measured timings lives in
-[POOL_OPTIMIZATION.md](POOL_OPTIMIZATION.md).
+[POOL_OPTIMISATION.md](POOL_OPTIMISATION.md).
 
 ---
 
@@ -27,8 +27,8 @@ below; the full optimisation log with measured timings lives in
 
 | Bundle | Port | Direction | Description |
 |--------|------|-----------|-------------|
-| `gmem0` | `x` | Read | Input feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMIZATION §2.13); base must be 16-byte aligned; the last word of a row run may extend up to 7 elements past the tensor end (bytes must be mappable) |
-| `gmem1` | `y` | Write | Output feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMIZATION §2.14); base must be 16-byte aligned; one burst per (output row, channel) run whose first / last words carry byte strobes for the run's own lanes only, so no tail padding of the y buffer is needed |
+| `gmem0` | `x` | Read | Input feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMISATION §2.13); base must be 16-byte aligned; the last word of a row run may extend up to 7 elements past the tensor end (bytes must be mappable) |
+| `gmem1` | `y` | Write | Output feature map (NCHW) — `hls::burst_maxi<ap_uint<128>>`, 8 elements per beat (POOL_OPTIMISATION §2.14); base must be 16-byte aligned; one burst per (output row, channel) run whose first / last words carry byte strobes for the run's own lanes only, so no tail padding of the y buffer is needed |
 
 **AXI-Lite control registers (`s_axilite bundle=ctrl`) — 19 arguments (2 addresses + 17 scalars) + return:**
 
@@ -109,7 +109,7 @@ the JSON via `string(JSON …)` and emits `Config.h` from
 `kMaxPoolH/W` are a hard contract: the kernel's tap counters are sized
 to them and it does not check `pool_h/pool_w` at run time, so an
 out-of-contract call (e.g. a 14×14 pool) hangs the kernel and wedges
-the HPC port (POOL_OPTIMIZATION §2.14.1).  The scheduler rejects such
+the HPC port (POOL_OPTIMISATION §2.14.1).  The scheduler rejects such
 models.
 
 **Fixed kernel-level constants:**
@@ -131,7 +131,7 @@ scheduler and checked in `PoolNode.from_onnx_node` before any kernel
 call is emitted; any ONNX op that would overflow `kMaxPoolH/W` or the
 dilated-window line-buffer extents is rejected at codegen time with a
 `SchedulerError` that names the violated bound. See
-[inference-scheduler/src/\_pool\_hw\_config.py](../inference-scheduler/src/_pool_hw_config.py).
+[inference-scheduler/src/\_pool\_hw\_config.py](../../inference-scheduler/src/_pool_hw_config.py).
 
 ---
 
@@ -140,7 +140,7 @@ dilated-window line-buffer extents is rejected at codegen time with a
 > The kernel has been substantially restructured from a single nested
 > loop into a four-stage DATAFLOW pipeline. The optimisation log with
 > per-step timings lives in
-> [POOL_OPTIMIZATION.md](POOL_OPTIMIZATION.md); this section describes
+> [POOL_OPTIMISATION.md](POOL_OPTIMISATION.md); this section describes
 > the *current* architecture.
 
 ### 4.1 Top-level DATAFLOW pipeline
@@ -167,7 +167,7 @@ flowchart LR
 Each box is an HLS subfunction; each arrow is an `hls::stream` FIFO
 sized by an explicit `#pragma HLS STREAM depth=…`. Single
 `#pragma HLS DATAFLOW` at the top of `PoolingKernel` runs all four
-stages concurrently.  Since POOL_OPTIMIZATION §2.14 every stage moves
+stages concurrently.  Since POOL_OPTIMISATION §2.14 every stage moves
 one 128-bit word (8 elements) per cycle where it touches DDR or the
 line buffer, and every stage's hot path is ONE flattened `II=1` loop
 per output row — there is no per-group or per-run loop re-entry.
@@ -303,7 +303,7 @@ LP-p=1, `+ x²` for LP-p=2.  Because `slot_len ≥ kTileC`, the finalise
 of group `g` (kOwParallel lanes per cycle — one channel's adjacent
 positions) always completes inside slot `g+1`, so the finalise
 hardware is `kOwParallel` wide instead of `kOwParallel × kTileC`
-(the rejected POOL_OPTIMIZATION §6.2.3 attempt) and never stalls the
+(the rejected POOL_OPTIMISATION §6.2.3 attempt) and never stalls the
 reduce.  `acc`, `acc_done`,
 `inv`, `inv_done` are fully partitioned registers.
 
@@ -372,7 +372,7 @@ The wall clock is the largest of the four, all overlapped.  For
 ResNet-18's MaxPool 3×3 s2 on 112²×64 (W-tiled into 31 + 25 output
 columns, input spans of 63 / 51 columns) the consumer's 9 cycles per
 group of 16 outputs is the bound (≈ 0.56 cycles per output, ~117 k
-cycles; 1.35 ms measured on the board, POOL_OPTIMIZATION §2.14.1);
+cycles; 1.35 ms measured on the board, POOL_OPTIMISATION §2.14.1);
 for 2×2 s2 pools the consumer's `kTileC = 8` cycles per group (2
 outputs per cycle) is; for global pools the loader's one word per
 cycle is.
@@ -381,7 +381,7 @@ cycle is.
 
 The kernel stages data through **three memory layers** — DDR, BRAM, and
 registers — each a smaller/faster cache of the layer below it. Unlike
-ConvKernel, PoolingKernel needs **no URAM**, and since POOL_OPTIMIZATION
+ConvKernel, PoolingKernel needs **no URAM**, and since POOL_OPTIMISATION
 §2.14 almost no BRAM either: the line buffer, the row buffers and the wide
 FIFOs are LUTRAM (the only BRAM18s are the x port's read adapter and the
 AVG reciprocal ROM).  Post-§2.14 synthesis (KV260, kv260.json constants)
@@ -624,7 +624,7 @@ runs `csynth_design`, and exports an IP catalog archive to
 JSON-file-plus-cmake-rerun operation; no C++ edits required.
 
 The verification workflow is also packaged as a
-[`pool-verify` skill](../.claude/skills/pool-verify/SKILL.md) that
+[`pool-verify` skill](../../.claude/skills/pool-verify/SKILL.md) that
 runs the four gates sequentially (C-sim → synthesis → behavior test →
 per-test timing diff vs the previous run) and reports a single
 summary.
@@ -650,4 +650,4 @@ summary.
 | `inference-scheduler/src/codegen/_core.py` | Pool node detection, buffer layout |
 | `inference-scheduler/src/codegen/_simulate.py` | Float64 reference simulation |
 | `inference-scheduler/test/test_pool.py` | Scheduler-level pool tests |
-| `doc/POOL_OPTIMIZATION.md` | Full optimisation log with measured timings and rejected experiments |
+| `doc/kernels/POOL_OPTIMISATION.md` | Full optimisation log with measured timings and rejected experiments |

@@ -73,7 +73,7 @@ The pipeline has three stages:
    `LlmNode`); it then folds activations into VectorOP nodes, lowers
    MatMuls onto ConvKernel where the cost model says so (`MatmulConvNode`)
    and packs constant MatMul weights.  The exact order is listed in
-   [`doc/INFERENCE_SCHEDULER.md` §OnnxGraph loading sequence](../../doc/INFERENCE_SCHEDULER.md#onnxgraph-loading-sequence).
+   [`doc/scheduler/INFERENCE_SCHEDULER.md` §OnnxGraph loading sequence](../../doc/scheduler/INFERENCE_SCHEDULER.md#onnxgraph-loading-sequence).
 
 2. **_CoreMixin** computes a `TensorLayout` for every tensor in the graph.
    Layouts capture how much DMA memory each tensor actually needs — they may
@@ -449,7 +449,7 @@ contiguous, 64-byte-aligned part of an internal buffer is emitted as a
 sub-buffer view (`inference_buf_init_view()`) instead of a copy.
 `LlmAttnConvNode` is the exception: a ConvKernel call (`kernel_name =
 "ConvKernel"`) whose key count is computed at run time.  Semantics:
-[`doc/INFERENCE_SCHEDULER.md`](../../doc/INFERENCE_SCHEDULER.md) §Host-CPU ops,
+[`doc/scheduler/INFERENCE_SCHEDULER.md`](../../doc/scheduler/INFERENCE_SCHEDULER.md) §Host-CPU ops,
 §Llama-family decoders.
 
 ---
@@ -988,7 +988,7 @@ objects mapped **cacheable** by default (`XCL_BO_FLAGS_CACHEABLE`; build with
 `-DINFERENCE_BUF_CACHEABLE=OFF` or run with `INFERENCE_BUF_CACHEABLE=0` for
 the old non-cacheable mapping), so the syncs below are real cache
 maintenance on the buffer's byte range.  The full hand-off table, including
-host-CPU ops, is in [`doc/INFERENCE_SCHEDULER.md` §Cache coherency](../../doc/INFERENCE_SCHEDULER.md#cache-coherency) and is
+host-CPU ops, is in [`doc/scheduler/INFERENCE_SCHEDULER.md` §Cache coherency](../../doc/scheduler/INFERENCE_SCHEDULER.md#cache-coherency) and is
 checked by `test/test_cache_coherency.py`.
 
 Two operations maintain coherency:

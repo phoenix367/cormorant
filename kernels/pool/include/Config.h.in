@@ -48,7 +48,7 @@ static constexpr unsigned kMaxPoolW = @POOL_MAX_KW@;
 // read-port budget.
 //
 // Hardware constraint — line_buf must service kOwParallel reads per channel
-// per cycle.  It is banked by column in LUTRAM (ram_s2p, POOL_OPTIMIZATION.md
+// per cycle.  It is banked by column in LUTRAM (ram_s2p, POOL_OPTIMISATION.md
 // §2.14), so the kOwParallel adjacent columns of one read come from
 // different banks.  Must be a power of 2 (so ow-group rounding compiles to a
 // bitwise AND) and <= kLanes (static_assert in PoolingKernel.cpp).

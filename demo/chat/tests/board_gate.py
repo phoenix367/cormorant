@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-board_gate.py — phase-1 board gate of doc/CHAT_PLAN.md against a running
+board_gate.py — phase-1 board gate of doc/plans/CHAT_PLAN.md against a running
 server (stdlib only; run from the host or the board):
 
   1. the demo's SQuAD questions (demo/bert_squad/build/results.json, the

@@ -59,7 +59,7 @@ out_ch up to a multiple of kTileM (ConvKernel.cpp §2.23 layout), so the
 capacity rule the scheduler must enforce is
 ``out_w * ceil(out_ch / kTileM) * kTileM <= kMaxAccPersistEntries``.
 The bounds exported here are the ones the scheduler must enforce ahead
-of codegen — see ``doc/CONV_KERNEL.md`` §3 "Runtime constraints
+of codegen — see ``doc/kernels/CONV_KERNEL.md`` §3 "Runtime constraints
 validated by the inference scheduler".
 """
 

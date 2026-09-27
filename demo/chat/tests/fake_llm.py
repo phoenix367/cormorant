@@ -1,4 +1,4 @@
-"""Fake decoder engines with the §11 contract of libsmollm2.so (doc/CHAT_PLAN.md),
+"""Fake decoder engines with the §11 contract of libsmollm2.so (doc/plans/CHAT_PLAN.md),
 at the level smollm2_backend.LibLlmEngine exposes it (open / close /
 position / truncate / prefill / decode, vocab_size / context_size, logits as
 a ctypes float array):

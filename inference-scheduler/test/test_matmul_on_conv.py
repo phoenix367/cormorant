@@ -1,4 +1,4 @@
-"""MatMul on ConvKernel with swapped operand roles (doc/BERT_PLAN.md §2 2A,
+"""MatMul on ConvKernel with swapped operand roles (doc/plans/BERT_PLAN.md §2 2A,
 src/matmul_lowering.py, nodes.MatmulConvNode).
 
 For C[N][M] = A[N][K] · B[K][M] the scheduler issues a ConvKernel call with

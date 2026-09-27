@@ -2,7 +2,7 @@
 """
 llm_lib_check.py — exercise libsmollm2.so through ctypes the way the chat
 server does (runs ON THE BOARD, Python stdlib only; phase-4 requirements
-of doc/CHAT_PLAN.md §12):
+of doc/plans/CHAT_PLAN.md §12):
 
   * load the library, check that it exports only llm_* symbols (nm -D) and
     llm_vocab_size() / llm_context_size();

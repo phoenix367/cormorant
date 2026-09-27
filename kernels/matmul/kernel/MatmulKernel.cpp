@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // MatmulKernel.cpp — tiled matrix multiplication kernel.
 //
-// Loop structure (see doc/MATMUL_KERNEL.md §4):
+// Loop structure (see doc/kernels/MATMUL_KERNEL.md §4):
 //
 //   batch loop        — iterates over batch; advances a/b/c offsets by stride
 //     n_tile loop     — tiles the N (output-row) dimension

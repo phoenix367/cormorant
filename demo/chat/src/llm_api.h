@@ -1,6 +1,6 @@
 /*
  * llm_api.h — libsmollm2.so: a Llama-family decoder (SmolLM2-135M-Instruct)
- * on the KV260's FPGA kernels.  The C API of doc/CHAT_PLAN.md §11.
+ * on the KV260's FPGA kernels.  The C API of doc/plans/CHAT_PLAN.md §11.
  *
  * Built from the generated multi-entry inference project (decode step,
  * prefill buckets, head; one weight pool; the KV cache and the position-0

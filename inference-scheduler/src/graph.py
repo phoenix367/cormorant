@@ -457,7 +457,7 @@ class OnnxGraph:
 
         matmul_on_conv: run MatMuls on ConvKernel with swapped operand roles
         where the engine cost model says it is faster (``matmul_lowering``,
-        doc/BERT_PLAN.md §2 2A).  "auto" (default, also ``True``), "always"
+        doc/plans/BERT_PLAN.md §2 2A).  "auto" (default, also ``True``), "always"
         (every eligible MatMul) or "off" (``False``; CLI
         ``--no-matmul-on-conv``).  Batch-1 FC layers — the only MatMuls of
         the CNN models — are never eligible, so their projects are unchanged.

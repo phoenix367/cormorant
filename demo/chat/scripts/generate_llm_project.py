@@ -2,7 +2,7 @@
 """
 generate_llm_project.py — schedule SmolLM2-135M-Instruct (any Llama-family
 checkpoint with a formats JSON) into the multi-entry KV260 project behind
-libsmollm2.so (doc/CHAT_PLAN.md phase 3).
+libsmollm2.so (doc/plans/CHAT_PLAN.md phase 3).
 
   1. src/llama.py frontend: config.json + model.safetensors + the calibrated
      formats (llm_study.py formats, policy pow2+sink+p12) -> entry graphs

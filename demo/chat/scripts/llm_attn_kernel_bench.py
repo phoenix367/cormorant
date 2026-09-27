@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 llm_attn_kernel_bench.py — what decode attention would cost on the FPGA
-(policy p12, doc/CHAT_PLAN.md §10.5 item 5) next to the shipped host region
+(policy p12, doc/plans/CHAT_PLAN.md §10.5 item 5) next to the shipped host region
 (xattn): the kernel calls the p12 decode path issues per layer and KV group,
 timed on the board with the per-layer profiler.
 

@@ -1,4 +1,4 @@
-/* fake_libsmollm2.c — the libsmollm2.so C API of doc/CHAT_PLAN.md §11 with
+/* fake_libsmollm2.c — the libsmollm2.so C API of doc/plans/CHAT_PLAN.md §11 with
  * scripted logits, for testing the ctypes path of smollm2_backend.py on a
  * host without the FPGA.  Build:  cc -O2 -shared -fPIC -o libfakellm.so fake_libsmollm2.c
  *

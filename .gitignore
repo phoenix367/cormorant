@@ -112,5 +112,5 @@ Thumbs.db
 # -----------------------------------------------------------------------
 .claude/settings.local.json
 
-# host-side model export environment (torch / transformers), see doc/CHAT_PLAN.md
+# host-side model export environment (torch / transformers), see doc/plans/CHAT_PLAN.md
 .venv-export/
