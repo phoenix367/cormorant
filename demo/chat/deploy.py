@@ -120,7 +120,7 @@ def load_config(path: Optional[str]) -> dict:
     for k, v in (("lib", None), ("weights_dir", None),
                  ("tokenizer", "assets/smollm2-135m-instruct/tokenizer.json"), ("context", 1024),
                  ("reserve", 256), ("temperature", 0.2), ("top_p", 0.9), ("top_k", 50),
-                 ("repetition_penalty", 1.1), ("cma_mb", 510), ("dry_multiplier", 0.8),
+                 ("repetition_penalty", 1.1), ("cma_mb", 330), ("dry_multiplier", 0.8),
                  ("dry_base", 1.75), ("dry_allowed_length", 2), ("dry_penalty_last_n", -1),
                  ("dry_sequence_breakers", [":", "\"", "*"]), ("loop_guard", True)):
         if llm.get(k) is None:

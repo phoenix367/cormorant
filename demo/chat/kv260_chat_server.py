@@ -919,7 +919,7 @@ def main(argv=None) -> int:
                    help="penalty window in tokens (0: off, -1: the whole context)")
     g.add_argument("--llm-prefill-chunk", type=int, default=0,
                    help="split prefills into calls of at most N tokens (cancellable between them); 0: one call")
-    g.add_argument("--llm-cma-mb", type=float, default=510.0,
+    g.add_argument("--llm-cma-mb", type=float, default=330.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g.add_argument("--llm-fake", choices=("float", "scripted"), default=None,
                    help="development without the FPGA: tests/fake_llm.py instead of libsmollm2.so")
