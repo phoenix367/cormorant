@@ -16,9 +16,9 @@ allowed-tools: Bash Read
 
 The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
 128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
-exported IP's own default (32 for the 16-bit element ports; 128 for the
-ports that are `ap_uint<128>` in C++: conv weight/bias, matmul a/b, pool
-x, VectorOP a/b/c since Track C of THROUGHPUT_PLAN.md).  The test stand's three block designs use the same widths with a
+exported IP's own default (128 for every `ap_uint<128>` port — all of
+VectorOP, Conv and Pool, matmul a/b; 32 for MatmulKernel `c`, the only
+16-bit element port left).  The test stand's four block designs use the same widths with a
 128-bit PS port since 2026-09-24, so RTL timing matches the board.  Two things that
 look like shortcuts and are not (2026-09-24): (a) widening
 `C_M_AXI_*_DATA_WIDTH` on an instance in IP integrator — the HLS wrapper
@@ -58,7 +58,7 @@ driver headers and fail preflight.
 ```bash
 cd inference-scheduler
 .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
-scripts/read_kernel_regs.sh            # from this skill: widths + kernel states
+../.claude/skills/board-deploy/scripts/read_kernel_regs.sh   # widths + kernel states
 ```
 
 `read_kernel_regs.sh` must show the HPC0 **and HPC1** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26; the loader derives both from the HWH)
@@ -84,7 +84,7 @@ and unbinds such a device before applying ours (2026-09-24); if
 ## 3. Run
 
 ```bash
-.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 144 models, ~10 min
+.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 148 models, ~10 min
 cd ../demo/image_classification && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
     && ../../inference-scheduler/.venv/bin/python scripts/deploy_and_run.py --verbose
 cd ../mnist && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
@@ -97,7 +97,10 @@ MATMUL_OPTIMISATION §3b) — and ALWAYS after a kernel gains an AXI-Lite
 register: a register keeps its last written value across runs, so a
 project generated before the register exists inherits whatever the
 previous project left there (2026-09-25: stale demo projects ran with
-`b_packed = 1` left by the model set and mispredicted).  Run the demos
+`b_packed = 1` left by the model set and mispredicted).  The chat
+server's libraries too: `demo/chat/scripts/generate_llm_project.py` +
+`scripts/llm_board.py --install-only` per model, `demo/chat/deploy.py
+--regenerate` for its BERT project (demo/chat/README.md).  Run the demos
 and the model set SEQUENTIALLY — they share the kernels.  Local configs
 must name the VectorOP UIO `fabric_vecop` (the overlay's name after a
 clean boot; older boards showed `fabric`).

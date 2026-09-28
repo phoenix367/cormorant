@@ -263,6 +263,15 @@ cd inference-scheduler
     --check-only
 ```
 
+`--bit`, `--hwh`, `--dtbo`, `--overlay-name` and `--xclbinutil` override the
+matching `bitstream.*` config keys.
+
+The `bitstream.bit` of `bitstream_config_kv260.json` also names the
+bitstream the scheduler plans for: its id (first 12 hex digits of the
+SHA-256 of the flat image) selects the performance model
+`perf_models/kv260/<bitstream-id>.json` that `--plan` and
+`perf_calibrate.py` use (see [Calibration Campaign](#calibration-campaign-perf_calibratepy)).
+
 After a successful run, verify the UIO devices are up:
 
 ```bash
@@ -316,7 +325,7 @@ Remote prerequisites
     OK      make                         GNU Make 4.3
     OK      gcc                          gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
     OK      xrt headers                  xrt via pkg-config
-    OK      sudo / root access           passwordless sudo OK
+    OK      sudo / root                  passwordless sudo OK
     OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio0
 ```
 
@@ -380,7 +389,7 @@ Preserve remote build directories after the run so you can SSH in and inspect:
 | `PASSED` | All steps completed; `test_inference` printed `PASSED` |
 | `GENERATE_ERROR` | `inference_scheduler.py` failed locally |
 | `UPLOAD_ERROR` | SFTP transfer to the board failed |
-| `DRIVERS_ERROR` | Copying `remote.driver_dir(s)` on the board failed |
+| `DRIVERS_ERROR` | A `local.driver_dir(s)` path does not exist, or copying `remote.driver_dir(s)` on the board failed |
 | `BUILD_ERROR` | `cmake` or `make` failed on the board |
 | `RUN_ERROR` | `test_inference` ran but printed `FAILED` or exited non-zero |
 
@@ -480,7 +489,8 @@ KV260. Unlike `run_remote_tests.py`, it does **not** check numerical correctness
 
 The script:
 1. Assembles a self-contained C benchmark project locally from `bench_src/`
-   (four standalone binaries, one per kernel)
+   (four standalone binaries, one per kernel, plus `calib_runner` for
+   `perf_calibrate.py` when all four kernels' drivers are present)
 2. Uploads it to the board once, builds everything in one `cmake` + `make` pass
 3. Runs each test case as a separate binary invocation and parses the JSON output
 4. Prints a formatted table of latency (ms) and throughput (GB/s or GOps/s)
@@ -561,7 +571,7 @@ An optional `"warmup"` field overrides the per-kernel warmup for that case.
 | Field | Description |
 |-------|-------------|
 | `label` | Display name in the report |
-| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6. Any other value is rejected by `run_remote_perf.py` when it loads the cases (after the connection, preflight and build, before any case runs) with `config error: VectorOPKernel case '<label>': unsupported op=…`. |
+| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6. Any other value is rejected by `run_remote_perf.py` when it loads the cases (right after the config, before it connects to the board) with `config error: VectorOPKernel case '<label>': unsupported op=…`. |
 | `size` | Elements per inner kernel call |
 | `outer` | Outer loop count; `outer=1` is the non-broadcast case |
 | `a_inc` | Stride for A between outer iterations (`size` to advance, `0` to repeat) |
@@ -650,6 +660,16 @@ Reported metric: **GB/s** = `(x_bytes + y_bytes) / lat`.
 
 `--iters` overrides the per-case `iters` field for every case. `--warmup`
 overrides the per-kernel `warmup` for every case.
+
+#### Machine-readable results
+
+```bash
+.venv/bin/python run_remote_perf.py --config perf_config.json --json results.json
+```
+
+`--json OUT` also writes the results as a JSON list, one object per case:
+`kernel`, `label`, `fields` (the case's fields), `warmup`, `ok`, `lat_ms`
+and the metric (`gbs` or `gops`; `null` for a failed case).
 
 #### Preflight check (no benchmarks)
 
@@ -839,6 +859,34 @@ manually for interactive debugging.
 
 ---
 
+## Calibration Campaign (`perf_calibrate.py`)
+
+The optional planning mode (`inference_scheduler.py --plan`) prices its
+choices with a performance model of the loaded bitstream,
+`perf_models/kv260/<bitstream-id>.json` (`perf_models/README.md`).
+`perf_calibrate.py` makes it, once per bitstream: it builds the benchmark
+project of `run_remote_perf.py` (same config format; `calib_runner` needs all
+four kernels' drivers) and measures every kernel call of the shipped models
+and their MatMul tactics plus a space-filling set, twice.
+
+```bash
+.venv/bin/python perf_calibrate.py cases                  # the case list
+.venv/bin/python perf_calibrate.py run --config perf_config.json --stop-server
+.venv/bin/python perf_calibrate.py fit                    # the model + validation report
+# or all three: perf_calibrate.py all --config perf_config.json --stop-server
+```
+
+`run` checks that the board runs the bitstream the cases are for
+(`--board-bin`, default `/lib/firmware/pl.bin`), refuses to run while the
+chat server owns the kernels unless `--stop-server` (stops it and restarts
+it afterwards), and `--resume` keeps the measurements already taken.
+`cases --refine` adds the tactics the fitted model ranks near the best;
+`host` / `simulate` build the host-op model and compare predictions with
+board profiles.  Full workflow:
+[`doc/scheduler/INFERENCE_SCHEDULER.md` §Planning](../../doc/scheduler/INFERENCE_SCHEDULER.md#planning---plan).
+
+---
+
 ## Multi-Kernel Models (MatmulKernel + VectorOPKernel)
 
 Models that combine kernels (e.g., `MatMul → Relu`, `Add → MatMul`) need
@@ -911,7 +959,7 @@ Tracked templates (copy, then edit the copy):
 |-------------|--------|---------|
 | `bitstream_config_kv260.json.example` | `upload_bitstream.py` | Load Cormorant bitstream + xclbin + DTBO onto the board |
 | `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 148 models over all four kernels |
-| `perf_config.json` / `perf_config.json.example` | `run_remote_perf.py` | Performance benchmarks — 60 cases |
+| `perf_config.json` / `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 60 cases; the board config of the calibration campaign |
 
 Per-subset copies such as `remote_config_vectorop.json`, `remote_config_conv.json`
 or `remote_config_all_models.json` are local working files (not tracked):

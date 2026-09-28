@@ -266,6 +266,7 @@ Notable behaviour visible in the run:
 | `--check-only` | run preflight checks for every stage and exit (no SSH uploads, no inference) |
 | `--profile-layers` | build with `INFERENCE_PROFILING=ON` and print the per-layer wall-clock stats (also `run.profile_layers`) |
 | `--no-cleanup` (deploy script) | keep the remote work_dir for inspection |
+| `--plan` (generate script; also `--perf-model`, `--plan-report`, `--pool-budget-mib`) | planning mode ([`doc/plans/TACTICS_PLAN.md`](../../doc/plans/TACTICS_PLAN.md) §9): tactics and issue order from the bitstream's performance model, bit-identical results; or `"plan": true` in the config |
 | `--verbose` | also print the cmake / make output of steps that succeed (a failed step always prints its output) |
 
 Each script also accepts `--check-only` on its own, useful for quickly

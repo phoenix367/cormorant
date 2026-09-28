@@ -215,7 +215,7 @@ left untouched.
 | All six operations | `ADD`, `SUB`, `MUL`, `DIV`, `RELU`, `RELU6` |
 | Sizes | 1, 3, 8, 9, 13, 64, 255, 256, 1023, 1024, 4097 (partial tail words) |
 | Saturation | Positive / negative overflow boundary cases (`ap_fixed` only) |
-| Broadcast / geometry | chunk 12–13 at stride 16 (`a`- and `b`-advancing), `outer` 1000 × 16, stride-0 operand at (2048) and past (2100) the replay bound, multi-piece runs, runs > 16 × 256 words |
+| Broadcast / geometry | chunks 9, 12 and 13 at stride 16 (`a`- and `b`-advancing), `outer` 1000 × 16, stride-0 operand at (2048) and past (2100) the replay bound, multi-piece runs, runs > 16 × 256 words |
 | Fused activation | `act` = relu / relu6 on binary, `DIV`, unary and broadcast calls |
 
 `make gen_vectorop_test_data` re-runs the test in `--dump-data` mode to emit
@@ -254,11 +254,12 @@ when a dependent op needs the result.
 ## 9. Build Targets
 
 ```bash
-# C simulation (GCC, no Vitis)
+# C simulation (GCC + the Vitis HLS headers; no HLS tool run)
 make TestSimulation && ctest
 
 # HLS synthesis + IP export for KV260
 make synthesize_vectorop_kv260
+make behavior_test_vectorop      # Vivado xsim on the test stand; reads hw/test_data/vecop_test_data/
 ```
 
 The synthesis target reads a `platforms/<name>.json` (part, optional board
@@ -267,7 +268,7 @@ and clock — `kv260.json` sets 150 MHz) and invokes Vitis HLS via
 `solution1`), sets 64-bit AXI addresses and
 `-m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}` (no effect on the ports, which
 are declared 128-bit in the C++), runs `csynth_design`, and exports an
-IP-catalog archive to `build/kernels/vectorop/<platform>/ip_catalog`.
+IP-catalog archive to `build/kernels/vectorop/<platform>/ip_catalog.zip`.
 
 ---
 

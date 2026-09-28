@@ -25,7 +25,7 @@ disagree about what is in flight on each lane at any point.
 ```mermaid
 flowchart TD
     M([model.onnx]) --> OG["OnnxGraph<br/>src/graph.py<br/>parse · shape inference · Gemm rewrite"]
-    OG --> DAG["Dag<br/>src/schedule.py<br/>producer/consumer edges<br/>(§3)"]
+    OG --> DAG["Dag<br/>src/schedule.py<br/>producer/consumer + state edges<br/>(§3)"]
     DAG --> EVS["Event stream<br/>_compute_event_stream<br/>start · wait · drain · reshape · cpu<br/>(§4)"]
     EVS --> LI["Live intervals<br/>_compute_live_intervals<br/>(start_event, end_event) per tensor<br/>(§5)"]
     EVS --> EM["inference_run() body<br/>_inference_function<br/>(consumed verbatim)"]
@@ -69,7 +69,7 @@ To overlap correctly we need answers to:
 
 A producer/consumer DAG is the natural representation of (1). (2) and
 (3) fall out by walking that DAG with a small state machine — the
-event stream described in §3.
+event stream described in §4.
 
 ---
 
@@ -88,7 +88,7 @@ dataclasses (not subclasses of `ScheduledNode`) that share a
 | `ConvNode`, `MatmulConvNode`, `LlmAttnConvNode` | `"ConvKernel"` | `KERNEL_CONV` |
 | `PoolNode`      | `"PoolKernel"`       | `KERNEL_POOL`       |
 | `ReshapeNode`   | `""` (none)          | —                   |
-| `SpaceToDepthNode`, `HostNode` family (incl. the `axi.llm` `LlmNode`s) | `""` (none) | — (host CPU) |
+| `SpaceToDepthNode`, `HostNode` family (incl. the `axi.llm` `LlmNode`s and `VitNode`s) | `""` (none) | — (host CPU) |
 
 `ReshapeNode` covers `Reshape` / `Squeeze` / `Unsqueeze` / `Dropout` /
 `Flatten` / `Identity` (collectively `RESHAPE_OP_TYPES`) and a `Cast`
@@ -102,7 +102,8 @@ Three flavours, distinguished at DAG construction:
 
 - **External** — graph inputs, constant initializers, and persistent
   states (`src/numeric.py`) that no node of the graph produces. They have
-  no producing node and impose no edges.
+  no producing node and impose no producer edges (a state's accesses are
+  ordered by the state edges of §3.1).
 - **Intermediate** — produced by some node, consumed by zero or more.
   Candidates for buffer-pool reuse.
 - **Alias** — output of a `ReshapeNode` or a Slice view. Excluded from the
@@ -133,7 +134,8 @@ The walker keeps `pending: dict[lane → node_idx]`: which node has been
 ### 3.1 Edges
 
 Edge `u → v` iff some intermediate tensor produced by `u` is consumed
-by `v`. Construction is one pass:
+by `v`, plus the state edges below. Construction
+(`Dag.from_graph(graph, state_edges=True)`) is one pass:
 
 ```python
 producer:   dict[onnx_name → producing_node_idx]
@@ -150,9 +152,26 @@ for sn in graph.nodes:
         prod = producer[t.onnx_name]
         if prod != sn.index:
             edge(prod → sn)
+
+if state_edges:
+    _add_state_edges(graph, by_index)
 ```
 
-Two consequences worth flagging:
+**State edges.** A persistent state (`src/numeric.py`, e.g. a KV cache)
+is read by some nodes and updated in place by others (`state_updates()`,
+e.g. the attention-prep ops that write the K / V caches, or a node whose
+output is the state).  `_add_state_edges` walks `graph.nodes` in list order
+and, per state, adds a **RAW** edge from the last writer to each later
+reader, a **WAR** edge from each reader since the last write to the next
+writer, and a **WAW** edge between consecutive writers.  So any order that
+respects the DAG keeps every state access where the list put it — which is
+what lets the `--plan` order search (§4.2) move nodes.  The frontends'
+list orders already respect every state edge, so the edges add no wait to
+the generated code (`test_planning.py::TestStateEdges`, which checks the
+edges on the tiny Llama / ViT graphs and the unchanged event stream);
+`state_edges=False` gives the data-flow edges only.
+
+Two consequences of the producer edges worth flagging:
 
 - A `Conv` reading its constant weight has zero predecessors *from the
   weight*: weights are external. The Conv is still ordered after any
@@ -209,7 +228,14 @@ strict chain comes out exactly as the source ONNX laid it out.
 This is the only place where the parallel schedule is decided. Both
 the body emitter (`_inference_function`) and the live-interval
 analyser (`_compute_live_intervals`) consume the events verbatim, so
-they cannot disagree about which lanes are in flight at any point.
+they cannot disagree about which lanes are in flight at any point; the
+report's cross-lane count and the planner's timed replay
+(`src/codegen/timing.py`) read the same stream.
+
+`_compute_event_stream(order=None, dag=None)` walks `graph.nodes` by
+default.  The `--plan` order search (`src/order_search.py`) passes a
+candidate `order` (node indices) and the `dag` of the original list, so it
+can price an order before applying it.
 
 ### 4.1 Effective predecessors (Reshape pass-through)
 
@@ -259,7 +285,7 @@ then MaxPool and Mul on the alias) for a 3-deep test case.
 
 ### 4.2 Per-node procedure
 
-For each `sn` in `graph.nodes` (graph order):
+For each `sn` in `graph.nodes` (list order, or `order` when given):
 
 ```
 emit ('comment', sn.index)
@@ -298,8 +324,8 @@ else:
     pending[target] = sn.index
 
 # (after the loop)
-for lane_, drained in pending.items():       # final drain
-    emit ('drain', lane_, drained)
+for lane_ in sorted(pending):                # final drain
+    emit ('drain', lane_, pending[lane_])
 ```
 
 As a flowchart:
@@ -307,7 +333,7 @@ As a flowchart:
 ```mermaid
 flowchart TD
     A([next sn in graph.nodes]) --> EMC["emit ('comment', sn.index)"]
-    EMC --> RX{"isinstance(sn, ReshapeNode)?"}
+    EMC --> RX{"ReshapeNode or Slice view?"}
     RX -->|Yes| RXemit["emit ('reshape', sn.index)"]
     RXemit --> A
 
@@ -323,10 +349,13 @@ flowchart TD
 
     EmitW["for (lane, drained) in queued_waits:<br/>  emit ('wait', lane, drained)<br/>  pending.pop(lane)"]
 
-    EmitW --> Sync{"is_synchronous(sn)?<br/>(MatmulNode 4D×3D)"}
+    EmitW --> Cpu{"host-CPU node?<br/>(SpaceToDepthNode / HostNode)"}
+    Cpu -->|Yes| CpuEmit["emit ('cpu', sn.index)"]
+    Cpu -->|No| Sync{"is_synchronous(sn)?<br/>(MatmulNode 4D×3D)"}
     Sync -->|Yes| StartSync["emit ('start_sync', sn.index)<br/>pending.pop(target)"]
     Sync -->|No| StartReg["emit ('start', sn.index)<br/>pending[target] = sn.index"]
 
+    CpuEmit --> A
     StartSync --> A
     StartReg --> A
 
@@ -334,7 +363,7 @@ flowchart TD
     Drain --> END([end of stream])
 
     classDef decision fill:#fff5cc,stroke:#cc9
-    class RX,TW,Sync decision
+    class RX,TW,Cpu,Sync decision
 ```
 
 Properties of this scheme worth internalising:
@@ -345,12 +374,19 @@ Properties of this scheme worth internalising:
   reason (e.g. an earlier consumer's wait), no extra wait fires. This
   is what makes a single shared producer's lane drain *once* even
   when many parallel consumers depend on it.
-- Walking `graph.nodes` in source order is sufficient — the order is
-  already a valid topological order (ONNX requires it). We do not
-  reorder for parallelism gain; we only refrain from inserting waits
-  that aren't required. Adding a list-scheduling reorder would
-  strictly only lengthen overlap windows; it has not been needed for
-  correctness on any model so far.
+- Walking `graph.nodes` in list order is sufficient — the order is
+  already a valid topological order (ONNX requires it). The walk never
+  reorders; it only refrains from inserting waits that aren't required.
+  By default the list is the model's node order.  With `--plan`,
+  `order_search.plan_order` may replace it before code generation: a
+  local search moves kernel starts earlier past nodes they do not depend
+  on (the DAG of the original order, state edges included), priced by the
+  timed replay of this event stream; the new order is kept only if the
+  simulated total drops by at least 0.5 % and the intermediates' pool stays
+  within `--pool-budget-mib` (default: the unplanned pool).  An applied
+  order renumbers the nodes 0..n-1 in the new order
+  (`order_search.apply_order`), so generated names and the profiler's
+  layer table follow it.
 
 ### 4.3 Synchronous nodes
 
@@ -361,7 +397,10 @@ helper itself polls `IsDone`. The walker treats such nodes as
 self-draining: it emits `start_sync`, then immediately removes the
 target lane from `pending` (it is never observed in flight).
 
-`run_matmul_at` is the **only** synchronous helper today.
+`run_matmul_at` is the **only** synchronous helper today.  A MatMul on
+ConvKernel with several calls (per batch item, or a row split) is an
+ordinary `start`: its `run_conv_at()` loop waits on `KERNEL_CONV` before
+each call after the first and leaves the last one in flight.
 
 A `SpaceToDepthNode` (the space-to-depth stem's host-side reorder) is
 synchronous in the same sense but occupies no lane: it waits on its
@@ -693,10 +732,12 @@ lane still busy?". Tested against
   well-formed graphs) gets `end_ei = drain_event[producer]`, which is
   set by the final drain. The slot is held until the run ends — safe
   but conservative.
-- **Non-deterministic graph orders.** ONNX guarantees nodes are
-  topologically ordered. The codegen does **not** reorder; it only
-  inserts waits. A future list-scheduling extension should preserve
-  this property (or document any divergence).
+- **Graph orders.** ONNX guarantees nodes are topologically ordered.
+  The codegen does **not** reorder; it only inserts waits.  The one
+  reordering is the opt-in `--plan` issue-order search (§4.2), which
+  replaces the node list before code generation with another
+  topological order of the DAG (state edges included), so every
+  invariant of §9 holds for it too.
 
 ---
 
@@ -711,16 +752,19 @@ lane still busy?". Tested against
 | ReshapeNode chains do not orphan the source's interval | `resolve_alias_chain` in §5.2 | `test_nop_corner_cases.py::TestNopChainDropoutFork::test_walk_traverses_full_chain` |
 | Profiler brackets recorded correctly under overlap | per-layer `begin_ns` slot | `test_profiler_overlap.py` |
 | Synchronous nodes self-drain their lane | `start_sync` removes target from `pending` | covered indirectly by every Matmul-only model in the fixture set |
+| State accesses keep their list order in any DAG order | RAW / WAR / WAW state edges (`_add_state_edges`) | `test_planning.py::TestStateEdges` |
+| Any DAG-respecting order computes the same bits | event stream + liveness recomputed for the new list | `test_planning.py::TestReorderedCode::test_random_orders_bit_exact` (host emulation) |
 
 ---
 
 ## 10. Future work
 
-- **List-scheduling reorder.** The current walk is non-reordering: it
-  preserves graph order and only refrains from inserting unnecessary
-  waits. A genuine list scheduler that hoists ready ops earlier could
-  open longer overlap windows on models like Inception. Any such
-  extension must preserve all invariants in §9.
+- **List-scheduling reorder.** The walk itself is non-reordering.  The
+  opt-in `--plan` mode already searches the issue order locally
+  (`src/order_search.py`, §4.2, priced by the performance model); a
+  default-on list scheduler that hoists ready ops earlier could open
+  longer overlap windows on models like Inception. Any such extension
+  must preserve all invariants in §9.
 - **Multiple instances per kernel.** If the bitstream ever provides
   two ConvKernels, the walker would need a per-instance `pending` map
   and a node→instance assignment policy. The DAG itself would not

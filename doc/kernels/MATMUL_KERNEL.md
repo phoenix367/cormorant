@@ -184,8 +184,9 @@ what makes HLS duplicate the RAMs or fall to II=2 — CONV_OPTIMISATION.md
 §2.35). `acc` is fully partitioned so all `kTileN·kTileM` accumulators are
 independent registers.
 
-The kernel is **not** a `DATAFLOW` design — it is a single sequential loop
-nest with each load / reduce / write loop pipelined at II=1; the B
+The tiled path is **not** a `DATAFLOW` design (the GEMV path, §4, is) — it
+is a single sequential loop nest with each load / reduce / write loop
+pipelined at II=1; the B
 prefetch overlaps DDR traffic with the MACs *inside* the K-loop rather
 than through a second process (the DATAFLOW form was measured and
 rejected, MATMUL_OPTIMISATION.md §2).
@@ -430,7 +431,12 @@ auto`, the default; `always` / `off`): a constant B then stays row-major
 names it, is emitted in ConvKernel's kw image.  `src/llm_entries.py` uses
 that for the Llama projects: the prefill buckets choose power-of-two kernel
 widths, the decode and head graphs read the same images, and the project
-keeps one copy of every weight (SmolLM2-135M: CMA pool 488 → 286 MiB).
+keeps one copy of every weight (SmolLM2-135M: CMA pool 488 → 286 MiB,
+2026-09-27, MATMUL_OPTIMISATION.md §8b).  With `--plan` the tiled / GEMV
+choice is priced by the calibrated performance model instead of
+`cost_model`, and `llm_entries.plan_shared_kw` picks each shared weight's
+kernel width by predicted time (INFERENCE_SCHEDULER.md "Planning
+(`--plan`)").
 
 `Gemm` is **not** a matmul node directly — `OnnxGraph._preprocess_model()`
 decomposes `Gemm` into `MatMul` + optional `Add` at model-load time, so the
@@ -438,11 +444,11 @@ MatmulKernel only ever sees plain `MatMul`.
 
 Not every `MatMul` runs here: `src/matmul_lowering.py` replaces a
 `MatmulNode` by a `MatmulConvNode` (ConvKernel with swapped operand roles)
-wherever the cost model estimates ConvKernel to be faster
-(`--matmul-on-conv auto`, the default; `always` / `off`), bit-identical
-either way.  Batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16
-rows and the 4-D × 3-D outer loops stay on MatmulKernel
-(`doc/plans/BERT_PLAN.md` §2 2A).
+wherever the cost model (with `--plan`, the calibrated performance model)
+estimates ConvKernel to be faster (`--matmul-on-conv auto`, the default;
+`always` / `off`), bit-identical either way.  Batch-1 FC layers,
+`K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows and the 4-D × 3-D outer
+loops stay on MatmulKernel (`doc/plans/BERT_PLAN.md` §2 2A).
 
 The code-generated `run_matmul()` writes the AXI-Lite registers and calls
 `XMatmulkernel_Start()` non-blocking; `run_matmul_at()` (used inside the
@@ -511,13 +517,14 @@ uses is `build/kernels/matmul/<name>/matmul_<name>/hls/impl/ip`).
 | **II=1 mechanism** | Accumulator lane rotation `n1 = ki % kTileN` (RAW distance = `kTileN`) |
 | **Short n_tiles** | K-split: 4 / 2 lanes per row when `n_valid = 1 / 2`, lanes folded after the k_tile loop |
 | **Architecture** | Single sequential tiled loop nest (not `DATAFLOW`); B block prefetch folded into the K-loop |
+| **GEMV streaming** | `gemv_kw` = 1 / 2 / 4 / 8: one A row against B streamed once through both read ports, in ConvKernel's kw image; a five-process `DATAFLOW` region, `kGemvMaxM` = 4096 columns per pass (§1, §4) |
 | **On-chip buffers** | `a_buf` (BRAM), `b_tile` (BRAM, two banks — next block prefetched under the K-loop), `acc` (registers) |
 | **A reuse** | `a_buf` loaded once per `n_tile` (row requests batched 4 deep), reused across all `m_tile`/`k_tile` |
 | **B reuse** | single-block B (`m ≤ kTileM`, `k ≤ kTileK`) loaded once per batch slice (once per call when it broadcasts) |
 | **Batch broadcasting** | `a_batch_stride` / `b_batch_stride` = 0 reuses A / B |
 | **Inner-dimension limit** | `k ≤ kMaxK` (4096, compile-time); `n` / `m` / `batch` unbounded |
 | **AXI master ports** | 3 (gmem0 `a` and gmem1 `b`: 128-bit `burst_maxi`; gmem2 `c`: 16-bit) |
-| **AXI-Lite registers** | 11 scalars/pointers (`b_packed` last, offset `0x6C`) + `return` |
+| **AXI-Lite registers** | 13 scalars/pointers (`b_packed` 0x6C, `gemv_kw` 0x74, 64-bit `a_to_b` 0x7C last) + `return` |
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` at the C-write |
 | **AXI-Lite base address** | `0xA001_0000` |
 | **Driver prefix** | `xmatmulkernel` |

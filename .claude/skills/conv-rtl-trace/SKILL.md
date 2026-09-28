@@ -22,8 +22,9 @@ case is ~0.5 ms simulated ≈ 2 min).
 
 ```bash
 # from the repo root; BUILD_DIR as in conv-verify (default build/)
-make -C build gen_conv_test_data                     # refresh dumps
-scripts/make_fixture.sh build 21 /tmp/trace_fixture  # one case → dir
+S=.claude/skills/conv-rtl-trace/scripts
+make -C build gen_conv_test_data                  # refresh dumps
+$S/make_fixture.sh build 21 /tmp/trace_fixture    # one case → dir
 ```
 
 `make_fixture.sh <build-dir> <test-index> <out-dir>` copies that case's
@@ -32,7 +33,7 @@ four hex files and a 2-line-header manifest into `<out-dir>`.
 ## 2. Run the verbose testbench
 
 ```bash
-scripts/run_trace.sh build /tmp/trace_fixture /tmp/trace.log
+$S/run_trace.sh build /tmp/trace_fixture /tmp/trace.log
 ```
 
 This runs `make -C hw/cormorant_test_stand tb-conv` with `TS_VERBOSE=1`
@@ -44,7 +45,7 @@ source changed.  The report goes next to the log.
 ## 3. Analyse
 
 ```bash
-python3 scripts/analyze_trace.py /tmp/trace.log
+python3 $S/analyze_trace.py /tmp/trace.log
 ```
 
 Prints, per test in the log:
@@ -64,9 +65,11 @@ Prints, per test in the log:
 ## Reading the numbers
 
 Compare against the cycle model (`conv-cycle-model` skill) for the same
-geometry: compute ≈ pixels · groups · (G·kh·kw + 2G + 6), fill ≈ weights
-/ 8 per (chunk, ict, owt, mg), drain = outputs at 1/cycle, writer ≈ drain
-unless bursts are shorter than 16 beats.  Anything the model does not
+geometry (§2.42): compute ≈ pixel pairs · G · max(kh·kw, 2) per (ict,
+owt, M-group) plus a ~12-cycle ramp, fill ≈ weights / 8 per slab (hidden
+under the previous slab's sweep except the first, §2.35), drain ≈ one
+8-channel word per cycle (§2.38), writer ≈ drain unless bursts are
+shorter than 16 beats.  Anything the model does not
 explain shows up here as a spacing or an in-flight count.
 
 ## Board hangs

@@ -13,8 +13,9 @@ board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  The study
 stage is reproducible from pinned checkpoints and texts, with the formats
 hashes recorded (`llm_calibrate.py`, §21).  SmolVLM-256M (image input): numeric
 study GO (§22), then implemented — bit-exact on the board, 3.9 s per image
-(7.7 s at first, §24) + ~9.5 tok/s, served by the chat server with OpenAI
-image_url parts (§23).  Not done:
+(7.7 s at first, §24; 3.84 s built with `--plan`, TACTICS_PLAN.md §9) +
+~9.5 tok/s, served by the chat server with OpenAI image_url parts (§23).
+Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).

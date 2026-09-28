@@ -1,6 +1,8 @@
 # Tactics plan — planning from calibrated performance models
 
-Date: 2026-09-28.  Status: **proposed, not started.**
+Date: 2026-09-28.  Status: **T0–T4 done and measured on the board (§9); T5
+reduced to the verification tool** — the simulator already predicts every
+measured workload within 2 %.
 
 Goal: an **optional** planning mode (`--plan`) in which the scheduler
 chooses each node's implementation (its *tactic*) and the issue order
@@ -250,11 +252,13 @@ Order search, under `--plan`:
 
 | entry point | switch |
 |---|---|
-| `inference_scheduler.py`, `OnnxGraph` | `--plan` / `plan=True`, `--perf-model FILE`, `--plan-report`, `--pool-budget-mib`, `--entry-weights` |
-| `demo/chat/scripts/generate_llm_project.py` | `--plan` (passed to every entry) |
+| `inference_scheduler.py`, `OnnxGraph` | `--plan` / `plan=PlanOptions(...)`, `--perf-model FILE`, `--plan-report`, `--pool-budget-mib`, `--entry-weights` |
+| `demo/chat/scripts/generate_llm_project.py` | the same options (passed to every entry) |
 | `demo/chat/deploy.py --regenerate` (BERT) | `--plan` |
-| demo `deploy_and_run.py` scripts | `--plan`, or `"plan": true` in the demo's config JSON |
-| chat server configs | `"plan": true` per backend, used when its project is (re)generated |
+| demo `generate_project.py` scripts (BERT, image classification, camera, MNIST) | the same options, or `"plan"` in the demo's config JSON (`true` or an object with those keys) |
+
+(As built.  The design listed `deploy_and_run.py` and a per-backend chat
+config key; planning happens at generation, so it sits in the generators.)
 
 The generated project records the plan: the model file's id and the chosen
 tactics and order, in the report and the `inference.c` header.  A build can
@@ -304,3 +308,138 @@ structure, and it stays equal to the conv-cycle-model skill script
 - **Who runs the campaign:** proposed, a `make` target / script run
   together with the bitstream build and board bring-up, its model file
   committed with the hw submodule bump.
+
+## 9. Results (2026-09-28, bitstream caa67f49a5a3 = hw_128 d7ce129)
+
+Where the implementation differs from §4, this section says so.
+
+**T0 — prerequisites.**
+- **Planning options:** `--plan`, `--perf-model`, `--plan-report`,
+  `--pool-budget-mib` and `--entry-weights` (`src/planning.py`).  They are
+  accepted by `inference_scheduler.py`, `generate_llm_project.py`, the
+  four demo `generate_project.py` scripts (or `"plan"` in their config) and
+  `deploy.py --regenerate --plan`.
+- **Kernel calls:** every kernel node describes its calls with
+  `kernel_calls()` (`src/perf_calls.py`).  `test_perf_calls.py` checks them
+  against the emitted C on 480 builds of the test models.
+- **State edges:** the DAG has read-after-write, write-after-read and
+  write-after-write edges for persistent states (`state_updates()`, host
+  caches included).  Today's event streams are unchanged by them: 161 test
+  graphs (160 test models and the tiny ViT), SmolVLM and SmolLM2-135M byte-identical.
+- **Bitstream id:** the SHA-256 of the flat `.bin`, computed locally from
+  the `.bit` and on the board from `/lib/firmware/pl.bin`.
+- **Perf runner:** `run_remote_perf.py --json`.
+
+**T1 — calibration** (`perf_calibrate.py`, `bench_src/calib_runner.c`).
+- **Runner:** instead of one SSH run per case, one board process times a
+  whole batch.  Each call is timed alone (register writes → done), with
+  no cache maintenance.
+- **Cases:** 1087 calls — every kernel call of the 9 shipped models plus
+  the analytic model's 3 best conv plans per row count of every MatMul,
+  and 569 grid calls from synthesised ONNX graphs, legal by construction.
+  A refinement pass added 101 more (below).
+- **Board time:** two passes of 90 s each, and about 10 minutes of
+  chat-server downtime with the build.
+- **Determinism:** each call is measured twice, in another order and with
+  other buffer contents.  The median spread is 0.017 %, the maximum 3.8 %;
+  27 calls exceed 0.5 %, all of them a few tens of µs long.
+- **Family models** (`src/perf_model.py`, `src/perf_fit.py`): a
+  non-negative linear fit over the analytic model's terms, times a
+  k-nearest-neighbour correction learned from the residuals (the board's
+  timing has local structure no global formula captured).  Held-out
+  relative error:
+
+  | family | median | p90 |
+  |---|---:|---:|
+  | mm-gemv | 0.01 % | 0.2 % |
+  | vecop | 0.15 % | 12.7 % |
+  | vecop-div | 5.4 % | 9.6 % |
+  | conv (standard) | 6.3 % | 36.9 % |
+  | pool | 7.8 % | 13.6 % |
+  | mm-tiled | 9.3 % | 19.8 % |
+  | conv-mm (MatMul on ConvKernel) | 10.3 % | 35.9 % |
+  | conv-dw | 10.8 % | 25.2 % |
+
+  **The §4.3 target of 3 % is met only for GEMV.**  The ConvKernel
+  families mostly run slower than the RTL-level cycle model where weight
+  tiles arrive as many short bursts: a 1001 × 1024 FC as a 1×1 conv takes
+  8.8 ms against the model's 1.4 ms.  Features for burst counts, fill /
+  sweep overlap and a log-space correction did not close the gap.
+- **Consequence for the planner** (§4.1 changed): measured calls decide.
+  A tactic priced by a family model may replace a choice only when that
+  family's held-out p90 is at most 5 % (`perf_model.MAX_MODEL_ERROR`), and
+  the p90 band must separate the two.
+- **Refinement:** `perf_calibrate.py cases --refine` adds the
+  unmeasured tactics the models rank near each shipped MatMul's best;
+  `run --resume` measures them (101 calls in 10 s).  1188 exact calls in
+  all.
+
+**T2 — planned tactics.**  Board gates bit-exact for all four libraries.
+
+| project | change | board |
+|---|---|---|
+| SmolVLM vision | 12 fc1 layers: 2 × 512 rows kw 6 → 4 × 256 rows kw 4 (both measured) | `llm_image` 3885 → 3844 ms (−1.1 %); vision MatMuls 2002 → 1949 ms, as predicted |
+| SmolLM2-135M, first plan | 60 prefill-16 MatMuls to an unmeasured geometry the conv-mm model priced at under 1.5 ms | no gain (prefill 16: 339.8 → 340.1 ms); the call takes 2.2 ms.  This is what led to the trust rule and the refinement pass |
+| SmolLM2-135M, after refinement | prefill 64: 30 down projections `out_w` 64 → 16 (measured 1946 → 1839 µs) | predicted −3 ms of 442; not run on the board |
+| BERT, CNNs | no MatMul choice changes | — |
+
+The joint kernel width over the prefill buckets and decode (weights: decode
+64, head 64, prefill 1) keeps kw 4 for all 210 shared SmolLM2 weights.
+
+**T3 — host-op models and simulator** (`src/host_model.py`,
+`src/codegen/timing.py`, `perf_calibrate.py host / simulate`).
+- **Host model:** 56 exact signatures and 27 op kinds, from the board
+  profiles of SmolVLM, SmolLM2-135M, BERT and the three CNNs.
+- **Simulator against the board:**
+
+  | workload | predicted | measured | error |
+  |---|---:|---:|---:|
+  | SmolVLM `llm_image` | 3914.5 ms | 3885.4 ms | +0.7 % |
+  | SmolVLM prefill 16 / 64 / 256 | 339.8 / 445.5 / 1281.9 ms | 339.2 / 440.9 / 1278.9 ms | +0.2 / +1.0 / +0.2 % |
+  | SmolVLM decode step | 100.4 ms | 100.8 ms | −0.4 % |
+  | SmolLM2-135M prefill 16 / 64 / 256, decode | 339.8 / 445.5 / 1281.9 / 100.3 ms | 339.8 / 442.0 / 1284.7 / 101.4 ms | 0.0 / +0.8 / −0.2 / −1.0 % |
+  | BERT inference (p50 of the profiled run) | 965.5 ms | 963.0 ms | +0.3 % |
+  | ResNet-18 | 60.0 ms | 60.3 ms | −0.5 % |
+  | MobileNet v1 / v2 | 81.4 / 62.9 ms | 81.0 / 63.9 ms | +0.5 / −1.6 % |
+
+- **Report:** `--plan-report` (or `--plan`) adds a "Planning" section to
+  `report.md` (predicted total, lane busy times, where the CPU waits).
+
+**T4 — order search** (`src/order_search.py`, on under `--plan`).
+- **Search:** local search from the given order; it moves kernel starts
+  earlier past nodes they do not depend on, against the DAG of the
+  original order.  The new order is kept if the simulated total drops by
+  0.5 % or more and the intermediates' pool (with slot reuse) stays within
+  the budget.
+- **BERT:** 48 moves, 965.5 → 949.9 ms simulated.  On the board, p50
+  **962.3 → 951.3 ms (−1.1 %)**, bit-exact.
+- **SmolLM2 prefill, SmolVLM vision:** no better order.  The frontends'
+  hand-written orders are already locally optimal.
+- **Host-op chunking:** `VitFrontend(attn_split=R)` splits every head's
+  softmax and P.V into R query-row parts.  It is bit-exact in simulation
+  and on the host emulation, but simulates no faster (3869.7 against
+  3860.8 ms).  With one call per lane and the CPU issuing only between
+  host ops, the waits move rather than disappear.  Not used by `--plan`.
+- **Safety test:** random valid orders of mixed models run bit-exact on
+  the host emulation (`test_planning.TestReorderedCode`).
+- **Without `--plan`:** SmolLM2 projects stay byte-identical.  SmolVLM's
+  differ only in the vision softmax helper, now taking a column range;
+  whole and in two halves it is identical to the old loop on x86 and on
+  the board's NEON path (4 exponents × 5 shapes × 5 value ranges).
+
+**T5 — reduced.**
+- **Verification:** `perf_calibrate.py simulate --profile MODEL=RESULTS`
+  compares predicted and measured phases, the §4.5 check.
+- **Not needed yet:** contention factors (every workload is already
+  within 2 %) and a serial profiling mode (it would change every
+  project's profiling code).
+
+**Still open:**
+- **Model accuracy:** the ConvKernel family models (and the ≤ 3 %
+  target).
+- **Tactics not yet available:** the swapped P.V operands (1.96 against
+  3.42 ms per head), host threads / grain, and the conv rewrites as
+  tactics.
+- **Deploying the planned builds:** the planned SmolVLM (−1.1 % per image)
+  and BERT (−1.1 %) libraries are measured but not deployed.  Regenerate
+  with `--plan` to use them.

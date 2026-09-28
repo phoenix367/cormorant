@@ -24,6 +24,7 @@ cmake ../
 # C simulation tests (no hardware needed; they need the Vitis HLS headers)
 make TestSimulation    # VectorOPKernel
 make TestConvRef       # ConvKernel
+make TestConvGrid      # ConvKernel MAC grid (include/ConvMacGrid.h) alone
 make TestMatmulRef     # MatmulKernel
 make TestPoolingSim    # PoolingKernel
 ctest                  # run all
@@ -113,8 +114,8 @@ emits a complete C project that drives up to four hardware kernels:
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
 | (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
 | (host CPU) | `Softmax` (last axis; opset < 13 coerce-to-2-D), `LayerNormalization`, `Gelu` (tanh / erf), `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0, int ids), `OneHot`, `Cast` (int ↔ Data_t) — `src/host_nodes.py`: double math, round-half-even + saturate write-back, staged through cached memory.  TF-style LayerNorm and GELU tanh / erf subgraphs are fused into single host nodes by `src/fusion.py` (`OnnxGraph(fuse_patterns=True)`, library + CLI default); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` / `Tanh` / `Erf` is rejected.  Integer tensors (ids, masks) are raw int16 in `inference_buf_t`.  BERT-base (bertsquad-12) generates — see `doc/plans/BERT_PLAN.md` |
-| (host CPU, Llama decoders) | domain `axi.llm`: `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd` (float32 residual), `LlmAttention` (RoPE + KV-cache write + causal GQA attention, one float region), `LlmSiluMul`, `LlmSelectRow`, `LlmDequant` — `src/llm_nodes.py`; the graphs come from the Llama frontend `src/llama.py` (config.json + safetensors + calibrated formats → decode / prefill_<T> / head entries) with power-of-two exponents, host tensors and states in the model's `axi.numeric` metadata (`src/numeric.py`).  SmolLM2-135M → `libsmollm2.so`, SmolLM2-360M → `libsmollm2_360m.so` — see `doc/plans/CHAT_PLAN.md` §13, §20 |
-| (host CPU, vision encoder) | domain `axi.llm`: `VitEmbedAdd`, `VitLayerNorm`, `VitResAdd`, `VitAttnPrep`, `VitAttnSoftmax`, `VitGelu`, `VitPixelShuffle`, `VitSumDequant` — `src/vit_nodes.py`; q·Kᵀ / P·V on ConvKernel (`LlmAttnConvNode`, static keys); the `vision` entry from `src/vit.py` (SigLIP-style ViT + Idefics3 connector → image-feature state that the text model's prefill `LlmEmbed` reads for ids V + k).  SmolVLM-256M → `libsmolvlm_256m.so` (`llm_image()`) — see `doc/plans/CHAT_PLAN.md` §22, §23 |
+| (host CPU, Llama decoders) | domain `axi.llm`: `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd` (float32 residual), `LlmAttention` (RoPE + KV-cache write + causal GQA attention, one float region; decode), `LlmSiluMul`, `LlmSelectRow`, `LlmDequant`, and prefill attention on the FPGA: `LlmAttnPrep`, `LlmAttnScores` / `LlmAttnPV` (q·Kᵀ / P·V on ConvKernel, `LlmAttnConvNode`), `LlmAttnSoftmax`, `LlmAttnMerge` — `src/llm_nodes.py`; the graphs come from the Llama frontend `src/llama.py` (config.json + safetensors + calibrated formats → decode / prefill_<T> / head entries) with power-of-two exponents, host tensors and states in the model's `axi.numeric` metadata (`src/numeric.py`).  SmolLM2-135M → `libsmollm2.so`, SmolLM2-360M → `libsmollm2_360m.so` — see `doc/plans/CHAT_PLAN.md` §13, §16, §20 |
+| (host CPU, vision encoder) | domain `axi.llm`: `VitEmbedAdd`, `VitLayerNorm`, `VitResAdd`, `VitAttnPrep`, `VitAttnSoftmax`, `VitGelu`, `VitPixelShuffle`, `VitSumDequant` — `src/vit_nodes.py`; q·Kᵀ / P·V on ConvKernel (`LlmAttnConvNode`, static keys); the `vision` entry from `src/vit.py` (SigLIP-style ViT + Idefics3 connector → image-feature state that the text model's prefill `LlmEmbed` reads for ids V + k).  SmolVLM-256M → `libsmolvlm_256m.so` (`llm_image()`) — see `doc/plans/CHAT_PLAN.md` §22–§24 |
 
 ```bash
 cd inference-scheduler
@@ -131,6 +132,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_parallel_models.py
 .venv/bin/python test/gen_bert_models.py      # tiny BERT-like fixtures (host ops, fusion)
 .venv/bin/python test/gen_llama_models.py     # tiny random Llama (decoder ops, exponents; imports demo/chat/scripts/llm_study.py)
+# (or all of the above at once: .venv/bin/python test/gen_all_models.py)
 
 # Run the scheduler on a model
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
@@ -139,23 +141,25 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1517 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1547 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 
 Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
-- **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`
-- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry; ConvKernel (conv-cycle-model port) and MatmulKernel (board-calibrated) cycle estimates
+- **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`, `SpaceToDepthNode`; every kernel node lists its calls with `kernel_calls()` (`src/perf_calls.py`)
+- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry (`conv_plans`, incl. the row split of accumulator-limited MatMuls); ConvKernel (conv-cycle-model port) and MatmulKernel (board-calibrated) cycle estimates
 - **`inference-scheduler/src/matmul_gemv.py`** / **`src/llm_entries.py`** — MatmulKernel GEMV streaming pass (`MatmulNode.gemv_kw`); the Llama entry graphs that let decode read the prefill weight images (one copy per weight)
 - **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side
 - **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations
-- **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (predecessors, topological order, independent pairs)
+- **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (tensor edges plus RAW / WAR / WAW edges of persistent states; predecessors, topological order, independent pairs)
 - **`inference-scheduler/src/numeric.py`** — `axi.numeric` metadata: per-tensor / per-channel power-of-two exponents (constant MatMul weights at the rank-1 exponent `f_w = f_out + 8 − f_in`), host-memory tensors (f32 / i32 / i16), persistent states
 - **`inference-scheduler/src/llama.py`** / **`src/llm_nodes.py`** — Llama frontend and the `axi.llm` host ops (numpy reference + C helpers)
+- **`inference-scheduler/src/vit.py`** / **`src/vit_nodes.py`** — vision-encoder frontend (`VitFrontend`, the `vision` entry) and its `Vit*` host ops
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake); `multi.py` — multi-entry projects (CLI `--entry NAME=MODEL.onnx`: weights deduplicated by name + image, states shared, intermediates overlapping)
+- **Planning (`--plan`, optional)** — `src/planning.py`, `tactics.py`, `perf_calls.py`, `perf_model.py` / `perf_fit.py` / `host_model.py`, `order_search.py`, `codegen/timing.py`: MatMul tactics and the issue order chosen from per-bitstream performance models measured once on the board (`perf_calibrate.py`, `perf_models/kv260/`); bit-identical results; without `--plan` every choice is unchanged — see `doc/plans/TACTICS_PLAN.md` §9
 
 See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
 

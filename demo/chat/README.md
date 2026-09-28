@@ -7,20 +7,26 @@ kernels, so existing clients — `curl`, the `openai` SDK, `llm`, `aichat` —
 and our own zero-install `chat.py` talk to the board directly.  Plan and
 decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md).
 
-Two backends:
+Three FPGA backends (plus `echo`, protocol only):
 
 * **`bert-squad`** (phase 1): BERT-base fine-tuned on SQuAD (the
-  [`bert_squad/`](../bert_squad/) demo's model, 971 ms per 256-token window
+  [`bert_squad/`](../bert_squad/) demo's model, 962 ms per 256-token window
   on the board, logits bit-exact with the scheduler simulation).  BERT is an
   extractive model — it cannot write free text — so the chat is **question
   answering over a document you supply**: the reply is the passage of the
   document that answers the question.
-* **`smollm2-135m-instruct`** (phases 3–5, [below](#generative-chat--smollm2-135m-instruct)):
+* **`smollm2`** (phases 3–5, [below](#generative-chat--smollm2-135m-instruct)):
   **generative chat** with SmolLM2-135M-Instruct — multi-turn, streamed token
   by token.  `libsmollm2.so` runs the model on the FPGA kernels and the A53
   (~10 tokens/s decode, 256-token prefill 1.3 s, logits bit-exact with the
   scheduler simulation); tokenizer, chat template, sampling and prefix
-  cache run in the server process.
+  cache run in the server process.  The same backend serves
+  [SmolLM2-360M-Instruct](#smollm2-360m-instruct-instead-of-135m)
+  (`libsmollm2_360m.so`, ~3.9 tokens/s); the model id is the library's.
+* **`smolvlm`** ([below](#smolvlm-256m-instruct--chat-about-images)):
+  SmolVLM-256M-Instruct, questions about images (`libsmolvlm_256m.so`; the
+  vision encoder takes 3.9 s per image, CHAT_PLAN §24).  The board serves it
+  next to SmolLM2-360M and BERT (CHAT_PLAN §23).
 
 ```
  laptop / board shell                          KV260 (Ubuntu 22.04, Python 3.10 stdlib)
@@ -32,11 +38,14 @@ Two backends:
                                               │   WordPiece, sliding windows, best span)    │
                                               │ smollm2_backend.py  (chatml.py, BPE         │
                                               │   tokenizer, prefix cache, libsampler.so)   │
+                                              │ smolvlm_backend.py  (idefics3.py, images)   │
                                               │        │ ctypes                             │
                                               │ lib/libbert_squad.so  (bert_api.c + the     │
                                               │   generated BERT project, weights in CMA)   │
                                               │ lib/libsmollm2.so  (llm_api.c + the         │
                                               │   generated SmolLM2 project, CMA weights)   │
+                                              │ lib/libsmolvlm_256m.so  (llm_api.c + the    │
+                                              │   generated SmolVLM project, CMA weights)   │
                                               │        │ XRT / UIO                          │
                                               │ ConvKernel · MatmulKernel · VectorOPKernel  │
                                               └─────────────────────────────────────────────┘
@@ -60,8 +69,10 @@ demo/chat/
 ├── chat_config.json.example
 ├── src/llm_api.{c,h}, src/llm_bench.c — libsmollm2.so's C API (§11) and its standalone benchmark
 ├── scripts/
-│   ├── generate_llm_project.py — schedule SmolLM2 into build/llm_project (libsmollm2.so)
-│   ├── llm_board.py         — build / install libsmollm2.so on the board, board gate, timings
+│   ├── generate_llm_project.py — schedule SmolLM2 / SmolVLM into build/llm_project[_<model>]
+│   │                          (libsmollm2.so, ...); takes the planning options (--plan, ...)
+│   ├── llm_board.py         — build / install the library on the board, board gate, timings,
+│   │                          per-layer profiles (--profile; --out saves them as profile_layers)
 │   ├── llm_project.py       — shared model / formats loading, library simulation (SimSession)
 │   ├── llm_sched_check.py   — scheduler simulation == study emulation, bit for bit (gate 2)
 │   ├── llm_host_emu.py      — the generated C on the host against software kernels
@@ -102,6 +113,8 @@ $PY deploy.py                  # generate (if needed), weights, build, start, wa
 $PY deploy.py --status         # unit state + /health
 $PY deploy.py --stop           # stop the server (frees the FPGA)
 $PY deploy.py --hold           # start, keep the board lock, follow the log; Ctrl-C stops it
+$PY deploy.py --regenerate --plan   # regenerate the BERT project in planning mode first
+                                    # (doc/plans/TACTICS_PLAN.md §9; or "plan" in the BERT config)
 ```
 
 `deploy.py` takes everything board-specific (ssh, UIO names, weights
@@ -125,12 +138,13 @@ power-down stops the token stream, later SSH and ping).
 
 **The generative backend** is enabled by adding `"smollm2"` to
 `server.backends` in `chat_config.json` (e.g. `["bert-squad", "smollm2"]`;
-the first is the default model).  deploy.py then also uploads the text side
+the first is the default model).  deploy.py always uploads the text side
 (`smollm2_backend.py`, `smollm2_tokenizer.py`, `chatml.py`, `sampler.py`)
-and `tokenizer.json` (from the untracked `assets/smollm2-135m-instruct/`, to
-`<dir>/smollm2/`), builds `lib/libsampler.so` from `src/sampler.c` on the
-board (under a second; without a compiler the server samples in Python), and
-passes the `smollm2` block (`lib`, `weights_dir`, sampling defaults,
+and builds `lib/libsampler.so` from `src/sampler.c` on the board (under a
+second; without a compiler the server samples in Python); with `smollm2` it
+also uploads `tokenizer.json` (`smollm2.tokenizer`, by default from the
+untracked `assets/smollm2-135m-instruct/`, to `<dir>/smollm2/`) and passes
+the `smollm2` block (`lib`, `weights_dir`, `model_id`, sampling defaults,
 `cma_mb`) and `server.resident` to the server.  `libsmollm2.so` itself is
 not built by `deploy.py` — the preflight reports whether it is at
 `smollm2.lib` (default `<dir>/lib/libsmollm2.so`).  If it cannot be loaded,
@@ -150,7 +164,7 @@ SHA-256 of every file) and checks the result against the recorded hash — see
 cd demo/chat
 python3 scripts/llm_calibrate.py all smollm2-135m-instruct   # fetch + calibrate, ~1.5 min
 PY=../../inference-scheduler/.venv/bin/python
-$PY scripts/generate_llm_project.py      # -> build/llm_project (~100 s; 538 MB weights/*.dat)
+$PY scripts/generate_llm_project.py      # -> build/llm_project (~100 s; 326 MB weights/*.dat)
 $PY deploy.py --stop                     # the server owns the FPGA
 $PY scripts/llm_board.py --install-only  # upload, build on the board (-j1, memory guard),
                                          # install <dir>/lib/libsmollm2.so; weights in /root/smollm2_weights
@@ -160,11 +174,17 @@ $PY deploy.py                            # with "smollm2" in server.backends
 `llm_board.py` takes ssh, driver directories and the board lock from
 `../bert_squad/bert_squad_config.json`; without `--install-only` it also
 runs the board gate (logits bit-exact with the scheduler simulation,
-prefill / decode timings, `llm_lib_check.py`).
+prefill / decode timings, `llm_lib_check.py`).  `--profile` adds the
+per-layer profile; `--out FILE` saves the results JSON, with the per-layer
+times (`profile_layers`) that `inference-scheduler/perf_calibrate.py host /
+simulate --profile` read (TACTICS_PLAN §9).  `generate_llm_project.py`
+takes the planning options (`--plan`, `--perf-model`, `--plan-report`,
+`--pool-budget-mib`, `--entry-weights`), passed to every entry.
 
 **The FPGA and the board lock.**  The running server owns the FPGA (its
-process holds the loaded models' pool BOs — BERT 216 MiB, SmolLM2 488 MiB
-— and the UIO mappings); nothing else may run kernels until it is stopped.
+process holds the loaded models' pool BOs — BERT 216 MiB, SmolLM2-135M
+286 MiB, SmolLM2-360M 740 MiB, SmolVLM 495 MiB — and the UIO mappings);
+nothing else may run kernels until it is stopped.
 `deploy.py` holds the shared board lock (`board_lock`, `flock`) only while
 deploying — use `--hold` to keep it for as long as the server runs, or
 `deploy.py --stop` before handing the board to another job.
@@ -344,7 +364,7 @@ The capital of France is Paris.
 ...
 ```
 
-### Two models, one FPGA — residency
+### Several models, one FPGA — residency
 
 BERT holds ~224 MB of CMA, SmolLM2 ~300 MB (a 286 MiB pool: one copy of
 every weight — decode reads the prefill image through MatmulKernel's GEMV
@@ -518,9 +538,11 @@ models: bert-squad; using bert-squad
 (Interactively the same, with line editing and history via `readline`.)
 
 Options: `--url` (or `KV260_CHAT_URL`), `--api-key` (or `KV260_CHAT_API_KEY`
-/ `OPENAI_API_KEY`), `--model`, `--doc FILE`, `--system TEXT`, `-q QUESTION`
+/ `OPENAI_API_KEY`), `--model`, `--doc FILE`, `--system TEXT`, `--image FILE`
+(an image for the first question; image models), `-q QUESTION`
 (one-shot; exit code 1 on errors), `--no-stream`, `--max-tokens`,
 `--temperature`, `--timeout`, `-v`.  Commands: `/doc FILE`, `/system [TEXT]`,
+`/image FILE` (attach to the next message, or end a message with it),
 `/model [M]`, `/reset`, `/help`, `/quit`.  On the board:
 `python3 /root/kv260_chat/chat.py --doc sb50.txt`.
 
@@ -725,21 +747,24 @@ OpenAI-compatible client instead.
 
 | | |
 |---|---|
-| `GET /health` | `{"status": "ok"\|"error", "version", "models": [{id, ready, loaded, ...backend fields: library, weights_dir, (bert) model_name, seq_len, max_windows, windows_run, (smollm2) vocab_size, context_size, reserve, sampler, cached_tokens, defaults, requests, prompt/reused/prefilled/generated_tokens}], "resident", "cma_free_mb", "loads", "unloads", "busy", "waiting", "requests", "uptime_s"}`; 503 when a model failed to load; no API key needed |
+| `GET /health` | `{"status": "ok"\|"error", "version", "models": [{id, ready, loaded, ...backend fields: library, weights_dir, (bert) model_name, seq_len, max_windows, windows_run, (smollm2) vocab_size, context_size, reserve, sampler, cached_tokens, defaults, requests, prompt/reused/prefilled/generated_tokens, (smolvlm) image_cache}], "resident", "cma_free_mb", "loads", "unloads", "busy", "waiting", "requests", "uptime_s"}`; 503 when a model failed to load; no API key needed |
 | `GET /v1/models`, `GET /v1/models/{id}` | model list / object (`id`, `object`, `created`, `owned_by`) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE `chat.completion.chunk` lines (role chunk, content chunks, a final chunk with `finish_reason`, a usage chunk with `stream_options.include_usage`), then `data: [DONE]`; chunked transfer (HTTP/1.1, keep-alive) or connection close (HTTP/1.0) |
 
 The paths also work without `/v1`.  Honoured: `model` (default: the first
-backend), `messages` (string content or text parts), `stream`,
+backend), `messages` (string content or text parts; `image_url` parts —
+base64 data URLs — for `smolvlm`), `stream`,
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`,
 `temperature` (0–2), `top_p` (0–1), `stop` (≤ 4), `seed`, `n` (1 only),
-and for `smollm2-135m-instruct` the sampling fields of the table above
+and for the generative models (`smollm2`, `smolvlm`) the sampling fields of the table above
 (`top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`,
 `repeat_last_n`, `dry_*`, `loop_guard`); anything else is ignored.  Errors
 are OpenAI-shaped `{"error": {"message", "type", "param", "code"}}`: 400 invalid request
-(`param` names the field), 401 missing / wrong API key (`invalid_api_key`),
+(`param` names the field; `images_not_supported` for an image sent to a text model),
+401 missing / wrong API key (`invalid_api_key`),
 404 unknown model (`model_not_found`) or URL (`unknown_url`), 411 / 413 body
-without length / over 4 MB, 500 backend failure (`backend_error`; an SSE
+without length / over 4 MB (32 MB when an image model is served;
+`--max-body-mb`), 500 backend failure (`backend_error`; an SSE
 `data: {"error": ...}` event once a stream has started), 503 busy
 (`server_busy`, `Retry-After: 5`) or model not loaded.
 

@@ -86,7 +86,7 @@ the exported IP defaults — 128 bits on all four ports.
 | `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one kTileM-padded output row (`out_w·ceil(out_ch/kTileM)·kTileM`) must fit. Bound to **URAM** as 512-bit words (`kMaxAccPersistEntries/16` words: 8 URAM blocks at 65536), and the chunk-deep `acc_stream` FIFO (`kMaxAccPersistEntries/8` × 128 bit, 4 URAM) scales with it — it trades URAM, not BRAM |
 | `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab; sets the weight-cache depth (`2 banks × kMaxMperGroup × 64` words) |
 
-All ten values come from `kernels.conv` in `platforms/<AXI_PLATFORM>.json` (`conv_load_constants()` in `kernels/conv/CMakeLists.txt`; no CMake cache defaults).  If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`.
+All ten values come from `kernels.conv` in `platforms/<AXI_PLATFORM>.json` (`conv_load_constants()` in `kernels/conv/CMakeLists.txt`; no CMake cache defaults).  If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`, but that configuration does not build: `ConvKernel.h` includes `ap_int.h` / `hls_burst_maxi.h` unconditionally, and the 128-bit ports and row / weight buffers assume eight 16-bit elements per word (`static_assert`s; the float library was dropped 2026-09-27).  The only configuration built and tested is `ap_fixed<16,8>`.
 
 **Runtime constraints validated by the inference scheduler:**
 
@@ -589,13 +589,13 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 ## 6. Data Types and Saturation
 
-`saturate_cast<Data_t>(v)` converts an `AccData_t` accumulator back to `Data_t`. It is applied in `process_conv_kernel_tile`'s Phase-3 drain (§2.16), so `acc_stream` carries finished `Data_t` values — 128-bit `YWord`s of 8 outputs of one channel since §2.38 — and `write_output_tile` only re-aligns them onto DDR words. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward −∞, i.e. floor) and `AP_SAT` (saturation clamping), matching the scheduler's reference (`dtype.truncate()` + clip). A fallback template handles `float` builds (identity cast).
+`saturate_cast<Data_t>(v)` converts an `AccData_t` accumulator back to `Data_t`. It is applied in `process_conv_kernel_tile`'s Phase-3 drain (§2.16), so `acc_stream` carries finished `Data_t` values — 128-bit `YWord`s of 8 outputs of one channel since §2.38 — and `write_output_tile` only re-aligns them onto DDR words. For `ap_fixed` the specialization uses `AP_TRN` (truncation toward −∞, i.e. floor) and `AP_SAT` (saturation clamping), matching the scheduler's reference (`dtype.truncate()` + clip). The primary template is an identity pass-through for non-`ap_fixed` types.
 
 ---
 
 ## 7. Test Coverage (`TestConvSim.cpp`)
 
-`TestConvRef` runs 97 named cases compiled with GCC (no Vitis required): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvSweep` (`TestConvRef --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match for `ap_fixed`, relative 1e-5 for `float`. The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
+`TestConvRef` runs 97 named cases compiled with GCC against the Vitis HLS headers (no HLS tool run): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvSweep` (`TestConvRef --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match (`ap_fixed<16,8>`, the only configuration that builds). The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
@@ -628,12 +628,14 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 - Validates 4-D NCHW shapes for input, weight, bias, and output
 - Parses `group`, `strides`, `dilations`, `pads`, `auto_pad` (NOTSET/VALID/SAME_UPPER/SAME_LOWER)
 - Determines `is_depthwise`: group=1 → standard, group=in_ch → depthwise, otherwise rejected
-- Rejects layers that break the §3 runtime constraints (`in_ch`, `out_ch`, the dilated row / column spans, the padded accumulator row), with bounds from `_conv_hw_config.py` (the platform JSON's `kernels.conv`). `kh ≤ kMaxKH` / `kw ≤ kMaxKW` are not checked by `ConvNode` itself — only the dilated spans against the line buffer are — so a kernel larger than 7 in either axis currently passes validation
+- Rejects layers that break the §3 runtime constraints (`in_ch`, `out_ch`, `kh ≤ kMaxKH` / `kw ≤ kMaxKW`, the dilated row / column spans, the padded accumulator row) with a `SchedulerError` naming the bound; the bounds come from `_conv_hw_config.py` (the platform JSON's `kernels.conv`)
 - Packs the weight and bias initializers into the §2 tile-major DDR layout (`_pack_conv_weight`)
 
-**`MatmulConvNode` (`nodes.py`, chosen by `matmul_lowering.py`)** runs an ONNX `MatMul` on this kernel with swapped operand roles: for `C[N][M] = A[N][K]·B[K][M]`, `out_ch = N`, `in_ch = K/kw`, a `1 × kw` kernel with stride `(1, kw)`, no pad, no bias, `out_h × out_w = M`; `A` (row-major) is the weight, `B` the input. Eligibility: ap_fixed<16,8> graphs, `N > 1`, `K % 16 == 0`, `M % 8 == 0` and the §3 bounds; the engine choice (`--matmul-on-conv auto|always|off`) uses the cycle models in `cost_model.py`. Results are bit-identical to MatmulKernel. See doc/plans/BERT_PLAN.md §2 2A.
+**`MatmulConvNode` (`nodes.py`, chosen by `matmul_lowering.py`)** runs an ONNX `MatMul` on this kernel with swapped operand roles: for `C[N][M] = A[N][K]·B[K][M]`, `out_ch = N`, `in_ch = K/kw`, a `1 × kw` kernel with stride `(1, kw)`, no pad, no bias, `out_h × out_w = M`; `A` (row-major) is the weight, `B` the input. Eligibility: ap_fixed<16,8> graphs, `N > 1`, `K % 16 == 0`, `M % 8 == 0` and the §3 bounds; the engine choice (`--matmul-on-conv auto|always|off`) uses the cycle models in `cost_model.py` (with `--plan`, the calibrated performance model — INFERENCE_SCHEDULER.md "Planning (`--plan`)"). **Row split** (`matmul_lowering.conv_plans`): when every one-call plan of a MatMul with contiguous rows is accumulator-limited (an oh-chunk shorter than the line buffer's rows), the rows are spread over several calls that share B (SmolVLM's 1024-token vision linears run as 2 × 512 rows; INFERENCE_SCHEDULER.md "Row split"). Results are bit-identical to MatmulKernel. See doc/plans/BERT_PLAN.md §2 2A.
 
-**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case. `run_conv_at()` is the same call with `x` / `weight` / `y` at element offsets into their buffers (no bias) — used for per-head MatMul-on-ConvKernel calls in attention.
+**`LlmAttnConvNode` (`llm_nodes.py`)** runs attention as MatMul-on-ConvKernel calls, one per KV group: q·Kᵀ (the K cache is the weight, `out_ch` = keys) and P·V (the V cache as the `1 × kw` input, `in_ch` = keys / kw). In the Llama prefill the key count is a runtime value from the entry's `pos` / `n` written into those registers; the vision encoder (`src/vit.py`) uses a static key count.
+
+**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case. `run_conv_at()` is the same call with `x` / `weight` / `y` at element offsets into their buffers (no bias) — used when a MatMul on ConvKernel is issued as several calls (one per batch item / attention head, or a row split) and by `LlmAttnConvNode`.
 
 **Layout constraint (`_core.py`):** `ConvKernel` writes a flat NCHW output. If the output tensor feeds a broadcast `VectorOP` node that requires an advancing-strided layout (`n_chunks > 1`), the scheduler raises a `SchedulerError`. Per-channel bias must be passed as the Conv operator's 3rd input, not as a separate downstream `Add` node.
 
@@ -644,7 +646,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 ## 9. Build Targets
 
 ```bash
-# C simulation (GCC, no Vitis)
+# C simulation (GCC + the Vitis HLS headers; no HLS tool run)
 make TestConvRef TestConvGrid && ctest -R 'TestConv'   # TestConvRef, TestConvGrid, TestConvSweep
 
 # HLS synthesis + IP export for KV260
@@ -676,7 +678,8 @@ The synthesis target reads `platforms/kv260.json` (part, optional board, clock �
 | `platforms/kv260.json` | KV260 platform config (`kernels.conv` bounds, part, clock) |
 | `inference-scheduler/src/_conv_hw_config.py` | Scheduler-side read of `kernels.conv` |
 | `inference-scheduler/src/nodes.py` | `ConvNode` / `MatmulConvNode` classes (ONNX → kernel params, weight packing) |
-| `inference-scheduler/src/matmul_lowering.py`, `cost_model.py` | MatMul → ConvKernel eligibility, geometry and engine choice |
+| `inference-scheduler/src/matmul_lowering.py`, `cost_model.py` | MatMul → ConvKernel eligibility, geometry, row split and engine choice |
+| `inference-scheduler/src/llm_nodes.py` | `LlmAttnConvNode` (Llama / vision-encoder attention calls on ConvKernel) |
 | `inference-scheduler/src/codegen/_source.py` | `run_conv()` / `run_conv_at()` code generation |
 | `inference-scheduler/src/codegen/_core.py` | Conv node detection, layout validation |
 | `inference-scheduler/src/codegen/_simulate.py` | Float64 reference simulation |
@@ -689,8 +692,8 @@ The synthesis target reads `platforms/kv260.json` (part, optional board, clock �
 |--------|---------|
 | **Supported ONNX op** | `Conv` (2-D, NCHW layout); `MatMul` lowered onto the kernel by the scheduler (§8) |
 | **Modes** | Standard (group=1), Depthwise (group=in_ch) |
-| **Data type** | `ap_fixed<16,8>` (default) or `float` |
-| **Accumulator type** | `ap_fixed<32,16>` (default) or `float` |
+| **Data type** | `ap_fixed<16,8>` (the only configuration that builds, §3) |
+| **Accumulator type** | `ap_fixed<32,16>` (default) |
 | **MAC operand width** | `Data_t × Data_t` 16×16 multiply → single DSP48 per lane; operands are *not* pre-widened to `AccData_t` (§2.17) |
 | **Tiling** | kTileM=16 output channels × kTileIC=16 input channels (§2.40; 8 × 16 before) |
 | **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid × 2 output pixels: 2 × kTileIC × kTileM = 512 MACs/cycle against one weight word per column (§2.24, §2.40, §2.42) |
@@ -710,7 +713,7 @@ The synthesis target reads `platforms/kv260.json` (part, optional board, clock �
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
 | **AXI-Lite registers** | 21 (4 DDR addresses + 17 scalars) |
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |
-| **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time; not checked by `ConvNode`, see §8) |
+| **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time; enforced by `ConvNode`, §8) |
 | **Persistent acc constraint** | `out_w·ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
 | **Persistent acc storage** | `partial_outputs[]` bound to URAM (`bind_storage impl=URAM`, 512-bit words, 8 URAM blocks) |
 | **Line-buffer column constraint** | `(kw-1)·dilation_w + 1 ≤ kMaxLineBufCols` *(in_w no longer capped — wider inputs auto-tiled along ow)* |

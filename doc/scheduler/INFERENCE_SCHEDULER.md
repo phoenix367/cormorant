@@ -8,7 +8,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 
 > This file is the technical reference for what the scheduler supports and
 > how (operator mapping, transformations, host ops, numerics, cache
-> coherency, multi-entry projects).  The user guide — CLI options, generated
+> coherency, multi-entry projects, planning).  The user guide — CLI options, generated
 > project layout, C API walk-through, building, `report.md` — is
 > [`inference-scheduler/doc/USER_GUIDE.md`](../../inference-scheduler/doc/USER_GUIDE.md);
 > codegen internals (node classes, layout engine, mixins) are in
@@ -56,16 +56,18 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 - **Llama-family decoder ops** (custom domain `axi.llm`, `src/llm_nodes.py`)
   — `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd`, `LlmAttention` (RoPE + KV cache
   + causal GQA attention as one float region), `LlmSiluMul`,
-  `LlmSelectRow`, `LlmDequant`; the graphs come from the Llama frontend
+  `LlmSelectRow`, `LlmDequant`, and `LlmAttnPrep` / `LlmAttnSoftmax` /
+  `LlmAttnMerge` around the prefill attention's ConvKernel calls; the graphs
+  come from the Llama frontend
   (`src/llama.py`, [§Llama-family decoders](#llama-family-decoders)) with
   power-of-two exponents, float / int host tensors and persistent states
   ([§Numerics beyond the element type](#numerics-beyond-the-element-type)).
-  This is what runs SmolLM2-135M-Instruct — [`CHAT_PLAN.md`](../plans/CHAT_PLAN.md) §13.
+  This is what runs SmolLM2-135M / 360M-Instruct — [`CHAT_PLAN.md`](../plans/CHAT_PLAN.md) §13, §20.
 - **Vision-encoder ops** (domain `axi.llm`, `src/vit_nodes.py`) — `VitEmbedAdd`,
   `VitLayerNorm`, `VitResAdd`, `VitAttnPrep`, `VitAttnSoftmax`, `VitGelu`,
   `VitPixelShuffle`, `VitSumDequant`, with q·Kᵀ / P·V on ConvKernel; the
   `vision` entry comes from `src/vit.py` ([§Vision encoders](#vision-encoders)).
-  This is what runs SmolVLM-256M-Instruct's image side — `CHAT_PLAN.md` §23.
+  This is what runs SmolVLM-256M-Instruct's image side — `CHAT_PLAN.md` §23, §24.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -110,13 +112,15 @@ python3 -m venv .venv
 
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
+# ... planned from the bitstream's performance model (§Planning)
+.venv/bin/python inference_scheduler.py model.onnx --plan --out-dir /tmp/out
 
 # A multi-entry project: one library, inference_run_<name>() per graph,
 # one weight pool (weights deduplicated), shared states
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1517 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1547 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -147,8 +151,8 @@ inference_scheduler.py          CLI, argument parsing
     ├── llm_nodes.py            axi.llm ops of Llama decoders: host ops (Embed,
     │                           RMSNorm, ResAdd, Attention, SiluMul, AttnPrep,
     │                           AttnSoftmax, AttnMerge, ...) and the FPGA
-    │                           prefill-attention ConvKernel calls with a
-    │                           runtime key count (LlmAttnConvNode)
+    │                           attention ConvKernel calls (LlmAttnConvNode;
+    │                           runtime key count, static for the vision encoder)
     ├── numeric.py              axi.numeric metadata: power-of-two exponents,
     │                           host tensors, states; rank-1 weight encoding
     ├── llama.py                Llama frontend: config + safetensors +
@@ -159,11 +163,23 @@ inference_scheduler.py          CLI, argument parsing
     │                           the `vision` entry of a multi-entry project
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
-    ├── matmul_lowering.py      MatMul -> ConvKernel engine choice and geometry
+    ├── matmul_lowering.py      MatMul -> ConvKernel engine choice, geometry, row split
+    ├── matmul_gemv.py          MatmulKernel GEMV streaming pass (single-row MatMuls)
+    ├── llm_entries.py          Llama entry graphs sharing one image per weight
     ├── cost_model.py           ConvKernel / MatmulKernel cycle estimates
-    ├── schedule.py Dag         data-flow DAG: predecessors, successors,
-    │                           topological order, independent pairs
-    ├── report.py               report.md (model summary, transformations, layers)
+    ├── planning.py             --plan options, performance-model lookup
+    ├── perf_calls.py           KernelCall (a kernel call's registers), bitstream id
+    ├── perf_model.py           per-bitstream kernel model: exact calls, fitted
+    │                           families, error bands
+    ├── perf_fit.py             fitting it (perf_calibrate.py fit)
+    ├── host_model.py           host-op timing model (host.json)
+    ├── tactics.py              a MatMul's tactics (conv / tiled / GEMV) and calls
+    ├── order_search.py         --plan issue-order search
+    ├── schedule.py Dag         data-flow DAG (+ state RAW / WAR / WAW edges):
+    │                           predecessors, successors, topological order,
+    │                           independent pairs
+    ├── report.py               report.md (model summary, transformations, layers,
+    │                           planning)
     └── codegen/    CodeGenerator
                     _core.py    event stream, tensor layout, DMA pool sizing,
                                 event-stream liveness intervals
@@ -175,6 +191,7 @@ inference_scheduler.py          CLI, argument parsing
                     _cmake.py   CMakeLists.txt
                     multi.py    MultiEntryGenerator (several graphs, one
                                 weight pool, shared states)
+                    timing.py   timed replay of the event stream (--plan)
 ```
 
 ### OnnxGraph loading sequence
@@ -193,8 +210,9 @@ inference_scheduler.py          CLI, argument parsing
 9. The numeric annotations are applied to the tensor registry
    (exponents, host tensors, states — states leave the input / weight
    lists).  Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` /
-   `ReshapeNode` / `ScheduledNode` / a host node (`host_nodes.HOST_OP_FACTORIES`,
-   or `llm_nodes.LLM_OP_FACTORIES` for the `axi.llm` domain) based on
+   `ReshapeNode` / `SpaceToDepthNode` / `ScheduledNode` / a host node
+   (`host_nodes.HOST_OP_FACTORIES`, or `llm_nodes.LLM_OP_FACTORIES` and
+   `vit_nodes.VIT_OP_FACTORIES` for the `axi.llm` domain) based on
    `op_type`; kernel nodes reading an integer tensor are rejected; then
    `numeric.check` (only MatMuls and the LLM ops touch exponent / host /
    state tensors) and `numeric.encode_matmul_weights` (rank-1 weight
@@ -208,14 +226,19 @@ inference_scheduler.py          CLI, argument parsing
    ([§MatMul on ConvKernel](#matmul-on-convkernel)); `matmul_conv_kw`
    ({weight: kw}) pins kernel widths (a multi-entry project's prefill
    buckets must re-lay out a shared weight identically), `matmul_conv_kws`
-   limits the widths it may choose.
+   limits the widths it may choose.  With `plan` enabled the performance
+   model is resolved first and each MatMul's choice is re-priced
+   (`_plan_matmul`, [§Planning](#planning---plan)).
 12. `matmul_gemv.choose_gemv()` (`matmul_gemv="auto"`, the default) —
    single-row MatmulNodes switch to MatmulKernel's GEMV streaming path
    (`gemv_kw`); `matmul_gemv_kw` ({weight: kw}) reads those weights in
-   ConvKernel's kw image ([§MatMul GEMV streaming](#matmul-gemv-streaming)).
+   ConvKernel's kw image ([§MatMul GEMV streaming](#matmul-gemv-streaming));
+   planned by `_plan_gemv` under `plan`.
 13. `_pack_matmul_weights()` (the remaining tiled MatmulNodes), then
    `_choose_slice_views()` (contiguous Slice pieces that may alias their
    source).
+14. `order_search.plan_order()` (only with `plan` enabled) — the issue
+   order from the timed simulation ([§Planning](#planning---plan)).
 
 `_space_to_depth_stems()` (when `s2d_stem=True`) runs on the ONNX model
 like the Gemm rewrite: it inserts the `SpaceToDepth`
@@ -511,8 +534,9 @@ bit; the simulator is unchanged):
 `('cpu', idx)` event that first waits for in-flight producers, liveness
 interval that starts and ends at that event (so its output never shares a
 pool slot with its input), profiled with `INFERENCE_PROF_BEGIN/END`.  Host
-ops run in graph order; kernel work that does not depend on them is not
-yet hoisted around them (phase-2 item).
+ops run in graph order; kernel work that does not depend on them is hoisted
+around them only by the `--plan` issue-order search
+([§Planning](#planning---plan)).
 
 **Slice views.**  `OnnxGraph._choose_slice_views` turns a `Slice` piece
 into a zero-cost `inference_buf_init_view()` of its source (set up once in
@@ -634,8 +658,11 @@ by the entries of a multi-entry project: an initializer (its initial VALUE —
 the C init image is the raw encoding of its non-zero prefix, e.g. a KV
 cache's sink row; the rest is zeroed) or a node output written in place
 (e.g. `h_last`, a prefill's last row handed to the head entry).  Host ops
-also update states in place (the KV cache rows).  States are external to
-the DAG (like weights), excluded from buffer reuse (`OnnxGraph.state_tensors`),
+also update states in place (the KV cache rows).  A state no node of the
+graph produces imposes no producer edge in the DAG (like weights); the
+nodes that read and update it get RAW / WAR / WAW ordering edges in list
+order (`src/schedule.py`, from `state_updates()` / `state_writes()`).
+States are excluded from buffer reuse (`OnnxGraph.state_tensors`),
 allocated in `inference_init()` and freed in `inference_deinit()`; the
 simulator keeps them in a dict it updates in place
 (`_forward_pass(..., states=)`, `initial_states()`).  Only host states are
@@ -785,6 +812,10 @@ policy pow2+p12, which the simulation reproduces bit for bit):
     qk0, qk1, then per head softmax(g), pv(g), qk(g + 2): qk(g + 1) runs
     on ConvKernel under softmax(g), and the CPU waits only for the short
     P.V before issuing the next qk.
+  - `VitFrontend(attn_split=R)` (default 1) splits every head's softmax and
+    P.V into R query-row parts (`VitAttnSoftmax` attribute `cols`,
+    `LlmAttnMerge` `row_splits`).  Bit-identical, but it simulates no
+    faster, and `--plan` does not use it (TACTICS_PLAN §9, T4).
   - `LlmAttnMerge` joins the heads.
 - **Connector:** K = 12 288 exceeds every kernel, so it runs as three
   K-chunk MatMuls (`VitPixelShuffle` writes each chunk's columns) summed by
@@ -930,7 +961,9 @@ several calls instead.  Call `i` reads A rows and writes C rows
 shared (`b_call_stride = 0`), and the cheapest split plan whose chunks are
 full is taken.  Only SmolVLM's 1024-token vision linears qualify (BERT,
 SmolLM2 and the SmolVLM text entries keep their plans).  They run as 2 × 512
-rows, 1.7–1.9× faster on the board (CHAT_PLAN §24).
+rows, 1.7–1.9× faster on the board (CHAT_PLAN §24).  Under `--plan` every
+row split of a contiguous-rows MatMul is a candidate
+(`conv_plans(splits="all")`, [§Planning](#planning---plan)).
 
 BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
 — the 72 encoder linears as 1×4 convs (`in_ch` 192 / 768, output 48×16 or
@@ -957,8 +990,8 @@ decode graphs of a Llama project read the same buffer.
 {auto,always,off}`) runs after the ConvKernel lowering.  A MatmulNode takes
 the path when the platform's kernel has it (`kernels.matmul.gemv_max_m >
 0`), the element type is `ap_fixed<16,8>`, `outer_count == 1`, `n == 1`,
-`k % 8 == 0` (`k % (16 kw) == 0` for `kw > 1`), `m % 8 == 0`, `m · kw ≥
-64`, the batch strides are multiples of 8 and — in `auto` —
+`k % 8 == 0` and `k ≤ max_k` (`k % (16 kw) == 0` for `kw > 1`), `m % 8 == 0`,
+`m · kw ≥ 64`, the batch strides are multiples of 8 and — in `auto` —
 `cost_model.gemv_cycles` is below the tiled `matmul_cycles`.  The kernel
 width comes from `matmul_gemv_kw` ({constant B: kw}) when that B is read by
 this MatMul only; a B this graph's ConvKernel lowering already re-imaged is
@@ -984,6 +1017,92 @@ the four-entry tiny project this way and runs it on the host emulation,
 whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
 
 ---
+
+### Planning (`--plan`)
+
+Optional ([`TACTICS_PLAN.md`](../plans/TACTICS_PLAN.md)).  Without `--plan`
+every choice is the one described above; with it the scheduler prices the
+alternatives with the target bitstream's **performance model** and changes
+a choice only where the model says it is faster.  Results never change:
+every alternative is bit-identical.
+
+**Performance models** (`perf_models/<platform>/`, versioned):
+- `<bitstream-id>.json`, the kernels (`src/perf_model.py`):
+  - the measured µs of every calibrated call (exact entries);
+  - per kernel family, a fitted model for other calls, with its calibrated
+    register ranges and held-out error.
+- `host.json`, the host ops (`src/host_model.py`): measured µs per op
+  signature from board profiles, plus a per-kind fit.
+- `<bitstream-id>.cases.json` / `.calib.json`, the campaign's call list and
+  measurements (`perf_models/README.md`).
+
+The bitstream id is the first 12 hex digits of the SHA-256 of the flat
+bitstream the board loads, computed from the `.bit` that
+`bitstream_config_kv260.json` names (`perf_calls.bitstream_id`);
+`--perf-model FILE` overrides the default lookup.  The models are keyed on
+a call's register values: every kernel node lists its calls with
+`kernel_calls()` (`perf_calls.KernelCall`; `test/test_perf_calls.py`
+checks them against the emitted C).
+
+**Calibration**, once per bitstream (`perf_calibrate.py`, board, chat
+server stopped):
+
+```bash
+.venv/bin/python perf_calibrate.py cases                     # the case list (shipped models + grid)
+.venv/bin/python perf_calibrate.py run --config CFG --stop-server
+.venv/bin/python perf_calibrate.py fit                       # the kernel models + validation report
+.venv/bin/python perf_calibrate.py cases --refine            # measure what the models rank near the best
+.venv/bin/python perf_calibrate.py run --config CFG --stop-server --resume && \
+    .venv/bin/python perf_calibrate.py fit
+# host ops and validation, from llm_board.py --profile --out / the demos' results.json
+.venv/bin/python perf_calibrate.py host     --profile smolvlm-256m-instruct=R.json bert=results.json ...
+.venv/bin/python perf_calibrate.py simulate --profile ...    # predicted vs measured per phase
+```
+
+(`perf_calibrate.py all --config CFG --stop-server` runs cases, run and fit
+in one go.)
+
+**What `--plan` decides:**
+- **MatMul tactics** (`matmul_lowering._plan_matmul`,
+  `matmul_gemv._plan_gemv`; `src/tactics.py` lists every MatMul's tactics
+  and their calls for the calibration): the engine, the ConvKernel
+  geometry, row splits and GEMV vs tiled.  A tactic replaces the unplanned choice only
+  when (`perf_model.clearly_faster`):
+  - it is priced at least 3 % below it (`PLAN_MIN_GAIN`) even with both at
+    the unfavourable end of their error bands (an exact entry has error 0,
+    a family prediction its family's held-out p90);
+  - the tactic is measured, or priced by a family whose held-out p90 is
+    within 5 % (`MAX_MODEL_ERROR`).
+  
+  A choice the model cannot price is kept.  Each decision is in
+  `OnnxGraph.plan_log`.
+- **Shared weights** (`llm_entries.plan_shared_kw`, Llama projects built
+  by `entry_graphs`): the kernel width of each weight shared by the prefill
+  buckets and decode, by predicted time weighted per entry
+  (`--entry-weights`; default decode 64, head 64, prefill 1).
+- **Issue order** (`src/order_search.py`), when every node is priced (the
+  kernels by the kernel model, the host ops by `host.json`):
+  - a local search over the order, priced by the timed replay of the event
+    stream (`src/codegen/timing.py`);
+  - moves respect the DAG of the original order, whose state edges fix
+    every state access;
+  - kept only if the simulated total drops by 0.5 % or more and the
+    intermediates' pool stays within `--pool-budget-mib` (default: the
+    unplanned pool).
+
+The generated banner and `report.md` say what was planned.
+`--plan-report` adds the report's "Planning" section (predicted time,
+lane busy times, where the CPU waits) without changing anything.
+
+The same options (`planning.add_plan_args`) are taken by
+`inference_scheduler.py`, `demo/chat/scripts/generate_llm_project.py` and
+the four demo `generate_project.py` scripts (or `"plan"` in their config
+JSON); `demo/chat/deploy.py --regenerate --plan` plans the BERT project.
+
+The simulator predicts SmolVLM, SmolLM2, BERT and the CNN demos within 2 %
+of the board.  Planned builds measured: SmolVLM `llm_image` −1.1 % (vision
+fc1 geometry) and BERT −1.1 % (issue order), all bit-exact
+(TACTICS_PLAN §9).
 
 ## Weight layouts
 

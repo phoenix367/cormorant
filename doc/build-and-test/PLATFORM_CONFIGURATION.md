@@ -78,8 +78,8 @@ only `part`, `board` and `clock`).
 > `config_interface -m_axi_max_widen_bitwidth`, i.e. it caps HLS
 > auto-widening of plain-pointer ports (the only one left is
 > MatmulKernel `c`, which HLS does not widen — it stays 16-bit); every
-> `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the *Key CMake parameters* table in the top-level
-> [README.md](../../README.md#key-cmake-parameters).
+> `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the configure-time cache variables table in
+> [BUILD_TARGETS.md](BUILD_TARGETS.md#setup).
 
 ---
 
@@ -100,7 +100,7 @@ context.
 | `max_out_ch` | `out_ch ≤ max_out_ch` | Hard upper bound on output channels; sizes the bias buffer |
 | `max_line_buf_cols` | power of 2; `(kw-1)·dilation_w + 1 ≤ max_line_buf_cols`; caps `ow_per_tile`, **not** `in_w` | Line-buffer column capacity |
 | `max_line_buf_rows` | power of 2; `(kh-1)·dilation_h + 1 ≤ max_line_buf_rows` | Line-buffer row capacity |
-| `max_acc_persist_entries` | `out_w · ceil(out_ch / tile_m) · tile_m ≤ max_acc_persist_entries` | URAM persistent-accumulator capacity across in-channel tiles (one `tile_m`-padded output row must fit; 4096 entries per URAM block) |
+| `max_acc_persist_entries` | `out_w · ceil(out_ch / tile_m) · tile_m ≤ max_acc_persist_entries` | URAM persistent-accumulator capacity across in-channel tiles (one `tile_m`-padded output row must fit; stored as 512-bit URAM words — 8 URAM blocks at 65536 — and the `acc_stream` FIFO scales with it) |
 | `max_m_per_group` | — | Number of M-tiles cached together in the weight slab |
 
 Models cannot violate `tile_m` / `tile_ic` (any `out_ch` / `in_ch` is
@@ -131,8 +131,8 @@ and the B block buffer `b_tile[tile_m][2·tile_k]` at compile time. See
 | `gemv_max_m` | multiple of 8; 0 = no GEMV path | GEMV streaming mode (`gemv_kw`, MATMUL_KERNEL.md §1): output columns one pass over B accumulates on chip per read stream (one URAM word per 8 columns); a wider `m` is split into column chunks inside the kernel, so it bounds nothing |
 
 The Python side reads `max_k` (validation), `tile_m` (the packed-B
-layout the scheduler emits for constant B operands), `tile_n` (engine
-cost model only) and `gemv_max_m` (whether the GEMV path exists, and the
+layout the scheduler emits for constant B operands), `tile_n` (the engine
+cost model and the `--plan` performance model only) and `gemv_max_m` (whether the GEMV path exists, and the
 cost model's column chunks). `tile_k` is a pure C++ tiling factor.
 Setting `gemv_max_m` to 0 also changes the generated `run_matmul()`: it
 then does not write the `gemv_kw` / `a_to_b` registers, so projects
@@ -153,8 +153,8 @@ architectural context including bank/port topology.
 | `max_kh` | `pool_h ≤ max_kh` | Compile-time pool window height limit |
 | `max_kw` | `pool_w ≤ max_kw` | Compile-time pool window width limit |
 | `max_line_buf_rows` | power of 2; `(pool_h-1)·dil_h + 1 ≤ max_line_buf_rows` | Line-buffer row capacity |
-| `max_line_buf_cols` | `(pool_w-1)·dil_w + 1 ≤ max_line_buf_cols`; W-tiling kicks in for `in_w > this` | Line-buffer column capacity |
-| `ow_parallel` | power of 2; any `out_w` works (residual-padded) | Output-position unroll factor |
+| `max_line_buf_cols` | multiple of 8 (whole 128-bit words); `(pool_w-1)·dil_w + 1 ≤ max_line_buf_cols`; W-tiling kicks in for `in_w > this` | Line-buffer column capacity |
+| `ow_parallel` | power of 2, `≤ 8` (lanes per word); any `out_w` works (residual-padded) | Output-position unroll factor |
 
 `tile_c` and `ow_parallel` are not exported to the Python validator —
 both have unconditional runtime fallbacks (channel tiling for any C;
@@ -180,7 +180,8 @@ residual-lane padding for any `out_w`).
       "max_m_per_group":         4
     },
     "matmul": {
-      "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 4096
+      "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 4096,
+      "gemv_max_m": 4096
     },
     "pool": {
       "tile_c":            8,
@@ -260,7 +261,8 @@ AXI_PLATFORM=<platform> .venv/bin/python test/gen_pool_models.py
 AXI_PLATFORM=<platform> .venv/bin/python -m pytest test/ -q
 ```
 
-The `TestMatmulHwConfigResolver` (`test/test_matmul.py`) and
+The `TestConvHwConfigResolver` (`test/test_conv.py`),
+`TestMatmulHwConfigResolver` (`test/test_matmul.py`) and
 `TestPoolHwConfigResolver` (`test/test_pool.py`) classes cross-check the
 resolved Python constants against the JSON, so a typo or shape error
 surfaces immediately at `pytest` time.
@@ -284,4 +286,4 @@ the same JSON as the bitstream.
 | [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
 | [`POOL_OPTIMISATION.md`](../kernels/POOL_OPTIMISATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
 | [`VECTOROP_KERNEL.md`](../kernels/VECTOROP_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds) |
-| [`../inference-scheduler/CLAUDE.md`](../../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |
+| [`inference-scheduler/CLAUDE.md`](../../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |

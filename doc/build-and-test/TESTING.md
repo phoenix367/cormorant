@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama ops (1507 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1547 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -29,7 +29,8 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1507 tests (1502 pass, 5 skip without BERT_SQUAD_MODEL)
+# Run all 1547 tests in 66 modules (1542 pass; 5 skip: the four opt-in
+# test_bert_base.py tests and one test_cli.py test that needs an HLS driver build)
 .venv/bin/python -m pytest test/ -q
 
 # Run a specific module
@@ -50,8 +51,9 @@ runs it, and requires `test_inference PASSED` — the generated host-op code
 (in place on cacheable buffers and staged on non-cacheable ones, lookup
 tables, 1 / 3 / 4 host threads) and the kernel call parameters must
 reproduce the scheduler simulation bit for bit (`test_bert_tiny.py`,
-`test_split_int.py`, `test_matmul_on_conv.py`, `test_numeric.py`,
-`test_llm_ops.py`, `test_llama.py`).  With `incoherent=True` it also gives
+`test_split_int.py`, `test_matmul_on_conv.py`, `test_matmul_gemv.py`,
+`test_numeric.py`, `test_llm_ops.py`, `test_llama.py`, `test_vit.py`,
+`test_planning.py`).  With `incoherent=True` it also gives
 every buffer a separate "DDR" copy, so a missing cache sync changes the
 output.
 `test_cache_coherency.py` walks the emitted `inference_run()` of every model
@@ -172,7 +174,7 @@ $EDITOR remote_config.json
 
 The two fields you must set are:
 
-- **`ssh.host`** — IP address or hostname of the KV260 (`"192.168.100.8"` by default)
+- **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
   Vitis-HLS-generated driver sources for each kernel, e.g.:
 
@@ -186,8 +188,8 @@ kernel in the config. After loading the `design_cormorant.dtbo`
 overlay all four names are `fabric_vecop`, `fabric_matmul`,
 `fabric_conv`, and `fabric_pool`.  `run_remote_tests.py` keys the map by
 the scheduler's kernel names — `VectorOPKernel`, `MatmulKernel`,
-`ConvKernel`, **`PoolKernel`** (the example's `PoolingKernel` key is not
-picked up; rename it).
+`ConvKernel`, **`PoolKernel`** (not `PoolingKernel`; the example uses
+these keys).
 
 ```bash
 # Verify board prerequisites before running
@@ -266,10 +268,11 @@ the correctness configs with an additional `benchmarks` section.
 }
 ```
 
-The default `perf_config.json` ships with **55 benchmark cases**
-across the four kernels (15 VectorOPKernel, 19 MatmulKernel — including
+`perf_config.json.example` ships with **60 benchmark cases**
+across the four kernels (15 VectorOPKernel, 24 MatmulKernel — including
 row-major / packed-B twins of the FC and classifier shapes, `b_packed`
-case field, MATMUL_OPTIMISATION §3b — 10 ConvKernel, 11 PoolingKernel).
+case field, MATMUL_OPTIMISATION §3b, and GEMV twins, `gemv_kw` case
+field, §8b — 10 ConvKernel, 11 PoolingKernel).
 
 VectorOPKernel `op` values outside the supported range (0..5) are
 rejected when the cases are loaded, before any case runs (currently
@@ -294,7 +297,17 @@ cd inference-scheduler
 
 # Preflight check — verify board is ready without running benchmarks
 .venv/bin/python run_remote_perf.py --config perf_config.json --check-only
+
+# Also write the results as JSON (one entry per case: kernel, label,
+# case fields, ok, lat_ms, metric)
+.venv/bin/python run_remote_perf.py --config perf_config.json --json /tmp/perf.json
 ```
+
+`perf_calibrate.py run --config <this format>` measures the kernel calls
+behind the performance models of the scheduler's `--plan` mode (`cases` /
+`run` / `fit`; `host` / `simulate` work from board profiles); its data
+lives in `inference-scheduler/perf_models/kv260/` (see
+`perf_models/README.md` and TACTICS_PLAN.md §9).
 
 **Sample output** (recorded on the board in May 2026 with the 48-case
 config of that time, before the 128-bit ports, packed-B MatmulKernel and

@@ -116,7 +116,7 @@ models.
 
 | Constant | Default | Where | Purpose |
 |----------|---------|-------|---------|
-| `Data_t` | `ap_fixed<16,8>` | `Config.h` | Element type (2-byte); `float` when the Vitis HLS headers are not found |
+| `Data_t` | `ap_fixed<16,8>` | `Config.h` | Element type (2-byte); CMake falls back to `float` when the Vitis HLS headers are not found, but `PoolingKernel.h` includes `ap_int.h` / `hls_burst_maxi.h`, so every build needs them |
 | `AccData_t` | `ap_fixed<32,16>` | `Config.h` | Accumulator type — wider range for sum/sum-of-squares |
 | `kPoolMax` / `kPoolAvg` / `kPoolLp` | 0 / 1 / 2 | `Config.h` | `pool_type` register codes |
 | `kDataMin` | `-128.0f` | `Config.h` | `MaxPool` pad-fill / identity (Data_t min) |
@@ -372,7 +372,7 @@ The wall clock is the largest of the four, all overlapped.  For
 ResNet-18's MaxPool 3×3 s2 on 112²×64 (W-tiled into 31 + 25 output
 columns, input spans of 63 / 51 columns) the consumer's 9 cycles per
 group of 16 outputs is the bound (≈ 0.56 cycles per output, ~117 k
-cycles; 1.35 ms measured on the board, POOL_OPTIMISATION §2.14.1);
+cycles; 1.35 ms measured on the board 2026-09-26, POOL_OPTIMISATION §2.14.1);
 for 2×2 s2 pools the consumer's `kTileC = 8` cycles per group (2
 outputs per cycle) is; for global pools the loader's one word per
 cycle is.
@@ -533,7 +533,8 @@ binary embeds the ROM directly (`kInvDenomLutBits`) and the
 
 ## 7. Test Coverage (`TestPoolingSim.cpp`)
 
-45 test cases compiled and run with GCC (no Vitis required). Tolerance:
+45 test cases (43 geometries + the two strict AVG sub-cases) compiled
+with GCC against the Vitis HLS headers (no HLS tool run). Tolerance:
 `kTol = 0.02f`; y is handed to the kernel as a 128-bit word buffer
 pre-filled with a 0xDEAD sentinel and every lane past the tensor end is
 checked afterwards (the byte-strobe contract of the y port).
@@ -598,7 +599,7 @@ comparison.
 ## 9. Build Targets
 
 ```bash
-# C simulation (GCC, no Vitis required).
+# C simulation (GCC + the Vitis HLS headers; no HLS tool run).
 make TestPoolingSim && ctest
 
 # HLS synthesis + IP export for KV260.
@@ -620,7 +621,7 @@ optional `board`, `clock` — 150 MHz for the KV260 — and the
 `Synthesis.tcl.in`, which opens a Vitis unified component
 (`open_component`, directory `pool_kv260`), adds the kernel source,
 runs `csynth_design`, and exports an IP catalog archive to
-`build/kernels/pool/kv260/ip_catalog`. Adding a new platform is a
+`build/kernels/pool/kv260/ip_catalog.zip`. Adding a new platform is a
 JSON-file-plus-cmake-rerun operation; no C++ edits required.
 
 The verification workflow is also packaged as a

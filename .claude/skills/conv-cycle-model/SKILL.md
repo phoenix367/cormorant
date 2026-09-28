@@ -1,15 +1,18 @@
 ---
-description: Analytical cycle model of ConvKernel (post-§2.35 architecture) — per-layer cycles split into MAC sweep, weight fill, bias init, drain/write and input loads, for an ONNX model or a single geometry, from the platform JSON's kernels.conv bounds. Use before choosing the next conv optimisation, to explain an RTL timing delta, or to size a fixture; re-validate against one RTL case after any kernel change.
+description: Analytical cycle model of ConvKernel (architecture as of CONV_OPTIMISATION §2.42) — per-layer cycles split into MAC sweep, weight fill, bias init, drain/write and input loads, for an ONNX model or a single geometry, from the platform JSON's kernels.conv bounds. Use before choosing the next conv optimisation, to explain an RTL timing delta, or to size a fixture; re-validate against one RTL case after any kernel change.
 allowed-tools: Bash Read
 ---
 
 # conv-cycle-model
 
-`scripts/conv_cycle_model.py` reproduces ConvKernel's loop structure —
-oh-chunking with the M-group residency cap, ow-tiling, M-grouping, the
-fused (tile, khi, kwi) sweep, one-word-per-cycle weight fill from the
-128-bit port with half tiles, one-element-per-cycle Phase-3 drain — and
-adds up ideal-II cycles plus the measured pipeline ramps.  It tracked
+`scripts/conv_cycle_model.py` reproduces ConvKernel's loop structure as
+of CONV_OPTIMISATION §2.42 — oh-chunking with the M-group residency cap,
+ow-tiling (even tile widths), M-grouping, the flat sweep over output-pixel
+PAIRS (`G · max(kh·kw, 2)` cycles per pair), one-word-per-cycle weight
+fill from the 128-bit port with half tiles (ping-pong overlapped), the
+8-lane Phase-3 drain, the `x_row_loader` row loads — and adds up ideal-II
+cycles plus the measured pipeline ramps.  `--arch 37 … 41` models the
+earlier steps (to re-validate their reports).  It tracked
 the RTL behavior test within 6 % at every step of the 2-D grid plan
 (CONV_2D_GRID_PLAN.md §7a) and is what located the write path (§2.22),
 the fill (§2.32) and the read path (§2.28) before any hardware ran.
@@ -31,7 +34,15 @@ share of MAC sweep / weight fill / bias init / drain+write / input
 loads, plus per model the totals and the fill-heaviest layers.  Shares
 above ~30 % in one bucket are where the next step is.
 
-## Accuracy (validated 2026-09-24 against the 40-case RTL report, §2.34 kernel)
+## Accuracy
+
+Latest (`--arch 42`, CONV_OPTIMISATION §2.42, 57 RTL cases): **5.0 %**
+mean |error| on the cases above 20 k cycles, 22.6 % over all (the
+sub-2 k-cycle stubs are dominated by the fixed invocation overhead).
+Validate against a report from the current kernel — an older
+`conv_test_report.json` in the build tree gives meaningless errors.
+
+Validated 2026-09-24 against the 40-case RTL report (§2.34 kernel):
 
 Mean |error| 6.5 % over all cases, 7.9 % over cases above 20 k cycles;
 the 3×3 / 7×7 M-grouped cases are within 5 %, the DW chunking case

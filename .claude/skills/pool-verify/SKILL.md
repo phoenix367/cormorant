@@ -47,13 +47,16 @@ make synthesize_pool_kv260
 - After it succeeds, glance at the synthesis summary for new violations (path is relative to the build directory):
 
   ```bash
-  sed -n '15,70p' kernels/pool/kv260/pool_kv260/solution1/syn/report/csynth.rpt
+  sed -n '15,70p' kernels/pool/kv260/pool_kv260/hls/syn/report/csynth.rpt
   ```
 
-  Report any of these against the prior run:
-  - **New** `Issue Type | Timing` rows (negative-slack stages) beyond the baseline `-0.66 ns` top-level slack.
+  (The pool build uses the Vitis unified component flow, so reports live
+  under `<component>/hls/syn/report/`, not the legacy `solution1/syn/report/`.)
+
+  Report any of these against the prior run (baseline as of POOL_OPTIMISATION §2.14: top-level slack 0.00 ns, II=1 and `Pipelined = yes` on every pipelined loop, no `SCHED 204-65`, both ports `128 -> 128`):
+  - **New** `Issue Type | Timing` rows (negative-slack stages) or a negative top-level slack.
   - **New** `II Violation Information` entries (II larger than 1 on previously II=1 loops).
-  - `m_axi_gmem0` / `m_axi_gmem1` data-width column changes (`16 -> N` row).
+  - `m_axi_gmem0` (x read) / `m_axi_gmem1` (y write) data-width column changes (both `128 -> 128`).
 
   Don't fail the gate on these — the user wants to see them in the report — but list any change clearly.
 
@@ -66,8 +69,8 @@ make behavior_test_pool
 - Takes ~2 min (Vivado xsim). The final two lines must be of the form:
 
   ```
-  [ts] kernel=PoolingKernel  total=31  passed=31  failed=0  all_passed=True
-  [ck] PoolingKernel: PASS  (31/31)  …/pooling_test_report.json
+  [ts] kernel=PoolingKernel  total=43  passed=43  failed=0  all_passed=True
+  [ck] PoolingKernel: PASS  (43/43)  …/pooling_test_report.json
   ```
 
 - `failed=0` and `all_passed=True` are mandatory. **If anything else, stop here.**

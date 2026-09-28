@@ -60,7 +60,7 @@ no hardware.
 | `TestSimulation` | VectorOPKernel | All 6 ops across sizes + saturation cases + broadcast / stride-0 / `act` geometry cases |
 | `TestConvRef` | ConvKernel | Kernel vs naive reference oracle; also registered as the CTest test `TestConvSweep` (`TestConvRef --sweep 300`, randomised geometries, ~1 min) |
 | `TestConvGrid` | ConvKernel | MAC-grid unit test on `include/ConvMacGrid.h` alone |
-| `TestMatmulRef` | MatmulKernel | Kernel vs `ref_matmul` oracle, all shape cases |
+| `TestMatmulRef` | MatmulKernel | Kernel vs the `ref_matmul_2d` / `ref_matmul_batch` oracle, all shape cases |
 | `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolingSim` | PoolingKernel | Max/Average/Lp pooling + global variants |
 

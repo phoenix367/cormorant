@@ -6,10 +6,12 @@ VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv,
 incl. depthwise, and MatMuls lowered with swapped operand roles), and
 PoolingKernel (2-D pooling). Ops no kernel implements (Softmax, LayerNorm,
 Gelu, Transpose, Slice / Split copies, Gather, OneHot, Cast, SpaceToDepth and
-the `axi.llm` Llama decoder ops) run as host-CPU code inside
+the `axi.llm` Llama decoder and vision-encoder ops) run as host-CPU code inside
 `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
 Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
-library and weight pool (multi-entry projects, `--entry`).
+library and weight pool (multi-entry projects, `--entry`). The opt-in `--plan`
+mode picks MatMul tactics and the issue order from the bitstream's measured
+performance model (`perf_models/`, `../doc/plans/TACTICS_PLAN.md`).
 
 The technical reference is `../doc/scheduler/INFERENCE_SCHEDULER.md`; the user guide is
 `doc/USER_GUIDE.md`.
@@ -75,12 +77,22 @@ Options:
                              Single-row MatMuls on MatmulKernel's GEMV streaming path
                              (both read ports; default auto: where the cost model says
                              it is faster)
+
+Planning (src/planning.py, ../doc/plans/TACTICS_PLAN.md; bit-identical results):
+  --plan                     MatMul tactics and the issue order from the performance model
+  --perf-model FILE          Model file (default: perf_models/kv260/<bitstream-id>.json of
+                             the bitstream named in bitstream_config_kv260.json)
+  --plan-report              Add the "Planning" section to report.md, change nothing
+  --pool-budget-mib MIB      --plan: pool limit for a new order (default: the unplanned pool)
+  --entry-weights NAME=W,... --plan: entry frequencies for the kernel widths a Llama
+                             project's entries share (llm_entries.entry_graphs, i.e.
+                             generate_llm_project.py; default decode 64, head 64, others 1)
 ```
 
 The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
 `matmul_on_conv="auto"` and `matmul_gemv="auto"`; the `OnnxGraph` library
 defaults are `fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
-`matmul_on_conv="auto"`, `matmul_gemv="auto"`.
+`matmul_on_conv="auto"`, `matmul_gemv="auto"`, `plan=None` (off).
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
 
@@ -151,11 +163,16 @@ left in place, non-depthwise grouped Conv) and a worked example on
 inference_scheduler.py   CLI entry point — ONNX → C project
 simplify_onnx.py         CLI entry point — ONNX → ONNX (onnxsim + BN-fusion)
 run_remote_tests.py      On-board correctness runner (SSH)
-run_remote_perf.py       On-board kernel benchmark runner (SSH; bench_src/)
+run_remote_perf.py       On-board kernel benchmark runner (SSH; bench_src/; --json OUT)
 upload_bitstream.py      Load .bit + xclbin + .dtbo on the board (src/bitstream/)
+perf_calibrate.py        Performance-model campaign for --plan: cases / run / fit / host /
+                         simulate / all (--refine, --resume)
 requirements.txt, pyproject.toml (ruff)
 runtime/                 inference_prof / inference_ddr sources copied into projects
-bench_src/               C benchmark project used by run_remote_perf.py
+bench_src/               C benchmark project used by run_remote_perf.py; calib_runner.c
+                         times perf_calibrate.py's kernel-call batches on the board
+perf_models/<platform>/  <bitstream-id>.cases / .calib / .json (kernel model), host.json
+                         (host-op model); perf_models/README.md
 src/
   dtype.py               DataType abstraction (ap_fixed<W,I>, float32)
   layout.py              TensorLayout frozen dataclass (numel, alloc, n_chunks, chunk, stride)
@@ -172,13 +189,24 @@ src/
   llama.py               Llama frontend: config.json + safetensors + formats → entry graphs
                          (image_rows: a VLM text model's prefill reads image-feature rows)
   vit.py                 Vision-encoder frontend (SmolVLM: SigLIP ViT + Idefics3 connector)
-                         → the `vision` entry of a multi-entry project
+                         → the `vision` entry of a multi-entry project (attn_split=R:
+                         softmax / P·V in R query-row parts, default 1)
   vit_nodes.py           the vision host ops (VitLayerNorm / AttnPrep / AttnSoftmax / Gelu /
                          ResAdd / EmbedAdd / PixelShuffle / SumDequant) + VIT_C helpers
   numeric.py             axi.numeric metadata: power-of-two exponents, host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
                          constant-broadcast normalisation
-  matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry)
+  matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry, row
+                         split; _plan_matmul under --plan)
+  planning.py            the opt-in --plan mode (options, model lookup, report line) —
+                         ../doc/plans/TACTICS_PLAN.md
+  perf_calls.py          KernelCall: the register values of a kernel call (every kernel node's
+                         kernel_calls()), the bitstream id
+  perf_model.py          per-bitstream kernel model (exact calls + fitted families), error bands
+  perf_fit.py            fitting it from a calibration campaign (NNLS + k-NN correction)
+  host_model.py          host-op timing model from board profiles
+  tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV)
+  order_search.py        issue-order search on the timed event-stream replay (codegen/timing.py)
   matmul_gemv.py         MatmulKernel GEMV streaming pass (single-row MatMuls, B image)
   llm_entries.py         Llama entry graphs: prefill kernel widths shared with the
                          GEMV decode, one copy of every weight
@@ -186,8 +214,9 @@ src/
   _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
                          platform JSON resolvers (kernels.{conv,matmul,pool})
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
-  schedule.py            Dag: data-flow DAG over scheduled nodes; topological order,
-                         predecessors/successors, independent-pair queries
+  schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
+                         edges); topological order, predecessors/successors,
+                         independent-pair queries
   report.py              ReportGenerator → report.md
   bitstream/             upload_bitstream.py implementation (convert, hwh, xclbin,
                          board, loader, platforms/kv260.py)
@@ -206,6 +235,8 @@ src/
     _cmake.py            generate_cmake()   → CMakeLists.txt
     _banners.py          File-header banner helpers
     multi.py             MultiEntryGenerator (--entry): several graphs, one weight pool
+    timing.py            simulate(): timed replay of the event stream (lane / CPU busy
+                         times, CPU waits) for --plan and perf_calibrate.py simulate
 test/
   gen_*_models.py        Test ONNX model generators; gen_all_models.py runs them all
   helpers.py             _model(), _models_exist() shared by test modules
@@ -213,13 +244,15 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              63 pytest modules, 1517 tests collected (1512 pass, 5 skip;
+  test_*.py              66 pytest modules, 1547 tests collected (1542 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
                          corner cases), test_profiler_overlap.py (overlapping brackets),
                          test_cache_coherency.py (sync audit), test_host_ops.py,
-                         test_llm_ops.py, test_llama.py, test_vit.py, test_matmul_on_conv.py
+                         test_llm_ops.py, test_llama.py, test_vit.py, test_matmul_on_conv.py,
+                         test_planning.py (--plan options, state edges, reordered code),
+                         test_perf_calls.py (kernel_calls() == emitted C), test_timing.py
 ```
 
 ## Key Abstractions
@@ -252,7 +285,7 @@ Key methods:
 Adding a new type: subclass `DataType`, implement all abstract methods, pass
 the instance to `OnnxGraph` and `CodeGenerator`.
 
-### Node Classes (`src/nodes.py`, `src/host_nodes.py`, `src/llm_nodes.py`)
+### Node Classes (`src/nodes.py`, `src/host_nodes.py`, `src/llm_nodes.py`, `src/vit_nodes.py`)
 
 **ScheduledNode** — VectorOPKernel element-wise ops:
 
@@ -296,8 +329,8 @@ chosen with `src/cost_model.py` (conv-cycle-model port vs a board-calibrated
 MatmulKernel model).  Batched MatMuls with per-item weights (attention)
 emit one `run_conv_at()` per item.  When every one-call plan is
 accumulator-limited (fewer than 16 output rows per chunk), the rows are
-split over several `run_conv_at()` calls, with B shared.  Only SmolVLM's
-1024-token vision linears qualify.  The simulator treats it exactly like a
+split over several `run_conv_at()` calls, with B shared.  Without `--plan`
+only SmolVLM's 1024-token vision linears qualify.  The simulator treats it exactly like a
 `MatmulNode` — the two kernels are bit-identical.  See
 `../doc/scheduler/INFERENCE_SCHEDULER.md` §"MatMul on ConvKernel".
 
@@ -347,7 +380,12 @@ C helpers run inside `inference_run()`, numpy `reference()` for the
 simulator; a contiguous 64-byte-aligned `Slice` piece becomes a zero-cost
 sub-buffer view instead (`OnnxGraph._choose_slice_views`).
 **LlmNode** / **LlmAttnConvNode** (`src/llm_nodes.py`) — the `axi.llm`
-domain ops of the Llama frontend.
+domain ops of the Llama frontend; **VitNode** (`src/vit_nodes.py`, an
+`LlmNode`) — those of the vision encoder.
+
+Every kernel node lists the calls it issues with `kernel_calls(layouts)`
+(`src/perf_calls.py` `KernelCall`: the register values), which the
+performance models, `perf_calibrate.py` and `--plan` key on.
 
 `Gemm` is decomposed to `MatMul` + optional `Add` by `OnnxGraph._preprocess_model()`
 at load time, before any node class sees it (`alpha=1, beta=1, transA=0`;
@@ -426,8 +464,14 @@ scheduled node list:
 
 - Edge `u → v` iff some intermediate tensor produced by `u` is consumed
   by `v`. Graph inputs, constant initializers and persistent states no
-  node of the graph produces are **external** — they impose no edges
-  (they're already available before `inference_run()` enters its body).
+  node of the graph produces are **external** — they impose no producer
+  edges (they're already available before `inference_run()` enters its body).
+- Persistent states add ordering edges in list order
+  (`from_graph(state_edges=True)`, the default): a read after a write (RAW),
+  a write after reads (WAR) and a write after a write (WAW), from the
+  nodes' state inputs and `state_updates()` / `state_writes()` — so any
+  order that respects the DAG (the `--plan` order search) keeps every state
+  access where the list put it.
 - ReshapeNodes appear as ordinary DAG nodes (`kernel_name == ""`), so
   consumers of an alias are correctly ordered after the producer of the
   underlying source. The event-stream walker traverses through them
@@ -470,8 +514,9 @@ Override at link time to swap in IRQ-driven waiting (UIO under Linux,
 GIC under bare-metal) without touching the generated code.
 
 **Event stream** — `CodeGenerator._compute_event_stream()` is the single
-source of truth for the schedule. It walks `graph.nodes` once, tracks
-`pending[lane] → node_idx`, and emits a deterministic sequence:
+source of truth for the schedule. It walks `graph.nodes` once (or a
+candidate `order` against a given `dag`, for the `--plan` order search),
+tracks `pending[lane] → node_idx`, and emits a deterministic sequence:
 
 ```
 ('comment', node_idx)              ─ node header
@@ -486,7 +531,8 @@ source of truth for the schedule. It walks `graph.nodes` once, tracks
 Both the body emitter (`_inference_function`) and the live-interval
 analyser (`_compute_live_intervals`) consume this stream verbatim, so
 the buffer-slot colouring and the emitted waits cannot disagree about
-which lanes are in flight at any point.
+which lanes are in flight at any point; `codegen/timing.py` replays the
+same stream with modelled durations.
 
 A wait fires only when (a) some predecessor is still in flight on its
 lane, or (b) the target lane has a different op pending. Predecessor
@@ -600,13 +646,14 @@ one, masking validator regressions. Re-run the generator after any
 
 ## On-Device Testing and Benchmarking
 
-Three scripts drive KV260 hardware over SSH:
+Four scripts drive KV260 hardware over SSH:
 
 | Script | Purpose | Config |
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (148 models) |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s) | `perf_config.json` (60 cases) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json` (60 cases) |
+| `perf_calibrate.py run` | **Calibration** for `--plan` — times batches of kernel calls with `bench_src/calib_runner.c` (two passes), then `fit` writes `perf_models/<platform>/<bitstream-id>.json` (`../doc/plans/TACTICS_PLAN.md` §4.3) | `--config` in the `run_remote_perf.py` format |
 
 All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
 the full reference including the `benchmarks` config section and per-kernel

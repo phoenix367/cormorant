@@ -6,10 +6,10 @@
 
 Four Vitis HLS kernels for the Xilinx Kria KV260 (VectorOP, MatMul, Conv,
 Pooling) and a Python code generator that compiles ONNX models — CNNs,
-BERT-base and a Llama-family decoder — into self-contained C projects that
-drive the kernels from Linux on the board.  Everything runs in
-`ap_fixed<16,8>`, and the board's outputs are checked bit for bit against the
-generator's fixed-point simulation.
+BERT-base, Llama-family decoders and a ViT vision encoder — into
+self-contained C projects that drive the kernels from Linux on the board.
+Everything runs in `ap_fixed<16,8>`, and the board's outputs are checked bit
+for bit against the generator's fixed-point simulation.
 
 > **About this fork.**  This repository is an independent fork of Cormorant.
 > It is not affiliated with, endorsed by or supported by any company,
@@ -21,18 +21,19 @@ generator's fixed-point simulation.
 
 ## Results on the board
 
-KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26/27):
+KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26 to 28):
 
 | Model | Result | Source |
 |---|---|---|
 | ResNet-18, 224×224 | **60.3 ms (16.6 FPS)** per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
 | MobileNet V1 / V2, 224×224 | 81.0 / 63.9 ms per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
 | MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **971 ms** per inference, EM/F1 equal to float32 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **962 ms** per inference (p50; 951 ms built with `--plan`), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
 | SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md) |
+| SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
 
-The BERT and SmolLM2 logits are bit-exact with the scheduler's simulation.
+The BERT, SmolLM2 and SmolVLM logits are bit-exact with the scheduler's simulation.
 The FPGA design uses 81 % of the DSPs (1009 / 1248), 73 % of the LUTs,
 111.5 / 144 BRAM and 48 / 64 URAM ([RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)).
 
@@ -49,7 +50,7 @@ runs the PL at 100 MHz.  Compile-time bounds come from
 | Kernel | ONNX ops | Highlights | Reference |
 |---|---|---|---|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), fused Relu / Relu6 after an op | [VECTOROP_KERNEL](doc/kernels/VECTOROP_KERNEL.md) |
-| **MatmulKernel** | `MatMul` | tiles 4 × 32 × 256, packed-B weight layout, K ≤ 4096, batched | [MATMUL_KERNEL](doc/kernels/MATMUL_KERNEL.md) |
+| **MatmulKernel** | `MatMul` | tiles 4 × 32 × 256, packed-B weight layout, K ≤ 4096, batched; GEMV mode for one-row MatMuls (B through both read ports) | [MATMUL_KERNEL](doc/kernels/MATMUL_KERNEL.md) |
 | **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | 16 × 16 MAC grid, two output pixels per cycle (512 MACs), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels | [CONV_KERNEL](doc/kernels/CONV_KERNEL.md) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | 8 channel lanes, windows ≤ 7×7, dilation, `count_include_pad` | [POOLING_KERNEL](doc/kernels/POOLING_KERNEL.md) |
 
@@ -77,11 +78,17 @@ program) for Linux with XRT buffers or for bare metal:
   builds decode / prefill / head graphs with host ops for RMSNorm, RoPE
   attention with a KV cache, SiLU and a float residual stream; per-channel
   power-of-two exponents fit the model into Q8.8.  Several graphs share one
-  library and weight pool (`--entry`).
+  library and weight pool (`--entry`).  A ViT frontend (SmolVLM's SigLIP-style
+  encoder + connector) adds a `vision` entry whose image features feed the
+  decoder's prefill.
 - **Scheduling** — kernels on different lanes run concurrently; one weak
   `kernel_wait()` does the synchronisation; intermediate buffers share pool
   slots by event-stream liveness; cache clean / invalidate calls are emitted
   wherever the CPU and the FPGA share a buffer.
+- **Planning (optional, `--plan`)** — MatMul tactics and the issue order
+  chosen from performance models of the bitstream, measured once on the
+  board (`perf_calibrate.py`); results stay bit-identical, and without
+  `--plan` nothing changes ([TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md)).
 - **Checking** — a fixed-point simulator produces the expected outputs the
   generated test compares bit for bit; `report.md` summarises the model,
   memory and quantisation error.
@@ -103,7 +110,7 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/image_classification/`](demo/image_classification/) | MobileNet V1 / V2 and ResNet-18: top-5 ImageNet predictions for your images |
 | [`demo/camera/`](demo/camera/) | MobileNet V1 on live RealSense frames, annotated frames streamed back over SSH |
 | [`demo/bert_squad/`](demo/bert_squad/) | BERT-base extractive question answering on SQuAD 1.1 |
-| [`demo/chat/`](demo/chat/) | An OpenAI-compatible chat server on the board: BERT document QA and SmolLM2-135M generative chat, usable from `chat.py` or any OpenAI client |
+| [`demo/chat/`](demo/chat/) | An OpenAI-compatible chat server on the board: BERT document QA, SmolLM2-135M / 360M generative chat and SmolVLM-256M chat about images, usable from `chat.py` or any OpenAI client |
 
 ---
 
@@ -133,7 +140,7 @@ ctest
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1507 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1547 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -189,8 +196,8 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1507 tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (121 tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1547 tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (149 tests) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make TestSimulation TestConvRef TestConvGrid TestMatmulRef TestPoolingSim && ctest` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
@@ -218,6 +225,8 @@ own models.
 | [ResNet-18](https://drive.google.com/file/d/1DKyALYam5jAzMSK8ulgFQuSbQ62-EVvr) | `1×3×224×224` | ImageNet classifier (residual blocks) |
 | bertsquad-12 (ONNX model zoo) | 256 tokens | extractive QA ([demo/bert_squad](demo/bert_squad/README.md)) |
 | SmolLM2-135M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
+| SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
+| SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](demo/chat/README.md)) |
 
 ---
 

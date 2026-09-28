@@ -15,7 +15,9 @@ to zero-cost no-ops when off.  The two modules can be linked
 independently into any host application that uses the generated
 `inference` library — the MNIST, image-classification, BERT-SQuAD and
 chat benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
-`llm_bench.c`) all use them.
+`llm_bench.c`) all use them (the chat bench only the per-layer profiler).
+The per-layer profiles also feed the host-op timing model of the
+scheduler's `--plan` mode ([Other benches](#other-benches)).
 
 > Companion docs:
 > [`inference-scheduler/doc/USER_GUIDE.md`](../../inference-scheduler/doc/USER_GUIDE.md) (codegen),
@@ -421,6 +423,28 @@ ddr (zuplus_apm @0xfd490000): total read=0.07 GB/s (2.94 GiB)  write=0.00 GB/s (
 Full per-layer and per-slot data is also written to
 `build/results.json` under `metrics.layer_stats` and `metrics.ddr_stats`
 for downstream analysis.
+
+### Other benches
+
+- **Image classification, BERT-SQuAD** — the same `run.profile_layers`
+  switch and `--profile-layers` flag of their `deploy_and_run.py`; the
+  results land under `metrics.layer_stats` / `metrics.ddr_stats` too
+  (the BERT report adds a per-op-kind breakdown).
+- **Chat** (`demo/chat/src/llm_bench.c`) — no DDR counters; with
+  profiling each dump is preceded by a `PROFILE_PHASE: <phase>` line
+  (`decode`, `prefill_<n>`, `vision`), and the profile is reset before each
+  phase.  `demo/chat/scripts/llm_board.py --profile` builds a second
+  `build_prof/` with `-DINFERENCE_PROFILING=ON`; with `--out FILE` the
+  results JSON holds `profile` (ms per call per op kind and phase) and
+  `profile_layers` (per phase, the called layers: `i`, `name`, `calls`,
+  `mean_us`, `min_us`, `total_us`).
+
+`inference-scheduler/perf_calibrate.py host --profile MODEL=RESULTS.json`
+fits the host-op model `perf_models/<platform>/host.json` from these files
+(`profile_layers`, or `metrics.layer_stats`; layers are matched to host
+ops by ONNX node name), and `simulate --profile ...` compares the
+scheduler's predicted times with the measured ones
+([`INFERENCE_SCHEDULER.md`](INFERENCE_SCHEDULER.md) §"Planning").
 
 ---
 

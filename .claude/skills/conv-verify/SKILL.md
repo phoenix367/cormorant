@@ -61,7 +61,7 @@ cp conv_test_data/* ../hw/test_data/conv_test_data/
 ```
 
 Keep new fixtures SMALL (xsim ≈ 20 µs simulated per wall-clock second;
-the 43-case set runs in ~18 min).  If the layout changed, the testbench's
+the 63-case set runs in ~18 min).  If the layout changed, the testbench's
 element-count formulas in `hw/cormorant_test_stand/.../conv_tb.sv` must
 match `conv_weight_numel` / `conv_bias_numel`.
 
@@ -89,22 +89,24 @@ make synthesize_conv_kv260
   (The conv build uses the Vitis unified component flow, so reports live
   under `<component>/hls/syn/report/`, not the legacy `solution1/syn/report/`.)
 
-  Report any of these against the prior run (baseline as of §2.39:
+  Report any of these against the prior run (baseline as of §2.42:
   top-level slack **0.00 ns**, **no** II violations, all four ports
   `128 -> 128` (`gmem0` x, `gmem1` weight, `gmem2` bias read; `gmem3` y write),
-  BRAM 165 (57 %), DSP 262, FF ~46 k, LUT ~68 k (58 %), URAM 16):
+  BRAM18 127 (44 %), DSP 679 (54 %), FF ~66.5 k, LUT ~99.4 k (csynth
+  over-estimates ConvKernel LUT ~2.4×), URAM 48 (75 %)):
   - **Top-level slack** going negative, or any sub-block slack that worsened.
   - **Any** `II Violation Information` entry — the design has none; the
-    grid loop (`ConvMacGrid.h`, iteration latency 6) and the fused consumer
-    loops are all II=1.
+    flat pair sweep (iteration latency 8 since §2.41) and every other
+    PIPELINE loop are II=1.
   - `m_axi_gmem0..3` data-width column changes.  `gmem0/1/2` are READ_ONLY
     (x, w, b), `gmem3` is WRITE_ONLY (y); all four are 128-bit
     `hls::burst_maxi<ap_uint<128>>` ports since §2.38/§2.39 — a change
     here means the port type or the layout contract moved (and the block
     designs' `C_M_AXI_GMEMn_DATA_WIDTH` instance parameters must follow).
   - Resource jumps (BRAM / DSP / FF / LUT % columns on the top-level
-    `ConvKernel` row) — flag anything >10 % of the previous value.  BRAM is
-    the tight resource on the full 128-bit design (56 % placed).
+    `ConvKernel` row) — flag anything >10 % of the previous value.  LUT and
+    DSP are the tight resources on the full 128-bit design (§6.4 bitstream:
+    LUT 73 %, DSP 1009 / 1248).
 
   Don't fail the gate on these — the user wants to see them in the report — but list any change clearly.
 
@@ -114,7 +116,7 @@ make synthesize_conv_kv260
 make behavior_test_conv
 ```
 
-- Takes ~2–3 min (Vivado xsim). The final two lines must be of the form:
+- Takes ~18 min for the 63 checked-in cases (Vivado xsim). The final two lines must be of the form:
 
   ```
   [ts] kernel=ConvKernel  total=N  passed=N  failed=0  all_passed=True

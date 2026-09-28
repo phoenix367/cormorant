@@ -302,6 +302,7 @@ with `run.power_poll_s`.
 | `--save-only` | headless host: save frames to `build/stream/` instead of a window |
 | `--check-only` | run preflight checks for every stage and exit |
 | `--no-cleanup` (deploy script) | leave the remote work_dir for inspection |
+| `--plan` (generate script; also `--perf-model`, `--plan-report`, `--pool-budget-mib`) | planning mode ([`doc/plans/TACTICS_PLAN.md`](../../doc/plans/TACTICS_PLAN.md) §9): tactics and issue order from the bitstream's performance model, bit-identical results; or `"plan": true` in the config |
 
 `--check-only` is the fastest way to confirm the board is ready — it probes
 SSH, the kernels' UIO devices, and the board-side RealSense / OpenCV

@@ -32,6 +32,7 @@ its own README under [`demo/`](../demo/README.md).
 | understand a kernel's interface, dataflow and limits | the kernel's reference in [kernels/](#kernels) |
 | know why a kernel is built the way it is, and how fast each step made it | the kernel's optimisation log in [kernels/](#kernels) |
 | profile a model on the board | [PROFILER](scheduler/PROFILER.md) |
+| plan tactics and the issue order from measured performance (`--plan`), or calibrate a new bitstream | [INFERENCE_SCHEDULER "Planning"](scheduler/INFERENCE_SCHEDULER.md#planning---plan), [TACTICS_PLAN §9](plans/TACTICS_PLAN.md); `perf_calibrate.py` and its data: [`perf_models/`](../inference-scheduler/perf_models/README.md) |
 | see the latest board results | the project [README](../README.md#results-on-the-board) |
 | fix a board that stops responding | [CHAT_PLAN §18](plans/CHAT_PLAN.md) and [`board/kv260/`](../board/kv260/) |
 | debug a strange RTL simulation failure | [SIMULATION_ISSUES](build-and-test/SIMULATION_ISSUES.md) |
@@ -66,7 +67,7 @@ survey of HLS convolution techniques (not a plan).
 
 | Document | Contents |
 |---|---|
-| [INFERENCE_SCHEDULER](scheduler/INFERENCE_SCHEDULER.md) | Technical reference: supported ops, kernel mapping, MatMul on ConvKernel, host-CPU ops, numerics, the Llama frontend, cache coherency, the generated code |
+| [INFERENCE_SCHEDULER](scheduler/INFERENCE_SCHEDULER.md) | Technical reference: supported ops, kernel mapping, MatMul on ConvKernel, host-CPU ops, numerics, the Llama frontend, the vision encoder, planning (`--plan`), cache coherency, the generated code |
 | [PROFILER](scheduler/PROFILER.md) | Per-layer wall-clock and DDR-bandwidth profiling of generated projects on the board |
 
 In [`inference-scheduler/doc/`](../inference-scheduler/doc/):
@@ -90,5 +91,6 @@ line at the top says what is done.
 | [THROUGHPUT_PLAN](plans/THROUGHPUT_PLAN.md) | MatMul, depthwise and VectorOP throughput tracks (2026-09-25/26): executed |
 | [CONV_2D_GRID_PLAN](plans/CONV_2D_GRID_PLAN.md) | The 2-D MAC grid for ConvKernel: executed, then grown further by RESNET18_15FPS_PLAN |
 | [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (60.3 ms = 16.6 FPS) |
-| [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference, accuracy equal to float32 |
-| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19) and SmolLM2-360M (§20) |
+| [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference (962 ms p50 on 2026-09-28), accuracy equal to float32 |
+| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
+| [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |

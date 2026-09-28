@@ -136,6 +136,14 @@ $PY scripts/deploy_and_run.py           # all 50, no profiling
 their outputs are missing (`--regenerate` forces both) and forwards every
 other option to `deploy_and_run.py`.
 
+`generate_project.py` also takes `--out-dir DIR`, `--check-only` and the
+scheduler's planning options (`--plan`, `--perf-model FILE`,
+`--plan-report`, `--pool-budget-mib MIB`;
+[`doc/plans/TACTICS_PLAN.md`](../../doc/plans/TACTICS_PLAN.md) §9): tactics
+and issue order from the bitstream's performance model, results bit-identical.
+Without `--plan` / `--plan-report` / `--perf-model` it uses the config's
+`plan` key.
+
 ## Sample run
 
 **Phase 1** (2026-09-26: every MatMul on MatmulKernel, host ops unoptimised
@@ -298,6 +306,11 @@ Per inference:
 | other | 5 | 3 ms | 0.2 ms |
 | **wall** | | **12131 ms** | **971 ms** |
 
+**Latest** (2026-09-28, bitstream hw_128 d7ce129; 10 examples, no
+profiling): p50 **962.3 ms** per inference; generated with `--plan` (issue
+order from the performance model) **951.3 ms**, bit-exact
+(`doc/plans/TACTICS_PLAN.md` §9, T4).
+
 ## Options (`deploy_and_run.py`)
 
 | Flag | Effect |
@@ -339,6 +352,10 @@ board logits differ from the simulation, 1 = a step failed.
   references are identical bit for bit — BERT_PLAN gate (b)).
 * **`run.smoke_test`** — build and run the generated `test_inference` first
   (fixed ramp inputs, expected outputs from the simulation; prints PASSED).
+* **`plan`** (optional) — `true`, or an object with `enabled`, `perf_model`,
+  `report`, `pool_budget_mib`: `generate_project.py` (also
+  through `run_demo.py --regenerate` and the chat demo's `deploy.py
+  --regenerate`) generates the project in planning mode; see *Run*.
 
 ## How it works
 

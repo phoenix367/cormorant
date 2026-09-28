@@ -17,10 +17,10 @@ takes its board settings from `bert_squad/bert_squad_config.json`.
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
 | [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.27 / 5.4 ms per image) |
-| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 62.3 ms = 16 FPS at 100 MHz) |
+| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 60.3 ms = 16.6 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
-| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (971 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M-Instruct | chat messages over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming): question answering over a user-supplied document (`bert-squad`, ~1 s per 256-token window) and generative multi-turn chat (`smollm2-135m-instruct`, ~10 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
+| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (962 ms per inference) |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct | chat messages (and images) over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming), backends `bert-squad`, `smollm2` and `smolvlm`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s) and questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
 
 ## Common workflow
 
@@ -43,6 +43,12 @@ kernel UIO devices, board-side dependencies) without uploading anything —
 the fastest way to confirm a board is ready (`deploy.py --check-only` for
 `chat/`).
 
+Planning (optional, [TACTICS_PLAN §9](../doc/plans/TACTICS_PLAN.md)): set
+`"plan": true` in `<demo>_config.json`, or pass `--plan` to
+`scripts/generate_project.py`, to generate the project from the bitstream's
+performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
+`scripts/generate_llm_project.py --plan` (the LLM libraries).
+
 ## Prerequisites (shared)
 
 - **Host:** Python 3.10+ and each demo's `requirements.txt` (or the
@@ -52,8 +58,8 @@ the fastest way to confirm a board is ready (`deploy.py --check-only` for
   `local.driver_dirs` at the result.  The driver sources only describe the
   AXI-Lite registers, so they are the same for every `AXI_BUS_WIDTH`.
 - **KV260 board:** Linux with the bitstream and overlay loaded
-  (`inference-scheduler/upload_bitstream.py`, see *Deploy and run on the
-  KV260* in the [root README](../README.md); UIO devices `fabric_vecop` /
+  (`inference-scheduler/upload_bitstream.py`, see *Quick start* step 5 in
+  the [root README](../README.md#quick-start); UIO devices `fabric_vecop` /
   `fabric_matmul` / `fabric_conv` / `fabric_pool`), `gcc` / `cmake` /
   `make`, the XRT runtime, and passwordless `sudo`.  The numbers in the
   demo READMEs were measured with the 128-bit block design

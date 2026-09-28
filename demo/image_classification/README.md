@@ -314,6 +314,7 @@ The full per-image top-K table is also written to `build/results.json`.
 | `--check-only` | run preflight checks for every stage and exit |
 | `--profile-layers` | enable per-layer wall-clock profiling on the board |
 | `--no-cleanup` (deploy) | leave the remote work_dir for inspection |
+| `--plan` (generate script; also `--perf-model`, `--plan-report`, `--pool-budget-mib`) | planning mode ([`doc/plans/TACTICS_PLAN.md`](../../doc/plans/TACTICS_PLAN.md) §9): tactics and issue order from the bitstream's performance model, bit-identical results; or `"plan": true` in the config |
 | `--verbose` | also print the cmake / make output of steps that succeed (a failed step always prints its output) |
 
 ## Tuning the run

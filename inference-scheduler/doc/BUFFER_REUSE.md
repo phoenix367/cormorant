@@ -134,6 +134,12 @@ Two tensors **conflict** (cannot share a slot) when their intervals overlap:
                              ↑ no overlap → can share
 ```
 
+The event stream follows the node list.  With `--plan` the issue-order
+search (`src/order_search.py`) may reorder that list, which changes the
+intervals and therefore the slots; a new order is kept only if the
+intermediates' pool stays within `--pool-budget-mib` (default: the pool of
+the unplanned order).
+
 ---
 
 ## 4. Greedy Interval Colouring
@@ -144,7 +150,7 @@ optimally in O(*n* log *n*):
 
 ```mermaid
 flowchart TD
-    S([Start]) --> A["Sort intermediates by produce_idx\n(ties broken: larger alloc first)"]
+    S([Start]) --> A["Sort intermediates by start event\n(ties broken: larger alloc first)"]
     A --> B{More tensors?}
     B -->|Yes| C["Next tensor T\n(start, end, alloc)"]
     C --> D{Existing slot with\nslot.end &lt; T.start?}
@@ -279,9 +285,9 @@ align_to  = 64 bytes / 2 bytes per element = 32 elements
 align_up(n) = (n + 31) & ~31
 ```
 
-A slot's footprint is `align_up(max(tenant.alloc))`, not `max(align_up(tenant.alloc))` —
-the distinction matters when tenants differ in size: the slot must fit the
-**largest** tenant, and that padded footprint is what advances the pool offset.
+A slot's footprint is `max(align_up(tenant.alloc))` (the same as `align_up`
+of the largest tenant): the slot must fit the **largest** tenant, and that
+padded footprint is what advances the pool offset.
 
 ---
 
@@ -365,7 +371,7 @@ and `test_nop_corner_cases.py::TestNopFixturesNoSlotAliasing`):
 
 | Test | What it checks |
 |------|---------------|
-| `test_intervals_produce_le_consume` | `produce ≤ consume` for all intermediates |
+| `test_intervals_produce_le_consume` | `start ≤ end` for all intermediates |
 | `test_no_weights_in_intervals` | Weight tensors absent from interval dict |
 | `test_no_reshape_aliases_in_intervals` | Reshape aliases absent |
 | `test_intervals_cover_all_non_alias_intermediates` | Every eligible tensor has an entry |
@@ -416,7 +422,7 @@ AvgPool 7×7  ──►  Conv2d_logits  ──►  Reshape + Squeeze  ──► 
 | Property | Value |
 |----------|-------|
 | ONNX nodes (ops) | 58 |
-| Intermediate tensors | 56 |
+| Intermediate tensors | 57 (56 pool buffers + 1 Reshape alias) |
 | Weight tensors | 56 (one filter + one bias per conv layer) |
 | Graph inputs | 1 (`input`) |
 | Graph outputs | 1 (`output`) |
