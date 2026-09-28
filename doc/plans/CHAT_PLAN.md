@@ -12,8 +12,8 @@ CMA pool 488 → 286 MiB (§19).  SmolLM2-360M-Instruct: bit-exact on the
 board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  The study
 stage is reproducible from pinned checkpoints and texts, with the formats
 hashes recorded (`llm_calibrate.py`, §21).  SmolVLM-256M (image input): numeric
-study GO on today's bitstream, answers as close to float as bf16 (§22); not
-implemented yet.  Not done:
+study GO (§22), then implemented — bit-exact on the board, 7.7 s per image +
+~9.5 tok/s, served by the chat server with OpenAI image_url parts (§23).  Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
@@ -1907,3 +1907,156 @@ The pieces:
    `<end_of_utterance>` as the stop token.
 4. **The gates:** scheduler simulation and board bit-exact against this
    emulation.
+
+## 23. SmolVLM-256M on the FPGA (2026-09-28)
+
+**Result.**  `libsmolvlm_256m.so` implements the §11 C API plus images, and
+the chat server serves `smolvlm-256m-instruct` next to SmolLM2-360M and
+BERT.
+- **Board gate:** the logits of 2 image prompts × (prefill + 16 greedy
+  steps) are bit-exact with the scheduler simulation, which equals the
+  study emulation.
+- **Chat API:** an image question's greedy answer through the server
+  (JPEG decoded and resized on the board) equals the study emulation's.
+- **Speed:** the vision encoder takes 7.7 s per image; the text runs at
+  135M speed (101 ms / token).
+
+**Numerics, final (vlm_study.py; the specification the C reproduces):**
+- **GELU:** a 65 536-entry table per fc1 exponent, filled with libm exp in
+  GELU's tanh form (y = x − x / (exp(2u) + 1)).  fc1's bias is added as an
+  integer at fc1's exponent first.  libm tanh is avoided because its
+  aarch64 and x86 results need not agree; exp agrees, as the SiLU tables
+  showed.
+- **Connector:** K = 12 288 exceeds every kernel (MatmulKernel 4096,
+  ConvKernel 1024 input channels × kw ≤ 7).  It runs as three
+  4096-row MatMuls at a shared output exponent, summed exactly on the host.
+- **Patch embedding:** the bias and position-embedding table is float32,
+  and the folded patch weights are float32 as the ONNX initializer holds
+  them.
+- **Formats:** `vlm_study.py formats` writes the text formats (llm_study
+  format, with the sink rows) and the vision formats (`pow2+p12`) into
+  `assets/study/smolvlm-256m-instruct/`.  Reruns are byte-identical.
+- **The final spec, rerun on the §22 data** (24 images, 96 new tokens;
+  `study/smolvlm-256m-instruct/final/`):
+
+  | vision / text | features rel. err | answer top-1 | KL | identical |
+  |---|---:|---:|---:|---:|
+  | bf16 / bf16 | 0.017 | 0.983 | 0.0011 | 7 / 24 |
+  | pow2+p12 / float | 0.055 | 0.981 | 0.0019 | 9 / 24 |
+  | float / pow2+sink+p12+mix | 0 | 0.977 | 0.0016 | 6 / 24 |
+  | **pow2+p12 / pow2+sink+p12+mix (built)** | 0.055 | **0.970** | 0.0034 | 5 / 24 |
+  | pow2+p14+in7 / pow2+sink+p12+mix | 0.047 | 0.979 | 0.0028 | 5 / 24 |
+
+  The same as §22's within noise (the float reference moved slightly too:
+  its b0 table is float32 now).  pow2+p14+in7 did better here and equal in
+  §22.  Switching needs only its vision formats and a regeneration: every
+  exponent is data.
+
+**Scheduler** (`inference-scheduler/src/vit.py`, `src/vit_nodes.py`):
+- **The `vision` entry:** patches [1024][768] (raw uint8 values at exponent
+  0) → state `vlm.img` [64][576] float32.
+- **Graph:** 598 nodes, and the cost model puts all 76 MatMuls on
+  ConvKernel.
+- **Host ops:**
+  - VitEmbedAdd, VitLayerNorm, VitResAdd (the bias inside the float32 add);
+  - VitAttnPrep: biases, q / k at per-head exponents, the q.Kᵀ input image,
+    and the K / V caches;
+  - VitAttnSoftmax: every key, P at 2⁻¹²;
+  - VitGelu, VitPixelShuffle (column chunks), VitSumDequant.
+  Their C helpers (`VIT_C`) are emitted only when used, so every other
+  project stays byte-identical; SmolLM2-135M's project differs only in its
+  timestamp line.
+- **Attention:** q.Kᵀ and P.V reuse `LlmAttnConvNode` with a static key
+  count (no pos / n inputs; keys = 1024).  The K / V caches are one pair of
+  raw DMA states (exponent 0, the exponents in the prep op's attributes),
+  shared by all 12 layers.
+- **The text model:** `LlamaFrontend(image_rows=64)`.  `LlmEmbed` gets an
+  optional image-state input: ids V .. V + 63 read its rows.
+- **Project:** `src/llm_entries.entry_graphs` builds extra entries (vision)
+  with the default lowering.
+- **Tests:** `test/test_vit.py` covers a tiny random ViT:
+  - simulation == study emulation, both engine choices;
+  - generated C == simulation in 3 build configurations;
+  - image rows against the study text model;
+  - a combined vision + text project.
+  The full suite: 1510 pass, 5 skipped.
+
+**Library** (`generate_llm_project.py --model-name smolvlm-256m-instruct` →
+`build/llm_project_smolvlm_256m`, 100 s):
+- **Pool:** 495 MiB (weights 433, KV caches 26, intermediates 36).  Host
+  tables 57 MiB, weight files 514 MB.  One copy of every weight: decode's
+  GEMV path reads the prefill image.
+- **C API:** `llm_api.c` adds `llm_image_tokens()` (64), `llm_image_size()`
+  (512) and `llm_image(rgb)`.  `llm_image(rgb)` patches the 512 × 512 × 3
+  image into a DMA buffer and runs the vision entry.  `llm_prefill()`
+  accepts ids up to V + 63.  Text-only libraries report 0 and refuse
+  images.
+- **Bench:** `llm_bench -I images.bin` encodes image p before prompt p.
+- **Board paths:** `llm_board.py` installs `lib/libsmolvlm_256m.so`,
+  `/root/smolvlm_256m_weights` and `llm_project_smolvlm_256m`.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| `vlm_sched_check.py --text` (simulation vs study) | vision 2 / 2 images bit-exact; text 2 / 2 prompts (80 / 83 tokens, split 64 + 16 / 64 + 19) + 16 decode steps bit-exact |
+| `vlm_host_emu.py` (generated C on the host) | 2 × 9 / 9 logits bit-exact, re-open identical |
+| `llm_board.py` (KV260) | 2 × 17 / 17 logits bit-exact, re-open identical; `llm_lib_check`: exports, chunked prefill, threads and re-open all fine; the 4 MB CMA-return rule missed by 7.6 MB (page cache, as in §19 / §20) |
+
+**Board** (same bitstream as §19; profile per kind, with the host softmax
+overlapping the ConvKernel calls):
+
+| | |
+|---|---:|
+| `llm_image` (vision encoder + connector) | **7.73–7.76 s** |
+| … MatMuls (76, ConvKernel) | 3.6 s |
+| … softmax (host, 144 × 1024²) | 2.3 s |
+| … P.V (ConvKernel) | 2.1 s |
+| … q.Kᵀ (ConvKernel) | 0.85 s |
+| … GELU 0.43, LayerNorm 0.32, attention prep 0.24, residual adds 0.12 | 1.1 s |
+| decode | 101 ms / token |
+| prefill 16 / 64 / 256 tokens | 0.34 / 0.44 / 1.28 s |
+| `llm_open` cached / cold (SD card) | 1.0 / 21.6 s |
+| CMA | 520–530 MB |
+
+**Server** (`smolvlm_backend.py`, `idefics3.py`, `vlm_image.py`;
+`kv260_chat_server.py --backend smolvlm`):
+- **Images in requests:** OpenAI `image_url` parts with base64 data URLs.
+  The server fetches no remote URLs.  Text models answer an image with 400
+  `images_not_supported`, and the body limit is 32 MB when an image model
+  is served.
+- **Preprocessing:** Pillow, the processor's two LANCZOS resizes.  The
+  pixels are identical under Pillow 9.0.1 (board), 10.2 and 12.3 for the
+  test JPEGs, and an LRU cache keyed by URL keeps a resent history from
+  being decoded again.
+- **Template:** `idefics3.py` produces transformers' Idefics3Processor ids
+  for 7 conversation shapes (`tests/data/smolvlm_cases.json`).
+- **Prefix cache:** keyed by content, with image rows keyed as (SHA-256,
+  row).  New positions are prefilled in segments with `llm_image()` before
+  each image block.  The answer's first leading space is dropped, so a
+  resent answer tokenizes exactly as generated.
+- **Tests:** 11 in `tests/test_smolvlm_backend.py`; the chat suite passes
+  149 tests.
+- **Clients:** `deploy.py` (a `smolvlm` config block, Pillow in the
+  preflight) and `chat.py --image FILE` / `/image FILE`.
+
+Through the API on the board, greedy:
+
+| request | cached / prefilled tokens | TTFT | decode |
+|---|---|---:|---:|
+| first image (model load: 360M evicted, cold `llm_open`) | 1 / 80 | 9.7 s (57 s total) | 9.1 tok/s |
+| the same image, another question | 70 / 12 | 0.36 s | 9.0 tok/s |
+| a follow-up turn | 104 / 15 | 0.36 s | 9.6 tok/s |
+| a new image | 5 / 79 | 9.1 s | 9.5 tok/s |
+
+The answers read like the float model's.  For the cats photo, "The image
+depicts two cats lying on a pink surface. The cat on the left is smaller
+and appears to be a mutt …" is word for word the study emulation's.
+
+**Open items:**
+- **Vision speed:** 7.7 s per image.
+  - The host softmax (2.3 s) could use more threads or a narrower exp
+    table.
+  - P.V (2.1 s) is weight-request-latency bound, like BERT's.
+  - The MatMuls reach only 24 GMAC/s against BERT's 44: K = 768 is short.
+- **Image splitting:** image splitting (more tiles) needs a larger context.

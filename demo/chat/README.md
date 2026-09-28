@@ -50,6 +50,8 @@ demo/chat/
 ├── chat_backend.py          — the backend interface (Backend, ChatRequest, Delta, Finish, ...)
 ├── bert_squad_backend.py    — backend A: document / question mapping, windows, libbert_squad.so
 ├── smollm2_backend.py       — backend B: prompt, prefix cache, decode loop, libsmollm2.so (§11 API)
+├── smolvlm_backend.py       — backend C: images (llm_image), prefix cache keyed by image content
+├── idefics3.py, vlm_image.py — SmolVLM's chat template with images; data URL -> 512 x 512 pixels (Pillow)
 ├── smollm2_tokenizer.py     — SmolLM2's byte-level BPE (tokenizer.json) + incremental detokenizer
 ├── chatml.py                — SmolLM2's ChatML template, block-wise tokenizing, history trimming
 ├── sampler.py, src/sampler.{c,h} — sampling (libsampler.so; pure-Python fallback, same tokens)
@@ -70,6 +72,8 @@ demo/chat/
 │   ├── llm_models.json      — pinned checkpoints / texts (SHA-256) and the expected formats hashes
 │   ├── requirements-study.txt — the .venv-export versions that reproduce those hashes
 │   ├── vlm_study.py         — SmolVLM-256M numeric study (vision encoder + image prompts, CHAT_PLAN §22)
+│   ├── vlm_project.py, vlm_sched_check.py, vlm_host_emu.py — SmolVLM entries, gate (sim == study), C on the host
+│   ├── vlm_template_fixture.py — tests/data/smolvlm_cases.json (template ids, image pixels; .venv-export)
 │   ├── vlm_study_inputs.json — its pinned checkpoint revision, file and COCO image hashes
 │   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export)
 ├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/
@@ -381,6 +385,40 @@ Then point `smollm2.lib` at `/root/kv260_chat/lib/libsmollm2_360m.so`, set
 `smollm2.cma_mb` to 760 and run `deploy.py`: the server serves the model the
 library names (`llm_model_name()`), `smollm2-360m-instruct`
 (`smollm2.model_id` / `--llm-model-id` override it).
+
+### SmolVLM-256M-Instruct — chat about images
+
+`smolvlm-256m-instruct` (CHAT_PLAN §22, §23) answers questions about images
+sent as OpenAI `image_url` parts — base64 data URLs; the server fetches
+nothing.  One 512 × 512 tile per image (67 prompt tokens): the vision
+encoder takes 7.7 s on the FPGA, then text comes at ~9.5 tokens/s; a
+follow-up question about the same image reuses it (TTFT ~0.4 s).  Its pool
+is 495 MiB, so it swaps with SmolLM2-360M under `--resident auto`.
+
+```bash
+cd demo/chat
+../../.venv-export/bin/python scripts/vlm_study.py fetch     # checkpoint + COCO images (pinned hashes)
+../../.venv-export/bin/python scripts/vlm_study.py formats   # text + vision exponents (~3 min)
+$PY scripts/generate_llm_project.py --model-name smolvlm-256m-instruct
+                                          # -> build/llm_project_smolvlm_256m (100 s)
+$PY scripts/llm_board.py --project build/llm_project_smolvlm_256m --install-only
+                                          # -> lib/libsmolvlm_256m.so, /root/smolvlm_256m_weights
+```
+
+Add `"smolvlm"` to `server.backends` in `chat_config.json` (the `smolvlm`
+block: library, tokenizer, `cma_mb` 540; the board needs `python3-pil`) and
+run `deploy.py`.  Clients:
+
+```bash
+python3 chat.py --model smolvlm-256m-instruct --image photo.jpg -q "What is in this image?"
+python3 chat.py --model smolvlm-256m-instruct      # then: /image photo.jpg, and ask
+```
+
+or any OpenAI client — `{"type": "image_url", "image_url": {"url":
+"data:image/jpeg;base64,..."}}` next to the text part.  Text models answer
+an image with 400 `images_not_supported`.  Before a board run of the gate:
+`$PY scripts/llm_board.py --project build/llm_project_smolvlm_256m` (image
+prompts, logits against the simulation).
 
 ### Calibration — the study stage, reproduced
 
@@ -821,7 +859,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 138 tests, ~40 s, stdlib only (a C compiler for the C parts)
+python3 -m unittest -v                  # 149 tests, ~40 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests)
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
 # host validation against transformers, from the repo root
@@ -859,7 +897,12 @@ CMA pool).  `test_llm_calibrate.py` — `llm_models.json`'s schema,
 verified downloads and fetch (file:// standing in for Hugging Face: kept,
 replaced, copied and rejected files), the formats diff, and `calibrate` /
 `check` against a fake `llm_study.py` (installed only on a reproduced or
-recorded hash, provenance, `check` writing nothing).
+recorded hash, provenance, `check` writing nothing).  `test_smolvlm_backend.py` — the
+Idefics3 template against transformers' processor (7 conversation shapes),
+the image pixels against the study's (Pillow's LANCZOS), and backend C over a
+fake engine: llm_image() before each new image block, image rows as vocab +
+k, prefix reuse keyed by image content, trimming with images, image parts
+over HTTP (and a text model's 400).
 
 **Tokenizer reference.**  `validate_text.py` compares against transformers'
 `TokenizersBackend.from_pretrained` — the `tokenizer.json` pipeline, what

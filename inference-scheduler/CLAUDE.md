@@ -167,8 +167,14 @@ src/
                          Gather, OneHot, Cast): numpy reference + C helpers
   llm_nodes.py           axi.llm ops (LlmEmbed, LlmRMSNorm, LlmResAdd, LlmAttention,
                          LlmSiluMul, LlmSelectRow, LlmDequant, LlmAttnPrep /
-                         LlmAttnSoftmax / LlmAttnMerge) + LlmAttnConvNode (FPGA q·Kᵀ / P·V)
+                         LlmAttnSoftmax / LlmAttnMerge) + LlmAttnConvNode (FPGA q·Kᵀ / P·V;
+                         static keys for the vision encoder)
   llama.py               Llama frontend: config.json + safetensors + formats → entry graphs
+                         (image_rows: a VLM text model's prefill reads image-feature rows)
+  vit.py                 Vision-encoder frontend (SmolVLM: SigLIP ViT + Idefics3 connector)
+                         → the `vision` entry of a multi-entry project
+  vit_nodes.py           the vision host ops (VitLayerNorm / AttnPrep / AttnSoftmax / Gelu /
+                         ResAdd / EmbedAdd / PixelShuffle / SumDequant) + VIT_C helpers
   numeric.py             axi.numeric metadata: power-of-two exponents, host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
                          constant-broadcast normalisation
@@ -207,13 +213,13 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              62 pytest modules, 1507 tests collected (1502 pass, 5 skip;
+  test_*.py              63 pytest modules, 1515 tests collected (1510 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
                          corner cases), test_profiler_overlap.py (overlapping brackets),
                          test_cache_coherency.py (sync audit), test_host_ops.py,
-                         test_llm_ops.py, test_llama.py, test_matmul_on_conv.py
+                         test_llm_ops.py, test_llama.py, test_vit.py, test_matmul_on_conv.py
 ```
 
 ## Key Abstractions

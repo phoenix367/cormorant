@@ -61,6 +61,11 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   power-of-two exponents, float / int host tensors and persistent states
   ([§Numerics beyond the element type](#numerics-beyond-the-element-type)).
   This is what runs SmolLM2-135M-Instruct — [`CHAT_PLAN.md`](../plans/CHAT_PLAN.md) §13.
+- **Vision-encoder ops** (domain `axi.llm`, `src/vit_nodes.py`) — `VitEmbedAdd`,
+  `VitLayerNorm`, `VitResAdd`, `VitAttnPrep`, `VitAttnSoftmax`, `VitGelu`,
+  `VitPixelShuffle`, `VitSumDequant`, with q·Kᵀ / P·V on ConvKernel; the
+  `vision` entry comes from `src/vit.py` ([§Vision encoders](#vision-encoders)).
+  This is what runs SmolVLM-256M-Instruct's image side — `CHAT_PLAN.md` §23.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -148,6 +153,10 @@ inference_scheduler.py          CLI, argument parsing
     │                           host tensors, states; rank-1 weight encoding
     ├── llama.py                Llama frontend: config + safetensors +
     │                           formats -> fixed-shape entry graphs
+    ├── vit_nodes.py            axi.llm ops of a vision encoder (LayerNorm,
+    │                           attention prep / softmax, GELU table, ...)
+    ├── vit.py                  vision frontend (SigLIP ViT + connector) ->
+    │                           the `vision` entry of a multi-entry project
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
     ├── matmul_lowering.py      MatMul -> ConvKernel engine choice and geometry
@@ -746,6 +755,42 @@ policy `pow2+sink+p12+mix` of the study (`pow2+sink+p12+xattn` with
 `prefill_attn="host"`); `demo/chat/scripts/llm_sched_check.py` shows the
 scheduler's simulation of SmolLM2-135M equal to the study's emulation bit
 for bit, over a first prefill, decode steps and a second turn.
+
+### Vision encoders
+
+`src/vit.py` writes SmolVLM-256M-Instruct's vision encoder (a SigLIP-style
+ViT, 12 layers of 768, 1024 patch tokens) and its connector (pixel shuffle
+×4 + one linear) as the `vision` entry of the text model's multi-entry
+project (`CHAT_PLAN.md` §23; the numerics are `demo/chat/scripts/vlm_study.py`'s
+policy pow2+p12, which the simulation reproduces bit for bit):
+
+- **Input:** `vision.patches` [1024][768], the raw uint8 pixel values at
+  exponent 0.  The (x − 0.5) / 0.5 normalisation is folded into the
+  patch-embedding weights and a float32 bias table.  `llm_image()` in
+  `demo/chat/src/llm_api.c` fills it from an RGB image.
+- **Per layer, host ops:** LayerNorm, the bias adds, GELU and the float32
+  residual adds.
+  - GELU reads a 65 536-entry table per input exponent (the bias added as an
+    integer first), filled with libm exp in the tanh form.
+- **Per layer, kernels:** MatMuls with per-channel power-of-two exponents,
+  and attention per head.
+  - `VitAttnPrep` writes the q.Kᵀ input image and the K / V "caches": one
+    pair of raw (exponent 0) DMA states for every layer, with the real
+    exponents as the op's attributes.
+  - Then per head: `LlmAttnScores` (ConvKernel, static key count),
+    `VitAttnSoftmax` (every key, P at 2⁻¹²) and `LlmAttnPV` (ConvKernel).
+  - `LlmAttnMerge` joins the heads.
+- **Connector:** K = 12 288 exceeds every kernel, so it runs as three
+  K-chunk MatMuls (`VitPixelShuffle` writes each chunk's columns) summed by
+  `VitSumDequant`.  The sum goes into the float32 host state `vlm.img`
+  [64][576].
+- **The text model:** `LlamaFrontend(image_rows=64)` gives the prefill
+  entries' `LlmEmbed` a third input, that state; ids V .. V + 63 select its
+  rows.
+
+The ops' C helpers (`VIT_C`) are emitted only when a project uses them.
+`test/test_vit.py` covers them on a tiny random ViT: simulation == study
+emulation, the generated C == the simulation, and a vision + text project.
 
 ### Multi-entry projects
 
