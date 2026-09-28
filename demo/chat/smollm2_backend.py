@@ -396,7 +396,7 @@ class Smollm2Backend(Backend):
             raise BackendError("Invalid type for 'loop_guard': expected a boolean.", "loop_guard",
                                code="invalid_type")
         loop_guard = self.loop_guard if lg is None else lg
-        msgs = [{"role": "system" if m["role"] == "developer" else m["role"], "content": m["content"]}
+        msgs = [dict(m, role="system" if m["role"] == "developer" else m["role"])
                 for m in req.messages]
         reserve = min(req.max_tokens, self.reserve) if req.max_tokens else self.reserve
         budget = self.ctx - reserve
@@ -413,6 +413,16 @@ class Smollm2Backend(Backend):
                    breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
 
     # ── prompt -> tokens (FPGA) ──
+
+    def _prompt_keys(self, job: Job) -> list:
+        """What the KV cache holds for the prompt, after the sink: one key per
+        position (the token ids; a VLM keys image rows by image content)."""
+        return job.ids[1:]
+
+    def _prefill_new(self, job: Job, keys: list, reuse: int, cancel: CancelToken):
+        """Prefill positions reuse.. of the prompt (self._cached = keys[:reuse]
+        on entry, extended with every prefilled key); the last logits."""
+        return self._prefill(job.ids[1 + reuse:], cancel)
 
     def _prefill(self, tokens: List[int], cancel: CancelToken):
         eng, chunk = self.engine, self.prefill_chunk
@@ -435,7 +445,7 @@ class Smollm2Backend(Backend):
         if len(prompt) > ctx:
             raise BackendError(f"The prompt needs {len(prompt)} tokens; this model's context is {ctx}.",
                                "messages", code="context_length_exceeded")
-        body = prompt[1:]                                   # position 0 is the sink
+        body = self._prompt_keys(job)                       # position 0 is the sink
         cancel.check()
         cached = self._cached
         try:
@@ -446,7 +456,7 @@ class Smollm2Backend(Backend):
             eng.truncate(1 + reuse)
             self._cached = body[:reuse]
             new = body[reuse:]
-            logits = self._prefill(new, cancel)
+            logits = self._prefill_new(job, body, reuse, cancel)
         except Cancelled:                                   # between calls: the cache is consistent
             raise
         except Exception:                                   # the library's state is unknown

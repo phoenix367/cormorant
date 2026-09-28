@@ -18,7 +18,7 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2, echo; the first is the default model. smollm2 needs libsmollm2.so on the board (see the smollm2 block).",
+    "_backends_note": "Any of bert-squad, smollm2, smolvlm, echo; the first is the default model. smollm2 needs libsmollm2.so on the board (see the smollm2 block), smolvlm libsmolvlm_256m.so and Pillow (see the smolvlm block).",
     "resident": "auto",
     "_resident_note": "auto = keep both FPGA models loaded when CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,
@@ -64,5 +64,16 @@
   },
   "board_lock": null,
   "_board_lock_note": "null = bert_squad_config board_lock. deploy.py holds flock() on it while it deploys (and with --hold until the server is stopped).",
-  "health_timeout": 180
+  "health_timeout": 180,
+  "smolvlm": {
+    "_comment": "SmolVLM-256M-Instruct: chat about images (CHAT_PLAN §23). Served when server.backends contains smolvlm; the sampling defaults of the smollm2 block apply.",
+    "lib": null,
+    "_lib_note": "null = <remote.dir>/lib/libsmolvlm_256m.so (llm_board.py --project build/llm_project_smolvlm_256m --install-only builds it).",
+    "weights_dir": null,
+    "model_id": null,
+    "tokenizer": "assets/smolvlm-256m-instruct/tokenizer.json",
+    "_tokenizer_note": "Host path; uploaded to <remote.dir>/smolvlm/tokenizer.json.",
+    "cma_mb": 540,
+    "_cma_note": "The 495 MiB pool BO + the image buffer (520-530 MB measured); with --resident auto it swaps with SmolLM2-360M."
+  }
 }

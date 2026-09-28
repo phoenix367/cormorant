@@ -27,7 +27,7 @@ saturate; host regions in double, round half to even + saturate on write):
                   the patch-embedding weights (x 2/255) and bias (b - sum W)
   patch embed     kernel MatMul [1024, 768] x [768, 768] (the 16 x 16 x 3 patch
                   as one row: channel, then kernel row, then column); the host adds
-                  the folded bias and the position embedding into the residual
+                  float32(folded bias + position embedding) into the residual
   residual h      float32 host tensor (policy q88: Q8.8 VectorOP adds)
   LayerNorm       mean and variance left to right, (h - mu) / sqrt(var + 1e-6)
                   * gamma + beta, written at f_x / f_x2 / f_xf
@@ -37,12 +37,16 @@ saturate; host regions in double, round half to even + saturate on write):
                   (no mask) from the raw scores (the llm_study exp tables),
                   P at 2^-p_bits; P.V kernel per head (f_pv = f_p + f_vc - 8)
   out_proj, fc2   kernel; the host adds the bias in the residual add
-  fc1             kernel; the host adds the bias and applies GELU (tanh form),
-                  written at f_a
+  fc1             kernel; the host adds the bias as an integer at fc1's exponent
+                  (round half even, saturate) and reads GELU (tanh form, via libm
+                  exp: y = x - x / (exp(2u) + 1)) from a 65 536-entry table per
+                  exponent, written at f_a
   post-LN         host, written at f_xf; pixel shuffle (data movement: channel
                   c' of the 12288 has the exponent of c' mod 768)
-  connector       kernel MatMul [64, 12288] x [12288, 576] -> image features at
-                  f_img, dequantised into the text model's float residual
+  connector       kernel MatMuls [64, 4096] x [4096, 576] over the three K chunks
+                  (K = 12288 exceeds every kernel's bound), each floored at f_img;
+                  the host sums the three partial values (exact) into the image
+                  features, the text model's float residual rows
 
 Text model: llm_study.Model (policies there; the shipped pow2+sink+p12+mix),
 image rows injected at the <image> positions.  Exponents come from float
@@ -215,13 +219,56 @@ def kernel_weights(Wv, vc):
         for key, (name, _, _) in VLIN.items():
             K[(l, key)] = np.ascontiguousarray(Wv[f"{LV}{l}.{name}.weight"].T, np.float64)
     Wp = Wv["vision_model.embeddings.patch_embedding.weight"].astype(np.float64).reshape(vc.D, -1)
-    K[(0, "pe")] = np.ascontiguousarray((Wp * (2.0 / 255.0)).T)
+    # float32, as the frontend's ONNX initializer holds it
+    K[(0, "pe")] = np.ascontiguousarray((Wp * (2.0 / 255.0)).astype(np.float32).astype(np.float64).T)
     K[(vc.L, "c")] = np.ascontiguousarray(Wv["connector.modality_projection.proj.weight"].T, np.float64)
     return K
 
 
+def patch_bias_table(Wv):
+    """float32(b - sum_i W[c][i] + pos[t][c]): the patch bias with the pixel
+    normalisation folded in (the sum left to right) plus the position
+    embedding — src/vit.py's table."""
+    Wp = Wv["vision_model.embeddings.patch_embedding.weight"].astype(np.float64)
+    Wp = Wp.reshape(Wp.shape[0], -1)
+    b = Wv["vision_model.embeddings.patch_embedding.bias"].astype(np.float64) - np.cumsum(Wp, axis=1)[:, -1]
+    pos = Wv["vision_model.embeddings.position_embedding.weight"].astype(np.float64)
+    return (b[None, :] + pos).astype(np.float32).astype(np.float64)
+
+
 def gelu_tanh(x):
     return 0.5 * x * (1.0 + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x * x * x)))
+
+
+GELU_C = 0.7978845608028654          # sqrt(2 / pi) as a double literal (the C helper's)
+
+
+def gelu_exp(x):
+    """GELU, tanh form, through libm exp (the C helper's operation order):
+    u = C * (x + 0.044715 * ((x * x) * x)), y = x - x / (exp(2u) + 1)
+    (= 0.5 x (1 + tanh u); exp overflow -> inf -> y = x)."""
+    u = GELU_C * (x + 0.044715 * ((x * x) * x))
+    try:
+        e = math.exp(2.0 * u)
+    except OverflowError:
+        e = math.inf
+    return x - x / (e + 1.0)
+
+
+_GELU_TAB = {}
+
+
+def gelu_table(f):
+    """gelu_exp(r * 2^-f) for every raw int16 r (index r + 32768)."""
+    if f not in _GELU_TAB:
+        d = 2.0 ** int(f)
+        _GELU_TAB[f] = np.array([gelu_exp((i - 32768) / d) for i in range(65536)])
+    return _GELU_TAB[f]
+
+
+def bias_raw(b, f):
+    """A bias as raw integers at exponent(s) f: round half to even."""
+    return np.round(np.asarray(b, np.float64) * p2v(f))
 
 
 def pixel_shuffle(x, s):
@@ -264,9 +311,9 @@ class VisionModel(ls.Model):
         self.b = {(l, key): g(f"{LV}{l}.{name}.bias") for l in range(vc.L) for key, (name, _, _) in VLIN.items()}
         Wp = g("vision_model.embeddings.patch_embedding.weight").reshape(vc.D, -1)
         # folded normalisation: W (2p/255 - 1) + b = (2/255) W p + (b - W 1); + position embedding
-        self.b0 = (g("vision_model.embeddings.patch_embedding.bias") - Wp.sum(1))[None, :] \
-            + g("vision_model.embeddings.position_embedding.weight")
+        self.b0 = patch_bias_table(Wv)
         self.w = {k: self._enc(Wk, k[0], k[1], *self._io(k[1])) for k, Wk in KW.items()}
+        self.conn_k = CONN_K
 
     def _enc(self, Wt, l, key, ci, co):
         qw = self.pol.get("qweights")                     # ablation: only these weights rounded
@@ -297,6 +344,23 @@ class VisionModel(ls.Model):
         d = h - mu[:, None]
         var = np.cumsum(d * d, axis=-1)[:, -1] / D
         return self.host(d / np.sqrt(var + self.cfg.eps)[:, None] * gm + bt, cls, l, self.E(cls, l))
+
+    def gelu(self, f, l):
+        """GELU(fc1 + b1).  Emulation: the bias added to fc1's raw output as an
+        integer at its exponent (round half even, saturate), then a 65 536-entry
+        table per exponent (gelu_table) — the C helper, no libm call per value."""
+        b = self.b[(l, "f1")]
+        if not self.q or self.exact("f"):
+            if self.record_ch:                              # f's exponent must hold f + b too
+                self.stats.add_ch("f", l, np.abs(f + b).max(0))
+            return self.host(gelu_tanh(f + b), "a", l, self.E("a", l))
+        ff = self.Ev("f", l, f.shape[1])
+        raw = np.clip(np.rint(f * p2v(ff)) + bias_raw(b, ff)[None, :], -32768, 32767).astype(np.int64)
+        y = np.empty(f.shape)
+        for e in np.unique(ff):
+            cols = ff == e
+            y[:, cols] = gelu_table(int(e))[raw[:, cols] + 32768]
+        return self.host(y, "a", l, self.E("a", l))
 
     def heads_e(self, cls, l):
         return np.repeat(self.Eh(cls, l, self.cfg.H), self.cfg.HD)
@@ -346,10 +410,31 @@ class VisionModel(ls.Model):
             att = self.attn(self.lin(xa, l, "q"), self.lin(xa, l, "k"), self.lin(xa, l, "v"), l)
             h = self.resadd(h, self.lin(att, l, "o") + self.b[(l, "o")], l)
             x2 = self.ln(h, self.ln2[l], "x2", l)
-            a = self.host(gelu_tanh(self.lin(x2, l, "f1") + self.b[(l, "f1")]), "a", l, self.E("a", l))
+            a = self.gelu(self.lin(x2, l, "f1"), l)
             h = self.resadd(h, self.lin(a, l, "f2") + self.b[(l, "f2")], l)
         xf = self.ln(h, self.lnf, "xf", vc.L)
-        return self.lin(pixel_shuffle(xf, self.scale), vc.L, "c")
+        return self.connector(pixel_shuffle(xf, self.scale))
+
+    def connector(self, xs):
+        """The connector MatMul in K chunks of CONN_K (K = 12288 exceeds every
+        kernel's bound): one kernel call per chunk, each output floored at f_img,
+        the partial values summed exactly on the host (which dequantises them
+        into the text model's float residual)."""
+        L, K = self.cfg.L, xs.shape[1]
+        parts = []
+        for a in range(0, K, self.conn_k):
+            b = min(K, a + self.conn_k)
+            if not self.q:
+                parts.append(self.fmm(xs[:, a:b], self.w[(L, "c")][a:b], "img", L))
+                continue
+            fin = self.Ev("xs", L, K)[a:b]
+            parts.append(self.kmm(xs[:, a:b] * p2v(fin), self.w[(L, "c")][a:b], self.E("img", L), 8, "img", L))
+        y = parts[0]
+        for q in parts[1:]:
+            y = y + q
+        if self.record_ch and not self.q:
+            self.stats.add_ch("img", L, np.abs(y).max(0))
+        return y
 
 
 def p2(e):
@@ -430,10 +515,11 @@ def make_vformats(pol, ch, KW, vc, scale):
 # ------------------------------------------------------------------ text model with image rows
 class TextModel(ls.Model):
     img = None                                      # features for the sequence being run
+    image_tok = IMAGE_TOK
 
     def embed(self, ids):
         h = self.emb[ids].astype(np.float64)
-        m = ids == IMAGE_TOK
+        m = ids == self.image_tok
         if m.any():
             assert self.img is not None and int(m.sum()) == len(self.img), (int(m.sum()), self.img is None)
             h[m] = self.img
@@ -491,6 +577,10 @@ VPOLICIES = {
     "pow2+hattn":      dict(_F, fmt="pow2", hattn=True),
 }
 TEXT_SHIPPED = "pow2+sink+p12+mix"
+TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)
+VISION_SHIPPED = "pow2+p12"
+CAL_MAX_NEW = 96                      # the calibration answers' length (independent of --quick)
+CONN_K = 4096                         # the connector's K chunk (MatmulKernel max_k)
 # (vision policy, text policy); the first is the reference
 COMBOS = [("float", "float"), ("bf16", "bf16"), ("q88", "float"), ("pow2+p12", "float"),
           ("pow2+p14+in7", "float"), ("pow2+hattn", "float"), ("float", TEXT_SHIPPED),
@@ -571,6 +661,68 @@ def run_combo(name, vm, tm, evals, prompts, pix, ref, max_new, log, held=None):
     return res
 
 
+def calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs, sinks=(False, True)):
+    """Float runs over the calibration images (and the WikiText text for the
+    text model): (float text model, its position-0 sink model, vision channel
+    maxima, {sink: text channel maxima}).  The calibration answers are the
+    float model's greedy answers (CAL_MAX_NEW tokens), teacher-forced."""
+    vf = VisionModel(Wv, KW, vc, scale, record_ch=True)
+    tf = TextModel(Wt, tc, None, cos_sin=cs)
+    tf0 = TextModel(Wt, tc, None, cos_sin=cs, base=tf)          # the position-0 sink
+    cal_feats = [vf.forward(pix[i]) for i, _ in calib]
+    cal_prompts = [prompt_ids(tok, t) for _, t in calib]
+    cal_answers = greedy(tf, cal_prompts, cal_feats, CAL_MAX_NEW)
+    tcal = {}
+    for sink in sinks:
+        cm = TextModel(Wt, tc, None, cos_sin=cs, base=tf, sink=sink, sink_model=tf0, record_ch=True)
+        for p, a, f in zip(cal_prompts, cal_answers, cal_feats):
+            teacher_forced(cm, np.concatenate([p, np.array(a, np.int64)]), f)
+        ls.teacher_forced(cm, ctext_ids)
+        tcal[sink] = cm.stats.ch
+        del cm
+    return tf, tf0, vf.stats.ch, tcal
+
+
+def formats_json(fmt, pol, name):
+    return {"policy": name, "spec": pol, "margin": ls.MARGIN,
+            "exponents": {f"{k[0]}@{k[1]}": np.asarray(v).tolist() for k, v in fmt.items()}}
+
+
+def cmd_formats(args):
+    """The calibrated exponents of the shipped policies: the text model's
+    (llm_study formats JSON: exponents + the position-0 sink K / V at the cache
+    exponents; src/llama.py Formats) and the vision encoder's."""
+    assets = args.assets
+    out_dir = args.out or ls.study_dir(assets)
+    os.makedirs(out_dir, exist_ok=True)
+    tc, vc, scale, Wt, Wv = load_all(assets)
+    KW = kernel_weights(Wv, vc)
+    tok = ls.Tok(assets)
+    _evals, calib, pix, ctext_ids, _held = build_data(assets, tok, True)
+    cs = ls.rope_tables(tc, 2 * ls.CTX)
+    tpol, vpol = ls.POLICIES[TEXT_FORMATS], VPOLICIES[VISION_SHIPPED]
+    tf, tf0, vch, tcal = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs,
+                                   sinks=(bool(tpol.get("sink")),))
+    tfmt = ls.make_formats(tpol, tcal[bool(tpol.get("sink"))], Wt, tc)
+    out = formats_json(tfmt, tpol, TEXT_FORMATS)
+    m = TextModel(Wt, tc, tpol, tfmt, cos_sin=cs, sink_model=tf0)
+    sq = ls.Seq(tc, 1)
+    m._write_sink(sq, BOS)
+    out["sink_token"] = BOS
+    out["sink_k_raw"] = [np.rint(sq.k[l][:, 0] * p2v(m.Eh("k", l, tc.KV))[:, None]).astype(int).tolist()
+                         for l in range(tc.L)]
+    out["sink_v_raw"] = [np.rint(sq.v[l][:, 0] * p2v(m.Ev("vc", l, tc.KV * tc.HD).reshape(tc.KV, tc.HD)))
+                         .astype(int).tolist() for l in range(tc.L)]
+    tpath = os.path.join(out_dir, f"formats_{TEXT_FORMATS}.json")
+    json.dump(out, open(tpath, "w"))
+    vfmt = make_vformats(vpol, vch, KW, vc, scale)
+    vout = formats_json(vfmt, vpol, VISION_SHIPPED)
+    vout.update(pixel_exp=0, gelu="table", scale_factor=scale)
+    vpath = os.path.join(out_dir, f"vision_formats_{VISION_SHIPPED}.json")
+    json.dump(vout, open(vpath, "w"))
+    print(f"{tpath}: {len(tfmt)} exponent entries\n{vpath}: {len(vfmt)} exponent entries")
+
+
 def cmd_study(args):
     assets = args.assets
     out_dir = args.out or ls.study_dir(assets)
@@ -590,22 +742,7 @@ def cmd_study(args):
     log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  eval {len(evals)} images, calibration {len(calib)} images "
         f"+ {len(ctext_ids)} WikiText tokens, max_new {max_new}, prompt tokens {len(prompts[0])}")
     cs = ls.rope_tables(tc, 2 * ls.CTX)
-    # float references and calibration
-    vf = VisionModel(Wv, KW, vc, scale, record_ch=True)
-    tf = TextModel(Wt, tc, None, cos_sin=cs)
-    tf0 = TextModel(Wt, tc, None, cos_sin=cs, base=tf)          # the position-0 sink
-    cal_feats = [vf.forward(pix[i]) for i, _ in calib]
-    vch = vf.stats.ch
-    cal_prompts = [prompt_ids(tok, t) for _, t in calib]
-    cal_answers = greedy(tf, cal_prompts, cal_feats, max_new)
-    tcal = {}
-    for sink in (False, True):
-        cm = TextModel(Wt, tc, None, cos_sin=cs, base=tf, sink=sink, sink_model=tf0, record_ch=True)
-        for p, a, f in zip(cal_prompts, cal_answers, cal_feats):
-            teacher_forced(cm, np.concatenate([p, np.array(a, np.int64)]), f)
-        ls.teacher_forced(cm, ctext_ids)
-        tcal[sink] = cm.stats.ch
-        del cm
+    tf, tf0, vch, tcal = calibrate(tc, vc, scale, Wt, Wv, KW, tok, calib, pix, ctext_ids, cs)
     log(f"  calibration {time.time() - t0:.0f}s")
     vfmts, tfmts = {}, {}
     vfloat = VisionModel(Wv, KW, vc, scale)
@@ -798,7 +935,7 @@ def cmd_validate(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate"])
+    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "formats"])
     ap.add_argument("--base", default="pow2+p12", help="ablate: the vision policy")
     ap.add_argument("--images", type=int, default=3, help="ablate: evaluation images")
     ap.add_argument("--only", default=None, help="ablate: run names containing one of these")
@@ -808,7 +945,8 @@ def main():
     ap.add_argument("--quick", action="store_true", help="6 images, 48 new tokens, a 256-token text window")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
-    {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate}[args.cmd](args)
+    {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate,
+     "formats": cmd_formats}[args.cmd](args)
 
 
 if __name__ == "__main__":

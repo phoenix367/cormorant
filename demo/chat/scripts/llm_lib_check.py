@@ -133,7 +133,7 @@ def main():
     L.llm_close()
     res["cma_free_kb"]["after_final_close"] = cma_free()
     ok = (res["only_llm_exports"] and res["chunked_prefill_identical"] and res["threads_identical"]
-          and res["reopen_identical"] and abs(c2 - c0) < 4096 and V == 49152 and C == 1024)
+          and res["reopen_identical"] and abs(c2 - c0) < 4096 and V > 0 and C == 1024)
     res["ok"] = ok
     print("LLM_LIB_CHECK: " + json.dumps(res))
     return 0 if ok else 1

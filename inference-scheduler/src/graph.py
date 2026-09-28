@@ -36,6 +36,7 @@ from .dtype  import DataType, AP_FIXED_16_8
 from ._conv_hw_config import CONV_TILE_IC
 from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
 from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES
+from .vit_nodes import VIT_OP_FACTORIES
 from . import fusion
 from . import matmul_lowering
 from . import numeric
@@ -635,11 +636,12 @@ class OnnxGraph:
             # message's root); a Llama project holds five graphs.
             node = _detached_node(node)
             if node.domain == LLM_DOMAIN:
-                if node.op_type not in LLM_OP_FACTORIES:
+                factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES}
+                if node.op_type not in factories:
                     raise SchedulerError(
                         f"Node '{node.name or node.op_type}': unknown {LLM_DOMAIN} op "
-                        f"'{node.op_type}' (known: {sorted(LLM_OP_FACTORIES)})")
-                sn = LLM_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
+                        f"'{node.op_type}' (known: {sorted(factories)})")
+                sn = factories[node.op_type](node, self._tensors, idx, align_elems,
                                                     host_ctx)
             elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,

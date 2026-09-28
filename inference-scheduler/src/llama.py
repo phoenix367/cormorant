@@ -207,7 +207,13 @@ class LlamaFrontend:
 
     def __init__(self, cfg: LlamaConfig, weights: Dict[str, np.ndarray], formats: Formats,
                  ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
-                 qk_kw: Optional[int] = None, pv_kw: Optional[int] = None):
+                 qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
+                 image_rows: int = 0, image_state: str = "vlm.img"):
+        # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
+        # LlmEmbed also reads image_state [image_rows][D] (float32 host state the
+        # vision entry writes); ids V .. V + image_rows - 1 select its rows
+        self.image_rows = int(image_rows)
+        self.image_state = image_state
         self.cfg = cfg
         self.W = weights
         self.fmt = formats
@@ -454,7 +460,12 @@ class LlamaFrontend:
             inputs.append(n)
         self._init("emb", self.W["model.embed_tokens.weight"])
         h0 = self._t(f"{ename}.h0", [T, c.D], host="f32")
-        self._node("LlmEmbed", [ids, "emb"], [h0], f"{ename}.embed", domain=LLM_DOMAIN)
+        emb_in = [ids, "emb"]
+        if select and self.image_rows:
+            img = self._t(self.image_state, [self.image_rows, c.D], host="f32", state=True)
+            self._init(img, np.zeros((self.image_rows, c.D), np.float32))
+            emb_in.append(img)
+        self._node("LlmEmbed", emb_in, [h0], f"{ename}.embed", domain=LLM_DOMAIN)
         h = self._layers(h0, T, pos, n)
         outputs = []
         if select:
@@ -495,7 +506,8 @@ class LlamaFrontend:
                               "prefill_attn": self.prefill_attn, "pv_kw": self.pv_kw,
                               "layers": self.cfg.L, "hidden": self.cfg.D, "heads": self.cfg.H,
                               "kv_heads": self.cfg.KV, "head_dim": self.cfg.HD,
-                              "vocab": self.cfg.V})
+                              "vocab": self.cfg.V}
+                             | ({"image_rows": self.image_rows} if self.image_rows else {}))
         return m
 
 

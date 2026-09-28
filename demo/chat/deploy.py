@@ -70,7 +70,8 @@ UNIT = "kv260-chat"
 SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py",
                 CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
-                CHAT / "sampler.py"]
+                CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
+                CHAT / "vlm_image.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -127,6 +128,13 @@ def load_config(path: Optional[str]) -> dict:
             llm[k] = v
     if not llm["lib"]:
         llm["lib"] = f"{rem['dir']}/lib/libsmollm2.so"
+    vlm = cfg.setdefault("smolvlm", {})
+    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 540),
+                 ("tokenizer", "assets/smolvlm-256m-instruct/tokenizer.json")):
+        if vlm.get(k) is None:
+            vlm[k] = v
+    if not vlm["lib"]:
+        vlm["lib"] = f"{rem['dir']}/lib/libsmolvlm_256m.so"
     cfg.setdefault("build", {}).setdefault("jobs", 4)
     cfg["build"].setdefault("timeout", 1800)
     cfg["board_lock"] = cfg.get("board_lock") or bcfg.get("board_lock")
@@ -136,6 +144,10 @@ def load_config(path: Optional[str]) -> dict:
 
 def uses_llm(cfg: dict) -> bool:
     return any(b in ("smollm2", "smollm2-135m-instruct") for b in cfg["server"]["backends"])
+
+
+def uses_vlm(cfg: dict) -> bool:
+    return any(b in ("smolvlm", "smolvlm-256m-instruct") for b in cfg["server"]["backends"])
 
 
 def sudo(cfg: dict) -> str:
@@ -239,6 +251,22 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
         good = tok.exists()
         print(f"    {_green('OK     ') if good else _red('MISSING')} {'tokenizer.json (host)':<36} {_dim(str(tok))}")
         ok &= good
+    if uses_vlm(cfg):
+        lib = cfg["smolvlm"]["lib"]
+        _, _, rc = session.exec(f"test -f {shlex.quote(lib)}", timeout=15)
+        good = rc == 0
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'libsmolvlm_256m.so (smolvlm)':<36} "
+              f"{_dim(lib if good else lib + ' - llm_board.py --install-only (CHAT_PLAN §23)')}")
+        ok &= good
+        tok = chat_path(cfg["smolvlm"]["tokenizer"])
+        good = tok.exists()
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'SmolVLM tokenizer.json (host)':<36} {_dim(str(tok))}")
+        ok &= good
+        out, _, rc = session.exec("python3 -c 'import PIL; print(PIL.__version__)'", timeout=30)
+        good = rc == 0
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'Pillow (image decoding)':<36} "
+              f"{_dim(out.strip() if good else 'apt install python3-pil')}")
+        ok &= good
     return ok
 
 
@@ -338,6 +366,10 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
             session.exec_checked(f"mkdir -p {d}/smollm2", timeout=15)
             sftp.put(str(chat_path(cfg["smollm2"]["tokenizer"])), f"{d}/smollm2/tokenizer.json")
             extra = " + smollm2/tokenizer.json"
+        if uses_vlm(cfg):
+            session.exec_checked(f"mkdir -p {d}/smolvlm", timeout=15)
+            sftp.put(str(chat_path(cfg["smolvlm"]["tokenizer"])), f"{d}/smolvlm/tokenizer.json")
+            extra += " + smolvlm/tokenizer.json"
     finally:
         sftp.close()
     return step("server", True, t0, f"{len(SERVER_FILES)} files + vocab.txt + src/sampler.[ch]{extra} -> {d}")
@@ -373,7 +405,7 @@ def server_argv(cfg: dict) -> List[str]:
     for b in s["backends"]:
         argv += ["--backend", b]
     argv += ["--resident", str(s["resident"])]
-    if uses_llm(cfg):
+    if uses_llm(cfg) or uses_vlm(cfg):              # the sampling defaults serve both
         llm = cfg["smollm2"]
         argv += ["--llm-lib", llm["lib"], "--llm-tokenizer", f"{d}/smollm2/tokenizer.json",
                  "--llm-sampler-lib", f"{d}/lib/libsampler.so", "--llm-context", str(llm["context"]),
@@ -391,6 +423,14 @@ def server_argv(cfg: dict) -> List[str]:
             argv += ["--llm-weights", llm["weights_dir"]]
         if llm.get("model_id"):
             argv += ["--llm-model-id", llm["model_id"]]
+    if uses_vlm(cfg):
+        vlm = cfg["smolvlm"]
+        argv += ["--vlm-lib", vlm["lib"], "--vlm-tokenizer", f"{d}/smolvlm/tokenizer.json",
+                 "--vlm-cma-mb", str(vlm["cma_mb"])]
+        if vlm.get("weights_dir"):
+            argv += ["--vlm-weights", vlm["weights_dir"]]
+        if vlm.get("model_id"):
+            argv += ["--vlm-model-id", vlm["model_id"]]
     if s.get("api_key"):
         argv += ["--api-key-file", f"{d}/api_key"]
     return argv

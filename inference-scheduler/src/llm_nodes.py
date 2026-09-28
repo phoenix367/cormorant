@@ -129,6 +129,11 @@ RUNTIME_GROUPS = {
               "_llm_sexp_slots", "llm_sexp_slot_t",
               "if (llm_sexp_table(T->f, T->scale) != 0) return -1;",
               "llm_sexp_free(T->f);"),
+    "gelu":  ("typedef struct {\n    int f;                          /* a GELU input exponent */\n"
+              "} vit_gelu_slot_t;",
+              "_vit_gelu_slots", "vit_gelu_slot_t",
+              "if (vit_gelu_table(T->f) != 0) return -1;",
+              "vit_gelu_free(T->f);"),
 }
 
 
@@ -372,45 +377,66 @@ def _const_array(ctx: HostContext, tensors, name, node, what) -> np.ndarray:
 @dataclass
 class LlmEmbedNode(LlmNode):
     """h[t] = table[ids[t]] (float32 host rows); the index is clamped to
-    [0, rows) like Gather."""
-    rows:  int = 1
-    d:     int = 1
-    n:     int = 1
+    [0, rows) like Gather.  With a third input — image rows [R][d] (float32
+    host, the vision entry's state, src/vit.py) — ids rows .. rows + R - 1
+    select image row id - rows (the index clamped to [0, rows + R))."""
+    rows:       int = 1
+    d:          int = 1
+    n:          int = 1
+    image_rows: int = 0
     table: Optional[HostTable] = field(default=None, repr=False)
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
-        ids, _tab = _llm_inputs(node, tensors)
+        ins = _llm_inputs(node, tensors)
+        ids = ins[0]
+        img = ins[2] if len(ins) > 2 else None
         y = _resolve(tensors, node.output[0], node)
         tab = _const_array(ctx, tensors, node.input[1], node, "table")
         _require(tab.ndim == 2, node, "table must be 2-D [rows][d]")
         rows, d = tab.shape
         name = "_llm_tab_" + tensors[node.input[1]].c_name
-        sn = cls(onnx_node=node, inputs=[ids], output=y, index=index,
-                 align_elems=align_elems, rows=int(rows), d=int(d), n=ids.numel,
+        sn = cls(onnx_node=node, inputs=[ids] + ([img] if img is not None else []), output=y,
+                 index=index, align_elems=align_elems, rows=int(rows), d=int(d), n=ids.numel,
+                 image_rows=img.numel // int(d) if img is not None else 0,
                  table=HostTable(name, table_kind(tab), np.asarray(tab, np.float32)),
                  F=ctx.frac_bits)
         sn._want(ids, "i32", "ids")
         sn._want(y, "f32", "output")
+        if img is not None:
+            sn._want(img, "f32", "image rows")
+            _require(int(img.shape[-1]) == d, node, "image rows must be [R][d]")
         _require(y.numel == ids.numel * d, node, "output numel")
         return sn
+
+    def c_helpers(self):
+        return ("llm", "vit") if self.image_rows else ("llm",)
 
     def tables(self):
         return [self.table]
 
     def describe(self):
-        return f"{self.n} rows of {self.d} from a [{self.rows}] {self.table.kind} host table"
+        return (f"{self.n} rows of {self.d} from a [{self.rows}] {self.table.kind} host table"
+                + (f" + {self.image_rows} image rows" if self.image_rows else ""))
 
     def c_call(self, ins, out, scratch, direct, dtype):
         bf = self.table.kind == "bf16"
-        return [f"llm_embed({ins[0]}, {self.n}u, {self.table.name if bf else 'NULL'}, "
-                f"{'NULL' if bf else self.table.name}, {self.rows}u, {self.d}u, {out});"]
+        t16, t32 = (self.table.name, "NULL") if bf else ("NULL", self.table.name)
+        if self.image_rows:
+            return [f"llm_embed_img({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, "
+                    f"{ins[1]}, {self.image_rows}u, {out});"]
+        return [f"llm_embed({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, {out});"]
 
     def reference(self, ins, dtype):
         k = np.asarray(ins[0], np.float64).reshape(-1).astype(np.int64)
-        k = np.clip(k, 0, self.rows - 1)
         tab = np.asarray(self.table.data, np.float32).reshape(self.rows, self.d)
-        return tab[k].astype(np.float64).reshape(self.output.shape)
+        if not self.image_rows:
+            return tab[np.clip(k, 0, self.rows - 1)].astype(np.float64).reshape(self.output.shape)
+        img = np.asarray(ins[1], np.float32).reshape(self.image_rows, self.d)
+        k = np.clip(k, 0, self.rows + self.image_rows - 1)
+        out = np.where((k >= self.rows)[:, None], img[np.maximum(k - self.rows, 0)],
+                       tab[np.minimum(k, self.rows - 1)])
+        return out.astype(np.float64).reshape(self.output.shape)
 
 
 # ------------------------------------------------------------------ #
@@ -949,7 +975,8 @@ class LlmAttnConvNode:
 
     Both write floor(sum / 2^8) saturated (ap_fixed<32,16> accumulator), raw
     integers.  inputs = [weight, x, pos, n]; the geometry (kw, out_h, out_w)
-    is fixed at codegen by the cost model."""
+    is fixed at codegen by the cost model.  inputs = [weight, x] (a vision
+    encoder, src/vit.py): a static key count, keys = C."""
 
     kernel_name: ClassVar[str] = "ConvKernel"
     is_llm_op:   ClassVar[bool] = True
@@ -972,6 +999,7 @@ class LlmAttnConvNode:
     Q:           int = KEY_QUANTUM    # the runtime key count's quantum
     F:           int = 8
     est_cycles:  Tuple = ()           # ((keys, conv cycles, MatmulKernel cycles), ...)
+    static:      bool = False         # no pos / n: keys = C
 
     # Compatibility shims (read by the layout / header passes)
     outer_count:        int  = field(default=1,    init=False)
@@ -990,14 +1018,16 @@ class LlmAttnConvNode:
         from ._conv_hw_config import (CONV_MAX_ACC_PERSIST_ENTRIES, CONV_MAX_IN_CH,
                                       CONV_MAX_OUT_CH)
         ins = _llm_inputs(node, tensors)
-        _require(len(ins) == 4, node, "inputs: weight, x, pos, n")
+        _require(len(ins) in (2, 4), node, "inputs: weight, x[, pos, n]")
         y = _resolve(tensors, node.output[0], node)
         a, H, KV, HD = _heads_attrs(node)
         kind = "qk" if node.op_type == "LlmAttnScores" else "pv"
         g = int(a["group"])
         G = H // KV
         _require(0 <= g < KV, node, f"group {g} of {KV}")
-        w, x, pos, n = ins
+        static = len(ins) == 2
+        w, x = ins[:2]
+        pos, n = (None, None) if static else ins[2:]
         cache = w if kind == "qk" else x
         C = int(cache.shape[0])
         _require(cache.is_state and not cache.is_host and cache.group_layout == (KV, HD), node,
@@ -1026,18 +1056,20 @@ class LlmAttnConvNode:
         _require(out_ch_max <= CONV_MAX_OUT_CH and in_ch_max <= CONV_MAX_IN_CH, node,
                  f"out_ch {out_ch_max} / in_ch {in_ch_max} beyond ConvKernel's bounds")
         m_pad = -(-out_ch_max // 16) * 16
-        oh, ow, est = cls._plan(kind, T, G, HD, C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES, Q)
-        sn = cls(onnx_node=node, inputs=[w, x, pos, n], output=y, index=index,
-                 align_elems=align_elems, kind=kind, group=g, T=T, H=H, KV=KV, HD=HD, C=C,
-                 kw=kw, out_h=oh, out_w=ow, Q=Q, F=ctx.frac_bits, est_cycles=est)
-        for t, what in ((pos, "pos"), (n, "n")):
+        oh, ow, est = cls._plan(kind, T, G, HD, C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES, Q,
+                                static)
+        sn = cls(onnx_node=node, inputs=[w, x] if static else [w, x, pos, n], output=y,
+                 index=index, align_elems=align_elems, kind=kind, group=g, T=T, H=H, KV=KV,
+                 HD=HD, C=C, kw=kw, out_h=oh, out_w=ow, Q=Q, F=ctx.frac_bits, est_cycles=est,
+                 static=static)
+        for t, what in (() if static else ((pos, "pos"), (n, "n"))):
             _require(t.host == "i32", node, f"{what} must be an i32 host tensor")
         for t in ((x, y) if kind == "qk" else (w, y)):
             _require(t.host is None, node, f"'{t.onnx_name}' must be a DMA tensor")
         return sn
 
     @staticmethod
-    def _plan(kind, T, G, HD, C, kw, M, m_pad, max_acc, Q=KEY_QUANTUM):
+    def _plan(kind, T, G, HD, C, kw, M, m_pad, max_acc, Q=KEY_QUANTUM, static=False):
         """(out_h, out_w, estimates): the output split out_h x out_w = M of the
         cheapest conv by cost_model.conv_cycles at keys = C / 2 (the geometry
         is fixed at codegen; keys varies at run time), and the conv /
@@ -1052,11 +1084,11 @@ class LlmAttnConvNode:
                                ow=ow, kh=1, kw=kw, sw=kw)["total"] + CALL_OVERHEAD
         cands = [d for d in range(1, M + 1) if M % d == 0 and d <= 64 and d * m_pad <= max_acc]
         wide = [d for d in cands if d >= 8] or cands
-        ref = max(Q, (C // 2) // Q * Q)
+        ref = C if static else max(Q, (C // 2) // Q * Q)
         ow = min(wide, key=lambda d: (cyc(ref, M // d, d), -d))
         oh = M // ow
         est = []
-        for keys in sorted({max(Q, -(-(T + 1) // Q) * Q), C}):
+        for keys in ([C] if static else sorted({max(Q, -(-(T + 1) // Q) * Q), C})):
             mm = (matmul_cycles(keys, HD, G * T) if kind == "qk"
                   else matmul_cycles(G * T, keys, HD)) + CALL_OVERHEAD
             est.append((keys, float(cyc(keys, oh, ow)), float(mm)))
@@ -1087,16 +1119,22 @@ class LlmAttnConvNode:
                     f" on ConvKernel: weight=P x=V cache image out_ch={self.G * self.T}"
                     f" in_ch=keys/{self.kw} 1x{self.kw} out {self.out_h}x{self.out_w}")
         return (f"    /* [{self.index}] {self.onnx_node.op_type}({w}, {x}) -> "
-                f"{self.output.onnx_name}  {what}; keys = roundup(pos + n, {self.Q}) at run"
-                f" time */")
+                f"{self.output.onnx_name}  {what}; "
+                + (f"keys = {self.C} */" if self.static else
+                   f"keys = roundup(pos + n, {self.Q}) at run time */"))
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
-        w, x, pos, n = self.inputs
+        w, x = self.inputs[:2]
         GTHD = self.G * self.T * self.HD
         if self.kind == "qk":
             xo, wo = self.group * GTHD, self.group * self.C * self.HD
         else:
             xo, wo = self.group * self.C * self.HD, 0
+        if self.static:
+            return "\n".join([
+                f"    run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
+                f"                {self.conv_regs(f'{self.C}u')});"])
+        pos, n = self.inputs[2:]
         return "\n".join([
             "    {",
             f"        const unsigned _keys = llm_keys((unsigned){pos.c_name}[0],"
@@ -1109,7 +1147,8 @@ class LlmAttnConvNode:
     # ---- simulation ------------------------------------------------------ #
     def reference(self, ins, dtype):
         w, x = ins[0], ins[1]
-        _n, keys = attn_keys(_i32(ins[2]), _i32(ins[3]), self.T, self.C, self.Q)
+        keys = self.C if self.static else attn_keys(_i32(ins[2]), _i32(ins[3]), self.T, self.C,
+                                                    self.Q)[1]
         g, HD, F = self.group, self.HD, self.F
         if self.kind == "qk":
             kc = _raw(self.inputs[0], w, F)[:keys, g * HD:(g + 1) * HD]     # [keys][HD]

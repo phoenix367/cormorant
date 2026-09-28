@@ -11,6 +11,7 @@ from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostN
                           SliceNode, host_c_helper)
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
                          llm_c_helpers)
+from ..vit_nodes import vit_c_helpers
 from ._banners  import _banner, _file_banner
 from .._matmul_hw_config import MATMUL_GEMV_MAX_M
 
@@ -255,6 +256,8 @@ class _SourceMixin:
             parts.append(llm_c_helpers())
             if self._dma_states:
                 parts.append(LLM_C_DMA)
+        if "vit" in used:
+            parts.append(vit_c_helpers())
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))
@@ -523,7 +526,8 @@ class _SourceMixin:
                 pre = self._state_init_prefix(t)
                 if pre is not None:
                     lines.append(pre[0])
-            if any(t.group_layout and self._state_init_prefix(t) is not None for t in states):
+            # (the compact init loop references it for every group-major state)
+            if any(t.group_layout for t in states):
                 lines.append(_STATE_SCATTER_C)
 
         if self._host_nodes:

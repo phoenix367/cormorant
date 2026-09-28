@@ -24,6 +24,10 @@
  *      over the steps' logits bits (compare two library builds bit for bit).
  *   6. Re-open (-r): llm_close(), CmaFree, llm_open() again, the first
  *      prompt's prefill + 2 decode steps compared bit for bit with step 2's.
+ *   Images (-I images.bin, a VLM library): prompt p < the image count is
+ *      preceded by llm_image(image p) (timed, "LLM_IMAGE: {...}"; with
+ *      profiling LAYERS_JSON:vision for image 0); its ids hold the image
+ *      tokens as vocab + k.  The re-open re-encodes image 0.
  *
  * prompts.bin: int32 count, then per prompt int32 n and |n| int32 token ids
  * (the ids AFTER the leading <|im_start|>, which is the cache's sink; n < 0:
@@ -33,8 +37,10 @@
  * "LLM_REOPEN: {...}", "LLM_SUMMARY: {...}",
  * and with profiling "PROFILE_PHASE: <phase>" + the profiler's "LAYERS_JSON: {...}".
  *
+ * images.bin: int32 count, int32 side S, then count x S x S x 3 bytes (RGB).
+ *
  * usage: llm_bench [-w weights_dir] [-i prompts.bin] [-o logits.bin] [-k 32]
- *                  [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r]
+ *                  [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r] [-I images.bin]
  */
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime, getopt */
 
@@ -112,9 +118,11 @@ static void prof_reset(void)
 int main(int argc, char **argv)
 {
     const char *wdir = NULL, *in_path = "prompts.bin", *out_path = "logits.bin";
-    const char *plens = "", *dpos = "";
+    const char *plens = "", *dpos = "", *img_path = NULL;
     int         k = 32, reps = 3, dsteps = 8, reopen = 0, c;
-    while ((c = getopt(argc, argv, "w:i:o:k:P:R:D:S:r")) != -1) {
+    int32_t     nimg = 0, side = 0;
+    uint8_t    *imgs = NULL;
+    while ((c = getopt(argc, argv, "w:i:o:k:P:R:D:S:rI:")) != -1) {
         switch (c) {
         case 'w': wdir = optarg; break;
         case 'i': in_path = optarg; break;
@@ -125,9 +133,11 @@ int main(int argc, char **argv)
         case 'D': dpos = optarg; break;
         case 'S': dsteps = atoi(optarg); break;
         case 'r': reopen = 1; break;
+        case 'I': img_path = optarg; break;
         default:
             fprintf(stderr, "usage: %s [-w weights_dir] [-i prompts.bin] [-o logits.bin] [-k 32]"
-                            " [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r]\n", argv[0]);
+                            " [-P 16,64,256] [-R 3] [-D 32,256,1000] [-S 8] [-r] [-I images.bin]\n",
+                    argv[0]);
             return 2;
         }
     }
@@ -150,6 +160,22 @@ int main(int argc, char **argv)
         if (fread(prompts[p], 4, (size_t)plen[p], fin) != (size_t)plen[p]) return 1;
     }
     fclose(fin);
+    if (img_path) {
+        FILE  *fi = fopen(img_path, "rb");
+        size_t bytes;
+        if (!fi || fread(&nimg, 4, 1, fi) != 1 || fread(&side, 4, 1, fi) != 1 || nimg < 0 ||
+            side < 1) {
+            fprintf(stderr, "error: %s: cannot read the image header\n", img_path);
+            return 1;
+        }
+        bytes = (size_t)nimg * (size_t)side * (size_t)side * 3u;
+        imgs = malloc(bytes ? bytes : 1u);
+        if (!imgs || fread(imgs, 1, bytes, fi) != bytes) {
+            fprintf(stderr, "error: %s: short read\n", img_path);
+            return 1;
+        }
+        fclose(fi);
+    }
 
     /* ---- open --------------------------------------------------------- */
     long   cma0 = cma_free_kb();
@@ -185,10 +211,26 @@ int main(int argc, char **argv)
         printf("%s%d", p ? "," : "", llm_bucket(p));
     printf("]}\n");
     fflush(stdout);
+    if (nimg && side != llm_image_size()) {
+        fprintf(stderr, "error: images of %d pixels, the library takes %d\n", side, llm_image_size());
+        return 1;
+    }
     for (p = 0; p < np; p++) {
         int     s, tok, pos0;
         double  pre_ms;
         if (!cont[p] && llm_truncate(1) != 0) return 1;
+        if (p < nimg) {
+            if (p == 0) prof_reset();
+            t = now_ms();
+            if (llm_image(imgs + (size_t)p * side * side * 3u) != 0) {
+                fprintf(stderr, "error: llm_image: %s\n", llm_last_error());
+                return 1;
+            }
+            t = now_ms() - t;
+            printf("LLM_IMAGE: {\"i\":%d,\"ms\":%.2f}\n", p, t);
+            fprintf(stderr, "image %d: %.1f ms\n", p, t);
+            if (p == 0) prof_dump("vision");
+        }
         pos0 = llm_position();
         t = now_ms();
         if (llm_prefill(prompts[p], plen[p], lg) != 0) {
@@ -318,6 +360,7 @@ int main(int argc, char **argv)
         }
         t = now_ms() - t;
         cma3 = cma_free_kb();
+        if (nimg && llm_image(imgs) != 0) return 1;
         if (llm_prefill(prompts[0], plen[0], lg) != 0) return 1;
         ok &= memcmp(lg, ref, (size_t)V * sizeof(float)) == 0;
         tok = argmax(lg, V);

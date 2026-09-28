@@ -49,6 +49,18 @@ int         llm_prefill(const int32_t *tokens, int n, float *logits);
 int         llm_decode(int32_t token, float *logits);
                   /* append one token; next-token logits */
 
+/* Images (a VLM library, doc/plans/CHAT_PLAN.md §23; text-only libraries report
+ * 0 image tokens and refuse llm_image).  llm_image() runs the vision encoder
+ * on one image — llm_image_size() x llm_image_size() RGB pixels, row-major,
+ * 3 bytes each (the caller resizes) — and keeps its llm_image_tokens()
+ * feature rows; a following llm_prefill() reads them for token ids
+ * llm_vocab_size() + k (k = 0 .. llm_image_tokens() - 1: the prompt's k-th
+ * image token).  The rows stay until the next llm_image(): the KV cache holds
+ * what earlier prefills took from them. */
+int         llm_image_tokens(void);              /* 64, or 0: no vision entry */
+int         llm_image_size(void);                /* 512, or 0 */
+int         llm_image(const uint8_t *rgb);
+
 /* Extras (not in the §11 contract; used by llm_bench and diagnostics). */
 const char *llm_model_name(void);                /* e.g. "smollm2-135m-instruct" */
 const char *llm_weights_dir(void);               /* INFERENCE_WEIGHTS_DIR of the build */

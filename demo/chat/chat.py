@@ -4,12 +4,15 @@ chat.py — a small OpenAI-compatible chat client (Python standard library
 only) for the KV260 chat server; runs on a laptop or on the board.
 
   chat.py [--url http://kv260:8000/v1] [--api-key KEY] [--model M]
-          [--doc FILE | --system TEXT] [-q QUESTION] [--no-stream]
+          [--doc FILE | --system TEXT] [--image FILE] [-q QUESTION] [--no-stream]
           [--max-tokens N] [--temperature T]
 
 Interactive commands:
   /doc FILE      use FILE as the document (the system message; bert-squad)
   /system TEXT   set the system message (/system alone clears it)
+  /image FILE    attach an image (JPEG / PNG ...) to your next message (an
+                 image model, e.g. smolvlm-256m-instruct); or end a message
+                 with it: "What is in this image? /image photo.jpg"
   /model [M]     list the server's models / switch to M (the history is kept)
   /reset         forget the conversation (keeps the system message)
   /help, /quit
@@ -20,6 +23,7 @@ OPENAI_API_KEY).
 """
 
 import argparse
+import base64
 import http.client
 import json
 import os
@@ -128,6 +132,44 @@ def read_file(path):
         return f.read().strip()
 
 
+IMAGE_TYPES = {".jpg": "jpeg", ".jpeg": "jpeg", ".png": "png", ".gif": "gif", ".webp": "webp",
+               ".bmp": "bmp"}
+
+
+def image_part(path):
+    """An OpenAI image_url content part holding the file as a data URL."""
+    ext = os.path.splitext(path)[1].lower()
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return {"type": "image_url",
+            "image_url": {"url": f"data:image/{IMAGE_TYPES.get(ext, 'jpeg')};base64,{data}"}}
+
+
+def image_path(arg):
+    """A path typed after /image: quotes stripped, ~ expanded (spaces kept)."""
+    arg = arg.strip()
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in "'\"":
+        arg = arg[1:-1]
+    return os.path.expanduser(arg)
+
+
+def split_image(line):
+    """(text, path or None, error): a message ending in "/image PATH"."""
+    i = line.rfind("/image ")
+    if i < 0 or (i and not line[i - 1].isspace()):
+        return line, None, None
+    path = image_path(line[i + len("/image "):])
+    if not os.path.isfile(path):
+        return line, None, f"no such file: {path!r}"
+    return line[:i].rstrip(), path, None
+
+
+def user_message(text, image=None):
+    if not image:
+        return {"role": "user", "content": text}
+    return {"role": "user", "content": [image_part(image), {"type": "text", "text": text}]}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -137,6 +179,7 @@ def main(argv=None):
     ap.add_argument("--model", default=None, help="default: the server's first model")
     ap.add_argument("--doc", help="document file (sent as the system message)")
     ap.add_argument("--system", help="system message")
+    ap.add_argument("--image", help="an image for the first question (an image model)")
     ap.add_argument("-q", "--question", help="ask once and exit")
     ap.add_argument("--no-stream", action="store_true")
     ap.add_argument("--max-tokens", type=int)
@@ -159,12 +202,13 @@ def main(argv=None):
 
     if args.question:
         try:
-            ask(args, convo() + [{"role": "user", "content": args.question}])
+            ask(args, convo() + [user_message(args.question, args.image)])
             return 0
         except (ApiError, OSError, http.client.HTTPException, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
 
+    pending_image = args.image
     tty = sys.stdin.isatty()
     print(f"{DIM}{args.url} · model {args.model}"
           f"{' · document ' + str(len(system.split())) + ' words' if system else ''}"
@@ -196,6 +240,13 @@ def main(argv=None):
                 system = read_file(arg)
                 history.clear()
                 print(f"{DIM}(document: {arg}, {len(system.split())} words; conversation cleared){RST}")
+            elif cmd == "/image":
+                path = image_path(arg)
+                if not os.path.isfile(path):
+                    print(f"{DIM}no such file: {path!r}{RST}")
+                else:
+                    pending_image = path
+                    print(f"{DIM}(image {path} goes with your next message){RST}")
             elif cmd == "/model":
                 if arg:
                     args.model = arg
@@ -203,7 +254,17 @@ def main(argv=None):
             elif cmd.startswith("/"):
                 print(f"{DIM}unknown command {cmd} (/help){RST}")
             else:
-                history.append({"role": "user", "content": line})
+                text, path, err = split_image(line)
+                if err:
+                    print(f"{DIM}{err} (nothing sent){RST}")
+                    continue
+                if path:
+                    pending_image = path
+                    if not text:
+                        print(f"{DIM}(image {path} goes with your next message){RST}")
+                        continue
+                history.append(user_message(text, pending_image))
+                pending_image = None
                 history.append({"role": "assistant", "content": ask(args, convo())})
         except ApiError as e:
             if history and history[-1]["role"] == "user":

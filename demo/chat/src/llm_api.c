@@ -28,6 +28,10 @@
 #include "inference.h"
 #include "llm_glue.h"
 
+#ifndef LLM_IMAGE_TOKENS              /* a glue header without the image part */
+#  define LLM_IMAGE_TOKENS 0
+#endif
+
 #ifndef LLM_API_WEIGHTS_DIR
 #  define LLM_API_WEIGHTS_DIR "."
 #endif
@@ -36,6 +40,9 @@ static int     s_open;
 static int     s_pos;                       /* positions filled, incl. the sink */
 static char    s_err[512];
 static int32_t s_ids[LLM_MAX_BUCKET];
+#if LLM_IMAGE_TOKENS > 0
+static inference_buf_t *s_patches;          /* the vision entry's input */
+#endif
 
 /* s_pick[r]: the bucket of the first prefill call for r remaining tokens on
  * the least-cost split; s_cost[r] its total cost.  Constant, filled once. */
@@ -117,6 +124,14 @@ int llm_open(const char *weights_dir)
                 weights_dir && *weights_dir ? weights_dir : LLM_API_WEIGHTS_DIR);
         return -4;
     }
+#if LLM_IMAGE_TOKENS > 0
+    s_patches = inference_buf_alloc(LLM_N_PATCHES * 3u * LLM_PATCH * LLM_PATCH);
+    if (!s_patches) {
+        inference_deinit();
+        set_err("cannot allocate the image input buffer (CMA)");
+        return -5;
+    }
+#endif
     plan_split();
     s_open = 1;
     s_pos = 1;                              /* the sink */
@@ -127,6 +142,10 @@ void llm_close(void)
 {
     if (!s_open)
         return;
+#if LLM_IMAGE_TOKENS > 0
+    inference_buf_free(s_patches);
+    s_patches = NULL;
+#endif
     inference_deinit();
     s_open = 0;
     s_pos = 0;
@@ -159,15 +178,62 @@ int llm_truncate(int n)
     return 0;
 }
 
-static int check_tokens(const int32_t *tokens, int n)
+static int check_tokens(const int32_t *tokens, int n, int images)
 {
+    const int lim = LLM_VOCAB + (images ? LLM_IMAGE_TOKENS : 0);
     int i;
     for (i = 0; i < n; i++)
-        if (tokens[i] < 0 || tokens[i] >= LLM_VOCAB) {
-            set_err("token %d at index %d outside [0, %d)", (int)tokens[i], i, LLM_VOCAB);
+        if (tokens[i] < 0 || tokens[i] >= lim) {
+            set_err("token %d at index %d outside [0, %d)", (int)tokens[i], i, lim);
             return -1;
         }
     return 0;
+}
+
+int llm_image_tokens(void) { return LLM_IMAGE_TOKENS; }
+
+int llm_image_size(void)
+{
+#if LLM_IMAGE_TOKENS > 0
+    return LLM_IMAGE_SIZE;
+#else
+    return 0;
+#endif
+}
+
+int llm_image(const uint8_t *rgb)
+{
+#if LLM_IMAGE_TOKENS > 0
+    const unsigned S = LLM_IMAGE_SIZE, P = LLM_PATCH, n = S / P, pe = 3u * P * P;
+    Data_t        *x;
+    unsigned       r, c, ch, ky, kx;
+    if (!s_open) {
+        set_err("llm_image: the model is not open");
+        return -1;
+    }
+    if (!rgb) {
+        set_err("llm_image: no image");
+        return -2;
+    }
+    /* patch t = r * n + c, element (channel, row, column) of the patch: the
+     * raw uint8 value (exponent 0; the normalisation is in the weights) */
+    x = inference_buf_ptr(s_patches);
+    for (r = 0u; r < n; r++)
+        for (c = 0u; c < n; c++) {
+            Data_t *o = x + (size_t)(r * n + c) * pe;
+            for (ch = 0u; ch < 3u; ch++)
+                for (ky = 0u; ky < P; ky++)
+                    for (kx = 0u; kx < P; kx++)
+                        o[(ch * P + ky) * P + kx] =
+                            (Data_t)rgb[((size_t)(r * P + ky) * S + c * P + kx) * 3u + ch];
+        }
+    llm_glue_vision(s_patches);
+    return 0;
+#else
+    (void)rgb;
+    set_err("llm_image: this library has no vision encoder");
+    return -1;
+#endif
 }
 
 int llm_prefill(const int32_t *tokens, int n, float *logits)
@@ -185,7 +251,7 @@ int llm_prefill(const int32_t *tokens, int n, float *logits)
         set_err("llm_prefill: %d + %d positions exceed the context (%d)", s_pos, n, LLM_CONTEXT);
         return -3;
     }
-    if (check_tokens(tokens, n) != 0)
+    if (check_tokens(tokens, n, 1) != 0)
         return -4;
     while (done < n) {
         unsigned b = s_pick[n - done], k;
@@ -218,7 +284,7 @@ int llm_decode(int32_t token, float *logits)
         set_err("llm_decode: the context (%d positions) is full", LLM_CONTEXT);
         return -3;
     }
-    if (check_tokens(&token, 1) != 0)
+    if (check_tokens(&token, 1, 0) != 0)
         return -4;
     pos = (int32_t)s_pos;
     llm_glue_decode(&token, &pos, logits);

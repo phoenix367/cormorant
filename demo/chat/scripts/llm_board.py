@@ -196,6 +196,8 @@ def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int
 
 def run_bench(session, remote_proj: str, bdir: str, args, tag: str) -> str:
     extra = f"-P {args.prefill_lens} -R {args.reps}" if args.prefill_lens else ""
+    if getattr(args, "vlm_images", None):
+        extra += " -I images.bin"
     if args.decode_at and tag == "main":
         extra += f" -D {args.decode_at} -S {args.decode_at_steps}"
     cmd = (f"mkdir -p {RUN_DIR} && cd {RUN_DIR} && "
@@ -216,10 +218,12 @@ def parse(out: str) -> dict:
     phase = None
     for line in out.splitlines():
         for key in ("LLM_OPEN", "LLM_PROMPT", "LLM_PREFILL", "LLM_DECODE_AT", "LLM_REOPEN",
-                    "LLM_SUMMARY"):
+                    "LLM_SUMMARY", "LLM_IMAGE"):
             if line.startswith(key + ":"):
                 d = json.loads(line[len(key) + 1:])
-                if key == "LLM_PROMPT":
+                if key == "LLM_IMAGE":
+                    res.setdefault("images", []).append(d)
+                elif key == "LLM_PROMPT":
                     res["prompts"].append(d)
                 elif key == "LLM_PREFILL":
                     res["prefill"].append(d)
@@ -288,6 +292,23 @@ def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: s
     return rep
 
 
+def vlm_inputs(summary: dict, images: str):
+    """(items [(COCO id, prompt)], library ids per prompt, pixels) of a VLM
+    project's image prompts (vlm_study's evaluation prompts)."""
+    import vlm_project as vp
+    import vlm_sched_check as vc
+    import vlm_study as vs
+    ids = [int(x) for x in images.split(",")]
+    items = [(i, vs.EVAL_PROMPTS[vs.EVAL_IDS.index(i) % len(vs.EVAL_PROMPTS)]
+              if i in vs.EVAL_IDS else vs.EVAL_PROMPTS[0]) for i in ids]
+    sd = lp.study.study_dir(summary["assets"])
+    toks = vc.prompt_tokens(items, summary["assets"], os.path.join(sd, "sched_check", "prompt_ids.json"))
+    pixd = vc.pixels(ids, os.path.join(sd, "sched_check"))
+    V = summary["config"]["vocab"]
+    image_token = json.load(open(os.path.join(summary["assets"], "config.json")))["image_token_id"]
+    return items, [vp.library_ids(toks[i], V, image_token) for i, _ in items], [pixd[i] for i, _ in items]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -314,6 +335,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-lib-check", action="store_true",
                     help="skip llm_lib_check.py (ctypes: exports, threads, chunks, re-open)")
     ap.add_argument("--out", default=None, help="write the results JSON here")
+    ap.add_argument("--images", default="39769,1268",
+                    help="a VLM project: the COCO images of the image prompts (vlm_study)")
     args = ap.parse_args(argv)
     cfg = bert_config(args.bert_config)
     summary = json.load(open(os.path.join(args.project, "project.json")))
@@ -321,7 +344,15 @@ def main(argv=None) -> int:
     if args.install_only and args.skip_build:
         ap.error("--install-only builds; it cannot be combined with --skip-build")
     local_prompts = os.path.join(args.project, "prompts.bin")
-    if not args.install_only:
+    vlm = bool(summary.get("vision"))
+    args.vlm_images = None
+    if not args.install_only and vlm:
+        import vlm_host_emu as vhe
+        v_items, v_lib_ids, v_pix = vlm_inputs(summary, args.images)
+        vhe.write_inputs(args.project, v_lib_ids, v_pix)
+        args.vlm_images = os.path.join(args.project, "images.bin")
+        names = [f"COCO {i}" for i, _ in v_items]
+    elif not args.install_only:
         ids = lp.with_second_turns(lp.tokenize_prompts(args.prompts.split(",")),
                                    [n for n in args.second_turn.split(",") if n])
         names = write_prompts(local_prompts, ids)
@@ -358,6 +389,8 @@ def main(argv=None) -> int:
             sftp = session._client.open_sftp()                   # noqa: SLF001
             session.exec_checked(f"mkdir -p {RUN_DIR}", timeout=15)
             sftp.put(local_prompts, f"{RUN_DIR}/prompts.bin")
+            if args.vlm_images:
+                sftp.put(args.vlm_images, f"{RUN_DIR}/images.bin")
             text = run_bench(session, remote_proj, "build", args, "main")
             res = parse(text)
             local_logits = os.path.join(args.project, "logits_board.bin")
@@ -400,7 +433,12 @@ def main(argv=None) -> int:
         print(f"re-open: {res['llm_reopen']}")
     for ph, bd in results.get("profile", {}).items():
         print(f"profile {ph}: " + ", ".join(f"{k} {v:.2f} ms" for k, v in bd.items()))
-    if not args.no_check:
+    for im in res.get("images", []):
+        print(f"image {im['i']}: llm_image {im['ms']:.0f} ms")
+    if not args.no_check and vlm:
+        results["check"] = vhe.check(os.path.abspath(args.project), v_items, v_lib_ids, v_pix, res,
+                                     local_logits, args.decode)
+    elif not args.no_check:
         results["check"] = check_logits(args.project, names, ids, res, local_logits,
                                         args.decode, args.study_json)
     if args.out:

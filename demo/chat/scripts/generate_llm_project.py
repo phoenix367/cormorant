@@ -47,6 +47,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import llm_project as lp                                           # noqa: E402
+import vlm_project as vp                                           # noqa: E402
 from src.codegen.multi import MultiEntryGenerator                  # noqa: E402
 from src.llm_entries import entry_graphs                         # noqa: E402
 from src.host_nodes import HostNode                                # noqa: E402
@@ -56,6 +57,9 @@ from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode,      # noqa: E402
                            LlmDequantNode, LlmEmbedNode, LlmResAddNode, LlmRMSNormNode,
                            LlmSelectRowNode, LlmSiluMulNode)
 from src.nodes import MatmulConvNode, MatmulNode                   # noqa: E402
+from src.vit_nodes import (VitAttnPrepNode, VitAttnSoftmaxNode,    # noqa: E402
+                           VitEmbedAddNode, VitGeluNode, VitLayerNormNode, VitPixelShuffleNode,
+                           VitResAddNode, VitSumDequantNode)
 
 CHAT = os.path.dirname(HERE)
 SRC = os.path.join(CHAT, "src")
@@ -65,10 +69,33 @@ DEFAULT_OUT = os.path.join(CHAT, "build", "llm_project")
 KINDS = ("MatMul linear", "LM head", "attention (host)", "attention q.K^T (FPGA)",
          "attention P.V (FPGA)", "attention softmax (host)", "attention prep (host)",
          "attention merge (host)", "RMSNorm", "residual add", "SiLU*up", "embedding",
-         "other host")
+         "other host", "vision MatMul", "vision attention q.K^T (FPGA)",
+         "vision attention P.V (FPGA)", "vision attention softmax (host)",
+         "vision attention prep (host)", "vision attention merge (host)", "vision LayerNorm",
+         "vision residual add", "vision GELU", "vision patch embedding add",
+         "vision pixel shuffle", "vision connector sum")
+
+
+VISION_KINDS = ((VitAttnSoftmaxNode, "vision attention softmax (host)"),
+                (VitAttnPrepNode, "vision attention prep (host)"),
+                (VitLayerNormNode, "vision LayerNorm"), (VitResAddNode, "vision residual add"),
+                (VitGeluNode, "vision GELU"), (VitEmbedAddNode, "vision patch embedding add"),
+                (VitPixelShuffleNode, "vision pixel shuffle"),
+                (VitSumDequantNode, "vision connector sum"))
 
 
 def node_kind(sn) -> str:
+    if sn.onnx_node.name.startswith("vision."):
+        if isinstance(sn, (MatmulNode, MatmulConvNode)):
+            return "vision MatMul"
+        if isinstance(sn, LlmAttnConvNode):
+            return ("vision attention q.K^T (FPGA)" if sn.kind == "qk"
+                    else "vision attention P.V (FPGA)")
+        if isinstance(sn, LlmAttnMergeNode):
+            return "vision attention merge (host)"
+        for cls, kind in VISION_KINDS:
+            if isinstance(sn, cls):
+                return kind
     if isinstance(sn, (MatmulNode, MatmulConvNode)):
         return "LM head" if sn.m >= 4096 and sn.inputs[1].is_weight and \
             "lm_head" in sn.inputs[1].onnx_name else "MatMul linear"
@@ -107,7 +134,28 @@ def populate_drivers(out: str, driver_dirs: dict, active) -> list:
     return missing
 
 
-def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buckets) -> None:
+def vision_glue(vcfg) -> str:
+    """llm_glue.h's image part (LLM_IMAGE_TOKENS 0 for a text-only model)."""
+    if vcfg is None:
+        return "\n#define LLM_IMAGE_TOKENS 0\n"
+    return f"""
+/* The vision entry (src/vit.py): an image of LLM_IMAGE_SIZE^2 RGB pixels in
+ * LLM_PATCH^2 patches -> LLM_IMAGE_TOKENS image-feature rows (the state the
+ * prefill entries read for ids LLM_VOCAB .. LLM_VOCAB + LLM_IMAGE_TOKENS - 1). */
+#define LLM_IMAGE_TOKENS {vcfg.n_img}
+#define LLM_IMAGE_SIZE   {vcfg.S}
+#define LLM_PATCH        {vcfg.P}
+#define LLM_N_PATCHES    {vcfg.N}u
+
+static inline void llm_glue_vision(inference_buf_t *patches)
+{{
+    inference_run_vision(patches);
+}}
+"""
+
+
+def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buckets,
+              vcfg=None) -> None:
     active = mg._active_kernels
     buckets = sorted(buckets)
     costs = lp.bucket_costs(buckets)
@@ -162,7 +210,7 @@ static inline void llm_glue_decode(const int32_t *id, const int32_t *pos, float 
 {{
     inference_run_decode(id, pos, logits);
 }}
-"""
+""" + vision_glue(vcfg)
     with open(os.path.join(out, "test", "llm_glue.h"), "w") as f:
         f.write(glue)
 
@@ -249,6 +297,8 @@ def main(argv=None) -> int:
                          "build/llm_project_<model> for another --model-name")
     ap.add_argument("--assets", default=None)
     ap.add_argument("--formats", default=None)
+    ap.add_argument("--vision-formats", default=None,
+                    help="a VLM's vision formats (default: its study dir)")
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
     ap.add_argument("--context", type=int, default=lp.CONTEXT)
     ap.add_argument("--prefill-engine", choices=("conv", "matmul"), default="conv")
@@ -260,20 +310,38 @@ def main(argv=None) -> int:
                     help="JSON {kernel: dir}; default: local.driver_dirs of "
                          "demo/bert_squad/bert_squad_config.json")
     args = ap.parse_args(argv)
+    if args.assets is None and args.model_name == vp.MODEL:
+        args.assets = vp.default_assets()
     if args.out_dir is None:
         tag = args.model_name.removesuffix("-instruct").replace("-", "_").replace(".", "_")
         args.out_dir = (DEFAULT_OUT if args.model_name == "smollm2-135m-instruct"
                         else f"{DEFAULT_OUT}_{tag}")
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
-    cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
-                     prefill_attn=args.prefill_attn)
-    print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
-          f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
-          f"prefill attention {args.prefill_attn}", flush=True)
-    models = lp.entry_models(fe, buckets)
-    del W
+    vcfg = None
+    if args.assets and vp.is_vlm(args.assets):
+        if args.prefill_attn != "fpga":
+            raise SystemExit("a VLM needs --prefill-attn fpga")
+        m = vp.load(args.assets, args.formats, args.vision_formats)
+        cfg, vcfg = m.tcfg, m.vcfg
+        fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name)
+        formats_paths = m.formats_paths
+        print(f"frontend: VLM, vision {vcfg.L} layers, hidden {vcfg.D}, {vcfg.N} patches -> "
+              f"{vcfg.n_img} image tokens; text {cfg.L} layers, hidden {cfg.D}, heads "
+              f"{cfg.H}/{cfg.KV}, vocab {cfg.V}, context {args.context}, buckets {buckets}",
+              flush=True)
+        models = vp.entry_models(fe, fe_v, buckets)
+        del m
+    else:
+        cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats)
+        fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
+                         prefill_attn=args.prefill_attn)
+        formats_paths = (os.path.abspath(args.formats or lp.default_formats(args.assets)),)
+        print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
+              f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
+              f"prefill attention {args.prefill_attn}", flush=True)
+        models = lp.entry_models(fe, buckets)
+        del W
     entries = build_entries(models, args.prefill_engine,
                             log=lambda m: print(m, flush=True))
     del models
@@ -295,7 +363,7 @@ def main(argv=None) -> int:
     missing = populate_drivers(out, dd, mg._active_kernels)
     for name in C_SOURCES:
         shutil.copy2(os.path.join(SRC, name), os.path.join(out, "test", name))
-    emit_glue(out, mg, args.model_name, cfg, args.context, buckets)
+    emit_glue(out, mg, args.model_name, cfg, args.context, buckets, vcfg)
     patch_cmake(out, mg)
     layers = write_layers(out, mg)
     summary.update({
@@ -303,9 +371,11 @@ def main(argv=None) -> int:
         "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
         "policy": lp.POLICIES[args.prefill_attn],
         "assets": os.path.abspath(args.assets or lp.default_assets()),
-        "formats": os.path.abspath(args.formats or lp.default_formats(args.assets)),
+        "formats": [os.path.abspath(p) for p in formats_paths] if vcfg else formats_paths[0],
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,
                    "head_dim": cfg.HD, "ffn": cfg.FF, "vocab": cfg.V},
+        "vision": ({"layers": vcfg.L, "hidden": vcfg.D, "heads": vcfg.H, "image": vcfg.S,
+                    "patch": vcfg.P, "image_tokens": vcfg.n_img} if vcfg else None),
         "kinds": {k: sum(1 for L in layers if L["kind"] == k) for k in KINDS},
         "missing_drivers": missing, "targets": ["llm_bench", "smollm2"],
         "generated_s": round(time.time() - t0, 1)})

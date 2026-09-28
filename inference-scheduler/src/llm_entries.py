@@ -67,8 +67,9 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
                  matmul_on_conv: Optional[str] = None,
                  log: Optional[Callable[[str], None]] = None) -> List[Tuple[str, OnnxGraph]]:
     """``[(name, OnnxGraph)]`` in the order decode, prefill buckets
-    (ascending), head, for ``models`` = {entry name: ModelProto} with names
-    ``decode``, ``prefill_<T>``, ``head``.  ``prefill_engine`` is "conv"
+    (ascending), head, then any other entry (a VLM's ``vision``, src/vit.py:
+    its own weights, the default lowering), for ``models`` = {entry name:
+    ModelProto} with names ``decode``, ``prefill_<T>``, ``head``, ....  ``prefill_engine`` is "conv"
     (MatMul-on-ConvKernel where the cost model prefers it) or "matmul";
     ``matmul_on_conv`` overrides the prefill lowering mode (tests).
 
@@ -110,7 +111,18 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
         st = g.matmul_gemv_stats
         log(f"  {name}: {len(g.nodes)} nodes, MatMul GEMV {st['gemv']} "
             f"(conv image {st['kw>1']}) ({time.time() - t0:.0f} s)")
-    order = (["decode"] + sorted(prefills, key=lambda n: int(n.split("_")[1])) + ["head"])
+    others = sorted(models)
+    for name in others:
+        t0 = time.time()
+        g = OnnxGraph(models.pop(name), fuse_act=True, s2d_stem=True, matmul_on_conv=mode)
+        _share_arrays(g, pool)
+        _release_memory()
+        graphs[name] = g
+        st = g.matmul_conv_stats
+        log(f"  {name}: {len(g.nodes)} nodes, MatMul on ConvKernel {st['lowered']} / kept "
+            f"{st['kept']} ({time.time() - t0:.0f} s)")
+    order = (["decode"] + sorted(prefills, key=lambda n: int(n.split("_")[1])) + ["head"]
+             + others)
     return [(n, graphs[n]) for n in order if n in graphs]
 
 

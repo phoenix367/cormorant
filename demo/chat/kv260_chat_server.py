@@ -18,6 +18,10 @@ Backends (chat_backend.Backend; one model id each)
   smollm2      model id smollm2-135m-instruct: generative chat with
                SmolLM2-135M-Instruct on the FPGA (smollm2_backend.py,
                libsmollm2.so; tokenizer, template and sampling on the host)
+  smolvlm      model id smolvlm-256m-instruct: chat about images with
+               SmolVLM-256M-Instruct on the FPGA (smolvlm_backend.py,
+               libsmolvlm_256m.so; image_url parts as base64 data URLs,
+               resized on the host with Pillow)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
 
@@ -117,23 +121,37 @@ def _number(body: dict, key: str, lo: float, hi: Optional[float], integer: bool 
     return v
 
 
-def _content(m: dict, i: int) -> str:
+def _content(m: dict, i: int):
+    """(text, parts): the content as text (text parts joined by "\\n"), and the
+    parts in order when there is an image — [{"type": "text", "text"} |
+    {"type": "image", "url"}] — else None."""
     c = m.get("content")
     if c is None:
-        return ""
+        return "", None
     if isinstance(c, str):
-        return c
+        return c, None
     if isinstance(c, list):
-        parts = []
+        texts, parts, images = [], [], 0
         for j, p in enumerate(c):
             if isinstance(p, str):
-                parts.append(p)
+                texts.append(p)
+                parts.append({"type": "text", "text": p})
             elif isinstance(p, dict) and p.get("type") in ("text", "input_text"):
-                parts.append(str(p.get("text") or ""))
+                texts.append(str(p.get("text") or ""))
+                parts.append({"type": "text", "text": texts[-1]})
+            elif isinstance(p, dict) and p.get("type") in ("image_url", "input_image"):
+                u = p.get("image_url")
+                url = u.get("url") if isinstance(u, dict) else u
+                if not isinstance(url, str) or not url:
+                    raise BackendError(f"Invalid image part in messages[{i}].content[{j}]: expected "
+                                       f"image_url.url (a data URL).", f"messages.[{i}].content.[{j}]")
+                parts.append({"type": "image", "url": url})
+                images += 1
             else:
                 raise BackendError(f"Invalid content part in messages[{i}].content[{j}]: only text "
-                                   f"parts are supported.", f"messages.[{i}].content.[{j}]")
-        return "\n".join(parts)
+                                   f"and image_url parts are supported.",
+                                   f"messages.[{i}].content.[{j}]")
+        return "\n".join(texts), (parts if images else None)
     raise BackendError(f"Invalid type for 'messages[{i}].content': expected a string or an array "
                        f"of text parts, but got {_type_name(c)} instead.", f"messages.[{i}].content")
 
@@ -159,7 +177,8 @@ def parse_chat_request(body: Any, default_model: str) -> ChatRequest:
         if role not in ROLES:
             raise BackendError(f"Invalid value for 'messages[{i}].role': '{role}'. Supported values "
                                f"are: {', '.join(repr(r) for r in ROLES)}.", f"messages.[{i}].role")
-        messages.append({"role": role, "content": _content(m, i)})
+        text, parts = _content(m, i)
+        messages.append({"role": role, "content": text} | ({"parts": parts} if parts else {}))
     stream = body.get("stream", False)
     if stream is None:
         stream = False
@@ -589,6 +608,16 @@ class ChatHandler(BaseHTTPRequestHandler):
             if backend is None:
                 return self._error(404, f"The model '{req.model}' does not exist or you do not "
                                    f"have access to it.", param="model", code="model_not_found")
+            if not getattr(backend, "accepts_images", False) and any(
+                    m.get("parts") for m in req.messages):
+                vlms = [m for m, b in srv.backends.items() if getattr(b, "accepts_images", False)]
+                hint = (f"send them to {', '.join(vlms)}" if vlms else "no image model is served")
+                i, j = next((i, j) for i, m in enumerate(req.messages)
+                            for j, p in enumerate(m.get("parts") or []) if p["type"] == "image")
+                return self._error(400, f"Invalid content part in messages[{i}].content[{j}]: the "
+                                   f"model '{req.model}' does not accept images; {hint}.",
+                                   param=f"messages.[{i}].content.[{j}]",
+                                   code="images_not_supported")
             try:
                 job = backend.prepare(req)
             except BackendError as e:
@@ -826,6 +855,14 @@ def llm_engine(args):
     return LibLlmEngine(args.llm_lib, args.llm_weights)
 
 
+def sampler_defaults(args):
+    from sampler import SamplerParams
+    return SamplerParams(temperature=args.llm_temperature, top_p=args.llm_top_p,
+                         top_k=args.llm_top_k, repetition_penalty=args.llm_repetition_penalty,
+                         dry_multiplier=args.llm_dry_multiplier, dry_base=args.llm_dry_base,
+                         dry_allowed_length=args.llm_dry_allowed_length)
+
+
 def build_backends(args) -> Dict[str, Backend]:
     out: Dict[str, Backend] = {}
     for name in args.backend or ["bert-squad"]:
@@ -852,8 +889,19 @@ def build_backends(args) -> Dict[str, Backend]:
                 context_size=args.llm_context, reserve=args.llm_reserve,
                 repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk,
                 cma_mb=args.llm_cma_mb, model_id=args.llm_model_id)
+        elif name in ("smolvlm", "smolvlm-256m-instruct"):
+            from smolvlm_backend import LibVlmEngine, SmolvlmBackend
+            b = SmolvlmBackend(
+                LibVlmEngine(args.vlm_lib, args.vlm_weights), args.vlm_tokenizer,
+                sampler_lib=args.llm_sampler_lib, defaults=sampler_defaults(args),
+                dry_penalty_last_n=args.llm_dry_penalty_last_n,
+                dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
+                loop_guard=not args.llm_no_loop_guard, context_size=args.llm_context,
+                reserve=args.llm_reserve, repeat_last_n=args.llm_repeat_last_n,
+                prefill_chunk=args.llm_prefill_chunk, cma_mb=args.vlm_cma_mb,
+                model_id=args.vlm_model_id)
         else:
-            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, echo)")
+            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, smolvlm, echo)")
         out[b.model_id] = b
     return out
 
@@ -871,7 +919,8 @@ def main(argv=None) -> int:
                     help="require 'Authorization: Bearer KEY' on /v1/* (env KV260_CHAT_API_KEY)")
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
-                    choices=("bert-squad", "smollm2", "smollm2-135m-instruct", "echo"),
+                    choices=("bert-squad", "smollm2", "smollm2-135m-instruct", "smolvlm",
+                             "smolvlm-256m-instruct", "echo"),
                     help="backend(s) to serve (default: bert-squad); the first is the default model")
     ap.add_argument("--resident", choices=("auto", "one", "all"), default="auto",
                     help="which FPGA models stay loaded (see above; default auto)")
@@ -926,6 +975,18 @@ def main(argv=None) -> int:
                    help="CMA the loaded model holds (MB), for --resident auto")
     g.add_argument("--llm-fake", choices=("float", "scripted"), default=None,
                    help="development without the FPGA: tests/fake_llm.py instead of libsmollm2.so")
+    g = ap.add_argument_group("smolvlm (chat about images; the llm sampling defaults apply)")
+    g.add_argument("--vlm-lib", default=os.path.join(HERE, "lib", "libsmolvlm_256m.so"))
+    g.add_argument("--vlm-weights", default=None,
+                   help="weights directory for llm_open(); default: the one the library was built for")
+    g.add_argument("--vlm-tokenizer", default=_first_existing(
+        os.path.join(HERE, "smolvlm", "tokenizer.json"),
+        os.path.join(HERE, "assets", "smolvlm-256m-instruct", "tokenizer.json")))
+    g.add_argument("--vlm-model-id", default=None)
+    g.add_argument("--vlm-cma-mb", type=float, default=520.0,
+                   help="CMA the loaded model holds (MB), for --resident auto")
+    ap.add_argument("--max-body-mb", type=float, default=None,
+                    help="request body limit (default 4 MB; 32 MB when an image model is served)")
     ap.add_argument("--queue-timeout", type=float, default=120.0,
                     help="seconds a request may wait for the FPGA before a 503")
     ap.add_argument("--max-queue", type=int, default=16, help="requests waiting at most")
@@ -936,9 +997,12 @@ def main(argv=None) -> int:
             args.api_key = f.read().strip()
 
     backends = build_backends(args)
+    max_body = (int(args.max_body_mb * (1 << 20)) if args.max_body_mb else
+                (32 << 20) if any(getattr(b, "accepts_images", False) for b in backends.values())
+                else MAX_BODY)
     srv = ChatServer((args.host, args.port), backends, api_key=args.api_key,
                      queue_timeout=args.queue_timeout, max_queue=args.max_queue,
-                     resident=args.resident, cma_margin_mb=args.cma_margin_mb)
+                     resident=args.resident, cma_margin_mb=args.cma_margin_mb, max_body=max_body)
     try:
         for mid, b in backends.items():
             t0 = time.monotonic()
