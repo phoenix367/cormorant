@@ -2168,3 +2168,6 @@ exponent) instead of one 65 536-entry table, now in `vlm_study.py`.
 - **The CPU still waits** about 3.4 ms per head for P.V to free the lane
   before the next q.Kᵀ.  Splitting each softmax in two halves would hide
   that.
+- **In general:** measured tactics and a timed schedule, instead of cost
+  model rules and hand-written orders, are planned in
+  [TACTICS_PLAN.md](TACTICS_PLAN.md).
