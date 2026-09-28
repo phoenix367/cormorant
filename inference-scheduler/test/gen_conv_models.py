@@ -716,7 +716,8 @@ def _conv_model(name, x_shape, w_shape, y_shape, scale, seed, bias=False, **attr
     inputs = ["X", "W"]
     if bias:
         b = (np.random.RandomState(seed + 1).uniform(-1.0, 1.0, size=(w_shape[0],)) * 0.1).astype(np.float32)
-        inits.append(numpy_helper.from_array(b, name="B")); inputs.append("B")
+        inits.append(numpy_helper.from_array(b, name="B"))
+        inputs.append("B")
     node = helper.make_node("Conv", inputs=inputs, outputs=["Y"], **attrs)
     graph = helper.make_graph([node], name, inputs=[_vi("X", x_shape)], outputs=[_vi("Y", y_shape)], initializer=inits)
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]), name + ".onnx")

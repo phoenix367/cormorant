@@ -6,12 +6,10 @@ checked against explicit integer arithmetic; the generated C against the
 software kernels (host emulation)."""
 
 import json
-import os
 import tempfile
 import unittest
 
 import numpy as np
-import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as nph
 from onnx import TensorProto

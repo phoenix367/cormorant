@@ -12,12 +12,19 @@ the platform JSON.
 
 import os
 import sys
+import tempfile
 import unittest
+
+import numpy as np
+import onnx
+from onnx import TensorProto as TP
+from onnx import helper as oh
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from src._matmul_hw_config import MATMUL_TILE_M
 from src.graph import OnnxGraph
-from src.nodes import MatmulNode, SchedulerError
+from src.nodes import MatmulNode, SchedulerError, matmul_packed_m
 
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
@@ -173,18 +180,14 @@ if __name__ == "__main__":
 # layout and the node is called with b_packed = 1; activations and
 # constants shared with non-MatMul readers stay row-major.
 # ---------------------------------------------------------------------------
-import tempfile
-import numpy as np
-import onnx
-from onnx import helper as oh, TensorProto as TP
-from src._matmul_hw_config import MATMUL_TILE_M
-from src.nodes import matmul_packed_m
 
 
 def _build(nodes, inputs, outputs, inits):
     g = oh.make_graph(nodes, "t", inputs, outputs, initializer=inits)
-    m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 13)]); m.ir_version = 8
-    d = tempfile.mkdtemp(); path = os.path.join(d, "m.onnx"); onnx.save(m, path)
+    m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 13)])
+    m.ir_version = 8
+    path = os.path.join(tempfile.mkdtemp(), "m.onnx")
+    onnx.save(m, path)
     return path
 
 

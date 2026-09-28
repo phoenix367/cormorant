@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import struct
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -170,24 +169,24 @@ class Formats:
     def heads(self, cls_: str, layer: int, n_heads: int) -> np.ndarray:
         return self.get(cls_, layer, n_heads)
 
-    def k_cache(self, l: int) -> np.ndarray:
+    def k_cache(self, li: int) -> np.ndarray:
         """[KV*HD]: the K cache exponent (per KV head) over the channels."""
         c = self.cfg
-        return np.repeat(self.heads("k", l, c.KV), c.HD)
+        return np.repeat(self.heads("k", li, c.KV), c.HD)
 
-    def v_cache(self, l: int) -> np.ndarray:
+    def v_cache(self, li: int) -> np.ndarray:
         c = self.cfg
-        key = "vc" if f"vc@{l}" in self.exp else "v"
-        return self.get(key, l, c.KV * c.HD)
+        key = "vc" if f"vc@{li}" in self.exp else "v"
+        return self.get(key, li, c.KV * c.HD)
 
-    def pv(self, l: int) -> np.ndarray:
+    def pv(self, li: int) -> np.ndarray:
         """P.V output exponent per channel of [H*HD]: f_p[h] + f_vc[g(h)] - F."""
         c = self.cfg
         grp = np.arange(c.H) // (c.H // c.KV)
-        fp = self.heads("p", l, c.H)
-        vc = self.v_cache(l).reshape(c.KV, c.HD)
-        if f"pv@{l}" in self.exp:
-            return self.get("pv", l, c.H * c.HD)
+        fp = self.heads("p", li, c.H)
+        vc = self.v_cache(li).reshape(c.KV, c.HD)
+        if f"pv@{li}" in self.exp:
+            return self.get("pv", li, c.H * c.HD)
         return (fp[:, None] + vc[grp] - F).reshape(-1)
 
 
@@ -241,18 +240,18 @@ class LlamaFrontend:
         self._consts: Dict[str, np.ndarray] = {}
 
     # ---- shared constants ------------------------------------------------ #
-    def _w(self, l: int, fname: str) -> np.ndarray:
-        return self.W[f"model.layers.{l}.{fname}.weight"]
+    def _w(self, li: int, fname: str) -> np.ndarray:
+        return self.W[f"model.layers.{li}.{fname}.weight"]
 
     def lm_weight(self) -> np.ndarray:
         W = self.W
         return W["lm_head.weight"] if "lm_head.weight" in W else W["model.embed_tokens.weight"]
 
-    def _cache_init(self, l: int, which: str) -> np.ndarray:
+    def _cache_init(self, li: int, which: str) -> np.ndarray:
         c = self.cfg
-        raw = np.asarray((self.fmt.sink_k if which == "k" else self.fmt.sink_v)[l],
+        raw = np.asarray((self.fmt.sink_k if which == "k" else self.fmt.sink_v)[li],
                          np.float64).reshape(-1)                      # [KV*HD]
-        f = self.fmt.k_cache(l) if which == "k" else self.fmt.v_cache(l)
+        f = self.fmt.k_cache(li) if which == "k" else self.fmt.v_cache(li)
         init = np.zeros((self.C, c.KV * c.HD), np.float32)
         init[0] = (raw * np.power(2.0, -f.astype(np.float64))).astype(np.float32)
         return init
@@ -297,18 +296,18 @@ class LlamaFrontend:
     def _node(self, op, ins, outs, name, domain="", **attrs):
         self._nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
 
-    def _matmul(self, l, key, x, T, out_exp, lm=False):
+    def _matmul(self, li, key, x, T, out_exp, lm=False):
         c = self.cfg
         if lm:
             wname, W = "w.lm_head", self.lm_weight().T
         else:
             fname = dict((k, f) for k, f, _, _ in LINEARS)[key]
-            wname, W = f"w.l{l}.{key}", self._w(l, fname).T
+            wname, W = f"w.l{li}.{key}", self._w(li, fname).T
         K, M = W.shape
         self._init(wname, W)
-        y = self._t(f"{self._e}.l{l}.{key}" if not lm else f"{self._e}.logits_q", [T, M],
+        y = self._t(f"{self._e}.l{li}.{key}" if not lm else f"{self._e}.logits_q", [T, M],
                     exp=out_exp)
-        self._node("MatMul", [x, wname], [y], f"{self._e}.l{l}.{key}_proj" if not lm
+        self._node("MatMul", [x, wname], [y], f"{self._e}.l{li}.{key}_proj" if not lm
                    else f"{self._e}.lm_head")
         del c
         return y
@@ -341,18 +340,18 @@ class LlamaFrontend:
                     best = (cyc, kw)
         return best[1]
 
-    def _caches(self, l):
+    def _caches(self, li):
         c, fm = self.cfg, self.fmt
         host = "i16" if self.prefill_attn == "host" else None
-        kc = self._t(f"kv.k.l{l}", [self.C, c.KV * c.HD], exp=fm.k_cache(l), host=host, state=True)
-        vc = self._t(f"kv.v.l{l}", [self.C, c.KV * c.HD], exp=fm.v_cache(l), host=host, state=True)
+        kc = self._t(f"kv.k.l{li}", [self.C, c.KV * c.HD], exp=fm.k_cache(li), host=host, state=True)
+        vc = self._t(f"kv.v.l{li}", [self.C, c.KV * c.HD], exp=fm.v_cache(li), host=host, state=True)
         self._meta["layout"][kc] = [c.KV, c.HD]
         self._meta["layout"][vc] = [c.KV, c.HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
-        self._init(kc, self._cache_init(l, "k"))
-        self._init(vc, self._cache_init(l, "v"))
+        self._init(kc, self._cache_init(li, "k"))
+        self._init(vc, self._cache_init(li, "v"))
         return kc, vc
 
-    def _fpga_attention(self, l, q0, k0, v, T, pos, n, kc, vc):
+    def _fpga_attention(self, li, q0, k0, v, T, pos, n, kc, vc):
         """Per layer: LlmAttnPrep, then per KV group q.K^T (ConvKernel), the
         p12 softmax (host) and P.V (ConvKernel), then LlmAttnMerge.  Node
         order q.K^T 0, q.K^T 1, softmax 0, P.V 0, then per group g >= 1
@@ -363,31 +362,31 @@ class LlamaFrontend:
         c, fm, e = self.cfg, self.fmt, self._e
         G, KV, HD, H = c.H // c.KV, c.KV, c.HD, c.H
         grp = np.arange(H) // G
-        fq = fm.heads("q", l, H)
-        fk = fm.heads("k", l, KV)
-        fs = (fm.heads("s", l, H) if f"s@{l}" in fm.exp else fq + fk[grp] - F)
-        fp = fm.heads("p", l, H)
+        fq = fm.heads("q", li, H)
+        fk = fm.heads("k", li, KV)
+        fs = (fm.heads("s", li, H) if f"s@{li}" in fm.exp else fq + fk[grp] - F)
+        fp = fm.heads("p", li, H)
         kw = self.choose_qk_kw(T)
         common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=16 * self.pv_kw)
-        qx = self._t(f"{e}.l{l}.qx", [KV, HD, G * T], exp=0)
+        qx = self._t(f"{e}.l{li}.qx", [KV, HD, G * T], exp=0)
         self._node("LlmAttnPrep", [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"], [qx],
-                   f"{e}.l{l}.attn_prep", domain=LLM_DOMAIN, qk_kw=kw,
+                   f"{e}.l{li}.attn_prep", domain=LLM_DOMAIN, qk_kw=kw,
                    q_exp=[int(x) for x in fq], **common)
-        s = [self._t(f"{e}.l{l}.s{g}", [self.C, G * T], exp=0) for g in range(KV)]
-        p = [self._t(f"{e}.l{l}.p{g}", [G * T, self.C], exp=0) for g in range(KV)]
-        o = [self._t(f"{e}.l{l}.o{g}", [G * T, HD], exp=0) for g in range(KV)]
+        s = [self._t(f"{e}.l{li}.s{g}", [self.C, G * T], exp=0) for g in range(KV)]
+        p = [self._t(f"{e}.l{li}.p{g}", [G * T, self.C], exp=0) for g in range(KV)]
+        o = [self._t(f"{e}.l{li}.o{g}", [G * T, HD], exp=0) for g in range(KV)]
 
         def qk(g):
-            self._node("LlmAttnScores", [kc, qx, pos, n], [s[g]], f"{e}.l{l}.qk{g}",
+            self._node("LlmAttnScores", [kc, qx, pos, n], [s[g]], f"{e}.l{li}.qk{g}",
                        domain=LLM_DOMAIN, group=g, qk_kw=kw, **common)
         def softmax(g):
             hs = slice(g * G, (g + 1) * G)
-            self._node("LlmAttnSoftmax", [s[g], pos, n], [p[g]], f"{e}.l{l}.softmax{g}",
+            self._node("LlmAttnSoftmax", [s[g], pos, n], [p[g]], f"{e}.l{li}.softmax{g}",
                        domain=LLM_DOMAIN, group=g, s_exp=[int(x) for x in fs[hs]],
                        p_exp=[int(x) for x in fp[hs]], **common)
 
         def pv_(g):
-            self._node("LlmAttnPV", [p[g], vc, pos, n], [o[g]], f"{e}.l{l}.pv{g}",
+            self._node("LlmAttnPV", [p[g], vc, pos, n], [o[g]], f"{e}.l{li}.pv{g}",
                        domain=LLM_DOMAIN, group=g, **common)
         qk(0)
         if KV > 1:
@@ -399,8 +398,8 @@ class LlamaFrontend:
             if g + 1 < KV:
                 qk(g + 1)
             pv_(g)
-        pv = self._t(f"{e}.l{l}.pv", [T, H * HD], exp=fm.pv(l))
-        self._node("LlmAttnMerge", o, [pv], f"{e}.l{l}.attn_merge", domain=LLM_DOMAIN,
+        pv = self._t(f"{e}.l{li}.pv", [T, H * HD], exp=fm.pv(li))
+        self._node("LlmAttnMerge", o, [pv], f"{e}.l{li}.attn_merge", domain=LLM_DOMAIN,
                    num_heads=H, num_kv_heads=KV, head_dim=HD)
         return pv
 
@@ -408,34 +407,34 @@ class LlamaFrontend:
         c, fm, e = self.cfg, self.fmt, self._e
         self._init("rope.cos", self._cos)
         self._init("rope.sin", self._sin)
-        for l in range(c.L):
-            x = self._rmsnorm(h, f"g.l{l}.in", self.W[f"model.layers.{l}.input_layernorm.weight"],
-                              T, f"{e}.l{l}.x", fm.get("x", l, c.D), f"{e}.l{l}.norm_in")
-            q0 = self._matmul(l, "q", x, T, fm.get("q0", l, c.H * c.HD))
-            k0 = self._matmul(l, "k", x, T, fm.get("k0", l, c.KV * c.HD))
-            v = self._matmul(l, "v", x, T, fm.get("v", l, c.KV * c.HD))
-            kc, vc = self._caches(l)
+        for li in range(c.L):
+            x = self._rmsnorm(h, f"g.l{li}.in", self.W[f"model.layers.{li}.input_layernorm.weight"],
+                              T, f"{e}.l{li}.x", fm.get("x", li, c.D), f"{e}.l{li}.norm_in")
+            q0 = self._matmul(li, "q", x, T, fm.get("q0", li, c.H * c.HD))
+            k0 = self._matmul(li, "k", x, T, fm.get("k0", li, c.KV * c.HD))
+            v = self._matmul(li, "v", x, T, fm.get("v", li, c.KV * c.HD))
+            kc, vc = self._caches(li)
             if n is not None and self.prefill_attn == "fpga":
-                pv = self._fpga_attention(l, q0, k0, v, T, pos, n, kc, vc)
+                pv = self._fpga_attention(li, q0, k0, v, T, pos, n, kc, vc)
             else:
-                pv = self._t(f"{e}.l{l}.pv", [T, c.H * c.HD], exp=fm.pv(l))
+                pv = self._t(f"{e}.l{li}.pv", [T, c.H * c.HD], exp=fm.pv(li))
                 self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc, "rope.cos",
                                             "rope.sin"],
-                           [pv], f"{e}.l{l}.attn", domain=LLM_DOMAIN,
+                           [pv], f"{e}.l{li}.attn", domain=LLM_DOMAIN,
                            num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
-            o = self._matmul(l, "o", pv, T, fm.get("o", l, c.D))
-            h1 = self._t(f"{e}.l{l}.h1", [T, c.D], host="f32")
-            self._node("LlmResAdd", [h, o], [h1], f"{e}.l{l}.res_attn", domain=LLM_DOMAIN)
-            x2 = self._rmsnorm(h1, f"g.l{l}.post",
-                               self.W[f"model.layers.{l}.post_attention_layernorm.weight"],
-                               T, f"{e}.l{l}.x2", fm.get("x2", l, c.D), f"{e}.l{l}.norm_post")
-            g = self._matmul(l, "g", x2, T, fm.get("g", l, c.FF))
-            u = self._matmul(l, "u", x2, T, fm.get("u", l, c.FF))
-            a = self._t(f"{e}.l{l}.a", [T, c.FF], exp=fm.get("a", l, c.FF))
-            self._node("LlmSiluMul", [g, u], [a], f"{e}.l{l}.silu_mul", domain=LLM_DOMAIN)
-            d = self._matmul(l, "d", a, T, fm.get("d", l, c.D))
-            h2 = self._t(f"{e}.l{l}.h2", [T, c.D], host="f32")
-            self._node("LlmResAdd", [h1, d], [h2], f"{e}.l{l}.res_mlp", domain=LLM_DOMAIN)
+            o = self._matmul(li, "o", pv, T, fm.get("o", li, c.D))
+            h1 = self._t(f"{e}.l{li}.h1", [T, c.D], host="f32")
+            self._node("LlmResAdd", [h, o], [h1], f"{e}.l{li}.res_attn", domain=LLM_DOMAIN)
+            x2 = self._rmsnorm(h1, f"g.l{li}.post",
+                               self.W[f"model.layers.{li}.post_attention_layernorm.weight"],
+                               T, f"{e}.l{li}.x2", fm.get("x2", li, c.D), f"{e}.l{li}.norm_post")
+            g = self._matmul(li, "g", x2, T, fm.get("g", li, c.FF))
+            u = self._matmul(li, "u", x2, T, fm.get("u", li, c.FF))
+            a = self._t(f"{e}.l{li}.a", [T, c.FF], exp=fm.get("a", li, c.FF))
+            self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN)
+            d = self._matmul(li, "d", a, T, fm.get("d", li, c.D))
+            h2 = self._t(f"{e}.l{li}.h2", [T, c.D], host="f32")
+            self._node("LlmResAdd", [h1, d], [h2], f"{e}.l{li}.res_mlp", domain=LLM_DOMAIN)
             h = h2
         return h
 

@@ -67,7 +67,7 @@ from typing import ClassVar, Dict, List, Optional, Tuple
 import numpy as np
 
 from .host_nodes import (HostContext, HostNode, _attrs, _c_double, _c_float, _label,
-                         _prod, _resolve, libm)
+                         _resolve, libm)
 from .nodes import SchedulerError
 
 LLM_DOMAIN = "axi.llm"

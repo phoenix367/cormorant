@@ -73,10 +73,10 @@ def tiny_weights(cfg: dict, seed: int = 0) -> dict:
 def study_cfg(cfg: dict):
     """llm_study.Cfg for an in-memory config dict."""
     c = study.Cfg.__new__(study.Cfg)
-    c.L = cfg["num_hidden_layers"]; c.D = cfg["hidden_size"]; c.H = cfg["num_attention_heads"]
-    c.KV = cfg["num_key_value_heads"]; c.F = cfg["intermediate_size"]; c.V = cfg["vocab_size"]
+    c.L, c.D, c.H = cfg["num_hidden_layers"], cfg["hidden_size"], cfg["num_attention_heads"]
+    c.KV, c.F, c.V = cfg["num_key_value_heads"], cfg["intermediate_size"], cfg["vocab_size"]
     c.HD = cfg.get("head_dim") or c.D // c.H
-    c.eps = float(cfg["rms_norm_eps"]); c.theta = float(cfg["rope_theta"])
+    c.eps, c.theta = float(cfg["rms_norm_eps"]), float(cfg["rope_theta"])
     c.tied = cfg.get("tie_word_embeddings", True)
     return c
 

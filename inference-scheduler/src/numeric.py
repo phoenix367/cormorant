@@ -47,7 +47,7 @@ without it is byte-identical to before).
 from __future__ import annotations
 
 import json
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 

@@ -23,7 +23,7 @@ from onnx import TensorProto
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
 from src.codegen._simulate import _conv2d_ref
-from src.nodes   import (ConvNode, ScheduledNode, SpaceToDepthNode,
+from src.nodes   import (ConvNode, SpaceToDepthNode,
                          _s2d_stem_geometry, _s2d_stem_weight)
 from src.report  import ReportGenerator
 from src._conv_hw_config import CONV_TILE_IC

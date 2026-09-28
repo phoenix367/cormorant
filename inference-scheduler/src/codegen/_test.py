@@ -172,7 +172,7 @@ class _TestMixin:
                 ]
                 continue
             if t.exp is not None:
-                display = f"(double)(int16_t)p[i] /* raw */"
+                display = "(double)(int16_t)p[i] /* raw */"
             if t.is_int:
                 macro = f"INFERENCE_{t.c_name.upper()}_SIZE"
                 print_lines += [

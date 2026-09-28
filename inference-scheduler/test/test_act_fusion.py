@@ -20,7 +20,7 @@ from onnx import TensorProto
 from src.graph   import OnnxGraph
 from src.codegen import CodeGenerator
 from src.nodes   import (ScheduledNode, ConvNode,
-                         ACT_NONE, ACT_RELU, ACT_RELU6, OP_ADD, OP_MUL)
+                         ACT_NONE, ACT_RELU, ACT_RELU6, OP_ADD)
 from src.report  import ReportGenerator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))

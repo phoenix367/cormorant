@@ -199,7 +199,7 @@ class MultiEntryGenerator:
         dtype = dtype or AP_FIXED_16_8
         images: Dict[str, List[str]] = {}          # name -> digests seen, in order
         renamed = {}
-        for ename, g in self.entries:
+        for _, g in self.entries:
             for t in g.weight_tensors:
                 d = _image_digest(t, dtype)
                 seen = images.setdefault(t.onnx_name, [])
@@ -230,7 +230,7 @@ class MultiEntryGenerator:
 
     def _check_states(self):
         first = {}
-        for ename, g in self.entries:
+        for _, g in self.entries:
             for t in g.state_tensors:
                 f = first.setdefault(t.onnx_name, t)
                 if f is t:

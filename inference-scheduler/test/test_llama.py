@@ -23,7 +23,6 @@ fixture of test/gen_llama_models.py (hidden 64, 2 layers, 4 / 2 heads
 
 import os
 import re
-import sys
 import tempfile
 import unittest
 
@@ -38,9 +37,7 @@ from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
 from src.llm_entries import entry_graphs
-from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode, LlmAttnMergeNode,
-                           LlmAttnPrepNode, LlmAttnSoftmaxNode, LlmDequantNode, LlmEmbedNode,
-                           LlmResAddNode, LlmRMSNormNode, LlmSelectRowNode, LlmSiluMulNode)
+from src.llm_nodes import (LlmAttnConvNode, LlmAttnSoftmaxNode, LlmResAddNode, LlmRMSNormNode, LlmSelectRowNode)
 from src.nodes import MatmulConvNode, MatmulNode
 from test_cache_coherency import CoherencyChecker
 
@@ -277,7 +274,7 @@ class TestSimVsStudy(unittest.TestCase):
             a = self._sched_run(prompt, 5, split)
             b = self._study_run(prompt, 5)
             with self.subTest(n=n, split=split):
-                for i, (x, y) in enumerate(zip(a, b)):
+                for i, (x, y) in enumerate(zip(a, b, strict=True)):
                     np.testing.assert_array_equal(x, y, err_msg=f"step {i}")
 
     def test_truncate_and_reprefill(self):
@@ -320,7 +317,7 @@ class TestSimVsStudy(unittest.TestCase):
         b = study_steps(self.sm, self.sc, steps)
         a = sched_steps(Session(self.cgs, [8, 16]), steps)
         self.assertEqual(len(a), len(b))
-        for i, (x, y) in enumerate(zip(a, b)):
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
             np.testing.assert_array_equal(x, y, err_msg=f"step {i} {steps[i]}")
 
 
@@ -353,7 +350,7 @@ class TestOtherShapes(unittest.TestCase):
             tok = int(np.argmax(a[-1]))
             a.append(ses.decode(tok))
             b.append(sm.forward([s], [np.array([tok])], phase="decode")[0][-1])
-        for i, (x, y) in enumerate(zip(a, b)):
+        for i, (x, y) in enumerate(zip(a, b, strict=True)):
             np.testing.assert_array_equal(x, y, err_msg=f"step {i}")
         return gs
 
@@ -470,7 +467,7 @@ class TestHostEmulation(unittest.TestCase):
             calls = []                    # (entry, ids, pos, n)
             pos = 1
 
-            def prefill(toks):
+            def prefill(toks, calls=calls):
                 nonlocal pos
                 i = 0
                 for k, B in ((min(8, len(toks) - j), 8 if len(toks) - j <= 8 else 16)
@@ -503,7 +500,7 @@ class TestHostEmulation(unittest.TestCase):
             with self.subTest(fixture=fx.__name__), tempfile.TemporaryDirectory() as td:
                 got = run_calls(mg, td, calls, incoherent=True)
                 self.assertEqual(len(got), len(want))
-                for i, (x, y) in enumerate(zip(got, want)):
+                for i, (x, y) in enumerate(zip(got, want, strict=True)):
                     np.testing.assert_array_equal(x.view(np.uint32), y.view(np.uint32),
                                                   err_msg=f"logits {i}")
 

@@ -255,22 +255,22 @@ class VitFrontend:
         common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
         for li in range(L):
             lw = f"{VP}encoder.layers.{li}."
-            e = f"vision.li{li}"
+            e = f"vision.l{li}"
             x = self._ln(h, li, "ln1", f"{e}.x", fm.get("x", li, D), lw + "layer_norm1.weight",
                          lw + "layer_norm1.bias")
-            q0 = self._matmul(x, f"w.v.li{li}.q", W[lw + "self_attn.q_proj.weight"].T, N, f"{e}.q0",
+            q0 = self._matmul(x, f"w.v.l{li}.q", W[lw + "self_attn.q_proj.weight"].T, N, f"{e}.q0",
                               fm.get("q0", li, D), f"{e}.q_proj")
-            k0 = self._matmul(x, f"w.v.li{li}.k", W[lw + "self_attn.k_proj.weight"].T, N, f"{e}.k0",
+            k0 = self._matmul(x, f"w.v.l{li}.k", W[lw + "self_attn.k_proj.weight"].T, N, f"{e}.k0",
                               fm.get("k0", li, D), f"{e}.k_proj")
-            v0 = self._matmul(x, f"w.v.li{li}.v", W[lw + "self_attn.v_proj.weight"].T, N, f"{e}.v",
+            v0 = self._matmul(x, f"w.v.l{li}.v", W[lw + "self_attn.v_proj.weight"].T, N, f"{e}.v",
                               fm.get("v", li, D), f"{e}.v_proj")
             fq, fk, fp = fm.get("q", li, H), fm.get("k", li, H), fm.get("p", li, H)
             fs = fq + fk - F
             qx = self._t(f"{e}.qx", [H, HD, N], exp=0)
             self._node("VitAttnPrep", [q0, k0, v0, kc, vc,
-                                       self._vec(f"v.li{li}.bq", W[lw + "self_attn.q_proj.bias"]),
-                                       self._vec(f"v.li{li}.bk", W[lw + "self_attn.k_proj.bias"]),
-                                       self._vec(f"v.li{li}.bv", W[lw + "self_attn.v_proj.bias"])],
+                                       self._vec(f"v.l{li}.bq", W[lw + "self_attn.q_proj.bias"]),
+                                       self._vec(f"v.l{li}.bk", W[lw + "self_attn.k_proj.bias"]),
+                                       self._vec(f"v.l{li}.bv", W[lw + "self_attn.v_proj.bias"])],
                        [qx], f"{e}.attn_prep", domain=LLM_DOMAIN, num_heads=H, head_dim=HD,
                        qk_kw=kw, q_exp=[int(v) for v in fq], k_exp=[int(v) for v in fk],
                        v_exp=[int(v) for v in fm.get("vc", li, D)])
@@ -303,22 +303,22 @@ class VitFrontend:
             pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
             self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
                        num_heads=H, num_kv_heads=H, head_dim=HD)
-            ov = self._matmul(pv, f"w.v.li{li}.o", W[lw + "self_attn.out_proj.weight"].T, N, f"{e}.o",
+            ov = self._matmul(pv, f"w.v.l{li}.o", W[lw + "self_attn.out_proj.weight"].T, N, f"{e}.o",
                               fm.get("o", li, D), f"{e}.o_proj")
             h1 = self._t(f"{e}.h1", [N, D], host="f32")
-            self._node("VitResAdd", [h, ov, self._vec(f"v.li{li}.bo", W[lw + "self_attn.out_proj.bias"])],
+            self._node("VitResAdd", [h, ov, self._vec(f"v.l{li}.bo", W[lw + "self_attn.out_proj.bias"])],
                        [h1], f"{e}.res_attn", domain=LLM_DOMAIN)
             x2 = self._ln(h1, li, "ln2", f"{e}.x2", fm.get("x2", li, D), lw + "layer_norm2.weight",
                           lw + "layer_norm2.bias")
-            fv = self._matmul(x2, f"w.v.li{li}.f1", W[lw + "mlp.fc1.weight"].T, N, f"{e}.f",
+            fv = self._matmul(x2, f"w.v.l{li}.f1", W[lw + "mlp.fc1.weight"].T, N, f"{e}.f",
                               fm.get("f", li, c.FF), f"{e}.fc1")
             a = self._t(f"{e}.a", [N, c.FF], exp=fm.get("a", li, c.FF))
-            self._node("VitGelu", [fv, self._vec(f"v.li{li}.b1", W[lw + "mlp.fc1.bias"])], [a],
+            self._node("VitGelu", [fv, self._vec(f"v.l{li}.b1", W[lw + "mlp.fc1.bias"])], [a],
                        f"{e}.gelu", domain=LLM_DOMAIN)
-            d = self._matmul(a, f"w.v.li{li}.f2", W[lw + "mlp.fc2.weight"].T, N, f"{e}.d",
+            d = self._matmul(a, f"w.v.l{li}.f2", W[lw + "mlp.fc2.weight"].T, N, f"{e}.d",
                              fm.get("d", li, D), f"{e}.fc2")
             h2 = self._t(f"{e}.h2", [N, D], host="f32")
-            self._node("VitResAdd", [h1, d, self._vec(f"v.li{li}.b2", W[lw + "mlp.fc2.bias"])], [h2],
+            self._node("VitResAdd", [h1, d, self._vec(f"v.l{li}.b2", W[lw + "mlp.fc2.bias"])], [h2],
                        f"{e}.res_mlp", domain=LLM_DOMAIN)
             h = h2
         xf = self._ln(h, None, "post", "vision.xf", fm.get("xf", L, D),

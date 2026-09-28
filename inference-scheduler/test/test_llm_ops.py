@@ -23,7 +23,6 @@ import unittest
 from unittest import mock
 
 import numpy as np
-import onnx
 import onnx.helper as oh
 import onnx.numpy_helper as nph
 from onnx import TensorProto

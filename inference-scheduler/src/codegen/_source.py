@@ -1480,7 +1480,7 @@ class _SourceMixin:
             deinit_free.append("    free(s_host_arena); s_host_arena = NULL;")
         tabled = set()
         if compact:
-            for tab, n in (("_s_weight_slots", "weight"), ("_s_inter_slots", "inter")):
+            for tab in ("_s_weight_slots", "_s_inter_slots"):
                 if any(tab in t for t in slot_tables):
                     deinit_free.append(
                         f"    {{ unsigned _i; for (_i = 0u; _i < sizeof {tab} / sizeof {tab}[0];"

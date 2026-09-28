@@ -146,7 +146,8 @@ def upload_bitstream(
 
 def dtbo_uio_nodes(dtbo_path) -> list[str]:
     """Return 'name@addr' of every generic-uio node in the compiled overlay."""
-    import re, subprocess
+    import re
+    import subprocess
     try:
         dts = subprocess.run(["dtc", "-I", "dtb", "-O", "dts", "-q", str(dtbo_path)],
                              capture_output=True, text=True, check=True).stdout
