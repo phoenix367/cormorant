@@ -10,7 +10,8 @@
 #       -r demo/chat/scripts/requirements-study.txt
 #
 # calibrate / study / fetch need only numpy and tokenizers; validate also
-# needs torch, transformers and safetensors (the float reference).
+# needs torch, transformers and safetensors (the float reference);
+# vlm_study.py also needs Pillow (image preprocessing).
 numpy==2.5.3
 tokenizers==0.23.2
 safetensors==0.8.0
@@ -18,3 +19,4 @@ torch==2.14.0+cpu
 transformers==5.17.0
 huggingface_hub==1.33.0
 Jinja2==3.1.6
+pillow==12.3.0

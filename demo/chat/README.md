@@ -69,6 +69,8 @@ demo/chat/
 │   ├── llm_calibrate.py     — the study stage from pinned inputs: fetch, calibrate, check, study
 │   ├── llm_models.json      — pinned checkpoints / texts (SHA-256) and the expected formats hashes
 │   ├── requirements-study.txt — the .venv-export versions that reproduce those hashes
+│   ├── vlm_study.py         — SmolVLM-256M numeric study (vision encoder + image prompts, CHAT_PLAN §22)
+│   ├── vlm_study_inputs.json — its pinned checkpoint revision, file and COCO image hashes
 │   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export)
 ├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/
 └── tests/                   — unittest: protocol, text modules, sampler, backends, fakes; board_gate.py

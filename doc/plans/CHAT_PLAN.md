@@ -11,7 +11,9 @@ one weight copy, decode **10.07 tok/s** at position 32 and 7.67 at 1000,
 CMA pool 488 → 286 MiB (§19).  SmolLM2-360M-Instruct: bit-exact on the
 board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  The study
 stage is reproducible from pinned checkpoints and texts, with the formats
-hashes recorded (`llm_calibrate.py`, §21).  Not done:
+hashes recorded (`llm_calibrate.py`, §21).  SmolVLM-256M (image input): numeric
+study GO on today's bitstream, answers as close to float as bf16 (§22); not
+implemented yet.  Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
@@ -1751,3 +1753,157 @@ a rounding boundary, can come out differently; `check` names such
 differences, and a differing formats file is a different (not a wrong)
 library — its board gate is the bit-exactness against its own study
 emulation (§13, §20).
+
+## 22. SmolVLM-256M-Instruct — numeric study (2026-09-28)
+
+**Verdict: GO on today's bitstream.**  The vision encoder runs on the
+existing kernels with the text model's recipe: per-channel power-of-two
+exponents, a float residual, and LayerNorm / GELU / softmax / bias adds on
+the host.  End to end with the shipped text policy, answers agree with
+float about as closely as bf16 inference does.  Plain Q8.8 (the BERT
+partition) is broken for this encoder.
+
+**Model** (`HuggingFaceTB/SmolVLM-256M-Instruct`, Apache-2.0, revision
+7e3e67e; Idefics3):
+- **Vision encoder:** SigLIP-style, 12 layers, 768 wide, FFN 3072, 12 heads
+  of 64, GELU tanh, LayerNorm.  A 512 × 512 image in 16 × 16 patches gives
+  1024 tokens.
+- **Connector:** pixel shuffle ×4 (64 tokens of 12288), then one linear
+  12288 → 576.
+- **Text model:** a Llama shaped like SmolLM2-135M (30 layers, 576 wide,
+  9 / 3 heads, RoPE θ 100000) with an untied LM head and vocab 49280.
+- **Prompt:** `<|im_start|>User:<fake_token_around_image><global-img>`,
+  64 × `<image>`, `<fake_token_around_image>`, the text, then
+  `<end_of_utterance>\nAssistant:` (81 tokens for a short question).
+- **One tile per image:** image splitting is off, and the image is squared
+  to 512 × 512 by two LANCZOS resizes (longest edge to 2048, then to 512).
+  The default 4 × 4 + 1 split would need 1088 image tokens, more than the
+  1024-token context.
+
+**Script:** `demo/chat/scripts/vlm_study.py`.  Commands:
+- `fetch`: the pinned checkpoint and COCO val2017 images, checked against
+  `vlm_study_inputs.json`.
+- `validate`: against transformers.
+- `ablate`: the vision error by tensor class, by weight, or by whole policy.
+- `study`: the policy comparison.
+
+It reuses `llm_study.py`'s emulation primitives.  Two changes to
+`llm_study.py`, neither of which changes the SmolLM2 formats hashes:
+an `embed()` hook, and weight fitting against `lm_head.weight` for untied
+heads.
+
+Calibration uses 10 COCO images with float's own answers teacher-forced,
+plus the WikiText-2 calibration text.  Evaluation uses 24 other images with
+three generic prompts in rotation and 96 new tokens.
+
+**Validation** (numpy float64 against torch float32, 4 images):
+- the prompt ids and the pixel values equal the Idefics3 processor's
+  (PIL backend) on 24 / 24 images;
+- image features agree to 2.4e-4 (values up to 120), logits to 5.9e-4;
+- greedy answers are identical on 4 / 4 images.
+
+**Emulated vision datapath:**
+- **Pixels:** the uint8 values enter the patch-embedding MatMul exactly, at
+  exponent 0.  The (x − 0.5) / 0.5 normalisation is folded into its
+  weights (× 2/255) and bias.
+- **Kernel MatMuls:** patch embedding, q / k / v, q·kᵀ, P·V, out_proj, fc1,
+  fc2 and the connector, all with per-channel pow2 exponents.
+- **Host passes:**
+  - add the q / k / v biases and write q, k per head and V per channel;
+  - softmax over all 1024 keys, P at 2⁻¹²;
+  - add the fc1 bias, apply GELU;
+  - add the out_proj / fc2 biases inside the float32 residual adds;
+  - LayerNorm with left-to-right sums;
+  - pixel shuffle, which only moves data: channel c′ keeps the exponent of
+    c′ mod 768.
+- **Into the text model:** the image features are dequantised into its
+  float residual at the `<image>` positions.  The text model is
+  `llm_study.Model` under the shipped `pow2+sink+p12+mix`.
+
+| vision / text policy | features rel. err (max) | answer top-1 | top-5 | KL | identical | WikiText ppl (float 12.221) |
+|---|---:|---:|---:|---:|---:|---:|
+| bf16 / bf16 | 0.017 (0.022) | 0.978 | 1.000 | 0.0012 | 7 / 24 | 12.196 |
+| q88 (BERT partition) / float | 0.879 (1.150) | 0.813 | 0.973 | 0.1891 | 0 / 24 | |
+| pow2+p12 / float | 0.054 (0.067) | 0.985 | 1.000 | 0.0018 | 11 / 24 | |
+| pow2+p14+in7 / float | 0.048 (0.057) | 0.985 | 1.000 | 0.0014 | 11 / 24 | |
+| pow2+hattn (float attention) / float | 0.037 (0.047) | 0.985 | 1.000 | 0.0010 | 11 / 24 | |
+| float / pow2+sink+p12+mix | 0 | 0.977 | 1.000 | 0.0017 | 7 / 24 | 12.223 |
+| **pow2+p12 / pow2+sink+p12+mix** | 0.054 (0.067) | **0.975** | 1.000 | 0.0031 | 6 / 24 | 12.223 |
+| pow2+p14+in7 / pow2+sink+p12+mix | 0.048 (0.057) | 0.975 | 1.000 | 0.0033 | 8 / 24 | 12.223 |
+
+How to read the table:
+- **Answer columns** are teacher-forced on float's greedy answers, over the
+  answer positions only.  "Identical" counts greedy answers equal to
+  float's.
+- **The vision emulation costs less than the text emulation.**  With float
+  text it stays at top-1 0.985.  The end-to-end numbers match the text
+  study's: for SmolLM2-135M, pow2+sink+p12 had KL 3.4× bf16's; here the
+  ratio is 2.6×.
+- **Answers read like float's**, and diverge where bf16's do
+  (`generations.txt`).  For example, "There are three jet planes flying in
+  the sky." is word for word, and the surfing photo's description matches
+  in substance.
+
+**Why Q8.8 fails.**  Attention scores reach 483, far past Q8.8's ±128.
+With 1024 keys a typical probability is about 2⁻¹⁰, which rounds to
+nothing at 2⁻⁸.  The residual reaches 753 and fc2's output 749.
+
+**Where the remaining error comes from.**  `ablate` on 3 evaluation images,
+starting from 5.2 % feature error:
+- **Weight rounding: 3.7 %**, mostly fc1 (2.6 %) and out_proj (2.0 %).
+  fc2 adds 1.0 % and the connector 0.9 %; q / k / v and the patch
+  embedding each add under 0.7 %.
+- **P at 2⁻¹²: most of the 3.4 %** that all activations cause with exact
+  weights.  The two sources add in quadrature.
+- **Every other tensor class: at most 0.1 %.**
+
+Both weight groups read finely scaled inputs: out_proj reads P·V at about
+2⁻¹¹, fc1 reads LayerNorm outputs at the 2⁻⁸ cap.  With the kernel's fixed
+>> 8, f_w = f_out + 8 − f_in, so input bits come out of the weights.
+
+Finer P does not help: 2⁻¹³…2⁻¹⁵ stays at 5.3–5.6 %, because P·V must fit
+int16 and V loses the bits.  Capping host-written inputs at 2⁻⁷ does help
+(4.5 %); 2⁻⁶ gives 4.8 % and 2⁻⁵ 9.2 %.  Float attention on the host
+(hattn) reaches the weight-rounding floor, 3.3–3.7 %, but q·kᵀ and P·V in
+double on the A53s would take roughly 10 s per image.  A runtime output shift in the kernels (sh > 8)
+would give every weight more bits; that is a bitstream change, not needed.
+
+**Other findings:**
+- **Attention sink:** the text model has SmolLM2's residual, 15,606 from
+  layer 11 on (SmolLM2-135M: 25,982), so the precomputed position-0 sink
+  carries over.
+- **Image features reach 125:** SmolLM2's embedding rows are below 1.  They
+  go straight into the float residual; the connector writes them at
+  per-channel exponents (`img`).
+- **Weights:** no vision weight saturates; the accumulators stay below 261
+  of ap_fixed<32,16>'s 32,768 range.
+- **Out-of-range values:** values beyond the calibration range saturate
+  146 fc1, 29 out_proj and 1 patch-embedding elements in the evaluation run
+  (pow2+p14+in7 also 26 P·V), out of about 10⁹.
+
+**What an implementation needs** (costs scaled from BERT's measured phase-2
+breakdown in doc/plans/BERT_PLAN.md; per 512 × 512 image):
+- **Linears:** 87.0 GMAC, about 2.0 s at 44 GMAC/s.
+- **Attention MatMuls:** 19.3 GMAC.  BERT's ran at 9 GMAC/s at 256 tokens;
+  larger matrices should do better, so 0.5–2 s.
+- **Softmax:** 151 M exponentials on the host, about 2 s at BERT's
+  13 ns / element.
+- **LayerNorm, GELU, bias and residual passes:** about 0.5–1 s.
+- **Total:** about 5–7 s per image before any optimisation.
+- **Then the text side:** prefill of about 80 tokens (0.5 s) and decode at
+  the 135M rate (about 10 tok/s).  The vision weights (93 M, 185 MB int16)
+  bring the pool to roughly 510 MiB.
+
+The pieces:
+1. **The vision graph:** a SigLIP frontend next to `src/llama.py`, as a
+   `vision` entry of the multi-entry project, with host passes as above.
+   The GELU could also take its bias from VectorOP so that a table on the
+   raw input applies.
+2. **The text model:** `llama.py` for the nested config and the untied
+   head.  `LlmEmbed` takes image-feature rows at `<image>` ids.  The prefix
+   cache must key on the image content.
+3. **The server:** OpenAI `image_url` content parts, PIL on the board (the
+   same two LANCZOS resizes), the Idefics3 template, and
+   `<end_of_utterance>` as the stop token.
+4. **The gates:** scheduler simulation and board bit-exact against this
+   emulation.

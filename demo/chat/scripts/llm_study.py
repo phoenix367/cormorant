@@ -630,6 +630,11 @@ class Model:
             out[:, h] = self.kmm(p * p2(fp[h]), V[g] * p2(fvg)[None, :], fpv[h * HD:(h + 1) * HD], shp[h], "pv", l)
         return out
 
+    def embed(self, ids):
+        """The residual stream's first rows: embedding-table rows (vlm_study.py
+        replaces the image tokens' rows with image features)."""
+        return self.emb[ids].astype(np.float64)
+
     # ---- position 0 (attention sink) precomputed in float
     def _write_sink(self, s, tok):
         cfg = self.cfg
@@ -685,7 +690,7 @@ class Model:
         T = len(ids)
         offs = np.cumsum([0] + [len(t) for t in toks])
         pos = np.concatenate([np.arange(s.n, s.n + len(t)) for s, t in zip(seqs, toks)])
-        h = self.emb[ids].astype(np.float64)
+        h = self.embed(ids)
         if self.q and self.pol.get("residual") == "q88":
             self.stats.add("h", 0, float(np.abs(h).max()), 0, h.size)
         for l in range(L):
@@ -879,7 +884,8 @@ def make_formats(pol, ch, W, cfg):
     # (LINEARS order: v is capped before o reads it)
     for l in range(L + 1):
         for key, (name, ci, co) in (LINEARS.items() if l < L else [("lm", (None, "xf", "logits"))]):
-            Wt = (W[f"model.layers.{l}.{name}.weight"] if l < L else W["model.embed_tokens.weight"]).T
+            Wt = (W[f"model.layers.{l}.{name}.weight"] if l < L
+                  else W.get("lm_head.weight", W["model.embed_tokens.weight"])).T
             if ci == "pv" and ("pv", l) not in fmt:
                 fvc = np.asarray(fmt.get(("vc", l), fmt[("v", l)]))
                 fvc = np.full(KV * HD, fvc) if fvc.ndim == 0 else fvc
