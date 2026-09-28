@@ -24,6 +24,18 @@ Eligibility (every rule is a hardware or layout fact, the rest is cost):
     ``in_ch = K/kw <= max_in_ch``, ``out_w · ceil(N/16)·16 <=
     max_acc_persist_entries``, ``kw <= max_kw``.
 
+Row split: the accumulator holds ``max_acc_persist_entries`` outputs, so a
+call with many rows (out_ch) sweeps fewer output rows per chunk than the
+line buffer holds (``max_line_buf_rows``) — at 1024 rows and ``out_w = 8``
+only 8 of 16.  Such a plan re-fetches its weight slabs twice as often and
+the board runs it 1.3x slower than the cycle model predicts (SmolVLM's
+1024-token vision linears: 25.2 / 100.6 / 96.6 ms vs 2 x 6.9 / 2 x 29.3 /
+2 x 25.3 ms in two 512-row calls, doc/plans/CHAT_PLAN.md §24).  When EVERY
+single-call plan of a MatMul with contiguous rows is limited that way, the
+rows are split over several calls (call i reads A rows and writes C rows
+``[i·r, (i+1)·r)``, B shared) and the cheapest split plan that is not
+limited is taken; no other MatMul changes.
+
 Kernel width: an activation B (or a constant B that something else also
 reads) is used as is, so ``kw = 1``; a constant B read only by this MatMul
 is re-laid out at codegen (``conv_lowered_b_image``) and any ``kw`` with
@@ -53,6 +65,7 @@ from ._conv_hw_config import (
     CONV_MAX_IN_CH,
     CONV_MAX_KW,
     CONV_MAX_LINE_BUF_COLS,
+    CONV_MAX_LINE_BUF_ROWS,
     CONV_MAX_OUT_CH,
     CONV_TILE_IC,
     CONV_TILE_M,
@@ -85,6 +98,7 @@ class ConvPlan:
     b_call_stride: int
     c_call_stride: int
     cycles:        float     # all calls, CALL_OVERHEAD included
+    acc_limited:   bool = False   # see "Row split" in the module docstring
 
 
 def normalize_mode(mode) -> str:
@@ -152,12 +166,17 @@ def _divisors(v: int) -> List[int]:
     return sorted(set(small + [v // d for d in small]))
 
 
-def conv_plans(mm: MatmulNode, kw_options: Sequence[int]) -> List[ConvPlan]:
-    """Every admissible (kw, out_w) geometry for ``mm``, cheapest first."""
-    bm = _batch_mode(mm)
-    if bm is None:
-        return []
-    conv_n, conv_batch, calls, a_cs, b_cs, c_cs = bm
+def _acc_limited(conv_n: int, out_h: int, out_w: int) -> bool:
+    """The accumulator caps a chunk below the rows the line buffer holds
+    (cost_model._conv_geom's ``per`` for a 1 x kw kernel)."""
+    n_pad = -(-conv_n // CONV_TILE_M) * CONV_TILE_M
+    per = max(1, min(out_h, CONV_MAX_ACC_PERSIST_ENTRIES // (out_w * n_pad)))
+    return per < min(out_h, CONV_MAX_LINE_BUF_ROWS)
+
+
+def _geometry_plans(mm: MatmulNode, kw_options: Sequence[int], conv_n: int,
+                    conv_batch: int, calls: int, a_cs: int, b_cs: int,
+                    c_cs: int) -> List[ConvPlan]:
     n_pad = -(-conv_n // CONV_TILE_M) * CONV_TILE_M
     plans: List[ConvPlan] = []
     for kw in kw_options:
@@ -176,9 +195,33 @@ def conv_plans(mm: MatmulNode, kw_options: Sequence[int]) -> List[ConvPlan]:
                 conv_batch, in_ch=in_ch, out_ch=conv_n, in_h=out_h, in_w=kw * out_w,
                 oh=out_h, ow=out_w, kh=1, kw=kw, sw=kw)
             plans.append(ConvPlan(kw, out_h, out_w, conv_n, conv_batch, calls,
-                                  a_cs, b_cs, c_cs, calls * (per_call + CALL_OVERHEAD)))
+                                  a_cs, b_cs, c_cs, calls * (per_call + CALL_OVERHEAD),
+                                  _acc_limited(conv_n, out_h, out_w)))
     plans.sort(key=lambda p: (p.cycles, p.kw, -p.out_w))
     return plans
+
+
+def conv_plans(mm: MatmulNode, kw_options: Sequence[int]) -> List[ConvPlan]:
+    """Every admissible (kw, out_w) geometry for ``mm``, cheapest first —
+    or, when every one of them is accumulator-limited and the rows are
+    contiguous (one call, ConvKernel batch 1), the row-split plans that
+    are not, cheapest first, ahead of them ("Row split" above)."""
+    bm = _batch_mode(mm)
+    if bm is None:
+        return []
+    conv_n, conv_batch, calls, a_cs, b_cs, c_cs = bm
+    plans = _geometry_plans(mm, kw_options, *bm)
+    if not plans or not all(p.acc_limited for p in plans) or calls != 1 or conv_batch != 1:
+        return plans
+    split: List[ConvPlan] = []
+    for rows in _divisors(conv_n):
+        if rows == conv_n or rows % CONV_TILE_M:
+            continue
+        split += [p for p in _geometry_plans(mm, kw_options, rows, 1, conv_n // rows,
+                                             rows * mm.k, 0, rows * mm.m)
+                  if not p.acc_limited]
+    split.sort(key=lambda p: (p.cycles, p.kw, -p.out_w))
+    return split + plans
 
 
 def matmul_plan_cycles(mm: MatmulNode) -> float:

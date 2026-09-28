@@ -129,11 +129,17 @@ RUNTIME_GROUPS = {
               "_llm_sexp_slots", "llm_sexp_slot_t",
               "if (llm_sexp_table(T->f, T->scale) != 0) return -1;",
               "llm_sexp_free(T->f);"),
-    "gelu":  ("typedef struct {\n    int f;                          /* a GELU input exponent */\n"
+    "vsexp": ("typedef struct {\n    int    f;                       /* a score exponent */\n"
+              "    double scale;                   /* 1 / sqrt(head_dim) */\n"
+              "} vit_sexp_slot_t;",
+              "_vit_sexp_slots", "vit_sexp_slot_t",
+              "if (vit_sexp_table(T->f, T->scale) != 0) return -1;",
+              "vit_sexp_free(T->f);"),
+    "gelu":  ("typedef struct {\n    int fx, fa;                     /* GELU input / output exponents */\n"
               "} vit_gelu_slot_t;",
               "_vit_gelu_slots", "vit_gelu_slot_t",
-              "if (vit_gelu_table(T->f) != 0) return -1;",
-              "vit_gelu_free(T->f);"),
+              "if (vit_gelu_table(T->fx, T->fa) != 0) return -1;",
+              "vit_gelu_free(T->fx, T->fa);"),
 }
 
 

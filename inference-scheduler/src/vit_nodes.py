@@ -23,12 +23,14 @@ arithmetic is IEEE double without FMA contraction, sums run left to right.
                    q.K^T conv input image (LlmAttnPrep's layout, one head per
                    group); both caches flushed
   VitAttnSoftmax   s_h [C][T] (raw scores at f_s) -> P_h [T][C] (raw at f_p): every
-                   key (no mask), k = raw_max - raw, e = sexp_{f_s}[k], sum left to
-                   right, P = round_half_even(e / sum * 2^f_p)
+                   key (no mask), k = raw_max - raw, e = T_hi[k >> 8] * T_lo[k & 255]
+                   (two 256-entry libm exp tables per score exponent, L1-resident),
+                   sum left to right, P = round_half_even(e / sum * 2^f_p)
   VitGelu          f (int16) -> a (int16): r = sat16(raw + round_half_even(b[c] *
-                   2^f[c])), a = gelu_{f[c]}[r] — a 65 536-entry table per exponent,
-                   GELU's tanh form through libm exp: y = x - x / (exp(2u) + 1),
-                   u = 0.7978845608028654 * (x + 0.044715 * ((x * x) * x))
+                   2^f[c])), a = round_half_even(gelu(r * 2^-f[c]) * 2^f_a[c]), GELU's
+                   tanh form through libm exp: y = x - x / (exp(2u) + 1),
+                   u = 0.7978845608028654 * (x + 0.044715 * ((x * x) * x)); in C one
+                   int16 table of the rounded outputs per (f, f_a) pair
   VitPixelShuffle  xf [n*n][D] -> columns [k0, k0 + K) of the pixel shuffle by s
                    (raw copy): out[I*(n/s) + J][(b*s + a)*D + c] = xf[(I*s + b)*n
                    + J*s + a][c]
@@ -52,7 +54,7 @@ import numpy as np
 from .host_nodes import HostContext, _attrs, _c_float, _resolve
 from .llm_nodes import (LLM_DOMAIN, SEXP_EMIN, SEXP_NE, HostTable, LlmNode, RuntimeItem,
                         _attr_ints, _const_array, _f32, _llm_inputs, _require, _st, exp_tag,
-                        scale_item, sexp_item, sexp_table)
+                        scale_item)
 from .nodes import SchedulerError
 
 GELU_C = 0.7978845608028654          # sqrt(2 / pi), the C helper's double literal
@@ -81,10 +83,36 @@ def gelu_table(f: int) -> np.ndarray:
     return _GELU_CACHE[f]
 
 
-def gelu_item(f: int) -> RuntimeItem:
-    if not GELU_EMIN <= int(f) < GELU_EMIN + GELU_NE:
-        raise SchedulerError(f"GELU input exponent {f} outside [{GELU_EMIN}, {GELU_EMIN + GELU_NE})")
-    return RuntimeItem(key=f"gelu:{int(f)}", decl="", group="gelu", row=f"{{ {int(f)} }}")
+_SEXP2_CACHE: Dict[Tuple[int, float], np.ndarray] = {}
+
+
+def sexp2_table(f: int, scale: float) -> np.ndarray:
+    """e(k) = T_hi[k >> 8] * T_lo[k & 255] for k in [0, 65535] (vlm_study.sexp2_table):
+    T_hi[i] = exp(-(i * 256) / 2^f * scale), T_lo[j] = exp(-j / 2^f * scale)."""
+    key = (int(f), float(scale))
+    if key not in _SEXP2_CACHE:
+        d = 2.0 ** int(f)
+        hi = np.array([math.exp(-(i * 256) / d * scale) for i in range(256)])
+        lo = np.array([math.exp(-j / d * scale) for j in range(256)])
+        k = np.arange(65536)
+        _SEXP2_CACHE[key] = hi[k >> 8] * lo[k & 255]
+    return _SEXP2_CACHE[key]
+
+
+def sexp2_item(f: int, scale: float) -> RuntimeItem:
+    if not SEXP_EMIN <= int(f) < SEXP_EMIN + SEXP_NE:
+        raise SchedulerError(f"score exponent {f} outside [{SEXP_EMIN}, {SEXP_EMIN + SEXP_NE})")
+    return RuntimeItem(key=f"vsexp:{int(f)}", decl="", group="vsexp",
+                       row=f"{{ {int(f)}, {scale!r} }}")
+
+
+def gelu_item(fx: int, fa: int) -> RuntimeItem:
+    """The int16 GELU output table of input exponent fx and output exponent fa."""
+    for f in (fx, fa):
+        if not GELU_EMIN <= int(f) < GELU_EMIN + GELU_NE:
+            raise SchedulerError(f"GELU exponent {f} outside [{GELU_EMIN}, {GELU_EMIN + GELU_NE})")
+    return RuntimeItem(key=f"gelu:{int(fx)}:{int(fa)}", decl="", group="gelu",
+                       row=f"{{ {int(fx)}, {int(fa)} }}")
 
 
 def pixel_shuffle_rows(n: int, s: int) -> np.ndarray:
@@ -409,7 +437,7 @@ class VitAttnSoftmaxNode(VitNode):
         return sn
 
     def c_runtime(self):
-        return [sexp_item(self.fs, self.scale)]
+        return [sexp2_item(self.fs, self.scale)]
 
     def describe(self):
         return f"{self.T} query columns x {self.C} keys, score exponent {self.fs}, P at 2^-{self.fp}"
@@ -421,7 +449,7 @@ class VitAttnSoftmaxNode(VitNode):
     def reference(self, ins, dtype):
         raw = np.asarray(ins[0], np.float64).T.astype(np.int64)          # [T][C]
         m = raw.max(-1, keepdims=True)
-        e = sexp_table(self.fs, self.scale)[m - raw]
+        e = sexp2_table(self.fs, self.scale)[m - raw]
         p = e / np.cumsum(e, -1)[..., -1:]
         return np.clip(np.round(p * 2.0 ** self.fp), -32768, 32767)
 
@@ -453,23 +481,27 @@ class VitGeluNode(VitNode):
         _require(y.numel == f.numel, node, "shapes")
         return sn
 
-    def c_runtime(self):
+    def _pairs(self):
         ff = self.inputs[0].exp_channels(self.F)
-        items = [gelu_item(int(e)) for e in sorted(set(int(v) for v in ff))]
+        fa = self.output.exp_channels(self.F)
+        return sorted(set(zip((int(v) for v in ff), (int(v) for v in fa), strict=True)))
+
+    def c_runtime(self):
+        items = [gelu_item(fx, fa) for fx, fa in self._pairs()]
         items.append(self._scales(self.inputs[0])[2])             # _llm_e_<tag> of the input
-        items.append(self._scales(self.output)[2])
+        items.append(self._scales(self.output)[2])                # ... and of the output
         items.append(int_array_item("_vit_bi", self.braw)[1])
         return items
 
     def describe(self):
-        ff = sorted(set(int(v) for v in self.inputs[0].exp_channels(self.F)))
-        return f"rows={self.rows} n={self.n} GELU tables for input exponents {ff}"
+        return (f"rows={self.rows} n={self.n} int16 GELU tables for (input, output) exponents "
+                f"{self._pairs()}")
 
     def c_call(self, ins, out, scratch, direct, dtype):
         ef = "_llm_e_" + exp_tag(self.inputs[0].exp_channels(self.F))
-        ia = self._scales(self.output)[1]
+        ea = "_llm_e_" + exp_tag(self.output.exp_channels(self.F))
         bi = int_array_item("_vit_bi", self.braw)[0]
-        return [f"vit_gelu({ins[0]}, {ef}, {bi}, {ia}, {self.rows}u, {self.n}u, {out});"]
+        return [f"vit_gelu({ins[0]}, {ef}, {ea}, {bi}, {self.rows}u, {self.n}u, {out});"]
 
     def reference(self, ins, dtype):
         ff = self.inputs[0].exp_channels(self.F)
@@ -652,16 +684,33 @@ typedef struct {
     float        *y;
 } vit_res_t;
 
+/* The per-element host loops below go 4 elements per step with no branch
+ * in between: the in-order A53 otherwise waits out every convert, multiply
+ * and add of one element before the next starts (2.5-3x on the board). */
+static inline int16_t vit_st16f(double v, double si)       /* llm_st16, v finite */
+{
+    return (int16_t)fmin(fmax(nearbyint(v * si), -32768.0), 32767.0);
+}
+
 static void vit_resadd_rows(void *p, unsigned r0, unsigned r1)
 {
     const vit_res_t *a = (const vit_res_t *)p;
-    unsigned r, c;
+    const double    *sx = a->sx;
+    const float     *b = a->b;
+    unsigned         r, c;
     for (r = r0; r < r1; r++) {
         const float  *h = a->h + (size_t)r * a->n;
         const Data_t *x = a->x + (size_t)r * a->n;
         float        *y = a->y + (size_t)r * a->n;
-        for (c = 0u; c < a->n; c++)
-            y[c] = (float)((double)h[c] + (llm_ld(x[c], a->sx[c]) + (double)a->b[c]));
+        for (c = 0u; c + 4u <= a->n; c += 4u) {
+            const double y0 = (double)h[c] + (llm_ld(x[c], sx[c]) + (double)b[c]);
+            const double y1 = (double)h[c + 1u] + (llm_ld(x[c + 1u], sx[c + 1u]) + (double)b[c + 1u]);
+            const double y2 = (double)h[c + 2u] + (llm_ld(x[c + 2u], sx[c + 2u]) + (double)b[c + 2u]);
+            const double y3 = (double)h[c + 3u] + (llm_ld(x[c + 3u], sx[c + 3u]) + (double)b[c + 3u]);
+            y[c] = (float)y0; y[c + 1u] = (float)y1; y[c + 2u] = (float)y2; y[c + 3u] = (float)y3;
+        }
+        for (; c < a->n; c++)
+            y[c] = (float)((double)h[c] + (llm_ld(x[c], sx[c]) + (double)b[c]));
     }
 }
 
@@ -674,7 +723,14 @@ static void vit_resadd(const float *h, const Data_t *x, const double *sx, const 
 }
 
 /* ---- VitLayerNorm: mu = sum h / n, var = sum (h - mu)^2 / n (left to right),
- *      y = ((h - mu) / sqrt(var + eps)) * gamma + beta ---- */
+ *      y = ((h - mu) / sqrt(var + eps)) * gamma + beta.  The quotient is
+ *      taken as (h - mu) * (1 / sd), within 3 ulp of the division: the
+ *      scaled value moves by < (5 |gamma q| + 2 |y|) 2^(f_y - 53), far
+ *      inside 2^-20 for int16 outputs, and an element within 2^-20 of a
+ *      rounding tie is redone with the division — the same int16 as the
+ *      division everywhere, without a divide per element.  Rows go 4 at a
+ *      time (4 independent sum chains, each row still summed left to
+ *      right: the in-order A53 otherwise waits out every add). ---- */
 typedef struct {
     const float  *h;
     unsigned      n;
@@ -684,24 +740,77 @@ typedef struct {
     Data_t       *y;
 } vit_ln_t;
 
+#define VIT_LN_TIE (0.5 - 0x1p-20)
+
+static inline Data_t vit_ln_st(double x, double q, double d, double sd, double g, double b, double iy)
+{
+    if (!(fabs(x - q) <= VIT_LN_TIE))                   /* near a tie (or NaN): exact */
+        return llm_st((d / sd) * g + b, iy);
+    return (Data_t)(int16_t)(q > 32767.0 ? 32767.0 : q < -32768.0 ? -32768.0 : q);
+}
+
 static void vit_layernorm_rows(void *p, unsigned r0, unsigned r1)
 {
     const vit_ln_t *a = (const vit_ln_t *)p;
-    unsigned r, c;
-    for (r = r0; r < r1; r++) {
-        const float *h = a->h + (size_t)r * a->n;
-        Data_t      *y = a->y + (size_t)r * a->n;
-        double       sum = 0.0, var = 0.0, mu, sd;
-        for (c = 0u; c < a->n; c++)
+    const unsigned  n = a->n;
+    const double    dn = (double)n;
+    unsigned        r = r0, c;
+    for (; r + 4u <= r1; r += 4u) {
+        const float *h0 = a->h + (size_t)r * n, *h1 = h0 + n, *h2 = h1 + n, *h3 = h2 + n;
+        Data_t      *y0 = a->y + (size_t)r * n, *y1 = y0 + n, *y2 = y1 + n, *y3 = y2 + n;
+        double       s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, v0 = 0.0, v1 = 0.0, v2 = 0.0, v3 = 0.0;
+        double       m0, m1, m2, m3, sd0, sd1, sd2, sd3, i0, i1, i2, i3;
+        for (c = 0u; c < n; c++) {
+            s0 += (double)h0[c]; s1 += (double)h1[c]; s2 += (double)h2[c]; s3 += (double)h3[c];
+        }
+        m0 = s0 / dn; m1 = s1 / dn; m2 = s2 / dn; m3 = s3 / dn;
+        for (c = 0u; c < n; c++) {
+            const double d0 = (double)h0[c] - m0, d1 = (double)h1[c] - m1;
+            const double d2 = (double)h2[c] - m2, d3 = (double)h3[c] - m3;
+            v0 += d0 * d0; v1 += d1 * d1; v2 += d2 * d2; v3 += d3 * d3;
+        }
+        sd0 = sqrt(v0 / dn + a->eps); sd1 = sqrt(v1 / dn + a->eps);
+        sd2 = sqrt(v2 / dn + a->eps); sd3 = sqrt(v3 / dn + a->eps);
+        i0 = 1.0 / sd0; i1 = 1.0 / sd1; i2 = 1.0 / sd2; i3 = 1.0 / sd3;
+        for (c = 0u; c < n; c++) {
+            const double g = (double)a->g[c], b = (double)a->b[c], iy = a->iy[c];
+            const double d0 = (double)h0[c] - m0, d1 = (double)h1[c] - m1;
+            const double d2 = (double)h2[c] - m2, d3 = (double)h3[c] - m3;
+            const double x0 = ((d0 * i0) * g + b) * iy, x1 = ((d1 * i1) * g + b) * iy;
+            const double x2 = ((d2 * i2) * g + b) * iy, x3 = ((d3 * i3) * g + b) * iy;
+            const double q0 = nearbyint(x0), q1 = nearbyint(x1), q2 = nearbyint(x2), q3 = nearbyint(x3);
+            if ((fabs(x0 - q0) <= VIT_LN_TIE) & (fabs(x1 - q1) <= VIT_LN_TIE)
+                & (fabs(x2 - q2) <= VIT_LN_TIE) & (fabs(x3 - q3) <= VIT_LN_TIE)
+                & (fabs(q0) <= 32767.0) & (fabs(q1) <= 32767.0)
+                & (fabs(q2) <= 32767.0) & (fabs(q3) <= 32767.0)) {
+                y0[c] = (Data_t)(int16_t)q0; y1[c] = (Data_t)(int16_t)q1;
+                y2[c] = (Data_t)(int16_t)q2; y3[c] = (Data_t)(int16_t)q3;
+            } else {
+                y0[c] = vit_ln_st(x0, q0, d0, sd0, g, b, iy);
+                y1[c] = vit_ln_st(x1, q1, d1, sd1, g, b, iy);
+                y2[c] = vit_ln_st(x2, q2, d2, sd2, g, b, iy);
+                y3[c] = vit_ln_st(x3, q3, d3, sd3, g, b, iy);
+            }
+        }
+    }
+    for (; r < r1; r++) {
+        const float *h = a->h + (size_t)r * n;
+        Data_t      *y = a->y + (size_t)r * n;
+        double       sum = 0.0, var = 0.0, mu, sd, rsd;
+        for (c = 0u; c < n; c++)
             sum += (double)h[c];
-        mu = sum / (double)a->n;
-        for (c = 0u; c < a->n; c++) {
+        mu = sum / dn;
+        for (c = 0u; c < n; c++) {
             const double d = (double)h[c] - mu;
             var += d * d;
         }
-        sd = sqrt(var / (double)a->n + a->eps);
-        for (c = 0u; c < a->n; c++)
-            y[c] = llm_st((((double)h[c] - mu) / sd) * (double)a->g[c] + (double)a->b[c], a->iy[c]);
+        sd = sqrt(var / dn + a->eps);
+        rsd = 1.0 / sd;
+        for (c = 0u; c < n; c++) {
+            const double g = (double)a->g[c], b = (double)a->b[c], iy = a->iy[c];
+            const double d = (double)h[c] - mu, x = ((d * rsd) * g + b) * iy;
+            y[c] = vit_ln_st(x, nearbyint(x), d, sd, g, b, iy);
+        }
     }
 }
 
@@ -736,11 +845,22 @@ static void vit_prep_kv_rows(void *p, unsigned t0, unsigned t1)
             const size_t o = (size_t)t * D + (size_t)g * HD;
             int16_t     *kc = a->ck + ((size_t)g * a->C + t) * HD;
             int16_t     *vc = a->cv + llm_vrow(a->C, HD, a->VK, g, t);
-            for (d = 0u; d < HD; d++) {
-                const size_t c = (size_t)g * HD + d;
-                kc[d] = llm_st16(llm_ld(a->k0[o + d], a->sk[c]) + (double)a->bk[c], a->ick[c]);
-                vc[(size_t)d * a->VK] = llm_st16(llm_ld(a->v[o + d], a->sv[c]) + (double)a->bv[c],
-                                                 a->icv[c]);
+            const size_t c0 = (size_t)g * HD;
+            for (d = 0u; d + 2u <= HD; d += 2u) {
+                const size_t  c = c0 + d;
+                const int16_t k0 = vit_st16f(llm_ld(a->k0[o + d], a->sk[c]) + (double)a->bk[c], a->ick[c]);
+                const int16_t k1 = vit_st16f(llm_ld(a->k0[o + d + 1u], a->sk[c + 1u]) + (double)a->bk[c + 1u],
+                                             a->ick[c + 1u]);
+                const int16_t v0 = vit_st16f(llm_ld(a->v[o + d], a->sv[c]) + (double)a->bv[c], a->icv[c]);
+                const int16_t v1 = vit_st16f(llm_ld(a->v[o + d + 1u], a->sv[c + 1u]) + (double)a->bv[c + 1u],
+                                             a->icv[c + 1u]);
+                kc[d] = k0; kc[d + 1u] = k1;
+                vc[(size_t)d * a->VK] = v0; vc[(size_t)(d + 1u) * a->VK] = v1;
+            }
+            for (; d < HD; d++) {
+                const size_t c = c0 + d;
+                kc[d] = vit_st16f(llm_ld(a->k0[o + d], a->sk[c]) + (double)a->bk[c], a->ick[c]);
+                vc[(size_t)d * a->VK] = vit_st16f(llm_ld(a->v[o + d], a->sv[c]) + (double)a->bv[c], a->icv[c]);
             }
         }
 }
@@ -759,10 +879,18 @@ static void vit_prep_q_items(void *p, unsigned i0, unsigned i1)
         Data_t        *xg = a->qx + (size_t)h * HD * T + (size_t)kw * t0;
         for (u = 0u; u < nt; u++) {
             const size_t o = (size_t)(t0 + u) * D + (size_t)h * HD;
-            for (d = 0u; d < HD; d++) {
-                const size_t c = (size_t)h * HD + d;
-                q[u][d] = llm_st16(llm_ld(a->q0[o + d], a->sq[c]) + (double)a->bq[c], a->iq[h]);
+            const size_t  c0 = (size_t)h * HD;
+            const double  iq = a->iq[h];
+            for (d = 0u; d + 4u <= HD; d += 4u) {
+                const size_t  c = c0 + d;
+                const int16_t y0 = vit_st16f(llm_ld(a->q0[o + d], a->sq[c]) + (double)a->bq[c], iq);
+                const int16_t y1 = vit_st16f(llm_ld(a->q0[o + d + 1u], a->sq[c + 1u]) + (double)a->bq[c + 1u], iq);
+                const int16_t y2 = vit_st16f(llm_ld(a->q0[o + d + 2u], a->sq[c + 2u]) + (double)a->bq[c + 2u], iq);
+                const int16_t y3 = vit_st16f(llm_ld(a->q0[o + d + 3u], a->sq[c + 3u]) + (double)a->bq[c + 3u], iq);
+                q[u][d] = y0; q[u][d + 1u] = y1; q[u][d + 2u] = y2; q[u][d + 3u] = y3;
             }
+            for (; d < HD; d++)
+                q[u][d] = vit_st16f(llm_ld(a->q0[o + d], a->sq[c0 + d]) + (double)a->bq[c0 + d], iq);
         }
         for (b = 0u; b < nb; b++)
             for (l = 0u; l < 16u; l++) {
@@ -781,59 +909,206 @@ static void vit_attn_prep(vit_prep_t *a)
 }
 
 /* ---- VitAttnSoftmax: s [C][T] raw scores (row stride T) -> P [T][C] raw at
- * 2^-f_p (the P.V weight), every key: m = max raw, e_j = sexp_{f_s}[m - raw_j],
- * sum left to right, P = round_half_even(e / sum * 2^f_p) (llm_attn_softmax's
- * arithmetic: e * (2^f_p / sum) unless within 1e-7 of a rounding tie).  Work
- * items are blocks of LLM_SMX_CB columns read once, transposed. ---- */
+ * 2^-f_p (the P.V weight), every key: m = max raw, k = m - raw_j,
+ * e_j = T_hi[k >> 8] * T_lo[k & 255] (two 256-entry libm exp tables per score
+ * exponent: they stay in L1, where the 65 536-entry table of the text softmax
+ * misses), sum left to right, P = round_half_even(e / sum * 2^f_p)
+ * (llm_attn_softmax's arithmetic: e * (2^f_p / sum) unless within 1e-7 of a
+ * rounding tie).  Work items are blocks of LLM_SMX_CB query columns, read
+ * once (the rows ahead prefetched) and transposed into a tile whose row
+ * stride is padded (at 2 KB its 32 rows share 4 L1 sets); then 4 columns
+ * at a time — 4 independent sum chains, each column still summed left to
+ * right.  AArch64: NEON 8 x 8 transposes, max and rounding (frinti; the
+ * saturating narrow is the clamp; a block of 8 with a near-tie is redone
+ * by the scalar code). ---- */
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#  include <arm_neon.h>
+#  define VIT_SMX_NEON 1
+#endif
+#if defined(__GNUC__)
+#  define VIT_PREFETCH(p) __builtin_prefetch(p)
+#else
+#  define VIT_PREFETCH(p) ((void)(p))
+#endif
+#define VIT_SMX_TP     40u      /* tile row padding (int16) */
+#define VIT_SEXP_EMIN  (SEXP_EMIN_VALUE)
+#define VIT_SEXP_NE    (SEXP_NE_VALUE)
+static double *_vit_sexp_tab[VIT_SEXP_NE];      /* T_hi[256] then T_lo[256] */
+
+static int vit_sexp_table(int f, double scale)
+{
+    double **t = &_vit_sexp_tab[f - VIT_SEXP_EMIN];
+    double   d = ldexp(1.0, f);
+    unsigned i;
+    if (*t) return 0;
+    *t = (double *)malloc(512u * sizeof(double));
+    if (!*t) return -1;
+    for (i = 0u; i < 256u; i++) {
+        (*t)[i] = exp(-(double)(i * 256u) / d * scale);
+        (*t)[256u + i] = exp(-(double)i / d * scale);
+    }
+    return 0;
+}
+
+static void vit_sexp_free(int f)
+{
+    free(_vit_sexp_tab[f - VIT_SEXP_EMIN]);
+    _vit_sexp_tab[f - VIT_SEXP_EMIN] = NULL;
+}
+
 typedef struct {
     const Data_t *s;
     Data_t       *p;
-    const double *tab;
+    const double *tab;              /* T_hi[256], T_lo[256] */
     double        ip;
     unsigned      T, C, nblk;
 } vit_smx_t;
 
+static inline Data_t vit_smx_rnd(double e, double rinv, double sum, double ip)
+{
+    const double q = e * rinv, r = nearbyint(q);
+    if (fabs(q - r) > 0.5 - 1e-7)
+        return llm_st(e / sum, ip);                     /* near a tie: exact */
+    return (Data_t)(int16_t)(r > 32767.0 ? 32767.0 : r);
+}
+
+static inline int vit_smx_max(const int16_t *r, unsigned n)
+{
+    unsigned j = 1u;
+    int      m = r[0];
+#ifdef VIT_SMX_NEON
+    if (n >= 8u) {
+        int16x8_t v = vld1q_s16(r);
+        for (j = 8u; j + 8u <= n; j += 8u)
+            v = vmaxq_s16(v, vld1q_s16(r + j));
+        m = vmaxvq_s16(v);
+    }
+#endif
+    for (; j < n; j++)
+        m = r[j] > m ? r[j] : m;
+    return m;
+}
+
+static void vit_smx_round(const double *e, double sum, double ip, unsigned n, Data_t *p)
+{
+    const double rinv = ip / sum;
+    unsigned     j = 0u, u;
+#ifdef VIT_SMX_NEON
+    const float64x2_t ri = vdupq_n_f64(rinv), th = vdupq_n_f64(0.5 - 1e-7);
+    for (; j + 8u <= n; j += 8u) {
+        const float64x2_t q0 = vmulq_f64(vld1q_f64(e + j), ri), q1 = vmulq_f64(vld1q_f64(e + j + 2u), ri);
+        const float64x2_t q2 = vmulq_f64(vld1q_f64(e + j + 4u), ri), q3 = vmulq_f64(vld1q_f64(e + j + 6u), ri);
+        const float64x2_t r0 = vrndiq_f64(q0), r1 = vrndiq_f64(q1), r2 = vrndiq_f64(q2), r3 = vrndiq_f64(q3);
+        const uint64x2_t  t = vorrq_u64(vorrq_u64(vcgtq_f64(vabdq_f64(q0, r0), th), vcgtq_f64(vabdq_f64(q1, r1), th)),
+                                        vorrq_u64(vcgtq_f64(vabdq_f64(q2, r2), th), vcgtq_f64(vabdq_f64(q3, r3), th)));
+        if (vmaxvq_u32(vreinterpretq_u32_u64(t))) {
+            for (u = 0u; u < 8u; u++)
+                p[j + u] = vit_smx_rnd(e[j + u], rinv, sum, ip);
+            continue;
+        }
+        vst1q_s16((int16_t *)(void *)(p + j),
+                  vcombine_s16(vqmovn_s32(vcombine_s32(vqmovn_s64(vcvtq_s64_f64(r0)), vqmovn_s64(vcvtq_s64_f64(r1)))),
+                               vqmovn_s32(vcombine_s32(vqmovn_s64(vcvtq_s64_f64(r2)), vqmovn_s64(vcvtq_s64_f64(r3))))));
+    }
+#endif
+    (void)u;
+    for (; j < n; j++)
+        p[j] = vit_smx_rnd(e[j], rinv, sum, ip);
+}
+
+#ifdef VIT_SMX_NEON
+/* 8 rows of 8 int16 (row stride ss) -> 8 rows of 8 (stride ds), transposed */
+static inline void vit_tr8(const int16_t *s, size_t ss, int16_t *d, size_t ds)
+{
+    const int16x8x2_t a0 = vtrnq_s16(vld1q_s16(s), vld1q_s16(s + ss));
+    const int16x8x2_t a1 = vtrnq_s16(vld1q_s16(s + 2u * ss), vld1q_s16(s + 3u * ss));
+    const int16x8x2_t a2 = vtrnq_s16(vld1q_s16(s + 4u * ss), vld1q_s16(s + 5u * ss));
+    const int16x8x2_t a3 = vtrnq_s16(vld1q_s16(s + 6u * ss), vld1q_s16(s + 7u * ss));
+    const int32x4x2_t b0 = vtrnq_s32(vreinterpretq_s32_s16(a0.val[0]), vreinterpretq_s32_s16(a1.val[0]));
+    const int32x4x2_t b1 = vtrnq_s32(vreinterpretq_s32_s16(a0.val[1]), vreinterpretq_s32_s16(a1.val[1]));
+    const int32x4x2_t b2 = vtrnq_s32(vreinterpretq_s32_s16(a2.val[0]), vreinterpretq_s32_s16(a3.val[0]));
+    const int32x4x2_t b3 = vtrnq_s32(vreinterpretq_s32_s16(a2.val[1]), vreinterpretq_s32_s16(a3.val[1]));
+    const int64x2_t   c0 = vreinterpretq_s64_s32(b0.val[0]), c1 = vreinterpretq_s64_s32(b1.val[0]);
+    const int64x2_t   c2 = vreinterpretq_s64_s32(b0.val[1]), c3 = vreinterpretq_s64_s32(b1.val[1]);
+    const int64x2_t   c4 = vreinterpretq_s64_s32(b2.val[0]), c5 = vreinterpretq_s64_s32(b3.val[0]);
+    const int64x2_t   c6 = vreinterpretq_s64_s32(b2.val[1]), c7 = vreinterpretq_s64_s32(b3.val[1]);
+    vst1q_s16(d,          vreinterpretq_s16_s64(vzip1q_s64(c0, c4)));
+    vst1q_s16(d + ds,     vreinterpretq_s16_s64(vzip1q_s64(c1, c5)));
+    vst1q_s16(d + 2u * ds, vreinterpretq_s16_s64(vzip1q_s64(c2, c6)));
+    vst1q_s16(d + 3u * ds, vreinterpretq_s16_s64(vzip1q_s64(c3, c7)));
+    vst1q_s16(d + 4u * ds, vreinterpretq_s16_s64(vzip2q_s64(c0, c4)));
+    vst1q_s16(d + 5u * ds, vreinterpretq_s16_s64(vzip2q_s64(c1, c5)));
+    vst1q_s16(d + 6u * ds, vreinterpretq_s16_s64(vzip2q_s64(c2, c6)));
+    vst1q_s16(d + 7u * ds, vreinterpretq_s16_s64(vzip2q_s64(c3, c7)));
+}
+#endif
+
 static void vit_smx_items(void *pp, unsigned i0, unsigned i1)
 {
     const vit_smx_t *a = (const vit_smx_t *)pp;
-    const unsigned   T = a->T, C = a->C;
+    const unsigned   T = a->T, C = a->C, TS = C + VIT_SMX_TP;
+    const int16_t   *s = (const int16_t *)(const void *)a->s;
+    const double    *hi = a->tab, *lo = a->tab + 256;
     unsigned         it;
-    int16_t         *tl = (int16_t *)malloc((size_t)LLM_SMX_CB * C * sizeof(int16_t));
-    double          *eb = (double *)malloc((size_t)C * sizeof(double));
+    int16_t         *tl = (int16_t *)malloc((size_t)LLM_SMX_CB * TS * sizeof(int16_t));
+    double          *eb = (double *)malloc((size_t)4u * C * sizeof(double));
     if (!tl || !eb) {
         free(tl); free(eb);
         return;
     }
     for (it = i0; it < i1; it++) {
         const unsigned c0 = it * LLM_SMX_CB, nc = c0 + LLM_SMX_CB < T ? LLM_SMX_CB : T - c0;
-        unsigned       k, j;
-        for (j = 0u; j < C; j++) {
-            const int16_t *row = (const int16_t *)a->s + (size_t)j * T + c0;
+        unsigned       k, j = 0u;
+#ifdef VIT_SMX_NEON
+        if (nc == LLM_SMX_CB)
+            for (; j + 8u <= C; j += 8u) {
+                const int16_t *row = s + (size_t)j * T + c0;
+                unsigned       u;
+                if (j + 32u <= C)
+                    for (u = 0u; u < 8u; u++)
+                        VIT_PREFETCH(row + (size_t)(24u + u) * T);
+                for (u = 0u; u < LLM_SMX_CB; u += 8u)
+                    vit_tr8(row + u, T, tl + (size_t)u * TS + j, TS);
+            }
+#endif
+        for (; j < C; j++) {
+            const int16_t *row = s + (size_t)j * T + c0;
+            if (j + 16u < C)
+                VIT_PREFETCH(row + (size_t)16u * T);
             for (k = 0u; k < nc; k++)
-                tl[(size_t)k * C + j] = row[k];
+                tl[(size_t)k * TS + j] = row[k];
         }
-        for (k = 0u; k < nc; k++) {
-            Data_t        *pr = a->p + (size_t)(c0 + k) * C;
-            const int16_t *r = tl + (size_t)k * C;
-            int            m = r[0];
-            double         sum = 0.0, rinv;
-            for (j = 1u; j < C; j++)
-                m = r[j] > m ? r[j] : m;
+        for (k = 0u; k + 4u <= nc; k += 4u) {
+            const int16_t *r0 = tl + (size_t)k * TS, *r1 = r0 + TS, *r2 = r1 + TS, *r3 = r2 + TS;
+            double        *e0 = eb, *e1 = eb + C, *e2 = eb + 2u * C, *e3 = eb + 3u * C;
+            const int      m0 = vit_smx_max(r0, C), m1 = vit_smx_max(r1, C);
+            const int      m2 = vit_smx_max(r2, C), m3 = vit_smx_max(r3, C);
+            double         s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+            Data_t        *p0 = a->p + (size_t)(c0 + k) * C;
             for (j = 0u; j < C; j++) {
-                eb[j] = a->tab[m - r[j]];
+                const unsigned k0 = (unsigned)(m0 - r0[j]), k1 = (unsigned)(m1 - r1[j]);
+                const unsigned k2 = (unsigned)(m2 - r2[j]), k3 = (unsigned)(m3 - r3[j]);
+                e0[j] = hi[k0 >> 8] * lo[k0 & 255u];
+                e1[j] = hi[k1 >> 8] * lo[k1 & 255u];
+                e2[j] = hi[k2 >> 8] * lo[k2 & 255u];
+                e3[j] = hi[k3 >> 8] * lo[k3 & 255u];
+                s0 += e0[j]; s1 += e1[j]; s2 += e2[j]; s3 += e3[j];
+            }
+            vit_smx_round(e0, s0, a->ip, C, p0);
+            vit_smx_round(e1, s1, a->ip, C, p0 + C);
+            vit_smx_round(e2, s2, a->ip, C, p0 + 2u * C);
+            vit_smx_round(e3, s3, a->ip, C, p0 + 3u * C);
+        }
+        for (; k < nc; k++) {
+            const int16_t *r = tl + (size_t)k * TS;
+            const int      m = vit_smx_max(r, C);
+            double         sum = 0.0;
+            for (j = 0u; j < C; j++) {
+                const unsigned kk = (unsigned)(m - r[j]);
+                eb[j] = hi[kk >> 8] * lo[kk & 255u];
                 sum += eb[j];
             }
-            rinv = a->ip / sum;
-            for (j = 0u; j < C; j++) {
-                const double q = eb[j] * rinv, f = q - floor(q);
-                double       rq;
-                if (f > 0.5 - 1e-7 && f < 0.5 + 1e-7) {
-                    pr[j] = llm_st(eb[j] / sum, a->ip);        /* near a tie: exact */
-                    continue;
-                }
-                rq = nearbyint(q);
-                pr[j] = (Data_t)(int16_t)(rq > 32767.0 ? 32767.0 : rq);
-            }
+            vit_smx_round(eb, sum, a->ip, C, a->p + (size_t)(c0 + k) * C);
         }
     }
     free(tl);
@@ -843,20 +1118,23 @@ static void vit_smx_items(void *pp, unsigned i0, unsigned i1)
 static void vit_attn_softmax(const Data_t *s, unsigned T, unsigned C, int fs, double ip, Data_t *p)
 {
     vit_smx_t a;
-    a.s = s; a.p = p; a.tab = _llm_sexp_tab[fs - LLM_SEXP_EMIN]; a.ip = ip; a.T = T; a.C = C;
+    a.s = s; a.p = p; a.tab = _vit_sexp_tab[fs - VIT_SEXP_EMIN]; a.ip = ip; a.T = T; a.C = C;
     a.nblk = (T + LLM_SMX_CB - 1u) / LLM_SMX_CB;
     host_parallel(vit_smx_items, &a, a.nblk, 1u, 1u);
 }
 
-/* ---- VitGelu: a = gelu_f[sat16(raw + braw[c])] (tables per input exponent,
- * GELU tanh form via libm exp: y = x - x / (exp(2u) + 1)) ---- */
+/* ---- VitGelu: a = round_half_even(gelu(r * 2^-fx) * 2^fa), r = sat16(raw +
+ * braw[c]) (GELU tanh form via libm exp: y = x - x / (exp(2u) + 1)).  One
+ * int16 table of the ROUNDED outputs per (fx, fa) exponent pair (128 KB,
+ * filled at init with the same double arithmetic and llm_st rounding): a
+ * lookup per element, the tables of a layer stay in L2. ---- */
 #define VIT_GELU_EMIN  (GELU_EMIN_VALUE)
 #define VIT_GELU_NE    (GELU_NE_VALUE)
-static double *_vit_gelu_tab[VIT_GELU_NE];
+static int16_t *_vit_gelu_tab[VIT_GELU_NE][VIT_GELU_NE];
 
 typedef struct {
-    double *t;
-    double  d;
+    int16_t *t;
+    double   d, ia;
 } vit_gelu_fill_t;
 
 static void vit_gelu_fill(void *p, unsigned i0, unsigned i1)
@@ -866,59 +1144,82 @@ static void vit_gelu_fill(void *p, unsigned i0, unsigned i1)
     for (i = i0; i < i1; i++) {
         const double x = (double)((int)i - 32768) / a->d;
         const double u = 0.7978845608028654 * (x + 0.044715 * ((x * x) * x));
-        a->t[i] = x - x / (exp(2.0 * u) + 1.0);
+        a->t[i] = llm_st16(x - x / (exp(2.0 * u) + 1.0), a->ia);
     }
 }
 
-static int vit_gelu_table(int f)
+static int vit_gelu_table(int fx, int fa)
 {
     vit_gelu_fill_t a;
-    double        **t = &_vit_gelu_tab[f - VIT_GELU_EMIN];
+    int16_t       **t = &_vit_gelu_tab[fx - VIT_GELU_EMIN][fa - VIT_GELU_EMIN];
     if (*t) return 0;
-    *t = (double *)malloc(65536u * sizeof(double));
+    *t = (int16_t *)malloc(65536u * sizeof(int16_t));
     if (!*t) return -1;
-    a.t = *t; a.d = ldexp(1.0, f);
+    a.t = *t; a.d = ldexp(1.0, fx); a.ia = ldexp(1.0, fa);
     host_parallel(vit_gelu_fill, &a, 65536u, 1024u, 8u);
     return 0;
 }
 
-static void vit_gelu_free(int f)
+static void vit_gelu_free(int fx, int fa)
 {
-    free(_vit_gelu_tab[f - VIT_GELU_EMIN]);
-    _vit_gelu_tab[f - VIT_GELU_EMIN] = NULL;
+    free(_vit_gelu_tab[fx - VIT_GELU_EMIN][fa - VIT_GELU_EMIN]);
+    _vit_gelu_tab[fx - VIT_GELU_EMIN][fa - VIT_GELU_EMIN] = NULL;
 }
 
 typedef struct {
-    const Data_t      *x;
-    const signed char *fx;
-    const int32_t     *bi;
-    const double      *ia;
-    unsigned           n;
-    Data_t            *y;
+    const Data_t          *x;
+    const int32_t         *bi;
+    const int16_t *const  *tab;     /* per channel: the table of (fx[c], fa[c]) */
+    unsigned               n;
+    Data_t                *y;
 } vit_gelu_t;
 
+static inline int32_t vit_gelu_ix(Data_t x, int32_t bi)
+{
+    const int32_t v = (int32_t)(int16_t)x + bi;
+    return (v > 32767 ? 32767 : v < -32768 ? -32768 : v) + 32768;
+}
+
+/* 8 lookups issued before their stores: the table reads (L2) overlap */
 static void vit_gelu_rows(void *p, unsigned r0, unsigned r1)
 {
-    const vit_gelu_t *a = (const vit_gelu_t *)p;
-    unsigned r, c;
+    const vit_gelu_t     *a = (const vit_gelu_t *)p;
+    const int16_t *const *t = a->tab;
+    const int32_t        *bi = a->bi;
+    unsigned              r, c;
     for (r = r0; r < r1; r++) {
         const Data_t *x = a->x + (size_t)r * a->n;
         Data_t       *y = a->y + (size_t)r * a->n;
-        for (c = 0u; c < a->n; c++) {
-            int32_t v = (int32_t)(int16_t)x[c] + a->bi[c];
-            if (v > 32767) v = 32767;
-            if (v < -32768) v = -32768;
-            y[c] = llm_st(_vit_gelu_tab[a->fx[c] - VIT_GELU_EMIN][v + 32768], a->ia[c]);
+        for (c = 0u; c + 8u <= a->n; c += 8u) {
+            const int16_t y0 = t[c][vit_gelu_ix(x[c], bi[c])];
+            const int16_t y1 = t[c + 1u][vit_gelu_ix(x[c + 1u], bi[c + 1u])];
+            const int16_t y2 = t[c + 2u][vit_gelu_ix(x[c + 2u], bi[c + 2u])];
+            const int16_t y3 = t[c + 3u][vit_gelu_ix(x[c + 3u], bi[c + 3u])];
+            const int16_t y4 = t[c + 4u][vit_gelu_ix(x[c + 4u], bi[c + 4u])];
+            const int16_t y5 = t[c + 5u][vit_gelu_ix(x[c + 5u], bi[c + 5u])];
+            const int16_t y6 = t[c + 6u][vit_gelu_ix(x[c + 6u], bi[c + 6u])];
+            const int16_t y7 = t[c + 7u][vit_gelu_ix(x[c + 7u], bi[c + 7u])];
+            y[c] = (Data_t)y0; y[c + 1u] = (Data_t)y1; y[c + 2u] = (Data_t)y2; y[c + 3u] = (Data_t)y3;
+            y[c + 4u] = (Data_t)y4; y[c + 5u] = (Data_t)y5; y[c + 6u] = (Data_t)y6; y[c + 7u] = (Data_t)y7;
         }
+        for (; c < a->n; c++)
+            y[c] = (Data_t)t[c][vit_gelu_ix(x[c], bi[c])];
     }
 }
 
-static void vit_gelu(const Data_t *x, const signed char *fx, const int32_t *bi, const double *ia,
-                     unsigned rows, unsigned n, Data_t *y)
+static void vit_gelu(const Data_t *x, const signed char *fx, const signed char *fa,
+                     const int32_t *bi, unsigned rows, unsigned n, Data_t *y)
 {
-    vit_gelu_t a;
-    a.x = x; a.fx = fx; a.bi = bi; a.ia = ia; a.n = n; a.y = y;
+    vit_gelu_t      a;
+    const int16_t **tab = (const int16_t **)malloc((size_t)n * sizeof(*tab));
+    unsigned        c;
+    if (!tab)
+        return;
+    for (c = 0u; c < n; c++)
+        tab[c] = _vit_gelu_tab[fx[c] - VIT_GELU_EMIN][fa[c] - VIT_GELU_EMIN];
+    a.x = x; a.bi = bi; a.tab = tab; a.n = n; a.y = y;
     host_parallel(vit_gelu_rows, &a, rows, host_row_grain(n), 1u);
+    free(tab);
 }
 
 /* ---- VitPixelShuffle: columns [k0, k0 + K) of out[I*m + J][(b*s + a)*D + c]
@@ -956,7 +1257,8 @@ static void vit_sum_dequant(const Data_t *const *p, unsigned m, const double *sx
 
 
 def vit_c_helpers() -> str:
-    return VIT_C.replace("GELU_EMIN_VALUE", str(GELU_EMIN)).replace("GELU_NE_VALUE", str(GELU_NE))
+    return (VIT_C.replace("GELU_EMIN_VALUE", str(GELU_EMIN)).replace("GELU_NE_VALUE", str(GELU_NE))
+            .replace("SEXP_EMIN_VALUE", str(SEXP_EMIN)).replace("SEXP_NE_VALUE", str(SEXP_NE)))
 
 
 __all__ = ("VIT_OP_FACTORIES", "VitNode", "VitEmbedAddNode", "VitResAddNode", "VitLayerNormNode",

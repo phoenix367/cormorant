@@ -34,7 +34,8 @@ saturate; host regions in double, round half to even + saturate on write):
   q, k, v         kernel MatMuls (q0, k0, v); the host adds the biases and writes
                   q, k at per-head exponents and V ("vc") per channel
   scores          kernel q.k^T per head; softmax on the host over all 1024 keys
-                  (no mask) from the raw scores (the llm_study exp tables),
+                  (no mask) from the raw scores: e(k) = T_hi[k >> 8] * T_lo[k & 255]
+                  (k = raw_max - raw; two 256-entry libm exp tables, sexp2_table),
                   P at 2^-p_bits; P.V kernel per head (f_pv = f_p + f_vc - 8)
   out_proj, fc2   kernel; the host adds the bias in the residual add
   fc1             kernel; the host adds the bias as an integer at fc1's exponent
@@ -266,6 +267,25 @@ def gelu_table(f):
     return _GELU_TAB[f]
 
 
+_SEXP2 = {}
+
+
+def sexp2_table(f, scale):
+    """The vision softmax's exp of k = raw_max - raw (k in [0, 65535]):
+    e(k) = T_hi[k >> 8] * T_lo[k & 255] (a double product), T_hi[i] =
+    exp(-(i * 256) / 2^f * scale), T_lo[j] = exp(-j / 2^f * scale) (libm exp):
+    two 256-entry tables stay in the A53's L1 (the 65 536-entry table of the
+    text model's softmax misses it).  Returned expanded to 65 536 entries."""
+    key = (int(f), float(scale))
+    if key not in _SEXP2:
+        d = 2.0 ** int(f)
+        hi = np.array([math.exp(-(i * 256) / d * scale) for i in range(256)])
+        lo = np.array([math.exp(-j / d * scale) for j in range(256)])
+        k = np.arange(65536)
+        _SEXP2[key] = hi[k >> 8] * lo[k & 255]
+    return _SEXP2[key]
+
+
 def bias_raw(b, f):
     """A bias as raw integers at exponent(s) f: round half to even."""
     return np.round(np.asarray(b, np.float64) * p2v(f))
@@ -361,6 +381,16 @@ class VisionModel(ls.Model):
             cols = ff == e
             y[:, cols] = gelu_table(int(e))[raw[:, cols] + 32768]
         return self.host(y, "a", l, self.E("a", l))
+
+    def softmax(self, s, mask, fs, fp, layer):
+        """llm_study.Model.softmax with the vision exp (sexp2_table) in the
+        emulation; every key valid."""
+        if not self.q or self.exact("s"):
+            return super().softmax(s, mask, fs, fp, layer)
+        raw = np.rint(s * p2(fs)).astype(np.int64)
+        k = raw.max(-1, keepdims=True) - raw
+        e = sexp2_table(int(fs), 1.0 / math.sqrt(self.cfg.HD))[k]
+        return self.host(e / np.cumsum(e, -1)[..., -1:], "p", layer, fp, record=False)
 
     def heads_e(self, cls, l):
         return np.repeat(self.Eh(cls, l, self.cfg.H), self.cfg.HD)

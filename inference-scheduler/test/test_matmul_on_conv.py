@@ -206,6 +206,8 @@ class _Models(unittest.TestCase):
                                       a_const=True, b_const=False, seed=4),
             # batched activation A, shared constant B -> rows fold into out_ch
             "fold": _matmul_model(os.path.join(d, "fold.onnx"), [3, 16, 64], [64, 32], seed=5),
+            # 1024 rows: every one-call plan is accumulator-limited -> row split
+            "rows": _matmul_model(os.path.join(d, "rows.onnx"), [1024, 64], [64, 128], seed=12),
             # stays on MatmulKernel
             "fc": _matmul_model(os.path.join(d, "fc.onnx"), [1, 512], [512, 1000], seed=6),
             "k24": _matmul_model(os.path.join(d, "k24.onnx"), [32, 24], [24, 64], seed=7),
@@ -248,6 +250,22 @@ class TestEngineChoice(_Models):
         self.assertEqual((sn.conv_batch, sn.calls, sn.conv_n, sn.kw), (3, 1, 32, 1))
         (sn,) = _lowered(_gen(self.m["fold"])[0])
         self.assertEqual((sn.conv_batch, sn.calls, sn.conv_n), (1, 1, 48))
+
+    def test_row_split(self):
+        """1024 rows: at out_w >= 8 the accumulator holds < 16 output rows per
+        chunk, so the rows go to several calls (A and C advance by the rows
+        of a call, B is shared); the one-call plans stay as the fallback."""
+        (sn,) = _lowered(_gen(self.m["rows"])[0])
+        self.assertEqual((sn.n, sn.calls, sn.conv_n, sn.conv_batch), (1024, 2, 512, 1))
+        self.assertEqual((sn.a_call_stride, sn.b_call_stride, sn.c_call_stride),
+                         (512 * sn.k, 0, 512 * sn.m))
+        plans = conv_plans(sn, range(1, 8))
+        self.assertFalse(plans[0].acc_limited)
+        one = [p for p in plans if p.calls == 1]
+        self.assertTrue(one and all(p.acc_limited and p.conv_n == 1024 for p in one))
+        # BERT's 256-row linears: a one-call plan fits, no split considered
+        (sn,) = _lowered(_gen(self.m["linear"])[0])
+        self.assertTrue(all(p.calls == 1 for p in conv_plans(sn, range(1, 8))))
 
     def test_kept_on_matmul_kernel(self):
         for name, why in (("fc", "N = 1"), ("k24", "K = 24"), ("m12", "M = 12")):
@@ -308,7 +326,7 @@ class TestSimulation(_Models):
         """The lowered op has no model of its own: _simulate gives the same
         bits whichever engine runs the MatMul (both kernels: exact products,
         ap_fixed<32,16> sum, floor + saturate)."""
-        for name in ("linear", "small", "gemm", "attn", "shared_a", "fold"):
+        for name in ("linear", "small", "gemm", "attn", "shared_a", "fold", "rows"):
             _, on = _gen(self.m[name])
             _, off = _gen(self.m[name], "off")
             a, b = on._simulate(), off._simulate()
@@ -381,6 +399,16 @@ class TestCodegen(_Models):
         self.assertLess(body.index("kernel_wait(KERNEL_CONV);\n    INFERENCE_PROF_END(0u);"),
                         body.index("run_conv_at(V"))
 
+    def test_row_split_emission(self):
+        g, cg = _gen(self.m["rows"])
+        (sn,) = _lowered(g)
+        src = cg.generate_source()
+        self.assertIn("for (unsigned _i = 0u; _i < 2u; _i++) {", src)
+        self.assertIn(f"run_conv_at(B, _i * 0u, A, _i * {512 * sn.k}u,", src)
+        self.assertIn(f"Y, _i * {512 * sn.m}u,", src)
+        self.assertIn("out_ch=512", src)
+        self.assertIn(", 2 calls", src)
+
     def test_event_stream_lane(self):
         g, cg = _gen(self.m["gemm"])
         (sn,) = _lowered(g)
@@ -394,7 +422,7 @@ class TestCodegen(_Models):
         from test_s2d_stem import _host_compile, _which_cc
         if not _which_cc():
             self.skipTest("no C compiler")
-        for name in ("linear", "attn", "shared_a", "gemm", "small"):
+        for name in ("linear", "attn", "shared_a", "gemm", "small", "rows"):
             _, cg = _gen(self.m[name])
             with tempfile.TemporaryDirectory() as td:
                 rc, log = _host_compile(cg, td)
@@ -408,7 +436,7 @@ class TestCodegen(_Models):
         re-laid-out weight images are right."""
         for name, mode in (("small", "auto"), ("gemm", "auto"), ("attn", "auto"),
                            ("shared_a", "auto"), ("fold", "auto"), ("n8", "always"),
-                           ("small", "off")):
+                           ("rows", "auto"), ("small", "off")):
             _, cg = _gen(self.m[name], mode)
             with tempfile.TemporaryDirectory() as td:
                 rc, out = host_emu.build_and_run(cg, td)

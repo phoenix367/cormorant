@@ -289,17 +289,18 @@ class VitFrontend:
             def pv_(g, p=p, o=o, e=e):
                 self._node("LlmAttnPV", [p[g], vc], [o[g]], f"{e}.pv{g}", domain=LLM_DOMAIN,
                            group=g, **common)
-            # each softmax hides behind a ConvKernel call (llama.py's order)
+            # ConvKernel runs qk(g+1) under softmax(g); pv(g) then qk(g+2)
+            # follow right away, so the CPU waits only for the short P.V to
+            # free the lane (qk(g+1) after softmax(g) waited for the longer
+            # qk before the next softmax)
             qk(0)
             if H > 1:
                 qk(1)
-            softmax(0)
-            pv_(0)
-            for g in range(1, H):
+            for g in range(H):
                 softmax(g)
-                if g + 1 < H:
-                    qk(g + 1)
                 pv_(g)
+                if g + 2 < H:
+                    qk(g + 2)
             pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
             self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
                        num_heads=H, num_kv_heads=H, head_dim=HD)
