@@ -12,8 +12,9 @@ CMA pool 488 → 286 MiB (§19).  SmolLM2-360M-Instruct: bit-exact on the
 board, 3.9 tok/s, 740 MiB pool, served by the same server (§20).  The study
 stage is reproducible from pinned checkpoints and texts, with the formats
 hashes recorded (`llm_calibrate.py`, §21).  SmolVLM-256M (image input): numeric
-study GO (§22), then implemented — bit-exact on the board, 7.7 s per image +
-~9.5 tok/s, served by the chat server with OpenAI image_url parts (§23).  Not done:
+study GO (§22), then implemented — bit-exact on the board, 3.9 s per image
+(7.7 s at first, §24) + ~9.5 tok/s, served by the chat server with OpenAI
+image_url parts (§23).  Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
 971 ms per inference on the board, bit-exact with the scheduler simulation).
@@ -2054,9 +2055,116 @@ depicts two cats lying on a pink surface. The cat on the left is smaller
 and appears to be a mutt …" is word for word the study emulation's.
 
 **Open items:**
-- **Vision speed:** 7.7 s per image.
+- **Vision speed:** 7.7 s per image (3.9 s after §24).
   - The host softmax (2.3 s) could use more threads or a narrower exp
     table.
   - P.V (2.1 s) is weight-request-latency bound, like BERT's.
   - The MatMuls reach only 24 GMAC/s against BERT's 44: K = 768 is short.
 - **Image splitting:** image splitting (more tiles) needs a larger context.
+
+## 24. The vision encoder, 2× faster (2026-09-28)
+
+**Result.**  `llm_image` takes **3.90 s instead of 7.73 s** on the board.
+The logits are bit-exact with the scheduler simulation, and that equals
+the study emulation.  Through the chat API, a new image gets its first
+token in about 4.7 s (9.1 s before) and a 48-token answer in 9.8 s.
+
+| per image (profile brackets; the kernel ones overlap host work) | §23 | now |
+|---|---:|---:|
+| `llm_image` | 7.73 s | **3.90 s** |
+| MatMuls (76, ConvKernel) | 3.6 s | 2.00 s |
+| softmax (host, 144 heads) | 2.3 s | 0.83 s |
+| q.Kᵀ (ConvKernel) | 0.85 s | 0.83 s |
+| P.V (ConvKernel; the bracket includes waiting for the lane) | 2.1 s | 0.52 s |
+| GELU | 0.43 s | 0.25 s |
+| LayerNorm / attention prep / residual adds | 0.32 / 0.24 / 0.12 s | 0.10 / 0.13 / 0.06 s |
+
+**1. Vision linears in 512-row calls** (`matmul_lowering.conv_plans`,
+INFERENCE_SCHEDULER.md "Row split").
+- **Why a call is slow at 1024 rows:** the accumulator holds 64 K
+  outputs, so a 1024-row call at `out_w = 8` sweeps only 8 output rows per
+  chunk instead of the line buffer's 16, and every chunk fetches its
+  weight slabs again.
+- **Board, one layer (ms, the whole 1024 rows):**
+
+  | linear | 1 × 1024 | 2 × 512 | 4 × 256 | 8 × 128 |
+  |---|---:|---:|---:|---:|
+  | q / k / v / o (768 → 768) | 25.2 | 13.9 | 13.7 | 13.8 |
+  | fc1 (768 → 3072) | 100.6 | 58.6 | 54.2 | 54.2 |
+  | fc2 (3072 → 768) | 96.6 | 50.5 | 49.9 | 49.6 |
+
+- **The cycle model vs the board:** within 0.8–1.0× on full-chunk plans,
+  1.06–1.3× too optimistic on the 8-row ones.  So the split is not driven
+  by the model's cost alone: the rows are split only when every one-call
+  plan has short chunks, and the split plans are ranked among the
+  full-chunk ones.  That picks 2 × 512 (kw 6, out_w 8), 4 % behind the
+  best measured (256 / 128 rows).
+- **Scope:** BERT, SmolLM2-135M / 360M and the SmolVLM text entries have
+  no short-chunk plan, so their projects are unchanged.
+
+**2. The host softmax, 2.5× faster** (`VitAttnSoftmax`, 16.2 → 6.5 ms
+per head on 4 threads).  A single-thread profile of one head (56 ms)
+split into: transpose 15, max 3, exp + sum 13, round 28.
+- **Transpose:** the 32 rows of the tile have a 2 KB stride, which maps
+  them onto 4 L1 sets; the row stride is now padded.  The rows ahead are
+  prefetched, since the score rows come from DRAM.  On AArch64 it uses
+  NEON 8 × 8 transposes.
+- **Max:** NEON (`vmaxq_s16`).
+- **Exp + sum:** 4 columns at a time, 4 independent sum chains, each
+  column still summed left to right.
+- **Round:** NEON `frinti` on 8 elements, with a vector test for a
+  near-tie (then those 8 are redone by the scalar code, which is exact).
+  The saturating narrow is the clamp.
+- **Check:** the library's code, cut out of `VIT_C`, was compared with the
+  old loop on the board and on x86.  It matched bit for bit over 4 score
+  exponents × 5 shapes (C = 7 … 1024) × 5 value ranges, including all-equal
+  and two-valued rows.
+
+**3. Attention order** (`vit.py`): qk0, qk1, then per head softmax(g),
+pv(g), qk(g + 2).  A lane takes one call at a time, so under the old order
+(qk(g + 1) after softmax(g)) the CPU waited for the whole q.Kᵀ before
+the next softmax.  Now it waits only for the shorter P.V.
+
+**4. The other host loops, 2.5–3×.**  The A53 is in-order: a loop that
+converts, scales, adds and rounds one element at a time waits out every
+latency.
+- **LayerNorm:** 4 rows at a time.  `1 / sd` replaces the per-element
+  divide; an element within 2⁻²⁰ of a rounding tie is redone with the
+  divide (the fast value is within (5 |γq| + 2 |y|) · 2^(f_y − 53)).
+  Single thread 50 → 16 ms, identical over 6 value distributions,
+  including saturation and ties.
+- **Residual add, attention prep:** 4 elements per step, with a
+  branch-free `llm_st16` for finite values.  Single thread 17.6 → 6.8 and
+  26.7 → 8.1 ms.
+- **GELU:** one int16 table of the rounded outputs per (fc1, GELU)
+  exponent pair, so an element is one lookup with no double math:
+  0.43 → 0.25 s.  8 table reads per step gained 28 % in a synthetic test
+  and nothing on the board: the 128 KB tables and the 6 MB streams bound
+  it.
+
+**Numerics.**  The only spec change is the softmax exp:
+e(k) = T_hi[k >> 8] · T_lo[k & 255] (two 256-entry libm tables per score
+exponent) instead of one 65 536-entry table, now in `vlm_study.py`.
+- The quick study (6 images, 48 tokens) gives the same metrics as before:
+  features rel. err 0.0550, top-1 0.9595, KL 0.0040, ppl 23.529.  The
+  greedy answers are identical.
+- The GELU tables hold the same values, rounded once at fill time: no
+  spec change.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| `vlm_sched_check.py` (simulation vs study) | vision 2 / 2 images bit-exact |
+| `vlm_host_emu.py` (generated C on the host) | 5 / 5 logits bit-exact, re-open identical |
+| `llm_board.py --profile --reopen --decode 16` (KV260) | 2 × 17 / 17 logits bit-exact, re-open identical |
+| chat API (repetition penalty, DRY, loop guard off) | COCO 39769 and 1268: 48-token greedy answers equal to the study emulation |
+| scheduler suite | 1512 pass, 5 skipped (new: `test_row_split`, `test_row_split_emission`, and the split case in the host-emulated run) |
+
+**Next levers:**
+- **q.Kᵀ (0.83 s):** on ConvKernel it reaches 13 GMAC/s at K = 64.
+- **P.V:** swapping its operands (the weight Vᵀ, 1.96 against 3.42 ms)
+  needs the transposed context layout all the way to out_proj.
+- **The CPU still waits** about 3.4 ms per head for P.V to free the lane
+  before the next q.Kᵀ.  Splitting each softmax in two halves would hide
+  that.

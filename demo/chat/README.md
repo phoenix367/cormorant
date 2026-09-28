@@ -391,7 +391,7 @@ library names (`llm_model_name()`), `smollm2-360m-instruct`
 `smolvlm-256m-instruct` (CHAT_PLAN §22, §23) answers questions about images
 sent as OpenAI `image_url` parts — base64 data URLs; the server fetches
 nothing.  One 512 × 512 tile per image (67 prompt tokens): the vision
-encoder takes 7.7 s on the FPGA, then text comes at ~9.5 tokens/s; a
+encoder takes 3.9 s on the FPGA, then text comes at ~9.5 tokens/s; a
 follow-up question about the same image reuses it (TTFT ~0.4 s).  Its pool
 is 495 MiB, so it swaps with SmolLM2-360M under `--resident auto`.
 

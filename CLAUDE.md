@@ -139,7 +139,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1515 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1517 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 

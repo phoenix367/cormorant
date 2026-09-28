@@ -116,7 +116,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1507 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1517 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -770,8 +770,9 @@ policy pow2+p12, which the simulation reproduces bit for bit):
   `demo/chat/src/llm_api.c` fills it from an RGB image.
 - **Per layer, host ops:** LayerNorm, the bias adds, GELU and the float32
   residual adds.
-  - GELU reads a 65 536-entry table per input exponent (the bias added as an
-    integer first), filled with libm exp in the tanh form.
+  - GELU reads a 65 536-entry int16 table of the rounded outputs per
+    (input, output) exponent pair (the bias added as an integer first),
+    filled with libm exp in the tanh form.
 - **Per layer, kernels:** MatMuls with per-channel power-of-two exponents,
   and attention per head.
   - `VitAttnPrep` writes the q.Kᵀ input image and the K / V "caches": one
@@ -779,6 +780,11 @@ policy pow2+p12, which the simulation reproduces bit for bit):
     exponents as the op's attributes.
   - Then per head: `LlmAttnScores` (ConvKernel, static key count),
     `VitAttnSoftmax` (every key, P at 2⁻¹²) and `LlmAttnPV` (ConvKernel).
+    The softmax's exp is two 256-entry tables per score exponent,
+    e(k) = T_hi[k >> 8] · T_lo[k & 255], which stay in L1.  The nodes go
+    qk0, qk1, then per head softmax(g), pv(g), qk(g + 2): qk(g + 1) runs
+    on ConvKernel under softmax(g), and the CPU waits only for the short
+    P.V before issuing the next qk.
   - `LlmAttnMerge` joins the heads.
 - **Connector:** K = 12 288 exceeds every kernel, so it runs as three
   K-chunk MatMuls (`VitPixelShuffle` writes each chunk's columns) summed by
@@ -789,6 +795,12 @@ policy pow2+p12, which the simulation reproduces bit for bit):
   rows.
 
 The ops' C helpers (`VIT_C`) are emitted only when a project uses them.
+Their element loops take 4 rows or elements per step without a branch in
+between: the KV260's in-order A53 otherwise waits out every convert,
+multiply and add.  Where a reciprocal replaces a divide (LayerNorm's
+`1 / sd`, the softmax's `2^f_p / sum`), an element near a rounding tie is
+redone exactly, so the int16 results are unchanged.  On AArch64 the
+softmax's transposes, max and rounding use NEON (CHAT_PLAN §24).
 `test/test_vit.py` covers them on a tiny random ViT: simulation == study
 emulation, the generated C == the simulation, and a vision + text project.
 
@@ -904,6 +916,21 @@ shares the weights); B shared and A batched → the batch folds into the rows
 per head) → one call per item, `run_conv_at()` with element offsets, each
 waiting on `KERNEL_CONV` for the previous one; the last call is left in
 flight like any other start, so the event stream / liveness are unchanged.
+
+**Row split** (`matmul_lowering.conv_plans`).  The accumulator holds
+`max_acc_persist_entries` outputs, so a call with many rows (`out_ch`)
+covers fewer output rows per chunk than the line buffer holds
+(`max_line_buf_rows`, 16).  At 1024 rows and `out_w = 8` a chunk has only
+8 rows, and each chunk fetches its weight slabs again.  The board runs such
+a plan 1.3× slower than the cycle model says; plans with full chunks land
+within 0.8–1.0×.  When **every** one-call plan of a MatMul with contiguous
+rows (one call, ConvKernel batch 1) is limited that way, the rows go to
+several calls instead.  Call `i` reads A rows and writes C rows
+`[i·r, (i+1)·r)` (`a_call_stride = r·K`, `c_call_stride = r·M`), B is
+shared (`b_call_stride = 0`), and the cheapest split plan whose chunks are
+full is taken.  Only SmolVLM's 1024-token vision linears qualify (BERT,
+SmolLM2 and the SmolVLM text entries keep their plans).  They run as 2 × 512
+rows, 1.7–1.9× faster on the board (CHAT_PLAN §24).
 
 BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
 — the 72 encoder linears as 1×4 convs (`in_ch` 192 / 768, output 48×16 or

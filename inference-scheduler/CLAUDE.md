@@ -213,7 +213,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              63 pytest modules, 1515 tests collected (1510 pass, 5 skip;
+  test_*.py              63 pytest modules, 1517 tests collected (1512 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -294,7 +294,10 @@ constant B read only by this MatMul is re-imaged by
 `nodes.conv_lowered_b_image` for `kw > 1`).  Engine and `(kw, out_w)` are
 chosen with `src/cost_model.py` (conv-cycle-model port vs a board-calibrated
 MatmulKernel model).  Batched MatMuls with per-item weights (attention)
-emit one `run_conv_at()` per item.  The simulator treats it exactly like a
+emit one `run_conv_at()` per item.  When every one-call plan is
+accumulator-limited (fewer than 16 output rows per chunk), the rows are
+split over several `run_conv_at()` calls, with B shared.  Only SmolVLM's
+1024-token vision linears qualify.  The simulator treats it exactly like a
 `MatmulNode` — the two kernels are bit-identical.  See
 `../doc/scheduler/INFERENCE_SCHEDULER.md` §"MatMul on ConvKernel".
 
