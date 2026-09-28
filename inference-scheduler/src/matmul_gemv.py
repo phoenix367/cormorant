@@ -64,6 +64,14 @@ def ineligible_reason(sn, kw: int = 1, is_ap_fixed_16_8: bool = True) -> Optiona
         return "element type is not ap_fixed<16,8>"
     if type(sn) is not MatmulNode:
         return "not a MatmulKernel node"
+    return gemv_shape_reason(sn, kw)
+
+
+def gemv_shape_reason(sn, kw: int = 1) -> Optional[str]:
+    """ineligible_reason()'s shape rules alone, for any object with the
+    MatMul attributes (n, k, m, outer_count, b_packed, batch strides) — the
+    planner's candidates of a MatMul already lowered elsewhere
+    (src/tactics.py)."""
     if sn.outer_count != 1:
         return "4D x 3D outer loop"
     if sn.n != 1:
@@ -83,13 +91,54 @@ def ineligible_reason(sn, kw: int = 1, is_ap_fixed_16_8: bool = True) -> Optiona
     return None
 
 
+def _plan_gemv(sn, kw: int, baseline: bool, perf_model, plan_log) -> bool:
+    """Planned GEMV (True) or tiled (False) for a single-row MatMul."""
+    from .matmul_lowering import PLAN_MIN_GAIN, plan_tiled_calls
+    from .perf_calls import KernelCall
+    from .perf_model import clearly_faster
+    b_gemv = perf_model.calls_band([KernelCall.of(
+        "MatmulKernel", n=sn.n, k=sn.k, m=sn.m, batch=sn.batch, a_stride=sn.a_batch_stride,
+        b_stride=sn.b_batch_stride, c_stride=sn.c_batch_stride, b_packed=0, gemv_kw=kw)])
+    b_tiled = perf_model.calls_band(plan_tiled_calls(sn, sn.inputs[1].data is not None))
+    t_gemv = b_gemv[0] if b_gemv else None
+    t_tiled = b_tiled[0] if b_tiled else None
+    chosen, why = baseline, "baseline"
+    if b_gemv is None or b_tiled is None:
+        why = "not priced"
+    else:
+        base, other = (b_gemv, b_tiled) if baseline else (b_tiled, b_gemv)
+        if clearly_faster(other, base, PLAN_MIN_GAIN):
+            chosen, why = not baseline, "planned"
+        elif other[0] < base[0]:
+            why = ("gain below the minimum" if other[0] >= base[0] * (1.0 - PLAN_MIN_GAIN)
+                   else "gain within the error band")
+    if plan_log is not None:
+        lab = lambda g: f"MatmulKernel GEMV kw={kw}" if g else "MatmulKernel tiled"  # noqa: E731
+        plan_log.append({"node": sn.index, "name": sn.onnx_node.name or f"MatMul_{sn.index}",
+                         "baseline": lab(baseline), "chosen": lab(chosen),
+                         "baseline_us": t_gemv if baseline else t_tiled,
+                         "best_us": min(t for t in (t_gemv, t_tiled) if t is not None)
+                         if (t_gemv is not None or t_tiled is not None) else None,
+                         "chosen_us": t_gemv if chosen else t_tiled,
+                         "decision": why, "candidates": 2,
+                         "priced": sum(t is not None for t in (t_gemv, t_tiled))})
+    return chosen
+
+
 def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = True,
                 graph_io: Sequence[str] = (),
-                kw_hint: Optional[Dict[str, int]] = None) -> dict:
+                kw_hint: Optional[Dict[str, int]] = None,
+                perf_model=None, plan_log: Optional[list] = None) -> dict:
     """Set ``gemv_kw`` on the MatmulNodes of ``nodes`` that should run as
     GEMV, re-imaging a constant B for kw > 1 (``TensorInfo.packed_data``).
     Runs after the ConvKernel lowering and before the packed-B pass.
-    Returns ``{"gemv", "kw>1", "tiled_cycles", "gemv_cycles"}``."""
+    Returns ``{"gemv", "kw>1", "tiled_cycles", "gemv_cycles"}``.
+
+    ``perf_model`` (planning): in "auto" mode the choice between the tiled
+    and the GEMV path is priced with the performance model instead of the
+    cost model (the other rules unchanged: the image a B is read in); a
+    choice changes only when priced PLAN_MIN_GAIN below the cost model's,
+    and when either path cannot be priced the cost model decides."""
     mode = normalize_mode(mode)
     kw_hint = kw_hint or {}
     stats = {"gemv": 0, "kw>1": 0, "tiled_cycles": 0.0, "gemv_cycles": 0.0}
@@ -124,7 +173,12 @@ def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = Tru
             kw, relayout = 1, False          # the hint's image does not fit: plain B
         tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch)
         gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
-        if mode == "auto" and gemv >= tiled:
+        use = mode != "auto" or gemv < tiled
+        if perf_model is not None and mode == "auto" and b.onnx_name not in kw_hint:
+            # (a weight in a shared image keeps the unplanned choice: switching
+            # it would need a second copy in another layout)
+            use = _plan_gemv(sn, kw, use, perf_model, plan_log)
+        if not use:
             continue
         if relayout:
             b.packed_data = conv_lowered_b_image(b.data, sn.k, sn.m, kw)

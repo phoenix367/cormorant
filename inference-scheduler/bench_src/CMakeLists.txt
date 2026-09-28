@@ -50,3 +50,23 @@ add_bench_if(bench_conv     bench_conv.c
              xconvkernel.c     xconvkernel_linux.c)
 add_bench_if(bench_pool     bench_pool.c
              xpoolingkernel.c  xpoolingkernel_linux.c)
+
+# ── Calibration runner: every kernel in one process (perf_calibrate.py) ─────
+set(_CALIB_DRV "")
+foreach(_d xvectoropkernel xmatmulkernel xconvkernel xpoolingkernel)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/driver/${_d}.c"
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/driver/${_d}_linux.c")
+        list(APPEND _CALIB_DRV "${CMAKE_CURRENT_SOURCE_DIR}/driver/${_d}.c"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/driver/${_d}_linux.c")
+    endif()
+endforeach()
+list(LENGTH _CALIB_DRV _n_calib_drv)
+if(_n_calib_drv EQUAL 8)
+    add_executable(calib_runner calib_runner.c ${_CALIB_DRV})
+    target_include_directories(calib_runner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/driver")
+    target_link_libraries(calib_runner PRIVATE bench_infra m)
+    target_compile_options(calib_runner PRIVATE -Wall -O2)
+    message(STATUS "benchmark: calib_runner enabled")
+else()
+    message(STATUS "benchmark: calib_runner SKIPPED (needs all four kernels' drivers)")
+endif()

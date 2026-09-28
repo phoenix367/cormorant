@@ -176,6 +176,33 @@ class TestHostEmulation(unittest.TestCase):
                 self.assertIn("test_inference PASSED", out)
 
 
+class TestAttentionSplit(unittest.TestCase):
+    """attn_split: every head's softmax and P.V in query-row parts — the same
+    bits as the unsplit entry, in simulation and in the generated C."""
+
+    def test_split_equals_unsplit(self):
+        cfg, W, vm, fe = Tiny.get()
+        fe2 = VitFrontend(fe.cfg, fe.W, fe.fmt, name="vit_tiny", conn_k=CONN_K, attn_split=2)
+        g = OnnxGraph(fe2.entry(output=True), fuse_act=True, s2d_stem=True)
+        names = [sn.onnx_node.name for sn in g.nodes]
+        self.assertIn("vision.l0.softmax0r1", names)
+        self.assertIn("vision.l0.pv0r1", names)
+        cg = CodeGenerator(g, model_path="vit_tiny_split.onnx")
+        for im in images(2, 13):
+            out = cg._forward_pass({"vision.patches": patches(im, cfg.P).astype(np.float64)},
+                                   states=cg.initial_states())
+            np.testing.assert_array_equal(out["vision.image"], vm.forward(im))
+        with tempfile.TemporaryDirectory() as td:
+            rc, out = host_emu.build_and_run(cg, td, cached=True, threads=3, min_elems=1)
+            self.assertEqual(rc, 0, out[-3000:])
+            self.assertIn("test_inference PASSED", out)
+
+    def test_bad_split(self):
+        _cfg, _W, _vm, fe = Tiny.get()
+        with self.assertRaises(ValueError):
+            VitFrontend(fe.cfg, fe.W, fe.fmt, attn_split=3)
+
+
 class TestImageRows(unittest.TestCase):
     """The text model's prefill reads image rows: ids V .. V + R - 1."""
     R = 4

@@ -64,6 +64,10 @@ class CombinedGraph:
         self.weights_saturated = {}
         for _, g in self.entries:
             self.weights_saturated.update(getattr(g, "weights_saturated", {}))
+        # planning (src/planning.py): the entries' decisions, one model
+        self.plan_log = [e for _, g in self.entries for e in getattr(g, "plan_log", [])]
+        self.perf_model = next((g.perf_model for _, g in self.entries
+                                if getattr(g, "perf_model", None) is not None), None)
 
     @property
     def nodes(self):

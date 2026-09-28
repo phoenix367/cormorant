@@ -296,6 +296,49 @@ class ReportGenerator:
                     )
         return ", ".join(parts) if parts else "—"
 
+    # ----- planning (--plan / --plan-report) ------------------------- #
+
+    def _planning(self) -> str:
+        """Predicted time and where the CPU waits (TACTICS_PLAN §4.4), from
+        the performance and host models; empty without --plan / --plan-report."""
+        plan = getattr(self.graph, "plan", None)
+        if plan is None or not plan.active:
+            return ""
+        from .codegen.timing import kernel_duration_fn, simulate
+        from .host_model import HostModel, default_host_model_path
+        from .planning import PlanError, resolve_perf_model
+        rows = ["## Planning", ""]
+        try:
+            pm = getattr(self.graph, "perf_model", None) or resolve_perf_model(plan)
+        except PlanError as e:
+            return "\n".join(rows + [f"No prediction: {e}."])
+        hp = default_host_model_path()
+        hm = HostModel.load(hp) if hp.exists() else HostModel()
+        cg = self.codegen
+        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts), hm.us)
+        by = {sn.index: sn for sn in self.graph.nodes}
+        rows.append(f"Predicted time of one `inference_run()`: **{tl.total_us / 1e3:.2f} ms** "
+                    f"(performance model {pm.platform}/{pm.bitstream}); CPU busy "
+                    f"{tl.cpu_us / 1e3:.2f} ms, waiting {tl.wait_us / 1e3:.2f} ms.")
+        if tl.unpriced:
+            rows.append(f"{len(set(tl.unpriced))} node(s) could not be priced (counted as 0).")
+        ol = getattr(self.graph, "order_log", None)
+        if ol:
+            rows.append(f"Issue order: {ol.get('why', '')}"
+                        + (f" ({ol['before_us'] / 1e3:.2f} -> {ol['after_us'] / 1e3:.2f} ms simulated)"
+                           if "before_us" in ol else "") + ".")
+        rows += ["", "| lane | busy (ms) |", "|---|---:|"]
+        rows += [f"| {lane} | {us / 1e3:.2f} |" for lane, us in sorted(tl.lane_us.items())]
+        top = tl.top_waits(8)
+        if top:
+            rows += ["", "Where the CPU waits (the node whose kernel it waits for):", "",
+                     "| node | lane | waits | total (ms) |", "|---|---|---:|---:|"]
+            for idx, lane, us, n in top:
+                sn = by.get(idx)
+                name = (sn.onnx_node.name or type(sn).__name__) if sn is not None else str(idx)
+                rows.append(f"| `{name}` | {lane} | {n} | {us / 1e3:.2f} |")
+        return "\n".join(rows)
+
     # ----- top-level entry point ------------------------------------ #
 
     def render_markdown(self) -> str:
@@ -306,6 +349,7 @@ class ReportGenerator:
             self._activation_memory(),
             self._hardware_lanes(),
             self._transformations(),
+            self._planning(),
             self._layers_table(),
             self._generated_files(),
         ]
@@ -571,6 +615,13 @@ class ReportGenerator:
                 f"{mc['matmul_cycles'] / 1e5:.1f} ms on MatmulKernel at 100 MHz); "
                 f"{mc.get('kept', 0)} stay on MatmulKernel."
             )
+        from .planning import plan_summary
+        ps = plan_summary(self.graph)
+        if ps:
+            bullets.append(f"- **Planning** (`--plan`, doc/plans/TACTICS_PLAN.md) — {ps}.")
+            for e in [e for e in self.graph.plan_log if e["decision"] == "planned"][:12]:
+                bullets.append(f"  - `{e['name']}`: {e['baseline']} → {e['chosen']} "
+                               f"({e['baseline_us'] / 1e3:.2f} → {e['chosen_us'] / 1e3:.2f} ms)")
         if s2d:
             bullets.append(
                 f"- **Space-to-depth stem** — {s2d} stride-2 `Conv`"

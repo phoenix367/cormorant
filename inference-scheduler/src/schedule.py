@@ -24,6 +24,15 @@ the reshaped tensor is correctly ordered after the producer of the
 underlying source. The event emitter ignores nodes whose ``kernel_name``
 is the empty string.
 
+Persistent states
+-----------------
+A state (src/numeric.py) is read by later nodes, and some nodes update it
+in place (``state_updates()``, e.g. the K / V caches the attention prep ops
+write).  In list order, per state: a read after a write is a RAW edge from
+the writer, a write after reads a WAR edge from each of those readers, and
+a write after a write a WAW edge — so any order that respects the DAG
+keeps every state access where the list put it (TACTICS_PLAN §4.4).
+
 Host ops
 --------
 ``SpaceToDepthNode`` also has an empty ``kernel_name`` (it runs on the
@@ -35,6 +44,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Set, Tuple
+
+
+def _state_updates(sn) -> List:
+    f = getattr(sn, "state_updates", None) or getattr(sn, "state_writes", None)
+    return list(f()) if f else []
+
+
+def _add_state_edges(graph, by_index) -> None:
+    """RAW / WAR / WAW edges of the persistent states, in list order."""
+    states = {t.onnx_name for t in getattr(graph, "state_tensors", [])}
+    if not states:
+        return
+    last_writer: Dict[str, int] = {}
+    readers: Dict[str, List[int]] = {}
+
+    def edge(u: int, v: int) -> None:
+        if u != v:
+            by_index[v].preds.add(u)
+            by_index[u].succs.add(v)
+
+    for sn in graph.nodes:
+        reads = [t.onnx_name for t in sn.inputs if t.onnx_name in states]
+        writes = {t.onnx_name for t in _state_updates(sn)}
+        if sn.output.onnx_name in states:
+            writes.add(sn.output.onnx_name)
+        for s in reads:
+            if s in last_writer:
+                edge(last_writer[s], sn.index)                      # RAW
+            readers.setdefault(s, []).append(sn.index)
+        for s in sorted(writes):
+            for r in readers.get(s, []):
+                edge(r, sn.index)                                   # WAR
+            if s in last_writer:
+                edge(last_writer[s], sn.index)                      # WAW
+            last_writer[s] = sn.index
+            readers[s] = []
 
 
 @dataclass
@@ -62,11 +107,12 @@ class Dag:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_graph(cls, graph) -> "Dag":
+    def from_graph(cls, graph, state_edges: bool = True) -> "Dag":
         """Build a DAG from an :class:`OnnxGraph`.
 
         The graph's ``nodes`` list is the source of truth for ordering and
-        for ``sched.index`` values.
+        for ``sched.index`` values.  ``state_edges`` adds the persistent
+        states' RAW / WAR / WAW edges (see the module docstring).
         """
         externals: Set[str] = {t.onnx_name for t in graph.input_tensors}
         externals.update(t.onnx_name for t in graph.weight_tensors)
@@ -115,6 +161,9 @@ class Dag:
                     continue
                 consumer.preds.add(prod_idx)
                 by_index[prod_idx].succs.add(sn.index)
+
+        if state_edges:
+            _add_state_edges(graph, by_index)
 
         return cls(
             nodes=dag_nodes,

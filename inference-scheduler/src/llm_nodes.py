@@ -337,6 +337,11 @@ class LlmNode(HostNode):
         CPU-dirty: a kernel may read them only after a flush)."""
         return []
 
+    def state_updates(self) -> List:
+        """Every state this op writes in place, host-memory ones included
+        (the DAG's state edges, src/schedule.py)."""
+        return self.state_writes()
+
     def tables(self) -> List[HostTable]:
         return []
 
@@ -663,6 +668,9 @@ class LlmAttentionNode(LlmNode):
 
     def state_writes(self):
         return [t for t in (self.ck, self.cv) if not t.is_host]
+
+    def state_updates(self):
+        return [self.ck, self.cv]
 
     @property
     def q0(self):
@@ -1150,6 +1158,19 @@ class LlmAttnConvNode:
             "    }",
         ])
 
+    def kernel_calls(self, layouts: dict, keys: int = None) -> list:  # noqa: ARG002
+        """The ConvKernel call emit_call() issues (perf_calls.py) at ``keys``
+        keys: the static count, or for a runtime count the one given (default
+        the cache size C, the most a call reads)."""
+        from .perf_calls import KernelCall
+        keys = self.C if (self.static or keys is None) else int(keys)
+        geo = dict(batch=1, in_h=self.out_h, in_w=self.kw * self.out_w, out_h=self.out_h,
+                   out_w=self.out_w, kh=1, kw=self.kw, stride_h=1, stride_w=self.kw,
+                   dilation_h=1, dilation_w=1)
+        if self.kind == "qk":
+            return [KernelCall.of("ConvKernel", in_ch=self.HD // self.kw, out_ch=keys, **geo)]
+        return [KernelCall.of("ConvKernel", in_ch=keys // self.kw, out_ch=self.G * self.T, **geo)]
+
     # ---- simulation ------------------------------------------------------ #
     def reference(self, ins, dtype):
         w, x = ins[0], ins[1]
@@ -1259,11 +1280,15 @@ class LlmAttnSoftmaxNode(LlmNode):
 class LlmAttnMergeNode(LlmNode):
     """FPGA prefill attention, host part 3: the P.V outputs o_g [G*T][HD]
     (raw) -> pv [T][H*HD] in head order, pv[t][(g*G + h')*HD + d] =
-    o_g[h'*T + t][d] (raw, at pv's exponent f_p + f_vc - 8)."""
+    o_g[h'*T + t][d] (raw, at pv's exponent f_p + f_vc - 8).  With the
+    ``row_splits`` attribute R (G = 1: the vision encoder's attention split
+    by query rows, TACTICS_PLAN §4.4) the inputs are o_{g,r} [T/R][HD] in
+    the order g-major, r-minor, split r holding rows r*T/R .. ."""
     T:  int = 1
     H:  int = 1
     KV: int = 1
     HD: int = 16
+    R:  int = 1
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -1271,13 +1296,16 @@ class LlmAttnMergeNode(LlmNode):
         y = _resolve(tensors, node.output[0], node)
         a, H, KV, HD = _heads_attrs(node)
         G = H // KV
-        _require(len(ins) == KV, node, f"{KV} inputs (one per KV group)")
+        R = int(a.get("row_splits", 1))
+        _require(R >= 1 and (R == 1 or G == 1), node, "row_splits needs one head per group")
+        _require(len(ins) == KV * R, node, f"{KV * R} inputs (KV groups x row splits)")
         T = y.numel // (H * HD)
+        _require(T % R == 0, node, f"{T} rows not split in {R}")
         for t in ins:
-            _require(list(t.shape) == [G * T, HD], node, f"inputs must be [{G * T}][{HD}]")
+            _require(list(t.shape) == [G * T // R, HD], node, f"inputs must be [{G * T // R}][{HD}]")
         _require(list(y.shape) == [T, H * HD], node, f"output must be [{T}][{H * HD}]")
         sn = cls(onnx_node=node, inputs=list(ins), output=y, index=index,
-                 align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, F=ctx.frac_bits)
+                 align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, R=R, F=ctx.frac_bits)
         for t in ins + [y]:
             sn._want(t, None, "tensor")
         return sn
@@ -1286,19 +1314,32 @@ class LlmAttnMergeNode(LlmNode):
         return f"{self.KV} groups x {self.H // self.KV} heads x {self.T} rows -> [{self.T}][{self.H * self.HD}]"
 
     def c_call(self, ins, out, scratch, direct, dtype):
-        return [
-            "{",
-            f"    const Data_t *_o[{self.KV}] = {{ {', '.join(ins)} }};",
-            f"    llm_attn_merge(_o, {self.KV}u, {self.H // self.KV}u, {self.T}u, {self.HD}u, {out});",
-            "}",
-        ]
+        if self.R == 1:
+            return [
+                "{",
+                f"    const Data_t *_o[{self.KV}] = {{ {', '.join(ins)} }};",
+                f"    llm_attn_merge(_o, {self.KV}u, {self.H // self.KV}u, {self.T}u, {self.HD}u, {out});",
+                "}",
+            ]
+        rows = self.T // self.R
+        lines = ["{"]
+        for r in range(self.R):
+            part = [ins[g * self.R + r] for g in range(self.KV)]
+            lines += [f"    const Data_t *_o{r}[{self.KV}] = {{ {', '.join(part)} }};",
+                      f"    llm_attn_merge(_o{r}, {self.KV}u, 1u, {rows}u, {self.HD}u, "
+                      f"{out} + {r * rows * self.H * self.HD}u);"]
+        return lines + ["}"]
 
     def reference(self, ins, dtype):
-        T, H, KV, HD = self.T, self.H, self.KV, self.HD
+        T, H, KV, HD, R = self.T, self.H, self.KV, self.HD, self.R
         G = H // KV
         raw = np.zeros((T, H, HD))
         for g in range(KV):
-            o = np.asarray(ins[g], np.float64).reshape(G, T, HD)
+            if R > 1:
+                o = np.concatenate([np.asarray(ins[g * R + r], np.float64).reshape(T // R, HD)
+                                    for r in range(R)]).reshape(1, T, HD)
+            else:
+                o = np.asarray(ins[g], np.float64).reshape(G, T, HD)
             for hh in range(G):
                 raw[:, g * G + hh] = o[hh]
         f = self.output.exp_channels(self.F).astype(np.float64)

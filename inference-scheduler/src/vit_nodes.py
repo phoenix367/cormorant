@@ -414,12 +414,17 @@ class VitAttnPrepNode(VitNode):
 
 @dataclass
 class VitAttnSoftmaxNode(VitNode):
-    """s [C][T] raw scores (at f_s) -> P [T][C] raw at 2^-f_p, every key."""
+    """s [C][T] raw scores (at f_s) -> P [T][C] raw at 2^-f_p, every key; with
+    the ``cols`` attribute [c0, n] only the query columns c0 .. c0 + n - 1
+    -> P [n][C] (one part of a softmax split by query rows,
+    TACTICS_PLAN §4.4)."""
     T:     int = 1
     C:     int = 16
     scale: float = 1.0
     fs:    int = 8
     fp:    int = 12
+    c0:    int = 0
+    nc:    int = 0
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -427,11 +432,14 @@ class VitAttnSoftmaxNode(VitNode):
         y = _resolve(tensors, node.output[0], node)
         a = _attrs(node)
         C, T = int(s.shape[0]), int(s.shape[1])
-        _require(len(s.shape) == 2 and list(y.shape) == [T, C], node, f"scores [C][T] -> P [{T}][{C}]")
+        c0, nc = (_attr_ints(a, "cols", node, 2) if "cols" in a else (0, T))
+        _require(0 <= c0 and 0 < nc and c0 + nc <= T, node, f"cols [{c0}, {nc}] outside {T}")
+        _require(len(s.shape) == 2 and list(y.shape) == [nc, C], node,
+                 f"scores [C][T] -> P [{nc}][{C}]")
         sn = cls(onnx_node=node, inputs=[s], output=y, index=index, align_elems=align_elems,
                  T=T, C=C, scale=1.0 / math.sqrt(int(a["head_dim"])),
                  fs=_attr_ints(a, "s_exp", node, 1)[0], fp=_attr_ints(a, "p_exp", node, 1)[0],
-                 F=ctx.frac_bits)
+                 c0=c0, nc=nc, F=ctx.frac_bits)
         sn._want(s, None, "scores")
         sn._want(y, None, "output")
         return sn
@@ -439,15 +447,31 @@ class VitAttnSoftmaxNode(VitNode):
     def c_runtime(self):
         return [sexp2_item(self.fs, self.scale)]
 
+    @property
+    def split(self) -> bool:
+        return (self.c0, self.nc) != (0, self.T)
+
+    def host_features(self):
+        """The host-op model's work of this node (src/host_model.py): the
+        scores of its columns only."""
+        return {"in_elems": float(self.nc * self.C), "out_elems": float(self.nc * self.C),
+                "rows": float(self.nc)}
+
     def describe(self):
-        return f"{self.T} query columns x {self.C} keys, score exponent {self.fs}, P at 2^-{self.fp}"
+        cols = f" (columns {self.c0}..{self.c0 + self.nc - 1})" if self.split else ""
+        return (f"{self.T} query columns{cols} x {self.C} keys, score exponent {self.fs}, "
+                f"P at 2^-{self.fp}")
 
     def c_call(self, ins, out, scratch, direct, dtype):
+        if self.split:
+            return [f"vit_attn_softmax_cols({ins[0]}, {self.T}u, {self.C}u, {self.c0}u, {self.nc}u, "
+                    f"{self.fs}, {float(2.0 ** self.fp)!r}, {out});"]
         return [f"vit_attn_softmax({ins[0]}, {self.T}u, {self.C}u, {self.fs}, "
                 f"{float(2.0 ** self.fp)!r}, {out});"]
 
     def reference(self, ins, dtype):
         raw = np.asarray(ins[0], np.float64).T.astype(np.int64)          # [T][C]
+        raw = raw[self.c0:self.c0 + self.nc]
         m = raw.max(-1, keepdims=True)
         e = sexp2_table(self.fs, self.scale)[m - raw]
         p = e / np.cumsum(e, -1)[..., -1:]
@@ -962,6 +986,7 @@ typedef struct {
     const double *tab;              /* T_hi[256], T_lo[256] */
     double        ip;
     unsigned      T, C, nblk;
+    unsigned      c0, nc;           /* the query columns done: c0 .. c0 + nc - 1 */
 } vit_smx_t;
 
 static inline Data_t vit_smx_rnd(double e, double rinv, double sum, double ip)
@@ -1057,7 +1082,9 @@ static void vit_smx_items(void *pp, unsigned i0, unsigned i1)
         return;
     }
     for (it = i0; it < i1; it++) {
-        const unsigned c0 = it * LLM_SMX_CB, nc = c0 + LLM_SMX_CB < T ? LLM_SMX_CB : T - c0;
+        /* block columns b0 .. b0 + nc - 1 of the range: s columns a->c0 + b0 .., P rows b0 .. */
+        const unsigned b0 = it * LLM_SMX_CB, nc = b0 + LLM_SMX_CB < a->nc ? LLM_SMX_CB : a->nc - b0;
+        const unsigned c0 = a->c0 + b0;
         unsigned       k, j = 0u;
 #ifdef VIT_SMX_NEON
         if (nc == LLM_SMX_CB)
@@ -1084,7 +1111,7 @@ static void vit_smx_items(void *pp, unsigned i0, unsigned i1)
             const int      m0 = vit_smx_max(r0, C), m1 = vit_smx_max(r1, C);
             const int      m2 = vit_smx_max(r2, C), m3 = vit_smx_max(r3, C);
             double         s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
-            Data_t        *p0 = a->p + (size_t)(c0 + k) * C;
+            Data_t        *p0 = a->p + (size_t)(b0 + k) * C;
             for (j = 0u; j < C; j++) {
                 const unsigned k0 = (unsigned)(m0 - r0[j]), k1 = (unsigned)(m1 - r1[j]);
                 const unsigned k2 = (unsigned)(m2 - r2[j]), k3 = (unsigned)(m3 - r3[j]);
@@ -1108,19 +1135,26 @@ static void vit_smx_items(void *pp, unsigned i0, unsigned i1)
                 eb[j] = hi[kk >> 8] * lo[kk & 255u];
                 sum += eb[j];
             }
-            vit_smx_round(eb, sum, a->ip, C, a->p + (size_t)(c0 + k) * C);
+            vit_smx_round(eb, sum, a->ip, C, a->p + (size_t)(b0 + k) * C);
         }
     }
     free(tl);
     free(eb);
 }
 
-static void vit_attn_softmax(const Data_t *s, unsigned T, unsigned C, int fs, double ip, Data_t *p)
+static void vit_attn_softmax_cols(const Data_t *s, unsigned T, unsigned C, unsigned c0,
+                                  unsigned nc, int fs, double ip, Data_t *p)
 {
     vit_smx_t a;
     a.s = s; a.p = p; a.tab = _vit_sexp_tab[fs - VIT_SEXP_EMIN]; a.ip = ip; a.T = T; a.C = C;
-    a.nblk = (T + LLM_SMX_CB - 1u) / LLM_SMX_CB;
+    a.c0 = c0; a.nc = nc;
+    a.nblk = (nc + LLM_SMX_CB - 1u) / LLM_SMX_CB;
     host_parallel(vit_smx_items, &a, a.nblk, 1u, 1u);
+}
+
+static void vit_attn_softmax(const Data_t *s, unsigned T, unsigned C, int fs, double ip, Data_t *p)
+{
+    vit_attn_softmax_cols(s, T, C, 0u, T, fs, ip, p);
 }
 
 /* ---- VitGelu: a = round_half_even(gelu(r * 2^-fx) * 2^fa), r = sat16(raw +

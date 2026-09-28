@@ -201,17 +201,34 @@ def _geometry_plans(mm: MatmulNode, kw_options: Sequence[int], conv_n: int,
     return plans
 
 
-def conv_plans(mm: MatmulNode, kw_options: Sequence[int]) -> List[ConvPlan]:
+def conv_plans(mm: MatmulNode, kw_options: Sequence[int],
+               splits: str = "auto") -> List[ConvPlan]:
     """Every admissible (kw, out_w) geometry for ``mm``, cheapest first —
     or, when every one of them is accumulator-limited and the rows are
     contiguous (one call, ConvKernel batch 1), the row-split plans that
-    are not, cheapest first, ahead of them ("Row split" above)."""
+    are not, cheapest first, ahead of them ("Row split" above).
+
+    ``splits="all"`` (the planner's candidates, src/tactics.py): every
+    one-call plan and every row-split plan of a contiguous-rows MatMul,
+    accumulator-limited or not, cheapest first."""
     bm = _batch_mode(mm)
     if bm is None:
         return []
     conv_n, conv_batch, calls, a_cs, b_cs, c_cs = bm
     plans = _geometry_plans(mm, kw_options, *bm)
-    if not plans or not all(p.acc_limited for p in plans) or calls != 1 or conv_batch != 1:
+    contiguous = calls == 1 and conv_batch == 1
+    if splits == "all":
+        if not contiguous:
+            return plans
+        out = list(plans)
+        for rows in _divisors(conv_n):
+            if rows == conv_n or rows % CONV_TILE_M:
+                continue
+            out += _geometry_plans(mm, kw_options, rows, 1, conv_n // rows,
+                                   rows * mm.k, 0, rows * mm.m)
+        out.sort(key=lambda p: (p.cycles, p.kw, -p.out_w, -p.conv_n))
+        return out
+    if not plans or not all(p.acc_limited for p in plans) or not contiguous:
         return plans
     split: List[ConvPlan] = []
     for rows in _divisors(conv_n):
@@ -236,10 +253,84 @@ def _readers(nodes) -> Dict[str, list]:
     return readers
 
 
+# Planning (--plan): a tactic replaces the baseline only when the model
+# prices it this much below (TACTICS_PLAN §4.1: no churn on noise).
+PLAN_MIN_GAIN = 0.03
+
+
+def plan_conv_calls(mm, p: ConvPlan) -> list:
+    """The ConvKernel calls of plan ``p`` for MatMul ``mm`` (perf_calls.py)."""
+    from .perf_calls import KernelCall
+    return [KernelCall.of("ConvKernel", count=p.calls, batch=p.conv_batch, in_ch=mm.k // p.kw,
+                          in_h=p.out_h, in_w=p.kw * p.out_w, out_ch=p.conv_n, out_h=p.out_h,
+                          out_w=p.out_w, kh=1, kw=p.kw, stride_h=1, stride_w=p.kw,
+                          dilation_h=1, dilation_w=1)]
+
+
+def plan_tiled_calls(mm, packed: bool) -> list:
+    """MatmulKernel's tiled call for ``mm`` (B packed when ``packed``)."""
+    from .nodes import matmul_packed_m
+    from .perf_calls import KernelCall
+    b_stride = (mm.b_batch_stride // (mm.k * mm.m) * matmul_packed_m(mm.m) * mm.k
+                if packed and mm.b_batch_stride else mm.b_batch_stride)
+    return [KernelCall.of("MatmulKernel", n=mm.n, k=mm.k, m=mm.m, batch=mm.batch,
+                          a_stride=mm.a_batch_stride, b_stride=b_stride,
+                          c_stride=mm.c_batch_stride, b_packed=int(packed), gemv_kw=0)]
+
+
+def _plan_label(p: Optional[ConvPlan]) -> str:
+    if p is None:
+        return "MatmulKernel tiled"
+    return (f"ConvKernel kw={p.kw} out_w={p.out_w}"
+            + (f" {p.calls}x{p.conv_n} rows" if p.calls > 1 else ""))
+
+
+def _plan_matmul(sn, baseline: Optional[ConvPlan], kws, mode: str, perf_model,
+                 plan_log: Optional[list]) -> Optional[ConvPlan]:
+    """The planned conv plan for ``sn`` (None: MatmulKernel tiled)."""
+    from .perf_model import clearly_faster
+    packed = sn.inputs[1].data is not None
+    cands: List[Tuple[Optional[Tuple[float, float]], Optional[ConvPlan]]] = []
+    for p in conv_plans(sn, kws, splits="all"):
+        cands.append((perf_model.calls_band(plan_conv_calls(sn, p)), p))
+    if mode != "always":
+        cands.append((perf_model.calls_band(plan_tiled_calls(sn, packed)), None))
+    base = (perf_model.calls_band(plan_conv_calls(sn, baseline)) if baseline is not None
+            else perf_model.calls_band(plan_tiled_calls(sn, packed)))
+    priced = [(b, p) for b, p in cands if b is not None]
+    chosen, why = baseline, "baseline"
+    best = min(priced, key=lambda bp: (bp[0][0], bp[1] is not None and bp[1].kw,
+                                        bp[1] is not None and -bp[1].out_w)) if priced else None
+    if base is None:
+        why = "baseline not priced"
+    elif best is not None and best[1] != baseline:
+        # the fastest candidate that may replace the baseline (perf_model.clearly_faster)
+        ok = [bp for bp in priced if bp[1] != baseline and clearly_faster(bp[0], base, PLAN_MIN_GAIN)]
+        if ok:
+            b2 = min(ok, key=lambda bp: (bp[0][0], bp[1] is not None and bp[1].kw,
+                                         bp[1] is not None and -bp[1].out_w))
+            chosen, why, best = b2[1], "planned", b2
+        elif best[0][0] < base[0]:
+            from .perf_model import MAX_MODEL_ERROR
+            why = ("gain below the minimum" if best[0][0] >= base[0] * (1.0 - PLAN_MIN_GAIN)
+                   else "predicted by a model outside its trust" if best[0][1] > MAX_MODEL_ERROR
+                   else "gain within the error band")
+    if plan_log is not None:
+        plan_log.append({"node": sn.index, "name": sn.onnx_node.name or f"MatMul_{sn.index}",
+                         "baseline": _plan_label(baseline), "chosen": _plan_label(chosen),
+                         "baseline_us": base[0] if base else None,
+                         "best_us": best[0][0] if best else None,
+                         "chosen_us": (best[0][0] if best is not None and chosen is best[1]
+                                       else base[0] if base else None),
+                         "decision": why, "candidates": len(cands), "priced": len(priced)})
+    return chosen
+
+
 def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = True,
                   graph_io: Sequence[str] = (),
                   kw_override: Optional[Dict[str, int]] = None,
-                  kw_choices: Optional[Sequence[int]] = None) -> Tuple[list, dict]:
+                  kw_choices: Optional[Sequence[int]] = None,
+                  perf_model=None, plan_log: Optional[list] = None) -> Tuple[list, dict]:
     """Return ``(new_nodes, stats)``: ``nodes`` with every MatmulNode that
     should run on ConvKernel replaced by a MatmulConvNode (same index,
     inputs and output), and the constant Bs that use a ``kw > 1`` layout
@@ -251,7 +342,15 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
     listed weights — a multi-entry project's graphs must re-lay out a
     shared weight identically for it to stay one buffer.  ``kw_choices``
     limits the widths a re-laid-out B may take (the LLM projects pass the
-    ones MatmulKernel's GEMV decode can read as well, matmul_gemv.py)."""
+    ones MatmulKernel's GEMV decode can read as well, matmul_gemv.py).
+
+    ``perf_model`` (planning, src/perf_model.py): every MatMul's choice
+    above is its baseline; the planner prices the baseline and every other
+    tactic (each conv geometry and row split with the allowed kernel widths,
+    and MatmulKernel's tiled path unless ``mode == "always"``) and takes the
+    cheapest one when it is priced at least ``PLAN_MIN_GAIN`` below the
+    baseline; a baseline the model cannot price is kept.  Each decision is
+    appended to ``plan_log``."""
     mode = normalize_mode(mode)
     kw_override = kw_override or {}
     stats = {"lowered": 0, "kept": 0, "conv_calls": 0,
@@ -285,11 +384,18 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
             kws = [k for k in kws if k == kw_override[b.onnx_name]]
         plans = conv_plans(sn, kws)
         mm_cyc = matmul_plan_cycles(sn)
-        if not plans or (mode == "auto" and plans[0].cycles >= LOWER_MARGIN * mm_cyc):
+        keep = not plans or (mode == "auto" and plans[0].cycles >= LOWER_MARGIN * mm_cyc)
+        p = None if keep else plans[0]
+        if perf_model is not None:
+            # a weight shared with other entries (pinned width) keeps one image:
+            # no MatmulKernel candidate unless that is already the baseline
+            pinned = b.onnx_name in kw_override and p is not None
+            p = _plan_matmul(sn, p, kws, "always" if pinned else mode, perf_model, plan_log)
+            keep = p is None
+        if keep:
             stats["kept"] += 1
             out.append(sn)
             continue
-        p = plans[0]
         if p.kw > 1:
             if not relayout_ok:                      # pragma: no cover — kw_options
                 raise SchedulerError("internal: kw > 1 for a B that cannot be re-laid out")
@@ -328,4 +434,7 @@ __all__ = (
     "conv_plans",
     "matmul_plan_cycles",
     "lower_matmuls",
+    "PLAN_MIN_GAIN",
+    "plan_conv_calls",
+    "plan_tiled_calls",
 )

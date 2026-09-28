@@ -409,6 +409,12 @@ def main(argv=None) -> int:
                     for ph, p in pres["profiles"].items()}
                 results["profile_runs"] = {"prompts": pres["prompts"], "prefill": pres["prefill"],
                                            "summary": pres.get("llm_summary")}
+                # per layer, for the performance models (inference-scheduler
+                # TACTICS_PLAN §4.4): the called layers of every phase
+                results["profile_layers"] = {
+                    ph: [{k: ly[k] for k in ("i", "name", "calls", "mean_us", "min_us", "total_us")
+                          if k in ly} for ly in p.get("layers", []) if ly.get("calls")]
+                    for ph, p in pres["profiles"].items()}
             if not args.no_lib_check:
                 sftp.put(os.path.join(HERE, "llm_lib_check.py"), f"{RUN_DIR}/llm_lib_check.py")
                 out, err, rc = session.exec(f"cd {RUN_DIR} && python3 llm_lib_check.py "

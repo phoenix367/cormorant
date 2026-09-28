@@ -156,7 +156,7 @@ def sudo(cfg: dict) -> str:
 
 # ── host side: the generated project ─────────────────────────────────────────
 
-def ensure_project(cfg: dict, regenerate: bool) -> dict:
+def ensure_project(cfg: dict, regenerate: bool, plan: bool = False) -> dict:
     summary = bert_common.PROJECT_SUMMARY
     fresh = False
     if summary.exists():
@@ -167,7 +167,7 @@ def ensure_project(cfg: dict, regenerate: bool) -> dict:
     if regenerate or not fresh:
         print(_bold("\nGenerating the BERT project") + _dim(" (demo/bert_squad/scripts/generate_project.py)"))
         import generate_project
-        rc = generate_project.main(["--config", cfg["_bert_path"]])
+        rc = generate_project.main(["--config", cfg["_bert_path"]] + (["--plan"] if plan else []))
         if rc != 0:
             sys.exit(rc)
     s = json.loads(summary.read_text())
@@ -548,6 +548,9 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None)
     ap.add_argument("--regenerate", action="store_true", help="regenerate the BERT project first")
+    ap.add_argument("--plan", action="store_true",
+                    help="with --regenerate: plan the BERT project from the bitstream's performance "
+                         "model (doc/plans/TACTICS_PLAN.md; or \"plan\": true in the BERT config)")
     ap.add_argument("--rebuild", action="store_true", help="rebuild libbert_squad.so even if unchanged")
     ap.add_argument("--hold", action="store_true",
                     help="keep the board lock, follow the log, stop the server on Ctrl-C / SIGTERM")
@@ -578,7 +581,7 @@ def main(argv=None) -> int:
         finally:
             session.close()
 
-    summary = ensure_project(cfg, args.regenerate) if not args.check_only else None
+    summary = ensure_project(cfg, args.regenerate, args.plan) if not args.check_only else None
     lock = None if args.no_lock else cfg["board_lock"]
     stop_on_exit = False
     with board_lock(lock):

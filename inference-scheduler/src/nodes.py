@@ -505,6 +505,21 @@ class ScheduledNode:
             f" {n}u, {a_inc}, {b_inc}{act});"
         )
 
+    def kernel_calls(self, layouts: dict) -> list:
+        """The VectorOPKernel call emit_call() issues (perf_calls.py)."""
+        from .perf_calls import KernelCall
+        if self.outer_count == 1:
+            y_lay = layouts.get(self.output.onnx_name)
+            size = y_lay.alloc if y_lay is not None else self.chunk_size
+            return [KernelCall.of("VectorOPKernel", op=self.op_code, size=size, outer=1,
+                                  act=self.act)]
+        stride = self.aligned_chunk_size
+        return [KernelCall.of("VectorOPKernel", op=self.op_code, size=self.chunk_size,
+                              outer=self.outer_count,
+                              a_inc=stride if self.a_advances else 0,
+                              b_inc=stride if (self.arity == 2 and self.b_advances) else 0,
+                              act=self.act)]
+
 
 # ------------------------------------------------------------------ #
 # MatmulNode                                                           #
@@ -960,6 +975,29 @@ class MatmulNode:
             f" {self.c_batch_stride}u, {int(self.b_packed)}u, {self.gemv_kw}u);",
             "    }",
         ])
+
+    def kernel_calls(self, layouts: dict) -> list:
+        """The MatmulKernel call(s) emit_call() issues (perf_calls.py)."""
+        from .perf_calls import KernelCall
+        common = dict(b_packed=int(self.b_packed), gemv_kw=self.gemv_kw)
+        if self.outer_count == 1:
+            a_lay = layouts.get(self.inputs[0].onnx_name)
+            y_lay = layouts.get(self.output.onnx_name)
+            a_row_stride = a_lay.stride if (a_lay and a_lay.gap > 0) else 0
+            c_row_stride = y_lay.stride if (y_lay and y_lay.gap > 0) else 0
+            if a_row_stride != 0 or c_row_stride != 0:
+                return [KernelCall.of("MatmulKernel", n=1, k=self.k, m=self.m, batch=self.n,
+                                      a_stride=a_row_stride or self.k,
+                                      b_stride=self.b_batch_stride,
+                                      c_stride=c_row_stride or self.m, **common)]
+            return [KernelCall.of("MatmulKernel", n=self.n, k=self.k, m=self.m,
+                                  batch=self.batch, a_stride=self.a_batch_stride,
+                                  b_stride=self.b_batch_stride, c_stride=self.c_batch_stride,
+                                  **common)]
+        return [KernelCall.of("MatmulKernel", count=self.outer_count, n=self.n, k=self.k,
+                              m=self.m, batch=self.batch, a_stride=self.a_batch_stride,
+                              b_stride=self.b_batch_stride, c_stride=self.c_batch_stride,
+                              **common)]
 
 
 # ------------------------------------------------------------------ #
@@ -1422,6 +1460,18 @@ class ConvNode:
             f" {self.pad_top}u, {self.pad_left}u, {hb}, {idw});"
         )
 
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        """The ConvKernel call emit_call() issues (perf_calls.py)."""
+        from .perf_calls import KernelCall
+        return [KernelCall.of("ConvKernel", batch=self.batch, in_ch=self.in_ch,
+                              in_h=self.in_h, in_w=self.in_w, out_ch=self.out_ch,
+                              out_h=self.out_h, out_w=self.out_w, kh=self.kh, kw=self.kw,
+                              stride_h=self.stride_h, stride_w=self.stride_w,
+                              dilation_h=self.dilation_h, dilation_w=self.dilation_w,
+                              pad_top=self.pad_top, pad_left=self.pad_left,
+                              has_bias=int(bool(self.has_bias)),
+                              is_dw=int(bool(self.is_depthwise)))]
+
 
 # ------------------------------------------------------------------ #
 # MatmulConvNode — a MatMul lowered onto ConvKernel                    #
@@ -1588,6 +1638,15 @@ class MatmulConvNode:
             f"                    {body});",
             "    }",
         ])
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        """The ConvKernel call(s) emit_call() issues (perf_calls.py)."""
+        from .perf_calls import KernelCall
+        return [KernelCall.of("ConvKernel", count=self.calls, batch=self.conv_batch,
+                              in_ch=self.in_ch, in_h=self.in_h, in_w=self.in_w,
+                              out_ch=self.conv_n, out_h=self.out_h, out_w=self.out_w,
+                              kh=1, kw=self.kw, stride_h=1, stride_w=self.kw,
+                              dilation_h=1, dilation_w=1)]
 
 
 # ------------------------------------------------------------------ #
@@ -1951,6 +2010,18 @@ class PoolNode:
             f"             {self.pool_type}u, {self.lp_order}u,"
             f" {self.count_include_pad}u);"
         )
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        """The PoolingKernel call emit_call() issues (perf_calls.py)."""
+        from .perf_calls import KernelCall
+        return [KernelCall.of("PoolKernel", batch=self.batch, channels=self.channels,
+                              in_h=self.in_h, in_w=self.in_w, out_h=self.out_h,
+                              out_w=self.out_w, pool_h=self.pool_h, pool_w=self.pool_w,
+                              stride_h=self.stride_h, stride_w=self.stride_w,
+                              pad_top=self.pad_top, pad_left=self.pad_left,
+                              dil_h=self.dil_h, dil_w=self.dil_w, pool_type=self.pool_type,
+                              lp_order=self.lp_order,
+                              count_include_pad=int(bool(self.count_include_pad)))]
 
 
 # ------------------------------------------------------------------ #

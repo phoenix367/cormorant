@@ -40,6 +40,7 @@ from src.codegen          import CodeGenerator
 from src.codegen._simulate import LARGE_EXPECTED_THRESHOLD
 from src.kernels           import KERNEL_REGISTRY, mixed_driver_readme
 from src.nodes            import SchedulerError
+from src.planning         import add_plan_args, plan_options_from_args
 from src.report           import ReportGenerator
 from src.tensor           import LARGE_WEIGHT_THRESHOLD
 
@@ -199,6 +200,7 @@ def parse_args(argv=None):
             "kernels.matmul.gemv_max_m > 0.  Bit-identical results either way."
         ),
     )
+    add_plan_args(p)
     return p.parse_args(argv)
 
 
@@ -239,7 +241,7 @@ def main_multi(args) -> int:
         try:
             g = OnnxGraph(path, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv)
+                          matmul_gemv=args.matmul_gemv, plan=plan_options_from_args(args))
         except (FileNotFoundError, SchedulerError) as e:
             print(f"error: entry {name}: {e}", file=sys.stderr)
             return 1
@@ -301,7 +303,8 @@ def main(argv=None):
         graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns,
                           matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv)
+                          matmul_gemv=args.matmul_gemv,
+                          plan=plan_options_from_args(args))
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

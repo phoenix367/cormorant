@@ -489,7 +489,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Keep remote build directory after run")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print error details for failed cases")
+    p.add_argument("--json", metavar="OUT", default=None,
+                   help="Also write the results as JSON: one entry per case with the "
+                        "kernel, label, the case's fields, ok, lat_ms and the metric")
     return p.parse_args(argv)
+
+
+def write_json(path: str, results: List["BenchResult"]) -> None:
+    """The results as a JSON list (the calibration / planning tools read it)."""
+    out = []
+    for r in results:
+        fields = dict(zip(_CASE_FIELDS[r.case.kernel], (int(a) for a in r.case.args), strict=True))
+        out.append({"kernel": r.case.kernel, "label": r.case.label, "fields": fields,
+                    "warmup": r.case.warmup, "ok": r.ok, "lat_ms": r.lat_ms if r.ok else None,
+                    r.metric_key or "metric": r.metric if r.ok else None})
+    Path(path).write_text(json.dumps(out, indent=1) + "\n")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -591,6 +605,9 @@ def main(argv=None) -> int:
             print(f"\n{_dim('Remote build kept at: '+ build_dir)}")
 
         print_report(results, verbose=args.verbose)
+        if args.json:
+            write_json(args.json, results)
+            print(f"results: {args.json}")
         return 0 if all(r.ok for r in results) else 1
 
     finally:

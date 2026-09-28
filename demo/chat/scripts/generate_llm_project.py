@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-generate_llm_project.py — schedule SmolLM2-135M-Instruct (any Llama-family
-checkpoint with a formats JSON) into the multi-entry KV260 project behind
-libsmollm2.so (doc/plans/CHAT_PLAN.md phase 3).
+generate_llm_project.py — schedule a Llama-family checkpoint with a formats
+JSON (SmolLM2-135M / 360M-Instruct; SmolVLM-256M-Instruct with its vision
+entry) into the multi-entry KV260 project behind the chat library
+(libsmollm2.so, doc/plans/CHAT_PLAN.md phase 3, §20, §23).
 
   1. src/llama.py frontend: config.json + model.safetensors + the calibrated
      formats (llm_study.py formats, policy pow2+sink+p12) -> entry graphs
@@ -12,12 +13,14 @@ libsmollm2.so (doc/plans/CHAT_PLAN.md phase 3).
      decode attention the xattn host region, the KV caches DMA states in the
      CMA pool; --prefill-attn host: phase 3's xattn everywhere
      (pow2+sink+p12+xattn), host-memory caches.
-  2. inference-scheduler: OnnxGraph per entry (the decode step and the head
-     are N = 1 MatMuls -> MatmulKernel with packed B; the prefill buckets use
-     the MatMul-on-ConvKernel lowering where the cost model says it wins,
-     every bucket with the same kernel width per weight so they share one
-     re-laid-out copy; --prefill-engine matmul keeps prefill on MatmulKernel
-     and the decode copy: one weight copy, slower prefill).
+  2. inference-scheduler: OnnxGraph per entry (src/llm_entries.py: the
+     prefill buckets use the MatMul-on-ConvKernel lowering where the cost
+     model says it wins, every bucket with the same kernel width per weight;
+     the decode step and the head are N = 1 MatMuls on MatmulKernel's GEMV
+     path reading that same image — one copy of every weight, CHAT_PLAN §19;
+     --prefill-engine matmul keeps prefill on MatmulKernel.  A VLM
+     (--assets of SmolVLM) adds the `vision` entry, src/vit.py.  --plan and
+     the other planning options: doc/plans/TACTICS_PLAN.md).
   3. src/codegen/multi.py: ONE project, weights deduplicated, the KV cache /
      sink and h_last as shared states -> <out>/ (CMake project, weights/*.dat
      incl. the host tables: the bf16 embedding, RoPE cos / sin).
@@ -28,9 +31,10 @@ libsmollm2.so (doc/plans/CHAT_PLAN.md phase 3).
      and project.json (summary).
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/generate_llm_project.py
+           [--model-name smollm2-135m-instruct] [--assets DIR] [--formats JSON]
            [--out-dir demo/chat/build/llm_project] [--buckets 16,64,256]
            [--prefill-engine conv|matmul] [--prefill-attn fpga|host] [--no-weights]
-           [--driver-dirs JSON]
+           [--driver-dirs JSON] [--plan ...]
 """
 
 from __future__ import annotations
@@ -57,6 +61,7 @@ from src.llm_nodes import (LlmAttentionNode, LlmAttnConvNode,      # noqa: E402
                            LlmDequantNode, LlmEmbedNode, LlmResAddNode, LlmRMSNormNode,
                            LlmSelectRowNode, LlmSiluMulNode)
 from src.nodes import MatmulConvNode, MatmulNode                   # noqa: E402
+from src.planning import add_plan_args, plan_options_from_args      # noqa: E402
 from src.vit_nodes import (VitAttnPrepNode, VitAttnSoftmaxNode,    # noqa: E402
                            VitEmbedAddNode, VitGeluNode, VitLayerNormNode, VitPixelShuffleNode,
                            VitResAddNode, VitSumDequantNode)
@@ -112,11 +117,11 @@ def node_kind(sn) -> str:
     return "other host" if isinstance(sn, HostNode) else "other"
 
 
-def build_entries(models: dict, prefill_engine: str, log=print):
+def build_entries(models: dict, prefill_engine: str, log=print, plan=None):
     """[(name, OnnxGraph)]: decode, the prefill buckets, head — one copy of
     every weight where MatmulKernel's GEMV path can read the prefill image
-    (src/llm_entries.py)."""
-    return entry_graphs(models, prefill_engine=prefill_engine, log=log)
+    (src/llm_entries.py); ``plan`` = the planning options (src/planning.py)."""
+    return entry_graphs(models, prefill_engine=prefill_engine, log=log, plan=plan)
 
 
 def populate_drivers(out: str, driver_dirs: dict, active) -> list:
@@ -290,7 +295,7 @@ def driver_dirs_from_config(path: str) -> dict:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
+    ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=None,
                     help="default: build/llm_project (SmolLM2-135M), "
@@ -309,6 +314,7 @@ def main(argv=None) -> int:
     ap.add_argument("--driver-dirs", default=None,
                     help="JSON {kernel: dir}; default: local.driver_dirs of "
                          "demo/bert_squad/bert_squad_config.json")
+    add_plan_args(ap)
     args = ap.parse_args(argv)
     if args.assets is None and args.model_name == vp.MODEL:
         args.assets = vp.default_assets()
@@ -343,7 +349,7 @@ def main(argv=None) -> int:
         models = lp.entry_models(fe, buckets)
         del W
     entries = build_entries(models, args.prefill_engine,
-                            log=lambda m: print(m, flush=True))
+                            log=lambda m: print(m, flush=True), plan=plan_options_from_args(args))
     del models
     mg = MultiEntryGenerator(entries, args.model_name.replace("-", "_").replace(".", "_"))
     out = os.path.abspath(args.out_dir)

@@ -24,7 +24,10 @@ import onnx.helper as onnx_helper
 import onnx.numpy_helper as nph
 from onnx import shape_inference, TensorProto
 
-from typing import Union
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from .planning import PlanOptions
 from .tensor import TensorInfo
 from .nodes  import (
     ACT_NONE, _pack_matmul_b, _s2d_stem_geometry, _s2d_stem_weight,
@@ -445,7 +448,8 @@ class OnnxGraph:
                  matmul_conv_kw: "Dict[str, int]" = None,
                  matmul_conv_kws: "Sequence[int]" = None,
                  matmul_gemv="auto",
-                 matmul_gemv_kw: "Dict[str, int]" = None) -> None:
+                 matmul_gemv_kw: "Dict[str, int]" = None,
+                 plan: "PlanOptions" = None) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -493,6 +497,10 @@ class OnnxGraph:
         ``self.matmul_gemv_stats`` reports ``{"gemv", "kw>1",
         "tiled_cycles", "gemv_cycles"}``.
 
+        plan: the opt-in planning mode (src/planning.py, doc/plans/
+        TACTICS_PLAN.md).  ``None`` / disabled: every choice as without
+        planning (the default); ``self.plan`` keeps the options.
+
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
         per output (``self.split_lowered_count``).
@@ -503,6 +511,8 @@ class OnnxGraph:
         tensors, states — src/numeric.py) are applied to the tensors; nodes
         of the ``axi.llm`` domain are the host ops of src/llm_nodes.py.
         """
+        from .planning import PlanOptions
+        self.plan = plan if plan is not None else PlanOptions()
         if isinstance(model_path, onnx.ModelProto):
             model = model_path
         else:
@@ -673,18 +683,32 @@ class OnnxGraph:
         self.weights_saturated = numeric.encode_matmul_weights(self._nodes, _dtype) \
             if numeric.is_active(self.numeric) else {}
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
+        perf_model, self.plan_log = None, []
+        if self.plan.enabled:
+            from .planning import PlanError, resolve_perf_model
+            try:
+                perf_model = resolve_perf_model(self.plan)
+            except PlanError as e:
+                raise SchedulerError(str(e)) from None
+        self.perf_model = perf_model
         self._nodes, self.matmul_conv_stats = matmul_lowering.lower_matmuls(
             self._nodes, mode=matmul_on_conv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
             graph_io=self._input_names + self._output_names,
-            kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws)
+            kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws,
+            perf_model=perf_model, plan_log=self.plan_log)
         self.matmul_gemv_stats = choose_gemv(
             self._nodes, mode=matmul_gemv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
             graph_io=self._input_names + self._output_names,
-            kw_hint=matmul_gemv_kw)
+            kw_hint=matmul_gemv_kw, perf_model=perf_model, plan_log=self.plan_log)
         self._pack_matmul_weights()
         self._choose_slice_views()
+        self.order_log = None
+        if self.plan.enabled:
+            # the issue order from the timed simulation (src/order_search.py)
+            from .order_search import plan_order
+            plan_order(self)
 
     # ------------------------------------------------------------------ #
     # Integer tensors / Slice views                                        #

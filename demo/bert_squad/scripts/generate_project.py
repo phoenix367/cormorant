@@ -82,12 +82,12 @@ def build_graph(model: Path):
     return g, CodeGenerator(graph=g, model_path=str(model))
 
 
-def run_scheduler(model: Path, out_dir: Path) -> None:
+def run_scheduler(model: Path, out_dir: Path, plan=None) -> None:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
     from inference_scheduler import main as sched_main
-    rc = sched_main(["--out-dir", str(out_dir), str(model)])
+    rc = sched_main(["--out-dir", str(out_dir), *(plan.argv() if plan else []), str(model)])
     if rc != 0:
         raise RuntimeError(f"inference-scheduler failed for {model} (rc={rc})")
 
@@ -296,9 +296,13 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--out-dir", default=str(PROJECT_DIR))
     ap.add_argument("--check-only", action="store_true")
+    from src.planning import PlanOptions, add_plan_args, plan_options_from_args
+    add_plan_args(ap)
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    plan = (plan_options_from_args(args) if args.plan or args.plan_report or args.perf_model
+            else PlanOptions.from_config(cfg))
     if not preflight(cfg):
         return 1
     if args.check_only:
@@ -309,7 +313,7 @@ def main(argv=None) -> int:
     out = Path(args.out_dir)
     t0 = time.time()
     log(f"scheduling {model.name} -> {out}")
-    run_scheduler(model, out)
+    run_scheduler(model, out, plan)
     g, gen = build_graph(model)
     active = [kd.name for kd in gen._active_kernels]
     log(f"active kernels: {', '.join(active)}   nodes: {len(g.nodes)}   "

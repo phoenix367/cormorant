@@ -42,6 +42,7 @@ sys.path.insert(0, str(SCHED_DIR))
 
 from src.graph   import OnnxGraph                 # noqa: E402
 from src.codegen import CodeGenerator             # noqa: E402
+from src.planning import PlanOptions, add_plan_args, plan_options_from_args  # noqa: E402
 from src.kernels import KERNEL_REGISTRY           # noqa: E402
 
 
@@ -62,8 +63,8 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def _run_scheduler(model_path: Path, out_dir: Path) -> Tuple[OnnxGraph,
-                                                              CodeGenerator]:
+def _run_scheduler(model_path: Path, out_dir: Path,
+                   plan: PlanOptions = None) -> Tuple[OnnxGraph, CodeGenerator]:
     """
     Invoke the inference-scheduler in-process so we can also harvest the
     OnnxGraph + CodeGenerator for downstream introspection (input/output
@@ -74,13 +75,14 @@ def _run_scheduler(model_path: Path, out_dir: Path) -> Tuple[OnnxGraph,
     out_dir.mkdir(parents=True)
 
     graph = OnnxGraph(str(model_path), fuse_act=True,   # Relu/Clip(0,6) fused into the producing VectorOP call (VECTOROP_OPTIMISATION §3)
-                      s2d_stem=True)                    # stride-2 RGB stem -> host SpaceToDepth + 4x4 s1 Conv (RESNET18_15FPS_PLAN step 1)
+                      s2d_stem=True, plan=plan)                    # stride-2 RGB stem -> host SpaceToDepth + 4x4 s1 Conv (RESNET18_15FPS_PLAN step 1)
     gen   = CodeGenerator(graph=graph, model_path=str(model_path))
 
     # Reuse the CLI generator to write all files (header, source, buf_impl,
     # cmake, test, weights/expected dat files).
     from inference_scheduler import main as sched_main
-    rc = sched_main(["--out-dir", str(out_dir), str(model_path)])
+    rc = sched_main(["--out-dir", str(out_dir), *(plan.argv() if plan else []),
+                     str(model_path)])
     if rc != 0:
         raise RuntimeError(f"inference-scheduler failed for {model_path} (rc={rc})")
     return graph, gen
@@ -241,13 +243,14 @@ static inline void bench_inference_run(inference_buf_t *in,
 
 def generate_for_model(*, model_name: str, model_path: Path,
                        project_dir: Path,
-                       driver_dirs: Dict[str, str]) -> Dict[str, object]:
+                       driver_dirs: Dict[str, str],
+                       plan: PlanOptions = None) -> Dict[str, object]:
     """
     Generate a complete benchmark-ready CMake project for one model.
     Returns a small summary dict.
     """
     _log(f"[{model_name}] scheduling {model_path.name}")
-    graph, gen = _run_scheduler(model_path, project_dir)
+    graph, gen = _run_scheduler(model_path, project_dir, plan)
     active = [kd.name for kd in gen._active_kernels]
     _log(f"[{model_name}] active kernels: {', '.join(active) or '(none)'}")
 
@@ -339,9 +342,13 @@ def main(argv=None) -> int:
                    help="restrict to a subset of models from the config (by name)")
     p.add_argument("--check-only", action="store_true",
                    help="validate config + assets and exit without generating")
+    add_plan_args(p)
     args = p.parse_args(argv)
 
     cfg = _load_config(Path(args.config))
+    plan = (plan_options_from_args(args)
+            if args.plan or args.plan_report or args.perf_model
+            else PlanOptions.from_config(cfg))
     if not _preflight(cfg, models_filter=args.models):
         return 1
     if args.check_only:
@@ -370,7 +377,7 @@ def main(argv=None) -> int:
                 model_path=onnx,
                 project_dir=proj,
                 driver_dirs=drivers,
-            )
+                plan=plan)
         )
 
     if not summaries:

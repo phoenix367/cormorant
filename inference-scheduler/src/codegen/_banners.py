@@ -72,6 +72,13 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
         " *",
         " * Target: Xilinx KV260 bare-metal, ap_fixed<16,8> data type",
         f" * Kernel: {kernel_line}",
-        " */",
     ]
+    from ..planning import plan_summary
+    ps = plan_summary(graph)
+    if ps:
+        import textwrap
+        wrapped = textwrap.wrap(ps, 66)
+        lines.append(f" * Planned: {wrapped[0]}")
+        lines += [f" *          {w}" for w in wrapped[1:]]
+    lines.append(" */")
     return "\n".join(lines)

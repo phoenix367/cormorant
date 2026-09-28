@@ -380,8 +380,13 @@ class _CoreMixin:
         for-loop; each iteration polls IsDone() before returning."""
         return isinstance(sched, MatmulNode) and sched.outer_count > 1
 
-    def _compute_event_stream(self) -> list:
+    def _compute_event_stream(self, order: Optional[list] = None, dag: Optional["Dag"] = None) -> list:
         """Build the linear event sequence inference_run() will emit.
+
+        ``order`` (node indices; default the graph's list order) and ``dag``
+        (default built from the graph) let the planner's order search price
+        a candidate order against the DAG of the original one (whose state
+        edges fix every state access, src/schedule.py).
 
         Each event is one of:
 
@@ -407,7 +412,7 @@ class _CoreMixin:
         has no lane) and the tensors it produced are complete at the event.
         """
         graph = self._graph
-        dag   = Dag.from_graph(graph)
+        dag   = dag if dag is not None else Dag.from_graph(graph)
 
         def effective_preds(idx: int) -> set:
             """Predecessors with their kernel_name set, traversing through
@@ -430,7 +435,8 @@ class _CoreMixin:
         events: list   = []
         pending: dict  = {}   # kid -> node index of last started, not yet waited
 
-        for sn in graph.nodes:
+        seq = graph.nodes if order is None else [dag.by_index[i].sched for i in order]
+        for sn in seq:
             events.append(('comment', sn.index))
 
             if self._is_alias_node(sn):

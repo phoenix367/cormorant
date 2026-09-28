@@ -153,8 +153,15 @@ class VitFrontend:
 
     def __init__(self, cfg: VitConfig, weights: Dict[str, np.ndarray], formats: VisionFormats,
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
-                 qk_kw: Optional[int] = None, pv_kw: Optional[int] = None):
+                 qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
+                 attn_split: int = 1):
+        """``attn_split`` R > 1 splits every head's softmax and P.V by query
+        rows into R parts (TACTICS_PLAN §4.4): the CPU can then start the
+        next ConvKernel call between the parts (--plan's order search)."""
         self.cfg = cfg
+        if attn_split < 1 or cfg.N % (attn_split * 16):
+            raise ValueError(f"attn_split {attn_split}: {cfg.N} query rows not in parts of 16")
+        self.attn_split = int(attn_split)
         self.W = weights
         self.fmt = formats
         self.name = name
@@ -274,9 +281,17 @@ class VitFrontend:
                        [qx], f"{e}.attn_prep", domain=LLM_DOMAIN, num_heads=H, head_dim=HD,
                        qk_kw=kw, q_exp=[int(v) for v in fq], k_exp=[int(v) for v in fk],
                        v_exp=[int(v) for v in fm.get("vc", li, D)])
+            R = self.attn_split
             s = [self._t(f"{e}.s{g}", [N, N], exp=0) for g in range(H)]
-            p = [self._t(f"{e}.p{g}", [N, N], exp=0) for g in range(H)]
-            o = [self._t(f"{e}.o{g}", [N, HD], exp=0) for g in range(H)]
+            if R == 1:
+                p = [self._t(f"{e}.p{g}", [N, N], exp=0) for g in range(H)]
+                o = [self._t(f"{e}.o{g}", [N, HD], exp=0) for g in range(H)]
+            else:
+                p = o = None
+                pr = [[self._t(f"{e}.p{g}r{r}", [N // R, N], exp=0) for r in range(R)]
+                      for g in range(H)]
+                orr = [[self._t(f"{e}.o{g}r{r}", [N // R, HD], exp=0) for r in range(R)]
+                       for g in range(H)]
 
             def qk(g, qx=qx, s=s, e=e):
                 self._node("LlmAttnScores", [kc, qx], [s[g]], f"{e}.qk{g}", domain=LLM_DOMAIN,
@@ -293,17 +308,36 @@ class VitFrontend:
             # follow right away, so the CPU waits only for the short P.V to
             # free the lane (qk(g+1) after softmax(g) waited for the longer
             # qk before the next softmax)
+            def softmax_r(g, r, s=s, pr=None if R == 1 else pr, e=e, fs=fs, fp=fp, R=R):
+                self._node("VitAttnSoftmax", [s[g]], [pr[g][r]], f"{e}.softmax{g}r{r}",
+                           domain=LLM_DOMAIN, head_dim=HD, s_exp=[int(fs[g])],
+                           p_exp=[int(fp[g])], cols=[r * (N // R), N // R])
+
+            def pv_r(g, r, pr=None if R == 1 else pr, orr=None if R == 1 else orr, e=e):
+                self._node("LlmAttnPV", [pr[g][r], vc], [orr[g][r]], f"{e}.pv{g}r{r}",
+                           domain=LLM_DOMAIN, group=g, **common)
             qk(0)
             if H > 1:
                 qk(1)
             for g in range(H):
-                softmax(g)
-                pv_(g)
+                if R == 1:
+                    softmax(g)
+                    pv_(g)
+                else:
+                    for r in range(R):
+                        softmax_r(g, r)
+                    for r in range(R):
+                        pv_r(g, r)
                 if g + 2 < H:
                     qk(g + 2)
             pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
-            self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
-                       num_heads=H, num_kv_heads=H, head_dim=HD)
+            if R == 1:
+                self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
+                           num_heads=H, num_kv_heads=H, head_dim=HD)
+            else:
+                self._node("LlmAttnMerge", [t for g in range(H) for t in orr[g]], [pv],
+                           f"{e}.attn_merge", domain=LLM_DOMAIN, num_heads=H, num_kv_heads=H,
+                           head_dim=HD, row_splits=R)
             ov = self._matmul(pv, f"w.v.l{li}.o", W[lw + "self_attn.out_proj.weight"].T, N, f"{e}.o",
                               fm.get("o", li, D), f"{e}.o_proj")
             h1 = self._t(f"{e}.h1", [N, D], host="f32")
