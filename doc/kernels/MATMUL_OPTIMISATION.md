@@ -877,7 +877,10 @@ projects and libraries with the new bitstream (as for `b_packed`, §3b).
 co-simulation PASS (15 GEMV cases in RTL), synthesis II=1 / slack 0.00 ns
 with BRAM 88, URAM 8, DSP 86, LUT 60.9 k; the test stand's `matmul_tb`
 reads manifests with the new `gemv_kw` column and programs `gemv_kw` /
-`a_to_b` (the checked-in 39 fixtures are unchanged).
+`a_to_b` (the checked-in 39 fixtures were unchanged then).  **2026-09-29:**
+the 11 GEMV cases of `make gen_matmul_test_data` (kw 1 / 2 / 4 / 8, three
+A rows, batches with A or B broadcast, saturation) were added to the
+checked-in fixtures: RTL behaviour test **50/50 PASS** (14 min 53 s).
 
 **`max_k` 2048 → 4096 (2026-09-25).**  `platforms/kv260.json`
 `kernels.matmul.max_k` doubled for BERT's FFN down-projection (`K = 3072`).
@@ -942,6 +945,6 @@ ResNet-18 311 → 310 ms through their classifiers; predictions identical.
 | `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (tiled loop nest + the §8b GEMV dataflow) |
 | `doc/kernels/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
 | `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
-| `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (39 cases, `manifest.txt`) |
+| `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (50 cases incl. 11 GEMV, `manifest.txt` with the `gemv_kw` column) |
 | `build/kernels/matmul/kv260/matmul_op_test_report.json` | Per-test behavior-test report |
 
