@@ -144,7 +144,7 @@ TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1564 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1580 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -222,7 +222,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1564 tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1580 tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (153 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers and Pillow is installed) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |

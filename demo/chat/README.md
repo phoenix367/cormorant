@@ -187,6 +187,13 @@ $PY scripts/llm_board.py --install-only  # upload, build on the board (-j1, memo
 $PY deploy.py                            # with "smollm2" in server.backends
 ```
 
+`generate_llm_project.py` takes the model name from the checkpoint
+directory (`--assets assets/<model>`, default SmolLM2-135M): it names the
+output project, the library and the board's weights directory, so a
+`--model-name` that disagrees with `--assets` is refused, and an output
+directory that holds another model's project is not replaced without
+`--force`.
+
 `llm_calibrate.py all` rewrites the tracked provenance
 `assets/study/smollm2-135m-instruct/formats_pow2+sink+p12.provenance.json`
 (commit, script hash, date); do not commit it unless you recalibrate on
@@ -214,9 +221,11 @@ takes the planning options (`--plan`, `--perf-model`, `--plan-report`,
 process holds the loaded models' pool BOs — BERT 216 MiB, SmolLM2-135M
 286 MiB, SmolLM2-360M 740 MiB, SmolVLM 495 MiB — and the UIO mappings);
 nothing else may run kernels until it is stopped.
-`deploy.py` holds the shared board lock (`board_lock`, `flock`) only while
-deploying — use `--hold` to keep it for as long as the server runs, or
-`deploy.py --stop` before handing the board to another job.
+`deploy.py` holds the shared board lock (`/tmp/kv260-board-<ssh.host>.lock`
+unless `board_lock` names another file — the lock every board tool takes,
+[REMOTE_TESTING §Board lock](../../inference-scheduler/doc/REMOTE_TESTING.md#board-lock))
+only while deploying — use `--hold` to keep it for as long as the server
+runs, or `deploy.py --stop` before handing the board to another job.
 
 By hand on the board (for development):
 

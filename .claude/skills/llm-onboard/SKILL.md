@@ -22,7 +22,6 @@ SPY=.venv-export/bin/python                 # study env (numpy, tokenizers, torc
 N=<name>          # llm_models.json key = demo/chat/assets/<name>/ = --model-name = served model id
 T=<tag>           # N without "-instruct", "-" and "." -> "_" (smollm2-360m-instruct -> smollm2_360m)
 BOARD=root@192.168.100.8; KEY=~/.ssh/kv260-testkey    # ssh block of demo/bert_squad/bert_squad_config.json
-LOCK=$(python3 -c "import json; print(json.load(open('demo/bert_squad/bert_squad_config.json'))['board_lock'])")
 ```
 
 SmolLM2-135M keeps legacy names: `build/llm_project`, `lib/libsmollm2.so`,
@@ -105,10 +104,13 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
 # -> demo/chat/build/llm_project_$T/ (135M: build/llm_project): weights/*.dat, project.json, layers.json
 ```
 
-- **Always pass `--model-name`**: the default `smollm2-135m-instruct` writes
-  `build/llm_project` and later installs over `lib/libsmollm2.so` +
-  `/root/smollm2_weights`.  The out dir is wiped (except `weights/` with
-  `--no-weights`).  `--model-name` becomes `llm_model_name()` = the served id.
+- The model name is the checkpoint directory's name: `--assets` alone is
+  enough (`--model-name`, if given, must match it — `--allow-name-mismatch`
+  overrides — and `--model-name` alone looks for `assets/<name>`).  It becomes
+  `llm_model_name()` = the served id and names the out dir, `lib/lib$T.so` and
+  `/root/${T}_weights`.  The out dir is wiped (except `weights/` with
+  `--no-weights`), but only if it is empty or holds this model's project —
+  another model's project or other files need `--force`.
 - Defaults are the shipped design — keep them: buckets `16,64,256`, context
   1024, `--prefill-engine conv`, `--prefill-attn fpga` (policy
   `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
@@ -151,14 +153,17 @@ $PY demo/chat/scripts/llm_host_emu.py --project demo/chat/build/llm_project_$T \
 
 ## 4. Board — gate, install, memory
 
-The board is shared: **one board job at a time**; `llm_board.py` holds the
-board lock (`board_lock` of the BERT config) for its session.  The running
+The board is shared: **one board job at a time**; `llm_board.py` (like every
+board tool) holds the per-board lock `/tmp/kv260-board-<host>.lock`
+(`src/remote/lock.py`; a path in the BERT config's `board_lock` overrides it)
+for its session.  The running
 chat server owns the FPGA and the CMA — stop it first.
 
 ```bash
 $PY demo/chat/deploy.py --stop
-flock "$LOCK" ssh -i $KEY $BOARD 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory;
-    grep -E "CmaFree|MemAvailable" /proc/meminfo; df -h /root'
+(cd inference-scheduler && .venv/bin/python -m src.remote.locked --host 192.168.100.8 -- \
+    ssh -i $KEY $BOARD 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory;
+    grep -E "CmaFree|MemAvailable" /proc/meminfo; df -h /root')
 $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
     --study-json demo/chat/assets/study/$N/gate2.json --reopen \
     [--profile] [--decode-at 32,256,1000] [--out /tmp/${T}_board.json]

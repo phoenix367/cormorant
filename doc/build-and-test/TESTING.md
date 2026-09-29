@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1564 tests); the chat app (153 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1580 tests); the chat app (153 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -29,7 +29,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1564 tests in 67 modules (1559 pass; 5 skip: the four opt-in
+# Run all 1580 tests in 69 modules (1575 pass; 5 skip: the four opt-in
 # test_bert_base.py tests and one test_cli.py test that needs an HLS driver build)
 .venv/bin/python -m pytest test/ -q
 
@@ -146,7 +146,7 @@ Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (so it
 re-synthesises its kernel and rebuilds its driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
-manifests currently hold 119 VectorOP, 63 Conv, 39 Matmul and 43 Pool
+manifests currently hold 119 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 43 Pool
 cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …): each
 kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);

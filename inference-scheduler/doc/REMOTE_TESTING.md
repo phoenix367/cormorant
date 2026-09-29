@@ -112,7 +112,27 @@ directories of a build in `<repo>/build`.
 | `run.timeout` | `120` | Per-model `test_inference` execution timeout in seconds |
 | `run.use_sudo` | `true` | Prefix the test binary with `sudo -n`; requires passwordless sudo |
 | `cleanup` | `true` | After all tests finish, remove the run's directories under `remote.work_dir`, then `remote.work_dir` itself when it is empty |
+| `board_lock` | `null` | The board lock file (see [Board lock](#board-lock)); `null` = `/tmp/kv260-board-<ssh.host>.lock`, `false` disables it |
 | `models` | `[]` | List of model paths relative to the `inference-scheduler` directory |
+
+### Board lock
+
+Two jobs on one board at the same time corrupt each other, so every board
+tool — `run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`,
+`upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat
+`deploy.py` / `llm_board.py` — holds an exclusive `flock` on one file per
+board for its whole session: `/tmp/kv260-board-<ssh.host>.lock` (the
+config's `board_lock` overrides it; `false` disables it;
+`src/remote/lock.py`).  A second job prints `waiting for board lock …`
+and starts when the first exits.  The lock is re-entrant for tools a
+holder starts (`perf_calibrate.py run --stop-server` → `deploy.py`): the
+holder marks its environment (`KV260_BOARD_LOCK_HELD`).  Do not wrap these
+tools in a shell `flock` on the same file — that lock is not marked and the
+tool inside would wait forever; run other commands under the lock with
+
+```bash
+.venv/bin/python -m src.remote.locked --host <board> -- CMD ARG ...   # or --config CFG.json
+```
 
 ### UIO device names
 

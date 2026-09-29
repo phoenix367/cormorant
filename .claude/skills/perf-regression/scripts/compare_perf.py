@@ -277,8 +277,8 @@ def main(argv=None) -> int:
     ap.add_argument("--baseline", type=Path, help="baseline file (default: "
                     "baselines/<platform>-<bitstream-id>.json next to this script's skill)")
     ap.add_argument("--threshold", type=float, default=2.0, help="flag |Δlat| above this %% (2)")
-    ap.add_argument("--min-delta-ms", type=float, default=0.0002,
-                    help="and above this many ms (0.0002: 2 steps of the 4-decimal lat_ms)")
+    ap.add_argument("--min-delta-ms", type=float, default=0.001,
+                    help="and above this many ms (0.001: short calls jitter by up to 0.5 us)")
     ap.add_argument("--record", action="store_true",
                     help="write the inputs into the baseline (after comparing)")
     ap.add_argument("--brief", action="store_true", help="summary only, no per-case table")

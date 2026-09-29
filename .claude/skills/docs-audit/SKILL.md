@@ -44,7 +44,7 @@ code changes; B when build / setup paths, repo contents (new files,
 4. **Tests and counts** — a total in the docs is what the suite COLLECTS,
    a pass / skip split is what a run prints:
    ```bash
-   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1564: 1559 pass, 5 skip (2026-09-29)
+   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1580: 1575 pass, 5 skip (2026-09-29)
    cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 153
    python3 $S/scripts/audit_facts.py counts --run   # no CHECK line left that is a stale count
    git diff --stat -- ':!*.md'                      # empty: docs only

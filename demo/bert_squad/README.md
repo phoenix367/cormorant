@@ -323,7 +323,7 @@ order from the performance model) **951.3 ms**, bit-exact
 | `--top K` | layers listed with `--profile-layers` (default 15) |
 | `--no-smoke` / `--smoke-only` | skip / only run the generated `test_inference` |
 | `--no-reference` | skip the host reference (no bit-exact check, no float / emulation columns) |
-| `--board-lock FILE` | hold `flock(FILE)` for the whole board session (shared boards) |
+| `--board-lock FILE` | the board lock to hold for the whole session (default: the config's `board_lock`, else `/tmp/kv260-board-<ssh.host>.lock`, the lock every board tool takes — [REMOTE_TESTING §Board lock](../../inference-scheduler/doc/REMOTE_TESTING.md#board-lock)) |
 | `--no-cleanup` | keep `remote.work_dir` (the weights directory is always kept) |
 | `--check-only` | local + remote preflight only |
 | `-v` | print cmake / make / smoke-test output |

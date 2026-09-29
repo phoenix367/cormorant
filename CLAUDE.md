@@ -141,7 +141,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1564 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1580 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -173,3 +173,4 @@ See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and 
 - **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.
 - **KV260 board**: Ubuntu 22.04 (kernel 5.15.0-xilinx-zynqmp), XRT 2.13, `cma=1000M` on the kernel command line (BERT + SmolLM2 pools), 3.9 GB RAM and no swap (build generated projects `-j1`). Keep `board/kv260/kv260-no-cpu-powerdown.conf` installed in `/etc/tmpfiles.d/` (`demo/chat/deploy.py` does it): the PSCI core power-down idle state can park a core forever and hang the board (`doc/plans/CHAT_PLAN.md` §18).
+- **One job per board**: every board tool (`run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`, `upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat `deploy.py` / `llm_board.py`) holds the per-board lock `/tmp/kv260-board-<host>.lock` (`inference-scheduler/src/remote/lock.py`; a config's `board_lock` overrides it, `false` disables it) and waits while another job holds it; tools started by a holder re-enter it.  Never wrap them in a shell `flock` on that file (they would wait forever) — use `python -m src.remote.locked -- CMD` from `inference-scheduler/` for other commands.

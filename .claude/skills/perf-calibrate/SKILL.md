@@ -57,9 +57,11 @@ bitstream needs one there too.
 5. **Board memory.** `ssh … 'sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory'`.
    `run` repeats this itself after building. Every case allocates its buffers as
    XRT BOs from CMA, and a failed allocation records the case as `"err":"alloc"`.
-6. **One board job at a time.** `perf_calibrate.py` takes NO board lock. Do not
-   wrap `run --stop-server` in `flock` on the board lock: its final server restart
-   (`deploy.py`) takes that lock and would deadlock.
+6. **One board job at a time.** `perf_calibrate.py run` takes the per-board lock
+   (`/tmp/kv260-board-<host>.lock`, `src/remote/lock.py`) for its session and waits
+   while another job holds it; the `deploy.py` it starts for `--stop-server`
+   re-enters the lock (the holder marks its environment).  Do not wrap it in a
+   shell `flock` on that file — that lock is not marked and it would wait forever.
 7. **Host**: `cases` and `cases --refine` load all nine shipped models (assets under
    `demo/*/assets`, `demo/chat/assets/<model>`). Measured here on 2026-09-29, with a
    23 GB peak RSS for each: 3.5 min for `cases` and 13 min for `cases --refine`. Run

@@ -19,7 +19,7 @@ ConvKernel and PoolingKernel have their own skills (`conv-verify`,
 | csynth.rpt (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_kv260/hls/syn/report/csynth.rpt` (unified component flow) | `vadd_kv260/solution1/syn/report/csynth.rpt` (legacy `open_project` flow) |
 | RTL behaviour test | `behavior_test_matmul` | `behavior_test_vectorop` |
 | report (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_op_test_report.json` | `vector_op_test_report.json` |
-| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (39 cases) | `hw/test_data/vecop_test_data/` (119 cases) |
+| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (119 cases) |
 | fixture target → output | `gen_matmul_test_data` → `$BUILD_DIR/matmul_test_data/` | `gen_vectorop_test_data` → `$BUILD_DIR/vectorop_test_data/` |
 | test-stand testbench | `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` |
 | block-design testbench (`hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`) | `mm_regmap.svh`, `mm_classes.svh`, `tb_functions.svh` | `vop_regmap.svh`, `vop_classes.svh`, `tb_functions.svh` |
@@ -114,13 +114,11 @@ rm -f "$FIX"/test_*.hex "$FIX"/manifest.txt
 cp "${K}_test_data"/* "$FIX"/
 ```
 
-State as of 2026-09-29: the VectorOP dump is identical to the
-checked-in 119 cases.  The MatMul dump is NOT — it writes 50 cases (the
-checked-in 39 plus 11 GEMV cases, `gemv_kw` manifest column; the two
-saturation cases move from 37/38 to 48/49), because the GEMV path
-(MATMUL_OPTIMISATION §8b) was verified by cosim and the fixtures were left
-at 39.  Copying the dump therefore changes the RTL suite, not just
-refreshes it: say so, and expect Gate 4 to list 11 new cases.
+State as of 2026-09-29: both dumps are identical to the checked-in
+fixtures — VectorOP 119 cases, MatMul 50 (the GEMV path's 11 cases, with
+the `gemv_kw` manifest column, were added to the RTL suite that day; 50/50
+PASS in 893 s).  A dump that differs changes the suite, not just refreshes
+it: say so, and expect Gate 4 to list the new cases.
 If the manifest gains a column or the DDR layout changes, the test-stand
 testbench (table above) must parse / lay it out the same way.  Keep
 fixtures small — xsim time grows with every element.
@@ -187,8 +185,8 @@ make behavior_test_matmul             # or behavior_test_vectorop
   `[100%] Built target behavior_test_K`:
 
   ```
-  [ts] kernel=MatmulKernel  total=39  passed=39  failed=0  all_passed=True
-  [ck] MatmulKernel: PASS  (39/39)  …/matmul_op_test_report.json
+  [ts] kernel=MatmulKernel  total=50  passed=50  failed=0  all_passed=True
+  [ck] MatmulKernel: PASS  (50/50)  …/matmul_op_test_report.json
   ```
 
   (`VectorOPKernel … total=119 passed=119`, `vector_op_test_report.json`).
@@ -332,7 +330,7 @@ one Vivado job at a time:
 | Gate | MatMul | VectorOP |
 |---|---|---|
 | 1 C-sim | `TestMatmulRef` 58/58, `TestMatmulBlas` 24/24; build 9 s (`make -B`), ctest 1 s | `TestSimulation` 119/119; build 4 s, ctest < 1 s |
-| 1b fixtures | dump 50 cases ≠ checked-in 39 (see Gate 1b) | dump identical to the checked-in 119 |
+| 1b fixtures | dump 50 cases ≠ checked-in 39 at the time (the 11 GEMV cases, since added — 50/50 PASS, 893 s) | dump identical to the checked-in 119 |
 | 2 synthesis | 70 s; `FLAGS: 0`; perf table identical to the previous run | 38 s; `FLAGS: 0` |
 | 3 behaviour test | 39/39 PASS, 901 s wall (incl. re-synthesis), `sim_time_ns` 5 170 915 | 119/119 PASS, 236 s, `sim_time_ns` 1 002 075 |
 | 4 timing diff | 0 of 39 cases moved vs a run 2 h earlier (Σ 4 388 715 ns) | 0 of 119 moved (Σ 999 875 ns) |

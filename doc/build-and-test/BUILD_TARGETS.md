@@ -164,7 +164,7 @@ target's exit code.
 
 Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (the IP catalogue
 must exist at the revision the test stand's `.xpr` references).  All four
-pass (119 VectorOP, 63 Conv, 39 Matmul, 43 Pool cases).  The runs modify
+pass (119 VectorOP, 63 Conv, 50 Matmul (11 GEMV), 43 Pool cases).  The runs modify
 tracked `.bd` / `.xci` / `.xpr` files of `hw/cormorant_test_stand`; do not
 commit them.
 
