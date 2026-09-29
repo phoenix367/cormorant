@@ -31,10 +31,18 @@ entry) into the multi-entry KV260 project behind the chat library
      and project.json (summary).
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/generate_llm_project.py
-           [--model-name smollm2-135m-instruct] [--assets DIR] [--formats JSON]
+           [--assets DIR] [--model-name NAME] [--formats JSON]
            [--out-dir demo/chat/build/llm_project] [--buckets 16,64,256]
            [--prefill-engine conv|matmul] [--prefill-attn fpga|host] [--no-weights]
-           [--driver-dirs JSON] [--plan ...]
+           [--driver-dirs JSON] [--force] [--plan ...]
+
+The model name is the checkpoint directory's name (assets/<model name>): it
+names the output project, the library and — through llm_board.py — the
+board's library and weights paths, so --model-name must agree with --assets
+(--allow-name-mismatch overrides) and a model name alone looks for
+assets/<name>.  Without either the default is SmolLM2-135M.  An output
+directory holding another model's project, or anything that is not a
+generated project, is not wiped without --force.
 """
 
 from __future__ import annotations
@@ -46,6 +54,7 @@ import re
 import shutil
 import sys
 import time
+from typing import Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -70,6 +79,7 @@ CHAT = os.path.dirname(HERE)
 SRC = os.path.join(CHAT, "src")
 C_SOURCES = ("llm_api.c", "llm_api.h", "llm_bench.c")
 DEFAULT_OUT = os.path.join(CHAT, "build", "llm_project")
+DEFAULT_MODEL = "smollm2-135m-instruct"
 
 KINDS = ("MatMul linear", "LM head", "attention (host)", "attention q.K^T (FPGA)",
          "attention P.V (FPGA)", "attention softmax (host)", "attention prep (host)",
@@ -294,13 +304,58 @@ def driver_dirs_from_config(path: str) -> dict:
     return out
 
 
+def resolve_model(model_name: Optional[str], assets: Optional[str],
+                  allow_mismatch: bool = False) -> Tuple[str, str]:
+    """(model name, checkpoint directory).  The name is the directory's
+    name — study_dir() and llm_board.board_paths() key on it too — so a
+    --model-name that disagrees with --assets is refused (it would write
+    another model's project, library and board weights under this name)."""
+    if assets is None:
+        if model_name in (None, DEFAULT_MODEL):
+            assets = lp.default_assets()          # SMOLLM_ASSETS or the checkout's 135M
+        elif model_name == vp.MODEL:
+            assets = vp.default_assets()
+        else:
+            assets = os.path.join(os.path.dirname(lp.default_assets()), model_name)
+    assets = os.path.normpath(os.path.abspath(assets))
+    if not os.path.isfile(os.path.join(assets, "config.json")):
+        raise SystemExit(f"no checkpoint at {assets} (config.json missing): pass --assets DIR "
+                         f"(fetch it with scripts/llm_calibrate.py fetch <model>)")
+    name = os.path.basename(assets)
+    if model_name is None:
+        model_name = name
+    elif model_name != name and not allow_mismatch:
+        raise SystemExit(f"--model-name {model_name} but the checkpoint is {assets} ({name}): the "
+                         f"model name names the project, the library and the board's weights "
+                         f"directory — drop --model-name, or pass --allow-name-mismatch")
+    return model_name, assets
+
+
+def check_out_dir(out: str, model_name: str, force: bool = False) -> None:
+    """Refuse to wipe an output directory that holds another model's project
+    or something that is not a generated project (no project.json)."""
+    if force or not os.path.isdir(out) or not os.listdir(out):
+        return
+    pj = os.path.join(out, "project.json")
+    if not os.path.isfile(pj):
+        raise SystemExit(f"{out} exists and is not a generated project (no project.json); "
+                         f"generating would delete its contents — pass another --out-dir, or "
+                         f"--force")
+    with open(pj) as f:
+        other = json.load(f).get("model")
+    if other != model_name:
+        raise SystemExit(f"{out} holds the project of {other!r}, not {model_name!r} — pass "
+                         f"--out-dir, or --force to replace it")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=None,
                     help="default: build/llm_project (SmolLM2-135M), "
                          "build/llm_project_<model> for another --model-name")
-    ap.add_argument("--assets", default=None)
+    ap.add_argument("--assets", default=None,
+                    help="checkpoint directory (default: assets/<--model-name>, else SmolLM2-135M)")
     ap.add_argument("--formats", default=None)
     ap.add_argument("--vision-formats", default=None,
                     help="a VLM's vision formats (default: its study dir)")
@@ -309,19 +364,25 @@ def main(argv=None) -> int:
     ap.add_argument("--prefill-engine", choices=("conv", "matmul"), default="conv")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN,
                     help="prefill attention on ConvKernel (fpga) or the host xattn region")
-    ap.add_argument("--model-name", default="smollm2-135m-instruct")
+    ap.add_argument("--model-name", default=None,
+                    help="default: the --assets directory's name (it must match)")
+    ap.add_argument("--allow-name-mismatch", action="store_true",
+                    help="accept a --model-name that differs from the --assets directory's name")
+    ap.add_argument("--force", action="store_true",
+                    help="replace an --out-dir that holds another model's project or other files")
     ap.add_argument("--no-weights", action="store_true", help="skip writing weights/*.dat")
     ap.add_argument("--driver-dirs", default=None,
                     help="JSON {kernel: dir}; default: local.driver_dirs of "
                          "demo/bert_squad/bert_squad_config.json")
     add_plan_args(ap)
     args = ap.parse_args(argv)
-    if args.assets is None and args.model_name == vp.MODEL:
-        args.assets = vp.default_assets()
+    args.model_name, args.assets = resolve_model(args.model_name, args.assets,
+                                                 args.allow_name_mismatch)
     if args.out_dir is None:
         tag = args.model_name.removesuffix("-instruct").replace("-", "_").replace(".", "_")
-        args.out_dir = (DEFAULT_OUT if args.model_name == "smollm2-135m-instruct"
+        args.out_dir = (DEFAULT_OUT if args.model_name == DEFAULT_MODEL
                         else f"{DEFAULT_OUT}_{tag}")
+    check_out_dir(os.path.abspath(args.out_dir), args.model_name, args.force)
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
     vcfg = None
