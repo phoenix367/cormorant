@@ -1,5 +1,6 @@
 """Remote board operations over SSH for bitstream loading."""
 
+import re
 from pathlib import Path
 
 from ..remote import RemoteSession, _green, _red, _dim
@@ -208,6 +209,41 @@ def overlay_status(session: RemoteSession, overlay_name: str) -> str:
     out, _, _ = session.exec(
         f"cat '{sysfs_dir}/status' 2>/dev/null || echo unknown", timeout=10)
     return out.strip()
+
+
+def list_overlays(session: RemoteSession) -> list[str]:
+    """Names of the device-tree overlays in configfs."""
+    out, _, _ = session.exec(f"ls '{_OVERLAYS_DIR}' 2>/dev/null", timeout=10)
+    return out.split()
+
+
+def _dmesg_tail(session: RemoteSession, n: int = 200) -> list[tuple[float, str]]:
+    """(timestamp s, text) of the kernel log's last ``n`` lines."""
+    out, _, _ = session.exec(f"dmesg 2>/dev/null | tail -n {n}", timeout=10)
+    lines = []
+    for ln in out.splitlines():
+        m = re.match(r"\[\s*(\d+\.\d+)\]\s*(.*)", ln)
+        if m:
+            lines.append((float(m.group(1)), m.group(2)))
+    return lines
+
+
+def dmesg_mark(session: RemoteSession) -> float:
+    """The kernel log's last timestamp (for overlay_errors_since).  A
+    timestamp, not a line count: once the ring buffer is full its length no
+    longer grows."""
+    lines = _dmesg_tail(session, 1)
+    return lines[-1][0] if lines else 0.0
+
+
+def overlay_errors_since(session: RemoteSession, mark: float) -> list[str]:
+    """Overlay errors the kernel logged after ``mark``: the configfs status
+    reads 'applied' even when of_overlay rejected the dtbo (e.g.
+    ``create_overlay: Failed to create overlay (err=-22)`` when another
+    overlay already owns the nodes)."""
+    return [text for t, text in _dmesg_tail(session) if t > mark
+            and "overlay" in text.lower()
+            and any(w in text.lower() for w in ("fail", "error", "err="))]
 
 
 def list_uio_devices(session: RemoteSession) -> list[tuple[str, str]]:

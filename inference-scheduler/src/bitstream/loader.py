@@ -9,6 +9,7 @@ from .hwh import parse_hwh_ps_params
 from .xclbin import build_xclbin
 from .board import (
     _FIRMWARE_DIR,
+    _OVERLAYS_DIR,
     upload_file,
     remove_overlay,
     load_bitstream,
@@ -18,6 +19,9 @@ from .board import (
     load_xclbin,
     apply_dtbo,
     overlay_status,
+    list_overlays,
+    dmesg_mark,
+    overlay_errors_since,
     list_uio_devices,
 )
 from .platforms import kv260
@@ -116,16 +120,24 @@ def upload_bitstream(
     if stale:
         print(f"          Unbound stale UIO device(s): {', '.join(stale)}")
     print(f"          Applying overlay '{overlay_name}'")
+    mark = dmesg_mark(session)
     apply_dtbo(session, remote_dtbo, overlay_name)
 
     print(f"\n{_bold('Step 10')}  Verifying overlay status")
     status = overlay_status(session, overlay_name)
-    if status == "applied":
+    errors = overlay_errors_since(session, mark)
+    if status == "applied" and not errors:
         print(f"          {_green('applied')}  ✓")
     else:
+        others = [o for o in list_overlays(session) if o != overlay_name]
         raise RuntimeError(
-            f"Overlay status is '{status}' (expected 'applied').\n"
-            f"Check dmesg on the board for device tree errors.")
+            f"Overlay '{overlay_name}' did not apply (status '{status}')"
+            + (":\n  " + "\n  ".join(errors) if errors else "") + "\n"
+            + (f"Other overlays are loaded: {', '.join(others)}.  One of them may already "
+               f"own these device-tree nodes (the same design loaded under another name):\n"
+               f"remove it on the board (rmdir {_OVERLAYS_DIR}/<name>) or pass "
+               f"--overlay-name <name>, then run again." if others else
+               "Check dmesg on the board for device tree errors."))
 
     # After the overlay: its afi0 node resets the AFIFM width fields (see
     # the docstring), so the HWH-derived widths must be written last.

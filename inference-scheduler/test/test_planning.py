@@ -67,8 +67,11 @@ class TestPlanOptions(unittest.TestCase):
         if not os.path.exists(path):
             self.skipTest("test models not generated")
         self.assertEqual(OnnxGraph(path).plan, PlanOptions())
-        o = PlanOptions(enabled=True)
-        self.assertIs(OnnxGraph(path, plan=o).plan, o)
+        # an explicit (empty) model: the test must not depend on the local
+        # bitstream_config_kv260.json naming a calibrated bitstream
+        with tempfile.TemporaryDirectory() as td:
+            o = PlanOptions(enabled=True, perf_model=_model_file(td))
+            self.assertIs(OnnxGraph(path, plan=o).plan, o)
 
 
 def _model_file(td, exact=None, families=None):

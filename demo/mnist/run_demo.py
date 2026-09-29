@@ -28,7 +28,7 @@ SCRIPTS  = DEMO_DIR / "scripts"
 
 
 def _run(label: str, cmd: list) -> int:
-    print(f"\n=== {label} ===")
+    print(f"\n=== {label} ===", flush=True)
     print(" ".join(map(str, cmd)))
     return subprocess.call(cmd)
 

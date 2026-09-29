@@ -9,6 +9,7 @@ CTestTestfile.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
+!cmake/FindVitis.cmake
 
 # -----------------------------------------------------------------------
 # Vitis HLS / Vivado generated output
@@ -114,3 +115,11 @@ Thumbs.db
 
 # host-side model export environment (torch / transformers), see doc/plans/CHAT_PLAN.md
 .venv-export/
+
+# per-user board configs (copies of the *.example files; they hold the board's
+# address and local paths)
+inference-scheduler/perf_config*.json
+inference-scheduler/remote_config*.json
+inference-scheduler/bitstream_config_kv260.json
+demo/mnist/mnist_config.json
+demo/image_classification/image_classification_config.json

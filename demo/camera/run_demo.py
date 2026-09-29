@@ -35,7 +35,7 @@ from _config_help import format_missing_config  # noqa: E402
 
 
 def _run(label: str, cmd: list) -> int:
-    print(f"\n=== {label} ===")
+    print(f"\n=== {label} ===", flush=True)
     print(" ".join(map(str, cmd)))
     return subprocess.call(cmd)
 

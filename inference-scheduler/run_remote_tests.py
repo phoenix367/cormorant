@@ -473,6 +473,8 @@ def cleanup_remote(session: RemoteSession, cfg: dict,
     work_dir = cfg["remote"]["work_dir"].rstrip("/")
     for name in model_names:
         session.exec(f"rm -rf {work_dir}/{name}", timeout=30)
+    # the work dir itself only if nothing else is in it (it may be shared)
+    session.exec(f"rmdir {work_dir} 2>/dev/null || true", timeout=15)
 
 
 

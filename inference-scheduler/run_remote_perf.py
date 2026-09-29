@@ -600,7 +600,8 @@ def main(argv=None) -> int:
         # Cleanup
         if not args.no_cleanup:
             work_dir = cfg["remote"]["work_dir"].rstrip("/")
-            session.exec(f"rm -rf {work_dir}/kv260_perf", timeout=30)
+            session.exec(f"rm -rf {work_dir}/kv260_perf; rmdir {work_dir} 2>/dev/null || true",
+                         timeout=30)
         else:
             print(f"\n{_dim('Remote build kept at: '+ build_dir)}")
 

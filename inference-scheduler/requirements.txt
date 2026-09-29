@@ -2,6 +2,9 @@ onnx>=1.14.0
 numpy>=1.24.0
 paramiko>=3.0.0
 
+# the test suite (test/, ../demo/chat/tests)
+pytest>=7.0
+
 # simplify_onnx.py — ONNX preprocessing pipeline
 onnxsim>=0.4.0
 onnxoptimizer>=0.3.0

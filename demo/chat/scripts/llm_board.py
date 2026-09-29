@@ -29,6 +29,8 @@ usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py
            [--decode-at-steps 8] [--profile] [--reopen]
            [--study-json gate2.json] [--board-lock FILE] [--skip-build]
        ... llm_board.py --install-only      (deploy: upload, build, install; no bench)
+       [--remote-dir DIR] [--weights-dir DIR]   (board paths; default: chat_config.json
+                                                remote.dir, /root/smollm2_weights)
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ import shlex
 import struct
 import sys
 import time
+from typing import Optional
 from pathlib import Path
 
 import numpy as np
@@ -61,18 +64,32 @@ RUN_DIR = "/tmp/llm_bench"
 DEFAULT_MODEL = "smollm2-135m-instruct"
 
 
-def board_paths(model: str) -> dict:
+def board_paths(model: str, remote_dir: str = REMOTE_DIR,
+                weights_dir: Optional[str] = None) -> dict:
     """Board locations of a model's library, project sources and weights.
     SmolLM2-135M keeps the original ones (the chat server's defaults); any
     other model gets its own, named after it — smollm2-360m-instruct:
     <remote dir>/lib/libsmollm2_360m.so, <remote dir>/llm_project_smollm2_360m,
-    /root/smollm2_360m_weights."""
+    /root/smollm2_360m_weights.  ``remote_dir`` is the chat install directory
+    (chat_config.json remote.dir, --remote-dir); ``weights_dir`` overrides
+    the weights directory (--weights-dir)."""
     if model == DEFAULT_MODEL:
-        return {"lib": f"{REMOTE_DIR}/lib/libsmollm2.so", "proj": f"{REMOTE_DIR}/llm_project",
-                "weights": WEIGHTS_DIR}
+        return {"lib": f"{remote_dir}/lib/libsmollm2.so", "proj": f"{remote_dir}/llm_project",
+                "weights": weights_dir or WEIGHTS_DIR}
     tag = model.removesuffix("-instruct").replace("-", "_").replace(".", "_")
-    return {"lib": f"{REMOTE_DIR}/lib/lib{tag}.so", "proj": f"{REMOTE_DIR}/llm_project_{tag}",
-            "weights": f"/root/{tag}_weights"}
+    return {"lib": f"{remote_dir}/lib/lib{tag}.so", "proj": f"{remote_dir}/llm_project_{tag}",
+            "weights": weights_dir or f"/root/{tag}_weights"}
+
+
+def chat_remote_dir(path: Optional[str] = None) -> str:
+    """remote.dir of the chat config (demo/chat/chat_config.json, where
+    deploy.py looks for the libraries), else /root/kv260_chat."""
+    path = path or os.path.join(os.path.dirname(HERE), "chat_config.json")
+    try:
+        with open(path) as f:
+            return (json.load(f).get("remote") or {}).get("dir") or REMOTE_DIR
+    except (OSError, ValueError):
+        return REMOTE_DIR
 
 
 def bert_config(path=None) -> dict:
@@ -331,6 +348,13 @@ def main(argv=None) -> int:
     ap.add_argument("--install-only", action="store_true",
                     help="upload, build and install libsmollm2.so; no bench or checks")
     ap.add_argument("--jobs", type=int, default=1, help="make -j on the board (default 1)")
+    ap.add_argument("--remote-dir", default=None,
+                    help="chat install directory on the board: <dir>/lib/lib<model>.so and the "
+                         "project sources (default: remote.dir of demo/chat/chat_config.json, "
+                         "else /root/kv260_chat)")
+    ap.add_argument("--weights-dir", default=None,
+                    help="weights directory on the board (default /root/smollm2_weights for "
+                         "SmolLM2-135M, /root/<model>_weights for the others)")
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--no-lib-check", action="store_true",
                     help="skip llm_lib_check.py (ctypes: exports, threads, chunks, re-open)")
@@ -363,7 +387,8 @@ def main(argv=None) -> int:
         try:
             out, _, _ = session.exec("grep -E 'CmaFree|CmaTotal' /proc/meminfo | tr -s ' '", timeout=15)
             print(f"board: {out.strip()}", flush=True)
-            paths = board_paths(summary.get("model", DEFAULT_MODEL))
+            remote_dir = args.remote_dir or chat_remote_dir()
+            paths = board_paths(summary.get("model", DEFAULT_MODEL), remote_dir, args.weights_dir)
             remote_proj, lib, weights_dir = paths["proj"], paths["lib"], paths["weights"]
             if not args.skip_build:
                 t0 = time.monotonic()
@@ -376,7 +401,7 @@ def main(argv=None) -> int:
                     return 1
                 build(session, remote_proj, cfg, summary["active_kernels"], args.profile,
                       args.jobs, weights_dir)
-                session.exec_checked(f"mkdir -p {REMOTE_DIR}/lib && cp {remote_proj}/build/libsmollm2.so "
+                session.exec_checked(f"mkdir -p {os.path.dirname(lib)} && cp {remote_proj}/build/libsmollm2.so "
                                      f"{lib}", timeout=30)
                 out, _, _ = session.exec(f"nm -D --defined-only {lib} "
                                          f"| awk '{{print $3}}' | sort", timeout=30)
