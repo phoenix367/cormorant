@@ -54,8 +54,9 @@ op (`src/host_nodes.py`: numpy reference + C helper), a pattern fusion
   `--resident auto` (a warm swap costs 1–2 s, a cold load 20–55 s).
 - Board: 3.9 GB RAM, no swap — host tensors (float32 residual, embedding
   table, image buffers) plus the server; generated projects build `-j1`.
-- Dev PC (46 GB): generating a Llama library peaks at 12.6 GB (135M) /
-  31.9 GB (360M); `llm_sched_check.py` for 360M 27 GB — never two at once.
+- Dev PC (46 GB): generating a Llama library peaks at 3.3 GB (135M) /
+  8.2 GB (360M), about 23 bytes per parameter (CHAT_PLAN §25);
+  `llm_sched_check.py` more (135M: 5.1 GB) — one at a time.
 
 **2.3 Numerics — the core.**
 1. A float reference, validated first: numpy vs onnxruntime (≤ 1e-5) or vs

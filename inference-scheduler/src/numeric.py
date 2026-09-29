@@ -153,6 +153,9 @@ def has_numeric(t) -> bool:
     return t.exp is not None or t.host is not None or t.is_state or t.wexp is not None
 
 
+_ENCODE_BLOCK = 1 << 20          # weight elements per block of encode_matmul_weights
+
+
 def encode_matmul_weights(nodes, dtype) -> Dict[str, int]:
     """Encode the constant B of every MatMul whose A or C has an exponent at
     the rank-1 weight exponent.  Returns {weight name: saturated count}."""
@@ -179,18 +182,35 @@ def encode_matmul_weights(nodes, dtype) -> Dict[str, int]:
         fo = c.exp_channels(F)                              # [M]
         if fa.size != sn.k or fo.size != sn.m:
             raise NumericError(f"MatMul '{sn.onnx_node.name}': exponent sizes")
-        wexp = fo[None, :] + F - fa[:, None]                # [K][M]
+        rows, cols = F - fa.astype(np.int64), fo.astype(np.int64)
         if b.onnx_name in done:
-            if not np.array_equal(done[b.onnx_name], wexp):
+            if not np.array_equal(done[b.onnx_name], np.add.outer(rows, cols)):
                 raise NumericError(f"weight '{b.onnx_name}' read by MatMuls with different "
                                    f"exponents")
             continue
-        w = np.asarray(b.data, np.float64).reshape(-1, sn.k, sn.m)
-        r = np.round(w * np.power(2.0, wexp)[None])
-        sat[b.onnx_name] = int(((r < lo) | (r > hi)).sum())
-        r = np.clip(r, lo, hi)
-        b.data = (r / float(1 << F)).astype(np.float32).reshape(b.data.shape)
-        b.wexp = wexp.copy()
+        # wexp[i][j] = f_out[j] + F - f_in[i], stored in the narrowest integer
+        # type that holds it; the encoding runs in row blocks (float64
+        # temporaries of a whole LM head would take GBs) — element-wise the
+        # same arithmetic
+        e_lo, e_hi = int(rows.min() + cols.min()), int(rows.max() + cols.max())
+        etype = next(t for t in (np.int8, np.int16, np.int32, np.int64)
+                     if np.iinfo(t).min <= e_lo and e_hi <= np.iinfo(t).max)
+        wexp = np.empty((sn.k, sn.m), etype)                # [K][M]
+        w = b.data.reshape(-1, sn.k, sn.m)
+        out = np.empty(w.shape, np.float32)
+        n_sat = 0
+        step = max(1, _ENCODE_BLOCK // max(1, w.shape[0] * sn.m))
+        for r0 in range(0, sn.k, step):
+            e = np.add.outer(rows[r0:r0 + step], cols)
+            wexp[r0:r0 + step] = e
+            r = np.round(w[:, r0:r0 + step].astype(np.float64)
+                         * np.power(2.0, e.astype(np.float64))[None])
+            n_sat += int(((r < lo) | (r > hi)).sum())
+            r = np.clip(r, lo, hi)
+            out[:, r0:r0 + step] = (r / float(1 << F)).astype(np.float32)
+        sat[b.onnx_name] = n_sat
+        b.data = out.reshape(b.data.shape)
+        b.wexp = wexp
         done[b.onnx_name] = wexp
     return sat
 

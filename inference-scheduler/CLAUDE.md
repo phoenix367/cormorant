@@ -250,7 +250,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              69 pytest modules, 1580 tests collected (1575 pass, 5 skip;
+  test_*.py              70 pytest modules, 1586 tests collected (1581 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -258,7 +258,9 @@ test/
                          test_cache_coherency.py (sync audit), test_host_ops.py,
                          test_llm_ops.py, test_llama.py, test_vit.py, test_matmul_on_conv.py,
                          test_planning.py (--plan options, state edges, reordered code),
-                         test_perf_calls.py (kernel_calls() == emitted C), test_timing.py
+                         test_perf_calls.py (kernel_calls() == emitted C), test_timing.py,
+                         test_generator_memory.py (lean simulation, weightless shape
+                         inference, lazy entry models / checkpoints, shared arrays)
 ```
 
 ## Key Abstractions

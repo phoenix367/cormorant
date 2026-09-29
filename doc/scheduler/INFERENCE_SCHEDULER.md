@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1580 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1586 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -197,9 +197,16 @@ inference_scheduler.py          CLI, argument parsing
 ### OnnxGraph loading sequence
 
 1. `onnx.load()` (or an in-memory `onnx.ModelProto`, e.g. from
-   `src/llama.py`) + `onnx.checker.check_model()` — structural validation;
-   the `axi.numeric` metadata is parsed (`src/numeric.py`).
+   `src/llama.py`) + `onnx.checker.check_model()` — structural validation.
 2. `shape_inference.infer_shapes()` — fills intermediate tensor shapes.
+   Steps 1–2 (`_checked_inferred`) run on a weightless copy: every
+   initializer over 4096 elements is a graph input of the same type and
+   shape there, so neither serialises the weights (they did 4–5 times, and
+   a model over 2 GB cannot be serialised at all).  The graph then works on
+   its own copy of the inferred model; a large initializer read only as a
+   MatMul's B or by `axi.llm` nodes stays in the caller's model (a
+   data-less placeholder in the copy) and the tensor registry reads it from
+   there.  The `axi.numeric` metadata is parsed (`src/numeric.py`).
 3. `fusion.fold_constant_nodes()` — `Constant` nodes become initializers.
 4. `_preprocess_model()` — rewrites `Gemm` → `MatMul` + optional `Add`.
 5. `fusion.lower_split()` — `Split` becomes one `Slice` per output.
@@ -691,7 +698,10 @@ order (`src/schedule.py`, from `state_updates()` / `state_writes()`).
 States are excluded from buffer reuse (`OnnxGraph.state_tensors`),
 allocated in `inference_init()` and freed in `inference_deinit()`; the
 simulator keeps them in a dict it updates in place
-(`_forward_pass(..., states=)`, `initial_states()`).  Only host states are
+(`_forward_pass(..., states=)`, `initial_states()`; `keep=` names the
+tensors to return — lean mode: weights quantized when read, other values
+dropped after their last reader — for the multi-entry test expectations and
+the Llama `SimSession`).  Only host states are
 supported by the host ops alone; a state **without** a host kind is a **DMA
 state**: a persistent buffer in the CMA pool (after the weights, never shared
 by liveness), initialised in `inference_init()` from its non-zero prefix and

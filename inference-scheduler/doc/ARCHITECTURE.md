@@ -178,9 +178,8 @@ clean, typed view of the computation graph.
 
 ```python
 model = onnx.load(model_path)                # or an onnx.ModelProto (src/llama.py)
-onnx.checker.check_model(model)              # validate structural correctness
+model, held = _checked_inferred(model)       # onnx.checker + infer_shapes on a weightless copy
 self.numeric = numeric.parse(model)          # axi.numeric metadata, if any
-model = shape_inference.infer_shapes(model)  # fill in intermediate shapes
 fusion.fold_constant_nodes(model)            # Constant → initializer
 model, n = OnnxGraph._preprocess_model(model)   # decompose Gemm → MatMul + Add
 fusion.lower_split(model)                    # Split → one Slice per output
@@ -190,6 +189,12 @@ fusion.lower_split(model)                    # Split → one Slice per output
 The shape inference step is critical. Without it, intermediate tensors (the
 outputs of each ONNX node that feed into the next) have no shape information.
 After `infer_shapes`, every tensor's shape is available in `model.graph.value_info`.
+`_checked_inferred` runs the checker and shape inference on a copy in which
+every initializer over 4096 elements is a graph input of the same shape —
+both serialise the whole model, 4–5 copies of the weights at once, and a
+model over 2 GB could not be serialised — and returns the graph's own copy
+of the inferred model (large MatMul-B / `axi.llm` initializers as
+placeholders, read from the caller's model by the tensor registry).
 
 ### Gemm Preprocessing (`_preprocess_model`)
 

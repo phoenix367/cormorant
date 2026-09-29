@@ -389,7 +389,7 @@ def main(argv=None) -> int:
     if args.assets and vp.is_vlm(args.assets):
         if args.prefill_attn != "fpga":
             raise SystemExit("a VLM needs --prefill-attn fpga")
-        m = vp.load(args.assets, args.formats, args.vision_formats)
+        m = vp.load(args.assets, args.formats, args.vision_formats, lazy=True)
         cfg, vcfg = m.tcfg, m.vcfg
         fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name)
         formats_paths = m.formats_paths
@@ -400,7 +400,7 @@ def main(argv=None) -> int:
         models = vp.entry_models(fe, fe_v, buckets)
         del m
     else:
-        cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats)
+        cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats, lazy=True)
         fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
                          prefill_attn=args.prefill_attn)
         formats_paths = (os.path.abspath(args.formats or lp.default_formats(args.assets)),)
@@ -411,7 +411,9 @@ def main(argv=None) -> int:
         del W
     entries = build_entries(models, args.prefill_engine,
                             log=lambda m: print(m, flush=True), plan=plan_options_from_args(args))
-    del models
+    del models, fe                      # the frontends hold the float32 checkpoint
+    if vcfg:
+        del fe_v
     mg = MultiEntryGenerator(entries, args.model_name.replace("-", "_").replace(".", "_"))
     out = os.path.abspath(args.out_dir)
     if os.path.exists(out):

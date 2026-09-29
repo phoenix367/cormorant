@@ -47,8 +47,9 @@ from __future__ import annotations
 import json
 import math
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import onnx
@@ -97,28 +98,78 @@ class LlamaConfig:
             return cls.from_dict(json.load(f))
 
 
+def _st_float32(raw: np.ndarray, dtype: str) -> np.ndarray:
+    """A safetensors tensor's bytes -> float32 (bf16 upcast exactly)."""
+    if dtype == "BF16":
+        return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    if dtype == "F16":
+        return raw.view(np.float16).astype(np.float32)
+    if dtype == "F32":
+        return raw.view(np.float32).copy()
+    raise ValueError(f"dtype {dtype}")
+
+
+def _st_header(f) -> Tuple[int, dict]:
+    n = struct.unpack("<Q", f.read(8))[0]
+    return 8 + n, json.loads(f.read(n))
+
+
 def load_safetensors(path: str) -> Dict[str, np.ndarray]:
     """bf16 / f16 / f32 safetensors -> float32 arrays (bf16 upcast exactly)."""
     with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(n))
+        _, hdr = _st_header(f)
         blob = np.frombuffer(f.read(), np.uint8)
     out = {}
     for name, m in hdr.items():
         if name == "__metadata__":
             continue
         a, b = m["data_offsets"]
-        raw = blob[a:b]
-        if m["dtype"] == "BF16":
-            arr = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-        elif m["dtype"] == "F16":
-            arr = raw.view(np.float16).astype(np.float32)
-        elif m["dtype"] == "F32":
-            arr = raw.view(np.float32).copy()
-        else:
-            raise ValueError(f"{name}: dtype {m['dtype']}")
+        try:
+            arr = _st_float32(blob[a:b], m["dtype"])
+        except ValueError:
+            raise ValueError(f"{name}: dtype {m['dtype']}") from None
         out[name] = arr.reshape(m["shape"])
     return out
+
+
+class LazySafetensors(Mapping):
+    """``load_safetensors`` without the float32 copy of the checkpoint: the
+    file is memory-mapped and a tensor becomes float32 when read — every read
+    converts anew and nothing is kept (the same values as load_safetensors).
+    For frontends that build one entry at a time (generate_llm_project.py).
+    ``select({name: name in the file})`` gives a renamed subset."""
+
+    def __init__(self, path: str, names: Optional[Dict[str, str]] = None):
+        with open(path, "rb") as f:
+            off, hdr = _st_header(f)
+        self.path = path
+        self._blob = np.memmap(path, np.uint8, mode="r", offset=off)
+        self._meta = {k: v for k, v in hdr.items() if k != "__metadata__"}
+        self._names = names if names is not None else {k: k for k in self._meta}
+
+    def select(self, names: Dict[str, str]) -> "LazySafetensors":
+        out = object.__new__(LazySafetensors)
+        out.path, out._blob, out._meta = self.path, self._blob, self._meta
+        out._names = {n: self._names[f] for n, f in names.items()}
+        return out
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        m = self._meta[self._names[name]]
+        a, b = m["data_offsets"]
+        try:
+            arr = _st_float32(np.asarray(self._blob[a:b]), m["dtype"])
+        except ValueError:
+            raise ValueError(f"{name}: dtype {m['dtype']}") from None
+        return arr.reshape(m["shape"])
+
+    def __contains__(self, name) -> bool:
+        return name in self._names
+
+    def __iter__(self):
+        return iter(self._names)
+
+    def __len__(self) -> int:
+        return len(self._names)
 
 
 def rope_tables(cfg: LlamaConfig, n: int):
@@ -188,6 +239,17 @@ class Formats:
         if f"pv@{li}" in self.exp:
             return self.get("pv", li, c.H * c.HD)
         return (fp[:, None] + vc[grp] - F).reshape(-1)
+
+
+def graph_with_initializers(nodes, name, inputs, outputs, inits: Dict[str, np.ndarray],
+                            value_info) -> onnx.GraphProto:
+    """``oh.make_graph`` with ``inits`` ({name: array}) converted to float32
+    TensorProtos one at a time, straight into the graph: one copy of each
+    weight, not a second set of TensorProtos beside the graph's."""
+    g = oh.make_graph(nodes, name, inputs, outputs, value_info=value_info)
+    for n, arr in inits.items():
+        g.initializer.append(nph.from_array(np.ascontiguousarray(arr, np.float32), n))
+    return g
 
 
 def _compact(e: np.ndarray):
@@ -273,7 +335,7 @@ class LlamaFrontend:
     def _new(self, ename):
         self._nodes: List[onnx.NodeProto] = []
         self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, onnx.TensorProto] = {}
+        self._inits: Dict[str, np.ndarray] = {}      # converted in _model
         self._meta = numeric.empty()
         self._e = ename
 
@@ -290,7 +352,7 @@ class LlamaFrontend:
 
     def _init(self, name, arr):
         if name not in self._inits:
-            self._inits[name] = nph.from_array(np.ascontiguousarray(arr, np.float32), name)
+            self._inits[name] = arr
         return name
 
     def _node(self, op, ins, outs, name, domain="", **attrs):
@@ -487,11 +549,11 @@ class LlamaFrontend:
         return self._model("head", [], [y])
 
     def _model(self, ename, inputs, outputs):
-        g = oh.make_graph(
+        g = graph_with_initializers(
             self._nodes, f"{self.name}_{ename}",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs],
-            initializer=list(self._inits.values()),
+            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
             value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
+        self._inits = {}
         m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17),
                                             oh.make_opsetid(LLM_DOMAIN, 1)],
                           producer_name="inference-scheduler/src/llama.py")
@@ -517,5 +579,5 @@ def entry_info(model: onnx.ModelProto) -> Optional[dict]:
     return None
 
 
-__all__ = ("LlamaConfig", "LlamaFrontend", "Formats", "load_safetensors", "rope_tables",
-           "entry_info", "LINEARS")
+__all__ = ("LlamaConfig", "LlamaFrontend", "Formats", "load_safetensors", "LazySafetensors",
+           "graph_with_initializers", "rope_tables", "entry_info", "LINEARS")

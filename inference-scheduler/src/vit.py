@@ -38,10 +38,10 @@ from typing import Dict, List, Optional
 import numpy as np
 import onnx
 import onnx.helper as oh
-import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 from . import numeric
+from .llama import graph_with_initializers
 from .llm_nodes import LLM_DOMAIN
 
 F = 8                                  # the kernels' output shift
@@ -198,7 +198,7 @@ class VitFrontend:
     def _new(self):
         self._nodes: List[onnx.NodeProto] = []
         self._vi: Dict[str, onnx.ValueInfoProto] = {}
-        self._inits: Dict[str, onnx.TensorProto] = {}
+        self._inits: Dict[str, np.ndarray] = {}      # converted in _model
         self._meta = numeric.empty()
 
     def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False):
@@ -214,7 +214,7 @@ class VitFrontend:
 
     def _init(self, name, arr):
         if name not in self._inits:
-            self._inits[name] = nph.from_array(np.ascontiguousarray(arr, np.float32), name)
+            self._inits[name] = arr
         return name
 
     def _node(self, op, ins, outs, name, domain="", **attrs):
@@ -374,11 +374,11 @@ class VitFrontend:
         return self._model([pin], [img] if output else [])
 
     def _model(self, inputs, outputs):
-        g = oh.make_graph(
+        g = graph_with_initializers(
             self._nodes, f"{self.name}_vision",
-            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs],
-            initializer=list(self._inits.values()),
+            [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
             value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
+        self._inits = {}
         m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
                           producer_name="inference-scheduler/src/vit.py")
         m.ir_version = 8

@@ -30,6 +30,7 @@ import ctypes
 import ctypes.util
 import gc
 import time
+from collections.abc import MutableMapping
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -41,6 +42,37 @@ from .matmul_gemv import GEMV_KWS
 from .nodes import MatmulConvNode
 
 
+class EntryModels(MutableMapping):
+    """``{entry name: onnx.ModelProto}`` whose models are built when first
+    read: ``entry_graphs`` pops them one at a time, so only one entry's
+    model — a float32 copy of every weight — exists at once.  ``add(name,
+    build)`` registers a builder; assigning a ModelProto stores it as is."""
+
+    def __init__(self):
+        self._items: Dict[str, object] = {}
+
+    def add(self, name: str, build: Callable[[], onnx.ModelProto]) -> None:
+        self._items[name] = build
+
+    def __getitem__(self, name: str) -> onnx.ModelProto:
+        v = self._items[name]
+        if not isinstance(v, onnx.ModelProto):
+            v = self._items[name] = v()
+        return v
+
+    def __setitem__(self, name: str, model: onnx.ModelProto) -> None:
+        self._items[name] = model
+
+    def __delitem__(self, name: str) -> None:
+        del self._items[name]
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
 def _release_memory() -> None:
     """Collect garbage and hand freed heap back to the OS (glibc)."""
     gc.collect()
@@ -49,24 +81,6 @@ def _release_memory() -> None:
         libc.malloc_trim(0)
     except (OSError, AttributeError):
         pass
-
-
-def _share_arrays(g: OnnxGraph, pool: Dict[Tuple[str, str], np.ndarray]) -> None:
-    """Point g's constant tensors at the arrays an earlier graph holds for
-    the same name when their contents are equal (the entries of one model
-    share every weight): one copy per weight in memory instead of one per
-    entry.  Arrays are only read after the graphs are built."""
-    for t in g._tensors.values():                          # noqa: SLF001
-        for attr in ("data", "packed_data"):
-            a = getattr(t, attr, None)
-            if not isinstance(a, np.ndarray) or a.nbytes < 4096:
-                continue
-            key = (t.onnx_name, attr)
-            b = pool.get(key)
-            if b is None:
-                pool[key] = a
-            elif b is not a and b.dtype == a.dtype and b.shape == a.shape and np.array_equal(a, b):
-                setattr(t, attr, b)
 
 
 def _matmul_weights(model: onnx.ModelProto) -> Dict[str, Tuple[int, int]]:
@@ -176,10 +190,11 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
     ``matmul_on_conv`` overrides the prefill lowering mode (tests).  ``plan``
     (src/planning.py) goes to every entry's graph.
 
-    ``models`` is consumed: each entry's ModelProto is removed from it once
-    its graph is built (with the graphs' weight arrays shared, a Llama
-    project needs about one copy of the weights plus one model at a time —
-    SmolLM2-360M's five entries otherwise exceed a 46 GB host)."""
+    ``models`` is consumed: each entry's ModelProto is removed from it (an
+    ``EntryModels`` builds it only then) and its graph shares the constant
+    arrays of the graphs before it (``OnnxGraph(array_pool=...)``), so a
+    Llama project holds one copy of each array plus one entry's model at a
+    time (SmolLM2-360M: 7.7 GiB peak for the whole generation)."""
     log = log or (lambda _msg: None)
     pool: Dict[Tuple[str, str], np.ndarray] = {}
     mode = matmul_on_conv or ("auto" if prefill_engine == "conv" else "off")
@@ -200,8 +215,8 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
     for name in prefills:
         t0 = time.time()
         g = OnnxGraph(models.pop(name), fuse_act=True, s2d_stem=True,
-                      matmul_on_conv=mode, matmul_conv_kw=kw, matmul_conv_kws=kws, plan=plan)
-        _share_arrays(g, pool)
+                      matmul_on_conv=mode, matmul_conv_kw=kw, matmul_conv_kws=kws, plan=plan,
+                      array_pool=pool)
         _release_memory()
         if kw is None or name == prefills[0]:
             # the first bucket's widths pin the others; a planned width wins
@@ -219,8 +234,7 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
             continue
         t0 = time.time()
         g = OnnxGraph(models.pop(name), fuse_act=True, s2d_stem=True, matmul_gemv_kw=kw,
-                      plan=plan)
-        _share_arrays(g, pool)
+                      plan=plan, array_pool=pool)
         _release_memory()
         graphs[name] = g
         st = g.matmul_gemv_stats
@@ -230,8 +244,7 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
     for name in others:
         t0 = time.time()
         g = OnnxGraph(models.pop(name), fuse_act=True, s2d_stem=True, matmul_on_conv=mode,
-                      plan=plan)
-        _share_arrays(g, pool)
+                      plan=plan, array_pool=pool)
         _release_memory()
         graphs[name] = g
         st = g.matmul_conv_stats
@@ -242,4 +255,4 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
     return [(n, graphs[n]) for n in order if n in graphs]
 
 
-__all__ = ("entry_graphs", "plan_shared_kw")
+__all__ = ("EntryModels", "entry_graphs", "plan_shared_kw")

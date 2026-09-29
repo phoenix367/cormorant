@@ -12,6 +12,7 @@ board run's logits against the simulation).  Runs in the scheduler's venv
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -30,8 +31,9 @@ for _p in (HERE, SCHED):
 import llm_study as study                                         # noqa: E402
 from src.codegen import CodeGenerator                             # noqa: E402
 from src.graph import OnnxGraph                                   # noqa: E402
-from src.llm_entries import entry_graphs                         # noqa: E402
-from src.llama import Formats, LlamaConfig, LlamaFrontend, load_safetensors  # noqa: E402
+from src.llm_entries import EntryModels, entry_graphs            # noqa: E402
+from src.llama import (Formats, LazySafetensors, LlamaConfig, LlamaFrontend,  # noqa: E402
+                       load_safetensors)
 
 # The shipped numeric policy (llm_study.py) per prefill-attention mode of the
 # frontend (src/llama.py): "fpga" (phase 5, CHAT_PLAN §16) — q.K^T / P.V of the
@@ -68,11 +70,14 @@ def default_formats(assets: Optional[str] = None) -> str:
     return os.path.join(study.study_dir(assets), f"formats_{FORMATS_POLICY}.json")
 
 
-def load_model(assets: Optional[str] = None, formats: Optional[str] = None):
-    """(LlamaConfig, weights {HF name: float32}, Formats, formats dict)."""
+def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
+               lazy: bool = False):
+    """(LlamaConfig, weights {HF name: float32}, Formats, formats dict);
+    ``lazy``: the weights as a LazySafetensors mapping (converted when read,
+    no float32 copy of the checkpoint held — generate_llm_project.py)."""
     assets = assets or default_assets()
     cfg = LlamaConfig.from_file(os.path.join(assets, "config.json"))
-    W = load_safetensors(os.path.join(assets, "model.safetensors"))
+    W = (LazySafetensors if lazy else load_safetensors)(os.path.join(assets, "model.safetensors"))
     fpath = formats or default_formats(assets)
     with open(fpath) as f:
         fd = json.load(f)
@@ -84,12 +89,14 @@ def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
     return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn)
 
 
-def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[str, object]:
-    """{entry name: onnx.ModelProto}: decode, prefill_<P> per bucket, head."""
-    out = {"decode": fe.entry("decode")}
+def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:
+    """{entry name: onnx.ModelProto}: decode, prefill_<P> per bucket, head —
+    each built when first read (entry_graphs takes them one at a time)."""
+    out = EntryModels()
+    out.add("decode", functools.partial(fe.entry, "decode"))
     for p in sorted(buckets):
-        out[f"prefill_{p}"] = fe.entry("prefill", p)
-    out["head"] = fe.entry("head")
+        out.add(f"prefill_{p}", functools.partial(fe.entry, "prefill", p))
+    out.add("head", functools.partial(fe.entry, "head"))
     return out
 
 
@@ -164,9 +171,9 @@ def make_codegen(model, name: str, matmul_on_conv="auto") -> CodeGenerator:
 def make_codegens(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> Dict[str, CodeGenerator]:
     """{entry: CodeGenerator} of every entry, scheduled like the generated
     library (src/llm_entries.entry_graphs): one model at a time and the
-    weight arrays shared across entries — per-entry make_codegen holds every
-    weight once per entry, too much for SmolLM2-360M on a 46 GB host.  The
-    simulation does not depend on the engine choices."""
+    constant arrays shared across entries — per-entry make_codegen holds
+    every weight once per entry.  The simulation does not depend on the
+    engine choices."""
     return {n: CodeGenerator(g, model_path=f"{n}.onnx")
             for n, g in entry_graphs(entry_models(fe, buckets))}
 
@@ -194,9 +201,11 @@ class SimSession:
         self.pos = n
 
     def _run(self, entry: str, feeds: dict) -> dict:
+        """One entry call; returns its outputs (and the states)."""
         cg = self.cgs[entry]
         return cg._forward_pass({k: np.asarray(v, np.float64) for k, v in feeds.items()},
-                                states=self.states)
+                                states=self.states,
+                                keep=[t.onnx_name for t in cg._graph.output_tensors])
 
     def prefill(self, tokens: Sequence[int]) -> np.ndarray:
         tokens = [int(t) for t in tokens]

@@ -22,7 +22,7 @@ import numpy as np
 
 import llm_project as lp
 from src.codegen import CodeGenerator
-from src.llama import Formats, LlamaConfig, LlamaFrontend, load_safetensors
+from src.llama import Formats, LazySafetensors, LlamaConfig, LlamaFrontend, load_safetensors
 from src.llm_entries import entry_graphs
 from src.vit import VisionFormats, VitConfig, VitFrontend, patches
 
@@ -65,20 +65,27 @@ class Vlm:
 
 
 def load(assets: Optional[str] = None, text_formats: Optional[str] = None,
-         vision_formats: Optional[str] = None) -> Vlm:
+         vision_formats: Optional[str] = None, lazy: bool = False) -> Vlm:
+    """``lazy``: the weights as LazySafetensors mappings (llm_project.load_model)."""
     assets = assets or default_assets()
     with open(os.path.join(assets, "config.json")) as f:
         cj = json.load(f)
     tcfg = LlamaConfig.from_dict({**cj["text_config"],
                                   "tie_word_embeddings": cj.get("tie_word_embeddings", False)})
     vcfg = VitConfig.from_dict(cj)
-    W = load_safetensors(os.path.join(assets, "model.safetensors"))
-    Wt = {k.replace("model.text_model.", "model."): v for k, v in W.items()
-          if k.startswith("model.text_model.")}
+    path = os.path.join(assets, "model.safetensors")
+    W = LazySafetensors(path) if lazy else load_safetensors(path)
+    tnames = {k.replace("model.text_model.", "model."): k for k in W
+              if k.startswith("model.text_model.")}
     if "lm_head.weight" in W:
-        Wt["lm_head.weight"] = W["lm_head.weight"]
-    Wv = {k: v for k, v in W.items()
-          if k.startswith("model.vision_model.") or k.startswith("model.connector.")}
+        tnames["lm_head.weight"] = "lm_head.weight"
+    vnames = {k: k for k in W
+              if k.startswith("model.vision_model.") or k.startswith("model.connector.")}
+    if lazy:
+        Wt, Wv = W.select(tnames), W.select(vnames)
+    else:
+        Wt = {n: W[k] for n, k in tnames.items()}
+        Wv = {n: W[k] for n, k in vnames.items()}
     del W
     tp, vp = default_formats(assets)
     tp, vp = text_formats or tp, vision_formats or vp
@@ -96,7 +103,7 @@ def frontends(m: Vlm, ctx: int = lp.CONTEXT, name: str = MODEL):
 
 def entry_models(fe_t: LlamaFrontend, fe_v: VitFrontend, buckets: Sequence[int] = lp.BUCKETS):
     out = lp.entry_models(fe_t, buckets)
-    out["vision"] = fe_v.entry()
+    out.add("vision", fe_v.entry)
     return out
 
 

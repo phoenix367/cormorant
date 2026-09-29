@@ -34,7 +34,7 @@ INTERM_MIB_PER_HIDDEN = 0.0108  # intermediates: +6.2 MiB (135M, hidden 576), +1
 DECODE_GBS = 2.89               # weight bytes streamed per second in decode (GEMV, both ports)
 DECODE_FIXED_MS = 5.8           # host ops per token beyond the weight stream
 PREFILL256_S = (0.321, 0.00713)  # s = a + b * M params (1.28 s at 134.5 M, 2.90 s at 361.8 M)
-GEN_RAM_GB = (12.6, 134.5, 31.9, 361.8)   # host RAM peak generating the library (135M, 360M)
+GEN_RAM_GB = (3.33, 134.5, 8.22, 361.8)   # host RAM peak generating the library (135M, 360M)
 
 
 def main(argv=None) -> int:
@@ -107,7 +107,7 @@ def main(argv=None) -> int:
     print(f"pool       ~{pool_mib:.0f} MiB of {free:.0f} MiB CMA: {verdict}")
     print(f"speed      decode ~{decode_ms:.0f} ms / token (~{1e3 / decode_ms:.1f} tok/s) at position 32, "
           f"prefill 256 ~{prefill_ms / 1e3:.2f} s  (fitted on SmolLM2-135M / 360M on the board)")
-    print(f"host RAM   generating the library ~{gen_gb:.0f} GB peak (135M 12.6, 360M 31.9; "
+    print(f"host RAM   generating the library ~{gen_gb:.1f} GB peak (135M 3.3, 360M 8.2; "
           f"the dev PC has 46 GB)")
     return 1 if issues else 0
 

@@ -33,7 +33,7 @@ file are needed: all type-specific logic is encapsulated in ``DataType``.
 
 from __future__ import annotations
 from collections import namedtuple
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -51,6 +51,22 @@ from ..llm_nodes import LlmAttnConvNode, LlmEmbedNode
 
 
 ResidualStats = namedtuple("ResidualStats", ("abs_max", "nrmse", "sqnr_db"))
+
+
+class _LazyWeights(dict):
+    """The forward pass's value table in lean mode: a weight missing from it
+    is quantized when a node reads it and is not kept."""
+
+    def __init__(self, value_fn, weights):
+        super().__init__()
+        self._value_fn = value_fn
+        self._weights = weights
+
+    def __missing__(self, name):
+        t = self._weights.get(name)
+        if t is None:
+            raise KeyError(name)
+        return self._value_fn(t)
 
 
 def _residual_stats(full: np.ndarray, quant: np.ndarray,
@@ -482,11 +498,22 @@ class _SimulateMixin:
     # Core: topological forward pass                                      #
     # ------------------------------------------------------------------ #
 
+    def _weight_value(self, t: TensorInfo) -> np.ndarray:
+        """A weight as the kernels read it (mirrors the ROM encoding written
+        to C); a weight encoded at a rank-1 exponent holds raw / 2^F in
+        ``data``."""
+        dtype = self._dtype
+        v = dtype.quantize(t.data.reshape(t.shape).astype(np.float64))
+        if t.wexp is not None:
+            v = v * np.power(2.0, dtype.frac_bits - t.wexp.astype(np.float64))
+        return v
+
     def _forward_pass(
         self,
         input_arrays: Dict[str, np.ndarray],
         errors_out: Optional[Dict[str, "tuple"]] = None,
         states: Optional[Dict[str, np.ndarray]] = None,
+        keep: Optional[Iterable[str]] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Run every ScheduledNode in topological order, quantizing outputs with
@@ -504,11 +531,35 @@ class _SimulateMixin:
         over the same states.  Default: fresh copies of the initial values.
 
         Returns {onnx_name: float64 ndarray} for every tensor visited.
+
+        ``keep`` (lean mode, for graphs with large weights) returns only
+        those tensors (and the states): a weight is quantized when a node
+        reads it instead of up front, and every other value is dropped after
+        its last reader.  The values are the same.
         """
         dtype   = self._dtype
-        arrays: Dict[str, np.ndarray] = {}
+        nodes   = self._graph.nodes
+        weights = {t.onnx_name: t for t in self._graph.weight_tensors if t.data is not None}
+        lean    = keep is not None
+        arrays: Dict[str, np.ndarray] = (_LazyWeights(self._weight_value, weights) if lean
+                                         else {})
         if states is None:
             states = self.initial_states()
+        dying: Dict[int, List[str]] = {}          # lean: node index -> values last read there
+        if lean:
+            keep = set(keep) | {t.onnx_name for t in self._graph.state_tensors}
+            last: Dict[str, int] = {}
+            for i, sn in enumerate(nodes):
+                for t in sn.inputs:
+                    if t is not None:
+                        last[t.onnx_name] = i
+            for i, sn in enumerate(nodes):
+                out = getattr(sn, "output", None)
+                if out is not None and out.onnx_name not in last:
+                    last[out.onnx_name] = i       # never read
+            for name, i in last.items():
+                if name not in keep and name not in weights:
+                    dying.setdefault(i, []).append(name)
 
         def _store_quant(name, full, truncate_fn=dtype.truncate, shape=None):
             quant = truncate_fn(full)
@@ -520,16 +571,10 @@ class _SimulateMixin:
                 errors_out[name] = _residual_stats(full_r, quant)
             return quant
 
-        # Seed with quantized weights (mirrors the ROM encoding written to C);
-        # a weight encoded at a rank-1 exponent holds raw / 2^F in `data`
-        for t in self._graph.weight_tensors:
-            if t.data is not None:
-                arrays[t.onnx_name] = dtype.quantize(
-                    t.data.reshape(t.shape).astype(np.float64)
-                )
-                if t.wexp is not None:
-                    arrays[t.onnx_name] = arrays[t.onnx_name] * np.power(
-                        2.0, (dtype.frac_bits - t.wexp).astype(np.float64))
+        # Seed with the quantized weights (lean mode: on first read)
+        if not lean:
+            for name, t in weights.items():
+                arrays[name] = self._weight_value(t)
 
         # Persistent states (updated in place by the host ops)
         for t in self._graph.state_tensors:
@@ -539,7 +584,9 @@ class _SimulateMixin:
         arrays.update(input_arrays)
 
         # Node-by-node forward pass
-        for sn in self._graph.nodes:
+        for i, sn in enumerate(nodes):
+            for name in dying.get(i - 1, ()):
+                arrays.pop(name, None)
             if isinstance(sn, (MatmulNode, MatmulConvNode)):
                 # A MatMul lowered onto ConvKernel (MatmulConvNode) computes
                 # exactly what MatmulKernel computes: exact Q8.8 products,
@@ -664,6 +711,8 @@ class _SimulateMixin:
             _store_quant(sn.output.onnx_name, result,
                          truncate_fn=truncate_fn, shape=sn.output.shape)
 
+        if lean:
+            return {n: v for n, v in arrays.items() if n in keep}
         return arrays
 
     # ------------------------------------------------------------------ #

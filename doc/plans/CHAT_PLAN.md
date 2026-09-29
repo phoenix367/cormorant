@@ -15,6 +15,8 @@ hashes recorded (`llm_calibrate.py`, §21).  SmolVLM-256M (image input): numeric
 study GO (§22), then implemented — bit-exact on the board, 3.9 s per image
 (7.7 s at first, §24; 3.84 s built with `--plan`, TACTICS_PLAN.md §9) +
 ~9.5 tok/s, served by the chat server with OpenAI image_url parts (§23).
+Generating a library needs 4× less host RAM than before (360M: 30 → 7.7 GiB,
+§25).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -1670,7 +1672,7 @@ entries kept its own copy of every weight array.  Fixed in the scheduler —
 `OnnxGraph` keeps detached NodeProto copies, `src/llm_entries.entry_graphs`
 consumes the entry models one at a time and shares equal weight arrays
 between the entries: SmolLM2-135M's generation peaks at 12.6 GB instead of
-17.9, 360M's at 31.9 GB.  `llm_project.make_codegens` builds the checks'
+17.9, 360M's at 31.9 GB (now 3.3 / 8.2 GB, §25).  `llm_project.make_codegens` builds the checks'
 simulations the same way.
 
 **Gates.**  `llm_sched_check.py --assets ...`: the scheduler simulation
@@ -2186,3 +2188,55 @@ exponent) instead of one 65 536-entry table, now in `vlm_study.py`.
 - **In general:** measured tactics and a timed schedule, instead of cost
   model rules and hand-written orders, are planned in
   [TACTICS_PLAN.md](TACTICS_PLAN.md).
+
+## 25. Generator memory, 4× less (2026-09-29)
+
+Generating a library (`generate_llm_project.py`) peaked at about 90 bytes
+of host RAM per parameter, which would put a ~1B model beyond the 46 GB dev
+PC.  Now it is about 23 bytes per parameter.  The generated projects are
+**byte-identical** to before: every file, weights included, except the
+"Generated at" banner line.
+
+| model | peak before | peak after | time before → after |
+|---|---|---|---|
+| SmolLM2-135M | 12.3 GiB | **3.1 GiB** | 69 → 60 s |
+| SmolLM2-360M | 29.9 GiB | **7.7 GiB** | 202 → 142 s |
+| SmolVLM-256M | 18.4 GiB | **3.3 GiB** | 107 → 90 s |
+| `llm_sched_check.py` 135M (1 prompt, 8 steps, second turn) | 10.5 GB | 5.1 GB | 115 → 119 s, bit-exact |
+
+Measured with a 0.1 s RSS sampler per phase, largest items first:
+
+1. **The test expectations' simulation** (`simulate_sequence`) kept every
+   entry's full result: all weights quantized to float64 (8 bytes per
+   parameter, per entry) and every intermediate.  The forward pass now has
+   a lean mode (`_forward_pass(keep=...)`): a weight is quantized when a
+   node reads it, a value is dropped after its last reader, and only the
+   entry's inputs, outputs and the states are returned.  `SimSession` (the
+   gates) uses it too.
+2. **Weight exponents** (`TensorInfo.wexp`, `[K][M]`) were int64 and not
+   shared between entries: now the narrowest integer type (int8), shared,
+   and encoded in row blocks, since the float64 temporaries of a whole
+   LM head took about 1.4 GB.
+3. **ONNX validation and shape inference** serialise the whole model, 4–5
+   copies of the weights at once, and protobuf cannot serialise a model
+   over 2 GB at all.  `OnnxGraph` now runs them on a weightless copy (large
+   initializers as graph inputs of the same shape) and reads the weights
+   from the caller's model.  Each weight becomes one float32 array; before,
+   there were three copies.
+4. **The entry models were all built up front** (5 ModelProtos with
+   float32 weights).  `EntryModels` builds each one when `entry_graphs`
+   takes it.  The frontends convert each weight straight into the graph,
+   not into a second set of TensorProtos.
+5. **The float32 checkpoint**: `LazySafetensors` memory-maps the file and
+   converts a tensor when it is read (the same values as
+   `load_safetensors`, checked bit for bit on both checkpoints).
+6. **Sharing** between the entries' graphs now also covers the states'
+   initial values and the host tables (the embedding), and it happens
+   inside each build (`OnnxGraph(array_pool=...)`), right after the
+   weights are encoded.
+
+What remains per parameter: the graphs' float32 weights and conv images,
+one entry's ModelProto while its graph is built, and the int8 exponents.
+Checks: the scheduler suite (1581 pass, 5 skipped, incl. `test_generator_memory.py`); the generated projects
+compared file by file with the old generator's for all three models; and
+`llm_sched_check.py` bit-exact with the study emulation.

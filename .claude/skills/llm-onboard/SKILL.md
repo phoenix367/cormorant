@@ -116,11 +116,12 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
   `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
   `inference-scheduler/perf_models/kv260/<bitstream-id>.json` of the board's
   bitstream; gains ≤ ~1 %, TACTICS_PLAN §9).
-- **Host RAM peak** (dev PC 46 GB): 135M 12.6 GB / ~100 s, 360M 31.9 GB /
-  ~6 min, SmolVLM ~20 GB / 100 s; `llama_fit.py` interpolates.  **One such
-  job at a time** — generation, `llm_sched_check.py`, `llm_host_emu.py` and
-  the host side of `llm_board.py` (it rebuilds the simulation) each hold the
-  model; check `free -g` first.
+- **Host RAM peak** (dev PC 46 GB): 135M 3.3 GB / ~60 s, 360M 8.2 GB /
+  ~2.5 min, SmolVLM 3.6 GB / 90 s (CHAT_PLAN §25; about 23 bytes per
+  parameter); `llama_fit.py` interpolates.  `llm_sched_check.py`,
+  `llm_host_emu.py` and the host side of `llm_board.py` rebuild the
+  simulation and hold the study model too (`llm_sched_check.py` on 135M:
+  5.1 GB); run one such job at a time and check `free -g` first.
 - **Gate:** the summary lines — pool MiB (weights / KV caches /
   intermediates) close to `llama_fit.py`'s estimate and < ~920; no
   `missing driver files` warning (drivers come from

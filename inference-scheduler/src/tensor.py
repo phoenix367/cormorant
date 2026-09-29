@@ -68,7 +68,8 @@ class TensorInfo:
     #      f_w[i][j] = f_out[j] + F - f_in[i] (F = the kernels' output shift);
     #      `data` then holds raw / 2^F so every existing encode / pack path
     #      emits the raw bits unchanged, and the simulator's value is
-    #      data * 2^(F - wexp).
+    #      data * 2^(F - wexp).  [K][M], the narrowest integer type that
+    #      holds it (int8 in practice).
     wexp:      Optional[np.ndarray] = field(default=None, repr=False)
     # host: tensor lives in host memory, never in a DMA buffer: "f32"
     #      (float32, e.g. a transformer's residual stream), "i32" (int32

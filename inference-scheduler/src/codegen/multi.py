@@ -371,12 +371,17 @@ class MultiEntryGenerator:
 
     def simulate_sequence(self, calls: Optional[Sequence[str]] = None) -> Dict[str, dict]:
         """Run the entries in order (default: declaration order), each with the
-        test harness's inputs, over shared states.  Returns {entry: arrays}."""
+        test harness's inputs, over shared states.  Returns {entry: arrays} with
+        each entry's inputs, outputs and the states (the forward pass's lean
+        mode: a Llama project's weights and intermediates are not all held at
+        once)."""
         states = self.initial_states()
         out = {}
         for name in (calls or [n for n, _ in self.entries]):
             cg = self.cgs[name]
-            out[name] = cg._forward_pass(cg._build_ramp_inputs(), states=states)
+            g = cg._graph
+            keep = [t.onnx_name for t in g.input_tensors + g.output_tensors]
+            out[name] = cg._forward_pass(cg._build_ramp_inputs(), states=states, keep=keep)
         return out
 
     def generate_test(self) -> str:

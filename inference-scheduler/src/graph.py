@@ -16,7 +16,7 @@ OnnxGraph
 
 from __future__ import annotations
 import os
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import onnx
@@ -38,7 +38,7 @@ from .nodes  import (
 from .dtype  import DataType, AP_FIXED_16_8
 from ._conv_hw_config import CONV_TILE_IC
 from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
-from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES
+from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES, HostTable
 from .vit_nodes import VIT_OP_FACTORIES
 from . import fusion
 from . import matmul_lowering
@@ -105,6 +105,107 @@ def _detached_node(node: onnx.NodeProto) -> onnx.NodeProto:
     return out
 
 
+# Initializers above this many elements are weights, never the constant
+# inputs shape inference reads (Reshape shapes, Slice starts, ...).
+_LIGHT_INIT_ELEMS = 1 << 12
+
+
+def _copy_fields(dst, src, skip: str) -> None:
+    """Copy every set field of message ``src`` except ``skip`` into ``dst``."""
+    for fd, val in src.ListFields():
+        if fd.name == skip:
+            continue
+        if fd.is_repeated:
+            getattr(dst, fd.name).extend(val)
+        elif fd.type == fd.TYPE_MESSAGE:
+            getattr(dst, fd.name).CopyFrom(val)
+        else:
+            setattr(dst, fd.name, val)
+
+
+def _numel(init: onnx.TensorProto) -> int:
+    n = 1
+    for d in init.dims:
+        n *= int(d)
+    return n
+
+
+def _checked_inferred(model: onnx.ModelProto):
+    """``onnx.checker`` and shape inference without serialising the weights.
+
+    Both serialise the whole model several times (4-5 copies of the weights
+    at once, and a model over 2 GB cannot be serialised at all), so they run
+    on a structural copy in which every initializer of more than
+    ``_LIGHT_INIT_ELEMS`` elements is a graph input of the same type and
+    shape.  Returns ``(work, held)``: ``work`` is a new model — the inferred
+    structure with ``model``'s graph inputs and initializers, in their
+    order — and ``held`` {name: TensorProto of ``model``} the large
+    initializers read only as a MatMul's B or by ``axi.llm`` nodes (no
+    rewrite pass touches those): ``work`` carries a placeholder for each
+    (name, type and dims, no data) and the tensor registry reads the data
+    from ``model``.  ``model`` itself is not modified."""
+    g = model.graph
+    light = onnx.ModelProto()
+    _copy_fields(light, model, skip="graph")
+    _copy_fields(light.graph, g, skip="initializer")
+    have = {vi.name for vi in g.input}
+    for init in g.initializer:
+        if _numel(init) <= _LIGHT_INIT_ELEMS:
+            light.graph.initializer.append(init)
+        elif init.name not in have:
+            light.graph.input.append(onnx_helper.make_tensor_value_info(
+                init.name, init.data_type, list(init.dims)))
+    onnx.checker.check_model(light)
+    work = shape_inference.infer_shapes(light)
+    del light
+    plain: Dict[str, bool] = {}                 # name -> only MatMul B / axi.llm reads
+    for node in g.node:
+        for k, name in enumerate(node.input):
+            ok = (node.domain == LLM_DOMAIN
+                  or (node.op_type == "MatMul" and node.domain in ("", "ai.onnx") and k == 1))
+            plain[name] = plain.get(name, True) and ok
+    wg = work.graph
+    wg.ClearField("input")
+    wg.input.extend(g.input)
+    wg.ClearField("initializer")
+    held: Dict[str, onnx.TensorProto] = {}
+    for init in g.initializer:
+        if _numel(init) > _LIGHT_INIT_ELEMS and plain.get(init.name, False):
+            ph = wg.initializer.add()
+            ph.name, ph.data_type = init.name, init.data_type
+            ph.dims.extend(init.dims)
+            held[init.name] = init
+        else:
+            wg.initializer.append(init)
+    return work, held
+
+
+def share_constant_arrays(g: "OnnxGraph", pool: Dict[Tuple[str, str], np.ndarray]) -> None:
+    """Point g's constant arrays — tensor data, packed images, weight
+    exponents, state initial values and the nodes' host tables — at the
+    arrays ``pool`` holds for the same name when their contents are equal
+    (the entries of one model share every weight): one copy per array in
+    memory instead of one per graph.  New arrays join the pool.  The arrays
+    are read-only once encoded."""
+    def share(obj, attr: str, key: Tuple[str, str]) -> None:
+        a = getattr(obj, attr, None)
+        if not isinstance(a, np.ndarray) or a.nbytes < 4096:
+            return
+        b = pool.get(key)
+        if b is None:
+            pool[key] = a
+        elif b is not a and b.dtype == a.dtype and b.shape == a.shape and np.array_equal(a, b):
+            setattr(obj, attr, b)
+
+    for t in g._tensors.values():
+        for attr in ("data", "packed_data", "wexp", "init_data"):
+            share(t, attr, (t.onnx_name, attr))
+    for sn in g._nodes:
+        tab = getattr(sn, "table", None)
+        if isinstance(tab, HostTable):
+            share(tab, "data", (f"table:{tab.name}", "data"))
+
+
 class OnnxGraph:
     """Parsed, validated, and resolved ONNX computation graph."""
 
@@ -137,8 +238,7 @@ class OnnxGraph:
         # and initializers — initializers don't appear in value_info).
         shape_map: Dict[str, List[int]] = {}
         for init in graph.initializer:
-            arr = nph.to_array(init)
-            shape_map[init.name] = list(arr.shape)
+            shape_map[init.name] = [int(d) for d in init.dims]
         for vi in list(graph.input) + list(graph.value_info) + list(graph.output):
             dims = [
                 d.dim_value if d.HasField("dim_value") else 0
@@ -451,7 +551,8 @@ class OnnxGraph:
                  matmul_gemv="auto",
                  matmul_gemv_kw: "Dict[str, int]" = None,
                  fc_conv="auto",
-                 plan: "PlanOptions" = None) -> None:
+                 plan: "PlanOptions" = None,
+                 array_pool: "Dict[Tuple[str, str], np.ndarray]" = None) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
         produces its input (the kernel's `act` register) when the producer's
@@ -513,6 +614,12 @@ class OnnxGraph:
         TACTICS_PLAN.md).  ``None`` / disabled: every choice as without
         planning (the default); ``self.plan`` keeps the options.
 
+        array_pool: a dict shared by the graphs of one model (the entries
+        of a Llama project, src/llm_entries.py): constant arrays equal to a
+        pooled one of the same name are replaced by it
+        (``share_constant_arrays``) — once the weights are encoded and again
+        at the end — so the model's graphs hold one copy of each.
+
         Always applied (these ops were unsupported before): ``Constant``
         nodes become initializers and ``Split`` is lowered to one ``Slice``
         per output (``self.split_lowered_count``).
@@ -534,12 +641,11 @@ class OnnxGraph:
         _dtype      = dtype if dtype is not None else AP_FIXED_16_8
         align_elems = _dtype.align_elems
 
-        # Validate
-        onnx.checker.check_model(model)
+        # Validate and run shape inference so every intermediate tensor gets
+        # a shape; from here on ``model`` is this graph's own copy (the
+        # passes below rewrite it in place)
+        model, held = _checked_inferred(model)
         self.numeric = numeric.parse(model)
-
-        # Run shape inference so every intermediate tensor gets a shape
-        model = shape_inference.infer_shapes(model)
         self.opset = fusion.default_opset(model)
         self.constant_nodes_folded = fusion.fold_constant_nodes(model)
 
@@ -579,15 +685,16 @@ class OnnxGraph:
         # 1. Constant weights / initializers
         self._raw_consts: Dict[str, np.ndarray] = {}
         for init in graph.initializer:
-            arr = nph.to_array(init).copy()
+            arr = nph.to_array(held.get(init.name, init))
             if arr.size <= _RAW_CONST_MAX:
-                self._raw_consts[init.name] = arr
+                self._raw_consts[init.name] = arr.copy()
             ti  = TensorInfo(
                 onnx_name=init.name,
                 shape=list(arr.shape),
                 dtype=_onnx_dtype_name(init.data_type),
-                data=arr.astype(np.float32),   # always store as float32
+                data=np.array(arr, dtype=np.float32),   # always store as float32
             )
+            del arr
             self._tensors[init.name] = ti
 
         # 2. Graph inputs (may overlap with initializers for older opsets)
@@ -641,6 +748,10 @@ class OnnxGraph:
         self._output_names: List[str] = [
             vi.name for vi in graph.output
         ]
+        # The tensor registry holds the weights now: drop this graph's proto
+        # copy of them before the nodes are built.
+        graph.ClearField("initializer")
+        del held
 
         # ---------------------------------------------------------- #
         # Resolve nodes                                               #
@@ -698,6 +809,8 @@ class OnnxGraph:
         numeric.check(self._nodes, _dtype)
         self.weights_saturated = numeric.encode_matmul_weights(self._nodes, _dtype) \
             if numeric.is_active(self.numeric) else {}
+        if array_pool is not None:
+            share_constant_arrays(self, array_pool)
         self.act_fused_count = self._fuse_activations() if fuse_act else 0
         perf_model, self.plan_log = None, []
         if self.plan.enabled:
@@ -725,6 +838,8 @@ class OnnxGraph:
             # the issue order from the timed simulation (src/order_search.py)
             from .order_search import plan_order
             plan_order(self)
+        if array_pool is not None:
+            share_constant_arrays(self, array_pool)
 
     # ------------------------------------------------------------------ #
     # Integer tensors / Slice views                                        #
