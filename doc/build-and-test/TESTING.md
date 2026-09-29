@@ -138,7 +138,7 @@ make behavior_test_vectorop   # also: behavior_test_conv / _matmul / _pool
 make behavior_test            # all four in sequence
 
 # Block-design behavioural sim against the SystemVerilog testbench
-# (hw/cormorant_hw_128 submodule) — currently FAILS, see below
+# (hw/cormorant_hw_128 submodule; ~3 min, all four kernels through the PS VIP)
 make sim_hw_kv260
 ```
 
@@ -147,34 +147,37 @@ re-synthesises its kernel and rebuilds its driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
 manifests currently hold 119 VectorOP, 63 Conv, 39 Matmul and 43 Pool
-cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …).  These
-per-kernel targets are the RTL verification path.  They modify tracked
+cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …): each
+kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);
 do not commit them.
 
-**Known issue — `sim_hw_kv260` fails.**  The block-design testbench is
-stale: VectorOPKernel passes 19 / 25 (`bcast_relu6` and the five `sm_*`
-tests, which use `op=6`, a Softmax op the kernel no longer has, fail), then
-ConvKernel test 1 stops the simulation with an AXI protocol-checker fatal
-(`AXI4_ERRS_RDATA_X` on `S_AXI_HPC1_FPD`: the weight port reads bytes the
-testbench never wrote), so MatmulKernel and PoolingKernel never run.
-`scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS
-PASSED` (a missing log or an early stop is a failure), so the target fails.
-A passing run would end with:
+**`sim_hw_kv260`** runs the whole block design (the four kernels, the
+interconnects, the PS VIP's DDR model) against constant-fill test cases
+in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 
 ```
 ##########################################################
 ##  CORMORANT TESTBENCH — OVERALL RESULTS
 ##########################################################
-##  VectorOPKernel         N /   N  (0 failed)
-##  ConvKernel             N /   N  (0 failed)
-##  MatmulKernel           N /   N  (0 failed)
-##  PoolingKernel          N /   N  (0 failed)
+##        VectorOPKernel   22 /  22  (0 failed)
+##            ConvKernel   17 /  17  (0 failed)
+##          MatmulKernel   10 /  10  (0 failed)
+##         PoolingKernel   19 /  19  (0 failed)
 ##########################################################
-##  TOTAL: N / N passed
+##  TOTAL: 68 / 68 passed
 ##  ALL TESTS PASSED
 ##########################################################
 ```
+
+`scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS
+PASSED` (a missing log or an early stop, e.g. an AXI protocol-checker
+fatal, is a failure).  The testbench writes every buffer the way the
+kernels read it: whole 16-byte words, row starts aligned (VectorOP
+`a_inc` / `b_inc` are 0 or multiples of 8 elements) and ConvKernel
+weights in the packed tile-major layout (`tb_functions.svh`
+`conv_const_weights`); the LpPool p=2 reference mirrors the kernel's
+fixed-point `poly_sqrt` bit for bit.
 
 For PS-VIP / xsim quirks observed during simulation development see
 [`SIMULATION_ISSUES.md`](SIMULATION_ISSUES.md).
