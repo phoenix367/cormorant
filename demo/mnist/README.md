@@ -51,8 +51,8 @@ demo/mnist/
 — not committed in the repo.  Each copy bakes in the right
 `INFERENCE_<INPUT>_SIZE` / `INFERENCE_<OUTPUT>_SIZE` macros and a
 `bench_inference_init()` shim that calls `inference_init()` with the correct
-number of UIO arguments for the kernels that model actually uses (e.g. 3 for
-LeNet, 4 for the MNIST convnet).  That's why it's generated rather than
+number of UIO arguments for the kernels that model actually uses (both
+models use all 4 today; a model without a MatMul would get 3).  That's why it's generated rather than
 static: the I/O names and active-kernel set differ per model.
 
 ## Prerequisites
@@ -158,18 +158,23 @@ Nodes      : 9
 Model      : demo/mnist/assets/models/lenet_simplified.onnx
 Inputs     : ['import/Placeholder:0[1, 1, 28, 28]']
 Outputs    : ['import/conv4last/BiasAdd:0[1, 10, 1, 1]']
-Nodes      : 9
+Nodes      : 14
   [  0] Conv         [1, 1, 28, 28] x [32, 1, 5, 5] x [32] -> [1, 32, 28, 28]
   [  1] Relu         [1, 32, 28, 28] -> [1, 32, 28, 28]
   [  2] MaxPool      [1, 32, 28, 28] -> [1, 32, 14, 14]
   [  3] Conv         [1, 32, 14, 14] x [64, 32, 5, 5] x [64] -> [1, 64, 14, 14]
   [  4] Relu         [1, 64, 14, 14] -> [1, 64, 14, 14]
   [  5] MaxPool      [1, 64, 14, 14] -> [1, 64, 7, 7]
-  [  6] Conv         [1, 64, 7, 7] x [1024, 64, 7, 7] x [1024] -> [1, 1024, 1, 1]
-  [  7] Relu         [1, 1024, 1, 1] -> [1, 1024, 1, 1]
-  [  8] Conv         [1, 1024, 1, 1] x [10, 1024, 1, 1] x [10] -> [1, 10, 1, 1]
-Weights    : 3 large weight(s) written to build/projects/mnist_lenet/weights/
-[mnist_lenet] active kernels: VectorOPKernel, ConvKernel, PoolKernel
+  [  6] Flatten      [1, 64, 7, 7] -> [1, 3136]
+  [  7] MatMul       [1, 3136] x [3136, 1024] -> [1, 1024]
+  [  8] Reshape      [1, 1024] -> [1, 1024, 1, 1]
+  [  9] Add          [1, 1024, 1, 1] x [1, 1024, 1, 1] -> [1, 1024, 1, 1]
+  [ 10] Flatten      [1, 1024, 1, 1] -> [1, 1024]
+  [ 11] MatMul       [1, 1024] x [1024, 10] -> [1, 10]
+  [ 12] Reshape      [1, 10] -> [1, 10, 1, 1]
+  [ 13] Add          [1, 10, 1, 1] x [1, 10, 1, 1] -> [1, 10, 1, 1]
+Weights    : 4 large weight(s) written to build/projects/mnist_lenet/weights/
+[mnist_lenet] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
 wrote 2 project(s) under demo/mnist/build/projects
 
 === deploy_and_run ===
@@ -185,6 +190,7 @@ Preflight (local)
     OK        driver/xpoolingkernel.h   (PoolKernel)
     OK      project 'mnist_lenet' on disk
     OK        driver/xvectoropkernel.h  (VectorOPKernel)
+    OK        driver/xmatmulkernel.h    (MatmulKernel)
     OK        driver/xconvkernel.h      (ConvKernel)
     OK        driver/xpoolingkernel.h   (PoolKernel)
 
@@ -222,9 +228,8 @@ mnist_lenet
   make     → OK       2.7s
     bench_mnist: dataset=10000 images, iters=10000, warmup=50
                  input_numel=784, output_numel=10, classes=10
-    progress: 10000/10000 (100.0%) acc=97.35% mean=55.503ms rate=18.0ips
-  run      → OK               54.6s
-    accuracy = 97.35%   mean = 5.442 ms   throughput = 183.8 img/s
+  run      → OK               28.3s
+    accuracy = 97.35%   mean = 2.810 ms   throughput = 355.9 img/s
 
 cleanup /tmp/mnist_demo
 per-step logs written to demo/mnist/build/logs
@@ -234,23 +239,29 @@ per-step logs written to demo/mnist/build/logs
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
   mnist_convnet  OK       98.92%      0.266      0.265      0.272     3766.7
-  mnist_lenet    OK       97.35%      5.442      5.442      5.449      183.8
+  mnist_lenet    OK       97.35%      2.810      2.809      2.816      355.9
 ```
 
 Notable behaviour visible in the run:
 
-- **Active-kernel set differs per model.** `mnist_convnet` uses all four
-  HLS kernels because of its `MatMul` + `Add` classifier head;
-  `mnist_lenet` uses only three (Conv / Pool / VectorOP) because its
-  final classifier is a 1×1 `Conv` rather than a fully-connected layer.
-  `generate_project.py` emits a different `bench_glue.h` for each so
-  `inference_init()` gets the right number of UIO arguments.
+- **LeNet's fully-connected Convs run as MatMuls.** Its conv3 (7×7 over
+  the 7×7 map, 1024 outputs) and conv4last (1×1 on 1×1) each compute one
+  output pixel; the scheduler rewrites them as Flatten + `MatMul` +
+  Reshape + bias `Add` (`--fc-conv`, default `auto`), so conv3's 6.4 MB
+  weight streams through MatmulKernel's GEMV path (both read ports):
+  **5.44 → 2.81 ms per image** (183.8 → 355.9 img/s), accuracy unchanged —
+  see [`doc/plans/LENET_PLAN.md`](../../doc/plans/LENET_PLAN.md).  Both
+  models now use all four kernels; `generate_project.py` still emits a
+  `bench_glue.h` per model so `inference_init()` gets the right number of
+  UIO arguments.
+- **LeNet's 97.35 % is the model's own.** In float (onnxruntime, the same
+  p/256 inputs) it scores 97.37 %; the board agrees with float on 99.91 %
+  of the images.
 - **Large weights go to `weights/`.** Tensors over the inline-array
   threshold end up as external `.dat` files loaded at runtime by
   `fread()`: all four `mnist_lenet` conv weights (the 1024×64×7×7
-  fully-connected-equivalent `Conv` weight alone is 6.4 MB) and the
-  convnet's `MatMul` weight.  (The transcript above predates the current
-  scheduler, which writes 4 LeNet weights instead of 3.)
+  fully-connected-equivalent weight alone is 6.4 MB) and the convnet's
+  `MatMul` weight.
 - The full per-image timing series is also written to
   `build/results.json`.
 

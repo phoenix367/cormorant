@@ -1707,6 +1707,20 @@ the library names (`llm_model_name()`; `smollm2.model_id` /
 `/root/kv260_chat/lib/libsmollm2_360m.so` and `smollm2.cma_mb` to 760 in
 `chat_config.json`.  The board runs 135M by default.
 
+**Both sizes side by side (2026-09-28).**  The server now has a backend per
+size, each with its own library: `smollm2` (`libsmollm2.so`, the
+`smollm2` block, `--llm-*`) and `smollm2-360m` (`libsmollm2_360m.so`, the
+`smollm2_360m` block, `--llm-360m-*`; the sampling defaults are shared).
+The two libraries export the same `llm_*` API; ctypes loads each
+`RTLD_LOCAL`, so each keeps its own state (a host test loads two copies of
+the fake library side by side).  Two backends serving one model id are
+refused at startup.  On the board (`["smollm2-360m", "smollm2",
+"bert-squad", "smolvlm"]`, `--resident auto`): both answer through the API
+at their usual speeds (360M 3.6–4.0 tok/s, 135M 9.9 tok/s, alternating
+requests at temperature 0); 740 + 286 MiB do not fit
+together, so they swap — the first load of each from the SD card took
+53.4 s / 21.3 s, later swaps 1.7 s / 0.8 s.
+
 
 ## 21. The study stage, reproducible (2026-09-28)
 

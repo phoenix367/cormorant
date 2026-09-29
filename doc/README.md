@@ -93,4 +93,5 @@ line at the top says what is done.
 | [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (60.3 ms = 16.6 FPS) |
 | [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference (962 ms p50 on 2026-09-28), accuracy equal to float32 |
 | [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
+| [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |

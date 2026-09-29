@@ -118,13 +118,20 @@ expensive. So the board runs a **persistent** inference host:
 * **Board setup** — the board-side capture loop needs these in the Python
   interpreter named by `run.board_python`:
 
-  ```bash
-  # RealSense — librealsense + the Python bindings
-  sudo apt-get install -y librealsense2-utils python3-pyrealsense2
-  # ... or, if your distro lacks the package, build librealsense from source:
-  #   https://github.com/IntelRealSense/librealsense  (enable -DBUILD_PYTHON_BINDINGS=ON)
+  RealSense is **not** in the apt sources of the stock Kria Ubuntu 22.04
+  (arm64) image: `apt-cache policy librealsense2-utils python3-pyrealsense2`
+  lists no candidate, so the `apt-get` line below only works where a
+  RealSense package repository is configured.  Otherwise build librealsense
+  with its Python bindings from source
+  ([IntelRealSense/librealsense](https://github.com/IntelRealSense/librealsense),
+  `-DBUILD_PYTHON_BINDINGS=ON`) — untested here: this README has no
+  verified build recipe for the board (4 GB RAM, no swap).
 
-  # OpenCV + numpy
+  ```bash
+  # RealSense — librealsense + the Python bindings (where a package exists)
+  sudo apt-get install -y librealsense2-utils python3-pyrealsense2
+
+  # OpenCV + numpy (in the Kria apt sources)
   sudo apt-get install -y python3-opencv python3-numpy
   ```
 

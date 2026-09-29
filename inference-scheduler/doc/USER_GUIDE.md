@@ -145,7 +145,10 @@ into that node's call through the kernel's `act` register (CLI default;
 Bias (`Conv` with three inputs) is supported: the bias add is fused into the
 `run_conv()` dispatch call alongside the convolution.  A stride-2 `Conv` on
 ≤ 4 input channels is rewritten as a host-side `SpaceToDepth(2)` plus a
-stride-1 `Conv` (CLI default; `--no-s2d-stem` disables it).
+stride-1 `Conv` (CLI default; `--no-s2d-stem` disables it).  A
+fully-connected `Conv` (the kernel covers the whole unpadded input: one
+output pixel) runs as a `MatMul` on MatmulKernel where the cost model
+estimates it faster (`--fc-conv`, default `auto`).
 
 ### PoolingKernel (2-D pooling, NCHW)
 
@@ -221,7 +224,7 @@ python3 -m venv .venv
 ```
 
 Dependencies (from `requirements.txt`): `onnx`, `numpy`, `paramiko`
-(remote-test runners), plus `onnxsim`, `onnxoptimizer`, `onnxruntime`
+(remote-test runners), `pytest` (the test suite), plus `onnxsim`, `onnxoptimizer`, `onnxruntime`
 (used by [`simplify_onnx.py`](../simplify_onnx.py) — see
 [MODEL_PREPARATION.md](MODEL_PREPARATION.md)).
 
@@ -246,6 +249,7 @@ python inference_scheduler.py --entry NAME=MODEL.onnx [--entry ...] [options]
 | `--no-report` | off | Skip writing `report.md`. Default is to always emit a human-readable model summary alongside the C project — see [§11](#11-generated-report-reportmd). |
 | `--no-fuse-act` | off | Do not fold `Relu` / `Clip(0,6)` into the VectorOP call that produces their input (the kernel's `act` register). |
 | `--no-s2d-stem` | off | Do not rewrite stride-2 `Conv` layers with ≤ 4 input channels as host `SpaceToDepth(2)` + stride-1 `Conv` ([§Space-to-depth stem](../../doc/scheduler/INFERENCE_SCHEDULER.md#space-to-depth-stem)). |
+| `--fc-conv {auto,always,off}` | `auto` | Run fully-connected `Conv` layers (kernel = the whole unpadded input, one output pixel, e.g. LeNet's 7×7 conv on a 7×7 map) as Flatten + `MatMul` + Reshape + bias `Add` on MatmulKernel (GEMV for one image): `auto` where the cost model estimates it ≥ 20 % faster, `always`, `off` ([§Fully-connected Convs](../../doc/scheduler/INFERENCE_SCHEDULER.md#fully-connected-convs)). Bit-identical unless the sum before the bias saturates. |
 | `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/scheduler/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/scheduler/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
 | `--matmul-on-conv {auto,always,off}` | `auto` | Run MatMuls on ConvKernel with swapped operand roles: `auto` where the cost model estimates it faster, `always` for every eligible MatMul, `off` for none ([§MatMul on ConvKernel](../../doc/scheduler/INFERENCE_SCHEDULER.md#matmul-on-convkernel)). Bit-identical either way. |
 | `--no-matmul-on-conv` | off | Same as `--matmul-on-conv off`. |
@@ -740,16 +744,25 @@ standalone BSP headers (xil_cache, xparameters).
 cd <out_dir>
 sh scripts/check_inference_setup.sh   # verify XRT prerequisites
 mkdir build && cd build
-cmake .. -DINFERENCE_TARGET=LINUX
+cmake .. -DINFERENCE_TARGET=LINUX \
+    -DINFERENCE_VECTOROPKERNEL_INSTANCE=\"fabric_vecop\" \
+    -DINFERENCE_MATMULKERNEL_INSTANCE=\"fabric_matmul\" \
+    -DINFERENCE_CONVKERNEL_INSTANCE=\"fabric_conv\" \
+    -DINFERENCE_POOLKERNEL_INSTANCE=\"fabric_pool\"
 make
 ```
 
 CMake selects each active kernel's `driver/x<kernel>_linux.c` and links
 against XRT (`pkg-config xrt`, else `-DXRT_DIR=<prefix>`, default
-`/opt/xilinx/xrt`, for `libxrt_core.so`).  Kernel instance names can be
-fixed at configure time with `-DINFERENCE_<KERNEL>_INSTANCE=<uio name>`
-(e.g. `-DINFERENCE_VECTOROPKERNEL_INSTANCE=\"fabric_vecop\"`); they are used
-by `test_inference` (`-DINFERENCE_BUILD_TEST=OFF` skips building it).
+`/opt/xilinx/xrt`, for `libxrt_core.so`).  The
+`-DINFERENCE_<KERNEL>_INSTANCE=<uio name>` defines fix the kernel instance
+names `test_inference` opens (`-DINFERENCE_BUILD_TEST=OFF` skips building
+it): the generated `inference.h` defaults (`VectorOPKernel_0`, …) are not
+the names of the Cormorant overlay (`fabric_*`, `dts/kv260/cormorant.dts`),
+and without the defines `inference_init()` fails.  Defines of kernels the
+model does not use are ignored (CMake warns that they were not used).
+Building the Vitis-generated ConvKernel driver prints `xconvkernel_linux.c:
+… warning: format '%x' expects …`; it is expected.
 
 ### Driver Sources
 
@@ -757,8 +770,8 @@ If `--driver-dir` was not supplied, copy the driver sources of every kernel
 the model uses before building (flat, no per-kernel sub-directories):
 
 ```bash
-cp <axi_demo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/*.{c,h} <out_dir>/driver/
-cp <axi_demo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/*.{c,h} <out_dir>/driver/
+cp <repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/*.{c,h} <out_dir>/driver/
+cp <repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/*.{c,h} <out_dir>/driver/
 # ... MatmulKernel_v1_0, PoolingKernel_v1_0 likewise (under hls/impl/ip)
 ```
 
@@ -773,7 +786,7 @@ The drivers are generated by Vitis HLS synthesis. See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1547 tests collected; test_bert_base.py is opt-in
+# Run the full test suite (1564 tests collected; test_bert_base.py is opt-in
 # via BERT_SQUAD_MODEL and skips otherwise)
 .venv/bin/python -m pytest test/ -v
 

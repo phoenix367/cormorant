@@ -67,6 +67,10 @@ Options:
   --no-report                Skip report.md
   --no-fuse-act              Keep Relu / Clip(0,6) as separate VectorOP calls
   --no-s2d-stem              Keep stride-2 Convs on <= 4 channels as they are
+  --fc-conv {auto,always,off}
+                             Fully-connected Convs (kernel = whole input, one output
+                             pixel) as MatMul on MatmulKernel (default auto: >= 20 %
+                             faster by the cost model; src/fc_conv.py)
   --no-fuse-patterns         No LayerNorm / GELU fusion, no constant-broadcast
                              normalisation
   --matmul-on-conv {auto,always,off}
@@ -90,9 +94,10 @@ Planning (src/planning.py, ../doc/plans/TACTICS_PLAN.md; bit-identical results):
 ```
 
 The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
-`matmul_on_conv="auto"` and `matmul_gemv="auto"`; the `OnnxGraph` library
-defaults are `fuse_act=False`, `s2d_stem=False`, `fuse_patterns=True`,
-`matmul_on_conv="auto"`, `matmul_gemv="auto"`, `plan=None` (off).
+`matmul_on_conv="auto"`, `matmul_gemv="auto"` and `fc_conv="auto"`; the
+`OnnxGraph` library defaults are `fuse_act=False`, `s2d_stem=False`,
+`fuse_patterns=True`, `matmul_on_conv="auto"`, `matmul_gemv="auto"`,
+`fc_conv="auto"`, `plan=None` (off).
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
 
@@ -208,6 +213,7 @@ src/
   tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV)
   order_search.py        issue-order search on the timed event-stream replay (codegen/timing.py)
   matmul_gemv.py         MatmulKernel GEMV streaming pass (single-row MatMuls, B image)
+  fc_conv.py             fully-connected Convs -> Flatten + MatMul + Reshape (+ bias Add)
   llm_entries.py         Llama entry graphs: prefill kernel widths shared with the
                          GEMV decode, one copy of every weight
   cost_model.py          ConvKernel / MatmulKernel (tiled + GEMV) cycle estimates
@@ -244,7 +250,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              66 pytest modules, 1547 tests collected (1542 pass, 5 skip;
+  test_*.py              67 pytest modules, 1564 tests collected (1559 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

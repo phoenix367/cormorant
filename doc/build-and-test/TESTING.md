@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1547 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1564 tests); the chat app (153 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -29,7 +29,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1547 tests in 66 modules (1542 pass; 5 skip: the four opt-in
+# Run all 1564 tests in 67 modules (1559 pass; 5 skip: the four opt-in
 # test_bert_base.py tests and one test_cli.py test that needs an HLS driver build)
 .venv/bin/python -m pytest test/ -q
 
@@ -75,25 +75,44 @@ boundary models derived from `platforms/<AXI_PLATFORM>.json`
 an existing platform's bounds*) — re-run the generators after any
 `max_*` change in a platform JSON.
 
+### Chat app tests
+
+The chat server's tests ([`demo/chat/`](../../demo/chat/README.md#tests))
+run with the same venv, from the repo root:
+
+```bash
+inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 153 tests
+```
+
+About 60 of them skip in a fresh clone, until the assets they read are
+present: the SmolLM2 tokenizer (`demo/chat/scripts/llm_calibrate.py fetch`),
+the SmolVLM tokenizer (`demo/chat/scripts/vlm_study.py fetch`), BERT's
+`vocab.txt` (the [`bert_squad/`](../../demo/bert_squad/README.md) assets)
+and Pillow.
+
 ---
 
 ## 2. HLS C-sim (no hardware)
 
-Each kernel ships with a C++ reference test executed by `ctest`:
+Each kernel ships with a C++ reference test executed by `ctest`.  The
+kernel headers include the Vitis HLS headers, so source Vitis first:
 
 ```bash
+source <Xilinx>/2025.2/Vitis/settings64.sh
 cd build && cmake ..
 
-make TestSimulation   # VectorOPKernel
-make TestConvRef      # ConvKernel
-make TestMatmulRef    # MatmulKernel
-make TestPoolingSim   # PoolingKernel
+make -j8              # every C-simulation executable
 ctest                 # run all registered tests
 ```
 
-`ctest` also runs `TestConvGrid` (MAC-grid unit test), `TestConvSweep`
-(`TestConvRef --sweep 300`, randomised geometries, ~1 min) and, when a BLAS
-is found at configure time, `TestMatmulBlas`.
+Plain `make` builds every test executable `ctest` registers: `TestSimulation`
+(VectorOPKernel), `TestConvRef` and `TestConvGrid` (ConvKernel, MAC-grid unit
+test), `TestMatmulRef` (MatmulKernel), `TestPoolingSim` (PoolingKernel) and,
+when a BLAS is found at configure time, `TestMatmulBlas`.  Or build them one
+by one: `make TestSimulation TestConvRef TestConvGrid TestMatmulRef
+TestPoolingSim` (+ `TestMatmulBlas`); a registered test whose executable is
+missing shows as *Not Run* and fails `ctest`.  `ctest` also runs
+`TestConvSweep` (`TestConvRef --sweep 300`, randomised geometries, ~1 min).
 
 These tests exercise the kernel C++ source directly without HLS
 synthesis, so they catch logic regressions in seconds.
@@ -108,8 +127,9 @@ per-kernel IP archives produced by HLS synthesis must exist first.
 ```bash
 cd build
 
-# Prerequisite: HLS synthesis (~10 min for all four kernels)
-source <Xilinx install dir>/settings64.sh
+# Prerequisite: HLS synthesis (~5–10 min for all four kernels); Vitis's
+# settings64.sh puts vitis-run, vivado and xclbinutil on PATH
+source <Xilinx>/2025.2/Vitis/settings64.sh
 make synthesize_kv260
 
 # Per-kernel RTL behaviour tests (hw/cormorant_test_stand submodule):
@@ -118,17 +138,29 @@ make behavior_test_vectorop   # also: behavior_test_conv / _matmul / _pool
 make behavior_test            # all four in sequence
 
 # Block-design behavioural sim against the SystemVerilog testbench
-# (hw/cormorant_hw_128 submodule)
+# (hw/cormorant_hw_128 submodule) — currently FAILS, see below
 make sim_hw_kv260
 ```
 
-Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` and fails when
+Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (so it
+re-synthesises its kernel and rebuilds its driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
-manifests currently hold 119 VectorOP, 63 Conv, 39 Matmul and 43 Pool cases.
+manifests currently hold 119 VectorOP, 63 Conv, 39 Matmul and 43 Pool
+cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …).  These
+per-kernel targets are the RTL verification path.  They modify tracked
+files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);
+do not commit them.
 
-`sim_hw_kv260` ends with a summary in this format (one line per kernel
-scoreboard; counts depend on the testbench's test lists):
+**Known issue — `sim_hw_kv260` fails.**  The block-design testbench is
+stale: VectorOPKernel passes 19 / 25 (`bcast_relu6` and the five `sm_*`
+tests, which use `op=6`, a Softmax op the kernel no longer has, fail), then
+ConvKernel test 1 stops the simulation with an AXI protocol-checker fatal
+(`AXI4_ERRS_RDATA_X` on `S_AXI_HPC1_FPD`: the weight port reads bytes the
+testbench never wrote), so MatmulKernel and PoolingKernel never run.
+`scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS
+PASSED` (a missing log or an early stop is a failure), so the target fails.
+A passing run would end with:
 
 ```
 ##########################################################
@@ -176,11 +208,13 @@ The two fields you must set are:
 
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
-  Vitis-HLS-generated driver sources for each kernel, e.g.:
+  Vitis-HLS-generated driver sources for each kernel (the example's
+  `../build/…` paths, relative to `inference-scheduler/`, fit a build in
+  `<repo>/build`), e.g.:
 
   ```
-  "VectorOPKernel": "<cormorant_base>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
-  "ConvKernel":     "<cormorant_base>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
+  "VectorOPKernel": "<repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
+  "ConvKernel":     "<repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
   ```
 
 The `remote.uio_devices` map must list the UIO sysfs name for every
@@ -253,8 +287,12 @@ first run:
 ```bash
 cd inference-scheduler
 cp perf_config.json.example perf_config.json
-$EDITOR perf_config.json   # set ssh.host and local.driver_dirs
+$EDITOR perf_config.json   # set ssh.host; the example's remote.uio_devices are the
+                           # fabric_* names and its local.driver_dirs point at <repo>/build
 ```
+
+The copy (`perf_config*.json`, like the other per-user configs) is not
+tracked.
 
 **Config file:** `perf_config.json` — extends the same SSH schema as
 the correctness configs with an additional `benchmarks` section.
@@ -281,8 +319,6 @@ reference in `REMOTE_TESTING.md`.
 
 ```bash
 cd inference-scheduler
-
-# Edit local.driver_dirs paths, then:
 
 # Full benchmark run (all enabled kernels)
 .venv/bin/python run_remote_perf.py --config perf_config.json
@@ -397,4 +433,5 @@ appear as:
 | `ConvKernel` | `fabric_conv` |
 | `PoolingKernel` | `fabric_pool` |
 
-Verify on the board: `cat /sys/class/uio/uio*/name`
+Verify on the board: `cat /sys/class/uio/uio*/name` (the Kria image lists
+four `axi-pmon` devices first, uio0–3; the kernels follow as uio4–7).

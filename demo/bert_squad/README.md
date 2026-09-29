@@ -114,8 +114,10 @@ curl -L -o assets/models/bertsquad-12.onnx \
 
 The download is 435 852 736 bytes; the simplified model (434 997 241
 bytes, md5 `f6818d482d18e703fbd8d7c3b609a98a`) is the file the results
-below were measured with.  Any other location works — set `model` in the
-config.
+below were measured with.  Its size and md5 depend on the installed onnx /
+onnxsim versions: a newer onnxsim writes a slightly different file (e.g.
+434 997 888 bytes with onnx 1.23.0 / onnxsim 0.7.3) that gives the same
+results.  Any other location works — set `model` in the config.
 
 ## Run
 

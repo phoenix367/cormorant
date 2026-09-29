@@ -27,15 +27,16 @@ KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26 to 2
 |---|---|---|
 | ResNet-18, 224×224 | **60.3 ms (16.6 FPS)** per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
 | MobileNet V1 / V2, 224×224 | 81.0 / 63.9 ms per image | [BERT_PLAN §3](doc/plans/BERT_PLAN.md) |
-| MNIST convnet / LeNet | 0.268 / 5.445 ms per image, 98.92 / 97.35 % top-1 | [BERT_PLAN §3](doc/plans/BERT_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| MNIST convnet / LeNet | 0.268 / 2.810 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
 | BERT-base SQuAD (bertsquad-12, 256 tokens) | **962 ms** per inference (p50; 951 ms built with `--plan`), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
 | SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md) |
 | SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
 
 The BERT, SmolLM2 and SmolVLM logits are bit-exact with the scheduler's simulation.
-The FPGA design uses 81 % of the DSPs (1009 / 1248), 73 % of the LUTs,
-111.5 / 144 BRAM and 48 / 64 URAM ([RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)).
+The FPGA design (`hw/cormorant_hw_128` d7ce129) uses 85 % of the DSPs
+(1058 / 1248), 79.7 % of the LUTs (93 303 / 117 120), 115.5 / 144 BRAM and
+56 / 64 URAM.
 
 ---
 
@@ -130,9 +131,12 @@ The kernel headers include the Vitis HLS headers, so source Vitis first.
 ```bash
 source <Xilinx>/2025.2/Vitis/settings64.sh
 mkdir build && cd build && cmake ..
-make TestSimulation TestConvRef TestConvGrid TestMatmulRef TestPoolingSim
+make -j8     # every C-simulation executable (incl. TestMatmulBlas when a BLAS was found)
 ctest
 ```
+
+Or build them one by one: `make TestSimulation TestConvRef TestConvGrid
+TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
 
 ### 3. The scheduler and its tests
 
@@ -140,7 +144,7 @@ ctest
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1547 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1564 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -149,10 +153,24 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```bash
 cd build
 cmake .. -DAXI_BUS_WIDTH=128     # the block design is 128-bit
-make synthesize_kv260            # HLS synthesis + IP export of all four kernels
+make synthesize_kv260            # HLS synthesis + IP export + C drivers of all four kernels
 make build_hw_kv260              # Vivado: bitstream in hw/cormorant_hw_128/.../impl_1/
 make dtbo_kv260_cormorant        # device-tree overlay: build/dts/kv260/design_cormorant.dtbo
 ```
+
+`make build_hw_kv260` runs the four HLS syntheses itself, so the separate
+`synthesize_kv260` step is only needed for the C drivers
+(`build/kernels/*/…/drivers`, used by the board tests and the demos)
+without a bitstream build.  Every synthesis deletes and rebuilds its
+kernel's driver directory, so do not generate demo or test projects while
+one runs.  `hw/cormorant_hw_128/build.sh` uses the `vivado` that Vitis's
+`settings64.sh` put on `PATH`.  Expected warnings: Vivado's `File not found
+as '…/utils_1/imports/synth_1/design_cormorant_wrapper.dcp'; using path …`
+(the project file carries the maintainer's old incremental-synthesis
+checkpoint path; incremental synthesis is off) and `dtc`'s `reg_format` /
+`avoid_default_addr_size`.  The build (and the RTL behaviour tests) modify
+tracked `.bd` / `.xci` / `.xpr` files in the `hw/` submodules — do not
+commit them.
 
 See [doc/build-and-test/BUILD_TARGETS.md](doc/build-and-test/BUILD_TARGETS.md) for every target.
 
@@ -168,8 +186,12 @@ the board hangs ([CHAT_PLAN §18](doc/plans/CHAT_PLAN.md)).  `demo/chat/deploy.p
 installs the rule; by hand:
 
 ```bash
-sudo cp board/kv260/kv260-no-cpu-powerdown.conf /etc/tmpfiles.d/
+# from the host (the checkout)
+scp board/kv260/kv260-no-cpu-powerdown.conf root@<board>:/tmp/
+# on the board
+sudo cp /tmp/kv260-no-cpu-powerdown.conf /etc/tmpfiles.d/
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/kv260-no-cpu-powerdown.conf
+cat /sys/devices/system/cpu/cpu*/cpuidle/state1/disable    # 1 for every core
 ```
 
 Then, from the host:
@@ -178,8 +200,12 @@ Then, from the host:
 cd inference-scheduler
 cp bitstream_config_kv260.json.example bitstream_config_kv260.json   # set ssh.host and the paths
 .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
-# on the board: cat /sys/class/uio/uio*/name  →  fabric_vecop fabric_matmul fabric_conv fabric_pool
+# on the board: cat /sys/class/uio/uio*/name  →  axi-pmon (×4, uio0–3), fabric_vecop fabric_matmul fabric_conv fabric_pool
 ```
+
+If the same design is already loaded under another overlay name,
+`upload_bitstream.py` stops with `Overlay '<name>' did not apply …`; see
+[REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy).
 
 ### 6. Run on the board
 
@@ -196,9 +222,9 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1547 tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (149 tests) |
-| Kernel C simulation | Vitis HLS headers, gcc, CMake | `make TestSimulation TestConvRef TestConvGrid TestMatmulRef TestPoolingSim && ctest` |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1564 tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (153 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers and Pillow is installed) |
+| Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |

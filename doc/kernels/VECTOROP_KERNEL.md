@@ -255,7 +255,7 @@ when a dependent op needs the result.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestSimulation && ctest
+make TestSimulation && ctest -R TestSimulation
 
 # HLS synthesis + IP export for KV260
 make synthesize_vectorop_kv260

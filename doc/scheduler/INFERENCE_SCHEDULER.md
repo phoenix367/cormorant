@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1547 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1564 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -203,6 +203,9 @@ inference_scheduler.py          CLI, argument parsing
 3. `fusion.fold_constant_nodes()` — `Constant` nodes become initializers.
 4. `_preprocess_model()` — rewrites `Gemm` → `MatMul` + optional `Add`.
 5. `fusion.lower_split()` — `Split` becomes one `Slice` per output.
+5b. `fc_conv.lower_fc_convs()` (`fc_conv="auto"`, the default) —
+   fully-connected Convs become Flatten + MatMul + Reshape (+ bias Add),
+   see [§Fully-connected Convs](#fully-connected-convs).
 6. `_space_to_depth_stems()` (when `s2d_stem=True`, see below).
 7. `fusion.fuse_patterns()` (when `fuse_patterns=True`, the default) —
    LayerNorm / GELU fusion and VectorOP constant-broadcast normalisation.
@@ -245,6 +248,29 @@ like the Gemm rewrite: it inserts the `SpaceToDepth`
 node, appends the `<W>_s2d` initializer and replaces the Conv, so the
 tensor registry, `ConvNode` validation / weight packing and the report see
 an ordinary graph.
+
+### Fully-connected Convs
+
+A `Conv` whose kernel covers its whole unpadded input computes one output
+pixel per image — a fully-connected layer (LeNet's 7×7 conv on a 7×7 map,
+a 1×1 conv on a 1×1 map).  ConvKernel streams such a weight through one
+128-bit port for a single pixel; `fc_conv.lower_fc_convs()` rewrites it
+on the ONNX model as `Flatten(x)` → `MatMul(·, W')` → `Reshape([N, M, 1,
+1])` → `Add(b)`, with `W'[(c·H + h)·W + w][m] = W[m][c][h][w]` (Flatten's
+order), so a batch-1 layer runs on MatmulKernel's GEMV path (both read
+ports).  Eligible: group 1, dilations 1, pads 0, kernel = input H × W,
+constant weight / bias, C·H·W ≤ `max_k`.  `fc_conv="auto"` (library and
+CLI default) rewrites where the engine cost model — ConvKernel cycles
+against GEMV (or tiled) MatmulKernel cycles plus one VectorOP call for the
+bias — estimates the MatMul ≥ 20 % faster; `"always"` / `"off"`
+(`--fc-conv`).  A following `Relu` still fuses into the bias `Add`.
+Bit-identical except where the sum before the bias saturates (the Conv
+adds the bias inside its accumulator; the MatMul saturates first).
+`OnnxGraph.fc_conv_stats` = `{lowered, kept, conv_cycles, matmul_cycles}`;
+`report.md` lists the rewrite.  LeNet: 5.44 → 2.81 ms on the board
+([LENET_PLAN](../plans/LENET_PLAN.md)); MobileNet v1's 1001-way 1×1
+classifier stays a Conv (GEMV needs m % 8 == 0, the tiled MatMul is not
+faster).
 
 **VectorOPKernel alignment contract** (kernel ports are 128-bit words):
 every DMA buffer base is 64-byte aligned, every broadcast `CHUNK_STRIDE`

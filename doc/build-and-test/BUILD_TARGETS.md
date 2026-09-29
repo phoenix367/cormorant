@@ -22,9 +22,11 @@ Key configure-time cache variables:
 | `VA_ENABLE_VITIS_FLOW` | `OFF` | VectorOPKernel Vitis `hw` / `hw_emu` xclbin targets (needs an installed Vitis platform, `VA_PLATFORM`) |
 
 Synthesis / cosim / hardware targets require **Vitis 2025.2** — source
-`settings64.sh` before invoking them. The C-simulation targets need only
+`<Xilinx>/2025.2/Vitis/settings64.sh` (it puts `vitis-run`, `vivado` and
+`xclbinutil` on `PATH`) before invoking them. The C-simulation targets need only
 the Vitis HLS headers (`ap_fixed.h`, `ap_int.h`, `hls_burst_maxi.h`, found
-via `$XILINX_HLS` / `$XILINX_VITIS` or `/mnt/data/xilinx/2025.2/Vitis/include`):
+via `$XILINX_HLS` / `$XILINX_VITIS`, else the built-in fallback
+`/mnt/data/xilinx/2025.2/Vitis/include`, the maintainer's install):
 every kernel header includes them unconditionally, so the CMake `float`
 fallback taken when they are missing no longer compiles.
 
@@ -80,7 +82,7 @@ as a dependency — build it with `make` / `make TestConvGrid` first.
 
 C synthesis + Vivado IP-catalog export, one component per kernel. Requires
 Vitis HLS. Target clock is the platform JSON's `clock` (150 MHz for
-`kv260`). The exported archive lands in `build/kernels/<k>/<platform>/ip_catalog`;
+`kv260`). The exported archive lands in `build/kernels/<k>/<platform>/ip_catalog.zip`;
 the IP directory the test stand uses is
 `build/kernels/<k>/<platform>/<k>_<platform>/hls/impl/ip` for conv / matmul /
 pool (Vitis unified component flow) and
@@ -96,7 +98,10 @@ VectorOPKernel (legacy `open_project` flow).
 | `synthesize_kv260` | Aggregate — all four kernels |
 
 A `synthesize_<kernel>_<platform>` target is generated for every
-`platforms/<platform>.json` file.
+`platforms/<platform>.json` file.  The targets always re-run: each starts
+by deleting its HLS project, so the kernel's C driver directory
+(`…/impl/ip/drivers`) is missing until the synthesis finishes — do not
+generate projects that copy the drivers meanwhile.
 
 ---
 
@@ -158,7 +163,10 @@ target's exit code.
 | `behavior_test` | Aggregate — all four kernels in sequence |
 
 Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (the IP catalogue
-must exist at the revision the test stand's `.xpr` references).
+must exist at the revision the test stand's `.xpr` references).  All four
+pass (119 VectorOP, 63 Conv, 39 Matmul, 43 Pool cases).  The runs modify
+tracked `.bd` / `.xci` / `.xpr` files of `hw/cormorant_test_stand`; do not
+commit them.
 
 ---
 
@@ -168,9 +176,9 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 
 | Target | Description |
 |--------|-------------|
-| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`; configure with `-DAXI_BUS_WIDTH=128` |
-| `sim_hw_kv260` | Hardware-level simulation of the integrated design |
-| `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260 |
+| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-runs all four HLS syntheses first; configure with `-DAXI_BUS_WIDTH=128`. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
+| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench). **Currently fails** — the testbench is stale (see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
+| `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260; `dtc`'s `reg_format` / `avoid_default_addr_size` warnings are expected |
 
 ---
 

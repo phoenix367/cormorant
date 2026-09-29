@@ -600,7 +600,7 @@ comparison.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run).
-make TestPoolingSim && ctest
+make TestPoolingSim && ctest -R TestPoolingSim
 
 # HLS synthesis + IP export for KV260.
 make synthesize_pool_kv260

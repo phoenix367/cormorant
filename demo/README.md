@@ -16,7 +16,7 @@ takes its board settings from `bert_squad/bert_squad_config.json`.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.27 / 5.4 ms per image) |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.27 / 2.8 ms per image) |
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 60.3 ms = 16.6 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (962 ms per inference) |

@@ -96,7 +96,8 @@ python3 -m venv .venv
 cp image_classification_config.json.example image_classification_config.json
 $EDITOR image_classification_config.json    # set ssh.host, key_file, etc.
 
-# Drop a few JPG/PNG files into assets/images/
+# Drop a few JPG/PNG files into assets/images/ (the repo ships one,
+# greyfox-672194.JPEG, the image of the sample output below)
 cp ~/Pictures/cat.jpg assets/images/
 cp ~/Pictures/dog.jpg assets/images/
 ```
@@ -348,7 +349,8 @@ Edit `image_classification_config.json`:
 ## Troubleshooting
 
 * **`assets/images/` is empty** — drop at least one JPG/PNG into that
-  folder before running `download_assets.py`.
+  folder before running `download_assets.py` (a checkout ships
+  `greyfox-672194.JPEG` there).
 * **`gdown failed`** — Google Drive sometimes throttles.  Run
   `python3 -m gdown --folder <url> -O assets/models/` manually, or download
   the `.onnx` file via a browser and place it in `assets/models/`.

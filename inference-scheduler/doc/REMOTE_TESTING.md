@@ -27,10 +27,10 @@ fails the test.
   ```
 - Driver sources from Vitis HLS synthesis (for `local.driver_dirs` in the config):
   ```
-  <axi_demo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/
-  <axi_demo>/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src/
-  <axi_demo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
-  <axi_demo>/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src/
+  <repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/
+  <repo>/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src/
+  <repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
+  <repo>/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src/
   ```
 
 ### Remote board (KV260)
@@ -65,7 +65,7 @@ leave `ssh.key_file` null.
 ### 2. Config files
 
 Copy the appropriate example(s) and set your board's IP (the `*.example`
-files are the tracked templates; the copies stay local):
+files are the tracked templates; the copies are gitignored):
 
 ```bash
 # Bitstream upload
@@ -81,7 +81,11 @@ cp perf_config.json.example perf_config.json
 $EDITOR perf_config.json
 ```
 
-Minimum required change in all configs: set `ssh.host` to your board's IP or hostname.
+Minimum required change in all configs: set `ssh.host` to your board's IP or
+hostname.  The remote / perf examples' `remote.uio_devices` are the
+`fabric_*` names of the Cormorant overlay and their `local.driver_dirs`
+(`../build/kernels/…`, relative to `inference-scheduler/`) the driver
+directories of a build in `<repo>/build`.
 
 ---
 
@@ -107,7 +111,7 @@ Minimum required change in all configs: set `ssh.host` to your board's IP or hos
 | `build.timeout` | `180` | Combined cmake + make timeout in seconds |
 | `run.timeout` | `120` | Per-model `test_inference` execution timeout in seconds |
 | `run.use_sudo` | `true` | Prefix the test binary with `sudo -n`; requires passwordless sudo |
-| `cleanup` | `true` | Remove `remote.work_dir` after all tests finish |
+| `cleanup` | `true` | After all tests finish, remove the run's directories under `remote.work_dir`, then `remote.work_dir` itself when it is empty |
 | `models` | `[]` | List of model paths relative to the `inference-scheduler` directory |
 
 ### UIO device names
@@ -138,10 +142,15 @@ grep -B3 'generic-uio' dts/kv260/cormorant.dts
 # fabric_pool: fabric_pool@a0030000 {
 ```
 
-Verify on the board after loading the DTBO:
+Verify on the board after loading the DTBO (the Kria Ubuntu image's four
+`axi-pmon` performance monitors come first, uio0–3):
 
 ```bash
 cat /sys/class/uio/uio*/name
+# axi-pmon
+# axi-pmon
+# axi-pmon
+# axi-pmon
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
@@ -193,16 +202,32 @@ what PYNQ's `Overlay` class does internally:
    memory topology so `xclAllocBO` resolves to a named DDR bank
 9. Upload the `.dtbo`; drop a stale `pynq` overlay and unbind any foreign
    UIO device at one of the kernel addresses; apply the overlay via configfs
-10. Verify overlay status == `applied`
+10. Verify overlay status == `applied` **and** no overlay error in `dmesg`
+    since step 9 (configfs reads `applied` even when the kernel rejected the
+    overlay)
 11. Write PS SLCR / AXIFM registers to match the bitstream's AXI bus widths
     (last, because the overlay's `afi0` node resets the AXIFM width fields)
 12. List `/dev/uio*` devices to confirm UIO nodes are up
+
+Step 5 removes only an overlay of the same name (and step 9 `pynq`).  If the
+same design is already loaded under another overlay name (e.g. `pl`), the
+kernel refuses the new one (`create_overlay: Failed to create overlay
+(err=-22)` in `dmesg`: the other overlay owns the nodes) and step 10 fails
+with `Overlay '<name>' did not apply …`, listing the kernel errors and the
+other loaded overlays.  Remove the other one on the board and run again,
+or reuse its name:
+
+```bash
+ls /sys/kernel/config/device-tree/overlays/          # on the board
+sudo rmdir /sys/kernel/config/device-tree/overlays/<name>
+# or: upload_bitstream.py --config bitstream_config_kv260.json --overlay-name <name>
+```
 
 ### Prerequisites
 
 - `xclbinutil` on `PATH` (source the Vitis `settings64.sh`):
   ```bash
-  source /mnt/data/xilinx/2025.2/Vitis/2025.2/settings64.sh
+  source <Xilinx>/2025.2/Vitis/settings64.sh   # e.g. /opt/Xilinx/2025.2/Vitis/settings64.sh
   which xclbinutil   # should print the path
   ```
 - SSH access to the board as root (or passwordless sudo) — same requirement
@@ -232,8 +257,11 @@ The `.bit` comes from `make build_hw_kv260`, the `.dtbo` from
 `make dtbo_kv260_cormorant` (compiles `dts/kv260/cormorant.dts`; needs `dtc`).
 
 All paths under `"bitstream"` are resolved relative to the config file, so the
-config is portable across checkouts.  The `hwh` key may be omitted when
-`<bit_stem>.hwh` sits alongside the `.bit` file (Vivado writes it there by default).
+config is portable across checkouts.  The `hwh` key may be omitted only when
+`<bit_stem>.hwh` sits alongside the `.bit` file; `make build_hw_kv260` writes
+none there (the hwh is
+`cormorant_hw_128.gen/sources_1/bd/design_cormorant/hw_handoff/design_cormorant.hwh`),
+so keep the key.
 
 #### `bitstream` config keys
 
@@ -276,6 +304,7 @@ After a successful run, verify the UIO devices are up:
 
 ```bash
 cat /sys/class/uio/uio*/name
+# axi-pmon            (×4, uio0–3: the Kria image's performance monitors)
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
@@ -326,16 +355,16 @@ Remote prerequisites
     OK      gcc                          gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
     OK      xrt headers                  xrt via pkg-config
     OK      sudo / root                  passwordless sudo OK
-    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio0
+    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio4
 ```
 
 For a model that uses all four kernels:
 
 ```
-    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio0
-    OK      uio (MatmulKernel: fabric_matmul)    /dev/uio1
-    OK      uio (ConvKernel: fabric_conv)        /dev/uio2
-    OK      uio (PoolKernel: fabric_pool)        /dev/uio3
+    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio4
+    OK      uio (MatmulKernel: fabric_matmul)    /dev/uio5
+    OK      uio (ConvKernel: fabric_conv)        /dev/uio6
+    OK      uio (PoolKernel: fabric_pool)        /dev/uio7
 ```
 
 ### Subset of models
@@ -452,7 +481,7 @@ names the loaded overlay actually exported:
 # On the board: list UIO device names
 cat /sys/class/uio/uio*/name
 
-# Expected for cormorant.dts (all four kernels):
+# Expected for cormorant.dts (all four kernels), after the image's four axi-pmon:
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
@@ -514,7 +543,7 @@ board (`remote.driver_dirs`). The local paths are the standard Vitis HLS output
 `<hls_project>/hls/impl/ip/`):
 
 ```
-<axi_demo>/build/kernels/<kernel>/kv260/<hls_project>/{solution1,hls}/impl/ip/drivers/<KernelName>_v1_0/src/
+<repo>/build/kernels/<kernel>/kv260/<hls_project>/{solution1,hls}/impl/ip/drivers/<KernelName>_v1_0/src/
 ```
 
 ---
@@ -920,6 +949,7 @@ carries all four kernels, so one bitstream covers every test model.
 
 # Verify UIO devices are up
 cat /sys/class/uio/uio*/name   # run on the board
+# axi-pmon (×4), then
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
@@ -959,7 +989,7 @@ Tracked templates (copy, then edit the copy):
 |-------------|--------|---------|
 | `bitstream_config_kv260.json.example` | `upload_bitstream.py` | Load Cormorant bitstream + xclbin + DTBO onto the board |
 | `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 148 models over all four kernels |
-| `perf_config.json` / `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 60 cases; the board config of the calibration campaign |
+| `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 60 cases; the board config of the calibration campaign |
 
 Per-subset copies such as `remote_config_vectorop.json`, `remote_config_conv.json`
 or `remote_config_all_models.json` are local working files (not tracked):

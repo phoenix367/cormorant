@@ -7,7 +7,7 @@ kernels, so existing clients — `curl`, the `openai` SDK, `llm`, `aichat` —
 and our own zero-install `chat.py` talk to the board directly.  Plan and
 decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md).
 
-Three FPGA backends (plus `echo`, protocol only):
+Four FPGA backends (plus `echo`, protocol only):
 
 * **`bert-squad`** (phase 1): BERT-base fine-tuned on SQuAD (the
   [`bert_squad/`](../bert_squad/) demo's model, 962 ms per 256-token window
@@ -20,13 +20,15 @@ Three FPGA backends (plus `echo`, protocol only):
   by token.  `libsmollm2.so` runs the model on the FPGA kernels and the A53
   (~10 tokens/s decode, 256-token prefill 1.3 s, logits bit-exact with the
   scheduler simulation); tokenizer, chat template, sampling and prefix
-  cache run in the server process.  The same backend serves
-  [SmolLM2-360M-Instruct](#smollm2-360m-instruct-instead-of-135m)
-  (`libsmollm2_360m.so`, ~3.9 tokens/s); the model id is the library's.
+  cache run in the server process.
+* **`smollm2-360m`** ([below](#smollm2-360m-instruct--smollm2-360m)): the
+  same with SmolLM2-360M-Instruct from its own library,
+  `libsmollm2_360m.so` (~3.9 tokens/s, better answers); both SmolLM2 sizes
+  can be served side by side and swap on the FPGA.
 * **`smolvlm`** ([below](#smolvlm-256m-instruct--chat-about-images)):
   SmolVLM-256M-Instruct, questions about images (`libsmolvlm_256m.so`; the
   vision encoder takes 3.9 s per image, CHAT_PLAN §24).  The board serves it
-  next to SmolLM2-360M and BERT (CHAT_PLAN §23).
+  next to both SmolLM2 sizes and BERT (CHAT_PLAN §23).
 
 ```
  laptop / board shell                          KV260 (Ubuntu 22.04, Python 3.10 stdlib)
@@ -119,7 +121,8 @@ $PY deploy.py --regenerate --plan   # regenerate the BERT project in planning mo
 
 `deploy.py` takes everything board-specific (ssh, UIO names, weights
 directory, board lock) from `../bert_squad/bert_squad_config.json`.  On the
-board it installs to `/root/kv260_chat/` (`project/` sources and build,
+board it installs to `remote.dir` of `chat_config.json` — `<dir>` below,
+default `/root/kv260_chat/` (`project/` sources and build,
 `lib/libbert_squad.so`, the server files, `vocab.txt`); the build is skipped
 when the generated sources and cmake options are unchanged, and
 `weights/*.dat` are uploaded only when their size or SHA-1 changed.  The
@@ -136,8 +139,9 @@ it at once: it keeps the cores out of the PSCI core power-down idle state,
 the workaround for the board hangs of CHAT_PLAN §18 (a core parked in
 power-down stops the token stream, later SSH and ping).
 
-**The generative backend** is enabled by adding `"smollm2"` to
-`server.backends` in `chat_config.json` (e.g. `["bert-squad", "smollm2"]`;
+**The generative backends** are enabled by adding `"smollm2"` (135M) and / or
+`"smollm2-360m"` to `server.backends` in `chat_config.json` (e.g.
+`["smollm2-360m", "smollm2", "bert-squad", "smolvlm"]`, the board's setup;
 the first is the default model).  deploy.py always uploads the text side
 (`smollm2_backend.py`, `smollm2_tokenizer.py`, `chatml.py`, `sampler.py`)
 and builds `lib/libsampler.so` from `src/sampler.c` on the board (under a
@@ -145,11 +149,15 @@ second; without a compiler the server samples in Python); with `smollm2` it
 also uploads `tokenizer.json` (`smollm2.tokenizer`, by default from the
 untracked `assets/smollm2-135m-instruct/`, to `<dir>/smollm2/`) and passes
 the `smollm2` block (`lib`, `weights_dir`, `model_id`, sampling defaults,
-`cma_mb`) and `server.resident` to the server.  `libsmollm2.so` itself is
-not built by `deploy.py` — the preflight reports whether it is at
-`smollm2.lib` (default `<dir>/lib/libsmollm2.so`).  If it cannot be loaded,
-the server still starts with the other backends and answers
-`smollm2-135m-instruct` requests with 503 `model_not_loaded`.
+`cma_mb`) and `server.resident` to the server; with `smollm2-360m` the
+`smollm2_360m` block likewise (`lib`, `weights_dir`, `model_id`,
+`tokenizer` → `<dir>/smollm2_360m/`, `cma_mb`; the `smollm2` block's
+sampling defaults apply to every generative model).  The libraries are not
+built by `deploy.py` — the preflight reports whether they are at
+`smollm2.lib` (default `<dir>/lib/libsmollm2.so`) and `smollm2_360m.lib`
+(default `<dir>/lib/libsmollm2_360m.so`).  If one cannot be loaded, the
+server still starts with the other backends and answers its model's
+requests with 503 `model_not_loaded`.
 
 **Building `libsmollm2.so`** (CHAT_PLAN §13.5).  The assets are not in
 git: the Hugging Face checkpoint `HuggingFaceTB/SmolLM2-135M-Instruct`
@@ -161,6 +169,14 @@ SHA-256 of every file) and checks the result against the recorded hash — see
 [Calibration](#calibration--the-study-stage-reproduced) below.
 
 ```bash
+# once, from the repo root: the study environment llm_calibrate.py runs in
+# (scripts/requirements-study.txt; calibrate needs only its numpy and
+# tokenizers, torch / transformers are for validate)
+python3 -m venv .venv-export
+PIP_CONFIG_FILE=/dev/null .venv-export/bin/pip install \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    -r demo/chat/scripts/requirements-study.txt
+
 cd demo/chat
 python3 scripts/llm_calibrate.py all smollm2-135m-instruct   # fetch + calibrate, ~1.5 min
 PY=../../inference-scheduler/.venv/bin/python
@@ -170,6 +186,19 @@ $PY scripts/llm_board.py --install-only  # upload, build on the board (-j1, memo
                                          # install <dir>/lib/libsmollm2.so; weights in /root/smollm2_weights
 $PY deploy.py                            # with "smollm2" in server.backends
 ```
+
+`llm_calibrate.py all` rewrites the tracked provenance
+`assets/study/smollm2-135m-instruct/formats_pow2+sink+p12.provenance.json`
+(commit, script hash, date); do not commit it unless you recalibrate on
+purpose.  `llm_board.py` installs the library in `<dir>/lib/`
+(`libsmollm2.so`; `libsmollm2_360m.so`, `libsmolvlm_256m.so` for the
+models below), `<dir>` = `remote.dir` of `chat_config.json` (else
+`/root/kv260_chat`), where `deploy.py` looks for it; `--remote-dir DIR`
+overrides that.  The
+library is built to read its weights from `/root/smollm2_weights`
+(SmolLM2-135M; `/root/<model>_weights` for the other models), where they
+are uploaded; `--weights-dir DIR` overrides that — use both options for a
+second install beside an existing one.
 
 `llm_board.py` takes ssh, driver directories and the board lock from
 `../bert_squad/bert_squad_config.json`; without `--install-only` it also
@@ -194,10 +223,13 @@ By hand on the board (for development):
 ```bash
 python3 /root/kv260_chat/kv260_chat_server.py --bert-lib /root/kv260_chat/lib/libbert_squad.so \
     --bert-weights /root/bert_squad_weights --vocab /root/kv260_chat/vocab.txt [--api-key KEY]
-python3 /root/kv260_chat/kv260_chat_server.py --backend smollm2 --backend bert-squad \
-    --llm-lib /root/kv260_chat/lib/libsmollm2.so --llm-sampler-lib /root/kv260_chat/lib/libsampler.so \
-    --llm-tokenizer /root/kv260_chat/smollm2/tokenizer.json --llm-cma-mb 510 --bert-lib ... \
-    [--resident auto|one|all]
+python3 /root/kv260_chat/kv260_chat_server.py --backend smollm2 --backend smollm2-360m \
+    --backend bert-squad --llm-lib /root/kv260_chat/lib/libsmollm2.so \
+    --llm-sampler-lib /root/kv260_chat/lib/libsampler.so \
+    --llm-tokenizer /root/kv260_chat/smollm2/tokenizer.json --llm-cma-mb 330 \
+    --llm-360m-lib /root/kv260_chat/lib/libsmollm2_360m.so \
+    --llm-360m-tokenizer /root/kv260_chat/smollm2_360m/tokenizer.json --llm-360m-cma-mb 760 \
+    --bert-lib ... [--resident auto|one|all]
 python3 kv260_chat_server.py --backend echo --port 8001     # anywhere, no FPGA: protocol only
 ```
 
@@ -384,11 +416,15 @@ serialised with inference; the request that triggers a load logs
 `load=…ms`.  `/health` shows `loaded` per model, `resident`, `cma_free_mb`,
 `loads` / `unloads`.  After an eviction the prefix cache starts empty.
 
-### SmolLM2-360M-Instruct instead of 135M
+### SmolLM2-360M-Instruct — `smollm2-360m`
 
-The same backend runs SmolLM2-360M-Instruct (CHAT_PLAN §20): bit-exact on
-the board, ~3.9 tokens/s decode (135M: ~10), TTFT ~1 s, better answers; its
-pool is 740 MiB, so it and BERT swap under `--resident auto`.
+The `smollm2-360m` backend serves SmolLM2-360M-Instruct from its own
+library, `libsmollm2_360m.so` (CHAT_PLAN §20): bit-exact on the board,
+~3.9 tokens/s decode (135M: ~10), TTFT ~1 s, better answers.  Its pool is
+740 MiB, so under `--resident auto` it swaps with every other FPGA model,
+the 135M one included (a swap with the weights in the page cache takes
+1–2 s; the first load of each from the SD card 53 s for 360M, 21 s for
+135M).
 
 ```bash
 cd demo/chat
@@ -398,13 +434,17 @@ $PY scripts/generate_llm_project.py --assets assets/smollm2-360m-instruct \
     --model-name smollm2-360m-instruct   # -> build/llm_project_smollm2_360m (~6 min, 32 GB RAM)
 $PY deploy.py --stop
 $PY scripts/llm_board.py --install-only --project build/llm_project_smollm2_360m
-                                          # -> lib/libsmollm2_360m.so, /root/smollm2_360m_weights
+                                          # -> <dir>/lib/libsmollm2_360m.so, /root/smollm2_360m_weights
+                                          # (--remote-dir / --weights-dir as above)
 ```
 
-Then point `smollm2.lib` at `/root/kv260_chat/lib/libsmollm2_360m.so`, set
-`smollm2.cma_mb` to 760 and run `deploy.py`: the server serves the model the
-library names (`llm_model_name()`), `smollm2-360m-instruct`
-(`smollm2.model_id` / `--llm-model-id` override it).
+Then add `"smollm2-360m"` to `server.backends` and run `deploy.py`; the
+`smollm2_360m` block's defaults (`lib` `<dir>/lib/libsmollm2_360m.so`,
+`cma_mb` 760, `tokenizer` `assets/smollm2-360m-instruct/tokenizer.json`)
+fit.  The server serves the model the library names (`llm_model_name()`),
+`smollm2-360m-instruct` (`smollm2_360m.model_id` /
+`--llm-360m-model-id` override it); two backends serving one model id are
+refused at startup.
 
 ### SmolVLM-256M-Instruct — chat about images
 
@@ -413,16 +453,19 @@ sent as OpenAI `image_url` parts — base64 data URLs; the server fetches
 nothing.  One 512 × 512 tile per image (67 prompt tokens): the vision
 encoder takes 3.9 s on the FPGA, then text comes at ~9.5 tokens/s; a
 follow-up question about the same image reuses it (TTFT ~0.4 s).  Its pool
-is 495 MiB, so it swaps with SmolLM2-360M under `--resident auto`.
+is 495 MiB: under `--resident auto` it stays loaded beside BERT; beside
+SmolLM2-135M only when the CMA is not fragmented (otherwise its load fails
+and is retried after evicting SmolLM2-135M); it swaps with SmolLM2-360M.
 
 ```bash
 cd demo/chat
 ../../.venv-export/bin/python scripts/vlm_study.py fetch     # checkpoint + COCO images (pinned hashes)
 ../../.venv-export/bin/python scripts/vlm_study.py formats   # text + vision exponents (~3 min)
 $PY scripts/generate_llm_project.py --model-name smolvlm-256m-instruct
-                                          # -> build/llm_project_smolvlm_256m (100 s)
+                                          # -> build/llm_project_smolvlm_256m (100 s, ~20 GB RAM)
 $PY scripts/llm_board.py --project build/llm_project_smolvlm_256m --install-only
-                                          # -> lib/libsmolvlm_256m.so, /root/smolvlm_256m_weights
+                                          # -> <dir>/lib/libsmolvlm_256m.so, /root/smolvlm_256m_weights
+                                          # (--remote-dir / --weights-dir as above)
 ```
 
 Add `"smolvlm"` to `server.backends` in `chat_config.json` (the `smolvlm`
@@ -430,8 +473,9 @@ block: library, tokenizer, `cma_mb` 540; the board needs `python3-pil`) and
 run `deploy.py`.  Clients:
 
 ```bash
-python3 chat.py --model smolvlm-256m-instruct --image photo.jpg -q "What is in this image?"
-python3 chat.py --model smolvlm-256m-instruct      # then: /image photo.jpg, and ask
+python3 chat.py --url http://<board>:8000/v1 --model smolvlm-256m-instruct --image photo.jpg \
+    -q "What is in this image?"
+python3 chat.py --url http://<board>:8000/v1 --model smolvlm-256m-instruct   # then: /image photo.jpg, and ask
 ```
 
 or any OpenAI client — `{"type": "image_url", "image_url": {"url":
@@ -496,13 +540,22 @@ transformers (see Tests).
 
 All transcripts below are real, against the board at `192.168.100.8`
 (2026-09-26); `sb50.txt` is the first paragraph of SQuAD's "Super Bowl 50"
-article.  Any OpenAI-compatible client works with base URL
+article (124 words), taken from the bert_squad demo's SQuAD dev set:
+
+```bash
+python3 -c "import json; d = json.load(open('demo/bert_squad/assets/dev-v1.1.json')); print(next(a for a in d['data'] if a['title'] == 'Super_Bowl_50')['paragraphs'][0]['context'])" > sb50.txt
+```
+
+Any OpenAI-compatible client works with base URL
 `http://<board>:8000/v1` and any (or, with `api_key` set, that) API key.
 
 ### `chat.py` (ours, stdlib only — laptop or board)
 
+The bracketed stats line after each answer is printed on a terminal, and
+with `-v` when the output is piped or redirected.
+
 ```
-$ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1 --doc sb50.txt -q "Which NFL team represented the AFC at Super Bowl 50?"
+$ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1 --doc sb50.txt -v -q "Which NFL team represented the AFC at Super Bowl 50?"
 Denver Broncos
 [1.0 s · 1/1 window(s) · confidence 0.75 · 171 + 2 tokens]
 
@@ -884,7 +937,8 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 149 tests, ~40 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests)
+python3 -m unittest -v                  # 153 tests, ~40 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests)
+                                        # ~60 skip until the SmolLM2 / SmolVLM tokenizers (llm_calibrate.py / vlm_study.py fetch) and BERT's vocab.txt are present
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
 # host validation against transformers, from the repo root
