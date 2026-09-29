@@ -6,10 +6,13 @@
 
 Four Vitis HLS kernels for the Xilinx Kria KV260 (VectorOP, MatMul, Conv,
 Pooling) and a Python code generator that compiles ONNX models — CNNs,
-BERT-base, Llama-family decoders and a ViT vision encoder — into
-self-contained C projects that drive the kernels from Linux on the board.
-Everything runs in `ap_fixed<16,8>`, and the board's outputs are checked bit
-for bit against the generator's fixed-point simulation.
+BERT-base, Llama-family decoders, a ViT vision encoder and a VITS
+text-to-speech model — into self-contained C projects that drive the
+kernels from Linux on the board.  Everything runs in 16-bit fixed point
+(`ap_fixed<16,8>`, or per-tensor power-of-two exponents), and the board's
+outputs are checked bit for bit against the generator's fixed-point
+simulation.  An OpenAI-compatible server on the board serves the chat,
+image and speech models.
 
 > **About this fork.**  This repository is an independent fork of Cormorant.
 > It is not affiliated with, endorsed by or supported by any company,
@@ -21,7 +24,7 @@ for bit against the generator's fixed-point simulation.
 
 ## Results on the board
 
-KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26 to 28):
+KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-09-26 to 30):
 
 | Model | Result | Source |
 |---|---|---|
@@ -32,8 +35,10 @@ KV260, programmable logic at 100 MHz, `ap_fixed<16,8>` (measured 2026-09-26 to 2
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
 | SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md) |
 | SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.7 s** per 1.49 s of audio (real-time factor 0.52); through the chat server the first sound after 1.8–3.5 s, real-time factor 0.78–0.94 end to end | [TTS_PLAN §4, §5](doc/plans/TTS_PLAN.md) |
 
-The BERT, SmolLM2 and SmolVLM logits are bit-exact with the scheduler's simulation.
+The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
+bit-exact with the scheduler's simulation.
 The FPGA design (`hw/cormorant_hw_128` d7ce129) uses 85 % of the DSPs
 (1058 / 1248), 79.7 % of the LUTs (93 303 / 117 120), 115.5 / 144 BRAM and
 56 / 64 URAM.
@@ -82,6 +87,13 @@ program) for Linux with XRT buffers or for bare metal:
   library and weight pool (`--entry`).  A ViT frontend (SmolVLM's SigLIP-style
   encoder + connector) adds a `vision` entry whose image features feed the
   decoder's prefill.
+- **Text to speech** — a Piper (VITS) frontend writes the flow and the
+  HiFi-GAN decoder as one fixed-size chunk (128 frames, 1.49 s of audio):
+  66 ConvKernel convolutions with power-of-two exponents per chunk.
+  - 1-D convolutions are folded into rows.
+  - Transposed convolutions run polyphase.
+  - Gates, sums, LeakyReLU and masks are host ops.
+  - Consecutive chunks join into one waveform bit for bit.
 - **Scheduling** — kernels on different lanes run concurrently; one weak
   `kernel_wait()` does the synchronisation; intermediate buffers share pool
   slots by event-stream liveness; cache clean / invalidate calls are emitted
@@ -111,7 +123,8 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/image_classification/`](demo/image_classification/) | MobileNet V1 / V2 and ResNet-18: top-5 ImageNet predictions for your images |
 | [`demo/camera/`](demo/camera/) | MobileNet V1 on live RealSense frames, annotated frames streamed back over SSH |
 | [`demo/bert_squad/`](demo/bert_squad/) | BERT-base extractive question answering on SQuAD 1.1 |
-| [`demo/chat/`](demo/chat/) | An OpenAI-compatible chat server on the board: BERT document QA, SmolLM2-135M / 360M generative chat and SmolVLM-256M chat about images, usable from `chat.py` or any OpenAI client |
+| [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, and Piper text to speech (`/v1/audio/speech`) |
+| [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |
 
 ---
 
@@ -144,7 +157,7 @@ TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1586 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1602 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -222,8 +235,8 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1586 tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (153 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers and Pillow is installed) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1602 tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (179 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
@@ -253,6 +266,7 @@ own models.
 | SmolLM2-135M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
 | SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
 | SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](demo/chat/README.md)) |
+| Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](demo/tts/README.md), [demo/chat](demo/chat/README.md#text-to-speech--piper-lessac-medium)) |
 
 ---
 
@@ -261,8 +275,10 @@ own models.
 `ap_fixed<16,8>`: 16-bit two's complement with 8 fractional bits
 (`1.0 = 0x0100`, range `[−128, 127.996]`), saturating.  The scheduler's
 `DataType` abstraction (`inference-scheduler/src/dtype.py`) also supports
-`float32`.  For the decoder, per-tensor / per-channel power-of-two exponents
-([CHAT_PLAN §10](doc/plans/CHAT_PLAN.md)) scale each tensor into this format.
+`float32`.  For the decoders and Piper's convolutions, per-tensor /
+per-channel power-of-two exponents ([CHAT_PLAN §10](doc/plans/CHAT_PLAN.md),
+[TTS_PLAN §3](doc/plans/TTS_PLAN.md)) scale each tensor into 16 bits instead
+of the fixed 8 fractional bits.
 
 ---
 

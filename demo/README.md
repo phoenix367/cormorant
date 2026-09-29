@@ -12,7 +12,8 @@ three stages — **download → generate → deploy** — driven by a one-shot
 `bert_squad/` runs **prepare → generate → deploy** the same way, with the
 model, vocabulary and SQuAD file downloaded by hand (see its README).
 `chat/` installs a long-running server on the board with `deploy.py` and
-takes its board settings from `bert_squad/bert_squad_config.json`.
+takes its board settings from `bert_squad/bert_squad_config.json`; `tts/`
+builds the speech library the server's `piper` backend loads.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
@@ -20,7 +21,8 @@ takes its board settings from `bert_squad/bert_squad_config.json`.
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 60.3 ms = 16.6 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (962 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct | chat messages (and images) over HTTP | OpenAI-compatible chat server running on the board (`/v1/chat/completions`, streaming), backends `bert-squad`, `smollm2` and `smolvlm`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s) and questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.8–3.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud) |
+| [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.7 s per 1.49 s of audio) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
 
 ## Common workflow
 
