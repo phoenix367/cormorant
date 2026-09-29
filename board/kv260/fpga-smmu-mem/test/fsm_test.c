@@ -4,7 +4,8 @@
  *
  *   ./fsm_test [BIG_MiB]
  *
- * Buffers come out zeroed at one page-aligned IOVA below 4 GiB, backed by
+ * Buffers come out zeroed at one page-aligned IOVA in the PL window
+ * [FSM_IOVA_BASE, FSM_IOVA_END) (the kernels' DDR_HIGH segment), backed by
  * scattered ordinary pages (not CMA: CmaFree stays put), readable and
  * writable through the cacheable and the write-combined mapping; the ioctls
  * reject bad arguments; buffers do not overlap in IOVA space and their memory
@@ -149,9 +150,10 @@ static void check_buffer(const char *what, uint64_t size, uint32_t flags)
 		failures++;
 		return;
 	}
-	printf("  iova 0x%08" PRIx64 "..0x%08" PRIx64 "\n", b.iova, b.iova + size);
+	printf("  iova 0x%09" PRIx64 "..0x%09" PRIx64 "\n", b.iova, b.iova + size);
 	CHECK(b.iova && !(b.iova & 0xfff), "iova 0x%" PRIx64 " not page aligned", b.iova);
-	CHECK(b.iova + size <= (1ull << 32), "iova range crosses 4 GiB");
+	CHECK(b.iova >= FSM_IOVA_BASE && b.iova + size <= FSM_IOVA_END,
+	      "iova range outside the PL window 0x%llx-0x%llx", FSM_IOVA_BASE, FSM_IOVA_END);
 
 	for (i = 0; i < size; i += 64)
 		bad |= *(volatile uint64_t *)(b.p + i);

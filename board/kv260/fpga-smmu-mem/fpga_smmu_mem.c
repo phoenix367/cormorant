@@ -19,6 +19,15 @@
  * The device must sit behind an IOMMU (device tree `iommus`): probe refuses
  * otherwise, since without translation the scattered pages would reach the
  * kernels as one bogus physical range.
+ *
+ * IOVA window: the kernels' AXI address map (Vivado address editor) forwards
+ * only DDR_LOW (0–2 GiB), QSPI and DDR_HIGH (32–64 GiB) to the PS; anything
+ * else gets DECERR from the interconnect and never reaches the SMMU.  A
+ * 36-bit DMA mask makes iommu-dma allocate top-down from 64 GiB, i.e. in
+ * DDR_HIGH — 32 GiB of IOVA space, room for size-aligned buffers of up to
+ * FSM_MAX_SIZE — and every buffer is checked to lie in
+ * [FSM_IOVA_BASE, FSM_IOVA_END).  (DDR_LOW would do for small buffers only:
+ * a buffer over 1 GiB needs a 2 GiB-aligned slot, and IOVA 0 is reserved.)
  */
 #include <linux/dma-mapping.h>
 #include <linux/fs.h>
@@ -37,6 +46,9 @@
 
 #define FSM_MAX_CHUNK_ORDER   9               /* 2 MiB with 4 KiB pages */
 #define FSM_MAX_SIZE          (3ULL << 30)    /* per buffer */
+#define FSM_IOVA_BITS         36              /* the mask's limit is FSM_IOVA_END */
+
+static_assert(FSM_IOVA_END == 1ULL << FSM_IOVA_BITS, "IOVA window vs DMA mask");
 
 struct fsm_dev {
 	struct device     *dev;
@@ -157,6 +169,12 @@ static long fsm_ioctl_alloc(struct fsm_buf *b, void __user *arg)
 	}
 	if (expect - b->iova < b->size) {
 		ret = -EFAULT;
+		goto err_unmap;
+	}
+	if (b->iova < FSM_IOVA_BASE || b->iova + b->size > FSM_IOVA_END) {
+		dev_err(dev, "buffer of %zu bytes at IOVA %pad is outside the PL window\n",
+			b->size, &b->iova);
+		ret = -ENOSPC;
 		goto err_unmap;
 	}
 
@@ -301,7 +319,7 @@ static int fsm_probe(struct platform_device *pdev)
 	}
 	if (fsm_the_dev)
 		return -EBUSY;
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(FSM_IOVA_BITS));
 	if (ret)
 		return ret;
 	dma_set_max_seg_size(dev, UINT_MAX);
@@ -321,7 +339,8 @@ static int fsm_probe(struct platform_device *pdev)
 		return ret;
 	}
 	platform_set_drvdata(pdev, fdev);
-	dev_info(dev, "/dev/fpga_smmu_mem: IOMMU domain type %u, 32-bit IOVA space\n", dom->type);
+	dev_info(dev, "/dev/fpga_smmu_mem: IOMMU domain type %u, IOVA window 0x%llx-0x%llx\n",
+		 dom->type, FSM_IOVA_BASE, FSM_IOVA_END - 1);
 	return 0;
 }
 

@@ -11,3 +11,5 @@ build.log
 *.dtbo
 cormorant-smmu.dts
 fsm_test
+fsm_kernel_test
+fsm_kernel_test_xrt

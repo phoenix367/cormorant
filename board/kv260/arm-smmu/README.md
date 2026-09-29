@@ -61,7 +61,10 @@ zocl on CMA and allocate SMMU-mapped memory through a separate driver (e.g.
 u-dma-buf with the PL stream IDs) behind `inference_buf.c`.
 
 The second way is `../fpga-smmu-mem/` (u-dma-buf's cache sync assumes
-physically contiguous memory).  It works as an allocator, but the PL traffic
-of the current bitstream is not translated: the HLS masters issue Secure
-accesses (`AxPROT = 000`), which bypass the non-secure stream-match table —
-see that README before loading anything with the PL running.
+physically contiguous memory), and it works (2026-09-29): with a bitstream
+whose HLS masters issue non-secure accesses (`AxPROT = 010`,
+`../fpga-smmu-mem/set_prot_ns.tcl`) the SMMU translates the PL traffic, and
+the kernels run on SMMU-mapped buffers — including one larger than the CMA
+region.  The production bitstream's masters issue Secure accesses
+(`AxPROT = 000`), which bypass the non-secure stream-match table — see that
+README before loading anything with the PL running.

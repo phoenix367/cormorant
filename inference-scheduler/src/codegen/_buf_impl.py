@@ -185,6 +185,8 @@ void inference_buf_read_float(const inference_buf_t *buf,
  * board/kv260/fpga-smmu-mem/fpga_smmu_mem.h (test_buf_impl.py checks it). */
 #define FSM_DEVICE_PATH       "/dev/fpga_smmu_mem"
 #define FSM_ALLOC_WC          0x1u
+#define FSM_IOVA_BASE         0x800000000ull
+#define FSM_IOVA_END          0x1000000000ull
 struct fsm_alloc {
     uint64_t size;
     uint32_t flags;
@@ -296,6 +298,16 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
         a.flags = s_cacheable ? 0u : FSM_ALLOC_WC;
         if (ioctl(fd, FSM_IOC_ALLOC, &a) != 0) {
             fprintf(stderr, "inference: fpga_smmu_mem allocation of %zu bytes failed\n", bytes);
+            close(fd);
+            free(buf);
+            return NULL;
+        }
+        /* The kernels' address map forwards only this window to the PS: an
+         * IOVA outside it (an old driver) would read as zeros, not fault. */
+        if (a.iova < FSM_IOVA_BASE || a.iova + bytes > FSM_IOVA_END) {
+            fprintf(stderr, "inference: fpga_smmu_mem IOVA 0x%llx outside the PL window "
+                    "0x%llx-0x%llx — update fpga_smmu_mem.ko\n",
+                    (unsigned long long)a.iova, FSM_IOVA_BASE, FSM_IOVA_END - 1);
             close(fd);
             free(buf);
             return NULL;

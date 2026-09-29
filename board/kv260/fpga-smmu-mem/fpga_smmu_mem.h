@@ -26,6 +26,13 @@
 
 #define FSM_ALLOC_WC          0x1u     /* write-combined CPU mapping */
 
+/* Every IOVA lies in [FSM_IOVA_BASE, FSM_IOVA_END): the kernels' HPC0/HPC1
+ * DDR_HIGH segment, which their AXI address map forwards to the PS (the
+ * interconnect answers anything outside DDR_LOW / QSPI / DDR_HIGH with
+ * DECERR before the SMMU sees it). */
+#define FSM_IOVA_BASE         0x800000000ull
+#define FSM_IOVA_END          0x1000000000ull
+
 struct fsm_alloc {
 	__u64 size;                    /* in: bytes */
 	__u32 flags;                   /* in: FSM_ALLOC_* */
