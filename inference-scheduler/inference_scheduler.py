@@ -154,6 +154,21 @@ def parse_args(argv=None):
         ),
     )
     p.add_argument(
+        "--fc-conv",
+        dest="fc_conv",
+        choices=("auto", "always", "off"),
+        default="auto",
+        help=(
+            "Run fully-connected Conv layers — the kernel covers the whole "
+            "unpadded input, one output pixel (e.g. LeNet's 7x7 conv on a 7x7 "
+            "map, a 1x1 conv on a 1x1 map) — as a MatMul on MatmulKernel "
+            "(GEMV for one image): 'auto' (default) where the engine cost "
+            "model estimates it at least 20%% faster than ConvKernel, "
+            "'always' for every eligible Conv, 'off' for none.  Bit-identical "
+            "unless the sum before the bias saturates."
+        ),
+    )
+    p.add_argument(
         "--no-fuse-patterns",
         dest="fuse_patterns",
         action="store_false",
@@ -241,7 +256,8 @@ def main_multi(args) -> int:
         try:
             g = OnnxGraph(path, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv, plan=plan_options_from_args(args))
+                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv,
+                          plan=plan_options_from_args(args))
         except (FileNotFoundError, SchedulerError) as e:
             print(f"error: entry {name}: {e}", file=sys.stderr)
             return 1
@@ -303,7 +319,7 @@ def main(argv=None):
         graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns,
                           matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv,
+                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv,
                           plan=plan_options_from_args(args))
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)

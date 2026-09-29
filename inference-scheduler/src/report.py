@@ -629,6 +629,15 @@ class ReportGenerator:
                 f"`SpaceToDepth(2)` + stride-1 `Conv` over 4× the input "
                 f"channels (ConvKernel IC-lane utilisation)."
             )
+        fcc = getattr(self.graph, "fc_conv_stats", None) or {}
+        if fcc.get("lowered"):
+            k = fcc["lowered"]
+            bullets.append(
+                f"- **Fully-connected Conv → MatMul** — {k} `Conv`{'s' if k != 1 else ''} "
+                f"whose kernel covers the whole input (one output pixel) run as "
+                f"`MatMul` on MatmulKernel: estimated {fcc['conv_cycles']:,.0f} → "
+                f"{fcc['matmul_cycles']:,.0f} cycles (`--fc-conv`)."
+            )
         fc = getattr(self.graph, "fusion_counts", {}) or {}
         if fc.get("layernorm") or fc.get("gelu"):
             bullets.append(

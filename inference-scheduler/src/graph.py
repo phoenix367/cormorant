@@ -44,6 +44,7 @@ from . import fusion
 from . import matmul_lowering
 from . import numeric
 from .matmul_gemv import choose_gemv
+from . import fc_conv as fc_conv_mod
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
     {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
@@ -449,6 +450,7 @@ class OnnxGraph:
                  matmul_conv_kws: "Sequence[int]" = None,
                  matmul_gemv="auto",
                  matmul_gemv_kw: "Dict[str, int]" = None,
+                 fc_conv="auto",
                  plan: "PlanOptions" = None) -> None:
         """
         fuse_act: fold a Relu / Clip(0,6) node into the VectorOP node that
@@ -497,6 +499,16 @@ class OnnxGraph:
         ``self.matmul_gemv_stats`` reports ``{"gemv", "kw>1",
         "tiled_cycles", "gemv_cycles"}``.
 
+        fc_conv: run fully-connected Convs (the kernel covers the whole
+        unpadded input: one output pixel, e.g. LeNet's 7x7 conv on a 7x7 map
+        or a 1x1 conv on a 1x1 map) as Flatten + MatMul + Reshape (+ bias
+        Add) on MatmulKernel (``fc_conv.lower_fc_convs``,
+        doc/plans/LENET_PLAN.md).  "auto" (default, also ``True``: where the
+        engine cost model estimates the MatMul at least 20 % faster),
+        "always" or "off" (``False``; CLI ``--fc-conv off``).  Bit-identical
+        unless the sum before the bias saturates.  ``self.fc_conv_stats``
+        reports ``{"lowered", "kept", "conv_cycles", "matmul_cycles"}``.
+
         plan: the opt-in planning mode (src/planning.py, doc/plans/
         TACTICS_PLAN.md).  ``None`` / disabled: every choice as without
         planning (the default); ``self.plan`` keeps the options.
@@ -538,6 +550,10 @@ class OnnxGraph:
 
         # Split -> one Slice per output (host copy or zero-cost view).
         self.split_lowered_count = fusion.lower_split(model)
+
+        # Fully-connected Convs (one output pixel) -> MatMul where the cost
+        # model says MatmulKernel is faster, see src/fc_conv.py.
+        model, self.fc_conv_stats = fc_conv_mod.lower_fc_convs(model, fc_conv)
 
         # Space-to-depth stems (opt-in): stride-2 Conv on <= kTileIC/4
         # channels -> SpaceToDepth + stride-1 Conv, see _space_to_depth_stems.
