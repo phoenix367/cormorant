@@ -1,0 +1,100 @@
+"""@OP@ host op (src/host_nodes.py, @OP@Node): the generated C helper against
+``reference()`` (what the simulator and so test_inference.c's expectations
+use) bit for bit with 1 / 3 / 4 host threads; the reference against an
+independent float formula; the rejected attributes; and a VectorOP -> @OP@
+-> VectorOP chain as a whole generated project on the host emulation
+(cacheable / staged buffers, separate CPU / DDR copies) plus the static
+cache-coherency audit.
+
+Instantiated from .claude/skills/add-host-op/templates/test_host_op.py.tmpl;
+save as inference-scheduler/test/test_<kind>.py.
+"""
+
+import tempfile
+import unittest
+
+import numpy as np
+import onnx.helper as oh
+import onnx.numpy_helper as nph
+
+import host_emu
+from test_cache_coherency import CoherencyChecker
+from test_host_ops import _Base, _grid, _save, _vi
+from src.codegen import CodeGenerator
+from src.graph import OnnxGraph
+from src.host_nodes import @OP@Node
+from src.nodes import SchedulerError
+
+OPSET = 13          # EDIT: an opset in which @OP@ has the attributes used below
+
+
+def _model(d, shape, name, **attrs):
+    return _save(d, [oh.make_node("@OP@", ["X"], ["Y"], **attrs)],
+                 [_vi("X", shape)], [_vi("Y", shape)], opset=OPSET, name=name)
+
+
+def _float_ref(x):
+    """EDIT: the op in plain float64 (independent of reference())."""
+    return x / np.sqrt((x * x).sum(-1, keepdims=True))
+
+
+class Test@OP@(_Base):
+
+    def test_c_equals_reference(self):
+        rng = np.random.default_rng(0)
+        # odd widths / row counts: tails of any 4- or 8-wide inner loop
+        for shape, lo, hi in (([3, 40], -8, 8), ([2, 5, 7], -2, 2), ([1, 1], -100, 100),
+                              ([6, 33], -0.5, 0.5)):
+            with self.subTest(shape=shape):
+                p = _model(self.d, shape, f"@KIND@_{'x'.join(map(str, shape))}", axis=-1)
+                g, _, a = self.check(p, {"X": _grid(rng, shape, lo, hi)}, kind=@OP@Node)
+                self.assertIsInstance(g.nodes[0], @OP@Node)
+
+    def test_edge_values(self):
+        # EDIT: rows that hit NaN (-> 0), saturation and exact rounding ties
+        x = np.zeros((4, 16))
+        x[1, :] = 1.0 / 256                          # smallest magnitude
+        x[2, 0] = 127.0                              # one dominant element
+        x[3, :] = -128.0                             # range edge
+        p = _model(self.d, [4, 16], "@KIND@_edges", axis=-1)
+        _, _, a = self.check(p, {"X": x}, kind=@OP@Node)
+        self.assertTrue(np.all(a["Y"][0] == 0.0))    # 0 / 0 = NaN -> 0
+
+    def test_reference_vs_float(self):
+        x = _grid(np.random.default_rng(1), (4, 24), -6, 6)
+        p = _model(self.d, [4, 24], "@KIND@_float", axis=-1)
+        _, _, a = self.check(p, {"X": x}, kind=@OP@Node)
+        # one write-back: within half an LSB of the float result
+        self.assertLessEqual(np.abs(a["Y"] - _float_ref(x)).max(), 0.5 / 256 + 1e-12)
+
+    def test_rejected(self):
+        # EDIT: every attribute value / input kind from_onnx_node refuses
+        with self.assertRaises(SchedulerError):
+            OnnxGraph(_model(self.d, [2, 3, 4], "@KIND@_axis", axis=1))
+        with self.assertRaises(SchedulerError):
+            OnnxGraph(_model(self.d, [2, 4], "@KIND@_p1", axis=-1, p=1))
+
+    def test_kernel_chain_on_host_emulation(self):
+        """Add -> @OP@ -> Add: the kernel-written input is invalidated, the
+        output flushed for the next kernel; n % 8 != 0 with a broadcast
+        operand gives a strided layout (the staged path)."""
+        R, n = 5, 12
+        b = nph.from_array(np.full(n, 0.25, np.float32), "B")
+        p = _save(self.d, [oh.make_node("Add", ["X", "B"], ["T"]),
+                           oh.make_node("@OP@", ["T"], ["U"], axis=-1),
+                           oh.make_node("Add", ["U", "B"], ["Y"])],
+                  [_vi("X", [R, n])], [_vi("Y", [R, n])], [b], opset=OPSET,
+                  name="@KIND@_chain")
+        cg = CodeGenerator(OnnxGraph(p, fuse_act=True), model_path=p)
+        self.assertEqual(CoherencyChecker(cg).check(), [])
+        for cached, threads, inc in ((True, 4, False), (False, 1, False), (True, 3, True)):
+            with self.subTest(cached=cached, threads=threads, incoherent=inc), \
+                    tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, td, cached=cached, threads=threads,
+                                                 min_elems=1, incoherent=inc)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertIn("test_inference PASSED", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,101 @@
+# add-host-op template: an axi.llm CUSTOM-DOMAIN host op (inference-scheduler/src/llm_nodes.py;
+# a vision op goes to src/vit_nodes.py the same way: VitNode, VIT_C, VIT_OP_FACTORIES).
+#
+# Placeholders:  @OP@   the op_type in domain axi.llm, CamelCase, Llm... / Vit...  (class @OP@Node)
+#                @KIND@ the C function, snake_case, llm_... / vit_...
+#   sed -e 's/@OP@/LlmMyOp/g' -e 's/@KIND@/llm_my_op/g' llm_op.py.tmpl > /tmp/my_op.py
+#
+# The worked formula is elementwise, int16 DMA tensor in and out, each at its
+# own per-channel power-of-two exponents: y = x / (1 + |x|) (softsign).  For a
+# row reduction copy LlmRMSNorm's shape (sum left to right per row, np.cumsum in
+# reference()); for float32 / int32 host tensors see the notes in BLOCK 2.
+# Replace every "EDIT" region, in the C AND in reference(), in the SAME order.
+#
+# Three blocks, pasted into src/llm_nodes.py where each block says.
+
+# ==== BLOCK 1 (C): paste at the END of the LLM_C string, above its closing triple quote (the one before "# DMA-state helpers") ====
+
+/* ---- @OP@: y = x / (1 + |x|) per element (EDIT), x read at its exponents
+ *      (llm_ld: raw * 2^-f_x[c], exact), y written at its own (llm_st: round
+ *      half to even at 2^f_y[c], saturate, NaN -> 0) ---- */
+typedef struct {
+    const Data_t *x;
+    const double *sx, *iy;                 /* 2^-f_x[c], 2^f_y[c] */
+    unsigned      n;
+    Data_t       *y;
+} @KIND@_t;
+
+static void @KIND@_rows(void *p, unsigned r0, unsigned r1)
+{
+    const @KIND@_t *a = (const @KIND@_t *)p;
+    unsigned        r, c;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * a->n;
+        Data_t       *y = a->y + (size_t)r * a->n;
+        for (c = 0u; c < a->n; c++) {
+            const double v = llm_ld(x[c], a->sx[c]);
+            y[c] = llm_st(v / (1.0 + fabs(v)), a->iy[c]);           /* EDIT: formula */
+        }
+    }
+}
+
+static void @KIND@(const Data_t *x, const double *sx, const double *iy, unsigned rows,
+                   unsigned n, Data_t *y)
+{
+    @KIND@_t a;
+    a.x = x; a.sx = sx; a.iy = iy; a.n = n; a.y = y;
+    host_parallel(@KIND@_rows, &a, rows, host_row_grain(n), 1u);
+}
+
+
+# ==== BLOCK 2 (node class): paste above "LLM_OP_FACTORIES = {" ====
+
+@dataclass
+class @OP@Node(LlmNode):
+    """y = x / (1 + |x|) at per-channel exponents (EDIT: semantics; the
+    spec is the study emulation, llm_study.py / vlm_study.py)."""
+    rows: int = 1
+    n:    int = 1
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        x = _resolve(tensors, node.input[0], node)
+        y = _resolve(tensors, node.output[0], node)
+        n = int(x.shape[-1])
+        sn = cls(onnx_node=node, inputs=[x], output=y, index=index, align_elems=align_elems,
+                 rows=x.numel // n, n=n, F=ctx.frac_bits)
+        # None = a DMA int16 tensor at its exponents; "f32" / "i32" / "i16" = a host
+        # tensor (a plain C pointer: const float * / const int32_t * / int16_t *,
+        # passed by name, never staged; a host OUTPUT is written directly)
+        sn._want(x, None, "input")
+        sn._want(y, None, "output")
+        _require(y.numel == x.numel and int(y.shape[-1]) == n, node, "shapes")
+        return sn
+
+    def c_runtime(self):
+        # every scale array the call names, deduplicated project-wide by key
+        return [self._scales(self.inputs[0])[2], self._scales(self.output)[2]]
+
+    def describe(self):
+        return f"rows={self.rows} n={self.n}"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        sx = self._scales(self.inputs[0])[0]          # 2^-f per channel (read)
+        iy = self._scales(self.output)[1]             # 2^f per channel (write-back)
+        return [f"@KIND@({ins[0]}, {sx}, {iy}, {self.rows}u, {self.n}u, {out});"]
+
+    def reference(self, ins, dtype):
+        """The C helper's operations in its order (the simulator runs this);
+        ins are VALUES (raw * 2^-f), the result is quantised at the output's
+        exponents."""
+        x = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
+        y = x / (1.0 + np.abs(x))                                    # EDIT: same order as C
+        return _st(dtype, y, self.output.exp_channels(self.F)[None, :]).reshape(
+            self.output.shape)
+
+
+# ==== BLOCK 3 (registration): edit these existing lines of src/llm_nodes.py ====
+#   LLM_OP_FACTORIES = {..., "@OP@": @OP@Node.from_onnx_node}
+#   __all__ = (..., "@OP@Node")
+# (vision op: VIT_OP_FACTORIES / __all__ of src/vit_nodes.py, class @OP@Node(VitNode),
+#  C at the end of VIT_C)

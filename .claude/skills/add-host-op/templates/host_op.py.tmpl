@@ -1,0 +1,103 @@
+# add-host-op template: a STANDARD ONNX host op (inference-scheduler/src/host_nodes.py).
+#
+# Placeholders:  @OP@   the ONNX op_type, CamelCase      (class @OP@Node)
+#                @KIND@ the helper kind, snake_case      (C: host_@KIND@, _@KIND@_C)
+#   sed -e 's/@OP@/MyOp/g' -e 's/@KIND@/my_op/g' host_op.py.tmpl > /tmp/my_op.py
+#
+# The worked formula is a row op over the last axis with a left-to-right
+# reduction and an element write-back: y = x / sqrt(sum x^2) (ONNX
+# LpNormalization, p = 2, axis = -1).  Replace every "EDIT" region, in the C
+# AND in reference(), keeping the SAME operation order in both.
+#
+# Three blocks, pasted into src/host_nodes.py where each block says.
+
+# ==== BLOCK 1 (C helper): paste above the line "# Helper kinds in emission order." ====
+
+_@KIND@_C = r"""/* @OP@ over rows of n elements (EDIT: the formula, as the C computes it):
+ *   ss = sum_j x[j]^2 (left to right),  y[j] = x[j] / sqrt(ss)
+ * ss == 0 gives 0 / 0 = NaN -> host_st writes 0. */
+typedef struct {
+    const Data_t *x;
+    Data_t       *y;
+    unsigned      n;
+} host_@KIND@_t;
+
+static void host_@KIND@_rows(void *p, unsigned r0, unsigned r1)
+{
+    const host_@KIND@_t *a = (const host_@KIND@_t *)p;
+    unsigned             r, j, n = a->n;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * n;
+        Data_t       *y = a->y + (size_t)r * n;
+        double        ss = 0.0, nrm;
+        for (j = 0u; j < n; j++) {                     /* EDIT: reduction, left to right */
+            double v = host_ld(x[j]);
+            ss += v * v;
+        }
+        nrm = sqrt(ss);
+        for (j = 0u; j < n; j++)                       /* EDIT: element formula */
+            y[j] = host_st(host_ld(x[j]) / nrm);
+    }
+}
+
+static void host_@KIND@(const Data_t *x, Data_t *y, unsigned rows, unsigned n)
+{
+    host_@KIND@_t a;
+    a.x = x; a.y = y; a.n = n;
+    host_parallel(host_@KIND@_rows, &a, rows, host_row_grain(n), 1u);
+}
+"""
+
+
+# ==== BLOCK 2 (node class): paste above the "# Registry" banner ====
+
+@dataclass
+class @OP@Node(HostNode):
+    """ONNX @OP@ on the host (EDIT: semantics; every restriction the C
+    makes is rejected in from_onnx_node with a SchedulerError)."""
+    helpers: ClassVar[Tuple[str, ...]] = ("@KIND@",)
+    rows: int = 1
+    n:    int = 1
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        x = _resolve(tensors, node.input[0], node)
+        y = _resolve(tensors, node.output[0], node)
+        a = _attrs(node)
+        rank = len(x.shape)
+        axis = int(a.get("axis", -1))                              # EDIT: attributes
+        if axis < 0:
+            axis += rank
+        if rank < 1 or axis != rank - 1:
+            raise SchedulerError(f"@OP@ node '{_label(node)}': axis {a.get('axis')}; only "
+                                 f"the last axis is supported.")
+        if int(a.get("p", 2)) != 2:
+            raise SchedulerError(f"@OP@ node '{_label(node)}': p={a.get('p')}; only p=2.")
+        n = int(x.shape[-1])
+        sn = cls(onnx_node=node, inputs=[x], output=y, index=index,
+                 align_elems=align_elems, rows=max(x.numel // max(n, 1), 1), n=n)
+        sn._reject_int(x)                                          # Data_t values only
+        if y.numel != x.numel:
+            raise SchedulerError(f"@OP@ node '{_label(node)}': output numel "
+                                 f"{y.numel} != input numel {x.numel}.")
+        return sn
+
+    def describe(self) -> str:                   # report.md "Notes" + the C comment
+        return f"rows={self.rows} n={self.n}"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        return [f"host_@KIND@({ins[0]}, {out}, {self.rows}u, {self.n}u);"]
+
+    def reference(self, ins, dtype):
+        """The C helper's operations in its order (the simulator runs this)."""
+        x = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
+        ss = np.cumsum(x * x, axis=1)[:, -1:]         # EDIT: left to right (NOT np.sum)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y = x / np.sqrt(ss)                       # EDIT: same formula, same order
+        return dtype.host_quantize(y).reshape(self.output.shape)   # round half even, sat, NaN -> 0
+
+
+# ==== BLOCK 3 (registration): edit these existing lines of src/host_nodes.py ====
+#   HOST_C_HELPER_ORDER = (..., "cast", "@KIND@")
+#   host_c_helper():  the dict in its last return  +  "@KIND@": _@KIND@_C,
+#   HOST_OP_FACTORIES = {..., "@OP@": @OP@Node.from_onnx_node}

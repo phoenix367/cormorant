@@ -1,0 +1,125 @@
+"""@OP@ (axi.llm host op, src/llm_nodes.py @OP@Node): the generated C against
+``reference()`` (the simulator's) bit for bit — alone and between two
+MatMuls on the host emulation (cacheable / staged buffers, 1 / 3 / 4 threads,
+separate CPU / DDR copies), exhaustively over every raw int16 input at
+several exponent pairs (ties, saturation, both signs), the reference against
+an independent float formula, and the cache-coherency audit.
+
+Instantiated from .claude/skills/add-host-op/templates/test_llm_op.py.tmpl;
+save as inference-scheduler/test/test_<kind>.py.
+"""
+
+import os
+import subprocess
+import tempfile
+import unittest
+
+import numpy as np
+import onnx.helper as oh
+import onnx.numpy_helper as nph
+
+import host_emu
+from test_cache_coherency import CoherencyChecker
+from test_llm_ops import F32, emulate, exps, model, node, vi
+from src.codegen import CodeGenerator
+from src.dtype import AP_FIXED_16_8 as Q
+from src.graph import OnnxGraph
+from src.host_nodes import HOST_C_POOL
+from src.llm_nodes import @OP@Node, llm_c_helpers
+
+
+def _float_ref(x):
+    """EDIT: the op in plain float64 (independent of reference())."""
+    return x / (1.0 + np.abs(x))
+
+
+class Test@OP@(unittest.TestCase):
+
+    def test_alone_on_host_emulation(self):
+        for T, N in ((3, 40), (1, 7), (5, 33)):          # odd widths: loop tails
+            m = model([node("@OP@", ["x"], ["y"])], [vi("x", F32, [T, N])],
+                      [vi("y", F32, [T, N])], (),
+                      {"exp": {"x": exps(N, 4, 14), "y": exps(N, 6, 14)}})
+            with self.subTest(T=T, N=N):
+                cg = emulate(self, m, "@KIND@", incoherent=True)
+                self.assertIsInstance(cg._graph.nodes[0], @OP@Node)
+
+    def test_between_kernels(self):
+        """MatMul -> @OP@ -> MatMul: invalidate the kernel-written input,
+        flush the output for the next kernel.  A custom-domain output needs
+        its value_info (ONNX shape inference does not know the op)."""
+        T, K, N, M = 3, 32, 48, 16
+        rng = np.random.default_rng(7)
+        w1 = (rng.normal(0, 0.2, (K, N))).astype(np.float32)
+        w2 = (rng.normal(0, 0.2, (N, M))).astype(np.float32)
+        m = model([oh.make_node("MatMul", ["a", "w1"], ["t"], name="mm1"),
+                   node("@OP@", ["t"], ["y"]),
+                   oh.make_node("MatMul", ["y", "w2"], ["z"], name="mm2")],
+                  [vi("a", F32, [T, K])], [vi("z", F32, [T, M])],
+                  [nph.from_array(w1, "w1"), nph.from_array(w2, "w2")],
+                  {"exp": {"a": exps(K, 8, 11), "t": exps(N, 8, 11), "y": exps(N, 9, 13),
+                           "z": exps(M, 7, 10)}},
+                  value_info=[vi("t", F32, [T, N]), vi("y", F32, [T, N])])
+        cg = emulate(self, m, "@KIND@_chain", incoherent=True)
+        self.assertEqual(CoherencyChecker(cg).check(), [])
+
+    def test_exhaustive_c(self):
+        """All 65 536 raw inputs (rows = 65 536, n = 1) at several (f_x, f_y):
+        the C helper, compiled alone with the thread pool, equals reference()."""
+        raw = np.arange(65536).astype(np.uint16).view(np.int16).astype(np.float64)
+        with tempfile.TemporaryDirectory() as td:
+            src, exe = os.path.join(td, "h.c"), os.path.join(td, "h")
+            with open(src, "w") as f:
+                f.write("#include <stdint.h>\n#include <stdio.h>\n#include <stdlib.h>\n"
+                        "#include <string.h>\n#include <math.h>\ntypedef uint16_t Data_t;\n"
+                        + HOST_C_POOL + llm_c_helpers() +
+                        "int main(int argc, char **argv) {\n"
+                        "    static Data_t x[65536], y[65536];\n"
+                        "    signed char ex = (signed char)atoi(argv[1]), ey = (signed char)atoi(argv[2]);\n"
+                        "    double *sx, *ix, *sy, *iy;\n"
+                        "    unsigned i;\n"
+                        "    if (argc < 3 || host_pool_init() != 0 || llm_scales(&sx, &ix, &ex, 1u) != 0\n"
+                        "        || llm_scales(&sy, &iy, &ey, 1u) != 0) return 1;\n"
+                        "    for (i = 0u; i < 65536u; i++) x[i] = (Data_t)i;\n"
+                        "    @KIND@(x, sx, iy, 65536u, 1u, y);\n"
+                        "    fwrite(y, sizeof(Data_t), 65536u, stdout);\n"
+                        "    free(sx); free(ix); free(sy); free(iy); host_pool_deinit();\n"
+                        "    return 0;\n}\n")
+            r = subprocess.run([host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra",
+                                "-Werror", "-Wno-unused-function", "-pthread", "-ffp-contract=off",
+                                "-DINFERENCE_HOST_MIN_ELEMS=1u", src, "-lm", "-o", exe],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for fx, fy in ((8, 8), (12, 6), (4, 14), (14, 3)):       # EDIT: the exponents in use
+                g = OnnxGraph(model([node("@OP@", ["x"], ["y"])], [vi("x", F32, [65536, 1])],
+                                    [vi("y", F32, [65536, 1])], (),
+                                    {"exp": {"x": fx, "y": fy}}))
+                ref = g.nodes[0].reference([(raw / 2.0 ** fx).reshape(65536, 1)], Q)
+                want = np.round(ref.reshape(-1) * 2.0 ** fy).astype(np.int16)
+                for threads in ("1", "4"):
+                    with self.subTest(fx=fx, fy=fy, threads=threads):
+                        out = subprocess.run([exe, str(fx), str(fy)], capture_output=True,
+                                             check=True,
+                                             env=dict(os.environ, INFERENCE_HOST_THREADS=threads))
+                        np.testing.assert_array_equal(np.frombuffer(out.stdout, np.int16), want)
+
+    def test_reference_vs_float(self):
+        T, N = 4, 24
+        fx, fy = exps(N, 6, 12), exps(N, 8, 14)
+        g = OnnxGraph(model([node("@OP@", ["x"], ["y"])], [vi("x", F32, [T, N])],
+                            [vi("y", F32, [T, N])], (), {"exp": {"x": fx, "y": fy}}))
+        x = np.round(np.random.default_rng(3).normal(0, 4, (T, N)) * 2.0 ** np.array(fx)) \
+            / 2.0 ** np.array(fx)
+        y = g.nodes[0].reference([x], Q)
+        # one write-back: within half an LSB of the output exponent
+        self.assertTrue(np.all(np.abs(y - _float_ref(x)) <= 0.5 * 2.0 ** -np.array(fy) + 1e-15))
+
+    def test_codegen_names_the_helper(self):
+        m = model([node("@OP@", ["x"], ["y"])], [vi("x", F32, [2, 8])], [vi("y", F32, [2, 8])],
+                  (), {"exp": {"x": 8, "y": 10}})
+        src = CodeGenerator(OnnxGraph(m), model_path="m.onnx").generate_source()
+        self.assertIn("@KIND@(", src)
+
+
+if __name__ == "__main__":
+    unittest.main()
