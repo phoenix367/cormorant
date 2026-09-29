@@ -42,6 +42,22 @@ Contract:
     server's per-request log line.
   * Parameters the backend cannot honour must be rejected in prepare() or
     documented (e.g. temperature for an extractive model).
+
+Text to speech (POST /v1/audio/speech): a backend with speech = True serves
+SpeechRequests instead of ChatRequests —
+
+        def prepare_speech(self, req):     # outside the FPGA lock: text ->
+            return job                     # phonemes -> the model's input;
+                                           # job.samples = the total length
+        def synthesize(self, job, cancel): # under the FPGA lock
+            for piece in ...:
+                cancel.check()
+                yield pcm_bytes            # int16 little-endian mono at
+            yield Finish("stop", ...)      # self.sample_rate
+
+  The server turns the PCM into the requested format (a WAV header, raw
+  PCM, or ffmpeg for mp3 / opus / aac / flac) and streams it; Finish's
+  prompt_tokens / completion_tokens are the usage's input / output tokens.
 """
 
 from __future__ import annotations
@@ -108,6 +124,19 @@ class ChatRequest:
 
 
 @dataclass
+class SpeechRequest:
+    """A validated /v1/audio/speech request (the server fills it)."""
+    model: str
+    input: str
+    voice: Optional[str] = None
+    response_format: str = "wav"           # wav | pcm | mp3 | opus | aac | flac
+    speed: float = 1.0                     # 0.25 .. 4
+    stream_format: str = "audio"           # audio | sse
+    seed: Optional[int] = None
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class Delta:
     text: str
 
@@ -131,6 +160,8 @@ class Backend:
     fingerprint: Optional[str] = None      # -> "system_fingerprint"
     uses_fpga: bool = True                 # False: no device state, always resident
     cma_mb: float = 0.0                    # CMA held while loaded (MB), for --resident auto
+    speech: bool = False                   # True: a text-to-speech model (/v1/audio/speech)
+    sample_rate: int = 0                   # speech: PCM samples per second
 
     def load_host(self) -> None:
         """Host-only resources prepare() needs (tokenizer, template); once,
@@ -155,6 +186,12 @@ class Backend:
         return req
 
     def generate(self, job: Any, cancel: CancelToken) -> Iterator[Event]:
+        raise NotImplementedError
+
+    def prepare_speech(self, req: SpeechRequest) -> Any:
+        raise BackendError(f"The model '{self.model_id}' does not synthesize speech.", "model")
+
+    def synthesize(self, job: Any, cancel: CancelToken) -> Iterator[Union[bytes, Finish]]:
         raise NotImplementedError
 
 

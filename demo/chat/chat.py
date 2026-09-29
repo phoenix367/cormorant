@@ -6,6 +6,8 @@ only) for the KV260 chat server; runs on a laptop or on the board.
   chat.py [--url http://kv260:8000/v1] [--api-key KEY] [--model M]
           [--doc FILE | --system TEXT] [--image FILE] [-q QUESTION] [--no-stream]
           [--max-tokens N] [--temperature T]
+          [--audio] [--say TEXT] [--audio-out FILE.wav] [--player CMD|none]
+          [--tts-model tts-1] [--voice V] [--speed S]
 
 Interactive commands:
   /doc FILE      use FILE as the document (the system message; bert-squad)
@@ -14,12 +16,24 @@ Interactive commands:
                  image model, e.g. smolvlm-256m-instruct); or end a message
                  with it: "What is in this image? /image photo.jpg"
   /model [M]     list the server's models / switch to M (the history is kept)
+  /audio [on|off]   read the answers aloud (text to speech on the server,
+                 POST /v1/audio/speech; /audio alone toggles)
+  /audio save FILE.wav   save the last audio
+  /say [TEXT]    speak TEXT, or the last answer again (Ctrl-C stops the audio)
   /reset         forget the conversation (keeps the system message)
   /help, /quit
 
 With -q the question is asked once and the answer printed (exit code 1 on
-an error).  Environment: KV260_CHAT_URL, KV260_CHAT_API_KEY (or
-OPENAI_API_KEY).
+an error); with --audio it is also spoken.  --say TEXT only speaks TEXT.
+Environment: KV260_CHAT_URL, KV260_CHAT_API_KEY (or OPENAI_API_KEY),
+KV260_CHAT_PLAYER.
+
+Audio plays as it streams in: raw 16-bit PCM from the server piped into
+the first player found — pw-play, paplay, aplay, ffplay or sox's play —
+or --player "CMD" (reading raw s16le mono from stdin; {rate} is replaced
+by the sample rate).  Without one it is played whole (afplay on macOS,
+winsound on Windows) or saved to a WAV file whose path is printed;
+--player none never plays.
 """
 
 import argparse
@@ -27,10 +41,16 @@ import base64
 import http.client
 import json
 import os
+import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import wave
 
 try:
     import readline  # noqa: F401 — line editing and history for input()
@@ -127,6 +147,160 @@ def ask(args, messages):
     return text
 
 
+# ── audio ────────────────────────────────────────────────────────────────────
+
+# Players that take raw s16le mono PCM on stdin and start at the first byte.
+PLAYERS = (("pw-play", "pw-play --rate {rate} --channels 1 --format s16 -"),
+           ("paplay", "paplay --raw --rate={rate} --channels=1 --format=s16le"),
+           ("aplay", "aplay -q -t raw -f S16_LE -r {rate} -c 1 -"),
+           ("ffplay", "ffplay -nodisp -autoexit -loglevel quiet -f s16le -ar {rate} -ac 1 -i -"),
+           ("play", "play -q -t raw -r {rate} -e signed -b 16 -c 1 -"))
+MAX_SPEECH = 4096                           # characters per request (OpenAI's limit)
+
+
+class Audio:
+    """What was last spoken, for /audio save and /say."""
+
+    def __init__(self):
+        self.pcm, self.rate = b"", 0
+
+
+def player_command(args, rate):
+    """argv of the streaming player, or None (play whole / save instead)."""
+    if args.player == "none":
+        return None
+    if args.player:
+        return shlex.split(args.player.replace("{rate}", str(rate)))
+    for name, tmpl in PLAYERS:
+        if shutil.which(name):
+            return shlex.split(tmpl.format(rate=rate))
+    return None
+
+
+def player_name(args):
+    if args.player:
+        return args.player.split()[0]
+    return next((n for n, _ in PLAYERS if shutil.which(n)), None) or (
+        "afplay" if shutil.which("afplay") else "winsound" if sys.platform == "win32" else "a WAV file")
+
+
+def speech_text(text):
+    """An answer as plain text to speak: code blocks and markdown marks out,
+    a period after a line without one (a heading, a list item: a pause),
+    whitespace collapsed, at most MAX_SPEECH characters (cut at a sentence)."""
+    text = re.sub(r"```.*?(```|$)", " ", text, flags=re.S)
+    text = re.sub(r"^[ \t]{0,3}(#{1,6}|>|[-*+]|\d+[.)])[ \t]+", "", text, flags=re.M)
+    text = re.sub(r"(\*\*|__|\*|`|~~)", "", text)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    text = " ".join(ln if ln[-1] in ".!?:;,\"')" else ln + "." for ln in lines)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_SPEECH:
+        cut = text[:MAX_SPEECH]
+        end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        text = cut[:end + 1] if end > MAX_SPEECH // 2 else cut
+    return text
+
+
+def wav_bytes(pcm, rate):
+    import io
+    b = io.BytesIO()
+    with wave.open(b, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(pcm)
+    return b.getvalue()
+
+
+def save_wav(path, pcm, rate):
+    with open(os.path.expanduser(path), "wb") as f:
+        f.write(wav_bytes(pcm, rate))
+
+
+def play_whole(args, pcm, rate):
+    """No streaming player: afplay (macOS), winsound (Windows), else a WAV
+    file whose path is printed."""
+    if args.player == "none":
+        return
+    if sys.platform == "win32":
+        import winsound
+        winsound.PlaySound(wav_bytes(pcm, rate), winsound.SND_MEMORY)
+        return
+    fd, path = tempfile.mkstemp(prefix="kv260_chat_", suffix=".wav")
+    os.close(fd)
+    save_wav(path, pcm, rate)
+    if shutil.which("afplay"):
+        try:
+            subprocess.run(["afplay", path], check=False)
+        finally:
+            os.unlink(path)
+    else:
+        print(f"{DIM}(no audio player found — pw-play, paplay, aplay, ffplay, play; saved {path}){RST}")
+
+
+def speak(args, text, audio):
+    """Synthesize text on the server (POST /audio/speech, raw PCM) and play
+    it while it streams in.  Ctrl-C stops it.  Keeps the audio in `audio`."""
+    text = speech_text(text)
+    if not text:
+        return
+    body = {"model": args.tts_model, "input": text, "voice": args.voice, "response_format": "pcm"}
+    if args.speed:
+        body["speed"] = args.speed
+    t0 = time.monotonic()
+    proc, pcm, first, rate, stopped, streamed = None, bytearray(), None, 24000, False, False
+    try:
+        r = call(args, "/audio/speech", body)
+        rate = int(r.headers.get("X-Sample-Rate") or 24000)      # OpenAI's pcm: 24 kHz
+        cmd = player_command(args, rate)
+        if cmd:
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                streamed = True
+            except OSError as e:
+                print(f"{DIM}(cannot start {cmd[0]}: {e}){RST}")
+        with r:
+            while True:
+                data = r.read1(65536)
+                if not data:
+                    break
+                if first is None:
+                    first = time.monotonic() - t0
+                pcm += data
+                if proc:
+                    try:
+                        proc.stdin.write(data)
+                        proc.stdin.flush()
+                    except OSError:                   # the player quit: keep downloading
+                        proc.kill()
+                        proc.wait()
+                        proc = None
+        if proc:
+            proc.stdin.close()
+            proc.wait()                               # until it has played everything
+        elif not streamed:
+            play_whole(args, bytes(pcm), rate)
+    except KeyboardInterrupt:
+        stopped = True
+        if proc:
+            proc.kill()
+            proc.wait()
+    audio.pcm, audio.rate = bytes(pcm), rate
+    if args.audio_out and pcm:
+        save_wav(args.audio_out, audio.pcm, rate)
+    if stopped:
+        print(f"{DIM}(audio stopped){RST}")
+    elif args.verbose or sys.stdout.isatty():
+        info = [f"audio {len(pcm) / 2 / rate:.1f} s"]
+        if first is not None:
+            info.append(f"first sound {first:.1f} s")
+        info.append(f"{time.monotonic() - t0:.1f} s")
+        if args.audio_out:
+            info.append(f"saved {args.audio_out}")
+        print(f"{DIM}[{' · '.join(info)}]{RST}")
+
+
 def read_file(path):
     with open(os.path.expanduser(path), encoding="utf-8") as f:
         return f.read().strip()
@@ -186,7 +360,26 @@ def main(argv=None):
     ap.add_argument("--temperature", type=float)
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("-v", "--verbose", action="store_true", help="print timing / token info")
+    g = ap.add_argument_group("audio (text to speech on the server)")
+    g.add_argument("--audio", action="store_true", help="read the answers aloud (/audio)")
+    g.add_argument("--say", metavar="TEXT", help="speak TEXT and exit (no chat)")
+    g.add_argument("--audio-out", metavar="FILE.wav", help="also save the (last) audio as a WAV file")
+    g.add_argument("--player", default=os.environ.get("KV260_CHAT_PLAYER"),
+                   help='command playing raw s16le mono PCM from stdin, {rate} = the sample rate '
+                        '(default: pw-play, paplay, aplay, ffplay or play); "none": never play')
+    g.add_argument("--tts-model", default="tts-1", help="speech model (default tts-1: the server's)")
+    g.add_argument("--voice", default="alloy", help="voice name (the server may have only one)")
+    g.add_argument("--speed", type=float, help="speech speed, 0.25 .. 4")
     args = ap.parse_args(argv)
+    audio = Audio()
+
+    if args.say is not None:
+        try:
+            speak(args, args.say, audio)
+            return 0
+        except (ApiError, OSError, http.client.HTTPException, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     try:
         system = read_file(args.doc) if args.doc else args.system
@@ -202,7 +395,9 @@ def main(argv=None):
 
     if args.question:
         try:
-            ask(args, convo() + [user_message(args.question, args.image)])
+            answer = ask(args, convo() + [user_message(args.question, args.image)])
+            if args.audio or args.audio_out:
+                speak(args, answer, audio)
             return 0
         except (ApiError, OSError, http.client.HTTPException, ValueError) as e:
             print(f"error: {e}", file=sys.stderr)
@@ -212,6 +407,7 @@ def main(argv=None):
     tty = sys.stdin.isatty()
     print(f"{DIM}{args.url} · model {args.model}"
           f"{' · document ' + str(len(system.split())) + ' words' if system else ''}"
+          f"{' · answers read aloud' if args.audio else ''}"
           f" · /help for commands{RST}")
     while True:
         try:
@@ -251,6 +447,30 @@ def main(argv=None):
                 if arg:
                     args.model = arg
                 print(f"{DIM}models: {', '.join(models(args))}; using {args.model}{RST}")
+            elif cmd == "/audio":
+                sub, _, rest = arg.partition(" ")
+                if sub == "save":
+                    if not audio.pcm:
+                        print(f"{DIM}no audio yet (/say or /audio on){RST}")
+                    elif not rest.strip():
+                        print(f"{DIM}usage: /audio save FILE.wav{RST}")
+                    else:
+                        save_wav(image_path(rest), audio.pcm, audio.rate)
+                        print(f"{DIM}(saved {len(audio.pcm) / 2 / audio.rate:.1f} s to "
+                              f"{image_path(rest)}){RST}")
+                    continue
+                if sub not in ("", "on", "off"):
+                    print(f"{DIM}usage: /audio [on|off] | /audio save FILE.wav{RST}")
+                    continue
+                args.audio = (not args.audio) if not sub else sub == "on"
+                print(f"{DIM}(answers {'read aloud: ' + args.tts_model + ' via ' + player_name(args) if args.audio else 'not read aloud'}){RST}")
+            elif cmd == "/say":
+                text = arg or next((m["content"] for m in reversed(history)
+                                    if m["role"] == "assistant"), "")
+                if not text:
+                    print(f"{DIM}nothing to say yet (/say TEXT){RST}")
+                else:
+                    speak(args, text, audio)
             elif cmd.startswith("/"):
                 print(f"{DIM}unknown command {cmd} (/help){RST}")
             else:
@@ -266,6 +486,11 @@ def main(argv=None):
                 history.append(user_message(text, pending_image))
                 pending_image = None
                 history.append({"role": "assistant", "content": ask(args, convo())})
+                if args.audio:
+                    try:
+                        speak(args, history[-1]["content"], audio)
+                    except ApiError as e:            # the answer stays in the history
+                        print(f"{DIM}(audio: {e}){RST}")
         except ApiError as e:
             if history and history[-1]["role"] == "user":
                 history.pop()

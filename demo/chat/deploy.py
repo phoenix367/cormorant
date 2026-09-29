@@ -14,7 +14,8 @@ host with inference-scheduler/.venv/bin/python).
               squad_text.py, chat.py, vocab.txt, and the smollm2 side
               (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
               src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/,
-              <dir>/smollm2_360m/, <dir>/smolvlm/) to <dir>
+              <dir>/smollm2_360m/, <dir>/smolvlm/), and the piper side
+              (piper_backend.py, piper_phonemize.py, piper_vits.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
               (skipped when unchanged; without it the server samples in Python)
   start    -> transient systemd unit 'kv260-chat' (systemd-run: survives the
@@ -28,6 +29,12 @@ smollm2.lib (default <dir>/lib/libsmollm2.so), smollm2-360m at
 smollm2_360m.lib (default <dir>/lib/libsmollm2_360m.so), smolvlm at
 smolvlm.lib (default <dir>/lib/libsmolvlm_256m.so); preflight reports whether
 they are there.  The smollm2 block's sampling defaults apply to all three.
+The piper backend (text to speech, POST /v1/audio/speech) needs
+libpiper_tts.so (piper.lib, default <dir>/lib/libpiper_tts.so) and its voice
+directory (piper.weights_dir, default /root/piper_weights: weights/*.dat,
+frontend.npz, voice.json), both installed by demo/tts/scripts/tts_board.py
+--install-only, plus numpy and libespeak-ng1 on the board (ffmpeg for mp3 /
+opus / aac / flac).
 
 The board lock (flock on board_lock) is held while deploying.  The running
 server owns the FPGA: other board jobs must wait until `deploy.py --stop`.
@@ -74,7 +81,8 @@ SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py",
                 CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
                 CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
-                CHAT / "vlm_image.py"]
+                CHAT / "vlm_image.py", CHAT / "piper_backend.py", CHAT / "piper_phonemize.py",
+                DEMO / "tts" / "scripts" / "piper_vits.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -145,6 +153,12 @@ def load_config(path: Optional[str]) -> dict:
             vlm[k] = v
     if not vlm["lib"]:
         vlm["lib"] = f"{rem['dir']}/lib/libsmolvlm_256m.so"
+    tts = cfg.setdefault("piper", {})
+    for k, v in (("lib", None), ("weights_dir", "/root/piper_weights"), ("model_id", None), ("cma_mb", 40)):
+        if tts.get(k) is None:
+            tts[k] = v
+    if not tts["lib"]:
+        tts["lib"] = f"{rem['dir']}/lib/libpiper_tts.so"
     cfg.setdefault("build", {}).setdefault("jobs", 4)
     cfg["build"].setdefault("timeout", 1800)
     cfg["board_lock"] = cfg.get("board_lock") or bcfg.get("board_lock")
@@ -166,6 +180,10 @@ def uses_llm_360m(cfg: dict) -> bool:
 
 def uses_vlm(cfg: dict) -> bool:
     return any(b in ("smolvlm", "smolvlm-256m-instruct") for b in cfg["server"]["backends"])
+
+
+def uses_tts(cfg: dict) -> bool:
+    return any(b in ("piper", "piper-lessac-medium") for b in cfg["server"]["backends"])
 
 
 def sudo(cfg: dict) -> str:
@@ -291,6 +309,29 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
         print(f"    {_green('OK     ') if good else _red('MISSING')} {'Pillow (image decoding)':<36} "
               f"{_dim(out.strip() if good else 'apt install python3-pil')}")
         ok &= good
+    if uses_tts(cfg):
+        tts, how = cfg["piper"], "demo/tts/scripts/tts_board.py --install-only (TTS_PLAN §5)"
+        for label, path in (("libpiper_tts.so (piper)", tts["lib"]),
+                            ("  frontend.npz", f"{tts['weights_dir']}/frontend.npz"),
+                            ("  voice.json", f"{tts['weights_dir']}/voice.json")):
+            _, _, rc = session.exec(f"test -f {shlex.quote(path)}", timeout=15)
+            good = rc == 0
+            print(f"    {_green('OK     ') if good else _red('MISSING')} {label:<36} "
+                  f"{_dim(path if good else path + ' - ' + how)}")
+            ok &= good
+        for label, cmd, fix in (
+                ("  numpy", "python3 -c 'import numpy; print(numpy.__version__)'", "apt install python3-numpy"),
+                ("  libespeak-ng (phonemes)",
+                 "python3 -c 'import ctypes, ctypes.util; p = ctypes.util.find_library(\"espeak-ng\"); "
+                 "ctypes.CDLL(p); print(p)'", "apt install libespeak-ng1 espeak-ng-data")):
+            out, _, rc = session.exec(cmd, timeout=30)
+            good = rc == 0
+            print(f"    {_green('OK     ') if good else _red('MISSING')} {label:<36} "
+                  f"{_dim(out.strip() if good else fix)}")
+            ok &= good
+        out, _, rc = session.exec("command -v ffmpeg", timeout=15)
+        print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'  ffmpeg (mp3 / opus / aac / flac)':<36} "
+              f"{_dim(out.strip() or 'none: speech as wav / pcm only')}")
     return ok
 
 
@@ -468,6 +509,12 @@ def server_argv(cfg: dict) -> List[str]:
             argv += ["--vlm-weights", vlm["weights_dir"]]
         if vlm.get("model_id"):
             argv += ["--vlm-model-id", vlm["model_id"]]
+    if uses_tts(cfg):
+        tts = cfg["piper"]
+        argv += ["--tts-lib", tts["lib"], "--tts-weights", tts["weights_dir"],
+                 "--tts-cma-mb", str(tts["cma_mb"])]
+        if tts.get("model_id"):
+            argv += ["--tts-model-id", tts["model_id"]]
     if s.get("api_key"):
         argv += ["--api-key-file", f"{d}/api_key"]
     return argv
@@ -493,8 +540,15 @@ def start_server(session: RemoteSession, cfg: dict) -> bool:
         envs = " ".join(shlex.quote(f"{k}={v}") for k, v in env.items())
         cmd = (f"cd {d} && {sudo(cfg)}env {envs} setsid nohup {argv} > {d}/server.log 2>&1 "
                f"< /dev/null & echo $! > {d}/server.pid")
+    # Page-cache pages left in the CMA area by uploads and builds can make the
+    # largest pool's contiguous allocation fail although CmaFree is enough
+    # (seen 2026-09-30: 776 MB for SmolLM2-360M with 834 MB free, TTS_PLAN §5);
+    # dropping the clean page cache first empties the area.
+    free, _, _ = session.exec(f"sync; echo 1 | {sudo(cfg)}tee /proc/sys/vm/drop_caches > /dev/null; "
+                              "awk '/CmaFree/{print int($2 / 1024)}' /proc/meminfo", timeout=60)
     out, err, rc = session.exec(cmd, timeout=60)
-    return step("start", rc == 0, t0, f"{launcher}: {UNIT}" if rc == 0 else (out + err).strip())
+    return step("start", rc == 0, t0, (f"{launcher}: {UNIT} (page cache dropped, CmaFree {free.strip()} MB)"
+                                       if rc == 0 else (out + err).strip()))
 
 
 def server_log(session: RemoteSession, cfg: dict, n: int = 40) -> str:
@@ -577,6 +631,9 @@ def print_ready(cfg: dict, h: dict) -> None:
     for m in h["models"]:
         if m["id"].startswith("smollm2-"):
             print(f"                      python3 demo/chat/chat.py --url {url} --model {m['id']}")
+        if m.get("type") == "speech":
+            print(f"                      curl {url}/audio/speech -H 'Content-Type: application/json' "
+                  f"-d '{{\"model\": \"{m['id']}\", \"input\": \"Hello from the FPGA.\"}}' -o hello.wav")
     print(f"    logs              ssh {cfg['ssh']['user']}@{cfg['ssh']['host']} journalctl -fu {UNIT}")
     print(f"    stop              demo/chat/deploy.py --stop   (the server owns the FPGA until then)\n")
 

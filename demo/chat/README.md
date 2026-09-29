@@ -7,7 +7,7 @@ kernels, so existing clients — `curl`, the `openai` SDK, `llm`, `aichat` —
 and our own zero-install `chat.py` talk to the board directly.  Plan and
 decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md).
 
-Four FPGA backends (plus `echo`, protocol only):
+Five FPGA backends (plus `echo`, protocol only):
 
 * **`bert-squad`** (phase 1): BERT-base fine-tuned on SQuAD (the
   [`bert_squad/`](../bert_squad/) demo's model, 962 ms per 256-token window
@@ -29,18 +29,26 @@ Four FPGA backends (plus `echo`, protocol only):
   SmolVLM-256M-Instruct, questions about images (`libsmolvlm_256m.so`; the
   vision encoder takes 3.9 s per image, CHAT_PLAN §24).  The board serves it
   next to both SmolLM2 sizes and BERT (CHAT_PLAN §23).
+* **`piper`** ([below](#text-to-speech--piper-lessac-medium)): **text to
+  speech**, `POST /v1/audio/speech`, with Piper (VITS) en_US-lessac-medium.
+  - `libpiper_tts.so` runs the flow and the HiFi-GAN decoder on ConvKernel:
+    1.49 s of audio per ~0.7 s chunk, bit-exact with the specification.
+  - espeak-ng phonemes and the numpy front end run in the server.
+  - The audio streams as it is made; see TTS_PLAN §4–§5.
 
 ```
  laptop / board shell                          KV260 (Ubuntu 22.04, Python 3.10 stdlib)
  ┌──────────────────────┐  HTTP, OpenAI API   ┌─────────────────────────────────────────────┐
  │ chat.py · curl       │ ──────────────────▶ │ kv260_chat_server.py  /v1/models            │
- │ openai SDK · llm     │ ◀── JSON / SSE ──── │   /v1/chat/completions  /health             │
+ │ openai SDK · llm     │ ◀── JSON / SSE ──── │   /v1/chat/completions  /v1/audio/speech    │
  │ aichat               │                     │   FIFO: one request on the FPGA at a time   │
  └──────────────────────┘                     │ bert_squad_backend.py  (squad_text.py:      │
                                               │   WordPiece, sliding windows, best span)    │
                                               │ smollm2_backend.py  (chatml.py, BPE         │
                                               │   tokenizer, prefix cache, libsampler.so)   │
                                               │ smolvlm_backend.py  (idefics3.py, images)   │
+                                              │ piper_backend.py  (espeak-ng phonemes,      │
+                                              │   numpy text encoder + durations)           │
                                               │        │ ctypes                             │
                                               │ lib/libbert_squad.so  (bert_api.c + the     │
                                               │   generated BERT project, weights in CMA)   │
@@ -48,6 +56,8 @@ Four FPGA backends (plus `echo`, protocol only):
                                               │   generated SmolLM2 project, CMA weights)   │
                                               │ lib/libsmolvlm_256m.so  (llm_api.c + the    │
                                               │   generated SmolVLM project, CMA weights)   │
+                                              │ lib/libpiper_tts.so  (tts_api.c + the       │
+                                              │   generated Piper chunk, CMA weights)       │
                                               │        │ XRT / UIO                          │
                                               │ ConvKernel · MatmulKernel · VectorOPKernel  │
                                               └─────────────────────────────────────────────┘
@@ -63,6 +73,8 @@ demo/chat/
 ├── smollm2_backend.py       — backend B: prompt, prefix cache, decode loop, libsmollm2.so (§11 API)
 ├── smolvlm_backend.py       — backend C: images (llm_image), prefix cache keyed by image content
 ├── idefics3.py, vlm_image.py — SmolVLM's chat template with images; data URL -> 512 x 512 pixels (Pillow)
+├── piper_backend.py         — backend D: text to speech (front end, libpiper_tts.so per chunk)
+├── piper_phonemize.py       — espeak-ng through ctypes -> Piper phoneme ids (+ ../tts/scripts/piper_vits.py)
 ├── smollm2_tokenizer.py     — SmolLM2's byte-level BPE (tokenizer.json) + incremental detokenizer
 ├── chatml.py                — SmolLM2's ChatML template, block-wise tokenizing, history trimming
 ├── sampler.py, src/sampler.{c,h} — sampling (libsampler.so; pure-Python fallback, same tokens)
@@ -532,6 +544,72 @@ and `llm_study.py`'s hash, the package versions, BLAS and CPU.  `HF_ENDPOINT` se
 `add <name> --repo <org/repo> [--revision <branch|tag|commit>]` pins it,
 then `fetch`, `calibrate --record` and `study --record`.
 
+### Text to speech — `piper-lessac-medium`
+
+`POST /v1/audio/speech`, OpenAI's speech API, served by the `piper` backend
+(doc/plans/TTS_PLAN.md §4–§5).
+
+**Install once** (the server must be stopped: it owns the FPGA):
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+# the voice and its calibrated exponents: piper_study.py fetch, phonemize, calibrate (TTS_PLAN §3 "Commands")
+$PY demo/tts/scripts/generate_tts_project.py         # -> demo/tts/build/piper_project
+$PY demo/chat/deploy.py --stop
+$PY demo/tts/scripts/tts_board.py --install-only     # <dir>/lib/libpiper_tts.so, /root/piper_weights
+```
+
+**Enable:** add `"piper"` to `server.backends` in `chat_config.json` and run
+`deploy.py`.  The board needs `libespeak-ng1`, `espeak-ng-data` and numpy
+(Ubuntu 22.04 on the KV260 has them); ffmpeg is needed for mp3 / opus /
+aac / flac.
+
+```
+$ curl http://192.168.100.8:8000/v1/audio/speech -H 'Content-Type: application/json' \
+       -d '{"model": "tts-1", "input": "Hello! I am running on an FPGA board."}' -o hello.wav
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://192.168.100.8:8000/v1", api_key="none")
+with client.audio.speech.with_streaming_response.create(
+        model="tts-1", voice="alloy", input="The birch canoe slid on the smooth planks.",
+        response_format="wav") as r:
+    r.stream_to_file("canoe.wav")
+```
+
+**Request fields**:
+- `model`: `piper-lessac-medium`, or `tts-1` / `tts-1-hd` /
+  `gpt-4o-mini-tts`.
+- `input`: up to 4096 characters.
+- `voice`: any name is accepted; there is one voice.
+- `response_format`: `wav` is the default here; OpenAI's default is mp3.
+  - `pcm` is raw s16le mono at **22 050 Hz** (OpenAI's pcm is 24 kHz); the
+    `X-Sample-Rate` header says so.
+  - `mp3` / `opus` / `aac` / `flac` go through ffmpeg.
+- `speed`: 0.25–4.
+- `stream_format`: `sse` gives `speech.audio.delta` / `speech.audio.done`
+  events.
+- `seed`: an extension; the default 0 makes the same text give the same
+  audio.
+
+**How a request runs**:
+- **Outside the FPGA lock:** the server phonemizes (espeak-ng, Piper's ids)
+  and packs sentences into ≤ 400-id passes of the numpy front end.
+- **On the FPGA:** chunks of 128 frames (1.49 s).
+- **Delivery:** each chunk's samples go out as soon as they exist.  wav /
+  pcm carry an exact Content-Length.
+- **Disconnects:** a client that disconnects stops the synthesis at the
+  next chunk.
+
+**Measured** (2026-09-30):
+- **First audio:** 1.8 s (3.4 s of speech) to 3.5 s (12.5 s of speech).
+- **RTF:** 0.78–0.94 end to end.
+- **Samples:** bit-exact with the same pipeline on the host
+  (`demo/tts/scripts/tts_speech_check.py`).
+- **Residency:** 40 MB of CMA; with `--resident auto` it stays loaded next
+  to SmolLM2-360M.
+
 ### Without the FPGA
 
 ```bash
@@ -605,8 +683,47 @@ Options: `--url` (or `KV260_CHAT_URL`), `--api-key` (or `KV260_CHAT_API_KEY`
 (one-shot; exit code 1 on errors), `--no-stream`, `--max-tokens`,
 `--temperature`, `--timeout`, `-v`.  Commands: `/doc FILE`, `/system [TEXT]`,
 `/image FILE` (attach to the next message, or end a message with it),
-`/model [M]`, `/reset`, `/help`, `/quit`.  On the board:
+`/model [M]`, `/audio`, `/say`, `/reset`, `/help`, `/quit`.  On the board:
 `python3 /root/kv260_chat/chat.py --doc sb50.txt`.
+
+**Audio** (a server with a speech backend,
+[`piper`](#text-to-speech--piper-lessac-medium)).  `chat.py` can read the
+answers aloud:
+
+```
+$ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1 --model smollm2-360m-instruct --audio
+> In two sentences, what is an FPGA?
+An FPGA (Field-Programmable Gate Array) is a type of semiconductor device ...
+[13.3 s · first token 1.0 s, 3.9 tok/s · 40 + 48 tokens]
+[audio 12.7 s · first sound 3.3 s · 9.1 s]
+> /say The birch canoe slid on the smooth planks.
+[audio 2.3 s · first sound 1.4 s · 2.0 s]
+> /audio save canoe.wav
+(saved 2.3 s to canoe.wav)
+```
+
+- **Commands:**
+  - `/audio [on|off]` toggles reading each answer aloud (`--audio` at
+    start).
+  - `/say TEXT` speaks a text; `/say` alone speaks the last answer again.
+  - `/audio save FILE.wav` keeps the last audio.
+  - Ctrl-C stops the audio.
+- **One-shot:** `-q QUESTION --audio`; `--say TEXT` speaks without a chat;
+  `--audio-out FILE.wav` also saves it.
+- **The request:** POST `/v1/audio/speech` (`--tts-model`, default `tts-1`,
+  the server's alias; `--voice`; `--speed`) for raw PCM.
+  - Markdown marks and code blocks are left out of the spoken text, and a
+    heading or list item ends with a pause.
+- **Playback:** the sound starts with the first chunk (~1.5 s), piped into
+  the first player found — `pw-play`, `paplay`, `aplay`, `ffplay` or sox's
+  `play`.
+  - `--player "CMD"` (or `KV260_CHAT_PLAYER`) names another one; it reads
+    raw s16le mono from stdin, and `{rate}` in it is replaced by the
+    sample rate.
+  - `--player none` never plays.
+  - Without a streaming player the audio plays once it is complete
+    (`afplay` on macOS, `winsound` on Windows), or goes to a WAV file whose
+    path is printed.
 
 ### `curl`
 
@@ -812,6 +929,7 @@ OpenAI-compatible client instead.
 | `GET /health` | `{"status": "ok"\|"error", "version", "models": [{id, ready, loaded, ...backend fields: library, weights_dir, (bert) model_name, seq_len, max_windows, windows_run, (smollm2) vocab_size, context_size, reserve, sampler, cached_tokens, defaults, requests, prompt/reused/prefilled/generated_tokens, (smolvlm) image_cache}], "resident", "cma_free_mb", "loads", "unloads", "busy", "waiting", "requests", "uptime_s"}`; 503 when a model failed to load; no API key needed |
 | `GET /v1/models`, `GET /v1/models/{id}` | model list / object (`id`, `object`, `created`, `owned_by`) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE `chat.completion.chunk` lines (role chunk, content chunks, a final chunk with `finish_reason`, a usage chunk with `stream_options.include_usage`), then `data: [DONE]`; chunked transfer (HTTP/1.1, keep-alive) or connection close (HTTP/1.0) |
+| `POST /v1/audio/speech` | text to speech (speech backends, [above](#text-to-speech--piper-lessac-medium)): the audio as it is synthesized — wav / pcm with a Content-Length, mp3 / opus / aac / flac chunked through ffmpeg, or with `stream_format: "sse"` `speech.audio.delta` events and a final `speech.audio.done` (usage); errors as below, plus `unsupported_format` (no ffmpeg) and `model_not_supported` (a chat model here, or a speech model at `/chat/completions`) |
 
 The paths also work without `/v1`.  Honoured: `model` (default: the first
 backend), `messages` (string content or text parts; `image_url` parts —
@@ -946,7 +1064,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 153 tests, ~40 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests)
+python3 -m unittest -v                  # 179 tests, ~45 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests; numpy, ffmpeg and libespeak-ng for the speech tests)
                                         # ~60 skip until the SmolLM2 / SmolVLM tokenizers (llm_calibrate.py / vlm_study.py fetch) and BERT's vocab.txt are present
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
@@ -990,7 +1108,27 @@ Idefics3 template against transformers' processor (7 conversation shapes),
 the image pixels against the study's (Pillow's LANCZOS), and backend C over a
 fake engine: llm_image() before each new image block, image rows as vocab +
 k, prefix reuse keyed by image content, trimming with images, image parts
-over HTTP (and a text model's 400).
+over HTTP (and a text model's 400).  `test_speech.py` —
+`/v1/audio/speech` with a fake speech backend:
+- wav (a real WAV header and Content-Length) and pcm;
+- mp3 / flac / opus / aac through ffmpeg;
+- SSE deltas and usage;
+- aliases and the default model;
+- every validation error, the unknown-length WAV, HTTP/1.0;
+- a client leaving mid-audio;
+- speech and chat sharing the FPGA queue.
+
+`test_chat_client.py` — `chat.py`'s audio:
+- streaming into a recording player;
+- `--say`, `-q --audio`, `--audio-out`;
+- `/audio`, `/audio save`, `/say`;
+- the WAV fallback;
+- the spoken-text cleanup.
+
+`test_piper_backend.py` — the Piper backend over a fake library and front
+end (sentence packing, the chunk loop, seeds, cancellation, the log
+line), and `piper_phonemize.py` against espeak-ng when it is installed
+(clause terminators, Piper's ids).
 
 **Tokenizer reference.**  `validate_text.py` compares against transformers'
 `TokenizersBackend.from_pretrained` — the `tokenizer.json` pipeline, what

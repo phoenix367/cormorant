@@ -10,6 +10,14 @@ Endpoints
   POST /v1/chat/completions     stream false -> one chat.completion JSON;
                                 stream true  -> SSE "data: {chat.completion.chunk}"
                                 lines, then "data: [DONE]"
+  POST /v1/audio/speech         text to speech: {"model", "input", "voice",
+                                "response_format", "speed", "stream_format"} ->
+                                the audio, streamed chunk by chunk as it is
+                                synthesized (wav / pcm directly with a
+                                Content-Length; mp3 / opus / aac / flac through
+                                ffmpeg; stream_format "sse": speech.audio.delta
+                                events); model aliases tts-1, tts-1-hd,
+                                gpt-4o-mini-tts; any voice name is accepted
   (the same paths without the /v1 prefix are accepted too)
 
 Backends (chat_backend.Backend; one model id each)
@@ -25,12 +33,15 @@ Backends (chat_backend.Backend; one model id each)
                SmolVLM-256M-Instruct on the FPGA (smolvlm_backend.py,
                libsmolvlm_256m.so; image_url parts as base64 data URLs,
                resized on the host with Pillow)
+  piper        model id piper-lessac-medium: text to speech with Piper (VITS)
+               on the FPGA (piper_backend.py, libpiper_tts.so; espeak-ng
+               phonemes and the numpy front end on the host; 22050 Hz mono)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~760 MB, SmolVLM
-~540 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
+~540 MB, Piper ~40 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -66,20 +77,25 @@ usage:
                        [--llm-360m-lib lib/libsmollm2_360m.so] [--llm-360m-weights DIR]
                        [--llm-360m-tokenizer tokenizer.json]
                        [--vlm-lib lib/libsmolvlm_256m.so] [--vlm-weights DIR]
+                       [--tts-lib lib/libpiper_tts.so] [--tts-weights DIR] [--ffmpeg PATH]
                        [--queue-timeout 120] [--max-queue 16]
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import collections
 import contextlib
 import hmac
 import json
 import os
 import select
+import shutil
 import signal
 import socket
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -95,11 +111,19 @@ for _p in (HERE, os.path.join(HERE, "..", "bert_squad", "scripts")):
         sys.path.insert(0, _p)
 
 from chat_backend import (Backend, BackendError, Cancelled, CancelToken,  # noqa: E402
-                          ChatRequest, Delta, Finish, apply_stop)
+                          ChatRequest, Delta, Finish, SpeechRequest, apply_stop)
 
 VERSION = "1.0"
 MAX_BODY = 4 << 20           # bytes; documents go into the messages
 ROLES = ("system", "developer", "user", "assistant", "tool", "function")
+SPEECH_TYPES = {"wav": "audio/wav", "pcm": "audio/pcm", "mp3": "audio/mpeg", "opus": "audio/ogg",
+                "aac": "audio/aac", "flac": "audio/flac"}
+FFMPEG_ARGS = {"mp3": ["-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"],
+               "opus": ["-c:a", "libopus", "-b:a", "32k", "-f", "ogg"],
+               "aac": ["-c:a", "aac", "-b:a", "64k", "-f", "adts"],
+               "flac": ["-c:a", "flac", "-f", "flac"]}
+SPEECH_ALIASES = ("tts-1", "tts-1-hd", "gpt-4o-mini-tts")
+MAX_SPEECH_INPUT = 4096       # characters, as OpenAI
 
 
 def log(msg: str) -> None:
@@ -215,6 +239,56 @@ def parse_chat_request(body: Any, default_model: str) -> ChatRequest:
                        top_p=_number(body, "top_p", 0, 1), stop=stop, seed=seed, raw=body)
 
 
+def parse_speech_request(body: Any, default_model: Optional[str]) -> SpeechRequest:
+    """Validate a /v1/audio/speech body (unknown fields — instructions — are
+    ignored).  response_format defaults to wav (OpenAI's default is mp3)."""
+    if not isinstance(body, dict):
+        raise BackendError("The request body must be a JSON object.")
+    model = body.get("model", default_model)
+    if not isinstance(model, str) or not model:
+        raise BackendError("Invalid 'model': expected a non-empty string.", "model")
+    text = body.get("input")
+    if text is None:
+        raise BackendError("Missing required parameter: 'input'.", "input",
+                           code="missing_required_parameter")
+    if not isinstance(text, str):
+        raise BackendError(f"Invalid type for 'input': expected a string, but got "
+                           f"{_type_name(text)} instead.", "input", code="invalid_type")
+    if not text.strip():
+        raise BackendError("Invalid 'input': expected a non-empty string.", "input")
+    if len(text) > MAX_SPEECH_INPUT:
+        raise BackendError(f"Invalid 'input': string too long. Expected a string with maximum length "
+                           f"{MAX_SPEECH_INPUT}, but got a string with length {len(text)} instead.",
+                           "input", code="string_above_max_length")
+    voice = body.get("voice")
+    if isinstance(voice, dict):                                # {"id": ...} custom voices
+        voice = voice.get("id")
+    if voice is not None and not isinstance(voice, str):
+        raise BackendError("Invalid 'voice': expected a string.", "voice")
+    fmt = body.get("response_format") or "wav"
+    if fmt not in SPEECH_TYPES:
+        raise BackendError(f"Invalid value for 'response_format': '{fmt}'. Supported values are: "
+                           f"{', '.join(repr(f) for f in SPEECH_TYPES)}.", "response_format")
+    sfmt = body.get("stream_format") or "audio"
+    if sfmt not in ("audio", "sse"):
+        raise BackendError(f"Invalid value for 'stream_format': '{sfmt}'. Supported values are: "
+                           f"'audio', 'sse'.", "stream_format")
+    speed = _number(body, "speed", 0.25, 4.0)
+    seed = _number(body, "seed", -2 ** 63, 2 ** 63 - 1, integer=True)
+    return SpeechRequest(model=model, input=text, voice=voice, response_format=fmt,
+                         speed=1.0 if speed is None else float(speed), stream_format=sfmt,
+                         seed=seed, raw=body)
+
+
+def wav_header(samples: Optional[int], rate: int) -> bytes:
+    """A 44-byte PCM WAV header, 16-bit mono; samples None = unknown length
+    (the sizes say 0xFFFFFFFF, as streaming servers write them)."""
+    data = 0xFFFFFFFF if samples is None else 2 * samples
+    riff = 0xFFFFFFFF if samples is None else 36 + data
+    return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", riff, b"WAVE", b"fmt ", 16, 1, 1, rate,
+                       2 * rate, 2, 16, b"data", data)
+
+
 # ── the FPGA queue ───────────────────────────────────────────────────────────
 
 class FifoLock:
@@ -328,12 +402,16 @@ class ChatServer(ThreadingHTTPServer):
 
     def __init__(self, addr, backends: Dict[str, Backend], *, api_key: Optional[str] = None,
                  queue_timeout: float = 120.0, max_queue: int = 16, max_body: int = MAX_BODY,
-                 resident: str = "all", cma_margin_mb: float = 32.0, cma_free=read_cma_free_mb):
+                 resident: str = "all", cma_margin_mb: float = 32.0, cma_free=read_cma_free_mb,
+                 ffmpeg: Optional[str] = None):
         super().__init__(addr, ChatHandler)
         if resident not in ("all", "one", "auto"):
             raise ValueError(f"resident: {resident!r}")
         self.backends = backends
-        self.default_model = next(iter(backends))
+        self.speech_models = [m for m, b in backends.items() if b.speech]
+        self.default_model = next((m for m, b in backends.items() if not b.speech), next(iter(backends)))
+        self.default_speech_model = self.speech_models[0] if self.speech_models else None
+        self.ffmpeg = ffmpeg
         self.api_key = api_key or None
         self.queue_timeout = queue_timeout
         self.max_body = max_body
@@ -563,6 +641,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self._status = 200
         if self._path() == "/chat/completions":
             return self._chat()
+        if self._path() == "/audio/speech":
+            return self._speech()
         self.close_connection = True                           # body left unread
         self._error(404, f"Unknown request URL: POST {urlsplit(self.path).path}.",
                     code="unknown_url")
@@ -616,6 +696,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             if backend is None:
                 return self._error(404, f"The model '{req.model}' does not exist or you do not "
                                    f"have access to it.", param="model", code="model_not_found")
+            if backend.speech:
+                return self._error(400, f"The model '{req.model}' is a text-to-speech model: send "
+                                   f"its input to /v1/audio/speech.", param="model",
+                                   code="model_not_supported")
             if not getattr(backend, "accepts_images", False) and any(
                     m.get("parts") for m in req.messages):
                 vlms = [m for m, b in srv.backends.items() if getattr(b, "accepts_images", False)]
@@ -635,26 +719,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
                                    "server_error", code="backend_error")
             cancel = CancelToken(self._peer_gone)
-            got = srv.fpga.acquire(srv.queue_timeout, cancel.cancelled)
-            rec["queue_ms"] = (time.monotonic() - t0) * 1000.0
-            if got == "cancelled":
-                return self._cancelled(rec, "cancelled while queued")
-            if got != "ok":
-                why = ("the queue is full" if got == "full" else
-                       f"the request waited {srv.queue_timeout:.0f} s")
-                return self._error(503, f"The server is busy: the FPGA runs one request at a "
-                                   f"time and {why}. Retry later.", "server_error",
-                                   code="server_busy", headers={"Retry-After": "5"})
+            if not self._acquire(cancel, rec, t0):
+                return
             try:
-                srv.last_used[req.model] = time.monotonic()
-                if not srv.loaded.get(req.model):
-                    try:
-                        rec["load_ms"] = srv.load_model(req.model) * 1000.0
-                    except Exception as e:                     # noqa: BLE001
-                        log(f"error: loading '{req.model}' failed: {e}")
-                        srv.load_errors[req.model] = str(e)
-                        return self._error(503, f"The model '{req.model}' is not available: {e}",
-                                           "server_error", code="model_not_loaded")
+                if not self._ensure_loaded(req.model, rec):
+                    return
                 gen = backend.generate(job, cancel)
                 if req.stream:
                     self._stream(req, backend, gen, cancel, rec, t0)
@@ -668,6 +737,40 @@ class ChatHandler(BaseHTTPRequestHandler):
             with srv.count_lock:
                 srv.n_requests += 1
             self._log_request(rec, t0)
+
+    def _acquire(self, cancel: CancelToken, rec: Dict[str, Any], t0: float) -> bool:
+        """Wait for the FPGA; False (and the response sent) when the request
+        was cancelled, timed out or found the queue full."""
+        srv = self.server
+        got = srv.fpga.acquire(srv.queue_timeout, cancel.cancelled)
+        rec["queue_ms"] = (time.monotonic() - t0) * 1000.0
+        if got == "cancelled":
+            self._cancelled(rec, "cancelled while queued")
+            return False
+        if got != "ok":
+            why = ("the queue is full" if got == "full" else
+                   f"the request waited {srv.queue_timeout:.0f} s")
+            self._error(503, f"The server is busy: the FPGA runs one request at a "
+                        f"time and {why}. Retry later.", "server_error",
+                        code="server_busy", headers={"Retry-After": "5"})
+            return False
+        return True
+
+    def _ensure_loaded(self, mid: str, rec: Dict[str, Any]) -> bool:
+        """Under the FPGA lock: make `mid` resident; False (503 sent) if it
+        does not load."""
+        srv = self.server
+        srv.last_used[mid] = time.monotonic()
+        if not srv.loaded.get(mid):
+            try:
+                rec["load_ms"] = srv.load_model(mid) * 1000.0
+            except Exception as e:                             # noqa: BLE001
+                log(f"error: loading '{mid}' failed: {e}")
+                srv.load_errors[mid] = str(e)
+                self._error(503, f"The model '{mid}' is not available: {e}",
+                            "server_error", code="model_not_loaded")
+                return False
+        return True
 
     def _next(self, gen):
         try:
@@ -813,6 +916,166 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
 
+    # ── text to speech ──
+
+    def _speech(self) -> None:
+        srv = self.server
+        t0 = time.monotonic()
+        rec: Dict[str, Any] = {"model": "-", "stream": "-"}
+        try:
+            try:
+                raw = self._read_body()
+            except BackendError as e:
+                return self._backend_error(e)
+            if not self._auth():
+                return
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return self._error(400, "We could not parse the JSON body of your request. "
+                                   "(HINT: This likely means you aren't using your HTTP library "
+                                   "correctly. The API expects a JSON payload.)")
+            try:
+                req = parse_speech_request(body, srv.default_speech_model)
+            except BackendError as e:
+                return self._backend_error(e)
+            if req.model not in srv.backends and req.model in SPEECH_ALIASES and srv.speech_models:
+                req.model = srv.speech_models[0]
+            rec.update(model=req.model, stream=f"{req.response_format}/{req.stream_format}")
+            backend = srv.backends.get(req.model)
+            if backend is None:
+                return self._error(404, f"The model '{req.model}' does not exist or you do not "
+                                   f"have access to it.", param="model", code="model_not_found")
+            if not backend.speech:
+                hint = (f"speech models: {', '.join(srv.speech_models)}" if srv.speech_models
+                        else "no speech model is served")
+                return self._error(400, f"The model '{req.model}' does not synthesize speech; "
+                                   f"{hint}.", param="model", code="model_not_supported")
+            if req.response_format in FFMPEG_ARGS and not srv.ffmpeg:
+                return self._error(400, f"response_format '{req.response_format}' needs ffmpeg on "
+                                   f"the server, which is not installed; use 'wav' or 'pcm'.",
+                                   param="response_format", code="unsupported_format")
+            try:
+                job = backend.prepare_speech(req)
+            except BackendError as e:
+                return self._backend_error(e)
+            except Exception as e:                             # noqa: BLE001
+                traceback.print_exc()
+                return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
+                                   "server_error", code="backend_error")
+            cancel = CancelToken(self._peer_gone)
+            if not self._acquire(cancel, rec, t0):
+                return
+            try:
+                if not self._ensure_loaded(req.model, rec):
+                    return
+                self._speak(req, backend, job, cancel, rec, t0)
+            finally:
+                srv.fpga.release()
+        except (BrokenPipeError, ConnectionResetError):
+            self._cancelled(rec, "client disconnected")
+        finally:
+            with srv.count_lock:
+                srv.n_requests += 1
+            self._log_request(rec, t0)
+
+    def _speak(self, req: SpeechRequest, backend: Backend, job: Any, cancel: CancelToken,
+               rec: Dict[str, Any], t0: float) -> None:
+        """Stream the synthesized audio: PCM pieces from backend.synthesize()
+        -> (WAV header +) PCM, or ffmpeg's encoding; as the raw body or as
+        speech.audio.delta SSE events."""
+        gen = backend.synthesize(job, cancel)
+        try:
+            ev = self._next(gen)                  # early errors are still HTTP errors
+        except Cancelled:
+            gen.close()
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except BackendError as e:
+            gen.close()
+            return self._backend_error(e)
+        except Exception as e:                                 # noqa: BLE001
+            gen.close()
+            traceback.print_exc()
+            return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
+                               "server_error", code="backend_error")
+        fmt, sse = req.response_format, req.stream_format == "sse"
+        samples = getattr(job, "samples", None)
+        rate = backend.sample_rate
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8" if sse else SPEECH_TYPES[fmt])
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Sample-Rate", str(rate))
+        self._chunked = False
+        if not sse and fmt in ("wav", "pcm") and samples is not None:
+            self.send_header("Content-Length", str(2 * samples + (44 if fmt == "wav" else 0)))
+        elif self.request_version == "HTTP/1.1":
+            self._chunked = True
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Connection", "close")
+            self.close_connection = True
+        self.end_headers()
+        wlock = threading.Lock()
+
+        def out(data: bytes) -> None:
+            if not data:
+                return
+            with wlock:
+                if "ttfa_ms" not in rec:
+                    rec["ttfa_ms"] = (time.monotonic() - t0) * 1000.0
+                if sse:
+                    self._sse({"type": "speech.audio.delta", "audio": base64.b64encode(data).decode()})
+                else:
+                    self._write(data)
+
+        enc = _Encoder(self.server.ffmpeg, fmt, rate, out) if fmt in FFMPEG_ARGS else None
+        fin, n = None, 0
+        try:
+            if fmt == "wav":
+                out(wav_header(samples, rate))
+            while True:
+                if isinstance(ev, Finish):
+                    fin = ev
+                    break
+                n += len(ev) // 2
+                if enc:
+                    enc.feed(ev)
+                else:
+                    out(ev)
+                ev = self._next(gen)
+            if enc:
+                enc.finish()
+        except (BrokenPipeError, ConnectionResetError):
+            cancel.cancel()
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except Cancelled:
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except Exception as e:                                 # noqa: BLE001
+            traceback.print_exc()
+            rec["result"] = f"error mid-stream: {e}"
+            self.close_connection = True
+            if sse:
+                self._sse({"type": "error", "error": {
+                    "message": f"Internal error in the '{req.model}' backend: {e}",
+                    "type": "server_error", "param": None, "code": "backend_error"}})
+            if self._chunked:
+                self.wfile.write(b"0\r\n\r\n")
+            return
+        finally:
+            gen.close()
+            if enc:
+                enc.close()
+        rec["fin"] = fin
+        rec["audio_s"] = n / rate if rate else 0.0
+        if sse:
+            self._sse({"type": "speech.audio.done", "usage": {
+                "input_tokens": fin.prompt_tokens, "output_tokens": fin.completion_tokens,
+                "total_tokens": fin.prompt_tokens + fin.completion_tokens}})
+        if self._chunked:
+            self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
     def _log_request(self, rec: Dict[str, Any], t0: float) -> None:
         total = (time.monotonic() - t0) * 1000.0
         fin: Optional[Finish] = rec.get("fin")
@@ -825,6 +1088,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             parts.append(f"queue={rec['queue_ms']:.0f}ms")
         if "load_ms" in rec:
             parts.append(f"load={rec['load_ms']:.0f}ms")
+        if "ttfa_ms" in rec:
+            parts.append(f"ttfa={rec['ttfa_ms']:.0f}ms")
+        if "audio_s" in rec:
+            parts.append(f"audio={rec['audio_s']:.2f}s")
         if "ttft_ms" in rec:
             parts.append(f"ttft={rec['ttft_ms']:.0f}ms")
             if fin is not None and fin.completion_tokens > 1 and total > rec["ttft_ms"]:
@@ -844,6 +1111,60 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
+
+class _Encoder:
+    """ffmpeg as a pipe: s16le mono PCM in (feed() from the request thread),
+    the encoded stream out (a reader thread hands it to `out`)."""
+
+    def __init__(self, ffmpeg: str, fmt: str, rate: int, out):
+        self.p = subprocess.Popen(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", str(rate), "-ac", "1",
+             "-i", "pipe:0", *FFMPEG_ARGS[fmt], "pipe:1"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.out, self.error = out, None
+        self.t = threading.Thread(target=self._read, daemon=True)
+        self.t.start()
+
+    def _read(self) -> None:
+        try:
+            while True:
+                data = self.p.stdout.read1(65536)
+                if not data:
+                    return
+                self.out(data)
+        except Exception as e:                                 # noqa: BLE001  (client gone)
+            self.error = e
+            with contextlib.suppress(Exception):
+                self.p.kill()
+
+    def feed(self, pcm: bytes) -> None:
+        if self.error:
+            raise self.error
+        try:
+            self.p.stdin.write(pcm)
+            self.p.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            raise self.error or RuntimeError(f"ffmpeg: {e}") from e
+
+    def finish(self) -> None:
+        self.p.stdin.close()
+        self.t.join()
+        rc = self.p.wait()
+        if self.error:
+            raise self.error
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg exited with {rc}: {self.p.stderr.read().decode(errors='replace')[-300:]}")
+
+    def close(self) -> None:
+        if self.p.poll() is None:
+            with contextlib.suppress(Exception):
+                self.p.kill()
+            self.p.wait()
+        self.t.join(5)
+        for f in (self.p.stdin, self.p.stdout, self.p.stderr):
+            with contextlib.suppress(Exception):
+                f.close()
+
 
 def llm_engine(args, lib: str, weights: Optional[str]):
     """A SmolLM2 library (libsmollm2.so, libsmollm2_360m.so), or with
@@ -917,9 +1238,14 @@ def build_backends(args) -> Dict[str, Backend]:
                 reserve=args.llm_reserve, repeat_last_n=args.llm_repeat_last_n,
                 prefill_chunk=args.llm_prefill_chunk, cma_mb=args.vlm_cma_mb,
                 model_id=args.vlm_model_id)
+        elif name in ("piper", "piper-lessac-medium"):
+            from piper_backend import LibTtsEngine, PiperBackend
+            b = PiperBackend(LibTtsEngine(args.tts_lib, args.tts_weights), args.tts_weights,
+                             cma_mb=args.tts_cma_mb, model_id=args.tts_model_id,
+                             espeak_data=args.tts_espeak_data)
         else:
             raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, "
-                             f"smollm2-360m, smolvlm, echo)")
+                             f"smollm2-360m, smolvlm, piper, echo)")
         if b.model_id in out:
             raise SystemExit(f"backend '{name}' serves model id '{b.model_id}', which another "
                              f"backend already serves (check the --llm-lib / --llm-360m-lib "
@@ -942,8 +1268,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
                     choices=("bert-squad", *SMOLLM2_135M, *SMOLLM2_360M, "smolvlm",
-                             "smolvlm-256m-instruct", "echo"),
-                    help="backend(s) to serve (default: bert-squad); the first is the default model")
+                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", "echo"),
+                    help="backend(s) to serve (default: bert-squad); the first chat backend is the "
+                         "default model of /v1/chat/completions, the first speech backend that of "
+                         "/v1/audio/speech")
     ap.add_argument("--resident", choices=("auto", "one", "all"), default="auto",
                     help="which FPGA models stay loaded (see above; default auto)")
     ap.add_argument("--cma-margin-mb", type=float, default=32.0,
@@ -1021,6 +1349,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--vlm-model-id", default=None)
     g.add_argument("--vlm-cma-mb", type=float, default=520.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
+    g = ap.add_argument_group("piper (text to speech)")
+    g.add_argument("--tts-lib", default=os.path.join(HERE, "lib", "libpiper_tts.so"))
+    g.add_argument("--tts-weights", default="/root/piper_weights",
+                   help="the voice directory: weights/*.dat of the library, frontend.npz, voice.json")
+    g.add_argument("--tts-model-id", default=None, help="default: voice.json model (piper-lessac-medium)")
+    g.add_argument("--tts-cma-mb", type=float, default=40.0, help="CMA the Piper library holds (MB)")
+    g.add_argument("--tts-espeak-data", default=None, help="espeak-ng-data directory (default: the system's)")
+    g.add_argument("--ffmpeg", default=shutil.which("ffmpeg"),
+                   help="ffmpeg for mp3 / opus / aac / flac speech (default: from PATH; '' = none)")
     ap.add_argument("--max-body-mb", type=float, default=None,
                     help="request body limit (default 4 MB; 32 MB when an image model is served)")
     ap.add_argument("--queue-timeout", type=float, default=120.0,
@@ -1042,7 +1379,8 @@ def main(argv=None) -> int:
                 else MAX_BODY)
     srv = ChatServer((args.host, args.port), backends, api_key=args.api_key,
                      queue_timeout=args.queue_timeout, max_queue=args.max_queue,
-                     resident=args.resident, cma_margin_mb=args.cma_margin_mb, max_body=max_body)
+                     resident=args.resident, cma_margin_mb=args.cma_margin_mb, max_body=max_body,
+                     ffmpeg=args.ffmpeg or None)
     try:
         for mid, b in backends.items():
             t0 = time.monotonic()
