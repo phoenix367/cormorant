@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.remote import (  # noqa: E402
     _green, _red, _yellow, _bold, _dim,
     load_config, uio_devices_from_cfg,
-    RemoteSession, check_prerequisites,
+    RemoteSession, check_prerequisites, hold_board_lock,
 )
 try:
     from src.kernels import KERNEL_REGISTRY as _KERNEL_REGISTRY
@@ -589,6 +589,7 @@ def main(argv=None) -> int:
         return 1
 
     # ── Connect ─────────────────────────────────────────────────────────── #
+    hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     ssh_cfg = cfg["ssh"]
     print(f"\n{_bold('Connecting')} to "
           f"{ssh_cfg['user']}@{ssh_cfg['host']}:{ssh_cfg['port']} …")

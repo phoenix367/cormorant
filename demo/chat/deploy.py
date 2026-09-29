@@ -63,7 +63,7 @@ if str(BERT_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(BERT_SCRIPTS))
 
 import _common as bert_common                                   # noqa: E402  (+ scheduler path)
-from deploy_and_run import board_lock, sync_weights             # noqa: E402
+from deploy_and_run import board_lock, lock_path, sync_weights  # noqa: E402
 from src.remote import (RemoteSession, _bold, _dim, _green, _red,  # noqa: E402
                         _yellow, check_prerequisites)
 
@@ -620,7 +620,7 @@ def main(argv=None) -> int:
             session.close()
 
     summary = ensure_project(cfg, args.regenerate, args.plan) if not args.check_only else None
-    lock = None if args.no_lock else cfg["board_lock"]
+    lock = None if args.no_lock else lock_path(cfg)
     stop_on_exit = False
     with board_lock(lock):
         session = connect(cfg)

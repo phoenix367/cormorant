@@ -516,7 +516,7 @@ def _chunks(cases: List[dict], seconds: float) -> Iterator[List[dict]]:
 
 def cmd_run(args) -> int:
     import run_remote_perf as rp
-    from src.remote import RemoteSession, load_config, uio_devices_from_cfg
+    from src.remote import RemoteSession, hold_board_lock, load_config, uio_devices_from_cfg
     bid = default_id(args)
     cpath = MODELS_DIR / f"{bid}.cases.json"
     if not cpath.exists():
@@ -529,6 +529,7 @@ def cmd_run(args) -> int:
     cfg = load_config(args.config, rp._EXTRA_DEFAULTS)
     uio = uio_devices_from_cfg(cfg)
     inst = [uio.get(k, "-") for k in ("VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolingKernel")]
+    hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     session = RemoteSession(cfg["ssh"])
     session.connect()
     stopped = False

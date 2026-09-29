@@ -55,7 +55,7 @@ from src.bitstream.board import fpga_state, list_uio_devices  # noqa: E402
 from src.remote import (  # noqa: E402
     _green, _red, _dim,
     load_config,
-    RemoteSession,
+    RemoteSession, hold_board_lock,
 )
 
 _BITSTREAM_DEFAULTS = {
@@ -197,6 +197,7 @@ def main() -> int:
         hwh_path = hwh_explicit  # not needed for --check-only
 
     # ── connect ──────────────────────────────────────────────────────────────
+    hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     ssh_cfg = cfg["ssh"]
     print(f"Connecting to {ssh_cfg['user']}@{ssh_cfg['host']}:{ssh_cfg['port']} …")
     session = RemoteSession(ssh_cfg)

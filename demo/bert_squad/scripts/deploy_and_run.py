@@ -33,8 +33,6 @@ usage:  deploy_and_run.py [--config CFG] [--n N] [--profile-layers] [--no-smoke]
 from __future__ import annotations
 
 import argparse
-import contextlib
-import fcntl
 import hashlib
 import json
 import shlex
@@ -51,7 +49,7 @@ from _common import (BUILD_DIR, PROJECT_SUMMARY, SCRIPTS_DIR, demo_path,
                      import_study, load_config, load_features, load_inputs,
                      preprocessed_dir)
 from src.remote import (_bold, _dim, _green, _red, _yellow,  # noqa: E402
-                        RemoteSession, check_prerequisites)
+                        RemoteSession, check_prerequisites, board_lock, lock_path)
 
 LOG_DIR = BUILD_DIR / "logs"
 KINDS = ("MatMul linear", "MatMul attention", "VectorOP", "LayerNorm", "GELU",
@@ -136,25 +134,8 @@ def preflight_remote(session: RemoteSession, cfg: dict) -> bool:
 
 
 # ── board lock ───────────────────────────────────────────────────────────────
-
-@contextlib.contextmanager
-def board_lock(path: Optional[str]):
-    if not path:
-        yield
-        return
-    p = Path(path).expanduser()
-    with open(p, "a") as f:
-        t0 = time.monotonic()
-        try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(_dim(f"waiting for board lock {p} ..."), flush=True)
-            fcntl.flock(f, fcntl.LOCK_EX)
-            print(_dim(f"board lock acquired after {time.monotonic() - t0:.0f} s"), flush=True)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+# board_lock / lock_path live in inference-scheduler/src/remote/lock.py (one
+# per-board lock for every board tool); re-exported here for the chat tools.
 
 
 # ── transfers ────────────────────────────────────────────────────────────────
@@ -532,7 +513,7 @@ def main(argv=None) -> int:
             _tail(step.output)
         return step.ok
 
-    with board_lock(args.board_lock or cfg.get("board_lock")):
+    with board_lock(lock_path(cfg, args.board_lock)):
         session = RemoteSession(cfg["ssh"])
         print(f"\n{_bold('Connecting')} to {cfg['ssh']['user']}@{cfg['ssh']['host']}:"
               f"{cfg['ssh'].get('port', 22)} ...")

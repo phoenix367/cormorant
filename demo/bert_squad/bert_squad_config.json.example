@@ -81,7 +81,7 @@
   },
 
   "board_lock": null,
-  "_board_lock_note": "Optional lock file; deploy_and_run.py holds flock() on it for the whole board session (serialises with other jobs sharing the board).",
+  "_board_lock_note": "null = the per-board default /tmp/kv260-board-<ssh.host>.lock, shared by every board tool (inference-scheduler/src/remote/lock.py); a path overrides it, false disables it. deploy_and_run.py holds flock() on it for the whole board session; a second job waits.",
 
   "cleanup": true
 }

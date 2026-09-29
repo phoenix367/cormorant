@@ -32,7 +32,7 @@ SCHED_DIR = REPO_ROOT / "inference-scheduler"
 sys.path.insert(0, str(SCHED_DIR))
 from src.remote import (   # noqa: E402
     _green, _red, _yellow, _bold, _dim,
-    RemoteSession, check_prerequisites,
+    RemoteSession, check_prerequisites, hold_board_lock,
 )
 
 
@@ -594,6 +594,7 @@ def deploy_models(cfg: dict, projects: List[dict],
         if not check_only:
             return []
 
+    hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     session = RemoteSession(cfg["ssh"])
     print(f"\n{_bold('Connecting')} to "
           f"{cfg['ssh']['user']}@{cfg['ssh']['host']}:{cfg['ssh']['port']} …")

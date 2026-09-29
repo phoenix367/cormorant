@@ -76,7 +76,7 @@
     "timeout": 1800
   },
   "board_lock": null,
-  "_board_lock_note": "null = bert_squad_config board_lock. deploy.py holds flock() on it while it deploys (and with --hold until the server is stopped).",
+  "_board_lock_note": "null = bert_squad_config board_lock, else the per-board default /tmp/kv260-board-<ssh.host>.lock (the lock every board tool takes). deploy.py holds flock() on it while it deploys (and with --hold until the server is stopped).",
   "health_timeout": 180,
   "smolvlm": {
     "_comment": "SmolVLM-256M-Instruct: chat about images (CHAT_PLAN §23). Served when server.backends contains smolvlm; the sampling defaults of the smollm2 block apply.",

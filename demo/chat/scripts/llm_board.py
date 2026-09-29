@@ -54,7 +54,7 @@ import llm_project as lp                                           # noqa: E402
 
 BERT_SCRIPTS = os.path.join(lp.REPO, "demo", "bert_squad", "scripts")
 sys.path.insert(0, BERT_SCRIPTS)
-from deploy_and_run import _stream_exec, board_lock, sync_weights  # noqa: E402
+from deploy_and_run import _stream_exec, board_lock, lock_path, sync_weights  # noqa: E402
 from src.remote import RemoteSession, _dim, _green, _red           # noqa: E402
 
 DEFAULT_PROJECT = os.path.join(os.path.dirname(HERE), "build", "llm_project")
@@ -381,7 +381,7 @@ def main(argv=None) -> int:
                                    [n for n in args.second_turn.split(",") if n])
         names = write_prompts(local_prompts, ids)
     results = {"project": summary, "prompts": [] if args.install_only else names}
-    with board_lock(args.board_lock or cfg.get("board_lock")):
+    with board_lock(lock_path(cfg, args.board_lock)):
         session = RemoteSession(cfg["ssh"])
         session.connect()
         try:

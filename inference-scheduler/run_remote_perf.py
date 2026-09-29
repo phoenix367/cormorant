@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.remote import (  # noqa: E402
     _green, _red, _yellow, _bold, _dim, _cyan,
     load_config, uio_devices_from_cfg,
-    RemoteSession, check_prerequisites,
+    RemoteSession, check_prerequisites, hold_board_lock,
 )
 
 
@@ -529,6 +529,7 @@ def main(argv=None) -> int:
         print(f"\n{_red('config error')}: {exc}", file=sys.stderr)
         return 1
 
+    hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     ssh_cfg = cfg["ssh"]
     print(f"\n{_bold('Connecting')} to "
           f"{ssh_cfg['user']}@{ssh_cfg['host']}:{ssh_cfg['port']} …")

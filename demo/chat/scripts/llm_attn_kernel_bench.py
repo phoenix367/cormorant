@@ -47,7 +47,7 @@ import llm_board                                                    # noqa: E402
 import llm_project as lp                                            # noqa: E402
 from inference_scheduler import main as sched_main                  # noqa: E402
 
-from deploy_and_run import _stream_exec, board_lock                 # noqa: E402
+from deploy_and_run import _stream_exec, board_lock, lock_path      # noqa: E402
 from src.codegen import CodeGenerator                               # noqa: E402
 from src.graph import OnnxGraph                                     # noqa: E402
 from src.remote import RemoteSession                                # noqa: E402
@@ -143,7 +143,7 @@ def main(argv=None) -> int:
         del cg
     results = {}
     uio = cfg["remote"]["uio_devices"]["MatmulKernel"]
-    with board_lock(args.board_lock or cfg.get("board_lock")):
+    with board_lock(lock_path(cfg, args.board_lock)):
         session = RemoteSession(cfg["ssh"])
         session.connect()
         try:
