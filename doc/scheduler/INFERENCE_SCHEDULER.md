@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1586 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1602 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -661,10 +661,16 @@ encoded (round half to even, saturate) at the **rank-1 weight exponent**
 before any packing: `TensorInfo.data` then holds `raw / 256`, so every
 existing encode / pack / re-layout path emits the raw bits unchanged, and
 `TensorInfo.wexp` gives the simulator the values `data · 2^(8 − wexp)`).
-Only MatMuls (constant B) and the LLM host ops may touch exponent tensors;
-a weight read by two MatMuls with different exponents, an exponent on a
-VectorOP / Conv / Pool tensor, or a Reshape that changes a per-channel
-exponent's channels is rejected.  Simulation (`_SimulateMixin._matmul_exp`):
+A Conv whose x / y carry scalar exponents (TTS_PLAN §4) is encoded the
+same way by `numeric.encode_conv_weights`: weight at `f_y + 8 − f_x`, bias
+at `f_y`, both raw int16, re-packed into the kernel's image; its
+simulation (`_SimulateMixin._conv_exp`) sums raw products exactly, wraps to
+int32 and floors (`test/test_conv_exp.py`).  Only MatMuls (constant B),
+such Convs (constant weight and bias, unannotated) and the LLM / TTS host
+ops may touch exponent tensors; a weight read by two MatMuls with different
+exponents, a per-channel exponent on a Conv, an exponent on a VectorOP /
+Pool tensor, or a Reshape that changes a per-channel exponent's channels is
+rejected.  Simulation (`_SimulateMixin._matmul_exp`):
 `acc = (A·B) · 2^(f_out + 8)` is an exact integer in float64 (every column's
 products share one scale), the int32 wrap is applied, then
 `floor(acc / 256)`, saturate, `/ 2^f_out`; host ops read `raw · 2^-f[c]`
@@ -870,6 +876,36 @@ redone exactly, so the int16 results are unchanged.  On AArch64 the
 softmax's transposes, max and rounding use NEON (CHAT_PLAN §24).
 `test/test_vit.py` covers them on a tiny random ViT: simulation == study
 emulation, the generated C == the simulation, and a vision + text project.
+
+### Text to speech (Piper)
+
+`src/piper.py` writes Piper's (VITS) flow and HiFi-GAN decoder as one
+fixed-size `chunk` entry (TTS_PLAN §4).
+- **Input:** z_p [192][256] frames (float32, host) plus the utterance's
+  frames lo / hi in chunk coordinates.
+- **Output:** pcm, 192 × 256 int16 samples, of which frames [64, 192)
+  are valid.  Stitched chunks equal one long pass bit for bit.
+- **Convs:** every conv is a ConvKernel `Conv` with power-of-two exponents.
+  - 1-D convs run as time-folded images: `TtsPrep` writes
+    [C][rows][w0 + halo], w0 · roundup16(O) ≤ 65 536.
+  - Transposed convs are polyphase kernel-3 convs followed by
+    `TtsInterleave`.
+  - The k7 dilation-12 conv is split into tap groups summed by `TtsSum`.
+- **Host ops** (`src/tts_nodes.py`, domain `axi.llm`): `TtsPrep`,
+  `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm`.  Each has
+  a numpy reference and a C helper.  tanh / exp come from libm on both
+  sides.
+- **The C helpers (`TTS_C`)** avoid per-element tests on the in-order A53;
+  every fast path is bit-identical (`test/test_tts_ops.py`):
+  - two-input sums with power-of-two scales, and the three-input average
+    (/ 3), run in integers with round half to even;
+  - the gates read per-exponent tanh / sigmoid tables.
+- **Tests:** `test/test_piper.py` checks the simulation against the
+  specification `demo/tts/scripts/piper_vits.py` (`chunk_forward`),
+  stitching, the node census and kernel bounds, and the generated C on the
+  host emulation.
+- **The library** `libpiper_tts.so` (`demo/tts/`) drives the entry chunk
+  by chunk for the chat server's `/v1/audio/speech`.
 
 ### Multi-entry projects
 

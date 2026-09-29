@@ -12,6 +12,7 @@ from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostN
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
                          llm_c_helpers)
 from ..vit_nodes import vit_c_helpers
+from ..tts_nodes import tts_c_helpers
 from ._banners  import _banner, _file_banner
 from .._matmul_hw_config import MATMUL_GEMV_MAX_M
 
@@ -258,6 +259,8 @@ class _SourceMixin:
                 parts.append(LLM_C_DMA)
         if "vit" in used:
             parts.append(vit_c_helpers())
+        if "tts" in used:
+            parts.append(tts_c_helpers())
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))

@@ -190,6 +190,31 @@ def _depthwise_conv2d_ref(
         y += bias.reshape(1, C, 1, 1)
 
     return y
+def _conv2d_int(x, w, stride_h, stride_w, pad_top, pad_left, dilation_h, dilation_w,
+                out_h, out_w, depthwise: bool) -> np.ndarray:
+    """Conv of integer-valued float64 operands, vectorised per tap: the sums
+    are exact (|acc| < 2^53), so the order of summation does not matter."""
+    N, C, H, W = x.shape
+    kH, kW = w.shape[2], w.shape[3]
+    need_h = (out_h - 1) * stride_h + (kH - 1) * dilation_h + 1
+    need_w = (out_w - 1) * stride_w + (kW - 1) * dilation_w + 1
+    xp = np.zeros((N, C, max(need_h, pad_top + H), max(need_w, pad_left + W)))
+    xp[:, :, pad_top:pad_top + H, pad_left:pad_left + W] = x
+    M = w.shape[0]
+    y = np.zeros((N, M, out_h, out_w))
+    for khi in range(kH):
+        h0 = khi * dilation_h
+        for kwi in range(kW):
+            w0 = kwi * dilation_w
+            xs = xp[:, :, h0:h0 + (out_h - 1) * stride_h + 1:stride_h,
+                    w0:w0 + (out_w - 1) * stride_w + 1:stride_w]
+            if depthwise:
+                y += xs * w[:, 0, khi, kwi][None, :, None, None]
+            else:
+                y += np.einsum("nchw,mc->nmhw", xs, w[:, :, khi, kwi], optimize=True)
+    return y
+
+
 def _quantize_trn(v: np.ndarray | float, frac_bits: int) -> np.ndarray | float:
     """AP_TRN-style truncation: floor toward -∞ at the given fractional bit
     width.  Mirrors HLS ap_fixed<W, I, AP_TRN> narrowing semantics."""
@@ -602,6 +627,14 @@ class _SimulateMixin:
                              shape=sn.output.shape)
                 continue
 
+            if isinstance(sn, ConvNode) and any(
+                    t.exp is not None or t.wexp is not None
+                    for t in (sn.inputs[0], sn.inputs[1], sn.output)):
+                arrays[sn.output.onnx_name] = self._conv_exp(
+                    sn, arrays[sn.inputs[0].onnx_name], arrays[sn.inputs[1].onnx_name],
+                    arrays[sn.inputs[2].onnx_name] if sn.has_bias else None)
+                continue
+
             if isinstance(sn, ConvNode):
                 conv_fn = _depthwise_conv2d_ref if sn.is_depthwise else _conv2d_ref
                 full = conv_fn(
@@ -727,6 +760,33 @@ class _SimulateMixin:
             out[t.onnx_name] = (np.zeros(t.shape) if init is None
                                 else np.array(init, np.float64).reshape(t.shape))
         return out
+
+    def _conv_exp(self, sn, x, w, bias) -> np.ndarray:
+        """A Conv on tensors with power-of-two exponents: ConvKernel sums raw
+        int16 products exactly in ap_fixed<32,16> (an int32 that wraps),
+        seeded with bias << F, and writes floor(acc / 2^F) saturated; the
+        weight is encoded at f_w = f_y + F - f_x, the bias at f_y
+        (numeric.encode_conv_weights)."""
+        dtype = self._dtype
+        F = dtype.frac_bits
+        xt, wt, yt = sn.inputs[0], sn.inputs[1], sn.output
+        fx = int(np.asarray(F if xt.exp is None else xt.exp))
+        fy = int(np.asarray(F if yt.exp is None else yt.exp))
+        fw = int(np.asarray(F if wt.wexp is None else wt.wexp))
+        x_raw = np.asarray(x, np.float64).reshape(sn.batch, sn.in_ch, sn.in_h, sn.in_w) * 2.0 ** fx
+        w_raw = np.asarray(w, np.float64).reshape(sn.out_ch, 1 if sn.is_depthwise else sn.in_ch,
+                                                  sn.kh, sn.kw) * 2.0 ** fw
+        acc = _conv2d_int(x_raw, w_raw, sn.stride_h, sn.stride_w, sn.pad_top, sn.pad_left,
+                          sn.dilation_h, sn.dilation_w, sn.out_h, sn.out_w, sn.is_depthwise)
+        if bias is not None:
+            acc += (np.asarray(bias, np.float64).reshape(-1) * 2.0 ** fy)[None, :, None, None] * 2.0 ** F
+        if not np.array_equal(acc, np.round(acc)):
+            raise ValueError(f"Conv '{sn.onnx_node.name}': operands not on their exponents' grids")
+        big = np.abs(acc) >= 2.0 ** 31
+        if big.any():                                          # ap_fixed<32,16> wraps
+            acc = np.where(big, np.mod(acc + 2.0 ** 31, 2.0 ** 32) - 2.0 ** 31, acc)
+        lo, hi = dtype.raw_range
+        return (np.clip(np.floor(acc / float(1 << F)), lo, hi) / 2.0 ** fy).reshape(sn.output.shape)
 
     def _matmul_exp(self, sn, a, b, arrays, errors_out) -> None:
         """A MatMul whose tensors carry power-of-two exponents: the kernel

@@ -120,7 +120,7 @@ def write_prompts(path: str, ids: dict) -> list:
     return names
 
 
-def upload_project(session, local: str, remote: str) -> int:
+def upload_project(session, local: str, remote: str, skip=()) -> int:
     session.exec_checked(f"mkdir -p {shlex.quote(remote)}", timeout=30)
     session.exec_checked(f"find {shlex.quote(remote)} -mindepth 1 -maxdepth 1 "
                          f"! -name build ! -name build_prof -exec rm -rf {{}} +", timeout=60)
@@ -129,7 +129,8 @@ def upload_project(session, local: str, remote: str) -> int:
     try:
         for p in sorted(Path(local).rglob("*")):
             rel = p.relative_to(local)
-            if rel.parts[0] in ("weights", "build", "build_prof", "expected", "host_emu") or rel.suffix == ".bin":
+            if rel.parts[0] in ("weights", "build", "build_prof", "expected", "host_emu", *skip) \
+                    or rel.suffix == ".bin":
                 continue
             dst = f"{remote}/{rel.as_posix()}"
             if p.is_dir():
@@ -173,8 +174,9 @@ exit $(cat "$B.rc")
 
 def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int,
           weights_dir: str = WEIGHTS_DIR,
-          min_avail_mb: int = 1500, limit_mb: int = 400, psi_max: float = 50.0) -> None:
-    """cmake + make llm_bench smollm2 on the board under a memory guard: the
+          min_avail_mb: int = 1500, limit_mb: int = 400, psi_max: float = 50.0,
+          targets: str = "llm_bench smollm2") -> None:
+    """cmake + make <targets> on the board under a memory guard: the
     build starts only with >= min_avail_mb MemAvailable, and is killed when
     MemAvailable drops below limit_mb or /proc/pressure/memory some avg10
     exceeds psi_max (the 3.7 MB generated inference.c once took cc1 to 3 GB
@@ -196,7 +198,7 @@ def build(session, remote_proj: str, cfg: dict, active, profile: bool, jobs: int
         cmd = (f"mkdir -p {b} && cmake -S {remote_proj} -B {b} -DCMAKE_BUILD_TYPE=Release "
                f"-DINFERENCE_TARGET=LINUX -DINFERENCE_WEIGHTS_DIR={weights_dir} "
                f"-DINFERENCE_PROFILING={'ON' if prof else 'OFF'} {defs} > {b}.cmake.log 2>&1 && "
-               f"make -C {b} -j{jobs} llm_bench smollm2 > {b}.make.log 2>&1")
+               f"make -C {b} -j{jobs} {targets} > {b}.make.log 2>&1")
         t0 = time.monotonic()
         lines = []
         _o, _e, rc = _stream_exec(session, f"bash {remote_proj}/build_guard.sh {b} bash -c "

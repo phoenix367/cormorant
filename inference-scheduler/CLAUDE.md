@@ -6,8 +6,8 @@ VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv,
 incl. depthwise, and MatMuls lowered with swapped operand roles), and
 PoolingKernel (2-D pooling). Ops no kernel implements (Softmax, LayerNorm,
 Gelu, Transpose, Slice / Split copies, Gather, OneHot, Cast, SpaceToDepth and
-the `axi.llm` Llama decoder and vision-encoder ops) run as host-CPU code inside
-`inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
+the `axi.llm` Llama decoder, vision-encoder and text-to-speech ops) run as
+host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
 Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
 library and weight pool (multi-entry projects, `--entry`). The opt-in `--plan`
 mode picks MatMul tactics and the issue order from the bitstream's measured
@@ -198,7 +198,11 @@ src/
                          softmax / P·V in R query-row parts, default 1)
   vit_nodes.py           the vision host ops (VitLayerNorm / AttnPrep / AttnSoftmax / Gelu /
                          ResAdd / EmbedAdd / PixelShuffle / SumDequant) + VIT_C helpers
-  numeric.py             axi.numeric metadata: power-of-two exponents, host tensors, states
+  piper.py               Piper (VITS) text-to-speech frontend: the flow + HiFi-GAN decoder as the
+                         fixed-size `chunk` entry (Conv exponents, folded 1-D convs, polyphase)
+  tts_nodes.py           the TTS host ops (TtsPrep / Gate / Sum / FlowOut / Interleave / Pcm) + TTS_C
+  numeric.py             axi.numeric metadata: power-of-two exponents (MatMul and Conv weight
+                         encoding), host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
                          constant-broadcast normalisation
   matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry, row
@@ -250,7 +254,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              70 pytest modules, 1586 tests collected (1581 pass, 5 skip;
+  test_*.py              73 pytest modules, 1602 tests collected (1597 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -260,7 +264,10 @@ test/
                          test_planning.py (--plan options, state edges, reordered code),
                          test_perf_calls.py (kernel_calls() == emitted C), test_timing.py,
                          test_generator_memory.py (lean simulation, weightless shape
-                         inference, lazy entry models / checkpoints, shared arrays)
+                         inference, lazy entry models / checkpoints, shared arrays),
+                         test_conv_exp.py (Conv with power-of-two exponents),
+                         test_tts_ops.py (the TTS C helpers), test_piper.py (the Piper
+                         chunk == the specification, stitching, host_emu)
 ```
 
 ## Key Abstractions

@@ -1,0 +1,5 @@
+# piper_study.py phonemize: espeak-ng (bundled) + phonemizer
+# python3 -m venv VENV && PIP_CONFIG_FILE=/dev/null VENV/bin/pip install -r demo/tts/scripts/requirements-phonemize.txt
+numpy
+espeakng-loader==0.2.4
+phonemizer-fork==3.3.2

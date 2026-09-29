@@ -215,11 +215,52 @@ def encode_matmul_weights(nodes, dtype) -> Dict[str, int]:
     return sat
 
 
+def encode_conv_weights(nodes, dtype) -> Dict[str, int]:
+    """Encode the weight and bias of every Conv whose input or output has an
+    exponent: ConvKernel sums raw int16 products exactly and writes
+    floor(acc / 2^F) saturated, so the weight sits at f_w = f_y + F - f_x
+    and the bias at f_y (the kernel seeds the accumulator with bias << F).
+    ``data`` then holds raw / 2^F, so the packing and ROM paths emit the raw
+    bits unchanged; ``wexp`` records the exponent (the simulator's value is
+    data * 2^(F - wexp)).  The packed images are rebuilt.  Returns
+    {weight / bias name: saturated count}."""
+    from .nodes import ConvNode, _pack_conv_weight, _pad_conv_bias
+    F = dtype.frac_bits
+    lo, hi = dtype.raw_range
+    sat: Dict[str, int] = {}
+    done: Dict[str, int] = {}
+    for sn in nodes:
+        if not isinstance(sn, ConvNode):
+            continue
+        x, w, y = sn.inputs[0], sn.inputs[1], sn.output
+        if x.exp is None and y.exp is None:
+            continue
+        fx = int(np.asarray(F if x.exp is None else x.exp))
+        fy = int(np.asarray(F if y.exp is None else y.exp))
+        fw = fy + F - fx
+        encoded = [(w, fw)] + ([(sn.inputs[2], fy)] if sn.has_bias else [])
+        for t, f in encoded:
+            if t.onnx_name in done:
+                if done[t.onnx_name] != f:
+                    raise NumericError(f"'{t.onnx_name}' read by Convs with different exponents")
+                continue
+            r = np.round(np.asarray(t.data, np.float64) * 2.0 ** f)
+            sat[t.onnx_name] = int(((r < lo) | (r > hi)).sum())
+            t.data = (np.clip(r, lo, hi) / float(1 << F)).astype(np.float32).reshape(t.data.shape)
+            t.wexp = np.asarray(f, np.int8 if -128 <= f <= 127 else np.int64)
+            done[t.onnx_name] = f
+        _pack_conv_weight(w, sn.out_ch, sn.in_ch, sn.kh, sn.kw, sn.is_depthwise)
+        if sn.has_bias:
+            _pad_conv_bias(sn.inputs[2], sn.out_ch)
+    return sat
+
+
 def check(nodes, dtype) -> None:
-    """Only MatMuls (constant B) and the LLM ops (host ops and the FPGA
-    attention kernel calls) may touch tensors with exponents; only the LLM
-    ops touch host tensors and states."""
-    from .nodes import MatmulNode, ReshapeNode
+    """Only MatMuls (constant B), Convs (per-tensor exponents; constant
+    weight and bias, encoded by encode_conv_weights) and the LLM / TTS ops
+    (host ops and the FPGA attention kernel calls) may touch tensors with
+    exponents; only those host ops touch host tensors and states."""
+    from .nodes import ConvNode, MatmulNode, ReshapeNode
     from .llm_nodes import LlmNode
     for sn in nodes:
         label = f"{sn.onnx_node.op_type} node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
@@ -230,6 +271,22 @@ def check(nodes, dtype) -> None:
             raise NumericError(f"{label}: host / state tensors are only read or written "
                                f"by the LLM host ops")
         if isinstance(sn, MatmulNode):
+            continue
+        if isinstance(sn, ConvNode):
+            x, w = sn.inputs[0], sn.inputs[1]
+            b = sn.inputs[2] if sn.has_bias else None
+            if w.exp is not None or (b is not None and b.exp is not None):
+                raise NumericError(f"{label}: weight / bias exponents are derived "
+                                   f"(f_w = f_y + {dtype.frac_bits} - f_x, bias at f_y), "
+                                   f"not annotated")
+            if (x.exp is not None or sn.output.exp is not None) and (
+                    w.data is None or (b is not None and b.data is None)):
+                raise NumericError(f"{label}: exponents need a constant weight and bias")
+            for t in (x, sn.output):
+                if t.exp is not None and np.ndim(t.exp) != 0:
+                    raise NumericError(f"{label}: '{t.onnx_name}': a Conv tensor takes one "
+                                       f"exponent (per-channel exponents are along the last "
+                                       f"axis, which is not a Conv's channel axis)")
             continue
         if isinstance(sn, ReshapeNode):
             src, out = sn.inputs[0], sn.output
@@ -249,4 +306,5 @@ def check(nodes, dtype) -> None:
 
 
 __all__ = ("METADATA_KEY", "HOST_KINDS", "NumericError", "empty", "parse", "to_metadata",
-           "is_active", "apply", "has_numeric", "encode_matmul_weights", "check")
+           "is_active", "apply", "has_numeric", "encode_matmul_weights", "encode_conv_weights",
+           "check")
