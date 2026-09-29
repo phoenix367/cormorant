@@ -564,6 +564,93 @@ class TestCtypesEngine(unittest.TestCase):
             b.close()
 
 
+# ── smollm2 + smollm2-360m: two libraries with the same C API ───────────────
+
+@unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
+class TestTwoSizes(unittest.TestCase):
+    """The smollm2 (libsmollm2.so) and smollm2-360m (libsmollm2_360m.so)
+    backends side by side in one server process: both libraries export the
+    same llm_* symbols (ctypes loads each RTLD_LOCAL), each keeps its own
+    state and serves the model id it reports."""
+
+    A, B = "smollm2-135m-instruct", "smollm2-360m-instruct"
+
+    def setUp(self):
+        import shutil
+        self.libs = fake_llm_lib(self.A), fake_llm_lib(self.B)
+        if self.libs[0] is None:
+            self.skipTest("no C compiler")
+        self.dirs = [tempfile.mkdtemp(prefix="fakellm_") for _ in range(2)]
+        self.addCleanup(lambda: [shutil.rmtree(d, True) for d in self.dirs])
+        self.replies = ("Small model here.", "The larger model answers.")
+        for d, reply in zip(self.dirs, self.replies):
+            with open(os.path.join(d, "script.txt"), "w") as f:
+                f.write(" ".join(map(str, GEN_PROMPT)) + "\n"
+                        + " ".join(map(str, tok().encode(reply))) + "\n")
+
+    def args(self, *argv, fake=True):
+        from _util import server_mod
+        return server_mod.parse_args(
+            ["--llm-tokenizer", TOKENIZER, "--llm-360m-tokenizer", TOKENIZER,
+             "--llm-sampler-lib", sampler_lib() or "/nonexistent", "--llm-temperature", "0",
+             "--llm-no-loop-guard", *(["--llm-fake", "scripted"] if fake else []), *argv])
+
+    def test_libraries_side_by_side(self):
+        import ctypes
+        engines = [LibLlmEngine(lib, d) for lib, d in zip(self.libs, self.dirs)]
+        small, large = (backend(e) for e in engines)
+        try:
+            self.assertEqual((small.model_id, large.model_id), (self.A, self.B))
+            counters = []
+            for e in engines:
+                e.lib.fake_llm_counters.restype = ctypes.POINTER(ctypes.c_long)
+                counters.append(e.lib.fake_llm_counters())
+            m = [{"role": "user", "content": "hello"}]
+            for _ in range(2):                              # interleaved turns
+                self.assertEqual("".join(run(small, req(m))[0]), self.replies[0])
+                self.assertEqual("".join(run(large, req(m))[0]), self.replies[1])
+            p = len(tok().encode(chatml.render(m)))
+            self.assertEqual([e.position() for e in engines],
+                             [p + len(tok().encode(r)) for r in self.replies])
+            self.assertEqual([c[0] for c in counters], [1, 1])      # one llm_open each
+            small.unload()
+            self.assertEqual("".join(run(large, req(m))[0]), self.replies[1])
+        finally:
+            small.close()
+            large.close()
+
+    def test_server_builds_both(self):
+        from _util import server_mod
+        bs = server_mod.build_backends(self.args("--backend", "smollm2-360m", "--backend", "smollm2",
+                                                 "--llm-lib", self.libs[0],
+                                                 "--llm-360m-lib", self.libs[1],
+                                                 "--llm-weights", self.dirs[0],
+                                                 "--llm-360m-weights", self.dirs[1], fake=False))
+        self.assertEqual(list(bs), [self.B, self.A])          # the first is the default model
+        self.assertEqual([b.engine.lib_path for b in bs.values()], [self.libs[1], self.libs[0]])
+        self.assertEqual([b.cma_mb for b in bs.values()], [760.0, 330.0])
+        self.assertEqual(bs[self.B].fingerprint, "kv260-smollm2-360m-pow2+sink+p12")
+
+    def test_default_ids_and_overrides(self):
+        from _util import server_mod
+        bs = server_mod.build_backends(self.args("--backend", "smollm2", "--backend", "smollm2-360m"))
+        self.assertEqual(list(bs), [self.A, self.B])       # fakes report no name: the defaults
+        bs = server_mod.build_backends(self.args("--backend", "smollm2-360m-instruct",
+                                                 "--llm-360m-model-id", "big", "--llm-360m-cma-mb", "700"))
+        self.assertEqual(list(bs), ["big"])
+        self.assertEqual(bs["big"].cma_mb, 700.0)
+
+    def test_one_model_twice_is_an_error(self):
+        from _util import server_mod
+        with self.assertRaises(SystemExit) as cm:        # both libraries report smollm2-360m-instruct
+            server_mod.build_backends(self.args("--backend", "smollm2", "--backend", "smollm2-360m",
+                                                "--llm-lib", self.libs[1],
+                                                "--llm-360m-lib", self.libs[1], fake=False))
+        self.assertIn("smollm2-360m-instruct", str(cm.exception))
+        with self.assertRaises(SystemExit):
+            server_mod.build_backends(self.args("--backend", "smollm2", "--backend", "smollm2-135m"))
+
+
 # ── residency: lazy loading and eviction between bert-squad and smollm2 ──────
 
 class FakeBertEngine:

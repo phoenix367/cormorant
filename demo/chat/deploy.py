@@ -13,7 +13,8 @@ host with inference-scheduler/.venv/bin/python).
   server   -> kv260_chat_server.py, chat_backend.py, bert_squad_backend.py,
               squad_text.py, chat.py, vocab.txt, and the smollm2 side
               (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
-              src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/) to <dir>
+              src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/,
+              <dir>/smollm2_360m/, <dir>/smolvlm/) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
               (skipped when unchanged; without it the server samples in Python)
   start    -> transient systemd unit 'kv260-chat' (systemd-run: survives the
@@ -21,10 +22,12 @@ host with inference-scheduler/.venv/bin/python).
               kv260-chat) or, with server.launcher = "nohup", a detached
               process; then waits for GET /health from the host
 
-The smollm2 backend (server.backends containing "smollm2") needs
-libsmollm2.so on the board at smollm2.lib (default <dir>/lib/libsmollm2.so;
-built by the decoder project of CHAT_PLAN phase 3, not by this script);
-preflight reports whether it is there.
+The generative backends need their libraries on the board, built by
+scripts/llm_board.py (not by this script): smollm2 (SmolLM2-135M) at
+smollm2.lib (default <dir>/lib/libsmollm2.so), smollm2-360m at
+smollm2_360m.lib (default <dir>/lib/libsmollm2_360m.so), smolvlm at
+smolvlm.lib (default <dir>/lib/libsmolvlm_256m.so); preflight reports whether
+they are there.  The smollm2 block's sampling defaults apply to all three.
 
 The board lock (flock on board_lock) is held while deploying.  The running
 server owns the FPGA: other board jobs must wait until `deploy.py --stop`.
@@ -128,6 +131,13 @@ def load_config(path: Optional[str]) -> dict:
             llm[k] = v
     if not llm["lib"]:
         llm["lib"] = f"{rem['dir']}/lib/libsmollm2.so"
+    l360 = cfg.setdefault("smollm2_360m", {})
+    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 760),
+                 ("tokenizer", "assets/smollm2-360m-instruct/tokenizer.json")):
+        if l360.get(k) is None:
+            l360[k] = v
+    if not l360["lib"]:
+        l360["lib"] = f"{rem['dir']}/lib/libsmollm2_360m.so"
     vlm = cfg.setdefault("smolvlm", {})
     for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 540),
                  ("tokenizer", "assets/smolvlm-256m-instruct/tokenizer.json")):
@@ -142,8 +152,16 @@ def load_config(path: Optional[str]) -> dict:
     return cfg
 
 
+SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")    # kv260_chat_server.py
+SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
+
+
 def uses_llm(cfg: dict) -> bool:
-    return any(b in ("smollm2", "smollm2-135m-instruct") for b in cfg["server"]["backends"])
+    return any(b in SMOLLM2_135M for b in cfg["server"]["backends"])
+
+
+def uses_llm_360m(cfg: dict) -> bool:
+    return any(b in SMOLLM2_360M for b in cfg["server"]["backends"])
 
 
 def uses_vlm(cfg: dict) -> bool:
@@ -240,16 +258,22 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     out, _, rc = session.exec("command -v cc || command -v gcc", timeout=15)
     print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'C compiler (libsampler.so)':<36} "
           f"{_dim(out.strip() or 'none: the server samples in Python (slower)')}")
-    if uses_llm(cfg):
-        lib = cfg["smollm2"]["lib"]
+    for used, key, label, how in (
+            (uses_llm(cfg), "smollm2", "libsmollm2.so (smollm2)", "llm_board.py --install-only"),
+            (uses_llm_360m(cfg), "smollm2_360m", "libsmollm2_360m.so (smollm2-360m)",
+             "llm_board.py --project build/llm_project_smollm2_360m --install-only (CHAT_PLAN §20)")):
+        if not used:
+            continue
+        lib = cfg[key]["lib"]
         _, _, rc = session.exec(f"test -f {shlex.quote(lib)}", timeout=15)
         good = rc == 0
-        print(f"    {_green('OK     ') if good else _red('MISSING')} {'libsmollm2.so (smollm2 backend)':<36} "
-              f"{_dim(lib if good else lib + ' - build it with the decoder project (CHAT_PLAN phase 3)')}")
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {label:<36} "
+              f"{_dim(lib if good else lib + ' - ' + how)}")
         ok &= good
-        tok = chat_path(cfg["smollm2"]["tokenizer"])
+        tok = chat_path(cfg[key]["tokenizer"])
         good = tok.exists()
-        print(f"    {_green('OK     ') if good else _red('MISSING')} {'tokenizer.json (host)':<36} {_dim(str(tok))}")
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'  tokenizer.json (host)':<36} "
+              f"{_dim(str(tok))}")
         ok &= good
     if uses_vlm(cfg):
         lib = cfg["smolvlm"]["lib"]
@@ -366,6 +390,11 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
             session.exec_checked(f"mkdir -p {d}/smollm2", timeout=15)
             sftp.put(str(chat_path(cfg["smollm2"]["tokenizer"])), f"{d}/smollm2/tokenizer.json")
             extra = " + smollm2/tokenizer.json"
+        if uses_llm_360m(cfg):
+            session.exec_checked(f"mkdir -p {d}/smollm2_360m", timeout=15)
+            sftp.put(str(chat_path(cfg["smollm2_360m"]["tokenizer"])),
+                     f"{d}/smollm2_360m/tokenizer.json")
+            extra += " + smollm2_360m/tokenizer.json"
         if uses_vlm(cfg):
             session.exec_checked(f"mkdir -p {d}/smolvlm", timeout=15)
             sftp.put(str(chat_path(cfg["smolvlm"]["tokenizer"])), f"{d}/smolvlm/tokenizer.json")
@@ -405,7 +434,7 @@ def server_argv(cfg: dict) -> List[str]:
     for b in s["backends"]:
         argv += ["--backend", b]
     argv += ["--resident", str(s["resident"])]
-    if uses_llm(cfg) or uses_vlm(cfg):              # the sampling defaults serve both
+    if uses_llm(cfg) or uses_llm_360m(cfg) or uses_vlm(cfg):   # the sampling defaults serve all
         llm = cfg["smollm2"]
         argv += ["--llm-lib", llm["lib"], "--llm-tokenizer", f"{d}/smollm2/tokenizer.json",
                  "--llm-sampler-lib", f"{d}/lib/libsampler.so", "--llm-context", str(llm["context"]),
@@ -423,6 +452,14 @@ def server_argv(cfg: dict) -> List[str]:
             argv += ["--llm-weights", llm["weights_dir"]]
         if llm.get("model_id"):
             argv += ["--llm-model-id", llm["model_id"]]
+    if uses_llm_360m(cfg):
+        l360 = cfg["smollm2_360m"]
+        argv += ["--llm-360m-lib", l360["lib"], "--llm-360m-tokenizer",
+                 f"{d}/smollm2_360m/tokenizer.json", "--llm-360m-cma-mb", str(l360["cma_mb"])]
+        if l360.get("weights_dir"):
+            argv += ["--llm-360m-weights", l360["weights_dir"]]
+        if l360.get("model_id"):
+            argv += ["--llm-360m-model-id", l360["model_id"]]
     if uses_vlm(cfg):
         vlm = cfg["smolvlm"]
         argv += ["--vlm-lib", vlm["lib"], "--vlm-tokenizer", f"{d}/smolvlm/tokenizer.json",
@@ -537,8 +574,9 @@ def print_ready(cfg: dict, h: dict) -> None:
     print(f"    models            {', '.join(m['id'] for m in h['models'])}")
     print(f"    API key           {key}")
     print(f"    try               python3 demo/chat/chat.py --url {url} --doc some.txt")
-    if any(m["id"] == "smollm2-135m-instruct" for m in h["models"]):
-        print(f"                      python3 demo/chat/chat.py --url {url} --model smollm2-135m-instruct")
+    for m in h["models"]:
+        if m["id"].startswith("smollm2-"):
+            print(f"                      python3 demo/chat/chat.py --url {url} --model {m['id']}")
     print(f"    logs              ssh {cfg['ssh']['user']}@{cfg['ssh']['host']} journalctl -fu {UNIT}")
     print(f"    stop              demo/chat/deploy.py --stop   (the server owns the FPGA until then)\n")
 

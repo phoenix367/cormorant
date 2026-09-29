@@ -88,9 +88,9 @@ def wait_until(pred, timeout=5.0, step=0.01):
 _BUILD = {}
 
 
-def build_c(src: str, name: str):
+def build_c(src: str, name: str, defines=()):
     """Compile src into a shared library in a temporary directory (once per
-    process); None when there is no C compiler."""
+    process and name); None when there is no C compiler."""
     import atexit
     import shutil
     import subprocess
@@ -105,7 +105,8 @@ def build_c(src: str, name: str):
             atexit.register(shutil.rmtree, d, True)
             _BUILD["_dir"] = d
         out = os.path.join(_BUILD["_dir"], name)
-        r = subprocess.run([cc, "-O2", "-Wall", "-shared", "-fPIC", "-o", out, src, "-lm"],
+        r = subprocess.run([cc, "-O2", "-Wall", "-shared", "-fPIC", *(f"-D{d}" for d in defines),
+                            "-o", out, src, "-lm"],
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"{cc} {src}: {r.stderr}")
@@ -117,5 +118,10 @@ def sampler_lib():
     return build_c(os.path.join(CHAT, "src", "sampler.c"), "libsampler.so")
 
 
-def fake_llm_lib():
-    return build_c(os.path.join(HERE, "fake_libsmollm2.c"), "libfakellm.so")
+def fake_llm_lib(model_name=None):
+    """tests/fake_libsmollm2.c built; with model_name a copy of its own that
+    reports it from llm_model_name()."""
+    if model_name is None:
+        return build_c(os.path.join(HERE, "fake_libsmollm2.c"), "libfakellm.so")
+    return build_c(os.path.join(HERE, "fake_libsmollm2.c"), f"libfakellm_{model_name}.so",
+                   (f'FAKE_MODEL_NAME="{model_name}"',))

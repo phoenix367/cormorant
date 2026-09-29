@@ -1,6 +1,6 @@
 """smollm2_backend.py — backend B of the KV260 chat server: generative chat
-with SmolLM2-135M-Instruct on the FPGA (libsmollm2.so, doc/plans/CHAT_PLAN.md
-§11).  Python standard library only (ctypes); text side in
+with SmolLM2-135M-Instruct (libsmollm2.so) or SmolLM2-360M-Instruct
+(libsmollm2_360m.so) on the FPGA (doc/plans/CHAT_PLAN.md §11, §20).  Python standard library only (ctypes); text side in
 smollm2_tokenizer.py and chatml.py, sampling in sampler.py (libsampler.so).
 
 prepare()  (no FPGA)  messages -> ChatML prompt ids (SmolLM2's template: the
@@ -238,18 +238,19 @@ class Smollm2Backend(Backend):
                  reserve: int = 256, repeat_last_n: int = 64, prefill_chunk: int = 0,
                  cma_mb: Optional[float] = None, dry_penalty_last_n: int = -1,
                  dry_sequence_breakers: Sequence[str] = DRY_BREAKERS, loop_guard: bool = True,
-                 model_id: Optional[str] = None):
+                 model_id: Optional[str] = None, default_model_id: Optional[str] = None):
         self.engine = engine
         # The served model id: explicit, else the library's own name
-        # (libsmollm2_360m.so reports smollm2-360m-instruct), else MODEL_ID.
+        # (libsmollm2_360m.so reports smollm2-360m-instruct), else
+        # default_model_id (a library without llm_model_name(), a fake),
+        # else the class's model_id.
         if model_id is None and callable(getattr(engine, "model_name", None)):
             try:
                 model_id = engine.model_name() or None
             except (OSError, AttributeError):
                 model_id = None
-        if model_id:
-            self.model_id = model_id
-            self.fingerprint = f"kv260-{model_id.removesuffix('-instruct')}-pow2+sink+p12"
+        self.model_id = model_id or default_model_id or type(self).model_id
+        self.fingerprint = f"kv260-{self.model_id.removesuffix('-instruct')}-pow2+sink+p12"
         self.tokenizer_path = tokenizer_path
         self.sampler_lib = sampler_lib
         self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50,

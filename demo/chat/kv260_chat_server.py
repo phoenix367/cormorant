@@ -18,6 +18,9 @@ Backends (chat_backend.Backend; one model id each)
   smollm2      model id smollm2-135m-instruct: generative chat with
                SmolLM2-135M-Instruct on the FPGA (smollm2_backend.py,
                libsmollm2.so; tokenizer, template and sampling on the host)
+  smollm2-360m model id smollm2-360m-instruct: the same with SmolLM2-360M-
+               Instruct (libsmollm2_360m.so; the --llm-* sampling defaults
+               apply, --llm-360m-* give its library, weights and tokenizer)
   smolvlm      model id smolvlm-256m-instruct: chat about images with
                SmolVLM-256M-Instruct on the FPGA (smolvlm_backend.py,
                libsmolvlm_256m.so; image_url parts as base64 data URLs,
@@ -26,7 +29,8 @@ Backends (chat_backend.Backend; one model id each)
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
-BERT holds ~224 MB, SmolLM2 ~510 MB, idle CmaFree was 626-813 MB).
+BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~760 MB, SmolVLM
+~540 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -52,12 +56,16 @@ BERT window, a decoder token).  One log line per request on stderr.
 usage:
   kv260_chat_server.py [--host 0.0.0.0] [--port 8000]
                        [--api-key KEY | --api-key-file FILE]
-                       [--backend bert-squad] [--backend smollm2] [--backend echo] ...
+                       [--backend bert-squad] [--backend smollm2] [--backend smollm2-360m]
+                       [--backend smolvlm] [--backend echo] ...
                        [--resident auto|one|all] [--cma-margin-mb 32]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]
                        [--llm-lib lib/libsmollm2.so] [--llm-weights DIR]
                        [--llm-tokenizer tokenizer.json] [--llm-* sampling defaults]
+                       [--llm-360m-lib lib/libsmollm2_360m.so] [--llm-360m-weights DIR]
+                       [--llm-360m-tokenizer tokenizer.json]
+                       [--vlm-lib lib/libsmolvlm_256m.so] [--vlm-weights DIR]
                        [--queue-timeout 120] [--max-queue 16]
 """
 
@@ -837,11 +845,11 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-def llm_engine(args):
-    """libsmollm2.so, or with --llm-fake a stand-in from tests/fake_llm.py
-    (development without the FPGA: 'float' = the float reference model,
-    exact and slow, needs numpy + the safetensors weights; 'scripted' =
-    a fixed reply)."""
+def llm_engine(args, lib: str, weights: Optional[str]):
+    """A SmolLM2 library (libsmollm2.so, libsmollm2_360m.so), or with
+    --llm-fake a stand-in from tests/fake_llm.py (development without the
+    FPGA: 'float' = the float reference model of SmolLM2-135M, exact and
+    slow, needs numpy + the safetensors weights; 'scripted' = a fixed reply)."""
     if args.llm_fake:
         sys.path.insert(0, os.path.join(HERE, "tests"))
         import fake_llm
@@ -852,7 +860,7 @@ def llm_engine(args):
             "This is the scripted fake of libsmollm2.so (kv260_chat_server.py --llm-fake scripted).")
         return fake_llm.ScriptedEngine(reply, context_size=args.llm_context, delay=args.echo_delay)
     from smollm2_backend import LibLlmEngine
-    return LibLlmEngine(args.llm_lib, args.llm_weights)
+    return LibLlmEngine(lib, weights)
 
 
 def sampler_defaults(args):
@@ -861,6 +869,25 @@ def sampler_defaults(args):
                          top_k=args.llm_top_k, repetition_penalty=args.llm_repetition_penalty,
                          dry_multiplier=args.llm_dry_multiplier, dry_base=args.llm_dry_base,
                          dry_allowed_length=args.llm_dry_allowed_length)
+
+
+SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")
+SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
+
+
+def smollm2_backend(args, engine, tokenizer: str, cma_mb: float, model_id: Optional[str],
+                    default_model_id: Optional[str] = None) -> Backend:
+    """A SmolLM2 backend over `engine`; the --llm-* sampling and context
+    options apply to every SmolLM2 size."""
+    from smollm2_backend import Smollm2Backend
+    return Smollm2Backend(
+        engine, tokenizer, sampler_lib=args.llm_sampler_lib, defaults=sampler_defaults(args),
+        dry_penalty_last_n=args.llm_dry_penalty_last_n,
+        dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
+        loop_guard=not args.llm_no_loop_guard, context_size=args.llm_context,
+        reserve=args.llm_reserve, repeat_last_n=args.llm_repeat_last_n,
+        prefill_chunk=args.llm_prefill_chunk, cma_mb=cma_mb, model_id=model_id,
+        default_model_id=default_model_id)
 
 
 def build_backends(args) -> Dict[str, Backend]:
@@ -872,23 +899,13 @@ def build_backends(args) -> Dict[str, Backend]:
             from bert_squad_backend import BertSquadBackend, LibBertEngine
             b = BertSquadBackend(LibBertEngine(args.bert_lib, args.bert_weights), args.vocab,
                                  max_windows=args.max_windows, doc_stride=args.doc_stride)
-        elif name in ("smollm2", "smollm2-135m-instruct"):
-            from sampler import SamplerParams
-            from smollm2_backend import Smollm2Backend
-            b = Smollm2Backend(
-                llm_engine(args), args.llm_tokenizer, sampler_lib=args.llm_sampler_lib,
-                defaults=SamplerParams(temperature=args.llm_temperature, top_p=args.llm_top_p,
-                                       top_k=args.llm_top_k,
-                                       repetition_penalty=args.llm_repetition_penalty,
-                                       dry_multiplier=args.llm_dry_multiplier,
-                                       dry_base=args.llm_dry_base,
-                                       dry_allowed_length=args.llm_dry_allowed_length),
-                dry_penalty_last_n=args.llm_dry_penalty_last_n,
-                dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
-                loop_guard=not args.llm_no_loop_guard,
-                context_size=args.llm_context, reserve=args.llm_reserve,
-                repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk,
-                cma_mb=args.llm_cma_mb, model_id=args.llm_model_id)
+        elif name in SMOLLM2_135M:
+            b = smollm2_backend(args, llm_engine(args, args.llm_lib, args.llm_weights),
+                                args.llm_tokenizer, args.llm_cma_mb, args.llm_model_id)
+        elif name in SMOLLM2_360M:
+            b = smollm2_backend(args, llm_engine(args, args.llm_360m_lib, args.llm_360m_weights),
+                                args.llm_360m_tokenizer, args.llm_360m_cma_mb,
+                                args.llm_360m_model_id, default_model_id="smollm2-360m-instruct")
         elif name in ("smolvlm", "smolvlm-256m-instruct"):
             from smolvlm_backend import LibVlmEngine, SmolvlmBackend
             b = SmolvlmBackend(
@@ -901,7 +918,12 @@ def build_backends(args) -> Dict[str, Backend]:
                 prefill_chunk=args.llm_prefill_chunk, cma_mb=args.vlm_cma_mb,
                 model_id=args.vlm_model_id)
         else:
-            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, smolvlm, echo)")
+            raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, "
+                             f"smollm2-360m, smolvlm, echo)")
+        if b.model_id in out:
+            raise SystemExit(f"backend '{name}' serves model id '{b.model_id}', which another "
+                             f"backend already serves (check the --llm-lib / --llm-360m-lib "
+                             f"libraries and --*-model-id)")
         out[b.model_id] = b
     return out
 
@@ -910,7 +932,7 @@ def _first_existing(*paths: str) -> str:
     return next((p for p in paths if os.path.exists(p)), paths[0])
 
 
-def main(argv=None) -> int:
+def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
@@ -919,7 +941,7 @@ def main(argv=None) -> int:
                     help="require 'Authorization: Bearer KEY' on /v1/* (env KV260_CHAT_API_KEY)")
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
-                    choices=("bert-squad", "smollm2", "smollm2-135m-instruct", "smolvlm",
+                    choices=("bert-squad", *SMOLLM2_135M, *SMOLLM2_360M, "smolvlm",
                              "smolvlm-256m-instruct", "echo"),
                     help="backend(s) to serve (default: bert-squad); the first is the default model")
     ap.add_argument("--resident", choices=("auto", "one", "all"), default="auto",
@@ -936,11 +958,12 @@ def main(argv=None) -> int:
     ap.add_argument("--max-windows", type=int, default=8,
                     help="256-token windows per question at most (latency cap, ~1 s each)")
     ap.add_argument("--doc-stride", type=int, default=128)
-    g = ap.add_argument_group("smollm2 (generative chat)")
+    g = ap.add_argument_group("smollm2 (generative chat with SmolLM2-135M; the sampling and "
+                              "context options apply to smollm2-360m and smolvlm too)")
     g.add_argument("--llm-lib", default=os.path.join(HERE, "lib", "libsmollm2.so"))
     g.add_argument("--llm-model-id", default=None,
-                   help="model id to serve (default: the library's llm_model_name(), e.g. "
-                        "smollm2-360m-instruct for libsmollm2_360m.so)")
+                   help="model id to serve (default: the library's llm_model_name(), else "
+                        "smollm2-135m-instruct)")
     g.add_argument("--llm-weights", default=None,
                    help="weights directory for llm_open(); default: the one the library was built for")
     g.add_argument("--llm-tokenizer", default=_first_existing(
@@ -974,7 +997,20 @@ def main(argv=None) -> int:
     g.add_argument("--llm-cma-mb", type=float, default=330.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g.add_argument("--llm-fake", choices=("float", "scripted"), default=None,
-                   help="development without the FPGA: tests/fake_llm.py instead of libsmollm2.so")
+                   help="development without the FPGA: tests/fake_llm.py instead of the SmolLM2 "
+                        "libraries")
+    g = ap.add_argument_group("smollm2-360m (generative chat with SmolLM2-360M)")
+    g.add_argument("--llm-360m-lib", default=os.path.join(HERE, "lib", "libsmollm2_360m.so"))
+    g.add_argument("--llm-360m-model-id", default=None,
+                   help="model id to serve (default: the library's llm_model_name(), else "
+                        "smollm2-360m-instruct)")
+    g.add_argument("--llm-360m-weights", default=None,
+                   help="weights directory for llm_open(); default: the one the library was built for")
+    g.add_argument("--llm-360m-tokenizer", default=_first_existing(
+        os.path.join(HERE, "smollm2_360m", "tokenizer.json"),
+        os.path.join(HERE, "assets", "smollm2-360m-instruct", "tokenizer.json")))
+    g.add_argument("--llm-360m-cma-mb", type=float, default=760.0,
+                   help="CMA the loaded model holds (MB), for --resident auto")
     g = ap.add_argument_group("smolvlm (chat about images; the llm sampling defaults apply)")
     g.add_argument("--vlm-lib", default=os.path.join(HERE, "lib", "libsmolvlm_256m.so"))
     g.add_argument("--vlm-weights", default=None,
@@ -995,7 +1031,11 @@ def main(argv=None) -> int:
     if args.api_key_file:
         with open(args.api_key_file) as f:
             args.api_key = f.read().strip()
+    return args
 
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
     backends = build_backends(args)
     max_body = (int(args.max_body_mb * (1 << 20)) if args.max_body_mb else
                 (32 << 20) if any(getattr(b, "accepts_images", False) for b in backends.values())

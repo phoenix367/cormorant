@@ -18,9 +18,9 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2, smolvlm, echo; the first is the default model. smollm2 needs libsmollm2.so on the board (see the smollm2 block), smolvlm libsmolvlm_256m.so and Pillow (see the smolvlm block).",
+    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, echo; the first is the default model. Each generative one needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow.",
     "resident": "auto",
-    "_resident_note": "auto = keep both FPGA models loaded when CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
+    "_resident_note": "auto = keep the FPGA models loaded while CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,
     "doc_stride": 128,
     "queue_timeout": 120,
@@ -30,8 +30,9 @@
     "env": {}
   },
   "smollm2": {
+    "_comment": "SmolLM2-135M-Instruct, served when server.backends contains smollm2. Its sampling and context settings are the server defaults for smollm2-360m and smolvlm too.",
     "lib": null,
-    "_lib_note": "libsmollm2.so on the board (CHAT_PLAN phase 3 builds it); null = <remote.dir>/lib/libsmollm2.so.",
+    "_lib_note": "null = <remote.dir>/lib/libsmollm2.so (llm_board.py --install-only builds it).",
     "weights_dir": null,
     "_weights_dir_note": "Passed to llm_open(); null = the directory the library was built for.",
     "tokenizer": "assets/smollm2-135m-instruct/tokenizer.json",
@@ -57,6 +58,18 @@
     "_loop_guard_note": "End an answer whose generated tokens end in one block repeated verbatim 3 times (>= 24 tokens); finish_reason stop, kv260.finish 'loop'.",
     "_sampling_note": "Server defaults for requests that do not set them (the model card's 0.2 / 0.9, HF's top_k 50).",
     "cma_mb": 330
+  },
+  "smollm2_360m": {
+    "_comment": "SmolLM2-360M-Instruct (CHAT_PLAN §20), served when server.backends contains smollm2-360m; the sampling defaults of the smollm2 block apply.",
+    "lib": null,
+    "_lib_note": "null = <remote.dir>/lib/libsmollm2_360m.so (llm_board.py --project build/llm_project_smollm2_360m --install-only builds it).",
+    "weights_dir": null,
+    "model_id": null,
+    "_model_id_note": "null = the library's llm_model_name() (smollm2-360m-instruct).",
+    "tokenizer": "assets/smollm2-360m-instruct/tokenizer.json",
+    "_tokenizer_note": "Host path; uploaded to <remote.dir>/smollm2_360m/tokenizer.json.",
+    "cma_mb": 760,
+    "_cma_note": "The 740 MiB pool BO; with --resident auto it swaps with the other FPGA models."
   },
   "build": {
     "jobs": 4,

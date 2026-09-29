@@ -7,7 +7,9 @@
  * of the generation prompt the next token is reply[k] (then <|im_end|> = 2);
  * logits are 0 except 30 at that token.  Context and vocabulary sizes come
  * from dir/sizes.txt ("vocab ctx") if present (default 49152 1024).
- * fake_llm_counters() exposes calls for the tests.
+ * fake_llm_counters() exposes calls for the tests.  With
+ * -DFAKE_MODEL_NAME='"<id>"' it also exports llm_model_name() (the served
+ * model id; two such copies stand in for libsmollm2.so + libsmollm2_360m.so).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +29,9 @@ const char *llm_last_error(void) { return s_err; }
 int         llm_vocab_size(void) { return s_open ? s_vocab : -1; }
 int         llm_context_size(void) { return s_open ? s_ctx : -1; }
 long       *fake_llm_counters(void) { return s_counters; }
+#ifdef FAKE_MODEL_NAME
+const char *llm_model_name(void) { return FAKE_MODEL_NAME; }
+#endif
 
 static int read_ids(FILE *f, int32_t *out, int max)
 {
