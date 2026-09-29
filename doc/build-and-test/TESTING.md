@@ -348,67 +348,67 @@ behind the performance models of the scheduler's `--plan` mode (`cases` /
 lives in `inference-scheduler/perf_models/kv260/` (see
 `perf_models/README.md` and TACTICS_PLAN.md §9).
 
-**Sample output** (recorded on the board in May 2026 with the 48-case
-config of that time, before the 128-bit ports, packed-B MatmulKernel and
-the ConvKernel 2-D grid — the format is current, the numbers are not):
+**Sample output** (2026-09-29, hw_128 d7ce129 at 100 MHz, the 60-case
+`perf_config.json.example` set; abbreviated — the full table is in
+[REMOTE_TESTING.md](../../inference-scheduler/doc/REMOTE_TESTING.md#reading-the-report)):
 
 ```
   VectorOPKernel
   ───────────────────────────────────────────────────────────────────────────────────
   Label                    Parameters                        Lat(ms)      GB/s
   ───────────────────────────────────────────────────────────────────────────────────
-  ADD-1K                   ADD    size=1024    outer=1        0.0208     0.296
-  ADD-4K                   ADD    size=4096    outer=1        0.0515     0.477
-  ADD-16K                  ADD    size=16384   outer=1        0.1754     0.561
-  ADD-64K                  ADD    size=65536   outer=1        0.6709     0.586
-  ADD-256K                 ADD    size=262144  outer=1        2.6528     0.593
+  ADD-1K                   ADD    size=1024    outer=1        0.0087     0.703
+  ADD-4K                   ADD    size=4096    outer=1        0.0175     1.406
+  ADD-16K                  ADD    size=16384   outer=1        0.0483     2.034
+  ADD-64K                  ADD    size=65536   outer=1        0.1711     2.298
+  ADD-256K                 ADD    size=262144  outer=1        0.6627     2.373
   ...
   ───────────────────────────────────────────────────────────────────────────────────
-                                                 peak GB/s                0.593
-                                               min latency     0.0181
+                                                 peak GB/s                4.604
+                                               min latency     0.0087
   15/15 OK
 
   MatmulKernel
-  ─────────────────────────────────────────────────────────────────────────────
-  Label              Parameters                        Lat(ms)    GOps/s
-  ─────────────────────────────────────────────────────────────────────────────
-  8x8x8              N=8    K=8    M=8    batch=1       0.0176     0.058
-  16x16x16           N=16   K=16   M=16   batch=1       0.0515     0.159
-  32x32x32           N=32   K=32   M=32   batch=1       0.3021     0.217
+  ────────────────────────────────────────────────────────────────────────────────────
+  Label                     Parameters                        Lat(ms)    GOps/s
+  ────────────────────────────────────────────────────────────────────────────────────
+  8x8x8                     N=8    K=8    M=8    batch=1       0.0114     0.090
+  16x16x16                  N=16   K=16   M=16   batch=1       0.0209     0.391
+  32x32x32                  N=32   K=32   M=32   batch=1       0.0499     1.313
   ...
-  dw-12544x16x3      N=12544 K=16   M=1    batch=3     38.7727     0.031
-  ─────────────────────────────────────────────────────────────────────────────
-                                         peak GOps/s                0.266
-                                         min latency     0.0176
-  12/12 OK
+  FC-1x1536x576-gemv-kw4    N=1    K=1536 M=576  batch=1 GEMV kw=4     0.5675     3.118
+  ────────────────────────────────────────────────────────────────────────────────────
+                                                peak GOps/s                4.679
+                                                min latency     0.0114
+  24/24 OK
 
   ConvKernel
   ─────────────────────────────────────────────────────────────────────────────────────
   Label                      Parameters                        Lat(ms)    GOps/s
   ─────────────────────────────────────────────────────────────────────────────────────
-  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                5.9634     0.076
-  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k               95.2806     0.076
-  3x3-64ch-56x56             64ch 56x56→64ch 3x3k             127.1612     1.818
+  3x3-1ch-28x28-32out        1ch 28x28→32ch 3x3k                0.1490     3.031
+  3x3-1ch-28x28-32out-b16    1ch 28x28→32ch 3x3k                2.0737     3.484
+  3x3-64ch-56x56             64ch 56x56→64ch 3x3k               2.6830    86.175
   ...
-  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k              33.7165     0.107
+  dw-3x3-64ch-56x56          64ch 56x56→64ch 3x3k               1.0129     3.567
   ─────────────────────────────────────────────────────────────────────────────────────
-                                                 peak GOps/s                1.903
-                                                 min latency     4.2167
+                                                 peak GOps/s               86.175
+                                                 min latency     0.1490
   10/10 OK
 
   PoolingKernel
   ────────────────────────────────────────────────────────────────────────────────────
   Label                     Parameters                        Lat(ms)      GB/s
   ────────────────────────────────────────────────────────────────────────────────────
-  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             3.7900     0.132
-  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             1.0524     0.119
-  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             3.8125     0.132
+  MaxPool-2x2-56x56         MaxPool 2x2 64ch 56x56             0.3352     1.497
+  MaxPool-2x2-28x28         MaxPool 2x2 64ch 28x28             0.1161     1.080
+  MaxPool-3x3-56x56         MaxPool 3x3 64ch 56x56             0.3385     1.482
   ...
   ────────────────────────────────────────────────────────────────────────────────────
-                                                  peak GB/s                0.133
-                                                min latency     0.1039
+                                                  peak GB/s                1.498
+                                                min latency     0.0254
   11/11 OK
-  ── OVERALL: All 48 cases passed ──
+  ── OVERALL: All 60 cases passed ──
 ```
 
 | Metric | Meaning |

@@ -95,3 +95,22 @@ line at the top says what is done.
 | [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
 | [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |
+
+## Claude Code skills
+
+Packaged workflows in [`.claude/skills/`](../.claude/skills/) (each
+`SKILL.md` has the procedure; Claude Code loads them by name, e.g.
+`/perf-regression`):
+
+| Skill | Use it to |
+|---|---|
+| `model-study` | decide GO / NO-GO for a new model before porting it: operators, memory, fixed-point numerics against float, projected latency |
+| `llm-onboard` | take a Llama-family model that passed `model-study` to a served chat model: calibrate, generate, bit-exact gates, board install, backend, deploy |
+| `add-host-op` | add an operator that runs on the board's CPU (numpy reference + C helper, bit-exact, A53-fast, timing model, tests) |
+| `conv-verify`, `pool-verify`, `kernel-verify` | verify a kernel change end to end: C-sim, HLS synthesis, RTL behaviour test, timing diff (`kernel-verify`: MatMul, VectorOP) |
+| `conv-cycle-model`, `conv-rtl-trace` | predict ConvKernel cycles per layer; trace one RTL case's AXI / FIFO activity |
+| `hls-rag` | ground HLS pragma / TCL edits in the indexed Vitis HLS user guide |
+| `board-deploy` | build and load a bitstream, then run the on-board tests and demos |
+| `perf-regression` | run the kernel benchmarks (and demo latencies) and compare them with the recorded baseline of the loaded bitstream |
+| `perf-calibrate` | measure the per-bitstream performance model that `--plan` needs (after every new bitstream) |
+| `docs-audit` | audit the docs against the code, or reproduce every documented path from a fresh clone |
