@@ -26,6 +26,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 
 import bert_study as bs                                  # noqa: E402
+import fetch_assets                                      # noqa: E402
 from src.graph import OnnxGraph                          # noqa: E402
 from src.codegen import CodeGenerator                    # noqa: E402
 
@@ -62,6 +63,7 @@ def main():
     ap.add_argument("--n", type=int, default=3, help="SQuAD examples (study selection)")
     args = ap.parse_args()
     t0 = time.time()
+    fetch_assets.ensure_all(bs.MODEL, bs.HERE)
     tok, pick = bs.pick_examples(args.n)
     g, cg = scheduler_sim(bs.MODEL)
     bert = bs.Bert(bs.MODEL, bs.POLS["sched"])

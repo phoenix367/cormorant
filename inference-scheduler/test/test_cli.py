@@ -54,28 +54,39 @@ class TestCLI(unittest.TestCase):
             )
 
     def test_driver_copied_when_dir_given(self):
-        driver_src = os.path.join(
-            ROOT, "..", "build", "kv260",
+        # The HLS driver of `make synthesize_vectorop_kv260` when the top-level
+        # build/ has it, else (a fresh clone, CI) a stand-in directory with the
+        # same file names: the copy is what is under test.
+        hls_src = os.path.join(
+            ROOT, "..", "build", "kernels", "vectorop", "kv260",
             "vadd_kv260", "solution1", "impl", "ip",
             "drivers", "VectorOPKernel_v1_0", "src",
         )
-        if not os.path.isdir(driver_src):
-            self.skipTest("HLS synthesis output not present")
+        names = ["xvectoropkernel.c", "xvectoropkernel.h",
+                 "xvectoropkernel_hw.h",
+                 "xvectoropkernel_sinit.c",
+                 "xvectoropkernel_linux.c"]
         with tempfile.TemporaryDirectory() as td:
+            driver_src = hls_src
+            if not os.path.isdir(hls_src):
+                driver_src = os.path.join(td, "hls_driver")
+                os.makedirs(driver_src)
+                for fname in names:
+                    with open(os.path.join(driver_src, fname), "w") as f:
+                        f.write(f"/* stand-in for the HLS {fname} */\n")
+            out = os.path.join(td, "out")
             r = self._run_cli(
                 "single_add.onnx",
-                ["--out-dir", td, "--driver-dir", driver_src],
+                ["--out-dir", out, "--driver-dir", driver_src],
             )
             self.assertEqual(r.returncode, 0, msg=r.stderr)
+            self.assertNotIn("missing driver files", r.stderr)
             # Both bare-metal and Linux driver variants must be present
-            for fname in ["xvectoropkernel.c", "xvectoropkernel.h",
-                          "xvectoropkernel_hw.h",
-                          "xvectoropkernel_sinit.c",
-                          "xvectoropkernel_linux.c"]:
-                self.assertTrue(
-                    os.path.isfile(os.path.join(td, "driver", fname)),
-                    msg=f"Missing driver file: {fname}",
-                )
+            for fname in names:
+                got = os.path.join(out, "driver", fname)
+                self.assertTrue(os.path.isfile(got), msg=f"Missing driver file: {fname}")
+                with open(got, "rb") as a, open(os.path.join(driver_src, fname), "rb") as b:
+                    self.assertEqual(a.read(), b.read(), msg=fname)
 
     def test_header_content_in_project(self):
         with tempfile.TemporaryDirectory() as td:

@@ -26,11 +26,10 @@ import onnx
 from onnx import numpy_helper
 
 import os
+import fetch_assets
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-HERE = os.environ.get("BERT_SQUAD_ASSETS",                          # vocab.txt, dev-v1.1.json
-                      os.path.join(REPO, "demo", "bert_squad", "assets"))
-MODEL = os.environ.get("BERT_SQUAD_MODEL",
-                       os.path.join(REPO, "inference-scheduler", "bertsquad-12-simplified.onnx"))
+HERE = str(fetch_assets.default_assets_dir())                      # vocab.txt, dev-v1.1.json
+MODEL = str(fetch_assets.default_model_path())                     # downloaded by fetch_assets.ensure
 
 # ----------------------------------------------------------------- text side
 # Tokenizer, SQuAD features, span decoding and metrics live in the stdlib-only
@@ -301,6 +300,7 @@ def main():
     ap.add_argument("--check-ort", action="store_true")
     ap.add_argument("--policies", default="q88,fused,fused+w,fused+w+p7,fused+fw")
     args = ap.parse_args()
+    fetch_assets.ensure_all(MODEL, HERE)
     tok, pick = pick_examples(args.n)
     bert = Bert(MODEL)
     if args.check_ort:

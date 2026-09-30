@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1586 tests); the chat app (153 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1615 tests); the chat app (179 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -16,6 +16,34 @@ Layers 1–3 run on the host. Layers 4–5 run on the KV260 over SSH and
 require the Cormorant bitstream to be loaded first
 (see the [Quick start](../../README.md#quick-start) in the README
 or [`inference-scheduler/doc/REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
+
+### Running the host layers in one go
+
+`.claude/agents/run-tests/run_tests.py` runs layers 1 and 2, plus the
+Piper library's host check, and prints one JSON report.  With Claude Code,
+ask for the `run-tests` subagent (`.claude/agents/run-tests.md`): it runs the
+helper and reads the report.
+
+```bash
+python3 .claude/agents/run-tests/run_tests.py --suite default    # scheduler + chat pytest, ruff (~5 min)
+python3 .claude/agents/run-tests/run_tests.py --suite all        # + csim (make + ctest), tts-host (~9 min)
+python3 .claude/agents/run-tests/run_tests.py --suite scheduler --tests test/test_piper.py
+python3 .claude/agents/run-tests/run_tests.py --list             # suites and baselines
+```
+
+- **What the report holds.**  For every failure: file:line, the assertion
+  lines and failed subtests.  Also every skip, xfail and warning (grouped;
+  marked project or third-party, known or new).
+- **Anomalies against the baselines** in
+  `.claude/agents/run-tests/baselines.json`: fewer tests than the baseline,
+  a skip not listed there, a run under 40 % of its usual time, no tests
+  collected, an odd exit code.
+- **Where things go.**  Logs, JUnit XML and `report.json` are written to
+  `$CLAUDE_JOB_DIR/tmp/run-tests-<time>/` (or `/tmp/run-tests-<uid>-<time>/`).
+- **The baselines.**  After adding tests,
+  `--suite <s> --record-baseline` re-records one from a clean run.
+- **Not included.**  The RTL behaviour tests (`--suite rtl`) run only on
+  request, and the board layers are never run.
 
 ---
 
@@ -29,8 +57,8 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1586 tests in 70 modules (1581 pass; 5 skip: the four opt-in
-# test_bert_base.py tests and one test_cli.py test that needs an HLS driver build)
+# Run all 1615 tests in 74 modules (all pass, none skipped; the first run
+# downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
 # Run a specific module
@@ -61,13 +89,32 @@ with a per-buffer cache-state model and fails on any missing flush /
 invalidate at a CPU ↔ kernel hand-off (the DMA buffers are mapped cacheable
 on the board).  `test_bert_base.py` does the
 same for BERT-base and checks the simulation against the BERT study's
-independent emulation; it is opt-in (435 MB model, ~2 min):
+independent emulation.  It runs on the real model (~40 s, ~6 GB RAM):
+- **The files.**
+  - `demo/bert_squad/assets/models/bertsquad-12-simplified.onnx`, plus
+    `vocab.txt` and `dev-v1.1.json` from the same directory.
+  - On the first run it downloads whatever is missing with
+    `demo/bert_squad/scripts/fetch_assets.py`: 435 MB from Google Drive,
+    md5-checked.
+- **Other locations.** `BERT_SQUAD_MODEL` / `BERT_SQUAD_ASSETS` point it
+  elsewhere.
+- **No download.** `BERT_SQUAD_DOWNLOAD=0` skips it instead of downloading.
+  A failed download skips it too, with the error as the reason.
 
 ```bash
-BERT_SQUAD_MODEL=/path/bertsquad-12-simplified.onnx \
-BERT_SQUAD_ASSETS=/path/demo/bert_squad/assets \
-    .venv/bin/python -m pytest test/test_bert_base.py -v
+.venv/bin/python ../demo/bert_squad/scripts/fetch_assets.py   # optional: fetch ahead of time
+.venv/bin/python -m pytest test/test_bert_base.py -v
 ```
+
+**CI.**  `.github/workflows/inference-scheduler-tests.yml` runs this layer
+on GitHub's hosted Ubuntu runners on every push / pull request that touches
+`inference-scheduler/`, `platforms/` or `demo/bert_squad/scripts/`.  It runs:
+1. `ruff check .`;
+2. `test/gen_all_models.py`;
+3. `demo/bert_squad/scripts/fetch_assets.py`, for `test_bert_base.py`.  Its
+   435 MB download is cached under a key named after the model's md5, and a
+   failed download only makes those tests skip;
+4. pytest with coverage.
 
 The fixtures generated by `gen_all_models.py` include hardware-bound
 boundary models derived from `platforms/<AXI_PLATFORM>.json`
@@ -81,13 +128,13 @@ The chat server's tests ([`demo/chat/`](../../demo/chat/README.md#tests))
 run with the same venv, from the repo root:
 
 ```bash
-inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 153 tests
+inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 179 tests
 ```
 
 About 60 of them skip in a fresh clone, until the assets they read are
 present: the SmolLM2 tokenizer (`demo/chat/scripts/llm_calibrate.py fetch`),
 the SmolVLM tokenizer (`demo/chat/scripts/vlm_study.py fetch`), BERT's
-`vocab.txt` (the [`bert_squad/`](../../demo/bert_squad/README.md) assets)
+`vocab.txt` (`demo/bert_squad/scripts/fetch_assets.py vocab`)
 and Pillow.
 
 ---

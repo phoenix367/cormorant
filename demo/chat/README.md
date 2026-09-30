@@ -116,9 +116,15 @@ uses).
 
 ## Deploy
 
-Prerequisites are those of the [`bert_squad/`](../bert_squad/) demo (its
-config, the model, the HLS driver sources; the weights go to the board once),
-plus, for the generative backend, `libsmollm2.so` on the board (see below).
+Prerequisites are those of the [`bert_squad/`](../bert_squad/) demo: its
+config, the HLS driver sources, the model and `vocab.txt`.  The weights go to
+the board once.
+- **The assets.** `../bert_squad/scripts/fetch_assets.py model vocab`
+  downloads the model and `vocab.txt`.  Generating the BERT project also
+  downloads the model when it is missing, but `deploy.py` needs `vocab.txt`
+  in place.
+- **The generative backend** also needs `libsmollm2.so` on the board (see
+  below).
 
 ```bash
 cd demo/chat
@@ -1072,7 +1078,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 ```bash
 cd demo/chat/tests
 python3 -m unittest -v                  # 179 tests, ~45 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests; numpy, ffmpeg and libespeak-ng for the speech tests)
-                                        # ~60 skip until the SmolLM2 / SmolVLM tokenizers (llm_calibrate.py / vlm_study.py fetch) and BERT's vocab.txt are present
+                                        # ~60 skip until the SmolLM2 / SmolVLM tokenizers (llm_calibrate.py / vlm_study.py fetch) and BERT's vocab.txt (../bert_squad/scripts/fetch_assets.py vocab) are present
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
 # host validation against transformers, from the repo root

@@ -1,11 +1,16 @@
-"""BERT-base (bertsquad-12) gates — OPTIONAL, needs the 435 MB model.
+"""BERT-base (bertsquad-12) gates on the real 435 MB model.
 
-Skipped unless BERT_SQUAD_MODEL points to bertsquad-12-simplified.onnx
-(e.g. inference-scheduler/bertsquad-12-simplified.onnx in the main
-checkout).  The SQuAD comparison also needs BERT_SQUAD_ASSETS (the directory
-with vocab.txt and dev-v1.1.json).  ~2 min, ~6 GB RAM:
+The model is $BERT_SQUAD_MODEL, else
+demo/bert_squad/assets/models/bertsquad-12-simplified.onnx (or an older
+checkout's inference-scheduler/bertsquad-12-simplified.onnx); vocab.txt and
+dev-v1.1.json come from $BERT_SQUAD_ASSETS, else demo/bert_squad/assets.
+Missing files are downloaded on the first run by
+demo/bert_squad/scripts/fetch_assets.py (the model from Google Drive, 435 MB,
+md5-checked).  BERT_SQUAD_DOWNLOAD=0 skips the class instead of downloading;
+a failed download skips it with the error as the reason.  ~40 s with 4+
+cores, ~6 GB RAM:
 
-  BERT_SQUAD_MODEL=... BERT_SQUAD_ASSETS=... .venv/bin/python -m pytest test/test_bert_base.py -v
+  .venv/bin/python -m pytest test/test_bert_base.py -v
 
 Gate (a): the project generates and its C compiles; gate (b): the
 scheduler simulation equals the study's independent emulation of the same
@@ -28,17 +33,38 @@ from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
 from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode
 
-MODEL = os.environ.get("BERT_SQUAD_MODEL", "")
-ASSETS = os.environ.get("BERT_SQUAD_ASSETS", "")
 _STUDY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "demo", "bert_squad", "scripts")
+if _STUDY not in sys.path:
+    sys.path.append(_STUDY)
+import fetch_assets                                   # noqa: E402  (demo/bert_squad/scripts)
+
+MODEL = ASSETS = ""                                   # set by setUpClass
 
 
-@unittest.skipUnless(MODEL and os.path.isfile(MODEL), "set BERT_SQUAD_MODEL to run")
+def _assets():
+    """(model, assets dir), downloading what is missing; SkipTest when that
+    is switched off or fails."""
+    model, assets = fetch_assets.default_model_path(), fetch_assets.default_assets_dir()
+    need = [model] + [assets / fetch_assets.ASSETS[n].rel for n in ("vocab", "squad_dev")]
+    if all(p.exists() for p in need):
+        return str(model), str(assets)
+    if os.environ.get("BERT_SQUAD_DOWNLOAD", "1") == "0":
+        raise unittest.SkipTest("bertsquad-12 assets missing and BERT_SQUAD_DOWNLOAD=0: "
+                                + ", ".join(str(p) for p in need if not p.exists()))
+    try:
+        model, assets = fetch_assets.ensure_all(model, assets)
+    except fetch_assets.FetchError as e:
+        raise unittest.SkipTest(f"bertsquad-12 assets could not be downloaded: {e}") from e
+    return str(model), str(assets)
+
+
 class TestBertBase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        global MODEL, ASSETS
+        MODEL, ASSETS = _assets()
         cls.g = OnnxGraph(MODEL, fuse_act=True, s2d_stem=True)
         cls.cg = CodeGenerator(cls.g, model_path=MODEL)
 
@@ -76,10 +102,7 @@ class TestBertBase(unittest.TestCase):
         self.assertEqual(rc, 0, out[-3000:])
         self.assertIn("test_inference PASSED", out)
 
-    @unittest.skipUnless(ASSETS and os.path.isdir(ASSETS), "set BERT_SQUAD_ASSETS to run")
     def test_bit_exact_vs_study_on_squad(self):
-        if _STUDY not in sys.path:
-            sys.path.insert(0, _STUDY)
         import bert_study as bs
         import bert_sched_check as chk
         bs.HERE = ASSETS

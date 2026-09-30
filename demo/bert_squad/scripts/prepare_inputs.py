@@ -30,7 +30,7 @@ import sys
 
 import numpy as np
 
-from _common import import_study, load_config, log, preprocessed_dir, demo_path
+from _common import demo_path, ensure_asset, import_study, load_config, log, preprocessed_dir
 
 
 def select_first(bs, tok, squad_path, n):
@@ -67,10 +67,8 @@ def main(argv=None) -> int:
     selection = args.selection or inp.get("selection", "first")
     vocab = demo_path(inp.get("vocab", "assets/vocab.txt"))
     squad = demo_path(inp.get("squad_dev", "assets/dev-v1.1.json"))
-    for p in (vocab, squad):
-        if not p.exists():
-            log(f"error: {p} not found — see README.md 'Assets' for the download commands")
-            return 1
+    ensure_asset("vocab", vocab)                       # downloaded when missing
+    ensure_asset("squad_dev", squad)
     if selection == "study" and squad.parent != vocab.parent:
         log("error: selection 'study' needs vocab.txt and dev-v1.1.json in one directory")
         return 1

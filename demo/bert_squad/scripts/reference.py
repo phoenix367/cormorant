@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
-from _common import (BUILD_DIR, SCHED_DIR, SCRIPTS_DIR, feeds_for, import_study,
+from _common import (BUILD_DIR, SCHED_DIR, SCRIPTS_DIR, ensure_asset, feeds_for, import_study,
                      load_config, load_features, load_inputs, log, model_path,
                      sha1_of_files)
 
@@ -106,6 +106,7 @@ def code_keys(cfg: dict) -> dict:
 
 
 def compute(cfg: dict, n: int, k: int, workers: int, emulation: bool = True) -> dict:
+    ensure_asset("model", model_path(cfg))
     feats = load_features(cfg)
     seq = feats["seq_len"]
     recs = load_inputs(cfg, seq)[:n]

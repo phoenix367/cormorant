@@ -69,7 +69,7 @@ def format_missing_config(path: Path) -> str:
             "  - ssh.host / ssh.user / ssh.key_file  (the KV260)",
             "  - local.driver_dirs.{VectorOPKernel,MatmulKernel} (HLS driver sources:",
             "      make synthesize_vectorop_kv260 synthesize_matmul_kv260 from build/)",
-            "  - model  (bertsquad-12-simplified.onnx, see README.md)",
+            "  - model  (bertsquad-12-simplified.onnx; downloaded to assets/models/ when missing)",
             "", f"See {DEMO_DIR / 'README.md'} for every field.", ""]
     return "\n".join(lines)
 
@@ -99,6 +99,17 @@ def model_path(cfg: dict) -> Path:
 
 def preprocessed_dir(cfg: dict) -> Path:
     return demo_path(cfg.get("inputs", {}).get("out_dir", "assets/preprocessed"))
+
+
+def ensure_asset(name: str, path: Path) -> Path:
+    """path, downloaded first when missing (scripts/fetch_assets.py: "model",
+    "vocab", "squad_dev"); exits with the error when that fails."""
+    import fetch_assets
+    try:
+        return fetch_assets.ensure(name, path)
+    except fetch_assets.FetchError as e:
+        log(f"error: {e}")
+        sys.exit(1)
 
 
 # ── study module ─────────────────────────────────────────────────────────────

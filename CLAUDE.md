@@ -142,8 +142,13 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1608 tests, 5 skipped by default; test_bert_base.py is opt-in: BERT_SQUAD_MODEL=<bertsquad-12-simplified.onnx>)
+# Run all tests (1615 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
+
+# Every host suite with one structured report (failures, unexpected skips, warnings, short runs;
+# baselines in .claude/agents/run-tests/baselines.json) — the `run-tests` subagent drives the same helper
+python3 ../.claude/agents/run-tests/run_tests.py --suite all      # scheduler, chat, lint, csim, tts-host
 ```
 
 Key source files:

@@ -5,7 +5,7 @@ VectorOP element ops, host-op element counts and DMA-buffer traffic, and a
 first-order latency estimate.
 
 usage:  inference-scheduler/.venv/bin/python demo/bert_squad/scripts/bert_schedule_stats.py [model.onnx]
-        (default: $BERT_SQUAD_MODEL or inference-scheduler/bertsquad-12-simplified.onnx)
+        (default: $BERT_SQUAD_MODEL or assets/models/bertsquad-12-simplified.onnx, downloaded when missing)
 
 MatMuls are listed per engine (BERT_PLAN §2 2A: MatmulKernel, or ConvKernel
 with swapped operand roles) with the scheduler's engine cost model
@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 
 from src.codegen import CodeGenerator                     # noqa: E402
 from src.graph import OnnxGraph                            # noqa: E402
+
+import fetch_assets                                        # noqa: E402  (this directory)
 from src.host_nodes import GatherNode, HostNode, SliceNode  # noqa: E402
 from src.cost_model import CALL_OVERHEAD, matmul_cycles    # noqa: E402
 from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode  # noqa: E402
@@ -40,8 +42,7 @@ COPY_NS = 2e-9
 
 
 def main():
-    model = sys.argv[1] if len(sys.argv) > 1 else os.environ.get(
-        "BERT_SQUAD_MODEL", os.path.join(REPO, "inference-scheduler", "bertsquad-12-simplified.onnx"))
+    model = sys.argv[1] if len(sys.argv) > 1 else str(fetch_assets.ensure("model", fetch_assets.default_model_path()))
     g = OnnxGraph(model, fuse_act=True, s2d_stem=True)
     cg = CodeGenerator(g, model_path=model)
     bpe = cg._dtype.bytes_per_elem

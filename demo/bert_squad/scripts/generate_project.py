@@ -39,8 +39,8 @@ from pathlib import Path
 from typing import Dict, List
 
 from _common import (DEMO_DIR, INPUT_ROLES, OPTIONAL_ROLES, OUTPUT_ROLES,
-                     PROJECT_DIR, PROJECT_SUMMARY, demo_path, load_config, log,
-                     model_path)
+                     PROJECT_DIR, PROJECT_SUMMARY, demo_path, ensure_asset, load_config,
+                     log, model_path)
 
 from src.codegen import CodeGenerator          # noqa: E402
 from src.graph import OnnxGraph                # noqa: E402
@@ -271,11 +271,13 @@ def write_layers(project_dir: Path, g: OnnxGraph) -> List[dict]:
     return layers
 
 
-def preflight(cfg: dict) -> bool:
+def preflight(cfg: dict, fetch: bool = True) -> bool:
     ok = True
     m = model_path(cfg)
-    if not m.exists():
-        log(f"error: model {m} not found — see README.md 'Assets'")
+    if not m.exists() and fetch:
+        ensure_asset("model", m)                       # 435 MB, once
+    elif not m.exists():
+        log(f"error: model {m} not found — scripts/fetch_assets.py downloads it")
         ok = False
     for name in C_SOURCES:
         if not (SRC_DIR / name).exists():
@@ -303,7 +305,7 @@ def main(argv=None) -> int:
     cfg = load_config(args.config)
     plan = (plan_options_from_args(args) if args.plan or args.plan_report or args.perf_model
             else PlanOptions.from_config(cfg))
-    if not preflight(cfg):
+    if not preflight(cfg, fetch=not args.check_only):
         return 1
     if args.check_only:
         log("preflight: ok")

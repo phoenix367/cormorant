@@ -12,11 +12,13 @@ on:
     paths:
       - 'inference-scheduler/**'
       - 'platforms/**'
+      - 'demo/bert_squad/scripts/**'
       - '.github/workflows/inference-scheduler-tests.yml'
   pull_request:
     paths:
       - 'inference-scheduler/**'
       - 'platforms/**'
+      - 'demo/bert_squad/scripts/**'
       - '.github/workflows/inference-scheduler-tests.yml'
   workflow_dispatch:
 
@@ -61,7 +63,27 @@ jobs:
         # All gen_*_models.py invocations bundled — see test/gen_all_models.py.
         run: python test/gen_all_models.py
 
+      - name: Cache the BERT-SQuAD assets
+        # test_bert_base.py runs on the real bertsquad-12 (435 MB, from Google
+        # Drive) plus vocab.txt / dev-v1.1.json: fetched once, then cached.
+        # Bump the key's md5 when fetch_assets.py points at another model.
+        uses: actions/cache@v4
+        with:
+          path: |
+            demo/bert_squad/assets/models/bertsquad-12-simplified.onnx
+            demo/bert_squad/assets/vocab.txt
+            demo/bert_squad/assets/dev-v1.1.json
+          key: bert-squad-assets-f6818d482d18e703fbd8d7c3b609a98a
+
+      - name: Fetch the BERT-SQuAD assets
+        # A download failure (Drive quota, network) does not fail the job:
+        # test_bert_base.py then skips with the reason in the pytest summary.
+        continue-on-error: true
+        run: python ../demo/bert_squad/scripts/fetch_assets.py
+
       - name: Run pytest with coverage
+        env:
+          BERT_SQUAD_DOWNLOAD: '0'   # fetched above; don't retry inside pytest
         run: |
           python -m pytest test/ -v --tb=short \
             --cov=src \

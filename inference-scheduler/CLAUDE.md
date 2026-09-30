@@ -258,8 +258,8 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              73 pytest modules, 1608 tests collected (1603 pass, 5 skip;
-                         test_bert_base.py needs BERT_SQUAD_MODEL) — includes
+  test_*.py              74 pytest modules, 1615 tests, all pass (test_bert_base.py
+                         downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
                          corner cases), test_profiler_overlap.py (overlapping brackets),
@@ -272,7 +272,9 @@ test/
                          test_conv_exp.py (Conv with power-of-two exponents),
                          test_tts_ops.py (the TTS C helpers), test_piper.py (the Piper
                          chunk and encode entries == the specification, stitching,
-                         buckets, host_emu; the C duration predictor == its spec)
+                         buckets, host_emu; the C duration predictor == its spec),
+                         test_bert_base.py (BERT-base on the real model),
+                         test_fetch_assets.py (the BERT demo's downloader, local server)
 ```
 
 ## Key Abstractions
@@ -646,8 +648,8 @@ Tests live in `test/`. Run with `pytest`:
 .venv/bin/python -m pytest test/test_source.py -v          # generated inference.c
 .venv/bin/python -m pytest test/test_broadcast.py -v       # broadcast logic
 .venv/bin/python -m pytest test/ -k "test_relu" -v         # filter by name
-BERT_SQUAD_MODEL=bertsquad-12-simplified.onnx \
-    .venv/bin/python -m pytest test/test_bert_base.py -v   # opt-in BERT-base check
+.venv/bin/python -m pytest test/test_bert_base.py -v       # BERT-base on the real model (downloads it once;
+                                                           # BERT_SQUAD_MODEL / BERT_SQUAD_ASSETS override the paths)
 ```
 
 Most test classes are decorated `@unittest.skipUnless(_models_exist(), ...)` —

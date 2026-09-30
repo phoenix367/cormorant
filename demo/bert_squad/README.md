@@ -40,6 +40,7 @@ demo/bert_squad/
 │   ├── reference.py                — host reference logits (float / emulation / simulation)
 │   ├── deploy_and_run.py           — upload, build, smoke test, run, score, report
 │   ├── _common.py                  — config / paths / input readers
+│   ├── fetch_assets.py             — download + md5-check the model, vocab and SQuAD dev set
 │   ├── squad_text.py               — WordPiece tokenizer, SQuAD features (one window or
 │   │                                 sliding windows), span decoding, EM/F1 — stdlib only,
 │   │                                 shared with the chat server (demo/chat/)
@@ -51,7 +52,7 @@ demo/bert_squad/
 │   ├── bert_api.h / bert_api.c     — C API over the generated project (bert_open / bert_run /
 │   │                                 bert_close); squad_bench and libbert_squad.so use it
 │   └── squad_bench.c               — board-side runner (compiled on the board)
-├── assets/                         — not in git
+├── assets/                         — not in git; downloaded on first use (fetch_assets.py)
 │   ├── vocab.txt, dev-v1.1.json
 │   ├── models/bertsquad-12-simplified.onnx
 │   └── preprocessed/{inputs.bin, features.json}
@@ -76,6 +77,8 @@ demo/bert_squad/
   synthesize_conv_kv260`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.
+* Internet access on the first run: the scripts download ~440 MB of
+  assets (see [Assets](#assets)).
 
 ### KV260 board
 
@@ -93,31 +96,52 @@ demo/bert_squad/
 
 ### Assets
 
+The scripts download what is missing on first use (`prepare_inputs.py`: the
+vocabulary and the SQuAD dev set; `generate_project.py` and
+`reference.py`: the model) into `assets/` (not in git), checking each
+file's size and md5.  To fetch them ahead of time or check them:
+
 ```bash
 cd demo/bert_squad
-mkdir -p assets/models
-
-# WordPiece vocabulary of bert-base-uncased (30 522 lines, 231 508 bytes)
-curl -L -o assets/vocab.txt https://huggingface.co/bert-base-uncased/resolve/main/vocab.txt
-
-# SQuAD 1.1 dev set
-curl -L -o assets/dev-v1.1.json https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v1.1.json
-
-# bertsquad-12 from the ONNX model zoo, input shapes pinned to [1, 256]
-curl -L -o assets/models/bertsquad-12.onnx \
-  https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/bert-squad/model/bertsquad-12.onnx
-../../inference-scheduler/.venv/bin/python ../../inference-scheduler/simplify_onnx.py \
-  assets/models/bertsquad-12.onnx -o assets/models/bertsquad-12-simplified.onnx \
-  --input-shape input_ids:0=1,256 --input-shape input_mask:0=1,256 \
-  --input-shape segment_ids:0=1,256 --input-shape unique_ids_raw_output___9:0=1
+../../inference-scheduler/.venv/bin/python scripts/fetch_assets.py            # all three, skips present files
+../../inference-scheduler/.venv/bin/python scripts/fetch_assets.py --verify   # md5 of present files vs the reference
 ```
 
-The download is 435 852 736 bytes; the simplified model (434 997 241
-bytes, md5 `f6818d482d18e703fbd8d7c3b609a98a`) is the file the results
-below were measured with.  Its size and md5 depend on the installed onnx /
-onnxsim versions: a newer onnxsim writes a slightly different file (e.g.
-434 997 888 bytes with onnx 1.23.0 / onnxsim 0.7.3) that gives the same
-results.  Any other location works — set `model` in the config.
+| asset | file | source | size |
+|---|---|---|---|
+| `model` | `assets/models/bertsquad-12-simplified.onnx` | [Google Drive](https://drive.google.com/file/d/1hdlHoD0VaAumbCcbL0y2iOEL9GLdYPY2/view) | 434 997 241 bytes, md5 `f6818d482d18e703fbd8d7c3b609a98a` |
+| `vocab` | `assets/vocab.txt` | bert-base-uncased WordPiece vocabulary ([Hugging Face](https://huggingface.co/bert-base-uncased/resolve/main/vocab.txt)) | 231 508 bytes (30 522 lines) |
+| `squad_dev` | `assets/dev-v1.1.json` | SQuAD 1.1 dev set ([rajpurkar.github.io](https://rajpurkar.github.io/SQuAD-explorer/dataset/dev-v1.1.json)) | 4 854 279 bytes |
+
+- **Downloads.**
+  - An interrupted download resumes from its `.part` file.
+  - A file that fails the size / md5 check is removed.
+  - A file that is already present is kept as it is.
+- **The model** is bertsquad-12 from the ONNX model zoo with its inputs
+  pinned to [1, 256] and simplified.  It is the file every result below was
+  measured with.
+- **Building it yourself.** If the Google Drive copy is unavailable,
+  `scripts/fetch_assets.py model --from-zoo` rebuilds the model from the zoo
+  (it needs onnxsim).  By hand, the same steps are:
+
+  ```bash
+  curl -L -o assets/models/bertsquad-12.onnx \
+    https://github.com/onnx/models/raw/main/validated/text/machine_comprehension/bert-squad/model/bertsquad-12.onnx
+  ../../inference-scheduler/.venv/bin/python ../../inference-scheduler/simplify_onnx.py \
+    assets/models/bertsquad-12.onnx -o assets/models/bertsquad-12-simplified.onnx \
+    --input-shape input_ids:0=1,256 --input-shape input_mask:0=1,256 \
+    --input-shape segment_ids:0=1,256 --input-shape unique_ids_raw_output___9:0=1
+  ```
+
+  The zoo download is 435 852 736 bytes.  The simplified file's size and md5
+  depend on the installed onnx / onnxsim versions.  A newer onnxsim writes a
+  slightly different file (e.g. 434 997 888 bytes with onnx 1.23.0 /
+  onnxsim 0.7.3) that gives the same results.
+- **Another location** works too: set `model` (and `inputs.vocab` /
+  `inputs.squad_dev`) in the config.  The scripts download to those paths
+  when the files are missing.
+- **The scheduler test** `inference-scheduler/test/test_bert_base.py` uses
+  these files and downloads them the same way.
 
 ## Run
 
@@ -127,8 +151,9 @@ cp bert_squad_config.json.example bert_squad_config.json
 $EDITOR bert_squad_config.json          # ssh.*, local.driver_dirs, remote.uio_devices
 
 PY=../../inference-scheduler/.venv/bin/python
-$PY scripts/prepare_inputs.py           # 50 questions -> assets/preprocessed/
-$PY scripts/generate_project.py         # -> build/project/ (~30 s, 3 GB RAM)
+$PY scripts/fetch_assets.py             # optional: the model, vocab and SQuAD dev set (once, ~440 MB)
+$PY scripts/prepare_inputs.py           # 50 questions -> assets/preprocessed/ (fetches vocab / dev set if missing)
+$PY scripts/generate_project.py         # -> build/project/ (~30 s, 3 GB RAM; fetches the model if missing)
 $PY scripts/deploy_and_run.py --n 20 --profile-layers
 $PY scripts/deploy_and_run.py           # all 50, no profiling
 # or: $PY run_demo.py [--regenerate] [deploy_and_run options]
@@ -333,6 +358,12 @@ board logits differ from the simulation, 1 = a step failed.
 
 ## Configuration
 
+* **`model`**, **`inputs.vocab`**, **`inputs.squad_dev`** — the asset
+  paths, relative to `demo/bert_squad/`.
+  - Defaults: `assets/models/bertsquad-12-simplified.onnx`,
+    `assets/vocab.txt` and `assets/dev-v1.1.json`.
+  - A missing file is downloaded to its configured path (see
+    [Assets](#assets)).
 * **`inputs.num_examples`** / **`inputs.selection`** — `first` takes the
   first N dev questions whose question + context fit one 256-token window
   (in dataset order, so N = 50 are all from the first article, "Super Bowl
