@@ -438,7 +438,7 @@ class TestHTTP(SchemaMixin, unittest.TestCase):
         self.assertEqual(obj["usage"]["completion_tokens"], len(tok().encode(self.reply)))
         self.assertEqual(obj["kv260"]["finish"], "eos")
         self.assertNotIn("log", obj["kv260"])
-        self.assertTrue(any("reuse=" in x and "prefill=" in x for x in LOG))
+        self.assertTrue(wait_until(lambda: any("reuse=" in x and "prefill=" in x for x in LOG)))   # the log line follows the response
 
     def test_stream(self):
         st, h, out = self.s.post(self.body(stream=True, stream_options={"include_usage": True}))
@@ -748,7 +748,7 @@ class TestResidency(unittest.TestCase):
             self.assertEqual((st, obj["choices"][0]["message"]["content"]), (200, "Generated."))
             self.assertEqual(self.health(s), {"bert-squad": False, MID: True})
             self.assertEqual((self.bert_eng.opens, self.bert_eng.closes), (1, 1))
-            self.assertTrue(any("load=" in x and MID in x for x in LOG))
+            self.assertTrue(wait_until(lambda: any("load=" in x and MID in x for x in LOG)))   # the log line follows the response
             st, _ = self.ask(s, "bert-squad")
             self.assertEqual(st, 200)
             self.assertEqual(self.health(s), {"bert-squad": True, MID: False})

@@ -518,7 +518,7 @@ class TestDisconnect(unittest.TestCase):
             time.sleep(0.2)
             self.assertEqual(len(fb.runs), 1)               # the queued request never ran
             self.assertEqual(fb.prepared, 2)
-            self.assertTrue(any("[cancelled while queued]" in x for x in LOG))
+            self.assertTrue(wait_until(lambda: any("[cancelled while queued]" in x for x in LOG)))   # the log line follows the response
         finally:
             s.close()
 

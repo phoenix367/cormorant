@@ -10,7 +10,7 @@ import random
 import struct
 import unittest
 
-from _util import DEMO, LOG, RunningServer, sse_events
+from _util import DEMO, LOG, RunningServer, sse_events, wait_until
 
 import squad_text as st
 from bert_squad_backend import USAGE_HINT, BertSquadBackend, split_conversation
@@ -232,7 +232,7 @@ class TestBertBackend(unittest.TestCase):
             self.assertEqual("".join((c["choices"][0]["delta"].get("content") or "")
                                      for c in ev[:-1] if c["choices"]), "Denver Broncos")
             self.assertEqual(ev[-2]["kv260"]["windows"], 1)
-            self.assertTrue(any("model=bert-squad" in x and "windows=1/1" in x for x in LOG))
+            self.assertTrue(wait_until(lambda: any("model=bert-squad" in x and "windows=1/1" in x for x in LOG)))   # the log line follows the response
             st_, _, out = s.request("GET", "/health")
             self.assertEqual(json.loads(out)["models"][0]["windows_run"], 2)
         finally:
