@@ -3,13 +3,14 @@ the KV260 for the chat server (POST /v1/audio/speech; doc/plans/TTS_PLAN.md §5)
 
   host (prepare_speech, outside the FPGA lock)
       text -> espeak-ng phonemes (piper_phonemize.py) -> Piper ids, packed by
-      sentence into utterances of <= 400 ids -> per utterance the float64
-      front end of piper_vits.py (text encoder, stochastic duration
-      predictor, length regulator, noise; erf_fast) -> z_p [192][frames]
-  FPGA (synthesize, under the lock)
-      libpiper_tts.so: the reverse flow + HiFi-GAN decoder in chunks of 128
-      frames (1.49 s of audio, ~1 s each); every chunk's samples go to the
-      client as soon as they exist
+      sentence into utterances of <= 400 ids
+  FPGA + host (synthesize, under the lock)
+      per utterance: the text encoder on the FPGA (tts_encode, TTS_PLAN §6),
+      the stochastic duration predictor in the library's C (tts_duration,
+      §7), the length regulator and the noise in numpy -> z_p
+      [192][frames]; then libpiper_tts.so: the reverse flow + HiFi-GAN
+      decoder in chunks of 128 frames (1.49 s of audio, ~0.7 s each); every
+      chunk's samples go to the client as soon as they exist
 
 The voice directory (--tts-weights) holds the library's weights/*.dat,
 frontend.npz (the text encoder's and duration predictor's weights) and
@@ -60,6 +61,14 @@ class LibTtsEngine:
         for name, (args, res) in sig.items():
             f = getattr(lib, name)
             f.argtypes, f.restype = args, res
+        if hasattr(lib, "tts_encode"):                  # libraries with the FPGA text encoder
+            lib.tts_encode.argtypes = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int, fp, fp, fp]
+            lib.tts_encode.restype = ctypes.c_int
+            lib.tts_max_ids.argtypes, lib.tts_max_ids.restype = [], ctypes.c_int
+        if hasattr(lib, "tts_duration"):                # ... and the C duration predictor
+            dp = ctypes.POINTER(ctypes.c_double)
+            lib.tts_duration.argtypes = [fp, ctypes.c_int, dp, dp]
+            lib.tts_duration.restype = ctypes.c_int
         return lib
 
     def _err(self, what: str, rc: int) -> TtsLibraryError:
@@ -79,6 +88,39 @@ class LibTtsEngine:
         self.channels, self.hop = int(lib.tts_channels()), int(lib.tts_hop())
         self.sample_rate, self.chunk_frames = int(lib.tts_sample_rate()), int(lib.tts_chunk_frames())
         self.buf = (ctypes.c_int16 * (self.chunk_frames * self.hop))()
+        self.max_ids = int(lib.tts_max_ids()) if hasattr(lib, "tts_encode") else 0
+        self.has_duration = hasattr(lib, "tts_duration")
+
+    @property
+    def has_encode(self) -> bool:
+        return self.lib is not None and self.max_ids > 0
+
+    def encode(self, ids):
+        """The text encoder on the FPGA: ids -> (x, m_p, logs_p) [192][n] float64."""
+        import numpy as np
+        n = len(ids)
+        a = np.ascontiguousarray(ids, np.int32)
+        out = np.empty((3, self.channels, n), np.float32)
+        fp = ctypes.POINTER(ctypes.c_float)
+        rc = self.lib.tts_encode(a.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), n,
+                                 out[0].ctypes.data_as(fp), out[1].ctypes.data_as(fp), out[2].ctypes.data_as(fp))
+        if rc < 0:
+            raise self._err("tts_encode", rc)
+        return out[0].astype(np.float64), out[1].astype(np.float64), out[2].astype(np.float64)
+
+    def duration(self, x, z):
+        """The C duration predictor: x [192][n] (float32 values), z [2][n] -> logw [n]."""
+        import numpy as np
+        n = x.shape[1]
+        xa = np.ascontiguousarray(x, np.float32)
+        za = np.ascontiguousarray(z, np.float64)
+        out = np.empty(n, np.float64)
+        dp = ctypes.POINTER(ctypes.c_double)
+        rc = self.lib.tts_duration(xa.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), n, za.ctypes.data_as(dp),
+                                   out.ctypes.data_as(dp))
+        if rc < 0:
+            raise self._err("tts_duration", rc)
+        return out
 
     def close(self) -> None:
         if self.lib is not None:
@@ -105,12 +147,18 @@ class LibTtsEngine:
 
 @dataclass
 class SpeechJob:
-    utterances: List[Any]                      # z_p per utterance, float32 [192][frames]
-    samples: int                               # total, for the Content-Length / WAV header
-    ids: int
-    frontend_ms: float
+    groups: List[List[int]]                    # phoneme ids per utterance
+    speed: float = 1.0
+    seed: int = 0
+    utterances: List[Any] = field(default_factory=list)   # z_p per utterance [192][frames] (synthesize)
+    samples: Optional[int] = None              # total, for the Content-Length / WAV header (synthesize)
+    frontend_ms: float = 0.0
     voice: Optional[str] = None
     info: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ids(self) -> int:
+        return sum(len(g) for g in self.groups)
 
 
 class PiperBackend(Backend):
@@ -119,9 +167,9 @@ class PiperBackend(Backend):
     speech = True
     sample_rate = 22050
 
-    def __init__(self, engine, voice_dir: str, *, cma_mb: float = 40.0, model_id: Optional[str] = None,
+    def __init__(self, engine, voice_dir: str, *, cma_mb: float = 55.0, model_id: Optional[str] = None,
                  espeak_lib: Optional[str] = None, espeak_data: Optional[str] = None,
-                 max_ids: int = MAX_IDS, frontend=None, phonemizer=None):
+                 max_ids: int = MAX_IDS, frontend=None, phonemizer=None, encoder=None, duration=None):
         self.engine = engine
         self.voice_dir = voice_dir
         self.cma_mb = cma_mb
@@ -133,8 +181,10 @@ class PiperBackend(Backend):
                 self.voice = json.load(f)
         self.model_id = model_id or self.voice.get("model", "piper-lessac-medium")
         self.sample_rate = int(self.voice.get("audio", {}).get("sample_rate", 22050))
-        self._frontend = frontend              # tests: a stand-in front_end(ids, ...) -> z_p
+        self._frontend = frontend              # tests: a stand-in front_end(ids, speed, seed) -> z_p
         self._espeak = phonemizer              # tests: a stand-in with clauses(text)
+        self._encoder = encoder                # ids -> (x, m_p, logs_p); default: the library's (FPGA)
+        self._duration = duration              # (x, z) -> logw; default: the library's (C)
         self.W = None
         self.stats = {"requests": 0, "audio_s": 0.0, "chunks": 0, "fpga_s": 0.0, "frontend_s": 0.0}
 
@@ -155,10 +205,14 @@ class PiperBackend(Backend):
             inf = self.voice.get("inference", {})
 
             def fe(ids, speed, seed):
+                enc = self._encoder or (self.engine.encode if getattr(self.engine, "has_encode", False)
+                                        else None)            # None: the numpy text encoder
+                dur = self._duration or (self.engine.duration if getattr(self.engine, "has_duration", False)
+                                         and getattr(self.engine, "lib", None) is not None else None)
                 return piper_vits.front_end(
                     self.W, ids, noise_scale=inf.get("noise_scale", 0.667),
                     length_scale=inf.get("length_scale", 1.0) / speed,
-                    noise_w=inf.get("noise_w", 0.8), seed=seed, fast_erf=True)
+                    noise_w=inf.get("noise_w", 0.8), seed=seed, fast_erf=True, encoder=enc, duration=dur)
             self._frontend = fe
 
     def phoneme_ids(self, text: str) -> List[List[int]]:
@@ -170,19 +224,26 @@ class PiperBackend(Backend):
                            f"to /v1/audio/speech.", "model")
 
     def prepare_speech(self, req: SpeechRequest) -> SpeechJob:
-        import numpy as np
-        t0 = time.monotonic()
         groups = self.phoneme_ids(req.input)
         if not groups:
             raise BackendError("Invalid 'input': nothing to speak (no phonemes).", "input")
         seed = 0 if req.seed is None else req.seed & 0x7FFFFFFFFFFFFFFF
-        zps = [np.ascontiguousarray(self._frontend(ids, req.speed, seed + i), np.float32)
-               for i, ids in enumerate(groups)]
-        frames = sum(z.shape[1] for z in zps)
-        hop = getattr(self.engine, "hop", 0) or HOP
-        return SpeechJob(utterances=zps, samples=frames * hop, ids=sum(len(g) for g in groups),
-                         frontend_ms=(time.monotonic() - t0) * 1000.0, voice=req.voice,
-                         info={"utterances": len(zps), "frames": frames})
+        return SpeechJob(groups=groups, speed=req.speed, seed=seed, voice=req.voice)
+
+    def front_end(self, job: SpeechJob, cancel: Optional[CancelToken] = None) -> None:
+        """z_p of every utterance (the encoder on the FPGA: under the lock),
+        then the job's sample count."""
+        import numpy as np
+        t0 = time.monotonic()
+        job.utterances = []
+        for i, ids in enumerate(job.groups):
+            if cancel is not None:
+                cancel.check()
+            job.utterances.append(np.ascontiguousarray(self._frontend(ids, job.speed, job.seed + i), np.float32))
+        frames = sum(z.shape[1] for z in job.utterances)
+        job.samples = frames * (getattr(self.engine, "hop", 0) or HOP)
+        job.frontend_ms = (time.monotonic() - t0) * 1000.0
+        job.info = {"utterances": len(job.utterances), "frames": frames}
 
     # ── FPGA side ──
 
@@ -199,6 +260,7 @@ class PiperBackend(Backend):
         self.engine.close()
 
     def synthesize(self, job: SpeechJob, cancel: CancelToken) -> Iterator[Union[bytes, Finish]]:
+        self.front_end(job, cancel)                   # before the first piece: the server reads job.samples
         t0 = time.monotonic()
         chunks = 0
         for zp in job.utterances:

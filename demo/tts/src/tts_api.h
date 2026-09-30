@@ -18,6 +18,12 @@
  * piper_vits.py synthesize_chunked is the specification).  A caller streams
  * with tts_synthesize_chunk(k) for k = 0 .. tts_num_chunks(frames) - 1.
  *
+ * The text encoder runs on the FPGA too (tts_encode, TTS_PLAN §6): phoneme
+ * ids -> x, m_p, logs_p [192][n]; the stochastic duration predictor runs in
+ * C on the host (tts_duration, TTS_PLAN §7): x + the noise -> logw.  The
+ * caller keeps the alignment and the noise (piper_vits.front_end with
+ * encoder=... and duration=...).
+ *
  * Every int function returns >= 0 on success, < 0 on error
  * (tts_last_error() says why).  Not thread-safe: one call at a time.
  */
@@ -43,6 +49,20 @@ int         tts_sample_rate(void);       /* 22050 */
 int         tts_hop(void);               /* 256 samples per frame */
 int         tts_chunk_frames(void);      /* 128 frames (32768 samples) per chunk */
 int         tts_num_chunks(int frames);  /* ceil(frames / 128) */
+
+/* The text encoder on n phoneme ids (1 <= n <= tts_max_ids()): x, m_p and
+ * logs_p [192][n] float32, channel-major (any may be NULL).  The ids are
+ * padded to the smallest bucket >= n (the result does not depend on it);
+ * returns that bucket. */
+int         tts_encode(const int32_t *ids, int n, float *x, float *m_p, float *logs_p);
+int         tts_max_ids(void);           /* 400 */
+
+/* The duration predictor on x [192][n] (tts_encode's) and the noise z [2][n]
+ * (standard normal * noise_w): logw [n] (float64; 4 host threads).  Bit for
+ * bit piper_vits.duration_predictor_seq.  < 0 without weights/dp.dat. */
+int         tts_duration(const float *x, int n, const double *z, double *logw);
+int         tts_num_buckets(void);       /* encode_<T> entries ... */
+int         tts_bucket(int i);           /* ... ascending */
 
 /* Chunk k of an utterance of `frames` frames: writes
  * min(128, frames - 128k) * 256 samples to pcm and returns their count. */

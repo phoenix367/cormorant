@@ -35,7 +35,7 @@ KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-09-26 to
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
 | SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md) |
 | SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
-| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.7 s** per 1.49 s of audio (real-time factor 0.52); through the chat server the first sound after 1.8–3.5 s, real-time factor 0.78–0.94 end to end | [TTS_PLAN §4, §5](doc/plans/TTS_PLAN.md) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.7 s** per 1.49 s of audio (real-time factor 0.52), text encoder 68 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md) |
 
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
@@ -90,6 +90,9 @@ program) for Linux with XRT buffers or for bare metal:
 - **Text to speech** — a Piper (VITS) frontend writes the flow and the
   HiFi-GAN decoder as one fixed-size chunk (128 frames, 1.49 s of audio):
   66 ConvKernel convolutions with power-of-two exponents per chunk.
+  - The text encoder runs as length-bucketed entries, with its projections
+    and attention on ConvKernel.
+  - The duration predictor runs as C code in the library.
   - 1-D convolutions are folded into rows.
   - Transposed convolutions run polyphase.
   - Gates, sums, LeakyReLU and masks are host ops.
@@ -157,7 +160,7 @@ TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1602 tests (5 skipped by default)
+.venv/bin/python -m pytest test/ -q              # 1608 tests (5 skipped by default)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 ```
 
@@ -235,7 +238,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1602 tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1608 tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (179 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |

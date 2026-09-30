@@ -9,7 +9,13 @@ of the library, the flow and the HiFi-GAN decoder of one chunk:
   output   pcm [DEC_FRAMES * 256] int16 host (the central OUT_FRAMES * 256
            samples valid)
 
-The computation is demo/tts/scripts/piper_vits.py ``chunk_forward`` (the
+``PiperEncoderFrontend`` builds the text encoder as ``encode_<T>`` entries
+(ids padded to a bucket of T rows, n valid; TTS_PLAN §6): every projection
+and FFN conv a MatMul, the attention's q.K^T / P.V on ConvKernel (the ViT's
+static-key path), the rest host ops (src/tts_nodes.py); the specification is
+piper_vits.py ``encoder_forward``.
+
+The chunk's computation is demo/tts/scripts/piper_vits.py ``chunk_forward`` (the
 specification, bit for bit): every 1-D conv is a ConvKernel call on its
 input folded into rows (TtsPrep writes [C][rows][w0 + halo]: one padded
 output row of out_w * out_ch <= 65 536 accumulators), transposed convs are
@@ -21,6 +27,7 @@ power-of-two exponent, each conv input the searched one ("#in").
 from __future__ import annotations
 
 import json
+import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -41,7 +48,11 @@ RB_DIL = ((1, 2), (2, 6), (3, 12))
 MAX_SPAN = 64                                          # kernels.conv.max_line_buf_cols
 ACC_ENTRIES = 65536                                    # kernels.conv.max_acc_persist_entries
 
+ENC_BUCKETS = (32, 64, 128, 256, 400)                 # encode_<T> entries: ids padded to T rows
+ENC_LAYERS, ENC_D, ENC_H, ENC_HD, ENC_WIN = 6, 192, 2, 96, 4
+
 __all__ = ("load_weights", "polyphase_weight", "fold", "exponent_keys", "PiperChunkFrontend", "entry_info",
+           "encoder_weights", "encoder_exponent_keys", "PiperEncoderFrontend", "ENC_BUCKETS",
            "FLOW_FRAMES", "DEC_FRAMES", "OUT_FRAMES", "DEC_OFF", "HOP")
 
 
@@ -299,3 +310,184 @@ def entry_info(model: onnx.ModelProto) -> Optional[dict]:
         if p.key == "axi.tts.entry":
             return json.loads(p.value)
     return None
+
+
+# ---- the text encoder: encode_<T> entries ------------------------------------ #
+
+def encoder_weights(W: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """The encoder's weights as the library stores them (float32; as
+    piper_vits.encoder_weights): row-layout MatMul weights [in][out], q's
+    weight and bias scaled by 1 / sqrt(96), the kernel-3 convs unrolled
+    tap-major into [3C][O]."""
+    f32 = lambda a: np.asarray(a, np.float32)                   # noqa: E731
+    k3 = lambda w: np.concatenate([w[:, :, t].T for t in range(3)], axis=0)   # noqa: E731
+    sq = 1.0 / math.sqrt(ENC_HD)
+    EW = {"emb": f32(W["emb"]), "wp": f32(W["enc_p.proj.weight"][:, :, 0].T), "bp": f32(W["enc_p.proj.bias"])}
+    for i in range(ENC_LAYERS):
+        p, f = f"enc_p.encoder.attn_layers.{i}", f"enc_p.encoder.ffn_layers.{i}"
+        EW[f"l{i}.wq"] = f32(W[f"{p}.conv_q.weight"][:, :, 0].T * sq)
+        EW[f"l{i}.bq"] = f32(W[f"{p}.conv_q.bias"] * sq)
+        for t in ("k", "v", "o"):
+            EW[f"l{i}.w{t}"] = f32(W[f"{p}.conv_{t}.weight"][:, :, 0].T)
+            EW[f"l{i}.b{t}"] = f32(W[f"{p}.conv_{t}.bias"])
+        EW[f"l{i}.ek"] = f32(W[f"{p}.emb_rel_k"][0])
+        EW[f"l{i}.ev"] = f32(W[f"{p}.emb_rel_v"][0])
+        EW[f"l{i}.w1"], EW[f"l{i}.b1"] = f32(k3(W[f"{f}.conv_1.weight"])), f32(W[f"{f}.conv_1.bias"])
+        EW[f"l{i}.w2"], EW[f"l{i}.b2"] = f32(k3(W[f"{f}.conv_2.weight"])), f32(W[f"{f}.conv_2.bias"])
+        for j in (1, 2):
+            EW[f"l{i}.g{j}"] = f32(W[f"enc_p.encoder.norm_layers_{j}.{i}.gamma"])
+            EW[f"l{i}.be{j}"] = f32(W[f"enc_p.encoder.norm_layers_{j}.{i}.beta"])
+    return EW
+
+
+def encoder_exponent_keys() -> List[str]:
+    """The exponents of the encode entries (piper_study.py encoder writes them
+    under "encoder" in exponents.json)."""
+    keys = ["enc.p", "enc.x0", "enc.st#in", "enc.st"]
+    for i in range(ENC_LAYERS):
+        keys += [f"enc.l{i}.{t}" for t in ("xin", "q0", "k0", "v0", "q", "k", "v", "s", "o", "att", "y",
+                                           "x1", "c1", "f1", "h", "f2", "x2")]
+    return keys
+
+
+class PiperEncoderFrontend:
+    """Builds the ``encode_<T>`` entry: inputs ids [T] (int32, padded) and n
+    [1] (the valid ids); outputs x [T][192] and stats [T][384] (float32 host,
+    rows >= n zero): the text encoder's output and its projection (m_p,
+    logs_p).  ``E``: exponents.json "encoder"."""
+
+    def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper"):
+        missing = [k for k in encoder_exponent_keys() if k not in E]
+        if missing:
+            raise ValueError(f"encoder exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
+        if T % 16:
+            raise ValueError(f"bucket {T}: a multiple of 16 rows")
+        self.EW, self.E, self.T, self.name = encoder_weights(W), {k: int(v) for k, v in E.items()}, int(T), name
+        self.pv_kw = next(k for k in (4, 2, 1) if T % (16 * k) == 0)
+
+    def choose_qk_kw(self) -> int:
+        """The q image's kernel width for q.K^T: the cheapest by the conv cost model."""
+        from .cost_model import conv_cycles
+        best = None
+        for kw in (1, 2, 4):
+            if ENC_HD % (16 * kw):
+                continue
+            for ow in [d for d in range(8, 65) if self.T % d == 0] or [self.T]:
+                cyc = conv_cycles(in_ch=ENC_HD // kw, out_ch=self.T, in_h=self.T // ow, in_w=kw * ow,
+                                  oh=self.T // ow, ow=ow, kh=1, kw=kw, sw=kw)["total"]
+                if best is None or cyc < best[0]:
+                    best = (cyc, kw)
+        return best[1]
+
+    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False):
+        self.vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
+        if exp is not None:
+            self.meta["exp"][name] = int(exp)
+        if host is not None:
+            self.meta["host"][name] = host
+        if state:
+            self.meta["state"].append(name)
+        return name
+
+    def _init(self, name, arr):
+        if name not in self.init_names:
+            self.init_names.add(name)
+            self.inits.append(nph.from_array(np.asarray(arr, np.float32), name))
+        return name
+
+    def _node(self, op, ins, outs, name, domain=LLM_DOMAIN, **attrs):
+        self.nodes.append(oh.make_node(op, ins, outs, name=name, domain=domain, **attrs))
+
+    def _matmul(self, x, wkey, y, cols, exp):
+        wname = self._init(f"w.enc.{wkey}", self.EW[wkey])
+        self._t(y, [self.T, cols], exp=exp)
+        self._node("MatMul", [x, wname], [y], y, domain="")
+        return y
+
+    def _rowprep(self, x, y, cols, exp, taps=1, bias=None, relu=0):
+        self._t(y, [self.T, taps * cols], exp=exp)
+        ins = [x, self.n] + ([self._init(f"v.enc.{bias}", self.EW[bias])] if bias else [])
+        self._node("TtsRowPrep", ins, [y], y, taps=taps, relu=relu)
+        return y
+
+    def entry(self) -> onnx.ModelProto:
+        T, E, EW, D, H, HD, Wn = self.T, self.E, self.EW, ENC_D, ENC_H, ENC_HD, ENC_WIN
+        p = f"enc{T}"
+        self.nodes, self.vi, self.inits, self.init_names = [], {}, [], set()
+        self.meta = numeric.empty()
+        ids = self._t(f"{p}.ids", [T], TensorProto.INT32, host="i32")
+        self.n = self._t(f"{p}.n", [1], TensorProto.INT32, host="i32")
+        self.meta["test_fill"][self.n] = max(1, T - 5)          # the generated test: padding rows too
+        x = self._t(f"{p}.x0", [T, D], exp=E["enc.x0"])
+        self._node("TtsEmbed", [ids, self._init("v.enc.emb", EW["emb"]), self.n], [x], f"{p}.embed",
+                   scale=repr(math.sqrt(D)))
+        kc = self._t(f"{p}.kc", [T, D], exp=0, state=True)
+        vc = self._t(f"{p}.vc", [T, D], exp=0, state=True)
+        self.meta["layout"][kc] = [H, HD]
+        self.meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
+        self._init(kc, np.zeros((T, D), np.float32))
+        self._init(vc, np.zeros((T, D), np.float32))
+        kw = self.choose_qk_kw()
+        common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
+        fp = E["enc.p"]
+        for i in range(ENC_LAYERS):
+            e, te = f"enc.l{i}", f"{p}.l{i}"
+            xin = self._rowprep(x, f"{te}.xin", D, E[f"{e}.xin"])
+            q0 = self._matmul(xin, f"l{i}.wq", f"{te}.q0", D, E[f"{e}.q0"])
+            k0 = self._matmul(xin, f"l{i}.wk", f"{te}.k0", D, E[f"{e}.k0"])
+            v0 = self._matmul(xin, f"l{i}.wv", f"{te}.v0", D, E[f"{e}.v0"])
+            qx = self._t(f"{te}.qx", [H, HD, T], exp=0)
+            bq = self._init(f"v.enc.l{i}.bq", EW[f"l{i}.bq"])
+            self._node("VitAttnPrep", [q0, k0, v0, kc, vc, bq, self._init(f"v.enc.l{i}.bk", EW[f"l{i}.bk"]),
+                                       self._init(f"v.enc.l{i}.bv", EW[f"l{i}.bv"])],
+                       [qx], f"{te}.attn_prep", num_heads=H, head_dim=HD, qk_kw=kw,
+                       q_exp=[E[f"{e}.q"]] * H, k_exp=[E[f"{e}.k"]] * H, v_exp=[E[f"{e}.v"]] * D)
+            ek = self._init(f"v.enc.l{i}.ek", EW[f"l{i}.ek"].reshape(-1))
+            s = [self._t(f"{te}.s{g}", [T, T], exp=0) for g in range(H)]
+            pr = [self._t(f"{te}.p{g}", [T, T], exp=0) for g in range(H)]
+            o = [self._t(f"{te}.o{g}", [T, HD], exp=0) for g in range(H)]
+            for g in range(H):
+                self._node("LlmAttnScores", [kc, qx], [s[g]], f"{te}.qk{g}", group=g, qk_kw=kw, **common)
+            for g in range(H):
+                self._node("TtsAttnSoftmax", [s[g], q0, bq, ek, self.n], [pr[g]], f"{te}.softmax{g}", head=g,
+                           head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]], p_exp=[fp])
+                self._node("LlmAttnPV", [pr[g], vc], [o[g]], f"{te}.pv{g}", group=g, **common)
+            att = self._t(f"{te}.att", [T, D], exp=E[f"{e}.att"])
+            self._node("TtsAttnMerge", o + pr + [self._init(f"v.enc.l{i}.ev", EW[f"l{i}.ev"].reshape(-1)), self.n],
+                       [att], f"{te}.attn_merge", num_heads=H, head_dim=HD, window=Wn,
+                       o_exp=[E[f"{e}.o"]] * H, p_exp=[fp])
+            y = self._matmul(att, f"l{i}.wo", f"{te}.y", D, E[f"{e}.y"])
+            x1 = self._t(f"{te}.x1", [T, D], exp=E[f"{e}.x1"])
+            self._node("TtsResNorm", [x, y, self._init(f"v.enc.l{i}.bo", EW[f"l{i}.bo"]),
+                                      self._init(f"v.enc.l{i}.g1", EW[f"l{i}.g1"]),
+                                      self._init(f"v.enc.l{i}.be1", EW[f"l{i}.be1"]), self.n],
+                       [x1], f"{te}.norm1", eps=repr(1e-5))
+            c1 = self._rowprep(x1, f"{te}.c1", D, E[f"{e}.c1"], taps=3)
+            f1 = self._matmul(c1, f"l{i}.w1", f"{te}.f1", EW[f"l{i}.w1"].shape[1], E[f"{e}.f1"])
+            h = self._rowprep(f1, f"{te}.h", EW[f"l{i}.w1"].shape[1], E[f"{e}.h"], taps=3, bias=f"l{i}.b1",
+                              relu=1)
+            f2 = self._matmul(h, f"l{i}.w2", f"{te}.f2", D, E[f"{e}.f2"])
+            x = self._t(f"{te}.x2", [T, D], exp=E[f"{e}.x2"])
+            self._node("TtsResNorm", [x1, f2, self._init(f"v.enc.l{i}.b2", EW[f"l{i}.b2"]),
+                                      self._init(f"v.enc.l{i}.g2", EW[f"l{i}.g2"]),
+                                      self._init(f"v.enc.l{i}.be2", EW[f"l{i}.be2"]), self.n],
+                       [x], f"{te}.norm2", eps=repr(1e-5))
+        sti = self._rowprep(x, f"{p}.st_in", D, E["enc.st#in"])
+        st = self._matmul(sti, "wp", f"{p}.st", 2 * D, E["enc.st"])
+        xo = self._t(f"{p}.x", [T, D], host="f32")
+        so = self._t(f"{p}.stats", [T, 2 * D], host="f32")
+        self._node("TtsEncOut", [x, self.n], [xo], f"{p}.x_out")
+        self._node("TtsEncOut", [st, self.n, self._init("v.enc.bp", EW["bp"])], [so], f"{p}.stats_out")
+        g = oh.make_graph(self.nodes, f"{self.name}_encode_{T}", [self.vi[ids], self.vi[self.n]],
+                          [self.vi[xo], self.vi[so]], initializer=self.inits,
+                          value_info=[v for k, v in self.vi.items() if k not in (ids, self.n, xo, so)])
+        m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
+                          producer_name="inference-scheduler/src/piper.py")
+        m.ir_version = 8
+        md = m.metadata_props.add()
+        md.key, md.value = numeric.METADATA_KEY, numeric.to_metadata(self.meta)
+        md = m.metadata_props.add()
+        md.key = "axi.tts.entry"
+        md.value = json.dumps({"entry": f"encode_{T}", "model": self.name, "rows": T, "hidden": D,
+                               "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw})
+        return m

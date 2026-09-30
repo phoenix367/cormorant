@@ -12,15 +12,25 @@
  *      repetition is printed as a LAYERS_JSON:chunk line (all its chunks).
  *   3. Re-open (-r): tts_close(), CmaFree, tts_open() again, utterance 0
  *      synthesized again and compared bit for bit.
+ *   4. The text encoder (-e ids.bin): tts_encode() on every id sequence,
+ *      -R repetitions (identical results required), timed; x, m_p, logs_p
+ *      appended to enc.bin (-E) for the host's bit-exact comparison; with
+ *      profiling LAYERS_JSON:encode for sequence 0.  With -d z.bin (per
+ *      sequence the noise [2][n], float64) also tts_duration() on its x,
+ *      timed, logw appended to dur.bin (-D).
  *
  * utts.bin: int32 count, then per utterance int32 frames and 192 x frames
  * float32 (z_p, channel-major).  pcm.bin: the utterances' int16 samples,
  * frames x 256 each, one after the other.
+ * ids.bin: int32 count, then per sequence int32 n and n int32 ids.  enc.bin:
+ * per sequence x, m_p, logs_p, each [192][n] float32.
  * Result lines on stdout: "TTS_OPEN: {...}", "TTS_UTT: {...}" per utterance,
+ * "TTS_ENC: {...}" per id sequence,
  * "TTS_REOPEN: {...}", "TTS_SUMMARY: {...}", and with profiling
  * "PROFILE_PHASE: chunk" + the profiler's "LAYERS_JSON: {...}".
  *
  * usage: tts_bench [-w weights_dir] [-i utts.bin] [-o pcm.bin] [-R 1] [-r]
+ *                  [-e ids.bin] [-E enc.bin] [-d z.bin] [-D dur.bin]
  */
 #define _POSIX_C_SOURCE 200809L   /* clock_gettime, getopt */
 
@@ -86,19 +96,24 @@ static int synth(const float *zp, int frames, int16_t *pcm, double *ms)
 int main(int argc, char **argv)
 {
     const char *wdir = NULL, *in_path = "utts.bin", *out_path = "pcm.bin";
+    const char *ids_path = NULL, *enc_path = "enc.bin", *z_path = NULL, *dur_path = "dur.bin";
     int         reps = 1, reopen = 0, opt, count = 0, u, r, k;
     int        *frames;
     float     **zp;
     FILE       *fi, *fo;
     double      sum_ms = 0.0, sum_audio = 0.0;
 
-    while ((opt = getopt(argc, argv, "w:i:o:R:r")) != -1) {
+    while ((opt = getopt(argc, argv, "w:i:o:R:re:E:d:D:")) != -1) {
         switch (opt) {
         case 'w': wdir = optarg; break;
         case 'i': in_path = optarg; break;
         case 'o': out_path = optarg; break;
         case 'R': reps = atoi(optarg) > 0 ? atoi(optarg) : 1; break;
         case 'r': reopen = 1; break;
+        case 'e': ids_path = optarg; break;
+        case 'E': enc_path = optarg; break;
+        case 'd': z_path = optarg; break;
+        case 'D': dur_path = optarg; break;
         default:
             fprintf(stderr, "usage: %s [-w weights_dir] [-i utts.bin] [-o pcm.bin] [-R 1] [-r]\n",
                     argv[0]);
@@ -208,6 +223,105 @@ int main(int argc, char **argv)
         free(best);
     }
     fclose(fo);
+
+    /* ---- the text encoder ------------------------------------------------ */
+    if (ids_path) {
+        FILE *fe = fopen(ids_path, "rb"), *fx = fopen(enc_path, "wb");
+        FILE *fz = z_path ? fopen(z_path, "rb") : NULL, *fd = z_path ? fopen(dur_path, "wb") : NULL;
+        int   ne = 0, e;
+        if (z_path && (!fz || !fd)) {
+            fprintf(stderr, "error: cannot read %s / write %s\n", z_path, dur_path);
+            return 1;
+        }
+        if (!fe || !fx || fread(&ne, sizeof ne, 1, fe) != 1) {
+            fprintf(stderr, "error: cannot read %s / write %s\n", ids_path, enc_path);
+            return 1;
+        }
+        for (e = 0; e < ne; e++) {
+            int      n = 0, bucket = 0;
+            int32_t *ids;
+            float   *out, *again;
+            double   best = 0.0;
+            int      same = 1;
+            if (fread(&n, sizeof n, 1, fe) != 1 || n < 1) {
+                fprintf(stderr, "error: %s: sequence %d\n", ids_path, e);
+                return 1;
+            }
+            ids = malloc((size_t)n * sizeof(int32_t));
+            out = malloc((size_t)n * 3u * (size_t)tts_channels() * sizeof(float));
+            again = malloc((size_t)n * 3u * (size_t)tts_channels() * sizeof(float));
+            if (fread(ids, sizeof(int32_t), (size_t)n, fe) != (size_t)n) {
+                fprintf(stderr, "error: %s: sequence %d is short\n", ids_path, e);
+                return 1;
+            }
+            for (r = 0; r < reps; r++) {
+                float *o = r ? again : out;
+                const size_t cn = (size_t)n * (size_t)tts_channels();
+                double t0;
+#if INFERENCE_PROFILING
+                if (e == 0 && r == 0) inference_prof_reset();
+#endif
+                t0 = now_ms();
+                bucket = tts_encode(ids, n, o, o + cn, o + 2u * cn);
+                t0 = now_ms() - t0;
+                if (bucket < 0) {
+                    fprintf(stderr, "error: tts_encode: %s\n", tts_last_error());
+                    return 1;
+                }
+#if INFERENCE_PROFILING
+                if (e == 0 && r == 0) {
+                    printf("PROFILE_PHASE: encode\n");
+                    inference_prof_dump_json(stdout);
+                    fflush(stdout);
+                }
+#endif
+                if (r == 0 || t0 < best) best = t0;
+                if (r && memcmp(out, again, 3u * cn * sizeof(float)) != 0) same = 0;
+            }
+            fwrite(out, sizeof(float), (size_t)n * 3u * (size_t)tts_channels(), fx);
+            if (fz) {                                         /* the duration predictor on x */
+                double *zz = malloc((size_t)n * 2u * sizeof(double)), *lw = malloc((size_t)n * sizeof(double));
+                double *lw2 = malloc((size_t)n * sizeof(double)), dbest = 0.0;
+                int     dsame = 1;
+                if (fread(zz, sizeof(double), (size_t)n * 2u, fz) != (size_t)n * 2u) {
+                    fprintf(stderr, "error: %s: sequence %d is short\n", z_path, e);
+                    return 1;
+                }
+                for (r = 0; r < reps; r++) {
+                    double t0 = now_ms();
+                    if (tts_duration(out, n, zz, r ? lw2 : lw) != 0) {
+                        fprintf(stderr, "error: tts_duration: %s\n", tts_last_error());
+                        return 1;
+                    }
+                    t0 = now_ms() - t0;
+                    if (r == 0 || t0 < dbest) dbest = t0;
+                    if (r && memcmp(lw, lw2, (size_t)n * sizeof(double)) != 0) dsame = 0;
+                }
+                fwrite(lw, sizeof(double), (size_t)n, fd);
+                printf("TTS_DUR: {\"i\":%d,\"n\":%d,\"best_ms\":%.2f,\"reps_identical\":%s}\n", e, n, dbest,
+                       dsame ? "true" : "false");
+                fflush(stdout);
+                fprintf(stderr, "tts_bench: duration %d: %d ids in %.1f ms\n", e, n, dbest);
+                free(zz);
+                free(lw);
+                free(lw2);
+            }
+            printf("TTS_ENC: {\"i\":%d,\"n\":%d,\"bucket\":%d,\"best_ms\":%.2f,\"reps\":%d,"
+                   "\"reps_identical\":%s,\"fnv\":%u}\n", e, n, bucket, best, reps, same ? "true" : "false",
+                   fnv1a((const int16_t *)out, (size_t)n * 6u * (size_t)tts_channels()));
+            fflush(stdout);
+            fprintf(stderr, "tts_bench: encode %d: %d ids (bucket %d) in %.1f ms\n", e, n, bucket, best);
+            free(ids);
+            free(out);
+            free(again);
+        }
+        fclose(fe);
+        fclose(fx);
+        if (fz) {
+            fclose(fz);
+            fclose(fd);
+        }
+    }
 
     /* ---- re-open ------------------------------------------------------ */
     if (reopen) {

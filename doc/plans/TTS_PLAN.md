@@ -654,3 +654,259 @@ $PY demo/tts/scripts/tts_speech_check.py                # end to end vs the host
 curl http://192.168.100.8:8000/v1/audio/speech -H 'Content-Type: application/json' \
      -d '{"model": "tts-1", "input": "Hello from the FPGA."}' -o hello.wav
 ```
+
+## 6. The text encoder on the FPGA (2026-09-30)
+
+**Result:** the text encoder now runs on the FPGA, bit-exact with its
+specification on the board.
+- **Speed:** 3.7–4.9× faster than numpy on the A53 (68 ms instead of
+  335 ms for 88 ids, 241 ms instead of 895 ms for 268).
+- **Quality:** it changes 0.35% of the phoneme durations, by one frame at
+  most, and moves the log-mel distance to float from 0.18 to 0.37 dB
+  (another float sample: 2.64 dB).
+- **Through the chat server:** the first sound comes 0.3–1.4 s sooner.
+
+### Numerics
+
+`piper_study.py encoder` calibrates on the 10 calibration sentences and
+measures on the 11 evaluation sentences.
+- **Durations:** compared with the float encoder.
+- **Audio:** measured with the float durations kept, so the waveforms align,
+  against float and against the float-encoder library.
+
+| policy | durations changed | log-mel distance vs float |
+|---|---|---|
+| float encoder (§4: the library before) | — | 0.18 dB |
+| int16, natural exponents, P at 2^-15 | 1.8% (21 / 1138), ≤ 1 frame | 0.69 dB |
+| **int16, searched MatMul-input exponents, P at 2^-15** | **0.35% (4 / 1138), ≤ 1 frame** | **0.37 dB** |
+| same, P at 2^-12 | 0.26% (3 / 1138) | 0.36 dB |
+
+**Why the input search matters.**
+- As in §3, ConvKernel's fixed 8-bit output shift put most encoder weights
+  on coarse grids: 49–436 of the int16 levels, 0.3–6% RMS error.
+- Every MatMul input is now written by a host op at a searched exponent,
+  3–5 bits coarser than natural. The search minimizes the consumers'
+  relative output error on the calibration data, among exponents whose
+  weights still fit int16.
+- The layer input for q / k / v and the projection's input are separate
+  copies, so the residual stream keeps its precision.
+- The encoder's error falls about 4×: x 1.6% → 0.38%, the statistics
+  2.3% → 0.53%.
+
+The softmax exponent makes no difference; 2^-15 is stored
+(`exponents.json` "encoder", 106 exponents). WAVs:
+`study/eval{00,10}_enc_int16_p{15,12}.wav`.
+
+### Implementation
+
+- **Specification** (`piper_vits.py`):
+  - `encoder_weights`: the library's float32 weights in row layout —
+    q's weight and bias scaled by 1/√96, kernel-3 convs unrolled into
+    [3C][O].
+  - `encoder_float`: the calibration pass, with the same structure in
+    float64.
+  - `encoder_exponents`: natural exponents plus the kernel constraints
+    — k at f_s + 8 − f_q and v at f_o + 8 − f_p must fit, else f_s / f_o
+    get coarser — plus the input search.
+  - `encoder_forward`: the bit-level encoder.
+  - `library_encoder`: the front end's `encoder=` hook.
+- **Entries** (`src/piper.py` `PiperEncoderFrontend`): `encode_<T>` for
+  T ∈ {32, 64, 128, 256, 400}.
+  - **Inputs:** ids padded to T, and n.
+  - **Outputs:** x [T][192] and stats [T][384], float32 host.
+  - **Padding:** rows and keys ≥ n are zeros that never reach a row < n,
+    so the result does not depend on the bucket (tested for every bucket
+    and length).
+  - **Per layer:**
+    - q / k / v projection;
+    - attention: `VitAttnPrep`, q·Kᵀ and P·V on ConvKernel (the ViT's
+      static-key calls), softmax, merge;
+    - output projection, residual + LayerNorm, the feed-forward block
+      (prep, MatMul, prep with bias + ReLU, MatMul), residual + LayerNorm;
+    - then the stats projection.
+  - **Graph:** 119 nodes per bucket — 37 MatMuls and 24 attention calls on
+    ConvKernel, 58 host ops.
+- **New host ops** (`src/tts_nodes.py`): `TtsEmbed`, `TtsRowPrep` (taps 1:
+  a copy at another exponent; taps 3: the unrolled kernel-3 input, with
+  bias + ReLU), `TtsAttnSoftmax` (the relative keys, window 4, recomputed
+  from q as the prep writes it; the padding mask), `TtsAttnMerge` (the
+  relative values), `TtsResNorm`, `TtsEncOut`.
+  - All compute in double with left-to-right sums and libm exp, as the
+    specification does.
+- **One weight copy:**
+  - A MatMul weight on ConvKernel lives in the convolution-input image of a
+    kernel width, and each bucket planned its own width at first: 50.6 MB
+    of weights.
+  - The 400 bucket now plans the widths and the others reuse them
+    (`matmul_conv_kw`, as the Llama prefill buckets do).
+  - Weights: 30.7 MB (chunk 18.2 + encoder 12.5); pool 35.5 → 48.1 MiB.
+    The chat server's budget for Piper is 55 MB.
+- **Library:** `tts_encode(ids, n, x, m_p, logs_p)` returns [192][n]
+  channel-major arrays and picks the smallest bucket ≥ n. The generated
+  `test/tts_glue.h` holds the bucket table.
+  `tts_bench -e ids.bin` times it and writes the outputs for the check.
+
+### Gates
+
+| gate | result |
+|---|---|
+| `test_piper.py` (random weights at Piper's shapes): simulation == `encoder_forward` for buckets 32 / 64 and lengths 1, 17, T − 5, T; the generated C == the simulation (host emulation) | pass |
+| `tts_host_emu.py`: tts_encode on the real voice, 6 cases over all 5 buckets (20 … 400 ids) | bit-exact |
+| `tts_host_emu.py --lib-check`: the server's backend through ctypes, its z_p == the front end on the spec encoder | bit-exact |
+| **board** (`tts_board.py`, bitstream `caa67f49a5a3`): the same 6 cases, 3 repetitions, close / re-open | **bit-exact**; the chunk still bit-exact |
+
+Board, ms per `tts_encode`:
+
+| ids (bucket) | 20 (32) | 60 (64) | 88 (128) | 162 (256) | 268 (400) | 400 (400) |
+|---|---|---|---|---|---|---|
+| FPGA encoder | 25.6 | 37.7 | 68.1 | 142.4 | 241.4 | 262.5 |
+| numpy encoder (float64, A53) | | | 335 | | 895 | |
+
+Profile of the 268-id call (bucket 400):
+
+| part | ms |
+|---|---|
+| ConvKernel (the model predicted ~124) | 132 |
+| TtsRowPrep | 56 |
+| TtsAttnSoftmax | 48 |
+| TtsAttnMerge | 23 |
+| TtsResNorm | 18 |
+| VitAttnPrep | 5.5 |
+| TtsEncOut + TtsEmbed | 5 |
+
+### In the chat server
+
+- **Where the front end runs:** `prepare_speech` now only phonemizes. The
+  encoder needs the FPGA, so the front end (tts_encode, then the numpy
+  duration predictor and noise) runs in `synthesize()` under the lock.
+- **Content-Length still exact:** the job's sample count is set before the
+  first piece, which is when the server reads it.
+- **Older libraries:** one without `tts_encode` falls back to the numpy
+  encoder.
+- **GELU:** the duration predictor's GELU uses in-place ufuncs in the same
+  order (bit-identical): 14.3 → 9.5 ms per call on the A53.
+
+`tts_speech_check.py` (the host's twin uses `encoder_forward`), bit-exact
+with the host pipeline:
+
+| audio | first sound, before → now | RTF end to end, before → now |
+|---|---|---|
+| 3.37 s | 1.76 → 1.43 s | 0.94 → 0.84 |
+| 5.89 s | 2.45 → 1.29 s | 0.79 → 0.63 |
+| 12.49 s (2 utterances) | 3.45 → 2.06 s | 0.78 → 0.68 |
+
+### Levers left
+
+- **The duration predictor** is now the largest front-end cost: ~420 ms
+  for 268 ids in numpy, mostly GELU and LayerNorm.
+  - C code for those ops is an estimated ~20 ms.
+  - Its 1×1 convs on the FPGA would need their own numerics check (the
+    durations are sampled).
+- **Finer buckets:** 268 ids pay for 400 rows; the kernel work scales with
+  the bucket.
+- **The encoder's host ops** (150 ms at 268 ids): the chunk ops' A53 tuning
+  (§4) has not been applied to them yet.
+
+### Commands
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+$PY demo/tts/scripts/piper_study.py encoder             # calibrate + measure, 3 min (-> exponents.json "encoder")
+$PY demo/tts/scripts/generate_tts_project.py            # chunk + encode_<T> entries, 10 s
+$PY demo/tts/scripts/tts_host_emu.py                    # chunk + encoder vs the spec on the host
+$PY demo/tts/scripts/tts_host_emu.py --lib-check        # the server's backend (tts_encode + chunks)
+$PY demo/chat/deploy.py --stop && $PY demo/tts/scripts/tts_board.py --profile --reopen && $PY demo/chat/deploy.py
+$PY demo/tts/scripts/tts_speech_check.py                # end to end vs the host
+```
+
+## 7. The duration predictor in C (2026-09-30)
+
+**Result:** the stochastic duration predictor runs as C code in
+`libpiper_tts.so` (`tts_duration`, float64, 4 host threads). It is 3×
+faster than numpy on the A53 (139 ms instead of ~420 ms for 268 ids), and
+bit-exact with its specification on the board. The durations are unchanged,
+since it is the same float64 model. First sound through the chat server now
+comes after 1.0–1.5 s.
+
+### Why C, not the FPGA
+
+After the encoder moved (§6), numpy's duration predictor took ~420 ms per
+268 ids:
+
+| part | ms |
+|---|---|
+| GELU (erf_fast) | ~230 |
+| LayerNorm | ~67 |
+| depthwise convs | ~47 |
+| fourteen 1×1 192→192 convs (OpenBLAS) | ~36 |
+| splines | ~9 |
+
+- **Mostly element-wise work:** in numpy every op allocates and makes
+  another pass over memory.
+- **The FPGA would take only the 1×1 convs**, and would put int16 into the
+  sampled durations, which would need its own numerics check.
+
+### Specification and C
+
+- **`piper_vits.duration_predictor_seq`:** `duration_predictor(fast=True)`
+  with every sum left to right (the 1×1 convs, LayerNorm, the spline's
+  softmax) and exp / log1p from libm.
+  - LayerNorm multiplies by 1/σ, and GELU's erf takes x · (1/√2): a multiply
+    instead of a divide per element, since the A53 divides slowly.
+  - It equals the float predictor within 1e-14 on the voice, with identical
+    durations.
+- **`demo/tts/src/tts_dp.c`** computes the same thing: every operand order
+  mirrors the spec, and it is built with `-ffp-contract=off`.
+  - **Time-major rows:** every stage is independent per step, except the
+    depthwise conv (its input's neighbours).
+  - **Threads:** each stage runs over row ranges on 4 threads, joined before
+    the next.
+  - **The 1×1 kernel** handles 2 rows × 4 outputs at once: 8 independent
+    sums, and each weight load serves 2 rows. The first kernel (1 row × 4
+    outputs) ran at 4.2 cycles per multiply-add on the in-order A53.
+  - **Timing, 268 ids, on the A53:** 713 ms on 1 thread with the first
+    kernel, then 481 ms (1 thread) and **140 ms (4 threads)** with the
+    blocked kernel and no per-element divides.
+- **Weights:** `weights/dp.dat` holds 555 163 float32 values in the order of
+  `dp_tensors()`, written by `generate_tts_project.py`. `tts_open` loads it
+  when present.
+
+### Gates
+
+| gate | result |
+|---|---|
+| `test_piper.py`: the C (`tts_dp.c` + a driver) against the spec, random weights, n = 1 / 7 / 61, 1 and 4 threads; the spec against the float predictor | bit-exact; spec ≈ float |
+| `tts_host_emu.py`: `tts_duration` on the 6 encoder cases (20 … 400 ids), after `tts_encode` | bit-exact |
+| `tts_host_emu.py --lib-check`: the server's backend, z_p == the front end on the spec encoder + spec duration predictor | bit-exact |
+| **board** (`tts_board.py`) | **bit-exact**; the chunk and the encoder too |
+
+Board, ms per `tts_duration`:
+
+| ids | 20 | 60 | 88 | 162 | 268 | 400 |
+|---|---|---|---|---|---|---|
+| C, 4 threads | 18.2 | 35.9 | 49.2 | 87.3 | 139.0 | 202.7 |
+
+### In the chat server
+
+`front_end(duration=...)` draws the noise where the numpy predictor drew it,
+then the backend calls `tts_duration`. The host's twin in
+`tts_speech_check.py` uses `duration_predictor_seq`, and stays bit-exact
+with the board.
+
+| audio | first sound: §5 → §6 → now | RTF end to end: §5 → §6 → now |
+|---|---|---|
+| 3.37 s | 1.76 → 1.43 → **1.27 s** | 0.94 → 0.84 → **0.79** |
+| 5.89 s | 2.45 → 1.29 → **1.03 s** | 0.79 → 0.63 → **0.58** |
+| 12.49 s | 3.45 → 2.06 → **1.54 s** | 0.78 → 0.68 → **0.64** |
+
+What remains before the first sound, for a 268-id sentence:
+
+| step | ms |
+|---|---|
+| the encoder | 240 |
+| the duration predictor | 139 |
+| alignment + noise (numpy) | ~30 |
+| the first chunk | ~700 |
+
+The first chunk is the main lever: a shorter first chunk, or larger chunks
+with less overlap afterwards (§4).

@@ -15,8 +15,10 @@ real-time factor, tts_open time, CMA and the close / re-open cycle.
   install <remote dir>/lib/libpiper_tts.so (remote dir: the chat install
           directory, demo/chat/chat_config.json remote.dir)
   run     tts_bench on utts.bin (z_p of the study's sentences from
-          piper_vits.front_end, seeded by name); pcm.bin downloaded
-  check   every sample against the specification; WAVs next to the project
+          piper_vits.front_end, seeded by name) and ids.bin (the encoder
+          cases: every encode bucket); pcm.bin and enc.bin downloaded
+  check   every sample against the specification (chunk_forward), every
+          encoder output against encoder_forward; WAVs next to the project
 
 The board lock is held for the whole session.  Stop the chat server first
 (demo/chat/deploy.py --stop) — it owns the FPGA.
@@ -102,6 +104,72 @@ def reference(project: str, W, E, zps: dict) -> dict:
     return out
 
 
+def encoder_cases(assets: str) -> dict:
+    """{name: phoneme ids} over every encode bucket (32 .. 400): prefixes and
+    concatenations of the study's sentences."""
+    t = {k: v["ids"] for k, v in json.load(open(os.path.join(assets, "texts.json"))).items()}
+    both = t["eval00"] + t["eval02"]
+    long = (t["eval10"] + t["eval00"] + t["eval01"])[:400]
+    return {"eval10": t["eval10"], "ids20": t["eval00"][:20], "ids60": t["eval00"][:60],
+            "eval00": t["eval00"], "ids162": both, "ids400": long}
+
+
+def write_ids(path: str, seqs: dict) -> None:
+    with open(path, "wb") as f:
+        f.write(struct.pack("<i", len(seqs)))
+        for ids in seqs.values():
+            f.write(struct.pack("<i", len(ids)))
+            f.write(np.asarray(ids, "<i4").tobytes())
+
+
+def dp_noise(seqs: dict) -> dict:
+    """{name: z [2][n]}: the duration predictor's noise per encoder case
+    (standard normal * 0.8, seeded by the name)."""
+    return {k: np.random.default_rng(zlib.crc32(k.encode())).standard_normal((2, len(ids))) * 0.8
+            for k, ids in seqs.items()}
+
+
+def write_noise(path: str, zs: dict) -> None:
+    with open(path, "wb") as f:
+        for z in zs.values():
+            f.write(np.ascontiguousarray(z, "<f8").tobytes())
+
+
+def check_dur(dur_path: str, seqs: dict, zs: dict, W, E_enc) -> dict:
+    """tts_duration's logw (dur.bin) against piper_vits.duration_predictor_seq on
+    the spec encoder's x."""
+    EW = pv.encoder_weights(W)
+    raw = np.fromfile(dur_path, "<f8")
+    rep, k = {}, 0
+    for name, ids in seqs.items():
+        n = len(ids)
+        got = raw[k:k + n]
+        k += n
+        x, _ = pv.encoder_forward(EW, E_enc, ids)
+        want = pv.duration_predictor_seq(W, x.T, zs[name])
+        bad = int((got.view(np.uint64) != want.view(np.uint64)).sum())
+        rep[name] = {"ids": n, "mismatches": bad}
+        print(f"  [duration {name}] {n} ids: " + ("bit-exact" if not bad else f"{bad} values differ"), flush=True)
+    return rep
+
+
+def check_enc(enc_path: str, seqs: dict, W, E_enc) -> dict:
+    """tts_encode's x, m_p, logs_p (enc.bin) against piper_vits.encoder_forward."""
+    EW = pv.encoder_weights(W)
+    raw = np.fromfile(enc_path, "<f4")
+    rep, k = {}, 0
+    for name, ids in seqs.items():
+        n = len(ids)
+        got = raw[k:k + 3 * 192 * n].reshape(3, 192, n)
+        k += 3 * 192 * n
+        x, st = pv.encoder_forward(EW, E_enc, ids)
+        want = np.stack([x.T, st[:, :192].T, st[:, 192:].T])
+        bad = int((got.view(np.uint32) != want.astype(np.float32).view(np.uint32)).sum())
+        rep[name] = {"ids": n, "mismatches": bad}
+        print(f"  [encode {name}] {n} ids: " + ("bit-exact" if not bad else f"{bad} values differ"), flush=True)
+    return rep
+
+
 def write_wav(path: str, pcm: np.ndarray) -> None:
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
@@ -135,14 +203,18 @@ def check_pcm(pcm_path: str, zps: dict, refs: dict, wav_dir: str = None, tag: st
 
 
 def parse(out: str) -> dict:
-    res = {"utts": [], "profiles": {}}
+    res = {"utts": [], "encs": [], "profiles": {}}
     phase = None
     for line in out.splitlines():
-        for key in ("TTS_OPEN", "TTS_UTT", "TTS_REOPEN", "TTS_SUMMARY"):
+        for key in ("TTS_OPEN", "TTS_UTT", "TTS_ENC", "TTS_DUR", "TTS_REOPEN", "TTS_SUMMARY"):
             if line.startswith(key + ":"):
                 d = json.loads(line[len(key) + 1:])
                 if key == "TTS_UTT":
                     res["utts"].append(d)
+                elif key == "TTS_ENC":
+                    res["encs"].append(d)
+                elif key == "TTS_DUR":
+                    res.setdefault("durs", []).append(d)
                 else:
                     res[key.lower()] = d
         if line.startswith("PROFILE_PHASE:"):
@@ -217,10 +289,15 @@ def main(argv=None) -> int:
     layers = json.load(open(os.path.join(project, "layers.json")))
     names = [n for n in args.utts.split(",") if n]
     zps = refs = None
+    seqs = {}
     if not args.install_only:
         summary, W, E = load(project)
         zps = utterances(W, summary["assets"], names)
         write_utts(os.path.join(project, "utts.bin"), zps)
+        seqs = encoder_cases(summary["assets"])
+        write_ids(os.path.join(project, "ids.bin"), seqs)
+        zs = dp_noise(seqs)
+        write_noise(os.path.join(project, "dpz.bin"), zs)
         if not args.no_check:
             refs = reference(project, W, E, zps)
     remote_dir = args.remote_dir or llm_board.chat_remote_dir()
@@ -257,11 +334,14 @@ def main(argv=None) -> int:
             sftp = session._client.open_sftp()                   # noqa: SLF001
             session.exec_checked(f"mkdir -p {RUN_DIR}", timeout=15)
             sftp.put(os.path.join(project, "utts.bin"), f"{RUN_DIR}/utts.bin")
+            sftp.put(os.path.join(project, "ids.bin"), f"{RUN_DIR}/ids.bin")
+            sftp.put(os.path.join(project, "dpz.bin"), f"{RUN_DIR}/dpz.bin")
             runs = [("build", "main", args.reps, args.reopen)] + (
                 [("build_prof", "prof", 1, False)] if args.profile else [])
             for bdir, tag, reps, reopen in runs:
                 cmd = (f"cd {RUN_DIR} && {remote_proj}/{bdir}/tts_bench -i utts.bin -o pcm_{tag}.bin "
-                       f"-R {reps} {'-r' if reopen else ''}")
+                       f"-R {reps} {'-r' if reopen else ''} -e ids.bin -E enc_{tag}.bin "
+                       f"-d dpz.bin -D dur_{tag}.bin")
                 t0 = time.monotonic()
                 out, err, rc = _stream_exec(session, cmd, timeout=3600,
                                             on_stderr_line=lambda ln: print("    " + ln, flush=True))
@@ -271,11 +351,13 @@ def main(argv=None) -> int:
                     return 1
                 res = parse(out)
                 sftp.get(f"{RUN_DIR}/pcm_{tag}.bin", os.path.join(project, f"pcm_board_{tag}.bin"))
+                sftp.get(f"{RUN_DIR}/enc_{tag}.bin", os.path.join(project, f"enc_board_{tag}.bin"))
+                sftp.get(f"{RUN_DIR}/dur_{tag}.bin", os.path.join(project, f"dur_board_{tag}.bin"))
                 if tag == "main":
                     results["bench"] = res
                 else:
                     chunks = res["utts"][0]["chunks"]
-                    results["profile"] = {ph: breakdown(p, layers, per=chunks)
+                    results["profile"] = {ph: breakdown(p, layers, per=chunks if ph == "chunk" else 1)
                                           for ph, p in res["profiles"].items()}
                     results["profile_layers"] = {
                         ph: [{k: ly[k] for k in ("i", "name", "calls", "mean_us", "min_us", "total_us")
@@ -295,14 +377,26 @@ def main(argv=None) -> int:
               f"repetitions identical {u['reps_identical']}")
     if "tts_reopen" in bench:
         print(f"re-open: {bench['tts_reopen']}")
-    for bd in results.get("profile", {}).values():
-        print("profile ms per chunk: " + ", ".join(f"{k} {v:.2f}" for k, v in bd.items()))
+    for e in bench.get("encs", []):
+        print(f"encode {e['i']}: {e['n']} ids (bucket {e['bucket']}) in {e['best_ms']:.1f} ms; "
+              f"repetitions identical {e['reps_identical']}")
+    for e in bench.get("durs", []):
+        print(f"duration {e['i']}: {e['n']} ids in {e['best_ms']:.1f} ms; repetitions identical {e['reps_identical']}")
+    for ph, bd in results.get("profile", {}).items():
+        print(f"profile ms per {'chunk' if ph == 'chunk' else ph + ' call'}: "
+              + ", ".join(f"{k} {v:.2f}" for k, v in bd.items()))
     ok = all(u["reps_identical"] for u in bench["utts"]) and \
+        all(e["reps_identical"] for e in bench.get("encs", []) + bench.get("durs", [])) and \
         bench.get("tts_reopen", {}).get("identical", True)
     if not args.no_check:
         results["check"] = check_pcm(os.path.join(project, "pcm_board_main.bin"), zps, refs,
                                      os.path.join(project, "wav"), "_board")
-        ok = ok and all(r.get("mismatches", 1) == 0 for r in results["check"].values())
+        E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
+        results["check_encoder"] = check_enc(os.path.join(project, "enc_board_main.bin"), seqs, W, E_enc)
+        results["check_duration"] = check_dur(os.path.join(project, "dur_board_main.bin"), seqs, zs, W, E_enc)
+        ok = ok and all(r.get("mismatches", 1) == 0 for r in results["check"].values()) and \
+            all(r["mismatches"] == 0 for r in results["check_encoder"].values()) and \
+            all(r["mismatches"] == 0 for r in results["check_duration"].values())
     if args.out:
         with open(args.out, "w") as f:
             json.dump(results, f, indent=1)

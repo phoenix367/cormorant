@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1602 tests; test_bert_base.py is opt-in)
+# Run the full test suite (1608 tests; test_bert_base.py is opt-in)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -904,8 +904,25 @@ fixed-size `chunk` entry (TTS_PLAN §4).
   specification `demo/tts/scripts/piper_vits.py` (`chunk_forward`),
   stitching, the node census and kernel bounds, and the generated C on the
   host emulation.
-- **The library** `libpiper_tts.so` (`demo/tts/`) drives the entry chunk
-  by chunk for the chat server's `/v1/audio/speech`.
+- **The text encoder:** `PiperEncoderFrontend` builds `encode_<T>`
+  entries (TTS_PLAN §6).
+  - **Buckets:** ids are padded to T ∈ {32, 64, 128, 256, 400}, with n
+    valid; padding rows and keys never reach a valid row.
+  - **Kernel work:** every projection and the FFN's kernel-3 convs
+    (unrolled by `TtsRowPrep`) are MatMuls with power-of-two exponents,
+    and each MatMul input is written at a searched exponent.
+  - **Attention:** q·Kᵀ and P·V use the ViT's static-key ConvKernel calls
+    (`VitAttnPrep`, `LlmAttnScores`, `LlmAttnPV`).
+  - **Host ops:** `TtsAttnSoftmax` adds the relative-position keys and masks
+    the padding; `TtsAttnMerge` adds the relative-position values; also
+    `TtsResNorm`, `TtsEmbed`, `TtsEncOut`.
+  - **One weight copy:** the largest bucket plans the MatMul kernel widths
+    and the others pin them (`matmul_conv_kw`).
+- **Tests:** `test/test_piper.py` also checks the encode entries against
+  `encoder_forward` for several buckets and lengths.
+- **The library** `libpiper_tts.so` (`demo/tts/`) drives the chunk entry
+  chunk by chunk and the encode entries per utterance (`tts_encode`) for
+  the chat server's `/v1/audio/speech`.
 
 ### Multi-entry projects
 

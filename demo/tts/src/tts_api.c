@@ -19,6 +19,12 @@
 
 #include "tts_api.h"
 #include "inference.h"
+#include "tts_dp.h"
+#include "tts_glue.h"
+
+#ifndef TTS_DP_THREADS
+#  define TTS_DP_THREADS 4
+#endif
 
 #ifndef TTS_API_WEIGHTS_DIR
 #  define TTS_API_WEIGHTS_DIR "."
@@ -45,6 +51,10 @@ static int     s_open;
 static char    s_err[512];
 static float   s_zp[TTS_CH * TTS_FLOW_FRAMES];
 static int16_t s_pcm[INFERENCE_PCM_SIZE];
+static int32_t s_ids[TTS_MAX_IDS];
+static int32_t s_n[1];
+static float   s_ex[TTS_MAX_IDS * TTS_CH];                   /* x [T][192] */
+static float   s_es[TTS_MAX_IDS * 2 * TTS_CH];               /* stats [T][384] */
 
 static void set_err(const char *fmt, ...)
 {
@@ -90,6 +100,8 @@ int tts_open(const char *weights_dir)
         }
     }
     rc = inference_init(INFERENCE_CONVKERNEL_INSTANCE);
+    if (rc == 0)                          /* the duration predictor's weights (optional) */
+        (void)tts_dp_load(TTS_API_WEIGHTS_DIR "/weights/dp.dat", TTS_DP_FLOATS);
     if (cwd >= 0) {
         if (fchdir(cwd) != 0)
             fprintf(stderr, "tts_api: warning: cannot restore the working directory: %s\n",
@@ -111,6 +123,7 @@ void tts_close(void)
     if (!s_open)
         return;
     inference_deinit();
+    tts_dp_free();
     s_open = 0;
 }
 
@@ -121,6 +134,60 @@ int         tts_hop(void)         { return TTS_HOP; }
 int         tts_chunk_frames(void){ return TTS_OUT_FRAMES; }
 const char *tts_model_name(void)  { return TTS_MODEL_NAME; }
 const char *tts_weights_dir(void) { return TTS_API_WEIGHTS_DIR; }
+
+int tts_max_ids(void)            { return TTS_MAX_IDS; }
+int tts_num_buckets(void)        { return TTS_N_BUCKETS; }
+int tts_bucket(int i)            { return i >= 0 && i < TTS_N_BUCKETS ? tts_buckets[i] : -1; }
+
+int tts_encode(const int32_t *ids, int n, float *x, float *m_p, float *logs_p)
+{
+    int b, t, c;
+    if (!s_open) {
+        set_err("tts_open() first");
+        return -1;
+    }
+    if (!ids || n < 1 || n > TTS_MAX_IDS) {
+        set_err("tts_encode: %d ids (1 .. %d)", n, TTS_MAX_IDS);
+        return -2;
+    }
+    for (b = 0; b < TTS_N_BUCKETS - 1 && tts_buckets[b] < n; b++)
+        ;
+    memset(s_ids, 0, (size_t)tts_buckets[b] * sizeof(int32_t));
+    memcpy(s_ids, ids, (size_t)n * sizeof(int32_t));
+    s_n[0] = n;
+    tts_glue_encode(b, s_ids, s_n, s_ex, s_es);
+    for (t = 0; t < n; t++)
+        for (c = 0; c < TTS_CH; c++) {
+            if (x)
+                x[(size_t)c * (size_t)n + (size_t)t] = s_ex[(size_t)t * TTS_CH + (size_t)c];
+            if (m_p)
+                m_p[(size_t)c * (size_t)n + (size_t)t] = s_es[(size_t)t * 2 * TTS_CH + (size_t)c];
+            if (logs_p)
+                logs_p[(size_t)c * (size_t)n + (size_t)t] = s_es[(size_t)t * 2 * TTS_CH + TTS_CH + (size_t)c];
+        }
+    return tts_buckets[b];
+}
+
+int tts_duration(const float *x, int n, const double *z, double *logw)
+{
+    int rc;
+    if (!s_open) {
+        set_err("tts_open() first");
+        return -1;
+    }
+    if (!tts_dp_loaded()) {
+        set_err("the duration predictor's weights (weights/dp.dat, %d floats) are missing", TTS_DP_FLOATS);
+        return -3;
+    }
+    if (!x || !z || !logw || n < 1) {
+        set_err("tts_duration: bad arguments (n %d)", n);
+        return -2;
+    }
+    rc = tts_dp_run(x, n, z, logw, TTS_DP_THREADS);
+    if (rc != 0)
+        set_err("tts_duration failed (%d)", rc);
+    return rc;
+}
 
 int tts_num_chunks(int frames)
 {

@@ -9,10 +9,11 @@ bit with the specification (piper_vits.synthesize_chunked) — the board gate
 without the board.
 
 With --lib-check, libpiper_tts.so is built the same way and driven by the chat
-server's backend (demo/chat/piper_backend.py: LibTtsEngine through ctypes,
-the espeak-ng phonemizer of the host, the front end from weights/frontend.npz)
-for a few sentences; the samples it yields must equal the specification on
-the z_p the backend computed.
+server's backend (demo/chat/piper_backend.py: LibTtsEngine through ctypes —
+tts_encode and the chunks —, the espeak-ng phonemizer of the host, the rest
+of the front end from weights/frontend.npz) for a few sentences: its z_p
+must equal the front end on the spec encoder (encoder_forward), its samples
+the specification on that z_p.
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/tts_host_emu.py
            [--project demo/tts/build/piper_project] [--utts eval00,eval10] [--incoherent]
@@ -60,7 +61,7 @@ def build(project: str, work: str, incoherent: bool = False, shared: bool = Fals
            f'-DTTS_API_WEIGHTS_DIR="{project}"', '-DTTS_MODEL_NAME="piper-lessac-medium"',
            "-I", os.path.join(project, "include"), "-I", os.path.join(project, "test"), "-I", emu,
            os.path.join(project, "src", "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
-           os.path.join(project, "test", "tts_api.c"),
+           os.path.join(project, "test", "tts_api.c"), os.path.join(project, "test", "tts_dp.c"),
            *(["-shared", "-fPIC"] if shared else [os.path.join(project, "test", "tts_bench.c")]),
            "-lm", "-o", exe]
     t0 = time.time()
@@ -86,19 +87,30 @@ def lib_check(project: str, work: str, texts) -> bool:
     b.load_host()
     b.load()
     summary, W, E = tb.load(project)
-    ok = True
+    enc = tb.pv.library_encoder(tb.pv.encoder_weights(W),
+                                json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"])
+    ok = b.engine.has_encode and b.engine.has_duration
+    print(f"  the library's text encoder (tts_encode): {'yes' if b.engine.has_encode else 'MISSING'}, "
+          f"duration predictor (tts_duration): {'yes' if b.engine.has_duration else 'MISSING'}")
     try:
         for i, text in enumerate(texts):
             job = b.prepare_speech(SpeechRequest(model=b.model_id, input=text, seed=i))
             t0 = time.time()
             out = list(b.synthesize(job, CancelToken()))
+            # the backend's z_p (tts_encode through ctypes) == the front end on the spec encoder
+            zref = [tb.pv.front_end(b.W, ids, seed=job.seed + j, fast_erf=True, encoder=enc,
+                                    duration=lambda x, z: tb.pv.duration_predictor_seq(W, x, z))
+                    for j, ids in enumerate(job.groups)]
+            zsame = all(a.shape == r.shape and np.array_equal(a, r) for a, r in zip(job.utterances, zref, strict=True))
+            ok &= zsame
             got = np.frombuffer(b"".join(out[:-1]), "<i2")
             want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp) for zp in job.utterances])
             same = got.shape == want.shape and np.array_equal(got, want)
             ok &= same
             print(f"  [{text[:40]}...] {len(job.utterances)} utterance(s), {job.samples} samples, "
-                  f"front end {job.frontend_ms:.0f} ms, library {time.time() - t0:.1f} s: "
-                  + ("bit-exact" if same else "MISMATCH"), flush=True)
+                  f"front end {job.frontend_ms:.0f} ms, library {time.time() - t0:.1f} s: z_p "
+                  + ("bit-exact" if zsame else "MISMATCH") + ", samples " + ("bit-exact" if same else "MISMATCH"),
+                  flush=True)
             tb.write_wav(os.path.join(work, f"lib_check_{i}.wav"), got)
     finally:
         b.close()
@@ -143,6 +155,26 @@ def main(argv=None) -> int:
     rep = tb.check_pcm(pcm, zps, refs)
     ok = all(v.get("mismatches", 1) == 0 for v in rep.values()) and \
         res.get("tts_reopen", {}).get("identical", False)
+    # the text encoder: every bucket
+    seqs = tb.encoder_cases(summary["assets"])
+    ids_bin, enc_bin = os.path.join(work, "ids.bin"), os.path.join(work, "enc_host.bin")
+    z_bin, dur_bin = os.path.join(work, "dpz.bin"), os.path.join(work, "dur_host.bin")
+    tb.write_ids(ids_bin, seqs)
+    zs = tb.dp_noise(seqs)
+    tb.write_noise(z_bin, zs)
+    r = subprocess.run([exe, "-i", utts, "-o", pcm, "-R", "2", "-e", ids_bin, "-E", enc_bin, "-d", z_bin,
+                        "-D", dur_bin], capture_output=True,
+                       text=True, cwd=work, env=dict(os.environ, INFERENCE_HOST_THREADS="4"))
+    if r.returncode:
+        print(r.stdout[-2000:], r.stderr[-2000:])
+        return 1
+    E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
+    erep = tb.check_enc(enc_bin, seqs, W, E_enc)
+    drep = tb.check_dur(dur_bin, seqs, zs, W, E_enc)
+    pr = tb.parse(r.stdout)
+    ok = ok and all(v["mismatches"] == 0 for v in list(erep.values()) + list(drep.values())) and \
+        all(e["reps_identical"] for e in pr["encs"] + pr.get("durs", []))
+    rep["encoder"], rep["duration"] = erep, drep
     with open(os.path.join(work, "result.json"), "w") as f:
         json.dump({"check": rep, "bench": res}, f, indent=1)
     print("HOST EMULATION: " + ("PCM bit-exact with the specification" if ok else "MISMATCH"))

@@ -199,8 +199,12 @@ src/
   vit_nodes.py           the vision host ops (VitLayerNorm / AttnPrep / AttnSoftmax / Gelu /
                          ResAdd / EmbedAdd / PixelShuffle / SumDequant) + VIT_C helpers
   piper.py               Piper (VITS) text-to-speech frontend: the flow + HiFi-GAN decoder as the
-                         fixed-size `chunk` entry (Conv exponents, folded 1-D convs, polyphase)
-  tts_nodes.py           the TTS host ops (TtsPrep / Gate / Sum / FlowOut / Interleave / Pcm) + TTS_C
+                         fixed-size `chunk` entry (Conv exponents, folded 1-D convs, polyphase);
+                         the text encoder as `encode_<T>` entries (length buckets, MatMuls and
+                         attention on ConvKernel, one weight image shared by the buckets)
+  tts_nodes.py           the TTS host ops (TtsPrep / Gate / Sum / FlowOut / Interleave / Pcm; the
+                         encoder's TtsEmbed / RowPrep / AttnSoftmax / AttnMerge / ResNorm / EncOut)
+                         + TTS_C / TTS_ENC_C
   numeric.py             axi.numeric metadata: power-of-two exponents (MatMul and Conv weight
                          encoding), host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
@@ -254,7 +258,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              73 pytest modules, 1602 tests collected (1597 pass, 5 skip;
+  test_*.py              73 pytest modules, 1608 tests collected (1603 pass, 5 skip;
                          test_bert_base.py needs BERT_SQUAD_MODEL) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -267,7 +271,8 @@ test/
                          inference, lazy entry models / checkpoints, shared arrays),
                          test_conv_exp.py (Conv with power-of-two exponents),
                          test_tts_ops.py (the TTS C helpers), test_piper.py (the Piper
-                         chunk == the specification, stitching, host_emu)
+                         chunk and encode entries == the specification, stitching,
+                         buckets, host_emu; the C duration predictor == its spec)
 ```
 
 ## Key Abstractions

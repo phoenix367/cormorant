@@ -31,9 +31,11 @@ Five FPGA backends (plus `echo`, protocol only):
   next to both SmolLM2 sizes and BERT (CHAT_PLAN §23).
 * **`piper`** ([below](#text-to-speech--piper-lessac-medium)): **text to
   speech**, `POST /v1/audio/speech`, with Piper (VITS) en_US-lessac-medium.
-  - `libpiper_tts.so` runs the flow and the HiFi-GAN decoder on ConvKernel:
-    1.49 s of audio per ~0.7 s chunk, bit-exact with the specification.
-  - espeak-ng phonemes and the numpy front end run in the server.
+  - `libpiper_tts.so` runs the text encoder, the flow and the HiFi-GAN
+    decoder on ConvKernel: 1.49 s of audio per ~0.7 s chunk, bit-exact with
+    the specification.
+  - The duration predictor runs as C code in the library; espeak-ng
+    phonemes, the alignment and the noise run in the server.
   - The audio streams as it is made; see TTS_PLAN §4–§5.
 
 ```
@@ -595,20 +597,25 @@ with client.audio.speech.with_streaming_response.create(
 
 **How a request runs**:
 - **Outside the FPGA lock:** the server phonemizes (espeak-ng, Piper's ids)
-  and packs sentences into ≤ 400-id passes of the numpy front end.
-- **On the FPGA:** chunks of 128 frames (1.49 s).
+  and packs sentences into utterances of ≤ 400 ids.
+- **Under the lock, per utterance:**
+  - the text encoder on the FPGA (`tts_encode`, 26–260 ms);
+  - the duration predictor in the library's C (`tts_duration`, 18–200 ms),
+    then the alignment and the noise in numpy;
+  - then chunks of 128 frames (1.49 s) on the FPGA.
 - **Delivery:** each chunk's samples go out as soon as they exist.  wav /
   pcm carry an exact Content-Length.
 - **Disconnects:** a client that disconnects stops the synthesis at the
   next chunk.
 
 **Measured** (2026-09-30):
-- **First audio:** 1.8 s (3.4 s of speech) to 3.5 s (12.5 s of speech).
-- **RTF:** 0.78–0.94 end to end.
+- **First audio:** 1.0–1.3 s (3.4 and 5.9 s of speech) to 1.5 s (12.5 s of
+  speech).
+- **RTF:** 0.58–0.79 end to end.
 - **Samples:** bit-exact with the same pipeline on the host
   (`demo/tts/scripts/tts_speech_check.py`).
-- **Residency:** 40 MB of CMA; with `--resident auto` it stays loaded next
-  to SmolLM2-360M.
+- **Residency:** 55 MB of CMA (a 48 MiB pool); with `--resident auto` it
+  stays loaded next to SmolLM2-360M.
 
 ### Without the FPGA
 

@@ -82,11 +82,12 @@ class TestPiperBackend(unittest.TestCase):
         b = self.backend(max_ids=40)
         req = SpeechRequest(model=b.model_id, input="Hello there. This is a test! Bye.", seed=5)
         job = b.prepare_speech(req)
-        self.assertEqual(len(job.utterances), 3)                  # 40 ids per pass: one sentence each
-        frames = [z.shape[1] for z in job.utterances]
-        self.assertEqual(job.samples, sum(frames) * 256)
+        self.assertEqual(len(job.groups), 3)                      # 40 ids per pass: one sentence each
+        self.assertIsNone(job.samples)                            # the front end runs under the lock
         b.load()
         out = list(b.synthesize(job, CancelToken()))
+        frames = [z.shape[1] for z in job.utterances]
+        self.assertEqual(job.samples, sum(frames) * 256)
         pcm, fin = out[:-1], out[-1]
         self.assertEqual(sum(len(p) for p in pcm), 2 * job.samples)
         self.assertEqual(len(pcm), sum(-(-f // 128) for f in frames))
@@ -101,6 +102,7 @@ class TestPiperBackend(unittest.TestCase):
         b = self.backend()
         req = SpeechRequest(model=b.model_id, input="Hello there. This is a test! Bye.", speed=2.0)
         job = b.prepare_speech(req)
+        b.front_end(job)
         self.assertEqual(len(job.utterances), 1)                  # 400 ids: all in one pass
         ids = b.phoneme_ids(req.input)[0]
         self.assertEqual(ids[:2], [1, 0])                         # ^ _

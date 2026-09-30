@@ -112,8 +112,40 @@ def erf_fast(x):
     return np.sign(x) * (1.0 - p * np.exp(-a * a))
 
 
+def _gelu_fast(x):
+    """gelu(x, fast=True) with in-place ufuncs, the same operations in the
+    same order (bit-identical): 5 temporaries instead of ~14 (the A53 front
+    end spent half the duration predictor in them)."""
+    u = x / math.sqrt(2.0)
+    a = np.abs(u)
+    t = a * 0.3275911
+    t += 1.0
+    np.divide(1.0, t, out=t)
+    p = t * 1.061405429
+    p -= 1.453152027
+    p *= t
+    p += 1.421413741
+    p *= t
+    p -= 0.284496736
+    p *= t
+    p += 0.254829592
+    p *= t
+    np.negative(a, out=t)
+    t *= a
+    np.exp(t, out=t)
+    p *= t
+    np.subtract(1.0, p, out=p)
+    p *= np.sign(u)
+    p += 1.0
+    h = x * 0.5
+    h *= p
+    return h
+
+
 def gelu(x, fast=False):
-    return 0.5 * x * (1.0 + (erf_fast if fast else _ERF)(x / math.sqrt(2.0)))
+    if fast:
+        return _gelu_fast(x)
+    return 0.5 * x * (1.0 + _ERF(x / math.sqrt(2.0)))
 
 
 def softmax(x, axis=-1):
@@ -573,13 +605,21 @@ def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None):
     return np.clip(np.round(_libm(math.tanh, yo[0]) * 32767.0), -32768, 32767).astype(np.int16)
 
 
-def front_end(W, ids, noise_scale=0.667, length_scale=1.0, noise_w=0.8, seed=0, fast_erf=False):
+def front_end(W, ids, noise_scale=0.667, length_scale=1.0, noise_w=0.8, seed=0, fast_erf=False,
+              encoder=None, duration=None):
     """Host front end (float64): text encoder, durations, alignment, noise ->
     z_p [192][frames] (float32, as handed to the library).  fast_erf: the
-    duration predictor's GELU on erf_fast (the chat server's choice)."""
+    duration predictor's GELU on erf_fast (the chat server's choice).
+    ``encoder``: ids -> (x, m_p, logs_p) [192][n] in place of text_encoder
+    (the library's int16 encoder); ``duration``: (x, z) -> logw in place of
+    duration_predictor (the library's C one; z = the noise * noise_w, drawn
+    where duration_predictor draws it)."""
     rng = np.random.default_rng(seed)
-    x, m_p, logs_p = text_encoder(W, np.asarray(ids))
-    logw = duration_predictor(W, x, noise_w, rng, fast_erf)
+    x, m_p, logs_p = (encoder or (lambda i: text_encoder(W, np.asarray(i))))(ids)
+    if duration is None:
+        logw = duration_predictor(W, x, noise_w, rng, fast_erf)
+    else:
+        logw = duration(x, rng.standard_normal((2, x.shape[1])) * noise_w)
     w_ceil = np.ceil(np.exp(logw) * length_scale).astype(int)
     rep = np.repeat(np.arange(len(ids)), np.maximum(w_ceil, 0))
     mp, lp = m_p[:, rep], logs_p[:, rep]
@@ -600,3 +640,439 @@ def synthesize_chunked(W, E, zp):
         o = (OUT_OFF - DEC_OFF) * HOP
         out.append(pcm[o:o + OUT_FRAMES * HOP])
     return np.concatenate(out)[:T * HOP]
+
+
+# ---- the library's text encoder: the specification (TTS_PLAN §6) ------------ #
+#
+# The text encoder in row layout [n][192] on the FPGA: every projection and
+# the FFN's kernel-3 convs are ConvKernel MatMuls (raw int16 operands,
+# weights at f_w = f_y + 8 - f_x, exact sums, floor(acc / 2^8), saturate);
+# q.K^T and P.V run on ConvKernel as well (the ViT's static-key attention).
+# The host ops compute in double with sequential sums (as the C loops) and
+# write int16 with round-half-even + saturation: the q / k / v prep (bias,
+# per-head exponents), the softmax (relative keys, window 4), the merge
+# (relative values), residual + LayerNorm, the kernel-3 conv inputs
+# (im2col, the FFN's bias + ReLU), the float32 outputs.  Every MatMul input
+# is written by a host op at its own searched exponent (the layer input for
+# q / k / v and the projection's input as separate copies, the residual
+# stream stays at its natural exponent): a coarser input puts the weight on
+# a finer grid (f_w = f_y + 8 - f_x), as the chunk's conv inputs (#in).  The library pads
+# the ids to a bucket of T >= n rows and masks: rows and keys >= n never
+# reach rows < n, so the result does not depend on the bucket.
+
+ENC_LAYERS, ENC_D, ENC_H, ENC_HD, ENC_FF, ENC_WIN, ENC_EPS = 6, 192, 2, 96, 768, 4, 1e-5
+ENC_P = 15                                                      # the softmax output P at 2^-15
+
+
+def _seqsum(a, axis=-1):
+    """Sequential (left-to-right) sum, as the C loops add."""
+    return np.cumsum(a, axis=axis).take(-1, axis=axis)
+
+
+def _raw(v, f):
+    """A host write in raw integers: round-half-even at 2^-f, saturate (+ 0.0:
+    an int16 has no negative zero)."""
+    return np.clip(np.round(np.asarray(v, np.float64) * 2.0 ** f), -32768, 32767) + 0.0
+
+
+def _kmm(x_raw, w_raw):
+    """ConvKernel MatMul on raw int16 operands: the exact sum (float64 holds
+    it: |sum| < 2^53), the int32 wrap, floor(acc / 2^8), saturate -> raw."""
+    acc = np.asarray(x_raw, np.float64) @ np.asarray(w_raw, np.float64)
+    big = np.abs(acc) >= 2.0 ** 31
+    if big.any():
+        acc = np.where(big, np.mod(acc + 2.0 ** 31, 2.0 ** 32) - 2.0 ** 31, acc)
+    return np.clip(np.floor(acc / 256.0), -32768, 32767) + 0.0
+
+
+def _k3(w):
+    """Conv weight [O][C][3] -> the unrolled MatMul weight [3C][O] (tap-major)."""
+    return np.concatenate([w[:, :, t].T for t in range(3)], axis=0)
+
+
+def _im2col3(x):
+    """[n][C] -> [n][3C]: row i holds rows i-1, i, i+1 ('same' padding, zeros outside)."""
+    p = np.pad(x, ((1, 1), (0, 0)))
+    return np.concatenate([p[:-2], p[1:-1], p[2:]], axis=1)
+
+
+def encoder_weights(W):
+    """The encoder's weights as the library stores them (float32): row-layout
+    MatMul weights [in][out], q's weight and bias scaled by 1 / sqrt(96),
+    the kernel-3 convs unrolled."""
+    f32 = lambda a: np.asarray(a, np.float32)                   # noqa: E731
+    sq = 1.0 / math.sqrt(ENC_HD)
+    EW = {"emb": f32(W["emb"]), "wp": f32(W["enc_p.proj.weight"][:, :, 0].T), "bp": f32(W["enc_p.proj.bias"])}
+    for i in range(ENC_LAYERS):
+        p, f = f"enc_p.encoder.attn_layers.{i}", f"enc_p.encoder.ffn_layers.{i}"
+        EW[f"l{i}.wq"] = f32(W[f"{p}.conv_q.weight"][:, :, 0].T * sq)
+        EW[f"l{i}.bq"] = f32(W[f"{p}.conv_q.bias"] * sq)
+        for t in ("k", "v", "o"):
+            EW[f"l{i}.w{t}"] = f32(W[f"{p}.conv_{t}.weight"][:, :, 0].T)
+            EW[f"l{i}.b{t}"] = f32(W[f"{p}.conv_{t}.bias"])
+        EW[f"l{i}.ek"] = f32(W[f"{p}.emb_rel_k"][0])            # [9][96], offsets -4 .. 4
+        EW[f"l{i}.ev"] = f32(W[f"{p}.emb_rel_v"][0])
+        EW[f"l{i}.w1"], EW[f"l{i}.b1"] = f32(_k3(W[f"{f}.conv_1.weight"])), f32(W[f"{f}.conv_1.bias"])
+        EW[f"l{i}.w2"], EW[f"l{i}.b2"] = f32(_k3(W[f"{f}.conv_2.weight"])), f32(W[f"{f}.conv_2.bias"])
+        for j in (1, 2):
+            EW[f"l{i}.g{j}"] = f32(W[f"enc_p.encoder.norm_layers_{j}.{i}.gamma"])
+            EW[f"l{i}.be{j}"] = f32(W[f"enc_p.encoder.norm_layers_{j}.{i}.beta"])
+    return {k: v.astype(np.float64) for k, v in EW.items()}
+
+
+def _enc_ln(s, g, b):
+    """LayerNorm over the channels of every row, sequential sums (the C loop)."""
+    mean = _seqsum(s) / s.shape[1]
+    d = s - mean[:, None]
+    var = _seqsum(d * d) / s.shape[1]
+    return d / np.sqrt(var + ENC_EPS)[:, None] * g + b
+
+
+def _enc_rel(qh, ek):
+    """The relative-key terms: rel[i][d + 4] = sum_c q[i][c] * ek[d + 4][c], sequential."""
+    return _seqsum(qh[:, None, :] * ek[None, :, :])             # [n][9]
+
+
+def encoder_float(EW, ids, record=None):
+    """The encoder in float64 with the library's structure (row layout,
+    unrolled convs, biases added where the host ops add them): the
+    calibration run (``record``: tensor -> max |x|) and the float yardstick.
+    Returns x [n][192] and stats [n][384]."""
+    rec = record if record is not None else {}
+
+    def r(name, v):
+        rec[name] = max(rec.get(name, 0.0), float(np.abs(v).max()) if v.size else 0.0)
+        return v
+
+    def inp(name, v):                     # a MatMul input: kept for the exponent search
+        rec.setdefault("__in", {}).setdefault(name, []).append(v)
+        return r(name, v)
+    n = len(ids)
+    x = r("enc.x0", EW["emb"][np.asarray(ids)] * math.sqrt(ENC_D))
+    for i in range(ENC_LAYERS):
+        e = f"enc.l{i}"
+        inp(f"{e}.xin", x)
+        q0 = r(f"{e}.q0", x @ EW[f"l{i}.wq"])
+        k0 = r(f"{e}.k0", x @ EW[f"l{i}.wk"])
+        v0 = r(f"{e}.v0", x @ EW[f"l{i}.wv"])
+        q, k, v = r(f"{e}.q", q0 + EW[f"l{i}.bq"]), r(f"{e}.k", k0 + EW[f"l{i}.bk"]), r(f"{e}.v", v0 + EW[f"l{i}.bv"])
+        heads = []
+        for h in range(ENC_H):
+            sl = slice(h * ENC_HD, (h + 1) * ENC_HD)
+            s = r(f"{e}.s", q[:, sl] @ k[:, sl].T)
+            rel = _enc_rel(q[:, sl], EW[f"l{i}.ek"])
+            val = s.copy()
+            for d in range(-ENC_WIN, ENC_WIN + 1):
+                idx = np.arange(max(0, -d), min(n, n - d))
+                val[idx, idx + d] += rel[idx, d + ENC_WIN]
+            ex = np.exp(val - val.max(1, keepdims=True))
+            p = ex / ex.sum(1, keepdims=True)
+            o = r(f"{e}.o", p @ v[:, sl])
+            for d in range(-ENC_WIN, ENC_WIN + 1):
+                idx = np.arange(max(0, -d), min(n, n - d))
+                o[idx] += p[idx, idx + d][:, None] * EW[f"l{i}.ev"][d + ENC_WIN][None, :]
+            heads.append(o)
+        att = inp(f"{e}.att", np.concatenate(heads, axis=1))
+        y = r(f"{e}.y", att @ EW[f"l{i}.wo"])
+        x1 = r(f"{e}.x1", _enc_ln(x + (y + EW[f"l{i}.bo"]), EW[f"l{i}.g1"], EW[f"l{i}.be1"]))
+        f1 = r(f"{e}.f1", inp(f"{e}.c1", _im2col3(x1)) @ EW[f"l{i}.w1"])
+        hh = np.maximum(f1 + EW[f"l{i}.b1"], 0.0)
+        f2 = r(f"{e}.f2", inp(f"{e}.h", _im2col3(hh)) @ EW[f"l{i}.w2"])
+        x = r(f"{e}.x2", _enc_ln(x1 + (f2 + EW[f"l{i}.b2"]), EW[f"l{i}.g2"], EW[f"l{i}.be2"]))
+    st = r("enc.st", inp("enc.st#in", x) @ EW["wp"])
+    return x, st + EW["bp"]
+
+
+def _nat(v, headroom=1):
+    """The finest exponent that leaves ``headroom`` bits over max |x| = v."""
+    return 24 if v <= 0 else int(math.floor(math.log2(2.0 ** (15 - headroom) / v)))
+
+
+def _search_input(E, rec, key, consumers, span=12):
+    """The exponent of MatMul input ``key`` that minimises its consumers'
+    relative output error on the calibration inputs (weights at
+    f_y + 8 - f_x must fit int16); ``consumers``: [(weight [in][out], output key)]."""
+    xs = rec["__in"][key]
+    nat = _nat(rec[key])
+    best, best_err = None, None
+    for fx in range(nat - span, nat + 1):
+        if any(float(np.abs(w).max()) * 2.0 ** (E[y] + 8 - fx) > 32767 for w, y in consumers):
+            continue
+        err = 0.0
+        for w, y in consumers:
+            wr = _raw(w, E[y] + 8 - fx)
+            for x in xs:
+                ref = x @ w
+                got = _kmm(_raw(x, fx), wr) * 2.0 ** -E[y]
+                err += float(np.mean((got - ref) ** 2) / max(np.mean(ref ** 2), 1e-30))
+        if best_err is None or err < best_err:
+            best, best_err = fx, err
+    if best is None:                      # no input exponent fits every weight: coarser outputs
+        for w, y in consumers:
+            while float(np.abs(w).max()) * 2.0 ** (E[y] + 8 - nat) > 32767:
+                E[y] -= 1
+        best = nat
+    E[key] = best
+
+
+def encoder_exponents(EW, rec, p_exp=ENC_P, search=True):
+    """Exponents of the int16 encoder from a calibration record (encoder_float):
+    every tensor at its natural exponent (one bit of headroom); k at
+    f_s + 8 - f_q and v at f_o + 8 - f_p must fit int16 (else f_s / f_o
+    coarser); every MatMul input at the searched exponent (``search``, else
+    the natural one with coarser outputs where a weight would not fit)."""
+    E = {"enc.p": int(p_exp)}
+    E["enc.x0"] = _nat(rec["enc.x0"])
+    for k in rec:
+        if k != "__in" and k not in ("enc.x0",):
+            E[k] = _nat(rec[k])
+    for i in range(ENC_LAYERS):
+        e = f"enc.l{i}"
+        fq = E[f"{e}.q"]
+        fs = E[f"{e}.s"]
+        while rec[f"{e}.k"] * 2.0 ** (fs + 8 - fq) > 32767:
+            fs -= 1
+        E[f"{e}.s"], E[f"{e}.k"] = fs, fs + 8 - fq
+        fo = E[f"{e}.o"]
+        while rec[f"{e}.v"] * 2.0 ** (fo + 8 - p_exp) > 32767:
+            fo -= 1
+        E[f"{e}.o"], E[f"{e}.v"] = fo, fo + 8 - p_exp
+    groups = [("enc.st#in", [(EW["wp"], "enc.st")])]
+    for i in range(ENC_LAYERS):
+        e = f"enc.l{i}"
+        groups += [(f"{e}.xin", [(EW[f"l{i}.w{t}"], f"{e}.{t}0") for t in "qkv"]),
+                   (f"{e}.att", [(EW[f"l{i}.wo"], f"{e}.y")]),
+                   (f"{e}.c1", [(EW[f"l{i}.w1"], f"{e}.f1")]),
+                   (f"{e}.h", [(EW[f"l{i}.w2"], f"{e}.f2")])]
+    for key, consumers in groups:
+        _search_input(E, rec, key, consumers, span=12 if search else 0)
+    return E
+
+
+def encoder_forward(EW, E, ids, trace=None):
+    """The library's encoder, bit for bit: ids -> x [n][192], stats [n][384]
+    (float32, as the library returns them)."""
+    tr = trace if trace is not None else {}
+    n = len(ids)
+    L2 = lambda f: 2.0 ** -f                                     # noqa: E731
+    fx = E["enc.x0"]
+    xr = tr["enc.x0"] = _raw(EW["emb"][np.asarray(ids)] * math.sqrt(ENC_D), fx)
+    fp = E["enc.p"]
+    for i in range(ENC_LAYERS):
+        e = f"enc.l{i}"
+        # q / k / v projections (kernel), then the prep: + bias at the per-head exponents
+        pr = {}
+        fxi = E[f"{e}.xin"]
+        xin = tr[f"{e}.xin"] = _raw(xr * L2(fx), fxi)                    # the q / k / v input copy
+        for t, ft in (("q", E[f"{e}.q"]), ("k", E[f"{e}.k"]), ("v", E[f"{e}.v"])):
+            fy = E[f"{e}.{t}0"]
+            y0 = _kmm(xin, _raw(EW[f"l{i}.w{t}"], fy + 8 - fxi))
+            tr[f"{e}.{t}0"] = y0
+            pr[t] = tr[f"{e}.{t}"] = _raw(y0 * L2(fy) + EW[f"l{i}.b{t}"], ft)
+        fq, fs, fo = E[f"{e}.q"], E[f"{e}.s"], E[f"{e}.o"]
+        heads = []
+        for h in range(ENC_H):
+            sl = slice(h * ENC_HD, (h + 1) * ENC_HD)
+            s_raw = _kmm(pr["q"][:, sl], pr["k"][:, sl].T)           # [queries][keys]
+            rel = _enc_rel(pr["q"][:, sl] * L2(fq), EW[f"l{i}.ek"])
+            val = s_raw * L2(fs)
+            for d in range(-ENC_WIN, ENC_WIN + 1):
+                idx = np.arange(max(0, -d), min(n, n - d))
+                val[idx, idx + d] = val[idx, idx + d] + rel[idx, d + ENC_WIN]
+            ex = _libm(math.exp, val - val.max(1, keepdims=True))
+            p_raw = np.clip(np.round(ex / _seqsum(ex)[:, None] * 2.0 ** fp), 0, 32767)
+            o_raw = _kmm(p_raw, pr["v"][:, sl])
+            o = o_raw * L2(fo)
+            for d in range(-ENC_WIN, ENC_WIN + 1):
+                idx = np.arange(max(0, -d), min(n, n - d))
+                o[idx] = o[idx] + (p_raw[idx, idx + d] * L2(fp))[:, None] * EW[f"l{i}.ev"][d + ENC_WIN][None, :]
+            tr[f"{e}.s{h}"], tr[f"{e}.p{h}"], tr[f"{e}.o{h}"] = s_raw, p_raw, o_raw
+            heads.append(o)
+        fa = E[f"{e}.att"]
+        att = tr[f"{e}.att"] = _raw(np.concatenate(heads, axis=1), fa)
+        fy = E[f"{e}.y"]
+        y = tr[f"{e}.y"] = _kmm(att, _raw(EW[f"l{i}.wo"], fy + 8 - fa))
+        f1x = E[f"{e}.x1"]
+        x1 = tr[f"{e}.x1"] = _raw(_enc_ln(xr * L2(fx) + (y * L2(fy) + EW[f"l{i}.bo"]),
+                                          EW[f"l{i}.g1"], EW[f"l{i}.be1"]), f1x)
+        ff1, fc1 = E[f"{e}.f1"], E[f"{e}.c1"]
+        c1 = tr[f"{e}.c1"] = _im2col3(_raw(x1 * L2(f1x), fc1))
+        f1 = tr[f"{e}.f1"] = _kmm(c1, _raw(EW[f"l{i}.w1"], ff1 + 8 - fc1))
+        fh = E[f"{e}.h"]
+        hh = tr[f"{e}.h"] = _raw(np.maximum(f1 * L2(ff1) + EW[f"l{i}.b1"], 0.0), fh)
+        ff2 = E[f"{e}.f2"]
+        f2 = tr[f"{e}.f2"] = _kmm(_im2col3(hh), _raw(EW[f"l{i}.w2"], ff2 + 8 - fh))
+        fx = E[f"{e}.x2"]
+        xr = tr[f"{e}.x2"] = _raw(_enc_ln(x1 * L2(f1x) + (f2 * L2(ff2) + EW[f"l{i}.b2"]),
+                                          EW[f"l{i}.g2"], EW[f"l{i}.be2"]), fx)
+    fst, fsi = E["enc.st"], E["enc.st#in"]
+    st = tr["enc.st"] = _kmm(_raw(xr * L2(fx), fsi), _raw(EW["wp"], fst + 8 - fsi))
+    return (xr * L2(fx)).astype(np.float32), (st * L2(fst) + EW["bp"]).astype(np.float32)
+
+
+def library_encoder(EW, E):
+    """ids -> (x, m_p, logs_p) [192][n] float64 from encoder_forward: the
+    front end's ``encoder`` for the library's int16 encoder."""
+    def enc(ids):
+        x, st = encoder_forward(EW, E, ids)
+        x, st = x.astype(np.float64).T, st.astype(np.float64).T
+        return x, st[:ENC_D], st[ENC_D:]
+    return enc
+
+
+# ---- the library's duration predictor (C, float64): the specification (TTS_PLAN §7) ---- #
+#
+# The stochastic duration predictor in float64 as demo/tts/src/tts_dp.c
+# computes it: duration_predictor(fast=True) with every sum left to right
+# (1x1 convs, LayerNorm, the spline's softmax) and exp / log1p from libm;
+# LayerNorm multiplies by 1 / sd and GELU's erf argument is x * (1 / sqrt 2)
+# (a multiply instead of a divide per element: the A53 divides slowly).
+# Inputs: x [192][n] (the encoder's output, float32 values) and z [2][n]
+# (the noise, already * noise_w); output logw [n].
+
+DP_FLOWS = (7, 5, 3)
+
+
+def dp_tensors():
+    """(name, shape) of the duration predictor's weights in dp.dat's order
+    (float32, the shapes as tts_dp.c reads them)."""
+    C = 192
+
+    def dds(p):
+        r = []
+        for i in range(3):
+            r += [(f"{p}.convs_sep.{i}.weight", (C, 3)), (f"{p}.convs_sep.{i}.bias", (C,)),
+                  (f"{p}.norms_1.{i}.gamma", (C,)), (f"{p}.norms_1.{i}.beta", (C,)),
+                  (f"{p}.convs_1x1.{i}.weight", (C, C)), (f"{p}.convs_1x1.{i}.bias", (C,)),
+                  (f"{p}.norms_2.{i}.gamma", (C,)), (f"{p}.norms_2.{i}.beta", (C,))]
+        return r
+    out = [("dp.pre.weight", (C, C)), ("dp.pre.bias", (C,))] + dds("dp.convs") + \
+        [("dp.proj.weight", (C, C)), ("dp.proj.bias", (C,))]
+    for fi in DP_FLOWS:
+        p = f"dp.flows.{fi}"
+        out += [(f"{p}.pre.weight", (C,)), (f"{p}.pre.bias", (C,))] + dds(f"{p}.convs") + \
+            [(f"{p}.proj.weight", (29, C)), (f"{p}.proj.bias", (29,))]
+    return out + [("dp.flows.0.m", (2,)), ("dp.flows.0.exp_neg_logs", (2,))]
+
+
+def dp_flat(W):
+    """dp.dat: the weights of dp_tensors(), float32, in that order."""
+    parts = []
+    for name, shape in dp_tensors():
+        a = np.asarray(W[name], np.float32)
+        if a.size != int(np.prod(shape)):
+            raise ValueError(f"{name}: {a.shape} is not {shape}")
+        parts.append(a.reshape(-1))
+    return np.concatenate(parts)
+
+
+def _dp_w(W):
+    """The weights as tts_dp.c holds them: float32 values in float64, its shapes."""
+    return {n: np.asarray(W[n], np.float32).astype(np.float64).reshape(s) for n, s in dp_tensors()}
+
+
+def _conv1x1_seq(x, w, b):
+    """y[o][t] = (sum_c w[o][c] * x[c][t], left to right) + b[o]."""
+    return _seqsum(w[:, :, None] * x[None, :, :], axis=1) + b[:, None]
+
+
+def _dwconv_seq(x, w, b, dil):
+    """Depthwise kernel 3 'same' (zero padding): ((0 + w0 x[t-d]) + w1 x[t]) + w2 x[t+d] + b."""
+    xp = np.pad(x, ((0, 0), (dil, dil)))
+    n = x.shape[1]
+    y = np.zeros_like(x)
+    for k in range(3):
+        y = y + w[:, k][:, None] * xp[:, k * dil: k * dil + n]
+    return y + b[:, None]
+
+
+_INV_SQRT2 = 1.0 / math.sqrt(2.0)
+
+
+def _ln_seq(x, g, b):
+    """LayerNorm over the channels of every column, sums left to right, x 1 / sd."""
+    C = x.shape[0]
+    mean = _seqsum(x, axis=0) / C
+    d = x - mean[None, :]
+    var = _seqsum(d * d, axis=0) / C
+    inv = 1.0 / np.sqrt(var + 1e-5)
+    return d * inv[None, :] * g[:, None] + b[:, None]
+
+
+def _gelu_seq(x):
+    """_gelu_fast's operations with erf's argument x * (1 / sqrt 2), exp from libm."""
+    u = x * _INV_SQRT2
+    a = np.abs(u)
+    t = 1.0 / (a * 0.3275911 + 1.0)
+    p = ((((t * 1.061405429 - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
+    p = 1.0 - p * _libm(math.exp, (-a) * a)
+    return (x * 0.5) * (p * np.sign(u) + 1.0)
+
+
+def _dds_seq(D, p, x, g=None):
+    if g is not None:
+        x = x + g
+    for i in range(3):
+        y = _dwconv_seq(x, D[f"{p}.convs_sep.{i}.weight"], D[f"{p}.convs_sep.{i}.bias"], 3 ** i)
+        y = _gelu_seq(_ln_seq(y, D[f"{p}.norms_1.{i}.gamma"], D[f"{p}.norms_1.{i}.beta"]))
+        y = _conv1x1_seq(y, D[f"{p}.convs_1x1.{i}.weight"], D[f"{p}.convs_1x1.{i}.bias"])
+        y = _gelu_seq(_ln_seq(y, D[f"{p}.norms_2.{i}.gamma"], D[f"{p}.norms_2.{i}.beta"]))
+        x = x + y
+    return x
+
+
+def _spline_seq(x, uw, uh, ud, tb=5.0, mbw=1e-3, mbh=1e-3, md=1e-3):
+    """rq_spline_inverse, sums left to right, exp / log1p from libm."""
+    nb = uw.shape[-1]
+    inside = (x >= -tb) & (x <= tb)
+    ud = np.pad(ud, ((0, 0), (1, 1)))
+    const = math.log(math.exp(1 - md) - 1)
+    ud[:, 0] = const
+    ud[:, -1] = const
+
+    def smax(u):
+        e = _libm(math.exp, u - u.max(-1, keepdims=True))
+        return e / _seqsum(e)[:, None]
+    widths = mbw + (1 - mbw * nb) * smax(uw)
+    cw = np.pad(np.cumsum(widths, -1), ((0, 0), (1, 0)))
+    cw = 2 * tb * cw - tb
+    cw[:, 0], cw[:, -1] = -tb, tb
+    widths = cw[:, 1:] - cw[:, :-1]
+    der = md + (_libm(math.log1p, _libm(math.exp, -np.abs(ud))) + np.maximum(ud, 0))
+    heights = mbh + (1 - mbh * nb) * smax(uh)
+    ch = np.pad(np.cumsum(heights, -1), ((0, 0), (1, 0)))
+    ch = 2 * tb * ch - tb
+    ch[:, 0], ch[:, -1] = -tb, tb
+    heights = ch[:, 1:] - ch[:, :-1]
+    loc = ch.copy()
+    loc[:, -1] += 1e-6
+    bi = np.clip((x[:, None] >= loc).sum(-1) - 1, 0, nb - 1)
+    r = np.arange(len(x))
+    icw, ibw, ich, ih = cw[r, bi], widths[r, bi], ch[r, bi], heights[r, bi]
+    delta = heights / widths
+    idl, idr, ide = der[r, bi], der[r, bi + 1], delta[r, bi]
+    a = (x - ich) * (idl + idr - 2 * ide) + ih * (ide - idl)
+    b = ih * idl - (x - ich) * (idl + idr - 2 * ide)
+    c = -ide * (x - ich)
+    root = (2 * c) / (-b - np.sqrt(b * b - 4 * a * c))
+    return np.where(inside, root * ibw + icw, x)
+
+
+def duration_predictor_seq(W, x, z):
+    """logw [n] of the library's duration predictor: x [192][n] (float32
+    values), z [2][n] (the noise * noise_w)."""
+    D = _dp_w(W)
+    x = np.asarray(x, np.float32).astype(np.float64)
+    z0, z1 = (np.asarray(v, np.float64).copy() for v in z)
+    h = _conv1x1_seq(x, D["dp.pre.weight"], D["dp.pre.bias"])
+    h = _dds_seq(D, "dp.convs", h)
+    g = _conv1x1_seq(h, D["dp.proj.weight"], D["dp.proj.bias"])
+    for fi in DP_FLOWS:
+        p = f"dp.flows.{fi}"
+        z0, z1 = z1, z0                                          # Flip
+        hf = D[f"{p}.pre.weight"][:, None] * z0[None, :] + D[f"{p}.pre.bias"][:, None]
+        hf = _dds_seq(D, f"{p}.convs", hf, g=g)
+        hh = _conv1x1_seq(hf, D[f"{p}.proj.weight"], D[f"{p}.proj.bias"]).T  # [n][29]
+        z1 = _spline_seq(z1, hh[:, :10] / math.sqrt(192), hh[:, 10:20] / math.sqrt(192), hh[:, 20:])
+    z0, z1 = z1, z0                                              # the last Flip
+    return (z0 - D["dp.flows.0.m"][0]) * D["dp.flows.0.exp_neg_logs"][0]

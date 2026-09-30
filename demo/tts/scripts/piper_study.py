@@ -14,10 +14,13 @@ KV260 (model-study skill, route C; doc/plans/TTS_PLAN.md §3).  Host only.
   study      the evaluation sentences (Harvard list 1 + a chat reply) under
              each policy against float with the same noise: waveform SNR,
              log-mel distance, saturation, accumulator peak; WAVs to listen
+  encoder    the int16 text encoder of the library (TTS_PLAN §6): calibrate
+             its exponents (-> exponents.json "encoder"), durations and
+             log-mel distance against float, per softmax exponent (--p-exp)
   costs      the flow and the decoder per second of audio priced by the
              bitstream's performance model (proxy graphs, in memory) + the
              host-side counts
-  all        fetch validate calibrate study costs (phonemize first)
+  all        fetch validate calibrate study costs (phonemize first; encoder apart)
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/piper_study.py
            [--assets DIR] [--perf-model FILE] CMD
@@ -215,8 +218,11 @@ def cmd_calibrate(a) -> int:
         fx = _best_input_exponent(pv, exp[name], items)
         exp[name + "#in"] = fx
         moved.append(fx)
-    json.dump({"exponents": exp, "max_abs": Q.record, "headroom_bits": HEADROOM_BITS},
-              open(os.path.join(a.assets, "exponents.json"), "w"), indent=1)
+    path = os.path.join(a.assets, "exponents.json")
+    keep = {k: v for k, v in (json.load(open(path)) if os.path.exists(path) else {}).items()
+            if k.startswith("encoder")}                       # cmd_encoder's part
+    json.dump({"exponents": exp, "max_abs": Q.record, "headroom_bits": HEADROOM_BITS, **keep},
+              open(path, "w"), indent=1)
     fs = sorted(v for k, v in exp.items() if not k.endswith("#in"))
     print(f"{len(fs)} tensors, exponents {fs[0]}..{fs[-1]} (median {fs[len(fs) // 2]}); "
           f"largest |x| {max(Q.record.values()):.1f}; {len(moved)} conv input exponents searched "
@@ -361,6 +367,73 @@ def cmd_study(a) -> int:
     return 0
 
 
+# ---- encoder (TTS_PLAN §6) ----------------------------------------------------------------- #
+
+def cmd_encoder(a) -> int:
+    """Calibrate the int16 text encoder (the library's encode entries) on the
+    calibration sentences, store its exponents in exponents.json
+    ("encoder"), and measure it on the evaluation sentences: durations
+    against the float encoder, and the audio with the float durations kept
+    (so the waveforms align) against the library's current front end and
+    against float."""
+    import piper_vits as pv
+    W = pv.load_weights(_onnx(a))
+    EW = pv.encoder_weights(W)
+    path = os.path.join(a.assets, "exponents.json")
+    doc = json.load(open(path))
+    exp = doc["exponents"]
+    results = {}
+    for p_exp in [int(v) for v in a.p_exp.split(",")]:
+        rec = {}
+        for t in _texts(a, "calib").values():
+            pv.encoder_float(EW, t["ids"], rec)
+        E = pv.encoder_exponents(EW, rec, p_exp)
+        enc_q = pv.library_encoder(EW, E)
+        n_ids = n_diff = worst = 0
+        lsd_f, lsd_cur, lsd_q = [], [], []
+        out_dir = os.path.join(a.assets, "study")
+        for name, t in _texts(a, "eval").items():
+            seed = zlib.crc32(name.encode())
+            ids = t["ids"]
+            xf, mf, lf = pv.text_encoder(W, np.asarray(ids))
+            xq, mq, lq = enc_q(ids)
+            wf = np.ceil(np.exp(pv.duration_predictor(W, xf, 0.8, np.random.default_rng(seed), True)))
+            wq = np.ceil(np.exp(pv.duration_predictor(W, xq, 0.8, np.random.default_rng(seed), True)))
+            n_ids += len(ids)
+            n_diff += int((wf != wq).sum())
+            worst = max(worst, int(np.abs(wf - wq).max()))
+            ref = pv.synthesize(W, ids, seed=seed)
+            mref = _mel_db(ref)
+            cur = pv.synthesize_chunked(W, exp, pv.front_end(W, ids, seed=seed, fast_erf=True)) / 32767.0
+            # the int16 encoder's statistics with the float durations (aligned audio)
+            aligned = pv.synthesize_chunked(W, exp, pv.front_end(
+                W, ids, seed=seed, fast_erf=True, encoder=lambda i, xf=xf, mq=mq, lq=lq: (xf, mq, lq))) / 32767.0
+            own = pv.synthesize_chunked(W, exp, pv.front_end(W, ids, seed=seed, fast_erf=True,
+                                                             encoder=enc_q)) / 32767.0
+            lsd_cur.append(_lsd(_mel_db(cur), mref))
+            lsd_q.append(_lsd(_mel_db(aligned), mref))
+            lsd_f.append(_lsd(_mel_db(aligned), _mel_db(cur)))
+            if name in ("eval00", "eval10"):
+                _write_wav(os.path.join(out_dir, f"{name}_enc_int16_p{p_exp}.wav"), own)
+        results[p_exp] = {"exponents": E, "durations_changed": n_diff / n_ids, "max_frames": worst,
+                          "lsd_current_vs_float": float(np.mean(lsd_cur)),
+                          "lsd_int16_encoder_vs_float": float(np.mean(lsd_q)),
+                          "lsd_int16_encoder_vs_current": float(np.mean(lsd_f))}
+        r = results[p_exp]
+        print(f"P at 2^-{p_exp}: durations changed for {n_diff}/{n_ids} ids ({100 * n_diff / n_ids:.1f} %, "
+              f"max {worst} frame); log-mel distance vs float {r['lsd_int16_encoder_vs_float']:.3f} dB "
+              f"(the float encoder: {r['lsd_current_vs_float']:.3f} dB), vs the float encoder "
+              f"{r['lsd_int16_encoder_vs_current']:.3f} dB", flush=True)
+    best = int(a.p_exp.split(",")[0])
+    doc["encoder"] = results[best]["exponents"]
+    doc["encoder_study"] = {str(k): {kk: vv for kk, vv in v.items() if kk != "exponents"}
+                            for k, v in results.items()}
+    json.dump(doc, open(path, "w"), indent=1)
+    print(f"encoder exponents (P at 2^-{best}) -> {path} \"encoder\"; WAVs eval00 / eval10 in "
+          f"{os.path.join(a.assets, 'study')}")
+    return 0
+
+
 # ---- costs ---------------------------------------------------------------------------- #
 
 K_GMACS = (13.4, 30.0)       # 1 x k (k > 2) convs are not in the performance model's families
@@ -479,7 +552,10 @@ def main(argv=None) -> int:
     ap.add_argument("--perf-model", default=None)
     ap.add_argument("--policies", default=None,
                     help="study: only these policies (';'-separated names from POLICIES)")
-    ap.add_argument("cmd", choices=("fetch", "phonemize", "validate", "calibrate", "study", "costs", "all"))
+    ap.add_argument("--p-exp", default="15,12",
+                    help="encoder: softmax output exponents to compare (the first is stored)")
+    ap.add_argument("cmd", choices=("fetch", "phonemize", "validate", "calibrate", "study", "encoder", "costs",
+                                    "all"))
     a = ap.parse_args(argv)
     if a.perf_model is None and a.cmd in ("costs", "all"):
         sys.path.insert(0, SCHED)
@@ -487,7 +563,7 @@ def main(argv=None) -> int:
         a.perf_model = os.path.join(SCHED, "perf_models", "kv260", f"{local_bitstream_id()}.json")
     cmds = ("fetch", "validate", "calibrate", "study", "costs") if a.cmd == "all" else (a.cmd,)
     fn = {"fetch": cmd_fetch, "phonemize": cmd_phonemize, "validate": cmd_validate,
-          "calibrate": cmd_calibrate, "study": cmd_study, "costs": cmd_costs}
+          "calibrate": cmd_calibrate, "study": cmd_study, "encoder": cmd_encoder, "costs": cmd_costs}
     rc = 0
     for c in cmds:
         print(f"== {c}", flush=True)

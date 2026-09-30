@@ -4,8 +4,9 @@ tts_speech_check.py — the chat server's text to speech end to end
 (doc/plans/TTS_PLAN.md §5): POST /v1/audio/speech on the board for a few
 texts, timed (time to first audio, total, real-time factor), and every sample
 compared with the host's own run of the same pipeline — the chat server's
-PiperBackend front end (espeak-ng on this machine, piper_vits.front_end with
-erf_fast, the request's seed) and the specification
+PiperBackend front end (espeak-ng on this machine, the library's text
+encoder as piper_vits.encoder_forward, the C duration predictor as
+duration_predictor_seq, the request's seed) and the specification
 (piper_vits.synthesize_chunked) — so the board's phonemes, front end and
 library are checked together.  WAVs of both are written next to the report.
 
@@ -78,9 +79,13 @@ def main(argv=None) -> int:
         from chat_backend import SpeechRequest
         from piper_backend import PiperBackend
         project = os.path.abspath(args.project)
-        ref = PiperBackend(None, os.path.join(project, "weights"))
+        summary, W, E = tb.load(project)
+        E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
+        # the host's twin of the board: the library's encoder is encoder_forward
+        ref = PiperBackend(None, os.path.join(project, "weights"),
+                           encoder=tb.pv.library_encoder(tb.pv.encoder_weights(W), E_enc),
+                           duration=lambda x, z: tb.pv.duration_predictor_seq(W, x, z))
         ref.load_host()
-        _, W, E = tb.load(project)
     report, ok = [], True
     for i, text in enumerate(texts):
         st, hd, audio, ttfa, total = speak(args.url, {"model": args.model, "input": text, "seed": i,
@@ -95,6 +100,7 @@ def main(argv=None) -> int:
         tb.write_wav(os.path.join(args.out, f"board_{i}.wav"), pcm)
         if ref is not None:
             job = ref.prepare_speech(SpeechRequest(model=ref.model_id, input=text, seed=i))
+            ref.front_end(job)
             want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp) for zp in job.utterances])
             tb.write_wav(os.path.join(args.out, f"host_{i}.wav"), want)
             same = want.shape == pcm.shape and np.array_equal(want, pcm)

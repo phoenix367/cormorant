@@ -154,7 +154,7 @@ def load_config(path: Optional[str]) -> dict:
     if not vlm["lib"]:
         vlm["lib"] = f"{rem['dir']}/lib/libsmolvlm_256m.so"
     tts = cfg.setdefault("piper", {})
-    for k, v in (("lib", None), ("weights_dir", "/root/piper_weights"), ("model_id", None), ("cma_mb", 40)):
+    for k, v in (("lib", None), ("weights_dir", "/root/piper_weights"), ("model_id", None), ("cma_mb", 55)):
         if tts.get(k) is None:
             tts[k] = v
     if not tts["lib"]:

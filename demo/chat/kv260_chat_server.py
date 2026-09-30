@@ -41,7 +41,7 @@ Backends (chat_backend.Backend; one model id each)
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~760 MB, SmolVLM
-~540 MB, Piper ~40 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
+~540 MB, Piper ~55 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -1354,7 +1354,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--tts-weights", default="/root/piper_weights",
                    help="the voice directory: weights/*.dat of the library, frontend.npz, voice.json")
     g.add_argument("--tts-model-id", default=None, help="default: voice.json model (piper-lessac-medium)")
-    g.add_argument("--tts-cma-mb", type=float, default=40.0, help="CMA the Piper library holds (MB)")
+    g.add_argument("--tts-cma-mb", type=float, default=55.0, help="CMA the Piper library holds (MB)")
     g.add_argument("--tts-espeak-data", default=None, help="espeak-ng-data directory (default: the system's)")
     g.add_argument("--ffmpeg", default=shutil.which("ffmpeg"),
                    help="ffmpeg for mp3 / opus / aac / flac speech (default: from PATH; '' = none)")
