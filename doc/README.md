@@ -15,7 +15,8 @@ doc/
 
 The scheduler's user-level guides live next to its code in
 [`inference-scheduler/doc/`](../inference-scheduler/doc/), and each demo has
-its own README under [`demo/`](../demo/README.md).
+its own README under [`demo/`](../demo/README.md); the chat server's guides
+are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 
 ---
 
@@ -34,6 +35,7 @@ its own README under [`demo/`](../demo/README.md).
 | profile a model on the board | [PROFILER](scheduler/PROFILER.md) |
 | plan tactics and the issue order from measured performance (`--plan`), or calibrate a new bitstream | [INFERENCE_SCHEDULER "Planning"](scheduler/INFERENCE_SCHEDULER.md#planning---plan), [TACTICS_PLAN §9](plans/TACTICS_PLAN.md); `perf_calibrate.py` and its data: [`perf_models/`](../inference-scheduler/perf_models/README.md) |
 | see the latest board results | the project [README](../README.md#results-on-the-board) |
+| run the chat server on the board, or use it from a client | the chat server's [README](../demo/chat/README.md), [DEPLOY](../demo/chat/doc/DEPLOY.md) and [CLIENTS](../demo/chat/doc/CLIENTS.md) |
 | fix a board that stops responding | [CHAT_PLAN §18](plans/CHAT_PLAN.md) and [`board/kv260/`](../board/kv260/) |
 | debug a strange RTL simulation failure | [SIMULATION_ISSUES](build-and-test/SIMULATION_ISSUES.md) |
 

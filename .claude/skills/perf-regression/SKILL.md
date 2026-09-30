@@ -44,7 +44,7 @@ $PY demo/chat/deploy.py --status      # exit 0 = running and healthy
   http://192.168.100.8:8000/health: no answer          (exit 1: not running)
 ```
 `active` (and a /health answer) = running: note it (step 6 restarts it),
-then `$PY demo/chat/deploy.py --stop` (demo/chat/README.md; `--stop` and
+then `$PY demo/chat/deploy.py --stop` (demo/chat/doc/DEPLOY.md; `--stop` and
 the restart were not exercised when this skill was validated — the server
 was already stopped).  Never touch `/root/kv260_chat` or other production
 directories on the board.

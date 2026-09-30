@@ -113,7 +113,7 @@ def load_config(path: Optional[str]) -> dict:
     if not p.exists():
         print(f"\nERROR: {p} not found.\n\n  cp '{EXAMPLE}' '{p}'\n  $EDITOR '{p}'\n\n"
               f"The BERT-SQuAD demo config it points at (bert_squad_config) supplies ssh, the\n"
-              f"UIO devices, the weights directory and the board lock; see {CHAT / 'README.md'}.\n",
+              f"UIO devices, the weights directory and the board lock; see {CHAT / 'doc' / 'DEPLOY.md'}.\n",
               file=sys.stderr)
         sys.exit(2)
     cfg = json.loads(p.read_text())

@@ -18,7 +18,7 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, echo; the first is the default model. Each generative one needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow.",
+    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice. See doc/DEPLOY.md.",
     "resident": "auto",
     "_resident_note": "auto = keep the FPGA models loaded while CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,

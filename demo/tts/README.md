@@ -3,7 +3,7 @@
 This directory runs Piper (VITS) text to speech with the
 [`en_US-lessac-medium`](https://huggingface.co/rhasspy/piper-voices) voice
 on this repo's FPGA kernels, and serves it as OpenAI's
-`POST /v1/audio/speech` in the [chat server](../chat/README.md#text-to-speech--piper-lessac-medium).
+`POST /v1/audio/speech` in the [chat server](../chat/doc/TEXT_TO_SPEECH.md).
 
 Plan, study and results: [`doc/plans/TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md).
 - §3: the numeric study.

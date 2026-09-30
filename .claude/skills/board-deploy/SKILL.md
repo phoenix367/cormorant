@@ -100,7 +100,7 @@ previous project left there (2026-09-25: stale demo projects ran with
 `b_packed = 1` left by the model set and mispredicted).  The chat
 server's libraries too: `demo/chat/scripts/generate_llm_project.py` +
 `scripts/llm_board.py --install-only` per model, `demo/chat/deploy.py
---regenerate` for its BERT project (demo/chat/README.md).  Run the demos
+--regenerate` for its BERT project (demo/chat/doc/DEPLOY.md).  Run the demos
 and the model set SEQUENTIALLY — they share the kernels.  Local configs
 must name the VectorOP UIO `fabric_vecop` (the overlay's name after a
 clean boot; older boards showed `fabric`).

@@ -400,8 +400,17 @@ board logits differ from the simulation, 1 = a step failed.
   (`logits.bin`, start[256] then end[256] per example); the host divides by
   256 and decodes the best span (`squad_text.best_span`: top-20 start / end
   candidates inside the context, length ≤ 30; equal logits are ranked by
-  position, the order of a stable argsort — the former `np.argsort` gave the
-  same spans on every real logit set checked, see `demo/chat/README.md`).
+  position, the order of a stable argsort).
+  - **Why the tie order changed.**  `best_span` moved to `squad_text.py`,
+    which the chat server shares.  numpy's unstable `argsort` ranked equal
+    logits in an order that depends on the numpy build.
+  - **Real logits: unchanged.**  The spans are the same on every real logit
+    set checked: the board, float and emulation logits (60 / 60),
+    `bert_study.py --policies q88,sched --n 5`, `prepare_inputs.py`
+    (byte-identical inputs) and `bert_sched_check.py --n 2`.
+  - **Synthetic tie-heavy logits.**  2844 / 3000 spans are unchanged; the
+    rest differ only by the tie order.  Against the old code with a stable
+    sort, 3000 / 3000 agree.
 * **Bit-exactness.**  The host ops compute in double with
   `-ffp-contract=off` and libm's `exp` / `tanh` (since phase 2B GELU and
   Softmax's `exp` are 65 536-entry tables filled at init with the same

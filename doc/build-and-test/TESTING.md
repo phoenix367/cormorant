@@ -124,7 +124,7 @@ an existing platform's bounds*) — re-run the generators after any
 
 ### Chat app tests
 
-The chat server's tests ([`demo/chat/`](../../demo/chat/README.md#tests))
+The chat server's tests ([`demo/chat/doc/DEVELOPMENT.md`](../../demo/chat/doc/DEVELOPMENT.md#tests))
 run with the same venv, from the repo root:
 
 ```bash

@@ -284,9 +284,12 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
   tables, weight files, generation time / RAM), gates (sched check, host emu,
   board), board table (decode at 32 / 256 / 1000, prefill 16 / 64 / 256,
   `llm_open` cached / cold, CMA), chat API turns, deploying it, residency.
-- `demo/chat/README.md`: backends list, a section like "SmolLM2-360M-Instruct
-  — `smollm2-360m`" with the commands, the pool list under "The FPGA and the
-  board lock", the by-hand server command, the test count.
+- `demo/chat/README.md`: a row in the "What it serves" table.
+  `demo/chat/doc/`: the model's guide (a section like "SmolLM2-360M-Instruct"
+  in `SMOLLM2.md`, or a new file linked from the README) with the commands;
+  in `DEPLOY.md` the backends table, the pool table under "The FPGA and the
+  board lock" and the by-hand server command; the test count in the README
+  and `DEVELOPMENT.md`.
 - `README.md`: the results table (~line 32) and the supported-models table
   (~line 253); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
   `kv260_chat_server.py`'s docstring, `chat_config.json.example`, and
@@ -300,7 +303,7 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
 $SPY demo/chat/scripts/vlm_study.py fetch       # pins: vlm_study_inputs.json (not llm_models.json); + COCO images
 $SPY demo/chat/scripts/vlm_study.py validate
 $SPY demo/chat/scripts/vlm_study.py formats     # text + vision formats -> assets/study/smolvlm-256m-instruct/ (~3 min)
-$PY demo/chat/scripts/generate_llm_project.py --model-name smolvlm-256m-instruct   # assets implied; 100 s, ~20 GB
+$PY demo/chat/scripts/generate_llm_project.py --model-name smolvlm-256m-instruct   # assets implied; 90 s, 3.3 GiB (CHAT_PLAN §25)
 $PY demo/chat/scripts/vlm_sched_check.py --text  # vision 2/2 images + text 2/2 prompts x 16 steps bit-exact
 $PY demo/chat/scripts/vlm_host_emu.py [--incoherent]           # HOST EMULATION: logits bit-exact, re-open identical
 $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_smolvlm_256m --decode 16 --reopen [--profile]
