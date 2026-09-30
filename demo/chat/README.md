@@ -119,10 +119,11 @@ uses).
 Prerequisites are those of the [`bert_squad/`](../bert_squad/) demo: its
 config, the HLS driver sources, the model and `vocab.txt`.  The weights go to
 the board once.
-- **The assets.** `../bert_squad/scripts/fetch_assets.py model vocab`
-  downloads the model and `vocab.txt`.  Generating the BERT project also
-  downloads the model when it is missing, but `deploy.py` needs `vocab.txt`
-  in place.
+- **The assets are downloaded when missing.**  `deploy.py` fetches
+  `vocab.txt` before it touches the board.  Generating the BERT project
+  fetches the model (435 MB).  Both go to the paths in the BERT config,
+  through `../bert_squad/scripts/fetch_assets.py`, which also fetches them
+  ahead of time.
 - **The generative backend** also needs `libsmollm2.so` on the board (see
   below).
 
@@ -1077,7 +1078,7 @@ transformers `generate(do_sample=False)`, the 2nd and 3rd turns prefilling
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 179 tests, ~45 s, stdlib only (a C compiler for the C parts; Pillow and the SmolVLM tokenizer for the image tests; numpy, ffmpeg and libespeak-ng for the speech tests)
+python3 -m unittest -v                  # 185 tests, ~45 s, stdlib only (a C compiler for the C parts; numpy and paramiko for the deploy tests; Pillow and the SmolVLM tokenizer for the image tests; numpy, ffmpeg and libespeak-ng for the speech tests)
                                         # ~60 skip until the SmolLM2 / SmolVLM tokenizers (llm_calibrate.py / vlm_study.py fetch) and BERT's vocab.txt (../bert_squad/scripts/fetch_assets.py vocab) are present
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 
@@ -1142,6 +1143,16 @@ over HTTP (and a text model's 400).  `test_speech.py` —
 end (sentence packing, the chunk loop, seeds, cancellation, the log
 line), and `piper_phonemize.py` against espeak-ng when it is installed
 (clause terminators, Piper's ids).
+
+`test_deploy_vocab.py` — `deploy.py` fetches BERT's `vocab.txt` before
+anything else:
+- it downloads to the BERT config's path, before the project is generated
+  and before the board connection;
+- it keeps an existing file;
+- a failed download stops the deploy;
+- `--check-only` downloads nothing.
+
+It needs numpy and paramiko, and is skipped without them.
 
 **Tokenizer reference.**  `validate_text.py` compares against transformers'
 `TokenizersBackend.from_pretrained` — the `tokenizer.json` pipeline, what

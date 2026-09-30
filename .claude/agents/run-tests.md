@@ -38,7 +38,7 @@ reasons, known warnings, typical duration) are in
 | suite | what | time |
 |---|---|---|
 | `scheduler` | `inference-scheduler/` pytest `test/` (1615 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
-| `chat` | `demo/chat/tests` pytest (179 tests) | ~50 s |
+| `chat` | `demo/chat/tests` pytest (185 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `csim` | `make -j8` + `ctest` in `build/` — kernel C simulation (Vitis headers) | 2–5 min |
 | `tts-host` | Piper library: generated C on the host vs the spec (`tts_host_emu.py`, `--lib-check`) | ~3 min |

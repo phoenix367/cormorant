@@ -10,6 +10,8 @@ host with inference-scheduler/.venv/bin/python).
   build    -> project sources to <dir>/project, cmake + make bert_squad,
               <dir>/lib/libbert_squad.so (skipped when the sources and the
               cmake options are unchanged since the last build)
+  vocab    -> BERT's vocab.txt (the BERT config's inputs.vocab), downloaded
+              first when missing (demo/bert_squad/scripts/fetch_assets.py)
   server   -> kv260_chat_server.py, chat_backend.py, bert_squad_backend.py,
               squad_text.py, chat.py, vocab.txt, and the smollm2 side
               (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
@@ -401,10 +403,23 @@ def upload_and_build(session: RemoteSession, cfg: dict, summary: dict, force: bo
     return ok
 
 
+def vocab_path(cfg: dict) -> Path:
+    """BERT's WordPiece vocabulary (the BERT config's inputs.vocab), which the
+    server loads."""
+    return bert_common.demo_path(cfg["_bert"].get("inputs", {}).get("vocab", "assets/vocab.txt"))
+
+
+def ensure_vocab(cfg: dict) -> Path:
+    """vocab_path(cfg), downloaded first when missing (231 KB, md5-checked,
+    demo/bert_squad/scripts/fetch_assets.py); exits with the error when the
+    download fails."""
+    return bert_common.ensure_asset("vocab", vocab_path(cfg))
+
+
 def upload_server(session: RemoteSession, cfg: dict) -> bool:
     t0 = time.monotonic()
     d = cfg["remote"]["dir"]
-    vocab = bert_common.demo_path(cfg["_bert"].get("inputs", {}).get("vocab", "assets/vocab.txt"))
+    vocab = vocab_path(cfg)
     session.exec_checked(f"mkdir -p {d}", timeout=15)
     sftp = session._client.open_sftp()                          # noqa: SLF001
     try:
@@ -676,6 +691,8 @@ def main(argv=None) -> int:
         finally:
             session.close()
 
+    if not args.check_only:
+        ensure_vocab(cfg)                       # before the board work: a download error stops here
     summary = ensure_project(cfg, args.regenerate, args.plan) if not args.check_only else None
     lock = None if args.no_lock else lock_path(cfg)
     stop_on_exit = False
