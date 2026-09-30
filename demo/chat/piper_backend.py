@@ -12,12 +12,14 @@ the KV260 for the chat server (POST /v1/audio/speech; doc/plans/TTS_PLAN.md §5)
       decoder in chunks of 128 frames (1.49 s of audio, ~0.7 s each); every
       chunk's samples go to the client as soon as they exist
 
-The voice directory (--tts-weights) holds the library's weights/*.dat,
-frontend.npz (the text encoder's and duration predictor's weights) and
-voice.json (phoneme ids, espeak voice, noise / length scales), written by
-demo/tts/scripts/generate_tts_project.py and installed by tts_board.py.
-Deterministic: the noise is seeded by the request's seed (default 0).
-Needs numpy and libespeak-ng.so.1 (+ espeak-ng-data) on the board.
+The voice directory (--tts-weights) holds the library's weights/*.dat (the
+duration predictor's weights/dp.dat among them) and voice.json (phoneme ids,
+espeak voice, noise / length scales), written by
+demo/tts/scripts/generate_tts_project.py and installed by tts_board.py.  The
+library must export tts_encode and tts_duration (built since TTS_PLAN §6 /
+§7); load() refuses an older one.  Deterministic: the noise is seeded by the
+request's seed (default 0).  Needs numpy (the length regulator and the
+noise) and libespeak-ng.so.1 (+ espeak-ng-data) on the board.
 """
 
 from __future__ import annotations
@@ -61,11 +63,13 @@ class LibTtsEngine:
         for name, (args, res) in sig.items():
             f = getattr(lib, name)
             f.argtypes, f.restype = args, res
-        if hasattr(lib, "tts_encode"):                  # libraries with the FPGA text encoder
+        # The text encoder (TTS_PLAN §6) and the duration predictor (§7): an
+        # older library lacks them and PiperBackend.load() refuses it.
+        if hasattr(lib, "tts_encode"):
             lib.tts_encode.argtypes = [ctypes.POINTER(ctypes.c_int32), ctypes.c_int, fp, fp, fp]
             lib.tts_encode.restype = ctypes.c_int
             lib.tts_max_ids.argtypes, lib.tts_max_ids.restype = [], ctypes.c_int
-        if hasattr(lib, "tts_duration"):                # ... and the C duration predictor
+        if hasattr(lib, "tts_duration"):
             dp = ctypes.POINTER(ctypes.c_double)
             lib.tts_duration.argtypes = [fp, ctypes.c_int, dp, dp]
             lib.tts_duration.restype = ctypes.c_int
@@ -185,13 +189,11 @@ class PiperBackend(Backend):
         self._espeak = phonemizer              # tests: a stand-in with clauses(text)
         self._encoder = encoder                # ids -> (x, m_p, logs_p); default: the library's (FPGA)
         self._duration = duration              # (x, z) -> logw; default: the library's (C)
-        self.W = None
         self.stats = {"requests": 0, "audio_s": 0.0, "chunks": 0, "fpga_s": 0.0, "frontend_s": 0.0}
 
     # ── host side ──
 
     def load_host(self) -> None:
-        import numpy as np
         if not self.voice:
             raise BackendError(f"{self.voice_dir}/voice.json not found (tts_board.py --install-only)")
         if self._espeak is None:
@@ -200,19 +202,17 @@ class PiperBackend(Backend):
                                   self.espeak_lib, self.espeak_data)
         if self._frontend is None:
             import piper_vits
-            with np.load(os.path.join(self.voice_dir, "frontend.npz")) as z:
-                self.W = {k: z[k].astype(np.float64) for k in z.files}
             inf = self.voice.get("inference", {})
 
             def fe(ids, speed, seed):
-                enc = self._encoder or (self.engine.encode if getattr(self.engine, "has_encode", False)
-                                        else None)            # None: the numpy text encoder
-                dur = self._duration or (self.engine.duration if getattr(self.engine, "has_duration", False)
-                                         and getattr(self.engine, "lib", None) is not None else None)
+                # the encoder and the duration predictor are the library's (or the
+                # caller's stand-ins): front_end reads no weights of its own (W=None)
                 return piper_vits.front_end(
-                    self.W, ids, noise_scale=inf.get("noise_scale", 0.667),
+                    None, ids, noise_scale=inf.get("noise_scale", 0.667),
                     length_scale=inf.get("length_scale", 1.0) / speed,
-                    noise_w=inf.get("noise_w", 0.8), seed=seed, fast_erf=True, encoder=enc, duration=dur)
+                    noise_w=inf.get("noise_w", 0.8), seed=seed, fast_erf=True,
+                    encoder=self._encoder or self.engine.encode,
+                    duration=self._duration or self.engine.duration)
             self._frontend = fe
 
     def phoneme_ids(self, text: str) -> List[List[int]]:
@@ -252,6 +252,20 @@ class PiperBackend(Backend):
         if self.engine.sample_rate and self.engine.sample_rate != self.sample_rate:
             raise BackendError(f"libpiper_tts.so runs at {self.engine.sample_rate} Hz, voice.json says "
                                f"{self.sample_rate}")
+        eng = self.engine
+        lib = getattr(eng, "lib_path", "libpiper_tts.so")
+        missing = [f for f, have, own in (("tts_encode", getattr(eng, "has_encode", True), self._encoder),
+                                          ("tts_duration", getattr(eng, "has_duration", True), self._duration))
+                   if not have and own is None]
+        if missing:
+            eng.close()
+            raise BackendError(f"{lib} has no {' / '.join(missing)} (built before TTS_PLAN §6 / §7): "
+                               f"regenerate it with demo/tts/scripts/generate_tts_project.py and install it "
+                               f"with tts_board.py --install-only")
+        if 0 < getattr(eng, "max_ids", 0) < self.max_ids:
+            eng.close()
+            raise BackendError(f"{lib} encodes at most {eng.max_ids} phoneme ids; the server packs "
+                               f"utterances of up to {self.max_ids}")
 
     def unload(self) -> None:
         self.engine.close()

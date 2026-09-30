@@ -121,7 +121,7 @@ for.
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 185 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 188 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

@@ -10,10 +10,11 @@ without the board.
 
 With --lib-check, libpiper_tts.so is built the same way and driven by the chat
 server's backend (demo/chat/piper_backend.py: LibTtsEngine through ctypes —
-tts_encode and the chunks —, the espeak-ng phonemizer of the host, the rest
-of the front end from weights/frontend.npz) for a few sentences: its z_p
-must equal the front end on the spec encoder (encoder_forward), its samples
-the specification on that z_p.
+tts_encode, tts_duration and the chunks —, the espeak-ng phonemizer of the
+host, the length regulator and the noise of piper_vits.front_end) for a few
+sentences: its z_p must equal the front end on the spec encoder
+(encoder_forward) and the spec duration predictor (duration_predictor_seq),
+its samples the specification on that z_p.
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/tts_host_emu.py
            [--project demo/tts/build/piper_project] [--utts eval00,eval10] [--incoherent]
@@ -98,7 +99,7 @@ def lib_check(project: str, work: str, texts) -> bool:
             t0 = time.time()
             out = list(b.synthesize(job, CancelToken()))
             # the backend's z_p (tts_encode through ctypes) == the front end on the spec encoder
-            zref = [tb.pv.front_end(b.W, ids, seed=job.seed + j, fast_erf=True, encoder=enc,
+            zref = [tb.pv.front_end(None, ids, seed=job.seed + j, fast_erf=True, encoder=enc,
                                     duration=lambda x, z: tb.pv.duration_predictor_seq(W, x, z))
                     for j, ids in enumerate(job.groups)]
             zsame = all(a.shape == r.shape and np.array_equal(a, r) for a, r in zip(job.utterances, zref, strict=True))

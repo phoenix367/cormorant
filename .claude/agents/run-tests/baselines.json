@@ -1,12 +1,12 @@
 {
  "_doc": "Written by run_tests.py --record-baseline from a clean whole-suite run; edit by hand to widen. min_tests: fewer is an anomaly; max_skipped / skip_allow (regexes over the skip reason): other skips are unexpected; warning_allow (regexes over 'category: message'): known warnings; typical_duration_s: a run under 40 % of it is an anomaly. No skip is expected in the scheduler suite since test_bert_base.py downloads its model (a skip there means BERT_SQUAD_DOWNLOAD=0 or a failed download); csim's known warning is in the Vitis ap_private.h header and only shows when a test is recompiled.",
  "chat": {
-  "min_tests": 185,
+  "min_tests": 188,
   "max_skipped": 0,
   "skip_allow": [],
   "warning_allow": [],
-  "typical_duration_s": 47.0,
-  "recorded": "2026-09-30 21:46"
+  "typical_duration_s": 45.4,
+  "recorded": "2026-10-01 03:30"
  },
  "csim": {
   "min_tests": 7,
@@ -33,5 +33,13 @@
   "warning_allow": [],
   "typical_duration_s": 212.4,
   "recorded": "2026-09-30 19:33"
+ },
+ "lint": {
+  "min_tests": 0,
+  "max_skipped": 0,
+  "skip_allow": [],
+  "warning_allow": [],
+  "typical_duration_s": 0.0,
+  "recorded": "2026-10-01 03:30"
  }
 }

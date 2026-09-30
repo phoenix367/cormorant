@@ -609,11 +609,12 @@ def front_end(W, ids, noise_scale=0.667, length_scale=1.0, noise_w=0.8, seed=0, 
               encoder=None, duration=None):
     """Host front end (float64): text encoder, durations, alignment, noise ->
     z_p [192][frames] (float32, as handed to the library).  fast_erf: the
-    duration predictor's GELU on erf_fast (the chat server's choice).
+    duration predictor's GELU on erf_fast.
     ``encoder``: ids -> (x, m_p, logs_p) [192][n] in place of text_encoder
     (the library's int16 encoder); ``duration``: (x, z) -> logw in place of
     duration_predictor (the library's C one; z = the noise * noise_w, drawn
-    where duration_predictor draws it)."""
+    where duration_predictor draws it).  With both given, W is not read (the
+    chat server passes None)."""
     rng = np.random.default_rng(seed)
     x, m_p, logs_p = (encoder or (lambda i: text_encoder(W, np.asarray(i))))(ids)
     if duration is None:

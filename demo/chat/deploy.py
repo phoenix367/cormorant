@@ -34,7 +34,7 @@ they are there.  The smollm2 block's sampling defaults apply to all three.
 The piper backend (text to speech, POST /v1/audio/speech) needs
 libpiper_tts.so (piper.lib, default <dir>/lib/libpiper_tts.so) and its voice
 directory (piper.weights_dir, default /root/piper_weights: weights/*.dat,
-frontend.npz, voice.json), both installed by demo/tts/scripts/tts_board.py
+voice.json), both installed by demo/tts/scripts/tts_board.py
 --install-only, plus numpy and libespeak-ng1 on the board (ffmpeg for mp3 /
 opus / aac / flac).
 
@@ -314,7 +314,7 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     if uses_tts(cfg):
         tts, how = cfg["piper"], "demo/tts/scripts/tts_board.py --install-only (TTS_PLAN §5)"
         for label, path in (("libpiper_tts.so (piper)", tts["lib"]),
-                            ("  frontend.npz", f"{tts['weights_dir']}/frontend.npz"),
+                            ("  weights/dp.dat", f"{tts['weights_dir']}/weights/dp.dat"),
                             ("  voice.json", f"{tts['weights_dir']}/voice.json")):
             _, _, rc = session.exec(f"test -f {shlex.quote(path)}", timeout=15)
             good = rc == 0

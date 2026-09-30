@@ -105,7 +105,7 @@ A text-to-speech backend sets `speech = True` and implements
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 185 tests, ~45 s
+python3 -m unittest -v                  # 188 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 
@@ -194,8 +194,13 @@ Speech:
   - speech and chat sharing the FPGA queue.
 - `test_piper_backend.py` — the Piper backend over a fake library and
   front end (sentence packing, the chunk loop, seeds, cancellation, the log
-  line), and `piper_phonemize.py` against espeak-ng when it is installed
-  (clause terminators, Piper's ids).
+  line).
+  - The real front end over a stand-in for the library's encoder and
+    duration predictor, from a voice directory holding only `voice.json`.
+  - A library without `tts_encode` / `tts_duration`, or with fewer ids per
+    utterance than the server packs, is refused.
+  - `piper_phonemize.py` against espeak-ng when it is installed (clause
+    terminators, Piper's ids).
 
 Client and deploy:
 - `test_chat_client.py` — `chat.py`'s audio: streaming into a recording

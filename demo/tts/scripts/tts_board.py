@@ -7,8 +7,8 @@ real-time factor, tts_open time, CMA and the close / re-open cycle.
 
   upload  project sources (demo/tts/build/piper_project, generate_tts_project.py)
           -> <remote dir>/piper_project (weights/ and build/ excluded)
-  weights weights/*.dat -> <weights dir>/weights (only changed files);
-          weights/frontend.npz + voice.json -> <weights dir>/ (the chat
+  weights weights/*.dat (dp.dat included) -> <weights dir>/weights (only
+          changed files); weights/voice.json -> <weights dir>/ (the chat
           server's front end, demo/chat/piper_backend.py)
   build   cmake -DINFERENCE_WEIGHTS_DIR=<weights dir> + make tts_bench piper_tts
           (and build_prof/ with -DINFERENCE_PROFILING=ON when --profile)
@@ -237,22 +237,28 @@ def breakdown(profile: dict, layers: list, per: int = 1) -> dict:
 
 
 def sync_voice(session, project: str, weights_dir: str) -> str:
-    """weights/frontend.npz + voice.json -> <weights_dir>/ when their SHA-1
-    differs from the board's copy."""
+    """weights/voice.json -> <weights_dir>/ when its SHA-1 differs from the
+    board's copy; removes the frontend.npz that older installs left there
+    (the server has not read it since the library runs the encoder and the
+    duration predictor)."""
     import hashlib
     sent = []
+    out, _, _ = session.exec(f"test -f {weights_dir}/frontend.npz && rm -f {weights_dir}/frontend.npz "
+                             f"&& echo removed", timeout=30)
+    if "removed" in out:
+        sent.append("obsolete frontend.npz removed")
     sftp = session._client.open_sftp()                           # noqa: SLF001
     try:
-        for name in ("frontend.npz", "voice.json"):
+        for name in ("voice.json",):
             local = os.path.join(project, "weights", name)
             sha = hashlib.sha1(open(local, "rb").read()).hexdigest()
             out, _, _ = session.exec(f"sha1sum {weights_dir}/{name} 2>/dev/null", timeout=60)
             if out.split()[:1] != [sha]:
                 sftp.put(local, f"{weights_dir}/{name}")
-                sent.append(name)
+                sent.append(f"{name} uploaded")
     finally:
         sftp.close()
-    return ", ".join(sent) + " uploaded" if sent else "unchanged"
+    return ", ".join(sent) if sent else "unchanged"
 
 
 def main(argv=None) -> int:

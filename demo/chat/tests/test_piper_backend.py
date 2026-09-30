@@ -6,7 +6,7 @@ import ctypes.util
 import os
 import unittest
 
-from _util import LOG, RunningServer
+from _util import CHAT, LOG, RunningServer, wait_until
 
 from chat_backend import BackendError, Cancelled, CancelToken, SpeechRequest
 
@@ -134,13 +134,95 @@ class TestPiperBackend(unittest.TestCase):
             self.assertEqual(int(hd["content-length"]), len(out))
             self.assertEqual(hd["x-sample-rate"], "22050")
             self.assertEqual(b.engine.opened, 1)
-            st, hd, out = srv.request("GET", "/health")
-            m = __import__("json").loads(out)["models"][0]
+
+            def model():
+                return __import__("json").loads(srv.request("GET", "/health")[2])["models"][0]
+            # the backend counts the request after its last audio bytes went out
+            self.assertTrue(wait_until(lambda: model()["requests"] == 1))
+            m = model()
             self.assertEqual((m["id"], m["type"], m["requests"]), ("piper-lessac-medium", "speech", 1))
-            self.assertTrue(any("model=piper-lessac-medium" in ln and "chunks=" in ln and "rtf=" in ln
-                                for ln in LOG), LOG)
+            self.assertTrue(wait_until(lambda: any("model=piper-lessac-medium" in ln and "chunks=" in ln
+                                                   and "rtf=" in ln for ln in LOG)), LOG)
         finally:
             srv.close()
+
+
+class LibLikeEngine(FakeEngine):
+    """A FakeEngine with the library's text encoder and duration predictor:
+    x = 0, m_p = the id, logs_p = -30 (no noise), logw = log(2) (2 frames
+    per id)."""
+
+    def __init__(self, has_encode=True, has_duration=True, max_ids=400):
+        super().__init__()
+        self.has_encode, self.has_duration, self.max_ids = has_encode, has_duration, max_ids
+        self.lib_path = "libpiper_tts.so"
+        self.encoded = self.durations = 0
+
+    def encode(self, ids):
+        self.encoded += 1
+        n = len(ids)
+        return (np.zeros((192, n)), np.tile(np.asarray(ids, np.float64), (192, 1)), np.full((192, n), -30.0))
+
+    def duration(self, x, z):
+        self.durations += 1
+        return np.full(x.shape[1], np.log(2.0))
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class TestLibraryFrontEnd(unittest.TestCase):
+    """The real front end (piper_vits.front_end over the library's encoder and
+    duration predictor) from a voice directory without frontend.npz."""
+
+    @classmethod
+    def setUpClass(cls):
+        tts = os.path.join(os.path.dirname(CHAT), "tts", "scripts")
+        if tts not in __import__("sys").path:
+            __import__("sys").path.insert(0, tts)
+
+    def backend(self, engine, **kw):
+        import json
+        import tempfile
+
+        import piper_backend as pb
+        self.td = tempfile.TemporaryDirectory()
+        with open(os.path.join(self.td.name, "voice.json"), "w") as f:
+            json.dump({"phoneme_id_map": ID_MAP, "audio": {"sample_rate": 22050},
+                       "inference": {"noise_scale": 0.667, "length_scale": 1.0, "noise_w": 0.8}}, f)
+        b = pb.PiperBackend(engine, self.td.name, phonemizer=FakeEspeak(), **kw)
+        b.load_host()                                             # no frontend.npz needed
+        return b
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_front_end_runs_on_the_library(self):
+        eng = LibLikeEngine()
+        b = self.backend(eng)
+        self.assertEqual(os.listdir(self.td.name), ["voice.json"])
+        b.load()
+        job = b.prepare_speech(SpeechRequest(model=b.model_id, input="Hello there."))
+        list(b.synthesize(job, CancelToken()))
+        ids = job.groups[0]
+        self.assertEqual((eng.encoded, eng.durations), (1, 1))
+        zp = job.utterances[0]
+        self.assertEqual(zp.shape, (192, 2 * len(ids)))          # ceil(exp(log 2)) = 2 frames per id
+        np.testing.assert_allclose(zp[0], np.repeat(ids, 2), atol=1e-9)   # m_p; noise ~exp(-30)
+
+    def test_old_library_is_refused(self):
+        for kw, name in (({"has_encode": False}, "tts_encode"), ({"has_duration": False}, "tts_duration")):
+            eng = LibLikeEngine(**kw)
+            b = self.backend(eng)
+            with self.assertRaises(BackendError) as cm:
+                b.load()
+            self.assertIn(name, cm.exception.message)
+            self.assertEqual(eng.closed, 1)
+
+    def test_fewer_ids_than_packed_is_refused(self):
+        b = self.backend(LibLikeEngine(max_ids=200))
+        with self.assertRaises(BackendError) as cm:
+            b.load()
+        self.assertIn("at most 200", cm.exception.message)
+        self.assertIsNotNone(self.backend(LibLikeEngine(max_ids=200), max_ids=200).load() or True)
 
 
 def _espeak():

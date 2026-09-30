@@ -49,7 +49,7 @@ demo/tts/
 │   │                            (front_end); also runs in the server
 │   ├── piper_study.py         — fetch / phonemize / validate / calibrate / study / encoder / costs (TTS_PLAN §3, §6)
 │   ├── generate_tts_project.py — src/piper.py's chunk + encode_<T> entries -> build/piper_project
-│   │                            (+ test/tts_glue.h, frontend.npz, voice.json)
+│   │                            (+ test/tts_glue.h, weights/dp.dat, voice.json)
 │   ├── tts_host_emu.py        — the generated C on the host vs the spec; --lib-check: the chat backend over it
 │   ├── tts_board.py           — build / install on the board, board gate (bit-exact, timing, profile)
 │   ├── tts_speech_check.py    — /v1/audio/speech on the board vs the same pipeline on the host

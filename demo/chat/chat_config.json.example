@@ -93,7 +93,7 @@
     "lib": null,
     "_lib_note": "null = <remote.dir>/lib/libpiper_tts.so (Piper text to speech, POST /v1/audio/speech; backend name \"piper\"). Built and installed with the voice by demo/tts/scripts/tts_board.py --install-only.",
     "weights_dir": "/root/piper_weights",
-    "_weights_dir_note": "The voice directory: weights/*.dat of the library, frontend.npz, voice.json.",
+    "_weights_dir_note": "The voice directory: weights/*.dat of the library (the duration predictor's weights/dp.dat among them) and voice.json.",
     "cma_mb": 55
   }
 }

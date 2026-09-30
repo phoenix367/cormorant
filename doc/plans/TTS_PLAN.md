@@ -910,3 +910,17 @@ What remains before the first sound, for a 268-id sentence:
 
 The first chunk is the main lever: a shorter first chunk, or larger chunks
 with less overlap afterwards (§4).
+
+### The server's own weights dropped (2026-10-01)
+
+With the encoder and the duration predictor in the library, the chat
+server's front end reads no weights: `frontend.npz` (§5: the text encoder's
+and the predictor's weights, 27.7 MB, 52.6 MiB as float64 in the server
+process) is no longer written, installed or loaded.
+- **The voice directory** is now `weights/*.dat` (with `dp.dat`) and
+  `voice.json`.  `tts_board.py --install-only` removes an old
+  `frontend.npz` from it.
+- **Older libraries.**  The backend refuses a library without `tts_encode`
+  / `tts_duration`, and one that encodes fewer ids than it packs per
+  utterance.
+- **The deploy preflight** checks `weights/dp.dat` instead of the npz.

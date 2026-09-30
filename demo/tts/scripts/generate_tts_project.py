@@ -12,8 +12,9 @@ project behind libpiper_tts.so (doc/plans/TTS_PLAN.md §4).
      test/tts_glue.h (the encode buckets and their run functions), CMake
      targets tts_bench and piper_tts (libpiper_tts.so: only the tts_*
      symbols exported), project.json, layers.json
-  4. weights/frontend.npz + weights/voice.json: the host front end of the
-     chat server (demo/chat/piper_backend.py)
+  4. weights/dp.dat (the C duration predictor's weights) and
+     weights/voice.json (phoneme ids, espeak voice, sampling defaults) for
+     the chat server's front end (demo/chat/piper_backend.py)
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/generate_tts_project.py
            [--assets DIR] [--out-dir demo/tts/build/piper_project] [--driver-dirs JSON]
@@ -75,15 +76,11 @@ def populate_drivers(out: str, driver_dirs: dict, active) -> list:
     return missing
 
 
-def write_frontend(out: str, W: dict, voice_json: str) -> None:
-    """weights/frontend.npz (the text encoder's and the duration predictor's
-    weights, float32 as in the voice) and weights/voice.json (phoneme ids,
-    espeak voice, sampling defaults) for the chat server's host front end
-    (piper_vits.front_end; demo/chat/piper_backend.py)."""
-    import numpy as np
-    keys = sorted(k for k in W if k == "emb" or k.startswith(("enc_p.", "dp.")))
-    np.savez(os.path.join(out, "weights", "frontend.npz"),
-             **{k: np.asarray(W[k], np.float32) for k in keys})
+def write_voice(out: str, voice_json: str) -> None:
+    """weights/voice.json (phoneme ids, espeak voice, sampling defaults) for
+    the chat server's front end (demo/chat/piper_backend.py).  The text
+    encoder and the duration predictor are the library's, so the server needs
+    no weights of its own."""
     cfg = json.load(open(voice_json))
     voice = {k: cfg[k] for k in ("audio", "espeak", "inference", "phoneme_id_map", "language", "dataset")
              if k in cfg}
@@ -189,7 +186,7 @@ def main(argv=None) -> int:
     dp = pv.dp_flat(W)                                    # the C duration predictor's weights
     dp.astype("<f4").tofile(os.path.join(out, "weights", "dp.dat"))
     write_glue(out, ENC_BUCKETS, int(dp.size))
-    write_frontend(out, W, os.path.join(a.assets, "en_US-lessac-medium.onnx.json"))
+    write_voice(out, os.path.join(a.assets, "en_US-lessac-medium.onnx.json"))
     patch_cmake(out, cg, {"model_name": "piper-lessac-medium", "sample_rate": info["sample_rate"]})
     layers, base = [], 0                  # MultiEntryGenerator numbers the nodes globally
     for ename, eg in entries:

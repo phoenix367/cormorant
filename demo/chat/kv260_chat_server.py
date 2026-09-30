@@ -34,8 +34,10 @@ Backends (chat_backend.Backend; one model id each)
                libsmolvlm_256m.so; image_url parts as base64 data URLs,
                resized on the host with Pillow)
   piper        model id piper-lessac-medium: text to speech with Piper (VITS)
-               on the FPGA (piper_backend.py, libpiper_tts.so; espeak-ng
-               phonemes and the numpy front end on the host; 22050 Hz mono)
+               on the FPGA (piper_backend.py, libpiper_tts.so: the text
+               encoder on the FPGA, the duration predictor in C; espeak-ng
+               phonemes, the length regulator and the noise on the host;
+               22050 Hz mono)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
 
@@ -1352,7 +1354,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g = ap.add_argument_group("piper (text to speech)")
     g.add_argument("--tts-lib", default=os.path.join(HERE, "lib", "libpiper_tts.so"))
     g.add_argument("--tts-weights", default="/root/piper_weights",
-                   help="the voice directory: weights/*.dat of the library, frontend.npz, voice.json")
+                   help="the voice directory: weights/*.dat of the library (with dp.dat), voice.json")
     g.add_argument("--tts-model-id", default=None, help="default: voice.json model (piper-lessac-medium)")
     g.add_argument("--tts-cma-mb", type=float, default=55.0, help="CMA the Piper library holds (MB)")
     g.add_argument("--tts-espeak-data", default=None, help="espeak-ng-data directory (default: the system's)")
