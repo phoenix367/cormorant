@@ -115,3 +115,9 @@ Packaged workflows in [`.claude/skills/`](../.claude/skills/) (each
 | `perf-regression` | run the kernel benchmarks (and demo latencies) and compare them with the recorded baseline of the loaded bitstream |
 | `perf-calibrate` | measure the per-bitstream performance model that `--plan` needs (after every new bitstream) |
 | `docs-audit` | audit the docs against the code, or reproduce every documented path from a fresh clone |
+
+Subagents in [`.claude/agents/`](../.claude/agents/):
+
+| Agent | Use it to |
+|---|---|
+| `run-tests` | run all or selected test suites and get a structured JSON report. Suites: scheduler and chat pytest, ruff, kernel C-sim, Piper host emulation; RTL only on request. The report lists every failure (with a diagnosis and a flaky rerun), unexpected skip, warning and short run, measured against `run-tests/baselines.json`. The helper also runs on its own: `python3 .claude/agents/run-tests/run_tests.py --suite default`. |
