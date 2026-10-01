@@ -47,10 +47,10 @@ Text to speech (POST /v1/audio/speech): a backend with speech = True serves
 SpeechRequests instead of ChatRequests —
 
         def prepare_speech(self, req):     # outside the FPGA lock: text ->
-            return job                     # phonemes -> the model's input;
-                                           # job.samples = the total length
-        def synthesize(self, job, cancel): # under the FPGA lock
-            for piece in ...:
+            return job                     # phonemes, validation
+        def synthesize(self, job, cancel): # under the FPGA lock; job.samples
+            ...                            # = the total length (or None)
+            for piece in ...:              # before the first yield
                 cancel.check()
                 yield pcm_bytes            # int16 little-endian mono at
             yield Finish("stop", ...)      # self.sample_rate

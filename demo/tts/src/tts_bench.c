@@ -9,25 +9,28 @@
  *      bit-exact comparison with the specification (demo/tts/scripts/
  *      tts_board.py), with an FNV-1a checksum printed per utterance.  With
  *      -DINFERENCE_PROFILING=ON the per-layer profile of utterance 0's first
- *      repetition is printed as a LAYERS_JSON:chunk line (all its chunks).
- *   3. Re-open (-r): tts_close(), CmaFree, tts_open() again, utterance 0
- *      synthesized again and compared bit for bit.
- *   4. The text encoder (-e ids.bin): tts_encode() on every id sequence,
+ *      repetition is printed as phase "chunk" (all its chunks).
+ *   3. The text encoder (-e ids.bin): tts_encode() on every id sequence,
  *      -R repetitions (identical results required), timed; x, m_p, logs_p
  *      appended to enc.bin (-E) for the host's bit-exact comparison; with
- *      profiling LAYERS_JSON:encode for sequence 0.  With -d z.bin (per
+ *      profiling phase "encode" for sequence 0.  With -d z.bin (per
  *      sequence the noise [2][n], float64) also tts_duration() on its x,
  *      timed, logw appended to dur.bin (-D).
+ *   4. Re-open (-r): tts_close(), CmaFree, tts_open() again, utterance 0
+ *      synthesized again and compared bit for bit.
  *
  * utts.bin: int32 count, then per utterance int32 frames and 192 x frames
  * float32 (z_p, channel-major).  pcm.bin: the utterances' int16 samples,
  * frames x 256 each, one after the other.
  * ids.bin: int32 count, then per sequence int32 n and n int32 ids.  enc.bin:
- * per sequence x, m_p, logs_p, each [192][n] float32.
+ * per sequence x, m_p, logs_p, each [192][n] float32.  dur.bin: per
+ * sequence logw [n] float64.
  * Result lines on stdout: "TTS_OPEN: {...}", "TTS_UTT: {...}" per utterance,
- * "TTS_ENC: {...}" per id sequence,
+ * "TTS_DUR: {...}" (with -d) and "TTS_ENC: {...}" per id sequence,
  * "TTS_REOPEN: {...}", "TTS_SUMMARY: {...}", and with profiling
- * "PROFILE_PHASE: chunk" + the profiler's "LAYERS_JSON: {...}".
+ * "PROFILE_PHASE: chunk" (the first utterance's chunks) and
+ * "PROFILE_PHASE: encode_<T>" (each sequence's first call; T = its bucket,
+ * the entry's name), each followed by the profiler's "LAYERS_JSON: {...}".
  *
  * usage: tts_bench [-w weights_dir] [-i utts.bin] [-o pcm.bin] [-R 1] [-r]
  *                  [-e ids.bin] [-E enc.bin] [-d z.bin] [-D dur.bin]
@@ -115,7 +118,8 @@ int main(int argc, char **argv)
         case 'd': z_path = optarg; break;
         case 'D': dur_path = optarg; break;
         default:
-            fprintf(stderr, "usage: %s [-w weights_dir] [-i utts.bin] [-o pcm.bin] [-R 1] [-r]\n",
+            fprintf(stderr, "usage: %s [-w weights_dir] [-i utts.bin] [-o pcm.bin] [-R 1] [-r]\n"
+                            "       [-e ids.bin] [-E enc.bin] [-d z.bin] [-D dur.bin]\n",
                     argv[0]);
             return 2;
         }
@@ -259,7 +263,7 @@ int main(int argc, char **argv)
                 const size_t cn = (size_t)n * (size_t)tts_channels();
                 double t0;
 #if INFERENCE_PROFILING
-                if (e == 0 && r == 0) inference_prof_reset();
+                if (r == 0) inference_prof_reset();          /* every sequence: every bucket profiled */
 #endif
                 t0 = now_ms();
                 bucket = tts_encode(ids, n, o, o + cn, o + 2u * cn);
@@ -269,8 +273,8 @@ int main(int argc, char **argv)
                     return 1;
                 }
 #if INFERENCE_PROFILING
-                if (e == 0 && r == 0) {
-                    printf("PROFILE_PHASE: encode\n");
+                if (r == 0) {                                 /* the phase is the entry's name */
+                    printf("PROFILE_PHASE: encode_%d\n", bucket);
                     inference_prof_dump_json(stdout);
                     fflush(stdout);
                 }

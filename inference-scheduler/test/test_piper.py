@@ -1,5 +1,5 @@
 """Piper (VITS) text to speech (doc/plans/TTS_PLAN.md §4, §6): the chunk entry
-of src/piper.py through the scheduler (Conv exponents, the axi.tts host ops
+of src/piper.py through the scheduler (Conv exponents, the TTS host ops
 of src/tts_nodes.py) against the specification demo/tts/scripts/piper_vits.py
 ``chunk_forward``, and the encode_<T> entries against ``encoder_forward``
 (every bucket and length: the padding never reaches a valid row), bit for

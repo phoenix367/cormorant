@@ -49,7 +49,7 @@ demo/tts/
 │   │                            (front_end); also runs in the server
 │   ├── piper_study.py         — fetch / phonemize / validate / calibrate / study / encoder / costs (TTS_PLAN §3, §6)
 │   ├── generate_tts_project.py — src/piper.py's chunk + encode_<T> entries -> build/piper_project
-│   │                            (+ test/tts_glue.h, weights/dp.dat, voice.json)
+│   │                            (+ test/tts_glue.h, weights/dp.dat, weights/voice.json)
 │   ├── tts_host_emu.py        — the generated C on the host vs the spec; --lib-check: the chat backend over it
 │   ├── tts_board.py           — build / install on the board, board gate (bit-exact, timing, profile)
 │   ├── tts_speech_check.py    — /v1/audio/speech on the board vs the same pipeline on the host
@@ -97,9 +97,14 @@ $PY demo/tts/scripts/tts_speech_check.py             # end to end, ~1 min
 - **The front end on the A53.**
   - The text encoder runs on the FPGA, the duration predictor as C code
     in the library (139 ms for 268 ids; numpy took ~420).
-  - numpy falls back to a naive loop for a matmul with a strided operand,
-    145× slower there, so `conv1d` makes its taps contiguous.
-  - GELU uses `erf_fast` with in-place ufuncs instead of `math.erf`
-    element by element.
+  - Only the length regulator and the noise stay in numpy.
+  - History, from when the numpy front end ran on the board (TTS_PLAN §5):
+    - numpy falls back to a naive loop for a matmul with a strided
+      operand, 145× slower there, so `piper_vits.conv1d` makes its taps
+      contiguous;
+    - GELU used `erf_fast` with in-place ufuncs instead of `math.erf`
+      element by element.
+
+    Both still matter for the float reference and the study on the host.
 - **License:** the voice is MIT, but its training data (Blizzard 2013
   Lessac) has its own license.  Check it before shipping.

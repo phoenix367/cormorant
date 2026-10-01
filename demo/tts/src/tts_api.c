@@ -79,7 +79,7 @@ static int same_dir(const char *a, const char *b)
 
 int tts_open(const char *weights_dir)
 {
-    int rc, cwd = -1;
+    int rc, dp_rc = 0, cwd = -1;
 
     s_err[0] = '\0';
     if (s_open)
@@ -100,8 +100,8 @@ int tts_open(const char *weights_dir)
         }
     }
     rc = inference_init(INFERENCE_CONVKERNEL_INSTANCE);
-    if (rc == 0)                          /* the duration predictor's weights (optional) */
-        (void)tts_dp_load(TTS_API_WEIGHTS_DIR "/weights/dp.dat", TTS_DP_FLOATS);
+    if (rc == 0)                          /* the duration predictor's weights */
+        dp_rc = tts_dp_load(TTS_API_WEIGHTS_DIR "/weights/dp.dat", TTS_DP_FLOATS);
     if (cwd >= 0) {
         if (fchdir(cwd) != 0)
             fprintf(stderr, "tts_api: warning: cannot restore the working directory: %s\n",
@@ -113,6 +113,19 @@ int tts_open(const char *weights_dir)
                 "the weights under %s/weights", rc,
                 weights_dir && *weights_dir ? weights_dir : TTS_API_WEIGHTS_DIR);
         return -4;
+    }
+    if (dp_rc != 0) {                     /* fail here, not in every tts_duration() */
+        inference_deinit();
+        if (dp_rc == -1)
+            set_err("the duration predictor's weights %s/weights/dp.dat are missing",
+                    weights_dir && *weights_dir ? weights_dir : TTS_API_WEIGHTS_DIR);
+        else if (dp_rc == -3)
+            set_err("%s/weights/dp.dat is not the layout this library expects (%d floats): "
+                    "install the weights of the same generated project",
+                    weights_dir && *weights_dir ? weights_dir : TTS_API_WEIGHTS_DIR, TTS_DP_FLOATS);
+        else
+            set_err("loading the duration predictor's weights failed (%d)", dp_rc);
+        return -5;
     }
     s_open = 1;
     return 0;
@@ -175,8 +188,8 @@ int tts_duration(const float *x, int n, const double *z, double *logw)
         set_err("tts_open() first");
         return -1;
     }
-    if (!tts_dp_loaded()) {
-        set_err("the duration predictor's weights (weights/dp.dat, %d floats) are missing", TTS_DP_FLOATS);
+    if (!tts_dp_loaded()) {                 /* tts_open() fails without them: not reached */
+        set_err("the duration predictor's weights (weights/dp.dat) are not loaded");
         return -3;
     }
     if (!x || !z || !logw || n < 1) {

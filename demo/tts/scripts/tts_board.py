@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 tts_board.py — build libpiper_tts.so + tts_bench on the KV260 and run the
-TTS board gate (doc/plans/TTS_PLAN.md §4): the PCM of real utterances bit-exact
-with the specification (piper_vits.synthesize_chunked), ms per chunk, the
-real-time factor, tts_open time, CMA and the close / re-open cycle.
+TTS board gate (doc/plans/TTS_PLAN.md §4, §6, §7): the PCM of real utterances
+bit-exact with the specification (piper_vits.synthesize_chunked), the text
+encoder (encoder_forward) and the duration predictor (duration_predictor_seq)
+bit-exact too, ms per chunk, the real-time factor, tts_open time, CMA and the
+close / re-open cycle.
 
   upload  project sources (demo/tts/build/piper_project, generate_tts_project.py)
           -> <remote dir>/piper_project (weights/ and build/ excluded)
@@ -15,10 +17,13 @@ real-time factor, tts_open time, CMA and the close / re-open cycle.
   install <remote dir>/lib/libpiper_tts.so (remote dir: the chat install
           directory, demo/chat/chat_config.json remote.dir)
   run     tts_bench on utts.bin (z_p of the study's sentences from
-          piper_vits.front_end, seeded by name) and ids.bin (the encoder
-          cases: every encode bucket); pcm.bin and enc.bin downloaded
+          piper_vits.front_end, seeded by name), ids.bin (the encoder
+          cases: every encode bucket) and dpz.bin (the duration predictor's
+          noise per case); the PCM, encoder and logw outputs downloaded
+          (pcm_board_<tag>.bin, enc_board_<tag>.bin, dur_board_<tag>.bin)
   check   every sample against the specification (chunk_forward), every
-          encoder output against encoder_forward; WAVs next to the project
+          encoder output against encoder_forward, every logw against
+          duration_predictor_seq; WAVs in <project>/wav
 
 The board lock is held for the whole session.  Stop the chat server first
 (demo/chat/deploy.py --stop) — it owns the FPGA.

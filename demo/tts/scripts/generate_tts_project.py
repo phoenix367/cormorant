@@ -8,13 +8,13 @@ project behind libpiper_tts.so (doc/plans/TTS_PLAN.md §4).
      to T in ENC_BUCKETS; piper_study.py encoder's exponents)
   2. inference-scheduler: OnnxGraph + CodeGenerator -> <out>/ (CMake
      project, weights/*.dat)
-  3. driver/ for ConvKernel, test/tts_api.{c,h} + test/tts_bench.c +
-     test/tts_glue.h (the encode buckets and their run functions), CMake
-     targets tts_bench and piper_tts (libpiper_tts.so: only the tts_*
-     symbols exported), project.json, layers.json
-  4. weights/dp.dat (the C duration predictor's weights) and
-     weights/voice.json (phoneme ids, espeak voice, sampling defaults) for
-     the chat server's front end (demo/chat/piper_backend.py)
+  3. driver/ for ConvKernel, test/tts_api.{c,h} + test/tts_dp.{c,h} +
+     test/tts_bench.c + test/tts_glue.h (the encode buckets and their run
+     functions), CMake targets tts_bench and piper_tts (libpiper_tts.so:
+     only the tts_* symbols exported), project.json, layers.json
+  4. weights/dp.dat (the C duration predictor's weights, read by
+     tts_open) and weights/voice.json (phoneme ids, espeak voice, sampling
+     defaults) for the chat server's front end (demo/chat/piper_backend.py)
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/generate_tts_project.py
            [--assets DIR] [--out-dir demo/tts/build/piper_project] [--driver-dirs JSON]
@@ -144,17 +144,19 @@ def patch_cmake(out: str, cg, info: dict) -> None:
         f.write(text)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
-    ap.add_argument("--assets", default=DEFAULT_ASSETS)
-    ap.add_argument("--out-dir", default=DEFAULT_OUT)
-    ap.add_argument("--driver-dirs", default=None,
-                    help="JSON {kernel: dir}; default: local.driver_dirs of "
-                         "demo/bert_squad/bert_squad_config.json")
-    a = ap.parse_args(argv)
-    t0 = time.time()
-    W = load_weights(os.path.join(a.assets, "en_US-lessac-medium.onnx"))
-    doc = json.load(open(os.path.join(a.assets, "exponents.json")))
+def entry_graphs(assets: str, W: dict = None) -> list:
+    """[(entry, OnnxGraph)] of libpiper_tts.so in project order: "chunk", then
+    "encode_<T>" for every bucket of ENC_BUCKETS.  Also what
+    inference-scheduler/perf_calibrate.py prices, so its kernel calls are the
+    library's."""
+    return _entries(assets, W)[0]
+
+
+def _entries(assets: str, W: dict = None):
+    """(entry_graphs, the chunk entry's info: frames, sample rate, ...)."""
+    if W is None:
+        W = load_weights(os.path.join(assets, "en_US-lessac-medium.onnx"))
+    doc = json.load(open(os.path.join(assets, "exponents.json")))
     if "encoder" not in doc:
         raise SystemExit("exponents.json has no \"encoder\" exponents: run piper_study.py encoder first")
     model = PiperChunkFrontend(W, doc["exponents"], name="piper_lessac_medium").entry()
@@ -170,7 +172,21 @@ def main(argv=None) -> int:
             kw = {sn.inputs[1].onnx_name: sn.kw for sn in eg.nodes
                   if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight}
         enc[T] = eg
-    entries = [("chunk", g)] + [(f"encode_{T}", enc[T]) for T in ENC_BUCKETS]
+    return [("chunk", g)] + [(f"encode_{T}", enc[T]) for T in ENC_BUCKETS], entry_info(model)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
+    ap.add_argument("--assets", default=DEFAULT_ASSETS)
+    ap.add_argument("--out-dir", default=DEFAULT_OUT)
+    ap.add_argument("--driver-dirs", default=None,
+                    help="JSON {kernel: dir}; default: local.driver_dirs of "
+                         "demo/bert_squad/bert_squad_config.json")
+    a = ap.parse_args(argv)
+    t0 = time.time()
+    W = load_weights(os.path.join(a.assets, "en_US-lessac-medium.onnx"))
+    entries, info = _entries(a.assets, W)
+    g = entries[0][1]
     cg = MultiEntryGenerator(entries, "piper_lessac_medium")
     out = os.path.abspath(a.out_dir)
     if os.path.exists(out):
@@ -182,7 +198,6 @@ def main(argv=None) -> int:
     missing = populate_drivers(out, dd, cg._active_kernels)
     for name in C_SOURCES:
         shutil.copy2(os.path.join(SRC, name), os.path.join(out, "test", name))
-    info = entry_info(model)
     dp = pv.dp_flat(W)                                    # the C duration predictor's weights
     dp.astype("<f4").tofile(os.path.join(out, "weights", "dp.dat"))
     write_glue(out, ENC_BUCKETS, int(dp.size))

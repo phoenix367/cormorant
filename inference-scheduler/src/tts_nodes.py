@@ -410,12 +410,6 @@ class TtsPcmNode(TtsNode):
 # The text encoder's ops (encode_<T> entries, src/piper.py)            #
 # ------------------------------------------------------------------ #
 
-def _n_input(tensors, node, idx, sn):
-    t = _resolve(tensors, node.input[idx], node)
-    sn._want(t, "i32", "n")
-    return t
-
-
 @dataclass
 class TtsEmbedNode(TtsNode):
     """inputs [ids, table (constant [rows][D]), n] -> x [T][D] int16 at f."""
@@ -786,7 +780,7 @@ TTS_OP_FACTORIES = {
 
 
 TTS_C = r"""
-/* ==================== axi.tts host ops (src/tts_nodes.py) ==================== */
+/* =============== TTS host ops (axi.llm domain, src/tts_nodes.py) =============== */
 
 /* The int16 write-back of these loops: llm_st() branch-free (round half to
  * even, saturate, NaN -> 0), bit-identical. */

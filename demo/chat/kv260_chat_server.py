@@ -11,9 +11,9 @@ Endpoints
                                 stream true  -> SSE "data: {chat.completion.chunk}"
                                 lines, then "data: [DONE]"
   POST /v1/audio/speech         text to speech: {"model", "input", "voice",
-                                "response_format", "speed", "stream_format"} ->
-                                the audio, streamed chunk by chunk as it is
-                                synthesized (wav / pcm directly with a
+                                "response_format", "speed", "stream_format",
+                                "seed"} -> the audio, streamed chunk by chunk
+                                as it is synthesized (wav / pcm directly with a
                                 Content-Length; mp3 / opus / aac / flac through
                                 ffmpeg; stream_format "sse": speech.audio.delta
                                 events); model aliases tts-1, tts-1-hd,
@@ -70,7 +70,7 @@ usage:
   kv260_chat_server.py [--host 0.0.0.0] [--port 8000]
                        [--api-key KEY | --api-key-file FILE]
                        [--backend bert-squad] [--backend smollm2] [--backend smollm2-360m]
-                       [--backend smolvlm] [--backend echo] ...
+                       [--backend smolvlm] [--backend piper] [--backend echo] ...
                        [--resident auto|one|all] [--cma-margin-mb 32]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]

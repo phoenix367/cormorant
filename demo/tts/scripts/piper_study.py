@@ -363,7 +363,8 @@ def cmd_study(a) -> int:
     path = os.path.join(out_dir, "results.json")
     old = json.load(open(path)) if a.policies and os.path.exists(path) else {}
     json.dump({**old, **results}, open(path, "w"), indent=1)
-    print(f"WAVs (eval00, eval10: float / bf16 / q88 / pow2 / opt / opt_hc) in {out_dir}")
+    print(f"WAVs (eval00, eval10: float / bf16 / q88 / pow2 / opt / opt_hc / opt_int16_chains / chunk_spec) "
+          f"in {out_dir}")
     return 0
 
 
@@ -374,7 +375,7 @@ def cmd_encoder(a) -> int:
     calibration sentences, store its exponents in exponents.json
     ("encoder"), and measure it on the evaluation sentences: durations
     against the float encoder, and the audio with the float durations kept
-    (so the waveforms align) against the library's current front end and
+    (so the waveforms align) against the front end on the float encoder and
     against float."""
     import piper_vits as pv
     W = pv.load_weights(_onnx(a))
@@ -541,8 +542,9 @@ def cmd_costs(a) -> int:
     host_el += c * W
     print(f"host     ~{host_el / 1e6:.0f} M element ops per second of audio (LeakyReLU, adds, "
           f"averages, gates): ~{host_el * 2e-9:.2f}-{host_el * 5e-9:.2f} s at 2-5 ns each (A53, 4 threads)")
-    print(f"total    kernels {tot[0]:.2f}-{tot[1]:.2f} s per second of audio; the text encoder and "
-          f"the duration predictor ~0.2 GMAC per second of audio in double on the host")
+    print(f"total    kernels {tot[0]:.2f}-{tot[1]:.2f} s per second of audio; not priced: the text encoder "
+          f"(on the FPGA, TTS_PLAN §6) and the duration predictor (C on the host, §7), ~0.2 GMAC per "
+          f"second of audio")
     return 0
 
 

@@ -1,4 +1,4 @@
-"""The axi.tts C helpers (src/tts_nodes.py tts_c_helpers) op by op against
+"""The TTS C helpers (src/tts_nodes.py tts_c_helpers) op by op against
 an independent numpy model of their contract (double arithmetic, int16
 write-back with round-half-even + saturation, libm tanh / exp): every
 branch of the fast paths — the integer sums with exact and rounding shifts

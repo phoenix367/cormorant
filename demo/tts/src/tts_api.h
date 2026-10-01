@@ -3,13 +3,14 @@
  * speech on the KV260 (doc/plans/TTS_PLAN.md §4): the reverse flow and the
  * HiFi-GAN decoder on ConvKernel + host ops, in chunks of 128 frames.
  *
- * Built from the generated single-entry inference project (entry "chunk")
- * by demo/tts/scripts/generate_tts_project.py.  The caller (the chat
- * server) runs the front end in numpy — phonemes -> ids, the text encoder,
- * the duration predictor, the length regulator and the noise — and hands
- * over z_p, the flow's input: frames x 192 values in channel-major order
- * (zp[c * frames + t]).  The library returns 16-bit PCM at
- * tts_sample_rate(), tts_hop() samples per frame.
+ * Built from the generated multi-entry inference project (entries "chunk"
+ * and "encode_<T>") by demo/tts/scripts/generate_tts_project.py.  The
+ * caller (the chat server) runs the front end — phonemes -> ids, the text
+ * encoder and the duration predictor through this library (below), the
+ * length regulator and the noise in numpy — and hands over z_p, the flow's
+ * input: frames x 192 values in channel-major order (zp[c * frames + t]).
+ * The library returns 16-bit PCM at tts_sample_rate(), tts_hop() samples
+ * per frame.
  *
  * Chunk k covers the utterance frames [128k - 64, 128k + 192) and yields the
  * samples of frames [128k, 128k + 128): the 64 frames of context on either
@@ -36,10 +37,12 @@
 extern "C" {
 #endif
 
-/* Open: DMA pool + weights, kernel driver.  weights_dir = the directory
- * holding weights/<name>.dat, or NULL for the one the library was built for
- * (INFERENCE_WEIGHTS_DIR, see tts_weights_dir()).  A second tts_open()
- * without tts_close() is a no-op. */
+/* Open: DMA pool + weights, kernel driver, the duration predictor's
+ * weights/dp.dat.  weights_dir = the directory holding weights/<name>.dat,
+ * or NULL for the one the library was built for (INFERENCE_WEIGHTS_DIR, see
+ * tts_weights_dir()).  Fails (-5, tts_last_error() says why) when dp.dat is
+ * missing or has another layout.  A second tts_open() without tts_close()
+ * is a no-op. */
 int         tts_open(const char *weights_dir);
 void        tts_close(void);
 const char *tts_last_error(void);
@@ -59,7 +62,8 @@ int         tts_max_ids(void);           /* 400 */
 
 /* The duration predictor on x [192][n] (tts_encode's) and the noise z [2][n]
  * (standard normal * noise_w): logw [n] (float64; 4 host threads).  Bit for
- * bit piper_vits.duration_predictor_seq.  < 0 without weights/dp.dat. */
+ * bit piper_vits.duration_predictor_seq.  Its weights (weights/dp.dat)
+ * are loaded by tts_open(). */
 int         tts_duration(const float *x, int n, const double *z, double *logw);
 int         tts_num_buckets(void);       /* encode_<T> entries ... */
 int         tts_bucket(int i);           /* ... ascending */

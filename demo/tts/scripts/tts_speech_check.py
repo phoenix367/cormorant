@@ -34,6 +34,9 @@ import tts_board as tb                                              # noqa: E402
 
 sys.path.insert(0, os.path.join(tb.REPO, "demo", "chat"))
 
+# The third text predates TTS_PLAN §6 / §7 (the text encoder now runs on the
+# FPGA, the duration predictor in C); kept as it is so the timings of §5 - §7
+# stay comparable.
 TEXTS = ("Hello! I am a small assistant running on an FPGA board.",
          "The birch canoe slid on the smooth planks. Glue the sheet to the dark blue background. "
          "It's easy to tell the depth of a well.",

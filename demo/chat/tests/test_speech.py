@@ -105,8 +105,8 @@ class TestSpeech(SpeechServer):
             self.assertEqual((w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()),
                              (1, 2, 16000, 3 * PIECE))
             self.assertEqual(w.readframes(w.getnframes()), expected_pcm(3))
-        self.assertTrue(any("POST /v1/audio/speech 200 model=fake-tts" in ln and "audio=0.19s" in ln
-                            for ln in LOG), LOG)
+        self.assertTrue(wait_until(lambda: any("POST /v1/audio/speech 200 model=fake-tts" in ln
+                                               and "audio=0.19s" in ln for ln in LOG)), LOG)
 
     def test_default_format_is_wav_and_default_model_is_speech(self):
         st, hd, out = self.speech({"input": "a b"})

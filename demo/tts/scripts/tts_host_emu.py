@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 tts_host_emu.py — run the generated Piper project on the HOST: the generated
-inference.c, tts_api.c and tts_bench.c compiled unchanged against the
-software ConvKernel and the malloc-backed buffers of
+inference.c, tts_api.c, tts_dp.c and tts_bench.c compiled unchanged against
+the software ConvKernel and the malloc-backed buffers of
 inference-scheduler/test/host_emu.py, then every sample of tts_bench (the
 study's sentences, chunk by chunk, stitched by the library) compared bit for
-bit with the specification (piper_vits.synthesize_chunked) — the board gate
-without the board.
+bit with the specification (piper_vits.synthesize_chunked), and the text
+encoder's and the duration predictor's outputs on every encode bucket with
+encoder_forward and duration_predictor_seq — the board gate without the
+board.
 
 With --lib-check, libpiper_tts.so is built the same way and driven by the chat
 server's backend (demo/chat/piper_backend.py: LibTtsEngine through ctypes —
@@ -56,6 +58,7 @@ def build(project: str, work: str, incoherent: bool = False, shared: bool = Fals
     emu = _emu_sources(work)
     exe = os.path.join(work, "libpiper_tts_host.so" if shared else "tts_bench_host")
     cmd = [host_emu.which_cc(), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
+           "-ffp-contract=off",                               # no FMA: tts_dp.c is bit-exact with the spec
            "-Wno-unused-function", "-pthread", f"-DEMU_TILE_M={MATMUL_TILE_M}",
            *(["-DEMU_INCOHERENT"] if incoherent else []),
            f"-DEMU_CONV_TILE_IC={CONV_TILE_IC}", f'-DINFERENCE_WEIGHTS_DIR="{project}"',

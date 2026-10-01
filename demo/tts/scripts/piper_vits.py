@@ -1,5 +1,7 @@
 """Piper (VITS) inference in numpy, with the fixed-point emulation of the
-planned KV260 partition (doc/plans/TTS_PLAN.md §3).
+study's KV260 partition (doc/plans/TTS_PLAN.md §3) and the bit-exact
+specifications of libpiper_tts.so: chunk_forward (§4), encoder_forward (§6)
+and duration_predictor_seq (§7).
 
 The float path (``Q = None``) is the reference: float64, the same
 computation as Piper's ONNX export (``piper_study.py validate`` checks it
@@ -7,10 +9,10 @@ against onnxruntime).  With a quantizer ``Q`` the flow and the decoder run
 as the board would: every Conv / ConvTranspose on ConvKernel (raw int16
 operands at power-of-two exponents, the sum exact in ap_fixed<32,16>,
 floor(acc / 2^8) saturated to int16), every other op on the host in double
-with round-half-even + saturate where it writes an int16 tensor.  The text
-encoder, the duration predictor and the alignment stay on the host in
-double (a few ms per sentence), so every policy sees the same durations and
-noise and the waveforms align sample by sample.
+with round-half-even + saturate where it writes an int16 tensor.  In that
+emulation the text encoder, the duration predictor and the alignment stay
+in float64, so every policy sees the same durations and noise and the
+waveforms align sample by sample.
 """
 
 from __future__ import annotations
@@ -104,8 +106,10 @@ _ERF = np.vectorize(math.erf, otypes=[np.float64])
 
 
 def erf_fast(x):
-    """Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7), vectorized: the board's
-    front end (math.erf element by element costs seconds on the A53)."""
+    """Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7), vectorized: the erf of
+    gelu(fast=True), which _gelu_fast computes in place, and of the C
+    duration predictor (tts_dp.c); math.erf element by element costs
+    seconds on the A53."""
     a = np.abs(x)
     t = 1.0 / (1.0 + 0.3275911 * a)
     p = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t
@@ -113,9 +117,9 @@ def erf_fast(x):
 
 
 def _gelu_fast(x):
-    """gelu(x, fast=True) with in-place ufuncs, the same operations in the
-    same order (bit-identical): 5 temporaries instead of ~14 (the A53 front
-    end spent half the duration predictor in them)."""
+    """0.5 * x * (1 + erf_fast(x / sqrt 2)) with in-place ufuncs, the same
+    operations in the same order (bit-identical): 5 temporaries instead of
+    ~14 (the A53 front end spent half the duration predictor in them)."""
     u = x / math.sqrt(2.0)
     a = np.abs(u)
     t = a * 0.3275911
