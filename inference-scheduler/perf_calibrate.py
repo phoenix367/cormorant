@@ -13,12 +13,24 @@ on the board, fit the models, write perf_models/<platform>/<bitstream-id>.json.
           the chat server must be stopped (--stop-server does it and
           restarts it afterwards)
   fit     fit the kernel models and write the model file + validation report
+  host    fit the host-op model (perf_models/<platform>/host.json) from board
+          profiles: llm_board.py --profile --out (chat models), tts_board.py
+          --profile --out (piper-lessac-medium), a demo's results.json
+          (--profile-layers); --merge keeps every op kind fitted before
+  simulate  predicted vs measured totals per phase (prefill, decode,
+          llm_image, inference, piper's chunk and encode buckets)
+
+The shipped models (SHIPPED) are the demos' CNNs, BERT, SmolLM2-135M /
+360M, SmolVLM-256M and Piper (the chunk and encode_<T> entries of
+libpiper_tts.so, built by demo/tts/scripts/generate_tts_project.py).
 
 usage:
   .venv/bin/python perf_calibrate.py cases [--models ...]
   .venv/bin/python perf_calibrate.py run --config remote_config.json [--stop-server]
   .venv/bin/python perf_calibrate.py fit
   .venv/bin/python perf_calibrate.py all --config remote_config.json --stop-server
+  .venv/bin/python perf_calibrate.py host --profile MODEL=RESULTS.json ... [--merge]
+  .venv/bin/python perf_calibrate.py simulate --profile MODEL=RESULTS.json ...
 
 Files (perf_models/<platform>/, versioned): <id>.cases.json (the case
 list), <id>.calib.json (the measurements), <id>.json (the model).
@@ -48,12 +60,14 @@ from src.perf_calls import KernelCall, local_bitstream_id  # noqa: E402
 PLATFORM = "kv260"
 MODELS_DIR = HERE / "perf_models" / PLATFORM
 CHAT = REPO / "demo" / "chat"
+TTS = REPO / "demo" / "tts"
 RUNNER_VERSION = 1
 KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P"}
 MHZ = 100.0
 
 SHIPPED = ("mnist_convnet", "mnist_lenet", "mobilenet_v1", "mobilenet_v2", "resnet18", "bert",
-           "smollm2-135m-instruct", "smolvlm-256m-instruct", "smollm2-360m-instruct")
+           "smollm2-135m-instruct", "smolvlm-256m-instruct", "smollm2-360m-instruct",
+           "piper-lessac-medium")
 
 
 def log(msg: str) -> None:
@@ -78,6 +92,16 @@ def _model_path(name: str) -> str:
     if name == "bert":
         return str(REPO / "demo/bert_squad/assets/models/bertsquad-12-simplified.onnx")
     return str(_cnn_path("image_classification", name))
+
+
+def piper_graphs() -> List[Tuple[str, object]]:
+    """Piper's entries (chunk, encode_<T>) exactly as libpiper_tts.so is generated
+    (demo/tts/scripts/generate_tts_project.py: the encoder buckets share the
+    largest bucket's kernel widths)."""
+    if str(TTS / "scripts") not in sys.path:
+        sys.path.insert(0, str(TTS / "scripts"))
+    import generate_tts_project as gtp
+    return gtp.entry_graphs(gtp.DEFAULT_ASSETS)
 
 
 def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
@@ -107,6 +131,8 @@ def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
             del W
         for e, g in entry_graphs(models):
             yield e, g
+    elif name.startswith("piper-"):
+        yield from piper_graphs()
     else:
         raise KeyError(f"unknown shipped model {name!r} (choose from {SHIPPED})")
 
@@ -638,6 +664,10 @@ def _single(model: str, res) -> Optional[Tuple[list, float]]:
 def _entry_graphs(model: str, planned: bool) -> Dict[str, object]:
     """The entry graphs of a shipped chat model, planned or not."""
     from src.planning import PlanOptions
+    if model.startswith("piper-"):
+        if planned:
+            raise SystemExit(f"error: {model}: generate_tts_project.py has no planned build")
+        return dict(piper_graphs())
     if not (model.startswith("smollm2-") or model.startswith("smolvlm-")):
         from src.graph import OnnxGraph
         (name, g), = shipped_graphs(model)
@@ -661,6 +691,24 @@ def _entry_graphs(model: str, planned: bool) -> Dict[str, object]:
     return dict(entry_graphs(models, plan=PlanOptions(enabled=planned) if planned else None))
 
 
+def _split_by_entry(graphs: Dict[str, object], phase: str, layers: List[dict]) -> Dict[str, List[dict]]:
+    """A profiler phase that ran several entries (piper's "encode": every
+    encode_<T> bucket) -> {entry: its layers}.  A multi-entry project numbers
+    the layers globally, entry after entry (MultiEntryGenerator), and the
+    buckets share node names, so the layer index picks the entry."""
+    base, ranges = 0, []
+    for name, g in graphs.items():
+        ranges.append((name, base, base + len(g.nodes)))
+        base += len(g.nodes)
+    out: Dict[str, List[dict]] = {}
+    for ly in layers:
+        i = ly.get("i")
+        hit = next((n for n, lo, hi in ranges if i is not None and lo <= i < hi), None)
+        if hit is not None and hit.startswith(phase + "_"):
+            out.setdefault(hit, []).append(ly)
+    return out
+
+
 def cmd_host(args) -> int:
     from src.host_model import HostModel, default_host_model_path, observations_from_profile
     obs = []
@@ -681,6 +729,9 @@ def cmd_host(args) -> int:
         for phase, ly in layers.items():
             if phase in graphs:
                 obs += observations_from_profile(graphs[phase], ly)
+            else:                       # one phase over several entries (piper's "encode")
+                for entry, part in _split_by_entry(graphs, phase, ly).items():
+                    obs += observations_from_profile(graphs[entry], part)
         log(f"  {model}{' (planned)' if planned else ''}: {len(obs) - n0} host-op timings")
     path = Path(args.host_model) if args.host_model else default_host_model_path()
     old = HostModel.load(path) if path.exists() and not args.fresh else None
@@ -689,6 +740,12 @@ def cmd_host(args) -> int:
     if old is not None:                       # keep earlier exact entries not re-measured
         for k, v in old.exact.items():
             hm.exact.setdefault(k, v)
+    if old is not None and args.merge:        # keep every kind fitted before; add the new ones
+        new_kinds = sorted(set(hm.kinds) - set(old.kinds))
+        kept = sorted(set(hm.kinds) & set(old.kinds))
+        hm.kinds = {**hm.kinds, **old.kinds}
+        log(f"merge: {len(new_kinds)} new kinds {new_kinds}; {len(kept)} kept as fitted before "
+            f"{kept} (their new signatures are exact entries)")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(hm.to_dict(), indent=1) + "\n")
     log(f"host model: {len(hm.exact)} exact signatures, {len(hm.kinds)} kinds -> {path}")
@@ -713,38 +770,70 @@ def cmd_simulate(args) -> int:
             cg = CodeGenerator(g, model_path=f"{model}.onnx")
             tl = simulate(cg, kernel_duration_fn(pm, cg._layouts), hm.us)
             rows.append((f"{model}{' plan' if planned else ''}", "inference", tl.total_us / 1e3,
-                         one[1], tl))
+                         one[1], tl, cg))
             continue
         b = res.get("bench", res)
         graphs = _entry_graphs(model, planned)
         cgs = {n: CodeGenerator(g, model_path=f"{n}.onnx") for n, g in graphs.items()}
+        if model.startswith("piper-"):          # tts_board.py --out: chunks and encoder buckets
+            tag = model
+            ms = [m for u in b.get("utts", []) for m in u.get("chunk_ms", [])]
+            if ms and "chunk" in cgs:
+                tl = simulate(cgs["chunk"], kernel_duration_fn(pm, cgs["chunk"]._layouts), hm.us)
+                rows.append((tag, "chunk", tl.total_us / 1e3, sorted(ms)[len(ms) // 2], tl, cgs["chunk"]))
+            # per bucket, the sequence nearest a full bucket: the graph prices T rows,
+            # and some host ops scale with the real id count n (tts_bench profiles
+            # each bucket's sequences; the largest n is the last one per bucket)
+            fullest = {}
+            for e in b.get("encs", []):
+                if e["n"] >= fullest.get(e["bucket"], {"n": -1})["n"]:
+                    fullest[e["bucket"]] = e
+            for T, e in sorted(fullest.items()):
+                entry = f"encode_{T}"
+                if entry in cgs:
+                    tl = simulate(cgs[entry], kernel_duration_fn(pm, cgs[entry]._layouts), hm.us)
+                    rows.append((tag, f"encode {T} ({e['n']} ids)", tl.total_us / 1e3, e["best_ms"], tl,
+                                 cgs[entry]))
+            continue
 
         def run(entry, pos0=1, n=None, cgs=cgs):
             cg = cgs[entry]
 
             def keys_of(sn):
                 return attn_keys(pos0, n if n is not None else sn.T, sn.T, sn.C, sn.Q)[1]
-            return simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us)
+            tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us)
+            tl.cg = cg
+            return tl
         tag = f"{model}{' plan' if planned else ''}"
         if "vision" in cgs and b.get("images"):
             tl = run("vision")
             meas = min(x["ms"] for x in b["images"])
-            rows.append((tag, "llm_image", tl.total_us / 1e3, meas, tl))
+            rows.append((tag, "llm_image", tl.total_us / 1e3, meas, tl, tl.cg))
         for p in b.get("prefill", []):
             e = f"prefill_{p['n']}"
             if e in cgs:
                 tl, th = run(e, 1, p["n"]), run("head")
                 rows.append((tag, f"prefill {p['n']}", (tl.total_us + th.total_us) / 1e3,
-                             p["best_ms"], tl))
+                             p["best_ms"], tl, tl.cg))
         if b.get("llm_summary", {}).get("decode_ms_mean") and "decode" in cgs:
             tl = run("decode")                  # the decode entry includes the LM head
             rows.append((tag, "decode step", tl.total_us / 1e3,
-                         b["llm_summary"]["decode_ms_mean"], tl))
-    log(f"{'project':28s} {'phase':12s} {'predicted':>10s} {'measured':>9s} {'error':>7s}  "
+                         b["llm_summary"]["decode_ms_mean"], tl, tl.cg))
+    log(f"{'project':28s} {'phase':20s} {'predicted':>10s} {'measured':>9s} {'error':>7s}  "
         f"{'CPU waits':>9s}  unpriced")
-    for tag, ph, pred, meas, tl in rows:
-        log(f"{tag:28s} {ph:12s} {pred:9.1f}ms {meas:8.1f}ms {(pred - meas) / meas * 100:+6.1f}%  "
+    for tag, ph, pred, meas, tl, _cg in rows:
+        log(f"{tag:28s} {ph:20s} {pred:9.1f}ms {meas:8.1f}ms {(pred - meas) / meas * 100:+6.1f}%  "
             f"{tl.wait_us / 1e3:8.1f}ms  {len(set(tl.unpriced))}")
+    if args.html:
+        from src.timeline_html import timeline_entry, write_html
+        entries = [timeline_entry(f"{tag} · {ph}", cg, tl, pm, hm, measured_us=meas * 1e3,
+                                  note=("prefill: the entry only, the LM head not drawn" if ph.startswith("prefill")
+                                        else ""))
+                   for tag, ph, pred, meas, tl, cg in rows]
+        write_html(args.html, entries, "Predicted execution timeline",
+                   f"performance model {pm.platform}/{pm.bitstream} · host model "
+                   f"{hm.meta.get('date', '?')} · perf_calibrate.py simulate")
+        log(f"timeline -> {args.html} ({len(entries)} phases)")
     return 0
 
 
@@ -773,10 +862,17 @@ def main(argv=None) -> int:
     ap.add_argument("--resume", action="store_true", help="run: keep measurements already taken")
     ap.add_argument("--profile", nargs="+", default=[], metavar="MODEL[:plan]=RESULTS",
                     help="host / simulate: llm_board.py --profile --out results of a shipped chat "
-                         "model's project (':plan' when it was generated with --plan)")
+                         "model's project (':plan' when it was generated with --plan), "
+                         "tts_board.py --profile --out results for piper-lessac-medium, or a demo's "
+                         "results.json")
     ap.add_argument("--host-model", default=None,
                     help="host / simulate: the host-op model file (default perf_models/kv260/host.json)")
     ap.add_argument("--fresh", action="store_true", help="host: drop the earlier exact entries")
+    ap.add_argument("--html", default=None, metavar="FILE",
+                    help="simulate: also write the predicted timelines as one HTML page (src/timeline_html.py)")
+    ap.add_argument("--merge", action="store_true",
+                    help="host: keep every op kind fitted before (fit only kinds the earlier model "
+                         "lacks), so one new model's profile can be added without re-profiling the rest")
     args = ap.parse_args(argv)
     if args.cmd == "host":
         return cmd_host(args)

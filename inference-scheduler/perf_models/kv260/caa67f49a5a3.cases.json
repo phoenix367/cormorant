@@ -10,7 +10,8 @@
 "bert",
 "smollm2-135m-instruct",
 "smolvlm-256m-instruct",
-"smollm2-360m-instruct"
+"smollm2-360m-instruct",
+"piper-lessac-medium"
 ],
 "cases": [
 {
@@ -33,17 +34,6 @@
 ],
 "est_us": 154.86,
 "iters": 193,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,1024,1,1,10,1,1,1,1,1,1,1,1,0,0,1,0",
-"kernel": "ConvKernel",
-"set": "shipped",
-"sources": [
-"mnist_lenet/mnist_lenet/import/conv4last/Conv2D"
-],
-"est_us": 105.23,
-"iters": 200,
 "warmup": 2
 },
 {
@@ -461,6 +451,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,128,12,130,512,12,128,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.up1#348"
+],
+"est_us": 13638.52,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,128,12,172,16,12,86,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -645,6 +646,83 @@
 "sources": [],
 "est_us": 1353.7,
 "iters": 22,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,514,128,3,512,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb00.c0#292"
+],
+"est_us": 2981.5,
+"iters": 10,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,516,128,3,512,1,3,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb00.c1#300"
+],
+"est_us": 2985.76,
+"iters": 10,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,520,128,3,512,1,5,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb01.c0#308"
+],
+"est_us": 4907.72,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,530,128,3,512,1,7,1,1,1,3,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb02.c0#324"
+],
+"est_us": 7532.78,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,536,128,3,512,1,3,1,1,1,12,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb02.c1#338"
+],
+"est_us": 3811.72,
+"iters": 7,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,536,128,3,512,1,5,1,1,1,6,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb01.c1#316"
+],
+"est_us": 5901.48,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,128,3,548,128,3,512,1,4,1,1,1,12,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb02.c1#332"
+],
+"est_us": 6454.52,
+"iters": 4,
 "warmup": 2
 },
 {
@@ -1039,6 +1117,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,144,12,256,80,12,64,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=4,out_w=64,rows=80,calls=5)"
+],
+"est_us": 1177.0,
+"iters": 25,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,144,12,64,128,12,16,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -1089,6 +1178,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,144,16,192,80,16,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=4,out_w=48,rows=80,calls=5)"
+],
+"est_us": 1174.84,
+"iters": 25,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,144,16,48,256,16,12,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -1098,6 +1198,29 @@
 ],
 "est_us": 768.9,
 "iters": 39,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,24,128,128,24,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=4,out_w=32,rows=128,calls=2)"
+],
+"est_us": 1664.0,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,24,128,256,24,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=4,out_w=32,rows=256,calls=1)"
+],
+"est_us": 2975.58,
+"iters": 10,
 "warmup": 2
 },
 {
@@ -1221,6 +1344,40 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,144,48,64,128,48,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=4,out_w=16,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=4,out_w=16,rows=128,calls=2)"
+],
+"est_us": 1664.46,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,48,64,256,48,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1"
+],
+"est_us": 2962.62,
+"iters": 10,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,48,64,400,48,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1"
+],
+"est_us": 4443.72,
+"iters": 6,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,144,56,56,144,28,28,3,3,2,2,1,1,1,1,1,1",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -1254,6 +1411,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,144,64,48,400,64,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=4,out_w=12,rows=400,calls=1)"
+],
+"est_us": 4461.0,
+"iters": 6,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,144,7,96,192,7,24,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -1262,6 +1430,28 @@
 "sources": [],
 "est_us": 629.24,
 "iters": 47,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,8,384,32,8,96,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1"
+],
+"est_us": 1044.3,
+"iters": 28,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,8,384,64,8,96,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1"
+],
+"est_us": 1093.3,
+"iters": 27,
 "warmup": 2
 },
 {
@@ -1443,6 +1633,17 @@
 "sources": [],
 "est_us": 185.94,
 "iters": 161,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,16,3,64,32,3,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.pv0"
+],
+"est_us": 39.9,
+"iters": 200,
 "warmup": 2
 },
 {
@@ -1737,6 +1938,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,16,6,64,64,6,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.pv0"
+],
+"est_us": 56.34,
+"iters": 200,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,16,64,64,1024,64,16,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -1958,6 +2170,84 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,192,1,192,16,1,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=1,out_w=192,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=1,out_w=192,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=1,out_w=192,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=1,out_w=192,rows=16,calls=16)"
+],
+"est_us": 113.76,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,1,192,32,1,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=1,out_w=192,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=1,out_w=192,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=1,out_w=192,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=1,out_w=192,rows=32,calls=8)"
+],
+"est_us": 119.9,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,1,256,192,1,256,1,1,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/flow.flows.6.enc.rs.3#60"
+],
+"est_us": 544.18,
+"iters": 55,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,1,256,96,1,256,1,1,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/flow.flows.6.post#66"
+],
+"est_us": 307.66,
+"iters": 97,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,1,384,16,1,384,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=384,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=384,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=384,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=384,rows=16,calls=16)"
+],
+"est_us": 200.86,
+"iters": 149,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,1,384,32,1,384,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=384,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=384,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=384,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=384,rows=32,calls=8)"
+],
+"est_us": 212.82,
+"iters": 140,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,192,112,112,192,112,112,7,7,1,1,1,1,3,3,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -2060,6 +2350,56 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,192,2,128,384,2,128,1,1,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/flow.flows.6.enc.rs.0#18"
+],
+"est_us": 1024.48,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,2,132,384,2,128,1,5,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/flow.flows.6.enc.in.0#12"
+],
+"est_us": 3972.5,
+"iters": 7,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,2,192,16,2,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=192,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=192,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=192,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=192,rows=16,calls=16)"
+],
+"est_us": 200.86,
+"iters": 149,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,2,192,32,2,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=192,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=192,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=192,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=192,rows=32,calls=8)"
+],
+"est_us": 212.82,
+"iters": 140,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,192,24,128,128,24,32,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -2139,6 +2479,34 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,192,3,128,16,3,128,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=128,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=128,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=128,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=128,rows=16,calls=16)"
+],
+"est_us": 200.86,
+"iters": 149,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,3,128,32,3,128,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=128,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=1,out_w=128,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=1,out_w=128,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=1,out_w=128,rows=32,calls=8)"
+],
+"est_us": 212.82,
+"iters": 140,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,192,3,32,16,3,32,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -2147,6 +2515,45 @@
 "sources": [],
 "est_us": 86.88,
 "iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,3,64,16,3,64,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=1,out_w=64,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=1,out_w=64,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=1,out_w=64,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=1,out_w=64,rows=16,calls=16)"
+],
+"est_us": 113.76,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,3,64,32,3,64,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=1,out_w=64,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=1,out_w=64,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=1,out_w=64,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=1,out_w=64,rows=32,calls=8)"
+],
+"est_us": 119.9,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,3,70,256,3,64,1,7,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.pre#278"
+],
+"est_us": 1833.54,
+"iters": 16,
 "warmup": 2
 },
 {
@@ -3072,6 +3479,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,256,3,66,1024,3,64,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.up0#284"
+],
+"est_us": 7918.3,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,256,32,108,128,32,18,1,6,1,6,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -3354,6 +3772,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,288,12,128,80,12,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=2,out_w=64,rows=80,calls=5)"
+],
+"est_us": 1174.44,
+"iters": 25,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,288,12,256,64,12,128,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -3442,6 +3871,29 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,288,24,64,128,24,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=2,out_w=32,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=32,rows=128,calls=2)"
+],
+"est_us": 1661.44,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,24,64,256,24,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=32,rows=256,calls=1)"
+],
+"est_us": 2973.02,
+"iters": 10,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,288,3,128,64,3,64,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -3464,6 +3916,19 @@
 "sources": [],
 "est_us": 2437.54,
 "iters": 12,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,4,384,64,4,192,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=2,out_w=192,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=2,out_w=192,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=192,rows=64,calls=4)"
+],
+"est_us": 1090.74,
+"iters": 27,
 "warmup": 2
 },
 {
@@ -3541,6 +4006,19 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,288,6,256,64,6,128,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=2,out_w=128,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=2,out_w=128,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=128,rows=64,calls=4)"
+],
+"est_us": 1090.74,
+"iters": 27,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,288,6,64,128,6,32,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -3604,6 +4082,19 @@
 ],
 "est_us": 294.74,
 "iters": 101,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,8,192,64,8,96,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=2,out_w=96,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=2,out_w=96,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=96,rows=64,calls=4)"
+],
+"est_us": 1090.74,
+"iters": 27,
 "warmup": 2
 },
 {
@@ -3765,6 +4256,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,32,12,4102,1,12,4096,1,7,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.post#476"
+],
+"est_us": 5986.02,
+"iters": 5,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,32,12,68,128,12,34,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -3773,6 +4275,28 @@
 "sources": [],
 "est_us": 244.18,
 "iters": 122,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,12,96,128,12,16,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0"
+],
+"est_us": 217.6,
+"iters": 137,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,12,96,256,12,16,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0"
+],
+"est_us": 372.16,
+"iters": 80,
 "warmup": 2
 },
 {
@@ -4094,6 +4618,83 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,32,24,2050,32,24,2048,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb20.c0#420"
+],
+"est_us": 9015.91,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2052,32,24,2048,1,3,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb20.c1#428"
+],
+"est_us": 9146.44,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2056,32,24,2048,1,5,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb21.c0#436"
+],
+"est_us": 12647.1,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2066,32,24,2048,1,7,1,1,1,3,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb22.c0#452"
+],
+"est_us": 17939.79,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2072,32,24,2048,1,3,1,1,1,12,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb22.c1#466"
+],
+"est_us": 11789.02,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2072,32,24,2048,1,5,1,1,1,6,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb21.c1#444"
+],
+"est_us": 15567.98,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,2084,32,24,2048,1,4,1,1,1,12,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb22.c1#460"
+],
+"est_us": 17908.02,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,32,24,34,16,24,17,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -4102,6 +4703,39 @@
 "sources": [],
 "est_us": 171.86,
 "iters": 174,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,48,32,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0"
+],
+"est_us": 134.62,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,48,400,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0"
+],
+"est_us": 549.04,
+"iters": 54,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,24,48,64,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0"
+],
+"est_us": 150.1,
+"iters": 199,
 "warmup": 2
 },
 {
@@ -4199,6 +4833,61 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,32,48,48,128,48,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st"
+],
+"est_us": 373.66,
+"iters": 80,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,48,48,256,48,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st"
+],
+"est_us": 653.02,
+"iters": 45,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,48,48,32,48,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st"
+],
+"est_us": 239.06,
+"iters": 125,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,48,48,400,48,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st"
+],
+"est_us": 967.84,
+"iters": 30,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,48,48,64,48,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st"
+],
+"est_us": 266.18,
+"iters": 112,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,32,52,128,32,52,32,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -4229,6 +4918,17 @@
 "sources": [],
 "est_us": 1490.7,
 "iters": 20,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,32,6,64,128,6,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.pv0"
+],
+"est_us": 98.64,
+"iters": 200,
 "warmup": 2
 },
 {
@@ -4661,6 +5361,28 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,384,12,96,128,12,16,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2"
+],
+"est_us": 1722.4,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,12,96,256,12,16,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2"
+],
+"est_us": 3064.96,
+"iters": 9,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,384,14,14,128,14,14,7,7,1,1,1,1,3,3,1,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -4736,6 +5458,39 @@
 ],
 "est_us": 5567.9,
 "iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,24,48,32,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2"
+],
+"est_us": 1148.38,
+"iters": 26,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,24,48,400,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2"
+],
+"est_us": 4589.56,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,24,48,64,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2"
+],
+"est_us": 1163.86,
+"iters": 25,
 "warmup": 2
 },
 {
@@ -4982,6 +5737,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,400,2,48,400,2,48,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.pv0"
+],
+"est_us": 751.8,
+"iters": 39,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,416,29,96,240,29,48,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5070,6 +5836,87 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,48,1,64,32,1,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.qk0"
+],
+"est_us": 37.22,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,128,128,12,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=4,out_w=32,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=4,out_w=32,rows=128,calls=2)"
+],
+"est_us": 366.34,
+"iters": 81,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,128,80,12,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=4,out_w=32,rows=80,calls=5)"
+],
+"est_us": 262.3,
+"iters": 114,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,64,128,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=4,out_w=16,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=4,out_w=16,rows=128,calls=2)"
+],
+"est_us": 198.9,
+"iters": 150,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,64,256,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=4,out_w=16,rows=256,calls=1)"
+],
+"est_us": 338.34,
+"iters": 88,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,64,64,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=4,out_w=16,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=4,out_w=16,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=4,out_w=16,rows=64,calls=4)"
+],
+"est_us": 136.02,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,64,80,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=4,out_w=16,rows=80,calls=5)"
+],
+"est_us": 146.88,
+"iters": 200,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,48,16,64,48,16,16,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5125,6 +5972,28 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,48,2,64,64,2,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.qk0"
+],
+"est_us": 52.06,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,20,40,400,20,20,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.qk0"
+],
+"est_us": 691.74,
+"iters": 43,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,48,20,792,32,20,198,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5147,6 +6016,28 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,48,24,32,400,24,8,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=4,out_w=8,rows=400,calls=1)"
+],
+"est_us": 550.62,
+"iters": 54,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,24,64,256,24,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=4,out_w=16,rows=256,calls=1)"
+],
+"est_us": 646.56,
+"iters": 46,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,48,3,224,32,3,56,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5166,6 +6057,17 @@
 "sources": [],
 "est_us": 2008.12,
 "iters": 14,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,4,64,128,4,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.qk0"
+],
+"est_us": 100.66,
+"iters": 200,
 "warmup": 2
 },
 {
@@ -5219,6 +6121,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,48,48,32,400,48,8,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=4,out_w=8,rows=400,calls=1)"
+],
+"est_us": 973.56,
+"iters": 30,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,48,72,220,32,72,55,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5227,6 +6140,17 @@
 "sources": [],
 "est_us": 2069.44,
 "iters": 14,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,8,64,256,8,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.qk0"
+],
+"est_us": 296.58,
+"iters": 101,
 "warmup": 2
 },
 {
@@ -5899,6 +6823,34 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,576,1,768,16,1,768,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=768,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=768,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=768,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=768,rows=16,calls=16)"
+],
+"est_us": 1018.84,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,1,768,32,1,768,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=768,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=768,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=768,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=768,rows=32,calls=8)"
+],
+"est_us": 1042.38,
+"iters": 28,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,576,1,984,48,1,984,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5907,6 +6859,81 @@
 "sources": [],
 "est_us": 1701.14,
 "iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,128,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=16,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=16,rows=128,calls=2)"
+],
+"est_us": 1521.54,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,16,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=16,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=16,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=16,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=16,rows=16,calls=16)"
+],
+"est_us": 1001.76,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,256,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=16,rows=256,calls=1)"
+],
+"est_us": 2682.66,
+"iters": 11,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,32,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=16,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=16,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=16,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=16,rows=32,calls=8)"
+],
+"est_us": 1008.86,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,64,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=16,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=16,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=16,rows=64,calls=4)"
+],
+"est_us": 1023.06,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,80,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:conv(kw=4,out_w=16,rows=80,calls=5)"
+],
+"est_us": 1089.36,
+"iters": 27,
 "warmup": 2
 },
 {
@@ -5965,6 +6992,40 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,576,16,48,128,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=12,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=12,rows=128,calls=2)"
+],
+"est_us": 1538.82,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,16,48,256,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=12,rows=256,calls=1)"
+],
+"est_us": 2699.94,
+"iters": 11,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,16,48,80,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:conv(kw=4,out_w=12,rows=80,calls=5)"
+],
+"est_us": 1167.12,
+"iters": 25,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,576,184,84,16,184,14,1,6,1,6,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -5984,6 +7045,34 @@
 "sources": [],
 "est_us": 652.3,
 "iters": 45,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,2,384,16,2,384,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=384,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=384,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=384,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=384,rows=16,calls=16)"
+],
+"est_us": 1018.84,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,2,384,32,2,384,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=384,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=384,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=384,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=384,rows=32,calls=8)"
+],
+"est_us": 1042.38,
+"iters": 28,
 "warmup": 2
 },
 {
@@ -6026,6 +7115,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,576,24,32,400,24,8,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:conv(kw=4,out_w=8,rows=400,calls=1)"
+],
+"est_us": 4636.68,
+"iters": 6,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,576,3,192,16,3,192,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -6051,6 +7151,34 @@
 ],
 "est_us": 788.94,
 "iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,3,256,16,3,256,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=256,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=256,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=256,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=256,rows=16,calls=16)"
+],
+"est_us": 1018.84,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,3,256,32,3,256,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=256,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=1,out_w=256,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=1,out_w=256,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=1,out_w=256,rows=32,calls=8)"
+],
+"est_us": 1042.38,
+"iters": 28,
 "warmup": 2
 },
 {
@@ -6121,6 +7249,34 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,576,4,192,16,4,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=48,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=48,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=48,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=48,rows=16,calls=16)"
+],
+"est_us": 1063.82,
+"iters": 28,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,4,192,32,4,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=48,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=48,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=48,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=48,rows=32,calls=8)"
+],
+"est_us": 1139.4,
+"iters": 26,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,576,5,96,64,5,48,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -6129,6 +7285,47 @@
 "sources": [],
 "est_us": 782.66,
 "iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,6,128,16,6,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=32,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=32,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=32,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=32,rows=16,calls=16)"
+],
+"est_us": 1020.22,
+"iters": 29,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,6,128,32,6,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=32,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=32,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=32,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=32,rows=32,calls=8)"
+],
+"est_us": 1050.04,
+"iters": 28,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,6,128,64,6,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=32,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=4,out_w=32,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=4,out_w=32,rows=64,calls=4)"
+],
+"est_us": 1109.68,
+"iters": 27,
 "warmup": 2
 },
 {
@@ -6289,6 +7486,83 @@
 ],
 "est_us": 854.48,
 "iters": 35,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1026,64,12,1024,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb10.c0#356"
+],
+"est_us": 6807.16,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1028,64,12,1024,1,3,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb10.c1#364"
+],
+"est_us": 7045.18,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1032,64,12,1024,1,5,1,1,1,2,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb11.c0#372"
+],
+"est_us": 10568.42,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1042,64,12,1024,1,7,1,1,1,3,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb12.c0#388"
+],
+"est_us": 15767.24,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1048,64,12,1024,1,3,1,1,1,12,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb12.c1#402"
+],
+"est_us": 8826.34,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1048,64,12,1024,1,5,1,1,1,6,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb11.c1#380"
+],
+"est_us": 13005.06,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,1060,64,12,1024,1,4,1,1,1,12,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.rb12.c1#396"
+],
+"est_us": 14055.38,
+"iters": 3,
 "warmup": 2
 },
 {
@@ -6487,6 +7761,39 @@
 "sources": [],
 "est_us": 4724.66,
 "iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,24,400,24,8,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=3,out_w=8,rows=400,calls=1)"
+],
+"est_us": 553.48,
+"iters": 54,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,48,256,24,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=3,out_w=16,rows=256,calls=1)"
+],
+"est_us": 649.12,
+"iters": 46,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,514,128,24,512,1,3,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/dec.up2#412"
+],
+"est_us": 13362.76,
+"iters": 3,
 "warmup": 2
 },
 {
@@ -6694,6 +8001,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,64,48,24,400,48,8,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=3,out_w=8,rows=400,calls=1)"
+],
+"est_us": 980.56,
+"iters": 30,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,64,48,273,96,48,39,1,7,1,7,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -6804,6 +8122,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,64,6,64,256,6,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.pv0"
+],
+"est_us": 239.52,
+"iters": 125,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,64,6,68,128,6,68,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -6834,17 +8163,6 @@
 "sources": [],
 "est_us": 907.48,
 "iters": 33,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,64,7,7,1024,1,1,7,7,1,1,1,1,0,0,1,0",
-"kernel": "ConvKernel",
-"set": "shipped",
-"sources": [
-"mnist_lenet/mnist_lenet/import/conv3/Conv2D"
-],
-"est_us": 4117.83,
-"iters": 7,
 "warmup": 2
 },
 {
@@ -7328,6 +8646,53 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,768,12,48,128,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=3,out_w=16,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=3,out_w=16,rows=128,calls=2)"
+],
+"est_us": 1540.42,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,12,48,256,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=3,out_w=16,rows=256,calls=1)"
+],
+"est_us": 2704.42,
+"iters": 11,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,12,48,64,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=3,out_w=16,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=3,out_w=16,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=3,out_w=16,rows=64,calls=4)"
+],
+"est_us": 1160.02,
+"iters": 25,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,12,48,80,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:conv(kw=3,out_w=16,rows=80,calls=5)"
+],
+"est_us": 1165.84,
+"iters": 25,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,768,14,200,352,14,40,1,5,1,5,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -7486,6 +8851,17 @@
 ],
 "est_us": 14095.26,
 "iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,24,24,400,24,8,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:conv(kw=3,out_w=8,rows=400,calls=1)"
+],
+"est_us": 4685.08,
+"iters": 6,
 "warmup": 2
 },
 {
@@ -8119,6 +9495,17 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,96,1,256,192,1,256,1,1,1,1,1,1,0,0,1,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/chunk/flow.flows.6.pre#6"
+],
+"est_us": 332.98,
+"iters": 90,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,96,112,112,16,56,56,1,1,2,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -8149,6 +9536,53 @@
 "sources": [],
 "est_us": 131.02,
 "iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,12,64,128,12,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=32,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=32,rows=128,calls=2)"
+],
+"est_us": 363.78,
+"iters": 82,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,12,64,256,12,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=32,rows=256,calls=1)"
+],
+"est_us": 646.88,
+"iters": 46,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,12,64,64,12,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=2,out_w=32,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=32,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=32,rows=64,calls=4)"
+],
+"est_us": 238.02,
+"iters": 126,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,12,64,80,12,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=2,out_w=32,rows=80,calls=5)"
+],
+"est_us": 259.74,
+"iters": 115,
 "warmup": 2
 },
 {
@@ -8240,6 +9674,19 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,96,3,128,64,3,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=2,out_w=64,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=64,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=64,rows=64,calls=4)"
+],
+"est_us": 139.84,
+"iters": 200,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,96,32,108,128,32,18,1,6,1,6,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "shipped",
@@ -8260,6 +9707,19 @@
 "sources": [],
 "est_us": 1411.14,
 "iters": 21,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,4,192,64,4,96,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=2,out_w=96,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=96,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=96,rows=64,calls=4)"
+],
+"est_us": 238.02,
+"iters": 126,
 "warmup": 2
 },
 {
@@ -8324,6 +9784,117 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,96,6,128,128,6,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=64,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=64,rows=128,calls=2)"
+],
+"est_us": 365.22,
+"iters": 82,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,128,64,6,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=2,out_w=64,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=64,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=2,out_w=64,rows=64,calls=4)"
+],
+"est_us": 238.02,
+"iters": 126,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,128,80,6,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=2,out_w=64,rows=80,calls=5)"
+],
+"est_us": 261.18,
+"iters": 114,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,128,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=32,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=32,rows=128,calls=2)"
+],
+"est_us": 197.06,
+"iters": 152,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,16,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=2,out_w=32,rows=16,calls=2)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=2,out_w=32,rows=16,calls=4)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=32,rows=16,calls=8)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=32,rows=16,calls=16)"
+],
+"est_us": 114.08,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,256,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=32,rows=256,calls=1)"
+],
+"est_us": 337.22,
+"iters": 88,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,32,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=2,out_w=32,rows=32,calls=1)",
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=2,out_w=32,rows=32,calls=2)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=32,rows=32,calls=4)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=32,rows=32,calls=8)"
+],
+"est_us": 120.54,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,64,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=2,out_w=32,rows=64,calls=1)",
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=32,rows=64,calls=2)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=32,rows=64,calls=4)"
+],
+"est_us": 133.46,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,64,80,6,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=2,out_w=32,rows=80,calls=5)"
+],
+"est_us": 145.04,
+"iters": 200,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,96,68,132,16,68,22,1,6,1,6,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -8368,6 +9939,40 @@
 "warmup": 2
 },
 {
+"key": "ConvKernel:1,96,8,48,128,8,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=24,rows=128,calls=1)",
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=24,rows=128,calls=2)"
+],
+"est_us": 198.5,
+"iters": 151,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,8,48,256,8,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=2,out_w=24,rows=256,calls=1)"
+],
+"est_us": 338.66,
+"iters": 88,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,8,48,80,8,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=2,out_w=24,rows=80,calls=5)"
+],
+"est_us": 150.8,
+"iters": 198,
+"warmup": 2
+},
+{
 "key": "ConvKernel:1,96,8,712,32,8,178,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "grid",
@@ -8376,6 +9981,17 @@
 "sources": [],
 "est_us": 1365.9,
 "iters": 21,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,96,48,400,96,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=6,out_w=8,rows=400,calls=1)"
+],
+"est_us": 4457.56,
+"iters": 6,
 "warmup": 2
 },
 {
@@ -8664,6 +10280,17 @@
 "sources": [],
 "est_us": 5777.3,
 "iters": 5,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:1,1024,10,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv4last/Conv2D_fc_matmul"
+],
+"est_us": 70.989,
+"iters": 200,
 "warmup": 2
 },
 {
@@ -9197,6 +10824,50 @@
 "sources": [],
 "est_us": 1302.914,
 "iters": 23,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:1,3136,1024,1,0,0,0,0,1",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv3/Conv2D_fc_matmul"
+],
+"est_us": 2108.421,
+"iters": 14,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:1,3136,1024,1,0,0,0,0,2",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv3/Conv2D_fc_matmul:gemv(kw=2)"
+],
+"est_us": 2108.431,
+"iters": 14,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:1,3136,1024,1,0,0,0,0,4",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv3/Conv2D_fc_matmul:gemv(kw=4)"
+],
+"est_us": 2108.451,
+"iters": 14,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:1,3136,1024,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv3/Conv2D_fc_matmul:tiled(packed=1)"
+],
+"est_us": 4281.102,
+"iters": 7,
 "warmup": 2
 },
 {
@@ -10038,6 +11709,50 @@
 "warmup": 2
 },
 {
+"key": "MatmulKernel:128,192,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:tiled(packed=1)"
+],
+"est_us": 2273.397,
+"iters": 13,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:128,192,384,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:tiled(packed=1)"
+],
+"est_us": 4521.794,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:128,2304,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2:tiled(packed=1)"
+],
+"est_us": 18980.162,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:128,576,768,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:tiled(packed=1)"
+],
+"est_us": 21168.962,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "MatmulKernel:142,128,48,1,0,0,0,1,0",
 "kernel": "MatmulKernel",
 "set": "grid",
@@ -10329,6 +12044,28 @@
 "warmup": 2
 },
 {
+"key": "MatmulKernel:256,192,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:tiled(packed=1)"
+],
+"est_us": 4521.794,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:256,192,384,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:tiled(packed=1)"
+],
+"est_us": 9018.587,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "MatmulKernel:256,2,768,1,0,0,0,1,0",
 "kernel": "MatmulKernel",
 "set": "shipped",
@@ -10337,6 +12074,17 @@
 ],
 "est_us": 5988.366,
 "iters": 5,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:256,2304,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2:tiled(packed=1)"
+],
+"est_us": 37935.323,
+"iters": 3,
 "warmup": 2
 },
 {
@@ -10405,6 +12153,17 @@
 "smolvlm-256m-instruct/prefill_256/prefill_256.l0.q_proj:tiled(packed=1)"
 ],
 "est_us": 31740.942,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:256,576,768,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1:tiled(packed=1)"
+],
+"est_us": 42312.923,
 "iters": 3,
 "warmup": 2
 },
@@ -10574,6 +12333,50 @@
 "warmup": 2
 },
 {
+"key": "MatmulKernel:32,192,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:tiled(packed=1)"
+],
+"est_us": 587.099,
+"iters": 51,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:32,192,384,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:tiled(packed=1)"
+],
+"est_us": 1149.198,
+"iters": 26,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:32,2304,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:tiled(packed=1)"
+],
+"est_us": 4763.79,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:32,576,768,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:tiled(packed=1)"
+],
+"est_us": 5310.99,
+"iters": 5,
+"warmup": 2
+},
+{
 "key": "MatmulKernel:33,1296,2776,12,42768,0,91608,1,0",
 "kernel": "MatmulKernel",
 "set": "grid",
@@ -10739,6 +12542,50 @@
 "warmup": 2
 },
 {
+"key": "MatmulKernel:400,192,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:tiled(packed=1)"
+],
+"est_us": 7051.24,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:400,192,384,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:tiled(packed=1)"
+],
+"est_us": 14077.48,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:400,2304,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f2:tiled(packed=1)"
+],
+"est_us": 59259.88,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:400,576,768,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:tiled(packed=1)"
+],
+"est_us": 66099.88,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "MatmulKernel:41,16,1192,1,0,0,0,1,0",
 "kernel": "MatmulKernel",
 "set": "grid",
@@ -10883,6 +12730,39 @@
 "warmup": 2
 },
 {
+"key": "MatmulKernel:64,192,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:tiled(packed=1)"
+],
+"est_us": 1149.198,
+"iters": 26,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:64,192,384,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:tiled(packed=1)"
+],
+"est_us": 2273.397,
+"iters": 13,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:64,2304,192,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2:tiled(packed=1)"
+],
+"est_us": 9502.581,
+"iters": 3,
+"warmup": 2
+},
+{
 "key": "MatmulKernel:64,2560,960,1,0,0,0,1,0",
 "kernel": "MatmulKernel",
 "set": "shipped",
@@ -10937,6 +12817,17 @@
 "smolvlm-256m-instruct/prefill_64/prefill_64.l0.q_proj:tiled(packed=1)"
 ],
 "est_us": 7953.986,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "MatmulKernel:64,576,768,1,0,0,0,1,0",
+"kernel": "MatmulKernel",
+"set": "shipped",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:tiled(packed=1)"
+],
+"est_us": 10596.981,
 "iters": 3,
 "warmup": 2
 },
@@ -11407,7 +13298,8 @@
 "kernel": "VectorOPKernel",
 "set": "shipped",
 "sources": [
-"mnist_convnet/mnist_convnet/_gemm_add_1"
+"mnist_convnet/mnist_convnet/_gemm_add_1",
+"mnist_lenet/mnist_lenet/import/conv4last/Conv2D_fc_bias"
 ],
 "est_us": 20.02,
 "iters": 200,
@@ -11444,6 +13336,17 @@
 "resnet18/resnet18/resnetv15_stage2__plus0"
 ],
 "est_us": 145.44,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "VectorOPKernel:0,1024,1,0,0,1",
+"kernel": "VectorOPKernel",
+"set": "shipped",
+"sources": [
+"mnist_lenet/mnist_lenet/import/conv3/Conv2D_fc_bias"
+],
+"est_us": 21.28,
 "iters": 200,
 "warmup": 2
 },
@@ -12097,17 +14000,6 @@
 "warmup": 2
 },
 {
-"key": "VectorOPKernel:4,1024,1,0,0,0",
-"kernel": "VectorOPKernel",
-"set": "shipped",
-"sources": [
-"mnist_lenet/mnist_lenet/import/conv3/Relu"
-],
-"est_us": 21.28,
-"iters": 200,
-"warmup": 2
-},
-{
 "key": "VectorOPKernel:4,114688,1,0,0,0",
 "kernel": "VectorOPKernel",
 "set": "grid",
@@ -12440,25 +14332,25 @@
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,256,48,48,256,48,16,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,48,32,256,48,16,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"bert/bert/_gemm_matmul_1:conv(kw=3,out_w=16,rows=256,calls=1)"
+"bert/bert/_gemm_matmul_1:conv(kw=2,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 3433.64,
+"est_us": 3543.536,
 "iters": 8,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,384,32,48,128,32,24,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,256,48,48,128,48,16,1,3,1,3,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"bert/bert/_gemm_matmul_1:conv(kw=2,out_w=24,rows=128,calls=2)"
+"bert/bert/_gemm_matmul_1:conv(kw=3,out_w=16,rows=128,calls=2)"
 ],
-"est_us": 1738.228,
-"iters": 17,
+"est_us": 1796.113,
+"iters": 16,
 "warmup": 2
 },
 {
@@ -12468,8 +14360,8 @@
 "sources": [
 "bert/bert/bert/encoder/layer_0/attention/self/MatMul:conv(kw=1,out_w=16,rows=256,calls=12)"
 ],
-"est_us": 340.912,
-"iters": 87,
+"est_us": 333.822,
+"iters": 89,
 "warmup": 2
 },
 {
@@ -12479,19 +14371,8 @@
 "sources": [
 "bert/bert/bert/encoder/layer_0/attention/self/MatMul_1:conv(kw=1,out_w=8,rows=256,calls=12)"
 ],
-"est_us": 623.612,
-"iters": 48,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,384,192,32,256,192,16,1,2,1,2,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"bert/bert/_gemm_matmul_5:conv(kw=2,out_w=16,rows=256,calls=1)"
-],
-"est_us": 13958.135,
-"iters": 3,
+"est_us": 611.515,
+"iters": 49,
 "warmup": 2
 },
 {
@@ -12501,18 +14382,18 @@
 "sources": [
 "bert/bert/_gemm_matmul_5:conv(kw=3,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 14046.089,
+"est_us": 13963.211,
 "iters": 3,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,1024,48,48,128,48,16,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,48,128,128,48,64,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"bert/bert/_gemm_matmul_6:conv(kw=3,out_w=16,rows=128,calls=2)"
+"bert/bert/_gemm_matmul_5:conv(kw=2,out_w=64,rows=128,calls=2)"
 ],
-"est_us": 6230.233,
+"est_us": 7074.784,
 "iters": 4,
 "warmup": 2
 },
@@ -12523,96 +14404,52 @@
 "sources": [
 "bert/bert/_gemm_matmul_6:conv(kw=4,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 6431.607,
+"est_us": 6327.592,
 "iters": 4,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,1024,64,36,128,64,12,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,9,128,16,9,64,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"bert/bert/_gemm_matmul_6:conv(kw=3,out_w=12,rows=128,calls=2)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=2,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 6516.314,
-"iters": 4,
+"est_us": 607.382,
+"iters": 49,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,144,4,576,16,4,144,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,18,64,16,18,32,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=144,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=2,out_w=32,rows=16,calls=1)"
 ],
-"est_us": 515.87,
-"iters": 58,
+"est_us": 617.365,
+"iters": 48,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,96,8,432,16,8,72,1,6,1,6,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,6,192,16,6,96,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=6,out_w=72,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=2,out_w=96,rows=16,calls=1)"
 ],
-"est_us": 524.747,
-"iters": 57,
+"est_us": 624.599,
+"iters": 48,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,192,4,432,16,4,144,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,576,12,48,16,12,48,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=3,out_w=144,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=1,out_w=48,rows=16,calls=1)"
 ],
-"est_us": 547.128,
-"iters": 54,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,96,6,576,16,6,96,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=6,out_w=96,rows=16,calls=1)"
-],
-"est_us": 548.807,
-"iters": 54,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,6,384,16,6,96,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=96,rows=16,calls=1)"
-],
-"est_us": 556.696,
-"iters": 53,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,3,768,16,3,192,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=192,rows=16,calls=1)"
-],
-"est_us": 574.033,
-"iters": 52,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,4,192,16,4,48,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=48,rows=16,calls=1)"
-],
-"est_us": 168.929,
-"iters": 177,
+"est_us": 658.651,
+"iters": 45,
 "warmup": 2
 },
 {
@@ -12622,8 +14459,8 @@
 "sources": [
 "smollm2-135m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=32,rows=16,calls=1)"
 ],
-"est_us": 187.235,
-"iters": 160,
+"est_us": 205.867,
+"iters": 145,
 "warmup": 2
 },
 {
@@ -12633,30 +14470,52 @@
 "sources": [
 "smollm2-135m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=2,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 193.346,
-"iters": 155,
+"est_us": 206.442,
+"iters": 145,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,144,6,1024,16,6,256,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,144,4,192,16,4,48,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=256,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=48,rows=16,calls=1)"
 ],
-"est_us": 1432.341,
-"iters": 20,
+"est_us": 207.168,
+"iters": 144,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,288,3,1024,16,3,512,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,576,6,256,16,6,256,1,1,1,1,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=512,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=256,rows=16,calls=1)"
 ],
-"est_us": 1452.011,
-"iters": 20,
+"est_us": 1562.146,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,48,64,16,48,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=32,rows=16,calls=1)"
+],
+"est_us": 1583.153,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,8,192,16,8,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=192,rows=16,calls=1)"
+],
+"est_us": 1596.41,
+"iters": 18,
 "warmup": 2
 },
 {
@@ -12666,19 +14525,8 @@
 "sources": [
 "smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 1547.392,
-"iters": 19,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,192,4,1152,16,4,384,1,3,1,3,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=3,out_w=384,rows=16,calls=1)"
-],
-"est_us": 1568.46,
-"iters": 19,
+"est_us": 1610.16,
+"iters": 18,
 "warmup": 2
 },
 {
@@ -12688,96 +14536,63 @@
 "sources": [
 "smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 1570.974,
-"iters": 19,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,576,4,384,16,4,384,1,1,1,1,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=384,rows=16,calls=1)"
-],
-"est_us": 1590.737,
+"est_us": 1614.963,
 "iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,384,8,288,16,8,72,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,144,4,1536,16,4,384,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=72,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=384,rows=16,calls=1)"
 ],
-"est_us": 1250.814,
-"iters": 23,
+"est_us": 1617.229,
+"iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,256,12,288,16,12,48,1,6,1,6,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,36,64,16,36,16,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=6,out_w=48,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=16,rows=16,calls=1)"
 ],
-"est_us": 1262.678,
-"iters": 23,
+"est_us": 1611.196,
+"iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,256,18,192,16,18,32,1,6,1,6,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,18,128,16,18,32,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=6,out_w=32,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=32,rows=16,calls=1)"
 ],
-"est_us": 1288.996,
-"iters": 23,
+"est_us": 1626.252,
+"iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,384,6,384,16,6,96,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,12,192,16,12,48,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=96,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=48,rows=16,calls=1)"
 ],
-"est_us": 1302.265,
-"iters": 23,
+"est_us": 1634.102,
+"iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,768,16,72,16,16,36,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,12,96,64,12,48,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=2,out_w=36,rows=16,calls=1)"
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=2,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 1312.422,
-"iters": 22,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,384,16,144,16,16,36,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=36,rows=16,calls=1)"
-],
-"est_us": 1316.136,
-"iters": 22,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,18,128,64,18,32,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
-],
-"est_us": 680.654,
-"iters": 44,
+"est_us": 736.637,
+"iters": 40,
 "warmup": 2
 },
 {
@@ -12787,52 +14602,19 @@
 "sources": [
 "smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 687.042,
-"iters": 43,
+"est_us": 740.629,
+"iters": 40,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,144,12,192,64,12,48,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,144,18,128,64,18,32,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
 ],
-"est_us": 703.229,
-"iters": 42,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,16,48,64,16,12,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=4,out_w=12,rows=64,calls=1)"
-],
-"est_us": 245.746,
-"iters": 122,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,96,24,48,64,24,8,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=6,out_w=8,rows=64,calls=1)"
-],
-"est_us": 246.927,
-"iters": 121,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,192,12,48,64,12,16,1,3,1,3,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=3,out_w=16,rows=64,calls=1)"
-],
-"est_us": 246.963,
-"iters": 121,
+"est_us": 745.176,
+"iters": 40,
 "warmup": 2
 },
 {
@@ -12842,8 +14624,41 @@
 "sources": [
 "smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=2,out_w=24,rows=64,calls=1)"
 ],
-"est_us": 249.442,
-"iters": 120,
+"est_us": 242.119,
+"iters": 123,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,16,48,64,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=4,out_w=12,rows=64,calls=1)"
+],
+"est_us": 243.428,
+"iters": 123,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,12,48,64,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=3,out_w=16,rows=64,calls=1)"
+],
+"est_us": 243.776,
+"iters": 123,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,24,48,64,24,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=6,out_w=8,rows=64,calls=1)"
+],
+"est_us": 254.223,
+"iters": 118,
 "warmup": 2
 },
 {
@@ -12853,29 +14668,18 @@
 "sources": [
 "smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=2,out_w=96,rows=64,calls=1)"
 ],
-"est_us": 1858.171,
+"est_us": 1775.265,
 "iters": 16,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,144,48,128,64,48,32,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,32,96,64,32,48,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=2,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 1876.857,
-"iters": 15,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,144,32,192,64,32,48,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
-],
-"est_us": 1936.485,
+"est_us": 1917.616,
 "iters": 15,
 "warmup": 2
 },
@@ -12886,30 +14690,30 @@
 "sources": [
 "smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 1538.955,
-"iters": 19,
+"est_us": 1838.503,
+"iters": 16,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,384,18,128,64,18,32,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,768,12,96,64,12,48,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=2,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 1693.34,
-"iters": 17,
+"est_us": 1839.529,
+"iters": 16,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,512,32,54,64,32,18,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,384,12,192,64,12,48,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=3,out_w=18,rows=64,calls=1)"
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 1698.077,
-"iters": 17,
+"est_us": 1853.317,
+"iters": 16,
 "warmup": 2
 },
 {
@@ -12919,19 +14723,19 @@
 "sources": [
 "smollm2-135m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=2,out_w=18,rows=128,calls=2)"
 ],
-"est_us": 1113.648,
-"iters": 26,
+"est_us": 1099.376,
+"iters": 27,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,288,48,24,256,48,12,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,144,48,48,128,48,12,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=2,out_w=12,rows=256,calls=1)"
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=4,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 2231.971,
-"iters": 13,
+"est_us": 1124.41,
+"iters": 26,
 "warmup": 2
 },
 {
@@ -12941,8 +14745,8 @@
 "sources": [
 "smollm2-135m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=4,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 359.367,
-"iters": 83,
+"est_us": 355.263,
+"iters": 84,
 "warmup": 2
 },
 {
@@ -12952,19 +14756,8 @@
 "sources": [
 "smollm2-135m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=3,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 364.77,
-"iters": 82,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,288,96,32,256,96,16,1,2,1,2,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=2,out_w=16,rows=256,calls=1)"
-],
-"est_us": 5475.967,
-"iters": 5,
+"est_us": 355.925,
+"iters": 84,
 "warmup": 2
 },
 {
@@ -12974,52 +14767,41 @@
 "sources": [
 "smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=3,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 5521.399,
+"est_us": 5315.291,
 "iters": 5,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,288,64,48,256,64,24,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,288,96,32,256,96,16,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=2,out_w=24,rows=256,calls=1)"
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=2,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 5657.772,
+"est_us": 5351.699,
 "iters": 5,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,384,36,64,128,36,16,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,192,128,36,256,128,12,1,3,1,3,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=16,rows=128,calls=2)"
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=3,out_w=12,rows=256,calls=1)"
 ],
-"est_us": 2507.171,
-"iters": 11,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,384,36,64,256,36,16,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=16,rows=256,calls=1)"
-],
-"est_us": 5271.36,
+"est_us": 5563.46,
 "iters": 5,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,768,18,64,128,18,32,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,512,48,36,128,48,12,1,3,1,3,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-135m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=2,out_w=32,rows=128,calls=2)"
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=3,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 2688.476,
-"iters": 11,
+"est_us": 2809.468,
+"iters": 10,
 "warmup": 2
 },
 {
@@ -13029,30 +14811,52 @@
 "sources": [
 "smolvlm-256m-instruct/vision/vision.connector0:conv(kw=4,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 4215.836,
-"iters": 7,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,1024,16,144,64,16,36,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smolvlm-256m-instruct/vision/vision.connector0:conv(kw=4,out_w=36,rows=64,calls=1)"
-],
-"est_us": 4669.462,
+"est_us": 4679.183,
 "iters": 6,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,1024,48,48,64,48,12,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,1024,24,96,64,24,24,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smolvlm-256m-instruct/vision/vision.connector0:conv(kw=4,out_w=12,rows=64,calls=1)"
+"smolvlm-256m-instruct/vision/vision.connector0:conv(kw=4,out_w=24,rows=64,calls=1)"
 ],
-"est_us": 4701.312,
-"iters": 6,
+"est_us": 5084.519,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,960,8,120,16,8,120,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=1,out_w=120,rows=16,calls=1)"
+],
+"est_us": 1583.484,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,12,320,16,12,80,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=80,rows=16,calls=1)"
+],
+"est_us": 1600.372,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,480,10,192,16,10,96,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=2,out_w=96,rows=16,calls=1)"
+],
+"est_us": 1610.256,
+"iters": 18,
 "warmup": 2
 },
 {
@@ -13062,30 +14866,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=160,rows=16,calls=1)"
 ],
-"est_us": 1365.269,
-"iters": 21,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,192,8,600,16,8,120,1,5,1,5,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=5,out_w=120,rows=16,calls=1)"
-],
-"est_us": 1413.259,
-"iters": 21,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,160,10,576,16,10,96,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=6,out_w=96,rows=16,calls=1)"
-],
-"est_us": 1421.963,
-"iters": 21,
+"est_us": 1633.046,
+"iters": 18,
 "warmup": 2
 },
 {
@@ -13095,30 +14877,30 @@
 "sources": [
 "smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=192,rows=16,calls=1)"
 ],
-"est_us": 1470.877,
-"iters": 20,
+"est_us": 1635.635,
+"iters": 18,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,480,3,640,16,3,320,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,480,10,64,16,10,32,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=2,out_w=320,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=2,out_w=32,rows=16,calls=1)"
 ],
-"est_us": 1496.036,
-"iters": 20,
+"est_us": 533.113,
+"iters": 56,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,240,4,960,16,4,240,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,320,16,60,16,16,20,1,3,1,3,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=240,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=3,out_w=20,rows=16,calls=1)"
 ],
-"est_us": 1510.326,
-"iters": 19,
+"est_us": 557.597,
+"iters": 53,
 "warmup": 2
 },
 {
@@ -13128,128 +14910,84 @@
 "sources": [
 "smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 404.447,
-"iters": 74,
+"est_us": 560.014,
+"iters": 53,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,240,4,320,16,4,80,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,240,40,256,16,40,64,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=80,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=64,rows=16,calls=1)"
 ],
-"est_us": 435.802,
-"iters": 68,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,192,8,200,16,8,40,1,5,1,5,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=5,out_w=40,rows=16,calls=1)"
-],
-"est_us": 443.922,
-"iters": 67,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,160,8,240,16,8,40,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=6,out_w=40,rows=16,calls=1)"
-],
-"est_us": 455.201,
-"iters": 65,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,480,40,128,16,40,64,1,2,1,2,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=64,rows=16,calls=1)"
-],
-"est_us": 3561.737,
-"iters": 8,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,960,20,128,16,20,128,1,1,1,1,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=128,rows=16,calls=1)"
-],
-"est_us": 3609.403,
-"iters": 8,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,960,40,64,16,40,64,1,1,1,1,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=64,rows=16,calls=1)"
-],
-"est_us": 3646.064,
-"iters": 8,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,160,32,480,16,32,80,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=6,out_w=80,rows=16,calls=1)"
-],
-"est_us": 3910.53,
+"est_us": 3953.428,
 "iters": 7,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,960,16,160,16,16,160,1,1,1,1,1,1,0,0,0,0",
+"key": "ConvKernel:1,480,20,256,16,20,128,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=160,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=128,rows=16,calls=1)"
 ],
-"est_us": 3914.101,
+"est_us": 3986.621,
 "iters": 7,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,192,32,400,16,32,80,1,5,1,5,1,1,0,0,0,0",
+"key": "ConvKernel:1,480,32,160,16,32,80,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=5,out_w=80,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=80,rows=16,calls=1)"
 ],
-"est_us": 3922.216,
+"est_us": 4091.129,
 "iters": 7,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,640,5,768,16,5,192,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,320,32,240,16,32,80,1,3,1,3,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=192,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=3,out_w=80,rows=16,calls=1)"
 ],
-"est_us": 4128.082,
+"est_us": 4129.726,
 "iters": 7,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,640,6,640,16,6,160,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,240,32,320,16,32,80,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=160,rows=16,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=80,rows=16,calls=1)"
 ],
-"est_us": 4205.33,
+"est_us": 4166.957,
+"iters": 7,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,480,80,64,16,80,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=32,rows=16,calls=1)"
+],
+"est_us": 4297.794,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,640,8,480,16,8,120,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=120,rows=16,calls=1)"
+],
+"est_us": 4241.999,
 "iters": 7,
 "warmup": 2
 },
@@ -13260,19 +14998,19 @@
 "sources": [
 "smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=48,rows=16,calls=1)"
 ],
-"est_us": 4214.377,
+"est_us": 4267.022,
 "iters": 7,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,480,30,64,64,30,32,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,640,6,640,16,6,160,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=2,out_w=32,rows=64,calls=1)"
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=160,rows=16,calls=1)"
 ],
-"est_us": 1681.821,
-"iters": 17,
+"est_us": 4295.475,
+"iters": 6,
 "warmup": 2
 },
 {
@@ -13282,7 +15020,7 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
 ],
-"est_us": 1729.277,
+"est_us": 1737.254,
 "iters": 17,
 "warmup": 2
 },
@@ -13293,7 +15031,7 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 1763.682,
+"est_us": 1741.412,
 "iters": 17,
 "warmup": 2
 },
@@ -13304,18 +15042,29 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=30,rows=64,calls=1)"
 ],
-"est_us": 1765.786,
+"est_us": 1781.511,
 "iters": 16,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,480,32,60,64,32,30,1,2,1,2,1,1,0,0,0,0",
+"key": "ConvKernel:1,480,15,128,64,15,64,1,2,1,2,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=2,out_w=30,rows=64,calls=1)"
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=2,out_w=64,rows=64,calls=1)"
 ],
-"est_us": 1767.706,
+"est_us": 1795.938,
+"iters": 16,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,160,48,120,64,48,20,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=6,out_w=20,rows=64,calls=1)"
+],
+"est_us": 1809.856,
 "iters": 16,
 "warmup": 2
 },
@@ -13326,19 +15075,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=4,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 543.675,
-"iters": 55,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,160,32,60,64,32,10,1,6,1,6,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=6,out_w=10,rows=64,calls=1)"
-],
-"est_us": 564.752,
-"iters": 53,
+"est_us": 593.155,
+"iters": 50,
 "warmup": 2
 },
 {
@@ -13348,8 +15086,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=3,out_w=20,rows=64,calls=1)"
 ],
-"est_us": 591.363,
-"iters": 50,
+"est_us": 626.217,
+"iters": 47,
 "warmup": 2
 },
 {
@@ -13359,41 +15097,19 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=3,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 621.367,
-"iters": 48,
+"est_us": 650.752,
+"iters": 46,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,160,80,192,64,80,32,1,6,1,6,1,1,0,0,0,0",
+"key": "ConvKernel:1,160,16,120,64,16,20,1,6,1,6,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=6,out_w=32,rows=64,calls=1)"
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=6,out_w=20,rows=64,calls=1)"
 ],
-"est_us": 4922.636,
-"iters": 6,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,320,40,192,64,40,64,1,3,1,3,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=3,out_w=64,rows=64,calls=1)"
-],
-"est_us": 4962.255,
-"iters": 6,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,240,160,64,64,160,16,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=4,out_w=16,rows=64,calls=1)"
-],
-"est_us": 5105.119,
-"iters": 5,
+"est_us": 653.579,
+"iters": 45,
 "warmup": 2
 },
 {
@@ -13403,19 +15119,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=16,rows=64,calls=1)"
 ],
-"est_us": 4125.883,
-"iters": 7,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,640,20,192,64,20,48,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
-],
-"est_us": 4271.955,
-"iters": 7,
+"est_us": 4387.427,
+"iters": 6,
 "warmup": 2
 },
 {
@@ -13425,41 +15130,19 @@
 "sources": [
 "smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=32,rows=64,calls=1)"
 ],
-"est_us": 4311.988,
+"est_us": 4406.12,
 "iters": 6,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,640,32,120,64,32,30,1,4,1,4,1,1,0,0,0,0",
+"key": "ConvKernel:1,640,20,192,64,20,48,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=30,rows=64,calls=1)"
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=48,rows=64,calls=1)"
 ],
-"est_us": 4408.404,
+"est_us": 4427.952,
 "iters": 6,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,512,80,60,64,80,12,1,5,1,5,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=5,out_w=12,rows=64,calls=1)"
-],
-"est_us": 4445.453,
-"iters": 6,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,320,48,60,128,48,20,1,3,1,3,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=3,out_w=20,rows=128,calls=2)"
-],
-"est_us": 2599.849,
-"iters": 11,
 "warmup": 2
 },
 {
@@ -13469,19 +15152,19 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=3,out_w=20,rows=256,calls=1)"
 ],
-"est_us": 5213.508,
+"est_us": 5202.572,
 "iters": 5,
 "warmup": 2
 },
 {
-"key": "ConvKernel:1,320,60,48,256,60,16,1,3,1,3,1,1,0,0,0,0",
+"key": "ConvKernel:1,240,32,120,128,32,30,1,4,1,4,1,1,0,0,0,0",
 "kernel": "ConvKernel",
 "set": "refine",
 "sources": [
-"smollm2-360m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=3,out_w=16,rows=256,calls=1)"
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=4,out_w=30,rows=128,calls=2)"
 ],
-"est_us": 5229.611,
-"iters": 5,
+"est_us": 2621.074,
+"iters": 11,
 "warmup": 2
 },
 {
@@ -13491,8 +15174,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=2,out_w=20,rows=128,calls=2)"
 ],
-"est_us": 916.469,
-"iters": 32,
+"est_us": 902.414,
+"iters": 33,
 "warmup": 2
 },
 {
@@ -13502,7 +15185,7 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=2,out_w=32,rows=256,calls=1)"
 ],
-"est_us": 13950.769,
+"est_us": 13869.671,
 "iters": 3,
 "warmup": 2
 },
@@ -13513,7 +15196,7 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=3,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 14070.342,
+"est_us": 13939.453,
 "iters": 3,
 "warmup": 2
 },
@@ -13524,19 +15207,8 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=2,out_w=16,rows=256,calls=1)"
 ],
-"est_us": 14109.978,
+"est_us": 14154.881,
 "iters": 3,
-"warmup": 2
-},
-{
-"key": "ConvKernel:1,640,32,120,128,32,30,1,4,1,4,1,1,0,0,0,0",
-"kernel": "ConvKernel",
-"set": "refine",
-"sources": [
-"smollm2-360m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=30,rows=128,calls=2)"
-],
-"est_us": 6512.733,
-"iters": 4,
 "warmup": 2
 },
 {
@@ -13546,8 +15218,1295 @@
 "sources": [
 "smollm2-360m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=12,rows=128,calls=2)"
 ],
-"est_us": 6647.923,
+"est_us": 6510.918,
 "iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,640,32,120,128,32,30,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=30,rows=128,calls=2)"
+],
+"est_us": 6526.285,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,64,32,12,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=4,out_w=16,rows=32,calls=1)"
+],
+"est_us": 86.932,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,3,128,32,3,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=2,out_w=64,rows=32,calls=1)"
+],
+"est_us": 91.715,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,16,48,32,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=4,out_w=12,rows=32,calls=1)"
+],
+"est_us": 94.86,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,2,192,32,2,96,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=2,out_w=96,rows=32,calls=1)"
+],
+"est_us": 95.105,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,6,128,32,6,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=4,out_w=32,rows=32,calls=1)"
+],
+"est_us": 95.155,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,16,192,32,16,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=4,out_w=48,rows=32,calls=1)"
+],
+"est_us": 770.629,
+"iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,12,256,32,12,64,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=4,out_w=64,rows=32,calls=1)"
+],
+"est_us": 780.809,
+"iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,6,128,32,6,128,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=128,rows=32,calls=1)"
+],
+"est_us": 786.615,
+"iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,4,192,32,4,192,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=192,rows=32,calls=1)"
+],
+"est_us": 796.425,
+"iters": 37,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,24,128,32,24,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=4,out_w=32,rows=32,calls=1)"
+],
+"est_us": 814.785,
+"iters": 36,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,8,96,32,8,24,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=24,rows=32,calls=1)"
+],
+"est_us": 823.49,
+"iters": 36,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,24,64,32,24,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=4,out_w=16,rows=32,calls=1)"
+],
+"est_us": 151.311,
+"iters": 198,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,8,192,32,8,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=4,out_w=48,rows=32,calls=1)"
+],
+"est_us": 156.01,
+"iters": 192,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,3,256,32,3,128,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=2,out_w=128,rows=32,calls=1)"
+],
+"est_us": 156.833,
+"iters": 191,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,12,64,32,12,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=2,out_w=32,rows=32,calls=1)"
+],
+"est_us": 157.94,
+"iters": 189,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,128,32,12,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=4,out_w=32,rows=32,calls=1)"
+],
+"est_us": 158.628,
+"iters": 189,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,48,32,24,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=3,out_w=16,rows=32,calls=1)"
+],
+"est_us": 163.078,
+"iters": 183,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,8,48,64,8,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=2,out_w=24,rows=64,calls=1)"
+],
+"est_us": 110.928,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,48,64,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=3,out_w=16,rows=64,calls=1)"
+],
+"est_us": 113.934,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,16,48,64,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.q0:conv(kw=4,out_w=12,rows=64,calls=1)"
+],
+"est_us": 114.35,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,12,128,64,12,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=2,out_w=64,rows=64,calls=1)"
+],
+"est_us": 867.13,
+"iters": 34,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,24,64,64,24,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=2,out_w=32,rows=64,calls=1)"
+],
+"est_us": 916.297,
+"iters": 32,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,16,192,64,16,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=4,out_w=48,rows=64,calls=1)"
+],
+"est_us": 920.777,
+"iters": 32,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,24,128,64,24,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f1:conv(kw=4,out_w=32,rows=64,calls=1)"
+],
+"est_us": 936.03,
+"iters": 32,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,16,48,64,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.l0.f2:conv(kw=4,out_w=12,rows=64,calls=1)"
+],
+"est_us": 896.102,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,24,64,64,24,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=4,out_w=16,rows=64,calls=1)"
+],
+"est_us": 190.698,
+"iters": 157,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,12,128,64,12,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=4,out_w=32,rows=64,calls=1)"
+],
+"est_us": 199.702,
+"iters": 150,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,16,48,64,16,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=2,out_w=24,rows=64,calls=1)"
+],
+"est_us": 204.519,
+"iters": 146,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,16,36,128,16,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=3,out_w=12,rows=128,calls=1)"
+],
+"est_us": 175.43,
+"iters": 171,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,48,128,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=3,out_w=16,rows=128,calls=1)"
+],
+"est_us": 175.888,
+"iters": 170,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,16,48,128,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=4,out_w=12,rows=128,calls=1)"
+],
+"est_us": 176.103,
+"iters": 170,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,32,48,128,32,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=2,out_w=24,rows=128,calls=1)"
+],
+"est_us": 1400.526,
+"iters": 21,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,48,48,128,48,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=3,out_w=16,rows=128,calls=1)"
+],
+"est_us": 1424.228,
+"iters": 21,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,64,48,128,64,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=4,out_w=12,rows=128,calls=1)"
+],
+"est_us": 1445.572,
+"iters": 20,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,16,36,128,16,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f2:conv(kw=3,out_w=12,rows=128,calls=1)"
+],
+"est_us": 1441.008,
+"iters": 20,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,16,48,128,16,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=24,rows=128,calls=1)"
+],
+"est_us": 320.813,
+"iters": 93,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,96,128,12,32,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=3,out_w=32,rows=128,calls=1)"
+],
+"est_us": 327.141,
+"iters": 91,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,48,128,24,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=3,out_w=16,rows=128,calls=1)"
+],
+"est_us": 327.165,
+"iters": 91,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,8,96,128,8,48,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=2,out_w=48,rows=128,calls=1)"
+],
+"est_us": 334.64,
+"iters": 89,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,16,48,256,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=4,out_w=12,rows=256,calls=1)"
+],
+"est_us": 314.705,
+"iters": 95,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,48,256,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=3,out_w=16,rows=256,calls=1)"
+],
+"est_us": 316.658,
+"iters": 94,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,16,36,256,16,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.q0:conv(kw=3,out_w=12,rows=256,calls=1)"
+],
+"est_us": 317.743,
+"iters": 94,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,48,48,256,48,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=3,out_w=16,rows=256,calls=1)"
+],
+"est_us": 2776.873,
+"iters": 10,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,32,48,256,32,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=4,out_w=12,rows=256,calls=1)"
+],
+"est_us": 622.99,
+"iters": 48,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,32,36,256,32,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.st:conv(kw=3,out_w=12,rows=256,calls=1)"
+],
+"est_us": 652.32,
+"iters": 45,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,16,48,80,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=4,out_w=12,rows=80,calls=5)"
+],
+"est_us": 124.313,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,12,48,80,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.q0:conv(kw=3,out_w=16,rows=80,calls=5)"
+],
+"est_us": 124.8,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,48,48,400,48,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=3,out_w=16,rows=400,calls=1)"
+],
+"est_us": 4554.009,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,64,36,400,64,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=3,out_w=12,rows=400,calls=1)"
+],
+"est_us": 4567.708,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,64,24,400,64,12,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=2,out_w=12,rows=400,calls=1)"
+],
+"est_us": 4736.717,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,32,48,400,32,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=4,out_w=12,rows=400,calls=1)"
+],
+"est_us": 1078.892,
+"iters": 27,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,16,48,80,16,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=2,out_w=24,rows=80,calls=5)"
+],
+"est_us": 224.928,
+"iters": 133,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,24,64,400,24,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=4,out_w=16,rows=400,calls=1)"
+],
+"est_us": 1126.348,
+"iters": 26,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,256,96,96,128,96,32,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"bert/bert/_gemm_matmul_5:conv(kw=3,out_w=32,rows=128,calls=2)"
+],
+"est_us": 6900.668,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,256,192,48,128,192,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"bert/bert/_gemm_matmul_5:conv(kw=3,out_w=16,rows=128,calls=2)"
+],
+"est_us": 6919.394,
+"iters": 4,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,512,96,48,256,96,8,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"bert/bert/_gemm_matmul_6:conv(kw=6,out_w=8,rows=256,calls=1)"
+],
+"est_us": 13437.028,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,18,128,16,18,32,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=32,rows=16,calls=1)"
+],
+"est_us": 608.692,
+"iters": 49,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,16,576,16,16,96,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=6,out_w=96,rows=16,calls=1)"
+],
+"est_us": 1570.482,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,16,384,16,16,96,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=96,rows=16,calls=1)"
+],
+"est_us": 1571.98,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,128,16,12,128,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=1,out_w=128,rows=16,calls=1)"
+],
+"est_us": 1594.922,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,96,64,16,96,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=16,rows=16,calls=1)"
+],
+"est_us": 1603.444,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,4,576,16,4,144,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=144,rows=16,calls=1)"
+],
+"est_us": 1561.597,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,256,6,576,16,6,96,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=6,out_w=96,rows=16,calls=1)"
+],
+"est_us": 1669.286,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,2,576,16,2,288,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=2,out_w=288,rows=16,calls=1)"
+],
+"est_us": 1699.478,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,24,48,64,24,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=2,out_w=24,rows=64,calls=1)"
+],
+"est_us": 735.459,
+"iters": 40,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,96,48,64,96,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=3,out_w=16,rows=64,calls=1)"
+],
+"est_us": 1928.179,
+"iters": 15,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,64,48,64,64,24,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=2,out_w=24,rows=64,calls=1)"
+],
+"est_us": 1936.507,
+"iters": 15,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,8,288,64,8,72,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=4,out_w=72,rows=64,calls=1)"
+],
+"est_us": 1719.73,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,256,12,288,64,12,48,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=6,out_w=48,rows=64,calls=1)"
+],
+"est_us": 1724.746,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,512,6,288,64,6,96,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_64/prefill_64.l0.d_proj:conv(kw=3,out_w=96,rows=64,calls=1)"
+],
+"est_us": 1770.439,
+"iters": 16,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,36,64,128,36,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=4,out_w=16,rows=128,calls=2)"
+],
+"est_us": 1078.119,
+"iters": 27,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,12,48,256,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=3,out_w=16,rows=256,calls=1)"
+],
+"est_us": 705.886,
+"iters": 42,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,16,36,256,16,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=3,out_w=12,rows=256,calls=1)"
+],
+"est_us": 709.395,
+"iters": 42,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,128,48,256,128,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.g_proj:conv(kw=4,out_w=12,rows=256,calls=1)"
+],
+"est_us": 5507.876,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,48,24,256,48,12,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-135m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=2,out_w=12,rows=256,calls=1)"
+],
+"est_us": 5514.493,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,960,15,64,16,15,64,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=1,out_w=64,rows=16,calls=1)"
+],
+"est_us": 1576.947,
+"iters": 19,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,15,256,16,15,64,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=4,out_w=64,rows=16,calls=1)"
+],
+"est_us": 1607.754,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,960,4,240,16,4,240,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.q_proj:conv(kw=1,out_w=240,rows=16,calls=1)"
+],
+"est_us": 1630.656,
+"iters": 18,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,20,64,16,20,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.k_proj:conv(kw=4,out_w=16,rows=16,calls=1)"
+],
+"est_us": 551.557,
+"iters": 54,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,320,4,1920,16,4,640,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=3,out_w=640,rows=16,calls=1)"
+],
+"est_us": 4269.373,
+"iters": 7,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,4,2560,16,4,640,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=640,rows=16,calls=1)"
+],
+"est_us": 4280.527,
+"iters": 7,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,20,512,16,20,128,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=4,out_w=128,rows=16,calls=1)"
+],
+"est_us": 4431.492,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,480,40,128,16,40,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.g_proj:conv(kw=2,out_w=64,rows=16,calls=1)"
+],
+"est_us": 4433.318,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,640,5,768,16,5,192,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_16/prefill_16.l0.d_proj:conv(kw=4,out_w=192,rows=16,calls=1)"
+],
+"est_us": 4304.985,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,240,12,320,64,12,80,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=4,out_w=80,rows=64,calls=1)"
+],
+"est_us": 1706.283,
+"iters": 17,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,16,300,64,16,60,1,5,1,5,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.q_proj:conv(kw=5,out_w=60,rows=64,calls=1)"
+],
+"est_us": 1776.229,
+"iters": 16,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,320,8,120,64,8,40,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.k_proj:conv(kw=3,out_w=40,rows=64,calls=1)"
+],
+"est_us": 633.524,
+"iters": 47,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,320,64,120,64,64,40,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=3,out_w=40,rows=64,calls=1)"
+],
+"est_us": 4876.509,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,480,16,320,64,16,160,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=2,out_w=160,rows=64,calls=1)"
+],
+"est_us": 5289.977,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,320,80,96,64,80,32,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_64/prefill_64.l0.g_proj:conv(kw=3,out_w=32,rows=64,calls=1)"
+],
+"est_us": 5312.94,
+"iters": 5,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,480,24,80,128,24,40,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.q_proj:conv(kw=2,out_w=40,rows=128,calls=2)"
+],
+"est_us": 2318.664,
+"iters": 12,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,160,16,120,128,16,20,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=6,out_w=20,rows=128,calls=2)"
+],
+"est_us": 892.546,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,160,32,60,128,32,10,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=6,out_w=10,rows=128,calls=2)"
+],
+"est_us": 892.546,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,16,100,128,16,20,1,5,1,5,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=5,out_w=20,rows=128,calls=2)"
+],
+"est_us": 901.458,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,32,50,128,32,10,1,5,1,5,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.k_proj:conv(kw=5,out_w=10,rows=128,calls=2)"
+],
+"est_us": 901.458,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,640,80,48,256,80,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"smollm2-360m-instruct/prefill_256/prefill_256.l0.d_proj:conv(kw=4,out_w=12,rows=256,calls=1)"
+],
+"est_us": 13044.657,
+"iters": 3,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,4,192,32,4,48,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.q0:conv(kw=4,out_w=48,rows=32,calls=1)"
+],
+"est_us": 87.353,
+"iters": 200,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,24,64,32,24,32,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=2,out_w=32,rows=32,calls=1)"
+],
+"est_us": 773.114,
+"iters": 38,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,12,64,32,12,64,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=1,out_w=64,rows=32,calls=1)"
+],
+"est_us": 802.198,
+"iters": 37,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,48,64,32,48,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f1:conv(kw=4,out_w=16,rows=32,calls=1)"
+],
+"est_us": 815.965,
+"iters": 36,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,576,16,48,32,16,12,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=4,out_w=12,rows=32,calls=1)"
+],
+"est_us": 890.41,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,384,8,144,32,8,24,1,6,1,6,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=6,out_w=24,rows=32,calls=1)"
+],
+"est_us": 899.588,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,12,48,32,12,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.l0.f2:conv(kw=3,out_w=16,rows=32,calls=1)"
+],
+"est_us": 899.779,
+"iters": 33,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,192,6,64,32,6,64,1,1,1,1,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=1,out_w=64,rows=32,calls=1)"
+],
+"est_us": 150.207,
+"iters": 199,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,6,256,32,6,64,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=4,out_w=64,rows=32,calls=1)"
+],
+"est_us": 156.332,
+"iters": 191,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,6,128,32,6,64,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_32/enc32.st:conv(kw=2,out_w=64,rows=32,calls=1)"
+],
+"est_us": 160.065,
+"iters": 187,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,8,96,64,8,48,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_64/enc64.st:conv(kw=2,out_w=48,rows=64,calls=1)"
+],
+"est_us": 204.124,
+"iters": 146,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,96,16,24,128,16,12,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.q0:conv(kw=2,out_w=12,rows=128,calls=1)"
+],
+"est_us": 177.028,
+"iters": 169,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,32,96,128,32,24,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.l0.f1:conv(kw=4,out_w=24,rows=128,calls=1)"
+],
+"est_us": 1362.148,
+"iters": 22,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,32,36,128,32,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=3,out_w=12,rows=128,calls=1)"
+],
+"est_us": 316.602,
+"iters": 94,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,48,24,64,128,24,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_128/enc128.st:conv(kw=4,out_w=16,rows=128,calls=1)"
+],
+"est_us": 324.527,
+"iters": 92,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,288,48,32,256,48,16,1,2,1,2,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f1:conv(kw=2,out_w=16,rows=256,calls=1)"
+],
+"est_us": 2713.905,
+"iters": 11,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,768,16,36,256,16,12,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_256/enc256.l0.f2:conv(kw=3,out_w=12,rows=256,calls=1)"
+],
+"est_us": 2402.161,
+"iters": 12,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,96,32,400,96,8,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=4,out_w=8,rows=400,calls=1)"
+],
+"est_us": 4521.819,
+"iters": 6,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,144,48,64,80,48,16,1,4,1,4,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.l0.f1:conv(kw=4,out_w=16,rows=80,calls=5)"
+],
+"est_us": 948.464,
+"iters": 31,
+"warmup": 2
+},
+{
+"key": "ConvKernel:1,64,24,48,400,24,16,1,3,1,3,1,1,0,0,0,0",
+"kernel": "ConvKernel",
+"set": "refine",
+"sources": [
+"piper-lessac-medium/encode_400/enc400.st:conv(kw=3,out_w=16,rows=400,calls=1)"
+],
+"est_us": 1069.527,
+"iters": 28,
 "warmup": 2
 }
 ],

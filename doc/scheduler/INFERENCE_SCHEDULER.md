@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1615 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1621 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1182,6 +1182,23 @@ in one go.)
 The generated banner and `report.md` say what was planned.
 `--plan-report` adds the report's "Planning" section (predicted time,
 lane busy times, where the CPU waits) without changing anything.
+
+**Timeline.**  With `--plan` or `--plan-report`, `inference_scheduler.py`
+also writes `timeline.html`.  It is the predicted execution, drawn in the
+style of a GPU profiler (Nsight Systems):
+- **What it shows:** one row per lane (the CPU and each kernel), every
+  node's span, the CPU's waits and synchronous calls, and for a selected
+  node its dependency arrows and details.
+- **Navigation:** wheel zoom, drag to pan, an overview strip of the whole
+  run, search, and a shareable view in the URL.
+- **Scale:** it draws on a canvas, searches only the visible window and
+  merges spans narrower than a pixel. It stays smooth on any shipped
+  model: 100 000 synthetic nodes render in 13 ms per frame.
+- **The spans** come from `codegen/timing.simulate`, in its
+  `Timeline.spans`.  The page is `src/timeline_html.py`.
+- **Against the board:** `perf_calibrate.py simulate --html FILE` draws
+  the simulated phases of the shipped models, with the measured time
+  beside each prediction.
 
 The same options (`planning.add_plan_args`) are taken by
 `inference_scheduler.py`, `demo/chat/scripts/generate_llm_project.py` and

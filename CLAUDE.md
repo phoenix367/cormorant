@@ -142,7 +142,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1615 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1621 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -167,7 +167,7 @@ Key source files:
 - **`inference-scheduler/src/vit.py`** / **`src/vit_nodes.py`** — vision-encoder frontend (`VitFrontend`, the `vision` entry) and its `Vit*` host ops
 - **`inference-scheduler/src/piper.py`** / **`src/tts_nodes.py`** — Piper (VITS) text-to-speech frontend (`PiperChunkFrontend`, the `chunk` entry) and its `Tts*` host ops; `demo/tts/` holds the specification, the library (`libpiper_tts.so`) and the board gate
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake); `multi.py` — multi-entry projects (CLI `--entry NAME=MODEL.onnx`: weights deduplicated by name + image, states shared, intermediates overlapping)
-- **Planning (`--plan`, optional)** — `src/planning.py`, `tactics.py`, `perf_calls.py`, `perf_model.py` / `perf_fit.py` / `host_model.py`, `order_search.py`, `codegen/timing.py`: MatMul tactics and the issue order chosen from per-bitstream performance models measured once on the board (`perf_calibrate.py`, `perf_models/kv260/`); bit-identical results; without `--plan` every choice is unchanged — see `doc/plans/TACTICS_PLAN.md` §9
+- **Planning (`--plan`, optional)** — `src/planning.py`, `tactics.py`, `perf_calls.py`, `perf_model.py` / `perf_fit.py` / `host_model.py`, `order_search.py`, `codegen/timing.py`, `timeline_html.py` (the predicted execution as an interactive timeline, `timeline.html`): MatMul tactics and the issue order chosen from per-bitstream performance models measured once on the board (`perf_calibrate.py`, `perf_models/kv260/`); bit-identical results; without `--plan` every choice is unchanged — see `doc/plans/TACTICS_PLAN.md` §9
 
 See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and `inference-scheduler/doc/SCHEDULER_DAG.md` for the DAG / event-stream / liveness / slot-coloring algorithm specifics.
 

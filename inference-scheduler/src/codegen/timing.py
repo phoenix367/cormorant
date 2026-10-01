@@ -15,7 +15,15 @@ the way the generated ``inference_run()`` executes it on the one CPU:
 
 It returns the total time, the busy time of the CPU and of every lane, and
 the CPU's waits: which node's lane it waited for, how long — the "where the
-CPU waits" of the planning report.
+CPU waits" of the planning report.  ``Timeline.spans`` is the whole replay,
+one ``(lane, node, start µs, end µs, kind)`` per interval, for the timeline
+view (src/timeline_html.py):
+
+  kernel lanes   "kernel": the node's kernel running on its lane
+  "CPU"          "host": a host op; "issue": register writes + Start (for a
+                 multi-call MatmulConvNode, the loop that issues every call);
+                 "wait": blocked on the node's kernel; "sync": blocked on a
+                 start_sync call
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ class Timeline:
     waits: List[Tuple[int, str, float]]             # (node waited for, lane, µs)
     node_end: Dict[int, float] = field(default_factory=dict)
     unpriced: List[int] = field(default_factory=list)
+    spans: List[Tuple[str, int, float, float, str]] = field(default_factory=list)  # (lane, node, t0, t1, kind)
 
     @property
     def wait_us(self) -> float:
@@ -62,6 +71,7 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
     node_end: Dict[int, float] = {}
     waits: List[Tuple[int, str, float]] = []
     unpriced: List[int] = []
+    spans: List[Tuple[str, int, float, float, str]] = []
 
     def dur(fn, sn) -> float:
         d = fn(sn)
@@ -77,6 +87,7 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
             end = node_end.get(idx, t)
             if end > t:
                 waits.append((idx, lane, end - t))
+                spans.append(("CPU", idx, t, end, "wait"))
                 t = end
         elif kind == "start":
             sn = by_index[ev[1]]
@@ -84,27 +95,33 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
             calls = getattr(sn, "calls", 1) if hasattr(sn, "conv_n") else 1
             lane = cg._kernel_id_of(sn) or "?"
             lane_us[lane] += d
+            spans.append((lane, sn.index, t, t + d, "kernel"))
+            node_end[sn.index] = t + d
+            t0 = t
             if calls > 1:
                 per = d / calls
-                node_end[sn.index] = t + d
                 t += (calls - 1) * per + issue_us
             else:
-                node_end[sn.index] = t + d
                 t += issue_us
+            spans.append(("CPU", sn.index, t0, t, "issue"))
             cpu += issue_us
         elif kind == "start_sync":
             sn = by_index[ev[1]]
             d = dur(kernel_us, sn)
-            lane_us[cg._kernel_id_of(sn) or "?"] += d
+            lane = cg._kernel_id_of(sn) or "?"
+            lane_us[lane] += d
+            spans.append((lane, sn.index, t, t + d, "kernel"))
+            spans.append(("CPU", sn.index, t, t + d, "sync"))
             t += d
             node_end[sn.index] = t
         elif kind == "cpu":
             sn = by_index[ev[1]]
             d = dur(host_us, sn)
+            spans.append(("CPU", sn.index, t, t + d, "host"))
             t += d
             cpu += d
             node_end[sn.index] = t
-    return Timeline(t, cpu, dict(lane_us), waits, node_end, unpriced)
+    return Timeline(t, cpu, dict(lane_us), waits, node_end, unpriced, spans)
 
 
 def kernel_duration_fn(perf_model, layouts: dict, keys_of: Optional[Callable] = None,

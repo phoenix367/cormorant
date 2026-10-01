@@ -24,9 +24,21 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 HEAD bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/caa67f49a5a3** = hw_128 d7ce129 (2026-09-28). The
-perf-regression skill keeps its own baseline for each bitstream id, so a new
+Current model: **kv260/caa67f49a5a3** = hw_128 d7ce129 (2026-09-28), topped up
+on 2026-10-01 with Piper (`piper-lessac-medium`: the chunk and `encode_<T>`
+entries) to 1505 exact calls, and `host.json` merged to 151 signatures / 39 kinds
+(§3). The perf-regression skill keeps its own baseline for each bitstream id, so a new
 bitstream needs one there too.
+
+**Adding a model** (the 2026-10-01 top-up, about 45 min of chat-server downtime):
+1. Add it to `perf_calibrate.SHIPPED`, with a loader in `shipped_graphs()` that
+   builds the entries exactly as its generator does. For Piper that is
+   `generate_tts_project.entry_graphs()`, so the calls are the library's.
+2. Run the coverage check (§6) on a copy.
+3. Run `cases`, `cases --refine`, `run --resume` and `fit`, repeating the
+   refinement while it adds calls.
+4. Profile the model and run `host --merge` (§3).
+5. Run `simulate` (§4).
 
 ## 1. Preconditions (board steps: from the sources, not re-run here)
 
@@ -62,10 +74,12 @@ bitstream needs one there too.
    while another job holds it; the `deploy.py` it starts for `--stop-server`
    re-enters the lock (the holder marks its environment).  Do not wrap it in a
    shell `flock` on that file — that lock is not marked and it would wait forever.
-7. **Host**: `cases` and `cases --refine` load all nine shipped models (assets under
-   `demo/*/assets`, `demo/chat/assets/<model>`). Measured here on 2026-09-29, with a
-   23 GB peak RSS for each: 3.5 min for `cases` and 13 min for `cases --refine`. Run
-   them in the background. `fit` takes seconds.
+7. **Host**: `cases` and `cases --refine` load all ten shipped models (assets under
+   `demo/*/assets`, `demo/chat/assets/<model>`, `demo/tts/assets`).
+   - Measured 2026-10-01: 2.2 min for `cases` and 11.4 min for `cases --refine`, with
+     an 8.8 GB peak RSS for each.
+   - On 2026-09-29 the peak was 23 GB, before the generator's memory diet.
+   - Run them in the background. `fit` takes seconds.
 
 ## 2. Kernel campaign
 
@@ -88,9 +102,12 @@ Use the same id throughout.
 **cases**: prints one line per model (`bert: 66 new calls (6 s)` …), then
 `space-filling set: 569 new calls`, then
 `N cases -> perf_models/kv260/<id>.cases.json (…); about N min of calls per pass`.
-The grid (seed 2026, a quarter held out) is 569 calls. The record has 1087 cases
-(518 shipped + 569 grid). Today's scheduler gives 1090, because the
-LeNet FC convs have run as MatMul since 8e537bc. The file is rewritten from scratch.
+The grid (seed 2026, a quarter held out) is 569 calls.
+- **The first record** had 1087 cases (518 shipped + 569 grid).
+- **Today's scheduler** gives 1249:
+  - the LeNet FC convs have run as MatMul since 8e537bc (+3);
+  - Piper adds 159 calls, 139 ConvKernel and 20 MatMul tactics (2026-10-01).
+- The file is rewritten from scratch, so run `cases --refine` after it.
 Keep the default `--seed`. Keep all models too: `--models` is for experiments only, because a
 model made from part of the list lacks the exact entries of the models left out.
 
@@ -142,11 +159,22 @@ not converged. A second `--refine` on a copy (2026-09-29) adds **42**: 38 conv-m
 SmolVLM (1) and SmolLM2-360M (16). The estimate is 1.4 s of calls per pass. `cases --refine` counts calls that are
 already measured but missing from the list (after a top-up `cases`) as "added". `run --resume` then
 measures only the missing ones, as its `pass 1: N cases` line shows.
+The 2026-10-01 top-up, with Piper, made three rounds:
+
+| round | calls added | for | after `fit` |
+|---|---:|---|---|
+| 1 | 135 | BERT 7, SmolLM2-135M 36, SmolVLM 2, SmolLM2-360M 37, Piper 53 | 1444 exact calls |
+| 2 | 63 | BERT 3, 135M 19, 360M 21, Piper 20 | 1505 exact calls |
+| 3 | 18 | BERT 1, 135M 7, 360M 5, Piper 5 | checked on a copy; not measured yet |
+
+The rounds converge. Each one costs a short `run --resume`, but also a stop of the
+chat server.
 
 ## 3. Host-op model: `host.json`, independent of the bitstream
 
 Its inputs are per-layer board profiles. Record: SmolVLM, SmolLM2-135M, BERT and the three CNNs
-gave **56 exact signatures and 27 op kinds**. Chat server stopped, one job at a time:
+gave **56 exact signatures and 27 op kinds**. Piper, merged in on 2026-10-01, made that
+151 signatures and 39 kinds. Chat server stopped, one job at a time:
 ```bash
 # chat models: llm_board.py --profile --out (results.profile_layers per phase: vision, prefill_<n>, decode)
 .venv/bin/python ../demo/chat/scripts/llm_board.py --project ../demo/chat/build/llm_project_smolvlm_256m --profile --out /tmp/vlm.json
@@ -170,6 +198,29 @@ Check the counts against the record, then copy `/tmp/host.json` over the committ
 - **Pass ALL the profiles in one call.** The per-kind fits are rebuilt from this
   call's profiles only. Only the exact entries carry over. Verified: two CNN specs without
   layer stats gave `56 exact signatures, 0 kinds`. `--fresh` also drops the old exact entries.
+- **Adding one model without re-profiling the others: `--merge`.**
+  - **What it keeps.**  Every kind of the file you point at keeps its fit. Only kinds
+    that are new get fitted, and every measured signature becomes an exact entry.
+    It prints `merge: N new kinds …; M kept as fitted before …`.
+  - **Start from the right file.**  Merge into a copy of the file *before* the new
+    model. Merging again into a file that already has the model's kinds keeps their
+    old fits.
+  - **Piper (2026-10-01):**
+
+    ```bash
+    $PY ../demo/tts/scripts/tts_board.py --profile --out /tmp/piper.json      # gate + profile, ~3 min
+    cp perf_models/kv260/host.json /tmp/host.json                              # (the pre-Piper file)
+    .venv/bin/python perf_calibrate.py host --host-model /tmp/host.json --merge \
+        --profile piper-lessac-medium=/tmp/piper.json
+    ```
+
+    The output: `piper-lessac-medium: 397 host-op timings`, 12 new `Tts*` kinds, and
+    `VitAttnPrepNode` kept (SmolVLM's fit).
+  - **Profile every bucket.**  `tts_bench` profiles each encode bucket as its own
+    phase (`encode_<T>`) since 2026-10-01. With only the 400 bucket profiled (one
+    size per kind), the smaller buckets were under-predicted by 6–16 %.
+  - **The board library.**  `tts_board.py` also installs the library it gates, in
+    the chat server's `lib/`.
 - `0 host-op timings` means the results file has no per-layer profile. Run it again with `--profile` or `--profile-layers`.
 - `MODEL` must be a shipped name (`perf_calibrate.SHIPPED`), not a project's `--model-name`.
   Append `:plan` when the profiled project was generated with `--plan`. The graphs are rebuilt
@@ -208,6 +259,18 @@ Records (TACTICS_PLAN §9 T3):
 | SmolLM2-135M prefill 16 / 64 / 256, decode | 339.8 / 445.5 / 1281.9 / 100.3 ms | 339.8 / 442.0 / 1284.7 / 101.4 ms | 0.0 / +0.8 / −0.2 / −1.0 % |
 | BERT (p50 of the profiled run) | 965.5 ms | 963.0 ms | +0.3 % |
 | ResNet-18, MobileNet v1 / v2 | 60.0, 81.4 / 62.9 ms | 60.3, 81.0 / 63.9 ms | −0.5, +0.5 / −1.6 % |
+| Piper chunk (median of the gate's chunks) | 708.4 ms | 707.6 ms | +0.1 % |
+| Piper `encode_<T>`, T = 32 / 64 / 128 / 256 / 400 (20 / 60 / 88 / 162 / 400 ids) | 25.4 / 38.1 / 67.5 / 139.3 / 259.7 ms | 25.6 / 37.7 / 67.9 / 139.9 / 260.2 ms | −0.6 / +1.1 / −0.6 / −0.5 / −0.2 % |
+
+Piper rows come from `piper-lessac-medium=<tts_board.py --profile --out JSON>`.
+- **The chunk** is compared with the median chunk time.
+- **Each `encode_<T>` bucket** is compared with its fullest sequence, the largest
+  id count in that bucket.  The graph prices T rows, and some host ops scale with
+  the real count: 400 ids take 260 ms, 268 ids 239 ms.
+
+`--html FILE` also writes the simulated phases as one interactive timeline
+(src/timeline_html.py): a tab per phase, with the measured time beside each
+prediction.  It is the quickest way to see which node a prediction gets wrong.
 
 **Pass:** every row within ±2 % and `unpriced` 0. A `:plan` spec must be paired with
 results from the planned build. `bert:plan` against the unplanned results gives

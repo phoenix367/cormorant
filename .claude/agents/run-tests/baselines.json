@@ -19,12 +19,12 @@
   "recorded": "2026-09-30 19:30"
  },
  "scheduler": {
-  "min_tests": 1615,
+  "min_tests": 1621,
   "max_skipped": 0,
   "skip_allow": [],
   "warning_allow": [],
-  "typical_duration_s": 232.2,
-  "recorded": "2026-09-30 20:56"
+  "typical_duration_s": 228.4,
+  "recorded": "2026-10-01 21:36"
  },
  "tts-host": {
   "min_tests": 18,

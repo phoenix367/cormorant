@@ -18,7 +18,9 @@ Output project layout (main parts):
   ├── test/test_inference.c       on-device test against the simulated outputs
   ├── driver/                     kernel drivers (copied from --driver-dir)
   ├── weights/, expected/         large tensors as .dat files
-  └── report.md                   model, memory and quantisation summary
+  ├── report.md                   model, memory and quantisation summary
+  └── timeline.html               with --plan / --plan-report: the predicted execution
+                                  (src/timeline_html.py)
 
 Usage:
   python inference_scheduler.py model.onnx --out-dir ./my_project
@@ -244,6 +246,33 @@ def _copy_driver(src_dir: str, dst_dir: str, files: list = None) -> list:
     return missing
 
 
+def _write_timeline(out_dir: str, entries, name: str) -> bool:
+    """timeline.html: the predicted execution of every entry (src/timeline_html.py),
+    when planning is on (--plan / --plan-report) and a performance model resolves."""
+    graphs = [g for _, g, _ in entries]
+    plan = next((getattr(g, "plan", None) for g in graphs if getattr(g, "plan", None) is not None), None)
+    if plan is None or not plan.active:
+        return False
+    try:
+        from src.codegen import CodeGenerator
+        from src.host_model import HostModel, default_host_model_path
+        from src.planning import resolve_perf_model
+        from src.timeline_html import timeline_entry, write_html
+        pm = next((g.perf_model for g in graphs if getattr(g, "perf_model", None) is not None), None) \
+            or resolve_perf_model(plan)
+        hp = default_host_model_path()
+        hm = HostModel.load(hp) if hp.exists() else HostModel()
+        items = [timeline_entry(ename, cg or CodeGenerator(g, model_path=f"{ename}.onnx"), None, pm, hm)
+                 for ename, g, cg in entries]
+        write_html(os.path.join(out_dir, "timeline.html"), items, f"{name} — predicted execution",
+                   f"performance model {pm.platform}/{pm.bitstream} · host model "
+                   f"{hm.meta.get('date', '?')}")
+        return True
+    except Exception as e:                                  # informational, like report.md
+        print(f"warning: timeline.html not written ({e})", file=sys.stderr)
+        return False
+
+
 def main_multi(args) -> int:
     """--entry NAME=MODEL.onnx ...: a multi-entry project."""
     from src.codegen.multi import MultiEntryGenerator
@@ -289,6 +318,8 @@ def main_multi(args) -> int:
           f"Pool       : {summary['pool_bytes']} B (weights {summary['weights_bytes']} B, shared "
           f"intermediates {summary['intermediate_region_bytes']} B), "
           f"{summary['weights']} weight buffers", file=sys.stderr)
+    if _write_timeline(out_dir, [(n, g, None) for n, g in entries], os.path.basename(out_dir.rstrip("/"))):
+        print(f"  {os.path.join(out_dir, 'timeline.html')}", file=sys.stderr)
     return 0
 
 
@@ -524,6 +555,9 @@ def main(argv=None):
             # break a successful project generation.
             print(f"warning: report.md not written ({e})", file=sys.stderr)
             report_items.remove("report.md")
+        # the predicted execution timeline (with --plan / --plan-report)
+        if _write_timeline(out_dir, [("inference", graph, gen)], os.path.basename(args.model)):
+            report_items.append("timeline.html")
 
     for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)

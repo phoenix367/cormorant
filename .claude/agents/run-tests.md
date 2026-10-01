@@ -37,7 +37,7 @@ reasons, known warnings, typical duration) are in
 
 | suite | what | time |
 |---|---|---|
-| `scheduler` | `inference-scheduler/` pytest `test/` (1615 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
+| `scheduler` | `inference-scheduler/` pytest `test/` (1621 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
 | `chat` | `demo/chat/tests` pytest (188 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `csim` | `make -j8` + `ctest` in `build/` — kernel C simulation (Vitis headers) | 2–5 min |
@@ -179,14 +179,14 @@ most 10 lines: the verdict, what failed and why, and the next command to run.
 ```json
 {
   "status": "pass | warn | fail | error",
-  "summary": "one line: e.g. 1613/1615 passed, 2 failed in test_piper.py (consistent), 3 project warnings",
+  "summary": "one line: e.g. 1619/1621 passed, 2 failed in test_piper.py (consistent), 3 project warnings",
   "git": "short HEAD",
   "requested": "what the caller asked for, and the suites / selection chosen",
   "suites": [
     {"suite": "scheduler", "status": "fail", "command": "...", "cwd": "...", "exit_code": 1,
      "duration_s": 240.1, "typical_duration_s": 232,
-     "counts": {"tests": 1615, "passed": 1613, "failed": 2, "errors": 0, "skipped": 0, "warnings": 3},
-     "baseline_tests": 1615, "log": "/path/scheduler.log"}
+     "counts": {"tests": 1621, "passed": 1619, "failed": 2, "errors": 0, "skipped": 0, "warnings": 3},
+     "baseline_tests": 1621, "log": "/path/scheduler.log"}
   ],
   "failures": [
     {"suite": "scheduler", "id": "test/test_x.py::TestY::test_z", "kind": "failure | error (setup/teardown) | collection_error | subtest | lint | compile_error | mismatch | timeout",
@@ -198,7 +198,7 @@ most 10 lines: the verdict, what failed and why, and the next command to run.
   "skips": {"expected": 0, "unexpected": [{"suite": "", "id": "", "reason": "", "meaning": ""}]},
   "warnings": [{"suite": "", "category": "DeprecationWarning", "message": "", "location": "file:line",
                 "count": 1, "source": "project | third_party", "tests": [], "note": ""}],
-  "anomalies": [{"suite": "", "what": "fewer tests than the baseline: 1500 < 1615"}],
+  "anomalies": [{"suite": "", "what": "fewer tests than the baseline: 1500 < 1621"}],
   "not_run": [{"suite": "", "why": "", "fix": ""}],
   "notes": [],
   "artifacts": {"out_dir": "/path", "reports": ["/path/report.json"]}
