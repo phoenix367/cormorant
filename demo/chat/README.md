@@ -10,6 +10,11 @@ Because it speaks the OpenAI protocol, ordinary tools work with it unchanged
 Plan and design decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md)
 (text to speech: [`TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md)).
 
+![chat.py greets you with the CORMORANT banner, the server and the model](../../doc/images/chat_banner.png)
+
+▶ **[Demo video](https://youtu.be/h8YjXGi_ThY)** (1 min): `chat.py` on a laptop, SmolLM2-360M on the
+board, a three-question conversation that the model remembers.
+
 ## What it serves
 
 | Model (`model` field) | Backend name in the config | What it does | On the board | Guide |
@@ -18,7 +23,7 @@ Plan and design decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.
 | `smollm2-135m-instruct` | `smollm2` | Multi-turn chat, streamed token by token | ~10 tokens/s; first token after 0.35–1.3 s | [Generative chat](doc/SMOLLM2.md) |
 | `smollm2-360m-instruct` | `smollm2-360m` | The same chat with a larger model: better answers, slower | ~3.9 tokens/s; first token after ~1 s | [Generative chat](doc/SMOLLM2.md#smollm2-360m-instruct) |
 | `smolvlm-256m-instruct` | `smolvlm` | Answers questions about images | 3.9 s per image, then ~9.5 tokens/s | [Chat about images](doc/SMOLVLM.md) |
-| `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md) |
+| `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md); listen: ▶ [hello](../tts/samples/hello.mp3), ▶ [paragraph](../tts/samples/paragraph.mp3) |
 
 - **Exact results.**  The board reproduces the host reference bit for bit:
   the language models' logits match the scheduler's simulation, and Piper's

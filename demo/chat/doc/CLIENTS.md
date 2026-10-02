@@ -42,7 +42,13 @@ anywhere Python does — your laptop or the board itself
 - `--image` / `/image` attaches a picture for `smolvlm-256m-instruct`;
 - after each answer it prints a line of statistics (time, windows or
   tokens/s, confidence, token counts);
-- it can read the answers aloud when the server has a speech model.
+- it can read the answers aloud when the server has a speech model;
+- an interactive session in a terminal opens with the CORMORANT banner
+  and a box naming the server and the model (below).  `--no-banner`, a
+  terminal narrower than 60 columns, or piped input give the plain
+  one-line header instead; colors follow `NO_COLOR`.
+
+![The CORMORANT banner of chat.py](../../../doc/images/chat_banner.png)
 
 **One question, then exit** (`-q`); the exit code is 1 on errors, so it
 also works in scripts:

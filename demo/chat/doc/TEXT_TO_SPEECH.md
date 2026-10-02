@@ -5,6 +5,13 @@ The `piper` backend turns text into speech through OpenAI's speech API,
 details of the port are in [`demo/tts/`](../../tts/README.md) and
 TTS_PLAN §4–§7.
 
+**Listen** — samples spoken by the board through this endpoint:
+▶ [hello](../../tts/samples/hello.mp3) ·
+▶ [a paragraph](../../tts/samples/paragraph.mp3) ·
+▶ [a question](../../tts/samples/question.mp3) ·
+▶ [`speed` 1.5](../../tts/samples/fast.mp3)
+(texts: [demo/tts](../../tts/README.md#samples)).
+
 - **Speed.**  The first sound comes 1.0–1.5 s after the request, and the
   speech is made faster than it plays (real-time factor 0.58–0.79 end to
   end).  The audio streams while it is being made.

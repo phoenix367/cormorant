@@ -7,7 +7,11 @@ only) for the KV260 chat server; runs on a laptop or on the board.
           [--doc FILE | --system TEXT] [--image FILE] [-q QUESTION] [--no-stream]
           [--max-tokens N] [--temperature T]
           [--audio] [--say TEXT] [--audio-out FILE.wav] [--player CMD|none]
-          [--tts-model tts-1] [--voice V] [--speed S]
+          [--tts-model tts-1] [--voice V] [--speed S] [--no-banner]
+
+An interactive session in a terminal opens with the CORMORANT banner and a
+box naming the server and the model (--no-banner, or a terminal narrower
+than 60 columns: one line instead).  Colors follow NO_COLOR.
 
 Interactive commands:
   /doc FILE      use FILE as the document (the system message; bert-squad)
@@ -57,7 +61,53 @@ try:
 except ImportError:                                           # pragma: no cover
     pass
 
-DIM, RST = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+DIM, RST = ("\033[2m", "\033[0m") if COLOR else ("", "")
+
+LOGO = (" ████  ███  ████  ██   ██  ███  ████   ███  ██  ██ ██████",
+        "██    ██ ██ ██ ██ ███ ███ ██ ██ ██ ██ ██ ██ ███ ██   ██  ",
+        "██    ██ ██ ████  ██ █ ██ ██ ██ ████  █████ ██ ███   ██  ",
+        "██    ██ ██ ██ ██ ██   ██ ██ ██ ██ ██ ██ ██ ██  ██   ██  ",
+        " ████  ███  ██ ██ ██   ██  ███  ██ ██ ██ ██ ██  ██   ██  ")
+TAGLINE = "Cormorant chat · language models on the Kria KV260 FPGA"
+
+
+def _rgb(r: int, g: int, b: int) -> str:
+    """The foreground color escape: 24-bit where the terminal says so, else the 256-color cube."""
+    if os.environ.get("COLORTERM", "") in ("truecolor", "24bit"):
+        return f"\033[38;2;{r};{g};{b}m"
+    return f"\033[38;5;{16 + 36 * round(r / 51) + 6 * round(g / 51) + round(b / 51)}m"
+
+
+def _gradient(t: float):
+    """teal -> blue -> violet, t in [0, 1]."""
+    stops = ((45, 212, 191), (59, 130, 246), (139, 92, 246))
+    i = min(int(t * 2), 1)
+    f = t * 2 - i
+    return tuple(round(a + (b - a) * f) for a, b in zip(stops[i], stops[i + 1], strict=True))
+
+
+def print_banner(info, plain: str) -> None:
+    """The CORMORANT logo and a box of ``info`` lines; ``plain`` (one line)
+    when the terminal is narrower than the logo."""
+    cols = shutil.get_terminal_size((80, 24)).columns
+    width = len(LOGO[0])
+    if cols < width + 3:
+        print(f"{DIM}{plain}{RST}")
+        return
+    print()
+    for row in LOGO:
+        line = "".join((_rgb(*_gradient(x / (width - 1))) + ch if COLOR and ch != " " else ch)
+                       for x, ch in enumerate(row))
+        print(f"  {line}{RST}")
+    inner = min(max(width, *(len(s) for s in info), len(TAGLINE) + 2), cols - 6)
+    edge = _rgb(*_gradient(0.5)) if COLOR else ""
+    clip = lambda s: s if len(s) <= inner else s[:inner - 1] + "…"         # noqa: E731
+    print(f"  {edge}╭{'─' * (inner + 2)}╮{RST}")
+    print(f"  {edge}│{RST} {clip('◆ ' + TAGLINE).ljust(inner)} {edge}│{RST}")
+    for s in info:
+        print(f"  {edge}│{RST} {DIM}{clip(s).ljust(inner)}{RST} {edge}│{RST}")
+    print(f"  {edge}╰{'─' * (inner + 2)}╯{RST}")
 
 
 class ApiError(Exception):
@@ -370,6 +420,8 @@ def main(argv=None):
     g.add_argument("--tts-model", default="tts-1", help="speech model (default tts-1: the server's)")
     g.add_argument("--voice", default="alloy", help="voice name (the server may have only one)")
     g.add_argument("--speed", type=float, help="speech speed, 0.25 .. 4")
+    ap.add_argument("--no-banner", action="store_true",
+                    help="no CORMORANT banner at the start of an interactive session")
     args = ap.parse_args(argv)
     audio = Audio()
 
@@ -405,10 +457,17 @@ def main(argv=None):
 
     pending_image = args.image
     tty = sys.stdin.isatty()
-    print(f"{DIM}{args.url} · model {args.model}"
-          f"{' · document ' + str(len(system.split())) + ' words' if system else ''}"
-          f"{' · answers read aloud' if args.audio else ''}"
-          f" · /help for commands{RST}")
+    plain = (f"{args.url} · model {args.model}"
+             f"{' · document ' + str(len(system.split())) + ' words' if system else ''}"
+             f"{' · answers read aloud' if args.audio else ''}"
+             f" · /help for commands")
+    if tty and sys.stdout.isatty() and not args.no_banner:
+        print_banner([f"server  {args.url}", f"model   {args.model}"]
+                     + ([f"doc     {len(system.split())} words"] if system else [])
+                     + (["audio   answers read aloud"] if args.audio else [])
+                     + ["", "/help for commands · /quit to exit"], plain)
+    else:
+        print(f"{DIM}{plain}{RST}")
     while True:
         try:
             line = input("> " if tty else "").strip()

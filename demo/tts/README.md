@@ -36,6 +36,25 @@ Plan, study and results: [`doc/plans/TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md).
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
   one frame (§6).
 
+## Samples
+
+Listen to the voice, spoken by the board through the chat server
+(`/v1/audio/speech`, the deployed `libpiper_tts.so`; mp3, 64 kbps mono,
+22 050 Hz), on 2026-10-02:
+
+| Sample | Text | Length |
+|---|---|---|
+| ▶ [hello.mp3](samples/hello.mp3) | "Hello! This voice comes from a Kria KV260 board. The neural network that speaks runs on its FPGA and its Arm cores, in sixteen-bit fixed point." | 9.3 s |
+| ▶ [paragraph.mp3](samples/paragraph.mp3) | "Cormorant turns neural networks into C programs that drive four hardware kernels. On this one board they answer questions about a document, chat with small language models, talk about pictures, and read their answers aloud, like this one." | 12.9 s |
+| ▶ [question.mp3](samples/question.mp3) | "Can you tell that this sentence was spoken by a machine? Questions rise at the end. Statements fall." | 5.8 s |
+| ▶ [fast.mp3](samples/fast.mp3) | "The same voice at one and a half times the normal speed, for when you are in a hurry." (`speed` 1.5) | 3.6 s |
+
+Every sample spans several 1.49 s chunks, which join bit for bit.
+`samples/manifest.json` records each text, speed and length.
+`python3 demo/tts/scripts/make_samples.py --url http://<board>:8000` makes
+them again from a running server (the default seed 0 makes the same
+audio).
+
 ## Files
 
 ```
@@ -53,8 +72,10 @@ demo/tts/
 │   ├── tts_host_emu.py        — the generated C on the host vs the spec; --lib-check: the chat backend over it
 │   ├── tts_board.py           — build / install on the board, board gate (bit-exact, timing, profile)
 │   ├── tts_speech_check.py    — /v1/audio/speech on the board vs the same pipeline on the host
+│   ├── make_samples.py        — the voice samples of the docs (samples/), from a running chat server
 │   ├── audio8_study.py, tts_screen.py — the Audio8 study (NO-GO) and the candidate screen (TTS_PLAN §1–§2)
 │   └── requirements-phonemize.txt — phonemizer-fork + espeakng-loader for the study's phonemize step
+├── samples/                   — voice samples spoken by the board (mp3) + manifest.json
 └── assets/                    — not in git: the voice, texts.json, exponents.json, study WAVs
 ```
 

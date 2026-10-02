@@ -1,0 +1,41 @@
+{
+ "samples": {
+  "hello": {
+   "file": "hello.mp3",
+   "text": "Hello! This voice comes from a Kria KV260 board. The neural network that speaks runs on its FPGA and its Arm cores, in sixteen-bit fixed point.",
+   "speed": 1.0,
+   "bytes": 74650,
+   "seconds": 9.33,
+   "sample_rate": 22050
+  },
+  "paragraph": {
+   "file": "paragraph.mp3",
+   "text": "Cormorant turns neural networks into C programs that drive four hardware kernels. On this one board they answer questions about a document, chat with small language models, talk about pictures, and read their answers aloud, like this one.",
+   "speed": 1.0,
+   "bytes": 103280,
+   "seconds": 12.9,
+   "sample_rate": 22050
+  },
+  "question": {
+   "file": "question.mp3",
+   "text": "Can you tell that this sentence was spoken by a machine? Questions rise at the end. Statements fall.",
+   "speed": 1.0,
+   "bytes": 46229,
+   "seconds": 5.77,
+   "sample_rate": 22050
+  },
+  "fast": {
+   "file": "fast.mp3",
+   "text": "The same voice at one and a half times the normal speed, for when you are in a hurry.",
+   "speed": 1.5,
+   "bytes": 28466,
+   "seconds": 3.55,
+   "sample_rate": 22050
+  }
+ },
+ "model": "piper-lessac-medium",
+ "server": "kv260-chat 1.0 (demo/chat), POST /v1/audio/speech, response_format mp3, seed 0",
+ "library": "/root/kv260_chat/lib/libpiper_tts.so",
+ "date": "2026-10-02",
+ "made_by": "demo/tts/scripts/make_samples.py"
+}

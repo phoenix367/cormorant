@@ -166,7 +166,9 @@ Notes on the tools:
 The `smollm2-360m` backend serves SmolLM2-360M-Instruct from its own
 library, `libsmollm2_360m.so` (CHAT_PLAN §20): bit-exact on the board,
 ~3.9 tokens/s decode, first token after ~1 s, and better answers than the
-135M model.
+135M model.  [This video](https://youtu.be/h8YjXGi_ThY) shows it in a three-question conversation
+with `chat.py`: the third answer recalls the name and the city given in the
+first message, which the 135M model did not manage on the same questions.
 
 - **Memory.**  Its pool is 740 MiB, so under `--resident auto` it swaps
   with every other FPGA model, the 135M one included; only Piper stays
