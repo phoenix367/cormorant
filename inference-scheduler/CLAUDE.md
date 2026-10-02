@@ -93,6 +93,10 @@ Planning (src/planning.py, ../doc/plans/TACTICS_PLAN.md; bit-identical results):
   --entry-weights NAME=W,... --plan: entry frequencies for the kernel widths a Llama
                              project's entries share (llm_entries.entry_graphs, i.e.
                              generate_llm_project.py; default decode 64, head 64, others 1)
+  --timeline-profile [PHASE=]FILE
+                             a board profile (LAYERS_JSON: output, a demo results.json,
+                             llm_board.py / tts_board.py --out): measured per-layer times
+                             in timeline.html, next to the prediction
 ```
 
 The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
@@ -234,7 +238,8 @@ src/
                          edges); topological order, predecessors/successors,
                          independent-pair queries
   report.py              ReportGenerator → report.md
-  timeline_html.py       timeline.html: the predicted execution (codegen/timing.simulate's spans)
+  timeline_html.py       timeline.html: the predicted execution (codegen/timing.simulate's spans;
+                         with a board profile, measured per-layer times vs Timeline.windows)
                          as a self-contained Nsight-style page (canvas, LOD merging, search, deps)
   bitstream/             upload_bitstream.py implementation (convert, hwh, xclbin,
                          board, loader, platforms/kv260.py)
@@ -262,7 +267,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              75 pytest modules, 1621 tests, all pass (test_bert_base.py
+  test_*.py              75 pytest modules, 1625 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

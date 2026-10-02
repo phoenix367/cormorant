@@ -770,17 +770,21 @@ def cmd_simulate(args) -> int:
             cg = CodeGenerator(g, model_path=f"{model}.onnx")
             tl = simulate(cg, kernel_duration_fn(pm, cg._layouts), hm.us)
             rows.append((f"{model}{' plan' if planned else ''}", "inference", tl.total_us / 1e3,
-                         one[1], tl, cg))
+                         one[1], tl, cg, one[0]))
             continue
         b = res.get("bench", res)
         graphs = _entry_graphs(model, planned)
         cgs = {n: CodeGenerator(g, model_path=f"{n}.onnx") for n, g in graphs.items()}
+        prof = dict(res.get("profile_layers") or {})          # per-layer times, for --html
+        for phase in [ph for ph in prof if ph not in graphs]:  # piper's old "encode": every bucket
+            prof.update(_split_by_entry(graphs, phase, prof.pop(phase)))
         if model.startswith("piper-"):          # tts_board.py --out: chunks and encoder buckets
             tag = model
             ms = [m for u in b.get("utts", []) for m in u.get("chunk_ms", [])]
             if ms and "chunk" in cgs:
                 tl = simulate(cgs["chunk"], kernel_duration_fn(pm, cgs["chunk"]._layouts), hm.us)
-                rows.append((tag, "chunk", tl.total_us / 1e3, sorted(ms)[len(ms) // 2], tl, cgs["chunk"]))
+                rows.append((tag, "chunk", tl.total_us / 1e3, sorted(ms)[len(ms) // 2], tl, cgs["chunk"],
+                             prof.get("chunk")))
             # per bucket, the sequence nearest a full bucket: the graph prices T rows,
             # and some host ops scale with the real id count n (tts_bench profiles
             # each bucket's sequences; the largest n is the last one per bucket)
@@ -793,7 +797,7 @@ def cmd_simulate(args) -> int:
                 if entry in cgs:
                     tl = simulate(cgs[entry], kernel_duration_fn(pm, cgs[entry]._layouts), hm.us)
                     rows.append((tag, f"encode {T} ({e['n']} ids)", tl.total_us / 1e3, e["best_ms"], tl,
-                                 cgs[entry]))
+                                 cgs[entry], prof.get(entry)))
             continue
 
         def run(entry, pos0=1, n=None, cgs=cgs):
@@ -808,32 +812,33 @@ def cmd_simulate(args) -> int:
         if "vision" in cgs and b.get("images"):
             tl = run("vision")
             meas = min(x["ms"] for x in b["images"])
-            rows.append((tag, "llm_image", tl.total_us / 1e3, meas, tl, tl.cg))
+            rows.append((tag, "llm_image", tl.total_us / 1e3, meas, tl, tl.cg, prof.get("vision")))
         for p in b.get("prefill", []):
             e = f"prefill_{p['n']}"
             if e in cgs:
                 tl, th = run(e, 1, p["n"]), run("head")
                 rows.append((tag, f"prefill {p['n']}", (tl.total_us + th.total_us) / 1e3,
-                             p["best_ms"], tl, tl.cg))
+                             p["best_ms"], tl, tl.cg, prof.get(e)))
         if b.get("llm_summary", {}).get("decode_ms_mean") and "decode" in cgs:
             tl = run("decode")                  # the decode entry includes the LM head
             rows.append((tag, "decode step", tl.total_us / 1e3,
-                         b["llm_summary"]["decode_ms_mean"], tl, tl.cg))
+                         b["llm_summary"]["decode_ms_mean"], tl, tl.cg, prof.get("decode")))
     log(f"{'project':28s} {'phase':20s} {'predicted':>10s} {'measured':>9s} {'error':>7s}  "
         f"{'CPU waits':>9s}  unpriced")
-    for tag, ph, pred, meas, tl, _cg in rows:
+    for tag, ph, pred, meas, tl, _cg, _layers in rows:
         log(f"{tag:28s} {ph:20s} {pred:9.1f}ms {meas:8.1f}ms {(pred - meas) / meas * 100:+6.1f}%  "
             f"{tl.wait_us / 1e3:8.1f}ms  {len(set(tl.unpriced))}")
     if args.html:
         from src.timeline_html import timeline_entry, write_html
         entries = [timeline_entry(f"{tag} · {ph}", cg, tl, pm, hm, measured_us=meas * 1e3,
                                   note=("prefill: the entry only, the LM head not drawn" if ph.startswith("prefill")
-                                        else ""))
-                   for tag, ph, pred, meas, tl, cg in rows]
+                                        else ""), layers=layers)
+                   for tag, ph, pred, meas, tl, cg, layers in rows]
         write_html(args.html, entries, "Predicted execution timeline",
                    f"performance model {pm.platform}/{pm.bitstream} · host model "
                    f"{hm.meta.get('date', '?')} · perf_calibrate.py simulate")
-        log(f"timeline -> {args.html} ({len(entries)} phases)")
+        log(f"timeline -> {args.html} ({len(entries)} phases, "
+            f"{sum(e['measured_nodes'] for e in entries)} nodes with measured times)")
     return 0
 
 
@@ -869,7 +874,8 @@ def main(argv=None) -> int:
                     help="host / simulate: the host-op model file (default perf_models/kv260/host.json)")
     ap.add_argument("--fresh", action="store_true", help="host: drop the earlier exact entries")
     ap.add_argument("--html", default=None, metavar="FILE",
-                    help="simulate: also write the predicted timelines as one HTML page (src/timeline_html.py)")
+                    help="simulate: also write the predicted timelines as one HTML page (src/timeline_html.py), "
+                         "with the measured per-layer times of the results that carry a profile")
     ap.add_argument("--merge", action="store_true",
                     help="host: keep every op kind fitted before (fit only kinds the earlier model "
                          "lacks), so one new model's profile can be added without re-profiling the rest")

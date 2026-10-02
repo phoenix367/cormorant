@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1621 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1625 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1198,7 +1198,13 @@ style of a GPU profiler (Nsight Systems):
   `Timeline.spans`.  The page is `src/timeline_html.py`.
 - **Against the board:** `perf_calibrate.py simulate --html FILE` draws
   the simulated phases of the shipped models, with the measured time
-  beside each prediction.
+  beside each prediction.  `--timeline-profile FILE` (or a results file
+  with a per-layer profile, for `simulate --html`) adds every node's
+  measured time from the board's profiler, in three places: the selection,
+  a "Measured vs predicted" table and an error coloring.  Each is compared
+  with the interval the profiler brackets in the simulation
+  (`Timeline.windows`): a kernel from its issue to the CPU passing its
+  wait, a host op its own span.
 
 The same options (`planning.add_plan_args`) are taken by
 `inference_scheduler.py`, `demo/chat/scripts/generate_llm_project.py` and

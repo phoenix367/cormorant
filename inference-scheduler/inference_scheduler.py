@@ -20,7 +20,8 @@ Output project layout (main parts):
   ├── weights/, expected/         large tensors as .dat files
   ├── report.md                   model, memory and quantisation summary
   └── timeline.html               with --plan / --plan-report: the predicted execution
-                                  (src/timeline_html.py)
+                                  (src/timeline_html.py); --timeline-profile FILE adds
+                                  a board profile's measured per-layer times
 
 Usage:
   python inference_scheduler.py model.onnx --out-dir ./my_project
@@ -218,6 +219,16 @@ def parse_args(argv=None):
         ),
     )
     add_plan_args(p)
+    p.add_argument(
+        "--timeline-profile", metavar="[PHASE=]FILE", default=None,
+        help=(
+            "With --plan / --plan-report: a board profile of this project (per layer) to show next "
+            "to the prediction in timeline.html — the LAYERS_JSON: output of inference_prof_dump_json "
+            "(PROFILE_PHASE: <entry> lines name the entries), a demo's results.json "
+            "(--profile-layers) or llm_board.py / tts_board.py --profile --out.  PHASE picks one "
+            "phase for a single model (e.g. resnet18= for the image demo's results list)."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -246,9 +257,46 @@ def _copy_driver(src_dir: str, dst_dir: str, files: list = None) -> list:
     return missing
 
 
-def _write_timeline(out_dir: str, entries, name: str) -> bool:
+def _profile_phases(path: str, entries, model_stem: str) -> dict:
+    """{entry name: profile layers} of --timeline-profile FILE: a phase named
+    after the entry; for a single graph also the only phase, "" or "inference"
+    or the model's stem (a demo's results list); else the entry's slice of a
+    whole-project profile (layer index in the entry's range — a multi-entry
+    project numbers the layers entry after entry)."""
+    from src.timeline_html import load_profile
+    phase, sep, rest = path.partition("=")
+    if sep and not os.path.exists(path) and "/" not in phase:
+        path = rest
+    else:
+        phase = None
+    prof = load_profile(path)
+    if phase is not None:
+        if phase not in prof:
+            raise ValueError(f"{path}: no phase {phase!r} (phases: {', '.join(map(repr, prof))})")
+        prof = {e: prof[phase] for e, _, _ in entries[:1]}
+    out = {}
+    for ename, g, _cg in entries:
+        layers = prof.get(ename)
+        if layers is None and len(entries) == 1:
+            layers = next((prof[k] for k in ("", "inference", model_stem) if k in prof), None)
+            if layers is None and len(prof) == 1:
+                layers = next(iter(prof.values()))
+        if layers is None and "" in prof and g.nodes:
+            lo, hi = g.nodes[0].index, g.nodes[-1].index
+            layers = [ly for ly in prof[""] if lo <= ly.get("i", -1) <= hi]
+        if layers:
+            out[ename] = layers
+    if not out:
+        print(f"warning: --timeline-profile {path}: no phase matches "
+              f"{', '.join(e for e, _, _ in entries)} (phases: {', '.join(map(repr, prof)) or 'none'})",
+              file=sys.stderr)
+    return out
+
+
+def _write_timeline(out_dir: str, entries, name: str, profile: str = None) -> bool:
     """timeline.html: the predicted execution of every entry (src/timeline_html.py),
-    when planning is on (--plan / --plan-report) and a performance model resolves."""
+    when planning is on (--plan / --plan-report) and a performance model resolves;
+    ``profile`` (--timeline-profile) adds the measured per-layer times."""
     graphs = [g for _, g, _ in entries]
     plan = next((getattr(g, "plan", None) for g in graphs if getattr(g, "plan", None) is not None), None)
     if plan is None or not plan.active:
@@ -262,7 +310,14 @@ def _write_timeline(out_dir: str, entries, name: str) -> bool:
             or resolve_perf_model(plan)
         hp = default_host_model_path()
         hm = HostModel.load(hp) if hp.exists() else HostModel()
-        items = [timeline_entry(ename, cg or CodeGenerator(g, model_path=f"{ename}.onnx"), None, pm, hm)
+        prof = {}
+        if profile:
+            try:
+                prof = _profile_phases(profile, entries, os.path.splitext(name)[0])
+            except (OSError, ValueError) as e:              # the timeline is still written
+                print(f"warning: --timeline-profile: {e}", file=sys.stderr)
+        items = [timeline_entry(ename, cg or CodeGenerator(g, model_path=f"{ename}.onnx"), None, pm, hm,
+                                layers=prof.get(ename))
                  for ename, g, cg in entries]
         write_html(os.path.join(out_dir, "timeline.html"), items, f"{name} — predicted execution",
                    f"performance model {pm.platform}/{pm.bitstream} · host model "
@@ -318,13 +373,17 @@ def main_multi(args) -> int:
           f"Pool       : {summary['pool_bytes']} B (weights {summary['weights_bytes']} B, shared "
           f"intermediates {summary['intermediate_region_bytes']} B), "
           f"{summary['weights']} weight buffers", file=sys.stderr)
-    if _write_timeline(out_dir, [(n, g, None) for n, g in entries], os.path.basename(out_dir.rstrip("/"))):
+    if _write_timeline(out_dir, [(n, g, None) for n, g in entries], os.path.basename(out_dir.rstrip("/")),
+                       args.timeline_profile):
         print(f"  {os.path.join(out_dir, 'timeline.html')}", file=sys.stderr)
     return 0
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.timeline_profile and not (args.plan or args.plan_report):
+        print("warning: --timeline-profile is used only with --plan / --plan-report "
+              "(timeline.html)", file=sys.stderr)
     if args.entries:
         if args.model:
             print("error: give either a model or --entry NAME=MODEL.onnx ...", file=sys.stderr)
@@ -556,7 +615,8 @@ def main(argv=None):
             print(f"warning: report.md not written ({e})", file=sys.stderr)
             report_items.remove("report.md")
         # the predicted execution timeline (with --plan / --plan-report)
-        if _write_timeline(out_dir, [("inference", graph, gen)], os.path.basename(args.model)):
+        if _write_timeline(out_dir, [("inference", graph, gen)], os.path.basename(args.model),
+                           args.timeline_profile):
             report_items.append("timeline.html")
 
     for rel in report_items:

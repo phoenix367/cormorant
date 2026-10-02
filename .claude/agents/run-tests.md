@@ -37,7 +37,7 @@ reasons, known warnings, typical duration) are in
 
 | suite | what | time |
 |---|---|---|
-| `scheduler` | `inference-scheduler/` pytest `test/` (1621 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
+| `scheduler` | `inference-scheduler/` pytest `test/` (1625 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
 | `chat` | `demo/chat/tests` pytest (188 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `csim` | `make -j8` + `ctest` in `build/` — kernel C simulation (Vitis headers) | 2–5 min |

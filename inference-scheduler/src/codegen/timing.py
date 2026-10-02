@@ -24,6 +24,12 @@ view (src/timeline_html.py):
                  multi-call MatmulConvNode, the loop that issues every call);
                  "wait": blocked on the node's kernel; "sync": blocked on a
                  start_sync call
+
+``Timeline.windows`` is what the board's per-layer profiler brackets
+(INFERENCE_PROF_BEGIN / END in the generated inference_run()), per node: a
+started kernel from its issue to the CPU passing its wait or drain (blocked
+or not), a synchronous call or a host op its own span — the predicted
+counterpart of a profile's mean_us.
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ class Timeline:
     node_end: Dict[int, float] = field(default_factory=dict)
     unpriced: List[int] = field(default_factory=list)
     spans: List[Tuple[str, int, float, float, str]] = field(default_factory=list)  # (lane, node, t0, t1, kind)
+    windows: Dict[int, Tuple[float, float]] = field(default_factory=dict)       # node -> profiler bracket
 
     @property
     def wait_us(self) -> float:
@@ -72,6 +79,7 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
     waits: List[Tuple[int, str, float]] = []
     unpriced: List[int] = []
     spans: List[Tuple[str, int, float, float, str]] = []
+    windows: Dict[int, Tuple[float, float]] = {}
 
     def dur(fn, sn) -> float:
         d = fn(sn)
@@ -89,6 +97,8 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
                 waits.append((idx, lane, end - t))
                 spans.append(("CPU", idx, t, end, "wait"))
                 t = end
+            if idx in windows:
+                windows[idx] = (windows[idx][0], t)
         elif kind == "start":
             sn = by_index[ev[1]]
             d = dur(kernel_us, sn)
@@ -104,6 +114,7 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
             else:
                 t += issue_us
             spans.append(("CPU", sn.index, t0, t, "issue"))
+            windows[sn.index] = (t0, t)
             cpu += issue_us
         elif kind == "start_sync":
             sn = by_index[ev[1]]
@@ -114,14 +125,16 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
             spans.append(("CPU", sn.index, t, t + d, "sync"))
             t += d
             node_end[sn.index] = t
+            windows[sn.index] = (t - d, t)
         elif kind == "cpu":
             sn = by_index[ev[1]]
             d = dur(host_us, sn)
             spans.append(("CPU", sn.index, t, t + d, "host"))
+            windows[sn.index] = (t, t + d)
             t += d
             cpu += d
             node_end[sn.index] = t
-    return Timeline(t, cpu, dict(lane_us), waits, node_end, unpriced, spans)
+    return Timeline(t, cpu, dict(lane_us), waits, node_end, unpriced, spans, windows)
 
 
 def kernel_duration_fn(perf_model, layouts: dict, keys_of: Optional[Callable] = None,

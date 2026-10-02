@@ -270,7 +270,17 @@ Piper rows come from `piper-lessac-medium=<tts_board.py --profile --out JSON>`.
 
 `--html FILE` also writes the simulated phases as one interactive timeline
 (src/timeline_html.py): a tab per phase, with the measured time beside each
-prediction.  It is the quickest way to see which node a prediction gets wrong.
+prediction.  Each phase that has a per-layer profile also gets every node's
+measured time, its "Measured vs predicted" table and the "color: error vs
+measured" mode.  The profile comes from `profile_layers` (`llm_board.py` /
+`tts_board.py --profile`) or `layer_stats` (the demos' `--profile-layers`).
+The log line counts the nodes that have a measured time.  It is the quickest
+way to see which node a prediction gets wrong.  Example, 2026-10-02, Piper
+`chunk`: four of the sixteen TtsGate host ops are priced at 1511 µs.  On the
+board, two of them take about 0.5 ms each.  The other two, gates #14 and
+#28, average 5.8 and 7.2 ms (min about 0.52 ms) over the two profiled
+chunks, so they carry the outliers.  `host.json`'s exact entry is the
+plain mean, outliers included.  The total is still right.
 
 **Pass:** every row within ±2 % and `unpriced` 0. A `:plan` spec must be paired with
 results from the planned build. `bert:plan` against the unplanned results gives

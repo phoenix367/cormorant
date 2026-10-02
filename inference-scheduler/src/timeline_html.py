@@ -10,7 +10,10 @@ on a time axis.
             unpriced, kernel calls, output shape, predecessors, inputs as
             [shape, tensor, is weight], and every kernel call: kernel, count,
             register values (names in the page's "fields", from
-            src/perf_calls.FIELDS), µs per call and its price source)
+            src/perf_calls.FIELDS), µs per call and its price source) and,
+            given a board profile, every node's measured per-layer time
+            next to the interval the profiler brackets in the simulation
+            (Timeline.windows)
   render    ``render_html()`` embeds the entries as JSON in a page that draws
             them on a canvas: it binary-searches the visible window of each
             lane and merges spans narrower than a pixel into one bar, so a
@@ -23,14 +26,18 @@ arrows, details, predecessors / successors), "/" = search, Esc = clear.
 The overview strip above shows the whole run and the visible window.
 
 Written by ``inference_scheduler.py --plan / --plan-report`` (timeline.html
-next to report.md) and ``perf_calibrate.py simulate --html FILE``.
+next to report.md; ``--timeline-profile`` adds measured times) and
+``perf_calibrate.py simulate --html FILE`` (measured times from the board
+results it reads).
 """
 
 from __future__ import annotations
 
 import html
 import json
+import re
 import time
+from collections import Counter
 from typing import Dict, Iterable, List, Optional
 
 from .codegen.timing import kernel_duration_fn, simulate
@@ -103,10 +110,77 @@ def _call_rows(calls, pm) -> list:
     return rows
 
 
+def match_layers(cg, layers: Iterable[dict]) -> Dict[int, list]:
+    """node index -> [mean µs, min µs, calls] of a per-layer profile
+    (inference_prof_dump_json: ``{"i", "name", "calls", "mean_us",
+    "min_us"}``, one phase), matched by the layer names of the generated
+    code (``_layer_display_names``).  A name made unique with a node index
+    (``<name>_<index>``) is global in a multi-entry project, so those are
+    matched by position: the layer index less the entry's base, which the
+    names that match exactly give."""
+    nodes = cg._graph.nodes
+    names = cg._layer_display_names()
+    pos_of = {n: k for k, n in enumerate(names)}
+    layers = [ly for ly in layers if ly.get("calls")]
+    base = Counter(ly["i"] - pos_of[ly["name"]] for ly in layers
+                   if ly.get("name") in pos_of and "i" in ly).most_common(1)
+    base = base[0][0] if base else 0
+    strip = lambda n: re.sub(r"_\d+$", "", n or "")            # noqa: E731  one index suffix
+    out: Dict[int, list] = {}
+    for ly in layers:
+        k = pos_of.get(ly.get("name"))
+        if k is None and "i" in ly:
+            k = ly["i"] - base
+            if not (0 <= k < len(nodes) and strip(ly.get("name")) in (names[k], strip(names[k]))):
+                k = None
+        if k is not None:
+            mean = float(ly["mean_us"])
+            out[nodes[k].index] = [round(mean, 3), round(float(ly.get("min_us", mean)), 3), int(ly["calls"])]
+    return out
+
+
+def load_profile(path: str) -> Dict[str, List[dict]]:
+    """{phase: layers} of a board profile: the profiler's own output
+    (``LAYERS_JSON: {...}`` lines, each after an optional ``PROFILE_PHASE:
+    NAME`` line; the phase is "" without one), its ``{"layers": [...]}``,
+    a demo's results.json (``metrics.layer_stats``, a list of results: one
+    phase per ``name``) or ``llm_board.py`` / ``tts_board.py --out``
+    (``profile_layers``)."""
+    with open(path) as f:
+        text = f.read()
+    try:
+        d = json.loads(text)
+    except ValueError:
+        out, phase = {}, ""
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("PROFILE_PHASE:"):
+                phase = line.split(":", 1)[1].strip()
+            elif line.startswith("LAYERS_JSON:"):
+                out[phase] = json.loads(line.split(":", 1)[1]).get("layers", [])
+        if not out:
+            raise ValueError(f"{path}: no LAYERS_JSON: line and not JSON") from None
+        return out
+    if isinstance(d, list):
+        return {x.get("name", ""): ((x.get("metrics") or {}).get("layer_stats") or {}).get("layers", [])
+                for x in d if isinstance(x, dict)}
+    if "profile_layers" in d:
+        return dict(d["profile_layers"])
+    if "layers" in d:
+        return {"": d["layers"]}
+    m = d.get("metrics") or {}
+    if (m.get("layer_stats") or {}).get("layers"):
+        return {"": m["layer_stats"]["layers"]}
+    raise ValueError(f"{path}: no per-layer profile (build with -DINFERENCE_PROFILING=ON; the demos' "
+                     "--profile-layers, llm_board.py / tts_board.py --profile --out)")
+
+
 def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Optional[float] = None,
-                   keys_of=None, note: str = "") -> dict:
+                   keys_of=None, note: str = "", layers: Optional[Iterable[dict]] = None) -> dict:
     """One entry of the page: the simulation ``tl`` of ``cg`` (run here from
-    ``pm`` / ``hm`` when not given), its lanes, node table and dependencies."""
+    ``pm`` / ``hm`` when not given), its lanes, node table and dependencies;
+    ``layers``, the board profile of this graph (one phase), adds every
+    matched node's measured time."""
     graph = cg._graph
     keys_of = keys_of or getattr(tl, "keys_of", None)
     if tl is None:
@@ -137,6 +211,8 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
     for _lane, idx, t0, t1, kind in tl.spans:
         if kind in ("kernel", "host"):
             dur[idx] = dur.get(idx, 0.0) + (t1 - t0)
+    meas = match_layers(cg, layers) if layers else {}
+    win = getattr(tl, "windows", None) or {}
     nodes = []
     for idx in used:
         sn = by[idx]
@@ -146,7 +222,9 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
                       onnx.op_type if onnx is not None else "", type(sn).__name__,
                       cg._kernel_id_of(sn) or "CPU", round(dur.get(idx, 0.0), 3),
                       _price_source(sn, calls, pm, hm, unpriced), sum(c.count for c in calls),
-                      _shape(sn), preds.get(idx, []), _inputs(sn), _call_rows(calls, pm)])
+                      _shape(sn), preds.get(idx, []), _inputs(sn), _call_rows(calls, pm),
+                      meas.get(idx),
+                      [round(win[idx][0], 3), round(win[idx][1], 3)] if idx in win else None])
     lanes = []
     present = {s[0] for s in tl.spans}
     for lane in [ln for ln in LANE_ORDER if ln in present] + sorted(present - set(LANE_ORDER)):
@@ -158,7 +236,8 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
         lanes.append({"id": lane, "label": LANE_LABELS.get(lane, lane), "s": flat, "busy_us": round(busy, 3)})
     return {"name": name, "total_us": round(tl.total_us, 3), "cpu_us": round(tl.cpu_us, 3),
             "wait_us": round(tl.wait_us, 3), "measured_us": measured_us, "note": note,
-            "unpriced": len(unpriced), "lanes": lanes, "nodes": nodes}
+            "unpriced": len(unpriced), "measured_nodes": sum(1 for n in nodes if n[12]),
+            "profiled": bool(layers), "lanes": lanes, "nodes": nodes}
 
 
 def render_html(entries: Iterable[dict], title: str, subtitle: str = "") -> str:
@@ -235,6 +314,7 @@ tr.link{cursor:pointer}tr.link:hover td{background:var(--panel2)}
 .pill{display:inline-block;padding:0 6px;border-radius:9px;border:1px solid var(--border);color:var(--dim);cursor:help}
 .exact{color:var(--accent);border-color:var(--accent)}.model{color:var(--sync);border-color:var(--sync)}
 .unpriced{color:var(--wait);border-color:var(--wait)}
+.meas{color:var(--sel)}.hint{cursor:help;border-bottom:1px dotted var(--faint)}
 a.nl{color:var(--fg);text-decoration:none;border-bottom:1px dotted var(--faint);cursor:pointer}
 #help{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:9}
 #help>div{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px 20px;max-width:560px}
@@ -248,6 +328,8 @@ a.nl{color:var(--fg);text-decoration:none;border-bottom:1px dotted var(--faint);
   <header>
     <h1 id="title"></h1><span class="sub" id="sub"></span>
     <select id="entry" title="entry / phase"></select>
+    <select id="colorby" title="bar colors: the node class, or the prediction's error against the board profile"
+      style="display:none"><option value="class">color: class</option><option value="error">color: error vs measured</option></select>
     <span class="stat" id="stats"></span>
     <span class="spacer"></span>
     <input id="search" placeholder="search  ( / )" spellcheck="false">
@@ -284,7 +366,9 @@ a.nl{color:var(--fg);text-decoration:none;border-bottom:1px dotted var(--faint);
   <p style="color:var(--dim);margin:10px 0 0">CPU row: <span style="color:var(--wait)">red</span> = blocked on a kernel,
   <span style="color:var(--sync)">amber</span> = a synchronous call, gray-blue = register writes / call issue,
   colored = host ops. Bars narrower than a pixel are merged (hatched gray). Times are the
-  performance model's prediction, not a measurement.</p>
+  performance model's prediction, not a measurement. With a board profile, a selected node's
+  measured time is drawn as a dashed yellow box from its start (the solid tick is where the
+  predicted interval ends), and "color: error vs measured" colors every bar by its error.</p>
 </div></div>
 <script id="data" type="application/json">__DATA__</script>
 <script>
@@ -328,12 +412,23 @@ function prep(e){
   e.search = e.nodes.map(n => (n[1] + " " + n[2] + " " + n[3]).toLowerCase());
   e._prepped = true; return e;
 }
+/* measured per-layer times: node[12] = [mean µs, min µs, runs] of the board profile, node[13] =
+   [t0, t1] of the interval the profiler brackets in the simulation (a kernel: issue -> its wait) */
+let colorMode = "class";
+const ERR_BUCKETS = [[5, "#3fa34d", "≤ 5 %"], [15, "#d4b106", "5–15 %"], [30, "#e8833a", "15–30 %"],
+                     [Infinity, "#c2185b", "> 30 %"]], UNMEASURED = "#59606b";
+function winUs(n){ return n[13] ? n[13][1] - n[13][0] : null; }
+function errPct(n){ const m = n[12], w = winUs(n);
+  return m && w !== null && m[0] > 0 ? (w - m[0]) / m[0] * 100 : null; }
+function errColor(e){ if (e === null) return UNMEASURED;
+  for (const [lim, col] of ERR_BUCKETS) if (Math.abs(e) <= lim) return col; return UNMEASURED; }
+function pct(e){ return (e >= 0 ? "+" : "") + e.toFixed(1) + " %"; }
 function spanColor(L, i, nd){
   const k = L.k[i];
   if (k === KIND.wait) return C.wait;
   if (k === KIND.sync) return C.sync;
   if (k === KIND.issue) return C.issue;
-  return clsColor(E.nodes[nd][3]);
+  return colorMode === "error" ? errColor(errPct(E.nodes[nd])) : clsColor(E.nodes[nd][3]);
 }
 
 /* ---------- geometry ---------- */
@@ -472,8 +567,8 @@ function render(){
   if (range) { const a = X(Math.min(range[0], range[1])), b = X(Math.max(range[0], range[1]));
     ctx.fillStyle = C.accent; ctx.globalAlpha = 0.12; ctx.fillRect(a, RULER, b - a, H); ctx.globalAlpha = 1;
     ctx.strokeStyle = C.accent; ctx.strokeRect(a + .5, RULER, b - a, H); }
-  // dependency arrows of the selection
-  if (sel >= 0) drawArrows(ctx);
+  // dependency arrows of the selection, its measured time
+  if (sel >= 0) { drawArrows(ctx); drawMeasured(ctx); }
   ctx.restore();
   // range label on the ruler
   if (range) { const a = X(Math.min(range[0], range[1])), b = X(Math.max(range[0], range[1]));
@@ -504,6 +599,14 @@ function nodeSpan(nd){ // the node's main span: kernel / host, else the first
   const sp = E.nodeSpans[nd]; let best = sp[0];
   for (const s of sp) { const k = E.lanes[s[0]].k[s[1]]; if (k === KIND.kernel || k === KIND.host) { best = s; break; } }
   return best; }
+function drawMeasured(ctx){ // dashed box: the measured time from the node's start; tick: the predicted end
+  const n = E.nodes[sel]; if (!n[12] || !n[13]) return;
+  const [li] = nodeSpan(sel), y = laneY(li) + 2, h = ROWH - 4;
+  const xa = X(n[13][0]), xm = X(n[13][0] + n[12][0]), xp = X(n[13][1]);
+  ctx.strokeStyle = C.sel; ctx.lineWidth = 1.5; ctx.setLineDash([5, 3]);
+  ctx.strokeRect(xa, y, Math.max(xm - xa, 2), h); ctx.setLineDash([]);
+  ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(xp, y - 1); ctx.lineTo(xp, y + h + 1); ctx.stroke();
+}
 function drawArrows(ctx){
   const [li, i] = nodeSpan(sel), L = E.lanes[li], ty = laneY(li) + ROWH / 2, tx = X(L.t0[i]);
   const arrow = (fx, fy, tx2, ty2, col) => { ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1.5;
@@ -545,7 +648,8 @@ const DECODE = {
   PoolKernel: {pool_type: ["max", "avg", "Lp"], count_include_pad: ["no", "yes"]},
   ConvKernel: {has_bias: ["no", "yes"], is_dw: ["no", "yes"]},
   MatmulKernel: {b_packed: ["no", "yes"]}};
-function callsHtml(calls){
+function callsHtml(calls, nodeSrc){
+  /* the node's duration row carries the price source; a call repeats it only when they differ (mixed) */
   const shown = calls.slice(0, 12);
   return shown.map(([kernel, count, regs, us, src]) => {
     const names = (D.fields && D.fields[kernel]) || regs.map((_, j) => "r" + j);
@@ -554,8 +658,21 @@ function callsHtml(calls){
       return `<span class="reg"><span class="k">${esc(nm)}</span> ${v}${dec !== undefined ? ` <span class="k">(${esc(dec)})</span>` : ""}</span>`; }).join("");
     return `<div class="call"><span class="h" title="performance-model key: ${esc(key)}"><b>${esc(kernel)}</b> × ${count}`
       + (us !== null && us !== undefined ? ` <span class="dimt">· ${fmt(us)} per call${count > 1 ? ", " + fmt(us * count) + " in all" : ""}</span>` : "")
-      + `</span> ${srcPill(src)}<div class="regs">${regsH}</div></div>`; }).join("")
+      + `</span> ${nodeSrc === "mixed" ? srcPill(src) : ""}<div class="regs">${regsH}</div></div>`; }).join("")
     + (calls.length > shown.length ? `<div class="dimt">+ ${calls.length - shown.length} more distinct calls</div>` : "");
+}
+const MEAS_HINT = "The board profiler's time for this node (INFERENCE_PROF_BEGIN … END in inference_run()), "
+  + "the mean over the profiled runs. For a started kernel it runs from the issue to the CPU passing the node's "
+  + "wait, so it includes whatever the CPU did in between; for a host op or a synchronous call it is the op itself. "
+  + "It is compared with the same interval of the simulation, not with the kernel's duration.";
+function measuredRow(n){
+  if (!E.profiled) return "";
+  const head = `<span class="k"><span class="hint" title="${esc(MEAS_HINT)}">measured</span></span>`;
+  if (!n[12]) return head + `<span style="color:var(--dim)">not in the profile</span>`;
+  const [mean, mn, runs] = n[12], w = winUs(n), e = errPct(n);
+  return head + `<span><b class="meas">${fmt(mean)}</b> per run (min ${fmt(mn)}, ${runs} run${runs === 1 ? "" : "s"})`
+    + (w !== null ? ` · predicted ${fmt(w)} for the same interval`
+       + (e !== null ? ` <b style="color:${errColor(e)}">${pct(e)}</b>` : "") : "") + `</span>`;
 }
 function nodeLink(i){ const n = E.nodes[i]; return `<a class="nl" data-n="${i}">${esc(n[1])}</a>`; }
 function showSel(){
@@ -570,7 +687,8 @@ function showSel(){
     <span class="k">op / class</span><span>${esc(n[2] || "—")} · ${esc(n[3])}</span>
     <span class="k">lane</span><span>${esc(n[4])}</span>
     <span class="k">duration</span><span><b>${fmt(n[5])}</b> (${(100 * n[5] / (E.total_us || 1)).toFixed(2)} % of the run) ${srcPill(n[6])}</span>
-    ${(n[11] || []).length ? `<span class="k">kernel calls</span><span>${n[7]} in all${n[11].length > 1 ? ", " + n[11].length + " distinct" : ""}${callsHtml(n[11])}</span>`
+    ${measuredRow(n)}
+    ${(n[11] || []).length ? `<span class="k">kernel calls</span><span>${n[7]} in all${n[11].length > 1 ? ", " + n[11].length + " distinct" : ""}${callsHtml(n[11], n[6])}</span>`
       : n[7] ? `<span class="k">kernel calls</span><span>${n[7]}</span>` : ""}
     ${(n[10] || []).length ? `<span class="k">inputs</span><span>${n[10].map(([sh, nm, w]) =>
       `<span class="mono">${esc(sh || "?")}</span> <span class="k">${w ? "weight · " : ""}${esc(nm)}</span>`).join("<br>")}</span>` : ""}
@@ -590,14 +708,38 @@ function showTop(){
     <th class="r">CPU waits on it</th></tr>${lanes}</table>
     <h2 style="margin-top:10px">Longest nodes</h2><table><tr><th>node</th><th>class</th><th class="r">time</th><th class="r">%</th><th title="exact = measured on the board; model = estimated by a fitted model; hover a label for details">price</th></tr>
     ${rows.map(([d, i]) => { const n = E.nodes[i]; return `<tr class="link" data-n="${i}"><td class="mono">${esc(n[1].length > 46 ? n[1].slice(0, 45) + "…" : n[1])}</td>
-      <td>${esc(n[3])}</td><td class="r">${fmt(d)}</td><td class="r">${(100 * d / (E.total_us || 1)).toFixed(1)}</td><td>${srcPill(n[6])}</td></tr>`; }).join("")}</table>`;
+      <td>${esc(n[3])}</td><td class="r">${fmt(d)}</td><td class="r">${(100 * d / (E.total_us || 1)).toFixed(1)}</td><td>${srcPill(n[6])}</td></tr>`; }).join("")}</table>`
+    + measuredTable();
+}
+function measuredTable(){ // the nodes the prediction misses most, by the absolute difference
+  if (!E.measured_nodes) return "";
+  const rows = E.nodes.map((n, i) => [n, i]).filter(([n]) => n[12] && n[13])
+    .map(([n, i]) => [winUs(n) - n[12][0], i]).sort((a, b) => Math.abs(b[0]) - Math.abs(a[0])).slice(0, 40);
+  let sp = 0, sm = 0; E.nodes.forEach(n => { if (n[12] && n[13]) { sp += winUs(n); sm += n[12][0]; } });
+  return `<h2 style="margin-top:10px" title="${esc(MEAS_HINT)}">Measured vs predicted <span style="text-transform:none;letter-spacing:0">
+    · ${E.measured_nodes} of ${E.nodes.length} nodes, largest differences first</span></h2>
+    <table><tr><th>node</th><th>class</th><th class="r">predicted</th><th class="r">measured</th><th class="r">difference</th>
+    <th class="r">error</th></tr>
+    ${rows.map(([dd, i]) => { const n = E.nodes[i], e = errPct(n); return `<tr class="link" data-n="${i}">
+      <td class="mono">${esc(n[1].length > 46 ? n[1].slice(0, 45) + "…" : n[1])}</td><td>${esc(n[3])}</td>
+      <td class="r">${fmt(winUs(n))}</td><td class="r">${fmt(n[12][0])}</td><td class="r">${dd >= 0 ? "+" : "−"}${fmt(Math.abs(dd))}</td>
+      <td class="r" style="color:${errColor(e)}">${e !== null ? pct(e) : ""}</td></tr>`; }).join("")}
+    <tr><td colspan="2" style="color:var(--dim)">all measured nodes (the intervals overlap)</td><td class="r">${fmt(sp)}</td>
+      <td class="r">${fmt(sm)}</td><td class="r">${sp - sm >= 0 ? "+" : "−"}${fmt(Math.abs(sp - sm))}</td>
+      <td class="r">${sm ? pct((sp - sm) / sm * 100) : ""}</td></tr></table>`;
 }
 function select(nd, zoom){ sel = nd; showSel(); if (nd >= 0 && zoom) { const [li, i] = nodeSpan(nd), L = E.lanes[li];
     const d = L.t1[i] - L.t0[i]; zoomTo(L.t0[i] - d * 2, L.t1[i] + d * 2); } dirty = true; }
 function legend(){
   const seen = new Map(); E.nodes.forEach(n => seen.set(n[3], (seen.get(n[3]) || 0) + 1));
-  const chips = [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([c, k]) =>
-    `<span class="chip"><span class="sw" style="background:${clsColor(c)}"></span>${esc(c)} <span style="color:var(--faint)">${k}</span></span>`);
+  const sw = (col, label, k) => `<span class="chip"><span class="sw" style="background:${col}"></span>${label}`
+    + (k !== undefined ? ` <span style="color:var(--faint)">${k}</span>` : "") + `</span>`;
+  const chips = colorMode === "error"
+    ? [`<span class="chip" title="${esc(MEAS_HINT)}">error of the predicted interval vs the measured time:</span>`,
+       ...ERR_BUCKETS.map(([lim, col, label]) => sw(col, label, E.nodes.filter(n => { const e = errPct(n);
+         return e !== null && errColor(e) === col; }).length)),
+       sw(UNMEASURED, "not measured", E.nodes.length - E.nodes.filter(n => errPct(n) !== null).length)]
+    : [...seen.entries()].sort((a, b) => b[1] - a[1]).map(([c, k]) => sw(clsColor(c), esc(c), k));
   chips.push(`<span class="chip"><span class="sw" style="background:${C.issue}"></span>issue</span>`,
              `<span class="chip"><span class="sw" style="background:${C.wait}"></span>CPU waits</span>`,
              `<span class="chip"><span class="sw" style="background:${C.sync}"></span>sync call</span>`,
@@ -608,7 +750,8 @@ function headerStats(){
   const m = E.measured_us, err = m ? ((E.total_us - m) / m * 100) : null;
   $("stats").innerHTML = `predicted <b>${fmt(E.total_us)}</b>` + (m ? ` · measured <b>${fmt(m)}</b> (${err >= 0 ? "+" : ""}${err.toFixed(1)} %)` : "")
     + ` · CPU busy ${fmt(E.cpu_us)}, waiting ${fmt(E.wait_us)} · ${E.nodes.length} nodes`
-    + (E.unpriced ? ` · <span style="color:var(--wait)">${E.unpriced} unpriced</span>` : "") + (E.note ? ` · ${esc(E.note)}` : "");
+    + (E.unpriced ? ` · <span style="color:var(--wait)">${E.unpriced} unpriced</span>` : "")
+    + (E.profiled ? ` · <span title="${esc(MEAS_HINT)}">${E.measured_nodes} measured</span>` : "") + (E.note ? ` · ${esc(E.note)}` : "");
 }
 function setEntry(k){
   E = prep(D.entries[k]); E._k = k; sel = -1; range = null; ovImg = null; sizeRows(); legend(); headerStats(); showSel(); showTop();
@@ -643,6 +786,8 @@ window.addEventListener("mousemove", ev => { if (!E) return; const r = tlc.getBo
   const what = k === "wait" ? `CPU blocked on ${esc(n[4])}` : k === "sync" ? "CPU in a synchronous call" : k === "issue" ? "register writes + start" : "";
   tip.innerHTML = `<div class="n mono">${esc(n[1])}</div><div class="k">${esc(n[2] || n[3])} · ${esc(L.label)} · ${k}${what ? " — " + what : ""}</div>
     <div>${fmt(L.t0[h.i])} → ${fmt(L.t1[h.i])} · <b>${fmt(L.t1[h.i] - L.t0[h.i])}</b> ${srcPill(n[6])}</div>`
+    + (n[12] ? `<div>measured <b class="meas">${fmt(n[12][0])}</b> · predicted ${fmt(winUs(n))} for that interval`
+       + (errPct(n) !== null ? ` <b style="color:${errColor(errPct(n))}">${pct(errPct(n))}</b>` : "") + `</div>` : "")
     + (n[8] ? `<div class="k mono">${(n[10] || []).length ? "in " + n[10].map(i => esc(i[0] || "?") + (i[2] ? " (weight)" : "")).join(", ") + " " : ""}→ ${esc(n[8])}${n[7] ? " · " + n[7] + " call" + (n[7] > 1 ? "s" : "") : ""}</div>` : "");
   tip.style.display = "block";
   const tw = tip.offsetWidth, th = tip.offsetHeight;
@@ -691,6 +836,8 @@ $("theme").onclick = () => { const r = document.documentElement;
   try { localStorage.setItem("tl-theme", r.dataset.theme); } catch (e) {}
   readTheme(); for (const k in hatch) delete hatch[k]; ovImg = null; if (E) legend(); dirty = true; };
 $("entry").onchange = ev => setEntry(+ev.target.value);
+$("colorby").onchange = ev => { colorMode = ev.target.value; ovImg = null; if (E) legend(); dirty = true;
+  try { localStorage.setItem("tl-colorby", colorMode); } catch (e) {} };
 
 /* ---------- the resizable details panel ---------- */
 const split = $("split"), det = $("details");
@@ -727,6 +874,8 @@ document.title = D.title;
 D.entries.forEach((e, k) => { const o = document.createElement("option"); o.value = k;
   o.textContent = `${e.name} — ${fmt(e.total_us)}`; $("entry").appendChild(o); });
 if (D.entries.length < 2) $("entry").style.display = "none";
+if (D.entries.some(e => e.measured_nodes)) { $("colorby").style.display = "";
+  try { const c = localStorage.getItem("tl-colorby"); if (c === "error") { colorMode = c; $("colorby").value = c; } } catch (e) {} }
 resize();
 if (D.entries.length) { setEntry(0); loadHash(); } else { $("stats").textContent = "no entries"; }
 (function loop(){ render(); requestAnimationFrame(loop); })();
@@ -736,4 +885,5 @@ if (D.entries.length) { setEntry(0); loadHash(); } else { $("stats").textContent
 """
 
 
-__all__ = ("timeline_entry", "render_html", "write_html", "LANE_LABELS", "KINDS")
+__all__ = ("timeline_entry", "match_layers", "load_profile", "render_html", "write_html",
+           "LANE_LABELS", "KINDS")
