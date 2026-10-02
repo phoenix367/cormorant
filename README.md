@@ -50,6 +50,19 @@ The FPGA design (`hw/cormorant_hw_128` d7ce129) uses 85 % of the DSPs
 
 ---
 
+## System architecture
+
+![Cormorant system architecture: the applications use the generated model libraries and the runtime on the board; the inference scheduler generates the libraries on the host; the four FPGA kernels run on the Kria KV260](doc/images/architecture.svg)
+
+The inference scheduler compiles each model into a C library on the host.
+On the board, the runtime drives the four FPGA kernels through XRT buffers
+and UIO drivers, and the Arm cores run what no kernel implements as host
+ops.  Every result is checked bit for bit against the scheduler's
+fixed-point simulation.  The diagram is drawn by
+[`doc/images/architecture.py`](doc/images/architecture.py).
+
+---
+
 ## Hardware kernels
 
 All data ports are 128-bit `hls::burst_maxi` AXI masters with 64-bit

@@ -527,6 +527,10 @@ facts:
     - {file: README.md, regex: 'tiles (?P<matmul_tiles>\d+ × \d+ × \d+), packed-B weight layout, K ≤ (?P<max_k>\d+)'}
     - {file: README.md, regex: '(?P<conv_grid>\d+ × \d+) MAC grid, .*?kernels ≤ (?P<conv_window>\d+×\d+), .*?≤ (?P<max_in_ch>\d+) in / (?P<max_out_ch>\d+) out channels'}
     - {file: README.md, regex: '(?P<pool_lanes>\d+) channel lanes, windows ≤ (?P<pool_window>\d+×\d+)'}
+    - {file: doc/images/architecture.svg, fix: report,       # generated: fix architecture.py and rerun it
+       regex: 'tiles (?P<matmul_tiles>\d+ × \d+ × \d+) · GEMV'}
+    - {file: doc/images/architecture.svg, fix: report, regex: '(?P<conv_grid>\d+ × \d+) MAC grid'}
+    - {file: doc/images/architecture.svg, fix: report, regex: '(?P<pool_lanes>\d+) channel lanes'}
 
 - id: board.pl_clock_mhz
   kind: value
@@ -540,6 +544,7 @@ facts:
     - {file: README.md, regex: 'runs the PL at (\d+) MHz'}
     - {file: demo/README.md, regex: '`-DAXI_BUS_WIDTH=128`\) at (\d+) MHz'}
     - {file: doc/kernels/HLS_CONV_RESEARCH.md, regex: 'the board runs at (\d+) MHz'}
+    - {file: doc/images/architecture.svg, regex: 'kernels at (\d+) MHz'}
     - {file: inference-scheduler/src/perf_model.py, regex: '^MHZ = (\d+)\.0'}
     - {file: inference-scheduler/perf_calibrate.py, regex: '^MHZ = (\d+)\.0'}
 
