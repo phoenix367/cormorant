@@ -703,3 +703,60 @@ facts:
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
     - {file: .claude/skills/docs-audit/templates/new_user_brief.md, regex: 'Vitis / Vivado (\d{4}\.\d)'}
+
+# ── the chat client, the voice samples, the demo video ──────────────────────
+- id: cli.chat_client
+  kind: interface
+  title: chat.py's flags in its own usage synopsis (the module docstring)
+  check: cli_flags
+  args:
+    script: demo/chat/chat.py
+    cwd: demo/chat
+    docs:
+      - {file: demo/chat/chat.py, start: '^  chat\.py ', end: '^$', pattern: '(--[a-z0-9][a-z0-9-]*)'}
+
+- id: chat.banner_columns
+  kind: value
+  title: the narrowest terminal chat.py draws its banner in (the logo's width + 3)
+  source: {py: 'chat:len(LOGO[0]) + 3', cwd: demo/chat}
+  fix: auto
+  mentions:
+    - {file: demo/chat/doc/CLIENTS.md, regex: 'terminal narrower than (\d+) columns'}
+    - {file: demo/chat/chat.py, regex: 'terminal narrower\s+than (\d+) columns'}
+
+- id: tts.sample_lengths
+  kind: value
+  title: the voice samples' lengths (demo/tts/samples/manifest.json) in the TTS README's table
+  source: {file: demo/tts/samples/manifest.json, json: samples, transform: "{k: s['seconds'] for k, s in v.items()}"}
+  fix: auto
+  mentions:
+    - {file: demo/tts/README.md, regex: '\(samples/hello\.mp3\) \| ".*?" \| (?P<hello>[\d.]+) s \|', format: "f'{v + 1e-6:.1f}'"}   # half up
+    - {file: demo/tts/README.md, regex: '\(samples/paragraph\.mp3\) \| ".*?" \| (?P<paragraph>[\d.]+) s \|', format: "f'{v + 1e-6:.1f}'"}   # half up
+    - {file: demo/tts/README.md, regex: '\(samples/question\.mp3\) \| ".*?" \| (?P<question>[\d.]+) s \|', format: "f'{v + 1e-6:.1f}'"}   # half up
+    - {file: demo/tts/README.md, regex: '\(samples/fast\.mp3\) \| .*? \| (?P<fast>[\d.]+) s \|', format: "f'{v + 1e-6:.1f}'"}   # half up
+
+- id: tts.sample_links
+  kind: interface
+  title: every voice sample a doc links to exists; the TTS README lists them all
+  check: names_in_docs
+  args:
+    names: {glob: 'demo/tts/samples/*.mp3', transform: '[basename(p) for p in v]'}
+    missing: no file in demo/tts/samples/
+    docs:
+      - {file: demo/tts/README.md, start: '^## Samples', end: '^## Files', pattern: 'samples/(\w+\.mp3)', reverse: true}
+      - {file: demo/chat/doc/TEXT_TO_SPEECH.md, start: '^# Text to speech', end: '^## Install', pattern: 'samples/(\w+\.mp3)',
+         forward: false, reverse: true}
+      - {file: demo/chat/README.md, start: '^# KV260 chat server', pattern: 'tts/samples/(\w+\.mp3)', forward: false, reverse: true}
+      - {file: README.md, start: '^## Results on the board', end: '^## Hardware kernels', pattern: 'samples/(\w+\.mp3)',
+         forward: false, reverse: true}
+
+- id: docs.demo_video
+  kind: value
+  title: "the demo video's link: set here, then `facts.py fix docs.demo_video` rewrites every copy"
+  source: "https://youtu.be/VVS7ExW0XYQ"
+  fix: auto
+  mentions:
+    - {file: README.md, regex: '(https://youtu\.be/[\w-]+)', count: 3}
+    - {file: demo/README.md, regex: '\[demo video\]\((https://youtu\.be/[\w-]+)\)'}
+    - {file: demo/chat/README.md, regex: '\[Demo video\]\((https://youtu\.be/[\w-]+)\)'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '\[This video\]\((https://youtu\.be/[\w-]+)\)'}

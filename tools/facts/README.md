@@ -135,7 +135,7 @@ The `fix` policy:
 | plugin | args | checks |
 |---|---|---|
 | `register_map` | `kernel`, `prefix`, `hls`, `driver` (glob, a build artifact), `fields_alias`, `not_keyed` {register: why}, `decode`, `writers_all` | It checks five things, sketched below the table. |
-| `cli_flags` | `script`, `cwd`, `docs` [{file, start, end}] | the flags of argparse's `usage:` against the flags that start the lines (or table rows) of each doc section, both ways |
+| `cli_flags` | `script`, `cwd`, `docs` [{file, start, end, pattern}] | the flags of argparse's `usage:` against the flags that start the lines (or table rows) of each doc section, or that `pattern` finds in it (a usage synopsis), both ways |
 | `ctypes_bindings` | `files`, `external` | `.claude/agents/code-audit/ctypes_check.py`. Mismatches, inconsistencies and undeclared non-int restypes are errors. A symbol without a prototype that is not listed in `external` is a warning. `loose` (`c_void_p` for an opaque handle) is info |
 | `config_keys` | `example`, `code`, `waive` {key: why} | `.claude/agents/code-audit/config_keys.py`. An unread example key or an undocumented key that is read is an error unless waived. A waiver that matches nothing is a warning |
 | `names_in_docs` | `names` (a source giving a list), `missing` (how to word an unknown name), `docs` [{file, start, end, pattern, forward, reverse, extra_ok, skip}] | Every name shows in each doc section (`pattern`'s group 1; `skip`: names a section may omit; `forward: false`: none required). With `reverse`, every name the section shows must exist, unless listed in `extra_ok` |
@@ -189,6 +189,10 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `build.make_targets` | interface, optional | every make target that the README and CLAUDE.md name exists in a configured `build/` (`make help`) |
 | `tests.suites` | value | the run-tests helper's `default` / `all` suite sets, in the README, CLAUDE.md, the agent and the helper's docstring |
 | `toolchain.vivado` | value, optional | the Vitis / Vivado release (2025.2, from the hw project) in 11 files |
+| `cli.chat_client` | interface | `chat.py`'s flags against its own usage synopsis (a `cli_flags` doc with a `pattern`) |
+| `chat.banner_columns` | value | the narrowest terminal `chat.py` draws its banner in (60), from `LOGO` |
+| `tts.sample_lengths`, `tts.sample_links` | value, interface | the voice samples' lengths (`samples/manifest.json`) in the TTS README; every sample a doc links to exists, and the TTS README lists them all |
+| `docs.demo_video` | value | the demo video's link. Its value lives in `facts.yaml`: change it there, then `facts.py fix docs.demo_video` rewrites the six copies |
 
 What the first run found:
 - five stale scheduler test counts (README ×2, TESTING ×2, the docs-audit
@@ -212,6 +216,10 @@ were current. The README itself was out of date in two ways:
 - it never mentioned the fact registry or the hook.
 
 Fourteen mutations of these facts were all caught.
+
+The fourth batch registered what the chat demo added: the client's flags, the
+banner's width, the voice samples and the video link. `chat.py`'s usage
+synopsis lacked `--timeout`; it has it now.
 
 ## Adding a fact
 

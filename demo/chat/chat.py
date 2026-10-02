@@ -5,7 +5,7 @@ only) for the KV260 chat server; runs on a laptop or on the board.
 
   chat.py [--url http://kv260:8000/v1] [--api-key KEY] [--model M]
           [--doc FILE | --system TEXT] [--image FILE] [-q QUESTION] [--no-stream]
-          [--max-tokens N] [--temperature T]
+          [--max-tokens N] [--temperature T] [--timeout S]
           [--audio] [--say TEXT] [--audio-out FILE.wav] [--player CMD|none]
           [--tts-model tts-1] [--voice V] [--speed S] [--no-banner]
 

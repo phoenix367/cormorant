@@ -150,10 +150,11 @@ def cli_flags(args: dict, ctx) -> List[Finding]:
         body = rest[:e.start()] if e else rest
         base = text.count("\n", 0, m.end())
         documented: Dict[str, int] = {}
+        pat = re.compile(doc["pattern"]) if doc.get("pattern") else None     # e.g. a usage synopsis
         for i, line in enumerate(body.splitlines()):
-            fm = FLAG_AT_START.match(line)
-            if fm and fm.group(1) not in documented:
-                documented[fm.group(1)] = base + i + 1
+            found = pat.findall(line) if pat else [fm.group(1)] if (fm := FLAG_AT_START.match(line)) else []
+            for flag in found:
+                documented.setdefault(flag, base + i + 1)
         for f in accepted:
             if f not in documented:
                 out.append(("error", f"{f} is accepted by {script} but not documented here", f"{rel}:{base + 1}"))
