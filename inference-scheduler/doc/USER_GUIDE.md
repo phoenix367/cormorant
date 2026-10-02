@@ -891,6 +891,21 @@ predicted execution of one `inference_run()` as an interactive timeline,
 styled like Nsight Systems.  It is one self-contained file that opens in any
 browser.
 
+[![timeline.html of BERT-base: CPU and kernel lanes, a selected MatMul with its kernel registers, the lanes and longest nodes tables](../../doc/images/timeline_bert.png)](../../doc/images/timeline_bert.png)
+
+*BERT-base (`inference_scheduler.py bertsquad-12-simplified.onnx --plan-report`),
+965.5 ms predicted, zoomed to 160–340 ms.*
+- **The selected node.** `_gemm_matmul_20` is a MatMul lowered to
+  ConvKernel. The selection shows:
+  - its one kernel call, with every register;
+  - its inputs, with the weight marked;
+  - its spans: 3 µs of CPU issue, then 3.4 ms of waiting while ConvKernel
+    runs it;
+  - arrows to its input and to its consumer, `_gemm_add_20` on
+    VectorOPKernel.
+- **Where the time goes.** The Lanes table shows ConvKernel busy for
+  63.5 % of the run, and the CPU waiting 487.7 ms on it.
+
 - **Rows.**  One row per lane: the CPU and each kernel. On the CPU row,
   host ops are colored, red hatching means the CPU is blocked on a kernel,
   amber a synchronous call, and gray-blue the register writes that start a

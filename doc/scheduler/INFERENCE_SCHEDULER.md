@@ -332,6 +332,19 @@ op pending. Predecessor analysis walks **through** ReshapeNode chains
 to reach the real producing kernel, so a `Pool → Squeeze → MatMul`
 chain still drains the Pool lane before MatMul reads the alias.
 
+The predicted timeline (`timeline.html`, [§Planning](#planning---plan))
+draws this schedule. In BERT-base (below):
+- **A single-call MatMul on ConvKernel.** The CPU starts it in 3 µs
+  (`run_conv()`: the register writes and `XConvkernel_Start()`). It then
+  blocks in `kernel_wait(KERNEL_CONV)`, the red hatching, until the output
+  that the next node needs is ready.
+- **Between the waits.** The host ops (Softmax, LayerNorm, the transposes)
+  and VectorOPKernel's adds run there.
+- **Over the run.** The CPU waits a predicted 589 ms of 965 ms, 488 ms of
+  it on ConvKernel.
+
+[![The predicted timeline of BERT-base: the CPU issues a MatMul on ConvKernel, waits for it, and the bias add runs on VectorOPKernel](../images/timeline_bert.png)](../images/timeline_bert.png)
+
 ### DMA buffer management
 
 - All buffers allocated in `inference_init()` from a contiguous DMA pool.
@@ -1194,7 +1207,8 @@ lane busy times, where the CPU waits) without changing anything.
 
 **Timeline.**  With `--plan` or `--plan-report`, `inference_scheduler.py`
 also writes `timeline.html`.  It is the predicted execution, drawn in the
-style of a GPU profiler (Nsight Systems):
+style of a GPU profiler (Nsight Systems); the figure in
+[§Parallel kernel execution](#parallel-kernel-execution) shows BERT-base:
 - **What it shows:** one row per lane (the CPU and each kernel), every
   node's span, the CPU's waits and synchronous calls, and for a selected
   node its dependency arrows and details.
