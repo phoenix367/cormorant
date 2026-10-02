@@ -1,0 +1,705 @@
+# facts.yaml — facts that code and docs state in several places: where each
+# one is true (source / producer / provenance) and every place that repeats it
+# (mentions / consumers).  Checked by tools/facts/facts.py (format and
+# workflow: tools/facts/README.md):
+#
+#   python3 tools/facts/facts.py check            # all facts; exit 1 on a failure
+#   python3 tools/facts/facts.py fix              # rewrite stale `fix: auto` mentions
+#   python3 tools/facts/facts.py changed          # the facts a change touches + files to review
+#   python3 tools/facts/facts.py impact PATH|ID   # what a file is part of / what a fact ties together
+#
+# Kinds: value (derived from the code), interface (components that must
+# agree), recorded (measured; value + provenance, stale when its inputs change).
+# Regex locators: Python syntax, multiline; group 1 (or named groups for a
+# mapping value) is the quoted text.  Markers in prose:
+# <!-- fact:ID -->VALUE<!-- /fact --> (or fact:ID.KEY) are found anywhere.
+
+python: inference-scheduler/.venv/bin/python     # runs `py:` sources and {python} in commands
+
+facts:
+
+# ── test counts ──────────────────────────────────────────────────────────────
+- id: scheduler.test_count
+  kind: value
+  title: tests the scheduler suite collects
+  source:
+    cmd: "{python} -m pytest test/ --collect-only -q -p no:cacheprovider --color=no"
+    cwd: inference-scheduler
+    parse: '(\d+) tests? collected'
+    type: int
+  watch: ['inference-scheduler/test/test_*.py']
+  fix: auto
+  mentions:
+    - {file: CLAUDE.md, regex: 'Run all tests \((\d+) tests'}
+    - {file: inference-scheduler/CLAUDE.md, regex: 'pytest modules, (\d+) tests'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'Run the full test suite \((\d+) tests'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: 'Run the full test suite \((\d+) tests'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'Run all (\d+) tests in \d+ modules'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'planning \((\d+) tests\)'}
+    - {file: README.md, regex: 'pytest test/ -q +# (\d+) tests'}
+    - {file: .claude/agents/run-tests.md, regex: 'pytest `test/` \((\d+) tests'}
+    - {file: .claude/agents/run-tests/baselines.json, regex: '"scheduler": \{[^}]*?"min_tests": (\d+)', dotall: true}
+    - {file: .claude/skills/docs-audit/SKILL.md, regex: 'pytest test/ -q +# (\d+): all pass'}
+    # README.md's table quotes it in a marker: <!-- fact:scheduler.test_count -->
+
+- id: scheduler.test_modules
+  kind: value
+  title: pytest modules of the scheduler suite
+  source: {glob: 'inference-scheduler/test/test_*.py', transform: 'len(v)'}
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/CLAUDE.md, regex: '(\d+) pytest modules'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'tests in (\d+) modules'}
+
+- id: chat.test_count
+  kind: value
+  title: tests of the chat app (pytest and unittest collect the same)
+  source:
+    cmd: "{python} -m pytest demo/chat/tests --collect-only -q -p no:cacheprovider --color=no"
+    parse: '(\d+) tests? collected'
+    type: int
+  watch: ['demo/chat/tests/test_*.py']
+  fix: auto
+  mentions:
+    - {file: .claude/agents/run-tests.md, regex: 'demo/chat/tests` pytest \((\d+) tests'}
+    - {file: .claude/agents/run-tests/baselines.json, regex: '"chat": \{[^}]*?"min_tests": (\d+)', dotall: true}
+    - {file: .claude/skills/docs-audit/SKILL.md, regex: 'pytest demo/chat/tests -q +# (\d+)'}
+    - {file: demo/chat/README.md, regex: 'unittest +# (\d+) tests'}
+    - {file: demo/chat/doc/DEVELOPMENT.md, regex: 'unittest -v +# (\d+) tests'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'pytest demo/chat/tests -q +# (\d+) tests'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'the chat app \((\d+) tests\)'}
+    # README.md's table: <!-- fact:chat.test_count -->
+
+# ── the performance model ────────────────────────────────────────────────────
+- id: perf.bitstream_id
+  kind: value
+  title: the bitstream the committed performance model is for
+  source:
+    glob: 'inference-scheduler/perf_models/kv260/*.json'
+    transform: 'one(stem(p) for p in v if re.fullmatch(r"[0-9a-f]{12}\.json", basename(p)))'
+  exists:                                    # the files a bitstream needs besides the model
+    - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.cases.json'
+    - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.calib.json'
+    - '.claude/skills/perf-regression/baselines/kv260-{fact:perf.bitstream_id}.json'
+  fix: report                                # a new bitstream rewrites these paragraphs by hand
+  mentions:
+    - {file: inference-scheduler/perf_models/README.md, regex: '^`kv260/([0-9a-f]{12})` is hw_128'}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'Current model: \*\*kv260/([0-9a-f]{12})\*\*'}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'print\(f\(\)\)" +# ([0-9a-f]{12}) today'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
+  # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
+
+- id: perf.model_size
+  kind: value
+  title: exact kernel calls of the performance model, host-model signatures and kinds
+  source:
+    parts:
+      exact_calls: {file: 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.json', json: exact, transform: 'len(v)'}
+      host_signatures: {file: inference-scheduler/perf_models/kv260/host.json, json: exact, transform: 'len(v)'}
+      host_kinds: {file: inference-scheduler/perf_models/kv260/host.json, json: kinds, transform: 'len(v)'}
+  fix: report                                # the sentences carry dates: a top-up rewrites them
+  mentions:
+    - {file: inference-scheduler/perf_models/README.md, regex: '\): (?P<exact_calls>\d+) calls,'}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
+       regex: 'to (?P<exact_calls>\d+) exact calls, and `host.json` merged to (?P<host_signatures>\d+) signatures / (?P<host_kinds>\d+) kinds'}
+
+# ── the scheduler CLI ────────────────────────────────────────────────────────
+- id: cli.inference_scheduler
+  kind: interface
+  title: inference_scheduler.py's flags in its option lists
+  check: cli_flags
+  args:
+    script: inference-scheduler/inference_scheduler.py
+    cwd: inference-scheduler
+    docs:
+      - {file: inference-scheduler/CLAUDE.md, start: '^## CLI$', end: '^## '}
+      - {file: inference-scheduler/doc/USER_GUIDE.md, start: '^### Options$', end: '^### '}
+
+# ── kernel register maps ─────────────────────────────────────────────────────
+# HLS s_axilite ports = the driver header = what the generated code, the
+# benchmarks and the calibration runner write; the performance model keys on
+# all of them except the not_keyed ones; the timeline decodes FIELDS only.
+- id: registers.VectorOPKernel
+  kind: interface
+  title: VectorOPKernel AXI-Lite registers
+  check: register_map
+  args:
+    kernel: VectorOPKernel
+    prefix: XVectoropkernel
+    hls: kernels/vectorop/kernel/VectorOP.cpp
+    driver: 'build*/kernels/vectorop/kv260/*/*/impl/ip/drivers/VectorOPKernel_v1_0/src/xvectoropkernel_hw.h'
+    not_keyed: {a: address, b: address, c: address}
+    decode: inference-scheduler/src/timeline_html.py
+    writers_all:
+      - inference-scheduler/src/codegen/_source.py
+      - inference-scheduler/bench_src/calib_runner.c
+      - inference-scheduler/bench_src/bench_vectorop.c
+
+- id: registers.MatmulKernel
+  kind: interface
+  title: MatmulKernel AXI-Lite registers
+  check: register_map
+  args:
+    kernel: MatmulKernel
+    prefix: XMatmulkernel
+    hls: kernels/matmul/kernel/MatmulKernel.cpp
+    driver: 'build*/kernels/matmul/kv260/*/*/impl/ip/drivers/MatmulKernel_v1_0/src/xmatmulkernel_hw.h'
+    fields_alias: {a_stride: a_batch_stride, b_stride: b_batch_stride, c_stride: c_batch_stride}
+    not_keyed: {a: address, b: address, c: address, a_to_b: "B's address relative to A (GEMV), no geometry"}
+    decode: inference-scheduler/src/timeline_html.py
+    writers_all:
+      - inference-scheduler/src/codegen/_source.py
+      - inference-scheduler/bench_src/calib_runner.c
+      - inference-scheduler/bench_src/bench_matmul.c
+
+- id: registers.ConvKernel
+  kind: interface
+  title: ConvKernel AXI-Lite registers
+  check: register_map
+  args:
+    kernel: ConvKernel
+    prefix: XConvkernel
+    hls: kernels/conv/kernel/ConvKernel.cpp
+    driver: 'build*/kernels/conv/kv260/*/*/impl/ip/drivers/ConvKernel_v1_0/src/xconvkernel_hw.h'
+    fields_alias: {is_dw: is_depthwise}
+    not_keyed: {x: address, y: address, weight: address, bias: address}
+    decode: inference-scheduler/src/timeline_html.py
+    writers_all:
+      - inference-scheduler/src/codegen/_source.py
+      - inference-scheduler/bench_src/calib_runner.c
+      - inference-scheduler/bench_src/bench_conv.c
+
+- id: registers.PoolKernel
+  kind: interface
+  title: PoolingKernel AXI-Lite registers
+  check: register_map
+  args:
+    kernel: PoolKernel
+    prefix: XPoolingkernel
+    hls: kernels/pool/kernel/PoolingKernel.cpp
+    driver: 'build*/kernels/pool/kv260/*/*/impl/ip/drivers/PoolingKernel_v1_0/src/xpoolingkernel_hw.h'
+    not_keyed: {x: address, y: address}
+    decode: inference-scheduler/src/timeline_html.py
+    writers_all:
+      - inference-scheduler/src/codegen/_source.py
+      - inference-scheduler/bench_src/calib_runner.c
+      - inference-scheduler/bench_src/bench_pool.c
+
+- id: vectorop.codes
+  kind: interface
+  title: VectorOP op / act codes (the Op and Act enums) and their copies
+  producer: {file: kernels/vectorop/include/VectorOP.h, regex: '^\s*((?:OP|ACT)_\w+)\s*=\s*(\d+)', as: dict}
+  consumers:
+    - {name: scheduler constants, file: inference-scheduler/src/nodes.py, regex: '^((?:OP|ACT)_\w+)\s*=\s*(\d+)', as: dict}
+    - {name: CLAUDE.md operations table, file: CLAUDE.md, regex: '^\| (\d+) \| `(OP_\w+)`', as: dict, swap: true, keys: 'OP_*'}
+    - {name: run_remote_perf._OP_NAMES, file: inference-scheduler/run_remote_perf.py, regex: '^_OP_NAMES = (\[.*\])',
+       transform: "{'OP_' + n: i for i, n in enumerate(ast(v))}", keys: 'OP_*'}
+    - {name: timeline DECODE, file: inference-scheduler/src/timeline_html.py,
+       regex: 'VectorOPKernel: \{op: (\[[^\]]*\]), act: (\[[^\]]*\])',
+       transform: "dict([('OP_' + n.upper(), i) for i, n in enumerate(ast(v[0]))] + [('ACT_' + n.upper(), i) for i, n in enumerate(ast(v[1]))])"}
+
+# ── Python <-> C libraries ───────────────────────────────────────────────────
+- id: ctypes.tts
+  kind: interface
+  title: the chat server's ctypes bindings of libpiper_tts.so and espeak-ng
+  check: ctypes_bindings
+  args:
+    files: [demo/chat/piper_backend.py, demo/chat/piper_phonemize.py]
+    external: [espeak_Initialize, espeak_SetVoiceByName, espeak_TextToPhonemes]   # libespeak-ng, no header here
+    header: demo/tts/src/tts_api.h
+
+- id: ctypes.llm
+  kind: interface
+  title: the chat server's ctypes bindings of the LLM, VLM, BERT and sampler libraries
+  check: ctypes_bindings
+  args:
+    files: [demo/chat/smollm2_backend.py, demo/chat/smolvlm_backend.py, demo/chat/bert_squad_backend.py,
+            demo/chat/sampler.py, demo/chat/scripts/llm_lib_check.py]
+    header: demo/chat/src/llm_api.h
+
+# ── configuration ────────────────────────────────────────────────────────────
+- id: config.chat
+  kind: interface
+  title: chat_config.json.example against the code that reads it
+  check: config_keys
+  args:
+    example: demo/chat/chat_config.json.example
+    code: [demo/chat]
+    waive:
+      ssh.host: "ssh is null in the example: deploy.py takes it from bert_squad_config"
+      ssh.port: "ssh is null in the example: deploy.py takes it from bert_squad_config"
+      ssh.user: "ssh is null in the example: deploy.py takes it from bert_squad_config"
+      local: "generate_llm_project.py reads local.driver_dirs from the BERT demo's config"
+      remote.uio_devices: "llm_board.py / llm_attn_kernel_bench.py read the BERT demo's remote section"
+
+# ── recorded: measured, with provenance ──────────────────────────────────────
+- id: chat.pool_mib
+  kind: recorded
+  title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
+  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495}
+  tolerance: 1                               # MiB: the docs round
+  provenance:
+    commit: 6c090cd
+    date: 2026-10-02
+    how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build
+          (BERT 215.3, 135M 285.8, 360M 740.3, SmolVLM 494.8 MiB)"
+  depends_on:                                # what changes a pool's size
+    - platforms/kv260.json
+    - inference-scheduler/src/codegen/_core.py
+    - inference-scheduler/src/codegen/multi.py
+    - inference-scheduler/src/tensor.py
+    - inference-scheduler/src/llm_entries.py
+    - inference-scheduler/src/llama.py
+    - inference-scheduler/src/vit.py
+    - inference-scheduler/src/matmul_gemv.py
+    - inference-scheduler/src/matmul_lowering.py
+  verify:
+    bert: {file: demo/bert_squad/build/project/report.md, regex: 'Pool size \(total incl\. weights\) \| [\d ]+ elem \(([\d.]+) MiB\)', type: float}
+    smollm2_135m: {file: demo/chat/build/llm_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+    smollm2_360m: {file: demo/chat/build/llm_project_smollm2_360m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+    smolvlm_256m: {file: demo/chat/build/llm_project_smolvlm_256m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+  fix: auto
+  mentions:
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| BERT \| (?P<bert>\d+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-135M \| (?P<smollm2_135m>\d+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-360M \| (?P<smollm2_360m>\d+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolVLM-256M \| (?P<smolvlm_256m>\d+) MiB'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: 'Its pool is (?P<smollm2_360m>\d+) MiB'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: 'The pool buffer is (?P<smollm2_135m>\d+) MiB'}
+    - {file: demo/chat/doc/SMOLVLM.md, regex: 'The SmolVLM pool is (?P<smolvlm_256m>\d+) MiB'}
+    - {file: README.md, regex: 'prefill 2\.90 s, (?P<smollm2_360m>\d+) MiB CMA'}
+    - {file: demo/chat/chat_config.json.example, regex: 'The (?P<smollm2_360m>\d+) MiB pool BO;'}
+    - {file: demo/chat/chat_config.json.example, regex: 'The (?P<smolvlm_256m>\d+) MiB pool BO \+'}
+    - {file: demo/chat/smolvlm_backend.py, regex: 'the (?P<smolvlm_256m>\d+) MiB pool BO'}
+    - {file: demo/chat/deploy.py, regex: 'BERT pool BO needs ~(?P<bert>\d+) MiB'}
+    - {file: .claude/skills/model-study/SKILL.md, dotall: true,
+       regex: 'Pools served today: BERT (?P<bert>\d+), SmolLM2-135M\s+(?P<smollm2_135m>\d+), SmolLM2-360M (?P<smollm2_360m>\d+), SmolVLM (?P<smolvlm_256m>\d+) MiB'}
+    - {file: .claude/skills/llm-onboard/SKILL.md, dotall: true,
+       regex: 'Served pools: BERT (?P<bert>\d+), SmolLM2-135M (?P<smollm2_135m>\d+),\s+SmolLM2-360M (?P<smollm2_360m>\d+), SmolVLM (?P<smolvlm_256m>\d+) MiB'}
+
+# ── what the scheduler accepts ───────────────────────────────────────────────
+- id: scheduler.onnx_ops
+  kind: interface
+  title: the standard ONNX ops the scheduler accepts (graph._ALL_SUPPORTED_OP_TYPES) in the op lists of the docs
+  check: names_in_docs
+  args:
+    names: {py: 'src.graph:sorted(_ALL_SUPPORTED_OP_TYPES)', cwd: inference-scheduler}
+    docs:
+      - file: inference-scheduler/doc/USER_GUIDE.md
+        start: '^## 2\. Supported ONNX Operators'
+        end: '^## 3\.'
+        pattern: '`([A-Z][a-z]+(?:[A-Z][a-z0-9]*)*)\b'
+        reverse: true
+        extra_ok: [ReduceMean, Pow, Sqrt, Reciprocal, Tanh, Erf, SchedulerError]    # rejected unless fused; the error
+      - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
+      - {file: doc/scheduler/INFERENCE_SCHEDULER.md, start: '^## Hardware Kernels', end: '^## ', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
+
+- id: scheduler.axi_llm_ops
+  kind: interface
+  title: the custom-domain axi.llm ops (LLM / ViT / TTS op factories) in the docs that list them
+  check: names_in_docs
+  args:
+    names: {py: 'src.graph:sorted({**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES})', cwd: inference-scheduler}
+    docs:
+      - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'}
+      - file: doc/scheduler/INFERENCE_SCHEDULER.md      # the summary lists the host ops
+        start: '^## Hardware Kernels'
+        end: '^## '
+        pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'
+        skip: [LlmAttnScores, LlmAttnPV]                  # ConvKernel calls, not host ops
+      - file: doc/scheduler/INFERENCE_SCHEDULER.md      # the sections that define them
+        start: '^### Llama-family decoders'
+        end: '^### Multi-entry projects'
+        pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'
+        reverse: true
+        extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode]
+
+- id: scheduler.event_kinds
+  kind: interface
+  title: the event-stream kinds (_compute_event_stream) and every consumer and list of them
+  producer: {file: inference-scheduler/src/codegen/_core.py, regex: "events\\.append\\(\\('(\\w+)'", all: true,
+             transform: 'dict.fromkeys(v, 1)'}
+  consumers:
+    - {name: the C emitter (_source._inference_function), file: inference-scheduler/src/codegen/_source.py,
+       regex: "kind == '(\\w+)'", all: true, transform: 'dict.fromkeys(v, 1)'}
+    - {name: liveness (_core._compute_live_intervals), file: inference-scheduler/src/codegen/_core.py,
+       regex: "ev\\[0\\] in \\(([^)]*)\\)", all: true, exclude: [comment, reshape],
+       transform: "dict.fromkeys(re.findall(r\"'(\\w+)'\", ' '.join(v)), 1)"}
+    - {name: the timed replay (timing.simulate), file: inference-scheduler/src/codegen/timing.py,
+       regex: 'kind (?:==|in) ([^:\n]+):', all: true, exclude: [comment, reshape],
+       transform: "dict.fromkeys(re.findall(r'\"(\\w+)\"', ' '.join(v)), 1)"}
+    - {name: inference-scheduler/CLAUDE.md, file: inference-scheduler/CLAUDE.md, regex: "^\\('(\\w+)',", all: true,
+       transform: 'dict.fromkeys(v, 1)'}
+    - {name: SCHEDULER_DAG.md, file: inference-scheduler/doc/SCHEDULER_DAG.md, regex: "^\\('(\\w+)',", all: true,
+       transform: 'dict.fromkeys(v, 1)'}
+
+- id: scheduler.file_thresholds
+  kind: value
+  title: when weights, expected outputs and host tables go to .dat files
+  source:
+    parts:
+      weights: {py: 'src.tensor:LARGE_WEIGHT_THRESHOLD', cwd: inference-scheduler}
+      expected: {py: 'src.codegen._simulate:LARGE_EXPECTED_THRESHOLD', cwd: inference-scheduler}
+      table_kib: {py: 'src.llm_nodes:TABLE_FILE_BYTES // 1024', cwd: inference-scheduler}
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/CLAUDE.md, regex: 'weights > (?P<weights>\d+) elems, host tables > (?P<table_kib>\d+) KiB'}
+    - {file: inference-scheduler/CLAUDE.md, regex: 'large GT expected arrays \(> (?P<expected>\d+) elems\)'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`LARGE_WEIGHT_THRESHOLD = (?P<weights>\d+)`'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`LARGE_EXPECTED_THRESHOLD = (?P<expected>\d+)`'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`TABLE_FILE_BYTES = (?P<table_kib>\d+) KiB`'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '^### Large Weights \(> (?P<weights>\d+) elements\)'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '^Weight tensors exceeding (?P<weights>\d+) elements'}
+    - {file: .claude/skills/add-host-op/SKILL.md, regex: 'Above `TABLE_FILE_BYTES` \((?P<table_kib>\d+) KiB\)'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '`weights/<name>\.dat` when > (?P<table_kib>\d+) KiB'}
+
+# ── planning ─────────────────────────────────────────────────────────────────
+- id: planning.thresholds
+  kind: value
+  title: --plan's minimum gain and the largest family error it trusts, in %
+  source:
+    parts:
+      min_gain_pct: {py: 'src.matmul_lowering:round(PLAN_MIN_GAIN * 100, 3)', cwd: inference-scheduler}
+      max_model_error_pct: {py: 'src.perf_model:round(MAX_MODEL_ERROR * 100, 3)', cwd: inference-scheduler}
+  fix: auto
+  mentions:
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'at least (?P<min_gain_pct>[\d.]+) % below it \(`PLAN_MIN_GAIN`\)'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'within (?P<max_model_error_pct>[\d.]+) % \(`MAX_MODEL_ERROR`\)'}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'held-out p90 is at most (?P<max_model_error_pct>[\d.]+) %'}
+
+- id: perf.shipped_models
+  kind: value
+  title: the models perf_calibrate.py measures (SHIPPED)
+  source: {file: inference-scheduler/perf_calibrate.py, regex: '^SHIPPED = \((.*?)\)\n', dotall: true,
+           transform: "len(ast('(' + v + ')'))"}
+  fix: auto
+  mentions:
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'load all (\w+) shipped models',
+       format: "['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen'][v]"}
+
+# ── on-board test configuration ──────────────────────────────────────────────
+- id: remote_tests.model_count
+  kind: value
+  title: models of the on-board correctness suite (remote_config.json.example)
+  source: {file: inference-scheduler/remote_config.json.example, json: models, transform: 'len(v)'}
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/CLAUDE.md, regex: '`remote_config\.json\.example` \((\d+) models\)'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Correctness tests — (\d+) models over all four kernels'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'lists every on-board test model \((\d+);'}
+
+# ── the platform ─────────────────────────────────────────────────────────────
+- id: platform.kv260_excerpt
+  kind: interface
+  title: PLATFORM_CONFIGURATION.md's copy of platforms/kv260.json
+  check: json_excerpt
+  args: {json: platforms/kv260.json, doc: doc/build-and-test/PLATFORM_CONFIGURATION.md,
+         start: '^## Example — kv260\.json', complete: true}
+
+- id: platform.kv260_clock
+  kind: value
+  title: the HLS synthesis target clock of the KV260 (MHz; the board runs the PL at 100)
+  source: {file: platforms/kv260.json, json: clock}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: 'HLS targets (\d+) MHz; the board'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: "platform JSON's `clock` \\((\\d+) MHz for"}
+    - {file: doc/kernels/CONV_KERNEL.md, regex: 'clock — (\d+) MHz for the KV260; the CMake fallback'}
+    - {file: doc/kernels/CONV_KERNEL.md, regex: '^\| \*\*Clock\*\* \| (\d+) MHz synthesis target'}
+    - {file: doc/kernels/POOLING_KERNEL.md, regex: '`clock` — (\d+) MHz for the KV260'}
+    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: '`kv260\.json` sets (\d+) MHz'}
+    - {file: doc/kernels/HLS_CONV_RESEARCH.md, regex: 'HLS targets (\d+) MHz and the board'}
+
+# ── the chat server's protocols ──────────────────────────────────────────────
+- id: chat.http_routes
+  kind: interface
+  title: the chat server's HTTP routes (do_GET / do_POST) and the docs that name them
+  producer:
+    file: demo/chat/kv260_chat_server.py
+    regex: 'def do_GET\(self\):(.*?)\n    def do_POST\(self\):(.*?)\n    def '
+    dotall: true
+    transform: >-
+      dict.fromkeys(['GET ' + p for p in re.findall(r'path == "(/[^"]*)"', v[0])]
+      + ['GET ' + p + '*' for p in re.findall(r'path\.startswith\("(/[^"]*)"\)', v[0])]
+      + ['POST ' + p for p in re.findall(r'_path\(\) == "(/[^"]*)"', v[1])], 1)
+  consumers:
+    - {name: API.md, file: demo/chat/doc/API.md, regex: '`(GET|POST) (/[^`]+)`', all: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: CLIENTS.md, file: demo/chat/doc/CLIENTS.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: DEPLOY.md, file: demo/chat/doc/DEPLOY.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: TEXT_TO_SPEECH.md, file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: chat README, file: demo/chat/README.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: tts README, file: demo/tts/README.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+
+- id: cli.script_calls
+  kind: interface
+  title: the flags one script passes to another, against what the callee accepts
+  check: script_flags
+  args:
+    pairs:
+      - {caller: demo/chat/deploy.py, function: server_argv, callee: demo/chat/kv260_chat_server.py}
+      - {caller: demo/chat/deploy.py, function: ensure_project, callee: demo/bert_squad/scripts/generate_project.py}
+      - {caller: demo/chat/scripts/e2e_check.py, function: main, callee: [demo/chat/kv260_chat_server.py, demo/chat/chat.py]}
+      - {caller: demo/chat/scripts/llm_calibrate.py, function: cmd_calibrate, callee: demo/chat/scripts/llm_study.py}
+      - {caller: inference-scheduler/run_remote_tests.py, function: generate_project, callee: inference-scheduler/inference_scheduler.py}
+
+- id: tts.max_ids
+  kind: value
+  title: Piper's encoder buckets; the largest is the chat server's packing size (piper_backend.MAX_IDS)
+  source:
+    parts:
+      max_ids: {file: inference-scheduler/src/piper.py, regex: '^ENC_BUCKETS = (\([^)]*\))', transform: 'max(ast(v))'}
+      buckets: {file: inference-scheduler/src/piper.py, regex: '^ENC_BUCKETS = (\([^)]*\))',
+                transform: "', '.join(str(b) for b in ast(v))"}
+  fix: report                                # code constants: change them by hand
+  mentions:
+    - {file: demo/chat/piper_backend.py, regex: '^MAX_IDS = (?P<max_ids>\d+)'}
+    - {file: demo/chat/piper_backend.py, regex: 'sentence into utterances of <= (?P<max_ids>\d+) ids'}
+    - {file: demo/chat/piper_phonemize.py, regex: 'max_ids: int = (?P<max_ids>\d+)\)'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'utterances of at most (?P<max_ids>\d+) ids'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'padded to T ∈ \{(?P<buckets>[\d, ]+)\}'}
+
+# ── headline results: measured on the board ─────────────────────────────────
+- id: board.results
+  kind: recorded
+  title: the board results of README "Results on the board", and where they are repeated
+  value: {resnet18_ms: 60.3, resnet18_fps: 16.6, bert_ms: 962, smollm2_135m_tok_s: 10.07, smollm2_360m_tok_s: 3.9,
+          smolvlm_image_s: 3.9, piper_rtf: 0.52}
+  tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
+  provenance:
+    date: 2026-09-26 to 2026-10-01
+    how: "README.md 'Results on the board': BERT_PLAN §3, CHAT_PLAN §19, §20, §23, §24, TTS_PLAN §5"
+    facts: {perf.bitstream_id: caa67f49a5a3}   # stale on another bitstream
+  verify:
+    resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
+                  transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
+    bert_ms: {file: demo/bert_squad/build/results.json, json: metrics.p50_ms}
+  fix: report                                # the sentences round and qualify: rewrite them by hand
+  mentions:
+    - {file: README.md, regex: '\*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
+    - {file: README.md, regex: '\*\*(?P<bert_ms>\d+) ms\*\* per inference \(p50'}
+    - {file: README.md, regex: 'SmolLM2-135M-Instruct \| \*\*(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\*'}
+    - {file: README.md, regex: 'SmolLM2-360M-Instruct \| \*\*(?P<smollm2_360m_tok_s>[\d.]+) tokens/s\*\*'}
+    - {file: README.md, regex: '\*\*(?P<smolvlm_image_s>[\d.]+) s\*\* per image for the vision encoder'}
+    - {file: README.md, regex: 'real-time factor (?P<piper_rtf>[\d.]+)\)'}
+    - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
+    - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
+    - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/image_classification/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms, MobileNet v1'}
+    - {file: doc/README.md, regex: 'met \((?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS\)'}
+    - {file: doc/README.md, regex: '\((?P<bert_ms>\d+) ms p50 on'}
+    - {file: doc/README.md, regex: 'SmolLM2-135M on the FPGA \(~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\)'}
+    - {file: doc/README.md, regex: 'bit-exact on the board, RTF (?P<piper_rtf>[\d.]+);'}
+    - {file: demo/chat/README.md, regex: 'streamed token by token \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/README.md, regex: 'better answers, slower \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/README.md, regex: 'Answers questions about images \| (?P<smolvlm_image_s>[\d.]+) s per image'}
+    - {file: demo/chat/doc/BERT_QA.md, regex: 'running on the FPGA: (?P<bert_ms>\d+) ms per 256-token window'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2` \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2-360m` \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '^~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s decode, first token'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: 'Decode: ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\* at short context'}
+    - {file: demo/chat/doc/SMOLVLM.md, regex: 'The vision encoder takes (?P<smolvlm_image_s>[\d.]+) s per image'}
+    - {file: .claude/skills/llm-onboard/SKILL.md, regex: '`llm_image` ~(?P<smolvlm_image_s>[\d.]+) s'}
+
+# ── the README's hardware claims ─────────────────────────────────────────────
+- id: platform.kv260_bounds
+  kind: value
+  title: the KV260 kernel tiles and bounds the README's kernel table quotes
+  source:
+    parts:
+      matmul_tiles: {file: platforms/kv260.json, json: kernels.matmul, transform: "f\"{v['tile_n']} × {v['tile_m']} × {v['tile_k']}\""}
+      max_k: {file: platforms/kv260.json, json: kernels.matmul.max_k}
+      conv_grid: {file: platforms/kv260.json, json: kernels.conv, transform: "f\"{v['tile_m']} × {v['tile_ic']}\""}
+      conv_window: {file: platforms/kv260.json, json: kernels.conv, transform: "f\"{v['max_kh']}×{v['max_kw']}\""}
+      max_in_ch: {file: platforms/kv260.json, json: kernels.conv.max_in_ch}
+      max_out_ch: {file: platforms/kv260.json, json: kernels.conv.max_out_ch}
+      pool_lanes: {file: platforms/kv260.json, json: kernels.pool.tile_c}
+      pool_window: {file: platforms/kv260.json, json: kernels.pool, transform: "f\"{v['max_kh']}×{v['max_kw']}\""}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: 'tiles (?P<matmul_tiles>\d+ × \d+ × \d+), packed-B weight layout, K ≤ (?P<max_k>\d+)'}
+    - {file: README.md, regex: '(?P<conv_grid>\d+ × \d+) MAC grid, .*?kernels ≤ (?P<conv_window>\d+×\d+), .*?≤ (?P<max_in_ch>\d+) in / (?P<max_out_ch>\d+) out channels'}
+    - {file: README.md, regex: '(?P<pool_lanes>\d+) channel lanes, windows ≤ (?P<pool_window>\d+×\d+)'}
+
+- id: board.pl_clock_mhz
+  kind: value
+  title: the clock the board runs the PL at (block design PL0), and the code that converts cycles with it
+  optional: true                             # the hw/ submodule
+  source: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sources_1/bd/design_cormorant/design_cormorant.bd,
+           regex: '"PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ": \{\s*"value": "(\d+)"', type: int}
+  fix: report                                # code constants among them
+  mentions:
+    - {file: README.md, regex: 'programmable logic at (\d+) MHz'}
+    - {file: README.md, regex: 'runs the PL at (\d+) MHz'}
+    - {file: demo/README.md, regex: '`-DAXI_BUS_WIDTH=128`\) at (\d+) MHz'}
+    - {file: doc/kernels/HLS_CONV_RESEARCH.md, regex: 'the board runs at (\d+) MHz'}
+    - {file: inference-scheduler/src/perf_model.py, regex: '^MHZ = (\d+)\.0'}
+    - {file: inference-scheduler/perf_calibrate.py, regex: '^MHZ = (\d+)\.0'}
+
+- id: hw.utilization
+  kind: recorded
+  title: the bitstream's source commit and FPGA utilization (README)
+  value: {hw_commit: d7ce129, dsp: 1058, dsp_total: 1248, dsp_pct: 85, lut: 93303, lut_total: 117120, lut_pct: 79.7,
+          bram: 115.5, bram_total: 144, uram: 56, uram_total: 64}
+  tolerance: 0.5                             # the docs round the percentages
+  provenance:
+    date: 2026-09-27
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at d7ce129 (the bitstream of perf.bitstream_id)"
+    facts: {perf.bitstream_id: caa67f49a5a3}
+  verify:
+    dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
+    lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
+    lut_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|.*\|\s+([\d.]+) \|$', type: float}
+    dsp_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|.*\|\s+([\d.]+) \|$', type: float}
+    bram: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| Block RAM Tile\s+\|\s+([\d.]+) ', type: float}
+    uram: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| URAM\s+\|\s+(\d+) ', type: int}
+  fix: report
+  mentions:
+    - file: README.md
+      regex: '`hw/cormorant_hw_128` (?P<hw_commit>[0-9a-f]{7})\) uses (?P<dsp_pct>\d+) % of the DSPs\s+\((?P<dsp>\d+) / (?P<dsp_total>\d+)\), (?P<lut_pct>[\d.]+) % of the LUTs \((?P<lut>[\d ]+) / (?P<lut_total>[\d ]+)\), (?P<bram>[\d.]+) / (?P<bram_total>\d+) BRAM and\s+(?P<uram>\d+) / (?P<uram_total>\d+) URAM'
+    - {file: inference-scheduler/perf_models/README.md, regex: 'is hw_128 (?P<hw_commit>[0-9a-f]{7}) \('}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: '= hw_128 (?P<hw_commit>[0-9a-f]{7}) \(2026'}
+
+# ── the board: UIO devices of the overlay ────────────────────────────────────
+- id: board.uio_labels
+  kind: interface
+  title: the overlay's UIO names (dts/kv260/cormorant.dts) in the configs and docs
+  producer: {file: dts/kv260/cormorant.dts, regex: '^\s*(fabric_\w+): fabric_\w+@', all: true, transform: 'dict.fromkeys(v, 1)'}
+  consumers:
+    - {name: remote_config example, file: inference-scheduler/remote_config.json.example, json: remote.uio_devices,
+       transform: "dict.fromkeys([x for k, x in v.items() if not k.startswith('_')], 1)"}
+    - {name: perf_config example, file: inference-scheduler/perf_config.json.example, json: remote.uio_devices,
+       transform: "dict.fromkeys([x for k, x in v.items() if not k.startswith('_')], 1)"}
+    - {name: the README, file: README.md, regex: 'uio\*/name +→ +.*?\), (fabric_\w+(?: fabric_\w+)*)$', transform: 'dict.fromkeys(v.split(), 1)'}
+    - {name: perf-calibrate skill, file: .claude/skills/perf-calibrate/SKILL.md, regex: 'It must list `(fabric_[\w ]+)`', transform: 'dict.fromkeys(v.split(), 1)'}
+    - {name: the MNIST README, file: demo/mnist/README.md, regex: '# → (fabric_\w+(?:, fabric_\w+)*)$', transform: "dict.fromkeys(v.split(', '), 1)"}
+
+- id: board.uio_map
+  kind: interface
+  title: which UIO device each kernel uses, in every example config and doc table
+  producer: {file: inference-scheduler/remote_config.json.example, json: remote.uio_devices,
+             transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+  consumers:
+    - {name: perf_config example, file: inference-scheduler/perf_config.json.example, json: remote.uio_devices,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: BERT demo config, file: demo/bert_squad/bert_squad_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: camera demo config, file: demo/camera/camera_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: image demo config, file: demo/image_classification/image_classification_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: MNIST demo config, file: demo/mnist/mnist_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: REMOTE_TESTING table, file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '^\| `(\w+Kernel)` +\| `(fabric_\w+)` +\| `fabric_\w+` +\|',
+       as: dict, transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items()}"}
+    - {name: TESTING table, file: doc/build-and-test/TESTING.md, regex: '^\| `(\w+Kernel)` \| `(fabric_\w+)` \|$',
+       as: dict, transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items()}"}
+
+# ── assets, limits, the chunk ────────────────────────────────────────────────
+- id: bert.model_mb
+  kind: value
+  title: the size of the bertsquad-12 download (fetch_assets.py), MB
+  source: {file: demo/bert_squad/scripts/fetch_assets.py, regex: '^\s*([\d_]+), "f6818d482d18e703fbd8d7c3b609a98a"',
+           transform: "round(int(v.replace('_', '')) / 1e6)"}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: 'downloads the (\d+) MB BERT model'}
+    - {file: CLAUDE.md, regex: 'downloads bertsquad-12 — (\d+) MB —'}
+    - {file: inference-scheduler/CLAUDE.md, regex: 'downloads bertsquad-12, (\d+) MB,'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: 'downloads the (\d+) MB'}
+    - {file: .claude/agents/run-tests.md, regex: 'downloads the (\d+) MB (?:BERT|bertsquad)'}
+    - {file: doc/build-and-test/TESTING.md, regex: '(?:downloads the |fetch_assets\.py`: |\n   )(\d+) MB'}
+    - {file: demo/chat/README.md, regex: 'BERT model \((\d+) MB\)'}
+    - {file: demo/chat/doc/BERT_QA.md, regex: 'The model \((\d+) MB\)'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: 'fetches the model \((\d+) MB\)'}
+    - {file: .github/workflows/inference-scheduler-tests.yml, regex: 'bertsquad-12 \((\d+) MB'}
+    - {file: inference-scheduler/test/test_bert_base.py, regex: '(?:real |Google Drive, )(\d+) MB'}
+
+- id: chat.limits
+  kind: value
+  title: the chat models' context and the speech endpoint's input limit
+  source:
+    parts:
+      context: {file: demo/chat/scripts/llm_project.py, regex: '^CONTEXT = (\d+)', type: int}
+      speech_chars: {file: demo/chat/kv260_chat_server.py, regex: '^MAX_SPEECH_INPUT = (\d+)', type: int}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: 'context (?P<context>\d+) \|', count: 3}
+    - {file: README.md, regex: 'up to (?P<speech_chars>\d+) characters'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'the text, up to (?P<speech_chars>\d+) characters'}
+    - {file: demo/chat/chat_config.json.example, regex: '"context": (?P<context>\d+),', fix: report}
+
+- id: piper.chunk
+  kind: value
+  title: "Piper's chunk (piper.py) — valid frames, decoder frames, seconds of audio at 22 050 Hz"
+  source:
+    parts:
+      out_frames: {file: inference-scheduler/src/piper.py, regex: '^FLOW_FRAMES, DEC_FRAMES, OUT_FRAMES = (\d+), (\d+), (\d+)', transform: 'int(v[2])'}
+      dec_frames: {file: inference-scheduler/src/piper.py, regex: '^FLOW_FRAMES, DEC_FRAMES, OUT_FRAMES = (\d+), (\d+), (\d+)', transform: 'int(v[1])'}
+      seconds: {file: inference-scheduler/src/piper.py, regex: '^FLOW_FRAMES, DEC_FRAMES, OUT_FRAMES = \d+, \d+, (\d+)',
+                transform: 'round(int(v) * 256 / 22050, 2)'}       # HOP 256, the voice's 22 050 Hz
+  fix: auto
+  mentions:
+    - {file: README.md, regex: 'one fixed-size chunk \((?P<out_frames>\d+) frames, (?P<seconds>[\d.]+) s of audio\)'}
+    - {file: README.md, regex: '\*\*0\.7 s\*\* per (?P<seconds>[\d.]+) s of audio'}
+    - {file: CLAUDE.md, regex: '(?P<out_frames>\d+) frames = (?P<seconds>[\d.]+) s of audio per pass'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'chunks of (?P<out_frames>\d+) frames \((?P<seconds>[\d.]+) s of speech\)'}
+    - {file: demo/tts/README.md, regex: 'about 0\.7 s per (?P<seconds>[\d.]+) s chunk'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'pcm, (?P<dec_frames>\d+) × 256 int16 samples'}
+
+# ── build and test entry points ─────────────────────────────────────────────
+- id: build.make_targets
+  kind: interface
+  title: the make targets the README and CLAUDE.md name exist (make help of a configured build/)
+  optional: true                             # needs a configured build/
+  check: names_in_docs
+  args:
+    names: {cmd: "make -C build help", transform: "re.findall(r'^\\.\\.\\. (\\S+)', v, re.M)"}
+    missing: no make target of build/
+    docs:
+      - {file: README.md, start: '^## Quick start', end: '^## Supported models', forward: false, reverse: true,
+         pattern: '\b(Test[A-Z]\w*|synthesize_\w+|build_hw_\w+|dtbo_\w+|behavior_test\w*|sim_hw_\w+|gen_\w+_test_data)\b'}
+      - {file: CLAUDE.md, start: '^## Build System', end: '^## Architecture', forward: false, reverse: true,
+         pattern: '\bmake +(\w+)'}
+
+- id: tests.suites
+  kind: value
+  title: the run-tests helper's suite sets (run_tests.py DEFAULT / ALL)
+  source:
+    parts:
+      default: {file: .claude/agents/run-tests/run_tests.py, regex: '^DEFAULT = (\([^)]*\))', transform: "', '.join(ast(v))"}
+      all: {file: .claude/agents/run-tests/run_tests.py, regex: '^ALL = (\([^)]*\))', transform: "', '.join(ast(v))"}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: '--suite all` \((?P<all>[\w, -]+)\)'}
+    - {file: CLAUDE.md, regex: '--suite all +# (?P<all>[\w, -]+)$'}
+    - {file: .claude/agents/run-tests.md, regex: '^\| `default` \| (?P<default>[\w, -]+) \|'}
+    - {file: .claude/agents/run-tests.md, regex: '^\| `all` \| (?P<all>[\w, -]+) \(not rtl\)'}
+    - {file: .claude/agents/run-tests/run_tests.py, regex: 'default: (?P<default>[\w,-]+)\):', format: "v.replace(', ', ',')"}
+    - {file: .claude/agents/run-tests/run_tests.py, regex: '^  all +(?P<all>[\w,-]+) \(not rtl\)', format: "v.replace(', ', ',')"}
+
+- id: toolchain.vivado
+  kind: value
+  title: the Vitis / Vivado release the design is built with (the hw project's version)
+  optional: true                             # the hw/ submodule
+  source: {file: hw/cormorant_hw_128/cormorant_hw_128.xpr, regex: 'Product Version: Vivado v(\d{4}\.\d)'}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: '<Xilinx>/(\d{4}\.\d)/Vitis/settings64\.sh'}
+    - {file: CLAUDE.md, regex: '(?:\*\*Xilinx Vitis |/mnt/data/xilinx/)(\d{4}\.\d)'}
+    - {file: CMakeLists.txt, regex: 'submodule and Vivado (\d{4}\.\d)\.'}
+    - {file: .claude/agents/run-tests/run_tests.py, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '(?:\*\*Vitis |<Xilinx>/|xilinx/|Requires Vivado )(\d{4}\.\d)'}
+    - {file: doc/build-and-test/TESTING.md, regex: '<Xilinx>/(\d{4}\.\d)/Vitis'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '(?:<Xilinx>|/opt/Xilinx)/(\d{4}\.\d)/Vitis'}
+    - {file: .claude/skills/board-deploy/SKILL.md, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
+    - {file: .claude/skills/docs-audit/SKILL.md, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
+    - {file: .claude/skills/docs-audit/templates/new_user_brief.md, regex: 'Vitis / Vivado (\d{4}\.\d)'}

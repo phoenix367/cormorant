@@ -35,6 +35,8 @@
     "_lib_note": "null = <remote.dir>/lib/libsmollm2.so (llm_board.py --install-only builds it).",
     "weights_dir": null,
     "_weights_dir_note": "Passed to llm_open(); null = the directory the library was built for.",
+    "model_id": null,
+    "_model_id_note": "null = the library's llm_model_name() (smollm2-135m-instruct).",
     "tokenizer": "assets/smollm2-135m-instruct/tokenizer.json",
     "_tokenizer_note": "Host path (demo/chat/assets is untracked); uploaded to <remote.dir>/smollm2/tokenizer.json.",
     "context": 1024,
@@ -94,6 +96,8 @@
     "_lib_note": "null = <remote.dir>/lib/libpiper_tts.so (Piper text to speech, POST /v1/audio/speech; backend name \"piper\"). Built and installed with the voice by demo/tts/scripts/tts_board.py --install-only.",
     "weights_dir": "/root/piper_weights",
     "_weights_dir_note": "The voice directory: weights/*.dat of the library (the duration predictor's weights/dp.dat among them) and voice.json.",
+    "model_id": null,
+    "_model_id_note": "null = the model of voice.json (piper-lessac-medium).",
     "cma_mb": 55
   }
 }

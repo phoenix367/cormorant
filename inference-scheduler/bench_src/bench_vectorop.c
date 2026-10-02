@@ -23,6 +23,7 @@ static void run_once(XVectoropkernel *k,
     XVectoropkernel_Set_outer(k, outer);
     XVectoropkernel_Set_a_inc(k, ai);
     XVectoropkernel_Set_b_inc(k, bi);
+    XVectoropkernel_Set_act(k, 0);      /* no fused activation; the register keeps the last program's value */
     XVectoropkernel_Start(k);
     while (!XVectoropkernel_IsDone(k)) {}
 }

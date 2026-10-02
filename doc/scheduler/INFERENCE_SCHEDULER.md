@@ -68,6 +68,13 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
   `VitPixelShuffle`, `VitSumDequant`, with q·Kᵀ / P·V on ConvKernel; the
   `vision` entry comes from `src/vit.py` ([§Vision encoders](#vision-encoders)).
   This is what runs SmolVLM-256M-Instruct's image side — `CHAT_PLAN.md` §23, §24.
+- **Text-to-speech ops** (domain `axi.llm`, `src/tts_nodes.py`) — `TtsPrep`,
+  `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm` around the
+  flow's and the HiFi-GAN decoder's ConvKernel convs, and `TtsEmbed`,
+  `TtsRowPrep`, `TtsAttnSoftmax`, `TtsAttnMerge`, `TtsResNorm`, `TtsEncOut`
+  in the text encoder; the `chunk` and `encode_<T>` entries come from
+  `src/piper.py` ([§Text to speech (Piper)](#text-to-speech-piper)).
+  This is what runs Piper lessac-medium — `TTS_PLAN.md` §4–§6.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -835,10 +842,12 @@ policy pow2+p12, which the simulation reproduces bit for bit):
 
 - **Input:** `vision.patches` [1024][768], the raw uint8 pixel values at
   exponent 0.  The (x − 0.5) / 0.5 normalisation is folded into the
-  patch-embedding weights and a float32 bias table.  `llm_image()` in
+  patch-embedding weights and a float32 bias table [tokens][768], which
+  `VitEmbedAdd` adds to the patch embedding.  `llm_image()` in
   `demo/chat/src/llm_api.c` fills it from an RGB image.
-- **Per layer, host ops:** LayerNorm, the bias adds, GELU and the float32
-  residual adds.
+- **Per layer, host ops:** LayerNorm (`VitLayerNorm`), the bias adds,
+  GELU (`VitGelu`) and the float32 residual adds (`VitResAdd`, which adds
+  the projection's bias too).
   - GELU reads a 65 536-entry int16 table of the rounded outputs per
     (input, output) exponent pair (the bias added as an integer first),
     filled with libm exp in the tanh form.

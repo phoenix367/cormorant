@@ -5,6 +5,9 @@ paramiko>=3.0.0
 # the test suite (test/, ../demo/chat/tests)
 pytest>=7.0
 
+# tools/facts/facts.py — the fact registry checker (../facts.yaml)
+pyyaml>=6.0
+
 # simplify_onnx.py — ONNX preprocessing pipeline
 onnxsim>=0.4.0
 onnxoptimizer>=0.3.0

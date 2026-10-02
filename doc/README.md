@@ -26,6 +26,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 |---|---|
 | build the C simulation, synthesise the kernels, make a bitstream or an overlay | [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) |
 | run the tests (host, RTL, board) | [TESTING](build-and-test/TESTING.md); on the board: [REMOTE_TESTING](../inference-scheduler/doc/REMOTE_TESTING.md) |
+| keep facts that code and docs repeat in step (counts, register maps, flags, bindings, pool sizes), or find what else a change must touch | [`tools/facts`](../tools/facts/README.md) (`facts.yaml`) |
 | change a kernel bound or add a board | [PLATFORM_CONFIGURATION](build-and-test/PLATFORM_CONFIGURATION.md) |
 | compile an ONNX model and use the generated C library | [USER_GUIDE](../inference-scheduler/doc/USER_GUIDE.md) |
 | know which ops are supported and how a model maps to the kernels | [INFERENCE_SCHEDULER](scheduler/INFERENCE_SCHEDULER.md) |

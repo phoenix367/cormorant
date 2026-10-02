@@ -10,6 +10,8 @@ The repository also contains **`inference-scheduler/`**, a Python code-generator
 
 Documentation index: `doc/README.md` — docs are grouped in `doc/build-and-test/`, `doc/kernels/` (reference + optimisation log per kernel), `doc/scheduler/` and `doc/plans/` (project plans and results); the scheduler's user guides are in `inference-scheduler/doc/`.
 
+**Fact registry:** `facts.yaml` lists the facts that code and docs state in several places — test counts, the bitstream id, CLI flags and script-to-script flags, kernel register maps, VectorOP codes, the supported ops, event-stream kinds, HTTP routes, ctypes bindings, config keys, the platform JSON and kernel bounds, UIO names, clocks, the toolchain release, pool sizes, headline board results and FPGA utilization — with where each is true and every place that repeats it.  `python3 tools/facts/facts.py check` verifies them (`fix` rewrites stale counts; `impact FILE` lists what must change with a file; `changed` checks the facts a branch touches) — `tools/facts/README.md`.  `facts.py install-hook` (once per clone) makes `git commit` refuse a commit that leaves a fact it touches stale; `git commit --no-verify` skips it.  When you find the same fact stale in two places, add it to the registry.
+
 ## Build System
 
 All four kernels live under `kernels/` and are built from a single top-level CMake project.
@@ -148,7 +150,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # Every host suite with one structured report (failures, unexpected skips, warnings, short runs;
 # baselines in .claude/agents/run-tests/baselines.json) — the `run-tests` subagent drives the same helper
-python3 ../.claude/agents/run-tests/run_tests.py --suite all      # scheduler, chat, lint, csim, tts-host
+python3 ../.claude/agents/run-tests/run_tests.py --suite all      # scheduler, chat, lint, facts, csim, tts-host
 ```
 
 Key source files:

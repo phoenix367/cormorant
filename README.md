@@ -160,8 +160,9 @@ TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1621 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1625 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
+python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
 
 ### 4. Build the hardware
@@ -238,13 +239,14 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (1621 tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (188 tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1625<!-- /fact --> tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |
-| All host layers, one report | as above | `python3 .claude/agents/run-tests/run_tests.py --suite all`: the scheduler, chat, lint, C-sim and Piper host checks, with failures, unexpected skips, warnings and short runs as JSON; in Claude Code, the `run-tests` subagent |
+| Facts in code and docs | Python, PyYAML | `python3 tools/facts/facts.py check`: the counts, register maps, supported ops, flags, routes, bounds and board results that several files state ([`facts.yaml`](facts.yaml), [tools/facts](tools/facts/README.md)); `install-hook` makes every `git commit` check the ones it touches |
+| All host layers, one report | as above | `python3 .claude/agents/run-tests/run_tests.py --suite all` (scheduler, chat, lint, facts, csim, tts-host): pytest, ruff, the fact registry, the kernel C simulation and the Piper host checks, with failures, unexpected skips, warnings and short runs as JSON; in Claude Code, the `run-tests` subagent |
 
 Details: [doc/build-and-test/TESTING.md](doc/build-and-test/TESTING.md),
 [inference-scheduler/doc/REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md).
@@ -299,6 +301,7 @@ and every document with a one-line summary:
 | [`inference-scheduler/doc/`](inference-scheduler/doc/) | scheduler user guide, architecture, DAG, model preparation, board testing |
 | [`doc/plans/`](doc/plans/) | project plans and their measured results |
 | [`demo/`](demo/README.md) | one README per demo |
+| [`tools/facts/`](tools/facts/README.md) | the fact registry ([`facts.yaml`](facts.yaml)): facts that code and docs repeat, checked by `facts.py` and a pre-commit hook |
 
 ---
 

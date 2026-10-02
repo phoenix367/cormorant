@@ -3,17 +3,21 @@
 run_tests.py — run the project's test suites and report a structured status
 (JSON on stdout) for the run-tests agent (.claude/agents/run-tests.md).
 
-Suites (--suite, comma-separated; default: scheduler,chat,lint):
+Suites (--suite, comma-separated; default: scheduler,chat,lint,facts):
   scheduler  inference-scheduler pytest (test/)                     ~3.5 min
   chat       demo/chat/tests with pytest                            ~1 min
   lint       ruff check of inference-scheduler/ (the CI lint)        seconds
+  facts      tools/facts: facts.yaml checked against code and docs (stale counts,
+             register maps, supported ops, CLI and script flags, HTTP routes,
+             ctypes, config keys, pool sizes, board results) + the tool's own
+             unittest                                                ~15 s
   csim       kernel C simulation: make + ctest in build/ (Vitis HLS headers)  ~2-5 min
   tts-host   demo/tts/scripts/tts_host_emu.py (+ --lib-check): the Piper library's
              generated C on the host vs the specifications (needs the voice assets
              and demo/tts/build/piper_project)                       ~2 min
   rtl        make behavior_test in build/ (Vivado xsim; re-synthesises; LONG, and
              it modifies tracked files of the hw/ submodules)       ~1 h
-  all        scheduler,chat,lint,csim,tts-host (not rtl)
+  all        scheduler,chat,lint,facts,csim,tts-host (not rtl)
 Board suites (run_remote_tests.py, run_remote_perf.py, tts_board.py, llm_board.py)
 are never run here: the board is shared and the chat server owns the FPGA.
 
@@ -64,9 +68,10 @@ RUFF = SCHED / ".venv" / "bin" / "ruff"
 BUILD = REPO / "build"
 VITIS = os.environ.get("VITIS_SETTINGS", "/mnt/data/xilinx/2025.2/Vitis/settings64.sh")
 BASELINES = HERE / "baselines.json"
+FACTS = REPO / "tools" / "facts"
 
-DEFAULT = ("scheduler", "chat", "lint")
-ALL = ("scheduler", "chat", "lint", "csim", "tts-host")
+DEFAULT = ("scheduler", "chat", "lint", "facts")
+ALL = ("scheduler", "chat", "lint", "facts", "csim", "tts-host")
 KNOWN = ALL + ("rtl",)
 RANK = {"pass": 0, "not_run": 1, "warn": 2, "fail": 3}
 TB_LINES = 40
@@ -316,6 +321,49 @@ def run_lint(a, out_dir: Path, bls: dict) -> dict:
     return r
 
 
+# ---- facts ------------------------------------------------------------------ #
+
+def run_facts(a, out_dir: Path, bls: dict) -> dict:
+    """facts.py check --json: a failing fact's errors are failures, its warnings
+    anomalies; then the tool's own tests."""
+    py = str(VENV_PY) if VENV_PY.exists() else sys.executable
+    cmd = [py, str(FACTS / "facts.py"), "check", "--json"]
+    r = base_result("facts", cmd, REPO)
+    if subprocess.run([py, "-c", "import yaml"], capture_output=True).returncode:
+        return not_run(r, f"{py} has no PyYAML", "inference-scheduler/.venv/bin/pip install -r "
+                                                 "inference-scheduler/requirements.txt")
+    log(f"[facts] {r['command']}")
+    rc, dt, out = run(cmd, REPO, out_dir / "facts.log", a.timeout or 900)
+    body = out.split("\n", 2)[2] if out.count("\n") >= 2 else ""
+    try:
+        facts = json.loads(body[body.find("["):]) if "[" in body else None
+    except ValueError:
+        facts = None
+    if facts is None:
+        r["anomalies"].append(f"exit code {rc}: facts.py output not JSON; log tail:\n{tail(out, 15)}")
+        facts = []
+    for f in facts:
+        for x in f["findings"]:
+            if x["level"] == "error":
+                r["failures"].append({"id": f["id"], "kind": "fact", "location": x["where"] or None,
+                                      "message": x["msg"], "assertion": "", "traceback": "", "time_s": None})
+            elif x["level"] == "warn":
+                r["anomalies"].append(f"{f['id']}: {x['where'] + ': ' if x['where'] else ''}{x['msg']}")
+    st = [f["status"] for f in facts]
+    r["counts"] = {"facts": len(facts), "ok": st.count("ok"), "failed": st.count("fail"),
+                   "warned": st.count("warn"), "skipped": st.count("skipped")}
+    ucmd = [py, "-m", "unittest", str(FACTS / "test_facts.py")]
+    rc2, dt2, out2 = run(ucmd, REPO, out_dir / "facts_selftest.log", 300)
+    m = re.search(r"Ran (\d+) tests?", out2)
+    r["counts"]["self_tests"] = int(m.group(1)) if m else 0
+    if rc2 != 0:
+        r["failures"].append({"id": "test_facts.py", "kind": "self_test", "location": "tools/facts/test_facts.py",
+                              "message": f"exit {rc2}", "assertion": "", "traceback": tail(out2, 30),
+                              "time_s": None})
+    r.update(exit_code=rc if rc2 == 0 else rc2, duration_s=round(dt + dt2, 1), log=str(out_dir / "facts.log"))
+    return r
+
+
 # ---- ctest ------------------------------------------------------------------ #
 
 def run_csim(a, out_dir: Path, bls: dict) -> dict:
@@ -459,7 +507,7 @@ def run_rtl(a, out_dir: Path, bls: dict) -> dict:
 
 RUNNERS = {"scheduler": lambda a, o, b: run_pytest("scheduler", a, o, b),
            "chat": lambda a, o, b: run_pytest("chat", a, o, b),
-           "lint": run_lint, "csim": run_csim, "tts-host": run_tts_host, "rtl": run_rtl}
+           "lint": run_lint, "facts": run_facts, "csim": run_csim, "tts-host": run_tts_host, "rtl": run_rtl}
 
 
 def classify_warnings(r: dict, bl: dict) -> None:

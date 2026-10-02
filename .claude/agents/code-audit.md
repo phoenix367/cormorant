@@ -54,6 +54,17 @@ edits.  Report what you would fix in the same lists, with
 - **Record the starting state** — `git status --porcelain` and
   `git diff --stat` — so your report can separate your edits from changes
   that were already there.
+- **Run the fact registry first**: `python3 tools/facts/facts.py changed`
+  (or `check` for a whole subsystem).  It checks the registered facts —
+  counts, register maps, supported ops, event kinds, CLI and script flags,
+  HTTP routes, ctypes bindings, config keys, the platform JSON, pool sizes,
+  board results — against code and docs, and `impact FILE` names a file's
+  counterparts.  Report its failures under the matching section; a
+  `fix: auto` mention may be fixed with `facts.py fix ID` even in a `.md`.
+  When you find the same fact stale or inconsistent in two places that the
+  registry does not cover, add `registry_candidates` to your report (the
+  fact, where it is true, where it is repeated) — `tools/facts/README.md`
+  "Adding a fact".
 
 ## Helper scripts
 

@@ -1,0 +1,22 @@
+#!/bin/sh
+# git pre-commit hook: check the facts of facts.yaml that the staged files
+# touch (every fact when facts.yaml or tools/facts/ is staged) and refuse the
+# commit when one fails.  tools/facts/README.md "Pre-commit hook".
+#
+#   install:        python3 tools/facts/facts.py install-hook
+#   skip once:      git commit --no-verify      (or FACTS_SKIP=1 git commit)
+#   every fact:     FACTS_HOOK=all git commit
+#   interpreter:    FACTS_PYTHON, else the scheduler venv, else python3 (needs PyYAML)
+[ -n "$FACTS_SKIP" ] && exit 0
+root=$(git rev-parse --show-toplevel) || exit 0
+py=${FACTS_PYTHON:-$root/inference-scheduler/.venv/bin/python}
+[ -x "$py" ] || command -v "$py" >/dev/null 2>&1 || py=python3
+if ! "$py" -c "import yaml" 2>/dev/null; then
+    echo "facts: $py has no PyYAML; fact check skipped" \
+         "(inference-scheduler/.venv/bin/pip install -r inference-scheduler/requirements.txt)" >&2
+    exit 0
+fi
+if [ "$FACTS_HOOK" = all ]; then
+    exec "$py" "$root/tools/facts/facts.py" check
+fi
+exec "$py" "$root/tools/facts/facts.py" changed --staged --quiet

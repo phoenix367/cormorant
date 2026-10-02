@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1621 tests); the chat app (188 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1625 tests); the chat app (188 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -25,7 +25,7 @@ ask for the `run-tests` subagent (`.claude/agents/run-tests.md`): it runs the
 helper and reads the report.
 
 ```bash
-python3 .claude/agents/run-tests/run_tests.py --suite default    # scheduler + chat pytest, ruff (~5 min)
+python3 .claude/agents/run-tests/run_tests.py --suite default    # scheduler + chat pytest, ruff, facts (~5 min)
 python3 .claude/agents/run-tests/run_tests.py --suite all        # + csim (make + ctest), tts-host (~9 min)
 python3 .claude/agents/run-tests/run_tests.py --suite scheduler --tests test/test_piper.py
 python3 .claude/agents/run-tests/run_tests.py --list             # suites and baselines
@@ -38,6 +38,14 @@ python3 .claude/agents/run-tests/run_tests.py --list             # suites and ba
   `.claude/agents/run-tests/baselines.json`: fewer tests than the baseline,
   a skip not listed there, a run under 40 % of its usual time, no tests
   collected, an odd exit code.
+- **The `facts` suite** checks `facts.yaml`, the facts that code and docs
+  repeat (test counts, register maps, supported ops, CLI and script flags,
+  HTTP routes, ctypes bindings, config keys, pool sizes, board results), with
+  `tools/facts/facts.py`
+  ([README](../../tools/facts/README.md)).  Run it alone with
+  `python3 tools/facts/facts.py check`; `fix` rewrites stale counts.
+  `python3 tools/facts/facts.py install-hook` makes every `git commit`
+  check the facts its staged files touch (a pre-commit hook).
 - **Where things go.**  Logs, JUnit XML and `report.json` are written to
   `$CLAUDE_JOB_DIR/tmp/run-tests-<time>/` (or `/tmp/run-tests-<uid>-<time>/`).
 - **The baselines.**  After adding tests,
@@ -57,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1621 tests in 75 modules (all pass, none skipped; the first run
+# Run all 1625 tests in 75 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
