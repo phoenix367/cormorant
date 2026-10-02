@@ -8,7 +8,9 @@ on a time axis.
             lanes (spans as flat [t0, t1, node, kind] lists), a node table
             (name, op, class, lane, µs, price source exact / model /
             unpriced, kernel calls, output shape, predecessors, inputs as
-            [shape, tensor, is weight])
+            [shape, tensor, is weight], and every kernel call: kernel, count,
+            register values (names in the page's "fields", from
+            src/perf_calls.FIELDS), µs per call and its price source)
   render    ``render_html()`` embeds the entries as JSON in a page that draws
             them on a canvas: it binary-searches the visible window of each
             lane and merges spans narrower than a pixel into one bar, so a
@@ -60,7 +62,21 @@ def _inputs(sn) -> list:
     return out
 
 
-def _price_source(sn, layouts, pm, hm, unpriced: set) -> str:
+def _kernel_calls(sn, layouts, keys_of=None) -> list:
+    """The node's KernelCalls (src/perf_calls.py), as the simulation priced
+    them (a runtime-keys attention call at ``keys_of(sn)`` keys); [] for a
+    host op or when they cannot be listed."""
+    if not hasattr(sn, "kernel_calls"):
+        return []
+    try:
+        if keys_of is not None and getattr(sn, "static", True) is False:
+            return list(sn.kernel_calls(layouts, keys=keys_of(sn)))
+        return list(sn.kernel_calls(layouts))
+    except Exception:                                      # noqa: BLE001 — informational only
+        return []
+
+
+def _price_source(sn, calls, pm, hm, unpriced: set) -> str:
     """exact (measured on the board) / model (a fitted family or kind) /
     mixed / unpriced / "" (no model given)."""
     if sn.index in unpriced:
@@ -69,24 +85,22 @@ def _price_source(sn, layouts, pm, hm, unpriced: set) -> str:
         if getattr(type(sn), "kernel_name", "") == "" and hm is not None:
             p = hm.predict(sn)
             return "unpriced" if p is None else p[1]
-        if hasattr(sn, "kernel_calls") and pm is not None:
-            srcs = set()
-            for c in sn.kernel_calls(layouts):
-                p = pm.predict(c)
-                srcs.add("unpriced" if p is None else p[1])
-            if not srcs:
-                return ""
+        if calls and pm is not None:
+            srcs = {("unpriced" if p is None else p[1]) for p in (pm.predict(c) for c in calls)}
             return srcs.pop() if len(srcs) == 1 else "mixed"
     except Exception:                                      # noqa: BLE001 — informational only
         return ""
     return ""
 
 
-def _calls(sn, layouts) -> int:
-    try:
-        return int(sum(c.count for c in sn.kernel_calls(layouts))) if hasattr(sn, "kernel_calls") else 0
-    except Exception:                                      # noqa: BLE001
-        return 0
+def _call_rows(calls, pm) -> list:
+    """[[kernel, count, [register values], µs per call or None, exact / model / unpriced / ""]]."""
+    rows = []
+    for c in calls:
+        p = pm.predict(c) if pm is not None else None
+        rows.append([c.kernel, int(c.count), [int(v) for v in c.regs],
+                     round(p[0], 3) if p else None, (p[1] if p else ("unpriced" if pm is not None else ""))])
+    return rows
 
 
 def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Optional[float] = None,
@@ -94,6 +108,7 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
     """One entry of the page: the simulation ``tl`` of ``cg`` (run here from
     ``pm`` / ``hm`` when not given), its lanes, node table and dependencies."""
     graph = cg._graph
+    keys_of = keys_of or getattr(tl, "keys_of", None)
     if tl is None:
         tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us if hm else (lambda sn: None))
     by = {sn.index: sn for sn in graph.nodes}
@@ -126,11 +141,12 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
     for idx in used:
         sn = by[idx]
         onnx = getattr(sn, "onnx_node", None)
+        calls = _kernel_calls(sn, cg._layouts, keys_of)
         nodes.append([idx, (onnx.name if onnx is not None and onnx.name else type(sn).__name__),
                       onnx.op_type if onnx is not None else "", type(sn).__name__,
                       cg._kernel_id_of(sn) or "CPU", round(dur.get(idx, 0.0), 3),
-                      _price_source(sn, cg._layouts, pm, hm, unpriced), _calls(sn, cg._layouts),
-                      _shape(sn), preds.get(idx, []), _inputs(sn)])
+                      _price_source(sn, calls, pm, hm, unpriced), sum(c.count for c in calls),
+                      _shape(sn), preds.get(idx, []), _inputs(sn), _call_rows(calls, pm)])
     lanes = []
     present = {s[0] for s in tl.spans}
     for lane in [ln for ln in LANE_ORDER if ln in present] + sorted(present - set(LANE_ORDER)):
@@ -146,8 +162,9 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
 
 
 def render_html(entries: Iterable[dict], title: str, subtitle: str = "") -> str:
+    from .perf_calls import FIELDS
     data = {"title": title, "subtitle": subtitle, "generated": time.strftime("%Y-%m-%d %H:%M"),
-            "kinds": list(KINDS), "entries": list(entries)}
+            "kinds": list(KINDS), "fields": {k: list(v) for k, v in FIELDS.items()}, "entries": list(entries)}
     blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
     return (_PAGE.replace("__TITLE__", html.escape(title))
                  .replace("__DATA__", blob))
@@ -211,6 +228,9 @@ table{border-collapse:collapse;width:100%}td,th{padding:2px 6px;text-align:left;
 th{color:var(--dim);font-weight:500}td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
 tr.link{cursor:pointer}tr.link:hover td{background:var(--panel2)}
 .kv{display:grid;grid-template-columns:max-content 1fr;gap:1px 12px}.kv .k{color:var(--dim)}
+.call{margin:0 0 6px}.call>.h{cursor:help}.call .dimt{color:var(--dim)}
+.regs{display:flex;flex-wrap:wrap;gap:1px 14px;margin-top:2px;font-variant-numeric:tabular-nums}
+.reg{white-space:nowrap}.reg .k{color:var(--dim)}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
 .pill{display:inline-block;padding:0 6px;border-radius:9px;border:1px solid var(--border);color:var(--dim);cursor:help}
 .exact{color:var(--accent);border-color:var(--accent)}.model{color:var(--sync);border-color:var(--sync)}
@@ -520,6 +540,23 @@ const SRC_HINT = {
   mixed: "mixed: some of the node's kernel calls were measured on the board, the others are estimated by a fitted model.",
   unpriced: "unpriced: outside the performance model (no measurement, no fitted model covers it); counted as 0 in the prediction."};
 function srcPill(s){ return s ? `<span class="pill ${esc(s)}" title="${esc(SRC_HINT[s] || s)}">${esc(s)}</span>` : ""; }
+const DECODE = {
+  VectorOPKernel: {op: ["add", "sub", "mul", "div", "relu", "relu6"], act: ["none", "relu", "relu6"]},
+  PoolKernel: {pool_type: ["max", "avg", "Lp"], count_include_pad: ["no", "yes"]},
+  ConvKernel: {has_bias: ["no", "yes"], is_dw: ["no", "yes"]},
+  MatmulKernel: {b_packed: ["no", "yes"]}};
+function callsHtml(calls){
+  const shown = calls.slice(0, 12);
+  return shown.map(([kernel, count, regs, us, src]) => {
+    const names = (D.fields && D.fields[kernel]) || regs.map((_, j) => "r" + j);
+    const key = kernel + ":" + regs.join(",");
+    const regsH = names.map((nm, j) => { const v = regs[j], dec = DECODE[kernel] && DECODE[kernel][nm] && DECODE[kernel][nm][v];
+      return `<span class="reg"><span class="k">${esc(nm)}</span> ${v}${dec !== undefined ? ` <span class="k">(${esc(dec)})</span>` : ""}</span>`; }).join("");
+    return `<div class="call"><span class="h" title="performance-model key: ${esc(key)}"><b>${esc(kernel)}</b> × ${count}`
+      + (us !== null && us !== undefined ? ` <span class="dimt">· ${fmt(us)} per call${count > 1 ? ", " + fmt(us * count) + " in all" : ""}</span>` : "")
+      + `</span> ${srcPill(src)}<div class="regs">${regsH}</div></div>`; }).join("")
+    + (calls.length > shown.length ? `<div class="dimt">+ ${calls.length - shown.length} more distinct calls</div>` : "");
+}
 function nodeLink(i){ const n = E.nodes[i]; return `<a class="nl" data-n="${i}">${esc(n[1])}</a>`; }
 function showSel(){
   const box = $("sel");
@@ -533,7 +570,8 @@ function showSel(){
     <span class="k">op / class</span><span>${esc(n[2] || "—")} · ${esc(n[3])}</span>
     <span class="k">lane</span><span>${esc(n[4])}</span>
     <span class="k">duration</span><span><b>${fmt(n[5])}</b> (${(100 * n[5] / (E.total_us || 1)).toFixed(2)} % of the run) ${srcPill(n[6])}</span>
-    ${n[7] ? `<span class="k">kernel calls</span><span>${n[7]}</span>` : ""}
+    ${(n[11] || []).length ? `<span class="k">kernel calls</span><span>${n[7]} in all${n[11].length > 1 ? ", " + n[11].length + " distinct" : ""}${callsHtml(n[11])}</span>`
+      : n[7] ? `<span class="k">kernel calls</span><span>${n[7]}</span>` : ""}
     ${(n[10] || []).length ? `<span class="k">inputs</span><span>${n[10].map(([sh, nm, w]) =>
       `<span class="mono">${esc(sh || "?")}</span> <span class="k">${w ? "weight · " : ""}${esc(nm)}</span>`).join("<br>")}</span>` : ""}
     ${n[8] ? `<span class="k">output</span><span class="mono">${esc(n[8])}</span>` : ""}

@@ -102,11 +102,17 @@ class TestPageData(unittest.TestCase):
             for i in range(0, len(L["s"]), 4):
                 end[L["s"][i + 2]] = max(end.get(L["s"][i + 2], 0.0), L["s"][i + 1])
         for k, node in enumerate(e["nodes"]):
-            idx, name, op, cls, lane, dur, src, calls, shape, preds, inputs = node
+            idx, name, op, cls, lane, dur, src, calls, shape, preds, inputs, call_rows = node
             self.assertTrue(name and cls and lane)
             sn = next(s for s in g.nodes if s.index == idx)
             self.assertEqual([i[0] for i in inputs], ["x".join(map(str, t.shape)) for t in sn.inputs if t is not None])
             self.assertTrue(all(len(i) == 3 and i[2] in (0, 1) for i in inputs))
+            from src.perf_calls import FIELDS
+            want = list(sn.kernel_calls(cg._layouts)) if hasattr(sn, "kernel_calls") else []
+            self.assertEqual([(r[0], r[1], tuple(r[2])) for r in call_rows],
+                             [(c.kernel, c.count, c.regs) for c in want])
+            self.assertEqual(calls, sum(c.count for c in want))
+            self.assertTrue(all(len(r[2]) == len(FIELDS[r[0]]) for r in call_rows))
             for p in preds:                       # an input is ready before its consumer starts
                 self.assertTrue(0 <= p < n and p != k)
                 self.assertLessEqual(end[p], start[k] + 1e-6)
@@ -122,6 +128,8 @@ class TestPageData(unittest.TestCase):
         self.assertEqual(d["title"], "T <&>")
         self.assertIn("<title>T &lt;&amp;&gt;</title>", text)
         self.assertEqual(d["kinds"], list(KINDS))
+        from src.perf_calls import FIELDS
+        self.assertEqual(d["fields"], {k: list(v) for k, v in FIELDS.items()})
 
     @unittest.skipUnless(shutil.which("node"), "Node.js not installed")
     def test_javascript_parses(self):

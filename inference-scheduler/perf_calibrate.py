@@ -802,7 +802,7 @@ def cmd_simulate(args) -> int:
             def keys_of(sn):
                 return attn_keys(pos0, n if n is not None else sn.T, sn.T, sn.C, sn.Q)[1]
             tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us)
-            tl.cg = cg
+            tl.cg, tl.keys_of = cg, keys_of            # for --html: the calls as priced
             return tl
         tag = f"{model}{' plan' if planned else ''}"
         if "vision" in cgs and b.get("images"):

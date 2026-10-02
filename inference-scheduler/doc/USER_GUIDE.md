@@ -902,9 +902,15 @@ browser.
   - drag on the ruler to measure a range, then Z to zoom to it;
   - the overview strip on top shows the whole run and the visible window.
 - **Selection.**  Click a node to see its time, whether the price was
-  measured (`exact`) or fitted (`model`), its kernel calls, its input
-  shapes and tensors (weights marked), its output shape, and arrows to its
-  inputs and consumers. Double-click zooms to it.
+  measured (`exact`) or fitted (`model`), its input shapes and tensors
+  (weights marked), its output shape, and arrows to its inputs and
+  consumers.
+  - **Kernel calls:** every distinct call with its count, its predicted µs
+    per call and its price source.
+  - **Registers:** each call's register values (strides, padding, flags,
+    opcodes …), with codes decoded, e.g. `op 4 (relu)`,
+    `pool_type 0 (max)`.  These are the fields of `src/perf_calls.FIELDS`,
+    and hovering a call shows its performance-model key. Double-click zooms to it.
 - **Search:** `/` searches names, ops and classes.
 - **The details panel.**  Drag the divider above it to resize it;
   double-click the divider to collapse or restore it. The page remembers
