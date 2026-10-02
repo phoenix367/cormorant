@@ -12,7 +12,7 @@ Plan and design decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.
 
 ![chat.py greets you with the CORMORANT banner, the server and the model](../../doc/images/chat_banner.png)
 
-▶ **[Demo video](https://youtu.be/h8YjXGi_ThY)** (1 min): `chat.py` on a laptop, SmolLM2-360M on the
+▶ **[Demo video](https://youtu.be/VVS7ExW0XYQ)** (1 min): `chat.py` on a laptop, SmolLM2-360M on the
 board, a three-question conversation that the model remembers.
 
 ## What it serves

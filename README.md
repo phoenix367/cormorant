@@ -15,8 +15,8 @@ simulation.  An OpenAI-compatible server on the board serves the chat,
 image and speech models.
 
 <p align="center">
-  <a href="https://youtu.be/h8YjXGi_ThY"><img src="doc/images/chat_demo_thumbnail.png" alt="Video: an LLM chat running on the Kria KV260 FPGA" width="560"/></a><br/>
-  <em>▶ <a href="https://youtu.be/h8YjXGi_ThY">Watch the demo</a> (1 min): SmolLM2-360M chatting on the KV260, and remembering the conversation</em>
+  <a href="https://youtu.be/VVS7ExW0XYQ"><img src="doc/images/chat_demo_thumbnail.png" alt="Video: an LLM chat running on the Kria KV260 FPGA" width="560"/></a><br/>
+  <em>▶ <a href="https://youtu.be/VVS7ExW0XYQ">Watch the demo</a> (1 min): SmolLM2-360M chatting on the KV260, and remembering the conversation</em>
 </p>
 
 > **About this fork.**  This repository is an independent fork of Cormorant.
@@ -38,7 +38,7 @@ KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-09-26 to
 | MNIST convnet / LeNet | 0.268 / 2.810 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
 | BERT-base SQuAD (bertsquad-12, 256 tokens) | **962 ms** per inference (p50; 951 ms built with `--plan`), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
 | SmolLM2-135M-Instruct | **10.07 tokens/s** decode (7.67 at 1000 cached tokens), 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md) |
-| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/h8YjXGi_ThY) |
+| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.3 at 1000 cached tokens), 256-token prefill 2.90 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) |
 | SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.7 s** per 1.49 s of audio (real-time factor 0.52), text encoder 68 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end; listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [samples](demo/tts/README.md#samples) |
 
