@@ -175,8 +175,9 @@ so the slot is always large enough for whichever tensor occupies it at runtime.
 `gemm_chain.onnx` is a two-layer fully-connected network (two `Gemm`s,
 `X[1,32]` → 16 → `Y[1,8]`):
 
-```
-X ──► MatMul0 ──► Add0 ──► MatMul1 ──► Add1 ──► Y
+```mermaid
+flowchart LR
+    X(["X"]) --> mm0["MatMul0"] --> a0["Add0"] --> mm1["MatMul1"] --> a1["Add1"] --> Y(["Y"])
 ```
 
 After Gemm decomposition the scheduler sees four nodes (indices 0–3):
@@ -408,15 +409,11 @@ Figures below use the library defaults (`OnnxGraph()`; the CLI's
 space-to-depth stem rewrite adds one intermediate and leaves the two slots
 unchanged).
 
-```
-input [N×3×224×224]
-  │
-  ▼
-Conv2d_0  ──Relu6──►  DWConv2d_1  ──Relu6──►  PWConv2d_1  ──Relu6──►
-  ▼
-DWConv2d_2  ──Relu6──►  PWConv2d_2  ──Relu6──►  …  (13 DW-sep blocks)
-  ▼
-AvgPool 7×7  ──►  Conv2d_logits  ──►  Reshape + Squeeze  ──►  output [N×1001]
+```mermaid
+flowchart LR
+    in(["input<br/>[N×3×224×224]"]) --> c0["Conv2d_0"]
+    c0 -- Relu6 --> blocks["<b>13 depthwise-separable blocks</b><br/>DWConv2d_i → Relu6 → PWConv2d_i → Relu6"]
+    blocks --> pool["AvgPool 7×7"] --> logits["Conv2d_logits"] --> rs["Reshape + Squeeze"] --> out(["output<br/>[N×1001]"])
 ```
 
 | Property | Value |

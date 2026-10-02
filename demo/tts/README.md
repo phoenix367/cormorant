@@ -12,14 +12,28 @@ Plan, study and results: [`doc/plans/TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md).
 - §6: the text encoder on the FPGA.
 - §7: the duration predictor in C.
 
-```
- text ──espeak-ng──▶ phoneme ids ──libpiper_tts.so tts_encode──▶ x, m_p, logs_p ──numpy (float64)──▶ z_p [192][frames]
-                     (piper_phonemize)   text encoder on the FPGA           duration predictor (C:    │
-                                         (encode_<T>: MatMuls + attention   tts_duration), alignment, │ chunks of
-                                         on ConvKernel, host ops)           noise (numpy)             │ 128 frames
-                                                                                                      ▼
-                     libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel (66 convs per chunk)
-                     + host ops (LeakyReLU / masks / folding, gates, sums, interleave)  ──▶ int16 PCM, 22 050 Hz
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 330}}}%%
+flowchart TB
+    text(["text"])
+    fe["<b>Front end</b> · Arm cores<br/>espeak-ng via piper_phonemize"]
+    enc["<b>Text encoder</b> · FPGA<br/>libpiper_tts.so tts_encode<br/>encode_#lt;T#gt;: MatMuls + attention on ConvKernel, host ops"]
+    dur["<b>Durations, alignment, noise</b> · Arm cores<br/>duration predictor in C (tts_duration)<br/>alignment and noise in numpy (float64)"]
+    dec["<b>Flow + HiFi-GAN</b> · FPGA, per chunk of 128 frames<br/>libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel, 66 convs per chunk<br/>host ops: LeakyReLU, masks, folding, gates, sums, interleave"]
+    pcm(["int16 PCM, 22 050 Hz"])
+
+    text --> fe
+    fe -- "phoneme ids" --> enc
+    enc -- "x, m_p, logs_p" --> dur
+    dur -- "z_p [192][frames]" --> dec
+    dec --> pcm
+
+    classDef fpga fill:#14532d,stroke:#4ade80,color:#ffffff
+    classDef arm fill:#1e3a8a,stroke:#93c5fd,color:#ffffff
+    classDef io fill:#f4f4f5,stroke:#71717a,color:#18181b
+    class enc,dec fpga
+    class fe,dur arm
+    class text,pcm io
 ```
 
 ## Results (2026-09-30)

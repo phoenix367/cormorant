@@ -295,17 +295,24 @@ buffer / stride gap (`test/test_act_fusion.py::TestAlignmentContract`).
 
 ### Key data flow
 
-```
-model.onnx  →  OnnxGraph  →  Dag  →  CodeGenerator  →  C project
-                                          │
-                       ┌──────────────────┼──────────────────┐
-                       │                  │                  │
-                  event stream      tensor layout         emit:
-                  (Start/Wait      (alloc sizes,         run_*()      Start kernel
-                   per node)        strides,             kernel_wait  Block on lane
-                                    pool slots from
-                                    event-stream
-                                    liveness intervals)
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 300}}}%%
+flowchart LR
+    m(["model.onnx"]) --> og["OnnxGraph"] --> dag["Dag"] --> ev
+    subgraph cg["CodeGenerator"]
+        ev["<b>event stream</b><br/>Start / Wait per node"]
+        lay["<b>tensor layout</b><br/>alloc sizes, strides, pool slots<br/>from event-stream liveness intervals"]
+        em["<b>emit</b><br/>run_*(): start a kernel<br/>kernel_wait: block on a lane"]
+        ev --> lay
+        ev --> em
+        lay --> em
+    end
+    em --> c(["C project"])
+
+    classDef stage fill:#1e3a8a,stroke:#93c5fd,color:#ffffff
+    classDef io fill:#f4f4f5,stroke:#71717a,color:#18181b
+    class og,dag,ev,lay,em stage
+    class m,c io
 ```
 
 ### Parallel kernel execution

@@ -542,10 +542,10 @@ must preserve.
 
 ### 7.2 `parallel_two_chains.onnx` — the bug that motivated event-stream liveness
 
-```
-       Conv ─ Relu ─ Pool ──┐
-   X ──┤                    ├── Add → Y
-       Conv ─ Relu  ────────┘
+```mermaid
+flowchart LR
+    X(["X"]) --> convA["convA"] -- ca0 --> reluA["reluA"] -- ca1 --> poolA["poolA"] -- ca2 --> join["Add"] --> Y(["Y"])
+    X --> convB["convB"] -- cb0 --> reluB["reluB"] -- cb1 --> join
 ```
 
 Old node-index liveness gave `ca1` (read by Pool) the interval

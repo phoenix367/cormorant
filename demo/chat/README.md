@@ -34,32 +34,39 @@ board, a three-question conversation that the model remembers.
 - **No FPGA needed for testing.**  An `echo` backend and fake models serve
   the protocol anywhere ([Deploying](doc/DEPLOY.md#without-the-fpga)).
 
-```
- laptop / board shell                          KV260 (Ubuntu 22.04, Python 3.10 stdlib)
- ┌──────────────────────┐  HTTP, OpenAI API   ┌─────────────────────────────────────────────┐
- │ chat.py · curl       │ ──────────────────▶ │ kv260_chat_server.py  /v1/models            │
- │ openai SDK · llm     │ ◀── JSON / SSE ──── │   /v1/chat/completions  /v1/audio/speech    │
- │ aichat               │                     │   FIFO: one request on the FPGA at a time   │
- └──────────────────────┘                     │ bert_squad_backend.py  (squad_text.py:      │
-                                              │   WordPiece, sliding windows, best span)    │
-                                              │ smollm2_backend.py  (chatml.py, BPE         │
-                                              │   tokenizer, prefix cache, libsampler.so)   │
-                                              │ smolvlm_backend.py  (idefics3.py, images)   │
-                                              │ piper_backend.py  (espeak-ng phonemes,      │
-                                              │   alignment, noise)                         │
-                                              │        │ ctypes                             │
-                                              │ lib/libbert_squad.so  (bert_api.c + the     │
-                                              │   generated BERT project, weights in CMA)   │
-                                              │ lib/libsmollm2.so  (llm_api.c + the         │
-                                              │   generated SmolLM2 project, CMA weights)   │
-                                              │ lib/libsmolvlm_256m.so  (llm_api.c + the    │
-                                              │   generated SmolVLM project, CMA weights)   │
-                                              │ lib/libpiper_tts.so  (tts_api.c + the       │
-                                              │   generated Piper encoder and chunk, the    │
-                                              │   duration predictor in C, CMA weights)     │
-                                              │        │ XRT / UIO                          │
-                                              │ ConvKernel · MatmulKernel · VectorOPKernel  │
-                                              └─────────────────────────────────────────────┘
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 300}}}%%
+flowchart LR
+    clients["<b>Clients</b> · laptop or board shell<br/>chat.py · curl · openai SDK<br/>llm · aichat"]
+    subgraph board["KV260 · Ubuntu 22.04 · Python 3.10 standard library"]
+        server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech<br/>FIFO: one request on the FPGA at a time"]
+        bert["<b>bert_squad_backend.py</b><br/>squad_text.py: WordPiece,<br/>sliding windows, best span"]
+        llm["<b>smollm2_backend.py</b><br/>chatml.py, BPE tokenizer,<br/>prefix cache, libsampler.so"]
+        vlm["<b>smolvlm_backend.py</b><br/>idefics3.py, images"]
+        tts["<b>piper_backend.py</b><br/>espeak-ng phonemes,<br/>alignment, noise"]
+        libbert["lib/libbert_squad.so<br/>bert_api.c + the generated<br/>BERT project"]
+        libllm["lib/libsmollm2.so, libsmollm2_360m.so<br/>llm_api.c + the generated<br/>SmolLM2 projects"]
+        libvlm["lib/libsmolvlm_256m.so<br/>llm_api.c + the generated<br/>SmolVLM project"]
+        libtts["lib/libpiper_tts.so<br/>tts_api.c + the generated Piper<br/>encoder and chunk, the duration<br/>predictor in C"]
+        fpga["<b>FPGA</b><br/>ConvKernel · MatmulKernel<br/>VectorOPKernel<br/>weights in CMA"]
+    end
+    clients -- "HTTP, OpenAI API" --> server
+    server -. "JSON / SSE" .-> clients
+    server --> bert & llm & vlm & tts
+    bert -- ctypes --> libbert
+    llm -- ctypes --> libllm
+    vlm -- ctypes --> libvlm
+    tts -- ctypes --> libtts
+    libbert & libllm & libvlm & libtts -- "XRT / UIO" --> fpga
+
+    classDef py fill:#1e3a8a,stroke:#93c5fd,color:#ffffff
+    classDef lib fill:#3f3f46,stroke:#a1a1aa,color:#ffffff
+    classDef hw fill:#14532d,stroke:#4ade80,color:#ffffff
+    classDef ext fill:#f4f4f5,stroke:#71717a,color:#18181b
+    class server,bert,llm,vlm,tts py
+    class libbert,libllm,libvlm,libtts lib
+    class fpga hw
+    class clients ext
 ```
 
 ## Quick start

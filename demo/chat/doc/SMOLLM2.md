@@ -204,10 +204,30 @@ are refused at startup.
 
 ## How a request runs
 
-```
-messages ─► chatml.py (template, trim) ─► smollm2_tokenizer.py (BPE, block cache)      prepare(): no FPGA
-          ─► prefix cache: llm_truncate(common prefix) + llm_prefill(new tokens only)  generate(): FPGA lock
-          ─► per token: llm_decode ─► sampler (libsampler.so) ─► incremental detokenizer ─► stop strings ─► SSE
+```mermaid
+%%{init: {"flowchart": {"wrappingWidth": 300}}}%%
+flowchart LR
+    msg(["messages"])
+    subgraph prepare["prepare() · no FPGA"]
+        tpl["chatml.py<br/>template, trim"] --> tok["smollm2_tokenizer.py<br/>BPE, block cache"]
+    end
+    subgraph generate["generate() · under the FPGA lock"]
+        pre["prefix cache<br/>llm_truncate(common prefix)<br/>llm_prefill(new tokens only)"]
+        dec["llm_decode"] --> smp["sampler<br/>libsampler.so"] --> detok["incremental<br/>detokenizer"] --> stop["stop strings"]
+        pre --> dec
+        stop -. "next token" .-> dec
+    end
+    sse(["SSE"])
+    msg --> tpl
+    tok --> pre
+    stop --> sse
+
+    classDef fpga fill:#14532d,stroke:#4ade80,color:#ffffff
+    classDef host fill:#1e3a8a,stroke:#93c5fd,color:#ffffff
+    classDef io fill:#f4f4f5,stroke:#71717a,color:#18181b
+    class pre,dec fpga
+    class tpl,tok,smp,detok,stop host
+    class msg,sse io
 ```
 
 1. **Prepare, outside the FPGA lock.**  The messages are rendered with the

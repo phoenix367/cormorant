@@ -652,6 +652,7 @@ facts:
     - {file: CLAUDE.md, regex: '(?P<out_frames>\d+) frames = (?P<seconds>[\d.]+) s of audio per pass'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'chunks of (?P<out_frames>\d+) frames \((?P<seconds>[\d.]+) s of speech\)'}
     - {file: demo/tts/README.md, regex: 'about 0\.7 s per (?P<seconds>[\d.]+) s chunk'}
+    - {file: demo/tts/README.md, regex: 'FPGA, per chunk of (?P<out_frames>\d+) frames'}       # the mermaid diagram
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'pcm, (?P<dec_frames>\d+) × 256 int16 samples'}
 
 # ── build and test entry points ─────────────────────────────────────────────
