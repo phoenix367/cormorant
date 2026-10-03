@@ -22,10 +22,14 @@ project(axi_kernels)
 #   make TestConvRef      — ConvKernel
 #   make TestMatmulRef    — MatmulKernel   (TestMatmulBlas if BLAS available)
 #   make TestPoolingSim   — PoolingKernel
+#   make TestMatmulRtl    — MatmulKernel in SystemVerilog (kernels/matmul_rtl,
+#                           Verilator)
 #
 # HLS synthesis + IP export targets (requires Vitis):
-#   make synthesize_<platform>              — all four kernels
+#   make synthesize_<platform>              — all four kernels (the MatmulKernel
+#                                             of AXI_MATMUL_IMPL)
 #   make synthesize_<kernel>_<platform>     — individual kernel
+#   make package_matmul_rtl                 — the RTL MatmulKernel IP (Vivado)
 #
 # Platform definitions live in platforms/*.json (shared by all kernels).
 # ---------------------------------------------------------------------------
@@ -71,6 +75,18 @@ add_subdirectory(kernels/vectorop)
 add_subdirectory(kernels/conv)
 add_subdirectory(kernels/matmul)
 add_subdirectory(kernels/pool)
+add_subdirectory(kernels/matmul_rtl)
+
+# Which MatmulKernel IP the hardware build uses: the Vitis HLS export
+# (kernels/matmul) or the SystemVerilog one (kernels/matmul_rtl).  Both have
+# the VLNV xilinx.com:hls:MatmulKernel:1.0 and the same register map; the RTL
+# IP's gmem2 is 128-bit (the block-design instance must say so).
+set(AXI_MATMUL_IMPL "hls" CACHE STRING "MatmulKernel IP in the hardware build: hls or rtl")
+set_property(CACHE AXI_MATMUL_IMPL PROPERTY STRINGS hls rtl)
+if(NOT AXI_MATMUL_IMPL MATCHES "^(hls|rtl)$")
+    message(FATAL_ERROR "axi_kernels: AXI_MATMUL_IMPL must be hls or rtl, not '${AXI_MATMUL_IMPL}'")
+endif()
+message(STATUS "axi_kernels: MatmulKernel IP = ${AXI_MATMUL_IMPL} (AXI_MATMUL_IMPL)")
 
 # ---------------------------------------------------------------------------
 # run_tests — build every C-simulation test executable, then run ctest.
@@ -85,6 +101,9 @@ set(_AXI_TEST_TARGETS
 )
 if(TARGET TestMatmulBlas)
     list(APPEND _AXI_TEST_TARGETS TestMatmulBlas)
+endif()
+if(TARGET TestMatmulRtl)
+    list(APPEND _AXI_TEST_TARGETS TestMatmulRtl)
 endif()
 
 add_custom_target(run_tests
@@ -114,13 +133,18 @@ endif()
 foreach(_PF IN LISTS AXI_PLATFORM_FILES)
     get_filename_component(_pname "${_PF}" NAME_WE)
 
+    if(AXI_MATMUL_IMPL STREQUAL "rtl")
+        set(_matmul_ip_target package_matmul_rtl)
+    else()
+        set(_matmul_ip_target "synthesize_matmul_${_pname}")
+    endif()
     add_custom_target("synthesize_${_pname}"
         DEPENDS
             "synthesize_vectorop_${_pname}"
             "synthesize_conv_${_pname}"
-            "synthesize_matmul_${_pname}"
+            "${_matmul_ip_target}"
             "synthesize_pool_${_pname}"
-        COMMENT "HLS synthesis: all kernels for platform '${_pname}'"
+        COMMENT "HLS synthesis: all kernels for platform '${_pname}' (MatmulKernel: ${AXI_MATMUL_IMPL})"
     )
     message(STATUS "axi_kernels: aggregate target 'synthesize_${_pname}'")
 
@@ -174,19 +198,47 @@ endforeach()
 # ---------------------------------------------------------------------------
 set(_HW_REPO "${CMAKE_SOURCE_DIR}/hw/cormorant_hw_128")
 if(EXISTS "${_HW_REPO}/build.sh")
+    # The IP repository Vivado scans.  With the HLS MatmulKernel it is the
+    # whole kernels/ build tree (the RTL IP is packaged outside it, in
+    # rtl_ip/).  With the RTL one it is ip_repo_kv260/, which links only the
+    # three HLS exports and the RTL IP: both MatmulKernel IPs have the same
+    # VLNV, so the HLS export (if built here) must stay out.
+    if(AXI_MATMUL_IMPL STREQUAL "rtl")
+        set(_HW_IP_REPO "${CMAKE_BINARY_DIR}/ip_repo_kv260")
+        set(_HW_K "${CMAKE_BINARY_DIR}/kernels")
+        add_custom_target(ip_repo_kv260
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_HW_IP_REPO}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${_HW_IP_REPO}"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                    "${_HW_K}/vectorop/kv260/vadd_kv260/solution1/impl/ip" "${_HW_IP_REPO}/vectorop"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                    "${_HW_K}/conv/kv260/conv_kv260/hls/impl/ip" "${_HW_IP_REPO}/conv"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                    "${_HW_K}/pool/kv260/pool_kv260/hls/impl/ip" "${_HW_IP_REPO}/pool"
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                    "${CMAKE_BINARY_DIR}/rtl_ip/MatmulKernel_ip" "${_HW_IP_REPO}/matmul"
+            COMMENT "IP repository for the KV260 build: three HLS kernels + the RTL MatmulKernel"
+            VERBATIM)
+        set(_HW_IP_REPO_DEP ip_repo_kv260)
+    else()
+        set(_HW_IP_REPO "${CMAKE_BINARY_DIR}/kernels")
+        set(_HW_IP_REPO_DEP "")
+    endif()
+
     add_custom_target(build_hw_kv260
         COMMAND bash "${_HW_REPO}/build.sh" all
-                -ip-repo "${CMAKE_BINARY_DIR}/kernels"
+                -ip-repo "${_HW_IP_REPO}"
         WORKING_DIRECTORY "${_HW_REPO}"
-        DEPENDS synthesize_kv260
+        DEPENDS synthesize_kv260 ${_HW_IP_REPO_DEP}
         COMMENT "Vivado: synthesis + implementation + bitstream (KV260 128-bit)"
     )
     message(STATUS "axi_kernels: target 'build_hw_kv260' (depends on synthesize_kv260)")
 
     add_custom_target(sim_hw_kv260
         COMMAND bash "${_HW_REPO}/sim.sh"
-                -ip-repo "${CMAKE_BINARY_DIR}/kernels"
+                -ip-repo "${_HW_IP_REPO}"
         WORKING_DIRECTORY "${_HW_REPO}"
+        DEPENDS ${_HW_IP_REPO_DEP}
         COMMENT "Vivado: behavioral simulation (KV260)"
     )
     message(STATUS "axi_kernels: target 'sim_hw_kv260'")

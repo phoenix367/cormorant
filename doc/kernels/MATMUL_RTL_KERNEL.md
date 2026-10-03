@@ -1,0 +1,459 @@
+# MatmulKernel in SystemVerilog (RTL)
+
+A SystemVerilog Q8.8 GEMM / GEMV engine for the Kria KV260
+(`kernels/matmul_rtl/`).  It replaces the Vitis HLS MatmulKernel
+([MATMUL_KERNEL](MATMUL_KERNEL.md), `kernels/matmul/`) without any change on
+the software side: the same IP name (VLNV `xilinx.com:hls:MatmulKernel:1.0`),
+the same AXI-Lite register map and driver API, the same DDR layouts and
+bit-identical results.  The one deliberate interface change is the C port
+(`m_axi_gmem2`): 128 bits instead of 32.
+
+It does 128 MAC/cycle on GEMM (the HLS kernel: 32) and 16 on GEMV (port-bound,
+as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
+([Resources and timing](#resources-and-timing)).
+
+**Status (2026-10-04):** imported into the repository with its Verilator
+testbench, the C driver and the IP packaging (phase 0 of the integration).
+It passes the 50 HLS-oracle fixtures and thousands of random cases in
+Verilator, and the test stand's block design in xsim; it has **not** run on
+the board yet.  The hardware build still uses the HLS kernel by default
+(`AXI_MATMUL_IMPL=hls`); the next phases are the bitstream with this IP
+(gmem2 widened to 128 in `cormorant_hw_128`), the board validation, then the
+retirement of the HLS kernel's synthesis (its C++ reference `ref_matmul_2d`
+stays: it writes the fixtures every RTL test checks against).
+
+Contents: [Building and testing](#building-and-testing) ·
+[Software driver](#software-driver) · [Interface contract](#interface-contract) ·
+[Architecture](#architecture) · [Performance](#performance) ·
+[Resources and timing](#resources-and-timing) ·
+[Verification status](#verification-status) · [Source files](#source-files) ·
+[Limits](#limits-and-not-yet-done)
+
+## Building and testing
+
+The kernel is part of the top-level CMake project (see
+[BUILD_TARGETS](../build-and-test/BUILD_TARGETS.md)); every target exists only
+when its tool is found (Verilator 5.x: `sudo apt install verilator`;
+Vivado 2025.2).
+
+```bash
+cd build && cmake ..
+make TestMatmulRtl        # Verilator testbench (kernels/matmul_rtl/vl/Vtb)
+ctest -R MatmulRtl        # TestMatmulRtl: 50 fixtures + 200 random cases (~50 s);
+                          # MatmulRtlDriver: the driver's register table vs the RTL
+make lint_matmul_rtl      # verilator --lint-only -Wall (waivers: scripts/lint_waivers.vlt)
+make perf_matmul_rtl      # cycle counts / MAC per cycle of typical shapes (ideal memory)
+make package_matmul_rtl   # Vivado IP -> build/rtl_ip/MatmulKernel_ip (+ .zip), ~20 s
+make synth_matmul_rtl     # Vivado OOC synthesis + P&R -> kernels/matmul_rtl/synth/*.rpt
+make xsim_matmul_rtl      # xvlog / xelab parse and elaboration
+make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP, xsim (~4 min)
+```
+
+| CMake cache variable | Default | Meaning |
+|---|---|---|
+| `AXI_MATMUL_IMPL` | `hls` | Which MatmulKernel IP `synthesize_kv260` / `build_hw_kv260` use: `hls` (the Vitis export) or `rtl` (`package_matmul_rtl`; Vivado then scans `build/ip_repo_kv260/`, which links the three HLS kernels and this IP — both MatmulKernel IPs have the same VLNV) |
+| `MM_RTL_FIXTURES` | `hw/test_data/matmul_test_data` | Fixtures `TestMatmulRtl` checks (`make gen_matmul_test_data` rewrites them from `ref_matmul_2d`) |
+| `MM_RTL_RANDOM_CASES` | 200 | Random cases after the fixtures in `TestMatmulRtl` |
+| `MM_RTL_PERIOD` | 3.333 | `synth_matmul_rtl` clock period in ns (300 MHz) |
+
+The IP is packaged outside `build/kernels/` on purpose: with
+`AXI_MATMUL_IMPL=hls` the hardware build scans that whole tree as its IP
+repository.
+
+**Testbench** (`build/kernels/matmul_rtl/vl/Vtb`, `tb/verilator/tb_main.cpp`):
+
+```bash
+Vtb --fixtures DIR [--timing rand|fast|slow]      # manifest.txt + test_NN_{a,b,c}.hex
+Vtb --random N --seed S [--timing ...]            # constrained-random cases
+Vtb --case "n k m batch as bs cs packed kw [data_mode]"   # one case, e.g. "4 16 8 1 64 128 32 0 0"
+Vtb --perf                                        # the shapes of the performance table
+# also: --max-cycles N, --quiet, --trace FILE
+```
+
+It exits non-zero if any case fails; a `FATAL` line is an AXI protocol or
+handshake violation.  For waveforms build `make matmul_rtl_tb_fst` (then
+`vlt/Vtb --case "..." --trace F.fst`) or `make matmul_rtl_tb_vcd` (then
+`vcd/Vtb --case "..." --trace F.vcd`).  Without a waveform viewer, query a VCD
+with `python3 kernels/matmul_rtl/scripts/vcdq.py F.vcd table T0 T1 <regex>...`
+(times are 2 per cycle; `hist` and `at` show value changes and the values at
+a time).
+
+After changing `mm_core`'s ports or parameters, regenerate the Verilog top
+level: `python3 kernels/matmul_rtl/scripts/gen_top_wrapper.py` (run it in
+`kernels/matmul_rtl/`).
+
+## Software driver
+
+`scripts/gen_driver.py` writes the C driver into the build tree
+(`build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/`) and
+`package_matmul_rtl` packages it into the IP, where Vivado and the Vitis BSP
+flows find it as they find the HLS export's (`drivers/MatmulKernel_v1_0/`:
+`src/xmatmulkernel{.h,_hw.h,.c,_linux.c,_sinit.c}`, `data/*.mdd|tcl|yaml`).
+Its API and register traffic are those of the HLS-generated `xmatmulkernel`
+(`XMatmulkernel_Initialize` / `_Release` / `_Start` / `_IsDone` /
+`_Set_<arg>` / `_Get_<arg>` / interrupt calls, Linux UIO and bare-metal back
+ends), so the inference scheduler's generated projects, the benchmarks and
+`calib_runner` build against either IP unchanged.  The register table in
+`gen_driver.py` is the one place the offsets are written down for C:
+
+- `ctest -R MatmulRtlDriver` (`gen_driver.py --check`) compares it with the
+  address constants of `rtl/mm_ctrl_s_axi.sv`;
+- `gen_driver.py --check --hls-driver <HLS export>/drivers/MatmulKernel_v1_0`
+  also compares the offsets and the function prototypes with the HLS driver;
+- the `registers.MatmulKernel` fact (`facts.yaml`) runs the first check and
+  compares the register names with the HLS kernel's `s_axilite` ports.
+
+## Interface contract
+
+The external interface (ports, register map, DDR layouts, arithmetic) matches
+the HLS kernel exactly; everything inside the IP may change.
+
+### Top-level ports
+
+- **Module and IP:** module `MatmulKernel`, packaged as VLNV
+  `xilinx.com:hls:MatmulKernel:1.0` by `syn/package_ip.tcl`, which reproduces
+  the HLS bus-interface names, the `Data_m_axi_gmem*` address spaces (16E,
+  64-bit) and the 64 KiB `s_axi_ctrl` block `Reg`.  The width parameters are
+  read-only: the block-design instance parameters must equal the IP defaults.
+- **Clock and reset:** `ap_clk`, and `ap_rst_n` (active-low, registered
+  internally).  `interrupt` is a level output, active-high.
+- **`s_axi_ctrl`:** AXI4-Lite with an 8-bit address and 32-bit data.
+- **`m_axi_gmem0` / `m_axi_gmem1`:** read-only, 128-bit.  **Both ports read A
+  and B**: port p streams lane p's K blocks and loads half the A panel, so in
+  the block design both masters must reach every DDR buffer (the HLS GEMV path
+  already read B through gmem0).  `a_to_b` is accepted and ignored.
+- **`m_axi_gmem2` (C):** write-only, **128-bit** data with a 16-bit `WSTRB` —
+  the deliberate change: the HLS export and the `MatmulKernel_0` instance of
+  `cormorant_hw_128` and the test stand are 32-bit on this port, so the
+  instance's `C_M_AXI_GMEM2_DATA_WIDTH` must become 128 when this IP replaces
+  the HLS one (`sysim_matmul_rtl` does it with `upgrade_ip` on a copy).
+- **All three `m_axi` ports:** the full AXI4 signal set, 64-bit addresses, ID
+  width 1, every `*USER` width 1, `CACHE` = 3, `PROT` = 0.  Unused directions
+  stay present and are tied off.
+
+### Register map (`s_axi_ctrl`)
+
+Identical to the HLS `ap_ctrl_hs` block; `rtl/mm_ctrl_s_axi.sv` mirrors the
+HLS-generated `MatmulKernel_ctrl_s_axi.v`.
+
+| Off | Reg | Off | Reg |
+|---|---|---|---|
+| 0x00 | ctrl: b0 ap_start (R/W, cleared on handshake), b1 ap_done (COR), b2 ap_idle, b3 ap_ready (COR), b7 auto_restart, b9 interrupt | 0x44 | m |
+| 0x04 | GIE b0 | 0x4C | batch |
+| 0x08 | IER: b0 done, b1 ready | 0x54 | a_batch_stride |
+| 0x0C | ISR: b0 done, b1 ready (toggle-on-write) | 0x5C | b_batch_stride |
+| 0x10/0x14 | a lo/hi (64-bit byte address) | 0x64 | c_batch_stride |
+| 0x1C/0x20 | b lo/hi | 0x6C | b_packed |
+| 0x28/0x2C | c lo/hi | 0x74 | gemv_kw |
+| 0x34 | n | 0x7C/0x80 | a_to_b lo/hi (signed 64-bit) |
+| 0x3C | k | | |
+
+- **Interrupt:** an ISR bit latches only when its IER bit is set and the
+  event fires; `interrupt` is registered as `GIE & |ISR`.
+- **Argument latching:** arguments are latched at ap_start, so the host may
+  reprogram registers during a run.
+- **Board check:** the HLS kernel once shipped a stale control block without
+  anyone noticing, so verify new registers on the board with a write-then-read.
+
+### Operation semantics
+
+For each `bi < batch`, the kernel computes `C_bi[n×m] = A_bi[n×k] × B_bi[k×m]`.
+Every matrix starts at its base address plus `bi * *_batch_stride`
+**elements**; a stride of 0 broadcasts that operand.
+
+- **A:** row-major.  Rows can start at any 16-bit lane.
+- **C:** row-major `n×m`.
+- **B, `b_packed = 0`:** row-major `k×m`.
+- **B, `b_packed = 1`:** tile-major,
+  `B_packed[(mt*k + kk)*32 + m1] = B[kk][mt*32 + m1]`, with m padded to a
+  multiple of 32 and `b_batch_stride` counted in packed elements.  The 32 is a
+  DDR-layout constant (the scheduler emits it), unrelated to the internal tiling.
+- **B, `gemv_kw ∈ {1,2,4,8}`:** the ConvKernel image
+  `img[(c*m + p)*kw + j] = B[(c/16)*16*kw + j*16 + c%16][p]`.  `b_packed` is
+  ignored and `kw = 1` is plain row-major.  The caller guarantees `k % 8 == 0`
+  (`k % (16*kw) == 0` for kw > 1), `m % 8 == 0`, `m*kw >= 64` and strides that
+  are multiples of 8; the RTL itself needs only the k divisibility, which the
+  image layout requires.  Any other `gemv_kw` value is treated as 0.
+- **Limits:** `k ≤ 4096`; a larger k is clamped (the job completes, C is
+  undefined).  n = 0, m = 0 or batch = 0 finish at once; k = 0 writes zeros.
+- **Addressing:** the contract says `a` and `b` are 16-byte aligned; the RTL
+  also handles 2-byte-aligned bases, and the tests exercise them.  Reads may
+  over-read the words around a run (buffers are padded).  **C writes touch
+  only output elements.**
+- **Write strobes:** each C run (a whole panel when the chunk spans all m
+  columns, else one row) goes out as bursts of up to 64 beats, with partial
+  strobes only on its first and last beat.  The KV260 PS was seen dropping
+  beats of single-beat partial-strobe writes (`kernels/matmul/scripts/Synthesis.tcl.in`,
+  2026-09-24) — a board check of phase 2.
+
+### Arithmetic (bit-exact with `ref_matmul_2d` and the fixtures)
+
+- **Data:** `Data_t = ap_fixed<16,8>` (Q8.8, two's complement, `1.0 = 0x0100`).
+- **Products:** Q8.8 × Q8.8 is exact in 32 bits (Q16.16).
+- **Accumulator:** `ap_fixed<32,16>`, **wrapping modulo 2³²** (AP_WRAP).
+  Because the adds are modular, the K split across lanes, the kw-tap reduction
+  and any accumulation order give the same bits.
+- **Output:** `saturate(acc >>> 8)` to `[-32768, 32767]`: AP_TRN (floor) then
+  AP_SAT (`ap_fixed<16,8,AP_TRN,AP_SAT>`), applied once after the full K
+  reduction, in `mm_drain`.
+- **DSP48E2:** `mm_mac` keeps only the low 32 bits of the 48-bit P register;
+  saturating from 48 bits would diverge whenever the 32-bit sum wraps.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    ctrl(["s_axi_ctrl"]) --> csr["mm_ctrl_s_axi"] --> fsm["job FSM (mm_core)"] --> walker["mm_walker"] --> steps["step FIFOs ×3"]
+    steps --> rg0["mm_rungen (port 0)"]
+    steps --> rg1["mm_rungen (port 1)"]
+    steps --> drain["mm_drain"]
+    subgraph P0 ["read port 0"]
+        rg0 -- runs --> rd0["mm_axi_rd"]
+        rg0 --> gb0["mm_gearbox"]
+        rd0 -- words --> gb0
+        gb0 -- A beats --> awr0["mm_awr"]
+    end
+    subgraph P1 ["read port 1"]
+        rg1 -- runs --> rd1["mm_axi_rd"]
+        rg1 --> gb1["mm_gearbox"]
+        rd1 -- words --> gb1
+        gb1 -- A beats --> awr1["mm_awr"]
+    end
+    rd0 <--> gm0(["m_axi_gmem0"])
+    rd1 <--> gm1(["m_axi_gmem1"])
+    awr0 --> abuf["mm_abuf<br/>A panel, 2 lanes × 8 rows"]
+    awr1 --> abuf
+    abuf --> xpf0["mm_xpf (lane 0)"] -- taps --> lane0["mm_lane 0<br/>8 × 8 MAC"]
+    abuf --> xpf1["mm_xpf (lane 1)"] -- taps --> lane1["mm_lane 1<br/>8 × 8 MAC"]
+    gb0 -- B beats --> lane0
+    gb1 -- B beats --> lane1
+    lane0 -- accumulators --> drain
+    lane1 -- accumulators --> drain
+    drain --> packer["mm_packer"] --> wr["mm_axi_wr"] --> gm2(["m_axi_gmem2"])
+```
+
+### Data flow
+
+A job computes, for every batch slice, `C = A × B` with A `n×k` (row-major),
+B `k×m` in one of three layouts, and C `n×m` (row-major).  The job is cut into
+**steps**:
+
+```
+for batch slice bi:                    (element strides; stride 0 = broadcast)
+  for panel of R = 8 rows of A:        (A panel held on chip, per lane)
+    for column chunk (≤ 512 elements of a B row):
+       step:  both lanes stream their half of K for the chunk and accumulate;
+              then the drain adds the two lanes and writes the chunk of C
+```
+
+Each step streams B **once** per panel.  Every 128-bit B beat (8 elements) is
+multiplied by all 8 panel rows at once, so each lane does 64 MAC/cycle and
+the kernel does 128 MAC/cycle.  A B element is reused R = 8 times per fetch;
+see *Performance*.
+
+#### K split between the lanes (column-aligned access)
+
+K is divided into blocks of 16 *planes* (a plane is one B row, or for the
+GEMV image one group of `kw` taps).  Block b belongs to lane `b % 2`, and
+lane p reads its blocks through read port p.  The two ports therefore stream
+**neighbouring** regions of the same B matrix, not two far-apart halves.
+This is the column-aligned access idea of Hummingbird (FPGA '25/'26): ports
+that hit the same DRAM row and bank arbitrate far better on the Zynq PS DDR
+controller.  The two lanes' partial sums are added by the drain.  All adds
+wrap modulo 2³², so the split is bit-exact.
+
+#### Run descriptors
+
+`mm_rungen` turns each step into **runs**.  A run is one contiguous element
+range of `rows` rows of `len` elements.
+
+| run | rows × len | when |
+|---|---|---|
+| A | (panel rows of this port) × k | first chunk of a panel, unless A is reused (a_stride == 0, n ≤ 8) |
+| B, packed | 16 × 32 | one per (32-column tile, K block) of the chunk; a chunk is 16 tiles |
+| B, image, one chunk | 16 × (m << lk) | one per K block, when `m << lk ≤ 512` (row-major B = image with kw = 1) |
+| B, image, chunked | 1 × (mcc << lk) | one per plane, for wide B |
+| marker | 0 | keeps the per-panel / per-step bookkeeping uniform when a port has nothing to do |
+
+Each run goes to three queues:
+
+- **Read engine (`mm_axi_rd`):** takes the word range, splits it into ≤64-beat INCR bursts without 4 KiB crossings, and issues each burst only when its FIFO has room for it (credit), so RREADY is always 1.
+- **Gearbox (`mm_gearbox`):** re-aligns the word stream into row-aligned beats. It uses a two-word window and an 8-way lane rotate, and a lookahead descriptor keeps back-to-back runs bubble-free. A and B element addresses may therefore start at any lane. Beyond the contract, even A/B bases that are only 2-byte aligned work.
+- **x prefetcher (`mm_xpf`):** receives B runs only.
+
+#### A panel and taps
+
+`mm_awr` writes a port's A rows into `mm_abuf`, which holds one 128-bit × 256
+BRAM per (lane, panel row): 32 BRAM36 in total.  Each beat is routed to the
+lane that owns its K block.  `mm_xpf` reads the A values each B row needs and
+assembles a **tap set** `tap[l][r]` into a LUTRAM FIFO:
+
+- **Row-major and packed B:** every lane uses `A[r][kk]`.
+- **GEMV image:** beat lane `l` uses tap `l % kw` of plane c, at lane-local K index `((c>>4)<<(4+lk)) | (j<<4) | (c&15)`, the inverse of `matmul_gemv_k`.
+
+#### MAC lane
+
+`mm_lane` holds 8 rows × 8 beat lanes of `mm_mac` (one DSP48E2 each):
+
+```
+beat[l] ─► AREG ─┐
+tap[l][r] ─► BREG (loaded at the row's first beat, held for the row)
+                 ├► MREG = A·B ─┐
+acc[w] (LUTRAM) ─► CREG (0 on the run's first row) ─► PREG = C + M ─► acc[w]
+```
+
+- **Accumulators:** each MAC owns `ACC_D = 64` 32-bit accumulators in LUTRAM, one per beat of a plane chunk. The accumulation happens in the DSP post-adder, so there is no fabric adder per MAC.
+- **Minimum row length:** the read → CREG → PREG → write loop is `DMIN = 3` cycles. A row shorter than 3 beats (tiny m) gets bubbles.
+- **GEMV kernel width:** with kw > 1, each MAC accumulates a single tap. The drain sums the kw lanes of a column, and this reduction is also exact.
+
+#### Drain and output
+
+After both lanes finish a step, `mm_drain` reads each valid row's
+accumulator words from both lanes in lockstep and computes:
+
+- `sum = lane0 + lane1`
+- the kw-tap reduction (a 3-level tree, selected by lk)
+- `C = sat16(sum >>> 8)`: floor, then clamp to Q8.8
+
+The results go to `mm_packer`, which turns the element stream of a C run into
+128-bit beats.  Only the first and last beat of a run carry partial strobes,
+and a run is a whole panel (`n_valid × m` elements) whenever the chunk spans
+all columns.  `mm_axi_wr` stores whole bursts before issuing their AW, and
+the job completes only after every B response has arrived.
+
+### Synchronisation
+
+Units run decoupled, in the style of access/execute, and hand off through
+monotonic counters:
+
+| counter | owner | meaning | waited on by |
+|---|---|---|---|
+| `awr_cnt[p]` | A writer p | panels whose A rows port p has written | x prefetchers (panel start) |
+| `xpf_cnt[h]` | x prefetcher h | panels whose A reads lane h has issued | A writers (single A buffer) |
+| `cmp_cnt[h]` | lane h | steps lane h has finished (pipeline flushed) | drain |
+| `drn_cnt` | drain | steps whose accumulators have been read | lanes (next step) |
+
+The read engines run ahead of the counters; only their FIFO space bounds how
+far.  Each port's gearbox output is consumed strictly in stream order: the A
+beats of panel p, then the B beats of its steps, then the A beats of panel
+p+1.  No consumer waits on data that sits behind its own head, so the scheme
+cannot deadlock.  A new job resets every unit (`job_start`).
+
+## Performance
+
+Verilator with ideal memory (`make perf_matmul_rtl`):
+
+| shape | MAC/cycle | bound |
+|---|---|---|
+| GEMV 1×576×1536, kw 1 | 15.9 | 2 ports × 8 elements/cycle = 16 |
+| GEMV 1×1536×576, kw 4 / 1×512×1536, kw 8 | 15.8 / 15.4 | 16 |
+| GEMV 4×576×1536 (4 A rows share one B pass) | 62.6 | 64 |
+| FC 1×4096×512, row-major | 15.9 | 16 |
+| GEMM 64×576×576, packed / row-major | 123 | 128 |
+| GEMM 128×256×2048, packed | 120 | 128 |
+| GEMM 256×64×64 (A reload per 8 rows dominates) | 98 | 128 |
+
+The HLS kernel reaches ≤ 32 MAC/cycle on its tiled path and ≤ 16 on GEMV,
+where it loops over A rows.  Per panel the kernel moves `8·k` A elements and
+`k·m` B elements through two 128-bit ports.  Steady-state GEMM is therefore
+compute-bound at 128 MAC/cycle when m ≥ ~64, and single-row GEMV is
+port-bound at 16.
+
+## Resources and timing
+
+xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
+
+| | RTL kernel (post-route) | HLS kernel in `cormorant_hw_128` |
+|---|---|---|
+| LUT (of which LUTRAM) | 18.4 k (6.9 k) | 26.8 k (0.1 k) |
+| FF | 9.5 k | 27.0 k |
+| BRAM36 | 38 (32 A panel, 6 FIFOs) | 44 |
+| URAM | 0 | 8 |
+| DSP48E2 | 128 (the MACs only) | 128 |
+| peak MAC/cycle | 128 (GEMM), 16 (GEMV, port-bound) | 32 (tiled), 16 (GEMV) |
+
+Timing is checked at 300 MHz.  Fmax is ≈ 297 MHz: 3 endpoints miss by at
+most 31 ps, all once-per-step address updates in the walker and run
+generator.  The current block design runs at 100 MHz, with 150 MHz planned.  Nearly every per-cycle decision was moved off long paths:
+
+- **Barrier counter compares:** registered, and computed against each counter's *next* value so they can only open late, never early.
+- **Burst length and credit checks:** registered in both AXI engines.
+- **Run generator:** a second output stage, and shift/add element counts instead of a general multiply.
+- **Drain:** the kw reduction tree takes two stages.
+
+## Verification status
+
+- **Unit level (Verilator, `TestMatmulRtl` in ctest):**
+  - All 50 HLS-oracle fixtures (`hw/test_data/matmul_test_data`, written by `make gen_matmul_test_data`) pass bit-exact: 39 tiled plus 11 GEMV-image cases.  ctest runs them plus 200 random cases (seed 1).
+  - Several thousand constrained-random cases pass across every mode. They cover strides and broadcasts, misaligned A/B/C bases, bases above 4 GiB, k up to 4096, and full-range data that wraps the accumulator.
+  - Memory timing is randomised, and reset state is randomised (`+verilator+rand+reset+2`).
+  - The AXI protocol is checked, including that nothing outside C is written.
+- **System level (`make sysim_matmul_rtl`):**
+  - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
+  - It passes 50 of 50 fixtures.
+- **Not yet done:** a bitstream and a board run in `cormorant_hw_128`, whose `MatmulKernel_0` gmem2 width still has to be set to 128 (phases 1 and 2).
+
+## Source files
+
+All in `kernels/matmul_rtl/`; read [Architecture](#architecture) before
+changing the RTL.
+
+- **Top level:** `rtl/MatmulKernel.v` is a GENERATED Verilog-2001 top (the
+  exact HLS port and parameter list, `scripts/gen_top_wrapper.py`) around
+  `rtl/mm_core.sv`, which holds the control FSM, the per-port instances and
+  the AXI tie-offs.  `rtl/mm_pkg.sv` has the shared constants.
+- **Descriptor flow:** `mm_walker` walks (batch slice → panel of R = 8 A rows
+  → column chunk ≤ 512) and emits steps; `mm_rungen` (one per port) turns each
+  step into runs (A rows, B blocks / tiles / planes, or markers); `mm_axi_rd`
+  issues the read bursts; `mm_gearbox` realigns words into row-aligned beats.
+- **Compute:** `mm_awr` → `mm_abuf` hold the A panel (32 BRAM36); `mm_xpf`
+  builds per-row tap sets; `mm_lane` is 64 × `mm_mac` (DSP48E2, P = C + A·B),
+  each with a 64 × 32-bit LUTRAM accumulator.
+- **Output:** `mm_drain` computes lane0 + lane1, reduces the kw taps and
+  saturates; `mm_packer` builds strobed 128-bit beats; `mm_axi_wr` stores
+  whole bursts before AW and waits for the B responses.  `mm_ctrl_s_axi` is
+  the HLS-compatible AXI-Lite block; `mm_fifo` the LUTRAM / BRAM FIFOs.
+- **Verification and tooling:** `tb/verilator/tb_main.cpp` + `axi_models.h`
+  (testbench), `scripts/lint_waivers.vlt`, `scripts/gen_driver.py` (C driver),
+  `scripts/vcdq.py` (VCD queries), `syn/rtl_files.tcl` (the source list of the
+  Vivado scripts), `syn/package_ip.tcl`, `syn/synth_ooc.tcl`, `syn/sysim.tcl`.
+  The CMake source list in `CMakeLists.txt` has the same order.
+
+**Invariants that are easy to break:**
+
+- **Lane assignment:** K is split in interleaved blocks of 16 planes (block
+  b → lane b % 2), and both read ports load A: port p loads panel rows
+  [4p, 4p + 4).  The A writer's lane / word mapping, the x prefetcher's
+  K-index formula and the run generator must agree.
+- **Handshake counters:** units synchronise only through `awr_cnt`,
+  `xpf_cnt`, `cmp_cnt` and `drn_cnt` ([Synchronisation](#synchronisation)).  A
+  panel is announced one cycle *after* its last A write lands (a race here
+  broke k = 1 once).  Every panel and step must produce exactly one A run or
+  marker per port and at least one B run or marker per lane.
+- **Accumulator distance:** `DMIN = 3` is the LUTRAM → CREG → PREG → LUTRAM
+  loop.  `mm_lane` inserts bubbles for rows shorter than that; any register
+  added in that loop must raise `DMIN`.
+- **BRAM FIFO skid:** `mm_fifo`'s BRAM variant needs its 3-entry skid to
+  sustain one pop per cycle (with 2 entries every stream ran at 2/3 rate).
+- **lk shift arithmetic:** widen `lk` before adding (`{2'b0, lk} + 4'd1`); a
+  2-bit `lk + 1` overflows at kw = 8.
+- **Timing:** Fmax is ≈ 297 MHz, so keep new logic off long combinational
+  handshake paths; register decisions against a counter's *next* value (see
+  `mm_awr`, `mm_xpf`, `mm_lane` and the AXI engines).
+
+**Toolchain:** Verilator 5.020 is the main simulator (it renames the
+`interrupt` port to `__SYM__interrupt` in the C++ model); Vivado 2025.2 for
+packaging, synthesis and xsim.
+
+**Background:** "Hummingbird+" (FPGA '26, doi 10.1145/3748173.3779189); the
+technical details are in its predecessor, arXiv 2507.03308.  Used here:
+AXPY-style accumulation in the DSP post-adder with the activation held in BREG
+for a whole B row, and column-aligned DDR access through interleaved K blocks
+per port.  Not used: segmented PCIN / PCOUT cascade chains — there is no adder
+tree in the MAC path, and a column's kw taps are reduced once in the drain.
+
+## Limits and not-yet-done
+
+- **k > 4096:** out of contract. k is clamped internally, so the job completes but C is undefined.
+- **Serial A load per panel:** A is single-buffered and shares the port with B. Small-k GEMMs (e.g. 256×64×64) spend ~20 % of their time reloading A. A second A bank would not help while A and B share a port; widening the effective A load (both ports per row) would.
+- **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; 150 MHz is the plan).

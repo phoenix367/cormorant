@@ -5,8 +5,9 @@ Each plugin is ``fn(args, ctx) -> [(level, message, where)]`` with level
 error | warn | info; facts.py turns them into the fact's findings.
 
   register_map     a kernel's AXI-Lite registers: the HLS s_axilite ports, the
-                   generated driver header (when built), the performance-model
-                   key (src/perf_calls.FIELDS), the timeline's decoder table and
+                   generated driver header (when built), an RTL kernel's driver
+                   table (its --check --json), the performance-model key
+                   (src/perf_calls.FIELDS), the timeline's decoder table and
                    every C file that writes them through the driver
   cli_flags        a script's argparse flags (its --help usage) against the
                    option lists of its docs
@@ -66,6 +67,28 @@ def register_map(args: dict, ctx) -> List[Finding]:
                                  f"{sorted(regs - P)}, only in HLS {sorted(P - regs)} (re-export the IP)", h))
     if args.get("driver") and not headers:
         out.append(("info", f"no driver header built here ({args['driver']})", ""))
+
+    # an RTL implementation of the kernel: its driver generator's register table,
+    # which the generator itself checks against the RTL address constants
+    if args.get("rtl_driver"):
+        rel = args["rtl_driver"]
+        rtl = f" --rtl {args['rtl']}" if args.get("rtl") else ""
+        r = json.loads(ctx.run(f"{{python}} {rel} --check --json{rtl}"))
+        regs = r["registers"]
+        for e in r["errors"]:
+            out.append(("error", f"driver table vs the RTL: {e}", rel))
+        if set(regs) != P:
+            out.append(("error", f"RTL driver registers differ from the HLS ports: only in the RTL driver "
+                                 f"{sorted(set(regs) - P)}, only in HLS {sorted(P - set(regs))}", rel))
+        for h in headers:
+            offs = {n.lower(): int(v, 16) for n, v in
+                    re.findall(r"#define \w+_CTRL_ADDR_(\w+)_DATA\s+(0x[0-9a-fA-F]+)", ctx.read(h))}
+            diff = sorted(n for n in set(regs) & set(offs) if offs[n] != regs[n]["offset"])
+            if diff:                        # a local build artifact: warn, as above
+                out.append(("warn", f"RTL driver offsets differ from this HLS driver for {', '.join(diff)} "
+                                     f"(re-export the HLS IP, or fix the RTL)", h))
+        if not r["errors"]:
+            out.append(("info", f"RTL driver table: {len(regs)} registers, offsets as in the RTL", rel))
 
     # the performance-model key
     fields = args["fields"] if "fields" in args else \

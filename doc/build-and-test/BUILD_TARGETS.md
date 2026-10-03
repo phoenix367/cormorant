@@ -20,6 +20,7 @@ Key configure-time cache variables:
 | `AXI_PLATFORM` | `kv260` | Platform whose `platforms/<name>.json` bounds drive the C-sim `Config.h` |
 | `VA_DATA_TYPE`, `CONV_DATA_TYPE` / `CONV_ACC_DATA_TYPE`, `MM_DATA_TYPE` / `MM_ACC_DATA_TYPE`, `POOL_DATA_TYPE` / `POOL_ACC_DATA_TYPE` | `ap_fixed<16,8>` / `ap_fixed<32,16>` | Element / accumulator types. Tile sizes and bounds are not cache variables — they come from the platform JSON ([PLATFORM_CONFIGURATION.md](PLATFORM_CONFIGURATION.md)) |
 | `VA_ENABLE_VITIS_FLOW` | `OFF` | VectorOPKernel Vitis `hw` / `hw_emu` xclbin targets (needs an installed Vitis platform, `VA_PLATFORM`) |
+| `AXI_MATMUL_IMPL` | `hls` | The MatmulKernel IP of `synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260`: `hls` (the Vitis export) or `rtl` (the SystemVerilog kernel, [below](#rtl-matmulkernel-systemverilog)) |
 
 Synthesis / cosim / hardware targets require **Vitis 2025.2** — source
 `<Xilinx>/2025.2/Vitis/settings64.sh` (it puts `vitis-run`, `vivado` and
@@ -65,15 +66,17 @@ no hardware.
 | `TestMatmulRef` | MatmulKernel | Kernel vs the `ref_matmul_2d` / `ref_matmul_batch` oracle, all shape cases |
 | `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolingSim` | PoolingKernel | Max/Average/Lp pooling + global variants |
+| `TestMatmulRtl` | MatmulKernel (RTL) | Verilator testbench of the SystemVerilog kernel; the CTest test runs the 50 checked-in fixtures + 200 random cases (~50 s) — only if Verilator 5.x is found ([below](#rtl-matmulkernel-systemverilog)) |
 
 | Aggregate | Description |
 |-----------|-------------|
-| `run_tests` | Builds `TestSimulation`, `TestConvRef`, `TestMatmulRef`, `TestPoolingSim` (and `TestMatmulBlas` when present), then runs `ctest --output-on-failure` |
+| `run_tests` | Builds `TestSimulation`, `TestConvRef`, `TestMatmulRef`, `TestPoolingSim` (and `TestMatmulBlas`, `TestMatmulRtl` when present), then runs `ctest --output-on-failure` |
 | `test` | Runs the CTest tests without rebuilding (equivalent to `ctest`) |
 
-CTest registers seven tests: `TestSimulation`, `TestConvRef`,
+CTest registers nine tests: `TestSimulation`, `TestConvRef`,
 `TestConvGrid`, `TestConvSweep`, `TestMatmulRef`, `TestMatmulBlas` (only
-with BLAS) and `TestPoolingSim`. `run_tests` does not list `TestConvGrid`
+with BLAS), `TestPoolingSim`, `MatmulRtlDriver` and `TestMatmulRtl` (only
+with Verilator). `run_tests` does not list `TestConvGrid`
 as a dependency — build it with `make` / `make TestConvGrid` first.
 
 ---
@@ -95,7 +98,7 @@ VectorOPKernel (legacy `open_project` flow).
 | `synthesize_conv_kv260` | Synthesize ConvKernel for the KV260 |
 | `synthesize_matmul_kv260` | Synthesize MatmulKernel for the KV260 |
 | `synthesize_pool_kv260` | Synthesize PoolingKernel for the KV260 |
-| `synthesize_kv260` | Aggregate — all four kernels |
+| `synthesize_kv260` | Aggregate — all four kernels (MatmulKernel: `package_matmul_rtl` instead when `AXI_MATMUL_IMPL=rtl`) |
 
 A `synthesize_<kernel>_<platform>` target is generated for every
 `platforms/<platform>.json` file.  The targets always re-run: each starts
@@ -118,6 +121,33 @@ Vitis HLS.
 | `cosim_pool_kv260` | Cosim PoolingKernel against `TestPoolingSim.cpp` |
 
 (VectorOPKernel has no cosim target.)
+
+---
+
+## RTL MatmulKernel (SystemVerilog)
+
+The SystemVerilog drop-in for the HLS MatmulKernel, `kernels/matmul_rtl/`
+([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)).  Each target exists
+only when its tool is found: Verilator 5.x (`sudo apt install verilator`) for
+the testbench and lint, Vivado for the rest.
+
+| Target | Description |
+|--------|-------------|
+| `TestMatmulRtl` | Verilator testbench `build/kernels/matmul_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random cases |
+| `lint_matmul_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
+| `perf_matmul_rtl` | Cycle counts / MAC per cycle of typical shapes (ideal memory) |
+| `matmul_rtl_tb_fst` / `matmul_rtl_tb_vcd` | The testbench with FST / VCD tracing (`vlt/Vtb`, `vcd/Vtb`; `--case "..." --trace FILE`) |
+| `driver_matmul_rtl` | The C driver (`scripts/gen_driver.py`, the HLS driver's API) → `build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/`, compiled with `-Werror`; CTest `MatmulRtlDriver` checks its register table against the RTL |
+| `package_matmul_rtl` | Vivado IP `xilinx.com:hls:MatmulKernel:1.0` with the driver → `build/rtl_ip/MatmulKernel_ip` (+ `.zip`), ~20 s |
+| `synth_matmul_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `MM_RTL_PERIOD` ns (default 3.333) → `build/kernels/matmul_rtl/synth/*.rpt` |
+| `xsim_matmul_rtl` | `xvlog` / `xelab` parse and elaboration |
+| `sysim_matmul_rtl` | The test stand's MatmulKernel block design (PS VIP, interconnect, DDR model, `matmul_tb.sv`) with this IP, gmem2 upgraded to 128, on a copy in `build/kernels/matmul_rtl/sysim/` (~4 min) |
+
+The IP is packaged outside `build/kernels/` because the `hls` hardware build
+scans that whole tree as its IP repository and both MatmulKernel IPs have the
+same VLNV.  With `AXI_MATMUL_IMPL=rtl` the hardware targets use
+`build/ip_repo_kv260/` instead (target `ip_repo_kv260`: links to the three HLS
+exports and the RTL IP).
 
 ---
 
@@ -176,7 +206,7 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 
 | Target | Description |
 |--------|-------------|
-| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-runs all four HLS syntheses first; configure with `-DAXI_BUS_WIDTH=128`. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
+| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-runs all four kernel IPs first (`AXI_MATMUL_IMPL`); configure with `-DAXI_BUS_WIDTH=128`. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
 | `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 68 cases over the four kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
 | `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260; `dtc`'s `reg_format` / `avoid_default_addr_size` warnings are expected |
 

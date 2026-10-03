@@ -298,6 +298,33 @@ class TestPlugins(unittest.TestCase):
         finally:
             r.close()
 
+    def test_register_map_rtl_driver(self):
+        gen = ("import json\nprint(json.dumps({'registers': {'a': {'offset': 16, 'bits': 64},\n"
+               "    'n': {'offset': 28, 'bits': 32}}, 'errors': ['n: A_N = 0x20 in the RTL, 0x1C in the table']}))\n")
+        r = Repo({"k.cpp": "#pragma HLS INTERFACE s_axilite port=a bundle=ctrl\n"
+                           "#pragma HLS INTERFACE s_axilite port=n bundle=ctrl\n"
+                           "#pragma HLS INTERFACE s_axilite port=mode bundle=ctrl\n",
+                  "drv/xk_hw.h": "#define XK_CTRL_ADDR_A_DATA 0x10\n#define XK_CTRL_ADDR_N_DATA 0x18\n"
+                                 "#define XK_CTRL_ADDR_MODE_DATA 0x20\n",
+                  "gen.py": gen},
+                 """
+                 facts:
+                 - id: regs
+                   kind: interface
+                   check: register_map
+                   args: {kernel: K, prefix: XK, hls: k.cpp, driver: 'drv/*_hw.h', rtl_driver: gen.py,
+                          fields: [n, mode], not_keyed: {a: address}}
+                 """)
+        try:
+            msgs = [(f.level, f.msg) for f in r.check("regs").findings if f.level != "info"]
+            self.assertIn(("error", "driver table vs the RTL: n: A_N = 0x20 in the RTL, 0x1C in the table"), msgs)
+            self.assertIn(("error", "RTL driver registers differ from the HLS ports: only in the RTL driver [], "
+                                    "only in HLS ['mode']"), msgs)
+            self.assertIn(("warn", "RTL driver offsets differ from this HLS driver for n "
+                                   "(re-export the HLS IP, or fix the RTL)"), msgs)
+        finally:
+            r.close()
+
     def test_cli_flags(self):
         script = ("import argparse\np = argparse.ArgumentParser()\np.add_argument('--alpha')\n"
                   "p.add_argument('--beta', action='store_true')\np.parse_args()\n")

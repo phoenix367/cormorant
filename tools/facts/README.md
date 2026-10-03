@@ -134,7 +134,7 @@ The `fix` policy:
 
 | plugin | args | checks |
 |---|---|---|
-| `register_map` | `kernel`, `prefix`, `hls`, `driver` (glob, a build artifact), `fields_alias`, `not_keyed` {register: why}, `decode`, `writers_all` | It checks five things, sketched below the table. |
+| `register_map` | `kernel`, `prefix`, `hls`, `driver` (glob, a build artifact), `rtl_driver` + `rtl`, `fields_alias`, `not_keyed` {register: why}, `decode`, `writers_all` | It checks six things, sketched below the table. |
 | `cli_flags` | `script`, `cwd`, `docs` [{file, start, end, pattern}] | the flags of argparse's `usage:` against the flags that start the lines (or table rows) of each doc section, or that `pattern` finds in it (a usage synopsis), both ways |
 | `ctypes_bindings` | `files`, `external` | `.claude/agents/code-audit/ctypes_check.py`. Mismatches, inconsistencies and undeclared non-int restypes are errors. A symbol without a prototype that is not listed in `external` is a warning. `loose` (`c_void_p` for an opaque handle) is info |
 | `config_keys` | `example`, `code`, `waive` {key: why} | `.claude/agents/code-audit/config_keys.py`. An unread example key or an undocumented key that is read is an error unless waived. A waiver that matches nothing is a warning |
@@ -146,6 +146,11 @@ The `fix` policy:
 - the HLS `s_axilite` ports equal the driver header's registers, where the
   driver is built (a mismatch is a warning, because the header is a local
   artifact);
+- with `rtl_driver` (an RTL kernel's driver generator,
+  `kernels/matmul_rtl/scripts/gen_driver.py`): its register table matches the
+  address constants of the RTL control block `rtl` (`--check --json`), its
+  register names equal the HLS ports, and its offsets equal a built HLS
+  driver header's (a warning, as above);
 - every port is a `src/perf_calls.FIELDS` field (through `fields_alias`) or
   is `not_keyed` with a reason;
 - the timeline's `DECODE` table decodes only FIELDS;

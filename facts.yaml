@@ -146,6 +146,8 @@ facts:
     prefix: XMatmulkernel
     hls: kernels/matmul/kernel/MatmulKernel.cpp
     driver: 'build*/kernels/matmul/kv260/*/*/impl/ip/drivers/MatmulKernel_v1_0/src/xmatmulkernel_hw.h'
+    rtl_driver: kernels/matmul_rtl/scripts/gen_driver.py
+    rtl: kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv
     fields_alias: {a_stride: a_batch_stride, b_stride: b_batch_stride, c_stride: c_batch_stride}
     not_keyed: {a: address, b: address, c: address, a_to_b: "B's address relative to A (GEMV), no geometry"}
     decode: inference-scheduler/src/timeline_html.py

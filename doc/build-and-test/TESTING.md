@@ -7,7 +7,7 @@ machine without an FPGA.
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
 | 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1625 tests); the chat app (188 tests) |
-| 2. **HLS C-sim** | gcc/g++, CMake | Each kernel's C++ reference against per-test golden vectors (`ctest`) |
+| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
@@ -171,6 +171,17 @@ missing shows as *Not Run* and fails `ctest`.  `ctest` also runs
 
 These tests exercise the kernel C++ source directly without HLS
 synthesis, so they catch logic regressions in seconds.
+
+The SystemVerilog MatmulKernel (`kernels/matmul_rtl/`,
+[MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) has two tests in the
+same `ctest` run when Verilator 5.x is installed (`sudo apt install
+verilator`): `TestMatmulRtl` builds the RTL with Verilator (~30 s, in plain
+`make`) and runs the 50 checked-in MatmulKernel fixtures — the ones
+`TestMatmulRef --dump-data` writes from `ref_matmul_2d` — plus 200 random
+cases against randomised AXI timing (~50 s); `MatmulRtlDriver` checks the C
+driver's register table against the RTL.  `make lint_matmul_rtl` is the
+Verilator lint; the testbench's own options (one case, a waveform, `--perf`)
+are in the kernel's reference.
 
 ---
 

@@ -1,0 +1,15 @@
+`verilator_config
+// Port name fixed by the HLS interface contract.
+lint_off -rule SYMRSVDWORD -file "*/mm_core.sv" -match "*interrupt*"
+lint_off -rule SYMRSVDWORD -file "*/MatmulKernel.v" -match "*interrupt*"
+// RREADY of the read engine is driven constant at the top level.
+lint_off -rule PINCONNECTEMPTY -file "*/mm_core.sv"
+// Descriptor / config structs are shared; each unit uses a subset of the fields.
+lint_off -rule UNUSEDSIGNAL -file "*/mm_*.sv" -match "*'cfg'*"
+lint_off -rule UNUSEDSIGNAL -file "*/mm_*.sv" -match "*'st'*"
+lint_off -rule UNUSEDSIGNAL -file "*/mm_lane.sv" -match "*'in_meta'*"
+lint_off -rule UNUSEDPARAM  -file "*/mm_pkg.sv"
+// Partially used address / index vectors and unused FIFO occupancy outputs.
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Signal is not used: '*count'*"
+lint_off -rule UNUSEDSIGNAL -file "*/mm_core.sv" -match "*'cnt'*"

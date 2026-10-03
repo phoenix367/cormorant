@@ -14,7 +14,7 @@ Documentation index: `doc/README.md` — docs are grouped in `doc/build-and-test
 
 ## Build System
 
-All four kernels live under `kernels/` and are built from a single top-level CMake project.
+All four kernels (and the SystemVerilog MatmulKernel, `kernels/matmul_rtl/`) live under `kernels/` and are built from a single top-level CMake project.
 See `doc/build-and-test/BUILD_TARGETS.md` for a full reference of every `make` target.
 
 ```bash
@@ -29,6 +29,7 @@ make TestConvRef       # ConvKernel
 make TestConvGrid      # ConvKernel MAC grid (include/ConvMacGrid.h) alone
 make TestMatmulRef     # MatmulKernel
 make TestPoolingSim    # PoolingKernel
+make TestMatmulRtl     # MatmulKernel in SystemVerilog (kernels/matmul_rtl/, Verilator 5.x)
 ctest                  # run all
 
 # HLS synthesis + Vivado IP export for the KV260
@@ -36,6 +37,7 @@ make synthesize_vectorop_kv260
 make synthesize_conv_kv260
 make synthesize_matmul_kv260
 make synthesize_pool_kv260
+make package_matmul_rtl          # the RTL MatmulKernel IP (Vivado); -DAXI_MATMUL_IMPL=rtl puts it in the hardware build
 ```
 
 Each kernel can also be built standalone:
@@ -100,6 +102,7 @@ All three ports are `hls::burst_maxi<ap_uint<128>>` (8 elements per beat); the k
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
 - **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across sizes 1…4097 (tail words), saturation boundary cases, and geometry / `act` cases (broadcast chunk 12 stride 16, outer 1000 × 16, stride-0 operands at and past the replay bound, runs > 16 × 256 words); asserts the alignment contract (`inc % 8 == 0`, tail lanes 0, gaps untouched). `--dump-data` writes the RTL fixtures (manifest with an `act` column) into the build tree (`make gen_vectorop_test_data`); the behaviour tests read the checked-in copies in `hw/test_data/vecop_test_data`.
 - **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
+- **`kernels/matmul_rtl/`** — MatmulKernel in SystemVerilog, a drop-in for the HLS one (same VLNV, registers, layouts, bit-exact; gmem2 128-bit; 128 MAC/cycle GEMM).  Verilator testbench (`TestMatmulRtl`: the HLS fixtures + random cases), `scripts/gen_driver.py` (the C driver with the HLS driver's API, checked against `rtl/mm_ctrl_s_axi.sv`), Vivado packaging.  Not yet in the bitstream: `AXI_MATMUL_IMPL=hls` is the default until the board validation (`doc/plans/MATMUL_RTL_PLAN.md`).  Read `doc/kernels/MATMUL_RTL_KERNEL.md` (contract, architecture, invariants) before changing the RTL.
 - **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.conv` / `kernels.matmul` / `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
 ### Inference Scheduler
@@ -180,6 +183,7 @@ See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and 
 ## Dependencies
 
 - **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
+- **Verilator 5.x** (`sudo apt install verilator`; 5.020 here) for the RTL MatmulKernel's testbench and lint; without it those targets are skipped.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.
 - **KV260 board**: Ubuntu 22.04 (kernel 5.15.0-xilinx-zynqmp), XRT 2.13, `cma=1000M` on the kernel command line (BERT + SmolLM2 pools), 3.9 GB RAM and no swap (build generated projects `-j1`). Keep `board/kv260/kv260-no-cpu-powerdown.conf` installed in `/etc/tmpfiles.d/` (`demo/chat/deploy.py` does it): the PSCI core power-down idle state can park a core forever and hang the board (`doc/plans/CHAT_PLAN.md` §18).
 - **One job per board**: every board tool (`run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`, `upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat `deploy.py` / `llm_board.py`) holds the per-board lock `/tmp/kv260-board-<host>.lock` (`inference-scheduler/src/remote/lock.py`; a config's `board_lock` overrides it, `false` disables it) and waits while another job holds it; tools started by a holder re-enter it.  Never wrap them in a shell `flock` on that file (they would wait forever) — use `python -m src.remote.locked -- CMD` from `inference-scheduler/` for other commands.

@@ -7,7 +7,7 @@ logs, grouped by topic:
 ```
 doc/
 ├── build-and-test/   building, configuring and testing the hardware and software
-├── kernels/          the four HLS kernels: reference + optimisation log each
+├── kernels/          the kernels (four in HLS, MatmulKernel also in RTL): reference + optimisation log
 ├── scheduler/        the ONNX-to-C inference scheduler
 ├── plans/            project plans and their results (chronological logs)
 └── images/
@@ -46,7 +46,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 
 | Document | Contents |
 |---|---|
-| [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) | Every CMake / make target: C-simulation tests, HLS synthesis and cosim, test fixtures, RTL behaviour tests, Vivado bitstream, device-tree overlay |
+| [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) | Every CMake / make target: C-simulation tests, HLS synthesis and cosim, the RTL MatmulKernel (Verilator, packaging), test fixtures, RTL behaviour tests, Vivado bitstream, device-tree overlay |
 | [TESTING](build-and-test/TESTING.md) | The five test layers (scheduler unit tests, kernel C simulation, RTL simulation, on-board correctness and performance) and how to run each |
 | [PLATFORM_CONFIGURATION](build-and-test/PLATFORM_CONFIGURATION.md) | `platforms/<name>.json`: FPGA part, clock and each kernel's compile-time bounds; adding a platform, changing a bound |
 | [SIMULATION_ISSUES](build-and-test/SIMULATION_ISSUES.md) | Traps in the Vivado PS VIP simulation (partial write strobes, DDR aliasing, backdoor loads) and their workarounds |
@@ -62,6 +62,7 @@ there, with measured numbers) per kernel:
 | MatmulKernel — tiled GEMM | [MATMUL_KERNEL](kernels/MATMUL_KERNEL.md) | [MATMUL_OPTIMISATION](kernels/MATMUL_OPTIMISATION.md) |
 | ConvKernel — 2-D and depthwise convolution | [CONV_KERNEL](kernels/CONV_KERNEL.md) | [CONV_OPTIMISATION](kernels/CONV_OPTIMISATION.md) |
 | PoolingKernel — max / average / Lp pooling | [POOLING_KERNEL](kernels/POOLING_KERNEL.md) | [POOL_OPTIMISATION](kernels/POOL_OPTIMISATION.md) |
+| MatmulKernel in SystemVerilog — 128 MAC/cycle GEMM, drop-in for the HLS one (not yet in the bitstream) | [MATMUL_RTL_KERNEL](kernels/MATMUL_RTL_KERNEL.md) | — ([MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md)) |
 
 [HLS_CONV_RESEARCH](kernels/HLS_CONV_RESEARCH.md) is a background literature
 survey of HLS convolution techniques (not a plan).
@@ -98,6 +99,7 @@ line at the top says what is done.
 | [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
 | [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TTS_PLAN](plans/TTS_PLAN.md) | Text to speech: Audio8 TTS Preview 0.1B — NO-GO for real time (18 GB/s of weights needed, 2.9 GB/s available); candidate screen — Piper, TinyTTS, Kitten nano and Supertonic-3 fit; Piper lessac-medium study — GO (int16 within 0.19 dB log-mel of float); implementation — `libpiper_tts.so` bit-exact on the board, RTF 0.52; `/v1/audio/speech` in the chat server; the text encoder on the FPGA (int16, 0.37 dB log-mel from float, 3.7–4.9× faster) and the duration predictor in C (3×); first audio 1.0–1.5 s |
+| [MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md) | Replacing the HLS MatmulKernel with the SystemVerilog one: phase 0 (into the repository: Verilator tests, driver, IP packaging) done; bitstream, board validation, performance models and the switch open |
 | [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |
 
 ## Claude Code skills
