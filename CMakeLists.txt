@@ -217,6 +217,7 @@ if(EXISTS "${_HW_REPO}/build.sh")
                     "${_HW_K}/pool/kv260/pool_kv260/hls/impl/ip" "${_HW_IP_REPO}/pool"
             COMMAND "${CMAKE_COMMAND}" -E create_symlink
                     "${CMAKE_BINARY_DIR}/rtl_ip/MatmulKernel_ip" "${_HW_IP_REPO}/matmul"
+            DEPENDS package_matmul_rtl
             COMMENT "IP repository for the KV260 build: three HLS kernels + the RTL MatmulKernel"
             VERBATIM)
         set(_HW_IP_REPO_DEP ip_repo_kv260)
@@ -313,6 +314,13 @@ if(EXISTS "${_TS_REPO}/Makefile")
 
         set(_bt_datadir "${CMAKE_SOURCE_DIR}/hw/test_data/${_bt_dataname}")
         set(_bt_iprepo  "${CMAKE_BINARY_DIR}/kernels/${_bt_kernel}/kv260/${_bt_hlsproj}/${_bt_ipsub}")
+        set(_bt_ipdep   "synthesize_${_bt_kernel}_kv260")
+        if(_bt_kernel STREQUAL "matmul" AND AXI_MATMUL_IMPL STREQUAL "rtl")
+            # the RTL IP; the test stand puts the instance widths back to the
+            # IP's defaults after the upgrade (gmem2 32 -> 128)
+            set(_bt_iprepo "${CMAKE_BINARY_DIR}/rtl_ip/MatmulKernel_ip")
+            set(_bt_ipdep  package_matmul_rtl)
+        endif()
 
         # Pin the scoreboard JSON report to a known path in the build tree.
         # check_test_report.py turns summary.all_passed into the target's
@@ -339,13 +347,13 @@ if(EXISTS "${_TS_REPO}/Makefile")
                     "${_bt_report}"
             WORKING_DIRECTORY "${_TS_REPO}"
             DEPENDS
-                "synthesize_${_bt_kernel}_kv260"
+                "${_bt_ipdep}"
             COMMENT "Vivado xsim: behavioural test of ${_bt_kernel} via cormorant_test_stand"
             USES_TERMINAL
             VERBATIM
         )
         message(STATUS "axi_kernels: target 'behavior_test_${_bt_kernel}' "
-                       "(data=hw/test_data/${_bt_dataname}, depends on synthesize_${_bt_kernel}_kv260)")
+                       "(data=hw/test_data/${_bt_dataname}, depends on ${_bt_ipdep})")
         list(APPEND _BEHAVIOR_TEST_AGG_DEPS "behavior_test_${_bt_kernel}")
     endforeach()
 

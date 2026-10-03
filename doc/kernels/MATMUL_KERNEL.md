@@ -22,9 +22,10 @@ reads, so a weight both kernels use needs one DDR copy.
 
 A SystemVerilog drop-in replacement with the same registers, layouts and
 results (128 MAC/cycle GEMM, 128-bit C port) is in `kernels/matmul_rtl/`:
-[MATMUL_RTL_KERNEL](MATMUL_RTL_KERNEL.md).  It is not in the bitstream yet
-([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md)); this kernel's C++ reference
-(`ref_matmul_2d`) writes the fixtures both are tested against.
+[MATMUL_RTL_KERNEL](MATMUL_RTL_KERNEL.md).  Its bitstream builds
+(`AXI_MATMUL_IMPL=rtl`) but has not run on the board yet
+([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md)); this kernel's C++
+reference (`ref_matmul_2d`) writes the fixtures both are tested against.
 
 ---
 

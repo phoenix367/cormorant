@@ -12,15 +12,15 @@ It does 128 MAC/cycle on GEMM (the HLS kernel: 32) and 16 on GEMV (port-bound,
 as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 ([Resources and timing](#resources-and-timing)).
 
-**Status (2026-10-04):** imported into the repository with its Verilator
-testbench, the C driver and the IP packaging (phase 0 of the integration).
-It passes the 50 HLS-oracle fixtures and thousands of random cases in
-Verilator, and the test stand's block design in xsim; it has **not** run on
-the board yet.  The hardware build still uses the HLS kernel by default
-(`AXI_MATMUL_IMPL=hls`); the next phases are the bitstream with this IP
-(gmem2 widened to 128 in `cormorant_hw_128`), the board validation, then the
-retirement of the HLS kernel's synthesis (its C++ reference `ref_matmul_2d`
-stays: it writes the fixtures every RTL test checks against).
+**Status (2026-10-04):** in the repository with its Verilator testbench, the
+C driver and the IP packaging; with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream
+builds (timing met at 100 MHz) and passes the test stand's matmul behaviour
+test (50 / 50) and the whole-design simulation (68 / 68).  It has **not** run
+on the board yet, and the hardware build still uses the HLS kernel by default
+(`AXI_MATMUL_IMPL=hls`).  Next: the board validation, the performance
+models, then the switch and the retirement of the HLS kernel's synthesis
+(its C++ reference `ref_matmul_2d` stays: it writes the fixtures every RTL
+test checks against) — [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
 
 Contents: [Building and testing](#building-and-testing) ·
 [Software driver](#software-driver) · [Interface contract](#interface-contract) ·
@@ -51,7 +51,7 @@ make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP,
 
 | CMake cache variable | Default | Meaning |
 |---|---|---|
-| `AXI_MATMUL_IMPL` | `hls` | Which MatmulKernel IP `synthesize_kv260` / `build_hw_kv260` use: `hls` (the Vitis export) or `rtl` (`package_matmul_rtl`; Vivado then scans `build/ip_repo_kv260/`, which links the three HLS kernels and this IP — both MatmulKernel IPs have the same VLNV) |
+| `AXI_MATMUL_IMPL` | `hls` | Which MatmulKernel IP `synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260` / `behavior_test_matmul` use: `hls` (the Vitis export) or `rtl` (`package_matmul_rtl`; Vivado then scans `build/ip_repo_kv260/`, which links the three HLS kernels and this IP — both MatmulKernel IPs have the same VLNV).  After the IP upgrade the hardware and test-stand scripts reset every kernel instance's `C_M_AXI_*_DATA_WIDTH` to its IP's default, so `MatmulKernel_0`'s gmem2 becomes 128 with this IP and 32 again with the HLS one |
 | `MM_RTL_FIXTURES` | `hw/test_data/matmul_test_data` | Fixtures `TestMatmulRtl` checks (`make gen_matmul_test_data` rewrites them from `ref_matmul_2d`) |
 | `MM_RTL_RANDOM_CASES` | 200 | Random cases after the fixtures in `TestMatmulRtl` |
 | `MM_RTL_PERIOD` | 3.333 | `synth_matmul_rtl` clock period in ns (300 MHz) |
@@ -123,10 +123,12 @@ the HLS kernel exactly; everything inside the IP may change.
   the block design both masters must reach every DDR buffer (the HLS GEMV path
   already read B through gmem0).  `a_to_b` is accepted and ignored.
 - **`m_axi_gmem2` (C):** write-only, **128-bit** data with a 16-bit `WSTRB` —
-  the deliberate change: the HLS export and the `MatmulKernel_0` instance of
-  `cormorant_hw_128` and the test stand are 32-bit on this port, so the
-  instance's `C_M_AXI_GMEM2_DATA_WIDTH` must become 128 when this IP replaces
-  the HLS one (`sysim_matmul_rtl` does it with `upgrade_ip` on a copy).
+  the deliberate change: the HLS export is 32-bit on this port, so the
+  `MatmulKernel_0` instance's `C_M_AXI_GMEM2_DATA_WIDTH` must be 128 with
+  this IP.  `upgrade_ip` from the HLS IP gives 128 (the parameter is
+  read-only here); the `cormorant_hw_128` and test-stand scripts also reset
+  every instance width to its IP's default after an upgrade, which matters
+  for the way back (an upgrade to the HLS IP would keep 128).
 - **All three `m_axi` ports:** the full AXI4 signal set, 64-bit addresses, ID
   width 1, every `*USER` width 1, `CACHE` = 3, `PROT` = 0.  Unused directions
   stay present and are tied off.
@@ -391,7 +393,8 @@ generator.  The current block design runs at 100 MHz, with 150 MHz planned.  Nea
 - **System level (`make sysim_matmul_rtl`):**
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
-- **Not yet done:** a bitstream and a board run in `cormorant_hw_128`, whose `MatmulKernel_0` gmem2 width still has to be set to 128 (phases 1 and 2).
+- **Full design (`sim_hw_kv260`, `AXI_MATMUL_IMPL=rtl`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
+- **Not yet done:** a board run (phase 2).
 
 ## Source files
 

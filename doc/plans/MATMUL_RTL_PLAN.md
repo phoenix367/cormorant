@@ -1,9 +1,13 @@
 # MatmulKernel in SystemVerilog: integration plan
 
-**Status (2026-10-04):** phase 0 done — the RTL kernel, its Verilator
-testbench, the C driver and the IP packaging are in `kernels/matmul_rtl/`
-and build from a fresh clone; the hardware build still uses the HLS kernel
-(`AXI_MATMUL_IMPL=hls`).  Phases 1–4 are open.
+**Status (2026-10-04):** phases 0 and 1 done — the RTL kernel, its
+Verilator testbench, the C driver and the IP packaging are in
+`kernels/matmul_rtl/` and build from a fresh clone; with
+`AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (`8b9aee0f54b3`, timing met
+at 100 MHz, 8.6 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer) and passes the
+matmul behaviour test (50 / 50) and the whole-design simulation (68 / 68).
+The default is still `hls`; phases 2–4 (board, performance models, switch)
+are open.
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
 drop-in replacement for the Vitis HLS MatmulKernel
@@ -104,18 +108,60 @@ Risks carried into the phases:
 | `synth_matmul_rtl` | 18 433 LUT (6 896 LUTRAM), 9 509 FF, 38 BRAM36, 0 URAM, 128 DSP; WNS −0.031 ns at 3.333 ns (Fmax ≈ 297 MHz), as before the import; 13 min |
 | `sysim_matmul_rtl` | 50 / 50 (`check_test_report.py` PASS), 4 min; the upgrade changed only gmem2 (32 → 128 bits, WSTRB 4 → 16) and the control address (7 → 8 bits: the test stand's block design predates `a_to_b`) |
 
-### Phase 1: block design and bitstream
+### Phase 1: block design and bitstream — done (2026-10-04)
 
-- Set `C_M_AXI_GMEM2_DATA_WIDTH = 128` on `MatmulKernel_0` in
-  `cormorant_hw_128` from the build script (not a hand edit), so the HLS
-  variant can still be built until phase 2 passes.
-- `AXI_MATMUL_IMPL=rtl`: build the bitstream at 100 MHz; expect about 8.4 k
-  fewer LUTs, 17.5 k fewer FFs, 6 fewer BRAM36 and 8 fewer URAM.
-- Simulations: the matmul behaviour test (`behavior_test_matmul` against the
-  RTL IP — the test stand's instance needs the same gmem2 change; until then
-  `sysim_matmul_rtl` covers it on a copy) and the full design
-  (`sim_hw_kv260`, 68 / 68).
-- *Done when* the bitstream is built, timing is met and both simulations pass.
+- **Instance widths follow the IP.**  Instead of a hand edit (or a width
+  passed per build), the `cormorant_hw_128` scripts (`build.tcl`, `sim.tcl`,
+  new `scripts/ip_defaults.tcl`) and the test stand (`ts_prepare_bd`,
+  `ts_apply_ip_default_widths`) put every kernel instance's
+  `C_M_AXI_*_DATA_WIDTH` back to the default of the IP in the catalogue after
+  the IP upgrade — the documented rule "instance widths = IP defaults",
+  now enforced.  Vivado has no reset to default (`reset_property` refuses
+  `CONFIG.*`; `VALUE_SRC DEFAULT` changes the flag, not the value), so the
+  defaults come from a temporary instance of each IP.  HLS → RTL: the upgrade
+  already gives gmem2 128 (the RTL IP's parameters are read-only) and nothing
+  is reset; RTL → HLS: the upgrade keeps 128 and the reset puts it back to
+  32.  Both directions checked on a copy of `cormorant_hw_128` and in the
+  test stand itself.
+- `AXI_MATMUL_IMPL=rtl` also points `behavior_test_matmul` at the RTL IP
+  (`build/rtl_ip/MatmulKernel_ip`, depending on `package_matmul_rtl`), and
+  `ip_repo_kv260` depends on `package_matmul_rtl`.
+- The bitstream: `build_hw128` configured with `-DAXI_MATMUL_IMPL=rtl`, then
+  `make package_matmul_rtl ip_repo_kv260` and `build.sh all -ip-repo
+  build_hw128/ip_repo_kv260` — the command `build_hw_kv260` runs, without
+  its `synthesize_kv260` step: the VectorOP, Conv and Pool exports in
+  `build_hw128` are the ones of the current bitstream (their sources have
+  not changed since).  52 min (synthesis 14, implementation 36).  The
+  upgrade changed only `MatmulKernel_0` (gmem2 32 → 128 bits, WSTRB 4 → 16)
+  and removed the interconnect's gmem2 upsizer (`auto_us_0`).
+
+| | HLS MatmulKernel (`caa67f49a5a3`, deployed) | RTL MatmulKernel (`8b9aee0f54b3`) | change |
+|---|---:|---:|---:|
+| LUT (placed) | 93 303 (79.7 %) | 84 699 (72.3 %) | −8 604 |
+| LUT as memory | — | 20 004 | |
+| FF | 97 321 | 79 510 | −17 811 |
+| BRAM36 | 115.5 | 109.5 | −6 |
+| URAM | 56 | 48 | −8 |
+| DSP | 1 058 | 1 058 | 0 |
+| WNS / WHS at 100 MHz | +0.671 / +0.010 ns | +1.204 / +0.010 ns | |
+
+| simulation | result |
+|---|---|
+| `behavior_test_matmul` (test stand, RTL IP) | 50 / 50, 4.6 min |
+| the same with the HLS IP again, on the RTL-upgraded test-stand project (the way back) | 50 / 50 (gmem2 reset 128 → 32) |
+| `sim_hw_kv260` (the whole block design with the RTL IP) | 68 / 68 (VectorOP 22, Conv 17, Matmul 10, Pool 19), 3.9 min |
+
+- The outputs of both bitstreams are kept outside the repository:
+  `/mnt/data/bitstreams/kv260_hls_caa67f49a5a3/` (the deployed one) and
+  `/mnt/data/bitstreams/kv260_rtl_8b9aee0f54b3/` (`.bit`, `.hwh`, synthesis
+  and implementation reports, build log).  `cormorant_hw_128.runs/impl_1`
+  — the path `bitstream_config_kv260.json` names — now holds the RTL one, so
+  `facts.py verify hw.utilization` reports the RTL numbers until phase 4
+  updates the README; to go back, copy the HLS `.bit` there (or rebuild with
+  `AXI_MATMUL_IMPL=hls`).
+- After the runs the submodules' tracked project files (`.bd`, `.xci`,
+  `.xpr`) were restored; the committed block designs still describe the HLS
+  configuration, and every build re-derives the RTL one.
 
 ### Phase 2: on the board (the chat server may be stopped)
 

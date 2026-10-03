@@ -147,7 +147,11 @@ The IP is packaged outside `build/kernels/` because the `hls` hardware build
 scans that whole tree as its IP repository and both MatmulKernel IPs have the
 same VLNV.  With `AXI_MATMUL_IMPL=rtl` the hardware targets use
 `build/ip_repo_kv260/` instead (target `ip_repo_kv260`: links to the three HLS
-exports and the RTL IP).
+exports and the RTL IP), and `behavior_test_matmul` takes the RTL IP
+(depending on `package_matmul_rtl`).  After the IP upgrade, both the
+`cormorant_hw_128` scripts and the test stand put every kernel instance's
+`C_M_AXI_*_DATA_WIDTH` back to its IP's default, so `MatmulKernel_0`'s gmem2
+follows the IP in use (HLS 32, RTL 128) in either direction.
 
 ---
 
@@ -193,7 +197,8 @@ target's exit code.
 | `behavior_test` | Aggregate — all four kernels in sequence |
 
 Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (the IP catalogue
-must exist at the revision the test stand's `.xpr` references).  All four
+must exist at the revision the test stand's `.xpr` references);
+`behavior_test_matmul` on `package_matmul_rtl` with `AXI_MATMUL_IMPL=rtl`.  All four
 pass (119 VectorOP, 63 Conv, 50 Matmul (11 GEMV), 43 Pool cases).  The runs modify
 tracked `.bd` / `.xci` / `.xpr` files of `hw/cormorant_test_stand`; do not
 commit them.
