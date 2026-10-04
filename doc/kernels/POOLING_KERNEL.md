@@ -112,9 +112,9 @@ rejects models outside them, and `run_remote_perf.py` rejects such
 benchmark cases.  The kernel itself returns at once on an out-of-contract
 call (window larger than `kMaxPoolH/W`, dilated window past the line
 buffer): every dataflow stage runs zero times, nothing is read or written
-(POOL_OPTIMISATION §2.15).  Kernels built before that guard
-(bitstream `1d28630fbfa4` and older) hang on such a call (e.g. a 14×14
-pool) and wedge the HPC port (§2.14.1).
+(POOL_OPTIMISATION §2.15; on the board since bitstream `bbb9a37f73f8`).
+Kernels built before that guard (bitstream `1d28630fbfa4` and older) hang
+on such a call (e.g. a 14×14 pool) and wedge the HPC port (§2.14.1).
 
 **Fixed kernel-level constants:**
 

@@ -18,12 +18,16 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/1d28630fbfa4` is hw_128 7d8eefe (2026-10-04; the SystemVerilog MatmulKernel,
-doc/plans/MATMUL_RTL_PLAN.md phases 3–4): 1383 calls, repeat spread median
-0.023 % (the shipped models with the RTL engine choices, one refinement round).  Its
-MatmulKernel families use the RTL job-walk terms (`rtl_*`).
+`kv260/bbb9a37f73f8` is hw_128 7d8eefe (2026-10-04; the SystemVerilog MatmulKernel and
+the PoolingKernel out-of-contract guard, doc/kernels/POOL_OPTIMISATION.md §2.15): 1580 calls,
+repeat spread median 0.018 % (the shipped models, four refinement rounds to convergence:
+122 + 31 + 8 + 3 calls).  Its MatmulKernel families use the RTL job-walk terms (`rtl_*`).
 
-Beside it, the last bitstream with the Vitis HLS MatmulKernel: `kv260/caa67f49a5a3`,
+Beside it, `kv260/1d28630fbfa4`, the same design without the pool guard (MATMUL_RTL_PLAN
+phases 3–4), with 1383 calls, repeat spread median 0.023 % (one refinement round).  The 1251
+calls both campaigns measured agree to a median 0.002 %.
+
+And the last bitstream with the Vitis HLS MatmulKernel: `kv260/caa67f49a5a3`,
 hw_128 d7ce129 (2026-09-28; Piper added 2026-10-01), 1505 calls, repeat spread
 median 0.019 % — for projects generated with `AXI_MATMUL_IMPL=hls` for that
 bitstream.

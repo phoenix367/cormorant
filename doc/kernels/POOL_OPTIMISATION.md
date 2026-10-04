@@ -998,6 +998,23 @@ total), slack 0.00, no II violations, both ports `128 -> 128`.  It reaches
 the board with the next bitstream build (a new bitstream id: the
 performance model needs its campaign, TACTICS_PLAN §8).
 
+#### 2.15.1. On board (2026-10-04)
+
+Bitstream **`bbb9a37f73f8`** (hw_128 7d8eefe, `make build_hw_kv260` in 52 min):
+WNS +1.288 ns (production `1d28630fbfa4`: +0.987), placed LUT 84 561
+(−42), FF 79 579 (+35), BRAM 109.5 / URAM 48 / DSP 1 060 unchanged;
+archived in `/mnt/data/bitstreams/kv260_rtl_bbb9a37f73f8/`.  The five
+out-of-contract calls of `bench_pool` — `GlobalMaxPool-14x14` (the §2.14.1
+case that hung the previous kernel), pool_h = 8, pool_w = 8, a dilated
+height of 17 rows and a dilated width of 65 columns — each returned in
+9–10 µs (the call overhead).  The 60 kernel benchmarks, run before and
+right after them, matched the `1d28630fbfa4` baseline (0 regressions, 0
+result changes, pool cases within ±0.4 %); `run_remote_tests.py` 148/148;
+MNIST 98.92 % / 0.260 ms, LeNet 97.35 % / 2.833 ms.  Promoted to production
+the same day after its performance-model campaign (`perf_models/kv260/bbb9a37f73f8`;
+the 1 251 calls both campaigns measured agree to a median 0.002 %) and its
+perf-regression baseline (all 66 cases within ±1.5 % of `1d28630fbfa4`).
+
 ## 3. Current architecture (post-2.14)
 
 ```mermaid

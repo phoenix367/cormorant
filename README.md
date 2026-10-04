@@ -30,7 +30,8 @@ image and speech models.
 ## Results on the board
 
 KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-10-04 on the bitstream
-with the SystemVerilog MatmulKernel, `1d28630fbfa4`; the chat-server Piper figures 2026-10-01):
+with the SystemVerilog MatmulKernel, `1d28630fbfa4`, the demos again on today's `bbb9a37f73f8`
+— the same kernels plus a pool-window guard — within 0.1 %; the chat-server Piper figures 2026-10-01):
 
 | Model | Result | Source |
 |---|---|---|
@@ -46,7 +47,7 @@ with the SystemVerilog MatmulKernel, `1d28630fbfa4`; the chat-server Piper figur
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
 The FPGA design (`hw/cormorant_hw_128` 7d8eefe) uses 85 % of the DSPs
-(1060 / 1248), 72.2 % of the LUTs (84 603 / 117 120), 109.5 / 144 BRAM and
+(1060 / 1248), 72.2 % of the LUTs (84 561 / 117 120), 109.5 / 144 BRAM and
 48 / 64 URAM.
 
 ---

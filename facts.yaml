@@ -665,8 +665,11 @@ facts:
           MatmulKernel), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
           prefill, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
           llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot); MNIST
-          demo results.json (mean 0.2597 / 2.8308 ms per image, 98.92 / 97.35 %)"
-    facts: {perf.bitstream_id: 1d28630fbfa4}   # stale on another bitstream
+          demo results.json (mean 0.2597 / 2.8308 ms per image, 98.92 / 97.35 %).  Re-measured on bbb9a37f73f8
+          (the same kernels plus the PoolingKernel guard; perf-regression baseline 2026-10-04 21:50): ResNet-18
+          59.9, MobileNet v1 / v2 73.0 / 63.0, BERT p50 919.7, MNIST 0.260 / 2.833 ms — every demo within 0.1 %
+          and the 60 kernel benchmarks equal; the chat figures were not re-run"
+    facts: {perf.bitstream_id: bbb9a37f73f8}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -767,14 +770,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 7d8eefe, dsp: 1060, dsp_total: 1248, dsp_pct: 85, lut: 84603, lut_total: 117120, lut_pct: 72.2,
+  value: {hw_commit: 7d8eefe, dsp: 1060, dsp_total: 1248, dsp_pct: 85, lut: 84561, lut_total: 117120, lut_pct: 72.2,
           bram: 109.5, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-04
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe with the RTL MatmulKernel
-          (main 1671b92, MATMUL_RTL_PLAN phase 2b; the bitstream of perf.bitstream_id)"
-    facts: {perf.bitstream_id: 1d28630fbfa4}
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe with the RTL MatmulKernel and the
+          PoolingKernel out-of-contract guard (main 17874ef, POOL_OPTIMISATION §2.15.1; the bitstream of
+          perf.bitstream_id; 1d28630fbfa4 before it: LUT 84 603)"
+    facts: {perf.bitstream_id: bbb9a37f73f8}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

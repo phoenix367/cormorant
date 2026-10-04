@@ -24,10 +24,13 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/1d28630fbfa4** = hw_128 7d8eefe (2026-10-04), the bitstream
-with the SystemVerilog MatmulKernel (MATMUL_RTL_PLAN phases 3–4): a full campaign
-with the RTL engine choices, a top-up and one refinement round to 1383 exact calls, and `host.json` merged to 151 signatures / 39 kinds
-(§3; the host model does not depend on the bitstream).  The previous model,
+Current model: **kv260/bbb9a37f73f8** = hw_128 7d8eefe (2026-10-04), the bitstream
+with the SystemVerilog MatmulKernel and the PoolingKernel out-of-contract guard
+(POOL_OPTIMISATION §2.15): a full campaign and four refinement rounds (122, 31, 8, 3
+calls; the fifth added 0) to 1580 exact calls, and `host.json` merged to 151 signatures / 39 kinds
+(§3; the host model does not depend on the bitstream).  Before it, kv260/1d28630fbfa4
+(the same design without the guard, one refinement round to 1383 calls; the 1251 calls
+both measured agree to a median 0.002 %).  The previous HLS model,
 kv260/caa67f49a5a3 (hw_128 d7ce129, the HLS MatmulKernel; topped up on 2026-10-01
 with Piper to 1505 exact calls), stays for projects on that bitstream
 (`AXI_MATMUL_IMPL=hls`); the records below are mostly its. The perf-regression skill keeps its own baseline for each bitstream id, so a new
@@ -48,7 +51,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 1d28630fbfa4 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # bbb9a37f73f8 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`
@@ -157,9 +160,9 @@ under the planner's 5 % trust threshold.
   (TACTICS_PLAN §1). The record's 27 noisy points are all calls a few tens of µs long.
   A large median means something else ran on the board. Measure again.
 - The family errors should be close to the table above. The `note:` line is EXPECTED:
-  only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none does, mm-gemv 3.22 %).
+  only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none did, mm-gemv 3.22 %; on bbb9a37f73f8 mm-gemv 2.89 %).
 - The planner trusts a family prediction only when the family's held-out p90 is at most 5 %
-  (`perf_model.MAX_MODEL_ERROR`). Today (1d28630fbfa4) that is mm-gemv and mm-tiled. Every other tactic needs an
+  (`perf_model.MAX_MODEL_ERROR`). Today (bbb9a37f73f8, as on 1d28630fbfa4) that is mm-gemv and mm-tiled. Every other tactic needs an
   exact entry. That is why the refinement exists.
 - `call_overhead_us` (the minimum measured call) was 3.121 µs.
 

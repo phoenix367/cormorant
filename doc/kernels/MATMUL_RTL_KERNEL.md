@@ -13,7 +13,8 @@ as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 ([Resources and timing](#resources-and-timing)).
 
 **Status (2026-10-04):** the MatmulKernel of the KV260 hardware build and of
-the board (bitstream `1d28630fbfa4`, MATMUL_RTL_PLAN phase 4); the HLS
+the board (bitstream `1d28630fbfa4`, MATMUL_RTL_PLAN phase 4; since 2026-10-04 `bbb9a37f73f8`,
+the same design plus a PoolingKernel guard); the HLS
 kernel's synthesis is retired, its C++ reference `ref_matmul_2d` stays and
 writes the fixtures every RTL test checks against.  The bitstream meets
 timing at 100 MHz and passes the test stand's matmul behaviour test
