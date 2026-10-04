@@ -1130,12 +1130,12 @@
    }
   },
   "bert_squad": {
-   "run": "2026-10-04 14:29",
-   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/phase4/bert_squad_results.json",
+   "run": "2026-10-04 17:37",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/convfix/bert_squad_results.json",
    "models": {
     "bertsquad-12-simplified": {
-     "lat_ms": 954.008,
-     "p50_ms": 953.271,
+     "lat_ms": 920.743,
+     "p50_ms": 919.813,
      "thr": null,
      "thr_unit": "ips",
      "checks": {
@@ -1177,6 +1177,15 @@
    "replaced": "2026-10-04",
    "lat_ms": {
     "bertsquad-12-simplified": 962.755
+   }
+  },
+  {
+   "section": "demo:bert_squad",
+   "run": "2026-10-04 14:29",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/phase4/bert_squad_results.json",
+   "replaced": "2026-10-04",
+   "lat_ms": {
+    "bertsquad-12-simplified": 954.008
    }
   }
  ],
