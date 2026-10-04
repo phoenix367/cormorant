@@ -2,7 +2,9 @@
 
 Date: 2026-09-28.  Status: **T0–T4 done and measured on the board (§9); T5
 reduced to the verification tool** — the simulator already predicts every
-measured workload within 2 %.
+measured workload within 2 %, except SmolLM2-360M (−2.6 … −6.0 %) and the
+Piper chunk (−2.3 %), first checked on `1d28630fbfa4` (MATMUL_RTL_PLAN.md
+phase 3a: the host-op model).
 
 Goal: an **optional** planning mode (`--plan`) in which the scheduler
 chooses each node's implementation (its *tactic*) and the issue order

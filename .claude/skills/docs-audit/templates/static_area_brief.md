@@ -34,13 +34,23 @@ Counts measured on {{DATE}} — use these, do not re-run the suites:
   doc to the bug — report it.
 - **Where to look.**  Kernels: `kernels/<k>/kernel/*.cpp`, `include/*.h`,
   `kernels/<k>/CMakeLists.txt`, `platforms/kv260.json`, the generated register
-  maps `build_hw128/kernels/<k>/kv260/**/drivers/*/src/x*_hw.h`.  Scheduler:
+  maps `build*/kernels/<k>/kv260/**/drivers/*/src/x*_hw.h` (MatmulKernel:
+  `kernels/matmul_rtl/rtl/*.sv`, `build*/kernels/matmul_rtl/driver/`).  Scheduler:
   `inference-scheduler/src/`, `inference_scheduler.py --help`, `test/`.  Build:
   the CMakeLists, `make help` in a configured build dir.  Demos: the scripts'
   `--help` and the `*.json.example` files.  History of a fact: `git log -S`.
 - **Cheap and safe commands only**: `--help`, `grep`, `git log`, `python -c`
   imports.  No syntheses, Vivado, board commands or full test suites.
+- **The fact registry** (`facts.yaml`, `tools/facts/README.md`;
+  `python3 tools/facts/facts.py list` / `impact FILE`) checks values that
+  several files repeat.  Do not edit `facts.yaml` — report candidates: a value
+  your files state that is stale here and also stated elsewhere, or quoted in
+  two or more places and derivable from code (a count, a path, a name, a
+  default, a bound, a measured result with its source).  For each: the value,
+  its source of truth (file + how to read it), every place that quotes it,
+  and whether a registered fact already covers it (then: which locator is
+  missing).
 
 Final message: a table `| file:line | was | now | evidence (code file:line) |`
-for every edit; then "unverified" (claims you could not check) and "code
-suspects" (the doc is right, the code is not).
+for every edit; then "unverified" (claims you could not check), "code
+suspects" (the doc is right, the code is not) and "registry candidates".

@@ -76,8 +76,8 @@ only `part`, `board` and `clock`).
 > `cmake -DAXI_BUS_WIDTH=128`) so that a single platform JSON can be
 > synthesised against multiple bus widths independently. It only sets
 > `config_interface -m_axi_max_widen_bitwidth`, i.e. it caps HLS
-> auto-widening of plain-pointer ports (the only one left is
-> MatmulKernel `c`, which HLS does not widen — it stays 16-bit); every
+> auto-widening of plain-pointer ports (none is left: the last, the HLS
+> MatmulKernel's `c`, went with its synthesis); every
 > `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the configure-time cache variables table in
 > [BUILD_TARGETS.md](BUILD_TARGETS.md#setup).
 
@@ -229,9 +229,9 @@ residual-lane padding for any `out_w`).
     ```
 
 3. The new platform now has:
-    - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export
+    - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export (vectorop, conv, pool)
     - `synthesize_<platform>` — roll-up target that builds all four kernels
-    - `cosim_<kernel>_<platform>` — C synthesis + RTL co-simulation (conv, matmul, pool)
+    - `cosim_<kernel>_<platform>` — C synthesis + RTL co-simulation (conv, pool)
     - `dtbo_<platform>_<stem>` — for any `<stem>.dts` file under `dts/<platform>/`
 
     The Vivado / behavioural-test targets (`build_hw_kv260`,

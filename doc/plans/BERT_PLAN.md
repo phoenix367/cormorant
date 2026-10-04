@@ -12,8 +12,9 @@ runs on the KV260 in **12.13 s per inference**, logits bit-exact with the
 scheduler simulation, EM / F1 equal to the float model on the demo set (§3).
 Phase 2 (performance): **2A + 2B merged — 12.13 s → 971 ms per inference
 (12.5×)**, logits bit-exact, EM / F1 unchanged (§3 "Phase 2A + 2B").  2A
-alone 4.34 s, 2B alone 8.79 s.  Latest (2026-09-28, 10 examples): p50
-962 ms; 951 ms with the issue order of `--plan` (TACTICS_PLAN.md §9).
+alone 4.34 s, 2B alone 8.79 s.  Latest (2026-10-04, 50 examples, the
+SystemVerilog MatmulKernel's bitstream `1d28630fbfa4`): p50 919 ms; 907 ms
+built with `--plan` (TACTICS_PLAN.md §9, MATMUL_RTL_PLAN.md after phase 4).
 
 ## 0. Feasibility (measured 2026-09-26)
 

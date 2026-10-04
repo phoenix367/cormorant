@@ -75,7 +75,7 @@ You need:
 - a KV260 prepared as in the [repo README](../../README.md#quick-start):
   the bitstream loaded and `cma=1000M` on the kernel command line;
 - the BERT demo's config, `../bert_squad/bert_squad_config.json`, with the
-  board's ssh address, UIO names and HLS driver paths
+  board's ssh address, UIO names and driver paths
   ([bert_squad README](../bert_squad/README.md#run));
 - the scheduler's virtualenv, `inference-scheduler/.venv`.
 

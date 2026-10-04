@@ -23,14 +23,15 @@ Paths below are relative to `inference-scheduler/` unless noted.
 | | standard ONNX op | pattern fusion | `axi.llm` op |
 |---|---|---|---|
 | when | the op_type appears in exported graphs; tensors at the element type (Q8.8) | a subgraph of primitive ops whose intermediates saturate Q8.8 op by op (x², x³) | a region a frontend (`src/llama.py`, `src/vit.py`) emits; per-channel exponents, f32 / i32 / i16 host tensors, states |
-| code | `HostNode` subclass + C string in `src/host_nodes.py`; `HOST_OP_FACTORIES` | matcher in `src/fusion.py`, producing a standard host op | `LlmNode` in `src/llm_nodes.py` (`LLM_C`, `LLM_OP_FACTORIES`), or `VitNode` in `src/vit_nodes.py` (`VIT_C`, `VIT_OP_FACTORIES`) |
+| code | `HostNode` subclass + C string in `src/host_nodes.py`; `HOST_OP_FACTORIES` | matcher in `src/fusion.py`, producing a standard host op | `LlmNode` in `src/llm_nodes.py` (`LLM_C`, `LLM_OP_FACTORIES`), `VitNode` in `src/vit_nodes.py` (`VIT_C`, `VIT_OP_FACTORIES`) or `TtsNode` in `src/tts_nodes.py` (`TTS_C`, `TTS_OP_FACTORIES`) |
 | spec | ONNX semantics, plus documented deviations (Gather clamps its index) | the subgraph evaluated in float64 | the study emulation: `demo/chat/scripts/llm_study.py` `Model`, `vlm_study.py` `VisionModel` |
 | examples | Softmax, LayerNormalization, Gelu, Transpose, Slice, Gather, OneHot, Cast | TF LayerNorm, GELU tanh / erf | LlmRMSNorm, LlmSiluMul, LlmAttention, VitLayerNorm, VitAttnSoftmax |
 | template | `templates/host_op.py.tmpl`, `test_host_op.py.tmpl` | none (§3) | `templates/llm_op.py.tmpl`, `test_llm_op.py.tmpl` |
 
 **Dispatch** (`OnnxGraph.__init__` in `src/graph.py`):
 
-- Domain `axi.llm` goes to `{**LLM_OP_FACTORIES, **VIT_OP_FACTORIES}`.
+- Domain `axi.llm` goes to
+  `{**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES}`.
 - Otherwise `HOST_OP_FACTORIES` is checked **before** MatMul, Conv, Pool,
   Reshape and VectorOP. Never register an op_type that a kernel runs.
 - A factory may return another node class. For example, `make_cast_node`
@@ -38,12 +39,14 @@ Paths below are relative to `inference-scheduler/` unless noted.
 
 **Two restrictions:**
 
-- `numeric.check` allows exponent tensors only on MatMuls, on Reshape
-  aliases with equal exponents, and on `LlmNode` subclasses and
+- `numeric.check` allows exponent tensors only on MatMuls, on Convs (one
+  exponent per tensor), on Reshape aliases with equal exponents, and on
+  `LlmNode` subclasses and
   `is_llm_op` kernel nodes. Host tensors and states are allowed only on the
   last two. A standard `HostNode` therefore sees Q8.8 values only.
-- `_check_integer_inputs`: only host ops may read an integer tensor
-  (`t.is_int`, raw int16). A float-only op calls `self._reject_int(t)`.
+- `_check_integer_inputs`: only host ops and buffer aliases may read an
+  integer tensor (`t.is_int`, raw int16). A float-only op calls
+  `self._reject_int(t)`.
 
 ## 1. The contract: C == `reference()`, bit for bit
 
@@ -98,7 +101,7 @@ the same scalar `math` calls (`silu_table`, `gelu_table`).
 - Emit float32 constants with `_c_float` and doubles with `_c_double`;
   both round-trip exactly.
 - A fused node carries the graph's constant as a `repr()` string attribute
-  (`axi_eps`, `axi_c1`, …); read it back with `_num()`.
+  (`axi_epsilon`, `axi_c1`, …); read it back with `_num()`.
 
 **Threads.** `host_parallel` splits rows or elements into contiguous
 ranges, and every row runs the same code. The result is therefore
@@ -224,9 +227,9 @@ Paste its three blocks where each says. The test template becomes
        (`LLM_C_DMA`).
      - `state_updates()` lists every state written, host states included.
        These become the DAG's RAW / WAR / WAW edges (`src/schedule.py`).
-   - C code goes at the end of the `LLM_C` (or `VIT_C`) string. The whole
+   - C code goes at the end of the `LLM_C` (or `VIT_C`, `TTS_C`) string. The whole
      string is emitted whenever the project contains any op of that family.
-3. **Register** the factory in `LLM_OP_FACTORIES` (or `VIT_OP_FACTORIES`)
+3. **Register** the factory in `LLM_OP_FACTORIES` (or `VIT_OP_FACTORIES`, `TTS_OP_FACTORIES`)
    and add the class to `__all__`.
 4. **Frontend** (`src/llama.py` or `src/vit.py`):
    - Emit the node with `self._node(op, ins, outs, name, domain=LLM_DOMAIN, **attrs)`.
@@ -435,10 +438,10 @@ threads; without it only thread 0 runs.
 - `inference-scheduler/CLAUDE.md`: the intro list, the Source Layout lines,
   the Node Classes paragraph, and the test count.
 - Other op lists:
-  - `README.md` (~l. 75)
+  - `README.md` (~l. 99)
   - `inference-scheduler/doc/USER_GUIDE.md` (~l. 181)
-  - `inference-scheduler/doc/ARCHITECTURE.md` (l. 122, plus the mermaid
-    edge at ~l. 307)
+  - `inference-scheduler/doc/ARCHITECTURE.md` (l. 123, plus the mermaid
+    edge at ~l. 322)
   - `inference-scheduler/doc/SCHEDULER_DAG.md` (~l. 414)
 - The plan doc that motivated the op (BERT_PLAN, CHAT_PLAN or
   `<MODEL>_PLAN`): the op, its gates and its board time.

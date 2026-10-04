@@ -33,9 +33,9 @@ flowchart TD
         direction TB
         G1["① Load ONNX proto (or in-memory ModelProto), validate with onnx.checker,\nparse axi.numeric metadata"]
         G2["② Shape inference — infer_shapes fills intermediate shapes"]
-        G3["③ Graph rewrites — Constant folding · Gemm → MatMul + optional Add ·\nSplit → Slice · space-to-depth stem · LayerNorm / GELU fusion"]
+        G3["③ Graph rewrites — Constant folding · Gemm → MatMul + optional Add ·\nSplit → Slice · fully-connected Conv → MatMul · space-to-depth stem · LayerNorm / GELU fusion"]
         G4["④ Build tensor registry\nweights · inputs · intermediates · outputs · numeric annotations"]
-        G5["⑤ Dispatch each node to a typed class\nMatMul→MatmulNode · Conv→ConvNode · Pool→PoolNode\nReshape-class→ReshapeNode · SpaceToDepth→SpaceToDepthNode\nhost ops→HostNode · axi.llm→LlmNode / VitNode · others→ScheduledNode"]
+        G5["⑤ Dispatch each node to a typed class\nMatMul→MatmulNode · Conv→ConvNode · Pool→PoolNode\nReshape-class→ReshapeNode · SpaceToDepth→SpaceToDepthNode\nhost ops→HostNode · axi.llm→LlmNode / VitNode / TtsNode · others→ScheduledNode"]
         G6["⑥ Activation fusion · MatMul → ConvKernel lowering · GEMV choice ·\nMatMul B packing · Slice views · (--plan) issue order"]
         G1 --> G2 --> G3 --> G4 --> G5 --> G6
     end
@@ -66,17 +66,19 @@ The pipeline has three stages:
 1. **OnnxGraph** parses the model file into a typed Python representation. It
    validates the structure, runs ONNX shape inference to fill in intermediate
    tensor shapes, applies the load-time rewrites (`Gemm` → `MatMul + Add`,
-   `Constant` folding, `Split` lowering, the optional space-to-depth stem and
+   `Constant` folding, `Split` lowering, fully-connected Convs → MatMul
+   (`fc_conv.lower_fc_convs`), the optional space-to-depth stem and
    LayerNorm / GELU fusion), and dispatches each graph node to the
    appropriate typed class (`ScheduledNode`, `MatmulNode`, `ConvNode`,
    `PoolNode`, `ReshapeNode`, `SpaceToDepthNode`, a `HostNode` or an
-   `LlmNode` / `VitNode`); it then folds activations into VectorOP nodes,
-   lowers MatMuls onto ConvKernel where the cost model says so
-   (`MatmulConvNode`), switches single-row MatMuls to the GEMV streaming
-   path (`matmul_gemv.choose_gemv`), packs constant MatMul weights and
-   chooses Slice views.  With `--plan` the MatMul choices come from the
-   bitstream's performance model instead, and a last step may reorder the
-   node list (`order_search.plan_order`).  The exact order is listed in
+   `LlmNode` / `VitNode` / `TtsNode`); it then folds activations into
+   VectorOP nodes, lowers MatMuls onto ConvKernel where the cost model says
+   so (`MatmulConvNode`), switches MatMuls to the GEMV / image path
+   (`matmul_gemv.choose_gemv`; on the HLS kernel only single-row ones),
+   packs constant MatMul weights and chooses Slice views.  With `--plan`
+   the MatMul choices come from the bitstream's performance model instead,
+   and a last step may reorder the node list (`order_search.plan_order`).
+   The exact order is listed in
    [`doc/scheduler/INFERENCE_SCHEDULER.md` §OnnxGraph loading sequence](../../doc/scheduler/INFERENCE_SCHEDULER.md#onnxgraph-loading-sequence).
 
 2. **_CoreMixin** computes a `TensorLayout` for every tensor in the graph.
@@ -129,11 +131,16 @@ src/
   vit.py                 vision-encoder frontend (SmolVLM: SigLIP ViT + Idefics3
                            connector) → the `vision` entry graph
   vit_nodes.py           the vision host ops (VitNode family, axi.llm domain)
+  piper.py               Piper (VITS) text-to-speech frontend → the `chunk` and
+                           `encode_<T>` entry graphs
+  tts_nodes.py           the text-to-speech host ops (TtsNode family, axi.llm domain)
   numeric.py             axi.numeric metadata: exponents, host tensors, states
   fusion.py              ONNX passes: Constant folding, Split lowering, LayerNorm / GELU
                            pattern fusion, VectorOP constant-broadcast normalisation
   matmul_lowering.py     MatMul → ConvKernel engine choice and geometry (incl. row splits)
-  matmul_gemv.py         MatmulKernel GEMV streaming pass (single-row MatMuls)
+  matmul_gemv.py         MatmulKernel GEMV / image pass (single-row MatMuls on the HLS
+                           kernel, any on the RTL one)
+  fc_conv.py             fully-connected Convs → Flatten + MatMul + Reshape (+ bias Add)
   cost_model.py          ConvKernel / MatmulKernel cycle estimates
   _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
                          platform JSON bounds (platforms/<AXI_PLATFORM>.json)
@@ -149,8 +156,10 @@ src/
   graph.py               OnnxGraph — ONNX loading, shape inference, Gemm preprocessing, node dispatch
   schedule.py            Dag — data-flow DAG over the scheduled nodes (SCHEDULER_DAG.md)
   report.py              ReportGenerator — report.md
+  timeline_html.py       timeline.html — the predicted execution (--plan / --plan-report)
   bitstream/             upload_bitstream.py implementation (REMOTE_TESTING.md)
-  remote/                SSH session, config defaults, preflight checks (board tools)
+  remote/                SSH session, config defaults, preflight checks, the per-board
+                           lock (board tools)
   codegen/
     __init__.py          CodeGenerator class (assembles all mixins via MRO)
     _core.py             _CoreMixin: __init__, tensor layouts, event stream, live
@@ -183,6 +192,7 @@ self.numeric = numeric.parse(model)          # axi.numeric metadata, if any
 fusion.fold_constant_nodes(model)            # Constant → initializer
 model, n = OnnxGraph._preprocess_model(model)   # decompose Gemm → MatMul + Add
 fusion.lower_split(model)                    # Split → one Slice per output
+model, stats = fc_conv.lower_fc_convs(model, fc_conv)   # fully-connected Conv → MatMul
 # optional: _space_to_depth_stems(model), fusion.fuse_patterns(model, align_elems)
 ```
 
@@ -297,8 +307,8 @@ _ONNX_OP_MAP = {
 ```
 
 `arity=2` means the kernel reads two input arrays (`gmem0` and `gmem1`).
-`arity=1` means the kernel reads only one input (`gmem0`); `gmem1` is left
-unprogrammed and no AXI transaction is issued on that port. All other ONNX ops
+`arity=1` means the kernel reads only one input (`gmem0`); the `b` register
+is written 0 and no AXI transaction is issued on that port. All other ONNX ops
 (`MatMul`, `Conv`, pooling variants, reshape-class ops, host ops) are handled
 by dedicated node classes and never reach `_ONNX_OP_MAP`.
 
@@ -308,7 +318,7 @@ by dedicated node classes and never reach `_ONNX_OP_MAP`.
 flowchart TD
     N["ONNX NodeProto"]
     N --> D{domain / op_type?}
-    D -->|"domain axi.llm"| LN["LlmNode / LlmAttnConvNode / VitNode\nLLM_OP_FACTORIES (llm_nodes.py)\nVIT_OP_FACTORIES (vit_nodes.py)"]
+    D -->|"domain axi.llm"| LN["LlmNode / LlmAttnConvNode / VitNode / TtsNode\nLLM_OP_FACTORIES (llm_nodes.py)\nVIT_OP_FACTORIES (vit_nodes.py)\nTTS_OP_FACTORIES (tts_nodes.py)"]
     D -->|"Softmax · LayerNormalization · Gelu\nTranspose · Slice · Gather · OneHot · Cast"| HN["HostNode\nHOST_OP_FACTORIES (host_nodes.py)\nhost-CPU code (same-kind Cast → ReshapeNode)"]
     D -->|MatMul| MN["MatmulNode\ndrives MatmulKernel\ntiled GEMM, batched"]
     D -->|Conv| CN["ConvNode\ndrives ConvKernel\nNCHW 2-D convolution, standard / depthwise"]
@@ -323,9 +333,10 @@ Dispatch happens in `OnnxGraph.__init__()` as it iterates over the nodes in the
 ONNX graph in topological order. Each node's domain / `op_type` selects one
 of these paths:
 
-- **LlmNode** (`axi.llm` domain) — the Llama decoder ops of `src/llm_nodes.py`
-  and the vision-encoder ops of `src/vit_nodes.py` (`VitNode`, an `LlmNode`
-  subclass).
+- **LlmNode** (`axi.llm` domain) — the Llama decoder ops of `src/llm_nodes.py`,
+  the vision-encoder ops of `src/vit_nodes.py` (`VitNode`, an `LlmNode`
+  subclass) and the text-to-speech ops of `src/tts_nodes.py` (`TtsNode`,
+  likewise).
 - **HostNode** — ops that run on the CPU inside `inference_run()`
   (`src/host_nodes.py`); a `Cast` within one storage kind becomes a
   `ReshapeNode` alias instead.
@@ -422,9 +433,10 @@ checks `TensorLayout.gap` on A and Y to choose between:
 
 A constant B read only by tiled MatMuls (same `(k, m)`) is emitted tile-major
 (`TensorInfo.packed_data`) and called with `b_packed = 1`
-(`OnnxGraph._pack_matmul_weights`).  Single-row MatMuls that
-`matmul_gemv.choose_gemv` switches to the GEMV streaming path carry
-`gemv_kw` (1 / 2 / 4 / 8: B row-major or in ConvKernel's x image of that
+(`OnnxGraph._pack_matmul_weights`).  MatMuls that
+`matmul_gemv.choose_gemv` switches to the GEMV / image path (on the HLS
+kernel only single-row ones) carry `gemv_kw` (1 / 2 / 4 / 8: B row-major
+or in ConvKernel's x image of that
 kernel width; 0 = tiled).  MatMuls that `matmul_lowering` moves to
 ConvKernel become `MatmulConvNode`s (`run_conv()`, or a `run_conv_at()`
 loop per batch item or row split; see the technical reference, §MatMul on
@@ -482,7 +494,7 @@ Key mechanics:
 ### Host nodes
 
 `SpaceToDepthNode` (`nodes.py`), the `HostNode` family (`host_nodes.py`)
-and the `LlmNode` family (`llm_nodes.py`, `vit_nodes.py`) have `kernel_name == ""`: they
+and the `LlmNode` family (`llm_nodes.py`, `vit_nodes.py`, `tts_nodes.py`) have `kernel_name == ""`: they
 emit C code that runs inline in `inference_run()` (a `('cpu', idx)` event,
 see [SCHEDULER_DAG.md](SCHEDULER_DAG.md) §4.3), and each provides a numpy
 `reference()` that `_simulate` runs.  A `SliceNode` whose piece is a
@@ -492,7 +504,7 @@ sub-buffer view (`inference_buf_init_view()`) instead of a copy.
 "ConvKernel"`) whose key count is computed at run time (fixed for the
 vision encoder's static keys).  Semantics:
 [`doc/scheduler/INFERENCE_SCHEDULER.md`](../../doc/scheduler/INFERENCE_SCHEDULER.md) §Host-CPU ops,
-§Llama-family decoders, §Vision encoders.
+§Llama-family decoders, §Vision encoders, §Text to speech (Piper).
 
 ---
 
@@ -938,7 +950,7 @@ flowchart TD
     LOOP --> SW{node type}
     SW -->|ScheduledNode| SN["numpy element-wise op\na+b · a-b · a*b · a/b · max(a,0) · clip(a,0,6)\n(+ fused act) then truncate(result)\n(Div: truncate_div)"]
     SW -->|"MatmulNode · MatmulConvNode"| MN["np.matmul(A, B)\nthen truncate(result)\n(_matmul_exp with exponents)"]
-    SW -->|ConvNode| CN["_conv2d_ref() / _depthwise_conv2d_ref()\nthen truncate(result)"]
+    SW -->|ConvNode| CN["_conv2d_ref() / _depthwise_conv2d_ref()\nthen truncate(result)\n(_conv_exp with exponents)"]
     SW -->|PoolNode| PN["_pool2d_ref() sliding-window reference\nthen truncate(result)"]
     SW -->|ReshapeNode| RN["arrays[output] = arrays[source].reshape(shape)\nzero cost — shares the numpy array"]
     SW -->|"HostNode · LlmNode · LlmAttnConvNode\nSpaceToDepthNode"| HN["node.reference(...)\n(double math, round-half-even write-back)\nor a pure reorder"]
@@ -969,7 +981,8 @@ evaluation path:
   power-of-two exponents go through `_matmul_exp` (exact integer
   accumulation with the int32 wrap).
 - **ConvNode** — calls the `_conv2d_ref()` (or `_depthwise_conv2d_ref()`)
-  sliding-window reference implementation, then truncates.
+  sliding-window reference implementation, then truncates; tensors with
+  power-of-two exponents go through `_conv_exp` (exact integer sums).
 - **PoolNode** — calls `_pool2d_ref()`, then truncates (average and Lp
   pooling produce off-grid values; max pooling stays on the grid).
 - **ReshapeNode** — zero-cost numpy view (`reshape`). No data is copied; the
@@ -1150,7 +1163,9 @@ OP_NAMES[OP_ABS] = "VECTOROP_ABS"
 _ONNX_OP_MAP["Abs"] = (OP_ABS, 1)   # arity=1 (unary)
 ```
 
-No other files need to change for a unary op. For a binary op, the broadcasting
+Besides its numpy branch in `_forward_pass()` (`src/codegen/_simulate.py`,
+which rejects an unknown op code), no other files need to change for a
+unary op. For a binary op, the broadcasting
 logic in `_broadcast_info()` already handles the general case.
 
 ### Adding a New Hardware Kernel

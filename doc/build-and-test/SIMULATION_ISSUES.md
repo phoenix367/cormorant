@@ -118,7 +118,7 @@ The result is that narrow writes — any beat whose WSTRB is not all ones — ar
 ### Effect on Simulation
 
 - Originally found with 32-bit ports: the last element of an odd-count `ap_fixed<16,8>` vector (last beat WSTRB = `0x3`) was lost; even counts passed.
-- With the current 128-bit ports, partial-strobe beats come from the ConvKernel and PoolingKernel `y` ports (byte-strobed run edges, `doc/kernels/CONV_OPTIMISATION.md` §2.38 / `doc/kernels/POOL_OPTIMISATION.md` §2.14) and from the MatmulKernel `c` writes (a 16-bit port — HLS does not widen it — so every beat is a partial strobe once upsized to the 128-bit PS port). VectorOPKernel writes every output word whole (tail lanes = 0), so it no longer produces partial beats.
+- With the current 128-bit ports, partial-strobe beats come from the ConvKernel and PoolingKernel `y` ports (byte-strobed run edges, `doc/kernels/CONV_OPTIMISATION.md` §2.38 / `doc/kernels/POOL_OPTIMISATION.md` §2.14) and from the MatmulKernel `c` writes (the RTL kernel's 128-bit `gmem2`: the first and last beat of each C run can carry partial strobes, `doc/kernels/MATMUL_RTL_KERNEL.md`). VectorOPKernel writes every output word whole (tail lanes = 0), so it no longer produces partial beats.
 - Stale-byte variant (`doc/kernels/CONV_OPTIMISATION.md` §2.38): a `y` beat with `WSTRB = 0x00ff` landed the line's pre-poison contents (a previous case's outputs at the same DDR line) in bytes 8..15. Single-case reruns hide it — it needs an earlier AXI write to the same line, so run the whole suite.
 - In all cases the kernel's beat is correct; the DDR model holds the wrong bytes.
 

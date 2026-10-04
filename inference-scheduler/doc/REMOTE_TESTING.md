@@ -44,7 +44,7 @@ fails the test.
 | Passwordless sudo, or SSH as root | `sudo -n true && echo ok` |
 
 The `--check-only` flag verifies all of these remotely before running any tests
-(see [Preflight Check](#preflight-check)).
+(see [Preflight Check](#preflight-check-no-tests)).
 
 ---
 
@@ -121,7 +121,7 @@ directories of a build in `<repo>/build`.
 Two jobs on one board at the same time corrupt each other, so every board
 tool — `run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`,
 `upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat
-`deploy.py` / `llm_board.py` — holds an exclusive `flock` on one file per
+`deploy.py` / `llm_board.py`, the TTS `tts_board.py` — holds an exclusive `flock` on one file per
 board for its whole session: `/tmp/kv260-board-<ssh.host>.lock` (the
 config's `board_lock` overrides it; `false` disables it;
 `src/remote/lock.py`).  A second job prints `waiting for board lock …`
@@ -195,7 +195,7 @@ The runner places kernel driver sources (`.c`/`.h` files) in the project's
    single-kernel models or when you have pre-merged the files.
 2. **`local.driver_dirs`** — per-kernel local paths; the runner merges them into
    one directory and passes it to `inference_scheduler.py --driver-dir`. Best for
-   multi-kernel models where each kernel's HLS output lives separately.
+   multi-kernel models where each kernel's driver lives separately.
 3. **`remote.driver_dirs`** — per-kernel paths **on the board**; the runner copies
    each kernel's files via SSH after upload.
 4. **`remote.driver_dir`** — single board-side directory for all driver files.
@@ -560,8 +560,9 @@ starting a long benchmark run.
 Driver files must be available either locally (`local.driver_dirs`) or on the
 board (`remote.driver_dirs`). The local paths are the standard Vitis HLS output
 (see [Prerequisites](#prerequisites); VectorOPKernel under
-`<hls_project>/solution1/impl/ip/`, the other three under
-`<hls_project>/hls/impl/ip/`):
+`<hls_project>/solution1/impl/ip/`, ConvKernel and PoolingKernel under
+`<hls_project>/hls/impl/ip/`) and, for MatmulKernel, the RTL kernel's driver
+(`make driver_matmul_rtl`, `<repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/`):
 
 ```
 <repo>/build/kernels/<kernel>/kv260/<hls_project>/{solution1,hls}/impl/ip/drivers/<KernelName>_v1_0/src/
@@ -582,7 +583,7 @@ All keys from the correctness-test config apply (see [Config File Reference](#co
 |-----|---------|-------------|
 | `remote.work_dir` | `"/tmp/inference_hw_tests"` | Temporary build directory on the board |
 | `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names (keys `VectorOPKernel`, `MatmulKernel`, `ConvKernel`, `PoolingKernel`); a missing entry falls back to `<Kernel>_0` |
-| `local.driver_dirs` | `{}` | Per-kernel local HLS driver source paths; merged before upload |
+| `local.driver_dirs` | `{}` | Per-kernel local driver source paths; merged before upload |
 | `build.timeout` | `300` | Combined cmake + make timeout in seconds |
 | `run.timeout` | `60` | Per-benchmark binary execution timeout in seconds |
 | `benchmarks.<Kernel>.enabled` | `true` | Set `false` to skip that kernel entirely |
@@ -719,7 +720,7 @@ overrides the per-kernel `warmup` for every case.
 
 `--json OUT` also writes the results as a JSON list, one object per case:
 `kernel`, `label`, `fields` (the case's fields), `warmup`, `ok`, `lat_ms`
-and the metric (`gbs` or `gops`; `null` for a failed case).
+and the metric (`gbs` or `gops`; a failed case has `lat_ms` and `metric` `null`).
 
 #### Preflight check (no benchmarks)
 
@@ -909,7 +910,7 @@ A case shows `ERR` when the benchmark binary exits non-zero. Common causes:
 | `alloc failed` | DMA buffer allocation failed | Reduce `size` or number of concurrent allocations; check `dmesg` for CMA |
 | `No such file` (binary missing) | Driver files not found at build time | Verify `local.driver_dirs` paths exist and contain all `x<kernel>*.c/.h` files; re-run with `--no-cleanup` and inspect cmake output |
 
-Run with `--verbose` to see the first 5 lines of stderr from the failing binary:
+Run with `--verbose` to see the first 5 lines of output (stdout + stderr) from the failing binary:
 
 ```bash
 .venv/bin/python run_remote_perf.py --config perf_config.json --verbose
@@ -938,7 +939,8 @@ and their MatMul tactics plus a space-filling set, twice.
 ```
 
 `run` checks that the board runs the bitstream the cases are for
-(`--board-bin`, default `/lib/firmware/pl.bin`), refuses to run while the
+(`--board-bin`, default `/lib/firmware/pl.bin`; `/lib/firmware/<overlay_name>.bin`
+for another overlay name), refuses to run while the
 chat server owns the kernels unless `--stop-server` (stops it and restarts
 it afterwards), and `--resume` keeps the measurements already taken.
 `cases --refine` adds the tactics the fitted model ranks near the best;
@@ -994,7 +996,7 @@ See [Bitstream Upload](#bitstream-upload-upload_bitstreampy) for config referenc
 
 ```bash
 # remote_config.json (from remote_config.json.example) with local.driver_dirs
-# pointing at your HLS output directories
+# pointing at your driver directories
 
 # Preflight check
 .venv/bin/python run_remote_tests.py --config remote_config.json --check-only

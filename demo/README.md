@@ -2,7 +2,7 @@
 
 End-to-end demos that take an ONNX model (or, for the chat, a Hugging Face
 checkpoint), compile it to a C inference project with `inference-scheduler`,
-build it on a KV260 board over SSH, and run it on this repo's HLS kernels
+build it on a KV260 board over SSH, and run it on this repo's FPGA kernels
 (Conv / Pool / MatMul / VectorOP) plus host-CPU ops on the board's A53 cores.
 
 The CNN demos (`mnist/`, `image_classification/`, `camera/`) follow the same
@@ -10,18 +10,18 @@ three stages — **download → generate → deploy** — driven by a one-shot
 `run_demo.py` orchestrator and configured by a single `<demo>_config.json`
 (copy the bundled `.example` and fill in your board's SSH details).
 `bert_squad/` runs **prepare → generate → deploy** the same way, with the
-model, vocabulary and SQuAD file downloaded by hand (see its README).
+model, vocabulary and SQuAD file downloaded on first use (see its README).
 `chat/` installs a long-running server on the board with `deploy.py` and
 takes its board settings from `bert_squad/bert_squad_config.json`; `tts/`
 builds the speech library the server's `piper` backend loads.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.27 / 2.8 ms per image) |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.26 / 2.8 ms per image) |
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 59.9 ms = 16.7 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (919 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.0–1.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.0–1.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
 | [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.7 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
 
 ## Common workflow

@@ -2280,7 +2280,7 @@ flowchart LR
     IPP["input_patch_producer<br/><i>unified standard + depthwise (§2.14)</i><br/>owns one shared line_buf (RAM_T2P), one column of all channels written per cycle (§2.39), two columns read per cycle (§2.42)<br/><i>oh-chunked (§2.9), ow-tiled (§2.11), PatchPair out (§2.12, §2.42)</i>"]
     SLW["stream_load_weights<br/><i>DDR→stream producer (§2.7)</i><br/><i>oh-chunked (§2.9), M-grouped (§2.10), ow-tiled (§2.11)</i>"]
     BP["bias_producer<br/><i>owns bias_buf[kMaxOutCh]</i>"]
-    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35) + Phase-3 transposer (§2.38)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); flat depthwise sweep (§2.37); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchVec in (§2.12)</i>"]
+    PCT["process_conv_kernel_tile<br/><i>owns partial_outputs[kMaxAccPersistEntries] (URAM §2.13) + w_cache ping-pong (§2.10, §2.35) + Phase-3 transposer (§2.38)</i><br/>persists across ic-tiles WITHIN a chunk<br/><i>PN/PM-wide MACs (§2.8); flat depthwise sweep (§2.37); oh-chunked (§2.9); M-grouped (§2.10); ow-tiled (§2.11); PatchPair in (§2.12, §2.42)</i>"]
     WO["<i>output write</i><br/><i>128-bit words re-aligned per run, byte strobes at run ends (§2.38)</i>"]
 
     DDR_X -->|m_axi read, 128-bit| XRL
@@ -2301,9 +2301,9 @@ flowchart LR
 
 > Verify against `csynth.rpt`: the top-level `ConvKernel*` row reports
 > `Pipelined = dataflow` and the immediate children are `entry_proc`,
-> `Block_entry_proc`, `x_row_loader`, `input_patch_producer`,
-> `bias_producer`, `stream_load_weights`, `process_conv_kernel_tile`,
-> `write_output_tile`.
+> `compute_conv_geometry`, `Block_entry_proc`, `x_row_loader`,
+> `input_patch_producer`, `bias_producer`, `stream_load_weights`,
+> `process_conv_kernel_tile`, `write_output_tile`.
 
 **Six dataflow stages** (five from §2.15 to §2.38; §2.39 split the DDR
 reader out of the patch producer), all running concurrently:
@@ -2316,9 +2316,10 @@ reader out of the patch producer), all running concurrently:
 1. **`input_patch_producer`** — one assembler for both modes (§2.14).
    Owns a single `line_buf[kTileIC][kMaxLineBufRows][kMaxLineBufCols]`
    partitioned `complete dim=1` (§2.12) with circular indexing on row
-   and column dims; reads `x[]` from `gmem0`.  Iterates
-   `(ni, chunk, ct, ow_tile, grp, oh, ow_in_tile, khi, kwi)` and emits
-   one channel-packed `PatchVec` per `(khi, kwi)`.  The channel-tile
+   and column dims; pops `x_row_loader`'s column vectors from
+   `col_stream` (§2.39).  Iterates
+   `(ni, chunk, ct, ow_tile, grp, oh, ow pair, khi, kwi)` and emits
+   one channel-packed `PatchPair` per `(khi, kwi)`.  The channel-tile
    axis is runtime-selected — `ct` spans `ic_tiles` of `kTileIC`
    channels for standard, `m_tiles` of `kTileM` for depthwise (which
    uses only `line_buf` banks `[0, kTileM)`); `grp` spans
@@ -2327,26 +2328,29 @@ reader out of the patch producer), all running concurrently:
    tile's iw range is fetched from DDR exactly once per `(ni, c)`; the
    `(kh-1)·stride_h`-row overlap is re-fetched at chunk transitions and
    the `(kw-1)·dilation_w`-col overlap at ow_tile transitions.  Emits
-   `PatchVec`s straight to `patch_stream` (§2.15 removed the
+   `PatchPair`s straight to `patch_stream` (§2.15 removed the
    intermediate `broadcast_patches` hop).
 2. **`bias_producer`** — loads `bias_buf[kMaxOutCh]` once from `gmem2`
-   and replays it `batch × out_h × out_w × m_tiles` times in
-   `(r, mt, m1)` order to match the consumer's Phase-1 init pattern.
-   Chunk-/tile-agnostic.
+   and replays it as one `BiasVec` per `(r, mt)` (§2.25) —
+   `batch × out_h × out_w × m_tiles` beats for standard (the
+   consumer's Phase-1 init pattern), `batch × num_chunks × m_tiles`
+   for depthwise (§2.37).
 3. **`stream_load_weights`** (§2.7, restructured by §2.9/§2.10/§2.11)
    — owns the `gmem1` AXI master.  Standard path emits weights in
-   `(ni, chunk, ict, ow_tile, mg, mt_in_group, m1, ic_l, khi, kwi)`
-   order — ONCE per `(ict, ow_tile, mg)`, no per-spatial replay
+   `(ni, chunk, ict, ow_tile, mg, mt_in_group, m1, khi, kwi)`
+   order, one `WeightVec` of all `ic_l` lanes per position (§2.32)
+   — ONCE per `(ict, ow_tile, mg)`, no per-spatial replay
    (§2.10).  Depthwise path emits `m_valid × kh × kw` once per
-   `(ni, chunk, mt)`.  Emits to `weight_stream` (depth 6,272).
+   `(ni, chunk, mt)`.  Emits to `weight_stream` (depth 392 `WeightVec`s).
 4. **`process_conv_kernel_tile`** — owns
    `partial_outputs[kMaxAccPersistEntries]` (URAM since §2.13 —
-   `bind_storage impl=URAM`, 256 KB / 16 URAM blocks at the 65536-entry
+   `bind_storage impl=URAM`, 256 KB / 8 URAM blocks at the 65536-entry
    default) AND
-   `w_cache[kTileM][kWCacheWords]` — one RAM column per m1 holding two
+   the weight cache `w_lo` / `w_hi` (`[kTileM/2][kWCacheWords]` each,
+   BRAM / URAM since §2.40) — one RAM column per m1 holding two
    banks of `kMaxMperGroup` tiles' `WeightVec`s (§2.10, §2.32, §2.35).
-   Per `(ni, chunk)`: Phase 1 inits the chunk's
-   `chunk_oh_count·out_w·out_ch` accumulators from `bias_stream`;
+   Per `(ni, chunk)`: Phase 1 (standard only since §2.37) inits the chunk's
+   `chunk_oh_count·out_w·out_ch_padded` accumulators from `bias_stream`;
    Phase 2a/2b accumulates with `oh_local = oh - oh_start` indexing,
    the inner loop reading patch from `patch_stream` and weights from
    `w_cache` (one slab per `(ict, ow_tile, mg)`, the next slab
@@ -2359,10 +2363,10 @@ reader out of the patch producer), all running concurrently:
      `(oh_local, ow pair, pos)` (§2.37, §2.42) → **2 × kTileM = 32
      MACs/cycle**.
    Phase 3 drains the chunk's `partial_outputs` to `acc_stream`.
-5. **`write_output_tile`** — saturates `AccData_t → Data_t` and writes
-   to `gmem3` in `(ni, oh, ow, mt, m1)` order.  Chunk-/tile-agnostic —
-   the consumer's drain phase concatenates the per-chunk sub-ranges
-   into the linear stream order this stage expects.
+5. **`write_output_tile`** — re-aligns the already-saturated (§2.16)
+   128-bit `YWord`s onto DDR words and writes them to `gmem3` in
+   `(ni, chunk, mt, segment, m1)` order — one channel-major run per
+   (channel, segment) (§2.22), byte strobes at the run ends (§2.38).
 
 **Loop nest** (consumer, standard path, post-§2.42):
 `(ni, chunk, ict, ow_tile, mg) × [flat: oh_in_chunk, ow pair,
@@ -2428,25 +2432,25 @@ schema and the add-a-new-platform workflow.
 
 | JSON field | C++ name (Config.h) | Python name | kv260 | Hard constraint | Notes |
 |---|---|---|---:|---|---|
-| `tile_m` | `kTileM` | (not validated) | 8 | power of 2; ≥ MAC latency (~3 cyc) | Output channel tile; II=1 lane rotation depth. |
-| `tile_ic` | `kTileIC` | (not validated) | 16 | power of 2 | Input channel tile; sets `w_buf` and patch-buffer IC depth. |
-| `max_kh` | `kMaxKH` | (not validated; kh checked vs weight rank) | 7 | `kh ≤ this` | Compile-time kernel-height bound. |
-| `max_kw` | `kMaxKW` | (not validated; kw checked vs weight rank) | 7 | `kw ≤ this` | Compile-time kernel-width bound. |
-| `max_in_ch` | `kMaxInCh` | `CONV_MAX_IN_CH` | 1024 | `in_ch ≤ this` | Sizes `bias_buf` only — line_buf is IC-tiled. |
+| `tile_m` | `kTileM` | `CONV_TILE_M` | 16 | power of 2; multiple of 8 (the `y` word); ≤ `tile_ic` | Output channel tile = the M dimension of the MAC grid (§2.24, §2.40); pads the accumulator row (§2.23). |
+| `tile_ic` | `kTileIC` | `CONV_TILE_IC` (not validated) | 16 | power of 2 | Input channel tile; sets the patch-buffer IC depth, the `line_buf` bank count and the `WeightVec` width. |
+| `max_kh` | `kMaxKH` | `CONV_MAX_KH` | 7 | `kh ≤ this` | Compile-time kernel-height bound. |
+| `max_kw` | `kMaxKW` | `CONV_MAX_KW` | 7 | `kw ≤ this` | Compile-time kernel-width bound. |
+| `max_in_ch` | `kMaxInCh` | `CONV_MAX_IN_CH` | 1024 | `in_ch ≤ this` | Validation bound only — no kernel buffer depends on it (line_buf is IC-tiled). |
 | `max_out_ch` | `kMaxOutCh` | `CONV_MAX_OUT_CH` | 1280 | `out_ch ≤ this` | Sizes `bias_buf` in `bias_producer`. |
 | `max_line_buf_cols` | `kMaxLineBufCols` | `CONV_MAX_LINE_BUF_COLS` | 64 | power of 2; `(kw-1)*dil_w + 1 ≤ this` *(was `in_w ≤ this` pre-§2.11)* | Column capacity of `line_buf`; bitmask for col-slot wrapping.  Wider inputs auto-split along `ow` — see §2.11 / `compute_ow_tiling()`. |
 | `max_line_buf_rows` | `kMaxLineBufRows` | `CONV_MAX_LINE_BUF_ROWS` | 16 | power of 2; `(kh-1)*dil_h + 1 ≤ this` | Circular row capacity. |
-| `max_acc_persist_entries` | `kMaxAccPersistEntries` | `CONV_MAX_ACC_PERSIST_ENTRIES` | 65536 *(was 16384 pre-§2.13)* | `out_w*out_ch ≤ this`  *(was `out_h*out_w*out_ch ≤ this` pre-§2.9)* | Persistent accumulator (Option-A) size; sized to hold one output chunk.  Larger outputs auto-split along `oh` — see §2.9 / `compute_oh_chunking()`.  Bound to **URAM** since §2.13 — each 4096 entries spends one URAM block, so raising this trades URAM (64 on the XCK26), not BRAM. |
-| `max_m_per_group` | `kMaxMperGroup` | (not validated) | 4 | none (runtime clamped to `m_tiles`) | Max mt-tiles cached together in the standard path's `(ict, M-group)` weight slab.  Sizes `w_cache` in `process_conv_kernel_tile`.  Larger values eliminate weight DDR replay for more layers in one group; smaller saves BRAM/LUT.  See §2.10 / `compute_m_grouping()`. |
+| `max_acc_persist_entries` | `kMaxAccPersistEntries` | `CONV_MAX_ACC_PERSIST_ENTRIES` | 65536 *(was 16384 pre-§2.13)* | `out_w*ceil(out_ch/tile_m)*tile_m ≤ this`  *(was `out_w*out_ch` pre-§2.23, `out_h*out_w*out_ch ≤ this` pre-§2.9)* | Persistent accumulator (Option-A) size; sized to hold one output chunk.  Larger outputs auto-split along `oh` — see §2.9 / `compute_oh_chunking()`.  Bound to **URAM** since §2.13 — each 8192 entries spends one URAM block (512-bit words: 8 blocks at 65536), so raising this trades URAM (64 on the XCK26), not BRAM. |
+| `max_m_per_group` | `kMaxMperGroup` | `CONV_MAX_M_PER_GROUP` (not validated) | 4 | none (runtime clamped to `m_tiles`) | Max mt-tiles cached together in the standard path's `(ict, M-group)` weight slab.  Sizes `w_cache` in `process_conv_kernel_tile`.  Larger values eliminate weight DDR replay for more layers in one group; smaller saves BRAM/LUT.  See §2.10 / `compute_m_grouping()`. |
 
-`tile_m`, `tile_ic`, `max_kh`, `max_kw`, `max_m_per_group` are read by
-the C++ build but **not** exported to the Python validator: `kTileM`/
-`kTileIC` are pure unrolling factors (any out_ch/in_ch is
-residual-padded), the kernel-size bounds are already validated against
-weight tensor rank earlier in `ConvNode`, and `kMaxMperGroup` is
-runtime-clamped to the actual `m_tiles`.  The five fields with Python
-names above gate model acceptance: `ConvNode.from_onnx_node` raises
-`SchedulerError` naming the violated bound.
+All ten fields are exported to Python; `tile_ic` and
+`max_m_per_group` are **not** validated: `kTileIC` is a pure
+unrolling factor (any in_ch is residual-padded; the weight packing
+reads it), and `kMaxMperGroup` is runtime-clamped to the actual
+`m_tiles` (the MatMul-on-ConvKernel cost model reads it).  The other
+eight gate model acceptance (`tile_m` through the padded accumulator
+row): `ConvNode.from_onnx_node` raises `SchedulerError` naming the
+violated bound.
 
 ### 4.2. How CMake reads the JSON
 

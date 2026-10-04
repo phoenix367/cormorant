@@ -40,12 +40,14 @@ connection (HTTP/1.0).
 - `version`;
 - `models`: one entry per model — `id`, `ready`, `loaded`, and backend
   fields:
-  - every model: `library`, `weights_dir`;
+  - every model: `library`, `weights_dir` (Piper: `voice_dir`);
   - BERT: `model_name`, `seq_len`, `max_windows`, `windows_run`;
   - SmolLM2: `vocab_size`, `context_size`, `reserve`, `sampler`,
     `cached_tokens`, `defaults`, `requests`,
     `prompt/reused/prefilled/generated_tokens`;
   - SmolVLM: `image_cache`;
+  - Piper: `type`, `sample_rate`, `espeak_voice`, `requests`, `audio_s`,
+    `chunks`, `rtf`, `frontend_s`;
 - `resident`, `cma_free_mb`, `loads`, `unloads`: see
   [residency](DEPLOY.md#several-models-on-one-fpga);
 - `busy`, `waiting`: the FPGA queue;

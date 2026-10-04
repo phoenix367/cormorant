@@ -165,7 +165,7 @@ all `outer × ceil(size / 8)` words (VECTOROP_OPTIMISATION.md §2):
 | `PIPELINE II=1` | every stage loop | One 8-lane word per clock (`OP_DIV`: one lane per clock) |
 | `UNROLL` | lane loops | 8 lanes of a word in one cycle |
 | `ARRAY_PARTITION complete` | `compute_div::res` | per-lane result registers |
-| `LOOP_TRIPCOUNT` | every loop | Latency-report hints only — no hardware effect |
+| `LOOP_TRIPCOUNT` | every stage loop | Latency-report hints only — no hardware effect |
 
 ---
 

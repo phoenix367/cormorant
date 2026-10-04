@@ -4,7 +4,7 @@ End-to-end MNIST inference demo for the KV260 FPGA platform.  Downloads the
 MNIST test split (from the `ossci-datasets` S3 mirror of LeCun's files) and
 two pre-trained ONNX models (an MNIST convnet and a LeNet variant) from a
 shared Google Drive folder, generates a self-contained KV260 inference
-project for each model with `inference-scheduler`, copies in the HLS driver
+project for each model with `inference-scheduler`, copies in the kernel driver
 sources, builds the project on the board over SSH, and runs a benchmark
 that reports top-1 accuracy and per-image latency for each.
 
@@ -39,7 +39,7 @@ demo/mnist/
     │   ├── include/inference*.h    —   from inference-scheduler
     │   ├── src/inference*.c        —   from inference-scheduler
     │   ├── weights/*.dat           —   large weight tensors, read at runtime
-    │   ├── driver/                 —   HLS driver sources copied in
+    │   ├── driver/                 —   kernel driver sources copied in
     │   └── test/
     │       ├── bench_mnist.c       —   copied from demo/mnist/src/
     │       └── bench_glue.h        —   generated; per-model glue + macros
@@ -61,8 +61,8 @@ static: the I/O names and active-kernel set differ per model.
 
 * Python 3.10+
 * `pip install -r requirements.txt`
-* HLS-generated driver sources for the four kernels.  These are produced by
-  the top-level CMake build:
+* Generated driver sources for the four kernels (HLS; the RTL MatmulKernel's
+  by `driver_matmul_rtl`).  These are produced by the top-level CMake build:
 
   ```bash
   # from the repo root

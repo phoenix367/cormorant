@@ -251,7 +251,7 @@ next baseline.
 - Durations are at the testbench's fixed 100 MHz sim basis, comparable
   between runs whatever the HLS clock.  Each includes the testbench's DDR
   fill and register programming (VectorOP's 1-element `ADD` is 4.8 µs,
-  MatMul `1x1x1` 6.7 µs), so tiny cases hardly move — judge a kernel
+  MatMul `1x1x1` 5.8 µs), so tiny cases hardly move — judge a kernel
   change by the large cases and the TOTAL.
 - There is **no run-to-run noise**: re-running an unchanged kernel
   reproduced every `duration_ns` and `sim_time_ns` exactly (2026-09-29,

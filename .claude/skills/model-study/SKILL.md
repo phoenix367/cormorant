@@ -97,7 +97,7 @@ and `llm_study.py costs` (bytes and GMAC per token / per prefill).  Route
 B: `onnx_study.py` replays the event stream with the bitstream's
 performance model (`perf_models/kv260/`, within ±2 % where the calls were
 measured; the family-model share carries its error band — ConvKernel
-families up to ±37 % p90).  ConvKernel per-layer detail: the
+families up to ±36 % p90).  ConvKernel per-layer detail: the
 `conv-cycle-model` skill.  Older studies scaled GMAC at ~40 GMAC/s
 (ConvKernel) / ~2.3 (MatmulKernel); the board came in slower (BERT 10.8 s
 projected → 12.1 s, SmolVLM 5–7 s → 7.7 s) — prefer the simulator.

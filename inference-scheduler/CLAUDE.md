@@ -165,7 +165,8 @@ left in place, non-depthwise grouped Conv) and a worked example on
 ├── driver/                   Kernel driver sources, flat (copied or stub README.md)
 ├── weights/                  External .dat files: weights > 4096 elems, host tables > 64 KiB
 ├── expected/                 External .dat files for large GT expected arrays (> 4096 elems)
-└── report.md                 Model summary (unless --no-report; single-entry only)
+├── report.md                 Model summary (unless --no-report; single-entry only)
+└── timeline.html             With --plan / --plan-report: the predicted execution
 ```
 
 ## Source Layout
@@ -243,8 +244,9 @@ src/
                          as a self-contained Nsight-style page (canvas, LOD merging, search, deps)
   bitstream/             upload_bitstream.py implementation (convert, hwh, xclbin,
                          board, loader, platforms/kv260.py)
-  remote/                SSH session, config defaults, preflight checks (shared by
-                         run_remote_tests.py / run_remote_perf.py / upload_bitstream.py)
+  remote/                SSH session, config defaults, preflight checks, the board lock
+                         (lock.py, `python -m src.remote.locked`; shared by run_remote_tests.py /
+                         run_remote_perf.py / upload_bitstream.py / perf_calibrate.py)
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
     _core.py             _compute_event_stream() → list of comment/start/wait/drain/cpu events
@@ -688,7 +690,7 @@ Four scripts drive KV260 hardware over SSH:
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (148 models) |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json` (60 cases) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (60 cases) |
 | `perf_calibrate.py run` | **Calibration** for `--plan` — times batches of kernel calls with `bench_src/calib_runner.c` (two passes), then `fit` writes `perf_models/<platform>/<bitstream-id>.json` (`../doc/plans/TACTICS_PLAN.md` §4.3) | `--config` in the `run_remote_perf.py` format |
 
 All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for

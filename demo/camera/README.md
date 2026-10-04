@@ -2,9 +2,9 @@
 
 Real-time ImageNet classification from a live **Intel RealSense** camera on
 the KV260 FPGA platform, using **MobileNetV1 1.0/224** running on this
-repo's own HLS kernels (Conv / Pool / VectorOP) — no Vitis-AI / DPU.
+repo's own kernels (Conv / Pool / VectorOP / MatMul) — no Vitis-AI / DPU.
 The shipped `mobilenet_v1_1.0_224_no_softmax` variant ends in a 1×1 Conv
-classifier, so MatmulKernel is not on the active path.
+classifier, which the scheduler runs as a MatMul on MatmulKernel (`--fc-conv`).
 
 Connect a RealSense camera to the board, run the orchestrator, and the demo
 will
@@ -33,7 +33,7 @@ flowchart LR
 > **Frame rate.** The pipeline keeps one frame in flight, so the display rate
 > is bounded by the per-frame inference time.  The transcript below (May 2026)
 > was recorded with an early ConvKernel: 2.46 s per frame, ~0.4 FPS.  The
-> current kernels run MobileNetV1 in ~81–83 ms (the
+> current kernels run MobileNetV1 in ~73 ms (the
 > [`image_classification/`](../image_classification/) demo); the camera demo
 > has not been re-measured with them, and at that speed the capture,
 > preprocessing, JPEG encoding and the host's SFTP pull
@@ -91,7 +91,8 @@ expensive. So the board runs a **persistent** inference host:
 * Python 3.10+, `pip install -r requirements.txt`
   (gdown, numpy, onnx, onnxsim, paramiko, **opencv-python** for the display
   window — a headless host can use `--save-only` instead).
-* HLS-generated driver sources for the kernels:
+* Generated driver sources for the kernels (HLS; the RTL MatmulKernel's by
+  `driver_matmul_rtl`):
 
   ```bash
   # from the repo root
@@ -109,8 +110,8 @@ expensive. So the board runs a **persistent** inference host:
 
 * Linux with the cormorant bitstream and overlay loaded
   (`inference-scheduler/upload_bitstream.py`, see the root README), so
-  `/dev/uio*` exposes `fabric_vecop` / `fabric_conv` / `fabric_pool` (the
-  three kernels this model uses).
+  `/dev/uio*` exposes `fabric_vecop` / `fabric_matmul` / `fabric_conv` /
+  `fabric_pool` (the four kernels this model uses).
 * `gcc`, `cmake ≥ 3.19`, `make`.
 * XRT runtime via `pkg-config xrt` or `/opt/xilinx/xrt`.
 * Passwordless `sudo` for the SSH user (XRT requires root).
@@ -187,8 +188,9 @@ shut down cleanly and the remote scratch directory is removed.
 
 Sample output (host `~/projects/axi_demo/demo/camera`, board at
 `192.168.100.8` with a RealSense D435; May 2026, with the ConvKernel of that
-time — the scheduler now also emits a host `SpaceToDepth` stem node, 59
-nodes in all, see the image-classification README):
+time — the scheduler now also emits a host `SpaceToDepth` stem node and
+runs the classifier as a MatMul, 62 nodes in all, see the
+image-classification README):
 
 ```
 $ ./run_demo.py
@@ -270,15 +272,16 @@ Each annotated frame's bottom strip reads
 
 Notable behaviour visible in the run:
 
-- **Only three kernels are active.**  The `no_softmax` MobileNetV1 ends
-  in a 1×1 `Conv` (node 55) rather than a fully-connected `MatMul`, so
-  `[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel`.
+- **Only three kernels were active in this run.**  The `no_softmax`
+  MobileNetV1 ends in a 1×1 `Conv` (node 55) rather than a fully-connected
+  `MatMul`, so `[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel,
+  PoolKernel` (today that classifier runs as a MatMul on MatmulKernel).
 - **Power source picked automatically.**  `xlnx_platformstats` (the SOM
   INA260 sensor, 3.18 W idle) was selected at startup; see *Power
   measurement* below for the fallback chain.
 - **Per-frame inference latency ≈ 2.46 s** in this run — the
   image-classification demo's MobileNetV1 time with the ConvKernel of
-  that date (it is ~81–83 ms now); the pipeline is one-frame-in-flight,
+  that date (it is ~73 ms now); the pipeline is one-frame-in-flight,
   so display refresh capped at ~0.4 fps.
 
 ### Power measurement

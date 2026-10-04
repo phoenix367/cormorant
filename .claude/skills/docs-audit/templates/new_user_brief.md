@@ -104,8 +104,8 @@ gaps; you do not fix them.
    `demo/bert_squad`, `demo/chat` (bert-squad and SmolLM2-135M backends: clients,
    the curl examples, `board_gate.py`), `demo/camera` (read-through only — no
    RealSense camera).  Only if time allows: SmolVLM-256M (its generation peaks
-   at ~20 GB RAM — never beside another generation).  Skip the SmolLM2-360M
-   generation (32 GB RAM).
+   at ~3.3 GiB RAM — never beside another generation).  Skip the SmolLM2-360M
+   generation (7.7 GiB RAM).
 
 The 2026-09-29 run took ~2 h 15 min with overlap (Vivado 71 min, RTL tests
 45 min).

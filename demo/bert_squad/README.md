@@ -4,7 +4,8 @@ Extractive question answering with **BERT-base** (ONNX model zoo
 `bertsquad-12`: 12 layers, hidden 768, 12 heads, sequence 256, 108.7 M
 parameters, fine-tuned on SQuAD 1.1) running on the KV260's
 **ConvKernel** (the MatMuls, with swapped operand roles — BERT_PLAN §2 2A),
-**MatmulKernel** (the two MatMuls ConvKernel cannot take) and
+**MatmulKernel** (the two MatMuls ConvKernel cannot take and the attention
+P·V MatMuls) and
 **VectorOPKernel**, with LayerNorm / GELU / Softmax / Transpose / embedding
 lookup on the A53 host.  The demo
 
@@ -84,10 +85,11 @@ demo/bert_squad/
 
 * The all-kernels bitstream, loaded with `fabric_vecop` / `fabric_matmul` /
   `fabric_conv` UIO devices.  With the scheduler's default
-  `--matmul-on-conv auto` (what `generate_project.py` uses) 96 of the 98
-  MatMuls run on ConvKernel; the K = 2 token-type MatMul and the M = 2
-  span head stay on MatmulKernel.  With `--no-matmul-on-conv` (phase 1; a
-  scheduler CLI option, not exposed by `generate_project.py`) MatmulKernel
+  `--matmul-on-conv auto` (what `generate_project.py` uses) 84 of the 98
+  MatMuls run on ConvKernel; the K = 2 token-type MatMul, the 12 attention
+  P·V MatMuls and the M = 2 span head stay on MatmulKernel.  With
+  `--no-matmul-on-conv` (phase 1; a scheduler CLI option, not exposed by
+  `generate_project.py`) MatmulKernel
   needs `kernels.matmul.max_k` ≥ 3072 (the FFN down-projection has
   K = 3072; `platforms/kv260.json` has 4096).
 * `gcc`, `cmake ≥ 3.19`, `make`, XRT, root or passwordless `sudo`.
@@ -174,7 +176,7 @@ Without `--plan` / `--plan-report` / `--perf-model` it uses the config's
 ## Sample run
 
 **Phase 1** (2026-09-26: every MatMul on MatmulKernel, host ops unoptimised
-— the current schedule is 12.5× faster, see *Results* below).  Host
+— the current schedule is 13.2× faster, see *Results* below).  Host
 `demo/bert_squad`, board at `192.168.100.8` (KV260, Ubuntu 22.04,
 MatmulKernel `max_k` 4096 bitstream, 100 MHz), first 50 single-window
 questions prepared.  The first run uploaded the weights (76 files, 217 MB,
@@ -333,10 +335,12 @@ Per inference:
 | other | 5 | 3 ms | 0.2 ms |
 | **wall** | | **12131 ms** | **971 ms** |
 
-**Latest** (2026-09-28, bitstream hw_128 d7ce129; 10 examples, no
+**2026-09-28** (bitstream hw_128 d7ce129; 10 examples, no
 profiling): p50 **962.3 ms** per inference; generated with `--plan` (issue
 order from the performance model) **951.3 ms**, bit-exact
-(`doc/plans/TACTICS_PLAN.md` §9, T4).
+(`doc/plans/TACTICS_PLAN.md` §9, T4).  **Latest**, on the RTL MatmulKernel bitstream
+1d28630fbfa4 with the attention P·V on MatmulKernel (2026-10-04, all 50
+examples): p50 **919.8 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 

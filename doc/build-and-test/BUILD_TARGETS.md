@@ -133,7 +133,8 @@ The MatmulKernel of the hardware build, `kernels/matmul_rtl/`
 ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)): a drop-in for the
 retired HLS kernel (same VLNV, registers, layouts and bits).  Each target exists
 only when its tool is found: Verilator 5.x (`sudo apt install verilator`) for
-the testbench and lint, Vivado for the rest.
+the testbench and lint, Vivado for the rest (`driver_matmul_rtl` needs only
+Python).
 
 | Target | Description |
 |--------|-------------|

@@ -614,8 +614,8 @@ gantt
 
 Each bar spans `[start_event_idx, drain_event_idx)` — the window in
 which that node is in flight on its lane. Pool #2 overlaps Conv #3
-(events 9-11) and reluB #4 (events 12-14): three lanes are
-simultaneously in flight at event 12. The join Add at event 16 only
+(events 9-11) and reluB #4 (events 12-14): two lanes are
+simultaneously in flight at events 9 and 12. The join Add at event 16 only
 fires after waits drain Pool and VectorOP at events 14 and 15.
 
 The slot view is the same x-axis but coloured by pool slot:

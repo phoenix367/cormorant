@@ -127,8 +127,8 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
   `missing driver files` warning (drivers come from
   `demo/bert_squad/bert_squad_config.json` `local.driver_dirs`; never generate
   while a conv synthesis rewrites `build*/…/drivers/`).  360M: pool 740.2 MiB,
-  weight files 818 MB, 224 / 224 prefill MatMuls on ConvKernel (kw 4), 225
-  decode on GEMV.
+  weight files 818 MB, 224 / 224 MatMuls of `prefill_64` / `prefill_256` on
+  ConvKernel (kw 4) and of `prefill_16` on MatmulKernel, 225 decode on GEMV.
 
 ## 3. Host gates — bit-exact before any board time
 
@@ -197,8 +197,8 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
   `[--remote-dir DIR] [--weights-dir DIR]` for a second install beside an
   existing one (defaults: `chat_config.json` `remote.dir`,
   `/root/${T}_weights`).
-- Reference (360M): decode 256 / 270 / 306 ms at 32 / 256 / 1000, prefill
-  0.83 / 1.00 / 2.90 s, CMA used 736–740 MB.
+- Reference (360M, bitstream `1d28630fbfa4`): decode 254 / 315 ms at 32 /
+  1000, prefill 0.58 / 1.04 / 3.08 s, CMA used 736–740 MB.
 
 **CMA budget** (`cma=1000M`, ~954 MiB usable, idle CmaFree ~1011 MB, less
 with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 286,
@@ -246,7 +246,7 @@ nothing — the id and fingerprint come from the library:
   (two `fake_llm_lib(model_name)` copies side by side, `build_backends`
   order / `cma_mb` / fingerprint, default ids and overrides, one id twice →
   `SystemExit`).  **Gate:** `cd demo/chat/tests && python3 -m unittest -v`
-  (153 before, ~60 skip without tokenizers).
+  (188 before, ~60 skip without tokenizers).
 
 **Deploy and talk to it:**
 
@@ -291,7 +291,7 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
   board lock" and the by-hand server command; the test count in the README
   and `DEVELOPMENT.md`.
 - `README.md`: the results table (~line 32) and the supported-models table
-  (~line 253); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
+  (~line 286); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
   `kv260_chat_server.py`'s docstring, `chat_config.json.example`, and
   model-study (`SKILL.md` §2.2, `llama_fit.py` `RESIDENT`).
 - Commit set: code, tests, docs, `llm_models.json`, the provenance JSON.

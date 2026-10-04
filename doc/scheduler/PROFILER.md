@@ -13,9 +13,10 @@ the inference loop runs on the KV260:
 It is **opt-in at compile time** via a single CMake option and degrades
 to zero-cost no-ops when off.  The two modules can be linked
 independently into any host application that uses the generated
-`inference` library — the MNIST, image-classification, BERT-SQuAD and
-chat benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
-`llm_bench.c`) all use them (the chat bench only the per-layer profiler).
+`inference` library — the MNIST, image-classification, BERT-SQuAD, chat
+and TTS benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
+`llm_bench.c`, `tts_bench.c`) all use them (the chat and TTS benches only
+the per-layer profiler).
 The per-layer profiles also feed the host-op timing model of the
 scheduler's `--plan` mode ([Other benches](#other-benches)).
 
@@ -400,7 +401,7 @@ overrides `cfg.run.profile_layers` to true for that run.
 ### Reporting
 
 Per-model summary printed by `deploy_and_run.py` (example from a
-2026-05 bitstream; the current one runs `mnist_convnet` at 0.266 ms —
+2026-05 bitstream; the current one runs `mnist_convnet` at 0.260 ms —
 see `demo/mnist/README.md`):
 
 ```
@@ -438,6 +439,8 @@ for downstream analysis.
   results JSON holds `profile` (ms per call per op kind and phase) and
   `profile_layers` (per phase, the called layers: `i`, `name`, `calls`,
   `mean_us`, `min_us`, `total_us`).
+- **TTS** (`demo/tts/src/tts_bench.c`) — the same, phases `chunk` and
+  `encode_<T>`; `demo/tts/scripts/tts_board.py --profile --out FILE`.
 
 `inference-scheduler/perf_calibrate.py host --profile MODEL=RESULTS.json`
 fits the host-op model `perf_models/<platform>/host.json` from these files
@@ -474,7 +477,7 @@ it again for JSON (control chars as `\u00XX`).
 
 ## Troubleshooting
 
-### `DDR_JSON: {"available":false,"reason":"open(/dev/mem) failed: Permission denied …"}`
+### `DDR_JSON: {"available":false,"reason":"… open(/dev/mem) failed: Permission denied …"}`
 
 `bench_mnist` not running as root.  Either `sudo`-launch (the demo's
 `deploy_and_run.py` already does this when `run.use_sudo: true`) or grant

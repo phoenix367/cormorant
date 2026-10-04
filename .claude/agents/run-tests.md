@@ -18,7 +18,7 @@ All runs go through the helper (repo root = `/home/ivan/projects/axi_demo`):
 
 ```bash
 python3 .claude/agents/run-tests/run_tests.py --suite SUITES [--tests PATH[::NODE] ...] [-k EXPR]
-        [--pytest-args "..."] [--timeout S] [--json FILE] [--detach] [--record-baseline] [--list]
+        [--pytest-args "..."] [--timeout S] [--out-dir DIR] [--json FILE] [--detach] [--record-baseline] [--list]
 ```
 
 It prints a JSON report on stdout (progress on stderr) and keeps it, the

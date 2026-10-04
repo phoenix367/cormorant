@@ -168,10 +168,14 @@ inference_scheduler.py          CLI, argument parsing
     │                           attention prep / softmax, GELU table, ...)
     ├── vit.py                  vision frontend (SigLIP ViT + connector) ->
     │                           the `vision` entry of a multi-entry project
+    ├── piper.py, tts_nodes.py  Piper TTS frontend (`chunk`, `encode_<T>`
+    │                           entries) and its axi.llm host ops
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
     ├── matmul_lowering.py      MatMul -> ConvKernel engine choice, geometry, row split
-    ├── matmul_gemv.py          MatmulKernel GEMV streaming pass (single-row MatMuls)
+    ├── matmul_gemv.py          MatmulKernel GEMV / image pass (single-row MatMuls
+    │                           on the HLS kernel, any on the RTL kernel)
+    ├── fc_conv.py              fully-connected Convs -> MatMul
     ├── llm_entries.py          Llama entry graphs sharing one image per weight
     ├── cost_model.py           ConvKernel / MatmulKernel cycle estimates
     ├── planning.py             --plan options, performance-model lookup
@@ -187,6 +191,7 @@ inference_scheduler.py          CLI, argument parsing
     │                           independent pairs
     ├── report.py               report.md (model summary, transformations, layers,
     │                           planning)
+    ├── timeline_html.py        timeline.html (the predicted execution)
     └── codegen/    CodeGenerator
                     _core.py    event stream, tensor layout, DMA pool sizing,
                                 event-stream liveness intervals
@@ -228,12 +233,13 @@ inference_scheduler.py          CLI, argument parsing
    (exponents, host tensors, states — states leave the input / weight
    lists).  Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` /
    `ReshapeNode` / `SpaceToDepthNode` / `ScheduledNode` / a host node
-   (`host_nodes.HOST_OP_FACTORIES`, or `llm_nodes.LLM_OP_FACTORIES` and
-   `vit_nodes.VIT_OP_FACTORIES` for the `axi.llm` domain) based on
-   `op_type`; kernel nodes reading an integer tensor are rejected; then
-   `numeric.check` (only MatMuls and the LLM ops touch exponent / host /
-   state tensors) and `numeric.encode_matmul_weights` (rank-1 weight
-   exponents, before any packing or re-layout).
+   (`host_nodes.HOST_OP_FACTORIES`, or `llm_nodes.LLM_OP_FACTORIES`,
+   `vit_nodes.VIT_OP_FACTORIES` and `tts_nodes.TTS_OP_FACTORIES` for the
+   `axi.llm` domain) based on `op_type`; kernel nodes reading an integer
+   tensor are rejected; then `numeric.check` (only MatMuls, Convs and the
+   LLM / TTS ops touch exponent tensors, only those ops host / state
+   tensors) and `numeric.encode_matmul_weights` (rank-1 weight exponents,
+   before any packing or re-layout) / `numeric.encode_conv_weights`.
 10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
    into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
    re-pointed) and renumbers node indices.
@@ -1095,14 +1101,17 @@ rows, 1.7–1.9× faster on the board (CHAT_PLAN §24).  Under `--plan` every
 row split of a contiguous-rows MatMul is a candidate
 (`conv_plans(splits="all")`, [§Planning](#planning---plan)).
 
-BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
+BERT-base (bertsquad-12, 386 nodes): 84 of the 98 MatMuls run on ConvKernel
 — the 72 encoder linears as 1×4 convs (`in_ch` 192 / 768, output 48×16 or
-192×16) and the 24 attention MatMuls as 12 per-head 1×1 calls each — in 360
-ConvKernel calls; the K = 2 token-type MatMul and the M = 2 span head stay
-on MatmulKernel.  Cost model at 100 MHz: 0.62 s of MatMul per inference
-against 8.37 s on MatmulKernel (the phase-1 board measured 8.41 s).  On
-the board the MatMuls take 0.63 s (linears 0.49 s at ~44 GMAC/s, attention
-0.14 s) and BERT-base 4.34 s per inference instead of 12.13 s, logits
+192×16) and the 12 attention q·Kᵀ MatMuls as 12 per-head 1×1 calls each — in
+216 ConvKernel calls; the 12 attention P·V MatMuls (weight-request bound on
+ConvKernel, `conv_board_cycles`), the K = 2 token-type MatMul and the M = 2
+span head stay on MatmulKernel (phase 2A: 96 MatMuls on ConvKernel, P·V too,
+in 360 calls).  Phase 2A, cost model at 100 MHz: 0.62 s of MatMul per
+inference against 8.37 s on MatmulKernel (the phase-1 board measured
+8.41 s).  On the board the MatMuls take 0.63 s (linears 0.49 s at
+~44 GMAC/s, attention 0.14 s) and BERT-base 4.34 s per inference instead
+of 12.13 s, logits
 bit-exact — BERT_PLAN §3 "Phase 2A".
 
 ### MatMul GEMV streaming
@@ -1143,7 +1152,8 @@ weight buffers, CMA pool 488.2 → 285.8 MiB, weight files 538 → 326 MB.
 `entry_graphs` also consumes the entry models one at a time and points
 equal weight arrays of the entries at one copy (and `OnnxGraph` keeps
 detached NodeProto copies, which do not pin their ModelProto): generating
-SmolLM2-360M peaks at 32 GB of host memory instead of running out of 46.
+SmolLM2-360M no longer runs out of 46 GB of host memory; with the other
+savings of CHAT_PLAN §25 it peaks at 7.7 GiB.
 `test/test_matmul_gemv.py` covers the pass; `test/test_llama.py` builds
 the four-entry tiny project this way and runs it on the host emulation,
 whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
@@ -1288,7 +1298,8 @@ the four demo `generate_project.py` scripts (or `"plan"` in their config
 JSON); `demo/chat/deploy.py --regenerate --plan` plans the BERT project.
 
 The simulator predicts SmolVLM, SmolLM2, BERT and the CNN demos within 2 %
-of the board.  Planned builds measured: SmolVLM `llm_image` −1.1 % (vision
+of the board, except SmolLM2-360M (−2.6 … −6.0 %, MATMUL_RTL_PLAN phase
+3a).  Planned builds measured: SmolVLM `llm_image` −1.1 % (vision
 fc1 geometry) and BERT −1.1 % (issue order), all bit-exact
 (TACTICS_PLAN §9).
 
@@ -1301,7 +1312,7 @@ image and `numel` / the `.dat` file / the DMA buffer follow it, while
 
 | Kernel | Tensor | Layout |
 |---|---|---|
-| ConvKernel | weight, bias | tile-major `[M][ceil(C/16)][kH][kW][lanes]`, bias padded to 8 (CONV_OPTIMISATION §2.32 / §2.34); a space-to-depth stem's re-indexed `<W>_s2d` initializer is packed the same way |
+| ConvKernel | weight, bias | tile-major `[M][ceil(C/16)][kH][kW][lanes]` (depthwise `[M][roundup(kH·kW, 8)]`), bias padded to 8 (CONV_OPTIMISATION §2.32 / §2.34); a space-to-depth stem's re-indexed `<W>_s2d` initializer is packed the same way |
 | MatmulKernel | B (constant only) | tile-major `[ceil(M/32)][K][32]`, `b_packed = 1` on every consumer (MATMUL_OPTIMISATION §3b, §8) |
 | MatmulKernel GEMV (`gemv_kw`) | B | row-major for `kw = 1`; for `kw > 1` (a constant named in `matmul_gemv_kw`) the ConvKernel x image of the row below — the same buffer ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | ConvKernel (MatMul on ConvKernel) | B (constant, read only by that MatMul, `kw > 1`) | `x[c][kw·p + j] = B[(c/16)·16·kw + j·16 + c%16][p]` per batch slice ([§MatMul on ConvKernel](#matmul-on-convkernel)); A needs none |
@@ -1361,8 +1372,8 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_HOST_THREADS=N` | `INFERENCE_HOST_THREADS=N` (1–64) | 4 | threads per host op (caller + N − 1 workers); models with host ops only |
 | `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
 
-BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
-ConvKernel, 2 on MatmulKernel) for example:
+BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 84 MatMuls on
+ConvKernel, 14 on MatmulKernel) for example:
 
 ```c
 int  inference_init(const char *vectoropkernel_instance,

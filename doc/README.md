@@ -71,7 +71,7 @@ survey of HLS convolution techniques (not a plan).
 
 | Document | Contents |
 |---|---|
-| [INFERENCE_SCHEDULER](scheduler/INFERENCE_SCHEDULER.md) | Technical reference: supported ops, kernel mapping, MatMul on ConvKernel, host-CPU ops, numerics, the Llama frontend, the vision encoder, planning (`--plan`), cache coherency, the generated code |
+| [INFERENCE_SCHEDULER](scheduler/INFERENCE_SCHEDULER.md) | Technical reference: supported ops, kernel mapping, MatMul on ConvKernel, host-CPU ops, numerics, the Llama frontend, the vision encoder, text to speech (Piper), planning (`--plan`), cache coherency, the generated code |
 | [PROFILER](scheduler/PROFILER.md) | Per-layer wall-clock and DDR-bandwidth profiling of generated projects on the board |
 
 In [`inference-scheduler/doc/`](../inference-scheduler/doc/):
@@ -94,13 +94,13 @@ line at the top says what is done.
 |---|---|
 | [THROUGHPUT_PLAN](plans/THROUGHPUT_PLAN.md) | MatMul, depthwise and VectorOP throughput tracks (2026-09-25/26): executed |
 | [CONV_2D_GRID_PLAN](plans/CONV_2D_GRID_PLAN.md) | The 2-D MAC grid for ConvKernel: executed, then grown further by RESNET18_15FPS_PLAN |
-| [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (60.3 ms = 16.6 FPS) |
+| [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (59.9 ms = 16.7 FPS) |
 | [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference (919 ms p50 on 2026-10-04, the RTL MatmulKernel bitstream), accuracy equal to float32 |
-| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
+| [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21), SmolVLM-256M image chat (§22–§24, 3.9 s per image) and a generator that needs 4× less host RAM (§25) |
 | [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TTS_PLAN](plans/TTS_PLAN.md) | Text to speech: Audio8 TTS Preview 0.1B — NO-GO for real time (18 GB/s of weights needed, 2.9 GB/s available); candidate screen — Piper, TinyTTS, Kitten nano and Supertonic-3 fit; Piper lessac-medium study — GO (int16 within 0.19 dB log-mel of float); implementation — `libpiper_tts.so` bit-exact on the board, RTF 0.52; `/v1/audio/speech` in the chat server; the text encoder on the FPGA (int16, 0.37 dB log-mel from float, 3.7–4.9× faster) and the duration predictor in C (3×); first audio 1.0–1.5 s |
 | [MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md) | Replacing the HLS MatmulKernel with the SystemVerilog one: done — in the repository, bitstream `1d28630fbfa4` (timing met, 8.7 k LUT / 17.8 k FF fewer), bit-exact on the board with no workload slower, the scheduler's RTL cost model and one-copy engine choices (16-token LLM prefill −26…−32 %, MobileNet v1 −10 %), the default of the build, the scheduler and the board since phase 4 |
-| [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |
+| [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board (except SmolLM2-360M and the Piper chunk), BERT and SmolVLM vision −1.1 % |
 
 ## Claude Code skills
 
@@ -125,5 +125,5 @@ Subagents in [`.claude/agents/`](../.claude/agents/):
 
 | Agent | Use it to |
 |---|---|
-| `run-tests` | run all or selected test suites and get a structured JSON report. Suites: scheduler and chat pytest, ruff, kernel C-sim, Piper host emulation; RTL only on request. The report lists every failure (with a diagnosis and a flaky rerun), unexpected skip, warning and short run, measured against `run-tests/baselines.json`. The helper also runs on its own: `python3 .claude/agents/run-tests/run_tests.py --suite default`. |
+| `run-tests` | run all or selected test suites and get a structured JSON report. Suites: scheduler and chat pytest, ruff, the fact registry, kernel C-sim, Piper host emulation; RTL only on request. The report lists every failure (with a diagnosis and a flaky rerun), unexpected skip, warning and short run, measured against `run-tests/baselines.json`. The helper also runs on its own: `python3 .claude/agents/run-tests/run_tests.py --suite default`. |
 | `code-audit` | audit code within a scope: the paths or subsystem named, by default the changes not yet on origin/main. It fixes stale facts in comments, docstrings and help texts, and removes provably dead code, keeping public APIs and reporting them. It reports interface and protocol inconsistencies with evidence from both sides: ctypes vs C headers, CLI flags between scripts, config keys, binary file writer vs reader, register maps, HTTP API, board paths. It checks its edits with the tests. Its checkers (`ctypes_check.py`, `unused.py`, `flags_check.py`, `config_keys.py` in `.claude/agents/code-audit/`) also run on their own. |

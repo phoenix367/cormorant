@@ -405,7 +405,10 @@ Source model: `mobilenet_v1_1.0_224_no_softmax.onnx`
 The graph is a pure linear pipeline of 58 nodes: a first standard convolution
 followed by 13 depthwise-separable blocks and a final 7×7 average pool,
 1×1 classifier Conv and Reshape + Squeeze to the 1 001-class logit vector.
-Figures below use the library defaults (`OnnxGraph()`; the CLI's
+Figures below use the library defaults with the fully-connected-Conv
+rewrite off (`OnnxGraph(fc_conv="off")`; the default `fc_conv="auto"` runs
+the 1×1 classifier Conv as a MatMul — weights 8.17 MiB, three more
+intermediates, still two slots — and the CLI's
 space-to-depth stem rewrite adds one intermediate and leaves the two slots
 unchanged).
 

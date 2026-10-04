@@ -179,8 +179,8 @@ All pool variants support configurable stride, padding, and dilation.
 Run on the A53 inside `inference_run()` (double arithmetic, round-half-even
 write-back, multi-threaded): `Softmax` (last axis), `LayerNormalization`,
 `Gelu`, `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0), `OneHot`,
-`Cast` (integer ↔ `Data_t`), `SpaceToDepth`, and the Llama decoder and
-vision-encoder (SmolVLM) ops of the custom domain `axi.llm`.
+`Cast` (integer ↔ `Data_t`), `SpaceToDepth`, and the Llama decoder,
+vision-encoder (SmolVLM) and text-to-speech (Piper) ops of the custom domain `axi.llm`.
 TensorFlow-style LayerNorm and GELU (tanh / erf)
 subgraphs are fused into single host ops first (`--no-fuse-patterns`
 disables it); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` /
@@ -224,7 +224,8 @@ python3 -m venv .venv
 ```
 
 Dependencies (from `requirements.txt`): `onnx`, `numpy`, `paramiko`
-(remote-test runners), `pytest` (the test suite), plus `onnxsim`, `onnxoptimizer`, `onnxruntime`
+(remote-test runners), `pytest` (the test suite), `pyyaml` (the fact registry checker
+`../tools/facts/facts.py`), plus `onnxsim`, `onnxoptimizer`, `onnxruntime`
 (used by [`simplify_onnx.py`](../simplify_onnx.py) — see
 [MODEL_PREPARATION.md](MODEL_PREPARATION.md)).
 
@@ -392,7 +393,8 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │   └── <name>.dat                Raw little-endian binary GT expected data;
 │                                 loaded at runtime by fread() in test_inference.c.
 │
-└── report.md                     Model summary (unless --no-report; §11)
+├── report.md                     Model summary (unless --no-report; §11)
+└── timeline.html                 With --plan / --plan-report: the predicted execution (§11)
 ```
 
 ---
@@ -471,7 +473,7 @@ static inline int inference_buf_is_cached(const inference_buf_t *buf);
 void inference_buf_sync_to_device(inference_buf_t *buf);   /* clean: before a kernel reads OR writes */
 void inference_buf_sync_from_device(inference_buf_t *buf); /* invalidate: after a kernel wrote */
 
-/* Plain C casts between float and Data_t (see the note in §7) */
+/* Conversion between float and Data_t's number format (see the note in §7) */
 void inference_buf_fill_float(inference_buf_t *buf, const float *src, unsigned n);
 void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n);
 ```
@@ -882,7 +884,7 @@ used) followed by these sections:
 | Weight quantization error *(fixed-point only)* | Per-weight `Max \|abs\|` / `NRMSE` / `SQNR (dB)`, with a "Used by" column linking each tensor to the consuming layer and role |
 | Activation memory | Pool slot count after coloring, total pool size, naive baseline, saving in elements/bytes/percent |
 | Hardware lanes | Per-lane usage check (`✓` / `–`) and node count |
-| Applied transformations | Gemm decomposition, activation fusion, MatMul on ConvKernel, planning (`--plan`), space-to-depth stem, pattern fusion, constant-broadcast normalisation, host-CPU ops, ReshapeNode folding, buffer-pool reuse summary, cross-lane parallelism (overlapping starts / total starts) — each line only when it applies |
+| Applied transformations | Gemm decomposition, activation fusion, MatMul on ConvKernel, planning (`--plan`), space-to-depth stem, fully-connected Conv → MatMul, pattern fusion, constant-broadcast normalisation, host-CPU ops, ReshapeNode folding, buffer-pool reuse summary, cross-lane parallelism (overlapping starts / total starts) — each line only when it applies |
 | Planning *(`--plan` / `--plan-report` only)* | Predicted time of one `inference_run()` from the performance and host-op models, CPU busy / waiting time, the issue-order result, busy time per lane, and where the CPU waits (the nodes whose kernels it waits for longest) |
 | Layers | One row per `ScheduledNode` with op-specific notes (Conv: `k=⋯·s=⋯·p=⋯`, Pool: type+window, Matmul: shape sizes) plus, for fixed-point dtypes, per-layer truncation `Max \|abs\|` / `NRMSE` / `SQNR (dB)` |
 | Generated artifacts | Every file written for this run |
@@ -1012,7 +1014,8 @@ reshape the input graph before code generation:
 - **Gemm decomposition** count — Gemm nodes rewritten to `MatMul + Add`
   by `OnnxGraph._preprocess_model`.
 - **Activation fusion**, **MatMul on ConvKernel**, **Space-to-depth stem**,
-  **Pattern fusion**, **Constant broadcast normalisation**, **Host-CPU ops**
+  **Fully-connected Conv → MatMul**, **Pattern fusion**,
+  **Constant broadcast normalisation**, **Host-CPU ops**
   — counts of the load-time rewrites described in the
   [technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md) (listed only when
   non-zero).
@@ -1042,7 +1045,7 @@ A truncated fragment from the report for `parallel_two_chains.onnx`:
 |-------------------|--------------------------------------|
 | Model             | `parallel_two_chains.onnx`           |
 | Data type         | `ap_fixed<16,8>` (2 byte/elem)       |
-| Hardware lanes    | VectorOPKernel, ConvKernel, PoolKernel |
+| Hardware lanes used | VectorOPKernel, ConvKernel, PoolKernel |
 
 …
 

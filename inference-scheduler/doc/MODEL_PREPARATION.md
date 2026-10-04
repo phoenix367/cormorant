@@ -148,7 +148,7 @@ remedies are:
 | `Shape`, `Gather` / `Concat` on shapes | Dynamic-shape scaffolding | A `simplify_onnx.py` pass with pinned input shapes (`--batch` / `--input-shape`) constant-folds them. |
 | `Pad` with non-constant pads | Dynamic padding via `Shape`/`Slice` | Re-export the model with constant padding values, or rewrite via `onnx.compose` / `onnx-graphsurgeon`. |
 | `Conv` with `group != 1 and group != in_channels` | Grouped convolution (not depthwise) | Not supported by ConvKernel. The model needs surgery to expand the grouped conv into multiple normal convs. |
-| `MatMul` with `k > kMaxK` | Inner-dim larger than the platform's `kernels.matmul.max_k` | Either bump `max_k` in `platforms/<name>.json` and re-synthesise, or split the matmul along K (manual). |
+| `MatMul` with `k > kMaxK` | Inner-dim larger than the platform's `kernels.matmul.max_k` | Either bump `max_k` in `platforms/<name>.json` (and the RTL kernel's `K_MAX` in `kernels/matmul_rtl/rtl/mm_pkg.sv`) and rebuild the bitstream, or split the matmul along K (manual). |
 
 `onnx.utils.extract_model` is the easiest way to keep just the
 "interesting" portion of a network — see the local `mobilenet_v1_*`

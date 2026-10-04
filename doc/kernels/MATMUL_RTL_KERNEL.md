@@ -55,7 +55,7 @@ make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP,
 
 | CMake cache variable | Default | Meaning |
 |---|---|---|
-| `MM_RTL_FIXTURES` | `hw/test_data/matmul_test_data` | Fixtures `TestMatmulRtl` checks (`make gen_matmul_test_data` rewrites them from `ref_matmul_2d`) |
+| `MM_RTL_FIXTURES` | `hw/test_data/matmul_test_data` | Fixtures `TestMatmulRtl` checks (the checked-in copy of what `make gen_matmul_test_data` writes from `ref_matmul_2d` into `build/matmul_test_data/`) |
 | `MM_RTL_RANDOM_CASES` | 200 | Random cases after the fixtures in `TestMatmulRtl` |
 | `MM_RTL_PERIOD` | 3.333 | `synth_matmul_rtl` clock period in ns (300 MHz) |
 

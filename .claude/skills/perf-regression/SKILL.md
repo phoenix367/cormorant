@@ -6,7 +6,7 @@ allowed-tools: Bash Read
 # perf-regression
 
 One board session, one comparison.  The reference numbers live in
-`baselines/` (one file per platform + bitstream), not in the five
+`baselines/` (one file per platform + bitstream), not in the four
 `*_OPTIMISATION.md` logs.  Commands run from the repo root unless stated.
 
 ```bash
@@ -21,7 +21,8 @@ STAMP=$(date +%Y%m%d_%H%M)
 
 - `inference-scheduler/perf_config.json` exists (local, gitignored copy of
   `perf_config.json.example`: the board's UIO names `fabric_vecop` /
-  `fabric_matmul` / `fabric_conv` / `fabric_pool`, the local HLS driver dirs).
+  `fabric_matmul` / `fabric_conv` / `fabric_pool`, the local driver dirs:
+  three HLS exports and MatmulKernel's `driver_matmul_rtl` output).
 - The kernels are CORRECT on the board (board-deploy §3).  This skill
   measures speed only; a wrong result is not a perf question.
 - Nothing else uses the board.  **Never two board jobs at once** — every

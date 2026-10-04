@@ -89,7 +89,7 @@ tables, 1 / 3 / 4 host threads) and the kernel call parameters must
 reproduce the scheduler simulation bit for bit (`test_bert_tiny.py`,
 `test_split_int.py`, `test_matmul_on_conv.py`, `test_matmul_gemv.py`,
 `test_numeric.py`, `test_llm_ops.py`, `test_llama.py`, `test_vit.py`,
-`test_planning.py`).  With `incoherent=True` it also gives
+`test_planning.py`, `test_conv_exp.py`, `test_piper.py`).  With `incoherent=True` it also gives
 every buffer a separate "DDR" copy, so a missing cache sync changes the
 output.
 `test_cache_coherency.py` walks the emitted `inference_run()` of every model
@@ -100,7 +100,7 @@ same for BERT-base and checks the simulation against the BERT study's
 independent emulation.  It runs on the real model (~40 s, ~6 GB RAM):
 - **The files.**
   - `demo/bert_squad/assets/models/bertsquad-12-simplified.onnx`, plus
-    `vocab.txt` and `dev-v1.1.json` from the same directory.
+    `vocab.txt` and `dev-v1.1.json` from `demo/bert_squad/assets/`.
   - On the first run it downloads whatever is missing with
     `demo/bert_squad/scripts/fetch_assets.py`: 435 MB from Google Drive,
     md5-checked.
@@ -115,7 +115,7 @@ independent emulation.  It runs on the real model (~40 s, ~6 GB RAM):
 ```
 
 **CI.**  `.github/workflows/inference-scheduler-tests.yml` runs this layer
-on GitHub's hosted Ubuntu runners on every push / pull request that touches
+on GitHub's hosted Ubuntu runners on every push to `main` / pull request that touches
 `inference-scheduler/`, `platforms/` or `demo/bert_squad/scripts/`.  It runs:
 1. `ruff check .`;
 2. `test/gen_all_models.py`;
@@ -188,7 +188,7 @@ are in the kernel's reference.
 ## 3. Hardware simulation (Vivado, no board)
 
 RTL behavioural simulation in Vivado xsim — no board required, but the
-per-kernel IP archives produced by HLS synthesis must exist first.
+per-kernel IP archives (HLS synthesis; the RTL MatmulKernel's packaging) must exist first.
 
 ```bash
 cd build
@@ -209,7 +209,8 @@ make behavior_test            # all four in sequence
 make sim_hw_kv260
 ```
 
-Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (so it
+Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (MatmulKernel:
+`package_matmul_rtl`) (so it
 re-synthesises its kernel and rebuilds its driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
@@ -278,7 +279,8 @@ The two fields you must set are:
 
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
-  Vitis-HLS-generated driver sources for each kernel (the example's
+  driver sources for each kernel (Vitis HLS generates three;
+  `make driver_matmul_rtl` writes MatmulKernel's; the example's
   `../build/…` paths, relative to `inference-scheduler/`, fit a build in
   `<repo>/build`), e.g.:
 
@@ -383,8 +385,8 @@ case field, MATMUL_OPTIMISATION §3b, and GEMV twins, `gemv_kw` case
 field, §8b — 10 ConvKernel, 11 PoolingKernel).
 
 VectorOPKernel `op` values outside the supported range (0..5) are
-rejected when the cases are loaded, before any case runs (currently
-after the connection, preflight and build) — see the *Case fields*
+rejected when the cases are loaded, before any case runs (right
+after the config, before it connects to the board) — see the *Case fields*
 reference in `REMOTE_TESTING.md`.
 
 ```bash

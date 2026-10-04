@@ -1057,8 +1057,8 @@ read.  Default platform is `kv260`; pick another with
 | `max_kh` | `kMaxPoolH` | `POOL_MAX_KH` | 7 | `pool_h ≤ this` | Compile-time pool window height limit. |
 | `max_kw` | `kMaxPoolW` | `POOL_MAX_KW` | 7 | `pool_w ≤ this` | Compile-time pool window width limit. |
 | `max_line_buf_rows` | `kMaxLineBufRows` | `POOL_MAX_LINE_BUF_ROWS` | 16 | power of 2; `(pool_h-1)*dil_h + 1 ≤ this` | Line-buffer row capacity. |
-| `max_line_buf_cols` | `kMaxLineBufCols` | `POOL_MAX_LINE_BUF_COLS` | 64 | `(pool_w-1)*dil_w + 1 ≤ this` | Line-buffer column capacity; W-tiling kicks in for `in_w > this`. |
-| `ow_parallel` | `kOwParallel` | (not validated) | 2 | power of 2; line_buf must service kOwParallel reads/cycle for the active stride_w (see §2.10 banking table) | Output-position unroll factor (§2.9, §2.10).  `line_buf` is partitioned `cyclic factor=kOwParallel dim=3` plus `BIND_STORAGE ram_t2p` so each per-channel sub-bank is dual-port; together this delivers kOwParallel reads/cycle for any `stride_w` with `gcd(stride_w, kOwParallel) ≤ 2`.  At the shipped `kOwParallel = 2` this holds for every `stride_w`; §2.10 evaluated 4 (covers stride_w 1–3) but reverted it.  Any out_w works (residual-lane padding). |
+| `max_line_buf_cols` | `kMaxLineBufCols` | `POOL_MAX_LINE_BUF_COLS` | 64 | multiple of 8; `(pool_w-1)*dil_w + 1 ≤ this` | Line-buffer column capacity; W-tiling kicks in for `in_w > this`. |
+| `ow_parallel` | `kOwParallel` | (not validated) | 2 | power of 2, ≤ 8 (the port lane count) | Output-position unroll factor (§2.9, §2.14).  `line_buf` is partitioned complete into `kTileC × 8` column banks of `ram_s2p` LUTRAM (1W1R, §2.14), so the kOwParallel columns of one read hit distinct banks unless `stride_w` is a multiple of `2·8/kOwParallel` (= 8 at the shipped `kOwParallel = 2`), where `PoolGeometry::gw` makes the groups one column wide.  §2.10 evaluated 4 but reverted it.  Any out_w works (residual-lane padding). |
 
 `tile_c` and `ow_parallel` are read by the C++ build but **not** validated
 by the Python scheduler — both have unconditional run-time fallbacks

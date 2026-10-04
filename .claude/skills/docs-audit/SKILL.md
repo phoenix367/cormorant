@@ -28,12 +28,13 @@ code changes; B when build / setup paths, repo contents (new files,
    count-like claim of the current-state docs that matches no measured number
    (`CHECK` — a lead, not a verdict: dated numbers, sample output, per-module
    counts show up too) and writes `area_<name>.md` + `review.md` with the
-   counts filled in.  Areas: root (README / CLAUDE.md / doc/README),
-   scheduler-ref (doc/scheduler, inference-scheduler/CLAUDE.md),
-   scheduler-guides (inference-scheduler/doc — the scheduler docs are ~7 500
-   lines, hence two agents), kernels (references in full, optimisation logs
-   only their current-state parts), build-test (doc/build-and-test,
-   .claude/skills, hw/ submodule READMEs), demos, plans (status lines only).
+   counts filled in.  Areas: root (README / CLAUDE.md / doc/README /
+   tools/facts/README), scheduler-ref (doc/scheduler,
+   inference-scheduler/CLAUDE.md), scheduler-guides (inference-scheduler/doc
+   — the scheduler docs are ~8 000 lines, hence two agents), kernels
+   (references in full, optimisation logs only their current-state parts),
+   build-test (doc/build-and-test, .claude/skills and agents, hw/ submodule
+   READMEs), demos, plans (status lines only).
 2. **One agent per area, in parallel** — a single message with one Agent call
    per `area_*.md` (general-purpose; the file's text is the prompt).  Each edits
    only its files and reports `| file:line | was | now | evidence |`.
@@ -125,7 +126,7 @@ complete, continue it with SendMessage (context intact) instead of a new agent.
        && .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
    cd ../demo/mnist && ../../inference-scheduler/.venv/bin/python run_demo.py --skip-download
    ```
-   Expect ConvMNIST 98.92 % / 0.268 ms, LeNet 97.35 % / 2.81 ms.  "Overlay
+   Expect ConvMNIST 98.92 % / 0.260 ms, LeNet 97.35 % / 2.83 ms.  "Overlay
    'pl' did not apply" → the agent's `design_cormorant` overlay is still
    there: `rmdir /sys/kernel/config/device-tree/overlays/design_cormorant` on
    the board, run again.

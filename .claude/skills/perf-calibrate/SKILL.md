@@ -22,7 +22,7 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | `--plan: no performance model for bitstream X (perf_models/kv260/X.json)` | the bitstream in `bitstream_config_kv260.json` has no campaign: §2 |
 | scheduler change that alters shipped kernel calls (same bitstream) | coverage check §6, then a top-up: `cases`, `run --resume`, `fit` |
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
-| hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 HEAD bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
+| hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
 Current model: **kv260/1d28630fbfa4** = hw_128 7d8eefe (2026-10-04), the bitstream
 with the SystemVerilog MatmulKernel (MATMUL_RTL_PLAN phases 3–4): a full campaign
@@ -64,7 +64,7 @@ bitstream needs one there too.
      must hold the register maps of the LOADED bitstream. They point at `build/` (the
      conv-verify tree), while the bitstream comes from `build_hw128`. All four must print `same`:
      ```bash
-     for f in $(cd ../build_hw128 && ls kernels/*/kv260/*/*/impl/ip/drivers/*/src/x*_hw.h); do
+     for f in $(cd ../build_hw128 && ls kernels/{vectorop,conv,pool}/kv260/*/*/impl/ip/drivers/*/src/x*_hw.h kernels/matmul_rtl/driver/*/src/x*_hw.h); do
          cmp -s ../build/$f ../build_hw128/$f && echo "same $f" || echo "DIFF $f"; done
      ```
 4. **Chat server stopped.** It owns the kernels and the CMA.
@@ -156,9 +156,9 @@ under the planner's 5 % trust threshold.
   (TACTICS_PLAN §1). The record's 27 noisy points are all calls a few tens of µs long.
   A large median means something else ran on the board. Measure again.
 - The family errors should be close to the table above. The `note:` line is EXPECTED:
-  only GEMV meets the §4.3 target of 3 %.
+  only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none does, mm-gemv 3.22 %).
 - The planner trusts a family prediction only when the family's held-out p90 is at most 5 %
-  (`perf_model.MAX_MODEL_ERROR`). Today that is only mm-gemv. Every other tactic needs an
+  (`perf_model.MAX_MODEL_ERROR`). Today (1d28630fbfa4) that is mm-gemv and mm-tiled. Every other tactic needs an
   exact entry. That is why the refinement exists.
 - `call_overhead_us` (the minimum measured call) was 3.121 µs.
 
@@ -303,7 +303,7 @@ results from the planned build. `bert:plan` against the unplanned results gives
 
 - `perf_models/kv260/<id>.cases.json`, `<id>.calib.json` and `<id>.json` (the three model files);
 - `perf_models/kv260/host.json`, if §3 was run;
-- `perf_models/README.md`: its last line names the current bitstream. Keep its form:
+- `perf_models/README.md`: its `kv260/<id>` paragraph names the current bitstream (the previous one follows it). Keep its form:
   "`kv260/<id>` is hw_128 <commit> (<date>): N calls, repeat spread median X %."
 
 Commit them together with the hw submodule bump (TACTICS_PLAN §8). A re-fit of unchanged

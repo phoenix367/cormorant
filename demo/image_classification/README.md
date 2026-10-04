@@ -48,7 +48,7 @@ demo/image_classification/
     ├── projects/projects.json              — summary of the generated projects
     ├── projects/<model>/                   — generated CMake project per model
     │   ├── weights/*.dat                   —   large weight tensors, read at runtime
-    │   ├── driver/                         —   HLS driver sources copied in
+    │   ├── driver/                         —   kernel driver sources copied in
     │   └── test/
     │       ├── classify_images.c           —   copied from demo/image_classification/src/
     │       └── bench_glue.h                —   generated; per-model glue + macros
@@ -61,7 +61,8 @@ demo/image_classification/
 ### Host
 
 * Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx, onnxsim).
-* HLS-generated driver sources for the four kernels:
+* Generated driver sources for the four kernels (HLS; the RTL
+  MatmulKernel's by `driver_matmul_rtl`):
 
   ```bash
   # from the repo root
@@ -140,18 +141,21 @@ done
 Model      : assets/models/mobilenet_v1_1.0_224_no_softmax.onnx
 Inputs     : ['input:0[1, 3, 224, 224]']
 Outputs    : ['MobilenetV1/Logits/SpatialSqueeze:0[1, 1001]']
-Nodes      : 59
+Nodes      : 62
   [  0] SpaceToDepth [1, 3, 224, 224] -> [1, 12, 112, 112]
   [  1] Conv         [1, 12, 112, 112] x [32, 12, 2, 2] x [32] -> [1, 32, 112, 112]
   [  2] Clip         [1, 32, 112, 112] -> [1, 32, 112, 112]
   [  3] Conv         [1, 32, 112, 112] x [32, 1, 3, 3] x [32] -> [1, 32, 112, 112]
   …  (depthwise-separable Conv / Clip blocks repeating to 14×14, 7×7) …
   [ 55] AveragePool  [1, 1024, 7, 7]   -> [1, 1024, 1, 1]
-  [ 56] Conv         [1, 1024, 1, 1]   x [1001, 1024, 1, 1] x [1001] -> [1, 1001, 1, 1]
-  [ 57] Reshape      [1, 1001, 1, 1]   -> [1, 1, 1, 1001]
-  [ 58] Squeeze      [1, 1, 1, 1001]   -> [1, 1001]
+  [ 56] Flatten      [1, 1024, 1, 1]   -> [1, 1024]
+  [ 57] MatMul       [1, 1024] x [1024, 1001] -> [1, 1001]
+  [ 58] Reshape      [1, 1001]         -> [1, 1001, 1, 1]
+  [ 59] Add          [1, 1001, 1, 1] x [1, 1001, 1, 1] -> [1, 1001, 1, 1]
+  [ 60] Reshape      [1, 1001, 1, 1]   -> [1, 1, 1, 1001]
+  [ 61] Squeeze      [1, 1, 1, 1001]   -> [1, 1001]
 Weights    : 20 large weight(s) written to build/projects/mobilenet_v1/weights/
-[mobilenet_v1] active kernels: VectorOPKernel, ConvKernel, PoolKernel
+[mobilenet_v1] active kernels: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel
 
 [mobilenet_v2] scheduling mobilenetv2-12_simplified.onnx
 Inputs     : ['input[1, 3, 224, 224]']
@@ -274,9 +278,10 @@ Notable behaviour visible in the run:
   MobileNetV1 (`(p/127.5)-1`), `imagenet` for MobileNetV2 and ResNet-18
   (`p/255` then per-channel `(x-μ)/σ`).  `deploy_and_run.py` swaps the
   right bin onto the board before each model runs.
-- **Active-kernel set differs per model.**  `mobilenet_v1` uses only
-  three kernels (VectorOP / Conv / Pool) because its `_no_softmax`
-  variant ends in a 1×1 `Conv` classifier; `mobilenet_v2` and
+- **Active-kernel set differs per model.**  In this run `mobilenet_v1`
+  used only three kernels (VectorOP / Conv / Pool) because its `_no_softmax`
+  variant ends in a 1×1 `Conv` classifier (now a MatMul, the generate
+  stage above and the last note); `mobilenet_v2` and
   `resnet18` use all four because they end in a `MatMul` (Gemm) +
   `Add` classifier head.  `generate_project.py` emits a per-model
   `bench_glue.h` so `inference_init()` gets the right number of UIO

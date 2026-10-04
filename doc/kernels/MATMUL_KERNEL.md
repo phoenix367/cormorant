@@ -434,9 +434,11 @@ skipped.
   decomposition handles alignment-gapped buffers.
 
 **GEMV (`src/matmul_gemv.py`, `MatmulNode.gemv_kw`).**  After the
-ConvKernel lowering, single-row MatmulNodes (`n == 1`, any batch) that meet
+ConvKernel lowering, single-row MatmulNodes (`n == 1`, any batch; on the
+RTL kernel, `kernels.matmul.impl = "rtl"`, any `n`) that meet
 the GEMV requirements above switch to the streaming path where
-`cost_model.gemv_cycles` beats the tiled `matmul_cycles` (`--matmul-gemv
+`cost_model.gemv_cycles` beats the tiled `matmul_cycles` (on the RTL kernel
+also every weight named in `matmul_gemv_kw`) (`--matmul-gemv
 auto`, the default; `always` / `off`): a constant B then stays row-major
 (`kw = 1`, never packed) or, when `OnnxGraph(matmul_gemv_kw={name: kw})`
 names it, is emitted in ConvKernel's kw image.  `src/llm_entries.py` uses
@@ -474,7 +476,7 @@ the result.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestMatmulRef && ctest -R Matmul    # TestMatmulBlas too when BLAS is found
+make TestMatmulRef && ctest -R Matmul    # TestMatmulBlas too when BLAS is found; also the RTL kernel's TestMatmulRtl / MatmulRtlDriver
 make gen_matmul_test_data                # RTL fixtures → build/matmul_test_data/
 
 # the hardware: the RTL kernel (MATMUL_RTL_KERNEL.md)
@@ -498,7 +500,7 @@ flow) was removed in MATMUL_RTL_PLAN phase 4; the last HLS bitstream is
 | `kernels/matmul/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `AccData_t`, tile constants) |
 | `kernels/matmul/test/TestMatmulSim.cpp` | C simulation tests (GCC) |
 | `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
-| `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`, `gemv_max_m`) |
+| `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`, `gemv_max_m`) and `impl` (`"rtl"`: the kernel the bitstream carries) |
 | `inference-scheduler/src/_matmul_hw_config.py` | Scheduler-side reader of the same bounds |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |
 | `inference-scheduler/src/matmul_gemv.py` | GEMV selection pass (eligibility, cost, B image) |

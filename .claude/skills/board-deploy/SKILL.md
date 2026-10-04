@@ -7,7 +7,7 @@ allowed-tools: Bash Read
 
 ## 0. Preconditions
 
-- The kernel passed `conv-verify` (or the pool equivalent).  Do not put
+- The kernel passed `conv-verify` (or `pool-verify` / `kernel-verify`).  Do not put
   an unverified IP on the board.
 - Board reachable: `ping 192.168.100.8`; SSH key `~/.ssh/kv260-testkey`.
 - Vitis env for `xclbinutil`: `source /mnt/data/xilinx/2025.2/Vitis/settings64.sh`.
@@ -35,7 +35,7 @@ tree used by conv-verify and its timing baseline stay intact:
 
 ```bash
 cmake -S . -B build_hw128 -DAXI_BUS_WIDTH=128     # once
-make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth all 4 kernels + Vivado
+make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth 3 HLS kernels + package the RTL MatmulKernel + Vivado
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 

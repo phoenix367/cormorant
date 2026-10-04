@@ -4,10 +4,10 @@
   <img src="doc/images/cormorant.png" alt="Cormorant" width="320"/>
 </p>
 
-Four Vitis HLS kernels for the Xilinx Kria KV260 (VectorOP, MatMul, Conv,
-Pooling) and a Python code generator that compiles ONNX models — CNNs,
-BERT-base, Llama-family decoders, a ViT vision encoder and a VITS
-text-to-speech model — into self-contained C projects that drive the
+Four kernels for the Xilinx Kria KV260 (VectorOP, Conv and Pooling in Vitis
+HLS, MatMul in SystemVerilog) and a Python code generator that compiles
+ONNX models — CNNs, BERT-base, Llama-family decoders, a ViT vision encoder
+and a VITS text-to-speech model — into self-contained C projects that drive the
 kernels from Linux on the board.  Everything runs in 16-bit fixed point
 (`ap_fixed<16,8>`, or per-tensor power-of-two exponents), and the board's
 outputs are checked bit for bit against the generator's fixed-point
@@ -172,7 +172,8 @@ ctest
 ```
 
 Or build them one by one: `make TestSimulation TestConvRef TestConvGrid
-TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS).
+TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS, `TestMatmulRtl` —
+the SystemVerilog MatmulKernel — with Verilator 5.x).
 
 ### 3. The scheduler and its tests
 
@@ -263,7 +264,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1645<!-- /fact --> tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
-| Kernel C simulation | Vitis HLS headers, gcc, CMake | `make -j8 && ctest` in `build/` |
+| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the RTL MatmulKernel) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |

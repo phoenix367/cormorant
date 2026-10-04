@@ -1,6 +1,6 @@
 # Throughput plan — MatmulKernel, depthwise ConvKernel, VectorOPKernel
 
-Date: 2026-09-25.  Status: **executed 2026-09-25/26** — Tracks A (A1–A5), B (B1–B3; B4 deferred) and C (C1–C4) landed and measured; see §8.  Track D (clock) not started.
+Date: 2026-09-25.  Status: **executed 2026-09-25/26** — Tracks A (A1–A5), B (B1–B3; B4 deferred) and C (C1–C4) landed and measured; see §8.  Track D (clock) not started.  A6 / A7 are moot since 2026-10-04: the SystemVerilog MatmulKernel (MATMUL_RTL_PLAN.md) writes C 128 bits wide and reads row-major B as fast as packed; the latest demo numbers are in its phase 4.
 
 > **Follow-up (2026-09-27).** The §8 next levers were taken by
 > doc/plans/RESNET18_15FPS_PLAN.md: flat standard sweep (CONV_OPTIMISATION §2.41),
