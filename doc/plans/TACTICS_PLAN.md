@@ -414,7 +414,14 @@ The joint kernel width over the prefill buckets and decode (weights: decode
   0.5 % or more and the intermediates' pool (with slot reuse) stays within
   the budget.
 - **BERT:** 48 moves, 965.5 → 949.9 ms simulated.  On the board, p50
-  **962.3 → 951.3 ms (−1.1 %)**, bit-exact.
+  **962.3 → 951.3 ms (−1.1 %)**, bit-exact (the HLS MatmulKernel's
+  bitstream `caa67f49a5a3`).  On the RTL MatmulKernel's bitstream
+  `1d28630fbfa4` (2026-10-04) `--plan` also moves the 12 attention P·V
+  products to MatmulKernel's tiled path (7.35 → 4.45 ms each; the unplanned
+  rule keeps them on ConvKernel because the ConvKernel cost model puts 12
+  per-head calls at 2.91 ms): 921.5 → 905.8 ms simulated, on the board p50
+  **955.5 → 907.9 / 906.7 ms (−5.0 %)** in two runs, bit-exact, EM / F1 =
+  float (MATMUL_RTL_PLAN, after phase 4).
 - **SmolLM2 prefill, SmolVLM vision:** no better order.  The frontends'
   hand-written orders are already locally optimal.
 - **Host-op chunking:** `VitFrontend(attn_split=R)` splits every head's

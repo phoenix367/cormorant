@@ -509,10 +509,17 @@ facts and docs.  What was done:
   MatmulKernel, and ConvKernel stays ahead at 64 and 256 rows.  What
   `--plan` predicts on the RTL bitstream (simulator, against this phase's
   unplanned board runs): BERT 956 → 906 ms (the 12 attention P·V products
-  on MatmulKernel's tiled path, 7.35 → 4.45 ms each — the unplanned cost
-  model keeps them on ConvKernel), SmolVLM's image encoder −53 ms
-  (ConvKernel widths), the 64-token prefill −3 ms; not measured on the
-  board yet.
+  on MatmulKernel's tiled path, 7.35 → 4.45 ms each), SmolVLM's image
+  encoder −53 ms (ConvKernel widths), the 64-token prefill −3 ms.
+- **BERT with `--plan` on the board** (2026-10-04, planned and unplanned in
+  one session): p50 **955.5 ms unplanned, 907.9 / 906.7 ms planned
+  (−5.0 %)** in two runs, predicted 905.8; 50 / 50 examples bit-exact, EM /
+  F1 = float.  The gain is the P·V move: the RTL MatmulKernel's model is
+  right (4.52 ms estimated, 4.45 measured), the ConvKernel cost model is
+  not — it puts the 12 per-head calls at 2.91 ms, the board takes 7.35.
+  Open: correct the ConvKernel cost model for small per-head calls (then
+  the unplanned rule picks MatmulKernel by itself), or build the chat
+  server's BERT with `--plan` (`deploy.py --regenerate --plan`).
 - The perf-regression baseline of `1d28630fbfa4` holds the demos as run in
   phase 2b (the HLS engine choices): MobileNet v1 now shows as improved
   until the demos are re-recorded.

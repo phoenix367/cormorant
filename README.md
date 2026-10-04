@@ -37,7 +37,7 @@ with the SystemVerilog MatmulKernel, `1d28630fbfa4`; the chat-server Piper figur
 | ResNet-18, 224×224 | **59.9 ms (16.7 FPS)** per image | [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
 | MobileNet V1 / V2, 224×224 | 73.0 / 62.9 ms per image | [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) |
 | MNIST convnet / LeNet | 0.260 / 2.831 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **953 ms** per inference (p50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **953 ms** per inference (p50; 907 ms built with `--plan`), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md), [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
 | SmolLM2-135M-Instruct | **10.0 tokens/s** decode (7.9 at 1000 cached tokens), 16-token prefill 0.25 s, 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) |
 | SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.2 at 1000 cached tokens), 16-token prefill 0.58 s, 256-token prefill 3.08 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) |
 | SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
