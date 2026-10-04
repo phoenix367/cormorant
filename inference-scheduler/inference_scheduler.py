@@ -99,8 +99,9 @@ def parse_args(argv=None):
         metavar="DIR",
         default=None,
         help=(
-            "Path to the XVectoropkernel driver source directory "
-            "(contains xvectoropkernel.c, .h, _hw.h, _sinit.c, _linux.c). "
+            "Directory to copy the kernel drivers from: the driver source files of "
+            "every kernel the model uses (xvectoropkernel.c / .h / _hw.h / _sinit.c / "
+            "_linux.c, xmatmulkernel*, xconvkernel*, xpoolingkernel*). "
             "If omitted, driver/ is left empty with a README."
         ),
     )

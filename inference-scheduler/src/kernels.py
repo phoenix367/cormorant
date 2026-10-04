@@ -266,10 +266,12 @@ def mixed_driver_readme(kernel_names: List[str]) -> str:
     sections = []
     for name in kernel_names:
         kd = KERNEL_REGISTRY[name]
+        source = ("make driver_matmul_rtl (the SystemVerilog kernel's driver)"
+                  if kd.name == "MatmulKernel" else f"Vitis HLS synthesis output for {kd.name}")
         sections.append(
             f"## {kd.name} driver\n\n"
             + "\n".join(f"  {f}" for f in kd.driver_files)
-            + f"\n\nSource: Vitis HLS synthesis output for {kd.name}.\n"
+            + f"\n\nSource: {source}.\n"
             f"AXI-Lite base address: 0x{kd.axi_base:08X}\n"
             f"UIO device name:       {kd.uio_default}\n"
         )

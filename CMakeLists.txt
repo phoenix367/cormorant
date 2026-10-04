@@ -15,7 +15,10 @@ endif()
 project(axi_kernels)
 
 # ---------------------------------------------------------------------------
-# All four HLS kernels.  Each subdirectory is a self-contained CMake project.
+# All four kernels — VectorOP, Conv and Pool in Vitis HLS, MatmulKernel in
+# SystemVerilog (kernels/matmul_rtl; kernels/matmul keeps the HLS kernel's
+# C++ as its reference model).  Each subdirectory is a self-contained CMake
+# project.
 #
 # Simulation test targets (no hardware needed):
 #   make TestSimulation   — VectorOPKernel

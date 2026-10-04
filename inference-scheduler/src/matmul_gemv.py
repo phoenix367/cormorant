@@ -2,10 +2,12 @@
 MatmulKernel GEMV streaming mode — the selection pass (doc/kernels/
 MATMUL_OPTIMISATION.md §8b, MatmulKernel.h "GEMV streaming mode").
 
-``choose_gemv(nodes, ...)`` switches single-row MatmulNodes (``n == 1``: the
-batch-1 FC layers of the CNNs, the LLM decode linears and LM head) to the
-kernel's GEMV path (``MatmulNode.gemv_kw``).  B is streamed once per A row,
-half through each of the kernel's two read ports, in the ConvKernel x image
+``choose_gemv(nodes, ...)`` switches MatmulNodes to the kernel's GEMV / image
+path (``MatmulNode.gemv_kw``): single-row ones (``n == 1``: the batch-1 FC
+layers of the CNNs, the LLM decode linears and LM head) on the HLS kernel,
+any on the RTL kernel (below).  B is streamed once per A row (on the RTL
+kernel once per panel of 8 rows), half through each of the kernel's two
+read ports, in the ConvKernel x image
 of kernel width kw (``nodes.conv_lowered_b_image``; kw = 1 is plain
 row-major B, so an activation B works too).
 

@@ -21,7 +21,7 @@ JSON shape (only the fields this module reads)::
         "matmul": {
           "impl":   "rtl",
           "tile_n":   4,
-          "tile_m":  16,
+          "tile_m":  32,
           "tile_k": 256,
           "max_k": 4096,
           "gemv_max_m": 4096
@@ -60,7 +60,7 @@ model, ``kernels/matmul``, and the ``"hls"`` cost model), which the RTL
 kernel does not use.  ``tile_m`` is exported because the packed
 tile-major B layout the scheduler emits for constant weights
 (``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the
-hard upper bound — see ``doc/kernels/MATMUL_KERNEL.md`` §3 "Runtime constraint
+hard upper bound — see ``doc/kernels/MATMUL_KERNEL.md`` §2 "Runtime constraint
 validated by the scheduler".  ``gemv_max_m`` is the GEMV streaming mode's
 accumulator depth (``MatmulNode.gemv_kw``); 0 means the kernel has no GEMV
 path and the scheduler never selects it — a wider ``m`` is split into

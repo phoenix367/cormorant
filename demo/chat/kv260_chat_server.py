@@ -1349,7 +1349,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         os.path.join(HERE, "smolvlm", "tokenizer.json"),
         os.path.join(HERE, "assets", "smolvlm-256m-instruct", "tokenizer.json")))
     g.add_argument("--vlm-model-id", default=None)
-    g.add_argument("--vlm-cma-mb", type=float, default=520.0,
+    g.add_argument("--vlm-cma-mb", type=float, default=540.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g = ap.add_argument_group("piper (text to speech)")
     g.add_argument("--tts-lib", default=os.path.join(HERE, "lib", "libpiper_tts.so"))

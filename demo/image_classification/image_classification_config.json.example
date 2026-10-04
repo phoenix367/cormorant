@@ -35,7 +35,7 @@
       "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
       "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel HLS-generated driver sources, copied into the project before upload."
+    "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; MatmulKernel's from make driver_matmul_rtl), copied into the project before upload."
   },
 
   "build": {

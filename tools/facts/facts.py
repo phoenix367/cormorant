@@ -55,6 +55,7 @@ REPO = Path(__file__).resolve().parents[2]
 REGISTRY = REPO / "facts.yaml"
 KINDS = ("value", "interface", "recorded")
 MARKER = re.compile(r"<!-- fact:([\w.\-]+) -->(.*?)<!-- /fact -->")
+MARKER_SUFFIXES = (".md", ".txt", ".html", ".rst")    # files whose fact markers count (mentions, the hook)
 LEVELS = ("error", "warn", "info")
 
 
@@ -369,7 +370,7 @@ def mention_hits(fact: dict, ctx: Ctx, res: Result) -> List[Hit]:
             for key, (a, b), txt in groups:
                 hits.append(Hit(rel, _line(text, a), key, a, b, txt, fix, loc.get("format")))
     for rel in ctx.tracked():                                     # markers anywhere
-        if not rel.endswith((".md", ".txt", ".html", ".rst")):
+        if not rel.endswith(MARKER_SUFFIXES):
             continue
         try:
             text = ctx.read(rel)
@@ -622,7 +623,7 @@ def fact_files(fact: dict, ctx: Ctx) -> Dict[str, List[str]]:
     walk("watch", fact.get("watch", []))
     walk("verify", fact.get("verify", {}))
     for rel in ctx.tracked():                                       # marker mentions
-        if rel.endswith(".md"):
+        if rel.endswith(MARKER_SUFFIXES):
             try:
                 if f"<!-- fact:{fact['id']}" in ctx.read(rel):
                     add("mentions", rel)

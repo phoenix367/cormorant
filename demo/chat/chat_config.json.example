@@ -1,7 +1,7 @@
 {
   "_comment": "Copy to chat_config.json and edit. Relative paths are relative to demo/chat/.",
   "bert_squad_config": "../bert_squad/bert_squad_config.json",
-  "_bert_squad_config_note": "The BERT-SQuAD demo config: model, io roles, HLS driver dirs, remote.uio_devices, remote.weights_dir, ssh and board_lock are taken from it (the project is generated with demo/bert_squad/scripts/generate_project.py).",
+  "_bert_squad_config_note": "The BERT-SQuAD demo config: model, io roles, kernel driver dirs, remote.uio_devices, remote.weights_dir, ssh and board_lock are taken from it (the project is generated with demo/bert_squad/scripts/generate_project.py).",
   "ssh": null,
   "_ssh_note": "null = the ssh block of bert_squad_config; or {host, user, port, key_file, password, connect_timeout}.",
   "remote": {

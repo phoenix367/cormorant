@@ -19,10 +19,11 @@
 
     "uio_devices": {
       "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel":   "fabric_matmul",
       "ConvKernel":     "fabric_conv",
       "PoolKernel":     "fabric_pool"
     },
-    "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name. Only the kernels this demo's models actually use are listed; the bundled mobilenet_v1_1.0_224_no_softmax has a 1×1 Conv classifier, so MatmulKernel is omitted. Add it back here (and under local.driver_dirs) if you swap in a model that uses MatMul.",
+    "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name. The bundled mobilenet_v1_1.0_224_no_softmax uses all four kernels: its 1x1 Conv classifier runs as a MatMul on MatmulKernel (the scheduler's fully-connected-Conv rewrite, --fc-conv).",
 
     "cmake_args": []
   },
@@ -30,10 +31,11 @@
   "local": {
     "driver_dirs": {
       "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "MatmulKernel":   "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
       "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel HLS-generated driver sources, copied into the project before upload."
+    "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; MatmulKernel's from make driver_matmul_rtl), copied into the project before upload."
   },
 
   "build": {

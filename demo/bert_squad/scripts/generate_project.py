@@ -7,8 +7,9 @@ for the BERT-SQuAD demo.
      activation fusion) -> CMake C project in build/project/, with the
      76 large weight tensors as build/project/weights/*.dat (208 MB).
   2. driver/ populated from local.driver_dirs for the active kernels
-     (VectorOPKernel, ConvKernel — the MatMuls, BERT_PLAN 2A — and
-     MatmulKernel for the two MatMuls that stay there).
+     (VectorOPKernel, ConvKernel — 84 of the 98 MatMuls, BERT_PLAN 2A — and
+     MatmulKernel for the 14 that stay there: the token-type and span-head
+     MatMuls and the 12 attention P·V).
   3. src/squad_bench.c and src/bert_api.{c,h} copied to test/, plus a
      generated test/bench_glue.h: the buffer order of inference_run(), each
      buffer's numel macro and the index of each role (input_ids,

@@ -590,9 +590,9 @@ class OnnxGraph:
         widths the lowering may choose (e.g. (1, 2, 4, 8): the widths a GEMV
         decode can read too).
 
-        matmul_gemv: run single-row MatMuls (batch-1 FC layers, LLM decode)
-        on MatmulKernel's GEMV streaming path (``matmul_gemv``,
-        MATMUL_OPTIMISATION §8b).  "auto" (default, also ``True``: where the
+        matmul_gemv: run MatMuls on MatmulKernel's GEMV / image path
+        (``matmul_gemv``, MATMUL_OPTIMISATION §8b): single-row ones (batch-1
+        FC layers, LLM decode) on the HLS kernel, any on the RTL one.  "auto" (default, also ``True``: where the
         cost model says it is faster), "always" or "off" (``False``; CLI
         ``--matmul-gemv off``).  Never selected when the platform's kernel
         has no GEMV path (``kernels.matmul.gemv_max_m = 0``).

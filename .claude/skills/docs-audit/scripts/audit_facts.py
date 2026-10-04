@@ -32,7 +32,8 @@ from pathlib import Path
 
 # (area, what the agent checks, patterns) — first match wins; '*' spans '/'
 AREAS = [
-    ("root", "README.md, CLAUDE.md, doc/README.md", ["README.md", "CLAUDE.md", "doc/README.md"]),
+    ("root", "README.md, CLAUDE.md, doc/README.md, the fact registry's README",
+     ["README.md", "CLAUDE.md", "doc/README.md", "tools/facts/*"]),
     ("scheduler-ref", "scheduler reference", ["doc/scheduler/*", "inference-scheduler/CLAUDE.md",
                                               "inference-scheduler/perf_models/*"]),
     ("scheduler-guides", "scheduler user guides", ["inference-scheduler/doc/*", "inference-scheduler/*"]),
