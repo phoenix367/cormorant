@@ -692,6 +692,8 @@ facts:
     - {file: README.md, regex: 'MNIST convnet / LeNet \| (?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
     - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
+    - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
+    - {file: demo/mnist/README.md, regex: '^  mnist_lenet    OK +[\d.]+% +(?P<mnist_lenet_ms>[\d.]+) '}
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
        regex: '`1d28630fbfa4`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}

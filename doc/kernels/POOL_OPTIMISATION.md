@@ -951,7 +951,52 @@ the scheduler enforces) ran on the old kernel but hangs the new one and
 wedges the HPC port (all later kernel calls time out; reboot before
 reloading the PL).  The case was replaced by `GlobalMaxPool-7x7-256`.
 Follow-up: clamp `pool_h/pool_w` to `kMaxPoolH/W` in the kernel so an
-out-of-contract call returns instead of hanging.
+out-of-contract call returns instead of hanging (done in §2.15, without
+clamping: such a call does nothing).
+
+### 2.15. Out-of-contract windows return instead of hanging (2026-10-04)
+
+**Problem.**  §2.14.1's incident: a window larger than `kMaxPoolH/W`, or a
+dilated window past the line buffer, overruns the line buffer and the tap
+counters, the dataflow hangs, and the hung transfer wedges the HPC port
+until a reboot.  The scheduler never emits such a call
+(`PoolNode.from_onnx_node`), but a direct caller can — the benchmark case
+did.
+
+**Change.**  `compute_pool_geometry` checks the window against the four
+compile-time bounds (`1 ≤ pool_h ≤ kMaxPoolH`, `1 ≤ pool_w ≤ kMaxPoolW`,
+`(pool_h−1)·dil_h + 1 ≤ kMaxLineBufRows`, `(pool_w−1)·dil_w + 1 ≤
+kMaxLineBufCols`) and gives an out-of-contract call **zero channel tiles**:
+every stage iterates over `geom.c_tiles` (the writer over `n_rows = batch ·
+c_tiles · …`), so all four run zero times, nothing is read or written, and
+`ap_done` comes at once.  No clamping — a clamped window would compute a
+wrong result silently; y stays as it was.  Host side, `run_remote_perf.py`
+rejects such a benchmark case before it connects (the kernels already on
+the board have no guard).
+
+Three variants were synthesised (HLS estimates, against §2.14 at HEAD:
+DSP 90, FF 19 581, LUT 35 306, slack 0.00):
+
+| Variant | DSP | FF | LUT | RTL timing |
+|---|---:|---:|---:|---|
+| `n_run = in_contract ? batch : 0` passed to the stages, 32-bit span products | 96 | 20 112 | 36 137 | identical |
+| same, span products on narrow operands (tap count × dilation < line buffer) | 92 | 20 252 | 36 275 | identical |
+| `geom.c_tiles = 0`, narrow products | 92 | 19 617 | 35 709 | −4…+9 cycles per call |
+| **`geom.c_tiles = 0`, narrow products bound to fabric (`BIND_OP impl=fabric`)** | **90** | **19 584** | **35 789** | **identical** |
+
+The `n_run` scalar is a new non-STABLE dataflow argument: HLS adds a
+`Block_entry_proc` per consumer (three of them), which is where its FF / LUT
+go (the cost §2.20 removed for the other scalars).  Folding the check into
+`geom`, which every stage already receives, avoids that; binding the two
+small products to fabric takes the last two DSPs back.
+
+**Result.**  C-sim 49/49 (`run_out_of_contract_test`: pool_h = 8,
+pool_w = 8, a dilated height of 17 rows, a dilated width of 65 columns —
+each returns with y untouched; the kernel without the guard writes y in all
+four), RTL 43/43 PASS with every case's time equal to §2.14 (696 045 ns
+total), slack 0.00, no II violations, both ports `128 -> 128`.  It reaches
+the board with the next bitstream build (a new bitstream id: the
+performance model needs its campaign, TACTICS_PLAN §8).
 
 ## 3. Current architecture (post-2.14)
 
@@ -1343,6 +1388,7 @@ interconnect matches — outside the scope of pool-only optimisation.
 
 | Configuration | C-sim (TestPoolingSim) | RTL sim (behavior_test_pool) |
 |---|---|---|
+| Default (kMaxLineBufCols=64), post-§2.15 | 49/49 PASS (y pad lanes checked; 4 out-of-contract calls leave y untouched) | 43/43 PASS, every case's time identical to §2.14 |
 | Default (kMaxLineBufCols=64), post-§2.14 | 45/45 PASS (y pad lanes checked) | 43/43 PASS (y tail lanes checked) |
 | Default (kMaxLineBufCols=64), §2.13 | 33/33 PASS | 31/31 PASS |
 | Reduced cache (kMaxLineBufCols=8) | 33/33 PASS, dup_reads tracks predictor | (not run) |
@@ -1351,10 +1397,11 @@ interconnect matches — outside the scope of pool-only optimisation.
 The cache-aware predictor in `TestPoolingSim.cpp` ensures the dup_reads
 column in test output is meaningful at any cache size.
 
-The C-sim count is 45 (vs 43 RTL): 43 geometry cases against the float64
-reference at `kTol = 0.02` (≈ 5 Data_t LSBs) plus 2 strict-equality
+The C-sim count is 49 (vs 43 RTL): 43 geometry cases against the float64
+reference at `kTol = 0.02` (≈ 5 Data_t LSBs), 2 strict-equality
 sub-cases (`run_avg_pool_strict_test`, `count_include_pad ∈ {0, 1}`)
-that pin the AVG path's bit-accurate match to `ref_avg_pool_fixed`.  The
+that pin the AVG path's bit-accurate match to `ref_avg_pool_fixed`, and
+4 out-of-contract windows (`run_out_of_contract_test`, §2.15).  The
 strict cases are sensitive to a regression to the float reciprocal —
 ~3% of cells in their input set diverge between the two paths.
 

@@ -106,11 +106,15 @@ the JSON via `string(JSON …)` and emits `Config.h` from
 | `kMaxLineBufRows` | 16 | Line-buffer row capacity; power of 2; bounds `(pool_h-1)·dil_h + 1`. |
 | `kMaxLineBufCols` | 64 | Line-buffer column capacity (multiple of 8); W-tiling activates when `in_w` exceeds it. |
 
-`kMaxPoolH/W` are a hard contract: the kernel's tap counters are sized
-to them and it does not check `pool_h/pool_w` at run time, so an
-out-of-contract call (e.g. a 14×14 pool) hangs the kernel and wedges
-the HPC port (POOL_OPTIMISATION §2.14.1).  The scheduler rejects such
-models.
+`kMaxPoolH/W` and the line-buffer extents are a hard contract: the
+kernel's tap counters and line buffer are sized to them.  The scheduler
+rejects models outside them, and `run_remote_perf.py` rejects such
+benchmark cases.  The kernel itself returns at once on an out-of-contract
+call (window larger than `kMaxPoolH/W`, dilated window past the line
+buffer): every dataflow stage runs zero times, nothing is read or written
+(POOL_OPTIMISATION §2.15).  Kernels built before that guard
+(bitstream `1d28630fbfa4` and older) hang on such a call (e.g. a 14×14
+pool) and wedge the HPC port (§2.14.1).
 
 **Fixed kernel-level constants:**
 
@@ -533,7 +537,8 @@ binary embeds the ROM directly (`kInvDenomLutBits`) and the
 
 ## 7. Test Coverage (`TestPoolingSim.cpp`)
 
-45 test cases (43 geometries + the two strict AVG sub-cases) compiled
+49 test cases (43 geometries, the two strict AVG sub-cases and four
+out-of-contract windows) compiled
 with GCC against the Vitis HLS headers (no HLS tool run). Tolerance:
 `kTol = 0.02f`; y is handed to the kernel as a 128-bit word buffer
 pre-filled with a 0xDEAD sentinel and every lane past the tensor end is
@@ -548,6 +553,7 @@ checked afterwards (the byte-strobe contract of the y port).
 | Wide-W (`in_w > kMaxLineBufCols`) | MaxPool W=128 3×3 pad1, AvgPool W=96 3×3 pad1, MaxPool W=128 2×2 s2 — plus batch=2 variants |
 | Word tails / alignment (§2.14) | W=7 (< 1 word), W=13 3×3 s1 (odd out_w), W=11 3×3 s2, W=9 C=1 AvgPool s2, 28×112 C=2 MaxPool 3×3 s2 (the ResNet stem shape, W-tiled), 7×7 stride 8 (one-column groups), 7×1 dil_h=2 stride_h=4 (no-prefetch mode), 1×1 pooling at W=64 and W=65, C=9 (c_valid = 1 tail tile), LpPool p=2 batch=2 C=3 W=7, GlobalAvgPool 7×7 C=16 |
 | AVG-pool numerical | 5×5 pad=2 strict-equality (validates fixed-point reciprocal vs ref) |
+| Out of contract | `pool_h` = kMaxPoolH + 1, `pool_w` = kMaxPoolW + 1, a dilated height past `kMaxLineBufRows`, a dilated width past `kMaxLineBufCols`: the kernel returns with y untouched |
 
 The dup-read predictor `expected_dup_reads_for(tc)` simulates the
 kernel's exact line-buffer + W-tile load schedule, so

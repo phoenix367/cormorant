@@ -55,7 +55,7 @@ after running the full TestConvRef case list.
 | + patch register file (§2.18) | 30 | 1,783,075 | -0.2 % | -63.7 % |
 | + tile-geometry hoist (§2.19) | 30 | 1,775,995 | -0.4 % | -63.9 % |
 | + STABLE arguments (§2.20, this snapshot) | 30 | 1,775,775 | -0.0 % | **-63.9 %** |
-| **Current state (post-§2.20, captured 2026-05-16)** | **30** | **1,775,775** | — | **-63.9 %** |
+| **Snapshot post-§2.20 (captured 2026-05-16)** | **30** | **1,775,775** | — | **-63.9 %** |
 | Snapshot post-§2.36 (40 tests, captured 2026-09-25 on `perf/dwconv`) | 40 | 7,982,735 | — | — |
 | + flat depthwise sweep (§2.37) | 40 | 7,666,615 | **-4.0 %** | — |
 | + 8-lane drain, 128-bit y with byte strobes (§2.38) | 43 (39 common) | 6,093,330 (common) | **-20.4 %** | — |
@@ -64,7 +64,7 @@ after running the full TestConvRef case list.
 | + flat standard sweep (§2.41) | 48 | 4,393,960 (4,408,535 re-measured on `perf/conv2px`) | **-41.3 %** | — |
 | + two output pixels per cycle (§2.42) | 58 (47 common) | 3,385,480 (common; 3,683,195 all 57 of the first run) | **-23.0 %** on the 47 common cases | — |
 
-**Net result vs §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
+**Net result of §2.8–§2.20 vs the §2.7 snapshot: 2.77× faster across 30 RTL tests; 63.9 %
 reduction in total HW sim time.  Net result vs original baseline: TODO
 (needs `conv_optimisation_1` re-run for the pre-§2.1 column).**
 
@@ -2396,7 +2396,7 @@ Depthwise hot loop, per `(oh, ow)`:
 | `accumulate_depthwise` MAC reduction | 1 | `kh × kw` | **÷ `kTileM` (§2.8)** |
 | Partial accumulator read/write | 1 | `2 × m_valid` | unchanged |
 
-**Current bottleneck.**  After §2.12 the patch read is `kh·kw` beats,
+**Bottleneck after §2.12–§2.13 (historical).**  After §2.12 the patch read is `kh·kw` beats,
 the same class as the MAC reduce, so no single phase dominates the
 inner loop.  For standard the cost is spread across the `kh·kw`-beat
 patch read, the per-`mt_in_group` accumulate, and the `2·m_valid`
@@ -2415,7 +2415,12 @@ acc r/w is a relatively larger share.  Remaining throughput paths:
 
 §2.13 moved `partial_outputs` to URAM — a resource win, not a
 throughput one — so the inner-loop balance above is unchanged from
-§2.12.
+§2.12.  Both paths were taken later: §2.32 streams one `WeightVec` (all
+ic-lanes of a kernel position) per beat, and §2.41 replaced the
+per-pixel loops with one flat sweep per `(ict, ow_tile, mg)`.  Today
+(§2.42) a pixel pair costs `G · max(kh·kw, 2)` cycles per M-group at
+512 MACs/cycle, and the 1×1 layers are bound by the drain
+(RESNET18_15FPS_PLAN.md step 8).
 
 ---
 
@@ -2565,9 +2570,10 @@ TODO: backfill the `Baseline (pre-§2.1)` column from a
 
 ---
 
-## 6. Where the floor is now
+## 6. Where the floor was after §2.20 (2026-05-16)
 
-After §2.20 the total across 30 RTL tests is **1.78 ms** — 2.77×
+A snapshot: §2.21–§2.42 changed the kernel since (the progression in §1,
+the current architecture in §3).  After §2.20 the total across 30 RTL tests is **1.78 ms** — 2.77×
 faster than at §2.7.  §2.13–§2.15 rebalanced resources at zero
 throughput cost: §2.13 moved `partial_outputs` to URAM (BRAM
 131 → 101, URAM 0 → 16), §2.14 merged the two patch producers (LUT
@@ -2582,7 +2588,7 @@ the broadcast read-mux trees (FF 62,987 → 32,089, LUT
 out of the per-stage bodies (FF → 29,810, LUT → 39,105) and §2.20
 marked the invariant arguments STABLE, dropping 36 scalar channel
 FIFOs (FF → **27,487**, LUT → **36,341**).
-Current utilisation: **LUT 31 %, BRAM 27 %, FF 11 %, URAM 25 %,
+Utilisation then: **LUT 31 %, BRAM 27 %, FF 11 %, URAM 25 %,
 DSP 12 %**.  LUT is still the tightest resource, but the §2.13–§2.20
 arc more than halved both the FF and LUT footprint and cleared the
 timing deficit.

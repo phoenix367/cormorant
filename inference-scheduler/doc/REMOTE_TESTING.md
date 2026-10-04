@@ -674,7 +674,7 @@ Reported metric: **GOps/s** = `2 × MACs / lat` where MACs = `batch × out_ch ×
 |-------|-------------|
 | `batch`, `channels` | Batch and channel count |
 | `in_h`, `in_w` | Input spatial dimensions |
-| `pool_h`, `pool_w` | Pooling window size; set to `in_h×in_w` for global pool |
+| `pool_h`, `pool_w` | Pooling window size; set to `in_h×in_w` for global pool.  `run_remote_perf.py` rejects a window outside the platform's `kernels.pool` bounds (`pool_h ≤ max_kh`, `pool_w ≤ max_kw`, `(pool_h−1)·dil_h + 1 ≤ max_line_buf_rows`, `(pool_w−1)·dil_w + 1 ≤ max_line_buf_cols`) before it connects — older kernels hang on one (POOL_OPTIMISATION §2.14.1) |
 | `stride_h`, `stride_w` | Pooling stride |
 | `pad_top`, `pad_left` | Zero-padding |
 | `dil_h`, `dil_w` | Dilation (1 = standard) |
@@ -939,8 +939,9 @@ and their MatMul tactics plus a space-filling set, twice.
 ```
 
 `run` checks that the board runs the bitstream the cases are for
-(`--board-bin`, default `/lib/firmware/pl.bin`; `/lib/firmware/<overlay_name>.bin`
-for another overlay name), refuses to run while the
+(`--board-bin`, default `/lib/firmware/<overlay>.bin` with the overlay name
+`upload_bitstream.py` uses for `bitstream_config_kv260.json`: `overlay_name`, else
+the `.dtbo` stem — `pl.bin` today), refuses to run while the
 chat server owns the kernels unless `--stop-server` (stops it and restarts
 it afterwards), and `--resume` keeps the measurements already taken.
 `cases --refine` adds the tactics the fitted model ranks near the best;

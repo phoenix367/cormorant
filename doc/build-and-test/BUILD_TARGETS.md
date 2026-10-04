@@ -12,6 +12,11 @@ mkdir build && cd build
 cmake ..
 ```
 
+Each kernel also configures on its own, with the same target names
+(`cmake -S kernels/<k> -B <dir>` for `vectorop`, `conv`, `pool`, `matmul`,
+`matmul_rtl`): `cmake/AxiPlatform.cmake`, which the top level includes too,
+sets `AXI_BUS_WIDTH`, `AXI_PLATFORM` and the platform list.
+
 Key configure-time cache variables:
 
 | Variable | Default | Effect |

@@ -40,7 +40,7 @@ make package_matmul_rtl          # MatmulKernel: the SystemVerilog IP (Vivado); 
 make driver_matmul_rtl           # its C driver, which projects copy (build/kernels/matmul_rtl/driver/...)
 ```
 
-Each kernel can also be built standalone:
+Each kernel (every `kernels/<k>`) can also be built standalone — `cmake/AxiPlatform.cmake` gives it the bus width and platform list the top level sets:
 
 ```bash
 cd kernels/vectorop && mkdir build && cd build
@@ -147,7 +147,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1645 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1647 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 

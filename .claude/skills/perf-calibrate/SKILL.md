@@ -51,8 +51,9 @@ bitstream needs one there too.
    .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 1d28630fbfa4 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
-   `run` makes this check itself: `--board-bin` (default `/lib/firmware/pl.bin`) must be
-   `/lib/firmware/<overlay_name>.bin` when `overlay_name` is not `pl`.
+   `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`
+   with the overlay name `upload_bitstream.py` uses for the same config (`overlay_name`,
+   else the `.dtbo` stem: `pl.bin` today).
 2. **The bitstream is actually loaded.** Follow the board-deploy skill §2. The id
    check only hashes the file. After a reboot the PL can hold the starter-kit overlay. Run
    `cat /sys/class/uio/uio*/name` on the board. It must list `fabric_vecop fabric_matmul fabric_conv fabric_pool`.

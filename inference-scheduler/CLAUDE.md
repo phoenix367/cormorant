@@ -269,7 +269,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              75 pytest modules, 1645 tests, all pass (test_bert_base.py
+  test_*.py              75 pytest modules, 1647 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -703,7 +703,11 @@ the `KERNEL_REGISTRY` names (`PoolKernel`); `run_remote_perf.py` uses
 kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) when it loads the cases and
 exits with `config error: VectorOPKernel case '<label>': unsupported op=…`
 before it connects to the board (`_load_cases()` runs right after the config
-is loaded), so a bad case costs no remote build.
+is loaded), so a bad case costs no remote build.  A `PoolingKernel` case's
+window is checked the same way against the platform JSON's `kernels.pool`
+bounds (`pool_h` / `pool_w` ≤ `max_kh` / `max_kw`, the dilated window within
+the line buffer): the kernels of bitstream `1d28630fbfa4` and older hang on a
+larger one and wedge the HPC port (`../doc/kernels/POOL_OPTIMISATION.md` §2.14.1).
 
 ## Driver Sources
 

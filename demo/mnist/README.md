@@ -122,7 +122,8 @@ Or step-by-step (lets you iterate without re-downloading):
 ```
 
 Sample output (host `~/projects/axi_demo/demo/mnist`, board at
-`192.168.100.8`, full 10 000-image MNIST test set):
+`192.168.100.8`, full 10 000-image MNIST test set; the run of 2026-10-04 on
+bitstream `1d28630fbfa4`):
 
 ```
 $ ./run_demo.py
@@ -203,7 +204,7 @@ Preflight (remote)
     OK      gcc                                  gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
     OK      xrt headers                          xrt via pkg-config
     OK      sudo / root                          passwordless sudo OK
-    OK      uio (VectorOPKernel: fabric)         /dev/uio4
+    OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio4
     OK      uio (MatmulKernel: fabric_matmul)    /dev/uio5
     OK      uio (ConvKernel:    fabric_conv)     /dev/uio6
     OK      uio (PoolKernel:    fabric_pool)     /dev/uio7
@@ -218,9 +219,9 @@ mnist_convnet
   make     → OK       3.0s
     bench_mnist: dataset=10000 images, iters=10000, warmup=50
                  input_numel=784, output_numel=10, classes=10
-    progress: 10000/10000 (100.0%) acc=98.92% mean=4.546ms rate=219.8ips
+    progress: 10000/10000 (100.0%) acc=98.92% mean=0.260ms rate=3813.0ips
   run      → OK                3.0s
-    accuracy = 98.92%   mean = 0.266 ms   throughput = 3766.7 img/s
+    accuracy = 98.92%   mean = 0.260 ms   throughput = 3850.9 img/s
 
 mnist_lenet
   upload   → OK       2.0s
@@ -228,8 +229,8 @@ mnist_lenet
   make     → OK       2.7s
     bench_mnist: dataset=10000 images, iters=10000, warmup=50
                  input_numel=784, output_numel=10, classes=10
-  run      → OK               28.3s
-    accuracy = 97.35%   mean = 2.810 ms   throughput = 355.9 img/s
+  run      → OK               28.6s
+    accuracy = 97.35%   mean = 2.831 ms   throughput = 353.3 img/s
 
 cleanup /tmp/mnist_demo
 per-step logs written to demo/mnist/build/logs
@@ -238,8 +239,8 @@ per-step logs written to demo/mnist/build/logs
 
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
-  mnist_convnet  OK       98.92%      0.266      0.265      0.272     3766.7
-  mnist_lenet    OK       97.35%      2.810      2.809      2.816      355.9
+  mnist_convnet  OK       98.92%      0.260      0.259      0.267     3850.9
+  mnist_lenet    OK       97.35%      2.831      2.830      2.839      353.3
 ```
 
 Notable behaviour visible in the run:
