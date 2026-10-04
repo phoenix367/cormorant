@@ -266,10 +266,10 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: bb2d1cd
+    commit: 16bdee5
     date: 2026-10-04
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
-          with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4; BERT 215.3, 135M 285.8,
+          with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
           360M 740.2, SmolVLM 494.8 MiB)"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
