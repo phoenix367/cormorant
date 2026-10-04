@@ -41,6 +41,7 @@ from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
 from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES, HostTable
 from .vit_nodes import VIT_OP_FACTORIES
 from .tts_nodes import TTS_OP_FACTORIES
+from . import cost_model
 from . import fusion
 from . import matmul_lowering
 from . import numeric
@@ -598,6 +599,9 @@ class OnnxGraph:
         ``matmul_gemv_kw`` ({constant B name: kw}) reads those weights in the
         ConvKernel image of that kernel width — a multi-entry project passes
         its prefill graphs' widths so decode and prefill share one buffer.
+        On the RTL MatmulKernel (``kernels.matmul.impl == "rtl"``) it
+        defaults to ``matmul_conv_kw``: a MatMul kept on MatmulKernel reads a
+        pinned weight in its pinned layout, whatever its row count.
         ``self.matmul_gemv_stats`` reports ``{"gemv", "kw>1",
         "tiled_cycles", "gemv_cycles"}``.
 
@@ -828,6 +832,10 @@ class OnnxGraph:
             graph_io=self._input_names + self._output_names,
             kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws,
             perf_model=perf_model, plan_log=self.plan_log)
+        if matmul_gemv_kw is None and cost_model.MATMUL_IMPL == "rtl":
+            # the RTL kernel reads a pinned weight in its pinned layout too
+            # (an image width, or 0: the tiled path's), whatever n is
+            matmul_gemv_kw = matmul_conv_kw
         self.matmul_gemv_stats = choose_gemv(
             self._nodes, mode=matmul_gemv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),

@@ -39,7 +39,7 @@ import onnx
 from ._matmul_hw_config import MATMUL_GEMV_MAX_M
 from .graph import OnnxGraph
 from .matmul_gemv import GEMV_KWS
-from .nodes import MatmulConvNode
+from .matmul_lowering import shared_weight_layouts
 
 
 class EntryModels(MutableMapping):
@@ -219,9 +219,9 @@ def entry_graphs(models: Dict[str, onnx.ModelProto], *, prefill_engine: str = "c
                       array_pool=pool)
         _release_memory()
         if kw is None or name == prefills[0]:
-            # the first bucket's widths pin the others; a planned width wins
-            first = {sn.inputs[1].onnx_name: sn.kw for sn in g.nodes
-                     if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight}
+            # the first bucket's layouts pin the others (on the RTL kernel the
+            # MatmulKernel ones too); a planned width wins
+            first = shared_weight_layouts(g.nodes)
             kw = first if kw is None else {**first, **kw}
         graphs[name] = g
         st = g.matmul_conv_stats

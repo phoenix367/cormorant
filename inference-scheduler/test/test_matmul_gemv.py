@@ -118,6 +118,67 @@ class TestGemvSelection(unittest.TestCase):
         self.assertIn("(uint64_t)((inference_buf_phys(b)) - (inference_buf_phys(a)))", src)
 
 
+@unittest.skipUnless(MATMUL_GEMV_MAX_M > 0, "platform kernel has no GEMV path")
+class TestRtlImagePolicy(unittest.TestCase):
+    """On the RTL MatmulKernel (``kernels.matmul.impl == "rtl"``) the image
+    (GEMV) layout is a B layout for any number of A rows, a weight pinned by
+    another entry is read in its pinned layout, and a width only ConvKernel
+    reads keeps the MatMul on ConvKernel (MATMUL_RTL_PLAN phase 3)."""
+
+    def _rtl(self):
+        from unittest import mock
+
+        from src import cost_model
+        return mock.patch.object(cost_model, "MATMUL_IMPL", "rtl")
+
+    def test_several_rows_are_eligible_on_rtl_only(self):
+        from src.matmul_gemv import gemv_shape_reason
+        from src.tactics import _MM
+        mm = _MM(16, 256, 96, 1, 0, 0, 0, [])
+        self.assertIn("n = 16", gemv_shape_reason(mm, 4))       # HLS: one row per B pass
+        with self._rtl():
+            self.assertIsNone(gemv_shape_reason(mm, 4))
+
+    def test_pinned_weight_reads_its_image_whatever_n(self):
+        k, m = 128, 48
+        with self._rtl():
+            g = OnnxGraph(_fc(16, k, m), matmul_on_conv="off", matmul_conv_kw={"W": 4})
+        sn, = _mm(g)
+        self.assertEqual(sn.gemv_kw, 4)
+        self.assertFalse(sn.b_packed)
+        np.testing.assert_array_equal(sn.inputs[1].packed_data,
+                                      conv_lowered_b_image(sn.inputs[1].data, k, m, 4))
+        # HLS: the pin only steers a ConvKernel lowering; 16 rows stay tiled
+        sn, = _mm(OnnxGraph(_fc(16, k, m), matmul_on_conv="off", matmul_conv_kw={"W": 4}))
+        self.assertEqual(sn.gemv_kw, 0)
+
+    def test_pinned_tiled_layout_stays_tiled(self):
+        with self._rtl():
+            sn, = _mm(OnnxGraph(_fc(1, 256, 96), matmul_conv_kw={"W": 0}))
+        self.assertEqual(sn.gemv_kw, 0)
+        self.assertTrue(sn.b_packed)
+
+    def test_shared_weight_layouts(self):
+        from src.matmul_lowering import shared_weight_layouts
+        g = OnnxGraph(_fc(1, 256, 96))
+        self.assertEqual(shared_weight_layouts(g.nodes), {})       # HLS: ConvKernel widths only
+        with self._rtl():
+            self.assertEqual(shared_weight_layouts(g.nodes), {"W": 1})
+            g = OnnxGraph(_fc(1, 256, 96), matmul_gemv="off")
+            self.assertEqual(shared_weight_layouts(g.nodes), {"W": 0})
+
+    def test_conv_only_width_keeps_conv(self):
+        from src.nodes import MatmulConvNode
+        # 64 rows, k = 96: a ConvKernel width of 6 (k % (16 * 6) == 0) no
+        # MatmulKernel image has; pinned, the MatMul stays on ConvKernel
+        # even where MatmulKernel would be estimated faster
+        with self._rtl():
+            g = OnnxGraph(_fc(64, 96, 64), matmul_conv_kw={"W": 6})
+        self.assertEqual([type(sn).__name__ for sn in g.nodes
+                          if isinstance(sn, (MatmulNode, MatmulConvNode))], ["MatmulConvNode"])
+        self.assertEqual([sn.kw for sn in g.nodes if isinstance(sn, MatmulConvNode)], [6])
+
+
 @unittest.skipUnless(MATMUL_GEMV_MAX_M > 0 and shutil.which("cc"), "needs GEMV and cc")
 class TestGemvHostEmulation(unittest.TestCase):
     """Generated C against the software MatmulKernel (GEMV image, a_to_b

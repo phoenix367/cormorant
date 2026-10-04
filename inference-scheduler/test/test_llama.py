@@ -452,6 +452,47 @@ class TestHostEmulation(unittest.TestCase):
                 self.assertIn("re-open: ok", out)
                 self.assertIn("test_inference PASSED", out)
 
+    def test_multi_entry_project_rtl_matmul(self):
+        """With the RTL MatmulKernel's cost model (``kernels.matmul.impl ==
+        "rtl"``) a MatMul kept on MatmulKernel reads its weight in the layout
+        the first prefill bucket pinned — the ConvKernel image whatever its row
+        count — so the project still holds ONE copy of every weight, and the
+        generated C (software kernels: the image read with several rows)
+        equals the simulation."""
+        from unittest import mock
+
+        from src import cost_model
+        from src.matmul_lowering import shared_weight_layouts
+        _cfg, _W, _f, fe = tiny()
+        with mock.patch.object(cost_model, "MATMUL_IMPL", "rtl"):
+            # the first bucket on ConvKernel (forced: the tiny dims are below
+            # its tile), the others pinned to its layouts as entry_graphs does
+            big = OnnxGraph(fe.entry("prefill", 16), fuse_act=True, matmul_on_conv="always")
+            pins = shared_weight_layouts(big.nodes)
+            gs = {"decode": OnnxGraph(fe.entry("decode", 1), fuse_act=True, matmul_gemv_kw=pins),
+                  "prefill_8": OnnxGraph(fe.entry("prefill", 8), fuse_act=True,
+                                         matmul_conv_kw=pins),
+                  "prefill_16": big,
+                  "head": OnnxGraph(fe.entry("head", 1), fuse_act=True, matmul_gemv_kw=pins)}
+            mg = MultiEntryGenerator(list(gs.items()), "llama_tiny")
+            s = mg.summary()
+        self.assertEqual(s["renamed_weights"], {})
+        conv_w = {sn.inputs[1].onnx_name: sn.kw for sn in gs["prefill_16"].nodes
+                  if isinstance(sn, MatmulConvNode)}
+        self.assertTrue(conv_w)
+        rows_on_image = 0
+        for name, g in gs.items():
+            for sn in g.nodes:
+                if type(sn) is MatmulNode and sn.inputs[1].onnx_name in conv_w:
+                    self.assertEqual(sn.gemv_kw, conv_w[sn.inputs[1].onnx_name], (name, sn.inputs[1].onnx_name))
+                    rows_on_image += sn.n > 1
+        self.assertGreater(rows_on_image, 0)          # prefill_8 on MatmulKernel, the conv image
+        with tempfile.TemporaryDirectory() as td:
+            rc, out = host_emu.build_and_run(mg, td, cached=True, threads=4, min_elems=1,
+                                             incoherent=True)
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("test_inference PASSED", out)
+
     def test_library_sequence(self):
         """The multi-entry project driven like llm_api.c — prefill split over
         the buckets, head, decode steps, a second turn on top of the decoded

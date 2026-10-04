@@ -35,7 +35,7 @@ sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 
 from src.codegen.multi import MultiEntryGenerator       # noqa: E402
 from src.graph import OnnxGraph                         # noqa: E402
-from src.nodes import MatmulConvNode                    # noqa: E402
+from src.matmul_lowering import shared_weight_layouts    # noqa: E402
 from src.piper import (ENC_BUCKETS, PiperChunkFrontend, PiperEncoderFrontend,   # noqa: E402
                        entry_info, load_weights)
 import piper_vits as pv                                 # noqa: E402
@@ -169,8 +169,7 @@ def _entries(assets: str, W: dict = None):
         eg = OnnxGraph(PiperEncoderFrontend(W, doc["encoder"], T, name="piper_lessac_medium").entry(),
                        matmul_conv_kw=kw)
         if kw is None:
-            kw = {sn.inputs[1].onnx_name: sn.kw for sn in eg.nodes
-                  if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight}
+            kw = shared_weight_layouts(eg.nodes)
         enc[T] = eg
     return [("chunk", g)] + [(f"encode_{T}", enc[T]) for T in ENC_BUCKETS], entry_info(model)
 

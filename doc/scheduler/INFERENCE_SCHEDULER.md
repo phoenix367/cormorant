@@ -127,7 +127,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1627 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1633 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1107,7 +1107,8 @@ decode graphs of a Llama project read the same buffer.
 `src/matmul_gemv.py` (`OnnxGraph(matmul_gemv=...)`, CLI `--matmul-gemv
 {auto,always,off}`) runs after the ConvKernel lowering.  A MatmulNode takes
 the path when the platform's kernel has it (`kernels.matmul.gemv_max_m >
-0`), the element type is `ap_fixed<16,8>`, `outer_count == 1`, `n == 1`,
+0`), the element type is `ap_fixed<16,8>`, `outer_count == 1`, `n == 1` (on
+the HLS kernel; any `n` on the RTL one, below),
 `k % 8 == 0` and `k ≤ max_k` (`k % (16 kw) == 0` for `kw > 1`), `m % 8 == 0`,
 `m · kw ≥ 64`, the batch strides are multiples of 8 and — in `auto` —
 `cost_model.gemv_cycles` is below the tiled `matmul_cycles`.  The kernel
@@ -1133,6 +1134,25 @@ SmolLM2-360M peaks at 32 GB of host memory instead of running out of 46.
 `test/test_matmul_gemv.py` covers the pass; `test/test_llama.py` builds
 the four-entry tiny project this way and runs it on the host emulation,
 whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
+
+**On the RTL MatmulKernel** (`platforms/<name>.json` `kernels.matmul.impl
+== "rtl"`, or `AXI_MATMUL_IMPL=rtl`; doc/kernels/MATMUL_RTL_KERNEL.md) the
+cost model is `cost_model.rtl_matmul_cycles`, and the image is just a B
+layout: the kernel streams B once per panel of 8 A rows on either path, at
+about the packed layout's speed.  So the `n == 1` rule does not apply there,
+and a multi-entry project keeps one copy of every weight whatever kernel
+each entry runs it on: the first prefill bucket pins every weight's layout
+(`matmul_lowering.shared_weight_layouts`: its ConvKernel width, the image a
+MatMul kept on MatmulKernel reads, or 0 for the tiled path's layout), the
+other entries get the pins as `matmul_conv_kw` — which on RTL is also their
+`matmul_gemv_kw` — and a pinned weight is read in its layout (a MatMul
+kept on MatmulKernel reads the ConvKernel image with any row count; a width
+only ConvKernel reads, like Piper's kw 6, keeps the MatMul on ConvKernel).
+With the RTL model the 16-token prefill buckets of the Llama projects run
+their linears on MatmulKernel (ConvKernel is bound by streaming the weights
+at 16 rows: 217k cycles for a 576×1536 linear against MatmulKernel's 124k),
+the larger buckets stay on ConvKernel, and every pool is unchanged
+(MATMUL_RTL_PLAN phase 3).
 
 ---
 

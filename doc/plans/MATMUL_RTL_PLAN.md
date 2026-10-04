@@ -1,18 +1,16 @@
 # MatmulKernel in SystemVerilog: integration plan
 
-**Status (2026-10-04):** phases 0, 1, 2 and 2b done — the RTL kernel, its
-Verilator testbench, the C driver and the IP packaging are in
-`kernels/matmul_rtl/` and build from a fresh clone; with
-`AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (now `1d28630fbfa4`,
-timing met at 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than
-with the HLS kernel) and passes the matmul behaviour test (50 / 50) and the
-whole-design simulation (68 / 68).  On the board everything is bit-exact
-(registers, the 148 models, targeted C writes, every demo and chat / TTS
-gate) and no benchmark or workload is slower than with the HLS kernel:
-tiled MatMuls 2–8× faster, depthwise-shaped ones 11×, GEMV equal or faster
-(SmolLM2-135M decode 98.0 vs 99.3 ms / token) after phase 2b balanced K
-between the two lanes.  The default is still `hls`; phases 3–4
-(performance models, switch) are open.
+**Status (2026-10-04):** phases 0–3 done.  The RTL kernel, its Verilator
+testbench, the C driver and the IP packaging are in `kernels/matmul_rtl/`;
+with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (`1d28630fbfa4`,
+timing met at 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer) and
+is bit-exact on the board everywhere, no benchmark or workload slower than
+with the HLS kernel (phase 2b balanced K between the lanes).  Phase 3: the
+bitstream is calibrated, the scheduler models the RTL kernel
+(`kernels.matmul.impl`), and its engine choices keep one copy of every
+weight — measured on the board, the 16-token LLM prefills run 26–32 %
+faster and MobileNet v1 10 %, all bit-exact.  The default is still `hls`;
+phase 4 (the switch: platform field, bitstream, chat server, docs) is open.
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
 drop-in replacement for the Vitis HLS MatmulKernel
@@ -320,7 +318,7 @@ workload slower than with the HLS kernel.  Outputs:
 `/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/` (bitstream, reports, build
 log, `perf_rtl2*.json`); logs in `/mnt/data/tmp/p2b_*.log`.
 
-### Phase 3: performance models and scheduling — in progress
+### Phase 3: performance models and scheduling — done (2026-10-04)
 
 **3a. Calibration campaign** on the RTL bitstream `1d28630fbfa4`
 (`perf_calibrate.py cases`, `run`, `fit`; 2026-10-04): 1 249 calls (754 from
@@ -362,18 +360,65 @@ around the shipped choices, and 3b changes both.
   MatMul's engine choice compares ConvKernel and MatmulKernel on the same
   image, so every weight keeps one copy across the entries.
 
-**Remaining:**
-- The scheduler policy above: the GEMV eligibility's n = 1 rule (an HLS
-  cost fact) becomes a cost question on RTL; `lower_matmuls` prices
-  MatmulKernel on the image; the first prefill bucket's MatmulKernel
-  weights pin their width for the other entries as its ConvKernel ones do;
-  hinted weights in decode always read the image.  Check: pools unchanged,
-  engine counts, predicted end-to-end times (`simulate` with the RTL model).
-- A top-up campaign for the new shipped calls, the refinement rounds, the
-  simulator check again.
-- 3c: regenerate and measure on the board, before / after: BERT, LLM
-  prefill and decode, LeNet, the CNNs, Piper; the perf-regression baseline
-  of the RTL bitstream is recorded (`kv260-1d28630fbfa4.json`).
+**3b, the policy** (all of it only with `impl: rtl`; the HLS path is
+unchanged, byte for byte):
+- `matmul_gemv`: the image ("GEMV") path is eligible for any row count, and
+  a weight pinned by another entry is always read in its pinned layout.
+- `matmul_lowering.shared_weight_layouts`: the first prefill bucket pins
+  every weight's layout — its ConvKernel width, the image width a MatMul
+  kept on MatmulKernel reads, or 0 for the tiled path's layout — and both
+  entry builders (`llm_entries.entry_graphs`, Piper's
+  `generate_tts_project.py`) pass it to the other entries, where
+  `OnnxGraph` uses it for the MatmulKernel reads as well.
+- `lower_matmuls` prices MatmulKernel on the pinned layout, and a width only
+  ConvKernel reads (Piper's encoder: kw 6) keeps the MatMul on ConvKernel.
+- Result: every pool unchanged (SmolLM2-135M 285.8, 360M 740.2, SmolVLM
+  494.8, Piper 48.1 MiB; no weight in a second layout); the 16-token
+  prefill buckets run their linears on MatmulKernel (at 16 rows ConvKernel
+  is bound by streaming the weights: 217k cycles measured for a 576×1536
+  linear, MatmulKernel 124k estimated), the larger buckets stay on
+  ConvKernel; MobileNet v1's last fully-connected Conv becomes a MatMul;
+  the LM head is stored packed (it is not shared, so the pool is the same).
+- A top-up campaign measured the new shipped calls and one refinement
+  round (134 calls; 1 383 exact calls, the GEMV family's held-out p90
+  3.2 %).  Predicted with every call priced: SmolLM2-135M / SmolVLM
+  16-token prefill 340.5 → 250.6 ms (−26 %), SmolLM2-360M 788.6 → 528.1 ms
+  (−33 %), MobileNet v1 81.4 → 73.3 ms (−10 %); everything else unchanged.
+- Tests: `test_matmul_gemv.TestRtlImagePolicy` (the rules), and
+  `test_llama.test_multi_entry_project_rtl_matmul`: a four-entry tiny
+  project with the RTL model keeps one copy of every weight, its 8-row
+  bucket reads the ConvKernel image on MatmulKernel, and the generated C on
+  the software kernels equals the simulation.
+- Not done: the planner (`--plan`) has no MatmulKernel-image tactic for
+  several rows yet (`tactics.py` offers GEMV for one row only), so a planned
+  project keeps a pinned weight on ConvKernel.
+
+**3c. On the board** (2026-10-04; the RTL bitstream after a reboot; the
+projects generated with `AXI_MATMUL_IMPL=rtl` into a scratch directory, the
+gates in `/root/rtl_gate` with their own weight directories — the LM head
+is stored packed there, so the deployed weight files differ in that one
+file; production restored after a reboot):
+
+| workload | today's choices (RTL bitstream) | RTL choices | change |
+|---|---:|---:|---:|
+| SmolLM2-135M prefill 16 | 340 ms | **251 ms** (predicted 250.6) | −26 % |
+| SmolVLM-256M prefill 16 | 339 ms | **250 ms** | −26 % |
+| SmolLM2-360M prefill 16 | 839 ms | **568 ms** (predicted 528; the host model misses 360M by 6 %) | −32 % |
+| MobileNet v1 | 81.0 ms | **73.0 ms** (predicted 73.3) | −10 % |
+| 135M / SmolVLM prefill 64, 256; decode | 443 / 1281 ms; 97.9 ms at 32 | unchanged | — |
+| 360M prefill 64 / 256; decode at 32 | 1035 / 3087 ms; 248.4 ms | 999 / 2898 ms; 247.7 ms (same kernel choices: run-to-run) | — |
+| ResNet-18, MobileNet v2 | 59.9, 63.0 ms | 59.9, 63.0 ms | — |
+
+Every gate bit-exact: the three chat models' logits (4 × 33 / 33 and the
+SmolVLM images), decode checksums identical to the HLS runs, the top-5
+classes and logits of the CNNs identical.  Pools unchanged.  BERT, MNIST
+and Piper keep today's choices (nothing to gain: their MatMuls stay on
+ConvKernel or already run on MatmulKernel).  Outputs:
+`/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/phase3c/`.
+
+**Phase 3 status:** done for the unplanned (default) path; the planner's
+multi-row image tactic is open, and the board still runs the HLS bitstream —
+phase 4 switches `kernels.matmul.impl` and the bitstream together.
 
 ### Phase 4: the default and the clean-up
 

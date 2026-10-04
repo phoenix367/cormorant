@@ -20,21 +20,26 @@ Eligibility (every rule is a kernel requirement):
 
   * the platform's kernel has the path (``kernels.matmul.gemv_max_m > 0``)
     and the graph's element type is ap_fixed<16,8> (8 lanes per word);
-  * a plain MatmulNode (``outer_count == 1``) with ``n == 1`` — each A row
-    streams all of B, so several rows are the tiled path's job;
+  * a plain MatmulNode (``outer_count == 1``) with ``n == 1`` on the HLS
+    kernel — it streams all of B per A row, so several rows are the tiled
+    path's job.  The RTL kernel (``kernels.matmul.impl == "rtl"``) streams B
+    once per panel of 8 rows on either path, so any ``n`` is eligible and the
+    image is simply a B layout: a constant weight shared with other entries
+    (``kw_hint``) is always read in its image there, keeping one copy;
   * ``k % 8 == 0`` and ``k <= max_k`` (``k % (16 kw) == 0`` for kw > 1),
     ``m % 8 == 0`` and ``m * kw >= 64``, A and B batch strides multiples of
     8 elements.
 
 Mode: "auto" (default) — eligible nodes whose ``cost_model.gemv_cycles`` is
-below the tiled path's ``matmul_cycles``; "always" — every eligible node;
-"off" (CLI ``--matmul-gemv off``).
+below the tiled path's ``matmul_cycles`` (on the RTL kernel also every hinted
+weight); "always" — every eligible node; "off" (CLI ``--matmul-gemv off``).
 """
 
 from __future__ import annotations
 
 from typing import Dict, Optional, Sequence
 
+from . import cost_model
 from ._conv_hw_config import CONV_TILE_IC
 from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_MAX_K
 from .cost_model import gemv_cycles, matmul_cycles
@@ -74,8 +79,8 @@ def gemv_shape_reason(sn, kw: int = 1) -> Optional[str]:
     (src/tactics.py)."""
     if sn.outer_count != 1:
         return "4D x 3D outer loop"
-    if sn.n != 1:
-        return f"n = {sn.n} rows (GEMV streams B once per row)"
+    if sn.n != 1 and cost_model.MATMUL_IMPL != "rtl":
+        return f"n = {sn.n} rows (the HLS kernel's GEMV streams B once per row)"
     if sn.b_packed:
         return "B is in the packed tile-major layout"
     if kw not in GEMV_KWS:
@@ -173,7 +178,10 @@ def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = Tru
             kw, relayout = 1, False          # the hint's image does not fit: plain B
         tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
         gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
-        use = mode != "auto" or gemv < tiled
+        # the RTL kernel reads a shared weight in its image whatever n is:
+        # the tiled path would need the packed layout as a second copy
+        shared = cost_model.MATMUL_IMPL == "rtl" and b.onnx_name in kw_hint
+        use = mode != "auto" or gemv < tiled or shared
         if perf_model is not None and mode == "auto" and b.onnx_name not in kw_hint:
             # (a weight in a shared image keeps the unplanned choice: switching
             # it would need a second copy in another layout)

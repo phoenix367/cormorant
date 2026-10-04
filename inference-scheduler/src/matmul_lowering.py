@@ -70,7 +70,8 @@ from ._conv_hw_config import (
     CONV_TILE_IC,
     CONV_TILE_M,
 )
-from .cost_model import CALL_OVERHEAD, conv_batch_cycles, matmul_cycles
+from . import cost_model
+from .cost_model import CALL_OVERHEAD, conv_batch_cycles, gemv_cycles, matmul_cycles
 from .nodes import MatmulConvNode, MatmulNode, SchedulerError, conv_lowered_b_image
 
 MODES = ("auto", "always", "off")
@@ -241,9 +242,38 @@ def conv_plans(mm: MatmulNode, kw_options: Sequence[int],
     return split + plans
 
 
-def matmul_plan_cycles(mm: MatmulNode) -> float:
-    return matmul_cycles(mm.n, mm.k, mm.m, mm.batch * mm.outer_count,
-                         b_packed=bool(mm.b_packed)) + CALL_OVERHEAD
+def matmul_plan_cycles(mm: MatmulNode, kw_pin: Optional[int] = None) -> float:
+    """MatmulKernel's cycles for ``mm`` (plus the call).  On the RTL kernel a
+    weight pinned by another entry (``kw_pin``: an image width, or 0 for the
+    tiled path's layout) is read in that layout, so it is priced in it."""
+    batch = mm.batch * mm.outer_count
+    if kw_pin and cost_model.MATMUL_IMPL == "rtl":
+        from .matmul_gemv import gemv_shape_reason
+        if gemv_shape_reason(mm, kw_pin) is None:
+            return gemv_cycles(mm.n, mm.k, mm.m, batch, kw_pin) + CALL_OVERHEAD
+    return matmul_cycles(mm.n, mm.k, mm.m, batch,
+                         b_packed=bool(mm.b_packed) or kw_pin == 0) + CALL_OVERHEAD
+
+
+# Image widths MatmulKernel reads (its GEMV / image path, matmul_gemv.GEMV_KWS).
+_MM_IMAGE_KWS = (1, 2, 4, 8)
+
+
+def shared_weight_layouts(nodes: list) -> Dict[str, int]:
+    """{constant B name: layout} of a graph's MatMul weights, for a
+    multi-entry project's other graphs to pin (``matmul_conv_kw``), so a
+    shared weight stays one buffer: the kernel width of every weight read by
+    ConvKernel (MatmulConvNode), and on the RTL kernel also of every weight
+    MatmulKernel reads — its image width (``gemv_kw``), or 0 for the tiled
+    path's layout (packed or row-major)."""
+    out: Dict[str, int] = {}
+    for sn in nodes:
+        if isinstance(sn, MatmulConvNode) and sn.inputs[1].is_weight:
+            out[sn.inputs[1].onnx_name] = sn.kw
+        elif (cost_model.MATMUL_IMPL == "rtl" and type(sn) is MatmulNode
+              and sn.inputs[1].is_weight):
+            out.setdefault(sn.inputs[1].onnx_name, sn.gemv_kw)
+    return out
 
 
 def _readers(nodes) -> Dict[str, list]:
@@ -384,8 +414,11 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
         if b.onnx_name in kw_override:
             kws = [k for k in kws if k == kw_override[b.onnx_name]]
         plans = conv_plans(sn, kws)
-        mm_cyc = matmul_plan_cycles(sn)
+        pin = kw_override.get(b.onnx_name)
+        mm_cyc = matmul_plan_cycles(sn, pin)
         keep = not plans or (mode == "auto" and plans[0].cycles >= LOWER_MARGIN * mm_cyc)
+        if keep and plans and pin and cost_model.MATMUL_IMPL == "rtl" and pin not in _MM_IMAGE_KWS:
+            keep = False      # pinned to a ConvKernel-only image: MatmulKernel would need a copy
         p = None if keep else plans[0]
         if perf_model is not None:
             # a weight shared with other entries (pinned width) keeps one image:
@@ -434,6 +467,7 @@ __all__ = (
     "ineligible_reason",
     "conv_plans",
     "matmul_plan_cycles",
+    "shared_weight_layouts",
     "lower_matmuls",
     "PLAN_MIN_GAIN",
     "plan_conv_calls",
