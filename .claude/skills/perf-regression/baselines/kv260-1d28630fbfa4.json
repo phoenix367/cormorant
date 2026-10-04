@@ -1071,13 +1071,13 @@
  },
  "demos": {
   "mnist": {
-   "run": "2026-10-04 06:37",
-   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/mnist_results.json",
+   "run": "2026-10-04 14:30",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/phase4/mnist_results.json",
    "models": {
     "mnist_convnet": {
      "lat_ms": 0.2597,
-     "p50_ms": 0.2594,
-     "thr": 3850.38,
+     "p50_ms": 0.2593,
+     "thr": 3850.89,
      "thr_unit": "ips",
      "checks": {
       "correct": 9892,
@@ -1085,9 +1085,9 @@
      }
     },
     "mnist_lenet": {
-     "lat_ms": 2.8039,
-     "p50_ms": 2.8032,
-     "thr": 356.64,
+     "lat_ms": 2.8308,
+     "p50_ms": 2.8304,
+     "thr": 353.25,
      "thr_unit": "ips",
      "checks": {
       "correct": 9735,
@@ -1097,21 +1097,21 @@
    }
   },
   "image_classification": {
-   "run": "2026-10-04 06:36",
-   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/image_classification_results.json",
+   "run": "2026-10-04 14:30",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/phase4/image_classification_results.json",
    "models": {
     "mobilenet_v1": {
-     "lat_ms": 81.0293,
-     "p50_ms": 81.0293,
-     "thr": 12.34,
+     "lat_ms": 72.9538,
+     "p50_ms": 72.9538,
+     "thr": 13.71,
      "thr_unit": "ips",
      "checks": {
       "top1[greyfox-672194.JPEG]": "281:3034"
      }
     },
     "mobilenet_v2": {
-     "lat_ms": 62.9501,
-     "p50_ms": 62.9501,
+     "lat_ms": 62.9446,
+     "p50_ms": 62.9446,
      "thr": 15.89,
      "thr_unit": "ips",
      "checks": {
@@ -1119,9 +1119,9 @@
      }
     },
     "resnet18": {
-     "lat_ms": 59.9142,
-     "p50_ms": 59.9142,
-     "thr": 16.69,
+     "lat_ms": 59.894,
+     "p50_ms": 59.894,
+     "thr": 16.7,
      "thr_unit": "ips",
      "checks": {
       "top1[greyfox-672194.JPEG]": "280:3057"
@@ -1130,12 +1130,12 @@
    }
   },
   "bert_squad": {
-   "run": "2026-10-04 06:38",
-   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/bert_squad_results.json",
+   "run": "2026-10-04 14:29",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/phase4/bert_squad_results.json",
    "models": {
     "bertsquad-12-simplified": {
-     "lat_ms": 962.755,
-     "p50_ms": 963.296,
+     "lat_ms": 954.008,
+     "p50_ms": 953.271,
      "thr": null,
      "thr_unit": "ips",
      "checks": {
@@ -1148,6 +1148,37 @@
    }
   }
  },
- "history": [],
+ "history": [
+  {
+   "section": "demo:mnist",
+   "run": "2026-10-04 06:37",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/mnist_results.json",
+   "replaced": "2026-10-04",
+   "lat_ms": {
+    "mnist_convnet": 0.2597,
+    "mnist_lenet": 2.8039
+   }
+  },
+  {
+   "section": "demo:image_classification",
+   "run": "2026-10-04 06:36",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/image_classification_results.json",
+   "replaced": "2026-10-04",
+   "lat_ms": {
+    "mobilenet_v1": 81.0293,
+    "mobilenet_v2": 62.9501,
+    "resnet18": 59.9142
+   }
+  },
+  {
+   "section": "demo:bert_squad",
+   "run": "2026-10-04 06:38",
+   "source": "/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/demos/bert_squad_results.json",
+   "replaced": "2026-10-04",
+   "lat_ms": {
+    "bertsquad-12-simplified": 962.755
+   }
+  }
+ ],
  "updated": "2026-10-04"
 }

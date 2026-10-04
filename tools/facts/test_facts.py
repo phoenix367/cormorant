@@ -317,11 +317,14 @@ class TestPlugins(unittest.TestCase):
                  """)
         try:
             msgs = [(f.level, f.msg) for f in r.check("regs").findings if f.level != "info"]
+            # the RTL table is the truth (registers a, n); the HLS C++ is the reference model
             self.assertIn(("error", "driver table vs the RTL: n: A_N = 0x20 in the RTL, 0x1C in the table"), msgs)
-            self.assertIn(("error", "RTL driver registers differ from the HLS ports: only in the RTL driver [], "
-                                    "only in HLS ['mode']"), msgs)
-            self.assertIn(("warn", "RTL driver offsets differ from this HLS driver for n "
-                                   "(re-export the HLS IP, or fix the RTL)"), msgs)
+            self.assertIn(("error", "the C++ model's s_axilite ports differ from the RTL: only in the model "
+                                    "['mode'], only in the RTL []"), msgs)
+            self.assertIn(("warn", "driver registers differ from the kernel's: only in the driver ['mode'], "
+                                   "only in the kernel [] (rebuild the driver)"), msgs)
+            self.assertIn(("warn", "driver offsets differ from the RTL for n (rebuild the driver)"), msgs)
+            self.assertIn(("error", "FIELDS[K] field 'mode' is no register"), msgs)
         finally:
             r.close()
 

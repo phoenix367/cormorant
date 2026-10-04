@@ -143,14 +143,14 @@ The `fix` policy:
 | `json_excerpt` | `json`, `doc`, `start`, `complete` | A doc's copy of a JSON file (the first ```` ```json ```` / ```` ```jsonc ```` block after `start`, comments allowed): every value it shows equals the file's; with `complete` it shows every key |
 
 `register_map` checks that:
-- the HLS `s_axilite` ports equal the driver header's registers, where the
-  driver is built (a mismatch is a warning, because the header is a local
-  artifact);
-- with `rtl_driver` (an RTL kernel's driver generator,
-  `kernels/matmul_rtl/scripts/gen_driver.py`): its register table matches the
-  address constants of the RTL control block `rtl` (`--check --json`), its
-  register names equal the HLS ports, and its offsets equal a built HLS
-  driver header's (a warning, as above);
+- the kernel's registers — the HLS `s_axilite` ports (`hls`), or for an RTL
+  kernel the table of its driver generator (`rtl_driver`,
+  `kernels/matmul_rtl/scripts/gen_driver.py`), which must match the address
+  constants of its control block `rtl` (`--check --json`) — equal the driver
+  header's, where the driver is built (a mismatch is a warning, because the
+  header is a local artifact; with `rtl_driver` the offsets are compared too);
+- with both `rtl_driver` and `hls` (MatmulKernel: the HLS kernel's C++ is the
+  RTL kernel's reference model), the HLS ports equal the RTL registers;
 - every port is a `src/perf_calls.FIELDS` field (through `fields_alias`) or
   is `not_keyed` with a reason;
 - the timeline's `DECODE` table decodes only FIELDS;
@@ -160,7 +160,7 @@ The `fix` policy:
 A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 `PLUGINS`.
 
-## The facts (2026-10-02)
+## The facts (2026-10-04)
 
 | id | kind | what |
 |---|---|---|
@@ -168,7 +168,8 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `perf.bitstream_id` | value | the committed performance model's bitstream. `exists`: its cases / calib files and the perf-regression baseline |
 | `perf.model_size` | value | exact calls of the model; host-model signatures and kinds (`fix: report`: dated sentences) |
 | `cli.inference_scheduler` | interface | the CLI flags against `inference-scheduler/CLAUDE.md` § CLI and USER_GUIDE § Options |
-| `registers.{VectorOP,Matmul,Conv,Pool}Kernel` | interface | the register maps (`register_map`) |
+| `registers.{VectorOP,Matmul,Conv,Pool}Kernel` | interface | the register maps (`register_map`; MatmulKernel's from the RTL control block) |
+| `paths.matmul_driver` | value | where `make driver_matmul_rtl` writes MatmulKernel's driver (`kernels/matmul_rtl/CMakeLists.txt`), in the five example configs (and the remote config's note) and five docs |
 | `vectorop.codes` | interface | the `Op` / `Act` enums against `nodes.py`, the CLAUDE.md table, `run_remote_perf._OP_NAMES` and the timeline `DECODE` |
 | `ctypes.tts`, `ctypes.llm` | interface | the chat server's ctypes bindings against the C headers |
 | `config.chat` | interface | `chat_config.json.example` against the code reading it, with 5 waivers |
@@ -183,10 +184,10 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `chat.http_routes` | interface | the server's routes against API.md, and against the routes five other docs name |
 | `cli.script_calls` | interface | the flags of five script-to-script calls (`deploy.py` → the server, the BERT generator; `e2e_check.py`; `llm_calibrate.py`; `run_remote_tests.py`) |
 | `tts.max_ids` | value | Piper's encoder buckets; the largest (400) is the server's packing size in two files |
-| `board.results` | recorded | the README's headline board results, quoted 24 times in 9 files, within 3 %; stale on another bitstream; verified against the demos' `results.json` |
-| `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json` |
+| `board.results` | recorded | the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 9 files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
+| `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json`; also the RTL MatmulKernel's `K_MAX` and the RTL cost model's packed-B tile |
 | `board.pl_clock_mhz` | value, optional | the PL clock (the block design's PL0, 100 MHz) in the README, two docs and the two `MHZ` constants of the performance model |
-| `hw.utilization` | recorded | the bitstream's hw commit (d7ce129) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
+| `hw.utilization` | recorded | the bitstream's hw commit (7d8eefe) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
 | `board.uio_labels`, `board.uio_map` | interface | the overlay's UIO names (`dts/kv260/cormorant.dts`) and which kernel uses which, in the six example configs, two doc tables, the README, a skill and the MNIST README |
 | `bert.model_mb` | value | the 435 MB BERT download (`fetch_assets.py`), quoted in 11 files |
 | `chat.limits` | value | the 1024-position context and the 4096-character speech input |
@@ -221,6 +222,12 @@ were current. The README itself was out of date in two ways:
 - it never mentioned the fact registry or the hook.
 
 Fourteen mutations of these facts were all caught.
+
+The MatmulKernel switch (2026-10-04, MATMUL_RTL_PLAN phase 4) added
+`paths.matmul_driver` and MobileNet v1 / v2 and the 135M first token to
+`board.results`: the driver path had moved in 13 places, and MobileNet v1's
+81.0 ms and the 0.35 s first token were each stale in two or three docs.
+Six mutations of the new locators were all caught.
 
 The fourth batch registered what the chat demo added: the client's flags, the
 banner's width, the voice samples and the video link. `chat.py`'s usage

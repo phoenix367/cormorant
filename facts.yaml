@@ -74,8 +74,7 @@ facts:
 - id: perf.bitstream_id
   kind: value
   title: the bitstream of the current performance model (perf_models/README.md names it; a
-    model of another bitstream may sit beside it, e.g. the RTL MatmulKernel's during
-    MATMUL_RTL_PLAN phases 3-4)
+    model of another bitstream may sit beside it, e.g. the last HLS MatmulKernel bitstream's)
   source:
     file: inference-scheduler/perf_models/README.md
     regex: '^`kv260/([0-9a-f]{12})` is hw_128'
@@ -156,6 +155,29 @@ facts:
       - inference-scheduler/src/codegen/_source.py
       - inference-scheduler/bench_src/calib_runner.c
       - inference-scheduler/bench_src/bench_matmul.c
+
+- id: paths.matmul_driver
+  kind: value
+  title: where the build writes MatmulKernel's C driver (make driver_matmul_rtl, below build/), the
+    directory the example configs and docs point projects at
+  source:
+    file: kernels/matmul_rtl/CMakeLists.txt
+    regex: 'MM_RTL_DRIVER_ROOT "\$\{CMAKE_CURRENT_BINARY_DIR\}/(\w+)"\)\nset\(MM_RTL_DRIVER_SRC "\$\{MM_RTL_DRIVER_ROOT\}/([^"]+)"'
+    transform: "f'kernels/matmul_rtl/{v[0]}/{v[1]}'"   # the subdirectory's binary dir below build/
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/perf_config.json.example, regex: '"MatmulKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '"MatmulKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '\\"MatmulKernel\\": \\"\.\./build/([^\\]+)\\"'}
+    - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/image_classification/image_classification_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/mnist/mnist_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/matmul_rtl/[\w./]+/src)', count: 2}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '<repo>/build/(kernels/matmul_rtl/[\w./]+/src)/'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '<repo>/build/(kernels/matmul_rtl/[\w./]+/src)/'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
 
 - id: registers.ConvKernel
   kind: interface
@@ -244,7 +266,7 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 6a41e5c
+    commit: bb2d1cd
     date: 2026-10-04
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
           with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4; BERT 215.3, 135M 285.8,
@@ -474,23 +496,31 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, bert_ms: 953, smollm2_135m_tok_s: 10.0, smollm2_360m_tok_s: 3.9,
+  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 953,
+          smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.25, smollm2_360m_tok_s: 3.9,
           smolvlm_image_s: 3.9, piper_rtf: 0.52}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
-    how: "MATMUL_RTL_PLAN phase 4 board session: the demos' results.json (ResNet-18 p50 59.9 ms, BERT p50
-          953.3 ms), llm_board.py (135M 100.2 ms / token, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
+    how: "MATMUL_RTL_PLAN phase 4 board session: the demos' results.json (ResNet-18 p50 59.9 ms, MobileNet
+          v1 / v2 73.0 / 62.9, BERT p50 953.3 ms), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
+          prefill, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
           llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot)"
     facts: {perf.bitstream_id: 1d28630fbfa4}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
+    mobilenet_v1_ms: {file: demo/image_classification/build/results.json, json: '',
+                      transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'mobilenet_v1')"}
+    mobilenet_v2_ms: {file: demo/image_classification/build/results.json, json: '',
+                      transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'mobilenet_v2')"}
     bert_ms: {file: demo/bert_squad/build/results.json, json: metrics.p50_ms}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
     - {file: README.md, regex: '\*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
+    - {file: README.md, regex: '\| MobileNet V1 / V2, 224×224 \| (?P<mobilenet_v1_ms>[\d.]+) / (?P<mobilenet_v2_ms>[\d.]+) ms per image'}
     - {file: README.md, regex: '\*\*(?P<bert_ms>\d+) ms\*\* per inference \(p50'}
+    - {file: README.md, regex: 'SmolLM2-135M-Instruct \|[^|\n]*, 16-token prefill (?P<smollm2_135m_prefill16_s>[\d.]+) s'}
     - {file: README.md, regex: 'SmolLM2-135M-Instruct \| \*\*(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\*'}
     - {file: README.md, regex: 'SmolLM2-360M-Instruct \| \*\*(?P<smollm2_360m_tok_s>[\d.]+) tokens/s\*\*'}
     - {file: README.md, regex: '\*\*(?P<smolvlm_image_s>[\d.]+) s\*\* per image for the vision encoder'}
@@ -498,16 +528,20 @@ facts:
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
     - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
-    - {file: demo/image_classification/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms, MobileNet v1'}
+    - {file: demo/image_classification/README.md,       # the transcript's latest note, not the older ones
+       regex: 'faster kernel — ResNet-18 (?P<resnet18_ms>[\d.]+) ms,\s+MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
     - {file: doc/README.md, regex: 'met \((?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS\)'}
     - {file: doc/README.md, regex: '\((?P<bert_ms>\d+) ms p50 on'}
     - {file: doc/README.md, regex: 'SmolLM2-135M on the FPGA \(~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\)'}
     - {file: doc/README.md, regex: 'bit-exact on the board, RTF (?P<piper_rtf>[\d.]+);'}
     - {file: demo/chat/README.md, regex: 'streamed token by token \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/README.md, regex: 'streamed token by token \| ~[\d.]+ tokens/s; first token after (?P<smollm2_135m_prefill16_s>[\d.]+)–'}
     - {file: demo/chat/README.md, regex: 'better answers, slower \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
     - {file: demo/chat/README.md, regex: 'Answers questions about images \| (?P<smolvlm_image_s>[\d.]+) s per image'}
     - {file: demo/chat/doc/BERT_QA.md, regex: 'running on the FPGA: (?P<bert_ms>\d+) ms per 256-token window'}
-    - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2` \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2` \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s \| (?P<smollm2_135m_prefill16_s>[\d.]+)–'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '\*\*Prefill\.\*\*  (?P<smollm2_135m_prefill16_s>[\d.]+) / [\d.]+ / [\d.]+ s for 16 / 64 / 256'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: 'first answer of a chat starts after ~(?P<smollm2_135m_prefill16_s>[\d.]+)–'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2-360m` \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: '^~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s decode, first token'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'Decode: ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\* at short context'}

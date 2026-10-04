@@ -98,8 +98,8 @@ def register_map(args: dict, ctx) -> List[Finding]:
             out.append(("warn", f"driver registers differ from the kernel's: only in the driver "
                                  f"{sorted(set(offs) - P)}, only in the kernel {sorted(P - set(offs))} "
                                  f"(rebuild the driver)", h))
-        elif rtl_regs is not None:
-            diff = sorted(n for n in P if offs[n] != rtl_regs[n]["offset"])
+        if rtl_regs is not None:
+            diff = sorted(n for n in P & set(offs) if offs[n] != rtl_regs[n]["offset"])
             if diff:                        # a local build artifact: warn, as above
                 out.append(("warn", f"driver offsets differ from the RTL for {', '.join(diff)} "
                                      f"(rebuild the driver)", h))
