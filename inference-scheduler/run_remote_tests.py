@@ -552,7 +552,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--check-only", action="store_true",
                    help="Check SSH connectivity and remote prerequisites, then exit")
     p.add_argument("--no-cleanup", action="store_true",
-                   help="Keep remote build directories (for debugging)")
+                   help="Keep remote build directories (for debugging; "
+                        "same as \"cleanup\": false in the config)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print build/run output for every test (not only failures)")
     p.add_argument("--fail-fast", action="store_true",
@@ -569,6 +570,8 @@ def main(argv=None) -> int:
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.no_cleanup:
+        cfg["cleanup"] = False
 
     # ── Resolve model list ───────────────────────────────────────────────── #
     base = Path(__file__).parent
@@ -662,12 +665,12 @@ def main(argv=None) -> int:
             shutil.rmtree(tmp_root, ignore_errors=True)
 
         # ── Cleanup remote ────────────────────────────────────────────────── #
-        if not args.no_cleanup:
+        if cfg["cleanup"]:
             print(f"\n{_bold('Cleaning up')} remote directories…")
             cleanup_remote(session, cfg, [r.model_name for r in results])
             print(f"  {_green('Done')}")
         else:
-            print(f"\n{_dim('Remote directories kept (--no-cleanup).')}")
+            print("\n" + _dim('Remote directories kept (--no-cleanup / "cleanup": false).'))
             print(f"  {_dim(work_dir)}/")
             for r in results:
                 print(f"    {_dim(r.model_name)}/")

@@ -241,6 +241,13 @@ class TestCli(unittest.TestCase):
             self.assertIn("test00000000", d["subtitle"])
             self.assertEqual(inference_scheduler.main(["--out-dir", plain, _model("mixed_ops.onnx")]), 0)
             self.assertFalse(os.path.exists(os.path.join(plain, "timeline.html")))   # only when planning
+            # --no-report skips report.md only
+            quiet = os.path.join(td, "q")
+            self.assertEqual(inference_scheduler.main(["--out-dir", quiet, "--no-report", "--plan-report",
+                                                       "--perf-model", self._model_file(td),
+                                                       _model("mixed_ops.onnx")]), 0)
+            self.assertTrue(os.path.isfile(os.path.join(quiet, "timeline.html")))
+            self.assertFalse(os.path.exists(os.path.join(quiet, "report.md")))
 
     def test_timeline_profile(self):
         """--timeline-profile: the profiler's LAYERS_JSON output, or one PHASE of a

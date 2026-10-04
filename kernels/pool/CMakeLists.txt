@@ -1,14 +1,20 @@
 cmake_minimum_required(VERSION 3.19)
 project(PoolingKernel VERSION 1.0 LANGUAGES CXX)
 
+# The platform JSONs (AXI_PLATFORM_FILES, AXI_DEFAULT_PLATFORM_JSON): set by the
+# top-level project, or here when this kernel is configured on its own.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+include(AxiPlatform)
+
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
 # Locate Vitis HLS headers (ap_fixed.h) for fixed-point C++ simulation.
 # The headers are header-only — no HLS synthesis flow is needed for C-sim.
-# If not found, Data_t falls back to float and tests still verify correctness,
-# but saturation behaviour won't be tested.
+# If not found, Data_t falls back to float, but the kernel headers include
+# ap_int.h / hls_burst_maxi.h unconditionally, so nothing builds without
+# them (the float Data_t is only the configure default).
 # ---------------------------------------------------------------------------
 find_path(HLS_INCLUDE_DIR NAMES ap_fixed.h
     HINTS
@@ -24,7 +30,7 @@ if(HLS_INCLUDE_DIR)
     set(_POOL_HAVE_HLS TRUE)
 else()
     message(STATUS "PoolingKernel: Vitis HLS headers not found — "
-                   "using float fallback (no saturation tests)")
+                   "the C-sim targets need them and will not build")
     set(_POOL_HAVE_HLS FALSE)
 endif()
 
@@ -175,7 +181,7 @@ target_compile_options(pool_kernel_float PRIVATE -Wall -Wextra -O2 -Wno-unknown-
 # TestPoolingSim — C++ simulation test, no Vitis HLS synthesis required.
 #
 # Compiles and runs entirely with standard GCC.  Links against pool_kernel
-# (ap_fixed<16,8> when HLS headers are available, float otherwise).
+# (ap_fixed<16,8>; the Vitis HLS headers are required).
 # ---------------------------------------------------------------------------
 add_executable(TestPoolingSim
     test/TestPoolingSim.cpp
@@ -340,7 +346,7 @@ if(POOL_VITIS_HLS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/include/PoolingKernel.h"
                 "${_p_build_dir}/Config.h")
 
-        message(STATUS "PoolingKernel: synthesis target 'synthesize_${_pname}' "
+        message(STATUS "PoolingKernel: synthesis target 'synthesize_pool_${_pname}' "
                        "(${_p_part} @ ${_p_clock} MHz)")
 
         # -------------------------------------------------------------------

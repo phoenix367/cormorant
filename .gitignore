@@ -9,7 +9,7 @@ CTestTestfile.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
-!cmake/FindVitis.cmake
+!cmake/*.cmake
 
 # -----------------------------------------------------------------------
 # Vitis HLS / Vivado generated output

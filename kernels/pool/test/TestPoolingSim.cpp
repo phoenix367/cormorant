@@ -738,6 +738,51 @@ static bool run_avg_pool_strict_test()
 // ---------------------------------------------------------------------------
 // Test cases
 // ---------------------------------------------------------------------------
+// Windows outside the compile-time bounds (the scheduler rejects them; a
+// direct call need not): the kernel must return without reading x or
+// writing y — the out-of-contract GlobalMaxPool-14x14 benchmark hung the
+// previous kernel on the board (POOL_OPTIMISATION.md §2.14).  One
+// sub-case per bound: pool_h, pool_w, the dilated height, the dilated width.
+static bool run_out_of_contract_test()
+{
+    struct Bad { const char* label; unsigned ph, pw, dh, dw; };
+    const Bad bad[] = {
+        {"pool_h = kMaxPoolH + 1",          kMaxPoolH + 1, 1, 1, 1},
+        {"pool_w = kMaxPoolW + 1",          1, kMaxPoolW + 1, 1, 1},
+        {"(pool_h-1)*dil_h+1 > line rows",  2, 1, kMaxLineBufRows, 1},
+        {"(pool_w-1)*dil_w+1 > line cols",  1, 2, 1, kMaxLineBufCols},
+    };
+    constexpr unsigned N = 1, C = 8, H = 4, W = 4, OH = 2, OW = 2;
+    std::vector<Data_t> x(N * C * H * W, from_float(1.0f));
+    bool ok = true;
+    for (const Bad& b : bad) {
+        const unsigned n_words = y_words_for((int)(N * C * OH * OW));
+#ifdef POOL_COSIM
+        {
+            const std::vector<PoolWord> xw = to_pool_words(x);
+            std::copy(xw.begin(), xw.end(), g_pool_x);
+        }
+        y_fill_sentinel(g_pool_y, n_words);
+        PoolWord* x_ptr = g_pool_x;
+        PoolWord* y_ptr = g_pool_y;
+#else
+        std::vector<PoolWord> y(n_words);
+        y_fill_sentinel(y.data(), n_words);
+        std::vector<PoolWord> xw = to_pool_words(x);
+        PoolWord* x_ptr = xw.data();
+        PoolWord* y_ptr = y.data();
+#endif
+        PoolingKernel(x_ptr, y_ptr, N, C, H, W, OH, OW, b.ph, b.pw,
+                      1u, 1u, 0u, 0u, b.dh, b.dw,
+                      /*pool_type=*/0u, /*lp_order=*/0u, /*count_include_pad=*/0u);
+        const unsigned touched = y_pad_violations(y_ptr, 0, n_words);   // lanes off the sentinel
+        printf("  [%s] out of contract (%s): %s\n", touched ? "FAIL" : "PASS", b.label,
+               touched ? "y written" : "returned, y untouched");
+        ok = ok && touched == 0;
+    }
+    return ok;
+}
+
 int main(int argc, char** argv)
 {
     // Optional --dump-data <dir>: write per-test x/y_ref hex files plus a
@@ -927,8 +972,11 @@ int main(int argc, char** argv)
     // Strict-equality verification of the fixed-point AVG reciprocal path.
     // Adds two sub-cases (count_include_pad ∈ {0,1}) to the pass count.
     const int strict_subtests = 2;
-    const int total_tests = n_tests + strict_subtests;
+    // Out-of-contract windows return untouched: four sub-cases.
+    const int contract_subtests = 4;
+    const int total_tests = n_tests + strict_subtests + contract_subtests;
     if (run_avg_pool_strict_test()) passed += strict_subtests;
+    if (run_out_of_contract_test()) passed += contract_subtests;
 
     printf("\n%d / %d tests passed.\n", passed, total_tests);
     return (passed == total_tests) ? 0 : 1;

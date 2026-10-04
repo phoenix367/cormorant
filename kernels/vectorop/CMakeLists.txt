@@ -75,6 +75,9 @@ endif()
 # ---------------------------------------------------------------------------
 list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
 find_package(Vitis)
+# The platform JSONs (AXI_PLATFORM_FILES): set by the top-level project, or
+# here when this kernel is configured on its own.
+include(AxiPlatform)
 
 # ---------------------------------------------------------------------------
 # Generate configuration header

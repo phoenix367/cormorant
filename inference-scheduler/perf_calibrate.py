@@ -55,7 +55,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from src.perf_calls import KernelCall, local_bitstream_id  # noqa: E402
+from src.perf_calls import KernelCall, local_bitstream_id, local_board_bin  # noqa: E402
 
 PLATFORM = "kv260"
 MODELS_DIR = HERE / "perf_models" / PLATFORM
@@ -560,9 +560,10 @@ def cmd_run(args) -> int:
     session.connect()
     stopped = False
     try:
-        bb = board_bitstream_id(session, args.board_bin)
+        board_bin = args.board_bin or local_board_bin()
+        bb = board_bitstream_id(session, board_bin)
         if bb != bid:
-            log(f"error: the board runs bitstream {bb}, the cases are for {bid}")
+            log(f"error: the board runs bitstream {bb} ({board_bin}), the cases are for {bid}")
             return 1
         if _server_active(session):
             if not args.stop_server:
@@ -861,8 +862,10 @@ def main(argv=None) -> int:
     ap.add_argument("--config", default=None, help="run: the board config (run_remote_perf.py format)")
     ap.add_argument("--stop-server", action="store_true",
                     help="run: stop the chat server for the campaign and restart it afterwards")
-    ap.add_argument("--board-bin", default="/lib/firmware/pl.bin",
-                    help="run: the flat bitstream the board loaded (its id is checked)")
+    ap.add_argument("--board-bin", default=None,
+                    help="run: the flat bitstream the board loaded (its id is checked; default: "
+                         "/lib/firmware/<overlay>.bin of bitstream_config_kv260.json, the name "
+                         "upload_bitstream.py gives it: overlay_name, else the .dtbo stem)")
     ap.add_argument("--chunk-seconds", type=float, default=60.0)
     ap.add_argument("--resume", action="store_true", help="run: keep measurements already taken")
     ap.add_argument("--profile", nargs="+", default=[], metavar="MODEL[:plan]=RESULTS",

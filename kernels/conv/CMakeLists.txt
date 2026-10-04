@@ -1,14 +1,20 @@
 cmake_minimum_required(VERSION 3.19)
 project(ConvKernel VERSION 1.0 LANGUAGES CXX)
 
+# The platform JSONs (AXI_PLATFORM_FILES, AXI_DEFAULT_PLATFORM_JSON): set by the
+# top-level project, or here when this kernel is configured on its own.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+include(AxiPlatform)
+
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
 # Locate Vitis HLS headers (ap_fixed.h) for fixed-point C++ simulation.
 # The headers are header-only — no HLS synthesis flow is needed for C-sim.
-# If not found, Data_t falls back to float and tests still verify correctness,
-# but saturation behaviour won't be tested.
+# If not found, Data_t falls back to float, but the kernel headers include
+# ap_int.h / hls_burst_maxi.h unconditionally, so nothing builds without
+# them (the float Data_t is only the configure default).
 # ---------------------------------------------------------------------------
 find_path(HLS_INCLUDE_DIR NAMES ap_fixed.h
     HINTS
@@ -24,7 +30,7 @@ if(HLS_INCLUDE_DIR)
     set(_CONV_HAVE_HLS TRUE)
 else()
     message(STATUS "ConvKernel: Vitis HLS headers not found — "
-                   "using float fallback (no saturation tests)")
+                   "the C-sim targets need them and will not build")
     set(_CONV_HAVE_HLS FALSE)
 endif()
 
@@ -56,8 +62,9 @@ endif()
 #   max_in_ch / max_out_ch      channel-count limits (size bias_buf)
 #   max_line_buf_cols / _rows   line-buffer column / circular-row capacity
 #                               (power of 2; cols caps ow_per_tile, not in_w)
-#   max_acc_persist_entries     out_w*out_ch bound for the URAM partial-output
-#                               accumulator that survives across ic-tiles
+#   max_acc_persist_entries     URAM partial-output accumulator that survives
+#                               across ic-tiles: one output chunk's
+#                               chunk_oh x out_w x out_ch (padded to kTileM)
 #   max_m_per_group             mt-tiles cached together in the weight slab
 # ---------------------------------------------------------------------------
 function(conv_load_constants platform_json out_var_prefix)
@@ -131,7 +138,7 @@ target_compile_options(conv_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragma
 # TestConvRef — C++ simulation test, no Vitis HLS synthesis required.
 #
 # Compiles and runs entirely with standard GCC.  Links against conv_kernel
-# (ap_fixed<16,8> when HLS headers are available, float otherwise).
+# (ap_fixed<16,8>; the Vitis HLS headers are required).
 # ---------------------------------------------------------------------------
 add_executable(TestConvRef
     test/TestConvSim.cpp
@@ -314,7 +321,7 @@ if(CONV_VITIS_HLS)
                 "${CMAKE_CURRENT_SOURCE_DIR}/include/ConvKernel.h"
                 "${_p_build_dir}/Config.h")
 
-        message(STATUS "ConvKernel: synthesis target 'synthesize_${_pname}' "
+        message(STATUS "ConvKernel: synthesis target 'synthesize_conv_${_pname}' "
                        "(${_p_part} @ ${_p_clock} MHz)")
 
         # -------------------------------------------------------------------

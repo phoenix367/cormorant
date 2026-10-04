@@ -382,10 +382,10 @@ static inline ConvGeometry compute_conv_geometry(
 // hls::burst_maxi write bursts).
 //
 // Loop nest matches the consumer's Phase-3 drain order —
-// (ni, chunk, mt, m1, oh_local, ow).  For each (ni, chunk, channel) the
+// (ni, chunk, mt, segment, m1, word).  For each (ni, chunk, channel) the
 // chunk_oh_count·out_w outputs are CONTIGUOUS in y (NCHW: a channel's
-// rows are adjacent), so the inner pipelined loop walks a single
-// sequential run and HLS infers an AXI write burst.  The previous
+// rows are adjacent), so each (channel, segment) is one sequential run
+// written with explicit write bursts.  The previous
 // pixel-major order strode by out_h·out_w between consecutive stores, so
 // every 16-bit output was a lone single-beat transaction — measured at
 // 11.7 cycles each and ~45 % of a 64-channel layer's runtime (see
@@ -398,7 +398,7 @@ static inline ConvGeometry compute_conv_geometry(
 // ---------------------------------------------------------------------------
 // §2.38: y is a 128-bit hls::burst_maxi<YWord> port.  acc_stream carries
 // one YWord per beat = kYPortElems consecutive pixels of ONE channel, in
-// (ni, chunk, mt, m1, segment, word) order — the consumer's Phase 3
+// (ni, chunk, mt, segment, m1, word) order — the consumer's Phase 3
 // transposes the [pixel][mt][kTileM] accumulator words into these
 // channel-major words in segments of kDrainSeg pixels.  Each (channel,
 // segment) run starts at an arbitrary element index (m*out_h*out_w +
@@ -1160,9 +1160,10 @@ static void input_patch_producer(
 //   Iteration order matches process_conv_kernel_tile's Phase 2a nest with
 //   M-grouping + ow-tiling — (ni, chunk, ict, ow_tile, mg, mt_in_group) —
 //   so per (ict, ow_tile, mg) the producer emits the full
-//   (mt_per_group_actual × m_valid × ic_valid × kh × kw) slab of weights
-//   in (mt_in_group, m1, ic_l, khi, kwi) order (kwi fastest).  Each m1
-//   stripe is read from a contiguous DDR region (m_axi infers bursts).
+//   (mt_per_group_actual × m_valid × kh × kw) slab of WeightVecs — the
+//   ic-tile in the vector lanes (§2.32 packed layout) — in
+//   (mt_in_group, m1, khi, kwi) order (kwi fastest).  Each m1 stripe is
+//   one contiguous DDR region, requested as explicit bursts.
 //   Weights are emitted ONCE per (ni, chunk, ict, ow_tile, mg) — no
 //   spatial replay across (oh, ow_in_tile).  When out_w fits one ow_tile
 //   AND m_tiles ≤ kMaxMperGroup each weight is read from DDR exactly once

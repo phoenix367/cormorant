@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.19)
 project(MatmulKernelRtl VERSION 1.0 LANGUAGES C CXX)
 
+# The platform JSONs (AXI_PLATFORM_FILES, AXI_DEFAULT_PLATFORM_JSON): set by the
+# top-level project, or here when this kernel is configured on its own.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+include(AxiPlatform)
+get_filename_component(MM_RTL_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+enable_testing()
+
 # ---------------------------------------------------------------------------
 # MatmulKernel in SystemVerilog — a drop-in replacement for the Vitis HLS
 # MatmulKernel (kernels/matmul): same VLNV, register map, DDR layouts and
@@ -32,7 +39,7 @@ set(MM_RTL_TB_SOURCES
     "${MM_RTL_DIR}/tb/verilator/tb_main.cpp"
     "${MM_RTL_DIR}/tb/verilator/axi_models.h")
 set(MM_RTL_WAIVERS "${MM_RTL_DIR}/scripts/lint_waivers.vlt")
-set(MM_RTL_FIXTURES "${CMAKE_SOURCE_DIR}/hw/test_data/matmul_test_data"
+set(MM_RTL_FIXTURES "${MM_RTL_REPO}/hw/test_data/matmul_test_data"
     CACHE PATH "MatmulKernel fixtures (manifest.txt + test_NN_{a,b,c}.hex) for TestMatmulRtl")
 set(MM_RTL_RANDOM_CASES 200 CACHE STRING "TestMatmulRtl: random cases after the fixtures")
 set(MM_RTL_PERIOD 3.333 CACHE STRING "synth_matmul_rtl: clock period in ns (OOC timing check)")
@@ -177,7 +184,7 @@ if(MM_RTL_VIVADO)
 
     # System level: a copy of the test stand's matmul_op_test project with
     # this IP in place of the HLS export (syn/sysim.tcl); ~4 min.
-    set(_mm_rtl_stand "${CMAKE_SOURCE_DIR}/hw/cormorant_test_stand/kernels/matmul_op_test")
+    set(_mm_rtl_stand "${MM_RTL_REPO}/hw/cormorant_test_stand/kernels/matmul_op_test")
     if(EXISTS "${_mm_rtl_stand}")
         set(_mm_rtl_sysim "${CMAKE_CURRENT_BINARY_DIR}/sysim")
         set(_mm_rtl_sysim_proj "${_mm_rtl_sysim}/matmul_op_test")
@@ -189,7 +196,7 @@ if(MM_RTL_VIVADO)
                     -source "${MM_RTL_DIR}/syn/sysim.tcl"
                     -tclargs "${_mm_rtl_sysim_proj}/matmul_op_test.xpr" "${MM_RTL_IP}"
                              "${MM_RTL_FIXTURES}" "${_mm_rtl_sysim}/sysim_report.json"
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/cmake/check_test_report.py"
+            COMMAND "${Python3_EXECUTABLE}" "${MM_RTL_REPO}/cmake/check_test_report.py"
                     "${_mm_rtl_sysim}/sysim_report.json"
             DEPENDS "${MM_RTL_IP}/component.xml"
             WORKING_DIRECTORY "${_mm_rtl_sysim}"

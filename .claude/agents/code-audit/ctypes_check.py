@@ -22,6 +22,7 @@ usage: python3 .claude/agents/code-audit/ctypes_check.py [PATH ...] [--json]
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import re
@@ -269,13 +270,19 @@ def compare(b, p):
 
 
 def main(argv=None) -> int:
-    args = [a for a in (argv if argv is not None else sys.argv[1:]) if a != "--json"]
-    as_json = "--json" in (argv if argv is not None else sys.argv[1:])
+    ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
+    ap.add_argument("paths", nargs="*", metavar="PATH",
+                    help="Python files or directories (default: every tracked .py file outside hw/)")
+    ap.add_argument("--json", action="store_true", help="the rows as JSON")
+    a = ap.parse_args(argv)
+    as_json = a.json
     files = []
-    for a in args:
-        p = (REPO / a) if not Path(a).is_absolute() else Path(a)
+    for arg in a.paths:
+        p = (REPO / arg) if not Path(arg).is_absolute() else Path(arg)
+        if not p.exists():
+            ap.error(f"{arg}: no such file or directory")
         files += sorted(p.rglob("*.py")) if p.is_dir() else [p]
-    if not args:
+    if not a.paths:
         files = git_files((".py",))
     protos = c_prototypes()
     rows, by_sym = [], {}

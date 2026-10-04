@@ -399,6 +399,17 @@ static_assert(kOwParallel <= kLanes && (kOwParallel & (kOwParallel - 1)) == 0,
               "kOwParallel must be a power of two <= the port lane count");
 static_assert((kMaxLineBufRows & (kMaxLineBufRows - 1)) == 0, "kMaxLineBufRows must be a power of two");
 
+// Bits needed to hold 0 .. v-1 (non-recursive: HLS rejects recursive
+// constexpr functions even when only evaluated at compile time).
+constexpr unsigned pool_clog2(unsigned v) {
+    unsigned b = 0;
+    while ((1u << b) < v) b++;
+    return b;
+}
+
+// A tap count 0 .. max(kMaxPoolH, kMaxPoolW) (the TapIdx counters below).
+static constexpr unsigned kTapBits = pool_clog2((kMaxPoolH > kMaxPoolW ? kMaxPoolH : kMaxPoolW) + 1u);
+
 struct PoolGeometry {
     unsigned c_tiles;
     unsigned ow_tile;
@@ -424,7 +435,26 @@ static inline PoolGeometry compute_pool_geometry(
     unsigned dil_w
 ) {
     PoolGeometry g;
-    g.c_tiles    = (channels + kTileC - 1) / kTileC;
+    // A window outside the compile-time bounds — the scheduler rejects such
+    // models (PoolNode.from_onnx_node), a direct call need not — would
+    // overrun the line buffer and hang the dataflow, and the hung transfer
+    // wedges the HPC port until a reboot (POOL_OPTIMISATION.md §2.14.1).
+    // Such a call gets zero channel tiles: every stage runs zero times, reads
+    // and writes nothing, and the call finishes at once (§2.15).  The span
+    // products only matter for in-range taps and dilations below the line
+    // buffer, so they take narrow operands, in fabric: a few LUTs, no DSP.
+    typedef ap_uint<pool_clog2(kMaxLineBufRows)> DilH;      // 0 .. kMaxLineBufRows - 1
+    typedef ap_uint<pool_clog2(kMaxLineBufCols)> DilW;      // 0 .. kMaxLineBufCols - 1
+    const bool taps_ok = pool_h >= 1u && pool_h <= kMaxPoolH && pool_w >= 1u && pool_w <= kMaxPoolW;
+    const bool dil_ok  = (pool_h == 1u || dil_h < kMaxLineBufRows) &&
+                         (pool_w == 1u || dil_w < kMaxLineBufCols);
+    const ap_uint<kTapBits + pool_clog2(kMaxLineBufRows)> reach_h = ap_uint<kTapBits>(pool_h - 1u) * DilH(dil_h);
+    const ap_uint<kTapBits + pool_clog2(kMaxLineBufCols)> reach_w = ap_uint<kTapBits>(pool_w - 1u) * DilW(dil_w);
+    #pragma HLS BIND_OP variable=reach_h op=mul impl=fabric
+    #pragma HLS BIND_OP variable=reach_w op=mul impl=fabric
+    const bool in_contract = taps_ok && dil_ok &&
+        (unsigned)reach_h + 1u <= kMaxLineBufRows && (unsigned)reach_w + 1u <= kMaxLineBufCols;
+    g.c_tiles    = in_contract ? (channels + kTileC - 1) / kTileC : 0u;
     g.ow_tile    = compute_ow_tile(out_w, pool_w, stride_w, dil_w);
     g.ow_tiles_w = (g.ow_tile > 0)
         ? ((out_w + g.ow_tile - 1) / g.ow_tile)
@@ -533,20 +563,11 @@ static inline void run_cursor_advance(RunCursor& c, unsigned c_valid,
 // comparators and muxes are sized to it (a 32-bit `unsigned` costs ~4× the
 // LUT of a 7-bit one and lengthens the loop-carried chain).
 // ---------------------------------------------------------------------------
-// Bits needed to hold 0 .. v-1 (non-recursive: HLS rejects recursive
-// constexpr functions even when only evaluated at compile time).
-constexpr unsigned pool_clog2(unsigned v) {
-    unsigned b = 0;
-    while ((1u << b) < v) b++;
-    return b;
-}
-
 static constexpr unsigned kLaneBits = pool_clog2(kLanes);                       // lane / bank index
 static constexpr unsigned kWordBits = pool_clog2(kLbWords + 2u);                // words per run: 0 .. kLbWords + 1
 static constexpr unsigned kColBits  = pool_clog2(kMaxLineBufCols + 1u);         // local column: 0 .. kMaxLineBufCols
 static constexpr unsigned kSlotBits = pool_clog2(kMaxLineBufRows);
 static constexpr unsigned kChBits   = pool_clog2(kTileC + 1u);
-static constexpr unsigned kTapBits  = pool_clog2((kMaxPoolH > kMaxPoolW ? kMaxPoolH : kMaxPoolW) + 1u);
 static constexpr unsigned kRbBits   = pool_clog2(kTileC * kLbWords);            // row-buffer entry
 
 typedef ap_uint<kPoolDataBits> Lane;

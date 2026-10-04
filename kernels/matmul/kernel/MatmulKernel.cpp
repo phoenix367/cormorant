@@ -591,20 +591,22 @@ void MatmulKernel(
     //          partitioned complete); element ki of row n1 is
     //          a_buf[n1][ki / E][ki % E].
     //
-    // b_tile — holds one TILE_K × TILE_M block of B for the current k_tile.
-    //          Reloaded from DDR for each (m_tile, k_tile) pair, or once per
-    //          batch slice when the whole of B is one tile (fast path).
+    // b_tile — two banks of one TILE_K × TILE_M block of B: the K-loop
+    //          multiplies out of bank cur_bank while the next block is
+    //          prefetched into the other (ping-pong, §7).  Reloaded from DDR
+    //          for each (m_tile, k_tile) pair, or once per batch slice when
+    //          the whole of B is one tile (fast path).
     //
-    //          ARRAY_PARTITION complete dim=2 → kTileM independent BRAMs,
-    //          each kTileK deep.  All TILE_M columns can be read in the
-    //          same cycle (the m1 unrolled loop reads kTileM elements per
-    //          ki iteration).
+    //          ARRAY_PARTITION complete dim=1 → kTileM independent BRAMs,
+    //          each 2 × kTileK deep (flat (bank, k1) address).  All TILE_M
+    //          columns can be read in the same cycle (the m1 unrolled loop
+    //          reads kTileM elements per ki iteration).
     //
     // acc    — TILE_N × TILE_M accumulators.  Cleared at each m_tile; hold
     //          the partial dot products over the K dimension.
     //
-    //          ARRAY_PARTITION complete dim=0 → all 64 elements as
-    //          registers.  The m1-unrolled loop writes to kTileM of them
+    //          ARRAY_PARTITION complete dim=0 → all kTileN × kTileM elements
+    //          (4 × 32 = 128 on the KV260) as registers.  The m1-unrolled loop writes to kTileM of them
     //          per ki cycle; the n1 rotation means no two consecutive
     //          iterations share an acc element.
     // -----------------------------------------------------------------------

@@ -105,19 +105,36 @@ def bitstream_id(bit_path: Path) -> str:
     return bitstream_id_of_bin(bit_to_bin(Path(bit_path)))
 
 
+def _bitstream_config(config: Optional[Path]) -> Tuple[Path, dict]:
+    """The ``bitstream`` section of ``bitstream_config_<platform>.json``
+    (default: the KV260 one next to this package); {} when it is missing."""
+    import json
+    cfg = Path(config) if config else Path(__file__).resolve().parent.parent / "bitstream_config_kv260.json"
+    try:
+        return cfg, json.loads(cfg.read_text())["bitstream"]
+    except (OSError, KeyError, ValueError):
+        return cfg, {}
+
+
 def local_bitstream_id(config: Optional[Path] = None) -> Optional[str]:
     """The id of the bitstream named by ``bitstream_config_<platform>.json``
     (default: the KV260 one next to this package), or None when the config
     or its .bit is missing."""
-    import json
-    cfg = Path(config) if config else Path(__file__).resolve().parent.parent / "bitstream_config_kv260.json"
-    try:
-        bit = json.loads(cfg.read_text())["bitstream"]["bit"]
-    except (OSError, KeyError, ValueError):
+    cfg, bs = _bitstream_config(config)
+    if not bs.get("bit"):
         return None
-    p = (cfg.parent / bit).resolve()
+    p = (cfg.parent / bs["bit"]).resolve()
     return bitstream_id(p) if p.exists() else None
 
 
+def local_board_bin(config: Optional[Path] = None) -> str:
+    """Where the board keeps the flat bitstream upload_bitstream.py loads for
+    that config: ``/lib/firmware/<overlay_name>.bin``, the overlay name
+    defaulting to the .dtbo stem as there (``pl`` without a config)."""
+    _, bs = _bitstream_config(config)
+    name = bs.get("overlay_name") or (Path(bs["dtbo"]).stem if bs.get("dtbo") else "pl")
+    return f"/lib/firmware/{name}.bin"
+
+
 __all__ = ("FIELDS", "KERNELS", "KernelCall", "merge", "BITSTREAM_ID_LEN",
-           "bitstream_id_of_bin", "bitstream_id", "local_bitstream_id")
+           "bitstream_id_of_bin", "bitstream_id", "local_bitstream_id", "local_board_bin")

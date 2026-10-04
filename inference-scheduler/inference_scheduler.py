@@ -616,10 +616,11 @@ def main(argv=None):
             # break a successful project generation.
             print(f"warning: report.md not written ({e})", file=sys.stderr)
             report_items.remove("report.md")
-        # the predicted execution timeline (with --plan / --plan-report)
-        if _write_timeline(out_dir, [("inference", graph, gen)], os.path.basename(args.model),
-                           args.timeline_profile):
-            report_items.append("timeline.html")
+    # the predicted execution timeline (with --plan / --plan-report; also
+    # with --no-report, which skips report.md only)
+    if _write_timeline(out_dir, [("inference", graph, gen)], os.path.basename(args.model),
+                       args.timeline_profile):
+        report_items.append("timeline.html")
 
     for rel in report_items:
         print(f"  {os.path.join(out_dir, rel)}", file=sys.stderr)

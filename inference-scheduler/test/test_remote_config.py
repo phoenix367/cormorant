@@ -159,3 +159,28 @@ class TestPerfCaseValidationBeforeConnect(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("config error", err.getvalue())
         self.assertIn("unsupported op=99", err.getvalue())
+
+    def test_pool_window_out_of_bounds_is_a_config_error_before_connecting(self):
+        """The 14x14 GlobalMaxPool case that hung the kernel (POOL_OPTIMISATION §2.14)."""
+        import contextlib
+        import io
+        from unittest import mock
+
+        import run_remote_perf
+
+        here = Path(__file__).resolve().parent.parent
+        cfg = json.loads((here / "perf_config.json.example").read_text())
+        cfg["benchmarks"]["PoolingKernel"]["cases"][0].update(
+            label="GlobalMaxPool-14x14", in_h=14, in_w=14, pool_h=14, pool_w=14, stride_h=1, stride_w=1)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "perf.json")
+            with open(path, "w") as f:
+                json.dump(cfg, f)
+            err = io.StringIO()
+            with mock.patch.object(run_remote_perf, "RemoteSession",
+                                   side_effect=AssertionError("connected")), \
+                    contextlib.redirect_stderr(err):
+                rc = run_remote_perf.main(["--config", path])
+        self.assertEqual(rc, 1)
+        self.assertIn("config error", err.getvalue())
+        self.assertIn("pool_h=14 (1..kMaxPoolH=7)", err.getvalue())

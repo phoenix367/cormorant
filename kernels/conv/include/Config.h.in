@@ -35,8 +35,9 @@ using AccData_t = @CONV_ACC_DATA_TYPE@;
 //          kWCacheUramCols in URAM), the accumulator word (kTileM x 32 bit)
 //          and the Phase-3 fill sub-steps (kTileM / 8 per word).
 //
-// kTileIC  Input channel tile.  Power of two; sets the w_buf and patch
-//          buffer depth in the IC dimension.
+// kTileIC  Input channel tile = the IC (row) dimension of the MAC grid.
+//          Power of two; sets the lanes of a WeightVec / PatchVec (one
+//          kernel position's ic-tile) and line_buf's channel dimension.
 //
 // kMaxKH   Compile-time upper bound on kernel height.
 // kMaxKW   Compile-time upper bound on kernel width.
@@ -53,7 +54,7 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //
 // Compile-time upper bounds for the on-chip buffers in the standard-conv
 // path.  The Option-A IC-tiling design shrinks the per-channel buffers
-// (line_buf, broadcast local_buf, w_buf) from kMaxInCh to kTileIC channels
+// (line_buf, the weight vectors) from kMaxInCh to kTileIC channels
 // at the cost of keeping a persistent partial-output buffer of
 // kMaxAccPersistEntries elements that survives across ic-tiles.
 //
@@ -69,7 +70,7 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //                  re-fetched (duplicate reads accepted in exchange for
 //                  not capping in_h or in_w).
 //   * bias_buf   — sized kMaxOutCh.  Entire bias is loaded once and
-//                  replayed in (r,mt,m1) order.
+//                  replayed as one kTileM-lane BiasVec per (r, mt).
 //   * partial_outputs — sized kMaxAccPersistEntries (flat).  Holds one
 //                  output CHUNK's chunk_oh_count*out_w*out_ch_padded
 //                  AccData_t accumulators (out_ch padded up to a multiple
@@ -81,7 +82,8 @@ static constexpr unsigned kMaxKW   = @CONV_MAX_KW@;
 //                  ConvKernel.cpp for the strategy.  Bound to URAM
 //                  (BIND_STORAGE impl=URAM) so it consumes no BRAM —
 //                  kMaxAccPersistEntries is sized against the idle
-//                  URAM pool (4096 AccData_t entries per URAM block).
+//                  URAM pool (8192 AccData_t entries per URAM block in
+//                  512-bit words: 65536 entries take 8 blocks).
 //
 // Constraints (validated by the inference scheduler):
 //   in_ch    <= kMaxInCh

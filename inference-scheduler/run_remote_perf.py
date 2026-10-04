@@ -123,6 +123,29 @@ _CASE_FIELDS: Dict[str, List[str]] = {
 }
 
 
+def _check_pool_case(d: dict) -> None:
+    """The window bounds the scheduler enforces (PoolNode.from_onnx_node), from
+    the platform JSON: a PoolingKernel built before its in-contract guard
+    (bitstream 1d28630fbfa4 and older) hangs on a larger window and wedges the
+    HPC port until a reboot (POOL_OPTIMISATION.md §2.14), so such a case is a
+    config error, raised before the board is touched."""
+    from src._pool_hw_config import resolve
+    hw = resolve()
+    ph, pw = int(d["pool_h"]), int(d["pool_w"])
+    dh, dw = int(d.get("dil_h", 0)), int(d.get("dil_w", 0))
+    bad = [msg for ok, msg in (
+        (1 <= ph <= hw["POOL_MAX_KH"], f"pool_h={ph} (1..kMaxPoolH={hw['POOL_MAX_KH']})"),
+        (1 <= pw <= hw["POOL_MAX_KW"], f"pool_w={pw} (1..kMaxPoolW={hw['POOL_MAX_KW']})"),
+        ((ph - 1) * dh + 1 <= hw["POOL_MAX_LINE_BUF_ROWS"],
+         f"(pool_h-1)*dil_h+1={(ph - 1) * dh + 1} (<= kMaxLineBufRows={hw['POOL_MAX_LINE_BUF_ROWS']})"),
+        ((pw - 1) * dw + 1 <= hw["POOL_MAX_LINE_BUF_COLS"],
+         f"(pool_w-1)*dil_w+1={(pw - 1) * dw + 1} (<= kMaxLineBufCols={hw['POOL_MAX_LINE_BUF_COLS']})"),
+    ) if not ok]
+    if bad:
+        raise ValueError(f"PoolingKernel case {d.get('label', '?')!r}: window outside the "
+                         f"kernel's bounds: {', '.join(bad)}")
+
+
 def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCase":
     """Build a BenchCase from a named-param dict using _CASE_FIELDS ordering."""
     fields = _CASE_FIELDS[kernel]
@@ -134,6 +157,8 @@ def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCas
                 f"VectorOPKernel case {d.get('label', '?')!r}: "
                 f"unsupported op={op} (valid: {valid})"
             )
+    elif kernel == "PoolingKernel":
+        _check_pool_case(d)
     # Optional fields default to 0 (e.g. MatmulKernel b_packed / gemv_kw,
     # MATMUL_OPTIMISATION §3b / §8b).
     args = [str(d.get(f, 0)) for f in fields]
@@ -486,7 +511,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--check-only", action="store_true",
                    help="Check SSH + prerequisites then exit")
     p.add_argument("--no-cleanup", action="store_true",
-                   help="Keep remote build directory after run")
+                   help="Keep remote build directory after run "
+                        "(same as \"cleanup\": false in the config)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Print error details for failed cases")
     p.add_argument("--json", metavar="OUT", default=None,
@@ -518,6 +544,8 @@ def main(argv=None) -> int:
     except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.no_cleanup:
+        cfg["cleanup"] = False
 
     cli_kernels = set(args.kernels) if args.kernels else None
 
@@ -599,7 +627,7 @@ def main(argv=None) -> int:
                         print(f"    {_dim(ln)}")
 
         # Cleanup
-        if not args.no_cleanup:
+        if cfg["cleanup"]:
             work_dir = cfg["remote"]["work_dir"].rstrip("/")
             session.exec(f"rm -rf {work_dir}/kv260_perf; rmdir {work_dir} 2>/dev/null || true",
                          timeout=30)

@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.19)
 project(MatmulKernel VERSION 1.0 LANGUAGES CXX)
 
+# The platform JSONs (AXI_PLATFORM_FILES, AXI_DEFAULT_PLATFORM_JSON): set by the
+# top-level project, or here when this kernel is configured on its own.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+include(AxiPlatform)
+
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -8,8 +13,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Locate Vitis HLS headers (ap_fixed.h) for fixed-point C++ simulation.
 #
 # The headers are header-only and work with standard GCC — no HLS synthesis
-# flow is needed.  If not found, Data_t falls back to float and tests still
-# verify correctness, but saturation behaviour won't be tested.
+# flow is needed.  If not found, Data_t falls back to float, but the kernel
+# headers include ap_int.h / hls_burst_maxi.h unconditionally, so nothing
+# builds without them (the float Data_t is only the configure default).
 # ---------------------------------------------------------------------------
 find_path(HLS_INCLUDE_DIR NAMES ap_fixed.h
     HINTS
@@ -25,7 +31,7 @@ if(HLS_INCLUDE_DIR)
     set(_MM_HAVE_HLS TRUE)
 else()
     message(STATUS "MatmulKernel: Vitis HLS headers not found — "
-                   "using float/double fallback (no saturation tests)")
+                   "the C-sim targets need them and will not build")
     set(_MM_HAVE_HLS FALSE)
 endif()
 

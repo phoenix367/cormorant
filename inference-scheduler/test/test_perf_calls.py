@@ -22,7 +22,7 @@ from src.codegen import CodeGenerator  # noqa: E402
 from src.graph import OnnxGraph  # noqa: E402
 from src.nodes import ACT_NAMES, OP_NAMES, SchedulerError  # noqa: E402
 from src.perf_calls import (FIELDS, KernelCall, bitstream_id_of_bin,  # noqa: E402
-                            local_bitstream_id, merge)
+                            local_bitstream_id, local_board_bin, merge)
 
 # C helper -> (kernel, leading pointer / offset arguments, register order of
 # the remaining arguments)
@@ -138,6 +138,20 @@ class TestKernelCall(unittest.TestCase):
     def test_bitstream_id(self):
         self.assertEqual(bitstream_id_of_bin(b"abc"), "ba7816bf8f01")
         self.assertIsNone(local_bitstream_id("/nonexistent/bitstream_config.json"))
+
+    def test_board_bin(self):
+        """perf_calibrate run's --board-bin default: the name upload_bitstream.py
+        gives the flat bitstream (overlay_name, else the .dtbo stem)."""
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            cfg = os.path.join(td, "bitstream_config.json")
+            for bs, want in (({"dtbo": "../dts/kv260/pl.dtbo", "overlay_name": None}, "pl"),
+                             ({"dtbo": "design_x.dtbo"}, "design_x"),
+                             ({"dtbo": "pl.dtbo", "overlay_name": "repro"}, "repro")):
+                with open(cfg, "w") as f:
+                    json.dump({"bitstream": bs}, f)
+                self.assertEqual(local_board_bin(cfg), f"/lib/firmware/{want}.bin")
+        self.assertEqual(local_board_bin("/nonexistent/bitstream_config.json"), "/lib/firmware/pl.bin")
 
 
 class TestEmittedCalls(unittest.TestCase):
