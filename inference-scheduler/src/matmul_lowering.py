@@ -242,7 +242,8 @@ def conv_plans(mm: MatmulNode, kw_options: Sequence[int],
 
 
 def matmul_plan_cycles(mm: MatmulNode) -> float:
-    return matmul_cycles(mm.n, mm.k, mm.m, mm.batch * mm.outer_count) + CALL_OVERHEAD
+    return matmul_cycles(mm.n, mm.k, mm.m, mm.batch * mm.outer_count,
+                         b_packed=bool(mm.b_packed)) + CALL_OVERHEAD
 
 
 def _readers(nodes) -> Dict[str, list]:

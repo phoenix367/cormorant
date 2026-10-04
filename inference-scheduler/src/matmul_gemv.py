@@ -171,7 +171,7 @@ def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = Tru
             if not relayout or ineligible_reason(sn, 1, is_ap_fixed_16_8) is not None:
                 continue
             kw, relayout = 1, False          # the hint's image does not fit: plain B
-        tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch)
+        tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
         gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
         use = mode != "auto" or gemv < tiled
         if perf_model is not None and mode == "auto" and b.onnx_name not in kw_hint:

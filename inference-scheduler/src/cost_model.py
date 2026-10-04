@@ -34,6 +34,22 @@ profile and MATMUL_OPTIMISATION.md §9): 256³ 7.24 ms (model 7.36),
 (3.30), P·V 256×256·256×64 1.94 ms (1.84).  For ``n < kTileN`` (K-split
 over the lanes) the same formula matches the B-port bound of the one-row
 FC layers (1×1280·1280×1001: 1.75 ms, model 1.82).
+
+MatmulKernel in SystemVerilog
+-----------------------------
+With ``kernels.matmul.impl == "rtl"`` in the platform JSON (or
+``AXI_MATMUL_IMPL=rtl``) the bitstream carries the RTL kernel
+(``kernels/matmul_rtl``, doc/kernels/MATMUL_RTL_KERNEL.md), and
+``matmul_cycles`` / ``gemv_cycles`` use ``rtl_matmul_cycles``: a structural
+model of its job walk — panels of 8 A rows × column chunks of at most 512
+accumulator columns; per step each lane streams its half of the K planes
+(blocks of 16, the odd last one split) at one 128-bit beat per cycle and at
+least ``DMIN`` cycles per row, then the drain reads the accumulators; the
+A panel loads before its first step.  ``rtl_matmul_terms`` lists the terms,
+weighted by ``RTL_COEF``: a non-negative fit to the 240 MatmulKernel calls
+of the RTL bitstream's calibration campaign (1d28630fbfa4; held-out median
+error 1.2 %, p90 3.3 %).  The same terms are the perf models' MatmulKernel
+features (``perf_model.features``, ``rtl_*``).
 """
 
 from __future__ import annotations
@@ -49,7 +65,7 @@ from ._conv_hw_config import (
     CONV_TILE_M,
     CONV_WEIGHT_PORT_ELEMS,
 )
-from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_TILE_M, MATMUL_TILE_N
+from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_IMPL, MATMUL_TILE_M, MATMUL_TILE_N
 
 # --------------------------------------------------------------------------
 # ConvKernel — constants of conv_cycle_model.py (ARCH 42), keep in sync.
@@ -177,8 +193,12 @@ def conv_batch_cycles(batch: int, **geom) -> float:
     return (t - CONV_INVOKE_OVERHEAD) * batch + CONV_INVOKE_OVERHEAD
 
 
-def matmul_cycles(n: int, k: int, m: int, batch: int = 1) -> float:
-    """Estimated cycles of one MatmulKernel call (``batch`` slices)."""
+def matmul_cycles(n: int, k: int, m: int, batch: int = 1, b_packed: bool = True) -> float:
+    """Estimated cycles of one MatmulKernel call (``batch`` slices) on its
+    tiled path, B packed (constant weights) or row-major; the model of the
+    platform's MatmulKernel (``MATMUL_IMPL``)."""
+    if MATMUL_IMPL == "rtl":
+        return rtl_matmul_cycles(n, k, m, batch, b_packed, 0)
     blocks = batch * -(-n // MATMUL_TILE_N) * -(-m // MATMUL_TILE_M)
     return blocks * (MM_K_CYCLE * MATMUL_TILE_N * k + MM_BLOCK_OVERHEAD) + MM_INVOKE_OVERHEAD
 
@@ -186,11 +206,83 @@ def matmul_cycles(n: int, k: int, m: int, batch: int = 1) -> float:
 def gemv_cycles(n: int, k: int, m: int, batch: int = 1, kw: int = 1) -> float:
     """Estimated cycles of one MatmulKernel GEMV call (``batch`` slices of
     ``n`` A rows; B is ``k x m``, ``kw`` its image's kernel width)."""
+    if MATMUL_IMPL == "rtl":
+        return rtl_matmul_cycles(n, k, m, batch, False, max(1, kw))
     chunks = max(1, -(-m // MATMUL_GEMV_MAX_M)) if MATMUL_GEMV_MAX_M else 1
     words  = k * m / 8
     per_row = (GEMV_WORD_CYCLE * words / 2
                + chunks * (k / 8 + kw + GEMV_JOB_OVERHEAD) + m)
     return batch * n * per_row + MM_INVOKE_OVERHEAD
+
+
+# --------------------------------------------------------------------------
+# MatmulKernel in SystemVerilog (platform ``kernels.matmul.impl == "rtl"``).
+# --------------------------------------------------------------------------
+RTL_ROWS   = 8      # A rows per panel (DSP rows per lane)
+RTL_W_EL   = 512    # accumulator columns of one step (ACC_D x 8), << lk
+RTL_DMIN   = 3      # minimum cycles per streamed B row (accumulator distance)
+RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
+
+# Cycles per term (rtl_matmul_terms), fitted on the board (see the module
+# docstring); "one" is the job's fixed cost without the host's call
+# overhead (3.15 us measured, charged by the callers as CALL_OVERHEAD).
+RTL_COEF = {"stream": 0.966, "drain": 0.968, "aload": 0.722,
+            "steps": 6.37, "runs": 1.39, "one": 92.0}
+
+
+def _rtl_lane_planes(planes: int) -> int:
+    """Planes the busier lane streams: blocks of 16 interleaved between the
+    two lanes, an odd last block of more than 8 planes split 8 / rest."""
+    if planes <= 0:
+        return 0
+    nb = -(-planes // 16)
+    rl = planes - 16 * (nb - 1)
+    l0 = 16 * (-(-nb // 2)) - (16 - rl if nb % 2 else 0)
+    l1 = 16 * (nb // 2) - (0 if nb % 2 else 16 - rl)
+    if nb % 2 and rl > 8:
+        l0, l1 = l0 - (rl - 8), l1 + (rl - 8)
+    return max(l0, l1)
+
+
+@lru_cache(maxsize=65536)
+def rtl_matmul_terms(n: int, k: int, m: int, batch: int = 1,
+                     b_packed: bool = True, gemv_kw: int = 0) -> dict:
+    """The RTL kernel's job walk as cycle terms: ``stream`` (B beats of the
+    busier lane, at least RTL_DMIN per row), ``drain`` (accumulator words
+    read), ``aload`` (A panel beats per port), ``steps``, ``runs`` (B read
+    runs: per tile and block, per block or per plane) and ``one``.
+    ``gemv_kw`` 1/2/4/8 is the GEMV image layout (1 = row-major B);
+    ``b_packed`` applies to the tiled path only."""
+    lk = gemv_kw.bit_length() - 1 if gemv_kw else 0
+    kw = 1 << lk
+    packed = bool(b_packed) and not gemv_kw
+    lf = m << lk
+    mc_max = RTL_W_EL if packed else (m if lf <= RTL_W_EL else RTL_W_EL >> lk)
+    chunks = [mc_max] * (m // mc_max) + ([m % mc_max] if m % mc_max else [])
+    planes = k >> lk
+    lp = _rtl_lane_planes(planes)
+    nblk = -(-planes // 16)
+    contig = not packed and lf <= RTL_W_EL
+    rows = [RTL_ROWS] * (n // RTL_ROWS) + ([n % RTL_ROWS] if n % RTL_ROWS else [])
+    stream = drain = runs = 0.0
+    for mcc in chunks:
+        if packed:
+            bpr, nr = 4 * -(-mcc // RTL_TILE), nblk * -(-mcc // RTL_TILE)
+        else:
+            bpr, nr = -(-(mcc * kw) // 8), (nblk if contig else planes)
+        stream += len(rows) * lp * max(bpr, RTL_DMIN)
+        drain += sum(rows) * -(-(mcc * kw) // 8)
+        runs += len(rows) * nr
+    return {"stream": batch * stream, "drain": batch * drain,
+            "aload": batch * len(rows) * -(-(4 * k) // 8),
+            "steps": batch * len(rows) * len(chunks), "runs": batch * runs, "one": 1.0}
+
+
+def rtl_matmul_cycles(n: int, k: int, m: int, batch: int = 1,
+                      b_packed: bool = True, gemv_kw: int = 0) -> float:
+    """Estimated cycles of one call of the RTL MatmulKernel."""
+    t = rtl_matmul_terms(n, k, m, batch, bool(b_packed), gemv_kw)
+    return sum(RTL_COEF[name] * v for name, v in t.items())
 
 
 def cycles_to_ms(cycles: float, mhz: float = 100.0) -> float:
@@ -203,5 +295,7 @@ __all__ = (
     "conv_batch_cycles",
     "matmul_cycles",
     "gemv_cycles",
+    "rtl_matmul_cycles",
+    "rtl_matmul_terms",
     "cycles_to_ms",
 )

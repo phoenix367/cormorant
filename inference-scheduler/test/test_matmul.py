@@ -109,6 +109,7 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
             "description": "test-only override",
             "part": "x", "clock": 100,
             "kernels": {"matmul": {
+                "impl": "rtl",
                 "tile_n": 4, "tile_m": 16, "tile_k": 256,
                 "max_k": 1024,                      # <-- the override
                 "gemv_max_m": 0,
@@ -118,6 +119,7 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
             cfg = resolve("_test_matmul_override")
             self.assertEqual(cfg["MATMUL_MAX_K"], 1024)
             self.assertEqual(cfg["MATMUL_GEMV_MAX_M"], 0)
+            self.assertEqual(cfg["MATMUL_IMPL"], "rtl")
         finally:
             alt.unlink(missing_ok=True)
 
@@ -157,7 +159,7 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
             "description": "missing max_k",
             "part": "x", "clock": 100,
             "kernels": {"matmul": {
-                "tile_n": 4, "tile_m": 16, "tile_k": 256,
+                "impl": "hls", "tile_n": 4, "tile_m": 16, "tile_k": 256,
                 # max_k deliberately absent
             }},
         }))
@@ -167,6 +169,41 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
             self.assertIn("max_k", str(cm.exception))
         finally:
             bad.unlink(missing_ok=True)
+
+    def test_impl_must_be_hls_or_rtl(self):
+        """``kernels.matmul.impl`` names the MatmulKernel of the bitstream;
+        a missing or unknown value errors (no default: it picks the engine
+        cost model)."""
+        import json
+        from src._matmul_hw_config import MatmulHwConfigError, resolve
+
+        bad = self._platforms_dir() / "_test_matmul_bad_impl.json"
+        for impl in (None, "verilog"):
+            mm = {"tile_n": 4, "tile_m": 16, "tile_k": 256, "max_k": 1024, "gemv_max_m": 0}
+            if impl:
+                mm["impl"] = impl
+            bad.write_text(json.dumps({"part": "x", "clock": 100, "kernels": {"matmul": mm}}))
+            try:
+                with self.assertRaises(MatmulHwConfigError) as cm:
+                    resolve("_test_matmul_bad_impl")
+                self.assertIn("impl", str(cm.exception))
+            finally:
+                bad.unlink(missing_ok=True)
+
+    def test_impl_env_override(self):
+        """``AXI_MATMUL_IMPL`` overrides the JSON's impl, as the CMake cache
+        variable of the same name does for the build."""
+        import os
+        from unittest import mock
+        from src._matmul_hw_config import MatmulHwConfigError, resolve
+
+        with mock.patch.dict(os.environ, {"AXI_MATMUL_IMPL": "rtl"}):
+            self.assertEqual(resolve()["MATMUL_IMPL"], "rtl")
+        with mock.patch.dict(os.environ, {"AXI_MATMUL_IMPL": "hls"}):
+            self.assertEqual(resolve()["MATMUL_IMPL"], "hls")
+        with mock.patch.dict(os.environ, {"AXI_MATMUL_IMPL": "fpga"}):
+            with self.assertRaises(MatmulHwConfigError):
+                resolve()
 
 
 if __name__ == "__main__":

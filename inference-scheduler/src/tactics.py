@@ -122,7 +122,8 @@ def matmul_tactics(sn, *, relayout_ok: bool, b_constant: bool,
             calls = tuple(sn.kernel_calls(layouts))
             packed = bool(sn.b_packed)
         out.append(Tactic("tiled", (("packed", int(packed)),), calls,
-                          float(matmul_cycles(mm.n, mm.k, mm.m, mm.batch) + CALL_OVERHEAD),
+                          float(matmul_cycles(mm.n, mm.k, mm.m, mm.batch, b_packed=packed)
+                                + CALL_OVERHEAD),
                           ("packed", 1) if packed else ("row", 1)))
     # gemv
     if MATMUL_GEMV_MAX_M > 0 and mm.outer_count == 1 and mm.n == 1:

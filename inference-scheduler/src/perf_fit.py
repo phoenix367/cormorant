@@ -20,7 +20,7 @@ from typing import Dict, List
 import numpy as np
 
 from .perf_calls import KernelCall
-from .perf_model import family, feature_vector, features
+from .perf_model import RTL_PREFIX, family, feature_vector, features
 
 TARGET_KERNEL = 0.03          # held-out relative error, kernels (TACTICS_PLAN §4.3)
 NOISY = 0.005                 # pass-to-pass spread above which a point is "noisy"
@@ -84,14 +84,35 @@ def _knn_correct(Z: np.ndarray, r: np.ndarray, zq: np.ndarray, k: int,
     return float((r[nn] * w).sum() / w.sum())
 
 
-def fit_family(rows: List[dict]) -> dict:
-    """rows: {"call", "us", "holdout"}; returns the family's model entry:
-    a non-negative linear fit (the base) times exp of the distance-weighted
-    mean log residual of the k nearest training calls in the standardised
-    log-feature space (the board's timing has local structure no global
-    formula of the analytic terms captures; k by leave-one-out on the
-    training calls only)."""
+def feature_sets(rows: List[dict]) -> List[List[str]]:
+    """The candidate feature sets of a family: one set, or for MatmulKernel
+    the HLS tile model's terms and the RTL job walk's (``rtl_*``), each
+    with ``one``."""
     names = sorted({k for r in rows for k in features(r["call"])}, key=lambda n: (n == "one", n))
+    rtl = [n for n in names if n.startswith(RTL_PREFIX)]
+    if not rtl:
+        return [names]
+    return [[n for n in names if not n.startswith(RTL_PREFIX)], rtl + ["one"]]
+
+
+def fit_family(rows: List[dict]) -> dict:
+    """rows: {"call", "us", "holdout"}; returns the family's model entry for
+    the feature set (``feature_sets``) with the lower training error — the
+    MatmulKernel families thereby take the structure of the bitstream's
+    kernel; the held-out calls never choose."""
+    fits = [_fit_family(rows, names) for names in feature_sets(rows)]
+    best = min(fits, key=lambda e: e["_train_err"])
+    for e in fits:
+        del e["_train_err"]
+    return best
+
+
+def _fit_family(rows: List[dict], names: List[str]) -> dict:
+    """The fit on one feature set: a non-negative linear fit (the base)
+    times exp of the distance-weighted mean log residual of the k nearest
+    training calls in the standardised log-feature space (the board's
+    timing has local structure no global formula of the analytic terms
+    captures; k by leave-one-out on the training calls only)."""
     X = np.array([feature_vector(r["call"], names) for r in rows])
     y = np.array([r["us"] for r in rows])
     train = np.array([not r["holdout"] for r in rows])
@@ -134,6 +155,7 @@ def fit_family(rows: List[dict]) -> dict:
            "r": [round(float(v), 5) for v in rt] if best_k else []}
     return {"kernel": rows[0]["call"].kernel, "features": names, "coef": [float(c) for c in coef],
             "knn": knn, "range": rng, "train": stats(train), "holdout": stats(~train),
+            "_train_err": best_err,
             "worst": [{"key": rows[i]["call"].key(), "us": float(y[i]), "pred": float(pred[i]),
                        "holdout": bool(rows[i]["holdout"])} for i in worst]}
 

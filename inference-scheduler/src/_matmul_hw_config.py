@@ -19,6 +19,7 @@ JSON shape (only the fields this module reads)::
     {
       "kernels": {
         "matmul": {
+          "impl":   "hls",
           "tile_n":   4,
           "tile_m":  16,
           "tile_k": 256,
@@ -40,6 +41,15 @@ Platform selection (lower entries override higher ones):
 
 Missing / malformed fields raise ``MatmulHwConfigError`` rather than
 silently falling back to defaults.
+
+``impl`` names the MatmulKernel the platform's bitstream carries: ``"hls"``
+(the Vitis HLS kernel, ``kernels/matmul``) or ``"rtl"`` (the SystemVerilog
+one, ``kernels/matmul_rtl``).  The two run the same calls bit-identically
+but at different speeds, so it selects the engine cost model
+(``cost_model.py``) behind the automatic engine choices; the CMake build
+takes its ``AXI_MATMUL_IMPL`` default from it.  The ``AXI_MATMUL_IMPL``
+environment variable overrides it, as the CMake cache variable of the same
+name does for the build (doc/plans/MATMUL_RTL_PLAN.md phase 3).
 
 ``tile_n``, ``tile_k`` are read but not exported to the validator: any
 ``n`` / ``m`` / ``k`` runs (residual-tile padded inside the kernel), so
@@ -69,6 +79,7 @@ _REPO_ROOT     = _SCHEDULER_DIR.parent
 _PLATFORMS_DIR = _REPO_ROOT / "platforms"
 
 _DEFAULT_PLATFORM = "kv260"
+IMPLS = ("hls", "rtl")
 
 # Required fields and the Python attribute they get exported as.
 _REQUIRED: Tuple[Tuple[str, str], ...] = (
@@ -115,11 +126,12 @@ def _load_matmul_section(path: Path) -> Mapping[str, int]:
     return section
 
 
-def resolve(platform_name: str = None) -> Dict[str, int]:
+def resolve(platform_name: str = None) -> Dict[str, object]:
     """Resolve MatmulKernel constants for the given platform.
 
     ``platform_name=None`` falls back to ``AXI_PLATFORM`` from the env, then
-    to the built-in default ``kv260``.  Function-based so tests can probe
+    to the built-in default ``kv260``.  ``MATMUL_IMPL`` is the JSON's
+    ``impl`` unless ``AXI_MATMUL_IMPL`` is set.  Function-based so tests can probe
     arbitrary platforms without re-importing this module — module-level
     constants below freeze the default-platform values at import time.
     """
@@ -127,7 +139,19 @@ def resolve(platform_name: str = None) -> Dict[str, int]:
         platform_name = os.environ.get("AXI_PLATFORM", _DEFAULT_PLATFORM)
     path    = _resolve_platform_path(platform_name)
     section = _load_matmul_section(path)
-    out: Dict[str, int] = {}
+    out: Dict[str, object] = {}
+    impl = section.get("impl")
+    if impl not in IMPLS:
+        raise MatmulHwConfigError(
+            f"Platform JSON {path}: 'kernels.matmul.impl' must be one of "
+            f"{', '.join(IMPLS)}, got {impl!r}.")
+    env = os.environ.get("AXI_MATMUL_IMPL")
+    if env:
+        if env not in IMPLS:
+            raise MatmulHwConfigError(
+                f"AXI_MATMUL_IMPL must be one of {', '.join(IMPLS)}, got {env!r}.")
+        impl = env
+    out["MATMUL_IMPL"] = impl
     for json_key, py_attr in _REQUIRED:
         if json_key not in section:
             raise MatmulHwConfigError(
@@ -153,6 +177,7 @@ MATMUL_MAX_K : int = _CFG["MATMUL_MAX_K"]
 MATMUL_TILE_M: int = _CFG["MATMUL_TILE_M"]
 MATMUL_TILE_N: int = _CFG["MATMUL_TILE_N"]
 MATMUL_GEMV_MAX_M: int = _CFG["MATMUL_GEMV_MAX_M"]
+MATMUL_IMPL: str = _CFG["MATMUL_IMPL"]      # "hls" | "rtl": the engine cost model
 
 
 __all__ = (
@@ -160,6 +185,7 @@ __all__ = (
     "MATMUL_TILE_M",
     "MATMUL_TILE_N",
     "MATMUL_GEMV_MAX_M",
+    "MATMUL_IMPL",
     "MatmulHwConfigError",
     "resolve",
 )

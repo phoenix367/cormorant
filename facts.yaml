@@ -73,17 +73,18 @@ facts:
 # ── the performance model ────────────────────────────────────────────────────
 - id: perf.bitstream_id
   kind: value
-  title: the bitstream the committed performance model is for
+  title: the bitstream of the current performance model (perf_models/README.md names it; a
+    model of another bitstream may sit beside it, e.g. the RTL MatmulKernel's during
+    MATMUL_RTL_PLAN phases 3-4)
   source:
-    glob: 'inference-scheduler/perf_models/kv260/*.json'
-    transform: 'one(stem(p) for p in v if re.fullmatch(r"[0-9a-f]{12}\.json", basename(p)))'
+    file: inference-scheduler/perf_models/README.md
+    regex: '^`kv260/([0-9a-f]{12})` is hw_128'
   exists:                                    # the files a bitstream needs besides the model
     - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.cases.json'
     - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.calib.json'
     - '.claude/skills/perf-regression/baselines/kv260-{fact:perf.bitstream_id}.json'
   fix: report                                # a new bitstream rewrites these paragraphs by hand
   mentions:
-    - {file: inference-scheduler/perf_models/README.md, regex: '^`kv260/([0-9a-f]{12})` is hw_128'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'Current model: \*\*kv260/([0-9a-f]{12})\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'print\(f\(\)\)" +# ([0-9a-f]{12}) today'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}

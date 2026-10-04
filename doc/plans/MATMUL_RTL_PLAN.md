@@ -320,15 +320,60 @@ workload slower than with the HLS kernel.  Outputs:
 `/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/` (bitstream, reports, build
 log, `perf_rtl2*.json`); logs in `/mnt/data/tmp/p2b_*.log`.
 
-### Phase 3: performance models and scheduling
+### Phase 3: performance models and scheduling — in progress
 
-- A `perf_calibrate` campaign for the new bitstream (cases, run, fit,
-  refinement rounds), then the simulator check (every workload within ±2 %).
-- Refit the MatmulKernel constants of `cost_model.py`; re-evaluate the
-  automatic engine choices (`--matmul-on-conv`, `--matmul-gemv`, `--fc-conv`)
-  and the planner's ConvKernel ‖ MatmulKernel overlap.
-- A new perf-regression baseline; end-to-end before / after: BERT, LLM
-  prefill and decode, LeNet, the CNNs.
+**3a. Calibration campaign** on the RTL bitstream `1d28630fbfa4`
+(`perf_calibrate.py cases`, `run`, `fit`; 2026-10-04): 1 249 calls (754 from
+the ten shipped models with today's engine choices, 569 from the grid), both
+passes complete, repeat spread median 0.022 %.  Simulator check against the
+phase 2b board measurements: every workload within ±2 % (CNNs, LeNet, BERT
+−0.7 %, SmolLM2-135M and SmolVLM prefill / decode / `llm_image`, the Piper
+encoder) except SmolLM2-360M (−2.6 … −6.0 %) and the Piper chunk (−2.3 %),
+which had never been checked: the HLS model misses 360M by the same amounts
+on the HLS bitstream, so it is the host-op model, not the kernel.  The
+refinement rounds wait for 3b: they rank tactics with the fitted model,
+around the shipped choices, and 3b changes both.
+
+**3b. The MatmulKernel models.**
+- `platforms/kv260.json` `kernels.matmul.impl` (`hls` / `rtl`) names the
+  bitstream's MatmulKernel.  The scheduler's cost model follows it (the
+  `AXI_MATMUL_IMPL` environment variable overrides it), and CMake's
+  `AXI_MATMUL_IMPL` takes its default from it.
+- `cost_model.rtl_matmul_cycles` is a structural model of the RTL job walk
+  (the B stream of the busier lane, the drain, the A-panel load, steps,
+  read runs), fitted to the 240 measured MatmulKernel calls: median error
+  1.3 %, p90 3.3 %.
+- The perf models' MatmulKernel families carry those terms (`rtl_*`)
+  besides the HLS tile model's, and the fit keeps the set with the lower
+  training error.  On the RTL bitstream the tiled family's held-out p90
+  drops from 49.9 % to 4.0 % (median 0.8 %), under the planner's 5 % trust
+  limit; the HLS bitstream's model refits identically.
+- **Finding: the engine choices cannot just follow the new model.**  With
+  `impl: rtl`, the RTL model moves 31–450 MatMuls per chat / TTS model from
+  ConvKernel or the GEMV path to MatmulKernel's packed tiled path, and the
+  multi-entry projects then need a second layout of those weights: the
+  pool of SmolLM2-135M grows from 286 to 488 MiB, SmolVLM from 495 to 697,
+  Piper from 48 to 55 (360M would exceed the 1000 MB CMA).  On the RTL
+  kernel the ConvKernel image layout (`gemv_kw`) is not a one-row path:
+  any number of A rows streams B once per 8-row panel, within 1–1.3 % of
+  the packed layout's speed (phase 2b benchmarks).  The RTL policy is
+  therefore: MatmulKernel reads constant weights in the image layout, for
+  any n, unless the shape forbids it (k % 8, m % 8, m · kw ≥ 64), and each
+  MatMul's engine choice compares ConvKernel and MatmulKernel on the same
+  image, so every weight keeps one copy across the entries.
+
+**Remaining:**
+- The scheduler policy above: the GEMV eligibility's n = 1 rule (an HLS
+  cost fact) becomes a cost question on RTL; `lower_matmuls` prices
+  MatmulKernel on the image; the first prefill bucket's MatmulKernel
+  weights pin their width for the other entries as its ConvKernel ones do;
+  hinted weights in decode always read the image.  Check: pools unchanged,
+  engine counts, predicted end-to-end times (`simulate` with the RTL model).
+- A top-up campaign for the new shipped calls, the refinement rounds, the
+  simulator check again.
+- 3c: regenerate and measure on the board, before / after: BERT, LLM
+  prefill and decode, LeNet, the CNNs, Piper; the perf-regression baseline
+  of the RTL bitstream is recorded (`kv260-1d28630fbfa4.json`).
 
 ### Phase 4: the default and the clean-up
 

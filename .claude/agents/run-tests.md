@@ -37,7 +37,7 @@ reasons, known warnings, typical duration) are in
 
 | suite | what | time |
 |---|---|---|
-| `scheduler` | `inference-scheduler/` pytest `test/` (1625 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
+| `scheduler` | `inference-scheduler/` pytest `test/` (1627 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
 | `chat` | `demo/chat/tests` pytest (188 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `facts` | `tools/facts/facts.py check` (`facts.yaml`: counts, register maps, supported ops, CLI and script flags, HTTP routes, ctypes, config keys, platform JSON, pool sizes, board results against code and docs; a failure = a stale or inconsistent fact) + the tool's unittest | ~15 s |

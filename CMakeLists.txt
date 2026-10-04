@@ -80,8 +80,16 @@ add_subdirectory(kernels/matmul_rtl)
 # Which MatmulKernel IP the hardware build uses: the Vitis HLS export
 # (kernels/matmul) or the SystemVerilog one (kernels/matmul_rtl).  Both have
 # the VLNV xilinx.com:hls:MatmulKernel:1.0 and the same register map; the RTL
-# IP's gmem2 is 128-bit (the block-design instance must say so).
-set(AXI_MATMUL_IMPL "hls" CACHE STRING "MatmulKernel IP in the hardware build: hls or rtl")
+# IP's gmem2 is 128-bit (the block-design instance must say so).  The default
+# is the platform JSON's kernels.matmul.impl, which the scheduler's cost model
+# reads too.
+file(READ "${AXI_DEFAULT_PLATFORM_JSON}" _axi_pjson)
+string(JSON _axi_mm_impl ERROR_VARIABLE _axi_mm_err GET "${_axi_pjson}" kernels matmul impl)
+if(_axi_mm_err)
+    message(FATAL_ERROR "axi_kernels: ${AXI_DEFAULT_PLATFORM_JSON} is missing kernels.matmul.impl "
+                        "(hls or rtl): ${_axi_mm_err}")
+endif()
+set(AXI_MATMUL_IMPL "${_axi_mm_impl}" CACHE STRING "MatmulKernel IP in the hardware build: hls or rtl")
 set_property(CACHE AXI_MATMUL_IMPL PROPERTY STRINGS hls rtl)
 if(NOT AXI_MATMUL_IMPL MATCHES "^(hls|rtl)$")
     message(FATAL_ERROR "axi_kernels: AXI_MATMUL_IMPL must be hls or rtl, not '${AXI_MATMUL_IMPL}'")

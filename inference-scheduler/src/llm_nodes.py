@@ -1103,8 +1103,8 @@ class LlmAttnConvNode:
         oh = M // ow
         est = []
         for keys in ([C] if static else sorted({max(Q, -(-(T + 1) // Q) * Q), C})):
-            mm = (matmul_cycles(keys, HD, G * T) if kind == "qk"
-                  else matmul_cycles(G * T, keys, HD)) + CALL_OVERHEAD
+            mm = (matmul_cycles(keys, HD, G * T, b_packed=False) if kind == "qk"
+                  else matmul_cycles(G * T, keys, HD, b_packed=False)) + CALL_OVERHEAD
             est.append((keys, float(cyc(keys, oh, ow)), float(mm)))
         return oh, ow, tuple(est)
 

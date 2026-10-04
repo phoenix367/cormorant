@@ -126,6 +126,20 @@ def _conv_terms(f) -> Dict[str, float]:
             "one": 1.0}
 
 
+# MatmulKernel exists as the Vitis HLS kernel and as the SystemVerilog one
+# (kernels/matmul_rtl): the families carry the terms of both structures,
+# the HLS tile model above and the RTL job walk (cost_model.rtl_matmul_terms,
+# prefixed "rtl_"), and the fit keeps the set that fits the bitstream's
+# measurements (perf_fit.FEATURE_SETS).
+RTL_PREFIX = "rtl_"
+
+
+def _rtl_terms(f) -> Dict[str, float]:
+    from .cost_model import rtl_matmul_terms
+    t = rtl_matmul_terms(f["n"], f["k"], f["m"], f["batch"], bool(f["b_packed"]), f["gemv_kw"])
+    return {RTL_PREFIX + name: v for name, v in t.items() if name != "one"}
+
+
 def features(c: KernelCall) -> Dict[str, float]:
     """The regressors of the call's family, in cycles-like units."""
     f = c.fields
@@ -143,11 +157,11 @@ def features(c: KernelCall) -> Dict[str, float]:
         blocks = bt * math.ceil(n / MATMUL_TILE_N) * math.ceil(m / MATMUL_TILE_M)
         return {"kloop": blocks * MATMUL_TILE_N * k, "blocks": blocks,
                 "b_words": bt * k * m / 8.0 * (0.0 if f["b_packed"] else 1.0),
-                "c_words": bt * n * m / 8.0, "one": 1.0}
+                "c_words": bt * n * m / 8.0, "one": 1.0, **_rtl_terms(f)}
     if fam == "mm-gemv":
         n, k, m, bt = f["n"], f["k"], f["m"], f["batch"]
         return {"b_words": bt * n * k * m / 8.0, "rows": bt * n, "k_words": bt * n * k / 8.0,
-                "m": bt * n * m, "one": 1.0}
+                "m": bt * n * m, "one": 1.0, **_rtl_terms(f)}
     if fam in ("vecop", "vecop-div"):
         words = f["outer"] * math.ceil(f["size"] / 8)
         unary = f["op"] in (4, 5)
