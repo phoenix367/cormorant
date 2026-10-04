@@ -15,9 +15,12 @@ as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 **Status (2026-10-04):** in the repository with its Verilator testbench, the
 C driver and the IP packaging; with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream
 builds (timing met at 100 MHz) and passes the test stand's matmul behaviour
-test (50 / 50) and the whole-design simulation (68 / 68).  It has **not** run
-on the board yet, and the hardware build still uses the HLS kernel by default
-(`AXI_MATMUL_IMPL=hls`).  Next: the board validation, the performance
+test (50 / 50) and the whole-design simulation (68 / 68).  On the board it
+is bit-exact everywhere (148 models, every demo and chat / TTS gate) and
+2–7× faster on tiled MatMuls; one GEMV shape (1×576×1536, kw 4: many
+128-column chunks, each waiting for the previous drain) is 9 % slower and
+costs SmolLM2-135M decode 4 %.  The hardware build still uses the HLS kernel
+by default (`AXI_MATMUL_IMPL=hls`).  Next: the board validation, the performance
 models, then the switch and the retirement of the HLS kernel's synthesis
 (its C++ reference `ref_matmul_2d` stays: it writes the fixtures every RTL
 test checks against) — [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
@@ -394,7 +397,7 @@ generator.  The current block design runs at 100 MHz, with 150 MHz planned.  Nea
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
 - **Full design (`sim_hw_kv260`, `AXI_MATMUL_IMPL=rtl`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
-- **Not yet done:** a board run (phase 2).
+- **Board (phase 2):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks and the regression above are in [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 2.
 
 ## Source files
 
@@ -459,4 +462,5 @@ tree in the MAC path, and a column's kw taps are reduced once in the drain.
 
 - **k > 4096:** out of contract. k is clamped internally, so the job completes but C is undefined.
 - **Serial A load per panel:** A is single-buffered and shares the port with B. Small-k GEMMs (e.g. 256×64×64) spend ~20 % of their time reloading A. A second A bank would not help while A and B share a port; widening the effective A load (both ports per row) would.
+- **Drain between column chunks:** a step's lanes wait until the drain has read the previous step's accumulators.  It shows when a row splits into many chunks — GEMV with kw > 1 and a wide B (kw 4: 128 columns per chunk; 1×576×1536 is 9 % slower on the board than the HLS kernel, phase 2).  Double-buffered accumulators, or a deeper one-row accumulator, would overlap the two.
 - **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; 150 MHz is the plan).

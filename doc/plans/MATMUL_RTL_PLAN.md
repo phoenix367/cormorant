@@ -6,8 +6,11 @@ Verilator testbench, the C driver and the IP packaging are in
 `AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (`8b9aee0f54b3`, timing met
 at 100 MHz, 8.6 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer) and passes the
 matmul behaviour test (50 / 50) and the whole-design simulation (68 / 68).
-The default is still `hls`; phases 2–4 (board, performance models, switch)
-are open.
+Phase 2 (board): everything bit-exact — registers, the 148 models, targeted
+C writes, every demo and chat / TTS gate; tiled MatMuls 2–7× faster, but
+one GEMV shape (1×576×1536, kw 4) 9 % slower, which costs SmolLM2-135M
+decode 4 %.  The default is still `hls`; the GEMV fix, phases 3–4
+(performance models, switch) are open.
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
 drop-in replacement for the Vitis HLS MatmulKernel
@@ -163,16 +166,80 @@ Risks carried into the phases:
   `.xpr`) were restored; the committed block designs still describe the HLS
   configuration, and every build re-derives the RTL one.
 
-### Phase 2: on the board (the chat server may be stopped)
+### Phase 2: on the board — correct everywhere; one GEMV shape slower (2026-10-04)
 
-- Upload the bitstream; write and read back every register.
-- `run_remote_tests` (148 / 148), plus targeted C-write cases: m < 8,
-  unaligned C rows, single-beat runs.
-- Demo gates, all bit-exact: BERT (EM / F1 unchanged), the CNNs,
-  `llm_board` for SmolLM2-135M / 360M and SmolVLM, `tts_board` for Piper.
-- The MatmulKernel benchmarks against the HLS kernel's figures.
-- *Done when* every gate is bit-exact and no case regresses; then the HLS
-  kernel's synthesis is retired.
+The chat server was stopped (`deploy.py --stop`), the RTL bitstream
+`8b9aee0f54b3` loaded with `upload_bitstream.py` (HPC0 / HPC1 widths 128,
+UIO `fabric_vecop` / `fabric_matmul` / `fabric_conv` / `fabric_pool`), and at
+the end the deployed bitstream `caa67f49a5a3` reloaded and the server
+restarted (`deploy.py`; a chat request answered).  Every board job ran under
+the board lock.  The chat-model and TTS gates built and installed into a
+scratch directory (`--remote-dir /root/rtl_gate`, weights copied there),
+removed afterwards: the server's libraries and weight directories were not
+touched.
+
+**Correctness — everything bit-exact:**
+
+| check | result |
+|---|---|
+| MatmulKernel registers: write and read back (GIE, IER, the 17 argument words) | 19 / 19 |
+| `run_remote_tests` (`remote_config_all_models.json`, the MatmulKernel driver from `gen_driver.py`) | 148 / 148 |
+| targeted C writes: C of 5 / 2 / 12 elements (one partial beat), rows of 7, m = 515 (per-row runs, 3-element tails, packed and row-major B), batch slices of 15 / 18 elements at unaligned starts | 8 / 8 |
+| image classification (ResNet-18, MobileNet v1 / v2) | top-5 classes and logits identical to the HLS run |
+| MNIST, 10 000 images | identical results (convnet 98.92 %, LeNet 97.35 %) |
+| BERT-SQuAD, 50 examples | 50 / 50 bit-exact with the emulation (3 / 3 with the scheduler simulation), EM / F1 88.0 / 90.3 = float |
+| `llm_board` SmolLM2-135M, SmolLM2-360M | logits 4 × 33 / 33 bit-exact each; chunked prefill, threads, close → open identical |
+| `llm_board` SmolVLM-256M | 2 images, 33 / 33 logits bit-exact each |
+| `tts_board` Piper | PCM, text encoder and duration predictor bit-exact |
+| SmolLM2-135M decode A/B, the same library on both bitstreams | decode checksums identical (FNV 2862720827 / 1879811210 / 2664026437) |
+
+The KV260 PS keeps the RTL kernel's partial-strobe beats (the risk from
+2026-09-24 concerned the HLS adapter's single-beat writes): the targeted
+cases pass.
+
+**Speed** (`run_remote_perf.py`, compared with the HLS bitstream's
+perf-regression baseline; VectorOP, Conv and Pool within ±1.7 %):
+
+| MatmulKernel case | HLS | RTL | |
+|---|---:|---:|---:|
+| 256×256×256 (row-major / packed) | 7.39 / 7.17 ms | 1.40 / 1.40 ms | 5.3× / 5.1× |
+| 64×64×64, batch 4 × 64×64×64 | 0.225, 0.875 ms | 0.033, 0.112 ms | 6.8×, 7.8× |
+| depthwise-as-MatMul 12544×16×1 / ×3 | 6.94 / 20.8 ms | 0.99 / 2.97 ms | 7.0× |
+| FC 1×256×256 … 1×1280×1001, tiled (row-major / packed) | 0.10–2.44 ms | 0.048–0.95 ms | 2.1–2.9× |
+| GEMV 1×512×1000, kw 1 | 0.339 ms | 0.340 ms | +0.5 % |
+| GEMV 1×1536×576, kw 4 | 0.568 ms | 0.565 ms | −0.5 % |
+| **GEMV 1×576×1536, kw 4** | **0.577 ms** | **0.631 ms** | **+9.2 %** |
+
+| workload | HLS | RTL |
+|---|---:|---:|
+| SmolLM2-135M decode at 32 / 256 / 1000 (A/B, same library) | 99.3 / 106.4 / 128.6 ms | 103.6 / 110.5 / 134.6 ms (+4 %) |
+| SmolLM2-135M prefill 16 / 64 / 256 | 341 / 442 / 1294 ms | 340 / 442 / 1291 ms |
+| SmolLM2-360M decode at 32 / 256 / 1000 (HLS: §20 record) | 256 / 270 / 306 ms | 258 / 271 / 312 ms |
+| SmolLM2-360M prefill 16 / 64 / 256 | 0.83 / 1.00 / 2.90 s | 0.83 / 1.00 / 2.92 s |
+| SmolVLM `llm_image` | 3.885 s | 3.92–3.94 s |
+| BERT p50 | 962.3 ms | 964.9 ms |
+| ResNet-18 / MobileNet v1 / v2 | 59.9 / 81.0 / 62.9 ms | 59.9 / 81.2 / 63.0 ms |
+| LeNet | 2.810 ms | 2.804 ms |
+| Piper RTF (6.9 s utterance) | 0.52 | 0.523 |
+
+- **The regression:** the GEMV image path with a wide B row.  With kw = 4
+  the RTL splits a row into chunks of 512 >> 2 = 128 columns (12 for
+  m = 1536), and each chunk's lanes wait for the previous chunk's drain
+  (`drn_cnt`) before streaming B; 1×1536×576 has 4.5 chunks and does not
+  slow down.  It is exactly SmolLM2-135M's gate / up projection in decode
+  (60 calls per token × 0.053 ms ≈ 3.2 of the 4.3 ms).  The fix is in the
+  RTL: overlap the drain with the next chunk (double-buffered accumulators,
+  or a deeper accumulator for one-row GEMV so a chunk covers more columns).
+- **No end-to-end gain yet:** today's scheduler, calibrated on the HLS
+  kernel, sends almost every multi-row MatMul to ConvKernel; the 2–7× of the
+  RTL kernel reaches the models only after phase 3 re-prices MatmulKernel.
+- **Done criterion not met** ("no case regresses"): the HLS kernel's
+  synthesis is not retired yet.  The RTL fix above comes first (a phase 2b:
+  RTL change, Verilator + sysim, bitstream, the GEMV cases and the 135M
+  decode A/B on the board), or the 4 % decode loss is accepted against the
+  phase 3 gains.
+- Outputs: `/mnt/data/bitstreams/kv260_rtl_8b9aee0f54b3/` (`perf_rtl.json`,
+  `perf_rtl.log`); logs of every run in `/mnt/data/tmp/p2_*.log`.
 
 ### Phase 3: performance models and scheduling
 
