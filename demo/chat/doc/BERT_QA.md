@@ -2,7 +2,7 @@
 
 The `bert-squad` model answers questions about a document you send.  It is
 BERT-base fine-tuned on SQuAD, the model of the [`bert_squad/`](../../bert_squad/README.md)
-demo, running on the FPGA: 953 ms per 256-token window, with logits
+demo, running on the FPGA: 919 ms per 256-token window, with logits
 bit-exact with the scheduler simulation.
 
 BERT is an **extractive** model: it cannot write free text.  The answer is

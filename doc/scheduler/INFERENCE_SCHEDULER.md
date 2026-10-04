@@ -127,7 +127,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1643 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1645 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -284,10 +284,11 @@ adds the bias inside its accumulator; the MatMul saturates first).
 `OnnxGraph.fc_conv_stats` = `{lowered, kept, conv_cycles, matmul_cycles}`;
 `report.md` lists the rewrite.  LeNet: 5.44 → 2.81 ms on the board
 ([LENET_PLAN](../plans/LENET_PLAN.md)).  MobileNet v1's 1001-way 1×1
-classifier is not GEMV-eligible (m % 8 ≠ 0): on the HLS kernel it stays a
-Conv (its tiled MatMul is not faster), on the RTL kernel the tiled MatMul is
-about twice as fast as the Conv and takes it (MobileNet v1 81.0 → 73.0 ms
-on the board, MATMUL_RTL_PLAN phase 3c).
+classifier is not GEMV-eligible (m % 8 ≠ 0) but runs as a tiled MatMul: the
+Conv is bound by its 1001 two-word weight requests (8.8 ms on the board,
+`cost_model.conv_board_cycles` 7.7 ms) against 0.67 ms for the RTL
+MatmulKernel's tiled path (MobileNet v1 81.0 → 73.0 ms on the board,
+MATMUL_RTL_PLAN phase 3c; the HLS kernel's 1.5 ms is faster too).
 
 **VectorOPKernel alignment contract** (kernel ports are 128-bit words):
 every DMA buffer base is 64-byte aligned, every broadcast `CHUNK_STRIDE`
@@ -1049,12 +1050,19 @@ spends `max(kh·kw, 2)` cycles per pixel pair, so `kw ≥ 2` halves a 1×1's
 sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
-`(kw, out_w | M)` geometry is costed with `cost_model.conv_cycles` — the
+`(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` — the
 standard path of the conv-cycle-model skill (§2.42), kept equal to the
-skill script by a test — plus `CALL_OVERHEAD` (1 500 cycles) per call;
-the cheapest is compared with `cost_model.matmul_cycles`, a block model of
-MatmulKernel calibrated on the board (256³, the BERT linears, attention
-QKᵀ within 1–4 %).  The MatMul is lowered when the conv estimate is below
+skill script by a test — plus `CALL_OVERHEAD` (1 500 cycles) per call.  The
+cheapest is priced on the board with `cost_model.conv_board_cycles`, which
+adds what the RTL simulation hides: a weight slab is fetched with one
+request per output channel (`kh·kw·16` elements, 2 words for a 1×1
+kernel, 8 in flight), ~12 cycles each, overlapped with the sweep one word
+per iteration — fitted to the 962 measured ConvKernel calls, it moves
+BERT's per-head attention P·V conv from 0.23 to 0.55 ms (board 0.61).  That
+price is compared with `cost_model.matmul_cycles` (the MatmulKernel of
+`kernels.matmul.impl`: the RTL kernel's structural model, or the HLS
+kernel's board-calibrated block model).  The MatMul is lowered when the
+conv estimate is below
 0.9 × MatmulKernel's and the conv has at least one full 16-row output tile
 (`out_ch ≥ kTileM`; below that both kernels are dominated by fixed
 per-call costs).  `--matmul-on-conv always` lowers every eligible MatMul

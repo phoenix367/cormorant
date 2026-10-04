@@ -166,7 +166,7 @@ def plan_shared_kw(models: Dict[str, onnx.ModelProto], prefills: List[str], kws,
     def unplanned(n, k, m, plans):
         """The largest bucket's unplanned layout (lower_matmuls, then the
         GEMV pass's rule for a MatMul kept on MatmulKernel)."""
-        if not rtl or plans[0].cycles < LOWER_MARGIN * (matmul_cycles(n, k, m, 1, b_packed=False)
+        if not rtl or plans[0].board_cycles < LOWER_MARGIN * (matmul_cycles(n, k, m, 1, b_packed=False)
                                                        + CALL_OVERHEAD):
             return plans[0].kw
         mm = _MM(n, k, m, 1, 0, 0, 0, [])

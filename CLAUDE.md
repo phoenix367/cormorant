@@ -147,7 +147,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1643 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1645 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -160,7 +160,7 @@ Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
 - **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`, `SpaceToDepthNode`; every kernel node lists its calls with `kernel_calls()` (`src/perf_calls.py`)
-- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry (`conv_plans`, incl. the row split of accumulator-limited MatMuls); ConvKernel (conv-cycle-model port) and MatmulKernel (the RTL kernel's structural model fitted to its calibration; the HLS kernel's board-calibrated block model with `impl = "hls"`) cycle estimates; `shared_weight_layouts` (one layout per weight across entries)
+- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry (`conv_plans`, incl. the row split of accumulator-limited MatMuls); ConvKernel (conv-cycle-model port; `conv_board_cycles` adds the board's weight-request cost for the engine choice) and MatmulKernel (the RTL kernel's structural model fitted to its calibration; the HLS kernel's board-calibrated block model with `impl = "hls"`) cycle estimates; `shared_weight_layouts` (one layout per weight across entries)
 - **`inference-scheduler/src/fc_conv.py`** — fully-connected Convs (one output pixel) → Flatten + MatMul + Reshape (+ bias Add) where the cost model says MatmulKernel is faster (LeNet 5.44 → 2.81 ms, `doc/plans/LENET_PLAN.md`)
 - **`inference-scheduler/src/matmul_gemv.py`** / **`src/llm_entries.py`** — MatmulKernel GEMV / image pass (`MatmulNode.gemv_kw`); the Llama entry graphs that let decode read the prefill weight images (one copy per weight)
 - **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side

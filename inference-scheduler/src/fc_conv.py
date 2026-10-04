@@ -36,7 +36,7 @@ from onnx import helper as onnx_helper
 from onnx import numpy_helper as nph
 
 from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_MAX_K
-from .cost_model import conv_cycles, gemv_cycles, matmul_cycles
+from .cost_model import conv_board_cycles, gemv_cycles, matmul_cycles
 from .nodes import SchedulerError
 
 MODES = ("auto", "always", "off")
@@ -98,7 +98,7 @@ def estimate(geo: dict) -> Dict[str, float]:
     """Cycles of the Conv and of its MatMul (GEMV where eligible) + bias."""
     n, c, h, wd, m = geo["n"], geo["c"], geo["h"], geo["wd"], geo["m"]
     k = c * h * wd
-    conv = n * conv_cycles(in_ch=c, out_ch=m, in_h=h, in_w=wd, oh=1, ow=1, kh=h, kw=wd)["total"]
+    conv = n * conv_board_cycles(in_ch=c, out_ch=m, in_h=h, in_w=wd, oh=1, ow=1, kh=h, kw=wd)["total"]
     gemv = (n == 1 and MATMUL_GEMV_MAX_M > 0 and m <= MATMUL_GEMV_MAX_M
             and k % LANES == 0 and m % LANES == 0 and m >= 64)
     mm = gemv_cycles(1, k, m) if gemv else matmul_cycles(n, k, m)

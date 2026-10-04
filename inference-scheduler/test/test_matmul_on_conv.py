@@ -326,6 +326,17 @@ class TestEngineChoiceRtl(_Models):
     wide, weight-heavy linears stay ahead on ConvKernel, the small GEMMs and
     the attention products go to MatmulKernel."""
 
+    def test_bert_attention(self):
+        """BERT-base's attention (12 heads, 256 tokens, head dim 64): q·Kᵀ on
+        ConvKernel, P·V on MatmulKernel — the board's verdict (MATMUL_RTL_PLAN
+        after phase 4: 955.5 → 907 ms), which the board-calibrated ConvKernel
+        model gives without planning (cost_model.conv_board_cycles)."""
+        with tempfile.TemporaryDirectory() as td:
+            g, _ = _gen(_attention_model(os.path.join(td, "bert_attn.onnx"), 12, 256, 64))
+        self.assertEqual([(sn.k, sn.m) for sn in _lowered(g)], [(64, 256)])        # q·Kᵀ
+        self.assertEqual([(sn.n, sn.k, sn.m, sn.batch) for sn in g.nodes
+                          if type(sn) is MatmulNode], [(256, 256, 64, 12)])     # P·V
+
     def test_choices(self):
         for name in ("linear", "ffn_up", "small", "rows"):
             (sn,) = _lowered(_gen(self.m[name])[0])
@@ -519,6 +530,24 @@ class TestCostModel(unittest.TestCase):
             for key in ("total", "sweep", "fill", "ph1", "ph3", "loads"):
                 self.assertEqual(got[key], ref[key], (key, c, m, h, w, kh, kw, sh, sw))
             n += 1
+
+    def test_conv_board_model(self):
+        """conv_board_cycles: within 1 % of the RTL-simulation model where the
+        weight fetch hides behind the sweep (a 3x3 conv on 56x56), above it
+        where a 1x1 kernel's 2-word requests bound the fetch, and close to the
+        board there — BERT's per-head P·V conv (1x1, 256 → 256 channels, 64
+        pixels) measured 612.6 µs per call (1d28630fbfa4)."""
+        from src.cost_model import conv_board_cycles, conv_cycles
+        pv = dict(in_ch=256, out_ch=256, in_h=1, in_w=64, oh=1, ow=64, kh=1, kw=1)
+        self.assertLess(abs(conv_board_cycles(**pv)["total"] / 61260 - 1), 0.15)
+        self.assertLess(conv_cycles(**pv)["total"] / 61260, 0.4)            # the RTL model
+        big = dict(in_ch=64, out_ch=64, in_h=58, in_w=58, oh=56, ow=56, kh=3, kw=3)
+        self.assertLess(abs(conv_board_cycles(**big)["total"] / conv_cycles(**big)["total"] - 1),
+                        0.01)
+        for m in (64, 256, 1001):
+            for ow in (1, 8, 64):
+                g = dict(in_ch=256, out_ch=m, in_h=1, in_w=ow, oh=1, ow=ow, kh=1, kw=1)
+                self.assertGreater(conv_board_cycles(**g)["total"], conv_cycles(**g)["total"])
 
     @matmul_impl("hls")
     def test_matmul_model_board_calibration(self):

@@ -86,8 +86,8 @@ class _Models(unittest.TestCase):
         # LeNet's conv3 itself: auto lowers it (GEMV)
         cls.lenet3 = _fc_model(j("lenet3.onnx"), 64, 7, 7, 1024, relu=True)
         # MobileNet v1's classifier (1x1 on 1x1, 1001 outputs): not GEMV-eligible;
-        # the HLS kernel's tiled MatMul is not faster -> auto keeps the Conv,
-        # the RTL kernel's is -> auto lowers it
+        # bound by its weight requests on ConvKernel, so auto lowers it to the
+        # tiled MatMul on either MatmulKernel
         cls.mnv1 = _fc_model(j("mnv1.onnx"), 1024, 1, 1, 1001, relu=False)
         # not fully connected / not eligible
         cls.padded = _fc_model(j("padded.onnx"), 8, 4, 4, 16, pads=[1, 1, 1, 1], kernel=(6, 6))
@@ -162,9 +162,12 @@ class TestAuto(_Models):
         self.assertEqual(g.matmul_gemv_stats["gemv"], 1)
 
     @matmul_impl("hls")
-    def test_mobilenet_classifier_kept(self):
+    def test_mobilenet_classifier_lowered_on_hls_too(self):
+        # 1001 output channels, each a 2-word weight request: 8.8 ms on the
+        # board (cost_model.conv_board_cycles 7.7 ms), so even the HLS
+        # kernel's tiled MatMul (1.5 ms) is faster; not GEMV-eligible
         g = self.graph(self.mnv1, "auto")
-        self.assertEqual((g.fc_conv_stats["lowered"], g.fc_conv_stats["kept"]), (0, 1))
+        self.assertEqual((g.fc_conv_stats["lowered"], g.fc_conv_stats["kept"]), (1, 0))
         self.assertFalse(self._estimate(self.mnv1)["gemv"])
 
     @matmul_impl("rtl")

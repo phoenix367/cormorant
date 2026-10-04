@@ -18,7 +18,17 @@ pixel PAIRS, ``G · max(kh·kw, 2)`` cycles per pair and M-group, one ramp per
 8-lane drain, the §2.39 row loader) with the same constants, so the two
 cannot drift apart silently: ``test/test_matmul_on_conv.py`` compares them
 on a geometry sweep.  That model tracked the RTL behavior test within ~5 %
-on the > 20 k-cycle cases at every kernel step.
+on the > 20 k-cycle cases at every kernel step.  On the board a weight
+slab's fetch is also bound by its requests — one per output channel, 2
+words for a 1x1 kernel —, which the simulation's DDR model hides:
+``conv_board_cycles`` adds that (``CONV_WEIGHT_REQ_CYCLES``,
+``CONV_PREFETCH_HIDE``, fitted to the board), and the engine choices use it
+to price ConvKernel against MatmulKernel (``matmul_lowering``: the geometry
+``conv_cycles`` ranks first; ``fc_conv``).  The geometries themselves —
+a lowered MatMul's (kw, out_w), the frontends' attention widths — are
+still ranked by ``conv_cycles``, whose choices were measured on the
+board (a geometry the board model prefers instead is mostly unmeasured),
+and so are the performance model's features.
 
 MatmulKernel (HLS, ``kernels.matmul.impl == "hls"``)
 -----------------------------------------------------
@@ -72,6 +82,12 @@ from ._matmul_hw_config import MATMUL_GEMV_MAX_M, MATMUL_IMPL, MATMUL_TILE_M, MA
 # ConvKernel — constants of conv_cycle_model.py (ARCH 42), keep in sync.
 # --------------------------------------------------------------------------
 CONV_INVOKE_OVERHEAD = 1000   # geometry dividers, bias load, DATAFLOW start-up
+# The board only (conv_board_cycles): cycles per weight request (one per
+# output channel of a slab, 8 in flight) and the share of a slab's sweep
+# that hides the next slab's fetch (one word per iteration); the RTL
+# simulation's model (conv_cycles, the skill's) uses 0 and 0.5.
+CONV_WEIGHT_REQ_CYCLES = 12
+CONV_PREFETCH_HIDE   = 1.0
 DRAIN_SEG            = 256    # §2.38 Phase-3 transposer segment (pixels)
 DRAIN_STEP_RAMP      = 6
 ROW_FILL_LATENCY     = 12     # §2.39 per-row Phase-1 entry
@@ -133,7 +149,6 @@ def _loader_row_cycles(ch, cols):
     return ch * (-(-cols // 8) + 1) + ch + ROW_LOADER_SETUP
 
 
-@lru_cache(maxsize=4096)
 def conv_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
                 oh: int, ow: int, kh: int, kw: int,
                 sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
@@ -141,7 +156,34 @@ def conv_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
     """Estimated cycles of one standard (group = 1) ConvKernel invocation
     with batch 1, split like conv_cycle_model.py's buckets:
     ``{total, sweep, fill, ph1, ph3, loads, chunks, rows, groups,
-    ic_tiles, owt}``."""
+    ic_tiles, owt}`` — the kernel in RTL simulation (the skill's model)."""
+    return _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+                      0, 0.5)
+
+
+def conv_board_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
+                      oh: int, ow: int, kh: int, kw: int,
+                      sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
+                      pt: int = 0, pl: int = 0) -> dict:
+    """:func:`conv_cycles` on the board: a weight slab's fetch is bound by
+    its requests too (one per output channel of the slab, ``kh·kw·16``
+    elements — 2 words for a 1x1 kernel —, 8 in flight:
+    ``CONV_WEIGHT_REQ_CYCLES`` each), and the sweep hides it one word per
+    iteration (``CONV_PREFETCH_HIDE``).  Fitted to the 962 measured
+    ConvKernel calls of the RTL MatmulKernel's bitstream (1d28630fbfa4):
+    median error 20.5 → 18.7 %, p90 46 → 37 %; a 1x1 kernel on <= 256
+    pixels and > 64 output channels (BERT's per-head attention P·V:
+    model 0.23 → 0.55 ms, board 0.61 ms) median |log error| 0.60 → 0.13."""
+    return _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+                      CONV_WEIGHT_REQ_CYCLES, CONV_PREFETCH_HIDE)
+
+
+@lru_cache(maxsize=8192)
+def _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+               req: float, hide: float) -> dict:
+    """The model's walk; ``req`` (cycles per weight request) and ``hide``
+    (the share of a slab's sweep that absorbs the next slab's fetch) are
+    the RTL model's 0 and 0.5, or the board's."""
     m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt = _conv_geom(
         in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw)
     E, T = CONV_WEIGHT_PORT_ELEMS, CONV_TILE_IC
@@ -177,20 +219,21 @@ def conv_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
                     G   = min(mtg, m_tiles - mt0)
                     mv_sum = sum(min(CONV_TILE_M, out_ch - (mt0 + i) * CONV_TILE_M)
                                  for i in range(G))
-                    f  = mv_sum * kh * kw * lanes / E
+                    f  = max(mv_sum * kh * kw * lanes / E, mv_sum * req)
                     s_ = rows * units * G + PIXEL_OVERHEAD
                     first = c == 0 and ict == 0 and t == 0 and g == 0
-                    fill  += f if first else max(0.0, f - s_ / 2)
+                    fill  += f if first else max(0.0, f - s_ * hide)
                     sweep += s_
     total = sweep + fill + ph1 + ph3 + loads + CONV_INVOKE_OVERHEAD
     return dict(total=total, sweep=sweep, fill=fill, ph1=ph1, ph3=ph3, loads=loads,
                 chunks=chunks, rows=per, groups=groups, ic_tiles=ic_tiles, owt=owt)
 
 
-def conv_batch_cycles(batch: int, **geom) -> float:
+def conv_batch_cycles(batch: int, board: bool = False, **geom) -> float:
     """A ConvKernel call with ``batch`` images: the per-image work repeats,
-    the invocation overhead does not (the conv-cycle-model --validate rule)."""
-    t = conv_cycles(**geom)["total"]
+    the invocation overhead does not (the conv-cycle-model --validate rule).
+    ``board``: :func:`conv_board_cycles` instead of :func:`conv_cycles`."""
+    t = (conv_board_cycles if board else conv_cycles)(**geom)["total"]
     return (t - CONV_INVOKE_OVERHEAD) * batch + CONV_INVOKE_OVERHEAD
 
 
@@ -293,6 +336,7 @@ def cycles_to_ms(cycles: float, mhz: float = 100.0) -> float:
 __all__ = (
     "CALL_OVERHEAD",
     "conv_cycles",
+    "conv_board_cycles",
     "conv_batch_cycles",
     "matmul_cycles",
     "gemv_cycles",

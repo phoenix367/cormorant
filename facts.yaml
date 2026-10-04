@@ -496,14 +496,15 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 953,
+  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 919,
           smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.25, smollm2_360m_tok_s: 3.9,
           smolvlm_image_s: 3.9, piper_rtf: 0.52}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
     how: "MATMUL_RTL_PLAN phase 4 board session: the demos' results.json (ResNet-18 p50 59.9 ms, MobileNet
-          v1 / v2 73.0 / 62.9, BERT p50 953.3 ms), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
+          v1 / v2 73.0 / 62.9; BERT p50 919.2 ms after the board-priced engine choice put P·V on
+          MatmulKernel), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
           prefill, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
           llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot)"
     facts: {perf.bitstream_id: 1d28630fbfa4}   # stale on another bitstream

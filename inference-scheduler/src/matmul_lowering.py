@@ -48,9 +48,10 @@ Engine choice (``mode``):
              (``out_ch >= kTileM`` = 16 rows; below that the conv leaves
              MAC columns idle and both kernels are dominated by fixed
              per-call costs the models only approximate) and whose cheapest
-             (kw, out_w) by ``cost_model.conv_cycles`` (plus
-             ``CALL_OVERHEAD`` per call) is below ``LOWER_MARGIN`` x
-             ``cost_model.matmul_cycles``;
+             (kw, out_w) — ranked by ``cost_model.conv_cycles``, the
+             geometries measured on the board — priced by
+             ``cost_model.conv_board_cycles`` (plus ``CALL_OVERHEAD`` per
+             call) is below ``LOWER_MARGIN`` x ``cost_model.matmul_cycles``;
   "always" — every eligible MatMul, cheapest geometry (tests, experiments);
   "off"    — none (CLI ``--no-matmul-on-conv``).
 """
@@ -98,8 +99,11 @@ class ConvPlan:
     a_call_stride: int
     b_call_stride: int
     c_call_stride: int
-    cycles:        float     # all calls, CALL_OVERHEAD included
+    cycles:        float     # all calls, CALL_OVERHEAD included (cost_model.conv_cycles:
+                             # ranks the geometries)
     acc_limited:   bool = False   # see "Row split" in the module docstring
+    board_cycles:  float = 0.0    # the same on the board (conv_board_cycles): priced
+                                  # against MatmulKernel by the engine choice
 
 
 def normalize_mode(mode) -> str:
@@ -192,12 +196,14 @@ def _geometry_plans(mm: MatmulNode, kw_options: Sequence[int], conv_n: int,
         wide = [d for d in widths if d >= _MIN_OUT_W]
         for out_w in (wide or widths[-1:]):
             out_h = mm.m // out_w
-            per_call = conv_batch_cycles(
-                conv_batch, in_ch=in_ch, out_ch=conv_n, in_h=out_h, in_w=kw * out_w,
-                oh=out_h, ow=out_w, kh=1, kw=kw, sw=kw)
+            geom = dict(in_ch=in_ch, out_ch=conv_n, in_h=out_h, in_w=kw * out_w,
+                        oh=out_h, ow=out_w, kh=1, kw=kw, sw=kw)
+            per_call = conv_batch_cycles(conv_batch, **geom)
+            per_board = conv_batch_cycles(conv_batch, board=True, **geom)
             plans.append(ConvPlan(kw, out_h, out_w, conv_n, conv_batch, calls,
                                   a_cs, b_cs, c_cs, calls * (per_call + CALL_OVERHEAD),
-                                  _acc_limited(conv_n, out_h, out_w)))
+                                  _acc_limited(conv_n, out_h, out_w),
+                                  calls * (per_board + CALL_OVERHEAD)))
     plans.sort(key=lambda p: (p.cycles, p.kw, -p.out_w))
     return plans
 
@@ -465,7 +471,8 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
         plans = conv_plans(sn, kws)
         pin = kw_override.get(b.onnx_name)
         mm_cyc = matmul_plan_cycles(sn, pin)
-        keep = not plans or (mode == "auto" and plans[0].cycles >= LOWER_MARGIN * mm_cyc)
+        keep = not plans or (mode == "auto"
+                             and plans[0].board_cycles >= LOWER_MARGIN * mm_cyc)
         if keep and plans and pin and cost_model.MATMUL_IMPL == "rtl" and pin not in _MM_IMAGE_KWS:
             keep = False      # pinned to a ConvKernel-only image: MatmulKernel would need a copy
         p = None if keep else plans[0]
@@ -516,11 +523,11 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
             conv_batch=p.conv_batch, calls=p.calls,
             a_call_stride=p.a_call_stride, b_call_stride=p.b_call_stride,
             c_call_stride=p.c_call_stride, b_relayout=p.kw > 1,
-            est_conv_cycles=p.cycles, est_matmul_cycles=mm_cyc,
+            est_conv_cycles=p.board_cycles, est_matmul_cycles=mm_cyc,
         )
         stats["lowered"] += 1
         stats["conv_calls"] += p.calls
-        stats["conv_cycles"] += p.cycles
+        stats["conv_cycles"] += p.board_cycles
         stats["matmul_cycles"] += mm_cyc
         out.append(node)
     return out, stats

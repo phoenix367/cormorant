@@ -53,6 +53,18 @@ ow-tiling case are UNDER-estimated (-12…-15 %, per-tile / per-request
 latencies not modelled).  A fixed 1 000-cycle invocation overhead
 covers the tiny cases.
 
+**On the board** (962 calls measured on bitstream 1d28630fbfa4,
+2026-10-04) the model is the RTL simulation's: median error 20.5 %, and
+it UNDER-estimates calls whose weight slabs are bound by their requests
+— one per output channel of `kh·kw·16` elements, 2 words for a 1×1
+kernel, 8 in flight — where the simulation's DDR model answers fast: a
+1×1 kernel on ≤ 256 pixels and > 64 output channels is 2–6× short
+(BERT's per-head P·V: 0.23 ms modelled, 0.61 ms on the board).  The
+scheduler's `cost_model.conv_board_cycles` adds that (12 cycles per
+request, the sweep hiding one word per iteration; median error 18.7 %,
+p90 37 %) for its engine choices; this script and `conv_cycles` stay the
+RTL simulation's model.
+
 ## Rules
 
 - **Re-validate after every kernel change** (`--validate`).  If a case

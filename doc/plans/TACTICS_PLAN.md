@@ -77,7 +77,7 @@ at deploy time.
 | attention order (LLM prefill, ViT) | `llama.py`, `vit.py` | written by hand (e.g. softmax(g), pv(g), qk(g + 2)) |
 | issue / wait | `_compute_event_stream` (`codegen/_core.py`) | one pass over the list: wait for producers still on a lane, wait for the node's own lane if busy, then start (non-blocking) or run a host op (blocking) |
 | MatMul engine | `matmul_lowering.lower_matmuls` | ConvKernel when the model says ≥ 10 % faster (`LOWER_MARGIN`) |
-| conv geometry (kw, out_w) | `matmul_lowering.conv_plans` | cheapest by `cost_model.conv_cycles`; `_MIN_OUT_W` rule |
+| conv geometry (kw, out_w) | `matmul_lowering.conv_plans` | cheapest by `cost_model.conv_cycles` (priced against MatmulKernel by `conv_board_cycles`); `_MIN_OUT_W` rule |
 | row split | `conv_plans` | rule: only when every one-call plan is accumulator-limited |
 | GEMV path | `matmul_gemv.py` | cost model, single-row MatMuls |
 | shared weight layout | `matmul_conv_kw` / `matmul_conv_kws` (`llm_entries.py`) | pinned so prefill buckets and decode share one image |
@@ -421,7 +421,9 @@ The joint kernel width over the prefill buckets and decode (weights: decode
   rule keeps them on ConvKernel because the ConvKernel cost model puts 12
   per-head calls at 2.91 ms): 921.5 → 905.8 ms simulated, on the board p50
   **955.5 → 907.9 / 906.7 ms (−5.0 %)** in two runs, bit-exact, EM / F1 =
-  float (MATMUL_RTL_PLAN, after phase 4).
+  float (MATMUL_RTL_PLAN, after phase 4).  Since the engine choice prices
+  ConvKernel for the board (`cost_model.conv_board_cycles`), the unplanned
+  build takes the P·V move itself (919 ms); `--plan` adds the issue order.
 - **SmolLM2 prefill, SmolVLM vision:** no better order.  The frontends'
   hand-written orders are already locally optimal.
 - **Host-op chunking:** `VitFrontend(attn_split=R)` splits every head's

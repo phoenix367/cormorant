@@ -517,9 +517,22 @@ facts and docs.  What was done:
   F1 = float.  The gain is the P·V move: the RTL MatmulKernel's model is
   right (4.52 ms estimated, 4.45 measured), the ConvKernel cost model is
   not — it puts the 12 per-head calls at 2.91 ms, the board takes 7.35.
-  Open: correct the ConvKernel cost model for small per-head calls (then
-  the unplanned rule picks MatmulKernel by itself), or build the chat
-  server's BERT with `--plan` (`deploy.py --regenerate --plan`).
+- **The ConvKernel cost model, priced for the board** (2026-10-04):
+  `cost_model.conv_board_cycles` adds what the RTL simulation hides — a
+  weight slab is fetched with one request per output channel (2 words for
+  a 1×1 kernel, 8 in flight), ~12 cycles each, and the sweep hides one word
+  per iteration — fitted to the 962 measured ConvKernel calls (median error
+  20.5 → 18.7 %, p90 46 → 37 %; BERT's P·V conv 0.23 → 0.55 ms, board
+  0.61).  The engine choices price ConvKernel with it (`matmul_lowering`,
+  `fc_conv`); the geometries are still ranked by `conv_cycles` — letting
+  the board model pick them too changed the 64-token prefill geometries to
+  unmeasured ones the simulator priced 6–10 % slower.  Simulated over every
+  shipped model, only BERT changes (956.3 → 921.5 ms): on the board its
+  unplanned build runs **p50 919.2 / 919.8 ms** in two runs (from 955.5;
+  `--plan` 907), 50 / 50 bit-exact, EM / F1 = float; the chat server's
+  BERT library was rebuilt from it.  MobileNet v1's classifier was already
+  a MatMul on the RTL kernel; the board model would have moved it on the HLS
+  kernel too (its conv takes 8.8 ms on the board, modelled 1.4).
 - The perf-regression baseline of `1d28630fbfa4` holds the demos as run in
   phase 2b (the HLS engine choices): MobileNet v1 now shows as improved
   until the demos are re-recorded.

@@ -78,14 +78,19 @@ class TestBertBase(unittest.TestCase):
         att = [sn for sn in mms if sn.batch == 12]
         self.assertEqual(len(att), 24)
         self.assertLessEqual(max(sn.k for sn in mms), 3072)
-        # BERT_PLAN 2A: the 72 encoder linears and the 24 attention MatMuls
-        # run on ConvKernel (one call per head for attention); the K = 2
+        # BERT_PLAN 2A: the 72 encoder linears and the 12 attention q·Kᵀ run on
+        # ConvKernel (one call per head); with the RTL MatmulKernel the 12 P·V
+        # run on it (their per-head convs are bound by weight requests on the
+        # board: 0.61 ms each, cost_model.conv_board_cycles; on the HLS kernel's
+        # bitstream all 24 attention MatMuls ran on ConvKernel), and the K = 2
         # token-type MatMul and the M = 2 span head stay on MatmulKernel.
-        self.assertEqual(k[MatmulConvNode], 96)
-        self.assertEqual(sorted((sn.k, sn.m) for sn in mms if isinstance(sn, MatmulNode)),
-                         [(2, 768), (768, 2)])
-        self.assertTrue(all(sn.kw == 1 and sn.calls == 12 for sn in att))
-        self.assertEqual(self.g.matmul_conv_stats["conv_calls"], 72 + 24 * 12)
+        self.assertEqual(k[MatmulConvNode], 84)
+        self.assertEqual(sorted((sn.k, sn.m, sn.batch) for sn in mms if isinstance(sn, MatmulNode)),
+                         [(2, 768, 1)] + [(256, 64, 12)] * 12 + [(768, 2, 1)])
+        conv_att = [sn for sn in att if isinstance(sn, MatmulConvNode)]
+        self.assertEqual(len(conv_att), 12)
+        self.assertTrue(all(sn.kw == 1 and sn.calls == 12 and sn.m == 256 for sn in conv_att))
+        self.assertEqual(self.g.matmul_conv_stats["conv_calls"], 72 + 12 * 12)
 
     def test_generated_c_compiles(self):
         with tempfile.TemporaryDirectory() as td:
