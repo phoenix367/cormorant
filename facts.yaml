@@ -70,6 +70,108 @@ facts:
     - {file: doc/build-and-test/TESTING.md, regex: 'the chat app \((\d+) tests\)'}
     # README.md's table: <!-- fact:chat.test_count -->
 
+# ── RTL fixtures, simulations and kernel benchmarks ──────────────────────────
+- id: fixtures.rtl
+  kind: value
+  title: the checked-in RTL fixtures (hw/test_data manifests) the behaviour tests and TestMatmulRtl run
+  source:
+    parts:
+      vecop: {file: hw/test_data/vecop_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
+      conv: {file: hw/test_data/conv_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
+      matmul: {file: hw/test_data/matmul_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
+      matmul_gemv: {file: hw/test_data/matmul_test_data/manifest.txt,    # gemv_kw column > 0
+                    regex: '^(?:\d+ ){8}([1-9]\d*) ', all: true, transform: 'len(v)'}
+      matmul_tiled: {file: hw/test_data/matmul_test_data/manifest.txt, regex: '^(?:\d+ ){8}(0) ', all: true, transform: 'len(v)'}
+      pool: {file: hw/test_data/pool_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
+  fix: auto
+  mentions:
+    - {file: .claude/skills/conv-verify/SKILL.md, regex: 'the (?P<conv>\d+)-case set runs'}
+    - {file: .claude/skills/conv-verify/SKILL.md, regex: 'for the (?P<conv>\d+) checked-in cases'}
+    - {file: .claude/skills/kernel-verify/SKILL.md,
+       regex: 'matmul_test_data/` \((?P<matmul>\d+) cases, (?P<matmul_gemv>\d+) GEMV\) \| `hw/test_data/vecop_test_data/` \((?P<vecop>\d+) cases\)'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`TestMatmulRtl` runs the (?P<matmul>\d+) checked-in fixtures'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '\[ck\] MatmulKernel: PASS  \((?P<matmul>\d+)/\d+\)'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`VectorOPKernel … total=(?P<vecop>\d+) passed='}
+    - {file: .claude/skills/pool-verify/SKILL.md, regex: '\[ck\] PoolingKernel: PASS  \((?P<pool>\d+)/\d+\)'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'CTest test runs the (?P<matmul>\d+) checked-in fixtures'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md,
+       regex: 'pass \((?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) GEMV\), (?P<pool>\d+) Pool cases\)'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'runs the (?P<matmul>\d+) checked-in MatmulKernel fixtures'}
+    - {file: doc/build-and-test/TESTING.md,
+       regex: 'manifests currently hold (?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) of them GEMV\) and (?P<pool>\d+) Pool'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'VectorOP Test Summary: (?P<vecop>\d+) / \d+ passed'}
+    - {file: doc/kernels/CONV_KERNEL.md, regex: '; (?P<conv>\d+) RTL fixtures\)'}
+    - {file: doc/kernels/POOLING_KERNEL.md, regex: '`make behavior_test_pool`\) runs the same (?P<pool>\d+)'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'matmul behaviour test\s+\((?P<matmul>\d+) / \d+\)'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'TestMatmulRtl: (?P<matmul>\d+) fixtures \+'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md,
+       regex: 'All (?P<matmul>\d+) HLS-oracle fixtures .*?: (?P<matmul_tiled>\d+) tiled plus (?P<matmul_gemv>\d+) GEMV-image cases'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'It passes (?P<matmul>\d+) of \d+ fixtures'}
+    - {file: hw/cormorant_test_stand/README.md, regex: 'kernel=ConvKernel  total=(?P<conv>\d+)'}
+  # dated records (kernel-verify's measured runs, MATMUL_RTL_PLAN, optimisation logs) keep their counts
+
+- id: matmul_rtl.random_cases
+  kind: value
+  title: the random cases TestMatmulRtl runs after the fixtures (MM_RTL_RANDOM_CASES)
+  source: {file: kernels/matmul_rtl/CMakeLists.txt, regex: 'set\(MM_RTL_RANDOM_CASES (\d+) CACHE', type: int}
+  fix: auto
+  mentions:
+    - {file: kernels/matmul_rtl/CMakeLists.txt, regex: 'HLS-oracle fixtures \+ (\d+) random cases'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'checked-in fixtures \+ (\d+) random cases'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'ref_matmul_2d` — plus (\d+) random'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'TestMatmulRtl: \d+ fixtures \+ (\d+) random cases'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'ctest runs them plus (\d+) random cases'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '^  (\d+) random cases \(seed 1\)'}
+
+- id: sim_hw.cases
+  kind: value
+  title: the cases of the whole-design simulation (sim_hw_kv260, hw/cormorant_hw_128 sim_1 testbench)
+  source:
+    parts:
+      vectorop: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/vop_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
+      conv: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/conv_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
+      matmul: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/mm_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
+      pool: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/pk_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
+      total: {cmd: "cat hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/*_classes.svh | grep -c 'tests\\.push_back'",
+              parse: '(\d+)', type: int}
+  fix: auto
+  mentions:
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'Pass: `##  TOTAL: (?P<total>\d+) / \d+ passed`'}
+    - {file: .claude/skills/kernel-verify/SKILL.md,
+       regex: '\(VectorOPKernel (?P<vectorop>\d+), ConvKernel (?P<conv>\d+), MatmulKernel (?P<matmul>\d+), PoolingKernel (?P<pool>\d+)\)'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'block-design testbench, (?P<total>\d+) cases over the four kernels'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'whole-design simulation \((?P<total>\d+) / \d+\)'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'with this IP passes (?P<total>\d+) / \d+ \(Matmul (?P<matmul>\d+) / \d+\)'}
+    - {file: hw/cormorant_hw_128/README.md, regex: '~3 minutes \((?P<total>\d+) constant-fill cases'}
+    # the sample output of TESTING.md §3, hw_128 CLAUDE.md and README.md
+    - {file: doc/build-and-test/TESTING.md, regex: &sim_hw_out '##        VectorOPKernel +(?P<vectorop>\d+) / .*\n##            ConvKernel +(?P<conv>\d+) / .*\n##          MatmulKernel +(?P<matmul>\d+) / .*\n##         PoolingKernel +(?P<pool>\d+) / .*\n.*\n##  TOTAL: (?P<total>\d+) / \d+ passed'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, regex: *sim_hw_out}
+    - {file: hw/cormorant_hw_128/README.md, regex: *sim_hw_out}
+
+- id: perf.case_count
+  kind: value
+  title: the kernel benchmarks of perf_config.json.example (run_remote_perf.py, the perf-regression baseline)
+  source:
+    parts:
+      vectorop: {file: inference-scheduler/perf_config.json.example, json: benchmarks.VectorOPKernel.cases, transform: 'len(v)'}
+      matmul: {file: inference-scheduler/perf_config.json.example, json: benchmarks.MatmulKernel.cases, transform: 'len(v)'}
+      conv: {file: inference-scheduler/perf_config.json.example, json: benchmarks.ConvKernel.cases, transform: 'len(v)'}
+      pool: {file: inference-scheduler/perf_config.json.example, json: benchmarks.PoolingKernel.cases, transform: 'len(v)'}
+      total: {file: inference-scheduler/perf_config.json.example, json: benchmarks,
+              transform: "sum(len(x['cases']) for x in v.values() if isinstance(x, dict))"}
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/CLAUDE.md, regex: '`perf_config\.json\.example` \((?P<total>\d+) cases\)'}
+    - {file: doc/build-and-test/TESTING.md, dotall: true,
+       regex: 'ships with \*\*(?P<total>\d+) benchmark cases\*\*\s+across the four kernels \((?P<vectorop>\d+) VectorOPKernel, (?P<matmul>\d+) MatmulKernel'}
+    - {file: doc/build-and-test/TESTING.md, regex: '§8b — (?P<conv>\d+) ConvKernel, (?P<pool>\d+) PoolingKernel\)'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Performance benchmarks — (?P<total>\d+) cases;'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: 'say whether anything regressed — the (?P<total>\d+) kernel benchmarks'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: 'OVERALL: All (?P<total>\d+) cases passed ──` \('}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: '^compared (?P<total>\d+) cases \(threshold'}
+    - {file: .claude/skills/perf-regression/scripts/compare_perf.py, regex: '--json output \(the (?P<total>\d+) kernel cases\)'}
+  # TESTING.md's and REMOTE_TESTING.md's sample outputs are dated runs
+
 # ── the performance model ────────────────────────────────────────────────────
 - id: perf.bitstream_id
   kind: value
@@ -178,6 +280,7 @@ facts:
     - {file: inference-scheduler/CLAUDE.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '\(`build/(kernels/matmul_rtl/[\w./]+)/`\) and', format: "v.removesuffix('/src')"}
 
 - id: registers.ConvKernel
   kind: interface
@@ -263,14 +366,15 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
-  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495}
+  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 48}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 16bdee5
+    commit: 5ecd78b
     date: 2026-10-04
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
-          with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
-          360M 740.2, SmolVLM 494.8 MiB)"
+          at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
+          360M 740.2, SmolVLM 494.8 MiB); Piper 48.1 MiB (demo/tts/build/piper_project, same session); 5ecd78b changed
+          only a docstring of matmul_gemv.py"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
     - inference-scheduler/src/codegen/_core.py
@@ -279,6 +383,7 @@ facts:
     - inference-scheduler/src/llm_entries.py
     - inference-scheduler/src/llama.py
     - inference-scheduler/src/vit.py
+    - inference-scheduler/src/piper.py
     - inference-scheduler/src/matmul_gemv.py
     - inference-scheduler/src/matmul_lowering.py
   verify:
@@ -286,12 +391,19 @@ facts:
     smollm2_135m: {file: demo/chat/build/llm_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     smollm2_360m: {file: demo/chat/build/llm_project_smollm2_360m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     smolvlm_256m: {file: demo/chat/build/llm_project_smolvlm_256m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+    piper: {file: demo/tts/build/piper_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
   fix: auto
   mentions:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| BERT \| (?P<bert>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-135M \| (?P<smollm2_135m>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-360M \| (?P<smollm2_360m>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolVLM-256M \| (?P<smolvlm_256m>\d+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Piper \| (?P<piper>\d+) MiB'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'MB of CMA \(a (?P<piper>\d+) MiB pool\)'}
+    - {file: demo/tts/README.md, regex: '\*\*Memory:\*\* (?P<piper>\d+) MiB of CMA'}
+    - {file: demo/bert_squad/README.md, regex: 'free CMA \(the pool BO is (?P<bert>\d+) MiB\)'}
+    - {file: .claude/skills/llm-onboard/SKILL.md,
+       regex: 'drop \+ margin \((?P<smollm2_135m>\d+) → \d+, (?P<smollm2_360m>\d+) → \d+, (?P<smolvlm_256m>\d+) → \d+\)'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'Its pool is (?P<smollm2_360m>\d+) MiB'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'The pool buffer is (?P<smollm2_135m>\d+) MiB'}
     - {file: demo/chat/doc/SMOLVLM.md, regex: 'The SmolVLM pool is (?P<smolvlm_256m>\d+) MiB'}
@@ -304,6 +416,47 @@ facts:
        regex: 'Pools served today: BERT (?P<bert>\d+), SmolLM2-135M\s+(?P<smollm2_135m>\d+), SmolLM2-360M (?P<smollm2_360m>\d+), SmolVLM (?P<smolvlm_256m>\d+) MiB'}
     - {file: .claude/skills/llm-onboard/SKILL.md, dotall: true,
        regex: 'Served pools: BERT (?P<bert>\d+), SmolLM2-135M (?P<smollm2_135m>\d+),\s+SmolLM2-360M (?P<smollm2_360m>\d+), SmolVLM (?P<smolvlm_256m>\d+) MiB'}
+
+- id: chat.cma_mb
+  kind: value
+  title: the CMA (MB) each chat backend declares while loaded — its pool plus buffers and a margin;
+    --resident auto evicts until CmaFree covers it
+  source:
+    parts:
+      bert: {file: demo/chat/bert_squad_backend.py, regex: '^    cma_mb = (\d+)\.0 ', type: int}
+      smollm2_135m: {file: demo/chat/kv260_chat_server.py, regex: '"--llm-cma-mb", type=float, default=(\d+)\.0', type: int}
+      smollm2_360m: {file: demo/chat/kv260_chat_server.py, regex: '"--llm-360m-cma-mb", type=float, default=(\d+)\.0', type: int}
+      smolvlm_256m: {file: demo/chat/kv260_chat_server.py, regex: '"--vlm-cma-mb", type=float, default=(\d+)\.0', type: int}
+      piper: {file: demo/chat/kv260_chat_server.py, regex: '"--tts-cma-mb", type=float, default=(\d+)\.0', type: int}
+  fix: auto
+  mentions:
+    - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smollm2_135m>\d+)\), \("dry_multiplier"'}
+    - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smollm2_360m>\d+)\),\n\s+\("tokenizer", "assets/smollm2-360m'}
+    - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smolvlm_256m>\d+)\),\n\s+\("tokenizer", "assets/smolvlm'}
+    - {file: demo/chat/deploy.py, regex: '"/root/piper_weights"\), \("model_id", None\), \("cma_mb", (?P<piper>\d+)\)'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smollm2": \{[^}]*?"cma_mb": (?P<smollm2_135m>\d+)'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smollm2_360m": \{[^}]*?"cma_mb": (?P<smollm2_360m>\d+)'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smolvlm": \{[^}]*?"cma_mb": (?P<smolvlm_256m>\d+)'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"piper": \{[^}]*?"cma_mb": (?P<piper>\d+)'}
+    - {file: demo/chat/kv260_chat_server.py, dotall: true,
+       regex: 'BERT holds ~(?P<bert>\d+) MB, SmolLM2-135M ~(?P<smollm2_135m>\d+) MB, SmolLM2-360M ~(?P<smollm2_360m>\d+) MB, SmolVLM\s+~(?P<smolvlm_256m>\d+) MB, Piper ~(?P<piper>\d+) MB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| BERT \| \d+ MiB \| (?P<bert>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-135M \| \d+ MiB \| (?P<smollm2_135m>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-360M \| \d+ MiB \| (?P<smollm2_360m>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolVLM-256M \| \d+ MiB \| (?P<smolvlm_256m>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Piper \| \d+ MiB \| (?P<piper>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '--llm-cma-mb (?P<smollm2_135m>\d+) '}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '--llm-360m-cma-mb (?P<smollm2_360m>\d+) '}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '`cma_mb` \((?P<smollm2_135m>\d+)\)\.'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '^- `cma_mb`: (?P<smollm2_360m>\d+);'}
+    - {file: demo/chat/doc/SMOLVLM.md, regex: 'the tokenizer and `cma_mb` \((?P<smolvlm_256m>\d+)\)'}
+    - {file: demo/chat/doc/SMOLVLM.md, regex: '\(`cma_mb` (?P<smolvlm_256m>\d+) with the image buffer\)'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'It needs (?P<piper>\d+) MB of CMA'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'and `cma_mb` \((?P<piper>\d+)\)'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'Residency\.\*\*  (?P<piper>\d+) MB of CMA'}
+    - {file: .claude/skills/llm-onboard/SKILL.md,
+       regex: 'drop \+ margin \(\d+ → (?P<smollm2_135m>\d+), \d+ → (?P<smollm2_360m>\d+), \d+ → (?P<smolvlm_256m>\d+)\)'}
+    - {file: .claude/skills/llm-onboard/SKILL.md, regex: 'config block `smolvlm`, `cma_mb` (?P<smolvlm_256m>\d+)\)'}
 
 # ── what the scheduler accepts ───────────────────────────────────────────────
 - id: scheduler.onnx_ops
@@ -380,6 +533,7 @@ facts:
     - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '^Weight tensors exceeding (?P<weights>\d+) elements'}
     - {file: .claude/skills/add-host-op/SKILL.md, regex: 'Above `TABLE_FILE_BYTES` \((?P<table_kib>\d+) KiB\)'}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '`weights/<name>\.dat` when > (?P<table_kib>\d+) KiB'}
+    - {file: inference-scheduler/doc/ARCHITECTURE.md, regex: 'numel > LARGE_WEIGHT_THRESHOLD \((?P<weights>\d+)\)'}
 
 # ── planning ─────────────────────────────────────────────────────────────────
 - id: planning.thresholds
@@ -389,11 +543,14 @@ facts:
     parts:
       min_gain_pct: {py: 'src.matmul_lowering:round(PLAN_MIN_GAIN * 100, 3)', cwd: inference-scheduler}
       max_model_error_pct: {py: 'src.perf_model:round(MAX_MODEL_ERROR * 100, 3)', cwd: inference-scheduler}
+      order_min_gain_pct: {py: 'src.order_search:round(MIN_GAIN * 100, 3)', cwd: inference-scheduler}
   fix: auto
   mentions:
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'at least (?P<min_gain_pct>[\d.]+) % below it \(`PLAN_MIN_GAIN`\)'}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'within (?P<max_model_error_pct>[\d.]+) % \(`MAX_MODEL_ERROR`\)'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'held-out p90 is at most (?P<max_model_error_pct>[\d.]+) %'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'kept only if the simulated total drops by (?P<order_min_gain_pct>[\d.]+) % or more'}
+    - {file: inference-scheduler/doc/SCHEDULER_DAG.md, regex: 'simulated total drops by at least (?P<order_min_gain_pct>[\d.]+) %'}
 
 - id: perf.shipped_models
   kind: value
@@ -415,6 +572,7 @@ facts:
     - {file: inference-scheduler/CLAUDE.md, regex: '`remote_config\.json\.example` \((\d+) models\)'}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Correctness tests — (\d+) models over all four kernels'}
     - {file: doc/build-and-test/TESTING.md, regex: 'lists every on-board test model \((\d+);'}
+    - {file: .claude/skills/board-deploy/SKILL.md, regex: 'remote_config_all_models\.json +# (\d+) models'}
 
 # ── the platform ─────────────────────────────────────────────────────────────
 - id: platform.kv260_excerpt
@@ -498,7 +656,7 @@ facts:
   title: the board results of README "Results on the board", and where they are repeated
   value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 919,
           smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.25, smollm2_360m_tok_s: 3.9,
-          smolvlm_image_s: 3.9, piper_rtf: 0.52}
+          smolvlm_image_s: 3.9, piper_rtf: 0.52, mnist_convnet_ms: 0.260, mnist_lenet_ms: 2.831}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -506,7 +664,8 @@ facts:
           v1 / v2 73.0 / 62.9; BERT p50 919.2 ms after the board-priced engine choice put P·V on
           MatmulKernel), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
           prefill, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
-          llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot)"
+          llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot); MNIST
+          demo results.json (mean 0.2597 / 2.8308 ms per image, 98.92 / 97.35 %)"
     facts: {perf.bitstream_id: 1d28630fbfa4}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
@@ -516,6 +675,10 @@ facts:
     mobilenet_v2_ms: {file: demo/image_classification/build/results.json, json: '',
                       transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'mobilenet_v2')"}
     bert_ms: {file: demo/bert_squad/build/results.json, json: metrics.p50_ms}
+    mnist_convnet_ms: {file: demo/mnist/build/results.json, json: '',
+                       transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'mnist_convnet')"}
+    mnist_lenet_ms: {file: demo/mnist/build/results.json, json: '',
+                     transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'mnist_lenet')"}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
     - {file: README.md, regex: '\*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
@@ -526,6 +689,14 @@ facts:
     - {file: README.md, regex: 'SmolLM2-360M-Instruct \| \*\*(?P<smollm2_360m_tok_s>[\d.]+) tokens/s\*\*'}
     - {file: README.md, regex: '\*\*(?P<smolvlm_image_s>[\d.]+) s\*\* per image for the vision encoder'}
     - {file: README.md, regex: 'real-time factor (?P<piper_rtf>[\d.]+)\)'}
+    - {file: README.md, regex: 'MNIST convnet / LeNet \| (?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image'}
+    - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
+    - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
+    - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
+    - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
+       regex: '`1d28630fbfa4`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `1d28630fbfa4`\): p50 (?P<bert_ms>\d+) ms'}
+    - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
     - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
@@ -670,6 +841,34 @@ facts:
     - {file: demo/chat/doc/DEPLOY.md, regex: 'fetches the model \((\d+) MB\)'}
     - {file: .github/workflows/inference-scheduler-tests.yml, regex: 'bertsquad-12 \((\d+) MB'}
     - {file: inference-scheduler/test/test_bert_base.py, regex: '(?:real |Google Drive, )(\d+) MB'}
+
+- id: bert.engine_split
+  kind: value
+  title: BERT-base's MatMuls on each kernel and its ConvKernel calls (test_bert_base.py asserts them;
+    the RTL MatmulKernel and the board-priced ConvKernel decide it)
+  source:
+    parts:
+      matmuls: {file: inference-scheduler/test/test_bert_base.py,
+                regex: 'k\[MatmulNode\] \+ k\[MatmulConvNode\], k\[ScheduledNode\]\), \((\d+),', type: int}
+      on_conv: {file: inference-scheduler/test/test_bert_base.py, regex: 'assertEqual\(k\[MatmulConvNode\], (\d+)\)', type: int}
+      on_matmul: {file: inference-scheduler/test/test_bert_base.py, dotall: true,
+                  regex: 'k\[ScheduledNode\]\), \((\d+), \d+\).*?assertEqual\(k\[MatmulConvNode\], (\d+)\)',
+                  transform: 'int(v[0]) - int(v[1])'}
+      conv_calls: {file: inference-scheduler/test/test_bert_base.py,
+                   regex: 'matmul_conv_stats\["conv_calls"\], (\d+) \+ (\d+) \* (\d+)\)',
+                   transform: 'int(v[0]) + int(v[1]) * int(v[2])'}
+  fix: auto
+  mentions:
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md,
+       regex: 'bertsquad-12, 386 nodes\): (?P<on_conv>\d+) of the (?P<matmuls>\d+) MatMuls run on ConvKernel'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '^(?P<conv_calls>\d+) ConvKernel calls; the 12 attention P·V'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md,
+       regex: 'CLI defaults — (?P<on_conv>\d+) MatMuls on\s+ConvKernel, (?P<on_matmul>\d+) on MatmulKernel'}
+    - {file: demo/bert_squad/README.md, regex: 'uses\) (?P<on_conv>\d+) of the (?P<matmuls>\d+)\s+MatMuls run on ConvKernel'}
+    - {file: demo/bert_squad/scripts/generate_project.py,
+       regex: 'ConvKernel — (?P<on_conv>\d+) of the (?P<matmuls>\d+) MatMuls, BERT_PLAN 2A — and\s+MatmulKernel for the (?P<on_matmul>\d+) that stay'}
+    - {file: demo/bert_squad/bert_squad_config.json.example, regex: 'ConvKernel runs (?P<on_conv>\d+) of its (?P<matmuls>\d+) MatMuls'}
+  # BERT_PLAN's phase results (96 of 98 in 360 calls, …) are dated
 
 - id: chat.limits
   kind: value

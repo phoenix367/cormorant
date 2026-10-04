@@ -1,7 +1,7 @@
 # facts — the fact registry
 
 Many facts in this repo are stated in more than one place. The scheduler's test count is
-quoted in eleven places. The bitstream id is in ten files. A kernel's registers are in its
+quoted in eleven places. The bitstream id is in twenty files. A kernel's registers are in its
 HLS source, its driver, the scheduler, two benchmarks, the calibration runner
 and the timeline viewer.
 
@@ -42,7 +42,8 @@ On every `git commit`, the shim runs `tools/facts/pre-commit` from the
 checked-out tree, which runs `facts.py changed --staged --quiet`:
 
 - **What it checks.** The facts that involve a staged file: a source,
-  producer, consumer, plugin argument, mention or `watch` glob. When
+  producer, consumer, plugin argument, mention, `depends_on` or `verify`
+  file, or `watch` glob. When
   `facts.yaml` or `tools/facts/` is staged, it checks every fact.
 - **How long it takes.** A commit that touches no fact costs well under a
   second. A staged test file re-collects that suite (1–2 s). A registry
@@ -165,6 +166,9 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | id | kind | what |
 |---|---|---|
 | `scheduler.test_count`, `scheduler.test_modules`, `chat.test_count` | value | the suites' collected counts, quoted in 11, 2 and 8 places |
+| `fixtures.rtl`, `matmul_rtl.random_cases` | value | the checked-in RTL fixtures per kernel (the `hw/test_data` manifests; MatMul split into tiled / GEMV) and `TestMatmulRtl`'s 200 random cases, in the verify skills, BUILD_TARGETS, TESTING, the kernel references and the test stand's README |
+| `sim_hw.cases` | value | the whole-design simulation's cases per kernel (68, from the hw_128 testbench classes) and its sample output in three files |
+| `perf.case_count` | value | the 60 kernel benchmarks of `perf_config.json.example` per kernel, in TESTING, REMOTE_TESTING, the perf-regression skill and `compare_perf.py` |
 | `perf.bitstream_id` | value | the committed performance model's bitstream. `exists`: its cases / calib files and the perf-regression baseline |
 | `perf.model_size` | value | exact calls of the model; host-model signatures and kinds (`fix: report`: dated sentences) |
 | `cli.inference_scheduler` | interface | the CLI flags against `inference-scheduler/CLAUDE.md` § CLI and USER_GUIDE § Options |
@@ -173,23 +177,25 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `vectorop.codes` | interface | the `Op` / `Act` enums against `nodes.py`, the CLAUDE.md table, `run_remote_perf._OP_NAMES` and the timeline `DECODE` |
 | `ctypes.tts`, `ctypes.llm` | interface | the chat server's ctypes bindings against the C headers |
 | `config.chat` | interface | `chat_config.json.example` against the code reading it, with 5 waivers |
-| `chat.pool_mib` | recorded | each chat model's DMA pool (MiB). It is verified against the generated projects in `demo/*/build`, and stale when the layout code changes |
+| `chat.pool_mib` | recorded | each chat model's DMA pool (MiB), Piper's included. It is verified against the generated projects in `demo/*/build`, and stale when the layout code changes |
+| `chat.cma_mb` | value | the CMA each chat backend declares (`cma_mb`: the server's defaults, BERT's backend), in `deploy.py`'s defaults, the example config, DEPLOY's table and the model docs |
 | `scheduler.onnx_ops`, `scheduler.axi_llm_ops` | interface | the ops the scheduler accepts (32 ONNX ops, 32 `axi.llm` ops) against the op lists of USER_GUIDE §2, CLAUDE.md and INFERENCE_SCHEDULER.md (`names_in_docs`) |
 | `scheduler.event_kinds` | interface | the event-stream kinds against the C emitter, the liveness pass, the timed replay and the two docs that list them |
 | `scheduler.file_thresholds` | value | when weights, expected outputs and host tables go to `.dat` files |
-| `planning.thresholds` | value | `--plan`'s minimum gain (3 %) and largest trusted family error (5 %) |
+| `planning.thresholds` | value | `--plan`'s minimum gain (3 %), largest trusted family error (5 %) and the order search's minimum gain (0.5 %) |
 | `perf.shipped_models` | value | how many models `perf_calibrate.py` measures, quoted as a word |
 | `remote_tests.model_count` | value | the on-board correctness suite's models (`remote_config.json.example`) |
 | `platform.kv260_excerpt`, `platform.kv260_clock` | interface, value | PLATFORM_CONFIGURATION.md's copy of `kv260.json`; the 150 MHz HLS target in six docs |
 | `chat.http_routes` | interface | the server's routes against API.md, and against the routes five other docs name |
 | `cli.script_calls` | interface | the flags of five script-to-script calls (`deploy.py` → the server, the BERT generator; `e2e_check.py`; `llm_calibrate.py`; `run_remote_tests.py`) |
 | `tts.max_ids` | value | Piper's encoder buckets; the largest (400) is the server's packing size in two files |
-| `board.results` | recorded | the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 9 files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
+| `board.results` | recorded | the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, MNIST convnet / LeNet, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 14 files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
 | `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json`; also the RTL MatmulKernel's `K_MAX` and the RTL cost model's packed-B tile |
 | `board.pl_clock_mhz` | value, optional | the PL clock (the block design's PL0, 100 MHz) in the README, two docs and the two `MHZ` constants of the performance model |
 | `hw.utilization` | recorded | the bitstream's hw commit (7d8eefe) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
 | `board.uio_labels`, `board.uio_map` | interface | the overlay's UIO names (`dts/kv260/cormorant.dts`) and which kernel uses which, in the six example configs, two doc tables, the README, a skill and the MNIST README |
 | `bert.model_mb` | value | the 435 MB BERT download (`fetch_assets.py`), quoted in 11 files |
+| `bert.engine_split` | value | BERT-base's 98 MatMuls on ConvKernel / MatmulKernel and its ConvKernel calls (what `test_bert_base.py` asserts), in INFERENCE_SCHEDULER, the BERT demo's README, generator and example config |
 | `chat.limits` | value | the 1024-position context and the 4096-character speech input |
 | `piper.chunk` | value | Piper's chunk: 128 frames = 1.49 s of audio, 192 decoder frames |
 | `build.make_targets` | interface, optional | every make target that the README and CLAUDE.md name exists in a configured `build/` (`make help`) |
