@@ -521,12 +521,14 @@ int main(int argc, char** argv) {
     add("perf_gemv_576x1536_kw1", 1, 576, 1536, 0, 1);
     add("perf_gemv_512x1536_kw8", 1, 512, 1536, 0, 8);
     add("perf_gemv_1536x576_kw4", 1, 1536, 576, 0, 4);
+    add("perf_gemv_576x1536_kw4", 1, 576, 1536, 0, 4);       // 9 K blocks: the last is split
     add("perf_gemv4_576x1536_kw1", 4, 576, 1536, 0, 1);
     add("perf_fc_1x4096x512_rm", 1, 4096, 512, 0, 0);
     add("perf_gemm_64x576x576_pk", 64, 576, 576, 1, 0);
     add("perf_gemm_64x576x576_rm", 64, 576, 576, 0, 0);
     add("perf_gemm_128x256x2048_pk", 128, 256, 2048, 1, 0);
     add("perf_gemm_256x64x64_rm", 256, 64, 64, 0, 0);
+    add("perf_gemm_64x144x576_pk", 64, 144, 576, 1, 0);      // 9 K blocks: the last is split
   }
   for (int i = 0; i < n_random; i++) cases.push_back(random_case(crng));
   if (cases.empty()) tb_fatal("nothing to run (use --fixtures, --random, --case or --perf)");

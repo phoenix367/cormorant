@@ -7,6 +7,9 @@
 // 8i..8i+7, never straddling a block) goes to
 //     lane  (i >> (lk + 1)) & 1
 //     word  ((i >> (lk + 2)) << (lk + 1)) | (i & ((2 << lk) - 1)).
+// A split last block (cfg.split, beats from cfg.bsplit on) is shared: beat
+// 2j + h of the block holds planes 8h..8h+7 of tap j, so lane = i & 1; the
+// word formula is unchanged (both lanes keep it at their next local block).
 //
 // Panel handshake: the A buffer is single-buffered, so panel p may only be
 // written after both lanes' x prefetchers have finished reading panel p - 1
@@ -70,7 +73,8 @@ module mm_awr
   always_ff @(posedge clk) begin
     if (fire) begin
       wrow  <= in_row[1:0];
-      wlane <= in_beat[{2'b0, cfg.lk} + 4'd1];
+      wlane <= (cfg.split && {1'b0, in_beat} >= cfg.bsplit) ? in_beat[0]
+                                                            : in_beat[{2'b0, cfg.lk} + 4'd1];
       waddr <= A_AW'(((in_beat >> ({2'b0, cfg.lk} + 4'd2)) << ({2'b0, cfg.lk} + 4'd1)) |
                      (in_beat & ((9'd2 << cfg.lk) - 9'd1)));
       wdata <= in_data;

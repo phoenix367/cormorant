@@ -277,11 +277,19 @@ module mm_core #(
           logic [1:0]  lk;
           logic        pk;
           logic [35:0] lf;
+          logic [8:0]  nb;
+          logic [4:0]  rl;
           kc = (j_k > 32'(K_MAX)) ? 13'(K_MAX) : j_k[12:0];
           lk = (j_kw == 32'd2) ? 2'd1 : (j_kw == 32'd4) ? 2'd2 : (j_kw == 32'd8) ? 2'd3 : 2'd0;
           pk = (j_kw == '0) && (j_bp != '0);
           pl = kc >> lk;
           lf = {4'b0, j_m} << lk;
+          nb = 9'((pl + 13'd15) >> 4);
+          rl = (pl[3:0] == 4'd0) ? 5'd16 : {1'b0, pl[3:0]};
+          cfg.rlast  <= rl;
+          cfg.split  <= nb[0] && (rl > 5'd8);
+          // block nb - 1 starts at beat (nb - 1) * (16 << lk) / 8 of an A row
+          cfg.bsplit <= 10'({1'b0, nb - 9'd1} << ({2'b0, lk} + 4'd1));
           cfg.n      <= j_n;
           cfg.m      <= j_m;
           cfg.batch  <= j_batch;
@@ -289,7 +297,10 @@ module mm_core #(
           cfg.pk     <= pk;
           cfg.lk     <= lk;
           cfg.planes <= pl;
-          cfg.nblk   <= 9'((pl + 13'd15) >> 4);
+          cfg.nblk   <= nb;
+          cfg.blk_l  <= nb - 9'd1;
+          cfg.blk_l2 <= nb - 9'd2;
+          cfg.p24    <= {1'b0, lf, 5'b0} + {2'b0, lf, 4'b0};
           cfg.lfull  <= lf;
           cfg.contig <= !pk && (lf <= 36'(W_EL));
           cfg.mc_max <= pk ? 10'(W_EL)

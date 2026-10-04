@@ -12,18 +12,17 @@ It does 128 MAC/cycle on GEMM (the HLS kernel: 32) and 16 on GEMV (port-bound,
 as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 ([Resources and timing](#resources-and-timing)).
 
-**Status (2026-10-04):** in the repository with its Verilator testbench, the
-C driver and the IP packaging; with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream
-builds (timing met at 100 MHz) and passes the test stand's matmul behaviour
-test (50 / 50) and the whole-design simulation (68 / 68).  On the board it
-is bit-exact everywhere (148 models, every demo and chat / TTS gate) and
-2–7× faster on tiled MatMuls; one GEMV shape (1×576×1536, kw 4: many
-128-column chunks, each waiting for the previous drain) is 9 % slower and
-costs SmolLM2-135M decode 4 %.  The hardware build still uses the HLS kernel
-by default (`AXI_MATMUL_IMPL=hls`).  Next: the board validation, the performance
-models, then the switch and the retirement of the HLS kernel's synthesis
-(its C++ reference `ref_matmul_2d` stays: it writes the fixtures every RTL
-test checks against) — [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
+**Status (2026-10-04):** with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds
+(timing met at 100 MHz) and passes the test stand's matmul behaviour test
+(50 / 50) and the whole-design simulation (68 / 68).  On the board it is
+bit-exact everywhere (148 models, every demo and chat / TTS gate), 2–11×
+faster on tiled and depthwise-shaped MatMuls and at least as fast on GEMV
+(SmolLM2-135M decode 98.0 vs 99.3 ms / token with the HLS kernel) — after
+the K-balance fix of phase 2b.  The hardware build still uses the HLS kernel
+by default (`AXI_MATMUL_IMPL=hls`).  Next: the performance models (phase 3),
+then the switch and the retirement of the HLS kernel's synthesis (its C++
+reference `ref_matmul_2d` stays: it writes the fixtures every RTL test checks
+against) — [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
 
 Contents: [Building and testing](#building-and-testing) ·
 [Software driver](#software-driver) · [Interface contract](#interface-contract) ·
@@ -267,6 +266,18 @@ that hit the same DRAM row and bank arbitrate far better on the Zynq PS DDR
 controller.  The two lanes' partial sums are added by the drain.  All adds
 wrap modulo 2³², so the split is bit-exact.
 
+With an odd number of blocks, one port would stream a whole block more
+than the other: 9 blocks (k = 576 with kw = 4, or k = 144) are 5 : 4, so
+the job takes 5 / 4.5 = 1.11× the balanced time.  The last block is
+therefore **split** when it has more than 8 planes (`cfg.split`): planes
+0–7 stay with lane 0, planes 8– go to lane 1, which takes them after its own
+last block (or alone, when there is only one block).  In an A row the split
+falls on beat boundaries — beat 2j + h of the block holds planes 8h … 8h + 7
+of tap j — so the A writer routes those beats by their parity, and both
+lanes store their half at their next lane-local block, where the x
+prefetcher's K-index formula already looks.  (1×576×1536, kw 4: 62 473 →
+56 324 cycles in Verilator; the packed 64×144×576: 51 078 → 46 472.)
+
 #### Run descriptors
 
 `mm_rungen` turns each step into **runs**.  A run is one contiguous element
@@ -352,11 +363,13 @@ Verilator with ideal memory (`make perf_matmul_rtl`):
 |---|---|---|
 | GEMV 1×576×1536, kw 1 | 15.9 | 2 ports × 8 elements/cycle = 16 |
 | GEMV 1×1536×576, kw 4 / 1×512×1536, kw 8 | 15.8 / 15.4 | 16 |
+| GEMV 1×576×1536, kw 4 (9 K blocks: the last one split) | 15.7 | 16 |
 | GEMV 4×576×1536 (4 A rows share one B pass) | 62.6 | 64 |
 | FC 1×4096×512, row-major | 15.9 | 16 |
 | GEMM 64×576×576, packed / row-major | 123 | 128 |
 | GEMM 128×256×2048, packed | 120 | 128 |
 | GEMM 256×64×64 (A reload per 8 rows dominates) | 98 | 128 |
+| GEMM 64×144×576, packed (9 K blocks: the last one split) | 114 | 128 |
 
 The HLS kernel reaches ≤ 32 MAC/cycle on its tiled path and ≤ 16 on GEMV,
 where it loops over A rows.  Per panel the kernel moves `8·k` A elements and
@@ -377,9 +390,9 @@ xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
 | DSP48E2 | 128 (the MACs only) | 128 |
 | peak MAC/cycle | 128 (GEMM), 16 (GEMV, port-bound) | 32 (tiled), 16 (GEMV) |
 
-Timing is checked at 300 MHz.  Fmax is ≈ 297 MHz: 3 endpoints miss by at
-most 31 ps, all once-per-step address updates in the walker and run
-generator.  The current block design runs at 100 MHz, with 150 MHz planned.  Nearly every per-cycle decision was moved off long paths:
+Timing is checked at 300 MHz and met (WNS +0.002 ns with the K-balance
+change; before it, ≈ 297 MHz with 3 endpoints missing by at most 31 ps, all
+once-per-step address updates in the walker and run generator).  The current block design runs at 100 MHz, with 150 MHz planned.  Nearly every per-cycle decision was moved off long paths:
 
 - **Barrier counter compares:** registered, and computed against each counter's *next* value so they can only open late, never early.
 - **Burst length and credit checks:** registered in both AXI engines.
@@ -397,7 +410,7 @@ generator.  The current block design runs at 100 MHz, with 150 MHz planned.  Nea
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
 - **Full design (`sim_hw_kv260`, `AXI_MATMUL_IMPL=rtl`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
-- **Board (phase 2):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks and the regression above are in [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 2.
+- **Board (phases 2 and 2b):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks show no case slower than the HLS kernel's ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phases 2 and 2b).
 
 ## Source files
 
@@ -428,9 +441,10 @@ changing the RTL.
 **Invariants that are easy to break:**
 
 - **Lane assignment:** K is split in interleaved blocks of 16 planes (block
-  b → lane b % 2), and both read ports load A: port p loads panel rows
-  [4p, 4p + 4).  The A writer's lane / word mapping, the x prefetcher's
-  K-index formula and the run generator must agree.
+  b → lane b % 2; a split last block: planes 0–7 → lane 0, 8– → lane 1), and
+  both read ports load A: port p loads panel rows [4p, 4p + 4).  The A
+  writer's lane / word mapping, the x prefetcher's K-index formula and the
+  run generator must agree.
 - **Handshake counters:** units synchronise only through `awr_cnt`,
   `xpf_cnt`, `cmp_cnt` and `drn_cnt` ([Synchronisation](#synchronisation)).  A
   panel is announced one cycle *after* its last A write lands (a race here
@@ -443,7 +457,7 @@ changing the RTL.
   sustain one pop per cycle (with 2 entries every stream ran at 2/3 rate).
 - **lk shift arithmetic:** widen `lk` before adding (`{2'b0, lk} + 4'd1`); a
   2-bit `lk + 1` overflows at kw = 8.
-- **Timing:** Fmax is ≈ 297 MHz, so keep new logic off long combinational
+- **Timing:** the kernel meets 300 MHz out of context with no margin (WNS +0.002 ns), so keep new logic off long combinational
   handshake paths; register decisions against a counter's *next* value (see
   `mm_awr`, `mm_xpf`, `mm_lane` and the AXI engines).
 
@@ -462,5 +476,5 @@ tree in the MAC path, and a column's kw taps are reduced once in the drain.
 
 - **k > 4096:** out of contract. k is clamped internally, so the job completes but C is undefined.
 - **Serial A load per panel:** A is single-buffered and shares the port with B. Small-k GEMMs (e.g. 256×64×64) spend ~20 % of their time reloading A. A second A bank would not help while A and B share a port; widening the effective A load (both ports per row) would.
-- **Drain between column chunks:** a step's lanes wait until the drain has read the previous step's accumulators.  It shows when a row splits into many chunks — GEMV with kw > 1 and a wide B (kw 4: 128 columns per chunk; 1×576×1536 is 9 % slower on the board than the HLS kernel, phase 2).  Double-buffered accumulators, or a deeper one-row accumulator, would overlap the two.
+- **K balance:** the lanes split K by blocks of 16 planes and halves of the last one, so they differ by at most 8 planes plus a partial block (an even number of blocks whose last one is short: up to 15 planes, e.g. k = 24 → 16 : 8).  Small-k jobs are therefore not perfectly balanced.
 - **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; 150 MHz is the plan).

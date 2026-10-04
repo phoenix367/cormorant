@@ -1,15 +1,17 @@
 # MatmulKernel in SystemVerilog: integration plan
 
-**Status (2026-10-04):** phases 0 and 1 done — the RTL kernel, its
+**Status (2026-10-04):** phases 0, 1, 2 and 2b done — the RTL kernel, its
 Verilator testbench, the C driver and the IP packaging are in
 `kernels/matmul_rtl/` and build from a fresh clone; with
-`AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (`8b9aee0f54b3`, timing met
-at 100 MHz, 8.6 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer) and passes the
-matmul behaviour test (50 / 50) and the whole-design simulation (68 / 68).
-Phase 2 (board): everything bit-exact — registers, the 148 models, targeted
-C writes, every demo and chat / TTS gate; tiled MatMuls 2–7× faster, but
-one GEMV shape (1×576×1536, kw 4) 9 % slower, which costs SmolLM2-135M
-decode 4 %.  The default is still `hls`; the GEMV fix, phases 3–4
+`AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (now `1d28630fbfa4`,
+timing met at 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than
+with the HLS kernel) and passes the matmul behaviour test (50 / 50) and the
+whole-design simulation (68 / 68).  On the board everything is bit-exact
+(registers, the 148 models, targeted C writes, every demo and chat / TTS
+gate) and no benchmark or workload is slower than with the HLS kernel:
+tiled MatMuls 2–8× faster, depthwise-shaped ones 11×, GEMV equal or faster
+(SmolLM2-135M decode 98.0 vs 99.3 ms / token) after phase 2b balanced K
+between the two lanes.  The default is still `hls`; phases 3–4
 (performance models, switch) are open.
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
@@ -164,7 +166,14 @@ Risks carried into the phases:
   `AXI_MATMUL_IMPL=hls`).
 - After the runs the submodules' tracked project files (`.bd`, `.xci`,
   `.xpr`) were restored; the committed block designs still describe the HLS
-  configuration, and every build re-derives the RTL one.
+  configuration, and every build re-derives the RTL one.  **Restoring them
+  alone was a mistake** (found in phase 2b): Vivado's untracked outputs
+  (`*.gen`, `*.ip_user_files`, `*.cache`) still described the RTL build, and
+  the next build found the PS and the interconnect's internal IPs locked and
+  could not generate the block design.  Either leave the tracked files as
+  the build left them (the documented convention: do not commit them), or
+  restore them AND move those three directories aside, which gives the state
+  of a clean checkout that `build.tcl` regenerates from.
 
 ### Phase 2: on the board — correct everywhere; one GEMV shape slower (2026-10-04)
 
@@ -222,24 +231,94 @@ perf-regression baseline; VectorOP, Conv and Pool within ±1.7 %):
 | LeNet | 2.810 ms | 2.804 ms |
 | Piper RTF (6.9 s utterance) | 0.52 | 0.523 |
 
-- **The regression:** the GEMV image path with a wide B row.  With kw = 4
-  the RTL splits a row into chunks of 512 >> 2 = 128 columns (12 for
-  m = 1536), and each chunk's lanes wait for the previous chunk's drain
-  (`drn_cnt`) before streaming B; 1×1536×576 has 4.5 chunks and does not
-  slow down.  It is exactly SmolLM2-135M's gate / up projection in decode
-  (60 calls per token × 0.053 ms ≈ 3.2 of the 4.3 ms).  The fix is in the
-  RTL: overlap the drain with the next chunk (double-buffered accumulators,
-  or a deeper accumulator for one-row GEMV so a chunk covers more columns).
+- **The regression:** first put down to the drain between column chunks;
+  phase 2b found the real cause — K-block imbalance.  K = 576 with kw = 4 is
+  144 planes = 9 blocks of 16, so read port 0 streamed 5 blocks and port 1
+  4: the job takes 5 / 4.5 = 1.11× the balanced time (Verilator with ideal
+  memory reproduced it: 62 467 cycles, the board 63 k).  1×1536×576 (24
+  blocks) and every kw = 1 shape of the benchmarks (even block counts) were
+  unaffected.  It is exactly SmolLM2-135M's k = 576 projections in decode.
 - **No end-to-end gain yet:** today's scheduler, calibrated on the HLS
   kernel, sends almost every multi-row MatMul to ConvKernel; the 2–7× of the
   RTL kernel reaches the models only after phase 3 re-prices MatmulKernel.
-- **Done criterion not met** ("no case regresses"): the HLS kernel's
-  synthesis is not retired yet.  The RTL fix above comes first (a phase 2b:
-  RTL change, Verilator + sysim, bitstream, the GEMV cases and the 135M
-  decode A/B on the board), or the 4 % decode loss is accepted against the
-  phase 3 gains.
+- **Done criterion not met** ("no case regresses") — fixed in phase 2b.
 - Outputs: `/mnt/data/bitstreams/kv260_rtl_8b9aee0f54b3/` (`perf_rtl.json`,
   `perf_rtl.log`); logs of every run in `/mnt/data/tmp/p2_*.log`.
+
+### Phase 2b: K balance between the lanes — fixed (2026-10-04)
+
+**Cause.**  K is split between the two lanes / read ports in blocks of 16
+planes, block b to lane b % 2.  With an odd number of blocks one port
+streams a whole block more: 9 blocks (k = 576 with kw = 4, k = 144, …) are
+5 : 4, so the job takes 5 / 4.5 = 1.11× the balanced time.  Verilator with
+ideal memory showed it (1×576×1536 kw 4: 62 467 cycles, 14.2 MAC/cycle,
+against 15.8 for 1×1536×576), so it was the RTL, not DDR.
+
+**Fix** (`mm_pkg`, `mm_core`, `mm_awr`, `mm_rungen`; `cfg.split`): with an
+odd number of blocks whose last one has more than 8 planes, that block is
+split — planes 0–7 to lane 0, planes 8– to lane 1, after its own last block
+(or alone when there is one block).  In an A row the halves are whole beats
+(beat 2j + h of the block = planes 8h … 8h + 7 of tap j), so the A writer
+routes them by beat parity; both lanes store their half at their next
+lane-local block, where the x prefetcher's K-index formula already reads.
+The run generator's three layouts (packed 16×32 tiles, contiguous image,
+per-plane image) emit the halves with the right address, lane-local plane,
+rows, element count and accumulator-init flag.  The block constants
+(nblk − 1, nblk − 2, the 24-plane byte offset) are computed once per job in
+the config, which keeps Fmax: the first version missed 300 MHz by 0.26 ns
+(278.5 MHz, a subtract-compare-add chain into lane 1's address adder); the
+final one meets it (WNS +0.002 ns, 18 395 LUT, 9 482 FF, 38 BRAM).
+
+| check | result |
+|---|---|
+| Verilator: fixtures / random (seeds 11, 2026 rand timing; 4711 slow) / directed split cases (nblk = 1, partial and full last blocks, every layout, batches) | 50 / 50, 1 800 / 1 800, 40 / 40 |
+| Verilator cycles, before → after | 1×576×1536 kw 4: 62 473 → 56 324 (15.7 MAC/cycle); packed 64×144×576: 51 078 → 46 472; other shapes unchanged |
+| `sysim_matmul_rtl` | 50 / 50 (`sysim.tcl` now upgrades every locked IP, as the test stand does — the SmartConnect of the copied project was locked) |
+| `behavior_test_matmul`, `sim_hw_kv260` | 50 / 50, 68 / 68 |
+| bitstream `1d28630fbfa4` | timing met at 100 MHz (WNS +0.987 ns); 84 603 LUT, 79 544 FF, 109.5 BRAM36, 48 URAM, 1 058 DSP |
+
+**Board** (`1d28630fbfa4`; the chat server stopped, the deployed bitstream
+and the server restored afterwards; gates in the scratch directory again):
+
+| check | result |
+|---|---|
+| registers (write / read back) | 19 / 19 |
+| `run_remote_tests` (148 models, generated driver), targeted C writes | 148 / 148, 8 / 8 |
+| image classification, MNIST, BERT | identical to the HLS run (top-5 logits; accuracies; BERT 50 / 50 bit-exact, EM / F1 = float) |
+| SmolLM2-135M, SmolVLM, Piper gates | bit-exact (135M decode checksums identical to the HLS A/B) |
+| SmolLM2-360M gate | logits 4 × 33 / 33 bit-exact; decode checksums identical on both bitstreams (A/B below) |
+| kernel benchmarks vs the HLS baseline | 0 regressions, 21 improved (a first run flagged VectorOP ADD-4K +1.1 µs; the re-run: +0.3 µs, jitter) |
+
+| | HLS | RTL before | RTL fixed |
+|---|---:|---:|---:|
+| GEMV 1×576×1536, kw 4 | 0.577 ms | 0.631 ms | **0.569 ms** |
+| depthwise-as-MatMul 12544×16×1 / ×3 (k = 16: one split block) | 6.94 / 20.8 ms | 0.99 / 2.97 ms | **0.62 / 1.84 ms** |
+| SmolLM2-135M decode at 32 / 256 / 1000 | 99.3 / 106.4 / 128.6 ms | 103.6 / 110.5 / 134.6 ms | **98.0 / 104.4 / 127.1 ms** |
+| SmolLM2-135M prefill 16 / 64 / 256 | 341 / 442 / 1294 ms | 340 / 442 / 1291 ms | 340 / 444 / 1285 ms |
+| SmolLM2-360M decode at 32 / 256 / 1000 (A/B, each the first open after a reboot) | 250.4 / 265.6 / 316.3 ms | — | **248.4 / 263.2 / 313.9 ms** |
+| SmolLM2-360M prefill 16 / 64 / 256 (the same A/B) | 839 / 1035 / 3087 ms | — | 839 / 1041 / 3092 ms |
+| SmolVLM `llm_image` | 3.885 s | 3.92–3.94 s | 3.94–3.95 s |
+| BERT p50 | 962.3 ms | 964.9 ms | 963.3 ms |
+| Piper RTF (6.9 s utterance) | 0.52 | 0.523 | 0.519 |
+
+(Phase 2's 360M row compared the pre-fix RTL with the §20 record of an
+older build: 256 / 270 / 306 ms decode, 0.83 / 1.00 / 2.90 s prefill.  The
+same-condition A/B above replaces it; today's project prefills 6 % slower
+than that record on both bitstreams.)
+
+**A board observation, not the kernel:** after a day of board jobs the
+360M library's 776 MB pool (one contiguous CMA buffer) could not be
+allocated although CmaFree was 1010 MB and zocl held no buffer — on the
+HLS bitstream too.  After a reboot the first open in a process succeeded,
+the following ones failed again: the CMA region fragments (14–24 MB of it
+stays in use by other drivers).  The chat server allocates its pools at
+start, so it was restarted after a reboot; whether its model swaps
+(`--resident auto`) can hit the same limit was not tested.
+
+**Phase 2's criterion is met**: bit-exact everywhere, no benchmark or
+workload slower than with the HLS kernel.  Outputs:
+`/mnt/data/bitstreams/kv260_rtl_1d28630fbfa4/` (bitstream, reports, build
+log, `perf_rtl2*.json`); logs in `/mnt/data/tmp/p2b_*.log`.
 
 ### Phase 3: performance models and scheduling
 

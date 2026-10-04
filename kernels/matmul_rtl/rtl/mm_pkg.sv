@@ -26,7 +26,10 @@ package mm_pkg;
   localparam int A_AW    = 8;
 
   // K is split between the two lanes in interleaved blocks of 2^BLK_LG
-  // planes (block b goes to lane b % 2).
+  // planes (block b goes to lane b % 2).  With an odd number of blocks the
+  // last one is split when it has more than 8 planes: planes 0..7 stay with
+  // lane 0, planes 8.. go to lane 1 (cfg_t.split), so neither port streams a
+  // whole block more than the other.
   localparam int BLK_LG  = 4;
 
   // Minimum distance (cycles) between two MACs into the same accumulator:
@@ -98,8 +101,14 @@ package mm_pkg;
     logic [1:0]  lk;          // log2 of the GEMV kernel width (0 = row-major)
     logic [12:0] planes;      // k >> lk
     logic [8:0]  nblk;        // ceil(planes / 16)
+    logic [8:0]  blk_l;       // nblk - 1: the last block
+    logic [8:0]  blk_l2;      // nblk - 2
+    logic [4:0]  rlast;       // planes of the last block (1..16)
+    logic        split;       // nblk odd and rlast > 8: the last block is split
+    logic [9:0]  bsplit;      // A beat (within a row) where the split block starts
     logic        contig;      // image mode, one chunk: planes are contiguous
     logic [35:0] lfull;       // elements per plane (m << lk)
+    logic [41:0] p24;         // bytes of 24 planes (48 * lfull): block to plane 8 of the next
     logic [9:0]  mc_max;      // columns per chunk
   } cfg_t;
 

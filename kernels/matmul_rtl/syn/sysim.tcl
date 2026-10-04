@@ -26,7 +26,11 @@ open_bd_design $bd_file
 set mm [get_bd_cells -hierarchical -filter {VLNV =~ "xilinx.com:hls:MatmulKernel:*"}]
 puts "\[sysim\] MatmulKernel cell: $mm"
 report_ip_status
-upgrade_ip [get_ips -filter {IPDEF =~ "xilinx.com:hls:MatmulKernel:*"}]
+# every locked IP, as the test stand's own flow does (ts_prepare_bd): the
+# MatmulKernel is locked by the new IP, others by a project saved elsewhere
+upgrade_ip [get_ips -quiet -filter {IS_LOCKED == 1}]
+set still [get_ips -quiet -filter {IS_LOCKED == 1}]
+if {[llength $still] > 0} { error "sysim: IPs still locked after upgrade_ip: $still" }
 # the upgrade invalidates cell handles: look the cell up again
 set mm [get_bd_cells -hierarchical -filter {VLNV =~ "xilinx.com:hls:MatmulKernel:*"}]
 foreach p {C_M_AXI_GMEM0_DATA_WIDTH C_M_AXI_GMEM1_DATA_WIDTH C_M_AXI_GMEM2_DATA_WIDTH} {

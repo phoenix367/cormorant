@@ -11,7 +11,10 @@
 //       packed B        one run per (tile of 32 columns, block): 16 rows x 32
 //       image, 1 chunk  one run per block: 16 planes x (m << lk) elements
 //       image, chunked  one run per plane: 1 row of (mcc << lk) elements
-//     or one B marker when the lane has no K blocks.
+//     or one B marker when the lane has no K blocks.  A split last block
+//     (cfg.split: an odd number of blocks, the last with more than 8 planes)
+//     gives planes [0, 8) to lane 0 and [8, rlast) to lane 1, which takes it
+//     after its own last block; its runs start 8 planes into the block.
 //
 // Every run goes to the gearbox queue; data runs also to the read engine,
 // B runs and markers also to the x prefetcher.
@@ -53,14 +56,27 @@ module mm_rungen
   logic [4:0]  j;            // plane within the block (chunked image mode)
   logic [4:0]  t, tiles_n;   // tile within the chunk (packed mode)
   logic [63:0] addr_run, addr_tile, addr_blk, pk_base, base_q;
+  logic [63:0] planes24;     // bytes of 24 planes: from a block to plane 8 of the next
+  assign planes24 = {22'b0, cfg.p24};
 
-  // Planes of the current block.
+  // Planes of the current block; this lane's share of it is [r_lo, r_hi).
   logic [12:0] blk_left;
-  logic [4:0]  blk_rows;
-  logic        last_blk;
+  logic [4:0]  blk_rows, r_lo, r_hi, l_rows;
+  logic [8:0]  blk_first;
+  logic        last_blk, in_split, to_half, half_start;
   assign blk_left = cfg.planes - {blk, 4'b0};
   assign blk_rows = (blk_left >= 13'd16) ? 5'd16 : blk_left[4:0];
-  assign last_blk = ({1'b0, blk} + 10'd2 >= {1'b0, cfg.nblk});
+  assign in_split = cfg.split && (blk == cfg.blk_l);
+  assign r_lo     = (P == 1 && in_split) ? 5'd8 : 5'd0;
+  assign r_hi     = (P == 0 && in_split) ? 5'd8 : blk_rows;
+  assign l_rows   = r_hi - r_lo;
+  // Lane 1 ends with the split block's upper half (taken after its block
+  // nblk - 2, or alone when nblk == 1); lane 0 ends with block nblk - 1.
+  assign last_blk = (P == 1 && cfg.split) ? (blk == cfg.blk_l)
+                                          : ({1'b0, blk} + 10'd2 >= {1'b0, cfg.nblk});
+  assign to_half    = (P == 1) && cfg.split && (blk == cfg.blk_l2);
+  assign half_start = (P == 1) && cfg.split && (cfg.nblk == 9'd1);
+  assign blk_first  = half_start ? 9'd0 : 9'(P);
 
   // A run geometry of this port.
   localparam logic [3:0] R0 = 4'(P * RH);
@@ -92,10 +108,10 @@ module mm_rungen
     c_marker = 1'b0;
     c_addr   = addr_run;
     c_len    = 13'd32;
-    c_rows   = blk_rows;
+    c_rows   = l_rows;
     c_wb     = 6'd0;
-    c_cl0    = {blk[7:1], 4'b0};
-    c_init   = (blk == 9'(P));
+    c_cl0    = {blk[7:1], 4'b0} + {6'b0, r_lo};
+    c_init   = (blk == blk_first);
     c_bdone  = last_blk;
     case (state)
       S_A: begin
@@ -125,8 +141,8 @@ module mm_rungen
           c_len   = 13'({st.mcc, 3'b0} >> (2'd3 - cfg.lk));   // mcc << lk
           c_rows  = 5'd1;
           c_cl0   = {blk[7:1], 4'b0} + {6'b0, j};
-          c_init  = (blk == 9'(P)) && (j == 5'd0);
-          c_bdone = last_blk && (j + 5'd1 == blk_rows);
+          c_init  = (blk == blk_first) && (j == r_lo);
+          c_bdone = last_blk && (j + 5'd1 == r_hi);
         end
       end
       default: ;
@@ -136,7 +152,8 @@ module mm_rungen
   end
 
   // Elements of the run, without a general multiplier: A runs have <= 4
-  // rows, B runs 16 rows except the last block (elems_last, set in S_BINIT).
+  // rows, B runs 16 rows except in the last block (elems_last: this lane's
+  // rows of it, set in S_BINIT).
   logic [17:0] elems_last;
   logic [17:0] c_elems;
   always_comb begin
@@ -144,9 +161,9 @@ module mm_rungen
       S_A:  c_elems = ({3'b0, cfg.k, 2'b0} & {18{a_rows[2]}}) +
                       ({4'b0, cfg.k, 1'b0} & {18{a_rows[1]}}) +
                       ({5'b0, cfg.k}       & {18{a_rows[0]}});
-      S_B:  if (cfg.pk)          c_elems = {8'b0, blk_rows, 5'b0};
-            else if (cfg.contig) c_elems = (blk_rows == 5'd16) ? {1'b0, cfg.lfull[12:0], 4'b0}
-                                                               : elems_last;
+      S_B:  if (cfg.pk)          c_elems = {8'b0, l_rows, 5'b0};
+            else if (cfg.contig) c_elems = (blk == cfg.blk_l) ? elems_last
+                                                          : {1'b0, cfg.lfull[12:0], 4'b0};
             else                 c_elems = {5'b0, c_len};
       default: c_elems = '0;
     endcase
@@ -238,11 +255,13 @@ module mm_rungen
         end
         S_A: if (emit) state <= S_BINIT;
         S_BINIT: begin
-          blk     <= 9'(P);
-          j       <= '0;
+          logic [4:0] rows_l;   // this lane's planes of the last block
+          rows_l = !cfg.split ? cfg.rlast : (P == 0) ? 5'd8 : cfg.rlast - 5'd8;
+          blk     <= blk_first;
+          j       <= half_start ? 5'd8 : 5'd0;
           t       <= '0;
           tiles_n <= 5'((11'(st.mcc) + 11'd31) >> 5);
-          elems_last <= 18'(cfg.planes[3:0]) * 18'(cfg.lfull[9:0]);
+          elems_last <= 18'(rows_l) * 18'(cfg.lfull[9:0]);
           // Base of the chunk in B.  Packed: chunk c0 starts at tile c0 / 32
           // = 16 * chunk index, 16 tiles of 32 x k elements per chunk.  Image:
           // column c0 of plane 0 (c0 == 0 for a single chunk).
@@ -251,36 +270,44 @@ module mm_rungen
           state <= S_BINIT2;
         end
         S_BINIT2: begin
-          // plus this lane's first K block: block P (16 rows of 32 or 16 planes)
+          // plus this lane's first K block: block P (16 rows of 32 or 16
+          // planes), or for lane 1 alone in a split block 0 its plane 8
           logic [63:0] first;
-          first = base_q + (cfg.pk ? 64'(P * 1024)
-                                   : ((P != 0) ? {23'b0, cfg.lfull, 5'b0} : 64'd0));
+          if (P == 0)          first = base_q;
+          else if (half_start) first = base_q + (cfg.pk ? 64'd512 : {24'b0, cfg.lfull, 4'b0});
+          else                 first = base_q + (cfg.pk ? 64'd1024 : {23'b0, cfg.lfull, 5'b0});
           if (cfg.pk) pk_base <= base_q;
           addr_tile <= first;
           addr_blk  <= first;
           addr_run  <= first;
-          state     <= (cfg.nblk <= 9'(P)) ? S_BM : S_B;
+          state     <= (cfg.nblk <= 9'(P) && !half_start) ? S_BM : S_B;
         end
         S_BM: if (emit) state <= S_IDLE;
         S_B: if (emit) begin
           if (c_bdone) state <= S_IDLE;
           if (cfg.pk) begin
             if (!last_blk) begin
-              blk      <= blk + 9'd2;
-              addr_run <= addr_run + 64'd2048;          // two blocks of 16 x 32
+              blk      <= to_half ? cfg.blk_l : blk + 9'd2;
+              // two blocks of 16 x 32, or one and a half into the split block
+              addr_run <= addr_run + (to_half ? 64'd1536 : 64'd2048);
             end else begin
-              blk       <= 9'(P);
+              blk       <= blk_first;
               t         <= t + 5'd1;
               addr_tile <= addr_tile + ({51'b0, cfg.k} << 6);   // next tile: 32 x k elements
               addr_run  <= addr_tile + ({51'b0, cfg.k} << 6);
             end
           end else if (cfg.contig) begin
-            blk      <= blk + 9'd2;
-            addr_run <= addr_run + {22'b0, cfg.lfull, 6'b0};   // 32 planes
+            blk      <= to_half ? cfg.blk_l : blk + 9'd2;
+            addr_run <= addr_run + (to_half ? planes24 : {22'b0, cfg.lfull, 6'b0});   // 24 / 32 planes
           end else begin
-            if (j + 5'd1 != blk_rows) begin
+            if (j + 5'd1 != r_hi) begin
               j        <= j + 5'd1;
               addr_run <= addr_run + {27'b0, cfg.lfull, 1'b0};
+            end else if (to_half) begin
+              j        <= 5'd8;
+              blk      <= cfg.blk_l;
+              addr_blk <= addr_blk + planes24;
+              addr_run <= addr_blk + planes24;
             end else begin
               j        <= '0;
               blk      <= blk + 9'd2;
