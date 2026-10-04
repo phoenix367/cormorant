@@ -626,6 +626,10 @@ class MatmulNode:
     # (conv_lowered_b_image; kw = 1 is row-major B), so a weight ConvKernel
     # also reads needs one buffer.  Never together with b_packed.
     gemv_kw:        int = 0
+    # The planner's MatmulKernel layout for this node (--plan, matmul_lowering
+    # ._plan_matmul): 0 = the tiled path, kw = the image path at kw; None =
+    # choose_gemv decides.  Read by choose_gemv only.
+    plan_kw:        Optional[int] = None
 
     # Compatibility shims for _compute_alloc_sizes / _broadcast_io_map.
     # These are always derived constants — never set by callers.

@@ -97,7 +97,9 @@ def gemv_shape_reason(sn, kw: int = 1) -> Optional[str]:
 
 
 def _plan_gemv(sn, kw: int, baseline: bool, perf_model, plan_log) -> bool:
-    """Planned GEMV (True) or tiled (False) for a single-row MatMul."""
+    """Planned GEMV (True) or tiled (False) for a MatMul the ConvKernel
+    lowering's planner did not price (one row; on the RTL kernel also the
+    MatMuls too small for ConvKernel)."""
     from .matmul_lowering import PLAN_MIN_GAIN, plan_tiled_calls
     from .perf_calls import KernelCall
     from .perf_model import clearly_faster
@@ -130,6 +132,39 @@ def _plan_gemv(sn, kw: int, baseline: bool, perf_model, plan_log) -> bool:
     return chosen
 
 
+def image_choice(sn, users: list, io, kw_hint: Dict[str, int], mode: str,
+                 is_ap_fixed_16_8: bool = True) -> Optional[tuple]:
+    """The unplanned rules for MatmulNode ``sn`` (``users``: every node
+    reading its B): ``(kw, relayout, use, tiled_cycles, gemv_cycles)`` — the
+    image it would read (``relayout``: a constant B re-imaged for it) and
+    whether it takes the path (``use``); None when no image fits.  Shared by
+    :func:`choose_gemv` and the planner's baseline (matmul_lowering)."""
+    b = sn.inputs[1]
+    relayout = False
+    if b.packed_data is not None:
+        # Re-imaged by this graph's ConvKernel lowering: read that image.
+        kws = {u.kw for u in users if isinstance(u, MatmulConvNode) and u.inputs[1] is b}
+        if len(kws) != 1:
+            return None
+        kw = kws.pop()
+    else:
+        kw = kw_hint.get(b.onnx_name, 1)
+        relayout = kw > 1
+        if relayout and not (b.data is not None and b.onnx_name not in io
+                             and len(users) == 1):
+            kw, relayout = 1, False
+    if ineligible_reason(sn, kw, is_ap_fixed_16_8) is not None:
+        if not relayout or ineligible_reason(sn, 1, is_ap_fixed_16_8) is not None:
+            return None
+        kw, relayout = 1, False          # the hint's image does not fit: plain B
+    tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
+    gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
+    # the RTL kernel reads a shared weight in its image whatever n is:
+    # the tiled path would need the packed layout as a second copy
+    shared = cost_model.MATMUL_IMPL == "rtl" and b.onnx_name in kw_hint
+    return kw, relayout, mode != "auto" or gemv < tiled or shared, tiled, gemv
+
+
 def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = True,
                 graph_io: Sequence[str] = (),
                 kw_hint: Optional[Dict[str, int]] = None,
@@ -143,7 +178,10 @@ def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = Tru
     and the GEMV path is priced with the performance model instead of the
     cost model (the other rules unchanged: the image a B is read in); a
     choice changes only when priced PLAN_MIN_GAIN below the cost model's,
-    and when either path cannot be priced the cost model decides."""
+    and when either path cannot be priced the cost model decides.  A node
+    the ConvKernel lowering's planner already placed on MatmulKernel
+    (``MatmulNode.plan_kw``: 0 = tiled, kw = the image at kw) takes that
+    layout as is."""
     mode = normalize_mode(mode)
     kw_hint = kw_hint or {}
     stats = {"gemv": 0, "kw>1": 0, "tiled_cycles": 0.0, "gemv_cycles": 0.0}
@@ -158,36 +196,25 @@ def choose_gemv(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = Tru
         if type(sn) is not MatmulNode:
             continue
         b = sn.inputs[1]
-        users = readers.get(b.onnx_name, [])
-        relayout = False
-        if b.packed_data is not None:
-            # Re-imaged by this graph's ConvKernel lowering: read that image.
-            kws = {u.kw for u in users if isinstance(u, MatmulConvNode) and u.inputs[1] is b}
-            if len(kws) != 1:
-                continue
-            kw = kws.pop()
+        if sn.plan_kw is not None:
+            if sn.plan_kw == 0 or ineligible_reason(sn, sn.plan_kw, is_ap_fixed_16_8) is not None:
+                continue                     # planned: the tiled path
+            kw = sn.plan_kw
+            relayout = kw > 1 and b.packed_data is None
+            tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
+            gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
         else:
-            kw = kw_hint.get(b.onnx_name, 1)
-            relayout = kw > 1
-            if relayout and not (b.data is not None and b.onnx_name not in io
-                                 and len(users) == 1):
-                kw, relayout = 1, False
-        if ineligible_reason(sn, kw, is_ap_fixed_16_8) is not None:
-            if not relayout or ineligible_reason(sn, 1, is_ap_fixed_16_8) is not None:
+            ch = image_choice(sn, readers.get(b.onnx_name, []), io, kw_hint, mode,
+                              is_ap_fixed_16_8)
+            if ch is None:
                 continue
-            kw, relayout = 1, False          # the hint's image does not fit: plain B
-        tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
-        gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
-        # the RTL kernel reads a shared weight in its image whatever n is:
-        # the tiled path would need the packed layout as a second copy
-        shared = cost_model.MATMUL_IMPL == "rtl" and b.onnx_name in kw_hint
-        use = mode != "auto" or gemv < tiled or shared
-        if perf_model is not None and mode == "auto" and b.onnx_name not in kw_hint:
-            # (a weight in a shared image keeps the unplanned choice: switching
-            # it would need a second copy in another layout)
-            use = _plan_gemv(sn, kw, use, perf_model, plan_log)
-        if not use:
-            continue
+            kw, relayout, use, tiled, gemv = ch
+            if perf_model is not None and mode == "auto" and b.onnx_name not in kw_hint:
+                # (a weight in a shared image keeps the unplanned choice: switching
+                # it would need a second copy in another layout)
+                use = _plan_gemv(sn, kw, use, perf_model, plan_log)
+            if not use:
+                continue
         if relayout:
             b.packed_data = conv_lowered_b_image(b.data, sn.k, sn.m, kw)
             b.packed_note = (f"MatmulKernel GEMV / ConvKernel x image, kw={kw}:"
@@ -208,5 +235,6 @@ __all__ = (
     "GEMV_KWS",
     "normalize_mode",
     "ineligible_reason",
+    "image_choice",
     "choose_gemv",
 )

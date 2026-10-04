@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1637 tests); the chat app (188 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1643 tests); the chat app (188 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1637 tests in 75 modules (all pass, none skipped; the first run
+# Run all 1643 tests in 75 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 

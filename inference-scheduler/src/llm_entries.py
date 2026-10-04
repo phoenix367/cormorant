@@ -100,16 +100,22 @@ def plan_shared_kw(models: Dict[str, onnx.ModelProto], prefills: List[str], kws,
                    log: Optional[Callable[[str], None]] = None) -> Dict[str, int]:
     """{weight name: kernel width} for the constant MatMul weights of the
     prefill entries.  Per width: the best priced prefill tactic of every
-    bucket (a ConvKernel geometry reading that image, or at kw 1 also
-    MatmulKernel's tiled path) and GEMV in decode / head at that width, each
-    times its entry weight.  The least total replaces the unplanned width
-    (the cost model's choice for the largest bucket) only when it is faster
-    beyond the model's error band (perf_model.clearly_faster); a weight
-    whose unplanned width cannot be priced is left out (the unplanned rule
-    then decides it)."""
+    bucket (a ConvKernel geometry reading that image, at kw 1 also
+    MatmulKernel's tiled path on row-major B, and on the RTL kernel
+    MatmulKernel's image path at that width for any bucket) and GEMV in
+    decode / head at that width, each times its entry weight.  On the RTL
+    kernel width 0 — the tiled path's packed layout, read by MatmulKernel
+    in every entry — is a candidate too.  The least total replaces the
+    unplanned width (the unplanned choice for the largest bucket: its
+    ConvKernel width, or on the RTL kernel the MatmulKernel layout it keeps)
+    only when it is faster beyond the model's error band
+    (perf_model.clearly_faster); a weight whose unplanned width cannot be
+    priced is left out (the unplanned rule then decides it)."""
+    from . import cost_model
+    from .cost_model import CALL_OVERHEAD, gemv_cycles, matmul_cycles
     from .matmul_gemv import gemv_shape_reason
-    from .matmul_lowering import PLAN_MIN_GAIN, conv_plans, plan_conv_calls, plan_tiled_calls
-    from .perf_calls import KernelCall
+    from .matmul_lowering import (LOWER_MARGIN, PLAN_MIN_GAIN, conv_plans, plan_conv_calls,
+                                  plan_mm_calls, plan_tiled_calls)
     from .perf_model import clearly_faster
     from .tactics import _MM
 
@@ -123,14 +129,21 @@ def plan_shared_kw(models: Dict[str, onnx.ModelProto], prefills: List[str], kws,
         shapes.update(_matmul_weights(models[name]))
     largest = max(int(n.split("_")[1]) for n in prefills)
 
+    rtl = cost_model.MATMUL_IMPL == "rtl"
+
     def cost(b, k, m, kw):
         tot = err = 0.0
         for name in prefills:
             mm = _MM(int(name.split("_")[1]), k, m, 1, 0, 0, 0, [_T(), _T()])
-            bands = [perf_model.calls_band(plan_conv_calls(mm, p))
-                     for p in conv_plans(mm, [kw], splits="all")]
-            if kw == 1:
-                bands.append(perf_model.calls_band(plan_tiled_calls(mm, False)))
+            if kw == 0:                          # the tiled path's packed layout
+                bands = [perf_model.calls_band(plan_tiled_calls(mm, True))]
+            else:
+                bands = [perf_model.calls_band(plan_conv_calls(mm, p))
+                         for p in conv_plans(mm, [kw], splits="all")]
+                if kw == 1:
+                    bands.append(perf_model.calls_band(plan_tiled_calls(mm, False)))
+                if rtl and gemv_shape_reason(mm, kw) is None:
+                    bands.append(perf_model.calls_band(plan_mm_calls(mm, kw, True)))
             bands = [x for x in bands if x is not None]
             if not bands:
                 return None
@@ -140,28 +153,39 @@ def plan_shared_kw(models: Dict[str, onnx.ModelProto], prefills: List[str], kws,
         for name in one_row:
             if b not in one_row_w[name]:
                 continue
-            if gemv_shape_reason(_MM(1, k, m, 1, 0, 0, 0, []), kw) is not None:
+            mm = _MM(1, k, m, 1, 0, 0, 0, [])
+            if kw and gemv_shape_reason(mm, kw) is not None:
                 return None
-            x = perf_model.calls_band([KernelCall.of("MatmulKernel", n=1, k=k, m=m, batch=1,
-                                                     gemv_kw=kw)])
+            x = perf_model.calls_band(plan_mm_calls(mm, kw, True))
             if x is None:
                 return None
             tot += weight(name) * x[0]
             err += weight(name) * x[0] * x[1]
         return tot, (err / tot if tot > 0 else 0.0)
 
+    def unplanned(n, k, m, plans):
+        """The largest bucket's unplanned layout (lower_matmuls, then the
+        GEMV pass's rule for a MatMul kept on MatmulKernel)."""
+        if not rtl or plans[0].cycles < LOWER_MARGIN * (matmul_cycles(n, k, m, 1, b_packed=False)
+                                                       + CALL_OVERHEAD):
+            return plans[0].kw
+        mm = _MM(n, k, m, 1, 0, 0, 0, [])
+        return 1 if (gemv_shape_reason(mm, 1) is None
+                     and gemv_cycles(n, k, m, 1, 1) < matmul_cycles(n, k, m, 1, b_packed=False)) else 0
+
     out: Dict[str, int] = {}
     changed = 0
+    widths = list(kws) + ([0] if rtl else [])
     for b, (k, m) in sorted(shapes.items()):
         plans = conv_plans(_MM(largest, k, m, 1, 0, 0, 0, [_T(), _T()]), list(kws))
         if not plans:
             continue
-        base_kw = plans[0].kw
+        base_kw = unplanned(largest, k, m, plans)
         base = cost(b, k, m, base_kw)
         if base is None:
             continue
         best_kw, best = base_kw, base
-        for kw in kws:
+        for kw in widths:
             c = cost(b, k, m, kw) if kw != base_kw else None
             if c is not None and c[0] < best[0]:
                 best_kw, best = kw, c

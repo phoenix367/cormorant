@@ -494,7 +494,25 @@ facts and docs.  What was done:
   `1d28630fbfa4`.
 
 **Open after phase 4:**
-- The planner (`--plan`) has no multi-row MatmulKernel image tactic.
+- ~~The planner (`--plan`) has no multi-row MatmulKernel image tactic.~~
+  Done (2026-10-04): `src/tactics.py` offers MatmulKernel's image path for
+  any row count on the RTL kernel; `matmul_lowering._plan_matmul` chooses
+  among the ConvKernel plans and MatmulKernel's layouts (tiled; image at
+  kw 1, and 2 / 4 / 8 for a B it may re-image), prices the unplanned
+  choice in the layout the GEMV pass would give it (`matmul_gemv
+  .image_choice`), offers a weight pinned by another entry on MatmulKernel
+  only in its pinned layout, and hands a kept MatMul's layout to the GEMV
+  pass (`MatmulNode.plan_kw`); `llm_entries.plan_shared_kw` prices each
+  prefill bucket's image read and width 0 (the tiled layout).  Unplanned
+  projects are byte-identical.  With the current model the tactic changes
+  no shipped plan: the 16-token buckets already read the kw-4 image on
+  MatmulKernel, and ConvKernel stays ahead at 64 and 256 rows.  What
+  `--plan` predicts on the RTL bitstream (simulator, against this phase's
+  unplanned board runs): BERT 956 → 906 ms (the 12 attention P·V products
+  on MatmulKernel's tiled path, 7.35 → 4.45 ms each — the unplanned cost
+  model keeps them on ConvKernel), SmolVLM's image encoder −53 ms
+  (ConvKernel widths), the 64-token prefill −3 ms; not measured on the
+  board yet.
 - The perf-regression baseline of `1d28630fbfa4` holds the demos as run in
   phase 2b (the HLS engine choices): MobileNet v1 now shows as improved
   until the demos are re-recorded.

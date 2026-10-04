@@ -58,7 +58,7 @@ Engine choice (``mode``):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from ._conv_hw_config import (
     CONV_MAX_ACC_PERSIST_ENTRIES,
@@ -259,6 +259,22 @@ def matmul_plan_cycles(mm: MatmulNode, kw_pin: Optional[int] = None) -> float:
 _MM_IMAGE_KWS = (1, 2, 4, 8)
 
 
+def _image_ok(sn, kw: int, is_ap_fixed_16_8: bool) -> bool:
+    from .matmul_gemv import ineligible_reason as gemv_ineligible
+    return gemv_ineligible(sn, kw, is_ap_fixed_16_8) is None
+
+
+def _unplanned_mm_layout(sn, users: list, io, gemv_mode: str, gemv_hint: Dict[str, int],
+                         is_ap_fixed_16_8: bool) -> int:
+    """The MatmulKernel layout the GEMV pass gives ``sn`` without planning
+    (0 = tiled, kw = the image at kw)."""
+    from .matmul_gemv import image_choice
+    if gemv_mode == "off":
+        return 0
+    ch = image_choice(sn, users, io, gemv_hint, gemv_mode, is_ap_fixed_16_8)
+    return ch[0] if ch is not None and ch[2] else 0
+
+
 def shared_weight_layouts(nodes: list) -> Dict[str, int]:
     """{constant B name: layout} of a graph's MatMul weights, for a
     multi-entry project's other graphs to pin (``matmul_conv_kw``), so a
@@ -309,38 +325,62 @@ def plan_tiled_calls(mm, packed: bool) -> list:
                           c_stride=mm.c_batch_stride, b_packed=int(packed), gemv_kw=0)]
 
 
-def _plan_label(p: Optional[ConvPlan]) -> str:
-    if p is None:
-        return "MatmulKernel tiled"
+def plan_mm_calls(mm, layout: int, b_constant: bool) -> list:
+    """MatmulKernel's call for ``mm`` in ``layout``: 0 = the tiled path (B
+    packed when it is a constant), kw = the GEMV / image path at kw."""
+    if layout == 0:
+        return plan_tiled_calls(mm, b_constant)
+    from .perf_calls import KernelCall
+    return [KernelCall.of("MatmulKernel", n=mm.n, k=mm.k, m=mm.m, batch=mm.batch,
+                          a_stride=mm.a_batch_stride, b_stride=mm.b_batch_stride,
+                          c_stride=mm.c_batch_stride, b_packed=0, gemv_kw=layout)]
+
+
+# A planned choice: a ConvPlan (ConvKernel), or MatmulKernel's layout as an
+# int — 0 the tiled path, kw the GEMV / image path at kw.
+Choice = Union[ConvPlan, int]
+
+
+def _plan_label(p: Choice) -> str:
+    if isinstance(p, int):
+        return "MatmulKernel tiled" if p == 0 else f"MatmulKernel image kw={p}"
     return (f"ConvKernel kw={p.kw} out_w={p.out_w}"
             + (f" {p.calls}x{p.conv_n} rows" if p.calls > 1 else ""))
 
 
-def _plan_matmul(sn, baseline: Optional[ConvPlan], kws, mode: str, perf_model,
-                 plan_log: Optional[list]) -> Optional[ConvPlan]:
-    """The planned conv plan for ``sn`` (None: MatmulKernel tiled)."""
+def _tie(c: Choice) -> tuple:
+    """Tie-break among equally priced choices: MatmulKernel first, then the
+    narrower kernel width, then the wider output tile."""
+    return (0, c, 0) if isinstance(c, int) else (1, c.kw, -c.out_w)
+
+
+def _plan_matmul(sn, baseline: Choice, kws, mm_layouts: Sequence[int], perf_model,
+                 plan_log: Optional[list]) -> Choice:
+    """The planned choice for ``sn`` among its ConvKernel plans (kernel
+    widths ``kws``), MatmulKernel in each layout of ``mm_layouts`` and the
+    ``baseline`` (always a candidate)."""
     from .perf_model import clearly_faster
-    packed = sn.inputs[1].data is not None
-    cands: List[Tuple[Optional[Tuple[float, float]], Optional[ConvPlan]]] = []
-    for p in conv_plans(sn, kws, splits="all"):
-        cands.append((perf_model.calls_band(plan_conv_calls(sn, p)), p))
-    if mode != "always":
-        cands.append((perf_model.calls_band(plan_tiled_calls(sn, packed)), None))
-    base = (perf_model.calls_band(plan_conv_calls(sn, baseline)) if baseline is not None
-            else perf_model.calls_band(plan_tiled_calls(sn, packed)))
-    priced = [(b, p) for b, p in cands if b is not None]
+    const = sn.inputs[1].data is not None
+
+    def band(c: Choice):
+        return perf_model.calls_band(plan_mm_calls(sn, c, const) if isinstance(c, int)
+                                     else plan_conv_calls(sn, c))
+    choices: List[Choice] = list(conv_plans(sn, kws, splits="all")) + list(mm_layouts)
+    if baseline not in choices:
+        choices.append(baseline)
+    cands = [(band(c), c) for c in choices]
+    base = band(baseline)
+    priced = [(b, c) for b, c in cands if b is not None]
     chosen, why = baseline, "baseline"
-    best = min(priced, key=lambda bp: (bp[0][0], bp[1] is not None and bp[1].kw,
-                                        bp[1] is not None and -bp[1].out_w)) if priced else None
+    best = min(priced, key=lambda bc: (bc[0][0],) + _tie(bc[1])) if priced else None
     if base is None:
         why = "baseline not priced"
     elif best is not None and best[1] != baseline:
         # the fastest candidate that may replace the baseline (perf_model.clearly_faster)
-        ok = [bp for bp in priced if bp[1] != baseline and clearly_faster(bp[0], base, PLAN_MIN_GAIN)]
+        ok = [bc for bc in priced if bc[1] != baseline and clearly_faster(bc[0], base, PLAN_MIN_GAIN)]
         if ok:
-            b2 = min(ok, key=lambda bp: (bp[0][0], bp[1] is not None and bp[1].kw,
-                                         bp[1] is not None and -bp[1].out_w))
-            chosen, why, best = b2[1], "planned", b2
+            best = min(ok, key=lambda bc: (bc[0][0],) + _tie(bc[1]))
+            chosen, why = best[1], "planned"
         elif best[0][0] < base[0]:
             from .perf_model import MAX_MODEL_ERROR
             why = ("gain below the minimum" if best[0][0] >= base[0] * (1.0 - PLAN_MIN_GAIN)
@@ -351,7 +391,7 @@ def _plan_matmul(sn, baseline: Optional[ConvPlan], kws, mode: str, perf_model,
                          "baseline": _plan_label(baseline), "chosen": _plan_label(chosen),
                          "baseline_us": base[0] if base else None,
                          "best_us": best[0][0] if best else None,
-                         "chosen_us": (best[0][0] if best is not None and chosen is best[1]
+                         "chosen_us": (best[0][0] if best is not None and chosen == best[1]
                                        else base[0] if base else None),
                          "decision": why, "candidates": len(cands), "priced": len(priced)})
     return chosen
@@ -361,6 +401,7 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
                   graph_io: Sequence[str] = (),
                   kw_override: Optional[Dict[str, int]] = None,
                   kw_choices: Optional[Sequence[int]] = None,
+                  gemv_mode: str = "auto", gemv_hint: Optional[Dict[str, int]] = None,
                   perf_model=None, plan_log: Optional[list] = None) -> Tuple[list, dict]:
     """Return ``(new_nodes, stats)``: ``nodes`` with every MatmulNode that
     should run on ConvKernel replaced by a MatmulConvNode (same index,
@@ -376,13 +417,21 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
     ones MatmulKernel's GEMV decode can read as well, matmul_gemv.py).
 
     ``perf_model`` (planning, src/perf_model.py): every MatMul's choice
-    above is its baseline; the planner prices the baseline and every other
-    tactic (each conv geometry and row split with the allowed kernel widths,
-    and MatmulKernel's tiled path unless ``mode == "always"``) and takes the
-    cheapest one when it is priced at least ``PLAN_MIN_GAIN`` below the
-    baseline; a baseline the model cannot price is kept.  Each decision is
-    appended to ``plan_log``."""
+    above is its baseline — on MatmulKernel in the layout the GEMV pass's
+    unplanned rules give it (``gemv_mode``, ``gemv_hint``: matmul_gemv
+    .image_choice) — and the planner prices the baseline and every other
+    tactic: each conv geometry and row split with the allowed kernel widths,
+    and unless ``mode == "always"`` MatmulKernel in each layout it may take
+    (its tiled path; its image path at kw 1, and at kw 2 / 4 / 8 for a B it
+    may re-image — on the HLS kernel only for one row; a weight pinned by
+    ``kw_override`` only in its pinned layout, so it keeps one copy).  It
+    takes the cheapest one when it is priced at least ``PLAN_MIN_GAIN``
+    below the baseline; a baseline the model cannot price is kept.  A
+    MatMul kept on MatmulKernel carries the layout in ``plan_kw`` for the
+    GEMV pass.  Each decision is appended to ``plan_log``."""
+    from .matmul_gemv import normalize_mode as gemv_normalize
     mode = normalize_mode(mode)
+    gemv_mode = gemv_normalize(gemv_mode)
     kw_override = kw_override or {}
     stats = {"lowered": 0, "kept": 0, "conv_calls": 0,
              "conv_cycles": 0.0, "matmul_cycles": 0.0}
@@ -421,11 +470,29 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
             keep = False      # pinned to a ConvKernel-only image: MatmulKernel would need a copy
         p = None if keep else plans[0]
         if perf_model is not None:
-            # a weight shared with other entries (pinned width) keeps one image:
-            # no MatmulKernel candidate unless that is already the baseline
-            pinned = b.onnx_name in kw_override and p is not None
-            p = _plan_matmul(sn, p, kws, "always" if pinned else mode, perf_model, plan_log)
-            keep = p is None
+            users = readers.get(b.onnx_name, [])
+            base_mm = _unplanned_mm_layout(sn, users, io, gemv_mode, gemv_hint or {},
+                                           is_ap_fixed_16_8)
+            mm_layouts: List[int] = []
+            if b.onnx_name in kw_override:
+                # a weight shared with other entries keeps one image: MatmulKernel
+                # only when it reads exactly the pinned layout (the RTL kernel, any
+                # n); the baseline stays a candidate whatever it is
+                if (mode != "always" and cost_model.MATMUL_IMPL == "rtl"
+                        and base_mm == kw_override[b.onnx_name]):
+                    mm_layouts = [base_mm]
+            elif mode != "always":
+                mm_layouts = [0] + [kw for kw in _MM_IMAGE_KWS
+                                    if gemv_mode != "off" and (kw == 1 or relayout_ok)
+                                    and (kw_choices is None or kw == 1 or kw in kw_choices)
+                                    and _image_ok(sn, kw, is_ap_fixed_16_8)]
+            choice = _plan_matmul(sn, base_mm if p is None else p, kws, mm_layouts,
+                                  perf_model, plan_log)
+            keep = isinstance(choice, int)
+            if keep:
+                sn.plan_kw = choice
+            else:
+                p = choice
         if keep:
             stats["kept"] += 1
             out.append(sn)

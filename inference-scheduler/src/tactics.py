@@ -15,7 +15,10 @@ MatMul tactics (:func:`matmul_tactics`):
          split; kw > 1 needs B re-imaged, allowed only for a constant B
          read by this MatMul alone and not a graph input / output;
   tiled  MatmulKernel's tiled path, B packed when it is a constant;
-  gemv   MatmulKernel's GEMV path (one A row), B read in kw's image.
+  gemv   MatmulKernel's GEMV / image path, B read in kw's image (ConvKernel's
+         x image; kw = 1 is row-major B): one A row on the HLS kernel, any
+         number of rows on the RTL kernel (``kernels.matmul.impl == "rtl"``,
+         matmul_gemv.gemv_shape_reason).
 """
 
 from __future__ import annotations
@@ -125,8 +128,8 @@ def matmul_tactics(sn, *, relayout_ok: bool, b_constant: bool,
                           float(matmul_cycles(mm.n, mm.k, mm.m, mm.batch, b_packed=packed)
                                 + CALL_OVERHEAD),
                           ("packed", 1) if packed else ("row", 1)))
-    # gemv
-    if MATMUL_GEMV_MAX_M > 0 and mm.outer_count == 1 and mm.n == 1:
+    # gemv / image (gemv_shape_reason: one row on the HLS kernel, any on the RTL one)
+    if MATMUL_GEMV_MAX_M > 0:
         for kw in GEMV_KWS:
             if kw > 1 and not relayout_ok:
                 continue
@@ -134,11 +137,11 @@ def matmul_tactics(sn, *, relayout_ok: bool, b_constant: bool,
                 continue
             if gemv_shape_reason(mm, kw) is not None:
                 continue
-            call = KernelCall.of("MatmulKernel", n=1, k=mm.k, m=mm.m, batch=mm.batch,
+            call = KernelCall.of("MatmulKernel", n=mm.n, k=mm.k, m=mm.m, batch=mm.batch,
                                  a_stride=mm.a_batch_stride, b_stride=mm.b_batch_stride,
                                  c_stride=mm.c_batch_stride, b_packed=0, gemv_kw=kw)
             out.append(Tactic("gemv", (("kw", kw),), (call,),
-                              float(gemv_cycles(1, mm.k, mm.m, mm.batch, kw) + CALL_OVERHEAD),
+                              float(gemv_cycles(mm.n, mm.k, mm.m, mm.batch, kw) + CALL_OVERHEAD),
                               ("conv", kw) if kw > 1 else ("row", 1)))
     return out
 

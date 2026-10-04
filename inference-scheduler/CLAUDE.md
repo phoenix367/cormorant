@@ -224,7 +224,7 @@ src/
   perf_model.py          per-bitstream kernel model (exact calls + fitted families), error bands
   perf_fit.py            fitting it from a calibration campaign (NNLS + k-NN correction)
   host_model.py          host-op timing model from board profiles
-  tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV)
+  tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV / image)
   order_search.py        issue-order search on the timed event-stream replay (codegen/timing.py)
   matmul_gemv.py         MatmulKernel GEMV / image pass (B in ConvKernel's image)
   fc_conv.py             fully-connected Convs -> Flatten + MatMul + Reshape (+ bias Add)
@@ -267,7 +267,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              75 pytest modules, 1637 tests, all pass (test_bert_base.py
+  test_*.py              75 pytest modules, 1643 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

@@ -127,7 +127,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1637 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1643 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -180,7 +180,7 @@ inference_scheduler.py          CLI, argument parsing
     │                           families, error bands
     ├── perf_fit.py             fitting it (perf_calibrate.py fit)
     ├── host_model.py           host-op timing model (host.json)
-    ├── tactics.py              a MatMul's tactics (conv / tiled / GEMV) and calls
+    ├── tactics.py              a MatMul's tactics (conv / tiled / GEMV-image) and calls
     ├── order_search.py         --plan issue-order search
     ├── schedule.py Dag         data-flow DAG (+ state RAW / WAR / WAW edges):
     │                           predecessors, successors, topological order,
@@ -1211,7 +1211,14 @@ in one go.)
 - **MatMul tactics** (`matmul_lowering._plan_matmul`,
   `matmul_gemv._plan_gemv`; `src/tactics.py` lists every MatMul's tactics
   and their calls for the calibration): the engine, the ConvKernel
-  geometry, row splits and GEMV vs tiled.  A tactic replaces the unplanned choice only
+  geometry, row splits and MatmulKernel's layout — its tiled path, or its
+  GEMV / image path at kw 1 / 2 / 4 / 8 (a re-imaged B only where the B may
+  be re-imaged; on the RTL kernel for any number of rows, on the HLS kernel
+  for one).  A weight pinned by another entry is priced on MatmulKernel only
+  in its pinned layout, so it keeps one copy; the unplanned choice is priced
+  in the layout the GEMV pass would give it.  A MatMul the lowering's
+  planner keeps on MatmulKernel carries its layout to the GEMV pass
+  (`MatmulNode.plan_kw`).  A tactic replaces the unplanned choice only
   when (`perf_model.clearly_faster`):
   - it is priced at least 3 % below it (`PLAN_MIN_GAIN`) even with both at
     the unfavourable end of their error bands (an exact entry has error 0,
@@ -1224,7 +1231,11 @@ in one go.)
 - **Shared weights** (`llm_entries.plan_shared_kw`, Llama projects built
   by `entry_graphs`): the kernel width of each weight shared by the prefill
   buckets and decode, by predicted time weighted per entry
-  (`--entry-weights`; default decode 64, head 64, prefill 1).
+  (`--entry-weights`; default decode 64, head 64, prefill 1).  A bucket's
+  price at a width is its best tactic reading that image — ConvKernel, and
+  on the RTL kernel also MatmulKernel's image path — and on the RTL kernel
+  width 0 (the tiled path's packed layout in every entry) is a candidate
+  too.
 - **Issue order** (`src/order_search.py`), when every node is priced (the
   kernels by the kernel model, the host ops by `host.json`):
   - a local search over the order, priced by the timed replay of the event

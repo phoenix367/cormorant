@@ -114,7 +114,9 @@ carries its kind and parameters, the call signatures it issues (with
 counts), the weight image it needs (if any) and the model's estimate.
 
 - **MatMul:** today's `conv_plans` (row splits included), MatmulKernel
-  tiled, and GEMV when `n == 1`.
+  tiled, and GEMV when `n == 1` — on the RTL MatmulKernel (MATMUL_RTL_PLAN)
+  the GEMV / image path for any `n`, a weight pinned by another entry only
+  in its pinned layout (2026-10-04).
 - **Attention:** q.Kᵀ / P.V kernel widths.
 - **Host ops:** chunk count for row-parallel ops (§4.4).
 

@@ -279,6 +279,151 @@ class TestPlannedTactics(unittest.TestCase):
                              {"W": other})
 
 
+class TestPlannedImageTactic(unittest.TestCase):
+    """The RTL MatmulKernel's image (GEMV) path for several rows as a planned
+    tactic (MATMUL_RTL_PLAN phase 4 follow-up): offered by src/tactics.py,
+    chosen by the lowering's planner when clearly faster (a B it may re-image
+    at kw > 1), for a pinned weight only in its pinned layout, and priced in
+    the shared kernel widths of a multi-entry project (plus the tiled
+    layout, 0); never on the HLS kernel."""
+
+    N, K, M = 64, 256, 96
+
+    def _model(self, td):
+        from test_matmul_on_conv import _matmul_model
+        return _matmul_model(os.path.join(td, "mm.onnx"), [self.N, self.K], [self.K, self.M],
+                             seed=21)
+
+    def _exact(self, fast: dict):
+        """{key: us}: every ConvKernel plan, the tiled path and each image
+        width at 1000 us, except the {layout: us} of ``fast`` (0 = tiled)."""
+        from src.matmul_lowering import conv_plans, plan_conv_calls, plan_mm_calls
+        from src.tactics import _MM
+        mm = _MM(self.N, self.K, self.M, 1, 0, 0, 0, [])
+        exact = {plan_conv_calls(mm, p)[0].key(): 1000.0
+                 for p in conv_plans(mm, range(1, 8), splits="all")}
+        for lay in (0, 1, 2, 4, 8):
+            exact[plan_mm_calls(mm, lay, True)[0].key()] = fast.get(lay, 1000.0)
+        return exact
+
+    def _graph(self, td, fast, **kw):
+        pm = _model_file(td, self._exact(fast))
+        return OnnxGraph(self._model(td), fuse_act=True, s2d_stem=True,
+                         plan=PlanOptions(enabled=True, perf_model=pm), **kw)
+
+    @staticmethod
+    def _mm(g):
+        from src.nodes import MatmulNode
+        return [s for s in g.nodes if type(s) is MatmulNode]
+
+    class _T:                                     # a MatMul operand stub (src/tactics._MM)
+        is_int, data, onnx_name = False, None, ""
+
+    def test_tactics_offer_the_image_for_several_rows_on_rtl_only(self):
+        from helpers import matmul_impl
+        from src.tactics import _MM, matmul_tactics
+        mm = _MM(16, 256, 96, 1, 0, 0, 0, [self._T(), self._T()])
+        with matmul_impl("rtl"):
+            ts = matmul_tactics(mm, relayout_ok=True, b_constant=True)
+        self.assertEqual(sorted(t.p["kw"] for t in ts if t.kind == "gemv"), [1, 2, 4, 8])
+        self.assertEqual({t.calls[0].fields["n"] for t in ts if t.kind == "gemv"}, {16})
+        with matmul_impl("hls"):
+            ts = matmul_tactics(mm, relayout_ok=True, b_constant=True)
+        self.assertEqual([t for t in ts if t.kind == "gemv"], [])
+
+    def test_image_chosen_when_clearly_faster(self):
+        from helpers import matmul_impl
+        from src.nodes import conv_lowered_b_image
+        for kw in (1, 4):
+            with self.subTest(kw=kw), tempfile.TemporaryDirectory() as td, matmul_impl("rtl"):
+                g = self._graph(td, {kw: 100.0})
+                (sn,) = self._mm(g)
+                self.assertEqual((sn.gemv_kw, sn.plan_kw, bool(sn.b_packed)), (kw, kw, False))
+                self.assertEqual(g.plan_log[0]["chosen"], f"MatmulKernel image kw={kw}")
+                b = sn.inputs[1]
+                if kw > 1:                      # re-imaged for MatmulKernel alone
+                    import numpy as np
+                    np.testing.assert_array_equal(
+                        b.packed_data, conv_lowered_b_image(b.data, self.K, self.M, kw))
+                else:
+                    self.assertIsNone(b.packed_data)
+                import host_emu
+                if host_emu.which_cc():
+                    cg = CodeGenerator(g, model_path="mm.onnx")
+                    rc, out = host_emu.build_and_run(cg, os.path.join(td, "emu"))
+                    self.assertEqual(rc, 0, out[-2000:])
+                    self.assertIn("test_inference PASSED", out)
+
+    def test_tiled_chosen_when_clearly_faster(self):
+        from helpers import matmul_impl
+        with tempfile.TemporaryDirectory() as td, matmul_impl("rtl"):
+            g = self._graph(td, {0: 100.0})
+            (sn,) = self._mm(g)
+            self.assertEqual((sn.gemv_kw, sn.plan_kw, bool(sn.b_packed)), (0, 0, True))
+
+    def test_pinned_weight_reads_its_layout_only(self):
+        from helpers import matmul_impl
+        with tempfile.TemporaryDirectory() as td, matmul_impl("rtl"):
+            # the tiled path and kw 1 are cheapest, but the weight is pinned to
+            # ConvKernel's kw-4 image: MatmulKernel may read only that one
+            g = self._graph(td, {0: 10.0, 1: 10.0, 4: 100.0}, matmul_conv_kw={"B": 4})
+            (sn,) = self._mm(g)
+            self.assertEqual((sn.gemv_kw, bool(sn.b_packed)), (4, False))
+            self.assertEqual(g.plan_log[0]["chosen"], "MatmulKernel image kw=4")
+
+    def test_no_image_on_hls(self):
+        from helpers import matmul_impl
+        with tempfile.TemporaryDirectory() as td, matmul_impl("hls"):
+            g = self._graph(td, {1: 100.0, 4: 100.0})
+            self.assertNotIn("image", g.plan_log[0]["chosen"])
+            self.assertTrue(all(sn.gemv_kw == 0 for sn in self._mm(g)))
+
+    def test_shared_kw_counts_the_image_and_the_tiled_layout(self):
+        from onnx import TensorProto
+        from onnx import helper as oh
+        from onnx import numpy_helper as nph
+        import numpy as np
+        from helpers import matmul_impl
+        from src.llm_entries import plan_shared_kw
+        from src.matmul_lowering import conv_plans, plan_conv_calls, plan_mm_calls
+        from src.perf_model import PerfModel
+        from src.tactics import _MM
+        K, M = 768, 768
+
+        def entry(n):
+            g = oh.make_graph([oh.make_node("MatMul", ["X", "W"], ["Y"])], "e",
+                              [oh.make_tensor_value_info("X", TensorProto.FLOAT, [n, K])],
+                              [oh.make_tensor_value_info("Y", TensorProto.FLOAT, [n, M])],
+                              initializer=[nph.from_array(np.zeros((K, M), np.float32), "W")])
+            return oh.make_model(g)
+
+        pre = _MM(64, K, M, 1, 0, 0, 0, [self._T(), self._T()])
+        one = _MM(1, K, M, 1, 0, 0, 0, [self._T(), self._T()])
+        hls_base = conv_plans(pre, [1, 2, 4, 8])[0].kw   # the unplanned width (ConvKernel here)
+        fast = next(kw for kw in (2, 4, 8) if kw != hls_base)
+        exact = {plan_conv_calls(pre, p)[0].key(): 500.0
+                 for kw in (1, 2, 4, 8) for p in conv_plans(pre, [kw], splits="all")}
+        for kw in (1, 2, 4, 8):
+            exact[plan_mm_calls(one, kw, True)[0].key()] = 100.0
+        exact[plan_mm_calls(pre, fast, True)[0].key()] = 50.0   # the bucket's image at `fast`
+        exact[plan_mm_calls(pre, 0, True)[0].key()] = 400.0     # tiled, packed
+        exact[plan_mm_calls(one, 0, True)[0].key()] = 100.0
+        args = (["prefill_64"], (1, 2, 4, 8))
+        with tempfile.TemporaryDirectory() as td:
+            pm = PerfModel.load(_model_file(td, exact))
+            with matmul_impl("rtl"):
+                self.assertEqual(plan_shared_kw({"prefill_64": entry(64), "decode": entry(1)},
+                                                *args, pm, lambda n: 1.0), {"W": fast})
+            with matmul_impl("hls"):          # no image path for 64 rows: all widths tie
+                self.assertEqual(plan_shared_kw({"prefill_64": entry(64), "decode": entry(1)},
+                                                *args, pm, lambda n: 1.0), {"W": hls_base})
+            exact[plan_mm_calls(pre, 0, True)[0].key()] = 10.0       # the tiled layout wins
+            pm = PerfModel.load(_model_file(td, exact))
+            with matmul_impl("rtl"):
+                self.assertEqual(plan_shared_kw({"prefill_64": entry(64), "decode": entry(1)},
+                                                *args, pm, lambda n: 1.0), {"W": 0})
+
+
 class TestStateEdges(unittest.TestCase):
     """RAW / WAR / WAW edges of the persistent states."""
 

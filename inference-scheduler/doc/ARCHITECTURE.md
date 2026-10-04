@@ -144,7 +144,7 @@ src/
   perf_model.py          per-bitstream kernel model: exact calls + fitted families
   perf_fit.py            fitting it from a calibration campaign (perf_calibrate.py fit)
   host_model.py          host-op timing model from board profiles
-  tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV)
+  tactics.py             a MatMul's tactics (conv geometries / row splits, tiled, GEMV / image)
   order_search.py        issue-order search on the timed event-stream replay
   graph.py               OnnxGraph — ONNX loading, shape inference, Gemm preprocessing, node dispatch
   schedule.py            Dag — data-flow DAG over the scheduled nodes (SCHEDULER_DAG.md)

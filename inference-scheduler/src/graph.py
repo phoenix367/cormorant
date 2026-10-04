@@ -826,16 +826,17 @@ class OnnxGraph:
             except PlanError as e:
                 raise SchedulerError(str(e)) from None
         self.perf_model = perf_model
+        if matmul_gemv_kw is None and cost_model.MATMUL_IMPL == "rtl":
+            # the RTL kernel reads a pinned weight in its pinned layout too
+            # (an image width, or 0: the tiled path's), whatever n is
+            matmul_gemv_kw = matmul_conv_kw
         self._nodes, self.matmul_conv_stats = matmul_lowering.lower_matmuls(
             self._nodes, mode=matmul_on_conv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
             graph_io=self._input_names + self._output_names,
             kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws,
+            gemv_mode=matmul_gemv, gemv_hint=matmul_gemv_kw,
             perf_model=perf_model, plan_log=self.plan_log)
-        if matmul_gemv_kw is None and cost_model.MATMUL_IMPL == "rtl":
-            # the RTL kernel reads a pinned weight in its pinned layout too
-            # (an image width, or 0: the tiled path's), whatever n is
-            matmul_gemv_kw = matmul_conv_kw
         self.matmul_gemv_stats = choose_gemv(
             self._nodes, mode=matmul_gemv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
