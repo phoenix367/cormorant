@@ -16,9 +16,11 @@ allowed-tools: Bash Read
 
 The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
 128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
-exported IP's own default (128 for every `ap_uint<128>` port — all of
-VectorOP, Conv and Pool, matmul a/b; 32 for MatmulKernel `c`, the only
-16-bit element port left).  The test stand's four block designs use the same widths with a
+exported IP's own default (128 for every data port: the `ap_uint<128>`
+ports of VectorOP, Conv and Pool and all three of the SystemVerilog
+MatmulKernel's; the block designs still say 32 for MatmulKernel `c`, the
+retired HLS kernel's width, and the build scripts reset it to the IP's 128
+after the upgrade, `scripts/ip_defaults.tcl`).  The test stand's four block designs use the same widths with a
 128-bit PS port since 2026-09-24, so RTL timing matches the board.  Two things that
 look like shortcuts and are not (2026-09-24): (a) widening
 `C_M_AXI_*_DATA_WIDTH` on an instance in IP integrator — the HLS wrapper

@@ -23,7 +23,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
-| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); single-row MatMuls take its GEMV streaming path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
+| **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image where that is faster or the weight's shared layout (on the HLS kernel of older bitstreams: single-row MatMuls) — its GEMV / image path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
 
@@ -127,7 +127,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1633 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1637 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -247,8 +247,9 @@ inference_scheduler.py          CLI, argument parsing
    model is resolved first and each MatMul's choice is re-priced
    (`_plan_matmul`, [§Planning](#planning---plan)).
 12. `matmul_gemv.choose_gemv()` (`matmul_gemv="auto"`, the default) —
-   single-row MatmulNodes switch to MatmulKernel's GEMV streaming path
-   (`gemv_kw`); `matmul_gemv_kw` ({weight: kw}) reads those weights in
+   MatmulNodes switch to MatmulKernel's GEMV / image path (`gemv_kw`) where
+   it is estimated faster or their weight's shared layout is the image (on
+   the HLS kernel only single-row ones); `matmul_gemv_kw` ({weight: kw}) reads those weights in
    ConvKernel's kw image ([§MatMul GEMV streaming](#matmul-gemv-streaming));
    planned by `_plan_gemv` under `plan`.
 13. `_pack_matmul_weights()` (the remaining tiled MatmulNodes), then
@@ -271,20 +272,22 @@ a 1×1 conv on a 1×1 map).  ConvKernel streams such a weight through one
 128-bit port for a single pixel; `fc_conv.lower_fc_convs()` rewrites it
 on the ONNX model as `Flatten(x)` → `MatMul(·, W')` → `Reshape([N, M, 1,
 1])` → `Add(b)`, with `W'[(c·H + h)·W + w][m] = W[m][c][h][w]` (Flatten's
-order), so a batch-1 layer runs on MatmulKernel's GEMV path (both read
-ports).  Eligible: group 1, dilations 1, pads 0, kernel = input H × W,
+order), so a batch-1 layer runs on MatmulKernel (the GEMV path through
+both read ports where it is faster).  Eligible: group 1, dilations 1, pads 0, kernel = input H × W,
 constant weight / bias, C·H·W ≤ `max_k`.  `fc_conv="auto"` (library and
 CLI default) rewrites where the engine cost model — ConvKernel cycles
-against GEMV (or tiled) MatmulKernel cycles plus one VectorOP call for the
+against GEMV or tiled MatmulKernel cycles plus one VectorOP call for the
 bias — estimates the MatMul ≥ 20 % faster; `"always"` / `"off"`
 (`--fc-conv`).  A following `Relu` still fuses into the bias `Add`.
 Bit-identical except where the sum before the bias saturates (the Conv
 adds the bias inside its accumulator; the MatMul saturates first).
 `OnnxGraph.fc_conv_stats` = `{lowered, kept, conv_cycles, matmul_cycles}`;
 `report.md` lists the rewrite.  LeNet: 5.44 → 2.81 ms on the board
-([LENET_PLAN](../plans/LENET_PLAN.md)); MobileNet v1's 1001-way 1×1
-classifier stays a Conv (GEMV needs m % 8 == 0, the tiled MatMul is not
-faster).
+([LENET_PLAN](../plans/LENET_PLAN.md)).  MobileNet v1's 1001-way 1×1
+classifier is not GEMV-eligible (m % 8 ≠ 0): on the HLS kernel it stays a
+Conv (its tiled MatMul is not faster), on the RTL kernel the tiled MatMul is
+about twice as fast as the Conv and takes it (MobileNet v1 81.0 → 73.0 ms
+on the board, MATMUL_RTL_PLAN phase 3c).
 
 **VectorOPKernel alignment contract** (kernel ports are 128-bit words):
 every DMA buffer base is 64-byte aligned, every broadcast `CHUNK_STRIDE`
@@ -1003,7 +1006,8 @@ and runs it on the host emulation.
 
 [`BERT_PLAN.md`](../plans/BERT_PLAN.md) §2 2A.  ConvKernel's 16 × 16 MAC grid runs
 two output pixels per cycle (512 MACs, CONV_OPTIMISATION §2.42) against
-MatmulKernel's 32; a MatMul runs on it with **swapped operand roles**.  For
+MatmulKernel's 128 (the retired HLS kernel's: 32); a MatMul runs on it with
+**swapped operand roles**.  For
 `C[N][M] = A[N][K] · B[K][M]` (per batch item) one ConvKernel call has
 
 | conv | = |
@@ -1099,7 +1103,8 @@ MatmulKernel's second datapath (MATMUL_KERNEL.md §1, MATMUL_OPTIMISATION
 §8b): `gemv_kw != 0` streams B once per A row through both of the kernel's
 read ports (port `a` reaches its half of B through the `a_to_b` register)
 at one 128-bit word per port per cycle, accumulating every output column
-on chip; the tiled path takes one B word per cycle.  B is read in the
+on chip; the HLS kernel's tiled path takes one B word per cycle (the RTL
+kernel streams B once per panel of 8 A rows on either path, below).  B is read in the
 image ConvKernel reads for a MatMul lowered with kernel width `kw`
 (`conv_lowered_b_image`; `kw = 1` is row-major B), so the prefill and
 decode graphs of a Llama project read the same buffer.
@@ -1136,7 +1141,9 @@ the four-entry tiny project this way and runs it on the host emulation,
 whose software MatmulKernel reads the GEMV image and checks `a_to_b`.
 
 **On the RTL MatmulKernel** (`platforms/<name>.json` `kernels.matmul.impl
-== "rtl"`, or `AXI_MATMUL_IMPL=rtl`; doc/kernels/MATMUL_RTL_KERNEL.md) the
+== "rtl"`, the KV260's since MATMUL_RTL_PLAN phase 4;
+doc/kernels/MATMUL_RTL_KERNEL.md; `AXI_MATMUL_IMPL=hls` models the HLS
+kernel of older bitstreams) the
 cost model is `cost_model.rtl_matmul_cycles`, and the image is just a B
 layout: the kernel streams B once per panel of 8 A rows on either path, at
 about the packed layout's speed.  So the `n == 1` rule does not apply there,

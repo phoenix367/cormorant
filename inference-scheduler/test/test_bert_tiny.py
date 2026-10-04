@@ -20,6 +20,7 @@ import numpy as np
 
 import gen_bert_models as gbm
 import host_emu
+from helpers import matmul_impl
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
@@ -110,8 +111,9 @@ class TestPartition(_Tiny):
             self.assertEqual({(sn.n, sn.k, sn.m, sn.batch) for sn in att},
                              {(S, dh, S, m["heads"]), (S, S, dh, m["heads"])})
 
+    @matmul_impl("hls")
     def test_matmul_engines(self):
-        """Default engine choice (BERT_PLAN 2A): seq 8 keeps every MatMul on
+        """Engine choice with the HLS MatmulKernel (BERT_PLAN 2A): seq 8 keeps every MatMul on
         MatmulKernel (fewer rows than one ConvKernel output-channel tile);
         at seq 64 every linear and attention MatMul runs on ConvKernel —
         the linears as 1x2 convs over re-laid-out constant weights, the
@@ -133,6 +135,20 @@ class TestPartition(_Tiny):
         self.assertEqual(g.matmul_conv_stats["conv_calls"], 6 + 2 * m["heads"])
         g, _ = self.gen(m["path"], matmul_on_conv="off")
         self.assertFalse(any(isinstance(sn, MatmulConvNode) for sn in g.nodes))
+
+    @matmul_impl("rtl")
+    def test_matmul_engines_rtl(self):
+        """With the RTL MatmulKernel (4x the HLS kernel on GEMM) the six
+        linears of a seq-64 layer stay on ConvKernel; the attention products
+        (64 x 64 per head) run on MatmulKernel."""
+        m = self.models["bert_tiny_h128_s64.onnx"]
+        g, _ = self.gen(m["path"])
+        low = [sn for sn in g.nodes if isinstance(sn, MatmulConvNode)]
+        kept = [sn for sn in g.nodes if isinstance(sn, MatmulNode)]
+        self.assertEqual(len(low), 6 * m["layers"])
+        self.assertTrue(all(sn.batch == 1 and sn.kw > 1 and sn.b_relayout for sn in low))
+        self.assertEqual(sorted((sn.k, sn.m, sn.batch) for sn in kept),
+                         [(2, 128, 1), (64, 64, m["heads"]), (64, 64, m["heads"]), (128, 2, 1)])
 
     def test_fusion_off_is_rejected(self):
         # without the pre-pass the first failure is the ones x mask broadcast

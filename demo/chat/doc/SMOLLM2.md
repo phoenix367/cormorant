@@ -5,7 +5,7 @@ model:
 
 | Model | Backend name | Decode speed | First token | Notes |
 |---|---|---|---|---|
-| `smollm2-135m-instruct` | `smollm2` | ~10 tokens/s | 0.35–1.3 s | fast; fluent but often wrong on facts |
+| `smollm2-135m-instruct` | `smollm2` | ~10 tokens/s | 0.25–1.3 s | fast; fluent but often wrong on facts |
 | `smollm2-360m-instruct` | `smollm2-360m` | ~3.9 tokens/s | ~1 s | better answers; needs most of the CMA |
 
 Each model runs from its own library, `libsmollm2.so` or
@@ -391,9 +391,11 @@ Measured on the board (CHAT_PLAN §13.4, §16.3, §17, §19):
     ~3.1 GB/s, ~87 ms per token.  The host attention adds the rest, and
     that part grows with the position.
   - **History.**  Decode was ~5 tokens/s before CHAT_PLAN §19.
-- **Prefill.**  0.34 / 0.44 / 1.28 s for 16 / 64 / 256 new tokens, with
-  the prefill attention on the FPGA since phase 5 (3.6 s for 256 before).
-  So the first answer of a chat starts after ~0.35–1.3 s, and a follow-up
+- **Prefill.**  0.25 / 0.44 / 1.28 s for 16 / 64 / 256 new tokens, with
+  the prefill attention on the FPGA since phase 5 (3.6 s for 256 before;
+  16 tokens took 0.34 s until the 16-token bucket's linears moved to the
+  SystemVerilog MatmulKernel, MATMUL_RTL_PLAN phase 4).
+  So the first answer of a chat starts after ~0.25–1.3 s, and a follow-up
   turn of a few tens of new tokens after ~0.45 s.
 - **Host overhead per token** on the board's A53: sampling 0.8–2 ms in C
   (greedy / the default settings; ~2.5 ms with DRY); detokenizing 6 µs.

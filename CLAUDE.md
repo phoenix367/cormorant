@@ -14,7 +14,7 @@ Documentation index: `doc/README.md` — docs are grouped in `doc/build-and-test
 
 ## Build System
 
-All four kernels (and the SystemVerilog MatmulKernel, `kernels/matmul_rtl/`) live under `kernels/` and are built from a single top-level CMake project.
+All four kernels live under `kernels/` and are built from a single top-level CMake project: VectorOP, Conv and Pool in Vitis HLS, MatmulKernel in SystemVerilog (`kernels/matmul_rtl/`; `kernels/matmul/` keeps the retired HLS kernel's C++ as its reference model).
 See `doc/build-and-test/BUILD_TARGETS.md` for a full reference of every `make` target.
 
 ```bash
@@ -27,7 +27,7 @@ cmake ../
 make TestSimulation    # VectorOPKernel
 make TestConvRef       # ConvKernel
 make TestConvGrid      # ConvKernel MAC grid (include/ConvMacGrid.h) alone
-make TestMatmulRef     # MatmulKernel
+make TestMatmulRef     # MatmulKernel's C++ reference model (the retired HLS kernel)
 make TestPoolingSim    # PoolingKernel
 make TestMatmulRtl     # MatmulKernel in SystemVerilog (kernels/matmul_rtl/, Verilator 5.x)
 ctest                  # run all
@@ -35,9 +35,9 @@ ctest                  # run all
 # HLS synthesis + Vivado IP export for the KV260
 make synthesize_vectorop_kv260
 make synthesize_conv_kv260
-make synthesize_matmul_kv260
 make synthesize_pool_kv260
-make package_matmul_rtl          # the RTL MatmulKernel IP (Vivado); -DAXI_MATMUL_IMPL=rtl puts it in the hardware build
+make package_matmul_rtl          # MatmulKernel: the SystemVerilog IP (Vivado); its HLS synthesis is retired
+make driver_matmul_rtl           # its C driver, which projects copy (build/kernels/matmul_rtl/driver/...)
 ```
 
 Each kernel can also be built standalone:
@@ -102,7 +102,7 @@ All three ports are `hls::burst_maxi<ap_uint<128>>` (8 elements per beat); the k
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
 - **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across sizes 1…4097 (tail words), saturation boundary cases, and geometry / `act` cases (broadcast chunk 12 stride 16, outer 1000 × 16, stride-0 operands at and past the replay bound, runs > 16 × 256 words); asserts the alignment contract (`inc % 8 == 0`, tail lanes 0, gaps untouched). `--dump-data` writes the RTL fixtures (manifest with an `act` column) into the build tree (`make gen_vectorop_test_data`); the behaviour tests read the checked-in copies in `hw/test_data/vecop_test_data`.
 - **`kernels/vectorop/scripts/Synthesis.tcl.in`** — Vitis HLS TCL template. CMake substitutes paths, flags, and part strings; generates one `.tcl` per platform under `build/<name>/`.
-- **`kernels/matmul_rtl/`** — MatmulKernel in SystemVerilog, a drop-in for the HLS one (same VLNV, registers, layouts, bit-exact; gmem2 128-bit; 128 MAC/cycle GEMM).  Verilator testbench (`TestMatmulRtl`: the HLS fixtures + random cases), `scripts/gen_driver.py` (the C driver with the HLS driver's API, checked against `rtl/mm_ctrl_s_axi.sv`), Vivado packaging.  Its bitstream builds and simulates (`-DAXI_MATMUL_IMPL=rtl`; the hw_128 and test-stand scripts reset instance m_axi widths to the IP defaults after the upgrade, so gmem2 follows the IP) but has not run on the board: `AXI_MATMUL_IMPL=hls` is the default until the board validation (`doc/plans/MATMUL_RTL_PLAN.md`).  Read `doc/kernels/MATMUL_RTL_KERNEL.md` (contract, architecture, invariants) before changing the RTL.
+- **`kernels/matmul_rtl/`** — MatmulKernel in SystemVerilog, a drop-in for the HLS one (same VLNV, registers, layouts, bit-exact; gmem2 128-bit; 128 MAC/cycle GEMM).  Verilator testbench (`TestMatmulRtl`: the HLS fixtures + random cases), `scripts/gen_driver.py` (the C driver with the HLS driver's API, checked against `rtl/mm_ctrl_s_axi.sv`), Vivado packaging.  The hardware build's MatmulKernel since `doc/plans/MATMUL_RTL_PLAN.md` phase 4 (bitstream `1d28630fbfa4`; the hw_128 and test-stand scripts reset instance m_axi widths to the IP defaults after the upgrade, so gmem2 becomes 128); `kernels/matmul/` keeps the HLS kernel's C++ as the reference model and fixture generator.  `platforms/kv260.json` `kernels.matmul.impl = "rtl"` tells the scheduler (`AXI_MATMUL_IMPL=hls` models older bitstreams).  Read `doc/kernels/MATMUL_RTL_KERNEL.md` (contract, architecture, invariants) before changing the RTL.
 - **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.conv` / `kernels.matmul` / `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
 ### Inference Scheduler
@@ -113,7 +113,7 @@ emits a complete C project that drives up to four hardware kernels:
 | Kernel | ONNX ops |
 |--------|----------|
 | VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
-| MatmulKernel | `MatMul` (and fully-connected `Conv`s — the kernel covers the whole input — rewritten to MatMul where faster, `--fc-conv`, `src/fc_conv.py`) — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster); single-row MatMuls on its GEMV streaming path (`--matmul-gemv`, B through both read ports, in ConvKernel's image where a prefill shares the weight — `doc/kernels/MATMUL_OPTIMISATION.md` §8b) |
+| MatmulKernel | `MatMul` (and fully-connected `Conv`s — the kernel covers the whole input — rewritten to MatMul where faster, `--fc-conv`, `src/fc_conv.py`) — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image (its GEMV / image path, `--matmul-gemv`, through both read ports) where that is faster or another entry pinned the weight's layout — one copy of every weight (`doc/scheduler/INFERENCE_SCHEDULER.md` §MatMul GEMV streaming) |
 | ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/plans/BERT_PLAN.md` §2 2A) |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
@@ -147,7 +147,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1633 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1637 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -160,9 +160,9 @@ Key source files:
 - **`inference-scheduler/inference_scheduler.py`** — CLI entry point
 - **`inference-scheduler/src/graph.py`** — ONNX loading, shape inference, Gemm preprocessing, tensor registry
 - **`inference-scheduler/src/nodes.py`** — `ScheduledNode`, `MatmulNode`, `ConvNode`, `MatmulConvNode` (a MatMul on ConvKernel), `PoolNode`, `ReshapeNode`, `SpaceToDepthNode`; every kernel node lists its calls with `kernel_calls()` (`src/perf_calls.py`)
-- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry (`conv_plans`, incl. the row split of accumulator-limited MatMuls); ConvKernel (conv-cycle-model port) and MatmulKernel (board-calibrated) cycle estimates
+- **`inference-scheduler/src/matmul_lowering.py`** / **`cost_model.py`** — MatMul → ConvKernel engine choice and geometry (`conv_plans`, incl. the row split of accumulator-limited MatMuls); ConvKernel (conv-cycle-model port) and MatmulKernel (the RTL kernel's structural model fitted to its calibration; the HLS kernel's board-calibrated block model with `impl = "hls"`) cycle estimates; `shared_weight_layouts` (one layout per weight across entries)
 - **`inference-scheduler/src/fc_conv.py`** — fully-connected Convs (one output pixel) → Flatten + MatMul + Reshape (+ bias Add) where the cost model says MatmulKernel is faster (LeNet 5.44 → 2.81 ms, `doc/plans/LENET_PLAN.md`)
-- **`inference-scheduler/src/matmul_gemv.py`** / **`src/llm_entries.py`** — MatmulKernel GEMV streaming pass (`MatmulNode.gemv_kw`); the Llama entry graphs that let decode read the prefill weight images (one copy per weight)
+- **`inference-scheduler/src/matmul_gemv.py`** / **`src/llm_entries.py`** — MatmulKernel GEMV / image pass (`MatmulNode.gemv_kw`); the Llama entry graphs that let decode read the prefill weight images (one copy per weight)
 - **`inference-scheduler/src/host_nodes.py`** — host-CPU nodes (Softmax, LayerNorm, Gelu, Transpose, Slice, Gather, OneHot, Cast): numpy reference + C helper library side by side
 - **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations

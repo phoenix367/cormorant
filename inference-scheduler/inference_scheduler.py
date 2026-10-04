@@ -210,11 +210,12 @@ def parse_args(argv=None):
         choices=("auto", "always", "off"),
         default="auto",
         help=(
-            "Run single-row MatMuls (batch-1 FC layers) on MatmulKernel's GEMV "
-            "streaming path, which reads B through both of the kernel's read "
-            "ports (MATMUL_OPTIMISATION 8b): 'auto' (default) where the cost "
-            "model estimates it faster than the tiled path, 'always' for every "
-            "eligible MatMul, 'off' for none.  Needs a kernel built with "
+            "Run MatMuls on MatmulKernel's GEMV / image path, which reads B in "
+            "ConvKernel's image through both of the kernel's read ports (any "
+            "MatMul on the RTL kernel; single-row ones on the HLS kernel of "
+            "older bitstreams): 'auto' (default) where the cost model "
+            "estimates it faster than the tiled path, 'always' for every "
+            "eligible MatMul, 'off' for none.  Needs "
             "kernels.matmul.gemv_max_m > 0.  Bit-identical results either way."
         ),
     )

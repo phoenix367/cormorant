@@ -118,24 +118,30 @@ acceptance is gated by `ConvNode.from_onnx_node()`, which raises
 
 ### `kernels.matmul`
 
-Sizes the MatmulKernel's row-staging buffer `a_buf[tile_n][max_k]`
-and the B block buffer `b_tile[tile_m][2·tile_k]` at compile time. See
-[`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3.
+Describes the MatmulKernel the bitstream carries — since MATMUL_RTL_PLAN
+phase 4 the SystemVerilog kernel
+([`MATMUL_RTL_KERNEL.md`](../kernels/MATMUL_RTL_KERNEL.md)), which shares
+`tile_m` (the packed-B DDR tile), `max_k` (its `K_MAX`) and `gemv_max_m > 0`
+(the image path) with the retired HLS kernel.  `tile_n`, `tile_k` and the
+value of `gemv_max_m` size the HLS kernel's C++ model (`kernels/matmul`, the
+reference and fixture generator): its row-staging buffer
+`a_buf[tile_n][max_k]` and B block buffer `b_tile[tile_m][2·tile_k]`
+([`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3).
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
-| `impl` | `"hls"` or `"rtl"` | Which MatmulKernel the platform's bitstream carries: the Vitis HLS kernel (`kernels/matmul`) or the SystemVerilog one (`kernels/matmul_rtl`, [MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)).  Same calls, same results, different speed: it selects the scheduler's MatmulKernel cost model, and it is the default of the CMake `AXI_MATMUL_IMPL`.  The `AXI_MATMUL_IMPL` environment variable overrides it for the Python tools |
-| `tile_n` | power of 2; any `N` works (residual-padded) | Row tile / unroll factor |
+| `impl` | `"rtl"` (the CMake build refuses anything else); the scheduler also takes `"hls"` | Which MatmulKernel the platform's bitstream carries: the SystemVerilog one (`kernels/matmul_rtl`, [MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)), or the Vitis HLS kernel of the bitstreams built before phase 4 (`caa67f49a5a3` and older).  Same calls, same results, different speed: it selects the scheduler's MatmulKernel cost model and engine-choice rules.  The `AXI_MATMUL_IMPL` environment variable overrides it for the Python tools (`AXI_MATMUL_IMPL=hls` for a project on an HLS bitstream) |
+| `tile_n` | power of 2; any `N` works (residual-padded) | Row tile / unroll factor (HLS kernel; the RTL kernel works on panels of 8 rows) |
 | `tile_m` | power of 2, multiple of 8; any `M` works (residual-padded) | Column tile / unroll factor; also the width of the packed-B DDR layout |
-| `tile_k` | power of 2; any `K` works (residual-padded) | K-loop tile (B block rows) |
-| `max_k` | `k ≤ max_k`; multiple of 8 | Hard upper bound on the inner dimension; sizes the row staging buffer. `MatMul` nodes with `k > max_k` are rejected at scheduling |
-| `gemv_max_m` | multiple of 8; 0 = no GEMV path | GEMV streaming mode (`gemv_kw`, MATMUL_KERNEL.md §1): output columns one pass over B accumulates on chip per read stream (one URAM word per 8 columns); a wider `m` is split into column chunks inside the kernel, so it bounds nothing |
+| `tile_k` | power of 2; any `K` works (residual-padded) | K-loop tile (B block rows; HLS kernel) |
+| `max_k` | `k ≤ max_k`; multiple of 8 | Hard upper bound on the inner dimension; sizes the row staging buffer (the RTL kernel's `K_MAX` in `rtl/mm_pkg.sv` must equal it — fact `platform.kv260_bounds`). `MatMul` nodes with `k > max_k` are rejected at scheduling |
+| `gemv_max_m` | multiple of 8; 0 = no GEMV path | GEMV streaming mode (`gemv_kw`, MATMUL_KERNEL.md §1): output columns one pass over B accumulates on chip per read stream (one URAM word per 8 columns); a wider `m` is split into column chunks inside the kernel, so it bounds nothing.  The RTL kernel reads the image at any `m` (512-column chunks); for it only `> 0` matters |
 
 The Python side reads `impl` (the engine cost model), `max_k` (validation),
 `tile_m` (the packed-B layout the scheduler emits for constant B operands),
 `tile_n` (the HLS kernel's engine cost model and the `--plan` performance
-model only) and `gemv_max_m` (whether the GEMV path exists, and the
-cost model's column chunks). `tile_k` is a pure C++ tiling factor.
+model's HLS features only) and `gemv_max_m` (whether the GEMV path exists,
+and the HLS cost model's column chunks). `tile_k` is a pure C++ tiling factor.
 Setting `gemv_max_m` to 0 also changes the generated `run_matmul()`: it
 then does not write the `gemv_kw` / `a_to_b` registers, so projects
 build against drivers without them.
@@ -182,7 +188,7 @@ residual-lane padding for any `out_w`).
       "max_m_per_group":         4
     },
     "matmul": {
-      "impl":   "hls",
+      "impl":   "rtl",
       "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 4096,
       "gemv_max_m": 4096
     },

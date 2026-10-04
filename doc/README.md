@@ -59,10 +59,10 @@ there, with measured numbers) per kernel:
 | Kernel | Reference | Optimisation log |
 |---|---|---|
 | VectorOPKernel — element-wise ops | [VECTOROP_KERNEL](kernels/VECTOROP_KERNEL.md) | [VECTOROP_OPTIMISATION](kernels/VECTOROP_OPTIMISATION.md) |
-| MatmulKernel — tiled GEMM | [MATMUL_KERNEL](kernels/MATMUL_KERNEL.md) | [MATMUL_OPTIMISATION](kernels/MATMUL_OPTIMISATION.md) |
+| MatmulKernel — SystemVerilog, 128 MAC/cycle GEMM, GEMV / image path | [MATMUL_RTL_KERNEL](kernels/MATMUL_RTL_KERNEL.md) | — ([MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md)) |
 | ConvKernel — 2-D and depthwise convolution | [CONV_KERNEL](kernels/CONV_KERNEL.md) | [CONV_OPTIMISATION](kernels/CONV_OPTIMISATION.md) |
 | PoolingKernel — max / average / Lp pooling | [POOLING_KERNEL](kernels/POOLING_KERNEL.md) | [POOL_OPTIMISATION](kernels/POOL_OPTIMISATION.md) |
-| MatmulKernel in SystemVerilog — 128 MAC/cycle GEMM, drop-in for the HLS one (validated on the board; not yet the default) | [MATMUL_RTL_KERNEL](kernels/MATMUL_RTL_KERNEL.md) | — ([MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md)) |
+| MatmulKernel in Vitis HLS — tiled GEMM (retired from the hardware build in MATMUL_RTL_PLAN phase 4; its C++ is the RTL kernel's reference model) | [MATMUL_KERNEL](kernels/MATMUL_KERNEL.md) | [MATMUL_OPTIMISATION](kernels/MATMUL_OPTIMISATION.md) |
 
 [HLS_CONV_RESEARCH](kernels/HLS_CONV_RESEARCH.md) is a background literature
 survey of HLS convolution techniques (not a plan).
@@ -95,11 +95,11 @@ line at the top says what is done.
 | [THROUGHPUT_PLAN](plans/THROUGHPUT_PLAN.md) | MatMul, depthwise and VectorOP throughput tracks (2026-09-25/26): executed |
 | [CONV_2D_GRID_PLAN](plans/CONV_2D_GRID_PLAN.md) | The 2-D MAC grid for ConvKernel: executed, then grown further by RESNET18_15FPS_PLAN |
 | [RESNET18_15FPS_PLAN](plans/RESNET18_15FPS_PLAN.md) | ResNet-18 at 15 FPS: met (60.3 ms = 16.6 FPS) |
-| [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference (962 ms p50 on 2026-09-28), accuracy equal to float32 |
+| [BERT_PLAN](plans/BERT_PLAN.md) | BERT-base SQuAD on the board: 971 ms per inference (953 ms p50 on 2026-10-04, the RTL MatmulKernel bitstream), accuracy equal to float32 |
 | [CHAT_PLAN](plans/CHAT_PLAN.md) | Chat app: OpenAI-compatible server, SmolLM2-135M on the FPGA (~10 tokens/s), sampling, attention, the board-hang workaround (§18), the one-copy GEMV decode (§19), SmolLM2-360M (§20), reproducible calibration (§21) and SmolVLM-256M image chat (§22–§24, 3.9 s per image) |
 | [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TTS_PLAN](plans/TTS_PLAN.md) | Text to speech: Audio8 TTS Preview 0.1B — NO-GO for real time (18 GB/s of weights needed, 2.9 GB/s available); candidate screen — Piper, TinyTTS, Kitten nano and Supertonic-3 fit; Piper lessac-medium study — GO (int16 within 0.19 dB log-mel of float); implementation — `libpiper_tts.so` bit-exact on the board, RTF 0.52; `/v1/audio/speech` in the chat server; the text encoder on the FPGA (int16, 0.37 dB log-mel from float, 3.7–4.9× faster) and the duration predictor in C (3×); first audio 1.0–1.5 s |
-| [MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md) | Replacing the HLS MatmulKernel with the SystemVerilog one: phases 0–3 done — in the repository, bitstream (timing met, 8.6 k LUT / 17.8 k FF fewer), bit-exact on the board with no workload slower (2b: K balance), the scheduler's RTL cost model and one-copy engine choices (16-token LLM prefill −26…−32 %, MobileNet v1 −10 %); the switch open |
+| [MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md) | Replacing the HLS MatmulKernel with the SystemVerilog one: done — in the repository, bitstream `1d28630fbfa4` (timing met, 8.7 k LUT / 17.8 k FF fewer), bit-exact on the board with no workload slower, the scheduler's RTL cost model and one-copy engine choices (16-token LLM prefill −26…−32 %, MobileNet v1 −10 %), the default of the build, the scheduler and the board since phase 4 |
 | [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board, BERT and SmolVLM vision −1.1 % |
 
 ## Claude Code skills

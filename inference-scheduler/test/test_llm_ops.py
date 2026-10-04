@@ -28,6 +28,7 @@ import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 import host_emu
+from helpers import matmul_impl
 from src import numeric
 from src.codegen import CodeGenerator
 from src.dtype import AP_FIXED_16_8 as Q
@@ -393,9 +394,12 @@ class TestFpgaAttention(unittest.TestCase):
         self.assertTrue((out[n:] == 0).all())
         del S
 
+    @matmul_impl("hls")
     def test_runtime_geometry(self):
         """The q.K^T / P.V calls' registers: keys16 goes into out_ch / in_ch,
-        the rest is fixed at codegen; the plan's estimates favour ConvKernel."""
+        the rest is fixed at codegen; the plan's estimates favour ConvKernel
+        over the HLS MatmulKernel (the RTL one would be faster on this tiny
+        geometry; the estimates are informational, report.md)."""
         cg = CodeGenerator(OnnxGraph(fpga_attention_model(T=16, kw=2)), model_path="g.onnx")
         convs = [sn for sn in cg._graph.nodes if isinstance(sn, LlmAttnConvNode)]
         self.assertEqual([sn.kind for sn in convs], ["qk", "qk", "pv", "pv"])

@@ -50,9 +50,12 @@ endif()
 # These are the single source of truth, defined under "kernels.matmul" in
 # each platforms/<name>.json — there are NO CMake CACHE defaults; the JSON is
 # authoritative.  matmul_load_constants() errors out if any field is missing
-# rather than silently defaulting.  Field reference:
+# rather than silently defaulting.  Field reference (the C++ model's; the RTL
+# kernel shares tile_m = the packed-B DDR tile, max_k and gemv_max_m > 0 =
+# the image path; tile_n / tile_k are the C++ model's internal tiling):
 #   tile_n   row interleave depth (power of 2; >= MAC latency for II=1)
-#   tile_m   parallel output columns per cycle (power of 2)
+#   tile_m   parallel output columns per cycle (power of 2); the packed-B
+#            tile width of the DDR layout
 #   tile_k   on-chip B-buffer row count (power of 2)
 #   max_k    compile-time a_buf row-length limit; K > max_k is rejected at
 #            scheduling
@@ -87,10 +90,6 @@ message(STATUS "MatmulKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
 # generated Config.h tracks JSON edits without a manual cmake re-run.
 set_property(DIRECTORY APPEND PROPERTY
     CMAKE_CONFIGURE_DEPENDS "${AXI_DEFAULT_PLATFORM_JSON}")
-foreach(_PF IN LISTS AXI_PLATFORM_FILES)
-    set_property(DIRECTORY APPEND PROPERTY
-        CMAKE_CONFIGURE_DEPENDS "${_PF}")
-endforeach()
 
 # ---------------------------------------------------------------------------
 # Generate Config.h into the build directory
@@ -102,8 +101,8 @@ configure_file(
 )
 
 # ---------------------------------------------------------------------------
-# Kernel library — MatmulKernel.cpp compiled as a static lib so that both
-# the C++ simulation target and the future HLS synthesis target can link it.
+# Kernel library — MatmulKernel.cpp (the HLS kernel's C++, the reference
+# model of the RTL kernel) compiled as a static lib for the C++ tests.
 # ---------------------------------------------------------------------------
 add_library(matmul_kernel STATIC
     kernel/MatmulKernel.cpp
@@ -121,11 +120,8 @@ endif()
 target_compile_options(matmul_kernel PRIVATE -Wall -Wextra -O2 -Wno-unknown-pragmas)
 
 # ---------------------------------------------------------------------------
-# TestMatmulRef — C++ simulation test, no Vitis HLS synthesis required.
-#
-# Compiles and runs entirely with standard GCC.  The name "Ref" reflects that
-# this is the Phase 1 reference; Phase 2 will rename/extend to TestMatmulSim
-# once the HLS kernel function is wired in.
+# TestMatmulRef — C++ simulation test: the kernel function (MatmulKernel.cpp)
+# against ref_matmul_2d(); compiles and runs entirely with standard GCC.
 # ---------------------------------------------------------------------------
 add_executable(TestMatmulRef
     test/TestMatmulSim.cpp
@@ -198,166 +194,8 @@ message(STATUS "MatmulKernel: Data_t=${MM_DATA_TYPE}  "
                "TILE_N=${MM_TILE_N}  TILE_M=${MM_TILE_M}  "
                "TILE_K=${MM_TILE_K}  MAX_K=${MM_MAX_K}  GEMV_MAX_M=${MM_GEMV_MAX_M}")
 
-# ---------------------------------------------------------------------------
-# HLS synthesis targets — one per platform JSON file in platforms/.
-#
-# Requires Vitis HLS (vitis-run for 2024.x+, vitis_hls for older versions).
-# Each JSON must have a "part" field; "board" and "clock" are optional.
-#
-# Generated targets:
-#   make synthesize_<name>   — C synthesis + ip_catalog export for that part
-# ---------------------------------------------------------------------------
-find_program(MM_VITIS_HLS NAMES vitis-run vitis_hls
-    HINTS
-        $ENV{XILINX_HLS}/bin
-        $ENV{XILINX_VITIS}/bin
-        /mnt/data/xilinx/2025.2/Vitis/bin
-    DOC "Vitis HLS executable (vitis-run for 2024.x+, vitis_hls for older)")
-
-if(MM_VITIS_HLS)
-    # vitis-run (2024.x+) uses --tcl; the old vitis_hls used -f.
-    if(MM_VITIS_HLS MATCHES "vitis-run")
-        set(MM_HLS_TCL_FLAG "--tcl")
-    else()
-        set(MM_HLS_TCL_FLAG "-f")
-    endif()
-    message(STATUS "MatmulKernel: HLS synthesis enabled via ${MM_VITIS_HLS} ${MM_HLS_TCL_FLAG}")
-else()
-    message(STATUS "MatmulKernel: vitis_hls / vitis-run not found — synthesis targets disabled")
-endif()
-
-if(MM_VITIS_HLS)
-    set(MM_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel/MatmulKernel.cpp")
-
-    set(_MM_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
-    foreach(_MM_PLATFORM_FILE IN LISTS _MM_PLATFORM_FILES)
-        get_filename_component(_pname "${_MM_PLATFORM_FILE}" NAME_WE)
-        file(READ "${_MM_PLATFORM_FILE}" _pjson)
-
-        # Required: FPGA part string
-        string(JSON _p_part ERROR_VARIABLE _e1 GET "${_pjson}" part)
-        if(_e1)
-            message(WARNING "MatmulKernel platform '${_pname}': missing 'part' — skipping.")
-            continue()
-        endif()
-
-        # Optional: board identifier
-        string(JSON _p_board ERROR_VARIABLE _e GET "${_pjson}" board)
-        if(_e)
-            set(_p_board "")
-        endif()
-
-        # Optional: target clock in MHz (default 300)
-        string(JSON _p_clock ERROR_VARIABLE _e GET "${_pjson}" clock)
-        if(_e)
-            set(_p_clock "300")
-        endif()
-
-        # Per-platform build directory
-        set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
-        file(MAKE_DIRECTORY "${_p_build_dir}")
-
-        # Per-platform matmul constants — drives this platform's Config.h
-        # rather than the C-sim default platform's values, so each
-        # synthesised IP uses bounds tuned for that platform.  Stash the
-        # C-sim values so we can restore them after configure_file().
-        set(_save_TILE_N "${MM_TILE_N}")
-        set(_save_TILE_M "${MM_TILE_M}")
-        set(_save_TILE_K "${MM_TILE_K}")
-        set(_save_MAX_K  "${MM_MAX_K}")
-        set(_save_GEMV_MAX_M "${MM_GEMV_MAX_M}")
-
-        matmul_load_constants("${_MM_PLATFORM_FILE}" MM)
-
-        # Generate a platform-specific Config.h using these constants.
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/include/Config.h.in"
-            "${_p_build_dir}/Config.h"
-            @ONLY)
-
-        set(MM_TILE_N "${_save_TILE_N}")
-        set(MM_TILE_M "${_save_TILE_M}")
-        set(MM_TILE_K "${_save_TILE_K}")
-        set(MM_MAX_K  "${_save_MAX_K}")
-        set(MM_GEMV_MAX_M "${_save_GEMV_MAX_M}")
-
-        # set_part TCL command (with optional -board)
-        if(_p_board)
-            set(MM_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
-        else()
-            set(MM_BOARD_OPTION "set_part {${_p_part}}")
-        endif()
-
-        # Variables consumed by Synthesis.tcl.in (@ONLY substitution)
-        set(MM_HLS_PROJECT_NAME  "matmul_${_pname}")
-        set(MM_SRC_SYNTHESIS     "${MM_KERNEL_SRC}")
-        set(MM_SYNTHESIS_FLAGS
-            "-O3 -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${_p_build_dir}")
-        set(MM_TARGET_CLOCK_TCL  "${_p_clock}")
-        set(MM_IP_OUTPUT_DIR     "${_p_build_dir}/ip_catalog")
-
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Synthesis.tcl.in"
-            "${_p_build_dir}/synthesize_${_pname}.tcl"
-            @ONLY)
-
-        # Clean stale HLS project + IP catalog so old Verilog from a prior
-        # run isn't re-exported into the IP archive (which then breaks
-        # downstream Vivado packaging when source files have been removed
-        # or renamed since the last synthesis).
-        add_custom_target(
-            "synthesize_matmul_${_pname}"
-            COMMAND ${CMAKE_COMMAND} -E rm -rf
-                    "${_p_build_dir}/${MM_HLS_PROJECT_NAME}"
-                    "${MM_IP_OUTPUT_DIR}"
-            COMMAND ${MM_VITIS_HLS} ${MM_HLS_TCL_FLAG}
-                    "${_p_build_dir}/synthesize_${_pname}.tcl"
-            WORKING_DIRECTORY "${_p_build_dir}"
-            COMMENT "HLS synthesis: MatmulKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
-            DEPENDS
-                "${MM_KERNEL_SRC}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include/MatmulKernel.h"
-                "${_p_build_dir}/Config.h")
-
-        message(STATUS "MatmulKernel: synthesis target 'synthesize_${_pname}' "
-                       "(${_p_part} @ ${_p_clock} MHz)")
-
-        # -------------------------------------------------------------------
-        # cosim_matmul_<name> — C synthesis + RTL co-simulation in ONE run.
-        #
-        # csynth_design and cosim_design are sequenced in a single TCL (see
-        # Cosim.tcl.in), so one vitis-run invocation produces a component
-        # whose run summary covers both — `vitis -a <component>` then shows
-        # the cosim report (measured latency / II) alongside synthesis.
-        #
-        # Separate component (matmul_<name>_cosim) so it never clobbers the
-        # synthesize target's matmul_<name> component / exported IP.  cosim
-        # RTL-simulates the whole TestMatmulSim.cpp test bench, so this target
-        # is slow (minutes) and is intentionally NOT a dependency of anything.
-        # -------------------------------------------------------------------
-        set(MM_COSIM_COMPONENT "matmul_${_pname}_cosim")
-        set(MM_TB_SYNTHESIS    "${CMAKE_CURRENT_SOURCE_DIR}/test/TestMatmulSim.cpp")
-
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Cosim.tcl.in"
-            "${_p_build_dir}/cosim_${_pname}.tcl"
-            @ONLY)
-
-        add_custom_target(
-            "cosim_matmul_${_pname}"
-            COMMAND ${CMAKE_COMMAND} -E rm -rf
-                    "${_p_build_dir}/${MM_COSIM_COMPONENT}"
-            COMMAND ${MM_VITIS_HLS} ${MM_HLS_TCL_FLAG}
-                    "${_p_build_dir}/cosim_${_pname}.tcl"
-            WORKING_DIRECTORY "${_p_build_dir}"
-            COMMENT "HLS synth + cosim: MatmulKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
-            DEPENDS
-                "${MM_KERNEL_SRC}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include/MatmulKernel.h"
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/TestMatmulSim.cpp"
-                "${_p_build_dir}/Config.h")
-
-        message(STATUS "MatmulKernel: cosim target 'cosim_matmul_${_pname}' "
-                       "(${_p_part} @ ${_p_clock} MHz)")
-    endforeach()
-endif()
+# The HLS synthesis (synthesize_matmul_<platform>, cosim_matmul_<platform>) was
+# retired: the hardware build packages the SystemVerilog MatmulKernel
+# (kernels/matmul_rtl, doc/plans/MATMUL_RTL_PLAN.md phase 4).  This C++ model
+# stays as the oracle (TestMatmulRef, TestMatmulBlas) and writes the fixtures
+# the RTL testbenches check (gen_matmul_test_data).

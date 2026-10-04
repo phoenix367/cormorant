@@ -12,17 +12,19 @@ It does 128 MAC/cycle on GEMM (the HLS kernel: 32) and 16 on GEMV (port-bound,
 as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 ([Resources and timing](#resources-and-timing)).
 
-**Status (2026-10-04):** with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds
-(timing met at 100 MHz) and passes the test stand's matmul behaviour test
+**Status (2026-10-04):** the MatmulKernel of the KV260 hardware build and of
+the board (bitstream `1d28630fbfa4`, MATMUL_RTL_PLAN phase 4); the HLS
+kernel's synthesis is retired, its C++ reference `ref_matmul_2d` stays and
+writes the fixtures every RTL test checks against.  The bitstream meets
+timing at 100 MHz and passes the test stand's matmul behaviour test
 (50 / 50) and the whole-design simulation (68 / 68).  On the board it is
 bit-exact everywhere (148 models, every demo and chat / TTS gate), 2–11×
-faster on tiled and depthwise-shaped MatMuls and at least as fast on GEMV
-(SmolLM2-135M decode 98.0 vs 99.3 ms / token with the HLS kernel) — after
-the K-balance fix of phase 2b.  The hardware build still uses the HLS kernel
-by default (`AXI_MATMUL_IMPL=hls`).  Next: the performance models (phase 3),
-then the switch and the retirement of the HLS kernel's synthesis (its C++
-reference `ref_matmul_2d` stays: it writes the fixtures every RTL test checks
-against) — [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
+faster than the HLS kernel on tiled and depthwise-shaped MatMuls and at
+least as fast on GEMV (phase 2b balanced K between the lanes).  The
+scheduler models it (`kernels.matmul.impl = "rtl"`, phase 3) and moves
+MatMuls to it where it is faster while keeping one copy of every weight:
+16-token LLM prefills 26–32 % faster, MobileNet v1 10 % —
+[MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md).
 
 Contents: [Building and testing](#building-and-testing) ·
 [Software driver](#software-driver) · [Interface contract](#interface-contract) ·
@@ -53,14 +55,19 @@ make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP,
 
 | CMake cache variable | Default | Meaning |
 |---|---|---|
-| `AXI_MATMUL_IMPL` | `hls` | Which MatmulKernel IP `synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260` / `behavior_test_matmul` use: `hls` (the Vitis export) or `rtl` (`package_matmul_rtl`; Vivado then scans `build/ip_repo_kv260/`, which links the three HLS kernels and this IP — both MatmulKernel IPs have the same VLNV).  After the IP upgrade the hardware and test-stand scripts reset every kernel instance's `C_M_AXI_*_DATA_WIDTH` to its IP's default, so `MatmulKernel_0`'s gmem2 becomes 128 with this IP and 32 again with the HLS one |
 | `MM_RTL_FIXTURES` | `hw/test_data/matmul_test_data` | Fixtures `TestMatmulRtl` checks (`make gen_matmul_test_data` rewrites them from `ref_matmul_2d`) |
 | `MM_RTL_RANDOM_CASES` | 200 | Random cases after the fixtures in `TestMatmulRtl` |
 | `MM_RTL_PERIOD` | 3.333 | `synth_matmul_rtl` clock period in ns (300 MHz) |
 
-The IP is packaged outside `build/kernels/` on purpose: with
-`AXI_MATMUL_IMPL=hls` the hardware build scans that whole tree as its IP
-repository.
+`synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260` /
+`behavior_test_matmul` use this IP (`package_matmul_rtl`): Vivado scans
+`build/ip_repo_kv260/`, which links the three HLS kernels and this IP.  After
+the IP upgrade the hardware and test-stand scripts reset every kernel
+instance's `C_M_AXI_*_DATA_WIDTH` to its IP's default, so `MatmulKernel_0`'s
+gmem2 becomes 128 (the block designs still say 32, the HLS kernel's width).
+Generated projects take the driver from `driver_matmul_rtl`
+(`build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src`, the files the IP
+carries).
 
 **Testbench** (`build/kernels/matmul_rtl/vl/Vtb`, `tb/verilator/tb_main.cpp`):
 
@@ -187,8 +194,9 @@ Every matrix starts at its base address plus `bi * *_batch_stride`
 - **Write strobes:** each C run (a whole panel when the chunk spans all m
   columns, else one row) goes out as bursts of up to 64 beats, with partial
   strobes only on its first and last beat.  The KV260 PS was seen dropping
-  beats of single-beat partial-strobe writes (`kernels/matmul/scripts/Synthesis.tcl.in`,
-  2026-09-24) — a board check of phase 2.
+  beats of single-beat partial-strobe writes (2026-09-24, the HLS kernel's
+  `-m_axi_min_bitwidth` experiment) — checked on the board in phase 2:
+  targeted partial-strobe C writes 8 / 8.
 
 ### Arithmetic (bit-exact with `ref_matmul_2d` and the fixtures)
 
@@ -409,7 +417,7 @@ once-per-step address updates in the walker and run generator).  The current blo
 - **System level (`make sysim_matmul_rtl`):**
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
-- **Full design (`sim_hw_kv260`, `AXI_MATMUL_IMPL=rtl`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
+- **Full design (`sim_hw_kv260`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
 - **Board (phases 2 and 2b):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks show no case slower than the HLS kernel's ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phases 2 and 2b).
 
 ## Source files
@@ -477,4 +485,4 @@ tree in the MAC path, and a column's kw taps are reduced once in the drain.
 - **k > 4096:** out of contract. k is clamped internally, so the job completes but C is undefined.
 - **Serial A load per panel:** A is single-buffered and shares the port with B. Small-k GEMMs (e.g. 256×64×64) spend ~20 % of their time reloading A. A second A bank would not help while A and B share a port; widening the effective A load (both ports per row) would.
 - **K balance:** the lanes split K by blocks of 16 planes and halves of the last one, so they differ by at most 8 planes plus a partial block (an even number of blocks whose last one is short: up to 15 planes, e.g. k = 24 → 16 : 8).  Small-k jobs are therefore not perfectly balanced.
-- **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; 150 MHz is the plan).
+- **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; out of context the kernel closes timing at ~300 MHz, a faster PL clock is not attempted yet).

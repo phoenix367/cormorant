@@ -7,6 +7,13 @@ experiment, the rationale, and the measured HW behavior-simulation
 
 For the high-level kernel description see [MATMUL_KERNEL.md](MATMUL_KERNEL.md).
 
+> **Retired (2026-10-04).**  The hardware build no longer synthesises this
+> kernel: the bitstream carries the SystemVerilog MatmulKernel
+> ([MATMUL_RTL_KERNEL.md](MATMUL_RTL_KERNEL.md), [MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md)
+> phase 4).  This log is the HLS kernel's history; its commands
+> (`synthesize_matmul_kv260`, `cosim_matmul_kv260`) are gone, and
+> `behavior_test_matmul` now runs the RTL IP.
+
 > **Status (2026-09-27).** §1 is the original single-sequential-loop-nest
 > kernel; §2 records a DATAFLOW restructuring that was **tried and
 > rejected**; §3 / §3b (128-bit ports, packed B) and §4–§8 (Track A of

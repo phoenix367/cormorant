@@ -20,12 +20,16 @@ FC layers and LLM decode — by streaming B once per row through **both**
 read ports, in the ConvKernel input image a MatMul lowered onto ConvKernel
 reads, so a weight both kernels use needs one DDR copy.
 
-A SystemVerilog drop-in replacement with the same registers, layouts and
-results (128 MAC/cycle GEMM, 128-bit C port) is in `kernels/matmul_rtl/`:
-[MATMUL_RTL_KERNEL](MATMUL_RTL_KERNEL.md).  Its bitstream builds
-(`AXI_MATMUL_IMPL=rtl`) but has not run on the board yet
-([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md)); this kernel's C++
-reference (`ref_matmul_2d`) writes the fixtures both are tested against.
+> **Retired from the hardware build (2026-10-04, MATMUL_RTL_PLAN phase 4).**
+> The bitstream carries a SystemVerilog drop-in with the same registers,
+> layouts and results (128 MAC/cycle GEMM, 128-bit C port),
+> `kernels/matmul_rtl/`: [MATMUL_RTL_KERNEL](MATMUL_RTL_KERNEL.md).  This
+> kernel's HLS synthesis targets are gone; its C++ (`MatmulKernel.cpp`,
+> `ref_matmul_2d`, `TestMatmulRef`, `TestMatmulBlas`) stays as the reference
+> model and writes the fixtures the RTL kernel is tested against.  The
+> register map, DDR layouts and arithmetic below hold for both kernels; the
+> microarchitecture, synthesis and resource sections describe the retired
+> HLS kernel (bitstreams `caa67f49a5a3` and older).
 
 ---
 
@@ -412,7 +416,7 @@ emit hex fixtures (A / B / C_ref per case plus a `manifest.txt` with
 `b_packed` and `gemv_kw` columns; GEMV cases with B over 64 k elements are
 left out) into `build/matmul_test_data/`; the RTL behaviour test reads the
 checked-in copy under `hw/test_data/matmul_test_data/` (manifests with or
-without the `gemv_kw` column).  `make cosim_matmul_kv260` runs the same
+without the `gemv_kw` column).  The retired `cosim_matmul_kv260` ran the same
 cases in C/RTL co-simulation; GEMV cases put A and B in one buffer (port
 `a` reaches B at `a_to_b`) and those larger than the cosim depths are
 skipped.
@@ -473,19 +477,15 @@ the result.
 make TestMatmulRef && ctest -R Matmul    # TestMatmulBlas too when BLAS is found
 make gen_matmul_test_data                # RTL fixtures → build/matmul_test_data/
 
-# HLS synthesis + IP export for KV260
-make synthesize_matmul_kv260
-make cosim_matmul_kv260                  # csynth + C/RTL co-simulation (slow)
+# the hardware: the RTL kernel (MATMUL_RTL_KERNEL.md)
+make package_matmul_rtl                  # IP -> build/rtl_ip/MatmulKernel_ip
 make behavior_test_matmul                # Vivado xsim on the test stand (hw/cormorant_test_stand)
 ```
 
-The synthesis target reads a `platforms/<name>.json` (part, optional board
-and clock) and invokes Vitis HLS via `Synthesis.tcl.in` (Vitis unified
-component flow, `open_component`), which sets the part and clock, enables
-64-bit AXI addresses and `-m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}`, runs
-`csynth_design`, and exports an IP-catalog archive
-(`build/kernels/matmul/<name>/ip_catalog.zip`; the IP repository Vivado
-uses is `build/kernels/matmul/<name>/matmul_<name>/hls/impl/ip`).
+The HLS synthesis (`synthesize_matmul_kv260`, `cosim_matmul_kv260`, the
+`Synthesis.tcl.in` / `Cosim.tcl.in` templates of the Vitis unified component
+flow) was removed in MATMUL_RTL_PLAN phase 4; the last HLS bitstream is
+`caa67f49a5a3` (hw_128 d7ce129), the git history has the scripts.
 
 ---
 
@@ -493,13 +493,11 @@ uses is `build/kernels/matmul/<name>/matmul_<name>/hls/impl/ip`).
 
 | File | Purpose |
 |------|---------|
-| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel — tiled loop nest |
+| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel — tiled loop nest; the RTL kernel's C++ reference model |
 | `kernels/matmul/include/MatmulKernel.h` | Kernel declaration, `saturate_cast<T>` |
 | `kernels/matmul/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `AccData_t`, tile constants) |
 | `kernels/matmul/test/TestMatmulSim.cpp` | C simulation tests (GCC) |
 | `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
-| `kernels/matmul/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
-| `kernels/matmul/scripts/Cosim.tcl.in` | csynth + C/RTL co-simulation TCL template |
 | `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`, `gemv_max_m`) |
 | `inference-scheduler/src/_matmul_hw_config.py` | Scheduler-side reader of the same bounds |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |

@@ -52,9 +52,9 @@ directories on the board.
 ## 2. Bitstream id — which baseline
 
 ```bash
-BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # caa67f49a5a3
+BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 1d28630fbfa4
 (cd inference-scheduler && .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())")
-ls .claude/skills/perf-regression/baselines/                               # kv260-caa67f49a5a3.json
+ls .claude/skills/perf-regression/baselines/                               # kv260-1d28630fbfa4.json, kv260-caa67f49a5a3.json (HLS MatmulKernel)
 ```
 The board's id is what gets measured; always pass it (`--bitstream-id
 $BID`).  A local id that differs means the board runs another bitstream
@@ -62,7 +62,7 @@ than `bitstream_config_kv260.json` names — say so.  No
 `baselines/kv260-$BID.json` → nothing to compare against; run anyway,
 show the numbers, offer to record them as the new baseline (step 7):
 ```
-no baseline for kv260 bitstream 0123456789ab (…/baselines/kv260-0123456789ab.json); recorded ones: kv260-caa67f49a5a3.json
+no baseline for kv260 bitstream 0123456789ab (…/baselines/kv260-0123456789ab.json); recorded ones: kv260-1d28630fbfa4.json, kv260-caa67f49a5a3.json
 nothing compared — rerun with --record to make these results the baseline      (exit 3)
 ```
 
@@ -85,10 +85,11 @@ FAILED).
 ```bash
 $PY $CMP --run $TMPDIR/perf_$STAMP.json --bitstream-id $BID     # --brief: summary only
 ```
-Output shape (validation run 2026-09-29 14:31 against the 09:53 run, same bitstream):
+Output shape (validation run 2026-09-29 14:31 against the 09:53 run, same bitstream;
+the id shown is today's bitstream):
 ```
 kernels: baseline run 2026-09-29 09:53 (…/perf_20260929.json)
-platform kv260, bitstream caa67f49a5a3
+platform kv260, bitstream 1d28630fbfa4
 
   section         case                         base ms     now ms   Δlat %   Δthr %  flag
   VectorOPKernel  ADD-1K                        0.0087     0.0088    +1.15    -0.57

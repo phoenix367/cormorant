@@ -19,7 +19,7 @@ JSON shape (only the fields this module reads)::
     {
       "kernels": {
         "matmul": {
-          "impl":   "hls",
+          "impl":   "rtl",
           "tile_n":   4,
           "tile_m":  16,
           "tile_k": 256,
@@ -46,21 +46,26 @@ silently falling back to defaults.
 (the Vitis HLS kernel, ``kernels/matmul``) or ``"rtl"`` (the SystemVerilog
 one, ``kernels/matmul_rtl``).  The two run the same calls bit-identically
 but at different speeds, so it selects the engine cost model
-(``cost_model.py``) behind the automatic engine choices; the CMake build
-takes its ``AXI_MATMUL_IMPL`` default from it.  The ``AXI_MATMUL_IMPL``
-environment variable overrides it, as the CMake cache variable of the same
-name does for the build (doc/plans/MATMUL_RTL_PLAN.md phase 3).
+(``cost_model.py``) behind the automatic engine choices.  The hardware build
+packages only the RTL kernel and refuses any other value (the HLS kernel's
+synthesis was retired, doc/plans/MATMUL_RTL_PLAN.md phase 4); ``"hls"``
+models the bitstreams built before (``caa67f49a5a3`` and older).  The
+``AXI_MATMUL_IMPL`` environment variable overrides it for the scheduler
+(e.g. ``AXI_MATMUL_IMPL=hls`` for a project on such a bitstream).
 
 ``tile_n``, ``tile_k`` are read but not exported to the validator: any
 ``n`` / ``m`` / ``k`` runs (residual-tile padded inside the kernel), so
-models cannot violate them.  ``tile_m`` is exported because the packed
+models cannot violate them; they are the HLS kernel's tiling (its C++
+model, ``kernels/matmul``, and the ``"hls"`` cost model), which the RTL
+kernel does not use.  ``tile_m`` is exported because the packed
 tile-major B layout the scheduler emits for constant weights
 (``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the
 hard upper bound — see ``doc/kernels/MATMUL_KERNEL.md`` §3 "Runtime constraint
 validated by the scheduler".  ``gemv_max_m`` is the GEMV streaming mode's
 accumulator depth (``MatmulNode.gemv_kw``); 0 means the kernel has no GEMV
 path and the scheduler never selects it — a wider ``m`` is split into
-column chunks inside the kernel, so it is not a bound either.
+column chunks inside the kernel, so it is not a bound either (the RTL kernel
+chunks at 512 columns whatever the value; > 0 says it reads the image).
 """
 
 from __future__ import annotations

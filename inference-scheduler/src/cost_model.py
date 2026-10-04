@@ -20,8 +20,9 @@ cannot drift apart silently: ``test/test_matmul_on_conv.py`` compares them
 on a geometry sweep.  That model tracked the RTL behavior test within ~5 %
 on the > 20 k-cycle cases at every kernel step.
 
-MatmulKernel
-------------
+MatmulKernel (HLS, ``kernels.matmul.impl == "hls"``)
+-----------------------------------------------------
+The kernel of the bitstreams built before MATMUL_RTL_PLAN phase 4.
 ``matmul_cycles`` is a block model of MatmulKernel after Track A
 (MATMUL_OPTIMISATION.md §4–§8): the output is computed in
 ``ceil(n / kTileN) × ceil(m / kTileM)`` blocks, each a K-loop of
@@ -37,8 +38,8 @@ FC layers (1×1280·1280×1001: 1.75 ms, model 1.82).
 
 MatmulKernel in SystemVerilog
 -----------------------------
-With ``kernels.matmul.impl == "rtl"`` in the platform JSON (or
-``AXI_MATMUL_IMPL=rtl``) the bitstream carries the RTL kernel
+With ``kernels.matmul.impl == "rtl"`` in the platform JSON (the KV260's
+since MATMUL_RTL_PLAN phase 4) the bitstream carries the RTL kernel
 (``kernels/matmul_rtl``, doc/kernels/MATMUL_RTL_KERNEL.md), and
 ``matmul_cycles`` / ``gemv_cycles`` use ``rtl_matmul_cycles``: a structural
 model of its job walk — panels of 8 A rows × column chunks of at most 512

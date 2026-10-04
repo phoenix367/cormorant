@@ -50,7 +50,7 @@
 <text x="360.0" y="528.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">cache clean / invalidate</text>
 <rect x="510.0" y="492.0" width="260.0" height="56.0" rx="4" fill="#9b6bff"/>
 <text x="640.0" y="511.6" font-size="13.5" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="central">Kernel drivers</text>
-<text x="640.0" y="528.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">Vitis HLS, over UIO</text>
+<text x="640.0" y="528.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">Xilinx driver API, over UIO</text>
 <rect x="230.0" y="558.0" width="260.0" height="56.0" rx="4" fill="#9b6bff"/>
 <text x="360.0" y="577.6" font-size="13.5" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="central">kernel_wait</text>
 <text x="360.0" y="594.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">kernels on different lanes overlap</text>
@@ -73,7 +73,7 @@
 <text x="1240.0" y="528.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">LayerNorm · GELU</text>
 <rect x="830.0" y="558.0" width="260.0" height="56.0" rx="4" fill="#9b6bff"/>
 <text x="960.0" y="577.6" font-size="13.5" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="central">Kernel mapping</text>
-<text x="960.0" y="594.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">MatMul → ConvKernel · GEMV</text>
+<text x="960.0" y="594.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">MatMul → ConvKernel · image</text>
 <rect x="1110.0" y="558.0" width="260.0" height="56.0" rx="4" fill="#9b6bff"/>
 <text x="1240.0" y="577.6" font-size="13.5" font-weight="bold" fill="#ffffff" text-anchor="middle" dominant-baseline="central">DAG + event stream</text>
 <text x="1240.0" y="594.4" font-size="13.5" font-weight="normal" fill="#ffffff" text-anchor="middle" dominant-baseline="central">buffer pool coloring</text>
@@ -93,13 +93,13 @@
 <text x="830.0" y="721.0" font-size="13.5" font-weight="500" fill="#4b5563" text-anchor="start" dominant-baseline="central">drive the kernels: AXI-Lite registers · start · wait</text>
 <rect x="210.0" y="752.0" width="1180.0" height="110.0" rx="4" fill="#aedcf6" stroke="#3fd09a" stroke-width="2.5"/>
 <text x="230.0" y="792.0" font-size="19" font-weight="600" fill="#1f2328" text-anchor="start" dominant-baseline="central">FPGA kernels</text>
-<text x="230.0" y="820.0" font-size="13.5" font-weight="normal" fill="#334155" text-anchor="start" dominant-baseline="central">Vitis HLS · 128-bit AXI</text>
+<text x="230.0" y="820.0" font-size="13.5" font-weight="normal" fill="#334155" text-anchor="start" dominant-baseline="central">HLS + SystemVerilog</text>
 <rect x="440.0" y="770.0" width="219.0" height="74.0" rx="4" fill="#bdf3d9"/>
 <text x="549.5" y="798.2" font-size="14" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">VectorOPKernel</text>
 <text x="549.5" y="815.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">element-wise, 8 lanes</text>
 <rect x="677.0" y="770.0" width="219.0" height="74.0" rx="4" fill="#bdf3d9"/>
 <text x="786.5" y="798.2" font-size="14" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">MatmulKernel</text>
-<text x="786.5" y="815.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">tiles 4 × 32 × 256 · GEMV</text>
+<text x="786.5" y="815.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">SystemVerilog, 128 MACs</text>
 <rect x="914.0" y="770.0" width="219.0" height="74.0" rx="4" fill="#bdf3d9"/>
 <text x="1023.5" y="798.2" font-size="14" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">ConvKernel</text>
 <text x="1023.5" y="815.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">16 × 16 MAC grid, 512 MACs</text>

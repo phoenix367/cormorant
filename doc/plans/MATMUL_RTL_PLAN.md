@@ -1,16 +1,13 @@
 # MatmulKernel in SystemVerilog: integration plan
 
-**Status (2026-10-04):** phases 0–3 done.  The RTL kernel, its Verilator
-testbench, the C driver and the IP packaging are in `kernels/matmul_rtl/`;
-with `AXI_MATMUL_IMPL=rtl` the KV260 bitstream builds (`1d28630fbfa4`,
-timing met at 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer) and
-is bit-exact on the board everywhere, no benchmark or workload slower than
-with the HLS kernel (phase 2b balanced K between the lanes).  Phase 3: the
-bitstream is calibrated, the scheduler models the RTL kernel
-(`kernels.matmul.impl`), and its engine choices keep one copy of every
-weight — measured on the board, the 16-token LLM prefills run 26–32 %
-faster and MobileNet v1 10 %, all bit-exact.  The default is still `hls`;
-phase 4 (the switch: platform field, bitstream, chat server, docs) is open.
+**Status (2026-10-04):** done.  The SystemVerilog MatmulKernel
+(`kernels/matmul_rtl/`) is the KV260's: the default of the build and the
+scheduler, and the board's bitstream (`1d28630fbfa4`, timing met at
+100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than with the HLS
+kernel), bit-exact everywhere and no workload slower; its engine choices
+keep one copy of every weight and run the 16-token LLM prefills 26–32 %
+and MobileNet v1 10 % faster.  The HLS kernel's synthesis is retired; its
+C++ stays as the reference model.
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
 drop-in replacement for the Vitis HLS MatmulKernel
@@ -273,7 +270,7 @@ final one meets it (WNS +0.002 ns, 18 395 LUT, 9 482 FF, 38 BRAM).
 | Verilator cycles, before → after | 1×576×1536 kw 4: 62 473 → 56 324 (15.7 MAC/cycle); packed 64×144×576: 51 078 → 46 472; other shapes unchanged |
 | `sysim_matmul_rtl` | 50 / 50 (`sysim.tcl` now upgrades every locked IP, as the test stand does — the SmartConnect of the copied project was locked) |
 | `behavior_test_matmul`, `sim_hw_kv260` | 50 / 50, 68 / 68 |
-| bitstream `1d28630fbfa4` | timing met at 100 MHz (WNS +0.987 ns); 84 603 LUT, 79 544 FF, 109.5 BRAM36, 48 URAM, 1 058 DSP |
+| bitstream `1d28630fbfa4` | timing met at 100 MHz (WNS +0.987 ns); 84 603 LUT, 79 544 FF, 109.5 BRAM36, 48 URAM, 1 060 DSP |
 
 **Board** (`1d28630fbfa4`; the chat server stopped, the deployed bitstream
 and the server restored afterwards; gates in the scratch directory again):
@@ -420,20 +417,88 @@ ConvKernel or already run on MatmulKernel).  Outputs:
 multi-row image tactic is open, and the board still runs the HLS bitstream —
 phase 4 switches `kernels.matmul.impl` and the bitstream together.
 
-### Phase 4: the default and the clean-up
+### Phase 4: the default and the clean-up — done (2026-10-04)
 
-- `AXI_MATMUL_IMPL=rtl` by default; remove the HLS synthesis targets of
-  MatmulKernel (keep its C++ reference).
-- Driver paths: the example configs (`perf_config`, `remote_config`, the
-  BERT / image-classification / MNIST demo configs), `src/kernels.py`, the
-  `registers.MatmulKernel` fact's `driver` glob and REMOTE_TESTING /
-  USER_GUIDE name the HLS export's `drivers/MatmulKernel_v1_0/src`; they move
-  to `build/rtl_ip/MatmulKernel_ip/drivers/MatmulKernel_v1_0/src`.  (Until
-  then either driver works with either bitstream: same API, same register
-  traffic.)
-- `platforms/kv260.json`: `tile_m` 32 stays (the packed-B DDR layout); decide
-  what `tile_n`, `tile_k` and `gemv_max_m` mean for the RTL kernel.
-- Facts: `registers.MatmulKernel` reads the RTL control block instead of the
-  HLS pragmas; `platform.kv260_bounds`; the architecture-diagram mentions.
-- Docs: `MATMUL_KERNEL.md`, the README kernel table, results and diagram,
-  both CLAUDE.md files, the kernel-verify and perf-calibrate skills.
+The plan (kept): `AXI_MATMUL_IMPL=rtl` by default and the HLS synthesis
+targets removed (the C++ reference kept); the driver paths moved; the
+meaning of `tile_n`, `tile_k` and `gemv_max_m` for the RTL kernel decided;
+facts and docs.  What was done:
+
+- **Build.**  `platforms/kv260.json` `kernels.matmul.impl` is `"rtl"`.  The
+  top-level CMake has no `AXI_MATMUL_IMPL` any more: `synthesize_kv260`,
+  `build_hw_kv260`, `sim_hw_kv260` and `behavior_test_matmul` always use the
+  RTL IP (`ip_repo_kv260`), and configure stops with a message if the JSON
+  says anything but `rtl`.  `synthesize_matmul_<platform>`,
+  `cosim_matmul_<platform>` and their TCL templates are gone; `kernels/matmul`
+  keeps the HLS kernel's C++ as the reference model (`TestMatmulRef`,
+  `TestMatmulBlas`, `gen_matmul_test_data`).
+- **Scheduler.**  The RTL cost model and engine-choice rules (phase 3) are
+  the default; `AXI_MATMUL_IMPL=hls` (environment) still models the
+  bitstreams built before (`caa67f49a5a3` and older).  25 tests encoded the
+  HLS kernel's engine choices: they pin `impl = "hls"`
+  (`test/helpers.matmul_impl`), and four RTL counterparts were added (the
+  RTL engine choices of the matmul-on-conv cases and BERT-tiny, the
+  fully-connected Convs, a one-row FC by cost).  The must-raise Conv bound
+  fixtures had one output pixel, so on the RTL model the fully-connected
+  Conv rewrite took them before the bound check: they now have 2 × 2.
+  1 637 tests.
+- **Driver paths.**  Projects take the RTL kernel's generated driver from
+  `build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src` (`make
+  driver_matmul_rtl`, no Vivado needed; the packaged IP carries the same
+  files) rather than the `build/rtl_ip/...` copy planned above: the example
+  and local configs, help texts, REMOTE_TESTING / USER_GUIDE, and the fact
+  `registers.MatmulKernel` (whose register list now comes from the RTL
+  control block through `gen_driver.py`; the C++ model's ports must match).
+- **Platform fields.**  `tile_m` (32) is the packed-B DDR tile and `max_k`
+  (4096) the kernel's `K_MAX` — both now checked against the RTL
+  (`mm_pkg.sv`) and the RTL cost model by the fact `platform.kv260_bounds`;
+  `gemv_max_m > 0` says the kernel reads the image (any m on the RTL
+  kernel).  `tile_n`, `tile_k` and the value of `gemv_max_m` describe the
+  HLS kernel: they size the C++ model and feed the `"hls"` cost model only.
+- **Board** (2026-10-04, bitstream `1d28630fbfa4` in production; every
+  library regenerated with the RTL choices, identical to the phase 3c
+  projects except the driver files; installed with the official tools):
+
+| workload | result |
+|---|---|
+| SmolLM2-360M | 4 × 33 / 33 logits bit-exact, decode checksums as in 3c; decode 254 ms / token (314.8 at 1000 cached tokens); prefill 16 / 64 / 256: 577 / 1037 / 3084 ms |
+| SmolLM2-135M | bit-exact; decode 100.2 ms / token (126.9 at 1000); prefill 251 / 443 / 1284 ms |
+| SmolVLM-256M | both COCO images 33 / 33 logits bit-exact; `llm_image` 4.24 / 4.20 s and prefill 64 / 256 462 / 1384 ms in a run started right after a reboot (3.91 / 3.93 s and 441 / 1277 ms in phase 3c with the identical project); decode 100.8 ms / token |
+| Piper | PCM, encoder and duration predictor bit-exact; RTF 0.518, encoder 68.0 ms and duration predictor 48.9 ms per 88 phonemes |
+| BERT-SQuAD | 50 / 50 examples bit-exact, EM / F1 = float; 953 ms p50 (962 on the HLS bitstream) |
+| CNNs | ResNet-18 59.9, MobileNet v1 73.0, v2 62.9 ms; top-5 classes and logits identical |
+| MNIST | 98.92 / 97.35 %, 0.260 / 2.831 ms |
+| `run_remote_tests` | 148 / 148 |
+| chat server | up, five backends |
+
+- **Board notes.**  The SmolVLM gate first failed to allocate its 519 MB
+  pool after the 360M and 135M gates had opened theirs (CMA fragmentation,
+  as for 360M before): run each large-pool gate right after a reboot.
+  The two gates started within minutes of a boot (360M, SmolVLM) ran their
+  host-heavy phases 3–8 % slower than the same projects in phase 3c
+  (image encoder, prefill 64 / 256, decode at 1000 cached tokens), while
+  135M, started 40 minutes after the boot, matched 3c to the millisecond;
+  the board's journal did not survive the reboots, so the cause (boot-time
+  jobs on the A53s is the guess) is not confirmed.  The README keeps 3c's
+  SmolVLM time.
+  `llm_lib_check.py` counted *more* free CMA after `llm_close` as a leak
+  (page cache leaving the CMA area; the same false `ok: false` showed in
+  phases 2b and 3c): it now fails only on a loss.
+- **Facts / docs:** README (kernel table, results, utilization: 72.2 % LUT,
+  109.5 BRAM36, 48 URAM, 1 060 DSP), architecture diagram, both CLAUDE.md
+  files, BUILD_TARGETS, PLATFORM_CONFIGURATION, MATMUL_KERNEL /
+  MATMUL_OPTIMISATION (retired), MATMUL_RTL_KERNEL, INFERENCE_SCHEDULER,
+  USER_GUIDE, the kernel-verify (its `matmul` gates are now Verilator +
+  out-of-context timing + the behaviour test), perf-calibrate,
+  perf-regression and board-deploy skills; the current performance model is
+  `1d28630fbfa4`.
+
+**Open after phase 4:**
+- The planner (`--plan`) has no multi-row MatmulKernel image tactic.
+- The perf-regression baseline of `1d28630fbfa4` holds the demos as run in
+  phase 2b (the HLS engine choices): MobileNet v1 now shows as improved
+  until the demos are re-recorded.
+- `LlmAttnConvNode` (prefill attention) always runs on ConvKernel; its
+  estimates favour the RTL MatmulKernel at short contexts (a tiny
+  geometry: 2 660 vs 3 824 cycles at 32 keys), not yet evaluated for the
+  real models.

@@ -300,6 +300,10 @@ Notable behaviour visible in the run:
   code maps its buffers cacheable and the SpaceToDepth reorder runs in
   place: ResNet-18 60.3 ms, MobileNet v1 81.0 ms, v2 63.9 ms with the same
   predictions (`doc/plans/BERT_PLAN.md` §3, "Phase 2A + 2B combined").
+- **Later: the SystemVerilog MatmulKernel** (2026-10-04,
+  `doc/plans/MATMUL_RTL_PLAN.md` phase 4): MobileNet v1's 1001-way
+  classifier runs as a MatMul on the faster kernel — ResNet-18 59.9 ms,
+  MobileNet v1 73.0 ms, v2 62.9 ms, the same top-5 classes and logits.
 
 The full per-image top-K table is also written to `build/results.json`.
 

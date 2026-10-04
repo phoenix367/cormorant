@@ -501,7 +501,9 @@ def gen_unsupported_out_ch_too_large() -> None:
     """out_ch one above kMaxOutCh — must raise.
 
     Uses a 3x3 kernel (not pointwise) so the planned 1x1→MatMul
-    transform won't intercept this fixture before constraint validation.
+    transform won't intercept this fixture before constraint validation,
+    and 2 x 2 output pixels so the fully-connected Conv rewrite
+    (src/fc_conv.py) does not either.
     """
     out_ch = CONV_MAX_OUT_CH + 1
     w_data = np.zeros((out_ch, 4, 3, 3), dtype=np.float32)
@@ -512,8 +514,8 @@ def gen_unsupported_out_ch_too_large() -> None:
     )
     graph = helper.make_graph(
         [conv], "conv_unsupported_out_ch",
-        inputs=[_vi("X", [1, 4, 3, 3])],
-        outputs=[_vi("Y", [1, out_ch, 1, 1])],
+        inputs=[_vi("X", [1, 4, 4, 4])],
+        outputs=[_vi("Y", [1, out_ch, 2, 2])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),
@@ -600,7 +602,9 @@ def gen_unsupported_acc_persist() -> None:
 
 def _gen_kernel_too_large(name: str, kh: int, kw: int, depthwise: bool) -> None:
     """A kernel window one above kMaxKH / kMaxKW — must raise.  The spans
-    stay inside the line buffer, so only the window check can reject it."""
+    stay inside the line buffer, so only the window check can reject it;
+    2 x 2 output pixels keep the fully-connected Conv rewrite
+    (src/fc_conv.py) from intercepting it."""
     c = 4
     w_data = np.zeros((c, 1 if depthwise else c, kh, kw), dtype=np.float32)
     w_init = numpy_helper.from_array(w_data, name="W")
@@ -610,8 +614,8 @@ def _gen_kernel_too_large(name: str, kh: int, kw: int, depthwise: bool) -> None:
     conv = helper.make_node("Conv", inputs=["X", "W"], outputs=["Y"], **attrs)
     graph = helper.make_graph(
         [conv], name,
-        inputs=[_vi("X", [1, c, kh, kw])],
-        outputs=[_vi("Y", [1, c, 1, 1])],
+        inputs=[_vi("X", [1, c, kh + 1, kw + 1])],
+        outputs=[_vi("Y", [1, c, 2, 2])],
         initializer=[w_init],
     )
     _save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)]),

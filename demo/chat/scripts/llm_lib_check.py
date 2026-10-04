@@ -12,7 +12,9 @@ of doc/plans/CHAT_PLAN.md §12):
   * greedy decode steps issued from different threads (calls serialised,
     no thread-local state) — identical to the same steps from one thread;
   * llm_truncate + re-prefill of a second turn;
-  * llm_close() (CmaFree back), llm_open() again, the first result again.
+  * llm_close() (CmaFree back: at most 4 MiB below its value before the
+    open; more free is no leak — the page cache leaves the CMA area while
+    the pool is held), llm_open() again, the first result again.
 
 usage (on the board): python3 llm_lib_check.py [/root/kv260_chat/lib/libsmollm2.so]
 prints one JSON line "LLM_LIB_CHECK: {...}" and exits 0 when every check passed.
@@ -133,7 +135,7 @@ def main():
     L.llm_close()
     res["cma_free_kb"]["after_final_close"] = cma_free()
     ok = (res["only_llm_exports"] and res["chunked_prefill_identical"] and res["threads_identical"]
-          and res["reopen_identical"] and abs(c2 - c0) < 4096 and V > 0 and C == 1024)
+          and res["reopen_identical"] and c0 - c2 < 4096 and V > 0 and C == 1024)
     res["ok"] = ok
     print("LLM_LIB_CHECK: " + json.dumps(res))
     return 0 if ok else 1

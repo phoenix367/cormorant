@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Summarise a MatmulKernel / VectorOPKernel HLS synthesis and diff it against
-the previous one.
+"""Summarise a VectorOPKernel HLS synthesis and diff it against the previous
+one (MatmulKernel is SystemVerilog since MATMUL_RTL_PLAN phase 4: its gate is
+``make synth_matmul_rtl``).
 
 Reads ``csynth.rpt`` and the vitis-run log of ``make synthesize_<k>_kv260`` and
 prints the top-level slack / resources, every pipelined loop that is not II=1,
@@ -24,7 +25,6 @@ import shutil
 import sys
 
 KERNELS = {  # kernel -> (top function, csynth.rpt below <build>/kernels/<k>/kv260)
-    "matmul": ("MatmulKernel", "matmul_kv260/hls/syn/report/csynth.rpt"),
     "vectorop": ("VectorOPKernel", "vadd_kv260/solution1/syn/report/csynth.rpt"),
 }
 PERF_COLS = ["name", "issue", "violation", "iter_lat", "ii", "trip", "pipelined",

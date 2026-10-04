@@ -20,11 +20,11 @@ its config, its model and its generated project.  You need:
 
 - **The BERT demo's config**, `demo/bert_squad/bert_squad_config.json`.
   `deploy.py` takes everything board-specific from it: ssh address and key,
-  UIO device names, the HLS driver directories, the weights directory and
+  UIO device names, the driver directories, the weights directory and
   the board lock.
-- **The HLS driver sources** of VectorOPKernel, MatmulKernel and ConvKernel
-  (`make synthesize_vectorop_kv260 synthesize_matmul_kv260
-  synthesize_conv_kv260` in `build/`).
+- **The driver sources** of VectorOPKernel, MatmulKernel and ConvKernel
+  (`make synthesize_vectorop_kv260 synthesize_conv_kv260 driver_matmul_rtl`
+  in `build/`).
 - **The BERT model and `vocab.txt`.**  These are downloaded when missing:
   - `deploy.py` fetches `vocab.txt` before it touches the board;
   - generating the BERT project fetches the model (435 MB);

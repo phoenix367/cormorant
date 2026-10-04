@@ -33,6 +33,7 @@ import subprocess
 
 import gen_llama_models as G
 import host_emu
+from helpers import matmul_impl
 from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
@@ -144,6 +145,7 @@ def sched_steps(ses, script):
 
 class TestFrontend(unittest.TestCase):
 
+    @matmul_impl("hls")         # the one-row linears on the HLS kernel's GEMV path
     def test_decode_graph(self):
         cfg, W, formats, fe = tiny()
         g = OnnxGraph(fe.entry("decode"))
@@ -194,6 +196,7 @@ class TestFrontend(unittest.TestCase):
                 self.assertIsNone(sn.output.host)
         self.assertTrue(all(t.host == "f32" for t in g.host_tensors))
 
+    @matmul_impl("hls")         # RTL: this tiny model's linears stay on MatmulKernel
     def test_prefill_uses_conv_and_head_state(self):
         _cfg, _W, _f, fe = tiny()
         g = OnnxGraph(fe.entry("prefill", 16))
@@ -354,6 +357,7 @@ class TestOtherShapes(unittest.TestCase):
             np.testing.assert_array_equal(x, y, err_msg=f"step {i}")
         return gs
 
+    @matmul_impl("hls")         # RTL: 16-row linears on MatmulKernel (phase 3)
     def test_smollm2_360m_layer_shape(self):
         cfg = dict(G.TINY, hidden_size=960, num_attention_heads=15, num_key_value_heads=5,
                    head_dim=64, intermediate_size=2560, vocab_size=1024, rope_theta=100000.0)

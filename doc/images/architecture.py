@@ -139,7 +139,7 @@ half = (R - L - 20) / 2
 rect(L, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(L + half / 2, y + 28, "Runtime — on the board", 19, TITLE, "600")
 cw = (half - 60) / 2
-rows = [[["XRT buffers in CMA", "cache clean / invalidate"], ["Kernel drivers", "Vitis HLS, over UIO"]],
+rows = [[["XRT buffers in CMA", "cache clean / invalidate"], ["Kernel drivers", "Xilinx driver API, over UIO"]],
         [["kernel_wait", "kernels on different lanes overlap"], ["Host ops in C", "Softmax · LayerNorm · attention"]],
         [["Per-layer profiler", "INFERENCE_PROFILING"], ["Linux on the A53", "Ubuntu 22.04 · XRT 2.13"]]]
 for r_i, row in enumerate(rows):
@@ -149,7 +149,7 @@ x2 = L + half + 20
 rect(x2, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(x2 + half / 2, y + 28, "Inference scheduler — design time, on the host", 19, TITLE, "600")
 rows = [[["Frontends", "ONNX · Llama · ViT · Piper"], ["Graph + fusion", "LayerNorm · GELU"]],
-        [["Kernel mapping", "MatMul → ConvKernel · GEMV"], ["DAG + event stream", "buffer pool coloring"]],
+        [["Kernel mapping", "MatMul → ConvKernel · image"], ["DAG + event stream", "buffer pool coloring"]],
         [["Fixed-point simulator", "the bit-exact expectations"], ["C code generator", "planning with --plan"]]]
 for r_i, row in enumerate(rows):
     for c_i, lines in enumerate(row):
@@ -170,9 +170,9 @@ y += 62
 hw_top = y
 rect(L, y, R - L, 110, HW_FILL, HW_STROKE, 2.5, 4)
 text(L + 20, y + 40, "FPGA kernels", 19, TITLE, "600", "start")
-text(L + 20, y + 68, "Vitis HLS · 128-bit AXI", 13.5, "#334155", anchor="start")
+text(L + 20, y + 68, "HLS + SystemVerilog", 13.5, "#334155", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 74, [
-    ["VectorOPKernel", "element-wise, 8 lanes"], ["MatmulKernel", "tiles 4 × 32 × 256 · GEMV"],
+    ["VectorOPKernel", "element-wise, 8 lanes"], ["MatmulKernel", "SystemVerilog, 128 MACs"],
     ["ConvKernel", "16 × 16 MAC grid, 512 MACs"], ["PoolingKernel", "8 channel lanes"]],
     HW_CHIP, TITLE, gap=18, size=14, bold_first=True)
 y += 110

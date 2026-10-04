@@ -17,6 +17,7 @@ import onnx.helper as oh
 import onnx.numpy_helper as nph
 from onnx import TensorProto
 
+from helpers import matmul_impl
 from src.codegen import CodeGenerator
 from src.fc_conv import candidate, estimate, lower_fc_convs
 from src.graph import OnnxGraph
@@ -84,8 +85,9 @@ class _Models(unittest.TestCase):
         cls.nobias = _fc_model(j("nobias.onnx"), 8, 4, 4, 32, bias=False, relu=False)
         # LeNet's conv3 itself: auto lowers it (GEMV)
         cls.lenet3 = _fc_model(j("lenet3.onnx"), 64, 7, 7, 1024, relu=True)
-        # MobileNet v1's classifier (1x1 on 1x1, 1001 outputs): not GEMV-eligible,
-        # the tiled MatMul is not faster -> auto keeps the Conv
+        # MobileNet v1's classifier (1x1 on 1x1, 1001 outputs): not GEMV-eligible;
+        # the HLS kernel's tiled MatMul is not faster -> auto keeps the Conv,
+        # the RTL kernel's is -> auto lowers it
         cls.mnv1 = _fc_model(j("mnv1.onnx"), 1024, 1, 1, 1001, relu=False)
         # not fully connected / not eligible
         cls.padded = _fc_model(j("padded.onnx"), 8, 4, 4, 16, pads=[1, 1, 1, 1], kernel=(6, 6))
@@ -152,21 +154,38 @@ class TestRewrite(_Models):
 
 
 class TestAuto(_Models):
+    @matmul_impl("hls")
     def test_lenet_conv3_lowered_to_gemv(self):
         g = self.graph(self.lenet3, "auto")
         self.assertEqual(g.fc_conv_stats["lowered"], 1)
         self.assertLess(g.fc_conv_stats["matmul_cycles"], 0.6 * g.fc_conv_stats["conv_cycles"])
         self.assertEqual(g.matmul_gemv_stats["gemv"], 1)
 
+    @matmul_impl("hls")
     def test_mobilenet_classifier_kept(self):
         g = self.graph(self.mnv1, "auto")
         self.assertEqual((g.fc_conv_stats["lowered"], g.fc_conv_stats["kept"]), (0, 1))
-        m = onnx.shape_inference.infer_shapes(onnx.load(self.mnv1))
+        self.assertFalse(self._estimate(self.mnv1)["gemv"])
+
+    @matmul_impl("rtl")
+    def test_rtl_lowers_both(self):
+        # the RTL kernel: LeNet's conv3 port-bound on either MatmulKernel path
+        # (GEMV and the packed tiled path tie, the tiled one stays), MobileNet's
+        # classifier ~2x faster than on ConvKernel (board: 81.0 -> 73.0 ms per
+        # image, MATMUL_RTL_PLAN phase 3c)
+        g = self.graph(self.lenet3, "auto")
+        self.assertEqual(g.fc_conv_stats["lowered"], 1)
+        self.assertLess(g.fc_conv_stats["matmul_cycles"], 0.6 * g.fc_conv_stats["conv_cycles"])
+        g = self.graph(self.mnv1, "auto")
+        self.assertEqual((g.fc_conv_stats["lowered"], g.fc_conv_stats["kept"]), (1, 0))
+        self.assertLess(g.fc_conv_stats["matmul_cycles"], 0.6 * g.fc_conv_stats["conv_cycles"])
+
+    def _estimate(self, path):
+        m = onnx.shape_inference.infer_shapes(onnx.load(path))
         shapes = {vi.name: [d.dim_value for d in vi.type.tensor_type.shape.dim]
                   for vi in list(m.graph.input) + list(m.graph.value_info) + list(m.graph.output)}
         inits = {i.name: i for i in m.graph.initializer}
-        est = estimate(candidate(m.graph.node[0], shapes, inits))
-        self.assertFalse(est["gemv"])
+        return estimate(candidate(m.graph.node[0], shapes, inits))
 
     def test_library_default_is_auto(self):
         self.assertEqual(OnnxGraph(self.lenet3).fc_conv_stats["lowered"], 1)

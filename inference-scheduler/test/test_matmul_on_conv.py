@@ -11,7 +11,9 @@ input.  Checked here:
     against the conv reference: A read through ConvKernel.h's packed-weight
     formula and B's image read as NCHW x give exactly A · B;
   * the engine choice (BERT-shaped linears and attention lowered, FC /
-    misaligned / tiny MatMuls kept, modes auto / always / off);
+    misaligned / tiny MatMuls kept, modes auto / always / off) against the
+    HLS MatmulKernel, whose cost model these cases were written for; the
+    RTL kernel (4x faster on GEMM) keeps more on MatmulKernel;
   * the simulator is the same for both engines (bit-identical outputs with
     the lowering on and off), and so are the emitted weight images;
   * the generated C: run_conv / run_conv_at emission, -Werror compile, and a
@@ -37,6 +39,7 @@ import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 import host_emu
+from helpers import matmul_impl
 from src.codegen import CodeGenerator
 from src.codegen._simulate import _conv2d_ref
 from src.cost_model import conv_cycles, matmul_cycles
@@ -220,6 +223,7 @@ class _Models(unittest.TestCase):
         cls._tmp.cleanup()
 
 
+@matmul_impl("hls")
 class TestEngineChoice(_Models):
 
     def test_bert_shapes_lowered(self):
@@ -316,10 +320,27 @@ class TestEngineChoice(_Models):
             del cg
 
 
+@matmul_impl("rtl")
+class TestEngineChoiceRtl(_Models):
+    """The RTL MatmulKernel (128 MAC/cycle on GEMM, the HLS kernel's 32): the
+    wide, weight-heavy linears stay ahead on ConvKernel, the small GEMMs and
+    the attention products go to MatmulKernel."""
+
+    def test_choices(self):
+        for name in ("linear", "ffn_up", "small", "rows"):
+            (sn,) = _lowered(_gen(self.m[name])[0])
+            self.assertLess(sn.est_conv_cycles, LOWER_MARGIN * sn.est_matmul_cycles)
+        for name in ("gemm", "attn", "shared_a", "fold"):
+            g, _ = _gen(self.m[name])
+            self.assertEqual(_lowered(g), [], name)
+            self.assertTrue(any(type(sn) is MatmulNode for sn in g.nodes), name)
+
+
 # --------------------------------------------------------------------------- #
 # Simulation and weight images                                                  #
 # --------------------------------------------------------------------------- #
 
+@matmul_impl("hls")         # the cases lowered as written
 class TestSimulation(_Models):
 
     def test_outputs_identical_with_lowering_on_and_off(self):
@@ -365,6 +386,7 @@ class TestSimulation(_Models):
 # Generated C                                                                   #
 # --------------------------------------------------------------------------- #
 
+@matmul_impl("hls")
 class TestCodegen(_Models):
 
     def test_single_call_emission(self):
@@ -449,16 +471,17 @@ class TestCodegen(_Models):
                              generated_files=[]).render_markdown()
         self.assertIn("**MatMul on ConvKernel** — 1 `MatMul` node run as ConvKernel calls", md)
         self.assertIn("on ConvKernel 1×", md)
+        env = dict(os.environ, AXI_MATMUL_IMPL="hls")      # the class's cost model, in the CLI
         with tempfile.TemporaryDirectory() as td:
             cli = os.path.join(_ROOT, "inference_scheduler.py")
             r = subprocess.run([sys.executable, cli, self.m["gemm"], "--out-dir", td],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("MatMul->Conv: 1 MatMul(s) on ConvKernel", r.stderr)
             with open(os.path.join(td, "src", "inference.c")) as f:
                 self.assertIn("run_conv(", f.read())
             r = subprocess.run([sys.executable, cli, self.m["gemm"], "--out-dir", td,
-                                "--no-matmul-on-conv"], capture_output=True, text=True)
+                                "--no-matmul-on-conv"], capture_output=True, text=True, env=env)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn("MatMul->Conv", r.stderr)
             with open(os.path.join(td, "src", "inference.c")) as f:
@@ -497,8 +520,9 @@ class TestCostModel(unittest.TestCase):
                 self.assertEqual(got[key], ref[key], (key, c, m, h, w, kh, kw, sh, sw))
             n += 1
 
+    @matmul_impl("hls")
     def test_matmul_model_board_calibration(self):
-        """MatmulKernel block model against the board (100 MHz): 256^3 7.24 ms,
+        """HLS MatmulKernel block model against the board (100 MHz): 256^3 7.24 ms,
         BERT 768^2 linear 54.3 ms, 3072x768 203 ms, QK^T head 3.28 ms."""
         for (n, k, m), ms in (((256, 256, 256), 7.24), ((256, 768, 768), 54.3),
                               ((256, 3072, 768), 203.0), ((256, 64, 256), 3.28)):

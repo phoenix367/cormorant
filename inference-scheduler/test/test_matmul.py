@@ -191,8 +191,8 @@ class TestMatmulHwConfigResolver(unittest.TestCase):
                 bad.unlink(missing_ok=True)
 
     def test_impl_env_override(self):
-        """``AXI_MATMUL_IMPL`` overrides the JSON's impl, as the CMake cache
-        variable of the same name does for the build."""
+        """``AXI_MATMUL_IMPL`` overrides the JSON's impl for the scheduler
+        (e.g. ``hls`` for a project on a bitstream with the HLS kernel)."""
         import os
         from unittest import mock
         from src._matmul_hw_config import MatmulHwConfigError, resolve

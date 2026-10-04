@@ -17,7 +17,7 @@
       "max_m_per_group":         4
     },
     "matmul": {
-      "impl":   "hls",
+      "impl":   "rtl",
       "tile_n":   4,
       "tile_m":  32,
       "tile_k": 256,

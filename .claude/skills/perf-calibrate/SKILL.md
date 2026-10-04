@@ -24,10 +24,13 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 HEAD bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/caa67f49a5a3** = hw_128 d7ce129 (2026-09-28), topped up
-on 2026-10-01 with Piper (`piper-lessac-medium`: the chunk and `encode_<T>`
-entries) to 1505 exact calls, and `host.json` merged to 151 signatures / 39 kinds
-(§3). The perf-regression skill keeps its own baseline for each bitstream id, so a new
+Current model: **kv260/1d28630fbfa4** = hw_128 7d8eefe (2026-10-04), the bitstream
+with the SystemVerilog MatmulKernel (MATMUL_RTL_PLAN phases 3–4): a full campaign
+with the RTL engine choices, a top-up and one refinement round to 1383 exact calls, and `host.json` merged to 151 signatures / 39 kinds
+(§3; the host model does not depend on the bitstream).  The previous model,
+kv260/caa67f49a5a3 (hw_128 d7ce129, the HLS MatmulKernel; topped up on 2026-10-01
+with Piper to 1505 exact calls), stays for projects on that bitstream
+(`AXI_MATMUL_IMPL=hls`); the records below are mostly its. The perf-regression skill keeps its own baseline for each bitstream id, so a new
 bitstream needs one there too.
 
 **Adding a model** (the 2026-10-01 top-up, about 45 min of chat-server downtime):
@@ -45,7 +48,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # caa67f49a5a3 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 1d28630fbfa4 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself: `--board-bin` (default `/lib/firmware/pl.bin`) must be
@@ -138,6 +141,16 @@ vecop       8   80     0.24%  43.56% |          5   0.15%  12.67%  18.09%
 vecop-div   1    7     0.54%   8.22% |          2   5.42%   9.62%  10.67%
 note: held-out p90 above 3 % in ['conv', 'conv-dw', 'conv-mm', 'mm-tiled', 'pool', 'vecop', 'vecop-div']
 ```
+For 1d28630fbfa4 (2026-10-04, the RTL MatmulKernel; reproduced apart from `date`):
+```
+performance model kv260 / 1d28630fbfa4: 1383 exact calls
+determinism: 1383 calls measured twice, median spread 0.023 %, max 7.60 %, 47 above 0.5 %
+family      k    n train med     max | held-out n     med     p90     max
+mm-gemv     3   94     1.00%   6.80% |         13   1.14%   3.22%   5.62%
+mm-tiled    5  121     0.39%  13.62% |         21   0.79%   3.98%   8.35%
+```
+(the other families as above within a few points): both MatmulKernel families are
+under the planner's 5 % trust threshold.
 **Pass criteria:**
 - The determinism median should be in the 0.01 % range, because the kernels are deterministic
   (TACTICS_PLAN §1). The record's 27 noisy points are all calls a few tens of µs long.

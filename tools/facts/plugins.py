@@ -49,46 +49,62 @@ def _decode_keys(text: str) -> Dict[str, List[str]]:
 
 
 def register_map(args: dict, ctx) -> List[Finding]:
+    """A kernel's AXI-Lite registers against everything that names them.  The
+    truth is the kernel the bitstream carries: the HLS source's s_axilite
+    pragmas (``hls``), or for an RTL kernel its driver generator's register
+    table (``rtl_driver``), which the generator checks against the RTL address
+    constants (``rtl``); ``hls`` is then the C++ reference model, whose ports
+    must be the same."""
     out: List[Finding] = []
-    kernel, prefix, hls = args["kernel"], args["prefix"], args["hls"]
-    src = ctx.read(hls)
-    ports = [p for p in re.findall(r"#pragma HLS INTERFACE s_axilite port=(\w+)", src) if p != "return"]
-    if not ports:
-        return [("error", "no s_axilite ports found", hls)]
-    P = set(ports)
-    out.append(("info", f"{len(P)} registers: {', '.join(ports)}", hls))
+    kernel, prefix, hls = args["kernel"], args["prefix"], args.get("hls")
+    hls_ports: List[str] = []
+    if hls:
+        hls_ports = [p for p in re.findall(r"#pragma HLS INTERFACE s_axilite port=(\w+)", ctx.read(hls))
+                     if p != "return"]
+        if not hls_ports:
+            return [("error", "no s_axilite ports found", hls)]
 
-    # the generated driver (a build artifact: checked where it is built)
-    headers = ctx.glob(args["driver"]) if args.get("driver") else []
-    for h in headers:
-        regs = {r.lower() for r in re.findall(r"#define \w+_CTRL_ADDR_(\w+)_DATA\b", ctx.read(h))}
-        if regs != P:                       # a local build artifact: warn, the HLS source is the truth
-            out.append(("warn", f"driver registers differ from the HLS ports: only in the driver "
-                                 f"{sorted(regs - P)}, only in HLS {sorted(P - regs)} (re-export the IP)", h))
-    if args.get("driver") and not headers:
-        out.append(("info", f"no driver header built here ({args['driver']})", ""))
-
-    # an RTL implementation of the kernel: its driver generator's register table,
-    # which the generator itself checks against the RTL address constants
+    rtl_regs = None
     if args.get("rtl_driver"):
         rel = args["rtl_driver"]
         rtl = f" --rtl {args['rtl']}" if args.get("rtl") else ""
         r = json.loads(ctx.run(f"{{python}} {rel} --check --json{rtl}"))
-        regs = r["registers"]
+        rtl_regs = r["registers"]
         for e in r["errors"]:
             out.append(("error", f"driver table vs the RTL: {e}", rel))
-        if set(regs) != P:
-            out.append(("error", f"RTL driver registers differ from the HLS ports: only in the RTL driver "
-                                 f"{sorted(set(regs) - P)}, only in HLS {sorted(P - set(regs))}", rel))
-        for h in headers:
-            offs = {n.lower(): int(v, 16) for n, v in
-                    re.findall(r"#define \w+_CTRL_ADDR_(\w+)_DATA\s+(0x[0-9a-fA-F]+)", ctx.read(h))}
-            diff = sorted(n for n in set(regs) & set(offs) if offs[n] != regs[n]["offset"])
-            if diff:                        # a local build artifact: warn, as above
-                out.append(("warn", f"RTL driver offsets differ from this HLS driver for {', '.join(diff)} "
-                                     f"(re-export the HLS IP, or fix the RTL)", h))
+        if not rtl_regs:
+            return out + [("error", "the RTL driver table lists no registers", rel)]
+        ports = sorted(rtl_regs, key=lambda n: rtl_regs[n]["offset"])
+        truth = args.get("rtl") or rel
+        if hls and set(hls_ports) != set(ports):
+            out.append(("error", f"the C++ model's s_axilite ports differ from the RTL: only in the model "
+                                 f"{sorted(set(hls_ports) - set(ports))}, only in the RTL "
+                                 f"{sorted(set(ports) - set(hls_ports))}", hls))
         if not r["errors"]:
-            out.append(("info", f"RTL driver table: {len(regs)} registers, offsets as in the RTL", rel))
+            out.append(("info", f"RTL driver table: {len(ports)} registers, offsets as in the RTL", rel))
+    elif hls:
+        ports, truth = hls_ports, hls
+    else:
+        return [("error", "register_map needs hls or rtl_driver", "facts.yaml")]
+    P = set(ports)
+    out.append(("info", f"{len(P)} registers: {', '.join(ports)}", truth))
+
+    # the generated driver (a build artifact: checked where it is built)
+    headers = ctx.glob(args["driver"]) if args.get("driver") else []
+    for h in headers:
+        offs = {n.lower(): int(v, 16) for n, v in
+                re.findall(r"#define \w+_CTRL_ADDR_(\w+)_DATA\s+(0x[0-9a-fA-F]+)", ctx.read(h))}
+        if set(offs) != P:                  # a local build artifact: warn, the source is the truth
+            out.append(("warn", f"driver registers differ from the kernel's: only in the driver "
+                                 f"{sorted(set(offs) - P)}, only in the kernel {sorted(P - set(offs))} "
+                                 f"(rebuild the driver)", h))
+        elif rtl_regs is not None:
+            diff = sorted(n for n in P if offs[n] != rtl_regs[n]["offset"])
+            if diff:                        # a local build artifact: warn, as above
+                out.append(("warn", f"driver offsets differ from the RTL for {', '.join(diff)} "
+                                     f"(rebuild the driver)", h))
+    if args.get("driver") and not headers:
+        out.append(("info", f"no driver header built here ({args['driver']})", ""))
 
     # the performance-model key
     fields = args["fields"] if "fields" in args else \

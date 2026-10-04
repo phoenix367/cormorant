@@ -72,9 +72,9 @@ demo/bert_squad/
 * The scheduler's virtualenv (`inference-scheduler/.venv`, from
   `inference-scheduler/requirements.txt`, see the root README): numpy,
   onnx, paramiko.  All commands below use it.
-* HLS driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
-  `build/`: `make synthesize_vectorop_kv260 synthesize_matmul_kv260
-  synthesize_conv_kv260`).
+* Driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
+  `build/`: `make synthesize_vectorop_kv260 synthesize_conv_kv260
+  driver_matmul_rtl`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.
 * Internet access on the first run: the scripts download ~440 MB of

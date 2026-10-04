@@ -25,10 +25,11 @@ fails the test.
   cd inference-scheduler
   .venv/bin/pip install paramiko
   ```
-- Driver sources from Vitis HLS synthesis (for `local.driver_dirs` in the config):
+- Driver sources (for `local.driver_dirs` in the config): the Vitis HLS exports
+  of `make synthesize_kv260` and the RTL MatmulKernel's driver (`make driver_matmul_rtl`):
   ```
   <repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/
-  <repo>/build/kernels/matmul/kv260/matmul_kv260/hls/impl/ip/drivers/MatmulKernel_v1_0/src/
+  <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
   <repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
   <repo>/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src/
   ```

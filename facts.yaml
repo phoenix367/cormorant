@@ -145,10 +145,10 @@ facts:
   args:
     kernel: MatmulKernel
     prefix: XMatmulkernel
-    hls: kernels/matmul/kernel/MatmulKernel.cpp
-    driver: 'build*/kernels/matmul/kv260/*/*/impl/ip/drivers/MatmulKernel_v1_0/src/xmatmulkernel_hw.h'
-    rtl_driver: kernels/matmul_rtl/scripts/gen_driver.py
-    rtl: kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv
+    rtl_driver: kernels/matmul_rtl/scripts/gen_driver.py     # the truth: the RTL kernel's table,
+    rtl: kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv             # checked against its control block
+    hls: kernels/matmul/kernel/MatmulKernel.cpp              # the C++ reference model: same ports
+    driver: 'build*/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/xmatmulkernel_hw.h'
     fields_alias: {a_stride: a_batch_stride, b_stride: b_batch_stride, c_stride: c_batch_stride}
     not_keyed: {a: address, b: address, c: address, a_to_b: "B's address relative to A (GEMV), no geometry"}
     decode: inference-scheduler/src/timeline_html.py
@@ -244,10 +244,11 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 6c090cd
-    date: 2026-10-02
-    how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build
-          (BERT 215.3, 135M 285.8, 360M 740.3, SmolVLM 494.8 MiB)"
+    commit: 6a41e5c
+    date: 2026-10-04
+    how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
+          with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4; BERT 215.3, 135M 285.8,
+          360M 740.2, SmolVLM 494.8 MiB)"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
     - inference-scheduler/src/codegen/_core.py
@@ -272,7 +273,7 @@ facts:
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'Its pool is (?P<smollm2_360m>\d+) MiB'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'The pool buffer is (?P<smollm2_135m>\d+) MiB'}
     - {file: demo/chat/doc/SMOLVLM.md, regex: 'The SmolVLM pool is (?P<smolvlm_256m>\d+) MiB'}
-    - {file: README.md, regex: 'prefill 2\.90 s, (?P<smollm2_360m>\d+) MiB CMA'}
+    - {file: README.md, regex: '256-token prefill [\d.]+ s, (?P<smollm2_360m>\d+) MiB CMA'}
     - {file: demo/chat/chat_config.json.example, regex: 'The (?P<smollm2_360m>\d+) MiB pool BO;'}
     - {file: demo/chat/chat_config.json.example, regex: 'The (?P<smolvlm_256m>\d+) MiB pool BO \+'}
     - {file: demo/chat/smolvlm_backend.py, regex: 'the (?P<smolvlm_256m>\d+) MiB pool BO'}
@@ -473,13 +474,15 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 60.3, resnet18_fps: 16.6, bert_ms: 962, smollm2_135m_tok_s: 10.07, smollm2_360m_tok_s: 3.9,
+  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, bert_ms: 953, smollm2_135m_tok_s: 10.0, smollm2_360m_tok_s: 3.9,
           smolvlm_image_s: 3.9, piper_rtf: 0.52}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
-    date: 2026-09-26 to 2026-10-01
-    how: "README.md 'Results on the board': BERT_PLAN §3, CHAT_PLAN §19, §20, §23, §24, TTS_PLAN §5"
-    facts: {perf.bitstream_id: caa67f49a5a3}   # stale on another bitstream
+    date: 2026-10-04
+    how: "MATMUL_RTL_PLAN phase 4 board session: the demos' results.json (ResNet-18 p50 59.9 ms, BERT p50
+          953.3 ms), llm_board.py (135M 100.2 ms / token, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
+          llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot)"
+    facts: {perf.bitstream_id: 1d28630fbfa4}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -514,10 +517,10 @@ facts:
 # ── the README's hardware claims ─────────────────────────────────────────────
 - id: platform.kv260_bounds
   kind: value
-  title: the KV260 kernel tiles and bounds the README's kernel table quotes
+  title: the KV260 kernel tiles and bounds the README's kernel table quotes (and the RTL MatmulKernel hard-codes)
   source:
     parts:
-      matmul_tiles: {file: platforms/kv260.json, json: kernels.matmul, transform: "f\"{v['tile_n']} × {v['tile_m']} × {v['tile_k']}\""}
+      matmul_packed_tile: {file: platforms/kv260.json, json: kernels.matmul.tile_m}
       max_k: {file: platforms/kv260.json, json: kernels.matmul.max_k}
       conv_grid: {file: platforms/kv260.json, json: kernels.conv, transform: "f\"{v['tile_m']} × {v['tile_ic']}\""}
       conv_window: {file: platforms/kv260.json, json: kernels.conv, transform: "f\"{v['max_kh']}×{v['max_kw']}\""}
@@ -527,12 +530,14 @@ facts:
       pool_window: {file: platforms/kv260.json, json: kernels.pool, transform: "f\"{v['max_kh']}×{v['max_kw']}\""}
   fix: auto
   mentions:
-    - {file: README.md, regex: 'tiles (?P<matmul_tiles>\d+ × \d+ × \d+), packed-B weight layout, K ≤ (?P<max_k>\d+)'}
+    - {file: README.md, regex: 'packed-B weight layout \((?P<matmul_packed_tile>\d+)-column tiles\), K ≤ (?P<max_k>\d+)'}
+    - {file: kernels/matmul_rtl/rtl/mm_pkg.sv, fix: report,  # the RTL kernel's own bounds
+       regex: 'localparam int K_MAX\s+= (?P<max_k>\d+);'}
+    - {file: inference-scheduler/src/cost_model.py, fix: report, regex: '^RTL_TILE\s+= (?P<matmul_packed_tile>\d+)\s'}
     - {file: README.md, regex: '(?P<conv_grid>\d+ × \d+) MAC grid, .*?kernels ≤ (?P<conv_window>\d+×\d+), .*?≤ (?P<max_in_ch>\d+) in / (?P<max_out_ch>\d+) out channels'}
     - {file: README.md, regex: '(?P<pool_lanes>\d+) channel lanes, windows ≤ (?P<pool_window>\d+×\d+)'}
     - {file: doc/images/architecture.svg, fix: report,       # generated: fix architecture.py and rerun it
-       regex: 'tiles (?P<matmul_tiles>\d+ × \d+ × \d+) · GEMV'}
-    - {file: doc/images/architecture.svg, fix: report, regex: '(?P<conv_grid>\d+ × \d+) MAC grid'}
+       regex: '(?P<conv_grid>\d+ × \d+) MAC grid'}
     - {file: doc/images/architecture.svg, fix: report, regex: '(?P<pool_lanes>\d+) channel lanes'}
 
 - id: board.pl_clock_mhz
@@ -554,13 +559,14 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: d7ce129, dsp: 1058, dsp_total: 1248, dsp_pct: 85, lut: 93303, lut_total: 117120, lut_pct: 79.7,
-          bram: 115.5, bram_total: 144, uram: 56, uram_total: 64}
+  value: {hw_commit: 7d8eefe, dsp: 1060, dsp_total: 1248, dsp_pct: 85, lut: 84603, lut_total: 117120, lut_pct: 72.2,
+          bram: 109.5, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-09-27
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at d7ce129 (the bitstream of perf.bitstream_id)"
-    facts: {perf.bitstream_id: caa67f49a5a3}
+    date: 2026-10-04
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe with the RTL MatmulKernel
+          (main 1671b92, MATMUL_RTL_PLAN phase 2b; the bitstream of perf.bitstream_id)"
+    facts: {perf.bitstream_id: 1d28630fbfa4}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
