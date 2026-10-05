@@ -57,10 +57,13 @@ accumulator columns; per step each lane streams its half of the K planes
 (blocks of 16, the odd last one split) at one 128-bit beat per cycle and at
 least ``DMIN`` cycles per row, then the drain reads the accumulators; the
 A panel loads before its first step.  ``rtl_matmul_terms`` lists the terms,
-weighted by ``RTL_COEF``: a non-negative fit to the 240 MatmulKernel calls
-of the RTL bitstream's calibration campaign (1d28630fbfa4; held-out median
-error 1.2 %, p90 3.3 %).  The same terms are the perf models' MatmulKernel
-features (``perf_model.features``, ``rtl_*``).
+weighted by ``RTL_COEF``: a non-negative fit to the 414 MatmulKernel calls
+of the calibration campaign of b3309f424562 (the IP with its m_axi bus
+parameters, MATMUL_RTL_PLAN phase 5; leave-one-out median error 0.35 %,
+p90 1.7 %; the previous fit, to 240 calls of 1d28630fbfa4 with every
+crossbar slot at 2 outstanding bursts, predicted it at 1.3 / 3.1 % and gave
+the shipped models the same engine choices).  The same terms are the perf
+models' MatmulKernel features (``perf_model.features``, ``rtl_*``).
 """
 
 from __future__ import annotations
@@ -270,8 +273,8 @@ RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 # Cycles per term (rtl_matmul_terms), fitted on the board (see the module
 # docstring); "one" is the job's fixed cost without the host's call
 # overhead (3.15 us measured, charged by the callers as CALL_OVERHEAD).
-RTL_COEF = {"stream": 0.966, "drain": 0.968, "aload": 0.722,
-            "steps": 6.37, "runs": 1.39, "one": 92.0}
+RTL_COEF = {"stream": 0.986, "drain": 1.000, "aload": 0.733,
+            "steps": 2.97, "runs": 0.325, "one": 96.4}
 
 
 def _rtl_lane_planes(planes: int) -> int:

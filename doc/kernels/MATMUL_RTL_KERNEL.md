@@ -6,7 +6,9 @@ A SystemVerilog Q8.8 GEMM / GEMV engine for the Kria KV260
 the software side: the same IP name (VLNV `xilinx.com:hls:MatmulKernel:1.0`),
 the same AXI-Lite register map and driver API, the same DDR layouts and
 bit-identical results.  The one deliberate interface change is the C port
-(`m_axi_gmem2`): 128 bits instead of 32.
+(`m_axi_gmem2`): 128 bits instead of 32.  Its m_axi interfaces declare the
+HLS export's kind of bus parameters (16 outstanding bursts per port; IP
+revision 3, MATMUL_RTL_PLAN phase 5).
 
 It does 128 MAC/cycle on GEMM (the HLS kernel: 32) and 16 on GEMV (port-bound,
 as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
@@ -143,6 +145,15 @@ the HLS kernel exactly; everything inside the IP may change.
 - **All three `m_axi` ports:** the full AXI4 signal set, 64-bit addresses, ID
   width 1, every `*USER` width 1, `CACHE` = 3, `PROT` = 0.  Unused directions
   stay present and are tied off.
+- **Bus parameters (IP revision 3, 2026-10-05):** each `m_axi` interface
+  declares, as an HLS export does, `NUM_READ_OUTSTANDING` /
+  `NUM_WRITE_OUTSTANDING` 16, the burst lengths (reads 64 beats, writes 64)
+  and `READ_WRITE_MODE` (gmem0 / gmem1 read-only, gmem2 write-only), and the
+  RTL never exceeds them (`mm_pkg` `RD_OUTS` / `WR_OUTS`; fact
+  `rtl.axi_masters`).  The block design sizes each crossbar slot's
+  acceptance from these; the first packages declared none, so every slot ran
+  at 2 outstanding bursts (the HLS kernel's: A 4, B 16, C 16 —
+  MATMUL_RTL_PLAN phase 5).
 
 ### Register map (`s_axi_ctrl`)
 
@@ -303,7 +314,7 @@ range of `rows` rows of `len` elements.
 
 Each run goes to three queues:
 
-- **Read engine (`mm_axi_rd`):** takes the word range, splits it into ≤64-beat INCR bursts without 4 KiB crossings, and issues each burst only when its FIFO has room for it (credit), so RREADY is always 1.
+- **Read engine (`mm_axi_rd`):** takes the word range, splits it into ≤64-beat INCR bursts without 4 KiB crossings, and issues each burst only when its FIFO has room for it (credit), so RREADY is always 1; at most `RD_OUTS` (16) bursts await their data.
 - **Gearbox (`mm_gearbox`):** re-aligns the word stream into row-aligned beats. It uses a two-word window and an 8-way lane rotate, and a lookahead descriptor keeps back-to-back runs bubble-free. A and B element addresses may therefore start at any lane. Beyond the contract, even A/B bases that are only 2-byte aligned work.
 - **x prefetcher (`mm_xpf`):** receives B runs only.
 
@@ -344,8 +355,9 @@ accumulator words from both lanes in lockstep and computes:
 The results go to `mm_packer`, which turns the element stream of a C run into
 128-bit beats.  Only the first and last beat of a run carry partial strobes,
 and a run is a whole panel (`n_valid × m` elements) whenever the chunk spans
-all columns.  `mm_axi_wr` stores whole bursts before issuing their AW, and
-the job completes only after every B response has arrived.
+all columns.  `mm_axi_wr` stores whole bursts before issuing their AW, keeps
+at most `WR_OUTS` (16) bursts awaiting B, and the job completes only after
+every B response has arrived.
 
 ### Synchronisation
 
@@ -387,6 +399,13 @@ where it loops over A rows.  Per panel the kernel moves `8·k` A elements and
 compute-bound at 128 MAC/cycle when m ≥ ~64, and single-row GEMV is
 port-bound at 16.
 
+On the board the ports share the PS's HP ports with the other kernels, and a
+read port needs enough bursts in flight to cover the DDR latency.  Until the
+IP declared its bus parameters (phase 5) the crossbar held each port to 2
+outstanding bursts; with 16, the row-major FC 1×1280×1001 runs 13 % faster,
+FC 1×512×1000 3.7 %, and 90 of the 414 calibrated calls by more than 1 %
+(none of the 24 benchmarks slower).
+
 ## Resources and timing
 
 xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
@@ -397,7 +416,7 @@ xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
 | FF | 9.5 k | 27.0 k |
 | BRAM36 | 38 (32 A panel, 6 FIFOs) | 44 |
 | URAM | 0 | 8 |
-| DSP48E2 | 128 (the MACs only) | 128 |
+| DSP48E2 | 130 (128 MACs; 1 per run generator) | 128 |
 | peak MAC/cycle | 128 (GEMM), 16 (GEMV, port-bound) | 32 (tiled), 16 (GEMV) |
 
 Timing is checked at 300 MHz and met (WNS +0.002 ns with the K-balance
@@ -405,7 +424,7 @@ change; before it, ≈ 297 MHz with 3 endpoints missing by at most 31 ps, all
 once-per-step address updates in the walker and run generator).  The current block design runs at 100 MHz, with 150 MHz planned.  Nearly every per-cycle decision was moved off long paths:
 
 - **Barrier counter compares:** registered, and computed against each counter's *next* value so they can only open late, never early.
-- **Burst length and credit checks:** registered in both AXI engines.
+- **Burst length, credit and outstanding-burst checks:** registered in both AXI engines (the outstanding caps of phase 5 kept WNS at +0.015 ns).
 - **Run generator:** a second output stage, and shift/add element counts instead of a general multiply.
 - **Drain:** the kw reduction tree takes two stages.
 

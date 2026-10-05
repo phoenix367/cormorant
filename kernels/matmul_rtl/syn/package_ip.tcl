@@ -4,7 +4,8 @@
 #
 #   VLNV            xilinx.com:hls:MatmulKernel:1.0
 #   interfaces      s_axi_ctrl (64 KiB register block "Reg"), m_axi_gmem0/1/2
-#                   (address spaces Data_m_axi_gmem0/1/2, 64-bit), ap_clk,
+#                   (address spaces Data_m_axi_gmem0/1/2, 64-bit; bus
+#                   parameters as an HLS export declares them), ap_clk,
 #                   ap_rst_n (active low), interrupt (level high)
 #   drivers         MatmulKernel_v1_0, written by scripts/gen_driver.py (the
 #                   API and register map of the HLS-generated xmatmulkernel)
@@ -38,7 +39,8 @@ set_property display_name MatmulKernel $core
 set_property description  "Q8.8 GEMM/GEMV kernel (SystemVerilog RTL), register- and\
  layout-compatible with the Vitis HLS MatmulKernel; 128-bit gmem0/1/2" $core
 set_property supported_families {zynquplus Production} $core
-set_property core_revision 2 $core
+# 3: the m_axi bus parameters (outstanding counts, burst lengths, read / write only)
+set_property core_revision 3 $core
 
 # Interface widths are fixed by the RTL: expose the HLS parameter names, read only.
 foreach p [ipx::get_user_parameters -of_objects $core] {
@@ -66,6 +68,22 @@ foreach g {GMEM0 GMEM1 GMEM2} {
 # Clock / reset / interrupt ----------------------------------------------------------
 foreach bi {s_axi_ctrl m_axi_gmem0 m_axi_gmem1 m_axi_gmem2} {
   ipx::associate_bus_interfaces -busif $bi -clock ap_clk $core
+}
+# m_axi properties (mm_pkg RD_BURST / RD_OUTS / WR_BURST / WR_OUTS), declared
+# as the HLS export declares them: the block design sizes each crossbar slot's
+# acceptance from the outstanding counts and leaves out the unused direction.
+# Without them a port is taken as read-write with 2 outstanding bursts, which
+# throttles reads.
+foreach {g mode rb wb} {gmem0 READ_ONLY 64 16  gmem1 READ_ONLY 64 16  gmem2 WRITE_ONLY 16 64} {
+  set bi [ipx::get_bus_interfaces m_axi_$g -of_objects $core]
+  foreach {n v} [list NUM_READ_OUTSTANDING 16 NUM_WRITE_OUTSTANDING 16 \
+                      MAX_READ_BURST_LENGTH $rb MAX_WRITE_BURST_LENGTH $wb MAX_BURST_LENGTH 256 \
+                      PROTOCOL AXI4 READ_WRITE_MODE $mode HAS_BURST 0 \
+                      SUPPORTS_NARROW_BURST 0 ADDR_WIDTH 64] {
+    set bp [ipx::get_bus_parameters $n -of_objects $bi]
+    if {$bp eq ""} { set bp [ipx::add_bus_parameter $n $bi] }
+    set_property value $v $bp
+  }
 }
 set rst [ipx::get_bus_interfaces ap_rst_n -of_objects $core]
 set pol [ipx::get_bus_parameters POLARITY -of_objects $rst]

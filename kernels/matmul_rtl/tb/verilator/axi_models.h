@@ -94,6 +94,7 @@ struct AxiReadSlave {
   int      ar_len_q = 0;
   uint64_t beats_total = 0, bursts_total = 0;
   int      max_outstanding = 0;
+  int      outs_limit = 0;      // > 0: the master's declared NUM_READ_OUTSTANDING
 
   bool coin(double p) { return std::uniform_real_distribution<double>(0, 1)(*rng) < p; }
 
@@ -136,6 +137,8 @@ struct AxiReadSlave {
       q.push_back({a, beats, g_cycle + (uint64_t)lat});
       bursts_total++;
       if ((int)q.size() > max_outstanding) max_outstanding = (int)q.size();
+      if (outs_limit > 0 && (int)q.size() > outs_limit)
+        tb_fatal("%s: %d bursts outstanding, more than %d", name, (int)q.size(), outs_limit);
       ar_pend = false;
     } else if (*arvalid) {
       ar_pend = true; ar_addr_q = *araddr; ar_len_q = *arlen;
@@ -172,6 +175,8 @@ struct AxiWriteSlave {
   bool bv = false, aw_pend = false;
   uint64_t aw_addr_q = 0; int aw_len_q = 0;
   uint64_t beats_total = 0, bursts_total = 0, partial_beats = 0;
+  int      max_outstanding = 0;  // bursts accepted, B not yet taken
+  int      outs_limit = 0;       // > 0: the master's declared NUM_WRITE_OUTSTANDING
 
   bool coin(double p) { return std::uniform_real_distribution<double>(0, 1)(*rng) < p; }
 
@@ -200,6 +205,10 @@ struct AxiWriteSlave {
         tb_fatal("%s: burst crosses 4 KiB", name);
       aw.push_back({a, beats});
       bursts_total++;
+      const int outs = (int)(aw.size() + b_due.size());
+      if (outs > max_outstanding) max_outstanding = outs;
+      if (outs_limit > 0 && outs > outs_limit)
+        tb_fatal("%s: %d bursts outstanding, more than %d", name, outs, outs_limit);
       aw_pend = false;
     } else if (*awvalid) {
       aw_pend = true; aw_addr_q = *awaddr; aw_len_q = *awlen;

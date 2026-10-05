@@ -241,6 +241,32 @@ facts:
       - inference-scheduler/bench_src/calib_runner.c
       - inference-scheduler/bench_src/bench_vectorop.c
 
+- id: rtl.axi_masters
+  kind: value
+  title: the RTL kernels' AXI masters — burst lengths and outstanding bursts per port, which the IPs
+    declare on their m_axi interfaces (the block design sizes the crossbar from them) and the
+    testbenches enforce
+  source:
+    parts:
+      mm_rd_burst: {file: kernels/matmul_rtl/rtl/mm_pkg.sv, regex: 'localparam int RD_BURST +=\s*(\d+);', type: int}
+      mm_rd_outs: {file: kernels/matmul_rtl/rtl/mm_pkg.sv, regex: 'localparam int RD_OUTS +=\s*(\d+);', type: int}
+      mm_wr_burst: {file: kernels/matmul_rtl/rtl/mm_pkg.sv, regex: 'localparam int WR_BURST +=\s*(\d+);', type: int}
+      mm_wr_outs: {file: kernels/matmul_rtl/rtl/mm_pkg.sv, regex: 'localparam int WR_OUTS +=\s*(\d+);', type: int}
+      vo_rd_burst: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int RD_BURST +=\s*(\d+);', type: int}
+      vo_rd_outs: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int RD_OUTS +=\s*(\d+);', type: int}
+      vo_wr_burst: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int WR_BURST +=\s*(\d+);', type: int}
+      vo_wr_outs: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int WR_OUTS +=\s*(\d+);', type: int}
+  fix: report                                # an IP change: repackage, rebuild, re-measure
+  mentions:
+    - {file: kernels/matmul_rtl/syn/package_ip.tcl, regex: 'NUM_READ_OUTSTANDING (?P<mm_rd_outs>\d+) NUM_WRITE_OUTSTANDING (?P<mm_wr_outs>\d+)'}
+    - {file: kernels/matmul_rtl/syn/package_ip.tcl,
+       regex: 'gmem0 READ_ONLY (?P<mm_rd_burst>\d+) \d+  gmem1 READ_ONLY \d+ \d+  gmem2 WRITE_ONLY \d+ (?P<mm_wr_burst>\d+)'}
+    - {file: kernels/matmul_rtl/tb/verilator/tb_main.cpp, regex: 'rd1\.outs_limit = (?P<mm_rd_outs>\d+);  wr\.outs_limit = (?P<mm_wr_outs>\d+);'}
+    - {file: kernels/vectorop_rtl/syn/package_ip.tcl, regex: 'NUM_READ_OUTSTANDING (?P<vo_rd_outs>\d+) NUM_WRITE_OUTSTANDING (?P<vo_wr_outs>\d+)'}
+    - {file: kernels/vectorop_rtl/syn/package_ip.tcl,
+       regex: 'gmem0 READ_ONLY (?P<vo_rd_burst>\d+) \d+  gmem1 READ_ONLY \d+ \d+  gmem2 WRITE_ONLY \d+ (?P<vo_wr_burst>\d+)'}
+    - {file: kernels/vectorop_rtl/tb/verilator/tb_main.cpp, regex: 'rd1\.outs_limit = (?P<vo_rd_outs>\d+);  wr\.outs_limit = (?P<vo_wr_outs>\d+);'}
+
 - id: registers.MatmulKernel
   kind: interface
   title: MatmulKernel AXI-Lite registers
@@ -700,8 +726,12 @@ facts:
           (the RTL VectorOPKernel, VECTOROP_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
           72.9 / 62.8, BERT p50 917.8, MNIST 0.261 / 2.833 ms; llm_board 135M 100.3 ms / token and a 250 ms
           16-token prefill, 360M 251.9 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.519 — all
-          within the tolerance of the values above"
-    facts: {perf.bitstream_id: 68665fc1833a}   # stale on another bitstream
+          within the tolerance of the values above.  Re-measured on b3309f424562 (the MatmulKernel IP with its
+          m_axi bus parameters, MATMUL_RTL_PLAN phase 5, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
+          72.9 / 62.8, BERT p50 917.3, MNIST 0.261 / 2.774 ms; llm_board 135M 100.2 ms / token and a 251 ms
+          16-token prefill, 360M 252.0 ms / token, SmolVLM llm_image 3.90 s; tts_board RTF 0.519 — within the
+          tolerance (LeNet 2.1 % faster: its FC layers run on MatmulKernel)"
+    facts: {perf.bitstream_id: b3309f424562}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -802,16 +832,17 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 7d8eefe, dsp: 1038, dsp_total: 1248, dsp_pct: 83, lut: 80965, lut_total: 117120, lut_pct: 69.1,
+  value: {hw_commit: 7d8eefe, dsp: 1038, dsp_total: 1248, dsp_pct: 83, lut: 80914, lut_total: 117120, lut_pct: 69.1,
           bram: 105.5, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-05
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe (4114b5d: docs only since) with the
-          RTL MatmulKernel and VectorOPKernel (VECTOROP_RTL_PLAN phase 1) and the PoolingKernel out-of-contract
-          guard; the bitstream of perf.bitstream_id (bbb9a37f73f8 before it, the HLS VectorOPKernel: LUT 84 561,
-          DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 68665fc1833a}
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe (docs only since) with the RTL
+          MatmulKernel (its IP declaring the m_axi bus parameters, MATMUL_RTL_PLAN phase 5) and VectorOPKernel
+          and the PoolingKernel out-of-contract guard; the bitstream of perf.bitstream_id (68665fc1833a before
+          it, the MatmulKernel IP without bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel:
+          LUT 84 561, DSP 1060, BRAM 109.5)"
+    facts: {perf.bitstream_id: b3309f424562}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

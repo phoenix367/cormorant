@@ -42,12 +42,15 @@ package mm_pkg;
   localparam int TAP_D   = 16;
   localparam int TAP_AW  = 4;
 
-  // AXI engines.
+  // AXI engines.  The burst lengths and outstanding counts are declared on the
+  // IP's m_axi interfaces (syn/package_ip.tcl); the block design sizes each
+  // crossbar slot's acceptance from them, so change both together.
   localparam int RD_FIFO_D  = 512;   // beats buffered per read port
   localparam int RD_BURST   = 64;    // max beats per AR burst (1 KiB)
+  localparam int RD_OUTS    = 16;    // AR bursts awaiting their data, per port
   localparam int WR_FIFO_D  = 512;   // beats buffered before AW issue
   localparam int WR_BURST   = 64;    // max beats per AW burst
-  localparam int WR_OUTS    = 16;    // AW bursts awaiting W / B
+  localparam int WR_OUTS    = 16;    // AW bursts awaiting their B
 
   // Run descriptor for a gearbox: a contiguous element range of `rows` rows
   // of `len` elements starting at lane `s` of the first word.  rows == 0 is a

@@ -80,7 +80,7 @@ does (`NUM_READ_OUTSTANDING` / `NUM_WRITE_OUTSTANDING` 16,
 `MAX_READ_BURST_LENGTH` / `MAX_WRITE_BURST_LENGTH`, `READ_WRITE_MODE`
 read-only for gmem0/1 and write-only for gmem2; `syn/package_ip.tcl`): the
 block design sizes each crossbar slot's acceptance from these.  Without them
-(the first package, and the RTL MatmulKernel's IP today) a port counts as
+(the first package; the RTL MatmulKernel's IP until MATMUL_RTL_PLAN phase 5) a port counts as
 read-write with 2 outstanding bursts, and the crossbar held the reads of a
 job of nine 2-word runs to about four in flight — slower than the HLS
 kernel in the test stand.

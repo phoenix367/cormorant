@@ -242,7 +242,6 @@ ADDs).  Perf-regression baseline `kv260-68665fc1833a.json`: the 60 kernel
 benchmarks of the A/B run and the phase-2 demos.  Host suites: scheduler
 1647, chat 188, lint, facts, csim 11 / 11, Piper host emulation 18 / 18.
 
-**Follow-up outside this plan: the RTL MatmulKernel's IP declares no m_axi
-bus parameters** either, so its crossbar slots run at 2 outstanding bursts
-(the HLS kernel's: A 4, B 16, C 16).  Declaring them (and capping the RTL
-at them) needs its own bitstream, board check and campaign.
+**Follow-up outside this plan: the RTL MatmulKernel's IP declared no m_axi
+bus parameters** either, so its crossbar slots ran at 2 outstanding bursts
+(the HLS kernel's: A 4, B 16, C 16) — fixed in MATMUL_RTL_PLAN phase 5.

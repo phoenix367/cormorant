@@ -1,13 +1,15 @@
 # MatmulKernel in SystemVerilog: integration plan
 
-**Status (2026-10-04):** done.  The SystemVerilog MatmulKernel
+**Status (2026-10-05):** done.  The SystemVerilog MatmulKernel
 (`kernels/matmul_rtl/`) is the KV260's: the default of the build and the
 scheduler, and the board's bitstream (`1d28630fbfa4`, timing met at
 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than with the HLS
 kernel), bit-exact everywhere and no workload slower; its engine choices
 keep one copy of every weight and run the 16-token LLM prefills 26–32 %
 and MobileNet v1 10 % faster.  The HLS kernel's synthesis is retired; its
-C++ stays as the reference model.
+C++ stays as the reference model.  Phase 5 (2026-10-05): the IP declares
+its m_axi bus parameters, so the crossbar no longer holds each port to 2
+outstanding bursts (bitstream `b3309f424562`).
 
 The RTL kernel ([MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) is a
 drop-in replacement for the Vitis HLS MatmulKernel
@@ -540,3 +542,70 @@ facts and docs.  What was done:
   estimates favour the RTL MatmulKernel at short contexts (a tiny
   geometry: 2 660 vs 3 824 cycles at 32 keys), not yet evaluated for the
   real models.
+
+### Phase 5: the IP's m_axi bus parameters — done (2026-10-05)
+
+**The gap** (found in VECTOROP_RTL_PLAN phase 0): `syn/package_ip.tcl`
+declared no bus parameters on the m_axi interfaces.  The block design sizes
+each crossbar slot's acceptance from the master's `NUM_READ_OUTSTANDING` /
+`NUM_WRITE_OUTSTANDING`, and without them it took every port as read-write
+with 2 outstanding bursts: since `1d28630fbfa4` the MatmulKernel's A, B and
+C slots accepted 2 bursts each (the HLS kernel's: A 4, B 16, C 16).  The RTL
+had no cap of its own — the read engines issue as long as their 512-beat
+FIFO has room, and the write engine's 6-bit count of bursts awaiting B was
+never compared against anything.
+
+**The fix.**
+- `mm_pkg` `RD_OUTS = 16`, `WR_OUTS = 16` (bursts awaiting B):
+  `mm_axi_rd` counts bursts until their last beat, `mm_axi_wr` until their
+  B, both checks registered like the existing credit checks (the cycle
+  after an issue is blocked anyway).  The testbench's AXI models fail a port
+  with more than 16 bursts outstanding; the random jobs reach 16.
+- `package_ip.tcl` declares, as an HLS export does,
+  `NUM_READ_OUTSTANDING` / `NUM_WRITE_OUTSTANDING` 16, the burst lengths
+  (reads 64 beats, writes 64), `READ_WRITE_MODE` (gmem0 / gmem1 read-only,
+  gmem2 write-only), `PROTOCOL`, `HAS_BURST`, `SUPPORTS_NARROW_BURST` and
+  `ADDR_WIDTH`; `core_revision` 3, so a block design holding the old IP
+  sees a revision change and upgrades it.  Fact `rtl.axi_masters` ties the
+  RTL constants, the declarations and the testbench limits of both RTL
+  kernels together.
+
+**Checks.**
+
+| check | result |
+|---|---|
+| `lint_matmul_rtl` | clean |
+| `TestMatmulRtl` (50 fixtures + 200 random, ctest); by hand 300 + 300 random (seeds 1, 2026) and 150 with slow timing (seed 4711) | all pass |
+| `perf_matmul_rtl` (ideal memory) | cycle counts unchanged |
+| `synth_matmul_rtl` | WNS +0.015 ns at 3.333 ns; 18 379 LUT, 9 493 FF, 38 BRAM36, 130 DSP (unchanged) |
+| `behavior_test_matmul` (test stand) | 50 / 50; kernel time 1 515 → 1 499 µs (−1.1 %; 22 cases faster by up to 5.4 %, 2 slower by 10–40 ns) |
+| bitstream `b3309f424562` | WNS +0.771 ns; the upgrade changed only `MatmulKernel_0` (revision 2 → 3); crossbar acceptance A / B / C 2 / 2 / 2 → 16 / 16 / 16; 80 914 LUT (−51) |
+| `sim_hw_kv260` | 68 / 68 |
+| board: `run_remote_tests` | 148 / 148 |
+| board: demos | MNIST 98.92 / 97.35 %, image-classification results unchanged, BERT 50 / 50 bit-exact |
+| board: `llm_board` SmolLM2-135M / 360M, SmolVLM; `tts_board` Piper | all bit-exact |
+
+**Speed** — the 24 MatmulKernel benchmarks, the production bitstream
+(`68665fc1833a`) and the new one back to back in one session: none slower
+(worst +0.06 %); row-major FC 1×1280×1001 −13.2 %, FC 1×512×1000 −3.7 %
+(its GEMV form −3.2 %), small GEMMs −0.4 to −1.5 %; the large GEMMs and the
+packed / kw-4 GEMV shapes unchanged (compute- or port-bound).  The
+calibration campaign's 414 MatmulKernel calls: median unchanged, 90 faster
+by more than 1 % (up to 14.7 %), 3 slower by 1–2.2 %.  Workloads: LeNet
+2.833 → 2.774 ms (its FC layers run on MatmulKernel); ResNet-18, MobileNet,
+BERT, SmolLM2 decode / prefill, SmolVLM and Piper within ±0.3 % (bound
+elsewhere).
+
+**Models.**  Performance model `kv260/b3309f424562` (the case list of
+`68665fc1833a`; refinement added 0; 1581 exact calls): the MatmulKernel
+families became more predictable — mm-gemv held-out p90 2.91 → 0.89 %,
+mm-tiled 4.20 → 3.13 %.  The scheduler's `cost_model.RTL_COEF` predicted
+the new calls at a median error of 1.28 % (p90 3.13 %); refitted to them
+(414 calls) it reaches 0.35 / 1.66 % leave-one-out — mostly a lower cost
+per step (6.37 → 2.97 cycles) and per B read run (1.39 → 0.33), the
+stalls the 2-burst slots had added.  The refit changes none of the shipped
+models' engine choices or geometries (the 1416 kernel calls of the ten
+models are identical under both coefficient sets), so no library is
+regenerated.  Perf-regression baseline `kv260-b3309f424562.json`; the
+bitstream is in production and the chat server serves from it.
+

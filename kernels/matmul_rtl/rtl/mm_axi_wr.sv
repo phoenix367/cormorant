@@ -4,8 +4,8 @@
 // Beats (data + strobes) are buffered in a block-RAM FIFO.  Word-range
 // descriptors are split into INCR bursts of at most WR_BURST beats that never
 // cross a 4 KiB boundary; a burst's AW is only issued once all of its beats
-// are in the FIFO, so W streams without gaps.  `idle` means every accepted
-// beat has been written and acknowledged.
+// are in the FIFO, so W streams without gaps; at most WR_OUTS bursts await
+// their B.  `idle` means every accepted beat has been written and acknowledged.
 // ---------------------------------------------------------------------------
 module mm_axi_wr
   import mm_pkg::*;
@@ -89,15 +89,19 @@ module mm_axi_wr
   assign avail = {1'b0, wf_count} - pend_w;
 
   logic issue;
-  // Registered "all beats of the next burst are buffered".  Safe although one
-  // cycle old: only an AW issue can lower `avail`, and after an issue bl_v
-  // blocks the next one until both blen and this flag are recomputed.
-  logic av_ok;
-  always_ff @(posedge clk)
+  // Registered "all beats of the next burst are buffered" and "fewer than
+  // WR_OUTS bursts await B".  Safe although one cycle old: only an AW issue
+  // can lower `avail` or raise `outstanding`, and after an issue bl_v blocks
+  // the next one until blen and these flags are recomputed.
+  localparam int OW = $clog2(WR_OUTS) + 1;
+  logic [OW-1:0] outstanding;  // bursts awaiting B
+  logic av_ok, ob_ok;
+  always_ff @(posedge clk) begin
     av_ok <= !rst && (avail >= (CW+1)'(bl_v ? blen : blen_c));
-  assign issue = busy && bl_v && av_ok && (!awvalid || awready) && lq_in_ready;
+    ob_ok <= !rst && (outstanding < OW'(WR_OUTS));
+  end
+  assign issue = busy && bl_v && av_ok && ob_ok && (!awvalid || awready) && lq_in_ready;
 
-  logic [5:0] outstanding;  // bursts awaiting B
   logic       w_fire, b_fire, w_end;
 
   always_ff @(posedge clk) begin
@@ -127,7 +131,7 @@ module mm_axi_wr
         if (rem == blen) busy <= 1'b0;
       end
       pend_w      <= pend_w + (issue ? (CW+1)'(blen) : '0) - (w_fire ? (CW+1)'(1) : '0);
-      outstanding <= outstanding + (issue ? 6'd1 : 6'd0) - (b_fire ? 6'd1 : 6'd0);
+      outstanding <= outstanding + (issue ? OW'(1) : '0) - (b_fire ? OW'(1) : '0);
     end
   end
 

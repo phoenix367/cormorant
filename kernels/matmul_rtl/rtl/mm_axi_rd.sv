@@ -5,7 +5,8 @@
 // bursts of at most RD_BURST beats that never cross a 4 KiB boundary, and
 // buffers the returned beats in a block-RAM FIFO.  A burst is only issued when
 // the FIFO has room for all of it, so RREADY is tied high and the port never
-// back-pressures the interconnect.  Single ID, so data returns in order.
+// back-pressures the interconnect; at most RD_OUTS bursts await their data.
+// Single ID, so data returns in order.
 // ---------------------------------------------------------------------------
 module mm_axi_rd
   import mm_pkg::*;
@@ -55,12 +56,17 @@ module mm_axi_rd
   end
 
   logic issue;
-  // Registered FIFO-space check (see mm_axi_wr): only an issue lowers
-  // `space`, and bl_v blocks the cycle after every issue.
-  logic sp_ok;
-  always_ff @(posedge clk)
+  // Registered FIFO-space and outstanding checks (see mm_axi_wr): only an
+  // issue lowers `space` or raises `outs`, and bl_v blocks the cycle after
+  // every issue.
+  localparam int OW = $clog2(RD_OUTS) + 1;
+  logic [OW-1:0] outs;      // bursts issued, last beat not yet received
+  logic sp_ok, os_ok;
+  always_ff @(posedge clk) begin
     sp_ok <= !rst && (space >= (CW+1)'(bl_v ? blen : blen_c));
-  assign issue      = busy && bl_v && sp_ok && (!arvalid || arready);
+    os_ok <= !rst && (outs < OW'(RD_OUTS));
+  end
+  assign issue      = busy && bl_v && sp_ok && os_ok && (!arvalid || arready);
   assign desc_ready = !busy;
 
   always_ff @(posedge clk) begin
@@ -69,6 +75,7 @@ module mm_axi_rd
       bl_v    <= 1'b0;
       arvalid <= 1'b0;
       space   <= (CW+1)'(RD_FIFO_D);
+      outs    <= '0;
     end else begin
       if (desc_valid && desc_ready) begin
         busy  <= (desc.nw != '0);
@@ -89,6 +96,7 @@ module mm_axi_rd
         if (rem == blen) busy <= 1'b0;
       end
       space <= space - (issue ? (CW+1)'(blen) : '0) + (out_fire ? (CW+1)'(1) : '0);
+      outs  <= outs + (issue ? OW'(1) : '0) - ((rvalid && rlast) ? OW'(1) : '0);
     end
   end
 
@@ -106,8 +114,7 @@ module mm_axi_rd
 
   assign idle = !busy && !arvalid && (space == (CW+1)'(RD_FIFO_D));
 
-  // rlast is implied by the burst lengths; it is only checked in simulation.
   logic unused;
-  assign unused = rlast ^ f_in_ready;
+  assign unused = f_in_ready;
 
 endmodule

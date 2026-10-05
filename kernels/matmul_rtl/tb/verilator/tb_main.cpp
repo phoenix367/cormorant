@@ -154,6 +154,9 @@ struct Tb {
           &T->m_axi_gmem2_WSTRB, &T->m_axi_gmem2_WDATA, &T->m_axi_gmem2_BVALID,
           &T->m_axi_gmem2_BREADY, &T->m_axi_gmem2_BRESP, &T->m_axi_gmem2_BID,
           &mem, &tim, &rng};
+    // the outstanding bursts the IP declares (mm_pkg RD_OUTS / WR_OUTS, package_ip.tcl;
+    // fact rtl.axi_masters)
+    rd0.outs_limit = rd1.outs_limit = 16;  wr.outs_limit = 16;
     lite.awvalid = &T->s_axi_ctrl_AWVALID; lite.awready = &T->s_axi_ctrl_AWREADY;
     lite.awaddr  = &T->s_axi_ctrl_AWADDR;  lite.wvalid  = &T->s_axi_ctrl_WVALID;
     lite.wready  = &T->s_axi_ctrl_WREADY;  lite.wstrb   = &T->s_axi_ctrl_WSTRB;

@@ -47,7 +47,7 @@ with the SystemVerilog MatmulKernel, `1d28630fbfa4`, the demos again on today's 
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
 The FPGA design (`hw/cormorant_hw_128` 7d8eefe) uses 83 % of the DSPs
-(1038 / 1248), 69.1 % of the LUTs (80 965 / 117 120), 105.5 / 144 BRAM and
+(1038 / 1248), 69.1 % of the LUTs (80 914 / 117 120), 105.5 / 144 BRAM and
 48 / 64 URAM.
 
 ---
