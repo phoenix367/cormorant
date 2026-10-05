@@ -2,7 +2,7 @@
 
 Many facts in this repo are stated in more than one place. The scheduler's test count is
 quoted in eleven places. The bitstream id is in twenty files. A kernel's registers are in its
-HLS source, its driver, the scheduler, two benchmarks, the calibration runner
+HLS source or RTL control block, its driver, the scheduler, two benchmarks, the calibration runner
 and the timeline viewer.
 
 `facts.yaml` (at the repo root) records, for each such fact, **where it is
@@ -146,12 +146,13 @@ The `fix` policy:
 `register_map` checks that:
 - the kernel's registers — the HLS `s_axilite` ports (`hls`), or for an RTL
   kernel the table of its driver generator (`rtl_driver`,
-  `kernels/matmul_rtl/scripts/gen_driver.py`), which must match the address
+  `kernels/{matmul,vectorop}_rtl/scripts/gen_driver.py`), which must match the address
   constants of its control block `rtl` (`--check --json`) — equal the driver
   header's, where the driver is built (a mismatch is a warning, because the
   header is a local artifact; with `rtl_driver` the offsets are compared too);
-- with both `rtl_driver` and `hls` (MatmulKernel: the HLS kernel's C++ is the
-  RTL kernel's reference model), the HLS ports equal the RTL registers;
+- with both `rtl_driver` and `hls` (MatmulKernel, VectorOPKernel: the HLS
+  kernel's C++ is the RTL kernel's reference model), the HLS ports equal the
+  RTL registers;
 - every port is a `src/perf_calls.FIELDS` field (through `fields_alias`) or
   is `not_keyed` with a reason;
 - the timeline's `DECODE` table decodes only FIELDS;
@@ -172,8 +173,9 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `perf.bitstream_id` | value | the committed performance model's bitstream. `exists`: its cases / calib files and the perf-regression baseline |
 | `perf.model_size` | value | exact calls of the model; host-model signatures and kinds (`fix: report`: dated sentences) |
 | `cli.inference_scheduler` | interface | the CLI flags against `inference-scheduler/CLAUDE.md` § CLI and USER_GUIDE § Options |
-| `registers.{VectorOP,Matmul,Conv,Pool}Kernel` | interface | the register maps (`register_map`; MatmulKernel's from the RTL control block) |
+| `registers.{VectorOP,Matmul,Conv,Pool}Kernel` | interface | the register maps (`register_map`; MatmulKernel's and VectorOPKernel's from the RTL control blocks) |
 | `paths.matmul_driver` | value | where `make driver_matmul_rtl` writes MatmulKernel's driver (`kernels/matmul_rtl/CMakeLists.txt`), in the five example configs (and the remote config's note) and five docs |
+| `paths.vectorop_driver` | value | where `make driver_vectorop_rtl` writes VectorOPKernel's driver (`kernels/vectorop_rtl/CMakeLists.txt`), in the six example configs, `src/kernels.py` and the CLI's help |
 | `vectorop.codes` | interface | the `Op` / `Act` enums against `nodes.py`, the CLAUDE.md table, `run_remote_perf._OP_NAMES` and the timeline `DECODE` |
 | `ctypes.tts`, `ctypes.llm` | interface | the chat server's ctypes bindings against the C headers |
 | `config.chat` | interface | `chat_config.json.example` against the code reading it, with 5 waivers |

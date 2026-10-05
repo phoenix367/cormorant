@@ -62,7 +62,8 @@ static: the I/O names and active-kernel set differ per model.
 * Python 3.10+
 * `pip install -r requirements.txt`
 * Generated driver sources for the four kernels (HLS; the RTL MatmulKernel's
-  by `driver_matmul_rtl`).  These are produced by the top-level CMake build:
+  and VectorOPKernel's by `driver_matmul_rtl` / `driver_vectorop_rtl`).  These
+  are produced by the top-level CMake build:
 
   ```bash
   # from the repo root

@@ -54,26 +54,25 @@ class TestCLI(unittest.TestCase):
             )
 
     def test_driver_copied_when_dir_given(self):
-        # The HLS driver of `make synthesize_vectorop_kv260` when the top-level
-        # build/ has it, else (a fresh clone, CI) a stand-in directory with the
-        # same file names: the copy is what is under test.
-        hls_src = os.path.join(
-            ROOT, "..", "build", "kernels", "vectorop", "kv260",
-            "vadd_kv260", "solution1", "impl", "ip",
-            "drivers", "VectorOPKernel_v1_0", "src",
+        # The driver of `make driver_vectorop_rtl` when the top-level build/
+        # has it, else (a fresh clone, CI) a stand-in directory with the same
+        # file names: the copy is what is under test.
+        vo_src = os.path.join(
+            ROOT, "..", "build", "kernels", "vectorop_rtl", "driver",
+            "VectorOPKernel_v1_0", "src",
         )
         names = ["xvectoropkernel.c", "xvectoropkernel.h",
                  "xvectoropkernel_hw.h",
                  "xvectoropkernel_sinit.c",
                  "xvectoropkernel_linux.c"]
         with tempfile.TemporaryDirectory() as td:
-            driver_src = hls_src
-            if not os.path.isdir(hls_src):
-                driver_src = os.path.join(td, "hls_driver")
+            driver_src = vo_src
+            if not os.path.isdir(vo_src):
+                driver_src = os.path.join(td, "vectorop_driver")
                 os.makedirs(driver_src)
                 for fname in names:
                     with open(os.path.join(driver_src, fname), "w") as f:
-                        f.write(f"/* stand-in for the HLS {fname} */\n")
+                        f.write(f"/* stand-in for {fname} */\n")
             out = os.path.join(td, "out")
             r = self._run_cli(
                 "single_add.onnx",

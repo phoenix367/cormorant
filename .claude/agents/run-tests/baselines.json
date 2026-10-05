@@ -9,7 +9,7 @@
   "recorded": "2026-10-01 03:30"
  },
  "csim": {
-  "min_tests": 9,
+  "min_tests": 11,
   "max_skipped": 0,
   "skip_allow": [],
   "warning_allow": [

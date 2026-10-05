@@ -28,12 +28,12 @@
   "local": {
     "driver_dir": null,
     "driver_dirs": {
-      "VectorOPKernel": "../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "VectorOPKernel": "../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel": "../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel": "../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
       "PoolingKernel": "../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel local driver source paths (relative to inference-scheduler/, where the runner is started), merged and bundled before upload. The output locations of `make synthesize_kv260` in <repo>/build are shown (MatmulKernel: the RTL kernel's driver, also `make driver_matmul_rtl`)."
+    "_driver_dirs_note": "Per-kernel local driver source paths (relative to inference-scheduler/, where the runner is started), merged and bundled before upload. The output locations of `make synthesize_kv260` in <repo>/build are shown (VectorOPKernel, MatmulKernel: the RTL kernels' drivers, also `make driver_vectorop_rtl driver_matmul_rtl`)."
   },
   "build": {
     "jobs": 4,

@@ -26,9 +26,10 @@ fails the test.
   .venv/bin/pip install paramiko
   ```
 - Driver sources (for `local.driver_dirs` in the config): the Vitis HLS exports
-  of `make synthesize_kv260` and the RTL MatmulKernel's driver (`make driver_matmul_rtl`):
+  of `make synthesize_kv260` and the RTL VectorOPKernel's and MatmulKernel's
+  drivers (`make driver_vectorop_rtl driver_matmul_rtl`):
   ```
-  <repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src/
+  <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/
   <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
   <repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
   <repo>/build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src/
@@ -559,13 +560,13 @@ starting a long benchmark run.
 
 Driver files must be available either locally (`local.driver_dirs`) or on the
 board (`remote.driver_dirs`). The local paths are the standard Vitis HLS output
-(see [Prerequisites](#prerequisites); VectorOPKernel under
-`<hls_project>/solution1/impl/ip/`, ConvKernel and PoolingKernel under
-`<hls_project>/hls/impl/ip/`) and, for MatmulKernel, the RTL kernel's driver
-(`make driver_matmul_rtl`, `<repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/`):
+(see [Prerequisites](#prerequisites); ConvKernel and PoolingKernel under
+`<hls_project>/hls/impl/ip/`) and, for MatmulKernel and VectorOPKernel, the RTL
+kernels' drivers (`make driver_matmul_rtl`, `<repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/`;
+`make driver_vectorop_rtl`, `<repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/`):
 
 ```
-<repo>/build/kernels/<kernel>/kv260/<hls_project>/{solution1,hls}/impl/ip/drivers/<KernelName>_v1_0/src/
+<repo>/build/kernels/<kernel>/kv260/<hls_project>/hls/impl/ip/drivers/<KernelName>_v1_0/src/
 ```
 
 ---

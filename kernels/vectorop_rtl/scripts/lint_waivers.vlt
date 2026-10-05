@@ -1,0 +1,8 @@
+`verilator_config
+// Port name fixed by the HLS interface contract.
+lint_off -rule SYMRSVDWORD -file "*/vo_core.sv" -match "*interrupt*"
+lint_off -rule SYMRSVDWORD -file "*/VectorOPKernel.v" -match "*interrupt*"
+// The geometry struct is shared: the write port's burst generator uses a subset of it.
+lint_off -rule UNUSEDSIGNAL -file "*/vo_burstgen.sv" -match "*'g'*"
+// Partially used address vectors (16-byte aligned bases, word-aligned AXI-Lite addresses).
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"

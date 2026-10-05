@@ -74,7 +74,7 @@ demo/bert_squad/
   `inference-scheduler/requirements.txt`, see the root README): numpy,
   onnx, paramiko.  All commands below use it.
 * Driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
-  `build/`: `make synthesize_vectorop_kv260 synthesize_conv_kv260
+  `build/`: `make synthesize_conv_kv260 driver_vectorop_rtl
   driver_matmul_rtl`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.

@@ -7,7 +7,7 @@ machine without an FPGA.
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
 | 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1647 tests); the chat app (188 tests) |
-| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel in Verilator against the same fixtures (`ctest`) |
+| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel and VectorOPKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel and VectorOPKernel in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
@@ -183,18 +183,26 @@ driver's register table against the RTL.  `make lint_matmul_rtl` is the
 Verilator lint; the testbench's own options (one case, a waveform, `--perf`)
 are in the kernel's reference.
 
+The SystemVerilog VectorOPKernel (`kernels/vectorop_rtl/`,
+[VECTOROP_RTL_KERNEL](../kernels/VECTOROP_RTL_KERNEL.md)) likewise:
+`TestVectorOpRtl` (in plain `make`) runs the 119 checked-in VectorOP
+fixtures — the ones `TestSimulation --dump-data` writes — plus 300 random
+jobs checked against the HLS kernel's C++ under randomised AXI timing;
+`VectorOpRtlDriver` checks the C driver's register table against the RTL;
+`make lint_vectorop_rtl` is its lint.
+
 ---
 
 ## 3. Hardware simulation (Vivado, no board)
 
 RTL behavioural simulation in Vivado xsim — no board required, but the
-per-kernel IP archives (HLS synthesis; the RTL MatmulKernel's packaging) must exist first.
+per-kernel IP archives (HLS synthesis; the RTL MatmulKernel's and VectorOPKernel's packaging) must exist first.
 
 ```bash
 cd build
 
-# Prerequisite: the four kernel IPs (three HLS syntheses + the RTL MatmulKernel's
-# packaging, ~5–10 min); Vitis's
+# Prerequisite: the four kernel IPs (two HLS syntheses + the RTL MatmulKernel's
+# and VectorOPKernel's packaging, ~5–10 min); Vitis's
 # settings64.sh puts vitis-run, vivado and xclbinutil on PATH
 source <Xilinx>/2025.2/Vitis/settings64.sh
 make synthesize_kv260
@@ -209,8 +217,8 @@ make behavior_test            # all four in sequence
 make sim_hw_kv260
 ```
 
-Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (MatmulKernel:
-`package_matmul_rtl`) (so it
+Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (MatmulKernel,
+VectorOPKernel: `package_matmul_rtl`, `package_vectorop_rtl`) (so it
 re-synthesises its kernel and rebuilds its driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
@@ -279,13 +287,14 @@ The two fields you must set are:
 
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
-  driver sources for each kernel (Vitis HLS generates three;
-  `make driver_matmul_rtl` writes MatmulKernel's; the example's
+  driver sources for each kernel (Vitis HLS generates ConvKernel's and
+  PoolingKernel's; `make driver_matmul_rtl` / `make driver_vectorop_rtl`
+  write MatmulKernel's and VectorOPKernel's; the example's
   `../build/…` paths, relative to `inference-scheduler/`, fit a build in
   `<repo>/build`), e.g.:
 
   ```
-  "VectorOPKernel": "<repo>/build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src"
+  "VectorOPKernel": "<repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src"
   "ConvKernel":     "<repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
   ```
 

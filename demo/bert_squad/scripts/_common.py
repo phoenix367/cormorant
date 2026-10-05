@@ -68,7 +68,7 @@ def format_missing_config(path: Path) -> str:
             "Required edits before the first run:",
             "  - ssh.host / ssh.user / ssh.key_file  (the KV260)",
             "  - local.driver_dirs.{VectorOPKernel,MatmulKernel} (driver sources:",
-            "      make synthesize_vectorop_kv260 driver_matmul_rtl from build/)",
+            "      make driver_vectorop_rtl driver_matmul_rtl from build/)",
             "  - model  (bertsquad-12-simplified.onnx; downloaded to assets/models/ when missing)",
             "", f"See {DEMO_DIR / 'README.md'} for every field.", ""]
     return "\n".join(lines)

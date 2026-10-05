@@ -15,6 +15,19 @@ compute, store C) on 128-bit words with every stage loop pipelined at II=1,
 so once the streams are primed it sustains one word (8 elements) per clock
 (`OP_DIV`: one element per clock).
 
+> **Retired from the hardware build (2026-10-05, VECTOROP_RTL_PLAN phase 3).**
+> The bitstream carries a SystemVerilog drop-in with the same registers,
+> m_axi bus parameters, DDR access pattern and results,
+> `kernels/vectorop_rtl/`: [VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md).
+> This kernel's HLS synthesis target is gone; its C++ (`VectorOP.cpp`,
+> `TestSimulation`) stays as the reference model and writes the fixtures
+> the RTL kernel is tested against.  The register map, geometry and
+> arithmetic below hold for both kernels — with one exception, DIV of
+> −128 by −1/256: the hardware (this kernel's synthesised 25-bit divider and
+> the RTL) saturates to 0x7FFF, this C++ in C simulation gives 0x8000.  The
+> microarchitecture, synthesis and resource sections describe the retired
+> HLS kernel (bitstreams `bbb9a37f73f8` and older).
+
 ---
 
 ## 1. AXI Interface
@@ -257,18 +270,16 @@ when a dependent op needs the result.
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
 make TestSimulation && ctest -R TestSimulation
 
-# HLS synthesis + IP export for KV260
-make synthesize_vectorop_kv260
-make behavior_test_vectorop      # Vivado xsim on the test stand; reads hw/test_data/vecop_test_data/
+# the RTL fixtures (hw/test_data/vecop_test_data) from this model
+make gen_vectorop_test_data
+make behavior_test_vectorop      # Vivado xsim on the test stand (the RTL IP); reads hw/test_data/vecop_test_data/
 ```
 
-The synthesis target reads a `platforms/<name>.json` (part, optional board
-and clock — `kv260.json` sets 150 MHz) and invokes Vitis HLS via
-`Synthesis.tcl.in`, which configures the project (`vadd_<platform>`,
-`solution1`), sets 64-bit AXI addresses and
-`-m_axi_max_widen_bitwidth ${AXI_BUS_WIDTH}` (no effect on the ports, which
-are declared 128-bit in the C++), runs `csynth_design`, and exports an
-IP-catalog archive to `build/kernels/vectorop/<platform>/ip_catalog.zip`.
+The retired synthesis target (`synthesize_vectorop_<platform>`, removed in
+VECTOROP_RTL_PLAN phase 3) ran Vitis HLS through a `Synthesis.tcl.in`
+template: project `vadd_<platform>` / `solution1`, 64-bit AXI addresses,
+`csynth_design`, an IP-catalog export.  The hardware build packages the RTL
+kernel instead (`make package_vectorop_rtl`).
 
 ---
 
@@ -276,11 +287,11 @@ IP-catalog archive to `build/kernels/vectorop/<platform>/ip_catalog.zip`.
 
 | File | Purpose |
 |------|---------|
-| `kernels/vectorop/kernel/VectorOP.cpp` | HLS kernel — four DATAFLOW stages on 128-bit words |
+| `kernels/vectorop/kernel/VectorOP.cpp` | the retired HLS kernel — four DATAFLOW stages on 128-bit words; the RTL kernel's reference model |
 | `kernels/vectorop/include/VectorOP.h` | Kernel declaration, `Op` / `Act` enums, `VecWord` lane helpers, alignment contract, `saturate_cast<T>` |
 | `kernels/vectorop/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`, `kSeed`) |
 | `kernels/vectorop/test/TestSimulation.cpp` | C simulation tests (GCC) |
-| `kernels/vectorop/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
+| `kernels/vectorop_rtl/` | the SystemVerilog kernel of the hardware build ([VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md)) |
 | `inference-scheduler/src/nodes.py` | `ScheduledNode` class (ONNX → kernel params) |
 | `inference-scheduler/src/codegen/_source.py` | `run_op()` / `run_op_act()` code generation |
 

@@ -56,8 +56,9 @@ performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
 - **Host:** Python 3.10+ and each demo's `requirements.txt` (or the
   scheduler's `.venv`, see above).
 - **Kernel drivers:** build the kernel IP from the repo root first —
-  `cmake .. && make synthesize_kv260` in `build/` (MatmulKernel's driver:
-  `build/kernels/matmul_rtl/driver/`) — and point
+  `cmake .. && make synthesize_kv260` in `build/` (MatmulKernel's and
+  VectorOPKernel's drivers: `build/kernels/matmul_rtl/driver/`,
+  `build/kernels/vectorop_rtl/driver/`) — and point
   `local.driver_dirs` at the result.  The driver sources only describe the
   AXI-Lite registers, so they are the same for every `AXI_BUS_WIDTH`.
 - **KV260 board:** Linux with the bitstream and overlay loaded

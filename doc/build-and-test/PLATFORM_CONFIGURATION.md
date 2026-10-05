@@ -68,8 +68,9 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
 
 VectorOPKernel has no per-platform constants: it is a runtime-sized,
-element-wise kernel and has no compile-time bounds to validate (it reads
-only `part`, `board` and `clock`).
+element-wise kernel and has no compile-time bounds to validate (its
+SystemVerilog IP reads only `part`, for packaging and out-of-context
+synthesis).
 
 > **`AXI_BUS_WIDTH` is not a JSON field.** It is a top-level CMake
 > cache variable (default `32`; the KV260 hardware build uses
@@ -229,7 +230,7 @@ residual-lane padding for any `out_w`).
     ```
 
 3. The new platform now has:
-    - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export (vectorop, conv, pool)
+    - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export (conv, pool)
     - `synthesize_<platform>` — roll-up target that builds all four kernels
     - `cosim_<kernel>_<platform>` — C synthesis + RTL co-simulation (conv, pool)
     - `dtbo_<platform>_<stem>` — for any `<stem>.dts` file under `dts/<platform>/`
@@ -294,5 +295,5 @@ the same JSON as the bitstream.
 | [`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
 | [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
 | [`POOL_OPTIMISATION.md`](../kernels/POOL_OPTIMISATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
-| [`VECTOROP_KERNEL.md`](../kernels/VECTOROP_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds) |
+| [`VECTOROP_RTL_KERNEL.md`](../kernels/VECTOROP_RTL_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds; the retired HLS kernel: [`VECTOROP_KERNEL.md`](../kernels/VECTOROP_KERNEL.md)) |
 | [`inference-scheduler/CLAUDE.md`](../../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |

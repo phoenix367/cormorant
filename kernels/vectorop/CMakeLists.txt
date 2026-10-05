@@ -1,15 +1,13 @@
-cmake_minimum_required(VERSION 3.19)  # 3.19+ required for string(JSON ...)
+cmake_minimum_required(VERSION 3.19)
 project(VectorOPKernel)
 
 # ---------------------------------------------------------------------------
-# User-facing parameters
+# The Vitis HLS VectorOPKernel's C++ (kernel/VectorOP.cpp): the reference model
+# of the SystemVerilog kernel the hardware build uses (kernels/vectorop_rtl),
+# its testbench oracle, and the generator of the RTL fixtures
+# (hw/test_data/vecop_test_data).  Its HLS synthesis was retired
+# (doc/plans/VECTOROP_RTL_PLAN.md phase 3).
 # ---------------------------------------------------------------------------
-
-# Vitis platform and clock — only needed for the Vitis hw/hw_emu flow.
-set(VA_PLATFORM "xilinx_u250_gen3x16_xdma_3_1_202020_1" CACHE STRING
-    "Vitis platform string.")
-set(VA_TARGET_CLOCK "" CACHE STRING
-    "Target clock in MHz for the Vitis flow (empty = platform default).")
 
 # ---------------------------------------------------------------------------
 # Auto-detect Vitis HLS headers (ap_fixed.h)
@@ -70,16 +68,6 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# Locate Vitis HLS (synthesis targets only; not required for C-sim).
-# FindVitis.cmake is bundled in <repo-root>/cmake/.
-# ---------------------------------------------------------------------------
-list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
-find_package(Vitis)
-# The platform JSONs (AXI_PLATFORM_FILES): set by the top-level project, or
-# here when this kernel is configured on its own.
-include(AxiPlatform)
-
-# ---------------------------------------------------------------------------
 # Generate configuration header
 # ---------------------------------------------------------------------------
 configure_file(include/Config.h.in Config.h)
@@ -137,121 +125,3 @@ if(VA_DATA_TYPE MATCHES "^ap_(u?)fixed<16")
 endif()
 
 message(STATUS "VectorOPKernel: Data_t=${VA_DATA_TYPE}")
-
-# ---------------------------------------------------------------------------
-# HLS synthesis flags (used for both Vitis and standalone HLS flows)
-# ---------------------------------------------------------------------------
-set(VA_SYNTHESIS_FLAGS "-O3 -DVA_SYNTHESIS")
-
-# ---------------------------------------------------------------------------
-# Vitis kernel + program targets (hw_emu / hw xclbin flow)
-#
-# Disabled by default — requires an installed Vitis platform (e.g. U250).
-# Enable with:  cmake -DVA_ENABLE_VITIS_FLOW=ON -DVA_PLATFORM=<platform> …
-# ---------------------------------------------------------------------------
-option(VA_ENABLE_VITIS_FLOW
-    "Enable Vitis hw/hw_emu xclbin targets (add_vitis_kernel/add_vitis_program). Requires an installed Vitis platform."
-    OFF)
-
-if(VA_ENABLE_VITIS_FLOW)
-    add_vitis_kernel(VectorOP
-                     KERNEL "VectorOPKernel"
-                     FILES  ${VA_KERNEL_SRC}
-                     HLS_FLAGS ${VA_SYNTHESIS_FLAGS}
-                     INCLUDE_DIRS
-                         ${CMAKE_CURRENT_SOURCE_DIR}/include
-                         ${CMAKE_CURRENT_BINARY_DIR}
-                     DEPENDS
-                         ${CMAKE_CURRENT_SOURCE_DIR}/include/VectorOP.h
-                         ${CMAKE_CURRENT_BINARY_DIR}/Config.h)
-
-    add_vitis_program(VectorOP ${VA_PLATFORM}
-                      CLOCK ${VA_TARGET_CLOCK})
-endif()
-
-# ---------------------------------------------------------------------------
-# Per-platform standalone HLS synthesis + IP export targets.
-#
-# Each JSON file in platforms/ defines one target.
-# Required fields:  part
-# Optional fields:  board, clock (default 300 MHz)
-#
-# Generated targets:
-#   make synthesize_vectorop_<name>   — HLS synthesis + ip_catalog export
-# ---------------------------------------------------------------------------
-if(Vitis_HLS)
-    message(STATUS "VectorOPKernel: HLS synthesis enabled via ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG}")
-
-    string(REPLACE ";" " " _VA_KERNEL_SRC_STR "${VA_KERNEL_SRC}")
-
-    set(_VA_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
-    foreach(_VA_PLATFORM_FILE IN LISTS _VA_PLATFORM_FILES)
-      get_filename_component(_pname "${_VA_PLATFORM_FILE}" NAME_WE)
-      file(READ "${_VA_PLATFORM_FILE}" _pjson)
-
-      # Required: FPGA part string
-      string(JSON _p_part ERROR_VARIABLE _e1 GET "${_pjson}" part)
-      if(_e1)
-        message(WARNING "VectorOPKernel platform '${_pname}': missing 'part' — skipping.")
-        continue()
-      endif()
-
-      # Optional: board identifier
-      string(JSON _p_board ERROR_VARIABLE _e GET "${_pjson}" board)
-      if(_e)
-        set(_p_board "")
-      endif()
-
-      # Optional: target clock in MHz (default 300)
-      string(JSON _p_clock ERROR_VARIABLE _e GET "${_pjson}" clock)
-      if(_e)
-        set(_p_clock "300")
-      endif()
-
-      # Per-platform build directory and Config.h
-      set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
-      file(MAKE_DIRECTORY "${_p_build_dir}")
-      configure_file(include/Config.h.in "${_p_build_dir}/Config.h")
-
-      # Build the set_part TCL command (with or without -board)
-      if(_p_board)
-        set(VA_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
-      else()
-        set(VA_BOARD_OPTION "set_part {${_p_part}}")
-      endif()
-
-      # Variables consumed by Synthesis.tcl.in
-      set(VA_HLS_PROJECT_NAME       "vadd_${_pname}")
-      set(VA_PART_NAME              "${_p_part}")
-      set(VA_SRC_SYNTHESIS          "${_VA_KERNEL_SRC_STR}")
-      set(VA_SYNTHESIS_FLAGS_PLATFORM
-          "${VA_SYNTHESIS_FLAGS} -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${_p_build_dir}")
-      set(VA_TARGET_CLOCK_TCL       "${_p_clock}")
-      set(VA_IP_OUTPUT_DIR          "${_p_build_dir}/ip_catalog")
-
-      configure_file(scripts/Synthesis.tcl.in
-                     "${_p_build_dir}/synthesize_${_pname}.tcl")
-
-      # Clean stale HLS project + IP catalog so old Verilog from a prior
-      # run isn't re-exported into the IP archive (which then breaks
-      # downstream Vivado packaging when source files have been removed
-      # or renamed since the last synthesis).
-      add_custom_target(
-          "synthesize_vectorop_${_pname}"
-          COMMAND ${CMAKE_COMMAND} -E rm -rf
-                  "${_p_build_dir}/${VA_HLS_PROJECT_NAME}"
-                  "${VA_IP_OUTPUT_DIR}"
-          COMMAND ${Vitis_HLS} ${Vitis_HLS_TCL_FLAG} "${_p_build_dir}/synthesize_${_pname}.tcl"
-          WORKING_DIRECTORY "${_p_build_dir}"
-          COMMENT "HLS synthesis: VectorOPKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
-          DEPENDS
-              ${VA_KERNEL_SRC}
-              ${CMAKE_CURRENT_SOURCE_DIR}/include/VectorOP.h
-              "${_p_build_dir}/Config.h")
-
-      message(STATUS "VectorOPKernel: synthesis target 'synthesize_vectorop_${_pname}' "
-                     "(${_p_part} @ ${_p_clock} MHz)")
-    endforeach()
-else()
-    message(STATUS "VectorOPKernel: vitis_hls / vitis-run not found — synthesis targets disabled")
-endif()

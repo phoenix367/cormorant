@@ -34,8 +34,9 @@ Counts measured on {{DATE}} — use these, do not re-run the suites:
   doc to the bug — report it.
 - **Where to look.**  Kernels: `kernels/<k>/kernel/*.cpp`, `include/*.h`,
   `kernels/<k>/CMakeLists.txt`, `platforms/kv260.json`, the generated register
-  maps `build*/kernels/<k>/kv260/**/drivers/*/src/x*_hw.h` (MatmulKernel:
-  `kernels/matmul_rtl/rtl/*.sv`, `build*/kernels/matmul_rtl/driver/`).  Scheduler:
+  maps `build*/kernels/<k>/kv260/**/drivers/*/src/x*_hw.h` (MatmulKernel and
+  VectorOPKernel: `kernels/{matmul,vectorop}_rtl/rtl/*.sv`,
+  `build*/kernels/{matmul,vectorop}_rtl/driver/`).  Scheduler:
   `inference-scheduler/src/`, `inference_scheduler.py --help`, `test/`.  Build:
   the CMakeLists, `make help` in a configured build dir.  Demos: the scripts'
   `--help` and the `*.json.example` files.  History of a fact: `git log -S`.

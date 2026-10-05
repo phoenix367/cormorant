@@ -26,7 +26,7 @@ Output project layout (main parts):
 Usage:
   python inference_scheduler.py model.onnx --out-dir ./my_project
   python inference_scheduler.py model.onnx --out-dir ./my_project \\
-      --driver-dir ../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src
+      --driver-dir ../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src
   python inference_scheduler.py --entry decode=decode.onnx --entry head=head.onnx --out-dir ./multi
 """
 

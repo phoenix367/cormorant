@@ -18,14 +18,20 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/bbb9a37f73f8` is hw_128 7d8eefe (2026-10-04; the SystemVerilog MatmulKernel and
-the PoolingKernel out-of-contract guard, doc/kernels/POOL_OPTIMISATION.md §2.15): 1580 calls,
-repeat spread median 0.018 % (the shipped models, four refinement rounds to convergence:
-122 + 31 + 8 + 3 calls).  Its MatmulKernel families use the RTL job-walk terms (`rtl_*`).
+`kv260/68665fc1833a` is hw_128 7d8eefe (2026-10-05; the SystemVerilog MatmulKernel and
+VectorOPKernel and the PoolingKernel out-of-contract guard, doc/plans/VECTOROP_RTL_PLAN.md
+phase 3): 1581 calls, repeat spread median 0.017 %.  Its case list started from the converged
+one of `bbb9a37f73f8` (the same scheduler); refinement rounds added 1 and 0 calls.  Against that
+campaign the Conv, Matmul and Pool calls agree to a median 0.000 %; the 95 VectorOP calls
+are a median 1.1 % faster (up to 38 % for jobs of many 2-word runs; four 0.5–1.2 % slower).
+Its MatmulKernel families use the RTL job-walk terms (`rtl_*`).
 
-Beside it, `kv260/1d28630fbfa4`, the same design without the pool guard (MATMUL_RTL_PLAN
-phases 3–4), with 1383 calls, repeat spread median 0.023 % (one refinement round).  The 1251
-calls both campaigns measured agree to a median 0.002 %.
+Beside it, `kv260/bbb9a37f73f8`, the same design with the Vitis HLS VectorOPKernel
+(2026-10-04), with 1580 calls, repeat spread median 0.018 % (four refinement rounds to
+convergence: 122 + 31 + 8 + 3 calls); and `kv260/1d28630fbfa4`, without the pool guard
+either (MATMUL_RTL_PLAN phases 3–4), with 1383 calls, repeat spread median 0.023 % (one
+refinement round).  The 1251 calls both of those campaigns measured agree to a median
+0.002 %.
 
 And the last bitstream with the Vitis HLS MatmulKernel: `kv260/caa67f49a5a3`,
 hw_128 d7ce129 (2026-09-28; Piper added 2026-10-01), 1505 calls, repeat spread

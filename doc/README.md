@@ -7,7 +7,7 @@ logs, grouped by topic:
 ```
 doc/
 ├── build-and-test/   building, configuring and testing the hardware and software
-├── kernels/          the kernels (four in HLS, MatmulKernel also in RTL): reference + optimisation log
+├── kernels/          the kernels (Conv and Pool in HLS, MatMul and VectorOP in RTL, with their retired HLS versions): reference + optimisation log
 ├── scheduler/        the ONNX-to-C inference scheduler
 ├── plans/            project plans and their results (chronological logs)
 └── images/
@@ -46,7 +46,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 
 | Document | Contents |
 |---|---|
-| [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) | Every CMake / make target: C-simulation tests, HLS synthesis and cosim, the RTL MatmulKernel (Verilator, packaging), test fixtures, RTL behaviour tests, Vivado bitstream, device-tree overlay |
+| [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) | Every CMake / make target: C-simulation tests, HLS synthesis and cosim, the RTL MatmulKernel and VectorOPKernel (Verilator, packaging), test fixtures, RTL behaviour tests, Vivado bitstream, device-tree overlay |
 | [TESTING](build-and-test/TESTING.md) | The five test layers (scheduler unit tests, kernel C simulation, RTL simulation, on-board correctness and performance) and how to run each |
 | [PLATFORM_CONFIGURATION](build-and-test/PLATFORM_CONFIGURATION.md) | `platforms/<name>.json`: FPGA part, clock and each kernel's compile-time bounds; adding a platform, changing a bound |
 | [SIMULATION_ISSUES](build-and-test/SIMULATION_ISSUES.md) | Traps in the Vivado PS VIP simulation (partial write strobes, DDR aliasing, backdoor loads) and their workarounds |
@@ -58,11 +58,12 @@ there, with measured numbers) per kernel:
 
 | Kernel | Reference | Optimisation log |
 |---|---|---|
-| VectorOPKernel — element-wise ops | [VECTOROP_KERNEL](kernels/VECTOROP_KERNEL.md) | [VECTOROP_OPTIMISATION](kernels/VECTOROP_OPTIMISATION.md) |
+| VectorOPKernel — SystemVerilog, element-wise ops | [VECTOROP_RTL_KERNEL](kernels/VECTOROP_RTL_KERNEL.md) | — ([VECTOROP_RTL_PLAN](plans/VECTOROP_RTL_PLAN.md)) |
 | MatmulKernel — SystemVerilog, 128 MAC/cycle GEMM, GEMV / image path | [MATMUL_RTL_KERNEL](kernels/MATMUL_RTL_KERNEL.md) | — ([MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md)) |
 | ConvKernel — 2-D and depthwise convolution | [CONV_KERNEL](kernels/CONV_KERNEL.md) | [CONV_OPTIMISATION](kernels/CONV_OPTIMISATION.md) |
 | PoolingKernel — max / average / Lp pooling | [POOLING_KERNEL](kernels/POOLING_KERNEL.md) | [POOL_OPTIMISATION](kernels/POOL_OPTIMISATION.md) |
 | MatmulKernel in Vitis HLS — tiled GEMM (retired from the hardware build in MATMUL_RTL_PLAN phase 4; its C++ is the RTL kernel's reference model) | [MATMUL_KERNEL](kernels/MATMUL_KERNEL.md) | [MATMUL_OPTIMISATION](kernels/MATMUL_OPTIMISATION.md) |
+| VectorOPKernel in Vitis HLS — element-wise ops (retired from the hardware build in VECTOROP_RTL_PLAN phase 3; its C++ is the RTL kernel's reference model) | [VECTOROP_KERNEL](kernels/VECTOROP_KERNEL.md) | [VECTOROP_OPTIMISATION](kernels/VECTOROP_OPTIMISATION.md) |
 
 [HLS_CONV_RESEARCH](kernels/HLS_CONV_RESEARCH.md) is a background literature
 survey of HLS convolution techniques (not a plan).
@@ -100,6 +101,7 @@ line at the top says what is done.
 | [LENET_PLAN](plans/LENET_PLAN.md) | LeNet study (the `model-study` skill): numerics equal to float; fully-connected Convs run as MatMul (`--fc-conv`), 5.44 → 2.81 ms per image |
 | [TTS_PLAN](plans/TTS_PLAN.md) | Text to speech: Audio8 TTS Preview 0.1B — NO-GO for real time (18 GB/s of weights needed, 2.9 GB/s available); candidate screen — Piper, TinyTTS, Kitten nano and Supertonic-3 fit; Piper lessac-medium study — GO (int16 within 0.19 dB log-mel of float); implementation — `libpiper_tts.so` bit-exact on the board, RTF 0.52; `/v1/audio/speech` in the chat server; the text encoder on the FPGA (int16, 0.37 dB log-mel from float, 3.7–4.9× faster) and the duration predictor in C (3×); first audio 1.0–1.5 s |
 | [MATMUL_RTL_PLAN](plans/MATMUL_RTL_PLAN.md) | Replacing the HLS MatmulKernel with the SystemVerilog one: done — in the repository, bitstream `1d28630fbfa4` (timing met, 8.7 k LUT / 17.8 k FF fewer), bit-exact on the board with no workload slower, the scheduler's RTL cost model and one-copy engine choices (16-token LLM prefill −26…−32 %, MobileNet v1 −10 %), the default of the build, the scheduler and the board since phase 4 |
+| [VECTOROP_RTL_PLAN](plans/VECTOROP_RTL_PLAN.md) | Replacing the HLS VectorOPKernel with the SystemVerilog one, the way MATMUL_RTL_PLAN replaced MatmulKernel: a drop-in IP (same VLNV, registers and m_axi bus parameters, bit-exact, fewer resources); the hardware build's VectorOPKernel since phase 3, the HLS synthesis retired |
 | [TACTICS_PLAN](plans/TACTICS_PLAN.md) | Optional planning (`--plan`) from performance models calibrated once per bitstream: T0–T4 done (§9), simulator within 2 % of the board (except SmolLM2-360M and the Piper chunk), BERT and SmolVLM vision −1.1 % |
 
 ## Claude Code skills
@@ -113,7 +115,7 @@ Packaged workflows in [`.claude/skills/`](../.claude/skills/) (each
 | `model-study` | decide GO / NO-GO for a new model before porting it: operators, memory, fixed-point numerics against float, projected latency |
 | `llm-onboard` | take a Llama-family model that passed `model-study` to a served chat model: calibrate, generate, bit-exact gates, board install, backend, deploy |
 | `add-host-op` | add an operator that runs on the board's CPU (numpy reference + C helper, bit-exact, A53-fast, timing model, tests) |
-| `conv-verify`, `pool-verify`, `kernel-verify` | verify a kernel change end to end: C-sim, HLS synthesis, RTL behaviour test, timing diff (`kernel-verify`: MatMul, VectorOP) |
+| `conv-verify`, `pool-verify`, `kernel-verify` | verify a kernel change end to end: C-sim, HLS synthesis, RTL behaviour test, timing diff (`kernel-verify`: the RTL MatMul and VectorOP — Verilator testbench and Vivado out-of-context synthesis in place of HLS) |
 | `conv-cycle-model`, `conv-rtl-trace` | predict ConvKernel cycles per layer; trace one RTL case's AXI / FIFO activity |
 | `hls-rag` | ground HLS pragma / TCL edits in the indexed Vitis HLS user guide |
 | `board-deploy` | build and load a bitstream, then run the on-board tests and demos |

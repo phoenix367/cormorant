@@ -9,6 +9,13 @@ RTL test stand (`hw/cormorant_test_stand/kernels/vector_op_test`).
 For the kernel description see [VECTOROP_KERNEL.md](VECTOROP_KERNEL.md);
 the plan this work executes is THROUGHPUT_PLAN.md §4 (Track C).
 
+> **Retired (2026-10-05).**  The hardware build no longer synthesises this
+> kernel: the bitstream carries the SystemVerilog VectorOPKernel
+> ([VECTOROP_RTL_KERNEL.md](VECTOROP_RTL_KERNEL.md), [VECTOROP_RTL_PLAN](../plans/VECTOROP_RTL_PLAN.md)
+> phase 3).  This log is the HLS kernel's history; its command
+> (`synthesize_vectorop_kv260`) is gone, and `behavior_test_vectorop` now
+> runs the RTL IP (119 / 119, 984 µs against this kernel's last 1 000 µs).
+
 All numbers are `duration_ns` per case from
 `build/kernels/vectorop/kv260/vector_op_test_report.json`.  The testbench
 runs at a fixed 100 MHz sim basis, so they are directly comparable between

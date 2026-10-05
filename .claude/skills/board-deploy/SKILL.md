@@ -17,8 +17,8 @@ allowed-tools: Bash Read
 The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
 128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
 exported IP's own default (128 for every data port: the `ap_uint<128>`
-ports of VectorOP, Conv and Pool and all three of the SystemVerilog
-MatmulKernel's; the block designs still say 32 for MatmulKernel `c`, the
+ports of Conv and Pool and all three of each SystemVerilog kernel's,
+VectorOPKernel and MatmulKernel; the block designs still say 32 for MatmulKernel `c`, the
 retired HLS kernel's width, and the build scripts reset it to the IP's 128
 after the upgrade, `scripts/ip_defaults.tcl`).  The test stand's four block designs use the same widths with a
 128-bit PS port since 2026-09-24, so RTL timing matches the board.  Two things that
@@ -35,7 +35,7 @@ tree used by conv-verify and its timing baseline stay intact:
 
 ```bash
 cmake -S . -B build_hw128 -DAXI_BUS_WIDTH=128     # once
-make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth 3 HLS kernels + package the RTL MatmulKernel + Vivado
+make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth 2 HLS kernels + package the RTL MatmulKernel and VectorOPKernel + Vivado
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 

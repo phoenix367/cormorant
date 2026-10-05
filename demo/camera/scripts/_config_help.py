@@ -39,7 +39,7 @@ def format_missing_config(path: Path) -> str:
             "                          Build them first from the repo root with:",
             "                            make synthesize_conv_kv260",
             "                            make synthesize_pool_kv260",
-            "                            make synthesize_vectorop_kv260",
+            "                            make driver_vectorop_rtl",
             "",
             "Board-side requirements (installed ON the KV260):",
             "  • pyrealsense2 + librealsense   — RealSense capture",

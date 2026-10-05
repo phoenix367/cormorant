@@ -1,5 +1,5 @@
 ---
-description: Verify a MatmulKernel or VectorOPKernel change end-to-end on the KV260 platform (argument `matmul` or `vectorop`) — C-simulation (MatmulKernel — the SystemVerilog kernel in kernels/matmul_rtl — also its Verilator testbench and lint), synthesis (VectorOP — HLS with an II / slack / interface diff; MatmulKernel — Vivado out-of-context timing), the test-stand behaviour test, then a per-case timing diff against the previous run; plus the project rules for optimisations (baseline first, revert regressions, log the result) and for interface changes (block-design testbench + sim_hw_kv260). Use after any edit to kernels/matmul_rtl/, kernels/matmul/ (the C++ reference model and fixture generator) or kernels/vectorop/, their CMakeLists, Synthesis.tcl.in or RTL fixtures, or the platform JSON's kernels.matmul block.
+description: Verify a MatmulKernel or VectorOPKernel change end-to-end on the KV260 platform (argument `matmul` or `vectorop`) — both are SystemVerilog kernels (kernels/matmul_rtl, kernels/vectorop_rtl) with a C++ reference model (kernels/matmul, kernels/vectorop): C-simulation, the Verilator testbench and lint, Vivado out-of-context synthesis (timing at 300 MHz, resources), the test-stand behaviour test, then a per-case timing diff against the previous run; plus the project rules for optimisations (baseline first, revert regressions, log the result) and for interface changes (block-design testbench + sim_hw_kv260). Use after any edit to kernels/matmul_rtl/, kernels/vectorop_rtl/, kernels/matmul/ or kernels/vectorop/ (the C++ reference models and fixture generators), their CMakeLists or RTL fixtures, or the platform JSON's kernels.matmul block.
 allowed-tools: Bash Read
 ---
 
@@ -13,17 +13,17 @@ ConvKernel and PoolingKernel have their own skills (`conv-verify`,
 
 | | `matmul` | `vectorop` |
 |---|---|---|
-| C-sim targets | `TestMatmulRef`, `TestMatmulBlas` (the C++ reference model; Blas only when configure found a BLAS), `TestMatmulRtl` (Verilator), `lint_matmul_rtl` | `TestSimulation` |
-| ctest filter | `ctest -R Matmul` (TestMatmulRef, TestMatmulBlas, TestMatmulRtl, MatmulRtlDriver) | `ctest -R TestSimulation` |
-| synthesis | `synth_matmul_rtl` (Vivado out of context at 300 MHz; the IP for the hardware is `package_matmul_rtl`) | `synthesize_vectorop_kv260` |
-| synthesis report | `$BUILD_DIR/kernels/matmul_rtl/synth/` (`timing.rpt`, `utilization.rpt`, the make output's `RESULT` line) | `$BUILD_DIR/kernels/vectorop/kv260/vadd_kv260/solution1/syn/report/csynth.rpt` (legacy `open_project` flow) |
+| C-sim targets | `TestMatmulRef`, `TestMatmulBlas` (the C++ reference model; Blas only when configure found a BLAS), `TestMatmulRtl` (Verilator), `lint_matmul_rtl` | `TestSimulation` (the C++ reference model), `TestVectorOpRtl` (Verilator), `lint_vectorop_rtl` |
+| ctest filter | `ctest -R Matmul` (TestMatmulRef, TestMatmulBlas, TestMatmulRtl, MatmulRtlDriver) | `ctest -R 'TestSimulation\|VectorOp'` (TestSimulation, TestVectorOpRtl, VectorOpRtlDriver) |
+| synthesis | `synth_matmul_rtl` (Vivado out of context at 300 MHz; the IP for the hardware is `package_matmul_rtl`) | `synth_vectorop_rtl` (likewise; the IP is `package_vectorop_rtl`) |
+| synthesis report | `$BUILD_DIR/kernels/matmul_rtl/synth/` (`timing.rpt`, `utilization.rpt`, the make output's `RESULT` line) | `$BUILD_DIR/kernels/vectorop_rtl/synth/` (the same files) |
 | RTL behaviour test | `behavior_test_matmul` | `behavior_test_vectorop` |
 | report (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_op_test_report.json` | `vector_op_test_report.json` |
 | checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (119 cases) |
 | fixture target → output | `gen_matmul_test_data` → `$BUILD_DIR/matmul_test_data/` | `gen_vectorop_test_data` → `$BUILD_DIR/vectorop_test_data/` |
 | test-stand testbench | `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` |
 | block-design testbench (`hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`) | `mm_regmap.svh`, `mm_classes.svh`, `tb_functions.svh` | `vop_regmap.svh`, `vop_classes.svh`, `tb_functions.svh` |
-| optimisation log | `doc/kernels/MATMUL_RTL_KERNEL.md` (Performance / Resources) and `doc/plans/MATMUL_RTL_PLAN.md` (`MATMUL_OPTIMISATION.md` is the retired HLS kernel's log) | `doc/kernels/VECTOROP_OPTIMISATION.md` |
+| optimisation log | `doc/kernels/MATMUL_RTL_KERNEL.md` (Performance / Resources) and `doc/plans/MATMUL_RTL_PLAN.md` (`MATMUL_OPTIMISATION.md` is the retired HLS kernel's log) | `doc/kernels/VECTOROP_RTL_KERNEL.md` and `doc/plans/VECTOROP_RTL_PLAN.md` (`VECTOROP_OPTIMISATION.md` is the retired HLS kernel's log) |
 
 ## Locate the build directory and set up the shell
 
@@ -79,9 +79,9 @@ cp "kernels/$K/kv260/"*_test_report.json "kernels/$K/kv260/${K}_report_before.js
 
 ```bash
 make TestMatmulRef TestMatmulBlas TestMatmulRtl lint_matmul_rtl   # K=matmul  (drop TestMatmulBlas if make says no rule: no BLAS)
-make TestSimulation                   # K=vectorop
-ctest -R Matmul --output-on-failure           # K=matmul (~50 s: TestMatmulRtl)
-ctest -R TestSimulation --output-on-failure   # K=vectorop
+make TestSimulation TestVectorOpRtl lint_vectorop_rtl             # K=vectorop
+ctest -R Matmul --output-on-failure                   # K=matmul (~50 s: TestMatmulRtl)
+ctest -R 'TestSimulation|VectorOp' --output-on-failure   # K=vectorop (~2 s)
 ```
 
 - `lint_matmul_rtl` (`verilator --lint-only -Wall` with the waivers) must
@@ -91,6 +91,13 @@ ctest -R TestSimulation --output-on-failure   # K=vectorop
   table against `rtl/mm_ctrl_s_axi.sv`.  Edits to `kernels/matmul/` (the C++
   reference model) change the oracle: then Gate 1b decides whether the
   fixtures move.
+- `lint_vectorop_rtl` likewise; `TestVectorOpRtl` runs the 119 checked-in
+  fixtures and 300 random cases (seed 1) against the HLS C++ under
+  randomised memory timing, with AXI protocol checks and at most 16 bursts
+  outstanding per port; `VectorOpRtlDriver` checks the driver table against
+  `rtl/vo_ctrl_s_axi.sv`.  For more coverage run the testbench by hand:
+  `kernels/vectorop_rtl/vl/Vtb --random 500 --seed 2026 --timing rand --quiet`
+  (also `--timing slow`, `--perf` for cycle counts with ideal memory).
 
 - ctest must end `100% tests passed`.  To see the per-case lines run the
   executable, e.g. `./kernels/matmul/TestMatmulRef | grep -E 'FAIL|passed|PASSED'`:
@@ -147,40 +154,26 @@ grep -A12 "Slice LUTs\b" kernels/matmul_rtl/synth/utilization.rpt | head -3
   it, and a clear loss of Fmax is a finding (phase 2b's first fix lost
   0.26 ns and was redone with precomputed config fields).
 - Resources against the record above; > 10 % more is a finding.
-- No `csynth_check.py` for the RTL kernel: its register map is checked by
-  ctest `MatmulRtlDriver` and the fact registry (`registers.MatmulKernel`).
+- Its register map is checked by ctest `MatmulRtlDriver` and the fact
+  registry (`registers.MatmulKernel`).
 
-**VectorOPKernel (HLS):**
+**VectorOPKernel (RTL):**
 
 ```bash
-make synthesize_vectorop_kv260
-python3 "$S/csynth_check.py" vectorop --build-dir "$BUILD_DIR"
+make synth_vectorop_rtl 2>&1 | grep -E "^RESULT|ERROR"    # ~5 min
+grep -E "^\| (CLB LUTs|CLB Registers|Block RAM Tile|DSPs) " kernels/vectorop_rtl/synth/utilization.rpt
 ```
 
-- The make must exit 0 and end `[100%] Built target synthesize_vectorop_kv260`
-  (~40 s).  Any `ERROR:` line is a hard failure.
-  The target always re-runs and starts by deleting its HLS project, so
-  the C driver directory (`…/impl/ip/drivers`) is missing until it
-  finishes — never synthesise while something else (a scheduler project
-  generation, another agent) reads it.
-- `csynth_check.py` prints the top-level slack / resources, the pipelined
-  loops that are not II=1, rows with an Issue / Violation type or negative
-  slack, the `m_axi` table, the `s_axi_ctrl` register map, and the log's
-  `ERROR` / `SCHED 204-65` / `II Violation` / `Inferring partial write`
-  counts; then diffs against the previous synthesis
-  (`kernels/K/kv260/K_csynth_last.rpt`, a copy it saves each run —
-  `--no-save` keeps it) and ends with `FLAGS: n`.  Report every `FLAG:`
-  line; do not fail the gate on them.  A `SCHED 204-65` count matters even
-  with all loops II=1: a PIPELINE loop that HLS could not pipeline shows
-  up only as `Pipelined = no` with no II entry (the "fewer pipelined
-  loops" flag).
-- Baseline (2026-09-29, 150 MHz target, estimated Fmax 205.47 MHz):
-  slack 0.00 ns, 14 pipelined loops all II=1, BRAM 32 (11 %), DSP 33,
-  FF 13 725, LUT 22 657; `gmem0/1` (a, b) READ_ONLY and `gmem2` (c)
-  WRITE_ONLY, all `128 -> 128`; registers up to `act` 0x5C.
-  The HLS 200-1449 "reads an input from its caller" warning on VectorOP's
-  `b` loader is known and benign.
-- A **register-map or `m_axi` change is an interface change** → Gate 5.
+- WNS ≥ 0 at 300 MHz, as for MatmulKernel.  Record (VECTOROP_RTL_PLAN
+  phase 0, 2026-10-05): WNS +0.248 ns (Fmax ≈ 324 MHz), 5 243 LUT,
+  6 453 FF, 10 BRAM36, 11 DSP.  The burst generators are the critical
+  paths (VECTOROP_RTL_KERNEL §6: no full-width add after the burst length).
+- Its register map: ctest `VectorOpRtlDriver` and the fact registry
+  (`registers.VectorOPKernel`); its m_axi bus parameters (outstanding
+  counts, burst lengths, read / write only) are declared in
+  `kernels/vectorop_rtl/syn/package_ip.tcl` and must match `vo_pkg`.
+- A **register-map, `m_axi` or bus-parameter change is an interface
+  change** → Gate 5.
 
 ## Gate 3 — RTL behaviour test
 
@@ -198,13 +191,14 @@ Run the test in the background and wait for the completion notice:
 make behavior_test_matmul             # or behavior_test_vectorop
 ```
 
-- `behavior_test_vectorop` depends on `synthesize_vectorop_kv260`, so it
-  re-synthesises first (~40 s); `behavior_test_matmul` on
-  `package_matmul_rtl` (~20 s; the test stand upgrades the IP and widens
-  gmem2 to its default 128).
+- `behavior_test_vectorop` depends on `package_vectorop_rtl`,
+  `behavior_test_matmul` on `package_matmul_rtl` (~20 s each; the test
+  stand upgrades the IP and puts the instance widths back to the IP's
+  defaults — MatmulKernel's gmem2 becomes 128).
 - Wall time: MatMul (RTL) ≈ 5 min (50 cases, 2.52 ms simulated, 297 s on
-  2026-10-04), VectorOP ≈ 4 min (119 cases, 1.00 ms simulated) — the xsim
-  simulated time, not the case count, sets the cost.  The output must end
+  2026-10-04), VectorOP (RTL) ≈ 4 min (119 cases, 0.986 ms simulated, 237 s
+  on 2026-10-05) — the xsim simulated time, not the case count, sets the
+  cost.  The output must end
   with these two lines followed by
   `[100%] Built target behavior_test_K`:
 
@@ -249,7 +243,7 @@ next baseline.
   reference: `--baseline kernels/$K/kv260/${K}_report_before.json --no-save`.
   `--top N` limits the table.
 - Durations are at the testbench's fixed 100 MHz sim basis, comparable
-  between runs whatever the HLS clock.  Each includes the testbench's DDR
+  between runs whatever the synthesis clock.  Each includes the testbench's DDR
   fill and register programming (VectorOP's 1-element `ADD` is 4.8 µs,
   MatMul `1x1x1` 5.8 µs), so tiny cases hardly move — judge a kernel
   change by the large cases and the TOTAL.
@@ -278,9 +272,11 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    because nobody ran it after interface changes.  Today the MatMul tests
    there never write `b_packed` / `gemv_kw` / `a_to_b` (reset 0 = the
    row-major tiled path).
-   For MatmulKernel also `kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv`, the
-   driver generator's table (`scripts/gen_driver.py`) and the fact
-   registry (`python3 tools/facts/facts.py check registers.MatmulKernel`).
+   Also the kernel's control block (`kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv`
+   / `kernels/vectorop_rtl/rtl/vo_ctrl_s_axi.sv`), its driver generator's
+   table (`scripts/gen_driver.py`) and the fact registry
+   (`python3 tools/facts/facts.py check registers.MatmulKernel` /
+   `registers.VectorOPKernel`).
 2. Run it (all four kernels through the PS VIP, ~4 min):
 
    ```bash
@@ -291,8 +287,9 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    (VectorOPKernel 22, ConvKernel 17, MatmulKernel 10, PoolingKernel 19)
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
-   in phase 1).  It uses `$BUILD_DIR/ip_repo_kv260` (the three HLS exports
-   and the RTL IP), so all four must have been built in this build tree.  It upgrades the IPs in `hw/cormorant_hw_128` and
+   in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).
+   It uses `$BUILD_DIR/ip_repo_kv260` (the Conv and Pool HLS exports and
+   the two RTL IPs), so all four must have been built in this build tree.  It upgrades the IPs in `hw/cormorant_hw_128` and
    modifies its tracked `.bd` / `.xci` files: do not commit those.
 3. Board: the new register must be proven with a write-then-read before
    trusting results, and generated projects / libraries regenerated (a
@@ -306,9 +303,8 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
   the baseline numbers.  A rejected attempt is still logged (MATMUL §2 is
   the model: "Tried and rejected").
 - **Log the result** in the optimisation log (table above): a new
-  section with the change, the HLS / RTL traps met, synthesis before → after
-  (VectorOP: slack, II, BRAM / DSP / FF / LUT from `csynth_check.py`;
-  MatmulKernel: WNS and the utilization report), and the
+  section with the change, the RTL traps met, synthesis before → after
+  (WNS and the utilization report), and the
   behaviour-test result — pass count and per-case / total `duration_ns`
   before → after against the Step 0 reference.  Board numbers go in later,
   after `board-deploy` (and `perf-regression` for the benchmark diff).
@@ -322,8 +318,7 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    the Step 0 reference when there is one.
 3. **Top movers** — 3–5 cases: `name: prev → now (Δns, ±X %)`; plus any
    `Slower than` cases and new / removed cases.
-4. **Synthesis flags** — every `FLAG:` line of `csynth_check.py` (VectorOP),
-   the WNS and resource moves (MatmulKernel); say explicitly whether the
+4. **Synthesis** — the WNS and resource moves; say explicitly whether the
    interface changed (and whether Gate 5 ran).
 
 ## When `make` reports an unknown target
@@ -345,18 +340,18 @@ Don't delete the build tree.
 - Don't rebuild or synthesise kernels the user hasn't touched.
 - Don't re-run cmake unless a CMakeLists or `platforms/*.json` changed
   (`CMAKE_CONFIGURE_DEPENDS` handles those automatically).
-- Don't read the whole `csynth.rpt` (150–330 KB) — `csynth_check.py` or
-  `sed -n` / `grep`.
 - Don't poll long runs with sleep loops — run them in the background and
   wait for the completion notice.
 
 ## Validation record (2026-09-29, scratch clone, `AXI_BUS_WIDTH=128`)
 
-The MatMul column is the retired HLS kernel's (its synthesis was removed in
-MATMUL_RTL_PLAN phase 4); the RTL kernel's gates ran in phases 0–2b
-(MATMUL_RTL_PLAN: `TestMatmulRtl` 50 fixtures + 200 random, lint clean,
-`synth_matmul_rtl` 13 min, behaviour test 50/50 in 297 s, `sim_hw_kv260`
-68/68).
+Both columns are the retired HLS kernels' (their synthesis was removed in
+MATMUL_RTL_PLAN phase 4 and VECTOROP_RTL_PLAN phase 3).  The RTL kernels'
+gates ran in their plans: MatmulKernel phases 0–2b (`TestMatmulRtl` 50
+fixtures + 200 random, lint clean, `synth_matmul_rtl` 13 min, behaviour test
+50/50 in 297 s, `sim_hw_kv260` 68/68); VectorOPKernel phases 0–1
+(`TestVectorOpRtl` 119 fixtures + 300 random, lint clean, `synth_vectorop_rtl`
+4 min, behaviour test 119/119 in 237 s, `sim_hw_kv260` 68/68).
 
 Every command above was run on unchanged kernels (`kernels/`,
 `hw/test_data/`, `platforms/` identical to main 481e7a1), sequentially,
@@ -373,7 +368,6 @@ one Vivado job at a time:
 
 `compare_timing.py` was also checked against perturbed report copies
 (slower / faster / +0.5 % / removed / new cases, a failed report, the
-other kernel's report or snapshot), `csynth_check.py` against a
-perturbed report (II=2 loop, negative slack, Issue type, lost pipelined
-loop, LUT +26 %, moved register, port width) — each case is reported as
-described above.
+other kernel's report or snapshot) — each case is reported as described
+above.  (The HLS synthesis summariser `csynth_check.py` went with the HLS
+VectorOP synthesis.)

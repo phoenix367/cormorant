@@ -37,7 +37,7 @@ def format_missing_config(path: Path) -> str:
             "  • ssh.key_file     — path to your SSH private key, or null + ssh.password",
             "  • local.driver_dirs.* — driver paths for each kernel.",
             "                          Build them first in build/ with:",
-            "                            make synthesize_vectorop_kv260",
+            "                            make driver_vectorop_rtl",
             "                            make driver_matmul_rtl",
             "                            make synthesize_conv_kv260",
             "                            make synthesize_pool_kv260",

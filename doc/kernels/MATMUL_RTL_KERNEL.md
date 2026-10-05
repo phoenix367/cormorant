@@ -62,7 +62,8 @@ make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP,
 
 `synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260` /
 `behavior_test_matmul` use this IP (`package_matmul_rtl`): Vivado scans
-`build/ip_repo_kv260/`, which links the three HLS kernels and this IP.  After
+`build/ip_repo_kv260/`, which links the Conv and Pool HLS kernels, the RTL
+VectorOPKernel ([VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md)) and this IP.  After
 the IP upgrade the hardware and test-stand scripts reset every kernel
 instance's `C_M_AXI_*_DATA_WIDTH` to its IP's default, so `MatmulKernel_0`'s
 gmem2 becomes 128 (the block designs still say 32, the HLS kernel's width).

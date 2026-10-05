@@ -24,11 +24,16 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/bbb9a37f73f8** = hw_128 7d8eefe (2026-10-04), the bitstream
-with the SystemVerilog MatmulKernel and the PoolingKernel out-of-contract guard
-(POOL_OPTIMISATION §2.15): a full campaign and four refinement rounds (122, 31, 8, 3
-calls; the fifth added 0) to 1580 exact calls, and `host.json` merged to 151 signatures / 39 kinds
-(§3; the host model does not depend on the bitstream).  Before it, kv260/1d28630fbfa4
+Current model: **kv260/68665fc1833a** = hw_128 7d8eefe (2026-10-05), the bitstream
+with the SystemVerilog MatmulKernel and VectorOPKernel and the PoolingKernel
+out-of-contract guard (VECTOROP_RTL_PLAN phase 3).  Its campaign started from the
+converged case list of kv260/bbb9a37f73f8 (the same design with the HLS VectorOPKernel;
+the scheduler had not changed): one pass of 1580 calls, then refinement rounds of 1 and 0
+calls to 1581 exact calls, and `host.json` merged to 151 signatures / 39 kinds (§3; the
+host model does not depend on the bitstream).  Against bbb9a37f73f8 the Conv / Matmul /
+Pool calls agree to a median 0.000 %, the VectorOP calls are a median 1.1 % faster.  kv260/bbb9a37f73f8 itself
+took a full campaign and four refinement rounds (122, 31, 8, 3 calls; the fifth added 0)
+to 1580 exact calls.  Before it, kv260/1d28630fbfa4
 (the same design without the guard, one refinement round to 1383 calls; the 1251 calls
 both measured agree to a median 0.002 %).  The previous HLS model,
 kv260/caa67f49a5a3 (hw_128 d7ce129, the HLS MatmulKernel; topped up on 2026-10-01
@@ -51,7 +56,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # bbb9a37f73f8 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 68665fc1833a today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`
@@ -68,7 +73,7 @@ bitstream needs one there too.
      must hold the register maps of the LOADED bitstream. They point at `build/` (the
      conv-verify tree), while the bitstream comes from `build_hw128`. All four must print `same`:
      ```bash
-     for f in $(cd ../build_hw128 && ls kernels/{vectorop,conv,pool}/kv260/*/*/impl/ip/drivers/*/src/x*_hw.h kernels/matmul_rtl/driver/*/src/x*_hw.h); do
+     for f in $(cd ../build_hw128 && ls kernels/{conv,pool}/kv260/*/*/impl/ip/drivers/*/src/x*_hw.h kernels/{matmul,vectorop}_rtl/driver/*/src/x*_hw.h); do
          cmp -s ../build/$f ../build_hw128/$f && echo "same $f" || echo "DIFF $f"; done
      ```
 4. **Chat server stopped.** It owns the kernels and the CMA.
@@ -160,9 +165,9 @@ under the planner's 5 % trust threshold.
   (TACTICS_PLAN §1). The record's 27 noisy points are all calls a few tens of µs long.
   A large median means something else ran on the board. Measure again.
 - The family errors should be close to the table above. The `note:` line is EXPECTED:
-  only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none did, mm-gemv 3.22 %; on bbb9a37f73f8 mm-gemv 2.89 %).
+  only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none did, mm-gemv 3.22 %; on bbb9a37f73f8 mm-gemv 2.89 %, on 68665fc1833a 2.91 %).
 - The planner trusts a family prediction only when the family's held-out p90 is at most 5 %
-  (`perf_model.MAX_MODEL_ERROR`). Today (bbb9a37f73f8, as on 1d28630fbfa4) that is mm-gemv and mm-tiled. Every other tactic needs an
+  (`perf_model.MAX_MODEL_ERROR`). Today (68665fc1833a, as on bbb9a37f73f8 and 1d28630fbfa4) that is mm-gemv and mm-tiled. Every other tactic needs an
   exact entry. That is why the refinement exists.
 - `call_overhead_us` (the minimum measured call) was 3.121 µs.
 

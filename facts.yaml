@@ -230,8 +230,10 @@ facts:
   args:
     kernel: VectorOPKernel
     prefix: XVectoropkernel
-    hls: kernels/vectorop/kernel/VectorOP.cpp
-    driver: 'build*/kernels/vectorop/kv260/*/*/impl/ip/drivers/VectorOPKernel_v1_0/src/xvectoropkernel_hw.h'
+    rtl_driver: kernels/vectorop_rtl/scripts/gen_driver.py   # the truth: the RTL kernel's table,
+    rtl: kernels/vectorop_rtl/rtl/vo_ctrl_s_axi.sv            # checked against its control block
+    hls: kernels/vectorop/kernel/VectorOP.cpp                 # the C++ reference model: same ports
+    driver: 'build*/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/xvectoropkernel_hw.h'
     not_keyed: {a: address, b: address, c: address}
     decode: inference-scheduler/src/timeline_html.py
     writers_all:
@@ -257,6 +259,33 @@ facts:
       - inference-scheduler/src/codegen/_source.py
       - inference-scheduler/bench_src/calib_runner.c
       - inference-scheduler/bench_src/bench_matmul.c
+
+- id: paths.vectorop_driver
+  kind: value
+  title: where the build writes VectorOPKernel's C driver (make driver_vectorop_rtl, below build/), the
+    directory the example configs and docs point projects at
+  source:
+    file: kernels/vectorop_rtl/CMakeLists.txt
+    regex: 'VO_RTL_DRIVER_ROOT "\$\{CMAKE_CURRENT_BINARY_DIR\}/(\w+)"\)\nset\(VO_RTL_DRIVER_SRC "\$\{VO_RTL_DRIVER_ROOT\}/([^"]+)"'
+    transform: "f'kernels/vectorop_rtl/{v[0]}/{v[1]}'"   # the subdirectory's binary dir below build/
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/perf_config.json.example, regex: '"VectorOPKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '"VectorOPKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '\\"VectorOPKernel\\": \\"\.\./build/([^\\]+)\\"'}
+    - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/image_classification/image_classification_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/mnist/mnist_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/camera/camera_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/vectorop_rtl/[\w./]+/src)', count: 2}
+    - {file: inference-scheduler/inference_scheduler.py, regex: '\.\./build/(kernels/vectorop_rtl/[\w./]+/src)'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '<repo>/build/(kernels/vectorop_rtl/[\w./]+/src)/', count: 2}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '<repo>/build/(kernels/vectorop_rtl/[\w./]+/src)/'}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '--driver-dir \.\./build/(kernels/vectorop_rtl/[\w./]+/src)'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`build/(kernels/vectorop_rtl/[\w./]+/src)`'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/vectorop_rtl/[\w./]+/src)`'}
+    - {file: doc/build-and-test/TESTING.md, regex: '"VectorOPKernel": "<repo>/build/(kernels/vectorop_rtl/[\w./]+/src)"'}
+    - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: '`build/(kernels/vectorop_rtl/[\w./]+/src)`'}
 
 - id: paths.matmul_driver
   kind: value
@@ -593,7 +622,6 @@ facts:
     - {file: doc/kernels/CONV_KERNEL.md, regex: 'clock — (\d+) MHz for the KV260; the CMake fallback'}
     - {file: doc/kernels/CONV_KERNEL.md, regex: '^\| \*\*Clock\*\* \| (\d+) MHz synthesis target'}
     - {file: doc/kernels/POOLING_KERNEL.md, regex: '`clock` — (\d+) MHz for the KV260'}
-    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: '`kv260\.json` sets (\d+) MHz'}
     - {file: doc/kernels/HLS_CONV_RESEARCH.md, regex: 'HLS targets (\d+) MHz and the board'}
 
 # ── the chat server's protocols ──────────────────────────────────────────────
@@ -668,8 +696,12 @@ facts:
           demo results.json (mean 0.2597 / 2.8308 ms per image, 98.92 / 97.35 %).  Re-measured on bbb9a37f73f8
           (the same kernels plus the PoolingKernel guard; perf-regression baseline 2026-10-04 21:50): ResNet-18
           59.9, MobileNet v1 / v2 73.0 / 63.0, BERT p50 919.7, MNIST 0.260 / 2.833 ms — every demo within 0.1 %
-          and the 60 kernel benchmarks equal; the chat figures were not re-run"
-    facts: {perf.bitstream_id: bbb9a37f73f8}   # stale on another bitstream
+          and the 60 kernel benchmarks equal; the chat figures were not re-run.  Re-measured on 68665fc1833a
+          (the RTL VectorOPKernel, VECTOROP_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
+          72.9 / 62.8, BERT p50 917.8, MNIST 0.261 / 2.833 ms; llm_board 135M 100.3 ms / token and a 250 ms
+          16-token prefill, 360M 251.9 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.519 — all
+          within the tolerance of the values above"
+    facts: {perf.bitstream_id: 68665fc1833a}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -770,15 +802,16 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 7d8eefe, dsp: 1060, dsp_total: 1248, dsp_pct: 85, lut: 84561, lut_total: 117120, lut_pct: 72.2,
-          bram: 109.5, bram_total: 144, uram: 48, uram_total: 64}
+  value: {hw_commit: 7d8eefe, dsp: 1038, dsp_total: 1248, dsp_pct: 83, lut: 80965, lut_total: 117120, lut_pct: 69.1,
+          bram: 105.5, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-04
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe with the RTL MatmulKernel and the
-          PoolingKernel out-of-contract guard (main 17874ef, POOL_OPTIMISATION §2.15.1; the bitstream of
-          perf.bitstream_id; 1d28630fbfa4 before it: LUT 84 603)"
-    facts: {perf.bitstream_id: bbb9a37f73f8}
+    date: 2026-10-05
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe (4114b5d: docs only since) with the
+          RTL MatmulKernel and VectorOPKernel (VECTOROP_RTL_PLAN phase 1) and the PoolingKernel out-of-contract
+          guard; the bitstream of perf.bitstream_id (bbb9a37f73f8 before it, the HLS VectorOPKernel: LUT 84 561,
+          DSP 1060, BRAM 109.5)"
+    facts: {perf.bitstream_id: 68665fc1833a}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

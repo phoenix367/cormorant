@@ -91,8 +91,8 @@ expensive. So the board runs a **persistent** inference host:
 * Python 3.10+, `pip install -r requirements.txt`
   (gdown, numpy, onnx, onnxsim, paramiko, **opencv-python** for the display
   window — a headless host can use `--save-only` instead).
-* Generated driver sources for the kernels (HLS; the RTL MatmulKernel's by
-  `driver_matmul_rtl`):
+* Generated driver sources for the kernels (HLS; the RTL MatmulKernel's and
+  VectorOPKernel's by `driver_matmul_rtl` / `driver_vectorop_rtl`):
 
   ```bash
   # from the repo root

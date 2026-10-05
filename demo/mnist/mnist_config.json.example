@@ -30,12 +30,12 @@
 
   "local": {
     "driver_dirs": {
-      "VectorOPKernel": "../../build/kernels/vectorop/kv260/vadd_kv260/solution1/impl/ip/drivers/VectorOPKernel_v1_0/src",
+      "VectorOPKernel": "../../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel":   "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
       "PoolKernel":     "../../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; MatmulKernel's from make driver_matmul_rtl), copied into each project before upload."
+    "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; VectorOPKernel's and MatmulKernel's from make driver_vectorop_rtl / driver_matmul_rtl), copied into each project before upload."
   },
 
   "build": {
