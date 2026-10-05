@@ -17,7 +17,7 @@ builds the speech library the server's `piper` backend loads.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.26 / 2.8 ms per image) |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.26 / 2.7 ms per image) |
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 59.9 ms = 16.7 FPS at 100 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (919 ms per inference) |
@@ -56,9 +56,9 @@ performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
 - **Host:** Python 3.10+ and each demo's `requirements.txt` (or the
   scheduler's `.venv`, see above).
 - **Kernel drivers:** build the kernel IP from the repo root first —
-  `cmake .. && make synthesize_kv260` in `build/` (MatmulKernel's and
-  VectorOPKernel's drivers: `build/kernels/matmul_rtl/driver/`,
-  `build/kernels/vectorop_rtl/driver/`) — and point
+  `cmake .. && make synthesize_kv260` in `build/` (the RTL MatmulKernel's,
+  VectorOPKernel's and PoolingKernel's drivers: `build/kernels/matmul_rtl/driver/`,
+  `build/kernels/vectorop_rtl/driver/`, `build/kernels/pool_rtl/driver/`) — and point
   `local.driver_dirs` at the result.  The driver sources only describe the
   AXI-Lite registers, so they are the same for every `AXI_BUS_WIDTH`.
 - **KV260 board:** Linux with the bitstream and overlay loaded

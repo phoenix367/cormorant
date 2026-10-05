@@ -48,7 +48,7 @@ code changes; B when build / setup paths, repo contents (new files,
    and fixed by `python3 tools/facts/facts.py check` / `fix`; add a count
    you find repeated in several docs to the registry:
    ```bash
-   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1647: all pass, 0 skip
+   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1648: all pass, 0 skip
    cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 188
    python3 $S/scripts/audit_facts.py counts --run   # no CHECK line left that is a stale count
    git diff --stat -- ':!*.md'                      # empty: docs only
@@ -126,7 +126,7 @@ complete, continue it with SendMessage (context intact) instead of a new agent.
        && .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
    cd ../demo/mnist && ../../inference-scheduler/.venv/bin/python run_demo.py --skip-download
    ```
-   Expect ConvMNIST 98.92 % / 0.260 ms, LeNet 97.35 % / 2.83 ms.  "Overlay
+   Expect ConvMNIST 98.92 % / 0.256 ms, LeNet 97.35 % / 2.74 ms.  "Overlay
    'pl' did not apply" → the agent's `design_cormorant` overlay is still
    there: `rmdir /sys/kernel/config/device-tree/overlays/design_cormorant` on
    the board, run again.

@@ -12,7 +12,8 @@ Suites (--suite, comma-separated; default: scheduler,chat,lint,facts):
              ctypes, config keys, pool sizes, board results) + the tool's own
              unittest                                                ~15 s
   csim       kernel C simulation: make + ctest in build/ (Vitis HLS headers;
-             Verilator for the RTL kernels' TestMatmulRtl / TestVectorOpRtl)  ~3-6 min
+             Verilator for the RTL kernels' TestMatmulRtl / TestVectorOpRtl /
+             TestPoolRtl)  ~3-6 min
   tts-host   demo/tts/scripts/tts_host_emu.py (+ --lib-check): the Piper library's
              generated C on the host vs the specifications (needs the voice assets
              and demo/tts/build/piper_project)                       ~2 min

@@ -288,8 +288,9 @@ def preflight(cfg: dict, fetch: bool = True) -> bool:
         if k.startswith("_"):
             continue
         if not demo_path(p).is_dir():
-            log(f"warning: local.driver_dirs.{k}: {demo_path(p)} not found "
-                f"(make synthesize_{ {'VectorOPKernel': 'vectorop', 'ConvKernel': 'conv'}.get(k, 'matmul')}_kv260)")
+            target = {"VectorOPKernel": "driver_vectorop_rtl", "MatmulKernel": "driver_matmul_rtl",
+                      "PoolKernel": "driver_pool_rtl"}.get(k, "synthesize_conv_kv260")
+            log(f"warning: local.driver_dirs.{k}: {demo_path(p)} not found (make {target})")
     return ok
 
 

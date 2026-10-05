@@ -9,6 +9,17 @@ For the high-level kernel description see [POOLING_KERNEL.md](POOLING_KERNEL.md)
 this file is a complement focused on the optimization arc and the current
 final architecture.
 
+> **Retired (2026-10-05).**  The hardware build no longer synthesises this
+> kernel: the bitstream carries the SystemVerilog PoolingKernel
+> ([POOL_RTL_KERNEL.md](POOL_RTL_KERNEL.md), [POOL_RTL_PLAN](../plans/POOL_RTL_PLAN.md)
+> phase 3).  This log is the HLS kernel's history; its commands
+> (`synthesize_pool_kv260`, `cosim_pool_kv260`) are gone, and `behavior_test_pool`
+> now runs the RTL IP (45 / 45; 584 µs against this kernel's 694 µs on the 43
+> cases both pass, −15.8 %; on the board every pooling benchmark 8.6–30.2 %
+> faster).  The RTL testbench found a line-buffer bank collision in this
+> kernel (`stride_w > 8` with left padding); `PoolingKernel.cpp` is fixed and
+> fixtures 43–44 cover it (POOL_RTL_PLAN phase 0).
+
 ---
 
 ## 1. Performance progression at a glance

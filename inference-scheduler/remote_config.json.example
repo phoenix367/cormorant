@@ -31,7 +31,7 @@
       "VectorOPKernel": "../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel": "../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel": "../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src",
-      "PoolKernel": "../build/kernels/pool/kv260/pool_kv260/hls/impl/ip/drivers/PoolingKernel_v1_0/src"
+      "PoolKernel": "../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel local paths for multi-kernel models, e.g. {\"VectorOPKernel\": \"../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src\", \"MatmulKernel\": \"../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src\"}. Files are merged automatically before upload."
   },

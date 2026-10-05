@@ -82,11 +82,11 @@ def hw_h():
            "// 64-bit arguments take two words, low word first.",
            ""]
     for name, off, _ in CTRL:
-        out.append(f"#define {MACRO}_CTRL_ADDR_{name:<22}0x{off:02x}")
+        out.append(f"#define {MACRO}_CTRL_ADDR_{name + ' ':<22}0x{off:02x}")
     for name, off, bits, _ in REGS:
         tag = name.upper() + "_DATA"
-        out.append(f"#define {MACRO}_CTRL_ADDR_{tag:<22}0x{off:02x}")
-        out.append(f"#define {MACRO}_CTRL_BITS_{tag:<22}{bits}")
+        out.append(f"#define {MACRO}_CTRL_ADDR_{tag + ' ':<22}0x{off:02x}")
+        out.append(f"#define {MACRO}_CTRL_BITS_{tag + ' ':<22}{bits}")
     return "\n".join(out) + "\n"
 
 

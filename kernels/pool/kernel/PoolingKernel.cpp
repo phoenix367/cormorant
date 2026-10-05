@@ -828,7 +828,6 @@ static void window_emitter(
                 const unsigned chunk_base = (ni * channels + cg.c_off) * in_hw + cg.iw_lo;
                 const unsigned n_emit     = cg.n_groups * red_len;
                 const ColIdx   run_len    = (ColIdx)cg.run_len;
-                const ChIdx    c_valid    = (ChIdx)cg.c_valid;
                 // Local column of output position ow_lo for tap kwi = 0.
                 const int col_base = (int)(cg.ow_lo * stride_w) - (int)pad_left - (int)cg.iw_lo;
 
@@ -1011,8 +1010,11 @@ static void window_emitter(
                             }
 
                             // One read per bank: the address of whichever
-                            // position maps to it (position 0 wins on a
-                            // collision — only possible when p ≥ 1 is padded).
+                            // in-bounds position maps to it (the positions of
+                            // a group land in different banks; a padded
+                            // position's bank_p is 0 and must not claim bank 0
+                            // — with stride_w > 8 a left-padded position 0
+                            // would take position 1's bank: fixed 2026-10-05).
                             Lane rv[kTileC][kLanes];
                             #pragma HLS ARRAY_PARTITION variable=rv complete dim=0
                             for (unsigned b = 0; b < kLanes; b++) {
@@ -1020,7 +1022,7 @@ static void window_emitter(
                                 unsigned addr = addr_p[kOwParallel - 1];
                                 for (int p = (int)kOwParallel - 2; p >= 0; p--) {
                                     #pragma HLS UNROLL
-                                    if (bank_p[p] == b) addr = addr_p[p];
+                                    if (ok_p[p] && bank_p[p] == b) addr = addr_p[p];
                                 }
                                 for (unsigned c = 0; c < kTileC; c++) {
                                     #pragma HLS UNROLL

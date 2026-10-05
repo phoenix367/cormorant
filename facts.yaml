@@ -92,7 +92,7 @@ facts:
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`TestMatmulRtl` runs the (?P<matmul>\d+) checked-in fixtures'}
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: '\[ck\] MatmulKernel: PASS  \((?P<matmul>\d+)/\d+\)'}
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`VectorOPKernel … total=(?P<vecop>\d+) passed='}
-    - {file: .claude/skills/pool-verify/SKILL.md, regex: '\[ck\] PoolingKernel: PASS  \((?P<pool>\d+)/\d+\)'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '\[ck\] PoolingKernel: PASS  \((?P<pool>\d+)/\d+\)'}
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'CTest test runs the (?P<matmul>\d+) checked-in fixtures'}
     - {file: doc/build-and-test/BUILD_TARGETS.md,
        regex: 'pass \((?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) GEMV\), (?P<pool>\d+) Pool cases\)'}
@@ -256,6 +256,10 @@ facts:
       vo_rd_outs: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int RD_OUTS +=\s*(\d+);', type: int}
       vo_wr_burst: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int WR_BURST +=\s*(\d+);', type: int}
       vo_wr_outs: {file: kernels/vectorop_rtl/rtl/vo_pkg.sv, regex: 'localparam int WR_OUTS +=\s*(\d+);', type: int}
+      pl_rd_burst: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int RD_BURST +=\s*(\d+);', type: int}
+      pl_rd_outs: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int RD_OUTS +=\s*(\d+);', type: int}
+      pl_wr_burst: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int WR_BURST +=\s*(\d+);', type: int}
+      pl_wr_outs: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int WR_OUTS +=\s*(\d+);', type: int}
   fix: report                                # an IP change: repackage, rebuild, re-measure
   mentions:
     - {file: kernels/matmul_rtl/syn/package_ip.tcl, regex: 'NUM_READ_OUTSTANDING (?P<mm_rd_outs>\d+) NUM_WRITE_OUTSTANDING (?P<mm_wr_outs>\d+)'}
@@ -266,6 +270,9 @@ facts:
     - {file: kernels/vectorop_rtl/syn/package_ip.tcl,
        regex: 'gmem0 READ_ONLY (?P<vo_rd_burst>\d+) \d+  gmem1 READ_ONLY \d+ \d+  gmem2 WRITE_ONLY \d+ (?P<vo_wr_burst>\d+)'}
     - {file: kernels/vectorop_rtl/tb/verilator/tb_main.cpp, regex: 'rd1\.outs_limit = (?P<vo_rd_outs>\d+);  wr\.outs_limit = (?P<vo_wr_outs>\d+);'}
+    - {file: kernels/pool_rtl/syn/package_ip.tcl, regex: 'gmem0 READ_ONLY (?P<pl_rd_outs>\d+) \d+  gmem1 WRITE_ONLY \d+ (?P<pl_wr_outs>\d+)'}
+    - {file: kernels/pool_rtl/syn/package_ip.tcl, regex: 'MAX_READ_BURST_LENGTH (?P<pl_rd_burst>\d+) MAX_WRITE_BURST_LENGTH (?P<pl_wr_burst>\d+)'}
+    - {file: kernels/pool_rtl/tb/verilator/tb_main.cpp, regex: 'rd\.outs_limit = (?P<pl_rd_outs>\d+);  wr\.outs_limit = (?P<pl_wr_outs>\d+);'}
 
 - id: registers.MatmulKernel
   kind: interface
@@ -312,6 +319,29 @@ facts:
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/vectorop_rtl/[\w./]+/src)`'}
     - {file: doc/build-and-test/TESTING.md, regex: '"VectorOPKernel": "<repo>/build/(kernels/vectorop_rtl/[\w./]+/src)"'}
     - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: '`build/(kernels/vectorop_rtl/[\w./]+/src)`'}
+
+- id: paths.pool_driver
+  kind: value
+  title: where the build writes PoolingKernel's C driver (make driver_pool_rtl, below build/), the
+    directory the example configs and docs point projects at
+  source:
+    file: kernels/pool_rtl/CMakeLists.txt
+    regex: 'PL_RTL_DRIVER_ROOT "\$\{CMAKE_CURRENT_BINARY_DIR\}/(\w+)"\)\nset\(PL_RTL_DRIVER_SRC "\$\{PL_RTL_DRIVER_ROOT\}/([^"]+)"'
+    transform: "f'kernels/pool_rtl/{v[0]}/{v[1]}'"   # the subdirectory's binary dir below build/
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/perf_config.json.example, regex: '"PoolingKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '"PoolKernel": "\.\./build/([^"]+)"'}
+    - {file: demo/image_classification/image_classification_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/mnist/mnist_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/camera/camera_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/pool_rtl/[\w./]+/src)', count: 2}
+    - {file: doc/kernels/POOL_RTL_KERNEL.md, regex: '`build/(kernels/pool_rtl/[\w./]+/src)`'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '<repo>/build/(kernels/pool_rtl/[\w./]+/src)/', count: 2}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: '<repo>/build/(kernels/pool_rtl/[\w./]+/src)/'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`build/(kernels/pool_rtl/[\w./]+/src)`'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/pool_rtl/[\w./]+/src)`'}
+    - {file: doc/build-and-test/TESTING.md, regex: '"PoolKernel": +"<repo>/build/(kernels/pool_rtl/[\w./]+/src)"'}
 
 - id: paths.matmul_driver
   kind: value
@@ -361,8 +391,10 @@ facts:
   args:
     kernel: PoolKernel
     prefix: XPoolingkernel
-    hls: kernels/pool/kernel/PoolingKernel.cpp
-    driver: 'build*/kernels/pool/kv260/*/*/impl/ip/drivers/PoolingKernel_v1_0/src/xpoolingkernel_hw.h'
+    rtl_driver: kernels/pool_rtl/scripts/gen_driver.py       # the truth: the RTL kernel's table,
+    rtl: kernels/pool_rtl/rtl/pl_ctrl_s_axi.sv               # checked against its control block
+    hls: kernels/pool/kernel/PoolingKernel.cpp               # the C++ reference model: same ports
+    driver: 'build*/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/xpoolingkernel_hw.h'
     not_keyed: {x: address, y: address}
     decode: inference-scheduler/src/timeline_html.py
     writers_all:
@@ -710,7 +742,7 @@ facts:
   title: the board results of README "Results on the board", and where they are repeated
   value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 919,
           smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.25, smollm2_360m_tok_s: 3.9,
-          smolvlm_image_s: 3.9, piper_rtf: 0.52, mnist_convnet_ms: 0.260, mnist_lenet_ms: 2.831}
+          smolvlm_image_s: 3.9, piper_rtf: 0.52, mnist_convnet_ms: 0.256, mnist_lenet_ms: 2.743}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -730,8 +762,12 @@ facts:
           m_axi bus parameters, MATMUL_RTL_PLAN phase 5, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
           72.9 / 62.8, BERT p50 917.3, MNIST 0.261 / 2.774 ms; llm_board 135M 100.2 ms / token and a 251 ms
           16-token prefill, 360M 252.0 ms / token, SmolVLM llm_image 3.90 s; tts_board RTF 0.519 — within the
-          tolerance (LeNet 2.1 % faster: its FC layers run on MatmulKernel)"
-    facts: {perf.bitstream_id: b3309f424562}   # stale on another bitstream
+          tolerance (LeNet 2.1 % faster: its FC layers run on MatmulKernel).  Re-measured on dbb320fb7297 (the
+          RTL PoolingKernel, POOL_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.7, MobileNet v1 / v2 72.8 / 62.7,
+          BERT mean 919.4, MNIST 0.256 / 2.743 ms (the values above since: LeNet 3.1 % faster than the 2.831
+          recorded, its two AveragePools); llm_board 135M 100.3 ms / token and a 251 ms 16-token prefill, 360M
+          251.7 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.518"
+    facts: {perf.bitstream_id: dbb320fb7297}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -832,17 +868,17 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 7d8eefe, dsp: 1038, dsp_total: 1248, dsp_pct: 83, lut: 80914, lut_total: 117120, lut_pct: 69.1,
-          bram: 105.5, bram_total: 144, uram: 48, uram_total: 64}
+  value: {hw_commit: 7d8eefe, dsp: 973, dsp_total: 1248, dsp_pct: 78, lut: 75472, lut_total: 117120, lut_pct: 64.4,
+          bram: 105, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-05
     how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe (docs only since) with the RTL
-          MatmulKernel (its IP declaring the m_axi bus parameters, MATMUL_RTL_PLAN phase 5) and VectorOPKernel
-          and the PoolingKernel out-of-contract guard; the bitstream of perf.bitstream_id (68665fc1833a before
-          it, the MatmulKernel IP without bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel:
-          LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: b3309f424562}
+          MatmulKernel (its IP declaring the m_axi bus parameters, MATMUL_RTL_PLAN phase 5), VectorOPKernel and
+          PoolingKernel (POOL_RTL_PLAN phase 1); the bitstream of perf.bitstream_id (b3309f424562 before it,
+          the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
+          bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
+    facts: {perf.bitstream_id: dbb320fb7297}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

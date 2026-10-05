@@ -40,7 +40,7 @@ def format_missing_config(path: Path) -> str:
             "                            make driver_vectorop_rtl",
             "                            make driver_matmul_rtl",
             "                            make synthesize_conv_kv260",
-            "                            make synthesize_pool_kv260",
+            "                            make driver_pool_rtl",
             "",
             "Optional but commonly tuned:",
             "  • remote.uio_devices  — DT node labels of your loaded overlay",

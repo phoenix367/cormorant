@@ -14,7 +14,7 @@ Documentation index: `doc/README.md` — docs are grouped in `doc/build-and-test
 
 ## Build System
 
-All four kernels live under `kernels/` and are built from a single top-level CMake project: Conv and Pool in Vitis HLS, MatmulKernel and VectorOPKernel in SystemVerilog (`kernels/matmul_rtl/`, `kernels/vectorop_rtl/`; `kernels/matmul/` and `kernels/vectorop/` keep the retired HLS kernels' C++ as their reference models).
+All four kernels live under `kernels/` and are built from a single top-level CMake project: Conv in Vitis HLS, MatmulKernel, VectorOPKernel and PoolingKernel in SystemVerilog (`kernels/matmul_rtl/`, `kernels/vectorop_rtl/`, `kernels/pool_rtl/`; `kernels/matmul/`, `kernels/vectorop/` and `kernels/pool/` keep the retired HLS kernels' C++ as their reference models).
 See `doc/build-and-test/BUILD_TARGETS.md` for a full reference of every `make` target.
 
 ```bash
@@ -28,18 +28,20 @@ make TestSimulation    # VectorOPKernel's C++ reference model (the retired HLS k
 make TestConvRef       # ConvKernel
 make TestConvGrid      # ConvKernel MAC grid (include/ConvMacGrid.h) alone
 make TestMatmulRef     # MatmulKernel's C++ reference model (the retired HLS kernel)
-make TestPoolingSim    # PoolingKernel
+make TestPoolingSim    # PoolingKernel's C++ reference model (the retired HLS kernel)
 make TestMatmulRtl     # MatmulKernel in SystemVerilog (kernels/matmul_rtl/, Verilator 5.x)
 make TestVectorOpRtl   # VectorOPKernel in SystemVerilog (kernels/vectorop_rtl/, Verilator 5.x)
+make TestPoolRtl       # PoolingKernel in SystemVerilog (kernels/pool_rtl/, Verilator 5.x)
 ctest                  # run all
 
 # HLS synthesis + Vivado IP export for the KV260
-make synthesize_conv_kv260
-make synthesize_pool_kv260
+make synthesize_conv_kv260       # ConvKernel, the one Vitis HLS kernel
 make package_matmul_rtl          # MatmulKernel: the SystemVerilog IP (Vivado); its HLS synthesis is retired
 make driver_matmul_rtl           # its C driver, which projects copy (build/kernels/matmul_rtl/driver/...)
 make package_vectorop_rtl        # VectorOPKernel: likewise
 make driver_vectorop_rtl         # (build/kernels/vectorop_rtl/driver/...)
+make package_pool_rtl            # PoolingKernel: likewise
+make driver_pool_rtl             # (build/kernels/pool_rtl/driver/...)
 ```
 
 Each kernel (every `kernels/<k>`) can also be built standalone — `cmake/AxiPlatform.cmake` gives the ones that read the platform the bus width and platform list the top level sets:
@@ -58,7 +60,7 @@ make TestSimulation
 
 ### Per-platform HLS synthesis
 
-Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `synthesize_<kernel>_<name>` CMake target that runs Vitis HLS and exports an IP catalog archive.  The top-level `AXI_PLATFORM` cache var (default `kv260`) also selects which platform's bounds drive the C-sim Config.h for each kernel.
+Each `platforms/<name>.json` file (top-level, shared across kernels) defines a `synthesize_conv_<name>` CMake target that runs Vitis HLS on ConvKernel (the one HLS kernel left) and exports an IP catalog archive.  The top-level `AXI_PLATFORM` cache var (default `kv260`) also selects which platform's bounds drive the C-sim Config.h for each kernel.
 
 **Schema reference: [`doc/build-and-test/PLATFORM_CONFIGURATION.md`](doc/build-and-test/PLATFORM_CONFIGURATION.md)** — full field-by-field tables for top-level keys and the `kernels.{conv,matmul,pool}` blocks (VectorOPKernel has none), with constraint formulas, the "add a new platform" workflow, and the "edit existing bounds + regenerate hardware-bound fixtures" workflow.
 
@@ -66,6 +68,7 @@ Key facts to keep in mind when editing platform JSON or any code that touches it
 
 - The JSON is the **single source of truth**.  The C++ build reads it via `string(JSON …)` in `kernels/<k>/CMakeLists.txt::<k>_load_constants` (no `set(<K>_* CACHE …)` defaults); the Python scheduler reads it via `inference-scheduler/src/_<k>_hw_config.py::resolve()`.  A missing field is a `FATAL_ERROR` during CMake configure and a `<Kernel>HwConfigError` at scheduler load time.
 - `CMAKE_CONFIGURE_DEPENDS` is set on every platform JSON, so `make` auto-reruns cmake when the JSON changes.
+- The RTL kernels hard-code their bounds: `kernels/pool_rtl/CMakeLists.txt` checks every `kernels.pool` field against `kernels/pool_rtl/rtl/pl_pkg.sv` at configure time (`FATAL_ERROR` when they differ), and MatmulKernel's `K_MAX` (`kernels/matmul_rtl/rtl/mm_pkg.sv`) must equal `kernels.matmul.max_k` — changing those bounds means changing the RTL.
 - Bumping a `max_*` bound requires re-running `inference-scheduler/test/gen_{conv,matmul,pool}_models.py` so the hardware-bound boundary fixtures re-derive their geometries from the new JSON — otherwise "must raise" / "at limit" tests can start passing on the wrong values.
 - `AXI_BUS_WIDTH` is a top-level CMake cache variable, **not** a JSON field, so a single platform can be synthesised against multiple bus widths.
 
@@ -102,6 +105,7 @@ All three ports are 128 bits wide (8 elements per beat); the kernel reads in bur
 - **`kernels/vectorop/include/Config.h.in`** — CMake template that produces `Config.h` with `Data_t`, `kDataWidthBits`, and `kSeed`.
 - **`kernels/vectorop/test/TestSimulation.cpp`** — Tests all 6 operations across sizes 1…4097 (tail words), saturation boundary cases, and geometry / `act` cases (broadcast chunk 12 stride 16, outer 1000 × 16, stride-0 operands at and past the replay bound, runs > 16 × 256 words); asserts the alignment contract (`inc % 8 == 0`, tail lanes 0, gaps untouched). `--dump-data` writes the RTL fixtures (manifest with an `act` column) into the build tree (`make gen_vectorop_test_data`); the behaviour tests read the checked-in copies in `hw/test_data/vecop_test_data`.
 - **`kernels/matmul_rtl/`** — MatmulKernel in SystemVerilog, a drop-in for the HLS one (same VLNV, registers, layouts, bit-exact; gmem2 128-bit; 128 MAC/cycle GEMM).  Verilator testbench (`TestMatmulRtl`: the HLS fixtures + random cases), `scripts/gen_driver.py` (the C driver with the HLS driver's API, checked against `rtl/mm_ctrl_s_axi.sv`), Vivado packaging.  The hardware build's MatmulKernel since `doc/plans/MATMUL_RTL_PLAN.md` phase 4 (bitstream `1d28630fbfa4`; the hw_128 and test-stand scripts reset instance m_axi widths to the IP defaults after the upgrade, so gmem2 becomes 128); `kernels/matmul/` keeps the HLS kernel's C++ as the reference model and fixture generator.  `platforms/kv260.json` `kernels.matmul.impl = "rtl"` tells the scheduler (`AXI_MATMUL_IMPL=hls` models older bitstreams).  Since phase 5 (bitstream `b3309f424562`) the IP declares its m_axi bus parameters (16 outstanding bursts per port, read- / write-only), as the RTL VectorOPKernel's does — without them the block design gives each crossbar slot 2 (fact `rtl.axi_masters`).  Read `doc/kernels/MATMUL_RTL_KERNEL.md` (contract, architecture, invariants) before changing the RTL.
+- **`kernels/pool_rtl/`** — PoolingKernel in SystemVerilog, the hardware build's since `doc/plans/POOL_RTL_PLAN.md` phase 3 (bitstream `dbb320fb7297`): a drop-in for the HLS one (same VLNV `xilinx.com:hls:PoolingKernel:1.0`, ports, register map, m_axi bus parameters — gmem0 read-only, gmem1 write-only, 16-beat bursts — bit-exact).  `rtl/` (`pl_core` job FSM and chunk sequencer, `pl_loader`, `pl_emit` line buffer, `pl_reduce` + finaliser, `pl_writer`; `pl_pkg.sv` holds the `kernels.pool` bounds), Verilator testbench (`TestPoolRtl`: the 45 fixtures + random jobs against the HLS C++), `scripts/gen_driver.py` (the HLS driver's API, MatmulKernel's generator), Vivado packaging (`syn/package_ip.tcl`); `kernels/pool/` keeps the HLS kernel's C++ (`kernel/PoolingKernel.cpp`, `TestPoolingSim`, `gen_pool_test_data`) as the reference model and fixture generator.  Read `doc/kernels/POOL_RTL_KERNEL.md` (contract, architecture, invariants) before changing the RTL.
 - **`platforms/kv260.json`** — KV260 Starter Kit platform config (shared by all kernels).  Holds FPGA `part`/`board`/`clock` plus `kernels.conv` / `kernels.matmul` / `kernels.pool` compile-time bounds (see §"Per-platform HLS synthesis" above).
 
 ### Inference Scheduler
@@ -146,7 +150,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1647 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1648 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -182,7 +186,7 @@ See `doc/scheduler/INFERENCE_SCHEDULER.md` for the full technical reference and 
 ## Dependencies
 
 - **`cmake/FindVitis.cmake`** — bundled in this repo; locates `vitis_hls`/`vitis-run` and sets `Vitis_HLS` / `Vitis_HLS_TCL_FLAG` for synthesis targets. No external hlslib dependency.
-- **Verilator 5.x** (`sudo apt install verilator`; 5.020 here) for the RTL MatmulKernel's and VectorOPKernel's testbenches and lint; without it those targets are skipped.
+- **Verilator 5.x** (`sudo apt install verilator`; 5.020 here) for the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's testbenches and lint; without it those targets are skipped.
 - **Xilinx Vitis 2025.2** at `/mnt/data/xilinx/2025.2`. Source `settings64.sh` before building. From 2024.x, `vitis-run --tcl` replaces the older `vitis_hls -f` invocation; `FindVitis.cmake` handles this automatically via `${Vitis_HLS_TCL_FLAG}`.
 - **KV260 board**: Ubuntu 22.04 (kernel 5.15.0-xilinx-zynqmp), XRT 2.13, `cma=1000M` on the kernel command line (BERT + SmolLM2 pools), 3.9 GB RAM and no swap (build generated projects `-j1`). Keep `board/kv260/kv260-no-cpu-powerdown.conf` installed in `/etc/tmpfiles.d/` (`demo/chat/deploy.py` does it): the PSCI core power-down idle state can park a core forever and hang the board (`doc/plans/CHAT_PLAN.md` §18).
 - **One job per board**: every board tool (`run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`, `upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat `deploy.py` / `llm_board.py`, the TTS `tts_board.py`) holds the per-board lock `/tmp/kv260-board-<host>.lock` (`inference-scheduler/src/remote/lock.py`; a config's `board_lock` overrides it, `false` disables it) and waits while another job holds it; tools started by a holder re-enter it.  Never wrap them in a shell `flock` on that file (they would wait forever) — use `python -m src.remote.locked -- CMD` from `inference-scheduler/` for other commands.

@@ -37,11 +37,11 @@ reasons, known warnings, typical duration) are in
 
 | suite | what | time |
 |---|---|---|
-| `scheduler` | `inference-scheduler/` pytest `test/` (1647 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
+| `scheduler` | `inference-scheduler/` pytest `test/` (1648 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
 | `chat` | `demo/chat/tests` pytest (188 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `facts` | `tools/facts/facts.py check` (`facts.yaml`: counts, register maps, supported ops, CLI and script flags, HTTP routes, ctypes, config keys, platform JSON, pool sizes, board results against code and docs; a failure = a stale or inconsistent fact) + the tool's unittest | ~15 s |
-| `csim` | `make -j8` + `ctest` in `build/` — kernel C simulation (Vitis headers) and the RTL MatmulKernel and VectorOPKernel in Verilator | 3–6 min |
+| `csim` | `make -j8` + `ctest` in `build/` — kernel C simulation (Vitis headers) and the RTL MatmulKernel, VectorOPKernel and PoolingKernel in Verilator | 3–6 min |
 | `tts-host` | Piper library: generated C on the host vs the spec (`tts_host_emu.py`, `--lib-check`) | ~3 min |
 | `rtl` | `make behavior_test` (Vivado xsim, re-synthesises) — **only when explicitly asked** | ~1 h |
 | `default` | scheduler, chat, lint, facts | ~5 min |

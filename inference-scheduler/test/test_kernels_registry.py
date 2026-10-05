@@ -124,6 +124,14 @@ class TestMixedDriverReadme(unittest.TestCase):
         for f in KERNEL_REGISTRY["MatmulKernel"].driver_files:
             self.assertIn(f, readme)
 
+    def test_driver_sources(self):
+        # the SystemVerilog kernels' drivers come from make driver_<k>_rtl,
+        # ConvKernel's from its HLS synthesis
+        readme = mixed_driver_readme(["VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolKernel"])
+        for target in ("driver_vectorop_rtl", "driver_matmul_rtl", "driver_pool_rtl"):
+            self.assertIn(f"make {target}", readme)
+        self.assertIn("Vitis HLS synthesis output for ConvKernel", readme)
+
 
 if __name__ == "__main__":
     unittest.main()

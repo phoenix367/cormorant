@@ -37,10 +37,10 @@ C-sim build** — the `Config.h` consumed by `make TestConvRef`,
 `make TestPoolingSim`, etc. is generated from this platform's bounds.
 
 The per-platform synthesis loop is independent. Every JSON file in
-`platforms/` gets its own `synthesize_<kernel>_<platform>` target
-regardless of `AXI_PLATFORM`. Picking a different platform with
+`platforms/` gets its own `synthesize_conv_<platform>` (the one HLS
+kernel) and `synthesize_<platform>` targets regardless of `AXI_PLATFORM`. Picking a different platform with
 `-DAXI_PLATFORM=foo` only affects which JSON drives the `Config.h`
-file used by C-sim tests.
+file used by C-sim tests and the RTL kernels' part and bound check.
 
 The Python side mirrors the same convention: setting the
 `AXI_PLATFORM` environment variable selects the JSON the scheduler
@@ -169,6 +169,14 @@ architectural context including bank/port topology.
 both have unconditional runtime fallbacks (channel tiling for any C;
 residual-lane padding for any `out_w`).
 
+The bitstream's PoolingKernel is the SystemVerilog one (`kernels/pool_rtl`,
+[`POOL_RTL_KERNEL.md`](../kernels/POOL_RTL_KERNEL.md)); it holds these six
+fields as constants in `rtl/pl_pkg.sv`, and configure compares them with
+the `AXI_PLATFORM` JSON and stops with a `FATAL_ERROR` when they differ —
+changing a `kernels.pool` field means changing the RTL.  The fields also size
+the retired HLS kernel's C++ (`kernels/pool`, the reference model and
+fixture generator).
+
 ---
 
 ## Example — kv260.json
@@ -230,9 +238,9 @@ residual-lane padding for any `out_w`).
     ```
 
 3. The new platform now has:
-    - `synthesize_<kernel>_<platform>` — per-kernel HLS synthesis + IP export (conv, pool)
+    - `synthesize_conv_<platform>` — ConvKernel HLS synthesis + IP export
     - `synthesize_<platform>` — roll-up target that builds all four kernels
-    - `cosim_<kernel>_<platform>` — C synthesis + RTL co-simulation (conv, pool)
+    - `cosim_conv_<platform>` — ConvKernel C synthesis + RTL co-simulation
     - `dtbo_<platform>_<stem>` — for any `<stem>.dts` file under `dts/<platform>/`
 
     The Vivado / behavioural-test targets (`build_hw_kv260`,
@@ -280,7 +288,8 @@ surfaces immediately at `pytest` time.
 `tile_*` / `ow_parallel` / `tile_c` changes don't require fixture
 regeneration — those fields are not validated against models — but
 they do affect HLS resource usage / II, so a re-synthesis is still
-needed before deploying. `kernels.conv.tile_ic` and
+needed before deploying (the `kernels.pool` fields, and `kernels.matmul.max_k`,
+are constants of the RTL kernels: change the RTL with them). `kernels.conv.tile_ic` and
 `kernels.matmul.tile_m` also change the packed weight layout the
 scheduler emits, so every generated project must be regenerated against
 the same JSON as the bitstream.
@@ -293,7 +302,8 @@ the same JSON as the bitstream.
 |----------|----------|
 | [`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 | Full ConvKernel architecture and tiling, including how each `kernels.conv.*` field maps to hardware resources |
 | [`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
-| [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration |
+| [`POOL_RTL_KERNEL.md`](../kernels/POOL_RTL_KERNEL.md) | The SystemVerilog PoolingKernel: contract (the bounds, `rtl/pl_pkg.sv`), architecture |
+| [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration (the retired HLS kernel's C++, the reference model) |
 | [`POOL_OPTIMISATION.md`](../kernels/POOL_OPTIMISATION.md) §4 | PoolingKernel field-by-field reference, bank topology, `ow_parallel` interaction with stride |
 | [`VECTOROP_RTL_KERNEL.md`](../kernels/VECTOROP_RTL_KERNEL.md) | VectorOPKernel architecture (no compile-time bounds; the retired HLS kernel: [`VECTOROP_KERNEL.md`](../kernels/VECTOROP_KERNEL.md)) |
 | [`inference-scheduler/CLAUDE.md`](../../inference-scheduler/CLAUDE.md) | Python resolver pattern (`_<k>_hw_config.resolve()`) and validator flow |

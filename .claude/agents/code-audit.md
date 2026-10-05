@@ -6,7 +6,7 @@ model: inherit
 ---
 
 You audit the code of the axi_demo repository: HLS kernels and the
-SystemVerilog MatmulKernel and VectorOPKernel (`kernels/`), the ONNX-to-C scheduler
+SystemVerilog MatmulKernel, VectorOPKernel and PoolingKernel (`kernels/`), the ONNX-to-C scheduler
 (`inference-scheduler/`), the demos (`demo/`: BERT, chat server, TTS, CNN
 demos) and the board tools.  Three jobs, in this order:
 
@@ -171,7 +171,7 @@ Check both sides of every exchange point the scope touches:
 | command lines between scripts | `deploy.py` → `kv260_chat_server.py`, board tools → each other, docs / usage strings → scripts | `flags_check.py --pairs`, then per pair |
 | config files | `*.json.example` ↔ `load_config` / readers (`demo/*/scripts/_common.py`, `src/remote/config.py`, `deploy.py`) | `config_keys.py` |
 | binary / text files (writer ↔ reader: dtype, endianness, shape and order, element count, header fields) | `weights/*.dat` (`src/tensor.py`, `src/numeric.py` ↔ generated C); `dp.dat` (`piper_vits.dp_flat` ↔ `tts_dp.c`, `TTS_DP_FLOATS` in `tts_glue.h`); `utts.bin` / `ids.bin` / `dpz.bin` / `pcm` / `enc` / `dur` (`tts_board.py`, `tts_host_emu.py` ↔ `tts_bench.c`); `inputs.bin` / `logits.bin` (`prepare_inputs.py`, `deploy_and_run.py` ↔ `squad_bench.c`); RTL fixture manifests (`--dump-data` ↔ `hw` testbenches — read only); `project.json` / `layers.json` (generators ↔ board tools); perf models and baselines JSON | find the writer (`tofile`, `struct.pack`, `json.dump`, `fwrite`) and the reader (`fromfile`, `fread`, `json.load`); compare field by field |
-| HLS kernel interface | kernel `s_axilite` / `m_axi` pragmas and argument order (`kernels/<k>/kernel/*.cpp`; MatmulKernel / VectorOPKernel: `kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv` / `kernels/vectorop_rtl/rtl/vo_ctrl_s_axi.sv` + `scripts/gen_driver.py`) ↔ register use in the scheduler (`src/kernels.py`, `src/codegen/`) ↔ software kernel models (`test/host_emu.py`) ↔ `platforms/*.json` bounds ↔ `src/_<k>_hw_config.py` ↔ `doc/kernels/*_KERNEL.md` | read and compare names, widths, offsets, bounds |
+| HLS kernel interface | kernel `s_axilite` / `m_axi` pragmas and argument order (`kernels/<k>/kernel/*.cpp`; MatmulKernel / VectorOPKernel / PoolingKernel: `kernels/matmul_rtl/rtl/mm_ctrl_s_axi.sv` / `kernels/vectorop_rtl/rtl/vo_ctrl_s_axi.sv` / `kernels/pool_rtl/rtl/pl_ctrl_s_axi.sv` + `scripts/gen_driver.py`) ↔ register use in the scheduler (`src/kernels.py`, `src/codegen/`) ↔ software kernel models (`test/host_emu.py`) ↔ `platforms/*.json` bounds ↔ `src/_<k>_hw_config.py` ↔ `doc/kernels/*_KERNEL.md` | read and compare names, widths, offsets, bounds |
 | generated C API ↔ glue | `inference.h` as the codegen emits it (`inference_run_<entry>`, buffer types, init / sync calls) ↔ `bert_api.c`, `llm_api.c`, `tts_api.c`, the benches | grep the emitted names in the codegen and in the glue |
 | HTTP API | `kv260_chat_server.py` ↔ `chat.py` ↔ `tests/` ↔ `board_gate.py`, `tts_speech_check.py` ↔ `demo/chat/doc/API.md` | request fields, response fields, status codes, SSE event names |
 | board layout | paths on the board (install dir, weights dirs, library names, UIO names) in `deploy.py`, `llm_board.py`, `tts_board.py`, the config examples, the server defaults | compare every path and name |

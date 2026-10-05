@@ -944,6 +944,14 @@ int main(int argc, char** argv)
                 2,3,7,7, 4,4, 3,3, 2,2, 1,1, 1,1, 2,2,0},
         {"GlobalAvgPool 7x7 C=16",
                 1,16,7,7, 1,1, 7,7, 1,1, 0,0, 1,1, 1,0,0},
+        // stride_w > 8 with left padding: position 0's padded tap and
+        // position 1's tap fall in the same column bank (position 1's
+        // column is a multiple of 8); position 1 must read its own word
+        // (the line-buffer read used position 0's address until 2026-10-05)
+        {"AvgPool 3x3 stride9 pad1 W=40 (padded position 0, shared bank)",
+                1,4,12,40, 2,5, 3,3, 9,9, 1,1, 1,1, 1,0,0},
+        {"LpPool p=1 1x5 stride4x10 pad_left2 dil_h4 W=76",
+                1,3,9,76, 3,8, 1,5, 4,10, 0,2, 4,1, 2,1,0},
     };
 
     const int n_tests = (int)(sizeof(tests) / sizeof(tests[0]));

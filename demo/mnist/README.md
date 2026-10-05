@@ -61,8 +61,9 @@ static: the I/O names and active-kernel set differ per model.
 
 * Python 3.10+
 * `pip install -r requirements.txt`
-* Generated driver sources for the four kernels (HLS; the RTL MatmulKernel's
-  and VectorOPKernel's by `driver_matmul_rtl` / `driver_vectorop_rtl`).  These
+* Generated driver sources for the four kernels (ConvKernel's by its HLS
+  synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's by
+  `driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`).  These
   are produced by the top-level CMake build:
 
   ```bash
@@ -123,8 +124,8 @@ Or step-by-step (lets you iterate without re-downloading):
 ```
 
 Sample output (host `~/projects/axi_demo/demo/mnist`, board at
-`192.168.100.8`, full 10 000-image MNIST test set; the run of 2026-10-04 on
-bitstream `1d28630fbfa4`):
+`192.168.100.8`, full 10 000-image MNIST test set; the run of 2026-10-05 on
+bitstream `dbb320fb7297`, without `--verbose`, so no per-model bench lines):
 
 ```
 $ ./run_demo.py
@@ -212,26 +213,21 @@ Preflight (remote)
     OK      work_dir parent writable (/tmp)      /tmp/mnist_demo
 
 Uploading dataset → /tmp/mnist_demo/data
-  dataset  → OK       2.4s
+  dataset  → OK       1.8s
 
 mnist_convnet
-  upload   → OK       0.4s
-  cmake    → OK       1.1s
-  make     → OK       3.0s
-    bench_mnist: dataset=10000 images, iters=10000, warmup=50
-                 input_numel=784, output_numel=10, classes=10
-    progress: 10000/10000 (100.0%) acc=98.92% mean=0.260ms rate=3813.0ips
-  run      → OK                3.0s
-    accuracy = 98.92%   mean = 0.260 ms   throughput = 3850.9 img/s
+  upload   → OK       0.5s
+  cmake    → OK       3.5s
+  make     → OK       3.5s
+  run      → OK       2.8s
+    accuracy = 98.92%   mean = 0.256 ms   throughput = 3904.9 img/s
 
 mnist_lenet
-  upload   → OK       2.0s
+  upload   → OK       1.8s
   cmake    → OK       0.9s
-  make     → OK       2.7s
-    bench_mnist: dataset=10000 images, iters=10000, warmup=50
-                 input_numel=784, output_numel=10, classes=10
-  run      → OK               28.6s
-    accuracy = 97.35%   mean = 2.831 ms   throughput = 353.3 img/s
+  make     → OK       3.1s
+  run      → OK      27.6s
+    accuracy = 97.35%   mean = 2.743 ms   throughput = 364.5 img/s
 
 cleanup /tmp/mnist_demo
 per-step logs written to demo/mnist/build/logs
@@ -240,8 +236,8 @@ per-step logs written to demo/mnist/build/logs
 
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
-  mnist_convnet  OK       98.92%      0.260      0.259      0.267     3850.9
-  mnist_lenet    OK       97.35%      2.831      2.830      2.839      353.3
+  mnist_convnet  OK       98.92%      0.256      0.256      0.263     3904.9
+  mnist_lenet    OK       97.35%      2.743      2.743      2.750      364.5
 ```
 
 Notable behaviour visible in the run:

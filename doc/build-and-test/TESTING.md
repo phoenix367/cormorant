@@ -6,8 +6,8 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1647 tests); the chat app (188 tests) |
-| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel and VectorOPKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel and VectorOPKernel in Verilator against the same fixtures (`ctest`) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1648 tests); the chat app (188 tests) |
+| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel, VectorOPKernel and PoolingKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel, VectorOPKernel and PoolingKernel in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1647 tests in 75 modules (all pass, none skipped; the first run
+# Run all 1648 tests in 75 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
@@ -191,18 +191,25 @@ jobs checked against the HLS kernel's C++ under randomised AXI timing;
 `VectorOpRtlDriver` checks the C driver's register table against the RTL;
 `make lint_vectorop_rtl` is its lint.
 
+The SystemVerilog PoolingKernel (`kernels/pool_rtl/`,
+[POOL_RTL_KERNEL](../kernels/POOL_RTL_KERNEL.md)) likewise: `TestPoolRtl`
+(in plain `make`) runs the 45 checked-in PoolingKernel fixtures — the ones
+`TestPoolingSim --dump-data` writes — plus 200 random jobs checked against
+the HLS kernel's C++ under randomised AXI timing; `PoolRtlDriver` checks the
+C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
+
 ---
 
 ## 3. Hardware simulation (Vivado, no board)
 
 RTL behavioural simulation in Vivado xsim — no board required, but the
-per-kernel IP archives (HLS synthesis; the RTL MatmulKernel's and VectorOPKernel's packaging) must exist first.
+per-kernel IP archives (ConvKernel's HLS synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's packaging) must exist first.
 
 ```bash
 cd build
 
-# Prerequisite: the four kernel IPs (two HLS syntheses + the RTL MatmulKernel's
-# and VectorOPKernel's packaging, ~5–10 min); Vitis's
+# Prerequisite: the four kernel IPs (ConvKernel's HLS synthesis + the RTL
+# MatmulKernel's, VectorOPKernel's and PoolingKernel's packaging, ~5–10 min); Vitis's
 # settings64.sh puts vitis-run, vivado and xclbinutil on PATH
 source <Xilinx>/2025.2/Vitis/settings64.sh
 make synthesize_kv260
@@ -217,12 +224,12 @@ make behavior_test            # all four in sequence
 make sim_hw_kv260
 ```
 
-Each `behavior_test_<k>` depends on `synthesize_<k>_kv260` (MatmulKernel,
-VectorOPKernel: `package_matmul_rtl`, `package_vectorop_rtl`) (so it
-re-synthesises its kernel and rebuilds its driver directory) and fails when
+Each `behavior_test_<k>` depends on its kernel's IP target —
+`synthesize_conv_kv260`, `package_matmul_rtl`, `package_vectorop_rtl`,
+`package_pool_rtl` — (so it rebuilds its kernel's IP and driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
-manifests currently hold 119 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 43 Pool
+manifests currently hold 119 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 45 Pool
 cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …): each
 kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);
@@ -287,15 +294,16 @@ The two fields you must set are:
 
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
-  driver sources for each kernel (Vitis HLS generates ConvKernel's and
-  PoolingKernel's; `make driver_matmul_rtl` / `make driver_vectorop_rtl`
-  write MatmulKernel's and VectorOPKernel's; the example's
+  driver sources for each kernel (Vitis HLS generates ConvKernel's;
+  `make driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`
+  write MatmulKernel's, VectorOPKernel's and PoolingKernel's; the example's
   `../build/…` paths, relative to `inference-scheduler/`, fit a build in
   `<repo>/build`), e.g.:
 
   ```
   "VectorOPKernel": "<repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src"
   "ConvKernel":     "<repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
+  "PoolKernel":     "<repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
   ```
 
 The `remote.uio_devices` map must list the UIO sysfs name for every

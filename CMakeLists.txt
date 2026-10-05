@@ -15,28 +15,31 @@ endif()
 project(axi_kernels)
 
 # ---------------------------------------------------------------------------
-# All four kernels — Conv and Pool in Vitis HLS, MatmulKernel and
-# VectorOPKernel in SystemVerilog (kernels/matmul_rtl, kernels/vectorop_rtl;
-# kernels/matmul and kernels/vectorop keep the retired HLS kernels' C++ as
-# their reference models).  Each subdirectory is a self-contained CMake
-# project.
+# All four kernels — Conv in Vitis HLS, MatmulKernel, VectorOPKernel and
+# PoolingKernel in SystemVerilog (kernels/matmul_rtl, kernels/vectorop_rtl,
+# kernels/pool_rtl; kernels/matmul, kernels/vectorop and kernels/pool keep the
+# retired HLS kernels' C++ as their reference models).  Each subdirectory is a
+# self-contained CMake project.
 #
 # Simulation test targets (no hardware needed):
 #   make TestSimulation   — VectorOPKernel's C++ reference model
 #   make TestConvRef      — ConvKernel
 #   make TestMatmulRef    — MatmulKernel   (TestMatmulBlas if BLAS available)
-#   make TestPoolingSim   — PoolingKernel
+#   make TestPoolingSim   — PoolingKernel's C++ reference model
 #   make TestMatmulRtl    — MatmulKernel in SystemVerilog (kernels/matmul_rtl,
 #                           Verilator)
 #   make TestVectorOpRtl  — VectorOPKernel in SystemVerilog (kernels/vectorop_rtl,
 #                           Verilator)
+#   make TestPoolRtl      — PoolingKernel in SystemVerilog (kernels/pool_rtl,
+#                           Verilator)
 #
 # IP export targets (requires Vitis / Vivado):
 #   make synthesize_<platform>              — all four kernel IPs
-#   make synthesize_<kernel>_<platform>     — one HLS kernel (conv, pool)
+#   make synthesize_conv_<platform>         — the HLS kernel (conv)
 #   make package_matmul_rtl                 — the MatmulKernel IP (SystemVerilog,
 #                                             Vivado; its HLS synthesis was retired)
 #   make package_vectorop_rtl               — the VectorOPKernel IP (likewise)
+#   make package_pool_rtl                   — the PoolingKernel IP (likewise)
 #
 # Platform definitions live in platforms/*.json (shared by all kernels).
 # ---------------------------------------------------------------------------
@@ -60,6 +63,7 @@ add_subdirectory(kernels/matmul)
 add_subdirectory(kernels/pool)
 add_subdirectory(kernels/matmul_rtl)
 add_subdirectory(kernels/vectorop_rtl)
+add_subdirectory(kernels/pool_rtl)
 
 # The hardware build's VectorOPKernel is the SystemVerilog one
 # (kernels/vectorop_rtl; VLNV xilinx.com:hls:VectorOPKernel:1.0, the HLS
@@ -92,6 +96,22 @@ if(_axi_mm_err OR NOT _axi_mm_impl STREQUAL "rtl")
                         "the HLS kernel's synthesis was retired), got '${_axi_mm_impl}'")
 endif()
 
+# The hardware build's PoolingKernel is the SystemVerilog one (kernels/pool_rtl;
+# VLNV xilinx.com:hls:PoolingKernel:1.0, the HLS kernel's ports, register map
+# and m_axi bus parameters).  The Vitis HLS kernel's synthesis was retired
+# (doc/plans/POOL_RTL_PLAN.md phase 3); kernels/pool keeps its C++ as the
+# oracle and fixture generator.  The phase-1 switch AXI_POOL_IMPL is gone: a
+# cache that still asks for hls is refused.
+if(DEFINED CACHE{AXI_POOL_IMPL})
+    if(NOT AXI_POOL_IMPL STREQUAL "rtl")
+        message(FATAL_ERROR
+            "AXI_POOL_IMPL=${AXI_POOL_IMPL}: the HLS PoolingKernel's synthesis "
+            "was retired (doc/plans/POOL_RTL_PLAN.md); the hardware build always "
+            "uses kernels/pool_rtl.  Re-run cmake with -UAXI_POOL_IMPL.")
+    endif()
+    unset(AXI_POOL_IMPL CACHE)
+endif()
+
 # ---------------------------------------------------------------------------
 # run_tests — build every C-simulation test executable, then run ctest.
 # `make test` (CTest's built-in target) only runs the tests; it does not
@@ -111,6 +131,9 @@ if(TARGET TestMatmulRtl)
 endif()
 if(TARGET TestVectorOpRtl)
     list(APPEND _AXI_TEST_TARGETS TestVectorOpRtl)
+endif()
+if(TARGET TestPoolRtl)
+    list(APPEND _AXI_TEST_TARGETS TestPoolRtl)
 endif()
 
 add_custom_target(run_tests
@@ -145,8 +168,8 @@ foreach(_PF IN LISTS AXI_PLATFORM_FILES)
             package_vectorop_rtl
             "synthesize_conv_${_pname}"
             package_matmul_rtl
-            "synthesize_pool_${_pname}"
-        COMMENT "IP export: all kernels for platform '${_pname}' (the RTL VectorOP and Matmul kernels, Conv and Pool HLS)"
+            package_pool_rtl
+        COMMENT "IP export: all kernels for platform '${_pname}' (the RTL VectorOP, Matmul and Pool kernels, Conv HLS)"
     )
     message(STATUS "axi_kernels: aggregate target 'synthesize_${_pname}'")
 
@@ -213,11 +236,11 @@ if(EXISTS "${_HW_REPO}/build.sh")
         COMMAND "${CMAKE_COMMAND}" -E create_symlink
                 "${_HW_K}/conv/kv260/conv_kv260/hls/impl/ip" "${_HW_IP_REPO}/conv"
         COMMAND "${CMAKE_COMMAND}" -E create_symlink
-                "${_HW_K}/pool/kv260/pool_kv260/hls/impl/ip" "${_HW_IP_REPO}/pool"
+                "${CMAKE_BINARY_DIR}/rtl_ip/PoolingKernel_ip" "${_HW_IP_REPO}/pool"
         COMMAND "${CMAKE_COMMAND}" -E create_symlink
                 "${CMAKE_BINARY_DIR}/rtl_ip/MatmulKernel_ip" "${_HW_IP_REPO}/matmul"
-        DEPENDS package_matmul_rtl package_vectorop_rtl
-        COMMENT "IP repository for the KV260 build: the RTL VectorOP and Matmul kernels, Conv and Pool HLS"
+        DEPENDS package_matmul_rtl package_vectorop_rtl package_pool_rtl
+        COMMENT "IP repository for the KV260 build: the RTL VectorOP, Matmul and Pool kernels, Conv HLS"
         VERBATIM)
 
     add_custom_target(build_hw_kv260
@@ -257,11 +280,11 @@ endif()
 #   make behavior_test              — all four kernels in sequence
 #
 # Each per-kernel target:
-#   - depends on `synthesize_<k>_kv260` (IP catalogue must exist at the
+#   - depends on `synthesize_conv_kv260` (IP catalogue must exist at the
 #     revision the test stand's .xpr's .xci references); the RTL kernels on
-#     `package_matmul_rtl` / `package_vectorop_rtl` (the test stand puts the
-#     instance widths back to the IP's defaults after the upgrade: matmul
-#     gmem2 32 -> 128)
+#     `package_matmul_rtl` / `package_vectorop_rtl` / `package_pool_rtl` (the
+#     test stand puts the instance widths back to the IP's defaults after the
+#     upgrade: matmul gmem2 32 -> 128)
 #   - reads its fixtures from the source tree at hw/test_data/<dir>/ — the
 #     same goldens are used on every machine, so any divergence is a kernel
 #     change, not a fixture-regeneration drift.  `gen_<k>_test_data` is left
@@ -274,14 +297,14 @@ endif()
 # Kernel-name asymmetry:
 #   axi_kernel  | test-stand | hls_project    | fixture dir under hw/test_data/
 #   conv        | conv       | conv_kv260     | conv_test_data
-#   pool        | pooling    | pool_kv260     | pool_test_data
+#   pool        | pooling    | (RTL IP)       | pool_test_data
 #   matmul      | matmul_op  | (RTL IP)       | matmul_test_data
 #   vectorop    | vector_op  | (RTL IP)       | vecop_test_data
 #
 # IP repo path resolution: Vitis HLS exports the IP catalogue into a
 # directory containing component.xml.  Vivado's set_property ip_repo_paths
 # needs that exact directory; passing a parent does NOT work.  The path
-# depends on the HLS flow: the Vitis unified component flow (conv and pool)
+# depends on the HLS flow: the Vitis unified component flow (conv)
 # puts it under <hls_project>/hls/impl/ip/, the legacy
 # open_project/open_solution flow under <hls_project>/solution1/impl/ip/.  The
 # per-kernel IP subpath is therefore the 5th column of _BEHAVIOR_TESTS below;
@@ -294,7 +317,7 @@ if(EXISTS "${_TS_REPO}/Makefile")
     #          fixture-dir name | IP-repo subpath (flow-dependent, see above)
     set(_BEHAVIOR_TESTS
         "conv|conv|conv_kv260|conv_test_data|hls/impl/ip"
-        "pool|pooling|pool_kv260|pool_test_data|hls/impl/ip"
+        "pool|pooling|-|pool_test_data|-"
         "matmul|matmul_op|-|matmul_test_data|-"
         "vectorop|vector_op|-|vecop_test_data|-"
     )
@@ -318,6 +341,9 @@ if(EXISTS "${_TS_REPO}/Makefile")
         elseif(_bt_kernel STREQUAL "vectorop")
             set(_bt_iprepo "${CMAKE_BINARY_DIR}/rtl_ip/VectorOPKernel_ip")
             set(_bt_ipdep  package_vectorop_rtl)
+        elseif(_bt_kernel STREQUAL "pool")
+            set(_bt_iprepo "${CMAKE_BINARY_DIR}/rtl_ip/PoolingKernel_ip")
+            set(_bt_ipdep  package_pool_rtl)
         endif()
 
         # Pin the scoreboard JSON report to a known path in the build tree.

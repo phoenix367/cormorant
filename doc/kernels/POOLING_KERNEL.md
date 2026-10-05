@@ -19,6 +19,22 @@ sqrt for LP-pool. All six are folded into the architecture described
 below; the full optimisation log with measured timings lives in
 [POOL_OPTIMISATION.md](POOL_OPTIMISATION.md).
 
+> **Retired from the hardware build (2026-10-05, POOL_RTL_PLAN phase 3).**
+> The bitstream carries a SystemVerilog drop-in with the same ports,
+> registers, m_axi bus parameters, DDR access pattern and results,
+> `kernels/pool_rtl/`: [POOL_RTL_KERNEL](POOL_RTL_KERNEL.md).
+> This kernel's HLS synthesis and co-simulation targets are gone; its C++
+> (`PoolingKernel.cpp`, `TestPoolingSim`) stays as the reference model and
+> writes the fixtures the RTL kernel is tested against.  The register map,
+> contract, geometry, arithmetic and scheduler integration below hold for
+> both kernels.  One fix came with the RTL testbench: with `stride_w > 8`
+> and left padding the line-buffer read of a padded position could take the
+> next position's column bank, so that position read a wrong word; the C++
+> was fixed on 2026-10-05 (fixtures 43–44; the HLS IP synthesised before the
+> fix has the bug, the RTL never had it; no shipped model has such a pool — the largest
+> pool stride of the 218 models is 4).  The microarchitecture, synthesis and
+> resource sections describe the retired HLS kernel.
+
 ---
 
 ## 1. AXI Interface
@@ -46,12 +62,13 @@ below; the full optimisation log with measured timings lives in
 | `lp_order` | `unsigned` | 1 or 2 (only for LpPool) |
 | `count_include_pad` | `unsigned` | 0 or 1 (only for AveragePool) |
 
-64-bit AXI addressing is configured in the synthesis TCL
-(`config_interface -m_axi_addr64`).  The data width of both ports is
+64-bit AXI addressing was configured in the retired synthesis TCL
+(`config_interface -m_axi_addr64`; the RTL kernel's addresses are 64-bit
+too).  The data width of both ports is
 fixed at 128 bits by the C++ port type (`PoolWord = ap_uint<128>`,
-`kPoolPortBits` in `PoolingKernel.h`); the top-level `AXI_BUS_WIDTH`
-CMake cache variable only feeds `config_interface
--m_axi_max_widen_bitwidth` and does not change these ports.  The block
+`kPoolPortBits` in `PoolingKernel.h`) and in the RTL; the top-level `AXI_BUS_WIDTH`
+CMake cache variable only fed `config_interface
+-m_axi_max_widen_bitwidth` and did not change these ports.  The block
 design's `C_M_AXI_GMEM*_DATA_WIDTH` instance parameters must equal the
 exported IP defaults (128).
 
@@ -537,7 +554,7 @@ binary embeds the ROM directly (`kInvDenomLutBits`) and the
 
 ## 7. Test Coverage (`TestPoolingSim.cpp`)
 
-49 test cases (43 geometries, the two strict AVG sub-cases and four
+51 test cases (45 geometries, the two strict AVG sub-cases and four
 out-of-contract windows) compiled
 with GCC against the Vitis HLS headers (no HLS tool run). Tolerance:
 `kTol = 0.02f`; y is handed to the kernel as a 128-bit word buffer
@@ -553,6 +570,7 @@ checked afterwards (the byte-strobe contract of the y port).
 | Wide-W (`in_w > kMaxLineBufCols`) | MaxPool W=128 3×3 pad1, AvgPool W=96 3×3 pad1, MaxPool W=128 2×2 s2 — plus batch=2 variants |
 | Word tails / alignment (§2.14) | W=7 (< 1 word), W=13 3×3 s1 (odd out_w), W=11 3×3 s2, W=9 C=1 AvgPool s2, 28×112 C=2 MaxPool 3×3 s2 (the ResNet stem shape, W-tiled), 7×7 stride 8 (one-column groups), 7×1 dil_h=2 stride_h=4 (no-prefetch mode), 1×1 pooling at W=64 and W=65, C=9 (c_valid = 1 tail tile), LpPool p=2 batch=2 C=3 W=7, GlobalAvgPool 7×7 C=16 |
 | AVG-pool numerical | 5×5 pad=2 strict-equality (validates fixed-point reciprocal vs ref) |
+| Bank collision (2026-10-05) | `stride_w > 8` with left padding: AvgPool 3×3 stride 9 pad 1 W=40, LpPool p=1 1×5 stride 4×10 pad_left 2 dil_h 4 W=76 (both failed before the line-buffer read fix) |
 | Out of contract | `pool_h` = kMaxPoolH + 1, `pool_w` = kMaxPoolW + 1, a dilated height past `kMaxLineBufRows`, a dilated width past `kMaxLineBufCols`: the kernel returns with y untouched |
 
 The dup-read predictor `expected_dup_reads_for(tc)` simulates the
@@ -560,10 +578,11 @@ kernel's exact line-buffer + W-tile load schedule, so
 `dup_reads=actual/predicted` always shows cache-aware expectations and
 adapts when `kMaxLineBufCols`, `kTileC`, or geometry change.
 
-The RTL behavior test (`make behavior_test_pool`) runs the same 43
-geometry cases on Vivado xsim against the synthesised RTL, reporting
-per-test cycle counts, and checks the poisoned y tail lanes after every
-case.
+The RTL behavior test (`make behavior_test_pool`) runs the same 45
+geometry cases on Vivado xsim against the RTL kernel's IP
+(`package_pool_rtl`), reporting per-test cycle counts, and checks the
+poisoned y tail lanes after every case; `TestPoolRtl` runs them in
+Verilator ([POOL_RTL_KERNEL](POOL_RTL_KERNEL.md) §4).
 
 ---
 
@@ -608,33 +627,30 @@ comparison.
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run).
 make TestPoolingSim && ctest -R TestPoolingSim
 
-# HLS synthesis + IP export for KV260.
-make synthesize_pool_kv260
+# The RTL fixtures from this model (TestPoolingSim --dump-data) into
+# build/pool_test_data/; the behaviour tests read the checked-in copies.
+make gen_pool_test_data
 
-# RTL behavior test on Vivado xsim — depends on synthesize_pool_kv260;
+# RTL behavior test on Vivado xsim (the RTL IP, package_pool_rtl);
 # reads the checked-in fixtures under hw/test_data/pool_test_data/.
 make behavior_test_pool
-
-# Optional: regenerate the RTL fixtures (TestPoolingSim --dump-data)
-# into build/pool_test_data/, and C/RTL co-simulation (slow, minutes).
-make gen_pool_test_data
-make cosim_pool_kv260
 ```
 
-The synthesis target reads `platforms/kv260.json` (specifies `part`,
-optional `board`, `clock` — 150 MHz for the KV260 — and the
-`kernels.pool` compile-time constants) and invokes Vitis HLS via
-`Synthesis.tcl.in`, which opens a Vitis unified component
-(`open_component`, directory `pool_kv260`), adds the kernel source,
-runs `csynth_design`, and exports an IP catalog archive to
-`build/kernels/pool/kv260/ip_catalog.zip`. Adding a new platform is a
-JSON-file-plus-cmake-rerun operation; no C++ edits required.
+The retired synthesis targets (`synthesize_pool_<platform>`,
+`cosim_pool_<platform>`, removed in POOL_RTL_PLAN phase 3) read
+`platforms/kv260.json` (`part`, optional `board`,
+`clock` — 150 MHz for the KV260 — and the `kernels.pool` compile-time
+constants) and ran Vitis HLS through `Synthesis.tcl.in` / `Cosim.tcl.in`: a Vitis unified component
+(`open_component`, directory `pool_kv260`), `csynth_design` (and
+`cosim_design`), an IP-catalog export.  The hardware build packages the
+RTL kernel instead (`make package_pool_rtl`); its `rtl/pl_pkg.sv` holds the
+`kernels.pool` constants, checked against the platform JSON at configure
+time.
 
-The verification workflow is also packaged as a
-[`pool-verify` skill](../../.claude/skills/pool-verify/SKILL.md) that
-runs the four gates sequentially (C-sim → synthesis → behavior test →
-per-test timing diff vs the previous run) and reports a single
-summary.
+The verification workflow is packaged as the
+[`kernel-verify` skill](../../.claude/skills/kernel-verify/SKILL.md) with
+the argument `pool` (C-sim → Verilator testbench and lint → out-of-context
+synthesis → behaviour test → per-test timing diff vs the previous run).
 
 ---
 
@@ -642,14 +658,13 @@ summary.
 
 | File | Purpose |
 |------|---------|
-| `kernels/pool/kernel/PoolingKernel.cpp` | HLS kernel implementation — all four DATAFLOW stages, `poly_sqrt`, `inv_denom_lookup` ROM |
+| `kernels/pool/kernel/PoolingKernel.cpp` | the retired HLS kernel — all four DATAFLOW stages, `poly_sqrt`, `inv_denom_lookup` ROM; the RTL kernel's reference model |
 | `kernels/pool/include/PoolingKernel.h` | Kernel declaration, 128-bit `PoolWord` port type and lane helpers, cosim depths, `saturate_cast<T>` |
 | `kernels/pool/include/PoolingKernelDebug.h` | C-sim-only duplicate-DDR-read counter used by the dup-read check |
 | `kernels/pool/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, all six per-platform tile constants, `pool_type` codes, MaxPool sentinels) |
 | `kernels/pool/test/TestPoolingSim.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
-| `kernels/pool/scripts/Synthesis.tcl.in` | Vitis HLS TCL template |
-| `kernels/pool/scripts/Cosim.tcl.in` | Vitis HLS C synthesis + C/RTL co-simulation template (`cosim_pool_<platform>`) |
-| `kernels/pool/CMakeLists.txt` | Per-platform synthesis target generation; `pool_load_constants` reads `kernels.pool` from each platform JSON |
+| `kernels/pool_rtl/` | the SystemVerilog kernel of the hardware build ([POOL_RTL_KERNEL](POOL_RTL_KERNEL.md)) |
+| `kernels/pool/CMakeLists.txt` | The C++ model, `TestPoolingSim`, `gen_pool_test_data`; `pool_load_constants` reads `kernels.pool` from the platform JSON |
 | `platforms/<name>.json` | Per-platform FPGA part + clock + `kernels.pool` constants (single source of truth) |
 | `inference-scheduler/src/_pool_hw_config.py` | Python validator that re-reads `kernels.pool` from the same JSON |
 | `inference-scheduler/src/nodes.py` | `PoolNode` (ONNX → kernel params + HW-bound validation) |

@@ -1,0 +1,6 @@
+`verilator_config
+// Port name fixed by the HLS interface contract.
+lint_off -rule SYMRSVDWORD -file "*/pl_core.sv" -match "*interrupt*"
+lint_off -rule SYMRSVDWORD -file "*/PoolingKernel.v" -match "*interrupt*"
+// Partially used address vectors (16-byte aligned bases, word-aligned AXI-Lite addresses).
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"

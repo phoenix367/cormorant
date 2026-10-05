@@ -61,9 +61,9 @@ demo/image_classification/
 ### Host
 
 * Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx, onnxsim).
-* Generated driver sources for the four kernels (HLS; the RTL
-  MatmulKernel's and VectorOPKernel's by `driver_matmul_rtl` /
-  `driver_vectorop_rtl`):
+* Generated driver sources for the four kernels (ConvKernel's by its HLS
+  synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's by
+  `driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`):
 
   ```bash
   # from the repo root

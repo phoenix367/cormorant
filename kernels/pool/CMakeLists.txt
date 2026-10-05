@@ -95,9 +95,9 @@ message(STATUS "PoolingKernel: constants from ${AXI_DEFAULT_PLATFORM_JSON}: "
                "OW_PARALLEL=${POOL_OW_PARALLEL}")
 
 # Re-run cmake configure automatically if the platform JSON changes.  The
-# generated Config.h, the per-platform synth Config.h, and `make`-time
-# rebuilds all depend on JSON values; without this, edits would not
-# regenerate Config.h until the user reruns cmake by hand.
+# generated Config.h and `make`-time rebuilds depend on JSON values; without
+# this, edits would not regenerate Config.h until the user reruns cmake by
+# hand.
 set_property(DIRECTORY APPEND PROPERTY
     CMAKE_CONFIGURE_DEPENDS "${AXI_DEFAULT_PLATFORM_JSON}")
 foreach(_PF IN LISTS AXI_PLATFORM_FILES)
@@ -115,8 +115,8 @@ configure_file(
 )
 
 # ---------------------------------------------------------------------------
-# Kernel library — PoolingKernel.cpp compiled as a static lib so that both
-# the C++ simulation target and the future HLS synthesis target can link it.
+# Kernel library — PoolingKernel.cpp (the RTL kernel's reference model)
+# compiled as a static lib for the C++ simulation target.
 # ---------------------------------------------------------------------------
 add_library(pool_kernel STATIC
     kernel/PoolingKernel.cpp
@@ -226,167 +226,7 @@ message(STATUS "PoolingKernel: Data_t=${POOL_DATA_TYPE}  "
                "MAX_LINE_BUF_COLS=${POOL_MAX_LINE_BUF_COLS}  "
                "OW_PARALLEL=${POOL_OW_PARALLEL}")
 
-# ---------------------------------------------------------------------------
-# HLS synthesis targets — one per platform JSON file in platforms/.
-#
-# Requires Vitis HLS (vitis-run for 2024.x+, vitis_hls for older versions).
-# Each JSON must have a "part" field; "board" and "clock" are optional.
-#
-# Generated targets:
-#   make synthesize_<name>   — C synthesis + ip_catalog export for that part
-# ---------------------------------------------------------------------------
-find_program(POOL_VITIS_HLS NAMES vitis-run vitis_hls
-    HINTS
-        $ENV{XILINX_HLS}/bin
-        $ENV{XILINX_VITIS}/bin
-        /mnt/data/xilinx/2025.2/Vitis/bin
-    DOC "Vitis HLS executable (vitis-run for 2024.x+, vitis_hls for older)")
-
-if(POOL_VITIS_HLS)
-    if(POOL_VITIS_HLS MATCHES "vitis-run")
-        set(POOL_HLS_TCL_FLAG "--tcl")
-    else()
-        set(POOL_HLS_TCL_FLAG "-f")
-    endif()
-    message(STATUS "PoolingKernel: HLS synthesis enabled via ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}")
-else()
-    message(STATUS "PoolingKernel: vitis_hls / vitis-run not found — synthesis targets disabled")
-endif()
-
-if(POOL_VITIS_HLS)
-    set(POOL_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/kernel/PoolingKernel.cpp")
-
-    set(_POOL_PLATFORM_FILES "${AXI_PLATFORM_FILES}")
-    foreach(_POOL_PLATFORM_FILE IN LISTS _POOL_PLATFORM_FILES)
-        get_filename_component(_pname "${_POOL_PLATFORM_FILE}" NAME_WE)
-        file(READ "${_POOL_PLATFORM_FILE}" _pjson)
-
-        # Required: FPGA part string
-        string(JSON _p_part ERROR_VARIABLE _e1 GET "${_pjson}" part)
-        if(_e1)
-            message(WARNING "PoolingKernel platform '${_pname}': missing 'part' — skipping.")
-            continue()
-        endif()
-
-        # Optional: board identifier
-        string(JSON _p_board ERROR_VARIABLE _e GET "${_pjson}" board)
-        if(_e)
-            set(_p_board "")
-        endif()
-
-        # Optional: target clock in MHz (default 300)
-        string(JSON _p_clock ERROR_VARIABLE _e GET "${_pjson}" clock)
-        if(_e)
-            set(_p_clock "300")
-        endif()
-
-        # Per-platform build directory
-        set(_p_build_dir "${CMAKE_CURRENT_BINARY_DIR}/${_pname}")
-        file(MAKE_DIRECTORY "${_p_build_dir}")
-
-        # Per-platform pool constants — drives this platform's Config.h
-        # rather than the C-sim default values, so each synthesised IP
-        # uses bounds tuned for that platform.  Stash the C-sim defaults
-        # so we can restore them after configure_file().
-        set(_save_TILE_C            "${POOL_TILE_C}")
-        set(_save_MAX_KH            "${POOL_MAX_KH}")
-        set(_save_MAX_KW            "${POOL_MAX_KW}")
-        set(_save_MAX_LINE_BUF_ROWS "${POOL_MAX_LINE_BUF_ROWS}")
-        set(_save_MAX_LINE_BUF_COLS "${POOL_MAX_LINE_BUF_COLS}")
-        set(_save_OW_PARALLEL       "${POOL_OW_PARALLEL}")
-
-        pool_load_constants("${_POOL_PLATFORM_FILE}" POOL)
-
-        # Generate a platform-specific Config.h using these constants.
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/include/Config.h.in"
-            "${_p_build_dir}/Config.h"
-            @ONLY)
-
-        set(POOL_TILE_C            "${_save_TILE_C}")
-        set(POOL_MAX_KH            "${_save_MAX_KH}")
-        set(POOL_MAX_KW            "${_save_MAX_KW}")
-        set(POOL_MAX_LINE_BUF_ROWS "${_save_MAX_LINE_BUF_ROWS}")
-        set(POOL_MAX_LINE_BUF_COLS "${_save_MAX_LINE_BUF_COLS}")
-        set(POOL_OW_PARALLEL       "${_save_OW_PARALLEL}")
-
-        if(_p_board)
-            set(POOL_BOARD_OPTION "set_part {${_p_part}} -board {${_p_board}}")
-        else()
-            set(POOL_BOARD_OPTION "set_part {${_p_part}}")
-        endif()
-
-        set(POOL_HLS_PROJECT_NAME  "pool_${_pname}")
-        set(POOL_SRC_SYNTHESIS     "${POOL_KERNEL_SRC}")
-        set(POOL_SYNTHESIS_FLAGS
-            "-O3 -I${CMAKE_CURRENT_SOURCE_DIR}/include -I${_p_build_dir}")
-        set(POOL_TARGET_CLOCK_TCL  "${_p_clock}")
-        set(POOL_IP_OUTPUT_DIR     "${_p_build_dir}/ip_catalog")
-
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Synthesis.tcl.in"
-            "${_p_build_dir}/synthesize_${_pname}.tcl"
-            @ONLY)
-
-        # Clean stale HLS project + IP catalog so old Verilog from a prior
-        # run isn't re-exported into the IP archive (which then breaks
-        # downstream Vivado packaging when source files have been removed
-        # or renamed since the last synthesis).
-        add_custom_target(
-            "synthesize_pool_${_pname}"
-            COMMAND ${CMAKE_COMMAND} -E rm -rf
-                    "${_p_build_dir}/${POOL_HLS_PROJECT_NAME}"
-                    "${POOL_IP_OUTPUT_DIR}"
-            COMMAND ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}
-                    "${_p_build_dir}/synthesize_${_pname}.tcl"
-            WORKING_DIRECTORY "${_p_build_dir}"
-            COMMENT "HLS synthesis: PoolingKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
-            DEPENDS
-                "${POOL_KERNEL_SRC}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include/PoolingKernel.h"
-                "${_p_build_dir}/Config.h")
-
-        message(STATUS "PoolingKernel: synthesis target 'synthesize_pool_${_pname}' "
-                       "(${_p_part} @ ${_p_clock} MHz)")
-
-        # -------------------------------------------------------------------
-        # cosim_pool_<name> — C synthesis + RTL co-simulation in ONE run.
-        #
-        # csynth_design and cosim_design are sequenced in a single TCL (see
-        # Cosim.tcl.in), so one vitis-run invocation produces a component
-        # whose run summary covers both — `vitis -a <component>` then shows
-        # the cosim report (measured latency/II + actual hls::stream FIFO
-        # depths from -enable_dataflow_profiling) alongside synthesis.
-        #
-        # Separate component (pool_<name>_cosim) so it never clobbers the
-        # synthesize target's pool_<name> component / exported IP.  cosim
-        # RTL-simulates the whole TestPoolingSim.cpp test bench, so this
-        # target is slow (minutes) and is intentionally NOT a dependency of
-        # anything.
-        # -------------------------------------------------------------------
-        set(POOL_COSIM_COMPONENT "pool_${_pname}_cosim")
-        set(POOL_TB_SYNTHESIS    "${CMAKE_CURRENT_SOURCE_DIR}/test/TestPoolingSim.cpp")
-
-        configure_file(
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Cosim.tcl.in"
-            "${_p_build_dir}/cosim_${_pname}.tcl"
-            @ONLY)
-
-        add_custom_target(
-            "cosim_pool_${_pname}"
-            COMMAND ${CMAKE_COMMAND} -E rm -rf
-                    "${_p_build_dir}/${POOL_COSIM_COMPONENT}"
-            COMMAND ${POOL_VITIS_HLS} ${POOL_HLS_TCL_FLAG}
-                    "${_p_build_dir}/cosim_${_pname}.tcl"
-            WORKING_DIRECTORY "${_p_build_dir}"
-            COMMENT "HLS synth + cosim: PoolingKernel for '${_pname}' (${_p_part} @ ${_p_clock} MHz)"
-            DEPENDS
-                "${POOL_KERNEL_SRC}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/include/PoolingKernel.h"
-                "${CMAKE_CURRENT_SOURCE_DIR}/test/TestPoolingSim.cpp"
-                "${_p_build_dir}/Config.h")
-
-        message(STATUS "PoolingKernel: cosim target 'cosim_pool_${_pname}' "
-                       "(${_p_part} @ ${_p_clock} MHz)")
-    endforeach()
-endif()
+# The HLS kernel's synthesis (synthesize_pool_<platform>, cosim_pool_<platform>)
+# was retired in doc/plans/POOL_RTL_PLAN.md phase 3: the hardware build's
+# PoolingKernel is the SystemVerilog one (kernels/pool_rtl), which runs this
+# C++ as its testbench oracle.
