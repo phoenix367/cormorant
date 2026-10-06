@@ -7,35 +7,31 @@ allowed-tools: Bash Read
 
 ## 0. Preconditions
 
-- The kernel passed `conv-verify` (or `kernel-verify`).  Do not put
-  an unverified IP on the board.
+- The kernel passed `kernel-verify`.  Do not put an unverified IP on the
+  board.
 - Board reachable: `ping 192.168.100.8`; SSH key `~/.ssh/kv260-testkey`.
 - Vitis env for `xclbinutil`: `source /mnt/data/xilinx/2025.2/Vitis/settings64.sh`.
 
 ## 1. Build the bitstream (~30 min, Vivado)
 
-The block design's `S_AXI_HPC0_FPD` and interconnect crossbar are
-128-bit; each kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the
-exported IP's own default (128 for every data port: the `ap_uint<128>`
-ports of Conv and every port of the SystemVerilog kernels,
-VectorOPKernel, MatmulKernel and PoolingKernel; the block designs still say 32 for MatmulKernel `c`, the
-retired HLS kernel's width, and the build scripts reset it to the IP's 128
-after the upgrade, `scripts/ip_defaults.tcl`).  The test stand's four block designs use the same widths with a
-128-bit PS port since 2026-09-24, so RTL timing matches the board.  Two things that
-look like shortcuts and are not (2026-09-24): (a) widening
-`C_M_AXI_*_DATA_WIDTH` on an instance in IP integrator — the HLS wrapper
-hard-codes `C_M_AXI_*_WSTRB_WIDTH = (<HLS bus width> / 8)` as a literal,
-the strobe port stays 4 bits (`0xzzzf` in sim) and only the low 4 bytes
-of every beat reach DDR (outputs [0],[1] right, rest zero); (b)
-`config_interface -m_axi_min_bitwidth 128` — the 16-bit ports then emit
-one single-beat partial-strobe write per element and the PS kept only
-lane-0 beats (every 8th output right, rest zero).  A port that must be
-wide is widened in the C++.  Keep that in a SEPARATE build tree so the 32-bit
-tree used by conv-verify and its timing baseline stay intact:
+All four kernels are SystemVerilog IPs (`package_<k>_rtl`; the last Vitis
+HLS kernel, ConvKernel, was retired in CONV_RTL_PLAN phase 3).  The block
+design's `S_AXI_HPC0_FPD` and interconnect crossbar are 128-bit; each
+kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the IP's own default
+(128 for every data port; the block designs still say 32 for MatmulKernel
+`c`, the retired HLS kernel's width, and the build scripts reset it to the
+IP's 128 after the upgrade, `scripts/ip_defaults.tcl`).  The test stand's
+four block designs use the same widths with a 128-bit PS port since
+2026-09-24, so RTL timing matches the board.  (With the HLS IPs, widening
+an instance's width in IP integrator or `config_interface
+-m_axi_min_bitwidth` corrupted writes — CONV_OPTIMISATION.md §2.31; the
+RTL IPs fix their widths, the parameters are read-only.)  The bitstream
+build uses its own tree, `build_hw128`, so it never disturbs the
+verification tree `build/` and its timing baselines:
 
 ```bash
-cmake -S . -B build_hw128 -DAXI_BUS_WIDTH=128     # once
-make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # synth the HLS ConvKernel + package the RTL MatmulKernel, VectorOPKernel and PoolingKernel + Vivado
+cmake -S . -B build_hw128 -DAXI_BUS_WIDTH=128     # once (the bus width no longer affects any IP)
+make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # package the four RTL IPs + Vivado
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 
@@ -48,11 +44,11 @@ change, prove it on the board: write the new register via /dev/mem and
 read it back (a register that is not there reads 0).  Post-synthesis utilisation:
 `hw/cormorant_hw_128/cormorant_hw_128.runs/synth_1/design_cormorant_wrapper_utilization_synth.rpt`;
 per-kernel numbers need `report_utilization -hierarchical` on the synth
-checkpoint (see CONV_OPTIMISATION.md §2.31 for the last set).
+checkpoint, or each kernel's own out-of-context run (`synth_<k>_rtl`).
 
 Never run a scheduler project generation (demo `generate_project.py`,
-`run_remote_tests.py`) while a conv synthesis is rewriting
-`build*/kernels/conv/.../drivers/` — the generated project will miss its
+`run_remote_tests.py`) while a driver target rewrites
+`build*/kernels/<k>_rtl/driver/` — the generated project would miss its
 driver headers and fail preflight.
 
 ## 2. Load it

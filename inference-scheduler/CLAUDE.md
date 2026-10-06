@@ -269,7 +269,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              75 pytest modules, 1648 tests, all pass (test_bert_base.py
+  test_*.py              75 pytest modules, 1651 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -360,11 +360,12 @@ with swapped operand roles: `C[N][M] = A[N][K]·B[K][M]` is a conv with
 `K % (16·kw) == 0`) as the weight and B as `x` (as is for `kw = 1`; a
 constant B read only by this MatMul is re-imaged by
 `nodes.conv_lowered_b_image` for `kw > 1`).  Engine and `(kw, out_w)` are
-chosen with `src/cost_model.py`: the geometry ranked by the conv-cycle-model
-port (`conv_cycles`), priced on the board (`conv_board_cycles`: weight-request
-bound slab fetches) against the MatmulKernel model of `kernels.matmul.impl`
-(the RTL kernel's structural model, or the HLS kernel's board-calibrated
-block model).  Batched MatMuls with per-item weights (attention)
+chosen with `src/cost_model.py`: the geometry ranked by the ConvKernel model of
+`kernels.conv.impl` (`conv_cycles`: the RTL kernel's pipeline recurrence
+`rtl_conv_walk`, or the HLS kernel's conv-cycle-model port), priced on the
+board (`conv_board_cycles`) against the MatmulKernel model of
+`kernels.matmul.impl` (the RTL kernel's structural model, or the HLS kernel's
+board-calibrated block model).  Batched MatMuls with per-item weights (attention)
 emit one `run_conv_at()` per item.  When every one-call plan is
 accumulator-limited (fewer than 16 output rows per chunk), the rows are
 split over several `run_conv_at()` calls, with B shared.  Without `--plan`

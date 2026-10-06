@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Compare a MatmulKernel / VectorOPKernel / PoolingKernel behaviour-test report
+"""Compare a MatmulKernel / VectorOPKernel / PoolingKernel / ConvKernel behaviour-test report
 against the previous run.
 
 Reads the freshly-written test-stand report
-(``<build>/kernels/<k>/kv260/{matmul_op,vector_op,pooling}_test_report.json``),
+(``<build>/kernels/<k>/kv260/{matmul_op,vector_op,pooling,conv}_test_report.json``),
 compares every case's ``duration_ns`` with the baseline, prints a delta table
 sorted by absolute movement, then overwrites the baseline snapshot
 (``<build>/kernels/<k>/kv260/<k>_timing_last.json``) with the current run so
@@ -32,6 +32,7 @@ KERNELS = {
     "matmul": ("MatmulKernel", "matmul_op_test_report.json", "matmul_timing_last.json"),
     "vectorop": ("VectorOPKernel", "vector_op_test_report.json", "vectorop_timing_last.json"),
     "pool": ("PoolingKernel", "pooling_test_report.json", "pool_timing_last.json"),
+    "conv": ("ConvKernel", "conv_test_report.json", "conv_timing_last.json"),
 }
 NAME_MAX = 64
 

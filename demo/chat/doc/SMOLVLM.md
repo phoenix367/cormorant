@@ -5,7 +5,7 @@
 Idefics3 connector and a small text model.  All three run on the FPGA
 kernels and the board's A53 cores, from one library, `libsmolvlm_256m.so`.
 
-- **Timing.**  The vision encoder takes 3.9 s per image (CHAT_PLAN §24),
+- **Timing.**  The vision encoder takes 3.4 s per image (3.9 s before the RTL ConvKernel: CHAT_PLAN §24, CONV_RTL_PLAN phase 2),
   then text comes at ~9.5 tokens/s.  A follow-up question about the same
   image reuses its encoding, so its first token comes after ~0.4 s.
 - **Images.**  Each image becomes one 512 × 512 tile (67 prompt tokens).

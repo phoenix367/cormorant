@@ -23,7 +23,7 @@ its config, its model and its generated project.  You need:
   UIO device names, the driver directories, the weights directory and
   the board lock.
 - **The driver sources** of VectorOPKernel, MatmulKernel and ConvKernel
-  (`make synthesize_conv_kv260 driver_vectorop_rtl driver_matmul_rtl`
+  (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl`
   in `build/`).
 - **The BERT model and `vocab.txt`.**  These are downloaded when missing:
   - `deploy.py` fetches `vocab.txt` before it touches the board;

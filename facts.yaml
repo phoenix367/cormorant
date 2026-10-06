@@ -85,8 +85,9 @@ facts:
       pool: {file: hw/test_data/pool_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
   fix: auto
   mentions:
-    - {file: .claude/skills/conv-verify/SKILL.md, regex: 'the (?P<conv>\d+)-case set runs'}
-    - {file: .claude/skills/conv-verify/SKILL.md, regex: 'for the (?P<conv>\d+) checked-in cases'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`hw/test_data/conv_test_data/` \((?P<conv>\d+) cases\)'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '\[ck\] ConvKernel: PASS  \((?P<conv>\d+)/\d+\)'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`TestConvRtl` runs the (?P<conv>\d+) checked-in fixtures'}
     - {file: .claude/skills/kernel-verify/SKILL.md,
        regex: 'matmul_test_data/` \((?P<matmul>\d+) cases, (?P<matmul_gemv>\d+) GEMV\) \| `hw/test_data/vecop_test_data/` \((?P<vecop>\d+) cases\)'}
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`TestMatmulRtl` runs the (?P<matmul>\d+) checked-in fixtures'}
@@ -260,6 +261,14 @@ facts:
       pl_rd_outs: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int RD_OUTS +=\s*(\d+);', type: int}
       pl_wr_burst: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int WR_BURST +=\s*(\d+);', type: int}
       pl_wr_outs: {file: kernels/pool_rtl/rtl/pl_pkg.sv, regex: 'localparam int WR_OUTS +=\s*(\d+);', type: int}
+      cv_x_burst: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'localparam int X_BURST = (\d+),', type: int}
+      cv_x_outs: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'X_OUTS = (\d+);', type: int}
+      cv_w_burst: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'localparam int W_BURST = (\d+),', type: int}
+      cv_w_outs: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'W_OUTS = (\d+);', type: int}
+      cv_b_burst: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'localparam int B_BURST = (\d+),', type: int}
+      cv_b_outs: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'B_OUTS = (\d+);', type: int}
+      cv_y_burst: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'localparam int Y_BURST = (\d+),', type: int}
+      cv_y_outs: {file: kernels/conv_rtl/rtl/cv_pkg.sv, regex: 'Y_OUTS = (\d+);', type: int}
   fix: report                                # an IP change: repackage, rebuild, re-measure
   mentions:
     - {file: kernels/matmul_rtl/syn/package_ip.tcl, regex: 'NUM_READ_OUTSTANDING (?P<mm_rd_outs>\d+) NUM_WRITE_OUTSTANDING (?P<mm_wr_outs>\d+)'}
@@ -273,6 +282,12 @@ facts:
     - {file: kernels/pool_rtl/syn/package_ip.tcl, regex: 'gmem0 READ_ONLY (?P<pl_rd_outs>\d+) \d+  gmem1 WRITE_ONLY \d+ (?P<pl_wr_outs>\d+)'}
     - {file: kernels/pool_rtl/syn/package_ip.tcl, regex: 'MAX_READ_BURST_LENGTH (?P<pl_rd_burst>\d+) MAX_WRITE_BURST_LENGTH (?P<pl_wr_burst>\d+)'}
     - {file: kernels/pool_rtl/tb/verilator/tb_main.cpp, regex: 'rd\.outs_limit = (?P<pl_rd_outs>\d+);  wr\.outs_limit = (?P<pl_wr_outs>\d+);'}
+    - {file: kernels/conv_rtl/syn/package_ip.tcl,
+       regex: 'gmem0 READ_ONLY (?P<cv_x_outs>\d+) \d+ (?P<cv_x_burst>\d+) \d+   gmem1 READ_ONLY (?P<cv_w_outs>\d+) \d+ (?P<cv_w_burst>\d+) \d+'}
+    - {file: kernels/conv_rtl/syn/package_ip.tcl,
+       regex: 'gmem2 READ_ONLY (?P<cv_b_outs>\d+) \d+ (?P<cv_b_burst>\d+) \d+  gmem3 WRITE_ONLY \d+ (?P<cv_y_outs>\d+) \d+ (?P<cv_y_burst>\d+)'}
+    - {file: kernels/conv_rtl/tb/verilator/tb_main.cpp,
+       regex: 'rx\.outs_limit = (?P<cv_x_outs>\d+);  rw\.outs_limit = (?P<cv_w_outs>\d+);  rb\.outs_limit = (?P<cv_b_outs>\d+);  wy\.outs_limit = (?P<cv_y_outs>\d+);'}
 
 - id: registers.MatmulKernel
   kind: interface
@@ -367,6 +382,24 @@ facts:
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '`build/(kernels/matmul_rtl/[\w./]+/src)`'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '\(`build/(kernels/matmul_rtl/[\w./]+)/`\) and', format: "v.removesuffix('/src')"}
 
+- id: paths.conv_driver
+  kind: value
+  title: where the build writes ConvKernel's C driver (make driver_conv_rtl, below build/), the
+    directory the example configs and docs point projects at
+  source:
+    file: kernels/conv_rtl/CMakeLists.txt
+    regex: 'CV_RTL_DRIVER_ROOT "\$\{CMAKE_CURRENT_BINARY_DIR\}/(\w+)"\)\nset\(CV_RTL_DRIVER_SRC "\$\{CV_RTL_DRIVER_ROOT\}/([^"]+)"'
+    transform: "f'kernels/conv_rtl/{v[0]}/{v[1]}'"   # the subdirectory's binary dir below build/
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/perf_config.json.example, regex: '"ConvKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '"ConvKernel": "\.\./build/([^"]+)"'}
+    - {file: demo/image_classification/image_classification_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/mnist/mnist_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/camera/camera_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: doc/kernels/CONV_RTL_KERNEL.md, regex: '`build/(kernels/conv_rtl/[\w./]+/src)`'}
+
 - id: registers.ConvKernel
   kind: interface
   title: ConvKernel AXI-Lite registers
@@ -374,8 +407,10 @@ facts:
   args:
     kernel: ConvKernel
     prefix: XConvkernel
-    hls: kernels/conv/kernel/ConvKernel.cpp
-    driver: 'build*/kernels/conv/kv260/*/*/impl/ip/drivers/ConvKernel_v1_0/src/xconvkernel_hw.h'
+    rtl_driver: kernels/conv_rtl/scripts/gen_driver.py       # the truth: the RTL kernel's table,
+    rtl: kernels/conv_rtl/rtl/cv_ctrl_s_axi.sv               # checked against its control block
+    hls: kernels/conv/kernel/ConvKernel.cpp                  # the C++ reference model: same ports
+    driver: 'build*/kernels/conv_rtl/driver/ConvKernel_v1_0/src/xconvkernel_hw.h'
     fields_alias: {is_dw: is_depthwise}
     not_keyed: {x: address, y: address, weight: address, bias: address}
     decode: inference-scheduler/src/timeline_html.py
@@ -671,12 +706,11 @@ facts:
 
 - id: platform.kv260_clock
   kind: value
-  title: the HLS synthesis target clock of the KV260 (MHz; the board runs the PL at 100)
+  title: the retired HLS synthesis's target clock of the KV260 (MHz; informational since every kernel
+    is RTL — the board runs the PL at 100)
   source: {file: platforms/kv260.json, json: clock}
   fix: auto
   mentions:
-    - {file: README.md, regex: 'HLS targets (\d+) MHz; the board'}
-    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: "platform JSON's `clock` \\((\\d+) MHz for"}
     - {file: doc/kernels/CONV_KERNEL.md, regex: 'clock — (\d+) MHz for the KV260; the CMake fallback'}
     - {file: doc/kernels/CONV_KERNEL.md, regex: '^\| \*\*Clock\*\* \| (\d+) MHz synthesis target'}
     - {file: doc/kernels/POOLING_KERNEL.md, regex: '`clock` — (\d+) MHz for the KV260'}
@@ -740,9 +774,9 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 59.9, resnet18_fps: 16.7, mobilenet_v1_ms: 73.0, mobilenet_v2_ms: 62.9, bert_ms: 919,
-          smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.25, smollm2_360m_tok_s: 3.9,
-          smolvlm_image_s: 3.9, piper_rtf: 0.52, mnist_convnet_ms: 0.256, mnist_lenet_ms: 2.743}
+  value: {resnet18_ms: 47.4, resnet18_fps: 21.1, mobilenet_v1_ms: 41.2, mobilenet_v2_ms: 38.1, bert_ms: 839,
+          smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.24, smollm2_360m_tok_s: 3.9,
+          smolvlm_image_s: 3.4, piper_rtf: 0.30, mnist_convnet_ms: 0.235, mnist_lenet_ms: 2.701}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -766,8 +800,16 @@ facts:
           RTL PoolingKernel, POOL_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.7, MobileNet v1 / v2 72.8 / 62.7,
           BERT mean 919.4, MNIST 0.256 / 2.743 ms (the values above since: LeNet 3.1 % faster than the 2.831
           recorded, its two AveragePools); llm_board 135M 100.3 ms / token and a 251 ms 16-token prefill, 360M
-          251.7 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.518"
-    facts: {perf.bitstream_id: dbb320fb7297}   # stale on another bitstream
+          251.7 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.518.  Measured on c2b2a6e5e50e (the
+          RTL ConvKernel, CONV_RTL_PLAN phase 2, 2026-10-06), the values above: ResNet-18 47.45, MobileNet v1 / v2
+          41.23 / 38.05 ms, BERT p50 865.1 (mean 866.1), MNIST 0.235 / 2.701 ms; llm_board 135M 100.25 ms /
+          token and a 249 ms 16-token prefill, 360M 251.8 ms / token, SmolVLM llm_image 3.36 s; tts_board RTF
+          0.302 (the 6.9 s utterance).  Re-measured with the projects regenerated under the RTL ConvKernel cost
+          model (CONV_RTL_PLAN phase 3, 2026-10-06), the values above: BERT p50 839.2 (mean 840.5; P·V on
+          ConvKernel), llm_board 135M 99.81 ms / token and a 243 ms 16-token prefill, 360M 252.0 ms / token,
+          SmolVLM llm_image 3.37 s; tts_board RTF 0.303; ResNet-18 47.46, MobileNet v1 / v2 41.23 / 38.10, MNIST
+          0.235 / 2.701 ms (those projects unchanged)"
+    facts: {perf.bitstream_id: c2b2a6e5e50e}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -797,8 +839,8 @@ facts:
     - {file: demo/mnist/README.md, regex: '^  mnist_lenet    OK +[\d.]+% +(?P<mnist_lenet_ms>[\d.]+) '}
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
-       regex: '`1d28630fbfa4`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `1d28630fbfa4`\): p50 (?P<bert_ms>\d+) ms'}
+       regex: '`c2b2a6e5e50e`, the RTL ConvKernel\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `c2b2a6e5e50e`\): p50 (?P<bert_ms>\d+) ms'}
     - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
@@ -864,21 +906,22 @@ facts:
     - {file: doc/images/architecture.svg, regex: 'kernels at (\d+) MHz'}
     - {file: inference-scheduler/src/perf_model.py, regex: '^MHZ = (\d+)\.0'}
     - {file: inference-scheduler/perf_calibrate.py, regex: '^MHZ = (\d+)\.0'}
+    - {file: .claude/skills/conv-cycle-model/scripts/conv_cycle_model.py, regex: '^PL_MHZ = (\d+) '}
 
 - id: hw.utilization
   kind: recorded
   title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 7d8eefe, dsp: 973, dsp_total: 1248, dsp_pct: 78, lut: 75472, lut_total: 117120, lut_pct: 64.4,
-          bram: 105, bram_total: 144, uram: 48, uram_total: 64}
+  value: {hw_commit: 850cc88, dsp: 688, dsp_total: 1248, dsp_pct: 55, lut: 56516, lut_total: 117120, lut_pct: 48.3,
+          bram: 103, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-05
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 7d8eefe (docs only since) with the RTL
-          MatmulKernel (its IP declaring the m_axi bus parameters, MATMUL_RTL_PLAN phase 5), VectorOPKernel and
-          PoolingKernel (POOL_RTL_PLAN phase 1); the bitstream of perf.bitstream_id (b3309f424562 before it,
+    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 850cc88 (docs only since) with the four RTL
+          kernels — the ConvKernel of CONV_RTL_PLAN phase 1; the bitstream of perf.bitstream_id (dbb320fb7297
+          before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: dbb320fb7297}
+    facts: {perf.bitstream_id: c2b2a6e5e50e}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
@@ -967,7 +1010,7 @@ facts:
   mentions:
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md,
        regex: 'bertsquad-12, 386 nodes\): (?P<on_conv>\d+) of the (?P<matmuls>\d+) MatMuls run on ConvKernel'}
-    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '^(?P<conv_calls>\d+) ConvKernel calls; the 12 attention P·V'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '^(?P<conv_calls>\d+) ConvKernel calls; the K = 2 token-type'}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md,
        regex: 'CLI defaults — (?P<on_conv>\d+) MatMuls on\s+ConvKernel, (?P<on_matmul>\d+) on MatmulKernel'}
     - {file: demo/bert_squad/README.md, regex: 'uses\) (?P<on_conv>\d+) of the (?P<matmuls>\d+)\s+MatMuls run on ConvKernel'}
@@ -1002,7 +1045,7 @@ facts:
   fix: auto
   mentions:
     - {file: README.md, regex: 'one fixed-size chunk \((?P<out_frames>\d+) frames, (?P<seconds>[\d.]+) s of audio\)'}
-    - {file: README.md, regex: '\*\*0\.7 s\*\* per (?P<seconds>[\d.]+) s of audio'}
+    - {file: README.md, regex: '\*\*[\d.]+ s\*\* per (?P<seconds>[\d.]+) s of audio'}
     - {file: CLAUDE.md, regex: '(?P<out_frames>\d+) frames = (?P<seconds>[\d.]+) s of audio per pass'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'chunks of (?P<out_frames>\d+) frames \((?P<seconds>[\d.]+) s of speech\)'}
     - {file: demo/tts/README.md, regex: 'about 0\.7 s per (?P<seconds>[\d.]+) s chunk'}

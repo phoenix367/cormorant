@@ -2213,9 +2213,9 @@ void ConvKernel(
     //                                        8 in-flight bursts before
     //                                        stalling, hiding DDR round-trip
     //                                        latency under DATAFLOW.
-    //   m_axi_max_widen_bitwidth is set globally in scripts/Synthesis.tcl.in
-    //   via AXI_BUS_WIDTH (lets users dial it back to match a 128-bit block
-    //   design); not duplicated per-port so the global stays authoritative.
+    //   m_axi_max_widen_bitwidth was set globally by the HLS synthesis script
+    //   (from AXI_BUS_WIDTH; retired with it in CONV_RTL_PLAN phase 3), not
+    //   per port.
     //
     //   depth=<N> is a C/RTL co-simulation hint only — it sizes the
     //   verification adapter FIFO cosim builds for each m_axi port.  It does

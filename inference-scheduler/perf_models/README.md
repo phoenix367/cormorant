@@ -18,17 +18,30 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/dbb320fb7297` is hw_128 7d8eefe (2026-10-05; the SystemVerilog MatmulKernel,
+`kv260/c2b2a6e5e50e` is hw_128 850cc88 (2026-10-06; all four kernels in SystemVerilog —
+CONV_RTL_PLAN phase 3): 2343 calls, repeat spread median 0.017 %.  Its campaign started
+from the converged case list of `dbb320fb7297` (one pass, a refinement round of 136 calls),
+then the list was rebuilt with the scheduler's RTL ConvKernel cost model, whose engine and
+geometry choices change the shipped ConvKernel calls (BERT's attention P·V moves onto
+ConvKernel), and refined to convergence: 181 + 93 + 32 + 16 + 5 calls.  Against
+`dbb320fb7297` the 1042 ConvKernel calls both campaigns measured are a median 28.4 % faster
+(up to 73.5 %; one depthwise grid case 8.4 % slower), the MatmulKernel, PoolingKernel and
+VectorOPKernel calls agree to a median 0.00 %.  The ConvKernel families use the RTL
+kernel's walk terms (`rtl_total`, `rtl_fill`, `rtl_loads` from `cost_model.rtl_conv_walk`):
+conv / conv-dw held-out p90 9.4 / 12.1 % (from 39.4 / 31.6 % with the HLS terms),
+conv-mm 42.8 %; mm-gemv / mm-tiled 1.44 / 3.14 %.
+
+Beside it, `kv260/dbb320fb7297`, hw_128 7d8eefe (2026-10-05; the SystemVerilog MatmulKernel,
 VectorOPKernel and PoolingKernel — POOL_RTL_PLAN phase 3 — with the ConvKernel the one Vitis
-HLS kernel): 1581 calls, repeat spread median 0.016 %.  Its case list started from the
+HLS kernel; `AXI_CONV_IMPL=hls` for projects on it), 1581 calls, repeat spread median 0.016 %.  Its case list started from the
 converged one of `b3309f424562`; the first refinement round added 0 calls.  Against that
 campaign the 30 PoolingKernel calls are a median 19.5 % faster (2.7–36.1 %); the Conv,
 Matmul and VectorOP calls agree to a median 0.00 % (within ±2.7 %).  mm-gemv / mm-tiled
 held-out p90 0.79 / 3.22 %.
 
-Beside it, `kv260/b3309f424562`, the same design with the Vitis HLS PoolingKernel (and its
+Before it, `kv260/b3309f424562`, the same design with the Vitis HLS PoolingKernel (and its
 out-of-contract guard; 2026-10-05, the MatmulKernel IP declaring its m_axi bus parameters —
-MATMUL_RTL_PLAN phase 5): 1581 calls, repeat spread median 0.015 %.  Its case list started
+MATMUL_RTL_PLAN phase 5), 1581 calls, repeat spread median 0.015 %.  Its case list started
 from the converged one of `68665fc1833a`; the first refinement round added 0 calls.  Against
 that campaign the 414 MatmulKernel calls are unchanged at the median, 90 faster by more than
 1 % (up to 15 %), 3 slower by 1–2.2 %; mm-gemv / mm-tiled held-out p90 0.89 / 3.13 % (from

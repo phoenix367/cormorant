@@ -2,14 +2,14 @@
 
 Everything platform-specific in this repository lives in a single JSON
 file: `platforms/<platform>.json`. The file is the **single source of
-truth** for the FPGA part, the synthesis target clock, and the
-compile-time bounds each kernel synthesises against.
+truth** for the FPGA part and the compile-time bounds of the kernels
+(constants of the RTL kernels, checked against it at configure time).
 
 Two distinct consumers read the same JSON:
 
 | Consumer | Source | How it reads |
 |----------|--------|--------------|
-| **C++ build** (Vitis HLS synthesis, IP export, C-sim Config.h) | `kernels/<k>/CMakeLists.txt::<k>_load_constants()` | `string(JSON … GET … kernels <k> <field>)`; missing field → `FATAL_ERROR` |
+| **C++ / RTL build** (IP packaging part, the RTL kernels' bound checks, C-sim Config.h) | `kernels/<k>/CMakeLists.txt::<k>_load_constants()` | `string(JSON … GET … kernels <k> <field>)`; missing field → `FATAL_ERROR` |
 | **Python scheduler** (model validation before codegen) | `inference-scheduler/src/_<k>_hw_config.py::resolve()` | `json.load`; missing field → `<Kernel>HwConfigError` |
 
 Keeping a single source means the Python validator and the C++ kernel
@@ -36,10 +36,11 @@ This picks `platforms/<platform>.json` as the source for the **default
 C-sim build** — the `Config.h` consumed by `make TestConvRef`,
 `make TestPoolingSim`, etc. is generated from this platform's bounds.
 
-The per-platform synthesis loop is independent. Every JSON file in
-`platforms/` gets its own `synthesize_conv_<platform>` (the one HLS
-kernel) and `synthesize_<platform>` targets regardless of `AXI_PLATFORM`. Picking a different platform with
-`-DAXI_PLATFORM=foo` only affects which JSON drives the `Config.h`
+Every JSON file in `platforms/` gets a `synthesize_<platform>` aggregate
+(the four kernel IPs) regardless of `AXI_PLATFORM`; the IPs themselves are
+packaged for the `AXI_PLATFORM` platform's part, and the RTL kernels hold
+its bounds as constants (checked at configure time).  Picking a different
+platform with `-DAXI_PLATFORM=foo` affects which JSON drives the `Config.h`
 file used by C-sim tests and the RTL kernels' part and bound check.
 
 The Python side mirrors the same convention: setting the
@@ -62,7 +63,7 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `description` | no | *(none)* | Informational only; not read by CMake or the scheduler |
 | `part` | yes | — | Xilinx device part string passed to `set_part` |
 | `board` | no | *(none)* | Board identifier passed to `set_part -board` |
-| `clock` | no | `300` | Target clock in MHz (HLS `create_clock -period`) |
+| `clock` | no | *(none)* | Informational: the target clock (MHz) of the retired Vitis HLS synthesis.  The RTL IPs' out-of-context checks use their own period (`<K>_RTL_PERIOD`, 3.333 ns); the block design runs the PL at 100 MHz |
 | `kernels.conv` | yes | — | ConvKernel compile-time bounds — [§ConvKernel](#kernelsconv) |
 | `kernels.matmul` | yes | — | MatmulKernel compile-time bounds — [§MatmulKernel](#kernelsmatmul) |
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
@@ -73,26 +74,29 @@ SystemVerilog IP reads only `part`, for packaging and out-of-context
 synthesis).
 
 > **`AXI_BUS_WIDTH` is not a JSON field.** It is a top-level CMake
-> cache variable (default `32`; the KV260 hardware build uses
-> `cmake -DAXI_BUS_WIDTH=128`) so that a single platform JSON can be
-> synthesised against multiple bus widths independently. It only sets
-> `config_interface -m_axi_max_widen_bitwidth`, i.e. it caps HLS
-> auto-widening of plain-pointer ports (none is left: the last, the HLS
-> MatmulKernel's `c`, went with its synthesis); every
-> `hls::burst_maxi` data port is declared 128-bit in the C++ regardless. See the configure-time cache variables table in
+> cache variable (default `32`) that set the HLS synthesis's
+> `config_interface -m_axi_max_widen_bitwidth`.  With every kernel in
+> SystemVerilog (fixed 128-bit data ports, the block design's width) it
+> affects no IP. See the configure-time cache variables table in
 > [BUILD_TARGETS.md](BUILD_TARGETS.md#setup).
 
 ---
 
 ### `kernels.conv`
 
-Sizes the ConvKernel's line buffer, weight cache, bias buffer, and
-persistent-accumulator at compile time. See
-[`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 for the full architectural
-context.
+Describes the ConvKernel the bitstream carries — since CONV_RTL_PLAN
+phase 3 the SystemVerilog kernel
+([`CONV_RTL_KERNEL.md`](../kernels/CONV_RTL_KERNEL.md)), whose
+`rtl/cv_pkg.sv` holds every bound below as a constant (configure stops with
+a `FATAL_ERROR` when they differ: changing a bound means changing the RTL).
+The same fields size the HLS kernel's C++ model (`kernels/conv`, the
+reference and fixture generator): its line buffer, weight cache, bias
+buffer and persistent accumulator
+([`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3).
 
 | Field | Constraint | Description |
 |-------|------------|-------------|
+| `impl` | `"rtl"` (the CMake build refuses anything else); the scheduler also takes `"hls"` | Which ConvKernel the platform's bitstream carries: the SystemVerilog one (`kernels/conv_rtl`), or the Vitis HLS kernel of the bitstreams built before phase 3 (`dbb320fb7297` and older).  Same calls, same results, different speed: it selects the scheduler's ConvKernel cycle model (`cost_model.rtl_conv_walk` or the HLS walk) behind the MatMul-on-ConvKernel engine and geometry choices.  The `AXI_CONV_IMPL` environment variable overrides it for the Python tools (`AXI_CONV_IMPL=hls` for a project on an HLS bitstream) |
 | `tile_m` | power of 2, multiple of 8, `≤ tile_ic`; any `out_ch` works (residual-padded) | Output-channel tile = M dimension of the `tile_ic × tile_m` MAC grid |
 | `tile_ic` | power of 2; any `in_ch` works (residual-padded) | Input-channel tile = IC dimension of the MAC grid; also the lane count of the packed weight layout |
 | `max_kh` | `kh ≤ max_kh` | Hard upper bound on kernel height |
@@ -189,6 +193,7 @@ fixture generator).
   "clock": 150,
   "kernels": {
     "conv": {
+      "impl":   "rtl",
       "tile_m":                  16, "tile_ic":               16,
       "max_kh":                  7,  "max_kw":                 7,
       "max_in_ch":            1024,  "max_out_ch":          1280,
@@ -238,9 +243,7 @@ fixture generator).
     ```
 
 3. The new platform now has:
-    - `synthesize_conv_<platform>` — ConvKernel HLS synthesis + IP export
-    - `synthesize_<platform>` — roll-up target that builds all four kernels
-    - `cosim_conv_<platform>` — ConvKernel C synthesis + RTL co-simulation
+    - `synthesize_<platform>` — roll-up target that packages all four kernel IPs
     - `dtbo_<platform>_<stem>` — for any `<stem>.dts` file under `dts/<platform>/`
 
     The Vivado / behavioural-test targets (`build_hw_kv260`,
@@ -286,10 +289,10 @@ resolved Python constants against the JSON, so a typo or shape error
 surfaces immediately at `pytest` time.
 
 `tile_*` / `ow_parallel` / `tile_c` changes don't require fixture
-regeneration — those fields are not validated against models — but
-they do affect HLS resource usage / II, so a re-synthesis is still
-needed before deploying (the `kernels.pool` fields, and `kernels.matmul.max_k`,
-are constants of the RTL kernels: change the RTL with them). `kernels.conv.tile_ic` and
+regeneration — those fields are not validated against models — but the
+`kernels.conv` and `kernels.pool` fields, and `kernels.matmul.max_k`, are
+constants of the RTL kernels: change the RTL with them, then rebuild the
+bitstream. `kernels.conv.tile_ic` and
 `kernels.matmul.tile_m` also change the packed weight layout the
 scheduler emits, so every generated project must be regenerated against
 the same JSON as the bitstream.
@@ -300,7 +303,8 @@ the same JSON as the bitstream.
 
 | Document | Coverage |
 |----------|----------|
-| [`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 | Full ConvKernel architecture and tiling, including how each `kernels.conv.*` field maps to hardware resources |
+| [`CONV_RTL_KERNEL.md`](../kernels/CONV_RTL_KERNEL.md) | The SystemVerilog ConvKernel: contract (the bounds, `rtl/cv_pkg.sv`), architecture |
+| [`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3 | The retired HLS kernel's architecture and tiling (its C++ is the reference model), including how each `kernels.conv.*` field maps to its resources |
 | [`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3 | MatmulKernel tiling, `max_k` rationale |
 | [`POOL_RTL_KERNEL.md`](../kernels/POOL_RTL_KERNEL.md) | The SystemVerilog PoolingKernel: contract (the bounds, `rtl/pl_pkg.sv`), architecture |
 | [`POOLING_KERNEL.md`](../kernels/POOLING_KERNEL.md) §3 | PoolingKernel compile-time configuration (the retired HLS kernel's C++, the reference model) |

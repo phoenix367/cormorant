@@ -74,8 +74,8 @@ demo/bert_squad/
   `inference-scheduler/requirements.txt`, see the root README): numpy,
   onnx, paramiko.  All commands below use it.
 * Driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
-  `build/`: `make synthesize_conv_kv260 driver_vectorop_rtl
-  driver_matmul_rtl`).
+  `build/`: `make driver_vectorop_rtl driver_matmul_rtl
+  driver_conv_rtl`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.
 * Internet access on the first run: the scripts download ~440 MB of
@@ -85,9 +85,9 @@ demo/bert_squad/
 
 * The all-kernels bitstream, loaded with `fabric_vecop` / `fabric_matmul` /
   `fabric_conv` UIO devices.  With the scheduler's default
-  `--matmul-on-conv auto` (what `generate_project.py` uses) 84 of the 98
-  MatMuls run on ConvKernel; the K = 2 token-type MatMul, the 12 attention
-  P·V MatMuls and the M = 2 span head stay on MatmulKernel.  With
+  `--matmul-on-conv auto` (what `generate_project.py` uses) 96 of the 98
+  MatMuls run on ConvKernel; the K = 2 token-type MatMul and the M = 2 span
+  head stay on MatmulKernel.  With
   `--no-matmul-on-conv` (phase 1; a scheduler CLI option, not exposed by
   `generate_project.py`) MatmulKernel
   needs `kernels.matmul.max_k` ≥ 3072 (the FFN down-projection has
@@ -338,9 +338,13 @@ Per inference:
 **2026-09-28** (bitstream hw_128 d7ce129; 10 examples, no
 profiling): p50 **962.3 ms** per inference; generated with `--plan` (issue
 order from the performance model) **951.3 ms**, bit-exact
-(`doc/plans/TACTICS_PLAN.md` §9, T4).  **Latest**, on the RTL MatmulKernel bitstream
-1d28630fbfa4 with the attention P·V on MatmulKernel (2026-10-04, all 50
-examples): p50 **919.8 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
+(`doc/plans/TACTICS_PLAN.md` §9, T4).  On the RTL MatmulKernel bitstream
+1d28630fbfa4 with the attention P·V on MatmulKernel (2026-10-04): p50
+919.8 ms.  On the RTL ConvKernel bitstream c2b2a6e5e50e with the same
+project (2026-10-06): p50 865.1 ms.  **Latest**, regenerated with the RTL
+ConvKernel's cost model, which puts the 12 attention P·V MatMuls on
+ConvKernel too (CONV_RTL_PLAN phase 3, 2026-10-06, all 50
+examples): p50 **839.2 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 

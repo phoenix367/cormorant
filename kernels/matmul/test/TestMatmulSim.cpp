@@ -239,7 +239,7 @@ static bool compare_outputs(
 // invoke_matmul — call MatmulKernel, routing through the cosim fixed buffers.
 //
 // Plain C-sim passes the per-test std::vector storage straight to the kernel.
-// The cosim build (-DMATMUL_COSIM, set by scripts/Cosim.tcl.in) instead copies
+// The cosim build (-DMATMUL_COSIM, set by the retired HLS Cosim.tcl.in) copies
 // each case into the fixed MATMUL_COSIM_DEPTH_*-sized globals: cosim's wrapc
 // adapter sizes its RTL memory model from the kernel's m_axi depth= hint and
 // transfers the whole buffer, so a smaller per-test allocation would be read

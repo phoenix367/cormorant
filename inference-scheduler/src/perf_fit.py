@@ -86,8 +86,8 @@ def _knn_correct(Z: np.ndarray, r: np.ndarray, zq: np.ndarray, k: int,
 
 def feature_sets(rows: List[dict]) -> List[List[str]]:
     """The candidate feature sets of a family: one set, or for MatmulKernel
-    the HLS tile model's terms and the RTL job walk's (``rtl_*``), each
-    with ``one``."""
+    and ConvKernel the HLS model's terms and the RTL job walk's
+    (``rtl_*``), each with ``one``."""
     names = sorted({k for r in rows for k in features(r["call"])}, key=lambda n: (n == "one", n))
     rtl = [n for n in names if n.startswith(RTL_PREFIX)]
     if not rtl:

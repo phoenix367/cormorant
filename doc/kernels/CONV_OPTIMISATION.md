@@ -9,6 +9,18 @@ For the high-level kernel description see [CONV_KERNEL.md](CONV_KERNEL.md);
 this file is a complement focused on the optimization arc and the current
 final architecture.
 
+> **Retired (2026-10-06).**  The hardware build no longer synthesises this
+> kernel: the bitstream carries the SystemVerilog ConvKernel
+> ([CONV_RTL_KERNEL.md](CONV_RTL_KERNEL.md), [CONV_RTL_PLAN](../plans/CONV_RTL_PLAN.md)
+> phase 3; first bitstream `c2b2a6e5e50e`).  This log is the HLS kernel's
+> history; its commands (`synthesize_conv_kv260`, `cosim_conv_kv260`) are
+> gone, and `behavior_test_conv` now runs the RTL IP (63 / 63; 3 768 µs
+> against this kernel's 4 903 µs, −23.1 %; on the board every ConvKernel
+> benchmark 6–43 % faster, ResNet-18 59.7 → 47.5 ms).  The RTL kernel keeps
+> this kernel's §2.42 schedule (two pixels × 16 × 16 MACs per cycle) on 518
+> DSPs instead of 803; the conv-cycle-model skill's `--arch 42` still models
+> this kernel.
+
 > **Status (2026-09-27).**  The log runs through §2.42 (two output pixels per
 > cycle, 512 MACs/cycle) plus the MatMul-on-ConvKernel test geometries
 > (BERT_PLAN 2A); the kernel has not changed since 2026-09-25.  §3

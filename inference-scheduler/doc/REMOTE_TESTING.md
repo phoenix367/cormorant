@@ -25,13 +25,12 @@ fails the test.
   cd inference-scheduler
   .venv/bin/pip install paramiko
   ```
-- Driver sources (for `local.driver_dirs` in the config): ConvKernel's Vitis HLS
-  export (`make synthesize_kv260`) and the RTL VectorOPKernel's, MatmulKernel's
-  and PoolingKernel's drivers (`make driver_vectorop_rtl driver_matmul_rtl driver_pool_rtl`):
+- Driver sources (for `local.driver_dirs` in the config): the RTL kernels'
+  drivers (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl driver_pool_rtl`):
   ```
   <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/
   <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
-  <repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
+  <repo>/build/kernels/conv_rtl/driver/ConvKernel_v1_0/src/
   <repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/
   ```
 
@@ -559,13 +558,12 @@ Same SSH, toolchain, and XRT requirements as `run_remote_tests.py`. See
 starting a long benchmark run.
 
 Driver files must be available either locally (`local.driver_dirs`) or on the
-board (`remote.driver_dirs`). The local paths are the standard Vitis HLS output
-for ConvKernel (see [Prerequisites](#prerequisites)) and, for MatmulKernel,
-VectorOPKernel and PoolingKernel, the RTL kernels' drivers (`make driver_matmul_rtl`,
-`driver_vectorop_rtl`, `driver_pool_rtl`):
+board (`remote.driver_dirs`). The local paths are the RTL kernels' drivers
+(`make driver_matmul_rtl driver_vectorop_rtl driver_conv_rtl driver_pool_rtl`;
+see [Prerequisites](#prerequisites)):
 
 ```
-<repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src/
+<repo>/build/kernels/conv_rtl/driver/ConvKernel_v1_0/src/
 <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
 <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/
 <repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""ConvKernel cycle model (architecture as of CONV_OPTIMISATION.md §2.42;
---arch 37/38/39/40/41 reproduces the earlier steps for re-validating their reports).
-See SKILL.md for usage.  Constants come from platforms/<AXI_PLATFORM>.json."""
+"""ConvKernel cycle model: the SystemVerilog kernel (--arch rtl, the default:
+the scheduler's cost_model.rtl_conv_walk) or the retired HLS kernel (--arch 42,
+CONV_OPTIMISATION.md §2.42; 37/38/39/40/41 reproduce the earlier steps for
+re-validating their reports).  See SKILL.md for usage.  Constants come from
+platforms/<AXI_PLATFORM>.json; milliseconds at the board's PL clock."""
 import argparse, json, math, os, sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+PL_MHZ = 100     # the board's PL clock (block design PL0; fact board.pl_clock_mhz)
 
 def load_platform(name):
     cfg = json.load(open(os.path.join(ROOT, "platforms", f"{name}.json")))
     c = cfg["kernels"]["conv"]
     return dict(TILE_M=c["tile_m"], TILE_IC=c["tile_ic"], ROWS=c["max_line_buf_rows"],
                 COLS=c["max_line_buf_cols"], ACC=c["max_acc_persist_entries"],
-                MPG=c["max_m_per_group"], CLOCK=cfg.get("clock", 150), PORT_ELEMS=8)
+                MPG=c["max_m_per_group"], CLOCK=PL_MHZ, PORT_ELEMS=8)
 
 def geom(P, in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw, dwise):
     m_tiles = -(-out_ch // P["TILE_M"]); ic_tiles = -(-in_ch // P["TILE_IC"])
@@ -23,9 +26,10 @@ def geom(P, in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw, dwise):
         per = min(per, cap)
     chunks = -(-oh // per)
     winw = (kw - 1) * dw + 1
-    owpt = min(ow, (P["COLS"] - winw) // sw + 1 if winw < P["COLS"] else 1)
+    owpt = (P["COLS"] - winw) // sw + 1 if winw < P["COLS"] else 1
     if ARCH >= 42 and owpt > 1:
-        owpt = min(ow, owpt & ~1)                  # §2.42: even tile widths (pair boundaries)
+        owpt &= ~1                                 # §2.42: even tile widths (pair boundaries) ...
+    owpt = min(ow, owpt)                           # ... then at most out_w (compute_ow_tiling)
     owt = -(-ow // owpt)
     return m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt
 
@@ -54,7 +58,27 @@ def loader_row_cycles(ch, cols):
     ch channel runs (each up to ceil(cols/8)+1 words when unaligned) + setup."""
     return ch * (-(-cols // 8) + 1) + ch + ROW_LOADER_SETUP
 
+def _rtl_walk():
+    """The SystemVerilog kernel's model: the scheduler's recurrence
+    (inference-scheduler/src/cost_model.py rtl_conv_walk, ideal memory)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "..", "..", "..", "inference-scheduler"))
+    from src.cost_model import RTL_CONV_SIM, rtl_conv_walk
+    return RTL_CONV_SIM, rtl_conv_walk
+
+
+def invoke_overhead():
+    return _rtl_walk()[0]["ONE"] if ARCH == "rtl" else INVOKE_OVERHEAD
+
+
 def model_layer(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise):
+    if ARCH == "rtl":
+        return _rtl_walk()[1](in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+                              bool(dwise), False)
+    return _model_layer_hls(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise)
+
+
+def _model_layer_hls(P, in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl, dwise):
     """Cycle model.  The patch producer is SEQUENTIAL per row: it loads a row's
     channel runs from DDR (one 16-bit element per cycle, requests pipelined)
     and only then streams that row's patches, and the patch FIFO holds only
@@ -184,7 +208,7 @@ def run_validate(P, report):
         except KeyError:
             print(f"{t['label'][:58]:58s}  (geometry fields missing in report)"); continue
         meas = t["duration_ns"] / 10.0
-        model = (r["total"] - INVOKE_OVERHEAD) * g.get("batch", 1) + INVOKE_OVERHEAD
+        model = (r["total"] - invoke_overhead()) * g.get("batch", 1) + invoke_overhead()
         errs.append(abs(model - meas) / meas)
         print(f"{t['label'][:58]:58s} {model/1e3:8.1f}k {meas/1e3:8.1f}k {100*(model-meas)/meas:+6.1f}%")
     big = [e for e, t in zip(errs, d["tests"]) if t["duration_ns"] > 200000]
@@ -197,9 +221,10 @@ def main():
     ap.add_argument("--platform", default=os.environ.get("AXI_PLATFORM", "kv260"))
     ap.add_argument("--case", nargs="+", type=int, metavar="N", help="C M H W kh kw [sh sw dh dw pt pl pb pr dw]")
     ap.add_argument("--validate", metavar="conv_test_report.json")
-    ap.add_argument("--arch", type=int, default=ARCH, help="model the kernel as of §2.<N> (37 … 42)")
+    ap.add_argument("--arch", default="rtl",
+                    help="rtl (the SystemVerilog kernel, default) or the HLS kernel as of §2.<N> (37 … 42)")
     a = ap.parse_args(); P = load_platform(a.platform)
-    ARCH = a.arch
+    ARCH = a.arch if a.arch == "rtl" else int(a.arch)
     if a.case:
         v = a.case + [1, 1, 1, 1, 0, 0, 0, 0, 0][len(a.case) - 6:]
         C, M, H, W, kh, kw, sh, sw, dh, dw, pt, pl, pb, pr, dwise = v[:15]

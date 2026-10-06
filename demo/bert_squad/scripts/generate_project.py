@@ -7,9 +7,9 @@ for the BERT-SQuAD demo.
      activation fusion) -> CMake C project in build/project/, with the
      76 large weight tensors as build/project/weights/*.dat (208 MB).
   2. driver/ populated from local.driver_dirs for the active kernels
-     (VectorOPKernel, ConvKernel — 84 of the 98 MatMuls, BERT_PLAN 2A — and
-     MatmulKernel for the 14 that stay there: the token-type and span-head
-     MatMuls and the 12 attention P·V).
+     (VectorOPKernel, ConvKernel — 96 of the 98 MatMuls, BERT_PLAN 2A — and
+     MatmulKernel for the 2 that stay there: the token-type and span-head
+     MatMuls).
   3. src/squad_bench.c and src/bert_api.{c,h} copied to test/, plus a
      generated test/bench_glue.h: the buffer order of inference_run(), each
      buffer's numel macro and the index of each role (input_ids,
@@ -289,7 +289,7 @@ def preflight(cfg: dict, fetch: bool = True) -> bool:
             continue
         if not demo_path(p).is_dir():
             target = {"VectorOPKernel": "driver_vectorop_rtl", "MatmulKernel": "driver_matmul_rtl",
-                      "PoolKernel": "driver_pool_rtl"}.get(k, "synthesize_conv_kv260")
+                      "ConvKernel": "driver_conv_rtl", "PoolKernel": "driver_pool_rtl"}.get(k, "driver_<k>_rtl")
             log(f"warning: local.driver_dirs.{k}: {demo_path(p)} not found (make {target})")
     return ok
 

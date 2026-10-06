@@ -4,8 +4,8 @@
 set -euo pipefail
 build=$(cd "${1:?build dir}" && pwd); fx=$(cd "${2:?fixture dir}" && pwd); log=${3:?log path}
 root=$(cd "$(dirname "$0")/../../../.." && pwd)
-ip="$build/kernels/conv/kv260/conv_kv260/hls/impl/ip"
-[ -d "$ip" ] || { echo "IP repo $ip missing — run: make -C $build synthesize_conv_kv260" >&2; exit 1; }
+ip="$build/rtl_ip/ConvKernel_ip"
+[ -d "$ip" ] || { echo "IP repo $ip missing — run: make -C $build package_conv_rtl" >&2; exit 1; }
 report="${log%.log}_report.json"
 t0=$(date +%s)
 TS_VERBOSE=1 make -C "$root/hw/cormorant_test_stand" tb-conv \

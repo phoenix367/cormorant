@@ -267,6 +267,7 @@ class TestConvHwConfigResolver(unittest.TestCase):
             "description": "test-only override",
             "part": "x", "clock": 100,
             "kernels": {"conv": {
+                "impl": "rtl",
                 "tile_m": 8, "tile_ic": 16,
                 "max_kh": 7, "max_kw": 7,
                 "max_in_ch":               512,          # <-- the override
@@ -320,6 +321,7 @@ class TestConvHwConfigResolver(unittest.TestCase):
             "description": "missing max_in_ch",
             "part": "x", "clock": 100,
             "kernels": {"conv": {
+                "impl": "rtl",
                 "tile_m": 8, "tile_ic": 16,
                 "max_kh": 7, "max_kw": 7,
                 # max_in_ch deliberately absent

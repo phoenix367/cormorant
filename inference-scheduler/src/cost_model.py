@@ -8,10 +8,25 @@ conv's kernel width / output shape.  Both models count kernel clock cycles
 (the board runs the fabric at 100 MHz); the absolute numbers matter only
 relative to each other.
 
-ConvKernel
-----------
-``conv_cycles`` is the standard-convolution path of the ConvKernel cycle
-model, ``.claude/skills/conv-cycle-model/scripts/conv_cycle_model.py``
+ConvKernel in SystemVerilog
+---------------------------
+With ``kernels.conv.impl == "rtl"`` (the KV260's since CONV_RTL_PLAN phase 3;
+env ``AXI_CONV_IMPL``) the bitstream carries the RTL kernel
+(``kernels/conv_rtl``, doc/kernels/CONV_RTL_KERNEL.md), and ``conv_cycles`` /
+``conv_board_cycles`` use ``rtl_conv_walk``: the kernel's sweeps as a
+pipeline recurrence (weight loader, the two weight-cache banks, patch
+producer and x loader, the sweep, the drain beside the next chunk; the
+comment above ``RTL_CONV_SIM``), with one parameter set tuned to the
+Verilator testbench and one to the board (``RTL_CONV_BOARD``, the
+calibration campaign of c2b2a6e5e50e).  The conv-cycle-model skill's script
+calls it for ``--arch rtl`` (its default).
+
+ConvKernel (HLS, ``kernels.conv.impl == "hls"``)
+------------------------------------------------
+The kernel of the bitstreams built before CONV_RTL_PLAN phase 3
+(dbb320fb7297 and older).  ``conv_cycles`` is the standard-convolution path
+of the ConvKernel cycle model,
+``.claude/skills/conv-cycle-model/scripts/conv_cycle_model.py --arch 42``
 (architecture of CONV_OPTIMISATION.md §2.42: flat II=1 sweep over output
 pixel PAIRS, ``G · max(kh·kw, 2)`` cycles per pair and M-group, one ramp per
 ``(ict, ow_tile, M-group)``, the §2.35 weight-slab prefetch, the §2.38
@@ -22,13 +37,13 @@ on the > 20 k-cycle cases at every kernel step.  On the board a weight
 slab's fetch is also bound by its requests — one per output channel, 2
 words for a 1x1 kernel —, which the simulation's DDR model hides:
 ``conv_board_cycles`` adds that (``CONV_WEIGHT_REQ_CYCLES``,
-``CONV_PREFETCH_HIDE``, fitted to the board), and the engine choices use it
-to price ConvKernel against MatmulKernel (``matmul_lowering``: the geometry
-``conv_cycles`` ranks first; ``fc_conv``).  The geometries themselves —
+``CONV_PREFETCH_HIDE``, fitted to the board).
+
+For either kernel the engine choices price ConvKernel against MatmulKernel
+with ``conv_board_cycles`` (``matmul_lowering``: the geometry
+``conv_cycles`` ranks first; ``fc_conv``), while the geometries themselves —
 a lowered MatMul's (kw, out_w), the frontends' attention widths — are
-still ranked by ``conv_cycles``, whose choices were measured on the
-board (a geometry the board model prefers instead is mostly unmeasured),
-and so are the performance model's features.
+ranked by ``conv_cycles``.
 
 MatmulKernel (HLS, ``kernels.matmul.impl == "hls"``)
 -----------------------------------------------------
@@ -71,6 +86,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from ._conv_hw_config import (
+    CONV_IMPL,
     CONV_MAX_ACC_PERSIST_ENTRIES,
     CONV_MAX_LINE_BUF_COLS,
     CONV_MAX_LINE_BUF_ROWS,
@@ -131,10 +147,10 @@ def _conv_geom(in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw):
         per = min(per, cap)
     chunks = -(-oh // per)
     winw = (kw - 1) * dw + 1
-    owpt = min(ow, (CONV_MAX_LINE_BUF_COLS - winw) // sw + 1
-               if winw < CONV_MAX_LINE_BUF_COLS else 1)
+    owpt = (CONV_MAX_LINE_BUF_COLS - winw) // sw + 1 if winw < CONV_MAX_LINE_BUF_COLS else 1
     if owpt > 1:
-        owpt = min(ow, owpt & ~1)            # §2.42: even tile widths
+        owpt &= ~1                           # §2.42: even tile widths ...
+    owpt = min(ow, owpt)                     # ... then at most out_w (compute_ow_tiling)
     owt = -(-ow // owpt)
     return m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt
 
@@ -152,6 +168,125 @@ def _loader_row_cycles(ch, cols):
     return ch * (-(-cols // 8) + 1) + ch + ROW_LOADER_SETUP
 
 
+# --------------------------------------------------------------------------
+# ConvKernel in SystemVerilog (platform ``kernels.conv.impl == "rtl"``).
+# --------------------------------------------------------------------------
+# The kernel's sweeps as a pipeline recurrence (CONV_RTL_KERNEL.md §2-§3).
+# Per sweep k, in the sequencer's order, with s_k grid instants (output rows
+# x pixel pairs x max(kh*kw, 2) x the group's m-tiles), b_k weight beats and
+# w_k weight-cache writes of its slab, and p_k the patch producer's cycles
+# (its beats, a cost per output row, and on a loading sweep the input rows at
+# the pace of the line buffer or of the x loader, whichever is slower):
+#
+#   weight loader  L_k = max(L_{k-1}, F_{k-1} - CAP) + b_k      (its FIFO runs ahead)
+#   cache fill     F_k = max(max(F_{k-1}, S_{k-2}) + w_k, L_k)  (two banks)
+#   producer       P_k = P_{k-1} + p_k
+#   sweep          S_k = max(max(S_{k-1} + H (+ HZW), F_k + FL, D_{c-2}) + s_k, P_k + PL)
+#   drain          D_c = max(D_{c-1}, S_last(c) + LAT) + DPX * (1 or 2 cycles per pixel and m-tile)
+#
+# and the job ends with the last chunk's drain plus ONE.  The DDR's runs: an x
+# run (one per input row and channel) costs its words plus RUN, a weight run
+# (one per output channel of the slab) its beats; with XLAT / WLAT, 16 x and
+# 8 weight runs in flight bound them too.  RTL_CONV_SIM is tuned to the
+# Verilator testbench (ideal memory) on the 1 042 ConvKernel calls of the
+# calibration case list — median error 0.65 %, p90 5.3 % —, RTL_CONV_BOARD to
+# the board's (bitstream c2b2a6e5e50e, the same calls: median 3.1 %, p90
+# 14.6 %, against 18.7 / 37 % for the HLS model on its bitstream).  The worst
+# misses are narrow, tall MatMul-on-ConvKernel jobs (a few short x runs per
+# row whose DDR latency depends on the channel-plane stride: up to 2.5x
+# slower than modelled).  ONE excludes the host's call overhead (CALL_OVERHEAD).
+RTL_CONV_SIM = {"CAP": 256, "XL": 0, "PL": 0, "FL": 0, "H": 2, "HAZ": 80, "HZW": 50,
+                "LAT": 10, "ROW": 1, "ONE": 400, "XBEAT": 0.9, "XROW": 12, "RUN": 0,
+                "XLAT": 0, "WLAT": 0, "WBEAT": 1.0, "DPX": 1.1}
+RTL_CONV_BOARD = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
+                  "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
+                  "XLAT": 50, "WLAT": 30, "WBEAT": 1.05, "DPX": 1.1}
+
+
+@lru_cache(maxsize=16384)
+def rtl_conv_walk(in_ch: int, out_ch: int, in_h: int, in_w: int, oh: int, ow: int,
+                  kh: int, kw: int, sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
+                  pt: int = 0, pl: int = 0, dwise: bool = False, board: bool = False) -> dict:
+    """The RTL kernel's job (batch 1) through the recurrence above:
+    ``{total, sweep, fill, ph1 (0: no bias pass), ph3 (the drain where it is not
+    hidden), loads (where the producer bounds a sweep), chunks, rows, groups,
+    ic_tiles, owt}`` — the keys of the HLS model's walk.  ``dwise``: a
+    depthwise job (one m-tile per sweep, its own input tile)."""
+    p = RTL_CONV_BOARD if board else RTL_CONV_SIM
+    m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt = _conv_geom(
+        in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw)
+    if dwise:                                # no m-group cap on the chunk height
+        per = max(1, min(oh, CONV_MAX_ACC_PERSIST_ENTRIES // (ow * m_tiles * CONV_TILE_M)))
+        chunks, groups, mtg = -(-oh // per), 1, 1
+    E, T = CONV_WEIGHT_PORT_ELEMS, CONV_TILE_IC
+    npos = kh * kw
+    nwin = max(npos, 2)
+    L = F = Pd = S = S2 = 0.0
+    D = [0.0, 0.0]
+    prev_s = 0
+    sweep = fill = loads = dwait = 0.0
+    for c in range(chunks):
+        rows = min(per, oh - c * per)
+        r0 = c * per * sh - pt
+        r1 = (c * per + rows - 1) * sh + (kh - 1) * dh - pt
+        in_rows = max(0, min(r1, in_h - 1) - max(r0, 0) + 1)
+        if sh > (kh - 1) * dh + 1:           # rows between the windows are not read
+            in_rows = sum(1 for r in range(max(r0, 0), min(r1, in_h - 1) + 1)
+                          if (r + pt) % sh <= (kh - 1) * dh)
+        first = True
+        for ct in range(m_tiles if dwise else ic_tiles):
+            icv = min(T, (out_ch if dwise else in_ch) - ct * T)
+            half = not dwise and ct == ic_tiles - 1 and icv <= E
+            for t in range(owt):
+                cols = min(in_w, (min(owpt, ow - t * owpt) - 1) * sw + (kw - 1) * dw + 1)
+                ow0 = t * owpt
+                npairs = ((min(ow, ow0 + owpt) - 1) >> 1) - (ow0 >> 1) + 1
+                for g in range(groups):
+                    if dwise:
+                        G, mv = 1, icv
+                        b = mv * -(-npos // E)
+                    else:
+                        G = min(mtg, m_tiles - g * mtg)
+                        mv = sum(min(CONV_TILE_M, out_ch - (g * mtg + i) * CONV_TILE_M)
+                                 for i in range(G))
+                        b = mv * npos * (1 if half else 2)
+                    w = mv * npos
+                    s = rows * npairs * nwin * G
+                    b = max(b, (p["WLAT"] + b / mv) * mv / 8) * p["WBEAT"]
+                    pk = rows * (npairs * npos + p["ROW"])
+                    if dwise or g == 0:              # the m-group's first sweep loads
+                        words = -(-cols // E) + p["RUN"]
+                        xrow = max(icv * words * p["XBEAT"] + p["XROW"],
+                                   (p["XLAT"] + words) * icv / 16)
+                        pk = max(pk + in_rows * cols, in_rows * xrow) + p["XL"]
+                    L = max(L, F - p["CAP"]) + b
+                    Fn = max(max(F, S2) + w, L)
+                    Pd += pk
+                    h = p["H"] + (p["HZW"] if not dwise and ct > 0 and prev_s < p["HAZ"] else 0)
+                    S0 = max(S + h, Fn + p["FL"])
+                    fill += max(0.0, Fn + p["FL"] - (S + h))
+                    if first and c >= 2:             # chunk c reuses chunk c-2's buffer
+                        dwait += max(0.0, D[0] - S0)
+                        S0 = max(S0, D[0])
+                    Sn = max(S0 + s, Pd + p["PL"])
+                    loads += Sn - (S0 + s)
+                    sweep += s
+                    S2, S, F = S, Sn, Fn
+                    prev_s = s
+                    first = False
+        dr = p["DPX"] * sum(rows * ow * (2 if min(CONV_TILE_M, out_ch - mt * CONV_TILE_M) > E else 1)
+                            for mt in range(m_tiles))
+        D = [D[1], max(D[1], S + p["LAT"]) + dr]
+    return dict(total=D[1] + p["ONE"], sweep=sweep, fill=fill, ph1=0.0, ph3=dwait + D[1] - S,
+                loads=loads, chunks=chunks, rows=per, groups=groups, ic_tiles=ic_tiles, owt=owt)
+
+
+def conv_invoke_overhead() -> float:
+    """The fixed cycles of one ConvKernel call (its configuration, first
+    loads, last drain), the part that does not repeat per image."""
+    return RTL_CONV_SIM["ONE"] if CONV_IMPL == "rtl" else CONV_INVOKE_OVERHEAD
+
+
 def conv_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
                 oh: int, ow: int, kh: int, kw: int,
                 sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
@@ -159,7 +294,11 @@ def conv_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
     """Estimated cycles of one standard (group = 1) ConvKernel invocation
     with batch 1, split like conv_cycle_model.py's buckets:
     ``{total, sweep, fill, ph1, ph3, loads, chunks, rows, groups,
-    ic_tiles, owt}`` — the kernel in RTL simulation (the skill's model)."""
+    ic_tiles, owt}`` — the kernel with ideal memory (the skill's model): the
+    SystemVerilog kernel's recurrence (``rtl_conv_walk``) with
+    ``kernels.conv.impl == "rtl"``, the HLS kernel's walk with ``"hls"``."""
+    if CONV_IMPL == "rtl":
+        return rtl_conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl)
     return _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
                       0, 0.5)
 
@@ -176,7 +315,12 @@ def conv_board_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
     ConvKernel calls of the RTL MatmulKernel's bitstream (1d28630fbfa4):
     median error 20.5 → 18.7 %, p90 46 → 37 %; a 1x1 kernel on <= 256
     pixels and > 64 output channels (BERT's per-head attention P·V:
-    model 0.23 → 0.55 ms, board 0.61 ms) median |log error| 0.60 → 0.13."""
+    model 0.23 → 0.55 ms, board 0.61 ms) median |log error| 0.60 → 0.13.
+    With ``kernels.conv.impl == "rtl"``: ``rtl_conv_walk`` with the board's
+    parameters (RTL_CONV_BOARD)."""
+    if CONV_IMPL == "rtl":
+        return rtl_conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+                             board=True)
     return _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
                       CONV_WEIGHT_REQ_CYCLES, CONV_PREFETCH_HIDE)
 
@@ -237,7 +381,9 @@ def conv_batch_cycles(batch: int, board: bool = False, **geom) -> float:
     the invocation overhead does not (the conv-cycle-model --validate rule).
     ``board``: :func:`conv_board_cycles` instead of :func:`conv_cycles`."""
     t = (conv_board_cycles if board else conv_cycles)(**geom)["total"]
-    return (t - CONV_INVOKE_OVERHEAD) * batch + CONV_INVOKE_OVERHEAD
+    one = (RTL_CONV_BOARD if board else RTL_CONV_SIM)["ONE"] if CONV_IMPL == "rtl" \
+        else CONV_INVOKE_OVERHEAD
+    return (t - one) * batch + one
 
 
 def matmul_cycles(n: int, k: int, m: int, batch: int = 1, b_packed: bool = True) -> float:
@@ -341,6 +487,8 @@ __all__ = (
     "conv_cycles",
     "conv_board_cycles",
     "conv_batch_cycles",
+    "conv_invoke_overhead",
+    "rtl_conv_walk",
     "matmul_cycles",
     "gemv_cycles",
     "rtl_matmul_cycles",

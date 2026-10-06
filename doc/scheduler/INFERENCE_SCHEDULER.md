@@ -127,7 +127,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1648 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1651 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1056,16 +1056,32 @@ spends `max(kh·kw, 2)` cycles per pixel pair, so `kw ≥ 2` halves a 1×1's
 sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
-`(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` — the
-standard path of the conv-cycle-model skill (§2.42), kept equal to the
-skill script by a test — plus `CALL_OVERHEAD` (1 500 cycles) per call.  The
-cheapest is priced on the board with `cost_model.conv_board_cycles`, which
-adds what the RTL simulation hides: a weight slab is fetched with one
-request per output channel (`kh·kw·16` elements, 2 words for a 1×1
-kernel, 8 in flight), ~12 cycles each, overlapped with the sweep one word
-per iteration — fitted to the 962 measured ConvKernel calls, it moves
-BERT's per-head attention P·V conv from 0.23 to 0.55 ms (board 0.61).  That
-price is compared with `cost_model.matmul_cycles` (the MatmulKernel of
+`(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
+`CALL_OVERHEAD` (1 500 cycles) per call, and the cheapest is priced on the
+board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
+`kernels.conv.impl` (env `AXI_CONV_IMPL`):
+
+- **`"rtl"`** (the KV260's since CONV_RTL_PLAN phase 3,
+  doc/kernels/CONV_RTL_KERNEL.md): `cost_model.rtl_conv_walk`, the
+  kernel's sweeps as a pipeline recurrence — weight loader with its FIFO
+  run-ahead, the two weight-cache banks, the patch producer and x loader,
+  the sweep (one grid instant per cycle, `G · max(kh·kw, 2)` instants per
+  pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
+  set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
+  p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
+  DDR latency, x and weight runs; median 3.1 %, p90 14.6 % over the
+  calibration campaign of `c2b2a6e5e50e`).  BERT's per-head attention P·V
+  conv: 0.20 ms predicted, 0.21 ms on the board.
+- **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
+  the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
+  script by a test; `conv_board_cycles` adds what the RTL simulation hides:
+  a weight slab is fetched with one request per output channel (`kh·kw·16`
+  elements, 2 words for a 1×1 kernel, 8 in flight), ~12 cycles each,
+  overlapped with the sweep one word per iteration — fitted to the 962
+  measured ConvKernel calls, it moves BERT's per-head attention P·V conv
+  from 0.23 to 0.55 ms (board 0.61).
+
+That price is compared with `cost_model.matmul_cycles` (the MatmulKernel of
 `kernels.matmul.impl`: the RTL kernel's structural model, or the HLS
 kernel's board-calibrated block model).  The MatMul is lowered when the
 conv estimate is below
@@ -1101,13 +1117,14 @@ rows, 1.7–1.9× faster on the board (CHAT_PLAN §24).  Under `--plan` every
 row split of a contiguous-rows MatMul is a candidate
 (`conv_plans(splits="all")`, [§Planning](#planning---plan)).
 
-BERT-base (bertsquad-12, 386 nodes): 84 of the 98 MatMuls run on ConvKernel
-— the 72 encoder linears as 1×4 convs (`in_ch` 192 / 768, output 48×16 or
-192×16) and the 12 attention q·Kᵀ MatMuls as 12 per-head 1×1 calls each — in
-216 ConvKernel calls; the 12 attention P·V MatMuls (weight-request bound on
-ConvKernel, `conv_board_cycles`), the K = 2 token-type MatMul and the M = 2
-span head stay on MatmulKernel (phase 2A: 96 MatMuls on ConvKernel, P·V too,
-in 360 calls).  Phase 2A, cost model at 100 MHz: 0.62 s of MatMul per
+BERT-base (bertsquad-12, 386 nodes): 96 of the 98 MatMuls run on ConvKernel
+— the 72 encoder linears (the 48 768×768 ones as 1×4 convs, `in_ch` 192,
+output 96×8; the 24 FFN ones as 1×6 convs, `in_ch` 128 / 512, output 384×8
+or 96×8) and the 24 attention MatMuls as 12 per-head 1×1 calls each — in
+360 ConvKernel calls; the K = 2 token-type MatMul and the M = 2 span head
+stay on MatmulKernel.  (On the HLS ConvKernel's bitstreams the 12 P·V
+MatMuls, weight-request bound there, ran on MatmulKernel: 84 on ConvKernel
+in 216 calls, the linears as 1×4 convs.)  Phase 2A, cost model at 100 MHz: 0.62 s of MatMul per
 inference against 8.37 s on MatmulKernel (the phase-1 board measured
 8.41 s).  On the board the MatMuls take 0.63 s (linears 0.49 s at
 ~44 GMAC/s, attention 0.14 s) and BERT-base 4.34 s per inference instead
@@ -1372,8 +1389,8 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_HOST_THREADS=N` | `INFERENCE_HOST_THREADS=N` (1–64) | 4 | threads per host op (caller + N − 1 workers); models with host ops only |
 | `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
 
-BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 84 MatMuls on
-ConvKernel, 14 on MatmulKernel) for example:
+BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
+ConvKernel, 2 on MatmulKernel) for example:
 
 ```c
 int  inference_init(const char *vectoropkernel_instance,

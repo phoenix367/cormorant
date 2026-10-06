@@ -401,7 +401,7 @@ overrides `cfg.run.profile_layers` to true for that run.
 ### Reporting
 
 Per-model summary printed by `deploy_and_run.py` (example from a
-2026-05 bitstream; the current one runs `mnist_convnet` at 0.256 ms —
+2026-05 bitstream; the current one runs `mnist_convnet` at 0.235 ms —
 see `demo/mnist/README.md`):
 
 ```

@@ -39,7 +39,7 @@ import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 import host_emu
-from helpers import matmul_impl
+from helpers import conv_impl, matmul_impl
 from src.codegen import CodeGenerator
 from src.codegen._simulate import _conv2d_ref
 from src.cost_model import conv_cycles, matmul_cycles
@@ -224,6 +224,7 @@ class _Models(unittest.TestCase):
 
 
 @matmul_impl("hls")
+@conv_impl("hls")
 class TestEngineChoice(_Models):
 
     def test_bert_shapes_lowered(self):
@@ -321,10 +322,12 @@ class TestEngineChoice(_Models):
 
 
 @matmul_impl("rtl")
+@conv_impl("hls")
 class TestEngineChoiceRtl(_Models):
-    """The RTL MatmulKernel (128 MAC/cycle on GEMM, the HLS kernel's 32): the
-    wide, weight-heavy linears stay ahead on ConvKernel, the small GEMMs and
-    the attention products go to MatmulKernel."""
+    """The RTL MatmulKernel (128 MAC/cycle on GEMM, the HLS kernel's 32) with
+    the HLS ConvKernel (the bitstreams 1d28630fbfa4 … dbb320fb7297): the wide,
+    weight-heavy linears stay ahead on ConvKernel, the small GEMMs and the
+    attention products go to MatmulKernel."""
 
     def test_bert_attention(self):
         """BERT-base's attention (12 heads, 256 tokens, head dim 64): q·Kᵀ on
@@ -342,6 +345,34 @@ class TestEngineChoiceRtl(_Models):
             (sn,) = _lowered(_gen(self.m[name])[0])
             self.assertLess(sn.est_conv_cycles, LOWER_MARGIN * sn.est_matmul_cycles)
         for name in ("gemm", "attn", "shared_a", "fold"):
+            g, _ = _gen(self.m[name])
+            self.assertEqual(_lowered(g), [], name)
+            self.assertTrue(any(type(sn) is MatmulNode for sn in g.nodes), name)
+
+
+@matmul_impl("rtl")
+@conv_impl("rtl")
+class TestEngineChoiceRtlConv(_Models):
+    """Both kernels in SystemVerilog (the KV260's since CONV_RTL_PLAN): the RTL
+    ConvKernel's fixed cost is a third of the HLS kernel's and its drain runs
+    beside the next chunk, so besides the linears the small GEMM and BERT's
+    P·V move to it; the batched attention products and the shared-A / folded
+    shapes stay on MatmulKernel."""
+
+    def test_bert_attention(self):
+        """BERT-base's attention (12 heads, 256 tokens, head dim 64): q·Kᵀ and
+        P·V on ConvKernel — the board's verdict on c2b2a6e5e50e: a per-head
+        P·V conv takes 205 µs, the batched MatmulKernel call 4.45 ms."""
+        with tempfile.TemporaryDirectory() as td:
+            g, _ = _gen(_attention_model(os.path.join(td, "bert_attn.onnx"), 12, 256, 64))
+        self.assertEqual([(sn.k, sn.m) for sn in _lowered(g)], [(64, 256), (256, 64)])
+        self.assertEqual([sn for sn in g.nodes if type(sn) is MatmulNode], [])
+
+    def test_choices(self):
+        for name in ("linear", "ffn_up", "small", "rows", "gemm"):
+            (sn,) = _lowered(_gen(self.m[name])[0])
+            self.assertLess(sn.est_conv_cycles, LOWER_MARGIN * sn.est_matmul_cycles)
+        for name in ("attn", "shared_a", "fold"):
             g, _ = _gen(self.m[name])
             self.assertEqual(_lowered(g), [], name)
             self.assertTrue(any(type(sn) is MatmulNode for sn in g.nodes), name)
@@ -508,6 +539,7 @@ class TestCodegen(_Models):
 class TestCostModel(unittest.TestCase):
 
     @unittest.skipUnless(os.path.isfile(_SKILL), "conv-cycle-model skill script not found")
+    @conv_impl("hls")
     def test_conv_model_equals_skill_script(self):
         spec = importlib.util.spec_from_file_location("conv_cycle_model", _SKILL)
         ccm = importlib.util.module_from_spec(spec)
@@ -531,8 +563,9 @@ class TestCostModel(unittest.TestCase):
                 self.assertEqual(got[key], ref[key], (key, c, m, h, w, kh, kw, sh, sw))
             n += 1
 
+    @conv_impl("hls")
     def test_conv_board_model(self):
-        """conv_board_cycles: within 1 % of the RTL-simulation model where the
+        """The HLS ConvKernel: conv_board_cycles within 1 % of the RTL-simulation model where the
         weight fetch hides behind the sweep (a 3x3 conv on 56x56), above it
         where a 1x1 kernel's 2-word requests bound the fetch, and close to the
         board there — BERT's per-head P·V conv (1x1, 256 → 256 channels, 64
@@ -548,6 +581,27 @@ class TestCostModel(unittest.TestCase):
             for ow in (1, 8, 64):
                 g = dict(in_ch=256, out_ch=m, in_h=1, in_w=ow, oh=1, ow=ow, kh=1, kw=1)
                 self.assertGreater(conv_board_cycles(**g)["total"], conv_cycles(**g)["total"])
+
+    @conv_impl("rtl")
+    def test_rtl_conv_model(self):
+        """The SystemVerilog ConvKernel (cost_model.rtl_conv_walk): conv_cycles
+        against its Verilator testbench (ideal memory) and conv_board_cycles
+        against the board (c2b2a6e5e50e, 100 MHz, the calibration's call
+        overhead of 3.12 µs taken off): the 3x3 64-channel 56² job 228 810
+        cycles in the testbench, 229 160 on the board (grid-bound); the 1x1
+        128 → 256 channel 28² job 107 425 in the testbench; BERT's per-head
+        P·V (1x1, 256 → 256 channels, 64 pixels) 20 230 on the board."""
+        from src.cost_model import conv_board_cycles, conv_cycles
+        big = dict(in_ch=64, out_ch=64, in_h=58, in_w=58, oh=56, ow=56, kh=3, kw=3)
+        self.assertLess(abs(conv_cycles(**big)["total"] / 228810 - 1), 0.01)
+        self.assertLess(abs(conv_board_cycles(**big)["total"] / 229160 - 1), 0.01)
+        pw = dict(in_ch=128, out_ch=256, in_h=28, in_w=28, oh=28, ow=28, kh=1, kw=1)
+        self.assertLess(abs(conv_cycles(**pw)["total"] / 107425 - 1), 0.03)
+        pv = dict(in_ch=256, out_ch=256, in_h=1, in_w=64, oh=1, ow=64, kh=1, kw=1)
+        self.assertLess(abs(conv_board_cycles(**pv)["total"] / 20230 - 1), 0.05)
+        for r in (conv_cycles(**big), conv_board_cycles(**pv)):
+            self.assertEqual(r["ph1"], 0.0)                    # no bias pass
+            self.assertGreater(r["sweep"], 0)
 
     @matmul_impl("hls")
     def test_matmul_model_board_calibration(self):

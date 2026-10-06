@@ -154,15 +154,12 @@ static_assert(
 //
 // Recorded here for reference; the kernel C++ logic does not use it.  It is
 // the AXI_BUS_WIDTH build option (a top-level CMakeLists.txt cache variable;
-// default 32, allowed 32 / 64 / 128 / 256 / 512), applied at C synthesis by
-// the generated scripts/Synthesis.tcl.in (and Cosim.tcl.in) via:
+// default 32, allowed 32 / 64 / 128 / 256 / 512), which the retired Vitis HLS
+// synthesis applied as
 //     config_interface -m_axi_max_widen_bitwidth <kAxiBusWidth>
-//
-// It caps how wide HLS may auto-widen the gmem0..3 m_axi adapters.  A wider
-// bus moves more elements per burst beat (fewer DDR transactions), but it
-// MUST match the AXI data width of the Vivado block design the exported IP
-// is integrated into (MAXI_DATA_WIDTH on each kernel IP) — e.g. configure
-// with -DAXI_BUS_WIDTH=128 for a 128-bit block design.
+// to cap HLS auto-widening of plain-pointer m_axi ports (none is left: the
+// data ports are 128-bit by declaration).  The hardware's ConvKernel is the
+// SystemVerilog one (kernels/conv_rtl), with fixed 128-bit ports.
 // ---------------------------------------------------------------------------
 static constexpr unsigned kAxiBusWidth = @AXI_BUS_WIDTH@;
 

@@ -126,12 +126,26 @@ def _conv_terms(f) -> Dict[str, float]:
             "one": 1.0}
 
 
-# MatmulKernel exists as the Vitis HLS kernel and as the SystemVerilog one
-# (kernels/matmul_rtl): the families carry the terms of both structures,
-# the HLS tile model above and the RTL job walk (cost_model.rtl_matmul_terms,
-# prefixed "rtl_"), and the fit keeps the set that fits the bitstream's
-# measurements (perf_fit.FEATURE_SETS).
+# MatmulKernel and ConvKernel exist as the Vitis HLS kernels and as the
+# SystemVerilog ones (kernels/matmul_rtl, kernels/conv_rtl): the families
+# carry the terms of both structures, the HLS models above and the RTL job
+# walks (cost_model.rtl_matmul_terms, cost_model.rtl_conv_walk; prefixed
+# "rtl_"), and the fit keeps the set that fits the bitstream's measurements
+# (perf_fit.feature_sets).
 RTL_PREFIX = "rtl_"
+
+
+def _rtl_conv_terms(f) -> Dict[str, float]:
+    """The RTL ConvKernel's board walk (cost_model.rtl_conv_walk): its total
+    without the fixed cost, and the sweep time the weight fill and the
+    producer add, for the fit to re-weigh."""
+    from .cost_model import RTL_CONV_BOARD, rtl_conv_walk
+    r = rtl_conv_walk(f["in_ch"], f["out_ch"], f["in_h"], f["in_w"], f["out_h"], f["out_w"],
+                      f["kh"], f["kw"], f["stride_h"], f["stride_w"], f["dilation_h"],
+                      f["dilation_w"], f["pad_top"], f["pad_left"], bool(f["is_dw"]), True)
+    b = f["batch"]
+    return {RTL_PREFIX + "total": b * (r["total"] - RTL_CONV_BOARD["ONE"]),
+            RTL_PREFIX + "fill": b * r["fill"], RTL_PREFIX + "loads": b * r["loads"]}
 
 
 def _rtl_terms(f) -> Dict[str, float]:
@@ -145,12 +159,13 @@ def features(c: KernelCall) -> Dict[str, float]:
     f = c.fields
     fam = family(c)
     if fam in ("conv", "conv-mm"):
-        return _conv_terms(f)
+        return {**_conv_terms(f), **_rtl_conv_terms(f)}
     if fam == "conv-dw":
         pix = f["batch"] * f["out_ch"] * f["out_h"] * f["out_w"]
         return {"taps": pix * f["kh"] * f["kw"] / 16.0, "out_words": pix / 8.0,
                 "in_words": f["batch"] * f["in_ch"] * f["in_h"] * f["in_w"] / 8.0,
-                "rows": f["batch"] * (f["out_ch"] / 16.0) * f["out_h"], "one": 1.0}
+                "rows": f["batch"] * (f["out_ch"] / 16.0) * f["out_h"], "one": 1.0,
+                **_rtl_conv_terms(f)}
     if fam == "mm-tiled":
         from ._matmul_hw_config import MATMUL_TILE_M, MATMUL_TILE_N
         n, k, m, bt = f["n"], f["k"], f["m"], f["batch"]

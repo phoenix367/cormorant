@@ -4,6 +4,20 @@
 
 `ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of four hardware kernels in the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel tiling (output-channel tile kTileM × input-channel tile kTileIC, 16 × 16) maps onto a 16 × 16 MAC grid that one flat II=1 sweep per `(ic-tile, ow-tile, M-group)` feeds with two output pixels per cycle (§5.1). The inference scheduler also runs MatMuls on this kernel (§8).
 
+> **Retired from the hardware build (2026-10-06, CONV_RTL_PLAN phase 3).**
+> The bitstream carries a SystemVerilog drop-in with the same ports,
+> registers, m_axi bus parameters, DDR layouts and results,
+> `kernels/conv_rtl/`: [CONV_RTL_KERNEL](CONV_RTL_KERNEL.md) (first
+> bitstream `c2b2a6e5e50e`).  This kernel's HLS synthesis and co-simulation
+> targets are gone; its C++ (`ConvKernel.cpp`, `TestConvRef`,
+> `TestConvSweep`) stays as the reference model and writes the fixtures the
+> RTL kernel is tested against (the RTL testbench also runs it as its
+> oracle on random jobs).  The register map, contract, packed layouts,
+> geometry, arithmetic and scheduler integration below hold for both
+> kernels; the scheduler's cycle model follows `kernels.conv.impl` (§8).
+> The microarchitecture, timing, synthesis and resource sections describe
+> the retired HLS kernel.
+
 ---
 
 ## 1. AXI Interface
@@ -631,7 +645,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 - Rejects layers that break the §3 runtime constraints (`in_ch`, `out_ch`, `kh ≤ kMaxKH` / `kw ≤ kMaxKW`, the dilated row / column spans, the padded accumulator row) with a `SchedulerError` naming the bound; the bounds come from `_conv_hw_config.py` (the platform JSON's `kernels.conv`)
 - Packs the weight and bias initializers into the §2 tile-major DDR layout (`_pack_conv_weight`)
 
-**`MatmulConvNode` (`nodes.py`, chosen by `matmul_lowering.py`)** runs an ONNX `MatMul` on this kernel with swapped operand roles: for `C[N][M] = A[N][K]·B[K][M]`, `out_ch = N`, `in_ch = K/kw`, a `1 × kw` kernel with stride `(1, kw)`, no pad, no bias, `out_h × out_w = M`; `A` (row-major) is the weight, `B` the input. Eligibility: ap_fixed<16,8> graphs, `N > 1`, `K % 16 == 0`, `M % 8 == 0` and the §3 bounds; the engine choice (`--matmul-on-conv auto|always|off`) uses the cycle models in `cost_model.py` (with `--plan`, the calibrated performance model — INFERENCE_SCHEDULER.md "Planning (`--plan`)"). **Row split** (`matmul_lowering.conv_plans`): when every one-call plan of a MatMul with contiguous rows is accumulator-limited (an oh-chunk shorter than the line buffer's rows), the rows are spread over several calls that share B (SmolVLM's 1024-token vision linears run as 2 × 512 rows; INFERENCE_SCHEDULER.md "Row split"). Results are bit-identical to MatmulKernel. See doc/plans/BERT_PLAN.md §2 2A.
+**`MatmulConvNode` (`nodes.py`, chosen by `matmul_lowering.py`)** runs an ONNX `MatMul` on this kernel with swapped operand roles: for `C[N][M] = A[N][K]·B[K][M]`, `out_ch = N`, `in_ch = K/kw`, a `1 × kw` kernel with stride `(1, kw)`, no pad, no bias, `out_h × out_w = M`; `A` (row-major) is the weight, `B` the input. Eligibility: ap_fixed<16,8> graphs, `N > 1`, `K % 16 == 0`, `M % 8 == 0` and the §3 bounds; the engine choice (`--matmul-on-conv auto|always|off`) uses the cycle models in `cost_model.py` (for ConvKernel the one `kernels.conv.impl` names: the RTL kernel's `rtl_conv_walk` or this kernel's walk; with `--plan`, the calibrated performance model — INFERENCE_SCHEDULER.md "Planning (`--plan`)"). **Row split** (`matmul_lowering.conv_plans`): when every one-call plan of a MatMul with contiguous rows is accumulator-limited (an oh-chunk shorter than the line buffer's rows), the rows are spread over several calls that share B (SmolVLM's 1024-token vision linears run as 2 × 512 rows; INFERENCE_SCHEDULER.md "Row split"). Results are bit-identical to MatmulKernel. See doc/plans/BERT_PLAN.md §2 2A.
 
 **`LlmAttnConvNode` (`llm_nodes.py`)** runs attention as MatMul-on-ConvKernel calls, one per KV group: q·Kᵀ (the K cache is the weight, `out_ch` = keys) and P·V (the V cache as the `1 × kw` input, `in_ch` = keys / kw). In the Llama prefill the key count is a runtime value from the entry's `pos` / `n` written into those registers; the vision encoder (`src/vit.py`) uses a static key count.
 
@@ -647,20 +661,17 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestConvRef TestConvGrid && ctest -R 'TestConv'   # TestConvRef, TestConvGrid, TestConvSweep
+make TestConvRef TestConvGrid && ctest -R 'TestConv(Ref|Grid|Sweep)'
 
-# HLS synthesis + IP export for KV260
-make synthesize_conv_kv260
-
-# HLS synthesis + C/RTL co-simulation of TestConvSim.cpp (slow; separate component)
-make cosim_conv_kv260
-
-# RTL fixtures: regenerate (ad hoc) / run the xsim behavior test
+# RTL fixtures: regenerate (ad hoc) / run the xsim behavior test (the RTL IP,
+# package_conv_rtl)
 make gen_conv_test_data          # writes build/conv_test_data/
 make behavior_test_conv          # needs hw/cormorant_test_stand; reads hw/test_data/conv_test_data/
 ```
 
-The synthesis target reads `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV260; the CMake fallback when `clock` is absent is 300) plus its `kernels.conv` bounds, generates `build/kernels/conv/kv260/Config.h` and `synthesize_kv260.tcl` from `Synthesis.tcl.in`, and runs Vitis HLS in the unified component flow (`open_component`): 64-bit AXI addresses (`config_interface -m_axi_addr64`), `-m_axi_max_widen_bitwidth` from the top-level `AXI_BUS_WIDTH` cache variable (the ports are declared 128-bit in C++; the hardware build configures with `-DAXI_BUS_WIDTH=128`), `csynth_design`, then `export_design` to `build/kernels/conv/kv260/ip_catalog.zip`.
+The retired synthesis targets (`synthesize_conv_<platform>`,
+`cosim_conv_<platform>`, removed in CONV_RTL_PLAN phase 3) 
+read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV260; the CMake fallback when `clock` was absent was 300) plus its `kernels.conv` bounds, generated `build/kernels/conv/kv260/Config.h` and `synthesize_kv260.tcl` from `Synthesis.tcl.in`, and ran Vitis HLS in the unified component flow (`open_component`): 64-bit AXI addresses (`config_interface -m_axi_addr64`), `-m_axi_max_widen_bitwidth` from the top-level `AXI_BUS_WIDTH` cache variable (the ports are declared 128-bit in C++; the hardware build configured with `-DAXI_BUS_WIDTH=128`), `csynth_design`, then `export_design` to `build/kernels/conv/kv260/ip_catalog.zip`.  The hardware build packages the RTL kernel instead (`make package_conv_rtl`); its `rtl/cv_pkg.sv` holds the `kernels.conv` constants, checked against the platform JSON at configure time.
 
 ---
 
@@ -668,13 +679,12 @@ The synthesis target reads `platforms/kv260.json` (part, optional board, clock �
 
 | File | Purpose |
 |------|---------|
-| `kernels/conv/kernel/ConvKernel.cpp` | HLS kernel implementation |
+| `kernels/conv/kernel/ConvKernel.cpp` | HLS kernel implementation (the retired kernel; the RTL kernel's reference model and testbench oracle) |
 | `kernels/conv/include/ConvKernel.h` | Kernel declaration, `saturate_cast<T>`, 128-bit port word types, packed weight / bias layout helpers (`conv_weight_index()` …), cosim depths |
 | `kernels/conv/include/ConvMacGrid.h` | MAC grid (`w_cache_read`, `mac_grid_column_step`, `mac_dw_step`) and weight-cache geometry, isolated from all tile geometry |
 | `kernels/conv/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, tile constants) |
 | `kernels/conv/test/TestConvSim.cpp` | C simulation tests (GCC), `--dump-data` RTL fixtures, `--sweep N` |
 | `kernels/conv/test/TestConvGrid.cpp` | MAC-grid unit test |
-| `kernels/conv/scripts/Synthesis.tcl.in`, `Cosim.tcl.in` | Vitis HLS TCL templates (synthesis / synthesis + cosim) |
 | `platforms/kv260.json` | KV260 platform config (`kernels.conv` bounds, part, clock) |
 | `inference-scheduler/src/_conv_hw_config.py` | Scheduler-side read of `kernels.conv` |
 | `inference-scheduler/src/nodes.py` | `ConvNode` / `MatmulConvNode` classes (ONNX → kernel params, weight packing) |
@@ -699,7 +709,7 @@ The synthesis target reads `platforms/kv260.json` (part, optional board, clock �
 | **Inner-MAC parallelism (standard)** | 16 × 16 MAC grid × 2 output pixels: 2 × kTileIC × kTileM = 512 MACs/cycle against one weight word per column (§2.24, §2.40, §2.42) |
 | **Inner-MAC parallelism (depthwise)** | PM-wide channel-parallel × 2 pixels: 2 × kTileM = 32 MACs/cycle (§2.42) |
 | **Initiation interval** | II=1 (all pipelined inner loops; see §5.7) |
-| **Clock** | 150 MHz synthesis target on the KV260 (`platforms/kv260.json`) |
+| **Clock** | 150 MHz synthesis target on the KV260 (`platforms/kv260.json`; the retired synthesis) |
 | **Dataflow stages** | 6 (x_row_loader, input_patch_producer, bias_producer, stream_load_weights, process_conv_kernel_tile, write_output_tile) |
 | **Weight caching (M-grouping)** | One `(ict, ow_tile, M-group)` weight slab is loaded once into the weight cache (`w_lo` BRAM + `w_hi` URAM) and reused across the spatial sweep, the next slab prefetched into the other bank (§2.35); weight DDR replay across (oh, ow) eliminated |
 | **Channel-packed patch stream** | `PatchPair` carries kTileIC lanes of TWO adjacent output pixels per beat (§2.12, §2.42); consumer patch drain is `kh·kw` beats per pixel pair |

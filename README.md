@@ -4,8 +4,8 @@
   <img src="doc/images/cormorant.png" alt="Cormorant" width="320"/>
 </p>
 
-Four kernels for the Xilinx Kria KV260 (Conv in Vitis HLS, VectorOP, MatMul
-and Pooling in SystemVerilog) and a Python code generator that compiles
+Four kernels for the Xilinx Kria KV260 (Conv, VectorOP, MatMul and Pooling,
+all in SystemVerilog) and a Python code generator that compiles
 ONNX models — CNNs, BERT-base, Llama-family decoders, a ViT vision encoder
 and a VITS text-to-speech model — into self-contained C projects that drive the
 kernels from Linux on the board.  Everything runs in 16-bit fixed point
@@ -29,25 +29,25 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-10-04 on the bitstream
-with the SystemVerilog MatmulKernel, `1d28630fbfa4`, the demos again on today's `bbb9a37f73f8`
-— the same kernels plus a pool-window guard — within 0.1 %; the chat-server Piper figures 2026-10-01):
+KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-10-06 on the bitstream
+with the SystemVerilog ConvKernel, `c2b2a6e5e50e`, [CONV_RTL_PLAN phases 2–3](doc/plans/CONV_RTL_PLAN.md);
+the chat-server Piper figures 2026-10-01, on the HLS ConvKernel):
 
 | Model | Result | Source |
 |---|---|---|
-| ResNet-18, 224×224 | **59.9 ms (16.7 FPS)** per image | [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) (62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | 73.0 / 62.9 ms per image | [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) |
-| MNIST convnet / LeNet | 0.256 / 2.743 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **919 ms** per inference (p50; 907 ms built with `--plan`), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md), [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
-| SmolLM2-135M-Instruct | **10.0 tokens/s** decode (7.9 at 1000 cached tokens), 16-token prefill 0.25 s, 256-token prefill 1.28 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [MATMUL_RTL_PLAN phase 4](doc/plans/MATMUL_RTL_PLAN.md) |
-| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.2 at 1000 cached tokens), 16-token prefill 0.58 s, 256-token prefill 3.08 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) |
-| SmolVLM-256M-Instruct (image chat) | **3.9 s** per image for the vision encoder (7.7 s at first), then 101 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md) |
-| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.7 s** per 1.49 s of audio (real-time factor 0.52), text encoder 68 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end; listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [samples](demo/tts/README.md#samples) |
+| ResNet-18, 224×224 | **47.4 ms (21.1 FPS)** per image | [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) (59.9 ms on the HLS ConvKernel, 62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
+| MobileNet V1 / V2, 224×224 | 41.2 / 38.1 ms per image | [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) (72.8 / 62.7 ms on the HLS ConvKernel) |
+| MNIST convnet / LeNet | 0.235 / 2.701 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **839 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [CONV_RTL_PLAN phase 3](doc/plans/CONV_RTL_PLAN.md), [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
+| SmolLM2-135M-Instruct | **10.0 tokens/s** decode (7.9 at 1000 cached tokens), 16-token prefill 0.24 s, 256-token prefill 1.12 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [CONV_RTL_PLAN phase 3](doc/plans/CONV_RTL_PLAN.md) |
+| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.2 at 1000 cached tokens), 16-token prefill 0.57 s, 256-token prefill 2.62 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) |
+| SmolVLM-256M-Instruct (image chat) | **3.4 s** per image for the vision encoder (7.7 s at first), then 100 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.43 s** per 1.49 s of audio (real-time factor 0.30), text encoder 62 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end; listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [samples](demo/tts/README.md#samples) |
 
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
-The FPGA design (`hw/cormorant_hw_128` 7d8eefe) uses 78 % of the DSPs
-(973 / 1248), 64.4 % of the LUTs (75 472 / 117 120), 105 / 144 BRAM and
+The FPGA design (`hw/cormorant_hw_128` 850cc88) uses 55 % of the DSPs
+(688 / 1248), 48.3 % of the LUTs (56 516 / 117 120), 103 / 144 BRAM and
 48 / 64 URAM.
 
 ---
@@ -67,17 +67,18 @@ fixed-point simulation.  The diagram is drawn by
 
 ## Hardware kernels
 
-All data ports are 128-bit AXI masters with 64-bit addresses and
-16-byte-aligned bases — `hls::burst_maxi` in the Vitis HLS ConvKernel;
-VectorOPKernel, MatmulKernel and PoolingKernel are written in SystemVerilog — and the control registers are
-AXI-Lite.  HLS targets 150 MHz; the board runs the PL at 100 MHz.  Compile-time bounds come from
-[`platforms/kv260.json`](platforms/kv260.json).
+All four kernels are written in SystemVerilog (each a drop-in for the Vitis
+HLS kernel it replaced, whose C++ stays as the reference model).  All data
+ports are 128-bit AXI masters with 64-bit addresses and 16-byte-aligned
+bases, and the control registers are AXI-Lite.  The kernels close timing
+at 300 MHz out of context; the board runs the PL at 100 MHz.  Compile-time
+bounds come from [`platforms/kv260.json`](platforms/kv260.json).
 
 | Kernel | ONNX ops | Highlights | Reference |
 |---|---|---|---|
 | **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | SystemVerilog: 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), fused Relu / Relu6 after an op | [VECTOROP_RTL_KERNEL](doc/kernels/VECTOROP_RTL_KERNEL.md) |
 | **MatmulKernel** | `MatMul` | SystemVerilog: 2 × 64 DSP MACs (128 MAC/cycle) on panels of 8 A rows, packed-B weight layout (32-column tiles), K ≤ 4096, batched; image mode reads B in ConvKernel's layout through both read ports, so a weight shared with ConvKernel is stored once | [MATMUL_RTL_KERNEL](doc/kernels/MATMUL_RTL_KERNEL.md) |
-| **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | 16 × 16 MAC grid, two output pixels per cycle (512 MACs), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels | [CONV_KERNEL](doc/kernels/CONV_KERNEL.md) |
+| **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | SystemVerilog: 16 × 16 MAC grid, two output pixels per cycle (512 MACs in 32 cascades of 16 DSP48E2), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels; a chunk's drain overlaps the next one's compute | [CONV_RTL_KERNEL](doc/kernels/CONV_RTL_KERNEL.md) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | SystemVerilog: 8 channel lanes, windows ≤ 7×7, two output positions per cycle, dilation, `count_include_pad` | [POOL_RTL_KERNEL](doc/kernels/POOL_RTL_KERNEL.md) |
 
 The Vivado block design (a git submodule, `hw/cormorant_hw_128`) streams the
@@ -173,9 +174,9 @@ ctest
 ```
 
 Or build them one by one: `make TestSimulation TestConvRef TestConvGrid
-TestMatmulRef TestPoolingSim` (+ `TestMatmulBlas` with a BLAS, `TestMatmulRtl`,
-`TestVectorOpRtl` and `TestPoolRtl` — the SystemVerilog MatmulKernel, VectorOPKernel
-and PoolingKernel — with Verilator 5.x).
+TestMatmulRef TestPoolingSim` (the reference models; + `TestMatmulBlas` with a
+BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl` (the
+SystemVerilog kernels, with Verilator 5.x).
 
 ### 3. The scheduler and its tests
 
@@ -183,7 +184,7 @@ and PoolingKernel — with Verilator 5.x).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1648 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1651 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -192,22 +193,19 @@ python3 ../tools/facts/facts.py install-hook     # optional: git commit checks t
 
 ```bash
 cd build
-cmake .. -DAXI_BUS_WIDTH=128     # the block design is 128-bit
-make synthesize_kv260            # IP export + C drivers of all four kernels (Conv HLS, the RTL MatmulKernel, VectorOPKernel and PoolingKernel)
+cmake ..
+make synthesize_kv260            # IP export + C drivers of all four kernels (Vivado packaging of the RTL)
 make build_hw_kv260              # Vivado: bitstream in hw/cormorant_hw_128/.../impl_1/
 make dtbo_kv260_cormorant        # device-tree overlay: build/dts/kv260/design_cormorant.dtbo
 ```
 
-`make build_hw_kv260` runs the ConvKernel HLS synthesis and packages the
-SystemVerilog MatmulKernel, VectorOPKernel and PoolingKernel itself, so the separate `synthesize_kv260` step
-is only needed for the C drivers (used by the
-board tests and the demos: ConvKernel's under `build/kernels/conv/…/drivers`;
-the RTL kernels' in `build/kernels/matmul_rtl/driver/`, `build/kernels/vectorop_rtl/driver/`
-and `build/kernels/pool_rtl/driver/`,
-also `make driver_matmul_rtl driver_vectorop_rtl driver_pool_rtl`) without a
-bitstream build.  The ConvKernel synthesis deletes and rebuilds its
-driver directory, so do not generate demo or test projects while
-it runs.  `hw/cormorant_hw_128/build.sh` uses the `vivado` that Vitis's
+`make build_hw_kv260` packages the four SystemVerilog kernels itself, so
+the separate `synthesize_kv260` step is only needed for the C drivers
+(used by the board tests and the demos: `build/kernels/<k>_rtl/driver/`;
+`make driver_vectorop_rtl driver_conv_rtl driver_matmul_rtl driver_pool_rtl`
+writes them alone, with Python and no Vivado) without a bitstream build.
+Do not generate demo or test projects while a driver target rewrites its
+directory.  `hw/cormorant_hw_128/build.sh` uses the `vivado` that Vitis's
 `settings64.sh` put on `PATH`.  Expected warnings: Vivado's `File not found
 as '…/utils_1/imports/synth_1/design_cormorant_wrapper.dcp'; using path …`
 (the project file carries the maintainer's old incremental-synthesis
@@ -266,9 +264,9 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1648<!-- /fact --> tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1651<!-- /fact --> tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
-| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the RTL MatmulKernel, VectorOPKernel and PoolingKernel) | `make -j8 && ctest` in `build/` |
+| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the four RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |

@@ -21,7 +21,7 @@
       "MatmulKernel":   "fabric_matmul",
       "ConvKernel":     "fabric_conv"
     },
-    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs 84 of its 98 MatMuls; MatmulKernel the token-type and span-head MatMuls and the 12 attention P·V).",
+    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs 96 of its 98 MatMuls; MatmulKernel the token-type and span-head MatMuls).",
     "cmake_args": []
   },
 
@@ -29,9 +29,9 @@
     "driver_dirs": {
       "VectorOPKernel": "../../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel":   "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
-      "ConvKernel":     "../../build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
+      "ConvKernel":     "../../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Kernel driver sources, copied into the project. Build them in build/ with make synthesize_conv_kv260 driver_vectorop_rtl driver_matmul_rtl."
+    "_driver_dirs_note": "Kernel driver sources, copied into the project. Build them in build/ with make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl."
   },
 
   "model": "assets/models/bertsquad-12-simplified.onnx",

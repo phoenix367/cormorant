@@ -5,6 +5,7 @@
   "clock": 150,
   "kernels": {
     "conv": {
+      "impl":                    "rtl",
       "tile_m":                  16,
       "tile_ic":                 16,
       "max_kh":                  7,

@@ -1,0 +1,8 @@
+`verilator_config
+// Port name fixed by the HLS interface contract.
+lint_off -rule SYMRSVDWORD -file "*/cv_core.sv" -match "*interrupt*"
+lint_off -rule SYMRSVDWORD -file "*/ConvKernel.v" -match "*interrupt*"
+// Partially used address vectors (16-byte aligned bases, word-aligned AXI-Lite addresses).
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"
+// Each DSP's P output is only taken from the chain's last DSP (the others feed PCOUT).
+lint_off -rule UNUSEDSIGNAL -file "*/cv_mac_chain.sv" -match "*pout*"

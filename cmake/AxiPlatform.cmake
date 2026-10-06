@@ -7,16 +7,19 @@
 # inherit the variables it set and the include is a no-op.
 #
 # Sets:
-#   AXI_BUS_WIDTH               (cache) the kernels' AXI master bus width
+#   AXI_BUS_WIDTH               (cache) informational: the bus width the HLS
+#                               synthesis widened ports to; every kernel is
+#                               RTL now (fixed 128-bit ports), so it affects no IP
 #   AXI_PLATFORM_FILES          platforms/*.json — one synthesis target per file
 #   AXI_PLATFORM                (cache) the default platform, kv260
 #   AXI_DEFAULT_PLATFORM_JSON   platforms/<AXI_PLATFORM>.json — the bounds the
 #                               C-sim builds (and the Python scheduler) target
 include_guard(GLOBAL)
 
-# AXI master bus data width.  Valid values: 32, 64, 128, 256, 512.
-# Wider buses amortise burst overhead; must match the interconnect configured
-# in the Vivado block design (MAXI_DATA_WIDTH for each kernel IP).
+# AXI master bus data width.  Valid values: 32, 64, 128, 256, 512.  It set the
+# HLS kernels' -m_axi_max_widen_bitwidth; with every kernel in SystemVerilog
+# (128-bit data ports, the block design's width) only the ConvKernel C++
+# model's informational kAxiBusWidth reads it.
 set(AXI_BUS_WIDTH 32 CACHE STRING
     "AXI master bus data width in bits (32, 64, 128, 256, 512)")
 set_property(CACHE AXI_BUS_WIDTH PROPERTY STRINGS 32 64 128 256 512)

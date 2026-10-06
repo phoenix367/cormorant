@@ -328,7 +328,8 @@ def _preflight(cfg: dict, *, models_filter: List[str] = None) -> bool:
                   else Path(path)
             if not src.is_dir():
                 _log(f"warning: driver_dirs.{kernel}: {src} not found "
-                     "(run `make synthesize_kv260` from the repo root)")
+                     "(run `make driver_vectorop_rtl driver_conv_rtl driver_matmul_rtl "
+                     "driver_pool_rtl` in build/)")
     return ok
 
 

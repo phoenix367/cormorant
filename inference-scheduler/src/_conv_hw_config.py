@@ -20,6 +20,7 @@ JSON shape (only the fields this module reads)::
     {
       "kernels": {
         "conv": {
+          "impl":                    "rtl",
           "tile_m":                  16,
           "tile_ic":                 16,
           "max_kh":                  7,
@@ -46,6 +47,17 @@ Platform selection (lower entries override higher ones):
 
 Missing / malformed fields raise ``ConvHwConfigError`` rather than
 silently falling back to defaults.
+
+``impl`` names the ConvKernel the platform's bitstream carries: ``"hls"``
+(the Vitis HLS kernel, ``kernels/conv``) or ``"rtl"`` (the SystemVerilog
+one, ``kernels/conv_rtl``).  The two run the same calls bit-identically but
+at different speeds, so it selects the ConvKernel cycle model
+(``cost_model.py``) behind the automatic engine and geometry choices.  The
+hardware build packages only the RTL kernel (the HLS kernel's synthesis was
+retired, doc/plans/CONV_RTL_PLAN.md phase 3); ``"hls"`` models the bitstreams
+built before (``dbb320fb7297`` and older).  The ``AXI_CONV_IMPL`` environment
+variable overrides it for the scheduler (e.g. ``AXI_CONV_IMPL=hls`` for a
+project on such a bitstream).
 
 ``tile_ic`` is not used by the validator: ``kTileIC`` is a pure
 unrolling factor (any in_ch is residual-padded); the weight packing reads
@@ -98,6 +110,9 @@ _REQUIRED: Tuple[Tuple[str, str], ...] = (
 )
 
 
+IMPLS: Tuple[str, ...] = ("hls", "rtl")
+
+
 class ConvHwConfigError(RuntimeError):
     """Platform JSON is missing / malformed for the conv kernel."""
 
@@ -134,11 +149,12 @@ def _load_conv_section(path: Path) -> Mapping[str, int]:
     return section
 
 
-def resolve(platform_name: str = None) -> Dict[str, int]:
+def resolve(platform_name: str = None) -> Dict[str, object]:
     """Resolve ConvKernel constants for the given platform.
 
     ``platform_name=None`` falls back to ``AXI_PLATFORM`` from the env, then
-    to the built-in default ``kv260``.  Function-based so tests can probe
+    to the built-in default ``kv260``.  ``CONV_IMPL`` is the JSON's ``impl``
+    unless ``AXI_CONV_IMPL`` is set.  Function-based so tests can probe
     arbitrary platforms without re-importing this module — module-level
     constants below freeze the default-platform values at import time.
     """
@@ -146,7 +162,19 @@ def resolve(platform_name: str = None) -> Dict[str, int]:
         platform_name = os.environ.get("AXI_PLATFORM", _DEFAULT_PLATFORM)
     path    = _resolve_platform_path(platform_name)
     section = _load_conv_section(path)
-    out: Dict[str, int] = {}
+    out: Dict[str, object] = {}
+    impl = section.get("impl")
+    if impl not in IMPLS:
+        raise ConvHwConfigError(
+            f"Platform JSON {path}: 'kernels.conv.impl' must be one of "
+            f"{', '.join(IMPLS)}, got {impl!r}.")
+    env = os.environ.get("AXI_CONV_IMPL")
+    if env:
+        if env not in IMPLS:
+            raise ConvHwConfigError(
+                f"AXI_CONV_IMPL must be one of {', '.join(IMPLS)}, got {env!r}.")
+        impl = env
+    out["CONV_IMPL"] = impl
     for json_key, py_attr in _REQUIRED:
         if json_key not in section:
             raise ConvHwConfigError(
@@ -178,6 +206,7 @@ CONV_TILE_IC                 : int = _CFG["CONV_TILE_IC"]
 CONV_MAX_KH                  : int = _CFG["CONV_MAX_KH"]
 CONV_MAX_KW                  : int = _CFG["CONV_MAX_KW"]
 CONV_MAX_M_PER_GROUP         : int = _CFG["CONV_MAX_M_PER_GROUP"]
+CONV_IMPL                    : str = _CFG["CONV_IMPL"]    # "hls" | "rtl": the cycle model
 
 # ConvKernel's weight / bias ports are hls::burst_maxi<ap_uint<128>>:
 # kWeightPortBits / kDataBits = 128 / 16 Data_t lanes per beat
@@ -198,6 +227,7 @@ __all__ = (
     "CONV_MAX_KH",
     "CONV_MAX_KW",
     "CONV_MAX_M_PER_GROUP",
+    "CONV_IMPL",
     "CONV_WEIGHT_PORT_ELEMS",
     "ConvHwConfigError",
     "resolve",

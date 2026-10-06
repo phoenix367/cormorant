@@ -312,7 +312,7 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_smolvlm
 - No `llm_calibrate.py` hash / `check` for the VLM formats (reruns are
   byte-identical, §23); `--prefill-attn fpga` is required.
 - Board gate: image prompts `--images 39769,1268` (COCO), 2 × 17 / 17 logits
-  vs the simulation (no `--study-json`); `llm_image` ~3.9 s.
+  vs the simulation (no `--study-json`); `llm_image` ~3.4 s (3.9 s before the RTL ConvKernel).
 - Serving: the `smolvlm` backend exists (`smolvlm_backend.py`, `idefics3.py`,
   `vlm_image.py`; `--vlm-*`; config block `smolvlm`, `cma_mb` 540); the board
   needs `python3-pil` (deploy preflight checks it).  API gate: 48-token

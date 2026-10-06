@@ -6,8 +6,8 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1648 tests); the chat app (188 tests) |
-| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL MatmulKernel, VectorOPKernel and PoolingKernel) | Each kernel's C++ reference against per-test golden vectors, and the SystemVerilog MatmulKernel, VectorOPKernel and PoolingKernel in Verilator against the same fixtures (`ctest`) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1651 tests); the chat app (188 tests) |
+| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the four SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1648 tests in 75 modules (all pass, none skipped; the first run
+# Run all 1651 tests in 75 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
@@ -198,19 +198,28 @@ The SystemVerilog PoolingKernel (`kernels/pool_rtl/`,
 the HLS kernel's C++ under randomised AXI timing; `PoolRtlDriver` checks the
 C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
 
+The SystemVerilog ConvKernel (`kernels/conv_rtl/`,
+[CONV_RTL_KERNEL](../kernels/CONV_RTL_KERNEL.md)) likewise: `TestConvRtl`
+(in plain `make`) runs the 63 checked-in ConvKernel fixtures — the ones
+`TestConvRef --dump-data` writes — plus 200 random jobs checked against the
+HLS kernel's C++ under randomised AXI timing; `ConvRtlDriver` checks the C
+driver's register table against the RTL; `ConvRtlDsp` (when Vivado's
+`DSP48E2.v` unisim model is found) runs the MAC chain's behavioural model
+against Vivado's DSP48E2 model cycle by cycle; `make lint_conv_rtl` is its
+lint.
+
 ---
 
 ## 3. Hardware simulation (Vivado, no board)
 
 RTL behavioural simulation in Vivado xsim — no board required, but the
-per-kernel IP archives (ConvKernel's HLS synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's packaging) must exist first.
+per-kernel IPs (the four RTL kernels' packaging) must exist first.
 
 ```bash
 cd build
 
-# Prerequisite: the four kernel IPs (ConvKernel's HLS synthesis + the RTL
-# MatmulKernel's, VectorOPKernel's and PoolingKernel's packaging, ~5–10 min); Vitis's
-# settings64.sh puts vitis-run, vivado and xclbinutil on PATH
+# Prerequisite: the four kernel IPs (the RTL kernels' packaging, a few minutes);
+# Vitis's settings64.sh puts vivado and xclbinutil on PATH
 source <Xilinx>/2025.2/Vitis/settings64.sh
 make synthesize_kv260
 
@@ -225,7 +234,7 @@ make sim_hw_kv260
 ```
 
 Each `behavior_test_<k>` depends on its kernel's IP target —
-`synthesize_conv_kv260`, `package_matmul_rtl`, `package_vectorop_rtl`,
+`package_conv_rtl`, `package_matmul_rtl`, `package_vectorop_rtl`,
 `package_pool_rtl` — (so it rebuilds its kernel's IP and driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
@@ -294,15 +303,15 @@ The two fields you must set are:
 
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
-  driver sources for each kernel (Vitis HLS generates ConvKernel's;
-  `make driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`
-  write MatmulKernel's, VectorOPKernel's and PoolingKernel's; the example's
+  driver sources for each kernel (`make driver_matmul_rtl` /
+  `driver_vectorop_rtl` / `driver_conv_rtl` / `driver_pool_rtl` write
+  them, the RTL kernels' drivers with the HLS drivers' API; the example's
   `../build/…` paths, relative to `inference-scheduler/`, fit a build in
   `<repo>/build`), e.g.:
 
   ```
   "VectorOPKernel": "<repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src"
-  "ConvKernel":     "<repo>/build/kernels/conv/kv260/conv_kv260/hls/impl/ip/drivers/ConvKernel_v1_0/src"
+  "ConvKernel":     "<repo>/build/kernels/conv_rtl/driver/ConvKernel_v1_0/src"
   "PoolKernel":     "<repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
   ```
 

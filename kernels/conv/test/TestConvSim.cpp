@@ -1,10 +1,10 @@
 // ---------------------------------------------------------------------------
 // TestConvSim.cpp — reference tests for ConvKernel.
 //
-// This single bench serves BOTH verification flows:
-//   * plain C simulation  — the CMake TestConvRef target (host compiler);
-//   * C/RTL co-simulation — the cosim_conv_<platform> target, which compiles
-//     this file with -DCONV_COSIM (set by scripts/Cosim.tcl.in).
+// This bench is the plain C simulation — the CMake TestConvRef target (host
+// compiler).  Built with -DCONV_COSIM it was also the C/RTL co-simulation
+// bench of the Vitis HLS synthesis, retired with its scripts in
+// CONV_RTL_PLAN phase 3 (the hardware's ConvKernel is kernels/conv_rtl).
 //
 // Each test computes the same convolution with two independent implementations:
 //
