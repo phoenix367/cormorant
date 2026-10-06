@@ -148,15 +148,24 @@ module cv_wload
     if (rvalid) d_lo <= rdata;
   end
 
+  // the entry through a register into the FIFO (the run queue's pair bit
+  // selects 256 bits): the credits reserved its room when the run was requested
+  logic          push_q;
+  logic [TIC*EW-1:0] push_data_q;
+  always_ff @(posedge clk) begin
+    push_q      <= push && !rst;
+    push_data_q <= push_data;
+  end
+
   logic fifo_in_ready;
   logic [FW-1:0] fifo_n;
   cv_fifo #(.W(TIC * EW), .D(FD), .BRAM(1'b1)) u_vf (
-    .clk, .rst, .in_valid (push), .in_ready (fifo_in_ready), .in_data (push_data),
+    .clk, .rst, .in_valid (push_q), .in_ready (fifo_in_ready), .in_data (push_data_q),
     .out_valid (wv_valid), .out_ready (wv_ready), .out_data (wv_data), .count (fifo_n)
   );
   assign fifo_pop = wv_valid && wv_ready;
 
-  assign idle = !s_act && !arvalid && (outs == '0) && !wv_valid;
+  assign idle = !s_act && !arvalid && (outs == '0) && !push_q && !wv_valid;
 
   logic unused;
   assign unused = fifo_in_ready ^ ^fifo_n ^ ^run_n ^ ^j ^ ^wq;

@@ -236,8 +236,8 @@ per-step logs written to demo/mnist/build/logs
 
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
-  mnist_convnet  OK       98.92%      0.235      0.235      0.243     4247.3
-  mnist_lenet    OK       97.35%      2.701      2.701      2.708      370.2
+  mnist_convnet  OK       98.92%      0.111      0.110      0.117     9045.6
+  mnist_lenet    OK       97.35%      1.249      1.245      1.314      800.8
 ```
 
 Notable behaviour visible in the run:

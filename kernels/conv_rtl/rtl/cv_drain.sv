@@ -229,20 +229,31 @@ module cv_drain
     .out_valid (sq_valid), .out_ready (sq_pop), .out_data (sq), .count (sq_n)
   );
 
-  // read latency 2 (the BRAM's output register): the data of the address
-  // given with e_go arrives with rd_v2
+  // The banks are spread over several block-RAM columns: the scatter reaches
+  // each bank through a register (enable, address, lane), the emitter's read
+  // address too (a copy per bank), and the read has the RAM's output
+  // register — the data of the address given with e_go arrives with rd_v3.
+  // A segment's last write lands the cycle after its seg_done; the emitter
+  // reads it three cycles later at the earliest.
   logic [E*EW-1:0] t_rdata;
   logic [9:0]      t_raddr;
   for (genvar b = 0; b < E; b++) begin : g_tb
     (* ram_style = "block" *) logic [EW-1:0] mem [2 * TM * SW];
     logic [2:0]  jl;                       // the lane (channel t_h + jl) bank b takes
-    logic [9:0]  wa;
-    logic [EW-1:0] rd;
+    logic        tw_we;
+    logic [9:0]  tw_addr;
+    (* keep = "true" *) logic [9:0] tr_addr;
+    logic [EW-1:0] tw_data, rd;
     assign jl = 3'(b) - t_p[2:0];
-    assign wa = {t_buf, t_h[3] ? 1'b1 : 1'b0, jl, t_p[7:3]};   // buf, channel (t_h + jl), word p / 8
     always_ff @(posedge clk) begin
-      if (t_we) mem[wa] <= t_lanes[jl * EW +: EW];
-      rd <= mem[t_raddr];
+      tw_we   <= t_we && !rst;
+      tw_addr <= {t_buf, t_h[3] ? 1'b1 : 1'b0, jl, t_p[7:3]};   // buf, channel (t_h + jl), word p / 8
+      tw_data <= t_lanes[jl * EW +: EW];
+    end
+    always_ff @(posedge clk) begin
+      tr_addr <= t_raddr;
+      if (tw_we) mem[tw_addr] <= tw_data;
+      rd <= mem[tr_addr];
       t_rdata[b * EW +: EW] <= rd;
     end
   end
@@ -254,14 +265,15 @@ module cv_drain
   logic [5:0]  e_j, e_nw;                  // word within the channel's run
   logic [31:0] e_e;
   logic        e_go, e_runpush;
-  logic        rd_v1, rd_v2;
-  logic [2:0]  rd_rot1, rd_rot2;
+  logic        rd_v1, rd_v2, rd_v3;
+  logic [2:0]  rd_rot1, rd_rot2, rd_rot3;
   logic        yq_in_ready, rq_in_ready;
   logic [5:0]  yq_n;
   logic [2:0]  rq_n;
 
   // output word queue (credit: words in the RAM read pipeline count)
-  assign e_go     = e_act && (32'(yq_n) + 32'(rd_v1) + 32'(rd_v2) < 30) && (e_j != 0 || rq_in_ready);
+  assign e_go     = e_act && (32'(yq_n) + 32'(rd_v1) + 32'(rd_v2) + 32'(rd_v3) < 30) &&
+                    (e_j != 0 || rq_in_ready);
   assign e_runpush = e_go && (e_j == 6'd0);
   assign t_raddr  = {es.buf_i, e_m1[3:0], e_j[4:0]};
   assign sq_pop   = !e_act && sq_valid;
@@ -272,6 +284,7 @@ module cv_drain
       full  <= '0;
       rd_v1 <= 1'b0;
       rd_v2 <= 1'b0;
+      rd_v3 <= 1'b0;
     end else begin
       if (sq_pop) begin
         e_act <= 1'b1;
@@ -299,19 +312,21 @@ module cv_drain
       if (f_seg_last_rd) full[f_buf] <= 1'b1;
       rd_v1 <= e_go;
       rd_v2 <= rd_v1;
+      rd_v3 <= rd_v2;
     end
     rd_rot1 <= e_m1[2:0];
     rd_rot2 <= rd_rot1;
+    rd_rot3 <= rd_rot2;
   end
 
   // the word: pixel q of the 8 is in bank (m1 + q) mod 8
   logic [BW-1:0] yw_in;
   always_comb
     for (int q = 0; q < E; q++)
-      yw_in[q * EW +: EW] = t_rdata[3'(rd_rot2 + 3'(q)) * EW +: EW];
+      yw_in[q * EW +: EW] = t_rdata[3'(rd_rot3 + 3'(q)) * EW +: EW];
 
   cv_fifo #(.W(BW), .D(32), .BRAM(1'b0)) u_yq (
-    .clk, .rst, .in_valid (rd_v2), .in_ready (yq_in_ready), .in_data (yw_in),
+    .clk, .rst, .in_valid (rd_v3), .in_ready (yq_in_ready), .in_data (yw_in),
     .out_valid (yw_valid), .out_ready (yw_ready), .out_data (yw_data), .count (yq_n)
   );
   cv_fifo #(.W(41), .D(4), .BRAM(1'b0)) u_rq (
@@ -321,7 +336,7 @@ module cv_drain
 
   assign idle = !f_act && !fr_d[1].v && !fr_d[2].v && !fr_d[3].v && !fr_d[4].v && !fr_d[5].v &&
                 !hi_pend && !sq_valid &&
-                !e_act && !rd_v1 && !rd_v2 && (full == '0);
+                !e_act && !rd_v1 && !rd_v2 && !rd_v3 && (full == '0);
 
   logic unused;
   assign unused = sq_in_ready ^ yq_in_ready ^ ^sq_n ^ ^rq_n ^ ^f_ycb ^ ^j ^ ^hi_fr;

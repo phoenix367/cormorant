@@ -35,7 +35,10 @@ package mm_pkg;
   // Minimum distance (cycles) between two MACs into the same accumulator:
   // LUTRAM read -> CREG -> PREG -> LUTRAM write.
   localparam int DMIN    = 3;
-  // Cycles after the last issue before a lane's accumulators are final.
+  // Flush of a lane after its step's last issue (cycle t): cmp_cnt counts the
+  // step at the end of t + FLUSH + 1.  The last accumulator write lands at
+  // the end of t + 5 (mm_lane's pipeline) and the drain reads 3 cycles after
+  // its first request at t + FLUSH + 3 at the earliest.
   localparam int FLUSH   = 6;
 
   // Tap FIFO between the x prefetcher and the MAC array (row sets).

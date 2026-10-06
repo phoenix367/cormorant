@@ -261,6 +261,23 @@ module cv_xload
   always_comb
     for (int c = 0; c < TIC; c++) rb_we[c] = rvalid && run_valid && (run_out.c == 4'(c));
 
+  // The write reaches the row buffer through a register stage — the address
+  // a copy per bank (it reaches every LUT of the bank), the data a copy per
+  // RBG banks — and is counted when it lands: the emitter reads a half only
+  // once all its words are in.
+  localparam int RBG = 4;
+  logic [TIC-1:0]   rbw_we;
+  (* keep = "true" *) logic [4:0]    rbw_addr [TIC];
+  (* keep = "true" *) logic [BW-1:0] rbw_data [TIC / RBG];
+  logic             rbw_v, rbw_h;
+  always_ff @(posedge clk) begin
+    rbw_we <= rst ? '0 : rb_we;
+    rbw_v  <= rvalid && run_valid && !rst;
+    rbw_h  <= run_out.h;
+    for (int c = 0; c < TIC; c++)       rbw_addr[c] <= {run_out.h, d_q};
+    for (int g = 0; g < TIC / RBG; g++) rbw_data[g] <= rdata;
+  end
+
   always_ff @(posedge clk) begin
     if (rst) begin
       d_q <= '0;
@@ -268,7 +285,7 @@ module cv_xload
       h_got[1] <= '0;
     end else begin
       if (rvalid) d_q <= run_pop ? 4'd0 : d_q + 4'd1;
-      if (rvalid && run_valid) h_got[run_out.h] <= h_got[run_out.h] + 8'd1;
+      if (rbw_v) h_got[rbw_h] <= h_got[rbw_h] + 8'd1;
       if (e_done) h_got[e_half] <= '0;
     end
   end
@@ -284,7 +301,7 @@ module cv_xload
     logic [6:0] e_pos;
     assign e_pos = {4'b0, h_shift[e_half][c]} + e_i;
     cv_lutram #(.W(BW), .D(32)) u_rb (
-      .clk, .we (rb_we[c]), .waddr ({run_out.h, d_q}), .wdata (rdata),
+      .clk, .we (rbw_we[c]), .waddr (rbw_addr[c]), .wdata (rbw_data[c / RBG]),
       .raddr ({e_half, e_pos[6:3]}), .rdata (rb_rd[c])
     );
     assign e_e = e_pos[2:0];

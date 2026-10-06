@@ -61,11 +61,12 @@ module mm_drain
   localparam int OD = 16;
   logic       of_in_valid, of_in_ready;
   logic [4:0] of_count;
-  logic [5:0] pipe_v;         // requests in the read / arithmetic pipeline
+  localparam int PIPE = 9;     // request -> output FIFO (see the arithmetic pipeline)
+  logic [PIPE-1:0] pipe_v;    // requests in the read / arithmetic pipeline
   logic [3:0] inflight;
   always_comb begin
     inflight = '0;
-    for (int i = 0; i < 6; i++) inflight += {3'b0, pipe_v[i]};
+    for (int i = 0; i < PIPE; i++) inflight += {3'b0, pipe_v[i]};
   end
 
   logic need_run, run_ok, credit_ok, rd_fire, last_rd;
@@ -135,63 +136,72 @@ module mm_drain
   end
 
   // Arithmetic pipeline ---------------------------------------------------------------
-  // request (0) -> lane RAM read (1) -> row mux (2) -> lane sum (3) ->
-  // pair / quad sums (4) -> column select (5) -> saturate (6) -> FIFO
-  localparam int PIPE = 6;
-  // tags: element count of the word, aligned with the data stages
+  // request (0) -> the lanes' address copies (1, 2) -> accumulator read and
+  // row select next to each beat lane's DSPs (3) -> lane word in drd_data
+  // (4) -> registered here (5) -> lane sum (6) -> pair / quad sums (7) ->
+  // column select (8) -> saturate (9) -> FIFO.  Stage k holds a request
+  // made k cycles earlier; the lane words cross the MAC array between two
+  // registers (mm_lane's drd_data and dq5).
+  // tags: element count of the word and the lanes' activity, aligned with
+  // the data stages (act0 / act1 change at the next step's S_WAIT, while
+  // this step's words are still in the pipeline)
   logic [3:0] cnt0;
   logic [PIPE:1][3:0] cnt;
+  logic [PIPE:1][1:0] act;
   assign cnt0 = (cfg.lk != 2'd0) ? 4'(4'd8 >> cfg.lk)
               : ((w + 7'd1 == dw) ? last_cnt : 4'd8);
 
-  logic [E-1:0][31:0] sum3, sum4, col5;
-  logic [3:0][31:0]   t1_4;
-  logic [1:0][31:0]   t2_4;
-  logic [E-1:0][15:0] sat6;
-  logic               a0, a1;
+  logic [1:0][E-1:0][31:0] dq5;
+  logic [E-1:0][31:0] sum6, sum7, col8;
+  logic [3:0][31:0]   t1_7;
+  logic [1:0][31:0]   t2_7;
+  logic [E-1:0][15:0] sat9;
 
   always_ff @(posedge clk) begin
     if (rst || start) pipe_v <= '0;
     else pipe_v <= {pipe_v[PIPE-2:0], rd_fire};
     cnt <= {cnt[PIPE-1:1], cnt0};
-    a0 <= act0; a1 <= act1;
+    act <= {act[PIPE-1:1], {act1, act0}};
   end
 
-  // stage 3: lane sum (drd_data is valid two cycles after the request)
+  // stage 5: the lane words, registered on this side of the MAC array
+  always_ff @(posedge clk) dq5 <= drd_data;
+
+  // stage 6: lane sum
   always_ff @(posedge clk)
     for (int l = 0; l < E; l++)
-      sum3[l] <= (a0 ? drd_data[0][l] : 32'd0) + (a1 ? drd_data[1][l] : 32'd0);
+      sum6[l] <= (act[5][0] ? dq5[0][l] : 32'd0) + (act[5][1] ? dq5[1][l] : 32'd0);
 
-  // stages 4-5: GEMV tap reduction (sums of 2 / 4 / 8 neighbouring lanes)
+  // stages 7-8: GEMV tap reduction (sums of 2 / 4 / 8 neighbouring lanes)
   logic [3:0][31:0] t1;
-  always_comb for (int g = 0; g < 4; g++) t1[g] = sum3[2*g] + sum3[2*g+1];
+  always_comb for (int g = 0; g < 4; g++) t1[g] = sum6[2*g] + sum6[2*g+1];
   always_ff @(posedge clk) begin
-    sum4 <= sum3;
-    t1_4 <= t1;
-    for (int g = 0; g < 2; g++) t2_4[g] <= t1[2*g] + t1[2*g+1];
+    sum7 <= sum6;
+    t1_7 <= t1;
+    for (int g = 0; g < 2; g++) t2_7[g] <= t1[2*g] + t1[2*g+1];
   end
   always_ff @(posedge clk) begin
-    col5 <= sum4;
+    col8 <= sum7;
     case (cfg.lk)
-      2'd1: for (int g = 0; g < 4; g++) col5[g] <= t1_4[g];
-      2'd2: for (int g = 0; g < 2; g++) col5[g] <= t2_4[g];
-      2'd3: col5[0] <= t2_4[0] + t2_4[1];
+      2'd1: for (int g = 0; g < 4; g++) col8[g] <= t1_7[g];
+      2'd2: for (int g = 0; g < 2; g++) col8[g] <= t2_7[g];
+      2'd3: col8[0] <= t2_7[0] + t2_7[1];
       default: ;
     endcase
   end
 
-  // stage 6: floor(acc / 256), saturated to Q8.8
+  // stage 9: floor(acc / 256), saturated to Q8.8
   always_ff @(posedge clk)
     for (int l = 0; l < E; l++) begin
-      if (col5[l][31:23] == 9'h000 || col5[l][31:23] == 9'h1FF) sat6[l] <= col5[l][23:8];
-      else sat6[l] <= col5[l][31] ? 16'h8000 : 16'h7FFF;
+      if (col8[l][31:23] == 9'h000 || col8[l][31:23] == 9'h1FF) sat9[l] <= col8[l][23:8];
+      else sat9[l] <= col8[l][31] ? 16'h8000 : 16'h7FFF;
     end
 
-  assign of_in_valid = pipe_v[PIPE-1];   // sat6 of a request made PIPE cycles ago
+  assign of_in_valid = pipe_v[PIPE-1];   // sat9 of a request made PIPE cycles ago
 
   mm_fifo #(.W(BW + 4), .D(OD), .BRAM(1'b0)) u_of (
     .clk, .rst,
-    .in_valid (of_in_valid), .in_ready (of_in_ready), .in_data ({cnt[PIPE], sat6}),
+    .in_valid (of_in_valid), .in_ready (of_in_ready), .in_data ({cnt[PIPE], sat9}),
     .out_valid(el_valid),    .out_ready(el_ready),    .out_data({el_cnt, el_data}),
     .count    (of_count)
   );

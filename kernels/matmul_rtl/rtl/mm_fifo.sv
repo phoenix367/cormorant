@@ -90,14 +90,18 @@ module mm_fifo #(
         if (rd_issue) rptr <= rptr + 1'b1;
         cnt      <= cnt + (AW+1)'(in_fire) - (AW+1)'(rd_issue);
         inflight <= rd_issue;
-        // Skid stage: pop from q[0], append the arriving RAM word.
-        if (out_fire) begin
-          q[0] <= q[1];
-          q[1] <= q[2];
-        end
-        if (inflight) q[qn_pop] <= rdata;
         qn <= qn_pop + {1'b0, inflight};
       end
+    end
+
+    // Skid stage: pop from q[0], append the arriving RAM word.  No reset on
+    // the data (qn qualifies it).
+    always_ff @(posedge clk) begin
+      if (out_fire) begin
+        q[0] <= q[1];
+        q[1] <= q[2];
+      end
+      if (inflight) q[qn_pop] <= rdata;
     end
   end
 

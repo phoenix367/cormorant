@@ -10,6 +10,8 @@
 // The lanes of a run's last word past `size` are zeroed (g.tail valid lanes).
 // Replay (a stride-0 operand of <= REP_D words): the single run is passed on
 // and stored as it arrives, then streamed g.reps - 1 more times from the RAM.
+// The AXI side is registered both ways: AR leaves through a register slice
+// (ARREADY only enables it) and R is registered before the FIFO write.
 // ---------------------------------------------------------------------------
 module vo_rd_port
   import vo_pkg::*;
@@ -52,27 +54,37 @@ module vo_rd_port
   localparam int NW = $clog2(RD_OUTS) + 1;
   logic [SW-1:0] space;                     // FIFO entries not reserved by a burst
   logic [NW-1:0] outs;                      // bursts issued, last beat not yet received
-  logic          rf_pop, issue;
-  assign issue    = bg_valid && (!arvalid || arready) && (space >= SW'(bg_len)) &&
+  logic          rf_pop, issue, ar_in_ready;
+  assign issue    = bg_valid && ar_in_ready && (space >= SW'(bg_len)) &&
                     (outs != NW'(RD_OUTS));
   assign bg_ready = issue;
 
+  // R registered before the FIFO (a beat in rv_q is already reserved).
+  logic          rv_q, rl_q;
+  logic [BW-1:0] rd_q;
+  always_ff @(posedge clk) begin
+    if (rst) rv_q <= 1'b0;
+    else     rv_q <= rvalid;
+    rl_q <= rlast;
+    rd_q <= rdata;
+  end
+
   always_ff @(posedge clk) begin
     if (rst) begin
-      arvalid <= 1'b0;
       space   <= SW'(RD_FIFO_D);
       outs    <= '0;
     end else begin
-      if (arvalid && arready) arvalid <= 1'b0;
-      if (issue) begin
-        arvalid <= 1'b1;
-        araddr  <= {bg_waddr, 4'b0};
-        arlen   <= 8'(bg_len - 9'd1);
-      end
       space <= space - (issue ? SW'(bg_len) : '0) + (rf_pop ? SW'(1) : '0);
-      outs  <= outs + (issue ? NW'(1) : '0) - ((rvalid && rlast) ? NW'(1) : '0);
+      outs  <= outs + (issue ? NW'(1) : '0) - ((rv_q && rl_q) ? NW'(1) : '0);
     end
   end
+
+  vo_rs #(.W(72)) u_ar (
+    .clk, .rst,
+    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({bg_waddr, 4'b0, 8'(bg_len - 9'd1)}),
+    .out_valid (arvalid), .out_ready (arready),     .out_data ({araddr, arlen}),
+    .head_data ()
+  );
 
   assign rready = 1'b1;
 
@@ -81,7 +93,7 @@ module vo_rd_port
   logic [SW-1:0] rf_count;
   vo_fifo #(.W(BW), .D(RD_FIFO_D), .BRAM(1'b1)) u_rf (
     .clk, .rst,
-    .in_valid (rvalid),   .in_ready (rf_in_ready), .in_data (rdata),
+    .in_valid (rv_q),     .in_ready (rf_in_ready), .in_data (rd_q),
     .out_valid(rf_valid), .out_ready(rf_pop),      .out_data(rf_data),
     .count    (rf_count)
   );
@@ -111,14 +123,17 @@ module vo_rd_port
   logic room;
   assign room = ({1'b0, of_count} + (OW+2)'(rp_v)) < (OW+2)'(OUT_D);
 
+  // The tail mask reads registers only: last_w (wr_left == 1) is kept as a
+  // flag beside wr_left, and the lanes past g.tail as a per-lane mask set at
+  // start, so the masked word is one LUT after the FIFO's output.
   logic          last_w;                    // the popped word ends its run
+  logic          rw1;                       // g.run_words == 1
+  logic [E-1:0]  tmask;                     // lanes zeroed in a run's last word
   logic [BW-1:0] masked;
-  assign last_w = (wr_left == 32'd1);
   always_comb begin
     masked = rf_data;
-    if (last_w)
-      for (int l = 0; l < E; l++)
-        if (l >= int'(g.tail)) masked[EW*l +: EW] = '0;
+    for (int l = 0; l < E; l++)
+      if (last_w && tmask[l]) masked[EW*l +: EW] = '0;
   end
 
   assign rf_pop = (phase == P_PASS) && rf_valid && room;
@@ -139,6 +154,9 @@ module vo_rd_port
     end else if (start) begin
       phase     <= P_PASS;
       wr_left   <= g.run_words;
+      last_w    <= (g.run_words == 32'd1);
+      rw1       <= (g.run_words == 32'd1);
+      for (int l = 0; l < E; l++) tmask[l] <= (l >= int'(g.tail));
       rp_idx    <= '0;
       reps_left <= g.reps - 32'd1;
       rp_v      <= 1'b0;
@@ -146,6 +164,7 @@ module vo_rd_port
       rp_v <= rp_rd;
       if (rf_pop) begin
         wr_left <= last_w ? g.run_words : wr_left - 32'd1;
+        last_w  <= last_w ? rw1 : (wr_left == 32'd2);
         if (g.replay) begin
           rp_idx <= last_w ? '0 : rp_idx + PW'(1);
           if (last_w) phase <= (reps_left != '0) ? P_REPLAY : P_DONE;
@@ -163,7 +182,7 @@ module vo_rd_port
     end
   end
 
-  assign idle = bg_done && !arvalid && (space == SW'(RD_FIFO_D)) && (phase != P_REPLAY) &&
+  assign idle = bg_done && !arvalid && ar_in_ready && (space == SW'(RD_FIFO_D)) && (phase != P_REPLAY) &&
                 !rp_v && (of_count == '0);
 
   // The FIFO never fills because every burst reserved its space.

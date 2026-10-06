@@ -70,12 +70,18 @@ ctrl ─► config ─► chunk sequencer ─┬► loader: runs ─► AR (gmem
 
 | module | role |
 |---|---|
-| `pl_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL VectorOPKernel's) |
+| `pl_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL VectorOPKernel's); its inputs are registered before they are decoded |
 | `pl_core` | job FSM: latch the registers; the products the chunks need through one pipelined DSP multiplier and `ow_tile` through a 6-step divider (about 30 cycles per job); the contract; the chunk sequencer (batch, channel tile, W-tile — every offset by increments) feeding a 4-deep chunk FIFO per unit; `ap_done` when all units are idle |
 | `pl_loader` | a chunk's (row, channel) runs in the HLS order (rows outer, channels inner); one AR burst per run (at most 9 beats), split at 4 KiB; AR issued only when the 256-beat read FIFO can take every beat (RREADY tied high); ≤ 16 bursts awaiting data; a run descriptor (row slot, channel, lane shift, words) per run |
-| `pl_emit` | the line buffer — 8 channels × 8 column banks of 16 rows × 8 words (LUTRAM; one write and one read per bank and cycle), a word written in one cycle with its lanes rotated by the run's alignment; per output row a "step" that loads the rows it needs and emits its window beats: per group of 2 output positions, pool_h × pool_w beats of 2 positions × 8 channels, padded taps carrying the pool type's identity, the AVG denominators with the group's last beat |
-| `pl_reduce` | 16 accumulators (2 positions × 8 channels): per beat the contribution (x, \|x\| or x²) and max / add; at a group's end a snapshot for the finaliser, which takes one channel (2 lanes) per cycle through a 9-stage pipeline (AVG product with a 64-entry reciprocal ROM, the LP-2 square root as two-cycle Horner steps) into a 32-entry bundle FIFO |
-| `pl_writer` | an output row's bundles into one of two row buffers (8 banks of 2 × 8 × 8 entries, LUTRAM); the other buffer's row drained as one run per channel, lanes rotated to the row's alignment, one AW burst per run (split at 4 KiB), a 32-beat W FIFO, ≤ 8 bursts awaiting B |
+| `pl_emit` | the line buffer — 8 channels × 8 column banks of 16 rows × 8 words (LUTRAM; one write and one read per bank and cycle), a word written in one cycle with its lanes rotated by the run's alignment (the write registered once more, LX, with its enables, addresses and data copied per bank; the read address in two register stages — the 8 bank addresses, then a copy per channel and bank next to it — and the read data registered next to the bank, WR); per output row a "step" that loads the rows it needs and emits its window beats: per group of 2 output positions, pool_h × pool_w beats of 2 positions × 8 channels, padded taps carrying the pool type's identity, the AVG denominators with the group's last beat |
+| `pl_reduce` | 16 accumulators (2 positions × 8 channels): per beat the contribution (x, \|x\| or x²) and max / add, the stall decision computed per group of 4 lanes from that group's copy of its few control registers; at a group's end a snapshot for the finaliser, which takes one channel (2 lanes) per cycle through a 9-stage pipeline (AVG product with a 64-entry reciprocal ROM, the LP-2 square root as two-cycle Horner steps) into a 32-entry bundle FIFO |
+| `pl_writer` | an output row's bundles into one of two row buffers (8 banks of 2 × 8 × 8 entries, LUTRAM; the bank writes registered); the other buffer's row drained as one run per channel, lanes rotated to the row's alignment, one AW burst per run (split at 4 KiB), a 32-beat W FIFO, ≤ 8 bursts awaiting B |
+
+The window beats reach the reducer through a register slice (`pl_rs`), and
+the m_axi ports are registered both ways: AR, AW and W leave through `pl_rs`
+slices (the AW and W FIFOs' LUTRAM outputs are no longer the port), xREADY
+only enables a slice's registers, and RVALID / RDATA / RLAST and BVALID are
+registered before they are used.
 
 Burst sizes and outstanding counts follow the HLS interface, and the IP
 declares them on its m_axi interfaces as the HLS export does
@@ -84,10 +90,30 @@ write-only, 16 / 8, 16-beat maximum bursts (the RTL's are at most 9 beats:
 a run of 64 columns at any alignment).  The block design sizes each crossbar
 slot's acceptance from these.
 
-Resources (out of context, xck26 −2LV, `make synth_pool_rtl`): 11 956 LUT
-(3 446 LUTRAM: the line buffer and the row buffers), 8 483 FF, 2 RAMB36 + 2
-RAMB18, 29 DSP; timing met at 300 MHz (WNS +0.077 ns, Fmax ≈ 307 MHz; the PL
-runs at 100).  The HLS kernel in the production bitstream (b3309f424562,
+Resources (out of context, xck26 −2LV, `make synth_pool_rtl`): 12 356 LUT
+(3 446 LUTRAM: the line buffer and the row buffers), 11 802 FF, 2 RAMB36 + 2
+RAMB18, 29 DSP; timing met at 300 MHz (WNS +0.110 ns, Fmax ≈ 310 MHz; the PL runs at
+100).  Before the in-context work of 2026-10-06: 11 956 LUT, 8 483 FF, WNS
++0.077 ns.
+
+In the block design (the routed 100 MHz `cormorant_hw_128`, 2026-10-05) the
+kernel's DSPs sit in columns X7, X11 and X12 over four clock regions and its
+line buffer and row buffers (3.4 k LUTRAM) spread over clock regions
+X1Y2–X2Y3, so its long paths were broadcast nets: the line-buffer write
+address and enables (2 944 loads on one register, 5.6 ns), the reducer's
+stall (`adv`, 837 loads over five clock regions), the job reset (`urst`
+496 + `rst` 713 loads), the window-beat FIFO's read address, the line-buffer
+read addresses, the bundle FIFO → row-buffer write enable (7 levels), and the
+AXI boundary (RDATA into the word FIFO, the AW / W FIFOs' LUTRAM outputs as
+the port).  The changes: the line-buffer write registered once more with
+its enables, addresses and data copied per bank; the read addresses
+registered per channel; the reducer's stall computed per lane group; a
+register slice for the window beats; the row-buffer write registered; the
+job reset registered per unit; the AXI ports registered both ways.  In the
+full 250 MHz design (four kernels, WNS +0.074 ns) the last cluster below
+0.1 ns was the line-buffer read (per-channel address registers → banks →
+`rv`, 93 % route): the read address now takes two stages (the 8 bank
+addresses, then a copy per bank) and `rv` loads without an enable.  The HLS kernel in the production bitstream (b3309f424562,
 routed): 17 208 LUT (3 520 LUTRAM), 14 936 FF, 3 RAMB36 + 1 RAMB18, 94 DSP.
 
 ## 3. Performance
@@ -98,16 +124,17 @@ positions × 8 channels, one tap) per cycle, at least 8 cycles per group
 row (the global pools) loads all its rows before its first beat, so there
 the loads count too.  Cycles from `ap_start` to `ap_done` with ideal memory
 (`make perf_pool_rtl`, Verilator; the HLS kernel's board times at 100 MHz
-for comparison):
+for comparison; the registered line-buffer write, beat slice and AXI ports
+of 2026-10-06 added 0.02–1.5 %):
 
 | job | cycles | window-beat cycles | HLS kernel on the board |
 |---|---:|---:|---:|
-| MaxPool 3×3 s2 p1, 64 × 112² (ResNet-18; W-tiles of 31 + 25 columns) | 123 548 | 116 928 | 1.35 ms |
-| MaxPool 2×2 s2, 64 × 56² | 27 019 | 25 088 | 0.335 ms |
-| MaxPool 3×3 s1 p1, 32 × 28² | 15 071 | 14 112 | — |
-| GlobalAveragePool 7×7, 512 channels | 10 213 | 3 136 (+ 56 runs loaded per chunk) | — |
-| GlobalAveragePool 7×7, 1 024 channels | 20 326 | 6 272 (+ 56 runs loaded per chunk) | 0.283 ms |
-| AveragePool 2×2 s2, 16 × 28² (LeNet) | 2 136 | 1 568 | — |
+| MaxPool 3×3 s2 p1, 64 × 112² (ResNet-18; W-tiles of 31 + 25 columns) | 123 571 | 116 928 | 1.35 ms |
+| MaxPool 2×2 s2, 64 × 56² | 27 259 | 25 088 | 0.335 ms |
+| MaxPool 3×3 s1 p1, 32 × 28² | 15 085 | 14 112 | — |
+| GlobalAveragePool 7×7, 512 channels | 10 284 | 3 136 (+ 56 runs loaded per chunk) | — |
+| GlobalAveragePool 7×7, 1 024 channels | 20 462 | 6 272 (+ 56 runs loaded per chunk) | 0.283 ms |
+| AveragePool 2×2 s2, 16 × 28² (LeNet) | 2 170 | 1 568 | — |
 
 On the test stand (the pooling block design in xsim, the 45 fixtures, the
 same day): 584 µs of kernel time against the HLS kernel's 694 µs on the 43
@@ -129,7 +156,8 @@ HLS kernel (POOL_RTL_PLAN phases 1–2).
 |---|---|---|
 | Verilator lint (`-Wall`) | `lint_pool_rtl` | clean |
 | the 45 checked-in fixtures (`hw/test_data/pool_test_data`) | `TestPoolRtl` (ctest) | 45 / 45: y.hex and byte-identical to the HLS oracle on the whole output region |
-| random jobs against the HLS kernel's C++, randomised AXI timing, protocol checks, the declared outstanding limits, no stray write | ctest: 200 (seed 1); by hand: 12 × 300 (seeds 2–5, fast / slow / random timing) and 3 × 800 | all bit-exact |
+| the synthesised netlist against the RTL, in lockstep on the board's pool geometries (`tools/neteq`) | `neteq_pool_rtl` | 13 jobs, every output equal every cycle (the first 250 MHz version: 1 872 mismatches, the board's failure) |
+| random jobs against the HLS kernel's C++, randomised AXI timing (also `--timing board` / `board2`: 150–900 cycles read latency, throttled AR, R bursts in pieces), protocol checks, the declared outstanding limits, no stray write | ctest: 200 (seed 1); by hand: 12 × 300 (seeds 2–5, fast / slow / random timing) and 3 × 800; after the in-context work (2026-10-06): 9 × 400 (seeds 2, 3, 2026 × random / fast / slow) + 800 (seed 5), repeated after the line-buffer read change; after the reducer fix 15 × 300 (seeds 2, 3, 2026 × five timing modes) | all bit-exact |
 | register table vs RTL and the HLS driver | `PoolRtlDriver` (ctest), `gen_driver.py --check --hls-driver` | 19 arguments + 4 control registers agree; the 56 API prototypes are the HLS driver's |
 | the test stand's pooling block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_pool_rtl` | 45 / 45 (`check_test_report.py` PASS); 584 µs against the HLS IP's 694 µs on the 43 cases both pass |
 
@@ -163,7 +191,8 @@ bank is its real column's, and two positions of a group never share one.
 `TestPoolRtl`, `lint_pool_rtl`, `perf_pool_rtl`, `pool_rtl_tb_fst`,
 `driver_pool_rtl` (`build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src`),
 `package_pool_rtl` (`build/rtl_ip/PoolingKernel_ip`), `synth_pool_rtl`,
-`xsim_pool_rtl`, `sysim_pool_rtl` — `kernels/pool_rtl/CMakeLists.txt`.
+`xsim_pool_rtl`, `neteq_pool_rtl` (the synthesised netlist against the RTL in lockstep,
+`tools/neteq`), `sysim_pool_rtl` — `kernels/pool_rtl/CMakeLists.txt`.
 
 ## 6. Invariants for changes
 
@@ -182,6 +211,28 @@ bank is its real column's, and two positions of a group never share one.
 - The finaliser takes a snapshot only when the previous one is done (8
   cycles); a group shorter than 8 beats waits — the HLS kernel's
   `slot_len = max(red_len, 8)`.
+- **No variable is written from more than one generate scope** (or more
+  than one process).  The first 250 MHz version wrote the reducer's
+  snapshot array `accd` from each lane group's generate block: Verilator and
+  xsim simulate that as intended, but Vivado synthesised it wrongly ("Trying
+  to implement RAM ... in registers", Synth 8-4767) — on the board every
+  windowed pool lost the first output pair of some channels (0x8000 for MAX,
+  0 for AVG), while the global pools, which finalise one group per chunk,
+  passed.  Generate scopes export wires; the shared registers live in one
+  process.  `make neteq_pool_rtl` (the synthesised netlist against the RTL in
+  lockstep) catches this class of bug; the Verilator testbench cannot.
 - The config FSM's products are captured 4 cycles after their operands
   (registered operands, three product stages); a deeper multiplier moves
   every capture index.
+- The reducer's stall decision exists once per lane group (`g_ctl`, 4 groups
+  plus the central copy): every copy sees the same inputs (`bt_valid`,
+  `bt.last`, the registered FIFO room) and the same reset, so all compute
+  the same `adv`; a new input to the decision must be copied the same way.
+  The room for the finaliser's output is registered twice, so it reserves 2
+  more bundles than are in flight (`room_c`).
+- A line-buffer word is written in LX, one cycle after LW; `loaded`, the
+  load-then-emit wait and `step_end` count the LX stage (`lx_v`).
+- A window beat reads the line buffer in WR, two cycles after its `adv`
+  (address stages `lb_ra1`, `lb_ra2`), and enters the beat FIFO in W1; the
+  FIFO credit counts W0, WR and W1, and `step_end` waits for W0 and WR (the
+  reads), not W1.

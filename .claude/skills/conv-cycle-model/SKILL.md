@@ -44,7 +44,7 @@ python3 .claude/skills/conv-cycle-model/scripts/conv_cycle_model.py --case 8 64 
 python3 .claude/skills/conv-cycle-model/scripts/conv_cycle_model.py --validate build/kernels/conv/kv260/conv_test_report.json
 ```
 
-Output per layer: total cycles and ms at the board's PL clock (100 MHz), and the
+Output per layer: total cycles and ms at the board's kernel clock (250 MHz), and the
 share of MAC sweep / weight fill / bias init / drain+write / input
 loads, plus per model the totals and the fill-heaviest layers.  Shares
 above ~30 % in one bucket are where the next step is.

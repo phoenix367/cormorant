@@ -35,7 +35,18 @@ make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # package the four RTL I
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 
-WNS must be positive.  `synth_1` must NOT run incrementally
+WNS must be positive — at **4.000 ns**: the kernels run at 250 MHz from an
+MMCM in the block design (`clk_wiz_0`, `scripts/bd_kernel_clock.tcl`;
+FMAX_250_PLAN), with impl_1's directives set by `scripts/build.tcl`
+(`set_impl_directives`; the default strategy missed by tens of ps).  The
+signed-off bitstream `986cef4866a0` had +0.105 ns; the margin moves by
+±0.1 ns from build to build, so a kernel change that leaves < +0.05 ns
+deserves a look at the worst paths.  Two checks before any bitstream goes
+to the board: `grep -c 'Synth 8-4767' <runs>/synth_1/runme.log` must be 0
+(a variable written from several generate scopes: Vivado builds something
+other than what the simulators run — the PoolingKernel bug of
+FMAX_250_PLAN), and the `neteq_<k>_rtl` targets (each kernel's RTL in
+lockstep with its synthesised netlist) after a kernel change.  `synth_1` must NOT run incrementally
 (`INCREMENTAL_CHECKPOINT` empty, `AUTO_INCREMENTAL_CHECKPOINT` 0): an
 incremental run against a stale reference checkpoint reused the old
 MatmulKernel control block and dropped a newly added AXI-Lite register
@@ -59,7 +70,10 @@ cd inference-scheduler
 ../.claude/skills/board-deploy/scripts/read_kernel_regs.sh   # widths + kernel states
 ```
 
-`read_kernel_regs.sh` must show the HPC0 **and HPC1** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26; the loader derives both from the HWH)
+The loader checks that PL0 (`/sys/devices/platform/fclk0/set_rate`) is at
+the HWH's 100 MHz before programming (Step 5b; it sets it when another loader
+changed it) and again after the xclbin load: the MMCM needs it to lock, and
+a design that does not lock stays in reset.  `read_kernel_regs.sh` must show the HPC0 **and HPC1** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26; the loader derives both from the HWH)
 — the AFIFM encoding is 0 = 128, 1 = 64, 2 = 32 (the loader's PYNQ
 table), NOT the other way round.  Until 2026-09-24 the block design
 left `S_AXI_HPC0_FPD` at 32 bits (`PSU__SAXIGP0__DATA_WIDTH`), so the

@@ -12,7 +12,10 @@
 //   0xA8 pad_top  0xB0 pad_left  0xB8 has_bias  0xC0 is_depthwise
 //
 // Like the HLS slave, AW and W are taken one after the other and every
-// access gets an OKAY response.  (Derived from the RTL PoolingKernel's
+// access gets an OKAY response.  The AXI inputs only reach a few registers:
+// a write's data and strobes are registered at the W handshake and written
+// the cycle after (with BVALID), a read's address at the AR handshake and
+// its data taken the cycle after (RVALID one cycle later).  (Derived from the RTL PoolingKernel's
 // pl_ctrl_s_axi.)
 // ---------------------------------------------------------------------------
 module cv_ctrl_s_axi (
@@ -81,7 +84,10 @@ module cv_ctrl_s_axi (
   typedef enum logic [1:0] {WR_IDLE, WR_DATA, WR_RESP} wst_t;
   wst_t       wst;
   logic [7:0] waddr;
-  logic       w_hs;
+  logic       w_hs;                        // the W handshake (inputs: wvalid)
+  logic       w_do;                        // the write lands (first WR_RESP cycle)
+  logic [31:0] wdata_q;                    // the W channel, registered at the handshake
+  logic [3:0]  wstrb_q;
 
   assign awready = (wst == WR_IDLE);
   assign wready  = (wst == WR_DATA);
@@ -98,25 +104,30 @@ module cv_ctrl_s_axi (
       default: wst <= WR_IDLE;
     endcase
     if (awvalid && awready) waddr <= {awaddr[7:2], 2'b00};
+    if (w_hs) begin
+      wdata_q <= wdata;
+      wstrb_q <= wstrb;
+    end
+    w_do <= w_hs && !rst;
   end
 
   logic [31:0] wmask;
-  assign wmask = {{8{wstrb[3]}}, {8{wstrb[2]}}, {8{wstrb[1]}}, {8{wstrb[0]}}};
+  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
   function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata & wmask) | (old & ~wmask);
+    return (wdata_q & wmask) | (old & ~wmask);
   endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
   logic       int_auto_restart, auto_restart_status, int_gie, int_irq;
   logic [1:0] int_ier, int_isr;
-  logic       ar_hs;
-  logic [7:0] raddr;
+  logic       ar_hs;                       // the AR handshake (inputs: arvalid)
+  logic       rd_do;                       // the read is taken (the cycle after ar_hs)
+  logic [7:0] raddr;                       // araddr, registered at the handshake
   logic       task_ap_done, task_ap_ready, auto_restart_done;
 
   assign ar_hs             = arvalid && arready;
-  assign raddr             = araddr;
   assign auto_restart_done = auto_restart_status && ap_idle && !int_ap_idle;
   assign task_ap_done      = (ap_done && !auto_restart_status) || auto_restart_done;
   assign task_ap_ready     = ap_ready && !int_auto_restart;
@@ -160,31 +171,31 @@ module cv_ctrl_s_axi (
     end else begin
       int_irq <= int_gie && (|int_isr);
 
-      if (w_hs && waddr == A_CTRL && wstrb[0] && wdata[0]) int_ap_start <= 1'b1;
+      if (w_do && waddr == A_CTRL && wstrb_q[0] && wdata_q[0]) int_ap_start <= 1'b1;
       else if (ap_ready)                                  int_ap_start <= int_auto_restart;
 
       if (task_ap_done)                   int_task_done <= 1'b1;
-      else if (ar_hs && raddr == A_CTRL)  int_task_done <= 1'b0;
+      else if (rd_do && raddr == A_CTRL)  int_task_done <= 1'b0;
 
       int_ap_idle <= ap_idle;
 
       if (task_ap_ready)                  int_ap_ready <= 1'b1;
-      else if (ar_hs && raddr == A_CTRL)  int_ap_ready <= 1'b0;
+      else if (rd_do && raddr == A_CTRL)  int_ap_ready <= 1'b0;
 
-      if (w_hs && waddr == A_CTRL && wstrb[0]) int_auto_restart <= wdata[7];
+      if (w_do && waddr == A_CTRL && wstrb_q[0]) int_auto_restart <= wdata_q[7];
 
       if (int_auto_restart) auto_restart_status <= 1'b1;
       else if (ap_idle)     auto_restart_status <= 1'b0;
 
-      if (w_hs && waddr == A_GIE && wstrb[0]) int_gie <= wdata[0];
-      if (w_hs && waddr == A_IER && wstrb[0]) int_ier <= wdata[1:0];
+      if (w_do && waddr == A_GIE && wstrb_q[0]) int_gie <= wdata_q[0];
+      if (w_do && waddr == A_IER && wstrb_q[0]) int_ier <= wdata_q[1:0];
 
       if (int_ier[0] && ap_done)                    int_isr[0] <= 1'b1;
-      else if (w_hs && waddr == A_ISR && wstrb[0])  int_isr[0] <= int_isr[0] ^ wdata[0];
+      else if (w_do && waddr == A_ISR && wstrb_q[0])  int_isr[0] <= int_isr[0] ^ wdata_q[0];
       if (int_ier[1] && ap_ready)                   int_isr[1] <= 1'b1;
-      else if (w_hs && waddr == A_ISR && wstrb[0])  int_isr[1] <= int_isr[1] ^ wdata[1];
+      else if (w_do && waddr == A_ISR && wstrb_q[0])  int_isr[1] <= int_isr[1] ^ wdata_q[1];
 
-      if (w_hs) begin
+      if (w_do) begin
         case (waddr)
           A_X0: x[31:0] <= merge(x[31:0]);
           A_X1: x[63:32] <= merge(x[63:32]);
@@ -218,21 +229,26 @@ module cv_ctrl_s_axi (
   end
 
   // Read channel -------------------------------------------------------------------
-  typedef enum logic {RD_IDLE, RD_DATA} rst_t;
+  // reads: the address is registered at the handshake (RD_ADDR), the data
+  // and the clear-on-read side effects are taken the cycle after (rd_do)
+  typedef enum logic [1:0] {RD_IDLE, RD_ADDR, RD_DATA} rst_t;
   rst_t rst_q;
 
   assign arready = (rst_q == RD_IDLE);
   assign rvalid  = (rst_q == RD_DATA);
   assign rresp   = 2'b00;
+  assign rd_do   = (rst_q == RD_ADDR);
 
   always_ff @(posedge clk) begin
     if (rst) rst_q <= RD_IDLE;
     else case (rst_q)
-      RD_IDLE: if (arvalid) rst_q <= RD_DATA;
+      RD_IDLE: if (arvalid) rst_q <= RD_ADDR;
+      RD_ADDR: rst_q <= RD_DATA;
       RD_DATA: if (rready)  rst_q <= RD_IDLE;
       default: rst_q <= RD_IDLE;
     endcase
-    if (ar_hs) begin
+    if (ar_hs) raddr <= araddr;
+    if (rd_do) begin
       rdata <= '0;
       case (raddr)
         A_CTRL:  begin

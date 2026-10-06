@@ -156,9 +156,18 @@ module pl_core
   output logic [1:0]                            s_axi_ctrl_BRESP,
   output logic                                  interrupt
 );
-  logic clk, rst;
+  // The reset, registered: one copy for the control slave, one for the rest.
+  // keep: the four kernels' copies are equivalent registers, and the block
+  // design's global synthesis would otherwise merge them into one that
+  // drives all four kernels across the device (FMAX_250_PLAN).
+  logic clk;
+  (* keep = "true" *) logic rst;
+  (* keep = "true", max_fanout = 128 *) logic rst_c;
   assign clk = ap_clk;
-  always_ff @(posedge clk) rst <= !ap_rst_n;
+  always_ff @(posedge clk) begin
+    rst   <= !ap_rst_n;
+    rst_c <= !ap_rst_n;
+  end
 
   // Control slave ------------------------------------------------------------------
   logic        ap_start, ap_done, ap_idle;
@@ -167,7 +176,7 @@ module pl_core
                r_pt, r_pl, r_dh, r_dw, r_type, r_lp, r_cip;
 
   pl_ctrl_s_axi u_ctrl (
-    .clk, .rst,
+    .clk, .rst (rst_c),
     .awvalid (s_axi_ctrl_AWVALID), .awready (s_axi_ctrl_AWREADY), .awaddr (s_axi_ctrl_AWADDR),
     .wvalid  (s_axi_ctrl_WVALID),  .wready  (s_axi_ctrl_WREADY),  .wdata  (s_axi_ctrl_WDATA),
     .wstrb   (s_axi_ctrl_WSTRB),
@@ -202,7 +211,9 @@ module pl_core
   logic [5:0]  dv_n, dv_rem, dv_q;          // (LBC - span) / stride_w, restoring
   logic [2:0]  dv_i;
   logic [6:0]  ow_tile;
-  logic        job_start, start_q, urst, seq_done, all_idle, ok_job;
+  logic        job_start, start_q, seq_done, all_idle, ok_job;
+  // The job reset, registered and copied per unit group.
+  (* keep = "true" *) logic urst, urst_ld, urst_em, urst_rd, urst_wr;
   job_t        j;
 
   // operands registered (the DSP's input registers), then three product stages:
@@ -245,6 +256,9 @@ module pl_core
                     ((q_ph == 32'd1) || (q_dh < 32'(LBR))) && ((q_pw == 32'd1) || (q_dw < 32'(LBC))) &&
                     (reach_h < 32'(LBR)) && (reach_w < 32'(LBC));
 
+  // Job FSM.  Only the state and job_start are reset; the latched arguments
+  // and the derived values below are loaded before every use, so the reset
+  // does not reach their enables.
   always_ff @(posedge clk) begin
     if (rst) begin
       tstate    <= T_IDLE;
@@ -252,69 +266,12 @@ module pl_core
     end else begin
       job_start <= 1'b0;
       case (tstate)
-        T_IDLE: if (ap_start) begin
-          {q_x, q_y} <= {r_x, r_y};
-          {q_batch, q_ch, q_in_h, q_in_w, q_out_h, q_out_w} <= {r_batch, r_ch, r_in_h, r_in_w, r_out_h, r_out_w};
-          {q_ph, q_pw, q_sh, q_sw, q_pt, q_pl, q_dh, q_dw}   <= {r_ph, r_pw, r_sh, r_sw, r_pt, r_pl, r_dh, r_dw};
-          {q_type, q_lp, q_cip}                              <= {r_type, r_lp, r_cip};
-          ci     <= '0;
-          tstate <= T_PA;
-        end
-        T_PA: begin
-          ci <= ci + 4'd1;
-          case (ci)
-            4'd4:  reach_h <= mp3;
-            4'd5:  reach_w <= mp3;
-            4'd6:  in_hw   <= mp3;
-            4'd7:  out_hw  <= mp3;
-            4'd8:  ohs     <= mp3;
-            4'd9:  lastw   <= mp3;
-            4'd10: begin
-              denom  <= mp3;
-              // the W-tile: (LBC - span) / stride_w + 1 when span <= LBC and stride_w > 0
-              dv_n   <= 6'(32'(LBC) - (reach_w + 32'd1));
-              dv_rem <= '0;
-              dv_q   <= '0;
-              dv_i   <= 3'd5;
-              tstate <= T_DIV;
-            end
-            default: ;
-          endcase
-        end
-        T_DIV: begin
-          logic [6:0] r;
-          r = {dv_rem, dv_n[dv_i]};
-          if (q_sw <= 32'd63 && 32'(r) >= q_sw) begin
-            dv_rem <= 6'(32'(r) - q_sw);
-            dv_q[dv_i] <= 1'b1;
-          end else begin
-            dv_rem <= r[5:0];
-          end
-          if (dv_i == 3'd0) begin
-            ci     <= '0;
-            tstate <= T_PB;
-          end
-          dv_i <= dv_i - 3'd1;
-        end
-        T_PB: begin
-          if (ci == 4'd0) begin
-            // ow_tile: the quotient + 1 (0 -> 1), at most out_w
-            logic [31:0] t;
-            t = (reach_w + 32'd1 <= 32'(LBC) && q_sw != 32'd0) ? 32'(dv_q) + 32'd1 : 32'd1;
-            ow_tile <= 7'((t > q_out_w) ? q_out_w : t);
-          end
-          ci <= ci + 4'd1;
-          case (ci)
-            4'd4: ch_in   <= mp3;
-            4'd5: ch_out  <= mp3;
-            4'd6: owt_sw  <= mp3;
-            4'd7: begin
-              owt1_sw <= mp3;
-              tstate  <= ok_job ? T_SEQ : T_DONE;
-              job_start <= ok_job;
-            end
-            default: ;
-          endcase
+        T_IDLE: if (ap_start) tstate <= T_PA;
+        T_PA:   if (ci == 4'd10) tstate <= T_DIV;
+        T_DIV:  if (dv_i == 3'd0) tstate <= T_PB;
+        T_PB:   if (ci == 4'd7) begin
+          tstate    <= ok_job ? T_SEQ : T_DONE;
+          job_start <= ok_job;
         end
         T_SEQ:  if (seq_done && !job_start) tstate <= T_WAIT;   // (the last job's flag clears now)
         T_WAIT: if (all_idle) tstate <= T_DONE;
@@ -322,6 +279,67 @@ module pl_core
         default: tstate <= T_IDLE;
       endcase
     end
+  end
+
+  always_ff @(posedge clk) begin
+    case (tstate)
+      T_IDLE: if (ap_start) begin
+        {q_x, q_y} <= {r_x, r_y};
+        {q_batch, q_ch, q_in_h, q_in_w, q_out_h, q_out_w} <= {r_batch, r_ch, r_in_h, r_in_w, r_out_h, r_out_w};
+        {q_ph, q_pw, q_sh, q_sw, q_pt, q_pl, q_dh, q_dw}   <= {r_ph, r_pw, r_sh, r_sw, r_pt, r_pl, r_dh, r_dw};
+        {q_type, q_lp, q_cip}                              <= {r_type, r_lp, r_cip};
+        ci <= '0;
+      end
+      T_PA: begin
+        ci <= ci + 4'd1;
+        case (ci)
+          4'd4:  reach_h <= mp3;
+          4'd5:  reach_w <= mp3;
+          4'd6:  in_hw   <= mp3;
+          4'd7:  out_hw  <= mp3;
+          4'd8:  ohs     <= mp3;
+          4'd9:  lastw   <= mp3;
+          4'd10: begin
+            denom  <= mp3;
+            // the W-tile: (LBC - span) / stride_w + 1 when span <= LBC and stride_w > 0
+            dv_n   <= 6'(32'(LBC) - (reach_w + 32'd1));
+            dv_rem <= '0;
+            dv_q   <= '0;
+            dv_i   <= 3'd5;
+          end
+          default: ;
+        endcase
+      end
+      T_DIV: begin
+        logic [6:0] r;
+        r = {dv_rem, dv_n[dv_i]};
+        if (q_sw <= 32'd63 && 32'(r) >= q_sw) begin
+          dv_rem <= 6'(32'(r) - q_sw);
+          dv_q[dv_i] <= 1'b1;
+        end else begin
+          dv_rem <= r[5:0];
+        end
+        if (dv_i == 3'd0) ci <= '0;
+        dv_i <= dv_i - 3'd1;
+      end
+      T_PB: begin
+        if (ci == 4'd0) begin
+          // ow_tile: the quotient + 1 (0 -> 1), at most out_w
+          logic [31:0] t;
+          t = (reach_w + 32'd1 <= 32'(LBC) && q_sw != 32'd0) ? 32'(dv_q) + 32'd1 : 32'd1;
+          ow_tile <= 7'((t > q_out_w) ? q_out_w : t);
+        end
+        ci <= ci + 4'd1;
+        case (ci)
+          4'd4: ch_in   <= mp3;
+          4'd5: ch_out  <= mp3;
+          4'd6: owt_sw  <= mp3;
+          4'd7: owt1_sw <= mp3;
+          default: ;
+        endcase
+      end
+      default: ;
+    endcase
   end
 
   // ow_tile is set in T_PB's first cycle, used by its products 2 and 3 (ci 2, 3).
@@ -360,7 +378,13 @@ module pl_core
   end
 
   always_ff @(posedge clk) start_q <= job_start;
-  always_ff @(posedge clk) urst <= rst || job_start;
+  always_ff @(posedge clk) begin
+    urst    <= rst || job_start;      // sequencer and chunk FIFOs
+    urst_ld <= rst || job_start;
+    urst_em <= rst || job_start;
+    urst_rd <= rst || job_start;
+    urst_wr <= rst || job_start;
+  end
 
   // Chunk sequencer ----------------------------------------------------------------------
   // (batch ni, channel tile, W-tile) in the HLS order; every quantity by
@@ -475,7 +499,7 @@ module pl_core
   logic          ld_idle, em_idle, rd_idle, wr_idle, cl_rdy, ce_rdy, cw_rdy;
 
   pl_loader u_ld (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_ld), .j,
     .cq_valid (cl_valid), .cq_ready (cl_rdy), .cq (cl),
     .arvalid (m_axi_gmem0_ARVALID), .arready (m_axi_gmem0_ARREADY),
     .araddr  (m_axi_gmem0_ARADDR),  .arlen   (m_axi_gmem0_ARLEN),
@@ -488,7 +512,7 @@ module pl_core
   assign cl_pop = cl_valid && cl_rdy;
 
   pl_emit u_em (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_em), .j,
     .cq_valid (ce_valid), .cq_ready (ce_rdy), .cq (ce),
     .dq_valid, .dq_ready, .dq_data (dq),
     .wq_valid, .wq_ready, .wq_data (wq),
@@ -497,15 +521,26 @@ module pl_core
   );
   assign ce_pop = ce_valid && ce_rdy;
 
+  // The window beats leave the emitter's beat FIFO through a register slice:
+  // the reducer spreads over several DSP columns, so its stall (bt_ready)
+  // and the beat's lanes cross a long distance between two registers.
+  logic  bs_valid, bs_ready;
+  beat_t bs;
+  pl_rs #(.W($bits(beat_t))) u_bs (
+    .clk, .rst (urst_rd),
+    .in_valid  (bt_valid), .in_ready  (bt_ready), .in_data (bt),
+    .out_valid (bs_valid), .out_ready (bs_ready), .out_data (bs)
+  );
+
   pl_reduce u_rd (
-    .clk, .rst (urst), .j,
-    .bt_valid, .bt_ready, .bt,
+    .clk, .rst (urst_rd), .j,
+    .bt_valid (bs_valid), .bt_ready (bs_ready), .bt (bs),
     .fb_valid, .fb_ready, .fb,
     .idle (rd_idle)
   );
 
   pl_writer u_wr (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_wr), .j,
     .cq_valid (cw_valid), .cq_ready (cw_rdy), .cq (cw),
     .fb_valid, .fb_ready, .fb,
     .awvalid (m_axi_gmem1_AWVALID), .awready (m_axi_gmem1_AWREADY),
@@ -518,7 +553,8 @@ module pl_core
   );
   assign cw_pop = cw_valid && cw_rdy;
 
-  assign all_idle = !cl_valid && !ce_valid && !cw_valid && ld_idle && em_idle && rd_idle && wr_idle;
+  assign all_idle = !cl_valid && !ce_valid && !cw_valid && ld_idle && em_idle && !bs_valid && bt_ready &&
+                    rd_idle && wr_idle;
   assign ap_done  = (tstate == T_DONE);
   assign ap_idle  = (tstate == T_IDLE);
 

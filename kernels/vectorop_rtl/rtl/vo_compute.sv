@@ -121,13 +121,17 @@ module vo_compute
     end else if (div_take) begin
       d_busy <= 1'b1;
       d_li   <= '0;
-      d_a    <= a_data;
-      d_b    <= b_data;
     end else if (d_busy) begin
       d_li <= d_li + 3'd1;
       if (d_li == 3'd7) d_busy <= 1'b0;
     end
   end
+
+  always_ff @(posedge clk)
+    if (div_take) begin
+      d_a <= a_data;
+      d_b <= b_data;
+    end
 
   logic        q_valid;
   logic [15:0] q;

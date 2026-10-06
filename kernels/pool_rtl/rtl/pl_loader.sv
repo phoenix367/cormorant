@@ -149,28 +149,35 @@ module pl_loader
   assign b_waddr = second ? h_waddr2 : h_waddr;
   assign b_len   = second ? h_len2 : h_len1;
   assign b_lastb = second || !h_split;
-  assign issue   = h_v && (!arvalid || arready) && (space >= SW'(b_len)) &&
+  // The AXI side is registered both ways: AR leaves through a register slice
+  // (ARREADY only enables it) and R is registered before the word FIFO.
+  logic          ar_in_ready, rv_q, rl_q;
+  logic [BW-1:0] rd_q;
+  assign issue   = h_v && ar_in_ready && (space >= SW'(b_len)) &&
                    (outs != OW'(RD_OUTS)) && (second || dq_in_ready);
   assign h_take  = issue && b_lastb;
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      arvalid <= 1'b0;
       second  <= 1'b0;
       space   <= SW'(RD_FIFO_D);
       outs    <= '0;
+      rv_q    <= 1'b0;
     end else begin
-      if (arvalid && arready) arvalid <= 1'b0;
-      if (issue) begin
-        arvalid <= 1'b1;
-        araddr  <= {b_waddr, 4'b0};
-        arlen   <= 8'(4'(b_len - 4'd1));
-        second  <= !b_lastb;
-      end
+      if (issue) second <= !b_lastb;
       space <= space - (issue ? SW'(b_len) : '0) + (wf_pop ? SW'(1) : '0);
-      outs  <= outs + (issue ? OW'(1) : '0) - ((rvalid && rlast) ? OW'(1) : '0);
+      outs  <= outs + (issue ? OW'(1) : '0) - ((rv_q && rl_q) ? OW'(1) : '0);
+      rv_q  <= rvalid;
     end
+    rl_q <= rlast;
+    rd_q <= rdata;
   end
+
+  pl_rs #(.W(72)) u_ar (
+    .clk, .rst,
+    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({b_waddr, 4'b0, 8'(4'(b_len - 4'd1))}),
+    .out_valid (arvalid), .out_ready (arready),     .out_data ({araddr, arlen})
+  );
 
   // Run descriptors and words to the emitter ---------------------------------------------
   logic [6:0] dq_count;
@@ -186,13 +193,13 @@ module pl_loader
   logic [SW-1:0] wf_count;
   pl_fifo #(.W(BW), .D(RD_FIFO_D), .BRAM(1'b1)) u_wf (
     .clk, .rst,
-    .in_valid (rvalid),   .in_ready (wf_in_ready), .in_data (rdata),
+    .in_valid (rv_q),     .in_ready (wf_in_ready), .in_data (rd_q),
     .out_valid(wq_valid), .out_ready(wq_ready),    .out_data(wq_data),
     .count    (wf_count)
   );
   assign wf_pop = wq_valid && wq_ready;
 
-  assign idle = !g_act && !rq_valid && !h_v && !arvalid && (outs == '0) &&
+  assign idle = !g_act && !rq_valid && !h_v && !arvalid && ar_in_ready && (outs == '0) &&
                 (space == SW'(RD_FIFO_D)) && !dq_valid;
 
   // The word FIFO never fills (every burst reserved its space).

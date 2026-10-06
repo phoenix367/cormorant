@@ -184,7 +184,7 @@ rect(L, y, R - L, 96, "#ffffff", "#c9cbd1", 2, 4)
 text(L + 20, y + 36, "Kria KV260", 19, TITLE, "600", "start")
 text(L + 20, y + 62, "Zynq UltraScale+ K26", 13.5, "#4b5563", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 60, [
-    ["Programmable logic", "kernels at 100 MHz"], ["4 × Arm Cortex-A53", "Linux, host ops"],
+    ["Programmable logic", "kernels at 250 MHz"], ["4 × Arm Cortex-A53", "Linux, host ops"],
     ["4 GB DDR4", "1 GB CMA for the kernels"], ["AXI HPC0 / HPC1", "weights on their own port"]],
     BOARD_CHIP, TITLE, gap=18, size=14, bold_first=True)
 hw_bot = y + 96

@@ -191,27 +191,57 @@ module cv_patch
   assign a_addr = (st == P_LOAD) ? {l_ih[3:0], l_col} : {e_ih[3:0], e_iw0[5:0]};
   assign b_addr = {e_ih[3:0], e_iw1[5:0]};
 
-  logic [TIC*EW-1:0] rd_a, rd_b;
-  for (genvar c = 0; c < TIC; c++) begin : g_lb
-    (* ram_style = "block" *) logic [EW-1:0] mem [LBR * LBC];
-    always_ff @(posedge clk) begin
-      if (l_go) mem[a_addr] <= col_data[c * EW +: EW];
-      rd_a[c * EW +: EW] <= mem[a_addr];
+  // The banks are spread over several block-RAM columns: their ports take a
+  // register stage (the address and write enable a copy per LBG banks), the
+  // reads the RAM's output register — a beat is pushed three cycles after
+  // its e_go, a column written one cycle after its l_go (writes and reads
+  // keep their order).
+  localparam int LBG = 4;
+  (* keep = "true" *) logic [9:0] pa_addr [TIC / LBG];
+  (* keep = "true" *) logic [9:0] pb_addr [TIC / LBG];
+  (* keep = "true" *) logic       pa_we   [TIC / LBG];
+  logic [TIC*EW-1:0] pa_wd;
+  always_ff @(posedge clk) begin
+    for (int g = 0; g < TIC / LBG; g++) begin
+      pa_addr[g] <= a_addr;
+      pb_addr[g] <= b_addr;
+      pa_we[g]   <= l_go && !rst;
     end
-    always_ff @(posedge clk) rd_b[c * EW +: EW] <= mem[b_addr];
+    pa_wd <= col_data;
   end
 
-  // masks travel with the read (one cycle), then the beat is pushed
-  logic        r_v, r_ok0, r_ok1;
-  logic [4:0]  r_chv;
-  always_ff @(posedge clk) begin
-    if (rst) r_v <= 1'b0;
-    else     r_v <= e_go;
-    r_ok0 <= ok0;
-    r_ok1 <= ok1;
-    r_chv <= sd.ch_valid;
+  logic [TIC*EW-1:0] rd_a, rd_b;
+  for (genvar c = 0; c < TIC; c++) begin : g_lb
+    localparam int G = c / LBG;
+    (* ram_style = "block" *) logic [EW-1:0] mem [LBR * LBC];
+    logic [EW-1:0] ra0, rb0;
+    always_ff @(posedge clk) begin
+      if (pa_we[G]) mem[pa_addr[G]] <= pa_wd[c * EW +: EW];
+      ra0 <= mem[pa_addr[G]];
+    end
+    always_ff @(posedge clk) rb0 <= mem[pb_addr[G]];
+    always_ff @(posedge clk) begin           // the RAM's output registers
+      rd_a[c * EW +: EW] <= ra0;
+      rd_b[c * EW +: EW] <= rb0;
+    end
   end
-  assign inflight = {1'b0, r_v};
+
+  // masks travel with the read (three cycles), then the beat is pushed
+  logic        r_v1, r_v2, r_v, r_ok0, r_ok1;
+  logic [1:0]  r_ok0_d, r_ok1_d;
+  logic [4:0]  r_chv, r_chv1, r_chv2;
+  always_ff @(posedge clk) begin
+    if (rst) {r_v1, r_v2, r_v} <= '0;
+    else     {r_v1, r_v2, r_v} <= {e_go, r_v1, r_v2};
+    r_ok0_d <= {r_ok0_d[0], ok0};
+    r_ok1_d <= {r_ok1_d[0], ok1};
+    r_ok0   <= r_ok0_d[1];
+    r_ok1   <= r_ok1_d[1];
+    r_chv1  <= sd.ch_valid;
+    r_chv2  <= r_chv1;
+    r_chv   <= r_chv2;
+  end
+  assign inflight = 2'(r_v1) + 2'(r_v2) + 2'(r_v);
 
   logic [PATCH_W-1:0] beat;
   always_comb
@@ -228,7 +258,7 @@ module cv_patch
     .out_valid (pt_valid), .out_ready (pt_ready), .out_data (pt_data), .count (pf_n)
   );
 
-  assign idle = (st == P_IDLE) && !r_v && !pt_valid;
+  assign idle = (st == P_IDLE) && !r_v1 && !r_v2 && !r_v && !pt_valid;
 
   logic unused;
   assign unused = pf_in_ready ^ ^j ^ ^sd;

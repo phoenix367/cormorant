@@ -6,3 +6,5 @@ lint_off -rule SYMRSVDWORD -file "*/VectorOPKernel.v" -match "*interrupt*"
 lint_off -rule UNUSEDSIGNAL -file "*/vo_burstgen.sv" -match "*'g'*"
 // Partially used address vectors (16-byte aligned bases, word-aligned AXI-Lite addresses).
 lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"
+// Register slices whose lookahead output (head_data) the user does not need.
+lint_off -rule PINCONNECTEMPTY -file "*/vo_*_port.sv" -match "*head_data*"

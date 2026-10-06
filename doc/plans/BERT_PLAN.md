@@ -18,7 +18,8 @@ built with `--plan` (TACTICS_PLAN.md §9, MATMUL_RTL_PLAN.md after phase 4).
 Latest (2026-10-06, 50 examples, the SystemVerilog ConvKernel's
 bitstream `c2b2a6e5e50e`): p50 839 ms (CONV_RTL_PLAN.md phase 3: the RTL
 ConvKernel's cost model puts the attention P·V on ConvKernel too; 865 ms in
-phase 2 with P·V on MatmulKernel).
+phase 2 with P·V on MatmulKernel).  At 250 MHz (bitstream `986cef4866a0`,
+FMAX_250_PLAN.md): p50 541 ms.
 
 ## 0. Feasibility (measured 2026-09-26)
 

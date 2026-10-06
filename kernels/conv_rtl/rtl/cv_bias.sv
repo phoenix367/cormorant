@@ -2,7 +2,8 @@
 // cv_bias — the bias reader (gmem2, the HLS bias_producer): at job start the
 // whole bias vector (ceil(out_ch / 8) words, one burst — two across 4 KiB)
 // into a RAM of one TM-lane word per m-tile; the engine reads a tile's word
-// asynchronously.  Without a bias the words read as zero.
+// (the address registered here, the RAM read asynchronously) and ignores it
+// without a bias.
 // ---------------------------------------------------------------------------
 module cv_bias
   import cv_pkg::*;
@@ -23,7 +24,7 @@ module cv_bias
 
   output logic          ok,                 // loaded (or no bias)
   input  logic [6:0]    tile,
-  output logic [TM*EW-1:0] vec,
+  output logic [TM*EW-1:0] vec,             // the word of the previous cycle's tile
 
   output logic          idle
 );
@@ -72,15 +73,35 @@ module cv_bias
   assign rready = 1'b1;
   assign ok     = !j.has_bias || (loading && got == nw);
 
-  // lanes 0-7 and 8-15 of each tile
+  // lanes 0-7 and 8-15 of each tile.  The write goes through a register
+  // stage (its address replicated: it reaches every LUT of the RAM); the
+  // engine registers the read address and the data, and gates them with
+  // has_bias (the RAM keeps the last job's words when this one has none).
+  // The engine reads at the earliest two cycles after ok (a sweep starts the
+  // cycle after it, its first read address is registered), the last word
+  // lands one cycle after ok.
+  logic            w_lo, w_hi;
+  (* max_fanout = 64 *) logic [6:0] w_addr;
+  logic [E*EW-1:0] w_data;
+  always_ff @(posedge clk) begin
+    w_lo   <= rvalid && !got[0] && !rst;
+    w_hi   <= rvalid && got[0] && !rst;
+    w_addr <= got[7:1];
+    w_data <= rdata;
+  end
+
+  // the read address, registered (replicated: it too reaches every LUT)
+  (* max_fanout = 64 *) logic [6:0] tile_q;
+  always_ff @(posedge clk) tile_q <= tile;
+
   logic [E*EW-1:0] lo, hi;
   cv_lutram #(.W(E * EW), .D(128)) u_lo (
-    .clk, .we (rvalid && !got[0]), .waddr (got[7:1]), .wdata (rdata), .raddr (tile), .rdata (lo)
+    .clk, .we (w_lo), .waddr (w_addr), .wdata (w_data), .raddr (tile_q), .rdata (lo)
   );
   cv_lutram #(.W(E * EW), .D(128)) u_hi (
-    .clk, .we (rvalid && got[0]), .waddr (got[7:1]), .wdata (rdata), .raddr (tile), .rdata (hi)
+    .clk, .we (w_hi), .waddr (w_addr), .wdata (w_data), .raddr (tile_q), .rdata (hi)
   );
-  assign vec = j.has_bias ? {hi, lo} : '0;
+  assign vec = {hi, lo};
 
   assign idle = !arvalid && (!loading || got == nw);
 

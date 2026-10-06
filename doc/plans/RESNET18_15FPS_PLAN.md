@@ -10,7 +10,9 @@ combined"); host reorder 3.0 → 0.5 ms.  On 2026-10-04 (bitstream
 `1d28630fbfa4`, MATMUL_RTL_PLAN.md phase 4): ResNet-18 59.9 ms (16.7 FPS),
 MobileNet v1 73.0 ms, v2 62.9 ms.  Latest (2026-10-06, bitstream
 `c2b2a6e5e50e`, the RTL ConvKernel): ResNet-18 47.4 ms (21.1 FPS), MobileNet v1 41.2 ms, v2
-38.1 ms (CONV_RTL_PLAN.md phase 2).  Step 5 (150 MHz) still not started.
+38.1 ms (CONV_RTL_PLAN.md phase 2).  Step 5 — a faster clock — done as FMAX_250_PLAN.md
+(250 MHz, bitstream `986cef4866a0`): ResNet-18 20.5 ms (48.8 FPS), MobileNet v1 22.0 ms, v2
+20.5 ms.
 
 ## 0. Where the 310 ms go (board, per-layer profiler, 2026-09-26)
 

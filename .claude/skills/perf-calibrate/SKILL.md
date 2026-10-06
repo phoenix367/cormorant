@@ -24,12 +24,18 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/c2b2a6e5e50e** = hw_128 850cc88 (2026-10-06), the bitstream
+Current model: **kv260/986cef4866a0** (2026-10-06), the 250 MHz bitstream
+(FMAX_250_PLAN): the case list of kv260/c2b2a6e5e50e (same shipped calls), one pass and
+five refinement rounds (108 + 59 + 33 + 69 + 13) to 2011 exact calls, and `host.json` merged to 151 signatures / 39 kinds
+(unchanged); repeat spread median 0.099 %, `clock_mhz` 250 (perf_fit takes it from the local HWH).
+Its family fits are loose (held-out p90 7–64 %): the features are the engine cost model's,
+fitted at 100 MHz — a refit at 250 MHz is open.
+kv260/c2b2a6e5e50e (hw_128 850cc88, 2026-10-06), the 100 MHz bitstream
 with all four kernels in SystemVerilog (CONV_RTL_PLAN phase 3).  Its campaign started from
 the converged case list of kv260/dbb320fb7297 (one pass, one refinement round of 136); the
 scheduler's RTL ConvKernel cost model then changed the shipped ConvKernel calls, so the
 list was rebuilt (`cases`: 1402) and refined to convergence — 181 + 93 + 32 + 16 + 5 calls,
-each round a `cases --refine` of 15–30 min and a `run --resume` of seconds — to 2343 exact calls, and `host.json` merged to 151 signatures / 39 kinds (unchanged; repeat spread median 0.017 %).  Against dbb320fb7297 the 1042
+each round a `cases --refine` of 15–30 min and a `run --resume` of seconds — to 2343 exact calls; `host.json` stayed at 151 signatures / 39 kinds (unchanged; repeat spread median 0.017 %).  Against dbb320fb7297 the 1042
 ConvKernel calls are a median 28.4 % faster, the others unchanged (median 0.00 %); conv /
 conv-dw held-out p90 9.4 / 12.1 % with the RTL walk's terms, conv-mm 42.8 %.
 kv260/dbb320fb7297 (hw_128 7d8eefe, 2026-10-05), the bitstream
@@ -72,7 +78,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # c2b2a6e5e50e today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 986cef4866a0 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`

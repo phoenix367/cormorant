@@ -5,8 +5,8 @@ model:
 
 | Model | Backend name | Decode speed | First token | Notes |
 |---|---|---|---|---|
-| `smollm2-135m-instruct` | `smollm2` | ~10 tokens/s | 0.24–1.3 s | fast; fluent but often wrong on facts |
-| `smollm2-360m-instruct` | `smollm2-360m` | ~3.9 tokens/s | ~1 s | better answers; needs most of the CMA |
+| `smollm2-135m-instruct` | `smollm2` | ~18.3 tokens/s | 0.16–0.8 s | fast; fluent but often wrong on facts |
+| `smollm2-360m-instruct` | `smollm2-360m` | ~7.3 tokens/s | ~0.4 s | better answers; needs most of the CMA |
 
 Each model runs from its own library, `libsmollm2.so` or
 `libsmollm2_360m.so`.  The library runs the transformer on the FPGA kernels
@@ -165,7 +165,7 @@ Notes on the tools:
 
 The `smollm2-360m` backend serves SmolLM2-360M-Instruct from its own
 library, `libsmollm2_360m.so` (CHAT_PLAN §20): bit-exact on the board,
-~3.9 tokens/s decode, first token after ~1 s, and better answers than the
+~7.3 tokens/s decode (3.9 at 100 MHz), first token after ~0.4 s, and better answers than the
 135M model.  [This video](https://youtu.be/VVS7ExW0XYQ) shows it in a three-question conversation
 with `chat.py`: the third answer recalls the name and the city given in the
 first message, which the 135M model did not manage on the same questions.
@@ -382,22 +382,25 @@ The server logs one line per request, e.g.
 
 ## Speed and quality
 
-Measured on the board (CHAT_PLAN §13.4, §16.3, §17, §19):
+Measured on the board (CHAT_PLAN §13.4, §16.3, §17, §19; the kernels at
+250 MHz since FMAX_250_PLAN, the figures at 100 MHz noted):
 
-- **Decode: ~10 tokens/s** at short context.  A token takes 99 ms at
-  position 32, 107 ms at 256 and 130 ms at 1000.
+- **Decode: ~18.3 tokens/s** at short context (54.5 ms per token at 250 MHz,
+  bitstream `986cef4866a0`).  At 100 MHz a token took 99 ms at position 32,
+  107 ms at 256 and 130 ms at 1000.
   - **Why.**  Decode is bound by weight bandwidth.  MatmulKernel's GEMV
-    mode streams the 256 MiB of weights through both read ports at
-    ~3.1 GB/s, ~87 ms per token.  The host attention adds the rest, and
+    mode streams the 256 MiB of weights through both read ports (at
+    100 MHz ~3.1 GB/s, ~87 ms per token).  The host attention adds the rest, and
     that part grows with the position.
   - **History.**  Decode was ~5 tokens/s before CHAT_PLAN §19.
-- **Prefill.**  0.24 / 0.33 / 1.12 s for 16 / 64 / 256 new tokens, with
+- **Prefill.**  0.16 / 0.30 / 0.81 s for 16 / 64 / 256 new tokens at 250 MHz
+  (0.24 / 0.33 / 1.12 s at 100 MHz), with
   the prefill attention on the FPGA since phase 5 (3.6 s for 256 before;
   16 tokens took 0.34 s until the 16-token bucket's linears moved to the
   SystemVerilog MatmulKernel, MATMUL_RTL_PLAN phase 4; 64 / 256 took
   0.44 / 1.28 s before the SystemVerilog ConvKernel, CONV_RTL_PLAN).
-  So the first answer of a chat starts after ~0.24–1.3 s, and a follow-up
-  turn of a few tens of new tokens after ~0.45 s.
+  So the first answer of a chat starts after ~0.16–0.8 s, and a follow-up
+  turn of a few tens of new tokens after ~0.3 s.
 - **Host overhead per token** on the board's A53: sampling 0.8–2 ms in C
   (greedy / the default settings; ~2.5 ms with DRY); detokenizing 6 µs.
 - **Quality.**  A 135M model is fluent but often wrong on facts and

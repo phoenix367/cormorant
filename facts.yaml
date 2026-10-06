@@ -180,7 +180,7 @@ facts:
     model of another bitstream may sit beside it, e.g. the last HLS MatmulKernel bitstream's)
   source:
     file: inference-scheduler/perf_models/README.md
-    regex: '^`kv260/([0-9a-f]{12})` is hw_128'
+    regex: '^`kv260/([0-9a-f]{12})` is '
   exists:                                    # the files a bitstream needs besides the model
     - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.cases.json'
     - 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.calib.json'
@@ -491,8 +491,8 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 48}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 5ecd78b
-    date: 2026-10-04
+    commit: 72188db
+    date: 2026-10-06
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
           at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
           360M 740.2, SmolVLM 494.8 MiB); Piper 48.1 MiB (demo/tts/build/piper_project, same session); 5ecd78b changed
@@ -774,9 +774,9 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 47.4, resnet18_fps: 21.1, mobilenet_v1_ms: 41.2, mobilenet_v2_ms: 38.1, bert_ms: 839,
-          smollm2_135m_tok_s: 10.0, smollm2_135m_prefill16_s: 0.24, smollm2_360m_tok_s: 3.9,
-          smolvlm_image_s: 3.4, piper_rtf: 0.30, mnist_convnet_ms: 0.235, mnist_lenet_ms: 2.701}
+  value: {resnet18_ms: 20.5, resnet18_fps: 48.8, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.5, bert_ms: 541,
+          smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.16, smollm2_360m_tok_s: 7.3,
+          smolvlm_image_s: 2.3, piper_rtf: 0.24, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -808,8 +808,12 @@ facts:
           model (CONV_RTL_PLAN phase 3, 2026-10-06), the values above: BERT p50 839.2 (mean 840.5; P·V on
           ConvKernel), llm_board 135M 99.81 ms / token and a 243 ms 16-token prefill, 360M 252.0 ms / token,
           SmolVLM llm_image 3.37 s; tts_board RTF 0.303; ResNet-18 47.46, MobileNet v1 / v2 41.23 / 38.10, MNIST
-          0.235 / 2.701 ms (those projects unchanged)"
-    facts: {perf.bitstream_id: c2b2a6e5e50e}   # stale on another bitstream
+          0.235 / 2.701 ms (those projects unchanged).  Measured on 986cef4866a0 (the kernels at 250 MHz,
+          FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
+          MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
+          97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)"
+    facts: {perf.bitstream_id: 986cef4866a0}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -839,15 +843,15 @@ facts:
     - {file: demo/mnist/README.md, regex: '^  mnist_lenet    OK +[\d.]+% +(?P<mnist_lenet_ms>[\d.]+) '}
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
-       regex: '`c2b2a6e5e50e`, the RTL ConvKernel\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `c2b2a6e5e50e`\): p50 (?P<bert_ms>\d+) ms'}
+       regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `986cef4866a0`,\s+FMAX_250_PLAN.md\): p50 (?P<bert_ms>\d+) ms', dotall: true}
     - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
     - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
     - {file: demo/image_classification/README.md,       # the transcript's latest note, not the older ones
-       regex: 'faster kernel — ResNet-18 (?P<resnet18_ms>[\d.]+) ms,\s+MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/README.md, regex: 'met \((?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS\)'}
+       regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms,\s+MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
+    - {file: doc/README.md, regex: 'met \((?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: doc/README.md, regex: '\((?P<bert_ms>\d+) ms p50 on'}
     - {file: doc/README.md, regex: 'SmolLM2-135M on the FPGA \(~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\)'}
     - {file: doc/README.md, regex: 'bit-exact on the board, RTF (?P<piper_rtf>[\d.]+);'}
@@ -860,7 +864,7 @@ facts:
     - {file: demo/chat/doc/SMOLLM2.md, regex: '\*\*Prefill\.\*\*  (?P<smollm2_135m_prefill16_s>[\d.]+) / [\d.]+ / [\d.]+ s for 16 / 64 / 256'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'first answer of a chat starts after ~(?P<smollm2_135m_prefill16_s>[\d.]+)–'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: '`smollm2-360m` \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
-    - {file: demo/chat/doc/SMOLLM2.md, regex: '^~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s decode, first token'}
+    - {file: demo/chat/doc/SMOLLM2.md, regex: '^~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s decode'}
     - {file: demo/chat/doc/SMOLLM2.md, regex: 'Decode: ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\* at short context'}
     - {file: demo/chat/doc/SMOLVLM.md, regex: 'The vision encoder takes (?P<smolvlm_image_s>[\d.]+) s per image'}
     - {file: .claude/skills/llm-onboard/SKILL.md, regex: '`llm_image` ~(?P<smolvlm_image_s>[\d.]+) s'}
@@ -893,35 +897,39 @@ facts:
 
 - id: board.pl_clock_mhz
   kind: value
-  title: the clock the board runs the PL at (block design PL0), and the code that converts cycles with it
+  title: the clock the board runs the kernels at (the block design's clk_wiz_0 output, fed by PL0 at 100 MHz),
+    and the code that converts cycles with it
   optional: true                             # the hw/ submodule
   source: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sources_1/bd/design_cormorant/design_cormorant.bd,
-           regex: '"PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ": \{\s*"value": "(\d+)"', type: int}
+           regex: '"CLKOUT1_REQUESTED_OUT_FREQ": \{\s*"value": "(\d+)"', type: int}
   fix: report                                # code constants among them
   mentions:
     - {file: README.md, regex: 'programmable logic at (\d+) MHz'}
-    - {file: README.md, regex: 'runs the PL at (\d+) MHz'}
-    - {file: demo/README.md, regex: '`-DAXI_BUS_WIDTH=128`\) at (\d+) MHz'}
+    - {file: README.md, regex: 'the board runs them at (\d+) MHz'}
+    - {file: demo/README.md, regex: 'since\s+FMAX_250_PLAN the kernels run at (\d+) MHz', dotall: true}
     - {file: doc/kernels/HLS_CONV_RESEARCH.md, regex: 'the board runs at (\d+) MHz'}
+    - {file: CLAUDE.md, regex: '\*\*The kernel clock is (\d+) MHz\*\*'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, regex: 'runs on `clk_wiz_0/clk_out1`, \*\*(\d+) MHz\*\*'}
+    - {file: doc/build-and-test/PLATFORM_CONFIGURATION.md, regex: 'runs the kernels at (\d+) MHz from an MMCM'}
     - {file: doc/images/architecture.svg, regex: 'kernels at (\d+) MHz'}
-    - {file: inference-scheduler/src/perf_model.py, regex: '^MHZ = (\d+)\.0'}
-    - {file: inference-scheduler/perf_calibrate.py, regex: '^MHZ = (\d+)\.0'}
     - {file: .claude/skills/conv-cycle-model/scripts/conv_cycle_model.py, regex: '^PL_MHZ = (\d+) '}
 
 - id: hw.utilization
   kind: recorded
-  title: the bitstream's source commit and FPGA utilization (README)
-  value: {hw_commit: 850cc88, dsp: 688, dsp_total: 1248, dsp_pct: 55, lut: 56516, lut_total: 117120, lut_pct: 48.3,
+  title: the production bitstream and its FPGA utilization (README)
+  value: {bitstream: 986cef4866a0, dsp: 688, dsp_total: 1248, dsp_pct: 55, lut: 56019, lut_total: 117120, lut_pct: 47.8,
           bram: 103, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-05
-    how: "Vivado placed utilization report of hw/cormorant_hw_128 at 850cc88 (docs only since) with the four RTL
-          kernels — the ConvKernel of CONV_RTL_PLAN phase 1; the bitstream of perf.bitstream_id (dbb320fb7297
+    how: "Vivado placed utilization report of the 250 MHz design (FMAX_250_PLAN int6: the MMCM, register slices,
+          the four kernels' register trees; /mnt/data/bitstreams/kv260_250_986cef4866a0/), FF 81 365 (48 328
+          before); c2b2a6e5e50e before it (hw_128 850cc88, 100 MHz): LUT 56 516; the ConvKernel of CONV_RTL_PLAN
+          phase 1; (dbb320fb7297
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: c2b2a6e5e50e}
+    facts: {perf.bitstream_id: 986cef4866a0}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
@@ -932,9 +940,9 @@ facts:
   fix: report
   mentions:
     - file: README.md
-      regex: '`hw/cormorant_hw_128` (?P<hw_commit>[0-9a-f]{7})\) uses (?P<dsp_pct>\d+) % of the DSPs\s+\((?P<dsp>\d+) / (?P<dsp_total>\d+)\), (?P<lut_pct>[\d.]+) % of the LUTs \((?P<lut>[\d ]+) / (?P<lut_total>[\d ]+)\), (?P<bram>[\d.]+) / (?P<bram_total>\d+) BRAM and\s+(?P<uram>\d+) / (?P<uram_total>\d+) URAM'
-    - {file: inference-scheduler/perf_models/README.md, regex: 'is hw_128 (?P<hw_commit>[0-9a-f]{7}) \('}
-    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: '= hw_128 (?P<hw_commit>[0-9a-f]{7}) \(2026'}
+      regex: 'bitstream `(?P<bitstream>[0-9a-f]{12})`\) uses (?P<dsp_pct>\d+) % of the DSPs\s+\((?P<dsp>\d+) / (?P<dsp_total>\d+)\), (?P<lut_pct>[\d.]+) % of the LUTs \((?P<lut>[\d ]+) / (?P<lut_total>[\d ]+)\), (?P<bram>[\d.]+) / (?P<bram_total>\d+) BRAM and\s+(?P<uram>\d+) / (?P<uram_total>\d+) URAM'
+    - {file: inference-scheduler/perf_models/README.md, regex: '^`kv260/(?P<bitstream>[0-9a-f]{12})` is'}
+    - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'Current model: \*\*kv260/(?P<bitstream>[0-9a-f]{12})\*\*'}
 
 # ── the board: UIO devices of the overlay ────────────────────────────────────
 - id: board.uio_labels

@@ -63,7 +63,7 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `description` | no | *(none)* | Informational only; not read by CMake or the scheduler |
 | `part` | yes | — | Xilinx device part string passed to `set_part` |
 | `board` | no | *(none)* | Board identifier passed to `set_part -board` |
-| `clock` | no | *(none)* | Informational: the target clock (MHz) of the retired Vitis HLS synthesis.  The RTL IPs' out-of-context checks use their own period (`<K>_RTL_PERIOD`, 3.333 ns); the block design runs the PL at 100 MHz |
+| `clock` | no | *(none)* | Informational: the target clock (MHz) of the retired Vitis HLS synthesis.  The RTL IPs' out-of-context checks use their own period (`<K>_RTL_PERIOD`, 3.333 ns); the block design runs the kernels at 250 MHz from an MMCM (`hw/cormorant_hw_128/scripts/bd_kernel_clock.tcl`, [FMAX_250_PLAN](../plans/FMAX_250_PLAN.md)) |
 | `kernels.conv` | yes | — | ConvKernel compile-time bounds — [§ConvKernel](#kernelsconv) |
 | `kernels.matmul` | yes | — | MatmulKernel compile-time bounds — [§MatmulKernel](#kernelsmatmul) |
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |

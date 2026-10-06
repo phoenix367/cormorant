@@ -225,9 +225,18 @@ module mm_core #(
     $error("mm_core: unsupported interface parameters");
   end
 
-  logic clk, rst;
+  // The reset, registered: one copy for the control slave, one for the rest.
+  // keep: the four kernels' copies are equivalent registers, and the block
+  // design's global synthesis would otherwise merge them into one that
+  // drives all four kernels across the device (FMAX_250_PLAN).
+  logic clk;
+  (* keep = "true" *) logic rst;
+  (* keep = "true", max_fanout = 128 *) logic rst_c;
   assign clk = ap_clk;
-  always_ff @(posedge clk) rst <= !ap_rst_n;
+  always_ff @(posedge clk) begin
+    rst   <= !ap_rst_n;
+    rst_c <= !ap_rst_n;
+  end
 
   // Control slave ------------------------------------------------------------------
   logic        ap_start, ap_done, ap_idle;
@@ -235,7 +244,7 @@ module mm_core #(
   logic [31:0] r_n, r_k, r_m, r_batch, r_as, r_bs, r_cs, r_bp, r_kw;
 
   mm_ctrl_s_axi u_ctrl (
-    .clk, .rst,
+    .clk, .rst (rst_c),
     .awvalid (s_axi_ctrl_AWVALID), .awready (s_axi_ctrl_AWREADY), .awaddr (s_axi_ctrl_AWADDR),
     .wvalid  (s_axi_ctrl_WVALID),  .wready  (s_axi_ctrl_WREADY),  .wdata  (s_axi_ctrl_WDATA),
     .wstrb   (s_axi_ctrl_WSTRB),
@@ -253,7 +262,7 @@ module mm_core #(
   // Job sequencing ---------------------------------------------------------------------
   typedef enum logic [1:0] {T_IDLE, T_CFG, T_RUN, T_DONE} tst_t;
   tst_t        tstate;
-  logic        job_start, urst;
+  logic        job_start, start_q;
   cfg_t        cfg;
   logic [63:0] j_a, j_b, j_c;
   logic [31:0] j_n, j_k, j_m, j_batch, j_as, j_bs, j_cs, j_bp, j_kw;
@@ -318,7 +327,18 @@ module mm_core #(
 
   assign ap_idle = (tstate == T_IDLE);
   assign ap_done = (tstate == T_DONE);
-  assign urst    = rst || job_start;      // every unit starts a job from reset
+  // Every unit starts a job from reset: the job reset is registered (with
+  // start_q one cycle after job_start, as before urst and start coincide)
+  // and copied per unit group, so no reset net spans the whole kernel.
+  (* keep = "true" *) logic [1:0] urst_p, urst_l;   // per read port: front end / lane side
+  (* keep = "true" *) logic       urst_s, urst_o;   // step queues / drain + write path
+  always_ff @(posedge clk) begin
+    start_q <= job_start;
+    urst_p  <= {2{rst || job_start}};
+    urst_l  <= {2{rst || job_start}};
+    urst_s  <= rst || job_start;
+    urst_o  <= rst || job_start;
+  end
 
   // Walker and step queues ----------------------------------------------------------
   logic  w_valid, w_ready, w_done;
@@ -328,7 +348,7 @@ module mm_core #(
   step_t       sq_out [3];
 
   mm_walker u_walker (
-    .clk, .rst, .start (job_start), .cfg,
+    .clk, .rst, .start (start_q), .cfg,
     .a_base (j_a), .b_base (j_b), .c_base (j_c),
     .a_stride (j_as), .b_stride (j_bs), .c_stride (j_cs),
     .step_valid (w_valid), .step_ready (w_ready), .step (w_step),
@@ -339,7 +359,7 @@ module mm_core #(
   for (genvar i = 0; i < 3; i++) begin : g_sq
     logic [2:0] cnt;
     mm_fifo #(.W($bits(step_t)), .D(4), .BRAM(1'b0)) u_sq (
-      .clk, .rst (urst),
+      .clk, .rst (urst_s),
       .in_valid (w_valid && w_ready), .in_ready (sq_in_ready[i]), .in_data (w_step),
       .out_valid(sq_out_valid[i]), .out_ready(sq_out_ready[i]), .out_data(sq_out[i]),
       .count    (cnt)
@@ -379,7 +399,7 @@ module mm_core #(
     rd_run_t rq_d;
     x_run_t  xq_d;
     mm_rungen #(.P(p)) u_rg (
-      .clk, .rst (urst), .start (job_start), .cfg,
+      .clk, .rst (urst_p[p]), .start (start_q), .cfg,
       .step_valid (sq_out_valid[p]), .step_ready (sq_out_ready[p]), .step (sq_out[p]),
       .gb_valid (gq_v), .gb_ready (gq_r), .gb_run (gq_d),
       .rd_valid (rq_v), .rd_ready (rq_r), .rd_run (rq_d),
@@ -393,20 +413,20 @@ module mm_core #(
     x_run_t  x_d;
     logic [5:0] c0, c1, c2;
     mm_fifo #(.W($bits(gb_run_t)), .D(32), .BRAM(1'b0)) u_gq (
-      .clk, .rst (urst), .in_valid (gq_v), .in_ready (gq_r), .in_data (gq_d),
+      .clk, .rst (urst_p[p]), .in_valid (gq_v), .in_ready (gq_r), .in_data (gq_d),
       .out_valid (gb_v), .out_ready (gb_r), .out_data (gb_d), .count (c0));
     mm_fifo #(.W($bits(rd_run_t)), .D(32), .BRAM(1'b0)) u_rq (
-      .clk, .rst (urst), .in_valid (rq_v), .in_ready (rq_r), .in_data (rq_d),
+      .clk, .rst (urst_p[p]), .in_valid (rq_v), .in_ready (rq_r), .in_data (rq_d),
       .out_valid (rd_v), .out_ready (rd_r), .out_data (rd_d), .count (c1));
     mm_fifo #(.W($bits(x_run_t)), .D(32), .BRAM(1'b0)) u_xq (
-      .clk, .rst (urst), .in_valid (xq_v), .in_ready (xq_r), .in_data (xq_d),
+      .clk, .rst (urst_p[p]), .in_valid (xq_v), .in_ready (xq_r), .in_data (xq_d),
       .out_valid (x_v), .out_ready (x_r), .out_data (x_d), .count (c2));
 
     // read engine
     logic          rw_v, rw_r;
     logic [BW-1:0] rw_d;
     mm_axi_rd u_rd (
-      .clk, .rst (urst),
+      .clk, .rst (urst_p[p]),
       .desc_valid (rd_v), .desc_ready (rd_r), .desc (rd_d),
       .arvalid (ar_valid[p]), .arready (ar_ready[p]), .araddr (ar_addr[p]), .arlen (ar_len[p]),
       .rvalid (r_valid[p]), .rready (), .rdata (r_data[p]), .rlast (r_last[p]),
@@ -420,21 +440,48 @@ module mm_core #(
     logic [8:0]    go_beat;
     logic [4:0]    go_row;
     gb_run_t       go_meta;
+    // register slice between the read FIFO and the gearbox: the gearbox's
+    // consume decision ends here instead of in the FIFO's skid stage
+    logic          ri_v, ri_r;
+    logic [BW-1:0] ri_d;
+    mm_rs #(.W(BW)) u_ri (
+      .clk, .rst (urst_p[p]),
+      .in_valid  (rw_v), .in_ready  (rw_r), .in_data (rw_d),
+      .out_valid (ri_v), .out_ready (ri_r), .out_data (ri_d)
+    );
+
     mm_gearbox u_gb (
-      .clk, .rst (urst),
+      .clk, .rst (urst_p[p]),
       .run_valid (gb_v), .run_ready (gb_r), .run (gb_d),
-      .in_valid (rw_v), .in_ready (rw_r), .in_data (rw_d),
+      .in_valid (ri_v), .in_ready (ri_r), .in_data (ri_d),
       .out_valid (go_v), .out_ready (go_r), .out_data (go_d), .out_marker (go_mk),
       .out_row_first (go_rf), .out_row_last (go_rl), .out_run_first (go_uf),
       .out_run_last (go_ul), .out_beat (go_beat), .out_row (go_row), .out_meta (go_meta)
     );
 
+    // Register slice between the gearbox and its consumers: the lane's and
+    // A writer's ready decisions stop here instead of running back through
+    // the gearbox into the read FIFO.
+    localparam int SW = BW + 5 + 9 + 5 + $bits(gb_run_t);
+    logic          s_v, s_r, s_mk, s_rf, s_rl, s_uf, s_ul;
+    logic [BW-1:0] s_d;
+    logic [8:0]    s_beat;
+    logic [4:0]    s_row;
+    gb_run_t       s_meta;
+    mm_rs #(.W(SW)) u_rs (
+      .clk, .rst (urst_l[p]),
+      .in_valid  (go_v), .in_ready (go_r),
+      .in_data   ({go_d, go_mk, go_rf, go_rl, go_uf, go_ul, go_beat, go_row, go_meta}),
+      .out_valid (s_v),  .out_ready (s_r),
+      .out_data  ({s_d, s_mk, s_rf, s_rl, s_uf, s_ul, s_beat, s_row, s_meta})
+    );
+
     // A writer (A beats)
     logic aw_r;
     mm_awr u_awr (
-      .clk, .rst (urst), .cfg,
-      .in_valid (go_v && !go_meta.dest_b), .in_ready (aw_r), .in_data (go_d),
-      .in_marker (go_mk), .in_run_last (go_ul), .in_beat (go_beat), .in_row (go_row),
+      .clk, .rst (urst_l[p]), .cfg,
+      .in_valid (s_v && !s_meta.dest_b), .in_ready (aw_r), .in_data (s_d),
+      .in_marker (s_mk), .in_run_last (s_ul), .in_beat (s_beat), .in_row (s_row),
       .xpf_cnt, .awr_cnt (awr_cnt[p]),
       .we (ab_we[p]), .wrow (ab_wrow[p]), .wlane (ab_wlane[p]),
       .waddr (ab_waddr[p]), .wdata (ab_wdata[p])
@@ -444,7 +491,7 @@ module mm_core #(
     logic tp_v, tp_pop;
     logic [E-1:0][R-1:0][EW-1:0] tp_d;
     mm_xpf u_xpf (
-      .clk, .rst (urst), .cfg,
+      .clk, .rst (urst_l[p]), .cfg,
       .xq_valid (x_v), .xq_ready (x_r), .xq (x_d),
       .awr_cnt, .xpf_cnt (xpf_cnt[p]),
       .re (ab_re[p]), .raddr (ab_raddr[p]), .rdata (ab_rdata[p]),
@@ -454,19 +501,19 @@ module mm_core #(
     // MAC lane p (B beats)
     logic ln_r;
     mm_lane u_lane (
-      .clk, .rst (urst),
-      .in_valid (go_v && go_meta.dest_b), .in_ready (ln_r), .in_data (go_d),
-      .in_marker (go_mk), .in_row_first (go_rf), .in_row_last (go_rl), .in_run_last (go_ul),
-      .in_beat (go_beat), .in_row (go_row), .in_meta (go_meta),
+      .clk, .rst (urst_l[p]),
+      .in_valid (s_v && s_meta.dest_b), .in_ready (ln_r), .in_data (s_d),
+      .in_marker (s_mk), .in_row_first (s_rf), .in_row_last (s_rl), .in_run_last (s_ul),
+      .in_beat (s_beat), .in_row (s_row), .in_meta (s_meta),
       .tap_valid (tp_v), .tap_pop (tp_pop), .tap_data (tp_d),
       .drn_cnt, .cmp_cnt (cmp_cnt[p]), .active (lane_active[p]),
       .drd_en, .drd_addr, .drd_row, .drd_data (drd_data[p])
     );
 
-    assign go_r = go_meta.dest_b ? ln_r : aw_r;
+    assign s_r = s_meta.dest_b ? ln_r : aw_r;
 
     logic unused;
-    assign unused = go_uf ^ ^c0 ^ ^c1 ^ ^c2;
+    assign unused = s_uf ^ ^c0 ^ ^c1 ^ ^c2;
   end
 
   mm_abuf u_abuf (
@@ -485,7 +532,7 @@ module mm_core #(
   logic          dr_idle, pk_idle, wr_idle;
 
   mm_drain u_drain (
-    .clk, .rst (urst), .start (job_start), .cfg,
+    .clk, .rst (urst_o), .start (start_q), .cfg,
     .step_valid (sq_out_valid[2]), .step_ready (sq_out_ready[2]), .step (sq_out[2]),
     .cmp_cnt, .lane_active, .drn_cnt,
     .drd_en, .drd_addr, .drd_row, .drd_data,
@@ -496,7 +543,7 @@ module mm_core #(
 
   logic [2:0] crq_cnt;
   mm_fifo #(.W(77), .D(4), .BRAM(1'b0)) u_crq (
-    .clk, .rst (urst), .in_valid (cr_v), .in_ready (cr_r), .in_data ({cr_n, cr_addr}),
+    .clk, .rst (urst_o), .in_valid (cr_v), .in_ready (cr_r), .in_data ({cr_n, cr_addr}),
     .out_valid (crq_v), .out_ready (crq_r), .out_data ({crq_n, crq_addr}), .count (crq_cnt));
 
   logic          pa_v, pa_r, pw_v, pw_r;
@@ -505,7 +552,7 @@ module mm_core #(
   logic [BW-1:0] pw_d;
   logic [2*E-1:0] pw_s;
   mm_packer u_pk (
-    .clk, .rst (urst),
+    .clk, .rst (urst_o),
     .run_valid (crq_v), .run_ready (crq_r), .run_addr (crq_addr), .run_n (crq_n),
     .el_valid (el_v), .el_ready (el_r), .el_data (el_d), .el_cnt (el_c),
     .aw_valid (pa_v), .aw_ready (pa_r), .aw_waddr (pa_waddr), .aw_nw (pa_nw),
@@ -514,7 +561,7 @@ module mm_core #(
   );
 
   mm_axi_wr u_wr (
-    .clk, .rst (urst),
+    .clk, .rst (urst_o),
     .desc_valid (pa_v), .desc_ready (pa_r), .desc_waddr (pa_waddr), .desc_nw (pa_nw),
     .in_valid (pw_v), .in_ready (pw_r), .in_data (pw_d), .in_strb (pw_s),
     .awvalid (m_axi_gmem2_AWVALID), .awready (m_axi_gmem2_AWREADY),
@@ -525,7 +572,7 @@ module mm_core #(
     .idle (wr_idle)
   );
 
-  assign job_done = (tstate == T_RUN) && !job_start && w_done && (drn_cnt == n_steps) &&
+  assign job_done = (tstate == T_RUN) && !job_start && !start_q && w_done && (drn_cnt == n_steps) &&
                     dr_idle && !crq_v && pk_idle && wr_idle;
 
   // AXI constant fields and unused channels ---------------------------------------------

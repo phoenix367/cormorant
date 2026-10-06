@@ -31,7 +31,7 @@ enable_testing()
 
 set(PL_RTL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(PL_RTL_SOURCES
-    rtl/pl_pkg.sv rtl/pl_fifo.sv rtl/pl_lutram.sv rtl/pl_ctrl_s_axi.sv rtl/pl_loader.sv
+    rtl/pl_pkg.sv rtl/pl_fifo.sv rtl/pl_rs.sv rtl/pl_lutram.sv rtl/pl_ctrl_s_axi.sv rtl/pl_loader.sv
     rtl/pl_emit.sv rtl/pl_reduce.sv rtl/pl_writer.sv rtl/pl_core.sv rtl/PoolingKernel.v)
 list(TRANSFORM PL_RTL_SOURCES PREPEND "${PL_RTL_DIR}/")
 set(PL_RTL_TB_SOURCES
@@ -230,6 +230,16 @@ if(PL_RTL_VIVADO)
                 -tclargs "${PL_RTL_DIR}" ${PL_RTL_PERIOD} "${PL_RTL_PART}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/synth"
         COMMENT "PoolingKernel RTL: Vivado OOC synthesis + P&R (${PL_RTL_PART}, ${PL_RTL_PERIOD} ns)"
+        USES_TERMINAL VERBATIM)
+
+    # netlist equivalence: Vivado's OOC synthesis of the IP top against the RTL,
+    # in lockstep in xsim on board-like jobs (tools/neteq) — catches RTL that
+    # synthesises differently from how it simulates
+    add_custom_target(neteq_pool_rtl
+        COMMAND "${CMAKE_COMMAND}" -E env "PATH=${_pl_rtl_vivado_bin}:$ENV{PATH}"
+                "${PL_RTL_DIR}/../../tools/neteq/run.sh" pool "${PL_RTL_DIR}/rtl"
+                "${CMAKE_CURRENT_BINARY_DIR}/neteq"
+        COMMENT "PoolingKernel RTL: synthesised netlist vs RTL in lockstep (xsim)"
         USES_TERMINAL VERBATIM)
 
     add_custom_target(xsim_pool_rtl

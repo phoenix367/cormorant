@@ -222,9 +222,18 @@ module vo_core #(
     $error("vo_core: unsupported interface parameters");
   end
 
-  logic clk, rst;
+  // The reset, registered: one copy for the control slave, one for the rest.
+  // keep: the four kernels' copies are equivalent registers, and the block
+  // design's global synthesis would otherwise merge them into one that
+  // drives all four kernels across the device (FMAX_250_PLAN).
+  logic clk;
+  (* keep = "true" *) logic rst;
+  (* keep = "true", max_fanout = 128 *) logic rst_c;
   assign clk = ap_clk;
-  always_ff @(posedge clk) rst <= !ap_rst_n;
+  always_ff @(posedge clk) begin
+    rst   <= !ap_rst_n;
+    rst_c <= !ap_rst_n;
+  end
 
   // Control slave ------------------------------------------------------------------
   logic        ap_start, ap_done, ap_idle;
@@ -232,7 +241,7 @@ module vo_core #(
   logic [31:0] r_size, r_op, r_outer, r_ainc, r_binc, r_act;
 
   vo_ctrl_s_axi u_ctrl (
-    .clk, .rst,
+    .clk, .rst (rst_c),
     .awvalid (s_axi_ctrl_AWVALID), .awready (s_axi_ctrl_AWREADY), .awaddr (s_axi_ctrl_AWADDR),
     .wvalid  (s_axi_ctrl_WVALID),  .wready  (s_axi_ctrl_WREADY),  .wdata  (s_axi_ctrl_WDATA),
     .wstrb   (s_axi_ctrl_WSTRB),
@@ -251,15 +260,16 @@ module vo_core #(
   // REP_D words is replayed; outer == 1 or inc == size (whole words) is one
   // contiguous range of outer * n_words words; otherwise outer runs of n_words
   // words, run o at word o * (inc / 8).  The output uses c_inc = a_inc + b_inc.
-  typedef enum logic [2:0] {T_IDLE, T_CFG0, T_CFG1, T_CFG2, T_CFG3, T_CFG4, T_RUN, T_DONE} tst_t;
+  typedef enum logic [3:0] {T_IDLE, T_LAT, T_CFG0, T_CFG1, T_CFG2, T_CFG3, T_CFG4, T_CFG5,
+                            T_RUN, T_DONE} tst_t;
   tst_t        tstate;
   logic [63:0] j_a, j_b, j_c;
   logic [31:0] j_size, j_op, j_outer, j_ainc, j_binc, j_act;
-  logic [31:0] nw, c_inc, pm1, pm2, pm3;
+  logic [31:0] nw, c_inc, pm;
   logic [3:0]  tail;
   logic        go;
   geom_t       ga, gb, gc;
-  logic        job_start, start_q, urst, job_done;
+  logic        job_start, start_q, start_q2, job_done;
 
   function automatic geom_t mk_geom(input logic en, input logic [63:0] base,
                                     input logic [31:0] inc, input logic can_replay);
@@ -273,45 +283,58 @@ module vo_core #(
     g.replay   = rep;
     g.reps     = j_outer;
     g.n_runs   = (rep || contig) ? 32'd1 : j_outer;
-    g.run_words = rep ? nw : contig ? pm3 : nw;
+    g.run_words = rep ? nw : contig ? pm : nw;
     g.stride_w = (rep || contig) ? '0 : {3'b0, inc[31:3]};
     return g;
   endfunction
 
-  // outer * n_words (low 32 bits, as the HLS kernel), pipelined into the DSPs
+  // outer * n_words (low 32 bits, as the HLS kernel) from three 16 x 16
+  // partial products, every stage registered (DSP A/B, M and P registers,
+  // then one 32-bit add):  o * n mod 2^32
+  //   = oL*nL + ((oL*nH + oH*nL) mod 2^16) << 16
+  // nw is valid from T_CFG1; pm from T_CFG5 (four stages).
+  logic [31:0] po, pn, m0, s0;
+  logic [15:0] m1, m2, s12;
   always_ff @(posedge clk) begin
-    pm1 <= j_outer * nw;
-    pm2 <= pm1;
-    pm3 <= pm2;
+    po  <= j_outer;
+    pn  <= nw;
+    m0  <= po[15:0] * pn[15:0];
+    m1  <= 16'(po[15:0] * pn[31:16]);
+    m2  <= 16'(po[31:16] * pn[15:0]);
+    s0  <= m0;
+    s12 <= m1 + m2;
+    pm  <= s0 + {s12, 16'b0};
   end
+
+  // The argument latch and the geometry loads are enabled by registered
+  // strobes (a state bit each, copied per geometry), not by a state decode:
+  // these enables reach several hundred registers across the kernel.
+  logic                ld_j;              // T_LAT: latch the arguments
+  (* keep = "true" *) logic ld_ga, ld_gb, ld_gc;   // T_CFG5: load the geometries
 
   always_ff @(posedge clk) begin
     if (rst) begin
       tstate    <= T_IDLE;
       job_start <= 1'b0;
+      ld_j      <= 1'b0;
+      ld_ga     <= 1'b0;
+      ld_gb     <= 1'b0;
+      ld_gc     <= 1'b0;
     end else begin
       job_start <= 1'b0;
+      ld_j      <= (tstate == T_IDLE) && ap_start;
+      ld_ga     <= (tstate == T_CFG4);
+      ld_gb     <= (tstate == T_CFG4);
+      ld_gc     <= (tstate == T_CFG4);
       case (tstate)
-        T_IDLE: if (ap_start) begin
-          j_a <= r_a; j_b <= r_b; j_c <= r_c;
-          j_size <= r_size; j_op <= r_op; j_outer <= r_outer;
-          j_ainc <= r_ainc; j_binc <= r_binc; j_act <= r_act;
-          tstate <= T_CFG0;
-        end
-        T_CFG0: begin
-          nw     <= 32'((33'(j_size) + 33'd7) >> 3);
-          tail   <= (j_size[2:0] == 3'd0) ? 4'd8 : {1'b0, j_size[2:0]};
-          c_inc  <= j_ainc + j_binc;
-          go     <= (j_size != '0) && (j_outer != '0);
-          tstate <= T_CFG1;
-        end
-        T_CFG1: tstate <= T_CFG2;           // pm1 .. pm3: three cycles of the product
+        T_IDLE: if (ap_start) tstate <= T_LAT;
+        T_LAT:  tstate <= T_CFG0;
+        T_CFG0: tstate <= T_CFG1;
+        T_CFG1: tstate <= T_CFG2;           // T_CFG1 .. T_CFG4: the product's four stages
         T_CFG2: tstate <= T_CFG3;
         T_CFG3: tstate <= T_CFG4;
-        T_CFG4: begin
-          ga <= mk_geom(1'b1,             j_a, j_ainc, 1'b1);
-          gb <= mk_geom(j_op < OP_RELU,   j_b, j_binc, 1'b1);
-          gc <= mk_geom(1'b1,             j_c, c_inc,  1'b0);
+        T_CFG4: tstate <= T_CFG5;
+        T_CFG5: begin
           job_start <= 1'b1;
           tstate    <= T_RUN;
         end
@@ -322,11 +345,39 @@ module vo_core #(
     end
   end
 
-  always_ff @(posedge clk) start_q <= !rst && job_start;
+  // Job arguments and derived values (no reset; loaded before every use).
+  always_ff @(posedge clk) begin
+    if (ld_j) begin
+      j_a <= r_a; j_b <= r_b; j_c <= r_c;
+      j_size <= r_size; j_op <= r_op; j_outer <= r_outer;
+      j_ainc <= r_ainc; j_binc <= r_binc; j_act <= r_act;
+    end
+    if (tstate == T_CFG0) begin
+      nw    <= 32'((33'(j_size) + 33'd7) >> 3);
+      tail  <= (j_size[2:0] == 3'd0) ? 4'd8 : {1'b0, j_size[2:0]};
+      c_inc <= j_ainc + j_binc;
+      go    <= (j_size != '0) && (j_outer != '0);
+    end
+    if (ld_ga) ga <= mk_geom(1'b1,           j_a, j_ainc, 1'b1);
+    if (ld_gb) gb <= mk_geom(j_op < OP_RELU, j_b, j_binc, 1'b1);
+    if (ld_gc) gc <= mk_geom(1'b1,           j_c, c_inc,  1'b0);
+  end
+
+  // Every unit starts a job from reset: the job reset is registered and
+  // copied per unit (start_q2 follows it by one cycle, as start_q followed
+  // the combinational reset before).
+  (* keep = "true" *) logic urst_a, urst_b, urst_c, urst_w;
+  always_ff @(posedge clk) begin
+    start_q  <= !rst && job_start;
+    start_q2 <= !rst && start_q;
+    urst_a   <= rst || job_start;
+    urst_b   <= rst || job_start;
+    urst_c   <= rst || job_start;
+    urst_w   <= rst || job_start;
+  end
 
   assign ap_idle = (tstate == T_IDLE);
   assign ap_done = (tstate == T_DONE);
-  assign urst    = rst || job_start;          // every unit starts a job from reset
 
   // Operand ports, compute, output -----------------------------------------------------
   logic          a_valid, a_ready, b_valid, b_ready, c_valid, c_ready;
@@ -334,7 +385,7 @@ module vo_core #(
   logic          a_idle, b_idle, cp_idle, wr_idle;
 
   vo_rd_port u_rd_a (
-    .clk, .rst (urst), .start (start_q), .g (ga),
+    .clk, .rst (urst_a), .start (start_q2), .g (ga),
     .arvalid (m_axi_gmem0_ARVALID), .arready (m_axi_gmem0_ARREADY),
     .araddr  (m_axi_gmem0_ARADDR),  .arlen   (m_axi_gmem0_ARLEN),
     .rvalid  (m_axi_gmem0_RVALID),  .rready  (m_axi_gmem0_RREADY),
@@ -344,7 +395,7 @@ module vo_core #(
   );
 
   vo_rd_port u_rd_b (
-    .clk, .rst (urst), .start (start_q), .g (gb),
+    .clk, .rst (urst_b), .start (start_q2), .g (gb),
     .arvalid (m_axi_gmem1_ARVALID), .arready (m_axi_gmem1_ARREADY),
     .araddr  (m_axi_gmem1_ARADDR),  .arlen   (m_axi_gmem1_ARLEN),
     .rvalid  (m_axi_gmem1_RVALID),  .rready  (m_axi_gmem1_RREADY),
@@ -354,14 +405,14 @@ module vo_core #(
   );
 
   vo_compute u_cp (
-    .clk, .rst (urst), .op (j_op), .act (j_act),
+    .clk, .rst (urst_c), .op (j_op), .act (j_act),
     .a_valid, .a_ready, .a_data, .b_valid, .b_ready, .b_data,
     .c_valid, .c_ready, .c_data,
     .idle (cp_idle)
   );
 
   vo_wr_port u_wr (
-    .clk, .rst (urst), .start (start_q), .g (gc),
+    .clk, .rst (urst_w), .start (start_q2), .g (gc),
     .in_valid (c_valid), .in_ready (c_ready), .in_data (c_data),
     .awvalid (m_axi_gmem2_AWVALID), .awready (m_axi_gmem2_AWREADY),
     .awaddr  (m_axi_gmem2_AWADDR),  .awlen   (m_axi_gmem2_AWLEN),
@@ -372,7 +423,7 @@ module vo_core #(
   );
   assign m_axi_gmem2_WSTRB = '1;
 
-  assign job_done = (tstate == T_RUN) && !job_start && !start_q &&
+  assign job_done = (tstate == T_RUN) && !job_start && !start_q && !start_q2 &&
                     a_idle && b_idle && cp_idle && wr_idle;
 
   // AXI constant fields and unused channels ---------------------------------------------

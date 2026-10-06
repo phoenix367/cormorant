@@ -11,6 +11,10 @@
 // -> LUTRAM write, a loop of DMIN cycles.  Rows shorter than DMIN beats get
 // bubbles so no accumulator is read before its previous update lands.
 //
+// tap_data[l] is the tap FIFO's head of the previous cycle (mm_xpf keeps a
+// copy of the read pointer per beat lane), so the B operand of a row whose
+// first beat issues at t is tap_data at t+1.
+//
 // Step handshake: step s (= cmp_cnt) may only start when the drain has
 // emptied the accumulators of step s - 1 (drn_cnt == cmp_cnt).  After the
 // step's last beat the pipeline flushes, then cmp_cnt increments and
@@ -44,7 +48,7 @@ module mm_lane
   input  logic            drd_en,
   input  logic [ACC_AW-1:0] drd_addr,
   input  logic [2:0]      drd_row,
-  output logic [E-1:0][31:0] drd_data
+  output logic [E-1:0][31:0] drd_data      // word of the request made 4 cycles ago
 );
 
   // Issue control ----------------------------------------------------------------
@@ -124,50 +128,96 @@ module mm_lane
     end
   end
 
-  // Pipeline tags -------------------------------------------------------------------
+  // Pipeline ------------------------------------------------------------------------
+  // The MAC array spans many DSP columns, so every signal that reaches it
+  // crosses a long distance.  The issue decision (cycle t) is registered once
+  // here (stage 1, x1 / v1 / p1 / ...), copied once per beat lane l (stage 2:
+  // the 8 MACs of a beat lane sit together, they share the beat element), and
+  // the operands enter the DSP input registers (mm_mac: AREG = BREG = 2):
+  //
+  //   t     decision; tap FIFO pop (rptr advances)
+  //   t+1   x1 -> A1          tap_data (the head at t) -> B1   v2 p2 f2 ra2
+  //   t+2   A1 -> A2          B1 -> B2 (p2)                    ra3 f3 (per half)
+  //   t+3   M = A2 * B2       C = f3 ? 0 : acc[ra3]
+  //   t+4   P = C + M
+  //   t+5   acc[w5] <= P
+  //
+  // The accumulator loop (read at t+3, write at the end of t+5) is still
+  // DMIN = 3 cycles.  A drain read requested at T reads at T+3 (ra3) and its
+  // row-selected word is in drd_data at T+4.
   logic [ACC_AW-1:0] w0;
   logic              f0;
   assign w0 = in_meta.wb + in_beat[ACC_AW-1:0];
   assign f0 = in_meta.init && (in_row == 5'd0);
 
-  logic [R-1:0][ACC_AW-1:0] ra, w2, w3;   // per-row copies (fan-out)
-  logic v1, v2, v3, f1;
-  logic [2:0] drow1;
+  // stage 1
+  logic [BW-1:0]     x1;
+  logic              v1, p1, f1, de1;
+  logic [ACC_AW-1:0] wa1, da1;
+  logic [2:0]        dr1;
   always_ff @(posedge clk) begin
     if (rst) begin
-      v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0;
+      v1 <= 1'b0; p1 <= 1'b0; de1 <= 1'b0;
     end else begin
-      v1 <= d_fire; v2 <= v1; v3 <= v2;
+      v1 <= d_fire; p1 <= tap_pop; de1 <= drd_en;
     end
-    f1    <= f0;
-    drow1 <= drd_row;
-    for (int r = 0; r < R; r++) begin
-      ra[r] <= drd_en ? drd_addr : w0;
-      w2[r] <= ra[r];
-      w3[r] <= w2[r];
-    end
+    x1  <= in_data;
+    wa1 <= w0;
+    f1  <= f0;
+    da1 <= drd_addr;
+    dr1 <= drd_row;
   end
 
-  // MAC array + accumulators ----------------------------------------------------------
-  logic [R-1:0][E-1:0][31:0] acc_rd, p;
+  // MAC array + accumulators, one group per beat lane ---------------------------------
+  localparam int RHF = R / 2;      // rows per accumulator-address copy
 
-  for (genvar r = 0; r < R; r++) begin : g_r
-    for (genvar l = 0; l < E; l++) begin : g_l
+  for (genvar l = 0; l < E; l++) begin : g_l
+    // stage 2 (per beat lane)
+    (* keep = "true" *) logic              v2, p2, f2;
+    (* keep = "true" *) logic [ACC_AW-1:0] ra2;
+    (* keep = "true" *) logic [2:0]        dr2;
+    // stage 3 .. 5 (accumulator addresses per half of the rows)
+    (* keep = "true" *) logic [1:0][ACC_AW-1:0] ra3, w4, w5;
+    (* keep = "true" *) logic [1:0]        f3;
+    logic              v3, v4, v5;
+    logic [2:0]        dr3;
+    always_ff @(posedge clk) begin
+      if (rst) begin
+        v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0; v5 <= 1'b0; p2 <= 1'b0;
+      end else begin
+        v2 <= v1; v3 <= v2; v4 <= v3; v5 <= v4; p2 <= p1;
+      end
+      f2  <= f1;
+      ra2 <= de1 ? da1 : wa1;
+      dr2 <= dr1;
+      dr3 <= dr2;
+      for (int h = 0; h < 2; h++) begin
+        ra3[h] <= ra2;
+        f3[h]  <= f2;
+        w4[h]  <= ra3[h];
+        w5[h]  <= w4[h];
+      end
+    end
+
+    logic [R-1:0][31:0] acc_rd, p;
+    for (genvar r = 0; r < R; r++) begin : g_r
       (* ram_style = "distributed" *) logic [31:0] acc [ACC_D];
-      always_ff @(posedge clk) if (v3) acc[w3[r]] <= p[r][l];
-      assign acc_rd[r][l] = acc[ra[r]];
+      always_ff @(posedge clk) if (v5) acc[w5[r / RHF]] <= p[r];
+      assign acc_rd[r] = acc[ra3[r / RHF]];
 
       mm_mac u_mac (
         .clk,
-        .a    (in_data[l*EW +: EW]),
-        .b_ce (tap_pop),
-        .b    (tap_data[l][r]),
-        .c    (f1 ? 32'sd0 : acc_rd[r][l]),
-        .p    (p[r][l])
+        .a     (x1[l*EW +: EW]),
+        .b     (tap_data[l][r]),
+        .b_ce  (p2),
+        .c     (acc_rd[r]),
+        .c_rst (f3[r / RHF]),
+        .p     (p[r])
       );
     end
-  end
 
-  always_ff @(posedge clk) drd_data <= acc_rd[drow1];
+    // drain: the word of row dr3, registered next to the group
+    always_ff @(posedge clk) drd_data[l] <= acc_rd[dr3];
+  end
 
 endmodule

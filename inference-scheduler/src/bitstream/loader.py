@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ..remote import RemoteSession, _green, _yellow, _bold
 from .convert import bit_to_bin
-from .hwh import parse_hwh_ps_params
+from .hwh import parse_hwh_clocks, parse_hwh_ps_params
 from .xclbin import build_xclbin
 from .board import (
     _FIRMWARE_DIR,
@@ -14,6 +14,8 @@ from .board import (
     remove_overlay,
     load_bitstream,
     fpga_state,
+    read_fclk_hz,
+    set_fclk_hz,
     set_axi_port_widths,
     unbind_stale_uio,
     load_xclbin,
@@ -40,13 +42,14 @@ def upload_bitstream(
 
     Loading sequence:
       1  .bit → .bin (header strip + 32-bit byteswap)
-      2  Parse HWH — PS family + AXI port-width parameters
+      2  Parse HWH — PS family, AXI port-width parameters, PL0 and kernel clocks
       3  Build xclbin with MEM_TOPOLOGY via xclbinutil
       4  Upload .bin → /lib/firmware/<overlay_name>.bin
       5  Remove any existing configfs DTBO overlay
+      5b Check PL0 (fclk0) = the HWH's PL0 frequency, set it if not
       6  Load bitstream via fpga_manager
       7  Verify fpga_manager state == "operating"
-      8  Load xclbin into zocl DRM driver
+      8  Load xclbin into zocl DRM driver (then PL0 checked again)
       9  Upload and apply DTBO via configfs
       10 Verify overlay status == "applied"
       11 Write PS SLCR / AXIFM registers (set_axi_port_width)
@@ -60,6 +63,15 @@ def upload_bitstream(
     PS slave port at a width that did not match the design, and every
     kernel then read/wrote garbage (all scheduler models failed, models
     that had passed earlier mispredicted).
+
+    PL0: nothing on the board sets it for us (the boot firmware leaves 100
+    MHz; another loader, an overlay or a manual set_rate may have changed it,
+    and removing an overlay does not restore it).  A design whose kernels run
+    from an MMCM fed by PL0 (doc/plans/FMAX_250_PLAN.md) needs PL0 at the
+    HWH's value or the MMCM does not lock and the design stays in reset; a
+    design clocked by PL0 directly would run at the wrong speed.  Step 5b
+    sets PL0 to the HWH's frequency before programming and refuses to go on
+    if the board cannot.
     """
     bin_name    = f"{overlay_name}.bin"
     remote_bin  = f"{_FIRMWARE_DIR}/{bin_name}"
@@ -75,6 +87,9 @@ def upload_bitstream(
     axi_writes = kv260.axi_port_width_writes(family, ps_params)
     for param, width in sorted(ps_params.items()):
         print(f"          {param} = {width}")
+    clocks = parse_hwh_clocks(hwh_path)
+    pl0_mhz, kernel_mhz = clocks["pl0_mhz"], clocks["kernel_mhz"]
+    print(f"          PL0 {pl0_mhz} MHz, kernel clock (ap_clk) {kernel_mhz} MHz")
 
     print(f"\n{_bold('Step 3')}   Building xclbin (MEM_TOPOLOGY from HWH)")
     xclbin_data = build_xclbin(hwh_path, kv260.BLANK_METADATA, xclbinutil)
@@ -93,6 +108,9 @@ def upload_bitstream(
     print(f"\n{_bold('Step 5')}   Removing existing overlay '{overlay_name}' (if any)")
     remove_overlay(session, overlay_name)
 
+    print(f"\n{_bold('Step 5b')}  PL0 clock (fclk0)")
+    check_pl0(session, pl0_mhz, set_if_off=True)
+
     print(f"\n{_bold('Step 6')}   Loading bitstream via FPGA manager")
     load_bitstream(session, bin_name)
 
@@ -108,6 +126,7 @@ def upload_bitstream(
     print(f"\n{_bold('Step 8')}   Loading xclbin into zocl DRM driver")
     load_xclbin(session, xclbin_data)
     print("          done")
+    check_pl0(session, pl0_mhz, set_if_off=False)
 
     print(f"\n{_bold('Step 9')}   Uploading DTBO → {remote_dtbo}")
     upload_file(session, dtbo_path, remote_dtbo)
@@ -154,6 +173,26 @@ def upload_bitstream(
         print(f"          {_yellow('none found')}  (check dmesg for DT errors)")
 
     print(f"\n{_green(_bold('Done.'))}  Bitstream loaded and overlay applied.\n")
+
+
+def check_pl0(session: RemoteSession, pl0_mhz, set_if_off: bool, tol: float = 0.01) -> None:
+    """PL0 (fclk0) within tol of the HWH's pl0_mhz; set it first when set_if_off."""
+    if pl0_mhz is None:
+        print(f"          {_yellow('the HWH names no PL0 frequency')} — not checked")
+        return
+    want = pl0_mhz * 1e6
+    have = read_fclk_hz(session)
+    if have is None:
+        raise RuntimeError("Cannot read /sys/devices/platform/fclk0/set_rate: the PL0 clock the "
+                           f"bitstream needs ({pl0_mhz} MHz) cannot be checked.")
+    if abs(have - want) > tol * want and set_if_off:
+        print(f"          fclk0 {have} Hz, the bitstream needs {pl0_mhz} MHz: setting it")
+        set_fclk_hz(session, round(want))
+        have = read_fclk_hz(session)
+    if have is None or abs(have - want) > tol * want:
+        raise RuntimeError(f"PL0 (fclk0) is {have} Hz, the bitstream needs {pl0_mhz} MHz "
+                           f"(±{tol:.0%}).")
+    print(f"          fclk0 {have} Hz  {_green('✓')}")
 
 
 def dtbo_uio_nodes(dtbo_path) -> list[str]:

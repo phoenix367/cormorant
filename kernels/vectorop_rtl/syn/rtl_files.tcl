@@ -2,6 +2,7 @@
 set rtl_files [list \
   $root/rtl/vo_pkg.sv \
   $root/rtl/vo_fifo.sv \
+  $root/rtl/vo_rs.sv \
   $root/rtl/vo_ctrl_s_axi.sv \
   $root/rtl/vo_burstgen.sv \
   $root/rtl/vo_rd_port.sv \

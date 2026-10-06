@@ -53,6 +53,7 @@ make perf_matmul_rtl      # cycle counts / MAC per cycle of typical shapes (idea
 make package_matmul_rtl   # Vivado IP -> build/rtl_ip/MatmulKernel_ip (+ .zip), ~20 s
 make synth_matmul_rtl     # Vivado OOC synthesis + P&R -> kernels/matmul_rtl/synth/*.rpt
 make xsim_matmul_rtl      # xvlog / xelab parse and elaboration
+make neteq_matmul_rtl     # synthesised netlist vs RTL in lockstep (xsim, tools/neteq)
 make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP, xsim (~4 min)
 ```
 
@@ -237,13 +238,15 @@ flowchart TB
         rg0 -- runs --> rd0["mm_axi_rd"]
         rg0 --> gb0["mm_gearbox"]
         rd0 -- words --> gb0
-        gb0 -- A beats --> awr0["mm_awr"]
+        gb0 --> rs0["mm_rs"]
+        rs0 -- A beats --> awr0["mm_awr"]
     end
     subgraph P1 ["read port 1"]
         rg1 -- runs --> rd1["mm_axi_rd"]
         rg1 --> gb1["mm_gearbox"]
         rd1 -- words --> gb1
-        gb1 -- A beats --> awr1["mm_awr"]
+        gb1 --> rs1["mm_rs"]
+        rs1 -- A beats --> awr1["mm_awr"]
     end
     rd0 <--> gm0(["m_axi_gmem0"])
     rd1 <--> gm1(["m_axi_gmem1"])
@@ -251,8 +254,8 @@ flowchart TB
     awr1 --> abuf
     abuf --> xpf0["mm_xpf (lane 0)"] -- taps --> lane0["mm_lane 0<br/>8 × 8 MAC"]
     abuf --> xpf1["mm_xpf (lane 1)"] -- taps --> lane1["mm_lane 1<br/>8 × 8 MAC"]
-    gb0 -- B beats --> lane0
-    gb1 -- B beats --> lane1
+    rs0 -- B beats --> lane0
+    rs1 -- B beats --> lane1
     lane0 -- accumulators --> drain
     lane1 -- accumulators --> drain
     drain --> packer["mm_packer"] --> wr["mm_axi_wr"] --> gm2(["m_axi_gmem2"])
@@ -319,6 +322,15 @@ Each run goes to three queues:
 - **Gearbox (`mm_gearbox`):** re-aligns the word stream into row-aligned beats. It uses a two-word window and an 8-way lane rotate, and a lookahead descriptor keeps back-to-back runs bubble-free. A and B element addresses may therefore start at any lane. Beyond the contract, even A/B bases that are only 2-byte aligned work.
 - **x prefetcher (`mm_xpf`):** receives B runs only.
 
+The gearbox's beats reach the A writer and the MAC lane through a register
+slice (`mm_rs`, two entries, registered in both directions), and the read
+FIFO's words reach the gearbox through another, so neither the lane's
+per-beat issue decision nor the gearbox's consume decision runs into the
+next unit.  The gearbox keeps a beat's end offset (`off + min(row_rem, 8)`)
+and its row / run end conditions in registers beside the counters, so its
+window refill decision (the enable of 256 window bits) starts from
+registers.
+
 #### A panel and taps
 
 `mm_awr` writes a port's A rows into `mm_abuf`, which holds one 128-bit × 256
@@ -329,36 +341,64 @@ assembles a **tap set** `tap[l][r]` into a LUTRAM FIFO:
 - **Row-major and packed B:** every lane uses `A[r][kk]`.
 - **GEMV image:** beat lane `l` uses tap `l % kw` of plane c, at lane-local K index `((c>>4)<<(4+lk)) | (j<<4) | (c&15)`, the inverse of `matmul_gemv_k`.
 
+The read is pipelined so that every long wire runs between two registers:
+issue (t) → registered read address and enable (t+1, the RAM's latch) →
+RAM output register (t+2) → per panel row, the selected element next to
+that row's RAM (t+3) → the tap set, write enable and slot copied per beat
+lane (t+4) → tap FIFO write, one LUTRAM per beat lane next to that beat
+lane's DSPs (t+5).  A tap set is in the FIFO 6 cycles after its row's last
+read issues (3 before).  The FIFO's read pointer is copied per beat lane one
+cycle late, so `tap_data` is the head of the previous cycle.
+
 #### MAC lane
 
-`mm_lane` holds 8 rows × 8 beat lanes of `mm_mac` (one DSP48E2 each):
+`mm_lane` holds 8 rows × 8 beat lanes of `mm_mac` (one DSP48E2 each).  The
+8 MACs of a beat lane share its B element and form a group; the issue
+decision (cycle t) is registered once, then copied per group, and every
+operand enters the DSP's own input registers (AREG = BREG = 2):
 
 ```
-beat[l] ─► AREG ─┐
-tap[l][r] ─► BREG (loaded at the row's first beat, held for the row)
-                 ├► MREG = A·B ─┐
-acc[w] (LUTRAM) ─► CREG (0 on the run's first row) ─► PREG = C + M ─► acc[w]
+t     issue decision (the tap FIFO pops)
+t+1   beat x1[l] ─► B1          tap[l][r] (FIFO head at t) ─► A1     per group: v, pop, f, address
+t+2   B1 ─► B2                  A1 ─► A2 (only at the row's first beat: held for the row)
+t+3   MREG = A2·B2              CREG = acc[w] (LUTRAM), or 0 on the run's first row (RSTC)
+t+4   PREG = C + M
+t+5   acc[w] ◄─ P
 ```
 
-- **Accumulators:** each MAC owns `ACC_D = 64` 32-bit accumulators in LUTRAM, one per beat of a plane chunk. The accumulation happens in the DSP post-adder, so there is no fabric adder per MAC.
-- **Minimum row length:** the read → CREG → PREG → write loop is `DMIN = 3` cycles. A row shorter than 3 beats (tiny m) gets bubbles.
+The beat element, shared by the group's 8 MACs, goes to the 18-bit B port
+(its sign bit drives 3 pins per slice; on the 27-bit A port it drove 12, a
+net of about 100 pins); the tap is sign-extended to 19 bits so that it takes
+the A port.
+
+- **Accumulators:** each MAC owns `ACC_D = 64` 32-bit accumulators in LUTRAM, one per beat of a plane chunk. The accumulation happens in the DSP post-adder, so there is no fabric adder per MAC.  Their read / write addresses, write enable and the init flag are registered per group (the addresses per half of the group's rows).
+- **Minimum row length:** the read → CREG → PREG → write loop is `DMIN = 3` cycles (read at t+3, write at the end of t+5). A row shorter than 3 beats (tiny m) gets bubbles.
 - **GEMV kernel width:** with kw > 1, each MAC accumulates a single tap. The drain sums the kw lanes of a column, and this reduction is also exact.
 
 #### Drain and output
 
 After both lanes finish a step, `mm_drain` reads each valid row's
-accumulator words from both lanes in lockstep and computes:
+accumulator words from both lanes in lockstep (a request reaches the
+accumulators through the lanes' group registers 3 cycles later; each group
+selects its row's word next to its DSPs, and the word is registered again on
+the drain's side) and computes:
 
 - `sum = lane0 + lane1`
 - the kw-tap reduction (a 3-level tree, selected by lk)
 - `C = sat16(sum >>> 8)`: floor, then clamp to Q8.8
+
+— 9 cycles from request to the output FIFO, with the words' element counts
+and the lanes' activity flags carried along as tags.
 
 The results go to `mm_packer`, which turns the element stream of a C run into
 128-bit beats.  Only the first and last beat of a run carry partial strobes,
 and a run is a whole panel (`n_valid × m` elements) whenever the chunk spans
 all columns.  `mm_axi_wr` stores whole bursts before issuing their AW, keeps
 at most `WR_OUTS` (16) bursts awaiting B, and the job completes only after
-every B response has arrived.
+every B response has arrived.  On all three m_axi ports the AXI side is
+registered both ways: AR / AW / W leave through register slices (`mm_rs`;
+xREADY only enables the slice) and RVALID / RDATA / RLAST and BVALID are
+registered before they are used.
 
 ### Synchronisation
 
@@ -380,7 +420,8 @@ cannot deadlock.  A new job resets every unit (`job_start`).
 
 ## Performance
 
-Verilator with ideal memory (`make perf_matmul_rtl`):
+Verilator with ideal memory (`make perf_matmul_rtl`; the in-context pipelining of
+2026-10-06 added 0.01–0.12 % cycles, e.g. GEMM 64×576×576 172 607 → 172 665):
 
 | shape | MAC/cycle | bound |
 |---|---|---|
@@ -413,21 +454,74 @@ xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
 
 | | RTL kernel (post-route) | HLS kernel in `cormorant_hw_128` |
 |---|---|---|
-| LUT (of which LUTRAM) | 18.4 k (6.9 k) | 26.8 k (0.1 k) |
-| FF | 9.5 k | 27.0 k |
+| LUT (of which LUTRAM) | 16.3 k (6.9 k) | 26.8 k (0.1 k) |
+| FF | 15.3 k | 27.0 k |
 | BRAM36 | 38 (32 A panel, 6 FIFOs) | 44 |
 | URAM | 0 | 8 |
 | DSP48E2 | 130 (128 MACs; 1 per run generator) | 128 |
 | peak MAC/cycle | 128 (GEMM), 16 (GEMV, port-bound) | 32 (tiled), 16 (GEMV) |
 
-Timing is checked at 300 MHz and met (WNS +0.002 ns with the K-balance
-change; before it, ≈ 297 MHz with 3 endpoints missing by at most 31 ps, all
-once-per-step address updates in the walker and run generator).  The current block design runs at 100 MHz, with 150 MHz planned.  Nearly every per-cycle decision was moved off long paths:
+Timing is checked at 300 MHz and met (WNS +0.026 ns, 2026-10-06, after the
+in-context pipelining below; before it +0.002 ns with 18.4 k LUT and 9.5 k
+FF).  The worst paths out of context are once-per-step address updates in
+the walker and run generator.  Nearly every per-cycle decision was moved off
+long paths:
 
 - **Barrier counter compares:** registered, and computed against each counter's *next* value so they can only open late, never early.
 - **Burst length, credit and outstanding-burst checks:** registered in both AXI engines (the outstanding caps of phase 5 kept WNS at +0.015 ns).
 - **Run generator:** a second output stage, and shift/add element counts instead of a general multiply.
 - **Drain:** the kw reduction tree takes two stages.
+
+### In the block design (the 250 MHz work)
+
+Out of context the MAC array sits in a compact block of DSP columns; in the
+full design (`cormorant_hw_128`, 688 of 1248 DSPs used) its 128 DSPs spread
+over DSP columns X0–X5 and clock regions X0Y0–X0Y3 (lane 0 over Y60–Y90,
+lane 1 over Y22–Y85), and its 38 BRAMs over three BRAM columns (X0–X2, clock
+regions X1Y1–X2Y3).  The routed 100 MHz design (2026-10-05) had 20 535
+kernel-internal paths with a data path over 3 ns; nearly all are one or two
+LUTs and 80–95 % route — nets whose loads span DSP or BRAM columns, which no
+placement fixes at 4 ns:
+
+| net (100 MHz design) | fanout | load span | worst data path |
+|---|---|---|---|
+| gearbox `off` → rotate mux → DSP A (the `out_data` register was absorbed into every DSP's A1, so the mux output fanned out to 8 DSPs per element) | 144 | 280 RPM columns, 2 clock regions | 6.95 ns |
+| `job_start` → combinational `urst` (all units) | 777 + 618 (`rst`) | 4 clock-region rows | 6.34 ns |
+| DSP `CEA1` (the gearbox's output enable) | 219 | 4 clock regions | 6.29 ns |
+| tap FIFO `rptr`, the tap LUTRAM → DSP B | 261 | 600 columns, 4 regions | 5.33 ns |
+| `xpf` element select (`sel2`) and A-buffer BRAM output → tap LUTRAM write | 8 per bit | 568 columns, 3 regions | 6.39 ns |
+| A-buffer read address / enable → 16 BRAMs | 16–39 | 656–1120 columns | 6.38 ns |
+| lane `w3` / `v3` (accumulator write address / enable) | 1440 / 1280 | 600 columns | ≈ 4.6 ns net |
+| lane `ra` (accumulator read address) → LUTRAM → CREG, `drow1` row select | 93 / 128 | 300–540 columns | 6.09 ns |
+| read FIFO pop ← lane `count` / ready chain → gearbox window and FIFO skid (7–11 LUTs) | 128–269 | 300–580 columns | 6.47 ns |
+| PS8 WREADY → W FIFO skid (`u_wr/u_wf`) | 288 | 3 regions | 5.39 ns |
+
+The changes (cycle counts in Verilator +0.01 … +0.12 %, results unchanged):
+
+- **DSP input registers:** `mm_mac` uses AREG = BREG = 2, CREG, MREG,
+  PREG; the beat element is registered once in the lane (`x1`) and enters
+  B1 / B2, the tap enters A1 / A2 (held by CEA2 for the row), the init flag
+  is the C register's reset.  The beat element moved to the 18-bit B port:
+  on the 27-bit A port its sign bit fanned out to 12 pins per DSP.
+- **Per-group control:** the lane's issue decision is registered once, then
+  copied per beat lane (valid, pop, init, accumulator addresses — the
+  addresses once more per half group): no control net spans the array.
+- **Drain gather:** each group selects its row's word next to its DSPs; the
+  word is registered there and again on the drain's side (PIPE 6 → 9).
+- **x prefetcher:** registered A-buffer address and enable, a per-row
+  element-select register next to the BRAMs, the tap set copied per beat
+  lane before the LUTRAM write, the read pointer copied per beat lane.
+- **Read FIFO → gearbox → lane:** register slices (`mm_rs`) between the
+  read FIFO and the gearbox and between the gearbox and its consumers cut
+  the ready chains; the gearbox's beat size and end conditions are
+  precomputed registers, and its data registers have no reset.
+- **Job reset:** registered, with one copy per unit group (`urst_p`,
+  `urst_l`, `urst_s`, `urst_o`); the units' `start` is one cycle later
+  (`start_q`), so reset and start still never overlap.
+- **AXI ports:** AR / AW / W through register slices, RVALID / RDATA /
+  RLAST and BVALID registered on entry, and the AXI-Lite inputs registered
+  before they are decoded (a write takes effect with BVALID, a read is
+  answered one cycle later).
 
 ## Verification status
 
@@ -435,6 +529,7 @@ once-per-step address updates in the walker and run generator).  The current blo
   - All 50 HLS-oracle fixtures (`hw/test_data/matmul_test_data`, written by `make gen_matmul_test_data`) pass bit-exact: 39 tiled plus 11 GEMV-image cases.  ctest runs them plus 200 random cases (seed 1).
   - Several thousand constrained-random cases pass across every mode. They cover strides and broadcasts, misaligned A/B/C bases, bases above 4 GiB, k up to 4096, and full-range data that wraps the accumulator.
   - Memory timing is randomised, and reset state is randomised (`+verilator+rand+reset+2`).
+  - After the in-context pipelining (2026-10-06): the 50 fixtures + 200 random cases, and 3 000 random cases by hand (seed 7 random timing, seed 4711 slow, seed 2026 fast).
   - The AXI protocol is checked, including that nothing outside C is written.
 - **System level (`make sysim_matmul_rtl`):**
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
@@ -483,11 +578,22 @@ changing the RTL.
 - **Accumulator distance:** `DMIN = 3` is the LUTRAM → CREG → PREG → LUTRAM
   loop.  `mm_lane` inserts bubbles for rows shorter than that; any register
   added in that loop must raise `DMIN`.
+- **Lane pipeline alignment:** in `mm_lane` the beat, the tap, the
+  accumulator read address and the init flag of an issue at t meet in the
+  DSP at t+3 (B2 / A2 / CREG), the write lands at the end of t+5, and a
+  drain request at T is read at T+3 and in `drd_data` at T+4; `mm_drain`'s
+  `PIPE = 9` and its tags count on that, and `FLUSH = 6` keeps the drain's
+  first read after the last write.  A register added on one operand path
+  needs its match on the others (and in these constants).
+- **Tap FIFO:** `tap_data` is the head of the *previous* cycle (the read
+  pointer is copied per beat lane); `mm_lane` takes B1 one cycle after the
+  pop decision.  A tap set is written 5 cycles after its last read issues;
+  `reserved` already counts it from the issue.
 - **BRAM FIFO skid:** `mm_fifo`'s BRAM variant needs its 3-entry skid to
   sustain one pop per cycle (with 2 entries every stream ran at 2/3 rate).
 - **lk shift arithmetic:** widen `lk` before adding (`{2'b0, lk} + 4'd1`); a
   2-bit `lk + 1` overflows at kw = 8.
-- **Timing:** the kernel meets 300 MHz out of context with no margin (WNS +0.002 ns), so keep new logic off long combinational
+- **Timing:** the kernel meets 300 MHz out of context with little margin (WNS +0.026 ns) and must reach 250 MHz in the block design, where the MAC array spans many DSP columns: keep every signal that reaches the array registered next to its group, keep new logic off long combinational
   handshake paths; register decisions against a counter's *next* value (see
   `mm_awr`, `mm_xpf`, `mm_lane` and the AXI engines).
 
@@ -497,8 +603,8 @@ packaging, synthesis and xsim.
 
 **Background:** "Hummingbird+" (FPGA '26, doi 10.1145/3748173.3779189); the
 technical details are in its predecessor, arXiv 2507.03308.  Used here:
-AXPY-style accumulation in the DSP post-adder with the activation held in BREG
-for a whole B row, and column-aligned DDR access through interleaved K blocks
+AXPY-style accumulation in the DSP post-adder with the activation held in the
+second A register (A2) for a whole B row, and column-aligned DDR access through interleaved K blocks
 per port.  Not used: segmented PCIN / PCOUT cascade chains — there is no adder
 tree in the MAC path, and a column's kw taps are reduced once in the drain.
 
@@ -507,4 +613,4 @@ tree in the MAC path, and a column's kw taps are reduced once in the drain.
 - **k > 4096:** out of contract. k is clamped internally, so the job completes but C is undefined.
 - **Serial A load per panel:** A is single-buffered and shares the port with B. Small-k GEMMs (e.g. 256×64×64) spend ~20 % of their time reloading A. A second A bank would not help while A and B share a port; widening the effective A load (both ports per row) would.
 - **K balance:** the lanes split K by blocks of 16 planes and halves of the last one, so they differ by at most 8 planes plus a partial block (an even number of blocks whose last one is short: up to 15 planes, e.g. k = 24 → 16 : 8).  Small-k jobs are therefore not perfectly balanced.
-- **One clock domain:** everything runs on `ap_clk`, the block design's PL clock (100 MHz in the current bitstream; out of context the kernel closes timing at ~300 MHz, a faster PL clock is not attempted yet).
+- **One clock domain:** everything runs on `ap_clk`, the block design's kernel clock — 250 MHz since FMAX_250_PLAN (an MMCM in the block design; bitstream `986cef4866a0`, 100 MHz before); out of context the kernel closes timing at ~300 MHz.

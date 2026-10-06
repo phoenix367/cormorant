@@ -115,7 +115,7 @@
 <text x="230.0" y="990.0" font-size="13.5" font-weight="normal" fill="#4b5563" text-anchor="start" dominant-baseline="central">Zynq UltraScale+ K26</text>
 <rect x="440.0" y="946.0" width="219.0" height="60.0" rx="4" fill="#e1e1e3"/>
 <text x="549.5" y="967.2" font-size="14" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">Programmable logic</text>
-<text x="549.5" y="984.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">kernels at 100 MHz</text>
+<text x="549.5" y="984.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">kernels at 250 MHz</text>
 <rect x="677.0" y="946.0" width="219.0" height="60.0" rx="4" fill="#e1e1e3"/>
 <text x="786.5" y="967.2" font-size="14" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">4 × Arm Cortex-A53</text>
 <text x="786.5" y="984.8" font-size="14" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">Linux, host ops</text>

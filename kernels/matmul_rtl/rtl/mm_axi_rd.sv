@@ -7,6 +7,10 @@
 // the FIFO has room for all of it, so RREADY is tied high and the port never
 // back-pressures the interconnect; at most RD_OUTS bursts await their data.
 // Single ID, so data returns in order.
+//
+// The AXI side is registered both ways: AR leaves through a register slice
+// (ARREADY only enables the slice), and R is registered before the FIFO
+// write.  Both add a cycle of latency; the FIFO reservation is unchanged.
 // ---------------------------------------------------------------------------
 module mm_axi_rd
   import mm_pkg::*;
@@ -55,6 +59,17 @@ module mm_axi_rd
     if (blen_c > {3'b0, to_4k}) blen_c = {3'b0, to_4k};
   end
 
+  // AR register slice and the registered R channel.
+  logic          ar_in_ready;
+  logic          rv_q, rl_q;
+  logic [BW-1:0] rd_q;
+  always_ff @(posedge clk) begin
+    if (rst) rv_q <= 1'b0;
+    else     rv_q <= rvalid;
+    rl_q <= rlast;
+    rd_q <= rdata;
+  end
+
   logic issue;
   // Registered FIFO-space and outstanding checks (see mm_axi_wr): only an
   // issue lowers `space` or raises `outs`, and bl_v blocks the cycle after
@@ -66,14 +81,13 @@ module mm_axi_rd
     sp_ok <= !rst && (space >= (CW+1)'(bl_v ? blen : blen_c));
     os_ok <= !rst && (outs < OW'(RD_OUTS));
   end
-  assign issue      = busy && bl_v && sp_ok && os_ok && (!arvalid || arready);
+  assign issue      = busy && bl_v && sp_ok && os_ok && ar_in_ready;
   assign desc_ready = !busy;
 
   always_ff @(posedge clk) begin
     if (rst) begin
       busy    <= 1'b0;
       bl_v    <= 1'b0;
-      arvalid <= 1'b0;
       space   <= (CW+1)'(RD_FIFO_D);
       outs    <= '0;
     end else begin
@@ -82,23 +96,24 @@ module mm_axi_rd
         cur_w <= desc.waddr;
         rem   <= desc.nw;
       end
-      if (arvalid && arready) arvalid <= 1'b0;
-
       // One cycle to size the next burst after every change of cur_w / rem.
       if (issue) bl_v <= 1'b0;
       else if (busy && !bl_v) begin blen <= blen_c; bl_v <= 1'b1; end
       if (issue) begin
-        arvalid <= 1'b1;
-        araddr  <= {cur_w, 4'b0};
-        arlen   <= 8'(blen - 12'd1);
         cur_w   <= cur_w + 60'(blen);
         rem     <= rem - blen;
         if (rem == blen) busy <= 1'b0;
       end
       space <= space - (issue ? (CW+1)'(blen) : '0) + (out_fire ? (CW+1)'(1) : '0);
-      outs  <= outs + (issue ? OW'(1) : '0) - ((rvalid && rlast) ? OW'(1) : '0);
+      outs  <= outs + (issue ? OW'(1) : '0) - ((rv_q && rl_q) ? OW'(1) : '0);
     end
   end
+
+  mm_rs #(.W(72)) u_ar (
+    .clk, .rst,
+    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({cur_w, 4'b0, 8'(blen - 12'd1)}),
+    .out_valid (arvalid), .out_ready (arready),     .out_data ({araddr, arlen})
+  );
 
   assign rready = 1'b1;
 
@@ -106,13 +121,13 @@ module mm_axi_rd
   logic [CW-1:0] f_count;
   mm_fifo #(.W(BW), .D(RD_FIFO_D), .BRAM(1'b1)) u_fifo (
     .clk, .rst,
-    .in_valid (rvalid), .in_ready (f_in_ready), .in_data (rdata),
+    .in_valid (rv_q), .in_ready (f_in_ready), .in_data (rd_q),
     .out_valid, .out_ready, .out_data,
     .count    (f_count)
   );
   assign out_fire = out_valid && out_ready;
 
-  assign idle = !busy && !arvalid && (space == (CW+1)'(RD_FIFO_D));
+  assign idle = !busy && !arvalid && ar_in_ready && (space == (CW+1)'(RD_FIFO_D));
 
   logic unused;
   assign unused = f_in_ready;

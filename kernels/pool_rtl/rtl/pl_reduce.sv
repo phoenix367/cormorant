@@ -49,87 +49,143 @@ module pl_reduce
   // Accumulate ----------------------------------------------------------------------------
   // R0 holds the beat, R1 its contributions; R1 enters the accumulators on adv.
   // A group's last tap needs a free finaliser (its snapshot), else all stall.
-  logic        r0_v, r1_v, adv;
-  beat_t       r0;
-  logic        r1_first, r1_last;
-  logic [5:0]  r1_d0, r1_d1;
-  logic [31:0] r1_c [NL];                  // contributions
-  logic [31:0] acc  [NL];
-  logic [31:0] accd [NL];                  // snapshot of the finished group
-  logic [23:0] invd [OWP];
-  logic        snap, fin_free;
+  //
+  // The 16 lanes (their DSPs for x * x) spread over several DSP columns, so
+  // the stall decision is not one net to all of them: each group of LG lanes
+  // keeps its own copy of the few registers it depends on (beat valid / last
+  // flags, the finaliser's channel count, the FIFO room) and computes an
+  // identical adv locally.  Copy NG is the central one (bt_ready, the AVG
+  // reciprocals, the finaliser).  The room for the finaliser's output is
+  // registered twice (central, then per copy), so it is reserved for two more
+  // issues than are in flight: f_issue never overruns the bundle FIFO.
+  localparam int NG = 4;                   // lane groups
+  localparam int LG = NL / NG;             // lanes per group
 
-  assign adv      = !(r1_v && r1_last && !fin_free);
-  assign bt_ready = adv;
-  assign snap     = adv && r1_v && r1_last;
+  logic [5:0]  fb_count;
+  logic [FL-1:0] f_v;
+  logic        room_c;
+  always_ff @(posedge clk)
+    room_c <= !rst && (32'(fb_count) + 32'($countones(f_v)) + 32'd2 < FD);
 
-  always_ff @(posedge clk) begin
-    if (rst) begin
-      r0_v <= 1'b0;
-      r1_v <= 1'b0;
-    end else if (adv) begin
-      r0_v <= bt_valid;
-      r1_v <= r0_v;
-    end
-    if (adv) begin
-      r0       <= bt;
-      r1_first <= r0.first;
-      r1_last  <= r0.last;
-      r1_d0    <= r0.d0;
-      r1_d1    <= r0.d1;
-      for (int l = 0; l < NL; l++) begin
-        logic signed [15:0] x;
-        logic signed [31:0] x32;
-        x   = signed'(r0.v[l * EW +: EW]);
-        x32 = 32'(x) <<< 8;
-        case (j.mode)
-          M_LP1:   r1_c[l] <= x[15] ? -x32 : x32;
-          M_LP2:   r1_c[l] <= 32'(x * x);
-          default: r1_c[l] <= x32;
-        endcase
+  // Every register below lives in exactly one always_ff of one generate
+  // scope; the scopes only export wires (g_adv, g_r1v, ..., the lanes' next
+  // accumulator values) and the shared snapshot accd is written by a single
+  // process.  (A variable written from several generate scopes is not
+  // synthesised as simulated: Vivado mapped the shared accd array wrongly.)
+  wire [NG:0] g_adv, g_snap, g_issue, g_r0v, g_r1v, g_fz;
+
+  for (genvar g = 0; g <= NG; g++) begin : g_ctl
+    (* keep = "true" *) logic r0v, r0l, r1v, r1l, room;
+    (* keep = "true" *) logic [3:0] frem;
+    logic fin_free;
+    assign fin_free   = (frem == 4'd0) || ((frem == 4'd1) && room);
+    assign g_issue[g] = (frem != 4'd0) && room;
+    assign g_adv[g]   = !(r1v && r1l && !fin_free);
+    assign g_snap[g]  = g_adv[g] && r1v && r1l;
+    assign g_r0v[g]   = r0v;
+    assign g_r1v[g]   = r1v;
+    assign g_fz[g]    = (frem == 4'd0);
+    always_ff @(posedge clk) begin
+      if (rst) begin
+        r0v  <= 1'b0;
+        r1v  <= 1'b0;
+        frem <= '0;
+        room <= 1'b0;
+      end else begin
+        if (g_adv[g]) begin
+          r0v <= bt_valid;
+          r1v <= r0v;
+        end
+        if (g_snap[g])       frem <= 4'(TC);
+        else if (g_issue[g]) frem <= frem - 4'd1;
+        room <= room_c;
       end
-    end
-    if (adv && r1_v) begin
-      for (int l = 0; l < NL; l++) begin
-        logic [31:0] n;
-        if (r1_first)             n = r1_c[l];
-        else if (j.mode == M_MAX) n = ($signed(r1_c[l]) > $signed(acc[l])) ? r1_c[l] : acc[l];
-        else                      n = acc[l] + r1_c[l];
-        acc[l] <= n;
-        if (r1_last) accd[l] <= n;
-      end
-      if (r1_last) begin
-        invd[0] <= INV[r1_d0];
-        invd[1] <= INV[r1_d1];
+      if (g_adv[g]) begin
+        r0l <= bt.last;
+        r1l <= r0l;
       end
     end
   end
 
-  // Finaliser -------------------------------------------------------------------------------
-  logic [3:0]  f_rem;                      // channels left of the snapshot
-  logic [2:0]  f_c;
-  logic [FL-1:0] f_v;
-  logic [5:0]  fb_count;
-  logic        f_issue;
+  logic adv, snap, f_issue;
+  assign adv      = g_adv[NG];
+  assign snap     = g_snap[NG];
+  assign f_issue  = g_issue[NG];
+  assign bt_ready = adv;
 
-  assign f_issue  = (f_rem != '0) &&
-                    (32'(fb_count) + 32'($countones(f_v)) < FD);
-  assign fin_free = (f_rem == '0) || ((f_rem == 4'd1) && f_issue);
+  // the lanes, LG per group; nx: each lane's next accumulator value
+  wire [NL-1:0][31:0] nx;
+  for (genvar g = 0; g < NG; g++) begin : g_lanes
+    logic [LG*EW-1:0] r0x;
+    logic r0f, r1f;
+    logic [31:0] r1c [LG];
+    logic [31:0] acc [LG];
+    logic [LG-1:0][31:0] n;
+    // the job's mode, copied per group (it steers the DSPs' operation); it is
+    // stable from long before the job's first beat
+    (* keep = "true" *) mode_t mode;
+    always_ff @(posedge clk) mode <= j.mode;
+    always_comb
+      for (int i = 0; i < LG; i++) begin
+        if (r1f)                n[i] = r1c[i];
+        else if (mode == M_MAX) n[i] = ($signed(r1c[i]) > $signed(acc[i])) ? r1c[i] : acc[i];
+        else                    n[i] = acc[i] + r1c[i];
+      end
+    assign nx[g * LG +: LG] = n;
+    always_ff @(posedge clk) begin
+      if (g_adv[g]) begin
+        r0x <= bt.v[g * LG * EW +: LG * EW];
+        r0f <= bt.first;
+        r1f <= r0f;
+        for (int i = 0; i < LG; i++) begin
+          logic signed [15:0] x;
+          logic signed [31:0] x32;
+          x   = signed'(r0x[i * EW +: EW]);
+          x32 = 32'(x) <<< 8;
+          case (mode)
+            M_LP1:   r1c[i] <= x[15] ? -x32 : x32;
+            M_LP2:   r1c[i] <= 32'(x * x);
+            default: r1c[i] <= x32;
+          endcase
+        end
+      end
+      if (g_adv[g] && g_r1v[g])
+        for (int i = 0; i < LG; i++) acc[i] <= n[i];
+    end
+  end
+
+  // the snapshot of a finished group, for the finaliser: one process, one
+  // enable (the central copy's; every copy's snap is the same), and a packed
+  // vector, so synthesis builds registers and a read mux, not a RAM
+  logic [NL-1:0][31:0] accd;
+  always_ff @(posedge clk)
+    if (snap) accd <= nx;
+
+  // the AVG reciprocals of the group (central)
+  logic [5:0]  r0_d0, r0_d1, r1_d0, r1_d1;
+  logic [23:0] invd [OWP];
+  always_ff @(posedge clk) begin
+    if (adv) begin
+      r0_d0 <= bt.d0;  r0_d1 <= bt.d1;
+      r1_d0 <= r0_d0;  r1_d1 <= r0_d1;
+    end
+    if (snap) begin
+      invd[0] <= INV[r1_d0];
+      invd[1] <= INV[r1_d1];
+    end
+  end
+
+  // Finaliser -------------------------------------------------------------------------------
+  logic [2:0]  f_c;
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      f_rem <= '0;
-      f_v   <= '0;
+      f_v <= '0;
     end else begin
       f_v <= {f_v[FL-2:0], f_issue};
-      if (snap) begin
-        f_rem <= 4'(TC);
-        f_c   <= '0;
-      end else if (f_issue) begin
-        f_rem <= f_rem - 4'd1;
-        f_c   <= f_c + 3'd1;
-      end
     end
+    if (snap)         f_c <= '0;
+    else if (f_issue) f_c <= f_c + 3'd1;
   end
 
   // per lane: 1 operands; 2 AVG product, LP-2 range reduction; 3-8 the three
@@ -202,7 +258,7 @@ module pl_reduce
     .count    (fb_count)
   );
 
-  assign idle = !r0_v && !r1_v && (f_rem == '0) && (f_v == '0) && !fb_valid;
+  assign idle = !g_r0v[NG] && !g_r1v[NG] && g_fz[NG] && (f_v == '0) && !fb_valid;
 
   logic unused;
   assign unused = fb_in_ready ^ ^j;

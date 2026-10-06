@@ -273,9 +273,19 @@ module cv_core
   // ===========================================================================
   // Control slave and the job's registers
   // ===========================================================================
-  logic        clk, rst;
+  // the reset, registered (the block design's reset drives the four
+  // kernels): one copy for the control slave, one for the rest (the units
+  // take their own copies of urst)
+  // keep: the four kernels' copies are equivalent registers, and the block
+  // design's global synthesis would otherwise merge them (FMAX_250_PLAN)
+  logic        clk;
+  (* keep = "true" *) logic rst;
+  (* keep = "true", max_fanout = 128 *) logic rst_c;
   assign clk = ap_clk;
-  assign rst = !ap_rst_n;
+  always_ff @(posedge clk) begin
+    rst   <= !ap_rst_n;
+    rst_c <= !ap_rst_n;
+  end
 
   logic        ap_start, ap_done, ap_idle, ap_ready;
   logic [63:0] r_x, r_w, r_b, r_y;
@@ -283,7 +293,7 @@ module cv_core
   logic [31:0] r_sh, r_sw, r_dh, r_dw, r_pt, r_pl, r_has_bias, r_dwm;
 
   cv_ctrl_s_axi u_ctrl (
-    .clk, .rst,
+    .clk, .rst (rst_c),
     .awvalid (s_axi_ctrl_AWVALID), .awready (s_axi_ctrl_AWREADY), .awaddr (s_axi_ctrl_AWADDR),
     .wvalid  (s_axi_ctrl_WVALID),  .wready  (s_axi_ctrl_WREADY),  .wdata  (s_axi_ctrl_WDATA),
     .wstrb   (s_axi_ctrl_WSTRB),
@@ -398,6 +408,25 @@ module cv_core
                     (q_out_w != '0) && (q_out_w <= 32'(ACCN / TM)) && q_kh_ok && q_kw_ok &&
                     (q_sh != '0) && (q_sw != '0) && (q_dh != '0) && (q_dw != '0);
 
+  // the registers, taken every cycle while idle: the job runs on the values
+  // of the ap_start cycle (the enable is a state bit, not a function of
+  // ap_start — it reaches several hundred registers)
+  always_ff @(posedge clk) begin
+    if (tstate == T_IDLE) begin
+      q_x <= r_x[63:4];  q_w <= r_w[63:4];  q_b <= r_b[63:4];  q_y <= r_y[63:4];
+      {q_batch, q_in_ch, q_in_h, q_in_w} <= {r_batch, r_in_ch, r_in_h, r_in_w};
+      {q_out_ch, q_out_h, q_out_w}       <= {r_out_ch, r_out_h, r_out_w};
+      {q_sh, q_sw, q_dh, q_dw, q_pt, q_pl} <= {r_sh, r_sw, r_dh, r_dw, r_pt, r_pl};
+      q_kh    <= r_kh[2:0];
+      q_kw    <= r_kw[2:0];
+      // kh, kw in 1..MAXK; a multi-tap dilated window within the line buffer
+      q_kh_ok <= (r_kh != '0) && (r_kh <= 32'(MAXK)) && ((r_kh == 32'd1) || (r_dh < 32'(LBR)));
+      q_kw_ok <= (r_kw != '0) && (r_kw <= 32'(MAXK)) && ((r_kw == 32'd1) || (r_dw < 32'(LBC)));
+      q_bias  <= (r_has_bias != '0);
+      q_dwm   <= (r_dwm != '0);
+    end
+  end
+
   always_ff @(posedge clk) begin
     if (rst) begin
       tstate    <= T_IDLE;
@@ -408,17 +437,6 @@ module cv_core
       dv_start  <= 1'b0;
       case (tstate)
         T_IDLE: if (ap_start) begin
-          q_x <= r_x[63:4];  q_w <= r_w[63:4];  q_b <= r_b[63:4];  q_y <= r_y[63:4];
-          {q_batch, q_in_ch, q_in_h, q_in_w} <= {r_batch, r_in_ch, r_in_h, r_in_w};
-          {q_out_ch, q_out_h, q_out_w}       <= {r_out_ch, r_out_h, r_out_w};
-          {q_sh, q_sw, q_dh, q_dw, q_pt, q_pl} <= {r_sh, r_sw, r_dh, r_dw, r_pt, r_pl};
-          q_kh    <= r_kh[2:0];
-          q_kw    <= r_kw[2:0];
-          // kh, kw in 1..MAXK; a multi-tap dilated window within the line buffer
-          q_kh_ok <= (r_kh != '0) && (r_kh <= 32'(MAXK)) && ((r_kh == 32'd1) || (r_dh < 32'(LBR)));
-          q_kw_ok <= (r_kw != '0) && (r_kw <= 32'(MAXK)) && ((r_kw == 32'd1) || (r_dw < 32'(LBC)));
-          q_bias  <= (r_has_bias != '0);
-          q_dwm   <= (r_dwm != '0);
           ci      <= '0;
           tstate  <= T_PA;
         end
@@ -523,9 +541,13 @@ module cv_core
   assign ap_idle  = (tstate == T_IDLE);
   assign ap_ready = ap_done;
 
-  // the job's constants, from T_SEQ on
+  // the job's constants, from T_SEQ on.  The enable is registered (a cycle
+  // ahead: ci counts up in T_PC) and replicated — it reaches every unit's
+  // copy of the job.
+  (* max_fanout = 96 *) logic j_ld;
+  always_ff @(posedge clk) j_ld <= (tstate == T_PC) && (ci == 4'd7);
   always_ff @(posedge clk) begin
-    if (tstate == T_PC && ci == 4'd8) begin
+    if (j_ld) begin
       j.x_w <= q_x;  j.w_w <= q_w;  j.b_w <= q_b;  j.y_w <= q_y;
       j.batch <= q_batch;  j.in_ch <= q_in_ch;  j.in_h <= q_in_h;  j.in_w <= q_in_w;
       j.out_ch <= q_out_ch;  j.out_h <= q_out_h;  j.out_w <= q_out_w;
@@ -549,6 +571,17 @@ module cv_core
 
   always_ff @(posedge clk) start_q <= job_start;
   always_ff @(posedge clk) urst <= rst || job_start;
+  // the units' resets: a copy per unit (each reaches its unit only)
+  (* keep = "true" *) logic urst_x, urst_p, urst_w, urst_b, urst_e, urst_d, urst_y;
+  always_ff @(posedge clk) begin
+    urst_x <= rst || job_start;
+    urst_p <= rst || job_start;
+    urst_w <= rst || job_start;
+    urst_b <= rst || job_start;
+    urst_e <= rst || job_start;
+    urst_d <= rst || job_start;
+    urst_y <= rst || job_start;
+  end
 
   // ===========================================================================
   // Sweep sequencer: (ni, chunk, input tile, ow-tile, m-group) for standard,
@@ -706,15 +739,15 @@ module cv_core
   logic   xq_v, pq_v, wq_v, fq_v, eq_v, xq_r, pq_r, wq_r, fq_r, eq_r;
   sweep_t xq, pq, wq, fq, eq;
   logic [2:0] xq_n, pq_n, wq_n, fq_n, eq_n;
-  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_xq (.clk, .rst (urst),
+  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_xq (.clk, .rst (urst_x),
     .in_valid (s_push), .in_ready (sq_x_rdy), .in_data (k), .out_valid (xq_v), .out_ready (xq_r), .out_data (xq), .count (xq_n));
-  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_pq (.clk, .rst (urst),
+  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_pq (.clk, .rst (urst_p),
     .in_valid (s_push), .in_ready (sq_p_rdy), .in_data (k), .out_valid (pq_v), .out_ready (pq_r), .out_data (pq), .count (pq_n));
-  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_wq (.clk, .rst (urst),
+  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_wq (.clk, .rst (urst_w),
     .in_valid (s_push), .in_ready (sq_w_rdy), .in_data (k), .out_valid (wq_v), .out_ready (wq_r), .out_data (wq), .count (wq_n));
-  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_fq (.clk, .rst (urst),
+  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_fq (.clk, .rst (urst_e),
     .in_valid (s_push), .in_ready (sq_f_rdy), .in_data (k), .out_valid (fq_v), .out_ready (fq_r), .out_data (fq), .count (fq_n));
-  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_eq (.clk, .rst (urst),
+  cv_fifo #(.W($bits(sweep_t)), .D(4), .BRAM(1'b0)) u_eq (.clk, .rst (urst_e),
     .in_valid (s_push), .in_ready (sq_e_rdy), .in_data (k), .out_valid (eq_v), .out_ready (eq_r), .out_data (eq), .count (eq_n));
 
   logic                 col_v, col_r, colq_v, colq_r;
@@ -738,25 +771,43 @@ module cv_core
   logic [BW-1:0]        yw_d;
   logic xl_idle, pa_idle, wl_idle, bi_idle, en_idle, dr_idle, yw_idle;
 
+  // The read channels, registered at the kernel's boundary: every reader
+  // keeps RREADY high (its buffer has room for each beat it requests), so the
+  // register is a pure delay — the outstanding-burst counts only fall a
+  // cycle later.
+  logic          x_rv, x_rl, w_rv, w_rl, b_rv, b_rl;
+  logic [BW-1:0] x_rd, w_rd, b_rd;
+  always_ff @(posedge clk) begin
+    x_rv <= m_axi_gmem0_RVALID && !rst;
+    w_rv <= m_axi_gmem1_RVALID && !rst;
+    b_rv <= m_axi_gmem2_RVALID && !rst;
+    x_rl <= m_axi_gmem0_RLAST;
+    w_rl <= m_axi_gmem1_RLAST;
+    b_rl <= m_axi_gmem2_RLAST;
+    x_rd <= m_axi_gmem0_RDATA;
+    w_rd <= m_axi_gmem1_RDATA;
+    b_rd <= m_axi_gmem2_RDATA;
+  end
+
   cv_xload u_xl (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_x), .j,
     .xq_valid (xq_v), .xq_ready (xq_r), .xq,
     .arvalid (m_axi_gmem0_ARVALID), .arready (m_axi_gmem0_ARREADY),
     .araddr  (m_axi_gmem0_ARADDR),  .arlen   (m_axi_gmem0_ARLEN),
-    .rvalid  (m_axi_gmem0_RVALID),  .rready  (m_axi_gmem0_RREADY),
-    .rdata   (m_axi_gmem0_RDATA),   .rlast   (m_axi_gmem0_RLAST),
+    .rvalid  (x_rv),  .rready  (m_axi_gmem0_RREADY),
+    .rdata   (x_rd),  .rlast   (x_rl),
     .col_valid (col_v), .col_ready (col_r), .col_data (col_d),
     .idle (xl_idle)
   );
 
   // the column FIFO: the loader runs up to 4 rows ahead of the producer
   cv_fifo #(.W(TIC * EW), .D(256), .BRAM(1'b1)) u_colq (
-    .clk, .rst (urst), .in_valid (col_v), .in_ready (col_r), .in_data (col_d),
+    .clk, .rst (urst_x), .in_valid (col_v), .in_ready (col_r), .in_data (col_d),
     .out_valid (colq_v), .out_ready (colq_r), .out_data (colq_d), .count (colq_n)
   );
 
   cv_patch u_pa (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_p), .j,
     .pq_valid (pq_v), .pq_ready (pq_r), .pq,
     .col_valid (colq_v), .col_ready (colq_r), .col_data (colq_d),
     .pt_valid (pt_v), .pt_ready (pt_r), .pt_data (pt_d),
@@ -764,28 +815,28 @@ module cv_core
   );
 
   cv_wload u_wl (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_w), .j,
     .wq_valid (wq_v), .wq_ready (wq_r), .wq,
     .arvalid (m_axi_gmem1_ARVALID), .arready (m_axi_gmem1_ARREADY),
     .araddr  (m_axi_gmem1_ARADDR),  .arlen   (m_axi_gmem1_ARLEN),
-    .rvalid  (m_axi_gmem1_RVALID),  .rready  (m_axi_gmem1_RREADY),
-    .rdata   (m_axi_gmem1_RDATA),   .rlast   (m_axi_gmem1_RLAST),
+    .rvalid  (w_rv),  .rready  (m_axi_gmem1_RREADY),
+    .rdata   (w_rd),  .rlast   (w_rl),
     .wv_valid (wv_v), .wv_ready (wv_r), .wv_data (wv_d),
     .idle (wl_idle)
   );
 
   cv_bias u_bi (
-    .clk, .rst (urst), .start (start_q), .j,
+    .clk, .rst (urst_b), .start (start_q), .j,
     .arvalid (m_axi_gmem2_ARVALID), .arready (m_axi_gmem2_ARREADY),
     .araddr  (m_axi_gmem2_ARADDR),  .arlen   (m_axi_gmem2_ARLEN),
-    .rvalid  (m_axi_gmem2_RVALID),  .rready  (m_axi_gmem2_RREADY),
-    .rdata   (m_axi_gmem2_RDATA),   .rlast   (m_axi_gmem2_RLAST),
+    .rvalid  (b_rv),  .rready  (m_axi_gmem2_RREADY),
+    .rdata   (b_rd),  .rlast   (b_rl),
     .ok (bias_ok), .tile (bias_tile), .vec (bias_vec),
     .idle (bi_idle)
   );
 
   cv_engine u_en (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_e), .j,
     .fq_valid (fq_v), .fq_ready (fq_r), .fq,
     .wv_valid (wv_v), .wv_ready (wv_r), .wv_data (wv_d),
     .eq_valid (eq_v), .eq_ready (eq_r), .eq,
@@ -797,7 +848,7 @@ module cv_core
   );
 
   cv_drain u_dr (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_d), .j,
     .dr_valid (dr_v), .dr_ready (dr_r), .dr,
     .d_ren, .d_par, .d_addr, .d_rdata, .d_free, .d_free_par,
     .run_valid (run_v), .run_ready (run_r), .run_e, .run_len,
@@ -806,7 +857,7 @@ module cv_core
   );
 
   cv_ywriter u_yw (
-    .clk, .rst (urst), .j,
+    .clk, .rst (urst_y), .j,
     .run_valid (run_v), .run_ready (run_r), .run_e, .run_len,
     .yw_valid (yw_v), .yw_ready (yw_r), .yw_data (yw_d),
     .awvalid (m_axi_gmem3_AWVALID), .awready (m_axi_gmem3_AWREADY),

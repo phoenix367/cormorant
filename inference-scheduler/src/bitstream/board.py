@@ -10,6 +10,7 @@ _FPGA_FIRMWARE = "/sys/class/fpga_manager/fpga0/firmware"
 _FPGA_STATE    = "/sys/class/fpga_manager/fpga0/state"
 _FIRMWARE_DIR  = "/lib/firmware"
 _OVERLAYS_DIR  = "/sys/kernel/config/device-tree/overlays"
+_FCLK_RATE     = "/sys/devices/platform/fclk{}/set_rate"
 
 
 def upload_file(session: RemoteSession, local_path: Path, remote_path: str) -> None:
@@ -65,6 +66,23 @@ def load_bitstream(session: RemoteSession, bin_name: str) -> None:
         if rc != 0:
             raise RuntimeError(
                 f"FPGA manager command failed (rc={rc}):\n  {cmd}\n{err}")
+
+
+def read_fclk_hz(session: RemoteSession, idx: int = 0) -> int | None:
+    """The PS PL clock idx's rate (xlnx,fclk driver), None if not readable."""
+    out, _, rc = session.exec(f"cat {_FCLK_RATE.format(idx)} 2>/dev/null", timeout=10)
+    try:
+        return int(out.strip()) if rc == 0 else None
+    except ValueError:
+        return None
+
+
+def set_fclk_hz(session: RemoteSession, hz: int, idx: int = 0) -> None:
+    """Request PS PL clock idx at hz (the clock framework rounds to a divider)."""
+    path = _FCLK_RATE.format(idx)
+    _, err, rc = session.exec(f"echo {int(hz)} > {path}", timeout=10)
+    if rc != 0:
+        raise RuntimeError(f"Could not set {path} to {int(hz)} Hz: {err.strip()}")
 
 
 def fpga_state(session: RemoteSession) -> str:

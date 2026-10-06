@@ -30,7 +30,7 @@ enable_testing()
 
 set(MM_RTL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(MM_RTL_SOURCES
-    rtl/mm_pkg.sv rtl/mm_fifo.sv rtl/mm_gearbox.sv rtl/mm_axi_rd.sv
+    rtl/mm_pkg.sv rtl/mm_fifo.sv rtl/mm_rs.sv rtl/mm_gearbox.sv rtl/mm_axi_rd.sv
     rtl/mm_axi_wr.sv rtl/mm_packer.sv rtl/mm_ctrl_s_axi.sv rtl/mm_walker.sv
     rtl/mm_rungen.sv rtl/mm_abuf.sv rtl/mm_awr.sv rtl/mm_xpf.sv rtl/mm_mac.sv
     rtl/mm_lane.sv rtl/mm_drain.sv rtl/mm_core.sv rtl/MatmulKernel.v)
@@ -173,6 +173,16 @@ if(MM_RTL_VIVADO)
                 -tclargs "${MM_RTL_DIR}" ${MM_RTL_PERIOD} "${MM_RTL_PART}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/synth"
         COMMENT "MatmulKernel RTL: Vivado OOC synthesis + P&R (${MM_RTL_PART}, ${MM_RTL_PERIOD} ns)"
+        USES_TERMINAL VERBATIM)
+
+    # netlist equivalence: Vivado's OOC synthesis of the IP top against the RTL,
+    # in lockstep in xsim on board-like jobs (tools/neteq) — catches RTL that
+    # synthesises differently from how it simulates
+    add_custom_target(neteq_matmul_rtl
+        COMMAND "${CMAKE_COMMAND}" -E env "PATH=${_mm_rtl_vivado_bin}:$ENV{PATH}"
+                "${MM_RTL_DIR}/../../tools/neteq/run.sh" matmul "${MM_RTL_DIR}/rtl"
+                "${CMAKE_CURRENT_BINARY_DIR}/neteq"
+        COMMENT "MatmulKernel RTL: synthesised netlist vs RTL in lockstep (xsim)"
         USES_TERMINAL VERBATIM)
 
     add_custom_target(xsim_matmul_rtl

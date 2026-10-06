@@ -7,7 +7,7 @@ platforms/<AXI_PLATFORM>.json; milliseconds at the board's PL clock."""
 import argparse, json, math, os, sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-PL_MHZ = 100     # the board's PL clock (block design PL0; fact board.pl_clock_mhz)
+PL_MHZ = 250     # the kernels' clock on the board (clk_wiz_0; fact board.pl_clock_mhz)
 
 def load_platform(name):
     cfg = json.load(open(os.path.join(ROOT, "platforms", f"{name}.json")))

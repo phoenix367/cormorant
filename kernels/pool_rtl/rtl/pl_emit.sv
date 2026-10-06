@@ -56,7 +56,8 @@ module pl_emit
   logic [31:0] oht, nh;
   logic [31:0] lc1;                        // SET0 -> SET1: min(nh, in_h)
   logic        lh_ok;
-  logic        step_end, wg_act, w0_v, w1_v, lw_v, cur_v;
+  logic        step_end, wg_act, w0_v, wr_v, w1_v, lw_v, lx_v, cur_v;
+  logic [TC-1:0] cvm;                      // channel c < ck.c_valid (loaded with ck)
 
   assign cq_ready = (st == S_IDLE);
 
@@ -67,6 +68,7 @@ module pl_emit
       case (st)
         S_IDLE: if (cq_valid) begin
           ck     <= cq;
+          for (int c = 0; c < TC; c++) cvm[c] <= (4'(c) < cq.c_valid);
           oh     <= j.prefetch ? 32'hFFFF_FFFF : 32'd0;
           ih0    <= (j.prefetch ? (32'd0 - j.stride_h) : 32'd0) - j.pad_top;
           oht    <= '0;
@@ -116,10 +118,12 @@ module pl_emit
   lbd_t          lw_d;
   logic [3:0]    lw_q;
 
+  logic lx_row;                            // the lx write completes a row
   always_ff @(posedge clk) begin
     if (rst || st == S_IDLE) begin
       cur_v  <= 1'b0;
       lw_v   <= 1'b0;
+      lx_v   <= 1'b0;
       lrow   <= '0;
       loaded <= '0;
     end else begin
@@ -139,7 +143,9 @@ module pl_emit
         lw_d    <= cur;
         lw_q    <= cq_w;
       end
-      if (lw_v && (lw_q + 4'd1 == lw_d.nw) && lw_d.row_last) loaded <= loaded + 32'd1;
+      lx_v   <= lw_v;
+      lx_row <= lw_v && (lw_q + 4'd1 == lw_d.nw) && lw_d.row_last;
+      if (lx_v && lx_row) loaded <= loaded + 32'd1;
     end
   end
 
@@ -163,6 +169,21 @@ module pl_emit
     end
   end
 
+  // LX: the line-buffer write, registered.  The 64 banks spread over a wide
+  // area and a word reaches the same bank of every channel, so the write
+  // enable, address and data are copied per bank (the data per channel too:
+  // one 16-bit copy per bank).  A word is in the line buffer at the end of LX.
+  (* keep = "true" *) logic [TC-1:0][E-1:0]          lx_we;
+  (* keep = "true" *) logic [TC-1:0][E-1:0][6:0]     lx_wa;
+  (* keep = "true" *) logic [TC-1:0][E-1:0][EW-1:0]  lx_wd;
+  always_ff @(posedge clk)
+    for (int b = 0; b < E; b++)
+      for (int c = 0; c < TC; c++) begin
+        lx_we[c][b] <= lb_we[c][b];
+        lx_wa[c][b] <= lb_wa[b];
+        lx_wd[c][b] <= lb_wd[b];
+      end
+
   // Window generator ---------------------------------------------------------------------
   logic [6:0]  g, gpos;
   logic [2:0]  khi, kwi, kwc0, kwc1, nvk;
@@ -173,8 +194,8 @@ module pl_emit
 
   assign gw_sw = j.gw2 ? {j.stride_w[30:0], 1'b0} : j.stride_w;
   assign en    = (st == S_RUN) && emit && wg_act &&
-                 (j.prefetch || ((loaded == tgt) && !lw_v && !cur_v));
-  assign adv   = en && (32'(bt_count) + 32'(w0_v) + 32'(w1_v) < BD);
+                 (j.prefetch || ((loaded == tgt) && !lw_v && !lx_v && !cur_v));
+  assign adv   = en && (32'(bt_count) + 32'(w0_v) + 32'(wr_v) + 32'(w1_v) < BD);
 
   // this tap
   logic        ih_ok, ok0, ok1, kt0, kt1, first, last;
@@ -193,8 +214,7 @@ module pl_emit
   end
 
   // W0: the tap's banks, words, validity
-  logic [2:0] w0_bank0, w0_bank1, w0_word0, w0_word1;
-  logic [3:0] w0_slot;
+  logic [2:0] w0_bank0, w0_bank1;
   logic       w0_ok0, w0_ok1, w0_first, w0_last;
   logic [5:0] w0_d0, w0_d1;
 
@@ -215,9 +235,8 @@ module pl_emit
         colk1  <= ck.col_base + j.stride_w;
         ih     <= ih0;
       end else if (adv) begin
-        w0_bank0 <= colk[2:0];   w0_word0 <= colk[5:3];
-        w0_bank1 <= colk1[2:0];  w0_word1 <= colk1[5:3];
-        w0_slot  <= ih_ok ? ih[3:0] : 4'd0;
+        w0_bank0 <= colk[2:0];
+        w0_bank1 <= colk1[2:0];
         w0_ok0   <= ok0;
         w0_ok1   <= ok1;
         w0_first <= first;
@@ -254,35 +273,58 @@ module pl_emit
   end
 
   // W1: one read per bank (position 0 wins a shared bank: then position 1 is padded)
-  logic [EW-1:0] rv     [TC][E];
-  logic [6:0]    lb_ra  [E];
-  logic [EW-1:0] lb_rd  [TC][E];
-  always_comb
+  //
+  // The 64 banks spread over a wide area, so the read address takes two
+  // register stages: at adv the 8 bank addresses (lb_ra1, the bank mux on
+  // the values W0 captures), in W0 a plain copy per (channel, bank)
+  // (lb_ra2, placed next to its bank), and the banks are read in WR into rv
+  // (no enable: rv is only used in the cycle after a WR beat).
+  logic [E-1:0][6:0] lb_ra1;
+  always_ff @(posedge clk) begin
+    logic [3:0] slot;
+    slot = ih_ok ? ih[3:0] : 4'd0;
     for (int b = 0; b < E; b++)
-      lb_ra[b] = (w0_bank0 == 3'(b)) ? {w0_slot, w0_word0} : {w0_slot, w0_word1};
+      lb_ra1[b] <= (colk[2:0] == 3'(b)) ? {slot, colk[5:3]} : {slot, colk1[5:3]};
+  end
 
+  (* keep = "true" *) logic [TC-1:0][E-1:0][6:0] lb_ra2;
+  always_ff @(posedge clk)
+    for (int c = 0; c < TC; c++)
+      for (int b = 0; b < E; b++)
+        lb_ra2[c][b] <= lb_ra1[b];
+
+  logic [EW-1:0] rv     [TC][E];
+  logic [EW-1:0] lb_rd  [TC][E];
   for (genvar c = 0; c < TC; c++) begin : g_ch
     for (genvar b = 0; b < E; b++) begin : g_bank
       pl_lutram #(.W(EW), .D(LBR * LBW)) u_lb (
-        .clk, .we (lb_we[c][b]), .waddr (lb_wa[b]), .wdata (lb_wd[b]),
-        .raddr (lb_ra[b]), .rdata (lb_rd[c][b])
+        .clk, .we (lx_we[c][b]), .waddr (lx_wa[c][b]), .wdata (lx_wd[c][b]),
+        .raddr (lb_ra2[c][b]), .rdata (lb_rd[c][b])
       );
     end
   end
+  always_ff @(posedge clk) rv <= lb_rd;     // one process for the whole array
 
-  logic [2:0] w1_bank0, w1_bank1;
-  logic       w1_ok0, w1_ok1, w1_first, w1_last;
-  logic [5:0] w1_d0, w1_d1;
+  // tags: W0 -> WR -> W1
+  logic [2:0] wr_bank0, wr_bank1, w1_bank0, w1_bank1;
+  logic       wr_ok0, wr_ok1, wr_first, wr_last, w1_ok0, w1_ok1, w1_first, w1_last;
+  logic [5:0] wr_d0, wr_d1, w1_d0, w1_d1;
   always_ff @(posedge clk) begin
-    if (rst || st == S_IDLE) w1_v <= 1'b0;
-    else                     w1_v <= w0_v;
-    if (w0_v) begin
-      rv       <= lb_rd;
-      w1_bank0 <= w0_bank0;  w1_bank1 <= w0_bank1;
-      w1_ok0   <= w0_ok0;    w1_ok1   <= w0_ok1;
-      w1_first <= w0_first;  w1_last  <= w0_last;
-      w1_d0    <= w0_d0;     w1_d1    <= w0_d1;
+    if (rst || st == S_IDLE) begin
+      wr_v <= 1'b0;
+      w1_v <= 1'b0;
+    end else begin
+      wr_v <= w0_v;
+      w1_v <= wr_v;
     end
+    wr_bank0 <= w0_bank0;  wr_bank1 <= w0_bank1;
+    wr_ok0   <= w0_ok0;    wr_ok1   <= w0_ok1;
+    wr_first <= w0_first;  wr_last  <= w0_last;
+    wr_d0    <= w0_d0;     wr_d1    <= w0_d1;
+    w1_bank0 <= wr_bank0;  w1_bank1 <= wr_bank1;
+    w1_ok0   <= wr_ok0;    w1_ok1   <= wr_ok1;
+    w1_first <= wr_first;  w1_last  <= wr_last;
+    w1_d0    <= wr_d0;     w1_d1    <= wr_d1;
   end
 
   // W2: pick each position's bank, pad the rest; into the beat FIFO
@@ -291,10 +333,8 @@ module pl_emit
   assign pad = (j.mode == M_MAX) ? DATA_MIN : 16'h0000;
   always_comb begin
     for (int c = 0; c < TC; c++) begin
-      logic cv;
-      cv = (4'(c) < ck.c_valid);
-      bt_in.v[(0 * TC + c) * EW +: EW] = (w1_ok0 && cv) ? rv[c][w1_bank0] : pad;
-      bt_in.v[(1 * TC + c) * EW +: EW] = (w1_ok1 && cv) ? rv[c][w1_bank1] : pad;
+      bt_in.v[(0 * TC + c) * EW +: EW] = (w1_ok0 && cvm[c]) ? rv[c][w1_bank0] : pad;
+      bt_in.v[(1 * TC + c) * EW +: EW] = (w1_ok1 && cvm[c]) ? rv[c][w1_bank1] : pad;
     end
     bt_in.first = w1_first;
     bt_in.last  = w1_last;
@@ -310,9 +350,10 @@ module pl_emit
     .count    (bt_count)
   );
 
-  // The step ends when its rows are written and its beats have read the buffer.
+  // The step ends when its rows are written and its beats have read the buffer
+  // (a beat in W1 only enters the beat FIFO, in this cycle).
   assign step_end = (st == S_RUN) && (!emit || !wg_act) && (loaded == tgt) &&
-                    !cur_v && !lw_v && !w0_v && !w1_v;
+                    !cur_v && !lw_v && !lx_v && !w0_v && !wr_v;
 
   assign idle = (st == S_IDLE) && !bt_valid;
 

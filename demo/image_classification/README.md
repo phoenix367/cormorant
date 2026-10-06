@@ -312,8 +312,11 @@ Notable behaviour visible in the run:
   MobileNet v1 73.0 ms, v2 62.9 ms, the same top-5 classes and logits.
 - **Later: the SystemVerilog ConvKernel** (2026-10-06,
   `doc/plans/CONV_RTL_PLAN.md` phase 2): every Conv runs on the
-  faster kernel — ResNet-18 47.4 ms,
-  MobileNet v1 41.2 ms, v2 38.1 ms, the same top-5 classes and logits.
+  faster kernel — ResNet-18 47.4 ms, MobileNet v1 41.2 ms, v2 38.1 ms,
+  the same top-5 classes and logits.
+- **Then 250 MHz** (2026-10-06, `doc/plans/FMAX_250_PLAN.md`, bitstream
+  `986cef4866a0`): ResNet-18 20.5 ms,
+  MobileNet v1 22.0 ms, v2 20.5 ms, the same top-5 classes and logits.
 
 The full per-image top-K table is also written to `build/results.json`.
 

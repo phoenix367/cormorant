@@ -30,6 +30,32 @@ def parse_hwh_ps_params(hwh_path: Path) -> tuple[str, dict]:
     )
 
 
+def parse_hwh_clocks(hwh_path: Path) -> dict:
+    """
+    Return {"pl0_mhz", "kernel_mhz"} from the HWH.
+
+    pl0_mhz    — the PS's PL0 clock the design expects (the PS module's
+                 PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ), None if absent
+    kernel_mhz — the kernels' ap_clk (CLKFREQUENCY of the first ap_clk
+                 input found), None if absent.  With the MMCM design
+                 (clk_wiz_0, doc/plans/FMAX_250_PLAN.md) it differs from PL0.
+    """
+    root = ET.parse(hwh_path).getroot()
+    pl0 = kernel = None
+    for mod in root.iter("MODULE"):
+        if mod.get("MODTYPE", "") in _PS_MODTYPES and pl0 is None:
+            for p in mod.findall("./PARAMETERS/PARAMETER"):
+                if p.get("NAME") == "PSU__CRL_APB__PL0_REF_CTRL__ACT_FREQMHZ":
+                    pl0 = float(p.get("VALUE"))
+        if kernel is None:
+            for port in mod.iter("PORT"):
+                if port.get("NAME") == "ap_clk" and port.get("DIR") == "I" \
+                        and port.get("CLKFREQUENCY"):
+                    kernel = int(port.get("CLKFREQUENCY")) / 1e6
+                    break
+    return {"pl0_mhz": pl0, "kernel_mhz": kernel}
+
+
 def parse_hwh_mem_topology(hwh_path: Path) -> dict:
     """
     Build the MEM_TOPOLOGY dict for xclbinutil from the HWH.

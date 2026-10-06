@@ -160,7 +160,14 @@ def _fit_family(rows: List[dict], names: List[str]) -> dict:
                        "holdout": bool(rows[i]["holdout"])} for i in worst]}
 
 
-def fit(cases: dict, data: dict) -> dict:
+def _mhz(mhz: float):
+    """A clock as the model files record it: 0.1 MHz resolution, whole MHz
+    as an integer (99.999 → 100, 249.9975 → 250)."""
+    r = round(mhz, 1)
+    return int(r) if r == int(r) else r
+
+
+def fit(cases: dict, data: dict, clock_mhz: float = 100.0) -> dict:
     meas = _measured(data)
     info = {e["key"]: e for e in cases["cases"]}
     fams: Dict[str, List[dict]] = {}
@@ -172,7 +179,8 @@ def fit(cases: dict, data: dict) -> dict:
     families = {n: fit_family(rows) for n, rows in sorted(fams.items()) if len(rows) >= 6}
     spreads = [m["spread"] for m in meas.values() if m["spread"] is not None]
     return {
-        "platform": data["platform"], "bitstream": data["bitstream"], "clock_mhz": 100,
+        "platform": data["platform"], "bitstream": data["bitstream"],
+        "clock_mhz": _mhz(clock_mhz),
         "axi_bus_width": 128, "date": time.strftime("%Y-%m-%d"),
         "calibration_date": data.get("date"), "runner": data.get("runner"),
         "exact": {k: {"us": round(m["us"], 3)} for k, m in sorted(meas.items())},
@@ -204,11 +212,26 @@ def report(model: dict) -> str:
     return "\n".join(lines)
 
 
+def kernel_clock_mhz(bid: str, model_path: Path) -> float:
+    """The kernels' clock of bitstream ``bid``: from the HWH of the local
+    bitstream config when it names that bitstream, else what the model file
+    already says, else 100 MHz (every bitstream before FMAX_250_PLAN)."""
+    from .perf_calls import local_bitstream_id, local_kernel_clock_mhz
+    if local_bitstream_id() == bid:
+        mhz = local_kernel_clock_mhz()
+        if mhz:
+            return mhz
+    try:
+        return float(json.loads(model_path.read_text())["clock_mhz"])
+    except (OSError, KeyError, ValueError, TypeError):
+        return 100.0
+
+
 def cmd_fit(models_dir: Path, bid: str) -> int:
     cases = json.loads((models_dir / f"{bid}.cases.json").read_text())
     data = json.loads((models_dir / f"{bid}.calib.json").read_text())
-    model = fit(cases, data)
     out = models_dir / f"{bid}.json"
+    model = fit(cases, data, kernel_clock_mhz(bid, out))
     out.write_text(json.dumps(model, indent=1) + "\n")
     print(report(model))
     print(f"model -> {out}")
@@ -219,4 +242,4 @@ def cmd_fit(models_dir: Path, bid: str) -> int:
     return 0
 
 
-__all__ = ("nnls", "fit", "fit_family", "report", "cmd_fit")
+__all__ = ("nnls", "fit", "fit_family", "report", "cmd_fit", "kernel_clock_mhz")

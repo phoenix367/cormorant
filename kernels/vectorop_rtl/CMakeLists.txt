@@ -32,7 +32,7 @@ enable_testing()
 
 set(VO_RTL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(VO_RTL_SOURCES
-    rtl/vo_pkg.sv rtl/vo_fifo.sv rtl/vo_ctrl_s_axi.sv rtl/vo_burstgen.sv
+    rtl/vo_pkg.sv rtl/vo_fifo.sv rtl/vo_rs.sv rtl/vo_ctrl_s_axi.sv rtl/vo_burstgen.sv
     rtl/vo_rd_port.sv rtl/vo_wr_port.sv rtl/vo_div.sv rtl/vo_compute.sv
     rtl/vo_core.sv rtl/VectorOPKernel.v)
 list(TRANSFORM VO_RTL_SOURCES PREPEND "${VO_RTL_DIR}/")
@@ -206,6 +206,16 @@ if(VO_RTL_VIVADO)
                 -tclargs "${VO_RTL_DIR}" ${VO_RTL_PERIOD} "${VO_RTL_PART}"
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/synth"
         COMMENT "VectorOPKernel RTL: Vivado OOC synthesis + P&R (${VO_RTL_PART}, ${VO_RTL_PERIOD} ns)"
+        USES_TERMINAL VERBATIM)
+
+    # netlist equivalence: Vivado's OOC synthesis of the IP top against the RTL,
+    # in lockstep in xsim on board-like jobs (tools/neteq) — catches RTL that
+    # synthesises differently from how it simulates
+    add_custom_target(neteq_vectorop_rtl
+        COMMAND "${CMAKE_COMMAND}" -E env "PATH=${_vo_rtl_vivado_bin}:$ENV{PATH}"
+                "${VO_RTL_DIR}/../../tools/neteq/run.sh" vectorop "${VO_RTL_DIR}/rtl"
+                "${CMAKE_CURRENT_BINARY_DIR}/neteq"
+        COMMENT "VectorOPKernel RTL: synthesised netlist vs RTL in lockstep (xsim)"
         USES_TERMINAL VERBATIM)
 
     add_custom_target(xsim_vectorop_rtl

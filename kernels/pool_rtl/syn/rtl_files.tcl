@@ -2,6 +2,7 @@
 set rtl_files [list \
   $root/rtl/pl_pkg.sv \
   $root/rtl/pl_fifo.sv \
+  $root/rtl/pl_rs.sv \
   $root/rtl/pl_lutram.sv \
   $root/rtl/pl_ctrl_s_axi.sv \
   $root/rtl/pl_loader.sv \

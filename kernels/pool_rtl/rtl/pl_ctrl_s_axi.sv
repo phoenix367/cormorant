@@ -76,45 +76,57 @@ module pl_ctrl_s_axi (
                           A_LP_ORDER = 8'hA0, A_CIP = 8'hA8;
 
   // Write channel ------------------------------------------------------------------
+  // Every AXI-Lite input is registered before it is decoded: the address and
+  // the write data are captured on their handshakes and the register update
+  // (w_hs) happens the cycle after the W handshake, together with BVALID; a
+  // read address is decoded the cycle after its handshake (RD_ADDR).
   typedef enum logic [1:0] {WR_IDLE, WR_DATA, WR_RESP} wst_t;
-  wst_t       wst;
-  logic [7:0] waddr;
-  logic       w_hs;
+  wst_t        wst;
+  logic [7:0]  waddr;
+  logic        w_hs;                 // registered W handshake: apply wdata / wstrb
+  logic [31:0] wdata_q;
+  logic [3:0]  wstrb_q;
 
   assign awready = (wst == WR_IDLE);
   assign wready  = (wst == WR_DATA);
   assign bvalid  = (wst == WR_RESP);
   assign bresp   = 2'b00;
-  assign w_hs    = wvalid && wready;
 
   always_ff @(posedge clk) begin
-    if (rst) wst <= WR_IDLE;
-    else case (wst)
-      WR_IDLE: if (awvalid) wst <= WR_DATA;
-      WR_DATA: if (wvalid)  wst <= WR_RESP;
-      WR_RESP: if (bready)  wst <= WR_IDLE;
-      default: wst <= WR_IDLE;
-    endcase
+    if (rst) begin
+      wst  <= WR_IDLE;
+      w_hs <= 1'b0;
+    end else begin
+      w_hs <= wvalid && wready;
+      case (wst)
+        WR_IDLE: if (awvalid) wst <= WR_DATA;
+        WR_DATA: if (wvalid)  wst <= WR_RESP;
+        WR_RESP: if (bready)  wst <= WR_IDLE;
+        default: wst <= WR_IDLE;
+      endcase
+    end
     if (awvalid && awready) waddr <= {awaddr[7:2], 2'b00};
+    if (wvalid && wready) begin
+      wdata_q <= wdata;
+      wstrb_q <= wstrb;
+    end
   end
 
   logic [31:0] wmask;
-  assign wmask = {{8{wstrb[3]}}, {8{wstrb[2]}}, {8{wstrb[1]}}, {8{wstrb[0]}}};
+  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
   function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata & wmask) | (old & ~wmask);
+    return (wdata_q & wmask) | (old & ~wmask);
   endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
   logic       int_auto_restart, auto_restart_status, int_gie, int_irq;
   logic [1:0] int_ier, int_isr;
-  logic       ar_hs;
+  logic       ar_hs;               // registered AR handshake: decode raddr
   logic [7:0] raddr;
   logic       task_ap_done, task_ap_ready, auto_restart_done;
 
-  assign ar_hs             = arvalid && arready;
-  assign raddr             = araddr;
   assign auto_restart_done = auto_restart_status && ap_idle && !int_ap_idle;
   assign task_ap_done      = (ap_done && !auto_restart_status) || auto_restart_done;
   assign task_ap_ready     = ap_ready && !int_auto_restart;
@@ -155,7 +167,7 @@ module pl_ctrl_s_axi (
     end else begin
       int_irq <= int_gie && (|int_isr);
 
-      if (w_hs && waddr == A_CTRL && wstrb[0] && wdata[0]) int_ap_start <= 1'b1;
+      if (w_hs && waddr == A_CTRL && wstrb_q[0] && wdata_q[0]) int_ap_start <= 1'b1;
       else if (ap_ready)                                  int_ap_start <= int_auto_restart;
 
       if (task_ap_done)                   int_task_done <= 1'b1;
@@ -166,18 +178,18 @@ module pl_ctrl_s_axi (
       if (task_ap_ready)                  int_ap_ready <= 1'b1;
       else if (ar_hs && raddr == A_CTRL)  int_ap_ready <= 1'b0;
 
-      if (w_hs && waddr == A_CTRL && wstrb[0]) int_auto_restart <= wdata[7];
+      if (w_hs && waddr == A_CTRL && wstrb_q[0]) int_auto_restart <= wdata_q[7];
 
       if (int_auto_restart) auto_restart_status <= 1'b1;
       else if (ap_idle)     auto_restart_status <= 1'b0;
 
-      if (w_hs && waddr == A_GIE && wstrb[0]) int_gie <= wdata[0];
-      if (w_hs && waddr == A_IER && wstrb[0]) int_ier <= wdata[1:0];
+      if (w_hs && waddr == A_GIE && wstrb_q[0]) int_gie <= wdata_q[0];
+      if (w_hs && waddr == A_IER && wstrb_q[0]) int_ier <= wdata_q[1:0];
 
       if (int_ier[0] && ap_done)                    int_isr[0] <= 1'b1;
-      else if (w_hs && waddr == A_ISR && wstrb[0])  int_isr[0] <= int_isr[0] ^ wdata[0];
+      else if (w_hs && waddr == A_ISR && wstrb_q[0])  int_isr[0] <= int_isr[0] ^ wdata_q[0];
       if (int_ier[1] && ap_ready)                   int_isr[1] <= 1'b1;
-      else if (w_hs && waddr == A_ISR && wstrb[0])  int_isr[1] <= int_isr[1] ^ wdata[1];
+      else if (w_hs && waddr == A_ISR && wstrb_q[0])  int_isr[1] <= int_isr[1] ^ wdata_q[1];
 
       if (w_hs) begin
         case (waddr)
@@ -209,20 +221,23 @@ module pl_ctrl_s_axi (
   end
 
   // Read channel -------------------------------------------------------------------
-  typedef enum logic {RD_IDLE, RD_DATA} rst_t;
+  typedef enum logic [1:0] {RD_IDLE, RD_ADDR, RD_DATA} rst_t;
   rst_t rst_q;
 
   assign arready = (rst_q == RD_IDLE);
   assign rvalid  = (rst_q == RD_DATA);
   assign rresp   = 2'b00;
+  assign ar_hs   = (rst_q == RD_ADDR);
 
   always_ff @(posedge clk) begin
     if (rst) rst_q <= RD_IDLE;
     else case (rst_q)
-      RD_IDLE: if (arvalid) rst_q <= RD_DATA;
+      RD_IDLE: if (arvalid) rst_q <= RD_ADDR;
+      RD_ADDR: rst_q <= RD_DATA;
       RD_DATA: if (rready)  rst_q <= RD_IDLE;
       default: rst_q <= RD_IDLE;
     endcase
+    if (arvalid && arready) raddr <= araddr;
     if (ar_hs) begin
       rdata <= '0;
       case (raddr)

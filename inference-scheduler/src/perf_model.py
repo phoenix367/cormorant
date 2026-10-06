@@ -26,8 +26,6 @@ from typing import Dict, List, Optional, Tuple
 
 from .perf_calls import KernelCall
 
-MHZ = 100.0
-
 
 # ---------------------------------------------------------------------------
 # Families and features
@@ -302,5 +300,5 @@ def default_model_path(bitstream_id: Optional[str], platform: str = "kv260") -> 
     return p if p.exists() else None
 
 
-__all__ = ("MHZ", "family", "features", "feature_vector", "Family", "PerfModel",
+__all__ = ("family", "features", "feature_vector", "Family", "PerfModel",
            "clearly_faster", "MAX_MODEL_ERROR", "default_model_path")

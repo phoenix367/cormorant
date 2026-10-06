@@ -18,8 +18,19 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/c2b2a6e5e50e` is hw_128 850cc88 (2026-10-06; all four kernels in SystemVerilog —
-CONV_RTL_PLAN phase 3): 2343 calls, repeat spread median 0.017 %.  Its campaign started
+`kv260/986cef4866a0` is the 250 MHz design (2026-10-06, FMAX_250_PLAN: the kernels on an MMCM
+at 250 MHz, register slices, the kernels' register trees): 2011 calls, `clock_mhz` 250, repeat
+spread median 0.099 % (the calls are 2.5× shorter; 268 above 0.5 %).  Its campaign started from
+the converged case list of `c2b2a6e5e50e` (the shipped calls are the same: the engine choices
+do not depend on the clock), then five refinement rounds: 108 + 59 + 33 + 69 + 13 calls.
+`host.json` unchanged.  The family fits are loose at 250 MHz — conv / conv-dw / conv-mm held-out
+p90 31 / 50 / 64 %, mm-gemv 18.5 %, mm-tiled 7.1 %: their features come from the engine cost
+model, whose board terms (DDR latency, host overhead in cycles) were fitted at 100 MHz.  The
+planner trusts no family and prices from the exact calls until that model is refitted
+(FMAX_250_PLAN §5).
+
+Before it, `kv260/c2b2a6e5e50e`, hw_128 850cc88 (2026-10-06; all four kernels in SystemVerilog at
+100 MHz — CONV_RTL_PLAN phase 3), 2343 calls, repeat spread median 0.017 %.  Its campaign started
 from the converged case list of `dbb320fb7297` (one pass, a refinement round of 136 calls),
 then the list was rebuilt with the scheduler's RTL ConvKernel cost model, whose engine and
 geometry choices change the shipped ConvKernel calls (BERT's attention P·V moves onto
@@ -31,7 +42,7 @@ kernel's walk terms (`rtl_total`, `rtl_fill`, `rtl_loads` from `cost_model.rtl_c
 conv / conv-dw held-out p90 9.4 / 12.1 % (from 39.4 / 31.6 % with the HLS terms),
 conv-mm 42.8 %; mm-gemv / mm-tiled 1.44 / 3.14 %.
 
-Beside it, `kv260/dbb320fb7297`, hw_128 7d8eefe (2026-10-05; the SystemVerilog MatmulKernel,
+Before that, `kv260/dbb320fb7297`, hw_128 7d8eefe (2026-10-05; the SystemVerilog MatmulKernel,
 VectorOPKernel and PoolingKernel — POOL_RTL_PLAN phase 3 — with the ConvKernel the one Vitis
 HLS kernel; `AXI_CONV_IMPL=hls` for projects on it), 1581 calls, repeat spread median 0.016 %.  Its case list started from the
 converged one of `b3309f424562`; the first refinement round added 0 calls.  Against that

@@ -57,7 +57,7 @@ Bases are 16-byte aligned (the low four address bits are ignored).
 ## 2. Architecture
 
 ```
-ctrl ─► config (5 cycles) ─┬► rd_port a: burstgen ─► AR ─► R FIFO (512) ─► tail mask ─┬─► out FIFO ─┐
+ctrl ─► config (7 cycles) ─┬► rd_port a: burstgen ─► AR ─► R FIFO (512) ─► tail mask ─┬─► out FIFO ─┐
                            │                                              └─► replay RAM (256) ─┘    │
                            ├► rd_port b (gmem1; disabled for ops >= 4)                               ├► compute ─► wr_port c
                            └──────────────────────────────────────────────────────────────────────────┘
@@ -65,13 +65,20 @@ ctrl ─► config (5 cycles) ─┬► rd_port a: burstgen ─► AR ─► R F
 
 | module | role |
 |---|---|
-| `vo_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL MatmulKernel's) |
-| `vo_core` | job FSM: latch the registers, derive the three port geometries (`outer · n_words` through a 3-stage DSP pipeline), start the units, `ap_done` when all are idle |
+| `vo_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL MatmulKernel's); its inputs are registered before they are decoded (a write takes effect with BVALID, a read is answered one cycle later) |
+| `vo_core` | job FSM: latch the registers, derive the three port geometries (`outer · n_words` as three 16 × 16 partial products, four registered stages), start the units, `ap_done` when all are idle; the latch and the geometry loads are enabled by registered strobes, and the job reset is registered and copied per unit |
 | `vo_burstgen` | one port's bursts: one per cycle, ≤ MAXB words, never across 4 KiB or a run |
-| `vo_rd_port` | AR issued only when the 512-beat read FIFO can take the whole burst (RREADY tied high); tail mask; the replay RAM; a small output FIFO |
+| `vo_rd_port` | AR issued only when the 512-beat read FIFO can take the whole burst (RREADY tied high); tail mask (its run-end flag and lane mask kept in registers); the replay RAM; a small output FIFO |
+| `vo_rs` | a register slice (two entries, both directions registered) on each AR, AW and W output |
 | `vo_compute` | 8 lanes per cycle in a 6-stage pipeline (add / sub, a DSP multiply per lane, select + saturate, activation); DIV through `vo_div`; a 16-word output FIFO, entered only with room for every word in flight |
 | `vo_div` | restoring radix-2 divider on magnitudes, one lane per cycle, 26 stages |
-| `vo_wr_port` | 512-beat FIFO; bursts ≤ 256 words issued on AW once their beats are buffered; ≤ 16 bursts awaiting B |
+| `vo_wr_port` | 512-beat FIFO; bursts ≤ 256 words issued on AW once their beats are buffered; ≤ 16 bursts awaiting B; the next bursts wait in a register slice and the issue decision is an AND of registers (`avail`, `av_ok` computed a cycle ahead, `ob_ok`) |
+
+The m_axi ports are registered both ways: AR, AW and W leave through
+`vo_rs` slices (ARREADY / AWREADY / WREADY only enable a slice's registers),
+and RVALID / RDATA / RLAST and BVALID are registered before they are used —
+so the block design's interconnect never sees a combinational path into the
+kernel's logic or out of it.
 
 Burst sizes and outstanding counts follow the HLS interface: reads ≤ 64
 beats with ≤ 16 bursts awaiting data per port, writes ≤ 256 beats with ≤ 16
@@ -85,24 +92,45 @@ read-write with 2 outstanding bursts, and the crossbar held the reads of a
 job of nine 2-word runs to about four in flight — slower than the HLS
 kernel in the test stand.
 
-Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`): 5 243
-LUT (230 LUTRAM), 6 453 FF, 10 BRAM36, 11 DSP; timing met at 300 MHz (WNS
-+0.248 ns, Fmax ≈ 324 MHz; the PL runs at 100).  The HLS kernel: about
-22.7k LUT, 13.7k FF, 32 BRAM18 and 33 DSP (its synthesis estimate).
+Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`): 5 412
+LUT (270 LUTRAM), 7 429 FF, 10 BRAM36, 11 DSP; timing met at 300 MHz (WNS
++0.191 ns, Fmax ≈ 318 MHz; the block design runs the kernels at 250 MHz since FMAX_250_PLAN).  Before the registered AXI
+ports and job reset (2026-10-06): 5 243 LUT, 6 453 FF, WNS +0.248 ns.  The
+HLS kernel: about 22.7k LUT, 13.7k FF, 32 BRAM18 and 33 DSP (its synthesis
+estimate).
+
+In the block design (the routed 100 MHz `cormorant_hw_128`, 2026-10-05) the
+kernel's long paths were not inside its arithmetic: the job reset
+(`rst || job_start`, combinational, 285 loads, plus `rst` with 417) spanning
+five clock regions, the geometry-register enable (504 loads), and the AXI
+boundary — the crossbar's WREADY through the W FIFO's skid logic (5 levels,
+5.7 ns), RDATA into the read FIFOs, `araddr` into the crossbar's arbiter.
+The registered resets, strobes and AXI slices above address them; cycle
+counts move by at most 12 cycles per job (`perf_vectorop_rtl`).  At 4 ns
+(the 250 MHz trial of 2026-10-06) the one logic-bound path of the whole
+design was this kernel's geometry product `outer · n_words`, a 32 × 32
+multiply in two cascaded DSPs and a carry chain (10 levels, 3.4 ns): it is
+now three 16 × 16 partial products with every stage registered (one more
+configuration cycle per job).  In the full 250 MHz design (four kernels,
+WNS +0.074 ns) the last cluster below 0.1 ns was the write port's issue
+decision: the FIFO count through `wf_count − pend_w ≥ len` (9 levels) into
+the enables of the burst generator's registers.  The bursts now wait in a
+register slice and the decision reads registers only.
 
 ## 3. Performance
 
 Cycles from `ap_start` to `ap_done` with ideal memory (`make
-perf_vectorop_rtl`, Verilator):
+perf_vectorop_rtl`, Verilator; the registered AXI ports and job start of
+2026-10-06 added 2–12 cycles per job):
 
 | job | cycles | words / cycle |
 |---|---:|---:|
-| ADD / MUL / RELU, 65 536 elements | 8 501–8 504 | 0.96 |
-| DIV, 8 192 elements | 8 352 | 0.12 (one lane per cycle, as HLS) |
-| bias add, 64 × 1 024 (b replayed) | 8 505 | 0.96 |
-| 12-element runs, stride 16, × 1 000 | 2 058 | 0.97 |
-| 8-element rows × 4 096 (one-word b replayed) | 4 404 | 0.93 |
-| 5 000-element rows × 16 (b over the replay bound) | 10 308 | 0.97 |
+| ADD / MUL / RELU, 65 536 elements | 8 507–8 510 | 0.96 |
+| DIV, 8 192 elements | 8 356 | 0.12 (one lane per cycle, as HLS) |
+| bias add, 64 × 1 024 (b replayed) | 8 507 | 0.96 |
+| 12-element runs, stride 16, × 1 000 | 2 064 | 0.97 |
+| 8-element rows × 4 096 (one-word b replayed) | 4 416 | 0.93 |
+| 5 000-element rows × 16 (b over the replay bound) | 10 319 | 0.97 |
 
 On the board (bitstream `68665fc1833a`, the 15 VectorOP benchmarks of
 `run_remote_perf.py` against the HLS kernel's bitstream back to back): no
@@ -118,7 +146,7 @@ the HLS kernel (VECTOROP_RTL_PLAN phases 1–2).
 |---|---|---|
 | Verilator lint (`-Wall`) | `lint_vectorop_rtl` | clean |
 | the 119 checked-in fixtures (`hw/test_data/vecop_test_data`) | `TestVectorOpRtl` (ctest) | 119 / 119: c.hex in every run, tail lanes 0, and byte-identical to the HLS oracle on the whole output region |
-| random jobs against the HLS kernel's C++, randomised AXI timing, protocol checks, no stray write, no gmem1 traffic for unary ops | ctest: 300 (seed 1); by hand: 2 × 500 (seeds 1, 2026) + 200 slow timing (seed 4711) | all bit-exact |
+| random jobs against the HLS kernel's C++, randomised AXI timing, protocol checks, no stray write, no gmem1 traffic for unary ops | ctest: 300 (seed 1); by hand: 2 × 500 (seeds 1, 2026) + 200 slow timing (seed 4711); after the registered ports and resets (2026-10-06): 9 × 700 (seeds 2, 2026, 4711 × random / fast / slow timing), repeated after the write-issue change | all bit-exact |
 | register table vs RTL and the HLS driver | `VectorOpRtlDriver` (ctest), `gen_driver.py --check --hls-driver` | 9 arguments + 4 control registers agree |
 | the test stand's VectorOP block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_vectorop_rtl`; `behavior_test_vectorop` | 119 / 119 (`check_test_report.py` PASS); 984 µs of kernel time against the HLS kernel's 1 000 µs, faster in 115 of the 119 cases, at most 2.4 % slower in the other four (1 000 × 16-element jobs with a replayed operand) |
 
@@ -139,7 +167,8 @@ jobs reach 16).
 `TestVectorOpRtl`, `lint_vectorop_rtl`, `perf_vectorop_rtl`,
 `vectorop_rtl_tb_fst`, `driver_vectorop_rtl` (`build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src`),
 `package_vectorop_rtl` (`build/rtl_ip/VectorOPKernel_ip`), `synth_vectorop_rtl`,
-`xsim_vectorop_rtl`, `sysim_vectorop_rtl` — `kernels/vectorop_rtl/CMakeLists.txt`.
+`xsim_vectorop_rtl`, `neteq_vectorop_rtl` (the synthesised netlist against the RTL in
+lockstep, `tools/neteq`), `sysim_vectorop_rtl` — `kernels/vectorop_rtl/CMakeLists.txt`.
 
 ## 6. Invariants for changes
 
@@ -150,13 +179,21 @@ jobs reach 16).
   `package_ip.tcl` declares; change both together.
 - `vo_burstgen` keeps the full-width adds off the path after `len` (the run
   end is decided beside it; the address and remainder add `len` to their low
-  bits only).  The plain form missed 300 MHz by 0.29 ns.
+  bits only, and the high parts' carry and borrow are decided from the
+  registers, not from those sums).  The plain form missed 300 MHz by
+  0.29 ns, the one with the carry / borrow taken from the sums by 0.04 ns.
 - The compute output FIFO is only entered with room for every word in
   flight (`alu_inflight`, `dw_inflight`); a deeper pipeline must count its
   stages.
 - An AW is issued only when all of its beats are buffered and not promised
-  to an earlier burst (`avail = wf_count − pend_w`), so W never stalls
-  mid-burst.
+  to an earlier burst, so W never stalls mid-burst.  `avail` (= the FIFO's
+  count minus the beats promised to issued bursts) is a register updated by
+  pushes and issues — a W pop lowers both terms — and `av_ok` / `ob_ok` are
+  computed one cycle ahead for the next cycle's head burst, ignoring that
+  cycle's push and B: they may only be late, never early.
+- The job reset (`urst_*`, one registered copy per unit) is asserted the
+  cycle after `job_start`, and the units' `start` (`start_q2`) the cycle
+  after that; the geometry registers are loaded (T_CFG5) before either.
 - The three word streams (a, b, c) have the same length by construction
   (`outer · n_words`); the geometry must stay identical to VectorOP.cpp's
   for the RTL to read and write the same words.

@@ -136,6 +136,7 @@ Python).
 | `package_matmul_rtl` | Vivado IP `xilinx.com:hls:MatmulKernel:1.0` with the driver → `build/rtl_ip/MatmulKernel_ip` (+ `.zip`), ~20 s |
 | `synth_matmul_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `MM_RTL_PERIOD` ns (default 3.333) → `build/kernels/matmul_rtl/synth/*.rpt` |
 | `xsim_matmul_rtl` | `xvlog` / `xelab` parse and elaboration |
+| `neteq_matmul_rtl` | Vivado's OOC-synthesised netlist of the IP against the RTL, in lockstep in xsim on board-like jobs (`tools/neteq`; exit 1 on a mismatch) → `build/kernels/matmul_rtl/neteq/` |
 | `sysim_matmul_rtl` | The test stand's MatmulKernel block design (PS VIP, interconnect, DDR model, `matmul_tb.sv`) with this IP, gmem2 upgraded to 128, on a copy in `build/kernels/matmul_rtl/sysim/` (~4 min) |
 
 The IP is packaged outside `build/kernels/`, in `build/rtl_ip/`.  The
@@ -169,6 +170,7 @@ Each target exists only when its tool is found, as for MatmulKernel
 | `package_vectorop_rtl` | Vivado IP `xilinx.com:hls:VectorOPKernel:1.0` with the driver → `build/rtl_ip/VectorOPKernel_ip` (+ `.zip`) |
 | `synth_vectorop_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `VO_RTL_PERIOD` ns (default 3.333) → `build/kernels/vectorop_rtl/synth/*.rpt` |
 | `xsim_vectorop_rtl` | `xvlog` / `xelab` parse and elaboration |
+| `neteq_vectorop_rtl` | Vivado's OOC-synthesised netlist of the IP against the RTL, in lockstep in xsim on board-like jobs (`tools/neteq`; exit 1 on a mismatch) → `build/kernels/vectorop_rtl/neteq/` |
 | `sysim_vectorop_rtl` | The test stand's VectorOPKernel block design (PS VIP, interconnect, DDR model) with this IP, on a copy in `build/kernels/vectorop_rtl/sysim/` |
 
 As for MatmulKernel, the IP is packaged in `build/rtl_ip/`, `ip_repo_kv260`
@@ -200,6 +202,7 @@ Each target exists only when its tool is found, as for MatmulKernel
 | `package_pool_rtl` | Vivado IP `xilinx.com:hls:PoolingKernel:1.0` with the driver → `build/rtl_ip/PoolingKernel_ip` (+ `.zip`) |
 | `synth_pool_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `PL_RTL_PERIOD` ns (default 3.333) → `build/kernels/pool_rtl/synth/*.rpt` |
 | `xsim_pool_rtl` | `xvlog` / `xelab` parse and elaboration |
+| `neteq_pool_rtl` | Vivado's OOC-synthesised netlist of the IP against the RTL, in lockstep in xsim on board-like jobs (`tools/neteq`; exit 1 on a mismatch) → `build/kernels/pool_rtl/neteq/` |
 | `sysim_pool_rtl` | The test stand's PoolingKernel block design (PS VIP, interconnect, DDR model) with this IP, on a copy in `build/kernels/pool_rtl/sysim/` |
 
 As for the other RTL kernels, the IP is packaged in `build/rtl_ip/`,

@@ -34,10 +34,16 @@ module vo_burstgen
   // full-width carry chain follows `len` (300 MHz): the run end is decided
   // beside it, and the address and the remainder add `len` to their low
   // bits only, the high part's +1 / -1 being computed from the registers.
+  // The high parts' carry and borrow are decided beside `len` too, from the
+  // registers (not from lo_sum / rem_lo), which keeps the remainder's update
+  // within 300 MHz:
+  //   carry  = cur_w[7:0] + len >= 256  <=>  len == to_4k  <=>  lim >= to_4k
+  //   borrow = rem[8:0] < len  <=>  big && rem[8:0] < MAXB && rem[8:0] < to_4k
+  //            (without big, len <= lim = rem[8:0])
   logic [8:0]  to_4k, lim, len;
-  logic        big, last;
-  logic [8:0]  lo_sum;                      // cur_w[7:0] + len  (<= 256)
-  logic [9:0]  rem_lo;                      // rem[8:0] - len    (b9: borrow)
+  logic        big, last, carry, borrow;
+  logic [8:0]  lo_sum;                      // cur_w[7:0] + len  (low 8 bits used)
+  logic [9:0]  rem_lo;                      // rem[8:0] - len    (low 9 bits used)
   logic [51:0] hi_inc;                      // cur_w[59:8] + 1
   logic [22:0] rem_hi_dec;                  // rem[31:9] - 1
   always_comb begin
@@ -46,6 +52,8 @@ module vo_burstgen
     lim        = big ? 9'(MAXB) : rem[8:0];
     len        = (lim > to_4k) ? to_4k : lim;
     last       = !big && (rem[8:0] <= to_4k);  // len == rem: the run ends with this burst
+    carry      = (lim >= to_4k);
+    borrow     = big && ({1'b0, rem[8:0]} < 10'(MAXB)) && (rem[8:0] < to_4k);
     lo_sum     = {1'b0, cur_w[7:0]} + len;
     rem_lo     = {1'b0, rem[8:0]} - {1'b0, len};
     hi_inc     = cur_w[59:8] + 52'd1;
@@ -79,8 +87,8 @@ module vo_burstgen
           cur_w      <= next_run_w;
           next_run_w <= next_run_w + 60'(g.stride_w);
         end else begin
-          rem   <= {rem_lo[9] ? rem_hi_dec : rem[31:9], rem_lo[8:0]};
-          cur_w <= {lo_sum[8] ? hi_inc : cur_w[59:8], lo_sum[7:0]};
+          rem   <= {borrow ? rem_hi_dec : rem[31:9], rem_lo[8:0]};
+          cur_w <= {carry ? hi_inc : cur_w[59:8], lo_sum[7:0]};
         end
       end
     end

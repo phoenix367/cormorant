@@ -6,6 +6,10 @@
 // cross a 4 KiB boundary; a burst's AW is only issued once all of its beats
 // are in the FIFO, so W streams without gaps; at most WR_OUTS bursts await
 // their B.  `idle` means every accepted beat has been written and acknowledged.
+//
+// The AXI side is registered both ways: AW and W leave through register
+// slices (AWREADY / WREADY only enable the slices' registers) and BVALID is
+// registered before it is counted.
 // ---------------------------------------------------------------------------
 module mm_axi_wr
   import mm_pkg::*;
@@ -88,7 +92,7 @@ module mm_axi_wr
   logic [CW:0] avail;
   assign avail = {1'b0, wf_count} - pend_w;
 
-  logic issue;
+  logic issue, aw_in_ready, w_in_ready, bv_q;
   // Registered "all beats of the next burst are buffered" and "fewer than
   // WR_OUTS bursts await B".  Safe although one cycle old: only an AW issue
   // can lower `avail` or raise `outstanding`, and after an issue bl_v blocks
@@ -100,7 +104,7 @@ module mm_axi_wr
     av_ok <= !rst && (avail >= (CW+1)'(bl_v ? blen : blen_c));
     ob_ok <= !rst && (outstanding < OW'(WR_OUTS));
   end
-  assign issue = busy && bl_v && av_ok && ob_ok && (!awvalid || awready) && lq_in_ready;
+  assign issue = busy && bl_v && av_ok && ob_ok && aw_in_ready && lq_in_ready;
 
   logic       w_fire, b_fire, w_end;
 
@@ -108,7 +112,6 @@ module mm_axi_wr
     if (rst) begin
       busy        <= 1'b0;
       bl_v        <= 1'b0;
-      awvalid     <= 1'b0;
       pend_w      <= '0;
       outstanding <= '0;
     end else begin
@@ -117,15 +120,10 @@ module mm_axi_wr
         cur_w <= dq_data[71:12];
         rem   <= dq_data[11:0];
       end
-      if (awvalid && awready) awvalid <= 1'b0;
-
       // One cycle to size the next burst after every change of cur_w / rem.
       if (issue) bl_v <= 1'b0;
       else if (busy && !bl_v) begin blen <= blen_c; bl_v <= 1'b1; end
       if (issue) begin
-        awvalid <= 1'b1;
-        awaddr  <= {cur_w, 4'b0};
-        awlen   <= 8'(blen - 12'd1);
         cur_w   <= cur_w + 60'(blen);
         rem     <= rem - blen;
         if (rem == blen) busy <= 1'b0;
@@ -143,25 +141,40 @@ module mm_axi_wr
   );
 
   // W side -----------------------------------------------------------------------
+  mm_rs #(.W(72)) u_aw (
+    .clk, .rst,
+    .in_valid  (issue),   .in_ready  (aw_in_ready), .in_data ({cur_w, 4'b0, 8'(blen - 12'd1)}),
+    .out_valid (awvalid), .out_ready (awready),     .out_data ({awaddr, awlen})
+  );
+
   logic [7:0] wcnt;
-  assign wvalid   = lq_valid && wf_valid;
-  assign wdata    = wf_data[BW-1:0];
-  assign wstrb    = wf_data[FW-1:BW];
-  assign wlast    = (wcnt == lq_data);
-  assign w_fire   = wvalid && wready;
-  assign w_end    = w_fire && wlast;
-  assign wf_ready = lq_valid && wready;
+  logic       wv_i, wl_i;
+  assign wv_i     = lq_valid && wf_valid;
+  assign wl_i     = (wcnt == lq_data);
+  assign w_fire   = wv_i && w_in_ready;
+  assign w_end    = w_fire && wl_i;
+  assign wf_ready = lq_valid && w_in_ready;
   assign lq_ready = w_end;
+
+  mm_rs #(.W(FW + 1)) u_w (
+    .clk, .rst,
+    .in_valid  (wv_i),   .in_ready  (w_in_ready), .in_data ({wl_i, wf_data}),
+    .out_valid (wvalid), .out_ready (wready),     .out_data ({wlast, wstrb, wdata})
+  );
 
   always_ff @(posedge clk) begin
     if (rst) wcnt <= '0;
-    else if (w_fire) wcnt <= wlast ? 8'd0 : wcnt + 8'd1;
+    else if (w_fire) wcnt <= wl_i ? 8'd0 : wcnt + 8'd1;
   end
 
   assign bready = 1'b1;
-  assign b_fire = bvalid;
+  always_ff @(posedge clk) begin
+    if (rst) bv_q <= 1'b0;
+    else     bv_q <= bvalid;
+  end
+  assign b_fire = bv_q;
 
-  assign idle = !busy && !dq_valid && !awvalid && (wf_count == '0) &&
-                !lq_valid && (outstanding == '0);
+  assign idle = !busy && !dq_valid && !awvalid && aw_in_ready && (wf_count == '0) &&
+                !lq_valid && !wvalid && w_in_ready && (outstanding == '0) && !bv_q;
 
 endmodule

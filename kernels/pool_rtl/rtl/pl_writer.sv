@@ -215,9 +215,24 @@ module pl_writer
       rb_ra[b] = {dr.buf_i, d_c[2:0], w[2:0]};
     end
 
+  // The row-buffer write is registered (bank enables, addresses and data),
+  // so the bundle FIFO's handshake ends in registers; a bundle is in its
+  // bank one cycle after f_take.  The drain cannot read it earlier: a row's
+  // drain starts at least two cycles after its last bundle's f_take (f_row_end
+  // -> drq FIFO -> d_act -> first read).
+  logic          rq_we [E];
+  logic [6:0]    rq_wa [E];
+  logic [EW-1:0] rq_wd [E];
+  always_ff @(posedge clk)
+    for (int b = 0; b < E; b++) begin
+      rq_we[b] <= rb_we[b];
+      rq_wa[b] <= rb_wa[b];
+      rq_wd[b] <= rb_wd[b];
+    end
+
   for (genvar b = 0; b < E; b++) begin : g_rb
     pl_lutram #(.W(EW), .D(2 * TC * LBW)) u_rb (
-      .clk, .we (rb_we[b]), .waddr (rb_wa[b]), .wdata (rb_wd[b]),
+      .clk, .we (rq_we[b]), .waddr (rq_wa[b]), .wdata (rq_wd[b]),
       .raddr (rb_ra[b]), .rdata (rb_rd[b])
     );
   end
@@ -263,35 +278,54 @@ module pl_writer
     end
   end
 
-  logic wf_in_ready;
+  // The AXI side is registered both ways: W and AW leave through register
+  // slices behind their LUTRAM FIFOs (WREADY / AWREADY only enable the
+  // slices), and BVALID is registered before it is counted.
+  logic                    wf_in_ready, wq_v, wq_r, aq_v, aq_r, bv_q;
+  logic [BW + 2 * E:0]     wq_d;
   pl_fifo #(.W(BW + 2 * E + 1), .D(WD), .BRAM(1'b0)) u_wf (
     .clk, .rst,
     .in_valid (d2_v),   .in_ready (wf_in_ready), .in_data ({d2_last, d2_strb, d2_data}),
-    .out_valid(wvalid), .out_ready(wready),      .out_data({wlast, wstrb, wdata}),
+    .out_valid(wq_v),   .out_ready(wq_r),        .out_data(wq_d),
     .count    (wf_count)
   );
+  pl_rs #(.W(BW + 2 * E + 1)) u_ws (
+    .clk, .rst,
+    .in_valid  (wq_v),   .in_ready  (wq_r),   .in_data (wq_d),
+    .out_valid (wvalid), .out_ready (wready), .out_data ({wlast, wstrb, wdata})
+  );
 
-  // AW queue: one entry per burst, queued with the burst's first word
   logic [3:0] aw_count;
   logic [67:0] aw_q;
   pl_fifo #(.W(68), .D(8), .BRAM(1'b0)) u_aw (
     .clk, .rst,
     .in_valid (d_go && d_bstart), .in_ready (aw_in_ready),
     .in_data  ({d_waddr, 4'b0, 4'(b_len - 4'd1)}),
-    .out_valid(awvalid), .out_ready(awready), .out_data(aw_q),
+    .out_valid(aq_v), .out_ready(aq_r), .out_data(aw_q),
     .count    (aw_count)
   );
-  assign awaddr = aw_q[67:4];
-  assign awlen  = {4'b0, aw_q[3:0]};
+  logic [3:0] awlen4;
+  pl_rs #(.W(68)) u_as (
+    .clk, .rst,
+    .in_valid  (aq_v),    .in_ready  (aq_r),    .in_data (aw_q),
+    .out_valid (awvalid), .out_ready (awready), .out_data ({awaddr, awlen4})
+  );
+  assign awlen  = {4'b0, awlen4};
 
   assign bready = 1'b1;
   always_ff @(posedge clk) begin
-    if (rst) outs <= '0;
-    else     outs <= outs + ((d_go && d_bstart) ? OW'(1) : '0) - (bvalid ? OW'(1) : '0);
+    if (rst) begin
+      outs <= '0;
+      bv_q <= 1'b0;
+    end else begin
+      outs <= outs + ((d_go && d_bstart) ? OW'(1) : '0) - (bv_q ? OW'(1) : '0);
+      bv_q <= bvalid;
+    end
   end
 
   assign idle = !f_act && !fb_valid && !drq_valid && !d_act && !d1_v && !d2_v &&
-                !wvalid && !awvalid && (outs == '0) && (full == '0);
+                !wq_v && !wvalid && wq_r && !aq_v && !awvalid && aq_r && (outs == '0) &&
+                (full == '0);
 
   logic unused;
   assign unused = wf_in_ready ^ ^aw_count ^ ^drq_count ^ ^j;

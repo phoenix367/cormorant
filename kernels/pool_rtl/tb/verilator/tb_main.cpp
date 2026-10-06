@@ -19,7 +19,7 @@
 // kernel's behaviour there is not defined, so no oracle).
 //
 // Usage:
-//   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow]
+//   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow|board|board2]
 //       [--case "N C H W oh ow ph pw sh sw pt pl dh dw type lp cip"] [--perf]
 //       [--quiet] [--max-cycles N] [--trace FILE]
 // ---------------------------------------------------------------------------
@@ -443,7 +443,8 @@ static std::vector<Case> load_fixtures(const std::string& dir) {
 
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-  std::string fixtures, trace, one_case, timing = "rand";
+  std::string fixtures, trace, timing = "rand";
+  std::vector<std::string> cases_arg;     // --case may repeat: the jobs run in order
   int n_random = 0;
   unsigned seed = 1;
   bool perf = false, quiet = false;
@@ -455,7 +456,7 @@ int main(int argc, char** argv) {
     else if (a == "--random") n_random = std::stoi(next());
     else if (a == "--seed") seed = (unsigned)std::stoul(next());
     else if (a == "--timing") timing = next();
-    else if (a == "--case") one_case = next();
+    else if (a == "--case") cases_arg.push_back(next());
     else if (a == "--perf") perf = true;
     else if (a == "--quiet") quiet = true;
     else if (a == "--max-cycles") max_cycles = std::stoull(next());
@@ -472,6 +473,10 @@ int main(int argc, char** argv) {
   auto set_timing = [&](const std::string& mode) {
     if (mode == "fast") tb.tim = Timing{1, 1, 1, 1, 1, 24, 24};
     else if (mode == "slow") tb.tim = Timing{0.3, 0.4, 0.3, 0.4, 0.5, 40, 200};
+    // the board at 250 MHz: long read latency, R beats back to back, slow B
+    else if (mode == "board") tb.tim = Timing{1, 1, 1, 1, 1, 150, 400, 150};
+    // a busy board: AR acceptance throttled, R bursts in pieces, 300-900 cycles latency
+    else if (mode == "board2") tb.tim = Timing{0.2, 0.6, 0.5, 0.7, 1, 300, 900, 300};
     else {
       auto P = [&] { return std::uniform_real_distribution<double>(0.25, 1.0)(crng); };
       int lmin = (int)(crng() % 60) + 2;
@@ -495,7 +500,7 @@ int main(int argc, char** argv) {
   std::vector<Case> cases;
   if (!fixtures.empty())
     for (auto& t : load_fixtures(fixtures)) cases.push_back(std::move(t));
-  if (!one_case.empty()) {
+  for (auto& one_case : cases_arg) {
     std::istringstream is(one_case);
     Case t;
     is >> t.n >> t.c >> t.h >> t.w >> t.oh >> t.ow >> t.ph >> t.pw >> t.sh >> t.sw >> t.pt >> t.pl

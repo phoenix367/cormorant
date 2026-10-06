@@ -1,7 +1,8 @@
 # HLS Convolution Kernels: State of the Art for KV260-class Devices
 
 > Background literature survey (2026-05-13), not a plan.  The target context
-> (300 MHz) is aspirational: HLS targets 150 MHz and the board runs at 100 MHz.
+> (300 MHz) is aspirational: HLS targets 150 MHz and the board runs at 250 MHz
+> (since FMAX_250_PLAN; 100 MHz when this was written).
 > What the kernel implements: CONV_KERNEL.md; history: CONV_OPTIMISATION.md.
 > §2's PM×PN grid became the 16×16 grid (§2.24 / §2.40) and PX = 2 (§2.42);
 > int8 packing (§6), Winograd (§8) and DW→PW fusion (§5) are unexplored.

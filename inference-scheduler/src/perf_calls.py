@@ -127,6 +127,20 @@ def local_bitstream_id(config: Optional[Path] = None) -> Optional[str]:
     return bitstream_id(p) if p.exists() else None
 
 
+def local_kernel_clock_mhz(config: Optional[Path] = None) -> Optional[float]:
+    """The kernels' clock (MHz) of the bitstream named by
+    ``bitstream_config_<platform>.json``, from its HWH (the ap_clk
+    CLKFREQUENCY), or None when the config or its HWH is missing."""
+    cfg, bs = _bitstream_config(config)
+    if not bs.get("hwh"):
+        return None
+    p = (cfg.parent / bs["hwh"]).resolve()
+    if not p.exists():
+        return None
+    from .bitstream.hwh import parse_hwh_clocks
+    return parse_hwh_clocks(p)["kernel_mhz"]
+
+
 def local_board_bin(config: Optional[Path] = None) -> str:
     """Where the board keeps the flat bitstream upload_bitstream.py loads for
     that config: ``/lib/firmware/<overlay_name>.bin``, the overlay name
@@ -137,4 +151,5 @@ def local_board_bin(config: Optional[Path] = None) -> str:
 
 
 __all__ = ("FIELDS", "KERNELS", "KernelCall", "merge", "BITSTREAM_ID_LEN",
-           "bitstream_id_of_bin", "bitstream_id", "local_bitstream_id", "local_board_bin")
+           "bitstream_id_of_bin", "bitstream_id", "local_bitstream_id", "local_board_bin",
+           "local_kernel_clock_mhz")

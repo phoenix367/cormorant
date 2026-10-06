@@ -29,25 +29,25 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 100 MHz, 16-bit fixed point (measured 2026-10-06 on the bitstream
-with the SystemVerilog ConvKernel, `c2b2a6e5e50e`, [CONV_RTL_PLAN phases 2–3](doc/plans/CONV_RTL_PLAN.md);
-the chat-server Piper figures 2026-10-01, on the HLS ConvKernel):
+KV260, programmable logic at 250 MHz, 16-bit fixed point (measured 2026-10-06 on bitstream
+`986cef4866a0`, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md); the chat-server Piper figures
+2026-10-01, at 100 MHz):
 
 | Model | Result | Source |
 |---|---|---|
-| ResNet-18, 224×224 | **47.4 ms (21.1 FPS)** per image | [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) (59.9 ms on the HLS ConvKernel, 62.3 ms before the cacheable buffer pool, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | 41.2 / 38.1 ms per image | [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) (72.8 / 62.7 ms on the HLS ConvKernel) |
-| MNIST convnet / LeNet | 0.235 / 2.701 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **839 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [CONV_RTL_PLAN phase 3](doc/plans/CONV_RTL_PLAN.md), [TACTICS_PLAN §9](doc/plans/TACTICS_PLAN.md) |
-| SmolLM2-135M-Instruct | **10.0 tokens/s** decode (7.9 at 1000 cached tokens), 16-token prefill 0.24 s, 256-token prefill 1.12 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [CONV_RTL_PLAN phase 3](doc/plans/CONV_RTL_PLAN.md) |
-| SmolLM2-360M-Instruct | **3.9 tokens/s** decode (3.2 at 1000 cached tokens), 16-token prefill 0.57 s, 256-token prefill 2.62 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) |
-| SmolVLM-256M-Instruct (image chat) | **3.4 s** per image for the vision encoder (7.7 s at first), then 100 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [CONV_RTL_PLAN phase 2](doc/plans/CONV_RTL_PLAN.md) |
-| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.43 s** per 1.49 s of audio (real-time factor 0.30), text encoder 62 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end; listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [samples](demo/tts/README.md#samples) |
+| ResNet-18, 224×224 | **20.5 ms (48.8 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
+| MobileNet V1 / V2, 224×224 | 22.0 / 20.5 ms per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
+| MNIST convnet / LeNet | 0.111 / 1.249 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **541 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (839 ms at 100 MHz) |
+| SmolLM2-135M-Instruct | **18.3 tokens/s** decode, 16-token prefill 0.16 s, 256-token prefill 0.81 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
+| SmolLM2-360M-Instruct | **7.3 tokens/s** decode, 16-token prefill 0.34 s, 256-token prefill 2.05 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
+| SmolVLM-256M-Instruct (image chat) | **2.3 s** per image for the vision encoder (7.7 s at first), then 54 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.35 s** per 1.49 s of audio (real-time factor 0.24), text encoder 61 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [samples](demo/tts/README.md#samples) |
 
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
-The FPGA design (`hw/cormorant_hw_128` 850cc88) uses 55 % of the DSPs
-(688 / 1248), 48.3 % of the LUTs (56 516 / 117 120), 103 / 144 BRAM and
+The FPGA design (`hw/cormorant_hw_128`, bitstream `986cef4866a0`) uses 55 % of the DSPs
+(688 / 1248), 47.8 % of the LUTs (56 019 / 117 120), 103 / 144 BRAM and
 48 / 64 URAM.
 
 ---
@@ -71,7 +71,8 @@ All four kernels are written in SystemVerilog (each a drop-in for the Vitis
 HLS kernel it replaced, whose C++ stays as the reference model).  All data
 ports are 128-bit AXI masters with 64-bit addresses and 16-byte-aligned
 bases, and the control registers are AXI-Lite.  The kernels close timing
-at 300 MHz out of context; the board runs the PL at 100 MHz.  Compile-time
+at 300 MHz out of context; the board runs them at 250 MHz (an MMCM in the
+block design, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)).  Compile-time
 bounds come from [`platforms/kv260.json`](platforms/kv260.json).
 
 | Kernel | ONNX ops | Highlights | Reference |

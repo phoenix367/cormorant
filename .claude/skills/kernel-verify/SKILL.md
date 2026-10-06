@@ -180,9 +180,10 @@ grep -E "^\| (CLB LUTs|CLB Registers|Block RAM Tile|DSPs) " kernels/matmul_rtl/s
 
 - `RESULT period=3.333ns WNS=…` must show WNS ≥ 0: the kernel closes
   timing at 300 MHz out of context (phase 5, 2026-10-05: WNS +0.015 ns,
-  18 379 LUT, 9 493 FF, 38 BRAM36, 0 URAM, 130 DSP — MATMUL_RTL_PLAN).  The PL clock is
-  100 MHz, so a small miss at 300 MHz does not break the bitstream; report
-  it, and a clear loss of Fmax is a finding (phase 2b's first fix lost
+  18 379 LUT, 9 493 FF, 38 BRAM36, 0 URAM, 130 DSP — MATMUL_RTL_PLAN).  The kernels
+  run at 250 MHz in the block design (FMAX_250_PLAN), where routing across
+  the device costs what out of context does not: a miss at 300 MHz is a
+  finding, and so is any clear loss of Fmax (phase 2b's first fix lost
   0.26 ns and was redone with precomputed config fields).
 - Resources against the record above; > 10 % more is a finding.
 - Its register map is checked by ctest `MatmulRtlDriver` and the fact

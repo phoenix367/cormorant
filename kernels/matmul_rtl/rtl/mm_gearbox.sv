@@ -64,18 +64,28 @@ module mm_gearbox
   assign adv = !o_valid || out_ready;
 
   // Beat production ------------------------------------------------------------
-  logic [3:0]  need;
+  // The beat's size and its end conditions are kept in registers beside the
+  // counters they derive from, so the window's consume / refill decision
+  // (whose enables reach 256 window bits) starts from registers:
+  //   off_end = off + min(row_rem, 8)    (the beat takes min(row_rem, 8) elements)
+  //   rlast   = row_rem <= 8             (the row's last beat)
+  //   rl1     = rows_left == 1
   logic [4:0]  off_end;
+  logic        rlast, rl1;
+  logic [3:0]  need_len;      // min(cur.len, 8): need at a row start
+  logic        rlast_len;     // cur.len <= 8
   logic        data_ok, fire, fire_mk, pop0, row_end, run_end;
 
-  assign need    = (row_rem >= 13'd8) ? 4'd8 : row_rem[3:0];
-  assign off_end = {2'b0, off} + {1'b0, need};
+  function automatic logic [3:0] f_need(input logic [12:0] n);
+    return (n >= 13'd8) ? 4'd8 : n[3:0];
+  endfunction
+
   assign data_ok = v0 && (off_end <= 5'd8 || v1);
   assign fire_mk = active && cur.marker && adv;
   assign fire    = active && !cur.marker && data_ok && adv;
   assign pop0    = fire && (off_end >= 5'd8);
-  assign row_end = fire && (row_rem == {9'b0, need});
-  assign run_end = fire_mk || (row_end && rows_left == 5'd1);
+  assign row_end = fire && rlast;
+  assign run_end = fire_mk || (row_end && rl1);
 
   logic [2*BW-1:0] win;
   logic [BW-1:0]   rot;
@@ -113,6 +123,7 @@ module mm_gearbox
   assign promote   = nxt_v && (!active || run_end);
   assign run_ready = !nxt_v;
 
+  // Control state (reset).
   always_ff @(posedge clk) begin
     if (rst) begin
       active  <= 1'b0;
@@ -121,69 +132,86 @@ module mm_gearbox
       v1      <= 1'b0;
       o_valid <= 1'b0;
     end else begin
-      // Lookahead descriptor.
-      if (run_valid && run_ready) begin
-        nxt      <= run;
-        nxt_v    <= 1'b1;
-        words_nx <= '0;
-      end else if (promote) begin
-        nxt_v    <= 1'b0;
-      end
-      if (take_nx && !promote) words_nx <= words_nx + 12'd1;
+      if (run_valid && run_ready) nxt_v <= 1'b1;
+      else if (promote)           nxt_v <= 1'b0;
+      if (promote)      active <= 1'b1;
+      else if (run_end) active <= 1'b0;
+      v0 <= v0_c || (take && !v0_c);
+      v1 <= v1_c || (take && v0_c);
+      if (adv) o_valid <= fire || fire_mk;
+    end
+  end
 
-      // Current run.
-      if (promote) begin
-        active     <= 1'b1;
-        cur        <= nxt;
-        off        <= nxt.s;
-        row_rem    <= nxt.len;
-        rows_left  <= nxt.rows;
-        words_in   <= words_nx + (take_nx ? 12'd1 : 12'd0);
-        beat_i     <= '0;
-        row_i      <= '0;
-        first_beat <= 1'b1;
-      end else begin
-        if (run_end) active <= 1'b0;
-        if (take && !take_nx) words_in <= words_in + 12'd1;
-        if (fire || fire_mk) first_beat <= 1'b0;
-        if (fire) begin
-          off <= off_end[2:0];
-          if (row_end) begin
-            row_rem   <= cur.len;
-            rows_left <= rows_left - 5'd1;
-            beat_i    <= '0;
-            row_i     <= row_i + 5'd1;
-          end else begin
-            row_rem   <= row_rem - {9'b0, need};
-            beat_i    <= beat_i + 9'd1;
-          end
+  // Descriptors, counters, window and output data: no reset (each is loaded
+  // by its own event before it is used), so the job reset only reaches the
+  // control bits above.
+  always_ff @(posedge clk) begin
+    // Lookahead descriptor.
+    if (run_valid && run_ready) begin
+      nxt      <= run;
+      words_nx <= '0;
+    end
+    if (take_nx && !promote) words_nx <= words_nx + 12'd1;
+
+    // Current run.
+    if (promote) begin
+      cur        <= nxt;
+      off        <= nxt.s;
+      row_rem    <= nxt.len;
+      rows_left  <= nxt.rows;
+      off_end    <= {2'b0, nxt.s} + {1'b0, f_need(nxt.len)};
+      rlast      <= (nxt.len <= 13'd8);
+      rl1        <= (nxt.rows == 5'd1);
+      need_len   <= f_need(nxt.len);
+      rlast_len  <= (nxt.len <= 13'd8);
+      words_in   <= words_nx + (take_nx ? 12'd1 : 12'd0);
+      beat_i     <= '0;
+      row_i      <= '0;
+      first_beat <= 1'b1;
+    end else begin
+      if (take && !take_nx) words_in <= words_in + 12'd1;
+      if (fire || fire_mk) first_beat <= 1'b0;
+      if (fire) begin
+        off <= off_end[2:0];
+        if (rlast) begin
+          // the next row: row_rem = cur.len
+          row_rem   <= cur.len;
+          rows_left <= rows_left - 5'd1;
+          off_end   <= {2'b0, off_end[2:0]} + {1'b0, need_len};
+          rlast     <= rlast_len;
+          rl1       <= (rows_left == 5'd2);
+          beat_i    <= '0;
+          row_i     <= row_i + 5'd1;
+        end else begin
+          // row_rem > 8, the beat took 8: row_rem - 8 left, off unchanged
+          logic [3:0] nn;
+          nn = (row_rem >= 13'd16) ? 4'd8 : {1'b0, row_rem[2:0]};
+          row_rem   <= row_rem - 13'd8;
+          off_end   <= {2'b0, off_end[2:0]} + {1'b0, nn};
+          rlast     <= (row_rem <= 13'd16);
+          beat_i    <= beat_i + 9'd1;
         end
       end
+    end
 
-      // Window.
-      if (sh_c) w0 <= w1;
-      v0 <= v0_c;
-      v1 <= v1_c;
-      if (take) begin
-        if (!v0_c) begin w0 <= in_data; v0 <= 1'b1; end
-        else       begin w1 <= in_data; v1 <= 1'b1; end
-      end
+    // Window.
+    if (sh_c) w0 <= w1;
+    if (take) begin
+      if (!v0_c) w0 <= in_data;
+      else       w1 <= in_data;
+    end
 
-      // Output register.
-      if (adv) begin
-        o_valid <= fire || fire_mk;
-        if (fire || fire_mk) begin
-          out_data      <= rot;
-          out_marker    <= cur.marker;
-          out_row_first <= fire && (beat_i == '0);
-          out_row_last  <= fire && row_end;
-          out_run_first <= first_beat;
-          out_run_last  <= run_end;
-          out_beat      <= beat_i;
-          out_row       <= row_i;
-          out_meta      <= cur;
-        end
-      end
+    // Output register.
+    if (adv && (fire || fire_mk)) begin
+      out_data      <= rot;
+      out_marker    <= cur.marker;
+      out_row_first <= fire && (beat_i == '0);
+      out_row_last  <= fire && row_end;
+      out_run_first <= first_beat;
+      out_run_last  <= run_end;
+      out_beat      <= beat_i;
+      out_row       <= row_i;
+      out_meta      <= cur;
     end
   end
 

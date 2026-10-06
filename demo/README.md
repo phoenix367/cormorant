@@ -17,11 +17,11 @@ builds the speech library the server's `piper` backend loads.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.24 / 2.7 ms per image) |
-| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 47.4 ms = 21.1 FPS at 100 MHz) |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.111 / 1.249 ms per image) |
+| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 20.5 ms = 48.8 FPS at 250 MHz) |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
-| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (839 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~10 tokens/s, 360M ~3.9 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.0–1.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
+| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (541 ms per inference) |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~18.3 tokens/s, 360M ~7.3 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.0–1.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
 | [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.7 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
 
 ## Common workflow
@@ -67,7 +67,9 @@ performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
   `fabric_matmul` / `fabric_conv` / `fabric_pool`), `gcc` / `cmake` /
   `make`, the XRT runtime, and passwordless `sudo`.  The numbers in the
   demo READMEs were measured with the 128-bit block design
-  (`hw/cormorant_hw_128`, `-DAXI_BUS_WIDTH=128`) at 100 MHz.  The
+  (`hw/cormorant_hw_128`) at 100 MHz, the dated transcripts; since
+  FMAX_250_PLAN the kernels run at 250 MHz (the current numbers are in the
+  root README's results).  The
   `camera/` demo additionally needs an Intel RealSense camera plus
   `pyrealsense2` / OpenCV on the board — see its README.
 

@@ -69,6 +69,7 @@ struct Memory {
 struct Timing {
   double p_arready = 1.0, p_rvalid = 1.0, p_awready = 1.0, p_wready = 1.0, p_bvalid = 1.0;
   int    lat_min = 20, lat_max = 20;   // AR accept -> first R beat
+  int    b_lat = 0;                    // extra cycles before a burst's B response
 };
 
 // ---------------------------------------------------------------------------
@@ -233,7 +234,7 @@ struct AxiWriteSlave {
       if (last) {
         wbeat = 0;
         aw.pop_front();
-        b_due.push_back(g_cycle + 3 + (g_cycle % 7));
+        b_due.push_back(g_cycle + 3 + (g_cycle % 7) + (uint64_t)t->b_lat);
       } else {
         wbeat++;
       }

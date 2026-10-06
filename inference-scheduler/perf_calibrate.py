@@ -55,7 +55,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 sys.path.insert(0, str(HERE))
 
-from src.perf_calls import KernelCall, local_bitstream_id, local_board_bin  # noqa: E402
+from src.perf_calls import (KernelCall, local_bitstream_id, local_board_bin,  # noqa: E402
+                            local_kernel_clock_mhz)
 
 PLATFORM = "kv260"
 MODELS_DIR = HERE / "perf_models" / PLATFORM
@@ -63,7 +64,9 @@ CHAT = REPO / "demo" / "chat"
 TTS = REPO / "demo" / "tts"
 RUNNER_VERSION = 1
 KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P"}
-MHZ = 100.0
+# the kernels' clock of the local bitstream (its HWH): turns the cost model's
+# cycles into the per-call time estimates that size iterations and timeouts
+MHZ = local_kernel_clock_mhz() or 100.0
 
 SHIPPED = ("mnist_convnet", "mnist_lenet", "mobilenet_v1", "mobilenet_v2", "resnet18", "bert",
            "smollm2-135m-instruct", "smolvlm-256m-instruct", "smollm2-360m-instruct",

@@ -2,6 +2,7 @@
 set rtl_files [list \
   $root/rtl/mm_pkg.sv \
   $root/rtl/mm_fifo.sv \
+  $root/rtl/mm_rs.sv \
   $root/rtl/mm_gearbox.sv \
   $root/rtl/mm_axi_rd.sv \
   $root/rtl/mm_axi_wr.sv \

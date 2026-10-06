@@ -344,7 +344,9 @@ order from the performance model) **951.3 ms**, bit-exact
 project (2026-10-06): p50 865.1 ms.  **Latest**, regenerated with the RTL
 ConvKernel's cost model, which puts the 12 attention P·V MatMuls on
 ConvKernel too (CONV_RTL_PLAN phase 3, 2026-10-06, all 50
-examples): p50 **839.2 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
+examples): p50 839.2 ms.  **Latest**, the kernels at 250 MHz (bitstream
+986cef4866a0, FMAX_250_PLAN, 2026-10-06, the same project, all 50
+examples): p50 **541.2 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 
