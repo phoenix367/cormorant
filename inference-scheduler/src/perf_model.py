@@ -43,6 +43,8 @@ def family(c: KernelCall) -> str:
     if c.kernel == "MatmulKernel":
         return "mm-gemv" if f["gemv_kw"] else "mm-tiled"
     if c.kernel == "VectorOPKernel":
+        if f["op"] in (10, 11):
+            return "vecop-smx"
         return "vecop-div" if f["op"] == 3 else "vecop"
     return "pool"
 
@@ -176,6 +178,17 @@ def features(c: KernelCall) -> Dict[str, float]:
         n, k, m, bt = f["n"], f["k"], f["m"], f["batch"]
         return {"b_words": bt * n * k * m / 8.0, "rows": bt * n, "k_words": bt * n * k / 8.0,
                 "m": bt * n * m, "one": 1.0, **_rtl_terms(f)}
+    if fam == "vecop-smx":
+        # the softmax unit (vo_smx): one unit (a row, or 16 query columns) at a
+        # time — its words in, e twice (EXP and OUT reads), one division per
+        # vector (25 cycles), P words out
+        nw = math.ceil(f["size"] / 8)
+        if f["op"] == 11:
+            blocks = f["outer"] // 16
+            return {"words": blocks * 2.0 * f["size"], "out_words": blocks * 16.0 * nw,
+                    "units": float(blocks), "divs": 16.0 * blocks, "one": 1.0}
+        return {"words": float(f["outer"] * nw), "out_words": float(f["outer"] * nw),
+                "units": float(f["outer"]), "divs": float(f["outer"]), "one": 1.0}
     if fam in ("vecop", "vecop-div"):
         words = f["outer"] * math.ceil(f["size"] / 8)
         unary = f["op"] in (4, 5)

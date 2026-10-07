@@ -6,7 +6,8 @@ For the examples in assets/preprocessed/inputs.bin computes
 
   float  bert_study.py's float32 numpy interpreter (matches onnxruntime to
          4e-6) — every example                          [N, 2, seq] float32
-  emu    bert_study.py policy "sched": the op-by-op Q8.8 emulation of the
+  emu    bert_study.py policy "sched" ("sched+vsmx" where the platform has
+         VectorOPKernel's softmax unit): the op-by-op Q8.8 emulation of the
          partition the scheduler generates — every example
                                                         [N, 2, seq] int16 bits
   sim    the scheduler's own simulation (OnnxGraph + CodeGenerator
@@ -57,12 +58,19 @@ def _worker_init(cfg: dict) -> None:
     _W["cfg"] = cfg
 
 
+def emu_policy() -> str:
+    """The study policy the scheduler's partition computes: its Softmax on
+    VectorOPKernel's softmax unit where the platform has it."""
+    from src.smx_nodes import enabled
+    return "sched+vsmx" if enabled() else "sched"
+
+
 def _study():
     if "bs" not in _W:
         bs = import_study(_W["cfg"])
         _W["bs"] = bs
         _W["float"] = bs.Bert(bs.MODEL)
-        _W["sched"] = bs.Bert(bs.MODEL, bs.POLS["sched"], base=_W["float"])
+        _W["sched"] = bs.Bert(bs.MODEL, bs.POLS[emu_policy()], base=_W["float"])
     return _W["bs"], _W["float"], _W["sched"]
 
 
@@ -101,7 +109,7 @@ def code_keys(cfg: dict) -> dict:
     model_id = f"{m.resolve()}:{st.st_size}:{int(st.st_mtime)}"
     study = sha1_of_files([SCRIPTS_DIR / "bert_study.py"])
     sched = sha1_of_files(sorted((SCHED_DIR / "src").rglob("*.py")))
-    return {"study": hashlib.sha1(f"{model_id}|{study}".encode()).hexdigest()[:16],
+    return {"study": hashlib.sha1(f"{model_id}|{study}|{emu_policy()}".encode()).hexdigest()[:16],
             "sim": hashlib.sha1(f"{model_id}|{sched}".encode()).hexdigest()[:16]}
 
 

@@ -24,14 +24,20 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/6436623029f7** (2026-10-06), the 250 MHz bitstream with
+Current model: **kv260/588d721997cb** (2026-10-07), the 250 MHz bitstream with
+VectorOPKernel's softmax unit (SOFTMAX_PLAN): a fresh case list (1443 cases, the softmax calls
+among them), three refinement rounds (139 + 126 + 78; a fourth would add 27), then the prefill
+softmax at every runtime key count (72 calls) to 1858 exact calls, and
+`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.057 %.  Note: `calib_runner.c` writes the softmax registers for ops
+10 / 11 only, as the generated `run_softmax()` — written on every VectorOP call they cost
+~80 ns per call (the first pass of this campaign; its 99 element-wise calls were re-measured).
+Before it, **kv260/6436623029f7** (2026-10-06), the 250 MHz bitstream with
 VectorOPKernel's activation unit (ACTIVATIONS_PLAN): a fresh case list (BERT's GELUs became
 VectorOP calls; 1402 cases), one pass and three refinement rounds (157 + 103 + 67); topped up
 on 2026-10-07 (OFFLOAD_PLAN: SmolVLM's GELU and Piper's decoder sums on VectorOP) with a fresh
 case list (1406), `run --resume` and three rounds (125 + 29 + 5) to 1852, then for the chat
 libraries' decode attention on ConvKernel (KV_DECODE_PLAN) a fresh case list (1438) and two
-rounds (118 + 26) to 1930 exact calls, and
-`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.078 %,
+rounds (118 + 26): 1930 exact calls, `host.json` as above; repeat spread median 0.078 %,
 `clock_mhz` 250 (perf_fit takes it from the local HWH).  Its family fits are loose (held-out
 p90 9–62 %): the ConvKernel features are the engine cost model's walk with the frozen 100 MHz
 parameters (`cost_model.RTL_CONV_FEATURES`, so refitting the cost model —
@@ -87,7 +93,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 6436623029f7 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 588d721997cb today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`

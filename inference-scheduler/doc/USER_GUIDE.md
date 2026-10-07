@@ -122,6 +122,7 @@ inside `inference_run()`.  Full semantics and restrictions:
 | `LeakyRelu` | `VECTOROP_LEAKY_RELU` (6) | unary | `c[i] = a[i] ≥ 0 ? a[i] : alpha · a[i]` — alpha quantised to 2⁻¹⁶, 0 ≤ alpha < 1 |
 | `x · Sigmoid(x)` (`Mul` + `Sigmoid`) | `VECTOROP_SILU` (7) | unary | `c[i] = a[i] · sigmoid(a[i])` (SiLU / Swish) |
 | `Gelu` (`approximate` none / tanh, or a fused GELU pattern) | `VECTOROP_GELU` (8), `VECTOROP_GELU_TANH` (9) | unary | `c[i] = a[i] · Φ(a[i])` — or the host op when its constants give another Q8.8 function |
+| `Softmax` (last axis, rows ≤ 2048, 16-byte aligned rows) | `VECTOROP_SOFTMAX` (10) | unary | the softmax unit's integer softmax of each row (within 1 LSB of the exact one; `src/vectorop_smx.py`) — only where the platform has the unit, else the host op |
 
 The last three run in VectorOPKernel's activation unit
 ([ACTIVATIONS_PLAN](../../doc/plans/ACTIVATIONS_PLAN.md)): the exact function
@@ -132,6 +133,16 @@ models an older bitstream (then `Gelu` runs on the host, `LeakyRelu` and SiLU
 are rejected), and a program that uses the unit checks the IP in
 `inference_init()`.  Only on `ap_fixed<16,8>` tensors without a power-of-two
 exponent.
+
+`Softmax` runs in VectorOPKernel's softmax unit
+([SOFTMAX_PLAN](../../doc/plans/SOFTMAX_PLAN.md), `src/smx_nodes.py`) where the
+platform JSON's `kernels.vectorop.softmax` (or `AXI_VECTOROP_SOFTMAX=1`) says the
+bitstream has it: an integer approximation (a 4 096-entry exponential table,
+an exact sum, one division per row) within one LSB of the exact softmax — not
+bit-identical to the host op, whose numbers it replaces in the simulation and
+the expected outputs.  The unit also runs the attention softmax of the Llama
+prefill and the vision encoder when their frontends are built with `vsmx=True`
+(the chat generators' `--vsmx`).
 
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
@@ -192,7 +203,7 @@ All pool variants support configurable stride, padding, and dilation.
 ### Host-CPU ops
 
 Run on the A53 inside `inference_run()` (double arithmetic, round-half-even
-write-back, multi-threaded): `Softmax` (last axis), `LayerNormalization`,
+write-back, multi-threaded): `Softmax` (last axis; on VectorOPKernel where the platform has the softmax unit, above), `LayerNormalization`,
 `Gelu`, `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0), `OneHot`,
 `Cast` (integer ↔ `Data_t`), `SpaceToDepth`, and the Llama decoder,
 vision-encoder (SmolVLM) and text-to-speech (Piper) ops of the custom domain `axi.llm`.
@@ -806,7 +817,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1678 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1691 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

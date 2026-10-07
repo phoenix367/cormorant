@@ -7,14 +7,18 @@ GELU tanh as ops 6-9 and acts 3-6, and the ``alpha`` register.  An IP without
 it passes ops 6-9 through unchanged and ignores acts 3-6, so the scheduler
 maps ONNX ``Gelu`` / ``LeakyRelu`` / ``x * Sigmoid(x)`` onto the kernel only
 when it is true (a generated program also checks for the unit at
-``inference_init()``).
+``inference_init()``).  ``softmax`` says whether it carries the softmax unit
+(doc/plans/SOFTMAX_PLAN.md: ops 10 / 11 and the smx_cm / smx_cfg / smx_mask
+registers); without it the softmax nodes compute their specification on the
+host.
 
-JSON shape (only the field this module reads)::
+JSON shape (only the fields this module reads)::
 
     {
       "kernels": {
         "vectorop": {
-          "activations": true
+          "activations": true,
+          "softmax": true
         }
       }
     }
@@ -23,8 +27,9 @@ Platform selection as for the other kernels (``_matmul_hw_config``): the
 ``AXI_PLATFORM`` environment variable picks ``platforms/<name>.json``,
 default ``kv260``.  ``AXI_VECTOROP_ACTIVATIONS`` (``0`` / ``1``) overrides
 the JSON for the scheduler — ``0`` for a project on a bitstream built before
-the activation unit (``986cef4866a0`` and older).  A missing or malformed
-field raises ``VectoropHwConfigError``.
+the activation unit (``986cef4866a0`` and older); ``AXI_VECTOROP_SOFTMAX``
+likewise for the softmax unit (``6436623029f7`` and older lack it).  A missing
+or malformed field raises ``VectoropHwConfigError``.
 """
 from __future__ import annotations
 
@@ -42,9 +47,29 @@ class VectoropHwConfigError(RuntimeError):
     """Platform JSON is missing / malformed for the vectorop kernel."""
 
 
+def _flag(section, key, path, what, env_name) -> bool:
+    try:
+        v = section[key]
+    except (KeyError, TypeError) as e:
+        raise VectoropHwConfigError(
+            f"Platform JSON {path}: 'kernels.vectorop.{key}' is required "
+            f"(true when the bitstream's VectorOPKernel has the {what}).") from e
+    if not isinstance(v, bool):
+        raise VectoropHwConfigError(
+            f"Platform JSON {path}: 'kernels.vectorop.{key}' must be true or "
+            f"false, got {v!r}.")
+    env = os.environ.get(env_name)
+    if env:
+        if env not in ("0", "1"):
+            raise VectoropHwConfigError(f"{env_name} must be 0 or 1, got {env!r}.")
+        v = env == "1"
+    return v
+
+
 def resolve(platform_name: str = None) -> Dict[str, object]:
-    """``{"VECTOROP_ACTIVATIONS": bool}`` for the given platform (``None``:
-    ``AXI_PLATFORM``, else ``kv260``), ``AXI_VECTOROP_ACTIVATIONS`` applied."""
+    """``{"VECTOROP_ACTIVATIONS": bool, "VECTOROP_SOFTMAX": bool}`` for the
+    given platform (``None``: ``AXI_PLATFORM``, else ``kv260``),
+    ``AXI_VECTOROP_ACTIVATIONS`` / ``AXI_VECTOROP_SOFTMAX`` applied."""
     if platform_name is None:
         platform_name = os.environ.get("AXI_PLATFORM", _DEFAULT_PLATFORM)
     path = _PLATFORMS_DIR / f"{platform_name}.json"
@@ -58,27 +83,20 @@ def resolve(platform_name: str = None) -> Dict[str, object]:
         raise VectoropHwConfigError(f"Platform JSON {path} is not valid JSON: {e}") from e
     try:
         section = data["kernels"]["vectorop"]
-        act = section["activations"]
     except (KeyError, TypeError) as e:
         raise VectoropHwConfigError(
-            f"Platform JSON {path}: 'kernels.vectorop.activations' is required "
-            f"(true when the bitstream's VectorOPKernel has the activation unit).") from e
-    if not isinstance(act, bool):
-        raise VectoropHwConfigError(
-            f"Platform JSON {path}: 'kernels.vectorop.activations' must be true or "
-            f"false, got {act!r}.")
-    env = os.environ.get("AXI_VECTOROP_ACTIVATIONS")
-    if env:
-        if env not in ("0", "1"):
-            raise VectoropHwConfigError(
-                f"AXI_VECTOROP_ACTIVATIONS must be 0 or 1, got {env!r}.")
-        act = env == "1"
-    return {"VECTOROP_ACTIVATIONS": act}
+            f"Platform JSON {path}: 'kernels.vectorop' is required.") from e
+    return {"VECTOROP_ACTIVATIONS": _flag(section, "activations", path, "activation unit",
+                                          "AXI_VECTOROP_ACTIVATIONS"),
+            "VECTOROP_SOFTMAX": _flag(section, "softmax", path, "softmax unit",
+                                      "AXI_VECTOROP_SOFTMAX")}
 
 
 _CFG = resolve()
 
-# Exported: whether the platform's VectorOPKernel has the activation unit.
+# Exported: whether the platform's VectorOPKernel has the activation unit, the
+# softmax unit.
 VECTOROP_ACTIVATIONS: bool = _CFG["VECTOROP_ACTIVATIONS"]
+VECTOROP_SOFTMAX: bool = _CFG["VECTOROP_SOFTMAX"]
 
-__all__ = ("VECTOROP_ACTIVATIONS", "VectoropHwConfigError", "resolve")
+__all__ = ("VECTOROP_ACTIVATIONS", "VECTOROP_SOFTMAX", "VectoropHwConfigError", "resolve")

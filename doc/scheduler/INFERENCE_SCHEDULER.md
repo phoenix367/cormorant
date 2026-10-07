@@ -152,7 +152,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1678 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1691 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -545,7 +545,7 @@ ResNet-18's 300 KB, dominated by the non-cacheable read).
 
 | ONNX op | Node | Semantics / restrictions |
 |---|---|---|
-| `Softmax` | `SoftmaxNode` | opset ≥ 13: last axis only; opset < 13: "coerce to 2-D", i.e. rows of `prod(shape[axis:])` (BERT's `axis = 3` on rank 4 is the last axis) |
+| `Softmax` | `SoftmaxNode` | opset ≥ 13: last axis only; opset < 13: "coerce to 2-D", i.e. rows of `prod(shape[axis:])` (BERT's `axis = 3` on rank 4 is the last axis).  Where the platform has VectorOPKernel's softmax unit (`kernels.vectorop.softmax`) a Q8.8 Softmax of rows ≤ 2048 (16-byte aligned) is a `SoftmaxVopNode` instead (`src/smx_nodes.py`: one `OP_SOFTMAX` call, scores at 2⁻⁸, P at 2⁻⁸; the integer softmax of `src/vectorop_smx.py`, [SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)) |
 | `LayerNormalization` | `LayerNormNode` | over `prod(shape[axis:])`; scale / bias must be constants (kept float32, emitted as C arrays, never DMA weights); only the `Y` output |
 | `Gelu` | `GeluNode` | `approximate = "tanh"` / `"none"` (erf) |
 | `Transpose` | `TransposeNode` | any perm, ≤ 5 non-mergeable dims |
@@ -891,6 +891,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches — a decode step (no `n` input) flushes only its rows, `llm_cache_flush_rows` |
 | `LlmAttnScores` (ConvKernel) | `s_g[j][p] = floor(Σ_d K_g[j][d]·q_g[d][p] / 2^8)`, j < keys: MatMul on ConvKernel ([§MatMul on ConvKernel](#matmul-on-convkernel)) with weight = the K cache rows `[keys][HD]` of KV head g (`out_ch = keys`), x = the q image (`in_ch = HD/kw`, 1×kw), output `G·T` pixels |
 | `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
+| `LlmAttnSoftmax` with `vsmx = 1` (VectorOPKernel, `LlmAttnSoftmaxVopNode`) | the prefill under policy `…+vsmx` (`LlamaFrontend(vsmx=True)`): per head h' one `OP_SOFTMAX_T` call — s_g columns `h'·T … +T` (row stride `G·T`) → P_g rows `h'·T … +T` at row stride keys, over keys = roundup(pos + n, Q), row t valid over keys `j < min(keys, pos + 1 + t)` (`smx_mask` valid0 = pos + 1, period = T); the integer softmax of `src/vectorop_smx.py` with Cm / Cs from f_s and 1/√HD.  Padded rows t ≥ n are computed too (they feed padded rows only); decode steps keep the host op |
 | `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
 | `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw) |
 
@@ -940,6 +941,10 @@ policy pow2+p12, which the simulation reproduces bit for bit):
     qk0, qk1, then per head softmax(g), pv(g), qk(g + 2): qk(g + 1) runs
     on ConvKernel under softmax(g), and the CPU waits only for the short
     P.V before issuing the next qk.
+  - `VitFrontend(vsmx=True)` (policy `pow2+p12+vgelu+vsmx`): every
+    `VitAttnSoftmax` carries `vsmx = 1` and runs as one `OP_SOFTMAX_T` call on
+    VectorOPKernel's softmax unit (`VitAttnSoftmaxVopNode`, every key valid) —
+    the platform must have the unit.
   - `VitFrontend(attn_split=R)` (default 1) splits every head's softmax and
     P.V into R query-row parts (`VitAttnSoftmax` attribute `cols`,
     `LlmAttnMerge` `row_splits`).  Bit-identical, but it simulates no
@@ -1110,7 +1115,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (448 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (434 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1130,7 +1135,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 907 predicted.
+  board (0.12 ms at 250 MHz), 34 921 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

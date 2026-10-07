@@ -145,7 +145,6 @@ def graph_calls(g, top_conv_per_rows: int = 3) -> Dict[str, Tuple[KernelCall, st
     calls (a runtime-keys attention call at every key count), and every
     MatMul tactic's calls (conv plans: the model's top few per row count)."""
     from src.codegen import CodeGenerator
-    from src.llm_nodes import LlmAttnConvNode
     from src.tactics import graph_matmul_tactics
     cg = CodeGenerator(g, model_path="calib.onnx")
     lay = cg._layouts
@@ -160,7 +159,7 @@ def graph_calls(g, top_conv_per_rows: int = 3) -> Dict[str, Tuple[KernelCall, st
         if not (getattr(type(sn), "kernel_name", "") and hasattr(sn, "kernel_calls")):
             continue
         label = sn.onnx_node.name or f"{sn.onnx_node.op_type}_{sn.index}"
-        if isinstance(sn, LlmAttnConvNode) and not sn.static:
+        if getattr(sn, "static", True) is False:      # runtime keys: q.K^T / P.V, the softmax
             for keys in range(sn.Q, sn.C + 1, sn.Q):
                 add(sn.kernel_calls(lay, keys=keys), f"{label}@{keys}")
         else:
@@ -333,6 +332,17 @@ def buffer_sizes(c: KernelCall) -> List[int]:
     from src._matmul_hw_config import MATMUL_TILE_M
     f = c.fields
     pad = 256
+    if c.kernel == "VectorOPKernel" and f["op"] in (10, 11):
+        # the softmax (doc/plans/SOFTMAX_PLAN.md): no b, c at the b stride; column
+        # mode reads size key rows of outer queries, writes outer & ~15 rows
+        span = _up(f["size"], 8)
+        if f["op"] == 11:
+            a = (f["size"] - 1) * f["a_inc"] + _up(f["outer"], 8)
+            rows = f["outer"] // 16 * 16
+        else:
+            a = (f["outer"] - 1) * f["a_inc"] + span
+            rows = f["outer"]
+        return [a + pad, 8 + pad, max(rows - 1, 0) * f["b_inc"] + span + pad]
     if c.kernel == "VectorOPKernel":
         span = _up(f["size"], 8)
         a = (f["outer"] - 1) * f["a_inc"] + span
@@ -375,6 +385,10 @@ def estimate_us(c: KernelCall) -> float:
     elif c.kernel == "MatmulKernel":
         cyc = (gemv_cycles(f["n"], f["k"], f["m"], f["batch"], f["gemv_kw"]) if f["gemv_kw"]
                else matmul_cycles(f["n"], f["k"], f["m"], f["batch"]))
+    elif c.kernel == "VectorOPKernel" and f["op"] in (10, 11):
+        # vo_smx with ideal memory (SOFTMAX_PLAN §4.2)
+        cyc = (60 + f["outer"] // 16 * (455 + 6 * f["size"]) if f["op"] == 11
+               else 75 + f["outer"] * (58 + 3 * math.ceil(f["size"] / 8)))
     elif c.kernel == "VectorOPKernel":
         cyc = f["outer"] * math.ceil(f["size"] / 8) * (8 if f["op"] == 3 else 1) + 500
     else:

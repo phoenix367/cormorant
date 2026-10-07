@@ -95,6 +95,10 @@ OP_LEAKY_RELU = 6
 OP_SILU       = 7
 OP_GELU       = 8
 OP_GELU_TANH  = 9
+# The softmax ops (doc/plans/SOFTMAX_PLAN.md; src/smx_nodes.py): row mode and
+# column mode, with the smx_cm / smx_cfg / smx_mask registers (run_softmax).
+OP_SOFTMAX    = 10
+OP_SOFTMAX_T  = 11
 
 # Human-readable names for comments
 OP_NAMES = {
@@ -108,6 +112,8 @@ OP_NAMES = {
     OP_SILU:       "VECTOROP_SILU",
     OP_GELU:       "VECTOROP_GELU",
     OP_GELU_TANH:  "VECTOROP_GELU_TANH",
+    OP_SOFTMAX:    "VECTOROP_SOFTMAX",
+    OP_SOFTMAX_T:  "VECTOROP_SOFTMAX_T",
 }
 
 # Fused-activation codes for the kernel's `act` register (must match the

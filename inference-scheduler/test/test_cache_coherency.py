@@ -41,6 +41,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 import onnx
 import onnx.helper as oh
@@ -49,6 +50,7 @@ import numpy as np
 from onnx import TensorProto
 
 import gen_bert_models as gbm
+from src import _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import HostNode
@@ -68,6 +70,8 @@ _KERNEL_CALLS = {
     # y, y_off, ...); asynchronous like run_conv — the next call waits.
     "run_conv_at":   ("KERNEL_CONV",     (0, 2), (4,), False),
     "run_pool":      ("KERNEL_POOL",     (0,), (1,), False),
+    # the softmax unit (a, a_off, c, c_off, ...; src/smx_nodes.py)
+    "run_softmax":   ("KERNEL_VECTOROP", (0,), (2,), False),
 }
 
 _TOKEN = re.compile(
@@ -78,7 +82,7 @@ _TOKEN = re.compile(
     # previous call — a no-op when nothing of that lane is in flight yet.
     r"|if\s*\(\s*_i\s*\)\s*kernel_wait\((?P<cwait>KERNEL_\w+)\)"
     r"|kernel_wait\((?P<wait>KERNEL_\w+)\)"
-    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool))\((?P<args>[^;]*)\);"
+    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool|softmax))\((?P<args>[^;]*)\);"
     r"|\bllm_cache_flush\(\s*(?P<sflush>\w+)\s*,"
     r"|INFERENCE_PROF_BEGIN\((?P<begin>\d+)u\)"
     r"|INFERENCE_PROF_END\((?P<end>\d+)u\)"
@@ -352,7 +356,9 @@ class TestMixedModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
-        cls.cg = _gen(_mixed_model(os.path.join(cls._tmp.name, "mixed.onnx")))
+        # the Softmax as the host op (the hand-offs around host ops are the point)
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False):
+            cls.cg = _gen(_mixed_model(os.path.join(cls._tmp.name, "mixed.onnx")))
         cls.src = cls.cg.generate_source()
 
     @classmethod

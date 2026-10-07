@@ -35,6 +35,8 @@ from src import _vectorop_hw_config
 # These test the host GELU op: on a platform with VectorOPKernel's activation
 # unit a matching Gelu runs there instead (test_activations.py).
 _host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
+# the host Softmax (VectorOP's softmax unit: test_softmax_unit.py)
+_host_softmax = mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False)
 
 DT = AP_FIXED_16_8
 _CC = shutil.which("cc") or shutil.which("gcc")
@@ -206,6 +208,7 @@ class TestRounding(_Base):
         np.testing.assert_array_equal(q, [0, 2, 2, 0, -2])
 
 
+@_host_softmax
 class TestSoftmax(_Base):
 
     def test_last_axis_random(self):

@@ -1255,6 +1255,9 @@ class LlmAttnSoftmaxNode(LlmNode):
         sn._want(pos, "i32", "pos")
         if n is not None:
             sn._want(n, "i32", "n")
+        from .smx_nodes import LlmAttnSoftmaxVopNode, vsmx_attr
+        if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
+            return LlmAttnSoftmaxVopNode.from_host(sn, node)
         return sn
 
     def c_runtime(self):

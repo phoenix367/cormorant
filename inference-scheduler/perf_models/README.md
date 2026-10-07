@@ -18,8 +18,17 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/6436623029f7` is the production design (2026-10-06, ACTIVATIONS_PLAN: `986cef4866a0`
-plus VectorOPKernel's activation unit): 1930 calls, `clock_mhz` 250, repeat spread median
+`kv260/588d721997cb` is the production design (2026-10-07, SOFTMAX_PLAN: `6436623029f7` plus
+VectorOPKernel's softmax unit): 1858 calls, `clock_mhz` 250, repeat spread median 0.057 %.  A
+fresh case list (1443 cases: BERT's, SmolVLM's and the prefills' softmaxes on VectorOP), three
+refinement rounds (139 + 126 + 78 calls; a fourth would add 27), then the prefill softmax at
+every runtime key count (`LlmAttnSoftmaxVopNode` is priced at `keys_of(sn)` keys, as the
+attention convs are: 72 calls).  The simulator against the board: the CNNs, BERT, SmolLM2-135M
+and SmolVLM within ±2 %; SmolLM2-360M's prefill 16 −12 %, 256 +4 % (its host ops priced by the
+kinds' fits).  `host.json` unchanged.
+
+Before it, `kv260/6436623029f7` — the production design from 2026-10-06 to 2026-10-07
+(ACTIVATIONS_PLAN: `986cef4866a0` plus VectorOPKernel's activation unit) — had 1930 calls, `clock_mhz` 250, repeat spread median
 0.078 %.  First a fresh case list (BERT's 12 GELUs now ride on VectorOP Adds; 1402 cases) and three
 refinement rounds (157 + 103 + 67 calls) to 1729 calls; topped up on 2026-10-07 (OFFLOAD_PLAN:
 SmolVLM's vision GELU and Piper's decoder sums on VectorOP, the engine cost model refitted) with a

@@ -449,6 +449,9 @@ class VitAttnSoftmaxNode(VitNode):
                  c0=c0, nc=nc, F=ctx.frac_bits)
         sn._want(s, None, "scores")
         sn._want(y, None, "output")
+        from .smx_nodes import VitAttnSoftmaxVopNode, vsmx_attr
+        if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
+            return VitAttnSoftmaxVopNode.from_host(sn, node)
         return sn
 
     def c_runtime(self):

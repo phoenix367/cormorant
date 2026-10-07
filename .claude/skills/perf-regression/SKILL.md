@@ -1,5 +1,5 @@
 ---
-description: Run the KV260 performance tests and say whether anything regressed — the 60 kernel benchmarks of run_remote_perf.py (VectorOP, Matmul, Conv, Pool) and, optionally, the MNIST / image-classification / BERT-SQuAD demo latencies — compared case by case with the recorded baseline of the loaded bitstream (baselines/<platform>-<bitstream-id>.json): latency moves above 2 %, failed cases and changed demo results are flagged, a new baseline is recorded on request. Use when asked to run the perf tests or check for a performance regression, after a kernel, bitstream or scheduler change that is already correct on the board, and before quoting board numbers in an optimisation log.
+description: Run the KV260 performance tests and say whether anything regressed — the 63 kernel benchmarks of run_remote_perf.py (VectorOP, Matmul, Conv, Pool) and, optionally, the MNIST / image-classification / BERT-SQuAD demo latencies — compared case by case with the recorded baseline of the loaded bitstream (baselines/<platform>-<bitstream-id>.json): latency moves above 2 %, failed cases and changed demo results are flagged, a new baseline is recorded on request. Use when asked to run the perf tests or check for a performance regression, after a kernel, bitstream or scheduler change that is already correct on the board, and before quoting board numbers in an optimisation log.
 allowed-tools: Bash Read
 ---
 
@@ -54,9 +54,9 @@ directories on the board.
 ## 2. Bitstream id — which baseline
 
 ```bash
-BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 6436623029f7
+BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 588d721997cb
 (cd inference-scheduler && .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())")
-ls .claude/skills/perf-regression/baselines/                               # kv260-6436623029f7.json; kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
+ls .claude/skills/perf-regression/baselines/                               # kv260-588d721997cb.json; kv260-6436623029f7.json (no softmax unit); kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
 ```
 The board's id is what gets measured; always pass it (`--bitstream-id
 $BID`).  A local id that differs means the board runs another bitstream
@@ -77,7 +77,7 @@ cd inference-scheduler
     --json $TMPDIR/perf_$STAMP.json > $TMPDIR/perf_$STAMP.log 2>&1; echo "exit $?"
 grep -E "OVERALL|FAIL" $TMPDIR/perf_$STAMP.log; cd ..
 ```
-Pass = `exit 0` and `── OVERALL: All 60 cases passed ──` (26 s wall
+Pass = `exit 0` and `── OVERALL: All 63 cases passed ──` (26 s wall
 clock on 2026-09-29: connect + upload + build ≈ 10 s, the cases ≈ 15 s).
 Exit 1 = a case failed (its `ok` is false in the JSON; compare flags it
 FAILED).
@@ -91,14 +91,14 @@ Output shape (validation run 2026-09-29 14:31 against the 09:53 run, same bitstr
 the id shown is today's bitstream):
 ```
 kernels: baseline run 2026-09-29 09:53 (…/perf_20260929.json)
-platform kv260, bitstream 6436623029f7
+platform kv260, bitstream 588d721997cb
 
   section         case                         base ms     now ms   Δlat %   Δthr %  flag
   VectorOPKernel  ADD-1K                        0.0087     0.0088    +1.15    -0.57
   …
   ConvKernel      3x3-64ch-56x56                2.6830     2.6830    +0.00    +0.00
   …
-compared 60 cases (threshold ±2 %, min Δ 0.001 ms): 0 regressions, 0 improved, 0 failed, 0 result changes, 0 missing, 0 new, 0 redefined
+compared 63 cases (threshold ±2 %, min Δ 0.001 ms): 0 regressions, 0 improved, 0 failed, 0 result changes, 0 missing, 0 new, 0 redefined
 worst 5 (largest latency increase):
   VectorOPKernel/ADD-1K: 0.0087 -> 0.0088 ms (+1.15 %)
   PoolingKernel/GlobalAvgPool-7x7-64: 0.0254 -> 0.0255 ms (+0.39 %)

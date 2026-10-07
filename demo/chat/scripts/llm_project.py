@@ -47,12 +47,27 @@ PREFILL_ATTN = "fpga"
 DECODE_ATTN = "fpga"                   # the chat libraries since doc/plans/KV_DECODE_PLAN.md
 
 
-def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN) -> str:
-    """The study policy a project of these attention modes computes."""
+def vsmx_default() -> bool:
+    """The prefill softmax on VectorOPKernel's softmax unit (doc/plans/SOFTMAX_PLAN.md,
+    policy <attention policy>+vsmx) where the platform has the unit."""
+    from src.smx_nodes import enabled
+    return enabled()
+
+
+def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
+           vsmx: Optional[bool] = None) -> str:
+    """The study policy a project of these attention modes computes (``vsmx``
+    None: vsmx_default())."""
     if (prefill_attn, decode_attn) not in ATTN_POLICIES:
         raise ValueError(f"no policy for prefill attention {prefill_attn!r} with decode "
                          f"attention {decode_attn!r} (decode on the FPGA needs FPGA prefill)")
-    return ATTN_POLICIES[(prefill_attn, decode_attn)]
+    base = ATTN_POLICIES[(prefill_attn, decode_attn)]
+    if not (vsmx_default() if vsmx is None else vsmx):
+        return base
+    if (prefill_attn, decode_attn) != ("fpga", "fpga"):
+        raise ValueError("vsmx (the prefill softmax on VectorOPKernel) is studied with the FPGA "
+                         "attention in prefill and decode only")
+    return base + "+vsmx"
 
 
 POLICY = policy()
@@ -99,9 +114,12 @@ def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
 
 
 def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
-             prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN) -> LlamaFrontend:
+             prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
+             vsmx: Optional[bool] = None) -> LlamaFrontend:
+    vsmx = vsmx_default() if vsmx is None else vsmx
+    policy(prefill_attn, decode_attn, vsmx)                     # a studied combination
     return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn,
-                         decode_attn=decode_attn)
+                         decode_attn=decode_attn, vsmx=vsmx)
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:

@@ -108,7 +108,9 @@ one item), `basename`, `stem` and the plain builtins.
 
 A regex locator, `{file: F, regex: R}`, quotes the value in group 1. For a
 mapping value it uses named groups, one per key:
-`(?P<smollm2_135m>\d+)`. Each match is checked. Optional fields:
+`(?P<smollm2_135m>\d+)`; a group named `KEY__SUFFIX` quotes `KEY` again in
+the same match (`(?P<total>\d+) / (?P<total__d>\d+) passed`). Each match is
+checked. Optional fields:
 - `count: N`: the locator must match exactly N times;
 - `dotall: true`: `.` also matches newlines;
 - `format: EXPR`: how this text renders the value, an expression on `v`

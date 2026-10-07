@@ -96,7 +96,7 @@ and unbinds such a device before applying ours (2026-09-24); if
 ## 3. Run
 
 ```bash
-.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 156 models, ~10 min
+.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 159 models, ~10 min
 cd ../demo/image_classification && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
     && ../../inference-scheduler/.venv/bin/python scripts/deploy_and_run.py --verbose
 cd ../mnist && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \

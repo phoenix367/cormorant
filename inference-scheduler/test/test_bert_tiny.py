@@ -30,6 +30,7 @@ from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormN
 from src.nodes import (ACT_GELU, ACT_GELU_TANH, OP_ADD, MatmulConvNode, MatmulNode,
                        ScheduledNode, SchedulerError)
 from src.report import ReportGenerator
+from src.smx_nodes import SoftmaxVopNode, enabled as softmax_unit
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -90,7 +91,12 @@ class TestPartition(_Tiny):
                 g_host, _ = self.gen(m["path"])
             self.assertEqual(collections.Counter(type(sn) for sn in g_host.nodes)[GeluNode],
                              L, fname)
-            self.assertEqual(kinds[SoftmaxNode], L, fname)
+            # Softmax on VectorOP's softmax unit where the platform has it, else the host op
+            self.assertEqual(kinds[SoftmaxVopNode if softmax_unit() else SoftmaxNode], L, fname)
+            for on, kind in ((True, SoftmaxVopNode), (False, SoftmaxNode)):
+                with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", on):
+                    g_s, _ = self.gen(m["path"])
+                self.assertEqual(collections.Counter(type(sn) for sn in g_s.nodes)[kind], L, fname)
             self.assertEqual(kinds[TransposeNode], 4 * L + 1, fname)
             self.assertEqual(kinds[GatherNode], 1, fname)
             self.assertEqual(kinds[OneHotNode], 1, fname)
@@ -197,14 +203,14 @@ class TestNumerics(_Tiny):
     def test_bit_exact_vs_study_emulation(self):
         """The study's op-by-op numpy emulation of the scheduler partition
         (policy "sched": LayerNorm / GELU as their 12 / 8 separate nodes in
-        float64) equals the scheduler simulation bit for bit, on every DDR
-        tensor both materialise."""
+        float64; "sched+vsmx" with VectorOP's softmax unit) equals the scheduler
+        simulation bit for bit, on every DDR tensor both materialise."""
         bs = _study()
         for fname, m in self.models.items():
             if m["opset"] != 12:
                 continue                 # the study interpreter speaks opset 12 (bertsquad-12)
             _, cg = self.gen(m["path"])
-            bert = bs.Bert(m["path"], bs.POLS["sched"])
+            bert = bs.Bert(m["path"], bs.POLS["sched+vsmx" if softmax_unit() else "sched"])
             for seed in range(2):
                 feeds = gbm.random_feeds(m["path"], seed)
                 sim = cg._forward_pass({k: v.astype(np.float64) for k, v in feeds.items()})
@@ -247,8 +253,9 @@ class TestGeneratedC(_Tiny):
 
     def test_source_structure(self):
         m = self.models["bert_tiny_h32_l1.onnx"]
-        with mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False):
-            g, cg = self.gen(m["path"])         # GELU as the host op
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False), \
+                mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False):
+            g, cg = self.gen(m["path"])         # GELU and the softmax as host ops
         src = cg.generate_source()
         self.assertIn("#include <math.h>", src)
         self.assertIn('#  pragma GCC optimize ("fp-contract=off")', src)
@@ -339,7 +346,8 @@ class TestGeneratedC(_Tiny):
 
     def test_report(self):
         m = self.models["bert_tiny_h64_l2.onnx"]
-        g, cg = self.gen(m["path"])
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False):
+            g, cg = self.gen(m["path"])         # the softmax as the host op
         md = ReportGenerator(graph=g, codegen=cg, model_path=m["path"], out_dir="/tmp",
                              generated_files=[]).render_markdown()
         self.assertIn("**Pattern fusion** — 5 LayerNorm and 2 GELU subgraph(s)", md)

@@ -175,11 +175,14 @@ class VitFrontend:
     def __init__(self, cfg: VitConfig, weights: Dict[str, np.ndarray], formats: VisionFormats,
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
-                 attn_split: int = 1):
+                 attn_split: int = 1, vsmx: bool = False):
         """``attn_split`` R > 1 splits every head's softmax and P.V by query
         rows into R parts (TACTICS_PLAN §4.4): the CPU can then start the
-        next ConvKernel call between the parts (--plan's order search)."""
+        next ConvKernel call between the parts (--plan's order search).
+        ``vsmx`` (policy pow2+p12+vgelu+vsmx, doc/plans/SOFTMAX_PLAN.md): the
+        softmax on VectorOPKernel's softmax unit (VitAttnSoftmax vsmx = 1)."""
         self.cfg = cfg
+        self.vsmx = bool(vsmx)
         if attn_split < 1 or cfg.N % (attn_split * 16):
             raise ValueError(f"attn_split {attn_split}: {cfg.N} query rows not in parts of 16")
         self.attn_split = int(attn_split)
@@ -195,6 +198,9 @@ class VitFrontend:
         self.qk_kw = qk_kw
         if (cfg.D * cfg.scale ** 2) % self.conn_k:
             raise ValueError(f"connector K {cfg.D * cfg.scale ** 2} % chunk {self.conn_k}")
+
+    def _vsmx_attr(self) -> dict:
+        return dict(vsmx=1) if self.vsmx else {}
 
     def choose_qk_kw(self) -> int:
         """Kernel width of the q.K^T calls' q image: the cheapest by the conv
@@ -320,7 +326,7 @@ class VitFrontend:
 
             def softmax(g, s=s, p=p, e=e, fs=fs, fp=fp):
                 self._node("VitAttnSoftmax", [s[g]], [p[g]], f"{e}.softmax{g}", domain=LLM_DOMAIN,
-                           head_dim=HD, s_exp=[int(fs[g])], p_exp=[int(fp[g])])
+                           head_dim=HD, s_exp=[int(fs[g])], p_exp=[int(fp[g])], **self._vsmx_attr())
 
             def pv_(g, p=p, o=o, e=e):
                 self._node("LlmAttnPV", [p[g], vc], [o[g]], f"{e}.pv{g}", domain=LLM_DOMAIN,
@@ -332,7 +338,7 @@ class VitFrontend:
             def softmax_r(g, r, s=s, pr=None if R == 1 else pr, e=e, fs=fs, fp=fp, R=R):
                 self._node("VitAttnSoftmax", [s[g]], [pr[g][r]], f"{e}.softmax{g}r{r}",
                            domain=LLM_DOMAIN, head_dim=HD, s_exp=[int(fs[g])],
-                           p_exp=[int(fp[g])], cols=[r * (N // R), N // R])
+                           p_exp=[int(fp[g])], cols=[r * (N // R), N // R], **self._vsmx_attr())
 
             def pv_r(g, r, pr=None if R == 1 else pr, orr=None if R == 1 else orr, e=e):
                 self._node("LlmAttnPV", [pr[g][r], vc], [orr[g][r]], f"{e}.pv{g}r{r}",

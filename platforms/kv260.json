@@ -26,7 +26,8 @@
       "gemv_max_m": 4096
     },
     "vectorop": {
-      "activations": true
+      "activations": true,
+      "softmax": true
     },
     "pool": {
       "tile_c":            8,

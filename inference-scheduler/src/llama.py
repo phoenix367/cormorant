@@ -276,7 +276,11 @@ class LlamaFrontend:
                  ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
                  decode_attn: str = "host",
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
-                 image_rows: int = 0, image_state: str = "vlm.img"):
+                 image_rows: int = 0, image_state: str = "vlm.img", vsmx: bool = False):
+        # vsmx (policy pow2+sink+p12+vsmx, doc/plans/SOFTMAX_PLAN.md): the FPGA
+        # prefill's softmax on VectorOPKernel's softmax unit (LlmAttnSoftmax
+        # vsmx = 1, src/smx_nodes.py); decode steps keep the host softmax
+        self.vsmx = bool(vsmx)
         # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
         # LlmEmbed also reads image_state [image_rows][D] (float32 host state the
         # vision entry writes); ids V .. V + image_rows - 1 select its rows
@@ -453,11 +457,16 @@ class LlamaFrontend:
         def qk(g):
             self._node("LlmAttnScores", [kc, qx, pos, n], [s[g]], f"{e}.l{li}.qk{g}",
                        domain=LLM_DOMAIN, group=g, qk_kw=kw, **common)
+        if self.vsmx and n and T % 16:
+            raise ValueError(f"vsmx: prefill rows {T} must be a multiple of 16 (the softmax "
+                             f"unit's column blocks)")
+        vsmx = dict(vsmx=1) if (self.vsmx and n) else {}
+
         def softmax(g):
             hs = slice(g * G, (g + 1) * G)
             self._node("LlmAttnSoftmax", [s[g], pos, n], [p[g]], f"{e}.l{li}.softmax{g}",
                        domain=LLM_DOMAIN, group=g, s_exp=[int(x) for x in fs[hs]],
-                       p_exp=[int(x) for x in fp[hs]], **common)
+                       p_exp=[int(x) for x in fp[hs]], **common, **vsmx)
 
         def pv_(g):
             self._node("LlmAttnPV", [p[g], vc, pos, n], [o[g]], f"{e}.l{li}.pv{g}",

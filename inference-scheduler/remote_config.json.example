@@ -204,7 +204,10 @@
     "test/models/act_bias_gelu.onnx",
     "test/models/act_mul_leaky_relu.onnx",
     "test/models/act_div_silu.onnx",
-    "test/models/act_gelu_leaky_chain.onnx"
+    "test/models/act_gelu_leaky_chain.onnx",
+    "test/models/smx_rows_64.onnx",
+    "test/models/smx_rows_2048.onnx",
+    "test/models/smx_attention.onnx"
   ],
   "_models_note": "Model paths relative to the inference-scheduler directory. Overridden by --models on the command line."
 }

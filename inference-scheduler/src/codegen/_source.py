@@ -5,7 +5,7 @@ from typing import List
 
 import numpy as np
 
-from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulConvNode, MatmulNode, ScheduledNode,
+from ..nodes    import (ACT_NAMES, OP_NAMES, OP_SOFTMAX, MatmulConvNode, MatmulNode, ScheduledNode,
                         SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
@@ -70,7 +70,7 @@ class _SourceMixin:
     def _source_includes(self) -> str:
         stdio = '#include <stdio.h>    /* fopen, fread, snprintf, fprintf */\n' \
                 if (self.large_weight_tensors or self._host_nodes
-                    or self._uses_activation_unit) else ''
+                    or self._uses_activation_unit or self._uses_softmax_unit) else ''
         stdlib = '#include <stdlib.h>   /* malloc, free (host staging buffers) */\n' \
                 if (self._host_op_nodes or self._host_nodes) else ''
         mathh = '#include <math.h>     /* host ops: exp, sqrt, tanh, erf, nearbyint */\n' \
@@ -110,6 +110,8 @@ class _SourceMixin:
             return ""
         lines = [_banner("VectorOPKernel operation codes (must match VectorOP.h)")]
         for code, name in sorted(OP_NAMES.items()):
+            if code >= OP_SOFTMAX and not self._uses_softmax_unit:
+                continue                       # the softmax ops: only where a node uses them
             lines.append(f"#define {name:<20} {code}u")
         lines.append("")
         lines.append("/* Fused activation applied after the op (VectorOP.h Act enum) */")
@@ -878,6 +880,48 @@ class _SourceMixin:
                 "}\n"
             )
 
+        if self._uses_softmax_unit:
+            parts.append(
+                "/*\n"
+                " * run_softmax() — VectorOPKernel's softmax unit (doc/plans/SOFTMAX_PLAN.md):\n"
+                " * op VECTOROP_SOFTMAX (row mode: outer rows of size elements, input row\n"
+                " * stride a_inc, output row stride b_inc) or VECTOROP_SOFTMAX_T (column\n"
+                " * mode: input s[size keys][outer queries] at row stride a_inc -> P[outer]\n"
+                " * [size] at row stride b_inc; outer a multiple of 16), the integer\n"
+                " * specification of src/vectorop_smx.py with smx_cm (Cm), smx_cfg (Cs [5:0],\n"
+                " * f_p [12:8]) and smx_mask (vector q valid over min(size, valid0 + q mod\n"
+                " * period) elements: valid0 [15:0], period [31:16]).  a_off / c_off are\n"
+                " * element offsets into a / c (16-byte aligned).  NON-BLOCKING, as run_op.\n"
+                " */\n"
+                "static void run_softmax(\n"
+                "    inference_buf_t *a,\n"
+                "    unsigned         a_off,\n"
+                "    inference_buf_t *c,\n"
+                "    unsigned         c_off,\n"
+                "    unsigned         size,\n"
+                "    unsigned         op,\n"
+                "    unsigned         outer,\n"
+                "    unsigned         a_inc,\n"
+                "    unsigned         b_inc,\n"
+                "    unsigned         cm,\n"
+                "    unsigned         cfg,\n"
+                "    unsigned         mask)\n"
+                "{\n"
+                f"    XVectoropkernel_Set_a(&{vop_var}, inference_buf_phys(a) + (u64)a_off * INFERENCE_BYTES_PER_ELEM);\n"
+                f"    XVectoropkernel_Set_b(&{vop_var}, (u64)0);\n"
+                f"    XVectoropkernel_Set_c(&{vop_var}, inference_buf_phys(c) + (u64)c_off * INFERENCE_BYTES_PER_ELEM);\n"
+                f"    XVectoropkernel_Set_size(&{vop_var}, size);\n"
+                f"    XVectoropkernel_Set_op(&{vop_var}, op);\n"
+                f"    XVectoropkernel_Set_outer(&{vop_var}, outer);\n"
+                f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
+                f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
+                f"    XVectoropkernel_Set_smx_cm(&{vop_var}, cm);\n"
+                f"    XVectoropkernel_Set_smx_cfg(&{vop_var}, cfg);\n"
+                f"    XVectoropkernel_Set_smx_mask(&{vop_var}, mask);\n"
+                f"    XVectoropkernel_Start(&{vop_var});\n"
+                "}\n"
+            )
+
         # GEMV registers (MatmulKernel.h "GEMV streaming mode"): written on
         # every call — they persist across calls — when the platform's
         # kernel has them; a_to_b lets port a reach its half of B.
@@ -1544,10 +1588,25 @@ class _SourceMixin:
         init_calls = []
         for kd in active:
             probe = ""
+            if kd.c_type == "XVectoropkernel" and self._uses_softmax_unit:
+                # An IP without the softmax unit has no smx registers (they read
+                # 0) and would pass ops 10 / 11 through as copies.
+                probe += (
+                    "    /* The softmax runs in VectorOPKernel's softmax unit\n"
+                    "     * (doc/plans/SOFTMAX_PLAN.md): an IP without it has no smx_cm\n"
+                    "     * register and would copy instead. */\n"
+                    f"    XVectoropkernel_Set_smx_cm(&{kd.c_var}, 0x5A5A5Au);\n"
+                    f"    if (XVectoropkernel_Get_smx_cm(&{kd.c_var}) != 0x5A5A5Au) {{\n"
+                    "        fprintf(stderr, \"inference_init: the VectorOPKernel has no softmax \"\n"
+                    "                \"unit (the bitstream predates it)\\n\");\n"
+                    "        rc = -1;\n"
+                    "        goto fail;\n"
+                    "    }\n"
+                )
             if kd.c_type == "XVectoropkernel" and self._uses_activation_unit:
                 # An IP without the activation unit has no alpha register (it
                 # reads 0) and would pass the activation ops through unchanged.
-                probe = (
+                probe += (
                     "    /* LeakyReLU / SiLU / GELU run in VectorOPKernel's activation unit\n"
                     "     * (doc/plans/ACTIVATIONS_PLAN.md): an IP without it has no alpha\n"
                     "     * register and would pass these ops through unchanged. */\n"

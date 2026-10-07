@@ -8,7 +8,10 @@ generator.  **2026-10-06:** the activation unit (`vo_act`: LeakyReLU, SiLU,
 GELU, GELU tanh as ops 6–9 and acts 3–6, the `alpha` register;
 [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — verified out of context
 at 300 MHz; in the production bitstream `6436623029f7` (250 MHz, WNS
-+0.061 ns) since 2026-10-06.
++0.061 ns) since 2026-10-06.  **2026-10-07:** the softmax unit (`vo_smx`: ops
+10 / 11, registers `smx_cm` / `smx_cfg` / `smx_mask`;
+[SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)) — in the production bitstream
+`588d721997cb` (250 MHz, WNS +0.041 ns) since 2026-10-07.
 
 A drop-in replacement for the HLS kernel: the same IP (VLNV
 `xilinx.com:hls:VectorOPKernel:1.0`, 155 ports and 35 parameters with the
@@ -25,7 +28,8 @@ auto_restart, b9 interrupt), `0x04` GIE, `0x08` IER, `0x0C` ISR (toggle on
 write), `0x10/14` a, `0x1C/20` b, `0x28/2C` c, `0x34` size, `0x3C` op,
 `0x44` outer, `0x4C` a_inc, `0x54` b_inc, `0x5C` act, `0x64` alpha
 (LeakyReLU's slope: bits 15:0 / 65536; bits 31:16 are stored and read back
-but unused).  `interrupt` is level high while GIE and a set ISR bit.
+but unused), `0x6C` smx_cm (the softmax's Cm, bits 23:0), `0x74` smx_cfg (Cs
+5:0, f_p 12:8), `0x7C` smx_mask (valid0 15:0, period 31:16).  `interrupt` is level high while GIE and a set ISR bit.
 
 **Arithmetic** per Q8.8 lane (raw int16):
 
@@ -37,7 +41,8 @@ but unused).  `interrupt` is level high while GIE and a set ISR bit.
 | 4 RELU | `max(a, 0)` |
 | 5 RELU6 | `min(max(a, 0), 0x0600)` |
 | 6 LEAKY_RELU, 7 SILU, 8 GELU, 9 GELU_TANH | `a`, then the activation op − 3 (the act register is not applied) |
-| ≥ 10 | `a` |
+| 10 SOFTMAX, 11 SOFTMAX_T | the softmax below (act not applied) |
+| ≥ 12 | `a` |
 
 then `act` on the result: 1 RELU, 2 RELU6, 3 LEAKY_RELU, 4 SILU, 5 GELU,
 6 GELU_TANH, anything else none.  Ops ≥ 4 read no b (nothing is issued on
@@ -57,6 +62,20 @@ SiLU 2 141 entries (|x| < 8.36), GELU 829 (|x| < 3.24), GELU tanh 816
 (|x| < 3.19), 3 786 of 4 096 (`rtl/vo_act_rom.sv`, written and checked by
 `scripts/gen_act_rom.py`).
 
+**The softmax** (ops 10 / 11; VectorOP.h `smx_vector`, the specification
+`inference-scheduler/src/vectorop_smx.py`).  Per vector of n raw inputs x, v
+valid (`v(q) = min(n, valid0 + (period ? q mod period : 0))` for vector q):
+`m = max_{j<v} x_j`, `y_j = ((m − x_j) · Cm) >> Cs`,
+`e_j = TAB[y_j mod 4096] >> (y_j div 4096)` (`TAB[k] = round(2¹⁶ · 2^(−k/4096))`,
+0 past 17 · 4096), `S = Σ e_j`, `R = ⌊2⁴⁰ / S⌋`,
+`P_j = min((e_j · R + 2^(39 − f_p)) >> (40 − f_p), 32767)`, 0 for j ≥ v —
+within 1 LSB of the exact softmax.  Row mode (10): `outer` rows of `size`
+(≤ 2048) at input stride `a_inc`, written at stride `b_inc`.  Column mode
+(11): the input `s[size keys][outer queries]` at row stride `a_inc`, the
+output `P[outer & ~15][size]` at row stride `b_inc` (≤ 1024 keys; the kernel
+reads blocks of 16 query columns).  Both read no b; every output row's last
+word is written whole (P = 0 past `size`).
+
 **DIV and the HLS kernel's C simulation.**  The RTL matches the synthesised
 HLS kernel, whose divider (`VectorOPKernel_sdiv_25s_16s_25`) is 25 bits
 wide.  HLS C simulation divides in 24 bits instead, so for a = 0x8000 (−128)
@@ -71,7 +90,10 @@ checked-in fixtures never divide by a negative number.
 `inc == size` with `size % 8 == 0` is one contiguous range of
 `outer · n_words` words (the 32-bit product); otherwise `outer` runs of
 `n_words` words, run `o` at word `o · ⌊inc / 8⌋`.  The output uses
-`c_inc = a_inc + b_inc` (no replay).  The lanes of a run's last word past
+`c_inc = a_inc + b_inc` (no replay); the softmax ops `c_inc = b_inc`, and
+column mode reads `outer / 16` blocks of `size` two-word runs (block `k` at
+word `2k`, run `r` at `r · ⌊a_inc / 8⌋` — `vo_burstgen`'s block loop) and
+writes `outer & ~15` runs of `n_words`.  The lanes of a run's last word past
 `size` read as 0, so every output run's last word is written whole with 0 in
 its tail lanes.  `size == 0` or `outer == 0`: nothing is read or written.
 Bases are 16-byte aligned (the low four address bits are ignored).
@@ -96,6 +118,8 @@ ctrl ─► config (7 cycles) ─┬► rd_port a: burstgen ─► AR ─► R F
 | `vo_act` | the activations 3–6 on the merged 8-lane words, a fixed 7-cycle pipeline (other jobs pass through): per lane `|x|`, the ROM address and past-the-table flag, the ROM read and its output register, `max(x, 0) − m`; LeakyReLU in one DSP48E2 per lane (A / B registers, M, P; the 33-bit product rounded in fabric) |
 | `vo_act_rom` | generated: the 4 096 × 7 table, two read ports with the block RAM's output register — one BRAM36 (4K × 9) per two lanes |
 | `vo_div` | restoring radix-2 divider on magnitudes, one lane per cycle, 26 stages |
+| `vo_smx` | the softmax (ops 10 / 11), on the a stream and into the write port in place of `vo_compute`: one unit at a time (a row, or 16 query columns), load into an 8-bank buffer (2048 × 16 per bank; column mode skewed so a key row is one write and an output word one read) with the maxima on the way in, then EXP (read, e, the sums), 25-cycle restoring divisions R = ⌊2⁴⁰ / S⌋, OUT (read again, e recomputed, e · R, round, saturate) — EXP and OUT share one 21-stage pipeline (2 DSPs per lane); the 32-word output FIFO with credits as `vo_compute`'s |
+| `vo_smx_rom` | generated: the 4 096 × 17 exponential table, two read ports with the output register — 4 instances (8 lanes) |
 | `vo_wr_port` | 512-beat FIFO; bursts ≤ 256 words issued on AW once their beats are buffered; ≤ 16 bursts awaiting B; the next bursts wait in a register slice and the issue decision is an AND of registers (`avail`, `av_ok` computed a cycle ahead, `ob_ok`) |
 
 The m_axi ports are registered both ways: AR, AW and W leave through
@@ -116,7 +140,10 @@ read-write with 2 outstanding bursts, and the crossbar held the reads of a
 job of nine 2-word runs to about four in flight — slower than the HLS
 kernel in the test stand.
 
-Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`): 6 173
+Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`), with the
+softmax unit (2026-10-07): 11 672 LUT (491 LUTRAM), 13 751 FF, 30 BRAM36, 35
+DSP; timing met at 300 MHz (WNS +0.175 ns, Fmax ≈ 317 MHz; the worst path the
+argument latch's enable, routing only).  Before it: 6 173
 LUT (345 LUTRAM), 8 640 FF, 14 BRAM36, 19 DSP; timing met at 300 MHz (WNS
 +0.277 ns, Fmax ≈ 327 MHz; the block design runs the kernels at 250 MHz
 since FMAX_250_PLAN).  The worst paths are the read ports' replay-RAM inputs
@@ -167,6 +194,20 @@ perf_vectorop_rtl`, Verilator; the registered AXI ports and job start of
 An activation costs no throughput: SiLU / GELU / LeakyReLU run at the
 memory-bound rate of any unary op, as a separate op or fused after one.
 
+The softmax (`vo_smx`) runs its phases one after the other per unit — load,
+EXP, the divisions, OUT — at about a third of that rate (ideal memory):
+
+| job | cycles | board (`run_remote_perf`, 250 MHz) |
+|---|---:|---:|
+| row mode, rows of n | 75 + rows · (58 + 3 ⌈n / 8⌉) | |
+| BERT head: 256 rows of 256 | 39 056 (0.21 words / cycle) | 0.160 ms |
+| column mode, K keys | 60 + (outer / 16) · (455 + 6 K) | |
+| SmolVLM head: 1024 keys × 1024 queries | 6 600 per 16 queries | 3.77 ms |
+| SmolLM2 prefill-256 head: 256 keys × 256 queries (row stride 768) | 31 947 | 0.182 ms |
+
+Column mode reads a two-beat run per key row: on the board it reaches about
+half the ideal-memory rate (SmolVLM's head 3.77 ms against 1.69).
+
 On the board (bitstream `68665fc1833a`, the 15 VectorOP benchmarks of
 `run_remote_perf.py` against the HLS kernel's bitstream back to back): no
 case slower; the large binary jobs are equal (bound by the shared HPC0 read
@@ -180,14 +221,16 @@ the HLS kernel (VECTOROP_RTL_PLAN phases 1–2).
 | check | where | result |
 |---|---|---|
 | Verilator lint (`-Wall`) | `lint_vectorop_rtl` | clean |
-| the 201 checked-in fixtures (`hw/test_data/vecop_test_data`; 82 activation cases since 2026-10-06) | `TestVectorOpRtl` (ctest) | 201 / 201: c.hex in every run, tail lanes 0, and byte-identical to the HLS oracle on the whole output region |
+| the 212 checked-in fixtures (`hw/test_data/vecop_test_data`; 82 activation cases since 2026-10-06, 11 softmax cases since 2026-10-07) | `TestVectorOpRtl` (ctest) | 212 / 212: c.hex in every run, tail lanes 0, and byte-identical to the HLS oracle on the whole output region |
+| the softmax: every Q8.8 input through a 2048-element row at two scales (ctest `--case … 3`); ~40 random softmax jobs per 300 (row and column mode, masks, any register value); 2 700 more by hand (seeds 1–3 × rand / slow / fast) and 1 200 after the masked-lane fix (seeds 5–6) | `TestVectorOpRtl`, `Vtb --random` | all bit-exact against the C++ model (`smx_vector`) |
+| the exponential table | ctest `VectorOpRtlSmxRom`; `gen_smx_rom.py --check` | current; equal to `vectorop_smx.TAB` |
 | every Q8.8 input of each activation (`a` = 0…65 535: LeakyReLU at slopes 0.01 and 0.5, SiLU, GELU, GELU tanh; ADD + SiLU, ADD + GELU tanh, DIV + GELU) | ctest `TestVectorOpRtl` (`--case … 3`) | bit-exact against the C++ model |
 | the generated table | ctest `VectorOpRtlActRom`; `gen_act_rom.py --exact` | current; all 3 786 entries equal 40-digit mpmath |
 | random jobs against the HLS kernel's C++, randomised AXI timing, protocol checks, no stray write, no gmem1 traffic for unary ops | ctest: 300 (seed 1; since 2026-10-06 ops 0–12, acts 0–9, random `alpha`); by hand: 2 × 500 (seeds 1, 2026) + 200 slow timing (seed 4711); after the registered ports and resets (2026-10-06): 9 × 700 (seeds 2, 2026, 4711 × random / fast / slow timing), repeated after the write-issue change | all bit-exact |
-| register table vs RTL (and, until it was retired, the HLS driver) | `VectorOpRtlDriver` (ctest), `gen_driver.py --check` | 10 arguments (`alpha` since 2026-10-06) + 4 control registers agree |
-| the synthesised netlist against the RTL, cycle by cycle in xsim | `neteq_vectorop_rtl` | 30 jobs over ops 0–9 and acts 0–6 (2026-10-06): 0 mismatches |
-| the full `cormorant_hw_128` block design through the PS VIP | `sim_hw_kv260` | 73 / 73 (VectorOPKernel 27, five of them activation cases, 2026-10-06) |
-| the test stand's VectorOP block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_vectorop_rtl`; `behavior_test_vectorop` | 201 / 201 with the activation unit (2026-10-06, 4 min 35 s).  Phase 1 (119 cases): 984 µs of kernel time against the HLS kernel's 1 000 µs, faster in 115 of the 119 cases, at most 2.4 % slower in the other four (1 000 × 16-element jobs with a replayed operand) |
+| register table vs RTL (and, until it was retired, the HLS driver) | `VectorOpRtlDriver` (ctest), `gen_driver.py --check` | 13 arguments (`alpha` since 2026-10-06, the three softmax registers since 2026-10-07) + 4 control registers agree |
+| the synthesised netlist against the RTL, cycle by cycle in xsim | `neteq_vectorop_rtl` | 30 jobs over ops 0–9 and acts 0–6 (2026-10-06): 0 mismatches; with 12 softmax jobs (2026-10-07): 0 mismatches after the masked-lane fix (§6) |
+| the full `cormorant_hw_128` block design through the PS VIP | `sim_hw_kv260` | 75 / 75 (VectorOPKernel 29: five activation cases, two softmax cases; 2026-10-07) |
+| the test stand's VectorOP block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_vectorop_rtl`; `behavior_test_vectorop` | 212 / 212 with the softmax unit (2026-10-07, 33 min on a loaded host); 201 / 201 with the activation unit (2026-10-06, 4 min 35 s).  Phase 1 (119 cases): 984 µs of kernel time against the HLS kernel's 1 000 µs, faster in 115 of the 119 cases, at most 2.4 % slower in the other four (1 000 × 16-element jobs with a replayed operand) |
 
 On the board (VECTOROP_RTL_PLAN phase 2): registers written and read back,
 DIV of every int16 value by −1/256, the 148 models of `run_remote_tests`, the
@@ -196,7 +239,12 @@ SmolVLM and Piper library gates — all bit-exact.  With the activation unit
 (bitstream `6436623029f7`, ACTIVATIONS_PLAN §6): `alpha` written and read
 back, 156 / 156 models (the eight `act_*` models among them, four over every
 Q8.8 input), the demos (BERT's GELUs on the unit: 541 → 525 ms) and the four
-library gates — all bit-exact.
+library gates — all bit-exact.  With the softmax unit (bitstream
+`588d721997cb`, SOFTMAX_PLAN §4.2b): the three registers written and read
+back, 159 / 159 models (the four tiny BERTs and three `smx_*` models on the
+unit), the 63 benchmarks, the demos (BERT's Softmaxes on the unit: 525 →
+427 ms) and the five library gates (SmolLM2-135M / 360M and SmolVLM with
+their softmaxes on the unit, BERT, Piper) — all bit-exact.
 
 The random jobs cover every op (also codes 10–12) and act (also 7–9), sizes
 up to 6 000, broadcasts in both directions, both-advancing strides, the
@@ -249,6 +297,25 @@ lockstep, `tools/neteq`), `sysim_vectorop_rtl` — `kernels/vectorop_rtl/CMakeLi
 - The job reset (`urst_*`, one registered copy per unit) is asserted the
   cycle after `job_start`, and the units' `start` (`start_q2`) the cycle
   after that; the geometry registers are loaded (T_CFG5) before either.
+- `vo_smx` handles one unit at a time and its buffer holds one unit: the next
+  unit's load starts only after OUT has issued every read, and only once the
+  issued words are past the stage that reads the maxima and valid lengths
+  (`S_NEXT` waits for r0–r2 to be empty) — the next unit's V / LOAD
+  overwrite them; R is written by the next unit's DIV, which follows its EXP
+  (in order behind every OUT word).  e is recomputed in OUT from the
+  buffer, so EXP and OUT must use the same pipeline and constants.
+- `vo_smx`'s masked lanes must produce a known 0, not only a 0 on hardware:
+  in column mode the last output word of a query reads buffer words this unit
+  never wrote (keys past `size`), whose X in a 4-state simulation reached P
+  through `e = 0 >> sh` (sh from the unknown input) until `sh13` was zeroed on
+  masked lanes too — `neteq_vectorop_rtl` caught it (RTL X, netlist 0 in the
+  tail lanes); Verilator, being 2-state, cannot.
+- `vo_smx`'s counts are 32 bits wide and its buffer addresses wrap: a job
+  outside the limits (rows > 2048, keys > 1024) gives wrong P but always
+  consumes and produces its words.
+- `rtl/vo_smx_rom.sv` is generated (`scripts/gen_smx_rom.py`; ctest
+  `VectorOpRtlSmxRom`); the table must stay `vectorop_smx.TAB`, which the C++
+  model (`smx_table`) and the scheduler share.
 - The three word streams (a, b, c) have the same length by construction
   (`outer · n_words`); the geometry must stay identical to VectorOP.cpp's
   for the RTL to read and write the same words.

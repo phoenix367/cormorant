@@ -5,6 +5,10 @@
 #include "ap_int.h"
 #include "hls_burst_maxi.h"
 
+#include <climits>
+#include <cmath>
+#include <cstdint>
+
 // ---------------------------------------------------------------------------
 // saturate_cast<T>(v)
 //
@@ -89,6 +93,13 @@ enum Op : unsigned {
     OP_SILU       = 7,  // a * sigmoid(a)
     OP_GELU       = 8,  // a * Phi(a) = a / 2 * (1 + erf(a / sqrt(2)))
     OP_GELU_TANH  = 9,  // a / 2 * (1 + tanh(sqrt(2 / pi) * (a + 0.044715 a^3)))
+    // Softmax (doc/plans/SOFTMAX_PLAN.md; smx_vector below), unary: b[] not
+    // read; c advances by b_inc per vector (not a_inc + b_inc).
+    OP_SOFTMAX    = 10, // row mode: outer rows of size elements (input stride
+                        // a_inc, output stride b_inc), softmax over each row
+    OP_SOFTMAX_T  = 11, // column mode: input s[size keys][outer queries] (row
+                        // stride a_inc), output P[outer][size] (row stride
+                        // b_inc): softmax over the keys of each query column
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +134,72 @@ enum Act : unsigned {
 inline unsigned job_act(unsigned op, unsigned act) {
     return (op >= OP_LEAKY_RELU && op <= OP_GELU_TANH) ? op - (OP_LEAKY_RELU - ACT_LEAKY_RELU)
                                                         : act;
+}
+
+// ---------------------------------------------------------------------------
+// Softmax (OP_SOFTMAX / OP_SOFTMAX_T; doc/plans/SOFTMAX_PLAN.md §2.1) — integer
+// arithmetic on the raw int16 lanes, the specification of
+// inference-scheduler/src/vectorop_smx.py.  Per vector of n inputs x with v
+// valid (registers smx_cm = Cm [23:0], smx_cfg = Cs [5:0] | f_p [12:8], smx_mask =
+// valid0 [15:0] | period [31:16]; v = min(n, valid0 + (q mod period)) for
+// vector q, period 0: valid0):
+//   m = max_{j<v} x_j;  d_j = m - x_j;  y_j = (d_j * Cm) >> Cs;
+//   e_j = TAB[y_j mod 2^12] >> (y_j div 2^12),  TAB[k] = round(2^16 * 2^(-k / 4096));
+//   S = sum_{j<v} e_j;  R = floor(2^40 / S);
+//   P_j = min((e_j * R + 2^(39 - f_p)) >> (40 - f_p), 32767);  P_j = 0 for j >= v.
+// Rows of at most kSmxMaxRow elements (row mode), at most kSmxMaxKeys keys
+// and outer a multiple of 16 (column mode: blocks of 16 query columns; the
+// kernel processes outer & ~15 of them).
+// ---------------------------------------------------------------------------
+static constexpr unsigned kSmxF       = 12;     // table index bits
+static constexpr unsigned kSmxE       = 16;     // e = 1.0 at 2^16
+static constexpr unsigned kSmxRB      = 40;     // R = floor(2^40 / S)
+static constexpr unsigned kSmxMaxRow  = 2048;
+static constexpr unsigned kSmxMaxKeys = 1024;
+
+// TAB[k] = round_half_even(2^16 * 2^(-k / 4096)); no entry lies within 1e-6
+// of a rounding tie (kernels/vectorop_rtl/scripts/gen_smx_rom.py checks), so
+// any accurate exp2 gives the same table.
+inline const int64_t* smx_table() {
+    static int64_t tab[1u << kSmxF];
+    static bool    init = false;
+    if (!init) {
+        for (unsigned k = 0; k < (1u << kSmxF); ++k)
+            tab[k] = (int64_t)std::nearbyint(std::ldexp(std::exp2(-(double)k / (1u << kSmxF)), kSmxE));
+        init = true;
+    }
+    return tab;
+}
+
+inline unsigned smx_valid(unsigned q, unsigned n, unsigned mask) {
+    const unsigned valid0 = mask & 0xFFFFu, period = mask >> 16;
+    const unsigned v = valid0 + (period ? q % period : 0u);
+    return v < n ? v : n;
+}
+
+// One softmax vector: x[n] raw int16 -> p[n] raw int16 at 2^-f_p.
+inline void smx_vector(const int16_t* x, unsigned n, unsigned v, unsigned cm, unsigned cfg,
+                       int16_t* p) {
+    const int64_t* tab = smx_table();
+    const unsigned cs = cfg & 63u, fp = (cfg >> 8) & 31u;
+    cm &= 0xFFFFFFu;
+    if (v > n) v = n;
+    int64_t m = INT64_MIN;
+    for (unsigned j = 0; j < v; ++j) m = x[j] > m ? x[j] : m;
+    int64_t S = 0;
+    static int64_t e[kSmxMaxRow > kSmxMaxKeys ? kSmxMaxRow : kSmxMaxKeys];
+    for (unsigned j = 0; j < v; ++j) {
+        const uint64_t y  = ((uint64_t)(m - x[j]) * cm) >> cs;
+        const uint64_t sh = y >> kSmxF;
+        e[j] = sh >= 63 ? 0 : tab[y & ((1u << kSmxF) - 1)] >> sh;
+        S += e[j];
+    }
+    const uint64_t R = S > 0 ? ((uint64_t)1 << kSmxRB) / (uint64_t)S : 0;
+    for (unsigned j = 0; j < n; ++j) {
+        if (j >= v) { p[j] = 0; continue; }
+        const uint64_t q = ((uint64_t)e[j] * R + ((uint64_t)1 << (kSmxRB - fp - 1))) >> (kSmxRB - fp);
+        p[j] = (int16_t)(q > 32767 ? 32767 : q);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -209,8 +286,9 @@ inline unsigned vec_words_for(unsigned count) {
 //   act     — AXI-Lite register: fused activation (Act enum, 0 = none);
 //             appended after b_inc so the earlier register offsets are
 //             unchanged (0x5C in the generated driver).
-//   alpha   — AXI-Lite register: LeakyReLU slope, alpha[15:0] / 65536;
-//             appended LAST (0x64).
+//   alpha   — AXI-Lite register: LeakyReLU slope, alpha[15:0] / 65536 (0x64).
+//   smx_cm, smx_cfg, smx_mask — AXI-Lite registers of the softmax ops (0x6C,
+//             0x74, 0x7C; see smx_vector), appended last.
 //   return  — AXI-Lite control: ap_ctrl_hs (start/done/idle/ready)
 //
 // The kernel processes outer × size elements:
@@ -244,5 +322,8 @@ void VectorOPKernel(
     unsigned      a_inc,
     unsigned      b_inc,
     unsigned      act,
-    unsigned      alpha
+    unsigned      alpha,
+    unsigned      smx_cm   = 0,
+    unsigned      smx_cfg  = 0,
+    unsigned      smx_mask = 0
 );

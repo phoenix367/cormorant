@@ -153,7 +153,8 @@ static void stream_runs(
     hls::burst_maxi<VecWord> src,
     hls::stream<VecWord>&    dst,
     RunGeom                  g,
-    unsigned                 tail_lanes
+    unsigned                 tail_lanes,
+    unsigned                 base_w = 0
 ) {
     const unsigned pieces_per_run   = (g.run_words + kReadReqWords - 1) / kReadReqWords;
     const unsigned last_piece_words = g.run_words - (pieces_per_run - 1) * kReadReqWords;
@@ -163,8 +164,8 @@ static void stream_runs(
     // Request cursor.
     unsigned issued   = 0;
     unsigned iss_p    = 0;          // piece within the run being issued
-    unsigned iss_base = 0;          // word offset of that run
-    unsigned iss_off  = 0;          // word offset of the next piece
+    unsigned iss_base = base_w;     // word offset of that run
+    unsigned iss_off  = base_w;     // word offset of the next piece
 
     // Prologue: the first kReadAhead pieces.
     const unsigned n_pro = (total_pieces < kReadAhead) ? total_pieces : kReadAhead;
@@ -219,7 +220,8 @@ static void load_words(
     unsigned                 outer,
     unsigned                 size,
     unsigned                 inc,
-    bool                     enabled
+    bool                     enabled,
+    unsigned                 base_w = 0
 ) {
     #pragma HLS INLINE off
     if (!enabled || size == 0 || outer == 0) return;
@@ -227,7 +229,7 @@ static void load_words(
     const unsigned n_words    = vec_words_for(size);
     const unsigned tail_lanes = (size % E == 0) ? E : size % E;
 
-    if (outer > 1 && inc == 0 && n_words <= kRepWords) {
+    if (outer > 1 && inc == 0 && n_words <= kRepWords && base_w == 0) {
         // Stride-0 operand: read it once, replay it outer times.
         VecWord rep_buf[kRepWords];
         for (unsigned w0 = 0; w0 < n_words; w0 += kReadReqWords) {
@@ -252,7 +254,7 @@ static void load_words(
         return;
     }
 
-    stream_runs(src, dst, run_geometry(outer, size, inc), tail_lanes);
+    stream_runs(src, dst, run_geometry(outer, size, inc), tail_lanes, base_w);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +346,8 @@ static void store_words(
     hls::stream<VecWord>&    src,
     unsigned                 outer,
     unsigned                 size,
-    unsigned                 inc
+    unsigned                 inc,
+    unsigned                 base_w = 0
 ) {
     #pragma HLS INLINE off
     if (size == 0 || outer == 0) return;
@@ -357,8 +360,8 @@ static void store_words(
     unsigned pending  = 0;
     unsigned cur_w    = 0;
     unsigned cur_p    = 0;
-    unsigned cur_base = 0;
-    unsigned cur_off  = 0;
+    unsigned cur_base = base_w;
+    unsigned cur_off  = base_w;
     unsigned cur_len  = (pieces_per_run == 1) ? last_piece_words : kWriteReqWords;
 
     for (unsigned i = 0; i < total_words; ++i) {
@@ -387,6 +390,59 @@ static void store_words(
 }
 
 // ---------------------------------------------------------------------------
+// Softmax jobs (OP_SOFTMAX / OP_SOFTMAX_T; smx_vector in VectorOP.h).  The
+// reference model reads and writes through the same load / store stages, one
+// vector (row mode) or one key row / one query row (column mode) at a time;
+// the RTL kernel streams them (kernels/vectorop_rtl/rtl/vo_smx.sv).
+// ---------------------------------------------------------------------------
+static void read_lanes(hls::burst_maxi<VecWord> src, unsigned base_w, unsigned n, int16_t* out) {
+    hls::stream<VecWord> s("smx_in");
+    load_words(src, s, 1u, n, 0u, true, base_w);
+    for (unsigned w = 0; w < vec_words_for(n); ++w) {
+        const VecWord x = s.read();
+        for (unsigned l = 0; l < E && w * E + l < n; ++l)
+            out[w * E + l] = (int16_t)x.range(kDataBits * (l + 1) - 1, kDataBits * l).to_int();
+    }
+}
+
+static void write_lanes(hls::burst_maxi<VecWord> dst, unsigned base_w, unsigned n, const int16_t* in) {
+    hls::stream<VecWord> s("smx_out");
+    for (unsigned w = 0; w < vec_words_for(n); ++w) {
+        VecWord x = 0;
+        for (unsigned l = 0; l < E && w * E + l < n; ++l)
+            x.range(kDataBits * (l + 1) - 1, kDataBits * l) = (ap_uint<kDataBits>)(uint16_t)in[w * E + l];
+        s.write(x);
+    }
+    store_words(dst, s, 1u, n, 0u, base_w);
+}
+
+static void softmax_job(hls::burst_maxi<VecWord> a, hls::burst_maxi<VecWord> c, unsigned op,
+                        unsigned size, unsigned outer, unsigned a_inc, unsigned b_inc,
+                        unsigned cm, unsigned cfg, unsigned mask) {
+    static int16_t x[kSmxMaxRow], p[kSmxMaxRow];
+    if (op == OP_SOFTMAX) {
+        for (unsigned o = 0; o < outer; ++o) {
+            read_lanes(a, o * (a_inc / E), size, x);
+            smx_vector(x, size, smx_valid(o, size, mask), cm, cfg, p);
+            write_lanes(c, o * (b_inc / E), size, p);
+        }
+        return;
+    }
+    // column mode: s[size][outer] (row stride a_inc) -> P[outer][size] (row stride b_inc)
+    static int16_t s[kSmxMaxKeys][kSmxMaxRow];
+    static int16_t row[kSmxMaxRow];
+    for (unsigned k = 0; k < size; ++k) {
+        read_lanes(a, k * (a_inc / E), outer, row);
+        for (unsigned q = 0; q < outer; ++q) s[k][q] = row[q];
+    }
+    for (unsigned q = 0; q < (outer & ~15u); ++q) {          // blocks of 16 query columns
+        for (unsigned k = 0; k < size; ++k) x[k] = s[k][q];
+        smx_vector(x, size, smx_valid(q, size, mask), cm, cfg, p);
+        write_lanes(c, q * (b_inc / E), size, p);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top kernel
 // ---------------------------------------------------------------------------
 void VectorOPKernel(
@@ -399,7 +455,10 @@ void VectorOPKernel(
     unsigned      a_inc,
     unsigned      b_inc,
     unsigned      act,
-    unsigned      alpha
+    unsigned      alpha,
+    unsigned      smx_cm,
+    unsigned      smx_cfg,
+    unsigned      smx_mask
 ) {
     // 128-bit burst_maxi ports (VecWord).  Read requests are <= 64 words
     // with up to 16 outstanding (adapter buffer 1024 words); write requests
@@ -421,6 +480,9 @@ void VectorOPKernel(
     #pragma HLS INTERFACE s_axilite port=b_inc  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=act    bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=alpha  bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=smx_cm   bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=smx_cfg  bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=smx_mask bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return bundle=ctrl
 
     // Word streams between the stages; depth 64 lets the loaders run a
@@ -435,6 +497,11 @@ void VectorOPKernel(
     #pragma HLS bind_storage variable=a_s type=fifo impl=lutram
     #pragma HLS bind_storage variable=b_s type=fifo impl=lutram
     #pragma HLS bind_storage variable=c_s type=fifo impl=lutram
+
+    if (op == OP_SOFTMAX || op == OP_SOFTMAX_T) {
+        softmax_job(a, c, op, size, outer, a_inc, b_inc, smx_cm, smx_cfg, smx_mask);
+        return;
+    }
 
     // c_inc == 0 when outer==1 (a_inc==b_inc==0) — writes c[i] directly.
     // Unary ops (OP_RELU, OP_RELU6, the activation ops) never read b.

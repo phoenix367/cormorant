@@ -7,8 +7,9 @@
 // same module / port names, AXI-Lite register map, DDR access pattern and
 // bit-identical results.  See doc/plans/VECTOROP_RTL_PLAN.md.
 //
-//   ap_start ─► config ─┬► rd_port a (gmem0) ─┐
-//                       ├► rd_port b (gmem1) ─┴► compute (8 lanes; DIV 1 lane) ─► wr_port (gmem2)
+//   ap_start ─► config ─┬► rd_port a (gmem0) ─┬──────────────────────────────────┐
+//                       ├► rd_port b (gmem1) ─┴► compute (8 lanes; DIV 1 lane) ─┴► wr_port (gmem2)
+//                       │                       smx (OP_SOFTMAX / _T: a only) ──┘
 //                       └──────────────────────────────────────────────────────────┘
 // ---------------------------------------------------------------------------
 module vo_core #(
@@ -239,6 +240,7 @@ module vo_core #(
   logic        ap_start, ap_done, ap_idle;
   logic [63:0] r_a, r_b, r_c;
   logic [31:0] r_size, r_op, r_outer, r_ainc, r_binc, r_act, r_alpha;
+  logic [31:0] r_scm, r_scfg, r_smask;
 
   vo_ctrl_s_axi u_ctrl (
     .clk, .rst (rst_c),
@@ -252,7 +254,8 @@ module vo_core #(
     .interrupt,
     .ap_start, .ap_done, .ap_ready (ap_done), .ap_idle,
     .a (r_a), .b (r_b), .c (r_c), .size (r_size), .op (r_op), .outer (r_outer),
-    .a_inc (r_ainc), .b_inc (r_binc), .act (r_act), .alpha (r_alpha)
+    .a_inc (r_ainc), .b_inc (r_binc), .act (r_act), .alpha (r_alpha),
+    .smx_cm (r_scm), .smx_cfg (r_scfg), .smx_mask (r_smask)
   );
 
   // Job configuration ------------------------------------------------------------------
@@ -260,11 +263,18 @@ module vo_core #(
   // REP_D words is replayed; outer == 1 or inc == size (whole words) is one
   // contiguous range of outer * n_words words; otherwise outer runs of n_words
   // words, run o at word o * (inc / 8).  The output uses c_inc = a_inc + b_inc.
+  // The softmax ops (vo_smx) read a only and write with c_inc = b_inc; row mode
+  // (OP_SOFTMAX) walks DDR as any unary op, column mode (OP_SOFTMAX_T) reads
+  // outer / 16 blocks of size key rows x 2 words (16 query columns each) and
+  // writes outer & ~15 rows of n_words words.
   typedef enum logic [3:0] {T_IDLE, T_LAT, T_CFG0, T_CFG1, T_CFG2, T_CFG3, T_CFG4, T_CFG5,
                             T_RUN, T_DONE} tst_t;
   tst_t        tstate;
   logic [63:0] j_a, j_b, j_c;
   logic [31:0] j_size, j_op, j_outer, j_ainc, j_binc, j_act, j_alpha;
+  logic [31:0] j_scm, j_scfg, j_smask;
+  logic        is_smx, s_col, s_en;         // a softmax job, column mode, with work
+  logic [31:0] s_units;                     // rows / blocks of 16 queries
   logic [31:0] nw, c_inc, pm;
   logic [3:0]  tail;
   logic        go;
@@ -279,12 +289,32 @@ module vo_core #(
     rep    = can_replay && (j_outer > 32'd1) && (inc == '0) && (nw <= 32'(REP_D));
     g.en       = en && go;
     g.base_w   = base[63:4];
+    g.n_blk    = 32'd1;
+    g.blk_w    = '0;
     g.tail     = tail;
     g.replay   = rep;
     g.reps     = j_outer;
     g.n_runs   = (rep || contig) ? 32'd1 : j_outer;
     g.run_words = rep ? nw : contig ? pm : nw;
     g.stride_w = (rep || contig) ? '0 : {3'b0, inc[31:3]};
+    return g;
+  endfunction
+
+  // OP_SOFTMAX_T: the input s[size keys][outer queries] in blocks of 16 query
+  // columns (two words of every key row: outer / 16 blocks of size runs), the
+  // output P[outer & ~15][size].
+  function automatic geom_t col_geom(input logic out);
+    geom_t g;
+    g.en       = go && (j_outer[31:4] != '0);
+    g.base_w   = out ? j_c[63:4] : j_a[63:4];
+    g.n_blk    = out ? 32'd1 : {4'b0, j_outer[31:4]};
+    g.blk_w    = out ? 32'd0 : 32'd2;
+    g.n_runs   = out ? {j_outer[31:4], 4'b0} : j_size;
+    g.run_words = out ? nw : 32'd2;
+    g.stride_w = {3'b0, out ? j_binc[31:3] : j_ainc[31:3]};
+    g.tail     = out ? tail : 4'd8;
+    g.replay   = 1'b0;
+    g.reps     = 32'd1;
     return g;
   endfunction
 
@@ -351,22 +381,27 @@ module vo_core #(
       j_a <= r_a; j_b <= r_b; j_c <= r_c;
       j_size <= r_size; j_op <= r_op; j_outer <= r_outer;
       j_ainc <= r_ainc; j_binc <= r_binc; j_act <= r_act; j_alpha <= r_alpha;
+      j_scm <= r_scm; j_scfg <= r_scfg; j_smask <= r_smask;
     end
     if (tstate == T_CFG0) begin
-      nw    <= 32'((33'(j_size) + 33'd7) >> 3);
-      tail  <= (j_size[2:0] == 3'd0) ? 4'd8 : {1'b0, j_size[2:0]};
-      c_inc <= j_ainc + j_binc;
-      go    <= (j_size != '0) && (j_outer != '0);
+      nw     <= 32'((33'(j_size) + 33'd7) >> 3);
+      tail   <= (j_size[2:0] == 3'd0) ? 4'd8 : {1'b0, j_size[2:0]};
+      is_smx <= (j_op == OP_SOFTMAX) || (j_op == OP_SOFTMAX_T);
+      s_col  <= (j_op == OP_SOFTMAX_T);
+      c_inc  <= ((j_op == OP_SOFTMAX) || (j_op == OP_SOFTMAX_T)) ? j_binc : j_ainc + j_binc;
+      go     <= (j_size != '0) && (j_outer != '0);
     end
-    if (ld_ga) ga <= mk_geom(1'b1,           j_a, j_ainc, 1'b1);
+    if (tstate == T_CFG1) s_units <= s_col ? {4'b0, j_outer[31:4]} : j_outer;
+    if (tstate == T_CFG2) s_en <= is_smx && go && (s_units != '0);
+    if (ld_ga) ga <= s_col ? col_geom(1'b0) : mk_geom(1'b1, j_a, j_ainc, 1'b1);
     if (ld_gb) gb <= mk_geom(j_op < OP_RELU, j_b, j_binc, 1'b1);
-    if (ld_gc) gc <= mk_geom(1'b1,           j_c, c_inc,  1'b0);
+    if (ld_gc) gc <= s_col ? col_geom(1'b1) : mk_geom(1'b1, j_c, c_inc, 1'b0);
   end
 
   // Every unit starts a job from reset: the job reset is registered and
   // copied per unit (start_q2 follows it by one cycle, as start_q followed
   // the combinational reset before).
-  (* keep = "true" *) logic urst_a, urst_b, urst_c, urst_w;
+  (* keep = "true" *) logic urst_a, urst_b, urst_c, urst_w, urst_s;
   always_ff @(posedge clk) begin
     start_q  <= !rst && job_start;
     start_q2 <= !rst && start_q;
@@ -374,15 +409,20 @@ module vo_core #(
     urst_b   <= rst || job_start;
     urst_c   <= rst || job_start;
     urst_w   <= rst || job_start;
+    urst_s   <= rst || job_start;
   end
 
   assign ap_idle = (tstate == T_IDLE);
   assign ap_done = (tstate == T_DONE);
 
   // Operand ports, compute, output -----------------------------------------------------
+  // A softmax job's a words go to vo_smx and its P words to the write port;
+  // vo_compute sees none of them (and the other jobs none of vo_smx's).
   logic          a_valid, a_ready, b_valid, b_ready, c_valid, c_ready;
   logic [BW-1:0] a_data, b_data, c_data;
-  logic          a_idle, b_idle, cp_idle, wr_idle;
+  logic          a_idle, b_idle, cp_idle, wr_idle, sm_idle;
+  logic          cp_a_ready, sm_a_ready, s_valid, s_ready, w_valid, w_ready;
+  logic [BW-1:0] s_data, w_data;
 
   vo_rd_port u_rd_a (
     .clk, .rst (urst_a), .start (start_q2), .g (ga),
@@ -406,14 +446,28 @@ module vo_core #(
 
   vo_compute u_cp (
     .clk, .rst (urst_c), .op (j_op), .act (j_act), .alpha (j_alpha),
-    .a_valid, .a_ready, .a_data, .b_valid, .b_ready, .b_data,
+    .a_valid (a_valid && !is_smx), .a_ready (cp_a_ready), .a_data, .b_valid, .b_ready, .b_data,
     .c_valid, .c_ready, .c_data,
     .idle (cp_idle)
   );
 
+  vo_smx u_smx (
+    .clk, .rst (urst_s), .start (start_q2), .en (s_en), .col (s_col),
+    .size (j_size), .nw, .units (s_units), .cm (j_scm), .cfg (j_scfg), .mask (j_smask),
+    .in_valid  (a_valid && is_smx), .in_ready (sm_a_ready), .in_data (a_data),
+    .out_valid (s_valid),           .out_ready (s_ready),   .out_data (s_data),
+    .idle (sm_idle)
+  );
+
+  assign a_ready = is_smx ? sm_a_ready : cp_a_ready;
+  assign w_valid = is_smx ? s_valid : c_valid;
+  assign w_data  = is_smx ? s_data : c_data;
+  assign c_ready = w_ready && !is_smx;
+  assign s_ready = w_ready && is_smx;
+
   vo_wr_port u_wr (
     .clk, .rst (urst_w), .start (start_q2), .g (gc),
-    .in_valid (c_valid), .in_ready (c_ready), .in_data (c_data),
+    .in_valid (w_valid), .in_ready (w_ready), .in_data (w_data),
     .awvalid (m_axi_gmem2_AWVALID), .awready (m_axi_gmem2_AWREADY),
     .awaddr  (m_axi_gmem2_AWADDR),  .awlen   (m_axi_gmem2_AWLEN),
     .wvalid  (m_axi_gmem2_WVALID),  .wready  (m_axi_gmem2_WREADY),
@@ -424,7 +478,7 @@ module vo_core #(
   assign m_axi_gmem2_WSTRB = '1;
 
   assign job_done = (tstate == T_RUN) && !job_start && !start_q && !start_q2 &&
-                    a_idle && b_idle && cp_idle && wr_idle;
+                    a_idle && b_idle && cp_idle && sm_idle && wr_idle;
 
   // AXI constant fields and unused channels ---------------------------------------------
   // gmem0 / gmem1: read only

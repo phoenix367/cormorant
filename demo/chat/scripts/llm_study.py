@@ -100,6 +100,22 @@ Deterministic: greedy decoding only, no sampling, fixed data.
 import argparse, collections, json, math, os, struct, subprocess, sys, time
 import numpy as np
 
+_VSMX = None
+
+
+def vsmx():
+    """inference-scheduler/src/vectorop_smx.py (numpy only), loaded by path: the
+    FPGA softmax's specification without the scheduler package."""
+    global _VSMX
+    if _VSMX is None:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "inference-scheduler", "src", "vectorop_smx.py")
+        spec = importlib.util.spec_from_file_location("vectorop_smx", p)
+        _VSMX = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_VSMX)
+    return _VSMX
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 DEFAULT_MODEL = "smollm2-135m-instruct"
@@ -561,6 +577,14 @@ class Model:
         return y
 
     def softmax(self, s, mask, fs, fp, l):              # one head: s [T, S], mask [T, S]
+        vs = self.pol.get("vsmx")
+        if self.q and not self.exact("s") and (vs is True or vs == self.phase):
+            # VectorOPKernel's softmax (doc/plans/SOFTMAX_PLAN.md §2.1): the
+            # integer specification of inference-scheduler/src/vectorop_smx.py
+            raw = np.rint(s * p2(fs)).astype(np.int64)
+            cm, cs = vsmx().scale_regs(int(fs), 1.0 / math.sqrt(self.cfg.HD))
+            P = vsmx().softmax_raw(raw, mask.sum(-1), cm, cs, int(fp))
+            return P * p2(-int(fp))
         if not self.q or self.exact("s"):
             x = np.where(mask, s * 0.125, -np.inf)
             e = np.exp(x - x.max(-1, keepdims=True))
@@ -807,6 +831,8 @@ POLICIES = {
     # (q.K^T and P.V on ConvKernel, P at 2^-12 on the host), decode attention the xattn
     # host region; the same formats and caches
     "pow2+sink+p12+mix":     dict(_RF, sink=True, fmt="pow2", p_bits=12, xattn="decode"),
+    # the prefill softmax on VectorOPKernel (doc/plans/SOFTMAX_PLAN.md), decode p12 on the host
+    "pow2+sink+p12+vsmx":    dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill"),
 }
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")

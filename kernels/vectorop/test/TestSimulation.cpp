@@ -207,11 +207,13 @@ static void dump_one_case(const char* label,
                           unsigned outer, unsigned a_inc, unsigned b_inc, unsigned act,
                           unsigned alpha,
                           const AlignedBuf& a, const AlignedBuf& b,
-                          const std::vector<double>& c_ref_d) {
+                          const std::vector<double>& c_ref_d,
+                          unsigned smx_cm = 0, unsigned smx_cfg = 0, unsigned smx_mask = 0,
+                          unsigned a_n_override = 0) {
 #ifndef VA_HAVE_APFIXED
     (void)label; (void)size; (void)op_code;
     (void)outer; (void)a_inc; (void)b_inc; (void)act; (void)alpha;
-    (void)a; (void)b; (void)c_ref_d;
+    (void)a; (void)b; (void)c_ref_d; (void)smx_cm; (void)smx_cfg; (void)smx_mask; (void)a_n_override;
     std::fprintf(stderr, "--dump-data requires VA_HAVE_APFIXED build\n");
     std::exit(1);
 #else
@@ -224,14 +226,14 @@ static void dump_one_case(const char* label,
     for (size_t i = 0; i < c_ref_d.size(); ++i)
         c_ref[i] = saturate_cast<Data_t>(c_ref_d[i]);
 
-    const unsigned a_n = extent(size, outer, a_inc);
-    const unsigned b_n = extent(size, outer, b_inc);
+    const unsigned a_n = a_n_override ? a_n_override : extent(size, outer, a_inc);
+    const unsigned b_n = a_n_override ? 0u : extent(size, outer, b_inc);
     write_hex_file(prefix + "a.hex", a.p, a_n);
     write_hex_file(prefix + "b.hex", b.p, b_n);
     write_hex_file(prefix + "c.hex", c_ref.data(), (unsigned)c_ref.size());
 
-    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %s\n",
-                 idx, size, op_code, outer, a_inc, b_inc, act, alpha,
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %u %u %u %s\n",
+                 idx, size, op_code, outer, a_inc, b_inc, act, alpha, smx_cm, smx_cfg, smx_mask,
                  sanitize_label(label).c_str());
     std::printf("[DUMP] test_%02d  %-34s  size=%u op=%u outer=%u a_inc=%u b_inc=%u act=%u alpha=%u\n",
                 idx, label, size, op_code, outer, a_inc, b_inc, act, alpha);
@@ -685,6 +687,149 @@ static bool RunActTests() {
     return allPassed;
 }
 
+
+// ---------------------------------------------------------------------------
+// Softmax (OP_SOFTMAX / OP_SOFTMAX_T; doc/plans/SOFTMAX_PLAN.md)
+//
+// smx_vector (VectorOP.h, the integer specification) against the exact
+// softmax rounded at f_p: at most 1 LSB apart; then whole kernel jobs —
+// strides, masks, causal periods, tail lanes, untouched gaps — exactly
+// against smx_vector applied per vector.  Every job is an RTL fixture.
+// ---------------------------------------------------------------------------
+// (Cm, Cs) for scores at exponent f_s with logit scale sigma (vectorop_smx.scale_regs)
+static void smx_scale_regs(int f_s, double sigma, unsigned& cm, unsigned& cs) {
+    const double c = std::log2(std::exp(1.0)) * sigma * std::ldexp(1.0, -f_s) * (1u << kSmxF);
+    int s = 23 - (int)std::floor(std::log2(c));
+    long long m = (long long)std::nearbyint(c * std::ldexp(1.0, s));
+    if (m >= (1LL << 24)) { m >>= 1; s -= 1; }
+    cm = (unsigned)m; cs = (unsigned)s;
+}
+
+static int16_t raw16(const Data_t& v) { return (int16_t)data_to_raw16(v); }
+static Data_t from_raw16(int16_t r) {
+#ifdef VA_HAVE_APFIXED
+    Data_t v; v.range(15, 0) = (ap_uint<16>)(uint16_t)r; return v;
+#else
+    return Data_t(r);
+#endif
+}
+
+static bool SmxMathTest(unsigned seed) {
+    std::mt19937 rng(seed);
+    const struct { int fs; int fp; double sd; unsigned n; } cfgs[] = {
+        {12, 12, 4.0, 1024}, {10, 12, 8.0, 256}, {8, 8, 6.0, 256}, {12, 15, 3.0, 400}, {13, 12, 1.0, 64},
+    };
+    int64_t worst = 0;
+    for (const auto& k : cfgs) {
+        unsigned cm, cs;
+        smx_scale_regs(k.fs, 0.125, cm, cs);
+        const unsigned cfg = cs | ((unsigned)k.fp << 8);
+        std::normal_distribution<double> nd(0.0, k.sd);
+        std::vector<int16_t> x(k.n), p(k.n);
+        for (unsigned r = 0; r < 50; ++r) {
+            for (unsigned j = 0; j < k.n; ++j)
+                x[j] = (int16_t)std::max(-32768.0, std::min(32767.0, std::nearbyint(nd(rng) * std::ldexp(1.0, k.fs))));
+            const unsigned v = (r % 5 == 0) ? 1 + r % k.n : k.n;
+            smx_vector(x.data(), k.n, v, cm, cfg, p.data());
+            double mx = -1e300, sum = 0.0;
+            for (unsigned j = 0; j < v; ++j) mx = std::max(mx, x[j] * std::ldexp(1.0, -k.fs) * 0.125);
+            for (unsigned j = 0; j < v; ++j) sum += std::exp(x[j] * std::ldexp(1.0, -k.fs) * 0.125 - mx);
+            for (unsigned j = 0; j < k.n; ++j) {
+                const double ex = j < v ? std::exp(x[j] * std::ldexp(1.0, -k.fs) * 0.125 - mx) / sum : 0.0;
+                const int64_t want = std::min<int64_t>(32767, (int64_t)std::nearbyint(ex * std::ldexp(1.0, k.fp)));
+                worst = std::max<int64_t>(worst, std::llabs((int64_t)p[j] - want));
+            }
+        }
+    }
+    std::cout << "  smx_vector vs the exact softmax: worst " << worst << " LSB ... "
+              << (worst <= 1 ? "PASS" : "FAIL") << "\n";
+    return worst <= 1;
+}
+
+struct SmxEntry {
+    const char* desc;
+    unsigned op, size, outer, a_inc, b_inc;
+    int fs, fp;
+    unsigned valid0, period;
+};
+
+// Row mode: outer rows of size at stride a_inc -> stride b_inc.  Column mode:
+// s[size][outer] at row stride a_inc -> P[outer][size] at row stride b_inc.
+static const SmxEntry kSmxTests[] = {
+    { "SOFTMAX row 256 BERT q88",          OP_SOFTMAX,   256,  12, 256, 256,   8,  8, 256,   0 },
+    { "SOFTMAX row 13 tail",               OP_SOFTMAX,    13,   5,  16,  24,  10, 12,  13,   0 },
+    { "SOFTMAX row 2048 max",              OP_SOFTMAX,  2048,   2, 2048, 2048, 12, 12, 2048, 0 },
+    { "SOFTMAX row 1 single",              OP_SOFTMAX,     1,   3,   8,   8,  12, 12,   1,   0 },
+    { "SOFTMAX row 64 causal p16",         OP_SOFTMAX,    64,  32,  64,  64,  11, 12,   3,  16 },
+    { "SOFTMAX row 100 valid 37",          OP_SOFTMAX,   100,   4, 104, 104,  12, 15,  37,   0 },
+    { "SOFTMAX_T 64 keys x 32 q",          OP_SOFTMAX_T,  64,  32,  32,  64,  12, 12,  64,   0 },
+    { "SOFTMAX_T 1024 keys x 64 q vit",    OP_SOFTMAX_T, 1024, 64,  64, 1024, 12, 12, 1024,  0 },
+    { "SOFTMAX_T 80 keys x 48 q causal",   OP_SOFTMAX_T,  80,  48,  48,  96,  11, 12,   9,  16 },
+    { "SOFTMAX_T 37 keys x 16 q tail",     OP_SOFTMAX_T,  37,  16,  16,  40,  10, 12,  37,   0 },
+    { "SOFTMAX_T 512 keys x 96 q stride",  OP_SOFTMAX_T, 512,  96,  96,  520,  12, 12,  30,  32 },
+};
+
+static bool RunSoftmaxCase(const SmxEntry& t, unsigned seed) {
+    unsigned cm, cs;
+    smx_scale_regs(t.fs, 0.125, cm, cs);
+    const unsigned cfg = cs | ((unsigned)t.fp << 8), mask = t.valid0 | (t.period << 16);
+    const bool col = t.op == OP_SOFTMAX_T;
+    const unsigned n_vec = t.outer;                             // vectors (rows / query columns)
+    const unsigned a_n = col ? (t.size - 1) * t.a_inc + t.outer : (t.outer - 1) * t.a_inc + t.size;
+    const unsigned c_n = (n_vec - 1) * t.b_inc + vec_words_for(t.size) * kVecLanes;
+    AlignedBuf a(a_n + kVecLanes, Data_t(0));
+    AlignedBuf c(c_n + kVecLanes, kPoison);
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> nd(0.0, 3.0);
+    for (unsigned i = 0; i < a_n; ++i)
+        a[i] = from_raw16((int16_t)std::max(-32768.0, std::min(32767.0, std::nearbyint(nd(rng) * std::ldexp(1.0, t.fs)))));
+    // expected: per vector q, its inputs in order
+    std::vector<double> c_ref(c_n, 0.0);
+    std::vector<bool> written(c_n, false);
+    std::vector<int16_t> x(t.size), p(t.size);
+    for (unsigned q = 0; q < n_vec; ++q) {
+        for (unsigned j = 0; j < t.size; ++j)
+            x[j] = raw16(a[col ? j * t.a_inc + q : q * t.a_inc + j]);
+        smx_vector(x.data(), t.size, smx_valid(q, t.size, mask), cm, cfg, p.data());
+        for (unsigned j = 0; j < vec_words_for(t.size) * kVecLanes; ++j) {
+            const unsigned at = q * t.b_inc + j;
+            c_ref[at] = j < t.size ? (double)from_raw16(p[j]) : 0.0;
+            written[at] = true;
+        }
+    }
+    if (!g_dump_dir.empty()) {
+        AlignedBuf b(1, Data_t(0));
+        dump_one_case(t.desc, t.size, t.op, t.outer, t.a_inc, t.b_inc, ACT_NONE, 0u, a, b, c_ref,
+                      cm, cfg, mask, a_n);
+        return true;
+    }
+    hls::burst_maxi<VecWord> pa(reinterpret_cast<VecWord*>(a.p));
+    hls::burst_maxi<VecWord> pc(reinterpret_cast<VecWord*>(c.p));
+    VectorOPKernel(pa, pa, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, ACT_NONE, 0u, cm, cfg, mask);
+    unsigned bad = 0;
+    for (unsigned i = 0; i < c_n; ++i) {
+        const bool ok = written[i] ? (raw16(c[i]) == raw16(Data_t(c_ref[i]))) : (raw16(c[i]) == raw16(kPoison));
+        if (!ok && bad++ < 5)
+            std::cout << "\n    c[" << i << "] = " << raw16(c[i]) << (written[i] ? " want " : " (gap) want poison ")
+                      << (written[i] ? raw16(Data_t(c_ref[i])) : raw16(kPoison));
+    }
+    return bad == 0;
+}
+
+static bool RunSoftmaxTests() {
+    bool ok = true;
+    const unsigned n = sizeof(kSmxTests) / sizeof(kSmxTests[0]);
+    std::cout << "\n--- Softmax tests (" << (g_dump_dir.empty() ? n + 1 : n) << ") ---\n";
+    if (g_dump_dir.empty()) ok &= SmxMathTest(kSeed + 5000);
+    for (unsigned i = 0; i < n; ++i) {
+        std::cout << "[" << (i + 1) << "/" << n << "] " << kSmxTests[i].desc << " ... " << std::flush;
+        const bool r = RunSoftmaxCase(kSmxTests[i], kSeed + 6000 + i);
+        std::cout << (r ? "PASS" : "FAIL") << "\n";
+        ok &= r;
+    }
+    return ok;
+}
+
 // ---------------------------------------------------------------------------
 // Full test suite
 // ---------------------------------------------------------------------------
@@ -716,6 +861,7 @@ static bool RunAllTests() {
     allPassed &= RunGeomTests(kGeomTests, sizeof(kGeomTests) / sizeof(kGeomTests[0]),
                               "Geometry / activation tests", kSeed + 1000);
     allPassed &= RunActTests();
+    allPassed &= RunSoftmaxTests();
 
     const unsigned nTotal = nRandom
                           + sizeof(kSatTests)     / sizeof(kSatTests[0])
@@ -724,7 +870,9 @@ static bool RunAllTests() {
                           + sizeof(kActSatTests)  / sizeof(kActSatTests[0])
                           + sizeof(kActGeomTests) / sizeof(kActGeomTests[0])
                           + (g_dump_dir.empty()
-                             ? sizeof(kExhaustiveTests) / sizeof(kExhaustiveTests[0]) : 0);
+                             ? sizeof(kExhaustiveTests) / sizeof(kExhaustiveTests[0]) : 0)
+                          + sizeof(kSmxTests) / sizeof(kSmxTests[0])
+                          + (g_dump_dir.empty() ? 1 : 0);
     std::cout << "\n"
               << (allPassed ? "All " : "FAILED — ")
               << nTotal << " tests"
@@ -764,7 +912,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(g_manifest,
             "# VectorOPKernel test fixture manifest\n"
-            "# idx size op outer a_inc b_inc act alpha label\n");
+            "# idx size op outer a_inc b_inc act alpha smx_cm smx_cfg smx_mask label\n");
 
         std::cout << "VectorOP test data dump → " << g_dump_dir << "\n";
         const bool ok = RunAllTests();

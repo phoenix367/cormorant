@@ -16,10 +16,13 @@
 //
 // Usage:
 //   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow]
-//       [--case "size op outer a_inc b_inc act [mode [alpha]]"] [--perf] [--quiet]
-//       [--max-cycles N] [--trace FILE]
+//       [--case "size op outer a_inc b_inc act [mode [alpha [smx_cm smx_cfg smx_mask]]]"]
+//       [--perf] [--quiet] [--max-cycles N] [--trace FILE]
 // (--case may be repeated; data mode 0: values in +-8, 1: any, 2: any with
 // edge values, 3: a[i] = i mod 2^16 — size 65536 covers every Q8.8 input.)
+// The softmax ops (10 row mode, 11 column mode; SOFTMAX_PLAN) write with
+// c_inc = b_inc; column mode reads size key rows of outer queries and writes
+// outer & ~15 rows of size.
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdarg>
@@ -60,6 +63,7 @@ enum : uint8_t {
   R_CTRL = 0x00, R_GIE = 0x04, R_IER = 0x08, R_ISR = 0x0C,
   R_A = 0x10, R_B = 0x1C, R_C = 0x28, R_SIZE = 0x34, R_OP = 0x3C, R_OUTER = 0x44,
   R_AINC = 0x4C, R_BINC = 0x54, R_ACT = 0x5C, R_ALPHA = 0x64,
+  R_SCM = 0x6C, R_SCFG = 0x74, R_SMASK = 0x7C,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +72,7 @@ enum : uint8_t {
 struct Case {
   std::string label;
   uint32_t size = 1, op = 0, outer = 1, a_inc = 0, b_inc = 0, act = 0, alpha = 0;
+  uint32_t smx_cm = 0, smx_cfg = 0, smx_mask = 0;
   uint64_t a = 0, b = 0, c = 0;          // byte addresses
   std::vector<uint16_t> av, bv, cv;      // fixture data (empty: random)
   int data_mode = 0;
@@ -75,11 +80,20 @@ struct Case {
 
 static uint64_t n_words(uint32_t size) { return ((uint64_t)size + 7) / 8; }
 static bool unary(uint32_t op) { return op >= 4; }
+static bool softmax(uint32_t op) { return op == 10 || op == 11; }
+static uint32_t c_inc_of(const Case& t) { return softmax(t.op) ? t.b_inc : t.a_inc + t.b_inc; }
+// rows of the output: column-mode softmax writes outer & ~15 of them
+static uint32_t out_rows(const Case& t) { return t.op == 11 ? (t.outer & ~15u) : t.outer; }
 
 // Words of an operand / output that the kernel touches, from its base.
 static uint64_t span_words(const Case& t, uint32_t inc, bool input) {
   if (t.size == 0 || t.outer == 0) return 0;
   const uint64_t nw = n_words(t.size);
+  if (t.op == 11) {             // column softmax: the C++ reads size rows of outer queries
+    if (input) return (uint64_t)(t.size - 1) * (inc / 8) + n_words(t.outer);
+    const uint32_t rows = out_rows(t);
+    return rows ? (uint64_t)(rows - 1) * (inc / 8) + nw : 0;
+  }
   if (input && t.outer > 1 && inc == 0 && nw <= 256) return nw;
   if (t.outer == 1 || (inc == t.size && t.size % 8 == 0)) return (uint64_t)t.outer * nw;
   return (uint64_t)(t.outer - 1) * (inc / 8) + nw;
@@ -233,7 +247,7 @@ struct Tb {
 
   // Runs one case; returns the kernel cycle count (0 on failure).
   uint64_t run(Case& t) {
-    const uint32_t c_inc = t.a_inc + t.b_inc;
+    const uint32_t c_inc = c_inc_of(t);
     const uint64_t a_w = span_words(t, t.a_inc, true) + 1;
     const uint64_t b_w = span_words(t, t.b_inc, true) + 1;
     const uint64_t c_w = span_words(t, c_inc, false);
@@ -257,7 +271,8 @@ struct Tb {
     std::vector<VecWord> oa = words_of(t.a, a_w), ob = words_of(t.b, b_w), oc = words_of(t.c, c_w);
     {
       hls::burst_maxi<VecWord> pa(oa.data()), pb(ob.data()), pc(oc.data());
-      VectorOPKernel(pa, pb, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act, t.alpha);
+      VectorOPKernel(pa, pb, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act, t.alpha,
+                     t.smx_cm, t.smx_cfg, t.smx_mask);
     }
     // HLS C simulation and the synthesised HLS kernel differ in one DIV case:
     // a = -128 (0x8000), b = -1/256 (0xFFFF).  C simulation divides in a 24-bit
@@ -290,10 +305,12 @@ struct Tb {
     lite.write(R_SIZE, t.size); lite.write(R_OP, t.op); lite.write(R_OUTER, t.outer);
     lite.write(R_AINC, t.a_inc); lite.write(R_BINC, t.b_inc); lite.write(R_ACT, t.act);
     lite.write(R_ALPHA, t.alpha);
+    lite.write(R_SCM, t.smx_cm); lite.write(R_SCFG, t.smx_cfg); lite.write(R_SMASK, t.smx_mask);
     lite.write(R_GIE, 1); lite.write(R_IER, 1);
     if (lite.read(R_SIZE) != t.size || lite.read(R_C) != (uint32_t)t.c ||
         lite.read(R_ACT) != t.act || lite.read(R_ALPHA) != t.alpha ||
-        lite.read(R_C + 4) != (uint32_t)(t.c >> 32))
+        lite.read(R_C + 4) != (uint32_t)(t.c >> 32) || lite.read(R_SCM) != t.smx_cm ||
+        lite.read(R_SCFG) != t.smx_cfg || lite.read(R_SMASK) != t.smx_mask)
       tb_fatal("register read-back mismatch");
     if (!(lite.read(R_CTRL) & 4)) tb_fatal("kernel not idle before start");
 
@@ -337,13 +354,14 @@ struct Tb {
 #endif
     if (!t.cv.empty()) {                                // fixture: runs vs c.hex, tails 0
       const uint64_t nw = n_words(t.size);
-      for (uint32_t o = 0; o < t.outer; o++)
+      const uint32_t rows = out_rows(t);
+      for (uint32_t o = 0; o < rows; o++)
         for (uint64_t i = 0; i < 8 * nw; i++) {
           const uint64_t e = (uint64_t)o * c_inc + i;
           const uint16_t got = mem.rd16(t.c + 2 * e);
           if (i < t.size) {
             if (e < t.cv.size() && got != t.cv[e]) report("fixture", e, got, t.cv[e]);
-          } else if (o + 1 == t.outer && got != 0) {
+          } else if (o + 1 == rows && got != 0) {
             report("tail", e, got, 0);
           }
         }
@@ -367,7 +385,7 @@ struct Tb {
       return 0;
     }
     if (!quiet) {
-      const double words = (double)t.outer * (double)n_words(t.size);
+      const double words = (double)out_rows(t) * (double)n_words(t.size);
       std::printf("PASS  %-40s  size=%u op=%u outer=%u inc=%u/%u act=%u  %llu cyc  %.2f word/cyc\n",
                   t.label.c_str(), t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act,
                   (unsigned long long)cyc, words / (double)std::max<uint64_t>(cyc, 1));
@@ -389,13 +407,41 @@ static void place(Case& t, std::mt19937& rng) {
     g_region &= ~15ull;
     return base;
   };
-  const uint32_t c_inc = t.a_inc + t.b_inc;
+  const uint32_t c_inc = c_inc_of(t);
   t.a = next(span_words(t, t.a_inc, true) + 1);
   t.b = next(span_words(t, t.b_inc, true) + 1);
   t.c = next(span_words(t, c_inc, false));
 }
 
 static uint32_t round8(uint32_t v) { return (v + 7) / 8 * 8; }
+
+// A softmax case (op 10 / 11) within VectorOP.h's limits (rows <= 2048,
+// keys <= 1024): scales around the models' (Cs 10 .. 30, f_p 8 .. 15), at
+// times any register value (Cm's ignored high bits, Cs to 63, f_p to 31);
+// valid lengths from smx_mask, causal (period) or not.
+static void random_softmax(Case& t, std::mt19937& rng) {
+  auto U = [&](uint32_t lo, uint32_t hi) { return std::uniform_int_distribution<uint32_t>(lo, hi)(rng); };
+  t.act = 0;
+  if (t.op == 10) {
+    t.size  = (U(0, 2) == 0) ? U(1, 24) : U(1, 2048);
+    t.outer = (t.size > 1024) ? U(1, 4) : U(1, 24);
+    const uint32_t step = (t.size % 8 == 0 && U(0, 1)) ? t.size : round8(t.size) + 8 * U(0, 2);
+    t.a_inc = (U(0, 7) == 0) ? 0 : step;                // 0: every row the same input (replay)
+    t.b_inc = (t.size % 8 == 0 && U(0, 1)) ? t.size : round8(t.size) + 8 * U(0, 2);
+  } else {
+    t.size  = (U(0, 2) == 0) ? U(1, 40) : U(1, 1024);
+    t.outer = 16 * U(1, t.size > 256 ? 3 : 8) + ((U(0, 5) == 0) ? U(1, 15) : 0);
+    t.a_inc = round8(t.outer) + 8 * U(0, 2);
+    t.b_inc = (t.size % 8 == 0 && U(0, 1)) ? t.size : round8(t.size) + 8 * U(0, 2);
+  }
+  t.smx_cm  = (U(0, 9) == 0) ? U(0, 0xFFFFFFFFu) : U(1u << 23, (1u << 24) - 1);
+  const uint32_t cs = (U(0, 9) == 0) ? U(0, 63) : U(10, 30);
+  const uint32_t fp = (U(0, 9) == 0) ? U(0, 31) : U(8, 15);
+  t.smx_cfg = cs | (fp << 8) | ((U(0, 9) == 0) ? (U(0, 0xFFFF) << 16) : 0);
+  const uint32_t valid0 = (U(0, 3) == 0) ? U(0, t.size + 4) : (U(0, 9) == 0 ? 0xFFFF : t.size);
+  const uint32_t period = (U(0, 2) == 0) ? U(1, 40) : 0;
+  t.smx_mask = valid0 | (period << 16);
+}
 
 // A random case: mostly within the documented contract (bases 16-byte
 // aligned, a_inc / b_inc 0 or multiples of 8), sometimes outside it (other
@@ -404,7 +450,17 @@ static uint32_t round8(uint32_t v) { return (v + 7) / 8 * 8; }
 static Case random_case(std::mt19937& rng) {
   auto U = [&](uint32_t lo, uint32_t hi) { return std::uniform_int_distribution<uint32_t>(lo, hi)(rng); };
   Case t;
-  t.op    = (U(0, 19) == 0) ? U(10, 12) : U(0, 9);
+  if (U(0, 6) == 0) {                                  // softmax
+    t.op = U(10, 11);
+    random_softmax(t, rng);
+    t.data_mode = (int)U(0, 2);
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "rand_smx%u_s%u_o%u_i%u_%u_%x_%x_%x", t.op, t.size, t.outer,
+                  t.a_inc, t.b_inc, t.smx_cm, t.smx_cfg, t.smx_mask);
+    t.label = buf;
+    return t;
+  }
+  t.op    = (U(0, 19) == 0) ? U(12, 14) : U(0, 9);
   t.act   = (U(0, 19) == 0) ? U(7, 9) : U(0, 6);
   t.alpha = (U(0, 9) == 0) ? U(0, 0xFFFFFFFFu) : U(0, 0xFFFF);
   const uint32_t shape = U(0, 9);
@@ -468,6 +524,9 @@ static std::vector<Case> load_fixtures(const std::string& dir) {
     t.size = std::stoul(tok[1]); t.op = std::stoul(tok[2]); t.outer = std::stoul(tok[3]);
     t.a_inc = std::stoul(tok[4]); t.b_inc = std::stoul(tok[5]); t.act = std::stoul(tok[6]);
     if (tok.size() >= 9) t.alpha = std::stoul(tok[7]);   // manifests before alpha: 0
+    if (tok.size() >= 12) {                              // manifests before softmax: 0
+      t.smx_cm = std::stoul(tok[8]); t.smx_cfg = std::stoul(tok[9]); t.smx_mask = std::stoul(tok[10]);
+    }
     t.label = "fx" + tok[0] + "_" + tok.back();
     if (t.label.size() > 40) t.label.resize(40);
     char pre[32];
@@ -541,9 +600,10 @@ int main(int argc, char** argv) {
     is >> t.size >> t.op >> t.outer >> t.a_inc >> t.b_inc >> t.act;
     if (!(is >> t.data_mode)) t.data_mode = 0;
     if (!(is >> t.alpha)) t.alpha = 0;
-    char buf[64];
-    std::snprintf(buf, sizeof buf, "case_s%u_op%u_act%u_m%d_al%x", t.size, t.op, t.act,
-                  t.data_mode, t.alpha);
+    if (!(is >> t.smx_cm >> t.smx_cfg >> t.smx_mask)) t.smx_cm = t.smx_cfg = t.smx_mask = 0;
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "case_s%u_op%u_act%u_m%d_al%x_%x_%x_%x", t.size, t.op, t.act,
+                  t.data_mode, t.alpha, t.smx_cm, t.smx_cfg, t.smx_mask);
     t.label = buf;
     cases.push_back(t);
   }
@@ -553,6 +613,9 @@ int main(int argc, char** argv) {
       Case t;
       t.label = l; t.size = size; t.op = op; t.outer = outer; t.a_inc = ai; t.b_inc = bi;
       t.act = act;
+      if (softmax(op)) {                                // q88 scores, P at 2^-15, every key valid
+        t.smx_cm = 12102203; t.smx_cfg = 19 | (15 << 8); t.smx_mask = size;
+      }
       cases.push_back(t);
     };
     add("perf_add_64k", 65536, 0, 1, 0, 0);
@@ -565,6 +628,9 @@ int main(int argc, char** argv) {
     add("perf_bcast_rows_5000", 5000, 0, 16, 5008, 0);    // b over the replay bound
     add("perf_gelu_64k", 65536, 8, 1, 0, 0);              // an activation op (vo_act)
     add("perf_add_silu_64k", 65536, 0, 1, 0, 0, 4);       // ADD + act SILU
+    add("perf_smx_bert_256x256", 256, 10, 256, 256, 256);  // BERT: a head's rows
+    add("perf_smx_t_vit_1024x64", 1024, 11, 64, 1024, 1024);   // SmolVLM: 1024 keys, 4 blocks
+    add("perf_smx_t_llm_256x256", 256, 11, 256, 256, 256);     // a prefill-256 head
   }
   for (int i = 0; i < n_random; i++) cases.push_back(random_case(crng));
   if (cases.empty()) tb_fatal("nothing to run (use --fixtures, --random, --case or --perf)");

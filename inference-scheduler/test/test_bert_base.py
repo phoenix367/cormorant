@@ -32,6 +32,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
 from src.nodes import ACT_GELU_TANH, MatmulConvNode, MatmulNode, ScheduledNode
+from src.smx_nodes import SoftmaxVopNode, enabled as softmax_unit
 
 _STUDY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "demo", "bert_squad", "scripts")
@@ -73,9 +74,11 @@ class TestBertBase(unittest.TestCase):
         self.assertEqual(self.g.fusion_counts,
                          {"layernorm": 25, "gelu": 12, "silu": 0, "const_bcast": 15})
         # the 12 GELUs run on VectorOP's activation unit, fused into the FFN
-        # bias Adds (bit-identical to the host op: test_activations.py)
-        self.assertEqual((k[LayerNormNode], k[GeluNode], k[SoftmaxNode], k[TransposeNode]),
-                         (25, 0, 12, 49))
+        # bias Adds (bit-identical to the host op: test_activations.py); the 12
+        # softmaxes on its softmax unit where the platform has it
+        smx = 12 if softmax_unit() else 0
+        self.assertEqual((k[LayerNormNode], k[GeluNode], k[SoftmaxNode], k[SoftmaxVopNode],
+                          k[TransposeNode]), (25, 0, 12 - smx, smx, 49))
         self.assertEqual(sum(1 for sn in self.g.nodes if isinstance(sn, ScheduledNode)
                              and sn.act == ACT_GELU_TANH), 12)
         self.assertEqual((k[MatmulNode] + k[MatmulConvNode], k[ScheduledNode]), (98, 126))
@@ -118,7 +121,7 @@ class TestBertBase(unittest.TestCase):
         import bert_sched_check as chk
         bs.HERE = ASSETS
         _, pick = bs.pick_examples(1)
-        bert = bs.Bert(MODEL, bs.POLS["sched"])
+        bert = bs.Bert(MODEL, bs.POLS["sched+vsmx" if softmax_unit() else "sched"])
         res, a, b, (n_cmp, n_bad) = chk.compare(self.cg, bert, bs.feeds_of(pick[0][1]))
         self.assertEqual(n_bad, 0)
         self.assertGreater(n_cmp, 300)

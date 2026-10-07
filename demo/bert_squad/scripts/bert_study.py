@@ -204,6 +204,13 @@ class Bert:
                 outs = [_libm_tanh(ins[0]) if self.pol.get("sched") else np.tanh(ins[0])]
             elif op == "ReduceMean":
                 outs = [np.mean(ins[0], axis=tuple(a["axes"]), keepdims=bool(a.get("keepdims", 1)))]
+            elif op == "Softmax" and self.pol.get("vsmx"):
+                # VectorOPKernel's row softmax (doc/plans/SOFTMAX_PLAN.md §2.1): Q8.8 in
+                # (the masked scores, already scaled), Q8.8 out; the last axis
+                x = ins[0]
+                raw = np.rint(np.asarray(x, np.float64) * 256.0).astype(np.int64).reshape(-1, x.shape[-1])
+                cm, cs = _vsmx().scale_regs(8, 1.0)
+                outs = [(_vsmx().softmax_raw(raw, raw.shape[1], cm, cs, 8) / 256.0).reshape(x.shape)]
             elif op == "Softmax":
                 x = ins[0]; ax = a.get("axis", 1)
                 xm = x - x.max(axis=ax, keepdims=True)
@@ -268,7 +275,15 @@ POLS = {
     "fused+w+p7": {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "w_shift": 1, "p_shift": 7},
     "fused+fw":   {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "float_weights": 1},
     "sched":      {"sched": 1},   # exactly the phase-1 scheduler partition (bert_sched_check.py)
+    "sched+vsmx": {"sched": 1, "vsmx": 1},   # its Softmax on VectorOPKernel (SOFTMAX_PLAN)
 }
+
+
+def _vsmx():
+    """inference-scheduler/src/vectorop_smx.py: the FPGA softmax's specification."""
+    sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
+    from src import vectorop_smx
+    return vectorop_smx
 
 # ----------------------------------------------------------------- examples
 def pick_examples(n):

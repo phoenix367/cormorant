@@ -11,6 +11,8 @@ set rtl_files [list \
   $root/rtl/vo_act_rom.sv \
   $root/rtl/vo_act.sv \
   $root/rtl/vo_compute.sv \
+  $root/rtl/vo_smx_rom.sv \
+  $root/rtl/vo_smx.sv \
   $root/rtl/vo_core.sv \
   $root/rtl/VectorOPKernel.v \
 ]

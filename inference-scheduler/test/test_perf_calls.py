@@ -35,6 +35,9 @@ _FN = {
     "run_conv":      ("ConvKernel", 4, FIELDS["ConvKernel"]),
     "run_conv_at":   ("ConvKernel", 6, FIELDS["ConvKernel"]),
     "run_pool":      ("PoolKernel", 2, FIELDS["PoolKernel"]),
+    # the softmax unit (a, a_off, c, c_off, ...); its scale / mask registers are no keys
+    "run_softmax":   ("VectorOPKernel", 4, ("size", "op", "outer", "a_inc", "b_inc", "_cm", "_cfg",
+                                            "_mask")),
 }
 _CALL = re.compile(r"\b(" + "|".join(sorted(_FN, key=len, reverse=True)) + r")\(")
 _LOOP = re.compile(r"for \(unsigned _i = 0u; _i < (\d+)u; _i\+\+\)")
@@ -75,7 +78,7 @@ class _Eval:
         self.names.update({v: k for k, v in ACT_NAMES.items()})
 
     def __call__(self, expr, env=None):
-        py = re.sub(r"\b(\d+)u\b", r"\1", expr).replace("/", "//")
+        py = re.sub(r"\b(0x[0-9A-Fa-f]+|\d+)u\b", r"\1", expr).replace("/", "//")
         py = re.sub(r"\(unsigned\)", "", py)
 
         def align_up(n):

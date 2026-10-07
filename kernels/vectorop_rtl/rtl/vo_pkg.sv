@@ -24,17 +24,23 @@ package vo_pkg;
   // the activation op - 3 (ACT_LEAKY_RELU .. ACT_GELU_TANH).
   localparam logic [31:0] OP_ADD = 32'd0, OP_SUB = 32'd1, OP_MUL = 32'd2, OP_DIV = 32'd3,
                           OP_RELU = 32'd4, OP_RELU6 = 32'd5,
-                          OP_LEAKY_RELU = 32'd6, OP_GELU_TANH = 32'd9;
+                          OP_LEAKY_RELU = 32'd6, OP_GELU_TANH = 32'd9,
+                          OP_SOFTMAX = 32'd10, OP_SOFTMAX_T = 32'd11;
   localparam logic [31:0] ACT_RELU = 32'd1, ACT_RELU6 = 32'd2, ACT_LEAKY_RELU = 32'd3,
                           ACT_SILU = 32'd4, ACT_GELU = 32'd5, ACT_GELU_TANH = 32'd6;
   localparam logic [15:0] SIX = 16'h0600;   // 6.0 in Q8.8
 
-  // How one operand (or the output) walks DDR during a job: n_runs runs of
-  // run_words words, run r at word base + r * stride_w; the last word of every
-  // run has `tail` valid lanes (1..8).  replay: one run, streamed `reps` times.
+  // How one operand (or the output) walks DDR during a job: n_blk blocks, block
+  // b at word base + b * blk_w, each of n_runs runs of run_words words, run r
+  // at the block's base + r * stride_w; the last word of every run has `tail`
+  // valid lanes (1..8).  replay: one run, streamed `reps` times.  Blocks
+  // (n_blk > 1) are the softmax's column mode only (vo_smx: 16 query columns
+  // of every key row); every other geometry is one block.
   typedef struct packed {
     logic        en;
     logic [59:0] base_w;      // word address of the first run
+    logic [31:0] n_blk;
+    logic [31:0] blk_w;
     logic [31:0] n_runs;
     logic [31:0] run_words;
     logic [31:0] stride_w;

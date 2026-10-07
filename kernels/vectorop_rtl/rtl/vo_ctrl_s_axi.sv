@@ -8,6 +8,7 @@
 //   0x04 GIE   0x08 IER (b0 done, b1 ready)   0x0C ISR (toggle on write)
 //   0x10/14 a  0x1C/20 b  0x28/2C c  0x34 size  0x3C op  0x44 outer
 //   0x4C a_inc  0x54 b_inc  0x5C act  0x64 alpha
+//   0x6C smx_cm  0x74 smx_cfg  0x7C smx_mask  (the softmax ops, SOFTMAX_PLAN)
 //
 // Like the HLS slave, AW and W are taken one after the other and every
 // access gets an OKAY response.  (Derived from the RTL MatmulKernel's
@@ -53,13 +54,16 @@ module vo_ctrl_s_axi (
   output logic [31:0] a_inc,
   output logic [31:0] b_inc,
   output logic [31:0] act,
-  output logic [31:0] alpha
+  output logic [31:0] alpha,
+  output logic [31:0] smx_cm,
+  output logic [31:0] smx_cfg,
+  output logic [31:0] smx_mask
 );
   localparam logic [6:0] A_CTRL = 7'h00, A_GIE = 7'h04, A_IER = 7'h08, A_ISR = 7'h0C,
                          A_A0 = 7'h10, A_A1 = 7'h14, A_B0 = 7'h1C, A_B1 = 7'h20,
                          A_C0 = 7'h28, A_C1 = 7'h2C, A_SIZE = 7'h34, A_OP = 7'h3C,
                          A_OUTER = 7'h44, A_AINC = 7'h4C, A_BINC = 7'h54, A_ACT = 7'h5C,
-                         A_ALPHA = 7'h64;
+                         A_ALPHA = 7'h64, A_SCM = 7'h6C, A_SCFG = 7'h74, A_SMASK = 7'h7C;
 
   // Write channel ------------------------------------------------------------------
   // Every AXI-Lite input is registered before it is decoded: the address and
@@ -134,6 +138,7 @@ module vo_ctrl_s_axi (
       int_irq             <= 1'b0;
       a <= '0; b <= '0; c <= '0; size <= '0; op <= '0; outer <= '0;
       a_inc <= '0; b_inc <= '0; act <= '0; alpha <= '0;
+      smx_cm <= '0; smx_cfg <= '0; smx_mask <= '0;
     end else begin
       int_irq <= int_gie && (|int_isr);
 
@@ -176,6 +181,9 @@ module vo_ctrl_s_axi (
           A_BINC:  b_inc          <= merge(b_inc);
           A_ACT:   act            <= merge(act);
           A_ALPHA: alpha          <= merge(alpha);
+          A_SCM:   smx_cm         <= merge(smx_cm);
+          A_SCFG:  smx_cfg        <= merge(smx_cfg);
+          A_SMASK: smx_mask       <= merge(smx_mask);
           default: ;
         endcase
       end
@@ -227,6 +235,9 @@ module vo_ctrl_s_axi (
         A_BINC:  rdata <= b_inc;
         A_ACT:   rdata <= act;
         A_ALPHA: rdata <= alpha;
+        A_SCM:   rdata <= smx_cm;
+        A_SCFG:  rdata <= smx_cfg;
+        A_SMASK: rdata <= smx_mask;
         default: ;
       endcase
     end

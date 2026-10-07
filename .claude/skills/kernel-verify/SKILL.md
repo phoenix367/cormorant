@@ -20,7 +20,7 @@ HLS ConvKernel).
 | synthesis report | `$BUILD_DIR/kernels/matmul_rtl/synth/` (`timing.rpt`, `utilization.rpt`, the make output's `RESULT` line) | `$BUILD_DIR/kernels/vectorop_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/pool_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/conv_rtl/synth/` (also `timing_paths.rpt`: one path per endpoint) |
 | RTL behaviour test | `behavior_test_matmul` | `behavior_test_vectorop` | `behavior_test_pool` | `behavior_test_conv` |
 | report (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_op_test_report.json` | `vector_op_test_report.json` | `pooling_test_report.json` | `conv_test_report.json` |
-| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (201 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (63 cases) |
+| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (212 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (63 cases) |
 | fixture target → output | `gen_matmul_test_data` → `$BUILD_DIR/matmul_test_data/` | `gen_vectorop_test_data` → `$BUILD_DIR/vectorop_test_data/` | `gen_pool_test_data` → `$BUILD_DIR/pool_test_data/` | `gen_conv_test_data` → `$BUILD_DIR/conv_test_data/` |
 | test-stand testbench | `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` | `hw/cormorant_test_stand/kernels/pooling_test/pooling_test.srcs/sim_1/new/pooling_tb.sv` | `hw/cormorant_test_stand/kernels/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` |
 | block-design testbench (`hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`) | `mm_regmap.svh`, `mm_classes.svh`, `tb_functions.svh` | `vop_regmap.svh`, `vop_classes.svh`, `tb_functions.svh` | `pk_regmap.svh`, `pk_classes.svh`, `tb_functions.svh` | `conv_regmap.svh`, `conv_classes.svh`, `tb_functions.svh` |
@@ -286,7 +286,7 @@ make behavior_test_matmul             # or behavior_test_vectorop
   [ck] MatmulKernel: PASS  (50/50)  …/matmul_op_test_report.json
   ```
 
-  (`VectorOPKernel … total=201 passed=201`, `vector_op_test_report.json`;
+  (`VectorOPKernel … total=212 passed=201`, `vector_op_test_report.json`;
   `PoolingKernel … total=45 passed=45`, `[ck] PoolingKernel: PASS  (45/45)`,
   `pooling_test_report.json`; `ConvKernel … total=63 passed=63`,
   `[ck] ConvKernel: PASS  (63/63)`, `conv_test_report.json`).
@@ -367,8 +367,8 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    make sim_hw_kv260
    ```
 
-   Pass: `##  TOTAL: 73 / 73 passed` and `##  ALL TESTS PASSED`
-   (VectorOPKernel 27, ConvKernel 17, MatmulKernel 10, PoolingKernel 19)
+   Pass: `##  TOTAL: 75 / 75 passed` and `##  ALL TESTS PASSED`
+   (VectorOPKernel 29, ConvKernel 17, MatmulKernel 10, PoolingKernel 19)
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
    in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).

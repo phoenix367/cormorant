@@ -2,6 +2,10 @@
  *
  * args: instance label op size outer a_inc b_inc iters [warmup]
  * output (stdout): one JSON line
+ *
+ * The softmax ops (10 row mode, 11 column mode; doc/plans/SOFTMAX_PLAN.md) run
+ * with scores at 2^-8, P at 2^-15 and every element valid; c advances by
+ * b_inc.  An IP without the softmax unit (no smx_cm register) is refused.
  */
 #include "inference.h"
 #include "xvectoropkernel.h"
@@ -26,6 +30,13 @@ static void run_once(XVectoropkernel *k,
     XVectoropkernel_Set_act(k, 0);      /* no fused activation; the register keeps the last program's value */
 #ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA   /* IPs with the activation unit */
     XVectoropkernel_Set_alpha(k, 0);    /* LeakyReLU slope, likewise */
+#endif
+#ifdef XVECTOROPKERNEL_CTRL_ADDR_SMX_CM_DATA  /* IPs with the softmax unit: written for the */
+    if (op == 10u || op == 11u) {                /* softmax ops only, as run_softmax() does */
+        XVectoropkernel_Set_smx_cm(k, 12102203u);           /* log2(e) * 2^-8 * 2^12, Cs 19 */
+        XVectoropkernel_Set_smx_cfg(k, 19u | (15u << 8));   /* P at 2^-15 */
+        XVectoropkernel_Set_smx_mask(k, sz & 0xFFFFu);      /* every element valid */
+    }
 #endif
     XVectoropkernel_Start(k);
     while (!XVectoropkernel_IsDone(k)) {}
@@ -59,6 +70,24 @@ int main(int argc, char **argv)
     unsigned a_n = (ai > 0u) ? outer * sz : sz;
     unsigned b_n = (bi > 0u) ? outer * sz : sz;
     unsigned c_n = outer * sz;
+    if (op == 10u || op == 11u) {
+#ifdef XVECTOROPKERNEL_CTRL_ADDR_SMX_CM_DATA
+        XVectoropkernel_Set_smx_cm(&k, 0x5A5A5Au);
+        if (XVectoropkernel_Get_smx_cm(&k) != 0x5A5A5Au) {
+#else
+        {
+#endif
+            fprintf(stderr, "bench_vectorop: the VectorOPKernel has no softmax unit\n");
+            return 1;
+        }
+        /* row mode: rows at a_inc -> rows at b_inc; column mode: size key rows of
+         * outer queries at a_inc -> (outer & ~15) rows of size at b_inc */
+        unsigned rows = (op == 11u) ? (outer & ~15u) : outer, span = (sz + 7u) & ~7u;
+        a_n = (op == 11u) ? (sz - 1u) * ai + ((outer + 7u) & ~7u) : (outer - 1u) * ai + span;
+        b_n = 8u;
+        c_n = (rows ? rows - 1u : 0u) * bi + span;
+    }
+    a_n += 64u; c_n += 64u;                 /* whole 16-byte words past the end */
 
     inference_buf_t *ba = inference_buf_alloc(a_n);
     inference_buf_t *bb = inference_buf_alloc(b_n);
@@ -93,9 +122,9 @@ int main(int argc, char **argv)
     double ms  = (double)(t1.tv_sec  - t0.tv_sec ) * 1e3
                + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-6;
     double lat = ms / (double)iters;
-    /* unary ops (RELU, RELU6) touch 2 ports; binary ops touch 3 */
+    /* unary ops (RELU, RELU6, the activations, the softmax) touch 2 ports; binary ops 3 */
     unsigned ports = (op >= 4u) ? 2u : 3u;
-    double gbs = (double)(ports * c_n * INFERENCE_BYTES_PER_ELEM)
+    double gbs = (double)(ports * (c_n - 64u) * INFERENCE_BYTES_PER_ELEM)
                  / (lat * 1e-3) / 1e9;
 
     printf("{\"kernel\":\"VectorOPKernel\",\"label\":\"%s\","

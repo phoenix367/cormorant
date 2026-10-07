@@ -46,6 +46,7 @@ from . import fusion
 from . import matmul_lowering
 from . import numeric
 from . import vectorop_act
+from . import smx_nodes
 from .matmul_gemv import choose_gemv
 from . import fc_conv as fc_conv_mod
 
@@ -794,6 +795,10 @@ class OnnxGraph:
                 # (Gelu) the host op where the unit cannot run it
                 sn = vectorop_act.from_onnx(node, self._tensors, idx, align_elems,
                                             host_ctx, _dtype)
+            elif node.op_type == "Softmax":
+                # VectorOPKernel's softmax unit, or the host op where it cannot run
+                sn = smx_nodes.from_onnx_softmax(node, self._tensors, idx, align_elems,
+                                                 host_ctx, _dtype)
             elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
                                                      host_ctx)

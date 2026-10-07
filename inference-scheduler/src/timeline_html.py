@@ -644,7 +644,7 @@ const SRC_HINT = {
   unpriced: "unpriced: outside the performance model (no measurement, no fitted model covers it); counted as 0 in the prediction."};
 function srcPill(s){ return s ? `<span class="pill ${esc(s)}" title="${esc(SRC_HINT[s] || s)}">${esc(s)}</span>` : ""; }
 const DECODE = {
-  VectorOPKernel: {op: ["add", "sub", "mul", "div", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh"], act: ["none", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh"]},
+  VectorOPKernel: {op: ["add", "sub", "mul", "div", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh", "softmax", "softmax_t"], act: ["none", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh"]},
   PoolKernel: {pool_type: ["max", "avg", "Lp"], count_include_pad: ["no", "yes"]},
   ConvKernel: {has_bias: ["no", "yes"], is_dw: ["no", "yes"]},
   MatmulKernel: {b_packed: ["no", "yes"]}};

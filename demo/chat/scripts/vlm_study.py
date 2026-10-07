@@ -419,6 +419,10 @@ class VisionModel(ls.Model):
         if not self.q or self.exact("s"):
             return super().softmax(s, mask, fs, fp, layer)
         raw = np.rint(s * p2(fs)).astype(np.int64)
+        if self.pol.get("vsmx"):
+            # VectorOPKernel's softmax (doc/plans/SOFTMAX_PLAN.md §2.1), every key valid
+            cm, cs = ls.vsmx().scale_regs(int(fs), 1.0 / math.sqrt(self.cfg.HD))
+            return ls.vsmx().softmax_raw(raw, raw.shape[-1], cm, cs, int(fp)) * p2(-int(fp))
         k = raw.max(-1, keepdims=True) - raw
         e = sexp2_table(int(fs), 1.0 / math.sqrt(self.cfg.HD))[k]
         return self.host(e / np.cumsum(e, -1)[..., -1:], "p", layer, fp, record=False)
@@ -628,6 +632,7 @@ VPOLICIES = {
     "pow2":            dict(_F, fmt="pow2"),
     "pow2+p12":        dict(_F, fmt="pow2", p_bits=12),
     "pow2+p12+vgelu":  dict(_F, fmt="pow2", p_bits=12, vop_gelu=True),   # OFFLOAD_PLAN §2.1
+    "pow2+p12+vgelu+vsmx": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True),   # SOFTMAX_PLAN
     "pow2+p13":        dict(_F, fmt="pow2", p_bits=13),
     "pow2+p14":        dict(_F, fmt="pow2", p_bits=14),
     "pow2+p15":        dict(_F, fmt="pow2", p_bits=15),
@@ -646,9 +651,14 @@ VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's ac
                                       # generates where the platform has the unit
 
 
-def vision_policy(activations: bool) -> str:
+def vision_policy(activations: bool, softmax: bool = False) -> str:
     """The vision policy the scheduler's `vision` entry computes: VISION_VOP on a
-    VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU)."""
+    VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU);
+    with ``softmax`` (the softmax unit, doc/plans/SOFTMAX_PLAN.md) VISION_VOP + vsmx."""
+    if softmax:
+        if not activations:
+            raise ValueError("the vsmx vision policy is studied with the VectorOP GELU only")
+        return VISION_VOP + "+vsmx"
     return VISION_VOP if activations else VISION_SHIPPED
 CAL_MAX_NEW = 96                      # the calibration answers' length (independent of --quick)
 CONN_K = 4096                         # the connector's K chunk (MatmulKernel max_k)

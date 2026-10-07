@@ -135,11 +135,13 @@ GEMV_JOB_OVERHEAD    = 200
 # Host-side cost of one kernel call on the board (AXI-Lite register writes
 # through the UIO mapping, Start, the IsDone poll loop), in kernel cycles:
 # the cheapest call of the calibration campaign (a 10-element VectorOP Add,
-# 1.79 us at 250 MHz on 6436623029f7; the kernels' fixed costs ONE / one are
-# fitted net of it).  Charged per call to both engines, so it only matters
+# 1.73 us at 250 MHz on 588d721997cb; the kernels' fixed costs ONE / one are
+# fitted net of it — moved by +14 with the floor's 448 -> 434 of the
+# 6436623029f7 campaign, so ONE + CALL_OVERHEAD and one + CALL_OVERHEAD, the
+# only sums any decision sees, are unchanged).  Charged per call to both engines, so it only matters
 # where the lowering issues several conv calls for one MatMul (batched
 # attention: one per head).
-CALL_OVERHEAD        = 448
+CALL_OVERHEAD        = 434
 
 
 def _conv_geom(in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw):
@@ -214,7 +216,7 @@ RTL_CONV_SIM = {"CAP": 256, "XL": 0, "PL": 0, "FL": 0, "H": 2, "HAZ": 80, "HZW":
                 "LAT": 10, "ROW": 1, "ONE": 400, "XBEAT": 0.9, "XROW": 12, "RUN": 0,
                 "XLAT": 0, "WLAT": 0, "WBEAT": 1.0, "DPX": 1.1}
 RTL_CONV_BOARD = {"CAP": 32, "XL": 115, "PL": 13, "FL": 231, "H": 113, "HAZ": 595, "HZW": 138,
-                  "LAT": 48, "ROW": 52, "ONE": 17, "XBEAT": 1.31, "XROW": 27, "RUN": 1,
+                  "LAT": 48, "ROW": 52, "ONE": 31, "XBEAT": 1.31, "XROW": 27, "RUN": 1,
                   "XLAT": 76, "WLAT": 44, "WBEAT": 1.39, "DPX": 0.79}
 RTL_CONV_FEATURES = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
                      "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
@@ -443,7 +445,7 @@ RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 # costs more cycles: "steps" 2.97 -> 27.45, "runs" 0.325 -> 2.97); "one" is
 # the job's fixed cost without the host's call overhead (CALL_OVERHEAD).
 RTL_COEF = {"stream": 1.063, "drain": 0.5561, "aload": 0.3901,
-            "steps": 27.45, "runs": 2.974, "one": 64.75}
+            "steps": 27.45, "runs": 2.974, "one": 78.75}
 
 
 def _rtl_lane_planes(planes: int) -> int:

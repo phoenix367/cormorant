@@ -102,8 +102,8 @@ def text_check(args, ids, pix, vm, vcg, fe, tc, Wt, sd, t0):
     tpath = os.path.join(sd, f"formats_{vs.TEXT_FORMATS}.json")
     fte = LlamaFrontend(tcfg, Wt, Formats.from_file(tpath, tcfg), ctx=ls.CTX, name="smolvlm",
                         prefill_attn="fpga", decode_attn=args.decode_attn, image_rows=fe.cfg.n_img,
-                        image_state=fe.image_state)
-    tpol = lp.policy("fpga", args.decode_attn)
+                        image_state=fe.image_state, vsmx=args.vsmx)
+    tpol = lp.policy("fpga", args.decode_attn, args.vsmx)
     cgs = lp.make_codegens(fte, buckets)
     cgs["vision"] = vcg
     cs = ls.rope_tables(tc, 2 * ls.CTX)
@@ -159,17 +159,21 @@ def main(argv=None) -> int:
                     help="the text entries' decode attention (fpga: policy pow2+sink+p12)")
     ap.add_argument("--decode", type=int, default=16)
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
+    ap.add_argument("--vsmx", choices=("auto", "on", "off"), default="auto",
+                    help="the softmax on VectorOPKernel's softmax unit (policies ...+vsmx); auto: "
+                         "where the platform has the unit")
     args = ap.parse_args(argv)
+    args.vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     t0 = time.time()
     sd = lp.study.study_dir(args.assets)
     vpath = os.path.join(sd, f"vision_formats_{vs.VISION_SHIPPED}.json")
     tc, vc, scale, Wt, Wv = vs.load_all(args.assets)
     KW = vs.kernel_weights(Wv, vc)
-    vpol = vs.vision_policy(vectorop_activations())
+    vpol = vs.vision_policy(vectorop_activations(), args.vsmx)
     vm = vs.VisionModel(Wv, KW, vc, scale, vs.VPOLICIES[vpol], study_formats(vpath))
     Wh = {"model." + k: v for k, v in Wv.items()}                  # HF names
     cfg = VitConfig.from_file(os.path.join(args.assets, "config.json"))
-    fe = VitFrontend(cfg, Wh, VisionFormats.from_file(vpath, cfg))
+    fe = VitFrontend(cfg, Wh, VisionFormats.from_file(vpath, cfg), vsmx=args.vsmx)
     model = fe.entry()
     g = OnnxGraph(model, fuse_act=True, s2d_stem=True, matmul_on_conv=args.matmul_on_conv)
     cg = CodeGenerator(g, model_path="vision.onnx")

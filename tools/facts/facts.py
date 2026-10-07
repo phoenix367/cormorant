@@ -366,7 +366,9 @@ def mention_hits(fact: dict, ctx: Ctx, res: Result) -> List[Hit]:
         fix = loc.get("fix", default_fix)
         for m in ms:
             names = [n for n in m.re.groupindex if m.group(n) is not None]
-            groups = [(n, m.span(n), m.group(n)) for n in names] or [(None, m.span(1), m.group(1))]
+            # a group named KEY__SUFFIX quotes KEY a second time ("29 / 29 passed")
+            groups = [(n.split("__", 1)[0], m.span(n), m.group(n)) for n in names] \
+                or [(None, m.span(1), m.group(1))]
             for key, (a, b), txt in groups:
                 hits.append(Hit(rel, _line(text, a), key, a, b, txt, fix, loc.get("format")))
     for rel in ctx.tracked():                                     # markers anywhere

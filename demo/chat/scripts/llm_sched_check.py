@@ -64,6 +64,9 @@ def main():
                          "(comma list, '' = none)")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN)
     ap.add_argument("--decode-attn", choices=("fpga", "host"), default=lp.DECODE_ATTN)
+    ap.add_argument("--vsmx", choices=("auto", "on", "off"), default="auto",
+                    help="the prefill softmax on VectorOPKernel (policy ...+vsmx); auto: where "
+                         "the platform has the unit")
     ap.add_argument("--save", default=None, help="write tokens / logits checksums as JSON")
     args = ap.parse_args()
     t0 = time.time()
@@ -71,9 +74,11 @@ def main():
     ids = lp.tokenize_prompts(args.prompts.split(","))
     turn2 = lp.second_turn_ids() if args.second_turn else []
     cont = set(filter(None, args.second_turn.split(",")))
-    policy = lp.policy(args.prefill_attn, args.decode_attn)
+    vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
+    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx)
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn)
+    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn,
+                     vsmx=vsmx)
     cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "

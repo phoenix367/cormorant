@@ -2,7 +2,7 @@
 """Compare KV260 performance results against the baseline of the bitstream.
 
 Inputs (at least one):
-  --run  RUN.json            run_remote_perf.py --json output (the 60 kernel cases)
+  --run  RUN.json            run_remote_perf.py --json output (the 63 kernel cases)
   --demo [NAME=]RESULTS.json a demo's build/results.json (mnist, image_classification,
                              bert_squad); NAME defaults to the directory above build/
 

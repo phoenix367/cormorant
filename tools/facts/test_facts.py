@@ -119,6 +119,26 @@ class TestValueFacts(unittest.TestCase):
         self.r.check("sizes", fix=True)
         self.assertIn("small 2, large 9", self.r.read("doc/a.md"))
 
+    def test_repeated_key_group(self):
+        # KEY__SUFFIX quotes KEY again: both numbers of "N / N passed" are checked and fixed
+        r = Repo({"n.txt": "29\n", "doc.md": "Summary: 27 / 27 passed\n"},
+                 """
+                 facts:
+                 - id: cases
+                   kind: value
+                   source: {parts: {n: {file: n.txt, regex: '(\\d+)', type: int}}}
+                   fix: auto
+                   mentions:
+                     - {file: doc.md, regex: 'Summary: (?P<n>\\d+) / (?P<n__d>\\d+) passed'}
+                 """)
+        try:
+            res = r.check("cases")
+            self.assertEqual(sum(f.level == "error" for f in res.findings), 2)     # both numbers
+            r.check("cases", fix=True)
+            self.assertEqual(r.read("doc.md"), "Summary: 29 / 29 passed\n")
+        finally:
+            r.close()
+
     def test_locator_lost(self):
         self.r.write("README.md", "The item count moved.\n")
         res = self.r.check("n.items")

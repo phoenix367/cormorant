@@ -171,7 +171,9 @@ _VOP = r"""
 /* The activation unit's register (the generated code guards plain alpha
  * writes with this macro, xvectoropkernel_hw.h of IPs that have it). */
 #define XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA 0x64
-typedef struct { u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act, alpha; } XVectoropkernel;
+#define XVECTOROPKERNEL_CTRL_ADDR_SMX_CM_DATA 0x6c
+typedef struct { u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act, alpha,
+                 smx_cm, smx_cfg, smx_mask; } XVectoropkernel;
 static inline int XVectoropkernel_Initialize(XVectoropkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
 #define VOP_SET(f) static inline void XVectoropkernel_Set_##f(XVectoropkernel *p, u64 v) { p->f = (uint32_t)v; }
@@ -179,7 +181,40 @@ static inline void XVectoropkernel_Set_a(XVectoropkernel *p, u64 v) { p->a = v; 
 static inline void XVectoropkernel_Set_b(XVectoropkernel *p, u64 v) { p->b = v; }
 static inline void XVectoropkernel_Set_c(XVectoropkernel *p, u64 v) { p->c = v; }
 VOP_SET(size) VOP_SET(op) VOP_SET(outer) VOP_SET(a_inc) VOP_SET(b_inc) VOP_SET(act) VOP_SET(alpha)
+VOP_SET(smx_cm) VOP_SET(smx_cfg) VOP_SET(smx_mask)
 static inline uint32_t XVectoropkernel_Get_alpha(XVectoropkernel *p) { return p->alpha; }
+static inline uint32_t XVectoropkernel_Get_smx_cm(XVectoropkernel *p) { return p->smx_cm; }
+/* The softmax unit (ops 10 / 11): VectorOP.h smx_vector — the integer
+ * specification of src/vectorop_smx.py; EMU_SMX_TAB is its table. */
+static const int32_t emu_smx_tab[4096] = { EMU_SMX_TAB };
+static void emu_smx_vector(const int16_t *x, size_t xs, unsigned n, unsigned v, uint32_t cm,
+                           uint32_t cfg, int16_t *p, size_t ps)
+{
+    static int64_t e[2048];
+    const unsigned cs = cfg & 63u, fp = (cfg >> 8) & 31u;
+    int64_t m = INT64_MIN, S = 0;
+    uint64_t R;
+    unsigned j;
+    cm &= 0xFFFFFFu;
+    if (v > n) v = n;
+    for (j = 0; j < v; j++) if (x[j * xs] > m) m = x[j * xs];
+    for (j = 0; j < v; j++) {
+        const uint64_t y = ((uint64_t)(m - x[j * xs]) * cm) >> cs, sh = y >> 12;
+        e[j] = sh >= 63u ? 0 : (int64_t)emu_smx_tab[y & 4095u] >> sh;   /* 64-bit: sh may exceed 31 */
+        S += e[j];
+    }
+    R = S > 0 ? ((uint64_t)1 << 40) / (uint64_t)S : 0u;
+    for (j = 0; j < n; j++) {
+        uint64_t q = 0;
+        if (j < v) q = ((uint64_t)e[j] * R + ((uint64_t)1 << (39u - fp))) >> (40u - fp);
+        p[j * ps] = (int16_t)(q > 32767u ? 32767u : q);
+    }
+}
+static inline unsigned emu_smx_valid(unsigned q, unsigned n, uint32_t mask)
+{
+    const unsigned v = (mask & 0xFFFFu) + ((mask >> 16) ? q % (mask >> 16) : 0u);
+    return v < n ? v : n;
+}
 /* LeakyReLU / SiLU / GELU / GELU tanh (acts 3..6): VectorOP.cpp act_fn in
  * double, rounded to nearest, ties to even, saturated. */
 static inline int64_t emu_act(int64_t r, uint32_t act, uint32_t alpha)
@@ -207,6 +242,24 @@ static inline void XVectoropkernel_Start(XVectoropkernel *p)
     const int16_t *b = (const int16_t *)(uintptr_t)p->b;
     int16_t *c = (int16_t *)(uintptr_t)p->c;
     unsigned o, i, words = (p->size + 7u) / 8u, c_inc = p->a_inc + p->b_inc;
+    if (p->op == 10u || p->op == 11u) {
+        /* softmax: row mode (rows at a_inc -> rows at b_inc) or column mode (s[size]
+         * [outer] at row stride a_inc -> P[outer & ~15][size] at b_inc); every output
+         * word written whole, tail lanes 0 */
+        const int col = p->op == 11u;
+        const unsigned rows = col ? (p->outer & ~15u) : p->outer;
+        for (o = 0; o < rows; o++) {
+            int16_t *out = c + (size_t)o * p->b_inc;
+            if (col)
+                emu_smx_vector(a + o, p->a_inc, p->size, emu_smx_valid(o, p->size, p->smx_mask),
+                               p->smx_cm, p->smx_cfg, out, 1);
+            else
+                emu_smx_vector(a + (size_t)o * p->a_inc, 1, p->size,
+                               emu_smx_valid(o, p->size, p->smx_mask), p->smx_cm, p->smx_cfg, out, 1);
+            for (i = p->size; i < words * 8u; i++) out[i] = 0;
+        }
+        return;
+    }
     const uint32_t jact = (p->op >= 6u && p->op <= 9u) ? p->op - 3u : p->act;
     for (o = 0; o < p->outer; o++)
         for (i = 0; i < words * 8u; i++) {
@@ -233,6 +286,11 @@ static inline void XVectoropkernel_Start(XVectoropkernel *p)
         }
 }
 """
+
+def _smx_tab() -> str:
+    from src.vectorop_smx import TAB
+    return ", ".join(str(int(v)) for v in TAB)
+
 
 _MM = r"""
 #include "emu_common.h"
@@ -404,7 +462,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     w(os.path.join(tst, "test_inference.c"), cg.generate_test())
     w(os.path.join(emu, "inference_buf_emu.c"), buf_emu_source(cg._dtype))
     w(os.path.join(emu, "emu_common.h"), _COMMON)
-    w(os.path.join(emu, "xvectoropkernel.h"), _VOP)
+    w(os.path.join(emu, "xvectoropkernel.h"), _VOP.replace("EMU_SMX_TAB", _smx_tab()))
     w(os.path.join(emu, "xmatmulkernel.h"), _MM)
     w(os.path.join(emu, "xconvkernel.h"), _CONV)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)

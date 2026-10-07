@@ -894,6 +894,13 @@ class _CoreMixin:
                    for sn in self._graph.nodes)
 
     @property
+    def _uses_softmax_unit(self) -> bool:
+        """A VectorOP call runs the softmax (ops 10 / 11, src/smx_nodes.py): the
+        program needs the kernel's softmax unit, and inference_init() checks the
+        IP has it (doc/plans/SOFTMAX_PLAN.md)."""
+        return any(getattr(sn, "uses_softmax_unit", False) for sn in self._graph.nodes)
+
+    @property
     def _uses_activation_unit(self) -> bool:
         """A VectorOP call applies LeakyReLU / SiLU / GELU (ops 6-9, acts 3-6):
         the program needs the kernel's activation unit, and inference_init()

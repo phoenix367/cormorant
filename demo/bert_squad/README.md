@@ -347,9 +347,13 @@ ConvKernel too (CONV_RTL_PLAN phase 3, 2026-10-06, all 50
 examples): p50 839.2 ms.  **Latest**, the kernels at 250 MHz (bitstream
 986cef4866a0, FMAX_250_PLAN, 2026-10-06, the same project, all 50
 examples): p50 541.2 ms, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
-**Latest**, the GELUs on VectorOPKernel's activation unit, fused into the FFN
-bias Adds (bitstream 6436623029f7, ACTIVATIONS_PLAN, 2026-10-06, regenerated,
-all 50 examples): p50 **525.0 ms**, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
+The GELUs on VectorOPKernel's activation unit, fused into the FFN bias Adds
+(bitstream 6436623029f7, ACTIVATIONS_PLAN, 2026-10-06, regenerated, all 50
+examples): p50 525.0 ms, bit-exact (3 / 3, 50 / 50), EM / F1 88.0 / 90.3.
+**Latest**, the 12 Softmaxes on VectorOPKernel's softmax unit (bitstream
+588d721997cb, SOFTMAX_PLAN, 2026-10-07, regenerated, all 50
+examples): p50 **427.3 ms**, bit-exact (3 / 3, 50 / 50 against the `sched+vsmx`
+emulation), EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 

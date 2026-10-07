@@ -187,6 +187,33 @@
           "a_inc": 16,
           "b_inc": 0,
           "iters": 100
+        },
+        {
+          "label": "SOFTMAX-rows-256x256",
+          "op": 10,
+          "size": 256,
+          "outer": 256,
+          "a_inc": 256,
+          "b_inc": 256,
+          "iters": 50
+        },
+        {
+          "label": "SOFTMAX_T-1024x1024",
+          "op": 11,
+          "size": 1024,
+          "outer": 1024,
+          "a_inc": 1024,
+          "b_inc": 1024,
+          "iters": 10
+        },
+        {
+          "label": "SOFTMAX_T-256x256-g3",
+          "op": 11,
+          "size": 256,
+          "outer": 256,
+          "a_inc": 768,
+          "b_inc": 256,
+          "iters": 50
         }
       ]
     },

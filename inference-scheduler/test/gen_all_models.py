@@ -66,6 +66,7 @@ _GLOBAL_MAIN = [
     "gen_parallel_models",
     "gen_llama_models",
     "gen_activation_models",
+    "gen_softmax_models",
 ]
 # Pattern C/D — no main(); global OUT_DIR + gen_* functions
 _GEN_FUNCS = [

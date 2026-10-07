@@ -72,6 +72,13 @@ static void start(const call_t *c)
 #ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA   /* IPs with the activation unit */
         XVectoropkernel_Set_alpha(&s_v, 0);   /* LeakyReLU slope: no effect on timing */
 #endif
+#ifdef XVECTOROPKERNEL_CTRL_ADDR_SMX_CM_DATA  /* IPs with the softmax unit: the softmax ops */
+        if (r[0] == 10u || r[0] == 11u) {        /* only, as run_softmax() (the scale and */
+            XVectoropkernel_Set_smx_cm(&s_v, 12102203u);   /* masks have no effect on timing) */
+            XVectoropkernel_Set_smx_cfg(&s_v, 19u | (12u << 8));
+            XVectoropkernel_Set_smx_mask(&s_v, r[1] & 0xFFFFu);
+        }
+#endif
         XVectoropkernel_Start(&s_v);
         break;
     case 'M':   /* n k m batch a_stride b_stride c_stride b_packed gemv_kw */
