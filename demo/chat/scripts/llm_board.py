@@ -275,7 +275,8 @@ def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: s
     summary = json.load(open(os.path.join(project, "project.json")))
     cfg, W, fmt, fd = lp.load_model(summary.get("assets"), summary.get("formats"))
     fe = lp.frontend(cfg, W, fmt, ctx=summary["context"],
-                     prefill_attn=summary.get("prefill_attn", "host"))
+                     prefill_attn=summary.get("prefill_attn", "host"),
+                     decode_attn=summary.get("decode_attn", "host"))
     cgs = lp.make_codegens(fe, summary["buckets"])
     raw = np.fromfile(logits_path, "<f4").reshape(-1, cfg.V)
     study = json.load(open(study_json)) if study_json and os.path.exists(study_json) else {}

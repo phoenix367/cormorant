@@ -556,15 +556,17 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
-  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 48}
+  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 51}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 72188db
-    date: 2026-10-06
+    commit: d05cf0b
+    date: 2026-10-07
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
           at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
           360M 740.2, SmolVLM 494.8 MiB); Piper 48.1 MiB (demo/tts/build/piper_project, same session); 5ecd78b changed
-          only a docstring of matmul_gemv.py"
+          only a docstring of matmul_gemv.py.  2026-10-07 (facts.py verify, after d05cf0b's VectorOP sums in Piper and
+          KV_DECODE_PLAN's decode attention on the FPGA): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9 (unchanged),
+          Piper 51.1 MiB (48.1 before: the stage-2 tap-group sum's own 3.1 MB output)"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
     - inference-scheduler/src/codegen/_core.py

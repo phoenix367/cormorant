@@ -4,9 +4,10 @@ scheduler's fixed-point simulation of SmolLM2-135M must equal the study's
 emulation of the shipped policy BIT FOR BIT on the logits — for a prefill of
 real chat prompts and greedy decode steps, and for a SECOND TURN (the next
 user message prefilled at position > 1 on top of the decoded answer).  The
-policy follows --prefill-attn: "fpga" (default) = llm_study.py
-pow2+sink+p12+mix (FPGA prefill attention, xattn decode), "host" =
-pow2+sink+p12+xattn (phase 3).
+policy follows --prefill-attn / --decode-attn: fpga / fpga (default, the chat
+libraries since doc/plans/KV_DECODE_PLAN.md) = llm_study.py pow2+sink+p12 (FPGA
+attention in prefill and decode), fpga / host = pow2+sink+p12+mix (xattn
+decode), host / host = pow2+sink+p12+xattn (phase 3).
 
 The scheduler side is exactly what the generated library computes: the
 frontend's entry graphs (src/llama.py) through OnnxGraph + CodeGenerator's
@@ -20,7 +21,8 @@ float32 — exact); the greedy tokens follow.
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_sched_check.py
            [--prompts factual,code,multi-turn] [--decode 32] [--buckets 16,64,256]
-           [--second-turn factual] [--prefill-attn fpga|host] [--save out.json]
+           [--second-turn factual] [--prefill-attn fpga|host] [--decode-attn fpga|host]
+           [--save out.json]
 """
 import argparse
 import json
@@ -61,6 +63,7 @@ def main():
                     help="prompts continued by a second turn after their decode steps "
                          "(comma list, '' = none)")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN)
+    ap.add_argument("--decode-attn", choices=("fpga", "host"), default=lp.DECODE_ATTN)
     ap.add_argument("--save", default=None, help="write tokens / logits checksums as JSON")
     args = ap.parse_args()
     t0 = time.time()
@@ -68,9 +71,9 @@ def main():
     ids = lp.tokenize_prompts(args.prompts.split(","))
     turn2 = lp.second_turn_ids() if args.second_turn else []
     cont = set(filter(None, args.second_turn.split(",")))
-    policy = lp.POLICIES[args.prefill_attn]
+    policy = lp.policy(args.prefill_attn, args.decode_attn)
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn)
+    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn)
     cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "

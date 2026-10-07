@@ -11,7 +11,9 @@ entries equals the numeric study's emulation bit for bit
            (AXI_VECTOROP_ACTIVATIONS=0) — and the shipped formats.
   text     (--text) the logits of each image prompt and 16 greedy decode
            steps: SimSession over the text entries (src/llama.py with the
-           image rows) against vlm_study.TextModel under pow2+sink+p12+mix.
+           image rows) against vlm_study.TextModel under pow2+sink+p12 (decode
+           attention on the FPGA, doc/plans/KV_DECODE_PLAN.md; --decode-attn
+           host: pow2+sink+p12+mix).
 
 Runs in the scheduler's venv (inference-scheduler/.venv); the pixels come
 from .venv-export (Pillow), cached as .npy.
@@ -39,7 +41,6 @@ from src.llama import Formats, LlamaConfig, LlamaFrontend        # noqa: E402
 from src.vectorop_act import enabled as vectorop_activations    # noqa: E402
 from src.vit import VisionFormats, VitConfig, VitFrontend, patches  # noqa: E402
 
-TEXT_POLICY = "pow2+sink+p12+mix"
 
 
 def study_formats(path):
@@ -100,16 +101,18 @@ def text_check(args, ids, pix, vm, vcg, fe, tc, Wt, sd, t0):
     tcfg = LlamaConfig.from_dict({**cj["text_config"], "tie_word_embeddings": False})
     tpath = os.path.join(sd, f"formats_{vs.TEXT_FORMATS}.json")
     fte = LlamaFrontend(tcfg, Wt, Formats.from_file(tpath, tcfg), ctx=ls.CTX, name="smolvlm",
-                        prefill_attn="fpga", image_rows=fe.cfg.n_img, image_state=fe.image_state)
+                        prefill_attn="fpga", decode_attn=args.decode_attn, image_rows=fe.cfg.n_img,
+                        image_state=fe.image_state)
+    tpol = lp.policy("fpga", args.decode_attn)
     cgs = lp.make_codegens(fte, buckets)
     cgs["vision"] = vcg
     cs = ls.rope_tables(tc, 2 * ls.CTX)
-    sm = vs.TextModel(Wt, tc, ls.POLICIES[TEXT_POLICY], study_formats(tpath), cos_sin=cs,
+    sm = vs.TextModel(Wt, tc, ls.POLICIES[tpol], study_formats(tpath), cos_sin=cs,
                       sink_model=vs.TextModel(Wt, tc, None, cos_sin=cs))
     items = [(i, vs.EVAL_PROMPTS[vs.EVAL_IDS.index(i) % len(vs.EVAL_PROMPTS)]
               if i in vs.EVAL_IDS else vs.EVAL_PROMPTS[0]) for i in ids]
     toks = prompt_tokens(items, args.assets, os.path.join(sd, "sched_check", "prompt_ids.json"))
-    print(f"text entries {sorted(cgs)} ({time.time() - t0:.0f} s), policy {TEXT_POLICY}", flush=True)
+    print(f"text entries {sorted(cgs)} ({time.time() - t0:.0f} s), policy {tpol}", flush=True)
     bad = 0
     for i, q in items:
         t1 = time.time()
@@ -152,6 +155,8 @@ def main(argv=None) -> int:
     ap.add_argument("--images", default="39769,1268")
     ap.add_argument("--matmul-on-conv", default="auto", choices=("auto", "always", "off"))
     ap.add_argument("--text", action="store_true", help="also the text entries' logits")
+    ap.add_argument("--decode-attn", choices=("fpga", "host"), default=lp.DECODE_ATTN,
+                    help="the text entries' decode attention (fpga: policy pow2+sink+p12)")
     ap.add_argument("--decode", type=int, default=16)
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
     args = ap.parse_args(argv)

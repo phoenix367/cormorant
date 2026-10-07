@@ -46,6 +46,7 @@ study = G.study
 
 _TINY = None
 _TINY_HOST = None
+_TINY_FPGA = None
 
 
 def tiny():
@@ -62,6 +63,16 @@ def tiny_host():
         cfg, W, formats, _fe = tiny()
         _TINY_HOST = (cfg, W, formats, G.frontend(cfg, W, formats, prefill_attn="host"))
     return _TINY_HOST
+
+
+def tiny_fpga():
+    """The tiny fixture with decode_attn="fpga" (doc/plans/KV_DECODE_PLAN.md:
+    decode attention on ConvKernel too, policy pow2+sink+p12)."""
+    global _TINY_FPGA
+    if _TINY_FPGA is None:
+        cfg, W, formats, _fe = tiny()
+        _TINY_FPGA = (cfg, W, formats, G.frontend(cfg, W, formats, decode_attn="fpga"))
+    return _TINY_FPGA
 
 
 def graphs(fe, kinds, **kw):
@@ -330,6 +341,28 @@ class TestSimVsStudyHost(TestSimVsStudy):
     POLICY = G.POLICY
 
 
+class TestSimVsStudyFpgaDecode(TestSimVsStudy):
+    """decode_attn="fpga": bit-exact against pow2+sink+p12 (the p12 kernel
+    attention in prefill and decode, doc/plans/KV_DECODE_PLAN.md)."""
+    TINY = staticmethod(tiny_fpga)
+    POLICY = G.FPGA_POLICY
+
+    def test_decode_graph(self):
+        """The decode entry runs the FPGA attention path with one row: no n
+        input, keys from pos, the prep flushing only its own cache rows; no
+        host attention region."""
+        g = OnnxGraph(self.TINY()[3].entry("decode"), fuse_act=True, s2d_stem=True)
+        kinds = [type(sn).__name__ for sn in g.nodes]
+        self.assertNotIn("LlmAttentionNode", kinds)
+        conv = [sn for sn in g.nodes if isinstance(sn, LlmAttnConvNode)]
+        self.assertEqual(len(conv), 2 * 2 * 2)               # 2 layers x 2 KV groups x (q.K^T, P.V)
+        self.assertTrue(all(not sn.has_n and sn.T == 1 and not sn.static for sn in conv))
+        self.assertTrue(all(not sn.has_n for sn in g.nodes if isinstance(sn, LlmAttnSoftmaxNode)))
+        src = CodeGenerator(g, model_path="llama_tiny_decode.onnx").generate_source()
+        self.assertIn("llm_cache_flush_rows(", src)
+        self.assertNotIn("    llm_cache_flush(kv_", src)
+
+
 class TestOtherShapes(unittest.TestCase):
     """Llama-generic: the SmolLM2-360M layer shape (hidden 960, 15 / 5 heads,
     head_dim 64, FFN 2560 — its K = 2560 down-projection needs kw >= 3 on
@@ -384,7 +417,7 @@ class TestHostEmulation(unittest.TestCase):
     """Generated C (-Werror) against the software kernels == simulation."""
 
     def test_entries(self):
-        for fx in (tiny, tiny_host):
+        for fx in (tiny, tiny_host, tiny_fpga):
             _cfg, _W, _f, fe = fx()
             gs = graphs(fe, {"decode": ("decode", 1, False), "prefill8": ("prefill", 8, True),
                              "prefill16": ("prefill", 16, True), "head": ("head", 1, False)})
@@ -503,7 +536,7 @@ class TestHostEmulation(unittest.TestCase):
         rows, a truncate — compiled against the software kernels with
         separate CPU / DDR copies (every cache flush matters): every logits
         vector equals the simulation of the same calls."""
-        for fx in (tiny, tiny_host):
+        for fx in (tiny, tiny_host, tiny_fpga):
             _cfg, _W, _f, fe = fx()
             gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),
                              "prefill_16": ("prefill", 16, False), "head": ("head", 1, False)})

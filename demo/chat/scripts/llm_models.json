@@ -20,14 +20,14 @@
         "sha256": "b870edfe590909a530b8985d79e19c4ae06b6daeafd8f704713c0ac7949a2f1a"
       },
       "study": {
-        "policy": "pow2+sink+p12+mix",
+        "policy": "pow2+sink+p12",
         "ppl": 15.616059,
         "float_ppl": 15.598483,
         "top1_all": 0.975595,
         "top1_resp": 0.979798,
         "top1_held": 0.969045,
         "kl_held": 0.002433,
-        "identical": 3
+        "identical": 2
       }
     },
     "smollm2-360m-instruct": {
@@ -49,7 +49,7 @@
         "sha256": "7196e6743e7a3cff42517b21a75f226e520a4ada14e5bca5f04a75e2476ad50a"
       },
       "study": {
-        "policy": "pow2+sink+p12+mix",
+        "policy": "pow2+sink+p12",
         "ppl": 12.393697,
         "float_ppl": 12.373367,
         "top1_all": 0.9777,

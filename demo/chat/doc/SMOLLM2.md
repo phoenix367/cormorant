@@ -28,16 +28,18 @@ that makes multi-turn chats cheap.
 
 **Numbers.**  The FPGA kernels compute in 16-bit fixed point.  The numeric
 policy that keeps the answers close to the float model's is
-`pow2+sink+p12+mix` (CHAT_PLAN §10 / §16):
+`pow2+sink+p12` (CHAT_PLAN §10 / §16, KV_DECODE_PLAN):
 - `pow2`: power-of-two scales per channel, calibrated once per model (see
   [Calibration](#calibration));
 - `sink`: position 0, the `<|im_start|>` token that every prompt begins
   with, is precomputed once in float: its activations are far too large
   for the 16-bit format (a residual of ~26 000);
-- `p12`: the attention probabilities are stored at 2⁻¹² resolution.  In
-  prefill the two attention products, q·Kᵀ and P·V, run on ConvKernel; the
-  softmax between them runs on the host;
-- `mix`: in decode the attention runs exactly, on the host.
+- `p12`: the attention probabilities are stored at 2⁻¹² resolution.  The
+  two attention products, q·Kᵀ and P·V, run on ConvKernel in prefill and in
+  decode (from position ~130 on that is faster than the exact host attention
+  the libraries used before, `pow2+sink+p12+mix`: 135M 72.5 instead of
+  81.5 ms per token at position 1000); the softmax between them runs on the
+  host.
 
 Greedy answers read like the float model's.
 

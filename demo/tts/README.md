@@ -47,7 +47,7 @@ flowchart TB
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.
-- **Memory:** 48 MiB of CMA.
+- **Memory:** 51 MiB of CMA.
 - **Quality:** the int16 datapath is within 0.19 dB log-mel of float (§3);
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
   one frame (§6).

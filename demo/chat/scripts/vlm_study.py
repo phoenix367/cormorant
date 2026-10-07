@@ -49,7 +49,7 @@ saturate; host regions in double, round half to even + saturate on write):
                   the host sums the three partial values (exact) into the image
                   features, the text model's float residual rows
 
-Text model: llm_study.Model (policies there; the shipped pow2+sink+p12+mix),
+Text model: llm_study.Model (policies there; the shipped pow2+sink+p12),
 image rows injected at the <image> positions.  Exponents come from float
 calibration runs over separate images (and the WikiText-2 calibration text
 for the text model), MARGIN one bit of headroom.
@@ -638,7 +638,7 @@ VPOLICIES = {
     "pow2_tensor+p12": dict(_F, fmt="pow2", p_bits=12, per_tensor=True),
     "pow2+hattn":      dict(_F, fmt="pow2", hattn=True),
 }
-TEXT_SHIPPED = "pow2+sink+p12+mix"
+TEXT_SHIPPED = "pow2+sink+p12"        # FPGA decode attention too (doc/plans/KV_DECODE_PLAN.md)
 TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)
 VISION_SHIPPED = "pow2+p12"           # the vision formats' policy (vision_formats_<it>.json)
 VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's activation unit

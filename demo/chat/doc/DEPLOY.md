@@ -179,7 +179,7 @@ a margin); the server uses it to decide what to evict.
 | SmolLM2-135M | 286 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
 | SmolLM2-360M | 740 MiB | 760 | Piper only; swaps with the others |
 | SmolVLM-256M | 495 MiB | 540 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
-| Piper | 48 MiB | 55 | any other model, even SmolLM2-360M |
+| Piper | 51 MiB | 55 | any other model, even SmolLM2-360M |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
   every weight (decode reads the prefill image through MatmulKernel's GEMV

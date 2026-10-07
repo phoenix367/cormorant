@@ -93,10 +93,10 @@ def load(assets: Optional[str] = None, text_formats: Optional[str] = None,
                VisionFormats.from_file(vp, vcfg), int(cj["image_token_id"]), (tp, vp))
 
 
-def frontends(m: Vlm, ctx: int = lp.CONTEXT, name: str = MODEL):
-    """(text frontend, vision frontend)."""
+def frontends(m: Vlm, ctx: int = lp.CONTEXT, name: str = MODEL, decode_attn: str = lp.DECODE_ATTN):
+    """(text frontend, vision frontend); ``decode_attn`` as llm_project.frontend."""
     fe_t = LlamaFrontend(m.tcfg, m.Wt, m.tfmt, ctx=ctx, name=name, prefill_attn="fpga",
-                         image_rows=m.vcfg.n_img, image_state=IMAGE_STATE)
+                         decode_attn=decode_attn, image_rows=m.vcfg.n_img, image_state=IMAGE_STATE)
     fe_v = VitFrontend(m.vcfg, m.Wv, m.vfmt, name=name, image_state=IMAGE_STATE)
     return fe_t, fe_v
 

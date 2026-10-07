@@ -68,7 +68,7 @@ STUDY = HERE / "llm_study.py"
 DEFAULT_MODEL = "smollm2-135m-instruct"          # llm_study.DEFAULT_MODEL: study files in assets/study
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 SHIPPED_POLICIES = "bf16,pow2+sink+p12,pow2+sink+p12+mix"
-SHIPPED = "pow2+sink+p12+mix"
+SHIPPED = "pow2+sink+p12"             # FPGA attention in prefill and decode (doc/plans/KV_DECODE_PLAN.md)
 CHECKPOINT_FILES = ("config.json", "generation_config.json", "model.safetensors", "tokenizer.json",
                     "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt")
 

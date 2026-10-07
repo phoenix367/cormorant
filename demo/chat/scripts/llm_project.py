@@ -35,13 +35,27 @@ from src.llm_entries import EntryModels, entry_graphs            # noqa: E402
 from src.llama import (Formats, LazySafetensors, LlamaConfig, LlamaFrontend,  # noqa: E402
                        load_safetensors)
 
-# The shipped numeric policy (llm_study.py) per prefill-attention mode of the
-# frontend (src/llama.py): "fpga" (phase 5, CHAT_PLAN §16) — q.K^T / P.V of the
-# prefill on ConvKernel with the p12 host softmax, decode attention the xattn
-# host region; "host" (phase 3) — xattn everywhere.
-POLICIES = {"fpga": "pow2+sink+p12+mix", "host": "pow2+sink+p12+xattn"}
+# The numeric policy (llm_study.py) per attention mode of the frontend
+# (src/llama.py), (prefill_attn, decode_attn): ("fpga", "host") — phase 5,
+# CHAT_PLAN §16: q.K^T / P.V of the prefill on ConvKernel with the p12 host
+# softmax, decode attention the xattn host region; ("fpga", "fpga") — decode on
+# ConvKernel too (doc/plans/KV_DECODE_PLAN.md); ("host", "host") — phase 3,
+# xattn everywhere.
+ATTN_POLICIES = {("fpga", "host"): "pow2+sink+p12+mix", ("fpga", "fpga"): "pow2+sink+p12",
+                 ("host", "host"): "pow2+sink+p12+xattn"}
 PREFILL_ATTN = "fpga"
-POLICY = POLICIES[PREFILL_ATTN]
+DECODE_ATTN = "fpga"                   # the chat libraries since doc/plans/KV_DECODE_PLAN.md
+
+
+def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN) -> str:
+    """The study policy a project of these attention modes computes."""
+    if (prefill_attn, decode_attn) not in ATTN_POLICIES:
+        raise ValueError(f"no policy for prefill attention {prefill_attn!r} with decode "
+                         f"attention {decode_attn!r} (decode on the FPGA needs FPGA prefill)")
+    return ATTN_POLICIES[(prefill_attn, decode_attn)]
+
+
+POLICY = policy()
 FORMATS_POLICY = "pow2+sink+p12"        # their exponents (both use the p12 formats)
 CONTEXT = 1024                          # positions incl. the sink (CHAT_PLAN decision)
 BUCKETS = (16, 64, 256)                 # prefill entries (rows per call)
@@ -85,8 +99,9 @@ def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
 
 
 def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
-             prefill_attn: str = PREFILL_ATTN) -> LlamaFrontend:
-    return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn)
+             prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN) -> LlamaFrontend:
+    return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn,
+                         decode_attn=decode_attn)
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:

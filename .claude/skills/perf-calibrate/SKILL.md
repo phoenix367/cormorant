@@ -28,8 +28,10 @@ Current model: **kv260/6436623029f7** (2026-10-06), the 250 MHz bitstream with
 VectorOPKernel's activation unit (ACTIVATIONS_PLAN): a fresh case list (BERT's GELUs became
 VectorOP calls; 1402 cases), one pass and three refinement rounds (157 + 103 + 67); topped up
 on 2026-10-07 (OFFLOAD_PLAN: SmolVLM's GELU and Piper's decoder sums on VectorOP) with a fresh
-case list (1406), `run --resume` and three rounds (125 + 29 + 5) to 1852 exact calls, and
-`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.076 %,
+case list (1406), `run --resume` and three rounds (125 + 29 + 5) to 1852, then for the chat
+libraries' decode attention on ConvKernel (KV_DECODE_PLAN) a fresh case list (1438) and two
+rounds (118 + 26) to 1930 exact calls, and
+`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.078 %,
 `clock_mhz` 250 (perf_fit takes it from the local HWH).  Its family fits are loose (held-out
 p90 9–62 %): the ConvKernel features are the engine cost model's walk with the frozen 100 MHz
 parameters (`cost_model.RTL_CONV_FEATURES`, so refitting the cost model —

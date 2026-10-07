@@ -40,6 +40,12 @@ Attention (``prefill_attn``):
          dimension.  The caches are DMA states in the CMA pool.
   "host" (phase 3, pow2+sink+p12+xattn): LlmAttention everywhere, the caches
          host-memory i16 states.
+Decode attention (``decode_attn``, with prefill_attn "fpga"):
+  "host" (default): the xattn host region above (policy pow2+sink+p12+mix).
+  "fpga" (doc/plans/KV_DECODE_PLAN.md, policy pow2+sink+p12): decode steps run
+         the prefill path with one row — LlmAttnPrep (no n: the step's own cache
+         rows flushed), q.K^T / P.V on ConvKernel over roundup(pos + 1, Q) keys,
+         the p12 softmax, LlmAttnMerge.
 """
 
 from __future__ import annotations
@@ -268,6 +274,7 @@ class LlamaFrontend:
 
     def __init__(self, cfg: LlamaConfig, weights: Dict[str, np.ndarray], formats: Formats,
                  ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
+                 decode_attn: str = "host",
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
                  image_rows: int = 0, image_state: str = "vlm.img"):
         # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
@@ -283,6 +290,11 @@ class LlamaFrontend:
         if prefill_attn not in ("fpga", "host"):
             raise ValueError(f"prefill_attn must be 'fpga' or 'host', got {prefill_attn!r}")
         self.prefill_attn = prefill_attn
+        if decode_attn not in ("fpga", "host"):
+            raise ValueError(f"decode_attn must be 'fpga' or 'host', got {decode_attn!r}")
+        if decode_attn == "fpga" and prefill_attn != "fpga":
+            raise ValueError("decode_attn 'fpga' needs prefill_attn 'fpga' (the caches in the pool)")
+        self.decode_attn = decode_attn
         self.qk_kw = qk_kw
         # The V cache's interleave K = the P.V call's kernel width: the cache
         # is stored as that conv's input image, so each P row of a weight slab
@@ -476,8 +488,8 @@ class LlamaFrontend:
             k0 = self._matmul(li, "k", x, T, fm.get("k0", li, c.KV * c.HD))
             v = self._matmul(li, "v", x, T, fm.get("v", li, c.KV * c.HD))
             kc, vc = self._caches(li)
-            if n is not None and self.prefill_attn == "fpga":
-                pv = self._fpga_attention(li, q0, k0, v, T, pos, n, kc, vc)
+            if self.prefill_attn == "fpga" and (n is not None or self.decode_attn == "fpga"):
+                pv = self._fpga_attention(li, q0, k0, v, T, pos, n or "", kc, vc)
             else:
                 pv = self._t(f"{e}.l{li}.pv", [T, c.H * c.HD], exp=fm.pv(li))
                 self._node("LlmAttention", [q0, k0, v, pos, n or "", kc, vc, "rope.cos",
@@ -564,7 +576,8 @@ class LlamaFrontend:
         p = m.metadata_props.add()
         p.key = "axi.llm.entry"
         p.value = json.dumps({"entry": ename, "model": self.name, "context": self.C,
-                              "prefill_attn": self.prefill_attn, "pv_kw": self.pv_kw,
+                              "prefill_attn": self.prefill_attn, "decode_attn": self.decode_attn,
+                              "pv_kw": self.pv_kw,
                               "layers": self.cfg.L, "hidden": self.cfg.D, "heads": self.cfg.H,
                               "kv_heads": self.cfg.KV, "head_dim": self.cfg.HD,
                               "vocab": self.cfg.V}

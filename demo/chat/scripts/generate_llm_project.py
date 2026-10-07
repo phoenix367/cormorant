@@ -12,7 +12,10 @@ entry) into the multi-entry KV260 project behind the chat library
      on ConvKernel over the runtime key count with the p12 host softmax,
      decode attention the xattn host region, the KV caches DMA states in the
      CMA pool; --prefill-attn host: phase 3's xattn everywhere
-     (pow2+sink+p12+xattn), host-memory caches.
+     (pow2+sink+p12+xattn), host-memory caches.  --decode-attn fpga
+     (default since doc/plans/KV_DECODE_PLAN.md, policy pow2+sink+p12): decode
+     steps run the FPGA attention too (one row); --decode-attn host: the xattn
+     region (pow2+sink+p12+mix).
   2. inference-scheduler: OnnxGraph per entry (src/llm_entries.py: the
      prefill buckets use the MatMul-on-ConvKernel lowering where the cost
      model says it wins, every bucket with the same kernel width per weight;
@@ -33,7 +36,8 @@ entry) into the multi-entry KV260 project behind the chat library
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/generate_llm_project.py
            [--assets DIR] [--model-name NAME] [--formats JSON]
            [--out-dir demo/chat/build/llm_project] [--buckets 16,64,256]
-           [--prefill-engine conv|matmul] [--prefill-attn fpga|host] [--no-weights]
+           [--prefill-engine conv|matmul] [--prefill-attn fpga|host] [--decode-attn fpga|host]
+           [--no-weights]
            [--driver-dirs JSON] [--force] [--plan ...]
 
 The model name is the checkpoint directory's name (assets/<model name>): it
@@ -364,6 +368,9 @@ def main(argv=None) -> int:
     ap.add_argument("--prefill-engine", choices=("conv", "matmul"), default="conv")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN,
                     help="prefill attention on ConvKernel (fpga) or the host xattn region")
+    ap.add_argument("--decode-attn", choices=("fpga", "host"), default=lp.DECODE_ATTN,
+                    help="decode attention on ConvKernel (fpga, needs --prefill-attn fpga) or the "
+                         "host xattn region")
     ap.add_argument("--model-name", default=None,
                     help="default: the --assets directory's name (it must match)")
     ap.add_argument("--allow-name-mismatch", action="store_true",
@@ -391,7 +398,8 @@ def main(argv=None) -> int:
             raise SystemExit("a VLM needs --prefill-attn fpga")
         m = vp.load(args.assets, args.formats, args.vision_formats, lazy=True)
         cfg, vcfg = m.tcfg, m.vcfg
-        fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name)
+        fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name,
+                                decode_attn=args.decode_attn)
         formats_paths = m.formats_paths
         print(f"frontend: VLM, vision {vcfg.L} layers, hidden {vcfg.D}, {vcfg.N} patches -> "
               f"{vcfg.n_img} image tokens; text {cfg.L} layers, hidden {cfg.D}, heads "
@@ -402,11 +410,11 @@ def main(argv=None) -> int:
     else:
         cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats, lazy=True)
         fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
-                         prefill_attn=args.prefill_attn)
+                         prefill_attn=args.prefill_attn, decode_attn=args.decode_attn)
         formats_paths = (os.path.abspath(args.formats or lp.default_formats(args.assets)),)
         print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
               f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
-              f"prefill attention {args.prefill_attn}", flush=True)
+              f"prefill attention {args.prefill_attn}, decode attention {args.decode_attn}", flush=True)
         models = lp.entry_models(fe, buckets)
         del W
     entries = build_entries(models, args.prefill_engine,
@@ -438,7 +446,7 @@ def main(argv=None) -> int:
     summary.update({
         "model": args.model_name, "context": args.context, "buckets": buckets,
         "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
-        "policy": lp.POLICIES[args.prefill_attn],
+        "decode_attn": args.decode_attn, "policy": lp.policy(args.prefill_attn, args.decode_attn),
         "assets": os.path.abspath(args.assets or lp.default_assets()),
         "formats": [os.path.abspath(p) for p in formats_paths] if vcfg else formats_paths[0],
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,

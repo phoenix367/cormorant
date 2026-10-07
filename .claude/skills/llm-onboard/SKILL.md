@@ -73,7 +73,7 @@ python3 demo/chat/scripts/llm_calibrate.py fetch $N          # texts copied from
 python3 demo/chat/scripts/llm_calibrate.py validate $N       # float64 numpy vs torch f32 (135M ~2 min)
 python3 demo/chat/scripts/llm_calibrate.py calibrate $N --record   # formats + provenance, hash stored
 python3 demo/chat/scripts/llm_calibrate.py check $N          # recompute, install nothing
-python3 demo/chat/scripts/llm_calibrate.py study $N --record # bf16 / p12 / p12+mix vs float (360M ~40 min)
+python3 demo/chat/scripts/llm_calibrate.py study $N --record # bf16 / p12 / p12+mix vs float (360M ~40 min; p12 ships)
 ```
 
 - `add` records the resolved commit, license and SHA-256 of `config.json,
@@ -112,8 +112,9 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
   `--no-weights`), but only if it is empty or holds this model's project —
   another model's project or other files need `--force`.
 - Defaults are the shipped design — keep them: buckets `16,64,256`, context
-  1024, `--prefill-engine conv`, `--prefill-attn fpga` (policy
-  `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
+  1024, `--prefill-engine conv`, `--prefill-attn fpga --decode-attn fpga`
+  (policy `pow2+sink+p12`: the attention on ConvKernel in prefill and decode,
+  KV_DECODE_PLAN; `--decode-attn host` builds the previous `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
   `inference-scheduler/perf_models/kv260/<bitstream-id>.json` of the board's
   bitstream; gains ≤ ~1 %, TACTICS_PLAN §9).
 - **Host RAM peak** (dev PC 46 GB): 135M 3.3 GB / ~60 s, 360M 8.2 GB /
@@ -140,7 +141,7 @@ $PY demo/chat/scripts/llm_host_emu.py --project demo/chat/build/llm_project_$T \
 ```
 
 - `llm_sched_check.py`: scheduler simulation == study emulation of
-  `pow2+sink+p12+mix`, every logits vector, for `factual, summarise,
+  `pow2+sink+p12` (the project's `--decode-attn`), every logits vector, for `factual, summarise,
   multi-turn` + a second `factual` turn at position 69, 32 greedy decode steps
   each.  **Gate:** `3/3 prompts bit-exact`, exit 0.  `setup` prints `weights
   saturated` (0 so far).  Keep `--prompts / --second-turn / --decode` at the
@@ -264,7 +265,7 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
   project too, whether or not `bert-squad` is in `server.backends` — the
   `demo/bert_squad` prerequisites must be in place.
 - **Gate (API = study):** with the penalties off, the greedy answer equals the
-  `pow2+sink+p12+mix` text of `[0] factual` in
+  `pow2+sink+p12` text of `[0] factual` in
   `demo/chat/assets/study/$N/shipped/generations.txt` (the server's default
   system prompt is the study's).  `chat.py` cannot switch the penalties off —
   use curl.  Then the §19 4-turn conversation at temperature 0 for the table

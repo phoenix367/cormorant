@@ -152,7 +152,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1674 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1678 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -841,6 +841,18 @@ logical `[C][KV·HD]` int16 states stored group-major `[KV][C][HD]` whose row
 * `"host"` (phase 3, `pow2+sink+p12+xattn`): `LlmAttention` in every entry,
   the caches i16 host states.
 
+**Decode attention** (`LlamaFrontend(decode_attn=...)`, with
+`prefill_attn="fpga"`; [`KV_DECODE_PLAN.md`](../plans/KV_DECODE_PLAN.md)):
+`"host"` runs the xattn region above; `"fpga"` (study policy `pow2+sink+p12`)
+runs the decode step through the prefill path with one row — `LlmAttnPrep`
+without `n` (n = T = 1), q·Kᵀ / P·V on ConvKernel over `roundup(pos + 1, Q)`
+keys, the p12 softmax, `LlmAttnMerge` — and the step's prep flushes only its
+own cache rows (`llm_cache_flush_rows`), every writer of such a project
+flushing what it wrote.  The chat libraries ship it (`generate_llm_project.py
+--decode-attn fpga`, the default): on the board bit-exact, per token at
+positions 32 / 1000 — SmolLM2-135M 52.7 / 72.5 ms (xattn 51.7 / 81.5),
+SmolLM2-360M 134.8 / 170.9 (133.3 / 187.7), SmolVLM 52.5 / 72.2 (51.6 / 81.3).
+
 **Runtime dimension.**  A prefill call attends to `pos + n` keys (sink,
 earlier turns / chunks, its own causal rows), not to the C-row cache.  The
 two ConvKernel calls (`LlmAttnConvNode`, one per KV head and kind) run over
@@ -876,7 +888,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
 | `LlmSelectRow` | `h_last = h[n − 1]` |
 | `LlmDequant` | `y = float32(raw · 2^-f[c])` |
-| `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches |
+| `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches — a decode step (no `n` input) flushes only its rows, `llm_cache_flush_rows` |
 | `LlmAttnScores` (ConvKernel) | `s_g[j][p] = floor(Σ_d K_g[j][d]·q_g[d][p] / 2^8)`, j < keys: MatMul on ConvKernel ([§MatMul on ConvKernel](#matmul-on-convkernel)) with weight = the K cache rows `[keys][HD]` of KV head g (`out_ch = keys`), x = the q image (`in_ch = HD/kw`, 1×kw), output `G·T` pixels |
 | `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
 | `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
@@ -885,7 +897,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 RoPE uses float32 cos / sin tables `[C][HD/2]` computed by the frontend
 exactly as `llm_study.rope_tables` (host tables).  The ops are the numeric
 policy `pow2+sink+p12+mix` of the study (`pow2+sink+p12+xattn` with
-`prefill_attn="host"`); `demo/chat/scripts/llm_sched_check.py` shows the
+`prefill_attn="host"`, `pow2+sink+p12` with `decode_attn="fpga"`); `demo/chat/scripts/llm_sched_check.py` shows the
 scheduler's simulation of SmolLM2-135M equal to the study's emulation bit
 for bit, over a first prefill, decode steps and a second turn.
 

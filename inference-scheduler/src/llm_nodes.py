@@ -838,7 +838,10 @@ class LlmAttnPrepNode(LlmNode):
     Rows t < n: RoPE(k0) and v go into the cache rows pos + t (as
     LlmAttention; the V cache interleaved by its group_kw); then the rows
     [0, keys) of both caches are flushed — the kernels read them (decode
-    steps write cache rows without flushing)."""
+    steps on the host write cache rows without flushing).  Without n (an
+    empty input: a decode step on the FPGA, doc/plans/KV_DECODE_PLAN.md) n =
+    T and only the rows written are flushed — every other writer of such a
+    project flushes its own."""
     T:   int = 1
     H:   int = 1
     KV:  int = 1
@@ -846,6 +849,7 @@ class LlmAttnPrepNode(LlmNode):
     C:   int = 16
     kw:  int = 1
     Q:   int = KEY_QUANTUM
+    has_n: bool = True
     fq:  Optional[np.ndarray] = field(default=None, repr=False)     # [H]
     cos: Optional[np.ndarray] = field(default=None, repr=False)
     sin: Optional[np.ndarray] = field(default=None, repr=False)
@@ -853,7 +857,8 @@ class LlmAttnPrepNode(LlmNode):
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
         ins = _llm_inputs(node, tensors)
-        _require(len(ins) == 9, node, "inputs: q0, k0, v, pos, n, cache_k, cache_v, cos, sin")
+        _require(len(ins) == 9, node, "inputs: q0, k0, v, pos, n (may be empty), cache_k, cache_v, "
+                                      "cos, sin")
         q0, k0, v, pos, n, ck, cv = ins[:7]
         y = _resolve(tensors, node.output[0], node)
         a, H, KV, HD = _heads_attrs(node)
@@ -872,13 +877,14 @@ class LlmAttnPrepNode(LlmNode):
         _require(cos.shape == (C, HD // 2) and sin.shape == cos.shape, node, "cos / sin shape")
         _require(list(y.shape) == [KV, HD, G * T], node, f"qx must be [{KV}][{HD}][{G * T}]")
         fq = np.asarray(_attr_ints(a, "q_exp", node, H), np.int64)
-        sn = cls(onnx_node=node, inputs=[q0, k0, v, pos, n, ck, cv], output=y, index=index,
-                 align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, C=C, kw=kw, Q=Q, fq=fq,
-                 cos=cos, sin=sin, F=ctx.frac_bits)
+        sn = cls(onnx_node=node, inputs=[q0, k0, v, pos] + ([n] if n is not None else []) + [ck, cv],
+                 output=y, index=index, align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, C=C,
+                 kw=kw, Q=Q, has_n=n is not None, fq=fq, cos=cos, sin=sin, F=ctx.frac_bits)
         for t, w in ((q0, "q"), (k0, "k"), (v, "v"), (y, "output")):
             sn._want(t, None, w)
         sn._want(pos, "i32", "pos")
-        sn._want(n, "i32", "n")
+        if n is not None:
+            sn._want(n, "i32", "n")
         for t, w in ((ck, "cache_k"), (cv, "cache_v")):
             sn._want(t, None, w)
             _require(t.is_state and t.group_layout == (KV, HD), node,
@@ -888,11 +894,11 @@ class LlmAttnPrepNode(LlmNode):
 
     @property
     def ck(self):
-        return self.inputs[5]
+        return self.inputs[-2]
 
     @property
     def cv(self):
-        return self.inputs[6]
+        return self.inputs[-1]
 
     def state_writes(self):
         return [self.ck, self.cv]
@@ -916,7 +922,8 @@ class LlmAttnPrepNode(LlmNode):
 
     def describe(self):
         return (f"T={self.T} heads {self.H}/{self.KV} head_dim {self.HD}, cache {self.C} rows, "
-                f"q.K^T input image kw={self.kw} (FPGA prefill attention)")
+                f"q.K^T input image kw={self.kw} (FPGA "
+                f"{'prefill' if self.has_n else 'decode'} attention)")
 
     def c_call(self, ins, out, scratch, direct, dtype):
         s = {k: self._scales(t) for k, t in (("q", self.inputs[0]), ("k", self.inputs[1]),
@@ -929,17 +936,22 @@ class LlmAttnPrepNode(LlmNode):
             "    llm_prep_t _a;",
             f"    _a.q0 = {ins[0]}; _a.k0 = {ins[1]}; _a.v = {ins[2]};",
             f"    _a.sq = {s['q'][0]}; _a.sk = {s['k'][0]}; _a.sv = {s['v'][0]};",
-            f"    _a.ck = {ins[5]}; _a.cv = {ins[6]};",
+            f"    _a.ck = {ins[-2]}; _a.cv = {ins[-1]};",
             f"    _a.ick = {s['ck'][1]}; _a.icv = {s['cv'][1]}; _a.iq = {iq};",
             f"    _a.qx = {out}; _a.cos = {p}_cos; _a.sin = {p}_sin;",
-            f"    _a.pos = (unsigned){ins[3]}[0]; _a.n = (unsigned){ins[4]}[0]; _a.T = {self.T}u;",
+            f"    _a.pos = (unsigned){ins[3]}[0]; _a.n = "
+            + (f"(unsigned){ins[4]}[0]" if self.has_n else f"{self.T}u") + f"; _a.T = {self.T}u;",
             f"    _a.H = {self.H}u; _a.KV = {self.KV}u; _a.HD = {self.HD}u; _a.C = {self.C}u;"
             f" _a.kw = {self.kw}u; _a.VK = {self.cv.group_kw}u; _a.Q = {self.Q}u;",
             "    llm_attn_prep(&_a);",
+        ] + ([
             f"    llm_cache_flush({self.ck.c_name}, _a.keys, {self.KV}u, {self.C}u, {self.HD}u);",
             f"    llm_cache_flush({self.cv.c_name}, _a.keys, {self.KV}u, {self.C}u, {self.HD}u);",
-            "}",
-        ]
+        ] if self.has_n else [
+            f"    llm_cache_flush_rows({self.ck.c_name}, _a.pos, _a.n, {self.KV}u, {self.C}u, {self.HD}u, 1u);",
+            f"    llm_cache_flush_rows({self.cv.c_name}, _a.pos, _a.n, {self.KV}u, {self.C}u, {self.HD}u,"
+            f" {self.cv.group_kw}u);",
+        ]) + ["}"]
 
     def reference(self, ins, dtype):
         H, KV, HD, T = self.H, self.KV, self.HD, self.T
@@ -948,8 +960,8 @@ class LlmAttnPrepNode(LlmNode):
         k0 = np.asarray(ins[1], np.float64).reshape(T, KV, HD)
         v = np.asarray(ins[2], np.float64).reshape(T, KV * HD)
         pos = _i32(ins[3])
-        n, _k = attn_keys(pos, _i32(ins[4]), T, self.C, self.Q)
-        ck, cv = ins[5], ins[6]                         # logical state arrays, in place
+        n, _k = attn_keys(pos, _i32(ins[4]) if self.has_n else T, T, self.C, self.Q)
+        ck, cv = ins[-2], ins[-1]                       # logical state arrays, in place
         fk = self.ck.exp_channels(self.F)
         fvc = self.cv.exp_channels(self.F)
         for t in range(n):
@@ -1024,6 +1036,7 @@ class LlmAttnConvNode(LlmKernelNode):
     F:           int = 8
     est_cycles:  Tuple = ()           # ((keys, conv cycles, MatmulKernel cycles), ...)
     static:      bool = False         # no pos / n: keys = C
+    has_n:       bool = True          # False: a decode step, n = T
 
     # Compatibility shims (read by the layout / header passes)
     outer_count:        int  = field(default=1,    init=False)
@@ -1042,7 +1055,7 @@ class LlmAttnConvNode(LlmKernelNode):
         from ._conv_hw_config import (CONV_MAX_ACC_PERSIST_ENTRIES, CONV_MAX_IN_CH,
                                       CONV_MAX_OUT_CH)
         ins = _llm_inputs(node, tensors)
-        _require(len(ins) in (2, 4), node, "inputs: weight, x[, pos, n]")
+        _require(len(ins) in (2, 4), node, "inputs: weight, x[, pos, n (may be empty: n = T)]")
         y = _resolve(tensors, node.output[0], node)
         a, H, KV, HD = _heads_attrs(node)
         kind = "qk" if node.op_type == "LlmAttnScores" else "pv"
@@ -1082,12 +1095,12 @@ class LlmAttnConvNode(LlmKernelNode):
         m_pad = -(-out_ch_max // 16) * 16
         oh, ow, est = cls._plan(kind, T, G, HD, C, kw, M, m_pad, CONV_MAX_ACC_PERSIST_ENTRIES, Q,
                                 static)
-        sn = cls(onnx_node=node, inputs=[w, x] if static else [w, x, pos, n], output=y,
-                 index=index, align_elems=align_elems, kind=kind, group=g, T=T, H=H, KV=KV,
-                 HD=HD, C=C, kw=kw, out_h=oh, out_w=ow, Q=Q, F=ctx.frac_bits, est_cycles=est,
-                 static=static)
+        sn = cls(onnx_node=node, inputs=[w, x] if static else [w, x, pos] + ([n] if n is not None else []),
+                 output=y, index=index, align_elems=align_elems, kind=kind, group=g, T=T, H=H,
+                 KV=KV, HD=HD, C=C, kw=kw, out_h=oh, out_w=ow, Q=Q, F=ctx.frac_bits, est_cycles=est,
+                 static=static, has_n=n is not None)
         for t, what in (() if static else ((pos, "pos"), (n, "n"))):
-            _require(t.host == "i32", node, f"{what} must be an i32 host tensor")
+            _require(t is None or t.host == "i32", node, f"{what} must be an i32 host tensor")
         for t in ((x, y) if kind == "qk" else (w, y)):
             _require(t.host is None, node, f"'{t.onnx_name}' must be a DMA tensor")
         return sn
@@ -1158,11 +1171,12 @@ class LlmAttnConvNode(LlmKernelNode):
             return "\n".join([
                 f"    run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
                 f"                {self.conv_regs(f'{self.C}u')});"])
-        pos, n = self.inputs[2:]
+        pos = self.inputs[2]
+        n = f"(unsigned){self.inputs[3].c_name}[0]" if self.has_n else f"{self.T}u"
         return "\n".join([
             "    {",
             f"        const unsigned _keys = llm_keys((unsigned){pos.c_name}[0],"
-            f" (unsigned){n.c_name}[0], {self.T}u, {self.C}u, {self.Q}u);",
+            f" {n}, {self.T}u, {self.C}u, {self.Q}u);",
             f"        run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
             f"                    {self.conv_regs('_keys')});",
             "    }",
@@ -1184,8 +1198,8 @@ class LlmAttnConvNode(LlmKernelNode):
     # ---- simulation ------------------------------------------------------ #
     def reference(self, ins, dtype):
         w, x = ins[0], ins[1]
-        keys = self.C if self.static else attn_keys(_i32(ins[2]), _i32(ins[3]), self.T, self.C,
-                                                    self.Q)[1]
+        keys = self.C if self.static else attn_keys(_i32(ins[2]), _i32(ins[3]) if self.has_n else self.T,
+                                                    self.T, self.C, self.Q)[1]
         g, HD, F = self.group, self.HD, self.F
         if self.kind == "qk":
             kc = _raw(self.inputs[0], w, F)[:keys, g * HD:(g + 1) * HD]     # [keys][HD]
@@ -1215,11 +1229,12 @@ class LlmAttnSoftmaxNode(LlmNode):
     scale: float = 1.0
     fs:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
     fp:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
+    has_n: bool = True                                               # False: n = T (decode)
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
         ins = _llm_inputs(node, tensors)
-        _require(len(ins) == 3, node, "inputs: scores, pos, n")
+        _require(len(ins) == 3, node, "inputs: scores, pos, n (may be empty: n = T)")
         s, pos, n = ins
         y = _resolve(tensors, node.output[0], node)
         a, H, KV, HD = _heads_attrs(node)
@@ -1230,15 +1245,16 @@ class LlmAttnSoftmaxNode(LlmNode):
                  f"scores [{C}][{G * T}] -> P [{G * T}][{C}]")
         Q = int(a.get("key_quantum", KEY_QUANTUM))
         _require(C % Q == 0 and Q % KEY_QUANTUM == 0, node, f"cache rows {C} % key_quantum {Q}")
-        sn = cls(onnx_node=node, inputs=[s, pos, n], output=y, index=index,
-                 align_elems=align_elems, T=T, G=G, C=C, Q=Q, group=int(a["group"]),
-                 scale=1.0 / math.sqrt(HD),
+        sn = cls(onnx_node=node, inputs=[s, pos] + ([n] if n is not None else []), output=y,
+                 index=index, align_elems=align_elems, T=T, G=G, C=C, Q=Q, group=int(a["group"]),
+                 scale=1.0 / math.sqrt(HD), has_n=n is not None,
                  fs=np.asarray(_attr_ints(a, "s_exp", node, G), np.int64),
                  fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits)
         sn._want(s, None, "scores")
         sn._want(y, None, "output")
         sn._want(pos, "i32", "pos")
-        sn._want(n, "i32", "n")
+        if n is not None:
+            sn._want(n, "i32", "n")
         return sn
 
     def c_runtime(self):
@@ -1257,7 +1273,8 @@ class LlmAttnSoftmaxNode(LlmNode):
             "{",
             "    llm_smx_t _a;",
             f"    _a.s = {ins[0]}; _a.p = {out}; _a.fs = _llm_e_{exp_tag(self.fs)}; _a.ip = {ip};",
-            f"    _a.pos = (unsigned){ins[1]}[0]; _a.n = (unsigned){ins[2]}[0];",
+            f"    _a.pos = (unsigned){ins[1]}[0]; _a.n = "
+            + (f"(unsigned){ins[2]}[0]" if self.has_n else f"{self.T}u") + ";",
             f"    _a.T = {self.T}u; _a.G = {self.G}u; _a.C = {self.C}u; _a.Q = {self.Q}u;",
             "    llm_attn_softmax(&_a);",
             "}",
@@ -1267,7 +1284,7 @@ class LlmAttnSoftmaxNode(LlmNode):
         T, G, C = self.T, self.G, self.C
         s = np.asarray(ins[0], np.float64)
         pos = _i32(ins[1])
-        n, keys = attn_keys(pos, _i32(ins[2]), T, C, self.Q)
+        n, keys = attn_keys(pos, _i32(ins[2]) if self.has_n else T, T, C, self.Q)
         P = np.zeros((G * T, C))
         if n == 0:
             return P
@@ -2348,7 +2365,7 @@ static void llm_attention(llm_attn_t *a)
         memset(a->pv + (size_t)n * a->H * HD, 0, (size_t)(a->T - n) * a->H * HD * sizeof(Data_t));
 }
 
-/* ---- FPGA prefill attention (policy pow2+sink+p12+mix) ----
+/* ---- FPGA attention (prefill: policy pow2+sink+p12+mix; prefill and decode: pow2+sink+p12) ----
  * keys = roundup(pos + n, q) keys (n clamped as in llm_attention; q = 16 x
  * the V cache interleave, C % q == 0): the runtime dimension of the q.K^T /
  * P.V ConvKernel calls (out_ch / in_ch). */
@@ -2631,6 +2648,28 @@ static void llm_cache_flush(inference_buf_t *cache, unsigned rows, unsigned G, u
         inference_buf_init_view(&v, cache, g * C * D, rows * D);
         inference_buf_sync_to_device(&v);
     }
+}
+
+/* Flush (clean) rows [r0, r0 + n) of every group of a group-major [G][C][D]
+ * DMA state whose rows are interleaved by K (llm_vrow; K = 1: plain rows) —
+ * the rows a decode step on the FPGA wrote (doc/plans/KV_DECODE_PLAN.md): row
+ * r spans (D - 1) * K + 1 elements from its base, flushed as whole 64-byte
+ * lines. */
+static void llm_cache_flush_rows(inference_buf_t *cache, unsigned r0, unsigned n, unsigned G,
+                                 unsigned C, unsigned D, unsigned K)
+{
+    inference_buf_t v;
+    unsigned        g, r;
+    const size_t    end = (size_t)G * C * D;
+    for (g = 0u; g < G; g++)
+        for (r = r0; r < r0 + n && r < C; r++) {
+            size_t a = llm_vrow(C, D, K, g, r), b = a + (size_t)(D - 1u) * K + 1u;
+            a &= ~(size_t)31u;                     /* 32 int16 = one 64-byte line */
+            b = (b + 31u) & ~(size_t)31u;
+            if (b > end) b = end;
+            inference_buf_init_view(&v, cache, (unsigned)a, (unsigned)(b - a));
+            inference_buf_sync_to_device(&v);
+        }
 }
 """
 
