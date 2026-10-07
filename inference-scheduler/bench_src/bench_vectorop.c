@@ -24,6 +24,9 @@ static void run_once(XVectoropkernel *k,
     XVectoropkernel_Set_a_inc(k, ai);
     XVectoropkernel_Set_b_inc(k, bi);
     XVectoropkernel_Set_act(k, 0);      /* no fused activation; the register keeps the last program's value */
+#ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA   /* IPs with the activation unit */
+    XVectoropkernel_Set_alpha(k, 0);    /* LeakyReLU slope, likewise */
+#endif
     XVectoropkernel_Start(k);
     while (!XVectoropkernel_IsDone(k)) {}
 }

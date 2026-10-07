@@ -119,15 +119,30 @@ inside `inference_run()`.  Full semantics and restrictions:
 | `Div` | `VECTOROP_DIV` (3) | binary | `c[i] = saturate(a[i] / b[i])` |
 | `Relu` | `VECTOROP_RELU` (4) | unary | `c[i] = max(a[i], 0)` |
 | `Clip(min=0, max=6)` | `VECTOROP_RELU6` (5) | unary | `c[i] = min(max(a[i], 0), 6)` |
+| `LeakyRelu` | `VECTOROP_LEAKY_RELU` (6) | unary | `c[i] = a[i] ≥ 0 ? a[i] : alpha · a[i]` — alpha quantised to 2⁻¹⁶, 0 ≤ alpha < 1 |
+| `x · Sigmoid(x)` (`Mul` + `Sigmoid`) | `VECTOROP_SILU` (7) | unary | `c[i] = a[i] · sigmoid(a[i])` (SiLU / Swish) |
+| `Gelu` (`approximate` none / tanh, or a fused GELU pattern) | `VECTOROP_GELU` (8), `VECTOROP_GELU_TANH` (9) | unary | `c[i] = a[i] · Φ(a[i])` — or the host op when its constants give another Q8.8 function |
+
+The last three run in VectorOPKernel's activation unit
+([ACTIVATIONS_PLAN](../../doc/plans/ACTIVATIONS_PLAN.md)): the exact function
+of the Q8.8 value rounded to nearest, ties to even — bit-identical to the host
+GELU.  They need a bitstream with the unit: the platform JSON's
+`kernels.vectorop.activations` (true for the KV260); `AXI_VECTOROP_ACTIVATIONS=0`
+models an older bitstream (then `Gelu` runs on the host, `LeakyRelu` and SiLU
+are rejected), and a program that uses the unit checks the IP in
+`inference_init()`.  Only on `ap_fixed<16,8>` tensors without a power-of-two
+exponent.
 
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
 [Architecture: Broadcasting Algorithm](ARCHITECTURE.md#6-broadcasting-algorithm).
 
-**Activation fusion**: a `Relu` / `Clip(0,6)` whose input is produced by a
-VectorOP node (and read by nothing else, and not a graph output) is folded
-into that node's call through the kernel's `act` register (CLI default;
-`--no-fuse-act` disables it).
+**Activation fusion**: a `Relu` / `Clip(0,6)` — or a `LeakyRelu`, SiLU or
+`Gelu` on the activation unit — whose input is produced by a VectorOP node
+(and read by nothing else, and not a graph output) is folded into that
+node's call through the kernel's `act` register (CLI default; `--no-fuse-act`
+disables it): a bias `Add` → `Gelu` is one pass.  Nothing is folded into an
+activation op itself (the kernel ignores `act` after one).
 
 ### MatmulKernel (matrix multiply, tiled)
 
@@ -791,7 +806,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1651 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1674 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

@@ -20,7 +20,8 @@ import numpy as np
 import host_emu
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
-from src.piper import FLOW_FRAMES, PiperChunkFrontend, PiperEncoderFrontend, encoder_weights, exponent_keys
+from src.piper import (FLOW_FRAMES, PiperChunkFrontend, PiperEncoderFrontend, encoder_weights, exponent_keys,
+                       vop_exponents)
 
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                         "demo", "tts", "scripts")
@@ -274,6 +275,33 @@ class TestPiperChunk(unittest.TestCase):
             np.testing.assert_array_equal(np.asarray(sim).astype(np.int64), spec.astype(np.int64),
                                           err_msg=f"lo {lo} hi {hi}")
 
+    def test_host_sums_variant(self):
+        """vop_sums=False (the library before OFFLOAD_PLAN §2.2: calibrated
+        decoder exponents, three-input sums on the host) against its spec."""
+        W, E, _ = chunk_cg()
+        g = OnnxGraph(PiperChunkFrontend(W, E, vop_sums=False).entry(), fuse_act=True, s2d_stem=True)
+        cg = CodeGenerator(g, model_path="piper_chunk_host.onnx")
+        rng = np.random.default_rng(4)
+        z = (rng.standard_normal((192, FLOW_FRAMES)) * 0.8).astype(np.float32)
+        sim = cg._forward_pass({"zp": z.astype(np.float64), "lo": np.array([0]), "hi": np.array([256])},
+                               keep=["pcm"])["pcm"]
+        np.testing.assert_array_equal(np.asarray(sim).astype(np.int64),
+                                      pv.chunk_forward(W, E, z, 0, 256, vop_sums=False).astype(np.int64))
+        self.assertFalse(np.array_equal(pv.chunk_forward(W, E, z, 0, 256, vop_sums=False),
+                                        pv.chunk_forward(W, E, z, 0, 256)))
+
+    def test_vop_exponents(self):
+        """One exponent per decoder stage, the smallest; the rest unchanged;
+        the scheduler's copy equals the specification's."""
+        _, E, _ = chunk_cg()
+        E2 = pv.vop_exponents(E)
+        self.assertEqual(E2, vop_exponents(E))
+        for i in range(3):
+            keys = [f"dec.up{i}"] + [f"dec.rb{i}{j}.{k}{c}" for j in range(3) for k in "cy" for c in range(2)]
+            self.assertEqual({E2[k] for k in keys}, {min(E[k] for k in keys)})
+        self.assertEqual({k: v for k, v in E2.items() if "dec.up" not in k and "dec.rb" not in k},
+                         {k: v for k, v in E.items() if "dec.up" not in k and "dec.rb" not in k})
+
     def test_stitched_chunks_equal_one_chunk(self):
         W, E, _ = chunk_cg()
         rng = np.random.default_rng(2)
@@ -290,8 +318,16 @@ class TestPiperChunk(unittest.TestCase):
         kinds = {}
         for sn in cg._graph.nodes:
             kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
-        self.assertEqual(kinds, {"ConvNode": 66, "TtsPrepNode": 46, "TtsSumNode": 37, "TtsGateNode": 16,
+        # 37 sums + the 3 split convs' tap-group sums; the decoder's 21 on VectorOP
+        # (and any flow sum whose random exponents happen to be equal)
+        sums = kinds.pop("TtsSumNode", 0) + kinds.get("TtsAddVopNode", 0)
+        self.assertEqual(sums, 40)
+        self.assertGreaterEqual(kinds.pop("TtsAddVopNode"), 21)
+        self.assertEqual(kinds, {"ConvNode": 66, "TtsPrepNode": 46, "TtsGateNode": 16,
                                  "TtsFlowOutNode": 4, "TtsInterleaveNode": 3, "TtsPcmNode": 1})
+        dec = [sn for sn in cg._graph.nodes if sn.onnx_node.name.startswith("dec.rb")
+               and sn.onnx_node.op_type == "TtsSum"]
+        self.assertTrue(dec and all(type(sn).__name__ == "TtsAddVopNode" for sn in dec))
         for sn in cg._graph.nodes:
             if type(sn).__name__ == "ConvNode":
                 self.assertLessEqual((sn.kw - 1) * sn.dilation_w + 1, 64)

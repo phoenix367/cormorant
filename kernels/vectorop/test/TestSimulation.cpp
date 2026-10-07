@@ -74,7 +74,7 @@ struct AlignedBuf {
 // the burst_maxi port objects.
 static void run_kernel(AlignedBuf& a, AlignedBuf* b, AlignedBuf& c,
                        unsigned size, unsigned op, unsigned outer,
-                       unsigned a_inc, unsigned b_inc, unsigned act) {
+                       unsigned a_inc, unsigned b_inc, unsigned act, unsigned alpha) {
     assert(a_inc % kVecLanes == 0 && "a_inc must be a multiple of kVecLanes");
     assert(b_inc % kVecLanes == 0 && "b_inc must be a multiple of kVecLanes");
     assert(reinterpret_cast<uintptr_t>(a.p) % 16 == 0);
@@ -92,7 +92,7 @@ static void run_kernel(AlignedBuf& a, AlignedBuf* b, AlignedBuf& c,
     hls::burst_maxi<VecWord> pa(reinterpret_cast<VecWord*>(a.p));
     hls::burst_maxi<VecWord> pb(reinterpret_cast<VecWord*>(bp));
     hls::burst_maxi<VecWord> pc(reinterpret_cast<VecWord*>(c.p));
-    VectorOPKernel(pa, pb, pc, size, op, outer, a_inc, b_inc, act);
+    VectorOPKernel(pa, pb, pc, size, op, outer, a_inc, b_inc, act, alpha);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,15 +111,43 @@ static double ref_sat(double v) {
     return std::max(kSatMin, std::min(kSatMax, v));
 }
 
-static double ref_act(double v, unsigned act) {
+// One LSB of an ap_fixed Data_t (0: a floating-point build, nothing rounds).
+template<typename T> struct RefLsb { static double get() { return 0.0; } };
+#ifdef VA_HAVE_APFIXED
+template<int W, int I, ap_q_mode Q, ap_o_mode O, int N>
+struct RefLsb<ap_fixed<W, I, Q, O, N>> { static double get() { return std::ldexp(1.0, I - W); } };
+#endif
+static const double kLsb = RefLsb<Data_t>::get();
+
+// The activation functions' rounding: nearest representable, ties to even
+// (nearbyint under the default rounding mode), then saturation.
+static double ref_round(double v) {
+    return ref_sat(kLsb > 0.0 ? std::nearbyint(v / kLsb) * kLsb : v);
+}
+
+// The op result as the kernel hands it to the activation: saturated and
+// truncated to Data_t (AP_TRN: floor; the quotient's truncation toward zero
+// is the same for the positive DIV operands of these tests).  ReLU / ReLU6
+// commute with it, the other activations do not.
+static double ref_quant(double v) {
+    return ref_sat(kLsb > 0.0 ? std::floor(v / kLsb) * kLsb : v);
+}
+
+static double ref_act(double v, unsigned act, unsigned alpha) {
     switch (act) {
-        case ACT_RELU:  return std::max(0.0, v);
-        case ACT_RELU6: return std::min(std::max(0.0, v), 6.0);
-        default:        return v;
+        case ACT_RELU:       return std::max(0.0, v);
+        case ACT_RELU6:      return std::min(std::max(0.0, v), 6.0);
+        case ACT_LEAKY_RELU: return ref_round(v >= 0.0 ? v : v * (alpha & 0xFFFFu) / 65536.0);
+        case ACT_SILU:       return ref_round(v / (1.0 + std::exp(-v)));
+        case ACT_GELU:       return ref_round(0.5 * v * (1.0 + std::erf(v / std::sqrt(2.0))));
+        case ACT_GELU_TANH:  return ref_round(0.5 * v * (1.0 + std::tanh(
+                                 std::sqrt(2.0 / M_PI) * (v + 0.044715 * v * v * v))));
+        default:             return v;
     }
 }
 
-static double ref_op(unsigned op, double a, double b, unsigned act = ACT_NONE) {
+static double ref_op(unsigned op, double a, double b, unsigned act = ACT_NONE,
+                     unsigned alpha = 0) {
     double r;
     switch (op) {
         case OP_ADD:   r = ref_sat(a + b); break;
@@ -128,9 +156,9 @@ static double ref_op(unsigned op, double a, double b, unsigned act = ACT_NONE) {
         case OP_DIV:   r = (b == 0.0) ? 0.0 : ref_sat(a / b); break;
         case OP_RELU:  r = std::max(0.0, a); break;
         case OP_RELU6: r = std::min(std::max(0.0, a), 6.0); break;
-        default:       r = a; break;
+        default:       r = a; break;      // the activation ops: job_act
     }
-    return ref_act(r, act);
+    return ref_act(ref_quant(r), job_act(op, act), alpha);
 }
 
 static bool is_unary(unsigned op) { return op >= OP_RELU; }
@@ -177,11 +205,12 @@ static unsigned extent(unsigned size, unsigned outer, unsigned inc) {
 static void dump_one_case(const char* label,
                           unsigned size, unsigned op_code,
                           unsigned outer, unsigned a_inc, unsigned b_inc, unsigned act,
+                          unsigned alpha,
                           const AlignedBuf& a, const AlignedBuf& b,
                           const std::vector<double>& c_ref_d) {
 #ifndef VA_HAVE_APFIXED
     (void)label; (void)size; (void)op_code;
-    (void)outer; (void)a_inc; (void)b_inc; (void)act;
+    (void)outer; (void)a_inc; (void)b_inc; (void)act; (void)alpha;
     (void)a; (void)b; (void)c_ref_d;
     std::fprintf(stderr, "--dump-data requires VA_HAVE_APFIXED build\n");
     std::exit(1);
@@ -201,11 +230,11 @@ static void dump_one_case(const char* label,
     write_hex_file(prefix + "b.hex", b.p, b_n);
     write_hex_file(prefix + "c.hex", c_ref.data(), (unsigned)c_ref.size());
 
-    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %s\n",
-                 idx, size, op_code, outer, a_inc, b_inc, act,
+    std::fprintf(g_manifest, "%d %u %u %u %u %u %u %u %s\n",
+                 idx, size, op_code, outer, a_inc, b_inc, act, alpha,
                  sanitize_label(label).c_str());
-    std::printf("[DUMP] test_%02d  %-34s  size=%u op=%u outer=%u a_inc=%u b_inc=%u act=%u\n",
-                idx, label, size, op_code, outer, a_inc, b_inc, act);
+    std::printf("[DUMP] test_%02d  %-34s  size=%u op=%u outer=%u a_inc=%u b_inc=%u act=%u alpha=%u\n",
+                idx, label, size, op_code, outer, a_inc, b_inc, act, alpha);
 #endif
 }
 
@@ -214,7 +243,7 @@ static void dump_one_case(const char* label,
 //
 // Fills a / b with random values for the op, computes the reference over
 // the full c extent (gaps marked don't-care), runs the kernel and checks:
-//   * every valid position matches the reference (1 LSB for ap_fixed,
+//   * every valid position matches the reference (exactly for ap_fixed,
 //     relative 1e-5 for float);
 //   * the tail lanes of every run's last word (positions [size, ceil8(size))
 //     within the run) read 0 — the contract's op(0, 0);
@@ -237,7 +266,7 @@ static const Data_t kPoison = Data_t(-77.5);
 
 static bool RunCase(const char* label, unsigned op, unsigned size, unsigned outer,
                     unsigned a_inc, unsigned b_inc, unsigned act, unsigned seed,
-                    bool verbose = true) {
+                    unsigned alpha = 0, bool verbose = true) {
     std::default_random_engine rng(seed);
     Range ra = input_range(op);
     Range rb = (op == OP_DIV) ? Range{1.0, 10.0} : input_range(op);
@@ -262,7 +291,7 @@ static bool RunCase(const char* label, unsigned op, unsigned size, unsigned oute
         for (unsigned i = 0; i < size; ++i) {
             const double av = static_cast<double>(a[o * a_inc + i]);
             const double bv = static_cast<double>(b[o * b_inc + i]);
-            c_ref[o * c_inc + i] = ref_op(op, av, bv, act);
+            c_ref[o * c_inc + i] = ref_op(op, av, bv, act, alpha);
             kind [o * c_inc + i] = 'v';
         }
         for (unsigned i = size; i < n_w * kVecLanes; ++i) {
@@ -272,14 +301,14 @@ static bool RunCase(const char* label, unsigned op, unsigned size, unsigned oute
     }
 
     if (!g_dump_dir.empty()) {
-        dump_one_case(label, size, op, outer, a_inc, b_inc, act, a, b, c_ref);
+        dump_one_case(label, size, op, outer, a_inc, b_inc, act, alpha, a, b, c_ref);
         return true;
     }
 
-    run_kernel(a, is_unary(op) ? nullptr : &b, c, size, op, outer, a_inc, b_inc, act);
+    run_kernel(a, is_unary(op) ? nullptr : &b, c, size, op, outer, a_inc, b_inc, act, alpha);
 
     const bool   isFloat = std::is_floating_point<Data_t>::value;
-    const double absTol  = 1.0 / 256.0;
+    const double absTol  = 0.0;            // ap_fixed: ref_op is exact (ref_quant, ref_round)
     const double relTol  = 1e-5;
 
     unsigned mismatches = 0;
@@ -319,7 +348,8 @@ static bool RunCase(const char* label, unsigned op, unsigned size, unsigned oute
 // Comparison tolerance is zero for fixed-point types (ap_fixed results are
 // exact when converted to double) and 1 LSB for float.
 // ---------------------------------------------------------------------------
-static bool RunSatTest(unsigned op, double a_val, double b_val, const char* desc) {
+static bool RunSatTest(unsigned op, double a_val, double b_val, const char* desc,
+                       unsigned alpha = 0) {
     static const unsigned kSize = 8;
     static const double   kTol  = std::is_floating_point<Data_t>::value
                                   ? 1.0 / 256.0
@@ -332,15 +362,15 @@ static bool RunSatTest(unsigned op, double a_val, double b_val, const char* desc
     // Reference uses the same saturate-cast semantics as the kernel.
     const double expected = ref_op(op,
                                    static_cast<double>(Data_t(a_val)),
-                                   static_cast<double>(Data_t(b_val)));
+                                   static_cast<double>(Data_t(b_val)), ACT_NONE, alpha);
 
     if (!g_dump_dir.empty()) {
         std::vector<double> c_ref(kSize, expected);
-        dump_one_case(desc, kSize, op, 1u, 0u, 0u, ACT_NONE, a, b, c_ref);
+        dump_one_case(desc, kSize, op, 1u, 0u, 0u, ACT_NONE, alpha, a, b, c_ref);
         return true;
     }
 
-    run_kernel(a, is_unary(op) ? nullptr : &b, c, kSize, op, 1u, 0u, 0u, ACT_NONE);
+    run_kernel(a, is_unary(op) ? nullptr : &b, c, kSize, op, 1u, 0u, 0u, ACT_NONE, alpha);
 
     bool ok = true;
     for (unsigned i = 0; i < kSize; ++i) {
@@ -372,6 +402,7 @@ struct SatEntry {
     unsigned    op;
     double      a, b;
     const char* desc;
+    unsigned    alpha = 0;  // LeakyReLU slope (alpha / 65536)
 };
 
 static const SatEntry kSatTests[] = {
@@ -417,16 +448,15 @@ static const SatEntry kSatTests[] = {
     { OP_RELU6, 20.0,            0.0,         "RELU6 20    → 6"               },
 };
 
-static bool RunSatTests() {
-    const unsigned n = sizeof(kSatTests) / sizeof(kSatTests[0]);
+static bool RunSatTests(const SatEntry* tests, unsigned n, const char* title) {
     bool allPassed = true;
 
-    std::cout << "\n--- Saturation boundary tests (" << n << ") ---\n";
+    std::cout << "\n--- " << title << " (" << n << ") ---\n";
     for (unsigned i = 0; i < n; ++i) {
-        const SatEntry& t = kSatTests[i];
+        const SatEntry& t = tests[i];
         std::cout << "[" << (i + 1) << "/" << n << "] " << t.desc
                   << " ... " << std::flush;
-        const bool ok = RunSatTest(t.op, t.a, t.b, t.desc);
+        const bool ok = RunSatTest(t.op, t.a, t.b, t.desc, t.alpha);
         std::cout << (ok ? "PASS" : "FAIL") << "\n";
         allPassed &= ok;
     }
@@ -445,6 +475,7 @@ struct GeomEntry {
     unsigned    op;
     unsigned    size, outer, a_inc, b_inc, act;
     const char* desc;
+    unsigned    alpha = 0;  // LeakyReLU slope (alpha / 65536)
 };
 
 static const GeomEntry kGeomTests[] = {
@@ -479,17 +510,17 @@ static const GeomEntry kGeomTests[] = {
     { OP_ADD,   16, 1000,   0,   16, ACT_RELU,  "outer1000 x size16 ADD + act RELU"     },
 };
 
-static bool RunGeomTests(unsigned seed_base) {
-    const unsigned n = sizeof(kGeomTests) / sizeof(kGeomTests[0]);
+static bool RunGeomTests(const GeomEntry* tests, unsigned n, const char* title,
+                         unsigned seed_base) {
     bool allPassed = true;
 
-    std::cout << "\n--- Geometry / activation tests (" << n << ") ---\n";
+    std::cout << "\n--- " << title << " (" << n << ") ---\n";
     for (unsigned i = 0; i < n; ++i) {
-        const GeomEntry& t = kGeomTests[i];
+        const GeomEntry& t = tests[i];
         std::cout << "[" << (i + 1) << "/" << n << "] " << t.desc
                   << " ... " << std::flush;
         const bool ok = RunCase(t.desc, t.op, t.size, t.outer,
-                                t.a_inc, t.b_inc, t.act, seed_base + i);
+                                t.a_inc, t.b_inc, t.act, seed_base + i, t.alpha);
         std::cout << (ok ? "PASS" : "FAIL") << "\n";
         allPassed &= ok;
     }
@@ -509,6 +540,150 @@ static const OpEntry kOps[] = {
     { OP_RELU,  "RELU"  },
     { OP_RELU6, "RELU6" },
 };
+
+// ---------------------------------------------------------------------------
+// The activation ops and acts (LeakyReLU, SiLU, GELU, GELU tanh).  They run
+// after every earlier test, so the fixtures dumped before them keep their
+// numbers; the exhaustive check is verify-only (65 536 elements per job).
+// ---------------------------------------------------------------------------
+static const OpEntry kActOps[] = {
+    { OP_LEAKY_RELU, "LEAKY_RELU" },
+    { OP_SILU,       "SILU"       },
+    { OP_GELU,       "GELU"       },
+    { OP_GELU_TANH,  "GELU_TANH"  },
+};
+
+static const unsigned kAlpha01  = 0x199A;   // 0.1000061 (Piper / YOLO's 0.1)
+static const unsigned kAlpha001 = 0x028F;   // 0.0099945 (ONNX LeakyRelu's default 0.01)
+
+static const SatEntry kActSatTests[] = {
+    // ── LEAKY_RELU (alpha / 65536, rounded to nearest, ties to even) ─────────
+    { OP_LEAKY_RELU,  -0.00390625,   0.0, "LEAKY a=0.5 -1LSB -> -0.5LSB tie -> 0",  0x8000 },
+    { OP_LEAKY_RELU,  -0.01171875,   0.0, "LEAKY a=0.5 -3LSB -> -1.5LSB tie -> -2", 0x8000 },
+    { OP_LEAKY_RELU,  -0.01953125,   0.0, "LEAKY a=0.5 -5LSB -> -2.5LSB tie -> -2", 0x8000 },
+    { OP_LEAKY_RELU, -128.0,         0.0, "LEAKY a=1-2^-16 min -> min (tie)",       0xFFFF },
+    { OP_LEAKY_RELU, -128.0,         0.0, "LEAKY a=0 min -> 0",                     0      },
+    { OP_LEAKY_RELU,   -1.0,         0.0, "LEAKY a=0.1 -1 -> -0.1015625",           kAlpha01 },
+    { OP_LEAKY_RELU,  127.99609375,  0.0, "LEAKY max -> max",                       kAlpha01 },
+    { OP_LEAKY_RELU,    0.0,         0.0, "LEAKY 0 -> 0",                           0xFFFF },
+    { OP_LEAKY_RELU,   -1.0,         0.0, "LEAKY alpha bits 31:16 ignored",         0xABCD0000u | kAlpha01 },
+    // ── SILU / GELU / GELU_TANH: the ends of the range and of the tables ────
+    { OP_SILU,       -128.0,         0.0, "SILU min -> 0"                           },
+    { OP_SILU,        127.99609375,  0.0, "SILU max -> max"                         },
+    { OP_SILU,         -1.27734375,  0.0, "SILU near its minimum (-0.2785)"         },
+    { OP_SILU,         -8.359375,    0.0, "SILU last table entry (-2140 LSB)"       },
+    { OP_SILU,         -8.36328125,  0.0, "SILU first input past the table -> 0"    },
+    { OP_SILU,          8.359375,    0.0, "SILU +8.359 (x + last entry)"            },
+    { OP_GELU,       -128.0,         0.0, "GELU min -> 0"                           },
+    { OP_GELU,        127.99609375,  0.0, "GELU max -> max"                         },
+    { OP_GELU,         -0.75,        0.0, "GELU near its minimum (-0.17)"           },
+    { OP_GELU,         -3.234375,    0.0, "GELU last table entry (-828 LSB)"        },
+    { OP_GELU,         -3.23828125,  0.0, "GELU first input past the table -> 0"    },
+    { OP_GELU,          3.234375,    0.0, "GELU +3.234 (x + last entry)"            },
+    { OP_GELU_TANH,  -128.0,         0.0, "GELU_TANH min -> 0"                      },
+    { OP_GELU_TANH,   127.99609375,  0.0, "GELU_TANH max -> max"                    },
+    { OP_GELU_TANH,    -3.18359375,  0.0, "GELU_TANH last table entry (-815 LSB)"   },
+    { OP_GELU_TANH,    -3.1875,      0.0, "GELU_TANH first input past the table"    },
+    { OP_GELU_TANH,     1.5,         0.0, "GELU_TANH 1.5"                           },
+};
+
+static const GeomEntry kActGeomTests[] = {
+    // Fused after a binary op (ALU path) and after DIV (one lane per cycle)
+    { OP_ADD,   255,    1,  0,  0, ACT_LEAKY_RELU, "ADD + act LEAKY_RELU",        kAlpha01  },
+    { OP_ADD,  1023,    1,  0,  0, ACT_SILU,       "ADD + act SILU"                         },
+    { OP_SUB,    64,    1,  0,  0, ACT_GELU_TANH,  "SUB + act GELU_TANH"                    },
+    { OP_MUL,    12,    5, 16,  0, ACT_GELU,       "MUL bcast + act GELU"                   },
+    { OP_DIV,   100,    1,  0,  0, ACT_SILU,       "DIV + act SILU"                         },
+    { OP_DIV,    37,    1,  0,  0, ACT_LEAKY_RELU, "DIV + act LEAKY_RELU",        0x4000    },
+    { OP_RELU,   33,    1,  0,  0, ACT_GELU,       "RELU + act GELU"                        },
+    { OP_ADD,    16, 1000,  0, 16, ACT_GELU,       "outer1000 x size16 ADD + act GELU"      },
+    // The activation ops: unary geometries; the act register is not applied
+    { OP_SILU,   12,    4, 16,  0, ACT_NONE,       "unary bcast-shaped SILU"                },
+    { OP_GELU,   33,    1,  0,  0, ACT_RELU6,      "GELU op (act RELU6 ignored)"            },
+    { OP_LEAKY_RELU, 20, 3, 24, 0, ACT_GELU,       "LEAKY_RELU op outer3 (act ignored)", kAlpha001 },
+    { OP_GELU_TANH, 2100, 3, 2104, 0, ACT_NONE,    "GELU_TANH outer3 size2100"              },
+};
+
+// Every Q8.8 input of each activation (65 536 elements, verify mode only):
+// the kernel against the reference exactly.
+static bool RunExhaustiveTest(const char* desc, unsigned op, unsigned act, unsigned alpha) {
+#ifndef VA_HAVE_APFIXED
+    (void)desc; (void)op; (void)act; (void)alpha;
+    return true;
+#else
+    const unsigned n = 65536;
+    AlignedBuf a(n), b(n), c(n, kPoison);
+    for (unsigned i = 0; i < n; ++i) {
+        a[i].range(15, 0) = i;
+        b[i] = Data_t(0);
+    }
+    run_kernel(a, is_unary(op) ? nullptr : &b, c, n, op, 1u, 0u, 0u, act, alpha);
+    unsigned bad = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const double ref = ref_op(op, static_cast<double>(a[i]), 0.0, act, alpha);
+        const double got = static_cast<double>(c[i]);
+        if (got != ref && ++bad <= 3)
+            std::cerr << "  [" << desc << "] a=" << static_cast<double>(a[i])
+                      << " got=" << got << " ref=" << ref << "\n";
+    }
+    return bad == 0;
+#endif
+}
+
+struct ExhEntry { unsigned op, act, alpha; const char* desc; };
+static const ExhEntry kExhaustiveTests[] = {
+    { OP_LEAKY_RELU, ACT_NONE, 0,         "LEAKY_RELU alpha 0"        },
+    { OP_LEAKY_RELU, ACT_NONE, 1,         "LEAKY_RELU alpha 2^-16"    },
+    { OP_LEAKY_RELU, ACT_NONE, kAlpha001, "LEAKY_RELU alpha 0.01"     },
+    { OP_LEAKY_RELU, ACT_NONE, kAlpha01,  "LEAKY_RELU alpha 0.1"      },
+    { OP_LEAKY_RELU, ACT_NONE, 0x8000,    "LEAKY_RELU alpha 0.5"      },
+    { OP_LEAKY_RELU, ACT_NONE, 0xFFFF,    "LEAKY_RELU alpha 1-2^-16"  },
+    { OP_SILU,       ACT_NONE, 0,         "SILU"                      },
+    { OP_GELU,       ACT_NONE, 0,         "GELU"                      },
+    { OP_GELU_TANH,  ACT_NONE, 0,         "GELU_TANH"                 },
+    { OP_ADD,        ACT_SILU, 0,         "ADD 0 + act SILU"          },
+    { OP_ADD,        ACT_GELU, 0,         "ADD 0 + act GELU"          },
+};
+
+static bool RunActTests() {
+    const unsigned sizes[] = { 1, 3, 8, 9, 13, 64, 255, 256, 1023, 1024, 4097 };
+    const unsigned nSizes  = sizeof(sizes) / sizeof(sizes[0]);
+    const unsigned nOps    = sizeof(kActOps) / sizeof(kActOps[0]);
+    bool allPassed = true;
+    unsigned idx = 0;
+
+    std::cout << "\n--- Activation random-value tests (" << nSizes * nOps << ") ---\n";
+    for (unsigned o = 0; o < nOps; ++o) {
+        for (unsigned s = 0; s < nSizes; ++s) {
+            ++idx;
+            std::cout << "[" << idx << "/" << nSizes * nOps << "] "
+                      << kActOps[o].name << "  size=" << sizes[s]
+                      << " ... " << std::flush;
+            const unsigned alpha = (kActOps[o].op == OP_LEAKY_RELU) ? kAlpha01 : 0u;
+            const bool ok = RunCase(kActOps[o].name, kActOps[o].op, sizes[s],
+                                    1u, 0u, 0u, ACT_NONE, kSeed + 2000 + idx, alpha);
+            std::cout << (ok ? "PASS" : "FAIL") << "\n";
+            allPassed &= ok;
+        }
+    }
+    allPassed &= RunSatTests(kActSatTests, sizeof(kActSatTests) / sizeof(kActSatTests[0]),
+                             "Activation boundary tests");
+    allPassed &= RunGeomTests(kActGeomTests, sizeof(kActGeomTests) / sizeof(kActGeomTests[0]),
+                              "Activation geometry / fusion tests", kSeed + 3000);
+
+    if (g_dump_dir.empty()) {
+        const unsigned n = sizeof(kExhaustiveTests) / sizeof(kExhaustiveTests[0]);
+        std::cout << "\n--- Exhaustive activation tests (" << n << " x 65536 inputs) ---\n";
+        for (unsigned i = 0; i < n; ++i) {
+            const ExhEntry& t = kExhaustiveTests[i];
+            std::cout << "[" << (i + 1) << "/" << n << "] " << t.desc << " ... " << std::flush;
+            const bool ok = RunExhaustiveTest(t.desc, t.op, t.act, t.alpha);
+            std::cout << (ok ? "PASS" : "FAIL") << "\n";
+            allPassed &= ok;
+        }
+    }
+    return allPassed;
+}
 
 // ---------------------------------------------------------------------------
 // Full test suite
@@ -536,12 +711,20 @@ static bool RunAllTests() {
         }
     }
 
-    allPassed &= RunSatTests();
-    allPassed &= RunGeomTests(kSeed + 1000);
+    allPassed &= RunSatTests(kSatTests, sizeof(kSatTests) / sizeof(kSatTests[0]),
+                             "Saturation boundary tests");
+    allPassed &= RunGeomTests(kGeomTests, sizeof(kGeomTests) / sizeof(kGeomTests[0]),
+                              "Geometry / activation tests", kSeed + 1000);
+    allPassed &= RunActTests();
 
     const unsigned nTotal = nRandom
-                          + sizeof(kSatTests)  / sizeof(kSatTests[0])
-                          + sizeof(kGeomTests) / sizeof(kGeomTests[0]);
+                          + sizeof(kSatTests)     / sizeof(kSatTests[0])
+                          + sizeof(kGeomTests)    / sizeof(kGeomTests[0])
+                          + nSizes * (sizeof(kActOps) / sizeof(kActOps[0]))
+                          + sizeof(kActSatTests)  / sizeof(kActSatTests[0])
+                          + sizeof(kActGeomTests) / sizeof(kActGeomTests[0])
+                          + (g_dump_dir.empty()
+                             ? sizeof(kExhaustiveTests) / sizeof(kExhaustiveTests[0]) : 0);
     std::cout << "\n"
               << (allPassed ? "All " : "FAILED — ")
               << nTotal << " tests"
@@ -564,7 +747,8 @@ int main(int argc, char** argv) {
                       << "  --dump-data <dir>: write hex fixtures + manifest "
                          "and exit.\n"
                       << "  op size: single random test "
-                         "(op: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6).\n";
+                         "(op: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6 6=LEAKY_RELU "
+                         "(alpha 0.1) 7=SILU 8=GELU 9=GELU_TANH).\n";
             return 0;
         } else {
             rest.push_back(argv[i]);
@@ -580,7 +764,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(g_manifest,
             "# VectorOPKernel test fixture manifest\n"
-            "# idx size op outer a_inc b_inc act label\n");
+            "# idx size op outer a_inc b_inc act alpha label\n");
 
         std::cout << "VectorOP test data dump → " << g_dump_dir << "\n";
         const bool ok = RunAllTests();
@@ -594,14 +778,15 @@ int main(int argc, char** argv) {
         const unsigned opCode = std::stoul(rest[0]);
         const unsigned size   = std::stoul(rest[1]);
         const unsigned nOps   = sizeof(kOps) / sizeof(kOps[0]);
-        if (opCode >= nOps) {
-            std::cerr << "op must be 0–" << (nOps - 1) << "\n";
+        const unsigned nAct   = sizeof(kActOps) / sizeof(kActOps[0]);
+        if (opCode >= nOps + nAct) {
+            std::cerr << "op must be 0–" << (nOps + nAct - 1) << "\n";
             return 1;
         }
-        std::cout << "Single test: op=" << kOps[opCode].name
-                  << "  size=" << size << "\n";
-        const bool ok = RunCase(kOps[opCode].name, kOps[opCode].op, size,
-                                1u, 0u, 0u, ACT_NONE, kSeed);
+        const OpEntry& e = (opCode < nOps) ? kOps[opCode] : kActOps[opCode - nOps];
+        std::cout << "Single test: op=" << e.name << "  size=" << size << "\n";
+        const bool ok = RunCase(e.name, e.op, size, 1u, 0u, 0u, ACT_NONE, kSeed,
+                                e.op == OP_LEAKY_RELU ? kAlpha01 : 0u);
         std::cout << (ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     }

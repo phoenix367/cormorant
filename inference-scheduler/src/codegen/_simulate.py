@@ -39,13 +39,14 @@ import numpy as np
 
 from ..nodes  import (
     OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_RELU, OP_RELU6,
-    ACT_RELU, ACT_RELU6,
+    ACT_RELU, ACT_RELU6, ACTIVATION_OPS, job_act,
     MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode, SpaceToDepthNode,
     POOL_MAX, POOL_AVG,
 )
 from ..tensor import TensorInfo
 from ..host_nodes import GatherNode, HostNode, OneHotNode
-from ..llm_nodes import LlmAttnConvNode, LlmEmbedNode
+from .. import vectorop_act
+from ..llm_nodes import LlmEmbedNode, LlmKernelNode
 
 # Expected GT arrays larger than this threshold are written to external
 
@@ -659,10 +660,11 @@ class _SimulateMixin:
                 arrays[sn.output.onnx_name] = src.reshape(sn.output.shape)
                 continue
 
-            if isinstance(sn, LlmAttnConvNode):
-                # FPGA prefill attention call (q.K^T / P.V on ConvKernel): raw
-                # integer operands, exact sums, int32 wrap, floor + saturate —
-                # over the runtime key count of this call's pos / n
+            if isinstance(sn, LlmKernelNode):
+                # LLM-domain kernel calls on exponent tensors: the FPGA prefill
+                # attention (q.K^T / P.V on ConvKernel: raw integer operands, exact
+                # sums, int32 wrap, floor + saturate — over the runtime key count
+                # of this call's pos / n), the vision GELU on VectorOPKernel
                 arrays[sn.output.onnx_name] = sn.reference(
                     [arrays[t.onnx_name] for t in sn.inputs], dtype)
                 continue
@@ -727,6 +729,8 @@ class _SimulateMixin:
                 result = np.maximum(a, 0.0)
             elif sn.op_code == OP_RELU6:
                 result = np.minimum(np.maximum(a, 0.0), 6.0)
+            elif sn.op_code in ACTIVATION_OPS:
+                result = a                     # the pass op; job_act applies it
             else:
                 raise ValueError(
                     f"_forward_pass: unknown op_code {sn.op_code} "
@@ -736,10 +740,18 @@ class _SimulateMixin:
             # Fused activation (kernel `act` register).  Clipping commutes
             # with the saturating truncation (0 and 6 are representable),
             # so applying it before quantisation matches the hardware.
-            if sn.act == ACT_RELU:
+            act = job_act(sn.op_code, sn.act)
+            if act == ACT_RELU:
                 result = np.maximum(result, 0.0)
-            elif sn.act == ACT_RELU6:
+            elif act == ACT_RELU6:
                 result = np.minimum(np.maximum(result, 0.0), 6.0)
+            elif act in vectorop_act.UNIT_ACTS:
+                # The activation unit: on the op result as the kernel hands
+                # it on (truncated), rounded to nearest-even (vectorop_act).
+                full = vectorop_act.act_values(act, truncate_fn(result), sn.alpha)
+                _store_quant(sn.output.onnx_name, full,
+                             truncate_fn=dtype.host_quantize, shape=sn.output.shape)
+                continue
 
             _store_quant(sn.output.onnx_name, result,
                          truncate_fn=truncate_fn, shape=sn.output.shape)

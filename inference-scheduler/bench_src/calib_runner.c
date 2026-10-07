@@ -69,6 +69,9 @@ static void start(const call_t *c)
         XVectoropkernel_Set_a_inc(&s_v, r[3]);
         XVectoropkernel_Set_b_inc(&s_v, r[4]);
         XVectoropkernel_Set_act(&s_v, r[5]);
+#ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA   /* IPs with the activation unit */
+        XVectoropkernel_Set_alpha(&s_v, 0);   /* LeakyReLU slope: no effect on timing */
+#endif
         XVectoropkernel_Start(&s_v);
         break;
     case 'M':   /* n k m batch a_stride b_stride c_stride b_packed gemv_kw */

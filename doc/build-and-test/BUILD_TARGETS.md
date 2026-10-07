@@ -70,7 +70,7 @@ no hardware.
 | `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolingSim` | PoolingKernel (C++ model) | Max/Average/Lp pooling + global variants; `--dump-data` writes the RTL fixtures |
 | `TestMatmulRtl` | MatmulKernel (RTL) | Verilator testbench of the SystemVerilog kernel; the CTest test runs the 50 checked-in fixtures + 200 random cases (~50 s) — only if Verilator 5.x is found ([below](#rtl-matmulkernel-systemverilog)) |
-| `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 119 checked-in fixtures and 300 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
+| `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 201 checked-in fixtures, 300 random jobs and 8 every-input activation jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
 | `TestPoolRtl` | PoolingKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 45 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-poolingkernel-systemverilog)) |
 | `TestConvRtl` | ConvKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 63 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-convkernel-systemverilog)) |
 
@@ -79,10 +79,11 @@ no hardware.
 | `run_tests` | Builds `TestSimulation`, `TestConvRef`, `TestMatmulRef`, `TestPoolingSim` (and `TestMatmulBlas`, `TestMatmulRtl`, `TestVectorOpRtl`, `TestPoolRtl`, `TestConvRtl`, `conv_rtl_dsp_check` when present), then runs `ctest --output-on-failure` |
 | `test` | Runs the CTest tests without rebuilding (equivalent to `ctest`) |
 
-CTest registers sixteen tests: `TestSimulation`, `TestConvRef`,
+CTest registers seventeen tests: `TestSimulation`, `TestConvRef`,
 `TestConvGrid`, `TestConvSweep`, `TestMatmulRef`, `TestMatmulBlas` (only
 with BLAS), `TestPoolingSim`, `MatmulRtlDriver`, `TestMatmulRtl` (only
-with Verilator), `VectorOpRtlDriver`, `TestVectorOpRtl` (only with
+with Verilator), `VectorOpRtlDriver`, `VectorOpRtlActRom` (the generated
+activation table is current), `TestVectorOpRtl` (only with
 Verilator), `PoolRtlDriver`, `TestPoolRtl` (only with Verilator),
 `ConvRtlDriver`, `TestConvRtl` (only with Verilator) and `ConvRtlDsp` (only
 with Verilator and Vivado's `DSP48E2.v` unisim model). `run_tests` does not list `TestConvGrid`
@@ -296,7 +297,7 @@ target's exit code.
 
 `behavior_test_<k>` depends on `package_<k>_rtl` (the IP the test stand's
 `.xpr` is pointed at, `build/rtl_ip/<Name>_ip`).  All four
-pass (119 VectorOP, 63 Conv, 50 Matmul (11 GEMV), 45 Pool cases).  The runs modify
+pass (201 VectorOP, 63 Conv, 50 Matmul (11 GEMV), 45 Pool cases).  The runs modify
 tracked `.bd` / `.xci` / `.xpr` files of `hw/cormorant_test_stand`; do not
 commit them.
 
@@ -309,7 +310,7 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 | Target | Description |
 |--------|-------------|
 | `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-packages the four kernel IPs first when their sources changed. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
-| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 68 cases over the four kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
+| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 73 cases over the four kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
 | `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260; `dtc`'s `reg_format` / `avoid_default_addr_size` warnings are expected |
 
 ---

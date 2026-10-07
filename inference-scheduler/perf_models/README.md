@@ -18,8 +18,16 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/986cef4866a0` is the 250 MHz design (2026-10-06, FMAX_250_PLAN: the kernels on an MMCM
-at 250 MHz, register slices, the kernels' register trees): 2011 calls, `clock_mhz` 250, repeat
+`kv260/6436623029f7` is the production design (2026-10-06, ACTIVATIONS_PLAN: `986cef4866a0`
+plus VectorOPKernel's activation unit): 1852 calls, `clock_mhz` 250, repeat spread median
+0.076 %.  First a fresh case list (BERT's 12 GELUs now ride on VectorOP Adds; 1402 cases) and three
+refinement rounds (157 + 103 + 67 calls) to 1729 calls; topped up on 2026-10-07 (OFFLOAD_PLAN:
+SmolVLM's vision GELU and Piper's decoder sums on VectorOP, the engine cost model refitted) with a
+fresh case list (1406 cases) and three refinement rounds (125 + 29 + 5 calls); `host.json`
+unchanged.
+
+Before it, `kv260/986cef4866a0` — the 250 MHz design (2026-10-06, FMAX_250_PLAN: the kernels on
+an MMCM at 250 MHz, register slices, the kernels' register trees) — had 2011 calls, `clock_mhz` 250, repeat
 spread median 0.099 % (the calls are 2.5× shorter; 268 above 0.5 %).  Its campaign started from
 the converged case list of `c2b2a6e5e50e` (the shipped calls are the same: the engine choices
 do not depend on the clock), then five refinement rounds: 108 + 59 + 33 + 69 + 13 calls.

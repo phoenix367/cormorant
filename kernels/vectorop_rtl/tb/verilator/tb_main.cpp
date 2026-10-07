@@ -16,8 +16,10 @@
 //
 // Usage:
 //   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow]
-//       [--case "size op outer a_inc b_inc act [mode]"] [--perf] [--quiet]
+//       [--case "size op outer a_inc b_inc act [mode [alpha]]"] [--perf] [--quiet]
 //       [--max-cycles N] [--trace FILE]
+// (--case may be repeated; data mode 0: values in +-8, 1: any, 2: any with
+// edge values, 3: a[i] = i mod 2^16 — size 65536 covers every Q8.8 input.)
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdarg>
@@ -57,7 +59,7 @@ uint64_t g_cycle = 0;
 enum : uint8_t {
   R_CTRL = 0x00, R_GIE = 0x04, R_IER = 0x08, R_ISR = 0x0C,
   R_A = 0x10, R_B = 0x1C, R_C = 0x28, R_SIZE = 0x34, R_OP = 0x3C, R_OUTER = 0x44,
-  R_AINC = 0x4C, R_BINC = 0x54, R_ACT = 0x5C,
+  R_AINC = 0x4C, R_BINC = 0x54, R_ACT = 0x5C, R_ALPHA = 0x64,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ enum : uint8_t {
 // ---------------------------------------------------------------------------
 struct Case {
   std::string label;
-  uint32_t size = 1, op = 0, outer = 1, a_inc = 0, b_inc = 0, act = 0;
+  uint32_t size = 1, op = 0, outer = 1, a_inc = 0, b_inc = 0, act = 0, alpha = 0;
   uint64_t a = 0, b = 0, c = 0;          // byte addresses
   std::vector<uint16_t> av, bv, cv;      // fixture data (empty: random)
   int data_mode = 0;
@@ -106,6 +108,8 @@ static std::vector<WordRef> word_stream(const Case& t, uint32_t inc, bool input)
   return out;
 }
 
+// The act of a DIV job on a positive value (the corner below: 0x7FFF): ReLU6
+// clips it; ReLU, LeakyReLU, SiLU and both GELUs leave values >= 8.36 as they are.
 static uint16_t activate(uint16_t v, uint32_t act) {
   const bool neg = v & 0x8000;
   if (act == 1) return neg ? 0 : v;
@@ -236,7 +240,8 @@ struct Tb {
 
     // ---- place data: every word the kernel may read --------------------------------
     for (uint64_t i = 0; i < 8 * a_w; i++)
-      mem.wr16(t.a + 2 * i, i < t.av.size() ? t.av[i] : rnd16(t.data_mode));
+      mem.wr16(t.a + 2 * i, i < t.av.size() ? t.av[i]
+                            : t.data_mode == 3 ? (uint16_t)i : rnd16(t.data_mode));
     for (uint64_t i = 0; i < 8 * b_w; i++)
       mem.wr16(t.b + 2 * i, i < t.bv.size() ? t.bv[i] : rnd16(t.data_mode));
     for (uint64_t i = 0; i < 8 * c_w; i++) mem.wr16(t.c + 2 * i, 0xDEAD);   // poison
@@ -252,7 +257,7 @@ struct Tb {
     std::vector<VecWord> oa = words_of(t.a, a_w), ob = words_of(t.b, b_w), oc = words_of(t.c, c_w);
     {
       hls::burst_maxi<VecWord> pa(oa.data()), pb(ob.data()), pc(oc.data());
-      VectorOPKernel(pa, pb, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act);
+      VectorOPKernel(pa, pb, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act, t.alpha);
     }
     // HLS C simulation and the synthesised HLS kernel differ in one DIV case:
     // a = -128 (0x8000), b = -1/256 (0xFFFF).  C simulation divides in a 24-bit
@@ -284,9 +289,11 @@ struct Tb {
     wr64(R_A, t.a); wr64(R_B, t.b); wr64(R_C, t.c);
     lite.write(R_SIZE, t.size); lite.write(R_OP, t.op); lite.write(R_OUTER, t.outer);
     lite.write(R_AINC, t.a_inc); lite.write(R_BINC, t.b_inc); lite.write(R_ACT, t.act);
+    lite.write(R_ALPHA, t.alpha);
     lite.write(R_GIE, 1); lite.write(R_IER, 1);
     if (lite.read(R_SIZE) != t.size || lite.read(R_C) != (uint32_t)t.c ||
-        lite.read(R_ACT) != t.act || lite.read(R_C + 4) != (uint32_t)(t.c >> 32))
+        lite.read(R_ACT) != t.act || lite.read(R_ALPHA) != t.alpha ||
+        lite.read(R_C + 4) != (uint32_t)(t.c >> 32))
       tb_fatal("register read-back mismatch");
     if (!(lite.read(R_CTRL) & 4)) tb_fatal("kernel not idle before start");
 
@@ -392,12 +399,14 @@ static uint32_t round8(uint32_t v) { return (v + 7) / 8 * 8; }
 
 // A random case: mostly within the documented contract (bases 16-byte
 // aligned, a_inc / b_inc 0 or multiples of 8), sometimes outside it (other
-// increments, op / act codes beyond the enums) — the oracle is exact either way.
+// increments, op / act codes beyond the enums, alpha's ignored high bits) —
+// the oracle is exact either way.
 static Case random_case(std::mt19937& rng) {
   auto U = [&](uint32_t lo, uint32_t hi) { return std::uniform_int_distribution<uint32_t>(lo, hi)(rng); };
   Case t;
-  t.op  = (U(0, 19) == 0) ? U(6, 9) : U(0, 5);
-  t.act = (U(0, 9) == 0) ? U(3, 5) : U(0, 2);
+  t.op    = (U(0, 19) == 0) ? U(10, 12) : U(0, 9);
+  t.act   = (U(0, 19) == 0) ? U(7, 9) : U(0, 6);
+  t.alpha = (U(0, 9) == 0) ? U(0, 0xFFFFFFFFu) : U(0, 0xFFFF);
   const uint32_t shape = U(0, 9);
   if (shape <= 2) {                                    // one run
     t.size = (U(0, 2) == 0) ? U(1, 40) : U(1, 6000);
@@ -423,8 +432,8 @@ static Case random_case(std::mt19937& rng) {
   }
   t.data_mode = (int)U(0, 2);
   char buf[96];
-  std::snprintf(buf, sizeof buf, "rand_s%u_op%u_o%u_i%u_%u_act%u", t.size, t.op, t.outer,
-                t.a_inc, t.b_inc, t.act);
+  std::snprintf(buf, sizeof buf, "rand_s%u_op%u_o%u_i%u_%u_act%u_al%x", t.size, t.op, t.outer,
+                t.a_inc, t.b_inc, t.act, t.alpha);
   t.label = buf;
   return t;
 }
@@ -458,6 +467,7 @@ static std::vector<Case> load_fixtures(const std::string& dir) {
     const int idx = std::stoi(tok[0]);
     t.size = std::stoul(tok[1]); t.op = std::stoul(tok[2]); t.outer = std::stoul(tok[3]);
     t.a_inc = std::stoul(tok[4]); t.b_inc = std::stoul(tok[5]); t.act = std::stoul(tok[6]);
+    if (tok.size() >= 9) t.alpha = std::stoul(tok[7]);   // manifests before alpha: 0
     t.label = "fx" + tok[0] + "_" + tok.back();
     if (t.label.size() > 40) t.label.resize(40);
     char pre[32];
@@ -472,7 +482,8 @@ static std::vector<Case> load_fixtures(const std::string& dir) {
 
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-  std::string fixtures, trace, one_case, timing = "rand";
+  std::string fixtures, trace, timing = "rand";
+  std::vector<std::string> one_cases;
   int n_random = 0;
   unsigned seed = 1;
   bool perf = false, quiet = false;
@@ -484,7 +495,7 @@ int main(int argc, char** argv) {
     else if (a == "--random") n_random = std::stoi(next());
     else if (a == "--seed") seed = (unsigned)std::stoul(next());
     else if (a == "--timing") timing = next();
-    else if (a == "--case") one_case = next();
+    else if (a == "--case") one_cases.push_back(next());
     else if (a == "--perf") perf = true;
     else if (a == "--quiet") quiet = true;
     else if (a == "--max-cycles") max_cycles = std::stoull(next());
@@ -524,19 +535,24 @@ int main(int argc, char** argv) {
   std::vector<Case> cases;
   if (!fixtures.empty())
     for (auto& t : load_fixtures(fixtures)) cases.push_back(std::move(t));
-  if (!one_case.empty()) {
+  for (const auto& one_case : one_cases) {
     std::istringstream is(one_case);
     Case t;
     is >> t.size >> t.op >> t.outer >> t.a_inc >> t.b_inc >> t.act;
     if (!(is >> t.data_mode)) t.data_mode = 0;
-    t.label = "case";
+    if (!(is >> t.alpha)) t.alpha = 0;
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "case_s%u_op%u_act%u_m%d_al%x", t.size, t.op, t.act,
+                  t.data_mode, t.alpha);
+    t.label = buf;
     cases.push_back(t);
   }
   if (perf) {
     auto add = [&](const char* l, uint32_t size, uint32_t op, uint32_t outer, uint32_t ai,
-                   uint32_t bi) {
+                   uint32_t bi, uint32_t act = 0) {
       Case t;
       t.label = l; t.size = size; t.op = op; t.outer = outer; t.a_inc = ai; t.b_inc = bi;
+      t.act = act;
       cases.push_back(t);
     };
     add("perf_add_64k", 65536, 0, 1, 0, 0);
@@ -547,6 +563,8 @@ int main(int argc, char** argv) {
     add("perf_bcast_12_stride16", 12, 0, 1000, 16, 0);    // two-word runs
     add("perf_bcast_8_x4096", 8, 0, 4096, 8, 0);          // contiguous a, one-word b replay
     add("perf_bcast_rows_5000", 5000, 0, 16, 5008, 0);    // b over the replay bound
+    add("perf_gelu_64k", 65536, 8, 1, 0, 0);              // an activation op (vo_act)
+    add("perf_add_silu_64k", 65536, 0, 1, 0, 0, 4);       // ADD + act SILU
   }
   for (int i = 0; i < n_random; i++) cases.push_back(random_case(crng));
   if (cases.empty()) tb_fatal("nothing to run (use --fixtures, --random, --case or --perf)");

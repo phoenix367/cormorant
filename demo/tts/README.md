@@ -19,7 +19,7 @@ flowchart TB
     fe["<b>Front end</b> · Arm cores<br/>espeak-ng via piper_phonemize"]
     enc["<b>Text encoder</b> · FPGA<br/>libpiper_tts.so tts_encode<br/>encode_#lt;T#gt;: MatMuls + attention on ConvKernel, host ops"]
     dur["<b>Durations, alignment, noise</b> · Arm cores<br/>duration predictor in C (tts_duration)<br/>alignment and noise in numpy (float64)"]
-    dec["<b>Flow + HiFi-GAN</b> · FPGA, per chunk of 128 frames<br/>libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel, 66 convs per chunk<br/>host ops: LeakyReLU, masks, folding, gates, sums, interleave"]
+    dec["<b>Flow + HiFi-GAN</b> · FPGA, per chunk of 128 frames<br/>libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel, 66 convs per chunk<br/>host ops: LeakyReLU, masks, folding, gates, stage averages, interleave; the decoder's residual sums on VectorOPKernel"]
     pcm(["int16 PCM, 22 050 Hz"])
 
     text --> fe
@@ -40,7 +40,9 @@ flowchart TB
 
 - **Output:** bit-exact with the specification on the board.
 - **Library speed:** about 0.7 s per 1.49 s chunk, an RTF of 0.52 on a
-  6.9 s sentence.
+  6.9 s sentence.  Since 2026-10-07 (kernels at 250 MHz, the decoder's
+  residual sums on VectorOPKernel — OFFLOAD_PLAN §4.2): 0.27 s per chunk,
+  RTF 0.20.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79

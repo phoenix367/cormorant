@@ -23,6 +23,13 @@ from src.dtype import AP_FIXED_16_8 as DT
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SliceNode
 from src.nodes import ScheduledNode, SchedulerError
+from unittest import mock
+
+from src import _vectorop_hw_config
+
+# These test the host GELU op: on a platform with VectorOPKernel's activation
+# unit a matching Gelu runs there instead (test_activations.py).
+_host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
 
 
 def _vi(name, shape, et=TensorProto.FLOAT):
@@ -226,6 +233,7 @@ class TestGeluFusion(_Base):
         graph, out = self.sim(p, {"X": x}, **kw)
         return graph, x, out["Y"]
 
+    @_host_gelu
     def test_tanh_all_tails_bit_exact(self):
         for tail in ("bert", "xa_half", "halfx_a"):
             for swap in (False, True):
@@ -246,6 +254,7 @@ class TestGeluFusion(_Base):
                     ref = x * (0.5 * (1.0 + tanh(c2 * (x + c1 * np.power(x, 3.0)))))
                     np.testing.assert_array_equal(y, DT.host_quantize(ref), (tail, swap, cube))
 
+    @_host_gelu
     def test_erf_forms(self):
         erf = np.vectorize(math.erf)
         for mul in (False, True):

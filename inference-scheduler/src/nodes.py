@@ -26,6 +26,9 @@ Supported ONNX ops (VectorOPKernel)
   Div                 → OP_DIV   (binary)
   Relu                → OP_RELU  (unary)
   Clip(min=0, max=6)  → OP_RELU6 (unary)
+  Gelu, LeakyRelu, x * Sigmoid(x)
+                      → OP_GELU / OP_GELU_TANH, OP_LEAKY_RELU, OP_SILU (unary)
+                        on a bitstream with the activation unit (vectorop_act.py)
 
 Supported ONNX ops (MatmulKernel)
 ----------------------------------
@@ -84,6 +87,14 @@ OP_MUL   = 2
 OP_DIV   = 3
 OP_RELU  = 4
 OP_RELU6 = 5
+# The activation ops (unary; the act register is not applied after them) and
+# their acts below: the kernel's codes since the VectorOP activation unit
+# (doc/plans/ACTIVATIONS_PLAN.md).  No ONNX op maps to them yet — the
+# production bitstream predates them.
+OP_LEAKY_RELU = 6
+OP_SILU       = 7
+OP_GELU       = 8
+OP_GELU_TANH  = 9
 
 # Human-readable names for comments
 OP_NAMES = {
@@ -93,6 +104,10 @@ OP_NAMES = {
     OP_DIV:   "VECTOROP_DIV",
     OP_RELU:  "VECTOROP_RELU",
     OP_RELU6: "VECTOROP_RELU6",
+    OP_LEAKY_RELU: "VECTOROP_LEAKY_RELU",
+    OP_SILU:       "VECTOROP_SILU",
+    OP_GELU:       "VECTOROP_GELU",
+    OP_GELU_TANH:  "VECTOROP_GELU_TANH",
 }
 
 # Fused-activation codes for the kernel's `act` register (must match the
@@ -101,18 +116,40 @@ OP_NAMES = {
 ACT_NONE  = 0
 ACT_RELU  = 1
 ACT_RELU6 = 2
+ACT_LEAKY_RELU = 3          # slope: the alpha register, alpha[15:0] / 65536
+ACT_SILU       = 4
+ACT_GELU       = 5
+ACT_GELU_TANH  = 6
 
 ACT_NAMES = {
     ACT_NONE:  "VECTOROP_ACT_NONE",
     ACT_RELU:  "VECTOROP_ACT_RELU",
     ACT_RELU6: "VECTOROP_ACT_RELU6",
+    ACT_LEAKY_RELU: "VECTOROP_ACT_LEAKY_RELU",
+    ACT_SILU:       "VECTOROP_ACT_SILU",
+    ACT_GELU:       "VECTOROP_ACT_GELU",
+    ACT_GELU_TANH:  "VECTOROP_ACT_GELU_TANH",
 }
 
 # op_code of a unary activation node -> act code it fuses into
 _ACT_FOR_OP = {
     OP_RELU:  ACT_RELU,
     OP_RELU6: ACT_RELU6,
+    OP_LEAKY_RELU: ACT_LEAKY_RELU,
+    OP_SILU:       ACT_SILU,
+    OP_GELU:       ACT_GELU,
+    OP_GELU_TANH:  ACT_GELU_TANH,
 }
+
+# The activation ops (6..9): the kernel applies their own activation and
+# ignores the act register, so nothing is fused into them.
+ACTIVATION_OPS = frozenset({OP_LEAKY_RELU, OP_SILU, OP_GELU, OP_GELU_TANH})
+
+
+def job_act(op_code: int, act: int) -> int:
+    """The activation a call applies after its op (VectorOP.h ``job_act``):
+    an activation op's own, any other op's act register."""
+    return _ACT_FOR_OP[op_code] if op_code in ACTIVATION_OPS else act
 
 # ONNX op_type → (op_code, arity)
 # arity 2 = binary (reads a and b), arity 1 = unary (reads a only)
@@ -267,7 +304,7 @@ class ScheduledNode:
     kernel_name: ClassVar[str] = "VectorOPKernel"
 
     onnx_node:   onnx.NodeProto
-    op_code:     int                   # OP_ADD … OP_RELU6
+    op_code:     int                   # OP_ADD … OP_GELU_TANH
     arity:       int                   # 1 = unary, 2 = binary
     inputs:      List[TensorInfo]      # resolved input tensors
     output:      TensorInfo            # single output tensor
@@ -292,11 +329,15 @@ class ScheduledNode:
     # folded into this node; the folded ONNX nodes are kept for the report.
     act:                int  = field(default=ACT_NONE, init=False)
     fused_nodes:        List[onnx.NodeProto] = field(default_factory=list, init=False)
+    # LeakyReLU's slope, the kernel's alpha register (alpha / 2^16): set for
+    # an OP_LEAKY_RELU node (vectorop_act.py) and carried by its fusion.
+    alpha:              int  = field(default=0, init=False)
 
     @property
     def fusable_act(self) -> Optional[int]:
         """The act code this node would contribute if fused into its
-        producer (Relu -> ACT_RELU, Clip(0,6) -> ACT_RELU6), else None."""
+        producer (Relu -> ACT_RELU, Clip(0,6) -> ACT_RELU6, the activation
+        ops -> ACT_LEAKY_RELU .. ACT_GELU_TANH), else None."""
         if self.arity != 1:
             return None
         return _ACT_FOR_OP.get(self.op_code)
@@ -478,10 +519,11 @@ class ScheduledNode:
         b  = self.inputs[1].c_name if self.arity == 2 else "NULL"
         c  = self.output.c_name
         op = OP_NAMES[self.op_code]
-        # run_op() programs act = VECTOROP_ACT_NONE; a node with a fused
-        # activation goes through run_op_act() with the act code appended.
-        fn  = "run_op" if self.act == ACT_NONE else "run_op_act"
-        act = "" if self.act == ACT_NONE else f", {ACT_NAMES[self.act]}"
+        # run_op() programs act = VECTOROP_ACT_NONE and alpha = 0; a node with
+        # a fused activation or a LeakyReLU slope goes through run_op_act()
+        # with the act code and alpha appended.
+        fn  = "run_op" if self.uses_run_op else "run_op_act"
+        act = "" if self.uses_run_op else f", {ACT_NAMES[self.act]}, {self.alpha}u"
 
         if self.outer_count == 1:
             y_lay = layouts.get(self.output.onnx_name)
@@ -504,6 +546,17 @@ class ScheduledNode:
             f" {chunk_macro}, {op},"
             f" {n}u, {a_inc}, {b_inc}{act});"
         )
+
+    @property
+    def uses_run_op(self) -> bool:
+        """No act and no slope to program: run_op() (else run_op_act())."""
+        return self.act == ACT_NONE and self.alpha == 0
+
+    @property
+    def uses_activation_unit(self) -> bool:
+        """An activation op, or an act the activation unit computes."""
+        return (self.op_code in ACTIVATION_OPS
+                or self.act in (ACT_LEAKY_RELU, ACT_SILU, ACT_GELU, ACT_GELU_TANH))
 
     def kernel_calls(self, layouts: dict) -> list:
         """The VectorOPKernel call emit_call() issues (perf_calls.py)."""

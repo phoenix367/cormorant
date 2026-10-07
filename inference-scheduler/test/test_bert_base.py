@@ -31,7 +31,7 @@ import host_emu
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
-from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode
+from src.nodes import ACT_GELU_TANH, MatmulConvNode, MatmulNode, ScheduledNode
 
 _STUDY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))), "demo", "bert_squad", "scripts")
@@ -70,9 +70,14 @@ class TestBertBase(unittest.TestCase):
 
     def test_partition(self):
         k = collections.Counter(type(sn) for sn in self.g.nodes)
-        self.assertEqual(self.g.fusion_counts, {"layernorm": 25, "gelu": 12, "const_bcast": 15})
+        self.assertEqual(self.g.fusion_counts,
+                         {"layernorm": 25, "gelu": 12, "silu": 0, "const_bcast": 15})
+        # the 12 GELUs run on VectorOP's activation unit, fused into the FFN
+        # bias Adds (bit-identical to the host op: test_activations.py)
         self.assertEqual((k[LayerNormNode], k[GeluNode], k[SoftmaxNode], k[TransposeNode]),
-                         (25, 12, 12, 49))
+                         (25, 0, 12, 49))
+        self.assertEqual(sum(1 for sn in self.g.nodes if isinstance(sn, ScheduledNode)
+                             and sn.act == ACT_GELU_TANH), 12)
         self.assertEqual((k[MatmulNode] + k[MatmulConvNode], k[ScheduledNode]), (98, 126))
         mms = [sn for sn in self.g.nodes if isinstance(sn, (MatmulNode, MatmulConvNode))]
         att = [sn for sn in mms if sn.batch == 12]

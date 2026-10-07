@@ -8,8 +8,10 @@ project behind libpiper_tts.so (doc/plans/TTS_PLAN.md §4).
      to T in ENC_BUCKETS; piper_study.py encoder's exponents)
   2. inference-scheduler: OnnxGraph + CodeGenerator -> <out>/ (CMake
      project, weights/*.dat)
-  3. driver/ for ConvKernel, test/tts_api.{c,h} + test/tts_dp.{c,h} +
-     test/tts_bench.c + test/tts_glue.h (the encode buckets and their run
+  3. driver/ for ConvKernel and VectorOPKernel (the decoder's residual
+     sums, doc/plans/OFFLOAD_PLAN.md §2.2), test/tts_api.{c,h} +
+     test/tts_dp.{c,h} + test/tts_bench.c + test/tts_glue.h (inference_init
+     with the project's kernels, the encode buckets and their run
      functions), CMake targets tts_bench and piper_tts (libpiper_tts.so:
      only the tts_* symbols exported), project.json, layers.json
   4. weights/dp.dat (the C duration predictor's weights, read by
@@ -89,8 +91,10 @@ def write_voice(out: str, voice_json: str) -> None:
         json.dump(voice, f, indent=1, ensure_ascii=False)
 
 
-def write_glue(out: str, buckets, dp_floats: int) -> None:
-    """test/tts_glue.h: the encode_<T> buckets and a dispatcher to their run functions."""
+def write_glue(out: str, buckets, dp_floats: int, active) -> None:
+    """test/tts_glue.h: inference_init() with the project's kernels (``active``:
+    the generator's active kernels), the encode_<T> buckets and a dispatcher to
+    their run functions."""
     cases = "\n".join(f"    case {i}: inference_run_encode_{T}(ids, n, x, stats); return;"
                        for i, T in enumerate(buckets))
     text = (
@@ -101,6 +105,9 @@ def write_glue(out: str, buckets, dp_floats: int) -> None:
         f"#define TTS_MAX_IDS   {max(buckets)}\n"
         f"#define TTS_DP_FLOATS {dp_floats}   /* weights/dp.dat: piper_vits.dp_tensors() */\n"
         f"static const int tts_buckets[TTS_N_BUCKETS] = {{ {', '.join(str(b) for b in buckets)} }};\n\n"
+        "/* inference_init() with every kernel the project drives (" + ", ".join(kd.name for kd in active)
+        + ") */\nstatic int tts_glue_init(void)\n{\n"
+        f"    return inference_init({', '.join(kd.instance_macro for kd in active)});\n}}\n\n"
         "static void tts_glue_encode(int b, const int32_t *ids, const int32_t *n, float *x, float *stats)\n"
         "{\n    switch (b) {\n" + cases + "\n    default: return;\n    }\n}\n\n#endif\n")
     with open(os.path.join(out, "test", "tts_glue.h"), "w") as f:
@@ -199,7 +206,7 @@ def main(argv=None) -> int:
         shutil.copy2(os.path.join(SRC, name), os.path.join(out, "test", name))
     dp = pv.dp_flat(W)                                    # the C duration predictor's weights
     dp.astype("<f4").tofile(os.path.join(out, "weights", "dp.dat"))
-    write_glue(out, ENC_BUCKETS, int(dp.size))
+    write_glue(out, ENC_BUCKETS, int(dp.size), cg._active_kernels)
     write_voice(out, os.path.join(a.assets, "en_US-lessac-medium.onnx.json"))
     patch_cmake(out, cg, {"model_name": "piper-lessac-medium", "sample_rate": info["sample_rate"]})
     layers, base = [], 0                  # MultiEntryGenerator numbers the nodes globally

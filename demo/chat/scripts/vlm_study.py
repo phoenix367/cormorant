@@ -291,6 +291,35 @@ def bias_raw(b, f):
     return np.round(np.asarray(b, np.float64) * p2v(f))
 
 
+def vop_gelu_b(b, ff):
+    """The VectorOP form of GELU(fc1 + b1) (doc/plans/OFFLOAD_PLAN.md §2.1), its two
+    per-channel operands: the ADD's bias at fc1's exponent ff plus half an LSB of
+    Q8.8 (2^(ff-9) for ff > 8: the MUL's floor becomes a round half up), and the
+    MUL's scale 2^(8-ff) as a Q8.8 raw value 2^(16-ff)."""
+    ff = np.asarray(ff, np.int64)
+    half = np.where(ff > 8, np.power(2.0, ff - 9), 0.0)
+    return bias_raw(b, ff) + half, np.power(2.0, 16 - ff)
+
+
+def vop_gelu_ok(ff, fa, b):
+    """The VectorOP form applies: GELU written at 2^-8 on every channel, the
+    operands int16 integers (the scale 2^(16 - ff): 2 <= ff <= 16)."""
+    if not np.all(np.asarray(fa) == 8):
+        return False
+    ba, sc = vop_gelu_b(b, ff)
+    return bool(np.all(np.abs(ba) < 32768) and np.all((sc < 32768) & (sc >= 1)))
+
+
+def vop_gelu(f, ff, b):
+    """VectorOPKernel: s = sat16(raw + ba) (ADD), q = sat16(floor(s * sc / 2^8))
+    (MUL), then act GELU_TANH — the exact GELU of q / 256 rounded to 2^-8
+    (gelu_table(8) here; the host() write-back rounds it the kernel's way)."""
+    ba, sc = vop_gelu_b(b, ff)
+    s = np.clip(np.rint(f * p2v(ff)) + ba[None, :], -32768, 32767)
+    q = np.clip(np.floor(s * sc[None, :] / 256.0), -32768, 32767).astype(np.int64)
+    return gelu_table(8)[q + 32768]
+
+
 def pixel_shuffle(x, s):
     """Idefics3Connector.pixel_shuffle for one image: [seq, D] -> [seq / s^2, D s^2]."""
     seq, D = x.shape
@@ -375,6 +404,8 @@ class VisionModel(ls.Model):
                 self.stats.add_ch("f", l, np.abs(f + b).max(0))
             return self.host(gelu_tanh(f + b), "a", l, self.E("a", l))
         ff = self.Ev("f", l, f.shape[1])
+        if self.pol.get("vop_gelu") and vop_gelu_ok(ff, self.Ev("a", l, f.shape[1]), b):
+            return self.host(vop_gelu(f, ff, b), "a", l, self.E("a", l))
         raw = np.clip(np.rint(f * p2v(ff)) + bias_raw(b, ff)[None, :], -32768, 32767).astype(np.int64)
         y = np.empty(f.shape)
         for e in np.unique(ff):
@@ -596,6 +627,7 @@ VPOLICIES = {
     "res_float":       dict(_F),                                   # Q8.8 tensors, float residual
     "pow2":            dict(_F, fmt="pow2"),
     "pow2+p12":        dict(_F, fmt="pow2", p_bits=12),
+    "pow2+p12+vgelu":  dict(_F, fmt="pow2", p_bits=12, vop_gelu=True),   # OFFLOAD_PLAN §2.1
     "pow2+p13":        dict(_F, fmt="pow2", p_bits=13),
     "pow2+p14":        dict(_F, fmt="pow2", p_bits=14),
     "pow2+p15":        dict(_F, fmt="pow2", p_bits=15),
@@ -608,7 +640,16 @@ VPOLICIES = {
 }
 TEXT_SHIPPED = "pow2+sink+p12+mix"
 TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)
-VISION_SHIPPED = "pow2+p12"
+VISION_SHIPPED = "pow2+p12"           # the vision formats' policy (vision_formats_<it>.json)
+VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's activation unit
+                                      # (doc/plans/OFFLOAD_PLAN.md §2.1): what the scheduler
+                                      # generates where the platform has the unit
+
+
+def vision_policy(activations: bool) -> str:
+    """The vision policy the scheduler's `vision` entry computes: VISION_VOP on a
+    VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU)."""
+    return VISION_VOP if activations else VISION_SHIPPED
 CAL_MAX_NEW = 96                      # the calibration answers' length (independent of --quick)
 CONN_K = 4096                         # the connector's K chunk (MatmulKernel max_k)
 # (vision policy, text policy); the first is the reference

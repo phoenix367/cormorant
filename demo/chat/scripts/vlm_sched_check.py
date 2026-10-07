@@ -6,7 +6,9 @@ entries equals the numeric study's emulation bit for bit
 
   vision   the image features of each image: the scheduler's simulation of
            the `vision` entry (src/vit.py) against vlm_study.VisionModel under
-           the shipped vision policy (pow2+p12) and formats.
+           the scheduler's vision policy — pow2+p12+vgelu (GELU on VectorOPKernel's
+           activation unit, doc/plans/OFFLOAD_PLAN.md §2.1), pow2+p12 without the unit
+           (AXI_VECTOROP_ACTIVATIONS=0) — and the shipped formats.
   text     (--text) the logits of each image prompt and 16 greedy decode
            steps: SimSession over the text entries (src/llama.py with the
            image rows) against vlm_study.TextModel under pow2+sink+p12+mix.
@@ -34,6 +36,7 @@ import vlm_study as vs                                            # noqa: E402
 from src.codegen import CodeGenerator                             # noqa: E402
 from src.graph import OnnxGraph                                   # noqa: E402
 from src.llama import Formats, LlamaConfig, LlamaFrontend        # noqa: E402
+from src.vectorop_act import enabled as vectorop_activations    # noqa: E402
 from src.vit import VisionFormats, VitConfig, VitFrontend, patches  # noqa: E402
 
 TEXT_POLICY = "pow2+sink+p12+mix"
@@ -157,7 +160,8 @@ def main(argv=None) -> int:
     vpath = os.path.join(sd, f"vision_formats_{vs.VISION_SHIPPED}.json")
     tc, vc, scale, Wt, Wv = vs.load_all(args.assets)
     KW = vs.kernel_weights(Wv, vc)
-    vm = vs.VisionModel(Wv, KW, vc, scale, vs.VPOLICIES[vs.VISION_SHIPPED], study_formats(vpath))
+    vpol = vs.vision_policy(vectorop_activations())
+    vm = vs.VisionModel(Wv, KW, vc, scale, vs.VPOLICIES[vpol], study_formats(vpath))
     Wh = {"model." + k: v for k, v in Wv.items()}                  # HF names
     cfg = VitConfig.from_file(os.path.join(args.assets, "config.json"))
     fe = VitFrontend(cfg, Wh, VisionFormats.from_file(vpath, cfg))
@@ -166,7 +170,7 @@ def main(argv=None) -> int:
     cg = CodeGenerator(g, model_path="vision.onnx")
     st = g.matmul_conv_stats
     print(f"vision entry: {len(g.nodes)} nodes, MatMul on ConvKernel {st['lowered']} / kept {st['kept']}"
-          f" ({time.time() - t0:.0f} s)", flush=True)
+          f", policy {vpol} ({time.time() - t0:.0f} s)", flush=True)
     ids = [int(x) for x in args.images.split(",")]
     pix = pixels(ids, os.path.join(sd, "sched_check"))
     ok = 0

@@ -134,15 +134,16 @@ RTL_PREFIX = "rtl_"
 
 
 def _rtl_conv_terms(f) -> Dict[str, float]:
-    """The RTL ConvKernel's board walk (cost_model.rtl_conv_walk): its total
-    without the fixed cost, and the sweep time the weight fill and the
-    producer add, for the fit to re-weigh."""
-    from .cost_model import RTL_CONV_BOARD, rtl_conv_walk
+    """The RTL ConvKernel's board walk (cost_model.rtl_conv_walk with the
+    frozen RTL_CONV_FEATURES, so a refit of RTL_CONV_BOARD leaves the stored
+    models' features alone): its total without the fixed cost, and the sweep
+    time the weight fill and the producer add, for the fit to re-weigh."""
+    from .cost_model import RTL_CONV_FEATURES, rtl_conv_walk
     r = rtl_conv_walk(f["in_ch"], f["out_ch"], f["in_h"], f["in_w"], f["out_h"], f["out_w"],
                       f["kh"], f["kw"], f["stride_h"], f["stride_w"], f["dilation_h"],
-                      f["dilation_w"], f["pad_top"], f["pad_left"], bool(f["is_dw"]), True)
+                      f["dilation_w"], f["pad_top"], f["pad_left"], bool(f["is_dw"]), features=True)
     b = f["batch"]
-    return {RTL_PREFIX + "total": b * (r["total"] - RTL_CONV_BOARD["ONE"]),
+    return {RTL_PREFIX + "total": b * (r["total"] - RTL_CONV_FEATURES["ONE"]),
             RTL_PREFIX + "fill": b * r["fill"], RTL_PREFIX + "loads": b * r["loads"]}
 
 

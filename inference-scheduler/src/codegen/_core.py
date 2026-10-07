@@ -45,7 +45,7 @@ from ..graph   import OnnxGraph
 from ..nodes    import (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
                         ReshapeNode, SpaceToDepthNode, SchedulerError)
 from ..host_nodes import HostNode, SliceNode
-from ..llm_nodes import LlmAttnConvNode
+from ..llm_nodes import LlmAttnConvNode, LlmKernelNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
 from ..tensor  import TensorInfo
@@ -186,7 +186,7 @@ class _CoreMixin:
             if sn.outer_count <= 1:
                 continue
             if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                               SpaceToDepthNode, HostNode, LlmAttnConvNode)):
+                               SpaceToDepthNode, HostNode, LlmKernelNode)):
                 continue
 
             n      = sn.outer_count          # number of loop iterations
@@ -244,7 +244,7 @@ class _CoreMixin:
             if sn.outer_count > 1:
                 continue
             if isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                               SpaceToDepthNode, HostNode, LlmAttnConvNode)):
+                               SpaceToDepthNode, HostNode, LlmKernelNode)):
                 continue
 
             input_layouts = [layouts[inp.onnx_name] for inp in sn.inputs]
@@ -887,8 +887,19 @@ class _CoreMixin:
 
     @property
     def _has_vectorop_nodes(self) -> bool:
-        """True when the graph contains at least one VectorOP ScheduledNode."""
-        return any(isinstance(sn, ScheduledNode) for sn in self._graph.nodes)
+        """True when the graph contains at least one VectorOP call (a
+        ScheduledNode, or an LLM node on VectorOPKernel)."""
+        return any(isinstance(sn, ScheduledNode)
+                   or (isinstance(sn, LlmKernelNode) and sn.kernel_name == "VectorOPKernel")
+                   for sn in self._graph.nodes)
+
+    @property
+    def _uses_activation_unit(self) -> bool:
+        """A VectorOP call applies LeakyReLU / SiLU / GELU (ops 6-9, acts 3-6):
+        the program needs the kernel's activation unit, and inference_init()
+        checks the IP has it (doc/plans/ACTIVATIONS_PLAN.md)."""
+        return any(isinstance(sn, (ScheduledNode, LlmKernelNode)) and sn.uses_activation_unit
+                   for sn in self._graph.nodes)
 
     def _layer_display_names(self) -> List[str]:
         """One human-readable name per scheduled node, suitable for the

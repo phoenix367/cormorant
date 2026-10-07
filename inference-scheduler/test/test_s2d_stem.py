@@ -366,6 +366,8 @@ def _host_compile(cg, workdir):
         for fn in funcs:
             if fn.endswith("_IsDone") or fn.endswith("_Initialize"):
                 lines.append(f"static inline int {fn}({kd.c_type} *p, ...) {{ (void)p; return 1; }}")
+            elif "_Get_" in fn:
+                lines.append(f"static inline uint32_t {fn}({kd.c_type} *p, ...) {{ (void)p; return 0; }}")
             else:
                 lines.append(f"static inline void {fn}({kd.c_type} *p, ...) {{ (void)p; }}")
         with open(os.path.join(workdir, "stub", f"{kd.driver_prefix}.h"), "w") as f:

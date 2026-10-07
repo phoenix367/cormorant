@@ -14,9 +14,11 @@ chunk n beside chunk n + 1 (no bias pass: `bias` is always 0 %) — tuned to
 the Verilator testbench on the 1 042 ConvKernel calls of the calibration
 case list (median error 0.65 %, p90 5.3 %; `vl/Vtb --case-file F
 --no-oracle` gives the cycle counts).  `cost_model.conv_board_cycles` uses
-the board's parameters (`RTL_CONV_BOARD`, the c2b2a6e5e50e campaign:
-median 3.1 %, p90 14.6 %); the misses are narrow, tall MatMul-on-ConvKernel
-jobs whose short x runs wait on the DDR.  To change the model, change it
+the board's parameters (`RTL_CONV_BOARD`, the 250 MHz campaign of
+6436623029f7: median 18.3 %, p90 45.8 %; at 100 MHz, c2b2a6e5e50e, 3.1 /
+14.6 % — refit with `inference-scheduler/tools/fit_cost_model.py`); the
+misses are narrow, input-heavy MatMul-on-ConvKernel jobs whose short x runs
+wait on the DDR.  To change the model, change it
 there — `test_matmul_on_conv.py` pins its anchors.
 
 **The retired HLS kernel (`--arch 37 … 42`).**  The script's own walk

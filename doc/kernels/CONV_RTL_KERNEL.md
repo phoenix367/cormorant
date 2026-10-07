@@ -179,9 +179,11 @@ the weight loader with its FIFO run-ahead, the two weight-cache banks, the
 patch producer and x loader, the sweep, the drain beside the next chunk —
 with one parameter set tuned to this testbench (`RTL_CONV_SIM`: median error
 0.65 %, p90 5.3 % over the 1 042 calls) and one to the board
-(`RTL_CONV_BOARD`: DDR latency, x and weight runs; median 3.1 %, p90 14.6 %).
-The worst misses are narrow, tall MatMul-on-ConvKernel jobs whose few short
-x runs per row wait on the DDR (up to 2.5× the model).  A change of the
+(`RTL_CONV_BOARD`: DDR latency, x and weight runs; at 250 MHz, bitstream
+`6436623029f7`, median 18.3 %, p90 45.8 % — at 100 MHz 3.1 / 14.6 %;
+`inference-scheduler/tools/fit_cost_model.py` refits it).  The worst misses
+are narrow, input-heavy MatMul-on-ConvKernel jobs whose few short x runs per
+row wait on the DDR (2.5–3× the model at 250 MHz).  A change of the
 kernel's schedule needs the model re-tuned: `test_matmul_on_conv.py`
 (`test_rtl_conv_model`) pins its anchors.
 

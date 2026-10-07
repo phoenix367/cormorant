@@ -5,8 +5,11 @@ Used by the MatMul-on-ConvKernel lowering (``matmul_lowering.py``,
 doc/plans/BERT_PLAN.md §2 2A) to choose, per MatMul, between MatmulKernel and a
 ConvKernel call with swapped operand roles, and to choose the lowered
 conv's kernel width / output shape.  Both models count kernel clock cycles
-(the board runs the fabric at 100 MHz); the absolute numbers matter only
-relative to each other.
+(the board runs the kernels at 250 MHz since FMAX_250_PLAN); the absolute
+numbers matter only relative to each other.  The board-fitted terms —
+RTL_CONV_BOARD, RTL_COEF, CALL_OVERHEAD — come from a performance-model
+calibration campaign (``tools/fit_cost_model.py``; today 6436623029f7 at
+250 MHz, doc/plans/OFFLOAD_PLAN.md §2.3).
 
 ConvKernel in SystemVerilog
 ---------------------------
@@ -18,7 +21,8 @@ pipeline recurrence (weight loader, the two weight-cache banks, patch
 producer and x loader, the sweep, the drain beside the next chunk; the
 comment above ``RTL_CONV_SIM``), with one parameter set tuned to the
 Verilator testbench and one to the board (``RTL_CONV_BOARD``, the
-calibration campaign of c2b2a6e5e50e).  The conv-cycle-model skill's script
+calibration campaign of 6436623029f7; ``RTL_CONV_FEATURES`` keeps the set of
+c2b2a6e5e50e as the performance models' features).  The conv-cycle-model skill's script
 calls it for ``--arch rtl`` (its default).
 
 ConvKernel (HLS, ``kernels.conv.impl == "hls"``)
@@ -129,10 +133,13 @@ GEMV_WORD_CYCLE      = 1.03
 GEMV_JOB_OVERHEAD    = 200
 
 # Host-side cost of one kernel call on the board (AXI-Lite register writes
-# through the UIO mapping, Start, the IsDone poll loop), in kernel cycles.
-# Charged per call to both engines, so it only matters where the lowering
-# issues several conv calls for one MatMul (batched attention: one per head).
-CALL_OVERHEAD        = 1500
+# through the UIO mapping, Start, the IsDone poll loop), in kernel cycles:
+# the cheapest call of the calibration campaign (a 10-element VectorOP Add,
+# 1.79 us at 250 MHz on 6436623029f7; the kernels' fixed costs ONE / one are
+# fitted net of it).  Charged per call to both engines, so it only matters
+# where the lowering issues several conv calls for one MatMul (batched
+# attention: one per head).
+CALL_OVERHEAD        = 448
 
 
 def _conv_geom(in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw):
@@ -190,29 +197,42 @@ def _loader_row_cycles(ch, cols):
 # 8 weight runs in flight bound them too.  RTL_CONV_SIM is tuned to the
 # Verilator testbench (ideal memory) on the 1 042 ConvKernel calls of the
 # calibration case list — median error 0.65 %, p90 5.3 % —, RTL_CONV_BOARD to
-# the board's (bitstream c2b2a6e5e50e, the same calls: median 3.1 %, p90
-# 14.6 %, against 18.7 / 37 % for the HLS model on its bitstream).  The worst
-# misses are narrow, tall MatMul-on-ConvKernel jobs (a few short x runs per
-# row whose DDR latency depends on the channel-plane stride: up to 2.5x
-# slower than modelled).  ONE excludes the host's call overhead (CALL_OVERHEAD).
+# the board's: bitstream 6436623029f7 at 250 MHz, 1 190 calls, median 18.3 %,
+# p90 45.8 % (the 100 MHz set as the callers used it: 33.9 / 64.5 %), fitted
+# by tools/fit_cost_model.py with the shipped calls weighted 0.75 and a
+# penalty for engine choices the performance model says are wrong — no
+# shipped model's choice moved (OFFLOAD_PLAN §2.3).  At 250 MHz DDR costs more
+# cycles: MatMul-on-ConvKernel jobs take 1.66x (p90 2.47x) the cycles of
+# 100 MHz, CNN convs 1.03x; the worst misses are narrow, input-heavy jobs
+# (16-64 output channels, >= 200 input channels: 2.5-3x slower than
+# modelled) — the parameters are effective, not physical.  ONE excludes the
+# host's call overhead (CALL_OVERHEAD).  RTL_CONV_FEATURES is the set fitted
+# at 100 MHz (c2b2a6e5e50e: median 3.1 %, p90 14.6 %), frozen: the
+# performance models use its walk as features (perf_model._rtl_conv_terms),
+# so their stored fits do not move with RTL_CONV_BOARD.
 RTL_CONV_SIM = {"CAP": 256, "XL": 0, "PL": 0, "FL": 0, "H": 2, "HAZ": 80, "HZW": 50,
                 "LAT": 10, "ROW": 1, "ONE": 400, "XBEAT": 0.9, "XROW": 12, "RUN": 0,
                 "XLAT": 0, "WLAT": 0, "WBEAT": 1.0, "DPX": 1.1}
-RTL_CONV_BOARD = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
-                  "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
-                  "XLAT": 50, "WLAT": 30, "WBEAT": 1.05, "DPX": 1.1}
+RTL_CONV_BOARD = {"CAP": 32, "XL": 115, "PL": 13, "FL": 231, "H": 113, "HAZ": 595, "HZW": 138,
+                  "LAT": 48, "ROW": 52, "ONE": 17, "XBEAT": 1.31, "XROW": 27, "RUN": 1,
+                  "XLAT": 76, "WLAT": 44, "WBEAT": 1.39, "DPX": 0.79}
+RTL_CONV_FEATURES = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
+                     "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
+                     "XLAT": 50, "WLAT": 30, "WBEAT": 1.05, "DPX": 1.1}
 
 
 @lru_cache(maxsize=16384)
 def rtl_conv_walk(in_ch: int, out_ch: int, in_h: int, in_w: int, oh: int, ow: int,
                   kh: int, kw: int, sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
-                  pt: int = 0, pl: int = 0, dwise: bool = False, board: bool = False) -> dict:
+                  pt: int = 0, pl: int = 0, dwise: bool = False, board: bool = False,
+                  features: bool = False) -> dict:
     """The RTL kernel's job (batch 1) through the recurrence above:
     ``{total, sweep, fill, ph1 (0: no bias pass), ph3 (the drain where it is not
     hidden), loads (where the producer bounds a sweep), chunks, rows, groups,
     ic_tiles, owt}`` — the keys of the HLS model's walk.  ``dwise``: a
-    depthwise job (one m-tile per sweep, its own input tile)."""
-    p = RTL_CONV_BOARD if board else RTL_CONV_SIM
+    depthwise job (one m-tile per sweep, its own input tile).  Parameters:
+    RTL_CONV_SIM, ``board`` RTL_CONV_BOARD, ``features`` RTL_CONV_FEATURES."""
+    p = RTL_CONV_FEATURES if features else RTL_CONV_BOARD if board else RTL_CONV_SIM
     m_tiles, ic_tiles, mtg, groups, per, chunks, owpt, owt = _conv_geom(
         in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw)
     if dwise:                                # no m-group cap on the chunk height
@@ -416,11 +436,14 @@ RTL_W_EL   = 512    # accumulator columns of one step (ACC_D x 8), << lk
 RTL_DMIN   = 3      # minimum cycles per streamed B row (accumulator distance)
 RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 
-# Cycles per term (rtl_matmul_terms), fitted on the board (see the module
-# docstring); "one" is the job's fixed cost without the host's call
-# overhead (3.15 us measured, charged by the callers as CALL_OVERHEAD).
-RTL_COEF = {"stream": 0.986, "drain": 1.000, "aload": 0.733,
-            "steps": 2.97, "runs": 0.325, "one": 96.4}
+# Cycles per term (rtl_matmul_terms), fitted on the board by non-negative
+# least squares (tools/fit_cost_model.py; 6436623029f7 at 250 MHz, 414 calls:
+# median 4.5 %, p90 17.7 %, leave-one-out 4.6 / 18.1 %; the 100 MHz set
+# fitted c2b2a6e5e50e to 0.36 / 1.7 % — at 250 MHz a DDR beat or request
+# costs more cycles: "steps" 2.97 -> 27.45, "runs" 0.325 -> 2.97); "one" is
+# the job's fixed cost without the host's call overhead (CALL_OVERHEAD).
+RTL_COEF = {"stream": 1.063, "drain": 0.5561, "aload": 0.3901,
+            "steps": 27.45, "runs": 2.974, "one": 64.75}
 
 
 def _rtl_lane_planes(planes: int) -> int:
@@ -478,12 +501,23 @@ def rtl_matmul_cycles(n: int, k: int, m: int, batch: int = 1,
     return sum(RTL_COEF[name] * v for name, v in t.items())
 
 
-def cycles_to_ms(cycles: float, mhz: float = 100.0) -> float:
+# The kernel clock the board-fitted terms count cycles of (the block design's
+# MMCM since FMAX_250_PLAN; the platform JSON's "clock" is the out-of-context
+# synthesis target).
+KERNEL_MHZ = 250.0
+
+
+def cycles_to_ms(cycles: float, mhz: float = KERNEL_MHZ) -> float:
     return cycles / (mhz * 1e3)
 
 
 __all__ = (
     "CALL_OVERHEAD",
+    "KERNEL_MHZ",
+    "RTL_CONV_BOARD",
+    "RTL_CONV_FEATURES",
+    "RTL_CONV_SIM",
+    "RTL_COEF",
     "conv_cycles",
     "conv_board_cycles",
     "conv_batch_cycles",

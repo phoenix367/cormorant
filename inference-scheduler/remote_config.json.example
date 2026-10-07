@@ -196,7 +196,15 @@
     "test/models/bert_tiny_h32_l1.onnx",
     "test/models/bert_tiny_h64_l2.onnx",
     "test/models/bert_tiny_erf.onnx",
-    "test/models/bert_tiny_native.onnx"
+    "test/models/bert_tiny_native.onnx",
+    "test/models/act_gelu.onnx",
+    "test/models/act_gelu_tanh.onnx",
+    "test/models/act_leaky_relu.onnx",
+    "test/models/act_silu.onnx",
+    "test/models/act_bias_gelu.onnx",
+    "test/models/act_mul_leaky_relu.onnx",
+    "test/models/act_div_silu.onnx",
+    "test/models/act_gelu_leaky_chain.onnx"
   ],
   "_models_note": "Model paths relative to the inference-scheduler directory. Overridden by --models on the command line."
 }

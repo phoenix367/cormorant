@@ -5,7 +5,9 @@ in 4 x 4 patches = 64 tokens, pixel shuffle x2 -> 16 image tokens of a
 
   * the frontend's vision entry (src/vit.py): structure, numerics;
   * the scheduler's simulation equals the study's emulation
-    (demo/chat/scripts/vlm_study.py VisionModel, policy pow2+p12) bit for bit;
+    (demo/chat/scripts/vlm_study.py VisionModel) bit for bit: policy
+    pow2+p12+vgelu (the GELU on VectorOPKernel's activation unit,
+    doc/plans/OFFLOAD_PLAN.md §2.1), pow2+p12 (host GELU) without the unit;
   * the generated C (-Werror) against the software kernels reproduces the
     simulation (cacheable / staged buffers, 1 / 4 host threads, separate CPU /
     DDR copies), and so does a multi-entry project of the vision entry and a
@@ -16,19 +18,23 @@ in 4 x 4 patches = 64 tokens, pixel shuffle x2 -> 16 image tokens of a
 
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
 import gen_llama_models as G
 import host_emu
 import vlm_study as vs
+from src import _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
 from src.llm_nodes import LlmAttnConvNode, LlmEmbedNode
 from src.nodes import MatmulConvNode, MatmulNode
 from src.vit import VisionFormats, VitConfig, VitFrontend, patches
-from src.vit_nodes import VitSumDequantNode, gelu_table
+from src.vit_nodes import VitGeluNode, VitGeluVopNode, VitSumDequantNode, gelu_table
+
+_host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
 
 TINY_CFG = {"scale_factor": 2,
             "vision_config": dict(hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
@@ -79,8 +85,11 @@ def images(n, seed):
 
 
 class Tiny:
-    """(config, weights, study model, frontend) of the tiny ViT."""
+    """(config, weights, study model, frontend) of the tiny ViT; the study model
+    computes the scheduler's policy (vlm_study.vision_policy), ``host_study()``
+    the host-GELU one."""
     _cache = None
+    _host = None
 
     @classmethod
     def get(cls):
@@ -96,13 +105,19 @@ class Tiny:
                 vf.forward(im)
             pol = vs.VPOLICIES[vs.VISION_SHIPPED]
             fmt = vs.make_vformats(pol, vf.stats.ch, KW, vc, scale)
-            vm = vs.VisionModel(Wv, KW, vc, scale, pol, fmt)
-            vm.conn_k = CONN_K
+            vm, cls._host = (vs.VisionModel(Wv, KW, vc, scale, vs.VPOLICIES[p], fmt)
+                             for p in (vs.vision_policy(True), vs.VISION_SHIPPED))
+            vm.conn_k = cls._host.conn_k = CONN_K
             cfg = VitConfig.from_dict(TINY_CFG)
             fd = vs.formats_json(fmt, pol, vs.VISION_SHIPPED)
             fe = VitFrontend(cfg, W, VisionFormats(fd, cfg), name="vit_tiny", conn_k=CONN_K)
             cls._cache = (cfg, W, vm, fe)
         return cls._cache
+
+    @classmethod
+    def host_study(cls):
+        cls.get()
+        return cls._host
 
 
 class TestGeluTables(unittest.TestCase):
@@ -129,7 +144,7 @@ class TestVisionEntry(unittest.TestCase):
         self.assertEqual(kinds.count("VitAttnPrepNode"), L)
         self.assertEqual(kinds.count("VitAttnSoftmaxNode"), L * H)
         self.assertEqual(kinds.count("LlmAttnConvNode"), 2 * L * H)
-        self.assertEqual(kinds.count("VitGeluNode"), L)
+        self.assertEqual(kinds.count("VitGeluVopNode"), L)
         self.assertEqual(kinds.count("VitPixelShuffleNode"), 2)
         self.assertEqual(kinds.count("VitSumDequantNode"), 1)
         mm = [sn for sn in g.nodes if isinstance(sn, (MatmulNode, MatmulConvNode))]
@@ -148,6 +163,43 @@ class TestVisionEntry(unittest.TestCase):
             cg._forward_pass({"vision.patches": patches(im, self.cfg.P).astype(np.float64)},
                              states=states)
             np.testing.assert_array_equal(states["vlm.img"], self.vm.forward(im))
+
+    def test_gelu_on_vectorop(self):
+        """Two VectorOP calls per layer (ADD bias, MUL by 2^(8-f) + GELU_TANH), the
+        rows' raw values those of vlm_study.vop_gelu_b; the generated C programs
+        the activation unit."""
+        g = OnnxGraph(self.fe.entry(), fuse_act=True, s2d_stem=True)
+        for sn in (sn for sn in g.nodes if isinstance(sn, VitGeluVopNode)):
+            f, ba, sc = sn.inputs
+            l = int(sn.onnx_node.name.split(".")[1][1:])
+            b = self.W[f"model.vision_model.encoder.layers.{l}.mlp.fc1.bias"]
+            want_ba, want_sc = vs.vop_gelu_b(b.astype(np.float32), f.exp_channels(8))
+            np.testing.assert_array_equal(sn._raw(ba), want_ba)
+            np.testing.assert_array_equal(sn._raw(sc), want_sc)
+            self.assertEqual([(c.fields["op"], c.fields["act"], c.fields["outer"], c.fields["b_inc"])
+                              for c in sn.kernel_calls({})], [(0, 0, sn.rows, 0), (2, 6, sn.rows, 0)])
+        src = CodeGenerator(g, model_path="vit_tiny.onnx").generate_source()
+        self.assertIn("VECTOROP_ACT_GELU_TANH", src)
+        self.assertIn("static void run_op_act(", src)
+
+    @_host_gelu
+    def test_host_gelu_without_the_unit(self):
+        """No activation unit (AXI_VECTOROP_ACTIVATIONS=0): the host VitGelu, the
+        policy pow2+p12, in simulation and in the generated C."""
+        g = OnnxGraph(self.fe.entry(output=True), fuse_act=True, s2d_stem=True)
+        kinds = [type(sn) for sn in g.nodes]
+        self.assertEqual(kinds.count(VitGeluNode), 2)
+        self.assertNotIn(VitGeluVopNode, kinds)
+        cg = CodeGenerator(g, model_path="vit_tiny_host.onnx")
+        im = images(1, 7)[0]
+        out = cg._forward_pass({"vision.patches": patches(im, self.cfg.P).astype(np.float64)},
+                               states=cg.initial_states())
+        np.testing.assert_array_equal(out["vision.image"], Tiny.host_study().forward(im))
+        self.assertFalse(np.array_equal(out["vision.image"], self.vm.forward(im)))
+        with tempfile.TemporaryDirectory() as td:
+            rc, log = host_emu.build_and_run(cg, td, cached=True, threads=3, min_elems=1)
+            self.assertEqual(rc, 0, log[-3000:])
+            self.assertIn("test_inference PASSED", log)
 
     def test_engines(self):
         for mode in ("off", "always"):

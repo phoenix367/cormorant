@@ -19,7 +19,7 @@
   "recorded": "2026-10-06 01:58"
  },
  "scheduler": {
-  "min_tests": 1651,
+  "min_tests": 1674,
   "max_skipped": 0,
   "skip_allow": [],
   "warning_allow": [],

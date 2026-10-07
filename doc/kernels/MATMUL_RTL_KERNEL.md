@@ -20,7 +20,7 @@ the same design plus a PoolingKernel guard); the HLS
 kernel's synthesis is retired, its C++ reference `ref_matmul_2d` stays and
 writes the fixtures every RTL test checks against.  The bitstream meets
 timing at 100 MHz and passes the test stand's matmul behaviour test
-(50 / 50) and the whole-design simulation (68 / 68).  On the board it is
+(50 / 50) and the whole-design simulation (73 / 73).  On the board it is
 bit-exact everywhere (148 models, every demo and chat / TTS gate), 2–11×
 faster than the HLS kernel on tiled and depthwise-shaped MatMuls and at
 least as fast on GEMV (phase 2b balanced K between the lanes).  The
@@ -534,7 +534,7 @@ The changes (cycle counts in Verilator +0.01 … +0.12 %, results unchanged):
 - **System level (`make sysim_matmul_rtl`):**
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
-- **Full design (`sim_hw_kv260`):** the `cormorant_hw_128` block design with this IP passes 68 / 68 (Matmul 10 / 10), and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
+- **Full design (`sim_hw_kv260`):** the `cormorant_hw_128` block design with this IP passes 73 / 73 (Matmul 10 / 10) — 68 / 68 when phase 1 ran —, and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
 - **Board (phases 2 and 2b):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks show no case slower than the HLS kernel's ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phases 2 and 2b).
 
 ## Source files

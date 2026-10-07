@@ -46,6 +46,33 @@ inline T saturate_cast(From v) {
 }
 
 // ---------------------------------------------------------------------------
+// round_cast<T>(v)
+//
+// Like saturate_cast, but rounds to the nearest representable value, ties
+// to even (ap_fixed AP_RND_CONV), instead of truncating: the activation
+// functions' rounding (the host ops' round-half-even write-back).  Plain
+// conversion for non-ap_fixed types.
+// ---------------------------------------------------------------------------
+template<typename T>
+struct round_to {
+    template<typename From>
+    static T cast(From v) { return T(v); }
+};
+
+template<int W, int I, ap_q_mode Q, ap_o_mode O, int N>
+struct round_to<ap_fixed<W, I, Q, O, N>> {
+    template<typename From>
+    static ap_fixed<W, I, Q, O, N> cast(From v) {
+        return ap_fixed<W, I, Q, O, N>(ap_fixed<W, I, AP_RND_CONV, AP_SAT>(v));
+    }
+};
+
+template<typename T, typename From>
+inline T round_cast(From v) {
+    return round_to<T>::template cast<From>(v);
+}
+
+// ---------------------------------------------------------------------------
 // Operation codes for VectorOPKernel.
 // Passed at runtime via the AXI-Lite 'op' register.
 // ---------------------------------------------------------------------------
@@ -56,19 +83,47 @@ enum Op : unsigned {
     OP_DIV   = 3,  // c[i] = saturate_cast<Data_t>(a[i] / b[i])  (b[i] ≠ 0)
     OP_RELU  = 4,  // c[i] = max(a[i], 0)          — unary, b[] not read
     OP_RELU6 = 5,  // c[i] = min(max(a[i], 0), 6)  — unary, b[] not read
+    // The activation ops: c[i] = the activation of a[i] (Act codes 3..6, the
+    // op code minus 3), unary; the act register is not applied after them.
+    OP_LEAKY_RELU = 6,  // a >= 0 ? a : alpha * a
+    OP_SILU       = 7,  // a * sigmoid(a)
+    OP_GELU       = 8,  // a * Phi(a) = a / 2 * (1 + erf(a / sqrt(2)))
+    OP_GELU_TANH  = 9,  // a / 2 * (1 + tanh(sqrt(2 / pi) * (a + 0.044715 a^3)))
 };
 
 // ---------------------------------------------------------------------------
 // Fused activation applied to the op result (AXI-Lite 'act' register).
 // ACT_NONE leaves the op result unchanged; ACT_RELU / ACT_RELU6 clip it
 // exactly like OP_RELU / OP_RELU6 would in a second pass, so the scheduler
-// can fuse Add -> Relu (or -> Clip(0,6)) into one kernel invocation.
+// can fuse Add -> Relu (or -> Clip(0,6)) into one kernel invocation; the
+// other activations likewise (Add -> Gelu, ...).
+//
+// ACT_LEAKY_RELU .. ACT_GELU_TANH (and the activation ops) are the exact
+// function of the Q8.8 input rounded to the nearest Q8.8 value, ties to
+// even (round_cast; the host ops' write-back).  LeakyReLU's slope is the
+// 'alpha' register: alpha[15:0] / 65536 (0 <= alpha < 1; bits 31:16 are
+// ignored).  The RTL kernel computes SiLU and both GELUs from a table of
+// f(-|x|) — for these odd-symmetric x * F(x), f(x) = max(x, 0) + f(-|x|) —
+// built by kernels/vectorop_rtl/scripts/gen_act_rom.py; IEEE double with
+// the formulas of act_fn() in VectorOP.cpp rounds every Q8.8 input the same
+// way as the exact value (the nearest tie is 1.6e-5 LSB away).
 // ---------------------------------------------------------------------------
 enum Act : unsigned {
-    ACT_NONE  = 0,
-    ACT_RELU  = 1,
-    ACT_RELU6 = 2,
+    ACT_NONE       = 0,
+    ACT_RELU       = 1,
+    ACT_RELU6      = 2,
+    ACT_LEAKY_RELU = 3,
+    ACT_SILU       = 4,
+    ACT_GELU       = 5,
+    ACT_GELU_TANH  = 6,
 };
+
+// The activation an op / act pair applies after the op: an activation op
+// (OP_LEAKY_RELU .. OP_GELU_TANH) its own, any other op the act register's.
+inline unsigned job_act(unsigned op, unsigned act) {
+    return (op >= OP_LEAKY_RELU && op <= OP_GELU_TANH) ? op - (OP_LEAKY_RELU - ACT_LEAKY_RELU)
+                                                        : act;
+}
 
 // ---------------------------------------------------------------------------
 // Port width — 128-bit words (VECTOROP_OPTIMISATION.md §2).
@@ -152,20 +207,23 @@ inline unsigned vec_words_for(unsigned count) {
 //   b_inc   — AXI-Lite register: element stride for b per outer iteration
 //             (0 = b repeats every outer iteration; size = b advances)
 //   act     — AXI-Lite register: fused activation (Act enum, 0 = none);
-//             appended LAST so the earlier register offsets are unchanged
-//             (0x5C in the generated driver).
+//             appended after b_inc so the earlier register offsets are
+//             unchanged (0x5C in the generated driver).
+//   alpha   — AXI-Lite register: LeakyReLU slope, alpha[15:0] / 65536;
+//             appended LAST (0x64).
 //   return  — AXI-Lite control: ap_ctrl_hs (start/done/idle/ready)
 //
 // The kernel processes outer × size elements:
-//   c[o * (a_inc+b_inc) + i] = act(op(a[o*a_inc + i], b[o*b_inc + i]))
+//   c[o * (a_inc+b_inc) + i] = job_act(op, act)(op(a[o*a_inc + i], b[o*b_inc + i]))
 //   for o in 0..outer-1, i in 0..size-1
 //
 // For non-broadcast use set outer=1, a_inc=0, b_inc=0.
 // For broadcast with a advancing: outer=N, a_inc=aligned_chunk, b_inc=0.
 // For broadcast with b advancing: outer=N, a_inc=0, b_inc=aligned_chunk.
 //
-// For unary operations (OP_RELU, OP_RELU6) only a[] is read; no AXI
-// transactions are issued on the gmem1 port and b_addr is ignored.
+// For unary operations (op >= OP_RELU: OP_RELU, OP_RELU6 and the
+// activation ops) only a[] is read; no AXI transactions are issued on the
+// gmem1 port and b_addr is ignored.
 //
 // Data paths (all three stages run at one word = kVecLanes elements per
 // cycle):
@@ -185,5 +243,6 @@ void VectorOPKernel(
     unsigned      outer,
     unsigned      a_inc,
     unsigned      b_inc,
-    unsigned      act
+    unsigned      act,
+    unsigned      alpha
 );

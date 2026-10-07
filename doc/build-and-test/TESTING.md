@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1651 tests); the chat app (188 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1674 tests); the chat app (188 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the four SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1651 tests in 75 modules (all pass, none skipped; the first run
+# Run all 1674 tests in 76 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
@@ -238,8 +238,8 @@ Each `behavior_test_<k>` depends on its kernel's IP target —
 `package_pool_rtl` — (so it rebuilds its kernel's IP and driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
-manifests currently hold 119 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 45 Pool
-cases, and all pass (`VectorOP Test Summary: 119 / 119 passed`, …): each
+manifests currently hold 201 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 45 Pool
+cases, and all pass (`VectorOP Test Summary: 201 / 201 passed`, …): each
 kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);
 do not commit them.
@@ -252,12 +252,12 @@ in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 ##########################################################
 ##  CORMORANT TESTBENCH — OVERALL RESULTS
 ##########################################################
-##        VectorOPKernel   22 /  22  (0 failed)
+##        VectorOPKernel   27 /  27  (0 failed)
 ##            ConvKernel   17 /  17  (0 failed)
 ##          MatmulKernel   10 /  10  (0 failed)
 ##         PoolingKernel   19 /  19  (0 failed)
 ##########################################################
-##  TOTAL: 68 / 68 passed
+##  TOTAL: 73 / 73 passed
 ##  ALL TESTS PASSED
 ##########################################################
 ```
@@ -288,7 +288,7 @@ Use `upload_bitstream.py` (see the README Quick start or
 [`REMOTE_TESTING.md`](../../inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy)).
 
 The tracked template `inference-scheduler/remote_config.json.example`
-lists every on-board test model (148; narrow the list, or pass
+lists every on-board test model (156; narrow the list, or pass
 `--models`, to test a subset of kernels). Copy it and fill in your board
 details:
 

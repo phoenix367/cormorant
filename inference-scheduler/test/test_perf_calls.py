@@ -28,7 +28,8 @@ from src.perf_calls import (FIELDS, KernelCall, bitstream_id_of_bin,  # noqa: E4
 # the remaining arguments)
 _FN = {
     "run_op":        ("VectorOPKernel", 3, ("size", "op", "outer", "a_inc", "b_inc")),
-    "run_op_act":    ("VectorOPKernel", 3, ("size", "op", "outer", "a_inc", "b_inc", "act")),
+    # alpha (LeakyReLU's slope) is no key: the timing does not depend on it
+    "run_op_act":    ("VectorOPKernel", 3, ("size", "op", "outer", "a_inc", "b_inc", "act", "_alpha")),
     "run_matmul":    ("MatmulKernel", 3, FIELDS["MatmulKernel"]),
     "run_matmul_at": ("MatmulKernel", 6, FIELDS["MatmulKernel"]),
     "run_conv":      ("ConvKernel", 4, FIELDS["ConvKernel"]),
@@ -101,7 +102,7 @@ def emitted_calls(snippet, ev, env=None):
     for m in _CALL.finditer(snippet):
         kernel, skip, order = _FN[m.group(1)]
         vals = [ev(a, env) for a in _args(snippet, m.end())[skip:]]
-        regs = dict(zip(order, vals, strict=True))
+        regs = {k: v for k, v in zip(order, vals, strict=True) if not k.startswith("_")}
         calls.append(KernelCall.of(kernel, count=count, **regs))
     return merge(calls)
 

@@ -192,6 +192,8 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds VectorOPKernel'}
+    - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})`; the scheduler maps'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
 - id: perf.model_size
@@ -206,7 +208,73 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '\): (?P<exact_calls>\d+) calls,'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: 'to (?P<exact_calls>\d+) exact calls, and `host.json` merged to (?P<host_signatures>\d+) signatures / (?P<host_kinds>\d+) kinds'}
+       regex: 'to (?P<exact_calls>\d+) exact calls, and\s+`host.json` merged to (?P<host_signatures>\d+) signatures / (?P<host_kinds>\d+) kinds'}
+
+# ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
+- id: cost_model.call_overhead
+  kind: value
+  title: "the host's cost of one kernel call that the engine choice charges (CALL_OVERHEAD) = the call floor
+    of the current performance model's campaign (its cheapest call, at its clock); the kernels' fixed costs
+    ONE / one are fitted net of it (OFFLOAD_PLAN §4.3: 1500 against a ~315-cycle floor over-charged every call)"
+  source:
+    parts:
+      cycles: {file: 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.json', json: '',
+               transform: "round(v['call_overhead_us'] * v['clock_mhz'])"}
+      us: {file: 'inference-scheduler/perf_models/kv260/{fact:perf.bitstream_id}.json', json: call_overhead_us,
+           transform: 'round(v, 2)'}
+  fix: report                                # a code constant: refit with tools/fit_cost_model.py
+  mentions:
+    - {file: inference-scheduler/src/cost_model.py, regex: '^CALL_OVERHEAD\s+= (?P<cycles>\d+)$'}
+    - {file: inference-scheduler/src/cost_model.py, regex: 'a 10-element VectorOP Add,\n# (?P<us>[\d.]+) us at \d+ MHz'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '`CALL_OVERHEAD` \((?P<cycles>\d+) cycles: the cheapest measured call'}
+
+- id: cost_model.board_fit
+  kind: recorded
+  title: the engine cost model's per-call error against the board (RTL_CONV_BOARD, RTL_COEF + CALL_OVERHEAD;
+    median / p90 %) on the campaign it was fitted to, quoted in the code and the docs that describe the model
+  value: {conv_calls: 1190, conv_median: 18.3, conv_p90: 45.8, matmul_calls: 414, matmul_median: 4.5, matmul_p90: 17.7}
+  provenance:
+    date: 2026-10-07
+    how: "tools/fit_cost_model.py fit --shipped-weight 0.75 --decisions D (the decision-aware set: no shipped
+          model's engine choice moves; OFFLOAD_PLAN §4.3) on the campaign of 6436623029f7 as of 1729 exact calls;
+          the constants as used before (100 MHz, + 1500): ConvKernel 33.9 / 64.5 %, MatmulKernel 8.8 / 29.6 %;
+          the plain refit 14.5 / 44.2 % (it moved BERT's P·V to MatmulKernel)"
+    facts: {perf.bitstream_id: 6436623029f7}  # a new bitstream: a new campaign, refit
+  fix: report
+  mentions:
+    - {file: inference-scheduler/src/cost_model.py,
+       regex: 'at 250 MHz, (?P<conv_calls>[\d ]+) calls, median (?P<conv_median>[\d.]+) %,\n# p90 (?P<conv_p90>[\d.]+) %'}
+    - {file: inference-scheduler/src/cost_model.py,
+       regex: 'at 250 MHz, (?P<matmul_calls>\d+) calls:\n# median (?P<matmul_median>[\d.]+) %, p90 (?P<matmul_p90>[\d.]+) %'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, dotall: true,
+       regex: 'x and weight runs; median (?P<conv_median>[\d.]+) %, p90 (?P<conv_p90>[\d.]+) % over the\s+(?P<conv_calls>[\d ]+) ConvKernel calls'}
+    - {file: doc/kernels/CONV_RTL_KERNEL.md, dotall: true,
+       regex: '`[0-9a-f]{12}`, median (?P<conv_median>[\d.]+) %, p90 (?P<conv_p90>[\d.]+) %'}
+    - {file: .claude/skills/conv-cycle-model/SKILL.md, dotall: true,
+       regex: '[0-9a-f]{12}: median (?P<conv_median>[\d.]+) %, p90 (?P<conv_p90>[\d.]+) %;'}
+  # OFFLOAD_PLAN §4.3's table is the dated record of this fit
+
+- id: cost_model.conv_anchors
+  kind: value
+  title: the board anchors test_rtl_conv_model pins conv_board_cycles to (cycles net of the call floor) and
+    the model's estimate of BERT's per-head P·V, as INFERENCE_SCHEDULER.md quotes them
+  source:
+    parts:
+      big_board: {file: inference-scheduler/test/test_matmul_on_conv.py,
+                  regex: '(?s)def test_rtl_conv_model.*?conv_board_cycles\(\*\*big\)\["total"\] / (\d+) - 1\)', type: int}
+      pv_board: {file: inference-scheduler/test/test_matmul_on_conv.py,
+                 regex: '(?s)def test_rtl_conv_model.*?conv_board_cycles\(\*\*pv\)\["total"\] / (\d+) - 1\)', type: int}
+      pv_board_ms: {file: inference-scheduler/test/test_matmul_on_conv.py,
+                    regex: '(?s)def test_rtl_conv_model.*?conv_board_cycles\(\*\*pv\)\["total"\] / (\d+) - 1\)',
+                    transform: 'round(int(v) / 250e3, 2)'}
+      pv_model: {py: 'src.cost_model:round(conv_board_cycles(in_ch=256, out_ch=256, in_h=1, in_w=64, oh=1, ow=64, kh=1, kw=1)["total"])',
+                 cwd: inference-scheduler}
+  fix: report
+  mentions:
+    - {file: inference-scheduler/test/test_matmul_on_conv.py, regex: 'testbench, (?P<big_board>[\d ]+) on the board \(grid-bound\)'}
+    - {file: inference-scheduler/test/test_matmul_on_conv.py, regex: 'channels, 64 pixels\) (?P<pv_board>[\d ]+) on the board'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, dotall: true,
+       regex: 'per-head attention P·V conv: (?P<pv_board>[\d ]+) cycles on the\s+board \((?P<pv_board_ms>[\d.]+) ms at 250 MHz\), (?P<pv_model>[\d ]+) predicted'}
 
 # ── the scheduler CLI ────────────────────────────────────────────────────────
 - id: cli.inference_scheduler
@@ -235,7 +303,7 @@ facts:
     rtl: kernels/vectorop_rtl/rtl/vo_ctrl_s_axi.sv            # checked against its control block
     hls: kernels/vectorop/kernel/VectorOP.cpp                 # the C++ reference model: same ports
     driver: 'build*/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/xvectoropkernel_hw.h'
-    not_keyed: {a: address, b: address, c: address}
+    not_keyed: {a: address, b: address, c: address, alpha: LeakyReLU slope (no effect on timing)}
     decode: inference-scheduler/src/timeline_html.py
     writers_all:
       - inference-scheduler/src/codegen/_source.py
@@ -593,7 +661,7 @@ facts:
         end: '^## 3\.'
         pattern: '`([A-Z][a-z]+(?:[A-Z][a-z0-9]*)*)\b'
         reverse: true
-        extra_ok: [ReduceMean, Pow, Sqrt, Reciprocal, Tanh, Erf, SchedulerError]    # rejected unless fused; the error
+        extra_ok: [ReduceMean, Pow, Sqrt, Reciprocal, Tanh, Erf, Sigmoid, SchedulerError]    # rejected unless fused; the error
       - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
       - {file: doc/scheduler/INFERENCE_SCHEDULER.md, start: '^## Hardware Kernels', end: '^## ', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
 
@@ -615,7 +683,8 @@ facts:
         end: '^### Multi-entry projects'
         pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'
         reverse: true
-        extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode]
+        extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode,
+                   LlmKernelNode, VitGeluVopNode, TtsAddVopNode]   # kernel-call node classes
 
 - id: scheduler.event_kinds
   kind: interface
@@ -774,9 +843,9 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.5, resnet18_fps: 48.8, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.5, bert_ms: 541,
+  value: {resnet18_ms: 20.5, resnet18_fps: 48.8, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.5, bert_ms: 525,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.16, smollm2_360m_tok_s: 7.3,
-          smolvlm_image_s: 2.3, piper_rtf: 0.24, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249}
+          smolvlm_image_s: 2.2, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -812,8 +881,8 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)"
-    facts: {perf.bitstream_id: 986cef4866a0}   # stale on another bitstream
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP)"
+    facts: {perf.bitstream_id: 6436623029f7}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -844,7 +913,7 @@ facts:
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
        regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `986cef4866a0`,\s+FMAX_250_PLAN.md\): p50 (?P<bert_ms>\d+) ms', dotall: true}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `6436623029f7`, ACTIVATIONS_PLAN.md\):\s+p50 (?P<bert_ms>\d+) ms', dotall: true}
     - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
@@ -855,6 +924,7 @@ facts:
     - {file: doc/README.md, regex: '\((?P<bert_ms>\d+) ms p50 on'}
     - {file: doc/README.md, regex: 'SmolLM2-135M on the FPGA \(~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\)'}
     - {file: doc/README.md, regex: 'bit-exact on the board, RTF (?P<piper_rtf>[\d.]+);'}
+    - {file: demo/tts/README.md, dotall: true, regex: '[\d.]+ s per chunk,\s+RTF (?P<piper_rtf>[\d.]+)\.'}
     - {file: demo/chat/README.md, regex: 'streamed token by token \| ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s'}
     - {file: demo/chat/README.md, regex: 'streamed token by token \| ~[\d.]+ tokens/s; first token after (?P<smollm2_135m_prefill16_s>[\d.]+)–'}
     - {file: demo/chat/README.md, regex: 'better answers, slower \| ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
@@ -913,23 +983,26 @@ facts:
     - {file: doc/build-and-test/PLATFORM_CONFIGURATION.md, regex: 'runs the kernels at (\d+) MHz from an MMCM'}
     - {file: doc/images/architecture.svg, regex: 'kernels at (\d+) MHz'}
     - {file: .claude/skills/conv-cycle-model/scripts/conv_cycle_model.py, regex: '^PL_MHZ = (\d+) '}
+    - {file: inference-scheduler/src/cost_model.py, regex: '^KERNEL_MHZ = (\d+)\.0$'}
 
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: 986cef4866a0, dsp: 688, dsp_total: 1248, dsp_pct: 55, lut: 56019, lut_total: 117120, lut_pct: 47.8,
-          bram: 103, bram_total: 144, uram: 48, uram_total: 64}
+  value: {bitstream: 6436623029f7, dsp: 696, dsp_total: 1248, dsp_pct: 56, lut: 56748, lut_total: 117120, lut_pct: 48.5,
+          bram: 107, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-05
-    how: "Vivado placed utilization report of the 250 MHz design (FMAX_250_PLAN int6: the MMCM, register slices,
+    how: "Vivado placed utilization report of the 250 MHz design with VectorOPKernel's activation unit
+          (ACTIVATIONS_PLAN, /mnt/data/bitstreams/kv260_250_6436623029f7/: +729 LUT, +1 233 FF, +4 BRAM, +8 DSP);
+          986cef4866a0 before it: LUT 56 019, DSP 688, BRAM 103 — the 250 MHz design (FMAX_250_PLAN int6: the MMCM, register slices,
           the four kernels' register trees; /mnt/data/bitstreams/kv260_250_986cef4866a0/), FF 81 365 (48 328
           before); c2b2a6e5e50e before it (hw_128 850cc88, 100 MHz): LUT 56 516; the ConvKernel of CONV_RTL_PLAN
           phase 1; (dbb320fb7297
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 986cef4866a0}
+    facts: {perf.bitstream_id: 6436623029f7}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
@@ -1059,6 +1132,44 @@ facts:
     - {file: demo/tts/README.md, regex: 'about 0\.7 s per (?P<seconds>[\d.]+) s chunk'}
     - {file: demo/tts/README.md, regex: 'FPGA, per chunk of (?P<out_frames>\d+) frames'}       # the mermaid diagram
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'pcm, (?P<dec_frames>\d+) × 256 int16 samples'}
+
+- id: vlm.vision_gelu
+  kind: value
+  title: SmolVLM's vision GELUs on VectorOPKernel's activation unit (VitGeluVopNode, OFFLOAD_PLAN §2.1) and
+    its layers, from the generated project (a layer whose GELU output has a channel off 2^-8 stays on the host)
+  optional: true                             # demo/chat/build: generate_llm_project.py --model-name smolvlm-256m-instruct
+  source:
+    parts:
+      on_vop: {file: demo/chat/build/llm_project_smolvlm_256m/src/inference.c,
+               regex: "(on VectorOPKernel's activation unit): ADD bias", all: true, transform: 'len(v)'}
+      layers: {file: demo/chat/build/llm_project_smolvlm_256m/src/inference.c,
+               regex: '/\* \[\d+\] (VitGelu)\(vision', all: true, transform: 'len(v)'}
+  fix: report
+  mentions:
+    - {file: CLAUDE.md, regex: '(?P<on_vop>\d+) of (?P<layers>\d+) layers, `doc/plans/OFFLOAD_PLAN\.md` §2\.1'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, dotall: true, regex: '\((?P<on_vop>\d+) of SmolVLM.s (?P<layers>\d+)\s+layers\)'}
+    - {file: doc/plans/OFFLOAD_PLAN.md, regex: 'for every channel \((?P<on_vop>\d+) of the (?P<layers>\d+) layers;'}
+
+- id: piper.vop_sums
+  kind: value
+  title: "Piper's chunk: the TtsSums on VectorOPKernel (TtsAddVopNode) and on the host, from the generated project,
+    and the decoder's stage exponents that make them exact (piper.vop_exponents; OFFLOAD_PLAN §2.2)"
+  optional: true                             # demo/tts/build, demo/tts/assets: generate_tts_project.py
+  source:
+    parts:
+      vop: {file: demo/tts/build/piper_project/src/inference.c, regex: '(VectorOPKernel ADD) \*/', all: true,
+            transform: 'len(v)'}
+      host: {file: demo/tts/build/piper_project/src/inference.c,
+             regex: '\] (TtsSum)\([^\n]*host CPU, no hardware call', all: true, transform: 'len(v)'}
+      stage_exp: {py: "src.piper:' / '.join(str(vop_exponents(json.load(open('../demo/tts/assets/piper-lessac-medium/exponents.json'))['exponents'])[f'dec.up{i}']) for i in range(3))",
+                  cwd: inference-scheduler}
+  fix: report
+  mentions:
+    - {file: doc/plans/OFFLOAD_PLAN.md, regex: 'smallest calibrated one \((?P<stage_exp>[\d /]+):'}
+    - {file: doc/plans/OFFLOAD_PLAN.md, regex: 'saturated\) first, so each sum has two inputs\.  (?P<vop>\d+) `TtsSum`'}
+    - {file: doc/plans/OFFLOAD_PLAN.md, dotall: true,
+       regex: 'the chunk graph has (?P<vop>\d+) `TtsAddVopNode` \(18 residual sums,\s+3 tap-group sums\) and (?P<host>\d+) host `TtsSum`'}
+    - {file: inference-scheduler/test/test_piper.py, regex: 'assertGreaterEqual\(kinds\.pop\("TtsAddVopNode"\), (?P<vop>\d+)\)'}
 
 # ── build and test entry points ─────────────────────────────────────────────
 - id: build.make_targets

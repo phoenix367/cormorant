@@ -194,13 +194,17 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `tts.max_ids` | value | Piper's encoder buckets; the largest (400) is the server's packing size in two files |
 | `board.results` | recorded | the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, MNIST convnet / LeNet, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 14 files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
 | `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json`; also the RTL MatmulKernel's `K_MAX` and the RTL cost model's packed-B tile |
-| `board.pl_clock_mhz` | value, optional | the PL clock (the block design's PL0, 100 MHz) in the README, two docs and the two `MHZ` constants of the performance model |
+| `board.pl_clock_mhz` | value, optional | the kernel clock (the block design's `clk_wiz_0`, 250 MHz since FMAX_250_PLAN) in the README, CLAUDE.md, the docs, the conv-cycle-model script's `PL_MHZ` and the cost model's `KERNEL_MHZ` |
 | `hw.utilization` | recorded | the bitstream's hw commit (7d8eefe) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
 | `board.uio_labels`, `board.uio_map` | interface | the overlay's UIO names (`dts/kv260/cormorant.dts`) and which kernel uses which, in the six example configs, two doc tables, the README, a skill and the MNIST README |
 | `bert.model_mb` | value | the 435 MB BERT download (`fetch_assets.py`), quoted in 11 files |
 | `bert.engine_split` | value | BERT-base's 98 MatMuls on ConvKernel / MatmulKernel and its ConvKernel calls (what `test_bert_base.py` asserts), in INFERENCE_SCHEDULER, the BERT demo's README, generator and example config |
 | `chat.limits` | value | the 1024-position context and the 4096-character speech input |
 | `piper.chunk` | value | Piper's chunk: 128 frames = 1.49 s of audio, 192 decoder frames |
+| `cost_model.call_overhead` | value | the engine choice's `CALL_OVERHEAD` (448 cycles) = the current performance model's call floor (`call_overhead_us` × `clock_mhz`), in `cost_model.py` and INFERENCE_SCHEDULER |
+| `cost_model.board_fit` | recorded | the cost model's per-call error on its campaign (ConvKernel 18.3 / 45.8 %, MatmulKernel 4.5 / 17.7 %), in `cost_model.py`, INFERENCE_SCHEDULER, CONV_RTL_KERNEL and the conv-cycle-model skill; stale on another bitstream |
+| `cost_model.conv_anchors` | value | `test_rtl_conv_model`'s board anchors and the model's estimate of BERT's per-head P·V, in the test's docstring and INFERENCE_SCHEDULER |
+| `vlm.vision_gelu`, `piper.vop_sums` | value, optional | from the generated projects: SmolVLM's GELU layers on VectorOP (11 of 12), Piper's sums on VectorOP / the host (21 / 19) and the decoder's stage exponents (8 / 10 / 11), in CLAUDE.md, INFERENCE_SCHEDULER, OFFLOAD_PLAN and `test_piper.py` |
 | `build.make_targets` | interface, optional | every make target that the README and CLAUDE.md name exists in a configured `build/` (`make help`) |
 | `tests.suites` | value | the run-tests helper's `default` / `all` suite sets, in the README, CLAUDE.md, the agent and the helper's docstring |
 | `toolchain.vivado` | value, optional | the Vitis / Vivado release (2025.2, from the hw project) in 11 files |
@@ -241,6 +245,14 @@ Six mutations of the new locators were all caught.
 The fourth batch registered what the chat demo added: the client's flags, the
 banner's width, the voice samples and the video link. `chat.py`'s usage
 synopsis lacked `--timeout`; it has it now.
+
+The fifth batch (2026-10-07, OFFLOAD_PLAN) registered the engine cost model's
+board terms and the two offloads.  The refit had found `CALL_OVERHEAD` (1500)
+far from the call floor its kernel terms were fitted against (~315 cycles at
+100 MHz); `cost_model.call_overhead` now ties it to the performance model's
+measured floor.  CLAUDE.md still said the activation ops were "not yet in a
+bitstream"; its two production-bitstream mentions joined `perf.bitstream_id`.
+Twelve mutations of the new locators were all caught.
 
 ## Adding a fact
 

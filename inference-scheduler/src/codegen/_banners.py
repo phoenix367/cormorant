@@ -8,7 +8,7 @@ from ..graph import OnnxGraph
 from ..nodes import (OP_NAMES, MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
                      SpaceToDepthNode)
 from ..host_nodes import HostNode
-from ..llm_nodes import LlmAttnConvNode
+from ..llm_nodes import LlmAttnConvNode, LlmKernelNode
 
 
 def _banner(title: str) -> str:
@@ -27,7 +27,7 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
         else "Conv"    if isinstance(sn, ConvNode)
         else "Reshape" if isinstance(sn, ReshapeNode)
         else sn.onnx_node.op_type if isinstance(sn, (PoolNode, SpaceToDepthNode, HostNode,
-                                                     LlmAttnConvNode))
+                                                     LlmKernelNode))
         else OP_NAMES[sn.op_code]
         for sn in graph.nodes
     })
@@ -40,7 +40,8 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
     has_pool     = any(isinstance(sn, PoolNode)    for sn in graph.nodes)
     has_vectorop = any(
         not isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
-                            SpaceToDepthNode, HostNode, LlmAttnConvNode))
+                            SpaceToDepthNode, HostNode, LlmKernelNode))
+        or (isinstance(sn, LlmKernelNode) and sn.kernel_name == "VectorOPKernel")
         for sn in graph.nodes
     )
     kernel_parts = []

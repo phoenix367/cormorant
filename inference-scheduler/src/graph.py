@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from .planning import PlanOptions
 from .tensor import TensorInfo
 from .nodes  import (
-    ACT_NONE, _pack_matmul_b, _s2d_stem_geometry, _s2d_stem_weight,
+    ACT_NONE, ACTIVATION_OPS, _pack_matmul_b, _s2d_stem_geometry, _s2d_stem_weight,
     ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
     SpaceToDepthNode,
     POOL_OP_TYPES, VECTOROP_OP_TYPES, RESHAPE_OP_TYPES, SPACE_TO_DEPTH_OP_TYPES,
@@ -45,12 +45,13 @@ from . import cost_model
 from . import fusion
 from . import matmul_lowering
 from . import numeric
+from . import vectorop_act
 from .matmul_gemv import choose_gemv
 from . import fc_conv as fc_conv_mod
 
 _ALL_SUPPORTED_OP_TYPES: frozenset = (
-    {"MatMul", "Conv", "Gemm", "Split", "Constant"} | POOL_OP_TYPES | VECTOROP_OP_TYPES
-    | RESHAPE_OP_TYPES | SPACE_TO_DEPTH_OP_TYPES | HOST_OP_TYPES
+    {"MatMul", "Conv", "Gemm", "Split", "Constant", "LeakyRelu"} | POOL_OP_TYPES
+    | VECTOROP_OP_TYPES | RESHAPE_OP_TYPES | SPACE_TO_DEPTH_OP_TYPES | HOST_OP_TYPES
 )
 
 # Raw (original-dtype) copies are kept for initializers up to this size so
@@ -674,9 +675,12 @@ class OnnxGraph:
 
         # Transformer patterns (LayerNorm / GELU) and VectorOP constant
         # broadcast normalisation, see fusion.py.
+        # x * Sigmoid(x) -> Silu only where VectorOPKernel can run it.
         self.fusion_counts = (
-            fusion.fuse_patterns(model, align_elems) if fuse_patterns
-            else {"layernorm": 0, "gelu": 0, "const_bcast": 0}
+            fusion.fuse_patterns(model, align_elems,
+                                 silu=vectorop_act.enabled() and vectorop_act.is_q88(_dtype))
+            if fuse_patterns
+            else {"layernorm": 0, "gelu": 0, "silu": 0, "const_bcast": 0}
         )
         self._dtype = _dtype
 
@@ -785,6 +789,11 @@ class OnnxGraph:
                         f"'{node.op_type}' (known: {sorted(factories)})")
                 sn = factories[node.op_type](node, self._tensors, idx, align_elems,
                                                     host_ctx)
+            elif node.op_type in vectorop_act.ONNX_OP_TYPES:
+                # Gelu / LeakyRelu / Silu: VectorOPKernel's activation unit, or
+                # (Gelu) the host op where the unit cannot run it
+                sn = vectorop_act.from_onnx(node, self._tensors, idx, align_elems,
+                                            host_ctx, _dtype)
             elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
                                                      host_ctx)
@@ -925,11 +934,13 @@ class OnnxGraph:
     # ------------------------------------------------------------------ #
 
     def _fuse_activations(self) -> int:
-        """Fold Relu / Clip(0,6) nodes into their producing VectorOP node.
+        """Fold Relu / Clip(0,6) and the activation-unit ops (LeakyRelu,
+        SiLU, GELU) into their producing VectorOP node.
 
         A unary activation node R with input T is folded into the
         ScheduledNode P that produces T when
-          * P is a VectorOP ScheduledNode with no activation fused yet,
+          * P is a VectorOP ScheduledNode with no activation fused yet and
+            not itself an activation op (the kernel ignores act after those),
           * T is not a graph output (it must not be materialised),
           * R is T's only consumer, and
           * R's output has the same element count as T (unary nodes are
@@ -960,7 +971,8 @@ class OnnxGraph:
             if ppos is None:
                 continue                                 # graph input / weight
             prod = self._nodes[ppos]
-            if not isinstance(prod, ScheduledNode) or prod.act != ACT_NONE:
+            if not isinstance(prod, ScheduledNode) or prod.act != ACT_NONE \
+                    or prod.op_code in ACTIVATION_OPS:
                 continue
             if src.onnx_name in graph_outputs:
                 continue
@@ -969,6 +981,7 @@ class OnnxGraph:
             if src.numel != sn.output.numel:
                 continue
             prod.act    = act
+            prod.alpha  = sn.alpha
             prod.output = sn.output
             prod.fused_nodes.append(sn.onnx_node)
             producer_pos[sn.output.onnx_name] = ppos

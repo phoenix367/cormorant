@@ -535,13 +535,34 @@ def polyphase_weight(w, b, s):
     return w3, np.tile(b, s)
 
 
-def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None):
+def vop_exponents(E):
+    """The exponents of the decoder's residual sums on VectorOPKernel
+    (doc/plans/OFFLOAD_PLAN.md §2.2): one exponent per decoder stage — the
+    upsampler's output, every resblock conv's output and every residual
+    y — the smallest of the calibrated ones, so ``y = rq(t + y)`` adds two
+    raw tensors at one exponent (an exact sum: the rounding is the identity,
+    VectorOP ADD's saturation is rq's)."""
+    E2 = dict(E)
+    for i in range(3):
+        keys = [f"dec.up{i}"] + [f"dec.rb{i}{j}.{k}{c}" for j in range(3) for k in "cy" for c in range(2)]
+        e = min(E[k] for k in keys)
+        E2.update({k: e for k in keys})
+    return E2
+
+
+def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True):
     """The library's chunk.  zp [192][FLOW_FRAMES] float32 (z_p, zero
     outside the utterance), [lo, hi) the utterance's frames in chunk
     coordinates, E the exponents (calibrate).  Returns int16 PCM
     [DEC_FRAMES * 256] (the central OUT_FRAMES * 256 valid).  The decoder
-    runs on frames [dec_off, frames - dec_off) (tests: longer chunks)."""
+    runs on frames [dec_off, frames - dec_off) (tests: longer chunks).
+    ``vop_sums`` (the library since doc/plans/OFFLOAD_PLAN.md §2.2): the
+    decoder at vop_exponents(E), a split conv's two tap groups summed and
+    saturated first — every residual sum one VectorOP ADD; False: the
+    calibrated exponents, one host sum of three (the library before)."""
     tr = trace if trace is not None else {}
+    if vop_sums:
+        E = vop_exponents(E)
     z = np.asarray(zp, np.float32)
     for fi in (6, 4, 2, 0):
         p, e = f"flow.flows.{fi}", f"flow.flows.{fi}.enc"
@@ -597,6 +618,8 @@ def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None):
                 if (wt.shape[2] - 1) * dil + 1 > 64:
                     t = _kconv(ain, fx, fy, wt, bt, dil, taps=(0, SPLIT_TAPS)) + \
                         _kconv(ain, fx, fy, wt, bt, dil, taps=(SPLIT_TAPS, wt.shape[2]))
+                    if vop_sums:
+                        t = _rq(t, fy)
                 else:
                     t = _kconv(ain, fx, fy, wt, bt, dil)
                 y = _rq(t + y, E[f"{r}.y{c}"])
@@ -631,7 +654,7 @@ def front_end(W, ids, noise_scale=0.667, length_scale=1.0, noise_w=0.8, seed=0, 
     return (mp + rng.standard_normal(mp.shape) * np.exp(lp) * noise_scale).astype(np.float32)
 
 
-def synthesize_chunked(W, E, zp):
+def synthesize_chunked(W, E, zp, vop_sums=True):
     """Stitch the chunks of an utterance: chunk k covers utterance frames
     [128k - 64, 128k + 192), its output frames [128k, 128k + 128)."""
     T = zp.shape[1]
@@ -641,7 +664,7 @@ def synthesize_chunked(W, E, zp):
         chunk = np.zeros((192, FLOW_FRAMES), np.float32)
         a, b = max(start, 0), min(start + FLOW_FRAMES, T)
         chunk[:, a - start:b - start] = zp[:, a:b]
-        pcm = chunk_forward(W, E, chunk, -start, T - start)
+        pcm = chunk_forward(W, E, chunk, -start, T - start, vop_sums=vop_sums)
         o = (OUT_OFF - DEC_OFF) * HOP
         out.append(pcm[o:o + OUT_FRAMES * HOP])
     return np.concatenate(out)[:T * HOP]

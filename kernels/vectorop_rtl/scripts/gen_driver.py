@@ -42,6 +42,7 @@ g.REGS = [
     ("a_inc", 0x4C, 32, ("A_AINC",)),
     ("b_inc", 0x54, 32, ("A_BINC",)),
     ("act",   0x5C, 32, ("A_ACT",)),
+    ("alpha", 0x64, 32, ("A_ALPHA",)),
 ]
 
 if __name__ == "__main__":

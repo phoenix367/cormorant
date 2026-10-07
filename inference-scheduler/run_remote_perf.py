@@ -369,7 +369,7 @@ def run_bench_case(session: RemoteSession, build_dir: str,
 # Report
 # ──────────────────────────────────────────────────────────────────────────────
 
-_OP_NAMES = ["ADD", "SUB", "MUL", "DIV", "RELU", "RELU6"]
+_OP_NAMES = ["ADD", "SUB", "MUL", "DIV", "RELU", "RELU6", "LEAKY_RELU", "SILU", "GELU", "GELU_TANH"]
 _POOL_TYPES = ["MaxPool", "AvgPool", "LpPool"]
 
 

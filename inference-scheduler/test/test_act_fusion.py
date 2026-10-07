@@ -161,8 +161,8 @@ class TestActFusionChain(_ModelDir):
         src = cg.generate_source()
         calls = self._run_op_calls(src)
         self.assertEqual(calls, [
-            "run_op_act(X, bias, relu_Y, 128u, VECTOROP_ADD, 1u, 0u, 0u, VECTOROP_ACT_RELU);",
-            "run_op_act(relu_Y, scale, Y, 128u, VECTOROP_MUL, 1u, 0u, 0u, VECTOROP_ACT_RELU6);",
+            "run_op_act(X, bias, relu_Y, 128u, VECTOROP_ADD, 1u, 0u, 0u, VECTOROP_ACT_RELU, 0u);",
+            "run_op_act(relu_Y, scale, Y, 128u, VECTOROP_MUL, 1u, 0u, 0u, VECTOROP_ACT_RELU6, 0u);",
         ])
         self.assertIn("#define VECTOROP_ACT_NONE    0u", src)
         self.assertIn("#define VECTOROP_ACT_RELU    1u", src)
@@ -250,7 +250,7 @@ class TestActFusionBroadcast(_ModelDir):
         src = cg.generate_source()
         self.assertIn(
             "run_op_act(X, bias, Y, INFERENCE_Y_CHUNK, VECTOROP_ADD, 5u, "
-            "INFERENCE_Y_CHUNK_STRIDE, 0u, VECTOROP_ACT_RELU);", src)
+            "INFERENCE_Y_CHUNK_STRIDE, 0u, VECTOROP_ACT_RELU, 0u);", src)
         # the stride macro follows the (renamed) output tensor
         hdr = cg.generate_header()
         self.assertIn("#define INFERENCE_Y_CHUNK", hdr)
@@ -315,7 +315,7 @@ class TestActFusionCli(_ModelDir):
 
     def test_cli_fuses_by_default(self):
         src = self._cli(self.chain, [])
-        self.assertIn("run_op_act(X, bias, relu_Y, 128u, VECTOROP_ADD, 1u, 0u, 0u, VECTOROP_ACT_RELU);", src)
+        self.assertIn("run_op_act(X, bias, relu_Y, 128u, VECTOROP_ADD, 1u, 0u, 0u, VECTOROP_ACT_RELU, 0u);", src)
 
     def test_cli_no_fuse_act(self):
         src = self._cli(self.chain, ["--no-fuse-act"])

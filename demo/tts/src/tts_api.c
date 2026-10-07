@@ -99,7 +99,7 @@ int tts_open(const char *weights_dir)
             return -3;
         }
     }
-    rc = inference_init(INFERENCE_CONVKERNEL_INSTANCE);
+    rc = tts_glue_init();
     if (rc == 0)                          /* the duration predictor's weights */
         dp_rc = tts_dp_load(TTS_API_WEIGHTS_DIR "/weights/dp.dat", TTS_DP_FLOATS);
     if (cwd >= 0) {

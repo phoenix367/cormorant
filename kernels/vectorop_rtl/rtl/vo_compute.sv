@@ -1,10 +1,13 @@
 // ---------------------------------------------------------------------------
 // vo_compute — the element-wise op on the a / b word streams, 8 lanes per
 // cycle (a 6-stage pipeline: input registers, then add / sub / DSP multiply,
-// product register, op select + saturation, activation), and OP_DIV one lane
-// per cycle through vo_div (as the HLS kernel).  Unary ops (op >= 4) take no
-// b words.  Results go to a small FIFO; a word enters a pipeline only when
-// the FIFO has room for it and for every word already in flight.
+// product register, op select + saturation, ReLU / ReLU6 activation), and
+// OP_DIV one lane per cycle through vo_div (as the HLS kernel); then both
+// through vo_act (LeakyReLU / SiLU / GELU / GELU tanh, 7 cycles).  Unary ops
+// (op >= 4, the activation ops 6..9 among them: the pass op plus their
+// activation) take no b words.  Results go to a small FIFO; a word enters a
+// pipeline only when the FIFO has room for it and for every word already in
+// flight.
 // ---------------------------------------------------------------------------
 module vo_compute
   import vo_pkg::*;
@@ -13,6 +16,7 @@ module vo_compute
   input  logic          rst,
   input  logic [31:0]   op,                 // job constants
   input  logic [31:0]   act,
+  input  logic [31:0]   alpha,
 
   input  logic          a_valid,
   output logic          a_ready,
@@ -29,17 +33,28 @@ module vo_compute
 );
   localparam int FW = $clog2(CF_D);
 
-  // Decoded job constants (op / act do not change during a job).
+  // Decoded job constants (op / act do not change during a job).  The job's
+  // activation (VectorOP.h job_act): an activation op's own (op - 3), else the
+  // act register's (codes past ACT_GELU_TANH: none); ReLU / ReLU6 are applied
+  // in the ALU's stage 5 and by vo_div, the others by vo_act.
   logic       binary, is_div;
   logic [2:0] sel;                          // 0 add 1 sub 2 mul 3 relu 4 relu6 5 pass
+  logic       actop;
+  logic [2:0] op3, act3, jact;
   logic [1:0] actc;
+  logic [2:0] fnc;                          // vo_act: 0 none, 3..6
   always_ff @(posedge clk) begin
     binary <= (op < OP_RELU);
     is_div <= (op == OP_DIV);
     sel    <= (op == OP_ADD) ? 3'd0 : (op == OP_SUB) ? 3'd1 : (op == OP_MUL) ? 3'd2 :
               (op == OP_RELU) ? 3'd3 : (op == OP_RELU6) ? 3'd4 : 3'd5;
-    actc   <= (act == ACT_RELU) ? 2'd1 : (act == ACT_RELU6) ? 2'd2 : 2'd0;
+    actop  <= (op >= OP_LEAKY_RELU) && (op <= OP_GELU_TANH);
+    op3    <= op[2:0];
+    act3   <= (act <= ACT_GELU_TANH) ? act[2:0] : 3'd0;
+    actc   <= (jact == 3'(ACT_RELU)) ? 2'd1 : (jact == 3'(ACT_RELU6)) ? 2'd2 : 2'd0;
+    fnc    <= (jact >= 3'(ACT_LEAKY_RELU)) ? jact : 3'd0;
   end
+  assign jact = actop ? op3 - 3'(OP_LEAKY_RELU - ACT_LEAKY_RELU) : act3;   // 6..9 -> 3..6 (mod 8)
 
   // Output FIFO and credits ----------------------------------------------------------
   logic          cf_in_valid, cf_in_ready;
@@ -53,14 +68,10 @@ module vo_compute
   );
 
   logic [5:0] v;                            // valid bits of ALU stages 1..5 (v[0] unused)
-  logic [3:0] dw_inflight;                  // DIV words taken, not yet pushed
-  logic [5:0] alu_inflight;
-  always_comb begin
-    alu_inflight = '0;
-    for (int s = 1; s <= 5; s++) alu_inflight += 6'(v[s]);
-  end
+  logic [FW:0] inflight;                    // words taken (ALU or DIV), not yet in the FIFO
+  logic       take;
   logic room;
-  assign room = (7'(cf_count) + 7'(alu_inflight) + 7'(dw_inflight)) < 7'(CF_D);
+  assign room = (7'(cf_count) + 7'(inflight)) < 7'(CF_D);
 
   // ALU pipeline -----------------------------------------------------------------------
   logic alu_take;
@@ -145,25 +156,32 @@ module vo_compute
   logic [BW-EW-1:0] d_acc;                  // lanes 0..6 of the word being assembled
   logic             d_push;
   assign d_push = q_valid && (q_lane == 3'd7);
-  always_ff @(posedge clk) begin
+  always_ff @(posedge clk)
     if (q_valid && q_lane != 3'd7) d_acc[EW*q_lane +: EW] <= q;
-    if (rst) dw_inflight <= '0;
-    else     dw_inflight <= dw_inflight + 4'(div_take) - 4'(d_push);
-  end
 
-  // Results -> FIFO ----------------------------------------------------------------------
+  // Results -> vo_act -> FIFO --------------------------------------------------------------
   logic [BW-1:0] o5w;
   always_comb for (int l = 0; l < E; l++) o5w[EW*l +: EW] = o5[l];
 
-  assign cf_in_valid = v[5] || d_push;
-  assign cf_in_data  = d_push ? {q, d_acc} : o5w;
+  vo_act u_act (
+    .clk, .rst, .fn (fnc), .alpha (alpha[15:0]),
+    .in_valid  (v[5] || d_push),             // one job is either ALU or DIV
+    .in_data   (d_push ? {q, d_acc} : o5w),
+    .out_valid (cf_in_valid), .out_data (cf_in_data)
+  );
+
+  assign take = alu_take || div_take;
+  always_ff @(posedge clk) begin
+    if (rst) inflight <= '0;
+    else     inflight <= inflight + (FW+1)'(take) - (FW+1)'(cf_in_valid);
+  end
 
   assign a_ready = alu_take || div_take;
   assign b_ready = (alu_take && binary) || div_take;
 
-  assign idle = (v == '0) && !d_busy && (dw_inflight == '0) && !c_valid;
+  assign idle = (inflight == '0) && !d_busy && !c_valid;
 
   logic unused;
-  assign unused = cf_in_ready;
+  assign unused = ^{cf_in_ready, alpha[31:16]};
 
 endmodule

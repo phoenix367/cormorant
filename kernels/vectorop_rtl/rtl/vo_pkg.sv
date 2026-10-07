@@ -17,12 +17,16 @@ package vo_pkg;
   localparam int WR_OUTS   = 16;        // AW bursts awaiting W / B (num_write_outstanding)
   localparam int REP_D     = 256;       // stride-0 replay buffer, words (2048 elements)
   localparam int OUT_D     = 8;         // read port output FIFO
-  localparam int CF_D      = 16;        // compute output FIFO
+  localparam int CF_D      = 32;        // compute output FIFO (and words in flight to it)
 
   // Op / act codes (VectorOP.h).
+  // The activation ops OP_LEAKY_RELU .. OP_GELU_TANH (6..9): the pass op with
+  // the activation op - 3 (ACT_LEAKY_RELU .. ACT_GELU_TANH).
   localparam logic [31:0] OP_ADD = 32'd0, OP_SUB = 32'd1, OP_MUL = 32'd2, OP_DIV = 32'd3,
-                          OP_RELU = 32'd4, OP_RELU6 = 32'd5;
-  localparam logic [31:0] ACT_RELU = 32'd1, ACT_RELU6 = 32'd2;
+                          OP_RELU = 32'd4, OP_RELU6 = 32'd5,
+                          OP_LEAKY_RELU = 32'd6, OP_GELU_TANH = 32'd9;
+  localparam logic [31:0] ACT_RELU = 32'd1, ACT_RELU6 = 32'd2, ACT_LEAKY_RELU = 32'd3,
+                          ACT_SILU = 32'd4, ACT_GELU = 32'd5, ACT_GELU_TANH = 32'd6;
   localparam logic [15:0] SIX = 16'h0600;   // 6.0 in Q8.8
 
   // How one operand (or the output) walks DDR during a job: n_runs runs of

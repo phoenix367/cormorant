@@ -9,7 +9,7 @@ from ..nodes    import (ACT_NAMES, OP_NAMES, MatmulConvNode, MatmulNode, Schedul
                         SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
-from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmNode,
+from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmKernelNode, LlmNode,
                          llm_c_helpers)
 from ..vit_nodes import vit_c_helpers
 from ..tts_nodes import tts_c_helpers
@@ -69,7 +69,8 @@ class _SourceMixin:
 
     def _source_includes(self) -> str:
         stdio = '#include <stdio.h>    /* fopen, fread, snprintf, fprintf */\n' \
-                if (self.large_weight_tensors or self._host_nodes) else ''
+                if (self.large_weight_tensors or self._host_nodes
+                    or self._uses_activation_unit) else ''
         stdlib = '#include <stdlib.h>   /* malloc, free (host staging buffers) */\n' \
                 if (self._host_op_nodes or self._host_nodes) else ''
         mathh = '#include <math.h>     /* host ops: exp, sqrt, tanh, erf, nearbyint */\n' \
@@ -704,10 +705,13 @@ class _SourceMixin:
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
         # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
-        need_run_op    = any(isinstance(sn, ScheduledNode) for sn in nodes)
+        need_run_op    = self._has_vectorop_nodes
+        # run_op_act(): fused activations, and the LLM nodes' activation calls
         need_run_op_act = any(
-            isinstance(sn, ScheduledNode) and sn.act != 0 for sn in nodes
+            (isinstance(sn, ScheduledNode) and not sn.uses_run_op)
+            or (isinstance(sn, LlmKernelNode) and sn.uses_activation_unit) for sn in nodes
         )
+        need_act_unit = self._uses_activation_unit
         need_run_matmul = self._has_matmul_nodes
         need_run_matmul_at = any(
             isinstance(sn, MatmulNode) and sn.outer_count > 1
@@ -760,6 +764,20 @@ class _SourceMixin:
         conv_var = conv_kd.c_var if conv_kd else "s_convkernel"
         pool_var = pool_kd.c_var if pool_kd else "s_poolkernel"
 
+        # The alpha register (LeakyReLU's slope) exists only in IPs with the
+        # activation unit; every program writes it (a register keeps the last
+        # program's value).  A program that uses the unit writes it plainly —
+        # with an older driver it does not compile, and inference_init()
+        # checks the IP — the others guarded, so the older driver compiles.
+        alpha_reg = ("#ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA\n"
+                     f"    XVectoropkernel_Set_alpha(&{vop_var}, 0u);\n"
+                     "#endif\n")
+        alpha_arg = (f"    XVectoropkernel_Set_alpha(&{vop_var}, alpha);\n" if need_act_unit
+                     else "#ifdef XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA\n"
+                          f"    XVectoropkernel_Set_alpha(&{vop_var}, alpha);\n"
+                          "#else\n"
+                          "    (void)alpha;\n"
+                          "#endif\n")
         if need_run_op:
             parts.append(
                 "/*\n"
@@ -782,7 +800,7 @@ class _SourceMixin:
                 " *     flow kernel-to-kernel never touch the CPU, so they need no sync.\n"
                 " *\n"
                 " *   a      input buffer A  (always required)\n"
-                " *   b      input buffer B  (NULL for unary ops: RELU, RELU6)\n"
+                " *   b      input buffer B  (NULL for unary ops: op >= RELU)\n"
                 " *   c      output buffer C (must not alias a or b)\n"
                 " *   size   elements per inner chunk\n"
                 " *   op     VECTOROP_* constant\n"
@@ -790,9 +808,10 @@ class _SourceMixin:
                 " *   a_inc  element stride for a per outer step (0 = a repeats)\n"
                 " *   b_inc  element stride for b per outer step (0 = b repeats)\n"
                 " *\n"
-                " * run_op writes act = 0 (no fused activation; the register keeps its\n"
-                " * last value across runs, so it is written every call).  A node with\n"
-                " * a fused Relu / Clip(0,6) uses run_op_act, which takes the act code.\n"
+                " * run_op writes act = 0 and alpha = 0 (no fused activation; a register\n"
+                " * keeps its last value across runs, so they are written every call).\n"
+                " * A node with a fused activation or a LeakyReLU slope uses run_op_act,\n"
+                " * which takes the act code and alpha.\n"
                 " *\n"
                 " * Alignment contract (VectorOP.h): every run start of a, b and c is\n"
                 " * 16-byte aligned (buffer bases are 64-byte aligned, a_inc / b_inc\n"
@@ -820,6 +839,7 @@ class _SourceMixin:
                 f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
                 f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
                 f"    XVectoropkernel_Set_act(&{vop_var}, VECTOROP_ACT_NONE);\n"
+                + alpha_reg +
                 f"    XVectoropkernel_Start(&{vop_var});\n"
                 "}\n"
             )
@@ -828,8 +848,9 @@ class _SourceMixin:
             parts.append(
                 "/*\n"
                 " * run_op_act() — run_op() with a fused activation: the kernel applies\n"
-                " * VECTOROP_ACT_RELU / VECTOROP_ACT_RELU6 to the op result before\n"
-                " * writing c, so Add -> Relu is one pass over the data.\n"
+                " * act (VECTOROP_ACT_*) to the op result before writing c, so\n"
+                " * Add -> Relu / Gelu is one pass over the data; alpha is LeakyReLU's\n"
+                " * slope (alpha / 65536) for VECTOROP_LEAKY_RELU / VECTOROP_ACT_LEAKY_RELU.\n"
                 " */\n"
                 "static void run_op_act(\n"
                 "    inference_buf_t *a,\n"
@@ -840,7 +861,8 @@ class _SourceMixin:
                 "    unsigned         outer,\n"
                 "    unsigned         a_inc,\n"
                 "    unsigned         b_inc,\n"
-                "    unsigned         act)\n"
+                "    unsigned         act,\n"
+                "    unsigned         alpha)\n"
                 "{\n"
                 f"    XVectoropkernel_Set_a(&{vop_var}, inference_buf_phys(a));\n"
                 f"    XVectoropkernel_Set_b(&{vop_var}, b ? inference_buf_phys(b) : (u64)0);\n"
@@ -851,6 +873,7 @@ class _SourceMixin:
                 f"    XVectoropkernel_Set_a_inc(&{vop_var}, a_inc);\n"
                 f"    XVectoropkernel_Set_b_inc(&{vop_var}, b_inc);\n"
                 f"    XVectoropkernel_Set_act(&{vop_var}, act);\n"
+                + alpha_arg +
                 f"    XVectoropkernel_Start(&{vop_var});\n"
                 "}\n"
             )
@@ -1520,10 +1543,26 @@ class _SourceMixin:
         # One Initialize call per active kernel
         init_calls = []
         for kd in active:
+            probe = ""
+            if kd.c_type == "XVectoropkernel" and self._uses_activation_unit:
+                # An IP without the activation unit has no alpha register (it
+                # reads 0) and would pass the activation ops through unchanged.
+                probe = (
+                    "    /* LeakyReLU / SiLU / GELU run in VectorOPKernel's activation unit\n"
+                    "     * (doc/plans/ACTIVATIONS_PLAN.md): an IP without it has no alpha\n"
+                    "     * register and would pass these ops through unchanged. */\n"
+                    f"    XVectoropkernel_Set_alpha(&{kd.c_var}, 0x5A5Au);\n"
+                    f"    if (XVectoropkernel_Get_alpha(&{kd.c_var}) != 0x5A5Au) {{\n"
+                    "        fprintf(stderr, \"inference_init: the VectorOPKernel has no activation \"\n"
+                    "                \"unit (the bitstream predates it)\\n\");\n"
+                    "        rc = -1;\n"
+                    "        goto fail;\n"
+                    "    }\n"
+                )
             init_calls.append(
                 f"    /* Initialise {kd.name} driver (UIO: {kd.uio_default}) */\n"
                 f"    rc = {kd.c_type}_Initialize(&{kd.c_var}, {kd.init_param});\n"
-                "    if (rc != 0) goto fail;\n"
+                "    if (rc != 0) goto fail;\n" + probe
             )
         init_calls_str = "\n".join(init_calls)
 

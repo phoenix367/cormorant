@@ -20,7 +20,7 @@ HLS ConvKernel).
 | synthesis report | `$BUILD_DIR/kernels/matmul_rtl/synth/` (`timing.rpt`, `utilization.rpt`, the make output's `RESULT` line) | `$BUILD_DIR/kernels/vectorop_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/pool_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/conv_rtl/synth/` (also `timing_paths.rpt`: one path per endpoint) |
 | RTL behaviour test | `behavior_test_matmul` | `behavior_test_vectorop` | `behavior_test_pool` | `behavior_test_conv` |
 | report (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_op_test_report.json` | `vector_op_test_report.json` | `pooling_test_report.json` | `conv_test_report.json` |
-| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (119 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (63 cases) |
+| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (201 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (63 cases) |
 | fixture target → output | `gen_matmul_test_data` → `$BUILD_DIR/matmul_test_data/` | `gen_vectorop_test_data` → `$BUILD_DIR/vectorop_test_data/` | `gen_pool_test_data` → `$BUILD_DIR/pool_test_data/` | `gen_conv_test_data` → `$BUILD_DIR/conv_test_data/` |
 | test-stand testbench | `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` | `hw/cormorant_test_stand/kernels/pooling_test/pooling_test.srcs/sim_1/new/pooling_tb.sv` | `hw/cormorant_test_stand/kernels/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` |
 | block-design testbench (`hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`) | `mm_regmap.svh`, `mm_classes.svh`, `tb_functions.svh` | `vop_regmap.svh`, `vop_classes.svh`, `tb_functions.svh` | `pk_regmap.svh`, `pk_classes.svh`, `tb_functions.svh` | `conv_regmap.svh`, `conv_classes.svh`, `tb_functions.svh` |
@@ -96,11 +96,13 @@ ctest -R Conv --output-on-failure                     # K=conv (~2 min: TestConv
   table against `rtl/mm_ctrl_s_axi.sv`.  Edits to `kernels/matmul/` (the C++
   reference model) change the oracle: then Gate 1b decides whether the
   fixtures move.
-- `lint_vectorop_rtl` likewise; `TestVectorOpRtl` runs the 119 checked-in
-  fixtures and 300 random cases (seed 1) against the HLS C++ under
+- `lint_vectorop_rtl` likewise; `TestVectorOpRtl` runs the 201 checked-in
+  fixtures, 300 random cases (seed 1) and 8 jobs over every Q8.8 input of
+  the activations (ACTIVATIONS_PLAN) against the HLS C++ under
   randomised memory timing, with AXI protocol checks and at most 16 bursts
   outstanding per port; `VectorOpRtlDriver` checks the driver table against
-  `rtl/vo_ctrl_s_axi.sv`.  For more coverage run the testbench by hand:
+  `rtl/vo_ctrl_s_axi.sv`, `VectorOpRtlActRom` that `rtl/vo_act_rom.sv` is
+  what `scripts/gen_act_rom.py` writes.  For more coverage run the testbench by hand:
   `kernels/vectorop_rtl/vl/Vtb --random 500 --seed 2026 --timing rand --quiet`
   (also `--timing slow`, `--perf` for cycle counts with ideal memory).
 - `lint_pool_rtl` likewise; `TestPoolRtl` runs the 45 checked-in fixtures
@@ -133,7 +135,7 @@ ctest -R Conv --output-on-failure                     # K=conv (~2 min: TestConv
   / `TestMatmulSim PASSED`; 19 of the 58 are GEMV cases),
   `./kernels/matmul/TestMatmulBlas` (`24/24 tests passed` /
   `TestMatmulBlas PASSED`), `./kernels/vectorop/TestSimulation`
-  (`All 119 tests passed.`), `./kernels/pool/TestPoolingSim`
+  (`All 212 tests passed.`), `./kernels/pool/TestPoolingSim`
   (`51 / 51 tests passed.`; `[FAIL]` / `failures=N/M` lines with N > 0 are
   regressions).  Counts grow with the suites — the passed count must equal
   the total.
@@ -199,10 +201,14 @@ make synth_vectorop_rtl 2>&1 | grep -E "^RESULT|ERROR"    # ~5 min
 grep -E "^\| (CLB LUTs|CLB Registers|Block RAM Tile|DSPs) " kernels/vectorop_rtl/synth/utilization.rpt
 ```
 
-- WNS ≥ 0 at 300 MHz, as for MatmulKernel.  Record (VECTOROP_RTL_PLAN
-  phase 0, 2026-10-05): WNS +0.248 ns (Fmax ≈ 324 MHz), 5 243 LUT,
-  6 453 FF, 10 BRAM36, 11 DSP.  The burst generators are the critical
-  paths (VECTOROP_RTL_KERNEL §6: no full-width add after the burst length).
+- WNS ≥ 0 at 300 MHz, as for MatmulKernel.  Record (ACTIVATIONS_PLAN,
+  2026-10-06, with the activation unit): WNS +0.277 ns (Fmax ≈ 327 MHz),
+  6 173 LUT, 8 640 FF, 14 BRAM36, 19 DSP (without it: +0.453 ns, 5 418 LUT,
+  7 431 FF, 10 BRAM36, 11 DSP).  The read / write ports' paths are the
+  critical ones (VECTOROP_RTL_KERNEL §6: no full-width add after the burst
+  length).  Also run `make neteq_vectorop_rtl` after an RTL change (the
+  synthesised netlist against the RTL in lockstep) and grep the synthesis
+  log for `Synth 8-4767`.
 - Its register map: ctest `VectorOpRtlDriver` and the fact registry
   (`registers.VectorOPKernel`); its m_axi bus parameters (outstanding
   counts, burst lengths, read / write only) are declared in
@@ -280,7 +286,7 @@ make behavior_test_matmul             # or behavior_test_vectorop
   [ck] MatmulKernel: PASS  (50/50)  …/matmul_op_test_report.json
   ```
 
-  (`VectorOPKernel … total=119 passed=119`, `vector_op_test_report.json`;
+  (`VectorOPKernel … total=201 passed=201`, `vector_op_test_report.json`;
   `PoolingKernel … total=45 passed=45`, `[ck] PoolingKernel: PASS  (45/45)`,
   `pooling_test_report.json`; `ConvKernel … total=63 passed=63`,
   `[ck] ConvKernel: PASS  (63/63)`, `conv_test_report.json`).
@@ -361,14 +367,16 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    make sim_hw_kv260
    ```
 
-   Pass: `##  TOTAL: 68 / 68 passed` and `##  ALL TESTS PASSED`
-   (VectorOPKernel 22, ConvKernel 17, MatmulKernel 10, PoolingKernel 19)
+   Pass: `##  TOTAL: 73 / 73 passed` and `##  ALL TESTS PASSED`
+   (VectorOPKernel 27, ConvKernel 17, MatmulKernel 10, PoolingKernel 19)
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
    in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).
    It uses `$BUILD_DIR/ip_repo_kv260` (the four RTL IPs), so all four
    must have been packaged in this build tree.  With the RTL ConvKernel
-   (CONV_RTL_PLAN phase 1, 2026-10-05) 68/68.  It upgrades the IPs in `hw/cormorant_hw_128` and
+   (CONV_RTL_PLAN phase 1, 2026-10-05) 68/68; with the VectorOP activation unit
+   (ACTIVATIONS_PLAN, 2026-10-06, five more VectorOP cases) 73/73 in 333 s
+   including the packaging of all four IPs.  It upgrades the IPs in `hw/cormorant_hw_128` and
    modifies its tracked `.bd` / `.xci` files: do not commit those.
 3. Board: the new register must be proven with a write-then-read before
    trusting results, and generated projects / libraries regenerated (a

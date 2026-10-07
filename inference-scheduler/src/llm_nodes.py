@@ -967,8 +967,18 @@ class LlmAttnPrepNode(LlmNode):
         return qx
 
 
+class LlmKernelNode:
+    """An LLM-domain node that issues hardware-kernel calls on tensors with
+    exponents (numeric.check lets it through): it occupies its kernel's lane
+    (``kernel_name``), emits its calls (``emit_call``) and computes its result
+    in the simulator (``reference``) — LlmAttnConvNode (ConvKernel),
+    vit_nodes.VitGeluVopNode (VectorOPKernel)."""
+    is_llm_op: ClassVar[bool] = True
+    uses_activation_unit: ClassVar[bool] = False
+
+
 @dataclass
-class LlmAttnConvNode:
+class LlmAttnConvNode(LlmKernelNode):
     """One ConvKernel call of the FPGA prefill attention (KV group ``group``)
     whose key count is a RUNTIME dimension: keys = roundup(pos + n, Q),
     computed in the run function from the entry's pos / n inputs (C
@@ -2632,7 +2642,7 @@ def llm_c_helpers() -> str:
 
 __all__ = ("LLM_DOMAIN", "LLM_OP_FACTORIES", "LlmNode", "LlmEmbedNode", "LlmResAddNode",
            "LlmRMSNormNode", "LlmSiluMulNode", "LlmAttentionNode", "LlmSelectRowNode",
-           "LlmDequantNode", "LlmAttnPrepNode", "LlmAttnConvNode", "LlmAttnSoftmaxNode",
+           "LlmDequantNode", "LlmAttnPrepNode", "LlmKernelNode", "LlmAttnConvNode", "LlmAttnSoftmaxNode",
            "LlmAttnMergeNode", "RuntimeItem", "HostTable", "llm_c_helpers", "dot8", "rope",
            "silu_table", "sexp_table", "attn_keys", "v_row_base", "KEY_QUANTUM",
            "TABLE_FILE_BYTES",

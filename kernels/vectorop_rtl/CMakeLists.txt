@@ -33,8 +33,8 @@ enable_testing()
 set(VO_RTL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(VO_RTL_SOURCES
     rtl/vo_pkg.sv rtl/vo_fifo.sv rtl/vo_rs.sv rtl/vo_ctrl_s_axi.sv rtl/vo_burstgen.sv
-    rtl/vo_rd_port.sv rtl/vo_wr_port.sv rtl/vo_div.sv rtl/vo_compute.sv
-    rtl/vo_core.sv rtl/VectorOPKernel.v)
+    rtl/vo_rd_port.sv rtl/vo_wr_port.sv rtl/vo_div.sv rtl/vo_act_rom.sv rtl/vo_act.sv
+    rtl/vo_compute.sv rtl/vo_core.sv rtl/VectorOPKernel.v)
 list(TRANSFORM VO_RTL_SOURCES PREPEND "${VO_RTL_DIR}/")
 set(VO_RTL_TB_SOURCES
     "${VO_RTL_DIR}/tb/verilator/tb_main.cpp"
@@ -75,6 +75,9 @@ target_compile_options(vectorop_rtl_driver PRIVATE -Wall -Wextra -Werror)
 add_custom_target(driver_vectorop_rtl DEPENDS vectorop_rtl_driver)
 add_test(NAME VectorOpRtlDriver
          COMMAND "${Python3_EXECUTABLE}" "${VO_RTL_DIR}/scripts/gen_driver.py" --check)
+# rtl/vo_act_rom.sv (the SiLU / GELU tables) is what scripts/gen_act_rom.py writes
+add_test(NAME VectorOpRtlActRom
+         COMMAND "${Python3_EXECUTABLE}" "${VO_RTL_DIR}/scripts/gen_act_rom.py" --check)
 
 # ---------------------------------------------------------------------------
 # The HLS oracle: kernels/vectorop/kernel/VectorOP.cpp built with the Vitis
@@ -97,7 +100,12 @@ if(VO_RTL_HLS_INCLUDE)
         -CFLAGS -I${VO_RTL_REPO}/kernels/vectorop/include -CFLAGS -I${VO_RTL_HLS_INCLUDE}
         -CFLAGS -Wno-unused -CFLAGS -Wno-unknown-pragmas)
     message(STATUS "VectorOPKernel RTL: testbench oracle = the HLS kernel's C++ (${VO_RTL_HLS_INCLUDE})")
-    set(_vo_rtl_ctest_random --random ${VO_RTL_RANDOM_CASES})
+    # every Q8.8 input through each activation (data mode 3: a[i] = i): LeakyReLU
+    # at alpha 0.01 / 0.5 (ties), SiLU, GELU, GELU tanh, and acts after ADD / DIV
+    set(_vo_rtl_ctest_random --random ${VO_RTL_RANDOM_CASES}
+        --case "65536 6 1 0 0 0 3 655" --case "65536 6 1 0 0 0 3 32768"
+        --case "65536 7 1 0 0 0 3" --case "65536 8 1 0 0 0 3" --case "65536 9 1 0 0 0 3"
+        --case "65536 0 1 0 0 4 3" --case "65536 0 1 0 0 6 3" --case "8192 3 1 0 0 5 3")
 else()
     message(STATUS "VectorOPKernel RTL: Vitis HLS headers not found — the testbench checks the fixtures only")
     set(_vo_rtl_ctest_random)

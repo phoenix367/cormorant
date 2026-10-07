@@ -28,6 +28,13 @@ from src.graph import OnnxGraph
 from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
                             OneHotNode, SliceNode, TransposeNode)
 from src.nodes import ReshapeNode, SchedulerError
+from unittest import mock
+
+from src import _vectorop_hw_config
+
+# These test the host GELU op: on a platform with VectorOPKernel's activation
+# unit a matching Gelu runs there instead (test_activations.py).
+_host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
 
 DT = AP_FIXED_16_8
 _CC = shutil.which("cc") or shutil.which("gcc")
@@ -265,6 +272,7 @@ class TestLayerNormGelu(_Base):
         self.assertEqual((g.nodes[0].rows, g.nodes[0].n), (3, 24))
         self.assertIsNone(g.nodes[0].beta)
 
+    @_host_gelu
     def test_native_gelu_both_forms(self):
         for approx in ("tanh", "none"):
             p = _save(self.d, [oh.make_node("Gelu", ["X"], ["Y"], approximate=approx)],
@@ -376,6 +384,7 @@ class TestLookupTables(_Base):
     all 2^16 (max - x) differences (phase 2B); both must reproduce the
     per-element double computation (== the simulator) bit for bit."""
 
+    @_host_gelu
     def test_gelu_exhaustive(self):
         bert_c = (float(np.float32(0.044715)), float(np.float32(math.sqrt(2 / math.pi))))
 
@@ -396,6 +405,7 @@ class TestLookupTables(_Base):
                 self.assertIn("host_lut_map(", g.nodes[0].c_call(["in0"], "out", "tmp", [], DT)[0])
                 self.assertIn(f"static Data_t *{g.nodes[0].lut_name} = NULL;", src)
 
+    @_host_gelu
     def test_gelu_lut_shared_by_equal_constants(self):
         p = _save(self.d, [oh.make_node("Gelu", ["X"], ["A"], approximate="tanh"),
                            oh.make_node("Gelu", ["A"], ["B"], approximate="tanh"),

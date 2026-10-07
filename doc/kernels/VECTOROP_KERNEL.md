@@ -5,8 +5,10 @@
 `VectorOPKernel` is a Vitis HLS kernel implementing runtime-selected
 element-wise vector operations on the Xilinx KV260 FPGA. It is one of four
 hardware kernels in the `axi_demo` project. The kernel reads up to two
-equal-length element arrays, applies one of six operations chosen by an
-AXI-Lite register, and writes the results to a third array. It also supports
+equal-length element arrays, applies one of ten operations chosen by an
+AXI-Lite register (six arithmetic ops and, since
+[ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md), four activation ops), and
+writes the results to a third array. It also supports
 a broadcasting mode (`outer` / `a_inc` / `b_inc`) so a smaller operand can be
 re-applied across a larger one without an explicit tile copy.
 
@@ -62,17 +64,20 @@ must cover it.  The block-design instance widths must equal the IP defaults
 |----------|------|-------------|
 | `a`, `b`, `c` | `uint64_t` | Physical DDR base addresses |
 | `size` | `unsigned` | Elements per inner chunk |
-| `op` | `unsigned` | Operation selector (`Op` enum, 0–5) |
+| `op` | `unsigned` | Operation selector (`Op` enum, 0–9) |
 | `outer` | `unsigned` | Number of outer broadcast iterations (1 = non-broadcast) |
 | `a_inc` | `unsigned` | Element stride for `a` per outer iteration (0 = `a` repeats) |
 | `b_inc` | `unsigned` | Element stride for `b` per outer iteration (0 = `b` repeats) |
-| `act` | `unsigned` | Fused activation applied after the op: 0 none, 1 relu, 2 relu6 (`Act` enum; register offset 0x5C, appended last) |
+| `act` | `unsigned` | Fused activation applied after the op: 0 none, 1 relu, 2 relu6, 3 leaky relu, 4 silu, 5 gelu, 6 gelu tanh (`Act` enum; register offset 0x5C) |
+| `alpha` | `unsigned` | LeakyReLU's slope, `alpha[15:0] / 65536` (0 ≤ slope < 1; bits 31:16 ignored; offset 0x64, appended last) |
 | `return` | — | `ap_ctrl_hs` (start / done / idle / ready) |
 
 The kernel processes `outer × size` elements:
-`c[o·(a_inc+b_inc) + i] = act(op(a[o·a_inc + i], b[o·b_inc + i]))`.
-The scheduler uses `act` to fold a following `Relu` / `Clip(0,6)` into the
-producing call (one pass over the data instead of two).
+`c[o·(a_inc+b_inc) + i] = act(op(a[o·a_inc + i], b[o·b_inc + i]))`, where
+an activation op (6–9) applies its own activation and ignores `act`
+(`job_act` in `VectorOP.h`).  The scheduler uses `act` to fold a following
+`Relu` / `Clip(0,6)` into the producing call (one pass over the data instead
+of two).
 
 ---
 
@@ -89,8 +94,21 @@ The operation is chosen at runtime by the `op` register (`Op` enum in
 | 3 | `OP_DIV` | `saturate_cast(a[i] / b[i])`, `b[i] = 0 → 0` | binary |
 | 4 | `OP_RELU` | `max(a[i], 0)` | unary |
 | 5 | `OP_RELU6` | `min(max(a[i], 0), 6)` | unary |
+| 6 | `OP_LEAKY_RELU` | `a[i] ≥ 0 ? a[i] : alpha · a[i]` (the `alpha` register) | unary |
+| 7 | `OP_SILU` | `a[i] · sigmoid(a[i])` | unary |
+| 8 | `OP_GELU` | `a[i] · Φ(a[i]) = a[i] / 2 · (1 + erf(a[i] / √2))` | unary |
+| 9 | `OP_GELU_TANH` | `a[i] / 2 · (1 + tanh(√(2/π) · (a[i] + 0.044715 a[i]³)))` | unary |
 
-For the two unary ops (`op ≥ OP_RELU`), the `b` loader issues **no** AXI
+Ops 6–9 are the activations of `act` codes 3–6 applied to `a`; the same
+four can follow any op through `act`.  Their results are the exact function
+of the Q8.8 input rounded to the nearest Q8.8 value, ties to even
+(`round_cast`) — the host ops' write-back rounding; IEEE double with the
+formulas of `act_fn` (`VectorOP.cpp`) gives exactly that for every input
+(the nearest rounding tie is 1.6e-5 LSB away).  The RTL kernel computes
+SiLU and both GELUs from a table of `f(−|x|)` and LeakyReLU in a DSP
+(VECTOROP_RTL_KERNEL §2).
+
+For the unary ops (`op ≥ OP_RELU`), the `b` loader issues **no** AXI
 reads on `gmem1` and pushes nothing; the compute stage reads `b_s` only for
 binary ops, and `b`'s base address is ignored.
 
@@ -211,6 +229,9 @@ clamping to \[-2^(I-1), 2^(I-1) − 2^-(W-I)\]. The primary template is an
 identity pass-through, so `float` / `double` / integer builds carry no
 saturation cost. Every binary op applies `saturate_cast` to its result
 (`OP_DIV` returns 0 for `b = 0`); `OP_RELU` / `OP_RELU6` clamp directly.
+LeakyReLU, SiLU and the GELUs round instead (`round_cast`: to nearest, ties
+to even, `AP_RND_CONV` + `AP_SAT`) — of the op result as it is truncated
+above when they follow an op through `act`.
 
 ---
 
@@ -218,21 +239,25 @@ saturation cost. Every binary op applies `saturate_cast` to its result
 
 C-simulation tests compiled with GCC against the Vitis HLS headers (no
 Vitis tools run). Each case runs the kernel against a naive scalar
-reference; tolerance is 1 LSB (1/256) for `ap_fixed`, relative `1e-5` for
-floating point, and exact for the saturation boundary cases.  Every case also checks the alignment contract: the tail
+reference; exact for `ap_fixed` (the reference truncates the op result and
+rounds the activations as the kernel does; 1 LSB was allowed until the
+activation ops), relative `1e-5` for floating point.  Every case also checks the alignment contract: the tail
 lanes of each run's last output word read 0 and every other gap position is
 left untouched.
 
 | Category | Coverage |
 |----------|----------|
-| All six operations | `ADD`, `SUB`, `MUL`, `DIV`, `RELU`, `RELU6` |
+| All ten operations | `ADD`, `SUB`, `MUL`, `DIV`, `RELU`, `RELU6`, `LEAKY_RELU`, `SILU`, `GELU`, `GELU_TANH` |
 | Sizes | 1, 3, 8, 9, 13, 64, 255, 256, 1023, 1024, 4097 (partial tail words) |
 | Saturation | Positive / negative overflow boundary cases (`ap_fixed` only) |
 | Broadcast / geometry | chunks 9, 12 and 13 at stride 16 (`a`- and `b`-advancing), `outer` 1000 × 16, stride-0 operand at (2048) and past (2100) the replay bound, multi-piece runs, runs > 16 × 256 words |
-| Fused activation | `act` = relu / relu6 on binary, `DIV`, unary and broadcast calls |
+| Fused activation | `act` = relu / relu6 / leaky relu / silu / gelu / gelu tanh on binary, `DIV`, unary and broadcast calls; an activation op ignores `act` |
+| Activation boundaries | LeakyReLU rounding ties (slope 0.5, 1 − 2⁻¹⁶), ignored `alpha` bits; the ends of the SiLU / GELU tables and of the Q8.8 range |
+| Every input (verify mode only) | each activation on all 65 536 Q8.8 values, exactly (LeakyReLU at six slopes, also as `act` after `ADD`) |
 
 `make gen_vectorop_test_data` re-runs the test in `--dump-data` mode to emit
-hex fixtures plus a `manifest.txt` (with an `act` column) for the HDL
+hex fixtures plus a `manifest.txt` (with `act` and `alpha` columns; the
+activation cases come after the older ones, which keep their numbers) for the HDL
 testbench (16-bit `ap_fixed` builds only; output directory
 `VA_TEST_DATA_DIR`, default `<build>/vectorop_test_data`), keeping RTL-level
 tests bit-identical to the C++ reference.  The fixtures the behavioural test
@@ -302,17 +327,17 @@ kernel instead (`make package_vectorop_rtl`).
 | Aspect | Details |
 |--------|---------|
 | **Supported ONNX ops** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` |
-| **Operations** | 6, runtime-selected via the `op` AXI-Lite register |
+| **Operations** | 10, runtime-selected via the `op` AXI-Lite register (6–9: LeakyReLU, SiLU, GELU, GELU tanh) |
 | **Data type** | `ap_fixed<16,8>` (default; configurable via `VA_DATA_TYPE`) |
 | **Architecture** | 4-stage `HLS DATAFLOW` pipeline (load A, load B, compute, store C) on 128-bit words, 8 elements per cycle |
 | **Initiation interval** | II=1 on every loop; 8 elements/cycle for all ops except `OP_DIV` (1 element/cycle, one divider) |
 | **Inter-stage FIFOs** | `a_s` / `b_s` / `c_s`, 128-bit, depth 64 (LUTRAM) |
 | **Vector length** | Pure runtime register — no compile-time bound |
 | **Broadcasting** | `outer` / `a_inc` / `b_inc` registers; stride-0 operand ≤ 2048 elements replayed from on-chip RAM, contiguous runs streamed as one range |
-| **Fused activation** | `act` register: none / relu / relu6 after the op |
-| **Unary ops** | `OP_RELU` / `OP_RELU6` issue no `gmem1` reads |
+| **Fused activation** | `act` register: none / relu / relu6 / leaky relu / silu / gelu / gelu tanh after the op; `alpha` register: the LeakyReLU slope |
+| **Unary ops** | `OP_RELU` … `OP_GELU_TANH` (op ≥ 4) issue no `gmem1` reads |
 | **AXI master ports** | 3 × 128-bit `burst_maxi` (gmem0 `a`, gmem1 `b`, gmem2 `c`); run starts 16-byte aligned, tail word of `c` written whole |
-| **AXI-Lite registers** | 9 scalars/pointers + `return` |
+| **AXI-Lite registers** | 10 scalars/pointers + `return` |
 | **Saturation** | `saturate_cast` with `AP_TRN` + `AP_SAT` on every result |
 | **AXI-Lite base address** | `0xA000_0000` |
 | **Driver prefix** | `xvectoropkernel` |

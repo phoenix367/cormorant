@@ -22,7 +22,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
-| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` |
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)`; `LeakyRelu`, SiLU (`x · Sigmoid(x)`), `Gelu` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` / activation; LeakyReLU, SiLU and GELU run in the activation unit when the platform has it (`kernels.vectorop.activations`, `src/vectorop_act.py`, [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — a `Gelu` it cannot run stays a host op |
 | **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image where that is faster or the weight's shared layout (on the HLS kernel of older bitstreams: single-row MatMuls) — its GEMV / image path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
@@ -38,12 +38,37 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 - `Gemm` — decomposed to `MatMul` + optional `Add` at model load time
   (`alpha=1, beta=1, transA=0` required; `transB=1` is accepted for a
   constant 2-D B, which is transposed offline into a `<B>_T` initializer).
-- `Relu` / `Clip(0,6)` after a VectorOP node — folded into that node's
-  call via the kernel's `act` register (`run_op_act()`), when the producer's
-  output has no other consumer and is not a graph output
-  (`OnnxGraph(fuse_act=True)`, the CLI default; `--no-fuse-act` disables
-  it; `OnnxGraph.act_fused_count` reports the number folded).  A `Relu`
-  after a Conv / MatMul / Pool node or on a graph input stays a call.
+- `Relu` / `Clip(0,6)` — and, on the activation unit, `LeakyRelu`, SiLU and
+  `Gelu` — after a VectorOP node: folded into that node's call via the
+  kernel's `act` register (`run_op_act()`, which also takes LeakyReLU's
+  `alpha`), when the producer's output has no other consumer and is not a
+  graph output, and the producer is not itself an activation op (the kernel
+  ignores `act` after those) (`OnnxGraph(fuse_act=True)`, the CLI default;
+  `--no-fuse-act` disables it; `OnnxGraph.act_fused_count` reports the
+  number folded).  A `Relu` after a Conv / MatMul / Pool node or on a graph
+  input stays a call.
+
+**VectorOPKernel's activation unit** (`src/vectorop_act.py`,
+[ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — when the platform's
+bitstream has it (`kernels.vectorop.activations`; `AXI_VECTOROP_ACTIVATIONS`
+overrides) and the tensors are plain `ap_fixed<16,8>` DMA tensors (no
+power-of-two exponent, not host memory):
+- `Gelu` (native or a fused pattern) → `VECTOROP_GELU` / `VECTOROP_GELU_TANH`
+  when the node's Q8.8 function equals the kernel's on all 65 536 inputs
+  (the graph's float32 constants do: BERT's GELUs are bit-identical on
+  either side), else the host op as before;
+- `LeakyRelu` → `VECTOROP_LEAKY_RELU`, slope `round(alpha · 65536)` in the
+  `alpha` register (0 ≤ alpha < 1; the simulator uses the quantised slope);
+- `Mul(x, Sigmoid(x))` → SiLU (`fusion.py` fuses it to a `Silu` node only
+  when the unit is there; else `Sigmoid` is rejected with a hint).
+
+The simulator rounds these the kernel's way: the op result truncated to
+Q8.8 as for every op, then the activation in double rounded to nearest-even
+(`vectorop_act.apply`).  A program that uses the unit writes `alpha`
+unguarded and checks at `inference_init()` that the IP has the register
+(an older IP reads 0 and passes ops 6–9 through unchanged); the others write
+`alpha = 0` only where the driver has it (`#ifdef
+XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
 
 **Host-CPU ops (C code inside `inference_run()`, no hardware call):**
 - **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Gather,
@@ -127,7 +152,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1651 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1674 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -241,8 +266,9 @@ inference_scheduler.py          CLI, argument parsing
    tensors) and `numeric.encode_matmul_weights` (rank-1 weight exponents,
    before any packing or re-layout) / `numeric.encode_conv_weights`.
 10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
-   into the producing `ScheduledNode` (`act`, `fused_nodes`, output tensor
-   re-pointed) and renumbers node indices.
+   and the activation-unit ops into the producing `ScheduledNode` (`act`,
+   `alpha`, `fused_nodes`, output tensor re-pointed) and renumbers node
+   indices.
 11. `matmul_lowering.lower_matmuls()` (`matmul_on_conv="auto"`, the
    default) — MatMuls estimated faster on ConvKernel become
    `MatmulConvNode`s, their constant B re-laid out when `kw > 1`
@@ -634,6 +660,7 @@ graph output.
 | GELU tanh (BERT, 8 nodes) | `Pow(x, 3)` \| `x·(x·x)`, `Mul(c1≈0.044715)`, `Add(x)`, `Mul(c2≈√(2/π))`, `Tanh`, `Add(1)`, then `x·(0.5·a)` \| `(x·a)·0.5` \| `(x·0.5)·a` | `Gelu(approximate="tanh")` with the graph's c1 / c2 |
 | GELU erf (PyTorch export) | `Div(x, k≈√2)` \| `Mul(x, k≈1/√2)`, `Erf`, `Add(1)`, then the same three tails | `Gelu(approximate="none")` with the graph's k |
 | native `LayerNormalization` / `Gelu` | — | dispatched directly (ONNX form / exact constants) |
+| SiLU (PyTorch's SiLU / Swish export) | `s = Sigmoid(x)` with no other consumer, `Mul(x, s)` \| `Mul(s, x)` — only where VectorOPKernel has the activation unit | `Silu` (VectorOPKernel op 7) |
 
 Constants are compared with a relative tolerance of 1e-5 (c1, c2, k) or
 exactly (0.5, 1, 2, 3).  A near miss is left alone and its `ReduceMean` /
@@ -881,6 +908,14 @@ policy pow2+p12, which the simulation reproduces bit for bit):
   - GELU reads a 65 536-entry int16 table of the rounded outputs per
     (input, output) exponent pair (the bias added as an integer first),
     filled with libm exp in the tanh form.
+  - Where the GELU's output is at 2^-8 on every channel (11 of SmolVLM's 12
+    layers) and the platform's VectorOPKernel has the activation unit, it
+    runs there instead (`VitGeluVopNode`, [`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
+    §2.1): `ADD` of the bias row `ba` (at the input's exponents, plus half
+    a Q8.8 LSB), then in place `MUL` by the row `sc` = 2^(8 − f) with act
+    `GELU_TANH` — the input rounded to 2^-8 before the exact GELU (policy
+    `pow2+p12+vgelu` of `vlm_study.py`; `AXI_VECTOROP_ACTIVATIONS=0`: the
+    host op, policy `pow2+p12`).
 - **Per layer, kernels:** MatMuls with per-channel power-of-two exponents,
   and attention per head.
   - `VitAttnPrep` writes the q.Kᵀ input image and the K / V "caches": one
@@ -930,6 +965,12 @@ fixed-size `chunk` entry (TTS_PLAN §4).
   - Transposed convs are polyphase kernel-3 convs followed by
     `TtsInterleave`.
   - The k7 dilation-12 conv is split into tap groups summed by `TtsSum`.
+- **Residual sums on VectorOPKernel** ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
+  §2.2): the decoder keeps one exponent per stage (`piper.vop_exponents`),
+  so each residual sum, and each split conv's tap-group sum, adds two whole
+  tensors at one exponent — `TtsAddVopNode`, one `ADD` (the exact sum
+  saturated: the host op's bits).  The stage averages and the flows' sums
+  stay host ops.
 - **Host ops** (`src/tts_nodes.py`, domain `axi.llm`): `TtsPrep`,
   `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm`.  Each has
   a numpy reference and a C helper.  tanh / exp come from libm on both
@@ -1057,7 +1098,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (1 500 cycles) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (448 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1069,9 +1110,15 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 3.1 %, p90 14.6 % over the
-  calibration campaign of `c2b2a6e5e50e`).  BERT's per-head attention P·V
-  conv: 0.20 ms predicted, 0.21 ms on the board.
+  DDR latency, x and weight runs; median 18.3 %, p90 45.8 % over the
+  1 190 ConvKernel calls of the 250 MHz campaign `6436623029f7` — the
+  100 MHz set fitted `c2b2a6e5e50e` to 3.1 / 14.6 %, but at 250 MHz a DDR
+  wait costs 2.5× the cycles and the recurrence fits less well).  The
+  board terms (`RTL_CONV_BOARD`, `RTL_COEF`, `CALL_OVERHEAD`) are refitted by
+  `tools/fit_cost_model.py`, which also lists the shipped models' engine
+  choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
+  §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
+  board (0.12 ms at 250 MHz), 34 907 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

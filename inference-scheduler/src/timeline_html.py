@@ -386,7 +386,7 @@ let drag = null;
 /* ---------- colors ---------- */
 const PAL = ["#4e9a06","#3a7bd5","#9b59b6","#e67e22","#16a085","#c0392b","#2e86c1","#b7950b","#8e44ad",
              "#27ae60","#d35400","#1abc9c","#7d6608","#5b2c6f","#1f618d","#a04000","#117a65","#6c3483"];
-const FIXED = {ConvNode:"#76b900", MatmulConvNode:"#2fa58a", MatmulNode:"#3a7bd5", LlmAttnConvNode:"#17a2b8",
+const FIXED = {ConvNode:"#76b900", MatmulConvNode:"#2fa58a", MatmulNode:"#3a7bd5", LlmAttnConvNode:"#17a2b8", VitGeluVopNode:"#9b59b6",
                PoolNode:"#e67e22", ScheduledNode:"#9b59b6", VectorOPNode:"#9b59b6"};
 const colorCache = {};
 function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
@@ -644,7 +644,7 @@ const SRC_HINT = {
   unpriced: "unpriced: outside the performance model (no measurement, no fitted model covers it); counted as 0 in the prediction."};
 function srcPill(s){ return s ? `<span class="pill ${esc(s)}" title="${esc(SRC_HINT[s] || s)}">${esc(s)}</span>` : ""; }
 const DECODE = {
-  VectorOPKernel: {op: ["add", "sub", "mul", "div", "relu", "relu6"], act: ["none", "relu", "relu6"]},
+  VectorOPKernel: {op: ["add", "sub", "mul", "div", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh"], act: ["none", "relu", "relu6", "leaky_relu", "silu", "gelu", "gelu_tanh"]},
   PoolKernel: {pool_type: ["max", "avg", "Lp"], count_include_pad: ["no", "yes"]},
   ConvKernel: {has_bias: ["no", "yes"], is_dw: ["no", "yes"]},
   MatmulKernel: {b_packed: ["no", "yes"]}};

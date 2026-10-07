@@ -21,8 +21,13 @@ patterns:
   * TensorFlow / BERT LayerNorm subgraph  -> ``LayerNormalization``
     (host op; its x^2 intermediates would saturate Q8.8 op by op).
   * GELU, tanh approximation (BERT) and erf form (PyTorch export)
-                                          -> ``Gelu`` (host op; x^3 would
-    saturate).
+                                          -> ``Gelu`` (VectorOPKernel's
+    activation unit or a host op, ``vectorop_act.py``; x^3 would saturate).
+  * SiLU ``Mul(x, Sigmoid(x))`` (PyTorch's SiLU / Swish export)
+                                          -> ``Silu`` (VectorOPKernel's
+    activation unit) — only with ``silu=True``: where the platform's
+    VectorOPKernel has the unit (``OnnxGraph`` passes it), else the
+    Sigmoid stays and is rejected as before.
   * Constant-operand broadcast normalisation for the VectorOP kernel:
     a scalar constant on a tensor whose last dim L is a multiple of the
     AXI alignment (<= 2048) becomes an [L] vector (a repeating chunk of L
@@ -36,9 +41,9 @@ Matching is structural — producer / consumer links, op types and constant
 values (with a tolerance for the transcendental constants) — never node
 names.  Every intermediate of a matched pattern must have no consumer
 outside the pattern and must not be a graph output; a near miss is left
-alone, and its ReduceMean / Pow / Sqrt / Reciprocal / Tanh / Erf then fail
-node dispatch with a pointer to this module (lowering them op by op is
-numerically wrong in Q8.8).
+alone, and its ReduceMean / Pow / Sqrt / Reciprocal / Tanh / Erf / Sigmoid
+then fail node dispatch with a pointer to this module (lowering them op by
+op is numerically wrong in Q8.8).
 """
 
 from __future__ import annotations
@@ -57,7 +62,8 @@ from .tensor import TensorInfo
 
 # Ops that exist only inside a fusable pattern — the dispatch error for an
 # unmatched instance points here.
-PATTERN_ONLY_OPS = frozenset({"ReduceMean", "Pow", "Sqrt", "Reciprocal", "Tanh", "Erf"})
+PATTERN_ONLY_OPS = frozenset({"ReduceMean", "Pow", "Sqrt", "Reciprocal", "Tanh", "Erf",
+                              "Sigmoid"})
 
 GELU_C1 = 0.044715
 GELU_C2 = math.sqrt(2.0 / math.pi)
@@ -501,6 +507,22 @@ def _match_gelu_erf(ix: _Index, e: onnx.NodeProto) -> Optional[dict]:
     return dict(nodes=nodes, anchor=y, fused=fused)
 
 
+def _match_silu(ix: _Index, sig: onnx.NodeProto) -> Optional[dict]:
+    """
+        s = Sigmoid(x)
+        y = Mul(x, s) | Mul(s, x)        (s has no other consumer)
+    """
+    x = sig.input[0]
+    mul = ix.sole(sig.output[0])
+    if not _is(mul, "Mul") or _other(mul, sig.output[0]) != x:
+        return None
+    nodes = [sig, mul]
+    pre = _common_prefix([n.name for n in nodes], "")
+    fused = oh.make_node("Silu", [x], [mul.output[0]],
+                         name=pre or f"{mul.name or 'Silu'}/fused")
+    return dict(nodes=nodes, anchor=mul, fused=fused)
+
+
 # ------------------------------------------------------------------ #
 # Constant broadcast normalisation (VectorOP kernel)                    #
 # ------------------------------------------------------------------ #
@@ -583,10 +605,12 @@ def _normalise_const_broadcast(ix: _Index, align_elems: int) -> int:
 # Entry point                                                          #
 # ------------------------------------------------------------------ #
 
-def fuse_patterns(model: onnx.ModelProto, align_elems: int = 8) -> Dict[str, int]:
-    """Run the pattern fusions in place.  Returns
-    ``{"layernorm": n, "gelu": n, "const_bcast": n}``."""
-    counts = {"layernorm": 0, "gelu": 0, "const_bcast": 0}
+def fuse_patterns(model: onnx.ModelProto, align_elems: int = 8,
+                  silu: bool = False) -> Dict[str, int]:
+    """Run the pattern fusions in place (``silu``: also x * Sigmoid(x) ->
+    ``Silu``).  Returns ``{"layernorm": n, "gelu": n, "silu": n,
+    "const_bcast": n}``."""
+    counts = {"layernorm": 0, "gelu": 0, "silu": 0, "const_bcast": 0}
     ix = _Index(model.graph)
     matches: List[dict] = []
     used: set = set()
@@ -605,6 +629,8 @@ def fuse_patterns(model: onnx.ModelProto, align_elems: int = 8) -> Dict[str, int
             counts["gelu"] += 1
         elif n.op_type == "Erf" and _take(_match_gelu_erf(ix, n)):
             counts["gelu"] += 1
+        elif silu and n.op_type == "Sigmoid" and _take(_match_silu(ix, n)):
+            counts["silu"] += 1
     if matches:
         _apply(ix, matches)
         ix = _Index(model.graph)
@@ -616,6 +642,11 @@ def pattern_hint(op_type: str) -> str:
     """Extra text for the 'not supported' error of a pattern-only op."""
     if op_type not in PATTERN_ONLY_OPS:
         return ""
+    if op_type == "Sigmoid":
+        return ("\n'Sigmoid' is only supported inside a SiLU x * Sigmoid(x) "
+                "(src/fusion.py), on a platform whose VectorOPKernel has the "
+                "activation unit (kernels.vectorop.activations); this instance did "
+                "not match, or the platform / AXI_VECTOROP_ACTIVATIONS disables it.")
     return (f"\n'{op_type}' is only supported inside a fused LayerNorm / GELU pattern "
             f"(src/fusion.py: TensorFlow-style LayerNorm, GELU tanh / erf forms, or "
             f"native LayerNormalization / Gelu ops); this instance did not match "

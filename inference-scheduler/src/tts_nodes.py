@@ -10,7 +10,10 @@ Host ops of the Piper (VITS) text-to-speech chunk (doc/plans/TTS_PLAN.md
                 holds source time r*w0 + j - hl + t0 (zero outside the
                 source window [wlo, whi))
   TtsGate       y = tanh(x[:n]) * sigmoid(x[n:])  (WaveNet gate)
-  TtsSum        y = ((x0[c0..] + x1[c1..]) + ...) / div, optionally masked
+  TtsSum        y = ((x0[c0..] + x1[c1..]) + ...) / div, optionally masked;
+                two whole inputs at the output's exponent: a VectorOP ADD
+                (TtsAddVopNode: the exact sum, saturated — the same bits;
+                doc/plans/OFFLOAD_PLAN.md §2.2)
   TtsFlowOut    the flow's coupling update on its float32 state:
                 z' = flip(z); z'[n:] -= m; masked outside the utterance
   TtsInterleave y[o][m*s + r] = x[r*O + o][m]  (polyphase transposed conv)
@@ -50,10 +53,11 @@ from typing import ClassVar, Optional, Tuple
 import numpy as np
 
 from .host_nodes import HostContext, _c_double, _resolve
-from .llm_nodes import LLM_DOMAIN, HostTable, LlmNode, _attr_ints, _const_array, _require, table_kind
+from .llm_nodes import (LLM_DOMAIN, HostTable, LlmKernelNode, LlmNode, _attr_ints, _const_array,
+                        _require, table_kind)
 from .vit_nodes import _bias, float_array_item
 
-__all__ = ("TTS_OP_FACTORIES", "TtsNode", "TtsPrepNode", "TtsGateNode", "TtsSumNode",
+__all__ = ("TTS_OP_FACTORIES", "TtsNode", "TtsPrepNode", "TtsGateNode", "TtsSumNode", "TtsAddVopNode",
            "TtsFlowOutNode", "TtsInterleaveNode", "TtsPcmNode", "TtsEmbedNode", "TtsRowPrepNode",
            "TtsAttnSoftmaxNode", "TtsAttnMergeNode", "TtsResNormNode", "TtsEncOutNode",
            "tts_c_helpers", "LLM_DOMAIN", "libm_map")
@@ -272,6 +276,10 @@ class TtsSumNode(TtsNode):
         _require(all(L == sn.L and c0 + nch <= c for (c, L), c0 in zip(cls_, ch0s, strict=True)),
                  node, "input shapes")
         _require(y.numel == nch * sn.L, node, "output size")
+        if (len(xs) == 2 and not masked and sn.div == 1.0 and all(c0 == 0 for c0 in ch0s)
+                and all(c == nch for c in sn.Cs) and all(f == sn.f_out for f in sn.f_ins)):
+            return TtsAddVopNode(onnx_node=node, inputs=xs, output=y, index=index,
+                                 align_elems=align_elems, n=nch * sn.L, f=sn.f_out)
         return sn
 
     def describe(self):
@@ -303,6 +311,52 @@ class TtsSumNode(TtsNode):
             lo, hi = int(np.asarray(ins[k]).reshape(-1)[0]), int(np.asarray(ins[k + 1]).reshape(-1)[0])
             v = np.where(_mask_cols(self.L, self.frame_off, self.rate, lo, hi)[None, :], v, 0.0)
         return _st16(v, self.f_out).reshape(self.output.shape)
+
+
+@dataclass
+class TtsAddVopNode(LlmKernelNode):
+    """A TtsSum of two whole DMA tensors at the output's exponent on
+    VectorOPKernel: one ADD of n raw int16 (the exact sum, saturated — the
+    host op's round-half-even is the identity on it)."""
+
+    kernel_name: ClassVar[str] = "VectorOPKernel"
+
+    onnx_node:   object
+    inputs:      list
+    output:      object
+    index:       int = 0
+    align_elems: int = 8
+    n:           int = 1
+    f:           int = 0
+
+    # Compatibility shims (read by the layout / header passes)
+    outer_count:        int  = field(default=1,    init=False)
+    chunk_size:         int  = field(default=0,    init=False)
+    aligned_chunk_size: int  = field(default=0,    init=False)
+    a_advances:         bool = field(default=True, init=False)
+    b_advances:         bool = field(default=True, init=False)
+    arity:              int  = field(default=2,    init=False)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        v = np.asarray(ins[0], np.float64).reshape(-1) + np.asarray(ins[1], np.float64).reshape(-1)
+        return _st16(v, self.f).reshape(self.output.shape)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .nodes import OP_ADD
+        from .perf_calls import KernelCall
+        return [KernelCall.of("VectorOPKernel", op=OP_ADD, size=self.n, outer=1)]
+
+    def describe(self) -> str:
+        return f"{self.n} elements at 2^-{self.f} on VectorOPKernel (ADD)"
+
+    def emit_comment(self) -> str:
+        a, b = (t.onnx_name for t in self.inputs)
+        return (f"    /* [{self.index}] TtsSum({a}, {b}) -> {self.output.onnx_name}  {self.n} elements "
+                f"at 2^-{self.f}: VectorOPKernel ADD */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        a, b = (t.c_name for t in self.inputs)
+        return f"    run_op({a}, {b}, {self.output.c_name}, {self.n}u, VECTOROP_ADD, 1u, 0u, 0u);"
 
 
 @dataclass

@@ -1220,14 +1220,19 @@ class GeluNode(HostNode):
         return [f"{self.helper.replace('gelu_', 'host_gelu_')}({ins[0]}, {out}, {self.n}u, "
                 f"{_c_double(p1)}, {_c_double(p2)});"]
 
-    def reference(self, ins, dtype):
-        v = np.asarray(ins[0], np.float64).reshape(-1)
+    def values(self, v, dtype) -> np.ndarray:
+        """This node's output for the flat float64 inputs ``v``, as written
+        back (also how ``vectorop_act`` compares it with the kernel's GELU)."""
+        v = np.asarray(v, np.float64).reshape(-1)
         if self.approximate == "tanh":
             y = v * (0.5 * (1.0 + libm("tanh", self.c2 * (v + self.c1 * (v * v * v)))))
         else:
             u = v / self.k if self.div else v * self.k
             y = v * (0.5 * (1.0 + libm("erf", u)))
-        return dtype.host_quantize(y).reshape(self.output.shape)
+        return dtype.host_quantize(y)
+
+    def reference(self, ins, dtype):
+        return self.values(ins[0], dtype).reshape(self.output.shape)
 
 
 # ------------------------------------------------------------------ #

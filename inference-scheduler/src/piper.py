@@ -21,7 +21,12 @@ input folded into rows (TtsPrep writes [C][rows][w0 + halo]: one padded
 output row of out_w * out_ch <= 65 536 accumulators), transposed convs are
 polyphase kernel-3 convs + TtsInterleave, the k7 dilation-12 convs run as
 two tap groups (one call spans <= 64 columns); every DMA tensor has one
-power-of-two exponent, each conv input the searched one ("#in").
+power-of-two exponent, each conv input the searched one ("#in").  The
+decoder's residual sums run on VectorOPKernel (doc/plans/OFFLOAD_PLAN.md
+§2.2): one exponent per decoder stage (vop_exponents), so every sum
+``y = t + y`` adds two raw tensors at one exponent (a split conv's tap
+groups first) — TtsSum nodes the scheduler maps to VectorOP ADDs
+(tts_nodes.TtsAddVopNode).
 """
 
 from __future__ import annotations
@@ -51,7 +56,8 @@ ACC_ENTRIES = 65536                                    # kernels.conv.max_acc_pe
 ENC_BUCKETS = (32, 64, 128, 256, 400)                 # encode_<T> entries: ids padded to T rows
 ENC_LAYERS, ENC_D, ENC_H, ENC_HD, ENC_WIN = 6, 192, 2, 96, 4
 
-__all__ = ("load_weights", "polyphase_weight", "fold", "exponent_keys", "PiperChunkFrontend", "entry_info",
+__all__ = ("load_weights", "polyphase_weight", "fold", "vop_exponents", "exponent_keys", "PiperChunkFrontend",
+           "entry_info",
            "encoder_weights", "encoder_exponent_keys", "PiperEncoderFrontend", "ENC_BUCKETS",
            "FLOW_FRAMES", "DEC_FRAMES", "OUT_FRAMES", "DEC_OFF", "HOP")
 
@@ -109,6 +115,18 @@ def fold(L: int, out_ch: int) -> Tuple[int, int]:
     return L // w0, w0
 
 
+def vop_exponents(E: Dict[str, int]) -> Dict[str, int]:
+    """One exponent per decoder stage — the upsampler's output, every
+    resblock conv's output and residual — the smallest calibrated one
+    (piper_vits.vop_exponents, the specification's)."""
+    E2 = dict(E)
+    for i in range(len(UPS)):
+        keys = [f"dec.up{i}"] + [f"dec.rb{i}{j}.{k}{c}" for j in range(3) for k in "cy" for c in range(2)]
+        e = min(E[k] for k in keys)
+        E2.update({k: e for k in keys})
+    return E2
+
+
 def exponent_keys() -> List[str]:
     """Every exponent the chunk entry needs (piper_study.py calibrate writes
     them: conv inputs "<conv>#in", conv outputs, the residual chains)."""
@@ -132,13 +150,16 @@ def exponent_keys() -> List[str]:
 class PiperChunkFrontend:
     """Builds the ``chunk`` entry.  ``W``: load_weights(); ``E``: the
     exponents (demo/tts/scripts/piper_study.py calibrate: tensor name ->
-    f, conv inputs "<conv>#in")."""
+    f, conv inputs "<conv>#in"); ``vop_sums`` False builds the library before
+    OFFLOAD_PLAN §2.2 (calibrated decoder exponents, three-input sums)."""
 
-    def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], name: str = "piper"):
+    def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], name: str = "piper",
+                 vop_sums: bool = True):
         missing = [k for k in exponent_keys() if k not in E]
         if missing:
             raise ValueError(f"exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
-        self.W, self.E, self.name = W, {k: int(v) for k, v in E.items()}, name
+        E = {k: int(v) for k, v in E.items()}
+        self.W, self.E, self.name, self.vop_sums = W, vop_exponents(E) if vop_sums else E, name, vop_sums
 
     # ---- builder helpers ------------------------------------------------ #
     def _new(self):
@@ -277,6 +298,8 @@ class PiperChunkFrontend:
                                                  frame_off=DEC_OFF)
                         parts.append(self._conv(f"{rb}.c{c}", a, r, w0, wt[:, :, ta:tb],
                                                 bt if ta == 0 else None, dil=d))
+                    if self.vop_sums and len(parts) > 1:      # the tap groups first (saturated)
+                        parts = [self._sum(parts, [0] * len(parts), n_out, L, f"{rb}.c{c}")]
                     y = self._sum(parts + [y], [0] * (len(parts) + 1), n_out, L, f"{rb}.y{c}")
                 ys.append(y)
             x = self._sum(ys, [0, 0, 0], n_out, L, f"dec.st{i}", div=3.0)

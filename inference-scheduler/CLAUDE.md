@@ -269,7 +269,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              75 pytest modules, 1651 tests, all pass (test_bert_base.py
+  test_*.py              76 pytest modules, 1674 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -691,7 +691,7 @@ Four scripts drive KV260 hardware over SSH:
 | Script | Purpose | Config |
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
-| `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (148 models) |
+| `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (156 models) |
 | `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (60 cases) |
 | `perf_calibrate.py run` | **Calibration** for `--plan` — times batches of kernel calls with `bench_src/calib_runner.c` (two passes), then `fit` writes `perf_models/<platform>/<bitstream-id>.json` (`../doc/plans/TACTICS_PLAN.md` §4.3) | `--config` in the `run_remote_perf.py` format |
 
@@ -702,7 +702,7 @@ the `KERNEL_REGISTRY` names (`PoolKernel`); `run_remote_perf.py` uses
 `PoolingKernel`.
 
 `run_remote_perf.py` validates each `VectorOPKernel` case's `op` against the
-kernel-supported set (`OP_ADD..OP_RELU6`, 0..5) when it loads the cases and
+kernel-supported set (`OP_ADD..OP_GELU_TANH`, 0..9) when it loads the cases and
 exits with `config error: VectorOPKernel case '<label>': unsupported op=…`
 before it connects to the board (`_load_cases()` runs right after the config
 is loaded), so a bad case costs no remote build.  A `PoolingKernel` case's

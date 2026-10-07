@@ -23,7 +23,10 @@ The graph (vlm_study.VisionModel's emulation, policy pow2+p12):
                 o_g = LlmAttnPV (ConvKernel)          keys = N (static)
     pv  = LlmAttnMerge(o_*)          o = pv . Wo
     h1  = VitResAdd(h, o, bo)        x2 = VitLayerNorm(h1)   f = x2 . W1
-    a   = VitGelu(f, b1)             d = a . W2    h = VitResAdd(h1, d, b2)
+    a   = VitGelu(f, b1[, ba, sc])   d = a . W2    h = VitResAdd(h1, d, b2)
+                                     (ba, sc where a is at 2^-8 on every channel:
+                                     VectorOPKernel's activation unit runs it,
+                                     policy pow2+p12+vgelu — _gelu_vop_rows)
   xf  = VitLayerNorm(h, post)
   per K chunk k: xs_k = VitPixelShuffle(xf)[:, chunk], img_k = xs_k . Wc[chunk]
   img = VitSumDequant(img_*)         (K = D s^2 exceeds every kernel's bound)
@@ -114,6 +117,24 @@ class VisionFormats:
         c = self.cfg
         fp = self.get("p", li, c.H)
         return (fp[:, None] + self.get("vc", li, c.D).reshape(c.H, c.HD) - F).reshape(-1)
+
+
+def _gelu_vop_rows(b, ef, ea, n):
+    """The two constant rows of GELU(f + b) on VectorOPKernel (doc/plans/OFFLOAD_PLAN.md
+    §2.1; vlm_study.vop_gelu_b): ba = round_half_even(b * 2^f) + 2^(f - 9) (f > 8: half
+    a Q8.8 LSB at f's exponent, so the MUL's floor rounds half up), sc = 2^(16 - f) —
+    both raw int16 rows, returned as float32 values raw / 2^8 (the default
+    exponent).  None when the output is not at 2^-8 on every channel or a row does
+    not fit int16 (the host VitGelu runs it)."""
+    ef = np.broadcast_to(np.asarray(ef, np.int64), (n,))
+    if not np.all(np.broadcast_to(np.asarray(ea, np.int64), (n,)) == 8):
+        return None
+    p = np.power(2.0, ef.astype(np.float64))
+    ba = np.round(np.asarray(b, np.float64) * p) + np.where(ef > 8, p / 512.0, 0.0)
+    sc = np.power(2.0, 16.0 - ef)
+    if not (np.all(np.abs(ba) < 32768) and np.all((sc < 32768) & (sc >= 1))):
+        return None
+    return (ba / 256.0).astype(np.float32), (sc / 256.0).astype(np.float32)
 
 
 def _compact(e):
@@ -348,8 +369,11 @@ class VitFrontend:
             fv = self._matmul(x2, f"w.v.l{li}.f1", W[lw + "mlp.fc1.weight"].T, N, f"{e}.f",
                               fm.get("f", li, c.FF), f"{e}.fc1")
             a = self._t(f"{e}.a", [N, c.FF], exp=fm.get("a", li, c.FF))
-            self._node("VitGelu", [fv, self._vec(f"v.l{li}.b1", W[lw + "mlp.fc1.bias"])], [a],
-                       f"{e}.gelu", domain=LLM_DOMAIN)
+            b1 = self._vec(f"v.l{li}.b1", W[lw + "mlp.fc1.bias"])
+            vop = _gelu_vop_rows(self._inits[b1], fm.get("f", li, c.FF), fm.get("a", li, c.FF), c.FF)
+            extra = [] if vop is None else [self._vec(f"v.l{li}.gelu_ba", vop[0]),
+                                            self._vec(f"v.l{li}.gelu_sc", vop[1])]
+            self._node("VitGelu", [fv, b1] + extra, [a], f"{e}.gelu", domain=LLM_DOMAIN)
             d = self._matmul(a, f"w.v.l{li}.f2", W[lw + "mlp.fc2.weight"].T, N, f"{e}.d",
                              fm.get("d", li, D), f"{e}.fc2")
             h2 = self._t(f"{e}.h2", [N, D], host="f32")

@@ -67,11 +67,12 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `kernels.conv` | yes | — | ConvKernel compile-time bounds — [§ConvKernel](#kernelsconv) |
 | `kernels.matmul` | yes | — | MatmulKernel compile-time bounds — [§MatmulKernel](#kernelsmatmul) |
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
+| `kernels.vectorop` | yes | — | VectorOPKernel capabilities — [§VectorOPKernel](#kernelsvectorop) |
 
-VectorOPKernel has no per-platform constants: it is a runtime-sized,
-element-wise kernel and has no compile-time bounds to validate (its
-SystemVerilog IP reads only `part`, for packaging and out-of-context
-synthesis).
+VectorOPKernel has no compile-time bounds: it is a runtime-sized,
+element-wise kernel (its SystemVerilog IP reads only `part`, for packaging
+and out-of-context synthesis).  Its block says what the bitstream's kernel
+can do.
 
 > **`AXI_BUS_WIDTH` is not a JSON field.** It is a top-level CMake
 > cache variable (default `32`) that set the HLS synthesis's
@@ -183,6 +184,16 @@ fixture generator).
 
 ---
 
+### `kernels.vectorop`
+
+Read by the scheduler only (`inference-scheduler/src/_vectorop_hw_config.py`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `activations` | bool | The bitstream's VectorOPKernel has the activation unit ([ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)): LeakyReLU / SiLU / GELU as ops 6–9 and acts 3–6, the `alpha` register.  When true the scheduler maps ONNX `Gelu`, `LeakyRelu` and `x · Sigmoid(x)` onto the kernel; when false `Gelu` stays a host op and the other two are rejected (an older IP passes ops 6–9 through unchanged).  `AXI_VECTOROP_ACTIVATIONS=0` / `1` overrides it — `0` for a project on a bitstream built before the unit (`986cef4866a0` and older) |
+
+---
+
 ## Example — kv260.json
 
 ```jsonc
@@ -205,6 +216,9 @@ fixture generator).
       "impl":   "rtl",
       "tile_n":   4, "tile_m":  32, "tile_k": 256, "max_k": 4096,
       "gemv_max_m": 4096
+    },
+    "vectorop": {
+      "activations": true
     },
     "pool": {
       "tile_c":            8,

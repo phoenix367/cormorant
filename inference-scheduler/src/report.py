@@ -126,8 +126,9 @@ def _node_notes(sn) -> str:
             bits.append(f"batch={sn.batch}")
         bits.append(f"on ConvKernel 1×{sn.kw} s(1,{sn.kw}) out {sn.out_h}×{sn.out_w}"
                     + (f" ×{sn.calls} calls" if sn.calls > 1 else ""))
-        bits.append(f"est {sn.est_conv_cycles / 1e5:.2f} ms vs MatmulKernel "
-                    f"{sn.est_matmul_cycles / 1e5:.2f} ms @100 MHz")
+        from .cost_model import KERNEL_MHZ, cycles_to_ms
+        bits.append(f"est {cycles_to_ms(sn.est_conv_cycles):.2f} ms vs MatmulKernel "
+                    f"{cycles_to_ms(sn.est_matmul_cycles):.2f} ms @{KERNEL_MHZ:g} MHz")
         return " · ".join(bits)
     if isinstance(sn, ConvNode):
         bits = [
@@ -166,12 +167,15 @@ def _node_notes(sn) -> str:
     if isinstance(sn, HostNode):
         det = sn.describe()
         return f"host CPU{' · ' + det if det else ''} · no kernel call"
-    from .llm_nodes import LlmAttnConvNode
+    from .llm_nodes import LlmAttnConvNode, LlmKernelNode
+    if isinstance(sn, LlmKernelNode) and not isinstance(sn, LlmAttnConvNode):
+        return sn.describe()
     if isinstance(sn, LlmAttnConvNode):
-        est = ", ".join(f"{k} keys {c / 1e5:.2f} ms (MatmulKernel {m / 1e5:.2f})"
+        from .cost_model import KERNEL_MHZ, cycles_to_ms
+        est = ", ".join(f"{k} keys {cycles_to_ms(c):.2f} ms (MatmulKernel {cycles_to_ms(m):.2f})"
                         for k, c, m in sn.est_cycles)
         return (f"{'q.K^T' if sn.kind == 'qk' else 'P.V'} group {sn.group} on ConvKernel · "
-                f"keys16 = roundup(pos + n, 16) at run time · est {est} @100 MHz")
+                f"keys16 = roundup(pos + n, 16) at run time · est {est} @{KERNEL_MHZ:g} MHz")
     return ""
 
 
@@ -606,13 +610,14 @@ class ReportGenerator:
                 f"VectorOP call (kernel `act` register)."
             )
         mc = getattr(self.graph, "matmul_conv_stats", None) or {}
+        from .cost_model import KERNEL_MHZ, cycles_to_ms
         if mc.get("lowered"):
             bullets.append(
                 f"- **MatMul on ConvKernel** — {mc['lowered']} `MatMul` "
                 f"node{'s' if mc['lowered'] != 1 else ''} run as ConvKernel calls "
                 f"with swapped operand roles ({mc['conv_calls']} calls; cost model "
-                f"{mc['conv_cycles'] / 1e5:.1f} ms against "
-                f"{mc['matmul_cycles'] / 1e5:.1f} ms on MatmulKernel at 100 MHz); "
+                f"{cycles_to_ms(mc['conv_cycles']):.1f} ms against "
+                f"{cycles_to_ms(mc['matmul_cycles']):.1f} ms on MatmulKernel at {KERNEL_MHZ:g} MHz); "
                 f"{mc.get('kept', 0)} stay on MatmulKernel."
             )
         from .planning import plan_summary
@@ -642,9 +647,23 @@ class ReportGenerator:
         if fc.get("layernorm") or fc.get("gelu"):
             bullets.append(
                 f"- **Pattern fusion** — {fc.get('layernorm', 0)} LayerNorm and "
-                f"{fc.get('gelu', 0)} GELU subgraph(s) fused into host-CPU ops "
-                f"(float regions; their x²/x³ intermediates would saturate "
-                f"op by op)."
+                f"{fc.get('gelu', 0)} GELU subgraph(s) fused into single ops "
+                f"(host-CPU float regions, or GELU on VectorOPKernel's activation "
+                f"unit; their x²/x³ intermediates would saturate op by op)."
+            )
+        if fc.get("silu"):
+            bullets.append(
+                f"- **SiLU fusion** — {fc['silu']} `x · Sigmoid(x)` pattern(s) fused "
+                f"into SiLU on VectorOPKernel's activation unit."
+            )
+        n_act = sum(1 for sn in self.graph.nodes
+                    if isinstance(sn, ScheduledNode) and sn.uses_activation_unit)
+        if n_act:
+            bullets.append(
+                f"- **Activation unit** — {n_act} VectorOP call{'s' if n_act != 1 else ''} "
+                f"apply LeakyReLU / SiLU / GELU in the kernel (as an op, or fused after "
+                f"one): the exact function rounded to nearest-even, bit-identical to "
+                f"the host op."
             )
         if fc.get("const_bcast"):
             bullets.append(

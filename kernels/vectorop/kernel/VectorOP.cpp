@@ -1,3 +1,5 @@
+#include <cmath>
+
 #include "VectorOP.h"
 #include "hls_stream.h"
 
@@ -34,12 +36,36 @@ static inline Data_t sub_relu6(Data_t a) {
     return a;
 }
 
-// Fused activation (AXI-Lite 'act' register) applied to the op result.
-static inline Data_t apply_act(Data_t v, unsigned act) {
+// The activation functions of ACT_LEAKY_RELU .. ACT_GELU_TANH in IEEE double
+// (VectorOP.h: these formulas round every Q8.8 input like the exact value);
+// LeakyReLU's product is exact (8 + 16 fraction bits).
+static inline double act_fn(double x, unsigned act, unsigned alpha) {
     switch (act) {
-        case ACT_RELU:  return sub_relu(v);
-        case ACT_RELU6: return sub_relu6(v);
-        default:        return v;
+        case ACT_LEAKY_RELU:
+            return (x >= 0.0) ? x : x * ((double)(alpha & 0xFFFFu) / 65536.0);
+        case ACT_SILU:
+            return x / (1.0 + std::exp(-x));
+        case ACT_GELU:
+            return x * (0.5 * (1.0 + std::erf(x / std::sqrt(2.0))));
+        case ACT_GELU_TANH:
+            return x * (0.5 * (1.0 + std::tanh(std::sqrt(2.0 / M_PI)
+                                               * (x + 0.044715 * (x * x * x)))));
+        default:
+            return x;
+    }
+}
+
+// Fused activation (AXI-Lite 'act' register, or the activation op's own:
+// job_act) applied to the op result.
+static inline Data_t apply_act(Data_t v, unsigned act, unsigned alpha) {
+    switch (act) {
+        case ACT_RELU:       return sub_relu(v);
+        case ACT_RELU6:      return sub_relu6(v);
+        case ACT_LEAKY_RELU:
+        case ACT_SILU:
+        case ACT_GELU:
+        case ACT_GELU_TANH:  return round_cast<Data_t>(act_fn((double)v, act, alpha));
+        default:             return v;
     }
 }
 
@@ -50,7 +76,7 @@ static inline Data_t op_lane(Data_t av, Data_t bv, unsigned op) {
         case OP_MUL:   return sub_mul (av, bv);
         case OP_RELU:  return sub_relu (av);
         case OP_RELU6: return sub_relu6(av);
-        default:       return av;           // OP_DIV is handled by compute_div
+        default:       return av;           // OP_DIV: compute_div; activation ops: job_act
     }
 }
 
@@ -239,7 +265,8 @@ static void compute_div(
     hls::stream<VecWord>& b_s,
     hls::stream<VecWord>& c_s,
     unsigned              total_words,
-    unsigned              act
+    unsigned              act,
+    unsigned              alpha
 ) {
     const unsigned total = total_words * E;
     VecWord aw = 0, bw = 0;
@@ -254,7 +281,7 @@ static void compute_div(
         const Data_t bv = vec_lane_to_data(bw.range(kDataBits - 1, 0));
         aw >>= kDataBits;
         bw >>= kDataBits;
-        const ap_uint<kDataBits> r = vec_data_to_lane(apply_act(sub_div(av, bv), act));
+        const ap_uint<kDataBits> r = vec_data_to_lane(apply_act(sub_div(av, bv), act, alpha));
         for (unsigned j = 0; j < E; ++j) {
             #pragma HLS UNROLL
             if (j == l) res[j] = r;
@@ -279,13 +306,15 @@ static void compute_words(
     hls::stream<VecWord>& c_s,
     unsigned              total_words,
     unsigned              op,
-    unsigned              act
+    unsigned              act,
+    unsigned              alpha
 ) {
     #pragma HLS INLINE off
     if (op == OP_DIV) {
-        compute_div(a_s, b_s, c_s, total_words, act);
+        compute_div(a_s, b_s, c_s, total_words, act, alpha);
         return;
     }
+    const unsigned jact = job_act(op, act);
     const bool binary = (op < OP_RELU);
     for (unsigned i = 0; i < total_words; ++i) {
         #pragma HLS PIPELINE II=1
@@ -297,7 +326,7 @@ static void compute_words(
             #pragma HLS UNROLL
             const Data_t av = vec_lane_to_data(aw.range(kDataBits * (l + 1) - 1, kDataBits * l));
             const Data_t bv = vec_lane_to_data(bw.range(kDataBits * (l + 1) - 1, kDataBits * l));
-            const Data_t r  = apply_act(op_lane(av, bv, op), act);
+            const Data_t r  = apply_act(op_lane(av, bv, op), jact, alpha);
             cw.range(kDataBits * (l + 1) - 1, kDataBits * l) = vec_data_to_lane(r);
         }
         c_s.write(cw);
@@ -369,7 +398,8 @@ void VectorOPKernel(
     unsigned      outer,
     unsigned      a_inc,
     unsigned      b_inc,
-    unsigned      act
+    unsigned      act,
+    unsigned      alpha
 ) {
     // 128-bit burst_maxi ports (VecWord).  Read requests are <= 64 words
     // with up to 16 outstanding (adapter buffer 1024 words); write requests
@@ -390,6 +420,7 @@ void VectorOPKernel(
     #pragma HLS INTERFACE s_axilite port=a_inc  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=b_inc  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=act    bundle=ctrl
+    #pragma HLS INTERFACE s_axilite port=alpha  bundle=ctrl
     #pragma HLS INTERFACE s_axilite port=return bundle=ctrl
 
     // Word streams between the stages; depth 64 lets the loaders run a
@@ -406,7 +437,7 @@ void VectorOPKernel(
     #pragma HLS bind_storage variable=c_s type=fifo impl=lutram
 
     // c_inc == 0 when outer==1 (a_inc==b_inc==0) — writes c[i] directly.
-    // Unary ops (OP_RELU, OP_RELU6) never read b.
+    // Unary ops (OP_RELU, OP_RELU6, the activation ops) never read b.
     const unsigned c_inc       = a_inc + b_inc;
     const unsigned total_words = outer * vec_words_for(size);
     const bool     b_enabled   = (op < OP_RELU);
@@ -414,6 +445,6 @@ void VectorOPKernel(
     #pragma HLS dataflow
     load_words(a, a_s, outer, size, a_inc, true);
     load_words(b, b_s, outer, size, b_inc, b_enabled);
-    compute_words(a_s, b_s, c_s, total_words, op, act);
+    compute_words(a_s, b_s, c_s, total_words, op, act, alpha);
     store_words(c, c_s, outer, size, c_inc);
 }

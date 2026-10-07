@@ -17,11 +17,15 @@ test/test_inference.c are compiled unchanged against
     no-ops here (``test_host_ops.TestCoherency`` checks the emitted sync
     sequence instead) — unless ``incoherent=True`` (-DEMU_INCOHERENT): then
     every allocation has a separate "DDR" copy that the kernels read and
-    write (phys) next to the CPU's copy (virt), a flush writes the bytes the
-    CPU changed since its last sync (the dirty data of a write-back cache)
+    write (phys) next to the CPU's copy (virt), a flush writes its whole range
     into DDR and an invalidate reloads the CPU copy from DDR — so a missing
     or too-narrow sync (e.g. a DMA state's row range) makes a kernel read
-    stale data or the CPU read a stale result, and the outputs differ.
+    stale data or the CPU read a stale result, and the outputs differ.  (Every
+    flush of the generated code follows CPU stores to its whole range — a
+    host op's output, host_store's chunks and gaps, an input, a state's rows
+    — and a stored line is dirty even where a byte keeps its stale value: a
+    slot a kernel wrote and only kernels read is never invalidated, so its
+    CPU copy is stale when a host op reuses it.)
 
 The harness fills the inputs, runs inference_run() and compares every output
 bit for bit with the scheduler simulation's expected arrays, exactly as on
@@ -59,9 +63,8 @@ void inference_buf_init_view(inference_buf_t *v, inference_buf_t *base,
 int  inference_buf_pool_init(void)   { return 0; }
 void inference_buf_pool_deinit(void) {}
 #ifdef EMU_INCOHERENT
-/* CPU copy (virt), DDR copy (phys: what the kernels access) and the CPU copy
- * as of its last sync (snap: bytes that differ are the CPU's dirty data). */
-typedef struct { unsigned char *cpu, *ddr, *snap; size_t bytes; } emu_alloc_t;
+/* CPU copy (virt) and DDR copy (phys: what the kernels access). */
+typedef struct { unsigned char *cpu, *ddr; size_t bytes; } emu_alloc_t;
 static emu_alloc_t emu_allocs[4096];
 static unsigned    emu_nalloc;
 static emu_alloc_t *emu_find(const void *p)
@@ -94,10 +97,8 @@ inference_buf_t *inference_buf_alloc(unsigned n)
         a->bytes = bytes ? bytes : 64;
         a->cpu = (unsigned char *)m;
         a->ddr = (unsigned char *)malloc(a->bytes);
-        a->snap = (unsigned char *)malloc(a->bytes);
-        if (!a->ddr || !a->snap) return NULL;
+        if (!a->ddr) return NULL;
         memset(a->ddr, 0xA5, a->bytes);
-        memset(a->snap, 0xA5, a->bytes);
         b->phys = (uint64_t)(uintptr_t)a->ddr;
     }
 #endif
@@ -109,7 +110,7 @@ void inference_buf_release(inference_buf_t *b)
     if (b && b->is_owner && --b->refcount == 0u) {
 #ifdef EMU_INCOHERENT
         emu_alloc_t *a = emu_find(b->virt);
-        if (a) { free(a->ddr); free(a->snap); memset(a, 0, sizeof *a); }
+        if (a) { free(a->ddr); memset(a, 0, sizeof *a); }
 #endif
         free(b->virt); free(b);
     }
@@ -119,11 +120,11 @@ void inference_buf_free(inference_buf_t *b) { inference_buf_release(b); }
 void inference_buf_sync_to_device(inference_buf_t *b)
 {
     emu_alloc_t *a = emu_find(b->virt);
-    size_t o, i, n = (size_t)b->count * INFERENCE_BYTES_PER_ELEM;
+    size_t o, n = (size_t)b->count * INFERENCE_BYTES_PER_ELEM;
     if (!a) return;
     o = (size_t)((unsigned char *)b->virt - a->cpu);
-    for (i = o; i < o + n && i < a->bytes; i++)
-        if (a->cpu[i] != a->snap[i]) { a->ddr[i] = a->cpu[i]; a->snap[i] = a->cpu[i]; }
+    if (o + n > a->bytes) n = a->bytes - o;
+    memcpy(a->ddr + o, a->cpu + o, n);
 }
 void inference_buf_sync_from_device(inference_buf_t *b)
 {
@@ -133,7 +134,6 @@ void inference_buf_sync_from_device(inference_buf_t *b)
     o = (size_t)((unsigned char *)b->virt - a->cpu);
     if (o + n > a->bytes) n = a->bytes - o;
     memcpy(a->cpu + o, a->ddr + o, n);
-    memcpy(a->snap + o, a->ddr + o, n);
 }
 #else
 void inference_buf_sync_to_device(inference_buf_t *b)   { (void)b; }
@@ -167,24 +167,47 @@ static inline int64_t emu_floor_shift(int64_t v, int s)   /* floor(v / 2^s) */
 
 _VOP = r"""
 #include "emu_common.h"
-typedef struct { u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act; } XVectoropkernel;
+#include <math.h>
+/* The activation unit's register (the generated code guards plain alpha
+ * writes with this macro, xvectoropkernel_hw.h of IPs that have it). */
+#define XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA 0x64
+typedef struct { u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act, alpha; } XVectoropkernel;
 static inline int XVectoropkernel_Initialize(XVectoropkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
 #define VOP_SET(f) static inline void XVectoropkernel_Set_##f(XVectoropkernel *p, u64 v) { p->f = (uint32_t)v; }
 static inline void XVectoropkernel_Set_a(XVectoropkernel *p, u64 v) { p->a = v; }
 static inline void XVectoropkernel_Set_b(XVectoropkernel *p, u64 v) { p->b = v; }
 static inline void XVectoropkernel_Set_c(XVectoropkernel *p, u64 v) { p->c = v; }
-VOP_SET(size) VOP_SET(op) VOP_SET(outer) VOP_SET(a_inc) VOP_SET(b_inc) VOP_SET(act)
+VOP_SET(size) VOP_SET(op) VOP_SET(outer) VOP_SET(a_inc) VOP_SET(b_inc) VOP_SET(act) VOP_SET(alpha)
+static inline uint32_t XVectoropkernel_Get_alpha(XVectoropkernel *p) { return p->alpha; }
+/* LeakyReLU / SiLU / GELU / GELU tanh (acts 3..6): VectorOP.cpp act_fn in
+ * double, rounded to nearest, ties to even, saturated. */
+static inline int64_t emu_act(int64_t r, uint32_t act, uint32_t alpha)
+{
+    const double x = (double)r / 256.0;
+    double y;
+    switch (act) {
+    case 3: y = x >= 0.0 ? x : x * ((double)(alpha & 0xFFFFu) / 65536.0); break;
+    case 4: y = x / (1.0 + exp(-x)); break;
+    case 5: y = x * (0.5 * (1.0 + erf(x / sqrt(2.0)))); break;
+    case 6: y = x * (0.5 * (1.0 + tanh(sqrt(2.0 / 3.14159265358979323846)
+                                       * (x + 0.044715 * (x * x * x))))); break;
+    default: return r;
+    }
+    return emu_sat((int64_t)nearbyint(y * 256.0));
+}
 static inline int XVectoropkernel_IsDone(XVectoropkernel *p) { (void)p; return 1; }
 static inline int XVectoropkernel_Release(XVectoropkernel *p) { (void)p; return 0; }
-/* c[o*(a_inc+b_inc) + i] = act(op(a[o*a_inc+i], b[o*b_inc+i])); the last
- * 8-lane word of every run is written whole, tail lanes = op(0,0) = 0. */
+/* c[o*(a_inc+b_inc) + i] = act(op(a[o*a_inc+i], b[o*b_inc+i])) — an
+ * activation op (6..9) applies its own activation (op - 3) instead of act;
+ * the last 8-lane word of every run is written whole, tail lanes = 0. */
 static inline void XVectoropkernel_Start(XVectoropkernel *p)
 {
     const int16_t *a = (const int16_t *)(uintptr_t)p->a;
     const int16_t *b = (const int16_t *)(uintptr_t)p->b;
     int16_t *c = (int16_t *)(uintptr_t)p->c;
     unsigned o, i, words = (p->size + 7u) / 8u, c_inc = p->a_inc + p->b_inc;
+    const uint32_t jact = (p->op >= 6u && p->op <= 9u) ? p->op - 3u : p->act;
     for (o = 0; o < p->outer; o++)
         for (i = 0; i < words * 8u; i++) {
             int64_t x = 0, y = 0, r;
@@ -198,11 +221,13 @@ static inline void XVectoropkernel_Start(XVectoropkernel *p)
             case 2: r = emu_floor_shift(x * y, 8); break;
             case 3: r = y ? (x * 256) / y : 0; break;          /* C division: trunc */
             case 4: r = x > 0 ? x : 0; break;
-            default: r = x > 0 ? (x < 1536 ? x : 1536) : 0; break;
+            case 5: r = x > 0 ? (x < 1536 ? x : 1536) : 0; break;
+            default: r = x; break;                              /* 6..9, >= 10: pass */
             }
             r = emu_sat(r);
-            if (p->act == 1u && r < 0) r = 0;
-            if (p->act == 2u) r = r < 0 ? 0 : (r > 1536 ? 1536 : r);
+            if (jact == 1u && r < 0) r = 0;
+            if (jact == 2u) r = r < 0 ? 0 : (r > 1536 ? 1536 : r);
+            r = emu_act(r, jact, p->alpha);
             if (i >= p->size) r = 0;
             c[(size_t)o * c_inc + i] = (int16_t)r;
         }

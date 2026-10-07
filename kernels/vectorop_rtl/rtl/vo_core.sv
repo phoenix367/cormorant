@@ -238,7 +238,7 @@ module vo_core #(
   // Control slave ------------------------------------------------------------------
   logic        ap_start, ap_done, ap_idle;
   logic [63:0] r_a, r_b, r_c;
-  logic [31:0] r_size, r_op, r_outer, r_ainc, r_binc, r_act;
+  logic [31:0] r_size, r_op, r_outer, r_ainc, r_binc, r_act, r_alpha;
 
   vo_ctrl_s_axi u_ctrl (
     .clk, .rst (rst_c),
@@ -252,7 +252,7 @@ module vo_core #(
     .interrupt,
     .ap_start, .ap_done, .ap_ready (ap_done), .ap_idle,
     .a (r_a), .b (r_b), .c (r_c), .size (r_size), .op (r_op), .outer (r_outer),
-    .a_inc (r_ainc), .b_inc (r_binc), .act (r_act)
+    .a_inc (r_ainc), .b_inc (r_binc), .act (r_act), .alpha (r_alpha)
   );
 
   // Job configuration ------------------------------------------------------------------
@@ -264,7 +264,7 @@ module vo_core #(
                             T_RUN, T_DONE} tst_t;
   tst_t        tstate;
   logic [63:0] j_a, j_b, j_c;
-  logic [31:0] j_size, j_op, j_outer, j_ainc, j_binc, j_act;
+  logic [31:0] j_size, j_op, j_outer, j_ainc, j_binc, j_act, j_alpha;
   logic [31:0] nw, c_inc, pm;
   logic [3:0]  tail;
   logic        go;
@@ -350,7 +350,7 @@ module vo_core #(
     if (ld_j) begin
       j_a <= r_a; j_b <= r_b; j_c <= r_c;
       j_size <= r_size; j_op <= r_op; j_outer <= r_outer;
-      j_ainc <= r_ainc; j_binc <= r_binc; j_act <= r_act;
+      j_ainc <= r_ainc; j_binc <= r_binc; j_act <= r_act; j_alpha <= r_alpha;
     end
     if (tstate == T_CFG0) begin
       nw    <= 32'((33'(j_size) + 33'd7) >> 3);
@@ -405,7 +405,7 @@ module vo_core #(
   );
 
   vo_compute u_cp (
-    .clk, .rst (urst_c), .op (j_op), .act (j_act),
+    .clk, .rst (urst_c), .op (j_op), .act (j_act), .alpha (j_alpha),
     .a_valid, .a_ready, .a_data, .b_valid, .b_ready, .b_data,
     .c_valid, .c_ready, .c_data,
     .idle (cp_idle)

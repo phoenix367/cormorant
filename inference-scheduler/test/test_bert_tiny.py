@@ -15,17 +15,20 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
 import gen_bert_models as gbm
 import host_emu
 from helpers import matmul_impl
+from src import _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
                             OneHotNode, SliceNode, SoftmaxNode, TransposeNode)
-from src.nodes import MatmulConvNode, MatmulNode, ScheduledNode, SchedulerError
+from src.nodes import (ACT_GELU, ACT_GELU_TANH, OP_ADD, MatmulConvNode, MatmulNode,
+                       ScheduledNode, SchedulerError)
 from src.report import ReportGenerator
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +80,16 @@ class TestPartition(_Tiny):
             L = m["layers"]
             kinds = collections.Counter(type(sn) for sn in g.nodes)
             self.assertEqual(kinds[LayerNormNode], 1 + 2 * L, fname)
-            self.assertEqual(kinds[GeluNode], L, fname)
+            # GELU on VectorOP's activation unit, fused into the FFN bias Add
+            self.assertEqual(kinds[GeluNode], 0, fname)
+            gelu_adds = [sn for sn in g.nodes if isinstance(sn, ScheduledNode)
+                         and sn.act in (ACT_GELU, ACT_GELU_TANH)]
+            self.assertEqual(len(gelu_adds), L, fname)
+            self.assertTrue(all(sn.op_code == OP_ADD for sn in gelu_adds), fname)
+            with mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False):
+                g_host, _ = self.gen(m["path"])
+            self.assertEqual(collections.Counter(type(sn) for sn in g_host.nodes)[GeluNode],
+                             L, fname)
             self.assertEqual(kinds[SoftmaxNode], L, fname)
             self.assertEqual(kinds[TransposeNode], 4 * L + 1, fname)
             self.assertEqual(kinds[GatherNode], 1, fname)
@@ -224,10 +236,19 @@ class TestGeneratedC(_Tiny):
                     self.assertEqual(rc, 0, f"{fname}\n{out}")
                     self.assertIn("test_inference PASSED", out)
                     self.assertEqual(host_emu.failures(out), [])
+            # GELU as the host op (a platform without VectorOP's activation unit)
+            with mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False):
+                _, cg = self.gen(m["path"])
+            with self.subTest(model=fname, gelu="host"), tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, td)
+                self.assertEqual(rc, 0, f"{fname}\n{out}")
+                self.assertIn("test_inference PASSED", out)
+                self.assertEqual(host_emu.failures(out), [])
 
     def test_source_structure(self):
         m = self.models["bert_tiny_h32_l1.onnx"]
-        g, cg = self.gen(m["path"])
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False):
+            g, cg = self.gen(m["path"])         # GELU as the host op
         src = cg.generate_source()
         self.assertIn("#include <math.h>", src)
         self.assertIn('#  pragma GCC optimize ("fp-contract=off")', src)
@@ -331,7 +352,16 @@ class TestGeneratedC(_Tiny):
             r = subprocess.run([sys.executable, os.path.join(_ROOT, "inference_scheduler.py"),
                                 m["path"], "--out-dir", td], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertIn("Gelu", r.stderr)
+            with open(os.path.join(td, "src", "inference.c")) as f:
+                src = f.read()
+            self.assertIn("VECTOROP_ACT_GELU, 0u);", src)       # fused into the bias Add
+            self.assertNotIn("host_gelu_erf_lut(", src)
+            env = dict(os.environ, AXI_VECTOROP_ACTIVATIONS="0")   # an older bitstream
+            r = subprocess.run([sys.executable, os.path.join(_ROOT, "inference_scheduler.py"),
+                                m["path"], "--out-dir", td], capture_output=True, text=True,
+                               env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Gelu", r.stderr)                     # a host op node
             with open(os.path.join(td, "src", "inference.c")) as f:
                 self.assertIn("host_gelu_erf_lut(", f.read())
             r = subprocess.run([sys.executable, os.path.join(_ROOT, "inference_scheduler.py"),

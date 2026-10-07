@@ -8,6 +8,8 @@ set rtl_files [list \
   $root/rtl/vo_rd_port.sv \
   $root/rtl/vo_wr_port.sv \
   $root/rtl/vo_div.sv \
+  $root/rtl/vo_act_rom.sv \
+  $root/rtl/vo_act.sv \
   $root/rtl/vo_compute.sv \
   $root/rtl/vo_core.sv \
   $root/rtl/VectorOPKernel.v \
