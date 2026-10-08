@@ -22,7 +22,8 @@ phase 2 with P·V on MatmulKernel).  At 250 MHz (bitstream `986cef4866a0`,
 FMAX_250_PLAN.md): p50 541 ms; with the 12 GELUs on VectorOPKernel's activation
 unit, fused into the FFN bias Adds (bitstream `6436623029f7`, ACTIVATIONS_PLAN.md):
 p50 525 ms; with the 12 Softmaxes on its softmax unit (bitstream `588d721997cb`,
-SOFTMAX_PLAN.md): p50 427 ms, bit-exact.
+SOFTMAX_PLAN.md): p50 427 ms; with VectorOPKernel's b read port on HPC1 (bitstream
+`8599aa7a5f12`, PS_PORTS_PLAN.md): p50 418 ms, bit-exact.
 
 ## 0. Feasibility (measured 2026-09-26)
 

@@ -54,9 +54,9 @@ directories on the board.
 ## 2. Bitstream id — which baseline
 
 ```bash
-BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 588d721997cb
+BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 8599aa7a5f12
 (cd inference-scheduler && .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())")
-ls .claude/skills/perf-regression/baselines/                               # kv260-588d721997cb.json; kv260-6436623029f7.json (no softmax unit); kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
+ls .claude/skills/perf-regression/baselines/                               # kv260-8599aa7a5f12.json; kv260-588d721997cb.json (VectorOP b on HPC0); kv260-6436623029f7.json (no softmax unit); kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
 ```
 The board's id is what gets measured; always pass it (`--bitstream-id
 $BID`).  A local id that differs means the board runs another bitstream
@@ -91,7 +91,7 @@ Output shape (validation run 2026-09-29 14:31 against the 09:53 run, same bitstr
 the id shown is today's bitstream):
 ```
 kernels: baseline run 2026-09-29 09:53 (…/perf_20260929.json)
-platform kv260, bitstream 588d721997cb
+platform kv260, bitstream 8599aa7a5f12
 
   section         case                         base ms     now ms   Δlat %   Δthr %  flag
   VectorOPKernel  ADD-1K                        0.0087     0.0088    +1.15    -0.57

@@ -1115,7 +1115,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (434 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (431 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1135,7 +1135,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 921 predicted.
+  board (0.12 ms at 250 MHz), 34 924 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

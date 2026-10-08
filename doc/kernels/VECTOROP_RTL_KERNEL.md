@@ -10,8 +10,10 @@ GELU, GELU tanh as ops 6–9 and acts 3–6, the `alpha` register;
 at 300 MHz; in the production bitstream `6436623029f7` (250 MHz, WNS
 +0.061 ns) since 2026-10-06.  **2026-10-07:** the softmax unit (`vo_smx`: ops
 10 / 11, registers `smx_cm` / `smx_cfg` / `smx_mask`;
-[SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)) — in the production bitstream
-`588d721997cb` (250 MHz, WNS +0.041 ns) since 2026-10-07.
+[SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)) — in the bitstreams since
+`588d721997cb` (2026-10-07); the production `8599aa7a5f12` (250 MHz, WNS +0.114 ns,
+since 2026-10-08) reads b through its own PS port, HPC1 (a and c on HPC0;
+[PS_PORTS_PLAN](../plans/PS_PORTS_PLAN.md) §5: binary ops 24–38 % faster).
 
 A drop-in replacement for the HLS kernel: the same IP (VLNV
 `xilinx.com:hls:VectorOPKernel:1.0`, 155 ports and 35 parameters with the

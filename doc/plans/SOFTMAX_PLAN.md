@@ -6,7 +6,7 @@
 the softmax on the FPGA and gated bit-exact on the board: BERT 525 → 427 ms,
 SmolVLM image 2.20 → 1.93 s, SmolLM2 prefill-256 811 → 737 ms (135M) /
 2059 → 1926 ms (360M).  Phase 6 (Piper's encoder softmax) not started.
-Uncommitted — §4.
+Committed as 51d1224 (hw_128 9c74ac9, test stand af44f6e).
 
 The user asked for softmax on the FPGA for every workload, with an
 approximation allowed (re-validated per model, as SmolVLM's GELU was in

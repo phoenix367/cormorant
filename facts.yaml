@@ -192,7 +192,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds its softmax unit'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` gives its b read port'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
@@ -242,8 +242,11 @@ facts:
           (SOFTMAX_PLAN, 2026-10-07; the kernels' cycles unchanged) and kept: `fit 588d721997cb` gives the
           constants as used ConvKernel 18.7 / 48.2 % over 1265 calls, MatmulKernel 4.6 / 17.7 % over 414 (its
           proposal 15.1 / 45.1 %, not taken: the shipped libraries stay as gated); CALL_OVERHEAD 448 -> 434 with
-          ONE / one +14, so no decision moves"
-    facts: {perf.bitstream_id: 588d721997cb}  # a new bitstream: a new campaign, refit or re-score
+          ONE / one +14, so no decision moves.  Re-scored on 8599aa7a5f12 (PS_PORTS_PLAN §5, 2026-10-08; the
+          ConvKernel / MatmulKernel calls unchanged): the constants as used ConvKernel 18.6 / 48.3 % over 1265
+          calls, MatmulKernel 4.5 / 17.7 % over 414; call floor 431 cycles: CALL_OVERHEAD 434 -> 431 with
+          ONE / one +3"
+    facts: {perf.bitstream_id: 8599aa7a5f12}  # a new bitstream: a new campaign, refit or re-score
   fix: report
   mentions:
     - {file: inference-scheduler/src/cost_model.py,
@@ -565,7 +568,7 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 51}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 80a942a
+    commit: 51d1224
     date: 2026-10-08
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
           at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
@@ -852,7 +855,7 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.5, resnet18_fps: 48.8, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.5, bert_ms: 427,
+  value: {resnet18_ms: 20.2, resnet18_fps: 49.6, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.4, bert_ms: 418,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
           smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
@@ -890,8 +893,8 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged)"
-    facts: {perf.bitstream_id: 588d721997cb}   # stale on another bitstream
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201"
+    facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -922,7 +925,7 @@ facts:
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
        regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream `588d721997cb`,\s+SOFTMAX_PLAN.md\): p50 (?P<bert_ms>\d+) ms', dotall: true}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream\s+`8599aa7a5f12`, PS_PORTS_PLAN.md\): p50 (?P<bert_ms>\d+) ms', dotall: true}
     - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
@@ -997,12 +1000,14 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: 588d721997cb, dsp: 712, dsp_total: 1248, dsp_pct: 57, lut: 62347, lut_total: 117120, lut_pct: 53.2,
+  value: {bitstream: 8599aa7a5f12, dsp: 712, dsp_total: 1248, dsp_pct: 57, lut: 62400, lut_total: 117120, lut_pct: 53.3,
           bram: 123, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-07
-    how: "Vivado placed utilization report of the 250 MHz design with VectorOPKernel's softmax unit
+    date: 2026-10-08
+    how: "Vivado placed utilization report of the 250 MHz design with VectorOPKernel's b read port on HPC1
+          (PS_PORTS_PLAN §5, /mnt/data/bitstreams/kv260_250_8599aa7a5f12/: +53 LUT, FF 87 703 -> 87 781; the
+          interconnects only); 588d721997cb before it: LUT 62 347 — VectorOPKernel's softmax unit
           (SOFTMAX_PLAN, /mnt/data/bitstreams/kv260_250_588d721997cb/: +5 599 LUT, +5 105 FF (87 703), +16 BRAM,
           +16 DSP); 6436623029f7 before it: LUT 56 748, DSP 696, BRAM 107 — the activation unit
           (ACTIVATIONS_PLAN, /mnt/data/bitstreams/kv260_250_6436623029f7/: +729 LUT, +1 233 FF, +4 BRAM, +8 DSP);
@@ -1013,7 +1018,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 588d721997cb}
+    facts: {perf.bitstream_id: 8599aa7a5f12}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

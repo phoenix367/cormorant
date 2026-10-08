@@ -18,8 +18,19 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/588d721997cb` is the production design (2026-10-07, SOFTMAX_PLAN: `6436623029f7` plus
-VectorOPKernel's softmax unit): 1858 calls, `clock_mhz` 250, repeat spread median 0.057 %.  A
+`kv260/8599aa7a5f12` is the production design (2026-10-08, PS_PORTS_PLAN §5: `588d721997cb` with
+VectorOPKernel's b read port on HPC1): 1862 calls, `clock_mhz` 250, repeat spread median 0.052 %.
+Its case list started from `588d721997cb`'s converged one, so both campaigns measure the same
+calls: 1597 listed plus the 261 ConvKernel refinement calls of that campaign's earlier rounds.
+One refinement round then added 4 calls.  Against `588d721997cb` the ConvKernel and MatmulKernel
+calls are unchanged (median 0.00 %, p10 / p90 within ±0.2 %) and the binary VectorOP calls up
+to 33 % faster.  Some small 2×2 / 3×3 stride-2 pooling calls are 1–2 µs slower (8–17 %); the
+pooling benchmarks and MNIST do not show it.  The simulator against this bitstream's board runs:
+the CNNs, BERT, SmolLM2-135M, SmolVLM and Piper within ±2.2 %; SmolLM2-360M's prefill 16 −12 %,
+256 +4.6 %, as before.  `host.json` unchanged.
+
+Before it, `kv260/588d721997cb` — the production design from 2026-10-07 to 2026-10-08
+(SOFTMAX_PLAN: `6436623029f7` plus VectorOPKernel's softmax unit) — had 1858 calls, `clock_mhz` 250, repeat spread median 0.057 %.  A
 fresh case list (1443 cases: BERT's, SmolVLM's and the prefills' softmaxes on VectorOP), three
 refinement rounds (139 + 126 + 78 calls; a fourth would add 27), then the prefill softmax at
 every runtime key count (`LlmAttnSoftmaxVopNode` is priced at `keys_of(sn)` keys, as the

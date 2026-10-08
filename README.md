@@ -37,10 +37,10 @@ at 100 MHz):
 
 | Model | Result | Source |
 |---|---|---|
-| ResNet-18, 224×224 | **20.5 ms (48.8 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | 22.0 / 20.5 ms per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
+| ResNet-18, 224×224 | **20.2 ms (49.6 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (20.5 ms with VectorOP's two reads on one PS port; 47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
+| MobileNet V1 / V2, 224×224 | 22.0 / 20.4 ms per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
 | MNIST convnet / LeNet | 0.111 / 1.249 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **427 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **418 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (427 ms with the softmax on the FPGA), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
 | SmolLM2-135M-Instruct | **18.3 tokens/s** decode, 16-token prefill 0.15 s, 256-token prefill 0.74 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
 | SmolLM2-360M-Instruct | **7.3 tokens/s** decode, 16-token prefill 0.34 s, 256-token prefill 2.05 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
 | SmolVLM-256M-Instruct (image chat) | **1.9 s** per image for the vision encoder (7.7 s at first), then 54 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
@@ -48,8 +48,8 @@ at 100 MHz):
 
 The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
 bit-exact with the scheduler's simulation.
-The FPGA design (`hw/cormorant_hw_128`, bitstream `588d721997cb`) uses 57 % of the DSPs
-(712 / 1248), 53.2 % of the LUTs (62 347 / 117 120), 123 / 144 BRAM and
+The FPGA design (`hw/cormorant_hw_128`, bitstream `8599aa7a5f12`) uses 57 % of the DSPs
+(712 / 1248), 53.3 % of the LUTs (62 400 / 117 120), 123 / 144 BRAM and
 48 / 64 URAM.
 
 ---

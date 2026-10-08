@@ -24,11 +24,17 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/588d721997cb** (2026-10-07), the 250 MHz bitstream with
+Current model: **kv260/8599aa7a5f12** (2026-10-08), `588d721997cb`'s design with
+VectorOPKernel's b read port on HPC1 (PS_PORTS_PLAN §5).  Its case list is the converged one of
+`588d721997cb` plus the 261 ConvKernel calls that campaign had measured in earlier rounds
+(copy `<old>.cases.json`, set its `bitstream`, append the calib's unlisted keys), then `run`,
+`fit` and one refinement round (+4) to 1862 exact calls, and
+`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.052 %.  That
+is the shortcut for a bitstream whose kernels are unchanged — only the PS port layout moved.
+Before it, **kv260/588d721997cb** (2026-10-07), the 250 MHz bitstream with
 VectorOPKernel's softmax unit (SOFTMAX_PLAN): a fresh case list (1443 cases, the softmax calls
 among them), three refinement rounds (139 + 126 + 78; a fourth would add 27), then the prefill
-softmax at every runtime key count (72 calls) to 1858 exact calls, and
-`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.057 %.  Note: `calib_runner.c` writes the softmax registers for ops
+softmax at every runtime key count (72 calls) to 1858 exact calls (`host.json` unchanged); repeat spread median 0.057 %.  Note: `calib_runner.c` writes the softmax registers for ops
 10 / 11 only, as the generated `run_softmax()` — written on every VectorOP call they cost
 ~80 ns per call (the first pass of this campaign; its 99 element-wise calls were re-measured).
 Before it, **kv260/6436623029f7** (2026-10-06), the 250 MHz bitstream with
@@ -93,7 +99,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 588d721997cb today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 8599aa7a5f12 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`
