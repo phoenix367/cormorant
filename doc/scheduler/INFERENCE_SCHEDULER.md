@@ -71,8 +71,8 @@ unguarded and checks at `inference_init()` that the IP has the register
 XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
 
 **Host-CPU ops (C code inside `inference_run()`, no hardware call):**
-- **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Gather,
-  OneHot, Cast** — `src/host_nodes.py`, see [§Host-CPU ops](#host-cpu-ops)
+- **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Concat,
+  Resize, Gather, OneHot, Cast** — `src/host_nodes.py`, see [§Host-CPU ops](#host-cpu-ops)
   below.  TensorFlow-style LayerNorm and GELU (tanh / erf) subgraphs are
   fused into single host nodes first ([§Pattern fusion](#pattern-fusion));
   integer tensors (token ids, masks) are supported as raw int16
@@ -152,7 +152,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1696 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1699 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -550,6 +550,8 @@ ResNet-18's 300 KB, dominated by the non-cacheable read).
 | `Gelu` | `GeluNode` | `approximate = "tanh"` / `"none"` (erf) |
 | `Transpose` | `TransposeNode` | any perm, ≤ 5 non-mergeable dims |
 | `Slice` (and every `Split` output) | `SliceNode` | constant starts / ends / axes, positive steps; zero-cost view when possible (below) |
+| `Concat` | `ConcatNode` | any axis, same rank and dims off the axis; block copies (`host_concat`): input k's `[outer][c_k · inner]` rows into the output's rows — bit-exact, dtype-agnostic (YOLOv5's channel joins, [YOLO_PLAN](../plans/YOLO_PLAN.md)) |
+| `Resize` | `ResizeNode` | mode `nearest` by **integer** scales on an NCHW tensor's H and W (an upsample) with a coordinate mode whose pick is pixel `(y / s_h, x / s_w)`: `asymmetric` + `floor` (`nn.Upsample`), `half_pixel` / `pytorch_half_pixel` + `round_prefer_floor` / `round_prefer_ceil`; a strided host copy with zero strides (`host_copy_nd`) |
 | `Gather` | `GatherNode` | axis 0, runtime integer indices, any table (a constant table stays a DMA weight; rows are copied straight out of it, one memcpy per row).  Negative indices count from the end; an index still outside `[0, rows)` is **clamped** (ONNX leaves it undefined) |
 | `OneHot` | `OneHotNode` | axis −1, runtime integer indices, constant depth and `[off, on]`; out-of-range index → all-off row |
 | `Cast` | `CastNode` | integer → Data_t, Data_t → integer (truncate toward zero), → bool; a cast within one storage kind (float → float, int → int) is a zero-cost `ReshapeNode` alias |

@@ -25,8 +25,8 @@ from onnx import TensorProto
 from src.codegen import CodeGenerator
 from src.dtype import AP_FIXED_16_8
 from src.graph import OnnxGraph
-from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
-                            OneHotNode, SliceNode, TransposeNode)
+from src.host_nodes import (CastNode, ConcatNode, GatherNode, GeluNode, HostNode, LayerNormNode,
+                            OneHotNode, ResizeNode, SliceNode, TransposeNode)
 from src.nodes import ReshapeNode, SchedulerError
 from unittest import mock
 
@@ -315,6 +315,56 @@ class TestDataMovement(_Base):
         self.assertIsInstance(g.nodes[0], SliceNode)
         self.assertFalse(g.nodes[0].is_view)
         np.testing.assert_array_equal(a["Y"], x[1:4:2, :, 0:8:3])
+
+    def test_concat_axes(self):
+        rng = np.random.default_rng(15)
+        for axis, shapes in [(1, [[1, 3, 4, 5], [1, 5, 4, 5], [1, 2, 4, 5]]),     # YOLOv5's channel joins
+                             (0, [[2, 3, 4], [1, 3, 4]]), (-1, [[2, 3, 4], [2, 3, 7]]),
+                             (2, [[2, 3, 1, 8], [2, 3, 4, 8]])]:
+            names = [f"X{i}" for i in range(len(shapes))]
+            ax = axis % len(shapes[0])
+            out = list(shapes[0])
+            out[ax] = sum(sh[ax] for sh in shapes)
+            p = _save(self.d, [oh.make_node("Concat", names, ["Y"], axis=axis)],
+                      [_vi(n, sh) for n, sh in zip(names, shapes, strict=True)], [_vi("Y", out)],
+                      name=f"concat{axis}_{len(shapes)}")
+            xs = [_grid(rng, sh, -100, 100) for sh in shapes]
+            g, _, a = self.check(p, dict(zip(names, xs, strict=True)))
+            self.assertIsInstance(g.nodes[0], ConcatNode)
+            np.testing.assert_array_equal(a["Y"], np.concatenate(xs, axis=axis))
+
+    def test_resize_nearest_upsample(self):
+        import onnxruntime as ort
+        rng = np.random.default_rng(16)
+        for (ctm, nm), sc in [(("asymmetric", "floor"), [1, 1, 2, 2]),            # YOLOv5's nn.Upsample
+                              (("half_pixel", "round_prefer_floor"), [1, 1, 3, 2]),
+                              (("half_pixel", "round_prefer_ceil"), [1, 1, 2, 4]),
+                              (("pytorch_half_pixel", "round_prefer_floor"), [1, 1, 1, 2])]:
+            shape = [2, 3, 4, 5]
+            out = [shape[i] * sc[i] for i in range(4)]
+            scales = nph.from_array(np.array(sc, np.float32), "sc")
+            p = _save(self.d, [oh.make_node("Resize", ["X", "", "sc"], ["Y"], mode="nearest",
+                                            coordinate_transformation_mode=ctm, nearest_mode=nm)],
+                      [_vi("X", shape)], [_vi("Y", out)], [scales], name=f"resize_{ctm}_{nm}")
+            x = _grid(rng, shape, -100, 100)
+            g, _, a = self.check(p, {"X": x})
+            self.assertIsInstance(g.nodes[0], ResizeNode)
+            want = ort.InferenceSession(p, providers=["CPUExecutionProvider"]).run(
+                ["Y"], {"X": x.astype(np.float32)})[0]
+            np.testing.assert_array_equal(a["Y"], want, err_msg=f"{ctm} / {nm}")
+
+    def test_resize_rejected(self):
+        scales = nph.from_array(np.array([1, 1, 2, 2], np.float32), "sc")
+        p = _save(self.d, [oh.make_node("Resize", ["X", "", "sc"], ["Y"], mode="linear")],
+                  [_vi("X", [1, 2, 4, 4])], [_vi("Y", [1, 2, 8, 8])], [scales], name="resize_linear")
+        with self.assertRaisesRegex(SchedulerError, "mode linear"):
+            OnnxGraph(p)
+        half = nph.from_array(np.array([1, 1, 0.5, 0.5], np.float32), "sc")
+        p = _save(self.d, [oh.make_node("Resize", ["X", "", "sc"], ["Y"], mode="nearest",
+                                        coordinate_transformation_mode="asymmetric", nearest_mode="floor")],
+                  [_vi("X", [1, 2, 4, 4])], [_vi("Y", [1, 2, 2, 2])], [half], name="resize_down")
+        with self.assertRaisesRegex(SchedulerError, "integer upsample"):
+            OnnxGraph(p)
 
     def test_gather_clamps_indices(self):
         tbl = nph.from_array(np.random.default_rng(7).normal(0, 2, (10, 3, 4)).astype(np.float32), "T")

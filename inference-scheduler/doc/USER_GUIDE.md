@@ -204,7 +204,8 @@ All pool variants support configurable stride, padding, and dilation.
 
 Run on the A53 inside `inference_run()` (double arithmetic, round-half-even
 write-back, multi-threaded): `Softmax` (last axis; on VectorOPKernel where the platform has the softmax unit, above), `LayerNormalization`,
-`Gelu`, `Transpose`, `Slice` / `Split` copies, `Gather` (axis 0), `OneHot`,
+`Gelu`, `Transpose`, `Slice` / `Split` copies, `Concat`, `Resize` (nearest,
+integer upsampling), `Gather` (axis 0), `OneHot`,
 `Cast` (integer ↔ `Data_t`), `SpaceToDepth`, and the Llama decoder,
 vision-encoder (SmolVLM) and text-to-speech (Piper) ops of the custom domain `axi.llm`.
 TensorFlow-style LayerNorm and GELU (tanh / erf)
@@ -817,7 +818,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1696 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1699 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

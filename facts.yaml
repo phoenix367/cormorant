@@ -400,6 +400,7 @@ facts:
     - {file: inference-scheduler/remote_config.json.example, regex: '\\"VectorOPKernel\\": \\"\.\./build/([^\\]+)\\"'}
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/object_detection/object_detection_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/camera/camera_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/vectorop_rtl/[\w./]+/src)', count: 2}
@@ -425,6 +426,7 @@ facts:
     - {file: inference-scheduler/perf_config.json.example, regex: '"PoolingKernel": "\.\./build/([^"]+)"'}
     - {file: inference-scheduler/remote_config.json.example, regex: '"PoolKernel": "\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/object_detection/object_detection_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/camera/camera_config.json.example, regex: '"PoolKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/pool_rtl/[\w./]+/src)', count: 2}
@@ -450,6 +452,7 @@ facts:
     - {file: inference-scheduler/remote_config.json.example, regex: '\\"MatmulKernel\\": \\"\.\./build/([^\\]+)\\"'}
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/object_detection/object_detection_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/matmul_rtl/[\w./]+/src)', count: 2}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '<repo>/build/(kernels/matmul_rtl/[\w./]+/src)/'}
@@ -472,6 +475,7 @@ facts:
     - {file: inference-scheduler/perf_config.json.example, regex: '"ConvKernel": "\.\./build/([^"]+)"'}
     - {file: inference-scheduler/remote_config.json.example, regex: '"ConvKernel": "\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/object_detection/object_detection_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/camera/camera_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
@@ -561,6 +565,21 @@ facts:
       local: "generate_llm_project.py reads local.driver_dirs from the BERT demo's config"
       remote.uio_devices: "llm_board.py / llm_attn_kernel_bench.py read the BERT demo's remote section"
 
+- id: config.object_detection
+  kind: interface
+  title: object_detection_config.json.example against the code that reads it
+  check: config_keys
+  args:
+    example: demo/object_detection/object_detection_config.json.example
+    code: [demo/object_detection]
+    waive:
+      ssh.host: "RemoteSession (inference-scheduler/src/remote/session.py) reads the ssh section"
+      ssh.user: "RemoteSession reads the ssh section"
+      ssh.port: "RemoteSession reads the ssh section"
+      ssh.key_file: "RemoteSession reads the ssh section"
+      ssh.password: "RemoteSession reads the ssh section"
+      ssh.connect_timeout: "RemoteSession reads the ssh section"
+
 # ── recorded: measured, with provenance ──────────────────────────────────────
 - id: chat.pool_mib
   kind: recorded
@@ -568,14 +587,14 @@ facts:
   value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 51}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 51d1224
+    commit: fcdc1e7
     date: 2026-10-08
     how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
           at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
           360M 740.2, SmolVLM 494.8 MiB); Piper 48.1 MiB (demo/tts/build/piper_project, same session); 5ecd78b changed
           only a docstring of matmul_gemv.py.  2026-10-07 (facts.py verify, after d05cf0b's VectorOP sums in Piper and
           KV_DECODE_PLAN's decode attention on the FPGA): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9 (unchanged),
-          Piper 51.1 MiB (48.1 before: the stage-2 tap-group sum's own 3.1 MB output)  2026-10-08 (facts.py verify after SOFTMAX_PLAN: the softmax moved to VectorOPKernel, no buffer changed): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9, Piper 51.1 MiB."
+          Piper 51.1 MiB (48.1 before: the stage-2 tap-group sum's own 3.1 MB output)  2026-10-08 (facts.py verify after SOFTMAX_PLAN: the softmax moved to VectorOPKernel, no buffer changed): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9, Piper 51.1 MiB.  Again after its phase 6 (fcdc1e7: Piper's encoder softmax on the unit, the logits in existing slots): the same."
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
     - inference-scheduler/src/codegen/_core.py
@@ -858,7 +877,8 @@ facts:
   title: the board results of README "Results on the board", and where they are repeated
   value: {resnet18_ms: 20.2, resnet18_fps: 49.6, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.4, bert_ms: 418,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
-          smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249}
+          smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249,
+          yolov5n_ms: 63.9, yolov5n_fps: 15.6}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -894,7 +914,7 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201"
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS"
     facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
@@ -908,9 +928,13 @@ facts:
                        transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'mnist_convnet')"}
     mnist_lenet_ms: {file: demo/mnist/build/results.json, json: '',
                      transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'mnist_lenet')"}
+    yolov5n_ms: {file: demo/object_detection/build/results.json, json: '',
+                 transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'yolov5n')"}
+    yolov5n_fps: {file: demo/object_detection/build/results.json, json: '',
+                  transform: "one(x['metrics']['fps'] for x in v if x['name'] == 'yolov5n')"}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
-    - {file: README.md, regex: '\*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
+    - {file: README.md, regex: '\| ResNet-18, 224×224 \| \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
     - {file: README.md, regex: '\| MobileNet V1 / V2, 224×224 \| (?P<mobilenet_v1_ms>[\d.]+) / (?P<mobilenet_v2_ms>[\d.]+) ms per image'}
     - {file: README.md, regex: '\*\*(?P<bert_ms>\d+) ms\*\* per inference \(p50'}
     - {file: README.md, regex: 'SmolLM2-135M-Instruct \|[^|\n]*, 16-token prefill (?P<smollm2_135m_prefill16_s>[\d.]+) s'}
@@ -919,6 +943,10 @@ facts:
     - {file: README.md, regex: '\*\*(?P<smolvlm_image_s>[\d.]+) s\*\* per image for the vision encoder'}
     - {file: README.md, regex: 'real-time factor (?P<piper_rtf>[\d.]+)\)'}
     - {file: README.md, regex: 'MNIST convnet / LeNet \| (?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image'}
+    - {file: README.md, regex: 'YOLOv5n object detection, 640×640 \| \*\*(?P<yolov5n_ms>[\d.]+) ms \((?P<yolov5n_fps>[\d.]+) FPS\)\*\*'}
+    - {file: demo/README.md, regex: 'PoolingKernel \((?P<yolov5n_ms>\d+) ms per image, (?P<yolov5n_fps>[\d.]+) FPS\)'}
+    - {file: demo/object_detection/README.md, regex: 'takes \*\*(?P<yolov5n_ms>[\d.]+) ms per image \((?P<yolov5n_fps>[\d.]+) FPS\)\*\*'}
+    - {file: doc/README.md, regex: 'the `demo/object_detection` demo — (?P<yolov5n_ms>\d+) ms per image on the board'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
     - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
     - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
@@ -953,6 +981,63 @@ facts:
     - {file: .claude/skills/llm-onboard/SKILL.md, regex: '`llm_image` ~(?P<smolvlm_image_s>[\d.]+) s'}
 
 # ── the README's hardware claims ─────────────────────────────────────────────
+
+- id: yolo.quality
+  kind: recorded
+  title: YOLOv5n's COCO128 mAP, the FPGA datapath (the scheduler's simulation = the board) against float
+  value: {map50: 0.543, map: 0.343, float_map50: 0.545, float_map: 0.349}
+  tolerance: 0.0006                          # the docs round to three places
+  provenance:
+    date: 2026-10-08
+    how: "demo/object_detection/scripts/yolo_study.py study (YOLO_PLAN §3.2): all 128 COCO128 images, val.py's
+          NMS (conf 0.001, IoU 0.6, multi-label); float = onnxruntime on yolov5n_raw.onnx, FPGA = the
+          scheduler's simulation (the board equals it bit for bit, §3.3): 0.5427 / 0.3429 against 0.5454 / 0.3486"
+    facts: {perf.bitstream_id: 8599aa7a5f12}   # the datapath, not the bitstream: any kernel change re-measures
+  verify:
+    map50: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map50}
+    map: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map}
+    float_map50: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.float.map50}
+    float_map: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.float.map}
+  fix: report
+  mentions:
+    - {file: README.md, regex: 'COCO128 mAP@0\.5:0\.95 (?P<map>[\d.]+) \(float (?P<float_map>[\d.]+)\)'}
+    - {file: demo/README.md, regex: 'COCO128 mAP@0\.5:0\.95 (?P<map>[\d.]+) against float.s (?P<float_map>[\d.]+)'}
+    - {file: doc/README.md, regex: 'COCO128 mAP@0\.5:0\.95 (?P<map>[\d.]+) against float.s (?P<float_map>[\d.]+)'}
+    - {file: doc/plans/YOLO_PLAN.md, dotall: true,
+       regex: 'mAP@0\.5:0\.95 (?P<map>[\d.]+) against float.s (?P<float_map>[\d.]+) \(mAP@0\.5 (?P<map50>[\d.]+)\s+vs (?P<float_map50>[\d.]+)\)'}
+    - {file: demo/object_detection/README.md, regex: '^\| float \(onnxruntime\) \| (?P<float_map50>[\d.]+) \| (?P<float_map>[\d.]+) \|'}
+    - {file: demo/object_detection/README.md, regex: '^\| \*\*FPGA\*\* \(Q8\.8 datapath\) \| \*\*(?P<map50>[\d.]+)\*\* \| \*\*(?P<map>[\d.]+)\*\* \|'}
+
+- id: yolo.model
+  kind: value
+  title: the YOLOv5n release file and COCO128 archive the demo pins (SHA-256), where the docs quote them
+  source:
+    parts:
+      model_sha: {file: demo/object_detection/scripts/yolo_study.py, regex: '^MODEL_SHA = "([0-9a-f]{64})"'}
+      coco_sha: {file: demo/object_detection/scripts/yolo_study.py, regex: '^COCO_SHA = "([0-9a-f]{64})"'}
+  fix: report
+  mentions:
+    - {file: doc/plans/YOLO_PLAN.md, regex: 'size and hash: [\d ]+ bytes, SHA-256\s+`(?P<model_sha>[0-9a-f]{64})`'}
+    - {file: doc/plans/YOLO_PLAN.md, regex: '`coco128\.zip` SHA-256\s+`(?P<coco_sha>[0-9a-f]+…[0-9a-f]+)`',
+       format: "f'{v[:8]}…{v[-5:]}'"}
+    - {file: demo/object_detection/README.md, regex: 'v7\.0, SHA-256 `(?P<model_sha>[0-9a-f]+)…`', format: "v[:8]"}
+
+- id: piper.encode_ms
+  kind: recorded
+  title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
+  value: {ids20: 20.4, ids88: 55.7, ids400: 163.9}
+  tolerance: {rel: 0.03}                     # the docs round to the ms
+  provenance:
+    date: 2026-10-08
+    how: "tts_board.py on 8599aa7a5f12 with the library of SOFTMAX_PLAN §5 (the encoder softmax on VectorOPKernel's
+          unit), best of 3 repetitions: 20 ids 20.43, 88 ids 55.65, 400 ids 163.92 ms (the host softmax before:
+          20.50 / 58.25 / 208.10); the install's gate on the production paths 163.7 ms at 400 ids"
+    facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
+  fix: report
+  mentions:
+    - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
+    - {file: demo/tts/README.md, regex: '(?P<ids88>\d+) ms for 88 ids, (?P<ids400>\d+) ms for 400 \(208 before\)'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`tts_encode`, (?P<ids20>\d+)–(?P<ids400>\d+) ms'}
 - id: platform.kv260_bounds
   kind: value
   title: the KV260 kernel tiles and bounds the README's kernel table quotes (and the RTL MatmulKernel hard-codes)
@@ -1061,6 +1146,8 @@ facts:
     - {name: camera demo config, file: demo/camera/camera_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
     - {name: image demo config, file: demo/image_classification/image_classification_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: object detection demo config, file: demo/object_detection/object_detection_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
     - {name: MNIST demo config, file: demo/mnist/mnist_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}

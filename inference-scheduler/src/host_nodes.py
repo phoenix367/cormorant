@@ -867,7 +867,7 @@ static void host_cast(const Data_t *x, Data_t *y, unsigned n, unsigned mode)
 # Helper kinds in emission order.  ``lut_map`` is pulled in by the GELU kinds
 # when the element type has lookup tables (``dtype.host_lut_bits``).
 HOST_C_HELPER_ORDER = ("lut_map", "softmax", "layernorm", "gelu_tanh", "gelu_erf",
-                       "copy_nd", "gather_rows", "onehot", "cast")
+                       "copy_nd", "concat", "gather_rows", "onehot", "cast")
 
 
 def host_c_helper(kind: str, lut: bool) -> str:
@@ -881,7 +881,7 @@ def host_c_helper(kind: str, lut: bool) -> str:
     if kind == "gelu_erf":
         return _gelu_c("erf", lut)
     return {"layernorm": _LAYERNORM_C, "copy_nd": _COPY_ND_C, "gather_rows": _GATHER_C,
-            "onehot": _ONEHOT_C, "cast": _CAST_C}[kind]
+            "onehot": _ONEHOT_C, "cast": _CAST_C, "concat": _CONCAT_C}[kind]
 
 
 # ------------------------------------------------------------------ #
@@ -1373,6 +1373,150 @@ class SliceNode(_CopyNode):
         return np.ascontiguousarray(x[sl]).reshape(self.output.shape)
 
 
+@dataclass
+class ResizeNode(_CopyNode):
+    """ONNX Resize, mode nearest by integer scales (an upsample: output
+    pixel (y, x) reads input (y / s_h, x / s_w)) as a strided host copy with
+    zero strides — bit-exact, dtype-agnostic.  Coordinate modes whose
+    integer-scale nearest pick is that pixel: asymmetric with floor (YOLOv5's
+    nn.Upsample), half_pixel / pytorch_half_pixel with round_prefer_floor /
+    round_prefer_ceil."""
+    scale: List[int] = field(default_factory=list)
+
+    _MODES: ClassVar[Tuple[Tuple[str, str], ...]] = (
+        ("asymmetric", "floor"), ("half_pixel", "round_prefer_floor"),
+        ("half_pixel", "round_prefer_ceil"), ("pytorch_half_pixel", "round_prefer_floor"),
+        ("pytorch_half_pixel", "round_prefer_ceil"))
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        x = _resolve(tensors, node.input[0], node)
+        y = _resolve(tensors, node.output[0], node)
+        a = _attrs(node)
+        mode = a.get("mode", b"nearest")
+        mode = mode.decode() if isinstance(mode, bytes) else str(mode)
+        ctm = a.get("coordinate_transformation_mode", b"half_pixel")
+        ctm = ctm.decode() if isinstance(ctm, bytes) else str(ctm)
+        nm = a.get("nearest_mode", b"round_prefer_floor")
+        nm = nm.decode() if isinstance(nm, bytes) else str(nm)
+        if mode != "nearest" or (ctm, nm) not in cls._MODES:
+            raise SchedulerError(f"Resize node '{_label(node)}': mode {mode}, coordinate "
+                                 f"transformation {ctm}, nearest_mode {nm} (supported: nearest "
+                                 f"with integer scales, {', '.join('/'.join(m) for m in cls._MODES)})")
+        rank = len(x.shape)
+        if list(y.shape)[:2] != list(x.shape)[:2] or rank != 4:
+            raise SchedulerError(f"Resize node '{_label(node)}': only the spatial dims of an NCHW "
+                                 f"tensor may scale ({x.shape} -> {y.shape})")
+        scale = []
+        for ax in (2, 3):
+            q, r = divmod(int(y.shape[ax]), int(x.shape[ax]))
+            if r or q < 1:
+                raise SchedulerError(f"Resize node '{_label(node)}': {x.shape} -> {y.shape} is not "
+                                     f"an integer upsample")
+            scale.append(q)
+        N, C, H, W = (int(v) for v in x.shape)
+        dims, sstr = _collapse([N * C, H, scale[0], W, scale[1]], [H * W, W, 0, 1, 0])
+        return cls(onnx_node=node, inputs=[x], output=y, index=index, align_elems=align_elems,
+                   dims=dims, sstr=sstr, scale=scale)
+
+    def describe(self) -> str:
+        return f"nearest x{self.scale[0]} x {self.scale[1]}"
+
+    def reference(self, ins, dtype):
+        x = np.asarray(ins[0]).reshape(self.inputs[0].shape)
+        return np.repeat(np.repeat(x, self.scale[0], axis=2), self.scale[1], axis=3).reshape(
+            self.output.shape)
+
+
+@dataclass
+class ConcatNode(HostNode):
+    """ONNX Concat as host copies: input k's [outer][c_k * inner] rows go to
+    the output rows at their offset (outer = the product of the dims before
+    the axis) — bit-exact, dtype-agnostic."""
+    helpers: ClassVar[Tuple[str, ...]] = ("concat",)
+    axis:  int = 1
+    outer: int = 1
+    rows:  List[int] = field(default_factory=list)
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        xs = [_resolve(tensors, n, node) for n in node.input if n]
+        y = _resolve(tensors, node.output[0], node)
+        rank = len(y.shape)
+        axis = int(_attrs(node).get("axis", 0))
+        axis = axis + rank if axis < 0 else axis
+        if not 0 <= axis < rank:
+            raise SchedulerError(f"Concat node '{_label(node)}': axis {axis} of rank {rank}")
+        for x in xs:
+            if len(x.shape) != rank or any(int(x.shape[i]) != int(y.shape[i]) for i in range(rank) if i != axis):
+                raise SchedulerError(f"Concat node '{_label(node)}': input {x.shape} does not match "
+                                     f"output {y.shape} off axis {axis}")
+            if x.is_int != y.is_int:
+                raise SchedulerError(f"Concat node '{_label(node)}': mixed integer / Data_t inputs")
+        if sum(int(x.shape[axis]) for x in xs) != int(y.shape[axis]):
+            raise SchedulerError(f"Concat node '{_label(node)}': inputs do not add up to {y.shape}")
+        outer = int(np.prod([int(v) for v in y.shape[:axis]], dtype=np.int64))
+        inner = int(np.prod([int(v) for v in y.shape[axis + 1:]], dtype=np.int64))
+        return cls(onnx_node=node, inputs=xs, output=y, index=index, align_elems=align_elems,
+                   axis=axis, outer=outer, rows=[int(x.shape[axis]) * inner for x in xs])
+
+    def describe(self) -> str:
+        return f"axis {self.axis}: {len(self.inputs)} inputs, {self.outer} x {sum(self.rows)} elements"
+
+    def c_file_consts(self, dtype):
+        r = ", ".join(f"{v}u" for v in self.rows)
+        return [f"static const unsigned {self.c_prefix}_r[{len(self.rows)}] = {{{r}}};"
+                f"  /* [{self.index}] Concat */"]
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        n = len(ins)
+        return ["{",
+                f"    const Data_t *const _in[{n}] = {{ {', '.join(ins)} }};",
+                f"    host_concat(_in, {self.c_prefix}_r, {n}u, {self.outer}u, {out});",
+                "}"]
+
+    def reference(self, ins, dtype):
+        xs = [np.asarray(v).reshape(t.shape) for v, t in zip(ins, self.inputs, strict=True)]
+        return np.concatenate(xs, axis=self.axis).reshape(self.output.shape)
+
+
+_CONCAT_C = r"""/* Concat: out row o = in_0 row o | in_1 row o | ... (rows[k] elements of
+ * input k), for the ``outer`` rows; split over the inputs x rows. */
+typedef struct {
+    const Data_t *const *in;
+    const unsigned      *rows;
+    unsigned             n, total;
+    Data_t              *out;
+} host_concat_t;
+
+static void host_concat_part(void *p, unsigned u0, unsigned u1)
+{
+    const host_concat_t *a = (const host_concat_t *)p;
+    unsigned             u;
+    for (u = u0; u < u1; u++) {
+        const unsigned o = u / a->n, k = u % a->n;
+        size_t         off = 0;
+        unsigned       j;
+        for (j = 0u; j < k; j++)
+            off += a->rows[j];
+        memcpy(a->out + (size_t)o * a->total + off, a->in[k] + (size_t)o * a->rows[k],
+               (size_t)a->rows[k] * sizeof(Data_t));
+    }
+}
+
+static void host_concat(const Data_t *const *in, const unsigned *rows, unsigned n, unsigned outer,
+                        Data_t *out)
+{
+    host_concat_t a;
+    unsigned      k;
+    a.in = in; a.rows = rows; a.n = n; a.out = out; a.total = 0u;
+    for (k = 0u; k < n; k++)
+        a.total += rows[k];
+    host_parallel(host_concat_part, &a, outer * n, 1u, 1u);
+}
+"""
+
+
 # ------------------------------------------------------------------ #
 # Gather / OneHot / Cast                                               #
 # ------------------------------------------------------------------ #
@@ -1563,6 +1707,8 @@ HOST_OP_FACTORIES = {
     "Gelu":               GeluNode.from_onnx_node,
     "Transpose":          TransposeNode.from_onnx_node,
     "Slice":              SliceNode.from_onnx_node,
+    "Concat":             ConcatNode.from_onnx_node,
+    "Resize":             ResizeNode.from_onnx_node,
     "Gather":             GatherNode.from_onnx_node,
     "OneHot":             OneHotNode.from_onnx_node,
     "Cast":               make_cast_node,

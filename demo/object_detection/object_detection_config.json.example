@@ -1,0 +1,48 @@
+{
+  "_comment": "Copy to object_detection_config.json and edit. Paths are relative to demo/object_detection/.",
+  "ssh": {
+    "host": "kv260.local",
+    "user": "root",
+    "port": 22,
+    "key_file": "~/.ssh/id_rsa",
+    "_key_file_note": "Path to SSH private key; null for password auth.",
+    "password": null,
+    "connect_timeout": 15
+  },
+  "remote": {
+    "work_dir": "/tmp/object_detection_demo",
+    "_work_dir_note": "Per-run scratch directory on the board (the project, the images, heads.bin). Created if missing.",
+    "uio_devices": {
+      "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel": "fabric_matmul",
+      "ConvKernel": "fabric_conv",
+      "PoolKernel": "fabric_pool"
+    },
+    "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name",
+    "cmake_args": []
+  },
+  "local": {
+    "driver_dirs": {
+      "VectorOPKernel": "../../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
+      "MatmulKernel": "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
+      "ConvKernel": "../../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src",
+      "PoolKernel": "../../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
+    },
+    "_driver_dirs_note": "Per-kernel driver sources (make driver_vectorop_rtl driver_conv_rtl driver_pool_rtl), copied into the project before upload."
+  },
+  "build": {
+    "jobs": 2,
+    "timeout": 900
+  },
+  "run": {
+    "timeout": 900,
+    "use_sudo": true,
+    "warmup": 1,
+    "images": 16,
+    "_images_note": "How many COCO128 images to run (all: 128), plus every picture in assets/images/.",
+    "check_images": 2,
+    "_check_images_note": "Images whose head maps are compared bit for bit with the scheduler's simulation (about 20 s each on the host).",
+    "conf": 0.25,
+    "iou": 0.45
+  }
+}

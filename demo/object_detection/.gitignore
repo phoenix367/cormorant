@@ -1,0 +1,10 @@
+# User-local config — copy from object_detection_config.json.example and edit.
+object_detection_config.json
+
+# Downloaded assets (the ONNX model, COCO128 images and labels) and preprocessed inputs.
+assets/
+
+# Generated inference project, reference outputs, annotated images, results, logs.
+build/
+
+__pycache__/
