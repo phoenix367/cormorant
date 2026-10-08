@@ -6,8 +6,9 @@
 
 Four kernels for the Xilinx Kria KV260 (Conv, VectorOP, MatMul and Pooling,
 all in SystemVerilog) and a Python code generator that compiles
-ONNX models — CNNs, BERT-base, Llama-family decoders, a ViT vision encoder
-and a VITS text-to-speech model — into self-contained C projects that drive the
+ONNX models — CNN classifiers, the YOLOv5n object detector, BERT-base,
+Llama-family decoders, a ViT vision encoder and a VITS text-to-speech model —
+into self-contained C projects that drive the
 kernels from Linux on the board.  Everything runs in 16-bit fixed point
 (`ap_fixed<16,8>`, or per-tensor power-of-two exponents), and the board's
 outputs are checked bit for bit against the generator's fixed-point
@@ -29,11 +30,13 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 250 MHz, 16-bit fixed point (measured 2026-10-06 on bitstream
-`986cef4866a0`, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), and again on the production
-`6436623029f7` — the same with VectorOPKernel's activation unit, BERT's GELUs on the FPGA,
-[ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md); the chat-server Piper figures 2026-10-01,
-at 100 MHz):
+KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-08 on the
+production bitstream `8599aa7a5f12`: the 250 MHz design of
+[FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
+([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
+([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), and its second read port on a PS port of its
+own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)).  The chat-server Piper figures are from
+2026-10-01, at 100 MHz.
 
 | Model | Result | Source |
 |---|---|---|
@@ -41,14 +44,14 @@ at 100 MHz):
 | MobileNet V1 / V2, 224×224 | 22.0 / 20.4 ms per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
 | YOLOv5n object detection, 640×640 | **63.9 ms (15.6 FPS)** per image (the network on the FPGA; decode + NMS on the host), COCO128 mAP@0.5:0.95 0.343 (float 0.349) | [YOLO_PLAN](doc/plans/YOLO_PLAN.md), [demo/object_detection](demo/object_detection/README.md) |
 | MNIST convnet / LeNet | 0.111 / 1.249 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **418 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (427 ms with the softmax on the FPGA), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **418 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (427 ms with both VectorOP reads on one PS port), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (525 ms with the softmax on the host), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host too; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
 | SmolLM2-135M-Instruct | **18.3 tokens/s** decode, 16-token prefill 0.15 s, 256-token prefill 0.74 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
 | SmolLM2-360M-Instruct | **7.3 tokens/s** decode, 16-token prefill 0.34 s, 256-token prefill 2.05 s, 740 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
 | SmolVLM-256M-Instruct (image chat) | **1.9 s** per image for the vision encoder (7.7 s at first), then 54 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.30 s** per 1.49 s of audio (real-time factor 0.20), text encoder 56 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
 
-The BERT, SmolLM2 and SmolVLM logits and the Piper audio samples are
-bit-exact with the scheduler's simulation.
+The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
+audio samples are bit-exact with the scheduler's simulation.
 The FPGA design (`hw/cormorant_hw_128`, bitstream `8599aa7a5f12`) uses 57 % of the DSPs
 (712 / 1248), 53.3 % of the LUTs (62 400 / 117 120), 123 / 144 BRAM and
 48 / 64 URAM.
@@ -80,14 +83,16 @@ bounds come from [`platforms/kv260.json`](platforms/kv260.json).
 
 | Kernel | ONNX ops | Highlights | Reference |
 |---|---|---|---|
-| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)` | SystemVerilog: 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), fused Relu / Relu6 after an op | [VECTOROP_RTL_KERNEL](doc/kernels/VECTOROP_RTL_KERNEL.md) |
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)`, `LeakyRelu`, SiLU, `Gelu`, `Softmax` | SystemVerilog: 8 lanes per cycle (`Div`: 1), broadcast / strided operands (`outer` × `size` runs, stride-0 replay), an activation fused after an op; an activation unit (LeakyReLU, SiLU, GELU erf / tanh: the exact function, rounded to nearest) and a softmax unit (rows, or keys-major columns written transposed; within 1 LSB of the exact softmax) | [VECTOROP_RTL_KERNEL](doc/kernels/VECTOROP_RTL_KERNEL.md), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) |
 | **MatmulKernel** | `MatMul` | SystemVerilog: 2 × 64 DSP MACs (128 MAC/cycle) on panels of 8 A rows, packed-B weight layout (32-column tiles), K ≤ 4096, batched; image mode reads B in ConvKernel's layout through both read ports, so a weight shared with ConvKernel is stored once | [MATMUL_RTL_KERNEL](doc/kernels/MATMUL_RTL_KERNEL.md) |
 | **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | SystemVerilog: 16 × 16 MAC grid, two output pixels per cycle (512 MACs in 32 cascades of 16 DSP48E2), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels; a chunk's drain overlaps the next one's compute | [CONV_RTL_KERNEL](doc/kernels/CONV_RTL_KERNEL.md) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | SystemVerilog: 8 channel lanes, windows ≤ 7×7, two output positions per cycle, dilation, `count_include_pad` | [POOL_RTL_KERNEL](doc/kernels/POOL_RTL_KERNEL.md) |
 
 The Vivado block design (a git submodule, `hw/cormorant_hw_128`) streams the
 weights — ConvKernel `weight` / `bias` and MatmulKernel's second read port —
-through PS port `S_AXI_HPC1_FPD`; the other data ports share `S_AXI_HPC0_FPD`.
+and VectorOPKernel's second operand (`b`) through PS port `S_AXI_HPC1_FPD`; the
+other data ports share `S_AXI_HPC0_FPD`.  The `b` port's move made binary
+VectorOP calls 24–38 % faster ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)).
 MatmulKernel reads A and B through both of its read ports.
 
 ---
@@ -98,30 +103,37 @@ MatmulKernel reads A and B through both of its read ports.
 project (`CMakeLists.txt`, `inference.c`, weights in `.dat` files, a test
 program) for Linux with XRT buffers or for bare metal:
 
-- **Kernel mapping** — element-wise ops on VectorOP, MatMuls on MatmulKernel
-  or, where a cost model says it is faster, on ConvKernel with swapped operand
+- **Kernel mapping** — element-wise ops on VectorOP (`LeakyRelu`, SiLU and
+  `Gelu` on its activation unit, fused into a producing Add / Mul where they
+  can be; `Softmax` rows on its softmax unit), MatMuls on MatmulKernel or,
+  where a cost model says it is faster, on ConvKernel with swapped operand
   roles; `Gemm` is decomposed, `Reshape`-class ops and contiguous
   `Split` / `Slice` pieces are free views.
-- **Host-CPU ops** for what no kernel implements — `Softmax`, `LayerNormalization`,
-  `Gelu`, `Transpose`, `Gather`, `OneHot`, `Cast`, `SpaceToDepth` — with the
-  LayerNorm / GELU subgraphs of exported BERT models fused into single ops, and
-  a host thread pool.
+- **Host-CPU ops** for what no kernel implements — `LayerNormalization`,
+  `Transpose`, `Concat`, `Resize` (nearest upsampling), `Gather`, `OneHot`,
+  `Cast`, `SpaceToDepth`, and `Softmax` / `Gelu` where the VectorOP units do not
+  apply — with the LayerNorm / GELU subgraphs of exported BERT models fused into
+  single ops, and a host thread pool.
 - **Llama-family decoders** — a frontend reads `config.json` + safetensors and
-  builds decode / prefill / head graphs with host ops for RMSNorm, RoPE
-  attention with a KV cache, SiLU and a float residual stream; per-channel
-  power-of-two exponents fit the model into Q8.8.  Several graphs share one
-  library and weight pool (`--entry`).  A ViT frontend (SmolVLM's SigLIP-style
-  encoder + connector) adds a `vision` entry whose image features feed the
-  decoder's prefill.
+  builds decode / prefill / head graphs with host ops for RMSNorm, RoPE, SiLU
+  and a float residual stream; attention reads the KV cache on ConvKernel
+  (q·Kᵀ and P·V, prefill and decode), with the prefill's softmax on
+  VectorOP's softmax unit.  Per-channel power-of-two exponents fit the model
+  into Q8.8.  Several graphs share one library and weight pool (`--entry`).  A
+  ViT frontend (SmolVLM's SigLIP-style encoder + connector) adds a `vision`
+  entry whose image features feed the decoder's prefill; its attention runs
+  on ConvKernel, its softmax and 11 of its 12 GELUs on VectorOP.
 - **Text to speech** — a Piper (VITS) frontend writes the flow and the
   HiFi-GAN decoder as one fixed-size chunk (128 frames, 1.49 s of audio):
   66 ConvKernel convolutions with power-of-two exponents per chunk.
   - The text encoder runs as length-bucketed entries, with its projections
-    and attention on ConvKernel.
+    and attention on ConvKernel and its attention softmax on VectorOP's
+    softmax unit.
   - The duration predictor runs as C code in the library.
   - 1-D convolutions are folded into rows.
   - Transposed convolutions run polyphase.
-  - Gates, sums, LeakyReLU and masks are host ops.
+  - The decoder's residual sums are VectorOP `Add`s; gates, the other sums,
+    LeakyReLU and masks are host ops.
   - Consecutive chunks join into one waveform bit for bit.
 - **Scheduling** — kernels on different lanes run concurrently; one weak
   `kernel_wait()` does the synchronisation; intermediate buffers share pool
@@ -298,6 +310,7 @@ own models.
 | [MobileNet V1](https://drive.google.com/file/d/1PzFSPkXpkIpiKfyo8tORl2AkfXgjdQvw) | `1×3×224×224` | ImageNet classifier (depthwise-separable) |
 | [MobileNet V2](https://drive.google.com/file/d/1ti97y2P_Fc8TRUk0oVm_AG7yrmk5Fuw1) | `1×3×224×224` | ImageNet classifier (inverted residuals) |
 | [ResNet-18](https://drive.google.com/file/d/1DKyALYam5jAzMSK8ulgFQuSbQ62-EVvr) | `1×3×224×224` | ImageNet classifier (residual blocks) |
+| [YOLOv5n](https://github.com/ultralytics/yolov5/releases/tag/v7.0) (Ultralytics v7.0 ONNX; the demo cuts it at its Detect convs) | `1×3×640×640` | object detection, COCO's 80 classes ([demo/object_detection](demo/object_detection/README.md)) |
 | bertsquad-12 (ONNX model zoo) | 256 tokens | extractive QA ([demo/bert_squad](demo/bert_squad/README.md)) |
 | SmolLM2-135M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
 | SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
