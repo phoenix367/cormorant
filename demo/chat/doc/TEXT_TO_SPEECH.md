@@ -99,7 +99,7 @@ chat answer aloud ([Clients](CLIENTS.md#reading-answers-aloud)).
    (espeak-ng, then Piper's ids).  It packs whole sentences into
    utterances of at most 400 ids.
 2. **Under the lock**, for each utterance:
-   - the text encoder runs on the FPGA (`tts_encode`, 26–260 ms);
+   - the text encoder runs on the FPGA (`tts_encode`, 20–164 ms; its attention softmax on VectorOPKernel's softmax unit);
    - the duration predictor runs as C code in the library
      (`tts_duration`, 18–200 ms);
    - the alignment and the noise are computed in numpy;

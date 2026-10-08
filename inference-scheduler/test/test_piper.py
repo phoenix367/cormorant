@@ -15,9 +15,12 @@ import sys
 import tempfile
 import unittest
 
+from unittest import mock
+
 import numpy as np
 
 import host_emu
+from src import _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.piper import (FLOW_FRAMES, PiperChunkFrontend, PiperEncoderFrontend, encoder_weights, exponent_keys,
@@ -186,6 +189,76 @@ class TestPiperEncoder(unittest.TestCase):
             rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
         self.assertEqual(rc, 0, out[-3000:])
         self.assertIn("PASSED", out)
+
+
+def _unit(on=True):
+    """The platform gate of VectorOPKernel's softmax unit, patched."""
+    return mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", on)
+
+
+class TestPiperEncoderSoftmaxUnit(unittest.TestCase):
+    """PiperEncoderFrontend(vsmx=True) (doc/plans/SOFTMAX_PLAN.md §5): the host
+    adds the relative-key band (TtsAttnRelAdd), VectorOPKernel's softmax unit
+    takes the softmax — against encoder_forward(vsmx_unit=True)."""
+
+    def test_simulation_matches_specification(self):
+        W, EW, E = encoder_setup()
+        rng = np.random.default_rng(5)
+        with _unit():
+            for T in (32, 64):
+                cg = CodeGenerator(OnnxGraph(PiperEncoderFrontend(W, E, T, vsmx=True).entry()),
+                                   model_path="enc.onnx")
+                for n in (T, T - 5, 17, 1):
+                    ids = rng.integers(0, 256, n)
+                    pad = np.zeros(T, np.int64)
+                    pad[:n] = ids
+                    out = cg._forward_pass({f"enc{T}.ids": pad, f"enc{T}.n": np.array([n])},
+                                           keep=[f"enc{T}.x", f"enc{T}.stats"])
+                    x = np.asarray(out[f"enc{T}.x"]).reshape(T, 192)
+                    st = np.asarray(out[f"enc{T}.stats"]).reshape(T, 384)
+                    xs, ss = pv.encoder_forward(EW, E, ids, vsmx_unit=True)
+                    np.testing.assert_array_equal(x[:n].astype(np.float32), xs, err_msg=f"x T {T} n {n}")
+                    np.testing.assert_array_equal(st[:n].astype(np.float32), ss, err_msg=f"stats T {T} n {n}")
+                    self.assertFalse(x[n:].any() or st[n:].any(), f"padding rows T {T} n {n}")
+
+    def test_differs_from_the_host_softmax(self):
+        # the unit's P is not the host's (within one LSB): the policy really changes the numbers
+        W, EW, E = encoder_setup()
+        ids = np.random.default_rng(6).integers(0, 256, 40)
+        self.assertFalse(np.array_equal(pv.encoder_forward(EW, E, ids)[0],
+                                        pv.encoder_forward(EW, E, ids, vsmx_unit=True)[0]))
+
+    def test_graph(self):
+        W, _, E = encoder_setup()
+        with _unit():
+            g = OnnxGraph(PiperEncoderFrontend(W, E, 64, vsmx=True).entry())
+        kinds = {}
+        for sn in g.nodes:
+            kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
+        self.assertEqual(kinds, {"TtsEmbedNode": 1, "TtsRowPrepNode": 19, "MatmulConvNode": 37,
+                                 "VitAttnPrepNode": 6, "LlmAttnConvNode": 24, "TtsAttnRelAddNode": 12,
+                                 "TtsAttnSoftmaxVopNode": 12, "TtsAttnMergeNode": 6, "TtsResNormNode": 12,
+                                 "TtsEncOutNode": 2})
+
+    def test_needs_the_unit(self):
+        W, _, E = encoder_setup()
+        with _unit(False), self.assertRaisesRegex(Exception, "softmax unit"):
+            OnnxGraph(PiperEncoderFrontend(W, E, 32, vsmx=True).entry())
+
+    @unittest.skipUnless(shutil.which("cc"), "needs cc")
+    def test_generated_c_matches_simulation(self):
+        W, _, E = encoder_setup()
+        with _unit():
+            cg = CodeGenerator(OnnxGraph(PiperEncoderFrontend(W, E, 64, vsmx=True).entry()),
+                               model_path="enc.onnx")
+            with tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("PASSED", out)
+        src = cg.generate_source()
+        self.assertIn("tts_attn_rel_add(", src)
+        self.assertIn("VECTOROP_SOFTMAX_T, 64u, 64u, 64u,", src)
+        self.assertLessEqual(src.count("tts_attn_softmax("), 1)          # the helper's definition, no call
 
 
 _DP_DRIVER = r"""

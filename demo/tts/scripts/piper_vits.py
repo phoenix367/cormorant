@@ -877,9 +877,30 @@ def encoder_exponents(EW, rec, p_exp=ENC_P, search=True):
     return E
 
 
-def encoder_forward(EW, E, ids, trace=None):
+_VSMX = None
+
+
+def vsmx():
+    """inference-scheduler/src/vectorop_smx.py (numpy only), loaded by path: the
+    integer specification of VectorOPKernel's softmax unit."""
+    global _VSMX
+    if _VSMX is None:
+        import importlib.util
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "inference-scheduler", "src", "vectorop_smx.py")
+        spec = importlib.util.spec_from_file_location("vectorop_smx", p)
+        _VSMX = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_VSMX)
+    return _VSMX
+
+
+def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False):
     """The library's encoder, bit for bit: ids -> x [n][192], stats [n][384]
-    (float32, as the library returns them)."""
+    (float32, as the library returns them).  ``vsmx_unit``: the softmax on
+    VectorOPKernel's unit (doc/plans/SOFTMAX_PLAN.md §5) — the host adds the
+    relative-key band to the scores in place (round half to even at 2^-fs,
+    saturate), the unit's integer softmax (vectorop_smx) gives P at 2^-15."""
     tr = trace if trace is not None else {}
     n = len(ids)
     L2 = lambda f: 2.0 ** -f                                     # noqa: E731
@@ -903,12 +924,21 @@ def encoder_forward(EW, E, ids, trace=None):
             sl = slice(h * ENC_HD, (h + 1) * ENC_HD)
             s_raw = _kmm(pr["q"][:, sl], pr["k"][:, sl].T)           # [queries][keys]
             rel = _enc_rel(pr["q"][:, sl] * L2(fq), EW[f"l{i}.ek"])
-            val = s_raw * L2(fs)
-            for d in range(-ENC_WIN, ENC_WIN + 1):
-                idx = np.arange(max(0, -d), min(n, n - d))
-                val[idx, idx + d] = val[idx, idx + d] + rel[idx, d + ENC_WIN]
-            ex = _libm(math.exp, val - val.max(1, keepdims=True))
-            p_raw = np.clip(np.round(ex / _seqsum(ex)[:, None] * 2.0 ** fp), 0, 32767)
+            if vsmx_unit:
+                lg = s_raw.copy()                                    # the band added in place
+                for d in range(-ENC_WIN, ENC_WIN + 1):
+                    idx = np.arange(max(0, -d), min(n, n - d))
+                    lg[idx, idx + d] = _raw(lg[idx, idx + d] + rel[idx, d + ENC_WIN] * 2.0 ** fs, 0)
+                cm, cs = vsmx().scale_regs(fs, 1.0)
+                p_raw = vsmx().softmax_raw(lg.astype(np.int64), n, cm, cs, fp).astype(np.float64)
+                tr[f"{e}.l{h}"] = lg
+            else:
+                val = s_raw * L2(fs)
+                for d in range(-ENC_WIN, ENC_WIN + 1):
+                    idx = np.arange(max(0, -d), min(n, n - d))
+                    val[idx, idx + d] = val[idx, idx + d] + rel[idx, d + ENC_WIN]
+                ex = _libm(math.exp, val - val.max(1, keepdims=True))
+                p_raw = np.clip(np.round(ex / _seqsum(ex)[:, None] * 2.0 ** fp), 0, 32767)
             o_raw = _kmm(p_raw, pr["v"][:, sl])
             o = o_raw * L2(fo)
             for d in range(-ENC_WIN, ENC_WIN + 1):
@@ -938,11 +968,12 @@ def encoder_forward(EW, E, ids, trace=None):
     return (xr * L2(fx)).astype(np.float32), (st * L2(fst) + EW["bp"]).astype(np.float32)
 
 
-def library_encoder(EW, E):
+def library_encoder(EW, E, vsmx_unit=False):
     """ids -> (x, m_p, logs_p) [192][n] float64 from encoder_forward: the
-    front end's ``encoder`` for the library's int16 encoder."""
+    front end's ``encoder`` for the library's int16 encoder (``vsmx_unit``:
+    its softmax on VectorOPKernel's unit)."""
     def enc(ids):
-        x, st = encoder_forward(EW, E, ids)
+        x, st = encoder_forward(EW, E, ids, vsmx_unit=vsmx_unit)
         x, st = x.astype(np.float64).T, st.astype(np.float64).T
         return x, st[:ENC_D], st[ENC_D:]
     return enc

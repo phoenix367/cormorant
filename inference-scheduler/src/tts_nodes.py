@@ -59,7 +59,7 @@ from .vit_nodes import _bias, float_array_item
 
 __all__ = ("TTS_OP_FACTORIES", "TtsNode", "TtsPrepNode", "TtsGateNode", "TtsSumNode", "TtsAddVopNode",
            "TtsFlowOutNode", "TtsInterleaveNode", "TtsPcmNode", "TtsEmbedNode", "TtsRowPrepNode",
-           "TtsAttnSoftmaxNode", "TtsAttnMergeNode", "TtsResNormNode", "TtsEncOutNode",
+           "TtsAttnSoftmaxNode", "TtsAttnRelAddNode", "TtsAttnMergeNode", "TtsResNormNode", "TtsEncOutNode",
            "tts_c_helpers", "LLM_DOMAIN", "libm_map")
 
 
@@ -649,6 +649,89 @@ class TtsAttnSoftmaxNode(TtsNode):
 
 
 @dataclass
+class TtsAttnRelAddNode(TtsNode):
+    """The softmax unit's half of TtsAttnSoftmax (doc/plans/SOFTMAX_PLAN.md
+    §5): inputs [s [C][T] (raw, keys-major), q0 [T][H * HD], bq, ek (constants),
+    n] -> the logits [C][T] raw at s's grid: s, plus the relative-key band
+    rel[i][j - i] (|j - i| <= W, i, j < n) rounded half to even at 2^-fs and
+    saturated; every other element copied.  TtsAttnSoftmax with vsmx = 1
+    (TtsAttnSoftmaxVopNode) then takes the softmax on VectorOPKernel."""
+    T: int = 1
+    C: int = 1
+    HD: int = 16
+    D: int = 16
+    g: int = 0
+    W: int = 4
+    fs: int = 0
+    fq: int = 0
+    fq0: int = 0
+    bq: Optional[np.ndarray] = field(default=None, repr=False)
+    ek: Optional[np.ndarray] = field(default=None, repr=False)
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        s = _resolve(tensors, node.input[0], node)
+        q0 = _resolve(tensors, node.input[1], node)
+        n = _resolve(tensors, node.input[4], node)
+        y = _resolve(tensors, node.output[0], node)
+        a = _attrs(node)
+        HD, W = int(a["head_dim"]), int(a.get("window", 4))
+        C, T = int(s.shape[0]), int(s.shape[1])
+        D = int(q0.shape[-1])
+        sn = cls(onnx_node=node, inputs=[s, q0, n], output=y, index=index, align_elems=align_elems,
+                 F=ctx.frac_bits, T=T, C=C, HD=HD, D=D, g=int(a["head"]), W=W,
+                 fs=_attr_ints(a, "s_exp", node, 1)[0], fq=_attr_ints(a, "q_exp", node, 1)[0],
+                 bq=_bias(ctx, tensors, node, 2, D, "bq"), ek=_bias(ctx, tensors, node, 3, (2 * W + 1) * HD, "ek"))
+        sn._want(s, None, "scores")
+        sn._want(q0, None, "q0")
+        sn._want(n, "i32", "n")
+        sn._want(y, None, "output")
+        sn.fq0 = _exp(q0, node)
+        _require(q0.numel == T * D and (sn.g + 1) * HD <= D, node, "q0 [T][H * HD]")
+        _require(list(y.shape) == [C, T] and C == T, node, "logits [C][T], C == T")
+        return sn
+
+    def c_runtime(self):
+        return [float_array_item("_tts_b", self.bq)[1], float_array_item("_tts_e", self.ek)[1]]
+
+    def describe(self):
+        return (f"head {self.g}: [{self.C}] keys x [{self.T}] queries + the relative-key band "
+                f"(window {self.W}) at 2^-{self.fs}")
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        bq = float_array_item("_tts_b", self.bq)[0]
+        ek = float_array_item("_tts_e", self.ek)[0]
+        return [f"tts_attn_rel_add({ins[0]}, {ins[1]}, {bq}, {ek}, {self.T}u, {self.C}u, {self.D}u, "
+                f"{self.HD}u, {self.g}u, {self.W}u, {ins[2]}[0], {_p2(-self.fq0)}, {_p2(self.fq)}, "
+                f"{_p2(self.fs)}, {out});"]
+
+    def reference(self, ins, dtype):
+        s = np.asarray(ins[0], np.float64).reshape(self.C, self.T)               # [keys][queries] raw
+        q0 = np.asarray(ins[1], np.float64).reshape(self.T, self.D)
+        n = min(max(int(np.asarray(ins[2]).reshape(-1)[0]), 0), self.C)
+        sl = slice(self.g * self.HD, (self.g + 1) * self.HD)
+        q = np.clip(np.round((q0[:n, sl] + self.bq[sl].astype(np.float64)) * 2.0 ** self.fq), -32768, 32767)
+        qv = q * 2.0 ** -self.fq
+        ek = self.ek.astype(np.float64).reshape(2 * self.W + 1, self.HD)
+        rel = np.cumsum(qv[:, None, :] * ek[None, :, :], axis=-1)[..., -1]      # [n][2W + 1]
+        out = s.copy()
+        for d in range(-self.W, self.W + 1):
+            idx = np.arange(max(0, -d), min(n, n - d))
+            out[idx + d, idx] = np.clip(np.round(out[idx + d, idx] + rel[idx, d + self.W] * 2.0 ** self.fs),
+                                        -32768, 32767)
+        return out.reshape(self.output.shape) + 0.0
+
+
+def tts_attn_softmax_factory(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsAttnSoftmax: the host op, or with vsmx = 1 VectorOPKernel's softmax
+    unit over the logits TtsAttnRelAdd wrote (inputs [l, n])."""
+    from .smx_nodes import TtsAttnSoftmaxVopNode, vsmx_attr
+    if vsmx_attr(node):
+        return TtsAttnSoftmaxVopNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    return TtsAttnSoftmaxNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+
+
+@dataclass
 class TtsAttnMergeNode(TtsNode):
     """inputs [o_0 .. o_{H-1} [T][HD] (raw P.V), P_0 .. P_{H-1} [T][C] (raw),
     ev (constant [2W + 1][HD]), n] -> [T][H * HD] int16 at f."""
@@ -826,7 +909,8 @@ TTS_OP_FACTORIES = {
     "TtsPcm":        TtsPcmNode.from_onnx_node,
     "TtsEmbed":      TtsEmbedNode.from_onnx_node,
     "TtsRowPrep":    TtsRowPrepNode.from_onnx_node,
-    "TtsAttnSoftmax": TtsAttnSoftmaxNode.from_onnx_node,
+    "TtsAttnRelAdd": TtsAttnRelAddNode.from_onnx_node,
+    "TtsAttnSoftmax": tts_attn_softmax_factory,
     "TtsAttnMerge":  TtsAttnMergeNode.from_onnx_node,
     "TtsResNorm":    TtsResNormNode.from_onnx_node,
     "TtsEncOut":     TtsEncOutNode.from_onnx_node,
@@ -1400,6 +1484,65 @@ static void tts_attn_softmax(const Data_t *s, const Data_t *q0, const float *bq,
     a.s = s; a.q0 = q0; a.bq = bq; a.ek = ek; a.T = T; a.C = C; a.D = D; a.HD = HD; a.g = g; a.W = W;
     a.n = n < (int)C ? n : (int)C; a.ss = ss; a.sq0 = sq0; a.iq = iq; a.ip = ip; a.p = p;
     host_parallel(tts_attn_softmax_rows, &a, T, 1u, 1u);
+}
+
+typedef struct {
+    const Data_t *s, *q0;
+    const float  *bq, *ek;
+    unsigned      T, C, D, HD, g, W;
+    int           n;
+    double        sq0, iq, is;
+    Data_t       *l;
+} tts_arel_t;
+
+/* Query rows [r0, r1): q and its relative-key logits as tts_attn_softmax
+ * computes them, added to the band of l (copied from s) — keys-major, so
+ * query i writes column i of key rows i - W .. i + W only. */
+static void tts_attn_rel_rows(void *pp, unsigned r0, unsigned r1)
+{
+    const tts_arel_t *a = (const tts_arel_t *)pp;
+    const unsigned    T = a->T, HD = a->HD, W = a->W, NW = 2u * a->W + 1u;
+    const int         n = a->n;
+    double            qv[TTS_MAX_HD], rel[2u * TTS_MAX_W + 1u];
+    unsigned          i, d, k;
+    for (i = r0; i < r1 && (int)i < n; i++) {
+        const Data_t *qr = a->q0 + (size_t)i * a->D + (size_t)a->g * HD;
+        const float  *bq = a->bq + (size_t)a->g * HD;
+        for (d = 0u; d < HD; d++) {                   /* q as the q / k / v prep writes it */
+            double r = nearbyint(((double)(int16_t)qr[d] * a->sq0 + (double)bq[d]) * a->iq);
+            r = r > 32767.0 ? 32767.0 : (r < -32768.0 ? -32768.0 : r);
+            qv[d] = r / a->iq;
+        }
+        for (k = 0u; k < NW; k++) {                   /* relative keys, sums left to right */
+            const float *e   = a->ek + (size_t)k * HD;
+            const int    j   = (int)i + (int)k - (int)W;
+            double       acc = 0.0;
+            size_t       o;
+            if (j < 0 || j >= n)
+                continue;
+            for (d = 0u; d < HD; d++)
+                acc += qv[d] * (double)e[d];
+            rel[k] = acc;
+            o = (size_t)j * T + i;
+            a->l[o] = tts_stf((double)(int16_t)a->s[o] + rel[k] * a->is, 1.0);
+        }
+    }
+}
+
+static void tts_attn_rel_add(const Data_t *s, const Data_t *q0, const float *bq, const float *ek,
+                             unsigned T, unsigned C, unsigned D, unsigned HD, unsigned g, unsigned W,
+                             int n, double sq0, double iq, double is, Data_t *l)
+{
+    tts_arel_t a;
+    if (HD > TTS_MAX_HD || W > TTS_MAX_W) {
+        fprintf(stderr, "tts_attn_rel_add: head_dim %u / window %u beyond the limits\n", HD, W);
+        abort();
+    }
+    if (l != s)
+        memcpy(l, s, (size_t)C * T * sizeof(Data_t));
+    a.s = s; a.q0 = q0; a.bq = bq; a.ek = ek; a.T = T; a.C = C; a.D = D; a.HD = HD; a.g = g; a.W = W;
+    a.n = n < 0 ? 0 : (n < (int)C ? n : (int)C); a.sq0 = sq0; a.iq = iq; a.is = is; a.l = l;
+    host_parallel(tts_attn_rel_rows, &a, T, 1u, 1u);
 }
 
 typedef struct {

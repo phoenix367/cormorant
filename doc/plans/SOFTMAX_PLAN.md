@@ -5,7 +5,8 @@
 `kernels.vectorop.softmax` on, the chat server's libraries regenerated with
 the softmax on the FPGA and gated bit-exact on the board: BERT 525 → 427 ms,
 SmolVLM image 2.20 → 1.93 s, SmolLM2 prefill-256 811 → 737 ms (135M) /
-2059 → 1926 ms (360M).  Phase 6 (Piper's encoder softmax) not started.
+2059 → 1926 ms (360M).  Phase 6 (Piper's encoder softmax, §5): bit-exact on the board, `tts_encode`
+−21 % at 400 ids; in the chat server since 2026-10-08.
 Committed as 51d1224 (hw_128 9c74ac9, test stand af44f6e).
 
 The user asked for softmax on the FPGA for every workload, with an
@@ -305,3 +306,183 @@ mode's DDR rate (two-beat runs per key row: SmolVLM's head 3.77 ms against
 1.69 with ideal memory — wider blocks or a query-major score layout would
 help); the phases of a unit could overlap (a second buffer) for about 3× the
 throughput.
+
+## 5. Phase 6: Piper's encoder softmax (2026-10-08)
+
+The user asked to move Piper's softmax to VectorOP too.
+
+### 5.1 Design
+
+`TtsAttnSoftmax` (Piper's text encoder: 6 layers × 2 heads, HD 96, a
+relative window W = 4) computes the following, per query row i < n:
+- q from the q projection, as the prep writes it;
+- the relative logits rel[i][d] = q_i · e_k[d] for d = −W … W;
+- the logits s[j][i]·2^-fs + rel[i][j − i] over the keys j < n;
+- the softmax, written as P at 2^-15.
+
+It is 48 ms of a 268-id `tts_encode` (241 ms at 100 MHz, TTS_PLAN §6).  The
+band can't run on VectorOP: in the keys-major score matrix a diagonal is not
+a contiguous run.  The split:
+
+- **`TtsAttnRelAdd` (host).**  It computes q and rel as before, then adds the
+  band into the scores **in place**: s[j][i] ← sat16(rhe(s[j][i] +
+  rel·2^fs)) for i, j < n, |j − i| ≤ W.
+  - The scores become a DMA state, written by the q·Kᵀ conv and updated by
+    the host (`state_writes`, as the attention prep's caches).  There is one
+    per head and bucket, shared by the six layers; the DAG's state edges
+    order conv → band → softmax → the next layer's conv.
+  - The node invalidates rows [0, n) of the head's scores before it reads
+    them, and cleans them after: one sync each way.
+- **`TtsAttnSoftmaxVopNode` (VectorOPKernel).**  The column mode over the
+  bucket: s [T keys][T queries] → P [T][T].
+  - smx_mask valid0 = n at run time, period 0: every query over keys j < n.
+  - Cm / Cs from fs with logit scale 1 (1/√HD is folded into q's weights),
+    P at 2^-15.
+  - The unit writes P's columns j ≥ n as 0.  Its rows i ≥ n are softmaxes of
+    padded queries; they feed only P·V's padded rows, which the merge never
+    reads.
+
+**Numerics.**  The logits are rounded to the score grid (2^-fs, round half to
+even), then the integer softmax (within 1 LSB at 2^-15).
+`piper_vits.encoder_forward(vsmx=True)` is the specification.  The yardstick
+is TTS_PLAN §6's: durations changed against the float encoder, and the
+log-mel distance against float with the float durations kept.  Today's
+encoder: 0.35 % (4 / 1138), 0.37 dB.
+
+**Expected.**  The host keeps the q / rel work and two syncs per head and
+layer (a few ms in all).  The unit takes about 0.3 ms per 400 × 400 head.
+That is roughly 40 ms off a 400-id encode, the time before the first audio.
+
+### 5.2 Steps
+
+| step | work | done when |
+|---|---|---|
+| 6.0 study | `encoder_forward(vsmx=True)`; `piper_study.py encoder --vsmx` on the stored exponents | durations / log-mel within the yardstick |
+| 6.1 scheduler | `PiperEncoderFrontend(vsmx)`, `TtsAttnRelAdd`, `TtsAttnSoftmaxVopNode`, the C helper, `generate_tts_project.py --vsmx`; tests: the simulation == the specification, the C == the simulation (emulator), coherency | the suite passes |
+| 6.2 host gate | `tts_host_emu.py` on the real voice, every bucket | bit-exact |
+| 6.3 board | `tts_board.py` (scratch dirs): bit-exact, `tts_encode` timings | bit-exact, faster |
+| 6.4 production | the library in the chat server (the user decides), perf-model top-up, docs, facts | — |
+
+### 5.3 Step 6.0: the study (2026-10-08)
+
+`piper_vits.encoder_forward(vsmx_unit=True)` is the specification.
+`piper_study.py encoder-vsmx` (new; 81 s) measures both softmaxes on the
+stored exponents and the 11 evaluation sentences (1138 ids), as `encoder`
+does; it writes `study/encoder_vsmx.json` and two WAVs and leaves
+`exponents.json` alone.
+
+| | host softmax (the library today) | VectorOP softmax |
+|---|---:|---:|
+| durations changed against the float encoder | 4 / 1138 (0.35 %), ≤ 1 frame | **3 / 1138 (0.26 %)**, ≤ 1 frame |
+| log-mel distance against float (float durations kept) | 0.388 dB | 0.391 dB |
+| max \|x − float\| (encoder output) | 0.0318 | 0.0271 |
+
+One duration in 1138 differs between the two, and no logit of 1.78 M
+saturates when the band is added.  **GO.**
+
+**One deviation from §5.1: no state.**  The six layers' q·Kᵀ convs can't share
+one ONNX output name, and one state per layer and head would pin about 6 MB
+of CMA; the server gives Piper 55 MB for a 51 MiB pool.  So
+`TtsAttnRelAdd` reads the scores as a host op and writes a new logits
+tensor: a T × T copy plus the band.  `host_in` / `host_out` hand it the
+buffers themselves when the mapping is cacheable, so the cost is about one
+memcpy per head and layer.
+
+### 5.4 Steps 6.1–6.3: scheduler, host gate, board (2026-10-08)
+
+**Scheduler.**
+- `TtsAttnRelAddNode` (`src/tts_nodes.py`, C `tts_attn_rel_add`: the copy,
+  then q and its relative logits per query row as `tts_attn_softmax`
+  computed them, written to the band).
+- `TtsAttnSoftmaxVopNode` (`src/smx_nodes.py`: one `OP_SOFTMAX_T` call, keys
+  j < n with n read at run time and clamped to [1, C]).
+- `PiperEncoderFrontend(vsmx=True)`; `generate_tts_project.py --vsmx
+  auto|on|off`, auto = the platform gate.  `project.json` records `vsmx`, and
+  `tts_board.py` / `tts_host_emu.py` check against the matching specification.
+- The pool is unchanged (51.1 MiB): the logits tensors fit in existing slots.
+  Each encode entry goes from 119 to 131 nodes.
+- `host_emu.vop_source()`: the emulated VectorOP header with the softmax
+  unit's table.  `tts_host_emu.py`, `llm_host_emu.py` and `test_llama.py`
+  wrote the header without it, so any library with the unit failed to
+  compile there.
+
+| gate | result |
+|---|---|
+| `test_piper.py` (5 new tests) | the simulation == `encoder_forward(vsmx_unit=True)` for buckets 32 / 64 and lengths 1 / 17 / T − 5 / T; the generated C == the simulation (emulator); the node census; the gate off → refused |
+| scheduler suite | 1696 / 1696 |
+| `tts_host_emu.py --incoherent` (the real voice, the library built on the host) | PCM (2 utterances), the encoder (6 cases over the 5 buckets, 20 … 400 ids) and the durations **bit-exact** |
+| board, `tts_board.py` (bitstream `8599aa7a5f12`, scratch dirs) | PCM, encoder and durations **bit-exact**; repetitions identical |
+
+`tts_encode` on the board against the library in the chat server, the same
+bitstream and the same morning:
+
+| ids (bucket) | host softmax | VectorOP softmax | change |
+|---|---:|---:|---:|
+| 20 (32) | 20.50 ms | 20.43 ms | −0.3 % |
+| 60 (64) | 31.22 ms | 30.43 ms | −2.5 % |
+| 88 (128) | 58.25 ms | 55.65 ms | −4.5 % |
+| 162 (256) | 113.23 ms | 102.60 ms | −9.4 % |
+| 268 (400) | 186.90 ms | 161.37 ms | −13.7 % |
+| 400 (400) | 208.10 ms | **163.92 ms** | **−21.2 %** |
+
+- **Scaling.**  The host softmax costs n² per head, while the unit always
+  processes the whole bucket.  So the gain grows with the text's share of
+  its bucket.
+- **The rest of the pipeline.**  The chunks and the duration predictor do
+  not change: utterance totals are within ±1 %.
+
+**Left for production (6.4).**
+- Install the library (`tts_board.py --install-only`).
+- Price the new calls: a performance-model top-up on `8599aa7a5f12` for the
+  column-mode calls over the buckets, and `host.json` merged with
+  `TtsAttnRelAdd`.  `perf_calibrate.py`'s shipped Piper graphs now follow
+  the gate.
+- The TTS docs.
+
+### 5.5 Step 6.4: production (2026-10-08)
+
+The user asked to install it.
+
+- **The project.**  `demo/tts/build/piper_project` was regenerated with the
+  default `--vsmx auto`, i.e. on.  It is identical to the gated project
+  apart from generation timestamps, and its 101 weight files are identical
+  to the installed ones.  The old project is kept in
+  `/mnt/data/act/piper_vsmx/piper_project_host_softmax`.
+- **The install.**  `tts_board.py` with the production defaults (the chat
+  server stopped) built and installed `libpiper_tts.so` and gated it
+  bit-exact: PCM, the encoder over all 5 buckets and the durations; no
+  weight uploaded.  The server is restarted with all five backends ready,
+  and `/v1/audio/speech` answers (first audio after 0.61 s on a warm
+  request).
+- **The performance model `8599aa7a5f12`, 1862 → 1867 calls.**
+  - The coverage check (`cases --models piper-lessac-medium` in a scratch
+    `MODELS_DIR`, `calib_status.py --coverage`) found exactly the 5
+    column-mode calls, one per bucket.  They were appended and measured
+    (`run --resume`), then refitted.
+  - One head's softmax takes 7.4 / 15.8 / 42.3 / 131.8 / 305.3 µs for
+    T = 32 / 64 / 128 / 256 / 400: 3.7 ms per 400-id encode.
+- **`host.json`.**  `tts_board.py --profile` (bit-exact again), then
+  `host --merge`.  `TtsAttnRelAddNode` is a new kind (60 timings, fit median
+  1.3 %); the result has 156 exact signatures and 40 kinds.
+- **The simulator against that run.**  Piper's chunk and its five encode
+  buckets are all within ±1.8 %, with nothing unpriced.
+
+The profile of a 400-id encode:
+
+| op | ms |
+|---|---:|
+| `TtsRowPrep` | 56.9 |
+| ConvKernel | 53.3 |
+| `TtsAttnMerge` | 23.2 |
+| `TtsResNorm` | 17.7 |
+| **`TtsAttnRelAdd`** | **17.3** |
+| `VitAttnPrep` | 5.4 |
+| `TtsEncOut` | 3.8 |
+| **the softmax unit** | **3.7** |
+| `TtsEmbed` | 2.0 |
+
+**The next lever is the band node.**  At 1.4 ms per head, `TtsAttnRelAdd`
+costs about 5× its memcpy estimate.  Its input is read whole, and the T × T
+logits are copied and flushed whole.  Two options:
+- update a DMA state in place, at the 6 MB CMA cost of §5.3;
+- copy only rows [0, n).

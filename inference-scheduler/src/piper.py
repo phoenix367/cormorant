@@ -377,15 +377,20 @@ class PiperEncoderFrontend:
     """Builds the ``encode_<T>`` entry: inputs ids [T] (int32, padded) and n
     [1] (the valid ids); outputs x [T][192] and stats [T][384] (float32 host,
     rows >= n zero): the text encoder's output and its projection (m_p,
-    logs_p).  ``E``: exponents.json "encoder"."""
+    logs_p).  ``E``: exponents.json "encoder".  ``vsmx``: the attention
+    softmax on VectorOPKernel's unit (doc/plans/SOFTMAX_PLAN.md §5) — the host
+    adds the relative-key band (TtsAttnRelAdd), the unit takes the softmax;
+    the specification is piper_vits.encoder_forward(vsmx_unit=True)."""
 
-    def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper"):
+    def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper",
+                 vsmx: bool = False):
         missing = [k for k in encoder_exponent_keys() if k not in E]
         if missing:
             raise ValueError(f"encoder exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
         if T % 16:
             raise ValueError(f"bucket {T}: a multiple of 16 rows")
         self.EW, self.E, self.T, self.name = encoder_weights(W), {k: int(v) for k, v in E.items()}, int(T), name
+        self.vsmx = bool(vsmx)
         self.pv_kw = next(k for k in (4, 2, 1) if T % (16 * k) == 0)
 
     def choose_qk_kw(self) -> int:
@@ -472,8 +477,15 @@ class PiperEncoderFrontend:
             for g in range(H):
                 self._node("LlmAttnScores", [kc, qx], [s[g]], f"{te}.qk{g}", group=g, qk_kw=kw, **common)
             for g in range(H):
-                self._node("TtsAttnSoftmax", [s[g], q0, bq, ek, self.n], [pr[g]], f"{te}.softmax{g}", head=g,
-                           head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]], p_exp=[fp])
+                if self.vsmx:                               # the band on the host, the softmax on the unit
+                    lg = self._t(f"{te}.l{g}", [T, T], exp=0)
+                    self._node("TtsAttnRelAdd", [s[g], q0, bq, ek, self.n], [lg], f"{te}.reladd{g}", head=g,
+                               head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]])
+                    self._node("TtsAttnSoftmax", [lg, self.n], [pr[g]], f"{te}.softmax{g}", vsmx=1,
+                               s_exp=[E[f"{e}.s"]], p_exp=[fp])
+                else:
+                    self._node("TtsAttnSoftmax", [s[g], q0, bq, ek, self.n], [pr[g]], f"{te}.softmax{g}", head=g,
+                               head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]], p_exp=[fp])
                 self._node("LlmAttnPV", [pr[g], vc], [o[g]], f"{te}.pv{g}", group=g, **common)
             att = self._t(f"{te}.att", [T, D], exp=E[f"{e}.att"])
             self._node("TtsAttnMerge", o + pr + [self._init(f"v.enc.l{i}.ev", EW[f"l{i}.ev"].reshape(-1)), self.n],
@@ -512,5 +524,6 @@ class PiperEncoderFrontend:
         md = m.metadata_props.add()
         md.key = "axi.tts.entry"
         md.value = json.dumps({"entry": f"encode_{T}", "model": self.name, "rows": T, "hidden": D,
-                               "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw})
+                               "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw,
+                               "vsmx": self.vsmx})
         return m

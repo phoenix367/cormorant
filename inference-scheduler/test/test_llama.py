@@ -605,7 +605,7 @@ def run_calls(mg, workdir, calls, incoherent=False):
              os.path.join(src, "inference.c"): mg.generate_source(),
              os.path.join(emu, "inference_buf_emu.c"): host_emu.buf_emu_source(),
              os.path.join(emu, "emu_common.h"): host_emu._COMMON,
-             os.path.join(emu, "xvectoropkernel.h"): host_emu._VOP,
+             os.path.join(emu, "xvectoropkernel.h"): host_emu.vop_source(),
              os.path.join(emu, "xmatmulkernel.h"): host_emu._MM,
              os.path.join(emu, "xconvkernel.h"): host_emu._CONV}
     V = mg.entries[0][1].output_tensors[0].numel

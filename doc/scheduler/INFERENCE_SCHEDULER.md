@@ -96,8 +96,8 @@ XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
 - **Text-to-speech ops** (domain `axi.llm`, `src/tts_nodes.py`) — `TtsPrep`,
   `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm` around the
   flow's and the HiFi-GAN decoder's ConvKernel convs, and `TtsEmbed`,
-  `TtsRowPrep`, `TtsAttnSoftmax`, `TtsAttnMerge`, `TtsResNorm`, `TtsEncOut`
-  in the text encoder; the `chunk` and `encode_<T>` entries come from
+  `TtsRowPrep`, `TtsAttnSoftmax` (or `TtsAttnRelAdd` + the softmax unit),
+  `TtsAttnMerge`, `TtsResNorm`, `TtsEncOut` in the text encoder; the `chunk` and `encode_<T>` entries come from
   `src/piper.py` ([§Text to speech (Piper)](#text-to-speech-piper)).
   This is what runs Piper lessac-medium — `TTS_PLAN.md` §4–§6.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
@@ -152,7 +152,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1691 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1696 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1013,6 +1013,16 @@ fixed-size `chunk` entry (TTS_PLAN §4).
   - **Host ops:** `TtsAttnSoftmax` adds the relative-position keys and masks
     the padding; `TtsAttnMerge` adds the relative-position values; also
     `TtsResNorm`, `TtsEmbed`, `TtsEncOut`.
+  - **The softmax on VectorOPKernel** (`PiperEncoderFrontend(vsmx=True)`,
+    `generate_tts_project.py --vsmx`, default where the platform has the
+    unit; `doc/plans/SOFTMAX_PLAN.md` §5).
+    - `TtsAttnRelAdd` (host) copies the scores and adds the relative-position
+      keys to their band (rounded to the score grid).
+    - `TtsAttnSoftmaxVopNode` then takes the softmax: one column-mode call
+      per head, keys j < n at run time.
+    - The specification is `piper_vits.encoder_forward(vsmx_unit=True)`.
+      `project.json` records `vsmx`, and `tts_board.py` / `tts_host_emu.py`
+      check against the matching specification.
   - **One weight copy:** the largest bucket plans the MatMul kernel widths
     and the others pin them (`matmul_conv_kw`).
 - **Tests:** `test/test_piper.py` also checks the encode entries against

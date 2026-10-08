@@ -696,7 +696,8 @@ facts:
         reverse: true
         extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode,
                    LlmKernelNode, VitGeluVopNode, TtsAddVopNode,
-                   LlmAttnSoftmaxVopNode, VitAttnSoftmaxVopNode]   # kernel-call node classes
+                   LlmAttnSoftmaxVopNode, VitAttnSoftmaxVopNode,
+                   TtsAttnSoftmaxVopNode]   # kernel-call node classes
 
 - id: scheduler.event_kinds
   kind: interface

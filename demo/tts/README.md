@@ -44,13 +44,16 @@ flowchart TB
   residual sums on VectorOPKernel — OFFLOAD_PLAN §4.2): 0.27 s per chunk,
   RTF 0.20.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
+  Since 2026-10-08 its attention softmax runs on VectorOPKernel's softmax
+  unit (SOFTMAX_PLAN §5): 56 ms for 88 ids, 164 ms for 400 (208 before).
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.
 - **Memory:** 51 MiB of CMA.
 - **Quality:** the int16 datapath is within 0.19 dB log-mel of float (§3);
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
-  one frame (§6).
+  one frame (§6); with its softmax on VectorOPKernel 0.39 dB and 0.26%
+  (`piper_study.py encoder-vsmx`, SOFTMAX_PLAN §5).
 
 ## Samples
 
@@ -82,7 +85,7 @@ demo/tts/
 │   ├── piper_vits.py          — float reference, the bit-level specifications (chunk_forward,
 │   │                            synthesize_chunked; encoder_forward; duration_predictor_seq) and the host front end
 │   │                            (front_end); also runs in the server
-│   ├── piper_study.py         — fetch / phonemize / validate / calibrate / study / encoder / costs (TTS_PLAN §3, §6)
+│   ├── piper_study.py         — fetch / phonemize / validate / calibrate / study / encoder / encoder-vsmx / costs (TTS_PLAN §3, §6)
 │   ├── generate_tts_project.py — src/piper.py's chunk + encode_<T> entries -> build/piper_project
 │   │                            (+ test/tts_glue.h, weights/dp.dat, weights/voice.json)
 │   ├── tts_host_emu.py        — the generated C on the host vs the spec; --lib-check: the chat backend over it
@@ -110,6 +113,7 @@ $PY demo/tts/scripts/piper_study.py fetch
 /mnt/data/tts_venv/bin/python demo/tts/scripts/piper_study.py phonemize    # venv from requirements-phonemize.txt
 $PY demo/tts/scripts/piper_study.py calibrate
 $PY demo/tts/scripts/piper_study.py encoder          # the text encoder's exponents (TTS_PLAN §6)
+$PY demo/tts/scripts/piper_study.py encoder-vsmx     # its softmax on VectorOPKernel against the host's (SOFTMAX_PLAN §5)
 # 2. the library project and its host checks
 $PY demo/tts/scripts/generate_tts_project.py         # -> demo/tts/build/piper_project, 4 s
 $PY demo/tts/scripts/tts_host_emu.py                 # the generated C == the spec on real sentences, 60 s

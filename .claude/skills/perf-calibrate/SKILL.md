@@ -28,8 +28,11 @@ Current model: **kv260/8599aa7a5f12** (2026-10-08), `588d721997cb`'s design with
 VectorOPKernel's b read port on HPC1 (PS_PORTS_PLAN §5).  Its case list is the converged one of
 `588d721997cb` plus the 261 ConvKernel calls that campaign had measured in earlier rounds
 (copy `<old>.cases.json`, set its `bitstream`, append the calib's unlisted keys), then `run`,
-`fit` and one refinement round (+4) to 1862 exact calls, and
-`host.json` merged to 151 signatures / 39 kinds (unchanged); repeat spread median 0.052 %.  That
+`fit` and one refinement round (+4) to 1862; topped up the same day with Piper's encoder softmax on
+VectorOPKernel (SOFTMAX_PLAN §5: five calls from the coverage check below, run against a scratch
+`MODELS_DIR` with `--models piper-lessac-medium`) to 1867 exact calls, and
+`host.json` merged to 156 signatures / 40 kinds (`TtsAttnRelAddNode` new, from `tts_board.py
+--profile`); repeat spread median 0.052 %.  That
 is the shortcut for a bitstream whose kernels are unchanged — only the PS port layout moved.
 Before it, **kv260/588d721997cb** (2026-10-07), the 250 MHz bitstream with
 VectorOPKernel's softmax unit (SOFTMAX_PLAN): a fresh case list (1443 cases, the softmax calls

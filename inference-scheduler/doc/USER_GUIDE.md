@@ -817,7 +817,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1691 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1696 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

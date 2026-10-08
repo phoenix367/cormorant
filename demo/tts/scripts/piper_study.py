@@ -17,6 +17,11 @@ KV260 (model-study skill, route C; doc/plans/TTS_PLAN.md §3).  Host only.
   encoder    the int16 text encoder of the library (TTS_PLAN §6): calibrate
              its exponents (-> exponents.json "encoder"), durations and
              log-mel distance against float, per softmax exponent (--p-exp)
+  encoder-vsmx  the encoder's softmax on VectorOPKernel's unit (SOFTMAX_PLAN
+             §5) against the host softmax, on the stored exponents: durations
+             and log-mel distance against float (as encoder), the
+             durations against the current library, the logits' saturation
+             (-> study/encoder_vsmx.json; exponents.json untouched)
   costs      the flow and the decoder per second of audio priced by the
              bitstream's performance model (proxy graphs, in memory) + the
              host-side counts
@@ -435,6 +440,72 @@ def cmd_encoder(a) -> int:
     return 0
 
 
+def cmd_encoder_vsmx(a) -> int:
+    """The text encoder with its softmax on VectorOPKernel's unit against the
+    library's host softmax, both on the stored exponents (exponents.json
+    "encoder"): durations against the float encoder and against each other,
+    the audio with the float durations kept against float (encoder's
+    yardstick), the encoder outputs' difference and the logits' saturation."""
+    import piper_vits as pv
+    W = pv.load_weights(_onnx(a))
+    EW = pv.encoder_weights(W)
+    doc = json.load(open(os.path.join(a.assets, "exponents.json")))
+    exp, E = doc["exponents"], {k: int(v) for k, v in doc["encoder"].items()}
+    out_dir = os.path.join(a.assets, "study")
+    pols = {"host softmax": False, "VectorOP softmax": True}
+    acc = {k: {"n_diff": 0, "worst": 0, "lsd": [], "dx": [], "dst": []} for k in pols}
+    n_ids = n_cross = sat = n_logits = 0
+    for name, t in _texts(a, "eval").items():
+        seed = zlib.crc32(name.encode())
+        ids = t["ids"]
+        n_ids += len(ids)
+        xf, mf, lf = pv.text_encoder(W, np.asarray(ids))
+        wf = np.ceil(np.exp(pv.duration_predictor(W, xf, 0.8, np.random.default_rng(seed), True)))
+        mref = _mel_db(pv.synthesize(W, ids, seed=seed))
+        w_of, x_of = {}, {}
+        for pol, unit in pols.items():
+            tr = {}
+            x, st = pv.encoder_forward(EW, E, ids, trace=tr, vsmx_unit=unit)
+            xq = x.astype(np.float64).T
+            mq, lq = st.astype(np.float64).T[:pv.ENC_D], st.astype(np.float64).T[pv.ENC_D:]
+            wq = np.ceil(np.exp(pv.duration_predictor(W, xq, 0.8, np.random.default_rng(seed), True)))
+            r = acc[pol]
+            r["n_diff"] += int((wf != wq).sum())
+            r["worst"] = max(r["worst"], int(np.abs(wf - wq).max()))
+            aligned = pv.synthesize_chunked(W, exp, pv.front_end(
+                W, ids, seed=seed, fast_erf=True, encoder=lambda i, xf=xf, mq=mq, lq=lq: (xf, mq, lq))) / 32767.0
+            r["lsd"].append(_lsd(_mel_db(aligned), mref))
+            r["dx"].append(float(np.abs(xq - xf).max()))
+            r["dst"].append(float(max(np.abs(mq - mf).max(), np.abs(lq - lf).max())))
+            w_of[pol], x_of[pol] = wq, xq
+            if unit:
+                for k, v in tr.items():
+                    if ".l" in k and k.rsplit(".", 1)[-1].startswith("l"):
+                        sat += int((np.abs(v) >= 32767).sum())
+                        n_logits += v.size
+                if name in ("eval00", "eval10"):
+                    own = pv.synthesize_chunked(W, exp, pv.front_end(
+                        W, ids, seed=seed, fast_erf=True, encoder=pv.library_encoder(EW, E, True))) / 32767.0
+                    _write_wav(os.path.join(out_dir, f"{name}_enc_int16_vsmx.wav"), own)
+        n_cross += int((w_of["host softmax"] != w_of["VectorOP softmax"]).sum())
+    res = {}
+    for pol, r in acc.items():
+        res[pol] = {"durations_changed": r["n_diff"] / n_ids, "durations_changed_n": r["n_diff"],
+                    "max_frames": r["worst"], "lsd_vs_float_db": float(np.mean(r["lsd"])),
+                    "max_abs_x_vs_float": max(r["dx"]), "max_abs_stats_vs_float": max(r["dst"])}
+        print(f"  {pol:17s} durations changed against float {r['n_diff']}/{n_ids} "
+              f"({100 * r['n_diff'] / n_ids:.2f} %, max {r['worst']} frame); log-mel distance vs float "
+              f"{res[pol]['lsd_vs_float_db']:.3f} dB; max |x - float| {max(r['dx']):.4f}", flush=True)
+    res["durations_differ_between_policies"] = n_cross
+    res["logits_saturated"] = sat
+    res["logits"] = n_logits
+    print(f"  durations differing between the two: {n_cross}/{n_ids}; saturated logits {sat} of {n_logits}")
+    path = os.path.join(out_dir, "encoder_vsmx.json")
+    json.dump(res, open(path, "w"), indent=1)
+    print(f"-> {path}; WAVs eval00 / eval10 _enc_int16_vsmx.wav in {out_dir}")
+    return 0
+
+
 # ---- costs ---------------------------------------------------------------------------- #
 
 K_GMACS = (13.4, 30.0)       # 1 x k (k > 2) convs are not in the performance model's families
@@ -556,8 +627,8 @@ def main(argv=None) -> int:
                     help="study: only these policies (';'-separated names from POLICIES)")
     ap.add_argument("--p-exp", default="15,12",
                     help="encoder: softmax output exponents to compare (the first is stored)")
-    ap.add_argument("cmd", choices=("fetch", "phonemize", "validate", "calibrate", "study", "encoder", "costs",
-                                    "all"))
+    ap.add_argument("cmd", choices=("fetch", "phonemize", "validate", "calibrate", "study", "encoder",
+                                    "encoder-vsmx", "costs", "all"))
     a = ap.parse_args(argv)
     if a.perf_model is None and a.cmd in ("costs", "all"):
         sys.path.insert(0, SCHED)
@@ -565,7 +636,8 @@ def main(argv=None) -> int:
         a.perf_model = os.path.join(SCHED, "perf_models", "kv260", f"{local_bitstream_id()}.json")
     cmds = ("fetch", "validate", "calibrate", "study", "costs") if a.cmd == "all" else (a.cmd,)
     fn = {"fetch": cmd_fetch, "phonemize": cmd_phonemize, "validate": cmd_validate,
-          "calibrate": cmd_calibrate, "study": cmd_study, "encoder": cmd_encoder, "costs": cmd_costs}
+          "calibrate": cmd_calibrate, "study": cmd_study, "encoder": cmd_encoder,
+          "encoder-vsmx": cmd_encoder_vsmx, "costs": cmd_costs}
     rc = 0
     for c in cmds:
         print(f"== {c}", flush=True)

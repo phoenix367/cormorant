@@ -151,16 +151,24 @@ def patch_cmake(out: str, cg, info: dict) -> None:
         f.write(text)
 
 
-def entry_graphs(assets: str, W: dict = None) -> list:
+def vsmx_default() -> bool:
+    """The encoder's attention softmax on VectorOPKernel's softmax unit
+    (doc/plans/SOFTMAX_PLAN.md §5) where the platform has the unit."""
+    from src.smx_nodes import enabled
+    return enabled()
+
+
+def entry_graphs(assets: str, W: dict = None, vsmx: bool = None) -> list:
     """[(entry, OnnxGraph)] of libpiper_tts.so in project order: "chunk", then
     "encode_<T>" for every bucket of ENC_BUCKETS.  Also what
     inference-scheduler/perf_calibrate.py prices, so its kernel calls are the
-    library's."""
-    return _entries(assets, W)[0]
+    library's (``vsmx`` None: vsmx_default())."""
+    return _entries(assets, W, vsmx)[0]
 
 
-def _entries(assets: str, W: dict = None):
+def _entries(assets: str, W: dict = None, vsmx: bool = None):
     """(entry_graphs, the chunk entry's info: frames, sample rate, ...)."""
+    vsmx = vsmx_default() if vsmx is None else bool(vsmx)
     if W is None:
         W = load_weights(os.path.join(assets, "en_US-lessac-medium.onnx"))
     doc = json.load(open(os.path.join(assets, "exponents.json")))
@@ -173,8 +181,8 @@ def _entries(assets: str, W: dict = None):
     # the project keeps one copy of every weight (as src/llm_entries.py)
     enc, kw = {}, None
     for T in sorted(ENC_BUCKETS, reverse=True):
-        eg = OnnxGraph(PiperEncoderFrontend(W, doc["encoder"], T, name="piper_lessac_medium").entry(),
-                       matmul_conv_kw=kw)
+        eg = OnnxGraph(PiperEncoderFrontend(W, doc["encoder"], T, name="piper_lessac_medium",
+                                            vsmx=vsmx).entry(), matmul_conv_kw=kw)
         if kw is None:
             kw = shared_weight_layouts(eg.nodes)
         enc[T] = eg
@@ -188,10 +196,15 @@ def main(argv=None) -> int:
     ap.add_argument("--driver-dirs", default=None,
                     help="JSON {kernel: dir}; default: local.driver_dirs of "
                          "demo/bert_squad/bert_squad_config.json")
+    ap.add_argument("--vsmx", choices=("auto", "on", "off"), default="auto",
+                    help="the text encoder's attention softmax on VectorOPKernel's softmax unit "
+                         "(doc/plans/SOFTMAX_PLAN.md §5); auto: where the platform has the unit "
+                         "(kernels.vectorop.softmax)")
     a = ap.parse_args(argv)
     t0 = time.time()
+    vsmx = vsmx_default() if a.vsmx == "auto" else a.vsmx == "on"
     W = load_weights(os.path.join(a.assets, "en_US-lessac-medium.onnx"))
-    entries, info = _entries(a.assets, W)
+    entries, info = _entries(a.assets, W, vsmx)
     g = entries[0][1]
     cg = MultiEntryGenerator(entries, "piper_lessac_medium")
     out = os.path.abspath(a.out_dir)
@@ -220,7 +233,7 @@ def main(argv=None) -> int:
     json.dump(layers, open(os.path.join(out, "layers.json"), "w"), indent=0)
     summary.update({"model": "piper-lessac-medium", "entry": info, "assets": os.path.abspath(a.assets),
                     "nodes": len(g.nodes), "encode_buckets": list(ENC_BUCKETS),
-                    "encode_nodes": {n: len(eg.nodes) for n, eg in entries[1:]},
+                    "encode_nodes": {n: len(eg.nodes) for n, eg in entries[1:]}, "vsmx": vsmx,
                     "missing_drivers": missing, "generated_s": round(time.time() - t0, 1)})
     json.dump(summary, open(os.path.join(out, "project.json"), "w"), indent=2)
     print(f"project: {out} ({len(g.nodes)} nodes, pool {summary['pool_bytes'] / 2**20:.1f} MiB, "

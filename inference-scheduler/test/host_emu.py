@@ -287,6 +287,12 @@ static inline void XVectoropkernel_Start(XVectoropkernel *p)
 }
 """
 
+def vop_source() -> str:
+    """The emulated xvectoropkernel.h: _VOP with the softmax unit's table
+    (every emulator that builds a generated project writes this one)."""
+    return _VOP.replace("EMU_SMX_TAB", _smx_tab())
+
+
 def _smx_tab() -> str:
     from src.vectorop_smx import TAB
     return ", ".join(str(int(v)) for v in TAB)
@@ -462,7 +468,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     w(os.path.join(tst, "test_inference.c"), cg.generate_test())
     w(os.path.join(emu, "inference_buf_emu.c"), buf_emu_source(cg._dtype))
     w(os.path.join(emu, "emu_common.h"), _COMMON)
-    w(os.path.join(emu, "xvectoropkernel.h"), _VOP.replace("EMU_SMX_TAB", _smx_tab()))
+    w(os.path.join(emu, "xvectoropkernel.h"), vop_source())
     w(os.path.join(emu, "xmatmulkernel.h"), _MM)
     w(os.path.join(emu, "xconvkernel.h"), _CONV)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)

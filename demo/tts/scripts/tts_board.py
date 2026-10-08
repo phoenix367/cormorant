@@ -140,9 +140,10 @@ def write_noise(path: str, zs: dict) -> None:
             f.write(np.ascontiguousarray(z, "<f8").tobytes())
 
 
-def check_dur(dur_path: str, seqs: dict, zs: dict, W, E_enc) -> dict:
+def check_dur(dur_path: str, seqs: dict, zs: dict, W, E_enc, vsmx: bool = False) -> dict:
     """tts_duration's logw (dur.bin) against piper_vits.duration_predictor_seq on
-    the spec encoder's x."""
+    the spec encoder's x (``vsmx``: its softmax on VectorOPKernel's unit, as
+    project.json records the library's)."""
     EW = pv.encoder_weights(W)
     raw = np.fromfile(dur_path, "<f8")
     rep, k = {}, 0
@@ -150,7 +151,7 @@ def check_dur(dur_path: str, seqs: dict, zs: dict, W, E_enc) -> dict:
         n = len(ids)
         got = raw[k:k + n]
         k += n
-        x, _ = pv.encoder_forward(EW, E_enc, ids)
+        x, _ = pv.encoder_forward(EW, E_enc, ids, vsmx_unit=vsmx)
         want = pv.duration_predictor_seq(W, x.T, zs[name])
         bad = int((got.view(np.uint64) != want.view(np.uint64)).sum())
         rep[name] = {"ids": n, "mismatches": bad}
@@ -158,8 +159,9 @@ def check_dur(dur_path: str, seqs: dict, zs: dict, W, E_enc) -> dict:
     return rep
 
 
-def check_enc(enc_path: str, seqs: dict, W, E_enc) -> dict:
-    """tts_encode's x, m_p, logs_p (enc.bin) against piper_vits.encoder_forward."""
+def check_enc(enc_path: str, seqs: dict, W, E_enc, vsmx: bool = False) -> dict:
+    """tts_encode's x, m_p, logs_p (enc.bin) against piper_vits.encoder_forward
+    (``vsmx``: its softmax on VectorOPKernel's unit)."""
     EW = pv.encoder_weights(W)
     raw = np.fromfile(enc_path, "<f4")
     rep, k = {}, 0
@@ -167,7 +169,7 @@ def check_enc(enc_path: str, seqs: dict, W, E_enc) -> dict:
         n = len(ids)
         got = raw[k:k + 3 * 192 * n].reshape(3, 192, n)
         k += 3 * 192 * n
-        x, st = pv.encoder_forward(EW, E_enc, ids)
+        x, st = pv.encoder_forward(EW, E_enc, ids, vsmx_unit=vsmx)
         want = np.stack([x.T, st[:, :192].T, st[:, 192:].T])
         bad = int((got.view(np.uint32) != want.astype(np.float32).view(np.uint32)).sum())
         rep[name] = {"ids": n, "mismatches": bad}
@@ -403,8 +405,10 @@ def main(argv=None) -> int:
         results["check"] = check_pcm(os.path.join(project, "pcm_board_main.bin"), zps, refs,
                                      os.path.join(project, "wav"), "_board")
         E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
-        results["check_encoder"] = check_enc(os.path.join(project, "enc_board_main.bin"), seqs, W, E_enc)
-        results["check_duration"] = check_dur(os.path.join(project, "dur_board_main.bin"), seqs, zs, W, E_enc)
+        vs = bool(summary.get("vsmx", False))
+        results["check_encoder"] = check_enc(os.path.join(project, "enc_board_main.bin"), seqs, W, E_enc, vs)
+        results["check_duration"] = check_dur(os.path.join(project, "dur_board_main.bin"), seqs, zs, W, E_enc,
+                                              vs)
         ok = ok and all(r.get("mismatches", 1) == 0 for r in results["check"].values()) and \
             all(r["mismatches"] == 0 for r in results["check_encoder"].values()) and \
             all(r["mismatches"] == 0 for r in results["check_duration"].values())

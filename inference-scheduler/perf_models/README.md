@@ -19,10 +19,14 @@ the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
 `kv260/8599aa7a5f12` is the production design (2026-10-08, PS_PORTS_PLAN §5: `588d721997cb` with
-VectorOPKernel's b read port on HPC1): 1862 calls, `clock_mhz` 250, repeat spread median 0.052 %.
+VectorOPKernel's b read port on HPC1): 1867 calls, `clock_mhz` 250, repeat spread median 0.052 %.
 Its case list started from `588d721997cb`'s converged one, so both campaigns measure the same
 calls: 1597 listed plus the 261 ConvKernel refinement calls of that campaign's earlier rounds.
-One refinement round then added 4 calls.  Against `588d721997cb` the ConvKernel and MatmulKernel
+One refinement round then added 4 calls, and on the same day Piper's encoder softmax on
+VectorOPKernel (SOFTMAX_PLAN §5) 5 more: its column-mode call per bucket, found by the coverage
+check (`cases --models piper-lessac-medium` in a scratch directory, `calib_status.py
+--coverage`).  `host.json` merged Piper's profile of that library: `TtsAttnRelAddNode` is a new
+kind (156 exact signatures, 40 kinds).  Against `588d721997cb` the ConvKernel and MatmulKernel
 calls are unchanged (median 0.00 %, p10 / p90 within ±0.2 %) and the binary VectorOP calls up
 to 33 % faster.  Some small 2×2 / 3×3 stride-2 pooling calls are 1–2 µs slower (8–17 %); the
 pooling benchmarks and MNIST do not show it.  The simulator against this bitstream's board runs:

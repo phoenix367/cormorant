@@ -21,6 +21,10 @@ exact softmax within one LSB of P.  Three node kinds issue it:
     keys = roundup(pos + n, Q), query row t valid over keys
     j < min(keys, pos + 1 + t) (smx_mask valid0 = pos + 1, period = T) —
     the padded rows t >= n too (they only feed padded rows).
+  * ``TtsAttnSoftmaxVopNode`` — Piper's encoder ``TtsAttnSoftmax`` with
+    ``vsmx = 1`` (``PiperEncoderFrontend(vsmx=True)``, SOFTMAX_PLAN §5): the
+    host op ``TtsAttnRelAdd`` adds the relative-key band to the scores, then
+    one ``OP_SOFTMAX_T`` call over the bucket, keys j < n valid (n at run time).
 
 A node with ``vsmx = 1`` needs the unit: its numbers are the kernel's, and the
 host has no copy of them (the frontends set it only where the platform has the
@@ -35,8 +39,8 @@ import numpy as np
 
 from . import _vectorop_hw_config
 from . import vectorop_smx as smx
-from .host_nodes import HostContext, SoftmaxNode, _attrs, _label
-from .llm_nodes import KEY_QUANTUM, LlmKernelNode, _i32, _require, attn_keys
+from .host_nodes import HostContext, SoftmaxNode, _attrs, _label, _resolve
+from .llm_nodes import KEY_QUANTUM, LlmKernelNode, _attr_ints, _i32, _require, attn_keys
 from .nodes import SchedulerError
 
 OP_SOFTMAX = 10              # row mode (VectorOP.h)
@@ -337,6 +341,75 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
         return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ #
+# TtsAttnSoftmax (Piper's encoder; column mode, n keys at run time)     #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class TtsAttnSoftmaxVopNode(SmxVopNode):
+    """TtsAttnSoftmax with vsmx = 1 on VectorOPKernel (column mode): the
+    logits l [C][T] (raw at 2^-f_s; TtsAttnRelAdd added the relative-key band)
+    -> P [T][C] raw at 2^-f_p over the keys j < n of every query column
+    (smx_mask valid0 = n at run time, at least 1; period 0).  The padded query
+    columns t >= n feed only P.V's padded rows, which the merge never reads."""
+    T:   int = 1
+    C:   int = 16
+    cm:  int = 0
+    cfg: int = 0
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index: int, align_elems: int, ctx: HostContext):
+        lg = _resolve(tensors, node.input[0], node)
+        n = _resolve(tensors, node.input[1], node)
+        y = _resolve(tensors, node.output[0], node)
+        a = _attrs(node)
+        C, T = int(lg.shape[0]), int(lg.shape[1])
+        _require(enabled(), node, "vsmx = 1 needs VectorOPKernel's softmax unit "
+                                  "(kernels.vectorop.softmax, AXI_VECTOROP_SOFTMAX)")
+        _require(C <= smx.MAX_KEYS, node, f"{C} keys (the unit takes {smx.MAX_KEYS})")
+        _require(T % COL_BLOCK == 0 and C % 8 == 0, node,
+                 f"{T} query columns, {C} keys: the unit takes blocks of {COL_BLOCK} columns at "
+                 f"16-byte aligned rows")
+        _require(list(y.shape) == [T, C], node, "P [T][C]")
+        _require(n.host == "i32", node, "n: an int32 host tensor")
+        cm, cfg = regs(_attr_ints(a, "s_exp", node, 1)[0], 1.0, _attr_ints(a, "p_exp", node, 1)[0])
+        return cls(onnx_node=node, inputs=[lg, n], output=y, index=index, align_elems=align_elems,
+                   F=ctx.frac_bits, T=T, C=C, cm=cm, cfg=cfg)
+
+    def _valid(self, n: int) -> int:
+        return min(max(int(n), 1), self.C)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        lg = np.asarray(ins[0], np.float64).astype(np.int64).reshape(self.C, self.T)
+        cs, fp = _unpack(self.cfg)
+        return smx.softmax_cols(lg, self._valid(_i32(ins[1])), self.cm, cs, fp).astype(np.float64)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        return [KernelCall.of("VectorOPKernel", op=OP_SOFTMAX_T, size=self.C, outer=self.T,
+                              a_inc=self.T, b_inc=self.C, act=0)]
+
+    def describe(self) -> str:
+        cs, fp = _unpack(self.cfg)
+        return (f"{self.T} query columns x {self.C} keys (n valid at run time) on VectorOPKernel's "
+                f"softmax unit (column mode; Cm {self.cm} >> {cs}, P at 2^-{fp})")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsAttnSoftmax({self.inputs[0].onnx_name}) -> "
+                f"{self.output.onnx_name}  l [{self.C}][{self.T}] -> P [{self.T}][{self.C}] on "
+                f"VectorOPKernel's softmax unit (column mode), keys j < n */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        n = self.inputs[1].c_name
+        return "\n".join([
+            "    {",
+            f"        const int _n = {n}[0];",
+            f"        const unsigned _mask = _n < 1 ? 1u : (_n > {self.C} ? {self.C}u : (unsigned)_n);",
+            self.call(self.inputs[0].c_name, 0, self.output.c_name, 0, self.C, OP_SOFTMAX_T, self.T,
+                      self.T, self.C, self.cm, self.cfg, "_mask", indent="        "),
+            "    }"])
+
+
 def vsmx_attr(node) -> bool:
     """The node asks for the softmax unit (attribute vsmx = 1)."""
     return int(_attrs(node).get("vsmx", 0)) != 0
@@ -344,4 +417,5 @@ def vsmx_attr(node) -> bool:
 
 __all__ = ("OP_SOFTMAX", "OP_SOFTMAX_T", "COL_BLOCK", "enabled", "cfg_reg", "mask_reg", "regs",
            "SmxVopNode", "SoftmaxVopNode", "VitAttnSoftmaxVopNode", "LlmAttnSoftmaxVopNode",
+           "TtsAttnSoftmaxVopNode",
            "softmax_ineligible", "from_onnx_softmax", "vsmx_attr")
