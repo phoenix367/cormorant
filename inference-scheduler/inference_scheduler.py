@@ -173,6 +173,18 @@ def parse_args(argv=None):
         ),
     )
     p.add_argument(
+        "--dw-slice",
+        dest="dw_slice",
+        choices=("auto", "off"),
+        default="auto",
+        help=(
+            "Issue a batch-1 depthwise Conv as several ConvKernel calls of 16, "
+            "32 or 64 channels (taller output-row chunks: fewer halo rows read "
+            "again): 'auto' (default) where the cost model estimates it at "
+            "least 5%% faster, 'off' keeps one call.  Bit-identical."
+        ),
+    )
+    p.add_argument(
         "--no-fuse-patterns",
         dest="fuse_patterns",
         action="store_false",
@@ -342,7 +354,7 @@ def main_multi(args) -> int:
         try:
             g = OnnxGraph(path, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns, matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv,
+                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv, dw_slice=args.dw_slice,
                           plan=plan_options_from_args(args))
         except (FileNotFoundError, SchedulerError) as e:
             print(f"error: entry {name}: {e}", file=sys.stderr)
@@ -411,7 +423,7 @@ def main(argv=None):
         graph = OnnxGraph(args.model, fuse_act=args.fuse_act, s2d_stem=args.s2d_stem,
                           fuse_patterns=args.fuse_patterns,
                           matmul_on_conv=args.matmul_on_conv,
-                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv,
+                          matmul_gemv=args.matmul_gemv, fc_conv=args.fc_conv, dw_slice=args.dw_slice,
                           plan=plan_options_from_args(args))
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)

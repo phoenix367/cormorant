@@ -348,6 +348,50 @@ def conv_board_cycles(in_ch: int, out_ch: int, in_h: int, in_w: int,
                       CONV_WEIGHT_REQ_CYCLES, CONV_PREFETCH_HIDE)
 
 
+# Depthwise channel slices (doc/scheduler/INFERENCE_SCHEDULER.md §Depthwise
+# channel slices).  The kernel sizes a job's output-row chunks so that every
+# m-tile's accumulators fit at once — 65 536 / (out_w · m_tiles · 16) rows —
+# but the m-tiles of a depthwise job are independent, so a job issued as
+# several calls of fewer channels gets taller chunks: fewer halo rows read
+# again and fewer sweeps.  On the board (8599aa7a5f12) a 3x3 job of 144
+# channels on 120 x 160 took 10.26 ms in one call and 9 x 0.635 ms as
+# 16-channel calls; a 2x1 one dilated by 13 (48 channels) 4.10 against
+# 3 x 0.80 ms; a 1x7 or 1x1 job (no row halo) gains nothing.
+DW_SLICES = (16, 32, 64)
+DW_SLICE_MARGIN = 0.05          # slice only where the model predicts >= 5 % less
+
+
+@lru_cache(maxsize=4096)
+def dw_slice(in_ch: int, in_h: int, in_w: int, oh: int, ow: int, kh: int, kw: int,
+             sh: int = 1, sw: int = 1, dh: int = 1, dw: int = 1,
+             pt: int = 0, pl: int = 0) -> int:
+    """Channels per ConvKernel call for a batch-1 depthwise job: the slice of
+    ``DW_SLICES`` with the fewest board cycles (``rtl_conv_walk(board=True)``
+    plus ``CALL_OVERHEAD`` per call; the last call takes the remainder), or
+    ``in_ch`` (one call) unless a slice is ``DW_SLICE_MARGIN`` faster.  Only
+    the RTL kernel (``kernels.conv.impl == "rtl"``) is sliced."""
+    if CONV_IMPL != "rtl":
+        return in_ch
+
+    def cost(s: int) -> float:
+        full, rem = divmod(in_ch, s)
+        total = 0.0
+        for ch, calls in ((s, full), (rem, 1 if rem else 0)):
+            if calls:
+                w = rtl_conv_walk(ch, ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
+                                  dwise=True, board=True)
+                total += calls * (w["total"] + CALL_OVERHEAD)
+        return total
+
+    best, best_c = in_ch, cost(in_ch)
+    for s in DW_SLICES:
+        if s < in_ch:
+            c = cost(s)
+            if c < best_c and c <= cost(in_ch) * (1.0 - DW_SLICE_MARGIN):
+                best, best_c = s, c
+    return best
+
+
 @lru_cache(maxsize=8192)
 def _conv_walk(in_ch, out_ch, in_h, in_w, oh, ow, kh, kw, sh, sw, dh, dw, pt, pl,
                req: float, hide: float) -> dict:
@@ -525,6 +569,8 @@ __all__ = (
     "conv_board_cycles",
     "conv_batch_cycles",
     "conv_invoke_overhead",
+    "dw_slice",
+    "DW_SLICES",
     "rtl_conv_walk",
     "matmul_cycles",
     "gemv_cycles",

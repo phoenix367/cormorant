@@ -129,7 +129,7 @@ emits a complete C project that drives up to four hardware kernels:
 |--------|----------|
 | VectorOPKernel | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)`; `LeakyRelu`, SiLU (`Mul(x, Sigmoid(x))`, fused by `src/fusion.py`) and `Gelu` (native or fused) on its activation unit — platform `kernels.vectorop.activations`, `AXI_VECTOROP_ACTIVATIONS=0` for older bitstreams (`Gelu` then stays a host op), `src/vectorop_act.py`; fused into a producing Add / Sub / Mul / Div through `act` |
 | MatmulKernel | `MatMul` (and fully-connected `Conv`s — the kernel covers the whole input — rewritten to MatMul where faster, `--fc-conv`, `src/fc_conv.py`) — the ones not lowered onto ConvKernel (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, < 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image (its GEMV / image path, `--matmul-gemv`, through both read ports) where that is faster or another entry pinned the weight's layout — one copy of every weight (`doc/scheduler/INFERENCE_SCHEDULER.md` §MatMul GEMV streaming) |
-| ConvKernel | `Conv`; `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/plans/BERT_PLAN.md` §2 2A) |
+| ConvKernel | `Conv` (a batch-1 depthwise one as 16- / 32- / 64-channel calls where the cost model says that is faster: taller row chunks, `--dw-slice`, `doc/scheduler/INFERENCE_SCHEDULER.md` §Depthwise channel slices); `MatMul` with swapped operand roles (A = conv weight, B = conv input, 1×kw kernel, stride (1, kw)) wherever the engine cost model says it is faster — `--matmul-on-conv auto` (default) / `always` / `off` (`--no-matmul-on-conv`), bit-identical either way (`doc/plans/BERT_PLAN.md` §2 2A) |
 | PoolingKernel | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` |
 | (zero-cost) | `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity` and same-kind `Cast` (buffer aliases), contiguous 64-byte-aligned `Split` / `Slice` pieces (sub-buffer views), `Gemm` (decomposed → MatMul + Add), `Constant` (→ initializer) |
 | (host CPU) | `SpaceToDepth` — also produced by the opt-in stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default): Conv 7×7 s2 on ≤ 4 channels → SpaceToDepth(2) + Conv 4×4 s1 on 4·C channels |
@@ -163,7 +163,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1727 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1743 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 

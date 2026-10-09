@@ -556,6 +556,7 @@ class OnnxGraph:
                  matmul_gemv="auto",
                  matmul_gemv_kw: "Dict[str, int]" = None,
                  fc_conv="auto",
+                 dw_slice="auto",
                  plan: "PlanOptions" = None,
                  array_pool: "Dict[Tuple[str, str], np.ndarray]" = None) -> None:
         """
@@ -617,6 +618,16 @@ class OnnxGraph:
         "always" or "off" (``False``; CLI ``--fc-conv off``).  Bit-identical
         unless the sum before the bias saturates.  ``self.fc_conv_stats``
         reports ``{"lowered", "kept", "conv_cycles", "matmul_cycles"}``.
+
+        dw_slice: issue a batch-1 depthwise Conv as several ConvKernel calls of
+        16, 32 or 64 channels where the cost model says it is faster
+        (``cost_model.dw_slice``, doc/scheduler/INFERENCE_SCHEDULER.md
+        §Depthwise channel slices): a call of fewer channels gets taller
+        output-row chunks, so fewer halo rows are read again.  "auto"
+        (default, also ``True``), "off" (``False``; CLI ``--dw-slice off``) or
+        a multiple of 16 (every depthwise Conv with more channels, in calls of
+        that many).  Bit-identical.  ``self.dw_slice_stats`` reports
+        ``{"sliced", "kept", "calls"}``.
 
         plan: the opt-in planning mode (src/planning.py, doc/plans/
         TACTICS_PLAN.md).  ``None`` / disabled: every choice as without
@@ -858,6 +869,7 @@ class OnnxGraph:
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),
             graph_io=self._input_names + self._output_names,
             kw_hint=matmul_gemv_kw, perf_model=perf_model, plan_log=self.plan_log)
+        self.dw_slice_stats = self._choose_dw_slices(dw_slice)
         self._pack_matmul_weights()
         self._choose_slice_views()
         self.order_log = None
@@ -886,6 +898,36 @@ class OnnxGraph:
                         f"({sn.onnx_node.op_type}) reads integer tensor "
                         f"'{t.onnx_name}' ({t.dtype}); integer tensors are stored "
                         f"as raw integers and must go through a Cast first.")
+
+    def _choose_dw_slices(self, mode) -> dict:
+        """Channels per ConvKernel call of every batch-1 depthwise ConvNode
+        (``ConvNode.dw_slice``; see ``__init__``'s ``dw_slice``)."""
+        if mode is True:
+            mode = "auto"
+        if mode is False or mode is None:
+            mode = "off"
+        if not (mode in ("auto", "off") or (isinstance(mode, int) and mode > 0 and mode % 16 == 0)):
+            raise ValueError(f"dw_slice: 'auto', 'off' or a positive multiple of 16, not {mode!r}")
+        stats = {"sliced": 0, "kept": 0, "calls": 0}
+        for sn in self._nodes:
+            if not (isinstance(sn, ConvNode) and sn.is_depthwise and sn.batch == 1
+                    and sn.out_ch > cost_model.DW_SLICES[0]):
+                continue
+            if mode == "off":
+                s = sn.out_ch
+            elif mode == "auto":
+                s = cost_model.dw_slice(sn.in_ch, sn.in_h, sn.in_w, sn.out_h, sn.out_w, sn.kh, sn.kw,
+                                        sn.stride_h, sn.stride_w, sn.dilation_h, sn.dilation_w,
+                                        sn.pad_top, sn.pad_left)
+            else:
+                s = mode
+            if s < sn.out_ch:
+                sn.dw_slice = s
+                stats["sliced"] += 1
+                stats["calls"] += sn.slice_calls()
+            else:
+                stats["kept"] += 1
+        return stats
 
     def _choose_slice_views(self) -> None:
         """Turn contiguous Slice pieces into zero-cost sub-buffer views where

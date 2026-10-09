@@ -1200,6 +1200,9 @@ class ConvNode:
     pad_left:    int = 0
     has_bias:    bool = False
     is_depthwise: bool = False
+    # Depthwise channel slices (OnnxGraph(dw_slice=...), cost_model.dw_slice):
+    # channels per ConvKernel call; 0 = one call over every channel.
+    dw_slice:    int = 0
 
     # Compatibility shims — never set by callers.
     outer_count:        int  = field(default=1,    init=False)
@@ -1495,6 +1498,8 @@ class ConvNode:
             if self.kh != self.kw else f"{self.kh}"
         )
         dw_str = " dw" if self.is_depthwise else ""
+        if self.sliced:
+            dw_str += f", {self.slice_calls()} calls of {self.dw_slice} channels"
         return (
             f"    /* [{self.index}] Conv({x_name}, {w_name}{bias_str})"
             f" -> {self.output.onnx_name}"
@@ -1505,6 +1510,14 @@ class ConvNode:
             f" p={self.pad_top},{self.pad_left}{dw_str} */"
         )
 
+    @property
+    def sliced(self) -> bool:
+        """A depthwise conv issued as several channel-slice calls."""
+        return self.is_depthwise and 0 < self.dw_slice < self.out_ch
+
+    def slice_calls(self) -> int:
+        return -(-self.out_ch // self.dw_slice) if self.sliced else 1
+
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         x      = self.inputs[0].c_name
         weight = self.inputs[1].c_name
@@ -1512,6 +1525,28 @@ class ConvNode:
         y      = self.output.c_name
         hb     = "1u" if self.has_bias else "0u"
         idw    = "1u" if self.is_depthwise else "0u"
+        if self.sliced:
+            # One call per slice of S channels (NCHW, batch 1: each slice of x
+            # and y is contiguous; the depthwise weights [C][roundup(kh*kw, 8)]
+            # and the bias [roundup(C, 8)] too), every offset 16-byte aligned
+            # (S is a multiple of 16).  Call s waits for call s-1; the last
+            # one is left in flight like any start.
+            s, c = self.dw_slice, self.out_ch
+            kpad = -(-(self.kh * self.kw) // 8) * 8
+            return "\n".join([
+                f"    for (unsigned _c = 0u; _c < {c}u; _c += {s}u) {{",
+                "        if (_c) kernel_wait(KERNEL_CONV);   /* one ConvKernel call per channel slice */",
+                f"        run_conv_dw_at({x}, _c * {self.in_h * self.in_w}u,"
+                f" {weight}, _c * {kpad}u, {bias}, _c,",
+                f"                       {y}, _c * {self.out_h * self.out_w}u,"
+                f" ({c}u - _c < {s}u) ? {c}u - _c : {s}u,",
+                f"                       {self.in_h}u, {self.in_w}u,"
+                f" {self.out_h}u, {self.out_w}u, {self.kh}u, {self.kw}u,",
+                f"                       {self.stride_h}u, {self.stride_w}u,"
+                f" {self.dilation_h}u, {self.dilation_w}u,"
+                f" {self.pad_top}u, {self.pad_left}u, {hb});",
+                "    }",
+            ])
         return (
             f"    run_conv({x}, {weight}, {bias}, {y},\n"
             f"             {self.batch}u, {self.in_ch}u,"
@@ -1524,8 +1559,18 @@ class ConvNode:
         )
 
     def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
-        """The ConvKernel call emit_call() issues (perf_calls.py)."""
+        """The ConvKernel call(s) emit_call() issues (perf_calls.py)."""
         from .perf_calls import KernelCall
+        if self.sliced:
+            full, rem = divmod(self.out_ch, self.dw_slice)
+            return [KernelCall.of("ConvKernel", count=n, batch=1, in_ch=ch,
+                                  in_h=self.in_h, in_w=self.in_w, out_ch=ch,
+                                  out_h=self.out_h, out_w=self.out_w, kh=self.kh, kw=self.kw,
+                                  stride_h=self.stride_h, stride_w=self.stride_w,
+                                  dilation_h=self.dilation_h, dilation_w=self.dilation_w,
+                                  pad_top=self.pad_top, pad_left=self.pad_left,
+                                  has_bias=int(bool(self.has_bias)), is_dw=1)
+                    for ch, n in ((self.dw_slice, full), (rem, 1 if rem else 0)) if n]
         return [KernelCall.of("ConvKernel", batch=self.batch, in_ch=self.in_ch,
                               in_h=self.in_h, in_w=self.in_w, out_ch=self.out_ch,
                               out_h=self.out_h, out_w=self.out_w, kh=self.kh, kw=self.kw,

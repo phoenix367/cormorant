@@ -896,7 +896,8 @@ facts:
   value: {resnet18_ms: 20.2, resnet18_fps: 49.6, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.4, bert_ms: 418,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
           smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249,
-          yolov5n_ms: 63.9, yolov5n_fps: 15.6, stereo_ms: 659, stereo_fps: 1.52}
+          yolov5n_ms: 63.9, yolov5n_fps: 15.6, stereo_ms: 599, stereo_fps: 1.67,
+          stereo320_ms: 160}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -932,7 +933,7 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before)"
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before); with the depthwise channel slices (INFERENCE_SCHEDULER.md §Depthwise channel slices, STEREO_PLAN §4.5, the same run, 42 + 2 RealSense pairs): 598.8 ms mean / 598.4 p50, 1.67 FPS, maps bit-exact; at 320 x 256 (run.height 256 / run.width 320, demo/stereo_depth/build/results_320_dwslice.json): 159.6 ms mean (163.7 before the slices)"
     facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
@@ -954,6 +955,8 @@ facts:
                 transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
     stereo_fps: {file: demo/stereo_depth/build/results.json, json: '',
                  transform: "one(x['metrics']['fps'] for x in v if x['name'] == 'lightstereo_s')"}
+    stereo320_ms: {file: demo/stereo_depth/build/results_320_dwslice.json, json: '',
+                   transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
     - {file: README.md, regex: '\| ResNet-18, 224×224 \| \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
@@ -974,6 +977,9 @@ facts:
     - {file: demo/stereo_depth/README.md, regex: 'a pair takes \*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
     - {file: doc/README.md, regex: 'demo: (?P<stereo_ms>\d+) ms per pair at 640 × 480 on the board'}
     - {file: doc/plans/STEREO_PLAN.md, regex: 'a pair takes\s+\*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
+    - {file: README.md, regex: '; (?P<stereo320_ms>\d+) ms at 320×256;'}
+    - {file: demo/stereo_depth/README.md, regex: 'At 320 × 256\s+\(`run.height` / `run.width`\) it takes (?P<stereo320_ms>\d+) ms'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: 'At 320 × 256 a pair takes (?P<stereo320_ms>[\d.]+) ms'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
     - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
     - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
@@ -1096,7 +1102,7 @@ facts:
     - {file: demo/README.md, regex: 'RealSense pairs: depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
     - {file: doc/README.md, regex: 'RealSense D435 on the board \(§4\.4\): depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
     - {file: demo/stereo_depth/README.md,
-       regex: 'a D435 pair took (?P<ms>\d+) ms; with the IR\s+projector on, the network.s depth is within 10 % of the camera.s own on\s+(?P<on_within10>\d+) % of the pixels \(median difference (?P<on_median>[\d.]+) %\), without it on (?P<off_within10>\d+) % \((?P<off_median>[\d.]+) %\)'}
+       regex: 'a D435 pair took (?P<ms>\d+) ms(?: \([^)]*\))?; with the IR\s+projector on, the network.s depth is within 10 % of the camera.s own on\s+(?P<on_within10>\d+) % of the pixels \(median difference (?P<on_median>[\d.]+) %\), without it on (?P<off_within10>\d+) % \((?P<off_median>[\d.]+) %\)'}
     - {file: doc/plans/STEREO_PLAN.md, regex: 'Both ran in (?P<ms>\d+) ms per pair'}
     - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector on \| [\d ]+ \| (?P<on_median>[\d.]+) % \| [\d.]+ % \| (?P<on_within10>[\d.]+) % \|'}
     - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector off \(passive\) \| [\d ]+ \| (?P<off_median>[\d.]+) % \| [\d.]+ % \| (?P<off_within10>[\d.]+) % \|'}

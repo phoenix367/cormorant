@@ -71,6 +71,9 @@ Options:
                              Fully-connected Convs (kernel = whole input, one output
                              pixel) as MatMul on MatmulKernel (default auto: >= 20 %
                              faster by the cost model; src/fc_conv.py)
+  --dw-slice {auto,off}      Batch-1 depthwise Convs as several 16- / 32- / 64-channel
+                             ConvKernel calls (taller output-row chunks; default auto:
+                             >= 5 % faster by the cost model)
   --no-fuse-patterns         No LayerNorm / GELU fusion, no constant-broadcast
                              normalisation
   --matmul-on-conv {auto,always,off}
@@ -100,10 +103,10 @@ Planning (src/planning.py, ../doc/plans/TACTICS_PLAN.md; bit-identical results):
 ```
 
 The CLI enables `fuse_act`, `s2d_stem`, `fuse_patterns`,
-`matmul_on_conv="auto"`, `matmul_gemv="auto"` and `fc_conv="auto"`; the
-`OnnxGraph` library defaults are `fuse_act=False`, `s2d_stem=False`,
-`fuse_patterns=True`, `matmul_on_conv="auto"`, `matmul_gemv="auto"`,
-`fc_conv="auto"`, `plan=None` (off).
+`matmul_on_conv="auto"`, `matmul_gemv="auto"`, `fc_conv="auto"` and
+`dw_slice="auto"`; the `OnnxGraph` library defaults are `fuse_act=False`,
+`s2d_stem=False`, `fuse_patterns=True`, `matmul_on_conv="auto"`,
+`matmul_gemv="auto"`, `fc_conv="auto"`, `dw_slice="auto"`, `plan=None` (off).
 
 ## Preprocessing ONNX models — `simplify_onnx.py`
 
@@ -274,7 +277,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              79 pytest modules, 1727 tests, all pass (test_bert_base.py
+  test_*.py              80 pytest modules, 1743 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -357,7 +360,11 @@ register writes) off.
 
 **ConvNode** — ConvKernel: `Conv`. NCHW 2-D convolution with optional bias,
 configurable kernel/stride/pad (incl. `auto_pad`)/dilation. `group=1` or
-depthwise (`group=in_ch`); other grouped convolutions are rejected.
+depthwise (`group=in_ch`); other grouped convolutions are rejected.  A
+batch-1 depthwise Conv runs as several 16- / 32- / 64-channel calls
+(`dw_slice`, `run_conv_dw_at()`) where `cost_model.dw_slice` says that is
+faster: fewer channels per call give taller output-row chunks
+(`../doc/scheduler/INFERENCE_SCHEDULER.md` §Depthwise channel slices).
 
 **MatmulConvNode** — ConvKernel: a `MatMul` lowered by
 `src/matmul_lowering.py` (`OnnxGraph(matmul_on_conv="auto")`, the default)

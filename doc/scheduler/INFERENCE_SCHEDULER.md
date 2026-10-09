@@ -159,7 +159,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1727 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1743 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -295,10 +295,14 @@ inference_scheduler.py          CLI, argument parsing
    the HLS kernel only single-row ones); `matmul_gemv_kw` ({weight: kw}) reads those weights in
    ConvKernel's kw image ([§MatMul GEMV streaming](#matmul-gemv-streaming));
    planned by `_plan_gemv` under `plan`.
-13. `_pack_matmul_weights()` (the remaining tiled MatmulNodes), then
+13. `_choose_dw_slices()` (`dw_slice="auto"`, the default) — batch-1
+   depthwise ConvNodes issued as several 16- / 32- / 64-channel calls
+   where the cost model says it is faster ([§Depthwise channel
+   slices](#depthwise-channel-slices)).
+14. `_pack_matmul_weights()` (the remaining tiled MatmulNodes), then
    `_choose_slice_views()` (contiguous Slice pieces that may alias their
    source).
-14. `order_search.plan_order()` (only with `plan` enabled) — the issue
+15. `order_search.plan_order()` (only with `plan` enabled) — the issue
    order from the timed simulation ([§Planning](#planning---plan)).
 
 `_space_to_depth_stems()` (when `s2d_stem=True`) runs on the ONNX model
@@ -332,6 +336,55 @@ Conv is bound by its 1001 two-word weight requests (8.8 ms on the board,
 `cost_model.conv_board_cycles` 7.7 ms) against 0.67 ms for the RTL
 MatmulKernel's tiled path (MobileNet v1 81.0 → 73.0 ms on the board,
 MATMUL_RTL_PLAN phase 3c; the HLS kernel's 1.5 ms is faster too).
+
+### Depthwise channel slices
+
+ConvKernel sizes a job's output-row chunks so that every 16-channel
+m-tile's accumulators fit at once: `65 536 / (out_w · ⌈out_ch / 16⌉ · 16)`
+rows.  The m-tiles of a depthwise job are independent, though, so a wide
+map with many channels runs in chunks of a few rows — and every chunk reads
+its window's `(kh − 1)·dilation_h` halo rows again and pays a sweep's
+start-up per m-tile and column tile.  `OnnxGraph._choose_dw_slices()`
+issues such a Conv as several ConvKernel calls of S = 16, 32 or 64 channels
+(`ConvNode.dw_slice`; the last call takes the remainder): each call gets
+taller chunks.  NCHW makes a channel slice of x and y contiguous, the
+depthwise weights `[C][roundup(kh·kw, 8)]` and the bias `[roundup(C, 8)]`
+too, so a slice is `run_conv_dw_at()` at element offsets (16-byte aligned:
+S is a multiple of 16), the calls in a loop that waits on `KERNEL_CONV`
+before each call after the first.  The arithmetic per channel is unchanged:
+bit-identical, and the simulation does not change.
+
+`cost_model.dw_slice()` prices one call and the three slice sizes with the
+board's walk (`rtl_conv_walk(board=True)`) plus `CALL_OVERHEAD` per call and
+slices only where that is at least 5 % less (`DW_SLICE_MARGIN`); the HLS
+ConvKernel (`AXI_CONV_IMPL=hls`) is never sliced, nor is a batch > 1 job.
+`dw_slice="auto"` is the library and CLI default; `"off"` (`--dw-slice off`)
+keeps one call, a multiple of 16 forces that slice on every depthwise Conv
+with more channels.  `OnnxGraph.dw_slice_stats` = `{sliced, kept, calls}`;
+`kernel_calls()` lists the sliced calls, so `--plan` and the timing replay
+price them.
+
+Measured on the board (8599aa7a5f12, one call against the slices):
+
+| depthwise job | one call | as slices |
+|---|---:|---:|
+| 3×3, 144 ch, 120×160 | 10.26 ms | 9 × 0.635 = 5.72 ms |
+| 3×3, 192 ch, 60×80 | 2.04 ms | 6 × 0.277 = 1.66 ms (32 ch) |
+| 3×3 stride 2, 96 ch, 240×320 | 12.55 ms | 6 × 1.93 = 11.56 ms |
+| 2×1 dilated 13, 48 ch, 120×160 | 4.10 ms | 3 × 0.80 = 2.39 ms |
+| 1×7, 96 ch, 60×80 (no row halo) | 0.715 ms | 6 × 0.142 = 0.85 ms — kept |
+| 1×1, 144 ch, 120×160 (no halo) | 5.04 ms | 9 × 0.565 = 5.09 ms |
+
+LightStereo-S ([STEREO_PLAN](../plans/STEREO_PLAN.md) §4.5): 70 of its 114
+depthwise convs sliced (498 calls), 659 → 599 ms per pair at 640 × 480,
+depthwise time 235 → 176 ms.  No other demo changes: MobileNet v1 / v2 keep
+one call for each of their 13 / 17 depthwise convs (projects byte-identical
+with `--dw-slice off`), and YOLOv5n and the chat / TTS models have none.  On
+the board one call is the fastest for every MobileNet depthwise layer (7 × 7
+to 112 × 112 maps: the chunks are tall enough already) or within 2.4 % (v1's
+56 × 56, 128 ch: 0.679 ms, 0.662 as 64-channel calls); slices cost the
+calls' fixed time — 7 × 7, 960 ch: 0.163 ms in one call, 0.247 / 0.297 /
+0.468 ms as 64- / 32- / 16-channel calls.
 
 **VectorOPKernel alignment contract** (kernel ports are 128-bit words):
 every DMA buffer base is 64-byte aligned, every broadcast `CHUNK_STRIDE`

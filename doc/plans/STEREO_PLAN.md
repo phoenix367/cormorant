@@ -3,11 +3,13 @@
 **Status (2026-10-09):** study done (2026-10-08) and implemented: `demo/stereo_depth` runs
 LightStereo-S on the board (§4).
 - **The demo.**  On bitstream `8599aa7a5f12` at 640 × 480 a pair takes
-  **659 ms (1.52 FPS)**.
+  **599 ms (1.67 FPS)** — 659 ms before the depthwise convs ran as channel
+  slices (§4.5, a scheduler change).
   - Quality on all 42 Middlebury / ETH3D pairs: EPE 0.667 px and bad-2
     4.94 %, against float's 0.650 / 4.87 % on the same scaled input.
   - The disparity maps are bit-exact with the scheduler's simulation.
-  - At 320 × 256 a pair takes 163.7 ms (6.1 FPS), with EPE 1.061 px.
+  - At 320 × 256 a pair takes 159.6 ms (6.3 FPS; 163.7 before §4.5), with EPE
+    1.061 px.
 - **The implementation.**
   - A frontend (`inference-scheduler/src/stereo.py`) reads the PyTorch
     checkpoint without torch.
@@ -19,6 +21,9 @@ LightStereo-S on the board (§4).
   - Per-channel weights on 28 convs bring the simulated quality to float's:
     EPE 0.627 px against 0.633 at native resolution.
   - No bitstream change.
+  - Depthwise channel slices (§4.5): a depthwise conv with many channels runs
+    as several 16- / 32- / 64-channel ConvKernel calls, which get taller row
+    chunks; depthwise time 235 → 176 ms, bit-identical.
 - **The study (2026-10-08).**
   - **Verdict: GO with power-of-two exponents and per-channel weights.**
     LightStereo-S (OpenStereo, StereoAnything weights) is the only candidate
@@ -445,6 +450,55 @@ the pair streams at 26.5 fps at 640 × 480 at 30 fps.
 On a laptop with kernel 7.0, `uvcvideo` cut every frame of the camera on
 5.17.3.10 at 64 KiB.  librealsense's own RSUSB backend got whole frames
 there, but only a few before its watchdog fired.  Capture on the board.
+
+### 4.5 Depthwise channel slices (2026-10-09)
+
+The profile of §4.3 has the depthwise convs at 235 ms of 658: 159 for the 41
+3 × 3 ones, 76 for the 45 stripe pieces, for 0.5 GMAC — about 1.3 GB/s of
+DDR traffic and 14 MAC per cycle.  The obvious culprit, the depthwise MAC
+grid using one lane of 16, is not the limit on the board: the cycle model
+with every 3 × 3 window in one instant gives 110 → 102 ms (the patch producer
+and the x loads bound it).  Probing single ConvKernel calls on the board
+(`run_remote_perf.py`) found the real cost:
+
+| depthwise call | one call | per channel | 16-channel calls |
+|---|---:|---:|---:|
+| 3 × 3, 144 ch, 120 × 160 | 10.26 ms | 71 µs | 9 × 0.635 = 5.72 ms |
+| 3 × 3, 16 ch, 120 × 160 | 0.635 ms | 40 µs | |
+| 3 × 3, 144 ch, 120 × 62 (one column tile) | 1.66 ms | 30 µs per 160 | |
+| 2 × 1 dilated 13, 48 ch, 120 × 160 | 4.10 ms | | 3 × 0.80 = 2.39 ms |
+| 1 × 7, 96 ch, 60 × 80 | 0.715 ms | | 6 × 0.142 = 0.85 ms |
+
+ConvKernel sizes its output-row chunks so that every 16-channel m-tile's
+accumulators fit at once (`65 536 / (out_w · m_tiles · 16)` rows): 144
+channels at width 160 get 2-row chunks, and every chunk reads the window's
+halo rows again and starts a sweep per m-tile and column tile.  A depthwise
+job's m-tiles are independent, so the scheduler now issues a depthwise conv
+as several calls of 16, 32 or 64 channels where the cost model says so
+(`cost_model.dw_slice`, `OnnxGraph(dw_slice="auto")`, `--dw-slice`;
+INFERENCE_SCHEDULER.md §Depthwise channel slices).  A slice is contiguous in
+x, y, the weights and the bias (NCHW, batch 1), so each call is
+`run_conv_dw_at()` at element offsets: bit-identical.  Windows without a row
+halo (1 × k, 1 × 1) gain nothing, and the model keeps them in one call.
+
+In LightStereo-S 70 of the 114 depthwise convs are sliced (498 calls).  On
+the board (`run_demo.py --pairs 0`, 42 pairs + the 2 RealSense pairs):
+**659 → 599 ms per pair (1.52 → 1.67 FPS)**, EPE 0.667 px unchanged, maps
+bit-exact; at 320 × 256 163.7 → 159.6 ms (smaller maps already get taller
+chunks).  The profile (`--profile`):
+
+| node kind | before | after |
+|---|---:|---:|
+| ConvKernel depthwise 3 × 3 (41) | 158.9 ms | 119.1 ms |
+| ConvKernel depthwise stripes (45) | 76.3 ms | 56.6 ms |
+| ConvKernel per-channel rescales (28) | 23.4 ms | 23.8 ms |
+| the rest | unchanged | unchanged |
+
+The largest depthwise cost left is the stride-2 3 × 3 layers (layer 7:
+11.5 ms for 16.6 MMAC): the input is 4 × the output, and loading it into the
+line buffer competes with the window reads.  What a kernel change could do
+— the x path first, a depthwise engine after — is analysed in
+[DEPTHWISE_PLAN](DEPTHWISE_PLAN.md).
 
 ## 5. Commands and runtimes
 

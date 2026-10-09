@@ -67,8 +67,8 @@ A D4xx's two infrared cameras are a rectified stereo pair.  `run_demo.py
 depth, the calibration, the emitter on and off), runs only those pairs and
 writes `<name>_depth.png`: the left image, the network's depth
 (fx · baseline / disparity) and the camera's own depth.  On the board
-(2026-10-09, STEREO_PLAN §4.4) a D435 pair took 657 ms; with the IR
-projector on, the network's depth is within 10 % of the camera's own on
+(2026-10-09, STEREO_PLAN §4.4) a D435 pair took 657 ms (599 with the depthwise slices,
+STEREO_PLAN §4.5); with the IR projector on, the network's depth is within 10 % of the camera's own on
 98 % of the pixels (median difference 2.4 %), without it on 77 % (4.3 %):
 blank walls have no texture to match.
 
@@ -92,11 +92,13 @@ USB 2, 5000M / 10000M is USB 3.
 
 ## Results (KV260, bitstream `8599aa7a5f12`, 2026-10-09)
 
-**Speed.**  At 640 × 480 a pair takes **659 ms (1.52 FPS)**.  At 320 × 256
-(`run.height` / `run.width`) it takes 164 ms (6.1 FPS), with coarser
+**Speed.**  At 640 × 480 a pair takes **599 ms (1.67 FPS)**.  At 320 × 256
+(`run.height` / `run.width`) it takes 160 ms (6.3 FPS), with coarser
 disparities.  Most of the time goes to the MobileNetV2-style layers: 1 × 1
-convs 165 ms, depthwise convs 235 ms, ReLU6 55 ms (the profile is in
-STEREO_PLAN §4.3).
+convs 165 ms, depthwise convs 176 ms, ReLU6 55 ms (the profile is in
+STEREO_PLAN §4.3 and §4.5).  The depthwise convs run as 16- / 32- /
+64-channel calls where that is faster (`--dw-slice`, STEREO_PLAN §4.5):
+659 ms per pair before.
 
 **Correctness.**  The board's disparity maps equal the scheduler's
 simulation of the generated C, bit for bit.

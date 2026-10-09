@@ -5,8 +5,8 @@ from typing import List
 
 import numpy as np
 
-from ..nodes    import (ACT_NAMES, OP_NAMES, OP_SOFTMAX, MatmulConvNode, MatmulNode, ScheduledNode,
-                        SchedulerError, SpaceToDepthNode)
+from ..nodes    import (ACT_NAMES, OP_NAMES, OP_SOFTMAX, ConvNode, MatmulConvNode, MatmulNode,
+                        ScheduledNode, SchedulerError, SpaceToDepthNode)
 from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
                           SliceNode, host_c_helper)
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmKernelNode, LlmNode,
@@ -727,8 +727,11 @@ class _SourceMixin:
         need_run_conv = self._has_conv_nodes and any(
             not (isinstance(sn, MatmulConvNode) and sn.calls > 1)
             and not isinstance(sn, LlmAttnConvNode)
+            and not (isinstance(sn, ConvNode) and sn.sliced)
             for sn in nodes if sn.kernel_name == "ConvKernel"
         )
+        # run_conv_dw_at: depthwise Convs issued as channel-slice calls
+        need_run_conv_dw = any(isinstance(sn, ConvNode) and sn.sliced for sn in nodes)
         need_run_conv_at = any(
             (isinstance(sn, MatmulConvNode) and sn.calls > 1)
             or isinstance(sn, LlmAttnConvNode) for sn in nodes
@@ -746,12 +749,11 @@ class _SourceMixin:
             titles.append("run_matmul_at() — MatmulKernel dispatch helper")
         elif need_run_matmul:
             titles.append("run_matmul() — MatmulKernel dispatch helper")
-        if need_run_conv and need_run_conv_at:
-            titles.append("run_conv() / run_conv_at() — ConvKernel dispatch helpers")
-        elif need_run_conv_at:
-            titles.append("run_conv_at() — ConvKernel dispatch helper")
-        elif need_run_conv:
-            titles.append("run_conv() — ConvKernel dispatch helper")
+        conv_helpers = [n for n, need in (("run_conv()", need_run_conv), ("run_conv_at()", need_run_conv_at),
+                                          ("run_conv_dw_at()", need_run_conv_dw)) if need]
+        if conv_helpers:
+            titles.append(" / ".join(conv_helpers) + " — ConvKernel dispatch helper"
+                          + ("s" if len(conv_helpers) > 1 else ""))
         if need_run_pool:
             titles.append("run_pool() — PoolingKernel dispatch helper")
         title = " / ".join(titles) if titles else "Kernel dispatch helpers"
@@ -1149,6 +1151,61 @@ class _SourceMixin:
                 f"    XConvkernel_Set_pad_left    (&{conv_var}, pad_left);\n"
                 f"    XConvkernel_Set_has_bias    (&{conv_var}, has_bias);\n"
                 f"    XConvkernel_Set_is_depthwise(&{conv_var}, is_depthwise);\n"
+                f"    XConvkernel_Start(&{conv_var});\n"
+                "}\n"
+            )
+
+        if need_run_conv_dw:
+            parts.append(
+                "/*\n"
+                " * run_conv_dw_at() — one channel slice of a depthwise conv (batch 1):\n"
+                " * x / weight / bias / y start at element offsets x_off / w_off / b_off /\n"
+                " * y_off of their buffers (NCHW: each slice of x and y is contiguous;\n"
+                " * the weights are [C][roundup(kh*kw, 8)], the bias [roundup(C, 8)]),\n"
+                " * ch channels.  A depthwise job of fewer channels gets taller output-row\n"
+                " * chunks (cost_model.dw_slice); every offset is 16-byte aligned.\n"
+                " *\n"
+                " * NON-BLOCKING like run_conv(): the caller waits on KERNEL_CONV\n"
+                " * before the next call reprograms the registers.\n"
+                " */\n"
+                "static void run_conv_dw_at(\n"
+                "    inference_buf_t *x,      unsigned x_off,\n"
+                "    inference_buf_t *weight, unsigned w_off,\n"
+                "    inference_buf_t *bias,   unsigned b_off,\n"
+                "    inference_buf_t *y,      unsigned y_off,\n"
+                "    unsigned ch,\n"
+                "    unsigned in_h,  unsigned in_w,  unsigned out_h, unsigned out_w,\n"
+                "    unsigned kh,    unsigned kw,\n"
+                "    unsigned stride_h, unsigned stride_w,\n"
+                "    unsigned dilation_h, unsigned dilation_w,\n"
+                "    unsigned pad_top, unsigned pad_left,\n"
+                "    unsigned has_bias)\n"
+                "{\n"
+                f"    XConvkernel_Set_x           (&{conv_var},\n"
+                "        inference_buf_phys(x) + (uint64_t)x_off * INFERENCE_BYTES_PER_ELEM);\n"
+                f"    XConvkernel_Set_weight      (&{conv_var},\n"
+                "        inference_buf_phys(weight) + (uint64_t)w_off * INFERENCE_BYTES_PER_ELEM);\n"
+                f"    XConvkernel_Set_bias        (&{conv_var}, bias ?\n"
+                "        inference_buf_phys(bias) + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM : (u64)0);\n"
+                f"    XConvkernel_Set_y           (&{conv_var},\n"
+                "        inference_buf_phys(y) + (uint64_t)y_off * INFERENCE_BYTES_PER_ELEM);\n"
+                f"    XConvkernel_Set_batch       (&{conv_var}, 1u);\n"
+                f"    XConvkernel_Set_in_ch       (&{conv_var}, ch);\n"
+                f"    XConvkernel_Set_in_h        (&{conv_var}, in_h);\n"
+                f"    XConvkernel_Set_in_w        (&{conv_var}, in_w);\n"
+                f"    XConvkernel_Set_out_ch      (&{conv_var}, ch);\n"
+                f"    XConvkernel_Set_out_h       (&{conv_var}, out_h);\n"
+                f"    XConvkernel_Set_out_w       (&{conv_var}, out_w);\n"
+                f"    XConvkernel_Set_kh          (&{conv_var}, kh);\n"
+                f"    XConvkernel_Set_kw          (&{conv_var}, kw);\n"
+                f"    XConvkernel_Set_stride_h    (&{conv_var}, stride_h);\n"
+                f"    XConvkernel_Set_stride_w    (&{conv_var}, stride_w);\n"
+                f"    XConvkernel_Set_dilation_h  (&{conv_var}, dilation_h);\n"
+                f"    XConvkernel_Set_dilation_w  (&{conv_var}, dilation_w);\n"
+                f"    XConvkernel_Set_pad_top     (&{conv_var}, pad_top);\n"
+                f"    XConvkernel_Set_pad_left    (&{conv_var}, pad_left);\n"
+                f"    XConvkernel_Set_has_bias    (&{conv_var}, has_bias);\n"
+                f"    XConvkernel_Set_is_depthwise(&{conv_var}, 1u);\n"
                 f"    XConvkernel_Start(&{conv_var});\n"
                 "}\n"
             )
