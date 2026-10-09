@@ -5,9 +5,9 @@ that runs inference on the Xilinx KV260 FPGA using up to four hardware kernels:
 VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv,
 incl. depthwise, and MatMuls lowered with swapped operand roles), and
 PoolingKernel (2-D pooling). Ops no kernel implements (Softmax, LayerNorm,
-Gelu, Transpose, Slice / Split copies, Gather, OneHot, Cast, SpaceToDepth and
-the `axi.llm` Llama decoder, vision-encoder and text-to-speech ops) run as
-host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
+Gelu, Transpose, Slice / Split copies, Concat, Resize, Gather, OneHot, Cast,
+SpaceToDepth and the `axi.llm` Llama decoder, vision-encoder, text-to-speech
+and stereo depth ops) run as host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
 Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
 library and weight pool (multi-entry projects, `--entry`). The opt-in `--plan`
 mode picks MatMul tactics and the issue order from the bitstream's measured
@@ -212,8 +212,13 @@ src/
   tts_nodes.py           the TTS host ops (TtsPrep / Gate / Sum / FlowOut / Interleave / Pcm; the
                          encoder's TtsEmbed / RowPrep / AttnSoftmax / AttnMerge / ResNorm / EncOut)
                          + TTS_C / TTS_ENC_C
+  stereo.py              LightStereo-S stereo depth frontend: the PyTorch checkpoint (read without
+                         torch) + calibrated formats -> one graph (BN folded, polyphase deconvs,
+                         split stripes, exponent solver, per-channel conv weights via chexp)
+  stereo_nodes.py        its ops: StereoVop / StereoSoftmax (VectorOP kernel nodes),
+                         StereoInstanceNorm / PadEdge / Correlation / Upsample (host) + STEREO_C
   numeric.py             axi.numeric metadata: power-of-two exponents (MatMul and Conv weight
-                         encoding), host tensors, states
+                         encoding; chexp: per-channel Conv exponents), host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
                          constant-broadcast normalisation
   matmul_lowering.py     MatMul → ConvKernel lowering pass (engine choice, geometry, row
@@ -269,7 +274,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              77 pytest modules, 1699 tests, all pass (test_bert_base.py
+  test_*.py              79 pytest modules, 1727 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -284,6 +289,8 @@ test/
                          test_tts_ops.py (the TTS C helpers), test_piper.py (the Piper
                          chunk and encode entries == the specification, stitching,
                          buckets, host_emu; the C duration predictor == its spec),
+                         test_stereo_nodes.py / test_stereo.py (the stereo ops, the
+                         LightStereo frontend on host_emu),
                          test_bert_base.py (BERT-base on the real model),
                          test_fetch_assets.py (the BERT demo's downloader, local server)
 ```

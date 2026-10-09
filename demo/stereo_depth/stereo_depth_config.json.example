@@ -1,0 +1,50 @@
+{
+  "_comment": "Copy to stereo_depth_config.json and edit. Paths are relative to demo/stereo_depth/.",
+  "ssh": {
+    "host": "kv260.local",
+    "user": "root",
+    "port": 22,
+    "key_file": "~/.ssh/id_rsa",
+    "_key_file_note": "Path to SSH private key; null for password auth.",
+    "password": null,
+    "connect_timeout": 15
+  },
+  "remote": {
+    "work_dir": "/tmp/stereo_depth_demo",
+    "_work_dir_note": "Per-run scratch directory on the board (the project, the pairs, disparity.bin). Created if missing.",
+    "uio_devices": {
+      "VectorOPKernel": "fabric_vecop",
+      "MatmulKernel": "fabric_matmul",
+      "ConvKernel": "fabric_conv",
+      "PoolKernel": "fabric_pool"
+    },
+    "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name",
+    "cmake_args": []
+  },
+  "local": {
+    "driver_dirs": {
+      "VectorOPKernel": "../../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
+      "MatmulKernel": "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
+      "ConvKernel": "../../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src"
+    },
+    "_driver_dirs_note": "Per-kernel driver sources (make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl), copied into the project before upload."
+  },
+  "build": {
+    "jobs": 2,
+    "timeout": 900
+  },
+  "run": {
+    "timeout": 900,
+    "use_sudo": true,
+    "warmup": 1,
+    "pairs": 12,
+    "_pairs_note": "Pairs with ground truth to run (Middlebury MiddEval3-Q and ETH3D, alternating; 0: all 42), plus every pair in assets/pairs/<name>/{left,right}.png.",
+    "height": 480,
+    "width": 640,
+    "_size_note": "The network's input size (multiples of 32): larger pairs are scaled down to fit, smaller ones padded.",
+    "per_channel": 0.05,
+    "_per_channel_note": "Per-channel weight exponents (a depthwise 1 x 1 rescale after the conv) where per-tensor rounding loses more than this share of a conv's weights; null: off (STEREO_PLAN \u00a74).",
+    "check_pairs": 2,
+    "_check_pairs_note": "Pairs whose disparity is compared bit for bit with the scheduler's simulation (about 15 s each on the host)."
+  }
+}

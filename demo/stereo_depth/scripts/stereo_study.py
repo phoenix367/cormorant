@@ -32,10 +32,8 @@ usage: .venv-export/bin/python demo/stereo_depth/scripts/stereo_study.py fetch|v
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
-import subprocess
 import sys
 import time
 import types
@@ -46,75 +44,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-DEMO = Path(__file__).resolve().parent.parent
-ASSETS = DEMO / "assets"
-CKPT_DIR = ASSETS / "ckpt"
-DATA_DIR = ASSETS / "data"
-STUDY_DIR = ASSETS / "study"
-OPENSTEREO = ASSETS / "OpenStereo"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stereo_assets import (ASSETS, CKPT_DIR, CKPTS, DATA_DIR, DEMO, FORMATS, OPENSTEREO,  # noqa: E402,F401
+                           STUDY_DIR, fetch, sha256, write_formats)
 
-HF_REPO = "XiandaGuo/OpenStereo"
-HF_REV = "cac6f81baeb0099522adc72859b1bda46bfcf6e7"
-OPENSTEREO_COMMIT = "23d71c92e33ad1f80dfc42bf29f5c6a914d38769"     # branch v2
-CKPTS = {   # name: (path in the HF repo, SHA-256)
-    "anything-s": ("checkpoint/StereoAnything/StereoAnything-LightStereo_S.pt",
-                   "fe62602ffc17cef1a7971d0237bb1ba801c5711bc70485523363ddc9f4b30abc"),
-    "sceneflow-s": ("checkpoint/LightStereo/LightStereo-S-SceneFlow-General.pth",
-                    "695c91639de3647db293fa48228c085a6ac70916b5081d4eb02536a90ea6c687"),
-    "kitti-s": ("checkpoint/LightStereo/LightStereo-S-KITTI.ckpt",
-                "3d768e0344c2b8bfacb8f7f27cc647cd338e5ba93ec66d944a9a73fd63ec9b2a"),
-}
-DATASETS = {   # file: (url, SHA-256)
-    "MiddEval3-data-Q.zip": ("https://vision.middlebury.edu/stereo/submit3/zip/MiddEval3-data-Q.zip",
-                             "a1411f283b523541e0d2e8b3a1dd6618974a0e539aea0122490791a041fffc09"),
-    "MiddEval3-GT0-Q.zip": ("https://vision.middlebury.edu/stereo/submit3/zip/MiddEval3-GT0-Q.zip",
-                            "489b6a4015951a3c865aa54c0f37dcb648b5d0efad8019264e22499cef35ca45"),
-    "two_view_training.7z": ("https://www.eth3d.net/data/two_view_training.7z",
-                             "cb7683a01ba037759f30b5a4f561d302453e20f1f7095cbdc51c8564b218224b"),
-    "two_view_training_gt.7z": ("https://www.eth3d.net/data/two_view_training_gt.7z",
-                                "e440f7ec4444dfd2af33a44495f325a3aed06762432e2419277596ba7dcb9b40"),
-}
 MAX_DISP = 192
 MEAN = np.array([0.485, 0.456, 0.406])
 STD = np.array([0.229, 0.224, 0.225])
 
 
-def sha256(p: Path) -> str:
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        for b in iter(lambda: f.read(1 << 20), b""):
-            h.update(b)
-    return h.hexdigest()
-
-
-def download(url: str, dst: Path, sha: str) -> None:
-    if not (dst.exists() and sha256(dst) == sha):
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["curl", "-sSL", "-o", str(dst), url], check=True)
-    got = sha256(dst)
-    if got != sha:
-        raise SystemExit(f"{dst}: SHA-256 {got}, expected {sha}")
-
-
 def cmd_fetch(_a) -> None:
-    for name, (path, sha) in CKPTS.items():
-        download(f"https://huggingface.co/{HF_REPO}/resolve/{HF_REV}/{path}", CKPT_DIR / Path(path).name, sha)
-        print(f"  {name}: {Path(path).name}")
-    for f, (url, sha) in DATASETS.items():
-        download(url, DATA_DIR / f, sha)
-    if not (DATA_DIR / "MiddEval3" / "trainingQ").exists():
-        for f in ("MiddEval3-data-Q.zip", "MiddEval3-GT0-Q.zip"):
-            subprocess.run(["unzip", "-q", "-o", f], cwd=DATA_DIR, check=True)
-    if not (DATA_DIR / "eth3d" / "delivery_area_1l" / "disp0GT.pfm").exists():
-        (DATA_DIR / "eth3d").mkdir(exist_ok=True)
-        for f in ("two_view_training.7z", "two_view_training_gt.7z"):
-            subprocess.run(["7z", "x", "-y", f"../{f}"], cwd=DATA_DIR / "eth3d", check=True,
-                           stdout=subprocess.DEVNULL)
-    if not OPENSTEREO.exists():
-        subprocess.run(["git", "clone", "-q", "-b", "v2", "https://github.com/XiandaGuo/OpenStereo.git",
-                        str(OPENSTEREO)], check=True)
-    subprocess.run(["git", "-C", str(OPENSTEREO), "checkout", "-q", OPENSTEREO_COMMIT], check=True)
-    print(f"  datasets: {len(pairs())} pairs; OpenStereo @ {OPENSTEREO_COMMIT[:12]}")
+    fetch(study=True)
 
 
 # ── data ──────────────────────────────────────────────────────────────────────
@@ -228,7 +168,7 @@ class Num:
             if t.dim() == 4:
                 c = t.abs().amax(dim=(0, 2, 3)).tolist()
                 prev = self.maxes.get(site + ":c")
-                self.maxes[site + ":c"] = c if prev is None else [max(a, b) for a, b in zip(prev, c)]
+                self.maxes[site + ":c"] = c if prev is None else [max(a, b) for a, b in zip(prev, c, strict=True)]
 
     def _sat(self, t: torch.Tensor, f: int) -> torch.Tensor:
         if self.bf16:
@@ -660,18 +600,25 @@ def cmd_study(a) -> None:
     for s, name, d in sel:
         im_l, im_r, gt, valid = load_pair(d)
         H0, W0 = im_l.shape[:2]
-        if a.scale != 1.0:     # a lower input resolution: the pair resized, the disparity scaled back
-            im_l, im_r = resize(im_l, a.scale), resize(im_r, a.scale)
+        scale = a.scale
+        if a.fit:              # the demo's input: scaled down to fit H x W, padded (prepare.py)
+            scale = min(1.0, a.fit[1] / W0, a.fit[0] / H0)
+        if scale != 1.0:       # a lower input resolution: the pair resized, the disparity scaled back
+            im_l, im_r = resize(im_l, scale), resize(im_r, scale)
         h, w = im_l.shape[:2]
-        th, tw = math.ceil(h / 32) * 32, math.ceil(w / 32) * 32
+        th, tw = (a.fit[0], a.fit[1]) if a.fit else (math.ceil(h / 32) * 32, math.ceil(w / 32) * 32)
         L, R = prep(im_l, th, tw), prep(im_r, th, tw)
-        row = {"set": s, "name": name, "size": [w, h], "valid": int(valid.sum()), "scale": a.scale}
+        row = {"set": s, "name": name, "size": [w, h], "valid": int(valid.sum()), "scale": scale}
         ref = None
         for p in policies:
             t0 = time.time()
             disp, st, _ = run_policy(sd, p, L, R, h, w, table=table)
-            if a.scale != 1.0:
-                disp = upscale(disp, H0, W0) / a.scale
+            if scale != 1.0 and a.fit:   # as postprocess.py: PIL bilinear, / scale
+                from PIL import Image
+                disp = np.asarray(Image.fromarray(disp.astype(np.float32), mode="F").resize((W0, H0), Image.BILINEAR),
+                                  dtype=np.float64) / scale
+            elif scale != 1.0:
+                disp = upscale(disp, H0, W0) / scale
             row[p] = metrics(disp, gt, valid)
             row[p]["sat_frac"] = st["sat"] / max(1, st["n"])
             row[p]["wsat"] = st["wsat"]
@@ -731,7 +678,7 @@ def cmd_calibrate(a) -> None:
         LightStereoF(sd, n).run(prep(im_l, th, tw), prep(im_r, th, tw))
         for k, v in n.maxes.items():
             if k.endswith(":c"):   # per-channel maxima
-                maxes[k] = v if k not in maxes else [max(a, b) for a, b in zip(maxes[k], v)]
+                maxes[k] = v if k not in maxes else [max(a, b) for a, b in zip(maxes[k], v, strict=True)]
             else:
                 maxes[k] = max(maxes.get(k, 0.0), v)
     table = {k: int(max(0, min(15, math.floor(math.log2(16383 / v))))) if v > 0 else 15
@@ -741,6 +688,9 @@ def cmd_calibrate(a) -> None:
            "exponents": table, "max_abs": maxes}
     STUDY_DIR.mkdir(parents=True, exist_ok=True)
     formats_path(a.ckpt).write_text(json.dumps(out, indent=1))
+    if a.ckpt == "anything-s":
+        write_formats(maxes, a.ckpt, out["calibration"])
+        print(f"-> {FORMATS} (the demo's formats)")
     hist = {}
     for f in (v for k, v in table.items() if not k.endswith(":c")):
         hist[f] = hist.get(f, 0) + 1
@@ -778,6 +728,8 @@ def main(argv=None) -> int:
     s.add_argument("--stride", type=int, default=1, help="every Nth pair (a quick ablation)")
     s.add_argument("--tag", default="", help="suffix of the results file")
     s.add_argument("--scale", type=float, default=1.0, help="run at this fraction of the pairs' resolution")
+    s.add_argument("--fit", type=int, nargs=2, metavar=("H", "W"), default=None,
+                   help="the demo's input: each pair scaled down to fit H x W and padded (prepare.py)")
     s.add_argument("--threads", type=int, default=8)
     k = sub.add_parser("calibrate")
     k.add_argument("--ckpt", default="anything-s", choices=sorted(CKPTS))

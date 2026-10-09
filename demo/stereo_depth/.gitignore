@@ -2,3 +2,4 @@ assets
 assets/
 build/
 __pycache__/
+stereo_depth_config.json

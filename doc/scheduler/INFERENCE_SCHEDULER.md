@@ -100,6 +100,13 @@ XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
   `TtsAttnMerge`, `TtsResNorm`, `TtsEncOut` in the text encoder; the `chunk` and `encode_<T>` entries come from
   `src/piper.py` ([§Text to speech (Piper)](#text-to-speech-piper)).
   This is what runs Piper lessac-medium — `TTS_PLAN.md` §4–§6.
+- **Stereo depth ops** (domain `axi.llm`, `src/stereo_nodes.py`) —
+  `StereoVop` (one VectorOPKernel ADD / MUL / RELU / RELU6 / LEAKY_RELU call
+  on exponent tensors) and `StereoSoftmax` (the softmax unit's column mode
+  over channels) as kernel nodes; `StereoInstanceNorm`, `StereoPadEdge`,
+  `StereoCorrelation` and `StereoUpsample` as host ops.  The graph comes
+  from `src/stereo.py` ([§Stereo depth (LightStereo)](#stereo-depth-lightstereo)).
+  This is what runs LightStereo-S — `STEREO_PLAN.md` §4.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -152,7 +159,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1699 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1727 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -195,6 +202,9 @@ inference_scheduler.py          CLI, argument parsing
     │                           the `vision` entry of a multi-entry project
     ├── piper.py, tts_nodes.py  Piper TTS frontend (`chunk`, `encode_<T>`
     │                           entries) and its axi.llm host ops
+    ├── stereo.py, stereo_nodes.py
+    │                           LightStereo-S frontend (checkpoint + formats
+    │                           -> one graph) and its axi.llm ops
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
     ├── matmul_lowering.py      MatMul -> ConvKernel engine choice, geometry, row split
@@ -259,10 +269,11 @@ inference_scheduler.py          CLI, argument parsing
    lists).  Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` /
    `ReshapeNode` / `SpaceToDepthNode` / `ScheduledNode` / a host node
    (`host_nodes.HOST_OP_FACTORIES`, or `llm_nodes.LLM_OP_FACTORIES`,
-   `vit_nodes.VIT_OP_FACTORIES` and `tts_nodes.TTS_OP_FACTORIES` for the
-   `axi.llm` domain) based on `op_type`; kernel nodes reading an integer
-   tensor are rejected; then `numeric.check` (only MatMuls, Convs and the
-   LLM / TTS ops touch exponent tensors, only those ops host / state
+   `vit_nodes.VIT_OP_FACTORIES`, `tts_nodes.TTS_OP_FACTORIES` and
+   `stereo_nodes.STEREO_OP_FACTORIES` for the `axi.llm` domain) based on
+   `op_type`; kernel nodes reading an integer tensor are rejected; then
+   `numeric.check` (only MatMuls, Convs, Concat / Transpose copies and the
+   LLM / TTS / stereo ops touch exponent tensors, only those ops host / state
    tensors) and `numeric.encode_matmul_weights` (rank-1 weight exponents,
    before any packing or re-layout) / `numeric.encode_conv_weights`.
 10. `_fuse_activations()` (when `fuse_act=True`) — folds `Relu` / `Clip(0,6)`
@@ -706,6 +717,7 @@ outputs exactly (printed with `%d`).
 
 ```json
 {"exp":       {"tensor": 11, "other": [9, 10, 12, ...]},
+ "chexp":     {"conv_out": [9, 12, 14, ...]},
  "host":      {"tensor": "f32" | "i32" | "i16"},
  "state":     ["kv.k.l0", "h_last", ...],
  "layout":    {"kv.k.l0": [3, 64]},
@@ -732,11 +744,25 @@ same way by `numeric.encode_conv_weights`: weight at `f_y + 8 − f_x`, bias
 at `f_y`, both raw int16, re-packed into the kernel's image; its
 simulation (`_SimulateMixin._conv_exp`) sums raw products exactly, wraps to
 int32 and floors (`test/test_conv_exp.py`).  Only MatMuls (constant B),
-such Convs (constant weight and bias, unannotated) and the LLM / TTS host
-ops may touch exponent tensors; a weight read by two MatMuls with different
-exponents, a per-channel exponent on a Conv, an exponent on a VectorOP /
-Pool tensor, or a Reshape that changes a per-channel exponent's channels is
-rejected.  Simulation (`_SimulateMixin._matmul_exp`):
+such Convs (constant weight and bias, unannotated), Concat / Transpose (raw
+copies: every input and the output at one per-tensor exponent) and the LLM /
+TTS / stereo host ops and kernel nodes may touch exponent tensors; a weight
+read by two MatMuls with different exponents, a last-axis exponent on a
+Conv, an exponent on a VectorOP / Pool tensor, or a Reshape that changes a
+per-channel exponent's channels is rejected.
+
+**Per-channel Conv exponents (`chexp`).**  One exponent per channel
+(axis 1) of a 4-D Conv tensor (`TensorInfo.chexp`; `exp` is then None),
+which only Convs may read or write.  A Conv writing it takes
+per-output-channel weight exponents and a Conv reading it per-input-channel
+ones — the rank-1 rule of a MatMul, `f_w[m][c] = f_y[m] + 8 − f_x[c]`
+(depthwise `f_w[m] = f_y[m] + 8 − f_x[m]`), the bias at `f_y[m]`;
+`TensorInfo.wexp` is then `[M][C][1][1]`.  A depthwise 1 × 1 Conv of weight
+1.0 reading a `chexp` tensor into a scalar exponent is an exact per-channel
+floor (raw weight `2^(8 − k)`): with it a Conv gets per-channel weight
+precision while every other node still sees one exponent — the stereo
+frontend's per-channel weights ([§Stereo depth](#stereo-depth-lightstereo);
+`test/test_conv_exp.py::TestPerChannel`).  Simulation (`_SimulateMixin._matmul_exp`):
 `acc = (A·B) · 2^(f_out + 8)` is an exact integer in float64 (every column's
 products share one scale), the int32 wrap is applied, then
 `floor(acc / 256)`, saturate, `/ 2^f_out`; host ops read `raw · 2^-f[c]`
@@ -1032,6 +1058,69 @@ fixed-size `chunk` entry (TTS_PLAN §4).
 - **The library** `libpiper_tts.so` (`demo/tts/`) drives the chunk entry
   chunk by chunk and the encode entries per utterance (`tts_encode`) for
   the chat server's `/v1/audio/speech`.
+
+### Stereo depth (LightStereo)
+
+`src/stereo.py` compiles OpenStereo's LightStereo-S (a rectified pair →
+a disparity map; `doc/plans/STEREO_PLAN.md`) from its PyTorch checkpoint,
+read with the standard library (`load_checkpoint`: zipfile + pickle, no
+torch), into one graph with `axi.numeric` exponents
+(`LightStereoFrontend(state, formats, H, W, per_channel=0.05).build()`;
+inputs `left` / `right` `[1][3][H][W]` at `2^-12`, output `disparity`
+`[H][W]` float32 on the host).
+
+- **Convs** (ConvKernel) are the BatchNorm-folded weights.
+  - A stride-2 `ConvTranspose` (4 × 4, or 3 × 3 with output padding) is
+    its polyphase conv: the four output phases as 4C channels of one 3 × 3
+    / 2 × 2 conv (`polyphase`).  A pixel shuffle (Reshape / Transpose /
+    Reshape, a host copy) interleaves them.
+  - A depthwise stripe longer than 7 taps (1 × 11, 1 × 21 and their
+    transposes) is the fewest dilated pieces of ≤ 7 taps
+    (`stripe_pieces`), summed by adds.  Each piece straddles the centre
+    tap, because ConvKernel programs only top / left padding, and fits
+    the line buffer (16 rows, 64 columns).  The 21 × 1 stripe takes six
+    pieces, the 1 × 21 three.
+- **VectorOPKernel.**
+  - `StereoVop` runs ReLU6, LeakyReLU, ReLU, the residual / stripe adds
+    and the attention product.
+  - `StereoSoftmax` runs both softmaxes in column mode, with P at `2^-15`:
+    - the 48 disparities per pixel, keys-major from the aggregation's NCHW
+      output;
+    - the 9 upsampling weights, padded to 16 keys with 9 valid, one call
+      per output phase of the last polyphase deconv (no full-resolution
+      pixel shuffle).
+- **Host ops** (`src/stereo_nodes.py`).
+  - The four instance norms, the replicate pad and the correlation volume.
+    The volume is an exact int64 dot product per pixel and disparity,
+    then double: 19 MMAC at 640 × 480, threaded by rows.
+  - `StereoUpsample`: the disparity regression Σ P·d, kept exact in int64
+    (a single-column MatMul took 52 ms on the board).  Then the context
+    upsampling: the 3 × 3 neighbourhood of the 1/4-resolution disparity,
+    weighted by the per-phase softmax, written as float32.
+  - Each C helper performs the same integer sums and the same double
+    operations as its numpy reference.
+- **Exponents** come from the checked-in calibration
+  (`demo/stereo_depth/lightstereo_s_formats.json`): a site's range with one
+  bit of headroom.  Constraints:
+  - Tensors an add, a concat, a copy or an activation ties share the
+    smallest exponent of their group (union-find).
+  - A ReLU6's input and output stay at `2^-8`: the kernel clamps at raw
+    6.0 in Q8.8.
+  - The attention product's conv3 takes the exponent that puts
+    `f_a + f_cost − 8` at the product's group.
+  - With `per_channel=T` a standard conv whose per-tensor weights lose more
+    than T of their norm to rounding writes a `chexp` tensor (per-channel
+    weight exponents), followed by an identity depthwise 1 × 1 rescale
+    ([§Numerics beyond the element type](#numerics-beyond-the-element-type)).
+    At T = 0.05 that is 28 calls at 640 × 480, and the simulated quality
+    equals float (STEREO_PLAN §4).
+- **Tests.**
+  - `test/test_stereo_nodes.py`: every op against an independent formula,
+    the exponent rules, and a small graph with every op on host_emu.
+  - `test/test_stereo.py`: the stripe covers, the polyphase deconvs
+    against a numpy ConvTranspose, the checkpoint reader on a synthetic
+    torch zip, and the whole network with random weights of the real
+    shapes, with and without per-channel weights, on host_emu.
 
 ### Multi-entry projects
 

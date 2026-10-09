@@ -64,6 +64,11 @@ class TensorInfo:
     #      ap_fixed<16,8>), else an int64 array broadcastable to `shape`
     #      (a scalar, or one exponent per last-axis channel).
     exp:       Optional[np.ndarray] = field(default=None, repr=False)
+    # chexp: one exponent per channel of a 4-D [N][C][H][W] Conv tensor (axis
+    #      1; ``exp`` is then None): the output of a Conv with per-channel
+    #      weight exponents, read only by Convs (numeric.check), e.g. the
+    #      depthwise 1 x 1 rescale that floors it to one exponent.
+    chexp:     Optional[np.ndarray] = field(default=None, repr=False)
     # wexp: a constant MatMul weight encoded at the rank-1 exponent
     #      f_w[i][j] = f_out[j] + F - f_in[i] (F = the kernels' output shift);
     #      `data` then holds raw / 2^F so every existing encode / pack path

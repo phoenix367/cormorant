@@ -120,5 +120,77 @@ class TestConvExp(unittest.TestCase):
         self.assertIn("PASSED", out)
 
 
+def per_channel_model(C=6, M=5, H=3, W=20, fx=11, fy=9, fc=(9, 12, 14, 10, 16), seed=2):
+    """conv (per-output-channel exponents fc, chexp) -> identity depthwise 1 x 1
+    conv (the rescale) -> y at fy."""
+    rng = np.random.default_rng(seed)
+    w = (rng.standard_normal((M, C, 3, 3)) * np.array([1, 0.05, 0.01, 0.3, 0.002])[:M, None, None, None]
+         ).astype(np.float32)
+    b = (rng.standard_normal(M) * 0.01).astype(np.float32)
+    ones = np.ones((M, 1, 1, 1), np.float32)
+    n1 = oh.make_node("Conv", ["x", "w", "b"], ["t"], name="conv", kernel_shape=[3, 3], pads=[1, 1, 1, 1])
+    n2 = oh.make_node("Conv", ["t", "ones"], ["y"], name="rescale", kernel_shape=[1, 1], group=M)
+    g = oh.make_graph([n1, n2], "pc", [oh.make_tensor_value_info("x", TP.FLOAT, [1, C, H, W])],
+                      [oh.make_tensor_value_info("y", TP.FLOAT, [1, M, H, W])],
+                      initializer=[nph.from_array(w, "w"), nph.from_array(b, "b"), nph.from_array(ones, "ones")],
+                      value_info=[oh.make_tensor_value_info("t", TP.FLOAT, [1, M, H, W])])
+    m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17)])
+    m.ir_version = 8
+    meta = numeric.empty()
+    meta["exp"]["x"], meta["exp"]["y"] = fx, fy
+    meta["chexp"]["t"] = list(fc[:M])
+    p = m.metadata_props.add()
+    p.key, p.value = numeric.METADATA_KEY, numeric.to_metadata(meta)
+    return m, w, b
+
+
+class TestPerChannel(unittest.TestCase):
+    """Per-output-channel weight exponents (chexp) and the depthwise 1 x 1
+    rescale: equal to one floor at f_y of the per-channel-encoded sum."""
+
+    def test_encoding_and_rescale(self):
+        fx, fy, fc = 11, 9, (9, 12, 14, 10, 16)
+        m, w, b = per_channel_model(fx=fx, fy=fy, fc=fc)
+        g = OnnxGraph(m)
+        conv, resc = g.nodes
+        fw = np.array(fc)[:, None] + 8 - fx                       # [M][C] (rank-1, C equal)
+        self.assertEqual(conv.inputs[1].wexp.shape, (5, 6, 1, 1))
+        np.testing.assert_array_equal(conv.inputs[1].wexp[:, :, 0, 0], np.broadcast_to(fw, (5, 6)))
+        np.testing.assert_array_equal(resc.inputs[1].wexp.reshape(-1), fy + 8 - np.array(fc))
+        rng = np.random.default_rng(3)
+        x_raw = rng.integers(-4000, 4000, (1, 6, 3, 20)).astype(np.float64)
+        cg = CodeGenerator(g, model_path="pc.onnx")
+        arr = cg._forward_pass({"x": x_raw * 2.0 ** -fx})
+        # the integer reference: per-channel weights, floor at f_c, then floor at f_y
+        w_raw = np.clip(np.round(w.astype(np.float64) * 2.0 ** fw[:, :, None, None]), -32768, 32767)
+        b_raw = np.clip(np.round(b.astype(np.float64) * 2.0 ** np.array(fc)), -32768, 32767)
+        xp = np.pad(x_raw, ((0, 0), (0, 0), (1, 1), (1, 1))).astype(np.int64)
+        acc = np.zeros((5, 3, 20), np.int64)
+        for a in range(3):
+            for c in range(3):
+                acc += np.einsum("chw,mc->mhw", xp[0, :, a:a + 3, c:c + 20], w_raw[:, :, a, c].astype(np.int64))
+        acc += (b_raw.astype(np.int64) << 8)[:, None, None]
+        t_raw = np.clip(np.floor_divide(acc, 256), -32768, 32767)
+        y_raw = np.clip(np.floor_divide(t_raw * (2 ** (fy + 8 - np.array(fc)))[:, None, None], 256), -32768, 32767)
+        np.testing.assert_array_equal(arr["y"].reshape(5, 3, 20) * 2.0 ** fy, y_raw)
+
+    def test_chexp_only_on_convs(self):
+        m, _, _ = per_channel_model()
+        meta = numeric.empty()
+        meta["exp"]["x"], meta["exp"]["y"] = 11, 9
+        meta["chexp"]["x"] = [11] * 6
+        m.metadata_props[0].value = numeric.to_metadata(meta)
+        with self.assertRaises(numeric.NumericError):              # x has exp and chexp
+            OnnxGraph(m)
+
+    def test_generated_c_matches_simulation(self):
+        m, _, _ = per_channel_model(H=4, W=40)
+        cg = CodeGenerator(OnnxGraph(m), model_path="pc.onnx")
+        with tempfile.TemporaryDirectory() as td:
+            rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"))
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("PASSED", out)
+
+
 if __name__ == "__main__":
     unittest.main()

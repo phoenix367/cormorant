@@ -19,6 +19,7 @@ builds the speech library the server's `piper` backend loads.
 |------|-------|-------|---------------|
 | [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.111 / 1.249 ms per image) |
 | [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 20.2 ms = 49.6 FPS at 250 MHz) |
+| [`stereo_depth/`](stereo_depth/) | LightStereo-S (OpenStereo, StereoAnything weights; 640 × 480) | Middlebury MiddEval3-Q / ETH3D pairs, your rectified pairs, a RealSense D4xx on the board (`--capture`) | Disparity maps beside the left image: the network on ConvKernel + VectorOPKernel, the correlation / norms / upsampling on the host (659 ms per pair, 1.52 FPS); EPE 0.667 px on 42 pairs against float's 0.650 on the same input, maps bit-exact vs the scheduler simulation; RealSense pairs: depth within 10 % of the camera's own on 98 % of the pixels (projector on) |
 | [`object_detection/`](object_detection/) | YOLOv5n (Ultralytics v7.0, 640 × 640) | COCO128 images, your JPG/PNG files | Boxes and classes drawn on each image: the network on ConvKernel + VectorOPKernel + PoolingKernel (64 ms per image, 15.6 FPS), decode + NMS on the host; COCO128 mAP@0.5:0.95 0.343 against float's 0.349, head maps bit-exact vs the scheduler simulation |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (418 ms per inference) |
@@ -71,8 +72,9 @@ performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
   (`hw/cormorant_hw_128`) at 100 MHz, the dated transcripts; since
   FMAX_250_PLAN the kernels run at 250 MHz (the current numbers are in the
   root README's results).  The
-  `camera/` demo additionally needs an Intel RealSense camera plus
-  `pyrealsense2` / OpenCV on the board — see its README.
+  `camera/` demo and `stereo_depth/`'s `--capture` additionally need an
+  Intel RealSense camera plus `pyrealsense2` / OpenCV on the board (the
+  stereo pair over USB 2: firmware 5.17.3.10) — see their READMEs.
 
 See each demo's own `README.md` for model sources, config-field reference,
 sample output, and troubleshooting. The generated-project internals are

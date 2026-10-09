@@ -5,6 +5,7 @@ A model may carry, in its ``metadata_props`` under the key ``axi.numeric``,
 a JSON object
 
     {"exp":       {tensor: f | [f per last-axis channel]},
+     "chexp":     {tensor: [f per channel (axis 1) of a 4-D Conv tensor]},
      "host":      {tensor: "f32" | "i32" | "i16"},
      "state":     [tensor, ...],
      "layout":    {tensor: [G, D]},
@@ -19,6 +20,12 @@ a JSON object
   is encoded — round half to even, saturate — at the rank-1 exponent
   ``f_w[i][j] = f_out[j] + F - f_in[i]`` (``encode_matmul_weights``).
   Unannotated tensors keep the element type's exponent (F).
+* ``chexp`` — one exponent per channel (axis 1) of a 4-D Conv tensor, which
+  only Convs may read or write: a Conv writing it takes per-output-channel
+  weight exponents ``f_w[m][c] = f_y[m] + F - f_x[c]`` (the rank-1 rule of a
+  MatMul), and a Conv reading it per-input-channel ones — a depthwise 1 x 1
+  Conv of weight 1.0 is then an exact per-channel rescale (floor) to one
+  exponent (the stereo frontend's per-channel weights, STEREO_PLAN).
 * ``host`` — the tensor lives in host memory, never in a DMA buffer:
   ``f32`` (float32; a transformer's residual stream), ``i32`` (token ids,
   positions: graph inputs become ``const int32_t *``), ``i16`` (raw int16 at
@@ -62,7 +69,7 @@ class NumericError(SchedulerError):
 
 
 def empty() -> dict:
-    return {"exp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}}
+    return {"exp": {}, "chexp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}}
 
 
 def parse(model) -> dict:
@@ -90,7 +97,7 @@ def to_metadata(meta: dict) -> str:
 
 
 def is_active(meta: dict) -> bool:
-    return any(meta[k] for k in ("exp", "host", "state"))
+    return any(meta[k] for k in ("exp", "chexp", "host", "state"))
 
 
 def apply(tensors: dict, meta: dict, dtype) -> None:
@@ -117,6 +124,15 @@ def apply(tensors: dict, meta: dict, dtype) -> None:
         if (arr < -30).any() or (arr > 40).any():
             raise NumericError(f"tensor '{name}': exponent out of range")
         t.exp = arr.copy()
+    for name, e in meta.get("chexp", {}).items():
+        t = _get(tensors, name, "chexp")
+        arr = np.asarray(e, np.int64)
+        if len(t.shape) != 4 or arr.ndim != 1 or arr.size != t.shape[1] or t.exp is not None or t.host:
+            raise NumericError(f"tensor '{name}': chexp is one exponent per channel of a 4-D DMA "
+                               f"tensor without exp (shape {t.shape}, got {list(arr.shape)})")
+        if (arr < -30).any() or (arr > 40).any():
+            raise NumericError(f"tensor '{name}': exponent out of range")
+        t.chexp = arr.copy()
     for name in meta["state"]:
         t = _get(tensors, name, "state")
         t.is_state = True
@@ -150,7 +166,8 @@ def _get(tensors, name, what):
 
 
 def has_numeric(t) -> bool:
-    return t.exp is not None or t.host is not None or t.is_state or t.wexp is not None
+    return (t.exp is not None or t.chexp is not None or t.host is not None or t.is_state
+            or t.wexp is not None)
 
 
 _ENCODE_BLOCK = 1 << 20          # weight elements per block of encode_matmul_weights
@@ -233,21 +250,33 @@ def encode_conv_weights(nodes, dtype) -> Dict[str, int]:
         if not isinstance(sn, ConvNode):
             continue
         x, w, y = sn.inputs[0], sn.inputs[1], sn.output
-        if x.exp is None and y.exp is None:
+        if x.exp is None and y.exp is None and x.chexp is None and y.chexp is None:
             continue
-        fx = int(np.asarray(F if x.exp is None else x.exp))
-        fy = int(np.asarray(F if y.exp is None else y.exp))
-        fw = fy + F - fx
-        encoded = [(w, fw)] + ([(sn.inputs[2], fy)] if sn.has_bias else [])
+        if x.chexp is None and y.chexp is None:
+            fx = int(np.asarray(F if x.exp is None else x.exp))
+            fy = int(np.asarray(F if y.exp is None else y.exp))
+            fw = fy + F - fx
+            encoded = [(w, fw)] + ([(sn.inputs[2], fy)] if sn.has_bias else [])
+        else:
+            # per-channel exponents (chexp, axis 1): f_w[m][c] = f_y[m] + F - f_x[c]
+            # (depthwise: f_w[m] = f_y[m] + F - f_x[m]), the bias at f_y[m]
+            fx = (x.chexp if x.chexp is not None else
+                  np.full(sn.in_ch, F if x.exp is None else int(np.asarray(x.exp)))).astype(np.int64)
+            fy = (y.chexp if y.chexp is not None else
+                  np.full(sn.out_ch, F if y.exp is None else int(np.asarray(y.exp)))).astype(np.int64)
+            fw = (fy + F - fx)[:, None] if sn.is_depthwise else np.add.outer(fy + F, -fx)
+            encoded = [(w, fw.reshape(fw.shape + (1, 1)))] + ([(sn.inputs[2], fy)] if sn.has_bias else [])
         for t, f in encoded:
             if t.onnx_name in done:
-                if done[t.onnx_name] != f:
+                if not np.array_equal(done[t.onnx_name], f):
                     raise NumericError(f"'{t.onnx_name}' read by Convs with different exponents")
                 continue
-            r = np.round(np.asarray(t.data, np.float64) * 2.0 ** f)
+            fa = np.asarray(f, np.int64)
+            r = np.round(np.asarray(t.data, np.float64).reshape(t.shape) * np.power(2.0, fa))
             sat[t.onnx_name] = int(((r < lo) | (r > hi)).sum())
             t.data = (np.clip(r, lo, hi) / float(1 << F)).astype(np.float32).reshape(t.data.shape)
-            t.wexp = np.asarray(f, np.int8 if -128 <= f <= 127 else np.int64)
+            t.wexp = (np.asarray(f, np.int8 if -128 <= f <= 127 else np.int64) if fa.ndim == 0
+                      else fa.astype(np.int8))
             done[t.onnx_name] = f
         _pack_conv_weight(w, sn.out_ch, sn.in_ch, sn.kh, sn.kw, sn.is_depthwise)
         if sn.has_bias:
@@ -257,10 +286,12 @@ def encode_conv_weights(nodes, dtype) -> Dict[str, int]:
 
 def check(nodes, dtype) -> None:
     """Only MatMuls (constant B), Convs (per-tensor exponents; constant
-    weight and bias, encoded by encode_conv_weights) and the LLM / TTS ops
-    (host ops and the FPGA attention kernel calls) may touch tensors with
-    exponents; only those host ops touch host tensors and states."""
+    weight and bias, encoded by encode_conv_weights), Concat / Transpose
+    (raw copies: one exponent on every input and the output) and the LLM /
+    TTS / stereo ops (host ops and the FPGA kernel calls) may touch tensors
+    with exponents; only those host ops touch host tensors and states."""
     from .nodes import ConvNode, MatmulNode, ReshapeNode
+    from .host_nodes import ConcatNode, TransposeNode
     from .llm_nodes import LlmNode
     for sn in nodes:
         label = f"{sn.onnx_node.op_type} node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
@@ -270,6 +301,8 @@ def check(nodes, dtype) -> None:
         if any(t.is_host or t.is_state for t in ts):
             raise NumericError(f"{label}: host / state tensors are only read or written "
                                f"by the LLM host ops")
+        if any(t.chexp is not None for t in ts) and not isinstance(sn, ConvNode):
+            raise NumericError(f"{label}: per-channel (chexp) tensors are only read or written by Convs")
         if isinstance(sn, MatmulNode):
             continue
         if isinstance(sn, ConvNode):
@@ -279,14 +312,21 @@ def check(nodes, dtype) -> None:
                 raise NumericError(f"{label}: weight / bias exponents are derived "
                                    f"(f_w = f_y + {dtype.frac_bits} - f_x, bias at f_y), "
                                    f"not annotated")
-            if (x.exp is not None or sn.output.exp is not None) and (
-                    w.data is None or (b is not None and b.data is None)):
+            if (x.exp is not None or sn.output.exp is not None or x.chexp is not None
+                    or sn.output.chexp is not None) and (w.data is None or (b is not None and b.data is None)):
                 raise NumericError(f"{label}: exponents need a constant weight and bias")
             for t in (x, sn.output):
                 if t.exp is not None and np.ndim(t.exp) != 0:
                     raise NumericError(f"{label}: '{t.onnx_name}': a Conv tensor takes one "
                                        f"exponent (per-channel exponents are along the last "
                                        f"axis, which is not a Conv's channel axis)")
+            continue
+        if isinstance(sn, (ConcatNode, TransposeNode)) and any(t.exp is not None for t in ts):
+            # raw copies: right for any exponent the inputs and the output share
+            es = {None if t.exp is None or np.ndim(t.exp) else int(np.asarray(t.exp)) for t in ts}
+            if len(es) != 1 or None in es:
+                raise NumericError(f"{label}: a copy's inputs and output must carry one and the same "
+                                   f"per-tensor exponent")
             continue
         if isinstance(sn, ReshapeNode):
             src, out = sn.inputs[0], sn.output

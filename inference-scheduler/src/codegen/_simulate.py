@@ -629,7 +629,7 @@ class _SimulateMixin:
                 continue
 
             if isinstance(sn, ConvNode) and any(
-                    t.exp is not None or t.wexp is not None
+                    t.exp is not None or t.wexp is not None or t.chexp is not None
                     for t in (sn.inputs[0], sn.inputs[1], sn.output)):
                 arrays[sn.output.onnx_name] = self._conv_exp(
                     sn, arrays[sn.inputs[0].onnx_name], arrays[sn.inputs[1].onnx_name],
@@ -782,23 +782,26 @@ class _SimulateMixin:
         dtype = self._dtype
         F = dtype.frac_bits
         xt, wt, yt = sn.inputs[0], sn.inputs[1], sn.output
-        fx = int(np.asarray(F if xt.exp is None else xt.exp))
-        fy = int(np.asarray(F if yt.exp is None else yt.exp))
-        fw = int(np.asarray(F if wt.wexp is None else wt.wexp))
-        x_raw = np.asarray(x, np.float64).reshape(sn.batch, sn.in_ch, sn.in_h, sn.in_w) * 2.0 ** fx
+        # scalars, or per channel (chexp, axis 1) as [1][C][1][1] / [M][C][1][1]
+        fx = (xt.chexp.astype(np.float64).reshape(1, -1, 1, 1) if xt.chexp is not None
+              else float(np.asarray(F if xt.exp is None else xt.exp)))
+        fy = (yt.chexp.astype(np.float64).reshape(1, -1, 1, 1) if yt.chexp is not None
+              else float(np.asarray(F if yt.exp is None else yt.exp)))
+        fw = np.asarray(F if wt.wexp is None else wt.wexp, np.float64)
+        x_raw = np.asarray(x, np.float64).reshape(sn.batch, sn.in_ch, sn.in_h, sn.in_w) * np.power(2.0, fx)
         w_raw = np.asarray(w, np.float64).reshape(sn.out_ch, 1 if sn.is_depthwise else sn.in_ch,
-                                                  sn.kh, sn.kw) * 2.0 ** fw
+                                                  sn.kh, sn.kw) * np.power(2.0, fw)
         acc = _conv2d_int(x_raw, w_raw, sn.stride_h, sn.stride_w, sn.pad_top, sn.pad_left,
                           sn.dilation_h, sn.dilation_w, sn.out_h, sn.out_w, sn.is_depthwise)
         if bias is not None:
-            acc += (np.asarray(bias, np.float64).reshape(-1) * 2.0 ** fy)[None, :, None, None] * 2.0 ** F
+            acc += (np.asarray(bias, np.float64).reshape(1, -1, 1, 1) * np.power(2.0, fy)) * 2.0 ** F
         if not np.array_equal(acc, np.round(acc)):
             raise ValueError(f"Conv '{sn.onnx_node.name}': operands not on their exponents' grids")
         big = np.abs(acc) >= 2.0 ** 31
         if big.any():                                          # ap_fixed<32,16> wraps
             acc = np.where(big, np.mod(acc + 2.0 ** 31, 2.0 ** 32) - 2.0 ** 31, acc)
         lo, hi = dtype.raw_range
-        return (np.clip(np.floor(acc / float(1 << F)), lo, hi) / 2.0 ** fy).reshape(sn.output.shape)
+        return (np.clip(np.floor(acc / float(1 << F)), lo, hi) / np.power(2.0, fy)).reshape(sn.output.shape)
 
     def _matmul_exp(self, sn, a, b, arrays, errors_out) -> None:
         """A MatMul whose tensors carry power-of-two exponents: the kernel

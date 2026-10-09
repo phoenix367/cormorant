@@ -1,27 +1,33 @@
 # Stereo depth (disparity) on the KV260
 
-**Status (2026-10-08):** study done (the `model-study` skill, host only); nothing implemented.
-- **Verdict: GO with power-of-two exponents and per-channel weights.**
-  - The model is LightStereo-S with OpenStereo's StereoAnything weights.
-  - It is the only candidate with 2D layers throughout.
-  - The emulated FPGA datapath reaches float's quality on 42 Middlebury and
-    ETH3D pairs with ground truth: EPE 0.628 px against float's 0.633, and
-    bad-2 4.40 % against 4.44 %.
-  - Its distance from float equals bfloat16's.
-  - Plain Q8.8 is a NO-GO (EPE 1.60 px, bad-2 13.6 %).
-- **Speed (projected, ±30 %).**  About 0.5 s per pair at 640 × 480 (2 FPS),
-  0.3 s at 512 × 384, and 0.14 s at 320 × 256 (7 FPS).  The depthwise and
-  1 × 1 layers of its MobileNetV2 blocks run at 5 and 35 GMAC/s on
-  ConvKernel, against 105 for a standard 3 × 3 conv.
-- **What it needs.**
-  - A frontend (route C, like Piper's) that writes the exponents.
-  - Four host ops: the correlation volume, the instance norm, the
-    pixel shuffle of the polyphase deconvs, and the context upsampling.
-  - A per-channel rescale node.
-  - Stripe convolutions longer than 7 taps split into pieces.
+**Status (2026-10-09):** study done (2026-10-08) and implemented: `demo/stereo_depth` runs
+LightStereo-S on the board (§4).
+- **The demo.**  On bitstream `8599aa7a5f12` at 640 × 480 a pair takes
+  **659 ms (1.52 FPS)**.
+  - Quality on all 42 Middlebury / ETH3D pairs: EPE 0.667 px and bad-2
+    4.94 %, against float's 0.650 / 4.87 % on the same scaled input.
+  - The disparity maps are bit-exact with the scheduler's simulation.
+  - At 320 × 256 a pair takes 163.7 ms (6.1 FPS), with EPE 1.061 px.
+- **The implementation.**
+  - A frontend (`inference-scheduler/src/stereo.py`) reads the PyTorch
+    checkpoint without torch.
+  - New `axi.llm` ops (`src/stereo_nodes.py`): VectorOP calls and the
+    column-mode softmax on exponent tensors, plus the correlation, instance
+    norm, edge pad and upsampling host ops.
+  - New scheduler numerics: per-channel Conv exponents (`chexp`), and
+    copies that carry exponents.
+  - Per-channel weights on 28 convs bring the simulated quality to float's:
+    EPE 0.627 px against 0.633 at native resolution.
   - No bitstream change.
+- **The study (2026-10-08).**
+  - **Verdict: GO with power-of-two exponents and per-channel weights.**
+    LightStereo-S (OpenStereo, StereoAnything weights) is the only candidate
+    with 2D layers throughout.  Plain Q8.8 is a NO-GO (EPE 1.60 px).
+  - The speed projection, about 0.5 s per pair at 640 × 480 (±30 %), came
+    in at the band's edge (0.66 s).  The MobileNetV2 layers dominate: the
+    1 × 1 and depthwise convs are 61 % of the summed node time.
 - **License caveat.**  OpenStereo's code is for academic use only, and its
-  weights carry no license of their own.
+  weights carry no license of their own: research and demo use.
 
 The user asked to "find a model that can convert a stereo pair into a depth
 map" and to see whether it can be supported.  A rectified pair gives a
@@ -282,7 +288,165 @@ Estimated size: the frontend and its tests about 1 500 lines, the host ops
 about 400 lines of C and Python, the demo on `demo/object_detection`'s
 pattern.
 
-## 4. Commands and runtimes
+## 4. Implementation (2026-10-09)
+
+The user asked to implement the demo.  The design is §3.5's.  Everything
+runs on the production bitstream; the hardware is unchanged.
+
+### 4.1 What was built
+
+- **Scheduler ops** (`inference-scheduler/src/stereo_nodes.py`, domain
+  `axi.llm`).  Two kernel nodes:
+  - `StereoVop`: one VectorOP ADD (+ ReLU) / MUL / RELU / RELU6 /
+    LEAKY_RELU call on raw int16, with the exponent rules of the raw
+    arithmetic (ADD one exponent; MUL f_a + f_b − 8; RELU6 at 2^-8).
+  - `StereoSoftmax`: the softmax unit's column mode over channels, in
+    groups.
+
+  Four host ops, each with a C helper and a numpy reference that agree bit
+  for bit (exact int64 sums, then the same double operations):
+  - `StereoInstanceNorm`;
+  - `StereoPadEdge`;
+  - `StereoCorrelation`: the cost volume;
+  - `StereoUpsample`: the disparity regression Σ P·d and the context
+    upsampling, written as float32.
+- **Scheduler numerics** (`src/numeric.py`, `_simulate.py`).
+  - `chexp`: per-channel exponents on 4-D Conv tensors, with rank-1
+    weight exponents f_w[m][c] = f_y[m] + 8 − f_x[c].  A depthwise 1 × 1
+    conv of weight 1.0 then floors a per-channel tensor to one exponent
+    exactly.
+  - Concat / Transpose may carry one shared exponent (raw copies).
+- **The frontend** (`src/stereo.py`).
+  - Reading: the PyTorch checkpoint with zipfile + pickle; BatchNorm folded.
+  - Polyphase deconvs: a stride-2 ConvTranspose becomes its four output
+    phases as one conv, followed by a pixel shuffle.
+  - Stripes: a depthwise stripe longer than 7 taps becomes the fewest
+    dilated pieces that straddle its centre, since ConvKernel has only
+    top / left padding registers.  The 21 × 1 stripe needs six pieces to
+    fit the 16-row line buffer, the 1 × 21 three.
+  - The exponent solver: groups tied by adds, concats, copies and
+    activations; ReLU6 at 2^-8; the attention product.
+  - Per-channel weights: a conv whose per-tensor weights lose more than 5 %
+    to rounding writes a `chexp` tensor plus a rescale.  That is 28 convs
+    at 640 × 480.
+  - The tail: the 9 upsampling weights stay as the last deconv's four
+    phases (four softmax calls, no full-resolution pixel shuffle), and the
+    regression runs inside the upsampling host op.  The board profile led
+    to both: a single-column MatMul took 52 ms and the shuffle 15 ms.
+- **The demo** (`demo/stereo_depth`), on `demo/object_detection`'s pattern.
+  - `stereo_assets.py`: pinned downloads, standard library only.
+  - `prepare.py`: fits each pair to H × W as OpenStereo evaluates, as
+    int16 at 2^-12.
+  - `generate_project.py`: the scheduler with `--no-s2d-stem
+    --no-fuse-act`, since the 3-channel stride-2 stems carry exponents.
+  - `deploy_and_run.py` and `src/stereo_pairs.c`: the board run.
+  - `postprocess.py`: the maps at each pair's resolution (PNG, PFM),
+    EPE / bad-2, and a bit-exact check against the simulation.
+  - `sim_quality.py`: the implemented graph's quality on the 42 pairs.
+  - No torch: the exponents are the checked-in `lightstereo_s_formats.json`
+    (from `stereo_study.py calibrate`).
+- **Tests.**
+  - `test/test_stereo_nodes.py`: every op, the rules, and a graph with
+    every op on host_emu.
+  - `test/test_stereo.py`: the stripe covers, the polyphase deconvs, the
+    checkpoint reader, and the network with random weights of the real
+    shapes, with and without per-channel weights, on host_emu.
+  - `test/test_conv_exp.py::TestPerChannel`.
+  - The real network at 320 × 256 also passes host_emu bit for bit.
+
+### 4.2 Numerics of the implemented graph
+
+The scheduler's simulation of the generated graph (= the board, bit for
+bit) on the 42 pairs at their native resolution (padded to a multiple of 32,
+as the study; `sim_quality.py`):
+
+| graph | EPE (px) | bad-1 | bad-2 |
+|---|---:|---:|---:|
+| float (the study) | 0.633 | 10.70 % | 4.44 % |
+| per-tensor exponents | 0.705 | 12.52 % | 5.27 % |
+| + per-channel weights on every conv that gains (109 rescales at 640 × 480) | 0.629 | 10.59 % | 4.38 % |
+| **+ per-channel weights where rounding loses > 5 % (28 rescales)** | **0.627** | **10.77 %** | **4.30 %** |
+
+These match the study's emulation (`pow2` 0.713, `pow2+pc5` 0.627), even
+though the splits differ: the stripes are cut into dilated pieces, the
+softmax is the unit's integer version, and the regression is exact.
+
+### 4.3 On the board
+
+**Setup.**  `run_demo.py --pairs 0` on bitstream `8599aa7a5f12`, all 42
+pairs.  Each pair is fitted to the network input (scaled down when larger,
+padded), and its disparity is mapped back to the pair's resolution for the
+metrics.  Float on the same fitted input comes from
+`stereo_study.py study --fit 480 640`.
+
+| input | per pair | EPE (px) | bad-1 | bad-2 | float on the same input |
+|---|---:|---:|---:|---:|---|
+| 640 × 480 | **659 ms** (p50 658, 1.52 FPS) | **0.667** | 12.21 % | **4.94 %** | 0.650 / 11.81 % / 4.87 % |
+| 320 × 256 | 163.7 ms (p50 163.3, 6.1 FPS) | 1.061 | 25.47 % | 9.71 % | — |
+
+The first two pairs are checked bit for bit against the scheduler's
+simulation in each run (float32 equality of the maps).  Upload takes
+about 35 s and the build on the board 25 s; the CMA pool is 93 MiB.
+
+**Where the time goes** at 640 × 480 (`--profile`).  The table gives each
+kind's summed node time: 702 ms against 658 end to end, since the kernel
+lanes overlap.
+
+| node kind | calls | ms |
+|---|---:|---:|
+| ConvKernel 1 × 1 (MobileNetV2 expand / project) | 86 | 164.5 |
+| ConvKernel depthwise 3 × 3 | 41 | 158.9 |
+| ConvKernel depthwise stripes (the split 7 / 11 / 21-tap pieces) | 45 | 76.3 |
+| VectorOP ReLU6 | 82 | 55.1 |
+| VectorOP softmax unit (48 disparities; 4 × the 16-key upsampling weights) | 2 nodes | 47.6 |
+| ConvKernel 3 × 3 (FPN, refinement, polyphase deconvs) | 23 | 45.7 |
+| VectorOP ADD | 65 | 37.8 |
+| ConvKernel per-channel rescales (depthwise 1 × 1) | 28 | 23.4 |
+| host: correlation volume | 1 | 21.3 |
+| host: regression + upsampling | 1 | 17.7 |
+| host: pixel shuffles | 9 | 13.9 |
+| host: instance norms | 4 | 12.5 |
+| the rest (ReLU, concat, LeakyReLU, 2 × 2 deconvs, pad, MUL) | 32 | 27.3 |
+
+**What would make it faster** (none needed for the demo):
+- A depthwise path in ConvKernel: the depthwise 3 × 3 and stripe convs
+  take 235 ms for 0.5 GMAC.
+- ReLU6 fused into ConvKernel's output (82 VectorOP calls, 55 ms).
+- A per-channel output shift in ConvKernel instead of the rescale calls
+  (23 ms).
+- The correlation on ConvKernel as per-row q·Kᵀ, instead of 21 ms on the
+  host.
+- The chosen resolution: 320 × 256 runs 4× faster at a quality cost.
+
+### 4.4 A RealSense D435 on the board (2026-10-09)
+
+`run_demo.py --capture` took two pairs with the board's D435 (640 × 480,
+fx 382.7 px, baseline 50.0 mm): one with the IR projector on, one with it
+off.  Both ran in 657 ms per pair, bit-exact against the simulation.  The
+network's depth (fx · baseline / disparity) was compared with the camera's
+own depth wherever both have a value:
+
+| pair | compared px | median rel. diff. | within 5 % | within 10 % | camera coverage |
+|---|---:|---:|---:|---:|---:|
+| projector on | 296 632 | 2.4 % | 80.4 % | 97.9 % | 96.6 % |
+| projector off (passive) | 151 667 | 4.3 % | 55.3 % | 76.7 % | 49.4 % |
+
+With the projector on, the network's map is dense and matches the camera's.
+Without it, the blank walls have no texture to match: the network's depth is
+wrong there, and the camera leaves most of them empty.
+
+**Getting both infrared images.**  The camera enumerated as USB 2 on every
+host and cable tried.  Its firmware 5.12.3 offers only the left camera on
+USB 2: librealsense builds infrared 2 by splitting the interleaved `Y8I` /
+`Y12I` formats, and 5.12.3 lists those on USB 3 only.  Firmware 5.17.3.10
+lists `Y8I` on USB 2 too, and on the board (kernel 5.15, pyrealsense2 2.56.5)
+the pair streams at 26.5 fps at 640 × 480 at 30 fps.
+
+On a laptop with kernel 7.0, `uvcvideo` cut every frame of the camera on
+5.17.3.10 at 64 KiB.  librealsense's own RSUSB backend got whole frames
+there, but only a few before its watchdog fired.  Capture on the board.
+
+## 5. Commands and runtimes
 
 Assets are untracked: `demo/stereo_depth/assets` → `/mnt/data/cormorant_repro/stereo_study`
 (about 500 MB of checkpoints, datasets and OpenStereo).
@@ -299,6 +463,10 @@ $PY demo/stereo_depth/scripts/stereo_study.py study --stride 3 --tag ablate \
     --policies float,q88,q88+fw,q88+oaggregation,...       # the per-stage ablation (o<stage>, x<stage>, fw)
 $PY demo/stereo_depth/scripts/stereo_study.py study --scale 0.5 --tag half --policies float,pow2+pc
 inference-scheduler/.venv/bin/python demo/stereo_depth/scripts/stereo_proxy.py --height 480 --width 640 --price   # 10 s
+$PY demo/stereo_depth/scripts/stereo_study.py study --fit 480 640 --tag fit640 --policies float   # float on the demo's input (2 min)
+# the implementation (inference-scheduler/.venv: numpy only)
+inference-scheduler/.venv/bin/python demo/stereo_depth/scripts/sim_quality.py --pc 0.05 --tag pc5   # 42 pairs simulated (8 min)
+cd demo/stereo_depth && ../../inference-scheduler/.venv/bin/python run_demo.py --stop-server --pairs 0 [--profile]   # 4 min
 ```
 
 Results: `demo/stereo_depth/assets/study/` (`study_anything-s_*.json`, the

@@ -257,7 +257,7 @@ def price(path: Path) -> dict:
     tl = simulate(cg, kus, hus)
     by = {sn.index: sn for sn in g.nodes}
     host: dict = collections.defaultdict(float)
-    for lane, idx, t0, t1, kind in tl.spans:
+    for _lane, idx, t0, t1, kind in tl.spans:
         if kind == "host":
             host[by[idx].onnx_node.op_type] += t1 - t0
     return {"perf_model": str(pm.path), "total_ms": tl.total_us / 1e3, "cpu_ms": tl.cpu_us / 1e3,

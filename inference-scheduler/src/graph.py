@@ -41,6 +41,7 @@ from .host_nodes import HOST_OP_FACTORIES, HOST_OP_TYPES, HostContext, SliceNode
 from .llm_nodes import LLM_DOMAIN, LLM_OP_FACTORIES, HostTable
 from .vit_nodes import VIT_OP_FACTORIES
 from .tts_nodes import TTS_OP_FACTORIES
+from .stereo_nodes import STEREO_OP_FACTORIES
 from . import cost_model
 from . import fusion
 from . import matmul_lowering
@@ -783,7 +784,8 @@ class OnnxGraph:
             # message's root); a Llama project holds five graphs.
             node = _detached_node(node)
             if node.domain == LLM_DOMAIN:
-                factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES}
+                factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES,
+                             **STEREO_OP_FACTORIES}
                 if node.op_type not in factories:
                     raise SchedulerError(
                         f"Node '{node.name or node.op_type}': unknown {LLM_DOMAIN} op "

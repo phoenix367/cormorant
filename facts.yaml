@@ -401,6 +401,7 @@ facts:
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/object_detection/object_detection_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/stereo_depth/stereo_depth_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/camera/camera_config.json.example, regex: '"VectorOPKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/vectorop_rtl/[\w./]+/src)', count: 2}
@@ -453,6 +454,7 @@ facts:
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/object_detection/object_detection_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/stereo_depth/stereo_depth_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"MatmulKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/matmul_rtl/[\w./]+/src)', count: 2}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '<repo>/build/(kernels/matmul_rtl/[\w./]+/src)/'}
@@ -476,6 +478,7 @@ facts:
     - {file: inference-scheduler/remote_config.json.example, regex: '"ConvKernel": "\.\./build/([^"]+)"'}
     - {file: demo/image_classification/image_classification_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/object_detection/object_detection_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/stereo_depth/stereo_depth_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/mnist/mnist_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/camera/camera_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"ConvKernel": +"\.\./\.\./build/([^"]+)"'}
@@ -576,6 +579,21 @@ facts:
       ssh.host: "RemoteSession (inference-scheduler/src/remote/session.py) reads the ssh section"
       ssh.user: "RemoteSession reads the ssh section"
       ssh.port: "RemoteSession reads the ssh section"
+      ssh.key_file: "RemoteSession reads the ssh section"
+      ssh.password: "RemoteSession reads the ssh section"
+      ssh.connect_timeout: "RemoteSession reads the ssh section"
+
+# ── recorded: measured, with provenance ──────────────────────────────────────
+
+- id: config.stereo_depth
+  kind: interface
+  title: stereo_depth_config.json.example against the code that reads it
+  check: config_keys
+  args:
+    example: demo/stereo_depth/stereo_depth_config.json.example
+    code: [demo/stereo_depth]
+    waive:
+      ssh.port: "RemoteSession (inference-scheduler/src/remote/session.py) reads the ssh section"
       ssh.key_file: "RemoteSession reads the ssh section"
       ssh.password: "RemoteSession reads the ssh section"
       ssh.connect_timeout: "RemoteSession reads the ssh section"
@@ -878,7 +896,7 @@ facts:
   value: {resnet18_ms: 20.2, resnet18_fps: 49.6, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.4, bert_ms: 418,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
           smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249,
-          yolov5n_ms: 63.9, yolov5n_fps: 15.6}
+          yolov5n_ms: 63.9, yolov5n_fps: 15.6, stereo_ms: 659, stereo_fps: 1.52}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-04
@@ -914,7 +932,7 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS"
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before)"
     facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
@@ -932,6 +950,10 @@ facts:
                  transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'yolov5n')"}
     yolov5n_fps: {file: demo/object_detection/build/results.json, json: '',
                   transform: "one(x['metrics']['fps'] for x in v if x['name'] == 'yolov5n')"}
+    stereo_ms: {file: demo/stereo_depth/build/results.json, json: '',
+                transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
+    stereo_fps: {file: demo/stereo_depth/build/results.json, json: '',
+                 transform: "one(x['metrics']['fps'] for x in v if x['name'] == 'lightstereo_s')"}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
     - {file: README.md, regex: '\| ResNet-18, 224×224 \| \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
@@ -947,6 +969,11 @@ facts:
     - {file: demo/README.md, regex: 'PoolingKernel \((?P<yolov5n_ms>\d+) ms per image, (?P<yolov5n_fps>[\d.]+) FPS\)'}
     - {file: demo/object_detection/README.md, regex: 'takes \*\*(?P<yolov5n_ms>[\d.]+) ms per image \((?P<yolov5n_fps>[\d.]+) FPS\)\*\*'}
     - {file: doc/README.md, regex: 'the `demo/object_detection` demo — (?P<yolov5n_ms>\d+) ms per image on the board'}
+    - {file: README.md, regex: 'LightStereo-S stereo depth, 640×480 \| \*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
+    - {file: demo/README.md, regex: 'on the host \((?P<stereo_ms>\d+) ms per pair, (?P<stereo_fps>[\d.]+) FPS\)'}
+    - {file: demo/stereo_depth/README.md, regex: 'a pair takes \*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
+    - {file: doc/README.md, regex: 'demo: (?P<stereo_ms>\d+) ms per pair at 640 × 480 on the board'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: 'a pair takes\s+\*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
     - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
     - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
@@ -1007,6 +1034,72 @@ facts:
        regex: 'mAP@0\.5:0\.95 (?P<map>[\d.]+) against float.s (?P<float_map>[\d.]+) \(mAP@0\.5 (?P<map50>[\d.]+)\s+vs (?P<float_map50>[\d.]+)\)'}
     - {file: demo/object_detection/README.md, regex: '^\| float \(onnxruntime\) \| (?P<float_map50>[\d.]+) \| (?P<float_map>[\d.]+) \|'}
     - {file: demo/object_detection/README.md, regex: '^\| \*\*FPGA\*\* \(Q8\.8 datapath\) \| \*\*(?P<map50>[\d.]+)\*\* \| \*\*(?P<map>[\d.]+)\*\* \|'}
+
+- id: stereo.quality
+  kind: recorded
+  title: LightStereo-S's disparity quality on the 42 Middlebury / ETH3D pairs, the board against float on the same input
+  value: {epe: 0.667, bad1: 12.21, bad2: 4.94, float_epe: 0.650, float_bad1: 11.81, float_bad2: 4.87, sim_epe: 0.627}
+  tolerance: 0.006                           # the docs round to two or three places
+  provenance:
+    date: 2026-10-09
+    how: "STEREO_PLAN §4.2-§4.3: the board run (run_demo.py --pairs 0, 640 x 480, per_channel 0.05, bitstream
+          8599aa7a5f12) EPE 0.6672 / bad-1 12.21 / bad-2 4.94; float on the same fitted input (stereo_study.py study
+          --fit 480 640) 0.6500 / 11.81 / 4.87; the simulated graph at native resolution (sim_quality.py --pc 0.05)
+          EPE 0.627 (float 0.633)"
+    facts: {perf.bitstream_id: 8599aa7a5f12}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
+  verify:
+    epe: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['epe'] for x in v if x['name'] == 'lightstereo_s')"}
+    bad1: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['bad1'] for x in v if x['name'] == 'lightstereo_s')"}
+    bad2: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['bad2'] for x in v if x['name'] == 'lightstereo_s')"}
+    float_epe: {file: demo/stereo_depth/assets/study/study_anything-s_fit640.json, json: summary.all.float.epe}
+    float_bad1: {file: demo/stereo_depth/assets/study/study_anything-s_fit640.json, json: summary.all.float.bad1}
+    float_bad2: {file: demo/stereo_depth/assets/study/study_anything-s_fit640.json, json: summary.all.float.bad2}
+    sim_epe: {file: demo/stereo_depth/assets/study/sim_quality_pc5_final.json, json: summary.all.epe}
+  fix: report
+  mentions:
+    - {file: README.md, regex: 'EPE (?P<epe>[\d.]+) px on 42 Middlebury / ETH3D pairs \(float (?P<float_epe>[\d.]+) on the same input\)'}
+    - {file: demo/README.md, regex: 'EPE (?P<epe>[\d.]+) px on 42 pairs against float.s (?P<float_epe>[\d.]+) on the same input'}
+    - {file: doc/README.md, regex: 'EPE (?P<epe>[\d.]+) px \(float (?P<float_epe>[\d.]+) on the same\s+input\)'}
+    - {file: demo/stereo_depth/README.md, regex: '^\| float on the same input \(`stereo_study\.py study --fit 480 640`\) \| (?P<float_epe>[\d.]+) \| (?P<float_bad1>[\d.]+) % \| (?P<float_bad2>[\d.]+) % \|'}
+    - {file: demo/stereo_depth/README.md, regex: '^\| \*\*FPGA\*\* \| \*\*(?P<epe>[\d.]+)\*\* \| \*\*(?P<bad1>[\d.]+) %\*\* \| \*\*(?P<bad2>[\d.]+) %\*\* \|'}
+    - {file: demo/stereo_depth/README.md, regex: 'simulation of the graph scores EPE\s+(?P<sim_epe>[\d.]+) px'}
+    - {file: doc/plans/STEREO_PLAN.md, dotall: true,
+       regex: 'EPE (?P<epe>[\d.]+) px and bad-2\s+(?P<bad2>[\d.]+) %, against float.s (?P<float_epe>[\d.]+) / (?P<float_bad2>[\d.]+) % on the same scaled input'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: '\| \*\*(?P<epe>[\d.]+)\*\* \| (?P<bad1>[\d.]+) % \| \*\*(?P<bad2>[\d.]+) %\*\* \| (?P<float_epe>[\d.]+) / (?P<float_bad1>[\d.]+) % / (?P<float_bad2>[\d.]+) % \|'}
+
+- id: stereo.realsense
+  kind: recorded
+  title: LightStereo-S on RealSense D435 pairs taken on the board - latency per pair and how its depth (fx * baseline / disparity) agrees with the camera's own (median relative difference and share of pixels within 10 %, IR projector on / off)
+  value: {ms: 657, on_median: 2.4, on_within10: 97.9, off_median: 4.3, off_within10: 76.7}
+  tolerance: {rel: 0.03}                     # the docs round ("98 %")
+  provenance:
+    date: 2026-10-09
+    how: "STEREO_PLAN §4.4: run_demo.py --capture on the board (bitstream 8599aa7a5f12; the D435 on firmware
+          5.17.3.10 over USB 2), two 640 x 480 pairs with the projector on and off, maps bit-exact against the
+          simulation; postprocess.realsense_depth compares where both depths exist (296 632 / 151 667 px).  The
+          run's results.json is kept as demo/stereo_depth/build/results_realsense.json"
+    facts: {perf.bitstream_id: 8599aa7a5f12}
+  verify:
+    ms: {file: demo/stereo_depth/build/results_realsense.json, json: '',
+         transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
+    on_median: {file: demo/stereo_depth/build/results_realsense.json, json: '',
+                transform: "one(100 * p['realsense']['median_rel_diff'] for x in v if x['name'] == 'lightstereo_s' for p in x['per_pair'] if p['name'] == 'realsense_emitter-on')"}
+    on_within10: {file: demo/stereo_depth/build/results_realsense.json, json: '',
+                  transform: "one(p['realsense']['within_10pct'] for x in v if x['name'] == 'lightstereo_s' for p in x['per_pair'] if p['name'] == 'realsense_emitter-on')"}
+    off_median: {file: demo/stereo_depth/build/results_realsense.json, json: '',
+                 transform: "one(100 * p['realsense']['median_rel_diff'] for x in v if x['name'] == 'lightstereo_s' for p in x['per_pair'] if p['name'] == 'realsense_emitter-off')"}
+    off_within10: {file: demo/stereo_depth/build/results_realsense.json, json: '',
+                   transform: "one(p['realsense']['within_10pct'] for x in v if x['name'] == 'lightstereo_s' for p in x['per_pair'] if p['name'] == 'realsense_emitter-off')"}
+  fix: report
+  mentions:
+    - {file: README.md, regex: 'RealSense D435 pairs taken on the board: depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
+    - {file: demo/README.md, regex: 'RealSense pairs: depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
+    - {file: doc/README.md, regex: 'RealSense D435 on the board \(§4\.4\): depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
+    - {file: demo/stereo_depth/README.md,
+       regex: 'a D435 pair took (?P<ms>\d+) ms; with the IR\s+projector on, the network.s depth is within 10 % of the camera.s own on\s+(?P<on_within10>\d+) % of the pixels \(median difference (?P<on_median>[\d.]+) %\), without it on (?P<off_within10>\d+) % \((?P<off_median>[\d.]+) %\)'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: 'Both ran in (?P<ms>\d+) ms per pair'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector on \| [\d ]+ \| (?P<on_median>[\d.]+) % \| [\d.]+ % \| (?P<on_within10>[\d.]+) % \|'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector off \(passive\) \| [\d ]+ \| (?P<off_median>[\d.]+) % \| [\d.]+ % \| (?P<off_within10>[\d.]+) % \|'}
 
 - id: yolo.model
   kind: value
@@ -1148,6 +1241,8 @@ facts:
     - {name: image demo config, file: demo/image_classification/image_classification_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
     - {name: object detection demo config, file: demo/object_detection/object_detection_config.json.example, json: remote.uio_devices, subset: true,
+       transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
+    - {name: stereo depth demo config, file: demo/stereo_depth/stereo_depth_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
     - {name: MNIST demo config, file: demo/mnist/mnist_config.json.example, json: remote.uio_devices, subset: true,
        transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items() if not k.startswith('_')}"}
