@@ -20,6 +20,23 @@
   - The chat server runs on it.
   - `CALL_OVERHEAD` follows the new call floor (434 → 431 cycles, with
     `ONE` / `one` +3): no engine choice moves.
+- **Experiment 3 (2026-10-09), the outputs on `S_AXI_HP0_FPD` on top of
+  experiment 2's design (§6): dropped.**  Bitstream `5de9b4f80908` is
+  bit-exact (159 / 159 models, demos) but a consistent small loss: the
+  large binary VectorOP calls +3…9 %, the global pools +2…4 %, BERT
+  418 → 421 ms (+0.8 %), ResNet-18 +0.7 %.  The user chose to try HP2
+  instead.
+- **Experiment 5 (2026-10-10), static read QoS 15 on HPC0 / HPC1 (§9): a
+  real but small gain, no hardware change.**  Memory-bound binary VectorOP
+  calls −4…6 %, the GEMV −4 %, two pools −2…5 %; end to end −0.1…−0.2 %
+  (BERT 418.0 → 417.6 ms); bit-exact.  Registers restored to 0; whether to
+  make it persistent in `upload_bitstream.py` is open.
+- **Experiment 4 (2026-10-09), the same outputs on `S_AXI_HP2_FPD` (§7):
+  the same as HP0.**  Bitstream `4a61fc965037` is bit-exact (159 / 159,
+  demos) and a small loss of the same shape: the large binary VectorOP
+  calls +2…7 %, the global pools +3 %, per-kernel means +0.1…+1.1 %; end to
+  end BERT +0.15 %, ResNet-18 +0.25 %, MNIST +0.5…0.7 %.  §8 explains why:
+  an HP port is one DDRC port behind the FPD switch, a CCI port is two.
 
 The user asked to add the MPSoC's `S_AXI_HP0_FPD` port to the block design
 and move the kernels' outputs to it ("let's try").  When that was neutral,
@@ -336,3 +353,486 @@ Done:
 | engine cost model (`tools/fit_cost_model.py fit 8599aa7a5f12`) | the constants as used: ConvKernel 18.6 / 48.3 % over 1265 calls, MatmulKernel 4.5 / 17.7 % over 414 (`588d721997cb`: 18.7 / 48.2, 4.6 / 17.7); kept, the call floor 434 → 431 cycles with `ONE` / `one` +3; `fit_cost_model.py diff` against the old constants: no shipped model's engine choice changes |
 | perf-regression baseline `kv260-8599aa7a5f12.json` | the second benchmark pass of §5.4 (63 cases) and the demos of that run |
 | chat server | restarted on `8599aa7a5f12` (the libraries unchanged); SmolLM2-135M / 360M, BERT and Piper answer |
+
+## 6. Experiment 3: the outputs on HP0 again, on top of experiment 2 (2026-10-09)
+
+The user asked to add a third interconnect, enable `S_AXI_HP0_FPD`, connect
+the interconnect to it and move the kernels' outputs there — experiment 1's
+layout, now on top of the production design (`8599aa7a5f12`, VectorOP b on
+HPC1).  Experiment 1 was measured neutral when both VectorOP reads shared
+HPC0; this run measures the combination.
+
+### 6.1 Design
+
+| port | interconnect | masters | mode |
+|---|---|---|---|
+| HPC0 | `axi_interconnect_0`, 4 SI (was 8) | VectorOP a, Matmul A, Conv x, Pool x | read |
+| HPC1 | `axi_mem_intercon`, 4 SI (unchanged) | Conv w / b, Matmul B, VectorOP b | read |
+| **HP0** (SAXIGP2, 128-bit) | **`axi_out_intercon`, 4 SI** | VectorOP c, Matmul C, Conv y, Pool y | write |
+
+- `scripts/bd_hp0_outputs.tcl` updated: the HPC0 reader list no longer
+  names VectorOP `gmem1` (it would have pulled b back from HPC1), and it
+  takes `-ip-repo` and upgrades locked kernel IPs, as `bd_vop_b_hpc1.tcl`
+  does.  Register slices on every SI of the three interconnects, none on
+  the three MIs (every port is one-way: BD 41-237).
+- `scripts/bd_kernel_clock.tcl`: with `axi_out_intercon` present its
+  register-slice pass leaves HPC0's MI without a slice too (idempotent on
+  this design).
+- `constrs_1/new/kernel_clock.xdc`: the `MAX_FANOUT` on that MI slice's
+  ready is commented out (`set_property` on no cells is an error; a guard
+  with `if` is not XDC — Designutils 20-1307 in this build's synthesis, the
+  line then ignored, which is the same result).
+- Testbench: the HP0 PS VIP gets the reset-check-to-warn and the BEST_CASE
+  slave profile, as HPC0.
+
+### 6.2 Phases 0–1: block design and simulation (2026-10-09)
+
+| gate | result |
+|---|---|
+| `bd_hp0_outputs.tcl` on the `8599aa7a5f12` design | `validate_bd_design` clean; the only critical warnings are the eight `*_LPS_OCM` BD 41-1359 (HPC1's four as before, HP0's four new) |
+| address map | writers `HP0_DDR_LOW` / `HP0_DDR_HIGH` / `HP0_QSPI` only; VectorOP a, Matmul A, Conv x, Pool x on HPC0; Conv w / b, Matmul B, VectorOP b on HPC1 |
+| `sim_hw_kv260` (HP0 VIP: reset check as a warning, BEST_CASE slave profile as HPC0) | 75 / 75 (3 min 36 s); PS VIP transactions — HP0: 191 writes, 0 reads; HPC0: 0 writes, 467 reads; HPC1: 0 writes, 82 reads (the reads as on `8599aa7a5f12`, the writes all moved); the user-width BD 41-237 warnings of HP0 are the ones HPC0 / HPC1 have |
+
+### 6.3 Phase 2: the bitstream (2026-10-09)
+
+| | `8599aa7a5f12` (production) | `5de9b4f80908` (outputs on HP0, b on HPC1) |
+|---|---|---|
+| synthesis | | 8 min; the XDC guard's `if` reported (Designutils 20-1307) and the line ignored — the slice it names does not exist; the line is commented out since |
+| routed, after post-route `phys_opt_design` | WNS +0.114 ns, WHS +0.010 ns | **WNS +0.076 ns, WHS +0.010 ns** |
+| placed utilization | | 62 196 LUT (53.1 %), 87 464 FF, 123 BRAM tiles (85.4 %), 48 URAM, 712 DSP |
+| archive | | `/mnt/data/bitstreams/kv260_250_5de9b4f80908/` (bit, hwh, timing and utilization reports, build log) |
+
+Experiment 1's build had gained slack from losing HPC0's write-side slice;
+this one lost 0.038 ns against production — place-and-route variation
+rather than a property of the layout.
+
+### 6.4 Phase 3: the board (2026-10-09)
+
+Loaded with `upload_bitstream.py --config bitstream_config_kv260.exp3.json`
+(a local copy of the production config naming the archive; the chat server
+stopped first): id `5de9b4f80908`, fpga0 operating, all six AFIFM width
+fields 0 (128-bit), HP0's included; the overlay applied without the §4.3
+error this time.
+
+| gate | `8599aa7a5f12` | `5de9b4f80908` (HP0) |
+|---|---|---|
+| `run_remote_tests` (159 models) | 159 / 159 | **159 / 159** (every output equal to the simulation) |
+| `run_remote_perf` (63 cases), two runs, against the `kv260-8599aa7a5f12` baseline | baseline | 63 / 63 correct; per-kernel mean Δ VectorOP **+0.9 %**, Matmul +0.8 %, Conv +0.1 %, Pool **+1.1 %** (medians +0.4 / +0.5 / +0.1 / +0.8 %) |
+| VectorOP ADD-16K / 64K / 256K | 16.2 / 49.7 / 185.2 µs | 16.7–16.4 / **52.7–54.2** / **192.7–191.2** µs (+1…3 / **+6…9** / **+3…4 %**) |
+| VectorOP MUL-16K / 64K, MUL-bcast-8x16K | 16.2 / 51.3, 87.6 µs | **16.7 / 53.0–53.2**, 89.2–90.1 µs (+3.1 / +3.3…3.7, +1.8…2.9 %) |
+| VectorOP unary (RELU, RELU6, softmax), DIV, MUL-bcast-dw, ADD-1K | | unchanged (ADD-1K 5.0 → 4.6 µs, within the ~0.5 µs jitter of the shortest calls) |
+| PoolingKernel GlobalMaxPool-7x7-256 / GlobalAvgPool-7x7-64 | 38.4 / 12.9 µs | 39.3–39.5 / 13.2–13.4 µs (+2.3…2.9 / +2.3…3.9 %) |
+| MatmulKernel, ConvKernel | | no consistent mover above 2 % (16x16x16 +7.1 / +2.4 %: a 4 µs call) |
+| MNIST convnet / LeNet | 0.1105 / 1.2504 ms | 0.1111 / 1.2579 ms (+0.5 / +0.6 %); 98.92 % / 97.35 % |
+| MobileNet v1 / v2, ResNet-18 | 21.96 / 20.35 / 20.18 ms | 21.96 / 20.40 / 20.32 ms (+0.0 / +0.2 / +0.7 %); top-1 unchanged |
+| BERT (p50) | 418.0 ms | **421.4 ms (+0.8 %)**; EM / F1 88.0 / 90.3, bit-exact |
+
+**Reading.**
+- **HP0 writes cost a little.**  Every write-heavy case is slower, none
+  faster: the large binary VectorOP calls +3…9 %, the global pools +2…4 %,
+  the demos +0.5…0.8 %.  The write path to DDRC port 3 through the FPD
+  switch is longer than HPC0's through the CCI (experiment 1 saw the same
+  sign on one pooling case, +1.4 %), and with b already on HPC1 nothing is
+  left for the move to relieve: a's reads never contended with c's writes
+  (§4.3).
+- **Bit-exact throughout**: the 159 models, the demos' results and
+  accuracies, the benchmark outputs.
+
+**Phase 4: the decision (2026-10-09).**  Dropped: the user asked to move
+the outputs from HP0 to HP2 instead (§7).  The board was put back on
+`8599aa7a5f12` and the chat server restarted (healthy) before the HP2 build;
+`bitstream_config_kv260.exp3.json` (local, untracked) names the HP0 archive.
+
+## 7. Experiment 4: the outputs on HP2 (2026-10-09)
+
+HP0's path (FPD switch → DDRC port 3, shared with DisplayPort) cost 0.5–1 %
+end to end against HPC0's through the CCI.  `S_AXI_HP2_FPD` (SAXIGP4)
+reaches the DDRC through the FPD switch's other leg, port 4 (shared with
+HP1, unused here): the user asked to try it.
+
+### 7.1 Design
+
+The layout of §6.1 with `axi_out_intercon` → `S_AXI_HP2_FPD`:
+`scripts/bd_hp0_outputs.tcl -port HP2` re-targets the interconnect's M00,
+enables `S_AXI_GP4` at 128 bits, clocks `saxihp2_fpd_aclk` from the MMCM,
+disconnects and disables HP0 (`PSU__USE__S_AXI_GP2` 0) and swaps the four
+writers' address segments to `HP2_DDR_LOW` / `HP2_DDR_HIGH` / `HP2_QSPI`.
+The testbench's reset check and slave profile name HP2; the loader already
+programs every `C_SAXIGP*_DATA_WIDTH` of the HWH (AFIFM4 at `0xFD3A_0000`),
+and `read_kernel_regs.sh` now prints HP1–HP3 too.
+
+### 7.2 Phases 0–3
+
+| gate | result |
+|---|---|
+| `bd_hp0_outputs.tcl -port HP2` on the §6 design | `validate_bd_design` clean; `HP0 released`; the eight `*_LPS_OCM` BD 41-1359 (HPC1's, HP2's); writers on HP2 segments only |
+| `sim_hw_kv260` (HP2 VIP: reset check as a warning, BEST_CASE slave profile) | 75 / 75; PS VIP — HP2: 191 writes, 0 reads; HP0: nothing; HPC0: 467 reads; HPC1: 82 reads |
+| `build_hw_kv260` | **WNS +0.021 ns, WHS +0.010 ns** (production +0.114, HP0 +0.076 — the same netlist but for the port, so place-and-route variation); 62 248 LUT, 123 BRAM, 712 DSP; bitstream **`4a61fc965037`**, archived in `/mnt/data/bitstreams/kv260_250_4a61fc965037/`; loaded with the local `bitstream_config_kv260.exp4.json` |
+| load | id `4a61fc965037`, fpga0 operating, all twelve AFIFM width fields 0 (HP2 = AFIFM4 included); the overlay applied cleanly |
+| `run_remote_tests` (159 models) | **159 / 159** |
+| `run_remote_perf` (63 cases), two runs, against the `kv260-8599aa7a5f12` baseline | 63 / 63 correct; per-kernel mean Δ VectorOP **+0.8 %**, Matmul +0.6 %, Conv +0.1 %, Pool **+1.1 %** (HP0: +0.9 / +0.8 / +0.1 / +1.1) |
+| VectorOP ADD-16K / 64K / 256K | 16.9–16.7 / **52.1–53.1** / **192.3–192.2** µs (+3…4 / **+5…7** / **+3.8 %**; HP0 +1…3 / +6…9 / +3…4) |
+| VectorOP MUL-16K / 64K, ADD / MUL-bcast-8x16K, DIV-4K | +1…3 / +2.4, +2 / +2, +3.3 % |
+| VectorOP ADD-1K / 4K | 5.0 → 4.6 / 6.9 → 6.6 µs (−7 / −4 %: the shortest calls, the write response path a little shorter?) |
+| unary VectorOP, softmax, MUL-bcast-dw, ConvKernel | unchanged |
+| PoolingKernel GlobalAvgPool-7x7-64 | +3…4 % (as HP0) |
+| MatmulKernel 64x64x64 | 14.7 → 15.3–15.4 µs (+4…5 %; HP0 +6 / +1); the others within noise |
+| MNIST convnet / LeNet | 0.1113 / 1.2567 ms (+0.7 / +0.5 %; HP0 +0.5 / +0.6); 98.92 % / 97.35 % |
+| MobileNet v1 / v2, ResNet-18 | 21.97 / 20.36 / 20.23 ms (+0.05 / +0.03 / **+0.25 %**; HP0 +0.0 / +0.2 / +0.7) |
+| BERT (p50) | **418.7 ms (+0.15 %**; HP0 +0.8 %); EM / F1 88.0 / 90.3, bit-exact |
+
+**Reading.**  HP2 behaves like HP0: the memory-bound binary VectorOP calls
+lose 2–7 %, the pools 3 %, everything else is flat, and the end-to-end
+loss is a little smaller than HP0's (BERT +0.15 against +0.8 %) — within
+the run-to-run spread of these demos rather than a property of port 4.
+What the two experiments share is the cause (§8): an HP port is one DDRC
+XPI behind the FPD switch, whereas a stream on HPC0 is spread over the two
+CCI channels and rides their write credits.  The board runs
+`8599aa7a5f12` again (id and fpga0 checked); the chat server is restarted
+and answers.  The DDR APM sample of this run was lost (the sampler
+produced no file; not repeated).
+
+## 8. How the DDR controller takes the PS ports (2026-10-09)
+
+Asked while the HP2 bitstream was building: how does the DDRC distribute
+the PL ports' data over its channels?  From UG1085 (v1.8, chapters 15–17,
+35) and the production board's registers.
+
+**The six XPI ports.**  The DDRC has six 128-bit AXI port interfaces (XPI),
+all synchronous to the controller clock — 533 MHz here (DDR4-2400 part run
+at 2133 MT/s, `PSU__CRF_APB__DDR_CTRL` 533.33), i.e. 8.5 GB/s per port and
+direction into a 64-bit DRAM bus of 17 GB/s peak.  Who reaches which port
+(Table 16-4 / Figure 16-3):
+
+| XPI | masters | path |
+|---|---|---|
+| 0 | LPD (RPU, PMU, CSU) | LPD switch |
+| 1, 2 | CCI: APU, `S_AXI_ACE_FPD`, TCU — and **`S_AXI_HPC0_FPD`, `S_AXI_HPC1_FPD`** | CCI-400, two parallel channels, each with two QoS virtual networks |
+| 3 | **`S_AXI_HP0_FPD`**, DisplayPort | FPD main switch |
+| 4 | `S_AXI_HP1_FPD`, **`S_AXI_HP2_FPD`** (exclusive to the two) | FPD main switch |
+| 5 | `S_AXI_HP3_FPD`, FPD DMA | FPD main switch |
+
+The FPD main switch (`TOPSW_MAIN`) runs at 533 MHz too; the PL-side AFIFM
+of every port is 128 bits at the PL clock (250 MHz: 4 GB/s per direction),
+with an asynchronous crossing.
+
+**The CCI spreads each HPC port over both channels.**  The TRM says the
+CCI's two DDR master ports each reach all of DDR and that a region is
+"allocated to one of the master ports" — an address split, not a per-slave
+one.  Measured with the DDR APM (`0xFD0B0000`, six slots = the six XPIs,
+read / write byte counters per slot, polled every 0.25 s) during a
+`run_remote_perf` pass on `8599aa7a5f12`, where every write goes through
+HPC0 and the reads through HPC0 and HPC1:
+
+| XPI | read | write |
+|---|---|---|
+| 1 (CCI) | 6 971 MB — **51 %** | 4 469 MB — **50 %** |
+| 2 (CCI) | 6 729 MB — 49 % | 4 340 MB — 50 % |
+| 0, 3, 4 | 0 | 0 |
+
+Writes from a single PL port land half on each channel: the CCI
+interleaves by address at a fine grain, so HPC0 and HPC1 each see two
+DDRC ports (17 GB/s of DDRC-side read capacity shared with the APU), while
+an HP port has exactly one XPI (8.5 GB/s per direction; HP1 and HP2 share
+theirs, HP0 shares with DisplayPort, idle on the headless board).  The idle
+board moves ~9 MB/s of reads and ~13 MB/s of writes on the CCI channels
+(the APU).
+
+**The port arbiter treats our ports alike.**  The PA arbitrates the six
+XPIs in tiers: (1) read / write direction — stay on the current direction
+while it has credits and no port of the other direction has timed out,
+reads before writes when equal, direction switches minimised; (2) port
+timeouts (aging counters: `PCFGR`/`PCFGW` `*_port_priority`, enabled by
+`*_port_aging_en`); (3) read class HPR over LPR / VPR (VPR and VPW become
+top priority once their latency budget expires), writes BEW / VPW; (4) the
+per-command AxQOS priority; (5) round-robin from the lowest port index.  On
+the board every port has `PCFGR = PCFGW = 0x200f` (priority 15, aging off,
+urgent on), the AFIFMs drive `AxQOS = 0` (`RDQOS` / `WRQOS` 0, issuing
+capability 7 + 1 outstanding per direction), and the QoS maps put QoS 0 in
+LPR / BEW on every port (`PCFGQOS0` ports 1–2: 0–3 LPR, 4–11 LPR, 12–15
+HPR; ports 3–5: 0–3 LPR / BEW, 4–15 VPR / VPW with a 79-cycle timeout).
+The DDR QoS controller's thresholds are 0 (`DDR_QOS_CTRL` `RD_LPR` /
+`RD_HPR` / `WR_THRSLD`), so it never masks a port.  With aging off and all
+traffic LPR / BEW at QoS 0, tiers 2–4 never differ between our ports: the
+PA is a per-direction round-robin over the XPIs that have requests, under
+the global read / write turnaround policy.
+
+**What that means for the layouts measured here.**
+- Moving the writes from HPC0 to an HP port does not change the DRAM-side
+  read / write turnaround (one PA, one DRAM bus), and the CCI channels were
+  never short of write credits — hence experiment 1's neutral result.
+- A write stream on HP0 pays the FPD-switch path and a single XPI with a
+  deeper queue ahead of it instead of two CCI channels: the +3…9 % on the
+  large binary VectorOP calls, whose c stream (2.8 GB/s) then also competes
+  in the PA with its own two read streams as a third requester instead of
+  riding the CCI's write credits (experiment 3).
+- Experiment 4 (HP2) tests whether port 4's leg of the switch behaves
+  differently from port 3's; the arbiter and QoS settings are identical, so
+  the expectation is "the same as HP0".
+- A read port on the CCI effectively has two DDRC ports; the binary
+  VectorOP's gain from HPC1 (experiment 2) came from the second AFIFM /
+  CCI slave port (4 GB/s each at the PL clock), not from DDRC ports.
+- The levers the TRM leaves: `AxQOS ≥ 12` on a CCI port makes its reads
+  HPR (ahead of the APU's LPR reads); `AxQOS ≥ 4` on an HP port makes them
+  VPR / VPW with an expiry — the AFIFM's `RDQOS` / `WRQOS` can set them
+  statically per port without a bitstream change.  Not tried.
+
+## 9. Experiment 5: static read QoS on the CCI ports (2026-10-10)
+
+The lever §8 left: every PL port's AFIFM carries a static AxQOS for its
+read and write channels (`RDQOS` / `WRQOS` at `+0x08` / `+0x1C`, `VALUE[3:0]`,
+used while `RDCTRL` / `WRCTRL` `FABRIC_QOS_EN` (bit 2) is 0 — it is, and the
+PS configuration sets the values to 0).  On DDRC ports 1–2 the read map
+puts QoS 12–15 in the HPR class (`PCFGQOS0`), and the CCI's QVN sorts by
+AxQOS into its low-latency virtual network.  The ECRTS 2021 study of the
+ZU+ QoS features (Serrano-Cases et al., "Leveraging Hardware QoS to
+Control Multicore Contention in the Zynq UltraScale+") confirms that the
+PL FIFOs and the second-level switches relay the AFIFM's static value to
+the memory controller, and that the CCI's two DDRC ports are 8 KB
+address-interleaved (their APM measurement; ours in §8 agrees).  The user
+asked to try it after the HP experiments.  No bitstream change: the
+registers are written through `/dev/mem` on the production bitstream
+`8599aa7a5f12` (chat server stopped), one `run_remote_perf` pass per
+setting against the `kv260-8599aa7a5f12` baseline, then restored to 0.
+
+| HPC0 + HPC1 `RDQOS` / `WRQOS` | 15 / 15 | 15 / 0 | 0 / 15 |
+|---|---|---|---|
+| VectorOP mean | **−2.0 %** | **−2.1 %** | −0.8 % |
+| ADD-256K / 64K / 16K | −5.4 / −2.6 / −5.6 % | −5.4 / −3.6 / −4.3 % | −0.4 / +1.2 / −3.1 % |
+| MUL-64K / 16K | −4.9 / −4.9 % | −6.0 / −4.3 % | −2.5 / −1.9 % |
+| ADD / MUL-bcast-8x16K | −5.8 / −5.1 % | −5.2 / −5.0 % | −0.8 / −1.0 % |
+| FC-1x512x1000-packed (GEMV) | −4.0 % | −3.9 % | −0.2 % |
+| AvgPool-2x2-3x3-32-112 / MaxPool-3x3-56x56 | −5.0 / −2.1 % | −5.1 / −2.1 % | +0.1 / +2.3 % |
+| unary VectorOP, softmax, ConvKernel | flat | flat | flat |
+| 4–15 µs MatMul calls, DIV-4K | +2…10 % | +2…4 % | +0…10 % — the same calls jitter that much in a plain re-run of the baseline (`16x16x16` +9.5 %) |
+
+The write QoS does nothing (the CCI ports' write map has one class), the
+read QoS does it all, and it moves exactly the memory-bound calls the HP
+ports made slower.  Why it helps with an idle APU: the port arbiter's
+direction policy switches from writes back to reads as soon as an HPR
+read port has credit (§8), the HPR reads have their own CAM share, and the
+QVN's low-latency network keeps them out of the best-effort queue behind
+the APU's traffic — a binary VectorOP streams reads and writes at once,
+so its reads wait less behind its own writes.
+
+A second pass with `RDQOS` 15 / `WRQOS` 0 repeated the kernel picture
+(ADD-64K / 256K, MUL-64K, both bcasts and MaxPool-3x3-56x56 improved again;
+`FC-1x1280x1001-packed` and `GlobalMaxPool-7x7-256` +2 % once — the two
+known one-run outliers of §5.4 / §6.4).  End to end, same setting:
+
+| demo | `8599aa7a5f12`, QoS 0 | `RDQOS` 15 on HPC0 + HPC1 |
+|---|---|---|
+| MNIST convnet / LeNet | 0.1105 / 1.2504 ms | 0.1111 / 1.2485 ms (+0.5 / −0.15 %); 98.92 % / 97.35 % |
+| MobileNet v1 / v2, ResNet-18 | 21.96 / 20.35 / 20.18 ms | 21.94 / 20.32 / 20.13 ms (−0.1 / −0.2 / −0.2 %); top-1 unchanged |
+| BERT (p50) | 418.0 ms | **417.6 ms (−0.1 %)**; EM / F1 88.0 / 90.3, bit-exact |
+
+**Reading.**  A real 4–6 % on the memory-bound binary VectorOP calls, the
+GEMV and two pooling shapes, bit-exact and free of any hardware change —
+but 0.1–0.2 % end to end: after experiment 2 those calls are a small share
+of every model's time (BERT's are ~5 % of 418 ms, ResNet-18's residual
+adds ~4 %).  The APU-side cost of giving the PL HPR reads did not show
+(the host-op phases of BERT and the demos' pre- / post-processing are
+unchanged); a loaded APU (the chat server's host ops during decode) was not
+measured.  The registers were restored to 0 and the chat server restarted.
+
+**Making it persistent** would be an `upload_bitstream.py` step beside
+the AFIFM width writes (a bitstream-config field such as
+`"axi_qos": {"HPC0": {"rd": 15}, "HPC1": {"rd": 15}}`), plus a top-up of
+the performance model's VectorOP / pooling calls and a new perf-regression
+baseline — the user's call.
+
+## 10. Experiment 6: the AFIFM issuing capability (2026-10-10)
+
+The other per-port AFIFM knob: `RDISSUE` / `WRISSUE` (`+0x04` / `+0x18`),
+the number of outstanding read / write commands the port accepts from the
+PL.  The PS configuration leaves both at 7; a write of 0xFF reads back
+0x1F, so the field is five bits.  The kernels declare 16 outstanding
+bursts per port (VectorOP's reads: 64-beat bursts, 1 KB), so the AFIFM's 7
+could cap them — but 8 × 1 KB in flight already covers 2 µs of latency at
+4 GB/s, several times the CCI path's, so no gain was expected.  The user
+asked to try the maximum.  Same method as §9: production bitstream,
+registers through `/dev/mem`, one `run_remote_perf` pass per setting
+against the `kv260-8599aa7a5f12` baseline, restored to 7 / 7 after.
+
+| HPC0 + HPC1 `RDISSUE` / `WRISSUE` (+ `RDQOS`) | 15 / 7 | 15 / 15 | 15 / 15 + 15 | 31 / 31 | 31 / 31 + 15 |
+|---|---|---|---|---|---|
+| VectorOP mean | −0.7 % | −0.5 % | **−2.8 %** | −1.6 % | **−3.4 %** |
+| ADD-64K / 256K, MUL-64K | +1.2 / +0.5 / −0.2 % | +3.6 / −0.2 / −1.6 % | −5.0 / −5.3 / −8.0 % | +3.0 / +0.1 / −4.1 % | −1.2 / −5.6 / −7.4 % |
+| ADD / MUL-bcast-8x16K | −1.9 / −0.5 % | −1.1 / −1.3 % | −4.9 / −4.5 % | | |
+| RELU-64K | 0.0 % | 0.0 % | −1.0 % | −3.3 % | −3.3 % |
+| AvgPool-2x2-3x3-32-112 | −0.5 % | −0.5 % | −5.8 % | −0.6 % | −5.8 % |
+| Matmul / Conv / Pool means | +1.1 / +0.4 / −0.4 % | +1.6 / +0.5 / −0.3 % | +0.6 / +0.2 / −1.0 % | **+2.2** / +0.2 / −0.2 % | **+2.6** / +0.2 / −1.3 % |
+
+(`WRISSUE` is a four-bit field: 0x1F reads back 0xF.)
+
+The issuing capability is not what limits these calls: 16 outstanding
+instead of 8 moves nothing beyond the noise, and combined with the HPR
+reads it reproduces §9's gain (−2.8 against −2.7 % on VectorOP) — the
+priority does it all.  At the field's maximum, 31, the picture turns into
+a trade: unary VectorOP gains (RELU-64K −3.3 %, the kernel's own 16
+bursts now all in flight) but every GEMV / FC MatMul case loses 2–5 %
+(`FC-1x512x1000` and its packed / gemv variants, `FC-1x1280x1001`,
+`dw-12544x16x1`: MatmulKernel mean +2.2 %, +2.6 % with HPR) — the weight
+stream's many outstanding 1 KB bursts on both CCI ports thrash the DDRC's
+queues rather than hide latency.  Consistent with the bandwidth-delay
+arithmetic: the latency was covered at 8, and the kernels' own prefetch
+(16 bursts) is not the bound either.  Nothing to keep from this one;
+`RDISSUE` 15 would be harmless but idle.
+
+## 11. Experiment 7: a, b, c in different DRAM banks (2026-10-10)
+
+The binary VectorOP's remaining gap to its ceiling (§9–§10: ~25 %, not the
+port, the issuing depth, the arbiter class or the kernel's prefetch) leaves
+the DRAM itself: three sequential streams whose rows collide in the same
+banks.  The user asked to spread them.
+
+**The board's DDR address map** (DDRC `ADDRMAP0–11`, read through
+`/dev/mem`; uMCTL2 semantics, HIF address = byte address ≫ 3 on the
+64-bit bus; `MSTR 0x81040010`: DDR4, one rank):
+
+| byte address bits | field | from |
+|---|---|---|
+| 0–5 | within a 64-byte burst (BL8 × 8 B) | — |
+| **6** | **bank group** (`ADDRMAP8` bg0 = 1 → HIF 3; bg1 unused: x16 devices, two groups) | consecutive 64 B bursts alternate groups |
+| 7–13 | column (`ADDRMAP2–4`: col 2 → HIF 2, col 3–9 → HIF 4–10) | an **8 KB row** per bank (1 K HIF words) |
+| **14–15** | **bank** (`ADDRMAP1` b0, b1 = 9 → HIF 11, 12; b2 unused: four banks per group) | |
+| 16–31 | row (`ADDRMAP5/6/9/10/11`: HIF 13–28, 16 bits) | |
+
+So a sequential stream walks one 8 KB row, then the next bank, and returns
+to the same bank every 64 KB; two streams whose start addresses differ by a
+multiple of 64 KB are in the **same bank with different rows at every
+moment** — a row miss (precharge + activate) on every switch between them,
+which the DDRC's 32-entry CAM can only partly batch away.  The benchmark's
+three buffers are separate XRT allocations (CMA pages, which tend to be
+large-aligned), so the natural layout is close to that worst case; the
+scheduler's pools are 64-byte aligned with arbitrary sizes, so the models
+see a mix.
+
+**Probe.**  `bench_vectorop` takes an optional `layout OFF_A,OFF_B,OFF_C`
+(byte offsets inside one buffer; `run_remote_perf.py` passes a case's
+`"layout"` and records the physical addresses) — the three arrays 1 MB
+(ADD-256K) / 256 KB (the 64K cases) apart, plus a bank phase on b and c:
+
+| layout | b, c shifted by | banks of a / b / c at any moment |
+|---|---|---|
+| same-bank | 0, 0 | n, n, n |
+| bank+1/+2 | 16 KB, 32 KB | n, n+1, n+2 |
+| bank+2/+1 | 32 KB, 16 KB | n, n+2, n+1 |
+| bank+1/+3 | 16 KB, 48 KB | n, n+1, n+3 |
+| half-row | 8 KB, 24 KB | same bank, other half of the row (control: no bank change) |
+| bg-flip | 64 B, 128 B | bank-group phase only (control) |
+
+One `run_remote_perf` pass on `8599aa7a5f12` (QoS 0, issuing 7), 100 / 200
+iterations per case, against the natural-allocation baseline numbers
+(ADD-256K 185.2 µs, ADD-64K 49.7, MUL-64K 51.3).
+
+**Result** (one pass; a at `0x37f00000` in every case, so the phases are
+exact):
+
+| layout | ADD-256K | ADD-64K | MUL-64K |
+|---|---|---|---|
+| natural (three allocations, the baseline) | 185.2 µs | 49.7 µs | 51.3 µs |
+| same-bank | 184.9 (−0.2 %) | 50.2 (+1.0 %) | 50.5 (−1.6 %) |
+| bg-flip (64 B, 128 B) | 183.2 (−1.1 %) | 50.3 (+1.2 %) | 49.7 (−3.1 %) |
+| half-row (8 KB, 24 KB) | 158.1 (−14.6 %) | 43.0 (−13.5 %) | 43.3 (−15.6 %) |
+| bank+1/+2 (16 KB, 32 KB) | 149.9 (−19.1 %) | 41.4 (−16.7 %) | 41.7 (−18.7 %) |
+| bank+2/+1 (32 KB, 16 KB) | 149.0 (−19.5 %) | 40.9 (−17.7 %) | 40.7 (−20.7 %) |
+| **bank+1/+3 (16 KB, 48 KB)** | **145.9 (−21.2 %)** | **40.0 (−19.5 %)** | **40.3 (−21.4 %)** |
+
+- The natural allocation **is** the worst case (same-bank reproduces it):
+  CMA hands out the 512 KB / 128 KB buffers at 1 MB / 256 KB spacing, every
+  stream in the same bank as the others at every moment.
+- Three distinct banks give **−20 %**: ADD-256K at 145.9 µs is 90 % of the
+  kernel's ideal 132 µs (the 25 % gap of §9 was three quarters DRAM row
+  conflicts); 1.5 MB in 146 µs = 10.8 GB/s of DRAM traffic, 3.6 GB/s per
+  stream — now near the port's 4 GB/s per direction.
+- The bank-group phase alone does nothing (the 64 B interleave already
+  alternates groups within every stream), and the half-row shift — same
+  bank, the other 8 KB half of the 16 KB bank-pair span — recovers two
+  thirds of it, so part of the loss is the controller's same-row / hazard
+  tracking between the streams, not only precharge-activate pairs.
+- Nothing in hardware or registers changed; bit-exact (the benchmark
+  checks nothing, but the addresses only move the data).
+
+**What it means.**  The scheduler owns every buffer address (`src/schedule`
+/ `codegen`: pool slots at `CHUNK_STRIDE`, 64-byte alignment; weights in
+their own pool), and the HLS-era layout rules never looked at DRAM banks.
+A bank-aware placement — give the operands of a kernel call start
+addresses that differ in bits 14–15 (a 16 KB bank phase per operand) —
+is a codegen-only change, bit-exact by construction.  The binary VectorOP
+is the clearest customer (its share of BERT / ResNet-18 / SmolVLM / Piper
+time is 4–8 %, so −20 % there is ~1–1.5 % end to end); whether the
+ConvKernel's x / w / y and MatmulKernel's A / B / C streams lose the same
+way is the next probe (their benches need the same `layout` option).
+
+**The other kernels** (the same probe through `bench_matmul` / `bench_conv`
+/ `bench_pool`: every case of `perf_config.json`, buffers 8 MB apart,
+"same-bank" against "bank-spread" = +16 KB of bank phase per buffer, one
+pass):
+
+| kernel (cases) | spread vs natural, mean | spread vs same-bank, mean | largest consistent move |
+|---|---|---|---|
+| MatmulKernel (24) | −0.2 % | −0.5 % | `batch4-A-bcast` −4.1 % vs same-bank, −0.9 % vs natural; the GEMVs ±0.4 % |
+| ConvKernel (10) | −0.1 % | −0.1 % | none above ±0.8 % |
+| PoolingKernel (11) | 0.0 % | −1.0 % | `AvgPool-3x3-28x28` −2.4 / −3.0 %, `MaxPool-3x3-14x14` −5.1 % vs same-bank but +4.6 % vs natural (a 28 µs call: noise) |
+
+Nothing like the VectorOP's 20 %: the ConvKernel is compute-bound and
+reads its weights into the on-chip cache in bursts, the MatmulKernel's
+GEMV path streams one operand (A is cached, C is small) and its tiled path
+is DSP-bound, and the pooling kernel reads one stream and writes one at
+the window-reduced rate — none of them keeps three full-rate sequential
+streams open at once.  The DRAM-bank effect belongs to the **binary
+VectorOP** (two reads + one write at 2.8 GB/s each), and in a model that
+is the residual / bias / gating adds and muls.
+
+**Scope of a scheduler change, then.**  Give the a, b, c of every binary
+VectorOP call start addresses that differ in bits 14–15: the pool
+allocator's slot bases get a 64 KB alignment plus a bank phase
+(`(slot index mod 4) × 16 KB`), so tensors in different slots of a
+VectorOP call land in different banks (weights broadcast with `b_inc` 0
+replay on chip and do not matter; a constant elementwise operand lives in
+the weight pool, which gets its own phase).  Cost: ≤ 64 KB of padding per
+slot; bit-exact by construction; checked by the generated address table.
+Worth ~20 % of the binary VectorOP's time: ~1–1.5 % end to end on BERT,
+ResNet-18, SmolVLM and Piper (whose binary VectorOP share is 4–8 %), more
+on graphs with many element-wise ops.
+
+### 11.1 Implementation (2026-10-10)
+
+`src/bank_phase.py` (`vectorop_groups`, `place_slots`), wired into the pool
+layouts of `src/codegen/_core.py` (`_bank_groups`, `_place`,
+`_compute_pool_layout` / `_compute_intermediate_layout(base_elems, fixed)`)
+and `src/codegen/multi.py` (`pool_layout`: the weights against every
+entry's groups, each entry's intermediates against its own and the weights');
+`CodeGenerator(bank_phase=True)`, `MultiEntryGenerator(bank_phase=True)`,
+`--bank-phase {on,off}`; `INFERENCE_BUF_POOL_SIZE_BYTES` covers the laid-out
+pool.  Streams shorter than 16 KB are left alone (nothing to gain, padding
+to pay — and the tiny test graphs keep their packing).  Documented in
+`doc/scheduler/INFERENCE_SCHEDULER.md` §DRAM bank phases, the user guide's
+option table and `SCHEDULER_DAG.md` §6; `test/test_bank_phase.py` (11 tests:
+`place_slots`, the groups and their distinct phases on a synthetic graph,
+`bank_phase=False` = the old packing, the growth bound, a multi-entry
+project, the host emulation bit-exact).  ResNet-18: 25 VectorOP groups, all
+at distinct phases, +4 KB of pool; MobileNet v2: 43 groups, +0 KB — the
+coloured slots mostly differed in phase already, the placement only fixes
+the ones that did not.  The scheduler suite: 1754 tests.
+
+Board, `8599aa7a5f12`, the demos regenerated with the phases (QoS 0, the
+AFIFM issuing at its default), against the `kv260-8599aa7a5f12` baseline:
+
+| demo | baseline | with bank phases |
+|---|---|---|
+| MNIST convnet / LeNet | 0.1105 / 1.2504 ms | 0.1112 / 1.2491 ms (+0.6 / −0.1 %); 98.92 % / 97.35 % |
+| MobileNet v1 / v2, ResNet-18 | 21.96 / 20.35 / 20.18 ms | 21.98 / 20.36 / 20.21 ms (+0.1 / +0.0 / +0.1 %); top-1 unchanged |
+| BERT (p50) | 418.0 ms | **414.9 ms (−0.75 %)**; EM / F1 88.0 / 90.3, bit-exact |
+| LightStereo-S 640 × 480 | 599.0 ms per pair | 598.1 ms (−0.15 %); disparity bit-exact with the simulation |
+
+**Reading.**  BERT takes the gain its binary VectorOP share allows (its
+residual and bias adds: −0.75 % of the inference); ResNet-18, the
+MobileNets and the stereo model are flat because their pools already had
+the operands of most VectorOP calls at different phases (ResNet-18's pool
+grew 4 KB: the placement changed almost nothing) — the benchmark's natural
+layout was the worst case because CMA hands separate buffers out 1 MB
+apart, the scheduler's packed slots are not.  All bit-exact.  The feature
+stays on: it costs nothing, fixes the layouts that do collide (BERT), and
+makes the gain independent of how the slots happen to fall.

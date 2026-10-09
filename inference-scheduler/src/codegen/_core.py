@@ -59,11 +59,14 @@ class _CoreMixin:
     def __init__(self, graph: OnnxGraph, model_path: str,
                  embed_large_weights: bool = False,
                  embed_large_expected: bool = False,
-                 dtype: Optional[DataType] = None) -> None:
+                 dtype: Optional[DataType] = None,
+                 bank_phase: bool = True) -> None:
         self._graph                = graph
         self._model_path           = model_path
         self._embed_large_weights  = embed_large_weights
         self._embed_large_expected = embed_large_expected
+        # DRAM bank phases for the VectorOP operand streams (src/bank_phase.py)
+        self._bank_phase           = bank_phase
         # Data type descriptor — controls encoding, quantization, and C type
         # declarations.  Defaults to ap_fixed<16,8> (the standard KV260 type).
         # Pass dtype=FLOAT32 (or any DataType subclass) for other types.
@@ -567,6 +570,42 @@ class _CoreMixin:
             intervals[name] = (start_ei, end_ei)
         return intervals
 
+    @property
+    def _bank_groups(self):
+        """The VectorOP operand streams as (pool buffer, byte shift) groups
+        (bank_phase.vectorop_groups); [] when bank phases are off."""
+        if not self._bank_phase:
+            return []
+        from ..bank_phase import vectorop_groups
+        bpe = self._dtype.bytes_per_elem
+        views = self._view_aliases
+        by_c = {t.c_name: t.onnx_name
+                for t in self._graph.weight_tensors + self._graph.intermediate_tensors}
+        pool = ({t.onnx_name for t in self._graph.weight_tensors}
+                | {t.onnx_name for t in self._dma_states}
+                | {t.onnx_name for t in self._graph.intermediate_tensors
+                   if t.onnx_name not in self._reshape_aliases and t.onnx_name not in views})
+
+        def root_of(name):
+            if name in views:
+                root_c, off, _n = views[name]
+                return by_c.get(root_c, root_c), off * bpe
+            return self._reshape_root(name), 0
+        return vectorop_groups(self._graph.nodes, root_of, pool.__contains__, bpe)
+
+    def _place(self, slots, base_elems=0, fixed=None):
+        """Start offsets of slots [(alloc_elems, [names])] laid end to end,
+        with the bank phases of _bank_groups kept apart (place_slots)."""
+        from ..bank_phase import place_slots
+        groups = self._bank_groups
+        if not groups:
+            starts, off = [], 0
+            for alloc, _names in slots:
+                starts.append(off)
+                off += alloc
+            return starts
+        return place_slots(slots, groups, self._dtype.bytes_per_elem, base_elems, fixed)
+
     def _compute_pool_layout(self):
         """
         Compute per-buffer offsets for the single contiguous pool allocation.
@@ -586,29 +625,28 @@ class _CoreMixin:
         def align_up(n):
             return (n + align_to - 1) & ~(align_to - 1)
 
-        layout  = []
-        offset  = 0
+        # Weights: live for the entire call — sequential, never shared; then
+        # the DMA states (a KV cache the FPGA prefill attention reads):
+        # persistent across calls, sequential, never shared.  Each is its own
+        # slot; a weight that a VectorOP streams gets a bank phase of its own.
+        fixed_t = list(self._graph.weight_tensors) + list(self._dma_states)
+        slots   = [(align_up(self._alloc_sizes[t.onnx_name]), [t.onnx_name]) for t in fixed_t]
+        starts  = self._place(slots)
+        layout  = [(t.onnx_name, s, self._alloc_sizes[t.onnx_name])
+                   for t, s in zip(fixed_t, starts, strict=True)]
+        offset  = (starts[-1] + slots[-1][0]) if slots else 0
+        fixed   = {t.onnx_name: s * bpe for t, s in zip(fixed_t, starts, strict=True)}
 
-        # Weights: live for the entire call — always sequential, never shared.
-        for t in self._graph.weight_tensors:
-            alloc = self._alloc_sizes[t.onnx_name]
-            layout.append((t.onnx_name, offset, alloc))
-            offset += align_up(alloc)
-        # DMA states (a KV cache the FPGA prefill attention reads): persistent
-        # across calls, sequential, never shared.
-        for t in self._dma_states:
-            alloc = self._alloc_sizes[t.onnx_name]
-            layout.append((t.onnx_name, offset, alloc))
-            offset += align_up(alloc)
-
-        inter, total = self._compute_intermediate_layout()
+        inter, total = self._compute_intermediate_layout(base_elems=offset, fixed=fixed)
         layout.extend((name, offset + off, alloc) for name, off, alloc in inter)
         return layout, offset + total
 
-    def _compute_intermediate_layout(self):
+    def _compute_intermediate_layout(self, base_elems: int = 0, fixed=None):
         """The intermediates' part of the pool, relative to its start:
         ([(onnx_name, offset, alloc)], total_elems) — slots from the
-        event-stream liveness colouring (see _compute_pool_layout)."""
+        event-stream liveness colouring (see _compute_pool_layout), at bank
+        phases apart from each other's and from the weights' (``fixed``:
+        {name: absolute byte offset}; ``base_elems``: the region's start)."""
         bpe       = self._dtype.bytes_per_elem
         align_to  = 64 // bpe   # elements per 64-byte boundary
         def align_up(n):
@@ -616,7 +654,6 @@ class _CoreMixin:
 
         reshape_aliases = self._reshape_aliases
         layout  = []
-        offset  = 0
 
         # Intermediates: greedy interval-graph colouring.
         # Two tensors may share a slot only when their live intervals are disjoint.
@@ -654,19 +691,16 @@ class _CoreMixin:
             if not placed:
                 slots.append([end, align_up(a), [name]])
 
-        for _slot_end, slot_alloc, names in slots:
-            for name in names:
-                layout.append((name, offset, alloc_sizes[name]))
-            offset += slot_alloc
-
         # Tensors with no interval data (should not occur in a well-formed
-        # graph but handled defensively) get their own sequential slot.
-        for name in no_intervals:
-            alloc = alloc_sizes[name]
-            layout.append((name, offset, alloc))
-            offset += align_up(alloc)
-
-        return layout, offset
+        # graph but handled defensively) get their own slot.
+        placed = [(slot_alloc, names) for _slot_end, slot_alloc, names in slots]
+        placed += [(align_up(alloc_sizes[name]), [name]) for name in no_intervals]
+        starts = self._place(placed, base_elems, fixed)
+        for (_slot_alloc, names), start in zip(placed, starts, strict=True):
+            for name in names:
+                layout.append((name, start, alloc_sizes[name]))
+        total = (starts[-1] + placed[-1][0]) if placed else 0
+        return layout, total
 
     # ------------------------------------------------------------------
     # Host-memory tensors (src/numeric.py): one malloc'd arena, slots
@@ -735,6 +769,10 @@ class _CoreMixin:
             _align64(lay.alloc * bpe)
             for name, lay in self._layouts.items() if name not in host
         )
+        # the bank phases (src/bank_phase.py) pad slots: the laid-out pool
+        # can exceed the no-reuse sum
+        _layout, pool_elems = self._compute_pool_layout()
+        total = max(total, pool_elems * bpe)
         page = 4096
         return (total + page - 1) & ~(page - 1)
 

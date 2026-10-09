@@ -1,5 +1,6 @@
 /* bench_pool.c — PoolingKernel latency / GB/s benchmark
  *
+ * layout "OFF_X,OFF_Y": x and y at byte offsets inside one buffer (PS_PORTS_PLAN §11)
  * args: instance label batch channels in_h in_w pool_h pool_w sh sw
  *             pt pl dh dw pool_type lp_order count_include_pad iters [warmup]
  */
@@ -46,7 +47,7 @@ int main(int argc, char **argv)
     if (argc < 19) {
         fprintf(stderr,
             "usage: %s instance label batch channels in_h in_w pool_h pool_w "
-            "sh sw pt pl dh dw pool_type lp_order cip iters [warmup]\n",
+            "sh sw pt pl dh dw pool_type lp_order cip iters [warmup [layout]]\n",
             argv[0]);
         return 1;
     }
@@ -69,6 +70,7 @@ int main(int argc, char **argv)
     unsigned cip   = (unsigned)strtoul(argv[17], NULL, 0);
     unsigned iters  = (unsigned)strtoul(argv[18], NULL, 0);
     unsigned warmup = (argc > 19) ? (unsigned)strtoul(argv[19], NULL, 0) : 10u;
+    const char *layout = (argc > 20) ? argv[20] : NULL;
 
     unsigned oh = (ih + 2*pt - dh*(ph-1) - 1) / sh + 1;
     unsigned ow = (iw + 2*pl - dw*(pw-1) - 1) / sw + 1;
@@ -83,11 +85,12 @@ int main(int argc, char **argv)
     unsigned x_n = batch * ch * ih * iw;
     unsigned y_n = batch * ch * oh * ow;
 
-    inference_buf_t *bx = inference_buf_alloc(x_n);
-    inference_buf_t *by = inference_buf_alloc(y_n);
-    if (!bx || !by) {
+    inference_buf_t *bufs[2], *pool;
+    unsigned counts[2] = { x_n, y_n };
+    if (inference_buf_alloc_layout(layout, 2, counts, bufs, &pool) != 0) {
         fprintf(stderr, "bench_pool: alloc failed\n"); return 1;
     }
+    inference_buf_t *bx = bufs[0], *by = bufs[1];
     memset(inference_buf_ptr(bx), 1, (size_t)x_n * INFERENCE_BYTES_PER_ELEM);
     inference_buf_sync_to_device(bx);
 
@@ -120,11 +123,11 @@ int main(int argc, char **argv)
            "\"batch\":%u,\"channels\":%u,\"in_h\":%u,\"in_w\":%u,"
            "\"out_h\":%u,\"out_w\":%u,"
            "\"pool_h\":%u,\"pool_w\":%u,\"pool_type\":%u,\"iters\":%u,"
-           "\"lat_ms\":%.4f,\"gbs\":%.3f}\n",
+           "\"lat_ms\":%.4f,\"gbs\":%.3f,\"phys\":%s}\n",
            label, batch, ch, ih, iw, oh, ow,
-           ph, pw, ptype, iters, lat, gbs);
+           ph, pw, ptype, iters, lat, gbs, inference_buf_phys_json(2, bufs));
 
-    inference_buf_free(bx); inference_buf_free(by);
+    inference_buf_free_layout(2, bufs, pool);
     XPoolingkernel_Release(&k);
     inference_buf_pool_deinit();
     return 0;

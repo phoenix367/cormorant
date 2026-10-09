@@ -173,6 +173,19 @@ def parse_args(argv=None):
         ),
     )
     p.add_argument(
+        "--bank-phase",
+        dest="bank_phase",
+        choices=("on", "off"),
+        default="on",
+        help=(
+            "DRAM bank phases for the VectorOP operand streams in the DMA pool "
+            "layout: a binary op's a, b and c start in different DDR banks "
+            "(bits 14-15 of the address), ~20 %% faster on the KV260 "
+            "(doc/plans/PS_PORTS_PLAN.md section 11); off packs the slots as before "
+            "(default: on)"
+        ),
+    )
+    p.add_argument(
         "--dw-slice",
         dest="dw_slice",
         choices=("auto", "off"),
@@ -364,7 +377,8 @@ def main_multi(args) -> int:
     out_dir = os.path.abspath(args.out_dir or "multi_inference")
     try:
         gen = MultiEntryGenerator(entries, os.path.basename(out_dir.rstrip("/")),
-                                  embed_large_weights=args.embed_large_weights)
+                                  embed_large_weights=args.embed_large_weights,
+                                  bank_phase=args.bank_phase == "on")
         summary = gen.write_project(out_dir)
     except SchedulerError as e:
         print(f"error: code generation failed — {e}", file=sys.stderr)
@@ -467,7 +481,8 @@ def main(argv=None):
     try:
         gen        = CodeGenerator(graph=graph, model_path=args.model,
                                    embed_large_weights=args.embed_large_weights,
-                                   embed_large_expected=args.embed_large_expected)
+                                   embed_large_expected=args.embed_large_expected,
+                                   bank_phase=args.bank_phase == "on")
         header     = gen.generate_header()
         source     = gen.generate_source()
         buf_impl   = gen.generate_buf_impl()

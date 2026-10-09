@@ -279,6 +279,7 @@ python inference_scheduler.py --entry NAME=MODEL.onnx [--entry ...] [options]
 | `--no-s2d-stem` | off | Do not rewrite stride-2 `Conv` layers with ≤ 4 input channels as host `SpaceToDepth(2)` + stride-1 `Conv` ([§Space-to-depth stem](../../doc/scheduler/INFERENCE_SCHEDULER.md#space-to-depth-stem)). |
 | `--fc-conv {auto,always,off}` | `auto` | Run fully-connected `Conv` layers (kernel = the whole unpadded input, one output pixel, e.g. LeNet's 7×7 conv on a 7×7 map) as Flatten + `MatMul` + Reshape + bias `Add` on MatmulKernel (GEMV for one image): `auto` where the cost model estimates it ≥ 20 % faster, `always`, `off` ([§Fully-connected Convs](../../doc/scheduler/INFERENCE_SCHEDULER.md#fully-connected-convs)). Bit-identical unless the sum before the bias saturates. |
 | `--dw-slice {auto,off}` | `auto` | Issue a batch-1 depthwise `Conv` as several ConvKernel calls of 16, 32 or 64 channels (`run_conv_dw_at()`): a call of fewer channels gets taller output-row chunks, so fewer halo rows are read again — `auto` where the cost model estimates it ≥ 5 % faster, `off` keeps one call ([§Depthwise channel slices](../../doc/scheduler/INFERENCE_SCHEDULER.md#depthwise-channel-slices)). Bit-identical.  LightStereo-S: 659 → 599 ms per pair on the board. |
+| `--bank-phase {on,off}` | `on` | Lay the DMA pool out so that a binary VectorOP's a, b and c start in different DRAM banks (byte address bits 14–15 on the KV260): the kernel's three streams then do not collide in one bank — ~20 % faster memory-bound VectorOP calls on the board ([§DRAM bank phases](../../doc/scheduler/INFERENCE_SCHEDULER.md#dram-bank-phases)); `off` packs the slots as before.  Bit-identical; the pool grows by at most 48 KB per constrained slot (ResNet-18 +4 KB). |
 | `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/scheduler/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/scheduler/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
 | `--matmul-on-conv {auto,always,off}` | `auto` | Run MatMuls on ConvKernel with swapped operand roles: `auto` where the cost model estimates it faster, `always` for every eligible MatMul, `off` for none ([§MatMul on ConvKernel](../../doc/scheduler/INFERENCE_SCHEDULER.md#matmul-on-convkernel)). Bit-identical either way. |
 | `--no-matmul-on-conv` | off | Same as `--matmul-on-conv off`. |
@@ -819,7 +820,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1743 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1754 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

@@ -203,7 +203,7 @@ SystemVerilog kernels, with Verilator 5.x).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1743 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1754 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -283,7 +283,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1743<!-- /fact --> tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1754<!-- /fact --> tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the four RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |

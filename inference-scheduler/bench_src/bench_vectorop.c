@@ -1,6 +1,11 @@
 /* bench_vectorop.c — VectorOPKernel latency / GB/s benchmark
  *
- * args: instance label op size outer a_inc b_inc iters [warmup]
+ * args: instance label op size outer a_inc b_inc iters [warmup [layout]]
+ *
+ * layout "OFF_A,OFF_B,OFF_C": byte offsets of a, b, c inside ONE buffer
+ * (default: three buffers wherever the allocator puts them) — DDR bank / page
+ * experiments (PS_PORTS_PLAN §11); the output JSON carries the physical
+ * addresses either way.
  * output (stdout): one JSON line
  *
  * The softmax ops (10 row mode, 11 column mode; doc/plans/SOFTMAX_PLAN.md) run
@@ -59,6 +64,7 @@ int main(int argc, char **argv)
     unsigned bi     = (unsigned)strtoul(argv[7], NULL, 0);
     unsigned iters  = (unsigned)strtoul(argv[8], NULL, 0);
     unsigned warmup = (argc > 9) ? (unsigned)strtoul(argv[9], NULL, 0) : 10u;
+    const char *layout = (argc > 10) ? argv[10] : NULL;
 
     if (inference_buf_pool_init() != 0) return 1;
 
@@ -89,17 +95,17 @@ int main(int argc, char **argv)
     }
     a_n += 64u; c_n += 64u;                 /* whole 16-byte words past the end */
 
-    inference_buf_t *ba = inference_buf_alloc(a_n);
-    inference_buf_t *bb = inference_buf_alloc(b_n);
-    inference_buf_t *bc = inference_buf_alloc(c_n);
-    if (!ba || !bb || !bc) {
-        fprintf(stderr, "bench_vectorop: alloc failed\n"); return 1;
+    inference_buf_t *bufs[3], *pool;
+    unsigned counts[3] = { a_n, b_n, c_n };
+    if (inference_buf_alloc_layout(layout, 3, counts, bufs, &pool) != 0) {
+        fprintf(stderr, "bench_vectorop: alloc failed (layout: OFF_A,OFF_B,OFF_C bytes, multiples of 64)\n");
+        return 1;
     }
+    inference_buf_t *ba = bufs[0], *bb = bufs[1], *bc = bufs[2];
     memset(inference_buf_ptr(ba), 1, (size_t)a_n * INFERENCE_BYTES_PER_ELEM);
     memset(inference_buf_ptr(bb), 1, (size_t)b_n * INFERENCE_BYTES_PER_ELEM);
     inference_buf_sync_to_device(ba);
     inference_buf_sync_to_device(bb);
-
     uint64_t ap = inference_buf_phys(ba);
     uint64_t bp = inference_buf_phys(bb);
     uint64_t cp = inference_buf_phys(bc);
@@ -130,10 +136,10 @@ int main(int argc, char **argv)
     printf("{\"kernel\":\"VectorOPKernel\",\"label\":\"%s\","
            "\"op\":%u,\"size\":%u,\"outer\":%u,"
            "\"a_inc\":%u,\"b_inc\":%u,\"iters\":%u,"
-           "\"lat_ms\":%.4f,\"gbs\":%.3f}\n",
-           label, op, sz, outer, ai, bi, iters, lat, gbs);
+           "\"lat_ms\":%.4f,\"gbs\":%.3f,\"phys\":%s}\n",
+           label, op, sz, outer, ai, bi, iters, lat, gbs, inference_buf_phys_json(3, bufs));
 
-    inference_buf_free(ba); inference_buf_free(bb); inference_buf_free(bc);
+    inference_buf_free_layout(3, bufs, pool);
     XVectoropkernel_Release(&k);
     inference_buf_pool_deinit();
     return 0;

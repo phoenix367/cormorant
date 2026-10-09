@@ -159,7 +159,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1743 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1754 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -392,6 +392,43 @@ is `INFERENCE_ALIGN_UP(CHUNK)` (a multiple of 8 elements), and
 `inference_buf_alloc()` rounds allocations up to 64 bytes, so the kernel's
 whole-word reads and its whole last-word write per run stay inside the
 buffer / stride gap (`test/test_act_fusion.py::TestAlignmentContract`).
+
+### DRAM bank phases
+
+`src/bank_phase.py`, `CodeGenerator(bank_phase=True)`, `--bank-phase {on,off}`
+(default on) — `doc/plans/PS_PORTS_PLAN.md` §11.
+
+The KV260's DDR controller maps byte address bits 14–15 to the DRAM bank
+(bit 6 the bank group, 7–13 the column of an 8 KB row, 16+ the row): a
+sequential stream returns to the same bank every 64 KB, and two streams whose
+start addresses differ by a multiple of 64 KB are in the same bank with
+different rows at every moment — a row miss on every switch between them.  A
+binary VectorOP keeps three such streams open (a, b, c) and loses ~20 % to it
+on the board (ADD-256K 185 → 146 µs, MUL-64K 51 → 40 µs when the three start
+in different banks); the ConvKernel, MatmulKernel and PoolingKernel streams do
+not care (measured ±1 %).
+
+The pool allocator therefore keeps the *bank phase* `(byte offset >> 14) & 3`
+of a VectorOP call's streams apart.  `vectorop_groups` lists, per
+`ScheduledNode`, the pool buffers it streams at full rate — the output, the
+first input, and the second input unless it is a broadcast replayed on chip
+(`b_inc` 0) — each resolved through Reshape aliases and Slice views to the
+owning buffer plus a byte shift, and only when the stream is at least 16 KB
+(`BANK_MIN_STREAM`); graph inputs / outputs are the caller's buffers and are
+left out.  `place_slots` then lays the slots end to end as before (the weights
+and DMA states first, each its own slot; then the liveness-coloured
+intermediate slots, §Pool-slot coloring of `inference-scheduler/doc/SCHEDULER_DAG.md`),
+but a slot with already-placed partners starts at the first 16 KB boundary
+whose phase — for every (slot, shift) pair of its groups — collides with none
+of them, choosing among the four phases by fewest conflicts, then least
+padding.  Unconstrained slots keep their 64-byte packing; a constrained one
+costs at most 48 KB.  In a multi-entry project the weights are placed against
+every entry's groups and each entry's intermediates against its own and the
+weights' phases.  `INFERENCE_BUF_POOL_SIZE_BYTES` covers the laid-out pool.
+Bit-exact by construction — only addresses move (`test/test_bank_phase.py`:
+the phases, the old packing with `bank_phase=False`, the growth bound, a
+multi-entry project, the host emulation).  ResNet-18: 25 groups, all distinct,
++4 KB of pool; MobileNet v2: 43 groups, +0 KB.
 
 ### Key data flow
 

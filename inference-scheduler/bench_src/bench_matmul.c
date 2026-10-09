@@ -1,6 +1,7 @@
 /* bench_matmul.c — MatmulKernel latency / GOps/s benchmark
  *
- * args: instance label n k m batch a_batch_stride b_batch_stride b_packed gemv_kw iters
+ * args: instance label n k m batch a_batch_stride b_batch_stride b_packed gemv_kw iters [warmup [layout]]
+ * layout "OFF_A,OFF_B,OFF_C": a, b, c at byte offsets inside one buffer (PS_PORTS_PLAN §11)
  *       [warmup]
  *
  * b_packed = 1 benchmarks MatmulKernel's tile-major packed B layout
@@ -44,7 +45,7 @@ int main(int argc, char **argv)
     if (argc < 12) {
         fprintf(stderr,
             "usage: %s instance label n k m batch a_stride b_stride b_packed gemv_kw iters"
-            " [warmup]\n", argv[0]);
+            " [warmup [layout]]\n", argv[0]);
         return 1;
     }
     const char *inst    = argv[1];
@@ -59,6 +60,7 @@ int main(int argc, char **argv)
     unsigned gemv_kw  = (unsigned)strtoul(argv[10], NULL, 0);
     unsigned iters  = (unsigned)strtoul(argv[11], NULL, 0);
     unsigned warmup = (argc > 12) ? (unsigned)strtoul(argv[12], NULL, 0) : 10u;
+    const char *layout = (argc > 13) ? argv[13] : NULL;
     if (gemv_kw) b_packed = 0u;
 
     if (inference_buf_pool_init() != 0) return 1;
@@ -78,12 +80,12 @@ int main(int argc, char **argv)
     unsigned b_n = (bs > 0u) ? batch * kd * m_pk : kd * m_pk;
     unsigned c_n = batch * n * m;
 
-    inference_buf_t *ba = inference_buf_alloc(a_n);
-    inference_buf_t *bb = inference_buf_alloc(b_n);
-    inference_buf_t *bc = inference_buf_alloc(c_n);
-    if (!ba || !bb || !bc) {
+    inference_buf_t *bufs[3], *pool;
+    unsigned counts[3] = { a_n, b_n, c_n };
+    if (inference_buf_alloc_layout(layout, 3, counts, bufs, &pool) != 0) {
         fprintf(stderr, "bench_matmul: alloc failed\n"); return 1;
     }
+    inference_buf_t *ba = bufs[0], *bb = bufs[1], *bc = bufs[2];
     memset(inference_buf_ptr(ba), 1, (size_t)a_n * INFERENCE_BYTES_PER_ELEM);
     memset(inference_buf_ptr(bb), 1, (size_t)b_n * INFERENCE_BYTES_PER_ELEM);
     inference_buf_sync_to_device(ba);
@@ -117,10 +119,11 @@ int main(int argc, char **argv)
     printf("{\"kernel\":\"MatmulKernel\",\"label\":\"%s\","
            "\"n\":%u,\"k\":%u,\"m\":%u,\"batch\":%u,"
            "\"a_str\":%u,\"b_str\":%u,\"b_packed\":%u,\"gemv_kw\":%u,\"iters\":%u,"
-           "\"lat_ms\":%.4f,\"gops\":%.4f}\n",
-           label, n, kd, m, batch, as, bs, b_packed, gemv_kw, iters, lat, gops);
+           "\"lat_ms\":%.4f,\"gops\":%.4f,\"phys\":%s}\n",
+           label, n, kd, m, batch, as, bs, b_packed, gemv_kw, iters, lat, gops,
+           inference_buf_phys_json(3, bufs));
 
-    inference_buf_free(ba); inference_buf_free(bb); inference_buf_free(bc);
+    inference_buf_free_layout(3, bufs, pool);
     XMatmulkernel_Release(&k);
     inference_buf_pool_deinit();
     return 0;

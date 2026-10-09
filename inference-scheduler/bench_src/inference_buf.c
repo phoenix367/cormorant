@@ -2,6 +2,7 @@
 #include "inference.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,6 +22,55 @@ void inference_buf_init_view(inference_buf_t *view, inference_buf_t *base,
     view->bo          = base->bo;
     view->bo_offset   = base->bo_offset + byte_off;
 #endif
+}
+
+int inference_buf_alloc_layout(const char *layout, unsigned n, const unsigned *counts,
+                               inference_buf_t *bufs[], inference_buf_t **pool)
+{
+    unsigned i;
+    *pool = NULL;
+    if (!layout) {
+        for (i = 0; i < n; i++) if (!(bufs[i] = inference_buf_alloc(counts[i]))) return -1;
+        return 0;
+    }
+    unsigned long long off[16];
+    const char *s = layout;
+    size_t need = 0, e = INFERENCE_BYTES_PER_ELEM;
+    for (i = 0; i < n && i < 16; i++) {
+        char *end;
+        off[i] = strtoull(s, &end, 0);
+        if (end == s || (off[i] & 63ull) || (*end != ',' && *end != '\0')) return -1;
+        if (off[i] + (size_t)counts[i] * e > need) need = off[i] + (size_t)counts[i] * e;
+        s = (*end == ',') ? end + 1 : end;
+    }
+    if (i < n) return -1;
+    *pool = inference_buf_alloc((unsigned)((need + e - 1) / e));
+    if (!*pool) return -1;
+    for (i = 0; i < n; i++) {
+        bufs[i] = (inference_buf_t *)malloc(sizeof(inference_buf_t));
+        if (!bufs[i]) return -1;
+        inference_buf_init_view(bufs[i], *pool, (unsigned)(off[i] / e), counts[i]);
+    }
+    return 0;
+}
+
+void inference_buf_free_layout(unsigned n, inference_buf_t *bufs[], inference_buf_t *pool)
+{
+    unsigned i;
+    if (pool) { for (i = 0; i < n; i++) free(bufs[i]); inference_buf_free(pool); }
+    else      { for (i = 0; i < n; i++) inference_buf_free(bufs[i]); }
+}
+
+const char *inference_buf_phys_json(unsigned n, inference_buf_t *const bufs[])
+{
+    static char out[16 * 24 + 4];
+    size_t len = 0; unsigned i;
+    out[len++] = '[';
+    for (i = 0; i < n && i < 16; i++)
+        len += (size_t)snprintf(out + len, sizeof(out) - len, "%s\"0x%llx\"", i ? "," : "",
+                                (unsigned long long)inference_buf_phys(bufs[i]));
+    out[len++] = ']'; out[len] = '\0';
+    return out;
 }
 
 /* Data_t is ap_fixed<16,8> bits: value = (int16_t)bits / 256.  Rounds half

@@ -163,7 +163,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1743 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1754 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -183,6 +183,7 @@ Key source files:
 - **`inference-scheduler/src/fusion.py`** — Constant folding, Split → Slice lowering, LayerNorm / GELU pattern fusion, VectorOP constant-broadcast normalisation
 - **`inference-scheduler/src/tensor.py`** — Weight encoding (float → ap_fixed<16,8>), buffer declarations
 - **`inference-scheduler/src/schedule.py`** — `Dag`: data-flow DAG (tensor edges plus RAW / WAR / WAW edges of persistent states; predecessors, topological order, independent pairs)
+- **`inference-scheduler/src/bank_phase.py`** — DRAM bank phases of the DMA pool slots: a binary VectorOP's a, b, c start in different DDR banks (byte address bits 14–15; ~20 % faster memory-bound VectorOP calls on the KV260, `--bank-phase`, `doc/plans/PS_PORTS_PLAN.md` §11)
 - **`inference-scheduler/src/numeric.py`** — `axi.numeric` metadata: per-tensor / per-channel power-of-two exponents (constant MatMul weights at the rank-1 exponent `f_w = f_out + 8 − f_in`), host-memory tensors (f32 / i32 / i16), persistent states
 - **`inference-scheduler/src/llama.py`** / **`src/llm_nodes.py`** — Llama frontend and the `axi.llm` host ops (numpy reference + C helpers)
 - **`inference-scheduler/src/vit.py`** / **`src/vit_nodes.py`** — vision-encoder frontend (`VitFrontend`, the `vision` entry) and its `Vit*` host ops

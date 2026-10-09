@@ -30,7 +30,7 @@ import sys
 import tempfile
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -95,6 +95,7 @@ class BenchCase:
     label:  str        # human-readable tag shown in the report
     args:   List[str]  # positional args after instance_name and label
     warmup: int = 10
+    extra:  List[str] = field(default_factory=list)   # after warmup (VectorOP: the buffer layout)
 
 
 @dataclass
@@ -163,7 +164,12 @@ def _case_from_dict(kernel: str, d: dict, default_warmup: int = 10) -> "BenchCas
     # MATMUL_OPTIMISATION §3b / §8b).
     args = [str(d.get(f, 0)) for f in fields]
     warmup = int(d.get("warmup", default_warmup))
-    return BenchCase(kernel=kernel, label=d["label"], args=args, warmup=warmup)
+    # "layout": "OFF0,OFF1,..." — byte offsets of the case's buffers (VectorOP
+    # a, b, c; MatMul A, B, C; Conv x, w, bias, y; Pool x, y) inside one
+    # allocation, for DDR bank / page experiments (PS_PORTS_PLAN §11); the
+    # benchmark reports the physical addresses either way.
+    extra = [str(d["layout"])] if d.get("layout") else []
+    return BenchCase(kernel=kernel, label=d["label"], args=args, warmup=warmup, extra=extra)
 
 
 def _load_cases(cfg: dict, cli_kernels) -> List["BenchCase"]:
@@ -340,7 +346,8 @@ def run_bench_case(session: RemoteSession, build_dir: str,
     warmup_arg = str(warmup_override) if warmup_override is not None else str(case.warmup)
 
     prefix = "sudo -n " if cfg["run"]["use_sudo"] else ""
-    cmd = " ".join(shlex.quote(a) for a in [binary, instance, case.label, *args, warmup_arg])
+    cmd = " ".join(shlex.quote(a) for a in [binary, instance, case.label, *args, warmup_arg,
+                                            *case.extra])
     cmd = prefix + cmd
 
     try:
@@ -526,9 +533,16 @@ def write_json(path: str, results: List["BenchResult"]) -> None:
     out = []
     for r in results:
         fields = dict(zip(_CASE_FIELDS[r.case.kernel], (int(a) for a in r.case.args), strict=True))
-        out.append({"kernel": r.case.kernel, "label": r.case.label, "fields": fields,
-                    "warmup": r.case.warmup, "ok": r.ok, "lat_ms": r.lat_ms if r.ok else None,
-                    r.metric_key or "metric": r.metric if r.ok else None})
+        entry = {"kernel": r.case.kernel, "label": r.case.label, "fields": fields,
+                 "warmup": r.case.warmup, "ok": r.ok, "lat_ms": r.lat_ms if r.ok else None,
+                 r.metric_key or "metric": r.metric if r.ok else None}
+        if r.case.extra:
+            entry["layout"] = r.case.extra[0]
+        try:
+            entry["phys"] = json.loads(r.raw).get("phys")
+        except (ValueError, AttributeError):
+            pass
+        out.append(entry)
     Path(path).write_text(json.dumps(out, indent=1) + "\n")
 
 

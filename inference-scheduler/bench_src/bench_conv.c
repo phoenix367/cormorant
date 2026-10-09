@@ -1,5 +1,6 @@
 /* bench_conv.c — ConvKernel latency / GOps/s benchmark
  *
+ * layout "OFF_X,OFF_W,OFF_BIAS,OFF_Y": the buffers at byte offsets inside one buffer (PS_PORTS_PLAN §11)
  * args: instance label batch in_ch in_h in_w out_ch kh kw sh sw
  *             dh dw pt pl has_bias is_dw iters [warmup]
  */
@@ -48,7 +49,7 @@ int main(int argc, char **argv)
     if (argc < 19) {
         fprintf(stderr,
             "usage: %s instance label batch in_ch in_h in_w out_ch kh kw "
-            "sh sw dh dw pt pl has_bias is_dw iters [warmup]\n", argv[0]);
+            "sh sw dh dw pt pl has_bias is_dw iters [warmup [layout]]\n", argv[0]);
         return 1;
     }
     const char *inst  = argv[1];
@@ -70,6 +71,7 @@ int main(int argc, char **argv)
     unsigned idw   = (unsigned)strtoul(argv[17], NULL, 0);
     unsigned iters  = (unsigned)strtoul(argv[18], NULL, 0);
     unsigned warmup = (argc > 19) ? (unsigned)strtoul(argv[19], NULL, 0) : 10u;
+    const char *layout = (argc > 20) ? argv[20] : NULL;
 
     unsigned oh = (ih + 2*pt - dh*(kh-1) - 1) / sh + 1;
     unsigned ow = (iw + 2*pl - dw*(kw-1) - 1) / sw + 1;
@@ -86,13 +88,12 @@ int main(int argc, char **argv)
     unsigned bias_n = hb ? oc : 1u;
     unsigned y_n    = batch * oc * oh * ow;
 
-    inference_buf_t *bx = inference_buf_alloc(x_n);
-    inference_buf_t *bw = inference_buf_alloc(w_n);
-    inference_buf_t *bb = inference_buf_alloc(bias_n);
-    inference_buf_t *by = inference_buf_alloc(y_n);
-    if (!bx || !bw || !bb || !by) {
+    inference_buf_t *bufs[4], *pool;
+    unsigned counts[4] = { x_n, w_n, bias_n, y_n };
+    if (inference_buf_alloc_layout(layout, 4, counts, bufs, &pool) != 0) {
         fprintf(stderr, "bench_conv: alloc failed\n"); return 1;
     }
+    inference_buf_t *bx = bufs[0], *bw = bufs[1], *bb = bufs[2], *by = bufs[3];
     memset(inference_buf_ptr(bx), 1, (size_t)x_n    * INFERENCE_BYTES_PER_ELEM);
     memset(inference_buf_ptr(bw), 1, (size_t)w_n    * INFERENCE_BYTES_PER_ELEM);
     memset(inference_buf_ptr(bb), 0, (size_t)bias_n * INFERENCE_BYTES_PER_ELEM);
@@ -135,12 +136,11 @@ int main(int argc, char **argv)
            "\"batch\":%u,\"in_ch\":%u,\"in_h\":%u,\"in_w\":%u,"
            "\"out_ch\":%u,\"out_h\":%u,\"out_w\":%u,"
            "\"kh\":%u,\"kw\":%u,\"sh\":%u,\"sw\":%u,"
-           "\"is_dw\":%u,\"iters\":%u,\"lat_ms\":%.4f,\"gops\":%.4f}\n",
+           "\"is_dw\":%u,\"iters\":%u,\"lat_ms\":%.4f,\"gops\":%.4f,\"phys\":%s}\n",
            label, batch, ic, ih, iw, oc, oh, ow,
-           kh, kw, sh, sw, idw, iters, lat, gops);
+           kh, kw, sh, sw, idw, iters, lat, gops, inference_buf_phys_json(4, bufs));
 
-    inference_buf_free(bx); inference_buf_free(bw);
-    inference_buf_free(bb); inference_buf_free(by);
+    inference_buf_free_layout(4, bufs, pool);
     XConvkernel_Release(&k);
     inference_buf_pool_deinit();
     return 0;

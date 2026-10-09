@@ -32,6 +32,16 @@ void     inference_buf_init_view(inference_buf_t *view, inference_buf_t *base,
                                   unsigned offset_elems, unsigned count_elems);
 void     inference_buf_sync_to_device(inference_buf_t *buf);
 void     inference_buf_sync_from_device(inference_buf_t *buf);
+/* The benchmarks' buffers at chosen addresses (DDR bank / page experiments,
+ * the parent repo's doc/plans/PS_PORTS_PLAN.md §11): layout "OFF0,OFF1,..."
+ * gives the byte offset of each of the n buffers inside ONE allocation
+ * (multiples of 64); NULL gives n separate allocations.  bufs[i] are views
+ * or owners, *pool the one allocation or NULL.  0 on success. */
+int      inference_buf_alloc_layout(const char *layout, unsigned n, const unsigned *counts,
+                                    inference_buf_t *bufs[], inference_buf_t **pool);
+void     inference_buf_free_layout(unsigned n, inference_buf_t *bufs[], inference_buf_t *pool);
+/* "[\"0x..\",...]": the buffers' physical addresses as a JSON array (static buffer) */
+const char *inference_buf_phys_json(unsigned n, inference_buf_t *const bufs[]);
 void     inference_buf_fill_float(inference_buf_t *buf,
                                    const float *src, unsigned n);
 void     inference_buf_read_float(const inference_buf_t *buf,

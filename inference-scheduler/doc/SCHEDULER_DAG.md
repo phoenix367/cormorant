@@ -516,6 +516,15 @@ all entries' slot regions overlap in one pool region.
 Tensors are sorted by start event, ties broken largest-alloc first, so the
 biggest buffer claims a slot and smaller ones only reuse it.
 
+The slots are then laid end to end by `src/bank_phase.py::place_slots`
+(since 2026-10-10, `doc/scheduler/INFERENCE_SCHEDULER.md` §DRAM bank
+phases): a slot that a binary VectorOP streams together with another
+buffer starts at the first 16 KB boundary whose DRAM bank phase (byte
+address bits 14–15) differs from its partners' — at most 48 KB of padding
+per such slot, none for the others — so the kernel's a, b and c do not
+collide in one bank.  `CodeGenerator(bank_phase=False)` keeps the plain
+packing.
+
 ---
 
 ## 7. Worked examples

@@ -74,6 +74,9 @@ Options:
   --dw-slice {auto,off}      Batch-1 depthwise Convs as several 16- / 32- / 64-channel
                              ConvKernel calls (taller output-row chunks; default auto:
                              >= 5 % faster by the cost model)
+  --bank-phase {on,off}      A binary VectorOP's a, b, c in different DRAM banks
+                             (pool slots at 16 KB bank phases; default on, ~20 %
+                             faster memory-bound VectorOP calls; src/bank_phase.py)
   --no-fuse-patterns         No LayerNorm / GELU fusion, no constant-broadcast
                              normalisation
   --matmul-on-conv {auto,always,off}
@@ -277,7 +280,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              80 pytest modules, 1743 tests, all pass (test_bert_base.py
+  test_*.py              81 pytest modules, 1754 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

@@ -164,7 +164,7 @@ class MultiEntryGenerator:
               unique across entries (the Llama frontend prefixes them)."""
 
     def __init__(self, entries: Sequence[Tuple[str, object]], model_name: str,
-                 embed_large_weights: bool = False, dtype=None):
+                 embed_large_weights: bool = False, dtype=None, bank_phase: bool = True):
         if not entries:
             raise SchedulerError("multi-entry project without entries")
         names = [n for n, _ in entries]
@@ -180,10 +180,12 @@ class MultiEntryGenerator:
         self.cgs: Dict[str, CodeGenerator] = {}
         for name, g in self.entries:
             cg = CodeGenerator(g, model_path=f"{model_name}_{name}.onnx",
-                               embed_large_weights=embed_large_weights, dtype=dtype)
+                               embed_large_weights=embed_large_weights, dtype=dtype,
+                               bank_phase=bank_phase)
             cg._run_fn_name = f"inference_run_{name}"
             self.cgs[name] = cg
-        self.cg = _CombinedCG(self, embed_large_weights=embed_large_weights, dtype=dtype)
+        self.cg = _CombinedCG(self, embed_large_weights=embed_large_weights, dtype=dtype,
+                              bank_phase=bank_phase)
         self._dtype = self.cg._dtype
         self._pool = None
         self._host = None
@@ -259,19 +261,25 @@ class MultiEntryGenerator:
             bpe = self._dtype.bytes_per_elem
             a = 64 // bpe
             up = lambda n: (n + a - 1) & ~(a - 1)  # noqa: E731
-            layout, off = [], 0
-            for t in self.combined.weight_tensors:
-                alloc = self.cg._alloc_sizes[t.onnx_name]
-                layout.append((t.onnx_name, off, alloc))
-                off += up(alloc)
-            self.weights_only_elems = off
-            for t in self.cg._dma_states:
-                alloc = self.cg._alloc_sizes[t.onnx_name]
-                layout.append((t.onnx_name, off, alloc))
-                off += up(alloc)
+            # the weights and states as slots, at bank phases apart from every
+            # entry's VectorOP partners (src/bank_phase.py); then each entry's
+            # intermediates in the shared region, apart from each other's and
+            # from the weights' phases
+            weights = list(self.combined.weight_tensors)
+            states  = list(self.cg._dma_states)
+            slots   = [(up(self.cg._alloc_sizes[t.onnx_name]), [t.onnx_name])
+                       for t in weights + states]
+            starts  = self.cg._place(slots)
+            layout  = [(t.onnx_name, s, self.cg._alloc_sizes[t.onnx_name])
+                       for t, s in zip(weights + states, starts, strict=True)]
+            nw = len(weights)
+            self.weights_only_elems = (starts[nw - 1] + slots[nw - 1][0]) if nw else 0
+            off = (starts[-1] + slots[-1][0]) if slots else 0
+            fixed = {t.onnx_name: s * bpe for t, s in zip(weights + states, starts, strict=True)}
             region = 0
             for name, _g in self.entries:
-                inter, total = self.cgs[name]._compute_intermediate_layout()
+                inter, total = self.cgs[name]._compute_intermediate_layout(base_elems=off,
+                                                                            fixed=fixed)
                 layout.extend((n, off + o, al) for n, o, al in inter)
                 region = max(region, total)
             self._pool = (layout, off + region)
