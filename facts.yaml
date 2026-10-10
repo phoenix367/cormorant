@@ -1214,7 +1214,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 8599aa7a5f12}
+    facts: {perf.bitstream_id: f70ce632a97a}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
