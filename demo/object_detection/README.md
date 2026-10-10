@@ -61,7 +61,7 @@ What it needs:
 
 ## Results (KV260, bitstream `8599aa7a5f12`, 2026-10-08)
 
-**Speed.**  YOLOv5n's FPGA graph takes **63.9 ms per image (15.6 FPS)**.
+**Speed.**  YOLOv5n's FPGA graph takes **46.9 ms per image (21.3 FPS)**.
 Per-layer profile (the kernel lanes overlap, so the parts add up to more
 than the total):
 

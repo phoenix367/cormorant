@@ -78,8 +78,8 @@ ctrl ─► config ─► sweep sequencer ─┬► x loader: row runs ─► AR
 |---|---|
 | `cv_ctrl_s_axi` | the AXI-Lite slave (the RTL PoolingKernel's, with this register table); a write's data and strobes are registered at the W handshake and land with BVALID, a read's address at the AR handshake and its data (and the clear-on-read bits) are taken a cycle later |
 | `cv_core` | the reset registered (a copy for the control slave), a unit reset per unit, the three read channels registered at the boundary (RREADY is always high: a pure delay); job FSM: latch the registers (every cycle while idle); the products the job needs through one pipelined DSP multiplier and three dividers (65 536 / row words, the ow-tile and the line-buffer row cap), about 40 cycles per job; the contract; the sweep sequencer (image, chunk, input tile, ow-tile, m-group — offsets by increments) feeding a 4-deep descriptor FIFO per unit; `ap_done` when every unit is idle |
-| `cv_xload` | for the first m-group of each (chunk, input tile, ow-tile): the input rows the line buffer lacks, each as one run per channel (≤ 16 beats, split at 4 KiB) into one half of a ping-pong row buffer; AR only into a free half, so RREADY stays high; ≤ 16 bursts outstanding; the row buffer's write through a register stage (the address a copy per bank), a word counted when it lands; out comes one column of 16 channels per cycle |
-| `cv_patch` | the line buffer — 16 channel banks of 16 rows × 64 columns (block RAM, row ih mod 16, column iw mod 64); per output row the new rows from the loader, then per pixel pair and window position one beat of both pixels' 16-lane columns (two read ports), lanes outside the input, past the tile's channels or of a pixel outside the ow-tile zero; the banks' ports through a register stage (a copy per 4 banks) and the reads through the RAMs' output registers: a beat three cycles after its read; a 64-beat patch FIFO |
+| `cv_xload` | for the first m-group of each (chunk, input tile, ow-tile): the input rows the line buffer lacks, each as one run per channel (≤ 16 beats, split at 4 KiB) into one half of a ping-pong row buffer; AR only into a free half, so RREADY stays high; ≤ 16 bursts outstanding; the row buffer's write through a register stage (the address a copy per bank), a word counted when it lands; out comes one column of 16 channels per cycle.  Its 144-byte runs are what the CCI throttles to ~0.4 beats per cycle: in the block design gmem0 goes to `S_AXI_HP2_FPD` (DEPTHWISE_PLAN §8.5) |
+| `cv_patch` | the line buffer — 16 channel banks of 16 rows × 64 columns (block RAM, row ih mod 16, column iw mod 64), **two copies per bank** so loads and window reads never share a port (each copy written through port A, read through port B: copy 0 for pixel 0 of a pair, copy 1 for pixel 1); a writer that loads, per output row, the new rows from the loader, and an emitter that reads, per pixel pair and window position, one beat of both pixels' 16-lane columns once the writer has finished that output row — the writer runs one output row ahead when the rows it writes cannot alias the rows the emitter reads (`stride_h + reach_h < 16`; DEPTHWISE_PLAN option B3), else it waits as the HLS producer did; lanes outside the input, past the tile's channels or of a pixel outside the ow-tile zero; the banks' ports through a register stage (a copy per 2 banks, each driving both copies) and the reads through the RAMs' output registers: a beat three cycles after its read; a 64-beat patch FIFO |
 | `cv_wload` | per sweep one run per output channel of the slab (standard: n_pos positions × two 8-lane beats, one for a half tile; depthwise: dw_words beats of 8 positions); a run requested only when the 512-vector FIFO can take it all; ≤ 8 bursts outstanding |
 | `cv_bias` | at job start the whole bias vector (one burst, two across 4 KiB) into a 16-lane word per m-tile (LUT RAM; the write through a register stage, the read address registered) |
 | `cv_engine` | the weight cache (16 columns × 512 words of 16 lanes, 8 columns in block RAM and 8 in UltraRAM; two banks, the next sweep's slab fills while the current one is read; depthwise slabs written as diagonal words, column m1 holding only lane m1); the issue sequencer (one instant per cycle: output row, pixel pair, m-tile, window position; m-tiles 1..G−1 replay the pair's patch beats from a 64-entry file); the MAC grid — 2 pixels × 16 columns of `cv_mac_chain` (16 DSP48E2 each); seeds (the bias for the first input tile, else the stored partial sum) and write-back; two accumulator buffers of 4096 × 16 × 32 bits (UltraRAM), one per chunk parity; every broadcast a register tree (below) |
@@ -180,7 +180,7 @@ patch producer and x loader, the sweep, the drain beside the next chunk —
 with one parameter set tuned to this testbench (`RTL_CONV_SIM`: median error
 0.65 %, p90 5.3 % over the 1 042 calls) and one to the board
 (`RTL_CONV_BOARD`: DDR latency, x and weight runs; at 250 MHz, bitstream
-`6436623029f7`, median 18.3 %, p90 45.8 % — at 100 MHz 3.1 / 14.6 %;
+`f70ce632a97a`, median 2.9 %, p90 18 % (18.3 / 45.8 % on `6436623029f7` before the x port left the CCI) — at 100 MHz 3.1 / 14.6 %;
 `inference-scheduler/tools/fit_cost_model.py` refits it).  The worst misses
 are narrow, input-heavy MatMul-on-ConvKernel jobs whose few short x runs per
 row wait on the DDR (2.5–3× the model at 250 MHz).  A change of the
@@ -242,13 +242,26 @@ written).
 - **The transposer** buffer of a segment is taken from the segment's last
   read on (its scatter takes 4–5 more cycles), so the fill never starts the
   segment after next in it.
+- **Line-buffer rows the emitter reads are never written** (`cv_patch`):
+  the writer loads output row w only while the emitter waits for it
+  (w = e) or, with `stride_h + reach_h < LBR`, emits row e = w − 1 — the
+  rows of w are then > every row of e's window and at most
+  `stride_h + reach_h` above its first, so no slot (row mod 16) is shared;
+  the emitter starts a row only after `w_done > e`, two cycles after the
+  last write landed.  Sweeps never overlap in the producer (the next
+  ow-tile's columns alias the current one's).
 - **Read FIFOs never fill**: the x loader requests a row only into a free
   half of its row buffer, the weight loader a run only when its vector FIFO
-  can take every beat — RREADY stays high, which is what lets `cv_core`
-  register the read channels as a plain delay.
-- At most `X_OUTS` / `W_OUTS` / `B_OUTS` / `Y_OUTS` bursts are outstanding —
-  the counts `package_ip.tcl` declares (fact `rtl.axi_masters`); change both
-  together.
+  can take it all, so RREADY stays high on every read channel.
+- **The row store** (`cv_xload`): a row's slot is read by the fill only after
+  the row landed (`rows_in` counts rows in fetch order; the fill waits for
+  it before taking the slot's base) and written again only after the block's
+  last sweep released it (`rows_free`); a block's rows all fit the ring
+  (`cv_core` caps the chunk height to `(cap_rows − reach_h − 1) / stride_h + 1`
+  and refuses a job whose window alone does not fit), so the fetch of the
+  next block can never wait on a release that the current block's fill
+  would make only after it.  Fetched rows are in fetch order, so the
+  landed count is a prefix.
 - **Chain timing** (`cv_mac_chain`): lane l's operands at E + l, the seed at
   E + 1, `wfb` at E + 16, the sum at E + 18.  E = issue + `D_E` (6: the
   weight cache's address tree, latch and output register, the mask, the

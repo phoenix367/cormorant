@@ -42,10 +42,10 @@ flowchart TB
 - **Library speed:** about 0.7 s per 1.49 s chunk, an RTF of 0.52 on a
   6.9 s sentence.  Since 2026-10-07 (kernels at 250 MHz, the decoder's
   residual sums on VectorOPKernel — OFFLOAD_PLAN §4.2): 0.27 s per chunk,
-  RTF 0.20.
+  RTF 0.19.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
   Since 2026-10-08 its attention softmax runs on VectorOPKernel's softmax
-  unit (SOFTMAX_PLAN §5): 56 ms for 88 ids, 164 ms for 400 (208 before).
+  unit (SOFTMAX_PLAN §5): 51 ms for 88 ids, 162 ms for 400 (208 before).
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.

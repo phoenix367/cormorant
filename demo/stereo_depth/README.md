@@ -90,9 +90,13 @@ USB 2, 5000M / 10000M is USB 3.
 | board | `scripts/deploy_and_run.py` | upload, `cmake` + `make stereo_pairs` on the board, the run (per-pair latency streamed), `build/results/disparity.bin` and `run.json`; `--profile` adds per-layer times |
 | results | `scripts/postprocess.py` | per pair the disparity at the pair's resolution: `build/results/disparity/<name>.png` (the left image beside the disparity) and `.pfm`.  EPE and bad-1 / bad-2 against the ground truth.  The first `run.check_pairs` maps bit for bit against the scheduler's simulation → `build/results.json` |
 
-## Results (KV260, bitstream `8599aa7a5f12`, 2026-10-09)
+## Results (KV260, bitstream `f70ce632a97a`, 2026-10-10)
 
-**Speed.**  At 640 × 480 a pair takes **599 ms (1.67 FPS)**.  At 320 × 256
+**Speed.**  At 640 × 480 a pair takes **469 ms (2.13 FPS)** — 599 ms on
+`8599aa7a5f12` (2026-10-09), before ConvKernel's x read port left the
+coherent interconnect for `S_AXI_HP2_FPD` and its line-buffer loads were
+overlapped with the window reads (DEPTHWISE_PLAN §8: the depthwise and 1 × 1
+layers 27–67 % faster).  At 320 × 256
 (`run.height` / `run.width`) it takes 160 ms (6.3 FPS), with coarser
 disparities.  Most of the time goes to the MobileNetV2-style layers: 1 × 1
 convs 165 ms, depthwise convs 176 ms, ReLU6 55 ms (the profile is in

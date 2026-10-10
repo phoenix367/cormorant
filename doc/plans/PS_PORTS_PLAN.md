@@ -26,6 +26,12 @@
   large binary VectorOP calls +3…9 %, the global pools +2…4 %, BERT
   418 → 421 ms (+0.8 %), ResNet-18 +0.7 %.  The user chose to try HP2
   instead.
+- **The one that paid (2026-10-10, `DEPTHWISE_PLAN.md` §8.5): ConvKernel's
+  x read port on `S_AXI_HP2_FPD`, bitstream `f70ce632a97a`, production.**
+  Short bursts are what the CCI throttles (§8): the depthwise and
+  few-channel 1 × 1 convs −27…−67 %, LightStereo-S 599 → 469 ms, MobileNet
+  v2 −14 %, BERT 418 → 364 ms, bit-exact — the outputs' move (§6–§7) lost
+  because 64-beat writes already had the CCI's two channels.
 - **Experiment 5 (2026-10-10), static read QoS 15 on HPC0 / HPC1 (§9): a
   real but small gain, no hardware change.**  Memory-bound binary VectorOP
   calls −4…6 %, the GEMV −4 %, two pools −2…5 %; end to end −0.1…−0.2 %

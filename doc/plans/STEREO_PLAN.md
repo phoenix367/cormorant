@@ -3,7 +3,9 @@
 **Status (2026-10-09):** study done (2026-10-08) and implemented: `demo/stereo_depth` runs
 LightStereo-S on the board (§4).
 - **The demo.**  On bitstream `8599aa7a5f12` at 640 × 480 a pair takes
-  **599 ms (1.67 FPS)** — 659 ms before the depthwise convs ran as channel
+  **469 ms (2.13 FPS)** — 599 ms before ConvKernel's x read port left the
+  coherent interconnect (DEPTHWISE_PLAN §8.5, bitstream `f70ce632a97a`,
+  2026-10-10), 659 ms before the depthwise convs ran as channel
   slices (§4.5, a scheduler change).
   - Quality on all 42 Middlebury / ETH3D pairs: EPE 0.667 px and bad-2
     4.94 %, against float's 0.650 / 4.87 % on the same scaled input.

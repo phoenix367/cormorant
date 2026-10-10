@@ -48,13 +48,15 @@ def convs(g):
 
 
 class TestChoice(unittest.TestCase):
-    """cost_model.dw_slice on shapes measured on the board (8599aa7a5f12)."""
+    """cost_model.dw_slice on shapes measured on the board (f70ce632a97a, the
+    constants refitted to it — DEPTHWISE_PLAN §8.6; 8599aa7a5f12 before)."""
 
     def test_tall_windows_slice(self):
-        # 144 ch on 120 x 160: 10.26 ms in one call, 9 x 0.635 ms as 16-channel calls
-        self.assertEqual(cost_model.dw_slice(144, 120, 160, 120, 160, 3, 3, 1, 1, 1, 1, 1, 1), 16)
-        # a 2x1 stripe piece dilated by 13: 1.69 ms against 6 x 0.150
-        self.assertEqual(cost_model.dw_slice(96, 60, 80, 60, 80, 2, 1, 1, 1, 13, 1, 9, 0), 16)
+        # 144 ch on 120 x 160: 4.25 ms in one call (10.26 on 8599aa7a5f12), 24.2-24.8 us per
+        # channel as 16- to 64-channel calls (0.39 ms x 9 / 0.77 x 4 + 0.39 / 1.17 x 3): any slice
+        self.assertIn(cost_model.dw_slice(144, 120, 160, 120, 160, 3, 3, 1, 1, 1, 1, 1, 1), (16, 32, 48, 64))
+        # a 2x1 stripe piece dilated by 13: 0.825 ms against 6 x 0.095 / 3 x 0.179
+        self.assertIn(cost_model.dw_slice(96, 60, 80, 60, 80, 2, 1, 1, 1, 13, 1, 9, 0), (16, 32))
 
     def test_no_row_halo_keeps_one_call(self):
         # a 1x7 stripe: 0.715 ms in one call, 6 x 0.142 as 16-channel calls
@@ -97,7 +99,7 @@ class TestGraph(unittest.TestCase):
 
     def test_auto_large_map_slices(self):
         g = OnnxGraph(dw_model(c=144, h=120, w=160))      # the shape measured above
-        self.assertEqual(convs(g)[0].dw_slice, 16)
+        self.assertIn(convs(g)[0].dw_slice, (16, 32, 48, 64))
 
     def test_batch_two_not_sliced(self):
         g = OnnxGraph(dw_model(batch=2), dw_slice=16)
@@ -160,8 +162,11 @@ class TestHostEmu(unittest.TestCase):
         self.run_emu(OnnxGraph(dw_model(c=72, seed=1), dw_slice=32))
 
     def test_auto_large_map(self):
-        g = OnnxGraph(dw_model(c=96, h=64, w=160, seed=2))   # 32-channel calls
-        self.assertEqual(convs(g)[0].dw_slice, 32)
+        # 144 ch on 120 x 160 is sliced on every board so far (96 on 64 x 160 was, until
+        # the refit to f70ce632a97a: the board gains 6.6 % as 3 x 32 there, the model
+        # prices it within its 5 % margin and keeps one call)
+        g = OnnxGraph(dw_model(c=144, h=120, w=160, seed=2))
+        self.assertIn(convs(g)[0].dw_slice, (16, 32, 48, 64))
         self.run_emu(g)
 
 

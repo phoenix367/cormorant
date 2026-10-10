@@ -18,7 +18,20 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/8599aa7a5f12` is the production design (2026-10-08, PS_PORTS_PLAN §5: `588d721997cb` with
+`kv260/f70ce632a97a` is the production design (2026-10-10, DEPTHWISE_PLAN §8: `8599aa7a5f12`'s
+with ConvKernel's x read port on `S_AXI_HP2_FPD`, past the CCI, and its line-buffer loads
+overlapped with the window reads): a fresh campaign — `cases` 1490 (ConvKernel grid 371 + shipped
+521, the MatmulKernel and VectorOP cases), two passes of 59 s, three refinement rounds (+211, +99,
++37; the fourth would add a few more) → **1837 exact calls**, repeat spread median 0.066 %.  Families (train / held-out p90): conv 2.9 /
+26.7 %, conv-dw 2.0 / 15.3 %, conv-mm 3.2 / 34.9 %, mm-gemv 4.8 / 18.5 %, mm-tiled 1.5 / 7.2 %,
+pool 3.4 / 42.5 %, vecop 0.4 / 14.1 %, vecop-div 0.8 / 7.7 %, vecop-smx (new, 55 calls) — every
+family above the planner's 5 % trust, so the planner relies on the exact entries.  Against
+`8599aa7a5f12` the x-bound ConvKernel calls are 27–67 % faster (the depthwise and few-channel
+1 × 1 jobs: on the Verilator ideal-memory column), BERT's MatMul-on-ConvKernel calls with them;
+MatmulKernel, VectorOP and pooling unchanged.  The engine cost model was refitted to this
+campaign (`tools/fit_cost_model.py fit`: ConvKernel median error 36 → 3 %).
+
+`kv260/8599aa7a5f12` was the production design before (2026-10-08, PS_PORTS_PLAN §5: `588d721997cb` with
 VectorOPKernel's b read port on HPC1): 1867 calls, `clock_mhz` 250, repeat spread median 0.052 %.
 Its case list started from `588d721997cb`'s converged one, so both campaigns measure the same
 calls: 1597 listed plus the 261 ConvKernel refinement calls of that campaign's earlier rounds.

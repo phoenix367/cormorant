@@ -1306,7 +1306,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (431 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (443 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1318,15 +1318,18 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 18.3 %, p90 45.8 % over the
-  1 190 ConvKernel calls of the 250 MHz campaign `6436623029f7` — the
+  DDR latency, x and weight runs; median 2.9 %, p90 18 % over the
+  1 103 ConvKernel calls of the 250 MHz campaign `f70ce632a97a`, refitted
+  there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
+  previous fit 36 % high on the x-bound jobs; 18.3 / 45.8 % over the 1 190 of
+  `6436623029f7` before — the
   100 MHz set fitted `c2b2a6e5e50e` to 3.1 / 14.6 %, but at 250 MHz a DDR
   wait costs 2.5× the cycles and the recurrence fits less well).  The
   board terms (`RTL_CONV_BOARD`, `RTL_COEF`, `CALL_OVERHEAD`) are refitted by
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 924 predicted.
+  board (0.12 ms at 250 MHz), 34 312 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

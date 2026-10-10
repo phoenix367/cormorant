@@ -192,7 +192,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` gives its b read port'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` moves ConvKernel'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
@@ -206,9 +206,9 @@ facts:
       host_kinds: {file: inference-scheduler/perf_models/kv260/host.json, json: kinds, transform: 'len(v)'}
   fix: report                                # the sentences carry dates: a top-up rewrites them
   mentions:
-    - {file: inference-scheduler/perf_models/README.md, regex: '\): (?P<exact_calls>\d+) calls,'}
+    - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: 'to (?P<exact_calls>\d+) exact calls, and\s+`host.json` merged to (?P<host_signatures>\d+) signatures / (?P<host_kinds>\d+) kinds'}
+       regex: '\+211, \+99, \+37; 8 s of board each\) → (?P<exact_calls>\d+) exact calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
@@ -232,10 +232,16 @@ facts:
   kind: recorded
   title: the engine cost model's per-call error against the board (RTL_CONV_BOARD, RTL_COEF + CALL_OVERHEAD;
     median / p90 %) on the campaign it was fitted to, quoted in the code and the docs that describe the model
-  value: {conv_calls: 1190, conv_median: 18.3, conv_p90: 45.8, matmul_calls: 414, matmul_median: 4.5, matmul_p90: 17.7}
+  value: {conv_calls: 1103, conv_median: 2.9, conv_p90: 18, matmul_calls: 414, matmul_median: 4.7, matmul_p90: 17.8}
   provenance:
-    date: 2026-10-07
-    how: "tools/fit_cost_model.py fit --shipped-weight 0.75 --decisions D (the decision-aware set: no shipped
+    date: 2026-10-10
+    how: "tools/fit_cost_model.py fit f70ce632a97a on its campaign (1701 exact calls, DEPTHWISE_PLAN §8.5: ConvKernel's x
+          port off the CCI): the constants as used before scored ConvKernel 35.8 / 77.6 % over 1103 calls (bias +0.30: the
+          x-path terms of the old board), MatmulKernel 4.5 / 18.1 % over 414; the proposal (applied: RTL_CONV_BOARD,
+          RTL_COEF, CALL_OVERHEAD 431 -> 443 = the new call floor 1.77 us) 2.9 / 18.0 % and 4.7 / 17.8 %; `diff`: the
+          CNNs, BERT and Piper keep every engine choice, SmolLM2-135M / SmolVLM / SmolLM2-360M prefill_16 move 60 / 60 / 160
+          MatMuls from the GEMV to ConvKernel (kw 2 / 4), which the performance model's measured entries price 1.3 / 1.3 /
+          40.1 ms per run cheaper (their libraries not regenerated yet).  Before: tools/fit_cost_model.py fit --shipped-weight 0.75 --decisions D (the decision-aware set: no shipped
           model's engine choice moves; OFFLOAD_PLAN §4.3) on the campaign of 6436623029f7 as of 1729 exact calls;
           the constants as used before (100 MHz, + 1500): ConvKernel 33.9 / 64.5 %, MatmulKernel 8.8 / 29.6 %;
           the plain refit 14.5 / 44.2 % (it moved BERT's P·V to MatmulKernel).  Re-scored on 588d721997cb
@@ -246,7 +252,7 @@ facts:
           ConvKernel / MatmulKernel calls unchanged): the constants as used ConvKernel 18.6 / 48.3 % over 1265
           calls, MatmulKernel 4.5 / 17.7 % over 414; call floor 431 cycles: CALL_OVERHEAD 434 -> 431 with
           ONE / one +3"
-    facts: {perf.bitstream_id: 8599aa7a5f12}  # a new bitstream: a new campaign, refit or re-score
+    facts: {perf.bitstream_id: f70ce632a97a}  # a new bitstream: a new campaign, refit or re-score
   fix: report
   mentions:
     - {file: inference-scheduler/src/cost_model.py,
@@ -893,10 +899,10 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.2, resnet18_fps: 49.6, mobilenet_v1_ms: 22.0, mobilenet_v2_ms: 20.4, bert_ms: 418,
+  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.5, bert_ms: 364,
           smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
-          smolvlm_image_s: 1.9, piper_rtf: 0.20, mnist_convnet_ms: 0.111, mnist_lenet_ms: 1.249,
-          yolov5n_ms: 63.9, yolov5n_fps: 15.6, stereo_ms: 599, stereo_fps: 1.67,
+          smolvlm_image_s: 2.1, piper_rtf: 0.19, mnist_convnet_ms: 0.108, mnist_lenet_ms: 1.253,
+          yolov5n_ms: 46.9, yolov5n_fps: 21.3, stereo_ms: 469, stereo_fps: 2.13,
           stereo320_ms: 160}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
@@ -933,8 +939,8 @@ facts:
           FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
           MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
           97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before); with the depthwise channel slices (INFERENCE_SCHEDULER.md §Depthwise channel slices, STEREO_PLAN §4.5, the same run, 42 + 2 RealSense pairs): 598.8 ms mean / 598.4 p50, 1.67 FPS, maps bit-exact; at 320 x 256 (run.height 256 / run.width 320, demo/stereo_depth/build/results_320_dwslice.json): 159.6 ms mean (163.7 before the slices)"
-    facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
+          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before); with the depthwise channel slices (INFERENCE_SCHEDULER.md §Depthwise channel slices, STEREO_PLAN §4.5, the same run, 42 + 2 RealSense pairs): 598.8 ms mean / 598.4 p50, 1.67 FPS, maps bit-exact; at 320 x 256 (run.height 256 / run.width 320, demo/stereo_depth/build/results_320_dwslice.json): 159.6 ms mean (163.7 before the slices).  Measured on f70ce632a97a (ConvKernel's x read port on HP2 past the CCI + overlapped line-buffer loads, DEPTHWISE_PLAN §8, 2026-10-10, the same projects): ResNet-18 19.98, MobileNet v1 / v2 20.45 / 17.51, MNIST 0.1080 / 1.2531 ms; BERT p50 363.9 ms; LightStereo-S 469.5 ms mean / 468.2 p50 (44 pairs, 2.13 FPS, EPE 0.667 on the 42 with ground truth); YOLOv5n 46.9 ms mean / p50 (21.3 FPS, 16 COCO128 images, bit-exact); llm_board 135M 54.9 ms / token, prefill 16 / 64 / 256 155 / 226 / 776 ms; 360M 137.8 ms / token, prefill 16 / 256 336 / 1701 ms; SmolVLM llm_image 2.08 / 2.07 s (an A/B on the same day: 8599aa7a5f12 2.15 / 2.17 s, f70ce632a97a 2.07 / 2.06 — 4.5 % faster; the 1.91 s on record is a board state that no longer reproduces on either bitstream, open); tts_board RTF 0.223 / 0.194, all bit-exact"
+    facts: {perf.bitstream_id: f70ce632a97a}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -960,7 +966,7 @@ facts:
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
     - {file: README.md, regex: '\| ResNet-18, 224×224 \| \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
-    - {file: README.md, regex: '\| MobileNet V1 / V2, 224×224 \| (?P<mobilenet_v1_ms>[\d.]+) / (?P<mobilenet_v2_ms>[\d.]+) ms per image'}
+    - {file: README.md, regex: '\| MobileNet V1 / V2, 224×224 \| \*\*(?P<mobilenet_v1_ms>[\d.]+) / (?P<mobilenet_v2_ms>[\d.]+) ms\*\* per image'}
     - {file: README.md, regex: '\*\*(?P<bert_ms>\d+) ms\*\* per inference \(p50'}
     - {file: README.md, regex: 'SmolLM2-135M-Instruct \|[^|\n]*, 16-token prefill (?P<smollm2_135m_prefill16_s>[\d.]+) s'}
     - {file: README.md, regex: 'SmolLM2-135M-Instruct \| \*\*(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\*\*'}
@@ -986,14 +992,14 @@ facts:
     - {file: demo/mnist/README.md, regex: '^  mnist_lenet    OK +[\d.]+% +(?P<mnist_lenet_ms>[\d.]+) '}
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
-       regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2\s+(?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream\s+`8599aa7a5f12`, PS_PORTS_PLAN.md\): p50 (?P<bert_ms>\d+) ms', dotall: true}
-    - {file: demo/bert_squad/README.md, regex: 'all 50\s+examples\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
+       regex: '`f70ce632a97a`, DEPTHWISE_PLAN §8.5,\s+2026-10-10\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream\s+`f70ce632a97a`, DEPTHWISE_PLAN.md §8\): p50 (?P<bert_ms>\d+) ms', dotall: true}
+    - {file: demo/bert_squad/README.md, regex: 'through that port\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
     - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
     - {file: demo/image_classification/README.md,       # the transcript's latest note, not the older ones
-       regex: '`986cef4866a0`\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms,\s+MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
+       regex: 'window reads\): ResNet-18 \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\*, MobileNet v1 \*\*(?P<mobilenet_v1_ms>[\d.]+) ms\*\*,\s+v2 \*\*(?P<mobilenet_v2_ms>[\d.]+) ms\*\*'}
     - {file: doc/README.md, regex: 'met \((?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: doc/README.md, regex: '\((?P<bert_ms>\d+) ms p50 on'}
     - {file: doc/README.md, regex: 'SmolLM2-135M on the FPGA \(~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s\)'}
@@ -1025,7 +1031,7 @@ facts:
     how: "demo/object_detection/scripts/yolo_study.py study (YOLO_PLAN §3.2): all 128 COCO128 images, val.py's
           NMS (conf 0.001, IoU 0.6, multi-label); float = onnxruntime on yolov5n_raw.onnx, FPGA = the
           scheduler's simulation (the board equals it bit for bit, §3.3): 0.5427 / 0.3429 against 0.5454 / 0.3486"
-    facts: {perf.bitstream_id: 8599aa7a5f12}   # the datapath, not the bitstream: any kernel change re-measures
+    facts: {perf.bitstream_id: f70ce632a97a}   # the datapath, not the bitstream: any kernel change re-measures
   verify:
     map50: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map50}
     map: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map}
@@ -1052,7 +1058,7 @@ facts:
           8599aa7a5f12) EPE 0.6672 / bad-1 12.21 / bad-2 4.94; float on the same fitted input (stereo_study.py study
           --fit 480 640) 0.6500 / 11.81 / 4.87; the simulated graph at native resolution (sim_quality.py --pc 0.05)
           EPE 0.627 (float 0.633)"
-    facts: {perf.bitstream_id: 8599aa7a5f12}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
+    facts: {perf.bitstream_id: f70ce632a97a}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
   verify:
     epe: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['epe'] for x in v if x['name'] == 'lightstereo_s')"}
     bad1: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['bad1'] for x in v if x['name'] == 'lightstereo_s')"}
@@ -1124,14 +1130,16 @@ facts:
 - id: piper.encode_ms
   kind: recorded
   title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
-  value: {ids20: 20.4, ids88: 55.7, ids400: 163.9}
+  value: {ids20: 15.7, ids88: 50.6, ids400: 162.0}
   tolerance: {rel: 0.03}                     # the docs round to the ms
   provenance:
-    date: 2026-10-08
-    how: "tts_board.py on 8599aa7a5f12 with the library of SOFTMAX_PLAN §5 (the encoder softmax on VectorOPKernel's
+    date: 2026-10-11
+    how: "tts_board.py on f70ce632a97a (ConvKernel's x read port past the CCI, DEPTHWISE_PLAN §8.5; the same library),
+          best of 3 repetitions: 20 ids 15.74, 88 ids 50.61, 400 ids 162.02 ms (the attention convs over few keys
+          are x-bound: the short buckets gain most).  Before, tts_board.py on 8599aa7a5f12 with the library of SOFTMAX_PLAN §5 (the encoder softmax on VectorOPKernel's
           unit), best of 3 repetitions: 20 ids 20.43, 88 ids 55.65, 400 ids 163.92 ms (the host softmax before:
           20.50 / 58.25 / 208.10); the install's gate on the production paths 163.7 ms at 400 ids"
-    facts: {perf.bitstream_id: 8599aa7a5f12}   # stale on another bitstream
+    facts: {perf.bitstream_id: f70ce632a97a}   # stale on another bitstream
   fix: report
   mentions:
     - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
@@ -1185,12 +1193,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: 8599aa7a5f12, dsp: 712, dsp_total: 1248, dsp_pct: 57, lut: 62400, lut_total: 117120, lut_pct: 53.3,
-          bram: 123, bram_total: 144, uram: 48, uram_total: 64}
+  value: {bitstream: f70ce632a97a, dsp: 712, dsp_total: 1248, dsp_pct: 57, lut: 62618, lut_total: 117120, lut_pct: 53.5,
+          bram: 131, bram_total: 144, uram: 48, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-08
-    how: "Vivado placed utilization report of the 250 MHz design with VectorOPKernel's b read port on HPC1
+    date: 2026-10-10
+    how: "Vivado placed utilization report of the 250 MHz design with ConvKernel's x read port on HP2 and its
+          two line-buffer copies (DEPTHWISE_PLAN §8, /mnt/data/bitstreams/kv260_250_f70ce632a97a/: +218 LUT,
+          FF 87 781 -> 87 832, +8 BRAM tiles — the second copy of the 16 RAMB18 line buffer); 8599aa7a5f12
+          before it: LUT 62 400, BRAM 123 — VectorOPKernel's b read port on HPC1
           (PS_PORTS_PLAN §5, /mnt/data/bitstreams/kv260_250_8599aa7a5f12/: +53 LUT, FF 87 703 -> 87 781; the
           interconnects only); 588d721997cb before it: LUT 62 347 — VectorOPKernel's softmax unit
           (SOFTMAX_PLAN, /mnt/data/bitstreams/kv260_250_588d721997cb/: +5 599 LUT, +5 105 FF (87 703), +16 BRAM,

@@ -1,9 +1,12 @@
 # Depthwise convolutions on ConvKernel: where the time goes, and what would help
 
-**Status (2026-10-09): analysis only — no kernel change yet.**  The
-scheduler's depthwise channel slices ([STEREO_PLAN](STEREO_PLAN.md) §4.5,
-INFERENCE_SCHEDULER.md §Depthwise channel slices) are in; this report
-explains the measurements behind them and ranks the kernel-side options.
+**Status (2026-10-10): the x path fixed — the ConvKernel's x port off the
+CCI onto `S_AXI_HP2_FPD` plus overlapped line-buffer loads (B3), bitstream
+`f70ce632a97a`: the depthwise and few-channel 1 × 1 jobs −27…−67 %,
+LightStereo-S 599 → 469 ms per pair, MobileNet v2 −14 %, BERT 418 → 364 ms,
+all bit-exact (§8); promotion pending.**  The analysis of §1–§5 (2026-10-09)
+stands; the transposed grid mode (§6) was built and reverted; the UltraRAM
+row store (§8.4) was designed and found unnecessary once the port was right.
 
 **Verdict in one paragraph.**  A depthwise job is slow not because the grid
 does its multiplies slowly but because it moves its input slowly.  On the
@@ -427,3 +430,272 @@ build/kernels/conv_rtl/vl/Vtb --no-oracle --timing slow --case "1 144 120 160 16
 # the cost model's split (sweep / loads) and the slice choice
 .venv/bin/python -c "from src import cost_model as cm; print(cm.rtl_conv_walk(16,16,120,160,120,160,3,3,dwise=True,board=True))"
 ```
+
+## 8. Option B, implemented (2026-10-10)
+
+After the scratchpad study (`SCRATCHPAD_PLAN.md`: the same layers reach
+the same ideal-memory bound through the x path), the user asked for A
+(the study) then B.
+
+### 8.1 B3 — loads beside emission (`cv_patch`)
+
+The line buffer gets a second copy per channel bank (16 RAMB18 more; each
+copy written through port A, read through port B: copy 0 for pixel 0 of a
+pair, copy 1 for pixel 1), and the producer splits into a writer (loads the
+new rows of output row w from the loader) and an emitter (the window reads
+of output row e, started once `w_done > e`).  The writer runs one output
+row ahead of the emitter when the rows it writes cannot alias the rows the
+emitter reads — `stride_h + reach_h < 16`: the rows of w = e + 1 are above
+every row of e's window by at most `stride_h + reach_h`, so no slot (row
+mod 16) is shared — else it waits for the emitter as the HLS producer did
+(`CONV_RTL_KERNEL.md` §6).  No sweep overlap in the producer (the next
+ow-tile's columns alias the current one's).  Bit-exact: `TestConvRtl` (63
+fixtures + 200 random jobs under randomised memory timing against the HLS
+C++) and `ConvRtlDriver` pass; lint clean.
+
+Verilator, `--no-oracle --timing fast|slow`, µs at 250 MHz, before → after:
+
+| job | fast (ideal memory) | slow (board-like) |
+|---|---|---|
+| dw 3 × 3, 16 ch, 120 × 160 | 461 → **386 (−16 %)** | 535 → 531 |
+| dw 3 × 3, 32 ch, 112 × 112 | 591 → **498 (−16 %)** | 671 → 673 |
+| dw 1 × 7 dil 3, 16 ch, 60 × 80 | 120 → **101 (−16 %)** | 207 → 208 |
+| dw 3 × 3, 144 ch, 120 × 160 | 4 587 → 4 245 (−7.5 %) | 7 779 → 7 772 |
+| dw 3 × 3 stride 2, 16 ch, 240 × 320 | 736 → 736 | 1 899 → 1 890 |
+| dw 3 × 3 stride 2, 96 ch, 56 → 28 | 183 → 175 (−5 %) | 424 → 419 |
+| 1 × 1, 16 → 16 ch, 120 × 160 | 196 → 196 | 483 → 484 |
+| 1 × 1, 144 → 16 ch, 120 × 160 | 1 420 → 1 420 | 3 717 → 3 708 |
+| standard 3 × 3, 64 ch, 56 × 56 | 915 → 915 | 975 → 976 |
+
+B3 does what §4 predicted for the `P_LOAD` serialisation — the stride-1
+depthwise jobs are at ~1.1× the grid bound with ideal memory — and nothing
+else: with board-like memory every job is bound by the x port's delivery,
+and the stride-2 / 1 × 1 jobs were already at the loader's beat count with
+ideal memory (the 1 × 1 16 → 16 job moves 614 KB in and out: 196 µs is the
+4 GB/s port).
+
+### 8.2 Where the board's x rate comes from
+
+The loader keeps at most 16 bursts of ≤ 9 beats in flight (`X_OUTS`,
+`X_BURST`) and issues a row's 16 runs together, so one row (2.3 KB) is in
+flight at a time; the PS side caps it harder: HPC0's AFIFM issuing
+capability is **8 read commands** (`RDISSUE` 7, `PS_PORTS_PLAN.md` §10) —
+8 × 144 B = 1.15 KB in flight.  At ~200 cycles of CCI / DDRC latency per
+burst that is ~0.36 beats per cycle, **1.4 GB/s: the board's 1–2 GB/s on
+these jobs** (the VectorOP's 1 KB bursts never noticed the cap).  So the
+board lever is bytes in flight — a register (`RDISSUE` 15 / 31 on HPC0,
+tried next), then longer runs (B1: whole rows at up to 64 beats, which also
+means declaring `X_BURST` 64 on gmem0) — not more loader states.
+
+| board (`8599aa7a5f12`), `RDISSUE` on HPC0 | 8 (default) | 16 | 32 |
+|---|---|---|---|
+| dw 3 × 3, 16 ch, 120 × 160 | 634 µs | 635 | 637 |
+| dw 3 × 3 stride 2, 16 ch, 240 × 320 | 1 925 | 1 928 | 1 927 |
+| dw 3 × 3, 144 ch, 120 × 160 | 10 258 | 10 371 | 10 377 |
+| dw 1 × 7 dil 3, 16 ch, 60 × 80 | 143 | 143 | 143 |
+| 1 × 1, 16 → 16 / 144 → 16 ch, 120 × 160 | 563 / 4 712 | 564 / 4 706 | 564 / 4 719 |
+| dw 3 × 3, 32 ch, 112 × 112; stride 2, 96 ch, 56 → 28 | 595; 412 | 595; 413 | 595; 413 |
+| standard 3 × 3, 64 ch, 56 × 56 | 926 | 926 | 926 |
+
+**Not the issuing capability**: nothing moves at 16 or 32 commands.  The
+x port's rate is set by the path itself: a 144-byte burst through the
+CCI (which splits it into cache-line requests) returns at ~0.4 beats per
+cycle whatever the depth — the same ~30–50 % utilisation the PS-PL study
+measured for 64-byte transactions on HPC (`PS_PORTS_PLAN.md` §8's sources)
+— while the VectorOP's 1 KB bursts get 70–85 %.  The lever is therefore
+the burst length: B1, whole input rows per (chunk, channel tile) as 64-beat
+runs, which the 64-column line buffer cannot take — the full-width line
+buffer belongs in UltraRAM (16 free: 512 columns × 16 rows × 16 channels
+× 16 bits = 256 KB per copy, two copies — `SCRATCHPAD_PLAN.md` §2's URAMs,
+spent on the x path instead), and it also removes the ow-tile re-reads and
+their sweep ramps.  A cheaper partial step: multi-row bursts when one tile
+spans the whole width (in_w ≤ 64: the rows of a channel are contiguous).
+An alternative to test with a bitstream: x on an HP port, past the CCI.
+
+### 8.3 Synthesis
+
+`make synth_conv_rtl` (out of context, 300 MHz): **WNS +0.025 ns** (Fmax
+302 MHz — the kernel's record, CONV_RTL_PLAN phase 0, was +0.025 too),
+18 191 LUT, 39 762 FF, **60 block-RAM tiles (52 before: the second line
+buffer copy, 16 RAMB18)**, 48 URAM, 518 DSP.  The producer's new
+register-stage fan-out (one copy per 2 banks driving both copies) stays off
+the critical paths; in-context timing is decided by the full build with
+whatever B1 adds.
+
+### 8.4 B1 — the x rows in UltraRAM (design, 2026-10-10)
+
+The user chose the full-width path (and the HP-port check first, §8.5).
+Not a full-width line buffer (two copies for the two read ports would take
+all 16 free URAMs and change every column index of `cv_patch`), but a
+**row store** in front of the unchanged 64-column line buffer:
+
+- **What it holds.**  The input rows of one (chunk, channel tile) block —
+  `(coh − 1) · stride_h + reach_h + 1` rows of 16 channels, each row as the
+  channel's whole width in 128-bit words aligned on the write (a per-run
+  shifter: word k = columns 8k … 8k + 7 whatever the row's start alignment)
+  — in **16 URAMs as two sets** (even / odd channels), each 2 URAMs wide ×
+  4 deep: 16 384 entries of 16 B per set, 512 KB in all.  Entry
+  `(slot · 8 + c ∕ 2) · words_per_row + k`: a row-slot base (a 32-entry
+  table the fetch side fills) plus a per-channel base (8 adders at job
+  start) plus the word — no multiplier on the path.
+- **Fetch** (`cv_xload`'s issuer, rewritten): on the first sweep of a block
+  (`ct_first`: ow-tile 0, m-group 0), one run per (row, channel) of the
+  whole row — `ceil((shift + in_w) / 8)` words as bursts of up to
+  **64 beats** (`X_BURST` 64, declared on gmem0; split at 4 KiB) — rows in
+  order, ≤ 16 bursts outstanding; a row is "in" when its last word landed
+  (a per-block counter the fill side compares with).  Slots are a ring of
+  `cap_rows = ⌊2048 / words_per_row⌋` (512 wide → 32 rows, 160 wide →
+  102); a slot is written again only after the block's last sweep released
+  it (below), so the next block's rows stream in while the current block's
+  last sweep still emits — the fetch is never exposed as long as a block's
+  window fits the ring, which the chunk height guarantees.
+- **Fill** (the column stream `cv_patch` already takes): per loading sweep
+  and output row, the rows the line buffer lacks, read from the store as 16
+  words per 8 columns — one read per set per cycle on the sets' second
+  ports, so **one column per cycle** with the fetch writing through the
+  first ports — through the existing alignment-free path (the words are
+  aligned already).  The fill of row r waits for `rows_in > slot(r)`.
+- **Release**: on a block's last sweep (`ct_last`: last ow-tile, last
+  m-group), after output row oh the rows below `ihmin(oh + 1)` are released
+  (a free pointer the fetch side waits on); the block's end releases the
+  rest.
+- **Geometry** (`cv_core`): the chunk height gets a third cap,
+  `per ≤ (cap_rows − reach_h − 1) / stride_h + 1` (two more dividers:
+  2048 / words_per_row, then the cap; ~40 cycles per job); the contract
+  gains `reach_h + 1 ≤ cap_rows` (in_w ≤ 16 384 / (reach_h + 1) columns:
+  5 461 for a 3 × 3, 1 260 for a 7 × 7 at dilation 2 — above every
+  model's; the scheduler's conv bound `max_in_w_rows` says the same).  The
+  sweep descriptor gains `ct_first` / `ct_last`.
+- **Traffic**: a row is read once per block instead of once per ow-tile
+  (the 120 × 160 maps: 2.6 tiles → 1.0, plus the halo overlap), in 64-beat
+  bursts instead of 9-beat ones; the DRAM sees 1 KB sequential runs.
+- **Cost**: 16 URAMs (all that are free: `SCRATCHPAD_PLAN.md` §2 spent
+  here), the shifter and the two 128-bit write / read paths (~1.5 k LUT),
+  the fetch / fill / release sequencers.  Timing: URAM with both register
+  stages (the output register and one after), the sets' addresses and
+  enables through `keep` register copies as the other RAM columns.
+- **Verification**: `TestConvRtl` (bit-exact), lint, the §8.1 table in
+  Verilator with `--timing slow` — the slow model's 0.4 beats per cycle
+  is per beat, so it understates 64-beat bursts; the board decides —,
+  `synth_conv_rtl`, then the bitstream, the model suite, the x-path cases
+  and the demos.  Gate 5 (`sim_hw_kv260`, the IP's bus parameters) for the
+  burst length.
+
+Expected on the board: the x port at ~4 GB/s for the x-bound jobs — the
+§8.1 "fast" column (dw 16 ch 120 × 160 0.635 → ~0.4 ms, stride 2 1.93 →
+~0.75, 1 × 1 144 → 16 4.7 → ~1.5), LightStereo-S 599 → ~480 ms, the
+MobileNets −10…15 %.
+
+### 8.5 The HP-port check: x past the CCI (2026-10-10)
+
+Before the row store, the user asked for the cheaper hypothesis test: the
+ConvKernel's x port (gmem0) moved from HPC0 to `S_AXI_HP2_FPD` through its
+own one-slave interconnect (`hw/cormorant_hw_128/scripts/bd_conv_x_hp.tcl
+-port HP2`; `axi_interconnect_0` re-seated with seven SIs), the testbench's
+HP2 VIP as in PS_PORTS_PLAN §7; the ConvKernel with B3.  `sim_hw_kv260`
+75 / 75 (HP2: 273 reads, HPC0 194 reads + 191 writes); bitstream
+**`f70ce632a97a`**, WNS +0.098 ns, WHS +0.010 (B3's 8 more RAMB36: 131 of
+144).  The x-path jobs on the board:
+
+| job | HPC0 (production `8599aa7a5f12`) | **x on HP2 + B3** | Verilator ideal |
+|---|---|---|---|
+| dw 3 × 3, 16 ch, 120 × 160 | 634 µs | **390 (−38 %)** | 386 |
+| dw 3 × 3 stride 2, 16 ch, 240 × 320 | 1 925 | **811 (−58 %)** | 736 |
+| dw 3 × 3, 144 ch, 120 × 160 | 10 258 | **4 250 (−59 %)** | 4 245 |
+| dw 1 × 7 dil 3, 16 ch, 60 × 80 | 143 | **105 (−27 %)** | 101 |
+| 1 × 1, 16 → 16 ch, 120 × 160 | 563 | **224 (−60 %)** | 196 |
+| 1 × 1, 144 → 16 ch, 120 × 160 | 4 712 | **1 571 (−67 %)** | 1 420 |
+| dw 3 × 3, 32 ch, 112 × 112 | 595 | 502 (−16 %) | 498 |
+| dw 3 × 3 stride 2, 96 ch, 56 → 28 | 412 | 184 (−55 %) | 175 |
+| standard 3 × 3, 64 ch, 56 × 56 | 926 | 920 | 915 |
+
+**The CCI was the whole x-path problem.**  Past it, the FPD switch serves
+the 144-byte bursts at the port's rate and every x-bound job lands on the
+ideal-memory column (the stride-1 depthwise ones on B3's: the kernel's own
+serialisation gone too); the remaining 5–10 % on the stride-2 and 1 × 1
+jobs is DDR against a model with 24 cycles of latency.  §1's "1–2 GB/s" was
+the coherent interconnect's small-transaction rate (PS_PORTS_PLAN §8), not
+the DRAM, the port or the loader.  Nothing in the kernel's address pattern
+had to change — so the UltraRAM row store of §8.4 is not needed for this
+gain: its design stays here as the record (and its first implementation,
+lint-clean but not yet bit-exact in Verilator, in
+`/mnt/data/cormorant_repro/rowstore_b1_2026-10-10.patch`: after a first
+bug — the emitter masked channels with the *current* sweep's count while the
+previous sweep's last group was still going out — the 63 fixtures pass but
+one random job, 3 × 3 stride 6 × 2 on 12 × 14, times out in the ring, and
+Verilator shows the stride-1 depthwise jobs at B3's cycles, stride 2 +33 %
+with ideal memory and nothing under the slow model, whose 0.4 beats per
+cycle is per beat whatever the burst); what it would
+still buy — the ow-tile re-reads, 1 KB bursts — is below the measurement
+floor once the port is right.
+
+Why the outputs on HP0 / HP2 lost (PS_PORTS_PLAN §6–§7) while the x reads on
+HP2 win: the writes were 64-beat bursts that the CCI's two channels already
+carried at full rate, and an HP port gave them one DDRC channel instead of
+two; the x reads are short bursts that the CCI itself throttles.
+
+Promotion gates (the production candidate is this bitstream): the 159-model
+suite, `run_remote_perf` against the `kv260-8599aa7a5f12` baseline, the
+demos (MNIST, MobileNets / ResNet-18, BERT, LightStereo-S):
+
+| gate | `8599aa7a5f12` (production) | **`f70ce632a97a`** (x on HP2 + B3) |
+|---|---|---|
+| `run_remote_tests` (159 models) | 159 / 159 | **159 / 159**, every output equal to the simulation |
+| `run_remote_perf` (63 cases) against the `kv260-8599aa7a5f12` baseline | baseline | 63 / 63 correct; ConvKernel `dw-3x3-64ch-56x56` **−18 %**, `dw-3x3-32ch-28x28` **−16 %**, `3x3-64ch-56x56-s2` **−13 %**, `5x5-16ch-28x28` −3.8 %, the standard 3 × 3 / 1 × 1 cases −0.4…−1.2 %; VectorOP, MatMul, Pool within noise (`GlobalMaxPool-7x7-256` +2.6 %, which a plain re-run of the production bitstream shows too) |
+| MNIST convnet / LeNet | 0.1105 / 1.2504 ms | 0.1080 / 1.2531 ms (−2.3 / +0.2 %); 98.92 % / 97.35 % |
+| MobileNet v1 / v2 | 21.96 / 20.35 ms | **20.45 / 17.51 ms (−6.9 / −14.0 %)**; top-1 unchanged |
+| ResNet-18 | 20.18 ms | 19.98 ms (−1.0 %) |
+| BERT (p50) | 418.0 ms | **363.9 ms (−12.9 %)**; EM / F1 88.0 / 90.3, bit-exact — its MatMul-on-ConvKernel calls stream the activations through the x port |
+| LightStereo-S 640 × 480 | 599 ms per pair | **469 ms (−22 %)**, 2.13 FPS; disparity bit-exact with the simulation |
+
+Everything bit-exact; the board back on `8599aa7a5f12` after the run, the
+chat server restarted.  The candidate for production is this bitstream:
+promotion means the performance-model campaign for `f70ce632a97a`, a
+perf-regression baseline, the cost-model refit (`RTL_CONV_BOARD`,
+`tools/fit_cost_model.py`) and the depthwise-slice margins re-checked (the
+chunk-height effect stays, the x-path cost in it changes), the hw_128
+block design (`bd_conv_x_hp.tcl`, the testbench's HP2 VIP) and B3
+committed, the docs and facts that name the production bitstream and its
+results.
+
+### 8.6 Promotion (2026-10-10 / 11)
+
+The user asked to promote `f70ce632a97a`.  Done:
+
+| step | result |
+|---|---|
+| local `bitstream_config_kv260.json` | names `/mnt/data/bitstreams/kv260_250_f70ce632a97a/` (the previous one saved there as `bitstream_config_kv260.before.json`); loaded, id and fpga0 checked |
+| performance model `kv260/f70ce632a97a` | a plain campaign: `cases` 1490 (ConvKernel grid 371 + shipped 521, MatmulKernel and VectorOP), two passes of 59 s, three refinement rounds (+211, +99, +37; 8 s of board each) → **1837 exact calls**, repeat spread median 0.066 %; families held-out p90 conv 26.7 %, conv-dw 15.3 %, conv-mm 34.9 %, mm-gemv 18.5 %, mm-tiled 7.2 %, pool 42.5 %, vecop 14.1 % — the planner relies on the exact entries |
+| engine cost model (`tools/fit_cost_model.py fit f70ce632a97a`) | the constants as used scored ConvKernel 35.8 / 77.6 % over 1103 calls (bias +0.30: their x-path terms priced the old port), MatmulKernel 4.5 / 18.1 %; the refit **2.9 / 18 %** and 4.7 / 17.8 %, applied (`RTL_CONV_BOARD`, `RTL_COEF`, `CALL_OVERHEAD` 431 → 443 = the new call floor 1.77 µs); `diff`: the CNNs, BERT and Piper keep every engine choice, the Llama / VLM `prefill_16` MatMuls move 60 / 60 / 160 from the GEMV to ConvKernel (kw 2 / 4), which the performance model's measured entries price 1.3 / 1.3 / 40.1 ms per run cheaper — their libraries not regenerated yet |
+| perf-regression baseline `kv260-f70ce632a97a.json` | the 63 cases and the MNIST / image-classification / BERT demos of the validation run |
+| LightStereo-S, 42 pairs + the 2 RealSense ones | **469.5 ms mean / 468.2 p50 per pair (2.13 FPS)**, EPE 0.667 / bad-1 12.21 / bad-2 4.94 on the 42 — the maps unchanged, bit-exact |
+| chat server | restarted on `f70ce632a97a` (the libraries unchanged) |
+| docs and facts | the production id, the headline results and the FPGA utilization (LUT 62 618, BRAM 131 / 144, FF 87 832) in README / CLAUDE.md / the hw_128 docs / the demos' READMEs / the plans' status lines / `facts.yaml`; the scheduler's `--dw-slice` margins re-checked against the new board (below) |
+| the other demos, re-measured | YOLOv5n **63.9 → 46.9 ms (−27 %)**, bit-exact; Piper utterances RTF 0.232 / 0.201 → 0.223 / 0.194, `tts_encode` 20 / 88 / 400 ids 20.4 / 55.7 / 163.9 → **15.7 / 50.6 / 162.0 ms** (the attention convs over few keys are x-bound); SmolLM2-135M 54.9 ms / token, prefill 16 / 64 / 256 155 / 226 / 776 ms (flat), SmolLM2-360M 137.8 ms / token, prefill 256 **1919 → 1701 ms**; SmolVLM `llm_image` 1.91 → 2.07 s — the one number that went the wrong way, see below |
+
+**The depthwise slices on the new board** (`run_remote_perf`, dw 3 × 3 at
+120 × 160: 16 / 32 / 48 / 64 / 144 channels 390 / 773 / 1 169 / 1 587 /
+4 250 µs = 24.4 / 24.2 / 24.4 / 24.8 / 29.5 µs per channel; at 64 × 160:
+16 / 32 / 96 channels 13.5 / 13.1 / 14.0 µs per channel; stride 2 from
+240 × 320: 16 / 32 / 64 channels 50.6 / 51.1 / 52.5; the 2 × 1 dilated-13
+stripe at 60 × 80: 16 / 32 / 96 channels 5.9 / 5.6 / 8.6).  Slicing still
+pays where the chunk height collapses (144 channels −18 %, the stripe
+−35 %) and the slice size no longer matters (16–64 within 2 %); the
+refitted cost model picks 32 there, one call for 96 channels at 64 × 160
+(the board gains 6.6 % as 3 × 32 — just above the 5 % margin, inside the
+model's error) and for the stride-2 shapes (−3 % as 4 × 16: below the
+margin).  `test_dw_slice.py` now accepts any slice of 16–64 for the shapes
+that must slice.
+
+**SmolVLM.**  `llm_image` measured 2.07 s against 1.91 on `8599aa7a5f12`
+(the same library, bit-exact), while every kernel call of its graph is
+within noise of the old campaign's entry (the two performance models'
+shared ConvKernel entries: median −21 %, max +3.4 %; VectorOP / MatMul
+±1 %) and the text model's phases are flat.  An A/B of the two bitstreams
+back to back, the same library and board state: `8599aa7a5f12` 2.154 /
+2.167 s, `f70ce632a97a` 2.066 / 2.057 s — the new bitstream is **4.5 %
+faster**; the 1.91 s on record (2026-10-08) belongs to a board state that
+no longer reproduces on either bitstream (the library and the project are
+the ones gated then; the drift is in the host-bound half of the vision
+phase and is not this change's).  Open: find it (`llm_board.py --profile`
+against the host model's entries).

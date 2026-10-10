@@ -317,6 +317,12 @@ Notable behaviour visible in the run:
 - **Then 250 MHz** (2026-10-06, `doc/plans/FMAX_250_PLAN.md`, bitstream
   `986cef4866a0`): ResNet-18 20.5 ms,
   MobileNet v1 22.0 ms, v2 20.5 ms, the same top-5 classes and logits.
+- **Then ConvKernel's x port off the CCI** (2026-10-10,
+  `doc/plans/DEPTHWISE_PLAN.md` §8.5, bitstream `f70ce632a97a`: the x
+  read port on `S_AXI_HP2_FPD`, the line-buffer loads overlapped with the
+  window reads): ResNet-18 **20.0 ms (50.0 FPS)**, MobileNet v1 **20.5 ms**,
+  v2 **17.5 ms** (their depthwise layers were bound by the coherent
+  interconnect's small-burst rate); the same top-5 classes and logits.
 
 The full per-image top-K table is also written to `build/results.json`.
 
