@@ -109,7 +109,13 @@ The decode step's `LlmAttnPrep` (one row), `LlmAttnMerge` (a 128-byte-row
 gather the unit would not beat) and `LlmDequant` (a host output) stay host
 ops; the decode prep invalidates the V-cache lines it writes 2-byte slots
 into (`llm_cache_inval_rows`): the unit wrote them through a port that does
-not snoop the CPU caches.  `test/host_emu.py` models
+not snoop the CPU caches.  The vision encoder's and the Piper encoder's
+`VitAttnPrep` (`VitAttnPrepRoNode`, phase 4b: the q / k / v bias adds as
+COPYs with the bias in the parameter block — `rowops_spec.bias_round`, the
+studies' `iqkv` — and the same image / cache jobs) and the Piper encoder's
+`TtsRowPrep` (`TtsRowPrepRoNode`: a COPY per tap with the bias and ReLU,
+the zeroed rows as window-[0, 0) COPYs; `TtsAttnRelAdd` then recomputes q
+with the unit's integer formula) run on the unit as well.  `test/host_emu.py` models
 the unit in C (`xrowopskernel.h`), so every generated project runs on the
 host; `perf_model.family()` prices its calls as the `rowops` family once a
 campaign measures them (phase 3).

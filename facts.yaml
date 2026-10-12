@@ -216,7 +216,7 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: '\+90, \+184, \+24, \+8\) → (?P<exact_calls>\d+) exact calls'}
+       regex: '\+58, \+179\) → (?P<exact_calls>\d+) exact calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
@@ -657,14 +657,14 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
-  value: {bert: 216, smollm2_135m: 294, smollm2_360m: 754, smolvlm_256m: 506, piper: 51}
+  value: {bert: 216, smollm2_135m: 294, smollm2_360m: 758, smolvlm_256m: 511, piper: 53}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 94000a8
+    commit: 397eaad
     date: 2026-10-12
-    how: "facts.py verify after HOSTOPS_PLAN phase 2-3: the residual stream as an int32 DMA tensor and the unit's parameter
-          blocks / table image — SmolLM2-135M 293.6, SmolLM2-360M 754.1, SmolVLM 505.6, Piper 51.5, BERT 216 MiB
-          (286 / 740 / 495 / 51 / 216 before; 2026-10-08 after SOFTMAX_PLAN: BERT 215.3, 135M 285.8, 360M 740.2,
+    how: "the projects regenerated for HOSTOPS_PLAN phases 4a-4b (the attention preps' staging states and cos / sin
+          table, the row preps): SmolLM2-135M 293.6, SmolLM2-360M 758.0, SmolVLM 511.4, Piper 52.8, BERT 216 MiB (phase
+          2-3: 293.6 / 754.1 / 505.6 / 51.5 / 216; 286 / 740 / 495 / 51 / 216 before; 2026-10-08 after SOFTMAX_PLAN: BERT 215.3, 135M 285.8, 360M 740.2,
           SmolVLM 494.9, Piper 51.1 MiB)"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
@@ -947,7 +947,7 @@ facts:
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
   value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.6, mobilenet_v2_ms: 17.5, bert_ms: 288,
-          smollm2_135m_tok_s: 20.3, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.7, smolvlm_image_s: 1.7,
+          smollm2_135m_tok_s: 20.3, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.7, smolvlm_image_s: 1.6,
           piper_rtf: 0.19, mnist_convnet_ms: 0.108, mnist_lenet_ms: 1.251, yolov5n_ms: 46.8, yolov5n_fps: 21.4,
           stereo_ms: 466, stereo_fps: 2.15, stereo320_ms: 160}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
@@ -958,7 +958,8 @@ facts:
           SmolLM2-135M 49.4 ms/token = 20.3 tok/s, prefill 16 / 64 / 256 81 / 98 / 398 ms (phase 3: 88 / 111 / 448;
           f70ce632a97a 54.9 ms, 155 / 226 / 776);
           SmolLM2-360M 129.5 ms/token = 7.7 tok/s, prefill 191 / 236 / 1050 ms (phase 3: 200 / 257 / 1125; 1701 at 256 before);
-          SmolVLM llm_image 1.70 s (2.07; its text prefill 256 449 -> 399 ms); tts_board RTF 0.224 / 0.194 (the chunk has no unit ops); MNIST 0.108 / 1.251 ms,
+          SmolVLM llm_image 1.64 s (phase 4b, §10.8: the vision prep on the unit; 1.70 after 4a, 2.07 before; its text
+          prefill 256 449 -> 399 ms); tts_board RTF 0.224 / 0.194 (the chunk has no unit ops); MNIST 0.108 / 1.251 ms,
           ResNet-18 19.99, MobileNet v1 / v2 20.59 / 17.49 ms (no unit ops: unchanged); YOLOv5n run_demo 16 images 46.8 ms
           mean / p50 (21.4 FPS; 46.9 before) and LightStereo-S 44 pairs 466.0 mean / 464.9 ms p50 (2.15 FPS; 469 before),
           both bit-exact — no unit ops in their graphs; the 320 x 256 stereo run not repeated.  Before: 2026-10-10 on
@@ -1155,19 +1156,20 @@ facts:
 - id: piper.encode_ms
   kind: recorded
   title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
-  value: {ids20: 14.2, ids88: 45.5, ids400: 146.0}
+  value: {ids20: 9.5, ids88: 28.4, ids400: 95.8}
   tolerance: {rel: 0.03}                     # the docs round to the ms
   provenance:
     date: 2026-10-12
-    how: "tts_board.py on 1cedaf2ed816 (HOSTOPS_PLAN phase 3: the encoder's residual LayerNorms on the row-ops unit):
-          20 / 60 / 88 / 162 / 268 / 400 ids 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0 ms (f70ce632a97a: 15.7 / 50.6 /
-          162.0 at 20 / 88 / 400)"
+    how: "tts_board.py on 1cedaf2ed816 (HOSTOPS_PLAN phase 4b, §10.8: the encoder's residual LayerNorms, attention prep
+          and row preps on the row-ops unit): 20 / 60 / 88 / 162 / 268 / 400 ids 9.5 / 14.4 / 28.4 / 56.8 / 92.1 / 95.8 ms
+          (phase 3, the LayerNorms alone: 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0; f70ce632a97a: 15.7 / 50.6 / 162.0 at
+          20 / 88 / 400)"
     facts: {perf.bitstream_id: 1cedaf2ed816}   # stale on another bitstream
   fix: report
   mentions:
     - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
     - {file: demo/tts/README.md, regex: '(?P<ids88>\d+) ms for 88 ids, (?P<ids400>\d+) ms for 400 \(51 / 162 before'}
-    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`tts_encode`, (?P<ids20>\d+)–(?P<ids400>\d+) ms'}
+    - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`tts_encode`, (?P<ids20>[\d.]+)–(?P<ids400>[\d.]+) ms'}
 - id: platform.kv260_bounds
   kind: value
   title: the KV260 kernel tiles and bounds the README's kernel table quotes (and the RTL MatmulKernel hard-codes)

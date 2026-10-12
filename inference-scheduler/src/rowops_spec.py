@@ -154,6 +154,52 @@ def quant_bias(bias: np.ndarray, f: int) -> np.ndarray:
     return np.rint(np.asarray(bias, np.float64) * 2.0 ** bb) / 2.0 ** bb
 
 
+BIAS_EXTRA = 8        # a COPY with a bias sums 8 bits below the finer of its input / output grids
+
+
+def bias_exp(bias: np.ndarray, f_x, f_out, extra: int = BIAS_EXTRA) -> np.ndarray:
+    """Per column, the exponent a COPY with a bias sums at (HOSTOPS_PLAN §10.4,
+    the vision / TTS q, k, v bias adds and the TTS row prep): max(f_x, f_out)
+    + extra, at most 24, lowered where round(bias * 2^fp) would leave the
+    int22 parameter — never below max(f_x, f_out) (a ValueError then)."""
+    bias = np.asarray(bias, np.float64).reshape(-1)
+    n = bias.size
+    f_x = np.broadcast_to(np.asarray(f_x, np.int64), (n,))
+    f_out = np.broadcast_to(np.asarray(f_out, np.int64), (n,))
+    lo = np.maximum(f_x, f_out)
+    fp = np.minimum(lo + extra, 24)
+    for _ in range(64):
+        over = np.abs(np.rint(bias * np.power(2.0, fp.astype(np.float64)))) > (1 << 21) - 1
+        if not over.any():
+            break
+        fp = np.where(over, fp - 1, fp)
+    if (fp < lo).any():
+        raise ValueError("bias_exp: a bias too large for the int22 parameter at the output's grid")
+    return fp
+
+
+def bias_params(bias: np.ndarray, f_x, f_out):
+    """The parameter block of a COPY with a bias: (Bq' [n], sh_a [n], sh_c [n])
+    at fp = bias_exp (bq_sh = 0)."""
+    fp = bias_exp(bias, f_x, f_out)
+    n = fp.size
+    bq = np.rint(np.asarray(bias, np.float64).reshape(-1) * np.power(2.0, fp.astype(np.float64))).astype(np.int64)
+    f_x = np.broadcast_to(np.asarray(f_x, np.int64), (n,))
+    f_out = np.broadcast_to(np.asarray(f_out, np.int64), (n,))
+    return bq, fp - f_x, fp - f_out
+
+
+def bias_round(x_raw: np.ndarray, f_x, bias: np.ndarray, f_out, relu: bool = False) -> np.ndarray:
+    """A COPY with a bias (ROWOPS_RTL_KERNEL.md §1.4 COPY): per column
+    y = sat16(rne_shr((x << (fp - f_x)) + round(bias * 2^fp), fp - f_out)), then
+    max(y, 0) with ``relu`` — the host's round((x * 2^-f_x + bias) * 2^f_out)
+    with the bias rounded once at 2^-fp (bias_exp).  x_raw int16 [T][n]."""
+    x_raw = np.asarray(x_raw, np.int64)
+    bq, sa, sc = bias_params(bias, f_x, f_out)
+    y = sat16(rne_shr_vec((x_raw << sa[None, :]) + bq[None, :], sc[None, :]))
+    return np.maximum(y, 0) if relu else y
+
+
 def norm_params(gamma: np.ndarray, n: int, eps: float, f_in: int, beta: Optional[np.ndarray] = None,
                 rms: bool = False):
     """The job constants a norm needs: (G int32 [n], g, Bq [n] or None, E) —
@@ -391,7 +437,7 @@ def table_image() -> bytes:
 
 __all__ = ("rne_shr", "rne_shr_vec", "sat16", "mul_shr_floor", "rsqrt_bf", "rsqrt_table", "norm_params", "beta_bits",
            "rms_norm", "layer_norm", "rope_tables_raw", "rope", "sigmoid_table", "silu_q", "silu_mul",
-           "bias_bits", "quant_bias",
+           "bias_bits", "quant_bias", "BIAS_EXTRA", "bias_exp", "bias_params", "bias_round",
            "OP_COPY", "OP_ADDX", "OP_DEQUANT", "OP_MULACT", "OP_NORM", "OP_ROPE", "OP_XPOSE", "OP_TLOAD",
            "K_I16", "K_I32", "K_F32", "F_B_EN", "F_P_BCAST", "F_P_KEEP", "F_RELU", "F_NORM_LN", "N_MAX",
            "PARAM_BYTES", "TABLE_BYTES", "TABLE_WORDS", "opword", "param_block", "table_image")

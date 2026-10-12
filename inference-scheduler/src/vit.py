@@ -306,7 +306,16 @@ class VitFrontend:
         self._meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
         self._init(kc, np.zeros((N, D), np.float32))
         self._init(vc, np.zeros((N, D), np.float32))
-        kw = self.choose_qk_kw()
+        # rowops (HOSTOPS_PLAN §10, phase 4b): the attention prep on the unit, which
+        # writes the q image at kw = 1 and stages q / v in DMA states of the entry
+        kw = 1 if self.rowops else self.choose_qk_kw()
+        prep_extra, prep_attrs = [], {}
+        if self.rowops:
+            qs = self._t("vision.ro.qs", [N, D], exp=0, state=True)
+            vs = self._t("vision.ro.vs", [N, D], exp=0, state=True)
+            self._init(qs, np.zeros((N, D), np.float32))
+            self._init(vs, np.zeros((N, D), np.float32))
+            prep_extra, prep_attrs = [qs, vs], dict(rowops=1)
         common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
         for li in range(L):
             lw = f"{VP}encoder.layers.{li}."
@@ -325,10 +334,10 @@ class VitFrontend:
             self._node("VitAttnPrep", [q0, k0, v0, kc, vc,
                                        self._vec(f"v.l{li}.bq", W[lw + "self_attn.q_proj.bias"]),
                                        self._vec(f"v.l{li}.bk", W[lw + "self_attn.k_proj.bias"]),
-                                       self._vec(f"v.l{li}.bv", W[lw + "self_attn.v_proj.bias"])],
+                                       self._vec(f"v.l{li}.bv", W[lw + "self_attn.v_proj.bias"])] + prep_extra,
                        [qx], f"{e}.attn_prep", domain=LLM_DOMAIN, num_heads=H, head_dim=HD,
                        qk_kw=kw, q_exp=[int(v) for v in fq], k_exp=[int(v) for v in fk],
-                       v_exp=[int(v) for v in fm.get("vc", li, D)])
+                       v_exp=[int(v) for v in fm.get("vc", li, D)], **prep_attrs)
             R = self.attn_split
             s = [self._t(f"{e}.s{g}", [N, N], exp=0) for g in range(H)]
             if R == 1:

@@ -454,8 +454,11 @@ def cmd_encoder_vsmx(a) -> int:
     out_dir = os.path.join(a.assets, "study")
     # (softmax on the unit, the residual LayerNorms as the row-ops unit's integer
     # LayerNorm — doc/plans/HOSTOPS_PLAN.md §5, piper_vits.ROWOPS_LN)
+    # (+ phase 4b, HOSTOPS_PLAN §10: the whole encoder prep on the unit — the LayerNorms,
+    # the q / k / v bias adds and the row prep's bias + ReLU as its COPY with a bias:
+    # piper_vits.encoder_forward(rowops_unit=True))
     pols = {"host softmax": (False, False), "VectorOP softmax": (True, False),
-            "VectorOP softmax + unit LN": (True, True)}
+            "VectorOP softmax + unit LN": (True, True), "VectorOP softmax + unit": (True, "unit")}
     acc = {k: {"n_diff": 0, "worst": 0, "lsd": [], "dx": [], "dst": []} for k in pols}
     n_ids = n_cross = sat = n_logits = 0
     for name, t in _texts(a, "eval").items():
@@ -468,8 +471,8 @@ def cmd_encoder_vsmx(a) -> int:
         w_of, x_of = {}, {}
         for pol, (unit, iln) in pols.items():
             tr = {}
-            pv.ROWOPS_LN = iln
-            x, st = pv.encoder_forward(EW, E, ids, trace=tr, vsmx_unit=unit)
+            pv.ROWOPS_LN = iln is True
+            x, st = pv.encoder_forward(EW, E, ids, trace=tr, vsmx_unit=unit, rowops_unit=iln == "unit")
             pv.ROWOPS_LN = False
             xq = x.astype(np.float64).T
             mq, lq = st.astype(np.float64).T[:pv.ENC_D], st.astype(np.float64).T[pv.ENC_D:]

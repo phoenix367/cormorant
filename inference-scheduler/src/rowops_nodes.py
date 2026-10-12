@@ -1155,10 +1155,343 @@ def from_vit_layernorm(node, tensors, index, align_elems, ctx: HostContext):
                         _bias(ctx, tensors, node, 2, n, "beta"), eps)
 
 
+@dataclass
+class VitAttnPrepRoNode(RowOpsNode):
+    """VitAttnPrep on the unit (the vision encoder and the Piper encoder: T = C
+    rows, every key valid, pos 0; HOSTOPS_PLAN §10, phase 4b), the jobs —
+
+      * q0 + bq rounded at the per-head q exponent -> the staging rows ``qs``
+        (a COPY with a bias: ``rowops_spec.bias_round``, the policy's iqkv),
+        then one TRANSPOSE (tiles of 8 query rows x HD, the heads as blocks)
+        into the q.K^T x images (kw = 1);
+      * per head a COPY with the bias of k0 straight into the K cache rows
+        (its own parameter block: the exponents and the bias are per head);
+      * v + bv rounded at the V cache's exponents -> ``vs``, then the V image:
+        group_kw 1 a COPY with the heads as blocks, else per head the
+        whole-block TRANSPOSEs of ``vimage_jobs`` (T % 16K == 0: no boundary
+        rows).
+
+    Every job is static (no runtime n)."""
+    T:  int = 1
+    H:  int = 1
+    HD: int = 16
+    C:  int = 16
+    K:  int = 1
+    pq_bc: bool = False
+    pv_bc: bool = False
+    fq: Optional[np.ndarray] = field(default=None, repr=False)     # [H]
+    fk: Optional[np.ndarray] = field(default=None, repr=False)     # [H]
+    fv: Optional[np.ndarray] = field(default=None, repr=False)     # [D]
+    bq: Optional[np.ndarray] = field(default=None, repr=False)
+    bk: Optional[np.ndarray] = field(default=None, repr=False)
+    bv: Optional[np.ndarray] = field(default=None, repr=False)
+    q0: object = field(default=None, repr=False)
+    k0: object = field(default=None, repr=False)
+    v:  object = field(default=None, repr=False)
+    ck: object = field(default=None, repr=False)
+    cv: object = field(default=None, repr=False)
+    qs: object = field(default=None, repr=False)
+    vs: object = field(default=None, repr=False)
+    pq: object = field(default=None, repr=False)
+    pk: list = field(default_factory=list, repr=False)
+    pvb: object = field(default=None, repr=False)
+    pz: object = field(default=None, repr=False)
+
+    @property
+    def D(self) -> int:
+        return self.H * self.HD
+
+    def state_writes(self):
+        return [self.ck, self.cv, self.qs, self.vs]
+
+    def state_updates(self):
+        return self.state_writes()
+
+    def _strides(self, layouts):
+        nd, al = self.onnx_node, self.align_elems
+        return (row_stride_bytes(self.q0, layouts, self.D, 2, nd, al),
+                row_stride_bytes(self.k0, layouts, self.D, 2, nd, al),
+                row_stride_bytes(self.v, layouts, self.D, 2, nd, al))
+
+    def _jobs(self, layouts):
+        sq, sk, sv = self._strides(layouts)
+        T, H, HD, C, K, D = self.T, self.H, self.HD, self.C, self.K, self.D
+        SQ = SV = D * 2
+        NW = NO_WINDOW
+        xp = rs.opword(rs.OP_XPOSE)
+        jobs = [("q0 + bq at f_q[h] -> qs", self.q0, 0, None, 0, self.qs, 0, self.pq,
+                 rs.opword(rs.OP_COPY, p_bcast=self.pq_bc), D, T, 1, sq, 0, 0, 0, SQ, 0, 0, 0, NW),
+                ("qs -> the q.K^T x image of every head (8-row tiles, the heads as blocks)", self.qs, 0,
+                 None, 0, self.output, 0, None, xp, HD, T // QIMAGE_R, H, QIMAGE_R * SQ, HD * 2, SQ, 2 * T,
+                 2 * QIMAGE_R, HD * T * 2, QIMAGE_R, 0, NW)]
+        for h in range(H):
+            jobs.append((f"k0 + bk of head {h} at f_k -> the K cache", self.k0, h * HD * 2, None, 0, self.ck,
+                         h * C * HD * 2, self.pk[h], rs.opword(rs.OP_COPY), HD, T, 1, sk, 0, 0, 0, HD * 2, 0,
+                         0, 0, NW))
+        jobs.append(("v + bv at the V cache's exponents -> vs", self.v, 0, None, 0, self.vs, 0, self.pvb,
+                     rs.opword(rs.OP_COPY, p_bcast=self.pv_bc), D, T, 1, sv, 0, 0, 0, SV, 0, 0, 0, NW))
+        if K == 1:
+            jobs.append(("vs -> the V cache rows (the heads as blocks)", self.vs, 0, None, 0, self.cv, 0,
+                         self.pz, rs.opword(rs.OP_COPY, p_bcast=True), HD, T, H, SV, HD * 2, 0, 0, HD * 2,
+                         C * HD * 2, 0, 0, NW))
+        else:
+            for h in range(H):
+                for a_off, c_off, rows, blocks, a_s1, a_s2, b_s1, b_s2, c_s1, c_s2, R in \
+                        vimage_jobs(0, T, HD, K, SV):
+                    jobs.append((f"the V image of head {h}", self.vs, h * HD * 2 + a_off, None, 0, self.cv,
+                                 h * C * HD * 2 + c_off, None, xp, HD, rows, blocks, a_s1, a_s2, b_s1, b_s2,
+                                 c_s1, c_s2, R, 0, NW))
+        return jobs
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall, merge
+        return merge([KernelCall.of("RowOpsKernel", op=j[8], n=j[9], rows=j[10], blocks=j[11], a_s1=j[12],
+                                    a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
+                                    win_lo=j[19], win_hi=j[20]) for j in self._jobs(layouts)])
+
+    def describe(self) -> str:
+        return (f"T={self.T} heads {self.H} head_dim {self.HD} on RowOpsKernel (the biases in the parameter "
+                f"blocks, the q image kw=1, the caches; V interleave {self.K})")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] VitAttnPrep({self.q0.onnx_name}, {self.k0.onnx_name}, {self.v.onnx_name}) "
+                f"-> {self.output.onnx_name} + the caches  on RowOpsKernel: {self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        cn = lambda t: "NULL" if t is None else t.c_name   # noqa: E731
+        lines = ["    {"]
+        for i, j in enumerate(self._jobs(layouts)):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(f"        /* {j[0]} */")
+            lines.append(self.call(cn(j[1]), j[2], cn(j[3]), j[4], cn(j[5]), j[6], cn(j[7]), j[8], j[9], j[10],
+                                   j[11], j[12], j[13], j[14], j[15], j[16], j[17], 0, j[18], 0, j[19], j[20],
+                                   indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        a = {t.onnx_name: x for t, x in zip(self.inputs, ins, strict=True)}
+        T, H, HD, D, F = self.T, self.H, self.HD, self.D, self.F
+        p2 = lambda e: np.power(2.0, np.asarray(e, np.float64))   # noqa: E731
+        raw = lambda t: np.rint(np.asarray(a[t.onnx_name], np.float64).reshape(T, D)   # noqa: E731
+                                * p2(_exps(t, F))[None, :]).astype(np.int64)
+        ck, cv = a[self.ck.onnx_name], a[self.cv.onnx_name]       # logical state arrays (raw), in place
+        ck[:T] = rs.bias_round(raw(self.k0), _exps(self.k0, F), self.bk, np.repeat(self.fk, HD))
+        cv[:T] = rs.bias_round(raw(self.v), _exps(self.v, F), self.bv, self.fv)
+        yq = rs.bias_round(raw(self.q0), _exps(self.q0, F), self.bq, np.repeat(self.fq, HD))
+        return yq.astype(np.float64).reshape(T, H, HD).transpose(1, 2, 0).copy()      # [H][HD][T]
+
+
+def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
+    """VitAttnPrep: VitAttnPrepRoNode with the attribute rowops = 1 (src/vit.py /
+    src/piper.py rowops=True), else the host op."""
+    from .host_nodes import _attrs
+    from .llm_nodes import _attr_ints, _llm_inputs, _resolve
+    from .vit_nodes import VitAttnPrepNode, _bias
+    if not _rowops_attr(node):
+        return VitAttnPrepNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    _need_unit(node, "rowops = 1")
+    F = ctx.frac_bits
+    ins = _llm_inputs(node, tensors)
+    _require(len(ins) == 10, node, "inputs: q0, k0, v, cache_k, cache_v, bq, bk, bv, qs, vs")
+    q0, k0, v, ck, cv, _bq, _bk, _bv, qs, vs = ins
+    y = _resolve(tensors, node.output[0], node)
+    a = _attrs(node)
+    H, HD = int(a["num_heads"]), int(a["head_dim"])
+    C = int(ck.shape[0])
+    D = H * HD
+    T = q0.numel // D
+    K = int(cv.group_kw)
+    _require(int(a.get("qk_kw", 1)) == 1, node, "the unit writes the q image with qk_kw = 1")
+    _require(HD % 16 == 0 and HD <= 1024, node, f"head_dim {HD}: a multiple of 16")
+    _require(T == C, node, f"rows {T} must equal the cache rows {C} (every key is valid)")
+    _require(T % QIMAGE_R == 0, node, f"rows {T} % {QIMAGE_R} (the q image's tiles)")
+    _require(K == 1 or T % (16 * K) == 0, node, f"rows {T} % the V image's {16 * K}-row blocks")
+    _require(q0.numel == k0.numel == v.numel == T * D, node, "q / k / v shapes")
+    _require(list(y.shape) == [H, HD, T], node, f"qx must be [{H}][{HD}][{T}]")
+    for t, w in ((q0, "q0"), (k0, "k0"), (v, "v"), (y, "qx")):
+        _require(t.dma is None and t.host is None and not t.is_state, node, f"{w}: an int16 DMA tensor")
+    for t, w in ((ck, "cache_k"), (cv, "cache_v")):
+        _require(t.is_state and not t.is_host and t.group_layout == (H, HD), node,
+                 f"{w} must be a DMA state stored group-major [{H}][{C}][{HD}]")
+        _require(not t.exp_channels(F).any(), node, f"{w} holds raw integers (exponent 0)")
+    _require(ck.group_kw == 1, node, "the K cache rows must not be interleaved")
+    for t, w in ((qs, "qs"), (vs, "vs")):
+        _require(t is not None and t.is_state and not t.is_host and t.dma is None
+                 and list(t.shape) == [T, D], node, f"{w}: an int16 DMA state [{T}][{D}]")
+    fq = np.asarray(_attr_ints(a, "q_exp", node, H), np.int64)
+    fk = np.asarray(_attr_ints(a, "k_exp", node, H), np.int64)
+    fv = np.asarray(_attr_ints(a, "v_exp", node, D), np.int64)
+    bq, bk, bv = (_bias(ctx, tensors, node, i, D, w) for i, w in ((5, "bq"), (6, "bk"), (7, "bv")))
+    try:
+        bqq, saq, scq = rs.bias_params(bq, _exps(q0, F), np.repeat(fq, HD))
+        bkq, sak, sck = rs.bias_params(bk, _exps(k0, F), np.repeat(fk, HD))
+        bvq, sav, scv = rs.bias_params(bv, _exps(v, F), fv)
+    except ValueError as e:
+        raise SchedulerError(f"{node.op_type} node '{_label(node)}': {e}") from None
+    _require((saq <= 63).all() and (sak <= 63).all() and (sav <= 63).all(), node, "exponents beyond the shifts")
+    pq, pq_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pq", 0, bqq, saq, 0, scq, D)
+    pk = [param_tensor(tensors, f"{y.onnx_name}__rowops_pk{h}",
+                       rs.param_block(np.zeros(HD, np.int64), bkq[h * HD:(h + 1) * HD], sak[h * HD:(h + 1) * HD],
+                                      0, sck[h * HD:(h + 1) * HD])) for h in range(H)]
+    pvb, pv_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pv", 0, bvq, sav, 0, scv, D)
+    pz = zero_param_tensor(tensors)
+    tb = tables_tensor(tensors)
+    return VitAttnPrepRoNode(onnx_node=node, inputs=[q0, k0, v, ck, cv, qs, vs, pq, *pk, pvb, pz, tb], output=y,
+                             index=index, align_elems=align_elems, F=F, T=T, H=H, HD=HD, C=C, K=K,
+                             pq_bc=pq_bc, pv_bc=pv_bc, fq=fq, fk=fk, fv=fv, bq=bq, bk=bk, bv=bv, q0=q0, k0=k0,
+                             v=v, ck=ck, cv=cv, qs=qs, vs=vs, pq=pq, pk=pk, pvb=pvb, pz=pz)
+
+
 VIT_OVERRIDES = {
     "VitResAdd":    from_vit_resadd,
     "VitLayerNorm": from_vit_layernorm,
+    "VitAttnPrep":  from_vit_attn_prep,
 }
+
+
+# ------------------------------------------------------------------ #
+# The TTS encoder's row prep (src/piper.py rowops=True)                #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class TtsRowPrepRoNode(RowOpsNode):
+    """TtsRowPrep on the unit: x [T][C] at f_in -> y [T][taps·C] at f_out, row
+    t's tap k reading row t + k - h (h = (taps - 1) / 2; zero outside [0, n)),
+    + bias, ReLU, rows t >= n zero.  Per tap a COPY of the rows it reads (with
+    the bias and RELU in the parameter block: ``rowops_spec.bias_round``; a
+    plain re-round without one, exact) at the tap's column block; the rows the
+    host zeroes — the first tap's row 0, the last tap's row n - 1, every row
+    t >= n — as COPYs with the window [0, 0).  ``n`` is a runtime value
+    (``_n``, ``_n1`` = n - 1, ``_nz`` = n > 0 in the emitted C); the calls are
+    priced at n = T."""
+    T: int = 1
+    C: int = 1
+    taps: int = 1
+    relu: int = 0
+    f_in: int = 0
+    f_out: int = 0
+    pb_bc: bool = False
+    bias: Optional[np.ndarray] = field(default=None, repr=False)
+    x:   object = field(default=None, repr=False)
+    n_t: object = field(default=None, repr=False)
+    pb:  object = field(default=None, repr=False)
+    pz:  object = field(default=None, repr=False)
+
+    @property
+    def calls_env(self) -> dict:
+        return {"_n": self.T, "_n1": self.T - 1, "_nz": 1}
+
+    def _jobs(self, layouts, n, n1, nz):
+        nd, al = self.onnx_node, self.align_elems
+        T, C, taps = self.T, self.C, self.taps
+        SX = row_stride_bytes(self.x, layouts, C, 2, nd, al)
+        SY = row_stride_bytes(self.output, layouts, taps * C, 2, nd, al)
+        NW = NO_WINDOW
+        opc = rs.opword(rs.OP_COPY, p_bcast=self.pb_bc, relu=bool(self.relu))
+        opz = rs.opword(rs.OP_COPY, p_bcast=True)
+        h = (taps - 1) // 2
+        sy = lambda r: f"{r} * {SY}u" if isinstance(r, str) else r * SY   # noqa: E731
+        jobs = []
+        for k in range(taps):
+            d = k - h
+            if d == 0:
+                jobs.append((f"tap {k}: x rows [0, n) -> y columns [{k * C}, {(k + 1) * C})", self.x, 0, None, 0,
+                             self.output, k * C * 2, self.pb, opc, C, n, 1, SX, 0, 0, 0, SY, 0, 0, 0, NW))
+            elif d < 0:
+                jobs.append((f"tap {k}: x rows [0, n - 1) -> y rows [1, n)", self.x, 0, None, 0, self.output,
+                             k * C * 2 + SY, self.pb, opc, C, n1, 1, SX, 0, 0, 0, SY, 0, 0, 0, NW))
+                jobs.append((f"tap {k}: y row 0 zero", self.output, 0, None, 0, self.output, k * C * 2,
+                             self.pz, opz, C, nz, 1, SY, 0, 0, 0, SY, 0, 0, 0, 0))
+            else:
+                jobs.append((f"tap {k}: x rows [1, n) -> y rows [0, n - 1)", self.x, SX, None, 0, self.output,
+                             k * C * 2, self.pb, opc, C, n1, 1, SX, 0, 0, 0, SY, 0, 0, 0, NW))
+                jobs.append((f"tap {k}: y row n - 1 zero", self.output, 0, None, 0, self.output,
+                             f"{k * C * 2}u + {sy(n1)}" if isinstance(n1, str) else k * C * 2 + sy(n1),
+                             self.pz, opz, C, nz, 1, SY, 0, 0, 0, SY, 0, 0, 0, 0))
+        jobs.append(("rows [n, T) zero", self.output, 0, None, 0, self.output, sy(n), self.pz, opz, taps * C,
+                     f"{T}u - {n}" if isinstance(n, str) else T - n, 1, SY, 0, 0, 0, SY, 0, 0, 0, 0))
+        return jobs
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall, merge
+        return merge([KernelCall.of("RowOpsKernel", op=j[8], n=j[9], rows=j[10], blocks=j[11], a_s1=j[12],
+                                    a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
+                                    win_lo=j[19], win_hi=j[20])
+                      for j in self._jobs(layouts, self.T, self.T - 1, 1)])
+
+    def describe(self) -> str:
+        return (f"[{self.T}][{self.C}] -> taps {self.taps}" + (" + bias" if self.bias is not None else "")
+                + (" ReLU" if self.relu else "") + " on RowOpsKernel (COPY per tap, the window for the zero rows)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsRowPrep({self.x.onnx_name}) -> {self.output.onnx_name}  "
+                f"on RowOpsKernel: {self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        cn = lambda t: "NULL" if t is None else t.c_name   # noqa: E731
+        lines = ["    {",
+                 f"        const unsigned _n = (unsigned){self.n_t.c_name}[0] > {self.T}u ? {self.T}u : "
+                 f"(unsigned){self.n_t.c_name}[0];",
+                 ] + (["        const unsigned _n1 = _n ? _n - 1u : 0u, _nz = _n ? 1u : 0u;"]
+                      if self.taps > 1 else [])
+        for i, j in enumerate(self._jobs(layouts, "_n", "_n1", "_nz")):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(f"        /* {j[0]} */")
+            lines.append(self.call(cn(j[1]), j[2], cn(j[3]), j[4], cn(j[5]), j[6], cn(j[7]), j[8], j[9], j[10],
+                                   j[11], j[12], j[13], j[14], j[15], j[16], j[17], 0, j[18], 0, j[19], j[20],
+                                   indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        T, C, taps = self.T, self.C, self.taps
+        x = np.rint(np.asarray(ins[0], np.float64).reshape(T, C) * 2.0 ** self.f_in).astype(np.int64)
+        n = max(0, min(int(np.asarray(ins[1]).reshape(-1)[0]), T))
+        bias = np.zeros(C) if self.bias is None else self.bias
+        core = rs.bias_round(x, self.f_in, bias, self.f_out, relu=bool(self.relu)).astype(np.float64)
+        core[n:] = 0.0
+        h = (taps - 1) // 2
+        p = np.pad(core, ((h, h), (0, 0)))
+        y = np.concatenate([p[k:k + T] for k in range(taps)], axis=1)
+        y[n:] = 0.0
+        return (y / 2.0 ** self.f_out).reshape(self.output.shape)
+
+
+def from_tts_rowprep(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsRowPrep: TtsRowPrepRoNode with the attribute rowops = 1, else the host op."""
+    from .host_nodes import _attrs
+    from .tts_nodes import TtsRowPrepNode, _exp
+    from .vit_nodes import _bias
+    if not _rowops_attr(node):
+        return TtsRowPrepNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    _need_unit(node, "rowops = 1")
+    F = ctx.frac_bits
+    x, n, y = tensors[node.input[0]], tensors[node.input[1]], tensors[node.output[0]]
+    a = _attrs(node)
+    C = int(x.shape[-1])
+    T = x.numel // C
+    taps, relu = int(a.get("taps", 1)), int(a.get("relu", 0))
+    _require(taps in (1, 3), node, "taps 1 or 3")
+    _require(x.dma is None and x.host is None and not x.is_state and y.dma is None and y.host is None, node,
+             "x / y: int16 DMA tensors")
+    _require(n.host == "i32", node, "n: an int32 host tensor")
+    _require(y.numel == T * taps * C, node, "output [T][taps * C]")
+    _require(C % align_elems == 0, node, f"row length {C} % {align_elems}")
+    f_in, f_out = _exp(x, node), _exp(y, node)
+    bias = _bias(ctx, tensors, node, 2, C, "bias") if len(node.input) > 2 and node.input[2] else None
+    try:
+        bq, sa, sc = rs.bias_params(np.zeros(C) if bias is None else bias, f_in, f_out)
+    except ValueError as e:
+        raise SchedulerError(f"{node.op_type} node '{_label(node)}': {e}") from None
+    _require((sa <= 63).all() and (sc <= 63).all(), node, "exponents beyond the shifts")
+    pb, pb_bc = _pblock(tensors, f"{y.onnx_name}__rowops_p", 0, bq, sa, 0, sc, C)
+    pz = zero_param_tensor(tensors)
+    return TtsRowPrepRoNode(onnx_node=node, inputs=[x, n, pb, pz, tables_tensor(tensors)], output=y, index=index,
+                            align_elems=align_elems, F=F, T=T, C=C, taps=taps, relu=relu, f_in=f_in, f_out=f_out,
+                            pb_bc=pb_bc, bias=bias, x=x, n_t=n, pb=pb, pz=pz)
 
 
 # ------------------------------------------------------------------ #
@@ -1195,6 +1528,7 @@ def from_tts_layernorm(node, tensors, index, align_elems, ctx: HostContext):
 TTS_OVERRIDES = {
     "TtsResAdd":    from_tts_resadd,
     "TtsLayerNorm": from_tts_layernorm,
+    "TtsRowPrep":   from_tts_rowprep,
 }
 
 
@@ -1211,5 +1545,6 @@ __all__ = ("TABLES_NAME", "NO_WINDOW", "enabled", "raw_as_data", "tables_tensor"
            "row_stride_bytes", "RowOpsNode", "LayerNormRoNode", "layernorm_ineligible",
            "from_onnx_layernorm", "ResAddRoNode", "RMSNormRoNode", "SiluMulRoNode", "LLM_OVERRIDES",
            "AttnPrepRoNode", "from_llm_attn_prep", "rope_raw_tensor", "zero_param_tensor", "vimage_jobs",
-           "ATTN_PREP_C", "QIMAGE_R",
+           "ATTN_PREP_C", "QIMAGE_R", "VitAttnPrepRoNode", "from_vit_attn_prep", "TtsRowPrepRoNode",
+           "from_tts_rowprep",
            "ResAddBiasRoNode", "LayerNorm32RoNode", "VIT_OVERRIDES", "TTS_OVERRIDES")

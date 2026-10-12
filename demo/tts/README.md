@@ -45,11 +45,11 @@ flowchart TB
   RTF 0.19.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
   Since 2026-10-08 its attention softmax runs on VectorOPKernel's softmax
-  unit (SOFTMAX_PLAN §5) and its residual LayerNorms on the row-ops unit (HOSTOPS_PLAN phase 3): 46 ms for 88 ids, 146 ms for 400 (51 / 162 before the row-ops unit, 208 before the FPGA encoder).
+  unit (SOFTMAX_PLAN §5) and its residual LayerNorms, attention prep and row preps on the row-ops unit (HOSTOPS_PLAN phases 3–4b): 28 ms for 88 ids, 96 ms for 400 (51 / 162 before the unit, 46 / 146 with its LayerNorms alone, the row-ops unit, 208 before the FPGA encoder).
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.
-- **Memory:** 51 MiB of CMA.
+- **Memory:** 53 MiB of CMA.
 - **Quality:** the int16 datapath is within 0.19 dB log-mel of float (§3);
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
   one frame (§6); with its softmax on VectorOPKernel 0.39 dB and 0.26%

@@ -126,9 +126,9 @@ every counter is sized for the register value.
 | `LlmSiluMulNode` | MULACT |
 | `LlmDequantNode` | DEQUANT |
 | `LlmAttnPrepNode` (the prefill entries — `AttnPrepRoNode`, HOSTOPS_PLAN §10) | ROPE on q0 (→ a staging row at f_q[h]) and k0 (→ a staging row at f_k[g]), one COPY of the k rows into the K cache (`blocks` = the KV groups), a COPY re-rounding v where the V cache's exponents differ, one TRANSPOSE per KV group of the q rows into the q·Kᵀ x image (tiles of 8 query rows, `kw` 1), the V image per group as TRANSPOSEs: the 16K-row blocks inside [pos, pos + n) with R = group_kw (contiguous granules), the two boundary blocks as R = 1 granules (byte-strobed); a COPY with the window [0, 0) zeroes the q staging once per run |
-| `VitAttnPrepNode`, Piper's | COPY with the bias and the per-head rounding, TRANSPOSE into the image |
+| `VitAttnPrepNode`, Piper's (`VitAttnPrepRoNode`, phase 4b) | q0 + bq and v + bv as COPYs with the bias in the parameter block (`rowops_spec.bias_round`: Bq' = round(b·2^fp), fp = `bias_exp`) into staging rows, k0 + bk per head straight into the K cache, one TRANSPOSE of the q rows into every head's image (the heads as blocks), the V image per head as the whole-block TRANSPOSEs (T = C = a multiple of 16K) or, group_kw 1, one COPY with the heads as blocks |
 | `LlmAttnMergeNode`, `TtsAttnMergeNode` | COPY per group (2-level: rows t, heads hh) |
-| `TtsRowPrepNode` | one COPY per tap with the window (`win_lo/hi`), the bias and `RELU` |
+| `TtsRowPrepNode` (`TtsRowPrepRoNode`, phase 4b) | one COPY per tap of the rows it reads (`rows = n`, the output shifted by the tap's offset) with the bias and `RELU` in the parameter block; the rows the host zeroes (the first tap's row 0, the last tap's row n − 1, every row ≥ n) as COPYs with the window [0, 0) |
 | `TransposeNode` (head split), `ConcatNode`, `SliceNode` | COPY |
 
 ## 2. Architecture
@@ -272,7 +272,7 @@ with phase 3.
   `rowops_spec.py` in 64- / 128-bit integer arithmetic — checked per case on
   the whole output region (every element, the zeroed tail lanes, no stray
   write), ap_done / interrupt behaviour, no traffic on the unused ID.
-- **Fixtures** `hw/test_data/rowops_test_data/` (27 cases: `manifest.txt`,
+- **Fixtures** `hw/test_data/rowops_test_data/` (28 cases: `manifest.txt`,
   `test_NN_{a,b,p,c}.hex` — every op, kinds, tails, the window, the
   broadcast and per-column parameter block, both norms, ROPE at HD 64,
   contiguous and strobed transposes): written by `scripts/gen_fixtures.py`

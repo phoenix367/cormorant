@@ -457,7 +457,7 @@ class PiperEncoderFrontend:
     def _rowprep(self, x, y, cols, exp, taps=1, bias=None, relu=0):
         self._t(y, [self.T, taps * cols], exp=exp)
         ins = [x, self.n] + ([self._init(f"v.enc.{bias}", self.EW[bias])] if bias else [])
-        self._node("TtsRowPrep", ins, [y], y, taps=taps, relu=relu)
+        self._node("TtsRowPrep", ins, [y], y, taps=taps, relu=relu, **(dict(rowops=1) if self.rowops else {}))
         return y
 
     def entry(self) -> onnx.ModelProto:
@@ -477,7 +477,14 @@ class PiperEncoderFrontend:
         self.meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
         self._init(kc, np.zeros((T, D), np.float32))
         self._init(vc, np.zeros((T, D), np.float32))
-        kw = self.choose_qk_kw()
+        kw = 1 if self.rowops else self.choose_qk_kw()      # the unit writes the q image at kw = 1
+        prep_extra, prep_attrs = [], {}
+        if self.rowops:                                      # the prep's staging rows (HOSTOPS_PLAN §10)
+            qs = self._t(f"{p}.ro.qs", [T, D], exp=0, state=True)
+            vs = self._t(f"{p}.ro.vs", [T, D], exp=0, state=True)
+            self._init(qs, np.zeros((T, D), np.float32))
+            self._init(vs, np.zeros((T, D), np.float32))
+            prep_extra, prep_attrs = [qs, vs], dict(rowops=1)
         common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
         fp = E["enc.p"]
         fx = E["enc.x0"]
@@ -490,9 +497,9 @@ class PiperEncoderFrontend:
             qx = self._t(f"{te}.qx", [H, HD, T], exp=0)
             bq = self._init(f"v.enc.l{i}.bq", EW[f"l{i}.bq"])
             self._node("VitAttnPrep", [q0, k0, v0, kc, vc, bq, self._init(f"v.enc.l{i}.bk", EW[f"l{i}.bk"]),
-                                       self._init(f"v.enc.l{i}.bv", EW[f"l{i}.bv"])],
+                                       self._init(f"v.enc.l{i}.bv", EW[f"l{i}.bv"])] + prep_extra,
                        [qx], f"{te}.attn_prep", num_heads=H, head_dim=HD, qk_kw=kw,
-                       q_exp=[E[f"{e}.q"]] * H, k_exp=[E[f"{e}.k"]] * H, v_exp=[E[f"{e}.v"]] * D)
+                       q_exp=[E[f"{e}.q"]] * H, k_exp=[E[f"{e}.k"]] * H, v_exp=[E[f"{e}.v"]] * D, **prep_attrs)
             ek = self._init(f"v.enc.l{i}.ek", EW[f"l{i}.ek"].reshape(-1))
             s = [self._t(f"{te}.s{g}", [T, T], exp=0) for g in range(H)]
             pr = [self._t(f"{te}.p{g}", [T, T], exp=0) for g in range(H)]
@@ -503,7 +510,8 @@ class PiperEncoderFrontend:
                 if self.vsmx:                               # the band on the host, the softmax on the unit
                     lg = self._t(f"{te}.l{g}", [T, T], exp=0)
                     self._node("TtsAttnRelAdd", [s[g], q0, bq, ek, self.n], [lg], f"{te}.reladd{g}", head=g,
-                               head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]])
+                               head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]],
+                               **prep_attrs)
                     self._node("TtsAttnSoftmax", [lg, self.n], [pr[g]], f"{te}.softmax{g}", vsmx=1,
                                s_exp=[E[f"{e}.s"]], p_exp=[fp])
                 else:

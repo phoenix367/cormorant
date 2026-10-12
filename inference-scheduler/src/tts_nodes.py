@@ -55,7 +55,7 @@ import numpy as np
 from .host_nodes import HostContext, _c_double, _resolve
 from .llm_nodes import (LLM_DOMAIN, HostTable, LlmKernelNode, LlmNode, _attr_ints, _const_array,
                         _require, table_kind)
-from .vit_nodes import _bias, float_array_item
+from .vit_nodes import _bias, float_array_item, int_array_item
 
 __all__ = ("TTS_OP_FACTORIES", "TtsNode", "TtsPrepNode", "TtsGateNode", "TtsSumNode", "TtsAddVopNode",
            "TtsFlowOutNode", "TtsInterleaveNode", "TtsPcmNode", "TtsEmbedNode", "TtsRowPrepNode",
@@ -665,6 +665,7 @@ class TtsAttnRelAddNode(TtsNode):
     fs: int = 0
     fq: int = 0
     fq0: int = 0
+    unit_q: bool = False          # rowops = 1: q as the row-ops unit's prep wrote it (rowops_spec.bias_round)
     bq: Optional[np.ndarray] = field(default=None, repr=False)
     ek: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -681,6 +682,7 @@ class TtsAttnRelAddNode(TtsNode):
         sn = cls(onnx_node=node, inputs=[s, q0, n], output=y, index=index, align_elems=align_elems,
                  F=ctx.frac_bits, T=T, C=C, HD=HD, D=D, g=int(a["head"]), W=W,
                  fs=_attr_ints(a, "s_exp", node, 1)[0], fq=_attr_ints(a, "q_exp", node, 1)[0],
+                 unit_q=int(a.get("rowops", 0)) != 0,
                  bq=_bias(ctx, tensors, node, 2, D, "bq"), ek=_bias(ctx, tensors, node, 3, (2 * W + 1) * HD, "ek"))
         sn._want(s, None, "scores")
         sn._want(q0, None, "q0")
@@ -691,8 +693,18 @@ class TtsAttnRelAddNode(TtsNode):
         _require(list(y.shape) == [C, T] and C == T, node, "logits [C][T], C == T")
         return sn
 
+    def _unit_params(self):
+        """The unit's COPY parameters of the q prep (rowops_spec.bias_params) as
+        one int32 array [3][D]: Bq', sh_a, sh_c per column."""
+        from . import rowops_spec as rs
+        bq, sa, sc = rs.bias_params(self.bq, self.fq0, self.fq)
+        return np.concatenate([bq, sa, sc]).astype(np.int64)
+
     def c_runtime(self):
-        return [float_array_item("_tts_b", self.bq)[1], float_array_item("_tts_e", self.ek)[1]]
+        items = [float_array_item("_tts_b", self.bq)[1], float_array_item("_tts_e", self.ek)[1]]
+        if self.unit_q:
+            items.append(int_array_item("_tts_rq", self._unit_params())[1])
+        return items
 
     def describe(self):
         return (f"head {self.g}: [{self.C}] keys x [{self.T}] queries + the relative-key band "
@@ -701,7 +713,8 @@ class TtsAttnRelAddNode(TtsNode):
     def c_call(self, ins, out, scratch, direct, dtype):
         bq = float_array_item("_tts_b", self.bq)[0]
         ek = float_array_item("_tts_e", self.ek)[0]
-        return [f"tts_attn_rel_add({ins[0]}, {ins[1]}, {bq}, {ek}, {self.T}u, {self.C}u, {self.D}u, "
+        rq = int_array_item("_tts_rq", self._unit_params())[0] if self.unit_q else "NULL"
+        return [f"tts_attn_rel_add({ins[0]}, {ins[1]}, {bq}, {rq}, {ek}, {self.T}u, {self.C}u, {self.D}u, "
                 f"{self.HD}u, {self.g}u, {self.W}u, {ins[2]}[0], {_p2(-self.fq0)}, {_p2(self.fq)}, "
                 f"{_p2(self.fs)}, {out});"]
 
@@ -710,7 +723,12 @@ class TtsAttnRelAddNode(TtsNode):
         q0 = np.asarray(ins[1], np.float64).reshape(self.T, self.D)
         n = min(max(int(np.asarray(ins[2]).reshape(-1)[0]), 0), self.C)
         sl = slice(self.g * self.HD, (self.g + 1) * self.HD)
-        q = np.clip(np.round((q0[:n, sl] + self.bq[sl].astype(np.float64)) * 2.0 ** self.fq), -32768, 32767)
+        if self.unit_q:
+            from . import rowops_spec as rs
+            q = rs.bias_round(np.rint(q0[:n] * 2.0 ** self.fq0).astype(np.int64), self.fq0, self.bq,
+                              self.fq)[:, sl].astype(np.float64)
+        else:
+            q = np.clip(np.round((q0[:n, sl] + self.bq[sl].astype(np.float64)) * 2.0 ** self.fq), -32768, 32767)
         qv = q * 2.0 ** -self.fq
         ek = self.ek.astype(np.float64).reshape(2 * self.W + 1, self.HD)
         rel = np.cumsum(qv[:, None, :] * ek[None, :, :], axis=-1)[..., -1]      # [n][2W + 1]
@@ -1487,13 +1505,23 @@ static void tts_attn_softmax(const Data_t *s, const Data_t *q0, const float *bq,
 }
 
 typedef struct {
-    const Data_t *s, *q0;
-    const float  *bq, *ek;
-    unsigned      T, C, D, HD, g, W;
-    int           n;
-    double        sq0, iq, is;
-    Data_t       *l;
+    const Data_t  *s, *q0;
+    const float   *bq, *ek;
+    const int32_t *rq;             /* the row-ops unit's q prep: Bq', sh_a, sh_c per column, or NULL */
+    unsigned       T, C, D, HD, g, W;
+    int            n;
+    double         sq0, iq, is;
+    Data_t        *l;
 } tts_arel_t;
+
+/* round half to even of v / 2^k (k >= 0), as the unit's rne_shr */
+static inline int64_t tts_rne_shr(int64_t v, unsigned k)
+{
+    int64_t q, r, half;
+    if (!k) return v;
+    q = v >> k; r = v - (q << k); half = (int64_t)1 << (k - 1u);
+    return q + ((r > half || (r == half && (q & 1))) ? 1 : 0);
+}
 
 /* Query rows [r0, r1): q and its relative-key logits as tts_attn_softmax
  * computes them, added to the band of l (copied from s) — keys-major, so
@@ -1508,6 +1536,15 @@ static void tts_attn_rel_rows(void *pp, unsigned r0, unsigned r1)
     for (i = r0; i < r1 && (int)i < n; i++) {
         const Data_t *qr = a->q0 + (size_t)i * a->D + (size_t)a->g * HD;
         const float  *bq = a->bq + (size_t)a->g * HD;
+        if (a->rq) {                                  /* q as the row-ops unit's prep wrote it */
+            const int32_t *rb = a->rq + (size_t)a->g * HD, *ra = a->rq + a->D + (size_t)a->g * HD,
+                          *rc = a->rq + 2u * a->D + (size_t)a->g * HD;
+            for (d = 0u; d < HD; d++) {
+                int64_t r = tts_rne_shr(((int64_t)(int16_t)qr[d] << ra[d]) + rb[d], (unsigned)rc[d]);
+                r = r > 32767 ? 32767 : (r < -32768 ? -32768 : r);
+                qv[d] = (double)r / a->iq;
+            }
+        } else
         for (d = 0u; d < HD; d++) {                   /* q as the q / k / v prep writes it */
             double r = nearbyint(((double)(int16_t)qr[d] * a->sq0 + (double)bq[d]) * a->iq);
             r = r > 32767.0 ? 32767.0 : (r < -32768.0 ? -32768.0 : r);
@@ -1529,11 +1566,12 @@ static void tts_attn_rel_rows(void *pp, unsigned r0, unsigned r1)
     }
 }
 
-static void tts_attn_rel_add(const Data_t *s, const Data_t *q0, const float *bq, const float *ek,
-                             unsigned T, unsigned C, unsigned D, unsigned HD, unsigned g, unsigned W,
-                             int n, double sq0, double iq, double is, Data_t *l)
+static void tts_attn_rel_add(const Data_t *s, const Data_t *q0, const float *bq, const int32_t *rq,
+                             const float *ek, unsigned T, unsigned C, unsigned D, unsigned HD, unsigned g,
+                             unsigned W, int n, double sq0, double iq, double is, Data_t *l)
 {
     tts_arel_t a;
+    a.rq = rq;
     if (HD > TTS_MAX_HD || W > TTS_MAX_W) {
         fprintf(stderr, "tts_attn_rel_add: head_dim %u / window %u beyond the limits\n", HD, W);
         abort();

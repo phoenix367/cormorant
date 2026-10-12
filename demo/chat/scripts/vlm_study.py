@@ -446,6 +446,22 @@ class VisionModel(ls.Model):
     def heads_e(self, cls, l):
         return np.repeat(self.Eh(cls, l, self.cfg.H), self.cfg.HD)
 
+    def qkv(self, x0, b, cls, l, e, x0cls):
+        """x0 + bias written at e (q / k per head, v at the V cache's exponents):
+        the host's rounding, or (policy iqkv, HOSTOPS_PLAN §10.4) the row-ops
+        unit's COPY with the bias — rowops_spec.bias_round on the kernel output's
+        raw grid, the bias rounded once at bias_exp."""
+        if self.q and self.pol.get("iqkv") and not self.exact(cls):
+            n = x0.shape[1]
+            fx = self.Ev(x0cls, l, n)
+            ev = np.broadcast_to(np.asarray(e, np.int64), (n,))
+            y = ls.rowops().bias_round(np.rint(x0 * ls.p2(fx)[None, :]).astype(np.int64), fx, b, ev)
+            yv = y / ls.p2(ev)[None, :]
+            self.stats.add(cls, l, float(np.abs(yv).max()) if yv.size else 0.0,
+                           int(((y == ls.I16_LO) | (y == ls.I16_HI)).sum()), y.size)
+            return yv
+        return self.host(x0 + b, cls, l, e)
+
     def attn(self, q0, k0, v0, l):
         vc = self.cfg
         N, H, HD = q0.shape[0], vc.H, vc.HD
@@ -460,9 +476,9 @@ class VisionModel(ls.Model):
                 e = np.exp(x - x.max(-1, keepdims=True))
                 out[:, sl] = (e / np.cumsum(e, -1)[..., -1:]) @ v[:, sl]
             return self.host(out, "pv", l, self.E("pv", l))
-        q = self.host(q0 + self.b[(l, "q")], "q", l, self.heads_e("q", l))
-        k = self.host(k0 + self.b[(l, "k")], "k", l, self.heads_e("k", l))
-        v = self.host(v0 + self.b[(l, "v")], "vc", l, self.Ev("vc", l, vc.D))
+        q = self.qkv(q0, self.b[(l, "q")], "q", l, self.heads_e("q", l), "q0")
+        k = self.qkv(k0, self.b[(l, "k")], "k", l, self.heads_e("k", l), "k0")
+        v = self.qkv(v0, self.b[(l, "v")], "vc", l, self.Ev("vc", l, vc.D), "v")
         if self.q:
             fq, fk, fs = self.Eh("q", l, H), self.Eh("k", l, H), self.Eh("s", l, H)
             fp, fv, fpv = self.Eh("p", l, H), self.Ev("vc", l, vc.D), self.Ev("pv", l, vc.D)
@@ -669,8 +685,12 @@ VPOLICIES = {
     # the row-ops unit (HOSTOPS_PLAN §6): int32 residual at 2^-15, its LayerNorms and residual
     # adds (the bias rounded once at the residual's scale) — what the scheduler's vision entry
     # computes with kernels.rowops.unit (vlm_sched_check.py --rowops on)
+    # (+ phase 4b, HOSTOPS_PLAN §10: the attention prep's q / k / v bias adds as the unit's
+    # COPY with a bias — iqkv)
     "pow2+p12+vgelu+vsmx+rowops": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
-                                       res_bits=15, inorm=True, ibias=True),
+                                       res_bits=15, inorm=True, ibias=True, iqkv=True),
+    "pow2+p12+vgelu+vsmx+r15+inorm+ibias": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
+                                                res_bits=15, inorm=True, ibias=True),
 }
 TEXT_SHIPPED = "pow2+sink+p12"        # FPGA decode attention too (doc/plans/KV_DECODE_PLAN.md)
 TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)

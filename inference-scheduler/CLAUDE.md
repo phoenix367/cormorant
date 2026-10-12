@@ -252,9 +252,10 @@ src/
                          tables, layer_norm / rms_norm / silu_mul / rope, the register constants,
                          the parameter block and the 64 KiB table image)
   rowops_nodes.py        its kernel nodes (LayerNormRoNode; ResAdd / RMSNorm / SiluMul and the prefill
-                         AttnPrep — RoPE, the q image, the KV caches — for Llama, ResAddBias /
-                         LayerNorm32 for the vision and TTS encoders) + the factories graph.py merges
-                         over the host ops when the platform has the unit
+                         AttnPrep — RoPE, the q image, the KV caches — for Llama; ResAddBias /
+                         LayerNorm32 / VitAttnPrep for the vision and TTS encoders, TtsRowPrep for
+                         the TTS encoder) + the factories graph.py merges over the host ops when the
+                         platform has the unit
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
                          edges); topological order, predecessors/successors,

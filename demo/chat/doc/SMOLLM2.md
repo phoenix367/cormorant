@@ -172,7 +172,7 @@ library, `libsmollm2_360m.so` (CHAT_PLAN §20): bit-exact on the board,
 with `chat.py`: the third answer recalls the name and the city given in the
 first message, which the 135M model did not manage on the same questions.
 
-- **Memory.**  Its pool is 754 MiB, so under `--resident auto` it swaps
+- **Memory.**  Its pool is 758 MiB, so under `--resident auto` it swaps
   with every other FPGA model, the 135M one included; only Piper stays
   loaded beside it.  Both SmolLM2 sizes can still be served side by side:
   they take turns on the FPGA.  A swap takes 1–2 s

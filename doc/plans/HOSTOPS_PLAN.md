@@ -11,8 +11,10 @@ ms at 400 ids.  **Phase 4a DONE 2026-10-12** (§10.8): the prefill attention
 prep on the unit as ROPE / TRANSPOSE / COPY jobs, no bitstream change —
 SmolLM2-135M prefill 256 448 → 398 ms (0.51 × of 776: the 0.55 × gate met),
 SmolLM2-360M 1 125 → 1 050 ms, SmolVLM's text prefill 449 → 399, every
-library bit-exact; BERT's 0.79 × (gate 0.75 ×) stays: its transposes and
-the merge are phase 4b / 5.  Phase 2 DONE
+library bit-exact.  **Phase 4b DONE 2026-10-12** (§10.9): the vision / Piper
+encoder prep and the TTS row prep on the unit — SmolVLM 1.70 → 1.64 s per
+image, the Piper encoder 146 → 96 ms at 400 ids.  BERT's 0.79 × (gate 0.75 ×)
+stays: its transposes and the merge are phase 5.  Phase 2 DONE
 2026-10-12: the scheduler lane (§7).  Phase 1 DONE 2026-10-11:
 `kernels/rowops_rtl`, bit-exact, +0.025 ns at 300 MHz out of context (§7).
 Phase 0 is done: the int32 residual
@@ -574,7 +576,7 @@ inference-scheduler/.venv/bin/python demo/tts/scripts/piper_study.py encoder-vsm
 | **1 — RTL** | DONE 2026-10-11 — `kernels/rowops_rtl` (`doc/kernels/ROWOPS_RTL_KERNEL.md`): the engine, the seven ops of §2 plus TLOAD (the 64 KiB table image into the UltraRAM tables, once per bitstream), the driver generator, the Verilator testbench against the specification's C++ port (`rowops_ref.h`) and the Python fixtures (`gen_fixtures.py`, 21 cases + `tables.hex`), lint, `synth_rowops_rtl`.  **Bit-exact ✓** (every fixture at fast / random / slow memory timing, 300 random jobs × 4 seeds).  **Synthesis ✓**: WNS +0.025 ns at 3.333 ns, 30 947 LUT, 24 774 FF, 6 RAMB36, 7 URAM, 121 DSP — above the estimate of 12–15 k LUT (the four-lane 64-bit shift / add / round-to-even arithmetic the estimate priced as DSP work), inside the device with the production design (80 % LUT, 137 / 144 BRAM, 55 / 64 URAM; phase 3's in-context build decides 250 MHz).  The road: the first synthesis gave 81 k LUT / 170 k FF (memories as flip-flops, eight sigmoid copies, the P RAM in 32 BRAM) and −22 ns (ROPE's n / HD); memories recoded, a sequential divider and a four-lane MULACT gave 42 k LUT / 32 BRAM / −4.8 ns; the decisions then taken — **four lanes for every op** (ADDX, MULACT, DEQUANT and NORM lose nothing against the port; COPY, ROPE and TRANSPOSE's reads run at 2 GB/s: COPY 256 × 576 74 → 148 µs, RoPE 118 → 192 µs, the movers ≤ 8 % of any model) and **the tables in UltraRAM** (an UltraRAM has no initial contents: TLOAD loads the sigmoid and rsqrt tables from DDR, 33 µs once per bitstream; the parameter RAM moved there too, BRAM 32 → 6) — with the two-stage rounding, the DSP pipeline registers, `ro_mul32` in the NORM scalar unit and the transposer's precomputed block step gave 31 k LUT and timing closure.  Cycle counts of the shipped shapes: ROWOPS_RTL_KERNEL §3 | bit-exact on every case ✓; WNS ≥ 0 at 300 MHz ✓ (+0.025); resources ≤ §4's estimate ✗ (LUT 2 ×, DSP 1.2 ×; BRAM 1.5 ×, URAM 7 of 8) — accepted: the device holds it | one day |
 | **2 — scheduler** | DONE 2026-10-12 (one day, not the 1–2 weeks: the int32 residual of phase 0 replaced "DMA f32") — **the lane**: `KERNEL_REGISTRY["RowOpsKernel"]` (UIO `RowOpsKernel_0`, 0xA004_0000, the generated driver), `KERNEL_ROWOPS` in `kernel_id_t`, the `run_rowops()` helper (byte strides, NULL → address 0), the 64 KiB table image as the weight tensor `rowops_tables` loaded by TLOAD in `inference_init()`, `perf_calls.FIELDS` / `perf_model.family() == "rowops"`, the timeline lane, `perf_calibrate` sizing; **the capability** `platforms/<p>.json kernels.rowops.unit` (`src/_rowops_hw_config.py`, `AXI_ROWOPS`; the KV260 says false until phase 3); **the int32 residual**: `axi.numeric` `dma: i32` (`TensorInfo.dma`, twice the pool elements), host ops take `int32_t *` buffers with the kernel-buffer syncs (`LlmEmbed` / `llm_embed32`, `LlmSelectRow`, `VitEmbedAdd` / `vit_embed_add32`, `LlmAttnPrep`, `LlmDequant`); **the nodes** (`src/rowops_nodes.py`, the factories merged over the host ops in `graph.py`): `LayerNormRoNode` (ONNX `LayerNormalization`, aligned rows ≤ 4 096, else the host op — BERT's 25), `ResAddRoNode` / `RMSNormRoNode` / `SiluMulRoNode` (`llama.py rowops=True`: `res_bits = 15` + `inorm` + `isilu`), `ResAddBiasRoNode` / `LayerNorm32RoNode` (`vit.py rowops=True`: the bias rounded once at 2^-15 — `rowops_spec.quant_bias`, the study's `ibias`; `piper.py rowops=True`: `TtsResAdd` at max(f_x, f_y) + `TtsLayerNorm`), each with the spec's reference, `kernel_calls()` and the per-column parameter block (`P_BCAST` when every column agrees; β at `beta_bits`: 2^-20, coarser only for |β| ≥ 2, which 6 of BERT's LayerNorms need); `LlmAttnPrep` / `LlmAttnMerge` / `LlmDequant` stay host ops (the four-lane ROPE / TRANSPOSE would not beat them; the dequant writes a host output); **the studies**: `llm_study` `pow2+sink+p12(+vsmx)+rowops`, `vlm_study` `pow2+p12+vgelu+vsmx+rowops`, `bert_study` `+iln`, `piper_vits` `encoder_forward(rowops_unit=True)`, and `--rowops auto / on / off` on `generate_llm_project.py`, `generate_tts_project.py`, the sched-checks; **`host_emu`** carries the unit's C model (`xrowopskernel.h`: every op, TLOAD, the tail-word writes) | every suite ✓ (1 789 scheduler tests, the chat tests, ruff, facts); the sched-checks bit for bit ✓ — BERT 3 / 3, SmolLM2-135M 3 / 3 (`AXI_ROWOPS=1 llm_sched_check.py --rowops on`), SmolVLM image features + text (`vlm_sched_check.py --rowops on`); the generated projects equal the simulation on the host emulation ✓ (test_rowops_unit, test_vit `TestVisionRowops`, test_piper `TestPiperEncoderRowops`); the libraries regenerated — after phase 3 | one day |
 | **3 — hardware** | DONE 2026-10-12 (§9): `hw/cormorant_hw_128/scripts/bd_rowops_hp0.tcl` (the kernel, `axi_rowops_intercon` with register slices on both sides into `S_AXI_HP0_FPD`, SmartConnect M04 at `0xA004_0000`, interrupt `pl_ps_irq0[4]`), the testbench's `ro_classes.svh` (the table load + the 21 fixtures through the PS VIP, byte for byte) — `sim_hw_kv260` 97 / 97; bitstream `1cedaf2ed816`, WNS +0.020 / WHS +0.010 ns, 93 969 LUT (80 %), 136 / 144 BRAM, 55 / 64 URAM, 833 DSP; the board: overlay `fabric_rowops`, 159 / 159 models, SmolLM2-135M / 360M, SmolVLM, Piper and BERT bit-exact, the perf baseline `kv260-1cedaf2ed816.json` (69 cases: 6 of the unit), the performance model `kv260/1cedaf2ed816` with the `rowops` family, the chat server redeployed with the regenerated libraries | WNS ≥ 0 ✓; 159 / 159 and every library bit-exact ✓; prefill_256 0.58 × (gate 0.55 ×) ✗ and BERT 0.79 × (gate 0.75 ×) ✗ — the attention prep / merge still on the host (§9.4) | one day + 2 h 20 min of Vivado |
-| **4 — attention prep on the unit** | **4a DONE 2026-10-12** (§10.8: 135M prefill 256 448 → 398 ms, 360M 1 125 → 1 050, bit-exact, the model topped up to 2 073 calls); PLANNED (§10): 4a the Llama prefill prep as ROPE / TRANSPOSE / COPY jobs on the production bitstream (`irope` joins the policy, `qk_kw = 1`, the V image's boundary blocks as R = 1 granules), 4b the vision / Piper prep (`iqkv`) and `TtsRowPrep` as windowed COPYs, 4c the RTL tweaks only on evidence (ROPE B reuse, TRANSPOSE emit rate, descriptor chains) | 135M prefill 256 ≤ 427 ms, 360M ≤ 1 030, SmolVLM ≤ 1.60 s, Piper encode 400 ≤ 110 ms, all bit-exact | 3 + 2 (+ 3) days |
+| **4 — attention prep on the unit** | **4a DONE 2026-10-12** (§10.8: 135M prefill 256 448 → 398 ms, 360M 1 125 → 1 050, bit-exact, the model topped up to 2 073 calls); **4b DONE 2026-10-12** (§10.9: SmolVLM 1.70 → 1.64 s per image, the Piper encoder 146 → 96 ms at 400 ids, bit-exact, 2 131 calls); PLANNED (§10): 4a the Llama prefill prep as ROPE / TRANSPOSE / COPY jobs on the production bitstream (`irope` joins the policy, `qk_kw = 1`, the V image's boundary blocks as R = 1 granules), 4b the vision / Piper prep (`iqkv`) and `TtsRowPrep` as windowed COPYs, 4c the RTL tweaks only on evidence (ROPE B reuse, TRANSPOSE emit rate, descriptor chains) | 135M prefill 256 ≤ 427 ms, 360M ≤ 1 030, SmolVLM ≤ 1.60 s, Piper encode 400 ≤ 110 ms, all bit-exact | 3 + 2 (+ 3) days |
 | **5 — the rest** | TtsPrep onto the unit if its share stays (77 ms of the chunk); the merge gone through a ConvKernel y channel stride (§10.4); sigmoid as act 7 with the next VectorOPKernel bitstream (§4.3); the perf-regression and docs-audit passes | | as they come |
 
 The decode step gets its 10 % from phase 0's host fix as much as from the
@@ -1024,3 +1026,62 @@ The performance model: +90 shipped calls, three refinement rounds (+184,
 per layer cost ≈ 40 µs each beyond the calibration's back-to-back loop —
 the issue after a wait; a per-lane issue constant for the timing model is
 open.  The chat server is redeployed with the three libraries.
+
+### 10.9 Phase 4b results (2026-10-12)
+
+**The vision and Piper encoder prep, the TTS row prep.**  `VitAttnPrepRoNode`
+(`VIT_OVERRIDES["VitAttnPrep"]`, `src/vit.py` / `src/piper.py` rowops=True:
+`qk_kw = 1`, the staging states `vision.ro.qs / vs`, `enc<T>.ro.qs / vs`): q0 +
+bq and v + bv as COPYs with the bias in the parameter block (the new
+`rowops_spec.bias_round`: Bq' = round(b·2^fp) at fp = `bias_exp` — max(f_x,
+f_out) + 8, at most 24, lowered where the int22 would overflow — then one
+round-half-even at f_out), one TRANSPOSE of the q rows into every head's image
+(the heads as blocks), k0 + bk per head straight into the K cache (its own
+parameter block), the V image per head as the whole-block TRANSPOSEs (T = C
+is a multiple of 16K in every bucket: pos 0, no boundary rows) or, at
+`pv_kw` 1 (Piper's 400-id bucket), one COPY with the heads as blocks: 3 + 2H
+jobs per layer, all static.  `TtsRowPrepRoNode` (`TTS_OVERRIDES["TtsRowPrep"]`):
+a COPY per tap of the rows it reads (`rows = n`, the output shifted by the
+tap's offset) with the bias and `RELU` in the parameter block, the rows the
+host zeroes — the first tap's row 0, the last tap's row n − 1, every row ≥ n
+— as window-[0, 0) COPYs: 6 jobs for 3 taps, 2 for one.  `TtsAttnRelAdd`,
+which recomputes q from q0 + bq, now does so with the unit's integer formula
+(`rowops = 1`: the parameter arrays in the C) — the one place the host had
+to follow the unit's numerics.
+
+**Numerics.**  The policies gained `iqkv` (`vlm_study.py`
+`pow2+p12+vgelu+vsmx+rowops`; `piper_vits.encoder_forward(rowops_unit=True)`
+and `piper_study.py encoder-vsmx`'s "VectorOP softmax + unit" policy):
+
+| gate | before (the unit's norms alone) | with the prep on the unit |
+|---|---|---|
+| SmolVLM, 24 images: features rel (max) / cos min / answer top-1 / KL / identical / ppl | 0.0548 (0.0690) / 0.99787 / 0.9712 / 0.0033 / 8 of 24 / 12.208 | identical to the digit |
+| Piper encoder, 1 138 ids: durations changed vs float / log-mel distance / max \|x − float\| | 4 (0.35 %, 1 frame) / 0.362 dB / 0.0264 | 2 (0.18 %) / 0.372 dB / 0.0274 (the host: 4 / 0.388 / 0.0318) |
+
+**Verification.**  28 fixtures (+ the per-column bias + ReLU COPY), Verilator
+and `sim_hw_kv260` 104 / 104 (RowOps 29 / 29); the suite 1 791, ruff clean;
+`test_vit` / `test_piper` against the study models (the Piper encoder's
+emulation now carries the integer prep); `vlm_sched_check --rowops on --text`
+vision and text bit-exact.
+
+**The board** (the window of 2026-10-12 14:46 on `1cedaf2ed816`):
+
+| | phase 4a | phase 4b | gate (§10.7) |
+|---|---|---|---|
+| SmolVLM `llm_image` | 1.70 s | **1.64 s** | ≤ 1.60 ✗ by 2.5 % |
+| Piper encode 20 / 60 / 88 / 162 / 268 / 400 ids | 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0 ms | **9.5 / 14.4 / 28.4 / 56.8 / 92.1 / 95.8 ms** | ≤ 110 ✓ |
+| Piper chunk, RTF | 259 ms, 0.224 / 0.194 | 260 ms, 0.224 / 0.194 | unchanged ✓ |
+
+Every output bit-exact (SmolVLM 2 images × 33 / 33 logits; Piper's encoder,
+durations and PCM).  The vision prep on the unit costs 4.81 ms per layer
+(the host 12.8; §10.2 said 4.7) — but the q·Kᵀ conv at `kw = 1` costs 3.86
+ms per head-call against 3.69 at `kw = 2` (+24 ms per image; the cost model
+had priced `kw = 1` cheaper) and the softmax +15 ms, so the image gains 55
+of the 96 ms the prep saved.  The TRANSPOSE kw-interleave of §10.6 (a second
+bitstream) would give the 24 ms back; the gate stays open by it.  The
+performance model: +58 shipped calls, one refinement round +179 → 2 131
+exact calls, the `rowops` family 131 calls (train median 3.1 %); the
+benchmark 72 / 72, the baseline re-recorded (PASS: two cases improved by the
+usual jitter); `simulate`: the image pass −2.3 %, the Piper encoder buckets
+−0.0…−3.6 %, the chunk −2.3 %, the text prefills −3.2…−4.2 % as in §10.8.
+The chat server is redeployed with both libraries.

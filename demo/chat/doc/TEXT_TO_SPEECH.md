@@ -17,7 +17,7 @@ TTS_PLAN §4–§7.
   end).  The audio streams while it is being made.
 - **Exactness.**  The samples are bit-exact with the same pipeline run on
   the host.
-- **Memory.**  It needs 55 MB of CMA (a 51 MiB pool).  Under
+- **Memory.**  It needs 55 MB of CMA (a 53 MiB pool).  Under
   `--resident auto` it stays loaded even next to SmolLM2-360M, the largest
   model.
 
@@ -99,7 +99,7 @@ chat answer aloud ([Clients](CLIENTS.md#reading-answers-aloud)).
    (espeak-ng, then Piper's ids).  It packs whole sentences into
    utterances of at most 400 ids.
 2. **Under the lock**, for each utterance:
-   - the text encoder runs on the FPGA (`tts_encode`, 14–146 ms; its attention softmax on VectorOPKernel's softmax unit);
+   - the text encoder runs on the FPGA (`tts_encode`, 9.5–96 ms; its attention softmax on VectorOPKernel's softmax unit);
    - the duration predictor runs as C code in the library
      (`tts_duration`, 18–200 ms);
    - the alignment and the noise are computed in numpy;
@@ -119,5 +119,5 @@ chat answer aloud ([Clients](CLIENTS.md#reading-answers-aloud)).
 - **RTF** (time to make the audio ÷ its length): 0.58–0.79 end to end.
 - **Samples.**  Bit-exact with the same pipeline on the host
   (`demo/tts/scripts/tts_speech_check.py`).
-- **Residency.**  55 MB of CMA (a 51 MiB pool).  With `--resident auto` it
+- **Residency.**  55 MB of CMA (a 53 MiB pool).  With `--resident auto` it
   stays loaded next to SmolLM2-360M.

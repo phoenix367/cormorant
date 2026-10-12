@@ -304,8 +304,8 @@ class TestPiperEncoderRowops(unittest.TestCase):
         kinds = {}
         for sn in g.nodes:
             kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
-        self.assertEqual(kinds, {"TtsEmbedNode": 1, "TtsRowPrepNode": 19, "MatmulConvNode": 37,
-                                 "VitAttnPrepNode": 6, "LlmAttnConvNode": 24, "TtsAttnRelAddNode": 12,
+        self.assertEqual(kinds, {"TtsEmbedNode": 1, "TtsRowPrepRoNode": 19, "MatmulConvNode": 37,
+                                 "VitAttnPrepRoNode": 6, "LlmAttnConvNode": 24, "TtsAttnRelAddNode": 12,
                                  "TtsAttnSoftmaxVopNode": 12, "TtsAttnMergeNode": 6, "ResAddBiasRoNode": 12,
                                  "LayerNorm32RoNode": 12, "TtsEncOutNode": 2})
         for sn in g.nodes:
@@ -329,7 +329,9 @@ class TestPiperEncoderRowops(unittest.TestCase):
         self.assertEqual(rc, 0, out[-3000:])
         self.assertIn("PASSED", out)
         src = cg.generate_source()
-        self.assertEqual(src.count("run_rowops(enc64_"), 24)        # 12 adds + 12 norms
+        # 12 adds + 12 norms + per layer the prep's 7 jobs (q, the q image, k per head x 2, v, the V
+        # image per head x 2) and the row preps' 14 (xin 2, c1 6, h 6) + the 2 of the stats' input
+        self.assertEqual(src.count("run_rowops(enc64_"), 24 + 6 * (7 + 14) + 2)
         self.assertEqual(src.count("run_rowops(rowops_tables,"), 1)  # TLOAD once, in inference_init
         self.assertNotIn("tts_resnorm(", src.split("inference_run_")[-1])
 

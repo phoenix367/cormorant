@@ -25,10 +25,12 @@ calls: the `rowops` family, `RowOpsKernel` in `FIELDS`), two passes of about 2 m
 project's `calib_runner` now needs the five kernels' drivers), three refinement rounds (+209,
 +100, +99) → 1938 exact calls; the phase-4a top-up of the same day (HOSTOPS_PLAN §10: the prefill
 attention prep's ROPE / TRANSPOSE / COPY jobs on the unit — +90 shipped calls, then three refinement
-rounds +184, +24, +8) → **2073 exact calls**, repeat spread median 0.065 %.  Families (train / held-out p90):
+rounds +184, +24, +8) → 2073 exact calls; the phase-4b top-up (the vision and Piper encoder preps and the
+TTS row preps on the unit: +58 shipped calls, +179 refined) → **2131 exact calls**, repeat spread median
+0.065 %.  Families (train / held-out p90):
 conv 3.0 / 26.5 %, conv-dw 1.8 / 15.3 %, conv-mm 2.8 / 43.5 %, mm-gemv 4.8 / 18.7 %, mm-tiled 1.5 /
 6.4 %, pool 3.5 / 42.5 %, vecop 0.6 / 20.3 %, vecop-div 0.8 / 7.7 %, vecop-smx (55 calls) and
-rowops (79 calls after the top-up, train median 7.8 %, no held-out) — the planner relies on the exact entries.
+rowops (131 calls after the phase-4 top-ups, train median 3.1 %, no held-out) — the planner relies on the exact entries.
 The unit's calls measure what the Verilator cycle counts predicted (LN 256 × 768 206 µs, ADDX
 256 × 576 234 µs, MULACT 256 × 1536 418 µs; the shipped libraries were regenerated with the
 unit, so their calls are the ones listed).

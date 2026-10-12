@@ -949,7 +949,11 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
             fy = E[f"{e}.{t}0"]
             y0 = _kmm(xin, _raw(EW[f"l{i}.w{t}"], fy + 8 - fxi))
             tr[f"{e}.{t}0"] = y0
-            pr[t] = tr[f"{e}.{t}"] = _raw(y0 * L2(fy) + EW[f"l{i}.b{t}"], ft)
+            # the prep's bias add: the host's rounding, or (rowops_unit, HOSTOPS_PLAN §10.4) the
+            # row-ops unit's COPY with the bias rounded once (rowops_spec.bias_round)
+            pr[t] = tr[f"{e}.{t}"] = (_rowops().bias_round(y0.astype(np.int64), fy, EW[f"l{i}.b{t}"], ft)
+                                      .astype(np.float64) + 0.0 if rowops_unit
+                                      else _raw(y0 * L2(fy) + EW[f"l{i}.b{t}"], ft))
         fq, fs, fo = E[f"{e}.q"], E[f"{e}.s"], E[f"{e}.o"]
         heads = []
         for h in range(ENC_H):
@@ -989,7 +993,9 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
         c1 = tr[f"{e}.c1"] = _im2col3(_raw(x1 * L2(f1x), fc1))
         f1 = tr[f"{e}.f1"] = _kmm(c1, _raw(EW[f"l{i}.w1"], ff1 + 8 - fc1))
         fh = E[f"{e}.h"]
-        hh = tr[f"{e}.h"] = _raw(np.maximum(f1 * L2(ff1) + EW[f"l{i}.b1"], 0.0), fh)
+        hh = tr[f"{e}.h"] = (_rowops().bias_round(f1.astype(np.int64), ff1, EW[f"l{i}.b1"], fh, relu=True)
+                             .astype(np.float64) + 0.0 if rowops_unit
+                             else _raw(np.maximum(f1 * L2(ff1) + EW[f"l{i}.b1"], 0.0), fh))
         ff2 = E[f"{e}.f2"]
         f2 = tr[f"{e}.f2"] = _kmm(_im2col3(hh), _raw(EW[f"l{i}.w2"], ff2 + 8 - fh))
         fx = E[f"{e}.x2"]

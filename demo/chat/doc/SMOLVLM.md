@@ -5,7 +5,7 @@
 Idefics3 connector and a small text model.  All three run on the FPGA
 kernels and the board's A53 cores, from one library, `libsmolvlm_256m.so`.
 
-- **Timing.**  The vision encoder takes 1.7 s per image at 250 MHz with its GELUs on VectorOPKernel's activation unit and its attention softmax on the softmax unit (2.2 s with the softmax on the host before SOFTMAX_PLAN; 2.3 s with the GELUs on the host before OFFLOAD_PLAN; 3.4 s at 100 MHz, 3.9 s before the RTL ConvKernel: CHAT_PLAN §24, CONV_RTL_PLAN, FMAX_250_PLAN),
+- **Timing.**  The vision encoder takes 1.6 s per image at 250 MHz with its GELUs on VectorOPKernel's activation unit and its attention softmax on the softmax unit (2.2 s with the softmax on the host before SOFTMAX_PLAN; 2.3 s with the GELUs on the host before OFFLOAD_PLAN; 3.4 s at 100 MHz, 3.9 s before the RTL ConvKernel: CHAT_PLAN §24, CONV_RTL_PLAN, FMAX_250_PLAN),
   then text comes at ~20 tokens/s.  A follow-up question about the same
   image reuses its encoding, so its first token comes after ~0.4 s.
 - **Images.**  Each image becomes one 512 × 512 tile (67 prompt tokens).
@@ -69,7 +69,7 @@ The request body may be up to 32 MB when an image model is served
 
 ## Memory and other models
 
-The SmolVLM pool is 506 MiB (`cma_mb` 550 with the image buffer).  Under
+The SmolVLM pool is 511 MiB (`cma_mb` 550 with the image buffer).  Under
 `--resident auto`:
 - **Beside BERT:** it stays loaded.
 - **Beside SmolLM2-135M:** only when the CMA is not fragmented.  Otherwise

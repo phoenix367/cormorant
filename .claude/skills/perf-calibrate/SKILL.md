@@ -29,8 +29,9 @@ Current model: **kv260/1cedaf2ed816** (2026-10-12), `f70ce632a97a`'s design with
 shipped calls form the new `rowops` family), `run --config perf_config.json --stop-server` (two
 passes of ~2 min; the bench's `calib_runner` needs all five kernels' drivers), `fit`, then `cases
 --refine` / `run --resume` / `fit` three times (+209, +100, +99) → 1938 exact calls, then the
-phase-4a top-up (the prefill attention prep's unit jobs: +90, +184, +24, +8) → 2073 exact calls, repeat
-spread median 0.065 %; `host.json` is to be re-merged from this bitstream's profiles (the norms, residual
+phase-4a top-up (the prefill attention prep's unit jobs: +90, +184, +24, +8) → 2073 exact calls and the
+phase-4b one (the vision / Piper preps and row preps: +58, +179) → 2131 exact calls, repeat spread
+median 0.065 %; `host.json` is to be re-merged from this bitstream's profiles (the norms, residual
 adds and SiLU·up left the host).  The model before, kv260/f70ce632a97a (2026-10-10), `8599aa7a5f12`'s
 design with ConvKernel's x read port on HP2 and overlapped line-buffer loads (DEPTHWISE_PLAN §8):
 a plain campaign (1490 cases, two passes of 59 s), three refinement rounds (+211, +99, +37) → 1837

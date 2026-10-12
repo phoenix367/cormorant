@@ -378,6 +378,20 @@ def build_cases():
     SQ = G * HD * 2
     add(xpose_geom("xpose_qimage_r8_g3_t16", 8, HD, T // 8, G,
                    (8 * SQ, HD * 2, SQ, 2 * G * T, 16, 2 * T)))
+    #     (f) the vision / TTS prep's COPY with a bias (rowops_spec.bias_round, phase 4b): per
+    #         column Bq' = round(b 2^fp), sh_a = fp - f_x, sh_c = fp - f_out at fp = bias_exp, RELU
+    n, c1 = 40, 3
+    bias = rng.uniform(-3.0, 3.0, n)
+    f_x = rng.integers(6, 13, n)
+    f_out = rng.integers(7, 11, n)
+    bq, sa, sc = rs.bias_params(bias, f_x, f_out)
+    prm = [(0, int(bq[c]), int(sa[c]), 0, int(sc[c])) for c in range(n)]
+    a, b, o = stream_rows(OP["COPY"], n, c1, 1, I16, I16, I16, prm, 0, rng, False, relu=True)
+    add(Case("copy_bias_relu_percol_40x3", opword(OP["COPY"], relu=True), n, c1, 1,
+             strides_for(n, c1, I16, I16, I16), a, b, prm, o, (I16, I16, I16)))
+    # the spec agrees with the fixture's formula
+    x_raw = np.array([a[(0, i)] for i in range(c1)], np.int64)
+    assert (rs.bias_round(x_raw, f_x, bias, f_out, relu=True) == np.array([o[(0, i)] for i in range(c1)])).all()
     return cases
 
 

@@ -267,7 +267,7 @@ kernels; the fixtures come from the Python specification
 
 | Target | Description |
 |--------|-------------|
-| `TestRowOpsRtl` | Verilator testbench `build/kernels/rowops_rtl/vl/Vtb` (in `all`); CTest runs the 27 checked-in RowOps fixtures (`hw/test_data/rowops_test_data/`) + random jobs (`RO_RTL_RANDOM_CASES`, default 300) against the C++ oracle `tb/verilator/rowops_ref.h` under randomised AXI timing |
+| `TestRowOpsRtl` | Verilator testbench `build/kernels/rowops_rtl/vl/Vtb` (in `all`); CTest runs the 28 checked-in RowOps fixtures (`hw/test_data/rowops_test_data/`) + random jobs (`RO_RTL_RANDOM_CASES`, default 300) against the C++ oracle `tb/verilator/rowops_ref.h` under randomised AXI timing |
 | `lint_rowops_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
 | `perf_rowops_rtl` | Cycle counts of the shipped models' job shapes (ideal memory) |
 | `rowops_rtl_tb_fst` | The testbench with FST tracing (`vlt/Vtb`; `--case "op n c1 c2 [mode]" --trace FILE`) |
@@ -340,7 +340,7 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 | Target | Description |
 |--------|-------------|
 | `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-packages the four kernel IPs first when their sources changed. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
-| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 103 cases over the five kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
+| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 104 cases over the five kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
 | `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260; `dtc`'s `reg_format` / `avoid_default_addr_size` warnings are expected |
 
 ---
