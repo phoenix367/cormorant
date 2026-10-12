@@ -60,9 +60,16 @@ def _worker_init(cfg: dict) -> None:
 
 def emu_policy() -> str:
     """The study policy the scheduler's partition computes: its Softmax on
-    VectorOPKernel's softmax unit where the platform has it."""
+    VectorOPKernel's softmax unit where the platform has it, its LayerNorms on
+    the row-ops unit where the platform has that (bert_study.py POLS)."""
+    from src.rowops_nodes import enabled as rowops
     from src.smx_nodes import enabled
-    return "sched+vsmx" if enabled() else "sched"
+    pol = "sched+vsmx" if enabled() else "sched"
+    if rowops():
+        if not enabled():
+            raise RuntimeError("the row-ops unit's BERT policy is studied with the softmax unit (sched+vsmx+iln)")
+        pol += "+iln"
+    return pol
 
 
 def _study():

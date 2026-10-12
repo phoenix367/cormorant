@@ -11,7 +11,7 @@ print("PS slave port AFIFM width fields (0=128b 1=64b 2=32b — PYNQ/TRM encodin
 for a, n in [(0xFD360000,"HPC0 rd"),(0xFD360014,"HPC0 wr"),(0xFD370000,"HPC1 rd"),(0xFD370014,"HPC1 wr"),(0xFD380000,"HP0 rd"),(0xFD380014,"HP0 wr"),(0xFD390000,"HP1 rd"),(0xFD390014,"HP1 wr"),(0xFD3A0000,"HP2 rd"),(0xFD3A0014,"HP2 wr"),(0xFD3B0000,"HP3 rd"),(0xFD3B0014,"HP3 wr")]:
     print("  %-8s %d" % (n, rd(a) & 3))
 print("kernel control (bit0 start, bit1 done, bit2 idle):")
-for b, n in [(0xA0000000,"vectorop"),(0xA0010000,"matmul"),(0xA0020000,"conv"),(0xA0030000,"pool")]:
+for b, n in [(0xA0000000,"vectorop"),(0xA0010000,"matmul"),(0xA0020000,"conv"),(0xA0030000,"pool"),(0xA0040000,"rowops")]:
     c = rd(b); print("  %-9s ctrl=0x%02x start=%d done=%d idle=%d" % (n, c, c&1, (c>>1)&1, (c>>2)&1))
 regs = [("batch",0x40),("in_ch",0x48),("in_h",0x50),("in_w",0x58),("out_ch",0x60),("out_h",0x68),("out_w",0x70),("kh",0x78),("kw",0x80),("stride_h",0x88),("stride_w",0x90),("dil_h",0x98),("dil_w",0xa0),("pad_top",0xa8),("pad_left",0xb0),("has_bias",0xb8),("is_dw",0xc0)]
 print("conv args:", " ".join("%s=%d" % (k, rd(0xA0020000 + o)) for k, o in regs))

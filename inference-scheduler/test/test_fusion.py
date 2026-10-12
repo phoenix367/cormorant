@@ -25,11 +25,13 @@ from src.host_nodes import GeluNode, LayerNormNode, SliceNode
 from src.nodes import ScheduledNode, SchedulerError
 from unittest import mock
 
-from src import _vectorop_hw_config
+from src import _rowops_hw_config, _vectorop_hw_config
 
 # These test the host GELU op: on a platform with VectorOPKernel's activation
 # unit a matching Gelu runs there instead (test_activations.py).
 _host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
+# the host LayerNorm (the row-ops unit takes it where the platform has the unit: test_rowops_unit)
+_host_ln = mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", False)
 
 
 def _vi(name, shape, et=TensorProto.FLOAT):
@@ -159,6 +161,7 @@ class _Base(unittest.TestCase):
         return g, cg.simulate(feeds)
 
 
+@_host_ln
 class TestLayerNormFusion(_Base):
 
     def _check_fused(self, shape, axis, **kw):

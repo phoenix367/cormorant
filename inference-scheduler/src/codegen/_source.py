@@ -372,11 +372,11 @@ class _SourceMixin:
         for i, (t, off, cnt, _io) in enumerate(ins):
             lines.append(f"        const Data_t *in{i};  /* '{t.onnx_name}': {cnt} elem"
                          f" (stage +{off}) */")
-        if not sn.output.is_host:
+        if not (sn.output.is_host or sn.output.dma == "i32"):
             lines.append(f"        Data_t       *out;  /* '{sn.output.onnx_name}': {o_cnt} elem"
                          f" (stage +{o_off}) */")
         seen = set()
-        for t in sn.dma_inputs():
+        for t in sn.dma_inputs() + [t for t in sn.inputs if t.dma == "i32" and not t.is_state]:
             if t.c_name not in seen and self._written_by_kernel(t):
                 seen.add(t.c_name)
                 lines.append(f"        inference_buf_sync_from_device({t.c_name});"
@@ -384,7 +384,7 @@ class _SourceMixin:
         for i, (t, off, _cnt, (nc, ch, st)) in enumerate(ins):
             lines.append(f"        in{i} = host_in({t.c_name}, s_host_stage + {off}u,"
                          f" {nc}u, {ch}u, {st}u);")
-        if not sn.output.is_host:
+        if not (sn.output.is_host or sn.output.dma == "i32"):
             nc, ch, st = o_io
             lines.append(f"        out = host_out({sn.output.c_name}, s_host_stage + {o_off}u,"
                          f" {nc}u, {ch}u, {st}u);")
@@ -392,14 +392,20 @@ class _SourceMixin:
         for t in sn.inputs:
             if t.onnx_name in staged:
                 args.append(f"in{staged[t.onnx_name][0]}")
+            elif t.dma == "i32":                    # an int32 DMA tensor, read in place
+                args.append(f"(int32_t *)inference_buf_ptr({t.c_name})")
             elif t.is_state and not t.is_host:      # a DMA state, read / updated in place
                 args.append(f"(int16_t *)inference_buf_ptr({t.c_name})")
             else:
                 args.append(t.c_name)
-        out = "out" if not sn.output.is_host else sn.output.c_name
+        o32 = sn.output.dma == "i32"
+        out = "out" if not (sn.output.is_host or o32) else (
+            f"(int32_t *)inference_buf_ptr({sn.output.c_name})" if o32 else sn.output.c_name)
         for ln in sn.c_call(args, out, "NULL", [], self._dtype):
             lines.append("        " + ln)
-        if not sn.output.is_host:
+        if o32:                                     # written in place: flush before a kernel reads it
+            lines.append(f"        inference_buf_sync_to_device({sn.output.c_name});")
+        elif not sn.output.is_host:
             nc, ch, st = o_io
             lines.append(f"        host_out_done({sn.output.c_name}, out, {nc}u, {ch}u, {st}u);")
         lines.append("    }")
@@ -567,7 +573,12 @@ class _SourceMixin:
         if t.group_layout:
             row = int(t.shape[1])
             n = -(-n // row) * row
-        if t.host == "i16" or not t.is_host:
+        if t.dma == "i32":
+            raw = np.clip(np.rint(v[:n] * 2.0 ** t.exp_full(self._dtype.frac_bits).reshape(-1)[:n]),
+                          -2147483648.0, 2147483647.0).astype(np.int32).view(np.int16)
+            lits = [str(int(x)) for x in raw]
+            n = int(raw.size)
+        elif t.host == "i16" or not t.is_host:
             raw = self._dtype.exp_to_storage(
                 v[:n], t.exp_full(self._dtype.frac_bits).reshape(-1)[:n]).view(np.int16)
             lits = [str(int(x)) for x in raw]
@@ -594,6 +605,7 @@ class _SourceMixin:
         "MatmulKernel":   "KERNEL_MATMUL",
         "ConvKernel":     "KERNEL_CONV",
         "PoolKernel":     "KERNEL_POOL",
+        "RowOpsKernel":   "KERNEL_ROWOPS",
     }
 
     def _kernel_wait_helper(self) -> str:
@@ -737,6 +749,7 @@ class _SourceMixin:
             or isinstance(sn, LlmAttnConvNode) for sn in nodes
         )
         need_run_pool = self._has_pool_nodes
+        need_run_rowops = self._has_rowops_nodes
 
         titles = []
         if need_run_op and need_run_op_act:
@@ -756,6 +769,8 @@ class _SourceMixin:
                           + ("s" if len(conv_helpers) > 1 else ""))
         if need_run_pool:
             titles.append("run_pool() — PoolingKernel dispatch helper")
+        if need_run_rowops:
+            titles.append("run_rowops() — RowOpsKernel dispatch helper")
         title = " / ".join(titles) if titles else "Kernel dispatch helpers"
 
         parts = [_banner(title)]
@@ -926,6 +941,54 @@ class _SourceMixin:
                 f"    XVectoropkernel_Start(&{vop_var});\n"
                 "}\n"
             )
+
+        if need_run_rowops:
+            from ..kernels import KERNEL_REGISTRY
+            ro_var = KERNEL_REGISTRY["RowOpsKernel"].c_var
+            parts.append(
+                "/*\n"
+                " * run_rowops() — the row-ops unit (doc/kernels/ROWOPS_RTL_KERNEL.md): every\n"
+                " * register of one job — the op word (op [3:0], the kinds of A / B / C, the\n"
+                " * flags), rows x blocks rows of n elements, the byte strides, the parameter\n"
+                " * block p, eps, aux (ROPE's HD / TRANSPOSE's R), bq_sh and COPY / ADDX's row\n"
+                " * window.  a_off / b_off / c_off are BYTE offsets; a NULL buffer programs\n"
+                " * address 0 (a stream the op does not read).  NON-BLOCKING, as run_op.\n"
+                " */\n"
+                "static void run_rowops(\n"
+                "    inference_buf_t *a, unsigned a_off,\n"
+                "    inference_buf_t *b, unsigned b_off,\n"
+                "    inference_buf_t *c, unsigned c_off,\n"
+                "    inference_buf_t *p,\n"
+                "    unsigned op, unsigned n, unsigned rows, unsigned blocks,\n"
+                "    unsigned a_s1, unsigned a_s2, unsigned b_s1, unsigned b_s2,\n"
+                "    unsigned c_s1, unsigned c_s2,\n"
+                "    uint64_t eps, unsigned aux, unsigned bq_sh, unsigned win_lo, unsigned win_hi)\n"
+                "{\n"
+                f"    XRowopskernel_Set_op(&{ro_var}, op);\n"
+                f"    XRowopskernel_Set_n(&{ro_var}, n);\n"
+                f"    XRowopskernel_Set_rows(&{ro_var}, rows);\n"
+                f"    XRowopskernel_Set_blocks(&{ro_var}, blocks);\n"
+                f"    XRowopskernel_Set_a(&{ro_var}, a ? inference_buf_phys(a) + (u64)a_off : (u64)0);\n"
+                f"    XRowopskernel_Set_a_s1(&{ro_var}, a_s1);\n"
+                f"    XRowopskernel_Set_a_s2(&{ro_var}, a_s2);\n"
+                f"    XRowopskernel_Set_b(&{ro_var}, b ? inference_buf_phys(b) + (u64)b_off : (u64)0);\n"
+                f"    XRowopskernel_Set_b_s1(&{ro_var}, b_s1);\n"
+                f"    XRowopskernel_Set_b_s2(&{ro_var}, b_s2);\n"
+                f"    XRowopskernel_Set_c(&{ro_var}, c ? inference_buf_phys(c) + (u64)c_off : (u64)0);\n"
+                f"    XRowopskernel_Set_c_s1(&{ro_var}, c_s1);\n"
+                f"    XRowopskernel_Set_c_s2(&{ro_var}, c_s2);\n"
+                f"    XRowopskernel_Set_p(&{ro_var}, p ? inference_buf_phys(p) : (u64)0);\n"
+                f"    XRowopskernel_Set_eps(&{ro_var}, eps);\n"
+                f"    XRowopskernel_Set_aux(&{ro_var}, aux);\n"
+                f"    XRowopskernel_Set_bq_sh(&{ro_var}, bq_sh);\n"
+                f"    XRowopskernel_Set_win_lo(&{ro_var}, win_lo);\n"
+                f"    XRowopskernel_Set_win_hi(&{ro_var}, win_hi);\n"
+                f"    XRowopskernel_Start(&{ro_var});\n"
+                "}\n"
+            )
+            from ..rowops_nodes import ATTN_PREP_C, AttnPrepRoNode
+            if any(isinstance(sn, AttnPrepRoNode) for sn in nodes):
+                parts.append(ATTN_PREP_C)
 
         # GEMV registers (MatmulKernel.h "GEMV streaming mode"): written on
         # every call — they persist across calls — when the platform's
@@ -1571,9 +1634,11 @@ class _SourceMixin:
                 "            *s->var = s->view;",
                 "            p = inference_buf_ptr(s->view);",
                 "            memset(p, 0, (size_t)s->count * INFERENCE_BYTES_PER_ELEM);",
-                "            if (s->init && s->G)",
-                "                _state_scatter((int16_t *)p, s->init, s->n_init, s->R, s->G, s->D, s->K);",
-                "            else if (s->init)",
+                *(["            if (s->init && s->G)",
+                   "                _state_scatter((int16_t *)p, s->init, s->n_init, s->R, s->G, s->D, s->K);",
+                   "            else if (s->init)"]
+                  if any(t.group_layout for t in dma_states) else
+                  ["            if (s->init)"]),
                 "                memcpy(p, s->init, (size_t)s->n_init * INFERENCE_BYTES_PER_ELEM);",
                 "        }",
                 "    }",
@@ -1683,6 +1748,18 @@ class _SourceMixin:
                 f"    rc = {kd.c_type}_Initialize(&{kd.c_var}, {kd.init_param});\n"
                 "    if (rc != 0) goto fail;\n" + probe
             )
+        if self._has_rowops_nodes:
+            from ..rowops_nodes import TABLES_NAME
+            from ..rowops_spec import OP_TLOAD, K_I32, opword
+            tb = self._graph._tensors[TABLES_NAME].c_name
+            init_calls.append(
+                "    /* RowOpsKernel: its sigmoid / rsqrt tables live in UltraRAM, which has no\n"
+                "     * initial contents — load the 64 KiB image once (OP_TLOAD, ROWOPS_RTL_KERNEL.md\n"
+                "     * §1.4) before any job. */\n"
+                f"    run_rowops({tb}, 0u, NULL, 0u, NULL, 0u, NULL,\n"
+                f"               0x{opword(OP_TLOAD, K_I32, K_I32, K_I32):05X}u, 4096u, 4u, 1u, "
+                "16384u, 65536u, 0u, 0u, 0u, 0u, 0ull, 0u, 0u, 0u, 0xFFFFFFFFu);\n"
+                "    kernel_wait(KERNEL_ROWOPS);\n")
         init_calls_str = "\n".join(init_calls)
 
         tables = ""

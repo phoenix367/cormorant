@@ -24,12 +24,17 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/f70ce632a97a** (2026-10-10), `8599aa7a5f12`'s design with ConvKernel's x
-read port on HP2 and overlapped line-buffer loads (DEPTHWISE_PLAN §8): a plain campaign — `all
---config perf_config.json --stop-server` (1490 cases, two passes of 59 s), then `cases --refine` /
-`run --resume` / `fit` three times (+211, +99, +37; 8 s of board each) → 1837 exact calls, repeat
-spread median 0.066 %; `host.json`
-unchanged (the host ops do not depend on the bitstream).  The previous model, kv260/8599aa7a5f12
+Current model: **kv260/1cedaf2ed816** (2026-10-12), `f70ce632a97a`'s design with the RowOpsKernel
+(the row-ops unit, HOSTOPS_PLAN phase 3) on HP0: a plain campaign — `cases` (1530: the unit's 37
+shipped calls form the new `rowops` family), `run --config perf_config.json --stop-server` (two
+passes of ~2 min; the bench's `calib_runner` needs all five kernels' drivers), `fit`, then `cases
+--refine` / `run --resume` / `fit` three times (+209, +100, +99) → 1938 exact calls, then the
+phase-4a top-up (the prefill attention prep's unit jobs: +90, +184, +24, +8) → 2073 exact calls, repeat
+spread median 0.065 %; `host.json` is to be re-merged from this bitstream's profiles (the norms, residual
+adds and SiLU·up left the host).  The model before, kv260/f70ce632a97a (2026-10-10), `8599aa7a5f12`'s
+design with ConvKernel's x read port on HP2 and overlapped line-buffer loads (DEPTHWISE_PLAN §8):
+a plain campaign (1490 cases, two passes of 59 s), three refinement rounds (+211, +99, +37) → 1837
+exact calls, repeat spread median 0.066 %.  The previous model, kv260/8599aa7a5f12
 (2026-10-08), `588d721997cb`'s design with
 VectorOPKernel's b read port on HPC1 (PS_PORTS_PLAN §5).  Its case list is the converged one of
 `588d721997cb` plus the 261 ConvKernel calls that campaign had measured in earlier rounds
@@ -108,7 +113,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # f70ce632a97a today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 1cedaf2ed816 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`
@@ -116,7 +121,7 @@ bitstream needs one there too.
    else the `.dtbo` stem: `pl.bin` today).
 2. **The bitstream is actually loaded.** Follow the board-deploy skill §2. The id
    check only hashes the file. After a reboot the PL can hold the starter-kit overlay. Run
-   `cat /sys/class/uio/uio*/name` on the board. It must list `fabric_vecop fabric_matmul fabric_conv fabric_pool`.
+   `cat /sys/class/uio/uio*/name` on the board. It must list `fabric_vecop fabric_matmul fabric_conv fabric_pool fabric_rowops`.
 3. **Config** `perf_config.json`: it is local and untracked. Copy it from
    `perf_config.json.example` if it is missing. It needs:
    - `remote.uio_devices` keyed **`PoolingKernel`** (the run_remote_perf naming). A

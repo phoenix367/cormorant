@@ -452,7 +452,10 @@ def cmd_encoder_vsmx(a) -> int:
     doc = json.load(open(os.path.join(a.assets, "exponents.json")))
     exp, E = doc["exponents"], {k: int(v) for k, v in doc["encoder"].items()}
     out_dir = os.path.join(a.assets, "study")
-    pols = {"host softmax": False, "VectorOP softmax": True}
+    # (softmax on the unit, the residual LayerNorms as the row-ops unit's integer
+    # LayerNorm — doc/plans/HOSTOPS_PLAN.md §5, piper_vits.ROWOPS_LN)
+    pols = {"host softmax": (False, False), "VectorOP softmax": (True, False),
+            "VectorOP softmax + unit LN": (True, True)}
     acc = {k: {"n_diff": 0, "worst": 0, "lsd": [], "dx": [], "dst": []} for k in pols}
     n_ids = n_cross = sat = n_logits = 0
     for name, t in _texts(a, "eval").items():
@@ -463,9 +466,11 @@ def cmd_encoder_vsmx(a) -> int:
         wf = np.ceil(np.exp(pv.duration_predictor(W, xf, 0.8, np.random.default_rng(seed), True)))
         mref = _mel_db(pv.synthesize(W, ids, seed=seed))
         w_of, x_of = {}, {}
-        for pol, unit in pols.items():
+        for pol, (unit, iln) in pols.items():
             tr = {}
+            pv.ROWOPS_LN = iln
             x, st = pv.encoder_forward(EW, E, ids, trace=tr, vsmx_unit=unit)
+            pv.ROWOPS_LN = False
             xq = x.astype(np.float64).T
             mq, lq = st.astype(np.float64).T[:pv.ENC_D], st.astype(np.float64).T[pv.ENC_D:]
             wq = np.ceil(np.exp(pv.duration_predictor(W, xq, 0.8, np.random.default_rng(seed), True)))
@@ -478,7 +483,7 @@ def cmd_encoder_vsmx(a) -> int:
             r["dx"].append(float(np.abs(xq - xf).max()))
             r["dst"].append(float(max(np.abs(mq - mf).max(), np.abs(lq - lf).max())))
             w_of[pol], x_of[pol] = wq, xq
-            if unit:
+            if unit and not iln:
                 for k, v in tr.items():
                     if ".l" in k and k.rsplit(".", 1)[-1].startswith("l"):
                         sat += int((np.abs(v) >= 32767).sum())

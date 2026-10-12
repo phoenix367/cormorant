@@ -38,6 +38,7 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
     has_conv     = any(isinstance(sn, (ConvNode, MatmulConvNode, LlmAttnConvNode))
                        for sn in graph.nodes)
     has_pool     = any(isinstance(sn, PoolNode)    for sn in graph.nodes)
+    has_rowops   = any(getattr(type(sn), "kernel_name", "") == "RowOpsKernel" for sn in graph.nodes)
     has_vectorop = any(
         not isinstance(sn, (MatmulNode, MatmulConvNode, ConvNode, PoolNode, ReshapeNode,
                             SpaceToDepthNode, HostNode, LlmKernelNode))
@@ -53,6 +54,8 @@ def _file_banner(filename: str, graph: OnnxGraph, model_path: str) -> str:
         kernel_parts.append("ConvKernel (2-D convolution, NCHW)")
     if has_pool:
         kernel_parts.append("PoolingKernel (2-D pooling, NCHW)")
+    if has_rowops:
+        kernel_parts.append("RowOpsKernel (row ops in fixed point)")
     kernel_line = " + ".join(kernel_parts) if kernel_parts else "unknown"
 
     lines = [

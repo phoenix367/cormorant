@@ -29,6 +29,9 @@
       "activations": true,
       "softmax": true
     },
+    "rowops": {
+      "unit": true
+    },
     "pool": {
       "tile_c":            8,
       "max_kh":            7,

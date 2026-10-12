@@ -166,11 +166,38 @@ class Bert:
         env = dict(self.qinit if q else self.init)
         env.update(feeds)
         policy = policy or {}
+        iln = bool(q and self.pol.get("iln"))
+        if iln and not hasattr(self, "_ln_regions"):
+            # every "cpu:ln:<prefix>" region (its 12 nodes are contiguous): the entry tensor
+            # (the residual add's Q8.8 output), the exit tensor, gamma / beta and eps
+            regs = {}
+            for n in self.nodes:
+                r = self.region[id(n)]
+                if r.startswith("cpu:ln:"):
+                    regs.setdefault(r, []).append(n)
+            self._ln_regions = {}
+            for r, ns in regs.items():
+                prefix = r[len("cpu:ln:"):]
+                eps_node = next(x for x in ns if x.op_type == "Add" and x.input[1] in self.init)
+                self._ln_regions[r] = (ns[0].input[0], ns[-1].output[0],
+                                       self.init[prefix + "/LayerNorm/gamma:0"].astype(np.float64),
+                                       self.init[prefix + "/LayerNorm/beta:0"].astype(np.float64),
+                                       float(np.asarray(self.init[eps_node.input[1]]).reshape(-1)[0]))
+        ln_done = set()
         for n in self.nodes:
             a = {x.name: onnx.helper.get_attribute_value(x) for x in n.attribute}
-            ins = [env[i] if i else None for i in n.input]
             op = n.op_type
             reg = self.region[id(n)]
+            if iln and reg in self._ln_regions:
+                if reg not in ln_done:                 # the unit's LayerNorm of the whole region
+                    entry, exit_, ga, be, eps = self._ln_regions[reg]
+                    x = np.asarray(env[entry], np.float64)
+                    x_raw = np.rint(x.reshape(-1, x.shape[-1]) * 256.0).astype(np.int64)
+                    y = _rowops().layer_norm(x_raw, 8, ga, be, eps, 8) / 256.0
+                    env[exit_] = y.reshape(x.shape)
+                    ln_done.add(reg)
+                continue
+            ins = [env[i] if i else None for i in n.input]
             if op == "Gemm":
                 A, B = ins[0], ins[1]
                 if a.get("transA", 0): A = A.T
@@ -276,7 +303,17 @@ POLS = {
     "fused+fw":   {"fuse_residual_ln": 1, "fuse_mask_softmax": 1, "fold_qscale": 1, "float_weights": 1},
     "sched":      {"sched": 1},   # exactly the phase-1 scheduler partition (bert_sched_check.py)
     "sched+vsmx": {"sched": 1, "vsmx": 1},   # its Softmax on VectorOPKernel (SOFTMAX_PLAN)
+    # + every LayerNorm as the row-ops unit's integer LayerNorm (HOSTOPS_PLAN §5:
+    # inference-scheduler/src/rowops_spec.layer_norm on the Q8.8 residual-add output)
+    "sched+vsmx+iln": {"sched": 1, "vsmx": 1, "iln": 1},
 }
+
+
+def _rowops():
+    """inference-scheduler/src/rowops_spec.py: the row-ops unit's integer specifications."""
+    sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
+    from src import rowops_spec
+    return rowops_spec
 
 
 def _vsmx():

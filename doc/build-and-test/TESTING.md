@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1754 tests); the chat app (188 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1791 tests); the chat app (188 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the four SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1754 tests in 81 modules (all pass, none skipped; the first run
+# Run all 1791 tests in 83 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
@@ -198,6 +198,18 @@ The SystemVerilog PoolingKernel (`kernels/pool_rtl/`,
 the HLS kernel's C++ under randomised AXI timing; `PoolRtlDriver` checks the
 C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
 
+The SystemVerilog RowOpsKernel (`kernels/rowops_rtl/`,
+[ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md); RTL only, not yet in
+the hardware build) has no C-simulation target: `TestRowOpsRtl` (in plain
+`make`) runs the 27 checked-in RowOps fixtures — written by
+`scripts/gen_fixtures.py` from the Python specification
+`inference-scheduler/src/rowops_spec.py` — plus 300 random jobs checked
+against the testbench's C++ port of that specification under randomised
+AXI timing, after a table-load job (the kernel's tables live in UltraRAM
+and are loaded from DDR once per bitstream; the fixtures' `tables.hex`);
+`RowOpsRtlDriver` checks the C driver's register table against the RTL;
+`make lint_rowops_rtl` is its lint.
+
 The SystemVerilog ConvKernel (`kernels/conv_rtl/`,
 [CONV_RTL_KERNEL](../kernels/CONV_RTL_KERNEL.md)) likewise: `TestConvRtl`
 (in plain `make`) runs the 63 checked-in ConvKernel fixtures — the ones
@@ -256,8 +268,9 @@ in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 ##            ConvKernel   17 /  17  (0 failed)
 ##          MatmulKernel   10 /  10  (0 failed)
 ##         PoolingKernel   19 /  19  (0 failed)
+##          RowOpsKernel   28 /  28  (0 failed)
 ##########################################################
-##  TOTAL: 75 / 75 passed
+##  TOTAL: 103 / 103 passed
 ##  ALL TESTS PASSED
 ##########################################################
 ```
@@ -317,8 +330,8 @@ The two fields you must set are:
 
 The `remote.uio_devices` map must list the UIO sysfs name for every
 kernel in the config. After loading the `design_cormorant.dtbo`
-overlay all four names are `fabric_vecop`, `fabric_matmul`,
-`fabric_conv`, and `fabric_pool`.  `run_remote_tests.py` keys the map by
+overlay all five names are `fabric_vecop`, `fabric_matmul`,
+`fabric_conv`, `fabric_pool` and `fabric_rowops`.  `run_remote_tests.py` keys the map by
 the scheduler's kernel names — `VectorOPKernel`, `MatmulKernel`,
 `ConvKernel`, **`PoolKernel`** (not `PoolingKernel`; the example uses
 these keys).
@@ -404,11 +417,12 @@ the correctness configs with an additional `benchmarks` section.
 }
 ```
 
-`perf_config.json.example` ships with **63 benchmark cases**
-across the four kernels (18 VectorOPKernel, 24 MatmulKernel — including
+`perf_config.json.example` ships with **72 benchmark cases**
+across the five kernels (18 VectorOPKernel, 24 MatmulKernel — including
 row-major / packed-B twins of the FC and classifier shapes, `b_packed`
 case field, MATMUL_OPTIMISATION §3b, and GEMV twins, `gemv_kw` case
-field, §8b — 10 ConvKernel, 11 PoolingKernel).
+field, §8b — 10 ConvKernel, 11 PoolingKernel, 9 RowOpsKernel: the row-ops unit's
+LayerNorm / RMSNorm / residual add / SiLU·up / copy shapes of the shipped models, doc/plans/HOSTOPS_PLAN.md).
 
 VectorOPKernel `op` values outside the supported range (0..5) are
 rejected when the cases are loaded, before any case runs (right
@@ -530,6 +544,7 @@ appear as:
 | `MatmulKernel` | `fabric_matmul` |
 | `ConvKernel` | `fabric_conv` |
 | `PoolingKernel` | `fabric_pool` |
+| `RowOpsKernel` | `fabric_rowops` |
 
 Verify on the board: `cat /sys/class/uio/uio*/name` (the Kria image lists
-four `axi-pmon` devices first, uio0–3; the kernels follow as uio4–7).
+four `axi-pmon` devices first, uio0–3; the kernels follow as uio4–8).

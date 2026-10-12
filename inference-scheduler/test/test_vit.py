@@ -324,3 +324,82 @@ class TestImageRows(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVisionRowops(unittest.TestCase):
+    """VitFrontend(vsmx=True, rowops=True) (doc/plans/HOSTOPS_PLAN.md §6): the
+    residual stream as the int32 DMA tensor at 2^-15, VitEmbedAdd writing it, the
+    residual adds (with the bias rounded once) and every LayerNorm on the row-ops
+    unit — against vlm_study's policy pow2+p12+vgelu+vsmx+rowops."""
+    _cache = None
+
+    @classmethod
+    def models(cls):
+        if cls._cache is None:
+            from src import _rowops_hw_config
+            cfg, W, _vm, fe = Tiny.get()
+            Wv = {k[len("model."):]: v for k, v in W.items()}
+            vc = vs.VCfg(TINY_CFG["vision_config"])
+            KW = vs.kernel_weights(Wv, vc)
+            pol = vs.vision_policy(True, True, True)
+            vm = vs.VisionModel(Wv, KW, vc, TINY_CFG["scale_factor"], vs.VPOLICIES[pol], _vm.fmt)
+            vm.conn_k = CONN_K
+            with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                    mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+                fe2 = VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=True)
+                g = OnnxGraph(fe2.entry(output=True), fuse_act=True, s2d_stem=True)
+                cg = CodeGenerator(g, model_path="vit_tiny_rowops.onnx")
+            cls._cache = (cfg, vm, g, cg)
+        return cls._cache
+
+    def test_nodes(self):
+        from src.rowops_nodes import LayerNorm32RoNode, ResAddBiasRoNode
+        _cfg, _vm, g, _cg = self.models()
+        kinds = [type(sn).__name__ for sn in g.nodes]
+        L = 2
+        self.assertEqual(kinds.count("LayerNorm32RoNode"), 2 * L + 1)
+        self.assertEqual(kinds.count("ResAddBiasRoNode"), 2 * L)
+        self.assertNotIn("VitLayerNormNode", kinds)
+        self.assertNotIn("VitResAddNode", kinds)
+        emb = [sn for sn in g.nodes if type(sn).__name__ == "VitEmbedAddNode"][0]
+        self.assertTrue(emb.res32 and emb.output.dma == "i32")
+        for sn in g.nodes:
+            if isinstance(sn, ResAddBiasRoNode):
+                self.assertTrue(sn.a32 and sn.fr == 15 and sn.bb == 15, sn)
+            if isinstance(sn, LayerNorm32RoNode):
+                self.assertEqual(sn.fr, 15)
+                self.assertEqual(len(sn.kernel_calls({})), 1)
+
+    def test_simulation_equals_study(self):
+        cfg, vm, _g, cg = self.models()
+        for im in images(3, 7):
+            states = cg.initial_states()
+            out = cg._forward_pass({"vision.patches": patches(im, cfg.P).astype(np.float64)}, states=states)
+            np.testing.assert_array_equal(out["vision.image"], vm.forward(im))
+
+    def test_differs_from_the_host_norms(self):
+        cfg, vm, _g, _cg = self.models()
+        im = images(1, 7)[0]
+        self.assertFalse(np.array_equal(vm.forward(im), Tiny.get()[2].forward(im)))
+
+    def test_needs_the_unit(self):
+        from src import _rowops_hw_config
+        cfg, W, _vm, fe = Tiny.get()
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", False), \
+                self.assertRaisesRegex(Exception, "row-ops unit"):
+            OnnxGraph(VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True,
+                                  rowops=True).entry(), fuse_act=True, s2d_stem=True)
+
+    def test_generated_c_matches_simulation(self):
+        _cfg, _vm, _g, cg = self.models()
+        src = cg.generate_source()
+        self.assertIn("vit_embed_add32(", src)
+        self.assertIn("run_rowops(", src)
+        for cached, threads, inc in ((True, 3, True), (False, 1, False)):
+            with self.subTest(cached=cached, threads=threads, incoherent=inc), \
+                    tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, td, cached=cached, threads=threads, min_elems=1,
+                                                 incoherent=inc)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertIn("test_inference PASSED", out)

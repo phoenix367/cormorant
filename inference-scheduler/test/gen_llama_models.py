@@ -123,10 +123,11 @@ def study_model(cfg: dict, W: dict, formats: dict, policy: str = POLICY):
 
 
 def frontend(cfg: dict, W: dict, formats: dict, ctx: int = TINY_CTX, name: str = "llama_tiny",
-             prefill_attn: str = "fpga", decode_attn: str = "host", vsmx: bool = False):
+             prefill_attn: str = "fpga", decode_attn: str = "host", vsmx: bool = False,
+             rowops: bool = False):
     lc = LlamaConfig.from_dict(cfg)
     return LlamaFrontend(lc, W, Formats(formats, lc), ctx=ctx, name=name,
-                         prefill_attn=prefill_attn, decode_attn=decode_attn, vsmx=vsmx)
+                         prefill_attn=prefill_attn, decode_attn=decode_attn, vsmx=vsmx, rowops=rowops)
 
 
 def tiny(seed: int = 0):

@@ -94,16 +94,19 @@ def load(assets: Optional[str] = None, text_formats: Optional[str] = None,
 
 
 def frontends(m: Vlm, ctx: int = lp.CONTEXT, name: str = MODEL, decode_attn: str = lp.DECODE_ATTN,
-              vsmx: Optional[bool] = None):
-    """(text frontend, vision frontend); ``decode_attn`` and ``vsmx`` (the softmax
+              vsmx: Optional[bool] = None, rowops: Optional[bool] = None):
+    """(text frontend, vision frontend); ``decode_attn``, ``vsmx`` (the softmax
     of the text prefill and of the vision encoder on VectorOPKernel's softmax
-    unit) as llm_project.frontend."""
+    unit) and ``rowops`` (the residual stream, norms and residual adds of both
+    on the row-ops unit) as llm_project.frontend."""
     vsmx = lp.vsmx_default() if vsmx is None else vsmx
-    lp.policy("fpga", decode_attn, vsmx)                        # a studied combination
+    rowops = lp.rowops_default() if rowops is None else rowops
+    lp.policy("fpga", decode_attn, vsmx, rowops)                # a studied combination
     fe_t = LlamaFrontend(m.tcfg, m.Wt, m.tfmt, ctx=ctx, name=name, prefill_attn="fpga",
                          decode_attn=decode_attn, image_rows=m.vcfg.n_img, image_state=IMAGE_STATE,
-                         vsmx=vsmx)
-    fe_v = VitFrontend(m.vcfg, m.Wv, m.vfmt, name=name, image_state=IMAGE_STATE, vsmx=vsmx)
+                         vsmx=vsmx, rowops=rowops)
+    fe_v = VitFrontend(m.vcfg, m.Wv, m.vfmt, name=name, image_state=IMAGE_STATE, vsmx=vsmx,
+                       rowops=rowops)
     return fe_t, fe_v
 
 

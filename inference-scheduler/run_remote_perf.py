@@ -54,6 +54,7 @@ _EXTRA_DEFAULTS: dict = {
         "MatmulKernel":   {"enabled": True, "warmup": 10},
         "ConvKernel":     {"enabled": True, "warmup": 10},
         "PoolingKernel":  {"enabled": True, "warmup": 10},
+        "RowOpsKernel":   {"enabled": True, "warmup": 10},
     },
 }
 
@@ -75,6 +76,10 @@ _DRIVER_FILES: Dict[str, List[str]] = {
         "xpoolingkernel.h", "xpoolingkernel_hw.h",
         "xpoolingkernel.c", "xpoolingkernel_linux.c",
     ],
+    "RowOpsKernel": [
+        "xrowopskernel.h", "xrowopskernel_hw.h",
+        "xrowopskernel.c", "xrowopskernel_linux.c",
+    ],
 }
 
 _BENCH_BINARY = {
@@ -82,6 +87,7 @@ _BENCH_BINARY = {
     "MatmulKernel":   "bench_matmul",
     "ConvKernel":     "bench_conv",
     "PoolingKernel":  "bench_pool",
+    "RowOpsKernel":   "bench_rowops",
 }
 
 
@@ -121,6 +127,9 @@ _CASE_FIELDS: Dict[str, List[str]] = {
                        "pool_h", "pool_w", "stride_h", "stride_w",
                        "pad_top", "pad_left", "dil_h", "dil_w",
                        "pool_type", "lp_order", "count_include_pad", "iters"],
+    # the row-ops unit (doc/plans/HOSTOPS_PLAN.md): src/perf_calls.py FIELDS order
+    "RowOpsKernel":   ["op", "n", "rows", "blocks", "a_s1", "a_s2", "b_s1", "b_s2", "c_s1", "c_s2",
+                       "aux", "win_lo", "win_hi", "iters"],
 }
 
 
@@ -416,11 +425,33 @@ def _pool_detail(args: List[str]) -> str:
     return f"{pt_s} {ph}x{pw} {ch}ch {ih}x{iw}"
 
 
+_RO_OPS = ["?", "COPY", "ADDX", "DEQUANT", "MULACT", "NORM", "ROPE", "XPOSE", "TLOAD"]
+
+
+def _rowops_detail(args: List[str]) -> str:
+    op   = int(args[0], 0) if args else 0
+    n    = int(args[1]) if len(args) > 1 else 0
+    rows = int(args[2]) if len(args) > 2 else 0
+    blocks = int(args[3]) if len(args) > 3 else 1
+    aux  = int(args[10]) if len(args) > 10 else 0
+    code = op & 15
+    op_s = _RO_OPS[code] if code < len(_RO_OPS) else str(code)
+    if code == 5 and op & (1 << 16):
+        op_s = "NORM_LN"
+    extra = f" x{blocks}" if blocks > 1 else ""
+    if code == 6:
+        extra += f" HD={aux & 0xFFF}"
+    elif code == 7:
+        extra += f" R={aux & 15}"
+    return f"{op_s:<7} n={n:<5} rows={rows}{extra}"
+
+
 _DETAIL_FN = {
     "VectorOPKernel": _vop_detail,
     "MatmulKernel":   _mm_detail,
     "ConvKernel":     _conv_detail,
     "PoolingKernel":  _pool_detail,
+    "RowOpsKernel":   _rowops_detail,
 }
 
 

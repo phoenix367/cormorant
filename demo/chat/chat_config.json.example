@@ -70,8 +70,8 @@
     "_model_id_note": "null = the library's llm_model_name() (smollm2-360m-instruct).",
     "tokenizer": "assets/smollm2-360m-instruct/tokenizer.json",
     "_tokenizer_note": "Host path; uploaded to <remote.dir>/smollm2_360m/tokenizer.json.",
-    "cma_mb": 760,
-    "_cma_note": "The 740 MiB pool BO; with --resident auto it swaps with the other FPGA models."
+    "cma_mb": 775,
+    "_cma_note": "The 754 MiB pool BO; with --resident auto it swaps with the other FPGA models."
   },
   "build": {
     "jobs": 4,
@@ -88,8 +88,8 @@
     "model_id": null,
     "tokenizer": "assets/smolvlm-256m-instruct/tokenizer.json",
     "_tokenizer_note": "Host path; uploaded to <remote.dir>/smolvlm/tokenizer.json.",
-    "cma_mb": 540,
-    "_cma_note": "The 495 MiB pool BO + the image buffer (520-530 MB measured); with --resident auto it swaps with SmolLM2-360M."
+    "cma_mb": 550,
+    "_cma_note": "The 506 MiB pool BO + the image buffer (520-530 MB measured); with --resident auto it swaps with SmolLM2-360M."
   },
   "piper": {
     "lib": null,

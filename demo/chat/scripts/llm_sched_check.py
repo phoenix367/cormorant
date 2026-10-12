@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--vsmx", choices=("auto", "on", "off"), default="auto",
                     help="the prefill softmax on VectorOPKernel (policy ...+vsmx); auto: where "
                          "the platform has the unit")
+    ap.add_argument("--rowops", choices=("auto", "on", "off"), default="auto",
+                    help="the residual stream as int32 and the row ops on the row-ops unit "
+                         "(policy ...+rowops); auto: where the platform has the unit")
     ap.add_argument("--save", default=None, help="write tokens / logits checksums as JSON")
     args = ap.parse_args()
     t0 = time.time()
@@ -75,10 +78,11 @@ def main():
     turn2 = lp.second_turn_ids() if args.second_turn else []
     cont = set(filter(None, args.second_turn.split(",")))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
-    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx)
+    rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
+    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops)
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
     fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn,
-                     vsmx=vsmx)
+                     vsmx=vsmx, rowops=rowops)
     cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "

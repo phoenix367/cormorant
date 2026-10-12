@@ -383,7 +383,7 @@ class PiperEncoderFrontend:
     the specification is piper_vits.encoder_forward(vsmx_unit=True)."""
 
     def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper",
-                 vsmx: bool = False):
+                 vsmx: bool = False, rowops: bool = False):
         missing = [k for k in encoder_exponent_keys() if k not in E]
         if missing:
             raise ValueError(f"encoder exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
@@ -391,6 +391,10 @@ class PiperEncoderFrontend:
             raise ValueError(f"bucket {T}: a multiple of 16 rows")
         self.EW, self.E, self.T, self.name = encoder_weights(W), {k: int(v) for k, v in E.items()}, int(T), name
         self.vsmx = bool(vsmx)
+        # rowops (doc/plans/HOSTOPS_PLAN.md §6): the residual LayerNorms as the unit's —
+        # the sum as an int32 DMA tensor (TtsResAdd), then TtsLayerNorm (the specification
+        # is piper_vits.encoder_forward(rowops_unit=True))
+        self.rowops = bool(rowops)
         self.pv_kw = next(k for k in (4, 2, 1) if T % (16 * k) == 0)
 
     def choose_qk_kw(self) -> int:
@@ -407,12 +411,14 @@ class PiperEncoderFrontend:
                     best = (cyc, kw)
         return best[1]
 
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False):
+    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
         self.vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
         if exp is not None:
             self.meta["exp"][name] = int(exp)
         if host is not None:
             self.meta["host"][name] = host
+        if dma is not None:
+            self.meta["dma"][name] = dma
         if state:
             self.meta["state"].append(name)
         return name
@@ -431,6 +437,22 @@ class PiperEncoderFrontend:
         self._t(y, [self.T, cols], exp=exp)
         self._node("MatMul", [x, wname], [y], y, domain="")
         return y
+
+    def _resnorm(self, x, fx, y, fy, out, f_out, bias, gamma, beta, name, D):
+        """LayerNorm(x + (y + bias)) -> out: the host op TtsResNorm, or with rowops the
+        unit's TtsResAdd (the sum as an int32 DMA tensor at the finer exponent) + TtsLayerNorm."""
+        self._t(out, [self.T, D], exp=f_out)
+        if not self.rowops:
+            self._node("TtsResNorm", [x, y, self._init(f"v.enc.{bias}", self.EW[bias]),
+                                      self._init(f"v.enc.{gamma}", self.EW[gamma]),
+                                      self._init(f"v.enc.{beta}", self.EW[beta]), self.n],
+                       [out], name, eps=repr(1e-5))
+            return out
+        s = self._t(f"{out}_s", [self.T, D], exp=max(int(fx), int(fy)), dma="i32")
+        self._node("TtsResAdd", [x, y, self._init(f"v.enc.{bias}", self.EW[bias])], [s], f"{name}_add")
+        self._node("TtsLayerNorm", [s, self._init(f"v.enc.{gamma}", self.EW[gamma]),
+                                    self._init(f"v.enc.{beta}", self.EW[beta])], [out], name, eps=repr(1e-5))
+        return out
 
     def _rowprep(self, x, y, cols, exp, taps=1, bias=None, relu=0):
         self._t(y, [self.T, taps * cols], exp=exp)
@@ -458,6 +480,7 @@ class PiperEncoderFrontend:
         kw = self.choose_qk_kw()
         common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
         fp = E["enc.p"]
+        fx = E["enc.x0"]
         for i in range(ENC_LAYERS):
             e, te = f"enc.l{i}", f"{p}.l{i}"
             xin = self._rowprep(x, f"{te}.xin", D, E[f"{e}.xin"])
@@ -492,21 +515,16 @@ class PiperEncoderFrontend:
                        [att], f"{te}.attn_merge", num_heads=H, head_dim=HD, window=Wn,
                        o_exp=[E[f"{e}.o"]] * H, p_exp=[fp])
             y = self._matmul(att, f"l{i}.wo", f"{te}.y", D, E[f"{e}.y"])
-            x1 = self._t(f"{te}.x1", [T, D], exp=E[f"{e}.x1"])
-            self._node("TtsResNorm", [x, y, self._init(f"v.enc.l{i}.bo", EW[f"l{i}.bo"]),
-                                      self._init(f"v.enc.l{i}.g1", EW[f"l{i}.g1"]),
-                                      self._init(f"v.enc.l{i}.be1", EW[f"l{i}.be1"]), self.n],
-                       [x1], f"{te}.norm1", eps=repr(1e-5))
+            x1 = self._resnorm(x, fx, y, E[f"{e}.y"], f"{te}.x1", E[f"{e}.x1"], f"l{i}.bo", f"l{i}.g1",
+                               f"l{i}.be1", f"{te}.norm1", D)
             c1 = self._rowprep(x1, f"{te}.c1", D, E[f"{e}.c1"], taps=3)
             f1 = self._matmul(c1, f"l{i}.w1", f"{te}.f1", EW[f"l{i}.w1"].shape[1], E[f"{e}.f1"])
             h = self._rowprep(f1, f"{te}.h", EW[f"l{i}.w1"].shape[1], E[f"{e}.h"], taps=3, bias=f"l{i}.b1",
                               relu=1)
             f2 = self._matmul(h, f"l{i}.w2", f"{te}.f2", D, E[f"{e}.f2"])
-            x = self._t(f"{te}.x2", [T, D], exp=E[f"{e}.x2"])
-            self._node("TtsResNorm", [x1, f2, self._init(f"v.enc.l{i}.b2", EW[f"l{i}.b2"]),
-                                      self._init(f"v.enc.l{i}.g2", EW[f"l{i}.g2"]),
-                                      self._init(f"v.enc.l{i}.be2", EW[f"l{i}.be2"]), self.n],
-                       [x], f"{te}.norm2", eps=repr(1e-5))
+            x = self._resnorm(x1, E[f"{e}.x1"], f2, E[f"{e}.f2"], f"{te}.x2", E[f"{e}.x2"], f"l{i}.b2",
+                              f"l{i}.g2", f"l{i}.be2", f"{te}.norm2", D)
+            fx = E[f"{e}.x2"]
         sti = self._rowprep(x, f"{p}.st_in", D, E["enc.st#in"])
         st = self._matmul(sti, "wp", f"{p}.st", 2 * D, E["enc.st"])
         xo = self._t(f"{p}.x", [T, D], host="f32")

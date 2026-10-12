@@ -26,6 +26,7 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 | **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image where that is faster or the weight's shared layout (on the HLS kernel of older bitstreams: single-row MatMuls) — its GEMV / image path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
+| **RowOpsKernel** (the row-ops unit, where the platform has it) | `LayerNormalization`; the frontends' `LlmResAdd` / `LlmRMSNorm` / `LlmSiluMul`, `VitResAdd` / `VitLayerNorm`, `TtsResAdd` / `TtsLayerNorm` | the host row ops in fixed point on int16 / int32 DMA rows ([§Hardware Kernels, the row-ops unit](#hardware-kernels)); not in the hardware build until [HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md) phase 3 |
 
 **Zero-cost transformations (no hardware call):**
 - `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity`
@@ -70,6 +71,49 @@ unguarded and checks at `inference_init()` that the IP has the register
 `alpha = 0` only where the driver has it (`#ifdef
 XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
 
+**The row-ops unit (RowOpsKernel)** (`src/rowops_nodes.py`, the integer
+specification `src/rowops_spec.py`, [HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md),
+[ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)) — when the platform
+has it (`kernels.rowops.unit`; `AXI_ROWOPS=1` / `0` overrides), a fifth lane
+(`KERNEL_ROWOPS`) takes row ops the host computed in double: a plain
+`LayerNormalization` of 16-byte-aligned rows ≤ 4 096 (`LayerNormRoNode`:
+NORM_LN on int16 rows, γ at 2^-g and β in a per-column parameter block —
+BERT's 25 LayerNorms; the host op where a row is longer, unaligned or on a
+host tensor), and — with a frontend's `rowops=True` (the chat / TTS
+generators' `--rowops`, the studies' `...+rowops` policies) — the Llama
+decoder's residual adds, RMSNorms and SiLU·up (`ResAddRoNode`,
+`RMSNormRoNode`, `SiluMulRoNode`), the vision encoder's residual adds with
+their bias and its LayerNorms (`ResAddBiasRoNode`, `LayerNorm32RoNode`),
+and the Piper text encoder's residual LayerNorms (`TtsResAdd` +
+`TtsLayerNorm`, the same two nodes).  The residual stream is then an
+**int32 DMA tensor** at 2^-15 (`axi.numeric` `dma: i32`, `TensorInfo.dma`;
+twice the element count in the pool) instead of float32 host memory: the
+adds are exact, the norms the integer specification's (within 1 LSB of the
+exact function; `demo/chat/scripts/llm_study.py` / `vlm_study.py` /
+`bert_study.py` / `piper_vits.py` compute the same numbers, which the
+sched-checks hold bit for bit).  Per call one `run_rowops()` (the 19
+registers: op word, n, rows, blocks, the three strides each of A / B / C,
+the parameter block P, eps, aux, the β shift, the window); the sigmoid and
+rsqrt tables are a 64 KiB weight tensor (`rowops_tables`) the program loads
+into the unit's UltraRAM once, in `inference_init()` (TLOAD).  Host ops
+reading an int32 residual (`LlmEmbed`, `VitEmbedAdd`, `LlmSelectRow`,
+`LlmAttnPrep`, `LlmDequant`) take the `int32_t *` buffer and sync it like any
+kernel-written buffer.  The prefill entries' `LlmAttnPrep` runs on the unit
+too (`AttnPrepRoNode`, HOSTOPS_PLAN §10): ROPE of q and k into staging
+rows (DMA states of the entry), a TRANSPOSE per KV group into the q·Kᵀ
+image (hence `qk_kw = 1`), a COPY into the K cache and TRANSPOSEs into the
+P·V image — the 16K-key blocks inside [pos, pos + n) as R = K tiles, the
+two boundary blocks as byte-strobed single-element granules; the
+calls are priced at pos = 0, n = T; the numerics are the study's `irope`.
+The decode step's `LlmAttnPrep` (one row), `LlmAttnMerge` (a 128-byte-row
+gather the unit would not beat) and `LlmDequant` (a host output) stay host
+ops; the decode prep invalidates the V-cache lines it writes 2-byte slots
+into (`llm_cache_inval_rows`): the unit wrote them through a port that does
+not snoop the CPU caches.  `test/host_emu.py` models
+the unit in C (`xrowopskernel.h`), so every generated project runs on the
+host; `perf_model.family()` prices its calls as the `rowops` family once a
+campaign measures them (phase 3).
+
 **Host-CPU ops (C code inside `inference_run()`, no hardware call):**
 - **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Concat,
   Resize, Gather, OneHot, Cast** — `src/host_nodes.py`, see [§Host-CPU ops](#host-cpu-ops)
@@ -97,7 +141,7 @@ XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA`).
   `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm` around the
   flow's and the HiFi-GAN decoder's ConvKernel convs, and `TtsEmbed`,
   `TtsRowPrep`, `TtsAttnSoftmax` (or `TtsAttnRelAdd` + the softmax unit),
-  `TtsAttnMerge`, `TtsResNorm`, `TtsEncOut` in the text encoder; the `chunk` and `encode_<T>` entries come from
+  `TtsAttnMerge`, `TtsResNorm` (or, on the row-ops unit, `TtsResAdd` + `TtsLayerNorm`), `TtsEncOut` in the text encoder; the `chunk` and `encode_<T>` entries come from
   `src/piper.py` ([§Text to speech (Piper)](#text-to-speech-piper)).
   This is what runs Piper lessac-medium — `TTS_PLAN.md` §4–§6.
 - **Stereo depth ops** (domain `axi.llm`, `src/stereo_nodes.py`) —
@@ -159,7 +203,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1754 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1791 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -454,7 +498,7 @@ flowchart LR
 
 ### Parallel kernel execution
 
-Each hardware lane (`Conv`, `Pool`, `Matmul`, `VectorOP`) is a single IP
+Each hardware lane (`Conv`, `Pool`, `Matmul`, `VectorOP`, and `RowOps` where the platform has the unit) is a single IP
 on the FPGA, and the codegen overlaps work across **different** lanes.
 The `run_*()` helpers are non-blocking — they program AXI-Lite
 registers, call `XKernel_Start()`, and return. Synchronisation is a
@@ -462,6 +506,7 @@ single weak-symbol primitive emitted into the generated source:
 
 ```c
 typedef enum { KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL,
+               KERNEL_ROWOPS,   /* only with the row-ops unit */
                KERNEL_COUNT } kernel_id_t;
 __attribute__((weak))
 void kernel_wait(kernel_id_t k);   /* default: poll IsDone */
@@ -526,7 +571,7 @@ rules):
 | CPU wrote → kernel **writes** | `inference_buf_sync_to_device` (clean) | graph outputs at the top of `inference_run()` — a caller's `memset` of an output buffer would otherwise leave dirty lines whose later eviction overwrites the kernel's result; freshly allocated BOs are cleaned once in `inference_buf_alloc()` |
 | kernel wrote → CPU reads | `inference_buf_sync_from_device` (invalidate) **after** the lane drained | a host op's kernel-written inputs (inside its block, after the event stream's `kernel_wait`); graph outputs after the final drain |
 | kernel ↔ kernel | none | intermediates never touch the CPU caches |
-| CPU wrote a **DMA state** → kernel reads | `llm_cache_flush` (clean the rows the kernels read) | the KV caches of the FPGA prefill attention: `LlmAttnPrep` flushes rows `[0, keys)` of every KV head after writing its rows; decode steps write their row without a sync (it stays dirty until the next prefill flushes it) |
+| CPU wrote a **DMA state** → kernel reads | `llm_cache_flush` (clean the rows the kernels read) | the KV caches of the FPGA prefill attention: the host `LlmAttnPrep` flushes rows `[0, keys)` of every KV head after writing its rows; decode steps write their row without a sync (it stays dirty until the next prefill flushes it).  With the row-ops unit the prefill prep is a kernel (`AttnPrepRoNode`) and every CPU writer of the caches flushes (decode: `llm_cache_flush_rows`), so the states are clean between runs — the audit then starts them clean and requires them clean at the end |
 
 Pool slots are 64-byte (cache-line) aligned and never share a line, a host
 op's output never shares a slot with one of its inputs (liveness), and the
@@ -1000,7 +1045,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | op | semantics |
 |---|---|
 | `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32; `weights/<name>.dat` when > 64 KiB), index clamped |
-| `LlmResAdd` | `h' = float32((double)h + d)` |
+| `LlmResAdd` | `h' = float32((double)h + d)`; with `rowops=True` the residual is an int32 DMA tensor at 2^-15 and the add runs on the row-ops unit (`ResAddRoNode`, exact), as do `LlmRMSNorm` and `LlmSiluMul` (`RMSNormRoNode`, `SiluMulRoNode`) — [§Hardware Kernels, the row-ops unit](#hardware-kernels) |
 | `LlmRMSNorm` | `ss = Σ h²`, `r = 1 / sqrt(ss / n + ε)`, `y = (h·r)·γ` (γ float32) |
 | `LlmAttention` | rows t < n: `RoPE(k0[t])` → K cache row `pos + t` at its exponent, `v[t]` re-rounded into the V cache; per (t, head): `RoPE(q)` in double, `s_j = dot8(q, k_j) · HD^-½` over keys `j ≤ pos + t` (8 lane sums over d ascending, combined `((0+1)+(2+3))+((4+5)+(6+7))`), `e_j = exp(s_j − max)`, `p_j = e_j / Σe`, `o = Σ_j p_j v_j`; rows ≥ n → 0; 4 host threads over (row, head).  A decode step (n = 1, `llm_attn_decode`) runs on all host threads in one pool dispatch, in phases separated by spin barriers — scores per (KV group, key quarter) with the group's heads sharing each K row, exp per (group, key quarter), Σe per head left to right, p per (group, key quarter), P·V per (group, lane quarter) — with the power-of-two cache scales folded out exactly (`q·2^-f` against the raw K row; P·V over raw V rows, scaled once, while p ≥ 2^-900) and NEON kernels on aarch64 (no FMA): bit-identical to the per-head code for any thread count |
 | `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
@@ -1035,7 +1080,11 @@ policy pow2+p12, which the simulation reproduces bit for bit):
   `demo/chat/src/llm_api.c` fills it from an RGB image.
 - **Per layer, host ops:** LayerNorm (`VitLayerNorm`), the bias adds,
   GELU (`VitGelu`) and the float32 residual adds (`VitResAdd`, which adds
-  the projection's bias too).
+  the projection's bias too).  With `VitFrontend(rowops=True)` (policy
+  `pow2+p12+vgelu+vsmx+rowops`) the residual is an int32 DMA tensor at
+  2^-15 that `VitEmbedAdd` writes, and the residual adds (the bias rounded
+  once at that scale: `rowops_spec.quant_bias`) and every LayerNorm run on
+  the row-ops unit (`ResAddBiasRoNode`, `LayerNorm32RoNode`).
   - GELU reads a 65 536-entry int16 table of the rounded outputs per
     (input, output) exponent pair (the bias added as an integer first),
     filled with libm exp in the tanh form.
@@ -1306,7 +1355,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (443 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (440 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1318,9 +1367,10 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 2.9 %, p90 18 % over the
-  1 103 ConvKernel calls of the 250 MHz campaign `f70ce632a97a`, refitted
-  there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
+  DDR latency, x and weight runs; median 2.8 %, p90 20.3 % over the
+  1303 ConvKernel calls of the 250 MHz campaign `1cedaf2ed816` (2.9 / 18 %
+  on `f70ce632a97a`, where it was fitted — HOSTOPS_PLAN §9.2 re-scored and
+  kept it), refitted there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
   previous fit 36 % high on the x-bound jobs; 18.3 / 45.8 % over the 1 190 of
   `6436623029f7` before — the
   100 MHz set fitted `c2b2a6e5e50e` to 3.1 / 14.6 %, but at 250 MHz a DDR
@@ -1329,7 +1379,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 312 predicted.
+  board (0.12 ms at 250 MHz), 34 315 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

@@ -103,6 +103,23 @@ import numpy as np
 _VSMX = None
 
 
+_ROWOPS = None
+
+
+def rowops():
+    """inference-scheduler/src/rowops_spec.py (numpy only), loaded by path: the
+    row-ops unit's integer specifications (doc/plans/HOSTOPS_PLAN.md §5)."""
+    global _ROWOPS
+    if _ROWOPS is None:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "inference-scheduler", "src", "rowops_spec.py")
+        spec = importlib.util.spec_from_file_location("rowops_spec", p)
+        _ROWOPS = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_ROWOPS)
+    return _ROWOPS
+
+
 def vsmx():
     """inference-scheduler/src/vectorop_smx.py (numpy only), loaded by path: the
     FPGA softmax's specification without the scheduler package."""
@@ -539,6 +556,14 @@ class Model:
         return self.kmm(x * p2(self.E(ci, l)), self.w[(l, key)], self.E(co, l), self.sh(key, l), co, l)
 
     def rms(self, h, gamma, cls, l):
+        if self.q and self.pol.get("inorm") and self.pol.get("res_bits") and not self.exact(cls):
+            # the row-ops unit's integer RMSNorm on the int32 residual (rowops_spec.rms_norm)
+            fr = int(self.pol["res_bits"])
+            e = self.E(cls, l)
+            y = rowops().rms_norm(np.rint(h * p2(fr)).astype(np.int64), fr, gamma, self.cfg.eps, e)
+            self.stats.add(cls, l, float(np.abs(y / p2(e)).max()) if y.size else 0.0,
+                           int(((y == I16_LO) | (y == I16_HI)).sum()), y.size)
+            return y / p2(e)
         ss = np.cumsum(h * h, axis=-1)[:, -1]           # left to right
         r = 1.0 / np.sqrt(ss / h.shape[1] + self.cfg.eps)
         return self.host((h * r[:, None]) * gamma, cls, l, self.E(cls, l))
@@ -555,6 +580,22 @@ class Model:
         half = HD // 2
         rot = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)
         e = self.E(cls, l)
+        ir = self.pol.get("irope")                   # True: every step; "prefill": the prefill only
+        if (self.q and ir and (ir is True or ir == self.phase) and not self.exact(cls)
+                and not ((self.hattn or self.xattn) and cls == "q")):
+            # the row-ops unit's integer RoPE (rowops_spec.rope): x on the kernel output's
+            # grid (q0 / k0 exponents per head), int24 cos / sin, one rounding at e
+            fx = self.Eh(cls + "0", l, nh * HD).reshape(nh, HD)        # per channel (pow2 formats)
+            if not hasattr(self, "_rope_raw"):
+                self._rope_raw = rowops().rope_tables_raw(self.cos, self.sin)
+            cr, sr = self._rope_raw
+            yr = rowops().rope(np.rint(x * p2(fx)[None]).astype(np.int64), fx,
+                               cr[pos], sr[pos], self.Eh(cls, l, nh))
+            ev = self.Eh(cls, l, nh)
+            yv = yr / p2(ev)[None, :, None]
+            self.stats.add(cls, l, float(np.abs(yv).max()) if yv.size else 0.0,
+                           int(((yr == I16_LO) | (yr == I16_HI)).sum()), yr.size)
+            return yv
         e = np.repeat(np.asarray(e, np.int64), HD) if np.ndim(e) else e
         y = (x * c + rot * s).reshape(T, nh * HD)
         if (self.hattn or self.xattn) and cls == "q":   # RoPE(q) stays inside the float attention region
@@ -572,9 +613,22 @@ class Model:
             y = bf16(h + d)                                 # bf16 residual (as torch bf16 inference)
             self.stats.add("h", l, float(np.abs(y).max()), 0, y.size)
             return y
+        if self.q and self.pol.get("res_bits"):           # int32 residual at 2^-res_bits (HOSTOPS_PLAN)
+            return self.res32(h + d, l)
         y = (h + d).astype(np.float32).astype(np.float64)  # float32 host residual
         self.stats.add("h", l, float(np.abs(y).max()), int((np.abs(y) * 256 > 32767.5).sum()), y.size)
         return y
+
+    def res32(self, y, l):
+        """The residual stream as int32 at 2^-res_bits (the row-ops unit's DMA
+        residual, doc/plans/HOSTOPS_PLAN.md): round half even, saturate; the
+        adds are exact whenever every delta exponent is <= res_bits."""
+        fr = int(self.pol["res_bits"])
+        raw = np.rint(y * p2(fr))
+        sat = int(((raw < -2147483648.0) | (raw > 2147483647.0)).sum())
+        raw = np.clip(raw, -2147483648.0, 2147483647.0)
+        self.stats.add("h", l, float(np.abs(y).max()), sat, y.size)
+        return raw / p2(fr)
 
     def softmax(self, s, mask, fs, fp, l):              # one head: s [T, S], mask [T, S]
         vs = self.pol.get("vsmx")
@@ -599,8 +653,19 @@ class Model:
         if not self.q or self.exact("g"):
             return self.host(g / (1.0 + np.exp(-g)) * u, "a", l, self.E("a", l))
         fg = self.E("g", l)
-        sil = np.empty_like(g)
         fgv = np.full(g.shape[1], fg, np.int64) if np.ndim(fg) == 0 else np.asarray(fg)
+        if self.pol.get("isilu") and not self.floor_fix:
+            # the row-ops unit's integer SiLU * up (rowops_spec.silu_mul): the table at
+            # 2^-20, an integer product with u on its grid, one rounding at a's exponent
+            fu = self.Eh("u", l, g.shape[1])
+            fa = self.Eh("a", l, g.shape[1])
+            ar = rowops().silu_mul(np.rint(g * p2(fgv)[None, :]).astype(np.int64), fgv,
+                                   np.rint(u * p2(fu)[None, :]).astype(np.int64), fu, fa)
+            av = ar / p2(fa)[None, :]
+            self.stats.add("a", l, float(np.abs(av).max()) if av.size else 0.0,
+                           int(((ar == I16_LO) | (ar == I16_HI)).sum()), ar.size)
+            return av
+        sil = np.empty_like(g)
         for f in np.unique(fgv):                        # one table per distinct exponent
             cols = fgv == f
             idx = np.floor(g[:, cols] * p2(f)).astype(np.int64) + 32768     # the raw int16
@@ -657,7 +722,10 @@ class Model:
     def embed(self, ids):
         """The residual stream's first rows: embedding-table rows (vlm_study.py
         replaces the image tokens' rows with image features)."""
-        return self.emb[ids].astype(np.float64)
+        h = self.emb[ids].astype(np.float64)
+        if self.q and self.pol.get("res_bits"):           # the stream starts on the int32 grid
+            h = self.res32(h, 0)
+        return h
 
     # ---- position 0 (attention sink) precomputed in float
     def _write_sink(self, s, tok):
@@ -833,6 +901,28 @@ POLICIES = {
     "pow2+sink+p12+mix":     dict(_RF, sink=True, fmt="pow2", p_bits=12, xattn="decode"),
     # the prefill softmax on VectorOPKernel (doc/plans/SOFTMAX_PLAN.md), decode p12 on the host
     "pow2+sink+p12+vsmx":    dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill"),
+    # the residual stream as int32 at 2^-N instead of float32 (doc/plans/HOSTOPS_PLAN.md phase 0:
+    # the row-ops unit's DMA residual); r15 makes every residual add exact (delta exponents <= 15)
+    "pow2+sink+p12+r15":     dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15),
+    "pow2+sink+p12+r14":     dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=14),
+    "pow2+sink+p12+r12":     dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=12),
+    "pow2+sink+p12+r10":     dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=10),
+    # the unit's integer specs (inference-scheduler/src/rowops_spec.py) on top of the int32
+    # residual: the norms (rsqrt table + Newton), RoPE with int24 tables, SiLU * up with the
+    # table at 2^-20; iops = all three
+    "pow2+sink+p12+r15+inorm": dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15, inorm=True),
+    "pow2+sink+p12+r15+irope": dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15, irope=True),
+    "pow2+sink+p12+r15+isilu": dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15, isilu=True),
+    "pow2+sink+p12+r15+iops":  dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15,
+                                    inorm=True, irope=True, isilu=True),
+    # the scheduler's rowops option (src/llama.py, HOSTOPS_PLAN phase 2 / phase 4a): the int32
+    # residual, the unit's RMSNorms, SiLU * up and — since phase 4a (§10) — the prefill's RoPE
+    # (irope: the integer RoPE of rowops_spec.rope on q and k; decode steps keep the host's
+    # double RoPE) — with the FPGA attention (+vsmx: its softmax on VectorOPKernel)
+    "pow2+sink+p12+rowops":      dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15,
+                                      inorm=True, isilu=True, irope="prefill"),
+    "pow2+sink+p12+vsmx+rowops": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill", res_bits=15,
+                                      inorm=True, isilu=True, irope="prefill"),
 }
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")

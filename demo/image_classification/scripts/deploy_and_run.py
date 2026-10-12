@@ -45,6 +45,7 @@ _REQUIRED_DRIVER_HEADERS = {
     "MatmulKernel":   ["xmatmulkernel.h",   "xmatmulkernel_hw.h"],
     "ConvKernel":     ["xconvkernel.h",     "xconvkernel_hw.h"],
     "PoolKernel":     ["xpoolingkernel.h",  "xpoolingkernel_hw.h"],
+    "RowOpsKernel":   ["xrowopskernel.h",   "xrowopskernel_hw.h"],
 }
 
 
@@ -236,6 +237,7 @@ _UIO_CMAKE_DEFINE = {
     "MatmulKernel":   "INFERENCE_MATMULKERNEL_INSTANCE",
     "ConvKernel":     "INFERENCE_CONVKERNEL_INSTANCE",
     "PoolKernel":     "INFERENCE_POOLKERNEL_INSTANCE",
+    "RowOpsKernel":   "INFERENCE_ROWOPSKERNEL_INSTANCE",
 }
 
 

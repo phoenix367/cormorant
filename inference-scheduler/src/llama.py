@@ -68,6 +68,7 @@ from .llm_nodes import LLM_DOMAIN
 
 # The shift of the kernels' output (floor(acc / 2^F)); ap_fixed<16,8>.
 F = 8
+RES_BITS = 15           # the int32 DMA residual's exponent (rowops; HOSTOPS_PLAN §5.1: r15)
 
 
 # ------------------------------------------------------------------ #
@@ -276,11 +277,22 @@ class LlamaFrontend:
                  ctx: int = 1024, name: str = "llama", prefill_attn: str = "fpga",
                  decode_attn: str = "host",
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
-                 image_rows: int = 0, image_state: str = "vlm.img", vsmx: bool = False):
+                 image_rows: int = 0, image_state: str = "vlm.img", vsmx: bool = False,
+                 rowops: bool = False):
         # vsmx (policy pow2+sink+p12+vsmx, doc/plans/SOFTMAX_PLAN.md): the FPGA
         # prefill's softmax on VectorOPKernel's softmax unit (LlmAttnSoftmax
         # vsmx = 1, src/smx_nodes.py); decode steps keep the host softmax
         self.vsmx = bool(vsmx)
+        # rowops (policy ...+rowops, doc/plans/HOSTOPS_PLAN.md §6): the residual
+        # stream as the int32 DMA tensor at 2^-RES_BITS and the residual adds,
+        # RMSNorms and SiLU * up on the row-ops unit (src/rowops_nodes.py); the
+        # deltas' exponents must not exceed RES_BITS (the adds are then exact)
+        self.rowops = bool(rowops)
+        if self.rowops and decode_attn != "fpga":
+            # the unit writes the caches through a port that does not snoop the
+            # CPU caches: every CPU writer of them must flush, which the host
+            # attention of decode_attn "host" does not (HOSTOPS_PLAN §10.5)
+            raise ValueError("rowops needs decode_attn 'fpga' (the row-ops unit writes the KV caches)")
         # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
         # LlmEmbed also reads image_state [image_rows][D] (float32 host state the
         # vision entry writes); ids V .. V + image_rows - 1 select its rows
@@ -355,13 +367,15 @@ class LlamaFrontend:
         self._meta = numeric.empty()
         self._e = ename
 
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False):
+    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
         if name not in self._vi:
             self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
         if exp is not None:
             self._meta["exp"][name] = _compact(exp)
         if host is not None:
             self._meta["host"][name] = host
+        if dma is not None:
+            self._meta["dma"][name] = dma
         if state and name not in self._meta["state"]:
             self._meta["state"].append(name)
         return name
@@ -388,6 +402,23 @@ class LlamaFrontend:
         self._node("MatMul", [x, wname], [y], f"{self._e}.l{li}.{key}_proj" if not lm
                    else f"{self._e}.lm_head")
         del c
+        return y
+
+    def _res(self, name, T, state=False):
+        """A residual-stream tensor [T][D]: float32 host, or with rowops the int32
+        DMA tensor at 2^-RES_BITS."""
+        if self.rowops:
+            return self._t(name, [T, self.cfg.D], exp=RES_BITS, dma="i32", state=state)
+        return self._t(name, [T, self.cfg.D], host="f32", state=state)
+
+    def _resadd(self, h, delta, out, T, name, key, li):
+        if self.rowops:
+            fd = np.asarray(self.fmt.get(key, li, self.cfg.D), np.int64)
+            if (fd > RES_BITS).any():
+                raise ValueError(f"rowops: the {key} exponents of layer {li} exceed 2^-{RES_BITS} "
+                                 f"(max {int(fd.max())}): the residual add would not be exact")
+        y = self._res(out, T)
+        self._node("LlmResAdd", [h, delta], [y], name, domain=LLM_DOMAIN)
         return y
 
     def _rmsnorm(self, h, gamma_name, gamma, T, out, exp, name):
@@ -444,12 +475,34 @@ class LlamaFrontend:
         fk = fm.heads("k", li, KV)
         fs = (fm.heads("s", li, H) if f"s@{li}" in fm.exp else fq + fk[grp] - F)
         fp = fm.heads("p", li, H)
-        kw = self.choose_qk_kw(T)
+        # rowops (HOSTOPS_PLAN §10): the prefill's prep runs on the unit, which
+        # writes the q image at kw = 1 (its TRANSPOSE granules are one column)
+        kw = 1 if self.rowops else self.choose_qk_kw(T)
         common = dict(num_heads=H, num_kv_heads=KV, head_dim=HD, key_quantum=16 * self.pv_kw)
         qx = self._t(f"{e}.l{li}.qx", [KV, HD, G * T], exp=0)
-        self._node("LlmAttnPrep", [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"], [qx],
-                   f"{e}.l{li}.attn_prep", domain=LLM_DOMAIN, qk_kw=kw,
-                   q_exp=[int(x) for x in fq], **common)
+        prep_in = [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"]
+        prep_attrs = {}
+        if self.rowops and n:
+            # the unit's jobs stage the rotated rows in DMA states of the entry
+            # (rowops_nodes.AttnPrepRoNode); v is re-rounded only where the V
+            # cache's exponents differ from the projection's
+            qs = self._t(f"{e}.ro.qs", [T, H * HD], exp=0, state=True)
+            ks = self._t(f"{e}.ro.ks", [T, KV * HD], exp=0, state=True)
+            self._init(qs, np.zeros((T, H * HD), np.float32))
+            self._init(ks, np.zeros((T, KV * HD), np.float32))
+            vs = ""
+            if not np.array_equal(np.broadcast_to(fm.v_cache(li), (KV * HD,)),
+                                  np.broadcast_to(fm.get("v", li, KV * HD), (KV * HD,))):
+                vs = self._t(f"{e}.ro.vs", [T, KV * HD], exp=0, state=True)
+                self._init(vs, np.zeros((T, KV * HD), np.float32))
+            prep_in += [qs, ks, vs]
+            prep_attrs = dict(rowops=1, first=int(li == 0))
+        elif self.rowops:
+            # a decode step: the host prep writes 2-byte V slots into lines the
+            # unit filled during the prefill — invalidate them first (§10.5)
+            prep_attrs = dict(rowops_cache=1)
+        self._node("LlmAttnPrep", prep_in, [qx], f"{e}.l{li}.attn_prep", domain=LLM_DOMAIN, qk_kw=kw,
+                   q_exp=[int(x) for x in fq], **common, **prep_attrs)
         s = [self._t(f"{e}.l{li}.s{g}", [self.C, G * T], exp=0) for g in range(KV)]
         p = [self._t(f"{e}.l{li}.p{g}", [G * T, self.C], exp=0) for g in range(KV)]
         o = [self._t(f"{e}.l{li}.o{g}", [G * T, HD], exp=0) for g in range(KV)]
@@ -506,19 +559,17 @@ class LlamaFrontend:
                            [pv], f"{e}.l{li}.attn", domain=LLM_DOMAIN,
                            num_heads=c.H, num_kv_heads=c.KV, head_dim=c.HD)
             o = self._matmul(li, "o", pv, T, fm.get("o", li, c.D))
-            h1 = self._t(f"{e}.l{li}.h1", [T, c.D], host="f32")
-            self._node("LlmResAdd", [h, o], [h1], f"{e}.l{li}.res_attn", domain=LLM_DOMAIN)
+            h1 = self._resadd(h, o, f"{e}.l{li}.h1", T, f"{e}.l{li}.res_attn", "o", li)
             x2 = self._rmsnorm(h1, f"g.l{li}.post",
                                self.W[f"model.layers.{li}.post_attention_layernorm.weight"],
                                T, f"{e}.l{li}.x2", fm.get("x2", li, c.D), f"{e}.l{li}.norm_post")
             g = self._matmul(li, "g", x2, T, fm.get("g", li, c.FF))
             u = self._matmul(li, "u", x2, T, fm.get("u", li, c.FF))
             a = self._t(f"{e}.l{li}.a", [T, c.FF], exp=fm.get("a", li, c.FF))
-            self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN)
+            self._node("LlmSiluMul", [g, u], [a], f"{e}.l{li}.silu_mul", domain=LLM_DOMAIN,
+                       **(dict(rowops=1) if self.rowops else {}))
             d = self._matmul(li, "d", a, T, fm.get("d", li, c.D))
-            h2 = self._t(f"{e}.l{li}.h2", [T, c.D], host="f32")
-            self._node("LlmResAdd", [h1, d], [h2], f"{e}.l{li}.res_mlp", domain=LLM_DOMAIN)
-            h = h2
+            h = self._resadd(h1, d, f"{e}.l{li}.h2", T, f"{e}.l{li}.res_mlp", "d", li)
         return h
 
     def _head(self, h):
@@ -541,7 +592,7 @@ class LlamaFrontend:
             n = self._t(f"{ename}.n", [1], TensorProto.INT32, host="i32")
             inputs.append(n)
         self._init("emb", self.W["model.embed_tokens.weight"])
-        h0 = self._t(f"{ename}.h0", [T, c.D], host="f32")
+        h0 = self._res(f"{ename}.h0", T)
         emb_in = [ids, "emb"]
         if select and self.image_rows:
             img = self._t(self.image_state, [self.image_rows, c.D], host="f32", state=True)
@@ -551,7 +602,7 @@ class LlamaFrontend:
         h = self._layers(h0, T, pos, n)
         outputs = []
         if select:
-            hl = self._t("h_last", [1, c.D], host="f32", state=True)
+            hl = self._res("h_last", 1, state=True)
             self._node("LlmSelectRow", [h, n], [hl], f"{ename}.select_last", domain=LLM_DOMAIN)
             h = hl
         if head:
@@ -564,7 +615,7 @@ class LlamaFrontend:
     def _build_head(self):
         c = self.cfg
         self._new("head")
-        hl = self._t("h_last", [1, c.D], host="f32", state=True)
+        hl = self._res("h_last", 1, state=True)
         self._init(hl, np.zeros((1, c.D), np.float32))
         y = self._head(hl)
         return self._model("head", [], [y])

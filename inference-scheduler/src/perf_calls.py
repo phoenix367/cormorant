@@ -33,6 +33,10 @@ FIELDS: Dict[str, Tuple[str, ...]] = {
     "PoolKernel":     ("batch", "channels", "in_h", "in_w", "out_h", "out_w",
                        "pool_h", "pool_w", "stride_h", "stride_w", "pad_top", "pad_left",
                        "dil_h", "dil_w", "pool_type", "lp_order", "count_include_pad"),
+    # the row-ops unit: the op word (op, kinds, flags), the geometry, the window;
+    # eps / bq_sh / the addresses set no time
+    "RowOpsKernel":   ("op", "n", "rows", "blocks", "a_s1", "a_s2", "b_s1", "b_s2",
+                       "c_s1", "c_s2", "aux", "win_lo", "win_hi"),
 }
 KERNELS = tuple(FIELDS)
 

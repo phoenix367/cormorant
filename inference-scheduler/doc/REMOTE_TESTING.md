@@ -152,6 +152,7 @@ The four UIO nodes and their names as they appear in `/sys/class/uio/uio*/name`:
 | `MatmulKernel`   | `fabric_matmul` | `fabric_matmul` |
 | `ConvKernel`     | `fabric_conv`   | `fabric_conv`   |
 | `PoolingKernel`  | `fabric_pool`   | `fabric_pool`   |
+| `RowOpsKernel`   | `fabric_rowops` | `fabric_rowops` |
 
 To look up or confirm names, grep the DTS for `generic-uio`:
 
@@ -1025,7 +1026,7 @@ Tracked templates (copy, then edit the copy):
 |-------------|--------|---------|
 | `bitstream_config_kv260.json.example` | `upload_bitstream.py` | Load Cormorant bitstream + xclbin + DTBO onto the board |
 | `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 159 models over all four kernels |
-| `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 63 cases; the board config of the calibration campaign |
+| `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 72 cases; the board config of the calibration campaign |
 
 Per-subset copies such as `remote_config_vectorop.json`, `remote_config_conv.json`
 or `remote_config_all_models.json` are local working files (not tracked):

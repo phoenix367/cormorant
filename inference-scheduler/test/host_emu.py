@@ -1,8 +1,8 @@
 """Run a generated project on the HOST: the generated inference.c and
 test/test_inference.c are compiled unchanged against
 
-  * software models of the VectorOPKernel, MatmulKernel and ConvKernel
-    drivers — the AXI-Lite register semantics of
+  * software models of the VectorOPKernel, MatmulKernel, ConvKernel and
+    RowOpsKernel drivers — the AXI-Lite register semantics of
     kernels/vectorop/include/VectorOP.h, kernels/matmul/include/MatmulKernel.h
     and kernels/conv/include/ConvKernel.h (ap_fixed<16,8>: exact products /
     sums, AP_TRN floor + AP_SAT on the result, C-style division; packed-B
@@ -432,6 +432,226 @@ static inline void XConvkernel_Start(XConvkernel *p)
 }
 """
 
+_ROWOPS = r"""
+#include "emu_common.h"
+#include <stdlib.h>
+/* RowOpsKernel (kernels/rowops_rtl, doc/kernels/ROWOPS_RTL_KERNEL.md): a C port of
+ * the testbench's oracle rowops_ref.h — the integer specifications of
+ * src/rowops_spec.py applied to a job's registers; the tables come from the
+ * OP_TLOAD image, as in the hardware.  Every output row is written as whole
+ * 16-byte words, the lanes past the row zero; TRANSPOSE's scattered granules
+ * are written byte-exact. */
+typedef __int128 i128;
+typedef struct { u64 a, b, c, p, eps; uint32_t op, n, rows, blocks, a_s1, a_s2, b_s1, b_s2,
+                 c_s1, c_s2, aux, bq_sh, win_lo, win_hi; } XRowopskernel;
+static inline int XRowopskernel_Initialize(XRowopskernel *q, const char *nm)
+{ (void)nm; memset(q, 0, sizeof *q); return 0; }
+#define RO_SET(f) static inline void XRowopskernel_Set_##f(XRowopskernel *q, u64 v) { q->f = (uint32_t)v; }
+static inline void XRowopskernel_Set_a(XRowopskernel *q, u64 v)   { q->a = v; }
+static inline void XRowopskernel_Set_b(XRowopskernel *q, u64 v)   { q->b = v; }
+static inline void XRowopskernel_Set_c(XRowopskernel *q, u64 v)   { q->c = v; }
+static inline void XRowopskernel_Set_p(XRowopskernel *q, u64 v)   { q->p = v; }
+static inline void XRowopskernel_Set_eps(XRowopskernel *q, u64 v) { q->eps = v; }
+RO_SET(op) RO_SET(n) RO_SET(rows) RO_SET(blocks) RO_SET(a_s1) RO_SET(a_s2) RO_SET(b_s1) RO_SET(b_s2)
+RO_SET(c_s1) RO_SET(c_s2) RO_SET(aux) RO_SET(bq_sh) RO_SET(win_lo) RO_SET(win_hi)
+static inline int XRowopskernel_IsDone(XRowopskernel *q) { (void)q; return 1; }
+static inline int XRowopskernel_IsIdle(XRowopskernel *q) { (void)q; return 1; }
+static inline int XRowopskernel_Release(XRowopskernel *q) { (void)q; return 0; }
+
+static uint64_t ro_sig[4096];                 /* {D[i] (24 bits) << 25 | T[i] (25 bits)} */
+static uint32_t ro_rsq[8192];
+static int      ro_tables_loaded;
+
+static inline i128 ro_rne_shr(i128 x, int k)
+{
+    i128 q, r, half;
+    if (k <= 0) return x << (-k);
+    q = x >> k; r = x - (q << k); half = (i128)1 << (k - 1);
+    return q + ((r > half || (r == half && (q & 1))) ? 1 : 0);
+}
+static inline int64_t ro_sat16(i128 x) { return x > 32767 ? 32767 : x < -32768 ? -32768 : (int64_t)x; }
+static inline int64_t ro_sat32(i128 x)
+{ return x > 2147483647 ? 2147483647 : x < -2147483648LL ? -2147483648LL : (int64_t)x; }
+static inline int ro_bitlen(i128 v) { int n = 0; while (v) { v >>= 1; n++; } return n; }
+static void ro_rsqrt_bf(i128 D, u64 *Rm, int *sh)
+{
+    int e = ro_bitlen(D), d = e - 32;
+    i128 Dm, y1;
+    u64 y0, t, u;
+    if (d & 1) d += 1;
+    Dm = d >= 0 ? (D >> d) : (D << (-d));
+    y0 = ro_rsq[(size_t)(Dm >> 19)];
+    t  = (u64)(((i128)Dm * (i128)y0) >> 32);
+    u  = (u64)(((i128)t * (i128)y0) >> 32);
+    y1 = (i128)y0 + ((((i128)y0) * ((i128)((int64_t)1 << 30) - (i128)u)) >> 31);
+    if (y1 < ((i128)1 << 31)) y1 = (i128)1 << 31;
+    if (y1 > ((i128)1 << 32) - 1) y1 = ((i128)1 << 32) - 1;
+    *Rm = (u64)y1;
+    *sh = 47 + d / 2;
+}
+static int64_t ro_silu_q(int64_t gv)                 /* silu(g) at 2^-20, g = gv 2^-14 */
+{
+    int64_t a = gv < 0 ? -gv : gv, sig;
+    int big = a >= ((int64_t)16 << 14);
+    int64_t ai = big ? ((int64_t)16 << 14) - 1 : a;
+    uint64_t e = ro_sig[ai >> 6];
+    int64_t t = (int64_t)(e & 0x1FFFFFF), dlt = (int64_t)((e >> 25) & 0xFFFFFF), frac = ai & 63;
+    sig = t + ((dlt * frac) >> 6);
+    if (big) sig = (int64_t)1 << 24;
+    if (gv < 0) sig = ((int64_t)1 << 24) - sig;
+    return (int64_t)ro_rne_shr((i128)gv * sig, 14 + 24 - 20);
+}
+static uint32_t ro_float_bits(int64_t v, int sh_c)   /* float32(v 2^-sh_c), round to nearest even */
+{
+    int neg, lz, exp;
+    u64 mag, norm;
+    uint32_t m24, m;
+    if (v == 0) return 0;
+    neg = v < 0;
+    mag = neg ? (u64)(-v) : (u64)v;
+    lz = 63 - __builtin_clzll(mag);
+    norm = lz >= 31 ? mag >> (lz - 31) : mag << (31 - lz);
+    m24 = (uint32_t)(norm >> 8);
+    m24 += ((norm & 0x80) && ((norm & 0x7F) || (norm & 0x100))) ? 1u : 0u;
+    exp = 127 + lz - sh_c + (int)((m24 >> 24) & 1u);
+    m = m24 & 0x7FFFFFu;
+    return ((uint32_t)neg << 31) | ((uint32_t)exp << 23) | m;
+}
+typedef struct { int32_t g, bq; unsigned sh_a, sh_b, sh_c; } ro_param_t;
+static ro_param_t ro_param(const XRowopskernel *q, uint32_t c)
+{
+    const unsigned char *e = (const unsigned char *)(uintptr_t)(q->p + 16ull * ((q->op & (1u << 13)) ? 0u : c));
+    ro_param_t r;
+    uint32_t g, bq;
+    memcpy(&g, e, 4); memcpy(&bq, e + 4, 4);
+    r.g = (int32_t)g;
+    r.bq = (int32_t)(bq << 10) >> 10;
+    r.sh_a = e[8] & 63u; r.sh_b = e[9] & 63u; r.sh_c = e[10] & 63u;
+    return r;
+}
+static int64_t ro_elem(u64 addr, unsigned kind)
+{
+    if (kind == 0u) { int16_t v; memcpy(&v, (const void *)(uintptr_t)addr, 2); return v; }
+    else { int32_t v; memcpy(&v, (const void *)(uintptr_t)addr, 4); return v; }
+}
+static void ro_row_write(u64 addr, const int64_t *vals, unsigned n, unsigned kind)
+{
+    unsigned char *d = (unsigned char *)(uintptr_t)addr;
+    unsigned nb = kind == 0u ? 2u : 4u, bytes = n * nb, c, i;
+    for (c = 0; c < n; c++) {
+        u64 x = (u64)vals[c];
+        for (i = 0; i < nb; i++) d[c * nb + i] = (unsigned char)(x >> (8 * i));
+    }
+    for (i = bytes; i % 16u; i++) d[i] = 0;
+}
+static inline void XRowopskernel_Start(XRowopskernel *q)
+{
+    const uint32_t op = q->op & 15u, n = q->n;
+    const unsigned ak = (q->op >> 4) & 3u, bk = (q->op >> 6) & 3u, ck = (q->op >> 8) & 3u;
+    const int ben = (q->op >> 12) & 1u, relu = (q->op >> 15) & 1u, ln = (q->op >> 16) & 1u;
+    int64_t *x, *vals;
+    u64 i1, i2;
+    uint32_t c;
+    if (op == 8u) {                               /* TLOAD: the 64 KiB image, words in order */
+        const unsigned char *src;
+        unsigned w = 0, r, i;
+        for (i2 = 0; i2 < q->blocks && w < 4096u; i2++)
+            for (i1 = 0; i1 < q->rows && w < 4096u; i1++) {
+                unsigned words = ak == 0u ? (n + 7u) / 8u : (n + 3u) / 4u;
+                src = (const unsigned char *)(uintptr_t)(q->a + i2 * q->a_s2 + i1 * q->a_s1);
+                for (r = 0; r < words && w < 4096u; r++, w++, src += 16) {
+                    if (w < 2048u) {
+                        memcpy(&ro_sig[2 * w], src, 8); memcpy(&ro_sig[2 * w + 1], src + 8, 8);
+                        ro_sig[2 * w] &= ((uint64_t)1 << 49) - 1; ro_sig[2 * w + 1] &= ((uint64_t)1 << 49) - 1;
+                    } else {
+                        for (i = 0; i < 4; i++) memcpy(&ro_rsq[4 * (w - 2048u) + i], src + 4 * i, 4);
+                    }
+                }
+            }
+        ro_tables_loaded = 1;
+        return;
+    }
+    if (n == 0u || q->rows == 0u || q->blocks == 0u || n > 4096u) return;
+    if ((op == 4u || op == 5u) && !ro_tables_loaded) abort();   /* a job before the table load */
+    x = (int64_t *)malloc((size_t)n * sizeof *x);
+    vals = (int64_t *)malloc((size_t)n * sizeof *vals);
+    for (i2 = 0; i2 < q->blocks; i2++)
+        for (i1 = 0; i1 < q->rows; i1++) {
+            const u64 ra = q->a + i2 * q->a_s2 + i1 * q->a_s1;
+            const u64 rb = q->b + i2 * q->b_s2 + i1 * q->b_s1;
+            const u64 rc = q->c + i2 * q->c_s2 + i1 * q->c_s1;
+            if (op <= 4u) {                        /* COPY / ADDX / DEQUANT / MULACT */
+                const int zero_a = (op == 1u || op == 2u) && (i1 < q->win_lo || i1 >= q->win_hi);
+                for (c = 0; c < n; c++) {
+                    const ro_param_t pr = ro_param(q, c);
+                    int64_t xv = zero_a ? 0 : ro_elem(ra + (u64)(ak == 0u ? 2u : 4u) * c, ak);
+                    int64_t yv = (ben && op != 3u) ? ro_elem(rb + (u64)(bk == 0u ? 2u : 4u) * c, bk) : 0;
+                    int64_t r;
+                    if (op == 1u || op == 2u) {
+                        i128 s = ((i128)xv << pr.sh_a) + ((i128)yv << pr.sh_b) + ((i128)pr.bq << q->bq_sh);
+                        i128 v = ro_rne_shr(s, (int)pr.sh_c);
+                        r = ck == 0u ? ro_sat16(v) : ro_sat32(v);
+                        if (relu && r < 0) r = 0;
+                    } else if (op == 3u) {
+                        r = (int64_t)ro_float_bits(xv, (int)pr.sh_c);
+                    } else {
+                        r = ro_sat16(ro_rne_shr((i128)ro_silu_q(xv << pr.sh_a) * yv, (int)pr.sh_c));
+                    }
+                    vals[c] = r;
+                }
+                ro_row_write(rc, vals, n, ck);
+            } else if (op == 5u) {                 /* NORM */
+                i128 S1 = 0, S2 = 0, D;
+                u64 Rm; int sh;
+                for (c = 0; c < n; c++) {
+                    x[c] = ro_elem(ra + (u64)(ak == 0u ? 2u : 4u) * c, ak);
+                    S1 += x[c];
+                    S2 += (i128)x[c] * x[c];
+                }
+                D = ln ? ((i128)n * S2 - S1 * S1 + (i128)(int64_t)q->eps) : (S2 + (i128)(int64_t)q->eps);
+                if (D <= 0) D = 1;
+                ro_rsqrt_bf(D, &Rm, &sh);
+                for (c = 0; c < n; c++) {
+                    const ro_param_t pr = ro_param(q, c);
+                    i128 A = ln ? ((i128)n * x[c] - S1) : (i128)x[c];
+                    i128 P1 = (A * (i128)Rm) >> (sh - 24);
+                    i128 s = P1 * (i128)pr.g + ((i128)pr.bq << q->bq_sh);
+                    vals[c] = ro_sat16(ro_rne_shr(s, (int)pr.sh_c));
+                }
+                ro_row_write(rc, vals, n, 0u);
+            } else if (op == 6u) {                 /* ROPE */
+                const uint32_t HD = q->aux & 0xFFFu, half = HD / 2u;
+                if (HD == 0u || (HD & 15u) || HD > 128u || n % HD) break;
+                for (c = 0; c < n; c++) x[c] = ro_elem(ra + 2ull * c, 0u);
+                for (c = 0; c < n; c++) {
+                    const ro_param_t pr = ro_param(q, c);
+                    uint32_t d = c % HD;
+                    int64_t cs = ro_elem(rb + 4ull * d, 1u), sn = ro_elem(rb + 4ull * (HD + d), 1u);
+                    int64_t rot = d < half ? -x[c + half] : x[c - half];
+                    i128 s = (((i128)x[c] * cs) << pr.sh_a) + (((i128)rot * sn) << pr.sh_b);
+                    vals[c] = ro_sat16(ro_rne_shr(s, (int)pr.sh_c));
+                }
+                ro_row_write(rc, vals, n, 0u);
+            } else if (op == 7u) {                 /* TRANSPOSE: tile (i2, i1), R rows of L */
+                const uint32_t R = q->aux & 15u, L = n;
+                unsigned char *d = (unsigned char *)(uintptr_t)rc;
+                uint32_t dd, r;
+                if (R == 0u || R > 8u) break;
+                for (dd = 0; dd < L; dd++)
+                    for (r = 0; r < R; r++) {
+                        int16_t v = (int16_t)ro_elem(ra + (u64)r * q->b_s1 + 2ull * dd, 0u);
+                        memcpy(d + (q->b_s2 == 2u * R ? (size_t)dd * 2u * R : (size_t)dd * q->b_s2) + 2u * r, &v, 2);
+                    }
+                if (q->b_s2 == 2u * R) {           /* one run: the tail lanes zero */
+                    size_t bytes = (size_t)L * 2u * R, i;
+                    for (i = bytes; i % 16u; i++) d[i] = 0;
+                }
+            }
+        }
+    free(x); free(vals);
+}
+"""
+
 
 def which_cc():
     return shutil.which("cc") or shutil.which("gcc")
@@ -453,7 +673,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
     for kd in cg._active_kernels:
-        if kd.name not in ("VectorOPKernel", "MatmulKernel", "ConvKernel"):
+        if kd.name not in ("VectorOPKernel", "MatmulKernel", "ConvKernel", "RowOpsKernel"):
             raise RuntimeError(f"host emulation has no model of {kd.name}")
     inc, src, tst, emu = (os.path.join(workdir, d) for d in ("include", "src", "test", "emu"))
     for d in (inc, src, tst, emu):
@@ -471,6 +691,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     w(os.path.join(emu, "xvectoropkernel.h"), vop_source())
     w(os.path.join(emu, "xmatmulkernel.h"), _MM)
     w(os.path.join(emu, "xconvkernel.h"), _CONV)
+    w(os.path.join(emu, "xrowopskernel.h"), _ROWOPS)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)
     if cg.large_weight_tensors:
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)

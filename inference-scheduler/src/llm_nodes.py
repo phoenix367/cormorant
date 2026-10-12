@@ -256,6 +256,14 @@ def _f32(v):
     return np.asarray(v, np.float64).astype(np.float32).astype(np.float64)
 
 
+def _res32(v: np.ndarray, f) -> np.ndarray:
+    """The int32 DMA residual's value grid: round half to even at 2^f, saturated
+    to int32 (llm_study res32; exact in float64)."""
+    f = np.asarray(f, np.float64)
+    raw = np.clip(np.rint(np.asarray(v, np.float64) * np.power(2.0, f)), -2147483648.0, 2147483647.0)
+    return raw / np.power(2.0, f)
+
+
 def dot8(prod: np.ndarray) -> np.ndarray:
     """Row sums of prod [n, HD] in the xattn order (see module docstring of
     demo/chat/scripts/llm_study.py): 8 lanes acc_l = sum_a prod[:, 8a + l]
@@ -322,9 +330,9 @@ class LlmNode(HostNode):
     F:       int = 8                              # kernel output shift
 
     def dma_inputs(self) -> List:
-        """DMA inputs read through host_in (a DMA state is passed as a
-        pointer into its buffer instead)."""
-        return [t for t in self.inputs if not t.is_host and not t.is_state]
+        """DMA inputs read through host_in (a DMA state, or an int32 DMA
+        tensor, is passed as a pointer into its buffer instead)."""
+        return [t for t in self.inputs if not t.is_host and not t.is_state and t.dma is None]
 
     def staged_inputs(self):
         return self.dma_inputs()
@@ -353,12 +361,21 @@ class LlmNode(HostNode):
         return scale_item(t.exp_channels(self.F))
 
     def _want(self, t, kind: Optional[str], what: str):
-        """Check that tensor t is stored as ``kind`` (None = DMA int16)."""
-        if t.host != kind:
+        """Check that tensor t is stored as ``kind`` (None = DMA int16; "dma:i32" =
+        the int32 DMA residual)."""
+        have = f"dma:{t.dma}" if t.dma else t.host
+        if have != kind:
             raise SchedulerError(
                 f"{self.onnx_node.op_type} node '{_label(self.onnx_node)}': {what} "
                 f"'{t.onnx_name}' must be {'a DMA tensor' if kind is None else kind + ' host'}"
-                f" (is {'DMA' if t.host is None else t.host})")
+                f" (is {'DMA' if have is None else have})")
+
+    def _want_residual(self, t, what: str) -> bool:
+        """t is the residual stream: float32 host (False) or int32 DMA (True)."""
+        if t.dma == "i32":
+            return True
+        self._want(t, "f32", what)
+        return False
 
     def describe(self) -> str:
         return ""
@@ -395,6 +412,7 @@ class LlmEmbedNode(LlmNode):
     d:          int = 1
     n:          int = 1
     image_rows: int = 0
+    res32:      bool = False                      # the output is the int32 DMA residual
     table: Optional[HostTable] = field(default=None, repr=False)
 
     @classmethod
@@ -413,7 +431,7 @@ class LlmEmbedNode(LlmNode):
                  table=HostTable(name, table_kind(tab), np.asarray(tab, np.float32)),
                  F=ctx.frac_bits)
         sn._want(ids, "i32", "ids")
-        sn._want(y, "f32", "output")
+        sn.res32 = sn._want_residual(y, "output")
         if img is not None:
             sn._want(img, "f32", "image rows")
             _require(int(img.shape[-1]) == d, node, "image rows must be [R][d]")
@@ -433,21 +451,26 @@ class LlmEmbedNode(LlmNode):
     def c_call(self, ins, out, scratch, direct, dtype):
         bf = self.table.kind == "bf16"
         t16, t32 = (self.table.name, "NULL") if bf else ("NULL", self.table.name)
-        if self.image_rows:
-            return [f"llm_embed_img({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, "
-                    f"{ins[1]}, {self.image_rows}u, {out});"]
-        return [f"llm_embed({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, {out});"]
+        img = f"{ins[1]}, {self.image_rows}u, " if self.image_rows else ""
+        fn = "llm_embed_img" if self.image_rows else "llm_embed"
+        if self.res32:
+            f = int(self.output.exp_channels(self.F)[0])
+            return [f"{fn}32({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, {img}{f}, {out});"]
+        return [f"{fn}({ins[0]}, {self.n}u, {t16}, {t32}, {self.rows}u, {self.d}u, {img}{out});"]
 
     def reference(self, ins, dtype):
         k = np.asarray(ins[0], np.float64).reshape(-1).astype(np.int64)
         tab = np.asarray(self.table.data, np.float32).reshape(self.rows, self.d)
         if not self.image_rows:
-            return tab[np.clip(k, 0, self.rows - 1)].astype(np.float64).reshape(self.output.shape)
-        img = np.asarray(ins[1], np.float32).reshape(self.image_rows, self.d)
-        k = np.clip(k, 0, self.rows + self.image_rows - 1)
-        out = np.where((k >= self.rows)[:, None], img[np.maximum(k - self.rows, 0)],
-                       tab[np.minimum(k, self.rows - 1)])
-        return out.astype(np.float64).reshape(self.output.shape)
+            out = tab[np.clip(k, 0, self.rows - 1)].astype(np.float64)
+        else:
+            img = np.asarray(ins[1], np.float32).reshape(self.image_rows, self.d)
+            k = np.clip(k, 0, self.rows + self.image_rows - 1)
+            out = np.where((k >= self.rows)[:, None], img[np.maximum(k - self.rows, 0)],
+                           tab[np.minimum(k, self.rows - 1)]).astype(np.float64)
+        if self.res32:
+            out = _res32(out, self.output.exp_channels(self.F)[None, :])
+        return out.reshape(self.output.shape)
 
 
 # ------------------------------------------------------------------ #
@@ -850,6 +873,7 @@ class LlmAttnPrepNode(LlmNode):
     kw:  int = 1
     Q:   int = KEY_QUANTUM
     has_n: bool = True
+    inval_cache: bool = False      # a decode step of a project whose prefill prep runs on the unit
     fq:  Optional[np.ndarray] = field(default=None, repr=False)     # [H]
     cos: Optional[np.ndarray] = field(default=None, repr=False)
     sin: Optional[np.ndarray] = field(default=None, repr=False)
@@ -879,7 +903,8 @@ class LlmAttnPrepNode(LlmNode):
         fq = np.asarray(_attr_ints(a, "q_exp", node, H), np.int64)
         sn = cls(onnx_node=node, inputs=[q0, k0, v, pos] + ([n] if n is not None else []) + [ck, cv],
                  output=y, index=index, align_elems=align_elems, T=T, H=H, KV=KV, HD=HD, C=C,
-                 kw=kw, Q=Q, has_n=n is not None, fq=fq, cos=cos, sin=sin, F=ctx.frac_bits)
+                 kw=kw, Q=Q, has_n=n is not None, inval_cache=int(a.get("rowops_cache", 0)) != 0,
+                 fq=fq, cos=cos, sin=sin, F=ctx.frac_bits)
         for t, w in ((q0, "q"), (k0, "k"), (v, "v"), (y, "output")):
             sn._want(t, None, w)
         sn._want(pos, "i32", "pos")
@@ -943,6 +968,12 @@ class LlmAttnPrepNode(LlmNode):
             + (f"(unsigned){ins[4]}[0]" if self.has_n else f"{self.T}u") + f"; _a.T = {self.T}u;",
             f"    _a.H = {self.H}u; _a.KV = {self.KV}u; _a.HD = {self.HD}u; _a.C = {self.C}u;"
             f" _a.kw = {self.kw}u; _a.VK = {self.cv.group_kw}u; _a.Q = {self.Q}u;",
+        ] + ([
+            # the row-ops unit filled the V image through a port that does not snoop the
+            # CPU caches; this step writes 2-byte slots into those lines (HOSTOPS_PLAN §10.5)
+            f"    llm_cache_inval_rows({self.cv.c_name}, _a.pos, _a.n, {self.KV}u, {self.C}u, {self.HD}u,"
+            f" {self.cv.group_kw}u);",
+        ] if self.inval_cache and not self.has_n else []) + [
             "    llm_attn_prep(&_a);",
         ] + ([
             f"    llm_cache_flush({self.ck.c_name}, _a.keys, {self.KV}u, {self.C}u, {self.HD}u);",
@@ -1383,9 +1414,11 @@ class LlmAttnMergeNode(LlmNode):
 @dataclass
 class LlmSelectRowNode(LlmNode):
     """y = h[n - 1] (n clamped to [1, rows]) — the last valid row of a
-    padded prefill, handed to the head entry through a state."""
-    rows: int = 1
-    n:    int = 1
+    padded prefill, handed to the head entry through a state (float32 host,
+    or the int32 DMA residual)."""
+    rows:  int = 1
+    n:     int = 1
+    res32: bool = False
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -1394,17 +1427,23 @@ class LlmSelectRowNode(LlmNode):
         n = int(h.shape[-1])
         sn = cls(onnx_node=node, inputs=[h, idx], output=y, index=index,
                  align_elems=align_elems, rows=h.numel // n, n=n, F=ctx.frac_bits)
-        sn._want(h, "f32", "h")
+        sn.res32 = sn._want_residual(h, "h")
         sn._want(idx, "i32", "n")
-        sn._want(y, "f32", "output")
+        if sn.res32:
+            _require(y.dma == "i32" and np.array_equal(y.exp_channels(ctx.frac_bits),
+                                                       h.exp_channels(ctx.frac_bits)),
+                     node, "output: the int32 DMA residual at h's exponent")
+        else:
+            sn._want(y, "f32", "output")
         _require(y.numel == n, node, "output must be one row")
         return sn
 
     def describe(self):
-        return f"row n-1 of [{self.rows}][{self.n}]"
+        return f"row n-1 of [{self.rows}][{self.n}]" + (" (int32 DMA)" if self.res32 else "")
 
     def c_call(self, ins, out, scratch, direct, dtype):
-        return [f"llm_select_row({ins[0]}, {self.rows}u, {self.n}u, {ins[1]}[0], {out});"]
+        fn = "llm_select_row32" if self.res32 else "llm_select_row"
+        return [f"{fn}({ins[0]}, {self.rows}u, {self.n}u, {ins[1]}[0], {out});"]
 
     def reference(self, ins, dtype):
         h = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
@@ -1563,6 +1602,55 @@ static void llm_embed(const int32_t *ids, unsigned n, const uint16_t *t16, const
     host_parallel(llm_embed_range, &a, n, host_row_grain(d), 1u);
 }
 
+/* The int32 DMA residual (doc/plans/HOSTOPS_PLAN.md §6): value = raw * 2^-f, written
+ * round half to even, saturated (llm_study res32). */
+static inline int32_t llm_st32(double v)
+{
+    double r = nearbyint(v);
+    if (!(r == r)) return 0;
+    if (r > 2147483647.0) return INT32_MAX;
+    if (r < -2147483648.0) return INT32_MIN;
+    return (int32_t)r;
+}
+typedef struct {
+    const int32_t  *ids;
+    const uint16_t *t16;
+    const float    *t32;
+    unsigned        rows, d;
+    double          scale;
+    int32_t        *h;
+} llm_embed32_t;
+
+static void llm_embed32_range(void *p, unsigned t0, unsigned t1)
+{
+    const llm_embed32_t *a = (const llm_embed32_t *)p;
+    unsigned t, i;
+    for (t = t0; t < t1; t++) {
+        long     k = (long)a->ids[t];
+        int32_t *h = a->h + (size_t)t * a->d;
+        if (k < 0) k = 0;
+        if (k >= (long)a->rows) k = (long)a->rows - 1;
+        for (i = 0u; i < a->d; i++) {
+            float v;
+            if (a->t16) {
+                uint32_t u = (uint32_t)a->t16[(size_t)k * a->d + i] << 16;
+                memcpy(&v, &u, sizeof v);
+            } else {
+                v = a->t32[(size_t)k * a->d + i];
+            }
+            h[i] = llm_st32((double)v * a->scale);
+        }
+    }
+}
+
+static void llm_embed32(const int32_t *ids, unsigned n, const uint16_t *t16, const float *t32,
+                        unsigned rows, unsigned d, int f, int32_t *h)
+{
+    llm_embed32_t a;
+    a.ids = ids; a.t16 = t16; a.t32 = t32; a.rows = rows; a.d = d; a.scale = ldexp(1.0, f); a.h = h;
+    host_parallel(llm_embed32_range, &a, n, host_row_grain(d), 1u);
+}
+
 /* ---- LlmResAdd: y = float32((double)h + x·sx) ---- */
 typedef struct {
     const float  *h;
@@ -1703,6 +1791,12 @@ static void llm_select_row(const float *h, unsigned rows, unsigned n, int32_t nv
 {
     unsigned r = nv < 1 ? 0u : ((unsigned)nv > rows ? rows - 1u : (unsigned)nv - 1u);
     memcpy(y, h + (size_t)r * n, (size_t)n * sizeof(float));
+}
+
+static void llm_select_row32(const int32_t *h, unsigned rows, unsigned n, int32_t nv, int32_t *y)
+{
+    unsigned r = nv < 1 ? 0u : ((unsigned)nv > rows ? rows - 1u : (unsigned)nv - 1u);
+    memcpy(y, h + (size_t)r * n, (size_t)n * sizeof(int32_t));
 }
 
 static void llm_dequant(const Data_t *x, const double *sx, unsigned count, unsigned n, float *y)
@@ -2672,6 +2766,27 @@ static void llm_cache_flush_rows(inference_buf_t *cache, unsigned r0, unsigned n
             if (b > end) b = end;
             inference_buf_init_view(&v, cache, (unsigned)a, (unsigned)(b - a));
             inference_buf_sync_to_device(&v);
+        }
+}
+
+/* Invalidate the lines of rows [r0, r0 + n) of such a state before the CPU
+ * writes into them: a row-ops unit job (a port that does not snoop the CPU
+ * caches) may have filled the other keys of those lines, and a stale clean
+ * line would be written back over them (doc/plans/HOSTOPS_PLAN.md §10.5). */
+static void llm_cache_inval_rows(inference_buf_t *cache, unsigned r0, unsigned n, unsigned G,
+                                 unsigned C, unsigned D, unsigned K)
+{
+    inference_buf_t v;
+    unsigned        g, r;
+    const size_t    end = (size_t)G * C * D;
+    for (g = 0u; g < G; g++)
+        for (r = r0; r < r0 + n && r < C; r++) {
+            size_t a = llm_vrow(C, D, K, g, r), b = a + (size_t)(D - 1u) * K + 1u;
+            a &= ~(size_t)31u;
+            b = (b + 31u) & ~(size_t)31u;
+            if (b > end) b = end;
+            inference_buf_init_view(&v, cache, (unsigned)a, (unsigned)(b - a));
+            inference_buf_sync_from_device(&v);
         }
 }
 """

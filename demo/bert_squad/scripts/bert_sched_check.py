@@ -2,7 +2,8 @@
 """BERT_PLAN phase 1, gate (b): the inference scheduler's fixed-point
 simulation of bertsquad-12 must equal the study's independent emulation of
 the same partition (bert_study.py policy "sched"; "sched+vsmx" where the
-platform has VectorOPKernel's softmax unit, doc/plans/SOFTMAX_PLAN.md) BIT FOR BIT.
+platform has VectorOPKernel's softmax unit, doc/plans/SOFTMAX_PLAN.md; "+iln" where
+it has the row-ops unit, doc/plans/HOSTOPS_PLAN.md) BIT FOR BIT.
 
 The scheduler side is OnnxGraph (CLI defaults: pattern fusion, activation
 fusion) + CodeGenerator.simulate(), i.e. exactly what the generated
@@ -30,6 +31,7 @@ import bert_study as bs                                  # noqa: E402
 import fetch_assets                                      # noqa: E402
 from src.graph import OnnxGraph                          # noqa: E402
 from src.codegen import CodeGenerator                    # noqa: E402
+from src.rowops_nodes import enabled as rowops_unit      # noqa: E402
 from src.smx_nodes import enabled as softmax_unit        # noqa: E402
 
 OUTS = ("unstack:0", "unstack:1")
@@ -69,6 +71,8 @@ def main():
     tok, pick = bs.pick_examples(args.n)
     g, cg = scheduler_sim(bs.MODEL)
     pol = "sched+vsmx" if softmax_unit() else "sched"
+    if rowops_unit():                                   # the LayerNorms on the row-ops unit
+        pol += "+iln"
     bert = bs.Bert(bs.MODEL, bs.POLS[pol])
     print(f"setup {time.time() - t0:.0f} s  (scheduler: {len(g.nodes)} nodes, "
           f"fusion {g.fusion_counts}; policy {pol})", flush=True)

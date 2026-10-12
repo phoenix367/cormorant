@@ -10,7 +10,7 @@ from src.kernels import (
 )
 
 
-_EXPECTED_KERNELS = ("VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolKernel")
+_EXPECTED_KERNELS = ("VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolKernel", "RowOpsKernel")
 
 
 # ---------------------------------------------------------------- #
@@ -125,12 +125,13 @@ class TestMixedDriverReadme(unittest.TestCase):
             self.assertIn(f, readme)
 
     def test_driver_sources(self):
-        # the SystemVerilog kernels' drivers come from make driver_<k>_rtl,
-        # ConvKernel's from its HLS synthesis
-        readme = mixed_driver_readme(["VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolKernel"])
-        for target in ("driver_vectorop_rtl", "driver_matmul_rtl", "driver_pool_rtl"):
+        # every kernel is SystemVerilog: the drivers come from make driver_<k>_rtl
+        readme = mixed_driver_readme(["VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolKernel",
+                                      "RowOpsKernel"])
+        for target in ("driver_vectorop_rtl", "driver_matmul_rtl", "driver_conv_rtl", "driver_pool_rtl",
+                       "driver_rowops_rtl"):
             self.assertIn(f"make {target}", readme)
-        self.assertIn("Vitis HLS synthesis output for ConvKernel", readme)
+        self.assertNotIn("Vitis HLS synthesis output", readme)
 
 
 if __name__ == "__main__":

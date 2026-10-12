@@ -144,6 +144,18 @@ the expected outputs.  The unit also runs the attention softmax of the Llama
 prefill and the vision encoder when their frontends are built with `vsmx=True`
 (the chat generators' `--vsmx`).
 
+**The row-ops unit (RowOpsKernel)** — where the platform JSON's
+`kernels.rowops.unit` (or `AXI_ROWOPS=1`) says the bitstream has it
+([HOSTOPS_PLAN](../../doc/plans/HOSTOPS_PLAN.md); not in the KV260's hardware
+build yet), a `LayerNormalization` of 16-byte-aligned rows of at most 4 096
+elements runs on it (`run_rowops()`, the integer specification of
+`src/rowops_spec.py`: within one LSB of the exact function, not bit-identical
+to the host op), and the chat / TTS generators' `--rowops` moves the Llama
+decoder's residual adds, RMSNorms and SiLU·up, the vision encoder's residual
+adds and LayerNorms and the Piper encoder's residual LayerNorms there, with
+the residual stream as an int32 DMA tensor.  The program loads the unit's
+tables once in `inference_init()`.
+
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
 [Architecture: Broadcasting Algorithm](ARCHITECTURE.md#6-broadcasting-algorithm).
@@ -820,7 +832,7 @@ See `driver/README.md`.
 ```bash
 cd inference-scheduler
 
-# Run the full test suite (1754 tests; test_bert_base.py downloads the 435 MB
+# Run the full test suite (1791 tests; test_bert_base.py downloads the 435 MB
 # bertsquad-12 model into demo/bert_squad/assets/ on its first run)
 .venv/bin/python -m pytest test/ -v
 

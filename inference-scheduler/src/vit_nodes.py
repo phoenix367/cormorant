@@ -174,9 +174,11 @@ def _bias(ctx, tensors, node, idx, n, what):
 
 @dataclass
 class VitEmbedAddNode(VitNode):
-    """h = float32(pe + b0[t][c]) — b0 a float32 host table [rows][n]."""
+    """h = float32(pe + b0[t][c]) — b0 a float32 host table [rows][n]; or, into
+    the int32 DMA residual, round half even at its exponent, saturated."""
     rows:  int = 1
     n:     int = 1
+    res32: bool = False
     table: Optional[HostTable] = field(default=None, repr=False)
 
     @classmethod
@@ -191,7 +193,7 @@ class VitEmbedAddNode(VitNode):
                  rows=rows, n=n, F=ctx.frac_bits,
                  table=HostTable("_vit_tab_" + tensors[node.input[1]].c_name, "f32", b0.reshape(-1)))
         sn._want(pe, None, "input")
-        sn._want(y, "f32", "output")
+        sn.res32 = sn._want_residual(y, "output")
         _require(y.numel == pe.numel, node, "shapes")
         return sn
 
@@ -202,15 +204,22 @@ class VitEmbedAddNode(VitNode):
         return super().c_runtime() + [self._scales(self.inputs[0])[2]]
 
     def describe(self):
-        return f"rows={self.rows} n={self.n} + a float32 [{self.rows}][{self.n}] table"
+        return (f"rows={self.rows} n={self.n} + a float32 [{self.rows}][{self.n}] table"
+                + (" -> int32 residual" if self.res32 else ""))
 
     def c_call(self, ins, out, scratch, direct, dtype):
         s = self._scales(self.inputs[0])[0]
+        if self.res32:
+            f = int(self.output.exp_channels(self.F)[0])
+            return [f"vit_embed_add32({ins[0]}, {s}, {self.table.name}, {self.rows}u, {self.n}u, {f}, {out});"]
         return [f"vit_embed_add({ins[0]}, {s}, {self.table.name}, {self.rows}u, {self.n}u, {out});"]
 
     def reference(self, ins, dtype):
+        from .llm_nodes import _res32
         pe = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
         b0 = np.asarray(self.table.data, np.float32).astype(np.float64).reshape(self.rows, self.n)
+        if self.res32:
+            return _res32(pe + b0, self.output.exp_channels(self.F)[None, :]).reshape(self.output.shape)
         return _f32(pe + b0).reshape(self.output.shape)
 
 
@@ -763,6 +772,31 @@ static void llm_embed_img(const int32_t *ids, unsigned n, const uint16_t *t16, c
     }
 }
 
+static void llm_embed_img32(const int32_t *ids, unsigned n, const uint16_t *t16, const float *t32,
+                            unsigned rows, unsigned d, const float *img, unsigned R, int f, int32_t *h)
+{
+    const double scale = ldexp(1.0, f);
+    unsigned t, i;
+    for (t = 0u; t < n; t++) {
+        long     k = (long)ids[t];
+        int32_t *o = h + (size_t)t * d;
+        if (k < 0) k = 0;
+        if (k >= (long)(rows + R)) k = (long)(rows + R) - 1;
+        for (i = 0u; i < d; i++) {
+            float v;
+            if (k >= (long)rows) {
+                v = img[(size_t)(k - (long)rows) * d + i];
+            } else if (t16) {
+                uint32_t u = (uint32_t)t16[(size_t)k * d + i] << 16;
+                memcpy(&v, &u, sizeof u);
+            } else {
+                v = t32[(size_t)k * d + i];
+            }
+            o[i] = llm_st32((double)v * scale);
+        }
+    }
+}
+
 /* ---- VitEmbedAdd: h = float32(pe + b0[t][c]) ---- */
 typedef struct {
     const Data_t *x;
@@ -791,6 +825,36 @@ static void vit_embed_add(const Data_t *x, const double *sx, const float *b0, un
     vit_emb_t a;
     a.x = x; a.sx = sx; a.b0 = b0; a.n = n; a.h = h;
     host_parallel(vit_embed_rows, &a, rows, host_row_grain(n), 1u);
+}
+
+/* into the int32 DMA residual: round half even at 2^f, saturated (llm_st32) */
+typedef struct {
+    const Data_t *x;
+    const double *sx;
+    const float  *b0;
+    unsigned      n;
+    double        scale;
+    int32_t      *h;
+} vit_emb32_t;
+static void vit_embed32_rows(void *p, unsigned r0, unsigned r1)
+{
+    const vit_emb32_t *a = (const vit_emb32_t *)p;
+    unsigned r, c;
+    for (r = r0; r < r1; r++) {
+        const Data_t *x = a->x + (size_t)r * a->n;
+        const float  *b = a->b0 + (size_t)r * a->n;
+        int32_t      *h = a->h + (size_t)r * a->n;
+        for (c = 0u; c < a->n; c++)
+            h[c] = llm_st32((llm_ld(x[c], a->sx[c]) + (double)b[c]) * a->scale);
+    }
+}
+
+static void vit_embed_add32(const Data_t *x, const double *sx, const float *b0, unsigned rows,
+                            unsigned n, int f, int32_t *h)
+{
+    vit_emb32_t a;
+    a.x = x; a.sx = sx; a.b0 = b0; a.n = n; a.scale = ldexp(1.0, f); a.h = h;
+    host_parallel(vit_embed32_rows, &a, rows, host_row_grain(n), 1u);
 }
 
 /* ---- VitResAdd: y = float32(h + (d + b)) ---- */

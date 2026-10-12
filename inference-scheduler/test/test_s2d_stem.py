@@ -360,7 +360,7 @@ def _host_compile(cg, workdir):
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"),
                 os.path.join(workdir, "include", "inference_prof.h"))
     for kd in cg._active_kernels:
-        funcs = sorted(set(re.findall(rf"\b({kd.c_type}_[A-Za-z_]+)\s*\(", src)))
+        funcs = sorted(set(re.findall(rf"\b({kd.c_type}_[A-Za-z0-9_]+)\s*\(", src)))
         lines = ["#pragma once", "#include <stdint.h>",
                  "typedef uint64_t u64;", f"typedef struct {{ int dummy; }} {kd.c_type};"]
         for fn in funcs:

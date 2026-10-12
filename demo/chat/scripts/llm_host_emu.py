@@ -40,7 +40,7 @@ def build(project: str, work: str, incoherent: bool = False) -> str:
     os.makedirs(emu, exist_ok=True)
     for name, text in (("inference_buf_emu.c", host_emu.buf_emu_source()), ("emu_common.h", host_emu._COMMON),
                        ("xvectoropkernel.h", host_emu.vop_source()), ("xmatmulkernel.h", host_emu._MM),
-                       ("xconvkernel.h", host_emu._CONV)):
+                       ("xconvkernel.h", host_emu._CONV), ("xrowopskernel.h", host_emu._ROWOPS)):
         with open(os.path.join(emu, name), "w") as f:
             f.write(text)
     exe = os.path.join(work, "llm_bench_host")

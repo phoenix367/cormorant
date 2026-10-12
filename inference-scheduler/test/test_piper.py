@@ -261,6 +261,79 @@ class TestPiperEncoderSoftmaxUnit(unittest.TestCase):
         self.assertLessEqual(src.count("tts_attn_softmax("), 1)          # the helper's definition, no call
 
 
+class TestPiperEncoderRowops(unittest.TestCase):
+    """PiperEncoderFrontend(vsmx=True, rowops=True) (doc/plans/HOSTOPS_PLAN.md §6):
+    the residual LayerNorms as TtsResAdd (the int32 sum on the row-ops unit) +
+    TtsLayerNorm — against encoder_forward(vsmx_unit=True, rowops_unit=True)."""
+
+    @staticmethod
+    def _units(on=True):
+        from src import _rowops_hw_config
+        return mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", on)
+
+    def test_simulation_matches_specification(self):
+        W, EW, E = encoder_setup()
+        rng = np.random.default_rng(7)
+        with _unit(), self._units():
+            for T in (32, 64):
+                cg = CodeGenerator(OnnxGraph(PiperEncoderFrontend(W, E, T, vsmx=True, rowops=True).entry()),
+                                   model_path="enc.onnx")
+                for n in (T, T - 5, 17, 1):
+                    ids = rng.integers(0, 256, n)
+                    pad = np.zeros(T, np.int64)
+                    pad[:n] = ids
+                    out = cg._forward_pass({f"enc{T}.ids": pad, f"enc{T}.n": np.array([n])},
+                                           keep=[f"enc{T}.x", f"enc{T}.stats"])
+                    x = np.asarray(out[f"enc{T}.x"]).reshape(T, 192)
+                    st = np.asarray(out[f"enc{T}.stats"]).reshape(T, 384)
+                    xs, ss = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)
+                    np.testing.assert_array_equal(x[:n].astype(np.float32), xs, err_msg=f"x T {T} n {n}")
+                    np.testing.assert_array_equal(st[:n].astype(np.float32), ss, err_msg=f"stats T {T} n {n}")
+                    self.assertFalse(x[n:].any() or st[n:].any(), f"padding rows T {T} n {n}")
+
+    def test_differs_from_the_host_norm(self):
+        W, EW, E = encoder_setup()
+        ids = np.random.default_rng(8).integers(0, 256, 40)
+        self.assertFalse(np.array_equal(pv.encoder_forward(EW, E, ids, vsmx_unit=True)[0],
+                                        pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)[0]))
+
+    def test_graph(self):
+        W, _, E = encoder_setup()
+        with _unit(), self._units():
+            g = OnnxGraph(PiperEncoderFrontend(W, E, 64, vsmx=True, rowops=True).entry())
+        kinds = {}
+        for sn in g.nodes:
+            kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
+        self.assertEqual(kinds, {"TtsEmbedNode": 1, "TtsRowPrepNode": 19, "MatmulConvNode": 37,
+                                 "VitAttnPrepNode": 6, "LlmAttnConvNode": 24, "TtsAttnRelAddNode": 12,
+                                 "TtsAttnSoftmaxVopNode": 12, "TtsAttnMergeNode": 6, "ResAddBiasRoNode": 12,
+                                 "LayerNorm32RoNode": 12, "TtsEncOutNode": 2})
+        for sn in g.nodes:
+            if type(sn).__name__ == "ResAddBiasRoNode":
+                self.assertFalse(sn.a32)                     # x int16 at f_x, the sum int32 at max(f_x, f_y)
+                self.assertEqual(sn.output.dma, "i32")
+
+    def test_needs_the_unit(self):
+        W, _, E = encoder_setup()
+        with _unit(), self._units(False), self.assertRaisesRegex(Exception, "row-ops unit"):
+            OnnxGraph(PiperEncoderFrontend(W, E, 32, vsmx=True, rowops=True).entry())
+
+    @unittest.skipUnless(shutil.which("cc"), "needs cc")
+    def test_generated_c_matches_simulation(self):
+        W, _, E = encoder_setup()
+        with _unit(), self._units():
+            cg = CodeGenerator(OnnxGraph(PiperEncoderFrontend(W, E, 64, vsmx=True, rowops=True).entry()),
+                               model_path="enc.onnx")
+            with tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("PASSED", out)
+        src = cg.generate_source()
+        self.assertEqual(src.count("run_rowops(enc64_"), 24)        # 12 adds + 12 norms
+        self.assertEqual(src.count("run_rowops(rowops_tables,"), 1)  # TLOAD once, in inference_init
+        self.assertNotIn("tts_resnorm(", src.split("inference_run_")[-1])
+
+
 _DP_DRIVER = r"""
 #include <stdio.h>
 #include <stdlib.h>

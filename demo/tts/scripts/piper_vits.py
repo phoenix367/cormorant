@@ -756,6 +756,38 @@ def _enc_ln(s, g, b):
     return d / np.sqrt(var + ENC_EPS)[:, None] * g + b
 
 
+# The encoder's residual LayerNorms as the row-ops unit's integer LayerNorm
+# (doc/plans/HOSTOPS_PLAN.md §5, inference-scheduler/src/rowops_spec.py): the
+# study's switch (piper_study.py encoder-vsmx), off = the library's double loop.
+ROWOPS_LN = False
+_ROWOPS = None
+
+
+def _rowops():
+    global _ROWOPS
+    if _ROWOPS is None:
+        import importlib.util
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "inference-scheduler", "src", "rowops_spec.py")
+        spec = importlib.util.spec_from_file_location("rowops_spec", p)
+        _ROWOPS = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_ROWOPS)
+    return _ROWOPS
+
+
+def _enc_resnorm(xr, fx, yr, fy, bias, g, b, f_out, unit=None):
+    """LayerNorm(x + (y + bias)) -> raw int16 at 2^-f_out: the library's double
+    path, or (ROWOPS_LN / unit) the unit's: the sum exact in integers at the finer of
+    the two exponents (the bias rounded there), then rowops_spec.layer_norm."""
+    if not (ROWOPS_LN if unit is None else unit):
+        return _raw(_enc_ln(xr * 2.0 ** -fx + (yr * 2.0 ** -fy + bias), g, b), f_out)
+    fs = max(int(fx), int(fy))
+    s = (np.asarray(xr, np.int64) << (fs - int(fx))) + (np.asarray(yr, np.int64) << (fs - int(fy))) \
+        + np.rint(np.asarray(bias, np.float64) * 2.0 ** fs).astype(np.int64)[None, :]
+    return _rowops().layer_norm(s, fs, g, b, ENC_EPS, int(f_out)).astype(np.float64) + 0.0
+
+
 def _enc_rel(qh, ek):
     """The relative-key terms: rel[i][d + 4] = sum_c q[i][c] * ek[d + 4][c], sequential."""
     return _seqsum(qh[:, None, :] * ek[None, :, :])             # [n][9]
@@ -895,7 +927,7 @@ def vsmx():
     return _VSMX
 
 
-def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False):
+def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
     """The library's encoder, bit for bit: ids -> x [n][192], stats [n][384]
     (float32, as the library returns them).  ``vsmx_unit``: the softmax on
     VectorOPKernel's unit (doc/plans/SOFTMAX_PLAN.md §5) — the host adds the
@@ -951,8 +983,8 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False):
         fy = E[f"{e}.y"]
         y = tr[f"{e}.y"] = _kmm(att, _raw(EW[f"l{i}.wo"], fy + 8 - fa))
         f1x = E[f"{e}.x1"]
-        x1 = tr[f"{e}.x1"] = _raw(_enc_ln(xr * L2(fx) + (y * L2(fy) + EW[f"l{i}.bo"]),
-                                          EW[f"l{i}.g1"], EW[f"l{i}.be1"]), f1x)
+        x1 = tr[f"{e}.x1"] = _enc_resnorm(xr, fx, y, fy, EW[f"l{i}.bo"], EW[f"l{i}.g1"], EW[f"l{i}.be1"], f1x,
+                                          unit=rowops_unit or None)
         ff1, fc1 = E[f"{e}.f1"], E[f"{e}.c1"]
         c1 = tr[f"{e}.c1"] = _im2col3(_raw(x1 * L2(f1x), fc1))
         f1 = tr[f"{e}.f1"] = _kmm(c1, _raw(EW[f"l{i}.w1"], ff1 + 8 - fc1))
@@ -961,19 +993,19 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False):
         ff2 = E[f"{e}.f2"]
         f2 = tr[f"{e}.f2"] = _kmm(_im2col3(hh), _raw(EW[f"l{i}.w2"], ff2 + 8 - fh))
         fx = E[f"{e}.x2"]
-        xr = tr[f"{e}.x2"] = _raw(_enc_ln(x1 * L2(f1x) + (f2 * L2(ff2) + EW[f"l{i}.b2"]),
-                                          EW[f"l{i}.g2"], EW[f"l{i}.be2"]), fx)
+        xr = tr[f"{e}.x2"] = _enc_resnorm(x1, f1x, f2, ff2, EW[f"l{i}.b2"], EW[f"l{i}.g2"], EW[f"l{i}.be2"], fx,
+                                          unit=rowops_unit or None)
     fst, fsi = E["enc.st"], E["enc.st#in"]
     st = tr["enc.st"] = _kmm(_raw(xr * L2(fx), fsi), _raw(EW["wp"], fst + 8 - fsi))
     return (xr * L2(fx)).astype(np.float32), (st * L2(fst) + EW["bp"]).astype(np.float32)
 
 
-def library_encoder(EW, E, vsmx_unit=False):
+def library_encoder(EW, E, vsmx_unit=False, rowops_unit=False):
     """ids -> (x, m_p, logs_p) [192][n] float64 from encoder_forward: the
     front end's ``encoder`` for the library's int16 encoder (``vsmx_unit``:
     its softmax on VectorOPKernel's unit)."""
     def enc(ids):
-        x, st = encoder_forward(EW, E, ids, vsmx_unit=vsmx_unit)
+        x, st = encoder_forward(EW, E, ids, vsmx_unit=vsmx_unit, rowops_unit=rowops_unit)
         x, st = x.astype(np.float64).T, st.astype(np.float64).T
         return x, st[:ENC_D], st[ENC_D:]
     return enc

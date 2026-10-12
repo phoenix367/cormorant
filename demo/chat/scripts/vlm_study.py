@@ -386,9 +386,25 @@ class VisionModel(ls.Model):
             return self.fmm(x, self.w[(l, key)], co, l)
         return self.kmm(x * p2v(self.Ev(ci, l, x.shape[1])), self.w[(l, key)], self.E(co, l), 8, co, l)
 
+    def ibias(self, b):
+        """A residual add's bias as the row-ops unit adds it (policy ...+rowops =
+        ibias): rounded once at 2^-bias_bits (the residual's exponent, coarser only
+        when the int22 parameter would overflow) — rowops_spec.quant_bias."""
+        if self.q and self.pol.get("ibias") and self.pol.get("res_bits"):
+            return ls.rowops().quant_bias(b, int(self.pol["res_bits"]))
+        return b
+
     def ln(self, h, gb, cls, l):
         gm, bt = gb
         D = h.shape[1]
+        if self.q and self.pol.get("inorm") and self.pol.get("res_bits") and not self.exact(cls):
+            # the row-ops unit's integer LayerNorm on the int32 residual (rowops_spec.layer_norm)
+            fr = int(self.pol["res_bits"])
+            e = self.E(cls, l)
+            y = ls.rowops().layer_norm(np.rint(h * ls.p2(fr)).astype(np.int64), fr, gm, bt, self.cfg.eps, e)
+            self.stats.add(cls, l, float(np.abs(y / ls.p2(e)).max()) if y.size else 0.0,
+                           int(((y == ls.I16_LO) | (y == ls.I16_HI)).sum()), y.size)
+            return y / ls.p2(e)
         mu = np.cumsum(h, axis=-1)[:, -1] / D
         d = h - mu[:, None]
         var = np.cumsum(d * d, axis=-1)[:, -1] / D
@@ -473,10 +489,10 @@ class VisionModel(ls.Model):
         for l in range(vc.L):
             xa = self.ln(h, self.ln1[l], "x", l)
             att = self.attn(self.lin(xa, l, "q"), self.lin(xa, l, "k"), self.lin(xa, l, "v"), l)
-            h = self.resadd(h, self.lin(att, l, "o") + self.b[(l, "o")], l)
+            h = self.resadd(h, self.lin(att, l, "o") + self.ibias(self.b[(l, "o")]), l)
             x2 = self.ln(h, self.ln2[l], "x2", l)
             a = self.gelu(self.lin(x2, l, "f1"), l)
-            h = self.resadd(h, self.lin(a, l, "f2") + self.b[(l, "f2")], l)
+            h = self.resadd(h, self.lin(a, l, "f2") + self.ibias(self.b[(l, "f2")]), l)
         xf = self.ln(h, self.lnf, "xf", vc.L)
         return self.connector(pixel_shuffle(xf, self.scale))
 
@@ -588,6 +604,8 @@ class TextModel(ls.Model):
         if m.any():
             assert self.img is not None and int(m.sum()) == len(self.img), (int(m.sum()), self.img is None)
             h[m] = self.img
+        if self.q and self.pol.get("res_bits"):           # the stream starts on the int32 grid (rowops)
+            h = self.res32(h, 0)
         return h
 
 
@@ -642,6 +660,17 @@ VPOLICIES = {
     "pow2+p14+in5":    dict(_F, fmt="pow2", p_bits=14, in_cap=5),
     "pow2_tensor+p12": dict(_F, fmt="pow2", p_bits=12, per_tensor=True),
     "pow2+hattn":      dict(_F, fmt="pow2", hattn=True),
+    # the vision residual as int32 at 2^-N (doc/plans/HOSTOPS_PLAN.md phase 0; llm_study's r-policies)
+    "pow2+p12+vgelu+vsmx+r15": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True, res_bits=15),
+    "pow2+p12+vgelu+vsmx+r12": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True, res_bits=12),
+    # + the unit's integer LayerNorm (rowops_spec.layer_norm on the int32 residual)
+    "pow2+p12+vgelu+vsmx+r15+inorm": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
+                                          res_bits=15, inorm=True),
+    # the row-ops unit (HOSTOPS_PLAN §6): int32 residual at 2^-15, its LayerNorms and residual
+    # adds (the bias rounded once at the residual's scale) — what the scheduler's vision entry
+    # computes with kernels.rowops.unit (vlm_sched_check.py --rowops on)
+    "pow2+p12+vgelu+vsmx+rowops": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
+                                       res_bits=15, inorm=True, ibias=True),
 }
 TEXT_SHIPPED = "pow2+sink+p12"        # FPGA decode attention too (doc/plans/KV_DECODE_PLAN.md)
 TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)
@@ -651,10 +680,15 @@ VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's ac
                                       # generates where the platform has the unit
 
 
-def vision_policy(activations: bool, softmax: bool = False) -> str:
+def vision_policy(activations: bool, softmax: bool = False, rowops: bool = False) -> str:
     """The vision policy the scheduler's `vision` entry computes: VISION_VOP on a
     VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU);
-    with ``softmax`` (the softmax unit, doc/plans/SOFTMAX_PLAN.md) VISION_VOP + vsmx."""
+    with ``softmax`` (the softmax unit, doc/plans/SOFTMAX_PLAN.md) VISION_VOP + vsmx;
+    with ``rowops`` (the row-ops unit, doc/plans/HOSTOPS_PLAN.md) + rowops as well."""
+    if rowops:
+        if not (activations and softmax):
+            raise ValueError("the rowops vision policy is studied with the VectorOP GELU and softmax only")
+        return VISION_VOP + "+vsmx+rowops"
     if softmax:
         if not activations:
             raise ValueError("the vsmx vision policy is studied with the VectorOP GELU only")

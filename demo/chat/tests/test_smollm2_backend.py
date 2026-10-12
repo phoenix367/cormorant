@@ -628,7 +628,7 @@ class TestTwoSizes(unittest.TestCase):
                                                  "--llm-360m-weights", self.dirs[1], fake=False))
         self.assertEqual(list(bs), [self.B, self.A])          # the first is the default model
         self.assertEqual([b.engine.lib_path for b in bs.values()], [self.libs[1], self.libs[0]])
-        self.assertEqual([b.cma_mb for b in bs.values()], [760.0, 330.0])
+        self.assertEqual([b.cma_mb for b in bs.values()], [775.0, 330.0])
         self.assertEqual(bs[self.B].fingerprint, "kv260-smollm2-360m-pow2+sink+p12")
 
     def test_default_ids_and_overrides(self):

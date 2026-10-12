@@ -17,7 +17,8 @@
       "VectorOPKernel": "fabric_vecop",
       "MatmulKernel": "fabric_matmul",
       "ConvKernel": "fabric_conv",
-      "PoolKernel": "fabric_pool"
+      "PoolKernel": "fabric_pool",
+      "RowOpsKernel": "fabric_rowops"
     },
     "_uio_devices_note": "Per-kernel UIO sysfs names \u2014 the node labels from dts/kv260/cormorant.dts. Verify on the board with: cat /sys/class/uio/uio*/name. To find names for a different bitstream run: grep -B3 generic-uio dts/<platform>/<stem>.dts. Remove kernels not present in your bitstream. Keys are the scheduler kernel names (src/kernels.py: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel).",
     "driver_dir": null,
@@ -31,7 +32,8 @@
       "VectorOPKernel": "../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel": "../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel": "../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src",
-      "PoolKernel": "../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
+      "PoolKernel": "../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src",
+      "RowOpsKernel": "../build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel local paths for multi-kernel models, e.g. {\"VectorOPKernel\": \"../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src\", \"MatmulKernel\": \"../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src\"}. Files are merged automatically before upload."
   },

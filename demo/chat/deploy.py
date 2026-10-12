@@ -142,14 +142,14 @@ def load_config(path: Optional[str]) -> dict:
     if not llm["lib"]:
         llm["lib"] = f"{rem['dir']}/lib/libsmollm2.so"
     l360 = cfg.setdefault("smollm2_360m", {})
-    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 760),
+    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 775),
                  ("tokenizer", "assets/smollm2-360m-instruct/tokenizer.json")):
         if l360.get(k) is None:
             l360[k] = v
     if not l360["lib"]:
         l360["lib"] = f"{rem['dir']}/lib/libsmollm2_360m.so"
     vlm = cfg.setdefault("smolvlm", {})
-    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 540),
+    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 550),
                  ("tokenizer", "assets/smolvlm-256m-instruct/tokenizer.json")):
         if vlm.get(k) is None:
             vlm[k] = v

@@ -32,7 +32,8 @@ from src.remote import RemoteSession, check_prerequisites, hold_board_lock  # no
 UIO_DEFINE = {"VectorOPKernel": "INFERENCE_VECTOROPKERNEL_INSTANCE",
               "MatmulKernel": "INFERENCE_MATMULKERNEL_INSTANCE",
               "ConvKernel": "INFERENCE_CONVKERNEL_INSTANCE",
-              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE"}
+              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE",
+              "RowOpsKernel": "INFERENCE_ROWOPSKERNEL_INSTANCE"}
 CHAT_DEPLOY = REPO / "demo" / "chat" / "deploy.py"
 
 

@@ -83,6 +83,7 @@ facts:
                     regex: '^(?:\d+ ){8}([1-9]\d*) ', all: true, transform: 'len(v)'}
       matmul_tiled: {file: hw/test_data/matmul_test_data/manifest.txt, regex: '^(?:\d+ ){8}(0) ', all: true, transform: 'len(v)'}
       pool: {file: hw/test_data/pool_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
+      rowops: {file: hw/test_data/rowops_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v)'}
   fix: auto
   mentions:
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`hw/test_data/conv_test_data/` \((?P<conv>\d+) cases\)'}
@@ -98,6 +99,10 @@ facts:
     - {file: doc/build-and-test/BUILD_TARGETS.md,
        regex: 'pass \((?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) GEMV\), (?P<pool>\d+) Pool cases\)'}
     - {file: doc/build-and-test/TESTING.md, regex: 'runs the (?P<matmul>\d+) checked-in MatmulKernel fixtures'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'runs the (?P<rowops>\d+) checked-in RowOps fixtures'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'runs the (?P<rowops>\d+) checked-in RowOps fixtures'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'rowops_test_data/` \((?P<rowops>\d+) cases'}
+    - {file: CLAUDE.md, regex: '`TestRowOpsRtl`: the (?P<rowops>\d+) fixtures'}
     - {file: doc/build-and-test/TESTING.md,
        regex: 'manifests currently hold (?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) of them GEMV\) and (?P<pool>\d+) Pool'}
     - {file: doc/build-and-test/TESTING.md, regex: 'VectorOP Test Summary: (?P<vecop>\d+) / (?P<vecop__d>\d+) passed'}
@@ -133,19 +138,21 @@ facts:
       conv: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/conv_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
       matmul: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/mm_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
       pool: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/pk_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
-      total: {cmd: "cat hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/*_classes.svh | grep -c 'tests\\.push_back'",
+      # the RowOps cases are the checked-in fixtures (ro_classes.svh reads the manifest) plus the table load
+      rowops: {file: hw/test_data/rowops_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v) + 1'}
+      total: {cmd: "echo $(( $(cat hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/*_classes.svh | grep -c 'tests\\.push_back') + $(grep -c '^[0-9]' hw/test_data/rowops_test_data/manifest.txt) + 1 ))",
               parse: '(\d+)', type: int}
   fix: auto
   mentions:
     - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'Pass: `##  TOTAL: (?P<total>\d+) / (?P<total__d>\d+) passed`'}
     - {file: .claude/skills/kernel-verify/SKILL.md,
-       regex: '\(VectorOPKernel (?P<vectorop>\d+), ConvKernel (?P<conv>\d+), MatmulKernel (?P<matmul>\d+), PoolingKernel (?P<pool>\d+)\)'}
-    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'block-design testbench, (?P<total>\d+) cases over the four kernels'}
+       regex: '\(VectorOPKernel (?P<vectorop>\d+), ConvKernel (?P<conv>\d+), MatmulKernel (?P<matmul>\d+), PoolingKernel (?P<pool>\d+), RowOpsKernel (?P<rowops>\d+)\)'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'block-design testbench, (?P<total>\d+) cases over the five kernels'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'whole-design simulation \((?P<total>\d+) / (?P<total__d>\d+)\)'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'with this IP passes (?P<total>\d+) / (?P<total__d>\d+) \(Matmul (?P<matmul>\d+) / (?P<matmul__d>\d+)\)'}
-    - {file: hw/cormorant_hw_128/README.md, regex: '~3 minutes \((?P<total>\d+) constant-fill cases'}
+    - {file: hw/cormorant_hw_128/README.md, regex: '~4 minutes \((?P<total>\d+) cases: the four kernels'' constant-fill cases and the RowOpsKernel''s (?P<rowops>\d+)'}
     # the sample output of TESTING.md §3, hw_128 CLAUDE.md and README.md
-    - {file: doc/build-and-test/TESTING.md, regex: &sim_hw_out '##        VectorOPKernel +(?P<vectorop>\d+) / +(?P<vectorop__d>\d+) .*\n##            ConvKernel +(?P<conv>\d+) / +(?P<conv__d>\d+) .*\n##          MatmulKernel +(?P<matmul>\d+) / +(?P<matmul__d>\d+) .*\n##         PoolingKernel +(?P<pool>\d+) / +(?P<pool__d>\d+) .*\n.*\n##  TOTAL: (?P<total>\d+) / (?P<total__d>\d+) passed'}
+    - {file: doc/build-and-test/TESTING.md, regex: &sim_hw_out '##        VectorOPKernel +(?P<vectorop>\d+) / +(?P<vectorop__d>\d+) .*\n##            ConvKernel +(?P<conv>\d+) / +(?P<conv__d>\d+) .*\n##          MatmulKernel +(?P<matmul>\d+) / +(?P<matmul__d>\d+) .*\n##         PoolingKernel +(?P<pool>\d+) / +(?P<pool__d>\d+) .*\n##          RowOpsKernel +(?P<rowops>\d+) / +(?P<rowops__d>\d+) .*\n.*\n##  TOTAL: (?P<total>\d+) / (?P<total__d>\d+) passed'}
     - {file: hw/cormorant_hw_128/CLAUDE.md, regex: *sim_hw_out}
     - {file: hw/cormorant_hw_128/README.md, regex: *sim_hw_out}
 
@@ -158,14 +165,15 @@ facts:
       matmul: {file: inference-scheduler/perf_config.json.example, json: benchmarks.MatmulKernel.cases, transform: 'len(v)'}
       conv: {file: inference-scheduler/perf_config.json.example, json: benchmarks.ConvKernel.cases, transform: 'len(v)'}
       pool: {file: inference-scheduler/perf_config.json.example, json: benchmarks.PoolingKernel.cases, transform: 'len(v)'}
+      rowops: {file: inference-scheduler/perf_config.json.example, json: benchmarks.RowOpsKernel.cases, transform: 'len(v)'}
       total: {file: inference-scheduler/perf_config.json.example, json: benchmarks,
               transform: "sum(len(x['cases']) for x in v.values() if isinstance(x, dict))"}
   fix: auto
   mentions:
     - {file: inference-scheduler/CLAUDE.md, regex: '`perf_config\.json\.example` \((?P<total>\d+) cases\)'}
     - {file: doc/build-and-test/TESTING.md, dotall: true,
-       regex: 'ships with \*\*(?P<total>\d+) benchmark cases\*\*\s+across the four kernels \((?P<vectorop>\d+) VectorOPKernel, (?P<matmul>\d+) MatmulKernel'}
-    - {file: doc/build-and-test/TESTING.md, regex: '§8b — (?P<conv>\d+) ConvKernel, (?P<pool>\d+) PoolingKernel\)'}
+       regex: 'ships with \*\*(?P<total>\d+) benchmark cases\*\*\s+across the five kernels \((?P<vectorop>\d+) VectorOPKernel, (?P<matmul>\d+) MatmulKernel'}
+    - {file: doc/build-and-test/TESTING.md, regex: '§8b — (?P<conv>\d+) ConvKernel, (?P<pool>\d+) PoolingKernel, (?P<rowops>\d+) RowOpsKernel:'}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Performance benchmarks — (?P<total>\d+) cases;'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'say whether anything regressed — the (?P<total>\d+) kernel benchmarks'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'OVERALL: All (?P<total>\d+) cases passed ──` \('}
@@ -192,7 +200,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` moves ConvKernel'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds the RowOpsKernel'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
@@ -208,7 +216,7 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: '\+211, \+99, \+37; 8 s of board each\) → (?P<exact_calls>\d+) exact calls'}
+       regex: '\+90, \+184, \+24, \+8\) → (?P<exact_calls>\d+) exact calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
@@ -232,10 +240,16 @@ facts:
   kind: recorded
   title: the engine cost model's per-call error against the board (RTL_CONV_BOARD, RTL_COEF + CALL_OVERHEAD;
     median / p90 %) on the campaign it was fitted to, quoted in the code and the docs that describe the model
-  value: {conv_calls: 1103, conv_median: 2.9, conv_p90: 18, matmul_calls: 414, matmul_median: 4.7, matmul_p90: 17.8}
+  value: {conv_calls: 1303, conv_median: 2.8, conv_p90: 20.3, matmul_calls: 414, matmul_median: 4.7, matmul_p90: 17.6}
   provenance:
-    date: 2026-10-10
-    how: "tools/fit_cost_model.py fit f70ce632a97a on its campaign (1701 exact calls, DEPTHWISE_PLAN §8.5: ConvKernel's x
+    date: 2026-10-12
+    how: "Re-scored on 1cedaf2ed816 (HOSTOPS_PLAN §9.2, the campaign of the row-ops unit, 1938 exact calls): the constants
+          as used ConvKernel 2.8 / 20.3 % over 1303 calls, MatmulKernel 4.7 / 17.6 % over 414; the plain refit's proposal
+          (2.9 / 19.1 % and 4.7 / 17.6 %) NOT taken: tools/fit_cost_model.py diff (decision files rebuilt — the cached ones
+          of 2026-10-11 replay the old comparison) moves SmolLM2-135M's and SmolVLM's prefill_16 60 MatMuls back from
+          ConvKernel to the GEMV, +1.3 ms per run each by the measured entries, and nothing else; the call floor 443 -> 440
+          cycles (1.76 us) with ONE / one +3, so no engine choice moves.  The shipped libraries now carry the f70ce632a97a
+          refit's choices (regenerated with the unit in the same window).  Before: tools/fit_cost_model.py fit f70ce632a97a on its campaign (1701 exact calls, DEPTHWISE_PLAN §8.5: ConvKernel's x
           port off the CCI): the constants as used before scored ConvKernel 35.8 / 77.6 % over 1103 calls (bias +0.30: the
           x-path terms of the old board), MatmulKernel 4.5 / 18.1 % over 414; the proposal (applied: RTL_CONV_BOARD,
           RTL_COEF, CALL_OVERHEAD 431 -> 443 = the new call floor 1.77 us) 2.9 / 18.0 % and 4.7 / 17.8 %; `diff`: the
@@ -252,7 +266,7 @@ facts:
           ConvKernel / MatmulKernel calls unchanged): the constants as used ConvKernel 18.6 / 48.3 % over 1265
           calls, MatmulKernel 4.5 / 17.7 % over 414; call floor 431 cycles: CALL_OVERHEAD 434 -> 431 with
           ONE / one +3"
-    facts: {perf.bitstream_id: f70ce632a97a}  # a new bitstream: a new campaign, refit or re-score
+    facts: {perf.bitstream_id: 1cedaf2ed816}  # a new bitstream: a new campaign, refit or re-score
   fix: report
   mentions:
     - {file: inference-scheduler/src/cost_model.py,
@@ -444,6 +458,25 @@ facts:
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`build/(kernels/pool_rtl/[\w./]+/src)`'}
     - {file: doc/build-and-test/TESTING.md, regex: '"PoolKernel": +"<repo>/build/(kernels/pool_rtl/[\w./]+/src)"'}
 
+- id: paths.rowops_driver
+  kind: value
+  title: where the build writes RowOpsKernel's C driver (make driver_rowops_rtl, below build/), the
+    directory the example configs and docs point projects at
+  source:
+    file: kernels/rowops_rtl/CMakeLists.txt
+    regex: 'RO_RTL_DRIVER_ROOT "\$\{CMAKE_CURRENT_BINARY_DIR\}/(\w+)"\)\nset\(RO_RTL_DRIVER_SRC "\$\{RO_RTL_DRIVER_ROOT\}/([^"]+)"'
+    transform: "f'kernels/rowops_rtl/{v[0]}/{v[1]}'"   # the subdirectory's binary dir below build/
+  fix: auto
+  mentions:
+    - {file: inference-scheduler/perf_config.json.example, regex: '"RowOpsKernel": "\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/remote_config.json.example, regex: '"RowOpsKernel": "\.\./build/([^"]+)"'}
+    - {file: demo/bert_squad/bert_squad_config.json.example, regex: '"RowOpsKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/image_classification/image_classification_config.json.example, regex: '"RowOpsKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/object_detection/object_detection_config.json.example, regex: '"RowOpsKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/mnist/mnist_config.json.example, regex: '"RowOpsKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: demo/camera/camera_config.json.example, regex: '"RowOpsKernel": +"\.\./\.\./build/([^"]+)"'}
+    - {file: inference-scheduler/src/kernels.py, regex: '<axi_demo>/build/(kernels/rowops_rtl/[\w./]+/src)', count: 2}
+
 - id: paths.matmul_driver
   kind: value
   title: where the build writes MatmulKernel's C driver (make driver_matmul_rtl, below build/), the
@@ -527,6 +560,22 @@ facts:
       - inference-scheduler/bench_src/calib_runner.c
       - inference-scheduler/bench_src/bench_pool.c
 
+- id: registers.RowOpsKernel
+  kind: interface
+  title: RowOpsKernel AXI-Lite registers (the row-ops unit, HOSTOPS_PLAN phase 1-2; RTL only until phase 3)
+  check: register_map
+  args:
+    kernel: RowOpsKernel
+    prefix: XRowopskernel
+    rtl_driver: kernels/rowops_rtl/scripts/gen_driver.py     # the truth: the RTL kernel's table,
+    rtl: kernels/rowops_rtl/rtl/ro_ctrl_s_axi.sv             # checked against its control block
+    driver: 'build*/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src/xrowopskernel_hw.h'
+    not_keyed: {a: address, b: address, c: address, p: "address of the parameter block",
+                eps: "NORM's epsilon term (no effect on timing)", bq_sh: "the beta shift (no effect on timing)"}
+    decode: inference-scheduler/src/timeline_html.py
+    writers_all:
+      - inference-scheduler/src/codegen/_source.py
+
 - id: vectorop.codes
   kind: interface
   title: VectorOP op / act codes (the Op and Act enums) and their copies
@@ -608,17 +657,15 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
-  value: {bert: 216, smollm2_135m: 286, smollm2_360m: 740, smolvlm_256m: 495, piper: 51}
+  value: {bert: 216, smollm2_135m: 294, smollm2_360m: 754, smolvlm_256m: 506, piper: 51}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: fcdc1e7
-    date: 2026-10-08
-    how: "facts.py verify: the generated projects in demo/chat/build and demo/bert_squad/build, regenerated
-          at 16bdee5 with the RTL MatmulKernel's engine choices (MATMUL_RTL_PLAN phase 4) and the board-priced ConvKernel (BERT 215.3, 135M 285.8,
-          360M 740.2, SmolVLM 494.8 MiB); Piper 48.1 MiB (demo/tts/build/piper_project, same session); 5ecd78b changed
-          only a docstring of matmul_gemv.py.  2026-10-07 (facts.py verify, after d05cf0b's VectorOP sums in Piper and
-          KV_DECODE_PLAN's decode attention on the FPGA): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9 (unchanged),
-          Piper 51.1 MiB (48.1 before: the stage-2 tap-group sum's own 3.1 MB output)  2026-10-08 (facts.py verify after SOFTMAX_PLAN: the softmax moved to VectorOPKernel, no buffer changed): BERT 215.3, 135M 285.8, 360M 740.2, SmolVLM 494.9, Piper 51.1 MiB.  Again after its phase 6 (fcdc1e7: Piper's encoder softmax on the unit, the logits in existing slots): the same."
+    commit: 94000a8
+    date: 2026-10-12
+    how: "facts.py verify after HOSTOPS_PLAN phase 2-3: the residual stream as an int32 DMA tensor and the unit's parameter
+          blocks / table image — SmolLM2-135M 293.6, SmolLM2-360M 754.1, SmolVLM 505.6, Piper 51.5, BERT 216 MiB
+          (286 / 740 / 495 / 51 / 216 before; 2026-10-08 after SOFTMAX_PLAN: BERT 215.3, 135M 285.8, 360M 740.2,
+          SmolVLM 494.9, Piper 51.1 MiB)"
   depends_on:                                # what changes a pool's size
     - platforms/kv260.json
     - inference-scheduler/src/codegen/_core.py
@@ -899,48 +946,24 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.5, bert_ms: 364,
-          smollm2_135m_tok_s: 18.3, smollm2_135m_prefill16_s: 0.15, smollm2_360m_tok_s: 7.3,
-          smolvlm_image_s: 2.1, piper_rtf: 0.19, mnist_convnet_ms: 0.108, mnist_lenet_ms: 1.253,
-          yolov5n_ms: 46.9, yolov5n_fps: 21.3, stereo_ms: 469, stereo_fps: 2.13,
-          stereo320_ms: 160}
+  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.6, mobilenet_v2_ms: 17.5, bert_ms: 288,
+          smollm2_135m_tok_s: 20.3, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.7, smolvlm_image_s: 1.7,
+          piper_rtf: 0.19, mnist_convnet_ms: 0.108, mnist_lenet_ms: 1.251, yolov5n_ms: 46.8, yolov5n_fps: 21.4,
+          stereo_ms: 466, stereo_fps: 2.15, stereo320_ms: 160}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
-    date: 2026-10-04
-    how: "MATMUL_RTL_PLAN phase 4 board session: the demos' results.json (ResNet-18 p50 59.9 ms, MobileNet
-          v1 / v2 73.0 / 62.9; BERT p50 919.2 ms after the board-priced engine choice put P·V on
-          MatmulKernel), llm_board.py (135M 100.2 ms / token and a 251 ms 16-token
-          prefill, 360M 254.0), tts_board.py (RTF 0.518); SmolVLM
-          llm_image 3.91 s from phase 3c (the same project; 4.2 s in a run right after a reboot); MNIST
-          demo results.json (mean 0.2597 / 2.8308 ms per image, 98.92 / 97.35 %).  Re-measured on bbb9a37f73f8
-          (the same kernels plus the PoolingKernel guard; perf-regression baseline 2026-10-04 21:50): ResNet-18
-          59.9, MobileNet v1 / v2 73.0 / 63.0, BERT p50 919.7, MNIST 0.260 / 2.833 ms — every demo within 0.1 %
-          and the 60 kernel benchmarks equal; the chat figures were not re-run.  Re-measured on 68665fc1833a
-          (the RTL VectorOPKernel, VECTOROP_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
-          72.9 / 62.8, BERT p50 917.8, MNIST 0.261 / 2.833 ms; llm_board 135M 100.3 ms / token and a 250 ms
-          16-token prefill, 360M 251.9 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.519 — all
-          within the tolerance of the values above.  Re-measured on b3309f424562 (the MatmulKernel IP with its
-          m_axi bus parameters, MATMUL_RTL_PLAN phase 5, 2026-10-05): ResNet-18 59.9, MobileNet v1 / v2
-          72.9 / 62.8, BERT p50 917.3, MNIST 0.261 / 2.774 ms; llm_board 135M 100.2 ms / token and a 251 ms
-          16-token prefill, 360M 252.0 ms / token, SmolVLM llm_image 3.90 s; tts_board RTF 0.519 — within the
-          tolerance (LeNet 2.1 % faster: its FC layers run on MatmulKernel).  Re-measured on dbb320fb7297 (the
-          RTL PoolingKernel, POOL_RTL_PLAN phase 2, 2026-10-05): ResNet-18 59.7, MobileNet v1 / v2 72.8 / 62.7,
-          BERT mean 919.4, MNIST 0.256 / 2.743 ms (the values above since: LeNet 3.1 % faster than the 2.831
-          recorded, its two AveragePools); llm_board 135M 100.3 ms / token and a 251 ms 16-token prefill, 360M
-          251.7 ms / token, SmolVLM llm_image 3.89-3.91 s; tts_board RTF 0.518.  Measured on c2b2a6e5e50e (the
-          RTL ConvKernel, CONV_RTL_PLAN phase 2, 2026-10-06), the values above: ResNet-18 47.45, MobileNet v1 / v2
-          41.23 / 38.05 ms, BERT p50 865.1 (mean 866.1), MNIST 0.235 / 2.701 ms; llm_board 135M 100.25 ms /
-          token and a 249 ms 16-token prefill, 360M 251.8 ms / token, SmolVLM llm_image 3.36 s; tts_board RTF
-          0.302 (the 6.9 s utterance).  Re-measured with the projects regenerated under the RTL ConvKernel cost
-          model (CONV_RTL_PLAN phase 3, 2026-10-06), the values above: BERT p50 839.2 (mean 840.5; P·V on
-          ConvKernel), llm_board 135M 99.81 ms / token and a 243 ms 16-token prefill, 360M 252.0 ms / token,
-          SmolVLM llm_image 3.37 s; tts_board RTF 0.303; ResNet-18 47.46, MobileNet v1 / v2 41.23 / 38.10, MNIST
-          0.235 / 2.701 ms (those projects unchanged).  Measured on 986cef4866a0 (the kernels at 250 MHz,
-          FMAX_250_PLAN, 2026-10-06; the same libraries and projects), the values above: ResNet-18 20.51,
-          MobileNet v1 / v2 21.97 / 20.48 ms, BERT p50 541.2 (mean 543.1), MNIST 0.1106 / 1.2488 ms (98.92 /
-          97.35 %); llm_board 135M 54.53 ms / token and a 156 ms 16-token prefill, 360M 137.35 ms / token,
-          SmolVLM llm_image 2.35 s; tts_board RTF 0.243 (the 6.9 s utterance)  Re-measured on 6436623029f7 (VectorOPKernel's activation unit, ACTIVATIONS_PLAN, 2026-10-06): ResNet-18 20.5, MobileNet v1 / v2 22.0 / 20.5, MNIST 0.111 / 1.249 ms; BERT p50 525.0 ms (541.2 with the GELUs on the host: they now run fused into the FFN bias Adds); llm_board 135M 54.4 ms / token, 360M 137.9, SmolVLM llm_image 2.33 s; tts_board RTF 0.244.  OFFLOAD_PLAN (2026-10-07, the same bitstream): SmolVLM llm_image 2.20 / 2.18 s (GELU on VectorOP), tts_board RTF 0.204 on the 6.9 s utterance (the decoder's residual sums on VectorOP).  Measured on 588d721997cb (VectorOPKernel's softmax unit, SOFTMAX_PLAN, 2026-10-07): ResNet-18 20.50, MobileNet v1 / v2 21.98 / 20.44, MNIST 0.111 / 1.251 ms; BERT p50 427.3 ms (regenerated: the 12 Softmaxes on the unit); llm_board 135M 54.6 ms / token, prefill 16 / 256 152 / 737 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.94 / 1.93 s; tts_board RTF 0.236 / 0.204 (the library unchanged).  Measured on 8599aa7a5f12 (VectorOPKernel's b read port on HPC1, PS_PORTS_PLAN §5, 2026-10-08; the same libraries and projects): ResNet-18 20.18, MobileNet v1 / v2 21.96 / 20.35, MNIST 0.1105 / 1.2504 ms; BERT p50 418.0 ms; llm_board 135M 54.6 ms / token, prefill 16 / 256 153 / 736 ms; 360M 137.5 ms / token; SmolVLM llm_image 1.91 / 1.91 s; tts_board RTF 0.232 / 0.201.  YOLOv5n (YOLO_PLAN §3.3, demo/object_detection run_demo.py on 8599aa7a5f12, 16 COCO128 images): 63.9 ms mean / p50, 15.6 FPS.  LightStereo-S (STEREO_PLAN §4.3, demo/stereo_depth run_demo.py --pairs 0 on 8599aa7a5f12, 2026-10-09, 640 x 480, 42 pairs): 658.9 ms mean / 657.8 p50, 1.52 FPS (660.1 / 657.6 in the run before); with the depthwise channel slices (INFERENCE_SCHEDULER.md §Depthwise channel slices, STEREO_PLAN §4.5, the same run, 42 + 2 RealSense pairs): 598.8 ms mean / 598.4 p50, 1.67 FPS, maps bit-exact; at 320 x 256 (run.height 256 / run.width 320, demo/stereo_depth/build/results_320_dwslice.json): 159.6 ms mean (163.7 before the slices).  Measured on f70ce632a97a (ConvKernel's x read port on HP2 past the CCI + overlapped line-buffer loads, DEPTHWISE_PLAN §8, 2026-10-10, the same projects): ResNet-18 19.98, MobileNet v1 / v2 20.45 / 17.51, MNIST 0.1080 / 1.2531 ms; BERT p50 363.9 ms; LightStereo-S 469.5 ms mean / 468.2 p50 (44 pairs, 2.13 FPS, EPE 0.667 on the 42 with ground truth); YOLOv5n 46.9 ms mean / p50 (21.3 FPS, 16 COCO128 images, bit-exact); llm_board 135M 54.9 ms / token, prefill 16 / 64 / 256 155 / 226 / 776 ms; 360M 137.8 ms / token, prefill 16 / 256 336 / 1701 ms; SmolVLM llm_image 2.08 / 2.07 s (an A/B on the same day: 8599aa7a5f12 2.15 / 2.17 s, f70ce632a97a 2.07 / 2.06 — 4.5 % faster; the 1.91 s on record is a board state that no longer reproduces on either bitstream, open); tts_board RTF 0.223 / 0.194, all bit-exact"
-    facts: {perf.bitstream_id: f70ce632a97a}   # stale on another bitstream
+    date: 2026-10-12
+    how: "the board windows of HOSTOPS_PLAN phase 3 and phase 4a (§10.8: the prefill attention prep on the unit) on
+          1cedaf2ed816 (the row-ops unit on HP0; the chat / TTS libraries regenerated with it): BERT deploy_and_run 50 examples p50 288.4 / mean 288.6 ms (364 on f70ce632a97a); llm_board
+          SmolLM2-135M 49.4 ms/token = 20.3 tok/s, prefill 16 / 64 / 256 81 / 98 / 398 ms (phase 3: 88 / 111 / 448;
+          f70ce632a97a 54.9 ms, 155 / 226 / 776);
+          SmolLM2-360M 129.5 ms/token = 7.7 tok/s, prefill 191 / 236 / 1050 ms (phase 3: 200 / 257 / 1125; 1701 at 256 before);
+          SmolVLM llm_image 1.70 s (2.07; its text prefill 256 449 -> 399 ms); tts_board RTF 0.224 / 0.194 (the chunk has no unit ops); MNIST 0.108 / 1.251 ms,
+          ResNet-18 19.99, MobileNet v1 / v2 20.59 / 17.49 ms (no unit ops: unchanged); YOLOv5n run_demo 16 images 46.8 ms
+          mean / p50 (21.4 FPS; 46.9 before) and LightStereo-S 44 pairs 466.0 mean / 464.9 ms p50 (2.15 FPS; 469 before),
+          both bit-exact — no unit ops in their graphs; the 320 x 256 stereo run not repeated.  Before: 2026-10-10 on
+          f70ce632a97a (DEPTHWISE_PLAN §8.6)"
+    facts: {perf.bitstream_id: 1cedaf2ed816}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -993,8 +1016,8 @@ facts:
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
     - {file: doc/plans/RESNET18_15FPS_PLAN.md, dotall: true,
        regex: '`f70ce632a97a`, DEPTHWISE_PLAN §8.5,\s+2026-10-10\): ResNet-18 (?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\), MobileNet v1 (?P<mobilenet_v1_ms>[\d.]+) ms, v2 (?P<mobilenet_v2_ms>[\d.]+) ms'}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream\s+`f70ce632a97a`, DEPTHWISE_PLAN.md §8\): p50 (?P<bert_ms>\d+) ms', dotall: true}
-    - {file: demo/bert_squad/README.md, regex: 'through that port\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'bitstream\s+`1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit\): p50 (?P<bert_ms>\d+) ms', dotall: true}
+    - {file: demo/bert_squad/README.md, regex: 'policy\): p50 \*\*(?P<bert_ms>[\d.]+) ms\*\*', dotall: true}
     - {file: demo/README.md, regex: 'ResNet-18 (?P<resnet18_ms>[\d.]+) ms = (?P<resnet18_fps>[\d.]+) FPS'}
     - {file: demo/README.md, regex: 'per-layer time by kind \((?P<bert_ms>\d+) ms per inference\)'}
     - {file: demo/README.md, regex: 'SmolLM2-135M ~(?P<smollm2_135m_tok_s>[\d.]+) tokens/s, 360M ~(?P<smollm2_360m_tok_s>[\d.]+) tokens/s'}
@@ -1030,8 +1053,9 @@ facts:
     date: 2026-10-08
     how: "demo/object_detection/scripts/yolo_study.py study (YOLO_PLAN §3.2): all 128 COCO128 images, val.py's
           NMS (conf 0.001, IoU 0.6, multi-label); float = onnxruntime on yolov5n_raw.onnx, FPGA = the
-          scheduler's simulation (the board equals it bit for bit, §3.3): 0.5427 / 0.3429 against 0.5454 / 0.3486"
-    facts: {perf.bitstream_id: f70ce632a97a}   # the datapath, not the bitstream: any kernel change re-measures
+          scheduler's simulation (the board equals it bit for bit, §3.3): 0.5427 / 0.3429 against 0.5454 / 0.3486; the board
+          run of 2026-10-12 on 1cedaf2ed816 (run_demo.py, 16 images) bit-exact with the simulation again"
+    facts: {perf.bitstream_id: 1cedaf2ed816}   # the datapath, not the bitstream: any kernel change re-measures
   verify:
     map50: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map50}
     map: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map}
@@ -1057,8 +1081,9 @@ facts:
     how: "STEREO_PLAN §4.2-§4.3: the board run (run_demo.py --pairs 0, 640 x 480, per_channel 0.05, bitstream
           8599aa7a5f12) EPE 0.6672 / bad-1 12.21 / bad-2 4.94; float on the same fitted input (stereo_study.py study
           --fit 480 640) 0.6500 / 11.81 / 4.87; the simulated graph at native resolution (sim_quality.py --pc 0.05)
-          EPE 0.627 (float 0.633)"
-    facts: {perf.bitstream_id: f70ce632a97a}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
+          EPE 0.627 (float 0.633); the board run of 2026-10-12 on 1cedaf2ed816 (44 pairs) gives the same EPE 0.667 /
+          12.21 / 4.94, bit-exact with the simulation"
+    facts: {perf.bitstream_id: 1cedaf2ed816}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
   verify:
     epe: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['epe'] for x in v if x['name'] == 'lightstereo_s')"}
     bad1: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['bad1'] for x in v if x['name'] == 'lightstereo_s')"}
@@ -1130,20 +1155,18 @@ facts:
 - id: piper.encode_ms
   kind: recorded
   title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
-  value: {ids20: 15.7, ids88: 50.6, ids400: 162.0}
+  value: {ids20: 14.2, ids88: 45.5, ids400: 146.0}
   tolerance: {rel: 0.03}                     # the docs round to the ms
   provenance:
-    date: 2026-10-11
-    how: "tts_board.py on f70ce632a97a (ConvKernel's x read port past the CCI, DEPTHWISE_PLAN §8.5; the same library),
-          best of 3 repetitions: 20 ids 15.74, 88 ids 50.61, 400 ids 162.02 ms (the attention convs over few keys
-          are x-bound: the short buckets gain most).  Before, tts_board.py on 8599aa7a5f12 with the library of SOFTMAX_PLAN §5 (the encoder softmax on VectorOPKernel's
-          unit), best of 3 repetitions: 20 ids 20.43, 88 ids 55.65, 400 ids 163.92 ms (the host softmax before:
-          20.50 / 58.25 / 208.10); the install's gate on the production paths 163.7 ms at 400 ids"
-    facts: {perf.bitstream_id: f70ce632a97a}   # stale on another bitstream
+    date: 2026-10-12
+    how: "tts_board.py on 1cedaf2ed816 (HOSTOPS_PLAN phase 3: the encoder's residual LayerNorms on the row-ops unit):
+          20 / 60 / 88 / 162 / 268 / 400 ids 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0 ms (f70ce632a97a: 15.7 / 50.6 /
+          162.0 at 20 / 88 / 400)"
+    facts: {perf.bitstream_id: 1cedaf2ed816}   # stale on another bitstream
   fix: report
   mentions:
     - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
-    - {file: demo/tts/README.md, regex: '(?P<ids88>\d+) ms for 88 ids, (?P<ids400>\d+) ms for 400 \(208 before\)'}
+    - {file: demo/tts/README.md, regex: '(?P<ids88>\d+) ms for 88 ids, (?P<ids400>\d+) ms for 400 \(51 / 162 before'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`tts_encode`, (?P<ids20>\d+)–(?P<ids400>\d+) ms'}
 - id: platform.kv260_bounds
   kind: value
@@ -1193,12 +1216,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: f70ce632a97a, dsp: 712, dsp_total: 1248, dsp_pct: 57, lut: 62618, lut_total: 117120, lut_pct: 53.5,
-          bram: 131, bram_total: 144, uram: 48, uram_total: 64}
+  value: {bitstream: 1cedaf2ed816, dsp: 833, dsp_total: 1248, dsp_pct: 67, lut: 93969, lut_total: 117120, lut_pct: 80.2,
+          bram: 136, bram_total: 144, uram: 55, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-10
-    how: "Vivado placed utilization report of the 250 MHz design with ConvKernel's x read port on HP2 and its
+    date: 2026-10-12
+    how: "Vivado placed utilization report of the 250 MHz design with the RowOpsKernel (the row-ops unit) and its
+          interconnect on HP0 (HOSTOPS_PLAN phase 3, /mnt/data/bitstreams/kv260_250_1cedaf2ed816/: +31 351 LUT,
+          FF 87 832 -> 113 020, +5 BRAM tiles, +7 URAM, +121 DSP; WNS +0.020 ns); f70ce632a97a before it:
+          LUT 62 618, DSP 712, BRAM 131, URAM 48 — ConvKernel's x read port on HP2 and its
           two line-buffer copies (DEPTHWISE_PLAN §8, /mnt/data/bitstreams/kv260_250_f70ce632a97a/: +218 LUT,
           FF 87 781 -> 87 832, +8 BRAM tiles — the second copy of the 16 RAMB18 line buffer); 8599aa7a5f12
           before it: LUT 62 400, BRAM 123 — VectorOPKernel's b read port on HPC1
@@ -1214,7 +1240,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: f70ce632a97a}
+    facts: {perf.bitstream_id: 1cedaf2ed816}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

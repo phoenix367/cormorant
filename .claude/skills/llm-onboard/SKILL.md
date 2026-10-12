@@ -202,9 +202,9 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
   1000, prefill 0.58 / 1.04 / 3.08 s, CMA used 736–740 MB.
 
 **CMA budget** (`cma=1000M`, ~954 MiB usable, idle CmaFree ~1011 MB, less
-with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 286,
-SmolLM2-360M 740, SmolVLM 495 MiB.  The backend's `cma_mb` = measured CMA
-drop + margin (286 → 330, 740 → 760, 495 → 540); `--resident auto` evicts
+with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 294,
+SmolLM2-360M 754, SmolVLM 506 MiB.  The backend's `cma_mb` = measured CMA
+drop + margin (294 → 330, 754 → 775, 506 → 550); `--resident auto` evicts
 least-recently-used models while CmaFree < `cma_mb` + 32 and retries a failed
 load once after evicting the rest — a pool that fits beside nothing swaps
 with every model (warm swap 1–2 s, cold from SD card 21–59 s).  An
@@ -313,9 +313,9 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_smolvlm
 - No `llm_calibrate.py` hash / `check` for the VLM formats (reruns are
   byte-identical, §23); `--prefill-attn fpga` is required.
 - Board gate: image prompts `--images 39769,1268` (COCO), 2 × 17 / 17 logits
-  vs the simulation (no `--study-json`); `llm_image` ~2.1 s at 250 MHz (2.2 s before SOFTMAX_PLAN's VectorOP softmax, 2.3 s before OFFLOAD_PLAN's VectorOP GELU; 3.4 s at 100 MHz, 3.9 s before the RTL ConvKernel).
+  vs the simulation (no `--study-json`); `llm_image` ~1.7 s at 250 MHz (2.1 s before HOSTOPS_PLAN's row-ops unit, 2.2 s before SOFTMAX_PLAN's VectorOP softmax, 2.3 s before OFFLOAD_PLAN's VectorOP GELU; 3.4 s at 100 MHz, 3.9 s before the RTL ConvKernel).
 - Serving: the `smolvlm` backend exists (`smolvlm_backend.py`, `idefics3.py`,
-  `vlm_image.py`; `--vlm-*`; config block `smolvlm`, `cma_mb` 540); the board
+  `vlm_image.py`; `--vlm-*`; config block `smolvlm`, `cma_mb` 550); the board
   needs `python3-pil` (deploy preflight checks it).  API gate: 48-token
   greedy answers for COCO 39769 and 1268 equal to the study emulation;
   `chat.py --image FILE`.

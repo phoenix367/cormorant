@@ -92,7 +92,7 @@ USB 2, 5000M / 10000M is USB 3.
 
 ## Results (KV260, bitstream `f70ce632a97a`, 2026-10-10)
 
-**Speed.**  At 640 × 480 a pair takes **469 ms (2.13 FPS)** — 599 ms on
+**Speed.**  At 640 × 480 a pair takes **466 ms (2.15 FPS)** — 599 ms on
 `8599aa7a5f12` (2026-10-09), before ConvKernel's x read port left the
 coherent interconnect for `S_AXI_HP2_FPD` and its line-buffer loads were
 overlapped with the window reads (DEPTHWISE_PLAN §8: the depthwise and 1 × 1

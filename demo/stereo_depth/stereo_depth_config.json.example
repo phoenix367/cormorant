@@ -16,7 +16,8 @@
       "VectorOPKernel": "fabric_vecop",
       "MatmulKernel": "fabric_matmul",
       "ConvKernel": "fabric_conv",
-      "PoolKernel": "fabric_pool"
+      "PoolKernel": "fabric_pool",
+      "RowOpsKernel": "fabric_rowops"
     },
     "_uio_devices_note": "DT node labels from the loaded overlay. Verify with: cat /sys/class/uio/uio*/name",
     "cmake_args": []

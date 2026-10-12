@@ -22,7 +22,7 @@ import numpy as np
 import gen_bert_models as gbm
 import host_emu
 from helpers import matmul_impl
-from src import _vectorop_hw_config
+from src import _rowops_hw_config, _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import (CastNode, GatherNode, GeluNode, HostNode, LayerNormNode,
@@ -64,6 +64,12 @@ class _Tiny(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._tmp.cleanup()
+
+    def setUp(self):
+        # the host partition (LayerNorm as the host op): the row-ops unit's is test_rowops_unit's
+        p = mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     @staticmethod
     def gen(path, **kw):

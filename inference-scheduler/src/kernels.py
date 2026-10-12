@@ -205,6 +205,45 @@ or re-run inference_scheduler.py with:
 """
 
 # ---------------------------------------------------------------------------
+# RowOpsKernel (the row-ops unit, doc/plans/HOSTOPS_PLAN.md)
+# ---------------------------------------------------------------------------
+
+_ROWOPS_DRIVER_FILES: Tuple[str, ...] = (
+    "xrowopskernel.h",
+    "xrowopskernel_hw.h",
+    "xrowopskernel.c",
+    "xrowopskernel_sinit.c",     # BARE_METAL target
+    "xrowopskernel_linux.c",     # LINUX target
+)
+
+_ROWOPS_README = """\
+# driver/
+
+Place XRowopskernel driver sources here before building.
+
+Required files:
+  xrowopskernel.h
+  xrowopskernel_hw.h
+  xrowopskernel.c
+  xrowopskernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xrowopskernel_linux.c   (used by INFERENCE_TARGET=LINUX)
+
+These are the RowOpsKernel's driver (the HLS drivers' API), written by
+kernels/rowops_rtl/scripts/gen_driver.py.  Generate them in the axi_demo
+build directory (build/):
+
+  make driver_rowops_rtl
+
+then copy them from
+
+  <axi_demo>/build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src/
+
+or re-run inference_scheduler.py with:
+
+  --driver-dir <axi_demo>/build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src
+"""
+
+# ---------------------------------------------------------------------------
 # Registry — ordered dict; iteration order defines init order in generated C.
 # To add a new kernel, append a new entry here.
 # ---------------------------------------------------------------------------
@@ -246,6 +285,15 @@ KERNEL_REGISTRY: dict = {
         driver_files=_POOL_DRIVER_FILES,
         driver_readme=_POOL_README,
     ),
+    "RowOpsKernel": KernelDesc(
+        name="RowOpsKernel",
+        driver_prefix="xrowopskernel",
+        c_type="XRowopskernel",
+        uio_default="RowOpsKernel_0",
+        axi_base=0xA004_0000,
+        driver_files=_ROWOPS_DRIVER_FILES,
+        driver_readme=_ROWOPS_README,
+    ),
 }
 
 
@@ -266,7 +314,8 @@ def mixed_driver_readme(kernel_names: List[str]) -> str:
     sections = []
     for name in kernel_names:
         kd = KERNEL_REGISTRY[name]
-        rtl = {"MatmulKernel": "matmul", "VectorOPKernel": "vectorop", "PoolKernel": "pool"}.get(kd.name)
+        rtl = {"MatmulKernel": "matmul", "VectorOPKernel": "vectorop", "PoolKernel": "pool",
+               "ConvKernel": "conv", "RowOpsKernel": "rowops"}.get(kd.name)
         source = (f"make driver_{rtl}_rtl (the SystemVerilog kernel's driver)"
                   if rtl else f"Vitis HLS synthesis output for {kd.name}")
         sections.append(

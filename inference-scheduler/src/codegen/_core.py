@@ -181,7 +181,7 @@ class _CoreMixin:
         )
 
         # Phase 1: seed all tensors as flat.
-        layouts: dict = {t.onnx_name: TensorLayout.flat(t.numel)
+        layouts: dict = {t.onnx_name: TensorLayout.flat(t.alloc_numel)
                          for t in all_tensors}
 
         # Phase 2: broadcast VectorOP nodes.
@@ -367,6 +367,7 @@ class _CoreMixin:
         "MatmulKernel":   "KERNEL_MATMUL",
         "ConvKernel":     "KERNEL_CONV",
         "PoolKernel":     "KERNEL_POOL",
+        "RowOpsKernel":   "KERNEL_ROWOPS",
     }
 
     def _kernel_id_of(self, sched) -> Optional[str]:
@@ -930,6 +931,11 @@ class _CoreMixin:
         return any(isinstance(sn, ScheduledNode)
                    or (isinstance(sn, LlmKernelNode) and sn.kernel_name == "VectorOPKernel")
                    for sn in self._graph.nodes)
+
+    @property
+    def _has_rowops_nodes(self) -> bool:
+        """True when a node runs on the row-ops unit (src/rowops_nodes.py)."""
+        return any(getattr(type(sn), "kernel_name", "") == "RowOpsKernel" for sn in self._graph.nodes)
 
     @property
     def _uses_softmax_unit(self) -> bool:

@@ -19,6 +19,8 @@ on the board, fit the models, write perf_models/<platform>/<bitstream-id>.json.
           (--profile-layers); --merge keeps every op kind fitted before
   simulate  predicted vs measured totals per phase (prefill, decode,
           llm_image, inference, piper's chunk and encode buckets)
+  rowops  the replay of every shipped entry with the host row ops priced as a
+          row-ops unit on one PS port (doc/plans/HOSTOPS_PLAN.md §3)
 
 The shipped models (SHIPPED) are the demos' CNNs, BERT, SmolLM2-135M /
 360M, SmolVLM-256M and Piper (the chunk and encode_<T> entries of
@@ -63,7 +65,8 @@ MODELS_DIR = HERE / "perf_models" / PLATFORM
 CHAT = REPO / "demo" / "chat"
 TTS = REPO / "demo" / "tts"
 RUNNER_VERSION = 1
-KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P"}
+KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P",
+           "RowOpsKernel": "R"}
 # the kernels' clock of the local bitstream (its HWH): turns the cost model's
 # cycles into the per-call time estimates that size iterations and timeouts
 MHZ = local_kernel_clock_mhz() or 100.0
@@ -349,6 +352,30 @@ def buffer_sizes(c: KernelCall) -> List[int]:
         b = (f["outer"] - 1) * f["b_inc"] + span
         cc = (f["outer"] - 1) * (f["a_inc"] + f["b_inc"]) + span
         return [a + pad, b + pad, cc + pad]
+    if c.kernel == "RowOpsKernel":
+        # one m_axi port: A, B (b_en) and P read, C written; the strides are bytes, the
+        # element width that of each operand's kind (op word bits 5:4 / 7:6 / 9:8)
+        from src import rowops_spec as rs
+        eb = {rs.K_I16: 2, rs.K_I32: 4, rs.K_F32: 4}
+        op = f["op"]
+        n, rows, blocks = f["n"], f["rows"], f["blocks"]
+
+        def span(s1, s2, row_bytes):
+            return max(rows - 1, 0) * s1 + max(blocks - 1, 0) * s2 + row_bytes
+        if (op & 15) == rs.OP_XPOSE:
+            # a tile of R rows (b_s1 apart) x L = n; column d -> a granule of R at d * b_s2
+            R = f["aux"] & 15
+            a = span(f["a_s1"], f["a_s2"], max(R - 1, 0) * f["b_s1"] + n * 2)
+            cc = span(f["c_s1"], f["c_s2"], max(n - 1, 0) * f["b_s2"] + 2 * R)
+            return [_up(v, 2) // 2 + pad for v in (a, 16, cc, 16)]
+        a = span(f["a_s1"], f["a_s2"], n * eb[(op >> 4) & 3])
+        if (op & 15) == rs.OP_ROPE:                  # B: the row's cos / sin, 2 HD int32
+            b = span(f["b_s1"], f["b_s2"], 8 * (f["aux"] & 0xFFF))
+        else:
+            b = span(f["b_s1"], f["b_s2"], n * eb[(op >> 6) & 3]) if op & rs.F_B_EN else 16
+        cc = span(f["c_s1"], f["c_s2"], n * eb[(op >> 8) & 3])
+        pb = rs.PARAM_BYTES if op & rs.F_P_BCAST else rs.PARAM_BYTES * n
+        return [_up(v, 2) // 2 + pad for v in (a, b, cc, pb)]
     if c.kernel == "MatmulKernel":
         n, k, m, bt = f["n"], f["k"], f["m"], f["batch"]
         a = (bt - 1) * f["a_stride"] + n * k
@@ -391,6 +418,19 @@ def estimate_us(c: KernelCall) -> float:
                else 75 + f["outer"] * (58 + 3 * math.ceil(f["size"] / 8)))
     elif c.kernel == "VectorOPKernel":
         cyc = f["outer"] * math.ceil(f["size"] / 8) * (8 if f["op"] == 3 else 1) + 500
+    elif c.kernel == "RowOpsKernel":
+        # four lanes per cycle; NORM reads its row twice; ROPE loads its B row (HD / 2
+        # words) per row; TRANSPOSE loads a tile and emits one granule per cycle
+        # (contiguous) or per two (scattered) (ROWOPS_RTL_KERNEL.md §Performance)
+        rows, n, op = f["rows"] * f["blocks"], f["n"], f["op"] & 15
+        if op == 7:
+            R = f["aux"] & 15
+            cyc = rows * (R * math.ceil(n / 8) + (n if f["b_s2"] == 2 * R else 2 * n)) + 500
+        elif op == 6:
+            cyc = rows * (math.ceil(n / 4) + (f["aux"] & 0xFFF) // 2 + 11) + 540
+        else:
+            passes = 2 if op == 5 else 1
+            cyc = rows * (passes * math.ceil(n / 4) + 40) + 500
     else:
         cyc = f["batch"] * f["channels"] * (f["out_h"] * f["out_w"] * f["pool_h"] * f["pool_w"]
                                             + f["in_h"] * f["in_w"]) / 8 + 500
@@ -571,7 +611,8 @@ def cmd_run(args) -> int:
         {"platform": PLATFORM, "bitstream": bid, "runner": RUNNER_VERSION, "passes": {}}
     cfg = load_config(args.config, rp._EXTRA_DEFAULTS)
     uio = uio_devices_from_cfg(cfg)
-    inst = [uio.get(k, "-") for k in ("VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolingKernel")]
+    inst = [uio.get(k, "-") for k in ("VectorOPKernel", "MatmulKernel", "ConvKernel", "PoolingKernel",
+                                       "RowOpsKernel")]
     hold_board_lock(cfg)                  # one job per board (src/remote/lock.py)
     session = RemoteSession(cfg["ssh"])
     session.connect()
@@ -599,7 +640,7 @@ def cmd_run(args) -> int:
             return 1
         out, _, _ = session.exec(f"ls {build_dir}/calib_runner", timeout=10)
         if "calib_runner" not in out:
-            log("error: calib_runner was not built (all four kernels' drivers are needed)")
+            log("error: calib_runner was not built (all five kernels' drivers are needed)")
             return 1
         _drop_caches(session)
         rng = np.random.default_rng(7)
@@ -864,14 +905,89 @@ def cmd_simulate(args) -> int:
 # main
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ------------------------------------------------------------------ rowops: the replay with a row-ops unit
+# The host op kinds a row-ops unit would run (doc/plans/HOSTOPS_PLAN.md §2) and
+# its price: one 128-bit PS port at 250 MHz at 85 % (3.4 GB/s per direction),
+# plus the issue / completion latency of a kernel call.
+ROWOPS_KINDS = frozenset((
+    "LayerNormNode", "LlmRMSNormNode", "VitLayerNormNode", "TtsResNormNode",
+    "LlmSiluMulNode", "LlmResAddNode", "VitResAddNode", "VitGeluNode", "LlmDequantNode",
+    "LlmAttnPrepNode", "VitAttnPrepNode", "LlmAttnMergeNode", "TtsAttnMergeNode",
+    "TtsRowPrepNode", "TtsAttnRelAddNode", "TtsSumNode", "TtsGateNode",
+    "TransposeNode", "ConcatNode", "SliceNode"))
+ROWOPS_RATE = 3.4e9
+ROWOPS_CALL_US = 2.5
+
+
+def rowops_bytes(sn) -> int:
+    """max(bytes read, bytes written) of a host op: the inputs (not weights, not
+    the DMA states a prefill only appends rows to) and the output, 4 bytes per
+    float32 / int32 host element, 2 otherwise."""
+    def nb(t):
+        return t.numel * (4 if getattr(t, "host", None) in ("f32", "i32") else 2)
+    ins = sum(nb(t) for t in sn.inputs
+              if not getattr(t, "is_weight", False) and not getattr(t, "is_state", False))
+    outs = getattr(sn, "outputs", None) or [sn.output]
+    return max(ins, sum(nb(t) for t in outs if t is not None))
+
+
+def rowops_us(sn) -> float:
+    return rowops_bytes(sn) / ROWOPS_RATE * 1e6 + ROWOPS_CALL_US
+
+
+def cmd_rowops(args) -> int:
+    """Every shipped entry replayed twice: the host ops at the host model, and
+    the ROWOPS_KINDS at the unit's price (HOSTOPS_PLAN §3's table)."""
+    from src.codegen import CodeGenerator
+    from src.codegen.timing import kernel_duration_fn, simulate
+    from src.host_model import HostModel, default_host_model_path
+    from src.llm_nodes import attn_keys
+    from src.perf_model import PerfModel
+    pm = PerfModel.load(MODELS_DIR / f"{default_id(args)}.json")
+    hm = HostModel.load(Path(args.host_model) if args.host_model else default_host_model_path())
+    print(f"{'model':24s} {'entry':12s} {'today':>9s} {'with unit':>10s} {'gain':>8s}  "
+          f"{'host ops today':>14s} {'on the unit':>11s}  calls")
+    for model in args.models or SHIPPED:
+        graphs = _entry_graphs(model, False)
+        for entry, g in sorted(graphs.items()):
+            cg = CodeGenerator(g, model_path=f"{entry}.onnx")
+            if model.startswith(("smollm2-", "smolvlm-")) and (entry.startswith("prefill") or entry == "decode"):
+                n = int(entry.split("_")[1]) if entry.startswith("prefill") else 1
+
+                def keys_of(sn, n=n):
+                    return attn_keys(1, n, sn.T, sn.C, sn.Q)[1]
+                kfn = kernel_duration_fn(pm, cg._layouts, keys_of=keys_of)
+            else:
+                kfn = kernel_duration_fn(pm, cg._layouts)
+            moved = {"calls": 0, "host": 0.0, "unit": 0.0}
+
+            def host_unit(sn, moved=moved):
+                h = hm.us(sn)
+                if type(sn).__name__ in ROWOPS_KINDS:
+                    u = rowops_us(sn)
+                    moved["calls"] += 1
+                    moved["host"] += h or 0.0
+                    moved["unit"] += u
+                    return u
+                return h
+            base = simulate(cg, kfn, hm.us)
+            new = simulate(cg, kfn, host_unit)
+            print(f"{model:24s} {entry:12s} {base.total_us / 1e3:8.1f}ms {new.total_us / 1e3:9.1f}ms "
+                  f"{(new.total_us / base.total_us - 1) * 100:+7.1f}%  {moved['host'] / 1e3:12.1f}ms "
+                  f"{moved['unit'] / 1e3:9.1f}ms  {moved['calls']}"
+                  + (f"  ({len(base.unpriced)} unpriced)" if base.unpriced else ""))
+            sys.stdout.flush()
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=("cases", "run", "fit", "all", "host", "simulate"))
+    ap.add_argument("cmd", choices=("cases", "run", "fit", "all", "host", "simulate", "rowops"))
     ap.add_argument("--bitstream-id", default=None,
                     help="default: the id of the bitstream in bitstream_config_kv260.json")
     ap.add_argument("--models", nargs="+", default=None, choices=SHIPPED,
-                    help="cases: the shipped models (default: all)")
+                    help="cases / rowops: the shipped models (default: all)")
     ap.add_argument("--seed", type=int, default=2026, help="cases: the space-filling set's seed")
     ap.add_argument("--refine", action="store_true",
                     help="cases: add the unmeasured tactics the fitted model ranks near each "
@@ -904,6 +1020,8 @@ def main(argv=None) -> int:
         return cmd_host(args)
     if args.cmd == "simulate":
         return cmd_simulate(args)
+    if args.cmd == "rowops":
+        return cmd_rowops(args)
     if args.cmd in ("cases", "all") and cmd_cases(args):
         return 1
     if args.cmd in ("run", "all"):

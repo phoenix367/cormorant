@@ -18,11 +18,26 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/f70ce632a97a` is the production design (2026-10-10, DEPTHWISE_PLAN §8: `8599aa7a5f12`'s
+`kv260/1cedaf2ed816` is the production design (2026-10-12, HOSTOPS_PLAN phase 3: `f70ce632a97a`'s
+with the RowOpsKernel — the row-ops unit — on `S_AXI_HP0_FPD`): a fresh campaign — `cases` 1530
+(ConvKernel grid 374 + shipped 521, the MatmulKernel and VectorOP cases, and the unit's 37 shipped
+calls: the `rowops` family, `RowOpsKernel` in `FIELDS`), two passes of about 2 min (the bench
+project's `calib_runner` now needs the five kernels' drivers), three refinement rounds (+209,
++100, +99) → 1938 exact calls; the phase-4a top-up of the same day (HOSTOPS_PLAN §10: the prefill
+attention prep's ROPE / TRANSPOSE / COPY jobs on the unit — +90 shipped calls, then three refinement
+rounds +184, +24, +8) → **2073 exact calls**, repeat spread median 0.065 %.  Families (train / held-out p90):
+conv 3.0 / 26.5 %, conv-dw 1.8 / 15.3 %, conv-mm 2.8 / 43.5 %, mm-gemv 4.8 / 18.7 %, mm-tiled 1.5 /
+6.4 %, pool 3.5 / 42.5 %, vecop 0.6 / 20.3 %, vecop-div 0.8 / 7.7 %, vecop-smx (55 calls) and
+rowops (79 calls after the top-up, train median 7.8 %, no held-out) — the planner relies on the exact entries.
+The unit's calls measure what the Verilator cycle counts predicted (LN 256 × 768 206 µs, ADDX
+256 × 576 234 µs, MULACT 256 × 1536 418 µs; the shipped libraries were regenerated with the
+unit, so their calls are the ones listed).
+
+`kv260/f70ce632a97a` was the production design before (2026-10-10, DEPTHWISE_PLAN §8: `8599aa7a5f12`'s
 with ConvKernel's x read port on `S_AXI_HP2_FPD`, past the CCI, and its line-buffer loads
 overlapped with the window reads): a fresh campaign — `cases` 1490 (ConvKernel grid 371 + shipped
 521, the MatmulKernel and VectorOP cases), two passes of 59 s, three refinement rounds (+211, +99,
-+37; the fourth would add a few more) → **1837 exact calls**, repeat spread median 0.066 %.  Families (train / held-out p90): conv 2.9 /
++37; the fourth would add a few more) → 1837 exact calls, repeat spread median 0.066 %.  Families (train / held-out p90): conv 2.9 /
 26.7 %, conv-dw 2.0 / 15.3 %, conv-mm 3.2 / 34.9 %, mm-gemv 4.8 / 18.5 %, mm-tiled 1.5 / 7.2 %,
 pool 3.4 / 42.5 %, vecop 0.4 / 14.1 %, vecop-div 0.8 / 7.7 %, vecop-smx (new, 55 calls) — every
 family above the planner's 5 % trust, so the planner relies on the exact entries.  Against

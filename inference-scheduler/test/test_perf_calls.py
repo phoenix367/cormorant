@@ -38,6 +38,9 @@ _FN = {
     # the softmax unit (a, a_off, c, c_off, ...); its scale / mask registers are no keys
     "run_softmax":   ("VectorOPKernel", 4, ("size", "op", "outer", "a_inc", "b_inc", "_cm", "_cfg",
                                             "_mask")),
+    # the row-ops unit (a, a_off, b, b_off, c, c_off, p, ...); eps / bq_sh are no keys
+    "run_rowops":    ("RowOpsKernel", 7, ("op", "n", "rows", "blocks", "a_s1", "a_s2", "b_s1", "b_s2",
+                                          "c_s1", "c_s2", "_eps", "aux", "_bq_sh", "win_lo", "win_hi")),
 }
 _CALL = re.compile(r"\b(" + "|".join(sorted(_FN, key=len, reverse=True)) + r")\(")
 _LOOP = re.compile(r"for \(unsigned _i = 0u; _i < (\d+)u; _i\+\+\)")
@@ -78,7 +81,7 @@ class _Eval:
         self.names.update({v: k for k, v in ACT_NAMES.items()})
 
     def __call__(self, expr, env=None):
-        py = re.sub(r"\b(0x[0-9A-Fa-f]+|\d+)u\b", r"\1", expr).replace("/", "//")
+        py = re.sub(r"\b(0x[0-9A-Fa-f]+|\d+)u(?:ll)?\b", r"\1", expr).replace("/", "//")
         py = re.sub(r"\(unsigned\)", "", py)
 
         def align_up(n):
@@ -108,6 +111,19 @@ def emitted_calls(snippet, ev, env=None):
         regs = {k: v for k, v in zip(order, vals, strict=True) if not k.startswith("_")}
         calls.append(KernelCall.of(kernel, count=count, **regs))
     return merge(calls)
+
+
+def node_emitted_calls(sn, cg, ev):
+    """The calls of a node's emit_call() text at the priced geometry: the
+    runtime names it uses (``calls_env``: the FPGA attention's ``_keys``, the
+    unit prep's ``_pos`` / ``_n``) plus the calls its C helpers issue
+    (``hidden_calls``)."""
+    env = {"_keys": sn.C} if hasattr(sn, "static") and not sn.static else None
+    if getattr(sn, "calls_env", None):
+        env = {**(env or {}), **sn.calls_env}
+    calls = emitted_calls(sn.emit_call(cg._layouts), ev, env)
+    hidden = getattr(sn, "hidden_calls", None)
+    return merge(calls + hidden(cg._layouts)) if hidden else calls
 
 
 def kernel_nodes(g):
@@ -167,8 +183,7 @@ class TestEmittedCalls(unittest.TestCase):
         n = 0
         for sn in kernel_nodes(g):
             got = merge(sn.kernel_calls(cg._layouts))
-            env = {"_keys": sn.C} if hasattr(sn, "static") and not sn.static else None
-            want = emitted_calls(sn.emit_call(cg._layouts), ev, env)
+            want = node_emitted_calls(sn, cg, ev)
             self.assertEqual(got, want, f"{label}: node {sn.index} {type(sn).__name__}")
             n += 1
         return n

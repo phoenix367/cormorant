@@ -76,7 +76,7 @@ class SmolvlmBackend(Smollm2Backend):
     model_id = MODEL_ID
     fingerprint = "kv260-smolvlm-256m-pow2+sink+p12"
     accepts_images = True
-    cma_mb = 520.0                      # fallback; the 495 MiB pool BO + the image buffer
+    cma_mb = 520.0                      # fallback; the 506 MiB pool BO + the image buffer
 
     def __init__(self, engine, tokenizer_path: str, *, image_cache: Optional[ImageCache] = None,
                  max_images: int = 8, **kw):

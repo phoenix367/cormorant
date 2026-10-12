@@ -1,10 +1,13 @@
 # CLAUDE.md — inference-scheduler
 
 Python code-generator that parses an ONNX model and emits a complete C project
-that runs inference on the Xilinx KV260 FPGA using up to four hardware kernels:
+that runs inference on the Xilinx KV260 FPGA using up to five hardware kernels:
 VectorOPKernel (element-wise), MatmulKernel (matmul/FC), ConvKernel (2-D conv,
-incl. depthwise, and MatMuls lowered with swapped operand roles), and
-PoolingKernel (2-D pooling). Ops no kernel implements (Softmax, LayerNorm,
+incl. depthwise, and MatMuls lowered with swapped operand roles),
+PoolingKernel (2-D pooling) and, where the platform has it, RowOpsKernel (the
+row-ops unit: LayerNorm and the frontends' residual adds, RMSNorms, SiLU·up on
+int16 / int32 DMA rows — `src/rowops_nodes.py`, `../doc/plans/HOSTOPS_PLAN.md`).
+Ops no kernel implements (Softmax, LayerNorm,
 Gelu, Transpose, Slice / Split copies, Concat, Resize, Gather, OneHot, Cast,
 SpaceToDepth and the `axi.llm` Llama decoder, vision-encoder, text-to-speech
 and stereo depth ops) run as host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
@@ -243,8 +246,15 @@ src/
   llm_entries.py         Llama entry graphs: prefill kernel widths shared with the
                          GEMV decode, one copy of every weight
   cost_model.py          ConvKernel / MatmulKernel (tiled + GEMV) cycle estimates
-  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py
-                         platform JSON resolvers (kernels.{conv,matmul,pool})
+  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py, _rowops_hw_config.py
+                         platform JSON resolvers (kernels.{conv,matmul,pool,rowops})
+  rowops_spec.py         the row-ops unit's integer specification (rne / sat16, rsqrt and sigmoid
+                         tables, layer_norm / rms_norm / silu_mul / rope, the register constants,
+                         the parameter block and the 64 KiB table image)
+  rowops_nodes.py        its kernel nodes (LayerNormRoNode; ResAdd / RMSNorm / SiluMul and the prefill
+                         AttnPrep — RoPE, the q image, the KV caches — for Llama, ResAddBias /
+                         LayerNorm32 for the vision and TTS encoders) + the factories graph.py merges
+                         over the host ops when the platform has the unit
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
                          edges); topological order, predecessors/successors,
@@ -280,7 +290,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              81 pytest modules, 1754 tests, all pass (test_bert_base.py
+  test_*.py              83 pytest modules, 1791 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -297,6 +307,8 @@ test/
                          buckets, host_emu; the C duration predictor == its spec),
                          test_stereo_nodes.py / test_stereo.py (the stereo ops, the
                          LightStereo frontend on host_emu),
+                         test_rowops_spec.py / test_rowops_unit.py (the row-ops unit's
+                         specification; its nodes, the Llama / ViT / Piper graphs on it, host_emu),
                          test_bert_base.py (BERT-base on the real model),
                          test_fetch_assets.py (the BERT demo's downloader, local server)
 ```
@@ -709,7 +721,7 @@ Four scripts drive KV260 hardware over SSH:
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (159 models) |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (63 cases) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (72 cases) |
 | `perf_calibrate.py run` | **Calibration** for `--plan` — times batches of kernel calls with `bench_src/calib_runner.c` (two passes), then `fit` writes `perf_models/<platform>/<bitstream-id>.json` (`../doc/plans/TACTICS_PLAN.md` §4.3) | `--config` in the `run_remote_perf.py` format |
 
 All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for

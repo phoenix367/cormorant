@@ -1,13 +1,13 @@
 /* calib_runner.c — batch timing of kernel calls for the performance models
  * (inference-scheduler/perf_calibrate.py, doc/plans/TACTICS_PLAN.md §4.3).
  *
- * usage: calib_runner CASES VOP_INST MM_INST CONV_INST POOL_INST [FILL]
+ * usage: calib_runner CASES VOP_INST MM_INST CONV_INST POOL_INST ROWOPS_INST [FILL]
  *
  * CASES: one case per line,
  *     id kernel iters warmup nbuf n_0 .. n_{nbuf-1} r_0 r_1 ...
- * kernel = V (VectorOPKernel), M (MatmulKernel), C (ConvKernel), P (PoolingKernel);
- * n_i = element counts of the call's buffers (sized by the host:
- * V a b c, M a b c, C x w bias y, P x y); r_i = the register values in the
+ * kernel = V (VectorOPKernel), M (MatmulKernel), C (ConvKernel), P (PoolingKernel),
+ * R (RowOpsKernel); n_i = element counts of the call's buffers (sized by the host:
+ * V a b c, M a b c, C x w bias y, P x y, R a b c p); r_i = the register values in the
  * order of src/perf_calls.py FIELDS.  A kernel whose instance is "-" is not
  * opened.  FILL (default 1) is the byte every buffer is filled with — a
  * second pass with another one checks that the timing does not depend on
@@ -29,6 +29,7 @@
 #include "xconvkernel.h"
 #include "xmatmulkernel.h"
 #include "xpoolingkernel.h"
+#include "xrowopskernel.h"
 #include "xvectoropkernel.h"
 
 #define MAX_BUF  4
@@ -46,7 +47,8 @@ static XVectoropkernel s_v;
 static XMatmulkernel   s_m;
 static XConvkernel     s_c;
 static XPoolingkernel  s_p;
-static int s_open[4];
+static XRowopskernel   s_r;
+static int s_open[5];
 
 typedef struct {
     char     kernel;
@@ -143,6 +145,28 @@ static void start(const call_t *c)
         XPoolingkernel_Set_count_include_pad(&s_p, r[16]);
         XPoolingkernel_Start(&s_p);
         break;
+    case 'R':   /* op n rows blocks a_s1 a_s2 b_s1 b_s2 c_s1 c_s2 aux win_lo win_hi (eps, bq_sh 0) */
+        XRowopskernel_Set_op(&s_r, r[0]);
+        XRowopskernel_Set_n(&s_r, r[1]);
+        XRowopskernel_Set_rows(&s_r, r[2]);
+        XRowopskernel_Set_blocks(&s_r, r[3]);
+        XRowopskernel_Set_a(&s_r, c->addr[0]);
+        XRowopskernel_Set_a_s1(&s_r, r[4]);
+        XRowopskernel_Set_a_s2(&s_r, r[5]);
+        XRowopskernel_Set_b(&s_r, c->addr[1]);
+        XRowopskernel_Set_b_s1(&s_r, r[6]);
+        XRowopskernel_Set_b_s2(&s_r, r[7]);
+        XRowopskernel_Set_c(&s_r, c->addr[2]);
+        XRowopskernel_Set_c_s1(&s_r, r[8]);
+        XRowopskernel_Set_c_s2(&s_r, r[9]);
+        XRowopskernel_Set_p(&s_r, c->addr[3]);
+        XRowopskernel_Set_eps(&s_r, 0u);
+        XRowopskernel_Set_aux(&s_r, r[10]);
+        XRowopskernel_Set_bq_sh(&s_r, 0u);
+        XRowopskernel_Set_win_lo(&s_r, r[11]);
+        XRowopskernel_Set_win_hi(&s_r, r[12]);
+        XRowopskernel_Start(&s_r);
+        break;
     }
 }
 
@@ -152,6 +176,7 @@ static int done(char k)
     case 'V': return (int)XVectoropkernel_IsDone(&s_v);
     case 'M': return (int)XMatmulkernel_IsDone(&s_m);
     case 'C': return (int)XConvkernel_IsDone(&s_c);
+    case 'R': return (int)XRowopskernel_IsDone(&s_r);
     default:  return (int)XPoolingkernel_IsDone(&s_p);
     }
 }
@@ -167,9 +192,9 @@ static double call(const call_t *c)
     return now_us() - t0;
 }
 
-static int kidx(char k) { return k == 'V' ? 0 : k == 'M' ? 1 : k == 'C' ? 2 : k == 'P' ? 3 : -1; }
+static int kidx(char k) { return k == 'V' ? 0 : k == 'M' ? 1 : k == 'C' ? 2 : k == 'P' ? 3 : k == 'R' ? 4 : -1; }
 
-static int open_kernel(char k, char *const inst[4])
+static int open_kernel(char k, char *const inst[5])
 {
     const int i = kidx(k);
     int rc = -1;
@@ -180,6 +205,7 @@ static int open_kernel(char k, char *const inst[4])
     case 'M': rc = XMatmulkernel_Initialize(&s_m, inst[1]); break;
     case 'C': rc = XConvkernel_Initialize(&s_c, inst[2]); break;
     case 'P': rc = XPoolingkernel_Initialize(&s_p, inst[3]); break;
+    case 'R': rc = XRowopskernel_Initialize(&s_r, inst[4]); break;
     }
     if (rc == 0) s_open[i] = 1;
     return rc == 0 ? 0 : -1;
@@ -190,11 +216,11 @@ int main(int argc, char **argv)
     char  line[4096];
     FILE *f;
     int   fill;
-    if (argc < 6) {
-        fprintf(stderr, "usage: %s CASES VOP_INST MM_INST CONV_INST POOL_INST [FILL]\n", argv[0]);
+    if (argc < 7) {
+        fprintf(stderr, "usage: %s CASES VOP_INST MM_INST CONV_INST POOL_INST ROWOPS_INST [FILL]\n", argv[0]);
         return 1;
     }
-    fill = argc > 6 ? (int)strtol(argv[6], NULL, 0) & 0xff : 1;
+    fill = argc > 7 ? (int)strtol(argv[7], NULL, 0) & 0xff : 1;
     if (!(f = fopen(argv[1], "r"))) {
         perror(argv[1]);
         return 1;

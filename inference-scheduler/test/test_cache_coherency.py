@@ -50,7 +50,7 @@ import numpy as np
 from onnx import TensorProto
 
 import gen_bert_models as gbm
-from src import _vectorop_hw_config
+from src import _rowops_hw_config, _vectorop_hw_config
 from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import HostNode
@@ -72,6 +72,11 @@ _KERNEL_CALLS = {
     "run_pool":      ("KERNEL_POOL",     (0,), (1,), False),
     # the softmax unit (a, a_off, c, c_off, ...; src/smx_nodes.py)
     "run_softmax":   ("KERNEL_VECTOROP", (0,), (2,), False),
+    # the row-ops unit (a, a_off, b, b_off, c, c_off, p, ...; src/rowops_nodes.py)
+    "run_rowops":    ("KERNEL_ROWOPS",   (0, 2, 6), (4,), False),
+    # the unit's V-image helper (src, stride, cache, ...; rowops_nodes.ATTN_PREP_C): its
+    # jobs wait for each other, the last is left in flight
+    "llm_ro_vimage": ("KERNEL_ROWOPS",   (0,), (2,), False),
 }
 
 _TOKEN = re.compile(
@@ -82,8 +87,9 @@ _TOKEN = re.compile(
     # previous call — a no-op when nothing of that lane is in flight yet.
     r"|if\s*\(\s*_i\s*\)\s*kernel_wait\((?P<cwait>KERNEL_\w+)\)"
     r"|kernel_wait\((?P<wait>KERNEL_\w+)\)"
-    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool|softmax))\((?P<args>[^;]*)\);"
-    r"|\bllm_cache_flush\(\s*(?P<sflush>\w+)\s*,"
+    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool|softmax|rowops)|llm_ro_vimage)"
+    r"\((?P<args>[^;]*)\);"
+    r"|\bllm_cache_flush(?:_rows)?\(\s*(?P<sflush>\w+)\s*,"
     r"|INFERENCE_PROF_BEGIN\((?P<begin>\d+)u\)"
     r"|INFERENCE_PROF_END\((?P<end>\d+)u\)"
     r"|\bhost_in\(\s*(?P<hin>\w+)\s*,"
@@ -164,6 +170,13 @@ class CoherencyChecker:
         self.outputs = [t.c_name for t in g.output_tensors]
         self.cpu_nodes = {sn.index for sn in g.nodes
                           if isinstance(sn, (HostNode, SpaceToDepthNode))}
+        # A project whose prefill prep runs on the row-ops unit (a port that does
+        # not snoop the CPU caches) keeps every DMA state clean between runs: its
+        # CPU writers flush (src/llama.py: rowops needs decode_attn "fpga"), so the
+        # states start clean and must end clean (HOSTOPS_PLAN §10.5).  Elsewhere a
+        # host op may leave cache rows dirty for a later prefill's flush.
+        from src.rowops_nodes import AttnPrepRoNode
+        self.states_clean = any(isinstance(sn, AttnPrepRoNode) for sn in g.nodes)
 
     # --- buffer relations ------------------------------------------------ #
     def _root(self, b):
@@ -186,7 +199,8 @@ class CoherencyChecker:
         in_flight = {}          # lane -> (reads, writes)
         for b in self.inputs + self.outputs:
             dirty.add(self.ptr[b])          # the caller wrote them (fill / memset)
-        dirty.update(self.states)           # another entry / call may have written rows
+        if not self.states_clean:
+            dirty.update(self.states)       # another entry / call may have written rows
         cur_node = None
 
         def buf(name):
@@ -309,6 +323,11 @@ class CoherencyChecker:
             b = buf(o)
             if b in stale or self._root(b) in stale:
                 errors.append(f"end: output '{o}' not invalidated after its kernel wrote it")
+        if self.states_clean:
+            for b in self.states:           # the next run (any entry) may hand it to the unit
+                if b in dirty:
+                    errors.append(f"end: DMA state '{b}' left CPU-dirty (no flush after a host op "
+                                  f"wrote it)")
         return errors
 
 
@@ -356,8 +375,9 @@ class TestMixedModel(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
-        # the Softmax as the host op (the hand-offs around host ops are the point)
-        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False):
+        # the Softmax and the LayerNorm as host ops (the hand-offs around host ops are the point)
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False), \
+                mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", False):
             cls.cg = _gen(_mixed_model(os.path.join(cls._tmp.name, "mixed.onnx")))
         cls.src = cls.cg.generate_source()
 

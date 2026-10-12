@@ -21,7 +21,8 @@
       "VectorOPKernel": "fabric_vecop",
       "MatmulKernel":   "fabric_matmul",
       "ConvKernel":     "fabric_conv",
-      "PoolKernel":     "fabric_pool"
+      "PoolKernel":     "fabric_pool",
+      "RowOpsKernel":     "fabric_rowops"
     },
     "_uio_devices_note": "DT node labels from the loaded overlay. Verify on the board with: cat /sys/class/uio/uio*/name",
 
@@ -33,7 +34,8 @@
       "VectorOPKernel": "../../build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src",
       "MatmulKernel":   "../../build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src",
       "ConvKernel":     "../../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src",
-      "PoolKernel":     "../../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src"
+      "PoolKernel":     "../../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src",
+      "RowOpsKernel":     "../../build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src"
     },
     "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; VectorOPKernel's and MatmulKernel's from make driver_vectorop_rtl / driver_matmul_rtl), copied into each project before upload."
   },

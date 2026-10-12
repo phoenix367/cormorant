@@ -54,6 +54,7 @@ _KERNEL_INIT_MACRO = {
     "MatmulKernel":   "INFERENCE_MATMULKERNEL_INSTANCE",
     "ConvKernel":     "INFERENCE_CONVKERNEL_INSTANCE",
     "PoolKernel":     "INFERENCE_POOLKERNEL_INSTANCE",
+    "RowOpsKernel":   "INFERENCE_ROWOPSKERNEL_INSTANCE",
 }
 
 _BOARD_FILES = ["camera_loop.py", "preprocessing.py", "visualization.py",

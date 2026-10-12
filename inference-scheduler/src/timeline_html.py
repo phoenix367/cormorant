@@ -42,9 +42,9 @@ from typing import Dict, Iterable, List, Optional
 
 from .codegen.timing import kernel_duration_fn, simulate
 
-LANE_ORDER = ("CPU", "KERNEL_CONV", "KERNEL_MATMUL", "KERNEL_VECTOROP", "KERNEL_POOL")
+LANE_ORDER = ("CPU", "KERNEL_CONV", "KERNEL_MATMUL", "KERNEL_VECTOROP", "KERNEL_POOL", "KERNEL_ROWOPS")
 LANE_LABELS = {"CPU": "CPU (A53)", "KERNEL_CONV": "ConvKernel", "KERNEL_MATMUL": "MatmulKernel",
-               "KERNEL_VECTOROP": "VectorOPKernel", "KERNEL_POOL": "PoolingKernel"}
+               "KERNEL_VECTOROP": "VectorOPKernel", "KERNEL_POOL": "PoolingKernel", "KERNEL_ROWOPS": "RowOpsKernel"}
 KINDS = ("kernel", "host", "issue", "wait", "sync")
 
 

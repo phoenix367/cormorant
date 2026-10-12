@@ -68,6 +68,7 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `kernels.matmul` | yes | — | MatmulKernel compile-time bounds — [§MatmulKernel](#kernelsmatmul) |
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
 | `kernels.vectorop` | yes | — | VectorOPKernel capabilities — [§VectorOPKernel](#kernelsvectorop) |
+| `kernels.rowops` | yes | — | the row-ops unit's presence — [§RowOpsKernel](#kernelsrowops) |
 
 VectorOPKernel has no compile-time bounds: it is a runtime-sized,
 element-wise kernel (its SystemVerilog IP reads only `part`, for packaging
@@ -193,6 +194,14 @@ Read by the scheduler only (`inference-scheduler/src/_vectorop_hw_config.py`).
 | `activations` | bool | The bitstream's VectorOPKernel has the activation unit ([ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)): LeakyReLU / SiLU / GELU as ops 6–9 and acts 3–6, the `alpha` register.  When true the scheduler maps ONNX `Gelu`, `LeakyRelu` and `x · Sigmoid(x)` onto the kernel; when false `Gelu` stays a host op and the other two are rejected (an older IP passes ops 6–9 through unchanged).  `AXI_VECTOROP_ACTIVATIONS=0` / `1` overrides it — `0` for a project on a bitstream built before the unit (`986cef4866a0` and older) |
 | `softmax` | bool | The bitstream's VectorOPKernel has the softmax unit ([SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)): ops 10 / 11 and the `smx_cm` / `smx_cfg` / `smx_mask` registers.  When true ONNX `Softmax` (Q8.8, rows ≤ 2048) runs on the kernel and the chat generators' `--vsmx auto` puts the prefill / vision attention softmax there (policies `…+vsmx`); when false they stay on the host.  `AXI_VECTOROP_SOFTMAX=0` / `1` overrides it — `0` for a project on a bitstream without the unit (`6436623029f7` and older) |
 
+### `kernels.rowops`
+
+Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `unit` | bool | The bitstream carries the row-ops unit, RowOpsKernel ([HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md), [ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)): the fifth kernel lane that runs the transformer's row ops in fixed point.  When true the scheduler puts ONNX / fused `LayerNormalization` (Q8.8, rows ≤ 4096) and the chat frontends' row ops there (`src/rowops_nodes.py`); when false they stay on the host.  `AXI_ROWOPS=0` / `1` overrides it — `1` to generate for a bitstream with the unit before this file says so |
+
 ---
 
 ## Example — kv260.json
@@ -221,6 +230,9 @@ Read by the scheduler only (`inference-scheduler/src/_vectorop_hw_config.py`).
     "vectorop": {
       "activations": true,
       "softmax": true
+    },
+    "rowops": {
+      "unit": true
     },
     "pool": {
       "tile_c":            8,

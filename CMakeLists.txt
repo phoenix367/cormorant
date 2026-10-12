@@ -66,6 +66,7 @@ add_subdirectory(kernels/matmul_rtl)
 add_subdirectory(kernels/vectorop_rtl)
 add_subdirectory(kernels/pool_rtl)
 add_subdirectory(kernels/conv_rtl)
+add_subdirectory(kernels/rowops_rtl)
 
 # The hardware build's VectorOPKernel is the SystemVerilog one
 # (kernels/vectorop_rtl; VLNV xilinx.com:hls:VectorOPKernel:1.0, the HLS
@@ -165,6 +166,9 @@ endif()
 if(TARGET TestConvRtl)
     list(APPEND _AXI_TEST_TARGETS TestConvRtl)
 endif()
+if(TARGET TestRowOpsRtl)
+    list(APPEND _AXI_TEST_TARGETS TestRowOpsRtl)
+endif()
 if(TARGET conv_rtl_dsp_check)
     list(APPEND _AXI_TEST_TARGETS conv_rtl_dsp_check)
 endif()
@@ -202,7 +206,8 @@ foreach(_PF IN LISTS AXI_PLATFORM_FILES)
             package_conv_rtl
             package_matmul_rtl
             package_pool_rtl
-        COMMENT "IP export: all four kernels' IPs for platform '${_pname}' (SystemVerilog, Vivado)"
+            package_rowops_rtl
+        COMMENT "IP export: the five kernels' IPs for platform '${_pname}' (SystemVerilog, Vivado)"
     )
     message(STATUS "axi_kernels: aggregate target 'synthesize_${_pname}'")
 
@@ -271,8 +276,11 @@ if(EXISTS "${_HW_REPO}/build.sh")
                 "${CMAKE_BINARY_DIR}/rtl_ip/PoolingKernel_ip" "${_HW_IP_REPO}/pool"
         COMMAND "${CMAKE_COMMAND}" -E create_symlink
                 "${CMAKE_BINARY_DIR}/rtl_ip/MatmulKernel_ip" "${_HW_IP_REPO}/matmul"
+        COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                "${CMAKE_BINARY_DIR}/rtl_ip/RowOpsKernel_ip" "${_HW_IP_REPO}/rowops"
         DEPENDS package_matmul_rtl package_vectorop_rtl package_pool_rtl package_conv_rtl
-        COMMENT "IP repository for the KV260 build: the four RTL kernels"
+                package_rowops_rtl
+        COMMENT "IP repository for the KV260 build: the five RTL kernels"
         VERBATIM)
 
     add_custom_target(build_hw_kv260

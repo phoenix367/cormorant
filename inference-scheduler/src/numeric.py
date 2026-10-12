@@ -68,8 +68,11 @@ class NumericError(SchedulerError):
     pass
 
 
+DMA_KINDS = ("i32",)
+
+
 def empty() -> dict:
-    return {"exp": {}, "chexp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}}
+    return {"exp": {}, "chexp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}, "dma": {}}
 
 
 def parse(model) -> dict:
@@ -97,7 +100,7 @@ def to_metadata(meta: dict) -> str:
 
 
 def is_active(meta: dict) -> bool:
-    return any(meta[k] for k in ("exp", "chexp", "host", "state"))
+    return any(meta.get(k) for k in ("exp", "chexp", "host", "state", "dma"))
 
 
 def apply(tensors: dict, meta: dict, dtype) -> None:
@@ -112,6 +115,13 @@ def apply(tensors: dict, meta: dict, dtype) -> None:
         if kind not in HOST_KINDS:
             raise NumericError(f"host tensor '{name}': kind {kind!r} not in {HOST_KINDS}")
         t.host = kind
+    for name, kind in meta.get("dma", {}).items():
+        t = _get(tensors, name, "dma")
+        if kind not in DMA_KINDS:
+            raise NumericError(f"dma tensor '{name}': kind {kind!r} not in {DMA_KINDS}")
+        if t.host is not None:
+            raise NumericError(f"tensor '{name}': both a host and a dma kind")
+        t.dma = kind
     for name, e in meta["exp"].items():
         t = _get(tensors, name, "exp")
         if t.host in ("f32", "i32"):
@@ -167,7 +177,7 @@ def _get(tensors, name, what):
 
 def has_numeric(t) -> bool:
     return (t.exp is not None or t.chexp is not None or t.host is not None or t.is_state
-            or t.wexp is not None)
+            or t.wexp is not None or t.dma is not None)
 
 
 _ENCODE_BLOCK = 1 << 20          # weight elements per block of encode_matmul_weights
@@ -345,6 +355,6 @@ def check(nodes, dtype) -> None:
                                f"supported on MatMul and the LLM host ops")
 
 
-__all__ = ("METADATA_KEY", "HOST_KINDS", "NumericError", "empty", "parse", "to_metadata",
+__all__ = ("METADATA_KEY", "HOST_KINDS", "DMA_KINDS", "NumericError", "empty", "parse", "to_metadata",
            "is_active", "apply", "has_numeric", "encode_matmul_weights", "encode_conv_weights",
            "check")

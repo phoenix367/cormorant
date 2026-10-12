@@ -135,16 +135,18 @@ GEMV_JOB_OVERHEAD    = 200
 # Host-side cost of one kernel call on the board (AXI-Lite register writes
 # through the UIO mapping, Start, the IsDone poll loop), in kernel cycles:
 # the cheapest call of the calibration campaign (a 10-element VectorOP Add,
-# 1.77 us at 250 MHz on f70ce632a97a; the kernels' fixed costs ONE / one are
-# fitted net of it — the whole model was refitted to that campaign, DEPTHWISE_PLAN
+# 1.76 us at 250 MHz on 1cedaf2ed816; the kernels' fixed costs ONE / one are
+# fitted net of it — the whole model was refitted to the campaign of f70ce632a97a, DEPTHWISE_PLAN
 # §8.5: ConvKernel's x port off the CCI made its x-bound jobs 27-67 % faster,
 # so the x-path terms of RTL_CONV_BOARD and the floor 431 -> 443 moved together;
 # tools/fit_cost_model.py diff: the CNNs, BERT and Piper keep every engine
 # choice, the Llama prefill_16 MatMuls move from the GEMV to ConvKernel as the
-# performance model's measured entries say).  Charged per call to both engines, so it only matters
+# performance model's measured entries say; re-scored on 1cedaf2ed816, HOSTOPS_PLAN §9.2: the
+# constants kept, its plain refit would move those MatMuls back, 1.3 ms per prefill_16 worse;
+# the floor 443 -> 440 with ONE / one +3).  Charged per call to both engines, so it only matters
 # where the lowering issues several conv calls for one MatMul (batched
 # attention: one per head).
-CALL_OVERHEAD        = 443
+CALL_OVERHEAD        = 440
 
 
 def _conv_geom(in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw):
@@ -202,8 +204,9 @@ def _loader_row_cycles(ch, cols):
 # 8 weight runs in flight bound them too.  RTL_CONV_SIM is tuned to the
 # Verilator testbench (ideal memory) on the 1 042 ConvKernel calls of the
 # calibration case list — median error 0.65 %, p90 5.3 % —, RTL_CONV_BOARD to
-# the board's: bitstream f70ce632a97a at 250 MHz, 1 103 calls, median 2.9 %,
-# p90 18 % (ConvKernel's x port off the CCI, DEPTHWISE_PLAN §8.5; the set
+# the board's: fitted to bitstream f70ce632a97a, re-scored on 1cedaf2ed816
+# at 250 MHz, 1303 calls, median 2.8 %,
+# p90 20.3 % (ConvKernel's x port off the CCI, DEPTHWISE_PLAN §8.5; the set
 # fitted to 6436623029f7's board scored 35.8 / 77.6 % on it: its x-path terms
 # priced the old port), fitted by tools/fit_cost_model.py — before that, with
 # the shipped calls weighted 0.75 and a
@@ -221,7 +224,7 @@ RTL_CONV_SIM = {"CAP": 256, "XL": 0, "PL": 0, "FL": 0, "H": 2, "HAZ": 80, "HZW":
                 "LAT": 10, "ROW": 1, "ONE": 400, "XBEAT": 0.9, "XROW": 12, "RUN": 0,
                 "XLAT": 0, "WLAT": 0, "WBEAT": 1.0, "DPX": 1.1}
 RTL_CONV_BOARD = {"CAP": 383, "XL": 12, "PL": 43, "FL": 122, "H": 15, "HAZ": 0, "HZW": 138,
-                  "LAT": 111, "ROW": 1, "ONE": 11, "XBEAT": 0.66, "XROW": 36, "RUN": 1,
+                  "LAT": 111, "ROW": 1, "ONE": 14, "XBEAT": 0.66, "XROW": 36, "RUN": 1,
                   "XLAT": 0, "WLAT": 44, "WBEAT": 1.34, "DPX": 1.1}
 RTL_CONV_FEATURES = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
                      "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
@@ -488,14 +491,15 @@ RTL_DMIN   = 3      # minimum cycles per streamed B row (accumulator distance)
 RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 
 # Cycles per term (rtl_matmul_terms), fitted on the board by non-negative
-# least squares (tools/fit_cost_model.py; f70ce632a97a at 250 MHz, 414 calls:
-# median 4.7 %, p90 17.8 %; 6436623029f7's fit scored 4.5 / 17.7 % there,
+# least squares (tools/fit_cost_model.py; fitted to f70ce632a97a, re-scored
+# on 1cedaf2ed816 at 250 MHz, 414 calls:
+# median 4.7 %, p90 17.6 %; 6436623029f7's fit scored 4.5 / 17.7 % there,
 # leave-one-out 4.6 / 18.1 %; the 100 MHz set
 # fitted c2b2a6e5e50e to 0.36 / 1.7 % — at 250 MHz a DDR beat or request
 # costs more cycles: "steps" 2.97 -> 27.45, "runs" 0.325 -> 2.97); "one" is
 # the job's fixed cost without the host's call overhead (CALL_OVERHEAD).
 RTL_COEF = {"stream": 1.06, "drain": 0.5985, "aload": 0.4719,
-            "steps": 12.5, "runs": 3.065, "one": 79.84}
+            "steps": 12.5, "runs": 3.065, "one": 82.84}
 
 
 def _rtl_lane_planes(planes: int) -> int:

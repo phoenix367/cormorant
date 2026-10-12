@@ -88,7 +88,7 @@ static: the I/O names and active-kernel set differ per model.
 
   ```bash
   cat /sys/class/uio/uio*/name
-  # → fabric_vecop, fabric_matmul, fabric_conv, fabric_pool
+  # → fabric_vecop, fabric_matmul, fabric_conv, fabric_pool, fabric_rowops
   ```
 
 * `gcc`, `cmake ≥ 3.19`, `make`

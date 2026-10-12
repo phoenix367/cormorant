@@ -375,6 +375,10 @@ def main(argv=None) -> int:
                     help="the prefill (and a VLM's vision) softmax on VectorOPKernel's softmax "
                          "unit, policy ...+vsmx (doc/plans/SOFTMAX_PLAN.md); auto: where the "
                          "platform has the unit (kernels.vectorop.softmax)")
+    ap.add_argument("--rowops", choices=("auto", "on", "off"), default="auto",
+                    help="the residual stream as int32 and the residual adds / RMSNorms / SiLU * up "
+                         "on the row-ops unit, policy ...+rowops (doc/plans/HOSTOPS_PLAN.md); auto: "
+                         "where the platform has the unit (not for a VLM yet)")
     ap.add_argument("--model-name", default=None,
                     help="default: the --assets directory's name (it must match)")
     ap.add_argument("--allow-name-mismatch", action="store_true",
@@ -397,6 +401,7 @@ def main(argv=None) -> int:
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
+    rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
     vcfg = None
     if args.assets and vp.is_vlm(args.assets):
         if args.prefill_attn != "fpga":
@@ -404,7 +409,7 @@ def main(argv=None) -> int:
         m = vp.load(args.assets, args.formats, args.vision_formats, lazy=True)
         cfg, vcfg = m.tcfg, m.vcfg
         fe, fe_v = vp.frontends(m, ctx=args.context, name=args.model_name,
-                                decode_attn=args.decode_attn, vsmx=vsmx)
+                                decode_attn=args.decode_attn, vsmx=vsmx, rowops=rowops)
         formats_paths = m.formats_paths
         print(f"frontend: VLM, vision {vcfg.L} layers, hidden {vcfg.D}, {vcfg.N} patches -> "
               f"{vcfg.n_img} image tokens; text {cfg.L} layers, hidden {cfg.D}, heads "
@@ -415,12 +420,13 @@ def main(argv=None) -> int:
     else:
         cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats, lazy=True)
         fe = lp.frontend(cfg, W, fmt, ctx=args.context, name=args.model_name,
-                         prefill_attn=args.prefill_attn, decode_attn=args.decode_attn, vsmx=vsmx)
+                         prefill_attn=args.prefill_attn, decode_attn=args.decode_attn, vsmx=vsmx,
+                         rowops=rowops)
         formats_paths = (os.path.abspath(args.formats or lp.default_formats(args.assets)),)
         print(f"frontend: {cfg.L} layers, hidden {cfg.D}, heads {cfg.H}/{cfg.KV}, vocab {cfg.V}, "
               f"context {args.context}, buckets {buckets}, prefill on {args.prefill_engine}, "
               f"prefill attention {args.prefill_attn}, decode attention {args.decode_attn}, "
-              f"policy {lp.policy(args.prefill_attn, args.decode_attn, vsmx)}", flush=True)
+              f"policy {lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops)}", flush=True)
         models = lp.entry_models(fe, buckets)
         del W
     entries = build_entries(models, args.prefill_engine,
@@ -452,8 +458,8 @@ def main(argv=None) -> int:
     summary.update({
         "model": args.model_name, "context": args.context, "buckets": buckets,
         "prefill_engine": args.prefill_engine, "prefill_attn": args.prefill_attn,
-        "decode_attn": args.decode_attn, "vsmx": vsmx,
-        "policy": lp.policy(args.prefill_attn, args.decode_attn, vsmx),
+        "decode_attn": args.decode_attn, "vsmx": vsmx, "rowops": rowops,
+        "policy": lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops),
         "assets": os.path.abspath(args.assets or lp.default_assets()),
         "formats": [os.path.abspath(p) for p in formats_paths] if vcfg else formats_paths[0],
         "config": {"layers": cfg.L, "hidden": cfg.D, "heads": cfg.H, "kv_heads": cfg.KV,

@@ -54,20 +54,28 @@ def vsmx_default() -> bool:
     return enabled()
 
 
+def rowops_default() -> bool:
+    """The residual stream as int32 and the residual adds / RMSNorms / SiLU * up on
+    the row-ops unit (doc/plans/HOSTOPS_PLAN.md, policy ...+rowops) where the
+    platform has the unit."""
+    from src.rowops_nodes import enabled
+    return enabled()
+
+
 def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
-           vsmx: Optional[bool] = None) -> str:
-    """The study policy a project of these attention modes computes (``vsmx``
-    None: vsmx_default())."""
+           vsmx: Optional[bool] = None, rowops: Optional[bool] = None) -> str:
+    """The study policy a project of these attention modes computes (``vsmx`` /
+    ``rowops`` None: vsmx_default() / rowops_default())."""
     if (prefill_attn, decode_attn) not in ATTN_POLICIES:
         raise ValueError(f"no policy for prefill attention {prefill_attn!r} with decode "
                          f"attention {decode_attn!r} (decode on the FPGA needs FPGA prefill)")
     base = ATTN_POLICIES[(prefill_attn, decode_attn)]
-    if not (vsmx_default() if vsmx is None else vsmx):
-        return base
-    if (prefill_attn, decode_attn) != ("fpga", "fpga"):
-        raise ValueError("vsmx (the prefill softmax on VectorOPKernel) is studied with the FPGA "
-                         "attention in prefill and decode only")
-    return base + "+vsmx"
+    vsmx = vsmx_default() if vsmx is None else vsmx
+    rowops = rowops_default() if rowops is None else rowops
+    if (vsmx or rowops) and (prefill_attn, decode_attn) != ("fpga", "fpga"):
+        raise ValueError("vsmx / rowops (the softmax and the row ops on the FPGA units) are studied "
+                         "with the FPGA attention in prefill and decode only")
+    return base + ("+vsmx" if vsmx else "") + ("+rowops" if rowops else "")
 
 
 POLICY = policy()
@@ -115,11 +123,12 @@ def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
 
 def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
              prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
-             vsmx: Optional[bool] = None) -> LlamaFrontend:
+             vsmx: Optional[bool] = None, rowops: Optional[bool] = None) -> LlamaFrontend:
     vsmx = vsmx_default() if vsmx is None else vsmx
-    policy(prefill_attn, decode_attn, vsmx)                     # a studied combination
+    rowops = rowops_default() if rowops is None else rowops
+    policy(prefill_attn, decode_attn, vsmx, rowops)             # a studied combination
     return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn,
-                         decode_attn=decode_attn, vsmx=vsmx)
+                         decode_attn=decode_attn, vsmx=vsmx, rowops=rowops)
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:

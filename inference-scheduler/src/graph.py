@@ -47,6 +47,7 @@ from . import fusion
 from . import matmul_lowering
 from . import numeric
 from . import vectorop_act
+from . import rowops_nodes
 from . import smx_nodes
 from .matmul_gemv import choose_gemv
 from . import fc_conv as fc_conv_mod
@@ -796,7 +797,8 @@ class OnnxGraph:
             node = _detached_node(node)
             if node.domain == LLM_DOMAIN:
                 factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES,
-                             **STEREO_OP_FACTORIES}
+                             **STEREO_OP_FACTORIES, **rowops_nodes.LLM_OVERRIDES,
+                             **rowops_nodes.VIT_OVERRIDES, **rowops_nodes.TTS_OVERRIDES}
                 if node.op_type not in factories:
                     raise SchedulerError(
                         f"Node '{node.name or node.op_type}': unknown {LLM_DOMAIN} op "
@@ -812,6 +814,10 @@ class OnnxGraph:
                 # VectorOPKernel's softmax unit, or the host op where it cannot run
                 sn = smx_nodes.from_onnx_softmax(node, self._tensors, idx, align_elems,
                                                  host_ctx, _dtype)
+            elif node.op_type == "LayerNormalization":
+                # the row-ops unit, or the host op where the platform has none
+                sn = rowops_nodes.from_onnx_layernorm(node, self._tensors, idx, align_elems,
+                                                      host_ctx, _dtype)
             elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
                                                      host_ctx)

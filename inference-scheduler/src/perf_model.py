@@ -46,6 +46,8 @@ def family(c: KernelCall) -> str:
         if f["op"] in (10, 11):
             return "vecop-smx"
         return "vecop-div" if f["op"] == 3 else "vecop"
+    if c.kernel == "RowOpsKernel":
+        return "rowops"
     return "pool"
 
 
@@ -194,6 +196,24 @@ def features(c: KernelCall) -> Dict[str, float]:
         unary = f["op"] in (4, 5)
         return {"words": words, "runs": f["outer"], "b_words": 0.0 if unary else words,
                 "one": 1.0}
+    if fam == "rowops":
+        # the row-ops unit (ROWOPS_RTL_KERNEL.md §3): one read+write port, four lanes
+        # per cycle — the words of A / B / C (int16 2 bytes, int32 / float32 4), the
+        # four-lane groups (half an int16 word), TRANSPOSE's granules, the rows
+        op, ak, bk, ck = f["op"] & 15, (f["op"] >> 4) & 3, (f["op"] >> 6) & 3, (f["op"] >> 8) & 3
+        rows = f["rows"] * f["blocks"]
+        n = f["n"]
+        eb = lambda k: 2 if k == 0 else 4   # noqa: E731
+        a_words = rows * math.ceil(n * eb(ak) / 16)
+        b_words = rows * math.ceil(n * eb(bk) / 16) if (f["op"] >> 12) & 1 else 0.0
+        if op == 6:                                   # ROPE: B is the row's cos / sin (HD / 2 words)
+            b_words = rows * (f["aux"] & 0xFFF) / 2.0
+        c_words = rows * math.ceil(n * eb(ck) / 16) if op != 7 else rows * math.ceil(n * (f["aux"] & 15) / 8)
+        if op == 5:                                   # NORM writes int16 whatever A is
+            c_words = rows * math.ceil(n / 8)
+        return {"a_words": float(a_words), "b_words": float(b_words), "c_words": float(c_words),
+                "groups": float(rows * math.ceil(n / 4)),
+                "granules": float(rows * n) if op == 7 else 0.0, "rows": float(rows), "one": 1.0}
     pix = f["batch"] * f["channels"] * f["out_h"] * f["out_w"]
     return {"taps": pix * f["pool_h"] * f["pool_w"] / 8.0, "out_words": pix / 8.0,
             "in_words": f["batch"] * f["channels"] * f["in_h"] * f["in_w"] / 8.0,

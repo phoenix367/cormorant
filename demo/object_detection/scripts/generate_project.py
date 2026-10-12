@@ -39,7 +39,8 @@ from src.kernels import KERNEL_REGISTRY  # noqa: E402
 INIT_MACRO = {"VectorOPKernel": "INFERENCE_VECTOROPKERNEL_INSTANCE",
               "MatmulKernel": "INFERENCE_MATMULKERNEL_INSTANCE",
               "ConvKernel": "INFERENCE_CONVKERNEL_INSTANCE",
-              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE"}
+              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE",
+              "RowOpsKernel": "INFERENCE_ROWOPSKERNEL_INSTANCE"}
 
 
 def graph_and_generator():

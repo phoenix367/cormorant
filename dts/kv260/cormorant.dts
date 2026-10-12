@@ -84,4 +84,17 @@
 			};
 		};
 	};
+
+	/*uio: the row-ops unit (RowOpsKernel, pl_ps_irq0[4] = SPI 125)*/
+	fragment@7 {
+		target = <&amba>;
+		overlay7: __overlay__ {
+			fabric_rowops: fabric_rowops@a0040000 {
+				interrupts = <0x00 0x5d 0x04>;
+				interrupt-parent = <&gic>;
+				compatible = "generic-uio";
+				reg = <0x00 0xa0040000 0x00 0x10000>;
+			};
+		};
+	};
 };

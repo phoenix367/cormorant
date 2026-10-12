@@ -24,7 +24,7 @@ unit, fused into the FFN bias Adds (bitstream `6436623029f7`, ACTIVATIONS_PLAN.m
 p50 525 ms; with the 12 Softmaxes on its softmax unit (bitstream `588d721997cb`,
 SOFTMAX_PLAN.md): p50 427 ms; with VectorOPKernel's b read port on HPC1 (bitstream
 `8599aa7a5f12`, PS_PORTS_PLAN.md): p50 418 ms, bit-exact; with ConvKernel's x read port past the CCI
-(bitstream `f70ce632a97a`, DEPTHWISE_PLAN.md §8): p50 364 ms, bit-exact.
+(bitstream `1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit): p50 288 ms, bit-exact (364 on `f70ce632a97a`, DEPTHWISE_PLAN.md §8).
 
 ## 0. Feasibility (measured 2026-09-26)
 

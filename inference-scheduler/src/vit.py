@@ -49,6 +49,7 @@ from .llm_nodes import LLM_DOMAIN
 
 F = 8                                  # the kernels' output shift
 VP = "model.vision_model."
+RES_BITS = 15           # the int32 DMA residual's exponent with rowops (doc/plans/HOSTOPS_PLAN.md §5.1: r15)
 CONN = "model.connector.modality_projection.proj.weight"
 
 
@@ -175,7 +176,7 @@ class VitFrontend:
     def __init__(self, cfg: VitConfig, weights: Dict[str, np.ndarray], formats: VisionFormats,
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
-                 attn_split: int = 1, vsmx: bool = False):
+                 attn_split: int = 1, vsmx: bool = False, rowops: bool = False):
         """``attn_split`` R > 1 splits every head's softmax and P.V by query
         rows into R parts (TACTICS_PLAN §4.4): the CPU can then start the
         next ConvKernel call between the parts (--plan's order search).
@@ -183,6 +184,10 @@ class VitFrontend:
         softmax on VectorOPKernel's softmax unit (VitAttnSoftmax vsmx = 1)."""
         self.cfg = cfg
         self.vsmx = bool(vsmx)
+        # rowops (policy ...+rowops, doc/plans/HOSTOPS_PLAN.md §6): the residual stream
+        # as the int32 DMA tensor at 2^-RES_BITS, the residual adds and LayerNorms on
+        # the row-ops unit (src/rowops_nodes.py)
+        self.rowops = bool(rowops)
         if attn_split < 1 or cfg.N % (attn_split * 16):
             raise ValueError(f"attn_split {attn_split}: {cfg.N} query rows not in parts of 16")
         self.attn_split = int(attn_split)
@@ -228,9 +233,18 @@ class VitFrontend:
         self._inits: Dict[str, np.ndarray] = {}      # converted in _model
         self._meta = numeric.empty()
 
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False):
+    def _res(self, name):
+        """A residual-stream tensor [N][D]: float32 host, or with rowops the int32
+        DMA tensor at 2^-RES_BITS."""
+        if self.rowops:
+            return self._t(name, [self.cfg.N, self.cfg.D], exp=RES_BITS, dma="i32")
+        return self._t(name, [self.cfg.N, self.cfg.D], host="f32")
+
+    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
         if name not in self._vi:
             self._vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
+        if dma is not None:
+            self._meta["dma"][name] = dma
         if exp is not None:
             self._meta["exp"][name] = _compact(exp)
         if host is not None:
@@ -276,8 +290,15 @@ class VitFrontend:
         pe = self._matmul(pin, "w.v.pe", patch_weight(W, c), N, "vision.pe", fm.get("pe", 0, D),
                           "vision.patch_embed")
         self._init("vision.b0", patch_bias_table(W))
-        h = self._t("vision.h0", [N, D], host="f32")
+        h = self._res("vision.h0")
         self._node("VitEmbedAdd", [pe, "vision.b0"], [h], "vision.embed", domain=LLM_DOMAIN)
+        if self.rowops:
+            for key in ("o", "d"):
+                for li in range(L):
+                    fd = np.asarray(fm.get(key, li, D), np.int64)
+                    if (fd > RES_BITS).any():
+                        raise ValueError(f"rowops: the {key} exponents of layer {li} exceed 2^-{RES_BITS} "
+                                         f"(max {int(fd.max())}): the residual add would not be exact")
         # the K / V caches: raw integers, one pair for every layer
         kc = self._t("vit.k", [N, D], exp=0, state=True)
         vc = self._t("vit.v", [N, D], exp=0, state=True)
@@ -367,7 +388,7 @@ class VitFrontend:
                            head_dim=HD, row_splits=R)
             ov = self._matmul(pv, f"w.v.l{li}.o", W[lw + "self_attn.out_proj.weight"].T, N, f"{e}.o",
                               fm.get("o", li, D), f"{e}.o_proj")
-            h1 = self._t(f"{e}.h1", [N, D], host="f32")
+            h1 = self._res(f"{e}.h1")
             self._node("VitResAdd", [h, ov, self._vec(f"v.l{li}.bo", W[lw + "self_attn.out_proj.bias"])],
                        [h1], f"{e}.res_attn", domain=LLM_DOMAIN)
             x2 = self._ln(h1, li, "ln2", f"{e}.x2", fm.get("x2", li, D), lw + "layer_norm2.weight",
@@ -382,7 +403,7 @@ class VitFrontend:
             self._node("VitGelu", [fv, b1] + extra, [a], f"{e}.gelu", domain=LLM_DOMAIN)
             d = self._matmul(a, f"w.v.l{li}.f2", W[lw + "mlp.fc2.weight"].T, N, f"{e}.d",
                              fm.get("d", li, D), f"{e}.fc2")
-            h2 = self._t(f"{e}.h2", [N, D], host="f32")
+            h2 = self._res(f"{e}.h2")
             self._node("VitResAdd", [h1, d, self._vec(f"v.l{li}.b2", W[lw + "mlp.fc2.bias"])], [h2],
                        f"{e}.res_mlp", domain=LLM_DOMAIN)
             h = h2

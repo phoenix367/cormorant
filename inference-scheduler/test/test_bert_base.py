@@ -32,6 +32,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
 from src.nodes import ACT_GELU_TANH, MatmulConvNode, MatmulNode, ScheduledNode
+from src.rowops_nodes import LayerNormRoNode, enabled as rowops_unit
 from src.smx_nodes import SoftmaxVopNode, enabled as softmax_unit
 
 _STUDY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -77,8 +78,9 @@ class TestBertBase(unittest.TestCase):
         # bias Adds (bit-identical to the host op: test_activations.py); the 12
         # softmaxes on its softmax unit where the platform has it
         smx = 12 if softmax_unit() else 0
-        self.assertEqual((k[LayerNormNode], k[GeluNode], k[SoftmaxNode], k[SoftmaxVopNode],
-                          k[TransposeNode]), (25, 0, 12 - smx, smx, 49))
+        ln = 25 if rowops_unit() else 0                   # the 25 LayerNorms on the row-ops unit
+        self.assertEqual((k[LayerNormNode], k[LayerNormRoNode], k[GeluNode], k[SoftmaxNode], k[SoftmaxVopNode],
+                          k[TransposeNode]), (25 - ln, ln, 0, 12 - smx, smx, 49))
         self.assertEqual(sum(1 for sn in self.g.nodes if isinstance(sn, ScheduledNode)
                              and sn.act == ACT_GELU_TANH), 12)
         self.assertEqual((k[MatmulNode] + k[MatmulConvNode], k[ScheduledNode]), (98, 126))
@@ -121,7 +123,9 @@ class TestBertBase(unittest.TestCase):
         import bert_sched_check as chk
         bs.HERE = ASSETS
         _, pick = bs.pick_examples(1)
-        bert = bs.Bert(MODEL, bs.POLS["sched+vsmx" if softmax_unit() else "sched"])
+        # the study policy of the platform's partition: the softmax unit, the row-ops unit's LayerNorms
+        policy = ("sched+vsmx" if softmax_unit() else "sched") + ("+iln" if rowops_unit() else "")
+        bert = bs.Bert(MODEL, bs.POLS[policy])
         res, a, b, (n_cmp, n_bad) = chk.compare(self.cg, bert, bs.feeds_of(pick[0][1]))
         self.assertEqual(n_bad, 0)
         self.assertGreater(n_cmp, 300)

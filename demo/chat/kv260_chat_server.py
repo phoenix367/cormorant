@@ -42,8 +42,8 @@ Backends (chat_backend.Backend; one model id each)
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
-BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~760 MB, SmolVLM
-~540 MB, Piper ~55 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
+BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~775 MB, SmolVLM
+~550 MB, Piper ~55 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -1339,7 +1339,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--llm-360m-tokenizer", default=_first_existing(
         os.path.join(HERE, "smollm2_360m", "tokenizer.json"),
         os.path.join(HERE, "assets", "smollm2-360m-instruct", "tokenizer.json")))
-    g.add_argument("--llm-360m-cma-mb", type=float, default=760.0,
+    g.add_argument("--llm-360m-cma-mb", type=float, default=775.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g = ap.add_argument_group("smolvlm (chat about images; the llm sampling defaults apply)")
     g.add_argument("--vlm-lib", default=os.path.join(HERE, "lib", "libsmolvlm_256m.so"))
@@ -1349,7 +1349,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         os.path.join(HERE, "smolvlm", "tokenizer.json"),
         os.path.join(HERE, "assets", "smolvlm-256m-instruct", "tokenizer.json")))
     g.add_argument("--vlm-model-id", default=None)
-    g.add_argument("--vlm-cma-mb", type=float, default=540.0,
+    g.add_argument("--vlm-cma-mb", type=float, default=550.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g = ap.add_argument_group("piper (text to speech)")
     g.add_argument("--tts-lib", default=os.path.join(HERE, "lib", "libpiper_tts.so"))

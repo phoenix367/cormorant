@@ -30,13 +30,15 @@ from src.host_nodes import (CastNode, ConcatNode, GatherNode, GeluNode, HostNode
 from src.nodes import ReshapeNode, SchedulerError
 from unittest import mock
 
-from src import _vectorop_hw_config
+from src import _rowops_hw_config, _vectorop_hw_config
 
 # These test the host GELU op: on a platform with VectorOPKernel's activation
 # unit a matching Gelu runs there instead (test_activations.py).
 _host_gelu = mock.patch.object(_vectorop_hw_config, "VECTOROP_ACTIVATIONS", False)
 # the host Softmax (VectorOP's softmax unit: test_softmax_unit.py)
 _host_softmax = mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", False)
+# the host LayerNorm (the row-ops unit takes it where the platform has the unit: test_rowops_unit)
+_host_ln = mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", False)
 
 DT = AP_FIXED_16_8
 _CC = shutil.which("cc") or shutil.which("gcc")
@@ -248,6 +250,7 @@ class TestSoftmax(_Base):
             OnnxGraph(p)
 
 
+@_host_ln
 class TestLayerNormGelu(_Base):
 
     def test_native_layernorm(self):

@@ -81,6 +81,12 @@ class TensorInfo:
     #      token ids / positions) or "i16" (raw int16 at `exp`, e.g. a KV
     #      cache only host ops touch).  None = a DMA buffer (the default).
     host:      Optional[str] = None
+    # dma: a DMA buffer of another element width: "i32" — int32 at `exp`
+    #      (4 bytes per element, e.g. a transformer's residual stream on the
+    #      row-ops unit, doc/plans/HOSTOPS_PLAN.md §6).  Its DMA buffer holds
+    #      2 Data_t per element (alloc_numel); only the row-ops kernel nodes
+    #      and the LLM host ops touch it.  None = Data_t elements.
+    dma:       Optional[str] = None
     # is_state: persistent across inference_run() calls (and shared by the
     #      entries of a multi-entry project); init_data = its initial VALUE
     #      (None = zeros).  Excluded from buffer reuse.
@@ -108,6 +114,17 @@ class TensorInfo:
     def is_host(self) -> bool:
         """True for a host-memory tensor (``host`` set): no DMA buffer."""
         return self.host is not None
+
+    @property
+    def dma_elem_bytes(self) -> int:
+        """Bytes per element in the DMA buffer (2 for Data_t, 4 for dma i32)."""
+        return 4 if self.dma == "i32" else 2
+
+    @property
+    def alloc_numel(self) -> int:
+        """The DMA buffer's size in Data_t elements: numel, twice that for a
+        dma i32 tensor."""
+        return self.numel * (2 if self.dma == "i32" else 1)
 
     def exp_full(self, default: int) -> np.ndarray:
         """Exponent of every element in the logical shape (int64)."""

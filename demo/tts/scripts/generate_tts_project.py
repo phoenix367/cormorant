@@ -158,17 +158,25 @@ def vsmx_default() -> bool:
     return enabled()
 
 
-def entry_graphs(assets: str, W: dict = None, vsmx: bool = None) -> list:
+def rowops_default() -> bool:
+    """The encoder's residual LayerNorms on the row-ops unit (doc/plans/HOSTOPS_PLAN.md)
+    where the platform has it."""
+    from src.rowops_nodes import enabled
+    return enabled()
+
+
+def entry_graphs(assets: str, W: dict = None, vsmx: bool = None, rowops: bool = None) -> list:
     """[(entry, OnnxGraph)] of libpiper_tts.so in project order: "chunk", then
     "encode_<T>" for every bucket of ENC_BUCKETS.  Also what
     inference-scheduler/perf_calibrate.py prices, so its kernel calls are the
     library's (``vsmx`` None: vsmx_default())."""
-    return _entries(assets, W, vsmx)[0]
+    return _entries(assets, W, vsmx, rowops)[0]
 
 
-def _entries(assets: str, W: dict = None, vsmx: bool = None):
+def _entries(assets: str, W: dict = None, vsmx: bool = None, rowops: bool = None):
     """(entry_graphs, the chunk entry's info: frames, sample rate, ...)."""
     vsmx = vsmx_default() if vsmx is None else bool(vsmx)
+    rowops = rowops_default() if rowops is None else bool(rowops)
     if W is None:
         W = load_weights(os.path.join(assets, "en_US-lessac-medium.onnx"))
     doc = json.load(open(os.path.join(assets, "exponents.json")))
@@ -182,7 +190,7 @@ def _entries(assets: str, W: dict = None, vsmx: bool = None):
     enc, kw = {}, None
     for T in sorted(ENC_BUCKETS, reverse=True):
         eg = OnnxGraph(PiperEncoderFrontend(W, doc["encoder"], T, name="piper_lessac_medium",
-                                            vsmx=vsmx).entry(), matmul_conv_kw=kw)
+                                            vsmx=vsmx, rowops=rowops).entry(), matmul_conv_kw=kw)
         if kw is None:
             kw = shared_weight_layouts(eg.nodes)
         enc[T] = eg
@@ -200,11 +208,15 @@ def main(argv=None) -> int:
                     help="the text encoder's attention softmax on VectorOPKernel's softmax unit "
                          "(doc/plans/SOFTMAX_PLAN.md §5); auto: where the platform has the unit "
                          "(kernels.vectorop.softmax)")
+    ap.add_argument("--rowops", choices=("auto", "on", "off"), default="auto",
+                    help="the text encoder's residual LayerNorms on the row-ops unit "
+                         "(doc/plans/HOSTOPS_PLAN.md); auto: where the platform has it (kernels.rowops.unit)")
     a = ap.parse_args(argv)
     t0 = time.time()
     vsmx = vsmx_default() if a.vsmx == "auto" else a.vsmx == "on"
+    rowops = rowops_default() if a.rowops == "auto" else a.rowops == "on"
     W = load_weights(os.path.join(a.assets, "en_US-lessac-medium.onnx"))
-    entries, info = _entries(a.assets, W, vsmx)
+    entries, info = _entries(a.assets, W, vsmx, rowops)
     g = entries[0][1]
     cg = MultiEntryGenerator(entries, "piper_lessac_medium")
     out = os.path.abspath(a.out_dir)
@@ -234,6 +246,7 @@ def main(argv=None) -> int:
     summary.update({"model": "piper-lessac-medium", "entry": info, "assets": os.path.abspath(a.assets),
                     "nodes": len(g.nodes), "encode_buckets": list(ENC_BUCKETS),
                     "encode_nodes": {n: len(eg.nodes) for n, eg in entries[1:]}, "vsmx": vsmx,
+                    "rowops": rowops,
                     "missing_drivers": missing, "generated_s": round(time.time() - t0, 1)})
     json.dump(summary, open(os.path.join(out, "project.json"), "w"), indent=2)
     print(f"project: {out} ({len(g.nodes)} nodes, pool {summary['pool_bytes'] / 2**20:.1f} MiB, "

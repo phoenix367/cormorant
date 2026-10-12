@@ -180,7 +180,7 @@ patch producer and x loader, the sweep, the drain beside the next chunk —
 with one parameter set tuned to this testbench (`RTL_CONV_SIM`: median error
 0.65 %, p90 5.3 % over the 1 042 calls) and one to the board
 (`RTL_CONV_BOARD`: DDR latency, x and weight runs; at 250 MHz, bitstream
-`f70ce632a97a`, median 2.9 %, p90 18 % (18.3 / 45.8 % on `6436623029f7` before the x port left the CCI) — at 100 MHz 3.1 / 14.6 %;
+`1cedaf2ed816`, median 2.8 %, p90 20.3 % (fitted on `f70ce632a97a`: 2.9 / 18 %; 18.3 / 45.8 % on `6436623029f7` before the x port left the CCI) — at 100 MHz 3.1 / 14.6 %;
 `inference-scheduler/tools/fit_cost_model.py` refits it).  The worst misses
 are narrow, input-heavy MatMul-on-ConvKernel jobs whose few short x runs per
 row wait on the DDR (2.5–3× the model at 250 MHz).  A change of the

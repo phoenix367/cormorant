@@ -46,7 +46,8 @@ from stereo_assets import FORMATS, ckpt_path   # noqa: E402
 INIT_MACRO = {"VectorOPKernel": "INFERENCE_VECTOROPKERNEL_INSTANCE",
               "MatmulKernel": "INFERENCE_MATMULKERNEL_INSTANCE",
               "ConvKernel": "INFERENCE_CONVKERNEL_INSTANCE",
-              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE"}
+              "PoolKernel": "INFERENCE_POOLKERNEL_INSTANCE",
+              "RowOpsKernel": "INFERENCE_ROWOPSKERNEL_INSTANCE"}
 SCHED_ARGS = ["--no-s2d-stem", "--no-fuse-act", "--fc-conv", "off", "--matmul-on-conv", "off"]
 GRAPH_KW = dict(fuse_act=False, s2d_stem=False, fc_conv="off", matmul_on_conv="off")
 

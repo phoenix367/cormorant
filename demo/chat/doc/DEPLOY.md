@@ -176,9 +176,9 @@ a margin); the server uses it to decide what to evict.
 | Model | Pool | `cma_mb` | Stays loaded (`--resident auto`) beside |
 |---|---:|---:|---|
 | BERT | 216 MiB | 224 | SmolLM2-135M, SmolVLM, Piper |
-| SmolLM2-135M | 286 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
-| SmolLM2-360M | 740 MiB | 760 | Piper only; swaps with the others |
-| SmolVLM-256M | 495 MiB | 540 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
+| SmolLM2-135M | 294 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
+| SmolLM2-360M | 754 MiB | 775 | Piper only; swaps with the others |
+| SmolVLM-256M | 506 MiB | 550 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
 | Piper | 51 MiB | 55 | any other model, even SmolLM2-360M |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
@@ -223,7 +223,7 @@ python3 /root/kv260_chat/kv260_chat_server.py --backend smollm2 --backend smollm
     --llm-sampler-lib /root/kv260_chat/lib/libsampler.so \
     --llm-tokenizer /root/kv260_chat/smollm2/tokenizer.json --llm-cma-mb 330 \
     --llm-360m-lib /root/kv260_chat/lib/libsmollm2_360m.so \
-    --llm-360m-tokenizer /root/kv260_chat/smollm2_360m/tokenizer.json --llm-360m-cma-mb 760 \
+    --llm-360m-tokenizer /root/kv260_chat/smollm2_360m/tokenizer.json --llm-360m-cma-mb 775 \
     --bert-lib /root/kv260_chat/lib/libbert_squad.so --bert-weights /root/bert_squad_weights \
     --vocab /root/kv260_chat/vocab.txt [--resident auto|one|all]
 ```

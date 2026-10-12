@@ -46,7 +46,7 @@ def _emu_sources(work: str) -> str:
     os.makedirs(emu, exist_ok=True)
     for name, text in (("inference_buf_emu.c", host_emu.buf_emu_source()), ("emu_common.h", host_emu._COMMON),
                        ("xvectoropkernel.h", host_emu.vop_source()), ("xmatmulkernel.h", host_emu._MM),
-                       ("xconvkernel.h", host_emu._CONV)):
+                       ("xconvkernel.h", host_emu._CONV), ("xrowopskernel.h", host_emu._ROWOPS)):
         with open(os.path.join(emu, name), "w") as f:
             f.write(text)
     return emu
@@ -93,7 +93,8 @@ def lib_check(project: str, work: str, texts) -> bool:
     summary, W, E = tb.load(project)
     enc = tb.pv.library_encoder(tb.pv.encoder_weights(W),
                                 json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"],
-                                vsmx_unit=bool(summary.get("vsmx", False)))
+                                vsmx_unit=bool(summary.get("vsmx", False)),
+                                rowops_unit=bool(summary.get("rowops", False)))
     ok = b.engine.has_encode and b.engine.has_duration
     print(f"  the library's text encoder (tts_encode): {'yes' if b.engine.has_encode else 'MISSING'}, "
           f"duration predictor (tts_duration): {'yes' if b.engine.has_duration else 'MISSING'}")
@@ -174,9 +175,9 @@ def main(argv=None) -> int:
         print(r.stdout[-2000:], r.stderr[-2000:])
         return 1
     E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
-    vs = bool(summary.get("vsmx", False))
-    erep = tb.check_enc(enc_bin, seqs, W, E_enc, vs)
-    drep = tb.check_dur(dur_bin, seqs, zs, W, E_enc, vs)
+    vs, ro = bool(summary.get("vsmx", False)), bool(summary.get("rowops", False))
+    erep = tb.check_enc(enc_bin, seqs, W, E_enc, vs, ro)
+    drep = tb.check_dur(dur_bin, seqs, zs, W, E_enc, vs, ro)
     pr = tb.parse(r.stdout)
     ok = ok and all(v["mismatches"] == 0 for v in list(erep.values()) + list(drep.values())) and \
         all(e["reps_identical"] for e in pr["encs"] + pr.get("durs", []))

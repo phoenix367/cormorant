@@ -1,0 +1,15 @@
+`verilator_config
+// Port name fixed by the HLS interface contract.
+lint_off -rule SYMRSVDWORD -file "*/ro_core.sv" -match "*interrupt*"
+lint_off -rule SYMRSVDWORD -file "*/RowOpsKernel.v" -match "*interrupt*"
+// The geometry struct is shared: the write port's burst generator uses a subset of it.
+lint_off -rule UNUSEDSIGNAL -file "*/ro_burstgen.sv" -match "*'g'*"
+// Partially used address vectors (16-byte aligned bases, word-aligned AXI-Lite addresses).
+lint_off -rule UNUSEDSIGNAL -file "*" -match "*Bits of signal are not used*"
+// Register slices whose lookahead output (head_data) the user does not need.
+lint_off -rule PINCONNECTEMPTY -file "*/ro_*_port.sv" -match "*head_data*"
+lint_off -rule PINCONNECTEMPTY -file "*/ro_rd_arb.sv" -match "*head_data*"
+// The sigmoid ROM's second port is for a later lane pairing.
+lint_off -rule PINCONNECTEMPTY -file "*/ro_stream.sv" -match "*q_b*"
+// Package constants of the ops still to come (NORM / ROPE / TRANSPOSE).
+lint_off -rule UNUSEDPARAM -file "*/ro_pkg.sv"
