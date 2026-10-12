@@ -300,6 +300,26 @@ class ReportGenerator:
                     )
         return ", ".join(parts) if parts else "—"
 
+    # ----- the Cortex-R5 (RPU_PLAN §9) -------------------------------- #
+
+    def _rpu(self) -> str:
+        """Who drives the kernels when the R5 firmware runs (src/rpu_policy.py)."""
+        from .rpu_policy import MAX_OVERHEAD, rpu_estimate
+        est = rpu_estimate(self.codegen)
+        if est["calls"] == 0:
+            return ""
+        pred = est["predicted_us"]
+        rows = ["## Cortex-R5", ""]
+        who = "the **R5** drives the kernels" if est["recommended"] else "the **A53** drives the kernels"
+        rows.append(f"With the R5 firmware running, {who} (`INFERENCE_RPU_RECOMMENDED`; "
+                    f"`INFERENCE_RPU=0` / `1` in the environment overrides): {est['calls']} kernel calls "
+                    f"in {est['batches']} batch(es) per inference cost about {est['overhead_us'] / 1e3:.2f} ms "
+                    "on the R5"
+                    + (f", {est['overhead_us'] / pred * 100:.1f} % of the {pred / 1e3:.2f} ms predicted "
+                       f"({est['basis']}); the limit is {MAX_OVERHEAD * 100:.0f} %." if pred
+                       else "; no prediction, so the call count decides."))
+        return "\n".join(rows)
+
     # ----- planning (--plan / --plan-report) ------------------------- #
 
     def _planning(self) -> str:
@@ -352,6 +372,7 @@ class ReportGenerator:
             self._parameters(),
             self._activation_memory(),
             self._hardware_lanes(),
+            self._rpu(),
             self._transformations(),
             self._planning(),
             self._layers_table(),

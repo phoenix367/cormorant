@@ -301,8 +301,29 @@ void inference_buf_sync_from_device(inference_buf_t *buf)
 #include "xil_cache.h"
 #include "xil_types.h"
 
+#ifndef INFERENCE_BUF_CACHEABLE
+#  define INFERENCE_BUF_CACHEABLE 1
+#endif
+
+/* The DMA region (RPU_PLAN track B1): identity-mapped memory another agent
+ * handed over — on the Cortex-R5 the DDR buffer the A53 allocated and named
+ * in the firmware's control block — carved by a bump allocator that never
+ * frees; without a region, malloc (the standalone heap). */
+static uintptr_t s_region_base  = 0;
+static size_t    s_region_bytes = 0;
+static size_t    s_region_used  = 0;
+
+void inference_buf_pool_set(uintptr_t base, size_t bytes)
+{
+    s_region_base  = base;
+    s_region_bytes = bytes;
+    s_region_used  = 0;
+}
+
+size_t inference_buf_pool_used(void) { return s_region_used; }
+
 int  inference_buf_pool_init(void)   { return 0; }
-void inference_buf_pool_deinit(void) {}
+void inference_buf_pool_deinit(void) { s_region_used = 0; }
 
 inference_buf_t *inference_buf_alloc(unsigned n_elem)
 {
@@ -314,8 +335,14 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf = (inference_buf_t *)malloc(sizeof(inference_buf_t));
     if (!buf) return NULL;
 
-    mem = malloc(bytes);
-    if (!mem) { free(buf); return NULL; }
+    if (s_region_bytes) {
+        if (s_region_used + bytes > s_region_bytes) { free(buf); return NULL; }
+        mem = (void *)(s_region_base + s_region_used);
+        s_region_used += bytes;
+    } else {
+        mem = malloc(bytes);
+        if (!mem) { free(buf); return NULL; }
+    }
 
     buf->virt     = mem;
     /* VA == PA on Xilinx standalone with identity-mapped DDR */
@@ -323,27 +350,29 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->count    = n_elem;
     buf->refcount = 1u;
     buf->is_owner = 1u;
-    buf->cached   = 1u;          /* standalone DDR is cached (Xil_DCache*) */
-    Xil_DCacheFlushRange((INTPTR)mem, (INTPTR)bytes);
+    buf->cached   = INFERENCE_BUF_CACHEABLE;   /* the MPU maps DDR cacheable: Xil_DCache* */
+    if (buf->cached) Xil_DCacheFlushRange((INTPTR)mem, (INTPTR)bytes);
     return buf;
 }
 
 static void _inference_buf_dealloc(inference_buf_t *buf)
 {
-    free(buf->virt);
+    if (!s_region_bytes) free(buf->virt);
     free(buf);
 }
 
 void inference_buf_sync_to_device(inference_buf_t *buf)
 {
-    Xil_DCacheFlushRange((INTPTR)buf->virt,
-                         (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
+    if (buf->cached)
+        Xil_DCacheFlushRange((INTPTR)buf->virt,
+                             (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
 }
 
 void inference_buf_sync_from_device(inference_buf_t *buf)
 {
-    Xil_DCacheInvalidateRange((INTPTR)buf->virt,
-                              (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
+    if (buf->cached)
+        Xil_DCacheInvalidateRange((INTPTR)buf->virt,
+                                  (INTPTR)(buf->count * INFERENCE_BYTES_PER_ELEM));
 }
 
 #endif /* __linux__ */

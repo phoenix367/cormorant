@@ -168,7 +168,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run all tests (1798 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
+# Run all tests (1813 tests, none skipped; test_bert_base.py downloads bertsquad-12 — 435 MB — into
 # demo/bert_squad/assets/ on its first run (demo/bert_squad/scripts/fetch_assets.py); BERT_SQUAD_DOWNLOAD=0 skips it instead)
 .venv/bin/python -m pytest test/ -v
 
@@ -195,6 +195,7 @@ Key source files:
 - **`inference-scheduler/src/vit.py`** / **`src/vit_nodes.py`** — vision-encoder frontend (`VitFrontend`, the `vision` entry) and its `Vit*` host ops
 - **`inference-scheduler/src/stereo.py`** / **`src/stereo_nodes.py`** — LightStereo-S stereo depth frontend (`LightStereoFrontend`: checkpoint + `demo/stereo_depth/lightstereo_s_formats.json` → one graph, `per_channel` weights) and its `Stereo*` ops; `demo/stereo_depth/` holds the study, the demo and the board run
 - **`inference-scheduler/src/piper.py`** / **`src/tts_nodes.py`** — Piper (VITS) text-to-speech frontend (`PiperChunkFrontend`, the `chunk` entry) and its `Tts*` host ops; `demo/tts/` holds the specification, the library (`libpiper_tts.so`) and the board gate
+- **`inference-scheduler/runtime/rpu/`** / **`runtime/inference_rpu.[ch]`** / **`rpu_board.py`** — the kernels driven from the Cortex-R5 (`doc/plans/RPU_PLAN.md` §9, track B1): a model-independent bare-metal firmware (one build per bitstream, from the BSP of `tools/rpu/`; loaded through remoteproc with `board/kv260/rpu/rpu.dts`) replays the command stream a Linux library records once `inference_rpu_attach()` is called — the register block of every kernel call, its Start, the lane waits — with interrupt-driven waits; the weights, the DMA buffers, the host ops and the outputs stay on the A53 (a batch is flushed before every host op and before the output sync).  Who drives is decided per entry (`inference-scheduler/src/rpu_policy.py`, RPU_PLAN §9.3): the R5's overhead, 8.4 µs a call + 61 µs a batch, against the predicted inference time — at most 5 % puts the entry on the R5 (ResNet-18, MobileNet v1, YOLOv5n), else it stays on the A53 (the MNIST models, MobileNet v2); the generated `inference_init()` attaches when the firmware runs, `INFERENCE_RPU=0` / `1` overrides.  `rpu_board.py` gates generated projects on it bit for bit against the A53 (`rpu/rpu_host.c`; `--mode r5` / `auto` / `both`)
 - **`inference-scheduler/src/codegen/`** — Multi-mixin code generator (header, source, buf_impl, test, cmake); `multi.py` — multi-entry projects (CLI `--entry NAME=MODEL.onnx`: weights deduplicated by name + image, states shared, intermediates overlapping)
 - **Planning (`--plan`, optional)** — `src/planning.py`, `tactics.py`, `perf_calls.py`, `perf_model.py` / `perf_fit.py` / `host_model.py`, `order_search.py`, `codegen/timing.py`, `timeline_html.py` (the predicted execution as an interactive timeline, `timeline.html`): MatMul tactics and the issue order chosen from per-bitstream performance models measured once on the board (`perf_calibrate.py`, `perf_models/kv260/`); bit-identical results; without `--plan` every choice is unchanged — see `doc/plans/TACTICS_PLAN.md` §9
 

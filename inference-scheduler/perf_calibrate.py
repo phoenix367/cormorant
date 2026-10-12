@@ -395,46 +395,10 @@ def buffer_sizes(c: KernelCall) -> List[int]:
 
 
 def estimate_us(c: KernelCall) -> float:
-    """The analytic cost model's time of one call (µs), to size iterations."""
-    from src.cost_model import CALL_OVERHEAD, conv_batch_cycles, gemv_cycles, matmul_cycles
-    f = c.fields
-    if c.kernel == "ConvKernel":
-        try:
-            cyc = conv_batch_cycles(f["batch"], in_ch=f["in_ch"], out_ch=f["out_ch"],
-                                    in_h=f["in_h"], in_w=f["in_w"], oh=f["out_h"], ow=f["out_w"],
-                                    kh=f["kh"], kw=f["kw"], sh=f["stride_h"], sw=f["stride_w"],
-                                    dh=f["dilation_h"], dw=f["dilation_w"],
-                                    pt=f["pad_top"], pl=f["pad_left"])
-            if f["is_dw"]:
-                cyc /= max(1, f["in_ch"] // 16)
-        except Exception:                                    # noqa: BLE001 — sizing only
-            cyc = 1e6
-    elif c.kernel == "MatmulKernel":
-        cyc = (gemv_cycles(f["n"], f["k"], f["m"], f["batch"], f["gemv_kw"]) if f["gemv_kw"]
-               else matmul_cycles(f["n"], f["k"], f["m"], f["batch"]))
-    elif c.kernel == "VectorOPKernel" and f["op"] in (10, 11):
-        # vo_smx with ideal memory (SOFTMAX_PLAN §4.2)
-        cyc = (60 + f["outer"] // 16 * (455 + 6 * f["size"]) if f["op"] == 11
-               else 75 + f["outer"] * (58 + 3 * math.ceil(f["size"] / 8)))
-    elif c.kernel == "VectorOPKernel":
-        cyc = f["outer"] * math.ceil(f["size"] / 8) * (8 if f["op"] == 3 else 1) + 500
-    elif c.kernel == "RowOpsKernel":
-        # four lanes per cycle; NORM reads its row twice; ROPE loads its B row (HD / 2
-        # words) per row; TRANSPOSE loads a tile and emits one granule per cycle
-        # (contiguous) or per two (scattered) (ROWOPS_RTL_KERNEL.md §Performance)
-        rows, n, op = f["rows"] * f["blocks"], f["n"], f["op"] & 15
-        if op == 7:
-            R = f["aux"] & 15
-            cyc = rows * (R * math.ceil(n / 8) + (n if f["b_s2"] == 2 * R else 2 * n)) + 500
-        elif op == 6:
-            cyc = rows * (math.ceil(n / 4) + (f["aux"] & 0xFFF) // 2 + 11) + 540
-        else:
-            passes = 2 if op == 5 else 1
-            cyc = rows * (passes * math.ceil(n / 4) + 40) + 500
-    else:
-        cyc = f["batch"] * f["channels"] * (f["out_h"] * f["out_w"] * f["pool_h"] * f["pool_w"]
-                                            + f["in_h"] * f["in_w"]) / 8 + 500
-    return (cyc + CALL_OVERHEAD) / MHZ
+    """The analytic cost model's time of one call (µs), to size iterations
+    (src/rpu_policy.py holds the model; this bitstream's kernel clock)."""
+    from src.rpu_policy import estimate_us as _est
+    return _est(c, MHZ)
 
 
 def iterations(est_us: float) -> Tuple[int, int]:

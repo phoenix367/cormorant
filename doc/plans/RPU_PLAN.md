@@ -220,7 +220,7 @@ all (139 ms of host time per 260 ms chunk today — on an R5 that would grow,
 |---|---|---|---|
 | **A1 — existing ops** | §3.1 as scheduler nodes: DEQUANT of the logits into DMA, the merges as COPY (behind the R5 flag), `VitEmbedAdd` / `VitSumDequant` / pixel shuffle, BERT's transposes, the Piper h sums and interleaves, the relative-key add through the diagonal transposes; the decode softmax on the unit (`vsmx="decode"` gate) | bit-exact sched-checks and board gates; BERT ≤ 275 ms (its 0.75 × gate of HOSTOPS §7), the Piper encoder ≤ 75 ms at 400 ids, nothing slower | 3 days |
 | **A2 — descriptor chains + the ConvKernel output stride** | one bitstream: the unit's job list from DDR; `y` rows at a stride; the decode prep on the unit (`irope=True` gate) | WNS ≥ 0 at 4 ns; 135M decode ≤ 45 ms per token, the merges gone (prefill 256 ≤ 390 ms); every library bit-exact | 4 days incl. the build and campaign |
-| **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build | 5 days |
+| **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build — **DONE 2026-10-13 (§9), as a model-independent firmware replaying the library's recorded kernel calls: the six CNN demos bit-exact, interrupt-driven, +2–5 % on the real models (YOLO +4 %, MobileNet v2 +5 %)** | 5 days |
 | **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens | 5 days |
 | **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss | 2 days |
 | **A3 — the Piper and stereo features** | §3.3's unit features (unaligned row start, the windowed copy, the acts, the scaled add, long-row norms) and the correlation on ConvKernel; Piper's chunk and the stereo pass on the R5 | the chunk's host time ≤ 10 ms; stereo ≤ 450 ms; bit-exact | 2 weeks |
@@ -323,3 +323,155 @@ ten minutes apart with no kernel change, four MatmulKernel cases moved by
 small cases (the 4a window saw the same); the 22:00 run is the recorded
 baseline.  The chat server is back up with every library regenerated
 (SmolLM2-135M / 360M, SmolVLM, Piper, the BERT project).
+
+## 9. Track B1 — the kernels driven from the Cortex-R5 (2026-10-12/13)
+
+**Result: every CNN demo runs with its kernels driven by a bare-metal
+firmware on RPU core 0, bit-exact with the same library driving them from
+the A53 (20 / 20 inferences each), every wait woken by the kernel's
+interrupt (0 missed), within 2–5 % of the A53's latency on the real
+models.**  The firmware knows no model.
+
+| project | calls / inference | batches / inference | A53 drives | R5 drives | Δ |
+|---|---:|---:|---:|---:|---:|
+| MNIST convnet | 8 | 1 | 0.111 ms | 0.249 ms | +124 % |
+| LeNet | 10 | 1 | 1.259 ms | 1.418 ms | +13 % |
+| ResNet-18 | 41 | 1 | 20.00 ms | 20.41 ms | +2.0 % |
+| MobileNet v1 | 57 | 1 | 20.47 ms | 21.00 ms | +2.6 % |
+| MobileNet v2 | 100 | 1 | 17.48 ms | 18.38 ms | +5.2 % |
+| YOLOv5n | 127 | 14 | 47.00 ms | 48.91 ms | +4.1 % |
+
+(20 runs each, ramp inputs offset per run, bitstream `1cedaf2ed816`; a
+batch ends before each host op — YOLO's Concat / Resize — and at the output
+sync.)  The cost is per call and per batch: about 4 µs a call (the R5's
+40-odd AXI-Lite writes across the LPD–FPD bridge and the interrupt wake)
+and some 50 µs a batch (the A53 polls the control block through /dev/mem).
+Both have obvious cuts — sending only the registers that changed, waking
+the A53 through the IPI (track B2) — and neither matters once the inference
+is tens of milliseconds.
+
+### 9.1 The design
+
+The first cut (2026-10-12) put the generated library itself on the R5: a
+bare-metal `inference_init` / `inference_run` with the weights embedded in
+the ELF, the DMA buffers carved from a region the A53 handed over, the
+I/O through a control block — the MNIST convnet ran that way, bit-exact
+(0.141 vs 0.110 ms).  It does not scale: the TCMs hold 64 + 64 KiB, the
+model's code and weights would need a reserved DDR region in the boot
+device tree (a reboot), the loader a split, and every host op would have
+had to run on the R5.  The user's direction — *the R5 needs no weights:
+transfer the list of calls and their parameters, the R5 does its job, the
+A53 processes the output* — is what shipped:
+
+- **The firmware** (`inference-scheduler/runtime/rpu/`: `rpu_main.c`,
+  `rpu_irq.c`, the protocol `rpu_ctrl.h`, `lscript.ld`, CMake + the R5
+  toolchain; 10 KiB of code, TCM-resident; one build per bitstream against
+  the BSP of `tools/rpu/`) replays a **command stream**: `REGS lane n`
+  followed by the kernel's argument registers from offset 0x10, `START
+  lane`, `WAIT lane`.  Its lanes are the bitstream's five kernels (bases and
+  PL lines from `xparameters.h`; a control-block mask says which exist).  A
+  batch is `ring[0 .. batch_words)` in a DDR buffer the A53 names in the
+  control block (the BTCM, polled); the firmware invalidates the batch, arms
+  the kernels' GIE for its duration, writes the registers, starts, and waits
+  in WFI for the lane's ap_done interrupt (the GIC setup and its traps of
+  §9.2 unchanged).
+- **The recorder** (`runtime/inference_rpu.[ch]`, compiled into every
+  Linux library): `inference_rpu_attach()` swaps each driver instance's
+  `Ctrl_BaseAddress` to a shadow page (seeded from the kernel's registers),
+  so the generated code's register writes go to memory; the generated
+  `X*_Start()` calls are macros that, while attached, copy the shadow
+  page's argument block (the register map's exact length,
+  `KernelDesc.rpu_reg_words` — the control blocks decode 7–8 address bits,
+  a write past the map aliases) into the ring with a START; the default
+  `kernel_wait()` records a WAIT.  `INFERENCE_RPU_FLUSH()` — emitted
+  before every host op and before the output sync, and called when the
+  ring fills — submits the batch and waits for `done_seq`.  Nothing else
+  changes: the weights, the pool, the host ops, the cache syncs and the
+  outputs are the library's as before, so multi-entry chat libraries get it
+  for free (`inference_rpu_attach()` once after `inference_init()`).
+- **The gate** (`rpu/rpu_host.c` in every project, `rpu_board.py` on the
+  board, under the board lock): N inferences, each first on the A53 (the
+  reference), then attached, compared bit for bit, both timed, plus the
+  firmware's batch / call / wait / interrupt counters.
+
+### 9.2 Traps (each cost a round trip on the board)
+
+1. The xlnx 5.15 remoteproc reads the singular `power-domain` on the TCM
+   nodes and translates the banks' global addresses to the R5's 0x0 /
+   0x20000 itself: the ELF uses the R5's own addresses.
+2. The RPU GIC keeps its state across remoteproc stop / start: an interrupt
+   a previous firmware acknowledged and never completed stays *active* with
+   the running priority at the kernels' level, masking everything below —
+   even a software interrupt.  The firmware completes and clears every
+   active interrupt and drains the pending ones before the driver's init
+   (which also skips its distributor setup when it finds the distributor
+   enabled — so it is disabled first).
+3. The kernels' level interrupts can fire a second time right after the ISR
+   clear while the line is still seen high: the handler counts a completion
+   only when it saw ap_done in the ISR register, else the next wait on that
+   lane would return early.
+4. The lines are shared with the APU: a firmware with the kernels' GIE on
+   consumes the completions of jobs the Linux library issues (the ISR's
+   ap_ctrl read clears ap_done, the Linux poll hangs).  The firmware arms
+   GIE only around a batch and never reads ap_ctrl.
+5. The R5's PMU cycle counter did not count from the firmware; the A53
+   times the runs.
+6. A write to a register offset past a kernel's map lands on a register:
+   the AXI-Lite blocks decode `awaddr[6:2]` / `[7:2]` only.  The recorder
+   copies exactly the map (`test_kernels` checks the counts against the
+   driver generators).
+
+### 9.3 Who drives: small models on the A53, large ones on the R5 (2026-10-13)
+
+The R5's cost is per call and per batch, so it matters for small models and
+vanishes into large ones.  `inference-scheduler/src/rpu_policy.py` decides
+per entry at generation time:
+
+- **The overhead model.**  8.4 µs a kernel call, 61 µs a batch — the
+  least-squares fit of the six measurements above, within 2 % on the four
+  large models and within 10 % on the two small ones.  A batch ends before
+  every host op that follows kernel work and at the output sync.
+- **The prediction.**  The event stream replayed with the bitstream's
+  performance model (`perf_models/kv260/`, as `--plan` uses it) and the
+  host-op model; a call the performance model cannot price falls back on
+  the analytic cost model.  With nothing priced, ≥ 32 calls per batch
+  counts as large.
+- **The rule.**  The R5 drives an entry when its overhead is at most 5 % of
+  the predicted inference time.  The header carries `INFERENCE_RPU_CALLS /
+  _BATCHES / _PREDICTED_US / _OVERHEAD_US / _RECOMMENDED` (with an
+  `_<ENTRY>` suffix per entry of a multi-entry project), `report.md` a
+  "Cortex-R5" paragraph.
+- **The runtime.**  The generated `inference_init()` calls
+  `inference_rpu_select()`: when the firmware runs it attaches in auto
+  mode, and the top of every `inference_run*()` picks that run's driver
+  from the entry's recommendation (`INFERENCE_RPU_ENTER`).  Without the
+  firmware nothing changes.  `INFERENCE_RPU=0` never attaches,
+  `INFERENCE_RPU=1` puts every run on the R5; `inference_rpu_set_mode()`
+  does the same from code.  `inference_deinit()` detaches.  The ring is
+  named in the control block at every flush, so several libraries in one
+  process (the chat server) share the firmware.
+
+On the board (20 runs each, bitstream `1cedaf2ed816`; `rpu_board.py
+--mode both`: one pass with the R5 forced, one with the policy):
+
+| project | predicted | overhead | policy | forced R5 | policy run | A53 |
+|---|---:|---:|---|---:|---:|---:|
+| MNIST convnet | 0.10 ms | 0.13 ms (125 %) | A53 | 0.248 ms | 0.112 ms | 0.110 ms |
+| LeNet | 1.22 ms | 0.15 ms (11.9 %) | A53 | 1.405 ms | 1.254 ms | 1.253 ms |
+| ResNet-18 | 20.08 ms | 0.41 ms (2.0 %) | R5 | 20.38 ms | 20.40 ms | 19.99 ms |
+| MobileNet v1 | 20.54 ms | 0.54 ms (2.6 %) | R5 | 20.97 ms | 21.00 ms | 20.47 ms |
+| MobileNet v2 | 17.56 ms | 0.90 ms (5.1 %) | A53 | 18.34 ms | 17.43 ms | 17.46 ms |
+| YOLOv5n | 42.10 ms | 1.92 ms (4.6 %) | R5 | 49.07 ms | 48.98 ms | 46.97 ms |
+
+Every pass bit-exact; in the policy pass each project ran all 20 runs where
+its header said (0 or 20 on the R5).  The predictions are within 1 % of the
+A53 measurements except YOLO's (−10 %: its host ops, Concat and Resize,
+are priced low), which only makes its overhead fraction look larger.
+MobileNet v2 sits just over the limit with 100 calls: the cheaper protocol
+of B2 (only the changed registers, the IPI instead of polling) moves it
+and the 5 % limit is the knob (`MAX_OVERHEAD`).
+
+Next: the chat libraries regenerated (the policy attaches them by itself
+once the firmware runs at boot), the cheaper protocol (changed registers
+only, the IPI instead of polling: B2), then B3 power with the A53 cores
+idle during a batch.

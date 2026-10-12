@@ -172,6 +172,9 @@ left in place, non-depthwise grouped Conv) and a worked example on
 ├── test/test_inference.c     On-device test: ramp fill → run → compare vs GT
 ├── scripts/check_inference_setup.sh
 ├── driver/                   Kernel driver sources, flat (copied or stub README.md)
+├── rpu/rpu_host.c            The gate of the project on the Cortex-R5 (runtime/rpu/, RPU_PLAN B1):
+│                         the library with inference_rpu_attach() against itself, bit for bit;
+│                         built by the LINUX CMake as `rpu_host`
 ├── weights/                  External .dat files: weights > 4096 elems, host tables > 64 KiB
 ├── expected/                 External .dat files for large GT expected arrays (> 4096 elems)
 ├── report.md                 Model summary (unless --no-report; single-entry only)
@@ -189,7 +192,18 @@ upload_bitstream.py      Load .bit + xclbin + .dtbo on the board (src/bitstream/
 perf_calibrate.py        Performance-model campaign for --plan: cases / run / fit / host /
                          simulate / all (--refine, --resume)
 requirements.txt, pyproject.toml (ruff)
-runtime/                 inference_prof / inference_ddr sources copied into projects
+runtime/                 inference_prof / inference_ddr sources copied into projects; inference_rpu.[ch]
+                         the Cortex-R5 recorder (src/inference_rpu.c of every project: with
+                         inference_rpu_attach() the kernel calls, Starts and waits are recorded into a
+                         command ring the R5 firmware replays with interrupt-driven waits; the host
+                         ops and the outputs stay on the A53); runtime/rpu/ the firmware itself —
+                         model-independent, one build per bitstream (rpu_main.c, rpu_irq.c, the
+                         protocol rpu_ctrl.h, lscript.ld, CMake / toolchain) and the gate harness
+                         rpu_host.c — ../doc/plans/RPU_PLAN.md §9
+rpu_board.py             Board tool: builds the firmware against the BSP (../tools/rpu/), loads it
+                         through remoteproc (../board/kv260/rpu/rpu.dts), builds each project on the
+                         board and runs its rpu_host (N inferences on the R5, bit for bit against
+                         the A53)
 bench_src/               C benchmark project used by run_remote_perf.py; calib_runner.c
                          times perf_calibrate.py's kernel-call batches on the board
 perf_models/<platform>/  <bitstream-id>.cases / .calib / .json (kernel model), host.json
@@ -248,6 +262,11 @@ src/
   cost_model.py          ConvKernel / MatmulKernel (tiled + GEMV) cycle estimates
   _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py, _rowops_hw_config.py
                          platform JSON resolvers (kernels.{conv,matmul,pool,rowops})
+  rpu_policy.py          who drives the kernels when the Cortex-R5 firmware runs: the R5's
+                         overhead (8.4 µs a call, 61 µs a batch, fitted on the board) against
+                         the predicted inference time (the perf model, else the analytic cost
+                         model); <= 5 % -> the R5, else the A53 (INFERENCE_RPU_RECOMMENDED in
+                         the header, per entry; report.md "Cortex-R5") — RPU_PLAN §9.3
   rowops_spec.py         the row-ops unit's integer specification (rne / sat16, rsqrt and sigmoid
                          tables, layer_norm / rms_norm / silu_mul / rope, the register constants,
                          the parameter block and the 64 KiB table image)
@@ -292,7 +311,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              83 pytest modules, 1798 tests, all pass (test_bert_base.py
+  test_*.py              85 pytest modules, 1813 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -663,6 +682,14 @@ typedef uint16_t Data_t;              // ap_fixed<16,8> raw bits
 // One instance name per active kernel, registry order (VectorOP, Matmul, Conv, Pool);
 // defaults INFERENCE_<KERNEL>_INSTANCE ("VectorOPKernel_0", ...)
 int  inference_init(const char *vectoropkernel_instance /*, ... */);
+// bare metal: int inference_init(UINTPTR vectoropkernel_base /*, ... */);
+// kernel_id_t, INFERENCE_RPU_{N_IN,N_OUT,IO_SIZES,RUN};
+// INFERENCE_RPU_{CALLS,BATCHES,PREDICTED_US,OVERHEAD_US,RECOMMENDED}[_<ENTRY>] (src/rpu_policy.py)
+// inference_rpu.h (Linux): inference_init() attaches when the R5 firmware runs; each run then
+// follows INFERENCE_RPU_RECOMMENDED (env INFERENCE_RPU=0 / 1 overrides)
+int  inference_rpu_set_mode(int mode);            // INFERENCE_RPU_MODE_A53 / _AUTO / _R5
+int  inference_rpu_attach(unsigned ring_bytes);   // attach + the R5 drives every run
+void inference_rpu_detach(void);
 void inference_run(inference_buf_t *in, inference_buf_t *out);
 // signature lists all graph inputs then all graph outputs; host-memory tensors
 // (axi.numeric) are plain pointers; --entry projects: inference_run_<name>()
@@ -682,6 +709,16 @@ int              inference_buf_is_cached(const inference_buf_t *buf);  // static
 void             inference_buf_sync_to_device(inference_buf_t *buf);
 void             inference_buf_sync_from_device(inference_buf_t *buf);
 ```
+
+Bare metal (`BARE_METAL`) takes the kernels' AXI-Lite base addresses in `inference_init()`
+(`CfgInitialize`, no `_sinit.c`) and carves the DMA buffers from the region
+`inference_buf_pool_set(base, bytes)` was given.  On Linux the Cortex-R5 firmware, when it
+runs, can drive the kernels (`../doc/plans/RPU_PLAN.md` §9): `inference_init()` attaches, and
+each `inference_run*()` follows its entry's `INFERENCE_RPU_RECOMMENDED` — small models (the R5's
+per-call overhead above 5 % of the predicted time) stay on the A53, large ones go to the R5;
+`INFERENCE_RPU=0` / `1` in the environment overrides.  On the R5 the generated code's Starts and
+waits are recorded (the drivers write a shadow page) and flushed to the firmware before every
+host op and before the output sync; `rpu/rpu_host.c` is the gate (`make rpu_host`).
 
 Build knobs: `-DINFERENCE_TARGET=BARE_METAL|LINUX`, `-DINFERENCE_BUF_CACHEABLE=ON|OFF`
 (env `INFERENCE_BUF_CACHEABLE`), `-DINFERENCE_HOST_THREADS=N` (env

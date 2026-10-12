@@ -45,6 +45,13 @@ class TestCLI(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(td, "test", "test_inference.c")))
             self.assertTrue(os.path.isfile(os.path.join(td, "scripts", "check_inference_setup.sh")))
             self.assertTrue(os.path.isdir(os.path.join(td, "driver")))
+            # driving the kernels from the Cortex-R5 (RPU_PLAN B1): the recorder, the
+            # protocol header and the gate harness; the firmware itself is not per project
+            self.assertTrue(os.path.isfile(os.path.join(td, "src", "inference_rpu.c")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "include", "inference_rpu.h")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "include", "rpu_ctrl.h")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "rpu", "rpu_host.c")))
+            self.assertFalse(os.path.exists(os.path.join(td, "rpu", "rpu_main.c")))
 
     def test_driver_readme_when_no_src_dir(self):
         with tempfile.TemporaryDirectory() as td:

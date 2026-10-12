@@ -246,7 +246,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1798 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1813 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1717,6 +1717,29 @@ int  inference_init(const char *vectoropkernel_instance
                     [, const char *matmulkernel_instance]
                     [, const char *convkernel_instance]
                     [, const char *poolkernel_instance]);
+// Bare metal: the same parameters are the kernels' AXI-Lite base addresses (UINTPTR;
+// INFERENCE_RPU_INIT_ARGS names them from the BSP's xparameters.h), and
+// inference_buf_pool_set(base, bytes) gives the DMA buffers their region.
+typedef enum { KERNEL_VECTOROP, /* … the active kernels in registry order */ KERNEL_COUNT } kernel_id_t;
+#define INFERENCE_RPU_IO_DMA    1      // 0 when an input / output is a host-memory tensor
+#define INFERENCE_RPU_N_IN      n      // DMA inputs, then INFERENCE_RPU_N_OUT outputs
+#define INFERENCE_RPU_IO_SIZES  { INFERENCE_<T>_SIZE, … }
+#define INFERENCE_RPU_RUN(b)    inference_run((b)[0], …)
+// Who drives the kernels when the Cortex-R5 firmware runs (src/rpu_policy.py, RPU_PLAN §9.3):
+// the R5's overhead (8.4 µs a call + 61 µs a batch) against the predicted time, <= 5 % -> R5
+#define INFERENCE_RPU_CALLS         n    // kernel calls per inference (_<ENTRY> per entry)
+#define INFERENCE_RPU_BATCHES       n    // R5 batches: one per host op after kernel work + the last
+#define INFERENCE_RPU_PREDICTED_US  n    // the performance model's (else the analytic) prediction
+#define INFERENCE_RPU_OVERHEAD_US   n
+#define INFERENCE_RPU_RECOMMENDED   0|1  // 1: the R5 drives this entry's runs
+// Linux (inference_rpu.h, doc/plans/RPU_PLAN.md §9): inference_init() attaches when the firmware
+// runs; each run follows its entry's recommendation (env INFERENCE_RPU=0 / 1 overrides).  On the
+// R5 the library records every call's register block, Start and wait into a command ring and
+// flushes it before each host op and before the output sync.
+int  inference_rpu_set_mode(int mode);             // INFERENCE_RPU_MODE_A53 / _AUTO / _R5
+int  inference_rpu_attach(unsigned ring_bytes);    // attach + the R5 drives every run
+void inference_rpu_detach(void);                   // inference_deinit() calls it
+int  inference_rpu_stats(inference_rpu_stats_t *out);   // batches, calls, waits, interrupts per lane
 
 // All graph inputs, then all graph outputs (integer tensors hold raw int16;
 // host-memory tensors are plain pointers: const int32_t *ids, float *logits):

@@ -157,10 +157,11 @@ class TestMixedKernelCMake(unittest.TestCase):
         self.assertIn("driver/xvectoropkernel.c", cm)
         self.assertIn("driver/xmatmulkernel.c",   cm)
 
-    def test_both_sinit_files(self):
+    def test_both_linux_driver_files(self):
         cm = self._cmake("mixed_matmul_relu.onnx")
-        self.assertIn("xvectoropkernel_sinit.c", cm)
-        self.assertIn("xmatmulkernel_sinit.c",   cm)
+        self.assertIn("xvectoropkernel_linux.c", cm)
+        self.assertIn("xmatmulkernel_linux.c",   cm)
+        self.assertNotIn("_sinit.c", cm)        # bare metal: CfgInitialize from the base address
 
     def test_both_linux_files(self):
         cm = self._cmake("mixed_matmul_relu.onnx")

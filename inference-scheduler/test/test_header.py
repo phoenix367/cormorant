@@ -94,3 +94,42 @@ class TestHeaderGen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestHeaderRpuBlock(unittest.TestCase):
+    """The firmware's view of the project (RPU_PLAN track B1, runtime/rpu/)."""
+
+    def _header(self, model_name: str) -> str:
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return cg.generate_header()
+
+    def test_kernel_id_enum_in_header(self):
+        h = self._header("single_add.onnx")
+        self.assertIn("KERNEL_VECTOROP = 0u", h)
+        self.assertIn("KERNEL_COUNT = 1u", h)
+        self.assertIn("} kernel_id_t;", h)
+
+    def test_dma_io_macros(self):
+        h = self._header("single_add.onnx")
+        self.assertIn("#define INFERENCE_RPU_IO_DMA   1", h)
+        self.assertIn("#define INFERENCE_RPU_N_IN     1u", h)
+        self.assertIn("#define INFERENCE_RPU_N_OUT    1u", h)
+        self.assertIn("#define INFERENCE_RPU_IO_SIZES { INFERENCE_X_SIZE, INFERENCE_Y_SIZE }", h)
+        self.assertIn("#define INFERENCE_RPU_RUN(b)   inference_run((b)[0], (b)[1])", h)
+
+    def test_bare_metal_init_from_xparameters(self):
+        h = self._header("single_add.onnx")
+        self.assertIn("#define INFERENCE_RPU_LINUX_INIT_ARGS  INFERENCE_VECTOROPKERNEL_INSTANCE", h)
+        self.assertIn('#include "xparameters.h"', h)
+        self.assertIn("#define INFERENCE_RPU_BASE_VECTOROPKERNEL  XPAR_XVECTOROPKERNEL_0_BASEADDR", h)
+        self.assertIn("#define INFERENCE_RPU_IRQ_VECTOROPKERNEL   XPAR_FABRIC_XVECTOROPKERNEL_0_INTR", h)
+        self.assertIn("#define INFERENCE_RPU_INIT_ARGS  INFERENCE_RPU_BASE_VECTOROPKERNEL", h)
+        self.assertIn("#define INFERENCE_RPU_KERNELS  { { KERNEL_VECTOROP, INFERENCE_RPU_BASE_VECTOROPKERNEL, "
+                      "INFERENCE_RPU_IRQ_VECTOROPKERNEL } }", h)
+        # the Linux and bare-metal init prototypes; the Cortex-R5 recorder's API
+        self.assertIn("#ifdef __linux__", h)
+        self.assertIn('#include "inference_rpu.h"', h)
+        self.assertIn("UINTPTR", h)
+        self.assertIn("inference_buf_pool_set", h)

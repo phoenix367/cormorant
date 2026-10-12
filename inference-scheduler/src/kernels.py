@@ -31,6 +31,14 @@ class KernelDesc:
     driver_files: Tuple[str, ...] = ()
     driver_readme: str = ""
 
+    # The Cortex-R5 firmware's lane of this kernel (runtime/rpu/rpu_ctrl.h
+    # RPU_LANE_*: the registry order) and its argument registers from offset
+    # 0x10 in 32-bit words (the end of its register map, kernels/<k>_rtl/
+    # scripts/gen_driver.py; the control blocks decode 7 or 8 address bits, so a
+    # write past the map would alias onto a register — test_kernels checks it).
+    rpu_lane: int = 0
+    rpu_reg_words: int = 0
+
     @property
     def c_var(self) -> str:
         """Static C instance variable name, e.g. 's_vectoropkernel'."""
@@ -251,6 +259,8 @@ or re-run inference_scheduler.py with:
 KERNEL_REGISTRY: dict = {
     "VectorOPKernel": KernelDesc(
         name="VectorOPKernel",
+        rpu_lane=0,
+        rpu_reg_words=28,
         driver_prefix="xvectoropkernel",
         c_type="XVectoropkernel",
         uio_default="VectorOPKernel_0",
@@ -260,6 +270,8 @@ KERNEL_REGISTRY: dict = {
     ),
     "MatmulKernel": KernelDesc(
         name="MatmulKernel",
+        rpu_lane=1,
+        rpu_reg_words=29,
         driver_prefix="xmatmulkernel",
         c_type="XMatmulkernel",
         uio_default="MatmulKernel_0",
@@ -269,6 +281,8 @@ KERNEL_REGISTRY: dict = {
     ),
     "ConvKernel": KernelDesc(
         name="ConvKernel",
+        rpu_lane=2,
+        rpu_reg_words=45,
         driver_prefix="xconvkernel",
         c_type="XConvkernel",
         uio_default="ConvKernel_0",
@@ -278,6 +292,8 @@ KERNEL_REGISTRY: dict = {
     ),
     "PoolKernel": KernelDesc(
         name="PoolKernel",
+        rpu_lane=3,
+        rpu_reg_words=39,
         driver_prefix="xpoolingkernel",
         c_type="XPoolingkernel",
         uio_default="PoolKernel_0",
@@ -287,6 +303,8 @@ KERNEL_REGISTRY: dict = {
     ),
     "RowOpsKernel": KernelDesc(
         name="RowOpsKernel",
+        rpu_lane=4,
+        rpu_reg_words=24,
         driver_prefix="xrowopskernel",
         c_type="XRowopskernel",
         uio_default="RowOpsKernel_0",

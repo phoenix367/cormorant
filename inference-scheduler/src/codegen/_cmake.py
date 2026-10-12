@@ -16,6 +16,10 @@ class _CmakeMixin:
         out_desc = ", ".join(f"{t.onnx_name}{t.shape}" for t in outputs)
         model_basename = os.path.basename(self._model_path)
         active = self._active_kernels
+        rpu_instance_defs = "".join(
+            f"    if(DEFINED {kd.instance_macro})\n"
+            f"        target_compile_definitions(rpu_host PRIVATE {kd.instance_macro}=${{{kd.instance_macro}}})\n"
+            f"    endif()\n" for kd in active)
         kernel_names_str = " + ".join(kd.name for kd in active)
 
         # Generate per-kernel driver verification blocks
@@ -40,11 +44,12 @@ class _CmakeMixin:
         drv_verify_str = "\n".join(drv_verify_blocks)
 
         # Target-specific driver files (sinit.c / linux.c) per kernel
-        sinit_files = "\n".join(
-            f"    driver/{kd.driver_prefix}_sinit.c" for kd in active
-        )
+        # bare metal: the drivers are initialised with their base addresses
+        # (CfgInitialize in inference.c), so no _sinit.c / configuration table
+        sinit_files = ""
         linux_files = "\n".join(
-            f"    driver/{kd.driver_prefix}_linux.c" for kd in active
+            [f"    driver/{kd.driver_prefix}_linux.c" for kd in active]
+            + ["    src/inference_rpu.c"]      # the Cortex-R5 recorder (inference_rpu.h)
         )
 
         # Common (shared) kernel driver .c sources for the static library
@@ -74,9 +79,10 @@ class _CmakeMixin:
             f"# Two targets are supported via the INFERENCE_TARGET cache variable:\n"
             f"#\n"
             f"#   BARE_METAL (default)\n"
-            f"#     Cross-compile for Xilinx standalone / FreeRTOS BSP.\n"
-            f"#     Requires -DBSP_INCLUDE_DIR=<path> and an aarch64-none-elf toolchain.\n"
-            f"#     Drivers: *_sinit.c  (static device lookup, one per kernel)\n"
+            f"#     Cross-compile for the Xilinx standalone BSP (the Cortex-R5 firmware of\n"
+            f"#     rpu/ builds this library with rpu/CMakeLists.txt; RPU_PLAN track B1).\n"
+            f"#     Requires -DBSP_INCLUDE_DIR=<path>; inference_init() takes the kernels'\n"
+            f"#     base addresses (INFERENCE_RPU_INIT_ARGS from xparameters.h).\n"
             f"#     Cache:   Xil_DCacheFlushRange / Xil_DCacheInvalidateRange\n"
             f"#\n"
             f"#   LINUX\n"
@@ -213,6 +219,16 @@ class _CmakeMixin:
             f"\n"
             f"if(DEFINED _TARGET_LIBS)\n"
             f"    target_link_libraries(inference PUBLIC ${{_TARGET_LIBS}})\n"
+            f"endif()\n"
+            f"\n"
+            f"# The gate of this library on the Cortex-R5 (rpu/rpu_host.c, RPU_PLAN track B1): its\n"
+            f"# runs with the R5 driving the kernels against the A53, bit for bit.  Built on\n"
+            f"# request only (make rpu_host; rpu_board.py does): single-entry projects.\n"
+            f"if(INFERENCE_TARGET STREQUAL \"LINUX\" AND EXISTS ${{CMAKE_CURRENT_SOURCE_DIR}}/rpu/rpu_host.c)\n"
+            f"    add_executable(rpu_host EXCLUDE_FROM_ALL rpu/rpu_host.c)\n"
+            f"    target_include_directories(rpu_host PRIVATE ${{CMAKE_CURRENT_SOURCE_DIR}}/rpu ${{_TARGET_INCDIRS}})\n"
+            f"    target_link_libraries(rpu_host PRIVATE inference)\n"
+            f"{rpu_instance_defs}"
             f"endif()\n"
             f"\n"
             f"# -----------------------------------------------------------------------\n"

@@ -26,8 +26,11 @@ class TestCMakeGen(unittest.TestCase):
         self.assertIn("LINUX", cm)
 
     def test_bare_metal_driver_source(self):
+        # bare metal (the R5 firmware) initialises the kernels from their base
+        # addresses: no _sinit.c (device-id lookup), no _linux.c
         cm = self._cmake("single_add.onnx")
-        self.assertIn("xvectoropkernel_sinit.c", cm)
+        self.assertIn("driver/xvectoropkernel.c", cm)
+        self.assertNotIn("xvectoropkernel_sinit.c", cm.split("# External weight files")[0].split("LINUX")[0])
 
     def test_linux_driver_source(self):
         cm = self._cmake("single_add.onnx")

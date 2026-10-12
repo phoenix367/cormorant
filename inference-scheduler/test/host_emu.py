@@ -172,7 +172,7 @@ _VOP = r"""
  * writes with this macro, xvectoropkernel_hw.h of IPs that have it). */
 #define XVECTOROPKERNEL_CTRL_ADDR_ALPHA_DATA 0x64
 #define XVECTOROPKERNEL_CTRL_ADDR_SMX_CM_DATA 0x6c
-typedef struct { u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act, alpha,
+typedef struct { u64 Ctrl_BaseAddress; u64 a, b, c; uint32_t size, op, outer, a_inc, b_inc, act, alpha,
                  smx_cm, smx_cfg, smx_mask; } XVectoropkernel;
 static inline int XVectoropkernel_Initialize(XVectoropkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
@@ -304,7 +304,7 @@ _MM = r"""
 #ifndef EMU_TILE_M
 #error EMU_TILE_M
 #endif
-typedef struct { u64 a, b, c, a_to_b; uint32_t n, k, m, batch, a_batch_stride, b_batch_stride,
+typedef struct { u64 Ctrl_BaseAddress; u64 a, b, c, a_to_b; uint32_t n, k, m, batch, a_batch_stride, b_batch_stride,
                  c_batch_stride, b_packed, gemv_kw; } XMatmulkernel;
 static inline int XMatmulkernel_Initialize(XMatmulkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
@@ -361,7 +361,7 @@ _CONV = r"""
 #ifndef EMU_CONV_TILE_IC
 #error EMU_CONV_TILE_IC
 #endif
-typedef struct { u64 x, weight, bias, y;
+typedef struct { u64 Ctrl_BaseAddress; u64 x, weight, bias, y;
                  uint32_t batch, in_ch, in_h, in_w, out_ch, out_h, out_w, kh, kw,
                           stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left,
                           has_bias, is_depthwise; } XConvkernel;
@@ -442,7 +442,7 @@ _ROWOPS = r"""
  * 16-byte words, the lanes past the row zero; TRANSPOSE's scattered granules
  * are written byte-exact. */
 typedef __int128 i128;
-typedef struct { u64 a, b, c, p, eps; uint32_t op, n, rows, blocks, a_s1, a_s2, b_s1, b_s2,
+typedef struct { u64 Ctrl_BaseAddress; u64 a, b, c, p, eps; uint32_t op, n, rows, blocks, a_s1, a_s2, b_s1, b_s2,
                  c_s1, c_s2, aux, bq_sh, win_lo, win_hi; } XRowopskernel;
 static inline int XRowopskernel_Initialize(XRowopskernel *q, const char *nm)
 { (void)nm; memset(q, 0, sizeof *q); return 0; }
@@ -706,6 +706,9 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     w(os.path.join(emu, "xconvkernel.h"), _CONV)
     w(os.path.join(emu, "xrowopskernel.h"), _ROWOPS)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)
+    # the Cortex-R5 recorder (inference_rpu.h): linked, never attached here
+    shutil.copy(os.path.join(_ROOT, "runtime", "inference_rpu.h"), inc)
+    shutil.copy(os.path.join(_ROOT, "runtime", "rpu", "rpu_ctrl.h"), inc)
     if cg.large_weight_tensors:
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
         for t in cg.large_weight_tensors:
@@ -733,6 +736,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
            f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', f'-DINFERENCE_EXPECTED_DIR="{workdir}"',
            "-I", inc, "-I", emu,
            os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
+           os.path.join(_ROOT, "runtime", "inference_rpu.c"),
            os.path.join(tst, "test_inference.c"), "-lm", "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

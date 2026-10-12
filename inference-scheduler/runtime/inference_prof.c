@@ -18,7 +18,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
 #include <time.h>
+#endif
 
 typedef struct {
     uint64_t calls;
@@ -41,7 +43,11 @@ static unsigned            g_n_layers = 0u;
 static uint64_t now_ns(void)
 {
     struct timespec ts;
+#ifdef __linux__
     clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    ts.tv_sec = 0; ts.tv_nsec = 0;     /* no wall clock on bare metal: the firmware times runs itself */
+#endif
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 

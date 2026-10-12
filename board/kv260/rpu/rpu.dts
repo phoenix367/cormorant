@@ -1,0 +1,57 @@
+/*
+ * rpu.dts — the Cortex-R5 remoteproc overlay for the KV260 (RPU_PLAN track B1).
+ *
+ * Adds RPU core 0 as a remoteproc (xlnx 5.15 zynqmp_r5_remoteproc, split
+ * mode) with its two TCM banks, so the A53 can load and start the inference
+ * firmware a generated project's rpu/ directory builds:
+ *
+ *   dtc -I dts -O dtb -o rpu.dtbo rpu.dts
+ *   mkdir /sys/kernel/config/device-tree/overlays/rpu
+ *   cat rpu.dtbo > /sys/kernel/config/device-tree/overlays/rpu/dtbo
+ *   modprobe zynqmp_r5_remoteproc
+ *   echo rpu_firmware.elf > /sys/class/remoteproc/remoteproc0/firmware   (in /lib/firmware)
+ *   echo start > /sys/class/remoteproc/remoteproc0/state
+ *
+ * The firmware lives in the TCMs alone (no reserved DDR region, which an
+ * overlay applied after boot could not register); its DMA buffers are a CMA
+ * buffer the A53 allocates and names in the firmware's control block
+ * (rpu/rpu_ctrl.h).  No mailbox: the control block is polled (RPMsg over
+ * the IPI is track B2).  Power domains: PD_RPU_0 = 7, PD_R5_0_ATCM = 15,
+ * PD_R5_0_BTCM = 16 (dt-bindings/power/xlnx-zynqmp-power.h).
+ */
+/dts-v1/;
+/plugin/;
+
+&{/} {
+	tcm_0a: tcm@ffe00000 {
+		compatible = "mmio-sram";
+		reg = <0x0 0xffe00000 0x0 0x10000>;
+		power-domain = <&zynqmp_firmware 15>;   /* xlnx 5.15: the singular name */
+		status = "okay";
+	};
+
+	tcm_0b: tcm@ffe20000 {
+		compatible = "mmio-sram";
+		reg = <0x0 0xffe20000 0x0 0x10000>;
+		power-domain = <&zynqmp_firmware 16>;
+		status = "okay";
+	};
+
+	rf5ss@ff9a0000 {
+		compatible = "xlnx,zynqmp-r5-remoteproc";
+		xlnx,cluster-mode = <1>;
+		reg = <0x0 0xff9a0000 0x0 0x10000>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		r5f_0 {
+			compatible = "xilinx,r5f";
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+			sram = <&tcm_0a>, <&tcm_0b>;
+			power-domain = <&zynqmp_firmware 7>;
+		};
+	};
+};

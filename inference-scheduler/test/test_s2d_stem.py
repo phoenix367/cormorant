@@ -359,10 +359,13 @@ def _host_compile(cg, workdir):
         f.write(src)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"),
                 os.path.join(workdir, "include", "inference_prof.h"))
+    for name in ("inference_rpu.h", os.path.join("rpu", "rpu_ctrl.h")):     # the Cortex-R5 recorder's API
+        shutil.copy(os.path.join(_ROOT, "runtime", name),
+                    os.path.join(workdir, "include", os.path.basename(name)))
     for kd in cg._active_kernels:
         funcs = sorted(set(re.findall(rf"\b({kd.c_type}_[A-Za-z0-9_]+)\s*\(", src)))
         lines = ["#pragma once", "#include <stdint.h>",
-                 "typedef uint64_t u64;", f"typedef struct {{ int dummy; }} {kd.c_type};"]
+                 "typedef uint64_t u64;", f"typedef struct {{ u64 Ctrl_BaseAddress; }} {kd.c_type};"]
         for fn in funcs:
             if fn.endswith("_IsDone") or fn.endswith("_Initialize"):
                 lines.append(f"static inline int {fn}({kd.c_type} *p, ...) {{ (void)p; return 1; }}")

@@ -631,6 +631,8 @@ def run_calls(mg, workdir, calls, incoherent=False):
         with open(path, "w") as f:
             f.write(text)
     shutil.copy(os.path.join(host_emu._ROOT, "runtime", "inference_prof.h"), inc)
+    shutil.copy(os.path.join(host_emu._ROOT, "runtime", "inference_rpu.h"), inc)      # the R5 recorder: linked, never attached
+    shutil.copy(os.path.join(host_emu._ROOT, "runtime", "rpu", "rpu_ctrl.h"), inc)
     for name, tb in mg.host_table_files():
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
         with open(os.path.join(workdir, "weights", f"{name}.dat"), "wb") as f:
@@ -646,6 +648,7 @@ def run_calls(mg, workdir, calls, incoherent=False):
                         *(["-DEMU_INCOHERENT"] if incoherent else []),
                         f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', "-I", inc, "-I", emu,
                         os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
+                        os.path.join(host_emu._ROOT, "runtime", "inference_rpu.c"),
                         os.path.join(src, "drive.c"), "-lm", "-o", exe],
                        capture_output=True, text=True)
     if r.returncode:

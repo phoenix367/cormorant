@@ -141,6 +141,9 @@ class _CombinedCG(CodeGenerator):
         flags, rel = [], []
         for kd in self._active_kernels:
             call = (f"    rc = {kd.c_type}_Initialize(&{kd.c_var}, {kd.init_param});\n"
+                    "#else\n"
+                    f"    rc = _inference_cfg_init_{kd.driver_prefix}(&{kd.c_var}, {kd.init_param});\n"
+                    "#endif\n"
                     "    if (rc != 0) goto fail;\n")
             if src.count(call) != 1:
                 raise SchedulerError(f"internal: {kd.name} initialisation not found")
@@ -320,8 +323,10 @@ class MultiEntryGenerator:
             lines.append(f"#define INFERENCE_ENTRY_{name.upper()}_FIRST_LAYER  {base}u")
             base += len(g.nodes)
         lines.append("")
+        from ..rpu_policy import header_lines, rpu_estimate
         for name, _g in self.entries:
             lines += self.cgs[name]._header_run()
+            lines += header_lines(rpu_estimate(self.cgs[name]), suffix=f"_{name.upper()}")
             lines.append("")
         return "\n".join([_file_banner("inference.h", self.combined, cg._model_path),
                           cg._header_guard_open(), "\n".join(lines),

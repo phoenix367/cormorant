@@ -82,7 +82,10 @@ class TestNonBlockingPoolHelper(unittest.TestCase):
 class TestKernelWaitPrimitive(unittest.TestCase):
 
     def test_kernel_id_enum_emitted(self):
-        s = _gen_source("conv_simple.onnx")
+        # the enum lives in the header since RPU_PLAN B1 (the firmware's
+        # inference_irq.c names the lanes); inference.c includes it
+        g  = OnnxGraph(_model("conv_simple.onnx"))
+        s = CodeGenerator(g, model_path=_model("conv_simple.onnx")).generate_header()
         self.assertIn("typedef enum {", s)
         self.assertIn("} kernel_id_t;", s)
         # Conv-only model: only KERNEL_CONV is enumerated.

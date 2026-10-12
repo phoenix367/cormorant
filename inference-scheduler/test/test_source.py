@@ -127,3 +127,34 @@ class TestSourceGen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+@unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
+class TestRpuRecorderHooks(unittest.TestCase):
+    """The hooks that let the Cortex-R5 drive the kernels (inference_rpu.h,
+    RPU_PLAN B1): every Start goes through the recorder while attached, the
+    default kernel_wait records, the recorder's kernel table names each
+    kernel's lane and register count, and a batch is flushed before every
+    host op and before the output sync."""
+
+    def _source(self, model_name: str) -> str:
+        g  = OnnxGraph(_model(model_name))
+        cg = CodeGenerator(g, model_path=_model(model_name))
+        return cg.generate_source()
+
+    def test_start_intercept_and_table(self):
+        s = self._source("mixed_matmul_relu.onnx")
+        self.assertIn("#define XVectoropkernel_Start(inst)  (inference_rpu_active() ? "
+                      "inference_rpu_start(KERNEL_VECTOROP) : (XVectoropkernel_Start)(inst))", s)
+        self.assertIn("#define XMatmulkernel_Start(inst)  (inference_rpu_active() ? "
+                      "inference_rpu_start(KERNEL_MATMUL) : (XMatmulkernel_Start)(inst))", s)
+        self.assertIn("{ 0u, 28u, &s_vectoropkernel.Ctrl_BaseAddress },   /* KERNEL_VECTOROP */", s)
+        self.assertIn("{ 1u, 29u, &s_matmulkernel.Ctrl_BaseAddress },   /* KERNEL_MATMUL */", s)
+        self.assertIn("if (inference_rpu_active()) { inference_rpu_wait(k); return; }", s)
+        self.assertIn("#define INFERENCE_RPU_FLUSH()  ((void)0)", s)
+
+    def test_flush_before_output_sync(self):
+        s = self._source("single_add.onnx")
+        body = s[s.index("void inference_run("):]
+        self.assertIn("INFERENCE_RPU_FLUSH();", body)
+        self.assertLess(body.index("INFERENCE_RPU_FLUSH();"), body.index("Invalidate graph outputs"))

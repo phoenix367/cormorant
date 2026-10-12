@@ -476,12 +476,16 @@ class _TestMixin:
             "\n"
             "    /* 1. Initialise: open UIO devices, map DMA pool */\n"
             + (
+                "#ifdef __linux__\n"
                 "    rc = inference_init(\n"
                 + ",\n".join(
                     f"        {kd.instance_macro}"
                     for kd in self._active_kernels
                 )
                 + ");\n"
+                "#else\n"
+                "    rc = inference_init(INFERENCE_RPU_INIT_ARGS);   /* the base addresses of xparameters.h */\n"
+                "#endif\n"
             ) +
             "    if (rc != 0) {\n"
             "        fprintf(stderr, \"inference_init() failed: %d\\n\", rc);\n"

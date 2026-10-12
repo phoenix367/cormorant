@@ -557,11 +557,14 @@ class TestMixedAllKernelsCMake(unittest.TestCase):
         self.assertIn("xmatmulkernel.c",   cm)
         self.assertIn("xconvkernel.c",     cm)
 
-    def test_all_three_sinit_files(self):
+    def test_all_three_linux_driver_files(self):
+        # the Linux target's _linux.c (UIO) files; bare metal initialises the
+        # kernels from their base addresses (no _sinit.c, RPU_PLAN B1)
         cm = self._cm()
-        self.assertIn("xvectoropkernel_sinit.c", cm)
-        self.assertIn("xmatmulkernel_sinit.c",   cm)
-        self.assertIn("xconvkernel_sinit.c",     cm)
+        self.assertIn("xvectoropkernel_linux.c", cm)
+        self.assertIn("xmatmulkernel_linux.c",   cm)
+        self.assertIn("xconvkernel_linux.c",     cm)
+        self.assertNotIn("_sinit.c", cm)
 
     def test_all_three_linux_files(self):
         cm = self._cm()

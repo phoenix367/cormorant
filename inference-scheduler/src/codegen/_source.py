@@ -80,12 +80,38 @@ class _SourceMixin:
             f'#include "{kd.driver_prefix}.h"\n'
             for kd in self._active_kernels
         )
+        err = ('/* Diagnostics: stderr on Linux; the bare-metal firmware reports through its\n'
+               ' * control block (rpu/rpu_main.c) and has no console. */\n'
+               '#ifdef __linux__\n'
+               '#  define INFERENCE_ERR(...) fprintf(stderr, __VA_ARGS__)\n'
+               '#else\n'
+               '#  define INFERENCE_ERR(...) ((void)0)\n'
+               '#endif\n')
+        from ._source import _SourceMixin as _M
+        starts = "".join(
+            f"#define {kd.c_type}_Start(inst)  (inference_rpu_active() ? "
+            f"inference_rpu_start({_M._KERNEL_ID_ENUM[kd.name]}) : ({kd.c_type}_Start)(inst))\n"
+            for kd in self._active_kernels)
+        rpu = ('/* Driving the kernels from the Cortex-R5 (inference_rpu.h, RPU_PLAN B1): while\n'
+               ' * attached, a Start records the call for the firmware (the registers went to a\n'
+               ' * shadow page), a kernel_wait() records a wait, and INFERENCE_RPU_FLUSH() hands\n'
+               ' * the batch over where the host needs the results. */\n'
+               '#ifdef __linux__\n'
+               '#include "inference_rpu.h"\n'
+               f'{starts}'
+               '#define INFERENCE_RPU_FLUSH()  inference_rpu_flush()\n'
+               '#define INFERENCE_RPU_ENTER(r) inference_rpu_enter(r)\n'
+               '#else\n'
+               '#define INFERENCE_RPU_FLUSH()  ((void)0)\n'
+               '#define INFERENCE_RPU_ENTER(r) ((void)0)\n'
+               '#endif\n')
         return (
             _banner("Includes") +
             '#include "inference.h"\n'
             '#include "inference_prof.h"  /* INFERENCE_PROF_BEGIN/END (no-ops unless'
             ' INFERENCE_PROFILING is set) */\n'
             f'{kernel_headers}'
+            f'{rpu}'
             '#include <string.h>    /* memcpy */\n'
             f'{stdio}'
             f'{stdlib}'
@@ -103,6 +129,7 @@ class _SourceMixin:
             '/* Forward declarations — defined in inference_buf.c */\n'
             'void inference_buf_sync_to_device(inference_buf_t *buf);\n'
             'void inference_buf_sync_from_device(inference_buf_t *buf);\n'
+            + err
         )
 
     def _source_op_defines(self) -> str:
@@ -627,13 +654,17 @@ class _SourceMixin:
         """
         active = list(self._active_kernels)
         if not active:
-            return ""
+            return (
+                "#ifdef __linux__\n"
+                "/* No kernel in this project: nothing for the Cortex-R5 recorder (inference_rpu.h). */\n"
+                "const inference_rpu_kernel_t *inference_rpu_kernels(unsigned *count)\n"
+                "{\n"
+                "    *count = 0u;\n"
+                "    return (const inference_rpu_kernel_t *)0;\n"
+                "}\n"
+                "#endif\n")
 
-        enum_lines = ["typedef enum {"]
-        for i, kd in enumerate(active):
-            enum_lines.append(f"    {self._KERNEL_ID_ENUM[kd.name]} = {i}u,")
-        enum_lines.append(f"    KERNEL_COUNT = {len(active)}u")
-        enum_lines.append("} kernel_id_t;")
+        enum_lines = ["/* kernel_id_t: include/inference.h */"]
 
         case_lines = []
         for kd in active:
@@ -643,8 +674,25 @@ class _SourceMixin:
                 f"            break;"
             )
 
+        table = "".join(
+            f"    {{ {kd.rpu_lane}u, {kd.rpu_reg_words}u, &{kd.c_var}.Ctrl_BaseAddress }},"
+            f"   /* {self._KERNEL_ID_ENUM[kd.name]} */\n" for kd in active)
+        rpu_table = (
+            "#ifdef __linux__\n"
+            "/* The kernels for the Cortex-R5 recorder (inference_rpu.h), by kernel_id_t:\n"
+            " * the firmware's lane, the argument registers to copy, the instance. */\n"
+            "const inference_rpu_kernel_t *inference_rpu_kernels(unsigned *count)\n"
+            "{\n"
+            "    static const inference_rpu_kernel_t k[] = {\n"
+            f"{table}"
+            "    };\n"
+            "    *count = (unsigned)(sizeof k / sizeof k[0]);\n"
+            "    return k;\n"
+            "}\n"
+            "#endif\n\n")
         return (
             _banner("Kernel synchronization (split start / wait)") +
+            rpu_table +
             "/*\n"
             " * kernel_wait(k) — block until the most-recent Start on lane k completes.\n"
             " *\n"
@@ -658,11 +706,17 @@ class _SourceMixin:
             " * can override it at link time:\n"
             " *\n"
             " *     void kernel_wait(kernel_id_t k) { ... wait-for-IRQ ... }\n"
+            " *\n"
+            " * rpu/inference_irq.c is that override for the Cortex-R5 firmware (the\n"
+            " * GIC's PL lines, WFI between a Start and its ap_done).\n"
             " */\n"
             + "\n".join(enum_lines) + "\n\n"
             "__attribute__((weak))\n"
             "void kernel_wait(kernel_id_t k)\n"
             "{\n"
+            "#ifdef __linux__\n"
+            "    if (inference_rpu_active()) { inference_rpu_wait(k); return; }   /* the R5 waits */\n"
+            "#endif\n"
             "    switch (k) {\n"
             + "\n".join(case_lines) + "\n"
             "        default: break;\n"
@@ -1105,7 +1159,7 @@ class _SourceMixin:
                 + gemv_regs("inference_buf_phys(a) + (uint64_t)a_off * INFERENCE_BYTES_PER_ELEM",
                             "inference_buf_phys(b) + (uint64_t)b_off * INFERENCE_BYTES_PER_ELEM")
                 + f"    XMatmulkernel_Start(&{mm_var});\n"
-                f"    while (!XMatmulkernel_IsDone(&{mm_var})) {{}}\n"
+                f"    kernel_wait(KERNEL_MATMUL);\n"
                 "}\n"
             )
 
@@ -1709,13 +1763,17 @@ class _SourceMixin:
         load_helper = self._load_weight_helper() if self.large_weight_tensors else ""
 
         # Build inference_init() signature: one const char* param per active kernel
+        # (Linux: the UIO names); on bare metal the AXI-Lite base addresses
         active = self._active_kernels
-        if len(active) == 1:
-            params_decl = f"    const char *{active[0].init_param}"
-        else:
-            params_decl = ",\n".join(
-                f"    const char *{kd.init_param}" for kd in active
-            )
+        params_decl = ",\n".join(f"    const char *{kd.init_param}" for kd in active)
+        params_decl_bm = ",\n".join(f"    UINTPTR {kd.init_param}" for kd in active)
+        cfg_inits = "".join(
+            f"static int _inference_cfg_init_{kd.driver_prefix}({kd.c_type} *inst, UINTPTR base)\n"
+            "{\n"
+            f"    static {kd.c_type}_Config cfg;\n"
+            "    cfg.Ctrl_BaseAddress = base;\n"
+            f"    return {kd.c_type}_CfgInitialize(inst, &cfg);\n"
+            "}\n\n" for kd in active)
 
         # One Initialize call per active kernel
         init_calls = []
@@ -1730,7 +1788,7 @@ class _SourceMixin:
                     "     * register and would copy instead. */\n"
                     f"    XVectoropkernel_Set_smx_cm(&{kd.c_var}, 0x5A5A5Au);\n"
                     f"    if (XVectoropkernel_Get_smx_cm(&{kd.c_var}) != 0x5A5A5Au) {{\n"
-                    "        fprintf(stderr, \"inference_init: the VectorOPKernel has no softmax \"\n"
+                    "        INFERENCE_ERR(\"inference_init: the VectorOPKernel has no softmax \"\n"
                     "                \"unit (the bitstream predates it)\\n\");\n"
                     "        rc = -1;\n"
                     "        goto fail;\n"
@@ -1745,7 +1803,7 @@ class _SourceMixin:
                     "     * register and would pass these ops through unchanged. */\n"
                     f"    XVectoropkernel_Set_alpha(&{kd.c_var}, 0x5A5Au);\n"
                     f"    if (XVectoropkernel_Get_alpha(&{kd.c_var}) != 0x5A5Au) {{\n"
-                    "        fprintf(stderr, \"inference_init: the VectorOPKernel has no activation \"\n"
+                    "        INFERENCE_ERR(\"inference_init: the VectorOPKernel has no activation \"\n"
                     "                \"unit (the bitstream predates it)\\n\");\n"
                     "        rc = -1;\n"
                     "        goto fail;\n"
@@ -1753,7 +1811,11 @@ class _SourceMixin:
                 )
             init_calls.append(
                 f"    /* Initialise {kd.name} driver (UIO: {kd.uio_default}) */\n"
+                "#ifdef __linux__\n"
                 f"    rc = {kd.c_type}_Initialize(&{kd.c_var}, {kd.init_param});\n"
+                "#else\n"
+                f"    rc = _inference_cfg_init_{kd.driver_prefix}(&{kd.c_var}, {kd.init_param});\n"
+                "#endif\n"
                 "    if (rc != 0) goto fail;\n" + probe
             )
         if self._has_rowops_nodes:
@@ -1793,8 +1855,19 @@ class _SourceMixin:
             "int  inference_buf_pool_init(void);\n"
             "void inference_buf_pool_deinit(void);\n"
             "\n"
+            "#ifndef __linux__\n"
+            "/* Bare metal: the drivers' CfgInitialize with the base address (no\n"
+            " * configuration table, no device ids). */\n"
+            f"{cfg_inits}"
+            "#endif\n"
+            "\n"
+            "#ifdef __linux__\n"
             "int inference_init(\n"
             f"{params_decl})\n"
+            "#else\n"
+            "int inference_init(\n"
+            f"{params_decl_bm})\n"
+            "#endif\n"
             "{\n"
             "    int rc;\n"
             "\n"
@@ -1804,6 +1877,11 @@ class _SourceMixin:
             "\n"
             f"{alloc_str}"
             f"{init_calls_str}"
+            "#ifdef __linux__\n"
+            "    /* The Cortex-R5 firmware, when it runs, drives the kernels of the entries that\n"
+            "     * recommend it (INFERENCE_RPU_RECOMMENDED*; INFERENCE_RPU=0 / 1 overrides). */\n"
+            "    inference_rpu_select(0u);\n"
+            "#endif\n"
             "    return 0;\n"
             "\n"
             "fail:\n"
@@ -1813,6 +1891,9 @@ class _SourceMixin:
             "\n"
             "void inference_deinit(void)\n"
             "{\n"
+            "#ifdef __linux__\n"
+            "    inference_rpu_detach();   /* the drivers' real bases back; the ring is a pool buffer */\n"
+            "#endif\n"
             f"{deinit_body}"
             "    inference_buf_pool_deinit();\n"
             "}\n"
@@ -1872,6 +1953,7 @@ class _SourceMixin:
             ]
 
         sync_out_lines = [
+            "    INFERENCE_RPU_FLUSH();   /* the R5's batch, when it drives the kernels */",
             "    /* Invalidate graph outputs in CPU cache (FPGA → CPU) */",
         ] + [
             f"    inference_buf_sync_from_device({t.c_name});"
@@ -1925,8 +2007,10 @@ class _SourceMixin:
             elif kind == 'cpu':
                 # Host-side op (SpaceToDepthNode / HostNode): runs inline on
                 # the CPU and syncs its own buffers; profiled like a
-                # synchronous node.
+                # synchronous node.  With the R5 driving the kernels, the
+                # recorded batch must have run before the host reads.
                 sn = nodes_by_idx[ev[1]]
+                body_lines.append("    INFERENCE_RPU_FLUSH();")
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
                 if isinstance(sn, HostNode):
                     body_lines.append(self._emit_host_block(sn))
@@ -2028,7 +2112,9 @@ class _SourceMixin:
                 alias_restore_lines.append(f"    {c} = _prev_{c};")
             alias_restore_lines.append(f"    inference_buf_release({out_c});")
 
-        sections = []
+        suffix = self._run_name[len("inference_run"):].upper()
+        sections = [f"    INFERENCE_RPU_ENTER(INFERENCE_RPU_RECOMMENDED{suffix});   "
+                    "/* the R5 or the A53 drives this entry's kernels (src/rpu_policy.py) */"]
         if run_alias_assign_lines:
             sections.append("\n".join(run_alias_assign_lines))
         if alias_redirect_lines:

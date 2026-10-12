@@ -29,6 +29,10 @@ class _HeaderMixin:
             "extern \"C\" {\n"
             "#endif\n"
             "\n#include <stdint.h>\n"
+            "#include <stddef.h>\n"
+            "#ifndef __linux__\n"
+            "#include \"xil_types.h\"   /* UINTPTR: the standalone BSP (rpu/) */\n"
+            "#endif\n"
         )
 
     def _header_guard_close(self) -> str:
@@ -210,6 +214,15 @@ class _HeaderMixin:
         )
         lines.append("")
         lines.append(
+            "#ifndef __linux__\n"
+            "/* Bare metal: the DMA region to carve the buffers from (identity-mapped;\n"
+            " * the Cortex-R5 firmware passes the DDR buffer the A53 allocated) — before\n"
+            " * inference_init(); without it the standalone heap (malloc). */\n"
+            "void   inference_buf_pool_set(uintptr_t base, size_t bytes);\n"
+            "size_t inference_buf_pool_used(void);\n"
+            "#endif\n")
+        lines.append("")
+        lines.append(
             "/* Allocate a buffer for n_elem Data_t elements from the DMA pool.\n"
             " * Returns NULL on failure.  On Linux the bump allocator never frees\n"
             " * individual sub-allocations; call inference_deinit() to release all. */"
@@ -337,6 +350,57 @@ class _HeaderMixin:
         lines.append("")
         return lines
 
+    def _header_rpu_block(self) -> str:
+        """The firmware's view of the project (RPU_PLAN track B1, runtime/rpu/):
+        kernel_id_t (the lanes), the kernels' base addresses and PL interrupt
+        lines from the BSP's xparameters.h, the DMA I/O buffers."""
+        from ..codegen._source import _SourceMixin
+        active = self._active_kernels
+        enum = ["typedef enum {"]
+        for i, kd in enumerate(active):
+            enum.append(f"    {_SourceMixin._KERNEL_ID_ENUM[kd.name]} = {i}u,")
+        enum.append(f"    KERNEL_COUNT = {len(active)}u")
+        enum.append("} kernel_id_t;")
+        io = [t for t in self._graph.input_tensors] + [t for t in self._graph.output_tensors]
+        dma_io = all(not t.is_host for t in io)
+        lines = ["/* The kernel lanes (the argument of kernel_wait(), src/inference.c). */"] + enum + [""]
+        lines.append("/* The Cortex-R5 firmware of the project (rpu/, RPU_PLAN track B1) and its A53\n"
+                     " * side (rpu/rpu_host.c): the DMA I/O buffers in order, inputs first. */")
+        if dma_io:
+            n_in = len(self._graph.input_tensors)
+            lines.append("#define INFERENCE_RPU_IO_DMA   1   /* every input / output is a DMA buffer */")
+            lines.append(f"#define INFERENCE_RPU_N_IN     {n_in}u")
+            lines.append(f"#define INFERENCE_RPU_N_OUT    {len(io) - n_in}u")
+            lines.append("#define INFERENCE_RPU_IO_SIZES { "
+                         + ", ".join(f"INFERENCE_{t.c_name.upper()}_SIZE" for t in io) + " }")
+            lines.append("#define INFERENCE_RPU_RUN(b)   inference_run("
+                         + ", ".join(f"(b)[{i}]" for i in range(len(io))) + ")")
+        else:
+            lines.append("#define INFERENCE_RPU_IO_DMA   0   /* a host-memory input / output: no firmware I/O */")
+        if getattr(self, "_multi", None) is None:        # a multi-entry project: per entry (multi.py)
+            from ..rpu_policy import header_lines, rpu_estimate
+            lines.append("/* Who drives the kernels (src/rpu_policy.py): the library follows this at\n"
+                         " * inference_init() unless INFERENCE_RPU=0 / 1 in the environment. */")
+            lines += header_lines(rpu_estimate(self))
+        lines.append("#ifdef __linux__")
+        lines.append("#define INFERENCE_RPU_LINUX_INIT_ARGS  "
+                     + ", ".join(kd.instance_macro for kd in active) + "   /* the UIO names */")
+        lines.append('#include "inference_rpu.h"   /* inference_rpu_attach(): the R5 drives the kernels */')
+        lines.append("#else")
+        lines.append("#include \"xparameters.h\"")
+        lines.append("/* RPU firmware (rpu/): the kernels of this project as the BSP names them */")
+        for kd in active:
+            up = kd.c_type.upper()
+            lines.append(f"#define INFERENCE_RPU_BASE_{kd.name.upper()}  XPAR_{up}_0_BASEADDR")
+            lines.append(f"#define INFERENCE_RPU_IRQ_{kd.name.upper()}   XPAR_FABRIC_{up}_0_INTR   /* the PL line (SPI) */")
+        lines.append("#define INFERENCE_RPU_INIT_ARGS  "
+                     + ", ".join(f"INFERENCE_RPU_BASE_{kd.name.upper()}" for kd in active))
+        lines.append("#define INFERENCE_RPU_KERNELS  { "
+                     + ", ".join(f"{{ {_SourceMixin._KERNEL_ID_ENUM[kd.name]}, INFERENCE_RPU_BASE_{kd.name.upper()}, "
+                                 f"INFERENCE_RPU_IRQ_{kd.name.upper()} }}" for kd in active) + " }")
+        lines.append("#endif /* __linux__ */")
+        return "\n".join(lines)
+
     def _header_init(self) -> list:
         lines = []
         # inference_init()
@@ -347,7 +411,7 @@ class _HeaderMixin:
             init_params = f"const char *{active[0].init_param}"
             param_doc = (
                 f" * {active[0].init_param}  "
-                f"UIO sysfs name (Linux) or xparameters.h name (bare-metal).\n"
+                f"UIO sysfs name (Linux) or the AXI-Lite base address (bare metal).\n"
                 f" *              Default: \"{active[0].uio_default}\"\n"
             )
         else:
@@ -370,8 +434,17 @@ class _HeaderMixin:
             " * Returns 0 on success, non-zero on failure.\n"
             " */"
         )
+        init_params_bm = ",\n    ".join(f"UINTPTR {kd.init_param}" for kd in active)
+        lines.append("#ifdef __linux__")
         lines.append(f"int  inference_init({init_params});")
+        lines.append("#else")
+        lines.append("/* Bare metal (the standalone BSP, RPU_PLAN track B1): the kernels' AXI-Lite base\n"
+                     " * addresses instead of the UIO names — INFERENCE_RPU_INIT_ARGS below names them\n"
+                     " * from the BSP's xparameters.h. */")
+        lines.append(f"int  inference_init({init_params_bm});")
+        lines.append("#endif")
         lines.append("")
+        lines.append(self._header_rpu_block())
         lines.append(
             "/*\n"
             " * inference_deinit() — release all DMA buffers and the pool.\n"
