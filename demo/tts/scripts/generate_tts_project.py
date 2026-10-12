@@ -246,7 +246,7 @@ def main(argv=None) -> int:
     summary.update({"model": "piper-lessac-medium", "entry": info, "assets": os.path.abspath(a.assets),
                     "nodes": len(g.nodes), "encode_buckets": list(ENC_BUCKETS),
                     "encode_nodes": {n: len(eg.nodes) for n, eg in entries[1:]}, "vsmx": vsmx,
-                    "rowops": rowops,
+                    "rowops": rowops, "rel": vsmx and rowops,
                     "missing_drivers": missing, "generated_s": round(time.time() - t0, 1)})
     json.dump(summary, open(os.path.join(out, "project.json"), "w"), indent=2)
     print(f"project: {out} ({len(g.nodes)} nodes, pool {summary['pool_bytes'] / 2**20:.1f} MiB, "

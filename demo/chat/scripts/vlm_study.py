@@ -501,7 +501,11 @@ class VisionModel(ls.Model):
         vc = self.cfg
         n, P = vc.side, vc.P
         x = pix.astype(np.float64).reshape(n, P, n, P, 3).transpose(0, 2, 4, 1, 3).reshape(n * n, 3 * P * P)
-        h = self.resadd(np.zeros((n * n, vc.D)), self.lin(x, 0, "pe") + self.b0, 0)
+        # policy iembed (RPU_PLAN §3.1): the position table as an int32 DMA stream at 2^-res_bits
+        # (rounded once), the patch embedding added exactly by the row-ops unit's ADDX
+        b0 = (np.rint(self.b0 * p2v(int(self.pol["res_bits"]))) / p2v(int(self.pol["res_bits"]))
+              if self.q and self.pol.get("iembed") and self.pol.get("res_bits") else self.b0)
+        h = self.resadd(np.zeros((n * n, vc.D)), self.lin(x, 0, "pe") + b0, 0)
         for l in range(vc.L):
             xa = self.ln(h, self.ln1[l], "x", l)
             att = self.attn(self.lin(xa, l, "q"), self.lin(xa, l, "k"), self.lin(xa, l, "v"), l)
@@ -691,6 +695,10 @@ VPOLICIES = {
                                        res_bits=15, inorm=True, ibias=True, iqkv=True),
     "pow2+p12+vgelu+vsmx+r15+inorm+ibias": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
                                                 res_bits=15, inorm=True, ibias=True),
+    # + the patch-embedding add on the unit (RPU_PLAN §3.1): the position table rounded once at
+    # 2^-15 as an int32 DMA stream — iembed
+    "pow2+p12+vgelu+vsmx+rowops+iembed": dict(_F, fmt="pow2", p_bits=12, vop_gelu=True, vsmx=True,
+                                              res_bits=15, inorm=True, ibias=True, iqkv=True, iembed=True),
 }
 TEXT_SHIPPED = "pow2+sink+p12"        # FPGA decode attention too (doc/plans/KV_DECODE_PLAN.md)
 TEXT_FORMATS = "pow2+sink+p12"        # its exponents (llm_study formats)
@@ -700,15 +708,19 @@ VISION_VOP = "pow2+p12+vgelu"         # its formats, GELU on VectorOPKernel's ac
                                       # generates where the platform has the unit
 
 
-def vision_policy(activations: bool, softmax: bool = False, rowops: bool = False) -> str:
+def vision_policy(activations: bool, softmax: bool = False, rowops: bool = False, iembed=None) -> str:
     """The vision policy the scheduler's `vision` entry computes: VISION_VOP on a
     VectorOPKernel with the activation unit, else VISION_SHIPPED (host GELU);
     with ``softmax`` (the softmax unit, doc/plans/SOFTMAX_PLAN.md) VISION_VOP + vsmx;
-    with ``rowops`` (the row-ops unit, doc/plans/HOSTOPS_PLAN.md) + rowops as well."""
+    with ``rowops`` (the row-ops unit, doc/plans/HOSTOPS_PLAN.md) + rowops as well
+    (+ iembed, the patch-embedding add on the unit, where src/vit.py defaults to it)."""
     if rowops:
         if not (activations and softmax):
             raise ValueError("the rowops vision policy is studied with the VectorOP GELU and softmax only")
-        return VISION_VOP + "+vsmx+rowops"
+        if iembed is None:
+            from src.vit import IEMBED_DEFAULT
+            iembed = IEMBED_DEFAULT
+        return VISION_VOP + "+vsmx+rowops" + ("+iembed" if iembed else "")
     if softmax:
         if not activations:
             raise ValueError("the vsmx vision policy is studied with the VectorOP GELU only")

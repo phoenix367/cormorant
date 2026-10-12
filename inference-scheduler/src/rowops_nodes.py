@@ -224,6 +224,119 @@ def from_onnx_layernorm(node, tensors, index: int, align_elems: int, ctx: HostCo
 
 
 # ------------------------------------------------------------------ #
+# Transpose (BERT's head splits / merges and K^T; RPU_PLAN §3.1)      #
+# ------------------------------------------------------------------ #
+
+@dataclass
+class TransposeRoNode(RowOpsNode):
+    """An ONNX Transpose of an int16 DMA tensor as one unit job (a bit copy,
+    the reference is numpy's transpose).  After the host node's collapse of
+    the output dims (``host_nodes._collapse``: adjacent dims merged, size-1
+    dropped) two shapes map:
+
+      * **[D2][D1][n] from source strides [n, D2·n, 1]** — the two outer axes
+        swapped, the rows kept (a head split / merge): one COPY of n elements,
+        ``rows = D1``, ``blocks = D2`` (A: a_s1 = D2·n, a_s2 = n; C: c_s1 = n,
+        c_s2 = D1·n — in bytes);
+      * **[B][L][M] from source strides [sB, 1, sM]** — the innermost output
+        axis gathers source elements sM apart (K^T): one TRANSPOSE of tiles
+        of 8 source rows (m) x L into granules of 8 at the output's row
+        stride M, ``rows = M / 8`` tiles, ``blocks = B``.
+
+    Everything else (odd strides, a last dim not a multiple of 8, other
+    element sizes) stays the host op."""
+    kind: str = "copy"            # "copy" | "xpose"
+    n: int = 0                    # copy: elements per row; xpose: L
+    rows: int = 0
+    blocks: int = 1
+    a_off: int = 0
+    strides: tuple = (0, 0, 0, 0, 0, 0)       # a_s1, a_s2, b_s1, b_s2, c_s1, c_s2 (bytes)
+    perm: list = field(default_factory=list)
+    pz: object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_COPY, p_bcast=True) if self.kind == "copy" else rs.opword(rs.OP_XPOSE)
+
+    @property
+    def aux(self) -> int:
+        return 0 if self.kind == "copy" else QIMAGE_R
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        x = np.asarray(ins[0]).reshape(self.inputs[0].shape)
+        return np.ascontiguousarray(np.transpose(x, self.perm)).reshape(self.output.shape)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        s = self.strides
+        return [KernelCall.of("RowOpsKernel", op=self.opword, n=self.n, rows=self.rows, blocks=self.blocks,
+                              a_s1=s[0], a_s2=s[1], b_s1=s[2], b_s2=s[3], c_s1=s[4], c_s2=s[5], aux=self.aux,
+                              win_lo=0, win_hi=NO_WINDOW)]
+
+    def describe(self) -> str:
+        return (f"perm={''.join(str(p) for p in self.perm)} on RowOpsKernel ("
+                + ("COPY" if self.kind == "copy" else "TRANSPOSE, 8-row tiles")
+                + f": n={self.n} rows={self.rows} blocks={self.blocks})")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] Transpose({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        s = self.strides
+        return self.call(self.inputs[0].c_name, self.a_off, "NULL", 0, self.output.c_name, 0,
+                         self.pz.c_name if self.kind == "copy" else "NULL", self.opword, self.n, self.rows,
+                         self.blocks, s[0], s[1], s[2], s[3], s[4], s[5], 0, self.aux, 0, 0, NO_WINDOW)
+
+
+def transpose_job(dims: list, sstr: list, elem_bytes: int = 2):
+    """The unit job of a collapsed transpose (``host_nodes._collapse`` output:
+    5 dims left-padded with 1s and their source strides), or None where the
+    unit cannot do it.  Returns (kind, n, rows, blocks, strides)."""
+    d = [(int(a), int(b)) for a, b in zip(dims, sstr, strict=True) if a != 1]
+    if elem_bytes != 2 or not d or len(d) > 3:
+        return None
+    al = 16 // elem_bytes
+    if d[-1][1] == 1:                                  # the rows are kept: a COPY
+        if len(d) == 1:
+            return None                                # a plain copy: a Reshape, not a transpose
+        if len(d) == 2:
+            d = [(1, 0)] + d
+        (D2, s2), (D1, s1), (n, _) = d
+        if n % al or s1 % al or s2 % al or n > rs.N_MAX:
+            return None
+        return ("copy", n, D1, D2, (s1 * elem_bytes, s2 * elem_bytes, 0, 0,
+                                    n * elem_bytes, D1 * n * elem_bytes))
+    if len(d) == 2:
+        d = [(1, 0)] + d
+    (B, sB), (L, sL), (M, sM) = d
+    if sL != 1 or M % QIMAGE_R or sM % al or sB % al or L > 1024:
+        return None
+    return ("xpose", L, M // QIMAGE_R, B, (QIMAGE_R * sM * elem_bytes, sB * elem_bytes, sM * elem_bytes,
+                                           M * elem_bytes, QIMAGE_R * elem_bytes, L * M * elem_bytes))
+
+
+def from_onnx_transpose(node, tensors, index: int, align_elems: int, ctx: HostContext, dtype):
+    """The scheduled node of a Transpose: TransposeRoNode where the unit can run
+    it (an int16 DMA tensor, one of the two shapes above), else the host
+    TransposeNode."""
+    from .host_nodes import TransposeNode
+    host = TransposeNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    x, y = host.inputs[0], host.output
+    if not enabled() or dtype.bytes_per_elem != 2 or x.is_host or y.is_host or x.dma or y.dma \
+            or x.is_state or y.is_state or host.offset % align_elems:
+        return host
+    job = transpose_job(host.dims, host.sstr, dtype.bytes_per_elem)
+    if job is None:
+        return host
+    kind, n, rows, blocks, strides = job
+    return TransposeRoNode(onnx_node=node, inputs=[x, zero_param_tensor(tensors), tables_tensor(tensors)],
+                           output=y, index=index, align_elems=align_elems, F=ctx.frac_bits, kind=kind, n=n,
+                           rows=rows, blocks=blocks, a_off=host.offset * dtype.bytes_per_elem, strides=strides,
+                           perm=list(host.perm), pz=zero_param_tensor(tensors))
+
+
+# ------------------------------------------------------------------ #
 # The Llama ops (src/llama.py rowops=True; llm_study policy ...+rowops)  #
 # ------------------------------------------------------------------ #
 
@@ -1079,21 +1192,21 @@ def _resadd_bias(cls, node, tensors, index, align_elems, ctx, h, d, y, bias, fr,
     """A ResAddBiasRoNode of h (int16 / int32 at one exponent) + d + bias -> y (int32 at fr)."""
     F = ctx.frac_bits
     n = int(h.shape[-1])
-    fa = _exps(h, F)
-    _require((fa == fa[0]).all() and y.dma == "i32" and (_exps(y, F) == fr).all(), node,
-             "h at one exponent, the output the int32 residual")
+    fa = _exps(h, F)                                 # an int16 h may be at per-channel exponents
+    _require((h.dma is None or (fa == fa[0]).all()) and y.dma == "i32" and (_exps(y, F) == fr).all(), node,
+             "an int32 h at one exponent, the output the int32 residual")
     _require(d.dma is None and d.host is None and not d.is_state and d.shape[-1] == n, node,
              "delta: an int16 DMA tensor of the residual's width")
     _require(d.numel == h.numel == y.numel, node, "shapes")
     fd = _exps(d, F)
-    _require(0 <= fr - fa[0] <= 63 and (fd <= fr).all() and (fr - fd <= 63).all(), node,
+    _require((fa <= fr).all() and (fr - fa <= 63).all() and (fd <= fr).all() and (fr - fd <= 63).all(), node,
              f"exponents beyond the residual's 2^-{fr}")
     _require(n % align_elems == 0, node, f"row length {n} % {align_elems}")
     bias = np.asarray(bias, np.float64).reshape(-1)
     _require(bias.size == n and np.isfinite(bias).all(), node, "bias [n]")
     bb = rs.bias_bits(bias, fr)
     bq = np.rint(bias * 2.0 ** bb).astype(np.int64)
-    p, bc = _pblock(tensors, name, 0, bq, fr - fa[0], fr - fd, 0, n)
+    p, bc = _pblock(tensors, name, 0, bq, fr - fa, fr - fd, 0, n)
     return cls(onnx_node=node, inputs=[h, d, p, tables_tensor(tensors)], output=y, index=index,
                align_elems=align_elems, F=F, rows=h.numel // n, n=n, fr=int(fr), bcast=bc, bb=int(bb),
                fa=int(fa[0]), a32=h.dma == "i32", bias=bias)
@@ -1128,13 +1241,14 @@ def _layernorm32(node, tensors, index, align_elems, ctx, h, y, gamma, beta, eps)
 def from_vit_resadd(node, tensors, index, align_elems, ctx: HostContext):
     """VitResAdd: ResAddBiasRoNode when h is the int32 DMA residual, else the host op."""
     from .vit_nodes import VitResAddNode, _bias
-    h = tensors.get(node.input[0])
-    if h is None or h.dma != "i32":
+    h, y = tensors.get(node.input[0]), tensors.get(node.output[0])
+    if h is None or y is None or (h.dma != "i32" and y.dma != "i32"):
         return VitResAddNode.from_onnx_node(node, tensors, index, align_elems, ctx)
     _need_unit(node, "the int32 DMA residual")
-    d, y = tensors[node.input[1]], tensors[node.output[0]]
+    _require(h.host is None and not h.is_state and h.dma in (None, "i32"), node, "h: a DMA tensor")
+    d = tensors[node.input[1]]
     n = int(h.shape[-1])
-    fr = int(_exps(h, ctx.frac_bits)[0])
+    fr = int(_exps(y, ctx.frac_bits)[0])             # the int32 sum's exponent (h's when h is the residual)
     return _resadd_bias(ResAddBiasRoNode, node, tensors, index, align_elems, ctx, h, d, y,
                         _bias(ctx, tensors, node, 2, n, "bias"), fr, f"{y.onnx_name}__rowops_p")
 
@@ -1196,6 +1310,8 @@ class VitAttnPrepRoNode(RowOpsNode):
     pk: list = field(default_factory=list, repr=False)
     pvb: object = field(default=None, repr=False)
     pz: object = field(default=None, repr=False)
+    ekr: object = field(default=None, repr=False)   # Piper rel_kernel: raw key rows [CR][D] -> cache rows T ..
+    CR: int = 0
 
     @property
     def D(self) -> int:
@@ -1228,18 +1344,22 @@ class VitAttnPrepRoNode(RowOpsNode):
             jobs.append((f"k0 + bk of head {h} at f_k -> the K cache", self.k0, h * HD * 2, None, 0, self.ck,
                          h * C * HD * 2, self.pk[h], rs.opword(rs.OP_COPY), HD, T, 1, sk, 0, 0, 0, HD * 2, 0,
                          0, 0, NW))
+        if self.CR:
+            jobs.append((f"the relative keys -> K cache rows {T} .. {T + self.CR - 1} of every head", self.ekr, 0,
+                         None, 0, self.ck, T * HD * 2, self.pz, rs.opword(rs.OP_COPY, p_bcast=True), HD, self.CR,
+                         H, D * 2, HD * 2, 0, 0, HD * 2, C * HD * 2, 0, 0, NW))
         jobs.append(("v + bv at the V cache's exponents -> vs", self.v, 0, None, 0, self.vs, 0, self.pvb,
                      rs.opword(rs.OP_COPY, p_bcast=self.pv_bc), D, T, 1, sv, 0, 0, 0, SV, 0, 0, 0, NW))
-        if K == 1:
+        if K == 1:                                       # the V cache has T rows per head (C: the K cache's)
             jobs.append(("vs -> the V cache rows (the heads as blocks)", self.vs, 0, None, 0, self.cv, 0,
                          self.pz, rs.opword(rs.OP_COPY, p_bcast=True), HD, T, H, SV, HD * 2, 0, 0, HD * 2,
-                         C * HD * 2, 0, 0, NW))
+                         T * HD * 2, 0, 0, NW))
         else:
             for h in range(H):
                 for a_off, c_off, rows, blocks, a_s1, a_s2, b_s1, b_s2, c_s1, c_s2, R in \
                         vimage_jobs(0, T, HD, K, SV):
                     jobs.append((f"the V image of head {h}", self.vs, h * HD * 2 + a_off, None, 0, self.cv,
-                                 h * C * HD * 2 + c_off, None, xp, HD, rows, blocks, a_s1, a_s2, b_s1, b_s2,
+                                 h * T * HD * 2 + c_off, None, xp, HD, rows, blocks, a_s1, a_s2, b_s1, b_s2,
                                  c_s1, c_s2, R, 0, NW))
         return jobs
 
@@ -1278,6 +1398,9 @@ class VitAttnPrepRoNode(RowOpsNode):
                                 * p2(_exps(t, F))[None, :]).astype(np.int64)
         ck, cv = a[self.ck.onnx_name], a[self.cv.onnx_name]       # logical state arrays (raw), in place
         ck[:T] = rs.bias_round(raw(self.k0), _exps(self.k0, F), self.bk, np.repeat(self.fk, HD))
+        if self.CR:                                              # the key rows' Q8.8 image, raw
+            ck[T:T + self.CR] = np.rint(np.asarray(a[self.ekr.onnx_name], np.float64).reshape(self.CR, D)
+                                        * p2(_exps(self.ekr, F))[None, :])
         cv[:T] = rs.bias_round(raw(self.v), _exps(self.v, F), self.bv, self.fv)
         yq = rs.bias_round(raw(self.q0), _exps(self.q0, F), self.bq, np.repeat(self.fq, HD))
         return yq.astype(np.float64).reshape(T, H, HD).transpose(1, 2, 0).copy()      # [H][HD][T]
@@ -1294,8 +1417,9 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     _need_unit(node, "rowops = 1")
     F = ctx.frac_bits
     ins = _llm_inputs(node, tensors)
-    _require(len(ins) == 10, node, "inputs: q0, k0, v, cache_k, cache_v, bq, bk, bv, qs, vs")
-    q0, k0, v, ck, cv, _bq, _bk, _bv, qs, vs = ins
+    _require(len(ins) in (10, 11), node, "inputs: q0, k0, v, cache_k, cache_v, bq, bk, bv, qs, vs[, key_rows]")
+    q0, k0, v, ck, cv, _bq, _bk, _bv, qs, vs = ins[:10]
+    ekr = ins[10] if len(ins) == 11 else None
     y = _resolve(tensors, node.output[0], node)
     a = _attrs(node)
     H, HD = int(a["num_heads"]), int(a["head_dim"])
@@ -1303,9 +1427,18 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     D = H * HD
     T = q0.numel // D
     K = int(cv.group_kw)
+    CR = 0
     _require(int(a.get("qk_kw", 1)) == 1, node, "the unit writes the q image with qk_kw = 1")
     _require(HD % 16 == 0 and HD <= 1024, node, f"head_dim {HD}: a multiple of 16")
-    _require(T == C, node, f"rows {T} must equal the cache rows {C} (every key is valid)")
+    _require(int(cv.shape[0]) == T, node, f"rows {T} must equal the V cache rows {cv.shape[0]}")
+    if ekr is None:
+        _require(T == C, node, f"rows {T} must equal the cache rows {C} (every key is valid)")
+    else:                       # Piper rel_kernel: constant key rows [CR][D] (raw) behind the T keys of every head
+        CR = int(ekr.shape[0])
+        _require(len(ekr.shape) == 2 and int(ekr.shape[1]) == D and ekr.is_weight and ekr.dma is None
+                 and (ekr.exp_channels(F) == F).all(), node,
+                 f"key_rows: a constant [rows][{D}] at 2^-{F} (its image the raw cache rows)")
+        _require(T + CR == C, node, f"the cache rows {C} must be {T} + the {CR} key rows")
     _require(T % QIMAGE_R == 0, node, f"rows {T} % {QIMAGE_R} (the q image's tiles)")
     _require(K == 1 or T % (16 * K) == 0, node, f"rows {T} % the V image's {16 * K}-row blocks")
     _require(q0.numel == k0.numel == v.numel == T * D, node, "q / k / v shapes")
@@ -1338,10 +1471,11 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     pvb, pv_bc = _pblock(tensors, f"{y.onnx_name}__rowops_pv", 0, bvq, sav, 0, scv, D)
     pz = zero_param_tensor(tensors)
     tb = tables_tensor(tensors)
-    return VitAttnPrepRoNode(onnx_node=node, inputs=[q0, k0, v, ck, cv, qs, vs, pq, *pk, pvb, pz, tb], output=y,
+    return VitAttnPrepRoNode(onnx_node=node, inputs=[q0, k0, v, ck, cv, qs, vs, pq, *pk, pvb, pz, tb]
+                             + ([ekr] if ekr is not None else []), output=y,
                              index=index, align_elems=align_elems, F=F, T=T, H=H, HD=HD, C=C, K=K,
                              pq_bc=pq_bc, pv_bc=pv_bc, fq=fq, fk=fk, fv=fv, bq=bq, bk=bk, bv=bv, q0=q0, k0=k0,
-                             v=v, ck=ck, cv=cv, qs=qs, vs=vs, pq=pq, pk=pk, pvb=pvb, pz=pz)
+                             v=v, ck=ck, cv=cv, qs=qs, vs=vs, pq=pq, pk=pk, pvb=pvb, pz=pz, ekr=ekr, CR=CR)
 
 
 VIT_OVERRIDES = {
@@ -1525,15 +1659,607 @@ def from_tts_layernorm(node, tensors, index, align_elems, ctx: HostContext):
                         _bias(ctx, tensors, node, 2, n, "beta"), eps)
 
 
+@dataclass
+class TtsSumRoNode(RowOpsNode):
+    """A two-input TtsSum of the Piper flows (h + the res-skip half, RPU_PLAN
+    §3.1) on the unit: one ADDX over the ``nch`` channel rows of L — A and B
+    the channel slices [ch0, ch0 + nch) of their [C][L] tensors, the shifts
+    fp - f_in0 / fp - f_in1 / fp - f_out at fp = max of the three exponents:
+    the host's integer path (round half to even, saturate), bit for bit."""
+    nch: int = 1
+    L: int = 1
+    ch0s: tuple = (0, 0)
+    f_ins: tuple = (0, 0)
+    f_out: int = 0
+    pb: object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_ADDX, rs.K_I16, rs.K_I16, rs.K_I16, b_en=True, p_bcast=True)
+
+    def _regs(self):
+        LB = self.L * 2
+        return dict(op=self.opword, n=self.L, rows=self.nch, blocks=1, a_s1=LB, a_s2=0, b_s1=LB, b_s2=0,
+                    c_s1=LB, c_s2=0, aux=0, win_lo=0, win_hi=NO_WINDOW)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        return [KernelCall.of("RowOpsKernel", **self._regs())]
+
+    def describe(self) -> str:
+        return (f"2 inputs [{self.nch}][{self.L}] at 2^-{self.f_ins[0]} / 2^-{self.f_ins[1]} -> 2^-{self.f_out} "
+                f"on RowOpsKernel (ADDX)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsSum({self.inputs[0].onnx_name}, {self.inputs[1].onnx_name}) -> "
+                f"{self.output.onnx_name}  {self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        r = self._regs()
+        return self.call(self.inputs[0].c_name, self.ch0s[0] * self.L * 2, self.inputs[1].c_name,
+                         self.ch0s[1] * self.L * 2, self.output.c_name, 0, self.pb.c_name, r["op"], r["n"],
+                         r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        fp = max(*self.f_ins, self.f_out)
+        acc = None
+        for x, c0, f in zip(ins[:2], self.ch0s, self.f_ins, strict=True):
+            raw = np.rint(np.asarray(x, np.float64).reshape(-1, self.L)[c0:c0 + self.nch] * 2.0 ** f).astype(np.int64)
+            acc = (raw << (fp - f)) if acc is None else acc + (raw << (fp - f))
+        y = rs.sat16(rs.rne_shr_vec(acc, np.full(acc.shape, fp - self.f_out)))
+        return (y / 2.0 ** self.f_out).reshape(self.output.shape)
+
+
+def from_tts_sum(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsSum: the VectorOP ADD or the host op as before; a two-input unmasked
+    sum with differing exponents or channel offsets becomes TtsSumRoNode."""
+    from .tts_nodes import TtsAddVopNode, TtsSumNode
+    host = TtsSumNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    if isinstance(host, TtsAddVopNode) or not enabled():
+        return host
+    xs = host.inputs[:2]
+    if (len(host.ch0s) != 2 or host.masked or host.div != 1.0 or host.L % align_elems
+            or any(t.dma or t.is_host or t.is_state for t in xs + [host.output])
+            or any(c0 * host.L % align_elems for c0 in host.ch0s) or host.L > rs.N_MAX):
+        return host
+    fp = max(*host.f_ins, host.f_out)
+    if fp - min(host.f_ins) > 63:
+        return host
+    pb, _bc = _pblock(tensors, f"{host.output.onnx_name}__rowops_p", 0, 0, fp - host.f_ins[0], fp - host.f_ins[1],
+                      fp - host.f_out, 1)
+    return TtsSumRoNode(onnx_node=node, inputs=[xs[0], xs[1], pb, tables_tensor(tensors)], output=host.output,
+                        index=index, align_elems=align_elems, F=ctx.frac_bits, nch=host.nch, L=host.L,
+                        ch0s=tuple(host.ch0s), f_ins=tuple(host.f_ins), f_out=host.f_out, pb=pb)
+
+
+@dataclass
+class TtsInterleaveRoNode(RowOpsNode):
+    """TtsInterleave (the polyphase phases of a ConvTranspose into one row,
+    y[o][m·s + r] = x[r·O + o][m]) on the unit: one TRANSPOSE of tiles of
+    R = s phase rows x L into contiguous granules of s, one tile per output
+    channel o — a bit copy."""
+    s: int = 1
+    O: int = 1      # noqa: E741
+    L: int = 1
+    Lc: int = 1     # columns per tile (<= 1024): L / Lc column chunks as the job's blocks
+
+    def _regs(self):
+        return dict(op=rs.opword(rs.OP_XPOSE), n=self.Lc, rows=self.O, blocks=self.L // self.Lc, a_s1=self.L * 2,
+                    a_s2=self.Lc * 2, b_s1=self.O * self.L * 2, b_s2=2 * self.s, c_s1=self.L * self.s * 2,
+                    c_s2=self.Lc * self.s * 2, aux=self.s, win_lo=0, win_hi=NO_WINDOW)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        return [KernelCall.of("RowOpsKernel", **self._regs())]
+
+    def describe(self) -> str:
+        return (f"interleave {self.s} phases of [{self.O}][{self.L}] on RowOpsKernel (TRANSPOSE, R = {self.s}, "
+                f"{self.L // self.Lc} column chunks of {self.Lc})")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsInterleave({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        r = self._regs()
+        return self.call(self.inputs[0].c_name, 0, "NULL", 0, self.output.c_name, 0, "NULL", r["op"], r["n"],
+                         r["rows"], r["blocks"], r["a_s1"], r["a_s2"], r["b_s1"], r["b_s2"], r["c_s1"], r["c_s2"],
+                         0, r["aux"], 0, 0, NO_WINDOW)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        x = np.asarray(ins[0], np.float64).reshape(self.s, self.O, self.L)
+        return x.transpose(1, 2, 0).reshape(self.output.shape)
+
+
+def from_tts_interleave(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsInterleave: TtsInterleaveRoNode where the unit can run it, else the host op."""
+    from .tts_nodes import TtsInterleaveNode
+    host = TtsInterleaveNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    x, y = host.inputs[0], host.output
+    Lc = next((c for c in range(min(host.L, 1024), 0, -1) if host.L % c == 0 and c % align_elems == 0), 0)
+    if (not enabled() or host.s > 8 or host.L % align_elems or not Lc
+            or any(t.dma or t.is_host or t.is_state for t in (x, y))):
+        return host
+    return TtsInterleaveRoNode(onnx_node=node, inputs=[x, tables_tensor(tensors)], output=y, index=index,
+                               align_elems=align_elems, F=ctx.frac_bits, s=host.s, O=host.O, L=host.L, Lc=Lc)
+
+
+@dataclass
+class TtsRelBandRoNode(RowOpsNode):
+    """The Piper encoder's relative-key band on the unit (RPU_PLAN §3.1,
+    ``PiperEncoderFrontend(rel_kernel=True)``): the scores ``s`` [T + CR][T]
+    (keys-major) carry, as rows T + k, the band terms q.ek_k^T of key offset
+    d = k - W (the relative keys are K cache rows, VitAttnPrepRoNode).  Per
+    offset one TRANSPOSE of R = 1 (byte-strobed granules 2(T + 1) bytes apart)
+    writes row T + k from its (16-byte-aligned) start onto the diagonal
+    (i + d, i) of the band state [W + T][T] — its first W rows are guard rows
+    that take the granules of i < -d (a stream A must start aligned, so a
+    negative offset's row is read whole); the band proper, rows W .., is zero
+    off the diagonals (they are rewritten every run).  Then one ADDX adds the
+    band to the first T rows: lg[j][i] = sat16(s[j][i] + band[W + j][i]) —
+    the host op's band add on every row and column (the softmax masks keys
+    and queries >= n).  inputs [s, band (state), P0, tables]."""
+    T: int = 1
+    CR: int = 16
+    W: int = 4
+    band: object = field(default=None, repr=False)
+    pz: object = field(default=None, repr=False)
+
+    def state_writes(self):
+        return [self.band]
+
+    def state_updates(self):
+        return self.state_writes()
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_ADDX, rs.K_I16, rs.K_I16, rs.K_I16, b_en=True, p_bcast=True)
+
+    def _jobs(self):
+        T, W = self.T, self.W
+        xp, NW = rs.opword(rs.OP_XPOSE), NO_WINDOW
+        s, band = self.inputs[0], self.band
+        jobs = []
+        for d in range(-W, W + 1):
+            jobs.append((f"key offset {d:+d}: row {T + d + W} of the scores -> the diagonal (i {d:+d}, i)", s,
+                         (T + d + W) * T * 2, None, 0, band, (d + W) * T * 2, None, xp, T - max(d, 0),
+                         1, 1, 0, 0, 0, 2 * (T + 1), 0, 0, 1, 0, NW))
+        jobs.append(("the scores + the band", s, 0, band, W * T * 2, self.output, 0, self.pz, self.opword, T, T, 1,
+                     T * 2, 0, T * 2, 0, T * 2, 0, 0, 0, NW))
+        return jobs
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall, merge
+        return merge([KernelCall.of("RowOpsKernel", op=j[8], n=j[9], rows=j[10], blocks=j[11], a_s1=j[12],
+                                    a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
+                                    win_lo=j[19], win_hi=j[20]) for j in self._jobs()])
+
+    def describe(self) -> str:
+        return (f"[{self.T}] keys x [{self.T}] queries + the relative-key band (window {self.W}) on RowOpsKernel: "
+                f"{2 * self.W + 1} diagonal TRANSPOSEs (R = 1) onto the band state + one ADDX")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsRelBand({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        cn = lambda t: "NULL" if t is None else t.c_name   # noqa: E731
+        lines = ["    {"]
+        for i, j in enumerate(self._jobs()):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(f"        /* {j[0]} */")
+            lines.append(self.call(cn(j[1]), j[2], cn(j[3]), j[4], cn(j[5]), j[6], cn(j[7]), j[8], j[9], j[10],
+                                   j[11], j[12], j[13], j[14], j[15], j[16], j[17], 0, j[18], 0, j[19], j[20],
+                                   indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        T, W = self.T, self.W
+        s = np.rint(np.asarray(ins[0], np.float64).reshape(T + self.CR, T)).astype(np.int64)
+        band = ins[1]                                           # the logical state array [W + T][T], in place
+        for d in range(-W, W + 1):
+            i = np.arange(0, T - max(d, 0))
+            band[i + d + W, i] = s[T + d + W, i]
+        y = rs.sat16(s[:T] + np.rint(band[W:]).astype(np.int64))
+        return y.astype(np.float64).reshape(self.output.shape) + 0.0
+
+
+def from_tts_rel_band(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsRelBand (src/piper.py rel_kernel=True) -> TtsRelBandRoNode."""
+    from .host_nodes import _attrs
+    from .llm_nodes import _llm_inputs, _resolve
+    _need_unit(node, "TtsRelBand")
+    s, band = _llm_inputs(node, tensors)
+    y = _resolve(tensors, node.output[0], node)
+    W = int(_attrs(node).get("window", 4))
+    T = int(y.shape[1])
+    CR = int(s.shape[0]) - T
+    F = ctx.frac_bits
+    _require(list(y.shape) == [T, T] and T <= rs.N_MAX and T % align_elems == 0, node,
+             f"logits [T][T], T <= {rs.N_MAX}, a multiple of {align_elems}")
+    _require(len(s.shape) == 2 and int(s.shape[1]) == T and CR >= 2 * W + 1, node,
+             f"scores [T + >= {2 * W + 1}][{T}] (the band terms as the rows behind the keys)")
+    _require(band.is_state and not band.is_host and band.dma is None and list(band.shape) == [W + T, T]
+             and band.group_layout is None, node, f"band: an int16 DMA state [{W + T}][{T}] (W guard rows)")
+    for t, w in ((s, "scores"), (y, "logits")):
+        _require(t.dma is None and t.host is None and not t.is_state and not t.exp_channels(F).any(), node,
+                 f"{w}: a raw int16 DMA tensor")
+    _require(not band.exp_channels(F).any(), node, "band: raw int16")
+    pz = zero_param_tensor(tensors)
+    return TtsRelBandRoNode(onnx_node=node, inputs=[s, band, pz, tables_tensor(tensors)], output=y, index=index,
+                            align_elems=align_elems, F=F, T=T, CR=CR, W=W, band=band, pz=pz)
+
+
 TTS_OVERRIDES = {
     "TtsResAdd":    from_tts_resadd,
     "TtsLayerNorm": from_tts_layernorm,
     "TtsRowPrep":   from_tts_rowprep,
+    "TtsSum":       from_tts_sum,
+    "TtsInterleave": from_tts_interleave,
+    "TtsRelBand":   from_tts_rel_band,
 }
 
 
 # the axi.llm ops the unit takes over (merged after LLM_OP_FACTORIES in src/graph.py)
+@dataclass
+class DequantRoNode(RowOpsNode):
+    """LlmDequant on the unit: x (int16 at per-channel exponents, or the int32
+    residual) -> float32 DMA rows, ``y = float32(raw · 2^-f[c])`` (DEQUANT:
+    round to nearest even — exact for |raw| < 2^24, so the host op's value bit
+    for bit).  One job of ``rows`` rows of ``n``; a single row longer than the
+    unit's N_MAX (the logits) as one job per contiguous chunk of ``n``, each
+    with its own parameter block (the exponents of its columns).  inputs
+    [x, P..., tables]; the output a DMA tensor or state."""
+    rows: int = 1
+    n:    int = 1
+    a32:  bool = False
+    bcast: bool = True
+    rerow: bool = False
+    pbs: list = field(default_factory=list, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_DEQUANT, rs.K_I32 if self.a32 else rs.K_I16, rs.K_I16, rs.K_F32,
+                         p_bcast=self.bcast)
+
+    def _strides(self, layouts):
+        nd = self.onnx_node
+        ab = 4 if self.a32 else 2
+        if self.rerow:
+            return (self.n * ab, self.n * 4)
+        return (row_stride_bytes(self.inputs[0], layouts, self.n, ab, nd, self.align_elems),
+                row_stride_bytes(self.output, layouts, self.n, 4, nd, self.align_elems))
+
+    def _jobs(self, layouts):
+        """[(a_off, c_off, rows, a_s1, c_s1, P, opword)]"""
+        a_s1, c_s1 = self._strides(layouts)
+        if not self.rerow:
+            return [(0, 0, self.rows, a_s1, c_s1, self.pbs[0], self.opword)]
+        ab = 4 if self.a32 else 2
+        return [(k * self.n * ab, k * self.n * 4, 1, a_s1, c_s1, pb,
+                 rs.opword(rs.OP_DEQUANT, rs.K_I32 if self.a32 else rs.K_I16, rs.K_I16, rs.K_F32, p_bcast=bc))
+                for k, (pb, bc) in enumerate(self.pbs)]
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        from .llm_nodes import _f32
+        return _f32(np.asarray(ins[0], np.float64)).reshape(self.output.shape)
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall, merge
+        return merge([KernelCall.of("RowOpsKernel", op=j[6], n=self.n, rows=j[2], blocks=1, a_s1=j[3], c_s1=j[4],
+                                    win_hi=NO_WINDOW) for j in self._jobs(layouts)])
+
+    def describe(self) -> str:
+        return (f"rows={self.rows} n={self.n} on RowOpsKernel (DEQUANT: {'int32' if self.a32 else 'int16'} "
+                f"-> float32 DMA" + (f", {len(self.pbs)} chunks of {self.n}" if self.rerow else "") + ")")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] LlmDequant({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"[{self.rows}][{self.n}] on RowOpsKernel (DEQUANT -> float32"
+                + (f"; {len(self.pbs)} jobs" if self.rerow else "") + ") */")
+
+    def emit_call(self, layouts: dict) -> str:
+        jobs = self._jobs(layouts)
+        if not self.rerow:
+            a_off, c_off, rows, a_s1, c_s1, pb, op = jobs[0]
+            return self.call(self.inputs[0].c_name, 0, "NULL", 0, self.output.c_name, 0, pb.c_name, op, self.n,
+                             rows, 1, a_s1, 0, 0, 0, c_s1, 0, 0, 0, 0, 0, NO_WINDOW)
+        lines = ["    {"]
+        for i, (a_off, c_off, rows, a_s1, c_s1, pb, op) in enumerate(jobs):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(self.call(self.inputs[0].c_name, a_off, "NULL", 0, self.output.c_name, c_off, pb.c_name,
+                                   op, self.n, rows, 1, a_s1, 0, 0, 0, c_s1, 0, 0, 0, 0, 0, NO_WINDOW,
+                                   indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
+
+
+def from_llm_dequant(node, tensors, index, align_elems, ctx: HostContext):
+    """LlmDequant: DequantRoNode when the output is a float32 DMA tensor (the
+    frontends' rowops=True), else the host op (a float32 host output)."""
+    import hashlib
+    from .llm_nodes import LlmDequantNode, _resolve
+    y = _resolve(tensors, node.output[0], node)
+    if y.dma != "f32":
+        return LlmDequantNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    _need_unit(node, "a float32 DMA output")
+    x = _resolve(tensors, node.input[0], node)
+    F = ctx.frac_bits
+    n = int(x.shape[-1])
+    _require(x.host is None and not x.is_state and x.dma in (None, "i32"), node, "input: a DMA tensor")
+    _require(y.numel == x.numel and int(y.shape[-1]) == n and not y.is_host, node, "shapes")
+    f = _exps(x, F)
+    _require((0 <= f).all() and (f <= 63).all(), node, "exponents beyond the shifts")
+    a32 = x.dma == "i32"
+    if n <= rs.N_MAX:
+        _require(n % align_elems == 0 or x.numel == n, node, f"rows of {n}: a multiple of {align_elems} (or one row)")
+        p, bc = _pblock(tensors, f"{y.onnx_name}__rowops_p", 0, 0, 0, 0, f, n)
+        return DequantRoNode(onnx_node=node, inputs=[x, p, tables_tensor(tensors)], output=y, index=index,
+                             align_elems=align_elems, F=F, rows=x.numel // n, n=n, a32=a32, bcast=bc, pbs=[p])
+    # one long row (the logits): contiguous chunks of <= N_MAX, a parameter block per chunk named by
+    # its exponents (so the entries of a project share them)
+    _require(x.numel == n, node, f"a row of {n} (> {rs.N_MAX}): one row")
+    nc = next((d for d in range(rs.N_MAX, 0, -1) if n % d == 0 and d % align_elems == 0), 0)
+    _require(nc > 0, node, f"a row of {n} has no divisor <= {rs.N_MAX} that is a multiple of {align_elems}")
+    pbs = []
+    for k in range(n // nc):
+        fk = f[k * nc:(k + 1) * nc]
+        h = hashlib.sha1(fk.astype(np.int64).tobytes()).hexdigest()[:12]
+        pbs.append(_pblock(tensors, f"rowops_p_dq_{nc}_{h}", 0, 0, 0, 0, fk, nc))
+    return DequantRoNode(onnx_node=node, inputs=[x, *[pb for pb, _ in pbs], tables_tensor(tensors)], output=y,
+                         index=index, align_elems=align_elems, F=F, rows=1, n=nc, a32=a32, bcast=False, rerow=True,
+                         pbs=pbs)
+
+
+@dataclass
+class SelectRowRoNode(RowOpsNode):
+    """LlmSelectRow on the unit: y = h[n - 1] (n clamped to [1, rows]) — one COPY
+    of one int32 row into the int32 DMA state (``_r`` = the row, from the
+    runtime n; the call priced at row rows - 1).  inputs [h, n, P0, tables]."""
+    rows: int = 1
+    n:    int = 1
+    pz:   object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_COPY, rs.K_I32, rs.K_I16, rs.K_I32, p_bcast=True)
+
+    def state_writes(self):
+        return [self.output] if self.output.is_state else []
+
+    def state_updates(self):
+        return self.state_writes()
+
+    def _stride(self, layouts):
+        return row_stride_bytes(self.inputs[0], layouts, self.n, 4, self.onnx_node, self.align_elems)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        h = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
+        r = min(max(int(np.asarray(ins[1]).reshape(-1)[0]), 1), self.rows) - 1
+        return h[r].reshape(self.output.shape).copy()
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        return [KernelCall.of("RowOpsKernel", op=self.opword, n=self.n, rows=1, blocks=1, a_s1=0, c_s1=0,
+                              win_hi=NO_WINDOW)]
+
+    def describe(self) -> str:
+        return f"row n-1 of [{self.rows}][{self.n}] (int32) on RowOpsKernel (COPY)"
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] LlmSelectRow({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        nv = f"{self.inputs[1].c_name}[0]"
+        return "\n".join([
+            "    {",
+            f"        const unsigned _r = {nv} < 1 ? 0u : ((unsigned){nv} > {self.rows}u ? {self.rows - 1}u : "
+            f"(unsigned){nv} - 1u);",
+            self.call(self.inputs[0].c_name, f"_r * {self._stride(layouts)}u", "NULL", 0, self.output.c_name, 0,
+                      self.pz.c_name, self.opword, self.n, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NO_WINDOW,
+                      indent="        "),
+            "    }"])
+
+
+def from_llm_select_row(node, tensors, index, align_elems, ctx: HostContext):
+    """LlmSelectRow: SelectRowRoNode for the int32 DMA residual (rowops), else the host op."""
+    from .llm_nodes import LlmSelectRowNode, _llm_inputs, _resolve
+    h, nt = _llm_inputs(node, tensors)
+    y = _resolve(tensors, node.output[0], node)
+    if h.dma != "i32" or y.dma != "i32" or not enabled():
+        return LlmSelectRowNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    F = ctx.frac_bits
+    n = int(h.shape[-1])
+    _require(nt.host == "i32", node, "n must be an i32 host tensor")
+    _require(y.numel == n and np.array_equal(_exps(y, F), _exps(h, F)), node,
+             "output: one int32 row at h's exponent")
+    _require(n % align_elems == 0 and n <= rs.N_MAX, node, f"row length {n}: a multiple of {align_elems}")
+    return SelectRowRoNode(onnx_node=node, inputs=[h, nt, zero_param_tensor(tensors), tables_tensor(tensors)],
+                           output=y, index=index, align_elems=align_elems, F=F, rows=h.numel // n, n=n,
+                           pz=zero_param_tensor(tensors))
+
+
+@dataclass
+class PixelShuffleRoNode(RowOpsNode):
+    """VitPixelShuffle on the unit: columns [k0, k0 + K) of the x s shuffle of xf
+    [n·n][D] — output row (i, j) (m = n / s per side) concatenates the source
+    rows (i·s + b)·n + j·s + a, column block q = b·s + a.  Per source block q
+    that the column window touches, one COPY of its (partial) row with the
+    output rows as a 2-level pattern (j: rows, i: blocks) — a bit copy.
+    inputs [xf, P0, tables]."""
+    n: int = 1
+    D: int = 1
+    s: int = 1
+    k0: int = 0
+    K: int = 1
+    pz: object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_COPY, p_bcast=True)
+
+    def _jobs(self, layouts):
+        n, D, s, k0, K = self.n, self.D, self.s, self.k0, self.K
+        m = n // s
+        sx = row_stride_bytes(self.inputs[0], layouts, D, 2, self.onnx_node, self.align_elems)
+        sy = row_stride_bytes(self.output, layouts, K, 2, self.onnx_node, self.align_elems)
+        jobs = []
+        for q in range(s * s):
+            lo, hi = max(k0, q * D), min(k0 + K, (q + 1) * D)
+            if lo >= hi:
+                continue
+            b, a = divmod(q, s)
+            jobs.append((f"source block {q} (rows (i s + {b}) n + j s + {a}), columns [{lo}, {hi})",
+                         (lo - q * D) * 2 + (b * n + a) * sx, (lo - k0) * 2, hi - lo, m, m, s * sx, s * n * sx,
+                         sy, m * sy))
+        return jobs
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        from .vit_nodes import pixel_shuffle_rows
+        x = np.asarray(ins[0], np.float64).reshape(self.n * self.n, self.D)
+        src = pixel_shuffle_rows(self.n, self.s)
+        full = x[src].reshape(src.shape[0], self.s * self.s * self.D)
+        return full[:, self.k0:self.k0 + self.K].reshape(self.output.shape).copy()
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall, merge
+        return merge([KernelCall.of("RowOpsKernel", op=self.opword, n=j[3], rows=j[4], blocks=j[5], a_s1=j[6],
+                                    a_s2=j[7], c_s1=j[8], c_s2=j[9], win_hi=NO_WINDOW) for j in self._jobs(layouts)])
+
+    def describe(self) -> str:
+        return (f"[{self.n * self.n}][{self.D}] -> columns {self.k0}..{self.k0 + self.K - 1} of the x{self.s} "
+                f"shuffle on RowOpsKernel ({len(self._jobs({}))} COPYs)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] VitPixelShuffle({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        lines = ["    {"]
+        for i, j in enumerate(self._jobs(layouts)):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(f"        /* {j[0]} */")
+            lines.append(self.call(self.inputs[0].c_name, j[1], "NULL", 0, self.output.c_name, j[2], self.pz.c_name,
+                                   self.opword, j[3], j[4], j[5], j[6], j[7], 0, 0, j[8], j[9], 0, 0, 0, 0,
+                                   NO_WINDOW, indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
+
+
+def from_vit_pixel_shuffle(node, tensors, index, align_elems, ctx: HostContext):
+    """VitPixelShuffle: PixelShuffleRoNode with the attribute rowops = 1, else the host op."""
+    from .vit_nodes import VitPixelShuffleNode
+    host = VitPixelShuffleNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    if not _rowops_attr(node):
+        return host
+    _need_unit(node, "rowops = 1")
+    _require(host.D % align_elems == 0 and host.k0 % align_elems == 0 and host.K % align_elems == 0, node,
+             f"D, col0 and the column count: multiples of {align_elems}")
+    _require(host.D <= rs.N_MAX, node, f"D {host.D} beyond the unit's rows of {rs.N_MAX}")
+    return PixelShuffleRoNode(onnx_node=node, inputs=[host.inputs[0], zero_param_tensor(tensors),
+                                                      tables_tensor(tensors)],
+                              output=host.output, index=index, align_elems=align_elems, F=ctx.frac_bits,
+                              n=host.n, D=host.D, s=host.s, k0=host.k0, K=host.K, pz=zero_param_tensor(tensors))
+
+
+@dataclass
+class EmbedAddRoNode(RowOpsNode):
+    """VitEmbedAdd on the unit (RPU_PLAN §3.1, the vision study's ``iembed``):
+    h = sat32(pe << (fr - f_pe[c]) + B) — the patch embedding (int16 at its
+    per-channel exponents) plus the position / bias table B as an int32 DMA
+    stream at 2^-fr (the table rounded once; shipped as a Q8.8 weight whose
+    image is the int32 words), into the int32 residual: one ADDX.  inputs
+    [pe, table, P, tables]."""
+    rows: int = 1
+    n:    int = 1
+    fr:   int = 15
+    bcast: bool = True
+    table: object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_ADDX, rs.K_I16, rs.K_I32, rs.K_I32, b_en=True, p_bcast=self.bcast)
+
+    def _strides(self, layouts):
+        nd = self.onnx_node
+        return (row_stride_bytes(self.inputs[0], layouts, self.n, 2, nd, self.align_elems), self.n * 4,
+                row_stride_bytes(self.output, layouts, self.n, 4, nd, self.align_elems))
+
+    @staticmethod
+    def table_words(b0q: np.ndarray) -> np.ndarray:
+        """The int32 table [rows][n] as the int16 words of a Q8.8 weight [rows][2n]."""
+        w = np.asarray(b0q, np.int64).astype(np.int32).reshape(-1).view(np.int16)
+        return raw_as_data(w).reshape(b0q.shape[0], 2 * b0q.shape[1])
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        pe = np.asarray(ins[0], np.float64).reshape(self.rows, self.n)
+        w = np.rint(np.asarray(ins[1], np.float64).reshape(self.rows, 2 * self.n) * 256.0).astype(np.int64)
+        b0 = ((w[:, 1::2] << 16) + (w[:, 0::2] & 0xFFFF)).astype(np.int64)
+        b0 = np.where(b0 >= 2 ** 31, b0 - 2 ** 32, b0)
+        raw = np.clip(np.rint(pe * 2.0 ** self.fr) + b0, -2147483648.0, 2147483647.0)
+        return (raw / 2.0 ** self.fr).reshape(self.output.shape)
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall
+        a_s1, b_s1, c_s1 = self._strides(layouts)
+        return [KernelCall.of("RowOpsKernel", op=self.opword, n=self.n, rows=self.rows, blocks=1,
+                              a_s1=a_s1, b_s1=b_s1, c_s1=c_s1, win_hi=NO_WINDOW)]
+
+    def describe(self) -> str:
+        return (f"rows={self.rows} n={self.n} on RowOpsKernel (ADDX: the patch embedding + the int32 "
+                f"position table at 2^-{self.fr} -> the int32 residual)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] VitEmbedAdd({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        a_s1, b_s1, c_s1 = self._strides(layouts)
+        return self.call(self.inputs[0].c_name, 0, self.inputs[1].c_name, 0, self.output.c_name, 0,
+                         self.inputs[2].c_name, self.opword, self.n, self.rows, 1, a_s1, 0, b_s1, 0, c_s1, 0,
+                         0, 0, 0, 0, NO_WINDOW)
+
+
+def from_vit_embed_add(node, tensors, index, align_elems, ctx: HostContext):
+    """VitEmbedAdd: EmbedAddRoNode with the attribute rowops = 1 (src/vit.py
+    iembed: the table an int32 image), else the host op."""
+    from .llm_nodes import _resolve
+    from .vit_nodes import VitEmbedAddNode
+    if not _rowops_attr(node):
+        return VitEmbedAddNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    _need_unit(node, "rowops = 1")
+    F = ctx.frac_bits
+    pe = _resolve(tensors, node.input[0], node)
+    tb = _resolve(tensors, node.input[1], node)
+    y = _resolve(tensors, node.output[0], node)
+    n = int(pe.shape[-1])
+    rows = pe.numel // n
+    _require(pe.dma is None and pe.host is None and not pe.is_state, node, "pe: an int16 DMA tensor")
+    _require(y.dma == "i32" and y.numel == pe.numel and int(y.shape[-1]) == n, node,
+             "output: the int32 residual of pe's shape")
+    fr = _exps(y, F)
+    _require((fr == fr[0]).all(), node, "the residual at one exponent")
+    _require(tb.is_weight and list(tb.shape) == [rows, 2 * n] and (tb.exp_channels(F) == F).all(), node,
+             f"table: a Q8.8 weight [{rows}][{2 * n}] holding the int32 words")
+    fp = _exps(pe, F)
+    _require((fp <= fr[0]).all() and (fr[0] - fp <= 63).all(), node, "pe exponents beyond the residual's")
+    _require(n % align_elems == 0 and n <= rs.N_MAX, node, f"row length {n}")
+    p, bc = _pblock(tensors, f"{y.onnx_name}__rowops_p", 0, 0, fr[0] - fp, 0, 0, n)
+    return EmbedAddRoNode(onnx_node=node, inputs=[pe, tb, p, tables_tensor(tensors)], output=y, index=index,
+                          align_elems=align_elems, F=F, rows=rows, n=n, fr=int(fr[0]), bcast=bc, table=tb)
+
+
+VIT_OVERRIDES["VitPixelShuffle"] = from_vit_pixel_shuffle
+VIT_OVERRIDES["VitEmbedAdd"] = from_vit_embed_add
+
 LLM_OVERRIDES = {
+    "LlmDequant":  from_llm_dequant,
+    "LlmSelectRow": from_llm_select_row,
     "LlmResAdd":   from_llm_resadd,
     "LlmRMSNorm":  from_llm_rmsnorm,
     "LlmSiluMul":  from_llm_silu_mul,
@@ -1546,5 +2272,8 @@ __all__ = ("TABLES_NAME", "NO_WINDOW", "enabled", "raw_as_data", "tables_tensor"
            "from_onnx_layernorm", "ResAddRoNode", "RMSNormRoNode", "SiluMulRoNode", "LLM_OVERRIDES",
            "AttnPrepRoNode", "from_llm_attn_prep", "rope_raw_tensor", "zero_param_tensor", "vimage_jobs",
            "ATTN_PREP_C", "QIMAGE_R", "VitAttnPrepRoNode", "from_vit_attn_prep", "TtsRowPrepRoNode",
-           "from_tts_rowprep",
+           "from_tts_rowprep", "TransposeRoNode", "transpose_job", "from_onnx_transpose",
+           "TtsSumRoNode", "from_tts_sum", "TtsInterleaveRoNode", "from_tts_interleave",
+           "TtsRelBandRoNode", "from_tts_rel_band", "DequantRoNode", "from_llm_dequant", "SelectRowRoNode", "from_llm_select_row",
+           "PixelShuffleRoNode", "from_vit_pixel_shuffle", "EmbedAddRoNode", "from_vit_embed_add",
            "ResAddBiasRoNode", "LayerNorm32RoNode", "VIT_OVERRIDES", "TTS_OVERRIDES")

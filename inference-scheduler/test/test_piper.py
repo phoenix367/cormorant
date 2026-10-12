@@ -25,6 +25,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.piper import (FLOW_FRAMES, PiperChunkFrontend, PiperEncoderFrontend, encoder_weights, exponent_keys,
                        vop_exponents)
+from src.rowops_nodes import enabled as rowops_unit
 
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                         "demo", "tts", "scripts")
@@ -262,9 +263,11 @@ class TestPiperEncoderSoftmaxUnit(unittest.TestCase):
 
 
 class TestPiperEncoderRowops(unittest.TestCase):
-    """PiperEncoderFrontend(vsmx=True, rowops=True) (doc/plans/HOSTOPS_PLAN.md §6):
-    the residual LayerNorms as TtsResAdd (the int32 sum on the row-ops unit) +
-    TtsLayerNorm — against encoder_forward(vsmx_unit=True, rowops_unit=True)."""
+    """PiperEncoderFrontend(vsmx=True, rowops=True) (doc/plans/HOSTOPS_PLAN.md §6, RPU_PLAN
+    §3.1): the residual LayerNorms as TtsResAdd (the int32 sum on the row-ops unit) +
+    TtsLayerNorm, the attention prep and the relative-key band on the unit (rel_kernel,
+    the default with both) — against encoder_forward(vsmx_unit=True, rowops_unit=True,
+    rel_kernel=True)."""
 
     @staticmethod
     def _units(on=True):
@@ -286,16 +289,45 @@ class TestPiperEncoderRowops(unittest.TestCase):
                                            keep=[f"enc{T}.x", f"enc{T}.stats"])
                     x = np.asarray(out[f"enc{T}.x"]).reshape(T, 192)
                     st = np.asarray(out[f"enc{T}.stats"]).reshape(T, 384)
-                    xs, ss = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)
+                    xs, ss = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True, rel_kernel=True)
                     np.testing.assert_array_equal(x[:n].astype(np.float32), xs, err_msg=f"x T {T} n {n}")
                     np.testing.assert_array_equal(st[:n].astype(np.float32), ss, err_msg=f"stats T {T} n {n}")
                     self.assertFalse(x[n:].any() or st[n:].any(), f"padding rows T {T} n {n}")
 
+    def test_host_band_matches_its_specification(self):
+        """rel_kernel=False: the band stays the host op (TtsAttnRelAdd) — against
+        encoder_forward(rowops_unit=True) without rel_kernel."""
+        W, EW, E = encoder_setup()
+        rng = np.random.default_rng(9)
+        with _unit(), self._units():
+            T = 32
+            cg = CodeGenerator(OnnxGraph(PiperEncoderFrontend(W, E, T, vsmx=True, rowops=True,
+                                                              rel_kernel=False).entry()), model_path="enc.onnx")
+            self.assertEqual(sum(type(sn).__name__ == "TtsAttnRelAddNode" for sn in cg._graph.nodes), 12)
+            self.assertFalse(any(type(sn).__name__ == "TtsRelBandRoNode" for sn in cg._graph.nodes))
+            for n in (T, 17):
+                ids = rng.integers(0, 256, n)
+                pad = np.zeros(T, np.int64)
+                pad[:n] = ids
+                out = cg._forward_pass({f"enc{T}.ids": pad, f"enc{T}.n": np.array([n])}, keep=[f"enc{T}.x"])
+                x = np.asarray(out[f"enc{T}.x"]).reshape(T, 192)
+                xs, _ = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)
+                np.testing.assert_array_equal(x[:n].astype(np.float32), xs, err_msg=f"n {n}")
+
     def test_differs_from_the_host_norm(self):
         W, EW, E = encoder_setup()
         ids = np.random.default_rng(8).integers(0, 256, 40)
-        self.assertFalse(np.array_equal(pv.encoder_forward(EW, E, ids, vsmx_unit=True)[0],
-                                        pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)[0]))
+        host = pv.encoder_forward(EW, E, ids, vsmx_unit=True)[0]
+        unit = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True)[0]
+        rel = pv.encoder_forward(EW, E, ids, vsmx_unit=True, rowops_unit=True, rel_kernel=True)[0]
+        self.assertFalse(np.array_equal(host, unit))
+        self.assertFalse(np.array_equal(unit, rel))
+
+    def test_rel_kernel_needs_both(self):
+        W, _, E = encoder_setup()
+        for kw in (dict(vsmx=False, rowops=True), dict(vsmx=True, rowops=False)):
+            with self.assertRaisesRegex(ValueError, "rel_kernel needs vsmx and rowops"):
+                PiperEncoderFrontend(W, E, 32, rel_kernel=True, **kw)
 
     def test_graph(self):
         W, _, E = encoder_setup()
@@ -305,13 +337,21 @@ class TestPiperEncoderRowops(unittest.TestCase):
         for sn in g.nodes:
             kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
         self.assertEqual(kinds, {"TtsEmbedNode": 1, "TtsRowPrepRoNode": 19, "MatmulConvNode": 37,
-                                 "VitAttnPrepRoNode": 6, "LlmAttnConvNode": 24, "TtsAttnRelAddNode": 12,
+                                 "VitAttnPrepRoNode": 6, "LlmAttnConvNode": 24, "TtsRelBandRoNode": 12,
                                  "TtsAttnSoftmaxVopNode": 12, "TtsAttnMergeNode": 6, "ResAddBiasRoNode": 12,
                                  "LayerNorm32RoNode": 12, "TtsEncOutNode": 2})
         for sn in g.nodes:
             if type(sn).__name__ == "ResAddBiasRoNode":
                 self.assertFalse(sn.a32)                     # x int16 at f_x, the sum int32 at max(f_x, f_y)
                 self.assertEqual(sn.output.dma, "i32")
+            elif type(sn).__name__ == "VitAttnPrepRoNode":
+                self.assertEqual((sn.T, sn.C, sn.CR), (64, 80, 16))   # the relative keys behind the 64 keys
+            elif type(sn).__name__ == "TtsRelBandRoNode":
+                calls = sn.kernel_calls({})
+                self.assertEqual(sum(c.count for c in calls), 10)     # 9 diagonals + the add
+                self.assertEqual((sn.T, sn.CR, sn.W), (64, 16, 4))
+            elif type(sn).__name__ == "LlmAttnConvNode" and sn.kind == "scores":
+                self.assertEqual(list(sn.output.shape), [80, 64])
 
     def test_needs_the_unit(self):
         W, _, E = encoder_setup()
@@ -329,9 +369,12 @@ class TestPiperEncoderRowops(unittest.TestCase):
         self.assertEqual(rc, 0, out[-3000:])
         self.assertIn("PASSED", out)
         src = cg.generate_source()
-        # 12 adds + 12 norms + per layer the prep's 7 jobs (q, the q image, k per head x 2, v, the V
-        # image per head x 2) and the row preps' 14 (xin 2, c1 6, h 6) + the 2 of the stats' input
-        self.assertEqual(src.count("run_rowops(enc64_"), 24 + 6 * (7 + 14) + 2)
+        # 12 adds + 12 norms + per layer the prep's 7 jobs reading entry tensors (q, the q image, k per
+        # head x 2, v, the V image per head x 2; the relative-key rows read a weight), the row preps' 14
+        # (xin 2, c1 6, h 6) and the band's 2 x 10 (9 diagonals + the add) + the 2 of the stats' input
+        self.assertEqual(src.count("run_rowops(enc64_"), 24 + 6 * (7 + 14 + 20) + 2)
+        self.assertEqual(src.count("run_rowops(v_enc_l"), 6)                      # the relative-key rows
+        self.assertNotIn("tts_attn_rel_add(", src.split("inference_run_")[-1])
         self.assertEqual(src.count("run_rowops(rowops_tables,"), 1)  # TLOAD once, in inference_init
         self.assertNotIn("tts_resnorm(", src.split("inference_run_")[-1])
 
@@ -468,11 +511,14 @@ class TestPiperChunk(unittest.TestCase):
             kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
         # 37 sums + the 3 split convs' tap-group sums; the decoder's 21 on VectorOP
         # (and any flow sum whose random exponents happen to be equal)
-        sums = kinds.pop("TtsSumNode", 0) + kinds.get("TtsAddVopNode", 0)
+        # (with the row-ops unit the two-input flow sums are TtsSumRoNodes and the
+        # interleaves TtsInterleaveRoNodes; the masked post sums and the /3 stage sums stay host ops)
+        sums = kinds.pop("TtsSumNode", 0) + kinds.pop("TtsSumRoNode", 0) + kinds.get("TtsAddVopNode", 0)
         self.assertEqual(sums, 40)
         self.assertGreaterEqual(kinds.pop("TtsAddVopNode"), 21)
+        il = "TtsInterleaveRoNode" if rowops_unit() else "TtsInterleaveNode"
         self.assertEqual(kinds, {"ConvNode": 66, "TtsPrepNode": 46, "TtsGateNode": 16,
-                                 "TtsFlowOutNode": 4, "TtsInterleaveNode": 3, "TtsPcmNode": 1})
+                                 "TtsFlowOutNode": 4, il: 3, "TtsPcmNode": 1})
         dec = [sn for sn in cg._graph.nodes if sn.onnx_node.name.startswith("dec.rb")
                and sn.onnx_node.op_type == "TtsSum"]
         self.assertTrue(dec and all(type(sn).__name__ == "TtsAddVopNode" for sn in dec))

@@ -68,6 +68,10 @@ def node_kind(sn) -> str:
                       (SoftmaxNode, "Softmax"), (TransposeNode, "Transpose")):
         if isinstance(sn, cls):
             return kind
+    # the row-ops unit's LayerNorms / Transposes (LayerNormRoNode / TransposeRoNode) and
+    # VectorOPKernel's softmax (SoftmaxVopNode) keep their kind
+    if sn.onnx_node.op_type in ("LayerNormalization", "Transpose", "Softmax"):
+        return {"LayerNormalization": "LayerNorm"}.get(sn.onnx_node.op_type, sn.onnx_node.op_type)
     return "other"
 
 

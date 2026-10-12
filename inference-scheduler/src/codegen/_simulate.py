@@ -665,8 +665,12 @@ class _SimulateMixin:
                 # attention (q.K^T / P.V on ConvKernel: raw integer operands, exact
                 # sums, int32 wrap, floor + saturate — over the runtime key count
                 # of this call's pos / n), the vision GELU on VectorOPKernel
-                arrays[sn.output.onnx_name] = sn.reference(
-                    [arrays[t.onnx_name] for t in sn.inputs], dtype)
+                y = sn.reference([arrays[t.onnx_name] for t in sn.inputs], dtype)
+                if sn.output.is_state:                 # written in place (a DMA state)
+                    arrays[sn.output.onnx_name][...] = np.asarray(y).reshape(
+                        arrays[sn.output.onnx_name].shape)
+                else:
+                    arrays[sn.output.onnx_name] = y
                 continue
 
             if isinstance(sn, HostNode):

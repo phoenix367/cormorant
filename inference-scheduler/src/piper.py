@@ -55,6 +55,15 @@ ACC_ENTRIES = 65536                                    # kernels.conv.max_acc_pe
 
 ENC_BUCKETS = (32, 64, 128, 256, 400)                 # encode_<T> entries: ids padded to T rows
 ENC_LAYERS, ENC_D, ENC_H, ENC_HD, ENC_WIN = 6, 192, 2, 96, 4
+REL_ROWS = 16            # the K cache rows that hold the 2·ENC_WIN + 1 relative keys (rel_kernel; a key quantum)
+
+
+def raw_rel_keys(ek: np.ndarray, f_s: int, f_q: int) -> np.ndarray:
+    """The relative keys [2W + 1][HD] as raw int16 at f_s + 8 - f_q (round half
+    to even, saturated): the K cache rows whose q.K^T gives the band terms at
+    2^-f_s — piper_vits.encoder_forward(rel_kernel=True).  The frontend ships
+    them as a Q8.8 weight (value = raw / 256) whose image is those words."""
+    return np.clip(np.round(np.asarray(ek, np.float64) * 2.0 ** (int(f_s) + 8 - int(f_q))), -32768, 32767)
 
 __all__ = ("load_weights", "polyphase_weight", "fold", "vop_exponents", "exponent_keys", "PiperChunkFrontend",
            "entry_info",
@@ -383,7 +392,7 @@ class PiperEncoderFrontend:
     the specification is piper_vits.encoder_forward(vsmx_unit=True)."""
 
     def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], T: int, name: str = "piper",
-                 vsmx: bool = False, rowops: bool = False):
+                 vsmx: bool = False, rowops: bool = False, rel_kernel: Optional[bool] = None):
         missing = [k for k in encoder_exponent_keys() if k not in E]
         if missing:
             raise ValueError(f"encoder exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
@@ -395,6 +404,14 @@ class PiperEncoderFrontend:
         # the sum as an int32 DMA tensor (TtsResAdd), then TtsLayerNorm (the specification
         # is piper_vits.encoder_forward(rowops_unit=True))
         self.rowops = bool(rowops)
+        # rel_kernel (doc/plans/RPU_PLAN.md §3.1, with vsmx and rowops): the relative-key
+        # band on the kernels — the 9 relative keys as 16 extra rows of the K cache (the
+        # same q.K^T call gives q.ek^T), the row-ops unit writes them onto the diagonals of
+        # a zero band state and adds it to the scores (TtsRelBand); the specification is
+        # piper_vits.encoder_forward(vsmx_unit=True, rowops_unit=True, rel_kernel=True)
+        self.rel = (self.vsmx and self.rowops) if rel_kernel is None else bool(rel_kernel)
+        if self.rel and not (self.vsmx and self.rowops):
+            raise ValueError("rel_kernel needs vsmx and rowops")
         self.pv_kw = next(k for k in (4, 2, 1) if T % (16 * k) == 0)
 
     def choose_qk_kw(self) -> int:
@@ -471,12 +488,18 @@ class PiperEncoderFrontend:
         x = self._t(f"{p}.x0", [T, D], exp=E["enc.x0"])
         self._node("TtsEmbed", [ids, self._init("v.enc.emb", EW["emb"]), self.n], [x], f"{p}.embed",
                    scale=repr(math.sqrt(D)))
-        kc = self._t(f"{p}.kc", [T, D], exp=0, state=True)
+        CK = T + REL_ROWS if self.rel else T                 # the K cache: + the relative-key rows
+        kc = self._t(f"{p}.kc", [CK, D], exp=0, state=True)
         vc = self._t(f"{p}.vc", [T, D], exp=0, state=True)
         self.meta["layout"][kc] = [H, HD]
         self.meta["layout"][vc] = [H, HD] + ([self.pv_kw] if self.pv_kw > 1 else [])
-        self._init(kc, np.zeros((T, D), np.float32))
+        self._init(kc, np.zeros((CK, D), np.float32))
         self._init(vc, np.zeros((T, D), np.float32))
+        band = []
+        if self.rel:                 # the band states: Wn guard rows, then [T][T] zero off the diagonals
+            band = [self._t(f"{p}.ro.band{g}", [Wn + T, T], exp=0, state=True) for g in range(H)]
+            for b in band:
+                self._init(b, np.zeros((Wn + T, T), np.float32))
         kw = 1 if self.rowops else self.choose_qk_kw()      # the unit writes the q image at kw = 1
         prep_extra, prep_attrs = [], {}
         if self.rowops:                                      # the prep's staging rows (HOSTOPS_PLAN §10)
@@ -496,22 +519,32 @@ class PiperEncoderFrontend:
             v0 = self._matmul(xin, f"l{i}.wv", f"{te}.v0", D, E[f"{e}.v0"])
             qx = self._t(f"{te}.qx", [H, HD, T], exp=0)
             bq = self._init(f"v.enc.l{i}.bq", EW[f"l{i}.bq"])
+            rel_extra = []
+            if self.rel:                                    # the relative keys raw at f_s + 8 - f_q, every head
+                ekr = np.zeros((REL_ROWS, D), np.float32)
+                for g in range(H):
+                    ekr[:2 * Wn + 1, g * HD:(g + 1) * HD] = raw_rel_keys(EW[f"l{i}.ek"], E[f"{e}.s"], E[f"{e}.q"])
+                rel_extra = [self._init(f"v.enc.l{i}.ekr", ekr / 256.0)]     # a Q8.8 image of the raw rows
             self._node("VitAttnPrep", [q0, k0, v0, kc, vc, bq, self._init(f"v.enc.l{i}.bk", EW[f"l{i}.bk"]),
-                                       self._init(f"v.enc.l{i}.bv", EW[f"l{i}.bv"])] + prep_extra,
+                                       self._init(f"v.enc.l{i}.bv", EW[f"l{i}.bv"])] + prep_extra + rel_extra,
                        [qx], f"{te}.attn_prep", num_heads=H, head_dim=HD, qk_kw=kw,
                        q_exp=[E[f"{e}.q"]] * H, k_exp=[E[f"{e}.k"]] * H, v_exp=[E[f"{e}.v"]] * D, **prep_attrs)
             ek = self._init(f"v.enc.l{i}.ek", EW[f"l{i}.ek"].reshape(-1))
-            s = [self._t(f"{te}.s{g}", [T, T], exp=0) for g in range(H)]
+            s = [self._t(f"{te}.s{g}", [CK, T], exp=0) for g in range(H)]
             pr = [self._t(f"{te}.p{g}", [T, T], exp=0) for g in range(H)]
             o = [self._t(f"{te}.o{g}", [T, HD], exp=0) for g in range(H)]
             for g in range(H):
-                self._node("LlmAttnScores", [kc, qx], [s[g]], f"{te}.qk{g}", group=g, qk_kw=kw, **common)
+                self._node("LlmAttnScores", [kc, qx], [s[g]], f"{te}.qk{g}", group=g, qk_kw=kw,
+                           **(dict(common, key_quantum=16) if self.rel else common))
             for g in range(H):
-                if self.vsmx:                               # the band on the host, the softmax on the unit
+                if self.vsmx:                               # the band first, the softmax on the unit
                     lg = self._t(f"{te}.l{g}", [T, T], exp=0)
-                    self._node("TtsAttnRelAdd", [s[g], q0, bq, ek, self.n], [lg], f"{te}.reladd{g}", head=g,
-                               head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]],
-                               **prep_attrs)
+                    if self.rel:                            # the diagonals + the add on the row-ops unit
+                        self._node("TtsRelBand", [s[g], band[g]], [lg], f"{te}.relband{g}", window=Wn)
+                    else:                                   # the band on the host
+                        self._node("TtsAttnRelAdd", [s[g], q0, bq, ek, self.n], [lg], f"{te}.reladd{g}", head=g,
+                                   head_dim=HD, window=Wn, s_exp=[E[f"{e}.s"]], q_exp=[E[f"{e}.q"]],
+                                   **prep_attrs)
                     self._node("TtsAttnSoftmax", [lg, self.n], [pr[g]], f"{te}.softmax{g}", vsmx=1,
                                s_exp=[E[f"{e}.s"]], p_exp=[fp])
                 else:
@@ -551,5 +584,5 @@ class PiperEncoderFrontend:
         md.key = "axi.tts.entry"
         md.value = json.dumps({"entry": f"encode_{T}", "model": self.name, "rows": T, "hidden": D,
                                "heads": H, "head_dim": HD, "qk_kw": kw, "pv_kw": self.pv_kw,
-                               "vsmx": self.vsmx})
+                               "vsmx": self.vsmx, "rel": self.rel})
         return m

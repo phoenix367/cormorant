@@ -927,7 +927,7 @@ def vsmx():
     return _VSMX
 
 
-def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
+def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False, rel_kernel=False):
     """The library's encoder, bit for bit: ids -> x [n][192], stats [n][384]
     (float32, as the library returns them).  ``vsmx_unit``: the softmax on
     VectorOPKernel's unit (doc/plans/SOFTMAX_PLAN.md §5) — the host adds the
@@ -960,7 +960,19 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
             sl = slice(h * ENC_HD, (h + 1) * ENC_HD)
             s_raw = _kmm(pr["q"][:, sl], pr["k"][:, sl].T)           # [queries][keys]
             rel = _enc_rel(pr["q"][:, sl] * L2(fq), EW[f"l{i}.ek"])
-            if vsmx_unit:
+            if vsmx_unit and rel_kernel:
+                # RPU_PLAN §3.1: the relative-key terms as a ConvKernel MatMul of the unit's q (raw
+                # at f_q) with ek at f_s + 8 - f_q -> floor(acc / 2^8) at f_s, written onto the
+                # diagonals (i, i + d) by the row-ops unit, then one VectorOP ADD onto the scores
+                relr = _kmm(pr["q"][:, sl], _raw(EW[f"l{i}.ek"].T, fs + 8 - fq))      # [n][9] at f_s
+                lg = s_raw.copy()
+                for d in range(-ENC_WIN, ENC_WIN + 1):
+                    idx = np.arange(max(0, -d), min(n, n - d))
+                    lg[idx, idx + d] = np.clip(lg[idx, idx + d] + relr[idx, d + ENC_WIN], -32768, 32767)
+                cm, cs = vsmx().scale_regs(fs, 1.0)
+                p_raw = vsmx().softmax_raw(lg.astype(np.int64), n, cm, cs, fp).astype(np.float64)
+                tr[f"{e}.l{h}"] = lg
+            elif vsmx_unit:
                 lg = s_raw.copy()                                    # the band added in place
                 for d in range(-ENC_WIN, ENC_WIN + 1):
                     idx = np.arange(max(0, -d), min(n, n - d))
@@ -1006,12 +1018,13 @@ def encoder_forward(EW, E, ids, trace=None, vsmx_unit=False, rowops_unit=False):
     return (xr * L2(fx)).astype(np.float32), (st * L2(fst) + EW["bp"]).astype(np.float32)
 
 
-def library_encoder(EW, E, vsmx_unit=False, rowops_unit=False):
+def library_encoder(EW, E, vsmx_unit=False, rowops_unit=False, rel_kernel=False):
     """ids -> (x, m_p, logs_p) [192][n] float64 from encoder_forward: the
     front end's ``encoder`` for the library's int16 encoder (``vsmx_unit``:
-    its softmax on VectorOPKernel's unit)."""
+    its softmax on VectorOPKernel's unit; ``rowops_unit`` / ``rel_kernel``:
+    the row-ops unit's norms / its relative-key band)."""
     def enc(ids):
-        x, st = encoder_forward(EW, E, ids, vsmx_unit=vsmx_unit, rowops_unit=rowops_unit)
+        x, st = encoder_forward(EW, E, ids, vsmx_unit=vsmx_unit, rowops_unit=rowops_unit, rel_kernel=rel_kernel)
         x, st = x.astype(np.float64).T, st.astype(np.float64).T
         return x, st[:ENC_D], st[ENC_D:]
     return enc

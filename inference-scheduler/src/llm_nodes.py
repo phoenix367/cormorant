@@ -433,7 +433,8 @@ class LlmEmbedNode(LlmNode):
         sn._want(ids, "i32", "ids")
         sn.res32 = sn._want_residual(y, "output")
         if img is not None:
-            sn._want(img, "f32", "image rows")
+            if img.dma != "f32":                    # float32 host, or the unit's DEQUANT output (DMA)
+                sn._want(img, "f32", "image rows")
             _require(int(img.shape[-1]) == d, node, "image rows must be [R][d]")
         _require(y.numel == ids.numel * d, node, "output numel")
         return sn
@@ -1483,8 +1484,37 @@ class LlmDequantNode(LlmNode):
         return _f32(np.asarray(ins[0], np.float64)).reshape(self.output.shape)
 
 
+@dataclass
+class LlmToHostNode(LlmNode):
+    """y (float32 host) = x, a float32 DMA tensor (the unit's DEQUANT output):
+    one invalidate and a memcpy — what hands a kernel-written result to the
+    caller's buffer (RPU_PLAN §3.1; a runtime that takes DMA outputs drops it)."""
+    count: int = 1
+
+    @classmethod
+    def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
+        x = _resolve(tensors, node.input[0], node)
+        y = _resolve(tensors, node.output[0], node)
+        sn = cls(onnx_node=node, inputs=[x], output=y, index=index,
+                 align_elems=align_elems, count=x.numel, F=ctx.frac_bits)
+        sn._want(x, "dma:f32", "input")
+        sn._want(y, "f32", "output")
+        _require(y.numel == x.numel, node, "shapes")
+        return sn
+
+    def describe(self):
+        return f"{self.count} float32 values, DMA -> host"
+
+    def c_call(self, ins, out, scratch, direct, dtype):
+        return [f"memcpy({out}, {ins[0]}, {self.count}u * sizeof(float));"]
+
+    def reference(self, ins, dtype):
+        return _f32(np.asarray(ins[0], np.float64)).reshape(self.output.shape)
+
+
 LLM_OP_FACTORIES = {
     "LlmEmbed":     LlmEmbedNode.from_onnx_node,
+    "LlmToHost":    LlmToHostNode.from_onnx_node,
     "LlmResAdd":    LlmResAddNode.from_onnx_node,
     "LlmRMSNorm":   LlmRMSNormNode.from_onnx_node,
     "LlmSiluMul":   LlmSiluMulNode.from_onnx_node,

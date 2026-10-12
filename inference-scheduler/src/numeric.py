@@ -68,7 +68,7 @@ class NumericError(SchedulerError):
     pass
 
 
-DMA_KINDS = ("i32",)
+DMA_KINDS = ("i32", "f32")      # int32 at a power-of-two exponent; float32 (the unit's DEQUANT output)
 
 
 def empty() -> dict:

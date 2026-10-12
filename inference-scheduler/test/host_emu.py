@@ -572,6 +572,19 @@ static inline void XRowopskernel_Start(XRowopskernel *q)
         return;
     }
     if (n == 0u || q->rows == 0u || q->blocks == 0u || n > 4096u) return;
+    /* the contract (ROWOPS_RTL_KERNEL.md §1.4): 16-byte-aligned bases and strides, TRANSPOSE's
+     * destination (c, c_s1, c_s2 and the granule stride b_s2) 2-byte aligned */
+    if ((q->a & 15u) || (q->b & 15u) || (q->p & 15u)
+        || (q->rows > 1u && ((q->a_s1 & 15u) || (op != 7u && (q->b_s1 & 15u))))
+        || (op == 7u && (q->aux & 15u) > 1u && (q->b_s1 & 15u))
+        || (q->blocks > 1u && ((q->a_s2 & 15u) || (op != 7u && (q->b_s2 & 15u))))
+        || (op != 7u && ((q->c & 15u) || (q->rows > 1u && (q->c_s1 & 15u)) || (q->blocks > 1u && (q->c_s2 & 15u))))
+        || (op == 7u && ((q->c & 1u) || (q->c_s1 & 1u) || (q->c_s2 & 1u) || (q->b_s2 & 1u)))) {
+        fprintf(stderr, "rowops: unaligned job (op %u): a %llx b %llx c %llx p %llx strides %u %u %u %u %u %u\n",
+                op, (unsigned long long)q->a, (unsigned long long)q->b, (unsigned long long)q->c,
+                (unsigned long long)q->p, q->a_s1, q->a_s2, q->b_s1, q->b_s2, q->c_s1, q->c_s2);
+        abort();
+    }
     if ((op == 4u || op == 5u) && !ro_tables_loaded) abort();   /* a job before the table load */
     x = (int64_t *)malloc((size_t)n * sizeof *x);
     vals = (int64_t *)malloc((size_t)n * sizeof *vals);

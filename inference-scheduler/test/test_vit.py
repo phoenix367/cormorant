@@ -326,6 +326,44 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class TestVisionRowopsIembed(unittest.TestCase):
+    """VitFrontend(rowops=True, iembed=True) (RPU_PLAN §3.1): the patch-embedding
+    add on the unit too (the position table rounded once at 2^-15 as an int32
+    stream, EmbedAddRoNode) — against vlm_study's policy ...+rowops+iembed."""
+
+    def test_nodes_simulation_and_c(self):
+        from src import _rowops_hw_config
+        from src.rowops_nodes import EmbedAddRoNode
+        cfg, W, _vm, fe = Tiny.get()
+        Wv = {k[len("model."):]: v for k, v in W.items()}
+        vc = vs.VCfg(TINY_CFG["vision_config"])
+        KW = vs.kernel_weights(Wv, vc)
+        pol = vs.vision_policy(True, True, True, iembed=True)
+        self.assertTrue(pol.endswith("+rowops+iembed"))
+        vm = vs.VisionModel(Wv, KW, vc, TINY_CFG["scale_factor"], vs.VPOLICIES[pol], _vm.fmt)
+        vm.conn_k = CONN_K
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            fe2 = VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=True, iembed=True)
+            g = OnnxGraph(fe2.entry(output=True), fuse_act=True, s2d_stem=True)
+            cg = CodeGenerator(g, model_path="vit_tiny_iembed.onnx")
+            emb = [sn for sn in g.nodes if isinstance(sn, EmbedAddRoNode)]
+            self.assertEqual(len(emb), 1)
+            self.assertEqual((emb[0].fr, emb[0].output.dma, len(emb[0].kernel_calls({}))), (15, "i32", 1))
+            self.assertNotIn("VitEmbedAddNode", [type(sn).__name__ for sn in g.nodes])
+            for im in images(2, 11):
+                states = cg.initial_states()
+                out = cg._forward_pass({"vision.patches": patches(im, cfg.P).astype(np.float64)}, states=states)
+                np.testing.assert_array_equal(out["vision.image"], vm.forward(im))
+            if host_emu.which_cc():
+                with tempfile.TemporaryDirectory() as td:
+                    rc, out = host_emu.build_and_run(cg, td, timeout=1800)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertEqual(host_emu.failures(out), [])
+        with self.assertRaisesRegex(ValueError, "iembed needs rowops"):
+            VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=False, iembed=True)
+
+
 class TestVisionRowops(unittest.TestCase):
     """VitFrontend(vsmx=True, rowops=True) (doc/plans/HOSTOPS_PLAN.md §6): the
     residual stream as the int32 DMA tensor at 2^-15, VitEmbedAdd writing it, the
@@ -358,13 +396,22 @@ class TestVisionRowops(unittest.TestCase):
         kinds = [type(sn).__name__ for sn in g.nodes]
         L = 2
         self.assertEqual(kinds.count("LayerNorm32RoNode"), 2 * L + 1)
-        self.assertEqual(kinds.count("ResAddBiasRoNode"), 2 * L)
+        self.assertEqual(kinds.count("ResAddBiasRoNode"), 2 * L + 1)      # + the connector parts' first sum
         self.assertNotIn("VitLayerNormNode", kinds)
         self.assertNotIn("VitResAddNode", kinds)
+        self.assertNotIn("VitSumDequantNode", kinds)
+        # the connector sum on the unit (RPU_PLAN §3.1): ADDX into an int32 row, DEQUANT into a
+        # float32 DMA row, the copy out (the vision.image output; the library's state is in DMA)
+        self.assertEqual((kinds.count("ResAddRoNode"), kinds.count("DequantRoNode"), kinds.count("LlmToHostNode")),
+                         (0, 1, 1))
+        dq = [sn for sn in g.nodes if type(sn).__name__ == "DequantRoNode"][0]
+        self.assertTrue(dq.a32 and dq.output.dma == "f32" and not dq.output.is_state)
         emb = [sn for sn in g.nodes if type(sn).__name__ == "VitEmbedAddNode"][0]
         self.assertTrue(emb.res32 and emb.output.dma == "i32")
         for sn in g.nodes:
-            if isinstance(sn, ResAddBiasRoNode):
+            if isinstance(sn, ResAddBiasRoNode) and sn.onnx_node.name.startswith("vision.sum"):
+                self.assertTrue(not sn.a32 and sn.fr == 15 and sn.output.dma == "i32", sn)
+            elif isinstance(sn, ResAddBiasRoNode):
                 self.assertTrue(sn.a32 and sn.fr == 15 and sn.bb == 15, sn)
             if isinstance(sn, LayerNorm32RoNode):
                 self.assertEqual(sn.fr, 15)

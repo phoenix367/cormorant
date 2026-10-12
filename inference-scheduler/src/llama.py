@@ -578,6 +578,11 @@ class LlamaFrontend:
                            fm.get("xf", L, c.D), f"{e}.norm_final")
         lq = self._matmul(L, "lm", xf, 1, fm.get("logits", L, c.V), lm=True)
         y = self._t(f"{e}.logits", [1, c.V], host="f32")
+        if self.rowops:                     # the unit's DEQUANT into a float32 DMA row, then the copy out
+            yd = self._t(f"{e}.logits_d", [1, c.V], dma="f32")
+            self._node("LlmDequant", [lq], [yd], f"{e}.dequant", domain=LLM_DOMAIN)
+            self._node("LlmToHost", [yd], [y], f"{e}.logits_out", domain=LLM_DOMAIN)
+            return y
         self._node("LlmDequant", [lq], [y], f"{e}.dequant", domain=LLM_DOMAIN)
         return y
 
@@ -594,8 +599,9 @@ class LlamaFrontend:
         self._init("emb", self.W["model.embed_tokens.weight"])
         h0 = self._res(f"{ename}.h0", T)
         emb_in = [ids, "emb"]
-        if select and self.image_rows:
-            img = self._t(self.image_state, [self.image_rows, c.D], host="f32", state=True)
+        if select and self.image_rows:      # float32 host, or (rowops) the vision entry's DEQUANT output in DMA
+            img = self._t(self.image_state, [self.image_rows, c.D], state=True,
+                          **(dict(dma="f32") if self.rowops else dict(host="f32")))
             self._init(img, np.zeros((self.image_rows, c.D), np.float32))
             emb_in.append(img)
         self._node("LlmEmbed", emb_in, [h0], f"{ename}.embed", domain=LLM_DOMAIN)

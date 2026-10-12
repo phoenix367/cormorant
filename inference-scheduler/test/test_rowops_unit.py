@@ -192,6 +192,69 @@ class TestGeneratedCode(unittest.TestCase):
                 self.assertEqual(host_emu.failures(out), [])
 
 
+def _dequant_model(path, n, exp=10, i32=False):
+    """x [1][n] (int16 at 2^-exp, or the int32 residual) -> LlmDequant -> yd (float32 DMA)
+    -> LlmToHost -> y (float32 host output): RPU_PLAN A1's logits path."""
+    from src import numeric
+    from src.llm_nodes import LLM_DOMAIN
+    meta = numeric.empty()
+    meta["exp"]["x"] = exp
+    if i32:
+        meta["dma"]["x"] = "i32"
+    meta["dma"]["yd"] = "f32"
+    meta["host"]["y"] = "f32"
+    g = oh.make_graph([oh.make_node("LlmDequant", ["x"], ["yd"], name="dq", domain=LLM_DOMAIN),
+                       oh.make_node("LlmToHost", ["yd"], ["y"], name="out", domain=LLM_DOMAIN)], "m",
+                      [oh.make_tensor_value_info("x", TensorProto.FLOAT, [1, n])],
+                      [oh.make_tensor_value_info("y", TensorProto.FLOAT, [1, n])],
+                      value_info=[oh.make_tensor_value_info("yd", TensorProto.FLOAT, [1, n])])
+    m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)])
+    m.ir_version = 9
+    md = m.metadata_props.add()
+    md.key, md.value = numeric.METADATA_KEY, numeric.to_metadata(meta)
+    onnx.save(m, path)
+    return path
+
+
+class TestDequantOnUnit(unittest.TestCase):
+    """LlmDequant into a float32 DMA tensor (DequantRoNode: one row, or a row
+    longer than the unit's 4 096 cut into contiguous rows at one exponent) and
+    the LlmToHost copy — the generated C against the simulation."""
+
+    def test_nodes(self):
+        from src.rowops_nodes import DequantRoNode
+        with tempfile.TemporaryDirectory() as td, _unit(True):
+            for n, jobs, nn in ((24, 1, 24), (8192, 2, 4096), (12000, 3, 4000)):
+                g = OnnxGraph(_dequant_model(os.path.join(td, "m.onnx"), n))
+                dq = g.nodes[0]
+                self.assertIsInstance(dq, DequantRoNode)
+                self.assertEqual((dq.rows, dq.n, dq.rerow, len(dq.pbs)), (1, nn, n > 4096, jobs), n)
+                self.assertEqual(sum(c.count for c in dq.kernel_calls({})), jobs)
+                self.assertEqual(type(g.nodes[1]).__name__, "LlmToHostNode")
+                self.assertEqual(dq.output.dma, "f32")
+                self.assertEqual(dq.output.alloc_numel, 2 * n)
+            g = OnnxGraph(_dequant_model(os.path.join(td, "m.onnx"), 64, exp=15, i32=True))
+            self.assertTrue(g.nodes[0].a32)
+
+    def test_host_without_the_unit(self):
+        with tempfile.TemporaryDirectory() as td, _unit(False), \
+                self.assertRaisesRegex(Exception, "row-ops unit"):
+            OnnxGraph(_dequant_model(os.path.join(td, "m.onnx"), 24))
+
+    @unittest.skipUnless(host_emu.which_cc(), "C compiler not available on host")
+    def test_host_emulated_run_matches_simulation(self):
+        # (an int32 graph input has no consistent test-harness fill; the int32 path is the
+        # vision connector sum's, test_vit TestVisionRowops)
+        for n, exp in ((24, 10), (8192, 12), (12000, 8)):
+            with tempfile.TemporaryDirectory() as td, _unit(True), self.subTest(n=n):
+                path = _dequant_model(os.path.join(td, "m.onnx"), n, exp=exp)
+                g = OnnxGraph(path)
+                cg = CodeGenerator(g, model_path=path)
+                rc, out = host_emu.build_and_run(cg, td, incoherent=True)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertEqual(host_emu.failures(out), [])
+
+
 class TestVImageJobs(unittest.TestCase):
     """rowops_nodes.vimage_jobs: the TRANSPOSE jobs that write the V rows
     [pos, pos + n) of one KV group into the P.V image (HOSTOPS_PLAN §10.3)

@@ -818,6 +818,10 @@ class OnnxGraph:
                 # the row-ops unit, or the host op where the platform has none
                 sn = rowops_nodes.from_onnx_layernorm(node, self._tensors, idx, align_elems,
                                                       host_ctx, _dtype)
+            elif node.op_type == "Transpose":
+                # the row-ops unit's COPY / TRANSPOSE, or the host copy (RPU_PLAN §3.1)
+                sn = rowops_nodes.from_onnx_transpose(node, self._tensors, idx, align_elems,
+                                                      host_ctx, _dtype)
             elif node.op_type in HOST_OP_FACTORIES:
                 sn = HOST_OP_FACTORIES[node.op_type](node, self._tensors, idx, align_elems,
                                                      host_ctx)

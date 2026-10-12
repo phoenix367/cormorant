@@ -660,7 +660,7 @@ facts:
   value: {bert: 216, smollm2_135m: 294, smollm2_360m: 758, smolvlm_256m: 511, piper: 53}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 397eaad
+    commit: 18be522
     date: 2026-10-12
     how: "the projects regenerated for HOSTOPS_PLAN phases 4a-4b (the attention preps' staging states and cos / sin
           table, the row preps): SmolLM2-135M 293.6, SmolLM2-360M 758.0, SmolVLM 511.4, Piper 52.8, BERT 216 MiB (phase

@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import unittest
 
+import host_emu
 import numpy as np
 import onnx
 import onnx.helper as oh
@@ -293,6 +294,7 @@ class TestLayerNormGelu(_Base):
             self.assertLessEqual(np.abs(a["Y"] - ref).max(), 0.5 / 256 + 1e-9)
 
 
+@_host_ln
 class TestDataMovement(_Base):
 
     def test_transpose_perms(self):
@@ -307,6 +309,35 @@ class TestDataMovement(_Base):
             g, _, a = self.check(p, {"X": x})
             self.assertIsInstance(g.nodes[0], TransposeNode)
             np.testing.assert_array_equal(a["Y"], np.transpose(x, perm))
+
+    def test_transpose_on_the_unit(self):
+        """With the row-ops unit (RPU_PLAN §3.1) the perms the unit can do become
+        TransposeRoNode — a COPY (the outer axes swapped, rows of 8 kept) or a
+        TRANSPOSE (the last output axis gathering source elements) — bit for
+        bit on the host emulation; the others stay the host copy."""
+        from src.rowops_nodes import TransposeRoNode
+        rng = np.random.default_rng(5)
+        with mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            for perm, shape, kind in [([0, 2, 1, 3], [1, 6, 3, 8], "copy"), ([0, 2, 3, 1], [1, 16, 3, 8], "xpose"),
+                                      ([0, 2, 3, 1], [1, 6, 3, 8], None), ([2, 0, 1], [1, 6, 2], None),
+                                      ([1, 0], [16, 8], "xpose"), ([1, 0, 2], [4, 5, 16], "copy")]:
+                out = [shape[i] for i in perm]
+                p = _save(self.d, [oh.make_node("Transpose", ["X"], ["Y"], perm=perm)],
+                          [_vi("X", shape)], [_vi("Y", out)], name="tru" + "".join(map(str, perm)))
+                x = _grid(rng, shape, -100, 100)
+                g = OnnxGraph(p, dtype=DT)
+                cg = CodeGenerator(g, model_path=p, dtype=DT)
+                a = cg._forward_pass({"X": np.asarray(x, np.float64)})
+                if kind is None:
+                    self.assertIsInstance(g.nodes[0], TransposeNode, perm)
+                else:
+                    self.assertIsInstance(g.nodes[0], TransposeRoNode, perm)
+                    self.assertEqual(g.nodes[0].kind, kind, perm)
+                    with tempfile.TemporaryDirectory() as td:          # the unit's C model
+                        rc, out = host_emu.build_and_run(cg, td)
+                    self.assertEqual(rc, 0, out[-2000:])
+                    self.assertEqual(host_emu.failures(out), [])
+                np.testing.assert_array_equal(a["Y"], np.transpose(x, perm))
 
     def test_slice_copy_steps(self):
         st = [nph.from_array(np.array(v, np.int64), n) for n, v in

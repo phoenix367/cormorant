@@ -50,6 +50,8 @@ from .llm_nodes import LLM_DOMAIN
 F = 8                                  # the kernels' output shift
 VP = "model.vision_model."
 RES_BITS = 15           # the int32 DMA residual's exponent with rowops (doc/plans/HOSTOPS_PLAN.md §5.1: r15)
+IEMBED_DEFAULT = False  # rowops: the patch-embedding add on the unit too (the position table rounded once at
+                        # 2^-RES_BITS as an int32 stream; vlm_study's policy ...+rowops+iembed, RPU_PLAN §3.1)
 CONN = "model.connector.modality_projection.proj.weight"
 
 
@@ -176,7 +178,8 @@ class VitFrontend:
     def __init__(self, cfg: VitConfig, weights: Dict[str, np.ndarray], formats: VisionFormats,
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
-                 attn_split: int = 1, vsmx: bool = False, rowops: bool = False):
+                 attn_split: int = 1, vsmx: bool = False, rowops: bool = False,
+                 iembed: Optional[bool] = None):
         """``attn_split`` R > 1 splits every head's softmax and P.V by query
         rows into R parts (TACTICS_PLAN §4.4): the CPU can then start the
         next ConvKernel call between the parts (--plan's order search).
@@ -188,6 +191,9 @@ class VitFrontend:
         # as the int32 DMA tensor at 2^-RES_BITS, the residual adds and LayerNorms on
         # the row-ops unit (src/rowops_nodes.py)
         self.rowops = bool(rowops)
+        self.iembed = (self.rowops and IEMBED_DEFAULT) if iembed is None else bool(iembed)
+        if self.iembed and not self.rowops:
+            raise ValueError("iembed needs rowops")
         if attn_split < 1 or cfg.N % (attn_split * 16):
             raise ValueError(f"attn_split {attn_split}: {cfg.N} query rows not in parts of 16")
         self.attn_split = int(attn_split)
@@ -289,9 +295,16 @@ class VitFrontend:
         pin = self._t("vision.patches", [N, 3 * c.P * c.P], exp=0)
         pe = self._matmul(pin, "w.v.pe", patch_weight(W, c), N, "vision.pe", fm.get("pe", 0, D),
                           "vision.patch_embed")
-        self._init("vision.b0", patch_bias_table(W))
         h = self._res("vision.h0")
-        self._node("VitEmbedAdd", [pe, "vision.b0"], [h], "vision.embed", domain=LLM_DOMAIN)
+        if self.iembed:                 # the table as int32 words at 2^-RES_BITS (rounded once), one ADDX
+            from .rowops_nodes import EmbedAddRoNode
+            b0q = np.clip(np.rint(patch_bias_table(W).astype(np.float64) * 2.0 ** RES_BITS),
+                          -2147483648.0, 2147483647.0)
+            self._init("vision.b0i", EmbedAddRoNode.table_words(b0q))
+            self._node("VitEmbedAdd", [pe, "vision.b0i"], [h], "vision.embed", domain=LLM_DOMAIN, rowops=1)
+        else:
+            self._init("vision.b0", patch_bias_table(W))
+            self._node("VitEmbedAdd", [pe, "vision.b0"], [h], "vision.embed", domain=LLM_DOMAIN)
         if self.rowops:
             for key in ("o", "d"):
                 for li in range(L):
@@ -425,13 +438,37 @@ class VitFrontend:
         for i, k0 in enumerate(range(0, K, self.conn_k)):
             xs = self._t(f"vision.xs{i}", [c.n_img, self.conn_k], exp=fxs[k0:k0 + self.conn_k])
             self._node("VitPixelShuffle", [xf], [xs], f"vision.shuffle{i}", domain=LLM_DOMAIN,
-                       scale=c.scale, col0=k0)
+                       scale=c.scale, col0=k0, **(dict(rowops=1) if self.rowops else {}))
             parts.append(self._matmul(xs, f"w.v.conn.{i}", Wc[k0:k0 + self.conn_k], c.n_img,
                                       f"vision.img{i}", fm.get("img", L, c.Dt), f"vision.connector{i}"))
-        img = (self._t("vision.image", [c.n_img, c.Dt], host="f32") if output else
-               self._t(self.image_state, [c.n_img, c.Dt], host="f32", state=True))
-        self._node("VitSumDequant", parts, [img], "vision.image_features", domain=LLM_DOMAIN)
-        return self._model([pin], [img] if output else [])
+        if not self.rowops:
+            img = (self._t("vision.image", [c.n_img, c.Dt], host="f32") if output else
+                   self._t(self.image_state, [c.n_img, c.Dt], host="f32", state=True))
+            self._node("VitSumDequant", parts, [img], "vision.image_features", domain=LLM_DOMAIN)
+            return self._model([pin], [img] if output else [])
+        # rowops (RPU_PLAN §3.1): the parts summed exactly on the unit as an int32 row at the
+        # finest part exponent (ADDX, per-column shifts), then DEQUANT into the float32 DMA
+        # state (the text model's LlmEmbed reads it in place) or, as an output, a DMA row the
+        # host copies out — the host op's value bit for bit
+        fr = int(max(int(np.max(fm.get("img", L, c.Dt))), RES_BITS))
+        acc = parts[0]
+        for i, part in enumerate(parts[1:]):
+            s = self._t(f"vision.sum{i}", [c.n_img, c.Dt], exp=fr, dma="i32")
+            if i == 0:
+                self._node("VitResAdd", [acc, part, self._vec("v.conn.zero", np.zeros(c.Dt, np.float32))], [s],
+                           f"vision.sum{i}", domain=LLM_DOMAIN, rowops=1)
+            else:
+                self._node("LlmResAdd", [acc, part], [s], f"vision.sum{i}", domain=LLM_DOMAIN)
+            acc = s
+        if output:
+            imgd = self._t("vision.image_d", [c.n_img, c.Dt], dma="f32")
+            img = self._t("vision.image", [c.n_img, c.Dt], host="f32")
+            self._node("LlmDequant", [acc], [imgd], "vision.image_features", domain=LLM_DOMAIN)
+            self._node("LlmToHost", [imgd], [img], "vision.image_out", domain=LLM_DOMAIN)
+            return self._model([pin], [img])
+        img = self._t(self.image_state, [c.n_img, c.Dt], dma="f32", state=True)
+        self._node("LlmDequant", [acc], [img], "vision.image_features", domain=LLM_DOMAIN)
+        return self._model([pin], [])
 
     def _model(self, inputs, outputs):
         g = graph_with_initializers(

@@ -118,13 +118,13 @@ class TensorInfo:
     @property
     def dma_elem_bytes(self) -> int:
         """Bytes per element in the DMA buffer (2 for Data_t, 4 for dma i32)."""
-        return 4 if self.dma == "i32" else 2
+        return 4 if self.dma in ("i32", "f32") else 2
 
     @property
     def alloc_numel(self) -> int:
         """The DMA buffer's size in Data_t elements: numel, twice that for a
         dma i32 tensor."""
-        return self.numel * (2 if self.dma == "i32" else 1)
+        return self.numel * (2 if self.dma in ("i32", "f32") else 1)
 
     def exp_full(self, default: int) -> np.ndarray:
         """Exponent of every element in the logical shape (int64)."""

@@ -241,7 +241,7 @@ class MultiEntryGenerator:
                 f = first.setdefault(t.onnx_name, t)
                 if f is t:
                     continue
-                if (list(f.shape) != list(t.shape) or f.host != t.host
+                if (list(f.shape) != list(t.shape) or f.host != t.host or f.dma != t.dma
                         or f.group_layout != t.group_layout
                         or f.group_kw != t.group_kw
                         or not np.array_equal(f.exp_full(8), t.exp_full(8))):

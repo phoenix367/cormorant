@@ -254,8 +254,9 @@ src/
   rowops_nodes.py        its kernel nodes (LayerNormRoNode; ResAdd / RMSNorm / SiluMul and the prefill
                          AttnPrep — RoPE, the q image, the KV caches — for Llama; ResAddBias /
                          LayerNorm32 / VitAttnPrep for the vision and TTS encoders, TtsRowPrep for
-                         the TTS encoder) + the factories graph.py merges over the host ops when the
-                         platform has the unit
+                         the TTS encoder; RPU_PLAN A1: Transpose, TtsSum / TtsInterleave / TtsRelBand,
+                         Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle) + the
+                         factories graph.py merges over the host ops when the platform has the unit
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
                          edges); topological order, predecessors/successors,
@@ -291,7 +292,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              83 pytest modules, 1791 tests, all pass (test_bert_base.py
+  test_*.py              83 pytest modules, 1798 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

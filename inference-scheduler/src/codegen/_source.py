@@ -372,38 +372,44 @@ class _SourceMixin:
         for i, (t, off, cnt, _io) in enumerate(ins):
             lines.append(f"        const Data_t *in{i};  /* '{t.onnx_name}': {cnt} elem"
                          f" (stage +{off}) */")
-        if not (sn.output.is_host or sn.output.dma == "i32"):
+        odma = sn.output.dma is not None            # an int32 / float32 DMA tensor, written in place
+        if not (sn.output.is_host or odma):
             lines.append(f"        Data_t       *out;  /* '{sn.output.onnx_name}': {o_cnt} elem"
                          f" (stage +{o_off}) */")
         seen = set()
-        for t in sn.dma_inputs() + [t for t in sn.inputs if t.dma == "i32" and not t.is_state]:
+        for t in sn.dma_inputs() + [t for t in sn.inputs if t.dma is not None and not t.is_state]:
             if t.c_name not in seen and self._written_by_kernel(t):
                 seen.add(t.c_name)
                 lines.append(f"        inference_buf_sync_from_device({t.c_name});"
                              f"  /* written by a kernel */")
+        for t in sn.inputs:                         # a float32 DMA state: a kernel of another entry wrote it
+            if t.is_state and t.dma == "f32" and t.c_name not in seen:
+                seen.add(t.c_name)
+                lines.append(f"        inference_buf_sync_from_device({t.c_name});"
+                             f"  /* a kernel-written state */")
         for i, (t, off, _cnt, (nc, ch, st)) in enumerate(ins):
             lines.append(f"        in{i} = host_in({t.c_name}, s_host_stage + {off}u,"
                          f" {nc}u, {ch}u, {st}u);")
-        if not (sn.output.is_host or sn.output.dma == "i32"):
+        if not (sn.output.is_host or odma):
             nc, ch, st = o_io
             lines.append(f"        out = host_out({sn.output.c_name}, s_host_stage + {o_off}u,"
                          f" {nc}u, {ch}u, {st}u);")
+        ctype = {"i32": "int32_t", "f32": "float"}
         args = []
         for t in sn.inputs:
             if t.onnx_name in staged:
                 args.append(f"in{staged[t.onnx_name][0]}")
-            elif t.dma == "i32":                    # an int32 DMA tensor, read in place
-                args.append(f"(int32_t *)inference_buf_ptr({t.c_name})")
+            elif t.dma is not None:                 # an int32 / float32 DMA tensor, read in place
+                args.append(f"({ctype[t.dma]} *)inference_buf_ptr({t.c_name})")
             elif t.is_state and not t.is_host:      # a DMA state, read / updated in place
                 args.append(f"(int16_t *)inference_buf_ptr({t.c_name})")
             else:
                 args.append(t.c_name)
-        o32 = sn.output.dma == "i32"
-        out = "out" if not (sn.output.is_host or o32) else (
-            f"(int32_t *)inference_buf_ptr({sn.output.c_name})" if o32 else sn.output.c_name)
+        out = "out" if not (sn.output.is_host or odma) else (
+            f"({ctype[sn.output.dma]} *)inference_buf_ptr({sn.output.c_name})" if odma else sn.output.c_name)
         for ln in sn.c_call(args, out, "NULL", [], self._dtype):
             lines.append("        " + ln)
-        if o32:                                     # written in place: flush before a kernel reads it
+        if odma:                                    # written in place: flush before a kernel reads it
             lines.append(f"        inference_buf_sync_to_device({sn.output.c_name});")
         elif not sn.output.is_host:
             nc, ch, st = o_io
@@ -573,6 +579,8 @@ class _SourceMixin:
         if t.group_layout:
             row = int(t.shape[1])
             n = -(-n // row) * row
+        if t.dma == "f32":
+            raise SchedulerError(f"state '{t.onnx_name}': a float32 DMA state starts at zero")
         if t.dma == "i32":
             raw = np.clip(np.rint(v[:n] * 2.0 ** t.exp_full(self._dtype.frac_bits).reshape(-1)[:n]),
                           -2147483648.0, 2147483647.0).astype(np.int32).view(np.int16)

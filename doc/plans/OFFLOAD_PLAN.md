@@ -181,7 +181,8 @@ exponents that moved: `dec.up0` 10 → 8, the stage-0 resblocks 1–2 9 → 8,
 11, `dec.rb21.c1` 12 → 11.
 
 **Implementation:** the chunk graph has 21 `TtsAddVopNode` (18 residual sums,
-3 tap-group sums) and 19 host `TtsSum`; `test/test_piper.py` (simulation =
+3 tap-group sums) and 7 host `TtsSum` (19 until RPU_PLAN A1 moved the 12
+two-input flow sums onto the row-ops unit, `TtsSumRoNode`); `test/test_piper.py` (simulation =
 specification, both variants; the generated C in the emulator) and
 `tts_host_emu.py --incoherent` (PCM, encoder, duration predictor bit-exact).
 `generate_tts_project.py` writes `tts_glue_init()` — `inference_init()` with

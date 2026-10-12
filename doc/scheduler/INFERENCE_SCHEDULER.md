@@ -105,11 +105,10 @@ image (hence `qk_kw = 1`), a COPY into the K cache and TRANSPOSEs into the
 P·V image — the 16K-key blocks inside [pos, pos + n) as R = K tiles, the
 two boundary blocks as byte-strobed single-element granules; the
 calls are priced at pos = 0, n = T; the numerics are the study's `irope`.
-The decode step's `LlmAttnPrep` (one row), `LlmAttnMerge` (a 128-byte-row
-gather the unit would not beat) and `LlmDequant` (a host output) stay host
-ops; the decode prep invalidates the V-cache lines it writes 2-byte slots
-into (`llm_cache_inval_rows`): the unit wrote them through a port that does
-not snoop the CPU caches.  The vision encoder's and the Piper encoder's
+The decode step's `LlmAttnPrep` (one row) and `LlmAttnMerge` (a 128-byte-row
+gather the unit would not beat) stay host ops; the decode prep invalidates
+the V-cache lines it writes 2-byte slots into (`llm_cache_inval_rows`): the
+unit wrote them through a port that does not snoop the CPU caches.  The vision encoder's and the Piper encoder's
 `VitAttnPrep` (`VitAttnPrepRoNode`, phase 4b: the q / k / v bias adds as
 COPYs with the bias in the parameter block — `rowops_spec.bias_round`, the
 studies' `iqkv` — and the same image / cache jobs) and the Piper encoder's
@@ -119,6 +118,44 @@ with the unit's integer formula) run on the unit as well.  `test/host_emu.py` mo
 the unit in C (`xrowopskernel.h`), so every generated project runs on the
 host; `perf_model.family()` prices its calls as the `rowops` family once a
 campaign measures them (phase 3).
+
+[RPU_PLAN](../plans/RPU_PLAN.md) track A1 (2026-10-12) moves the remaining
+copies and dequantisations there, each a bit copy or the host op's value bit
+for bit: an ONNX **`Transpose`** of an int16 DMA tensor whose collapsed
+shape is a head split / merge (one COPY with the two outer axes swapped) or
+a Kᵀ (one TRANSPOSE of 8-row tiles into granules at the output's row
+stride) — `TransposeRoNode`, BERT's 48 of 49 (the host op for odd strides
+or a last dim not a multiple of 8); the Piper chunk's two-input **`TtsSum`**
+with differing exponents or channel offsets (`TtsSumRoNode`: one ADDX with
+per-tensor shifts — the masked and the ÷ 3 sums stay host ops) and
+**`TtsInterleave`** (`TtsInterleaveRoNode`: one TRANSPOSE of R = the phase
+count, the columns in chunks of ≤ 1 024 as the job's blocks); the Piper
+encoder's **relative-key band** (`PiperEncoderFrontend(rel_kernel=True)`,
+the default with `vsmx` and `rowops`): the 9 relative keys ride as 16
+extra rows of the K cache (`VitAttnPrepRoNode` copies them in; the q·Kᵀ
+call's rows T .. T + 8 are then q·ekᵀ at 2^-f_s), `TtsRelBandRoNode` writes
+them onto the diagonals of a zero band state with 9 byte-strobed R = 1
+TRANSPOSEs (granules 2(T + 1) bytes apart; the state has W guard rows above
+the matrix, so every job reads its scores row from its 16-byte-aligned
+start — `host_emu` now aborts on an unaligned unit job) and adds the band
+to the scores with one ADDX (`piper_vits.encoder_forward(rel_kernel=True)` is the
+specification; 0.408 dB log-mel against float, the host's 0.388); the
+**float32 DMA kind** (`axi.numeric` `dma: f32`, four bytes per element in
+the pool): `LlmDequant` into it is the unit's DEQUANT (`DequantRoNode`, an
+int16 or int32 input — the Llama logits with `rowops`, then `LlmToHost`, a
+host op that invalidates and copies the row into the caller's `float *`;
+the vision connector's `VitSumDequant` becomes two ADDX into an int32 row
+at the finest part exponent plus the DEQUANT into the image-feature
+*state*, which the text model's `LlmEmbed` now reads from DMA memory
+after an invalidate); `LlmSelectRow` of the int32 residual (one COPY of
+the row `n − 1`, `SelectRowRoNode`); and `VitPixelShuffle` as one COPY per
+source block the column window touches (`PixelShuffleRoNode`, the output
+rows as a 2-level pattern).  `VitEmbedAdd` as one ADDX with the position
+table as an int32 stream (`EmbedAddRoNode`) exists as an opt-in
+(`VitFrontend(iembed=True)`): the study found its once-rounded table a small
+step down (RPU_PLAN §8).  `LlmAttnMerge` / `TtsAttnMerge`, the decode
+step's prep and softmax, `TtsEncOut` (its stats add a float32 bias) and
+the embeddings stay host ops (RPU_PLAN §3.1, §3.3).
 
 **Host-CPU ops (C code inside `inference_run()`, no hardware call):**
 - **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Concat,
@@ -131,7 +168,7 @@ campaign measures them (phase 3).
 - **Llama-family decoder ops** (custom domain `axi.llm`, `src/llm_nodes.py`)
   — `LlmEmbed`, `LlmRMSNorm`, `LlmResAdd`, `LlmAttention` (RoPE + KV cache
   + causal GQA attention as one float region), `LlmSiluMul`,
-  `LlmSelectRow`, `LlmDequant`, and `LlmAttnPrep` / `LlmAttnSoftmax` /
+  `LlmSelectRow`, `LlmDequant`, `LlmToHost`, and `LlmAttnPrep` / `LlmAttnSoftmax` /
   `LlmAttnMerge` around the prefill attention's ConvKernel calls; the graphs
   come from the Llama frontend
   (`src/llama.py`, [§Llama-family decoders](#llama-family-decoders)) with
@@ -209,7 +246,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1791 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1798 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1057,6 +1094,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmSiluMul` | `a = silu(g)·u`, silu from a 65 536-entry double table per gate exponent (libm exp, exhaustively equal to the simulator's) |
 | `LlmSelectRow` | `h_last = h[n − 1]` |
 | `LlmDequant` | `y = float32(raw · 2^-f[c])` |
+| `LlmToHost` | `y` (float32 host) = `x`, a float32 DMA tensor (the unit's DEQUANT output), invalidated and copied into the caller's buffer — RPU_PLAN A1 |
 | `LlmAttnPrep` | rows t < n: RoPE(k0) → K cache row `pos + t`, v → V cache (as LlmAttention); `RoPE(q0)` rounded at the per-head q exponent → the q·Kᵀ input image of every KV head, `x_g[c][kw·p + j] = q[t][h][(c/16)·16kw + j·16 + c%16]`, `p = (h mod G)·T + t` (rows ≥ n zero; blocks of 16 rows per head, one contiguous run per image row); then `llm_cache_flush` of rows `[0, keys)` of both caches — a decode step (no `n` input) flushes only its rows, `llm_cache_flush_rows` |
 | `LlmAttnScores` (ConvKernel) | `s_g[j][p] = floor(Σ_d K_g[j][d]·q_g[d][p] / 2^8)`, j < keys: MatMul on ConvKernel ([§MatMul on ConvKernel](#matmul-on-convkernel)) with weight = the K cache rows `[keys][HD]` of KV head g (`out_ch = keys`), x = the q image (`in_ch = HD/kw`, 1×kw), output `G·T` pixels |
 | `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |

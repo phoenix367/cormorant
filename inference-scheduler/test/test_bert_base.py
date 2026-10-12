@@ -32,7 +32,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.host_nodes import GeluNode, LayerNormNode, SoftmaxNode, TransposeNode
 from src.nodes import ACT_GELU_TANH, MatmulConvNode, MatmulNode, ScheduledNode
-from src.rowops_nodes import LayerNormRoNode, enabled as rowops_unit
+from src.rowops_nodes import LayerNormRoNode, TransposeRoNode, enabled as rowops_unit
 from src.smx_nodes import SoftmaxVopNode, enabled as softmax_unit
 
 _STUDY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -79,8 +79,11 @@ class TestBertBase(unittest.TestCase):
         # softmaxes on its softmax unit where the platform has it
         smx = 12 if softmax_unit() else 0
         ln = 25 if rowops_unit() else 0                   # the 25 LayerNorms on the row-ops unit
+        # the row-ops unit also takes the 48 head-split / merge / K^T transposes (RPU_PLAN §3.1);
+        # the final [1][256][2] -> [2][1][256] one stays a host copy
+        tr = 48 if ln else 0
         self.assertEqual((k[LayerNormNode], k[LayerNormRoNode], k[GeluNode], k[SoftmaxNode], k[SoftmaxVopNode],
-                          k[TransposeNode]), (25 - ln, ln, 0, 12 - smx, smx, 49))
+                          k[TransposeNode], k[TransposeRoNode]), (25 - ln, ln, 0, 12 - smx, smx, 49 - tr, tr))
         self.assertEqual(sum(1 for sn in self.g.nodes if isinstance(sn, ScheduledNode)
                              and sn.act == ACT_GELU_TANH), 12)
         self.assertEqual((k[MatmulNode] + k[MatmulConvNode], k[ScheduledNode]), (98, 126))

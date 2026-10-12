@@ -124,12 +124,19 @@ every counter is sized for the register value.
 | `LlmResAddNode`, `VitResAddNode` | ADDX (A h i32, B d i16, `P_BCAST` or per-column bias) |
 | `LlmRMSNormNode`, `VitLayerNormNode`, `LayerNormNode` (BERT), `TtsResNormNode` | NORM (TtsResNorm: ADDX into an i32 row, then NORM) |
 | `LlmSiluMulNode` | MULACT |
-| `LlmDequantNode` | DEQUANT |
+| `LlmDequantNode` (`DequantRoNode`, RPU_PLAN A1: the output a float32 DMA tensor or state, `dma: f32`) | DEQUANT (A i16 at per-column exponents, or the int32 residual) |
+| `VitSumDequantNode` (RPU_PLAN A1, the vision frontend's `rowops`) | the parts summed by ADDX into an int32 row at the finest part exponent (`ResAddBiasRoNode` with a zero bias, then `ResAddRoNode`), DEQUANT into the float32 image-feature state |
+| `LlmSelectRowNode` (`SelectRowRoNode`, the int32 residual) | one COPY (A / C i32) of row n − 1, the base from the runtime n |
+| `VitPixelShuffleNode` (`PixelShuffleRoNode`) | one COPY per source block the column window touches: the output rows (i, j) as rows j × blocks i, the source rows (i·s + b)·n + j·s + a |
 | `LlmAttnPrepNode` (the prefill entries — `AttnPrepRoNode`, HOSTOPS_PLAN §10) | ROPE on q0 (→ a staging row at f_q[h]) and k0 (→ a staging row at f_k[g]), one COPY of the k rows into the K cache (`blocks` = the KV groups), a COPY re-rounding v where the V cache's exponents differ, one TRANSPOSE per KV group of the q rows into the q·Kᵀ x image (tiles of 8 query rows, `kw` 1), the V image per group as TRANSPOSEs: the 16K-row blocks inside [pos, pos + n) with R = group_kw (contiguous granules), the two boundary blocks as R = 1 granules (byte-strobed); a COPY with the window [0, 0) zeroes the q staging once per run |
 | `VitAttnPrepNode`, Piper's (`VitAttnPrepRoNode`, phase 4b) | q0 + bq and v + bv as COPYs with the bias in the parameter block (`rowops_spec.bias_round`: Bq' = round(b·2^fp), fp = `bias_exp`) into staging rows, k0 + bk per head straight into the K cache, one TRANSPOSE of the q rows into every head's image (the heads as blocks), the V image per head as the whole-block TRANSPOSEs (T = C = a multiple of 16K) or, group_kw 1, one COPY with the heads as blocks |
 | `LlmAttnMergeNode`, `TtsAttnMergeNode` | COPY per group (2-level: rows t, heads hh) |
 | `TtsRowPrepNode` (`TtsRowPrepRoNode`, phase 4b) | one COPY per tap of the rows it reads (`rows = n`, the output shifted by the tap's offset) with the bias and `RELU` in the parameter block; the rows the host zeroes (the first tap's row 0, the last tap's row n − 1, every row ≥ n) as COPYs with the window [0, 0) |
-| `TransposeNode` (head split), `ConcatNode`, `SliceNode` | COPY |
+| `TransposeNode` (`TransposeRoNode`, RPU_PLAN A1: BERT's head splits / merges and Kᵀ) | a head split / merge (the collapsed [D2][D1][n] with strides [n, D2·n, 1]) as one COPY with `rows = D1`, `blocks = D2`; Kᵀ ([B][L][M] with strides [sB, 1, sM]) as one TRANSPOSE of 8-row tiles into granules at the output's row stride M |
+| `TtsSumNode` (two inputs, `TtsSumRoNode`) / `TtsInterleaveNode` (`TtsInterleaveRoNode`) | ADDX over the channel slices with the shifts fp − f at the max exponent / one TRANSPOSE of R = the phase count s, tile = output channel, the columns in ≤ 1 024-wide chunks as blocks |
+| `TtsAttnRelAddNode` (`TtsRelBandRoNode`, `PiperEncoderFrontend(rel_kernel=True)`) | the relative keys as 16 extra K cache rows (a COPY in `VitAttnPrepRoNode`; the q·Kᵀ call yields q·ekᵀ as rows T ..), one TRANSPOSE (R = 1, granule stride 2(T + 1): byte strobes) per key offset onto the diagonals of a zero band state [W + T][T] (W guard rows take the granules of i < −d, so every job reads its scores row from its aligned start), one ADDX of the band onto the scores |
+| `VitEmbedAddNode` (`EmbedAddRoNode`, opt-in: `VitFrontend(iembed=True)`) | one ADDX of the patch embedding (i16, per-column shifts) and the position table as an int32 stream at 2^-15 (shipped as a Q8.8 weight whose words are the int32 image) into the int32 residual |
+| `ConcatNode`, `SliceNode` | COPY |
 
 ## 2. Architecture
 
