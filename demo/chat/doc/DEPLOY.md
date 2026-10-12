@@ -176,9 +176,9 @@ a margin); the server uses it to decide what to evict.
 | Model | Pool | `cma_mb` | Stays loaded (`--resident auto`) beside |
 |---|---:|---:|---|
 | BERT | 216 MiB | 224 | SmolLM2-135M, SmolVLM, Piper |
-| SmolLM2-135M | 294 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
+| SmolLM2-135M | 297 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
 | SmolLM2-360M | 758 MiB | 775 | Piper only; swaps with the others |
-| SmolVLM-256M | 511 MiB | 550 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
+| SmolVLM-256M | 512 MiB | 550 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
 | Piper | 53 MiB | 55 | any other model, even SmolLM2-360M |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of

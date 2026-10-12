@@ -69,7 +69,7 @@ The request body may be up to 32 MB when an image model is served
 
 ## Memory and other models
 
-The SmolVLM pool is 511 MiB (`cma_mb` 550 with the image buffer).  Under
+The SmolVLM pool is 512 MiB (`cma_mb` 550 with the image buffer).  Under
 `--resident auto`:
 - **Beside BERT:** it stays loaded.
 - **Beside SmolLM2-135M:** only when the CMA is not fragmented.  Otherwise

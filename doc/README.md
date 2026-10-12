@@ -132,12 +132,14 @@ Packaged workflows in [`.claude/skills/`](../.claude/skills/) (each
 | `model-study` | decide GO / NO-GO for a new model before porting it: operators, memory, fixed-point numerics against float, projected latency |
 | `llm-onboard` | take a Llama-family model that passed `model-study` to a served chat model: calibrate, generate, bit-exact gates, board install, backend, deploy |
 | `add-host-op` | add an operator that runs on the board's CPU (numpy reference + C helper, bit-exact, A53-fast, timing model, tests) |
+| `rowops-offload` | move a host op onto the row-ops unit: the node, its factory and frontend flag, the specification and study policy, the tests, the libraries and the board gate — with the contract's traps (aligned streams, raw images, per-column exponents) |
 | `kernel-verify` | verify a kernel change end to end (`matmul` / `vectorop` / `pool` / `conv`, all SystemVerilog): C-sim of the reference model, the Verilator testbench and lint, Vivado out-of-context synthesis, the test-stand behaviour test, timing diff |
 | `conv-cycle-model`, `conv-rtl-trace` | predict ConvKernel cycles per layer; trace one RTL case's AXI / FIFO activity |
 | `hls-rag` | ground HLS pragma / TCL edits in the indexed Vitis HLS user guide |
 | `board-deploy` | build and load a bitstream, then run the on-board tests and demos |
 | `perf-regression` | run the kernel benchmarks (and demo latencies) and compare them with the recorded baseline of the loaded bitstream |
 | `perf-calibrate` | measure the per-bitstream performance model that `--plan` needs (after every new bitstream) |
+| `board-window` | one board session after a scheduler change: regenerate the libraries, gate / install / profile each on the KV260, top up the perf and host models, benchmark + baseline, the chat server back, the simulator check (`scripts/board_window.sh`) |
 | `docs-audit` | audit the docs against the code, or reproduce every documented path from a fresh clone |
 
 Subagents in [`.claude/agents/`](../.claude/agents/):

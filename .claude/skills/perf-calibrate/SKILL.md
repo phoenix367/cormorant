@@ -22,6 +22,7 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | `--plan: no performance model for bitstream X (perf_models/kv260/X.json)` | the bitstream in `bitstream_config_kv260.json` has no campaign: §2 |
 | scheduler change that alters shipped kernel calls (same bitstream) | coverage check §6, then a top-up: `cases`, `run --resume`, `fit` |
 | host-op C code, `INFERENCE_HOST_THREADS` or the model set changed | §3, then §4 |
+| a host-op kind appeared or vanished (an op moved onto a kernel, a new host node — `simulate` reports an unpriced node) | profile every shipped model in the same board window, then `host --merge` with all the profiles (§3); the `board-window` skill does both |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
 Current model: **kv260/1cedaf2ed816** (2026-10-12), `f70ce632a97a`'s design with the RowOpsKernel
@@ -252,6 +253,13 @@ The rounds converge. Each one costs a short `run --resume`, but also a stop of t
 chat server.
 
 ## 3. Host-op model: `host.json`, independent of the bitstream
+
+A node kind without an entry prices at 0 and shows as `unpriced` in `simulate`
+(the planner's order search then leaves the order unchanged).  After RPU_PLAN
+A1 the five profiles of one window merged into 170 exact signatures / 41 kinds
+with `--merge` (the new `LlmToHostNode` fitted, every other kind kept); the
+profiles were the window's `llm_board.py --out` / `tts_board.py --out` JSONs and
+the BERT demo's `results.json` from `--profile-layers`.
 
 Its inputs are per-layer board profiles. Record: SmolVLM, SmolLM2-135M, BERT and the three CNNs
 gave **56 exact signatures and 27 op kinds**. Piper, merged in on 2026-10-01, made that

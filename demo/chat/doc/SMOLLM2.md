@@ -451,7 +451,7 @@ cache from an earlier request.
   - `llm_open` takes 0.6–0.7 s with the weights in the page cache.  Cold
     from the SD card it took 35.6 s before §19, when the weight files were
     538 MB; they are now 326 MB.
-  - The pool buffer is 294 MiB; before §19 it was 488 MiB, with a second
+  - The pool buffer is 297 MiB; before §19 it was 488 MiB, with a second
     copy of the weights.
 
 ### Server side

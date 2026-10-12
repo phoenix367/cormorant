@@ -160,7 +160,9 @@ $PY $CMP --run $TMPDIR/perf_$STAMP.json [--demo …] --bitstream-id $BID --recor
 ```
 It compares first (exit status = the comparison's), then writes
 `baselines/<platform>-<id>.json`.  Only a clean run is recorded (a
-failed case or demo → error, exit 2).  Recording kernels leaves the demo
+failed case or demo → error, exit 2); a REGRESSION verdict does not block
+the record — the run is written and the exit status stays 1, so read the
+compare output before trusting a freshly recorded baseline.  Recording kernels leaves the demo
 entries alone and vice versa; a replaced section (kernels, or one demo)
 moves to `history` with its run time, source and latencies.  Format:
 `kernels.cases["<Kernel>/<label>"] = {fields, lat_ms, thr, thr_unit}`,
@@ -182,6 +184,11 @@ baselines are checked-in files: tell the user to commit them.
 - A new or renamed case in `perf_config.json` shows as `new` / `missing`
   until recorded; a changed geometry under an old label shows `REDEFINED`
   — rename the label instead.
+- Run-to-run noise on 1cedaf2ed816 (2026-10-12, two runs ten minutes
+  apart, no kernel change): the small MatmulKernel cases (64x64x64,
+  batch4-A-bcast, FC-1x1280x1001-packed, 256x256x256) moved +2 … +7 %, a
+  14x14 pool case ±8 % — re-run once before calling a MatmulKernel or pool
+  case of a few tens of µs a regression.
 - Report: verdict, counts, every flagged case (base → now, Δ %), the
   worst five, and whether a baseline was recorded.  Quote the numbers
   from the compare output, not from memory or the optimisation logs.
