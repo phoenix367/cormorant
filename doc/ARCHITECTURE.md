@@ -818,8 +818,10 @@ five lines are concatenated into `pl_ps_irq0[4:0]`:
 The A53 polls `ap_done` and does not use the kernel interrupts.  The R5
 sets GIE on a lane before the lane's first start in a batch and clears it at
 the end of the batch.  The A53 can then drive the same kernel between
-batches without stray interrupts.  The Linux overlay's numbers for
-MatmulKernel, ConvKernel and PoolingKernel are wrong (§9).
+batches without stray interrupts.  The Linux overlay
+(`dts/kv260/cormorant.dts`) gives each kernel's UIO node the same SPI, so an
+interrupt-driven wait on the A53 can use it; the fact registry's
+`board.irq_spi` checks the overlay and this table against the block design.
 
 ### 6.4 Inter-processor interrupts and the R5 control block
 
@@ -1179,12 +1181,6 @@ A new bitstream is promoted to production in this order:
 
 ## 9. Known issues and open items
 
-- **Overlay interrupt numbers.**  `dts/kv260/cormorant.dts` gives
-  MatmulKernel, ConvKernel and PoolingKernel SPIs 96, 97 and 98.  The
-  bitstream raises them on 90, 91 and 92; the R5's BSP, generated from the
-  hardware description, has them right.  Nothing on Linux uses those UIO
-  interrupts today.  An interrupt-driven wait on the A53 needs the overlay
-  fixed first.
 - **Resource headroom** (§8.5).  BRAM 94 %, URAM 86 %, every CLB in use, and
   +0.020 ns of slack.  The next kernel feature has to recover area or move
   storage to LUTRAM.

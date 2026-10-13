@@ -16,10 +16,11 @@
  * The DDR APM is the right block for measuring FPGA→DDR bandwidth on
  * KV260: every AFI / FPGA-HP transaction landing in DDR shows up on
  * one of its six slots, regardless of whether CCI is in the path or
- * not.  (CCI is disabled in the cormorant overlay, so HPC0/HPC1 are
- * unused — kernels go through HP0–HP3 → AFI → DDR APM → DDRC.)
+ * not.  (The kernels use S_AXI_HPC0 / HPC1, which reach the DDRC
+ * through the CCI-400, and S_AXI_HP0 / HP2, which go straight to it —
+ * doc/ARCHITECTURE.md §4.5.)
  *
- * Each slot maps to one DDRC AXI port.  The four FPGA kernels'
+ * Each slot maps to one DDRC AXI port.  The five FPGA kernels'
  * m_axi_gmem masters land on different DDRC ports depending on the
  * bitstream wiring, so a single-slot measurement misses traffic.
  * This backend supports up to 5 slots in one run (10 metric counters

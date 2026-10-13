@@ -503,11 +503,12 @@ names the loaded overlay actually exported:
 # On the board: list UIO device names
 cat /sys/class/uio/uio*/name
 
-# Expected for cormorant.dts (all four kernels), after the image's four axi-pmon:
+# Expected for cormorant.dts (all five kernels), after the image's four axi-pmon:
 # fabric_vecop
 # fabric_matmul
 # fabric_conv
 # fabric_pool
+# fabric_rowops
 ```
 
 If the names differ, find the `.dts` that was used to build the overlay:

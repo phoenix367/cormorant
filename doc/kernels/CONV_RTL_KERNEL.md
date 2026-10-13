@@ -125,12 +125,18 @@ fan-out to several DSP columns):
 | weight-cache fill | one register, a copy per column group (each drives 4 columns' RAMs) |
 | bias RAM, row buffer, line buffer, transposer | write and read addresses through a register stage, copies per bank group |
 
-Resources (out of context, xck26 −2LV, `make synth_conv_rtl`, routed): 17 835
-LUT (3 758 LUTRAM, 2 389 SRL: the operand skew), 39 630 FF (21 507 before
-the register trees: the patch lanes' per-chain copies are 8 192 of the 18 123
-added), 40 RAMB36 + 24 RAMB18, 48 URAM, 518 DSP; timing met at 300 MHz (WNS
-+0.039 ns, Fmax ≈ 304 MHz).  The HLS kernel in the production bitstream
-(routed): 37 233 LUT, 41 457 FF, 46 RAMB36 + 16 RAMB18, 48 URAM, 803 DSP.
+Resources (out of context, xck26 −2LV, `make synth_conv_rtl`, routed;
+2026-10-10, with the line buffer's second copy, `doc/plans/DEPTHWISE_PLAN.md`
+§8.3): 18 191 LUT (3 758 LUTRAM, 2 389 SRL: the operand skew), 39 762 FF,
+40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP; timing met at 300 MHz (WNS
++0.025 ns, WHS +0.031 ns, Fmax ≈ 302 MHz).  Before the second copy: 17 835
+LUT, 39 630 FF (21 507 before the register trees: the patch lanes' per-chain
+copies are 8 192 of the 18 123 added), 40 RAMB36 + 24 RAMB18 (the copy adds
+16 RAMB18), WNS +0.039 ns.  In context (production bitstream `1cedaf2ed816`,
+routed, `report_utilization -hierarchical`): 18 253 LUT (3 758 LUTRAM, 2 390
+SRL), 39 731 FF, 40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP.  The retired HLS
+kernel, routed in the bitstreams that carried it: 37 233 LUT, 41 457 FF,
+46 RAMB36 + 16 RAMB18, 48 URAM, 803 DSP.
 
 ## 3. Performance
 

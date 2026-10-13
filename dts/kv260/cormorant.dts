@@ -33,7 +33,7 @@
 		};
 	};
 
-	/*uio*/
+	/*uio: VectorOPKernel, pl_ps_irq0[0] = SPI 89 (GIC id 121)*/
 	fragment@3 {
 		target = <&amba>;
 		overlay3: __overlay__ {
@@ -46,12 +46,12 @@
 		};
 	};
 
-	/*uio*/
+	/*uio: MatmulKernel, pl_ps_irq0[1] = SPI 90 (GIC id 122)*/
 	fragment@4 {
 		target = <&amba>;
 		overlay4: __overlay__ {
 			fabric_matmul: fabric_matmul@a0010000 {
-				interrupts = <0x00 0x60 0x04>;
+				interrupts = <0x00 0x5a 0x04>;
 				interrupt-parent = <&gic>;
 				compatible = "generic-uio";
 				reg = <0x00 0xa0010000 0x00 0x10000>;
@@ -59,12 +59,12 @@
 		};
 	};
 
-	/*uio*/
+	/*uio: ConvKernel, pl_ps_irq0[2] = SPI 91 (GIC id 123)*/
 	fragment@5 {
 		target = <&amba>;
 		overlay5: __overlay__ {
 			fabric_conv: fabric_conv@a0020000 {
-				interrupts = <0x00 0x61 0x04>;
+				interrupts = <0x00 0x5b 0x04>;
 				interrupt-parent = <&gic>;
 				compatible = "generic-uio";
 				reg = <0x00 0xa0020000 0x00 0x10000>;
@@ -72,12 +72,12 @@
 		};
 	};
 
-	/*uio*/
+	/*uio: PoolingKernel, pl_ps_irq0[3] = SPI 92 (GIC id 124)*/
 	fragment@6 {
 		target = <&amba>;
 		overlay6: __overlay__ {
 			fabric_pool: fabric_pool@a0030000 {
-				interrupts = <0x00 0x62 0x04>;
+				interrupts = <0x00 0x5c 0x04>;
 				interrupt-parent = <&gic>;
 				compatible = "generic-uio";
 				reg = <0x00 0xa0030000 0x00 0x10000>;
@@ -85,7 +85,7 @@
 		};
 	};
 
-	/*uio: the row-ops unit (RowOpsKernel, pl_ps_irq0[4] = SPI 125)*/
+	/*uio: the row-ops unit (RowOpsKernel), pl_ps_irq0[4] = SPI 93 (GIC id 125)*/
 	fragment@7 {
 		target = <&amba>;
 		overlay7: __overlay__ {

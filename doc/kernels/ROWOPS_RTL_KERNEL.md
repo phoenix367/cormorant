@@ -32,7 +32,8 @@ VLNV `xilinx.com:hls:RowOpsKernel:1.0`, driver `RowOpsKernel_v1_0`
 ### 1.2 Register map
 
 HLS layout: `0x00` ctrl (b0 ap_start, b1 ap_done COR, b2 ap_idle, b3
-ap_ready, b7 auto_restart), `0x04` GIE, `0x08` IER, `0x0C` ISR.  Arguments
+ap_ready COR, b7 auto_restart, b9 interrupt), `0x04` GIE, `0x08` IER (b0
+done, b1 ready), `0x0C` ISR (toggle on write).  Arguments
 (32-bit words; 64-bit values low word first):
 
 | offset | name | meaning |
@@ -145,12 +146,12 @@ every counter is sized for the register value.
                                    │
    m_axi_gmem0 AR/R ◄─ ro_rd_arb ◄─┼─ ro_rd_port A (ARID 0) ─► A words ─┐
                                    ├─ ro_rd_port B (ARID 1) ─► B words ─┤
-                                   ├─ ro_param  (P: 4 RAMs of 2 BRAM36, 8 entries / cycle)
+                                   ├─ ro_param  (P: 2 URAM 4096 x 72, 4 banks, 4 entries / cycle)
                                    │                                     ▼
-                                   │   ro_stream (COPY / ADDX / DEQUANT / MULACT; sigmoid ROM)
+                                   │   ro_stream (COPY / ADDX / DEQUANT / MULACT; sigmoid table, 2 URAM)
                                    │   ro_norm   (ring 2 URAM, sums, ro_rsqrt, emit)
                                    │   ro_rope   (head-segment buffer)
-                                   │   ro_xpose  (8 x 4096 tile, granule strobes)
+                                   │   ro_xpose  (tile ≤ 8 rows x 1024 elements, granule strobes)
                                    │                                     │
    m_axi_gmem0 AW/W/B ◄─────────────┴─ ro_wr_port (strobes) ◄─ C words ◄─┘
 ```

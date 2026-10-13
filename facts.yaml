@@ -1317,6 +1317,23 @@ facts:
     - {name: TESTING table, file: doc/build-and-test/TESTING.md, regex: '^\| `(\w+Kernel)` \| `(fabric_\w+)` \|$',
        as: dict, transform: "{k.replace('PoolingKernel', 'PoolKernel'): x for k, x in v.items()}"}
 
+- id: board.irq_spi
+  kind: interface
+  title: each kernel's interrupt (SPI) — the block design's pl_ps_irq0 bit n is SPI 89 + n (UG1085 PL-to-PS group 0,
+    GIC ids 121–128) — in the Linux overlay's UIO nodes and the architecture document
+  optional: true                             # the hw/ submodule
+  producer: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sources_1/bd/design_cormorant/design_cormorant.bd,
+             json: design.nets,
+             transform: "{n[:-len('_0_interrupt')]: 89 + [int(p.split('/In')[1]) for p in x['ports'] if p.startswith('ilconcat_0/In')][0]
+                          for n, x in v.items() if n.endswith('_0_interrupt')}"}
+  consumers:
+    - {name: the Linux overlay, file: dts/kv260/cormorant.dts, as: dict,
+       regex: '^\s*fabric_(\w+): fabric_\w+@[0-9a-f]+ \{\s*interrupts = <0x00 (0x[0-9a-f]+) 0x04>;',
+       transform: "{ {'vecop': 'VectorOPKernel', 'matmul': 'MatmulKernel', 'conv': 'ConvKernel', 'pool': 'PoolingKernel',
+                      'rowops': 'RowOpsKernel'}[k]: int(x, 16) for k, x in v.items()}"}
+    - {name: ARCHITECTURE interrupt table, file: doc/ARCHITECTURE.md, as: dict,
+       regex: '^\| (\w+Kernel) \| \d \| (\d+) \| \d+ \|'}
+
 # ── assets, limits, the chunk ────────────────────────────────────────────────
 - id: bert.model_mb
   kind: value
