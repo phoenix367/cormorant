@@ -246,7 +246,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1813 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1818 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1726,7 +1726,7 @@ typedef enum { KERNEL_VECTOROP, /* … the active kernels in registry order */ K
 #define INFERENCE_RPU_IO_SIZES  { INFERENCE_<T>_SIZE, … }
 #define INFERENCE_RPU_RUN(b)    inference_run((b)[0], …)
 // Who drives the kernels when the Cortex-R5 firmware runs (src/rpu_policy.py, RPU_PLAN §9.3):
-// the R5's overhead (8.4 µs a call + 61 µs a batch) against the predicted time, <= 5 % -> R5
+// the R5's overhead (1.0 µs a call + 10.6 µs a batch) against the predicted time, <= 5 % -> R5
 #define INFERENCE_RPU_CALLS         n    // kernel calls per inference (_<ENTRY> per entry)
 #define INFERENCE_RPU_BATCHES       n    // R5 batches: one per host op after kernel work + the last
 #define INFERENCE_RPU_PREDICTED_US  n    // the performance model's (else the analytic) prediction

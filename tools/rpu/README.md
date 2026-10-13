@@ -26,9 +26,11 @@ cd inference-scheduler
     --project ../demo/image_classification/build/projects/resnet18
 ```
 
-`rpu_board.py` builds the firmware, uploads it with the overlay
-(`board/kv260/rpu/rpu.dts`: RPU core 0, its TCMs, `zynqmp_r5_remoteproc`)
-and the projects, starts the remote processor, and per project builds the
+`rpu_board.py` builds the firmware, uploads it with the overlays
+(`board/kv260/rpu/rpu.dts`: RPU core 0, its TCMs, `zynqmp_r5_remoteproc`;
+`rpu-ipi.dts`: the A53's doorbell, IPI channel 7 as the `rpu_ipi` UIO device,
+so the A53 sleeps while the R5 runs a batch) and the projects, starts the
+remote processor, and per project builds the
 Linux library and the harness `rpu/rpu_host.c` on the board and runs N
 inferences: each first by the library driving the kernels itself (the
 reference), then with `inference_rpu_attach()` — the library records every
@@ -39,3 +41,9 @@ calls, waits and interrupts per lane.  `--mode auto` lets each project's
 policy choose instead (`INFERENCE_RPU_RECOMMENDED`, `src/rpu_policy.py`:
 small models stay on the A53), `--mode both` (the default) runs one pass of
 each.
+
+`--start-only` brings the firmware up and leaves it running (every library
+on the board then attaches by itself, `INFERENCE_RPU=0` / `1` overrides its
+policy), `--stop` stops it.  For the chat server, `demo/chat/deploy.py --rpu
+BSP_DIR` (or `rpu.enabled` + `rpu.bsp_dir` in `chat_config.json`) builds and
+starts the firmware before the server and stops it with the server.

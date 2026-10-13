@@ -1,22 +1,41 @@
 /*
  * rpu_irq.c — the kernel lanes of the Cortex-R5 firmware and their
- * interrupt-driven waits (RPU_PLAN §4.2).  Every kernel's ap_done interrupt
- * (its control block's GIE / IER, the PL line from xparameters.h) is routed
- * through the RPU's GIC; a wait sleeps in WFI until the lane's interrupt was
- * taken.  The command stream issues at most one wait per Start on a lane
- * (the generated code's event stream drains a lane before reusing it), so
- * the per-lane counter consumed here stays in step with the Starts.
+ * interrupt-driven waits (RPU_PLAN §4.2, §9.4).
+ *
+ * The record of a completion is the kernel's own ISR bit 0: every control
+ * block (kernels/<k>_rtl/rtl/<k>_ctrl_s_axi.sv) latches ap_done there (IER bit 0
+ * set) until a write toggles it.  rpu_irq_start() clears it — and sees the
+ * clear land — while the lane is idle, before the ap_start on the same write
+ * channel, so after a Start the bit means "this job is done".  A wait reads
+ * the bit; between reads it sleeps in WFI with the lane's GIC line unmasked
+ * and the CPU's IRQs held off (no wake-up can be lost between the read and
+ * the WFI: a pending interrupt wakes WFI even while CPSR.I is set).  The
+ * interrupt handler only masks the line at the GIC and returns — it counts
+ * nothing and never writes a kernel register.
+ *
+ * (The first two designs counted completions in the handler: a toggle-clear
+ * of the ISR with a posted write could be overtaken by its own read-back and
+ * count one completion twice, and a stale count from the previous job's still
+ * high line masked the real one — waits returned early or never; and the
+ * driver's enable / disable rewrote the routing register three lanes share.
+ * The 135M / 360M prefill and SmolVLM hangs of 2026-10-13.)
+ *
+ * A kernel raises its line only while the R5 drives it (GIE): the lines are
+ * shared with the APU, which may drive the same kernels between batches.
  */
 #include "rpu_ctrl.h"
 #include "rpu_irq.h"
 #include "xil_exception.h"
 #include "xil_io.h"
+#include "xil_mpu.h"
 #include "xparameters.h"
 #include "xscugic.h"
 
 #define CTRL_GIE      0x04u
 #define CTRL_IER      0x08u
 #define CTRL_ISR      0x0Cu
+#define GICD_ISENABLER 0x100u
+#define GICD_ICENABLER 0x180u
 
 typedef struct { uint32_t id; UINTPTR base; uint32_t spi; } rpu_kernel_t;
 
@@ -42,25 +61,28 @@ static const rpu_kernel_t s_kernels[] = {
 #define N_KERNELS (sizeof s_kernels / sizeof s_kernels[0])
 
 static XScuGic s_gic;
-static volatile uint32_t s_done[RPU_LANES];
+static UINTPTR s_dist;                      /* the GIC distributor */
 static volatile struct rpu_ctrl *s_ctrl;
 static UINTPTR s_base[RPU_LANES];
+static u32 s_irq_id[RPU_LANES];             /* the lane's GIC interrupt id */
+static uint32_t s_armed;                    /* lanes with GIE on */
+static uint32_t s_inflight;                 /* lanes started and not yet waited for */
 
 UINTPTR rpu_lane_base(uint32_t lane) { return s_base[lane]; }
 
+/* The GIC enable bits are write-1 set / clear registers: no read-modify-write
+ * (the driver's XScuGic_Enable / _Disable also rewrite the target register,
+ * one word for four interrupt ids). */
+static inline void gic_unmask(u32 id) { Xil_Out32(s_dist + GICD_ISENABLER + 4u * (id >> 5), 1u << (id & 31u)); }
+static inline void gic_mask(u32 id)   { Xil_Out32(s_dist + GICD_ICENABLER + 4u * (id >> 5), 1u << (id & 31u)); }
+
+/* A kernel's line: mask it (its ISR stays set until the lane's next Start, so
+ * the level would re-fire) and let the waiting code read the ISR. */
 static void kernel_isr(void *ref)
 {
     const rpu_kernel_t *k = (const rpu_kernel_t *)ref;
-    const u32 isr = Xil_In32(k->base + CTRL_ISR);   /* ap_done (and ap_ready): toggle-on-write clear */
-    if (isr) {
-        Xil_Out32(k->base + CTRL_ISR, isr);
-        (void)Xil_In32(k->base + CTRL_ISR);         /* the posted write lands before the EOI: the level drops */
-    }
-    /* (ap_ctrl is not read here: its ap_done bit is clear-on-read, and a poller
-     * elsewhere — the Linux library sharing the kernels — would miss it.)
-     * Only an ap_done counts: a second interrupt can follow the clear while the
-     * level is still seen high, and it must not wake a wait early. */
-    if (isr & 1u) s_done[k->id]++;
+    gic_mask(k->spi + 32u);
+    __asm__ volatile("dsb" ::: "memory");          /* masked before the EOI */
     if (s_ctrl) s_ctrl->irq_count[k->id]++;
 }
 
@@ -96,12 +118,34 @@ int rpu_irq_init(volatile struct rpu_ctrl *ctrl)
     s_ctrl = ctrl;
     ctrl->lanes = 0u;
     for (i = 0u; i < N_KERNELS; i++) ctrl->lanes |= 1u << s_kernels[i].id;
+    /* The BSP maps the whole PL window (0x8000_0000, 1 GiB) strongly ordered: every
+     * register write then waits for its completion across the LPD-FPD path.  Device
+     * memory keeps the writes to one control block in order but posts them; a read
+     * back still waits.  The kernels' blocks share one 1 MiB window (0xA000_0000 +
+     * 64 KiB each). */
+    {
+        UINTPTR lo = ~(UINTPTR)0, hi = 0u;
+        for (i = 0u; i < N_KERNELS; i++) {
+            if (s_kernels[i].base < lo) lo = s_kernels[i].base;
+            if (s_kernels[i].base + 0x1000u > hi) hi = s_kernels[i].base + 0x1000u;
+        }
+        ctrl->regs_window = 0u;
+        if (N_KERNELS && (lo & ~(UINTPTR)0xFFFFFu) == ((hi - 1u) & ~(UINTPTR)0xFFFFFu)) {
+            const UINTPTR win = lo & ~(UINTPTR)0xFFFFFu;
+            if (Xil_SetMPURegion(win, 0x100000u, DEVICE_SHARED | PRIV_RW_USER_RW) == XST_SUCCESS)
+                ctrl->regs_window = (uint32_t)win;
+        }
+    }
     Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_UNDEFINED_INT, fault_handler, (void *)1u);
     Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_PREFETCH_ABORT_INT, fault_handler, (void *)2u);
     Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_DATA_ABORT_INT, fault_handler, (void *)3u);
-    for (i = 0u; i < N_KERNELS; i++) s_base[s_kernels[i].id] = s_kernels[i].base;
+    for (i = 0u; i < N_KERNELS; i++) {
+        s_base[s_kernels[i].id] = s_kernels[i].base;
+        s_irq_id[s_kernels[i].id] = s_kernels[i].spi + 32u;   /* a PL line's SPI -> the GIC id */
+    }
     cfg = XScuGic_LookupConfig(XPAR_XSCUGIC_0_BASEADDR);   /* the SDT driver: by base address */
     if (!cfg) return -10;
+    s_dist = cfg->DistBaseAddress;
     /* The driver only configures the distributor (groups, priorities, targets) when
      * it finds it disabled; a previous firmware leaves it enabled.  The RPU GIC is
      * this core's alone (core 1 is unused), so disable it first. */
@@ -127,8 +171,7 @@ int rpu_irq_init(volatile struct rpu_ctrl *ctrl)
     for (i = 0u; i < N_KERNELS; i++) {
         const u32 id = s_kernels[i].spi + 32u;      /* a PL line's SPI number -> the GIC interrupt id */
         XScuGic_SetPriorityTriggerType(&s_gic, id, 0xA0u, 0x1u);   /* active-high level */
-        /* The driver leaves the distributor alone when it is already enabled (a
-         * previous firmware, the other core), so the SPI's target CPU is set here. */
+        /* the target CPU, once (the driver skips it when the distributor was enabled) */
         XScuGic_InterruptMaptoCpu(&s_gic, 0u, id);
         rc = XScuGic_Connect(&s_gic, id, kernel_isr, (void *)&s_kernels[i]);
         if (rc != XST_SUCCESS) return -12;
@@ -136,9 +179,9 @@ int rpu_irq_init(volatile struct rpu_ctrl *ctrl)
             const u32 isr = Xil_In32(s_kernels[i].base + CTRL_ISR);
             if (isr) Xil_Out32(s_kernels[i].base + CTRL_ISR, isr);
         }
-        Xil_Out32(s_kernels[i].base + CTRL_IER, 1u);   /* ap_done; GIE: inference_irq_arm() around a run */
-        Xil_Out32(s_kernels[i].base + CTRL_GIE, 0u);
-        XScuGic_Enable(&s_gic, id);
+        Xil_Out32(s_kernels[i].base + CTRL_IER, 1u);   /* ap_done latches into ISR bit 0 */
+        Xil_Out32(s_kernels[i].base + CTRL_GIE, 0u);   /* the line: rpu_irq_start() .. batch end */
+        gic_mask(id);                                   /* unmasked by a wait */
     }
     Xil_ExceptionEnable();
     /* Self-test of the interrupt path: a software interrupt to this CPU. */
@@ -150,44 +193,63 @@ int rpu_irq_init(volatile struct rpu_ctrl *ctrl)
     return 0;
 }
 
-#define WAIT_TIMEOUT_SPINS  (20u * 1000u * 1000u)   /* ~1 s of the loop below */
-
-/* The kernels raise their interrupt lines only while the firmware runs an
- * batch: the lines are shared with the APU (the Linux library may drive the
- * same kernels between batches, and its completions must not be consumed here). */
-void rpu_irq_arm(int on)
+void rpu_irq_start(uint32_t lane)
 {
-    unsigned i;
-    for (i = 0u; i < N_KERNELS; i++) {
-        if (on) {
-            const u32 isr = Xil_In32(s_kernels[i].base + CTRL_ISR);
-            if (isr) Xil_Out32(s_kernels[i].base + CTRL_ISR, isr);     /* a stale ap_done of another master */
-            s_done[s_kernels[i].id] = 0u;
-        }
-        Xil_Out32(s_kernels[i].base + CTRL_GIE, on ? 1u : 0u);
-        (void)Xil_In32(s_kernels[i].base + CTRL_GIE);
+    const uint32_t bit = 1u << lane;
+    const UINTPTR b = s_base[lane];
+    /* The lane is idle: clear its previous ap_done (this core's, or another
+     * master's), and see the clear land — after it, ISR bit 0 can only be this
+     * job's.  (The ap_start that follows is on the same write channel, so it lands
+     * after the clear anyway; the read-back makes the wait's first read safe too.) */
+    const u32 isr = Xil_In32(b + CTRL_ISR);
+    if (isr) {
+        unsigned n = 0u;
+        Xil_Out32(b + CTRL_ISR, isr);
+        __asm__ volatile("dsb" ::: "memory");
+        while ((Xil_In32(b + CTRL_ISR) & 1u) && ++n < 1000u) { }
     }
+    if (!(s_armed & bit)) {
+        Xil_Out32(b + CTRL_GIE, 1u);
+        s_armed |= bit;
+    }
+    s_inflight |= bit;
+}
+
+/* A lane started and not waited for keeps GIE across the batch's end (a host op
+ * between two batches does not need every lane's result); the others drop it,
+ * so the APU may drive them. */
+void rpu_irq_batch_end(void)
+{
+    uint32_t idle = s_armed & ~s_inflight, lane;
+    for (lane = 0u; idle; lane++, idle >>= 1)
+        if (idle & 1u) {
+            Xil_Out32(s_base[lane] + CTRL_GIE, 0u);
+            __asm__ volatile("dsb" ::: "memory");
+            (void)Xil_In32(s_base[lane] + CTRL_GIE);   /* landed before the A53 may drive it */
+        }
+    s_armed &= s_inflight;
 }
 
 void rpu_irq_wait(uint32_t k)
 {
-    uint32_t spins = 0u;
-    while (s_done[k] == 0u) {
-        if (s_sgi_count)                            /* the interrupt path is proven: sleep until one arrives */
-            __asm__ volatile("wfi" ::: "memory");
-        s_ctrl->heartbeat++;
-        /* Fallback (diagnostics): the kernel's ap_done in its ISR register without
-         * the interrupt having been taken — count it, clear it, go on. */
-        if (++spins > WAIT_TIMEOUT_SPINS) {
-            spins = 0u;
-            const u32 isr = Xil_In32(s_base[k] + CTRL_ISR);
-            s_ctrl->wait_isr = isr; s_ctrl->wait_checks++;
-            if (isr & 1u) {
-                Xil_Out32(s_base[k] + CTRL_ISR, isr);
-                s_ctrl->irq_missed[k]++;
-                return;
-            }
+    const UINTPTR isr = s_base[k] + CTRL_ISR;
+    const u32 id = s_irq_id[k];
+    s_ctrl->wait_lane = k;
+    if (!s_sgi_count) {                             /* no interrupt path: read the ISR */
+        while (!(Xil_In32(isr) & 1u)) s_ctrl->wait_checks++;
+        s_ctrl->irq_missed[k]++;                    /* (counts the waits served by reading) */
+    } else {
+        for (;;) {
+            if (Xil_In32(isr) & 1u) break;
+            __asm__ volatile("cpsid i" ::: "memory");   /* no IRQ between the check and the WFI */
+            gic_unmask(id);
+            __asm__ volatile("dsb" ::: "memory");
+            if (Xil_In32(isr) & 1u) { __asm__ volatile("cpsie i" ::: "memory"); break; }
+            __asm__ volatile("wfi" ::: "memory");       /* a pending IRQ wakes it, I set or not */
+            __asm__ volatile("cpsie i" ::: "memory");   /* the handler runs here: masks the line */
+            s_ctrl->heartbeat++;
         }
     }
-    s_done[k]--;
+    s_ctrl->wait_isr = Xil_In32(isr);
+    s_inflight &= ~(1u << k);
 }

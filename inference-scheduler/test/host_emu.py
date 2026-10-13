@@ -104,6 +104,7 @@ inference_buf_t *inference_buf_alloc(unsigned n)
 #endif
     return b;
 }
+inference_buf_t *inference_buf_alloc_uncached(unsigned n) { return inference_buf_alloc(n); }
 void inference_buf_retain(inference_buf_t *b)  { if (b && b->is_owner) b->refcount++; }
 void inference_buf_release(inference_buf_t *b)
 {

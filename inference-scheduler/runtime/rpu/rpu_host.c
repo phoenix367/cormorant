@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #include "inference.h"
@@ -32,6 +33,16 @@ static double now_s(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+/* The process's CPU time (user + system): with the R5 driving and the doorbell
+ * there, the A53 sleeps through the batches. */
+static double cpu_s(void)
+{
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    return (double)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec)
+         + 1e-6 * (double)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
 }
 
 /* The ramp of test/test_inference.c: p[i] = (Data_t)(i & 0xFFFF), offset by the run. */
@@ -49,7 +60,7 @@ int main(int argc, char **argv)
     const unsigned n_in = INFERENCE_RPU_N_IN, n_io = INFERENCE_RPU_N_IN + INFERENCE_RPU_N_OUT;
     inference_buf_t *io[INFERENCE_RPU_N_IN + INFERENCE_RPU_N_OUT];
     Data_t *ref[INFERENCE_RPU_N_OUT];
-    double t_run = 0.0, t_a53 = 0.0, t0;
+    double t_run = 0.0, t_a53 = 0.0, t0, c0, cpu_run = 0.0, cpu_a53 = 0.0;
     inference_rpu_stats_t st;
 #if !INFERENCE_RPU_IO_DMA
     fprintf(stderr, "this model has host-memory I/O: rpu_host runs DMA I/O models only\n");
@@ -98,18 +109,18 @@ int main(int argc, char **argv)
         for (i = 0u; i < n_in; i++) fill_ramp(inference_buf_ptr(io[i]), sizes[i], r);
         if (check) {                                    /* the reference: the A53 drives the kernels */
             inference_rpu_set_mode(INFERENCE_RPU_MODE_A53);
-            t0 = now_s();
+            t0 = now_s(); c0 = cpu_s();
             INFERENCE_RPU_RUN(io);
-            t_a53 += now_s() - t0;
+            t_a53 += now_s() - t0; cpu_a53 += cpu_s() - c0;
             for (i = n_in; i < n_io; i++)
                 memcpy(ref[i - n_in], inference_buf_ptr(io[i]), (size_t)sizes[i] * INFERENCE_BYTES_PER_ELEM);
             for (i = n_in; i < n_io; i++)
                 memset(inference_buf_ptr(io[i]), 0x5A, (size_t)sizes[i] * INFERENCE_BYTES_PER_ELEM);
         }
         inference_rpu_set_mode(auto_mode ? INFERENCE_RPU_MODE_AUTO : INFERENCE_RPU_MODE_R5);
-        t0 = now_s();
+        t0 = now_s(); c0 = cpu_s();
         INFERENCE_RPU_RUN(io);                          /* the R5, or the policy's choice */
-        t_run += now_s() - t0;
+        t_run += now_s() - t0; cpu_run += cpu_s() - c0;
         if (inference_rpu_active()) on_r5++;
         if (inference_rpu_error()) { fprintf(stderr, "run %u: R5 error %d\n", r, inference_rpu_error()); return 1; }
         if (check) {
@@ -130,8 +141,10 @@ int main(int argc, char **argv)
         if (bad) bad_runs++;
     }
     inference_rpu_stats(&st);
-    printf("summary: %u runs (%u driven by the R5), measured mean %.3f ms", runs, on_r5, t_run / runs * 1e3);
-    if (check) printf(", A53 mean %.3f ms", t_a53 / runs * 1e3);
+    printf("summary: %u runs (%u driven by the R5), measured mean %.3f ms (A53 CPU %.3f ms)", runs, on_r5,
+           t_run / runs * 1e3, cpu_run / runs * 1e3);
+    if (check) printf(", A53 mean %.3f ms (A53 CPU %.3f ms)", t_a53 / runs * 1e3, cpu_a53 / runs * 1e3);
+    printf("; doorbell %s, %u sleeps", st.doorbell ? "on" : "off (spinning)", st.sleeps);
     printf("; batches %u, calls %u, waits %u; interrupts per lane:", st.batches, st.calls, st.waits);
     for (i = 0u; i < 5u; i++) printf(" %u", st.irq_count[i]);
     printf("; missed:");

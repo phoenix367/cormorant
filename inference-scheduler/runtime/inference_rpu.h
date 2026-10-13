@@ -19,8 +19,12 @@
  * puts every run on the R5.  Without the firmware nothing changes.
  *
  * Linux on the KV260 only (src/inference_rpu.c): the control block is the
- * RPU's BTCM through /dev/mem (rpu_ctrl.h), the ring a DMA buffer of this
- * library.  Elsewhere (the host emulation) the firmware is never found.
+ * RPU's BTCM through /dev/mem (rpu_ctrl.h), the ring an uncached DMA buffer
+ * of this library.  While the R5 runs a batch the A53 spins for
+ * INFERENCE_RPU_SPIN_US (default 50), then sleeps until the R5 rings the
+ * doorbell (IPI channel 7, the rpu_ipi UIO device of
+ * board/kv260/rpu/rpu-ipi.dts; without it the A53 spins).  Elsewhere (the
+ * host emulation) the firmware is never found.
  */
 #ifndef INFERENCE_RPU_H
 #define INFERENCE_RPU_H
@@ -88,6 +92,8 @@ typedef struct {
     uint32_t lanes;                   /* the firmware's lane mask */
     uint32_t flushes;                 /* this library's batches submitted */
     uint32_t words;                   /* command words submitted */
+    uint32_t sleeps;                  /* waits that slept on the doorbell */
+    uint32_t doorbell;                /* 1: the rpu_ipi doorbell is there (else the A53 spins) */
 } inference_rpu_stats_t;
 int  inference_rpu_stats(inference_rpu_stats_t *out);   /* -1 when not attached */
 

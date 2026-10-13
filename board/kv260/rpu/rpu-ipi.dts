@@ -1,0 +1,35 @@
+/*
+ * rpu-ipi.dts — the A53's end of the Cortex-R5's doorbell (RPU_PLAN §9.4).
+ *
+ * IPI channel 7 (the PL0 agent: registers at 0xFF34_0000, interrupt SPI 29 =
+ * GIC 61, UG1085 ch. 13) as a UIO device named rpu_ipi.  Nothing on this board
+ * uses the channel: Linux's own IPI mailbox (zynqmp-ipi, the PMU firmware's)
+ * is channel 0, SPI 35.  The R5 firmware rings it at the end of a batch when
+ * the library asked to be woken (rpu_ctrl.h `wake`): it writes its own
+ * channel's TRIG (RPU0 = channel 1, 0xFF31_0000) with channel 7's bit (24),
+ * which sets bit 8 (the RPU0 source) in channel 7's ISR.  The library
+ * (src/inference_rpu.c) enables that bit in IER, clears it in ISR before each
+ * sleep and blocks in poll() on /dev/uioN; uio_pdrv_genirq masks the level
+ * interrupt when it fires and the library unmasks it with a write.
+ *
+ * A separate overlay from rpu.dts so a board that already has the R5 overlay
+ * gets the doorbell without removing it:
+ *
+ *   dtc -I dts -O dtb -@ -o rpu-ipi.dtbo rpu-ipi.dts
+ *   mkdir /sys/kernel/config/device-tree/overlays/rpu-ipi
+ *   cat rpu-ipi.dtbo > /sys/kernel/config/device-tree/overlays/rpu-ipi/dtbo
+ *
+ * (the board's command line has uio_pdrv_genirq.of_id=generic-uio, as for the
+ * fabric_* devices).  Without it the library spins on the control block.
+ */
+/dts-v1/;
+/plugin/;
+
+&amba {
+	rpu_ipi: rpu_ipi@ff340000 {
+		compatible = "generic-uio";
+		reg = <0x0 0xff340000 0x0 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <0x0 0x1d 0x4>;
+	};
+};

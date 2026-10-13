@@ -4,6 +4,8 @@ Cortex-R5 (doc/plans/RPU_PLAN.md track B1) and check it against the same
 library driving them from the A53.
 
   python rpu_board.py --config remote_config.json --bsp-dir <bsp> --project <dir> [--project ...]
+  python rpu_board.py --config remote_config.json --bsp-dir <bsp> --start-only   (firmware up, left running)
+  python rpu_board.py --config remote_config.json --stop                         (firmware stopped)
 
 Steps (the per-board lock is held throughout, src/remote/lock.py):
   firmware -> cmake + make of runtime/rpu (the model-independent firmware: it
@@ -12,8 +14,10 @@ Steps (the per-board lock is held throughout, src/remote/lock.py):
               bitstream's XSA
   upload   -> the firmware (/lib/firmware/<name>.elf), the overlay
               (board/kv260/rpu/rpu.dts compiled with dtc) and the projects
-  rpu      -> the overlay applied once (configfs), zynqmp_r5_remoteproc loaded,
-              remoteproc0 started on the firmware (restarted if it was running)
+  rpu      -> the overlays applied once (configfs: rpu.dts, and rpu-ipi.dts — the
+              A53's doorbell, the rpu_ipi UIO device), zynqmp_r5_remoteproc
+              loaded, remoteproc0 started on the firmware (restarted if it was
+              running)
   per project:
     build  -> its Linux library and rpu/rpu_host.c on the board, with the
               config's UIO names
@@ -24,7 +28,8 @@ Steps (the per-board lock is held throughout, src/remote/lock.py):
               auto: small models stay on the A53, src/rpu_policy.py); compared
               bit for bit, both timed, the R5's counters; --mode both (default)
               runs one pass of each
-  stop     -> remoteproc0 stopped (the overlay stays); the board's memory compacted
+  stop     -> remoteproc0 stopped (the overlay stays); the board's CMA cleaned
+              (src/remote/cma.py: page cache dropped, memory compacted)
 
 Exit 0: every project bit-exact; 1: a mismatch or a firmware error; 2: a
 setup error.  The chat server must be stopped first (demo/chat/deploy.py
@@ -39,11 +44,13 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.remote import RemoteSession, hold_board_lock, load_config, uio_devices_from_cfg   # noqa: E402
+from src.remote.cma import clean_cma, describe                                     # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 FIRMWARE_SRC = HERE / "runtime" / "rpu"
 DTS = REPO / "board" / "kv260" / "rpu" / "rpu.dts"
+DTS_IPI = REPO / "board" / "kv260" / "rpu" / "rpu-ipi.dts"       # the A53's doorbell (rpu_ipi UIO)
 VITIS = Path(os.environ.get("XILINX_VITIS", "/mnt/data/xilinx/2025.2/Vitis"))
 
 
@@ -59,22 +66,66 @@ def build_firmware(bsp_dir: Path, build_dir: Path, log) -> Path:
     return elf
 
 
-def compile_overlay(out: Path) -> Path:
+def compile_overlay(out: Path, dts: Path = DTS) -> Path:
     dtc = VITIS / "bin" / "dtc"
     if not dtc.is_file():
         dtc = Path("dtc")
-    dtbo = out / "rpu.dtbo"
-    subprocess.run([str(dtc), "-I", "dts", "-O", "dtb", "-@", "-o", str(dtbo), str(DTS)],
+    dtbo = out / (dts.stem + ".dtbo")
+    subprocess.run([str(dtc), "-I", "dts", "-O", "dtb", "-@", "-o", str(dtbo), str(dts)],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return dtbo
+
+
+FIRMWARE_STOP = ("R=$(ls -d /sys/class/remoteproc/remoteproc* 2>/dev/null | head -1); "
+                 "[ -n \"$R\" ] && echo stop > $R/state 2>/dev/null; [ -n \"$R\" ] && cat $R/state; true")
+
+
+def build_artifacts(bsp_dir: Path, out: Path, log) -> tuple:
+    """(firmware ELF, rpu.dtbo, rpu-ipi.dtbo) built under ``out`` (the firmware
+    build's output goes to ``log``)."""
+    return (build_firmware(Path(bsp_dir).resolve(), out / "build-rpu", log),
+            compile_overlay(out), compile_overlay(out, DTS_IPI))
+
+
+def firmware_up_script(work: str, firmware_name: str = "rpu_firmware.elf") -> str:
+    """The board-side shell: the firmware into /lib/firmware, the overlays applied
+    once (configfs: rpu.dtbo, rpu-ipi.dtbo from ``work``), zynqmp_r5_remoteproc
+    loaded, remoteproc0 (re)started on the firmware; prints its state."""
+    return f"""
+set -e
+cp {work}/{firmware_name} /lib/firmware/{firmware_name}
+modprobe zynqmp_r5_remoteproc 2>/dev/null || true
+if [ ! -d /sys/kernel/config/device-tree/overlays/rpu ]; then
+    mkdir /sys/kernel/config/device-tree/overlays/rpu
+    cat {work}/rpu.dtbo > /sys/kernel/config/device-tree/overlays/rpu/dtbo
+fi
+cat /sys/kernel/config/device-tree/overlays/rpu/status
+if [ ! -d /sys/kernel/config/device-tree/overlays/rpu-ipi ]; then
+    mkdir /sys/kernel/config/device-tree/overlays/rpu-ipi
+    cat {work}/rpu-ipi.dtbo > /sys/kernel/config/device-tree/overlays/rpu-ipi/dtbo
+fi
+echo "doorbell: $(cat /sys/kernel/config/device-tree/overlays/rpu-ipi/status) \
+$(grep -l rpu_ipi /sys/class/uio/uio*/name 2>/dev/null | head -1)"
+R=$(ls -d /sys/class/remoteproc/remoteproc* | head -1); echo "remoteproc $R"
+echo stop > $R/state 2>/dev/null || true
+sleep 1
+echo {firmware_name} > $R/firmware
+echo start > $R/state
+sleep 1
+cat $R/state
+"""
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="remote_config.json")
-    ap.add_argument("--project", action="append", required=True,
+    ap.add_argument("--project", action="append", default=[],
                     help="a generated project (DMA inputs and outputs); repeatable")
-    ap.add_argument("--bsp-dir", required=True, help="the R5 standalone BSP (tools/rpu/make_r5_bsp.py)")
+    ap.add_argument("--start-only", action="store_true",
+                    help="build, load and start the firmware (and the overlays), gate nothing, leave "
+                         "it running: the libraries on the board then attach by themselves")
+    ap.add_argument("--stop", action="store_true", help="stop the firmware (remoteproc) and exit")
+    ap.add_argument("--bsp-dir", help="the R5 standalone BSP (tools/rpu/make_r5_bsp.py)")
     ap.add_argument("--runs", type=int, default=20)
     ap.add_argument("--ring-kb", type=int, default=0, help="the command ring (default 1 MiB)")
     ap.add_argument("--firmware-name", default="rpu_firmware.elf")
@@ -89,6 +140,22 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    if args.stop:
+        hold_board_lock(cfg, args.board_lock)
+        session = RemoteSession(cfg["ssh"])
+        session.connect()
+        try:
+            out, _err, _rc = session.exec(FIRMWARE_STOP, timeout=30)
+            print(f"rpu: {out.strip() or 'no remoteproc'}")
+        finally:
+            session.close()
+        return 0
+    if not args.project and not args.start_only:
+        ap.error("--project is required (or --start-only / --stop)")
+    if not args.bsp_dir:
+        ap.error("--bsp-dir is required to build the firmware")
+    if args.start_only:
+        args.keep_running = True
     projects = [Path(p).resolve() for p in args.project]
     for project in projects:
         if not (project / "rpu" / "rpu_host.c").is_file() or not (project / "src" / "inference_rpu.c").is_file():
@@ -101,12 +168,11 @@ def main(argv=None) -> int:
         print("firmware: building for the R5 ...", flush=True)
         with open(tdp / "firmware_build.log", "w") as log:
             try:
-                elf = build_firmware(Path(args.bsp_dir).resolve(), tdp / "build-rpu", log)
+                elf, dtbo, dtbo_ipi = build_artifacts(Path(args.bsp_dir), tdp, log)
             except (subprocess.CalledProcessError, RuntimeError) as e:
                 print(f"firmware: build failed: {e}\n{(tdp / 'firmware_build.log').read_text()[-3000:]}",
                       file=sys.stderr)
                 return 2
-        dtbo = compile_overlay(tdp)
         print(f"firmware: {elf.stat().st_size} bytes; overlay {dtbo.name}", flush=True)
 
         session = RemoteSession(cfg["ssh"])
@@ -127,25 +193,10 @@ def main(argv=None) -> int:
                 subprocess.run(["rm", "-rf", str(stage / name / "build")])
             subprocess.run(["cp", str(elf), str(stage / args.firmware_name)], check=True)
             subprocess.run(["cp", str(dtbo), str(stage / "rpu.dtbo")], check=True)
+            subprocess.run(["cp", str(dtbo_ipi), str(stage / "rpu-ipi.dtbo")], check=True)
             session.upload_dir(stage, work)
 
-            script = f"""
-set -e
-cp {work}/{args.firmware_name} /lib/firmware/{args.firmware_name}
-modprobe zynqmp_r5_remoteproc 2>/dev/null || true
-if [ ! -d /sys/kernel/config/device-tree/overlays/rpu ]; then
-    mkdir /sys/kernel/config/device-tree/overlays/rpu
-    cat {work}/rpu.dtbo > /sys/kernel/config/device-tree/overlays/rpu/dtbo
-fi
-cat /sys/kernel/config/device-tree/overlays/rpu/status
-R=$(ls -d /sys/class/remoteproc/remoteproc* | head -1); echo "remoteproc $R"
-echo stop > $R/state 2>/dev/null || true
-sleep 1
-echo {args.firmware_name} > $R/firmware
-echo start > $R/state
-sleep 1
-cat $R/state
-"""
+            script = firmware_up_script(work, args.firmware_name)
             out, err, rc = session.exec(script, timeout=60)
             if args.verbose or rc != 0:
                 print(out + err)
@@ -153,6 +204,11 @@ cat $R/state
                 print("rpu: the firmware did not start (dmesg on the board tells why)", file=sys.stderr)
                 return 2
             print("rpu: firmware running", flush=True)
+            # the uploads' page cache sits in the CMA area: clean it before any library
+            # allocates its pool (a 311 MB pool failed with 880 MB free once, 2026-10-13)
+            print(f"cma: {describe(clean_cma(session)['after'])}", flush=True)
+            if args.start_only:
+                return 0
 
             flags = " ".join(f'-DINFERENCE_{k.upper()}_INSTANCE=\\"{v}\\"' for k, v in uio_devices_from_cfg(cfg).items())
             flags += " " + " ".join(cfg["remote"].get("cmake_args", []))
@@ -185,10 +241,10 @@ cat $R/state
                     worst_rc = max(worst_rc, rc)
                 results[name] = worst_rc
             if not args.keep_running:
-                session.exec("R=$(ls -d /sys/class/remoteproc/remoteproc* | head -1); echo stop > $R/state", timeout=30)
-            # the projects' pools fragment the CMA: compact it for whatever comes next
+                session.exec(FIRMWARE_STOP, timeout=30)
+            # the projects' pools fragment the CMA: clean it for whatever comes next
             # (the chat server's 775 MiB pool failed to allocate after six gates once)
-            session.exec("sync; echo 3 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory", timeout=60)
+            clean_cma(session)
             print()
             for name, rc in results.items():
                 print(f"BOARD GATE {name}: " + ("bit-exact with the A53" if rc == 0 else

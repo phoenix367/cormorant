@@ -8,12 +8,15 @@
 struct rpu_ctrl;
 
 /* The GIC, the fault handlers and every kernel lane the BSP names: their
- * interrupt enables (GIE off until rpu_irq_arm), the control block's lane
+ * interrupt enables (GIE off until rpu_irq_start), the control block's lane
  * mask and diagnostics.  0 on success. */
 int rpu_irq_init(volatile struct rpu_ctrl *ctrl);
-/* The kernels raise their lines only while a batch runs (they are shared
- * with the APU, which must not lose its own completions to this core). */
-void rpu_irq_arm(int on);
+/* A lane's interrupt is armed before its first Start of a batch (call it
+ * before writing ap_start) and disarmed at the batch's end unless a Start is
+ * still in flight: the lines are shared with the APU, which must not lose its
+ * own completions to this core. */
+void rpu_irq_start(uint32_t lane);
+void rpu_irq_batch_end(void);
 /* Block until the lane's most recent Start completed (WFI between interrupts). */
 void rpu_irq_wait(uint32_t lane);
 UINTPTR rpu_lane_base(uint32_t lane);

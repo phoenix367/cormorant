@@ -505,9 +505,8 @@ class MultiEntryGenerator:
     def write_project(self, out_dir: str, runtime_dir: Optional[str] = None,
                       weights: bool = True) -> dict:
         """Write CMakeLists.txt, include/, src/, test/, scripts/ and (unless
-        weights=False) weights/*.dat.  Returns a summary."""
-        import shutil
-
+        weights=False) weights/*.dat, and the runtime files (runtime_files.py).
+        Returns a summary."""
         def w(rel, text):
             p = os.path.join(out_dir, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -519,17 +518,8 @@ class MultiEntryGenerator:
         w("src/inference_buf.c", self.generate_buf_impl())
         w("scripts/check_inference_setup.sh", self.generate_setup_script())
         w("test/test_inference.c", self.generate_test())
-        rt = runtime_dir or os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__)))), "runtime")
-        for src_name, rel in (("inference_prof.h", "include/inference_prof.h"),
-                              ("inference_prof.c", "src/inference_prof.c"),
-                              ("inference_ddr.h", "include/inference_ddr.h"),
-                              ("inference_ddr.c", "src/inference_ddr.c"),
-                              ("inference_ddr_backend.h", "src/inference_ddr_backend.h"),
-                              ("ddr/zuplus_apm.c", "src/ddr/zuplus_apm.c")):
-            dst = os.path.join(out_dir, rel)
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy2(os.path.join(rt, src_name), dst)
+        from .runtime_files import copy_runtime
+        copy_runtime(out_dir, runtime_dir)
         nbytes = 0
         if weights:
             wd = os.path.join(out_dir, "weights")

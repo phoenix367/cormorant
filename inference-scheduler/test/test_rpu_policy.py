@@ -17,30 +17,34 @@ def _cg(name):
 
 
 class TestDecision(unittest.TestCase):
-    """The rule on the measured board numbers (2026-10-13): the overhead model
-    and the 5 % limit put the MNIST models and MobileNet v2 on the A53 and
-    ResNet-18, MobileNet v1 and YOLOv5n on the R5."""
+    """The rule on the measured board numbers (protocol v4, 2026-10-13, RPU_PLAN
+    §9.4): the overhead model and the 5 % limit keep the sub-millisecond models
+    (the MNIST convnet, chains of tiny calls) on the A53 and put LeNet and the
+    large models on the R5."""
 
-    CASES = [   # (calls, batches, predicted / measured A53 µs, R5?)
-        ("mnist_convnet", 8, 1, 111.0, False),
-        ("mnist_lenet", 10, 1, 1259.0, False),
-        ("resnet18", 41, 1, 20004.0, True),
-        ("mobilenet_v1", 57, 1, 20472.0, True),
-        ("mobilenet_v2", 100, 1, 17475.0, False),
-        ("yolov5n", 127, 14, 46998.0, True),
+    CASES = [   # (calls, batches, A53 µs, R5 - A53 µs measured, R5?)
+        ("chain1", 1, 1, 9.0, 3.0, False),
+        ("chain16", 16, 1, 33.0, 21.0, False),
+        ("chain128", 128, 1, 220.0, 146.0, False),
+        ("mnist_convnet", 8, 1, 112.0, 17.0, False),
+        ("mnist_lenet", 10, 1, 1283.0, 11.0, True),
+        ("resnet18", 41, 1, 19982.0, 36.0, True),
+        ("mobilenet_v1", 57, 1, 20461.0, 47.0, True),
+        ("mobilenet_v2", 100, 1, 17462.0, 111.0, True),
+        ("yolov5n", 127, 14, 46955.0, 276.0, True),
     ]
 
     def test_measured_models(self):
-        for name, calls, batches, us, r5 in self.CASES:
+        for name, calls, batches, us, _extra, r5 in self.CASES:
             over = calls * rpu_policy.CALL_US + batches * rpu_policy.BATCH_US
             self.assertEqual(over <= rpu_policy.MAX_OVERHEAD * us, r5, name)
+            # and the rule agrees with the measured overhead
+            self.assertEqual(_extra <= rpu_policy.MAX_OVERHEAD * us, r5, name)
 
     def test_overhead_fit(self):
-        measured = {"mnist_convnet": 138, "mnist_lenet": 159, "resnet18": 410,
-                    "mobilenet_v1": 530, "mobilenet_v2": 900, "yolov5n": 1910}
-        for name, calls, batches, _us, _r5 in self.CASES:
+        for name, calls, batches, _us, extra, _r5 in self.CASES:
             over = calls * rpu_policy.CALL_US + batches * rpu_policy.BATCH_US
-            self.assertLess(abs(over - measured[name]) / measured[name], 0.10, name)
+            self.assertLess(abs(over - extra), 25.0, name)
 
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -98,3 +102,23 @@ class TestMultiEntry(unittest.TestCase):
         for n in ("DECODE", "HEAD"):
             self.assertIn(f"#define INFERENCE_RPU_RECOMMENDED_{n}", h)
             self.assertIn(f"INFERENCE_RPU_ENTER(INFERENCE_RPU_RECOMMENDED_{n});", s)
+
+    def test_written_project_carries_every_cmake_source(self):
+        """Both project writers copy the runtime files (src/codegen/runtime_files.py):
+        every src/ file the generated CMakeLists.txt names is there — the chat
+        libraries' build broke on src/inference_rpu.c once (2026-10-13)."""
+        import os
+        import re
+        import tempfile
+        if not os.path.exists(_model("llama_tiny_decode.onnx")):
+            self.skipTest("run test/gen_llama_models.py")
+        from src.codegen.multi import MultiEntryGenerator
+        entries = [(n, OnnxGraph(_model(f"llama_tiny_{n}.onnx"))) for n in ("decode", "head")]
+        mg = MultiEntryGenerator(entries, "llama_tiny")
+        with tempfile.TemporaryDirectory() as td:
+            mg.write_project(td, weights=False)
+            cm = open(os.path.join(td, "CMakeLists.txt")).read()
+            for rel in sorted(set(re.findall(r"\b(src/[A-Za-z0-9_/]+\.c)\b", cm))):
+                self.assertTrue(os.path.isfile(os.path.join(td, rel)), rel)
+            for rel in ("include/inference_rpu.h", "include/rpu_ctrl.h", "rpu/rpu_host.c"):
+                self.assertTrue(os.path.isfile(os.path.join(td, rel)), rel)

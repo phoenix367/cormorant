@@ -660,9 +660,11 @@ facts:
   value: {bert: 216, smollm2_135m: 297, smollm2_360m: 758, smolvlm_256m: 512, piper: 53}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 80b1608
-    date: 2026-10-12
-    how: "the projects regenerated for HOSTOPS_PLAN phases 4a-4b (the attention preps' staging states and cos / sin
+    commit: 62bfb4d
+    date: 2026-10-13
+    how: "regenerated for RPU_PLAN B2 (2026-10-13): SmolLM2-135M 296.8, SmolLM2-360M 758.7, SmolVLM 512.3 MiB — the R5's
+          command ring is a buffer of its own, outside the pool; 2026-10-12 (80b1608),
+          the projects regenerated for HOSTOPS_PLAN phases 4a-4b (the attention preps' staging states and cos / sin
           table, the row preps): SmolLM2-135M 293.6, SmolLM2-360M 758.0, SmolVLM 511.4, Piper 52.8, BERT 216 MiB (phase
           2-3: 293.6 / 754.1 / 505.6 / 51.5 / 216; 286 / 740 / 495 / 51 / 216 before; 2026-10-08 after SOFTMAX_PLAN: BERT 215.3, 135M 285.8, 360M 740.2,
           SmolVLM 494.9, Piper 51.1 MiB)"

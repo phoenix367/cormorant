@@ -37,3 +37,23 @@ class TestRpuLanes(unittest.TestCase):
             name = {"PoolKernel": "POOL"}.get(kd.name, kd.name.replace("Kernel", "").upper())
             self.assertIn(f"#define RPU_LANE_{name}  ", header.replace("   ", "  "), kd.name)
         self.assertIn(f"#define RPU_LANES          {len(lanes)}u", header)
+
+    def test_control_block_layout(self):
+        """rpu_ctrl.h compiles on the host with its 512-byte layout assert: the
+        A53 library and the R5 firmware share the block in the BTCM."""
+        import shutil
+        import subprocess
+        import tempfile
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            self.skipTest("no C compiler")
+        hdr = os.path.join(os.path.dirname(__file__), "..", "runtime", "rpu")
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "t.c")
+            with open(src, "w") as f:
+                f.write('#include <stddef.h>\n#include "rpu_ctrl.h"\n'
+                        'int main(void) { return (int)offsetof(struct rpu_ctrl, gic) == 152 ? 0 : 1; }\n')
+            r = subprocess.run([cc, "-std=gnu99", "-Wall", "-Werror", "-I", hdr, src, "-o",
+                                os.path.join(td, "t")], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(subprocess.run([os.path.join(td, "t")]).returncode, 0)

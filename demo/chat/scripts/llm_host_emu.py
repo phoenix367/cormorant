@@ -33,6 +33,13 @@ sys.path.insert(0, os.path.join(lp.SCHED, "test"))
 import host_emu                                                     # noqa: E402
 
 
+
+def _rpu_recorder(project: str) -> list:
+    """The project's Cortex-R5 recorder (src/inference_rpu.c, RPU_PLAN §9): the
+    generated inference.c calls it; projects from before the R5 work lack both."""
+    p = os.path.join(project, "src", "inference_rpu.c")
+    return [p] if os.path.exists(p) else []
+
 def build(project: str, work: str, incoherent: bool = False) -> str:
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
@@ -51,6 +58,7 @@ def build(project: str, work: str, incoherent: bool = False) -> str:
            f'-DLLM_API_WEIGHTS_DIR="{project}"', "-I", os.path.join(project, "include"),
            "-I", os.path.join(project, "test"), "-I", emu,
            os.path.join(project, "src", "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
+           *_rpu_recorder(project),                            # the Cortex-R5 recorder (never attached here)
            os.path.join(project, "test", "llm_api.c"), os.path.join(project, "test", "llm_bench.c"),
            "-lm", "-o", exe]
     t0 = time.time()

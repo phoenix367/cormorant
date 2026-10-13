@@ -29,6 +29,12 @@
     "_launcher_note": "systemd = a transient unit 'kv260-chat' (systemd-run; logs: journalctl -u kv260-chat; not started at boot); nohup = a detached process (<dir>/server.log, <dir>/server.pid).",
     "env": {}
   },
+  "rpu": {
+    "enabled": false,
+    "bsp_dir": null,
+    "firmware": "rpu_firmware.elf",
+    "_note": "The Cortex-R5 drives the kernels (doc/plans/RPU_PLAN.md §9): with enabled, deploy.py builds inference-scheduler/runtime/rpu against bsp_dir (the bitstream's R5 BSP, tools/rpu/make_r5_bsp.py), uploads it with board/kv260/rpu/rpu.dts + rpu-ipi.dts and starts it before the server; the libraries attach by themselves and each entry follows its INFERENCE_RPU_RECOMMENDED (src/rpu_policy.py).  --rpu BSP_DIR / --no-rpu override it for one deploy; --stop stops the firmware with the server."
+  },
   "smollm2": {
     "_comment": "SmolLM2-135M-Instruct, served when server.backends contains smollm2. Its sampling and context settings are the server defaults for smollm2-360m and smolvlm too.",
     "lib": null,

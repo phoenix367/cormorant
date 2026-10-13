@@ -506,29 +506,11 @@ def main(argv=None):
     # ---------------------------------------------------------------- #
     # 5a. Runtime helper sources (static templates copied verbatim)     #
     # ---------------------------------------------------------------- #
-    runtime_src = os.path.join(os.path.dirname(__file__), "runtime")
-    runtime_files = [
-        ("inference_prof.h",         os.path.join("include", "inference_prof.h")),
-        ("inference_prof.c",         os.path.join("src",     "inference_prof.c")),
-        ("inference_ddr.h",          os.path.join("include", "inference_ddr.h")),
-        ("inference_ddr.c",          os.path.join("src",     "inference_ddr.c")),
-        ("inference_ddr_backend.h",  os.path.join("src",     "inference_ddr_backend.h")),
-        # DDR backends — one .c per platform under src/ddr/.
-        ("ddr/zuplus_apm.c",         os.path.join("src", "ddr", "zuplus_apm.c")),
-        # Driving the kernels from the Cortex-R5 (RPU_PLAN track B1): the recorder
-        # behind inference_rpu.h (Linux), the protocol with the firmware
-        # (runtime/rpu/, built once per bitstream) and rpu_host.c, the harness that
-        # checks a project on the R5 against the same library on the A53.
-        ("inference_rpu.h",          os.path.join("include", "inference_rpu.h")),
-        ("inference_rpu.c",          os.path.join("src",     "inference_rpu.c")),
-        ("rpu/rpu_ctrl.h",           os.path.join("include", "rpu_ctrl.h")),
-        ("rpu/rpu_host.c",           os.path.join("rpu", "rpu_host.c")),
-    ]
-    for src_name, rel_dst in runtime_files:
-        sp = os.path.join(runtime_src, src_name)
-        dp = os.path.join(out_dir,    rel_dst)
-        os.makedirs(os.path.dirname(dp), exist_ok=True)
-        shutil.copy2(sp, dp)
+    # The runtime files (src/codegen/runtime_files.py: the profiler, its DDR counters,
+    # the Cortex-R5 recorder and the R5 gate harness) — the same list multi-entry
+    # projects get.
+    from src.codegen.runtime_files import copy_runtime
+    copy_runtime(out_dir)
 
     # ---------------------------------------------------------------- #
     # 5b. External weight .dat files (large tensors)                    #

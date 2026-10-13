@@ -52,6 +52,13 @@ def _emu_sources(work: str) -> str:
     return emu
 
 
+
+def _rpu_recorder(project: str) -> list:
+    """The project's Cortex-R5 recorder (src/inference_rpu.c, RPU_PLAN §9): the
+    generated inference.c calls it; projects from before the R5 work lack both."""
+    p = os.path.join(project, "src", "inference_rpu.c")
+    return [p] if os.path.exists(p) else []
+
 def build(project: str, work: str, incoherent: bool = False, shared: bool = False) -> str:
     from src._conv_hw_config import CONV_TILE_IC
     from src._matmul_hw_config import MATMUL_TILE_M
@@ -65,6 +72,7 @@ def build(project: str, work: str, incoherent: bool = False, shared: bool = Fals
            f'-DTTS_API_WEIGHTS_DIR="{project}"', '-DTTS_MODEL_NAME="piper-lessac-medium"',
            "-I", os.path.join(project, "include"), "-I", os.path.join(project, "test"), "-I", emu,
            os.path.join(project, "src", "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
+           *_rpu_recorder(project),                            # the Cortex-R5 recorder (never attached here)
            os.path.join(project, "test", "tts_api.c"), os.path.join(project, "test", "tts_dp.c"),
            *(["-shared", "-fPIC"] if shared else [os.path.join(project, "test", "tts_bench.c")]),
            "-lm", "-o", exe]

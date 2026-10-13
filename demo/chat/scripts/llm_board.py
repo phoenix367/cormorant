@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import struct
 import sys
@@ -219,9 +220,16 @@ def run_bench(session, remote_proj: str, bdir: str, args, tag: str) -> str:
         extra += " -I images.bin"
     if args.decode_at and tag == "main":
         extra += f" -D {args.decode_at} -S {args.decode_at_steps}"
+    # who drives the kernels when the Cortex-R5 firmware runs (inference_rpu.h,
+    # RPU_PLAN §9): the library's policy, or forced by INFERENCE_RPU
+    # (a batch never takes seconds: a hung one fails the gate in 10 s, not 60)
+    env = {"off": "INFERENCE_RPU=0 ", "r5": "INFERENCE_RPU=1 INFERENCE_RPU_TIMEOUT_S=10 "}.get(
+        getattr(args, "rpu", "auto"), "")
     cmd = (f"mkdir -p {RUN_DIR} && cd {RUN_DIR} && "
-           f"{remote_proj}/{bdir}/llm_bench -i prompts.bin -o logits_{tag}.bin -k {args.decode} "
-           f"{extra} {'-r' if args.reopen and tag == 'main' else ''}")
+           f"{env}{remote_proj}/{bdir}/llm_bench -i prompts.bin -o logits_{tag}.bin -k {args.decode} "
+           f"{extra} {'-r' if args.reopen and tag == 'main' else ''}; rc=$?; "
+           # `times` in this shell (not a $(...) subshell): its children's user / system time
+           f"times > times_{tag}.txt; echo \"LLM_CPU: $(tail -1 times_{tag}.txt)\"; exit $rc")
     t0 = time.monotonic()
     out, err, rc = _stream_exec(session, cmd, timeout=7200,
                                 on_stderr_line=lambda ln: print("    " + ln, flush=True))
@@ -236,6 +244,10 @@ def parse(out: str) -> dict:
     res = {"prompts": [], "prefill": [], "decode_at": [], "profiles": {}}
     phase = None
     for line in out.splitlines():
+        if line.startswith("LLM_CPU:"):         # bash `times`: the bench's user / system CPU
+            secs = [int(m) * 60 + float(sec) for m, sec in re.findall(r"(\d+)m([\d.]+)s", line)]
+            if len(secs) == 2:
+                res["cpu_s"] = {"user": secs[0], "system": secs[1]}
         for key in ("LLM_OPEN", "LLM_PROMPT", "LLM_PREFILL", "LLM_DECODE_AT", "LLM_REOPEN",
                     "LLM_SUMMARY", "LLM_IMAGE"):
             if line.startswith(key + ":"):
@@ -360,6 +372,10 @@ def main(argv=None) -> int:
                     help="weights directory on the board (default /root/smollm2_weights for "
                          "SmolLM2-135M, /root/<model>_weights for the others)")
     ap.add_argument("--no-check", action="store_true")
+    ap.add_argument("--rpu", choices=("auto", "off", "r5"), default="auto",
+                    help="when the Cortex-R5 firmware runs (inference-scheduler/rpu_board.py "
+                         "--start-only): the library's policy (auto), the A53 (off) or the R5 for "
+                         "every run (r5) drives the kernels (INFERENCE_RPU, RPU_PLAN §9)")
     ap.add_argument("--no-lib-check", action="store_true",
                     help="skip llm_lib_check.py (ctypes: exports, threads, chunks, re-open)")
     ap.add_argument("--out", default=None, help="write the results JSON here")
@@ -420,6 +436,11 @@ def main(argv=None) -> int:
             sftp.put(local_prompts, f"{RUN_DIR}/prompts.bin")
             if args.vlm_images:
                 sftp.put(args.vlm_images, f"{RUN_DIR}/images.bin")
+            # the build's and the uploads' page cache sits in the CMA area: clean it
+            # before the pool's contiguous allocation (the 360M's 795 MB failed with
+            # 990 MB free after a build, 2026-10-13; src/remote/cma.py)
+            from src.remote.cma import clean_cma, describe
+            print(f"  cma: {describe(clean_cma(session)['after'])}", flush=True)
             text = run_bench(session, remote_proj, "build", args, "main")
             res = parse(text)
             local_logits = os.path.join(args.project, "logits_board.bin")
@@ -461,6 +482,9 @@ def main(argv=None) -> int:
           f"({(o.get('cma_free_kb_before', 0) - o.get('cma_free_kb_after', 0)) / 1024:.1f} MB)")
     print(f"decode {res.get('llm_summary', {}).get('decode_ms_mean')} ms/token; prefill "
           + ", ".join(f"{p['n']}: {p['best_ms']:.0f} ms" for p in res["prefill"]))
+    if res.get("cpu_s"):
+        print(f"A53 CPU of the bench (--rpu {args.rpu}): user {res['cpu_s']['user']:.1f} s, "
+              f"system {res['cpu_s']['system']:.1f} s")
     if res["decode_at"]:
         print("decode by position: " + ", ".join(
             f"{d['pos']}: {d['mean_ms']:.1f} ms (fnv {d['fnv']})" for d in res["decode_at"]))

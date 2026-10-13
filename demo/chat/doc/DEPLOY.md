@@ -166,6 +166,34 @@ Nothing else may run kernels until the server is stopped.
   `--hold`.
 - Before handing the board to another job, run `deploy.py --stop`.
 
+**Large pools and CMA.**  A model's pool is one contiguous CMA buffer (the
+360M's 795 MB).  After uploads, builds and gates the allocation can fail with
+enough CmaFree; `deploy.py` cleans the CMA area before it starts the server,
+and `python -m src.remote.cma --config CFG` (from `inference-scheduler/`) does
+it by hand: it drops the page cache, compacts memory and names any process
+still holding FPGA buffers.  A reboot is not needed.
+
+## The kernels driven from the Cortex-R5
+
+With `deploy.py --rpu BSP_DIR` (or `"rpu": {"enabled": true, "bsp_dir": ...}`
+in `chat_config.json`; the board's server runs this way since 2026-10-13) the
+deploy also starts the Cortex-R5 firmware, just before the server ([RPU_PLAN §9](../../../doc/plans/RPU_PLAN.md)):
+- **the firmware** is built from `inference-scheduler/runtime/rpu` against
+  the bitstream's R5 BSP (`tools/rpu/make_r5_bsp.py`), uploaded to
+  `<dir>/rpu` with its two device-tree overlays and started through
+  remoteproc;
+- **the libraries** the server loads find it at `inference_init()` and
+  attach by themselves; each entry then follows its
+  `INFERENCE_RPU_RECOMMENDED` (the R5 when its call overhead is at most 5 %
+  of the predicted time), and the A53 sleeps while the R5 runs a batch.
+  Set `INFERENCE_RPU=0` in `server.env` to keep every run on the A53, `1` to
+  put every run on the R5;
+- **`deploy.py --stop`** stops the firmware with the server, so no other
+  board job finds it running.
+
+`--no-rpu` deploys without it once.  Without the option nothing changes: the
+libraries drive the kernels from the A53.
+
 ## Several models on one FPGA
 
 The board has 1000 MB of CMA (`cma=1000M`), and idle CmaFree was

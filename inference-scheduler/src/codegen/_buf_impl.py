@@ -210,13 +210,13 @@ static void _inference_buf_sync(inference_buf_t *buf, enum xclBOSyncDirection di
     }
 }
 
-inference_buf_t *inference_buf_alloc(unsigned n_elem)
+static inference_buf_t *_inference_buf_alloc(unsigned n_elem, int cacheable)
 {
     /* Round up to 64 bytes: the kernels read / write whole 16-byte words
      * (VectorOPKernel writes the last word of every run whole), so the
      * allocation must cover the tail word past n_elem. */
     size_t                 bytes = ((size_t)n_elem * INFERENCE_BYTES_PER_ELEM + 63u) & ~(size_t)63u;
-    unsigned               flags = s_cacheable ? XCL_BO_FLAGS_CACHEABLE : 0u;
+    unsigned               flags = cacheable ? XCL_BO_FLAGS_CACHEABLE : 0u;
     xclBufferHandle        bo;
     void                  *virt;
     struct xclBOProperties props;
@@ -258,13 +258,25 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->bo        = (unsigned)bo;
     buf->refcount  = 1u;
     buf->is_owner  = 1u;
-    buf->cached    = (uint8_t)(s_cacheable != 0);
+    buf->cached    = (uint8_t)(cacheable != 0);
     buf->bo_offset = 0;
     /* Start clean: no CPU-dirty line may exist in a range a kernel writes
      * before the CPU ever touched it (~15 ms per 216 MiB on the KV260). */
     if (buf->cached)
         _inference_buf_sync(buf, XCL_BO_SYNC_BO_TO_DEVICE);
     return buf;
+}
+
+inference_buf_t *inference_buf_alloc(unsigned n_elem)
+{
+    return _inference_buf_alloc(n_elem, s_cacheable);
+}
+
+/* A buffer the CPU writes and another agent reads without cache maintenance
+ * (write-combined): the Cortex-R5's command ring (src/inference_rpu.c). */
+inference_buf_t *inference_buf_alloc_uncached(unsigned n_elem)
+{
+    return _inference_buf_alloc(n_elem, 0);
 }
 
 static void _inference_buf_dealloc(inference_buf_t *buf)
@@ -353,6 +365,11 @@ inference_buf_t *inference_buf_alloc(unsigned n_elem)
     buf->cached   = INFERENCE_BUF_CACHEABLE;   /* the MPU maps DDR cacheable: Xil_DCache* */
     if (buf->cached) Xil_DCacheFlushRange((INTPTR)mem, (INTPTR)bytes);
     return buf;
+}
+
+inference_buf_t *inference_buf_alloc_uncached(unsigned n_elem)
+{
+    return inference_buf_alloc(n_elem);
 }
 
 static void _inference_buf_dealloc(inference_buf_t *buf)

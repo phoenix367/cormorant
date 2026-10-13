@@ -263,7 +263,7 @@ src/
   _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py, _rowops_hw_config.py
                          platform JSON resolvers (kernels.{conv,matmul,pool,rowops})
   rpu_policy.py          who drives the kernels when the Cortex-R5 firmware runs: the R5's
-                         overhead (8.4 µs a call, 61 µs a batch, fitted on the board) against
+                         overhead (1.0 µs a call, 10.6 µs a batch, fitted on the board) against
                          the predicted inference time (the perf model, else the analytic cost
                          model); <= 5 % -> the R5, else the A53 (INFERENCE_RPU_RECOMMENDED in
                          the header, per entry; report.md "Cortex-R5") — RPU_PLAN §9.3
@@ -289,6 +289,9 @@ src/
   remote/                SSH session, config defaults, preflight checks, the board lock
                          (lock.py, `python -m src.remote.locked`; shared by run_remote_tests.py /
                          run_remote_perf.py / upload_bitstream.py / perf_calibrate.py)
+                         cma.py: the board's CMA clean-up (`python -m src.remote.cma --config CFG
+                         [--check] [--min-mb N]`: drop the page cache, compact memory, report CmaFree
+                         and the processes holding FPGA buffers; deploy / llm_board / rpu_board call it)
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
     _core.py             _compute_event_stream() → list of comment/start/wait/drain/cpu events
@@ -311,7 +314,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              85 pytest modules, 1813 tests, all pass (test_bert_base.py
+  test_*.py              86 pytest modules, 1818 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

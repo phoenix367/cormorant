@@ -20,6 +20,13 @@ host with inference-scheduler/.venv/bin/python).
               (piper_backend.py, piper_phonemize.py, piper_vits.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
               (skipped when unchanged; without it the server samples in Python)
+  rpu      -> with rpu.enabled (or --rpu BSP_DIR): the Cortex-R5 firmware built
+              against the bitstream's BSP (inference-scheduler/rpu_board.py,
+              tools/rpu/), uploaded with its two overlays to <dir>/rpu and
+              started (remoteproc): the libraries the server loads then attach
+              by themselves and each entry follows its INFERENCE_RPU_RECOMMENDED
+              (doc/plans/RPU_PLAN.md §9).  --stop stops the firmware with the
+              server.
   start    -> transient systemd unit 'kv260-chat' (systemd-run: survives the
               ssh session, not started at boot, logs in journalctl -u
               kv260-chat) or, with server.launcher = "nohup", a detached
@@ -130,6 +137,11 @@ def load_config(path: Optional[str]) -> dict:
                  ("max_windows", 8), ("doc_stride", 128), ("queue_timeout", 120), ("max_queue", 16),
                  ("launcher", "systemd"), ("env", {}), ("resident", "auto")):
         srv.setdefault(k, v)
+    rpu = cfg.setdefault("rpu", {})
+    for k, v in (("enabled", False), ("bsp_dir", None), ("firmware", "rpu_firmware.elf")):
+        rpu.setdefault(k, v)
+    if rpu.get("bsp_dir"):
+        rpu["bsp_dir"] = str(chat_path(rpu["bsp_dir"]))
     llm = cfg.setdefault("smollm2", {})
     for k, v in (("lib", None), ("weights_dir", None),
                  ("tokenizer", "assets/smollm2-135m-instruct/tokenizer.json"), ("context", 1024),
@@ -337,6 +349,43 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     return ok
 
 
+def start_rpu(session: RemoteSession, cfg: dict) -> bool:
+    """The Cortex-R5 firmware for the server's libraries: built against the BSP,
+    uploaded with its overlays to <dir>/rpu, started (rpu_board.py's steps)."""
+    import subprocess
+    import tempfile
+    import rpu_board                                           # inference-scheduler/
+    t0 = time.monotonic()
+    r = cfg["rpu"]
+    if not r.get("bsp_dir"):
+        return step("rpu", False, t0, "rpu.enabled needs rpu.bsp_dir (tools/rpu/make_r5_bsp.py)")
+    work = f"{cfg['remote']['dir']}/rpu"
+    with tempfile.TemporaryDirectory(prefix="chat_rpu_") as td:
+        tdp = Path(td)
+        with open(tdp / "build.log", "w") as log:
+            try:
+                elf, dtbo, dtbo_ipi = rpu_board.build_artifacts(Path(r["bsp_dir"]), tdp, log)
+            except (subprocess.CalledProcessError, RuntimeError) as e:
+                return step("rpu", False, t0, f"firmware build failed: {e}\n"
+                            + (tdp / "build.log").read_text()[-2000:])
+        stage = tdp / "stage"
+        stage.mkdir()
+        for f, name in ((elf, r["firmware"]), (dtbo, "rpu.dtbo"), (dtbo_ipi, "rpu-ipi.dtbo")):
+            (stage / name).write_bytes(Path(f).read_bytes())
+        session.exec(f"mkdir -p {work}", timeout=30)
+        session.upload_dir(stage, work)
+    out, err, rc = session.exec(f"{sudo(cfg)}bash -c {shlex.quote(rpu_board.firmware_up_script(work, r['firmware']))}",
+                                timeout=90)
+    ok = rc == 0 and out.strip().endswith("running")
+    door = next((ln for ln in out.splitlines() if ln.startswith("doorbell:")), "doorbell: ?")
+    return step("rpu", ok, t0, f"firmware running, {door}" if ok else out + err)
+
+
+def stop_rpu(session: RemoteSession, cfg: dict) -> None:
+    import rpu_board                                           # inference-scheduler/
+    session.exec(f"{sudo(cfg)}bash -c {shlex.quote(rpu_board.FIRMWARE_STOP)}", timeout=30)
+
+
 def stop_server(session: RemoteSession, cfg: dict, quiet: bool = False) -> str:
     d = cfg["remote"]["dir"]
     su = sudo(cfg)
@@ -347,6 +396,7 @@ def stop_server(session: RemoteSession, cfg: dict, quiet: bool = False) -> str:
     session.exec(f"{su}pkill -f '[k]v260_chat_server.py' 2>/dev/null; sleep 0.5", timeout=30)
     out, _, _ = session.exec("pgrep -fa '[k]v260_chat_server.py' || echo none", timeout=15)
     state = out.strip()
+    stop_rpu(session, cfg)          # the R5 firmware belongs to the server: no other job finds it running
     if not quiet:
         print(f"  server stopped" if state == "none" else _yellow(f"  still running: {state}"))
     return state
@@ -557,12 +607,13 @@ def start_server(session: RemoteSession, cfg: dict) -> bool:
                f"< /dev/null & echo $! > {d}/server.pid")
     # Page-cache pages left in the CMA area by uploads and builds can make the
     # largest pool's contiguous allocation fail although CmaFree is enough
-    # (seen 2026-09-30: 776 MB for SmolLM2-360M with 834 MB free, TTS_PLAN §5);
-    # dropping the clean page cache first empties the area.
-    free, _, _ = session.exec(f"sync; echo 1 | {sudo(cfg)}tee /proc/sys/vm/drop_caches > /dev/null; "
-                              "awk '/CmaFree/{print int($2 / 1024)}' /proc/meminfo", timeout=60)
+    # (2026-09-30: 776 MB for SmolLM2-360M with 834 MB free, TTS_PLAN §5;
+    # 2026-10-13: 795 MB with 990 MB free): drop the page cache and compact
+    # memory first (inference-scheduler/src/remote/cma.py).
+    from src.remote.cma import clean_cma, describe
+    cma = clean_cma(session, sudo(cfg))["after"]
     out, err, rc = session.exec(cmd, timeout=60)
-    return step("start", rc == 0, t0, (f"{launcher}: {UNIT} (page cache dropped, CmaFree {free.strip()} MB)"
+    return step("start", rc == 0, t0, (f"{launcher}: {UNIT} (CMA cleaned: {describe(cma)})"
                                        if rc == 0 else (out + err).strip()))
 
 
@@ -669,11 +720,19 @@ def main(argv=None) -> int:
     ap.add_argument("--stop", action="store_true", help="stop the server")
     ap.add_argument("--status", action="store_true", help="show whether the server runs and its /health")
     ap.add_argument("--check-only", action="store_true", help="remote preflight only")
+    ap.add_argument("--rpu", metavar="BSP_DIR", default=None,
+                    help="start the Cortex-R5 firmware (built against this BSP) with the server: the "
+                         "libraries' policy puts large entries on the R5 (rpu.enabled / rpu.bsp_dir)")
+    ap.add_argument("--no-rpu", action="store_true", help="no R5 firmware this time (rpu.enabled off)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     if args.board_lock:
         cfg["board_lock"] = args.board_lock
+    if args.rpu:
+        cfg["rpu"].update(enabled=True, bsp_dir=str(Path(args.rpu).resolve()))
+    if args.no_rpu:
+        cfg["rpu"]["enabled"] = False
 
     if args.stop or args.status:
         session = connect(cfg)
@@ -716,6 +775,8 @@ def main(argv=None) -> int:
                 return 1
             upload_server(session, cfg)
             build_sampler(session, cfg)
+            if cfg["rpu"]["enabled"] and not start_rpu(session, cfg):
+                return 1
             if not start_server(session, cfg):
                 return 1
             h = wait_health(session, cfg)

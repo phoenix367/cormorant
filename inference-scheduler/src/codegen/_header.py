@@ -228,6 +228,9 @@ class _HeaderMixin:
             " * individual sub-allocations; call inference_deinit() to release all. */"
         )
         lines.append("inference_buf_t *inference_buf_alloc(unsigned n_elem);")
+        lines.append("/* Linux: write-combined, no cache maintenance (the Cortex-R5's command ring);\n"
+                     " * bare metal: inference_buf_alloc(). */")
+        lines.append("inference_buf_t *inference_buf_alloc_uncached(unsigned n_elem);")
         lines.append("")
         lines.append(
             "/* Increment the reference count.  No-op for views (is_owner == 0).\n"

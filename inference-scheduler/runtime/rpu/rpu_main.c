@@ -38,9 +38,9 @@ static void rpu_batch(void)
     Xil_DCacheInvalidateRange((INTPTR)w, n * 4u);
     rpu_ctrl.state = RPU_STATE_RUNNING;
     rpu_ctrl.progress = PROG_BATCH;
-    rpu_irq_arm(1);
     while (i < n) {
-        const uint32_t hdr = w[i++];
+        const uint32_t hdr = w[i];
+        rpu_ctrl.batch_pos = i++;
         const uint32_t lane = RPU_CMD_LANE(hdr);
         UINTPTR base;
         if (lane >= RPU_LANES || !(rpu_ctrl.lanes & (1u << lane))) { rpu_ctrl.rc = (uint32_t)-7; goto out; }
@@ -54,7 +54,18 @@ static void rpu_batch(void)
             i += cnt;
             break;
         }
+        case RPU_OP_REGSO: {
+            const uint32_t cnt = RPU_CMD_N(hdr);
+            uint32_t r, first;
+            if (i + 1u + cnt > n) { rpu_ctrl.rc = (uint32_t)-5; goto out; }
+            first = w[i++];
+            if (first + cnt > RPU_REG_WORDS_MAX) { rpu_ctrl.rc = (uint32_t)-6; goto out; }
+            for (r = 0u; r < cnt; r++) Xil_Out32(base + CTRL_ARGS + 4u * (first + r), w[i + r]);
+            i += cnt;
+            break;
+        }
         case RPU_OP_START:
+            rpu_irq_start(lane);                    /* its interrupt armed first */
             Xil_Out32(base + CTRL_AP_CTRL, 1u);     /* ap_start (no auto-restart) */
             calls++;
             break;
@@ -69,7 +80,7 @@ static void rpu_batch(void)
     }
     rpu_ctrl.rc = 0u;
 out:
-    rpu_irq_arm(0);
+    rpu_irq_batch_end();
     rpu_ctrl.calls += calls;
     rpu_ctrl.waits += waits;
     rpu_ctrl.batches++;
@@ -120,6 +131,12 @@ int main(void)
         __asm__ volatile("dsb" ::: "memory");
         rpu_ctrl.done_seq = seq;
         __asm__ volatile("dsb" ::: "memory");
+        /* the A53 sets `wake` before it sleeps and rechecks done_seq after: either
+         * it sees done_seq or this sees `wake` (both sides fence in between) */
+        if (rpu_ctrl.wake) {
+            Xil_Out32(RPU_IPI_RPU0_TRIG, RPU_IPI_CH7_BIT);
+            rpu_ctrl.doorbells++;
+        }
         if (rpu_ctrl.state == RPU_STATE_QUIT) break;
     }
     for (;;) { __asm__ volatile("wfi"); }

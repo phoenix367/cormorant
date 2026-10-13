@@ -15,11 +15,19 @@
  * names in ring_lo / ring_hi / ring_bytes.  A batch is written from word 0,
  * cleaned from the A53's cache, its length put in batch_words, and
  * cmd = RPU_CMD_BATCH with cmd_seq += 1 submits it; the firmware executes it
- * (arming the kernels' interrupts around it) and answers done_seq = cmd_seq.
+ * (arming the kernels' interrupts around it) and answers done_seq = cmd_seq;
+ * when the A53 set `wake` it then rings the doorbell — IPI channel 7, the
+ * rpu_ipi UIO device of board/kv260/rpu/rpu-ipi.dts — so the A53 can sleep
+ * through a long batch instead of polling.
  * Each command is a header word followed by its payload:
  *
  *   RPU_OP_REGS  | lane << 8 | n << 16   then n words: the kernel's registers
  *                                         from offset 0x10 up (the arguments)
+ *   RPU_OP_REGSO | lane << 8 | n << 16   then the first register's index w (its
+ *                                         offset is 0x10 + 4 w) and n words: the
+ *                                         registers that changed since the lane's
+ *                                         last call (the library sends a lane's
+ *                                         full block on its first call of a run)
  *   RPU_OP_START | lane << 8              write ap_start
  *   RPU_OP_WAIT  | lane << 8              block until that lane's ap_done
  *
@@ -32,7 +40,7 @@
 #include <stdint.h>
 
 #define RPU_CTRL_MAGIC     0x52505531u          /* "RPU1" */
-#define RPU_CTRL_VERSION   3u
+#define RPU_CTRL_VERSION   4u
 #define RPU_CTRL_A53_ADDR  0xFFE20000u           /* the BTCM as the A53 sees it */
 
 #define RPU_LANE_VECTOROP  0u
@@ -45,6 +53,11 @@
 #define RPU_OP_REGS        1u
 #define RPU_OP_START       2u
 #define RPU_OP_WAIT        3u
+#define RPU_OP_REGSO       4u
+#define RPU_IPI_RPU0_TRIG  0xFF310000u          /* RPU0's IPI channel (1): TRIG */
+#define RPU_IPI_CH7_BIT    (1u << 24)           /* destination: channel 7 (the PL0 agent, rpu_ipi) */
+#define RPU_IPI_SRC_RPU0   (1u << 8)            /* in channel 7's ISR / IER: from RPU0 */
+#define RPU_REG_WORDS_MAX  60u                  /* a control block's argument registers: 0x10 .. 0xFF */
 #define RPU_CMD_OP(w)      ((w) & 0xFFu)
 #define RPU_CMD_LANE(w)    (((w) >> 8) & 0xFFu)
 #define RPU_CMD_N(w)       ((w) >> 16)
@@ -72,7 +85,8 @@ struct rpu_ctrl {
     uint32_t waits;            /* waits served */
     uint32_t lanes;            /* bit i set: lane i exists in this firmware's bitstream */
     uint32_t irq_count[8];     /* interrupts taken per lane */
-    uint32_t irq_missed[8];    /* waits that found the kernel done without its interrupt (rpu_irq.c) */
+    uint32_t irq_missed[8];    /* waits served by reading the ISR without the interrupt path (no SGI
+                                * self-test: should stay 0, rpu_irq.c) */
     uint32_t heartbeat;        /* incremented while a wait spins (the firmware is alive) */
     uint32_t reserved0;
     uint32_t fault;            /* an exception the firmware took: 1 undefined, 2 prefetch abort, 3 data abort */
@@ -86,7 +100,15 @@ struct rpu_ctrl {
                                 * 11 HPPIR, 12 the SGI self-test's count (1 = the interrupt path works),
                                 * 13 TYPER */
     uint32_t progress;         /* the firmware's last step (rpu_main.c) */
-    uint32_t reserved[71];
+    uint32_t regs_window;      /* the kernels' register window the firmware maps as device
+                                * memory (posted writes; 0: left strongly ordered) */
+    uint32_t wake;             /* A53 -> R5: ring the doorbell (IPI channel 7) when the
+                                * current batch is done (the A53 sleeps on it) */
+    uint32_t doorbells;        /* doorbells rung */
+    uint32_t batch_pos;        /* the word index of the command the firmware executes (a hung
+                                * batch's position: the library prints the commands before it) */
+    uint32_t reserved[69];
 };                             /* 512 bytes */
+_Static_assert(sizeof(struct rpu_ctrl) == 512u, "rpu_ctrl: the A53 and the R5 share this layout");
 
 #endif /* RPU_CTRL_H */

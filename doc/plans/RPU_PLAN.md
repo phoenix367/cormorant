@@ -221,7 +221,7 @@ all (139 ms of host time per 260 ms chunk today — on an R5 that would grow,
 | **A1 — existing ops** | §3.1 as scheduler nodes: DEQUANT of the logits into DMA, the merges as COPY (behind the R5 flag), `VitEmbedAdd` / `VitSumDequant` / pixel shuffle, BERT's transposes, the Piper h sums and interleaves, the relative-key add through the diagonal transposes; the decode softmax on the unit (`vsmx="decode"` gate) | bit-exact sched-checks and board gates; BERT ≤ 275 ms (its 0.75 × gate of HOSTOPS §7), the Piper encoder ≤ 75 ms at 400 ids, nothing slower | 3 days |
 | **A2 — descriptor chains + the ConvKernel output stride** | one bitstream: the unit's job list from DDR; `y` rows at a stride; the decode prep on the unit (`irope=True` gate) | WNS ≥ 0 at 4 ns; 135M decode ≤ 45 ms per token, the merges gone (prefill 256 ≤ 390 ms); every library bit-exact | 4 days incl. the build and campaign |
 | **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build — **DONE 2026-10-13 (§9), as a model-independent firmware replaying the library's recorded kernel calls: the six CNN demos bit-exact, interrupt-driven, +2–5 % on the real models (YOLO +4 %, MobileNet v2 +5 %)** | 5 days |
-| **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens | 5 days |
+| **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens — **DONE 2026-10-13 in the B1 design (§10): no RPMsg or sampler on the R5 (the A53 keeps the host ops and the output, by the user's direction); protocol v4 + the doorbell; every chat library, BERT and Piper gated bit-exact with the R5 driving; the chat server runs with it (`deploy.py --rpu`); decode +2 % (135M), the bench's A53 CPU 3 s instead of 10 s** | 5 days |
 | **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss | 2 days |
 | **A3 — the Piper and stereo features** | §3.3's unit features (unaligned row start, the windowed copy, the acts, the scaled add, long-row norms) and the correlation on ConvKernel; Piper's chunk and the stereo pass on the R5 | the chunk's host time ≤ 10 ms; stereo ≤ 450 ms; bit-exact | 2 weeks |
 
@@ -475,3 +475,105 @@ Next: the chat libraries regenerated (the policy attaches them by itself
 once the firmware runs at boot), the cheaper protocol (changed registers
 only, the IPI instead of polling: B2), then B3 power with the A53 cores
 idle during a batch.
+
+## 10. Track B2 — the chat path on the R5 (2026-10-13)
+
+**Result: the chat server runs with the Cortex-R5 driving the kernels.**  The
+regenerated SmolLM2-135M, SmolLM2-360M and SmolVLM libraries, BERT and
+Piper all passed their board gates bit-exact with the firmware running (the
+chat libraries also with the R5 forced for every entry), and
+`demo/chat/deploy.py --rpu BSP_DIR` (or `rpu.enabled` in `chat_config.json`)
+starts the firmware with the server.  A chat request moves the firmware's
+counters (four requests: 17 304 batches, 65 472 kernel calls, 0 missed
+interrupts, the A53 asleep on 3 072 of the batches).
+
+| library (R5 driving, 2026-10-13) | gate | decode | prefill 16 / 64 / 256 | A53 CPU of the bench |
+|---|---|---:|---:|---:|
+| SmolLM2-135M | logits bit-exact, 4 prompts | 51.1 ms/token (A53: 49.9) | 83 / 100 / 400 ms (A53: 80 / 98 / 397) | 3.0 s (A53: 10.1 s) |
+| SmolLM2-360M | logits bit-exact | 132.2 ms/token | 194 / 238 / 1054 ms | 5.2 s |
+| SmolVLM-256M | logits bit-exact, `llm_image` 1617 ms | 51.1 ms/token | 83 / 100 / 401 ms | 2.9 s |
+| BERT (SQuAD) | 20 / 20 bit-exact | 266.1 ms / inference | | |
+| Piper | PCM bit-exact | | | |
+
+What the plan's B2 had and what shipped: the plan put the sampler and an
+RPMsg bridge on the R5 so the whole token ran there; the design that
+shipped (§9) keeps the host ops and the output on the A53 and has the R5
+replay the kernel calls — so B2 became making that cheap enough for decode
+(543 calls and 151 batches a token) and letting the A53 sleep.
+
+### 10.1 Protocol v4: the overhead an order of magnitude down
+
+| change | why |
+|---|---|
+| the kernels' register window (0xA000_0000, 1 MiB) mapped as device memory in the R5's MPU | the BSP maps the PL strongly ordered: every register write waited for its completion |
+| `REGSO lane n` + first index: only the registers that changed since the lane's last call (the whole block on a lane's first call of a run) | 28–45 register words a call; the control blocks change none themselves |
+| the command ring an uncached buffer (`inference_buf_alloc_uncached`) | the A53 cleaned the whole 1 MiB ring from its cache every batch |
+| a lane's GIE armed at its first Start of a batch, dropped at the end only when it is not in flight | arming all five lanes per batch; and a lane in flight across a host op lost its completion |
+
+Measured (R5 minus A53): chains of 1 / 16 / 128 tiny VectorOP calls +77 / +176 /
++917 µs → +3 / +21 / +146 µs; ResNet-18 +410 → +36 µs, MobileNet v2 +900 →
++111 µs, YOLOv5n +1910 → +276 µs.  The policy's fit (§9.3) became 1.0 µs a call
+and 10.6 µs a batch: every chat entry now goes to the R5, and only
+sub-millisecond models (the MNIST convnet, chains of tiny calls) stay on the A53.
+
+**The doorbell.**  While the R5 runs a batch the A53 spins for
+`INFERENCE_RPU_SPIN_US` (50 µs), then sleeps in `poll()` on the `rpu_ipi` UIO
+device (`board/kv260/rpu/rpu-ipi.dts`: IPI channel 7, the PL0 agent at
+0xFF34_0000, SPI 29 — Linux's own mailbox is channel 0, SPI 35); the R5 rings it
+(its channel's TRIG, channel 7's bit) after a batch when the A53 asked
+(`wake` in the control block, with the done / wake check fenced on both sides).
+ResNet-18 costs the A53 0.65 ms of CPU per 20 ms inference instead of 20 ms;
+YOLOv5n 20.6 ms instead of 54.5 ms (its host ops).  The wake costs 20–70 µs per
+sleeping batch, which the policy does not model yet: LeNet (10 calls, one
+1.3 ms batch) runs +3.7 % on the R5 against the 1.6 % predicted.
+
+### 10.2 The interrupt handling, third design
+
+The first two designs counted completions in the interrupt handler and hung
+under load (the 135M and 360M 16-token prefill, SmolVLM): a VectorOP job
+finished — ISR set, line high — and the R5 waited forever.
+
+1. *Toggle-clear in the handler.*  With posted writes the ISR clear's
+   read-back can overtake the write (AXI reads and writes are separate
+   channels); a re-taken level interrupt then read the bit still set, toggled
+   it back and counted one completion twice — a wait returned early, the next
+   Start went to a busy kernel and was wiped by its ap_ready.
+2. *Count, mask at the GIC, clear and unmask at the next Start.*  The unmask
+   (a write to the GIC) could overtake the posted ISR clear (a write to the
+   PL): the GIC delivered the previous job's still high line, the handler
+   counted it and masked the lane, the real completion was never seen.  And
+   the driver's `XScuGic_Enable` / `_Disable` rewrite `GICD_ITARGETSR`, one
+   word for the ids of VectorOP, MatmulKernel and ConvKernel.
+3. *Shipped: the ISR is the record.*  `rpu_irq_start()` clears ISR bit 0 and
+   reads it back until the clear has landed, before the ap_start (same write
+   channel); after a Start the bit means "this job is done".  `rpu_irq_wait()`
+   reads it; between reads it unmasks the lane (`GICD_ISENABLER`, a set
+   register: no read-modify-write) and sleeps in WFI with the CPU's IRQs held
+   off (`cpsid i` … `wfi` … `cpsie i`: no wake-up lost between the read and the
+   WFI).  The handler only masks the line and returns.  Nothing is counted,
+   so nothing can be counted twice or missed.  On the board: the six demos and
+   the three chat libraries with the R5 forced, all bit-exact, no hang; the
+   demos' latency unchanged.
+
+### 10.3 Traps (B2)
+
+7. Every multi-entry project (the chat and TTS libraries) is written by
+   `multi.write_project`, not the CLI: the runtime files the generated CMake
+   names were missing there (`src/codegen/runtime_files.py` is now the one list).
+8. The TCMs are powered only while remoteproc runs the firmware: a library
+   reading the control block with the R5 stopped died of SIGBUS in
+   `inference_init()`.  The library checks `/sys/class/remoteproc/*/state` first.
+9. Large pools (the 360M's 795 MB) failed to allocate with 880–990 MB of CMA
+   free after uploads, builds and gates (page cache in the CMA area,
+   fragmentation).  `src/remote/cma.py` (`python -m src.remote.cma --config
+   CFG`) drops the page cache, compacts memory and names the processes holding
+   FPGA buffers; `deploy.py`, `llm_board.py` and `rpu_board.py` call it before
+   the allocation.  No reboot needed.
+10. A tool edited while a background session was about to run it started the
+    firmware from a half-written file: no edits to the board tools while a
+    board session runs.
+
+Next: B3 power — the A53 now sleeps during long batches, so the APU's
+frequency / idle policy can be measured against §6; the wake cost in the
+policy; and fewer, longer decode batches (the decode host ops onto the
+kernels, A2) so the A53 can sleep through a token.

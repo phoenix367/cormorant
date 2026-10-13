@@ -2,16 +2,19 @@
 (doc/plans/RPU_PLAN.md §9.3).  Small models stay on the A53, large ones go to
 the R5.
 
-Driving the kernels from the R5 costs about CALL_US per kernel call (the R5's
-AXI-Lite writes across the LPD–FPD bridge and its interrupt wake) and
-BATCH_US per batch (the A53 submits a batch and polls for its end; a batch
-ends before every host op and at the output sync).  Measured on the KV260 on
-2026-10-13 (bitstream 1cedaf2ed816, R5 minus A53 latency): MNIST convnet
-+138 µs for 8 calls and 1 batch, LeNet +159 µs for 10 + 1, ResNet-18 +410 µs
-for 41 + 1, MobileNet v1 +530 µs for 57 + 1, MobileNet v2 +900 µs for 100 + 1,
-YOLOv5n +1910 µs for 127 + 14.  The least-squares fit, 8.4 µs a call and
-61 µs a batch, is within 2 % on the four large models and within 10 % on
-the two small ones.
+Driving the kernels from the R5 costs about CALL_US per kernel call more
+than the A53 (the R5 writes the call's changed registers across the LPD–FPD
+bridge — posted, the window is device memory — and takes the interrupt) and
+BATCH_US per batch (the A53 hands the batch over and waits for its end; a
+batch ends before every host op and at the output sync).  Measured on the
+KV260 on 2026-10-13 (bitstream 1cedaf2ed816, protocol v4, R5 minus A53
+latency, RPU_PLAN §9.4): chains of 1 / 16 / 128 tiny VectorOP calls +3 /
++21 / +146 µs, MNIST convnet +17 µs for 8 calls and 1 batch, LeNet +11 µs
+for 10 + 1, ResNet-18 +36 µs for 41 + 1, MobileNet v1 +47 µs for 57 + 1,
+MobileNet v2 +111 µs for 100 + 1, YOLOv5n +276 µs for 127 + 14.  The
+least-squares fit, 1.0 µs a call and 10.6 µs a batch, is within 21 µs of
+every one.  (Protocol v3 — every register strongly ordered, the whole ring
+cleaned per batch — cost 8.4 µs and 61 µs.)
 
 A model is "large" — the R5 drives it — when that overhead is at most
 MAX_OVERHEAD of its predicted inference time.  The prediction is the
@@ -29,8 +32,8 @@ from __future__ import annotations
 import math
 from typing import Dict, Optional
 
-CALL_US = 8.4
-BATCH_US = 61.0
+CALL_US = 1.0
+BATCH_US = 10.6
 MAX_OVERHEAD = 0.05
 MIN_CALLS_WITHOUT_MODEL = 32
 
