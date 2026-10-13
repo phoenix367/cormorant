@@ -27,7 +27,8 @@
 #define DEFAULT_RING     (1u << 20)
 #define FLUSH_TIMEOUT_S  60.0               /* INFERENCE_RPU_TIMEOUT_S */
 #define SPIN_US_DEFAULT  50u                /* then sleep on the doorbell (INFERENCE_RPU_SPIN_US) */
-#define IPI_ISR          (0x10u / 4u)       /* IPI channel 7's registers (the rpu_ipi UIO map) */
+#define IPI_TRIG         (0x00u / 4u)       /* IPI channel 7's registers (the rpu_ipi UIO map) */
+#define IPI_ISR          (0x10u / 4u)
 #define IPI_IER          (0x18u / 4u)
 
 static volatile struct rpu_ctrl *s_ctrl;    /* NULL = not attached */
@@ -49,6 +50,7 @@ static int       s_ipi_fd = -1;             /* the doorbell (board/kv260/rpu/rpu
 static volatile uint32_t *s_ipi;
 static double    s_spin_s = SPIN_US_DEFAULT * 1e-6;
 static uint32_t  s_sleeps;
+static uint32_t  s_rings;                   /* submissions that rang a sleeping R5 */
 static double    s_timeout_s = FLUSH_TIMEOUT_S;
 
 static double now_s(void)
@@ -184,6 +186,11 @@ static int attach_core(unsigned ring_bytes)
     s_enabled = 0;
     s_ctrl = c;
     ipi_open();
+    /* the R5 sleeps between commands only while the libraries attached can ring it */
+    c->a53_rings = s_ipi ? RPU_RINGS_MAGIC : 0u;
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");
+#endif
     return 0;
 }
 
@@ -336,7 +343,17 @@ void inference_rpu_flush(void)
 #endif
     seq = c->cmd_seq + 1u;
     c->cmd_seq = seq;
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");      /* cmd_seq out before r5_sleeping is read */
+#else
     __sync_synchronize();
+#endif
+    /* the R5 sets r5_sleeping, fences, then rereads cmd_seq: it sees this
+     * submission, or this sees it asleep and rings (rpu_ctrl.h, protocol v5) */
+    if (s_ipi && c->r5_sleeping) {
+        s_ipi[IPI_TRIG] = RPU_IPI_DST_RPU0;
+        s_rings++;
+    }
     t0 = now_s();
     /* spin a little (a short batch costs less than a wake-up), then sleep on the
      * doorbell: ask for it, recheck, unmask the interrupt, block */
@@ -446,5 +463,8 @@ int inference_rpu_stats(inference_rpu_stats_t *out)
     out->words = s_words_total;
     out->sleeps = s_sleeps;
     out->doorbell = s_ipi != NULL;
+    out->rings = s_rings;
+    out->r5_sleeps = s_ctrl->r5_sleeps;
+    out->r5_rings = s_ctrl->r5_rings;
     return 0;
 }

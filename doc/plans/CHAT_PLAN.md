@@ -1578,6 +1578,12 @@ state (each one locks a core); use the serial console (FT4232H channel B,
 core that prints no backtrace).  Do not read PMU RAM over JTAG on a live
 system: it wedged the PMU and then CPU0.
 
+**Reproduction attempt (2026-10-13, RPU_PLAN §11.1).**  Not reproduced in
+4.6 h and ~420 000 power-downs on cpu1–3 and then all four cores, quiet,
+under the chat load with a threaded burst load, and through the chat gates;
+the state saves ~9 mW idle.  A single CPU allowed into `cpu-sleep-0` never
+enters it (the hrtimer tick broadcast refuses the CPU that arms it).
+
 ## 19. One weight copy and dual-port decode: MatmulKernel GEMV (2026-09-27)
 
 **What.**  MatmulKernel gained a GEMV streaming mode (`gemv_kw`, `a_to_b`;

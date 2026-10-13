@@ -25,6 +25,26 @@ volatile struct rpu_ctrl rpu_ctrl __attribute__((section(".rpu_ctrl"), aligned(6
 
 enum { PROG_LOOP = 1, PROG_IRQ = 2, PROG_BATCH = 3, PROG_BATCH_DONE = 4 };
 
+/* The R5's PMU cycle counter: how long the firmware has been idle.  The RPU runs
+ * at 533 MHz on the KV260 (the BSP does not name the CPU clock), and the BSP's
+ * cpu_init.S sets PMCR.D: the counter ticks once per 64 cycles.  Returns the
+ * counts in RPU_IDLE_SPIN_US. */
+#define R5_CYCLES_PER_US 533u
+static uint32_t cycles_init(void)
+{
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(v));    /* PMCR */
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v | 1u)); /* E: counters on */
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(1u << 31));   /* PMCNTENSET: the cycle counter */
+    return RPU_IDLE_SPIN_US * R5_CYCLES_PER_US / ((v & 8u) ? 64u : 1u);
+}
+static inline uint32_t cycles(void)
+{
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v));    /* PMCCNTR */
+    return v;
+}
+
 static void rpu_batch(void)
 {
     const uint32_t n = rpu_ctrl.batch_words;
@@ -90,7 +110,7 @@ out:
 
 int main(void)
 {
-    uint32_t seen = 0u;
+    uint32_t seen = 0u, idle_from, idle_spin;
     int rc;
 
     rpu_ctrl.done_seq = 0u;
@@ -108,10 +128,15 @@ int main(void)
     }
     rpu_ctrl.magic = RPU_CTRL_MAGIC;
     __asm__ volatile("dsb" ::: "memory");
+    idle_spin = cycles_init();
+    idle_from = cycles();
 
+    /* Between commands: poll for RPU_IDLE_SPIN_US (the batches of one inference
+     * pay no wake-up), then sleep until the library rings (rpu_irq_idle). */
     while (rpu_ctrl.state != RPU_STATE_ERROR) {
         uint32_t seq = rpu_ctrl.cmd_seq;
         if (seq == seen) {
+            if (cycles() - idle_from > idle_spin) rpu_irq_idle(seen);
             __asm__ volatile("dsb" ::: "memory");
             continue;
         }
@@ -138,6 +163,7 @@ int main(void)
             rpu_ctrl.doorbells++;
         }
         if (rpu_ctrl.state == RPU_STATE_QUIT) break;
+        idle_from = cycles();
     }
     for (;;) { __asm__ volatile("wfi"); }
     return 0;

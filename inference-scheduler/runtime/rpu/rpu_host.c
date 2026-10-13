@@ -145,6 +145,7 @@ int main(int argc, char **argv)
            t_run / runs * 1e3, cpu_run / runs * 1e3);
     if (check) printf(", A53 mean %.3f ms (A53 CPU %.3f ms)", t_a53 / runs * 1e3, cpu_a53 / runs * 1e3);
     printf("; doorbell %s, %u sleeps", st.doorbell ? "on" : "off (spinning)", st.sleeps);
+    printf("; R5 idle sleeps %u, rings %u sent / %u taken", st.r5_sleeps, st.rings, st.r5_rings);
     printf("; batches %u, calls %u, waits %u; interrupts per lane:", st.batches, st.calls, st.waits);
     for (i = 0u; i < 5u; i++) printf(" %u", st.irq_count[i]);
     printf("; missed:");

@@ -222,7 +222,7 @@ all (139 ms of host time per 260 ms chunk today — on an R5 that would grow,
 | **A2 — descriptor chains + the ConvKernel output stride** | one bitstream: the unit's job list from DDR; `y` rows at a stride; the decode prep on the unit (`irope=True` gate) | WNS ≥ 0 at 4 ns; 135M decode ≤ 45 ms per token, the merges gone (prefill 256 ≤ 390 ms); every library bit-exact | 4 days incl. the build and campaign |
 | **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build — **DONE 2026-10-13 (§9), as a model-independent firmware replaying the library's recorded kernel calls: the six CNN demos bit-exact, interrupt-driven, +2–5 % on the real models (YOLO +4 %, MobileNet v2 +5 %)** | 5 days |
 | **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens — **DONE 2026-10-13 in the B1 design (§10): no RPMsg or sampler on the R5 (the A53 keeps the host ops and the output, by the user's direction); protocol v4 + the doorbell; every chat library, BERT and Piper gated bit-exact with the R5 driving; the chat server runs with it (`deploy.py --rpu`); decode +2 % (135M), the bench's A53 CPU 3 s instead of 10 s** | 5 days |
-| **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss | 2 days |
+| **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss — **started 2026-10-13 (§11): the A53 cores' power-down idle −9 mW (on, as a soak), the R5 asleep between commands (protocol v5) −50 mW idle; the APU clock, the PL and DDR next** | 2 days |
 | **A3 — the Piper and stereo features** | §3.3's unit features (unaligned row start, the windowed copy, the acts, the scaled add, long-row norms) and the correlation on ConvKernel; Piper's chunk and the stereo pass on the R5 | the chunk's host time ≤ 10 ms; stereo ≤ 450 ms; bit-exact | 2 weeks |
 
 Order: A1, then B1 and A2 in parallel (A2 is a bitstream; B1 needs none),
@@ -577,3 +577,93 @@ Next: B3 power — the A53 now sleeps during long batches, so the APU's
 frequency / idle policy can be measured against §6; the wake cost in the
 policy; and fewer, longer decode batches (the decode host ops onto the
 kernels, A2) so the A53 can sleep through a token.
+
+## 11. Track B3 — power, first measurements (2026-10-13)
+
+The INA260 (`hwmon2`, the carrier's 5 V rail) at 10 Hz, 60–90 s windows,
+the two settings of each comparison interleaved (A B A B) so drift cancels;
+the fan PWM and the SoC temperature logged with each window.
+
+### 11.1 The A53 cores' power-down idle state (`cpu-sleep-0`)
+
+Disabled since CHAT_PLAN §18 (a core parked in `psci_power_down_wfi`).  The
+hang was not reproduced in 4.6 h and ~420 000 power-downs: cpu1–3 quiet
+(57 k entries, 15 min), cpu1–3 under the chat load plus a threaded burst
+load that wakes cores early (186 k entries, 3 228 rejected, ~95 % woken
+before the 10 ms residency, 2 h), all four cores through the three chat gates
+(174 k, 49 min); the PMU firmware's node states only ever 1 / 2 / 3 in
+passing.  Under the R5-driven chat load the A53 is ~92 % idle, unlike the
+2026-09-26 load that hung (polled waits, host ops in four threads).
+
+Trap: with this kernel's hrtimer tick broadcast the CPU that arms the
+broadcast timer is refused deep idle (`tick_broadcast_enter` → busy, a silent
+fall-back to WFI), so a single CPU allowed into `cpu-sleep-0` never enters
+it — a test needs at least two.
+
+| | deep idle off | on | |
+|---|---:|---:|---|
+| idle chat server | 4.768 W | 4.760 W | −9 mW, fan constant |
+| back-to-back SmolLM2-135M chat | 6.206 W | 6.170 W | −36 mW, the fan 34 → 68 PWM across the windows |
+| decode, the three chat gates (R5 forced) | 51.1 / 132.2 / 51.1 ms/token | 52.2 / 135.0 / 52.1 | +2 %, bit-exact |
+
+Worth a few mW: not the lever.  Left on at runtime as a soak since
+2026-10-13 (the tmpfiles rule and `deploy.py` turn it off again).
+
+### 11.2 The R5 asleep between commands (protocol v5)
+
+The firmware polled the control block whenever no batch ran.  Protocol v5
+(`runtime/rpu/rpu_ctrl.h`): a library that has the `rpu_ipi` doorbell says
+so at attach (`a53_rings`); the firmware polls for `RPU_IDLE_SPIN_US` (1 ms)
+after a command, then sets `r5_sleeping`, fences, rechecks `cmd_seq` and
+sleeps in WFI with its IPI line (channel 1, GIC 65) unmasked and IRQs held
+off; after a submission the library fences and, when it finds
+`r5_sleeping`, rings — channel 7's TRIG with RPU0's bit (`rpu_irq_idle`, the
+third design's pattern of §10.2).  A v4 library refuses the v5 firmware and
+drives its kernels from the A53, so an old library never meets a sleeping
+R5.
+
+Trap: the BSP's `cpu_init.S` sets `PMCR.D` — the cycle counter ticks once
+per 64 cycles — so the first build's 20 µs spin was 1.3 ms.  1 ms is kept on
+purpose: the R5 sleeps between requests and once per decode token (the
+sampler and the server between tokens), not in the ~0.1 ms host-op gaps
+inside an inference, where a ring per gap would buy ~3 mW.
+
+| | board |
+|---|---:|
+| no server: the R5 off / polling / asleep | 4.555 / 4.672 / 4.624 W (asleep −48 mW; running at all costs 69 mW) |
+| idle chat server: R5 polling / asleep | 4.765 / 4.715 W (−50 mW) |
+| back-to-back 135M chat: polling / asleep | 6.177 / 6.177 W (the R5 sleeps ~20 times a second, once per token) |
+
+Every chat library (SmolLM2-135M / 360M, SmolVLM), Piper and the BERT
+project rebuilt with the v5 recorder and gated with the R5 forced:
+bit-exact; decode 52.2 / 135.1 / 52.1 ms/token and the prefills as with v4
+(no cost); 2 862 sleeps under the chat load, every one woken by its ring.
+
+The demo projects too (the six CNN demos given the v5 runtime files, the
+stereo and camera projects regenerated): `rpu_board.py --mode r5`, 50 runs
+each against the A53 — MNIST convnet / LeNet, ResNet-18, MobileNet v1 / v2,
+YOLOv5n and the camera's MobileNet v1 bit-exact; LightStereo-S (host-memory
+I/O: no `rpu_host`) through its own runner with the firmware up: the R5 drove
+it (1 035 batches, 22 590 calls), 468.8 ms per pair, EPE 0.667 px, the maps
+bit-exact against the simulation.  The cost of the sleep in those gates:
+R5 over A53 +0.6 / +0.7 / +1.4 / +1.7 % for ResNet-18 / MobileNet v1 / v2 /
+YOLO (+0.4 / +0.4 / +1.1 / +1.1 % with v4) and LeNet +6.5 % (+3.7 %) — the
+gate runs the A53 reference between the R5 runs, so the R5 sleeps before
+every run, and YOLO's host ops leave gaps over 1 ms; a wake seems to cost tens
+of µs, more than the interrupt itself should (open).
+
+The policy (§9.3) gained the v5 costs: `RUN_US` 61 µs once per inference
+(the R5 woken for the first batch, the A53 asleep on the doorbell through the
+last — the convnet, whose runs come back to back, shows the A53's ~23 µs, LeNet
+the R5's wake on top) and `WAKE_US` 38 µs for every further wake (a host
+interval over 1 ms in the timed replay).  LeNet: 82 µs = 6.7 % of 1.22 ms →
+the A53 again (it went to the R5 with v4's 21 µs); every other decision as
+before (decode 3.6 %, prefill ≤ 1.6 %, Piper's smallest encode bucket 4.8 %).
+A per-long-batch term was tried and dropped: the replay calls all 151 decode
+batches long, the board's doorbell count about a fifth.
+
+Where B3's 0.5 W has to come from: the idle board is ~4.7 W with the PL at
+250 MHz, the DDR, the carrier and the fan; the A53 cores' power-down and the
+R5's sleep together give ~60 mW.  Next: the APU clock (333 MHz between
+requests, `userspace` governor), the R5 stopped while no library is attached
+(69 mW), the PL clocks and DDR between requests.

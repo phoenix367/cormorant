@@ -16,6 +16,25 @@ least-squares fit, 1.0 µs a call and 10.6 µs a batch, is within 21 µs of
 every one.  (Protocol v3 — every register strongly ordered, the whole ring
 cleaned per batch — cost 8.4 µs and 61 µs.)
 
+Since protocol v5 (RPU_PLAN §11.2) the R5 sleeps after R5_IDLE_US without a
+command and each inference pays RUN_US once — the R5 woken for its first batch
+and the A53 asleep on the doorbell through its last, which waits for the
+outputs — and WAKE_US for every further wake, after a host interval longer
+than R5_IDLE_US.  Measured on 2026-10-13 evening (v5, the A53 cores' deep
+idle on, rpu_board.py --mode r5, R5 minus A53 per run): MNIST convnet +42 µs
+(its runs back to back: no R5 wake), LeNet +82 µs, ResNet-18 +112, MobileNet
+v1 +151 / +140, MobileNet v2 +245, YOLOv5n +825 (14 batches, 3.4 wakes): the
+convnet against LeNet gives the A53's share (~23 µs over the calls and the
+batch) and the R5's wake (~38 µs).  LeNet: 10 + 10.6 + 61 = 82 µs, 6.6 % of
+its 1.22 ms -> the A53.  The larger models' calls cost more than 1.0 µs
+(MobileNet v2 ~1.8: more registers change per call) and YOLO's long inner
+batches each ~30 µs more (the A53 asleep on the doorbell); neither is
+modelled — a per-long-batch term from the replay's batch lengths counted all
+151 decode batches of SmolLM2-135M as long where the board's doorbell count
+says about a fifth, and would have put decode on the A53 against the
+measurement (+1.2 ms, 2.4 %, on the R5) — and both only make large models'
+small shares larger.
+
 A model is "large" — the R5 drives it — when that overhead is at most
 MAX_OVERHEAD of its predicted inference time.  The prediction is the
 bitstream's performance model where one exists (perf_models/kv260/, as
@@ -34,6 +53,10 @@ from typing import Dict, Optional
 
 CALL_US = 1.0
 BATCH_US = 10.6
+RUN_US = 61.0                   # once per inference: the R5 woken for its first batch + the A53 asleep on
+                                # the doorbell through its last (the outputs)
+WAKE_US = 38.0                  # every further R5 wake: after a host interval longer than R5_IDLE_US
+R5_IDLE_US = 1000.0             # runtime/rpu/rpu_ctrl.h RPU_IDLE_SPIN_US
 MAX_OVERHEAD = 0.05
 MIN_CALLS_WITHOUT_MODEL = 32
 
@@ -134,8 +157,6 @@ def rpu_estimate(cg) -> dict:
             pending = False
     if pending:
         batches += 1
-    overhead_us = calls * CALL_US + batches * BATCH_US
-
     pm = _default_perf_model()
     hp = default_host_model_path()
     hm = HostModel.load(hp) if hp.exists() else HostModel()
@@ -156,6 +177,7 @@ def rpu_estimate(cg) -> dict:
 
     predicted_us: Optional[float] = None
     basis = "call count"
+    r5_wakes = 1 if calls else 0
     if calls:
         tl = simulate(cg, kernel_us, hm.us, events=events)
         basis = (f"performance model {pm.platform}/{pm.bitstream}" if pm is not None
@@ -163,18 +185,39 @@ def rpu_estimate(cg) -> dict:
         predicted_us = tl.total_us if tl.total_us > 0 else None
         if predicted_us is None:
             basis = "call count"
+        else:
+            r5_wakes = _r5_wakes(tl)
+    overhead_us = (calls * CALL_US + batches * BATCH_US
+                   + (RUN_US + (r5_wakes - 1) * WAKE_US if calls else 0.0))
     if predicted_us is not None:
         recommended = overhead_us <= MAX_OVERHEAD * predicted_us
     else:
         recommended = calls >= MIN_CALLS_WITHOUT_MODEL * max(1, batches)
-    return {"calls": calls, "batches": batches, "predicted_us": predicted_us,
-            "overhead_us": overhead_us, "recommended": bool(recommended and calls > 0), "basis": basis}
+    return {"calls": calls, "batches": batches, "r5_wakes": r5_wakes,
+            "predicted_us": predicted_us, "overhead_us": overhead_us,
+            "recommended": bool(recommended and calls > 0), "basis": basis}
+
+
+def _r5_wakes(tl) -> int:
+    """The R5's wake-ups per inference, from the timed replay: one at the start,
+    one after every host interval (back-to-back host ops merged) longer than
+    R5_IDLE_US that kernel work follows."""
+    host = sorted((t0, t1) for lane, _n, t0, t1, kind in tl.spans if lane == "CPU" and kind == "host")
+    merged = []
+    for t0, t1 in host:
+        if merged and t0 <= merged[-1][1] + 1e-6:
+            merged[-1][1] = max(merged[-1][1], t1)
+        else:
+            merged.append([t0, t1])
+    kernels = [t0 for lane, _n, t0, _t1, kind in tl.spans if kind == "kernel"]
+    return 1 + sum(1 for t0, t1 in merged if t1 - t0 > R5_IDLE_US and any(k >= t1 - 1e-6 for k in kernels))
 
 
 def header_lines(est: dict, suffix: str = "") -> list:
     """The policy as C macros (``suffix`` names the entry of a multi-entry project)."""
     pred = est["predicted_us"]
-    why = (f"{est['overhead_us'] / pred * 100:.1f} % of {pred / 1e3:.2f} ms predicted ({est['basis']})"
+    why = (f"{est['overhead_us'] / pred * 100:.1f} % of {pred / 1e3:.2f} ms predicted ({est['basis']}; "
+           f"{est['r5_wakes']} R5 wake(s))"
            if pred else f"no prediction: {est['calls']} calls, {est['batches']} batch(es)")
     return [
         f"#define INFERENCE_RPU_CALLS{suffix}         {est['calls']}u",
@@ -186,5 +229,6 @@ def header_lines(est: dict, suffix: str = "") -> list:
     ]
 
 
-__all__ = ("CALL_US", "BATCH_US", "MAX_OVERHEAD", "MIN_CALLS_WITHOUT_MODEL",
+__all__ = ("CALL_US", "BATCH_US", "RUN_US", "WAKE_US", "R5_IDLE_US",
+           "MAX_OVERHEAD", "MIN_CALLS_WITHOUT_MODEL",
            "estimate_us", "rpu_estimate", "header_lines")

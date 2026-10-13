@@ -19,6 +19,10 @@ void rpu_irq_start(uint32_t lane);
 void rpu_irq_batch_end(void);
 /* Block until the lane's most recent Start completed (WFI between interrupts). */
 void rpu_irq_wait(uint32_t lane);
+/* Between commands: sleep in WFI until the library rings (IPI channel 7 -> this
+ * core) — unless a command came already (cmd_seq != seen), the library cannot
+ * ring (a53_rings) or this core has no interrupt path.  Returns at once then. */
+void rpu_irq_idle(uint32_t seen);
 UINTPTR rpu_lane_base(uint32_t lane);
 
 #endif

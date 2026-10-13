@@ -17,34 +17,79 @@ def _cg(name):
 
 
 class TestDecision(unittest.TestCase):
-    """The rule on the measured board numbers (protocol v4, 2026-10-13, RPU_PLAN
-    §9.4): the overhead model and the 5 % limit keep the sub-millisecond models
-    (the MNIST convnet, chains of tiny calls) on the A53 and put LeNet and the
-    large models on the R5."""
+    """The per-call / per-batch fit on the protocol v4 board numbers (2026-10-13,
+    RPU_PLAN §9.4; every run back to back, the R5 never asleep)."""
 
-    CASES = [   # (calls, batches, A53 µs, R5 - A53 µs measured, R5?)
-        ("chain1", 1, 1, 9.0, 3.0, False),
-        ("chain16", 16, 1, 33.0, 21.0, False),
-        ("chain128", 128, 1, 220.0, 146.0, False),
-        ("mnist_convnet", 8, 1, 112.0, 17.0, False),
-        ("mnist_lenet", 10, 1, 1283.0, 11.0, True),
-        ("resnet18", 41, 1, 19982.0, 36.0, True),
-        ("mobilenet_v1", 57, 1, 20461.0, 47.0, True),
-        ("mobilenet_v2", 100, 1, 17462.0, 111.0, True),
-        ("yolov5n", 127, 14, 46955.0, 276.0, True),
+    CASES = [   # (calls, batches, A53 µs, R5 - A53 µs measured)
+        ("chain1", 1, 1, 9.0, 3.0),
+        ("chain16", 16, 1, 33.0, 21.0),
+        ("chain128", 128, 1, 220.0, 146.0),
+        ("mnist_convnet", 8, 1, 112.0, 17.0),
+        ("mnist_lenet", 10, 1, 1283.0, 11.0),
+        ("resnet18", 41, 1, 19982.0, 36.0),
+        ("mobilenet_v1", 57, 1, 20461.0, 47.0),
+        ("mobilenet_v2", 100, 1, 17462.0, 111.0),
+        ("yolov5n", 127, 14, 46955.0, 276.0),
     ]
 
-    def test_measured_models(self):
-        for name, calls, batches, us, _extra, r5 in self.CASES:
-            over = calls * rpu_policy.CALL_US + batches * rpu_policy.BATCH_US
-            self.assertEqual(over <= rpu_policy.MAX_OVERHEAD * us, r5, name)
-            # and the rule agrees with the measured overhead
-            self.assertEqual(_extra <= rpu_policy.MAX_OVERHEAD * us, r5, name)
-
     def test_overhead_fit(self):
-        for name, calls, batches, _us, extra, _r5 in self.CASES:
+        for name, calls, batches, _us, extra in self.CASES:
             over = calls * rpu_policy.CALL_US + batches * rpu_policy.BATCH_US
             self.assertLess(abs(over - extra), 25.0, name)
+
+
+class TestDecisionV5(unittest.TestCase):
+    """The rule on the protocol v5 board numbers (2026-10-13 evening, RPU_PLAN
+    §11.2; rpu_board.py --mode r5, the A53 reference run between the R5 runs, so
+    the R5 sleeps before each): the per-inference wake costs keep the
+    sub-millisecond MNIST convnet and LeNet on the A53 and put the large models on
+    the R5."""
+
+    CASES = [   # (calls, batches, R5 wakes per run, A53 µs, R5 - A53 µs measured, R5?)
+        ("mnist_convnet", 8, 1, 0, 114.0, 42.0, False),       # runs back to back: no R5 wake
+        ("mnist_lenet", 10, 1, 1, 1258.0, 82.0, False),
+        ("resnet18", 41, 1, 1, 19986.0, 112.0, True),
+        ("mobilenet_v1", 57, 1, 1, 20464.0, 151.0, True),
+        ("mobilenet_v2", 100, 1, 1, 17470.0, 245.0, True),
+        ("yolov5n", 127, 14, 3.4, 47292.0, 825.0, True),
+    ]
+
+    @staticmethod
+    def _model(calls, batches, wakes):
+        """The policy's overhead for that many R5 wakes (0: the A53's share of
+        RUN_US only)."""
+        return (calls * rpu_policy.CALL_US + batches * rpu_policy.BATCH_US + rpu_policy.RUN_US
+                + (wakes - 1) * rpu_policy.WAKE_US)
+
+    def test_measured_models(self):
+        for name, calls, batches, _w, us, extra, r5 in self.CASES:
+            over = self._model(calls, batches, 1)                  # the policy assumes one wake
+            self.assertEqual(over <= rpu_policy.MAX_OVERHEAD * us, r5, name)
+            self.assertEqual(extra <= rpu_policy.MAX_OVERHEAD * us, r5, name)
+
+    def test_small_models_fit(self):
+        """Within 25 µs where the calls are few; the larger models' calls cost
+        more than CALL_US (the model's share only grows: the decision holds)."""
+        for name, calls, batches, wakes, _us, extra, _r5 in self.CASES:
+            over = self._model(calls, batches, wakes)
+            if calls <= 41:
+                self.assertLess(abs(over - extra), 25.0, name)
+            else:
+                self.assertLess(over, extra, name)
+
+    def test_r5_wakes_from_the_replay(self):
+        """One wake at the start, one after each host interval longer than
+        R5_IDLE_US that kernel work follows (back-to-back host ops merged)."""
+        long_gap = rpu_policy.R5_IDLE_US + 100.0
+        spans = [("Conv", 1, 0.0, 50.0, "kernel"),
+                 ("CPU", 2, 60.0, 60.0 + long_gap / 2, "host"),
+                 ("CPU", 3, 60.0 + long_gap / 2, 60.0 + long_gap, "host"),    # merged with the one before
+                 ("Conv", 4, 70.0 + long_gap, 120.0 + long_gap, "kernel"),
+                 ("CPU", 5, 130.0 + long_gap, 140.0 + long_gap, "host"),     # short
+                 ("Conv", 6, 150.0 + long_gap, 160.0 + long_gap, "kernel"),
+                 ("CPU", 7, 170.0 + long_gap, 170.0 + 2 * long_gap, "host")]  # long, no kernel after it
+        tl = mock.Mock(spans=spans, total_us=170.0 + 2 * long_gap)
+        self.assertEqual(rpu_policy._r5_wakes(tl), 2)
 
 
 @unittest.skipUnless(_models_exist(), "Run test/gen_test_models.py first")
@@ -53,7 +98,8 @@ class TestEstimate(unittest.TestCase):
     def test_small_model_stays_on_the_a53(self):
         est = rpu_policy.rpu_estimate(_cg("mixed_matmul_relu.onnx"))
         self.assertEqual((est["calls"], est["batches"]), (2, 1))
-        self.assertAlmostEqual(est["overhead_us"], 2 * rpu_policy.CALL_US + rpu_policy.BATCH_US)
+        self.assertEqual(est["r5_wakes"], 1)
+        self.assertAlmostEqual(est["overhead_us"], 2 * rpu_policy.CALL_US + rpu_policy.BATCH_US + rpu_policy.RUN_US)
         self.assertFalse(est["recommended"])
 
     def test_large_prediction_goes_to_the_r5(self):

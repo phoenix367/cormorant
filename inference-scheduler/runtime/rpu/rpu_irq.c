@@ -22,6 +22,11 @@
  *
  * A kernel raises its line only while the R5 drives it (GIE): the lines are
  * shared with the APU, which may drive the same kernels between batches.
+ *
+ * Between commands the core sleeps the same way (rpu_irq_idle, protocol v5):
+ * the record is the control block's cmd_seq, the wake-up the library's ring —
+ * IPI channel 7 triggering this core's channel 1 — and the handler again only
+ * masks the line.
  */
 #include "rpu_ctrl.h"
 #include "rpu_irq.h"
@@ -97,6 +102,16 @@ static void fault_handler(void *ref)
 
 static volatile uint32_t s_sgi_count;
 static void sgi_isr(void *ref) { (void)ref; s_sgi_count++; }
+
+/* The library's ring (IPI channel 7 -> channel 1): mask the line, as for a kernel;
+ * rpu_irq_idle clears the ISR before it unmasks again. */
+static void ipi_isr(void *ref)
+{
+    (void)ref;
+    gic_mask(RPU_IPI_RPU0_GIC);
+    __asm__ volatile("dsb" ::: "memory");
+    if (s_ctrl) s_ctrl->r5_rings++;
+}
 
 /* The RPU GIC's state into the control block (the A53 cannot read 0xF9000000). */
 static void gic_dump(volatile uint32_t *g)
@@ -183,6 +198,18 @@ int rpu_irq_init(volatile struct rpu_ctrl *ctrl)
         Xil_Out32(s_kernels[i].base + CTRL_GIE, 0u);   /* the line: rpu_irq_start() .. batch end */
         gic_mask(id);                                   /* unmasked by a wait */
     }
+    /* The library's ring: only channel 7 as a source of this core's IPI channel. */
+    Xil_Out32(RPU_IPI_RPU0_IDR, ~RPU_IPI_CH7_BIT);
+    Xil_Out32(RPU_IPI_RPU0_ISR, RPU_IPI_CH7_BIT);
+    Xil_Out32(RPU_IPI_RPU0_IER, RPU_IPI_CH7_BIT);
+    XScuGic_SetPriorityTriggerType(&s_gic, RPU_IPI_RPU0_GIC, 0xA0u, 0x1u);
+    XScuGic_InterruptMaptoCpu(&s_gic, 0u, RPU_IPI_RPU0_GIC);
+    rc = XScuGic_Connect(&s_gic, RPU_IPI_RPU0_GIC, ipi_isr, NULL);
+    if (rc != XST_SUCCESS) return -13;
+    gic_mask(RPU_IPI_RPU0_GIC);                         /* unmasked by an idle sleep */
+    ctrl->r5_sleeping = 0u;
+    ctrl->r5_sleeps = 0u;
+    ctrl->r5_rings = 0u;
     Xil_ExceptionEnable();
     /* Self-test of the interrupt path: a software interrupt to this CPU. */
     XScuGic_Connect(&s_gic, 15u, sgi_isr, NULL);
@@ -252,4 +279,23 @@ void rpu_irq_wait(uint32_t k)
     }
     s_ctrl->wait_isr = Xil_In32(isr);
     s_inflight &= ~(1u << k);
+}
+
+void rpu_irq_idle(uint32_t seen)
+{
+    if (!s_sgi_count || s_ctrl->a53_rings != RPU_RINGS_MAGIC) return;   /* keep polling */
+    __asm__ volatile("cpsid i" ::: "memory");       /* no IRQ between the checks and the WFI */
+    Xil_Out32(RPU_IPI_RPU0_ISR, RPU_IPI_CH7_BIT);   /* a ring already served: cmd_seq is read below */
+    s_ctrl->r5_sleeping = 1u;
+    __asm__ volatile("dsb" ::: "memory");           /* the library sees it, or this sees its cmd_seq */
+    if (s_ctrl->cmd_seq == seen && s_ctrl->a53_rings == RPU_RINGS_MAGIC) {
+        gic_unmask(RPU_IPI_RPU0_GIC);
+        __asm__ volatile("dsb" ::: "memory");
+        if (s_ctrl->cmd_seq == seen) {
+            s_ctrl->r5_sleeps++;
+            __asm__ volatile("wfi" ::: "memory");   /* a pending IRQ wakes it, I set or not */
+        }
+    }
+    s_ctrl->r5_sleeping = 0u;
+    __asm__ volatile("cpsie i" ::: "memory");       /* the handler runs here: masks the line */
 }

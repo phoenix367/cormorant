@@ -18,7 +18,15 @@
  * (arming the kernels' interrupts around it) and answers done_seq = cmd_seq;
  * when the A53 set `wake` it then rings the doorbell — IPI channel 7, the
  * rpu_ipi UIO device of board/kv260/rpu/rpu-ipi.dts — so the A53 can sleep
- * through a long batch instead of polling.
+ * through a long batch instead of polling.  The other way round (protocol v5):
+ * a library that can ring the R5 says so at attach (a53_rings); the firmware,
+ * idle for RPU_IDLE_SPIN_US (1 ms) after a command, then sleeps in WFI with
+ * r5_sleeping set, and the library rings it after a submission that finds
+ * r5_sleeping — channel 7's TRIG with RPU0's bit, the R5's IPI interrupt
+ * (channel 1, GIC 65).  Both sides store, fence, then load the other's word,
+ * so a submission is never missed.  A library of another protocol version
+ * refuses to attach (the A53 drives its kernels): an older library would
+ * never ring a sleeping R5.
  * Each command is a header word followed by its payload:
  *
  *   RPU_OP_REGS  | lane << 8 | n << 16   then n words: the kernel's registers
@@ -40,7 +48,7 @@
 #include <stdint.h>
 
 #define RPU_CTRL_MAGIC     0x52505531u          /* "RPU1" */
-#define RPU_CTRL_VERSION   4u
+#define RPU_CTRL_VERSION   5u
 #define RPU_CTRL_A53_ADDR  0xFFE20000u           /* the BTCM as the A53 sees it */
 
 #define RPU_LANE_VECTOROP  0u
@@ -57,6 +65,16 @@
 #define RPU_IPI_RPU0_TRIG  0xFF310000u          /* RPU0's IPI channel (1): TRIG */
 #define RPU_IPI_CH7_BIT    (1u << 24)           /* destination: channel 7 (the PL0 agent, rpu_ipi) */
 #define RPU_IPI_SRC_RPU0   (1u << 8)            /* in channel 7's ISR / IER: from RPU0 */
+#define RPU_IPI_DST_RPU0   (1u << 8)            /* in channel 7's TRIG: to RPU0 (the R5's channel 1) */
+#define RPU_IPI_RPU0_ISR   0xFF310010u          /* the R5's channel: ISR (write 1 to clear) */
+#define RPU_IPI_RPU0_IER   0xFF310018u          /*                   IER (write 1 to enable) */
+#define RPU_IPI_RPU0_IDR   0xFF31001Cu          /*                   IDR (write 1 to disable) */
+#define RPU_IPI_RPU0_GIC   65u                  /* its interrupt on the RPU GIC (SPI 33) */
+#define RPU_RINGS_MAGIC    0x52494E47u          /* "RING": a53_rings, the library rings a sleeping R5 */
+#define RPU_IDLE_SPIN_US   1000u                /* the firmware polls this long after a command, then sleeps:
+                                                 * between requests and once per decode token, not in the
+                                                 * ~0.1 ms host-op gaps of an inference (a ring there would
+                                                 * cost more wake-ups than the few mW it saves) */
 #define RPU_REG_WORDS_MAX  60u                  /* a control block's argument registers: 0x10 .. 0xFF */
 #define RPU_CMD_OP(w)      ((w) & 0xFFu)
 #define RPU_CMD_LANE(w)    (((w) >> 8) & 0xFFu)
@@ -107,7 +125,12 @@ struct rpu_ctrl {
     uint32_t doorbells;        /* doorbells rung */
     uint32_t batch_pos;        /* the word index of the command the firmware executes (a hung
                                 * batch's position: the library prints the commands before it) */
-    uint32_t reserved[69];
+    uint32_t a53_rings;        /* A53 -> R5 at attach: RPU_RINGS_MAGIC when the library rings a
+                                * sleeping R5 (it has the rpu_ipi doorbell), else 0: the R5 polls */
+    uint32_t r5_sleeping;      /* R5 -> A53: 1 while the firmware sleeps between commands */
+    uint32_t r5_sleeps;        /* idle sleeps the firmware entered */
+    uint32_t r5_rings;         /* rings it took (its IPI interrupt) */
+    uint32_t reserved[65];
 };                             /* 512 bytes */
 _Static_assert(sizeof(struct rpu_ctrl) == 512u, "rpu_ctrl: the A53 and the R5 share this layout");
 

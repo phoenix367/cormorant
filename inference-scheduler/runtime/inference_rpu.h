@@ -94,6 +94,8 @@ typedef struct {
     uint32_t words;                   /* command words submitted */
     uint32_t sleeps;                  /* waits that slept on the doorbell */
     uint32_t doorbell;                /* 1: the rpu_ipi doorbell is there (else the A53 spins) */
+    uint32_t rings;                   /* this library's submissions that rang the sleeping R5 */
+    uint32_t r5_sleeps, r5_rings;     /* the firmware's idle sleeps and the rings it took (every library) */
 } inference_rpu_stats_t;
 int  inference_rpu_stats(inference_rpu_stats_t *out);   /* -1 when not attached */
 
