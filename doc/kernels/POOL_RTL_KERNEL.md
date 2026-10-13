@@ -3,7 +3,7 @@
 **Status (2026-10-05):** the hardware build's PoolingKernel since
 [POOL_RTL_PLAN](../plans/POOL_RTL_PLAN.md) phase 3 (bitstream
 `dbb320fb7297`); the Vitis HLS kernel's synthesis is retired, its C++
-([POOLING_KERNEL](POOLING_KERNEL.md)) is the reference model and fixture
+(`model/`, [POOLING_KERNEL](POOLING_KERNEL.md)) is the reference model and fixture
 generator.
 
 A drop-in replacement for the HLS kernel: the same IP (VLNV
@@ -179,7 +179,7 @@ padding, a group's first position can be padded while the second reads
 column bank 0 — and the HLS emitter let the padded position claim bank 0's
 read address (its `ucol` is 0), so the second position read word 0 of the
 bank instead of its own.  PoolingKernel.cpp now lets only an in-bounds
-position claim a bank (the fix changes no other output), TestPoolingSim has
+position claim a bank (the fix changes no other output), TestPoolModel has
 two cases for it (the old code fails both against the float reference), and
 they are fixtures 43–44.  The HLS IP in the production bitstream fails both
 on the test stand (8 / 40 and 9 / 72 outputs); no model of the test set or

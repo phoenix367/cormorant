@@ -3,12 +3,12 @@
 //
 // Runs element-wise jobs through the real AXI interfaces against sparse-memory
 // slave models with randomised timing and checks, per case:
-//   * with the HLS oracle (VO_HLS_ORACLE: the HLS kernel's own C++,
-//     kernels/vectorop/kernel/VectorOP.cpp, built with the Vitis HLS headers):
-//     every byte of the output region equals what the HLS kernel leaves there,
+//   * with the model oracle (VO_ORACLE: the C++ model,
+//     kernels/vectorop_rtl/model/src/VectorOP.cpp, built with the Vitis HLS headers):
+//     every byte of the output region equals what the model leaves there,
 //     run on the same DDR image — the written elements, the zeroed tail
 //     lanes and the untouched gaps alike;
-//   * fixtures (kernels/vectorop TestSimulation --dump-data): every element
+//   * fixtures (kernels/vectorop_rtl/model TestVectorOpModel --dump-data): every element
 //     inside a run equals c.hex, every tail lane is 0;
 //   * that nothing outside the output words was written, that a unary op
 //     issued nothing on gmem1, the AXI protocol on all ports, ap_done /
@@ -33,7 +33,7 @@
 
 #include "VVectorOPKernel.h"
 #include "axi_models.h"
-#ifdef VO_HLS_ORACLE
+#ifdef VO_ORACLE
 #include "VectorOP.h"
 #endif
 #if VM_TRACE
@@ -260,8 +260,8 @@ struct Tb {
       mem.wr16(t.b + 2 * i, i < t.bv.size() ? t.bv[i] : rnd16(t.data_mode));
     for (uint64_t i = 0; i < 8 * c_w; i++) mem.wr16(t.c + 2 * i, 0xDEAD);   // poison
 
-#ifdef VO_HLS_ORACLE
-    // ---- the HLS kernel on the same image ------------------------------------------
+#ifdef VO_ORACLE
+    // ---- the C++ model on the same image ------------------------------------------
     auto words_of = [&](uint64_t base, uint64_t n) {
       std::vector<VecWord> v(std::max<uint64_t>(n, 1) + 1);
       for (uint64_t w = 0; w < n; w++)
@@ -274,8 +274,9 @@ struct Tb {
       VectorOPKernel(pa, pb, pc, t.size, t.op, t.outer, t.a_inc, t.b_inc, t.act, t.alpha,
                      t.smx_cm, t.smx_cfg, t.smx_mask);
     }
-    // HLS C simulation and the synthesised HLS kernel differ in one DIV case:
-    // a = -128 (0x8000), b = -1/256 (0xFFFF).  C simulation divides in a 24-bit
+    // The model (the retired HLS kernel's C simulation) and the synthesised HLS
+    // kernel, which this RTL matches, differ in one DIV case: a = -128 (0x8000),
+    // b = -1/256 (0xFFFF).  The model divides in a 24-bit
     // sdiv, where (a << 8) / b = +2^23 wraps to -2^23 (saturating to 0x8000);
     // the hardware's divider is 25 bits wide (VectorOPKernel_sdiv_25s_16s_25),
     // so the quotient saturates to 0x7FFF.  The board runs the hardware: expect
@@ -344,7 +345,7 @@ struct Tb {
                      what, (unsigned long long)e, got, exp);
       bad++;
     };
-#ifdef VO_HLS_ORACLE
+#ifdef VO_ORACLE
     for (uint64_t w = 0; w < c_w; w++)
       for (int l = 0; l < 8; l++) {
         const uint16_t exp = (uint16_t)oc[w].range(16 * l + 15, 16 * l).to_uint();
@@ -495,7 +496,7 @@ static Case random_case(std::mt19937& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: manifest.txt + test_NN_{a,b,c}.hex (kernels/vectorop TestSimulation --dump-data)
+// Fixtures: manifest.txt + test_NN_{a,b,c}.hex (kernels/vectorop_rtl/model TestVectorOpModel --dump-data)
 // ---------------------------------------------------------------------------
 static std::vector<uint16_t> read_hex(const std::string& path) {
   std::ifstream f(path);
@@ -586,9 +587,9 @@ int main(int argc, char** argv) {
   }
 #endif
   tb.reset();
-#ifndef VO_HLS_ORACLE
-  std::printf("note: built without the HLS oracle (no Vitis HLS headers): fixtures only\n");
-  if (n_random) tb_fatal("--random needs the HLS oracle");
+#ifndef VO_ORACLE
+  std::printf("note: built without the model oracle (no Vitis HLS headers): fixtures only\n");
+  if (n_random) tb_fatal("--random needs the model oracle");
 #endif
 
   std::vector<Case> cases;

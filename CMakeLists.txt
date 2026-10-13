@@ -15,17 +15,18 @@ endif()
 project(axi_kernels)
 
 # ---------------------------------------------------------------------------
-# All four kernels in SystemVerilog (kernels/vectorop_rtl, kernels/conv_rtl,
-# kernels/matmul_rtl, kernels/pool_rtl); kernels/vectorop, kernels/conv,
-# kernels/matmul and kernels/pool keep the retired Vitis HLS kernels' C++ as
-# their reference models, testbench oracles and fixture generators.  Each
+# The five kernels in SystemVerilog (kernels/vectorop_rtl, kernels/conv_rtl,
+# kernels/matmul_rtl, kernels/pool_rtl, kernels/rowops_rtl).  The first four
+# carry their C++ reference model in model/ (the testbench oracle and the
+# fixture generator; it began as the retired Vitis HLS kernel).  Each
 # subdirectory is a self-contained CMake project.
 #
 # Simulation test targets (no hardware needed):
-#   make TestSimulation   — VectorOPKernel's C++ reference model
-#   make TestConvRef      — ConvKernel's C++ reference model
-#   make TestMatmulRef    — MatmulKernel   (TestMatmulBlas if BLAS available)
-#   make TestPoolingSim   — PoolingKernel's C++ reference model
+#   make TestVectorOpModel — VectorOPKernel's C++ reference model
+#   make TestConvModel     — ConvKernel's C++ reference model (TestConvModelGrid:
+#                            its MAC grid)
+#   make TestMatmulModel   — MatmulKernel's (TestMatmulModelBlas if BLAS available)
+#   make TestPoolModel     — PoolingKernel's C++ reference model
 #   make TestMatmulRtl    — MatmulKernel in SystemVerilog (kernels/matmul_rtl,
 #                           Verilator)
 #   make TestVectorOpRtl  — VectorOPKernel in SystemVerilog (kernels/vectorop_rtl,
@@ -58,10 +59,6 @@ include(AxiPlatform)
 # registered by every kernel subdirectory.
 enable_testing()
 
-add_subdirectory(kernels/vectorop)
-add_subdirectory(kernels/conv)
-add_subdirectory(kernels/matmul)
-add_subdirectory(kernels/pool)
 add_subdirectory(kernels/matmul_rtl)
 add_subdirectory(kernels/vectorop_rtl)
 add_subdirectory(kernels/pool_rtl)
@@ -72,7 +69,7 @@ add_subdirectory(kernels/rowops_rtl)
 # (kernels/vectorop_rtl; VLNV xilinx.com:hls:VectorOPKernel:1.0, the HLS
 # kernel's ports, register map and m_axi bus parameters).  The Vitis HLS
 # kernel's synthesis was retired (doc/plans/VECTOROP_RTL_PLAN.md phase 3);
-# kernels/vectorop keeps its C++ as the oracle and fixture generator.  The
+# its C++ is the reference model in kernels/vectorop_rtl/model.  The
 # phase-1 switch AXI_VECTOROP_IMPL is gone: a cache that still asks for hls
 # is refused.
 if(DEFINED CACHE{AXI_VECTOROP_IMPL})
@@ -88,8 +85,8 @@ endif()
 # The hardware build's MatmulKernel is the SystemVerilog one (kernels/matmul_rtl;
 # VLNV xilinx.com:hls:MatmulKernel:1.0, the HLS kernel's register map, gmem2
 # 128-bit).  The Vitis HLS kernel's synthesis was retired
-# (doc/plans/MATMUL_RTL_PLAN.md phase 4); kernels/matmul keeps its C++ model as
-# the oracle.  The platform JSON's kernels.matmul.impl tells the scheduler's
+# (doc/plans/MATMUL_RTL_PLAN.md phase 4); its C++ is the reference model in
+# kernels/matmul_rtl/model.  The platform JSON's kernels.matmul.impl tells the scheduler's
 # cost model which kernel the bitstream carries, so it must say rtl here.
 file(READ "${AXI_DEFAULT_PLATFORM_JSON}" _axi_pjson)
 string(JSON _axi_mm_impl ERROR_VARIABLE _axi_mm_err GET "${_axi_pjson}" kernels matmul impl)
@@ -102,8 +99,8 @@ endif()
 # The hardware build's PoolingKernel is the SystemVerilog one (kernels/pool_rtl;
 # VLNV xilinx.com:hls:PoolingKernel:1.0, the HLS kernel's ports, register map
 # and m_axi bus parameters).  The Vitis HLS kernel's synthesis was retired
-# (doc/plans/POOL_RTL_PLAN.md phase 3); kernels/pool keeps its C++ as the
-# oracle and fixture generator.  The phase-1 switch AXI_POOL_IMPL is gone: a
+# (doc/plans/POOL_RTL_PLAN.md phase 3); its C++ is the reference model in
+# kernels/pool_rtl/model.  The phase-1 switch AXI_POOL_IMPL is gone: a
 # cache that still asks for hls is refused.
 if(DEFINED CACHE{AXI_POOL_IMPL})
     if(NOT AXI_POOL_IMPL STREQUAL "rtl")
@@ -118,8 +115,8 @@ endif()
 # The hardware build's ConvKernel is the SystemVerilog one (kernels/conv_rtl;
 # VLNV xilinx.com:hls:ConvKernel:1.0, the HLS kernel's ports, register map and
 # m_axi bus parameters).  The Vitis HLS kernel's synthesis was retired
-# (doc/plans/CONV_RTL_PLAN.md phase 3); kernels/conv keeps its C++ as the
-# oracle and fixture generator.  No Vitis HLS kernel is left in the hardware
+# (doc/plans/CONV_RTL_PLAN.md phase 3); its C++ is the reference model in
+# kernels/conv_rtl/model.  No Vitis HLS kernel is left in the hardware
 # build.  The phase-1 switch AXI_CONV_IMPL is gone: a cache that still asks
 # for hls is refused.  The platform JSON's kernels.conv.impl tells the
 # scheduler's cost model which kernel the bitstream carries, so it must say
@@ -146,13 +143,14 @@ endif()
 # rebuild their executables.  This aggregate target does both.
 # ---------------------------------------------------------------------------
 set(_AXI_TEST_TARGETS
-    TestSimulation
-    TestConvRef
-    TestMatmulRef
-    TestPoolingSim
+    TestVectorOpModel
+    TestConvModel
+    TestConvModelGrid
+    TestMatmulModel
+    TestPoolModel
 )
-if(TARGET TestMatmulBlas)
-    list(APPEND _AXI_TEST_TARGETS TestMatmulBlas)
+if(TARGET TestMatmulModelBlas)
+    list(APPEND _AXI_TEST_TARGETS TestMatmulModelBlas)
 endif()
 if(TARGET TestMatmulRtl)
     list(APPEND _AXI_TEST_TARGETS TestMatmulRtl)

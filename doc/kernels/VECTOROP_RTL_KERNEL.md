@@ -3,7 +3,7 @@
 **Status (2026-10-05):** the hardware build's VectorOPKernel since
 [VECTOROP_RTL_PLAN](../plans/VECTOROP_RTL_PLAN.md) phase 3 (bitstream
 `68665fc1833a`); the Vitis HLS kernel's synthesis is retired, its C++
-([VECTOROP_KERNEL](VECTOROP_KERNEL.md)) is the reference model and fixture
+(`model/`, [VECTOROP_KERNEL](VECTOROP_KERNEL.md)) is the reference model and fixture
 generator.  **2026-10-06:** the activation unit (`vo_act`: LeakyReLU, SiLU,
 GELU, GELU tanh as ops 6–9 and acts 3–6, the `alpha` register;
 [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — verified out of context
@@ -83,7 +83,7 @@ HLS kernel, whose divider (`VectorOPKernel_sdiv_25s_16s_25`) is 25 bits
 wide.  HLS C simulation divides in 24 bits instead, so for a = 0x8000 (−128)
 and b = 0xFFFF (−1/256) — quotient +2²³ — C simulation wraps and saturates
 to 0x8000, while the hardware (and the RTL) gives 0x7FFF.  The testbench's
-oracle (the HLS C++) is corrected for exactly that input pair; the
+oracle (the C++ model) is corrected for exactly that input pair; the
 checked-in fixtures never divide by a negative number.
 
 **Geometry** — VectorOP.cpp's, word for word (8 lanes per 16-byte word):

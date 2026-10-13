@@ -413,7 +413,7 @@ static Case random_case(std::mt19937& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: manifest.txt + test_NN_{a,b,c}.hex (kernels/matmul TestMatmulRef --dump-data)
+// Fixtures: manifest.txt + test_NN_{a,b,c}.hex (kernels/matmul_rtl/model TestMatmulModel --dump-data)
 // ---------------------------------------------------------------------------
 static std::vector<uint16_t> read_hex(const std::string& path) {
   std::ifstream f(path);

@@ -8,14 +8,18 @@ include(AxiPlatform)
 get_filename_component(MM_RTL_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 enable_testing()
 
+# The C++ reference model: the testbench oracle, the fixture generator and its
+# tests (model/CMakeLists.txt).
+add_subdirectory(model)
+
 # ---------------------------------------------------------------------------
 # MatmulKernel in SystemVerilog — a drop-in replacement for the Vitis HLS
-# MatmulKernel (kernels/matmul): same VLNV, register map, DDR layouts and
+# MatmulKernel (its C++ model in model/): same VLNV, register map, DDR layouts and
 # arithmetic; gmem2 (C) is 128-bit.  See doc/kernels/MATMUL_RTL_KERNEL.md.
 #
 # Targets (each one only when its tool is found):
 #   TestMatmulRtl          Verilator testbench (vl/Vtb); ctest runs the
-#                          HLS-oracle fixtures + 200 random cases
+#                          fixtures + 200 random cases
 #   lint_matmul_rtl        verilator --lint-only -Wall
 #   perf_matmul_rtl        cycle counts of typical shapes (ideal memory)
 #   matmul_rtl_tb_fst      testbench with FST tracing (vlt/Vtb --trace F.fst)

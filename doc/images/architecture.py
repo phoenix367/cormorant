@@ -112,9 +112,9 @@ y = 130
 app_top = y
 rect(L, y, R - L, 96, APP_FILL, APP_STROKE, 2.5, 4)
 chips(L + 22, y + 16, R - L - 44, 64, [
-    ["Image classification", "ResNet-18 · MobileNet"], ["Camera", "MobileNet V1, live"],
-    ["MNIST", "ConvNet · LeNet"], ["Question answering", "BERT-base SQuAD"],
-    ["Chat server", "OpenAI API · SmolLM2"], ["Text to speech", "Piper (VITS)"]],
+    ["Image classification", "ResNet-18 · MobileNet"], ["Object detection", "YOLOv5n"],
+    ["Stereo depth", "LightStereo-S"], ["MNIST", "ConvNet · LeNet"],
+    ["Chat server", "LLM · VLM · BERT"], ["Text to speech", "Piper (VITS)"]],
     APP_CHIP, TITLE, gap=16, size=14, bold_first=True)
 app_bot = y + 96
 y = app_bot
@@ -129,7 +129,7 @@ rect(L, y, R - L, 92, SW_FILL, SW_STROKE, 2, 4)
 text(L + 20, y + 30, "Model libraries", 19, TITLE, "600", "start")
 text(L + 20, y + 58, "generated C, one per model", 13.5, "#4b5563", anchor="start")
 chips(L + 270, y + 16, R - L - 290, 60, [
-    ["CNN projects", "ResNet · MobileNet"], ["libbert_squad.so", "BERT-base"],
+    ["CNN projects", "ResNet · YOLO · stereo"], ["libbert_squad.so", "BERT-base"],
     ["libsmollm2.so", "SmolLM2 135M, 360M"], ["libsmolvlm_256m.so", "SmolVLM image chat"],
     ["libpiper_tts.so", "Piper TTS"]], SW_OLIVE, gap=14, size=13.5, bold_first=True)
 lib_bot = y + 92
@@ -140,17 +140,17 @@ rect(L, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(L + half / 2, y + 28, "Runtime — on the board", 19, TITLE, "600")
 cw = (half - 60) / 2
 rows = [[["XRT buffers in CMA", "cache clean / invalidate"], ["Kernel drivers", "Xilinx driver API, over UIO"]],
-        [["kernel_wait", "kernels on different lanes overlap"], ["Host ops in C", "Softmax · LayerNorm · attention"]],
-        [["Per-layer profiler", "INFERENCE_PROFILING"], ["Linux on the A53", "Ubuntu 22.04 · XRT 2.13"]]]
+        [["Call recorder", "kernel calls → the R5's ring"], ["Host ops in C", "attention · embeddings"]],
+        [["Cortex-R5 firmware", "replays calls · IRQ waits"], ["Linux on the A53", "Ubuntu 22.04 · XRT 2.13"]]]
 for r_i, row in enumerate(rows):
     for c_i, lines in enumerate(row):
         chip(L + 20 + c_i * (cw + 20), y + 52 + r_i * 66, cw, 56, lines, SW_CHIP, size=13.5, bold_first=True)
 x2 = L + half + 20
 rect(x2, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(x2 + half / 2, y + 28, "Inference scheduler — design time, on the host", 19, TITLE, "600")
-rows = [[["Frontends", "ONNX · Llama · ViT · Piper"], ["Graph + fusion", "LayerNorm · GELU"]],
-        [["Kernel mapping", "MatMul → ConvKernel · image"], ["DAG + event stream", "buffer pool coloring"]],
-        [["Fixed-point simulator", "the bit-exact expectations"], ["C code generator", "planning with --plan"]]]
+rows = [[["Frontends", "ONNX · Llama · ViT · Piper"], ["Graph + fusion", "LayerNorm · GELU · SiLU"]],
+        [["Kernel mapping", "five lanes · row ops"], ["DAG + event stream", "buffer pool coloring"]],
+        [["Fixed-point simulator", "the bit-exact expectations"], ["C code generator", "--plan · R5 policy"]]]
 for r_i, row in enumerate(rows):
     for c_i, lines in enumerate(row):
         chip(x2 + 20 + c_i * (cw + 20), y + 52 + r_i * 66, cw, 56, lines, SW_CHIP, size=13.5, bold_first=True)
@@ -163,30 +163,32 @@ sw_bot = y + 250
 y = sw_bot
 for cx in (L + 230, (L + R) / 2, R - 230):
     arrow_down(cx, y + 10, y + 52)
-note((L + R) / 2 + 30, y + 31, "drive the kernels: AXI-Lite registers · start · wait")
+note((L + R) / 2 + 30, y + 31, "drive the kernels — from the A53 or the R5")
 y += 62
 
 # hardware
 hw_top = y
 rect(L, y, R - L, 110, HW_FILL, HW_STROKE, 2.5, 4)
 text(L + 20, y + 40, "FPGA kernels", 19, TITLE, "600", "start")
-text(L + 20, y + 68, "HLS + SystemVerilog", 13.5, "#334155", anchor="start")
+text(L + 20, y + 68, "SystemVerilog", 13.5, "#334155", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 74, [
-    ["VectorOPKernel", "element-wise, 8 lanes"], ["MatmulKernel", "SystemVerilog, 128 MACs"],
-    ["ConvKernel", "16 × 16 MAC grid, 512 MACs"], ["PoolingKernel", "8 channel lanes"]],
-    HW_CHIP, TITLE, gap=18, size=14, bold_first=True)
+    ["VectorOPKernel", "8 lanes", "act · softmax"], ["MatmulKernel", "128 MACs", "GEMV"],
+    ["ConvKernel", "16 × 16 MAC grid", "512 MACs"], ["PoolingKernel", "8 channel lanes"],
+    ["RowOpsKernel", "row-ops unit", "norm · RoPE · add"]],
+    HW_CHIP, TITLE, gap=14, size=13.5, bold_first=True)
 y += 110
 for cx in (L + 330, (L + R) / 2, R - 330):
     arrow_both(cx, y + 8, y + 58)
-note((L + R) / 2 + 30, y + 33, "data: 128-bit AXI masters ⇄ DDR")
+note((L + R) / 2 + 30, y + 33, "128-bit AXI ⇄ DDR · IRQs")
 y += 66
 rect(L, y, R - L, 96, "#ffffff", "#c9cbd1", 2, 4)
 text(L + 20, y + 36, "Kria KV260", 19, TITLE, "600", "start")
 text(L + 20, y + 62, "Zynq UltraScale+ K26", 13.5, "#4b5563", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 60, [
-    ["Programmable logic", "kernels at 250 MHz"], ["4 × Arm Cortex-A53", "Linux, host ops"],
-    ["4 GB DDR4", "1 GB CMA for the kernels"], ["AXI HPC0 / HPC1", "weights on their own port"]],
-    BOARD_CHIP, TITLE, gap=18, size=14, bold_first=True)
+    ["Programmable logic", "kernels at 250 MHz"], ["4 × Cortex-A53", "Linux, host ops"],
+    ["Cortex-R5", "drives the kernels"], ["4 GB DDR4", "1 GB CMA"],
+    ["AXI HPC0/1 · HP0/2", "4 × 128-bit ports"]],
+    BOARD_CHIP, TITLE, gap=14, size=13.5, bold_first=True)
 hw_bot = y + 96
 y = hw_bot + 18
 rect(L, y, R - L, 44, "#e6dcfb", r=4)

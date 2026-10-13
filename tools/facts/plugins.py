@@ -4,7 +4,8 @@ Check plugins for interface facts (facts.yaml ``check: NAME``, ``args: {...}``).
 Each plugin is ``fn(args, ctx) -> [(level, message, where)]`` with level
 error | warn | info; facts.py turns them into the fact's findings.
 
-  register_map     a kernel's AXI-Lite registers: the HLS s_axilite ports, the
+  register_map     a kernel's AXI-Lite registers: the HLS s_axilite ports (or
+                   the C++ model's top-function parameters), the
                    generated driver header (when built), an RTL kernel's driver
                    table (its --check --json), the performance-model key
                    (src/perf_calls.FIELDS), the timeline's decoder table and
@@ -48,21 +49,35 @@ def _decode_keys(text: str) -> Dict[str, List[str]]:
     return {k: re.findall(r"(\w+):", body) for k, body in re.findall(r"(\w+): \{([^}]*)\}", m.group(1))}
 
 
+def _model_ports(text: str) -> List[str]:
+    """The s_axilite ports of a kernel's C++: its ``#pragma HLS INTERFACE
+    s_axilite`` ports, or — a C++ reference model carries no pragmas — the
+    parameters of its top function (the last ``void <Name>Kernel(...) {``),
+    each of which was an s_axilite port (the pointers' addresses, the scalars)."""
+    ports = [p for p in re.findall(r"#pragma HLS INTERFACE s_axilite port=(\w+)", text) if p != "return"]
+    if ports:
+        return ports
+    tops = re.findall(r"^void\s+\w+Kernel\s*\(([^)]*)\)\s*\{", text, re.M)
+    if not tops:
+        return []
+    params = [q.strip() for q in re.sub(r"//[^\n]*|/\*.*?\*/", "", tops[-1], flags=re.S).split(",")]
+    return [m.group(1) for q in params if (m := re.search(r"(\w+)\s*(?:\[[^\]]*\])*$", q))]
+
+
 def register_map(args: dict, ctx) -> List[Finding]:
     """A kernel's AXI-Lite registers against everything that names them.  The
     truth is the kernel the bitstream carries: the HLS source's s_axilite
     pragmas (``hls``), or for an RTL kernel its driver generator's register
     table (``rtl_driver``), which the generator checks against the RTL address
     constants (``rtl``); ``hls`` is then the C++ reference model, whose ports
-    must be the same."""
+    (its top function's parameters) must be the same."""
     out: List[Finding] = []
     kernel, prefix, hls = args["kernel"], args["prefix"], args.get("hls")
     hls_ports: List[str] = []
     if hls:
-        hls_ports = [p for p in re.findall(r"#pragma HLS INTERFACE s_axilite port=(\w+)", ctx.read(hls))
-                     if p != "return"]
+        hls_ports = _model_ports(ctx.read(hls))
         if not hls_ports:
-            return [("error", "no s_axilite ports found", hls)]
+            return [("error", "no s_axilite ports (or top-function parameters) found", hls)]
 
     rtl_regs = None
     if args.get("rtl_driver"):

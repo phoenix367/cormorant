@@ -589,7 +589,7 @@ class ScheduledNode:
 # (platforms/<AXI_PLATFORM>.json, ``kernels.matmul`` object — see
 # doc/kernels/MATMUL_KERNEL.md §3 for the field reference).  The resolver in
 # ``_matmul_hw_config`` reads the same file the C++ CMake build consumes
-# via ``matmul_load_constants()`` in kernels/matmul/CMakeLists.txt.
+# via ``matmul_load_constants()`` in kernels/matmul_rtl/model/CMakeLists.txt.
 # ---------------------------------------------------------------------------
 from ._matmul_hw_config import MATMUL_MAX_K, MATMUL_TILE_M  # noqa: E402
 
@@ -1072,7 +1072,7 @@ class MatmulNode:
 # (platforms/<AXI_PLATFORM>.json, ``kernels.conv`` object — see
 # doc/kernels/CONV_KERNEL.md §3 for the field reference).  The resolver in
 # ``_conv_hw_config`` reads the same file the C++ CMake build consumes via
-# ``conv_load_constants()`` in kernels/conv/CMakeLists.txt, so a CLI
+# ``conv_load_constants()`` in kernels/conv_rtl/model/CMakeLists.txt, so a CLI
 # invocation targeting a non-default board can stay in sync with
 # ``cmake -DAXI_PLATFORM=<name>``.
 # ---------------------------------------------------------------------------

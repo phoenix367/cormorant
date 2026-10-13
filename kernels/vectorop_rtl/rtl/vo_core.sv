@@ -3,7 +3,8 @@
 // top level is the Verilog wrapper VectorOPKernel.v (generated from this
 // header by scripts/gen_top_wrapper.py); all logic lives here.
 //
-// Drop-in replacement for the Vitis-HLS VectorOPKernel (kernels/vectorop):
+// Drop-in replacement for the Vitis-HLS VectorOPKernel (its C++ is the reference
+// model in kernels/vectorop_rtl/model):
 // same module / port names, AXI-Lite register map, DDR access pattern and
 // bit-identical results.  See doc/plans/VECTOROP_RTL_PLAN.md.
 //

@@ -2,7 +2,7 @@
 
 Many facts in this repo are stated in more than one place. The scheduler's test count is
 quoted in eleven places. The bitstream id is in twenty files. A kernel's registers are in its
-HLS source or RTL control block, its driver, the scheduler, two benchmarks, the calibration runner
+RTL control block and C++ reference model, its driver, the scheduler, two benchmarks, the calibration runner
 and the timeline viewer.
 
 `facts.yaml` (at the repo root) records, for each such fact, **where it is
@@ -19,7 +19,7 @@ python3 tools/facts/facts.py check              # every fact; exit 1 when one fa
 python3 tools/facts/facts.py check 'registers.*' -v
 python3 tools/facts/facts.py fix                # rewrite the stale mentions of `fix: auto` facts (--dry-run)
 python3 tools/facts/facts.py changed            # the facts this branch touches, checked, + their files you did not change
-python3 tools/facts/facts.py impact kernels/matmul/kernel/MatmulKernel.cpp   # what a file is part of
+python3 tools/facts/facts.py impact kernels/matmul_rtl/model/src/MatmulKernel.cpp   # what a file is part of
 python3 tools/facts/facts.py impact registers.MatmulKernel                   # what a fact ties together
 python3 tools/facts/facts.py verify             # re-measure recorded facts where they can be measured (local builds)
 python3 tools/facts/facts.py install-hook       # git commit checks the facts the staged files touch
@@ -146,15 +146,17 @@ The `fix` policy:
 | `json_excerpt` | `json`, `doc`, `start`, `complete` | A doc's copy of a JSON file (the first ```` ```json ```` / ```` ```jsonc ```` block after `start`, comments allowed): every value it shows equals the file's; with `complete` it shows every key |
 
 `register_map` checks that:
-- the kernel's registers — the HLS `s_axilite` ports (`hls`), or for an RTL
+- the kernel's registers — the HLS `s_axilite` ports (`hls`; a C++ reference
+  model without pragmas: its top function's parameters), or for an RTL
   kernel the table of its driver generator (`rtl_driver`,
-  `kernels/{matmul,vectorop,pool}_rtl/scripts/gen_driver.py`), which must match the address
+  `kernels/<k>_rtl/scripts/gen_driver.py`), which must match the address
   constants of its control block `rtl` (`--check --json`) — equal the driver
   header's, where the driver is built (a mismatch is a warning, because the
   header is a local artifact; with `rtl_driver` the offsets are compared too);
-- with both `rtl_driver` and `hls` (MatmulKernel, VectorOPKernel, PoolingKernel:
-  the HLS kernel's C++ is the RTL kernel's reference model), the HLS ports equal the
-  RTL registers;
+- with both `rtl_driver` and `hls` (MatmulKernel, VectorOPKernel, PoolingKernel,
+  ConvKernel: `hls` is the RTL kernel's C++ reference model,
+  `kernels/<k>_rtl/model/src/*.cpp`, which began as the HLS kernel), the model's
+  ports equal the RTL registers;
 - every port is a `src/perf_calls.FIELDS` field (through `fields_alias`) or
   is `not_keyed` with a reason;
 - the timeline's `DECODE` table decodes only FIELDS;

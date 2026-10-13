@@ -64,21 +64,28 @@ The FPGA design (`hw/cormorant_hw_128`, bitstream `1cedaf2ed816`) uses 67 % of t
 
 ## System architecture
 
-![Cormorant system architecture: the applications use the generated model libraries and the runtime on the board; the inference scheduler generates the libraries on the host; the four FPGA kernels run on the Kria KV260](doc/images/architecture.svg)
+![Cormorant system architecture: the applications use the generated model libraries and the runtime on the board; the inference scheduler generates the libraries on the host; the five FPGA kernels run on the Kria KV260, driven from the A53 or the Cortex-R5](doc/images/architecture.svg)
 
 The inference scheduler compiles each model into a C library on the host.
-On the board, the runtime drives the four FPGA kernels through XRT buffers
-and UIO drivers, and the Arm cores run what no kernel implements as host
-ops.  Every result is checked bit for bit against the scheduler's
-fixed-point simulation.  The diagram is drawn by
-[`doc/images/architecture.py`](doc/images/architecture.py).
+On the board, the library keeps the weights and buffers in XRT buffers and
+runs what no kernel implements as host ops on the Arm Cortex-A53 cores; its
+kernel calls go either straight to the five FPGA kernels or, for the larger
+models, to firmware on a Cortex-R5 core that replays them with
+interrupt-driven waits while the A53 sleeps.  Every result is checked bit
+for bit against the scheduler's fixed-point simulation.
+[`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) is the hardware architecture
+document (requirements, interconnect and control path, clocks and reset,
+memory, datapath, interfaces, verification, timing and utilization); the
+diagram is drawn by [`doc/images/architecture.py`](doc/images/architecture.py).
 
 ---
 
 ## Hardware kernels
 
-All four kernels are written in SystemVerilog (each a drop-in for the Vitis
-HLS kernel it replaced, whose C++ stays as the reference model).  All data
+All five kernels are written in SystemVerilog.  The first four are drop-ins
+for the Vitis HLS kernels they replaced, whose C++ stays as the reference
+model in each kernel's `model/` directory; the row-ops unit was written
+against an integer specification in Python.  All data
 ports are 128-bit AXI masters with 64-bit addresses and 16-byte-aligned
 bases, and the control registers are AXI-Lite.  The kernels close timing
 at 300 MHz out of context; the board runs them at 250 MHz (an MMCM in the
@@ -91,12 +98,17 @@ bounds come from [`platforms/kv260.json`](platforms/kv260.json).
 | **MatmulKernel** | `MatMul` | SystemVerilog: 2 × 64 DSP MACs (128 MAC/cycle) on panels of 8 A rows, packed-B weight layout (32-column tiles), K ≤ 4096, batched; image mode reads B in ConvKernel's layout through both read ports, so a weight shared with ConvKernel is stored once | [MATMUL_RTL_KERNEL](doc/kernels/MATMUL_RTL_KERNEL.md) |
 | **ConvKernel** | `Conv` (incl. depthwise), `MatMul`s routed here by the cost model | SystemVerilog: 16 × 16 MAC grid, two output pixels per cycle (512 MACs in 32 cascades of 16 DSP48E2), kernels ≤ 7×7, stride / dilation / padding / bias, ≤ 1024 in / 1280 out channels; a chunk's drain overlaps the next one's compute | [CONV_RTL_KERNEL](doc/kernels/CONV_RTL_KERNEL.md) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool` and the Global variants | SystemVerilog: 8 channel lanes, windows ≤ 7×7, two output positions per cycle, dilation, `count_include_pad` | [POOL_RTL_KERNEL](doc/kernels/POOL_RTL_KERNEL.md) |
+| **RowOpsKernel** (the row-ops unit) | `LayerNormalization`, BERT's `Transpose`s; the transformer frontends' residual adds, RMSNorms, SiLU · up, RoPE, dequantisation, KV-cache copies | SystemVerilog: 4 lanes per cycle on rows of ≤ 4096 elements, int32 residual rows and float32 output, per-column parameters and the sigmoid / rsqrt tables in UltraRAM; bit-exact with a Python integer specification | [ROWOPS_RTL_KERNEL](doc/kernels/ROWOPS_RTL_KERNEL.md), [HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md) |
 
 The Vivado block design (a git submodule, `hw/cormorant_hw_128`) streams the
 weights — ConvKernel `weight` / `bias` and MatmulKernel's second read port —
 and VectorOPKernel's second operand (`b`) through PS port `S_AXI_HPC1_FPD`; the
-other data ports share `S_AXI_HPC0_FPD`.  The `b` port's move made binary
-VectorOP calls 24–38 % faster ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)).
+other data ports share `S_AXI_HPC0_FPD`, except ConvKernel's `x`, which has
+`S_AXI_HP2_FPD` to itself, and the row-ops unit, on `S_AXI_HP0_FPD`.  The `b`
+port's move made binary VectorOP calls 24–38 % faster
+([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)); `x` on HP2 made the depthwise
+and few-channel 1 × 1 convolutions 27–67 % faster
+([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8).
 MatmulKernel reads A and B through both of its read ports.
 
 ---
@@ -186,17 +198,17 @@ git submodule update --init      # hw/: Vivado block design and RTL test stand (
 
 ### 2. C simulation of the kernels (no board needed)
 
-The kernel headers include the Vitis HLS headers, so source Vitis first.
+The reference models' headers include the Vitis HLS headers, so source Vitis first.
 
 ```bash
 source <Xilinx>/2025.2/Vitis/settings64.sh
 mkdir build && cd build && cmake ..
-make -j8     # every C-simulation executable (incl. TestMatmulBlas when a BLAS was found)
+make -j8     # every C-simulation executable (incl. TestMatmulModelBlas when a BLAS was found)
 ctest
 ```
 
-Or build them one by one: `make TestSimulation TestConvRef TestConvGrid
-TestMatmulRef TestPoolingSim` (the reference models; + `TestMatmulBlas` with a
+Or build them one by one: `make TestVectorOpModel TestConvModel TestConvModelGrid
+TestMatmulModel TestPoolModel` (the reference models; + `TestMatmulModelBlas` with a
 BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl` (the
 SystemVerilog kernels, with Verilator 5.x).
 
@@ -288,7 +300,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1820<!-- /fact --> tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
-| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the four RTL kernels) | `make -j8 && ctest` in `build/` |
+| Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
 | On-board kernel benchmarks | KV260 over SSH, bitstream loaded | `run_remote_perf.py --config perf_config.json` |

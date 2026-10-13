@@ -10,7 +10,7 @@ C code would reference geometries the kernel can't service.
 
 Source of truth: ``platforms/<AXI_PLATFORM>.json`` ``kernels.matmul``
 object, the same file the C++ CMake build reads (see
-``matmul_load_constants()`` in ``kernels/matmul/CMakeLists.txt``).
+``matmul_load_constants()`` in ``kernels/matmul_rtl/model/CMakeLists.txt``).
 Keeping a single JSON file as the single source means the Python
 validator and the C++ kernel build cannot drift apart.
 
@@ -43,8 +43,9 @@ Missing / malformed fields raise ``MatmulHwConfigError`` rather than
 silently falling back to defaults.
 
 ``impl`` names the MatmulKernel the platform's bitstream carries: ``"hls"``
-(the Vitis HLS kernel, ``kernels/matmul``) or ``"rtl"`` (the SystemVerilog
-one, ``kernels/matmul_rtl``).  The two run the same calls bit-identically
+(the retired Vitis HLS kernel, whose C++ is the reference model in
+``kernels/matmul_rtl/model``) or ``"rtl"`` (the SystemVerilog one,
+``kernels/matmul_rtl``).  The two run the same calls bit-identically
 but at different speeds, so it selects the engine cost model
 (``cost_model.py``) behind the automatic engine choices.  The hardware build
 packages only the RTL kernel and refuses any other value (the HLS kernel's
@@ -56,7 +57,7 @@ models the bitstreams built before (``caa67f49a5a3`` and older).  The
 ``tile_n``, ``tile_k`` are read but not exported to the validator: any
 ``n`` / ``m`` / ``k`` runs (residual-tile padded inside the kernel), so
 models cannot violate them; they are the HLS kernel's tiling (its C++
-model, ``kernels/matmul``, and the ``"hls"`` cost model), which the RTL
+model, ``kernels/matmul_rtl/model``, and the ``"hls"`` cost model), which the RTL
 kernel does not use.  ``tile_m`` is exported because the packed
 tile-major B layout the scheduler emits for constant weights
 (``MatmulNode.b_packed``) pads ``m`` to a multiple of it.  Only ``max_k`` is the

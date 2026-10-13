@@ -3,7 +3,7 @@
 **Status (2026-10-06):** the hardware build's ConvKernel since
 [CONV_RTL_PLAN](../plans/CONV_RTL_PLAN.md) phase 3 (first bitstream
 `c2b2a6e5e50e`; bit-exact on the board everywhere, phase 2).  The Vitis HLS
-kernel's synthesis is retired; its C++ ([CONV_KERNEL](CONV_KERNEL.md)) is the
+kernel's synthesis is retired; its C++ (`model/`, [CONV_KERNEL](CONV_KERNEL.md)) is the
 reference model, testbench oracle and fixture generator.  The scheduler
 prices this kernel with `cost_model.rtl_conv_walk` (§3; platform
 `kernels.conv.impl = "rtl"`).

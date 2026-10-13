@@ -3,8 +3,9 @@ test/test_inference.c are compiled unchanged against
 
   * software models of the VectorOPKernel, MatmulKernel, ConvKernel and
     RowOpsKernel drivers — the AXI-Lite register semantics of
-    kernels/vectorop/include/VectorOP.h, kernels/matmul/include/MatmulKernel.h
-    and kernels/conv/include/ConvKernel.h (ap_fixed<16,8>: exact products /
+    kernels/vectorop_rtl/model/include/VectorOP.h,
+    kernels/matmul_rtl/model/include/MatmulKernel.h and
+    kernels/conv_rtl/model/include/ConvKernel.h (ap_fixed<16,8>: exact products /
     sums, AP_TRN floor + AP_SAT on the result, C-style division; packed-B
     tile-major layout; ConvKernel's packed tile-major weights with the §2.34
     half last tile, depthwise stride, word-padded bias; NCHW x / y with

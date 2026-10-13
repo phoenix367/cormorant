@@ -2,7 +2,8 @@
 
 A SystemVerilog Q8.8 GEMM / GEMV engine for the Kria KV260
 (`kernels/matmul_rtl/`).  It replaces the Vitis HLS MatmulKernel
-([MATMUL_KERNEL](MATMUL_KERNEL.md), `kernels/matmul/`) without any change on
+([MATMUL_KERNEL](MATMUL_KERNEL.md); its C++ is the reference model in
+`kernels/matmul_rtl/model/`) without any change on
 the software side: the same IP name (VLNV `xilinx.com:hls:MatmulKernel:1.0`),
 the same AXI-Lite register map and driver API, the same DDR layouts and
 bit-identical results.  The one deliberate interface change is the C port

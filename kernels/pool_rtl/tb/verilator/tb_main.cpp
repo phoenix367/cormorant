@@ -4,19 +4,19 @@
 // Drives the IP top level PoolingKernel through its AXI4-Lite slave and serves
 // gmem0 (x, read) / gmem1 (y, write) from a sparse byte-addressed DDR model
 // with randomised ready / valid timing and read latency.  Checks per job:
-//   * with the HLS oracle (PL_HLS_ORACLE: the HLS kernel's own C++,
-//     kernels/pool/kernel/PoolingKernel.cpp, built with the Vitis HLS headers):
-//     every byte of the output region equals what the HLS kernel leaves there,
+//   * with the model oracle (PL_ORACLE: the C++ model,
+//     kernels/pool_rtl/model/src/PoolingKernel.cpp, built with the Vitis HLS headers):
+//     every byte of the output region equals what the model leaves there,
 //     run on the same DDR image — the written elements and the untouched
 //     lanes between runs alike;
-//   * fixtures (kernels/pool TestPoolingSim --dump-data): every output element
+//   * fixtures (kernels/pool_rtl/model TestPoolModel --dump-data): every output element
 //     equals y.hex;
 //   * that nothing outside the output elements was written, the AXI protocol
 //     (bursts never cross 4 KiB, WLAST, at most the declared outstanding
 //     bursts), ap_done / interrupt behaviour.
 // Jobs outside the contract (pool_h / pool_w > 7, a dilated window past the
-// line buffer) must write nothing; jobs with a zero size likewise (the HLS
-// kernel's behaviour there is not defined, so no oracle).
+// line buffer) must write nothing; jobs with a zero size likewise (the
+// model's behaviour there is not defined, so no oracle).
 //
 // Usage:
 //   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow|board|board2]
@@ -34,7 +34,7 @@
 
 #include "VPoolingKernel.h"
 #include "axi_models.h"
-#ifdef PL_HLS_ORACLE
+#ifdef PL_ORACLE
 #include "PoolingKernel.h"
 #endif
 #if VM_TRACE
@@ -208,8 +208,8 @@ struct Tb {
       mem.wr16(t.x + 2 * i, i < t.xv.size() ? t.xv[i] : rnd16(t.data_mode));
     for (uint64_t i = 0; i < 8 * yw; i++) mem.wr16(t.y + 2 * i, 0xDEAD);   // poison
 
-#ifdef PL_HLS_ORACLE
-    // ---- the HLS kernel on the same image ------------------------------------------
+#ifdef PL_ORACLE
+    // ---- the C++ model on the same image ------------------------------------------
     std::vector<PoolWord> ox(xw + 1), oy(yw + 1);
     for (uint64_t w = 0; w < xw; w++)
       for (int l = 0; l < 8; l++) ox[w].range(16 * l + 15, 16 * l) = mem.rd16(t.x + 16 * w + 2 * l);
@@ -281,7 +281,7 @@ struct Tb {
       bad++;
     };
     const bool expect_none = t.no_oracle || !in_contract(t);
-#ifdef PL_HLS_ORACLE
+#ifdef PL_ORACLE
     if (!t.no_oracle)
       for (uint64_t w = 0; w < yw; w++)
         for (int l = 0; l < 8; l++) {
@@ -401,7 +401,7 @@ static Case random_case(std::mt19937& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: manifest.txt + test_NN_{x,y}.hex (kernels/pool TestPoolingSim --dump-data)
+// Fixtures: manifest.txt + test_NN_{x,y}.hex (kernels/pool_rtl/model TestPoolModel --dump-data)
 // ---------------------------------------------------------------------------
 static std::vector<uint16_t> read_hex(const std::string& path) {
   std::ifstream f(path);
@@ -492,9 +492,9 @@ int main(int argc, char** argv) {
   }
 #endif
   tb.reset();
-#ifndef PL_HLS_ORACLE
-  std::printf("note: built without the HLS oracle (no Vitis HLS headers): fixtures only\n");
-  if (n_random) tb_fatal("--random needs the HLS oracle");
+#ifndef PL_ORACLE
+  std::printf("note: built without the model oracle (no Vitis HLS headers): fixtures only\n");
+  if (n_random) tb_fatal("--random needs the model oracle");
 #endif
 
   std::vector<Case> cases;

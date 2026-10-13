@@ -11,7 +11,7 @@ service.
 
 Source of truth: ``platforms/<AXI_PLATFORM>.json`` ``kernels.conv``
 object, the same file the C++ CMake build reads (see
-``conv_load_constants()`` in ``kernels/conv/CMakeLists.txt``).  Keeping a
+``conv_load_constants()`` in ``kernels/conv_rtl/model/CMakeLists.txt``).  Keeping a
 single JSON file as the single source means the Python validator and
 the C++ kernel build cannot drift apart.
 
@@ -49,8 +49,9 @@ Missing / malformed fields raise ``ConvHwConfigError`` rather than
 silently falling back to defaults.
 
 ``impl`` names the ConvKernel the platform's bitstream carries: ``"hls"``
-(the Vitis HLS kernel, ``kernels/conv``) or ``"rtl"`` (the SystemVerilog
-one, ``kernels/conv_rtl``).  The two run the same calls bit-identically but
+(the retired Vitis HLS kernel, whose C++ is the reference model in
+``kernels/conv_rtl/model``) or ``"rtl"`` (the SystemVerilog one,
+``kernels/conv_rtl``).  The two run the same calls bit-identically but
 at different speeds, so it selects the ConvKernel cycle model
 (``cost_model.py``) behind the automatic engine and geometry choices.  The
 hardware build packages only the RTL kernel (the HLS kernel's synthesis was

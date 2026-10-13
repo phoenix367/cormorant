@@ -1,5 +1,9 @@
 # VectorOP Kernel — Detailed Implementation Description
 
+*This file describes the C++ reference model in `kernels/vectorop_rtl/model/`:
+the retired Vitis HLS kernel's design (the model no longer carries the HLS
+pragmas named below).*
+
 ## Overview
 
 `VectorOPKernel` is a Vitis HLS kernel implementing runtime-selected
@@ -21,8 +25,8 @@ so once the streams are primed it sustains one word (8 elements) per clock
 > The bitstream carries a SystemVerilog drop-in with the same registers,
 > m_axi bus parameters, DDR access pattern and results,
 > `kernels/vectorop_rtl/`: [VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md).
-> This kernel's HLS synthesis target is gone; its C++ (`VectorOP.cpp`,
-> `TestSimulation`) stays as the reference model and writes the fixtures
+> This kernel's HLS synthesis target is gone; its C++ (`kernels/vectorop_rtl/model`:
+> `src/VectorOP.cpp`, `TestVectorOpModel`) stays as the reference model and writes the fixtures
 > the RTL kernel is tested against.  The register map, geometry and
 > arithmetic below hold for both kernels — with one exception, DIV of
 > −128 by −1/256: the hardware (this kernel's synthesised 25-bit divider and
@@ -49,7 +53,7 @@ the kernel requests whole word ranges (`read_request` of ≤ 64 words on
 `a` / `b`, `num_read_outstanding=16`; `write_request` of ≤ 256 words on
 `c`, `num_write_outstanding=16`, ≤ 8 responses outstanding) and extracts /
 packs the lanes itself.  **Alignment contract** (asserted by
-`TestSimulation`, guaranteed by the scheduler): every run start of `a`,
+`TestVectorOpModel`, guaranteed by the scheduler): every run start of `a`,
 `b` and `c` is 16-byte aligned — the base registers are 16-byte aligned and
 `a_inc` / `b_inc` are 0 or a multiple of 8 elements; `size` is arbitrary.
 Input lanes past the end of a run are read and masked to zero; the last
@@ -128,7 +132,7 @@ CMake substitutes the data type into `Config.h`:
 |----------|---------|---------|
 | `Data_t` | `ap_fixed<16,8>` | Element type (2-byte, range \[-128, 127.996\]) |
 | `kDataWidthBits` | 16 | Bit width of one element (byte width × 8; the lane width used by the kernel is `kDataBits` in `VectorOP.h`) |
-| `kSeed` | 42 | RNG seed for `TestSimulation` |
+| `kSeed` | 42 | RNG seed for `TestVectorOpModel` |
 
 `Data_t` is set by the CMake cache variable `VA_DATA_TYPE` (default
 `ap_fixed<16,8>`) and may be `float`, `double`, `half`, `uint8_t`, or any
@@ -235,7 +239,7 @@ above when they follow an op through `act`.
 
 ---
 
-## 7. Test Coverage (`TestSimulation.cpp`)
+## 7. Test Coverage (`TestVectorOpModel.cpp`)
 
 C-simulation tests compiled with GCC against the Vitis HLS headers (no
 Vitis tools run). Each case runs the kernel against a naive scalar
@@ -293,7 +297,7 @@ when a dependent op needs the result.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestSimulation && ctest -R TestSimulation
+make TestVectorOpModel && ctest -R TestVectorOpModel
 
 # the RTL fixtures (hw/test_data/vecop_test_data) from this model
 make gen_vectorop_test_data
@@ -312,10 +316,11 @@ kernel instead (`make package_vectorop_rtl`).
 
 | File | Purpose |
 |------|---------|
-| `kernels/vectorop/kernel/VectorOP.cpp` | the retired HLS kernel — four DATAFLOW stages on 128-bit words; the RTL kernel's reference model |
-| `kernels/vectorop/include/VectorOP.h` | Kernel declaration, `Op` / `Act` enums, `VecWord` lane helpers, alignment contract, `saturate_cast<T>` |
-| `kernels/vectorop/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`, `kSeed`) |
-| `kernels/vectorop/test/TestSimulation.cpp` | C simulation tests (GCC) |
+| `kernels/vectorop_rtl/model/src/VectorOP.cpp` | the C++ reference model (the retired HLS kernel without its pragmas) — four stages on 128-bit words; the RTL kernel's testbench oracle and fixture generator |
+| `kernels/vectorop_rtl/model/include/VectorOP.h` | Kernel declaration, `Op` / `Act` enums, `VecWord` lane helpers, alignment contract, `saturate_cast<T>` |
+| `kernels/vectorop_rtl/model/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `kDataWidthBits`, `kSeed`) |
+| `kernels/vectorop_rtl/model/test/TestVectorOpModel.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
+| `kernels/vectorop_rtl/model/CMakeLists.txt` | the model, `TestVectorOpModel`, `gen_vectorop_test_data` |
 | `kernels/vectorop_rtl/` | the SystemVerilog kernel of the hardware build ([VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md)) |
 | `inference-scheduler/src/nodes.py` | `ScheduledNode` class (ONNX → kernel params) |
 | `inference-scheduler/src/codegen/_source.py` | `run_op()` / `run_op_act()` code generation |

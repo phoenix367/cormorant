@@ -8,16 +8,20 @@ include(AxiPlatform)
 get_filename_component(CV_RTL_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 enable_testing()
 
+# The C++ reference model: the testbench oracle, the fixture generator and its
+# tests (model/CMakeLists.txt).
+add_subdirectory(model)
+
 # ---------------------------------------------------------------------------
 # ConvKernel in SystemVerilog — a drop-in for the Vitis HLS ConvKernel
-# (kernels/conv, whose C++ is the reference model): same VLNV, register map,
+# (whose C++ is the reference model in model/): same VLNV, register map,
 # m_axi bus parameters, DDR layouts and arithmetic.  See
 # doc/plans/CONV_RTL_PLAN.md.
 #
 # Targets (each one only when its tool is found):
 #   TestConvRtl            Verilator testbench (vl/Vtb); ctest runs the
 #                          fixtures + CV_RTL_RANDOM_CASES random jobs checked
-#                          against the HLS kernel's C++ (with the Vitis HLS headers)
+#                          against the C++ model (model/, with the Vitis HLS headers)
 #   lint_conv_rtl          verilator --lint-only -Wall
 #   perf_conv_rtl          cycle counts of the board's ConvKernel benchmarks (ideal memory)
 #   ConvRtlDsp             (ctest) cv_mac_chain's behavioural model against the
@@ -95,14 +99,14 @@ add_test(NAME ConvRtlDriver
          COMMAND "${Python3_EXECUTABLE}" "${CV_RTL_DIR}/scripts/gen_driver.py" --check)
 
 # ---------------------------------------------------------------------------
-# The HLS oracle: kernels/conv/kernel/ConvKernel.cpp built with the Vitis
+# The oracle: the C++ model (model/src/ConvKernel.cpp) built with the Vitis
 # HLS headers into the testbench (ap_fixed<16,8> / <32,16> and the platform's
 # bounds, as the bitstream).
 # ---------------------------------------------------------------------------
 find_path(CV_RTL_HLS_INCLUDE NAMES ap_fixed.h hls_burst_maxi.h
     HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include /mnt/data/xilinx/2025.2/Vitis/include
     NO_DEFAULT_PATH
-    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's HLS oracle")
+    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's oracle (the C++ model)")
 set(_cv_rtl_oracle_flags)
 set(_cv_rtl_oracle_src)
 if(CV_RTL_HLS_INCLUDE)
@@ -119,13 +123,13 @@ if(CV_RTL_HLS_INCLUDE)
         string(TOUPPER "CONV_${_k}" _var)
         string(JSON ${_var} GET "${_cv_rtl_pjson}" kernels conv ${_k})
     endforeach()
-    configure_file("${CV_RTL_REPO}/kernels/conv/include/Config.h.in" "${_cv_rtl_cfg}/Config.h")
-    set(_cv_rtl_oracle_src "${CV_RTL_REPO}/kernels/conv/kernel/ConvKernel.cpp")
-    set(_cv_rtl_oracle_flags -CFLAGS -DCV_HLS_ORACLE -CFLAGS -I${_cv_rtl_cfg}
-        -CFLAGS -I${CV_RTL_REPO}/kernels/conv/include -CFLAGS -I${CV_RTL_HLS_INCLUDE}
+    configure_file("${CV_RTL_DIR}/model/include/Config.h.in" "${_cv_rtl_cfg}/Config.h")
+    set(_cv_rtl_oracle_src "${CV_RTL_DIR}/model/src/ConvKernel.cpp")
+    set(_cv_rtl_oracle_flags -CFLAGS -DCV_ORACLE -CFLAGS -I${_cv_rtl_cfg}
+        -CFLAGS -I${CV_RTL_DIR}/model/include -CFLAGS -I${CV_RTL_HLS_INCLUDE}
         -CFLAGS -Wno-unused -CFLAGS -Wno-unknown-pragmas -CFLAGS -Wno-unused-parameter
         -CFLAGS -Wno-sign-compare)
-    message(STATUS "ConvKernel RTL: testbench oracle = the HLS kernel's C++ (${CV_RTL_HLS_INCLUDE})")
+    message(STATUS "ConvKernel RTL: testbench oracle = the C++ model (${CV_RTL_HLS_INCLUDE})")
     set(_cv_rtl_ctest_random --random ${CV_RTL_RANDOM_CASES})
 else()
     message(STATUS "ConvKernel RTL: Vitis HLS headers not found — the testbench checks the fixtures only")
@@ -163,13 +167,17 @@ if(CV_RTL_VERILATOR)
         add_custom_command(
             OUTPUT "${_out}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/${dir}"
+            # the oracle moved (kernels/conv -> model/, 2026-10-13): a build tree from before
+            # keeps ConvKernel.d / tb_main.d naming the old paths, which stops make; drop them
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "${CMAKE_CURRENT_BINARY_DIR}/${dir}/ConvKernel.d"
+                    "${CMAKE_CURRENT_BINARY_DIR}/${dir}/tb_main.d"
             COMMAND "${CV_RTL_VERILATOR}" --cc --exe --build -j ${_cv_rtl_jobs} ${opt}
                     --x-assign unique --x-initial unique ${ARGN} ${_cv_rtl_oracle_flags} ${CV_RTL_VFLAGS}
                     -Mdir "${CMAKE_CURRENT_BINARY_DIR}/${dir}" -o Vtb
                     "${CV_RTL_DIR}/tb/verilator/tb_main.cpp" ${_cv_rtl_oracle_src} ${CV_RTL_SOURCES}
             DEPENDS ${CV_RTL_SOURCES} ${CV_RTL_TB_SOURCES} "${CV_RTL_WAIVERS}" ${_cv_rtl_oracle_src}
-                    "${CV_RTL_REPO}/kernels/conv/include/ConvKernel.h"
-                    "${CV_RTL_REPO}/kernels/conv/include/ConvMacGrid.h"
+                    "${CV_RTL_DIR}/model/include/ConvKernel.h"
+                    "${CV_RTL_DIR}/model/include/ConvMacGrid.h"
             COMMENT "ConvKernel RTL: Verilator testbench -> ${dir}/Vtb"
             VERBATIM)
     endfunction()

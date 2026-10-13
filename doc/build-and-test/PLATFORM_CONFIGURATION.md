@@ -9,7 +9,7 @@ Two distinct consumers read the same JSON:
 
 | Consumer | Source | How it reads |
 |----------|--------|--------------|
-| **C++ / RTL build** (IP packaging part, the RTL kernels' bound checks, C-sim Config.h) | `kernels/<k>/CMakeLists.txt::<k>_load_constants()` | `string(JSON … GET … kernels <k> <field>)`; missing field → `FATAL_ERROR` |
+| **C++ / RTL build** (IP packaging part, the RTL kernels' bound checks, C-sim Config.h) | `kernels/<k>_rtl/model/CMakeLists.txt::<k>_load_constants()` (the C++ models), `kernels/<k>_rtl/CMakeLists.txt` (the RTL kernels) | `string(JSON … GET … kernels <k> <field>)`; missing field → `FATAL_ERROR` |
 | **Python scheduler** (model validation before codegen) | `inference-scheduler/src/_<k>_hw_config.py::resolve()` | `json.load`; missing field → `<Kernel>HwConfigError` |
 
 Keeping a single source means the Python validator and the C++ kernel
@@ -33,8 +33,8 @@ cmake .. -DAXI_PLATFORM=<platform>
 ```
 
 This picks `platforms/<platform>.json` as the source for the **default
-C-sim build** — the `Config.h` consumed by `make TestConvRef`,
-`make TestPoolingSim`, etc. is generated from this platform's bounds.
+C-sim build** — the `Config.h` consumed by `make TestConvModel`,
+`make TestPoolModel`, etc. is generated from this platform's bounds.
 
 Every JSON file in `platforms/` gets a `synthesize_<platform>` aggregate
 (the four kernel IPs) regardless of `AXI_PLATFORM`; the IPs themselves are
@@ -91,8 +91,8 @@ phase 3 the SystemVerilog kernel
 ([`CONV_RTL_KERNEL.md`](../kernels/CONV_RTL_KERNEL.md)), whose
 `rtl/cv_pkg.sv` holds every bound below as a constant (configure stops with
 a `FATAL_ERROR` when they differ: changing a bound means changing the RTL).
-The same fields size the HLS kernel's C++ model (`kernels/conv`, the
-reference and fixture generator): its line buffer, weight cache, bias
+The same fields size the C++ reference model (`kernels/conv_rtl/model`, the
+retired HLS kernel's C++; the reference and fixture generator): its line buffer, weight cache, bias
 buffer and persistent accumulator
 ([`CONV_KERNEL.md`](../kernels/CONV_KERNEL.md) §3).
 
@@ -130,8 +130,8 @@ phase 4 the SystemVerilog kernel
 ([`MATMUL_RTL_KERNEL.md`](../kernels/MATMUL_RTL_KERNEL.md)), which shares
 `tile_m` (the packed-B DDR tile), `max_k` (its `K_MAX`) and `gemv_max_m > 0`
 (the image path) with the retired HLS kernel.  `tile_n`, `tile_k` and the
-value of `gemv_max_m` size the HLS kernel's C++ model (`kernels/matmul`, the
-reference and fixture generator): its row-staging buffer
+value of `gemv_max_m` size the C++ reference model (`kernels/matmul_rtl/model`,
+the retired HLS kernel's C++; the reference and fixture generator): its row-staging buffer
 `a_buf[tile_n][max_k]` and B block buffer `b_tile[tile_m][2·tile_k]`
 ([`MATMUL_KERNEL.md`](../kernels/MATMUL_KERNEL.md) §2–§3).
 
@@ -180,8 +180,8 @@ The bitstream's PoolingKernel is the SystemVerilog one (`kernels/pool_rtl`,
 fields as constants in `rtl/pl_pkg.sv`, and configure compares them with
 the `AXI_PLATFORM` JSON and stops with a `FATAL_ERROR` when they differ —
 changing a `kernels.pool` field means changing the RTL.  The fields also size
-the retired HLS kernel's C++ (`kernels/pool`, the reference model and
-fixture generator).
+the C++ reference model (`kernels/pool_rtl/model`, the retired HLS kernel's
+C++; the reference and fixture generator).
 
 ---
 

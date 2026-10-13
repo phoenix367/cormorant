@@ -8,16 +8,20 @@ include(AxiPlatform)
 get_filename_component(PL_RTL_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 enable_testing()
 
+# The C++ reference model: the testbench oracle, the fixture generator and its
+# tests (model/CMakeLists.txt).
+add_subdirectory(model)
+
 # ---------------------------------------------------------------------------
 # PoolingKernel in SystemVerilog — a drop-in for the Vitis HLS PoolingKernel
-# (kernels/pool, whose C++ is the reference model): same VLNV, register map,
+# (whose C++ is the reference model in model/): same VLNV, register map,
 # m_axi bus parameters, DDR access pattern and arithmetic.  See
 # doc/plans/POOL_RTL_PLAN.md.
 #
 # Targets (each one only when its tool is found):
 #   TestPoolRtl            Verilator testbench (vl/Vtb); ctest runs the
 #                          fixtures + PL_RTL_RANDOM_CASES random jobs checked
-#                          against the HLS kernel's C++ (with the Vitis HLS headers)
+#                          against the C++ model (model/, with the Vitis HLS headers)
 #   lint_pool_rtl          verilator --lint-only -Wall
 #   perf_pool_rtl          cycle counts of typical jobs (ideal memory)
 #   pool_rtl_tb_fst        testbench with FST tracing (vlt/Vtb --trace F.fst)
@@ -91,14 +95,14 @@ add_test(NAME PoolRtlDriver
          COMMAND "${Python3_EXECUTABLE}" "${PL_RTL_DIR}/scripts/gen_driver.py" --check)
 
 # ---------------------------------------------------------------------------
-# The HLS oracle: kernels/pool/kernel/PoolingKernel.cpp built with the Vitis
+# The oracle: the C++ model (model/src/PoolingKernel.cpp) built with the Vitis
 # HLS headers into the testbench (ap_fixed<16,8> / <32,16> and the platform's
 # bounds, as the bitstream).
 # ---------------------------------------------------------------------------
 find_path(PL_RTL_HLS_INCLUDE NAMES ap_fixed.h hls_burst_maxi.h
     HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include /mnt/data/xilinx/2025.2/Vitis/include
     NO_DEFAULT_PATH
-    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's HLS oracle")
+    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's oracle (the C++ model)")
 set(_pl_rtl_oracle_flags)
 set(_pl_rtl_oracle_src)
 if(PL_RTL_HLS_INCLUDE)
@@ -115,12 +119,12 @@ if(PL_RTL_HLS_INCLUDE)
     string(JSON POOL_MAX_LINE_BUF_ROWS GET "${_pl_rtl_pjson}" kernels pool max_line_buf_rows)
     string(JSON POOL_MAX_LINE_BUF_COLS GET "${_pl_rtl_pjson}" kernels pool max_line_buf_cols)
     string(JSON POOL_OW_PARALLEL       GET "${_pl_rtl_pjson}" kernels pool ow_parallel)
-    configure_file("${PL_RTL_REPO}/kernels/pool/include/Config.h.in" "${_pl_rtl_cfg}/Config.h")
-    set(_pl_rtl_oracle_src "${PL_RTL_REPO}/kernels/pool/kernel/PoolingKernel.cpp")
-    set(_pl_rtl_oracle_flags -CFLAGS -DPL_HLS_ORACLE -CFLAGS -I${_pl_rtl_cfg}
-        -CFLAGS -I${PL_RTL_REPO}/kernels/pool/include -CFLAGS -I${PL_RTL_HLS_INCLUDE}
+    configure_file("${PL_RTL_DIR}/model/include/Config.h.in" "${_pl_rtl_cfg}/Config.h")
+    set(_pl_rtl_oracle_src "${PL_RTL_DIR}/model/src/PoolingKernel.cpp")
+    set(_pl_rtl_oracle_flags -CFLAGS -DPL_ORACLE -CFLAGS -I${_pl_rtl_cfg}
+        -CFLAGS -I${PL_RTL_DIR}/model/include -CFLAGS -I${PL_RTL_HLS_INCLUDE}
         -CFLAGS -Wno-unused -CFLAGS -Wno-unknown-pragmas)
-    message(STATUS "PoolingKernel RTL: testbench oracle = the HLS kernel's C++ (${PL_RTL_HLS_INCLUDE})")
+    message(STATUS "PoolingKernel RTL: testbench oracle = the C++ model (${PL_RTL_HLS_INCLUDE})")
     set(_pl_rtl_ctest_random --random ${PL_RTL_RANDOM_CASES})
 else()
     message(STATUS "PoolingKernel RTL: Vitis HLS headers not found — the testbench checks the fixtures only")
@@ -158,12 +162,16 @@ if(PL_RTL_VERILATOR)
         add_custom_command(
             OUTPUT "${_out}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/${dir}"
+            # the oracle moved (kernels/pool -> model/, 2026-10-13): a build tree from before
+            # keeps PoolingKernel.d / tb_main.d naming the old paths, which stops make; drop them
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "${CMAKE_CURRENT_BINARY_DIR}/${dir}/PoolingKernel.d"
+                    "${CMAKE_CURRENT_BINARY_DIR}/${dir}/tb_main.d"
             COMMAND "${PL_RTL_VERILATOR}" --cc --exe --build -j ${_pl_rtl_jobs} ${opt}
                     --x-assign unique --x-initial unique ${ARGN} ${_pl_rtl_oracle_flags} ${PL_RTL_VFLAGS}
                     -Mdir "${CMAKE_CURRENT_BINARY_DIR}/${dir}" -o Vtb
                     "${PL_RTL_DIR}/tb/verilator/tb_main.cpp" ${_pl_rtl_oracle_src} ${PL_RTL_SOURCES}
             DEPENDS ${PL_RTL_SOURCES} ${PL_RTL_TB_SOURCES} "${PL_RTL_WAIVERS}" ${_pl_rtl_oracle_src}
-                    "${PL_RTL_REPO}/kernels/pool/include/PoolingKernel.h"
+                    "${PL_RTL_DIR}/model/include/PoolingKernel.h"
             COMMENT "PoolingKernel RTL: Verilator testbench -> ${dir}/Vtb"
             VERBATIM)
     endfunction()

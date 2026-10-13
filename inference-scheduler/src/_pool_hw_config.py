@@ -10,7 +10,7 @@ reference geometries the kernel can't service.
 
 Source of truth: ``platforms/<AXI_PLATFORM>.json`` ``kernels.pool`` object,
 the same file the C++ CMake build reads (see ``pool_load_constants()`` in
-``kernels/pool/CMakeLists.txt``).  Keeping a single JSON file as the single
+``kernels/pool_rtl/model/CMakeLists.txt``).  Keeping a single JSON file as the single
 source means the Python validator and the C++ kernel build cannot drift
 apart — no parsing of ``CMakeLists.txt`` defaults, no dependency on
 ``CMakeCache.txt`` having been generated.

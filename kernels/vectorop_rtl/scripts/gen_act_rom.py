@@ -13,10 +13,10 @@
 # SiLU 2141 entries, GELU 829, GELU tanh 816; 3786 of a 4096 x 7 ROM, one
 # BRAM36 (4K x 9) per two lanes — and vo_act computes f(x) = max(x, 0) - m(|x|)
 # (0 past a function's segment).  Rounding: to nearest, ties to even, the C++
-# model's round_cast (kernels/vectorop/include/VectorOP.h).
+# model's round_cast (kernels/vectorop_rtl/model/include/VectorOP.h).
 #
 # The values come from the C++ model's formulas in IEEE double
-# (kernels/vectorop/kernel/VectorOP.cpp act_fn).  Every run asserts that no
+# (kernels/vectorop_rtl/model/src/VectorOP.cpp act_fn).  Every run asserts that no
 # Q8.8 input lies within 1e-9 LSB of a rounding tie — so any implementation
 # within a few ulp rounds alike (the nearest is 1.6e-5 LSB away) — and that the
 # identity above reproduces the direct formula for all 65 536 inputs; --exact

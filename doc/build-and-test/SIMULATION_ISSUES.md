@@ -225,7 +225,7 @@ The extra bytes (beyond `this.a_count * ELEM_BYTES`) should be filled with a kno
 
 Conversion: `raw = value × 256`, rounded and saturated to int16. The scheduler's encoder (`inference-scheduler/src/dtype.py`) rounds half to even; a C++ assignment to `ap_fixed<16,8>` (default `AP_TRN`) truncates toward −∞.
 
-**Arithmetic reference model (integer, matches HLS AP_TRN truncation).** Historical: an earlier VectorOPKernel bench computed expected values with this function, which predates the `act` register. The current benches compare against C-simulation goldens under `hw/test_data/{vecop,matmul,conv,pool}_test_data/` (VectorOP: `TestSimulation --dump-data`, target `gen_vectorop_test_data`), so `compute_op_result` no longer exists in any bench.
+**Arithmetic reference model (integer, matches HLS AP_TRN truncation).** Historical: an earlier VectorOPKernel bench computed expected values with this function, which predates the `act` register. The current benches compare against C-simulation goldens under `hw/test_data/{vecop,matmul,conv,pool}_test_data/` (VectorOP: `TestVectorOpModel --dump-data`, target `gen_vectorop_test_data`), so `compute_op_result` no longer exists in any bench.
 
 ```systemverilog
 function automatic logic [15:0] compute_op_result(

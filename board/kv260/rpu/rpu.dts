@@ -15,8 +15,9 @@
  * The firmware lives in the TCMs alone (no reserved DDR region, which an
  * overlay applied after boot could not register); its DMA buffers are a CMA
  * buffer the A53 allocates and names in the firmware's control block
- * (rpu/rpu_ctrl.h).  No mailbox: the control block is polled (RPMsg over
- * the IPI is track B2).  Power domains: PD_RPU_0 = 7, PD_R5_0_ATCM = 15,
+ * (rpu/rpu_ctrl.h).  No mailbox driver: the two doorbells are IPI channel 7
+ * (rpu-ipi.dts, the A53's end) and the R5's channel 1 (RPU_PLAN §10, §11.2).
+ * Power domains: PD_RPU_0 = 7, PD_R5_0_ATCM = 15,
  * PD_R5_0_BTCM = 16 (dt-bindings/power/xlnx-zynqmp-power.h).
  */
 /dts-v1/;

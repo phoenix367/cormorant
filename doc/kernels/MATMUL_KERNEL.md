@@ -1,5 +1,9 @@
 # Matmul Kernel — Detailed Implementation Description
 
+*This file describes the C++ reference model in `kernels/matmul_rtl/model/`:
+the retired Vitis HLS kernel's design (the model no longer carries the HLS
+pragmas named below, nor the co-simulation code).*
+
 ## Overview
 
 `MatmulKernel` is a Vitis HLS kernel implementing tiled matrix multiplication
@@ -24,8 +28,8 @@ reads, so a weight both kernels use needs one DDR copy.
 > The bitstream carries a SystemVerilog drop-in with the same registers,
 > layouts and results (128 MAC/cycle GEMM, 128-bit C port),
 > `kernels/matmul_rtl/`: [MATMUL_RTL_KERNEL](MATMUL_RTL_KERNEL.md).  This
-> kernel's HLS synthesis targets are gone; its C++ (`MatmulKernel.cpp`,
-> `ref_matmul_2d`, `TestMatmulRef`, `TestMatmulBlas`) stays as the reference
+> kernel's HLS synthesis targets are gone; its C++ (`kernels/matmul_rtl/model`:
+> `src/MatmulKernel.cpp`, `ref_matmul_2d`, `TestMatmulModel`, `TestMatmulModelBlas`) stays as the reference
 > model and writes the fixtures the RTL kernel is tested against.  The
 > register map, DDR layouts and arithmetic below hold for both kernels; the
 > microarchitecture, synthesis and resource sections describe the retired
@@ -381,9 +385,9 @@ widening the operands first, at one 16×16 DSP per column instead of two
 
 ---
 
-## 8. Test Coverage (`TestMatmulSim.cpp`)
+## 8. Test Coverage (`TestMatmulModel.cpp`)
 
-C-simulation tests compiled with GCC (CTest name `TestMatmulRef`, 58
+C-simulation tests compiled with GCC (CTest name `TestMatmulModel`, 58
 cases). Each case runs `MatmulKernel` against `ref_matmul_2d()` — a naive
 triple-nested-loop oracle that uses the same `AccData_t` accumulation and
 `saturate_cast<Data_t>` output, so results are bitwise-identical (exact
@@ -403,7 +407,7 @@ comparison).
 | Saturation | `a=100`, `b=±100`, `K=3` → `AP_MAX` / `AP_MIN` |
 | GEMV streaming (19) | `kw` 1 / 2 / 4 / 8 at the minimum plane (`m · kw = 64`); SmolLM2-135M / 360M decode shapes (`576×192`, `576×1536`, `1536×576`, `960×320`, `2560×960`); `K = kMaxK`; odd word counts; three A rows; 2 and 3 column chunks (`m > kGemvMaxM`); batch with both / B / A advancing; saturation at `K = 8` — B built as the kw image of the reference's row-major B |
 
-A second test, **`TestMatmulBlas.cpp`**, validates the configured kernel
+A second test, **`TestMatmulModelBlas.cpp`**, validates the configured model
 (`ap_fixed<16,8>`) bit-exactly against `cblas_sgemm` when a BLAS library is
 found at configure time: inputs are multiples of 2^-8 with |x| ≤ 0.25, so
 every partial sum over `K ≤ kMaxK` terms is an integer ≤ 2^24 in units of
@@ -476,7 +480,7 @@ the result.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestMatmulRef && ctest -R Matmul    # TestMatmulBlas too when BLAS is found; also the RTL kernel's TestMatmulRtl / MatmulRtlDriver
+make TestMatmulModel && ctest -R Matmul  # TestMatmulModelBlas too when BLAS is found; also the RTL kernel's TestMatmulRtl / MatmulRtlDriver
 make gen_matmul_test_data                # RTL fixtures → build/matmul_test_data/
 
 # the hardware: the RTL kernel (MATMUL_RTL_KERNEL.md)
@@ -495,11 +499,11 @@ flow) was removed in MATMUL_RTL_PLAN phase 4; the last HLS bitstream is
 
 | File | Purpose |
 |------|---------|
-| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel — tiled loop nest; the RTL kernel's C++ reference model |
-| `kernels/matmul/include/MatmulKernel.h` | Kernel declaration, `saturate_cast<T>` |
-| `kernels/matmul/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `AccData_t`, tile constants) |
-| `kernels/matmul/test/TestMatmulSim.cpp` | C simulation tests (GCC) |
-| `kernels/matmul/test/TestMatmulBlas.cpp` | configured kernel validated bit-exactly against `cblas_sgemm` |
+| `kernels/matmul_rtl/model/src/MatmulKernel.cpp` | the C++ reference model (the retired HLS kernel without its pragmas) — tiled loop nest; the RTL kernel's testbench oracle and fixture generator |
+| `kernels/matmul_rtl/model/include/MatmulKernel.h` | Kernel declaration, `saturate_cast<T>` |
+| `kernels/matmul_rtl/model/include/Config.h.in` | CMake template → `Config.h` (`Data_t`, `AccData_t`, tile constants) |
+| `kernels/matmul_rtl/model/test/TestMatmulModel.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
+| `kernels/matmul_rtl/model/test/TestMatmulModelBlas.cpp` | configured model validated bit-exactly against `cblas_sgemm` |
 | `platforms/kv260.json` | `kernels.matmul` bounds (`tile_n`, `tile_m`, `tile_k`, `max_k`, `gemv_max_m`) and `impl` (`"rtl"`: the kernel the bitstream carries) |
 | `inference-scheduler/src/_matmul_hw_config.py` | Scheduler-side reader of the same bounds |
 | `inference-scheduler/src/nodes.py` | `MatmulNode` class (ONNX → kernel params) |

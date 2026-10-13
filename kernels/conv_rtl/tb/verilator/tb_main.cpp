@@ -5,19 +5,19 @@
 // gmem0 (x), gmem1 (weight), gmem2 (bias) (reads) and gmem3 (y, write) from a
 // sparse byte-addressed DDR model with randomised ready / valid timing and
 // read latency.  Checks per job:
-//   * with the HLS oracle (CV_HLS_ORACLE: the HLS kernel's own C++,
-//     kernels/conv/kernel/ConvKernel.cpp, built with the Vitis HLS headers):
-//     every byte of the output region equals what the HLS kernel leaves there,
+//   * with the model oracle (CV_ORACLE: the C++ model,
+//     kernels/conv_rtl/model/src/ConvKernel.cpp, built with the Vitis HLS headers):
+//     every byte of the output region equals what the model leaves there,
 //     run on the same DDR image — the written elements and the untouched
 //     lanes past the tensor alike;
-//   * fixtures (kernels/conv TestConvRef --dump-data): every output element
+//   * fixtures (kernels/conv_rtl/model TestConvModel --dump-data): every output element
 //     equals y.hex;
 //   * that nothing outside the output elements was written, the AXI protocol
 //     (bursts never cross 4 KiB, WLAST, at most the declared outstanding
 //     bursts), ap_done / interrupt behaviour.
 // Jobs outside the contract (a window past the line buffer, kh or kw > 7, a
 // padded accumulator row past 65 536 entries) and jobs with a zero size must
-// write nothing (the HLS kernel's behaviour there is not defined, so no
+// write nothing (the model's behaviour there is not defined, so no
 // oracle).
 //
 // Usage:
@@ -27,7 +27,7 @@
 //       [--trace FILE]
 //   --case-file reads one --case geometry per line (17 numbers, then an
 //   optional label; '#' comments).  --only runs the listed cases (0-based
-//   positions in the list built above).  --no-oracle skips the HLS oracle
+//   positions in the list built above).  --no-oracle skips the model oracle
 //   (cycle counts only: the protocol and stray-write checks stay).
 // ---------------------------------------------------------------------------
 #include <algorithm>
@@ -41,7 +41,7 @@
 
 #include "VConvKernel.h"
 #include "axi_models.h"
-#ifdef CV_HLS_ORACLE
+#ifdef CV_ORACLE
 #include "ConvKernel.h"
 #endif
 #if VM_TRACE
@@ -230,7 +230,7 @@ struct Tb {
     }
   }
 
-  // logical weights -> the packed layout (TestConvSim pack_conv_weights)
+  // logical weights -> the packed layout (TestConvModel.cpp pack_conv_weights)
   std::vector<uint16_t> pack(const Case& t) {
     std::vector<uint16_t> out(w_elems(t), 0);
     if (t.dwm) {
@@ -269,8 +269,8 @@ struct Tb {
       mem.wr16(t.b + 2 * i, i < t.bv.size() ? t.bv[i] : (i < t.oc ? rnd16(t.data_mode) : 0));
     for (uint64_t i = 0; i < 8 * yw; i++) mem.wr16(t.y + 2 * i, 0xDEAD);   // poison
 
-#ifdef CV_HLS_ORACLE
-    // ---- the HLS kernel on the same image ------------------------------------------
+#ifdef CV_ORACLE
+    // ---- the C++ model on the same image ------------------------------------------
     std::vector<XWord> ox(xw + 1), oy(yw + 1);
     std::vector<WeightWord> ow_(ww + 1), ob(bw + 1);
     auto load = [&](auto& v, uint64_t base, uint64_t words) {
@@ -350,7 +350,7 @@ struct Tb {
       bad++;
     };
     const bool expect_none = t.no_oracle || !in_contract(t);
-#ifdef CV_HLS_ORACLE
+#ifdef CV_ORACLE
     if (!expect_none && !skip_oracle)
       for (uint64_t w = 0; w < yw; w++)
         for (int l = 0; l < 8; l++) {
@@ -487,7 +487,7 @@ static Case random_case(std::mt19937& rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: manifest.txt + test_NN_{x,w,b,y}.hex (kernels/conv TestConvRef --dump-data)
+// Fixtures: manifest.txt + test_NN_{x,w,b,y}.hex (kernels/conv_rtl/model TestConvModel --dump-data)
 // ---------------------------------------------------------------------------
 static std::vector<uint16_t> read_hex(const std::string& path) {
   std::ifstream f(path);
@@ -581,9 +581,9 @@ int main(int argc, char** argv) {
   }
 #endif
   tb.reset();
-#ifndef CV_HLS_ORACLE
-  std::printf("note: built without the HLS oracle (no Vitis HLS headers): fixtures only\n");
-  if (n_random) tb_fatal("--random needs the HLS oracle");
+#ifndef CV_ORACLE
+  std::printf("note: built without the model oracle (no Vitis HLS headers): fixtures only\n");
+  if (n_random) tb_fatal("--random needs the model oracle");
 #endif
 
   std::vector<Case> cases;

@@ -8,17 +8,21 @@ include(AxiPlatform)
 get_filename_component(VO_RTL_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 enable_testing()
 
+# The C++ reference model: the testbench oracle, the fixture generator and its
+# tests (model/CMakeLists.txt).
+add_subdirectory(model)
+
 # ---------------------------------------------------------------------------
 # VectorOPKernel in SystemVerilog — the hardware build's VectorOPKernel, a
-# drop-in for the retired Vitis HLS kernel (kernels/vectorop keeps its C++ as
-# the reference model): same VLNV, register map, m_axi bus parameters, DDR
+# drop-in for the retired Vitis HLS kernel (its C++ reference model is in
+# model/): same VLNV, register map, m_axi bus parameters, DDR
 # access pattern and arithmetic.  See doc/kernels/VECTOROP_RTL_KERNEL.md and
 # doc/plans/VECTOROP_RTL_PLAN.md.
 #
 # Targets (each one only when its tool is found):
 #   TestVectorOpRtl        Verilator testbench (vl/Vtb); ctest runs the
-#                          HLS-oracle fixtures + 300 random cases checked
-#                          against the HLS kernel's C++ (with the Vitis HLS headers)
+#                          fixtures + 300 random cases checked
+#                          against the C++ model (model/, with the Vitis HLS headers)
 #   lint_vectorop_rtl      verilator --lint-only -Wall
 #   perf_vectorop_rtl      cycle counts of typical jobs (ideal memory)
 #   vectorop_rtl_tb_fst    testbench with FST tracing (vlt/Vtb --trace F.fst)
@@ -83,13 +87,13 @@ add_test(NAME VectorOpRtlSmxRom
          COMMAND "${Python3_EXECUTABLE}" "${VO_RTL_DIR}/scripts/gen_smx_rom.py" --check)
 
 # ---------------------------------------------------------------------------
-# The HLS oracle: kernels/vectorop/kernel/VectorOP.cpp built with the Vitis
+# The oracle: the C++ model (model/src/VectorOP.cpp) built with the Vitis
 # HLS headers into the testbench (Data_t = ap_fixed<16,8>, as the bitstream).
 # ---------------------------------------------------------------------------
 find_path(VO_RTL_HLS_INCLUDE NAMES ap_fixed.h hls_burst_maxi.h
     HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include /mnt/data/xilinx/2025.2/Vitis/include
     NO_DEFAULT_PATH
-    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's HLS oracle")
+    DOC "Vitis HLS include directory (ap_fixed.h): the testbench's oracle (the C++ model)")
 set(_vo_rtl_oracle_flags)
 set(_vo_rtl_oracle_src)
 if(VO_RTL_HLS_INCLUDE)
@@ -97,12 +101,12 @@ if(VO_RTL_HLS_INCLUDE)
     set(VA_DATA_TYPE_INCLUDE "#include \"ap_fixed.h\"")
     set(VA_DATA_TYPE "ap_fixed<16,8>")
     set(VA_DATA_WIDTH_BITS 16)
-    configure_file("${VO_RTL_REPO}/kernels/vectorop/include/Config.h.in" "${_vo_rtl_cfg}/Config.h")
-    set(_vo_rtl_oracle_src "${VO_RTL_REPO}/kernels/vectorop/kernel/VectorOP.cpp")
-    set(_vo_rtl_oracle_flags -CFLAGS -DVO_HLS_ORACLE -CFLAGS -I${_vo_rtl_cfg}
-        -CFLAGS -I${VO_RTL_REPO}/kernels/vectorop/include -CFLAGS -I${VO_RTL_HLS_INCLUDE}
+    configure_file("${VO_RTL_DIR}/model/include/Config.h.in" "${_vo_rtl_cfg}/Config.h")
+    set(_vo_rtl_oracle_src "${VO_RTL_DIR}/model/src/VectorOP.cpp")
+    set(_vo_rtl_oracle_flags -CFLAGS -DVO_ORACLE -CFLAGS -I${_vo_rtl_cfg}
+        -CFLAGS -I${VO_RTL_DIR}/model/include -CFLAGS -I${VO_RTL_HLS_INCLUDE}
         -CFLAGS -Wno-unused -CFLAGS -Wno-unknown-pragmas)
-    message(STATUS "VectorOPKernel RTL: testbench oracle = the HLS kernel's C++ (${VO_RTL_HLS_INCLUDE})")
+    message(STATUS "VectorOPKernel RTL: testbench oracle = the C++ model (${VO_RTL_HLS_INCLUDE})")
     # every Q8.8 input through each activation (data mode 3: a[i] = i): LeakyReLU
     # at alpha 0.01 / 0.5 (ties), SiLU, GELU, GELU tanh, and acts after ADD / DIV;
     # every Q8.8 input through the softmax (32 rows of 2048) at two scales
@@ -148,12 +152,16 @@ if(VO_RTL_VERILATOR)
         add_custom_command(
             OUTPUT "${_out}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/${dir}"
+            # the oracle moved (kernels/vectorop -> model/, 2026-10-13): a build tree from before
+            # keeps VectorOP.d / tb_main.d naming the old paths, which stops make; drop them
+            COMMAND "${CMAKE_COMMAND}" -E rm -f "${CMAKE_CURRENT_BINARY_DIR}/${dir}/VectorOP.d"
+                    "${CMAKE_CURRENT_BINARY_DIR}/${dir}/tb_main.d"
             COMMAND "${VO_RTL_VERILATOR}" --cc --exe --build -j ${_vo_rtl_jobs} ${opt}
                     --x-assign unique --x-initial unique ${ARGN} ${_vo_rtl_oracle_flags} ${VO_RTL_VFLAGS}
                     -Mdir "${CMAKE_CURRENT_BINARY_DIR}/${dir}" -o Vtb
                     "${VO_RTL_DIR}/tb/verilator/tb_main.cpp" ${_vo_rtl_oracle_src} ${VO_RTL_SOURCES}
             DEPENDS ${VO_RTL_SOURCES} ${VO_RTL_TB_SOURCES} "${VO_RTL_WAIVERS}" ${_vo_rtl_oracle_src}
-                    "${VO_RTL_REPO}/kernels/vectorop/include/VectorOP.h"
+                    "${VO_RTL_DIR}/model/include/VectorOP.h"
             COMMENT "VectorOPKernel RTL: Verilator testbench -> ${dir}/Vtb"
             VERBATIM)
     endfunction()

@@ -3,7 +3,8 @@
 // level is the Verilog wrapper MatmulKernel.v (generated from this header by
 // scripts/gen_top_wrapper.py); all logic lives here.
 //
-// Drop-in replacement for the Vitis-HLS MatmulKernel (kernels/matmul): same
+// Drop-in replacement for the Vitis-HLS MatmulKernel (its C++ is the reference
+// model in kernels/matmul_rtl/model): same
 // module / port names, AXI-Lite register map and DDR layouts (row-major B,
 // tile-major packed B, GEMV kernel-width image), bit-identical results.
 // All three m_axi ports are 128 bits wide.  See doc/kernels/MATMUL_RTL_KERNEL.md.

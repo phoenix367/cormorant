@@ -149,8 +149,9 @@ and Pillow.
 
 ## 2. HLS C-sim (no hardware)
 
-Each kernel ships with a C++ reference test executed by `ctest`.  The
-kernel headers include the Vitis HLS headers, so source Vitis first:
+Each kernel's C++ reference model (`kernels/<k>_rtl/model/`; it began as
+the retired Vitis HLS kernel) ships with a test executed by `ctest`.  The
+model headers include the Vitis HLS headers, so source Vitis first:
 
 ```bash
 source <Xilinx>/2025.2/Vitis/settings64.sh
@@ -160,24 +161,24 @@ make -j8              # every C-simulation executable
 ctest                 # run all registered tests
 ```
 
-Plain `make` builds every test executable `ctest` registers: `TestSimulation`
-(VectorOPKernel), `TestConvRef` and `TestConvGrid` (ConvKernel, MAC-grid unit
-test), `TestMatmulRef` (MatmulKernel), `TestPoolingSim` (PoolingKernel) and,
-when a BLAS is found at configure time, `TestMatmulBlas`.  Or build them one
-by one: `make TestSimulation TestConvRef TestConvGrid TestMatmulRef
-TestPoolingSim` (+ `TestMatmulBlas`); a registered test whose executable is
+Plain `make` builds every test executable `ctest` registers: `TestVectorOpModel`
+(VectorOPKernel), `TestConvModel` and `TestConvModelGrid` (ConvKernel, MAC-grid unit
+test), `TestMatmulModel` (MatmulKernel), `TestPoolModel` (PoolingKernel) and,
+when a BLAS is found at configure time, `TestMatmulModelBlas`.  Or build them one
+by one: `make TestVectorOpModel TestConvModel TestConvModelGrid TestMatmulModel
+TestPoolModel` (+ `TestMatmulModelBlas`); a registered test whose executable is
 missing shows as *Not Run* and fails `ctest`.  `ctest` also runs
-`TestConvSweep` (`TestConvRef --sweep 300`, randomised geometries, ~1 min).
+`TestConvModelSweep` (`TestConvModel --sweep 300`, randomised geometries, ~1 min).
 
-These tests exercise the kernel C++ source directly without HLS
-synthesis, so they catch logic regressions in seconds.
+These tests exercise the C++ reference models directly, so they catch
+logic regressions in seconds.
 
 The SystemVerilog MatmulKernel (`kernels/matmul_rtl/`,
 [MATMUL_RTL_KERNEL](../kernels/MATMUL_RTL_KERNEL.md)) has two tests in the
 same `ctest` run when Verilator 5.x is installed (`sudo apt install
 verilator`): `TestMatmulRtl` builds the RTL with Verilator (~30 s, in plain
 `make`) and runs the 50 checked-in MatmulKernel fixtures — the ones
-`TestMatmulRef --dump-data` writes from `ref_matmul_2d` — plus 200 random
+`TestMatmulModel --dump-data` writes from `ref_matmul_2d` — plus 200 random
 cases against randomised AXI timing (~50 s); `MatmulRtlDriver` checks the C
 driver's register table against the RTL.  `make lint_matmul_rtl` is the
 Verilator lint; the testbench's own options (one case, a waveform, `--perf`)
@@ -186,16 +187,16 @@ are in the kernel's reference.
 The SystemVerilog VectorOPKernel (`kernels/vectorop_rtl/`,
 [VECTOROP_RTL_KERNEL](../kernels/VECTOROP_RTL_KERNEL.md)) likewise:
 `TestVectorOpRtl` (in plain `make`) runs the 119 checked-in VectorOP
-fixtures — the ones `TestSimulation --dump-data` writes — plus 300 random
-jobs checked against the HLS kernel's C++ under randomised AXI timing;
+fixtures — the ones `TestVectorOpModel --dump-data` writes — plus 300 random
+jobs checked against the C++ model under randomised AXI timing;
 `VectorOpRtlDriver` checks the C driver's register table against the RTL;
 `make lint_vectorop_rtl` is its lint.
 
 The SystemVerilog PoolingKernel (`kernels/pool_rtl/`,
 [POOL_RTL_KERNEL](../kernels/POOL_RTL_KERNEL.md)) likewise: `TestPoolRtl`
 (in plain `make`) runs the 45 checked-in PoolingKernel fixtures — the ones
-`TestPoolingSim --dump-data` writes — plus 200 random jobs checked against
-the HLS kernel's C++ under randomised AXI timing; `PoolRtlDriver` checks the
+`TestPoolModel --dump-data` writes — plus 200 random jobs checked against
+the C++ model under randomised AXI timing; `PoolRtlDriver` checks the
 C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
 
 The SystemVerilog RowOpsKernel (`kernels/rowops_rtl/`,
@@ -213,8 +214,8 @@ and are loaded from DDR once per bitstream; the fixtures' `tables.hex`);
 The SystemVerilog ConvKernel (`kernels/conv_rtl/`,
 [CONV_RTL_KERNEL](../kernels/CONV_RTL_KERNEL.md)) likewise: `TestConvRtl`
 (in plain `make`) runs the 63 checked-in ConvKernel fixtures — the ones
-`TestConvRef --dump-data` writes — plus 200 random jobs checked against the
-HLS kernel's C++ under randomised AXI timing; `ConvRtlDriver` checks the C
+`TestConvModel --dump-data` writes — plus 200 random jobs checked against the
+C++ model under randomised AXI timing; `ConvRtlDriver` checks the C
 driver's register table against the RTL; `ConvRtlDsp` (when Vivado's
 `DSP48E2.v` unisim model is found) runs the MAC chain's behavioural model
 against Vivado's DSP48E2 model cycle by cycle; `make lint_conv_rtl` is its

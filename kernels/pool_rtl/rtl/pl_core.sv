@@ -4,7 +4,8 @@
 // wrapper PoolingKernel.v (generated from this header by
 // scripts/gen_top_wrapper.py); all logic lives here.
 //
-// Drop-in replacement for the Vitis-HLS PoolingKernel (kernels/pool): same
+// Drop-in replacement for the Vitis-HLS PoolingKernel (its C++ is the reference
+// model in kernels/pool_rtl/model): same
 // module / port names, AXI-Lite register map, DDR access pattern and
 // bit-identical results.  See doc/plans/POOL_RTL_PLAN.md.
 //

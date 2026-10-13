@@ -6,8 +6,9 @@ logs, grouped by topic:
 
 ```
 doc/
+├── ARCHITECTURE.md   hardware architecture: requirements, interconnect, clocks / reset, memory, datapath, interfaces, verification, timing
 ├── build-and-test/   building, configuring and testing the hardware and software
-├── kernels/          the kernels (Conv in HLS, MatMul, VectorOP and Pool in RTL, with their retired HLS versions): reference + optimisation log
+├── kernels/          the five SystemVerilog kernels and the C++ reference models of four (the retired HLS kernels): reference + optimisation log
 ├── scheduler/        the ONNX-to-C inference scheduler
 ├── plans/            project plans and their results (chronological logs)
 └── images/
@@ -24,6 +25,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 
 | I want to… | Read |
 |---|---|
+| understand the hardware: the A53 ↔ R5 ↔ PL interconnect, clocks and reset, memory, datapath, interfaces, verification, timing and utilization | [ARCHITECTURE](ARCHITECTURE.md) |
 | build the C simulation, synthesise the kernels, make a bitstream or an overlay | [BUILD_TARGETS](build-and-test/BUILD_TARGETS.md) |
 | run the tests (host, RTL, board) | [TESTING](build-and-test/TESTING.md); on the board: [REMOTE_TESTING](../inference-scheduler/doc/REMOTE_TESTING.md) |
 | keep facts that code and docs repeat in step (counts, register maps, flags, bindings, pool sizes), or find what else a change must touch | [`tools/facts`](../tools/facts/README.md) (`facts.yaml`) |

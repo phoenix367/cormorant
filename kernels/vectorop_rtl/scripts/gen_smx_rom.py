@@ -7,7 +7,7 @@
 #
 # rounded to nearest, ties to even — the table of the specification
 # inference-scheduler/src/vectorop_smx.py and of the C++ model
-# (kernels/vectorop/include/VectorOP.h smx_table).  Every run asserts that the
+# (kernels/vectorop_rtl/model/include/VectorOP.h smx_table).  Every run asserts that the
 # two Python computations agree and that no entry lies within 1e-6 of a
 # rounding tie, so any exp2 within a few ulp gives the same table (the C++
 # model's std::exp2 among them).

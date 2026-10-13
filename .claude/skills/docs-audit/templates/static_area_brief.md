@@ -32,11 +32,12 @@ Counts measured on {{DATE}} — use these, do not re-run the suites:
 - **Docs only.**  Do not touch code, tests, configs or other areas' files.  If
   a doc is right and the CODE is wrong (a bug, a missing file), do not bend the
   doc to the bug — report it.
-- **Where to look.**  Kernels: `kernels/<k>/kernel/*.cpp`, `include/*.h`,
-  `kernels/<k>/CMakeLists.txt`, `platforms/kv260.json`, the generated register
-  maps `build*/kernels/<k>/kv260/**/drivers/*/src/x*_hw.h` (MatmulKernel,
-  VectorOPKernel and PoolingKernel: `kernels/{matmul,vectorop,pool}_rtl/rtl/*.sv`,
-  `build*/kernels/{matmul,vectorop,pool}_rtl/driver/`).  Scheduler:
+- **Where to look.**  Kernels: `kernels/<k>_rtl/rtl/*.sv`,
+  `kernels/<k>_rtl/CMakeLists.txt`, the C++ reference models
+  `kernels/<k>_rtl/model/{src,include,test}/` and their
+  `model/CMakeLists.txt`, `platforms/kv260.json`, the register maps
+  `kernels/<k>_rtl/rtl/*_ctrl_s_axi.sv` and the generated drivers
+  `build*/kernels/<k>_rtl/driver/`.  Scheduler:
   `inference-scheduler/src/`, `inference_scheduler.py --help`, `test/`.  Build:
   the CMakeLists, `make help` in a configured build dir.  Demos: the scripts'
   `--help` and the `*.json.example` files.  History of a fact: `git log -S`.

@@ -13,8 +13,9 @@ cmake ..
 ```
 
 Each kernel also configures on its own, with the same target names
-(`cmake -S kernels/<k> -B <dir>` for `vectorop`, `conv`, `pool`, `matmul`,
-`matmul_rtl`, `vectorop_rtl`, `pool_rtl`, `conv_rtl`): `cmake/AxiPlatform.cmake`, which the top level includes too,
+(`cmake -S kernels/<k> -B <dir>` for `matmul_rtl`, `vectorop_rtl`,
+`pool_rtl`, `conv_rtl` — each with its C++ reference model, `model/` — and
+`cmake -S kernels/<k>_rtl/model -B <dir>` for a model alone): `cmake/AxiPlatform.cmake`, which the top level includes too,
 sets `AXI_BUS_WIDTH`, `AXI_PLATFORM` and the platform list.
 
 Key configure-time cache variables:
@@ -43,16 +44,16 @@ targets. Rarely built directly.
 
 | Target | Description |
 |--------|-------------|
-| `vadd_kernel` | VectorOPKernel's C++ model (the retired HLS kernel; the RTL kernel's reference) |
-| `conv_kernel` | ConvKernel's C++ model (the retired HLS kernel; the RTL kernel's reference) — configured type (`ap_fixed<16,8>` by default) |
-| `matmul_kernel` | MatmulKernel's C++ model (the retired HLS kernel; the RTL kernel's reference) — configured type (`ap_fixed<16,8>` by default) |
-| `pool_kernel` / `pool_kernel_float` | PoolingKernel's C++ model (the retired HLS kernel; the RTL kernel's reference) — configured type / forced-`float` builds |
+| `vectorop_model` | VectorOPKernel's C++ reference model (`kernels/vectorop_rtl/model`; it began as the retired HLS kernel) |
+| `conv_model` | ConvKernel's C++ reference model (`kernels/conv_rtl/model`; it began as the retired HLS kernel) — configured type (`ap_fixed<16,8>` by default) |
+| `matmul_model` | MatmulKernel's C++ reference model (`kernels/matmul_rtl/model`; it began as the retired HLS kernel) — configured type (`ap_fixed<16,8>` by default) |
+| `pool_model` / `pool_model_float` | PoolingKernel's C++ reference model (`kernels/pool_rtl/model`; it began as the retired HLS kernel) — configured type / forced-`float` builds |
 
-`pool_kernel_float` forces `Data_t=float` regardless of HLS availability;
+`pool_model_float` forces `Data_t=float` regardless of HLS availability;
 no test target links it.  ConvKernel and MatmulKernel have no float
 variant: their 128-bit ports pack 16-bit elements, so the kernels only
-build with a 16-bit `Data_t` (`TestMatmulBlas` drives the configured
-`matmul_kernel`).
+build with a 16-bit `Data_t` (`TestMatmulModelBlas` drives the configured
+`matmul_model`).
 
 ---
 
@@ -63,12 +64,12 @@ no hardware.
 
 | Target | Kernel | Description |
 |--------|--------|-------------|
-| `TestSimulation` | VectorOPKernel (C++ model) | All 6 ops across sizes + saturation cases + broadcast / stride-0 / `act` geometry cases |
-| `TestConvRef` | ConvKernel (C++ model) | Model vs naive reference oracle; also registered as the CTest test `TestConvSweep` (`TestConvRef --sweep 300`, randomised geometries, ~1 min) |
-| `TestConvGrid` | ConvKernel (C++ model) | MAC-grid unit test on `include/ConvMacGrid.h` alone |
-| `TestMatmulRef` | MatmulKernel (C++ model) | Model vs the `ref_matmul_2d` / `ref_matmul_batch` oracle, all shape cases; `--dump-data` writes the RTL fixtures |
-| `TestMatmulBlas` | MatmulKernel | configured kernel vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
-| `TestPoolingSim` | PoolingKernel (C++ model) | Max/Average/Lp pooling + global variants; `--dump-data` writes the RTL fixtures |
+| `TestVectorOpModel` | VectorOPKernel (C++ model) | All 6 ops across sizes + saturation cases + broadcast / stride-0 / `act` geometry cases |
+| `TestConvModel` | ConvKernel (C++ model) | Model vs naive reference oracle; also registered as the CTest test `TestConvModelSweep` (`TestConvModel --sweep 300`, randomised geometries, ~1 min) |
+| `TestConvModelGrid` | ConvKernel (C++ model) | MAC-grid unit test on `include/ConvMacGrid.h` alone |
+| `TestMatmulModel` | MatmulKernel (C++ model) | Model vs the `ref_matmul_2d` / `ref_matmul_batch` oracle, all shape cases; `--dump-data` writes the RTL fixtures |
+| `TestMatmulModelBlas` | MatmulKernel (C++ model) | configured model vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
+| `TestPoolModel` | PoolingKernel (C++ model) | Max/Average/Lp pooling + global variants; `--dump-data` writes the RTL fixtures |
 | `TestMatmulRtl` | MatmulKernel (RTL) | Verilator testbench of the SystemVerilog kernel; the CTest test runs the 50 checked-in fixtures + 200 random cases (~50 s) — only if Verilator 5.x is found ([below](#rtl-matmulkernel-systemverilog)) |
 | `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 201 checked-in fixtures, 300 random jobs and 8 every-input activation jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
 | `TestPoolRtl` | PoolingKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 45 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-poolingkernel-systemverilog)) |
@@ -76,18 +77,19 @@ no hardware.
 
 | Aggregate | Description |
 |-----------|-------------|
-| `run_tests` | Builds `TestSimulation`, `TestConvRef`, `TestMatmulRef`, `TestPoolingSim` (and `TestMatmulBlas`, `TestMatmulRtl`, `TestVectorOpRtl`, `TestPoolRtl`, `TestConvRtl`, `conv_rtl_dsp_check` when present), then runs `ctest --output-on-failure` |
+| `run_tests` | Builds `TestVectorOpModel`, `TestConvModel`, `TestConvModelGrid`, `TestMatmulModel`, `TestPoolModel` (and `TestMatmulModelBlas`, `TestMatmulRtl`, `TestVectorOpRtl`, `TestPoolRtl`, `TestConvRtl`, `TestRowOpsRtl`, `conv_rtl_dsp_check` when present), then runs `ctest --output-on-failure` |
 | `test` | Runs the CTest tests without rebuilding (equivalent to `ctest`) |
 
-CTest registers seventeen tests: `TestSimulation`, `TestConvRef`,
-`TestConvGrid`, `TestConvSweep`, `TestMatmulRef`, `TestMatmulBlas` (only
-with BLAS), `TestPoolingSim`, `MatmulRtlDriver`, `TestMatmulRtl` (only
-with Verilator), `VectorOpRtlDriver`, `VectorOpRtlActRom` (the generated
-activation table is current), `TestVectorOpRtl` (only with
-Verilator), `PoolRtlDriver`, `TestPoolRtl` (only with Verilator),
-`ConvRtlDriver`, `TestConvRtl` (only with Verilator) and `ConvRtlDsp` (only
-with Verilator and Vivado's `DSP48E2.v` unisim model). `run_tests` does not list `TestConvGrid`
-as a dependency — build it with `make` / `make TestConvGrid` first.
+CTest registers twenty tests: `TestVectorOpModel`, `TestConvModel`,
+`TestConvModelGrid`, `TestConvModelSweep`, `TestMatmulModel`, `TestMatmulModelBlas` (only
+with BLAS), `TestPoolModel`, `MatmulRtlDriver`, `TestMatmulRtl` (only
+with Verilator), `VectorOpRtlDriver`, `VectorOpRtlActRom` and
+`VectorOpRtlSmxRom` (the generated activation and exponential tables are
+current), `TestVectorOpRtl` (only with Verilator), `PoolRtlDriver`,
+`TestPoolRtl` (only with Verilator), `ConvRtlDriver`, `TestConvRtl` (only
+with Verilator), `ConvRtlDsp` (only with Verilator and Vivado's
+`DSP48E2.v` unisim model), `RowOpsRtlDriver` and `TestRowOpsRtl` (only with
+Verilator).
 
 ---
 
@@ -108,13 +110,14 @@ A `synthesize_<platform>` aggregate is generated for every
 No kernel has a Vitis HLS synthesis or C/RTL co-simulation target any more:
 ConvKernel's was the last (CONV_RTL_PLAN phase 3; MatmulKernel's went in
 MATMUL_RTL_PLAN phase 4, VectorOPKernel's in VECTOROP_RTL_PLAN phase 3,
-PoolingKernel's in POOL_RTL_PLAN phase 3).  `kernels/conv`, `kernels/matmul`,
-`kernels/vectorop` and `kernels/pool` keep the HLS kernels' C++ as the
-reference models and fixture generators (`TestConvRef`, `TestConvSweep`,
-`gen_conv_test_data` — `TestMatmulRef`, `TestMatmulBlas`,
-`gen_matmul_test_data` — `TestSimulation`, `gen_vectorop_test_data` —
-`TestPoolingSim`, `gen_pool_test_data`); the RTL kernels are simulated with
-Verilator and xsim.
+PoolingKernel's in POOL_RTL_PLAN phase 3).  The HLS kernels' C++ lives on
+as the C++ reference models and fixture generators in `model/` of each RTL
+kernel — `kernels/conv_rtl/model` (`TestConvModel`, `TestConvModelSweep`,
+`gen_conv_test_data`), `kernels/matmul_rtl/model` (`TestMatmulModel`,
+`TestMatmulModelBlas`, `gen_matmul_test_data`), `kernels/vectorop_rtl/model`
+(`TestVectorOpModel`, `gen_vectorop_test_data`) and `kernels/pool_rtl/model`
+(`TestPoolModel`, `gen_pool_test_data`), without the HLS pragmas; the RTL
+kernels are simulated with Verilator and xsim.
 
 ---
 
@@ -163,7 +166,7 @@ Each target exists only when its tool is found, as for MatmulKernel
 
 | Target | Description |
 |--------|-------------|
-| `TestVectorOpRtl` | Verilator testbench `build/kernels/vectorop_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`VO_RTL_RANDOM_CASES`, checked against the HLS C++ when the Vitis HLS headers are found) |
+| `TestVectorOpRtl` | Verilator testbench `build/kernels/vectorop_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`VO_RTL_RANDOM_CASES`, checked against the C++ model when the Vitis HLS headers are found) |
 | `lint_vectorop_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
 | `perf_vectorop_rtl` | Cycle counts of typical jobs (ideal memory) |
 | `vectorop_rtl_tb_fst` | The testbench with FST tracing (`vlt/Vtb`; `--case "..." --trace FILE`) |
@@ -195,7 +198,7 @@ Each target exists only when its tool is found, as for MatmulKernel
 
 | Target | Description |
 |--------|-------------|
-| `TestPoolRtl` | Verilator testbench `build/kernels/pool_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`PL_RTL_RANDOM_CASES`, checked against the HLS C++ when the Vitis HLS headers are found) |
+| `TestPoolRtl` | Verilator testbench `build/kernels/pool_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`PL_RTL_RANDOM_CASES`, checked against the C++ model when the Vitis HLS headers are found) |
 | `lint_pool_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
 | `perf_pool_rtl` | Cycle counts of typical jobs (ideal memory) |
 | `pool_rtl_tb_fst` | The testbench with FST tracing (`vlt/Vtb`; `--case "..." --trace FILE`) |
@@ -231,7 +234,7 @@ needs only Python).
 
 | Target | Description |
 |--------|-------------|
-| `TestConvRtl` | Verilator testbench `build/kernels/conv_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`CV_RTL_RANDOM_CASES`, checked against the HLS C++ when the Vitis HLS headers are found); `--case "…"`, `--only I,J`, `--no-oracle` for one job |
+| `TestConvRtl` | Verilator testbench `build/kernels/conv_rtl/vl/Vtb` (in `all`); CTest runs it on the fixtures + random jobs (`CV_RTL_RANDOM_CASES`, checked against the C++ model when the Vitis HLS headers are found); `--case "…"`, `--only I,J`, `--no-oracle` for one job |
 | `conv_rtl_dsp_check` | `cv_mac_chain`'s behavioural model (what the testbench simulates) against Vivado's DSP48E2 unisim model (what the hardware is), every cycle on random stimulus → `dsp/Vdsp`, CTest `ConvRtlDsp` |
 | `lint_conv_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
 | `perf_conv_rtl` | Cycle counts of the board benchmarks' layers (ideal memory) |

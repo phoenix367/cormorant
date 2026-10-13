@@ -1,5 +1,9 @@
 # Convolutional Kernel — Detailed Implementation Description
 
+*This file describes the C++ reference model in `kernels/conv_rtl/model/`:
+the retired Vitis HLS kernel's design (the model no longer carries the HLS
+pragmas named below, nor the co-simulation code).*
+
 ## Overview
 
 `ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of four hardware kernels in the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel tiling (output-channel tile kTileM × input-channel tile kTileIC, 16 × 16) maps onto a 16 × 16 MAC grid that one flat II=1 sweep per `(ic-tile, ow-tile, M-group)` feeds with two output pixels per cycle (§5.1). The inference scheduler also runs MatMuls on this kernel (§8).
@@ -9,8 +13,8 @@
 > registers, m_axi bus parameters, DDR layouts and results,
 > `kernels/conv_rtl/`: [CONV_RTL_KERNEL](CONV_RTL_KERNEL.md) (first
 > bitstream `c2b2a6e5e50e`).  This kernel's HLS synthesis and co-simulation
-> targets are gone; its C++ (`ConvKernel.cpp`, `TestConvRef`,
-> `TestConvSweep`) stays as the reference model and writes the fixtures the
+> targets are gone; its C++ (`kernels/conv_rtl/model`: `src/ConvKernel.cpp`, `TestConvModel`,
+> `TestConvModelSweep`) stays as the reference model and writes the fixtures the
 > RTL kernel is tested against (the RTL testbench also runs it as its
 > oracle on random jobs).  The register map, contract, packed layouts,
 > geometry, arithmetic and scheduler integration below hold for both
@@ -100,7 +104,7 @@ the exported IP defaults — 128 bits on all four ports.
 | `kMaxAccPersistEntries` | 65536 | `partial_outputs[]` buffer size; one kTileM-padded output row (`out_w·ceil(out_ch/kTileM)·kTileM`) must fit. Bound to **URAM** as 512-bit words (`kMaxAccPersistEntries/16` words: 8 URAM blocks at 65536), and the chunk-deep `acc_stream` FIFO (`kMaxAccPersistEntries/8` × 128 bit, 4 URAM) scales with it — it trades URAM, not BRAM |
 | `kMaxMperGroup` | 4 | Max number of mt-tiles cached together in the standard path's (ict, M-group) weight slab; sets the weight-cache depth (`2 banks × kMaxMperGroup × 64` words) |
 
-All ten values come from `kernels.conv` in `platforms/<AXI_PLATFORM>.json` (`conv_load_constants()` in `kernels/conv/CMakeLists.txt`; no CMake cache defaults).  If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`, but that configuration does not build: `ConvKernel.h` includes `ap_int.h` / `hls_burst_maxi.h` unconditionally, and the 128-bit ports and row / weight buffers assume eight 16-bit elements per word (`static_assert`s; the float library was dropped 2026-09-27).  The only configuration built and tested is `ap_fixed<16,8>`.
+All ten values come from `kernels.conv` in `platforms/<AXI_PLATFORM>.json` (`conv_load_constants()` in `kernels/conv_rtl/model/CMakeLists.txt`; no CMake cache defaults).  If Vitis HLS headers are unavailable at CMake configure time, both types fall back to `float`, but that configuration does not build: `ConvKernel.h` includes `ap_int.h` / `hls_burst_maxi.h` unconditionally, and the 128-bit ports and row / weight buffers assume eight 16-bit elements per word (`static_assert`s; the float library was dropped 2026-09-27).  The only configuration built and tested is `ap_fixed<16,8>`.
 
 **Runtime constraints validated by the inference scheduler:**
 
@@ -607,9 +611,9 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 ---
 
-## 7. Test Coverage (`TestConvSim.cpp`)
+## 7. Test Coverage (`TestConvModel.cpp`)
 
-`TestConvRef` runs 97 named cases compiled with GCC against the Vitis HLS headers (no HLS tool run): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvSweep` (`TestConvRef --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match (`ap_fixed<16,8>`, the only configuration that builds). The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
+`TestConvModel` runs 97 named cases compiled with GCC against the Vitis HLS headers (no HLS tool run): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvModelGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvModelSweep` (`TestConvModel --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match (`ap_fixed<16,8>`, the only configuration that builds). The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
@@ -661,7 +665,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run)
-make TestConvRef TestConvGrid && ctest -R 'TestConv(Ref|Grid|Sweep)'
+make TestConvModel TestConvModelGrid && ctest -R TestConvModel   # TestConvModel, TestConvModelGrid, TestConvModelSweep
 
 # RTL fixtures: regenerate (ad hoc) / run the xsim behavior test (the RTL IP,
 # package_conv_rtl)
@@ -679,12 +683,12 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 
 | File | Purpose |
 |------|---------|
-| `kernels/conv/kernel/ConvKernel.cpp` | HLS kernel implementation (the retired kernel; the RTL kernel's reference model and testbench oracle) |
-| `kernels/conv/include/ConvKernel.h` | Kernel declaration, `saturate_cast<T>`, 128-bit port word types, packed weight / bias layout helpers (`conv_weight_index()` …), cosim depths |
-| `kernels/conv/include/ConvMacGrid.h` | MAC grid (`w_cache_read`, `mac_grid_column_step`, `mac_dw_step`) and weight-cache geometry, isolated from all tile geometry |
-| `kernels/conv/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, tile constants) |
-| `kernels/conv/test/TestConvSim.cpp` | C simulation tests (GCC), `--dump-data` RTL fixtures, `--sweep N` |
-| `kernels/conv/test/TestConvGrid.cpp` | MAC-grid unit test |
+| `kernels/conv_rtl/model/src/ConvKernel.cpp` | the C++ reference model (the retired HLS kernel without its pragmas; the RTL kernel's testbench oracle and fixture generator) |
+| `kernels/conv_rtl/model/include/ConvKernel.h` | Kernel declaration, `saturate_cast<T>`, 128-bit port word types, packed weight / bias layout helpers (`conv_weight_index()` …) |
+| `kernels/conv_rtl/model/include/ConvMacGrid.h` | MAC grid (`w_cache_read`, `mac_grid_column_step`, `mac_dw_step`) and weight-cache geometry, isolated from all tile geometry |
+| `kernels/conv_rtl/model/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, tile constants) |
+| `kernels/conv_rtl/model/test/TestConvModel.cpp` | C simulation tests (GCC), `--dump-data` RTL fixtures, `--sweep N` |
+| `kernels/conv_rtl/model/test/TestConvModelGrid.cpp` | MAC-grid unit test |
 | `platforms/kv260.json` | KV260 platform config (`kernels.conv` bounds, part, clock) |
 | `inference-scheduler/src/_conv_hw_config.py` | Scheduler-side read of `kernels.conv` |
 | `inference-scheduler/src/nodes.py` | `ConvNode` / `MatmulConvNode` classes (ONNX → kernel params, weight packing) |
@@ -736,4 +740,4 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` (generated-code default, `INFERENCE_CONVKERNEL_INSTANCE`); the KV260 overlay `dts/kv260/cormorant.dts` names the node `fabric_conv` |
 | **Resources (csynth, post-§2.42)** | 127 BRAM18 (44 %), 48 URAM (75 %), 679 DSP (54 %) |
-| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 63 RTL fixtures) + `TestConvGrid` + the 300-case random sweep (`TestConvSweep`) |
+| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 63 RTL fixtures) + `TestConvModelGrid` + the 300-case random sweep (`TestConvModelSweep`) |

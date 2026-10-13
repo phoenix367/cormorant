@@ -1,5 +1,9 @@
 # Pooling Kernel — Detailed Implementation Description
 
+*This file describes the C++ reference model in `kernels/pool_rtl/model/`:
+the retired Vitis HLS kernel's design (the model no longer carries the HLS
+pragmas named below, nor the co-simulation code).*
+
 ## Overview
 
 `PoolingKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D
@@ -24,7 +28,7 @@ below; the full optimisation log with measured timings lives in
 > registers, m_axi bus parameters, DDR access pattern and results,
 > `kernels/pool_rtl/`: [POOL_RTL_KERNEL](POOL_RTL_KERNEL.md).
 > This kernel's HLS synthesis and co-simulation targets are gone; its C++
-> (`PoolingKernel.cpp`, `TestPoolingSim`) stays as the reference model and
+> (`kernels/pool_rtl/model`: `src/PoolingKernel.cpp`, `TestPoolModel`) stays as the reference model and
 > writes the fixtures the RTL kernel is tested against.  The register map,
 > contract, geometry, arithmetic and scheduler integration below hold for
 > both kernels.  One fix came with the RTL testbench: with `stride_w > 8`
@@ -357,7 +361,7 @@ formula collapses to `ow_tile = out_w` and `ow_tiles_w = 1`
 (zero-duplication path). For wider inputs, boundary input columns
 overlap between adjacent W-tiles and get re-read once per
 transition — the documented bounded relaxation, accounted for by
-the dup-read predictor in `TestPoolingSim.cpp`.
+the dup-read predictor in `TestPoolModel.cpp`.
 
 ### 4.8 HLS pragmas applied
 
@@ -552,7 +556,7 @@ binary embeds the ROM directly (`kInvDenomLutBits`) and the
 
 ---
 
-## 7. Test Coverage (`TestPoolingSim.cpp`)
+## 7. Test Coverage (`TestPoolModel.cpp`)
 
 51 test cases (45 geometries, the two strict AVG sub-cases and four
 out-of-contract windows) compiled
@@ -625,9 +629,9 @@ comparison.
 
 ```bash
 # C simulation (GCC + the Vitis HLS headers; no HLS tool run).
-make TestPoolingSim && ctest -R TestPoolingSim
+make TestPoolModel && ctest -R TestPoolModel
 
-# The RTL fixtures from this model (TestPoolingSim --dump-data) into
+# The RTL fixtures from this model (TestPoolModel --dump-data) into
 # build/pool_test_data/; the behaviour tests read the checked-in copies.
 make gen_pool_test_data
 
@@ -658,13 +662,13 @@ synthesis → behaviour test → per-test timing diff vs the previous run).
 
 | File | Purpose |
 |------|---------|
-| `kernels/pool/kernel/PoolingKernel.cpp` | the retired HLS kernel — all four DATAFLOW stages, `poly_sqrt`, `inv_denom_lookup` ROM; the RTL kernel's reference model |
-| `kernels/pool/include/PoolingKernel.h` | Kernel declaration, 128-bit `PoolWord` port type and lane helpers, cosim depths, `saturate_cast<T>` |
-| `kernels/pool/include/PoolingKernelDebug.h` | C-sim-only duplicate-DDR-read counter used by the dup-read check |
-| `kernels/pool/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, all six per-platform tile constants, `pool_type` codes, MaxPool sentinels) |
-| `kernels/pool/test/TestPoolingSim.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
+| `kernels/pool_rtl/model/src/PoolingKernel.cpp` | the C++ reference model (the retired HLS kernel without its pragmas) — all four stages, `poly_sqrt`, `inv_denom_lookup` ROM; the RTL kernel's testbench oracle and fixture generator |
+| `kernels/pool_rtl/model/include/PoolingKernel.h` | Kernel declaration, 128-bit `PoolWord` port type and lane helpers, `saturate_cast<T>` |
+| `kernels/pool_rtl/model/include/PoolingKernelDebug.h` | C-sim-only duplicate-DDR-read counter used by the dup-read check |
+| `kernels/pool_rtl/model/include/Config.h.in` | CMake template → `Config.h` (Data_t, AccData_t, all six per-platform tile constants, `pool_type` codes, MaxPool sentinels) |
+| `kernels/pool_rtl/model/test/TestPoolModel.cpp` | C simulation tests (GCC); `--dump-data` writes the RTL fixtures |
 | `kernels/pool_rtl/` | the SystemVerilog kernel of the hardware build ([POOL_RTL_KERNEL](POOL_RTL_KERNEL.md)) |
-| `kernels/pool/CMakeLists.txt` | The C++ model, `TestPoolingSim`, `gen_pool_test_data`; `pool_load_constants` reads `kernels.pool` from the platform JSON |
+| `kernels/pool_rtl/model/CMakeLists.txt` | The C++ model, `TestPoolModel`, `gen_pool_test_data`; `pool_load_constants` reads `kernels.pool` from the platform JSON |
 | `platforms/<name>.json` | Per-platform FPGA part + clock + `kernels.pool` constants (single source of truth) |
 | `inference-scheduler/src/_pool_hw_config.py` | Python validator that re-reads `kernels.pool` from the same JSON |
 | `inference-scheduler/src/nodes.py` | `PoolNode` (ONNX → kernel params + HW-bound validation) |

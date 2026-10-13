@@ -693,7 +693,7 @@ bottom / right values chosen so shape inference reproduces the original
 `out_h`/`out_w` (`[2, 2, 1, 1]` for 224² → 112²).  ConvKernel takes only
 `pad_top` / `pad_left` and zero-pads bottom / right by its bounds check
 (`ConvKernel.h`), which is exactly the implicit padding the identity
-relies on; the geometry is covered by C-sim (`TestConvSim.cpp`, "s2d
+relies on; the geometry is covered by C-sim (`TestConvModel.cpp`, "s2d
 stem: 12ch 4x4 s1 pad [2,2,1,1]").
 
 Applicability (all required): `group = 1`, dilations 1, `strides = [2, 2]`,
@@ -1377,7 +1377,7 @@ ConvKernel.h's packed-weight formula and B's image read as NCHW `x` give
 `A · B` through the conv reference; the generated C run on the host
 against a software ConvKernel reproduces the simulation bit for bit —
 also for BERT-base, `test/test_bert_base.py`).  The kernel side is
-covered by `TestConvSim.cpp`'s `mm-on-conv` cases (C-sim and RTL: 1×2 /
+covered by `TestConvModel.cpp`'s `mm-on-conv` cases (C-sim and RTL: 1×2 /
 1×3 / 1×4 with stride = kw, 1×1 with out_h > 1, M-groups and oh-chunks,
 in_ch 1024, weights read at offsets inside a shared buffer).
 

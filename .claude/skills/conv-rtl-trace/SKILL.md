@@ -6,7 +6,7 @@ allowed-tools: Bash Read
 # conv-rtl-trace
 
 ConvKernel is the SystemVerilog kernel in `kernels/conv_rtl`
-(CONV_RTL_KERNEL.md; its C++ reference model is `kernels/conv`).  Two
+(CONV_RTL_KERNEL.md; its C++ reference model is `kernels/conv_rtl/model`).  Two
 views of one case:
 
 - **Inside the kernel** — the Verilator testbench with waveforms (§1):
@@ -61,8 +61,8 @@ python3 $S/analyze_trace.py /tmp/trace.log
 ```
 
 `make_fixture.sh <build-dir> <test-index> <out-dir>` copies that case's
-four hex files (`TestConvRef --dump-data`) and a 2-line-header manifest;
-add a named case to `kernels/conv/test/TestConvSim.cpp` first if none
+four hex files (`TestConvModel --dump-data`) and a 2-line-header manifest;
+add a named case to `kernels/conv_rtl/model/test/TestConvModel.cpp` first if none
 fits (keep it SMALL).  `run_trace.sh` runs `make -C
 hw/cormorant_test_stand tb-conv` with `TS_VERBOSE=1` against
 `<build-dir>/rtl_ip/ConvKernel_ip` — the last packaged IP; re-package
