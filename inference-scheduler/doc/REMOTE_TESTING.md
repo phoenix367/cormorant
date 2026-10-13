@@ -217,7 +217,9 @@ what PYNQ's `Overlay` class does internally:
 2. Parse the `.hwh` — extract PS AXI port-width parameters and memory topology
 3. Build a minimal xclbin (MEM_TOPOLOGY) locally with `xclbinutil`
 4. Upload `.bin` → `/lib/firmware/<name>.bin` on the board
-5. Remove any existing configfs DTBO overlay with the same name
+5. Remove a `pynq` overlay (PYNQ images insert one on every login shell), then
+   any existing configfs DTBO overlay with the same name; each removal is
+   checked in `dmesg`, and a refused one stops the upload (below)
 6. Write to `fpga_manager` sysfs — triggers PL reconfiguration
 7. Verify `fpga_manager` state == `operating`
 8. Load the xclbin into the zocl DRM driver (`xclLoadXclBin`) — registers
@@ -229,9 +231,22 @@ what PYNQ's `Overlay` class does internally:
     overlay)
 11. Write PS SLCR / AXIFM registers to match the bitstream's AXI bus widths
     (last, because the overlay's `afi0` node resets the AXIFM width fields)
-12. List `/dev/uio*` devices to confirm UIO nodes are up
+12. List `/dev/uio*` devices to confirm UIO nodes are up, and check that each
+    UIO node holds the interrupt the overlay gives it (`/proc/interrupts`); a
+    device that kept an old one is rebound once, and the upload fails if it
+    still disagrees
 
-Step 5 removes only an overlay of the same name (and step 9 `pynq`).  If the
+The kernel removes an overlay only when no overlay applied after it touches
+the same nodes; otherwise it logs `overlay #N is not topmost`, while
+configfs's `rmdir` still succeeds — the old overlay then stays in the live
+device tree for good, and a new one would land on top of it with its UIO
+devices keeping their old interrupts.  PYNQ's login-shell overlay defines
+`afi0` and `zyxclmm_drm` like ours, so step 5 removes it first; any other
+refusal stops the upload with `The kernel refused to remove overlay …`:
+reboot the board and run again.  (The R5's `rpu` and `rpu-ipi` overlays touch
+none of these nodes and stay.)
+
+Step 5 removes only an overlay of the same name (and `pynq`).  If the
 same design is already loaded under another overlay name (e.g. `pl`), the
 kernel refuses the new one (`create_overlay: Failed to create overlay
 (err=-22)` in `dmesg`: the other overlay owns the nodes) and step 10 fails

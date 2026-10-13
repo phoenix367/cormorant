@@ -43,14 +43,29 @@ def upload_text(session: RemoteSession, text: str, remote_path: str) -> None:
 
 
 def remove_overlay(session: RemoteSession, overlay_name: str) -> None:
-    """Remove a device tree overlay from configfs if present."""
+    """Remove a device tree overlay from configfs if present.
+
+    The kernel removes only an overlay that no later one overlaps
+    (``overlay #N is not topmost``), but configfs's rmdir succeeds either way:
+    a refused overlay loses its configfs entry and stays in the live tree,
+    where nothing can remove it any more and the next overlay of the same
+    design lands on top of it (its UIO devices keep their old properties).
+    So the kernel log is checked, and a refusal stops the caller."""
     sysfs_dir = f"{_OVERLAYS_DIR}/{overlay_name}"
+    mark = dmesg_mark(session)
     out, _, rc = session.exec(
         f"[ -d '{sysfs_dir}' ] && rmdir '{sysfs_dir}' && echo removed || echo absent",
         timeout=15,
     )
     status = out.strip()
     if status == "removed":
+        refused = overlay_removal_refused_since(session, mark)
+        if refused:
+            raise RuntimeError(
+                f"The kernel refused to remove overlay '{overlay_name}':\n  " + "\n  ".join(refused)
+                + f"\nAn overlay applied after it overlaps it (remaining: {', '.join(list_overlays(session))}).  "
+                f"Its configfs entry is gone but its nodes stay in the live device tree, so a new "
+                f"overlay would land on top of them.  Reboot the board, then run again.")
         print(f"  Removed existing overlay: {overlay_name}")
     elif status != "absent":
         raise RuntimeError(f"Failed to remove overlay '{overlay_name}': {out.strip()}")
@@ -262,6 +277,42 @@ def overlay_errors_since(session: RemoteSession, mark: float) -> list[str]:
     return [text for t, text in _dmesg_tail(session) if t > mark
             and "overlay" in text.lower()
             and any(w in text.lower() for w in ("fail", "error", "err="))]
+
+
+def overlay_removal_refused_since(session: RemoteSession, mark: float) -> list[str]:
+    """The kernel's refusals to remove an overlay after ``mark``
+    (``node_overlaps_later_cs: #2 overlaps with #5 @/axi/afi0``,
+    ``overlay #2 is not topmost``)."""
+    return [text for t, text in _dmesg_tail(session) if t > mark
+            and ("not topmost" in text or "overlaps with" in text)]
+
+
+def parse_proc_interrupts(text: str) -> dict[str, int]:
+    """{action name: GIC hardware interrupt id} of the GIC lines of
+    /proc/interrupts (`` 67:  0  0  0  0  GICv2 122 Level  fabric_matmul``)."""
+    irqs = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*\d+:(?:\s+\d+)+\s+GIC\S*\s+(\d+)\s+\S+\s+(\S+)\s*$", line)
+        if m:
+            irqs[m.group(2)] = int(m.group(1))
+    return irqs
+
+
+def uio_irqs(session: RemoteSession) -> dict[str, int]:
+    """The GIC interrupt id each interrupt handler on the board holds, by name."""
+    out, _, _ = session.exec("cat /proc/interrupts", timeout=10)
+    return parse_proc_interrupts(out)
+
+
+def rebind_uio(session: RemoteSession, devices: list[str]) -> None:
+    """Unbind and bind uio_pdrv_genirq platform devices (``a0010000.fabric_matmul``):
+    the device takes its interrupt from the live device tree again."""
+    drv = "/sys/bus/platform/drivers/uio_pdrv_genirq"
+    for dev in devices:
+        _, err, rc = session.exec(f"echo '{dev}' > '{drv}/unbind' && echo '{dev}' > '{drv}/bind'",
+                                  timeout=10)
+        if rc != 0:
+            raise RuntimeError(f"Could not rebind {dev}: {err.strip()}")
 
 
 def list_uio_devices(session: RemoteSession) -> list[tuple[str, str]]:

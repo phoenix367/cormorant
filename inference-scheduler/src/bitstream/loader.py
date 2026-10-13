@@ -25,6 +25,8 @@ from .board import (
     dmesg_mark,
     overlay_errors_since,
     list_uio_devices,
+    uio_irqs,
+    rebind_uio,
 )
 from .platforms import kv260
 
@@ -45,7 +47,8 @@ def upload_bitstream(
       2  Parse HWH — PS family, AXI port-width parameters, PL0 and kernel clocks
       3  Build xclbin with MEM_TOPOLOGY via xclbinutil
       4  Upload .bin → /lib/firmware/<overlay_name>.bin
-      5  Remove any existing configfs DTBO overlay
+      5  Remove a `pynq` overlay, then any existing overlay of ours (each
+         removal checked in the kernel log)
       5b Check PL0 (fclk0) = the HWH's PL0 frequency, set it if not
       6  Load bitstream via fpga_manager
       7  Verify fpga_manager state == "operating"
@@ -53,7 +56,8 @@ def upload_bitstream(
       9  Upload and apply DTBO via configfs
       10 Verify overlay status == "applied"
       11 Write PS SLCR / AXIFM registers (set_axi_port_width)
-      12 List /dev/uio* devices
+      12 List /dev/uio* devices; check each UIO node holds the interrupt the
+         overlay gives it (a stale device is rebound once)
 
     The AXI port widths are written AFTER the overlay is applied on
     purpose: the overlay's `afi0` node (`xlnx,afi-fpga`, `config-afi`
@@ -106,6 +110,12 @@ def upload_bitstream(
     print("          done")
 
     print(f"\n{_bold('Step 5')}   Removing existing overlay '{overlay_name}' (if any)")
+    # PYNQ images insert a `pynq` overlay on every login shell
+    # (/etc/profile.d/pynq_venv.sh → pynq-dts/insert_dtbo.py).  It defines
+    # afi0 and zyxclmm_drm, nodes ours has too, so once it sits above ours
+    # the kernel refuses to remove ours ("overlay #N is not topmost"): remove
+    # it first.  remove_overlay stops on a refusal.
+    remove_overlay(session, "pynq")
     remove_overlay(session, overlay_name)
 
     print(f"\n{_bold('Step 5b')}  PL0 clock (fclk0)")
@@ -130,8 +140,8 @@ def upload_bitstream(
 
     print(f"\n{_bold('Step 9')}   Uploading DTBO → {remote_dtbo}")
     upload_file(session, dtbo_path, remote_dtbo)
-    # A `pynq` overlay may have been applied during the xclbin load (PYNQ
-    # images); its fabric@A0000000 UIO device outlives the overlay and holds
+    # A login shell on a PYNQ image may have inserted a `pynq` overlay since
+    # step 5; its fabric@A0000000 UIO device outlives the overlay and holds
     # the IRQ our fabric_vecop node needs.  Drop that overlay and unbind any
     # foreign UIO device at one of our kernel addresses before applying ours.
     remove_overlay(session, "pynq")
@@ -171,6 +181,7 @@ def upload_bitstream(
             print(f"          {_green(dev)}  {name}")
     else:
         print(f"          {_yellow('none found')}  (check dmesg for DT errors)")
+    check_uio_irqs(session, dtbo_uio_irqs(dtbo_path))
 
     print(f"\n{_green(_bold('Done.'))}  Bitstream loaded and overlay applied.\n")
 
@@ -195,8 +206,9 @@ def check_pl0(session: RemoteSession, pl0_mhz, set_if_off: bool, tol: float = 0.
     print(f"          fclk0 {have} Hz  {_green('✓')}")
 
 
-def dtbo_uio_nodes(dtbo_path) -> list[str]:
-    """Return 'name@addr' of every generic-uio node in the compiled overlay."""
+def _dtbo_uio(dtbo_path) -> list[tuple[str, dict[str, str]]]:
+    """('name@addr', {property: value text}) of every generic-uio node in the
+    compiled overlay ([] when dtc is missing)."""
     import re
     import subprocess
     try:
@@ -209,10 +221,54 @@ def dtbo_uio_nodes(dtbo_path) -> list[str]:
         t = line.strip()
         m = re.match(r"(?:\w+:\s*)?([\w-]+@[0-9a-fA-F]+|[\w-]+)\s*\{$", t)
         if m:
-            stack.append(m.group(1))
+            stack.append((m.group(1), {}))
         elif t.startswith("};"):
             if stack:
-                stack.pop()
-        elif t.startswith("compatible") and "generic-uio" in t and stack and "@" in stack[-1]:
-            nodes.append(stack[-1])
+                name, props = stack.pop()
+                if "generic-uio" in props.get("compatible", "") and "@" in name:
+                    nodes.append((name, props))
+        elif stack and (p := re.match(r"([\w,#-]+)\s*=\s*(.*);$", t)):
+            stack[-1][1][p.group(1)] = p.group(2)
     return nodes
+
+
+def dtbo_uio_nodes(dtbo_path) -> list[str]:
+    """Return 'name@addr' of every generic-uio node in the compiled overlay."""
+    return [name for name, _ in _dtbo_uio(dtbo_path)]
+
+
+def dtbo_uio_irqs(dtbo_path) -> dict[str, int]:
+    """{'name@addr': GIC interrupt id} of the overlay's generic-uio nodes with
+    a GIC SPI (``interrupts = <0x00 SPI flags>``: id = SPI + 32)."""
+    import re
+    irqs = {}
+    for name, props in _dtbo_uio(dtbo_path):
+        cells = re.findall(r"0x[0-9a-fA-F]+|\d+", props.get("interrupts", ""))
+        if len(cells) == 3 and int(cells[0], 0) == 0:
+            irqs[name] = int(cells[1], 0) + 32
+    return irqs
+
+
+def check_uio_irqs(session: RemoteSession, want: dict[str, int]) -> None:
+    """Each UIO node of the overlay holds the interrupt the overlay gives it.
+
+    A UIO device takes its interrupt when it binds.  When the overlay lands
+    on nodes that already exist (an earlier overlay of the design that the
+    kernel would not remove), the device keeps the old interrupt; rebinding
+    it reads the live tree again.  Raises if a node still disagrees."""
+    if not want:
+        return
+    def stale(have):
+        return {n: (have.get(n.split("@")[0]), irq) for n, irq in want.items()
+                if have.get(n.split("@")[0]) != irq}
+    bad = stale(uio_irqs(session))
+    if bad:
+        print(f"          {_yellow('stale interrupts')}: "
+              + ", ".join(f"{n} GIC {h} (overlay {w})" for n, (h, w) in bad.items()) + " — rebinding")
+        rebind_uio(session, [f"{n.split('@')[1]}.{n.split('@')[0]}" for n in bad])
+        bad = stale(uio_irqs(session))
+    if bad:
+        raise RuntimeError("UIO interrupts disagree with the overlay after a rebind: "
+                           + ", ".join(f"{n}: GIC {h}, overlay {w}" for n, (h, w) in bad.items())
+                           + ".  Reboot the board, then run again.")
+    print(f"          interrupts as the overlay gives them ({len(want)} UIO nodes)  {_green('✓')}")

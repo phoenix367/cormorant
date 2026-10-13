@@ -57,7 +57,7 @@
     "_use_sudo_note": "camera_loop.py is launched with sudo -n; the FPGA UIO devices and XRT buffers need root.",
 
     "board_python": "python3",
-    "_board_python_note": "Python interpreter on the board with pyrealsense2/numpy/opencv. Use a full path for a venv, e.g. /usr/local/share/pynq-venv/bin/python3.",
+    "_board_python_note": "Python interpreter on the board with pyrealsense2/numpy/opencv. Use a full path for a venv, e.g. /root/venv/bin/python3 (the system python3 has them on the KV260).",
 
     "warmup": 1,
     "top_k": 5,

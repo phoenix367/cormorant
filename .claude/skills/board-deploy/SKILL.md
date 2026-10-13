@@ -84,10 +84,17 @@ resets the fields to 0 when applied (§2.31); a reading that does not
 match the handoff file's `C_SAXIGP0_DATA_WIDTH` means every kernel will read/write
 garbage.
 
-After a reboot the board applies the starter-kit overlay (dfx-mgr) and,
-during the xclbin load, a `pynq` overlay whose `fabric@A0000000` node
-takes IRQ 61 and outlives its overlay.  The loader now removes `pynq`
-and unbinds such a device before applying ours (2026-09-24); if
+After a reboot the board applies the starter-kit overlay (dfx-mgr).  A
+PYNQ image also inserts a `pynq` overlay on every login shell
+(`/etc/profile.d/pynq_venv.sh`): its `fabric@A0000000` node takes IRQ 61
+and outlives its overlay, and since it defines `afi0` / `zyxclmm_drm` like
+ours, the kernel refuses to remove our older overlay under it ("not
+topmost": the old overlay stays in the live tree).  PYNQ was removed from
+this board on 2026-10-13 (backup: `/mnt/data/board_backups/kv260_pynq_2026-10-13.tar`).
+The loader still removes `pynq` before its own overlay, stops on any
+refused removal (reboot, then run again), unbinds a foreign UIO device at
+one of our addresses, and after applying checks every UIO node's
+interrupt against the overlay (a stale device is rebound); if
 `inference_init() failed: 2` still shows up, check
 `ls /sys/class/uio/*/name` — it must list `fabric_vecop`, not `fabric`
 (`rmdir` the foreign overlay, `echo a0000000.fabric >

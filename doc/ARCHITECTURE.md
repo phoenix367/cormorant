@@ -458,13 +458,22 @@ of the bitstream is loaded, at run time:
 1. `inference-scheduler/upload_bitstream.py` converts the `.bit` to the flat
    `.bin`.  It checks PL0 against the hardware description's 100 MHz and
    sets it if needed.
-2. Linux's FPGA manager programs the PL.  The script checks the state reads
+2. It removes the previous overlay, and first a `pynq` overlay that a PYNQ
+   image's login shell may have inserted above it.  The kernel removes an
+   overlay only when no overlay applied later touches the same nodes
+   ("overlay #N is not topmost"), while configfs reports success either way;
+   a refused removal would leave the old overlay in the live tree, so the
+   script stops and asks for a reboot.  (The R5's `rpu` and `rpu-ipi`
+   overlays touch none of these nodes and stay.)
+3. Linux's FPGA manager programs the PL.  The script checks the state reads
    "operating".
-3. It loads a memory-topology-only xclbin into XRT's `zocl`, for the buffer
+4. It loads a memory-topology-only xclbin into XRT's `zocl`, for the buffer
    objects.
-4. It applies the device-tree overlay `pl.dtbo`: five UIO nodes, `zocl`, and
-   the `afi0` node.
-5. It writes the AFI port-width registers last, because applying the overlay
+5. It applies the device-tree overlay `pl.dtbo`: five UIO nodes, `zocl`, and
+   the `afi0` node.  It then checks that every UIO device holds the
+   interrupt the overlay gives it; a device that kept an old one is rebound
+   once.
+6. It writes the AFI port-width registers last, because applying the overlay
    resets them (§8.6).
 
 When `pl_resetn0` is released, the MMCM locks, the reset block releases
@@ -1199,14 +1208,5 @@ A new bitstream is promoted to production in this order:
 - **The A53 power-down idle state** (`doc/plans/CHAT_PLAN.md` §18) once
   parked a core forever and hung the board, and is disabled at boot.  A
   4.6 h, 420 000-entry soak on 2026-10-13 did not reproduce it.
-- **Reloading the PL under the R5's overlays.**  `upload_bitstream.py`
-  removes the `pl` overlay before loading a bitstream.  When overlays
-  applied after it are still there (the R5's `rpu` and `rpu-ipi`, or a
-  `pynq` one), the kernel refuses (`overlay #N is not topmost`).  The new
-  `pl` overlay then goes on top of the old one: the device tree gets the new
-  properties, but the UIO devices keep what they were created with.  On
-  2026-10-13 the corrected interrupts took effect only after the three UIO
-  devices were rebound (`uio_pdrv_genirq` unbind / bind); a reboot clears
-  the stack.
 - **One job per board.**  The kernels and the CMA are shared, so every board
   tool takes the per-board lock.
