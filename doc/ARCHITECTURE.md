@@ -602,11 +602,14 @@ production keeps physical addressing.
 Each kernel port is 128 bits at 250 MHz, 4 GB/s per direction.
 Arbitration happens at two levels:
 
-1. **In the PL.**  Each data interconnect is an AXI Interconnect with a
+1. **In the PL.**  The two shared interconnects (`axi_interconnect_0`, 7
+   to 1, and `axi_mem_intercon`, 4 to 1) are AXI Interconnects with a
    shared-address, multiple-data crossbar: round-robin address arbitration
-   between its slave ports.  Each crossbar has register slices on every
-   slave port and on `axi_interconnect_0`'s master port.  `axi_mem_intercon`
-   also has address-decode stages (`axi_mmu`) on its four slave ports.  The
+   between their slave ports.  The HP2 and HP0 interconnects carry one
+   master each.  All four have register slices on their slave ports, and
+   `axi_interconnect_0` and `axi_rowops_intercon` on their master ports as
+   well.  `axi_mem_intercon` also has address-decode stages (`axi_mmu`) on
+   its four slave ports.  The
    interconnects are sized from the outstanding-transaction counts each IP
    declares in its packaging (§6.1).  Without those declarations the crossbar
    gives every slot 2.
@@ -1053,8 +1056,8 @@ FMAX_250_PLAN).  The rules, each learned from a failed closure:
 5. **Configuration products registered before use.**  A multiplier or
    divider result is consumed several cycles after its operands are
    captured (§2.3).
-6. **Register slices** on every data interconnect slave port, and on
-   `axi_interconnect_0`'s master port.
+6. **Register slices** on every data interconnect slave port, and on the
+   master ports of `axi_interconnect_0` and `axi_rowops_intercon`.
 
 ### 8.4 Timing results
 
@@ -1196,5 +1199,14 @@ A new bitstream is promoted to production in this order:
 - **The A53 power-down idle state** (`doc/plans/CHAT_PLAN.md` §18) once
   parked a core forever and hung the board, and is disabled at boot.  A
   4.6 h, 420 000-entry soak on 2026-10-13 did not reproduce it.
+- **Reloading the PL under the R5's overlays.**  `upload_bitstream.py`
+  removes the `pl` overlay before loading a bitstream.  When overlays
+  applied after it are still there (the R5's `rpu` and `rpu-ipi`, or a
+  `pynq` one), the kernel refuses (`overlay #N is not topmost`).  The new
+  `pl` overlay then goes on top of the old one: the device tree gets the new
+  properties, but the UIO devices keep what they were created with.  On
+  2026-10-13 the corrected interrupts took effect only after the three UIO
+  devices were rebound (`uio_pdrv_genirq` unbind / bind); a reboot clears
+  the stack.
 - **One job per board.**  The kernels and the CMA are shared, so every board
   tool takes the per-board lock.
