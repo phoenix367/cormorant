@@ -7,7 +7,7 @@
  * interrupt-driven waits, inference_rpu.h) — and compares every output bit
  * for bit.
  *
- *   rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] [--irq [--spin-us N]]
+ *   rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] [--irq [--spin-us N] [--early-us N|off]]
  *
  * Default: the second run is forced onto the R5 (INFERENCE_RPU_MODE_R5, the
  * gate of the R5 path).  --auto lets the project's policy choose instead
@@ -15,7 +15,8 @@
  * the A53 in both runs.  --irq gates the A53's waits on the kernels'
  * interrupts instead (inference_irq.h): both runs on the A53, the reference
  * polling, the second sleeping on the interrupts (--spin-us: the spin before
- * a sleep); the firmware need not run.
+ * a sleep; --early-us: the early wake's margin, off without it); the firmware
+ * need not run.
  *
  * Exit 0: every run bit-exact (or --no-check); 1: a mismatch or an R5 error;
  * 2: a setup error.  Load / start the firmware with remoteproc first
@@ -60,6 +61,7 @@ int main(int argc, char **argv)
     unsigned runs = 5u, ring_kb = 0u, i, r, on_r5 = 0u;
     int check = 1, rc, bad_runs = 0, arg, auto_mode = 0, irq_mode = 0;
     long spin_us = -1;
+    int early_set = 0, early_us = 0;
     inference_irq_stats_t ist;
     static const unsigned sizes[] = INFERENCE_RPU_IO_SIZES;
     const unsigned n_in = INFERENCE_RPU_N_IN, n_io = INFERENCE_RPU_N_IN + INFERENCE_RPU_N_OUT;
@@ -78,8 +80,13 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[arg], "--auto")) auto_mode = 1;
         else if (!strcmp(argv[arg], "--irq")) irq_mode = 1;
         else if (!strcmp(argv[arg], "--spin-us") && arg + 1 < argc) spin_us = atol(argv[++arg]);
-        else {
-            fprintf(stderr, "usage: rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] [--irq [--spin-us N]]\n");
+        else if (!strcmp(argv[arg], "--early-us") && arg + 1 < argc) {
+            ++arg;
+            early_set = 1;
+            early_us = strcmp(argv[arg], "off") ? atoi(argv[arg]) : -1;
+        } else {
+            fprintf(stderr, "usage: rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] "
+                            "[--irq [--spin-us N] [--early-us N|off]]\n");
             return 2;
         }
     }
@@ -89,13 +96,15 @@ int main(int argc, char **argv)
     if (irq_mode) {                                             /* the A53 drives every run, attached or not */
         inference_rpu_set_mode(INFERENCE_RPU_MODE_A53);
         if (spin_us >= 0) inference_irq_set_spin_us((unsigned)spin_us);
+        if (early_set) inference_irq_set_early_us(early_us);
         inference_irq_stats(&ist);
         if (!ist.lanes) {
             fprintf(stderr, "no kernel of this project has its UIO interrupt (the overlay's fabric_* nodes?)\n");
             return 2;
         }
         printf("irq: the A53 drives; reference polling, then waits on the interrupts of lanes 0x%x "
-               "(spin %u us before a sleep)\n", ist.lanes, ist.spin_us);
+               "(spin %u us before a sleep; early wake %s)\n", ist.lanes, ist.spin_us,
+               ist.early_us < 0 ? "off" : "on");
     } else if (ring_kb || inference_rpu_mode() < 0) {           /* a ring size, or INFERENCE_RPU=0 in the environment */
         inference_rpu_detach();
         rc = inference_rpu_attach(ring_kb * 1024u);
@@ -178,8 +187,14 @@ int main(int argc, char **argv)
                cpu_run / runs * 1e3);
         if (check) printf(", polling mean %.3f ms (A53 CPU %.3f ms)", t_a53 / runs * 1e3, cpu_a53 / runs * 1e3);
         printf("; spin %u us; waits %llu: %llu within the spin, %llu sleeps, %llu wake-ups, %llu timeouts, "
-               "%llu missed; %s\n", ist.spin_us, ist.waits, ist.spun, ist.sleeps, ist.wakeups, ist.timeouts,
-               ist.missed, bad_runs ? "MISMATCH" : (check ? "all runs bit-exact" : "unchecked"));
+               "%llu missed", ist.spin_us, ist.waits, ist.spun, ist.sleeps, ist.wakeups, ist.timeouts, ist.missed);
+        if (ist.early_us >= 0)
+            printf("; early wake %d us: %llu timed sleeps, %llu by the timer (then %.1f us to the end), "
+                   "%llu by the line", ist.early_us, ist.early, ist.early_timer,
+                   ist.early_timer ? ist.early_spin_us / (double)ist.early_timer : 0.0, ist.early_line);
+        else
+            printf("; early wake off");
+        printf("; %s\n", bad_runs ? "MISMATCH" : (check ? "all runs bit-exact" : "unchecked"));
         inference_deinit();
         return bad_runs || ist.missed ? 1 : 0;
     }

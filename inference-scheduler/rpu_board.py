@@ -30,7 +30,8 @@ Steps (the per-board lock is held throughout, src/remote/lock.py):
               runs one pass of each; --mode irq gates the A53's waits on the
               kernels' interrupts instead (inference_irq.h: the reference
               polling, then sleeping on the UIO interrupts; no firmware,
-              --spin-us the spin before a sleep)
+              --spin-us the spin before a sleep, --early-us the early
+              wake's margin)
   stop     -> remoteproc0 stopped (the overlay stays); the board's CMA cleaned
               (src/remote/cma.py: page cache dropped, memory compacted)
 
@@ -140,6 +141,9 @@ def main(argv=None) -> int:
                          "sleeping on the kernels' interrupts (inference_irq.h; no firmware)")
     ap.add_argument("--spin-us", type=int, default=None,
                     help="--mode irq: the spin before a sleep (default: the library's)")
+    ap.add_argument("--early-us", default=None,
+                    help="--mode irq: the early wake's margin before a call's predicted end, µs, "
+                         "or 'off' (default: the library's)")
     ap.add_argument("--keep-running", action="store_true", help="leave the firmware running")
     ap.add_argument("--board-lock", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -248,7 +252,8 @@ def main(argv=None) -> int:
                           + (f" --ring-kb {args.ring_kb}" if args.ring_kb else "") \
                           + (" --no-check" if args.no_check else "") + (" --auto" if mode == "auto" else "") \
                           + (" --irq" if mode == "irq" else "") \
-                          + (f" --spin-us {args.spin_us}" if mode == "irq" and args.spin_us is not None else "")
+                          + (f" --spin-us {args.spin_us}" if mode == "irq" and args.spin_us is not None else "") \
+                          + (f" --early-us {args.early_us}" if mode == "irq" and args.early_us is not None else "")
                     out, err, rc = session.exec(cmd, timeout=cfg["run"]["timeout"] + 30)
                     lines = out.strip().splitlines()
                     shown = lines if args.verbose else [ln for ln in lines if not ln.startswith("run ") or "MISMATCH" in ln][:12]

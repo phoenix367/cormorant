@@ -246,7 +246,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1829 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1830 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -561,8 +561,15 @@ Who waits, in this order:
 - **the kernel's interrupt** (Linux, `runtime/inference_irq.[ch]`), when the
   lane's Start armed it.  The generated `X<Kernel>_Start` macro calls
   `inference_irq_start()`: it lets ap_done latch into ISR bit 0, clears the
-  previous job's bit, confirms the clear landed, and raises GIE.  The wait
-  reads the ISR for `INFERENCE_IRQ_SPIN_US` (300 µs), then unmasks the line
+  previous job's bit, confirms the clear landed, and raises GIE.  Before each
+  node's Start, `INFERENCE_KERNEL_EXPECT(k, µs)` gives the predicted length of
+  its calls (`_kernel_expect_us`: the bitstream's performance model where it
+  prices the call, else the analytic cost model; the node's shortest call, so
+  a node of unequal calls wakes early rather than late).  The wait sleeps on
+  a timer (`ppoll()`, the line armed) until `INFERENCE_IRQ_EARLY_US` (100 µs)
+  before the predicted end — the early wake: running when the job ends, no
+  wake-up after it; a job that ends sooner fires the line.  Then it reads the
+  ISR for `INFERENCE_IRQ_SPIN_US` (300 µs), then unmasks the line
   (a write of 1 to the kernel's `/dev/uioN`), reads again and sleeps in
   `poll()` until the line fires; GIE drops after the wait.  The level line
   stays high from ap_done to the next Start, so an unmask after the job
@@ -571,11 +578,11 @@ Who waits, in this order:
 - **`IsDone()` in a tight loop** otherwise: bare metal, `INFERENCE_WAIT=poll`,
   the host emulation.
 
-A short job ends within the spin and costs no more than polling; a sleep
-costs 20–35 µs of wake-up on the KV260.  On the board, against polling
-(`rpu_board.py --mode irq`, `doc/plans/RPU_PLAN.md` §12): LeNet / MobileNet v2 /
-ResNet-18 / BERT +1.9 / +2.8 / +3.9 / +2.5 % latency for −48 / −17 / −58 /
-−66 % A53 CPU.  The function stays weak, so a deployment can still replace it at
+A sleep on the interrupt costs 20–35 µs of wake-up on the KV260, which the
+early wake avoids.  On the board, against polling (`rpu_board.py --mode irq`,
+`doc/plans/RPU_PLAN.md` §12): LeNet / MobileNet v2 / ResNet-18 / BERT +0.4 /
++0.7 / +0.1 / +0.4 % latency for −64 / −58 / −85 / −81 % A53 CPU (the spin
+alone, without predictions: +1.9…+3.9 % for −17…−66 %).  The function stays weak, so a deployment can still replace it at
 link time.
 
 `inference_run()` emits a `kernel_wait` only when (a) some predecessor
@@ -1786,6 +1793,7 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
 | `-DINFERENCE_IRQ_MODE_DEFAULT=0/1` | `INFERENCE_WAIT=poll/irq` | 1 (irq) | `kernel_wait()` on the A53: poll `IsDone()`, or spin then sleep on the kernel's UIO interrupt (`inference_irq.h`) |
 | `-DINFERENCE_IRQ_SPIN_US_DEFAULT=N` | `INFERENCE_IRQ_SPIN_US=N` | 300 | the spin before a sleep, µs |
+| `-DINFERENCE_IRQ_EARLY_US_DEFAULT=N` | `INFERENCE_IRQ_EARLY_US=N` / `off` | 100 | the early wake: the timed sleep ends this long before the call's predicted end (< 0 / `off`: no early wake) |
 
 BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
 ConvKernel, 2 on MatmulKernel) for example:

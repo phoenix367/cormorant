@@ -731,7 +731,36 @@ kernels handed between the A53's and the R5's waits every run: LeNet,
 ResNet-18 and BERT bit-exact; the R5 path unchanged (ResNet-18 20.1 ms, BERT
 266 ms, A53 CPU 0.66 / 1.1 ms an inference).
 
-Open: a wait that knows its call's length (the performance model's
-prediction, or the last run's duration of the same wait) could sleep with a
-timer until just before the end and spin the rest — the CPU saving without
-the wake-up's latency.
+### 12.1 The early wake (2026-10-14)
+
+A sleep on the line costs its 20–35 µs wake-up after the job ended; a wait
+that knows its call's length can sleep on a timer until just before the end
+and read the ISR from there.  The generated code puts
+`INFERENCE_KERNEL_EXPECT(k, µs)` before every node's Start: the predicted
+length of the node's shortest call (`_source.py _kernel_expect_us`: the
+bitstream's performance model where it prices the call, else the analytic
+cost model — as the R5 policy prices them; every call of the four projects
+below priced).  `inference_irq_start()` notes the Start's time; the wait, when
+more than 50 µs of sleep is left, sleeps in `ppoll()` with the line armed
+until `INFERENCE_IRQ_EARLY_US` before the predicted end — a job that ends
+sooner fires the line, as before — then spins up to `INFERENCE_IRQ_SPIN_US`
+and falls back to the line.
+
+The margin, swept beside the spin alone (300 µs) in one session, two rounds,
+latency / A53 CPU against polling:
+
+| margin | LeNet | MobileNet v2 | ResNet-18 | BERT |
+|---|---|---|---|---|
+| off (spin 300 µs) | +3.0 % / −49 % | +3.7 % / −17 % | +4.3 % / −58 % | +2.3 % / −66 % |
+| 50 µs | +3.4 % / −81 % | +6.9 % / −77 % | +2.8 % / −91 % | +3.4 % / −91 % |
+| 75 µs | +0.7 % / −66 % | +0.8 % / −69 % | +0.5 % / −88 % | +0.6 % / −83 % |
+| **100 µs** | **+0.4 % / −64 %** | **+0.7 % / −58 %** | **+0.1 % / −85 %** | **+0.4 % / −81 %** |
+| 150 µs | +1.0 % / −61 % | +0.4 % / −46 % | +0.3 % / −79 % | +0.3 % / −78 % |
+
+The timer's wake-up lands about 65 µs after the asked time (the default
+50 µs timer slack and the wake-up itself): at 100 µs the waits woke about
+33 µs before the job's end (ResNet-18 420 of 420 timed sleeps, MobileNet v2
+740 of 740, BERT 1 580 of 1 700 — 120 woken by the line, calls shorter than
+predicted); at 50 µs most woke after it, on the line (ResNet-18 539 of 540 in
+one round), and paid the wake-up again.  100 µs is the default.  Every run
+bit-exact, 0 missed interrupts.

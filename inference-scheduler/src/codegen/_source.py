@@ -97,16 +97,21 @@ class _SourceMixin:
                ' * attached, a Start records the call for the firmware (the registers went to a\n'
                ' * shadow page), a kernel_wait() records a wait, and INFERENCE_RPU_FLUSH() hands\n'
                ' * the batch over where the host needs the results.  While the A53 drives, a\n'
-               ' * Start arms the kernel\'s interrupt for kernel_wait() (inference_irq.h). */\n'
+               ' * Start arms the kernel\'s interrupt for kernel_wait() (inference_irq.h), and\n'
+               ' * INFERENCE_KERNEL_EXPECT(k, us) before a node\'s Start gives its calls\' predicted\n'
+               ' * length (µs; the performance model or the cost model), so the wait sleeps until\n'
+               ' * just before the end instead of waking on the interrupt after it. */\n'
                '#ifdef __linux__\n'
                '#include "inference_rpu.h"\n'
                '#include "inference_irq.h"\n'
                f'{starts}'
                '#define INFERENCE_RPU_FLUSH()  inference_rpu_flush()\n'
                '#define INFERENCE_RPU_ENTER(r) inference_rpu_enter(r)\n'
+               '#define INFERENCE_KERNEL_EXPECT(k, us)  inference_irq_expect(k, us)\n'
                '#else\n'
                '#define INFERENCE_RPU_FLUSH()  ((void)0)\n'
                '#define INFERENCE_RPU_ENTER(r) ((void)0)\n'
+               '#define INFERENCE_KERNEL_EXPECT(k, us)  ((void)0)\n'
                '#endif\n')
         return (
             _banner("Includes") +
@@ -1921,6 +1926,44 @@ class _SourceMixin:
                     or is_active(getattr(self._graph, "numeric", None) or
                                  {"exp": {}, "host": {}, "state": []}))
 
+    def _kernel_expect_us(self) -> dict:
+        """{node index: the predicted µs of the node's shortest kernel call} —
+        the A53's early wake (runtime/inference_irq.h): the bitstream's
+        performance model where it prices the call, else the analytic cost
+        model, as the R5 policy prices them (src/rpu_policy.py).  The shortest
+        call, so a node of unequal calls wakes early rather than late (late
+        costs a wake-up, early only spin).  A node whose calls cannot be listed
+        (runtime-keyed) is absent."""
+        cached = getattr(self, "_expect_us_cache", None)
+        if cached is not None:
+            return cached
+        from ..rpu_policy import _calls_of, _default_perf_model, estimate_us
+        pm = _default_perf_model()
+        out = {}
+        for sn in self._graph.nodes:
+            if not getattr(sn, "kernel_name", ""):
+                continue
+            cs = _calls_of(sn, self._layouts)
+            if not cs or any(c is None for c in cs):
+                continue
+            us = []
+            for c in cs:
+                p = pm.predict(c) if pm is not None else None
+                us.append(p[0] if p is not None else estimate_us(c))
+            out[sn.index] = max(0, int(min(us)))
+        self._expect_us_cache = out
+        return out
+
+    def _expect_line(self, sn) -> str:
+        """INFERENCE_KERNEL_EXPECT before a node's Start: its calls' predicted
+        length for the early wake (0 when unpriced: the lane keeps no stale
+        prediction)."""
+        kid = self._KERNEL_ID_ENUM.get(sn.kernel_name)
+        if kid is None:
+            return ""
+        us = self._kernel_expect_us().get(sn.index, 0)
+        return f"    INFERENCE_KERNEL_EXPECT({kid}, {us}u);"
+
     def _inference_function(self) -> str:
         graph   = self._graph
         inputs  = graph.input_tensors
@@ -2004,12 +2047,14 @@ class _SourceMixin:
 
             elif kind == 'start':
                 sn = nodes_by_idx[ev[1]]
+                body_lines.append(self._expect_line(sn))
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
                 body_lines.append(sn.emit_call(self._layouts))
                 body_lines.append("")
 
             elif kind == 'start_sync':
                 sn = nodes_by_idx[ev[1]]
+                body_lines.append(self._expect_line(sn))
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
                 body_lines.append(sn.emit_call(self._layouts))
                 body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")

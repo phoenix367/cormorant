@@ -1,5 +1,6 @@
 """Tests for inference.c source file generation (TestSourceGen)."""
 
+import re
 import unittest
 
 from helpers import _model, _models_exist
@@ -173,6 +174,21 @@ class TestRpuRecorderHooks(unittest.TestCase):
         deinit = s[s.index("void inference_deinit(void)"):]
         self.assertIn("inference_irq_close();", deinit[:deinit.index("}")])
         self.assertIn('#include "inference_irq.h"', s)
+
+    def test_kernel_expect_before_each_start(self):
+        """Every kernel Start in inference_run() is preceded by the node's
+        predicted call length for the early wake (inference_irq.h): a macro,
+        a no-op off Linux; the value comes from the performance model or the
+        cost model, so only its form is checked here."""
+        s = self._source("mixed_matmul_relu.onnx")
+        self.assertIn("#define INFERENCE_KERNEL_EXPECT(k, us)  inference_irq_expect(k, us)", s)
+        self.assertIn("#define INFERENCE_KERNEL_EXPECT(k, us)  ((void)0)", s)
+        body = s[s.index("void inference_run("):]
+        for kid, call in (("KERNEL_MATMUL", "run_matmul("), ("KERNEL_VECTOROP", "run_op(")):
+            m = re.search(rf"INFERENCE_KERNEL_EXPECT\({kid}, (\d+)u\);\n\s*INFERENCE_PROF_BEGIN\(\d+u\);\n\s*{re.escape(call)}",
+                          body)
+            self.assertIsNotNone(m, kid)
+            self.assertGreater(int(m.group(1)), 0)
 
     def test_flush_before_output_sync(self):
         s = self._source("single_add.onnx")

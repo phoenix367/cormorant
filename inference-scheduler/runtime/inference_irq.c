@@ -26,18 +26,24 @@
 #define REG_IER          2u     /* 0x08: bit 0 latches ap_done into the ISR */
 #define REG_ISR          3u     /* 0x0C: bit 0 = done; a write toggles */
 #define POLL_TIMEOUT_MS  100    /* a sleep wakes to read the ISR at least this often */
+#define EARLY_MIN_US     50     /* a shorter timed sleep is not worth its syscall and wake-up */
 
 typedef struct {
     int                fd;      /* the UIO device (valid while regs != NULL) */
     volatile uint32_t *regs;    /* the kernel's register window, or NULL: the lane polls */
     int                armed;   /* the last Start armed the interrupt: the wait sleeps */
+    unsigned           expect_us;  /* the predicted length of the lane's calls (0: unknown) */
+    double             t_start;    /* the armed Start's time (with expect_us) */
 } lane_t;
 
 static lane_t   s_lane[LANES];
 static int      s_env_done;
 static int      s_mode = INFERENCE_IRQ_MODE_DEFAULT;
 static unsigned s_spin_us = INFERENCE_IRQ_SPIN_US_DEFAULT;
+static int      s_early_us = INFERENCE_IRQ_EARLY_US_DEFAULT;
 static unsigned long long s_waits, s_spun, s_sleeps, s_wakeups, s_timeouts, s_missed;
+static unsigned long long s_early, s_early_timer, s_early_line;
+static double   s_early_spin_s;
 
 static void env_once(void)
 {
@@ -49,6 +55,8 @@ static void env_once(void)
     else if (e && (!strcmp(e, "irq") || !strcmp(e, "1"))) s_mode = INFERENCE_WAIT_IRQ;
     e = getenv("INFERENCE_IRQ_SPIN_US");
     if (e && *e) s_spin_us = (unsigned)strtoul(e, NULL, 10);
+    e = getenv("INFERENCE_IRQ_EARLY_US");
+    if (e && *e) s_early_us = !strcmp(e, "off") ? -1 : (int)strtol(e, NULL, 10);
 }
 
 static double now_s(void)
@@ -130,6 +138,20 @@ unsigned inference_irq_set_spin_us(unsigned us)
     return prev;
 }
 
+int inference_irq_set_early_us(int us)
+{
+    int prev;
+    env_once();
+    prev = s_early_us;
+    s_early_us = us;
+    return prev;
+}
+
+void inference_irq_expect(unsigned k, unsigned us)
+{
+    if (k < LANES) s_lane[k].expect_us = us;
+}
+
 void inference_irq_start(unsigned k)
 {
     volatile uint32_t *r;
@@ -151,7 +173,46 @@ void inference_irq_start(unsigned k)
     }
     r[REG_GIE] = 1u;
     s_lane[k].armed = 1;
+    if (s_lane[k].expect_us && s_early_us >= 0) s_lane[k].t_start = now_s();
 }
+
+#if defined(__linux__)
+/* The early wake: with the line armed, sleep until s_early_us before the
+ * call's predicted end.  Returns 1 when it slept until the timer (the caller
+ * then reads the ISR), 0 otherwise. */
+static int early_sleep(lane_t *l)
+{
+    volatile uint32_t *r = l->regs;
+    const double target = l->t_start + 1e-6 * ((double)l->expect_us - (double)s_early_us);
+    if (target - now_s() < 1e-6 * EARLY_MIN_US) return 0;
+    s_early++;
+    for (;;) {
+        struct pollfd p;
+        struct timespec ts;
+        uint32_t one = 1u, count;
+        double rem;
+        int rc;
+        if (r[REG_ISR] & 1u) return 0;
+        if (write(l->fd, &one, sizeof one) != (ssize_t)sizeof one) return 0;   /* the normal path copes */
+        if (r[REG_ISR] & 1u) return 0;
+        rem = target - now_s();
+        if (rem <= 0.0) return 1;
+        ts.tv_sec = (time_t)rem;
+        ts.tv_nsec = (long)((rem - (double)ts.tv_sec) * 1e9);
+        p.fd = l->fd;
+        p.events = POLLIN;
+        p.revents = 0;
+        rc = ppoll(&p, 1, &ts, NULL);
+        if (rc > 0) {                                   /* the line: the job ended, or a stale event */
+            (void)!read(l->fd, &count, sizeof count);
+            if (r[REG_ISR] & 1u) { s_early_line++; return 0; }
+            continue;
+        }
+        if (rc == 0) { s_early_timer++; return 1; }
+        return 0;
+    }
+}
+#endif
 
 int inference_irq_wait(unsigned k)
 {
@@ -160,6 +221,13 @@ int inference_irq_wait(unsigned k)
     s_lane[k].armed = 0;
     r = s_lane[k].regs;
     s_waits++;
+#if defined(__linux__)
+    if (s_lane[k].expect_us && s_early_us >= 0 && !(r[REG_ISR] & 1u) && early_sleep(&s_lane[k])) {
+        const double t0 = now_s();
+        while (!(r[REG_ISR] & 1u) && now_s() - t0 < 1e-6 * (double)s_spin_us) { }
+        s_early_spin_s += now_s() - t0;
+    }
+#endif
     if (!(r[REG_ISR] & 1u)) {                           /* a short job costs less than a wake-up */
         const double t0 = now_s(), spin = 1e-6 * (double)s_spin_us;
         while (!(r[REG_ISR] & 1u) && now_s() - t0 < spin) { }
@@ -218,4 +286,9 @@ void inference_irq_stats(inference_irq_stats_t *out)
     out->wakeups = s_wakeups;
     out->timeouts = s_timeouts;
     out->missed = s_missed;
+    out->early_us = s_early_us;
+    out->early = s_early;
+    out->early_timer = s_early_timer;
+    out->early_line = s_early_line;
+    out->early_spin_us = 1e6 * s_early_spin_s;
 }

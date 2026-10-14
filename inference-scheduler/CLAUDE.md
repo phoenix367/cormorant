@@ -318,7 +318,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              87 pytest modules, 1829 tests, all pass (test_bert_base.py
+  test_*.py              87 pytest modules, 1830 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -613,9 +613,13 @@ Who waits, in this order: the Cortex-R5 while it drives the kernels (the
 wait is recorded, `runtime/inference_rpu.h`); on Linux, the kernel's
 interrupt when the lane's Start armed it (`runtime/inference_irq.h`: the
 generated `X<Kernel>_Start` macro calls `inference_irq_start()`, which clears
-the ISR and raises GIE; the wait spins `INFERENCE_IRQ_SPIN_US` = 300 µs, then
-sleeps in `poll()` on the kernel's UIO device; `INFERENCE_WAIT=poll` turns it
-off); otherwise `IsDone()` in a tight loop (bare metal, the host emulation).
+the ISR and raises GIE; `INFERENCE_KERNEL_EXPECT(k, µs)` before each node's
+Start gives its calls' predicted length — `_source.py _kernel_expect_us`: the
+bitstream's performance model, else the analytic cost model, the node's
+shortest call — and the wait sleeps on a timer, the line armed, until
+`INFERENCE_IRQ_EARLY_US` = 100 µs before the predicted end; then it spins
+`INFERENCE_IRQ_SPIN_US` = 300 µs, then sleeps in `poll()` on the kernel's UIO
+device; `INFERENCE_WAIT=poll` turns it off); otherwise `IsDone()` in a tight loop (bare metal, the host emulation).
 `inference_init()` opens each kernel's UIO interrupt after its driver.  The
 function stays weak, so a deployment can still replace it at link time.
 

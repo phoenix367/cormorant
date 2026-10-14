@@ -1093,8 +1093,11 @@ void kernel_wait(kernel_id_t k);
 While the Cortex-R5 drives the kernels it records a wait for the firmware
 (§14).  On Linux otherwise it waits on the kernel's interrupt: the
 generated `X<Kernel>_Start` macro arms it (`inference_irq_start()`: ISR
-cleared and confirmed, GIE up), and the wait spins `INFERENCE_IRQ_SPIN_US`
-(300 µs), then sleeps in `poll()` on the kernel's UIO device
+cleared and confirmed, GIE up); `INFERENCE_KERNEL_EXPECT(k, µs)` before the
+Start gives the call's predicted length (the performance model or the cost
+model), and the wait sleeps on a timer until 100 µs before the predicted end,
+spins up to `INFERENCE_IRQ_SPIN_US` (300 µs), then sleeps in `poll()` on the
+kernel's UIO device
 (`runtime/inference_irq.[ch]`, `INFERENCE_WAIT=poll` to poll).  Bare metal
 and the host emulation poll `X<Kernel>_IsDone()`.  The function stays weak,
 so a deployment can replace it at link time.  One

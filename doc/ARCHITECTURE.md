@@ -264,10 +264,11 @@ generated model library decides per entry which one does
 
 - **A53.**  The library writes each call's registers through UIO and starts
   the kernel.  It waits only where a later call or a host op needs the
-  result: it reads the kernel's ISR for 300 µs, then sleeps on the kernel's
-  interrupt through its UIO device (`runtime/inference_irq.[ch]`; §6.3).  A
-  sleep costs 20–35 µs of wake-up: 2–4 % latency on ResNet-18 or BERT, for
-  58–66 % less A53 CPU.
+  result: it sleeps on a timer until just before the call's predicted end
+  (the scheduler's performance model), reads the kernel's ISR from there, and
+  falls back to sleeping on the kernel's interrupt through its UIO device
+  (`runtime/inference_irq.[ch]`; §6.3).  On ResNet-18 and BERT that costs
+  0.1–0.4 % latency for 81–85 % less A53 CPU.
 - **R5.**  The library records each call's register block into a command ring
   in uncached DDR instead of writing it.  It flushes the batch to the R5
   before each host op.  The R5 writes the registers, starts the kernel and

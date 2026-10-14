@@ -100,7 +100,7 @@ def _strip_plan(lines, out_dir):
         if cont and ln.startswith(" *          "):
             continue
         cont = False
-        if "Generated at" not in ln:
+        if "Generated at" not in ln and not ln.startswith("| Generated |"):   # the report's timestamp row
             out.append(ln.replace(out_dir, "OUT"))
     return out
 
