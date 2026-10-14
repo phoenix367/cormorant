@@ -7,12 +7,15 @@
  * interrupt-driven waits, inference_rpu.h) — and compares every output bit
  * for bit.
  *
- *   rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto]
+ *   rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] [--irq [--spin-us N]]
  *
  * Default: the second run is forced onto the R5 (INFERENCE_RPU_MODE_R5, the
  * gate of the R5 path).  --auto lets the project's policy choose instead
  * (INFERENCE_RPU_RECOMMENDED, src/rpu_policy.py): a small model then stays on
- * the A53 in both runs.
+ * the A53 in both runs.  --irq gates the A53's waits on the kernels'
+ * interrupts instead (inference_irq.h): both runs on the A53, the reference
+ * polling, the second sleeping on the interrupts (--spin-us: the spin before
+ * a sleep); the firmware need not run.
  *
  * Exit 0: every run bit-exact (or --no-check); 1: a mismatch or an R5 error;
  * 2: a setup error.  Load / start the firmware with remoteproc first
@@ -55,7 +58,9 @@ static void fill_ramp(Data_t *p, unsigned n, unsigned offset)
 int main(int argc, char **argv)
 {
     unsigned runs = 5u, ring_kb = 0u, i, r, on_r5 = 0u;
-    int check = 1, rc, bad_runs = 0, arg, auto_mode = 0;
+    int check = 1, rc, bad_runs = 0, arg, auto_mode = 0, irq_mode = 0;
+    long spin_us = -1;
+    inference_irq_stats_t ist;
     static const unsigned sizes[] = INFERENCE_RPU_IO_SIZES;
     const unsigned n_in = INFERENCE_RPU_N_IN, n_io = INFERENCE_RPU_N_IN + INFERENCE_RPU_N_OUT;
     inference_buf_t *io[INFERENCE_RPU_N_IN + INFERENCE_RPU_N_OUT];
@@ -71,12 +76,27 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[arg], "--ring-kb") && arg + 1 < argc) ring_kb = (unsigned)atoi(argv[++arg]);
         else if (!strcmp(argv[arg], "--no-check")) check = 0;
         else if (!strcmp(argv[arg], "--auto")) auto_mode = 1;
-        else { fprintf(stderr, "usage: rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto]\n"); return 2; }
+        else if (!strcmp(argv[arg], "--irq")) irq_mode = 1;
+        else if (!strcmp(argv[arg], "--spin-us") && arg + 1 < argc) spin_us = atol(argv[++arg]);
+        else {
+            fprintf(stderr, "usage: rpu_host [--runs N] [--no-check] [--ring-kb N] [--auto] [--irq [--spin-us N]]\n");
+            return 2;
+        }
     }
 
     rc = inference_init(INFERENCE_RPU_LINUX_INIT_ARGS);        /* its policy attaches when the firmware runs */
     if (rc != 0) { fprintf(stderr, "inference_init failed: %d\n", rc); return 2; }
-    if (ring_kb || inference_rpu_mode() < 0) {                  /* a ring size, or INFERENCE_RPU=0 in the environment */
+    if (irq_mode) {                                             /* the A53 drives every run, attached or not */
+        inference_rpu_set_mode(INFERENCE_RPU_MODE_A53);
+        if (spin_us >= 0) inference_irq_set_spin_us((unsigned)spin_us);
+        inference_irq_stats(&ist);
+        if (!ist.lanes) {
+            fprintf(stderr, "no kernel of this project has its UIO interrupt (the overlay's fabric_* nodes?)\n");
+            return 2;
+        }
+        printf("irq: the A53 drives; reference polling, then waits on the interrupts of lanes 0x%x "
+               "(spin %u us before a sleep)\n", ist.lanes, ist.spin_us);
+    } else if (ring_kb || inference_rpu_mode() < 0) {           /* a ring size, or INFERENCE_RPU=0 in the environment */
         inference_rpu_detach();
         rc = inference_rpu_attach(ring_kb * 1024u);
         if (rc != 0) {
@@ -87,10 +107,11 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    printf("policy: %s (%u calls, %u batch(es), %u us predicted, %u us R5 overhead); this gate %s\n",
-           INFERENCE_RPU_RECOMMENDED ? "the R5 drives the kernels" : "the A53 drives the kernels",
-           INFERENCE_RPU_CALLS, INFERENCE_RPU_BATCHES, INFERENCE_RPU_PREDICTED_US, INFERENCE_RPU_OVERHEAD_US,
-           auto_mode ? "follows it" : "forces the R5");
+    if (!irq_mode)
+        printf("policy: %s (%u calls, %u batch(es), %u us predicted, %u us R5 overhead); this gate %s\n",
+               INFERENCE_RPU_RECOMMENDED ? "the R5 drives the kernels" : "the A53 drives the kernels",
+               INFERENCE_RPU_CALLS, INFERENCE_RPU_BATCHES, INFERENCE_RPU_PREDICTED_US, INFERENCE_RPU_OVERHEAD_US,
+               auto_mode ? "follows it" : "forces the R5");
     for (i = 0u; i < n_io; i++) {
         io[i] = inference_buf_alloc(sizes[i]);
         if (!io[i]) { fprintf(stderr, "inference_buf_alloc failed\n"); return 2; }
@@ -100,15 +121,18 @@ int main(int argc, char **argv)
         ref[i - n_in] = (Data_t *)calloc(sizes[i], INFERENCE_BYTES_PER_ELEM);
         if (!ref[i - n_in]) return 2;
     }
-    inference_rpu_stats(&st);
-    printf("rpu: firmware lanes 0x%x, interrupt self-test %s, %u batches so far\n",
-           st.lanes, st.self_test_ok ? "ok" : "FAILED", st.batches);
+    if (!irq_mode) {
+        inference_rpu_stats(&st);
+        printf("rpu: firmware lanes 0x%x, interrupt self-test %s, %u batches so far\n",
+               st.lanes, st.self_test_ok ? "ok" : "FAILED", st.batches);
+    }
 
     for (r = 0u; r < runs; r++) {
         unsigned bad = 0u;
         for (i = 0u; i < n_in; i++) fill_ramp(inference_buf_ptr(io[i]), sizes[i], r);
         if (check) {                                    /* the reference: the A53 drives the kernels */
-            inference_rpu_set_mode(INFERENCE_RPU_MODE_A53);
+            if (irq_mode) inference_irq_set_mode(INFERENCE_WAIT_POLL);
+            else inference_rpu_set_mode(INFERENCE_RPU_MODE_A53);
             t0 = now_s(); c0 = cpu_s();
             INFERENCE_RPU_RUN(io);
             t_a53 += now_s() - t0; cpu_a53 += cpu_s() - c0;
@@ -117,9 +141,10 @@ int main(int argc, char **argv)
             for (i = n_in; i < n_io; i++)
                 memset(inference_buf_ptr(io[i]), 0x5A, (size_t)sizes[i] * INFERENCE_BYTES_PER_ELEM);
         }
-        inference_rpu_set_mode(auto_mode ? INFERENCE_RPU_MODE_AUTO : INFERENCE_RPU_MODE_R5);
+        if (irq_mode) inference_irq_set_mode(INFERENCE_WAIT_IRQ);
+        else inference_rpu_set_mode(auto_mode ? INFERENCE_RPU_MODE_AUTO : INFERENCE_RPU_MODE_R5);
         t0 = now_s(); c0 = cpu_s();
-        INFERENCE_RPU_RUN(io);                          /* the R5, or the policy's choice */
+        INFERENCE_RPU_RUN(io);                          /* the R5, the policy's choice, or the A53 on interrupts */
         t_run += now_s() - t0; cpu_run += cpu_s() - c0;
         if (inference_rpu_active()) on_r5++;
         if (inference_rpu_error()) { fprintf(stderr, "run %u: R5 error %d\n", r, inference_rpu_error()); return 1; }
@@ -134,11 +159,29 @@ int main(int argc, char **argv)
                     }
             }
         }
+        if (bad) bad_runs++;
+        if (irq_mode) {
+            inference_irq_stats(&ist);
+            printf("run %u: A53 on interrupts %.3f ms%s (%llu waits, %llu sleeps so far)%s\n", r,
+                   (t_run / (r + 1u)) * 1e3, check ? "" : " (no check)", ist.waits, ist.sleeps,
+                   check ? (bad ? "  MISMATCH" : "  bit-exact with polling") : "");
+            continue;
+        }
         inference_rpu_stats(&st);
         printf("run %u: %s %.3f ms%s (%u batches, %u calls, %u waits so far)%s\n", r,
                inference_rpu_active() ? "R5" : "A53", (t_run / (r + 1u)) * 1e3, check ? "" : " (no check)",
                st.batches, st.calls, st.waits, check ? (bad ? "  MISMATCH" : "  bit-exact with the A53") : "");
-        if (bad) bad_runs++;
+    }
+    if (irq_mode) {
+        inference_irq_stats(&ist);
+        printf("summary: %u runs on interrupts, mean %.3f ms (A53 CPU %.3f ms)", runs, t_run / runs * 1e3,
+               cpu_run / runs * 1e3);
+        if (check) printf(", polling mean %.3f ms (A53 CPU %.3f ms)", t_a53 / runs * 1e3, cpu_a53 / runs * 1e3);
+        printf("; spin %u us; waits %llu: %llu within the spin, %llu sleeps, %llu wake-ups, %llu timeouts, "
+               "%llu missed; %s\n", ist.spin_us, ist.waits, ist.spun, ist.sleeps, ist.wakeups, ist.timeouts,
+               ist.missed, bad_runs ? "MISMATCH" : (check ? "all runs bit-exact" : "unchecked"));
+        inference_deinit();
+        return bad_runs || ist.missed ? 1 : 0;
     }
     inference_rpu_stats(&st);
     printf("summary: %u runs (%u driven by the R5), measured mean %.3f ms (A53 CPU %.3f ms)", runs, on_r5,

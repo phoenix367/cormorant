@@ -50,6 +50,8 @@ class TestCLI(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(td, "src", "inference_rpu.c")))
             self.assertTrue(os.path.isfile(os.path.join(td, "include", "inference_rpu.h")))
             self.assertTrue(os.path.isfile(os.path.join(td, "include", "rpu_ctrl.h")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "include", "inference_irq.h")))
+            self.assertTrue(os.path.isfile(os.path.join(td, "src", "inference_irq.c")))
             self.assertTrue(os.path.isfile(os.path.join(td, "rpu", "rpu_host.c")))
             self.assertFalse(os.path.exists(os.path.join(td, "rpu", "rpu_main.c")))
 

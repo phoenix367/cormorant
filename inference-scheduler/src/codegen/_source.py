@@ -90,14 +90,17 @@ class _SourceMixin:
         from ._source import _SourceMixin as _M
         starts = "".join(
             f"#define {kd.c_type}_Start(inst)  (inference_rpu_active() ? "
-            f"inference_rpu_start({_M._KERNEL_ID_ENUM[kd.name]}) : ({kd.c_type}_Start)(inst))\n"
+            f"inference_rpu_start({_M._KERNEL_ID_ENUM[kd.name]}) : "
+            f"(inference_irq_start({_M._KERNEL_ID_ENUM[kd.name]}), ({kd.c_type}_Start)(inst)))\n"
             for kd in self._active_kernels)
         rpu = ('/* Driving the kernels from the Cortex-R5 (inference_rpu.h, RPU_PLAN B1): while\n'
                ' * attached, a Start records the call for the firmware (the registers went to a\n'
                ' * shadow page), a kernel_wait() records a wait, and INFERENCE_RPU_FLUSH() hands\n'
-               ' * the batch over where the host needs the results. */\n'
+               ' * the batch over where the host needs the results.  While the A53 drives, a\n'
+               ' * Start arms the kernel\'s interrupt for kernel_wait() (inference_irq.h). */\n'
                '#ifdef __linux__\n'
                '#include "inference_rpu.h"\n'
+               '#include "inference_irq.h"\n'
                f'{starts}'
                '#define INFERENCE_RPU_FLUSH()  inference_rpu_flush()\n'
                '#define INFERENCE_RPU_ENTER(r) inference_rpu_enter(r)\n'
@@ -644,13 +647,12 @@ class _SourceMixin:
     }
 
     def _kernel_wait_helper(self) -> str:
-        """Emit kernel_id_t and a weak kernel_wait() polling default.
+        """Emit kernel_id_t and the weak kernel_wait(): the R5's recorded wait
+        while it drives, the kernel's interrupt where the lane's Start armed it
+        (Linux, inference_irq.h), else IsDone() polling.
 
         Only enumerates kernels the model actually uses, so single-kernel
         projects don't pull in references to undeclared driver instances.
-        The function is __weak so deployments that prefer interrupt-driven
-        waiting (UIO/IRQ on Linux, GIC under bare-metal) can override it at
-        link time without touching the generated source.
         """
         active = list(self._active_kernels)
         if not active:
@@ -701,14 +703,16 @@ class _SourceMixin:
             " * earlier op, or when a lane must be reused.  This lets different lanes\n"
             " * (Conv ‖ Pool ‖ VectorOP ‖ Matmul) overlap without threading.\n"
             " *\n"
-            " * The default implementation polls IsDone() in a tight loop.  It is\n"
-            " * declared __weak so deployments that prefer interrupt-driven waiting\n"
-            " * can override it at link time:\n"
-            " *\n"
-            " *     void kernel_wait(kernel_id_t k) { ... wait-for-IRQ ... }\n"
-            " *\n"
-            " * rpu/inference_irq.c is that override for the Cortex-R5 firmware (the\n"
-            " * GIC's PL lines, WFI between a Start and its ap_done).\n"
+            " * Who waits, in this order:\n"
+            " *   - the Cortex-R5, while it drives the kernels (inference_rpu.h): the\n"
+            " *     wait is recorded for the firmware;\n"
+            " *   - the kernel's interrupt (Linux, inference_irq.h): when the lane's\n"
+            " *     Start armed it — INFERENCE_WAIT=irq, the default, and a UIO\n"
+            " *     device with the kernel's line — the A53 spins briefly, then sleeps\n"
+            " *     until the line fires;\n"
+            " *   - otherwise IsDone() in a tight loop (bare metal, INFERENCE_WAIT=poll,\n"
+            " *     the host emulation).\n"
+            " * It is declared __weak so a deployment can still replace it at link time.\n"
             " */\n"
             + "\n".join(enum_lines) + "\n\n"
             "__attribute__((weak))\n"
@@ -716,6 +720,7 @@ class _SourceMixin:
             "{\n"
             "#ifdef __linux__\n"
             "    if (inference_rpu_active()) { inference_rpu_wait(k); return; }   /* the R5 waits */\n"
+            "    if (inference_irq_wait(k)) return;                 /* the kernel's interrupt */\n"
             "#endif\n"
             "    switch (k) {\n"
             + "\n".join(case_lines) + "\n"
@@ -1816,7 +1821,12 @@ class _SourceMixin:
                 "#else\n"
                 f"    rc = _inference_cfg_init_{kd.driver_prefix}(&{kd.c_var}, {kd.init_param});\n"
                 "#endif\n"
-                "    if (rc != 0) goto fail;\n" + probe
+                "    if (rc != 0) goto fail;\n" + probe +
+                "#ifdef __linux__\n"
+                "    /* its interrupt, for kernel_wait() (inference_irq.h; without one it polls) */\n"
+                f"    (void)inference_irq_open({self._KERNEL_ID_ENUM[kd.name]}, {kd.init_param},\n"
+                f"                             (void *)(uintptr_t){kd.c_var}.Ctrl_BaseAddress);\n"
+                "#endif\n"
             )
         if self._has_rowops_nodes:
             from ..rowops_nodes import TABLES_NAME
@@ -1893,6 +1903,7 @@ class _SourceMixin:
             "{\n"
             "#ifdef __linux__\n"
             "    inference_rpu_detach();   /* the drivers' real bases back; the ring is a pool buffer */\n"
+            "    inference_irq_close();\n"
             "#endif\n"
             f"{deinit_body}"
             "    inference_buf_pool_deinit();\n"

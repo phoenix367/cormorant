@@ -667,3 +667,71 @@ Where B3's 0.5 W has to come from: the idle board is ~4.7 W with the PL at
 R5's sleep together give ~60 mW.  Next: the APU clock (333 MHz between
 requests, `userspace` governor), the R5 stopped while no library is attached
 (69 mW), the PL clocks and DDR between requests.
+
+## 12. The A53's waits on the kernels' interrupts (2026-10-13)
+
+With the overlay's interrupt numbers fixed (MatmulKernel, ConvKernel and
+PoolingKernel had SPIs 96–98 in `dts/kv260/cormorant.dts`, the bitstream
+raises them on 90–92), a library that drives the kernels from the A53 can
+sleep on them too.  `runtime/inference_irq.[ch]` (every generated Linux
+project) does what the R5's `rpu_irq.c` does, through UIO:
+
+- **record**: the kernel's ISR bit 0 (IER bit 0 set);
+- **Start** (`inference_irq_start()`, called by the generated
+  `X<Kernel>_Start` macro while the A53 drives): clear the previous job's bit
+  and confirm the clear landed, raise GIE;
+- **wait** (`kernel_wait()` → `inference_irq_wait()`): read the ISR for
+  `INFERENCE_IRQ_SPIN_US`, then unmask the line (a write of 1 to the kernel's
+  `/dev/uioN`; `uio_pdrv_genirq` masks it when it fires), read again, sleep in
+  `poll()`; drop GIE after the wait.  The level line is high from ap_done to
+  the next Start, so an unmask after the job ended fires at once.
+
+`INFERENCE_WAIT=poll` (or `-DINFERENCE_IRQ_MODE_DEFAULT=0`) polls as before; a
+lane without a UIO interrupt polls.  The gate is `rpu_board.py --mode irq`
+(`rpu_host --irq`): each run first polling, then on the interrupts, bit for
+bit.
+
+**Board** (bitstream `1cedaf2ed816`, deep idle on, the firmware stopped; 20
+runs, BERT 10; projects from the CLI): every run bit-exact, 0 timeouts, 0
+missed interrupts in 30 000 waits.  Latency and A53 CPU against polling, by
+the spin before a sleep:
+
+| spin | LeNet (1.29 ms) | MobileNet v2 (17.4 ms) | ResNet-18 (20.0 ms) | BERT (265 ms) |
+|---|---|---|---|---|
+| 0 µs | +13 % / −83 % | +14 % / −84 % | +8 % / −93 % | +7 % / −95 % |
+| 100 µs | +3 % / −64 % | +11 % / −46 % | +7 % / −78 % | +4 % / −76 % |
+| **200 µs** | **+2 % / −57 %** | **+7 % / −26 %** | **+2 % / −68 %** | **+2 % / −70 %** |
+| 500 µs | +3 % / −34 % | +1.5 % / −7 % | +2.5 % / −40 % | +2 % / −57 % |
+| 1000 µs | ±0 / ±0 | ±0 / ±0 | +1 % / −6 % | +1.5 % / −42 % |
+
+A sleep costs 20–35 µs of wake-up (spin 0: MobileNet v2 +2.4 ms over 100
+sleeps an inference, BERT +18 ms over 548).  200 µs, the first default:
+most short calls end within the spin, and the long ones sleep; MobileNet v2
+loses most, because many of its waits run just past the spin.
+
+250 and 300 µs, run beside 200 µs in one session (two rounds each): the
+latency is the same within the noise — the two rounds of one setting differ
+by up to 3 points (ResNet-18 at 250 µs: +5.2 / +1.8 %) — while the CPU saving
+shrinks:
+
+| spin | LeNet | MobileNet v2 | ResNet-18 | BERT |
+|---|---|---|---|---|
+| 200 µs | +2.5 % / −56 % | +3.8 % / −26 % | +3.9 % / −68 % | +2.2 % / −70 % |
+| 250 µs | +3.6 % / −52 % | +3.4 % / −21 % | +3.5 % / −63 % | +2.7 % / −68 % |
+| 300 µs | +1.9 % / −48 % | +2.8 % / −17 % | +3.9 % / −58 % | +2.5 % / −66 % |
+
+Only MobileNet v2 and BERT sleep less as the spin grows (600 → 360 → 260
+and 1 450 → 1 330 → 1 210 sleeps per 20 / 10 runs); LeNet and ResNet-18 sleep
+as often.  The default is 300 µs: in this session the lowest latency for
+LeNet and MobileNet v2, the fewest sleeps, for a smaller CPU saving — A53 CPU
+−48 / −17 / −58 / −66 % at +1.9 / +2.8 / +3.9 / +2.5 % latency.
+
+The R5 gate (`--mode both`) with the A53 reference on interrupts — the same
+kernels handed between the A53's and the R5's waits every run: LeNet,
+ResNet-18 and BERT bit-exact; the R5 path unchanged (ResNet-18 20.1 ms, BERT
+266 ms, A53 CPU 0.66 / 1.1 ms an inference).
+
+Open: a wait that knows its call's length (the performance model's
+prediction, or the last run's duration of the same wait) could sleep with a
+timer until just before the end and spin the rest — the CPU saving without
+the wake-up's latency.

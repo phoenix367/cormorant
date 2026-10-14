@@ -49,7 +49,8 @@ class _CmakeMixin:
         sinit_files = ""
         linux_files = "\n".join(
             [f"    driver/{kd.driver_prefix}_linux.c" for kd in active]
-            + ["    src/inference_rpu.c"]      # the Cortex-R5 recorder (inference_rpu.h)
+            + ["    src/inference_rpu.c",      # the Cortex-R5 recorder (inference_rpu.h)
+               "    src/inference_irq.c"]      # the waits on the kernels' interrupts (inference_irq.h)
         )
 
         # Common (shared) kernel driver .c sources for the static library

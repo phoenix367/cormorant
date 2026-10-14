@@ -633,6 +633,7 @@ def run_calls(mg, workdir, calls, incoherent=False):
     shutil.copy(os.path.join(host_emu._ROOT, "runtime", "inference_prof.h"), inc)
     shutil.copy(os.path.join(host_emu._ROOT, "runtime", "inference_rpu.h"), inc)      # the R5 recorder: linked, never attached
     shutil.copy(os.path.join(host_emu._ROOT, "runtime", "rpu", "rpu_ctrl.h"), inc)
+    shutil.copy(os.path.join(host_emu._ROOT, "runtime", "inference_irq.h"), inc)      # the A53's interrupt waits
     for name, tb in mg.host_table_files():
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
         with open(os.path.join(workdir, "weights", f"{name}.dat"), "wb") as f:
@@ -649,6 +650,7 @@ def run_calls(mg, workdir, calls, incoherent=False):
                         f'-DINFERENCE_WEIGHTS_DIR="{workdir}"', "-I", inc, "-I", emu,
                         os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
                         os.path.join(host_emu._ROOT, "runtime", "inference_rpu.c"),
+                        os.path.join(host_emu._ROOT, "runtime", "inference_irq.c"),
                         os.path.join(src, "drive.c"), "-lm", "-o", exe],
                        capture_output=True, text=True)
     if r.returncode:

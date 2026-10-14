@@ -35,10 +35,11 @@ import host_emu                                                     # noqa: E402
 
 
 def _rpu_recorder(project: str) -> list:
-    """The project's Cortex-R5 recorder (src/inference_rpu.c, RPU_PLAN §9): the
-    generated inference.c calls it; projects from before the R5 work lack both."""
-    p = os.path.join(project, "src", "inference_rpu.c")
-    return [p] if os.path.exists(p) else []
+    """The project's Cortex-R5 recorder (src/inference_rpu.c, RPU_PLAN §9) and its
+    waits on the kernels' interrupts (src/inference_irq.c, polling here): the
+    generated inference.c calls them; older projects lack them."""
+    ps = [os.path.join(project, "src", f) for f in ("inference_rpu.c", "inference_irq.c")]
+    return [p for p in ps if os.path.exists(p)]
 
 def build(project: str, work: str, incoherent: bool = False) -> str:
     from src._conv_hw_config import CONV_TILE_IC

@@ -27,7 +27,10 @@ Steps (the per-board lock is held throughout, src/remote/lock.py):
               interrupt-driven waits) or the project's policy choosing (--mode
               auto: small models stay on the A53, src/rpu_policy.py); compared
               bit for bit, both timed, the R5's counters; --mode both (default)
-              runs one pass of each
+              runs one pass of each; --mode irq gates the A53's waits on the
+              kernels' interrupts instead (inference_irq.h: the reference
+              polling, then sleeping on the UIO interrupts; no firmware,
+              --spin-us the spin before a sleep)
   stop     -> remoteproc0 stopped (the overlay stays); the board's CMA cleaned
               (src/remote/cma.py: page cache dropped, memory compacted)
 
@@ -130,10 +133,13 @@ def main(argv=None) -> int:
     ap.add_argument("--ring-kb", type=int, default=0, help="the command ring (default 1 MiB)")
     ap.add_argument("--firmware-name", default="rpu_firmware.elf")
     ap.add_argument("--no-check", action="store_true", help="time the R5 only, no A53 reference")
-    ap.add_argument("--mode", choices=("r5", "auto", "both"), default="both",
+    ap.add_argument("--mode", choices=("r5", "auto", "both", "irq"), default="both",
                     help="r5: the R5 drives every checked run (the gate of the R5 path); auto: the "
                          "project's policy decides (INFERENCE_RPU_RECOMMENDED, src/rpu_policy.py); "
-                         "both (default): one pass of each")
+                         "both (default): one pass of each; irq: the A53 drives, polling against "
+                         "sleeping on the kernels' interrupts (inference_irq.h; no firmware)")
+    ap.add_argument("--spin-us", type=int, default=None,
+                    help="--mode irq: the spin before a sleep (default: the library's)")
     ap.add_argument("--keep-running", action="store_true", help="leave the firmware running")
     ap.add_argument("--board-lock", default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -152,7 +158,8 @@ def main(argv=None) -> int:
         return 0
     if not args.project and not args.start_only:
         ap.error("--project is required (or --start-only / --stop)")
-    if not args.bsp_dir:
+    firmware = args.mode != "irq"                        # the A53's interrupt gate needs no R5
+    if firmware and not args.bsp_dir:
         ap.error("--bsp-dir is required to build the firmware")
     if args.start_only:
         args.keep_running = True
@@ -161,26 +168,31 @@ def main(argv=None) -> int:
         if not (project / "rpu" / "rpu_host.c").is_file() or not (project / "src" / "inference_rpu.c").is_file():
             print(f"{project}: no rpu/rpu_host.c or src/inference_rpu.c (generate the project again)", file=sys.stderr)
             return 2
+        if not firmware and not (project / "src" / "inference_irq.c").is_file():
+            print(f"{project}: no src/inference_irq.c (generate the project again)", file=sys.stderr)
+            return 2
     hold_board_lock(cfg, args.board_lock)
 
     with tempfile.TemporaryDirectory(prefix="rpu_board_") as td:
         tdp = Path(td)
-        print("firmware: building for the R5 ...", flush=True)
-        with open(tdp / "firmware_build.log", "w") as log:
-            try:
-                elf, dtbo, dtbo_ipi = build_artifacts(Path(args.bsp_dir), tdp, log)
-            except (subprocess.CalledProcessError, RuntimeError) as e:
-                print(f"firmware: build failed: {e}\n{(tdp / 'firmware_build.log').read_text()[-3000:]}",
-                      file=sys.stderr)
-                return 2
-        print(f"firmware: {elf.stat().st_size} bytes; overlay {dtbo.name}", flush=True)
+        if firmware:
+            print("firmware: building for the R5 ...", flush=True)
+            with open(tdp / "firmware_build.log", "w") as log:
+                try:
+                    elf, dtbo, dtbo_ipi = build_artifacts(Path(args.bsp_dir), tdp, log)
+                except (subprocess.CalledProcessError, RuntimeError) as e:
+                    print(f"firmware: build failed: {e}\n{(tdp / 'firmware_build.log').read_text()[-3000:]}",
+                          file=sys.stderr)
+                    return 2
+            print(f"firmware: {elf.stat().st_size} bytes; overlay {dtbo.name}", flush=True)
 
         session = RemoteSession(cfg["ssh"])
         session.connect()
         try:
             work = cfg["remote"]["work_dir"].rstrip("/") + "/rpu_board"
             session.exec(f"rm -rf {work} && mkdir -p {work}")
-            print(f"upload: {len(projects)} project(s), the firmware and the overlay ...", flush=True)
+            print(f"upload: {len(projects)} project(s)"
+                  + (", the firmware and the overlay" if firmware else "") + " ...", flush=True)
             stage = tdp / "stage"
             stage.mkdir()
             names = []
@@ -191,19 +203,21 @@ def main(argv=None) -> int:
                 names.append(name)
                 subprocess.run(["cp", "-a", str(project), str(stage / name)], check=True)
                 subprocess.run(["rm", "-rf", str(stage / name / "build")])
-            subprocess.run(["cp", str(elf), str(stage / args.firmware_name)], check=True)
-            subprocess.run(["cp", str(dtbo), str(stage / "rpu.dtbo")], check=True)
-            subprocess.run(["cp", str(dtbo_ipi), str(stage / "rpu-ipi.dtbo")], check=True)
+            if firmware:
+                subprocess.run(["cp", str(elf), str(stage / args.firmware_name)], check=True)
+                subprocess.run(["cp", str(dtbo), str(stage / "rpu.dtbo")], check=True)
+                subprocess.run(["cp", str(dtbo_ipi), str(stage / "rpu-ipi.dtbo")], check=True)
             session.upload_dir(stage, work)
 
-            script = firmware_up_script(work, args.firmware_name)
-            out, err, rc = session.exec(script, timeout=60)
-            if args.verbose or rc != 0:
-                print(out + err)
-            if rc != 0 or "running" not in out:
-                print("rpu: the firmware did not start (dmesg on the board tells why)", file=sys.stderr)
-                return 2
-            print("rpu: firmware running", flush=True)
+            if firmware:
+                script = firmware_up_script(work, args.firmware_name)
+                out, err, rc = session.exec(script, timeout=60)
+                if args.verbose or rc != 0:
+                    print(out + err)
+                if rc != 0 or "running" not in out:
+                    print("rpu: the firmware did not start (dmesg on the board tells why)", file=sys.stderr)
+                    return 2
+                print("rpu: firmware running", flush=True)
             # the uploads' page cache sits in the CMA area: clean it before any library
             # allocates its pool (a 311 MB pool failed with 880 MB free once, 2026-10-13)
             print(f"cma: {describe(clean_cma(session)['after'])}", flush=True)
@@ -227,11 +241,14 @@ def main(argv=None) -> int:
                 worst_rc = 0
                 for mode in (("r5", "auto") if args.mode == "both" else (args.mode,)):
                     print(f"run: {args.runs} inferences, "
-                          + ("the R5 driving the kernels" if mode == "r5" else "the policy choosing the driver")
+                          + {"r5": "the R5 driving the kernels", "auto": "the policy choosing the driver",
+                             "irq": "the A53 polling, then sleeping on the kernels' interrupts"}[mode]
                           + " ...", flush=True)
                     cmd = f"cd {pdir} && timeout {cfg['run']['timeout']} ./build/rpu_host --runs {args.runs}" \
                           + (f" --ring-kb {args.ring_kb}" if args.ring_kb else "") \
-                          + (" --no-check" if args.no_check else "") + (" --auto" if mode == "auto" else "")
+                          + (" --no-check" if args.no_check else "") + (" --auto" if mode == "auto" else "") \
+                          + (" --irq" if mode == "irq" else "") \
+                          + (f" --spin-us {args.spin_us}" if mode == "irq" and args.spin_us is not None else "")
                     out, err, rc = session.exec(cmd, timeout=cfg["run"]["timeout"] + 30)
                     lines = out.strip().splitlines()
                     shown = lines if args.verbose else [ln for ln in lines if not ln.startswith("run ") or "MISMATCH" in ln][:12]
@@ -240,15 +257,15 @@ def main(argv=None) -> int:
                         print(err.strip(), file=sys.stderr)
                     worst_rc = max(worst_rc, rc)
                 results[name] = worst_rc
-            if not args.keep_running:
+            if firmware and not args.keep_running:
                 session.exec(FIRMWARE_STOP, timeout=30)
             # the projects' pools fragment the CMA: clean it for whatever comes next
             # (the chat server's 775 MiB pool failed to allocate after six gates once)
             clean_cma(session)
             print()
             for name, rc in results.items():
-                print(f"BOARD GATE {name}: " + ("bit-exact with the A53" if rc == 0 else
-                                                 "MISMATCH" if rc == 1 else f"failed (rc {rc})"))
+                ok = "bit-exact with polling" if args.mode == "irq" else "bit-exact with the A53"
+                print(f"BOARD GATE {name}: " + (ok if rc == 0 else "MISMATCH" if rc == 1 else f"failed (rc {rc})"))
             worst = max(results.values()) if results else 2
             return 0 if worst == 0 else (1 if worst == 1 else 2)
         finally:

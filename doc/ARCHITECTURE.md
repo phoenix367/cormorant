@@ -263,9 +263,11 @@ generated model library decides per entry which one does
 (`inference-scheduler/src/rpu_policy.py`).
 
 - **A53.**  The library writes each call's registers through UIO and starts
-  the kernel.  It polls `ap_done` only where a later call or a host op needs
-  the result.  This is the simplest mode, but the core spins through every
-  call.
+  the kernel.  It waits only where a later call or a host op needs the
+  result: it reads the kernel's ISR for 300 µs, then sleeps on the kernel's
+  interrupt through its UIO device (`runtime/inference_irq.[ch]`; §6.3).  A
+  sleep costs 20–35 µs of wake-up: 2–4 % latency on ResNet-18 or BERT, for
+  58–66 % less A53 CPU.
 - **R5.**  The library records each call's register block into a command ring
   in uncached DDR instead of writing it.  It flushes the batch to the R5
   before each host op.  The R5 writes the registers, starts the kernel and
@@ -827,10 +829,14 @@ five lines are concatenated into `pl_ps_irq0[4:0]`:
 | PoolingKernel | 3 | 92 | 124 | the R5's waits |
 | RowOpsKernel | 4 | 93 | 125 | the R5's waits |
 
-The A53 polls `ap_done` and does not use the kernel interrupts.  The R5
-sets GIE on a lane before the lane's first start in a batch and clears it at
-the end of the batch.  The A53 can then drive the same kernel between
-batches without stray interrupts.  The Linux overlay
+Both processors use the same record, ISR bit 0 (IER bit 0 set), and raise
+GIE only while they wait.  The R5 sets GIE on a lane before the lane's first
+start in a batch and clears it at the end of the batch.  The A53, when it
+drives, clears the ISR and raises GIE before each start and drops GIE after
+its wait (`inference_irq.h`); Linux's `uio_pdrv_genirq` masks the line when
+it fires, and the library unmasks it before each sleep.  So a kernel line is
+up only while one of them waits on it, and either can drive a kernel after
+the other.  The Linux overlay
 (`dts/kv260/cormorant.dts`) gives each kernel's UIO node the same SPI, so an
 interrupt-driven wait on the A53 can use it; the fact registry's
 `board.irq_spi` checks the overlay and this table against the block design.
@@ -902,6 +908,7 @@ Every level is checked bit-exactly against the level above it:
 | generated software | the generated C against software kernels | the scheduler's simulator | `inference-scheduler/test/host_emu.py`, also with incoherent caches |
 | the board | the bitstream and the libraries | the simulator's expectations, bit for bit | `run_remote_tests.py` (the model suite), every demo and library gate |
 | the R5 path | the R5-driven runs | the A53-driven runs, bit for bit | `rpu_board.py`, `llm_board.py --rpu r5` |
+| the A53's interrupt waits | the A53 sleeping on the kernels' interrupts | the A53 polling, bit for bit | `rpu_board.py --mode irq` |
 
 The netlist check exists because Verilator simulates two-state RTL as
 written, while synthesis can disagree:

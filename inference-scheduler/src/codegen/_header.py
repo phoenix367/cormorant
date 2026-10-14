@@ -389,6 +389,7 @@ class _HeaderMixin:
         lines.append("#define INFERENCE_RPU_LINUX_INIT_ARGS  "
                      + ", ".join(kd.instance_macro for kd in active) + "   /* the UIO names */")
         lines.append('#include "inference_rpu.h"   /* inference_rpu_attach(): the R5 drives the kernels */')
+        lines.append('#include "inference_irq.h"   /* kernel_wait() on the kernels\' interrupts (INFERENCE_WAIT) */')
         lines.append("#else")
         lines.append("#include \"xparameters.h\"")
         lines.append("/* RPU firmware (rpu/): the kernels of this project as the BSP names them */")

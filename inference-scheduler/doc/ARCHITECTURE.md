@@ -1087,12 +1087,17 @@ source:
 ```c
 /* include/inference.h: kernel_id_t lists the project's active lanes */
 __attribute__((weak))
-void kernel_wait(kernel_id_t k);   /* default: poll X<Kernel>_IsDone() */
+void kernel_wait(kernel_id_t k);
 ```
 
-A deployment can override it at link time (interrupt-driven waiting)
-without touching the generated code.  While the Cortex-R5 drives the
-kernels, the default records a wait for the firmware instead (§14).  One
+While the Cortex-R5 drives the kernels it records a wait for the firmware
+(§14).  On Linux otherwise it waits on the kernel's interrupt: the
+generated `X<Kernel>_Start` macro arms it (`inference_irq_start()`: ISR
+cleared and confirmed, GIE up), and the wait spins `INFERENCE_IRQ_SPIN_US`
+(300 µs), then sleeps in `poll()` on the kernel's UIO device
+(`runtime/inference_irq.[ch]`, `INFERENCE_WAIT=poll` to poll).  Bare metal
+and the host emulation poll `X<Kernel>_IsDone()`.  The function stays weak,
+so a deployment can replace it at link time.  One
 driver instance per lane is a framework limit, not a hardware one
 (`SCHEDULER_DAG.md` §1, §10).
 

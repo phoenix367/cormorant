@@ -246,7 +246,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1828 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1829 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -552,11 +552,31 @@ typedef enum { KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL,
                KERNEL_ROWOPS,   /* only with the row-ops unit */
                KERNEL_COUNT } kernel_id_t;
 __attribute__((weak))
-void kernel_wait(kernel_id_t k);   /* default: poll IsDone */
+void kernel_wait(kernel_id_t k);
 ```
 
-Override at link time to swap in IRQ-driven waiting (UIO/Linux,
-GIC/bare-metal) without touching the generated code.
+Who waits, in this order:
+- **the Cortex-R5**, while it drives the kernels: the wait is recorded for
+  the firmware (§Cortex-R5);
+- **the kernel's interrupt** (Linux, `runtime/inference_irq.[ch]`), when the
+  lane's Start armed it.  The generated `X<Kernel>_Start` macro calls
+  `inference_irq_start()`: it lets ap_done latch into ISR bit 0, clears the
+  previous job's bit, confirms the clear landed, and raises GIE.  The wait
+  reads the ISR for `INFERENCE_IRQ_SPIN_US` (300 µs), then unmasks the line
+  (a write of 1 to the kernel's `/dev/uioN`), reads again and sleeps in
+  `poll()` until the line fires; GIE drops after the wait.  The level line
+  stays high from ap_done to the next Start, so an unmask after the job
+  ended fires at once and no completion is lost.  `inference_init()` opens
+  each kernel's UIO interrupt after its driver; a lane without one polls;
+- **`IsDone()` in a tight loop** otherwise: bare metal, `INFERENCE_WAIT=poll`,
+  the host emulation.
+
+A short job ends within the spin and costs no more than polling; a sleep
+costs 20–35 µs of wake-up on the KV260.  On the board, against polling
+(`rpu_board.py --mode irq`, `doc/plans/RPU_PLAN.md` §12): LeNet / MobileNet v2 /
+ResNet-18 / BERT +1.9 / +2.8 / +3.9 / +2.5 % latency for −48 / −17 / −58 /
+−66 % A53 CPU.  The function stays weak, so a deployment can still replace it at
+link time.
 
 `inference_run()` emits a `kernel_wait` only when (a) some predecessor
 is still in flight on its lane, or (b) the target lane has a different
@@ -1764,6 +1784,8 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_BUF_CACHEABLE=ON/OFF` | `INFERENCE_BUF_CACHEABLE=1/0` | ON | cacheable vs non-cacheable XRT BO mapping ([§Cache coherency](#cache-coherency)) |
 | `-DINFERENCE_HOST_THREADS=N` | `INFERENCE_HOST_THREADS=N` (1–64) | 4 | threads per host op (caller + N − 1 workers); models with host ops only |
 | `-DINFERENCE_PROFILING=ON` | — | OFF | per-layer wall-clock profile (`inference_prof.h`) |
+| `-DINFERENCE_IRQ_MODE_DEFAULT=0/1` | `INFERENCE_WAIT=poll/irq` | 1 (irq) | `kernel_wait()` on the A53: poll `IsDone()`, or spin then sleep on the kernel's UIO interrupt (`inference_irq.h`) |
+| `-DINFERENCE_IRQ_SPIN_US_DEFAULT=N` | `INFERENCE_IRQ_SPIN_US=N` | 300 | the spin before a sleep, µs |
 
 BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
 ConvKernel, 2 on MatmulKernel) for example:

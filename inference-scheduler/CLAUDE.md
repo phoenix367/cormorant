@@ -168,7 +168,8 @@ left in place, non-depthwise grouped Conv) and a worked example on
 │   ├── inference.c           Weight ROM arrays, run_*() helpers, kernel_wait(),
 │   │                         host-op helpers, init/deinit/run bodies
 │   ├── inference_buf.c       DMA buffer alloc/sync (Linux XRT BOs or bare-metal Xil)
-│   ├── inference_prof.c, inference_ddr.c, inference_ddr_backend.h, ddr/zuplus_apm.c
+│   ├── inference_prof.c, inference_ddr.c, inference_ddr_backend.h, ddr/zuplus_apm.c,
+│   │   inference_rpu.c (the R5 recorder), inference_irq.c (the waits on the kernels' interrupts)
 ├── test/test_inference.c     On-device test: ramp fill → run → compare vs GT
 ├── scripts/check_inference_setup.sh
 ├── driver/                   Kernel driver sources, flat (copied or stub README.md)
@@ -199,11 +200,13 @@ runtime/                 inference_prof / inference_ddr sources copied into proj
                          ops and the outputs stay on the A53); runtime/rpu/ the firmware itself —
                          model-independent, one build per bitstream (rpu_main.c, rpu_irq.c, the
                          protocol rpu_ctrl.h, lscript.ld, CMake / toolchain) and the gate harness
-                         rpu_host.c — ../doc/plans/RPU_PLAN.md §9
+                         rpu_host.c — ../doc/plans/RPU_PLAN.md §9; inference_irq.[ch] the A53's
+                         waits on the kernels' UIO interrupts while it drives them (§12)
 rpu_board.py             Board tool: builds the firmware against the BSP (../tools/rpu/), loads it
                          through remoteproc (../board/kv260/rpu/rpu.dts), builds each project on the
                          board and runs its rpu_host (N inferences on the R5, bit for bit against
-                         the A53)
+                         the A53); --mode irq: the A53 sleeping on the kernels' interrupts against
+                         polling (no firmware; --spin-us)
 bench_src/               C benchmark project used by run_remote_perf.py; calib_runner.c
                          times perf_calibrate.py's kernel-call batches on the board
 perf_models/<platform>/  <bitstream-id>.cases / .calib / .json (kernel model), host.json
@@ -315,7 +318,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              87 pytest modules, 1828 tests, all pass (test_bert_base.py
+  test_*.py              87 pytest modules, 1829 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -597,15 +600,24 @@ generated source:
 
 ```c
 typedef enum {
-    KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL, KERNEL_COUNT
+    KERNEL_VECTOROP, KERNEL_MATMUL, KERNEL_CONV, KERNEL_POOL,
+    KERNEL_ROWOPS,                 // only with the row-ops unit
+    KERNEL_COUNT
 } kernel_id_t;
 
 __attribute__((weak))
-void kernel_wait(kernel_id_t k);   // default: poll IsDone in a tight loop
+void kernel_wait(kernel_id_t k);
 ```
 
-Override at link time to swap in IRQ-driven waiting (UIO under Linux,
-GIC under bare-metal) without touching the generated code.
+Who waits, in this order: the Cortex-R5 while it drives the kernels (the
+wait is recorded, `runtime/inference_rpu.h`); on Linux, the kernel's
+interrupt when the lane's Start armed it (`runtime/inference_irq.h`: the
+generated `X<Kernel>_Start` macro calls `inference_irq_start()`, which clears
+the ISR and raises GIE; the wait spins `INFERENCE_IRQ_SPIN_US` = 300 µs, then
+sleeps in `poll()` on the kernel's UIO device; `INFERENCE_WAIT=poll` turns it
+off); otherwise `IsDone()` in a tight loop (bare metal, the host emulation).
+`inference_init()` opens each kernel's UIO interrupt after its driver.  The
+function stays weak, so a deployment can still replace it at link time.
 
 **Event stream** — `CodeGenerator._compute_event_stream()` is the single
 source of truth for the schedule. It walks `graph.nodes` once (or a

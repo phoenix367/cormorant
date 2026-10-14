@@ -166,5 +166,5 @@ class TestMultiEntry(unittest.TestCase):
             cm = open(os.path.join(td, "CMakeLists.txt")).read()
             for rel in sorted(set(re.findall(r"\b(src/[A-Za-z0-9_/]+\.c)\b", cm))):
                 self.assertTrue(os.path.isfile(os.path.join(td, rel)), rel)
-            for rel in ("include/inference_rpu.h", "include/rpu_ctrl.h", "rpu/rpu_host.c"):
+            for rel in ("include/inference_rpu.h", "include/rpu_ctrl.h", "rpu/rpu_host.c", "include/inference_irq.h"):
                 self.assertTrue(os.path.isfile(os.path.join(td, rel)), rel)

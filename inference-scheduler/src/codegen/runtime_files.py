@@ -23,6 +23,9 @@ RUNTIME_FILES = (
     # the kernels driven from the Cortex-R5 (RPU_PLAN §9): the recorder in every Linux
     # library, the protocol with the firmware (runtime/rpu/, one build per bitstream)
     # and rpu_host.c, the gate of a single-entry project on the R5 (make rpu_host)
+    # the A53's waits on the kernels' interrupts (UIO) while it drives them
+    ("inference_irq.h", "include/inference_irq.h"),
+    ("inference_irq.c", "src/inference_irq.c"),
     ("inference_rpu.h", "include/inference_rpu.h"),
     ("inference_rpu.c", "src/inference_rpu.c"),
     ("rpu/rpu_ctrl.h", "include/rpu_ctrl.h"),

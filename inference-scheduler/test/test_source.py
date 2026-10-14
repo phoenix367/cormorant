@@ -145,13 +145,34 @@ class TestRpuRecorderHooks(unittest.TestCase):
     def test_start_intercept_and_table(self):
         s = self._source("mixed_matmul_relu.onnx")
         self.assertIn("#define XVectoropkernel_Start(inst)  (inference_rpu_active() ? "
-                      "inference_rpu_start(KERNEL_VECTOROP) : (XVectoropkernel_Start)(inst))", s)
+                      "inference_rpu_start(KERNEL_VECTOROP) : "
+                      "(inference_irq_start(KERNEL_VECTOROP), (XVectoropkernel_Start)(inst)))", s)
         self.assertIn("#define XMatmulkernel_Start(inst)  (inference_rpu_active() ? "
-                      "inference_rpu_start(KERNEL_MATMUL) : (XMatmulkernel_Start)(inst))", s)
+                      "inference_rpu_start(KERNEL_MATMUL) : "
+                      "(inference_irq_start(KERNEL_MATMUL), (XMatmulkernel_Start)(inst)))", s)
         self.assertIn("{ 0u, 28u, &s_vectoropkernel.Ctrl_BaseAddress },   /* KERNEL_VECTOROP */", s)
         self.assertIn("{ 1u, 29u, &s_matmulkernel.Ctrl_BaseAddress },   /* KERNEL_MATMUL */", s)
         self.assertIn("if (inference_rpu_active()) { inference_rpu_wait(k); return; }", s)
         self.assertIn("#define INFERENCE_RPU_FLUSH()  ((void)0)", s)
+
+    def test_irq_waits(self):
+        """While the A53 drives, a Start arms the kernel's interrupt and
+        kernel_wait() sleeps on it (inference_irq.h): after the R5's recorded
+        wait, before the IsDone() polling; inference_init() opens each kernel's
+        UIO interrupt after its driver, inference_deinit() closes them."""
+        s = self._source("mixed_matmul_relu.onnx")
+        wait = s[s.index("void kernel_wait(kernel_id_t k)"):]
+        self.assertLess(wait.index("inference_rpu_wait(k)"), wait.index("if (inference_irq_wait(k)) return;"))
+        self.assertLess(wait.index("if (inference_irq_wait(k)) return;"), wait.index("_IsDone("))
+        init = s[s.index("int inference_init("):s.index("void inference_deinit(void)")]
+        for kid, inst, var in (("KERNEL_VECTOROP", "vectoropkernel_instance", "s_vectoropkernel"),
+                               ("KERNEL_MATMUL", "matmulkernel_instance", "s_matmulkernel")):
+            self.assertIn(f"(void)inference_irq_open({kid}, {inst},\n"
+                          f"                             (void *)(uintptr_t){var}.Ctrl_BaseAddress);", init)
+        self.assertLess(init.index("XMatmulkernel_Initialize("), init.index("inference_irq_open(KERNEL_MATMUL"))
+        deinit = s[s.index("void inference_deinit(void)"):]
+        self.assertIn("inference_irq_close();", deinit[:deinit.index("}")])
+        self.assertIn('#include "inference_irq.h"', s)
 
     def test_flush_before_output_sync(self):
         s = self._source("single_add.onnx")

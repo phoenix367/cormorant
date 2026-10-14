@@ -710,6 +710,8 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"), inc)
     # the Cortex-R5 recorder (inference_rpu.h): linked, never attached here
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_rpu.h"), inc)
+    # the waits on the kernels' interrupts (inference_irq.h): no UIO here, every lane polls
+    shutil.copy(os.path.join(_ROOT, "runtime", "inference_irq.h"), inc)
     shutil.copy(os.path.join(_ROOT, "runtime", "rpu", "rpu_ctrl.h"), inc)
     if cg.large_weight_tensors:
         os.makedirs(os.path.join(workdir, "weights"), exist_ok=True)
@@ -739,6 +741,7 @@ def build_and_run(cg, workdir, timeout=600, cached=True, threads=None, min_elems
            "-I", inc, "-I", emu,
            os.path.join(src, "inference.c"), os.path.join(emu, "inference_buf_emu.c"),
            os.path.join(_ROOT, "runtime", "inference_rpu.c"),
+           os.path.join(_ROOT, "runtime", "inference_irq.c"),
            os.path.join(tst, "test_inference.c"), "-lm", "-o", exe]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

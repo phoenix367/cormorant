@@ -359,7 +359,8 @@ def _host_compile(cg, workdir):
         f.write(src)
     shutil.copy(os.path.join(_ROOT, "runtime", "inference_prof.h"),
                 os.path.join(workdir, "include", "inference_prof.h"))
-    for name in ("inference_rpu.h", os.path.join("rpu", "rpu_ctrl.h")):     # the Cortex-R5 recorder's API
+    for name in ("inference_rpu.h", os.path.join("rpu", "rpu_ctrl.h"),     # the Cortex-R5 recorder's API
+                 "inference_irq.h"):                                      # the A53's interrupt waits
         shutil.copy(os.path.join(_ROOT, "runtime", name),
                     os.path.join(workdir, "include", os.path.basename(name)))
     for kd in cg._active_kernels:
