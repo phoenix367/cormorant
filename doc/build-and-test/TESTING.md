@@ -266,12 +266,12 @@ in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 ##  CORMORANT TESTBENCH — OVERALL RESULTS
 ##########################################################
 ##        VectorOPKernel   29 /  29  (0 failed)
-##            ConvKernel   17 /  17  (0 failed)
+##            ConvKernel   19 /  19  (0 failed)
 ##          MatmulKernel   10 /  10  (0 failed)
 ##         PoolingKernel   19 /  19  (0 failed)
-##          RowOpsKernel   37 /  37  (0 failed)
+##          RowOpsKernel   39 /  39  (0 failed)
 ##########################################################
-##  TOTAL: 112 / 112 passed
+##  TOTAL: 116 / 116 passed
 ##  ALL TESTS PASSED
 ##########################################################
 ```

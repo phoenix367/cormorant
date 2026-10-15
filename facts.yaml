@@ -140,9 +140,11 @@ facts:
       conv: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/conv_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
       matmul: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/mm_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
       pool: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/pk_classes.svh, regex: '(tests\.push_back)', all: true, transform: 'len(v)'}
-      # the RowOps cases are the checked-in fixtures (ro_classes.svh reads the manifest) plus the table load
-      rowops: {file: hw/test_data/rowops_test_data/manifest.txt, regex: '^(\d+) ', all: true, transform: 'len(v) + 1'}
-      total: {cmd: "echo $(( $(cat hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/*_classes.svh | grep -c 'tests\\.push_back') + $(grep -c '^[0-9]' hw/test_data/rowops_test_data/manifest.txt) + 1 ))",
+      # the RowOps cases are the checked-in fixtures (ro_classes.svh reads the manifest), the table load
+      # and one case per descriptor chain (chains/manifest.txt: the first column is the chain)
+      rowops: {cmd: "echo $(( $(grep -c '^[0-9]' hw/test_data/rowops_test_data/manifest.txt) + 1 + $(grep '^[0-9]' hw/test_data/rowops_test_data/chains/manifest.txt | cut -d' ' -f1 | sort -u | wc -l) ))",
+               parse: '(\d+)', type: int}
+      total: {cmd: "echo $(( $(cat hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/*_classes.svh | grep -c 'tests\\.push_back') + $(grep -c '^[0-9]' hw/test_data/rowops_test_data/manifest.txt) + 1 + $(grep '^[0-9]' hw/test_data/rowops_test_data/chains/manifest.txt | cut -d' ' -f1 | sort -u | wc -l) ))",
               parse: '(\d+)', type: int}
   fix: auto
   mentions:
@@ -153,7 +155,7 @@ facts:
     - {file: doc/ARCHITECTURE.md, regex: 'and the row-ops fixtures, (?P<total>\d+) cases'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'whole-design simulation \((?P<total>\d+) / (?P<total__d>\d+)\)'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'with this IP passes (?P<total>\d+) / (?P<total__d>\d+) \(Matmul (?P<matmul>\d+) / (?P<matmul__d>\d+)\)'}
-    - {file: hw/cormorant_hw_128/README.md, regex: '~4 minutes \((?P<total>\d+) cases: the four kernels'' constant-fill cases and the RowOpsKernel''s (?P<rowops>\d+)'}
+    - {file: hw/cormorant_hw_128/README.md, regex: '~8 minutes \((?P<total>\d+) cases: the four kernels'' constant-fill cases — ConvKernel''s with two\s+y channel-pattern cases — and the RowOpsKernel''s (?P<rowops>\d+)'}
     # the sample output of TESTING.md §3, hw_128 CLAUDE.md and README.md
     - {file: doc/build-and-test/TESTING.md, regex: &sim_hw_out '##        VectorOPKernel +(?P<vectorop>\d+) / +(?P<vectorop__d>\d+) .*\n##            ConvKernel +(?P<conv>\d+) / +(?P<conv__d>\d+) .*\n##          MatmulKernel +(?P<matmul>\d+) / +(?P<matmul__d>\d+) .*\n##         PoolingKernel +(?P<pool>\d+) / +(?P<pool__d>\d+) .*\n##          RowOpsKernel +(?P<rowops>\d+) / +(?P<rowops__d>\d+) .*\n.*\n##  TOTAL: (?P<total>\d+) / (?P<total__d>\d+) passed'}
     - {file: hw/cormorant_hw_128/CLAUDE.md, regex: *sim_hw_out}

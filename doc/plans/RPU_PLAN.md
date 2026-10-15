@@ -914,7 +914,7 @@ they are replaced by §13.6's.
 | **A2.0 — no bitstream** | output views for P·V; the decode merge through `y_off`; the `irope="all"` study — **DONE 2026-10-15 (§13.8)** | the libraries bit-exact (sched-checks, board); decode −0.3 / −0.55 ms per token; `irope="all"` within the prefill policy's yardstick (top-1, KL, ppl) — ✓ (−0.26 / −0.54 ms; the study unchanged) |
 | **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver — **DONE 2026-10-15 (§13.9)** | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
 | **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures — **DONE 2026-10-15 (§13.9)** | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
-| **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
+| **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain — **DONE 2026-10-16 (§13.10): `33a799febc56`, WNS +0.022 ns, 90 607 LUT, `sim_hw` 116 / 116** | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
 | **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
 | **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
 
@@ -1074,3 +1074,54 @@ copies of `j_aux` are the remedy if the build misses.  The scheduler writes
 descriptors, the R5 window 24 → 27 words; the strict `xvlog` (`xsim_rowops_rtl`)
 needs `--relax` (use before declaration in four files at HEAD).
 
+
+### 13.10 A2.3 results (2026-10-15/16)
+
+**`sim_hw`.**  The block-design testbench (`hw/cormorant_hw_128` sim_1)
+gains both features.  ConvKernel: the three registers in `conv_regmap.svh`,
+`conv_item.set_pattern()`, the driver writes them on every case (0 = dense)
+and the scoreboard poisons the pattern's whole span, then checks every
+channel plane and that every gap kept the poison; two cases — an attention
+P·V (G 3, T 16, HD 64: `y_cs` 576, `y_cn` 16, `y_gs` 64) and odd strides
+(23 / 16 / 11, 20 channels).  RowOpsKernel: the chain registers and a
+segment / descriptor buffer in `ro_regmap.svh` (the descriptors straddle a
+4 KiB boundary), `ro_driver.run_chain`, `ro_scoreboard.run_bytes` (the whole
+segment) and `ro_test.run_chains`, which builds the descriptors from
+`chains/manifest.txt` (the segment base + the byte offsets) and runs each
+chain with one Start.  Two testbench traps on the way: `scripts/sim.tcl`
+read a run that stopped on an xsim `FATAL_ERROR` (no overall summary) as a
+pass — it now passes only on the testbench's `##  ALL TESTS PASSED`; and
+under xsim a 22-conversion `$sscanf` crashed the simulator kernel and a
+tokenizer built by `{cur, string'(line[i])}` miscounted the fields (24 of
+22 on some lines, so the first run fed the RTL wrong descriptors) — the
+manifest is now split with `substr`.  Result: **116 / 116** (VectorOP 29,
+Conv 19, Matmul 10, Pool 19, RowOps 39 = 36 fixtures + the table load + the
+2 chains), 8 min.
+
+**The bitstream `33a799febc56`** (hw_128 at 51920b6 + the testbench; the
+block design unchanged, so the HWH is the same size and address map as
+`de968ccc45da`'s): `build_hw_kv260` in 65 min, **WNS +0.022 ns**, WHS
++0.010 ns at 4 ns, every net routed.  The router converged faster than
+de968's (rip-up −0.189 → −0.006 → +0.022 against −0.883 … +0.029).
+
+| | `de968ccc45da` | `33a799febc56` | Δ |
+|---|---:|---:|---:|
+| LUT (placed) | 89 547 | 90 607 | +1 060 |
+| FF | 108 713 | 109 798 | +1 085 |
+| ConvKernel LUT / FF | 14 827 / 37 497 | 15 096 / 37 788 | +269 / +291 |
+| RowOpsKernel LUT / FF | 33 340 / 26 712 | 34 083 / 27 427 | +743 / +715 |
+| the other three kernels | | | ±20 LUT (placement) |
+| BRAM / URAM / DSP | 136 / 55 / 841 | 136 / 55 / 841 | 0 |
+
+The new logic is far from the critical paths (post-route physopt
+checkpoint): out of `j_aux` +0.470 ns (into FOLD's `k_half` resets), the
+other `j_*` fields +0.286 (`j_n` into the stream unit), the chain state
++0.393 (`ch_on`'s replica into NORM's DSP B inputs), ConvKernel's pattern
+registers +1.141 (the AXI-Lite read mux).  The worst path is unchanged code:
+VectorOPKernel's softmax load (`ld_j` → a DSP's CEA1) at +0.022, then the
+PoolingKernel tile counter, NORM and Matmul's reset tree at +0.095 … +0.107
+— the classes of de968's 20 worst.  Per-unit copies of `j_aux` are not
+needed.  Archived in `/mnt/data/bitstreams/kv260_250_33a799febc56` (bit,
+HWH, the post-route timing and placed utilization reports, the build log,
+the path query).  Not on the board yet: the overlay, the board gates and the
+promotion are A2.5's, after the scheduler (A2.4).

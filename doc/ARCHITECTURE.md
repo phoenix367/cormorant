@@ -907,7 +907,7 @@ Every level is checked bit-exactly against the level above it:
 | DSP primitives | ConvKernel's behavioural MAC chain | Vivado's DSP48E2 unisim model, cycle by cycle (199 899 cycles, 0 mismatches) | ctest `ConvRtlDsp` |
 | synthesised netlist | Matmul, VectorOP, Pool | their RTL in lockstep, in xsim | `neteq_<k>_rtl` (`tools/neteq`) |
 | packaged IP | each kernel's IP in the test stand's block design (PS VIP, interconnect, DDR model) | the checked-in fixtures | `behavior_test_<k>`, `sysim_<k>_rtl` (`hw/cormorant_test_stand`) |
-| whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 112 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
+| whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 116 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
 | generated software | the generated C against software kernels | the scheduler's simulator | `inference-scheduler/test/host_emu.py`, also with incoherent caches |
 | the board | the bitstream and the libraries | the simulator's expectations, bit for bit | `run_remote_tests.py` (the model suite), every demo and library gate |
 | the R5 path | the R5-driven runs | the A53-driven runs, bit for bit | `rpu_board.py`, `llm_board.py --rpu r5` |
