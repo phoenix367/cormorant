@@ -219,7 +219,7 @@ all (139 ms of host time per 260 ms chunk today — on an R5 that would grow,
 | phase | what | gate | effort |
 |---|---|---|---|
 | **A1 — existing ops** | §3.1 as scheduler nodes: DEQUANT of the logits into DMA, the merges as COPY (behind the R5 flag), `VitEmbedAdd` / `VitSumDequant` / pixel shuffle, BERT's transposes, the Piper h sums and interleaves, the relative-key add through the diagonal transposes; the decode softmax on the unit (`vsmx="decode"` gate) | bit-exact sched-checks and board gates; BERT ≤ 275 ms (its 0.75 × gate of HOSTOPS §7), the Piper encoder ≤ 75 ms at 400 ids, nothing slower | 3 days |
-| **A2 — descriptor chains + the ConvKernel output stride** | one bitstream: the unit's job list from DDR; `y` rows at a stride; the decode prep on the unit (`irope=True` gate) | WNS ≥ 0 at 4 ns; 135M decode ≤ 45 ms per token, the merges gone (prefill 256 ≤ 390 ms); every library bit-exact | 4 days incl. the build and campaign |
+| **A2 — descriptor chains + the ConvKernel output stride** | one bitstream: the unit's job list from DDR; `y` rows at a stride; the decode prep on the unit (`irope=True` gate) — **planned in §13 (2026-10-15)**: a two-level y pattern (the Llama's grouped heads), chains of ≤ 16 descriptors, the decode merge without a bitstream | WNS ≥ 0 at 4 ns; every library bit-exact; the gates of §13.6 (135M decode ≤ 48.5 ms, prefill 256 ≤ 402 ms, SmolVLM image ≤ 1.63 s), replacing the first estimate (≤ 45 / ≤ 390 ms) | about 8 days (§13.6) |
 | **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build — **DONE 2026-10-13 (§9), as a model-independent firmware replaying the library's recorded kernel calls: the six CNN demos bit-exact, interrupt-driven, +2–5 % on the real models (YOLO +4 %, MobileNet v2 +5 %)** | 5 days |
 | **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens — **DONE 2026-10-13 in the B1 design (§10): no RPMsg or sampler on the R5 (the A53 keeps the host ops and the output, by the user's direction); protocol v4 + the doorbell; every chat library, BERT and Piper gated bit-exact with the R5 driving; the chat server runs with it (`deploy.py --rpu`); decode +2 % (135M), the bench's A53 CPU 3 s instead of 10 s** | 5 days |
 | **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss — **started 2026-10-13 (§11): the A53 cores' power-down idle −9 mW (on, as a soak), the R5 asleep between commands (protocol v5) −50 mW idle; the APU clock, the PL and DDR next** | 2 days |
@@ -305,7 +305,7 @@ Board results (bitstream `1cedaf2ed816`, 2026-10-12 evening):
 | workload | before | after | gate |
 |---|---:|---:|---|
 | BERT-base, 20 SQuAD windows of 256 (`run_demo.py --regenerate --n 20 --profile-layers`) | 288 ms | **265.4 ms** (min 265.2, max 265.6); bit-exact 3 / 3 vs the simulation, 20 / 20 vs the emulation | ≤ 275 ms ✓ |
-| Piper encoder (`tts_board.py --profile`), 20 / 60 / 88 / 162 / 268 / 400 ids | 9.5 / 14.4 / 28.3 / 56.8 / 92.1 / 95.8 ms | **8.2 / 12.1 / 23.8 / 47.6 / 78.5 / 81.1 ms**; every encode and duration bit-exact (12 / 12 sequences) | ≤ 75 ms at 400 ids ✗ (−15 %; the band 17 → 2.65 ms, the merge's 23 ms is A2's) |
+| Piper encoder (`tts_board.py --profile`), 20 / 60 / 88 / 162 / 268 / 400 ids | 9.5 / 14.4 / 28.3 / 56.8 / 92.1 / 95.8 ms | **8.2 / 12.1 / 23.8 / 47.6 / 78.5 / 81.1 ms**; every encode and duration bit-exact (12 / 12 sequences) | ≤ 75 ms at 400 ids ✗ (−15 %; the band 17 → 2.65 ms; the merge's 23 ms is a banded MAC, not a copy: A3's, §13) |
 | Piper chunk (the sums and interleaves on the unit) | 260 ms, RTF 0.221 / 0.192 | 257 ms (217.9 … 278.0), RTF 0.224 / 0.194; PCM bit-exact 2 / 2 | bit-exact ✓, no faster (the chunk's CPU time is `TtsPrep` / `TtsGate` / the ÷ 3 sums: A3) |
 | SmolLM2-135M (`llm_board.py --profile`) | prefill 16 / 64 / 256: other host 0.77 ms (the dequant) | the same prefills with "other host" 0.12 ms (the copy out); logits bit-exact 4 × 33 / 33 | bit-exact ✓ |
 | SmolLM2-360M | other host 0.77 ms | 0.10 ms; logits bit-exact 4 × 33 / 33 | bit-exact ✓ |
@@ -764,3 +764,182 @@ The timer's wake-up lands about 65 µs after the asked time (the default
 predicted); at 50 µs most woke after it, on the line (ResNet-18 539 of 540 in
 one round), and paid the wake-up again.  100 µs is the default.  Every run
 bit-exact, 0 missed interrupts.
+
+## 13. Track A2 plan — the ConvKernel y pattern and RowOps descriptor chains (2026-10-15)
+
+One bitstream after `de968ccc45da` with two kernel features, and the
+scheduler work that uses them.  The goal is the A53's (or the R5's) share of
+the chat path: the attention merges, the decode attention prep and the issue
+cost of multi-job row-ops nodes.  What it does **not** do: the Piper
+encoder's `TtsAttnMerge` (23 ms at 400 ids) is a banded MAC of P against the
+relative value embeddings plus a re-rounding, not a copy — a head-ordered
+P·V write removes only its ~0.1 ms gather; the rest needs A3's unaligned row
+start (§3.3).  §8's "the merge's 23 ms is A2's" was wrong.
+
+### 13.1 What it removes (board profiles, 2026-10-12 … 15)
+
+| host work | where | cost | A2 mechanism |
+|---|---|---:|---|
+| `LlmAttnMerge` at decode (`[G][HD]` per group, already in head order) | 135M / 360M / SmolVLM decode | 0.3 / 0.55 ms per token | none: P·V writes at `y_off = g·G·HD` (the existing `run_conv_at` argument) — **no bitstream** |
+| `LlmAttnMerge`, prefill (G = 3: channel p = h'·T + t → `(t·H + g·G + h')·HD`) | 135M / 360M prefill 256 | 5.5 / 9.7 ms | the ConvKernel **y pattern** (two levels, §13.2) |
+| `LlmAttnMerge`, vision (G = 1, one call per head) | SmolVLM `llm_image` | 12 ms | the y pattern's first level alone |
+| decode `LlmAttnPrep` (k / q dequant, RoPE in double, the cache writes, the q·Kᵀ image) | 135M / 360M decode | 95 / 126 µs per layer = 2.9 / 4.0 ms per token | the unit's ops (as prefill's `AttnPrepRoNode`) in one **chain** per layer (§13.3) |
+| the prefill prep's 10–15 jobs per layer, each issued after the previous one's wait | prefill (135M / 360M / VLM text), vision prep | ≈ 40 µs per job beyond the calibrated back-to-back time (HOSTOPS §10.8) | one chain per layer |
+| `LlmDequant`'s 12 jobs (a 49 152-wide row as 12 × 4 096) | every decode / head | 12 issues per token | one chain |
+| `TtsRelBandRoNode`'s 9 diagonal TRANSPOSEs + ADDX | Piper encoder, 6 layers | 10 issues per layer | one chain per layer |
+
+### 13.2 ConvKernel: the y channel pattern
+
+Today a channel's plane starts `out_h · out_w` elements after the previous
+one (`cv_drain.sv:132` per m-tile of 16 channels, `:299` per channel; the
+writer already places a run at any element offset with byte strobes,
+`cv_ywriter.sv:77-103`, and splits runs at 4 KiB).  Three registers after
+`is_depthwise` (0xC0; the 8-bit control address leaves 0xC4–0xFC free):
+
+| offset | register | meaning |
+|---|---|---|
+| 0xC8 | `y_cs` | elements from channel c to channel c + 1 inside a group; 0 = `out_h · out_w` (dense: every library today) |
+| 0xD0 | `y_cn` | channels per group; 0 = one group (no wrap) |
+| 0xD8 | `y_gs` | elements from group k's first channel to group k + 1's |
+
+Channel c lands at `y + (c mod y_cn) · y_cs + (c div y_cn) · y_gs`; a
+channel's own `out_h · out_w` pixels stay contiguous (the drain's 256-pixel
+segments are linear inside a channel).  For a Llama P·V call of group g:
+`y_off = g·G·HD`, `y_cs = H·HD`, `y_cn = T`, `y_gs = HD`; for vision
+`y_cs = H·HD`, `y_cn = 0`.  **Contract:** `batch = 1` when `y_cs ≠ 0`, and
+`y_cn` a multiple of 16 (an m-tile of 16 channels never straddles a group:
+the prefill buckets are 16 / 64 / 256, vision has no wrap); every run is
+then HD elements — 128 B, 16-byte aligned for HD 64 — so no partial strobes
+on the shipped calls (the general case keeps them).
+
+RTL: three fields in `job_t` (`cv_pkg.sv`), latched beside `q_y`
+(`cv_core.sv:416`); in `cv_drain` the m-tile base becomes a group walker
+(channel-in-group += 16; at `y_cn`, base = group base + `y_gs`), the
+per-channel step `y_cs` instead of `out_hw`, both selected at configuration
+time (no mux on the 250 MHz drain path: the dense case loads `y_cs = out_hw`
+into the same register).  Estimate: ≈ 300 LUT, no RAM.
+
+Everything that describes ConvKernel's y moves with it:
+- the C++ model: `ConvKernel()` gains the three scalars; `write_output_tile` uses the pattern;
+- the Verilator testbench: the `Case` fields, the poisoned region and the stray-write check over the strided footprint, `--case` with 20 numbers, random strided jobs;
+- the fixture manifest (3 columns) and its parsers: the testbench, the test stand's `conv_tb.sv`, the block-design `conv_classes.svh`;
+- the drivers (`gen_driver.py` REGS, ctest `ConvRtlDriver`, fact `registers.ConvKernel`);
+- `host_emu`'s ConvKernel, `perf_calls.FIELDS` (the pattern does not change the cycles; it joins the key so a strided call is measured as one), `calib_runner` / `bench_conv`;
+- the R5 recorder (`rpu_reg_words` 45 → 51).
+
+**Every** generated `run_conv*` writes the three registers (0 when dense): a
+register keeps its value across runs, and a library generated before them
+would inherit a stride (the hazard board-deploy §3 records).
+
+### 13.3 RowOpsKernel: descriptor chains
+
+| offset | register | meaning |
+|---|---|---|
+| 0x70 / 0x74 | `chain` | base of the descriptor list (16-byte aligned) |
+| 0x78 | `chain_n` | jobs in the list; 0 = the single job of the registers (every library today) |
+
+A descriptor is the 24 argument words 0x10 … 0x6C in register order, padded
+to 32 words (128 B, 8 beats).  With `chain_n` = N (1 … 16) the unit reads
+the N descriptors on port B (ARID 1, as the P-block load does — a new
+`T_DFETCH` phase before `T_CFG0`) into a 16 × 32-word LUTRAM, then for each
+loads the job registers from it instead of from the AXI-Lite copies and
+runs the job exactly as today (P load, units, every B response back before
+the next), and raises `ap_done` once after the last.  A job of a chain sees
+the previous one's writes, as consecutive calls do now.  Estimate: ≈ 1.2 k
+LUT (the RAM, the fetch FSM, the 24-word mux in front of the `j_*`
+registers — on paths *into* `j_aux`, not out of it, where the worst path
+starts).  A list longer than 16 is split by the software.
+
+Software: one DMA buffer per chained node in the pool (N × 128 B), its
+static words written by `inference_init()`, the position-dependent words
+(the RoPE B row `pos · 8 · HD`, the K-cache offset, the boundary V granules,
+whose number varies with `pos % 64`) patched per call and cleaned to DDR
+before the Start; `run_rowops_chain(ptr, n)`.  With the R5 driving, the A53
+patches and cleans before it records the Start, so the replay sees them; a
+chain is one register block (+2 words: `rpu_reg_words` 24 → 27) instead of
+N.  `host_emu` loops over the descriptors.  The performance model prices a
+chain as its jobs' exact entries plus one chain overhead (a `rowops-chain`
+term fitted from chained cases of `calib_runner`); `rpu_policy` and the
+timing model count one issue per chain.
+
+### 13.4 Scheduler
+
+- **P·V into the merged tensor.**  A new *output view*: the P·V node's
+  output `o_g` is declared a patterned view of the merge's output `pv`
+  (offset `g·G·HD`, the pattern of §13.2) instead of its own buffer; the
+  merge node stays in the graph — its `reference()` (a pure permutation) is
+  the simulation's, so the numbers cannot move — but emits no code, like the
+  zero-cost aliases (`_is_alias_node`).  The planner gives `pv` one
+  allocation whose life starts at the first P·V call; the one-producer rule
+  holds for the views.  Decode (T = 1) needs only the offset (dense
+  pattern) and works on today's bitstream; prefill and vision need
+  `kernels.conv.y_pattern` (platform flag, `AXI_CONV_YPATTERN`, as `fold`).
+- **Decode prep on the unit.**  `AttnPrepRoNode` for T = 1 (today it requires
+  `T % 8 == 0` for the 8-row q tiles): the q image as granules of R = G, the
+  K-cache COPY and the V granules at the runtime `pos`, all in one chain per
+  layer.  Numerics: the decode RoPE becomes the unit's integer one —
+  `irope="all"` in `llm_study.py` (135M, 360M, SmolVLM text: top-1, KL and ppl
+  against the shipped `irope="prefill"`), the gate HOSTOPS §5.2 used for
+  prefill.  The decode step then writes no cache line from the CPU: the
+  `llm_cache_inval_rows` / flush pair goes, and the coherency audit's
+  "states start clean" covers decode too.
+- **Chains for the existing multi-job nodes**: `AttnPrepRoNode` (prefill),
+  `VitAttnPrepRoNode`, `TtsRowPrepRoNode`, `TtsRelBandRoNode`,
+  `DequantRoNode` (≥ 2 jobs) — one chain where every job of the node is
+  static or patchable; behind `kernels.rowops.chains`.
+- **Optional, its own gate:** the decode softmax (90 calls per token, 0.4 ms)
+  on VectorOP's row mode after a TRANSPOSE (§3.1, `vsmx="decode"`).
+
+### 13.5 Expected effect (estimates, against the 2026-10-15 board)
+
+| workload | today | A2 | how |
+|---|---:|---:|---|
+| SmolLM2-135M decode | 50.5 ms / token | ≈ 48.3 | merges −0.3; prep 95 → ≈ 33 µs per layer (≈ 10 jobs at the 2.5 µs chain rate + one issue): −1.9 |
+| SmolLM2-360M decode | 131.8 | ≈ 128.4 | −0.55; prep 126 → ≈ 35 µs × 32: −2.9 |
+| SmolLM2-135M prefill 16 / 256 | 81.5 / 408 ms | ≈ 79 / 400 | the prep's issues (≈ −2 / −3 ms), the merge (−0.4 / −5.5) |
+| SmolLM2-360M prefill 256 | 1 063 ms | ≈ 1 048 | merge −9.7, issues ≈ −4 |
+| SmolVLM `llm_image` | 1 642 ms | ≈ 1 625 | merge −12, the vision prep's issues |
+| Piper encoder, 400 ids | 81.7 ms | ≈ 80 | the band's chains |
+| A53 / R5 | 30 host ops per decode token | 0 | each was a batch break on the R5: −30 batches per token (§10: 10.6 µs + a wake each) |
+
+The §5 gates of A2 (135M decode ≤ 45 ms, prefill 256 ≤ 390 ms) were set on
+the 2026-10-12 numbers before the A53's interrupt waits and the deep-idle
+soak and assumed the merges and the prep were worth more than measured;
+they are replaced by §13.6's.
+
+### 13.6 Phases and gates
+
+| phase | what | gate |
+|---|---|---|
+| **A2.0 — no bitstream** | output views for P·V; the decode merge through `y_off`; the `irope="all"` study | the libraries bit-exact (sched-checks, board); decode −0.3 / −0.55 ms per token; `irope="all"` within the prefill policy's yardstick (top-1, KL, ppl) |
+| **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
+| **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
+| **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
+| **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
+| **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
+
+Order: A2.0 first (no bitstream; it also builds the output-view machinery
+the pattern needs), A2.1 and A2.2 in parallel, then one build.  Effort: A2.0
+1 day, A2.1 1½, A2.2 2, the build and `sim_hw` ½, A2.4 2, the board 1 — about
+eight days.
+
+### 13.7 Risks
+
+- **Timing.**  +0.029 ns today; both features add logic next to paths in the
+  20 worst (the unit's `j_aux` fan-out, ConvKernel's job configuration).  The
+  pattern's step is chosen at configuration time and the descriptor mux
+  feeds registers, so neither adds a level to an existing path; the build is
+  still the gate, with AREA_PLAN's open items (the replay file, Matmul's
+  handshake counters: ≈ 1.5 k LUT) as the reserve.
+- **Resources.**  ≈ 1.5 k LUT in all, no block RAM or URAM (94 % / 86 % used).
+- **Stale registers.**  Every library is regenerated with the new bitstream
+  (the run helpers write the new registers); a library generated before it
+  must not run on it — the platform flags make the regeneration necessary
+  anyway.
+- **Descriptor coherence.**  The buffers are cleaned after every patch; the
+  host emulation checks that a chain's buffer was cleaned since its last
+  write (as it checks the 16-byte stream alignment since A1).
+- **The planner.**  A patterned view is the first non-contiguous view in the
+  memory planner (`_demote_strided_views` drops them today): its liveness and
+  the slot colouring are what A2.0 tests first, on decode, where the pattern
+  is dense.
