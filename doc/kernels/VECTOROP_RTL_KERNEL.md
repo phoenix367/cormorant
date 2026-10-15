@@ -98,7 +98,7 @@ word `2k`, run `r` at `r · ⌊a_inc / 8⌋` — `vo_burstgen`'s block loop) and
 writes `outer & ~15` runs of `n_words`.  The lanes of a run's last word past
 `size` read as 0, so every output run's last word is written whole with 0 in
 its tail lanes.  `size == 0` or `outer == 0`: nothing is read or written.
-Bases are 16-byte aligned (the low four address bits are ignored).
+Bases are 16-byte aligned (the low four address bits are ignored).  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).
 
 ## 2. Architecture
 

@@ -203,6 +203,10 @@ def features(c: KernelCall) -> Dict[str, float]:
         op, ak, bk, ck = f["op"] & 15, (f["op"] >> 4) & 3, (f["op"] >> 6) & 3, (f["op"] >> 8) & 3
         rows = f["rows"] * f["blocks"]
         n = f["n"]
+        if op == 9:                                   # FOLD: a row's source words, one per cycle, eight lanes
+            words = rows * (math.ceil(n / 8) + 1)
+            return {"a_words": float(words), "b_words": 0.0, "c_words": float(math.ceil(rows * n / 8)),
+                    "groups": float(words), "granules": 0.0, "rows": float(rows), "one": 1.0}
         eb = lambda k: 2 if k == 0 else 4   # noqa: E731
         a_words = rows * math.ceil(n * eb(ak) / 16)
         b_words = rows * math.ceil(n * eb(bk) / 16) if (f["op"] >> 12) & 1 else 0.0

@@ -68,7 +68,7 @@ AXI_PLATFORM=zcu102 .venv/bin/python inference_scheduler.py model.onnx
 | `kernels.matmul` | yes | — | MatmulKernel compile-time bounds — [§MatmulKernel](#kernelsmatmul) |
 | `kernels.pool` | yes | — | PoolingKernel compile-time bounds — [§PoolingKernel](#kernelspool) |
 | `kernels.vectorop` | yes | — | VectorOPKernel capabilities — [§VectorOPKernel](#kernelsvectorop) |
-| `kernels.rowops` | yes | — | the row-ops unit's presence — [§RowOpsKernel](#kernelsrowops) |
+| `kernels.rowops` | yes | — | the row-ops unit's presence and its FOLD op — [§RowOpsKernel](#kernelsrowops) |
 
 VectorOPKernel has no compile-time bounds: it is a runtime-sized,
 element-wise kernel (its SystemVerilog IP reads only `part`, for packaging
@@ -201,6 +201,7 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
 | Field | Type | Description |
 |-------|------|-------------|
 | `unit` | bool | The bitstream carries the row-ops unit, RowOpsKernel ([HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md), [ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)): the fifth kernel lane that runs the transformer's row ops in fixed point.  When true the scheduler puts ONNX / fused `LayerNormalization` (Q8.8, rows ≤ 4096) and the chat frontends' row ops there (`src/rowops_nodes.py`); when false they stay on the host.  `AXI_ROWOPS=0` / `1` overrides it — `1` to generate for a bitstream with the unit before this file says so |
+| `fold` | bool | The unit has op 9, FOLD ([HOSTOPS_PLAN §11](../plans/HOSTOPS_PLAN.md)): Piper's `TtsPrep` — windowed source rows at any element offset, LeakyReLU with alpha = 1/m and the re-rounding — as one job.  When true (and `unit`) the scheduler puts the int16 `TtsPrep` calls whose rule is exact there (`rowops_nodes.FoldRoNode`, `rowops_spec.fold_divisor`); when false they stay on the host.  Bitstreams up to `1cedaf2ed816` lack it; `de968ccc45da` (production since 2026-10-15) has it.  `AXI_ROWOPS_FOLD=0` / `1` overrides it |
 
 ---
 
@@ -232,7 +233,8 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
       "softmax": true
     },
     "rowops": {
-      "unit": true
+      "unit": true,
+      "fold": true
     },
     "pool": {
       "tile_c":            8,

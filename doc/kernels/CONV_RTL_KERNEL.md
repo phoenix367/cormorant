@@ -39,7 +39,7 @@ defined).  Depthwise (`is_depthwise`) takes in_ch = out_ch.
 **DDR layouts** (`ConvKernel.h`): x and y NCHW; weights tile-major
 `[out_ch][ic_tiles][kh][kw][16 lanes]`, the last tile 8 lanes when at most 8
 channels remain; depthwise `[out_ch][roundup(kh·kw, 8)]`; bias
-`[roundup(out_ch, 8)]`.  Buffers are 16-byte aligned; y runs are written with
+`[roundup(out_ch, 8)]`.  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).  Buffers are 16-byte aligned; y runs are written with
 byte strobes on their own lanes, so the neighbouring elements of the first
 and last word stay untouched.
 
@@ -117,8 +117,8 @@ fan-out to several DSP columns):
 
 | signal | tree (from the issue cycle I) |
 |---|---|
-| weight-cache read address | one register (I + 1), a copy per column (I + 2); the RAM latch, its output register (I + 4); the column mask (I + 5); a weight lane's shift register ends next to its two DSPs (lane 0 at E = I + 6) |
-| patch lanes | a root chain I + 1 … I + 6 (zeroed at I + 2 for bubbles); per lane one register (E + l − 2), a copy per column group of 4 (E + l − 1), a copy per chain (E + l) |
+| weight-cache read address | one register (I + 1); a column is four 64-bit RAMs, one per group of 4 lanes, and group k reads 4k cycles later (the address and the column mask delayed once, then a copy per column and group at I + 2 + 4k); the RAM latch, its output register (I + 4 + 4k); the column mask (I + 5 + 4k); lane 4k + r then goes straight (r = 0, 1) or through r − 1 registers to its two DSPs' A ports, whose A1 / A2 (and, r ≠ 0, AD) registers make up the rest of its skew (lane l at the multiplier with the patch at E + l + 1) — no shift registers; the bank is released 12 cycles later (AREA_PLAN, 2026-10-14) |
+| patch lanes | a root chain I + 1 … I + 6 (zeroed at I + 2 for bubbles); per lane one register (E + l − 2), a copy per column group of 4 (E + l − 1), a copy per chain (E + l), into the DSP's B port |
 | seeds | the accumulator word at I + 3 (output register), the chunk's buffer at I + 4, bias or partial sum and the column mask at I + 5, a copy near the columns at I + 6, per chain gated by the pixel's seed position at E + 1 = I + 7 (the gates: per group, then per chain) |
 | `wfb` | one register, a copy per group, one per chain (into the OPMODE register) |
 | write-back | the pixel multiplexer next to the chains (its select per group, then per column), a middle register, a copy per buffer next to its UltraRAMs: stores at I + LAT + 3 (pixel 0) and one cycle later |
@@ -132,9 +132,11 @@ Resources (out of context, xck26 −2LV, `make synth_conv_rtl`, routed;
 +0.025 ns, WHS +0.031 ns, Fmax ≈ 302 MHz).  Before the second copy: 17 835
 LUT, 39 630 FF (21 507 before the register trees: the patch lanes' per-chain
 copies are 8 192 of the 18 123 added), 40 RAMB36 + 24 RAMB18 (the copy adds
-16 RAMB18), WNS +0.039 ns.  In context (production bitstream `1cedaf2ed816`,
-routed, `report_utilization -hierarchical`): 18 253 LUT (3 758 LUTRAM, 2 390
-SRL), 39 731 FF, 40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP.  The retired HLS
+16 RAMB18), WNS +0.039 ns.  In context (production bitstream `de968ccc45da`,
+routed, `report_utilization -hierarchical`): 14 827 LUT (4 046 LUTRAM, 512
+SRL: the weight skew left the SRLs, `doc/plans/AREA_PLAN.md`), 37 497 FF,
+40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP; on `1cedaf2ed816` before the area
+pass 18 253 LUT (3 758 LUTRAM, 2 390 SRL), 39 731 FF.  The retired HLS
 kernel, routed in the bitstreams that carried it: 37 233 LUT, 41 457 FF,
 46 RAMB36 + 16 RAMB18, 48 URAM, 803 DSP.
 
@@ -186,7 +188,7 @@ patch producer and x loader, the sweep, the drain beside the next chunk —
 with one parameter set tuned to this testbench (`RTL_CONV_SIM`: median error
 0.65 %, p90 5.3 % over the 1 042 calls) and one to the board
 (`RTL_CONV_BOARD`: DDR latency, x and weight runs; at 250 MHz, bitstream
-`1cedaf2ed816`, median 2.8 %, p90 20.3 % (fitted on `f70ce632a97a`: 2.9 / 18 %; 18.3 / 45.8 % on `6436623029f7` before the x port left the CCI) — at 100 MHz 3.1 / 14.6 %;
+`de968ccc45da`, median 2.9 %, p90 22.9 % (on `1cedaf2ed816` 2.8 / 20.3 %; fitted on `f70ce632a97a`: 2.9 / 18 %; 18.3 / 45.8 % on `6436623029f7` before the x port left the CCI) — at 100 MHz 3.1 / 14.6 %;
 `inference-scheduler/tools/fit_cost_model.py` refits it).  The worst misses
 are narrow, input-heavy MatMul-on-ConvKernel jobs whose few short x runs per
 row wait on the DDR (2.5–3× the model at 250 MHz).  A change of the

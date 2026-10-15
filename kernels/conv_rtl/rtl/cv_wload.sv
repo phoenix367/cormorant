@@ -48,7 +48,7 @@ module cv_wload
   // ---- runs -------------------------------------------------------------------------
   logic        s_act;
   logic [10:0] s_nruns, s_r;               // runs of the sweep (<= MPG * TM), run index
-  logic [59:0] s_waddr;                    // word address of run s_r
+  logic [WA-1:0] s_waddr;                    // word address of run s_r
   logic [12:0] s_stride;                   // words between consecutive channels
   logic [7:0]  s_len;                      // beats per run (<= 2 * MAXK * MAXK)
   logic [6:0]  s_ent;                      // FIFO entries per run
@@ -94,7 +94,7 @@ module cv_wload
         s_act    <= 1'b1;
         s_r      <= '0;
         s_nruns  <= (nrem >= {25'b0, wq.g_n, 4'b0}) ? {4'b0, wq.g_n, 4'b0} : nrem[10:0];
-        s_waddr  <= j.w_w + 60'(wq.w_off);
+        s_waddr  <= j.w_w + WA'(wq.w_off);
         s_stride <= j.dwm ? {9'b0, j.dw_words} : j.per_m_words;
         s_len    <= j.dwm ? {4'b0, j.dw_words}
                           : (wq.half ? {2'b0, j.n_pos} : {1'b0, j.n_pos, 1'b0});
@@ -103,11 +103,11 @@ module cv_wload
       end
       if (issue) begin
         arvalid  <= 1'b1;
-        araddr   <= {(s_second ? s_waddr + 60'(to4k) : s_waddr), 4'b0};
+        araddr   <= {{(60-WA){1'b0}}, (s_second ? s_waddr + WA'(to4k) : s_waddr), 4'b0};
         arlen    <= b_len - 8'd1;
         s_second <= !b_last;
         if (b_last) begin
-          s_waddr <= s_waddr + 60'(s_stride);
+          s_waddr <= s_waddr + WA'(s_stride);
           if (s_r + 11'd1 == s_nruns) s_act <= 1'b0;
           s_r <= s_r + 11'd1;
         end

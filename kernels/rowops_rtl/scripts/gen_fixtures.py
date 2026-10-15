@@ -28,7 +28,7 @@ _spec = importlib.util.spec_from_file_location("rowops_spec", SPEC)
 rs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rs)
 
-OP = dict(COPY=1, ADDX=2, DEQUANT=3, MULACT=4, NORM=5, ROPE=6, XPOSE=7)
+OP = dict(COPY=1, ADDX=2, DEQUANT=3, MULACT=4, NORM=5, ROPE=6, XPOSE=7, FOLD=9)
 I16, I32, F32 = 0, 1, 2
 F_B_EN, F_P_BCAST, F_P_KEEP, F_RELU, F_NORM_LN = 1 << 12, 1 << 13, 1 << 14, 1 << 15, 1 << 16
 POISON = 0xDE
@@ -72,16 +72,20 @@ def param_bytes(params):
 
 class Case:
     def __init__(self, label, op, n, c1, c2, strides, a_rows, b_rows, params, expect_rows,
-                 kinds, eps=0, aux=0, bq_sh=0, win=(0, 0xFFFFFFFF), xpose=None):
+                 kinds, eps=0, aux=0, bq_sh=0, win=(0, 0xFFFFFFFF), xpose=None, raw=None):
         """a_rows / b_rows / expect_rows: {(i2, i1): list of ints}; kinds (ak, bk, ck);
         strides (a_s1, a_s2, b_s1, b_s2, c_s1, c_s2).  xpose: (R, tiles) for TRANSPOSE
-        with tiles {(i2, i1): [row lists]} and the expected granules computed here."""
+        with tiles {(i2, i1): [row lists]} and the expected granules computed here.
+        raw: the (a, b, p, c) images as they are (FOLD)."""
         self.label, self.op, self.n, self.c1, self.c2 = label, op, n, c1, c2
         self.strides, self.a_rows, self.b_rows, self.params = strides, a_rows, b_rows, params
         self.expect_rows, self.kinds, self.eps, self.aux, self.bq_sh, self.win = expect_rows, kinds, eps, aux, bq_sh, win
         self.xpose = xpose
+        self.raw = raw
 
     def images(self):
+        if self.raw is not None:
+            return self.raw
         a_s1, a_s2, b_s1, b_s2, c_s1, c_s2 = self.strides
         ak, bk, ck = self.kinds
         n, c1, c2 = self.n, self.c1, self.c2
@@ -392,6 +396,32 @@ def build_cases():
     # the spec agrees with the fixture's formula
     x_raw = np.array([a[(0, i)] for i in range(c1)], np.int64)
     assert (rs.bias_round(x_raw, f_x, bias, f_out, relu=True) == np.array([o[(0, i)] for i in range(c1)])).all()
+
+    # 18. FOLD (op 9, HOSTOPS_PLAN §11: Piper's TtsPrep) — rowops_spec.fold on C source rows
+    #     of L int16 a_s2 bytes apart: W = w0 + hl + hr columns per row from s0 = t0 - hl,
+    #     the window [lo, hi), LeakyReLU 1/m, s bits coarser; the output one contiguous run
+    def fold_case(label, C, L, rows, w0, hl, hr, t0, m, s, win, pad=0):
+        W, s0 = w0 + hl + hr, t0 - hl
+        stride = L + pad                                           # elements between the source rows
+        src = rng.integers(-32768, 32768, (C - 1) * stride + L)
+        src[::5] = rng.integers(-300, 300, src[::5].size)          # small values: ties
+        src[:8] = [-32768, 32767, -1, 1, 0, -5 * m, 5 * m, -m]
+        x = np.stack([src[k * stride: k * stride + L] for k in range(C)])
+        y = rs.fold(x, rows, w0, s0, W, win[0], win[1], m, s)
+        a_img = pack(src, I16)
+        a_img += bytes(round16(len(a_img)) - len(a_img))
+        c_img = pack(y.reshape(-1), I16)
+        c_img += bytes(round16(len(c_img)) - len(c_img))
+        return Case(label, OP["FOLD"], W, rows, C, (0, 2 * stride, w0, s0 & 0xFFFFFFFF, 0, 0), {}, {}, [], {},
+                    (I16, I16, I16), aux=rs.fold_aux(m, s), win=win, raw=(a_img, b"", b"", c_img))
+    add(fold_case("fold_flow_w36_m1_s4", 6, 64, 2, 32, 2, 2, 0, 1, 4, (0, 64)))
+    add(fold_case("fold_leaky_m10_window", 4, 96, 3, 32, 1, 1, 0, 10, 1, (5, 90)))
+    add(fold_case("fold_m100_halo36", 2, 128, 4, 32, 36, 0, 0, 100, 2, (0, 128)))
+    add(fold_case("fold_t0_12_hr24", 3, 128, 4, 32, 0, 24, 12, 10, 0, (0, 128)))
+    add(fold_case("fold_window_empty", 2, 64, 3, 24, 1, 1, 0, 10, 1, (40, 40)))
+    add(fold_case("fold_m7_s9_w8", 3, 40, 5, 8, 0, 0, 0, 7, 9, (0, 40)))
+    add(fold_case("fold_w1_rows9", 2, 30, 9, 3, 0, 0, 1, 10, 2, (0, 30)))
+    add(fold_case("fold_unaligned_rows", 3, 50, 2, 24, 3, 2, 0, 10, 3, (2, 47), pad=3))
     return cases
 
 

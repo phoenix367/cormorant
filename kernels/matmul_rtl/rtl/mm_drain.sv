@@ -54,7 +54,7 @@ module mm_drain
   logic [2:0]  r;
   logic [6:0]  w, dw;         // word within the row / words per row
   logic [3:0]  last_cnt;      // elements of the last word (row-major)
-  logic [63:0] row_addr;
+  logic [AB-1:0] row_addr;
   logic        run_pushed;    // this row's C run is queued
 
   // Output FIFO and credits.
@@ -77,7 +77,7 @@ module mm_drain
   assign last_rd   = (w + 7'd1 == dw) && ({1'b0, r} + 4'd1 == st.n_valid);
 
   assign crun_valid = (state == S_RUN) && need_run && credit_ok;
-  assign crun_addr  = row_addr;
+  assign crun_addr  = 64'(row_addr);
   assign crun_n     = contig ? 13'(st.n_valid * st.mcc) : {3'b0, st.mcc};
 
   assign drd_en   = rd_fire;
@@ -119,7 +119,7 @@ module mm_drain
             if (w + 7'd1 == dw) begin
               w          <= '0;
               r          <= r + 3'd1;
-              row_addr   <= row_addr + {31'b0, cfg.m, 1'b0};
+              row_addr   <= row_addr + AB'({cfg.m, 1'b0});
               run_pushed <= 1'b0;
             end else begin
               w <= w + 7'd1;

@@ -543,9 +543,11 @@ module mm_core #(
   );
 
   logic [2:0] crq_cnt;
-  mm_fifo #(.W(77), .D(4), .BRAM(1'b0)) u_crq (
-    .clk, .rst (urst_o), .in_valid (cr_v), .in_ready (cr_r), .in_data ({cr_n, cr_addr}),
-    .out_valid (crq_v), .out_ready (crq_r), .out_data ({crq_n, crq_addr}), .count (crq_cnt));
+  logic [AB-1:0] crq_addr_n;
+  assign crq_addr = 64'(crq_addr_n);
+  mm_fifo #(.W(13 + AB), .D(4), .BRAM(1'b0)) u_crq (
+    .clk, .rst (urst_o), .in_valid (cr_v), .in_ready (cr_r), .in_data ({cr_n, cr_addr[AB-1:0]}),
+    .out_valid (crq_v), .out_ready (crq_r), .out_data ({crq_n, crq_addr_n}), .count (crq_cnt));
 
   logic          pa_v, pa_r, pw_v, pw_r;
   logic [59:0]   pa_waddr;

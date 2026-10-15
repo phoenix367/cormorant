@@ -39,13 +39,14 @@ flowchart TB
 ## Results (2026-09-30)
 
 - **Output:** bit-exact with the specification on the board.
-- **Library speed:** about 0.7 s per 1.49 s chunk, an RTF of 0.52 on a
-  6.9 s sentence.  Since 2026-10-07 (kernels at 250 MHz, the decoder's
-  residual sums on VectorOPKernel — OFFLOAD_PLAN §4.2): 0.27 s per chunk,
-  RTF 0.19.
+- **Library speed:** since 2026-10-15 (the flow inputs, `TtsPrep`, as the
+  row-ops unit's FOLD — HOSTOPS_PLAN §11; a 6.9 s sentence) 0.18 s per chunk,
+  RTF 0.13.  At first about 0.7 s per 1.49 s chunk, an RTF of 0.52;
+  from 2026-10-07 (kernels at 250 MHz, the decoder's residual sums on
+  VectorOPKernel — OFFLOAD_PLAN §4.2) 0.27 s per chunk and an RTF of 0.19.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
   Since 2026-10-08 its attention softmax runs on VectorOPKernel's softmax
-  unit (SOFTMAX_PLAN §5) and its residual LayerNorms, attention prep and row preps on the row-ops unit (HOSTOPS_PLAN phases 3–4b): 28 ms for 88 ids, 96 ms for 400 (51 / 162 before the unit, 46 / 146 with its LayerNorms alone, the row-ops unit, 208 before the FPGA encoder).
+  unit (SOFTMAX_PLAN §5) and its residual LayerNorms, attention prep and row preps on the row-ops unit (HOSTOPS_PLAN phases 3–4b, RPU_PLAN A1's relative-key band): 24 ms for 88 ids, 82 ms for 400 (51 / 162 before the unit, 46 / 146 with its LayerNorms alone, 28 / 96 before the band, 208 before the FPGA encoder).
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.

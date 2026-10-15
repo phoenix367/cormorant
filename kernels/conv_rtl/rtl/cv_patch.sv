@@ -253,7 +253,12 @@ module cv_patch
     pw_wd <= col_data;
   end
 
+  // The beat mask (channel c < ch_valid, the pixel's ok) zeroes the words in the
+  // RAMs' output registers: their synchronous reset, registered one stage ahead
+  // (rz_*[c] at the second cycle after the read, applied at the third) — no
+  // 512-bit AND after the registers (doc/plans/AREA_PLAN.md).
   logic [TIC*EW-1:0] rd_a, rd_b;
+  (* keep = "true" *) logic [TIC-1:0] rz_a, rz_b;
   for (genvar c = 0; c < TIC; c++) begin : g_lb
     localparam int G = c / LBG;
     (* ram_style = "block" *) logic [EW-1:0] mem0 [LBR * LBC];   // read by pixel 0
@@ -268,36 +273,32 @@ module cv_patch
       rb0 <= mem1[pb_addr[G]];
     end
     always_ff @(posedge clk) begin           // the RAMs' output registers
-      rd_a[c * EW +: EW] <= ra0;
-      rd_b[c * EW +: EW] <= rb0;
+      if (rz_a[c]) rd_a[c * EW +: EW] <= '0;
+      else         rd_a[c * EW +: EW] <= ra0;
+      if (rz_b[c]) rd_b[c * EW +: EW] <= '0;
+      else         rd_b[c * EW +: EW] <= rb0;
     end
   end
 
-  // masks travel with the read (three cycles), then the beat is pushed
+  // masks travel with the read: registered as the output registers' resets at
+  // the second cycle, applied with the RAM word at the third; the beat is pushed
   logic        r_v1, r_v2, r_v, r_ok0, r_ok1;
-  logic [1:0]  r_ok0_d, r_ok1_d;
-  logic [4:0]  r_chv, r_chv1, r_chv2;
+  logic [4:0]  r_chv1;
   always_ff @(posedge clk) begin
     if (rst) {r_v1, r_v2, r_v} <= '0;
     else     {r_v1, r_v2, r_v} <= {e_go, r_v1, r_v2};
-    r_ok0_d <= {r_ok0_d[0], ok0};
-    r_ok1_d <= {r_ok1_d[0], ok1};
-    r_ok0   <= r_ok0_d[1];
-    r_ok1   <= r_ok1_d[1];
-    r_chv1  <= sd.ch_valid;
-    r_chv2  <= r_chv1;
-    r_chv   <= r_chv2;
+    r_ok0  <= ok0;
+    r_ok1  <= ok1;
+    r_chv1 <= sd.ch_valid;
+    for (int c = 0; c < TIC; c++) begin
+      rz_a[c] <= !((5'(c) < r_chv1) && r_ok0);
+      rz_b[c] <= !((5'(c) < r_chv1) && r_ok1);
+    end
   end
   assign inflight = 2'(r_v1) + 2'(r_v2) + 2'(r_v);
 
   logic [PATCH_W-1:0] beat;
-  always_comb
-    for (int c = 0; c < TIC; c++) begin
-      logic ch_ok;
-      ch_ok = (5'(c) < r_chv);
-      beat[c * EW +: EW]         = (ch_ok && r_ok0) ? rd_a[c * EW +: EW] : '0;
-      beat[(TIC + c) * EW +: EW] = (ch_ok && r_ok1) ? rd_b[c * EW +: EW] : '0;
-    end
+  assign beat = {rd_b, rd_a};
 
   logic pf_in_ready;
   cv_fifo #(.W(PATCH_W), .D(PD), .BRAM(1'b0)) u_pf (

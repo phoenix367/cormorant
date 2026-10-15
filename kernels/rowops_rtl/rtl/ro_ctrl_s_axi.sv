@@ -113,12 +113,7 @@ module ro_ctrl_s_axi (
     end
   end
 
-  logic [31:0] wmask;
-  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
-  function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata_q & wmask) | (old & ~wmask);
-  endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
@@ -180,30 +175,30 @@ module ro_ctrl_s_axi (
 
       if (w_hs) begin
         case (waddr)
-          A_OP:     op        <= merge(op);
-          A_N:      n         <= merge(n);
-          A_ROWS:   rows      <= merge(rows);
-          A_BLOCKS: blocks    <= merge(blocks);
-          A_A0:     a[31:0]   <= merge(a[31:0]);
-          A_A1:     a[63:32]  <= merge(a[63:32]);
-          A_AS1:    a_s1      <= merge(a_s1);
-          A_AS2:    a_s2      <= merge(a_s2);
-          A_B0:     b[31:0]   <= merge(b[31:0]);
-          A_B1:     b[63:32]  <= merge(b[63:32]);
-          A_BS1:    b_s1      <= merge(b_s1);
-          A_BS2:    b_s2      <= merge(b_s2);
-          A_C0:     c[31:0]   <= merge(c[31:0]);
-          A_C1:     c[63:32]  <= merge(c[63:32]);
-          A_CS1:    c_s1      <= merge(c_s1);
-          A_CS2:    c_s2      <= merge(c_s2);
-          A_P0:     p[31:0]   <= merge(p[31:0]);
-          A_P1:     p[63:32]  <= merge(p[63:32]);
-          A_E0:     eps[31:0] <= merge(eps[31:0]);
-          A_E1:     eps[63:32] <= merge(eps[63:32]);
-          A_AUX:    aux       <= merge(aux);
-          A_BQSH:   bq_sh     <= merge(bq_sh);
-          A_WLO:    win_lo    <= merge(win_lo);
-          A_WHI:    win_hi    <= merge(win_hi);
+          A_OP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) op[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_N: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) n[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_ROWS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) rows[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BLOCKS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) blocks[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_A0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_A1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AS1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_s1[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AS2: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_s2[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BS1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b_s1[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BS2: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b_s2[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CS1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c_s1[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CS2: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c_s2[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_P0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) p[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_P1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) p[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_E0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) eps[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_E1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) eps[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AUX: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) aux[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BQSH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) bq_sh[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_WLO: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) win_lo[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_WHI: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) win_hi[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end

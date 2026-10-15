@@ -5,6 +5,8 @@ package vo_pkg;
   localparam int E         = 8;         // Q8.8 lanes per 128-bit AXI word
   localparam int EW        = 16;        // element width
   localparam int BW        = E * EW;    // word width (128)
+  localparam int WA        = 44;        // word-address bits of the address arithmetic: byte addresses
+                                         // below 2^48 (the PS ports' 40-bit physical space, SMMU IOVAs)
 
   // Burst lengths and outstanding counts are the HLS interface's; the IP
   // declares them on its m_axi interfaces (syn/package_ip.tcl), and the

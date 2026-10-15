@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1830 tests); the chat app (188 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1840 tests); the chat app (188 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the four SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1830 tests in 87 modules (all pass, none skipped; the first run
+# Run all 1840 tests in 87 modules (all pass, none skipped; the first run
 # downloads the 435 MB bertsquad-12 model for test_bert_base.py)
 .venv/bin/python -m pytest test/ -q
 
@@ -202,7 +202,7 @@ C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
 The SystemVerilog RowOpsKernel (`kernels/rowops_rtl/`,
 [ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md); RTL only, not yet in
 the hardware build) has no C-simulation target: `TestRowOpsRtl` (in plain
-`make`) runs the 28 checked-in RowOps fixtures — written by
+`make`) runs the 36 checked-in RowOps fixtures — written by
 `scripts/gen_fixtures.py` from the Python specification
 `inference-scheduler/src/rowops_spec.py` — plus 300 random jobs checked
 against the testbench's C++ port of that specification under randomised
@@ -269,9 +269,9 @@ in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 ##            ConvKernel   17 /  17  (0 failed)
 ##          MatmulKernel   10 /  10  (0 failed)
 ##         PoolingKernel   19 /  19  (0 failed)
-##          RowOpsKernel   29 /  29  (0 failed)
+##          RowOpsKernel   37 /  37  (0 failed)
 ##########################################################
-##  TOTAL: 104 / 104 passed
+##  TOTAL: 112 / 112 passed
 ##  ALL TESTS PASSED
 ##########################################################
 ```

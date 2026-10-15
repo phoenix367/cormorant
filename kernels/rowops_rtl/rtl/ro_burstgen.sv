@@ -32,10 +32,10 @@ module ro_burstgen
   logic [31:0] runs_left;                   // runs of the tile not finished, current included
   logic        run1, tile1, blk1, nr1, nt1; // runs_left == 1, tiles_left == 1, blks_left == 1, n_runs == 1, n_tiles == 1
   logic [31:0] rem;                         // words left in the current run
-  logic [59:0] cur_w;                       // next word to request
-  logic [59:0] next_run_w;                  // first word of the next run
-  logic [59:0] tile_next;                   // first word of the next tile
-  logic [59:0] blk_next;                    // first word of the next block
+  logic [WA-1:0] cur_w;                       // next word to request
+  logic [WA-1:0] next_run_w;                  // first word of the next run
+  logic [WA-1:0] tile_next;                   // first word of the next tile
+  logic [WA-1:0] blk_next;                    // first word of the next block
   logic [31:0] run_i;                       // index of the current run within its block
   logic        zero_cur, zero_next;         // the current / next run is outside the window
   assign zero_next = ((run_i + 32'd1) < g.win_lo) || ((run_i + 32'd1) >= g.win_hi);
@@ -54,7 +54,7 @@ module ro_burstgen
   logic        big, last, carry, borrow;
   logic [8:0]  lo_sum;                      // cur_w[7:0] + len  (low 8 bits used)
   logic [9:0]  rem_lo;                      // rem[8:0] - len    (low 9 bits used)
-  logic [51:0] hi_inc;                      // cur_w[59:8] + 1
+  logic [WA-9:0] hi_inc;                    // cur_w[WA-1:8] + 1
   logic [22:0] rem_hi_dec;                  // rem[31:9] - 1
   always_comb begin
     to_4k      = 9'd256 - {1'b0, cur_w[7:0]};
@@ -66,7 +66,7 @@ module ro_burstgen
     borrow     = big && ({1'b0, rem[8:0]} < 10'(MAXB)) && (rem[8:0] < to_4k);
     lo_sum     = {1'b0, cur_w[7:0]} + len;
     rem_lo     = {1'b0, rem[8:0]} - {1'b0, len};
-    hi_inc     = cur_w[59:8] + 52'd1;
+    hi_inc     = cur_w[WA-1:8] + (WA-8)'(1);
     rem_hi_dec = rem[31:9] - 23'd1;
   end
 
@@ -88,10 +88,10 @@ module ro_burstgen
       run1       <= (g.n_runs == 32'd1);
       nr1        <= (g.n_runs == 32'd1);
       rem        <= g.run_words;
-      cur_w      <= g.base_w;
-      next_run_w <= g.base_w + 60'(g.stride_w);
-      tile_next  <= g.base_w + 60'(g.tile_w);
-      blk_next   <= g.base_w + 60'(g.blk_w);
+      cur_w      <= g.base_w[WA-1:0];
+      next_run_w <= g.base_w[WA-1:0] + WA'(g.stride_w);
+      tile_next  <= g.base_w[WA-1:0] + WA'(g.tile_w);
+      blk_next   <= g.base_w[WA-1:0] + WA'(g.blk_w);
       run_i      <= '0;
       zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
       b_valid    <= 1'b0;
@@ -99,7 +99,7 @@ module ro_burstgen
       if (b_valid && b_ready) b_valid <= 1'b0;
       if (load) begin
         b_valid <= 1'b1;
-        b_waddr <= cur_w;
+        b_waddr <= 60'(cur_w);
         b_len   <= len;
         b_zero  <= zero_cur;
         if (last) begin
@@ -113,9 +113,9 @@ module ro_burstgen
             runs_left  <= g.n_runs;
             run1       <= nr1;
             cur_w      <= blk_next;
-            next_run_w <= blk_next + 60'(g.stride_w);
-            tile_next  <= blk_next + 60'(g.tile_w);
-            blk_next   <= blk_next + 60'(g.blk_w);
+            next_run_w <= blk_next + WA'(g.stride_w);
+            tile_next  <= blk_next + WA'(g.tile_w);
+            blk_next   <= blk_next + WA'(g.blk_w);
             run_i      <= '0;
             zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
           end else if (run1) begin          // the tile ends
@@ -124,21 +124,21 @@ module ro_burstgen
             runs_left  <= g.n_runs;
             run1       <= nr1;
             cur_w      <= tile_next;
-            next_run_w <= tile_next + 60'(g.stride_w);
-            tile_next  <= tile_next + 60'(g.tile_w);
+            next_run_w <= tile_next + WA'(g.stride_w);
+            tile_next  <= tile_next + WA'(g.tile_w);
             run_i      <= '0;
             zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
           end else begin
             runs_left  <= runs_left - 32'd1;
             run1       <= (runs_left == 32'd2);
             cur_w      <= next_run_w;
-            next_run_w <= next_run_w + 60'(g.stride_w);
+            next_run_w <= next_run_w + WA'(g.stride_w);
             run_i      <= run_i + 32'd1;
             zero_cur   <= zero_next;
           end
         end else begin
           rem   <= {borrow ? rem_hi_dec : rem[31:9], rem_lo[8:0]};
-          cur_w <= {carry ? hi_inc : cur_w[59:8], lo_sum[7:0]};
+          cur_w <= {carry ? hi_inc : cur_w[WA-1:8], lo_sum[7:0]};
         end
       end
     end

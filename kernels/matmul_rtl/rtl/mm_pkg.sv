@@ -9,6 +9,8 @@ package mm_pkg;
   localparam int E       = 8;          // Q8.8 elements per 128-bit AXI beat
   localparam int EW      = 16;         // element width
   localparam int BW      = E * EW;     // beat width (128)
+  localparam int AB      = 48;         // byte-address bits of the address arithmetic: addresses below
+                                       // 2^48 (the PS ports' 40-bit physical space, SMMU IOVAs)
   localparam int R       = 8;          // A rows per panel = DSP rows per lane
   localparam int RH      = R / 2;      // panel rows loaded by each read port
   localparam int NLANE   = 2;          // lanes = read ports (gmem0, gmem1)
@@ -73,7 +75,7 @@ package mm_pkg;
 
   // Read engine descriptor: nw words from word address waddr.
   typedef struct packed {
-    logic [59:0] waddr;
+    logic [AB-5:0] waddr;
     logic [11:0] nw;
   } rd_run_t;
 
@@ -87,9 +89,9 @@ package mm_pkg;
 
   // Step = one (batch slice, panel, column chunk) of the job.
   typedef struct packed {
-    logic [63:0] a_addr;      // byte address of A row n_off
-    logic [63:0] b_addr;      // byte address of this batch slice of B
-    logic [63:0] c_addr;      // byte address of C[n_off][c0]
+    logic [AB-1:0] a_addr;    // byte address of A row n_off
+    logic [AB-1:0] b_addr;    // byte address of this batch slice of B
+    logic [AB-1:0] c_addr;    // byte address of C[n_off][c0]
     logic [31:0] c0;          // first column of the chunk
     logic [9:0]  mcc;         // columns in the chunk (1..512)
     logic [3:0]  n_valid;     // panel rows (1..R)

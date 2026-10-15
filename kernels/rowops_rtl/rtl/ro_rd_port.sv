@@ -14,6 +14,11 @@
 // order of real and zero bursts).
 // Replay (a stride-0 operand of <= REP_D words): the single run is passed on
 // and stored as it arrives, then streamed g.reps - 1 more times from the RAM.
+// External runs (ext_en, FOLD): the geometry is not walked; each run offered
+// on ext_* (a word address and a count >= 1) restarts the burst generator
+// once the previous run's bursts are issued — the bursts, the credits and the
+// output stage as for the geometry's runs (g sets the output stage: tail 8, no
+// replay).
 // The AXI side is registered both ways: AR leaves through a register slice
 // (ARREADY only enables it) and R is registered before the FIFO write.
 // ---------------------------------------------------------------------------
@@ -24,6 +29,11 @@ module ro_rd_port
   input  logic          rst,
   input  logic          start,
   input  geom_t         g,
+  input  logic          ext_en,           // runs from ext_* (stable for the job)
+  input  logic          ext_valid,
+  output logic          ext_ready,
+  input  logic [59:0]   ext_waddr,
+  input  logic [31:0]   ext_words,
 
   output logic          arvalid,
   input  logic          arready,
@@ -49,8 +59,30 @@ module ro_rd_port
   logic [59:0] bg_waddr;
   logic [8:0]  bg_len;
 
+  // External runs: the run taken in one cycle starts the generator in the next.
+  geom_t gx, g_bg;
+  logic  kick;
+  assign ext_ready = ext_en && bg_done && !kick;
+  assign g_bg      = ext_en ? gx : g;
+  always_ff @(posedge clk) begin
+    if (rst || start) kick <= 1'b0;
+    else              kick <= ext_valid && ext_ready;
+    if (ext_valid && ext_ready) begin
+      gx           <= '0;
+      gx.en        <= 1'b1;
+      gx.base_w    <= ext_waddr;
+      gx.n_blk     <= 32'd1;
+      gx.n_tiles   <= 32'd1;
+      gx.n_runs    <= 32'd1;
+      gx.run_words <= ext_words;
+      gx.tail      <= 4'd8;
+      gx.reps      <= 32'd1;
+      gx.win_hi    <= 32'hFFFFFFFF;
+    end
+  end
+
   ro_burstgen #(.MAXB(RD_BURST)) u_bg (
-    .clk, .rst, .start, .g,
+    .clk, .rst, .start ((start && !ext_en) || kick), .g (g_bg),
     .b_valid (bg_valid), .b_ready (bg_ready), .b_waddr (bg_waddr), .b_len (bg_len), .b_zero (bg_zero),
     .done    (bg_done)
   );
@@ -207,7 +239,7 @@ module ro_rd_port
     end
   end
 
-  assign idle = bg_done && !arvalid && ar_in_ready && (space == SW'(RD_FIFO_D)) && (phase != P_REPLAY) &&
+  assign idle = bg_done && !kick && !arvalid && ar_in_ready && (space == SW'(RD_FIFO_D)) && (phase != P_REPLAY) &&
                 !rp_v && (of_count == '0) && !dq_valid;
 
   // The FIFO never fills because every burst reserved its space.

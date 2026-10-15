@@ -102,12 +102,7 @@ module mm_ctrl_s_axi (
     end
   end
 
-  logic [31:0] wmask;
-  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
-  function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata_q & wmask) | (old & ~wmask);
-  endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
@@ -168,23 +163,23 @@ module mm_ctrl_s_axi (
 
       if (w_hs) begin
         case (waddr)
-          A_A0:    a[31:0]        <= merge(a[31:0]);
-          A_A1:    a[63:32]       <= merge(a[63:32]);
-          A_B0:    b[31:0]        <= merge(b[31:0]);
-          A_B1:    b[63:32]       <= merge(b[63:32]);
-          A_C0:    c[31:0]        <= merge(c[31:0]);
-          A_C1:    c[63:32]       <= merge(c[63:32]);
-          A_N:     n              <= merge(n);
-          A_K:     k              <= merge(k);
-          A_M:     m              <= merge(m);
-          A_BATCH: batch          <= merge(batch);
-          A_AS:    a_batch_stride <= merge(a_batch_stride);
-          A_BS:    b_batch_stride <= merge(b_batch_stride);
-          A_CS:    c_batch_stride <= merge(c_batch_stride);
-          A_BP:    b_packed       <= merge(b_packed);
-          A_KW:    gemv_kw        <= merge(gemv_kw);
-          A_AB0:   a_to_b[31:0]   <= merge(a_to_b[31:0]);
-          A_AB1:   a_to_b[63:32]  <= merge(a_to_b[63:32]);
+          A_A0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_A1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_N: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) n[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_K: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) k[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_M: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) m[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BATCH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) batch[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_batch_stride[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b_batch_stride[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c_batch_stride[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b_packed[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_KW: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) gemv_kw[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AB0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_to_b[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AB1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_to_b[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end

@@ -18,7 +18,21 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/1cedaf2ed816` is the production design (2026-10-12, HOSTOPS_PLAN phase 3: `f70ce632a97a`'s
+`kv260/de968ccc45da` is the production design (2026-10-15, HOSTOPS_PLAN §11 and AREA_PLAN:
+`1cedaf2ed816`'s with the row-ops unit's op 9, FOLD — Piper's int16 `TtsPrep` on the unit — and the
+kernels' area pass, every kernel call as fast as before): `cases` 1703 (the shipped calls with
+`kernels.rowops.fold`, the unit's 28 FOLD calls new) plus the 179 ConvKernel refinement calls of
+`1cedaf2ed816`'s list (as `8599aa7a5f12` began from `588d721997cb`'s), two passes of 68 s, three
+refinement rounds (+103, +84, +31) → **2100 exact calls**, repeat spread median 0.069 %.  Families
+(train / held-out p90): conv 2.9 / 26.6 %, conv-dw 1.9 / 15.3 %, conv-mm 3.2 / 36.9 %, mm-gemv 4.8 /
+18.3 %, mm-tiled 1.6 / 7.2 %, pool 4.3 / 43.1 %, vecop 0.4 / 23.5 %, vecop-div 0.8 / 8.2 %, vecop-smx
+(55 calls) and rowops (210 calls, train median 2.5 %, no held-out).  `perf_calibrate.py simulate`
+against the board runs of the same day: the CNNs and BERT within 0.4 % (MNIST convnet −10 %: 0.1 ms),
+the Piper chunk +4.3 % (its 41 FOLD calls 11.3 ms predicted, 11.6 measured: the lanes' overlap, not
+the prices), the chat libraries −2.5 … −6.3 % — the same on `1cedaf2ed816`'s model: the host-op model
+predates the A53's interrupt waits and the deep-idle soak, a `host --merge` of new profiles is open.
+
+`kv260/1cedaf2ed816` was the production design before (2026-10-12, HOSTOPS_PLAN phase 3: `f70ce632a97a`'s
 with the RowOpsKernel — the row-ops unit — on `S_AXI_HP0_FPD`): a fresh campaign — `cases` 1530
 (ConvKernel grid 374 + shipped 521, the MatmulKernel and VectorOP cases, and the unit's 37 shipped
 calls: the `rowops` family, `RowOpsKernel` in `FIELDS`), two passes of about 2 min (the bench
@@ -28,7 +42,7 @@ attention prep's ROPE / TRANSPOSE / COPY jobs on the unit — +90 shipped calls,
 rounds +184, +24, +8) → 2073 exact calls; the phase-4b top-up (the vision and Piper encoder preps and the
 TTS row preps on the unit: +58 shipped calls, +179 refined) → 2131 exact calls; the RPU_PLAN A1 top-up
 (the transposes, the Piper band / sums / interleaves, the dequants, the row select and pixel shuffle
-on the unit: +56 shipped calls, one refinement round added none) → **2187 exact calls**, repeat spread median
+on the unit: +56 shipped calls, one refinement round added none) → 2187 exact calls, repeat spread median
 0.066 %.  Families (train / held-out p90):
 conv 3.0 / 26.5 %, conv-dw 1.8 / 15.3 %, conv-mm 2.8 / 43.5 %, mm-gemv 4.8 / 18.7 %, mm-tiled 1.5 /
 6.4 %, pool 3.5 / 42.5 %, vecop 0.6 / 20.3 %, vecop-div 0.8 / 7.7 %, vecop-smx (55 calls) and

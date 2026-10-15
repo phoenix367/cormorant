@@ -283,38 +283,57 @@ module cv_engine
   // ===========================================================================
   // Weight cache: TM columns of WC_WORDS words of TIC lanes; columns
   // [0, TM/2) in block RAM, [TM/2, TM) in UltraRAM.  Address {bank, tile,
-  // khi, kwi}.  From the issue: the address register (one copy) at I + 1,
-  // its copy per column at I + 2 (each drives its column's RAMs only: 4 block
-  // RAMs or 4 UltraRAMs), the RAM latch, the RAM's output register, then the
-  // column mask (a column past the m-tile's channels reads zero) at I + 5.
+  // khi, kwi}.  A column is WQ = 4 RAMs of 64 bits, one per group of 4 lanes,
+  // and group k is read 4k cycles after group 0: that is most of the weight
+  // lanes' skew (lane l at E + l); the DSPs' A-port registers take the rest
+  // (cv_mac_chain) — no shift registers (doc/plans/AREA_PLAN.md).  From the
+  // issue: the address register (one copy) at I + 1, delayed 4k for group k
+  // (one copy), its copy per column and group at I + 2 + 4k (each drives one
+  // RAM), the RAM latch, the RAM's output register, then the column mask (a
+  // column past the m-tile's channels reads zero) at I + 5 + 4k.  The writes
+  // are not delayed: a sweep's bank is released 4 (WQ - 1) cycles later instead.
   // ===========================================================================
+  localparam int WQ  = 4;                  // RAM groups per column
+  localparam int WQW = WW / WQ;            // 64 bits: 4 lanes
+  localparam int WQL = TIC / WQ;           // lanes per group
+  localparam int WSK = 4 * (WQ - 1);       // the last group's read delay
   logic [8:0]    wa1;                      // I + 1
-  (* keep = "true" *) logic [8:0] wa_q [TM];   // I + 2, per column
+  logic [8:0]    wa_dl [1:WSK];            // wa1 delayed: wa_dl[d] at I + 1 + d
+  (* keep = "true" *) logic [8:0] wa_q [TM][WQ];   // I + 2 + 4k, per column and group
   (* keep = "true" *) logic [TM-1:0] mk1;  // the m-tile's valid columns, I + 1
   (* keep = "true" *) logic [TM-1:0] mk2, mk3, mk4;   // per column, I + 2 .. I + 4
-  logic [WW-1:0] wr_data [TM];             // the masked word, I + 5
+  logic [TM-1:0] mk_dl [1:WSK];            // mk4 delayed: mk_dl[d] at I + 4 + d
+  logic [WQW-1:0] wr_q [TM][WQ];           // group k's masked word, I + 5 + 4k
 
   for (genvar m = 0; m < TM; m++) begin : g_wc
     localparam int G = m / GW;
-    logic [WW-1:0] rd0, rd1, rd2;
-    if (m < TM / 2) begin : g_b
-      (* ram_style = "block" *) logic [WW-1:0] mem [WC_WORDS];
-      always_ff @(posedge clk) begin
-        if (wg_we[G] && wg_col[G] == 2'(m % GW)) mem[wg_addr[G]] <= wg_data[G];
-        rd0 <= mem[wa_q[m]];
+    for (genvar k = 0; k < WQ; k++) begin : g_q
+      logic [WQW-1:0] rd0, rd1, rd2;
+      logic           mk;
+      if (k == 0) begin : g_m0
+        assign mk = mk4[m];
+      end else begin : g_mk
+        assign mk = mk_dl[4 * k][m];
       end
-    end else begin : g_u
-      (* ram_style = "ultra" *) logic [WW-1:0] mem [WC_WORDS];
-      always_ff @(posedge clk) begin
-        if (wg_we[G] && wg_col[G] == 2'(m % GW)) mem[wg_addr[G]] <= wg_data[G];
-        rd0 <= mem[wa_q[m]];
+      if (m < TM / 2) begin : g_b
+        (* ram_style = "block" *) logic [WQW-1:0] mem [WC_WORDS];
+        always_ff @(posedge clk) begin
+          if (wg_we[G] && wg_col[G] == 2'(m % GW)) mem[wg_addr[G]] <= wg_data[G][k * WQW +: WQW];
+          rd0 <= mem[wa_q[m][k]];
+        end
+      end else begin : g_u
+        (* ram_style = "ultra" *) logic [WQW-1:0] mem [WC_WORDS];
+        always_ff @(posedge clk) begin
+          if (wg_we[G] && wg_col[G] == 2'(m % GW)) mem[wg_addr[G]] <= wg_data[G][k * WQW +: WQW];
+          rd0 <= mem[wa_q[m][k]];
+        end
       end
+      always_ff @(posedge clk) begin
+        rd1 <= rd0;                        // the RAM's output register
+        rd2 <= mk ? rd1 : '0;
+      end
+      assign wr_q[m][k] = rd2;
     end
-    always_ff @(posedge clk) begin
-      rd1 <= rd0;                          // the RAM's output register
-      rd2 <= mk4[m] ? rd1 : '0;
-    end
-    assign wr_data[m] = rd2;
   end
 
   // ===========================================================================
@@ -450,13 +469,13 @@ module cv_engine
   end
 
   // a sweep's bank is released the cycle after its last weight read reached
-  // the RAMs (issue + 2)
-  logic [2:0] r_pipe;
+  // the RAMs (issue + 2, the last group WSK cycles later)
+  logic [WSK+2:0] r_pipe;
   always_ff @(posedge clk) begin
     if (rst) r_pipe <= '0;
-    else     r_pipe <= {r_pipe[1:0], adv && s_lastit};
+    else     r_pipe <= {r_pipe[WSK+1:0], adv && s_lastit};
   end
-  assign r_done = r_pipe[2];
+  assign r_done = r_pipe[WSK+2];
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -527,10 +546,17 @@ module cv_engine
   always_ff @(posedge clk) begin
     wa1 <= {s_bank, s_g[1:0], s_khi, s_kwi};
     mk1 <= s_mask;
-    for (int m = 0; m < TM; m++) wa_q[m] <= wa1;
+    wa_dl[1] <= wa1;
+    for (int d = 2; d <= WSK; d++) wa_dl[d] <= wa_dl[d - 1];
+    for (int m = 0; m < TM; m++) begin
+      wa_q[m][0] <= wa1;
+      for (int k = 1; k < WQ; k++) wa_q[m][k] <= wa_dl[4 * k];
+    end
     mk2 <= mk1;
     mk3 <= mk2;
     mk4 <= mk3;
+    mk_dl[1] <= mk4;
+    for (int d = 2; d <= WSK; d++) mk_dl[d] <= mk_dl[d - 1];
   end
 
   // patches: the root chain pd[1..D_E], zeroed at I + 2 for bubbles and
@@ -660,17 +686,25 @@ module cv_engine
     end
   end
 
-  // A weight lane drives only the two pixels' DSPs of its column: the masked
-  // word (a register) delayed l + 1 cycles — a shift register ending in a
-  // register next to the DSPs.
+  // A weight lane drives only the two pixels' DSPs of its column.  Lane
+  // l = 4k + r of group k's masked word (at E - 1 + 4k): lanes r = 0, 1 go to
+  // the DSPs' A ports as they are (AREG 2, and the AD register for r = 1),
+  // r = 2, 3 through r - 1 registers first (cv_mac_chain's lane timing:
+  // E + l - 1 for r = 0, E + l - 2 otherwise).
   for (genvar m = 0; m < TM; m++) begin : g_bsk
     for (genvar l = 0; l < TIC; l++) begin : g_l
-      (* srl_style = "srl_reg" *) logic [15:0] sr [l + 1];
-      always_ff @(posedge clk) begin
-        sr[0] <= wr_data[m][l * EW +: EW];
-        for (int k = 1; k <= l; k++) sr[k] <= sr[k - 1];
+      localparam int K  = l / WQL;
+      localparam int RR = l % WQL;
+      if (RR < 2) begin : g_dir
+        assign b_sk[m][l] = wr_q[m][K][RR * EW +: EW];
+      end else begin : g_reg
+        logic [15:0] wd [RR - 1];
+        always_ff @(posedge clk) begin
+          wd[0] <= wr_q[m][K][RR * EW +: EW];
+          for (int d = 1; d < RR - 1; d++) wd[d] <= wd[d - 1];
+        end
+        assign b_sk[m][l] = wd[RR - 2];
       end
-      assign b_sk[m][l] = sr[l];
     end
   end
 

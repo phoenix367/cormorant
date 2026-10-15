@@ -55,9 +55,9 @@ module mm_rungen
   logic [8:0]  blk;          // current K block
   logic [4:0]  j;            // plane within the block (chunked image mode)
   logic [4:0]  t, tiles_n;   // tile within the chunk (packed mode)
-  logic [63:0] addr_run, addr_tile, addr_blk, pk_base, base_q;
-  logic [63:0] planes24;     // bytes of 24 planes: from a block to plane 8 of the next
-  assign planes24 = {22'b0, cfg.p24};
+  logic [AB-1:0] addr_run, addr_tile, addr_blk, pk_base, base_q;
+  logic [AB-1:0] planes24;   // bytes of 24 planes: from a block to plane 8 of the next
+  assign planes24 = AB'(cfg.p24);
 
   // Planes of the current block; this lane's share of it is [r_lo, r_hi).
   logic [12:0] blk_left;
@@ -82,20 +82,20 @@ module mm_rungen
   localparam logic [3:0] R0 = 4'(P * RH);
   logic [3:0]  a_rows;
   logic        a_marker;
-  logic [63:0] a_addr;
+  logic [AB-1:0] a_addr;
   always_comb begin
     if (st.n_valid <= R0)            a_rows = 4'd0;
     else if (st.n_valid - R0 >= 4'(RH)) a_rows = 4'(RH);
     else                             a_rows = st.n_valid - R0;
     a_marker = !st.a_load || (a_rows == 4'd0) || (cfg.k == '0);
     // rows P*RH.. start P * RH * k elements into the panel
-    a_addr   = st.a_addr + ({51'b0, cfg.k} << 1) * 64'(P * RH);
+    a_addr   = st.a_addr + (AB'(cfg.k) << 1) * AB'(P * RH);
   end
 
   // Candidate run -------------------------------------------------------------------
   logic        cand;
   logic        c_dest_b, c_marker, c_init, c_last, c_plast;
-  logic [63:0] c_addr;
+  logic [AB-1:0] c_addr;
   logic [12:0] c_len;
   logic [4:0]  c_rows;
   logic [5:0]  c_wb;
@@ -171,7 +171,7 @@ module mm_rungen
 
   // Two register stages: s1 = candidate, o = derived queue descriptors.
   logic        s1_v, s1_dest_b, s1_marker, s1_init, s1_last, s1_plast;
-  logic [63:0] s1_addr;
+  logic [AB-1:0] s1_addr;
   logic [12:0] s1_len;
   logic [4:0]  s1_rows;
   logic [5:0]  s1_wb;
@@ -222,7 +222,7 @@ module mm_rungen
           o_gb.step_last  <= s1_last;
           o_gb.panel_last <= s1_plast;
           o_rd            <= !s1_marker;
-          o_rdr.waddr     <= s1_addr[63:4];
+          o_rdr.waddr     <= s1_addr[AB-1:4];
           o_rdr.nw        <= s1_nw;
           o_x             <= s1_dest_b;
           o_xr.marker     <= s1_marker;
@@ -265,17 +265,17 @@ module mm_rungen
           // Base of the chunk in B.  Packed: chunk c0 starts at tile c0 / 32
           // = 16 * chunk index, 16 tiles of 32 x k elements per chunk.  Image:
           // column c0 of plane 0 (c0 == 0 for a single chunk).
-          if (cfg.pk) base_q <= (st.c0 == '0) ? st.b_addr : pk_base + ({51'b0, cfg.k} << 10);
-          else        base_q <= st.b_addr + ({32'b0, st.c0} << ({2'b0, cfg.lk} + 4'd1));
+          if (cfg.pk) base_q <= (st.c0 == '0) ? st.b_addr : pk_base + (AB'(cfg.k) << 10);
+          else        base_q <= st.b_addr + (AB'(st.c0) << ({2'b0, cfg.lk} + 4'd1));
           state <= S_BINIT2;
         end
         S_BINIT2: begin
           // plus this lane's first K block: block P (16 rows of 32 or 16
           // planes), or for lane 1 alone in a split block 0 its plane 8
-          logic [63:0] first;
+          logic [AB-1:0] first;
           if (P == 0)          first = base_q;
-          else if (half_start) first = base_q + (cfg.pk ? 64'd512 : {24'b0, cfg.lfull, 4'b0});
-          else                 first = base_q + (cfg.pk ? 64'd1024 : {23'b0, cfg.lfull, 5'b0});
+          else if (half_start) first = base_q + (cfg.pk ? AB'(512) : AB'({cfg.lfull, 4'b0}));
+          else                 first = base_q + (cfg.pk ? AB'(1024) : AB'({cfg.lfull, 5'b0}));
           if (cfg.pk) pk_base <= base_q;
           addr_tile <= first;
           addr_blk  <= first;
@@ -289,20 +289,20 @@ module mm_rungen
             if (!last_blk) begin
               blk      <= to_half ? cfg.blk_l : blk + 9'd2;
               // two blocks of 16 x 32, or one and a half into the split block
-              addr_run <= addr_run + (to_half ? 64'd1536 : 64'd2048);
+              addr_run <= addr_run + (to_half ? AB'(1536) : AB'(2048));
             end else begin
               blk       <= blk_first;
               t         <= t + 5'd1;
-              addr_tile <= addr_tile + ({51'b0, cfg.k} << 6);   // next tile: 32 x k elements
-              addr_run  <= addr_tile + ({51'b0, cfg.k} << 6);
+              addr_tile <= addr_tile + (AB'(cfg.k) << 6);   // next tile: 32 x k elements
+              addr_run  <= addr_tile + (AB'(cfg.k) << 6);
             end
           end else if (cfg.contig) begin
             blk      <= to_half ? cfg.blk_l : blk + 9'd2;
-            addr_run <= addr_run + (to_half ? planes24 : {22'b0, cfg.lfull, 6'b0});   // 24 / 32 planes
+            addr_run <= addr_run + (to_half ? planes24 : AB'({cfg.lfull, 6'b0}));   // 24 / 32 planes
           end else begin
             if (j + 5'd1 != r_hi) begin
               j        <= j + 5'd1;
-              addr_run <= addr_run + {27'b0, cfg.lfull, 1'b0};
+              addr_run <= addr_run + AB'({cfg.lfull, 1'b0});
             end else if (to_half) begin
               j        <= 5'd8;
               blk      <= cfg.blk_l;
@@ -311,8 +311,8 @@ module mm_rungen
             end else begin
               j        <= '0;
               blk      <= blk + 9'd2;
-              addr_blk <= addr_blk + {22'b0, cfg.lfull, 6'b0};
-              addr_run <= addr_blk + {22'b0, cfg.lfull, 6'b0};
+              addr_blk <= addr_blk + AB'({cfg.lfull, 6'b0});
+              addr_run <= addr_blk + AB'({cfg.lfull, 6'b0});
             end
           end
         end

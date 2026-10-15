@@ -362,6 +362,11 @@ def buffer_sizes(c: KernelCall) -> List[int]:
 
         def span(s1, s2, row_bytes):
             return max(rows - 1, 0) * s1 + max(blocks - 1, 0) * s2 + row_bytes
+        if (op & 15) == rs.OP_FOLD:
+            # the source rows a_s2 apart, read up to column win_hi; C one contiguous run
+            a = max(blocks - 1, 0) * f["a_s2"] + 2 * f["win_hi"]
+            cc = 2 * _up(blocks * rows * n, 8)
+            return [_up(v, 2) // 2 + pad for v in (a, 16, cc, 16)]
         if (op & 15) == rs.OP_XPOSE:
             # a tile of R rows (b_s1 apart) x L = n; column d -> a granule of R at d * b_s2
             R = f["aux"] & 15

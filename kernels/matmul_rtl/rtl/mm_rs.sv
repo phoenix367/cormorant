@@ -50,3 +50,35 @@ module mm_rs #(
   end
 
 endmodule
+
+// ---------------------------------------------------------------------------
+// mm_rs1 — one-entry register slice: out_valid / out_data from a register,
+// in_ready = !out_valid (a register too).  It takes a word every other cycle
+// at most, which is all the AR / AW engines issue (their bl_v blocks the cycle
+// after every issue), at half the registers and none of the skid muxes of
+// mm_rs (doc/plans/AREA_PLAN.md).
+// ---------------------------------------------------------------------------
+module mm_rs1 #(
+  parameter int W = 8
+) (
+  input  logic         clk,
+  input  logic         rst,
+
+  input  logic         in_valid,
+  output logic         in_ready,
+  input  logic [W-1:0] in_data,
+
+  output logic         out_valid,
+  input  logic         out_ready,
+  output logic [W-1:0] out_data
+);
+  assign in_ready = !out_valid;
+
+  always_ff @(posedge clk) begin
+    if (rst)                      out_valid <= 1'b0;
+    else if (in_valid && in_ready) out_valid <= 1'b1;
+    else if (out_ready)           out_valid <= 1'b0;
+    if (in_valid && in_ready) out_data <= in_data;
+  end
+
+endmodule

@@ -92,9 +92,12 @@ def estimate_us(c, mhz: Optional[float] = None) -> float:
     elif c.kernel == "RowOpsKernel":
         # four lanes per cycle; NORM reads its row twice; ROPE loads its B row (HD / 2
         # words) per row; TRANSPOSE loads a tile and emits one granule per cycle
-        # (contiguous) or per two (scattered) (ROWOPS_RTL_KERNEL.md §Performance)
+        # (contiguous) or per two (scattered); FOLD eight lanes (ROWOPS_RTL_KERNEL.md
+        # §Performance)
         rows, n, op = f["rows"] * f["blocks"], f["n"], f["op"] & 15
-        if op == 7:
+        if op == 9:                                   # FOLD: eight lanes, a row's words + one
+            cyc = rows * (math.ceil(n / 8) + 1) + 500
+        elif op == 7:
             R = f["aux"] & 15
             cyc = rows * (R * math.ceil(n / 8) + (n if f["b_s2"] == 2 * R else 2 * n)) + 500
         elif op == 6:

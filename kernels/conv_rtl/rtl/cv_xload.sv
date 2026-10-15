@@ -142,7 +142,7 @@ module cv_xload
   logic [4:0]  i_c;
   logic        i_second;                   // the run's second burst (4 KiB split) is next
   logic [OW-1:0] outs;
-  logic [59:0] i_waddr;
+  logic [WA-1:0] i_waddr;
   logic [3:0]  i_nw;                       // words of the current run
 
   // per-half row info for the emitter
@@ -186,7 +186,7 @@ module cv_xload
   // the run's geometry follows its offset
   logic [31:0] runoff_nw_sum;
   assign runoff_nw_sum = {29'b0, i_runoff[2:0]} + {25'b0, ir.iw_cnt} + 32'd7;
-  assign i_waddr = j.x_w + 60'(i_runoff[31:3]);
+  assign i_waddr = j.x_w + WA'(i_runoff[31:3]);
   assign i_nw    = runoff_nw_sum[6:3];
 
   always_ff @(posedge clk) begin
@@ -215,7 +215,7 @@ module cv_xload
       end
       if (issue) begin
         arvalid  <= 1'b1;
-        araddr   <= {(i_second ? i_waddr + 60'(to4k) : i_waddr), 4'b0};
+        araddr   <= {{(60-WA){1'b0}}, (i_second ? i_waddr + WA'(to4k) : i_waddr), 4'b0};
         arlen    <= {4'b0, b_len - 4'd1};
         i_second <= !b_last;
         if (b_last) begin

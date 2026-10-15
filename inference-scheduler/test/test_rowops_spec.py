@@ -135,5 +135,80 @@ class TestRopeSilu(unittest.TestCase):
         self.assertLess((diff > 0).mean(), 0.01)
 
 
+def tts_prep_double(x_raw, ch, rows, w0, hl, hr, t0, slo, shi, alpha, f_in, f_out):
+    """TtsPrep's arithmetic as the C helper does it (src/tts_nodes.py tts_prep):
+    double LeakyReLU, round half to even at f_out, saturation; 0 outside [slo, shi)."""
+    W = w0 + hl + hr
+    col = np.arange(rows)[:, None] * w0 + np.arange(W)[None, :] - hl + t0
+    ok = (col >= slo) & (col < shi)
+    v = x_raw[ch][:, np.clip(col, 0, x_raw.shape[1] - 1)].astype(np.float64) * 2.0 ** -f_in
+    v = np.where(v > 0, v, alpha * v)
+    return np.where(ok[None], exact_rne(v, f_out), 0.0)
+
+
+class TestFold(unittest.TestCase):
+    """FOLD (op 9, HOSTOPS_PLAN §11): TtsPrep's LeakyReLU and re-rounding as an
+    integer quotient, its divider-free form and the windowed gather."""
+
+    def test_recip_equals_quotient(self):
+        """The datapath's reciprocal form for every int16, m 1 .. 127 and s 0 .. 15."""
+        x = np.arange(-32768, 32768, dtype=np.int64)
+        for m in range(1, rs.FOLD_M_MAX + 1):
+            for s in range(rs.FOLD_S_MAX + 1):
+                np.testing.assert_array_equal(rs.fold_recip(x, m, s), rs.fold_elem(x, m, s),
+                                              err_msg=f"m {m} s {s}")
+
+    def test_quotient_is_round_half_even(self):
+        from fractions import Fraction
+        x = list(range(-32768, -32700)) + list(range(-700, 700)) + list(range(32700, 32768))
+        for m, s in ((10, 0), (10, 3), (100, 2), (7, 5), (127, 15), (1, 4)):
+            got = rs.fold_elem(np.array(x), m, s)
+            want = [round(Fraction(v, (m if v < 0 else 1) << s)) for v in x]   # Python round: half to even
+            self.assertEqual(list(got), want, f"m {m} s {s}")
+
+    def test_divisor(self):
+        for s in range(9):
+            self.assertEqual(rs.fold_divisor(1.0, s), 1)
+            self.assertEqual(rs.fold_divisor(0.1, s), 10)
+            self.assertEqual(rs.fold_divisor(0.01, s), 100)
+        self.assertIsNone(rs.fold_divisor(0.3, 2))       # 1 / alpha not an integer
+        self.assertIsNone(rs.fold_divisor(0.005, 2))     # m 200 beyond the register
+        self.assertIsNone(rs.fold_divisor(0.1, 16))      # s beyond the register
+        self.assertIsNone(rs.fold_divisor(0.1, -1))      # a left shift: not the op
+        self.assertIsNone(rs.fold_divisor(0.0, 0))
+        self.assertIsNone(rs.fold_divisor(1.5, 0))
+        self.assertEqual(rs.fold_aux(100, 2), 2 | (100 << 4))
+        with self.assertRaises(ValueError):
+            rs.fold_aux(0, 2)
+
+    def test_fold_equals_ttsprep(self):
+        """The Piper chunk's int16 call shapes (scaled down in channels and rows), with
+        windows inside, across and outside the rows: fold == TtsPrep's double path."""
+        rng = np.random.default_rng(11)
+        #       C    L      nch rows w0    hl  hr  t0  alpha f_in f_out
+        shapes = ((8, 1536, 4, 3, 512, 12, 12, 0, 0.1, 8, 7),
+                  (4, 1536, 4, 3, 512, 0, 24, 12, 0.1, 8, 7),
+                  (4, 12288, 2, 12, 1024, 36, 0, 0, 0.1, 10, 8),
+                  (2, 49152, 2, 12, 4096, 3, 3, 0, 0.01, 12, 10),
+                  (6, 256, 6, 2, 128, 2, 2, 0, 1.0, 11, 6),
+                  (5, 192, 5, 3, 64, 1, 1, 0, 0.1, 7, 4),
+                  (3, 1536, 3, 12, 128, 1, 1, 0, 0.1, 9, 6))
+        for C, L, nch, rows, w0, hl, hr, t0, alpha, f_in, f_out in shapes:
+            x = rng.integers(-32768, 32768, (C, L), dtype=np.int64)
+            x[:, ::7] = rng.integers(-40, 40, (C, (L + 6) // 7))          # ties at small values
+            ch = np.arange(nch)
+            m = rs.fold_divisor(alpha, f_in - f_out)
+            self.assertIsNotNone(m)
+            for slo, shi in ((0, L), (L // 3, L - 5), (17, 18), (0, 0), (L, L), (5, 3)):
+                got = rs.fold(x[ch], rows, w0, t0 - hl, w0 + hl + hr, slo, shi, m, f_in - f_out)
+                want = tts_prep_double(x, ch, rows, w0, hl, hr, t0, slo, shi, alpha, f_in, f_out)
+                np.testing.assert_array_equal(got, want, err_msg=f"L {L} W {w0 + hl + hr} [{slo}, {shi})")
+
+    def test_fold_window_must_stay_in_the_row(self):
+        x = np.zeros((1, 64), np.int64)
+        with self.assertRaises(ValueError):
+            rs.fold(x, 2, 32, -2, 36, -2, 64, 1, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

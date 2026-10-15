@@ -1,5 +1,14 @@
 # The host row ops on the FPGA — a row-ops unit (study)
 
+**Status (2026-10-15): phase 5a DONE — FOLD (op 9, Piper's `TtsPrep`) is in
+production.**  Bitstream `de968ccc45da` (§11.7, after the kernels' area pass
+of `AREA_PLAN.md`): WNS +0.029 ns, 89 547 LUTs; on the board 159 / 159 models
+and every library bit-exact, the 72 kernel benchmarks equal to
+`1cedaf2ed816`'s; the Piper chunk ≈ 260 → 183 ms (RTF 0.19 → 0.13); the
+chat server runs it (with the R5).  RPU_PLAN track A1 (2026-10-13) moved
+BERT's transposes, the Piper sums / interleaves / relative-key band, the
+dequants, the row select and pixel shuffle onto the unit (BERT 288 → 266 ms).
+
 **Status (2026-10-12): phase 3 DONE — the unit is in production.  Bitstream
 `1cedaf2ed816` (§9): the RowOpsKernel on `S_AXI_HP0_FPD`, WNS +0.020 ns at
 4 ns, the design at 80 % LUT / 136 of 144 BRAM; on the board 159 / 159
@@ -577,7 +586,7 @@ inference-scheduler/.venv/bin/python demo/tts/scripts/piper_study.py encoder-vsm
 | **2 — scheduler** | DONE 2026-10-12 (one day, not the 1–2 weeks: the int32 residual of phase 0 replaced "DMA f32") — **the lane**: `KERNEL_REGISTRY["RowOpsKernel"]` (UIO `RowOpsKernel_0`, 0xA004_0000, the generated driver), `KERNEL_ROWOPS` in `kernel_id_t`, the `run_rowops()` helper (byte strides, NULL → address 0), the 64 KiB table image as the weight tensor `rowops_tables` loaded by TLOAD in `inference_init()`, `perf_calls.FIELDS` / `perf_model.family() == "rowops"`, the timeline lane, `perf_calibrate` sizing; **the capability** `platforms/<p>.json kernels.rowops.unit` (`src/_rowops_hw_config.py`, `AXI_ROWOPS`; the KV260 says false until phase 3); **the int32 residual**: `axi.numeric` `dma: i32` (`TensorInfo.dma`, twice the pool elements), host ops take `int32_t *` buffers with the kernel-buffer syncs (`LlmEmbed` / `llm_embed32`, `LlmSelectRow`, `VitEmbedAdd` / `vit_embed_add32`, `LlmAttnPrep`, `LlmDequant`); **the nodes** (`src/rowops_nodes.py`, the factories merged over the host ops in `graph.py`): `LayerNormRoNode` (ONNX `LayerNormalization`, aligned rows ≤ 4 096, else the host op — BERT's 25), `ResAddRoNode` / `RMSNormRoNode` / `SiluMulRoNode` (`llama.py rowops=True`: `res_bits = 15` + `inorm` + `isilu`), `ResAddBiasRoNode` / `LayerNorm32RoNode` (`vit.py rowops=True`: the bias rounded once at 2^-15 — `rowops_spec.quant_bias`, the study's `ibias`; `piper.py rowops=True`: `TtsResAdd` at max(f_x, f_y) + `TtsLayerNorm`), each with the spec's reference, `kernel_calls()` and the per-column parameter block (`P_BCAST` when every column agrees; β at `beta_bits`: 2^-20, coarser only for |β| ≥ 2, which 6 of BERT's LayerNorms need); `LlmAttnPrep` / `LlmAttnMerge` / `LlmDequant` stay host ops (the four-lane ROPE / TRANSPOSE would not beat them; the dequant writes a host output); **the studies**: `llm_study` `pow2+sink+p12(+vsmx)+rowops`, `vlm_study` `pow2+p12+vgelu+vsmx+rowops`, `bert_study` `+iln`, `piper_vits` `encoder_forward(rowops_unit=True)`, and `--rowops auto / on / off` on `generate_llm_project.py`, `generate_tts_project.py`, the sched-checks; **`host_emu`** carries the unit's C model (`xrowopskernel.h`: every op, TLOAD, the tail-word writes) | every suite ✓ (1 789 scheduler tests, the chat tests, ruff, facts); the sched-checks bit for bit ✓ — BERT 3 / 3, SmolLM2-135M 3 / 3 (`AXI_ROWOPS=1 llm_sched_check.py --rowops on`), SmolVLM image features + text (`vlm_sched_check.py --rowops on`); the generated projects equal the simulation on the host emulation ✓ (test_rowops_unit, test_vit `TestVisionRowops`, test_piper `TestPiperEncoderRowops`); the libraries regenerated — after phase 3 | one day |
 | **3 — hardware** | DONE 2026-10-12 (§9): `hw/cormorant_hw_128/scripts/bd_rowops_hp0.tcl` (the kernel, `axi_rowops_intercon` with register slices on both sides into `S_AXI_HP0_FPD`, SmartConnect M04 at `0xA004_0000`, interrupt `pl_ps_irq0[4]`), the testbench's `ro_classes.svh` (the table load + the 21 fixtures through the PS VIP, byte for byte) — `sim_hw_kv260` 97 / 97; bitstream `1cedaf2ed816`, WNS +0.020 / WHS +0.010 ns, 93 969 LUT (80 %), 136 / 144 BRAM, 55 / 64 URAM, 833 DSP; the board: overlay `fabric_rowops`, 159 / 159 models, SmolLM2-135M / 360M, SmolVLM, Piper and BERT bit-exact, the perf baseline `kv260-1cedaf2ed816.json` (69 cases: 6 of the unit), the performance model `kv260/1cedaf2ed816` with the `rowops` family, the chat server redeployed with the regenerated libraries | WNS ≥ 0 ✓; 159 / 159 and every library bit-exact ✓; prefill_256 0.58 × (gate 0.55 ×) ✗ and BERT 0.79 × (gate 0.75 ×) ✗ — the attention prep / merge still on the host (§9.4) | one day + 2 h 20 min of Vivado |
 | **4 — attention prep on the unit** | **4a DONE 2026-10-12** (§10.8: 135M prefill 256 448 → 398 ms, 360M 1 125 → 1 050, bit-exact, the model topped up to 2 073 calls); **4b DONE 2026-10-12** (§10.9: SmolVLM 1.70 → 1.64 s per image, the Piper encoder 146 → 96 ms at 400 ids, bit-exact, 2 131 calls); PLANNED (§10): 4a the Llama prefill prep as ROPE / TRANSPOSE / COPY jobs on the production bitstream (`irope` joins the policy, `qk_kw = 1`, the V image's boundary blocks as R = 1 granules), 4b the vision / Piper prep (`iqkv`) and `TtsRowPrep` as windowed COPYs, 4c the RTL tweaks only on evidence (ROPE B reuse, TRANSPOSE emit rate, descriptor chains) | 135M prefill 256 ≤ 427 ms, 360M ≤ 1 030, SmolVLM ≤ 1.60 s, Piper encode 400 ≤ 110 ms, all bit-exact | 3 + 2 (+ 3) days |
-| **5 — the rest** | TtsPrep onto the unit if its share stays (77 ms of the chunk); the merge gone through a ConvKernel y channel stride (§10.4); sigmoid as act 7 with the next VectorOPKernel bitstream (§4.3); the perf-regression and docs-audit passes | | as they come |
+| **5 — the rest** | TtsPrep onto the unit (77 ms of the chunk): op 9 FOLD, §11 — DONE 2026-10-15 (5a, bitstream `de968ccc45da`); the merge gone through a ConvKernel y channel stride (§10.4); sigmoid as act 7 with the next VectorOPKernel bitstream (§4.3); the perf-regression and docs-audit passes | | as they come |
 
 The decode step gets its 10 % from phase 0's host fix as much as from the
 unit; the prefill, BERT and the Piper encoder need the unit.
@@ -1085,3 +1094,220 @@ benchmark 72 / 72, the baseline re-recorded (PASS: two cases improved by the
 usual jitter); `simulate`: the image pass −2.3 %, the Piper encoder buckets
 −0.0…−3.6 %, the chunk −2.3 %, the text prefills −3.2…−4.2 % as in §10.8.
 The chat server is redeployed with both libraries.
+
+## 11. Phase 5a plan — TtsPrep on the unit: FOLD, op 9 (2026-10-14)
+
+**Verdict: GO — a new op and a bitstream.**  `TtsPrep` is the Piper
+chunk's largest host op: 77 ms of the 260 ms chunk on the board (RPU_PLAN
+§1), 80.7 ms by the host model's 46 entries.  None of the unit's ops fits
+it (a 2-D windowed gather at unaligned element offsets, a runtime column
+window, LeakyReLU and a re-rounding per element), so it is one new op —
+FOLD — with its own row sequencer and an 8-lane datapath, ≈ 11–14 ms for
+the chunk's 41 int16 calls: the chunk 260 → ≈ 195 ms, RTF 0.194 → ≈ 0.15,
+and 77 ms of A53 time per chunk freed.
+
+### 11.1 What `TtsPrep` does (the contract to keep)
+
+`TtsPrepNode` (`src/tts_nodes.py`): output `y [nch][rows][W]` int16 at
+f_out, `W = w0 + hl + hr` (contiguous: rows start at any element, `W · 2`
+bytes apart); element `(k, r, j)` reads source channel `ch0 + k`
+(`reverse`: `ch0 + nch − 1 − k`) at column `s = r·w0 + j − hl + t0` of a
+`[C][L]` int16 (or float32) tensor at f_in, LeakyReLU with `alpha`, rounded
+half to even at f_out and saturated — or 0 where `s` lies outside `[slo,
+shi)`: the columns inside `[wlo, whi) ∩ [0, L)` and inside the utterance,
+`lo · rate ≤ s + off · rate < hi · rate`, with `lo` / `hi` runtime int32
+graph inputs (the C helper `tts_prep` clamps them into `[slo, shi)` once
+per call).
+
+The chunk's 46 calls (`generate_tts_project.entry_graphs`, the host
+model's prices):
+
+| source | calls | W | rows | alpha | f_in − f_out | host |
+|---|---:|---|---:|---|---|---:|
+| `[32][49152]` i16 (the last upsampling stage) | 8 | 2050 … 4102 | 24 / 12 | 0.1 (0.01 for the last) | 0 … 2 | 44.6 ms |
+| `[64][12288]` i16 | 8 | 514 … 1060 | 12 / 24 | 0.1 | 1, 2 | 24.5 ms |
+| `[128][1536]` i16 | 8 | 130 … 548 | 3 / 12 | 0.1 | 1 … 3 | 6.4 ms |
+| `[192][256]` i16 (the flow's couplings) | 16 | 132 | 2 | 1 | 4, 5 | 4.2 ms |
+| `[256][192]` i16 | 1 | 66 | 3 | 0.1 | 3 | 0.3 ms |
+| float32 sources (the flow's reversed halves, the encoder output) | 5 | 70, 256 | 1 / 3 | 1 | — | 0.8 ms |
+
+The 41 int16 calls write 21.5 M elements per chunk.  The five float32 calls
+stay on the host.
+
+### 11.2 The exact rule
+
+The C computes `v = x · 2^-f_in` (exact), `alpha · v` in double (one
+rounding) for `v ≤ 0`, then `nearbyint(· 2^f_out)`.  With `s = f_in −
+f_out` and `m = 1 / alpha`, that is **`rne(x / (m_x · 2^s))` with `m_x = m`
+for x < 0 and 1 for x ≥ 0** — checked over every negative int16 for alpha
+0.1 (m 10) and 0.01 (m 100) and s −2 … 8: 0 mismatches of 32 768 each.  It
+is not the exact product with the double constant (0.1 is not 1 / 10 in
+binary; that product differs from the C on some inputs): the double's single
+rounding happens to land on the exact quotient.  So the op is specified with
+an integer divisor, and the scheduler checks each call's (alpha, s) over all
+65 536 inputs at generation time (`rowops_spec.fold_divisor`): a pair that
+fails stays on the host.  Positive x is a plain `rne_shr(x, s)`; for s ≥ 0
+no value saturates.
+
+The datapath divides by multiplying: with `R = ceil(2^24 / m)` (2^24 for
+x ≥ 0), `u = 2|x|` and `P = u · R`, `q1 = P >> 24` is `floor(u / m)` and
+`P mod 2^24 < R` says the remainder is 0 — exact for every |x| ≤ 32 768 and
+m ≤ 127 (the error of R stays below 1 / m over that range); the round at
+`s + 1` bits (u carries one more) is then a shift with round-to-even
+decided from the low bits and that remainder flag, and the sign comes back
+last.  The spec states both forms; its test runs the reciprocal form
+against the quotient for every m 1 … 127, s 0 … 15 and every int16.
+
+### 11.3 The op
+
+| register | FOLD |
+|---|---|
+| `op` | [3:0] = 9 (A and C int16; kinds and flags ignored) |
+| `n` | W, the output row (1 … 65 535) |
+| `c1` / `c2` | rows per channel / channels |
+| `a` | the byte address of source column 0 of the first output channel (2-byte aligned) |
+| `a_s2` | the bytes from one output channel's source row to the next (signed, even: reversal is a negative stride) |
+| `b_s1` | w0, the source columns between rows |
+| `b_s2` | `s0 = t0 − hl`, the source column of row 0, column 0 (signed) |
+| `c` | the output, one contiguous run of `ceil(c2·c1·n / 8)` words (16-byte aligned; the last word's lanes past the end 0) |
+| `aux` | [3:0] s (0 … 15), [10:4] m (1 … 127) |
+| `win_lo` / `win_hi` | `[slo, shi)`: the source columns that are read; every other column is 0; the unit never reads outside it |
+
+Row `(k, r)` covers source columns `[base, base + W)`, `base = s0 + r·w0`;
+the valid part `[max(slo, base), min(shi, base + W))` is one read of whole
+words at element address `a / 2 + k · a_s2 / 2 + column` — any alignment.
+
+- **Reads**: a row sequencer (64-bit element addresses, a few cycles per
+  row, running ahead through a descriptor FIFO) gives each row's word range
+  to stream A's read port through a new **external-run input**: the port's
+  burst generator is restarted per run (the 4 KiB and 64-beat splits, the
+  credits and the outstanding count unchanged); a row with no valid column
+  reads nothing.
+- **Datapath, eight 16-bit lanes** (a word per cycle; at four lanes, the
+  unit's width for the other ops, FOLD would take 21 ms instead of 11): a
+  two-word window per row slides one word per group of 8 output columns, lane
+  l takes window element `δ + l` (δ = the row's start mod 8), the columns
+  outside the valid part are zeroed (group / lane masks from the row's
+  descriptor), the fold of §11.2 per lane (one DSP for `u · R`), then a
+  packer appends each group (8 columns, the row's last W mod 8) to the
+  contiguous output.  One group per cycle; a row of W columns costs
+  `ceil(W / 8)` cycles plus one to fill the window.
+- **Core**: R from the ROPE divider (`(2^24 + m − 1) / m`, 32 cycles in
+  T_CFG2), the output's word count from `rows · blocks · n`; no parameter
+  block.  Every counter is sized for its register; m = 0 or n = 0 is an
+  empty job.
+- **Cost**: ≈ 2.5–3 k LUT, ≈ 2 k FF, 8 DSP, no BRAM / URAM.  The design is
+  at 80.2 % LUT and closes 4 ns by +0.020 ns: in-context timing is the risk
+  (a register between every stage of the sequencer, the lane muxes and the
+  packer).
+
+### 11.4 What it buys
+
+Cycles ≈ the words read (one per cycle through the port): Σ rows ·
+ceil((δ + W) / 8) ≈ 2.7 M for the chunk = 10.7 ms at 250 MHz; at the
+read + write rate ADDX reaches on HP0 (6.3 GB/s both ways, §9.2) ≈ 13.5 ms
+— against 80 ms on the host.  The chunk 260 → ≈ 195 ms (RTF 0.194 →
+≈ 0.15); the chunk's A53 time 139 → ≈ 62 ms.  Nothing else in the shipped
+models uses TtsPrep.
+
+### 11.5 Scheduler
+
+- **Capability** `platforms/kv260.json kernels.rowops.fold` (false until a
+  bitstream with op 9 is in production; `AXI_ROWOPS_FOLD=0 / 1`), read by
+  `src/_rowops_hw_config.py`.
+- **`FoldRoNode`** (`TTS_OVERRIDES["TtsPrep"]`): int16 source, `reverse` or
+  not, `fold_divisor(alpha, s)` defined, `s ≥ 0`, W ≤ 65 535 — else the host
+  op.  Its C computes `slo` / `shi` from `lo` / `hi` as `tts_prep` does and
+  starts one `run_rowops()`; the reference is `rowops_spec.fold`, equal to
+  `TtsPrepNode.reference` by §11.2 (tested on every chunk call);
+  `kernel_calls()` with the full window.
+- **Host emulation**: the unit's C model (`xrowopskernel.h` of `host_emu`)
+  gains op 9; the Piper chunk on the emulation equals the simulation.
+
+### 11.6 Phases and gates
+
+| phase | what | gate |
+|---|---|---|
+| **5a.1 — spec + scheduler** (host only) | `rowops_spec.fold` / `fold_recip` / `fold_divisor`, `FoldRoNode`, the capability, the C model, the tests | fold = TtsPrep's reference on all 41 int16 calls (random + edge windows); the reciprocal form = the quotient exhaustively; the Piper chunk on `host_emu` = the simulation; every suite |
+| **5a.2 — RTL** | `ro_fold.sv`, the read port's external runs, op 9 in `ro_core`, the C++ oracle, fixtures (W not a multiple of 8, halos, empty / partial windows, negative stride, m 1 / 10 / 100, s 0 … 5), random jobs, `--perf` shapes | fixtures + 300 random × 4 seeds at every memory timing; lint clean; WNS ≥ 0 at 300 MHz out of context |
+| **5a.3 — bitstream** | `build_hw_kv260`, the block-design testbench's FOLD fixtures | WNS ≥ 0 at 4 ns; `sim_hw_kv260` 100 % |
+| **5a.4 — board** | load, the 159 models, every library bit-exact (the chat ones unchanged), the Piper gate with FOLD, the perf campaign and baseline for the new id | bit-exact; **Piper chunk ≤ 205 ms**; simulate within ±3 % |
+| **5a.5 — production** | `pl.bin` and the archive, `kernels.rowops.fold = true`, the libraries regenerated, the chat server, docs and facts | the chat server healthy on the new bitstream |
+
+### 11.7 Phase 5a results (2026-10-14)
+
+**5a.1 — spec and scheduler.**  `rowops_spec.fold` / `fold_elem` (the
+quotient), `fold_recip` (the datapath's form: equal to the quotient for
+every int16, m 1 … 127, s 0 … 15 — 133 M cases), `fold_divisor` (accepts
+alpha 1, 0.1, 0.01 at s 0 … 8; rejects 0.3, m > 127, s outside 0 … 15) and
+`fold_aux`; `test_rowops_spec.py TestFold` checks fold against TtsPrep's
+double arithmetic on the chunk's shapes with windows inside, across and
+outside the rows.  `FoldRoNode` (`TTS_OVERRIDES["TtsPrep"]`) where
+`kernels.rowops.fold` (false until the bitstream is in production;
+`AXI_ROWOPS_FOLD=1` generates for it): on the real voice **all 41 int16
+calls** (21.5 M elements; m 1 / 10 / 100, s 0 … 5), the five float32 ones
+stay host ops.  The chunk's simulation equals `piper_vits.chunk_forward`
+at five utterance windows, the generated C equals the simulation on
+`host_emu` (whose unit model gained op 9), and the real Piper project with
+FOLD runs bit-exact on `tts_host_emu.py` (PCM, encoder, durations).  The
+pricing: `perf_model` features, `rpu_policy.estimate_us` (`rows · (ceil(n /
+8) + 1) + 500` cycles), `perf_calibrate`'s buffer sizes.  The suite 1 840
+passed, ruff clean.
+
+**5a.2 — RTL.**  `ro_fold.sv` (row sequencer, eight lanes, packer, its own
+write bursts), external runs on `ro_rd_port`, op 9 in `ro_core` (R from the
+ROPE divider); the C++ oracle (`rowops_ref.h`, the quotient form — the RTL
+takes the reciprocal one), 8 new fixtures from the Python spec (36 in all),
+random FOLD jobs (reversed and unaligned channel rows, empty / inverted
+windows, any m and s).  One bug on the way: the packer read the lane
+results one stage late (the pipeline had 10 stages, the valids 11), so each
+group took its successor's values.  **Bit-exact ✓**: the 36 fixtures at
+fast / random / slow memory timing, 1 112 random FOLD jobs over three seeds
+at each timing, ctest `TestRowOpsRtl` (fixtures + 300 random jobs), lint
+clean.  Cycles with ideal memory: 32 × 24 × 2050 in 199 051 (0.80 ms, 0.99
+words per cycle; the host 5.5 ms), 64 × 12 × 1026 in 100 713, a flow
+coupling 192 × 2 × 132 in 7 273.  **Synthesis** at 3.333 ns: WNS 0.000 ns
+(no FOLD path among the 20 worst: the sigmoid UltraRAMs, as before),
+34 675 LUT (+3 728), 28 259 FF, 129 DSP (+8); `ro_fold` 3 546 LUT.
+
+**5a.3 — the block design.**  `sim_hw_kv260` **112 / 112** (RowOps 37 / 37:
+the table load and the 36 fixtures through the PS VIP on HP0; the
+testbench parses the signed FOLD registers as 64-bit).  The first bitstream
+with FOLD did not route: it placed at 97 729 LUTs (83.4 %, 99.9 % of the
+CLBs) and the router stayed at WNS −2.18 ns.  An area pass over the five
+kernels at equal throughput (`AREA_PLAN.md`: the FIFOs' skid stages as
+LUTRAM rings, per-byte control writes, 48-bit address arithmetic, Matmul's
+packed accumulators, Conv's weight skew in the RAM addresses and the DSPs'
+A registers) gave bitstream **`de968ccc45da`**: 89 547 LUTs (76.5 %, 4 422
+below the production `1cedaf2ed816`), WNS +0.029 ns, WHS +0.010 ns; the
+block-design simulation again 112 / 112.
+
+**5a.4 — the board** (2026-10-15, `de968ccc45da`, deep idle on as the soak
+of RPU_PLAN §11 leaves it):
+
+| gate | result |
+|---|---|
+| `run_remote_tests` (159 models) | **159 / 159**, every output equal to the simulation |
+| `run_remote_perf` (72 cases) | 72 / 72; against `1cedaf2ed816` run twice in the same session every case within the run-to-run noise (the 20–25 µs calls move by 1–2 µs, FC-1x1280x1001-packed is 0.36 or 0.40 ms by its buffers' placement on either bitstream); baseline `kv260-de968ccc45da.json` recorded |
+| SmolLM2-135M / 360M, SmolVLM (`llm_board`, the libraries unchanged) | logits **bit-exact** (4 prompts × 33 / 33; SmolVLM 2 images × 33 / 33); decode 50.5 / 131.8 / 50.2 ms per token, prefill 256 408 / 1 063 / 408 ms, `llm_image` 1.64 s |
+| BERT-base (`deploy_and_run`, 50 examples) | 50 / 50 bit-exact with the emulation, EM / F1 88.0 / 90.3; p50 266.3 ms |
+| the CNN demos | MNIST 0.114 / 1.266 ms (the same on `1cedaf2ed816` in the same session: the 0.108 / 1.251 of its baseline predate the A53's interrupt waits), ResNet-18 20.02 ms, MobileNet v1 / v2 20.51 / 17.52 ms |
+| **Piper with FOLD** (`tts_board`, the library regenerated with `kernels.rowops.fold`) | PCM, encoder and durations **bit-exact**; **chunk 179–187 ms** (≈ 260 before; gate ≤ 205 ✓), RTF 0.134 (6.88 s utterance) / 0.169 (2.15 s) |
+| YOLOv5n, LightStereo-S (`run_demo.py`) | head maps / disparity bit-exact with the simulation; 47.9 ms per image (47.9 on `1cedaf2ed816` in the same session), 468.9 ms per pair |
+| performance model `kv260/de968ccc45da` | `cases` 1703 + `1cedaf2ed816`'s 179 ConvKernel refinement calls, three refinement rounds (+103, +84, +31) → 2100 exact calls, repeat spread median 0.069 %; FOLD's 41 calls of the chunk 11.3 ms predicted, 11.6 measured |
+| `perf_calibrate.py simulate` (gate ±3 %) | the CNNs and BERT within 0.4 % ✓; the Piper chunk +4.3 % ✗ (every node priced within a few %: the lanes' overlap); the chat libraries −2.5 … −6.3 % ✗ — the same with `1cedaf2ed816`'s model: the host-op model predates the A53's interrupt waits and the deep-idle soak (a `host --merge` of new profiles is open) |
+
+The ctypes check of the 360M library reports CmaFree 6.4 MB short after its
+first close on both bitstreams (after the close 1 007 788 kB to the kB on
+each; only the value before the open moves with the board's page cache): its
+4 MiB rule compares against a moving start, not a leak.
+
+**5a.5 — production** (2026-10-15): `/lib/firmware/pl.bin` is
+`de968ccc45da` (archive `/mnt/data/bitstreams/kv260_250_de968ccc45da/`, the
+previous one stays in `kv260_250_1cedaf2ed816/`); `platforms/kv260.json`
+`kernels.rowops.fold = true`; the R5 BSP rebuilt from the design
+(`xparameters.h` unchanged); the Piper library regenerated with FOLD and
+installed by `tts_board.py`; the chat server redeployed (`deploy.py`, the
+R5 driving): healthy, speech at RTF 0.137 through the server; the deep-idle
+soak re-enabled after the deploy.  The other libraries are unchanged (no
+FOLD in their graphs; bit-exact on the new bitstream above).

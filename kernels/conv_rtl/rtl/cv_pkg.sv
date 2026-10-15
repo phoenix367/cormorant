@@ -10,6 +10,8 @@ package cv_pkg;
   localparam int E    = 8;             // Q8.8 lanes per 128-bit word
   localparam int EW   = 16;
   localparam int BW   = E * EW;
+  localparam int WA   = 44;            // word-address bits of the address arithmetic: byte addresses
+                                      // below 2^48 (the PS ports' 40-bit physical space, SMMU IOVAs)
 
   localparam int TM    = 16;           // tile_m: output channels per tile (grid columns)
   localparam int TIC   = 16;           // tile_ic: input channels per tile (grid rows)
@@ -38,7 +40,7 @@ package cv_pkg;
 
   // Job constants (stable from the first sweep on).
   typedef struct packed {
-    logic [59:0] x_w, w_w, b_w, y_w;   // 16-byte word addresses
+    logic [WA-1:0] x_w, w_w, b_w, y_w; // 16-byte word addresses
     logic [31:0] batch, in_ch, in_h, in_w, out_ch, out_h, out_w;
     logic [31:0] sh, sw, dh, dw, pt, pl;
     logic [2:0]  kh, kw;               // 1..MAXK

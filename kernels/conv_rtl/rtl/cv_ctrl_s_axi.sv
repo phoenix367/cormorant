@@ -111,12 +111,7 @@ module cv_ctrl_s_axi (
     w_do <= w_hs && !rst;
   end
 
-  logic [31:0] wmask;
-  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
-  function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata_q & wmask) | (old & ~wmask);
-  endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
@@ -197,31 +192,31 @@ module cv_ctrl_s_axi (
 
       if (w_do) begin
         case (waddr)
-          A_X0: x[31:0] <= merge(x[31:0]);
-          A_X1: x[63:32] <= merge(x[63:32]);
-          A_WEIGHT0: weight[31:0] <= merge(weight[31:0]);
-          A_WEIGHT1: weight[63:32] <= merge(weight[63:32]);
-          A_BIAS0: bias[31:0] <= merge(bias[31:0]);
-          A_BIAS1: bias[63:32] <= merge(bias[63:32]);
-          A_Y0: y[31:0] <= merge(y[31:0]);
-          A_Y1: y[63:32] <= merge(y[63:32]);
-          A_BATCH: batch <= merge(batch);
-          A_IN_CH: in_ch <= merge(in_ch);
-          A_IN_H: in_h <= merge(in_h);
-          A_IN_W: in_w <= merge(in_w);
-          A_OUT_CH: out_ch <= merge(out_ch);
-          A_OUT_H: out_h <= merge(out_h);
-          A_OUT_W: out_w <= merge(out_w);
-          A_KH: kh <= merge(kh);
-          A_KW: kw <= merge(kw);
-          A_STRIDE_H: stride_h <= merge(stride_h);
-          A_STRIDE_W: stride_w <= merge(stride_w);
-          A_DIL_H: dilation_h <= merge(dilation_h);
-          A_DIL_W: dilation_w <= merge(dilation_w);
-          A_PAD_TOP: pad_top <= merge(pad_top);
-          A_PAD_LEFT: pad_left <= merge(pad_left);
-          A_HAS_BIAS: has_bias <= merge(has_bias);
-          A_IS_DW: is_depthwise <= merge(is_depthwise);
+          A_X0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) x[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_X1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) x[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_WEIGHT0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) weight[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_WEIGHT1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) weight[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BIAS0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) bias[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BIAS1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) bias[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BATCH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) batch[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IN_CH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) in_ch[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IN_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) in_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IN_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) in_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUT_CH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) out_ch[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUT_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) out_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUT_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) out_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_KH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) kh[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_KW: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) kw[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_STRIDE_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) stride_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_STRIDE_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) stride_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_DIL_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) dilation_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_DIL_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) dilation_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_PAD_TOP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pad_top[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_PAD_LEFT: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pad_left[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_HAS_BIAS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) has_bias[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IS_DW: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) is_depthwise[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end

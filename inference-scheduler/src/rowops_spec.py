@@ -376,10 +376,94 @@ def silu_mul(g_raw: np.ndarray, f_g, u_raw: np.ndarray, f_u, f_out) -> np.ndarra
     return sat16(y)
 
 
+# ------------------------------------------------------------------ FOLD (op 9)
+# Piper's TtsPrep (doc/plans/HOSTOPS_PLAN.md §11): rows of a [C][L] source cut into
+# overlapping windows, LeakyReLU with alpha = 1/m and the re-rounding from f_in to
+# f_out = f_in - s.  The C's double arithmetic (alpha * v rounded once, then the
+# round half to even at f_out) equals the exact quotient below for the alphas
+# fold_divisor() accepts — checked over every int16 for each call.
+FOLD_K = 24           # the datapath's reciprocal: R = ceil(2^24 / m)
+FOLD_M_MAX = 127      # aux[10:4]
+FOLD_S_MAX = 15       # aux[3:0]
+FOLD_W_MAX = 65535    # elements per output row (n)
+
+
+def fold_elem(x_raw, m: int, s: int) -> np.ndarray:
+    """rne(x / (m_x * 2^s)), m_x = m for x < 0 and 1 for x >= 0 (x int16, s >= 0):
+    LeakyReLU with alpha = 1/m and the round half to even s bits coarser, exactly.
+    No value saturates."""
+    x = np.asarray(x_raw, np.int64)
+    den = np.where(x < 0, np.int64(m), np.int64(1)) << np.int64(s)
+    q, r = np.divmod(np.abs(x), den)
+    up = (2 * r > den) | ((2 * r == den) & ((q & 1) == 1))
+    return np.where(x < 0, -(q + up), q + up)
+
+
+def fold_recip(x_raw, m: int, s: int) -> np.ndarray:
+    """fold_elem as the datapath computes it, without a divider: u = 2|x|, R_x =
+    ceil(2^24 / m) for x < 0 (2^24 for x >= 0), P = u * R_x; q1 = P >> 24 is
+    floor(u / m_x) and (P mod 2^24) < R_x says its remainder is 0 (exact for
+    |x| <= 32768 and m <= FOLD_M_MAX: the error of R_x stays below 1 / m); then
+    the round at s + 1 bits — q = q1 >> (s + 1), low = q1 mod 2^(s + 1), up when
+    low > 2^s, or low == 2^s and (the remainder is not 0 or q is odd)."""
+    x = np.asarray(x_raw, np.int64)
+    R = np.where(x < 0, np.int64(-(-(1 << FOLD_K) // m)), np.int64(1 << FOLD_K))
+    P = (2 * np.abs(x)) * R
+    q1 = P >> FOLD_K
+    z = (P & ((1 << FOLD_K) - 1)) < R
+    q = q1 >> (s + 1)
+    low = q1 & ((1 << (s + 1)) - 1)
+    half = 1 << s
+    up = (low > half) | ((low == half) & (~z | ((q & 1) == 1)))
+    return np.where(x < 0, -(q + up), q + up)
+
+
+def fold_divisor(alpha: float, s: int) -> Optional[int]:
+    """The m of a TtsPrep call: alpha = 1 gives 1; else m = round(1 / alpha) when it is
+    in 2 .. FOLD_M_MAX and the C's arithmetic — nearbyint(fl(alpha * x) * 2^-s) —
+    equals fold_elem(x, m, s) for every negative int16 x (the rest is the same rule
+    for both); None when no m fits (the call stays on the host)."""
+    if not 0 <= int(s) <= FOLD_S_MAX:
+        return None
+    if alpha == 1.0:
+        return 1
+    if not 0.0 < alpha < 1.0:
+        return None
+    m = int(round(1.0 / alpha))
+    if not 2 <= m <= FOLD_M_MAX:
+        return None
+    x = np.arange(I16_LO, 0, dtype=np.int64)
+    c = np.clip(np.rint(x.astype(np.float64) * alpha * 2.0 ** -int(s)), I16_LO, I16_HI).astype(np.int64)
+    return m if np.array_equal(c, fold_elem(x, m, int(s))) else None
+
+
+def fold(x_raw: np.ndarray, rows: int, w0: int, s0: int, W: int, slo: int, shi: int, m: int,
+         s: int) -> np.ndarray:
+    """FOLD: y[k][r][j] = fold_elem(x[k][c], m, s) with c = s0 + r * w0 + j when c lies
+    in [slo, shi), else 0 — x [nch][L] int16 (the source rows in output channel order),
+    y [nch][rows][W].  The window must lie inside the source row where it is used."""
+    x = np.asarray(x_raw, np.int64)
+    L = x.shape[1]
+    col = int(s0) + np.arange(rows, dtype=np.int64)[:, None] * int(w0) + np.arange(W, dtype=np.int64)[None, :]
+    ok = (col >= slo) & (col < shi)
+    if ok.any() and (int(col[ok].min()) < 0 or int(col[ok].max()) >= L):
+        raise ValueError("fold: the window [slo, shi) leaves the source row")
+    v = fold_elem(x[:, np.clip(col, 0, L - 1)], m, s)
+    return np.where(ok[None], v, 0)
+
+
+def fold_aux(m: int, s: int) -> int:
+    """FOLD's aux register: [3:0] s, [10:4] m."""
+    if not (0 <= s <= FOLD_S_MAX and 1 <= m <= FOLD_M_MAX):
+        raise ValueError(f"fold_aux: m {m} or s {s} outside the register fields")
+    return int(s) | (int(m) << 4)
+
+
 # ------------------------------------------------------------------ the unit's registers
 # RowOpsKernel (kernels/rowops_rtl, doc/kernels/ROWOPS_RTL_KERNEL.md §1): the op
 # register's fields, the kinds and the parameter block's 16-byte entry.
 OP_COPY, OP_ADDX, OP_DEQUANT, OP_MULACT, OP_NORM, OP_ROPE, OP_XPOSE, OP_TLOAD = 1, 2, 3, 4, 5, 6, 7, 8
+OP_FOLD = 9
 K_I16, K_I32, K_F32 = 0, 1, 2
 F_B_EN, F_P_BCAST, F_P_KEEP, F_RELU, F_NORM_LN = 1 << 12, 1 << 13, 1 << 14, 1 << 15, 1 << 16
 N_MAX = 4096                  # elements per row
@@ -439,5 +523,7 @@ __all__ = ("rne_shr", "rne_shr_vec", "sat16", "mul_shr_floor", "rsqrt_bf", "rsqr
            "rms_norm", "layer_norm", "rope_tables_raw", "rope", "sigmoid_table", "silu_q", "silu_mul",
            "bias_bits", "quant_bias", "BIAS_EXTRA", "bias_exp", "bias_params", "bias_round",
            "OP_COPY", "OP_ADDX", "OP_DEQUANT", "OP_MULACT", "OP_NORM", "OP_ROPE", "OP_XPOSE", "OP_TLOAD",
+           "OP_FOLD", "FOLD_K", "FOLD_M_MAX", "FOLD_S_MAX", "FOLD_W_MAX", "fold_elem", "fold_recip",
+           "fold_divisor", "fold", "fold_aux",
            "K_I16", "K_I32", "K_F32", "F_B_EN", "F_P_BCAST", "F_P_KEEP", "F_RELU", "F_NORM_LN", "N_MAX",
            "PARAM_BYTES", "TABLE_BYTES", "TABLE_WORDS", "opword", "param_block", "table_image")

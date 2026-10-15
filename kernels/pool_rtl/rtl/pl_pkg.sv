@@ -34,6 +34,9 @@ package pl_pkg;
   typedef enum logic [1:0] {M_MAX = 2'd0, M_AVG = 2'd1, M_LP1 = 2'd2, M_LP2 = 2'd3} mode_t;
 
   // Per-job constants, fixed while the job runs (pl_core's configuration).
+  localparam int WA = 44;   // word-address bits of the address arithmetic: byte addresses below
+                            // 2^48 (the PS ports' 40-bit physical space, SMMU IOVAs)
+
   typedef struct packed {
     logic [59:0] x_w, y_w;             // word addresses of x and y
     logic [31:0] in_h, in_w, out_h, out_w, in_hw, out_hw;

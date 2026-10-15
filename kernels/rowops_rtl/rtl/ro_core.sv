@@ -6,7 +6,7 @@
 //
 //   ap_start ─► config ─► [P load: rd_port B ─► ro_param]
 //                      ─► rd_port A (ARID 0) ─┐
-//                         rd_port B (ARID 1) ─┴► ro_stream / ro_norm / ro_rope / ro_xpose ─► wr_port
+//                         rd_port B (ARID 1) ─┴► ro_stream / ro_norm / ro_rope / ro_xpose / ro_fold ─► wr_port
 //                         (one AXI read channel through ro_rd_arb; one write channel)
 // ---------------------------------------------------------------------------
 module ro_core #(
@@ -145,7 +145,7 @@ module ro_core #(
   logic [3:0]  opc;
   logic [1:0]  ak, bk, ck;
   logic        f_ben, f_pbc, f_pkeep, f_relu, f_ln;
-  logic        is_stream, is_norm, is_rope, is_xpose, is_tload, known, xp_contig;
+  logic        is_stream, is_norm, is_rope, is_xpose, is_tload, is_fold, known, xp_contig;
   logic [35:0] ln_prod;                       // TRANSPOSE: L * R (T_CFG0)
   logic [31:0] lr_words;                      // TRANSPOSE: words of a tile's contiguous run
   logic [3:0]  lr_tail;
@@ -207,8 +207,9 @@ module ro_core #(
   (* keep = "true" *) logic ld_g;
   logic prm_busy;
 
-  // ROPE's segments per row, n / HD: a restoring divider, one bit per cycle, started
-  // with the geometries (ld_g); T_CFG2 waits for it (32 cycles, ROPE jobs only).
+  // ROPE's segments per row, n / HD, and FOLD's reciprocal ceil(2^24 / m) =
+  // (2^24 + m - 1) / m: a restoring divider, one bit per cycle, started with the
+  // geometries (ld_g); T_CFG2 waits for it (32 cycles, ROPE and FOLD jobs only).
   logic        div_busy;
   logic [5:0]  div_cnt;
   logic [32:0] div_rem;
@@ -216,13 +217,13 @@ module ro_core #(
   always_ff @(posedge clk) begin
     if (rst) begin
       div_busy <= 1'b0;
-    end else if (ld_g && is_rope) begin
-      div_busy <= (j_aux[11:0] != '0);
+    end else if (ld_g && (is_rope || is_fold)) begin
+      div_busy <= is_fold ? (j_aux[10:4] != '0) : (j_aux[11:0] != '0);
       div_cnt  <= '0;
       div_rem  <= '0;
       div_q    <= '0;
-      div_num  <= j_n;
-      div_den  <= 32'(j_aux[11:0]);
+      div_num  <= is_fold ? 32'h0100_0000 + 32'(j_aux[10:4]) - 32'd1 : j_n;
+      div_den  <= is_fold ? 32'(j_aux[10:4]) : 32'(j_aux[11:0]);
     end else if (div_busy) begin
       logic [32:0] t;
       t = {div_rem[31:0], div_num[31]};
@@ -257,8 +258,8 @@ module ro_core #(
         T_CFG0:  tstate <= T_CFG1;
         T_CFG1:  tstate <= T_CFG2;
         T_CFG2:  begin                          // geometries loaded (ld_g); nrows valid
-          if (div_busy || (ld_g && is_rope)) begin
-            tstate <= T_CFG2;                   // ROPE: n / HD in flight (started this cycle)
+          if (div_busy || (ld_g && (is_rope || is_fold))) begin
+            tstate <= T_CFG2;                   // ROPE: n / HD, FOLD: 2^24 / m in flight (started this cycle)
           end else if (go && !f_pkeep && (is_stream || is_norm || is_rope)) begin
             pld_start <= 1'b1;
             tstate    <= T_PLD;
@@ -304,16 +305,18 @@ module ro_core #(
       is_rope   <= (j_op[3:0] == OP_ROPE);
       is_xpose  <= (j_op[3:0] == OP_XPOSE);
       is_tload  <= (j_op[3:0] == OP_TLOAD);
+      is_fold   <= (j_op[3:0] == OP_FOLD);
       ln_prod   <= 36'(j_n) * 36'(j_aux[3:0]);
       row_words(j_op[5:4], j_n, wa, ta);
       row_words(j_op[7:6], j_n, wb, tb);
       row_words(j_op[9:8], j_n, wc, tc);
     end
     if (tstate == T_CFG1) begin
-      known <= is_stream || is_norm || is_rope || is_xpose || is_tload;
-      go    <= (is_stream || is_norm || is_rope || is_xpose || is_tload) && (j_n != '0) && (j_rows != '0) &&
-               (j_blocks != '0) && (j_n <= 32'(N_MAX)) &&
-               (!is_xpose || (j_aux[3:0] != '0 && j_n <= 32'd1024));
+      known <= is_stream || is_norm || is_rope || is_xpose || is_tload || is_fold;
+      go    <= ((is_stream || is_norm || is_rope || is_xpose || is_tload) && (j_n != '0) && (j_rows != '0) &&
+                (j_blocks != '0) && (j_n <= 32'(N_MAX)) &&
+                (!is_xpose || (j_aux[3:0] != '0 && j_n <= 32'd1024))) ||
+               (is_fold && (j_n != '0) && (j_rows != '0) && (j_blocks != '0) && (j_aux[10:4] != '0));
       xp_contig <= (j_bs2 == {27'b0, j_aux[3:0], 1'b0});
       lr_words  <= 32'((ln_prod + 36'd7) >> 3);
       lr_tail   <= (ln_prod[2:0] == 3'd0) ? 4'd8 : {1'b0, ln_prod[2:0]};
@@ -327,6 +330,11 @@ module ro_core #(
         gc <= mk_geom(go && xp_contig, j_c, j_cs1, j_rows, j_cs2, j_blocks, lr_words, lr_tail,
                       32'd0, 32'hFFFFFFFF);
         gb <= '0;                                   // no stream B (not the previous job's)
+      end else if (is_fold) begin
+        // the read runs and the write bursts come from ro_fold (external)
+        ga <= mk_geom(1'b0, j_a, 32'd0, 32'd1, 32'd0, 32'd1, 32'd1, 4'd8, 32'd0, 32'hFFFFFFFF);
+        gb <= '0;
+        gc <= '0;
       end else if (is_tload) begin
         // the table image: rows of A words (its kinds int32), no B, no C
         ga <= mk_geom(go, j_a, j_as1, j_rows, j_as2, j_blocks, wa, ta, 32'd0, 32'hFFFFFFFF);
@@ -375,8 +383,13 @@ module ro_core #(
   logic [63:0]   a_araddr, b_araddr;
   logic [7:0]    a_arlen, b_arlen;
 
+  logic        fd_rr_valid, fd_rr_ready;
+  logic [59:0] fd_rr_waddr;
+  logic [31:0] fd_rr_words;
   ro_rd_port u_rd_a (
     .clk, .rst (urst_a), .start (start_q2), .g (ga),
+    .ext_en (is_fold), .ext_valid (fd_rr_valid), .ext_ready (fd_rr_ready),
+    .ext_waddr (fd_rr_waddr), .ext_words (fd_rr_words),
     .arvalid (a_arvalid), .arready (a_arready), .araddr (a_araddr), .arlen (a_arlen),
     .rvalid  (a_rvalid),  .rready  (a_rready),
     .rdata   (m_axi_gmem0_RDATA), .rlast (m_axi_gmem0_RLAST),
@@ -384,8 +397,10 @@ module ro_core #(
     .idle (a_idle)
   );
 
+  logic b_ext_ready;
   ro_rd_port u_rd_b (
     .clk, .rst (urst_b), .start (start_q2 || pld_q2), .g (gb_cur),
+    .ext_en (1'b0), .ext_valid (1'b0), .ext_ready (b_ext_ready), .ext_waddr ('0), .ext_words ('0),
     .arvalid (b_arvalid), .arready (b_arready), .araddr (b_araddr), .arlen (b_arlen),
     .rvalid  (b_rvalid),  .rready  (b_rready),
     .rdata   (m_axi_gmem0_RDATA), .rlast (m_axi_gmem0_RLAST),
@@ -405,10 +420,17 @@ module ro_core #(
   logic        xp_ext_en, xp_ext_valid, xp_ext_ready, xp_ext_done;
   logic [59:0] xp_ext_waddr;
   logic [8:0]  xp_ext_len;
+  logic        fd_wb_valid, fd_wb_ready, fd_wb_done, wr_ext_ready;
+  logic [59:0] fd_wb_waddr;
+  logic [8:0]  fd_wb_len;
+  assign xp_ext_ready = wr_ext_ready && !is_fold;
+  assign fd_wb_ready  = wr_ext_ready && is_fold;
   ro_wr_port u_wr (
     .clk, .rst (urst_c), .start (start_q2), .g (gc),
-    .ext_en (is_xpose && !xp_contig), .ext_valid (xp_ext_valid), .ext_ready (xp_ext_ready),
-    .ext_waddr (xp_ext_waddr), .ext_len (xp_ext_len), .ext_done (xp_ext_done),
+    .ext_en ((is_xpose && !xp_contig) || is_fold),
+    .ext_valid (is_fold ? fd_wb_valid : xp_ext_valid), .ext_ready (wr_ext_ready),
+    .ext_waddr (is_fold ? fd_wb_waddr : xp_ext_waddr), .ext_len (is_fold ? fd_wb_len : xp_ext_len),
+    .ext_done (is_fold ? fd_wb_done : xp_ext_done),
     .in_valid (w_valid), .in_ready (w_ready), .in_data (w_data), .in_strb (w_strb),
     .awvalid (m_axi_gmem0_AWVALID), .awready (m_axi_gmem0_AWREADY),
     .awaddr  (m_axi_gmem0_AWADDR),  .awlen   (m_axi_gmem0_AWLEN),
@@ -530,16 +552,32 @@ module ro_core #(
     .idle (xp_idle)
   );
 
+  logic fd_a_ready, fd_idle, fd_valid;
+  logic [BW-1:0] fd_data;
+
+  ro_fold u_fd (
+    .clk, .rst (urst_d), .start (start_q2), .en (go && is_fold),
+    .a (j_a), .a_s2 (j_as2), .w0 (j_bs1), .s0 (j_bs2), .n (j_n), .rows (j_rows), .blocks (j_blocks),
+    .win_lo (j_wlo), .win_hi (j_whi), .s (j_aux[3:0]), .rcp (div_q[24:0]), .c (j_c),
+    .rr_valid (fd_rr_valid), .rr_ready (fd_rr_ready), .rr_waddr (fd_rr_waddr), .rr_words (fd_rr_words),
+    .a_valid (a_valid && is_fold), .a_ready (fd_a_ready), .a_data,
+    .c_valid (fd_valid), .c_ready (w_ready), .c_data (fd_data),
+    .wb_valid (fd_wb_valid), .wb_ready (fd_wb_ready), .wb_waddr (fd_wb_waddr), .wb_len (fd_wb_len),
+    .wb_done (fd_wb_done),
+    .idle (fd_idle)
+  );
+
   assign prm_idx = is_norm ? nm_prm_idx : is_rope ? rp_prm_idx : st_prm_idx;
   assign a_ready = is_norm ? nm_a_ready : is_rope ? rp_a_ready : is_xpose ? xp_a_ready :
-                   is_tload ? tl_a_ready : st_a_ready;
+                   is_tload ? tl_a_ready : is_fold ? fd_a_ready : st_a_ready;
   assign b_ready = loading ? prm_in_ready : is_rope ? rp_b_ready : st_b_ready;
-  assign w_valid = is_norm ? nm_valid : is_rope ? rp_valid : is_xpose ? xp_valid : is_tload ? 1'b0 : st_valid;
-  assign w_data  = is_norm ? nm_data : is_rope ? rp_data : is_xpose ? xp_data : st_data;
+  assign w_valid = is_norm ? nm_valid : is_rope ? rp_valid : is_xpose ? xp_valid : is_tload ? 1'b0 :
+                   is_fold ? fd_valid : st_valid;
+  assign w_data  = is_norm ? nm_data : is_rope ? rp_data : is_xpose ? xp_data : is_fold ? fd_data : st_data;
   assign w_strb  = is_xpose ? xp_strb : '1;
 
   assign job_done = (tstate == T_RUN) && !job_start && !start_q && !start_q2 &&
-                    a_idle && b_idle && st_idle && nm_idle && rp_idle && xp_idle && tl_idle && wr_idle;
+                    a_idle && b_idle && st_idle && nm_idle && rp_idle && xp_idle && tl_idle && fd_idle && wr_idle;
 
   // AXI constant fields ------------------------------------------------------------------
   assign m_axi_gmem0_ARSIZE   = 3'b100;
@@ -565,6 +603,6 @@ module ro_core #(
   logic unused_top;
   assign unused_top = ^{m_axi_gmem0_RUSER, m_axi_gmem0_RRESP, m_axi_gmem0_BRESP, m_axi_gmem0_BID,
                         m_axi_gmem0_BUSER, j_aux[31:12], tb, wb, xp_ext_en,
-                        is_xpose, known, j_bqsh[31:6]};
+                        is_xpose, known, j_bqsh[31:6], b_ext_ready};
 
 endmodule

@@ -21,7 +21,7 @@ the same design plus a PoolingKernel guard); the HLS
 kernel's synthesis is retired, its C++ reference `ref_matmul_2d` stays and
 writes the fixtures every RTL test checks against.  The bitstream meets
 timing at 100 MHz and passes the test stand's matmul behaviour test
-(50 / 50) and the whole-design simulation (104 / 104).  On the board it is
+(50 / 50) and the whole-design simulation (112 / 112).  On the board it is
 bit-exact everywhere (148 models, every demo and chat / TTS gate), 2–11×
 faster than the HLS kernel on tiled and depthwise-shaped MatMuls and at
 least as fast on GEMV (phase 2b balanced K between the lanes).  The
@@ -203,6 +203,7 @@ Every matrix starts at its base address plus `bi * *_batch_stride`
   image layout requires.  Any other `gemv_kw` value is treated as 0.
 - **Limits:** `k ≤ 4096`; a larger k is clamped (the job completes, C is
   undefined).  n = 0, m = 0 or batch = 0 finish at once; k = 0 writes zeros.
+- **Address range:** Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).
 - **Addressing:** the contract says `a` and `b` are 16-byte aligned; the RTL
   also handles 2-byte-aligned bases, and the tests exercise them.  Reads may
   over-read the words around a run (buffers are padded).  **C writes touch
@@ -535,7 +536,7 @@ The changes (cycle counts in Verilator +0.01 … +0.12 %, results unchanged):
 - **System level (`make sysim_matmul_rtl`):**
   - This is the test stand's block design (Zynq PS VIP, AXI interconnect, DDR model, `matmul_tb.sv`) with the packaged IP upgraded in place and gmem2 widened to 128.
   - It passes 50 of 50 fixtures.
-- **Full design (`sim_hw_kv260`):** the `cormorant_hw_128` block design with this IP passes 104 / 104 (Matmul 10 / 10) — 68 / 68 when phase 1 ran —, and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
+- **Full design (`sim_hw_kv260`):** the `cormorant_hw_128` block design with this IP passes 112 / 112 (Matmul 10 / 10) — 68 / 68 when phase 1 ran —, and the bitstream meets timing at 100 MHz with 8.6 k LUT, 17.8 k FF, 6 BRAM36 and 8 URAM fewer than with the HLS kernel ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phase 1).
 - **Board (phases 2 and 2b):** registers 19 / 19, `run_remote_tests` 148 / 148, targeted partial-strobe C writes 8 / 8, every demo and chat / TTS gate bit-exact; the kernel benchmarks show no case slower than the HLS kernel's ([MATMUL_RTL_PLAN](../plans/MATMUL_RTL_PLAN.md) phases 2 and 2b).
 
 ## Source files
@@ -592,6 +593,19 @@ changing the RTL.
   `reserved` already counts it from the issue.
 - **BRAM FIFO skid:** `mm_fifo`'s BRAM variant needs its 3-entry skid to
   sustain one pop per cycle (with 2 entries every stream ran at 2/3 rate).
+  Since AREA_PLAN (2026-10-14) the skid is a 4-entry LUTRAM ring (three
+  used), read asynchronously at its head — ~200 LUTs and 400 FFs less per
+  FIFO than three registers and their muxes.
+- **Accumulators:** the RHF = 4 rows of a half-group share the write address,
+  enable and read address, so they live in one 128-bit distributed RAM
+  (19 RAM64M8) rather than four 32-bit ones (20).
+- **AR / AW slices:** the read and write engines issue at most every other
+  cycle (`bl_v`), so their AR / AW outputs go through a one-entry register
+  (`mm_rs1`, `in_ready = !out_valid`); the W channel keeps the two-entry
+  slice.
+- **Addresses:** the address arithmetic (walker, run generators, the AXI
+  engines, the drain) is 48-bit (`mm_pkg::AB`): byte addresses below 2^48;
+  the AXI address outputs are zero-extended to 64 bits.
 - **lk shift arithmetic:** widen `lk` before adding (`{2'b0, lk} + 4'd1`); a
   2-bit `lk + 1` overflows at kw = 8.
 - **Timing:** the kernel meets 300 MHz out of context with little margin (WNS +0.026 ns) and must reach 250 MHz in the block design, where the MAC array spans many DSP columns: keep every signal that reaches the array registered next to its group, keep new logic off long combinational

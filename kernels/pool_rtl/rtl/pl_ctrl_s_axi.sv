@@ -112,12 +112,7 @@ module pl_ctrl_s_axi (
     end
   end
 
-  logic [31:0] wmask;
-  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
-  function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata_q & wmask) | (old & ~wmask);
-  endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
@@ -193,27 +188,27 @@ module pl_ctrl_s_axi (
 
       if (w_hs) begin
         case (waddr)
-          A_X0: x[31:0]  <= merge(x[31:0]);
-          A_X1: x[63:32] <= merge(x[63:32]);
-          A_Y0: y[31:0]  <= merge(y[31:0]);
-          A_Y1: y[63:32] <= merge(y[63:32]);
-          A_BATCH: batch <= merge(batch);
-          A_CHANNELS: channels <= merge(channels);
-          A_IN_H: in_h <= merge(in_h);
-          A_IN_W: in_w <= merge(in_w);
-          A_OUT_H: out_h <= merge(out_h);
-          A_OUT_W: out_w <= merge(out_w);
-          A_POOL_H: pool_h <= merge(pool_h);
-          A_POOL_W: pool_w <= merge(pool_w);
-          A_STRIDE_H: stride_h <= merge(stride_h);
-          A_STRIDE_W: stride_w <= merge(stride_w);
-          A_PAD_TOP: pad_top <= merge(pad_top);
-          A_PAD_LEFT: pad_left <= merge(pad_left);
-          A_DIL_H: dil_h <= merge(dil_h);
-          A_DIL_W: dil_w <= merge(dil_w);
-          A_POOL_TYPE: pool_type <= merge(pool_type);
-          A_LP_ORDER: lp_order <= merge(lp_order);
-          A_CIP: count_include_pad <= merge(count_include_pad);
+          A_X0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) x[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_X1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) x[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BATCH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) batch[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CHANNELS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) channels[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IN_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) in_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_IN_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) in_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUT_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) out_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUT_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) out_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_POOL_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pool_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_POOL_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pool_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_STRIDE_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) stride_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_STRIDE_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) stride_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_PAD_TOP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pad_top[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_PAD_LEFT: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pad_left[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_DIL_H: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) dil_h[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_DIL_W: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) dil_w[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_POOL_TYPE: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pool_type[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_LP_ORDER: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) lp_order[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CIP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) count_include_pad[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end

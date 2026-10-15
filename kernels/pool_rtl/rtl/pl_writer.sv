@@ -139,7 +139,7 @@ module pl_writer
   logic [OW-1:0] outs;                     // bursts queued on AW, B not yet received
   logic [5:0]  wf_count;
   logic        aw_in_ready, d_go, d1_v, d2_v, d_end;
-  logic [59:0] d_waddr;
+  logic [WA-1:0] d_waddr;
   logic [8:0]  d_to4k;
 
   // an output run (<= LBC columns) is at most LBW + 1 words
@@ -148,7 +148,7 @@ module pl_writer
   end
 
   // the word's address; the burst splits where it crosses 4 KiB
-  assign d_waddr = j.y_w + 60'(d_e[31:3]) + 60'(d_k);
+  assign d_waddr = j.y_w[WA-1:0] + WA'(d_e[31:3]) + WA'(d_k);
   assign d_to4k  = 9'd256 - {1'b0, d_waddr[7:0]};
 
   assign d_go = d_act && (32'(wf_count) + 32'(d1_v) + 32'(d2_v) < WD) &&
@@ -300,7 +300,7 @@ module pl_writer
   pl_fifo #(.W(68), .D(8), .BRAM(1'b0)) u_aw (
     .clk, .rst,
     .in_valid (d_go && d_bstart), .in_ready (aw_in_ready),
-    .in_data  ({d_waddr, 4'b0, 4'(b_len - 4'd1)}),
+    .in_data  ({60'(d_waddr), 4'b0, 4'(b_len - 4'd1)}),
     .out_valid(aq_v), .out_ready(aq_r), .out_data(aw_q),
     .count    (aw_count)
   );

@@ -324,7 +324,7 @@ module cv_core
   logic [31:0] q_sh, q_sw, q_dh, q_dw, q_pt, q_pl;
   logic [2:0]  q_kh, q_kw;
   logic        q_bias, q_dwm, q_kh_ok, q_kw_ok;
-  logic [59:0] q_x, q_w, q_b, q_y;
+  logic [WA-1:0] q_x, q_w, q_b, q_y;
   logic [31:0] ma, mb, ma_q, mb_q, mp1, mp2, mp3;
   logic [31:0] in_hw, out_hw, row_words, lastw, reach_h, reach_w, n_pos, ch_in, ch_out, pmw;
   logic [31:0] per_sh, per_ow, owpt_sw, owpt_mt, gstep_q;
@@ -413,7 +413,7 @@ module cv_core
   // ap_start — it reaches several hundred registers)
   always_ff @(posedge clk) begin
     if (tstate == T_IDLE) begin
-      q_x <= r_x[63:4];  q_w <= r_w[63:4];  q_b <= r_b[63:4];  q_y <= r_y[63:4];
+      q_x <= r_x[WA+3:4];  q_w <= r_w[WA+3:4];  q_b <= r_b[WA+3:4];  q_y <= r_y[WA+3:4];
       {q_batch, q_in_ch, q_in_h, q_in_w} <= {r_batch, r_in_ch, r_in_h, r_in_w};
       {q_out_ch, q_out_h, q_out_w}       <= {r_out_ch, r_out_h, r_out_w};
       {q_sh, q_sw, q_dh, q_dw, q_pt, q_pl} <= {r_sh, r_sw, r_dh, r_dw, r_pt, r_pl};

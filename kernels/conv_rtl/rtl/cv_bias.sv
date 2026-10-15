@@ -30,7 +30,7 @@ module cv_bias
 );
   logic [8:0]  n_words, nw, issued, got;   // nw: n_words latched at the start
   logic        second;
-  logic [59:0] waddr;
+  logic [WA-1:0] waddr;
   logic        loading;
 
   // the bias words: ceil(out_ch / 8) <= MAXOC / 8 — one burst, or two across 4 KiB,
@@ -61,7 +61,7 @@ module cv_bias
       // up to two bursts, issued back to back (B_OUTS = 2)
       if (loading && (!arvalid || arready) && issued != nw) begin
         arvalid <= 1'b1;
-        araddr  <= {(second ? waddr + 60'(to4k) : waddr), 4'b0};
+        araddr  <= {{(60-WA){1'b0}}, (second ? waddr + WA'(to4k) : waddr), 4'b0};
         arlen   <= 8'(b_len - 9'd1);
         issued  <= issued + b_len;
         second  <= 1'b1;

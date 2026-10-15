@@ -48,6 +48,12 @@ def enabled() -> bool:
     return _rowops_hw_config.ROWOPS_UNIT
 
 
+def fold_enabled() -> bool:
+    """The platform's unit has op 9, FOLD (``_rowops_hw_config.ROWOPS_FOLD``,
+    ``AXI_ROWOPS_FOLD``; read at call time, as ``enabled``)."""
+    return _rowops_hw_config.ROWOPS_FOLD
+
+
 def raw_as_data(raw) -> np.ndarray:
     """Raw int16 words as the float32 values whose Q8.8 encoding is those
     words (exact: every int16 / 256 is a float32)."""
@@ -1892,7 +1898,141 @@ def from_tts_rel_band(node, tensors, index, align_elems, ctx: HostContext):
                             align_elems=align_elems, F=F, T=T, CR=CR, W=W, band=band, pz=pz)
 
 
+@dataclass
+class FoldRoNode(RowOpsNode):
+    """TtsPrep on the unit (HOSTOPS_PLAN §11): one FOLD job.  Output channel k
+    reads the source row ch0 + k of x [C][L] (int16 at f_in); row r, column j
+    reads column s0 + r·w0 + j (s0 = t0 - hl) where it lies in [slo, shi), else
+    0 — LeakyReLU with alpha = 1/m and the round half to even s = f_in - f_out
+    bits coarser (``rowops_spec.fold``: TtsPrep's double arithmetic exactly, for
+    the (alpha, s) ``fold_divisor`` accepts).  [slo, shi) is TtsPrep's clamp of
+    the runtime utterance window lo / hi (int32 host inputs) into [max(wlo, 0),
+    min(whi, L)), computed in the emitted C; the call is priced at the full
+    window."""
+    L: int = 1
+    ch0: int = 0
+    nch: int = 1
+    rows: int = 1
+    w0: int = 1
+    s0: int = 0
+    W: int = 1
+    rate: int = 1
+    off: int = 0
+    wlo: int = 0
+    whi: int = 1
+    m: int = 1
+    s: int = 0
+    f_in: int = 0
+    f_out: int = 0
+    x:    object = field(default=None, repr=False)
+    lo_t: object = field(default=None, repr=False)
+    hi_t: object = field(default=None, repr=False)
+
+    def _clamp(self, lo: int, hi: int):
+        """(slo, shi) as tts_prep: clamp(v, a, b) = v < a ? a : v > b ? b : v."""
+        cl = lambda v, a, b: a if v < a else b if v > b else v   # noqa: E731
+        sh = self.off * self.rate
+        slo = cl(lo * self.rate - sh, max(self.wlo, 0), self.L)
+        return slo, cl(hi * self.rate - sh, slo, min(self.whi, self.L))
+
+    @property
+    def full_window(self):
+        return self._clamp(-(1 << 40), 1 << 40)
+
+    @property
+    def calls_env(self) -> dict:
+        slo, shi = self.full_window
+        return {"_slo": slo, "_shi": shi}
+
+    def _regs(self, layouts):
+        nd = self.onnx_node
+        lay = layouts.get(self.output.onnx_name) if layouts else None
+        if lay is not None and lay.n_chunks > 1 and lay.is_strided:
+            raise SchedulerError(f"{nd.op_type} node '{_label(nd)}': the output "
+                                 f"'{self.output.onnx_name}' must be contiguous")
+        SX = row_stride_bytes(self.x, layouts, self.L, 2, nd, 1)
+        return dict(op=rs.opword(rs.OP_FOLD), n=self.W, rows=self.rows, blocks=self.nch, a_s1=0, a_s2=SX,
+                    b_s1=self.w0, b_s2=self.s0 & 0xFFFFFFFF, c_s1=0, c_s2=0, aux=rs.fold_aux(self.m, self.s),
+                    a_off=self.ch0 * SX)
+
+    def kernel_calls(self, layouts: dict) -> list:
+        from .perf_calls import KernelCall
+        r = self._regs(layouts)
+        del r["a_off"]
+        slo, shi = self.full_window
+        return [KernelCall.of("RowOpsKernel", **r, win_lo=slo, win_hi=shi)]
+
+    def describe(self) -> str:
+        return (f"{self.nch} ch of [{self.L}] -> [{self.rows}][{self.W}] (w0 {self.w0}, from {self.s0}), "
+                f"LeakyReLU 1/{self.m}, >> {self.s} on RowOpsKernel (FOLD)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsPrep({self.x.onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:
+        r = self._regs(layouts)
+        sh = self.off * self.rate
+        return "\n".join([
+            "    {",
+            "        /* the source columns inside the utterance: tts_prep's clamps */",
+            f"        const long _v0 = (long){self.lo_t.c_name}[0] * {self.rate}L - {sh}L, "
+            f"_v1 = (long){self.hi_t.c_name}[0] * {self.rate}L - {sh}L;",
+            f"        const long _slo = _v0 < {max(self.wlo, 0)}L ? {max(self.wlo, 0)}L : _v0 > {self.L}L ? "
+            f"{self.L}L : _v0;",
+            f"        const long _shi = _v1 < _slo ? _slo : _v1 > {min(self.whi, self.L)}L ? "
+            f"{min(self.whi, self.L)}L : _v1;",
+            self.call(self.x.c_name, r["a_off"], "NULL", 0, self.output.c_name, 0, "NULL", r["op"], r["n"],
+                      r["rows"], r["blocks"], 0, r["a_s2"], r["b_s1"], r["b_s2"], 0, 0, 0, r["aux"], 0,
+                      "(unsigned)_slo", "(unsigned)_shi", indent="        "),
+            "    }"])
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        x = np.rint(np.asarray(ins[0], np.float64).reshape(-1, self.L) * 2.0 ** self.f_in).astype(np.int64)
+        lo, hi = (int(np.asarray(t).reshape(-1)[0]) for t in ins[1:3])
+        slo, shi = self._clamp(lo, hi)
+        y = rs.fold(x[self.ch0:self.ch0 + self.nch], self.rows, self.w0, self.s0, self.W, slo, shi, self.m,
+                    self.s)
+        return (y / 2.0 ** self.f_out).reshape(self.output.shape)
+
+
+def fold_ineligible(host) -> Optional[str]:
+    """Why a TtsPrep call cannot run as FOLD (None: it can)."""
+    if not fold_enabled():
+        return "the platform's unit has no FOLD"
+    if host.src_f32:
+        return "a float32 source"
+    if host.reverse:
+        return "reversed channels"
+    if host.f_out > host.f_in:
+        return "a finer output exponent"
+    if rs.fold_divisor(host.alpha, host.f_in - host.f_out) is None:
+        return f"alpha {host.alpha!r} at >> {host.f_in - host.f_out}: not an exact 1/m"
+    if host.w0 + host.hl + host.hr > rs.FOLD_W_MAX:
+        return "rows longer than FOLD_W_MAX"
+    if any(t.dma or t.is_host or t.is_state for t in (host.inputs[0], host.output)):
+        return "x / y not int16 DMA tensors"
+    return None
+
+
+def from_tts_prep(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsPrep: FoldRoNode where the unit has FOLD and the call fits it
+    (``fold_ineligible``), else the host op."""
+    from .tts_nodes import TtsPrepNode
+    host = TtsPrepNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    if fold_ineligible(host) is not None:
+        return host
+    x, lo, hi = host.inputs
+    return FoldRoNode(onnx_node=node, inputs=[x, lo, hi, tables_tensor(tensors)], output=host.output, index=index,
+                      align_elems=align_elems, F=ctx.frac_bits, L=host.L_src, ch0=host.ch0, nch=host.nch,
+                      rows=host.rows, w0=host.w0, s0=host.t0 - host.hl, W=host.w0 + host.hl + host.hr,
+                      rate=host.rate, off=host.frame_off, wlo=host.wlo, whi=host.whi,
+                      m=rs.fold_divisor(host.alpha, host.f_in - host.f_out), s=host.f_in - host.f_out,
+                      f_in=host.f_in, f_out=host.f_out, x=x, lo_t=lo, hi_t=hi)
+
+
 TTS_OVERRIDES = {
+    "TtsPrep":      from_tts_prep,
     "TtsResAdd":    from_tts_resadd,
     "TtsLayerNorm": from_tts_layernorm,
     "TtsRowPrep":   from_tts_rowprep,
@@ -2276,4 +2416,5 @@ __all__ = ("TABLES_NAME", "NO_WINDOW", "enabled", "raw_as_data", "tables_tensor"
            "TtsSumRoNode", "from_tts_sum", "TtsInterleaveRoNode", "from_tts_interleave",
            "TtsRelBandRoNode", "from_tts_rel_band", "DequantRoNode", "from_llm_dequant", "SelectRowRoNode", "from_llm_select_row",
            "PixelShuffleRoNode", "from_vit_pixel_shuffle", "EmbedAddRoNode", "from_vit_embed_add",
-           "ResAddBiasRoNode", "LayerNorm32RoNode", "VIT_OVERRIDES", "TTS_OVERRIDES")
+           "ResAddBiasRoNode", "LayerNorm32RoNode", "VIT_OVERRIDES", "TTS_OVERRIDES", "fold_enabled",
+           "FoldRoNode", "fold_ineligible", "from_tts_prep")

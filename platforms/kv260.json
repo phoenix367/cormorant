@@ -30,7 +30,8 @@
       "softmax": true
     },
     "rowops": {
-      "unit": true
+      "unit": true,
+      "fold": true
     },
     "pool": {
       "tile_c":            8,

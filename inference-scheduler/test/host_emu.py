@@ -546,6 +546,39 @@ static void ro_row_write(u64 addr, const int64_t *vals, unsigned n, unsigned kin
     }
     for (i = bytes; i % 16u; i++) d[i] = 0;
 }
+static int64_t ro_fold(int64_t x, unsigned m, unsigned s)   /* rne(x / (m_x 2^s)), m_x = m for x < 0 */
+{
+    const int64_t u = x < 0 ? -x : x, den = (int64_t)(x < 0 ? m : 1u) << s;
+    int64_t qq = u / den, r = u - qq * den;
+    qq += (2 * r > den || (2 * r == den && (qq & 1))) ? 1 : 0;
+    return x < 0 ? -qq : qq;
+}
+/* FOLD (op 9, HOSTOPS_PLAN §11): channel k reads the row at a + k a_s2 (signed); row r,
+ * column j its column b_s2 + r b_s1 + j (b_s2 signed) where it lies in [win_lo, win_hi),
+ * else 0; the output one contiguous run of blocks x rows x n, the last word's tail 0 */
+static void ro_fold_job(const XRowopskernel *q)
+{
+    const unsigned s = q->aux & 15u, m = (q->aux >> 4) & 127u;
+    unsigned char *d = (unsigned char *)(uintptr_t)q->c;
+    u64 e = 0, k, r, j;
+    if (q->n == 0u || q->rows == 0u || q->blocks == 0u || m == 0u) return;
+    if ((q->a & 1u) || (q->a_s2 & 1u) || (q->c & 15u)) {
+        fprintf(stderr, "rowops: unaligned FOLD: a %llx a_s2 %u c %llx\n", (unsigned long long)q->a, q->a_s2,
+                (unsigned long long)q->c);
+        abort();
+    }
+    for (k = 0; k < q->blocks; k++)
+        for (r = 0; r < q->rows; r++)
+            for (j = 0; j < q->n; j++, e++) {
+                const int64_t col = (int64_t)(int32_t)q->b_s2 + (int64_t)r * q->b_s1 + (int64_t)j;
+                int64_t y = 0;
+                if (col >= (int64_t)q->win_lo && col < (int64_t)q->win_hi)
+                    y = ro_fold(ro_elem(q->a + (u64)((int64_t)k * (int32_t)q->a_s2 + 2 * col), 0u), m, s);
+                d[2 * e] = (unsigned char)y;
+                d[2 * e + 1] = (unsigned char)(y >> 8);
+            }
+    for (e *= 2u; e % 16u; e++) d[e] = 0;
+}
 static inline void XRowopskernel_Start(XRowopskernel *q)
 {
     const uint32_t op = q->op & 15u, n = q->n;
@@ -571,6 +604,10 @@ static inline void XRowopskernel_Start(XRowopskernel *q)
                 }
             }
         ro_tables_loaded = 1;
+        return;
+    }
+    if (op == 9u) {
+        ro_fold_job(q);
         return;
     }
     if (n == 0u || q->rows == 0u || q->blocks == 0u || n > 4096u) return;

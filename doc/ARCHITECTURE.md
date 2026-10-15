@@ -6,7 +6,7 @@ K26, driven by the Arm cores of the same device.  This document describes
 the hardware in the order of an FPGA architecture document: requirements,
 top-level structure, clocks and reset, memory, datapath, interfaces,
 verification, and implementation.  The numbers are those of the production
-bitstream `1cedaf2ed816` unless a section says otherwise.
+bitstream `de968ccc45da` unless a section says otherwise.
 
 ![Cormorant system architecture](images/architecture.svg)
 
@@ -35,7 +35,7 @@ block:
 | **MatmulKernel** | batched C = A · B, tiled; a GEMV mode for one-row products | 128 MACs per cycle (GEMV: 16, port-bound) |
 | **ConvKernel** | 2-D convolution, group 1 or depthwise; MatMuls lowered onto it | 512 MACs per cycle |
 | **PoolingKernel** | Max, Average and Lp pooling, and their global forms | one window beat per cycle |
-| **RowOpsKernel** (the row-ops unit) | row operations of transformers: residual add, RMSNorm / LayerNorm, SiLU · up, RoPE, transposes, copies, dequantisation to float32 | one 4 × 32-bit word per cycle |
+| **RowOpsKernel** (the row-ops unit) | row operations of transformers: residual add, RMSNorm / LayerNorm, SiLU · up, RoPE, transposes, copies, dequantisation to float32; Piper's windowed LeakyReLU rows (FOLD) | one 4 × 32-bit word per cycle |
 
 The kernels share no data path.  Each call reads its operands from DDR and
 writes its results to DDR, and software on the Arm cores chains the calls.
@@ -56,13 +56,13 @@ speech synthesis.  Results on the board with this bitstream at 250 MHz:
 | workload | input | result |
 |---|---|---|
 | ResNet-18 | 224 × 224 | 20.0 ms (50 FPS) |
-| MobileNet V1 / V2 | 224 × 224 | 20.6 / 17.5 ms |
-| YOLOv5n | 640 × 640 | 46.8 ms (21.4 FPS) |
-| LightStereo-S | 640 × 480 pair | 466 ms |
-| BERT-base SQuAD | 256 tokens | 288 ms |
-| SmolLM2-135M / 360M | chat decode | 20.3 / 7.7 tokens/s |
+| MobileNet V1 / V2 | 224 × 224 | 20.5 / 17.5 ms |
+| YOLOv5n | 640 × 640 | 47.9 ms (20.9 FPS) |
+| LightStereo-S | 640 × 480 pair | 469 ms |
+| BERT-base SQuAD | 256 tokens | 266 ms |
+| SmolLM2-135M / 360M | chat decode | 19.8 / 7.6 tokens/s |
 | SmolVLM-256M | one image | 1.6 s |
-| Piper TTS | text | real-time factor 0.19 |
+| Piper TTS | text | real-time factor 0.13 |
 
 Each result is bit-exact with the scheduler's fixed-point simulation of the
 same model.  Accuracy is set by the numerics studies (Q8.8 with calibrated
@@ -249,7 +249,7 @@ flowchart LR
 | MatmulKernel | `mm_ctrl_s_axi`, `mm_core`, `mm_walker` (batch → 8-row panel → ≤ 512-column chunk), `mm_rungen` × 2; the units synchronise on monotonic counters | `mm_axi_rd` × 2, `mm_gearbox` × 2 (lane rotation), `mm_awr` → `mm_abuf` (A panel), `mm_xpf` × 2 (tap sets), `mm_lane` × 2 (64 MACs each), `mm_drain`, `mm_packer`, `mm_axi_wr` |
 | ConvKernel | `cv_ctrl_s_axi`, `cv_core` (configuration through one pipelined multiplier and three dividers, about 40 cycles per job; the contract check; the sweep sequencer with a 4-deep descriptor FIFO per unit) | `cv_xload`, `cv_patch` (line buffer), `cv_wload`, `cv_bias`, `cv_engine` (weight cache, MAC grid of 32 `cv_mac_chain`s, two accumulator buffers), `cv_drain` (transposer), `cv_ywriter` |
 | PoolingKernel | `pl_ctrl_s_axi`, `pl_core` (one pipelined multiplier, a 6-step divider, about 30 cycles per job; the chunk sequencer with 4-deep chunk FIFOs) | `pl_loader`, `pl_emit` (line buffer, window beats), `pl_reduce` (accumulators, finaliser), `pl_writer` |
-| RowOpsKernel | `ro_ctrl_s_axi`, `ro_core` (job FSM, geometries, the op multiplexer, the TLOAD table loader), `ro_rd_arb` (round-robin AR merge), the scalar FSM of `ro_norm` | `ro_rd_port` × 2, `ro_param`, `ro_stream` (COPY, ADDX, DEQUANT, MULACT), `ro_norm`, `ro_rope`, `ro_xpose`, `ro_wr_port` |
+| RowOpsKernel | `ro_ctrl_s_axi`, `ro_core` (job FSM, geometries, the op multiplexer, the TLOAD table loader), `ro_rd_arb` (round-robin AR merge), the scalar FSM of `ro_norm` | `ro_rd_port` × 2, `ro_param`, `ro_stream` (COPY, ADDX, DEQUANT, MULACT), `ro_norm`, `ro_rope`, `ro_xpose`, `ro_fold` (FOLD: row sequencer, eight lanes, packer, its own write bursts), `ro_wr_port` |
 
 The control path is narrow and slow-changing.  Its timing is kept off the
 datapath's critical paths by registering every configuration product before
@@ -380,7 +380,7 @@ placement, routing and post-route physical optimisation, at 3.333 ns
 | RowOpsKernel | +0.025 ns | ≈ 302 MHz | 2026-10-11 |
 
 In context the five kernels share the device, the interconnects and the
-paths to the PS.  The whole design closes 4 ns with +0.020 ns (§8.4).  The
+paths to the PS.  The whole design closes 4 ns with +0.029 ns (§8.4).  The
 50 MHz between the out-of-context target and the in-context clock is the
 margin that cross-die routing in the full design consumes.
 
@@ -501,17 +501,17 @@ In-context utilization per instance, from the routed design
 
 | instance | LUT | of which LUTRAM | SRL | FF | RAMB36 | RAMB18 | URAM | DSP |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| VectorOPKernel | 11 737 | 304 | 187 | 13 753 | 30 | 0 | 0 | 35 |
-| MatmulKernel | 16 315 | 6 892 | 22 | 15 278 | 38 | 0 | 0 | 130 |
-| ConvKernel | 18 253 | 3 758 | 2 390 | 39 731 | 40 | 40 | 48 | 518 |
-| PoolingKernel | 12 345 | 3 404 | 42 | 11 809 | 2 | 0 | 0 | 29 |
-| RowOpsKernel | 30 947 | 3 466 | 415 | 24 463 | 6 | 0 | 7 | 121 |
-| `axi_interconnect_0` (HPC0) | 1 923 | 0 | 10 | 3 847 | 0 | 0 | 0 | 0 |
-| `axi_mem_intercon` (HPC1) | 1 326 | 0 | 0 | 2 159 | 0 | 0 | 0 | 0 |
-| `axi_smc` (control) | 909 | 0 | 1 | 965 | 0 | 0 | 0 | 0 |
-| `axi_rowops_intercon` (HP0) | 149 | 0 | 0 | 669 | 0 | 0 | 0 | 0 |
-| `axi_x_intercon` (HP2) | 69 | 0 | 0 | 313 | 0 | 0 | 0 | 0 |
-| **design** | **93 969** | **17 824** | **3 068** | **113 020** | **116** | **40** | **55** | **833** |
+| VectorOPKernel | 10 768 | 526 | 187 | 12 178 | 30 | 0 | 0 | 35 |
+| MatmulKernel | 14 453 | 6 656 | 22 | 13 297 | 38 | 0 | 0 | 130 |
+| ConvKernel | 14 827 | 4 046 | 512 | 37 497 | 40 | 40 | 48 | 518 |
+| PoolingKernel | 11 856 | 3 462 | 42 | 11 283 | 2 | 0 | 0 | 29 |
+| RowOpsKernel | 33 340 | 3 930 | 437 | 26 712 | 6 | 0 | 7 | 129 |
+| `axi_interconnect_0` (HPC0) | 1 874 | 0 | 10 | 3 733 | 0 | 0 | 0 | 0 |
+| `axi_mem_intercon` (HPC1) | 1 278 | 0 | 0 | 2 029 | 0 | 0 | 0 | 0 |
+| `axi_smc` (control) | 929 | 0 | 1 | 971 | 0 | 0 | 0 | 0 |
+| `axi_rowops_intercon` (HP0) | 150 | 0 | 0 | 668 | 0 | 0 | 0 | 0 |
+| `axi_x_intercon` (HP2) | 69 | 0 | 0 | 312 | 0 | 0 | 0 | 0 |
+| **design** | **89 547** | **18 620** | **1 212** | **108 713** | **116** | **40** | **55** | **841** |
 
 Every RAM is inferred from RTL (`report_ram_utilization`: 100 % inferred,
 no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
@@ -533,7 +533,7 @@ no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
 | | activation ROM | 4096 × 7 (3 786 used) | BRAM ROM, init from the bitstream | 2 read ports, output register; 1 RAMB36 per 2 lanes | SiLU / GELU correction table (`scripts/gen_act_rom.py`) |
 | | exponential ROM × 4 | 4096 × 17 | BRAM ROM | 2 read ports; 2 RAMB36 per 2 lanes | `2^(−k/4096)` (`scripts/gen_smx_rom.py`) |
 | Matmul | A panel | 16 × (128 × 256) | BRAM, 32 RAMB36 | 2-cycle read | the 8-row A panel, one RAM per (lane, row) |
-| | accumulators | 128 × (64 × 32) | LUTRAM | async read, read-modify-write | one per MAC |
+| | accumulators | 128 × (64 × 32), as 32 RAMs of 64 × 128 | LUTRAM | async read, read-modify-write | one 32-bit word per MAC and beat; the 4 rows of a half-group share one RAM and its addresses |
 | | tap FIFOs | 16 × 128 per beat lane | LUTRAM | | x-prefetch tap sets |
 | | read FIFO × 2, write FIFO | 512 × 128, 512 × 144 | BRAM | SDP | DDR latency; data + strobes |
 | Conv | weight cache | 16 columns × 512 × 256 | 8 columns BRAM, 8 URAM | double-banked: the next sweep fills while the current one is read | weight slabs |
@@ -542,7 +542,7 @@ no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
 | | column, weight-vector FIFOs | 256 × 256, 512 × 256 | BRAM | SDP | |
 | | transposer | 8 banks × 1024 × 16 | BRAM | | output-channel-major to NCHW |
 | | patch FIFO, replay file, row buffer, bias RAM, y FIFOs | 64 × 512; 2 × 64 × 256; 16 × 32 × 128; 2 × 128 × 128; 32 × 145 + 8 × 68 | LUTRAM | async read | |
-| | operand skew | 2 390 SRLs | SRL16/32 | | align operands along the 16-deep DSP chains |
+| | operand skew | none in SRLs | weight-cache read addresses, DSP A registers | | weight lane l reaches DSP l l + 1 cycles late: group k of 4 lanes reads its RAM 4k cycles later, the A1 / A2 / AD registers add the rest; the patch lanes through register copies into the B port |
 | Pool | read FIFO | 256 × 128 | BRAM | SDP | |
 | | line buffer | 8 channels × 8 column banks × 16 rows × 8 words | LUTRAM | async read | window rows |
 | | row buffers, W / AW FIFOs, bundle FIFO | 2 × 8 banks; 32 × 145, 8 × 68; 32 × 32 | LUTRAM | | |
@@ -568,8 +568,10 @@ All five kernels use one first-word-fall-through FIFO module per kernel
 (`vo_fifo`, `mm_fifo`, `cv_fifo`, `pl_fifo`, `ro_fifo`) with a choice of
 storage:
 - **LUTRAM:** distributed RAM with an asynchronous read.
-- **BRAM:** block RAM with a registered read and a 3-entry skid buffer, so
-  it still sustains one pop per cycle.
+- **BRAM:** block RAM with a registered read and a 4-entry LUTRAM ring
+  (three entries used) behind it, so it still sustains one pop per cycle.
+  The ring replaced a three-register skid stage that cost about 200 LUTs and
+  400 FFs per FIFO (`doc/plans/AREA_PLAN.md` step 1).
 
 The depths follow three rules:
 
@@ -594,7 +596,7 @@ The depths follow three rules:
 | devices | DDR4 on the K26 SOM, 4 GB, 64-bit, no ECC |
 | rate | 2133 MT/s (DPLL 1066 MHz, set by the boot firmware), 17 GB/s peak |
 | PS address map | `DDR_LOW` `0x0000_0000`–`0x7FFF_FFFF` (2 GB), `DDR_HIGH` `0x8_0000_0000`–`0x8_7FFF_FFFF` (2 GB) |
-| kernel addressing | physical, 64-bit address fields; the SMMU stays in bypass |
+| kernel addressing | physical, 64-bit address fields; the kernels' address arithmetic is 48-bit (bytes) / 44-bit (128-bit words), the upper bits zero — the PS ports' physical space is 40 bits; the SMMU stays in bypass |
 | buffers | one contiguous pool per model library, from CMA (`cma=1000M`) as an XRT buffer object, carved by the scheduler into weights, persistent states and coloured intermediate slots |
 | caching | the pool is mapped cacheable for the A53; the runtime cleans before a kernel reads and invalidates after a kernel writes; the R5's command ring is uncached |
 
@@ -718,14 +720,14 @@ calibrate keep one bit of headroom.
 |---|---:|---|
 | VectorOPKernel | 35 | one multiplier per lane in `vo_compute` (8), one per lane for LeakyReLU in `vo_act` (8, A / B / M / P registers), two per lane in `vo_smx` (16), three 16 × 16 partial products for the job geometry (3) |
 | MatmulKernel | 130 | 128 MACs (`mm_mac`: AREG = BREG = 2, CREG, MREG, PREG; `P = C + A · B`, the accumulator from LUTRAM through C, no cascade) + 1 per run generator |
-| ConvKernel | 518 | the MAC grid: 32 chains of 16 DSP48E2 in a PCIN / PCOUT cascade (2 pixels × 16 output channels × 16 input channels); the seed enters DSP 0's C port, DSP 15 accumulates over window positions; AREG = BREG = MREG = PREG = 1; the other 6 in control arithmetic, the configuration multiplier among them |
+| ConvKernel | 518 | the MAC grid: 32 chains of 16 DSP48E2 in a PCIN / PCOUT cascade (2 pixels × 16 output channels × 16 input channels); the seed enters DSP 0's C port, DSP 15 accumulates over window positions; the weight on the A port (AREG = 2, and the AD register on lanes l % 4 ≠ 0: the end of its skew), the patch on the B port (BREG = 1), MREG = PREG = 1; the other 6 in control arithmetic, the configuration multiplier among them |
 | PoolingKernel | 29 | control arithmetic and the finaliser's multiplies (AVG reciprocal, LP2 Horner steps) |
-| RowOpsKernel | 121 | of which the stream ops 20 (32 × 25 and 39 × 17 products), RoPE 16, NORM 77 (44 × 32 emit product, `ro_mul32`) |
-| **total** | **833 / 1 248** | |
+| RowOpsKernel | 129 | of which the stream ops 20 (32 × 25 and 39 × 17 products), RoPE 16, NORM 77 (44 × 32 emit product, `ro_mul32`), FOLD 8 (one reciprocal product per lane) |
+| **total** | **841 / 1 248** | |
 
 ConvKernel's chains are the only cascaded DSPs: a 16-deep partial-sum chain
-needs no fabric adder tree.  Its operands arrive skewed by SRLs
-(§4.2).  The behavioural chain that Verilator simulates is checked cycle by
+needs no fabric adder tree.  Its operands arrive skewed by the weight
+cache's read addresses and the DSPs' A registers, not by SRLs (§4.2).  The behavioural chain that Verilator simulates is checked cycle by
 cycle against Vivado's DSP48E2 unisim model (§7.1).
 
 ### 5.4 Pipelines, latency and initiation interval
@@ -736,7 +738,7 @@ cycle against Vivado's DSP48E2 unisim model (§7.1).
 | Matmul | 128 MACs per cycle (GEMM), 16 (GEMV) | MAC issue → B/A registers → M → P → accumulator write: 5 cycles; drain 9; an accumulator recurrence of 3 (rows shorter than 3 beats bubble) | the first A panel load | 123 MACs per cycle on 64 × 576 × 576; 15.4–15.9 on GEMV |
 | Conv | one window position per cycle for a pixel pair (512 MACs) | issue → operand 6; issue → chain output 24; write-back 3 | about 40 cycles + the first weight slab | 1 × 1 kernels at half rate (two instants per pixel pair); the grid bound `n · out_h · ⌈out_w/2⌉ · G · max(kh · kw, 2)` cycles |
 | Pool | one window beat per cycle | finaliser 9 stages, one channel (2 lanes) per cycle | about 30 cycles | global pools load-bound |
-| RowOps | ≤ 1 output word (4 × 32-bit) per cycle; NORM 4 elements per cycle; COPY and RoPE half the port rate | stream ops 21 stages; NORM emit 17; RoPE 10 | ~2 µs per job | `max(words read, words written) + ~2 µs` |
+| RowOps | ≤ 1 output word (4 × 32-bit) per cycle; NORM 4 elements per cycle; COPY and RoPE half the port rate; FOLD one 8-element source word per cycle | stream ops 21 stages; NORM emit 17; RoPE 10; FOLD 10 | ~2 µs per job | `max(words read, words written) + ~2 µs` |
 
 At system level, the latency budget of a kernel call includes the driver:
 - **From the A53:** the shortest measured call is 3.1 µs, register writes to
@@ -754,7 +756,7 @@ within ±2 % ([`doc/plans/TACTICS_PLAN.md`](plans/TACTICS_PLAN.md) §9).
 ### 6.1 AXI4 masters (data)
 
 All data ports are AXI4 memory-mapped:
-- 128-bit data, 64-bit addresses, INCR bursts of 16-byte beats;
+- 128-bit data, 64-bit addresses (bits 63:48 zero), INCR bursts of 16-byte beats;
 - one ID (the row-ops unit's reads use two), so data arrives in order;
 - `AxCACHE = 0011`, `AxPROT = 000`;
 - no burst crosses a 4 KiB boundary;
@@ -905,7 +907,7 @@ Every level is checked bit-exactly against the level above it:
 | DSP primitives | ConvKernel's behavioural MAC chain | Vivado's DSP48E2 unisim model, cycle by cycle (199 899 cycles, 0 mismatches) | ctest `ConvRtlDsp` |
 | synthesised netlist | Matmul, VectorOP, Pool | their RTL in lockstep, in xsim | `neteq_<k>_rtl` (`tools/neteq`) |
 | packaged IP | each kernel's IP in the test stand's block design (PS VIP, interconnect, DDR model) | the checked-in fixtures | `behavior_test_<k>`, `sysim_<k>_rtl` (`hw/cormorant_test_stand`) |
-| whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 104 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
+| whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 112 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
 | generated software | the generated C against software kernels | the scheduler's simulator | `inference-scheduler/test/host_emu.py`, also with incoherent caches |
 | the board | the bitstream and the libraries | the simulator's expectations, bit for bit | `run_remote_tests.py` (the model suite), every demo and library gate |
 | the R5 path | the R5-driven runs | the A53-driven runs, bit for bit | `rpu_board.py`, `llm_board.py --rpu r5` |
@@ -966,7 +968,7 @@ All builds use `--x-assign unique --x-initial unique`.
 | Matmul | 50 (11 GEMV) | 200 | random reset values (`+verilator+rand+reset+2`) |
 | Conv | 63 | 200 | zero-size and out-of-contract jobs |
 | Pool | 45 | 200 | board-like timing modes |
-| RowOps | 28 | 300 | 1 200 random over 4 seeds; after a TLOAD |
+| RowOps | 36 | 300 | 1 200 random over 4 seeds; after a TLOAD |
 
 Thousands more random jobs per kernel were run by hand at each timing mode
 during development (the kernel documents record them).
@@ -1082,20 +1084,28 @@ Post-route, post-physical-optimisation, production bitstream:
 
 | metric | value |
 |---|---|
-| WNS (setup) | +0.020 ns |
+| WNS (setup) | +0.029 ns |
 | TNS | 0.000 ns |
 | WHS (hold) | +0.010 ns |
-| endpoints | 511 646 |
+| endpoints | 517 657 |
 | methodology | no timing or CDC warnings; ULMTCS-1 (control-set count warning), CLKC-40 and CLKC-56 (MMCM advisories) |
 
-The 20 worst setup paths are all within 0.020–0.061 ns and spread over:
-- the HPC1 crossbar's address arbiter (`axi_mem_intercon`, the worst path:
-  7 logic levels, 70 % routing delay);
-- block-RAM FIFO reads into fabric registers (the row-ops unit's write FIFO,
-  VectorOP's b read FIFO);
-- ConvKernel's URAM write data and DSP-chain operand skew;
-- the row-ops unit's NORM DSP inputs and the fan-out of its RoPE
-  LUTRAM write address.
+The 20 worst setup paths are all within 0.029–0.089 ns, most of each path
+routing delay (60–97 %), and spread over:
+- the row-ops unit's transposer: its byte mask from the job's `aux`
+  register (the worst path: a CARRY8 and a LUT4; FOLD reads the same
+  register), its LUTRAM banks' data from the read port's output FIFO, and a
+  NORM DSP input;
+- MatmulKernel's A-buffer read addresses and tap registers (`u_xpf`) and a
+  lane's drain read;
+- ConvKernel's job configuration (`mp3` → `reach_h`), the transposer's
+  enable and the replay file's write enable;
+- a PoolingKernel finaliser register and a VectorOP softmax DSP input.
+
+The area pass moved the worst paths out of the HPC1 crossbar and ConvKernel's
+DSP-chain operand skew (on `1cedaf2ed816`: 0.020–0.061 ns over the
+`axi_mem_intercon` address arbiter, the row-ops unit's write FIFO, ConvKernel's
+URAM write data and operand skew, the NORM DSP inputs).
 
 No single unit dominates.  The next addition will have to find its slack
 across the design, not in one place.
@@ -1110,6 +1120,7 @@ The slack history across production bitstreams at 250 MHz:
 | `8599aa7a5f12` | VectorOP b on HPC1 | +0.114 ns |
 | `f70ce632a97a` | ConvKernel x on HP2, line-buffer copies | +0.098 ns |
 | `1cedaf2ed816` | the RowOpsKernel on HP0 | +0.020 ns |
+| `de968ccc45da` | the row-ops unit's FOLD; the kernels' area pass (`doc/plans/AREA_PLAN.md`: −4.4 k LUT) | +0.029 ns |
 
 The default implementation strategy missed 4 ns by tens of picoseconds.
 `build.tcl` therefore runs these directives:
@@ -1121,21 +1132,21 @@ The default implementation strategy missed 4 ns by tens of picoseconds.
 ### 8.5 Utilization against the headroom guideline
 
 The usual guideline keeps 20–30 % headroom (70–80 % utilization) for timing
-closure and for later changes.  The production design is past it on four
-resources:
+closure and for later changes.  The production design is past it on three
+resources (block RAM, URAM, CLBs) and inside it on LUTs:
 
 | resource | used | available | utilization | against 70–80 % |
 |---|---:|---:|---:|---|
-| CLB LUTs | 93 969 | 117 120 | 80.2 % | at the limit |
-| — as logic | 73 077 | | 62.4 % | |
-| — as distributed RAM | 17 824 | 57 600 (LUTM) | 30.9 % | |
-| — as shift registers | 3 068 | 57 600 (LUTM) | 5.3 % | |
-| CLB registers | 113 020 | 234 240 | 48.3 % | within |
-| CARRY8 | 3 063 | 14 640 | 20.9 % | within |
-| CLBs (any part used) | 14 618 | 14 640 | 99.9 % | full: every CLB holds something |
+| CLB LUTs | 89 547 | 117 120 | 76.5 % | within, near the top |
+| — as logic | 69 715 | | 59.5 % | |
+| — as distributed RAM | 18 620 | 57 600 (LUTM) | 32.3 % | |
+| — as shift registers | 1 212 | 57 600 (LUTM) | 2.1 % | |
+| CLB registers | 108 713 | 234 240 | 46.4 % | within |
+| CARRY8 | 3 188 | 14 640 | 21.8 % | within |
+| CLBs (any part used) | 14 573 | 14 640 | 99.5 % | full: almost every CLB holds something |
 | block RAM tiles | 136 (116 RAMB36 + 40 RAMB18) | 144 | 94.4 % | over |
 | URAM | 55 | 64 | 85.9 % | over |
-| DSP48E2 | 833 | 1 248 | 66.7 % | within |
+| DSP48E2 | 841 | 1 248 | 67.4 % | within |
 | BUFGCE / MMCM | 1 / 1 | 112 / 4 | | |
 | bonded IOB | 0 | 189 | 0 % | |
 
@@ -1143,10 +1154,12 @@ What this means for the next change:
 - **Block RAM and URAM are the binding resources.**  Eight BRAM tiles and
   nine URAMs are left.  A new buffer must come from LUTRAM, or from a
   kernel's existing storage.
-- **LUTs are at the guideline.**  With every CLB in use, placement has no
-  room to spread a congested region.  The +0.020 ns slack is the visible
-  consequence.
-- **DSPs have room** (415 left).  Arithmetic is not the limit; memory and
+- **LUTs are inside the guideline again, CLBs are not.**  The FOLD design
+  did not route at 83.4 % LUTs; the area pass of `doc/plans/AREA_PLAN.md`
+  brought it to 76.5 % (−4.4 k against `1cedaf2ed816`, which had no FOLD).
+  Almost every CLB still holds something, so placement has little room to
+  spread a congested region; the +0.029 ns slack is the visible consequence.
+- **DSPs have room** (407 left).  Arithmetic is not the limit; memory and
   routing are.
 
 ### 8.6 Bitstream generation, version control and handoff
@@ -1201,8 +1214,8 @@ A new bitstream is promoted to production in this order:
 
 ## 9. Known issues and open items
 
-- **Resource headroom** (§8.5).  BRAM 94 %, URAM 86 %, every CLB in use, and
-  +0.020 ns of slack.  The next kernel feature has to recover area or move
+- **Resource headroom** (§8.5).  BRAM 94 %, URAM 86 %, 99.5 % of the CLBs in
+  use, and +0.029 ns of slack.  The next kernel feature has to recover area or move
   storage to LUTRAM.
 - **`pl_clk1`** is enabled in the PS configuration and drives nothing.
 - **Clocking advisories.**  The MMCM could be a PLLE4 (CLKC-40) and has no

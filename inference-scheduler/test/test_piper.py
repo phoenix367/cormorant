@@ -121,11 +121,15 @@ _CG = None
 
 
 def chunk_cg():
+    """The chunk with TtsPrep as host ops (the unit's FOLD off whatever the
+    platform says; fold_chunk_cg is the FOLD variant)."""
     global _CG
     if _CG is None:
+        from src import _rowops_hw_config
         W, E = random_weights(), exponents()
-        _CG = (W, E, CodeGenerator(OnnxGraph(PiperChunkFrontend(W, E).entry(), fuse_act=True,
-                                             s2d_stem=True), model_path="piper_chunk.onnx"))
+        with mock.patch.object(_rowops_hw_config, "ROWOPS_FOLD", False):
+            _CG = (W, E, CodeGenerator(OnnxGraph(PiperChunkFrontend(W, E).entry(), fuse_act=True,
+                                                 s2d_stem=True), model_path="piper_chunk.onnx"))
     return _CG
 
 
@@ -531,6 +535,85 @@ class TestPiperChunk(unittest.TestCase):
     def test_generated_c_matches_simulation(self):
         _, _, cg = chunk_cg()
         with tempfile.TemporaryDirectory() as td:
+            rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("PASSED", out)
+
+
+_FOLD_CG = None
+
+
+def _fold(on=True):
+    """The platform gates of the row-ops unit and its FOLD op, patched."""
+    from src import _rowops_hw_config
+    return mock.patch.multiple(_rowops_hw_config, ROWOPS_UNIT=on, ROWOPS_FOLD=on)
+
+
+def fold_chunk_cg():
+    """chunk_cg's graph with the row-ops unit's FOLD (HOSTOPS_PLAN §11)."""
+    global _FOLD_CG
+    if _FOLD_CG is None:
+        W, E, _ = chunk_cg()
+        with _fold():
+            _FOLD_CG = (W, E, CodeGenerator(OnnxGraph(PiperChunkFrontend(W, E).entry(), fuse_act=True,
+                                                      s2d_stem=True), model_path="piper_chunk_fold.onnx"))
+    return _FOLD_CG
+
+
+class TestPiperChunkFold(unittest.TestCase):
+    """TtsPrep as the row-ops unit's FOLD (rowops_nodes.FoldRoNode): the chunk still
+    equals chunk_forward bit for bit, the generated C its simulation."""
+
+    def test_simulation_matches_specification(self):
+        W, E, cg = fold_chunk_cg()
+        rng = np.random.default_rng(5)
+        zp = (rng.standard_normal((192, FLOW_FRAMES)) * 0.8).astype(np.float32)
+        for lo, hi in ((64, 256), (0, 256), (-64, 121), (70, 90), (300, 400)):
+            z = zp.copy()
+            z[:, :max(min(lo, FLOW_FRAMES), 0)] = 0
+            z[:, max(min(hi, FLOW_FRAMES), 0):] = 0
+            with _fold():
+                sim = cg._forward_pass({"zp": z.astype(np.float64), "lo": np.array([lo]),
+                                        "hi": np.array([hi])}, keep=["pcm"])["pcm"]
+            np.testing.assert_array_equal(np.asarray(sim).astype(np.int64),
+                                          pv.chunk_forward(W, E, z, lo, hi).astype(np.int64),
+                                          err_msg=f"lo {lo} hi {hi}")
+
+    def test_census(self):
+        """Every int16 TtsPrep whose rule is an exact 1/m with a coarser output is a
+        FOLD; the float32 sources (and, with these random exponents, the finer outputs)
+        stay host ops."""
+        from src.rowops_nodes import FoldRoNode, fold_ineligible
+        from src.tts_nodes import TtsPrepNode
+        _, _, cg = fold_chunk_cg()
+        folds = [sn for sn in cg._graph.nodes if isinstance(sn, FoldRoNode)]
+        hosts = [sn for sn in cg._graph.nodes if isinstance(sn, TtsPrepNode)]
+        self.assertEqual(len(folds) + len(hosts), 46)
+        self.assertGreaterEqual(len(folds), 10)
+        with _fold():
+            self.assertEqual({fold_ineligible(sn) for sn in hosts}, {"a float32 source", "a finer output exponent"})
+        self.assertEqual(sum(1 for sn in hosts if sn.src_f32), 5)
+        self.assertTrue(any(sn.m == 10 for sn in folds) and any(sn.m == 1 for sn in folds))
+        self.assertTrue(any(sn.W % 8 for sn in folds) and any(sn.s0 < 0 for sn in folds))
+
+    def test_kernel_calls_are_the_emitted_ones(self):
+        from test_perf_calls import _Eval, node_emitted_calls
+        from src.rowops_nodes import FoldRoNode
+        _, _, cg = fold_chunk_cg()
+        ev = _Eval(cg.generate_header())
+        for sn in cg._graph.nodes:
+            if isinstance(sn, FoldRoNode):
+                self.assertEqual(sn.kernel_calls(cg._layouts), node_emitted_calls(sn, cg, ev), sn.describe())
+
+    def test_off_without_the_op(self):
+        from src.rowops_nodes import FoldRoNode
+        _, _, cg = chunk_cg()
+        self.assertFalse(any(isinstance(sn, FoldRoNode) for sn in cg._graph.nodes))
+
+    @unittest.skipUnless(shutil.which("cc"), "needs cc")
+    def test_generated_c_matches_simulation(self):
+        _, _, cg = fold_chunk_cg()
+        with tempfile.TemporaryDirectory() as td, _fold():
             rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
         self.assertEqual(rc, 0, out[-3000:])
         self.assertIn("PASSED", out)

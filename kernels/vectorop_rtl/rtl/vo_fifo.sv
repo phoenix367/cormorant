@@ -4,7 +4,7 @@
 //
 //   BRAM = 0: distributed RAM with an asynchronous read (small FIFOs).
 //   BRAM = 1: block RAM with a registered read, followed by a three-entry skid
-//             stage so the output still sustains one pop per cycle.
+//             stage (a LUTRAM ring) so the output still sustains one pop per cycle.
 //
 // `count` is the number of accepted entries not yet popped, including the
 // ones in the BRAM read pipeline (usable for credit schemes).
@@ -60,7 +60,12 @@ module vo_fifo #(
     (* ram_style = "block" *) logic [W-1:0] mem [D];
     logic [W-1:0] rdata;
     logic         rd_issue, inflight;
-    logic [W-1:0] q [3];
+    // The skid stage: a ring of four entries (three used) in distributed RAM,
+    // written from the RAM's output register and read asynchronously at its
+    // head — 128-bit words cost ~80 LUTs here against three registers and
+    // their input muxes (doc/plans/AREA_PLAN.md).
+    (* ram_style = "distributed" *) logic [W-1:0] q [4];
+    logic [1:0]   qw, qr;      // ring write / read pointers
     logic [1:0]   qn;          // entries in the skid stage (0..3)
     logic         out_fire;
 
@@ -72,10 +77,11 @@ module vo_fifo #(
     always_ff @(posedge clk) begin
       if (in_fire)  mem[wptr] <= in_data;
       if (rd_issue) rdata <= mem[rptr];
+      if (inflight) q[qw] <= rdata;
     end
 
     assign out_valid = (qn != 2'd0);
-    assign out_data  = q[0];
+    assign out_data  = q[qr];
     assign out_fire  = out_valid && out_ready;
     assign count     = cnt + {{AW{1'b0}}, inflight} + {{(AW-1){1'b0}}, qn};
 
@@ -84,24 +90,16 @@ module vo_fifo #(
 
     always_ff @(posedge clk) begin
       if (rst) begin
-        wptr <= '0; rptr <= '0; cnt <= '0; inflight <= 1'b0; qn <= 2'd0;
+        wptr <= '0; rptr <= '0; cnt <= '0; inflight <= 1'b0; qn <= 2'd0; qw <= '0; qr <= '0;
       end else begin
         if (in_fire)  wptr <= wptr + 1'b1;
         if (rd_issue) rptr <= rptr + 1'b1;
         cnt      <= cnt + (AW+1)'(in_fire) - (AW+1)'(rd_issue);
         inflight <= rd_issue;
+        if (inflight) qw <= qw + 2'd1;
+        if (out_fire) qr <= qr + 2'd1;
         qn <= qn_pop + {1'b0, inflight};
       end
-    end
-
-    // Skid stage: pop from q[0], append the arriving RAM word.  No reset on
-    // the data (qn qualifies it).
-    always_ff @(posedge clk) begin
-      if (out_fire) begin
-        q[0] <= q[1];
-        q[1] <= q[2];
-      end
-      if (inflight) q[qn_pop] <= rdata;
     end
   end
 

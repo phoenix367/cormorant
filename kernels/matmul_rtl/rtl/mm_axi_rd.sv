@@ -42,7 +42,7 @@ module mm_axi_rd
 
   // Current descriptor.
   logic        busy;
-  logic [59:0] cur_w;       // next word address
+  logic [AB-5:0] cur_w;     // next word address
   logic [11:0] rem;         // words left to request
 
   logic [CW:0] space;       // FIFO entries not yet reserved by a burst
@@ -100,7 +100,7 @@ module mm_axi_rd
       if (issue) bl_v <= 1'b0;
       else if (busy && !bl_v) begin blen <= blen_c; bl_v <= 1'b1; end
       if (issue) begin
-        cur_w   <= cur_w + 60'(blen);
+        cur_w   <= cur_w + (AB-4)'(blen);
         rem     <= rem - blen;
         if (rem == blen) busy <= 1'b0;
       end
@@ -109,9 +109,9 @@ module mm_axi_rd
     end
   end
 
-  mm_rs #(.W(72)) u_ar (
+  mm_rs1 #(.W(72)) u_ar (
     .clk, .rst,
-    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({cur_w, 4'b0, 8'(blen - 12'd1)}),
+    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({60'(cur_w), 4'b0, 8'(blen - 12'd1)}),
     .out_valid (arvalid), .out_ready (arready),     .out_data ({araddr, arlen})
   );
 

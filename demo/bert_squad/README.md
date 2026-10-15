@@ -362,11 +362,16 @@ ConvKernel's x read port on HP2 past the CCI plus its overlapped
 line-buffer loads (bitstream f70ce632a97a, DEPTHWISE_PLAN §8, 2026-10-10,
 the same project — its MatMul-on-ConvKernel calls stream the activations
 through that port): p50 363.9 ms, bit-exact, EM / F1 88.0 / 90.3.
-**Latest**, the 25 LayerNorms on the row-ops unit (bitstream 1cedaf2ed816,
+The 25 LayerNorms on the row-ops unit (bitstream 1cedaf2ed816,
 HOSTOPS_PLAN phase 3, 2026-10-12, the project regenerated — its LayerNorms
 are `run_rowops()` calls, the host emulation of `reference.py` follows with the
-`sched+vsmx+iln` policy): p50 **288.4 ms**, bit-exact (3 / 3 against the
+`sched+vsmx+iln` policy): p50 288.4 ms, bit-exact (3 / 3 against the
 simulation), EM / F1 88.0 / 90.3.
+**Latest**, 48 of its 49 Transposes on the row-ops unit as well (RPU_PLAN
+track A1, 2026-10-13; measured 2026-10-15 on the production bitstream
+de968ccc45da with the same `sched+vsmx+iln` policy): p50 **266.3 ms**,
+bit-exact (3 / 3 against the simulation, 50 / 50 against the emulation),
+EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 

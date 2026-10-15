@@ -200,11 +200,20 @@ module mm_lane
     end
 
     logic [R-1:0][31:0] acc_rd, p;
-    for (genvar r = 0; r < R; r++) begin : g_r
-      (* ram_style = "distributed" *) logic [31:0] acc [ACC_D];
-      always_ff @(posedge clk) if (v5) acc[w5[r / RHF]] <= p[r];
-      assign acc_rd[r] = acc[ra3[r / RHF]];
+    // the accumulators of a half's RHF rows share their addresses and enable:
+    // one RHF x 32-bit distributed RAM per half packs into fewer RAM64M8
+    // (7 bits each) than RHF 32-bit ones (doc/plans/AREA_PLAN.md)
+    for (genvar h = 0; h < 2; h++) begin : g_h
+      (* ram_style = "distributed" *) logic [RHF*32-1:0] acc [ACC_D];
+      logic [RHF*32-1:0] wd;
+      for (genvar i = 0; i < RHF; i++) begin : g_i
+        assign wd[i * 32 +: 32]     = p[h * RHF + i];
+        assign acc_rd[h * RHF + i] = acc[ra3[h]][i * 32 +: 32];
+      end
+      always_ff @(posedge clk) if (v5) acc[w5[h]] <= wd;
+    end
 
+    for (genvar r = 0; r < R; r++) begin : g_r
       mm_mac u_mac (
         .clk,
         .a     (x1[l*EW +: EW]),

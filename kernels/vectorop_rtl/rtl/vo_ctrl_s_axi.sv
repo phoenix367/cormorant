@@ -102,12 +102,7 @@ module vo_ctrl_s_axi (
     end
   end
 
-  logic [31:0] wmask;
-  assign wmask = {{8{wstrb_q[3]}}, {8{wstrb_q[2]}}, {8{wstrb_q[1]}}, {8{wstrb_q[0]}}};
 
-  function automatic logic [31:0] merge(input logic [31:0] old);
-    return (wdata_q & wmask) | (old & ~wmask);
-  endfunction
 
   // Control / status -------------------------------------------------------------
   logic       int_ap_start, int_task_done, int_ap_idle, int_ap_ready;
@@ -168,22 +163,22 @@ module vo_ctrl_s_axi (
 
       if (w_hs) begin
         case (waddr)
-          A_A0:    a[31:0]        <= merge(a[31:0]);
-          A_A1:    a[63:32]       <= merge(a[63:32]);
-          A_B0:    b[31:0]        <= merge(b[31:0]);
-          A_B1:    b[63:32]       <= merge(b[63:32]);
-          A_C0:    c[31:0]        <= merge(c[31:0]);
-          A_C1:    c[63:32]       <= merge(c[63:32]);
-          A_SIZE:  size           <= merge(size);
-          A_OP:    op             <= merge(op);
-          A_OUTER: outer          <= merge(outer);
-          A_AINC:  a_inc          <= merge(a_inc);
-          A_BINC:  b_inc          <= merge(b_inc);
-          A_ACT:   act            <= merge(act);
-          A_ALPHA: alpha          <= merge(alpha);
-          A_SCM:   smx_cm         <= merge(smx_cm);
-          A_SCFG:  smx_cfg        <= merge(smx_cfg);
-          A_SMASK: smx_mask       <= merge(smx_mask);
+          A_A0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_A1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_B1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_C1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) c[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_SIZE: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) size[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OP: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) op[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_OUTER: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) outer[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_AINC: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) a_inc[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_BINC: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) b_inc[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_ACT: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) act[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_ALPHA: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) alpha[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_SCM: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) smx_cm[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_SCFG: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) smx_cfg[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_SMASK: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) smx_mask[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end

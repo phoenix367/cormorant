@@ -50,7 +50,7 @@ module mm_axi_wr
   logic [2:0]  dq_count;
   mm_fifo #(.W(72), .D(4), .BRAM(1'b0)) u_dq (
     .clk, .rst,
-    .in_valid (desc_valid), .in_ready (desc_ready), .in_data ({desc_waddr, desc_nw}),
+    .in_valid (desc_valid), .in_ready (desc_ready), .in_data ({16'b0, desc_waddr[AB-5:0], desc_nw}),
     .out_valid(dq_valid),   .out_ready(dq_ready),   .out_data(dq_data),
     .count    (dq_count)
   );
@@ -68,7 +68,7 @@ module mm_axi_wr
 
   // AW side ----------------------------------------------------------------------
   logic        busy;
-  logic [59:0] cur_w;
+  logic [AB-5:0] cur_w;
   logic [11:0] rem;
   logic [CW:0] pend_w;      // beats of issued bursts not yet sent on W
 
@@ -117,14 +117,14 @@ module mm_axi_wr
     end else begin
       if (dq_valid && dq_ready) begin
         busy  <= (dq_data[11:0] != '0);
-        cur_w <= dq_data[71:12];
+        cur_w <= dq_data[12 +: AB-4];
         rem   <= dq_data[11:0];
       end
       // One cycle to size the next burst after every change of cur_w / rem.
       if (issue) bl_v <= 1'b0;
       else if (busy && !bl_v) begin blen <= blen_c; bl_v <= 1'b1; end
       if (issue) begin
-        cur_w   <= cur_w + 60'(blen);
+        cur_w   <= cur_w + (AB-4)'(blen);
         rem     <= rem - blen;
         if (rem == blen) busy <= 1'b0;
       end
@@ -141,9 +141,9 @@ module mm_axi_wr
   );
 
   // W side -----------------------------------------------------------------------
-  mm_rs #(.W(72)) u_aw (
+  mm_rs1 #(.W(72)) u_aw (
     .clk, .rst,
-    .in_valid  (issue),   .in_ready  (aw_in_ready), .in_data ({cur_w, 4'b0, 8'(blen - 12'd1)}),
+    .in_valid  (issue),   .in_ready  (aw_in_ready), .in_data ({60'(cur_w), 4'b0, 8'(blen - 12'd1)}),
     .out_valid (awvalid), .out_ready (awready),     .out_data ({awaddr, awlen})
   );
 

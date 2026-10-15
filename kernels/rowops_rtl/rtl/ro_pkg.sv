@@ -8,6 +8,8 @@ package ro_pkg;
   localparam int E         = 8;         // int16 lanes per 128-bit AXI word
   localparam int EW        = 16;        // element width (int16); int32 / f32 elements take two lanes
   localparam int BW        = E * EW;    // word width (128)
+  localparam int WA        = 44;        // word-address bits of the address arithmetic: byte addresses
+                                         // below 2^48 (the PS ports' 40-bit physical space, SMMU IOVAs)
   localparam int E32       = 4;         // int32 elements per word
 
   // Burst lengths and outstanding counts the IP declares (syn/package_ip.tcl).
@@ -32,7 +34,8 @@ package ro_pkg;
 
   // Op codes (register op[3:0]) and kinds (op[5:4] A, [7:6] B, [9:8] C).
   localparam logic [3:0] OP_COPY = 4'd1, OP_ADDX = 4'd2, OP_DEQUANT = 4'd3, OP_MULACT = 4'd4,
-                         OP_NORM = 4'd5, OP_ROPE = 4'd6, OP_XPOSE = 4'd7, OP_TLOAD = 4'd8;
+                         OP_NORM = 4'd5, OP_ROPE = 4'd6, OP_XPOSE = 4'd7, OP_TLOAD = 4'd8,
+                         OP_FOLD = 4'd9;
   localparam logic [1:0] K_I16 = 2'd0, K_I32 = 2'd1, K_F32 = 2'd2;
   // Flags (register op bits).
   localparam int F_B_EN = 12, F_P_BCAST = 13, F_P_KEEP = 14, F_RELU = 15, F_NORM_LN = 16;

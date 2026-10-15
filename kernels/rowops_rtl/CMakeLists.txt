@@ -30,7 +30,7 @@ set(RO_RTL_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(RO_RTL_SOURCES
     rtl/ro_pkg.sv rtl/ro_fifo.sv rtl/ro_rs.sv rtl/ro_ctrl_s_axi.sv rtl/ro_burstgen.sv
     rtl/ro_rd_port.sv rtl/ro_wr_port.sv rtl/ro_rd_arb.sv rtl/ro_prm_ram.sv rtl/ro_param.sv rtl/ro_sig_ram.sv
-    rtl/ro_stream.sv rtl/ro_rsqrt_ram.sv rtl/ro_mul32.sv rtl/ro_norm.sv rtl/ro_rope.sv rtl/ro_xpose.sv rtl/ro_core.sv rtl/RowOpsKernel.v)
+    rtl/ro_stream.sv rtl/ro_rsqrt_ram.sv rtl/ro_mul32.sv rtl/ro_norm.sv rtl/ro_rope.sv rtl/ro_xpose.sv rtl/ro_fold.sv rtl/ro_core.sv rtl/RowOpsKernel.v)
 list(TRANSFORM RO_RTL_SOURCES PREPEND "${RO_RTL_DIR}/")
 set(RO_RTL_TB_SOURCES
     "${RO_RTL_DIR}/tb/verilator/tb_main.cpp"

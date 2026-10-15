@@ -8,7 +8,7 @@ fixed point, bit for bit the integer specifications of
 `inference-scheduler/src/rowops_spec.py`.  One AXI4 master (reads on two
 IDs, writes on one) on its own PS port — `S_AXI_HP0_FPD` through
 `axi_rowops_intercon` in the block design since phase 3 (bitstream
-`1cedaf2ed816`, 2026-10-12: control block at `0xA004_0000`, interrupt
+`1cedaf2ed816`, 2026-10-12; FOLD since `de968ccc45da`, 2026-10-15: control block at `0xA004_0000`, interrupt
 `pl_ps_irq0[4]`, UIO `fabric_rowops`; `hw/cormorant_hw_128/scripts/bd_rowops_hp0.tcl`)
 — and an AXI4-Lite control slave with the HLS register-block layout,
 `ap_ctrl_hs`.
@@ -39,27 +39,27 @@ done, b1 ready), `0x0C` ISR (toggle on write).  Arguments
 | offset | name | meaning |
 |---|---|---|
 | `0x10` | `op` | [3:0] op code (§1.4); [5:4] A kind; [7:6] B kind; [9:8] C kind (0 i16, 1 i32, 2 f32 — C only); [12] `B_EN` stream B present; [13] `P_BCAST` one parameter entry for every column; [14] `P_KEEP` keep the parameter RAM of the previous job (no read of `p`); [15] `RELU` (COPY / ADDX: max(y, 0) after saturation); [16] `NORM_LN` (NORM: LayerNorm; 0 RMSNorm) |
-| `0x14` | `n` | elements per row, 1 … 4096 (TRANSPOSE: L, the tile's row length) |
+| `0x14` | `n` | elements per row, 1 … 4096 (TRANSPOSE: L, the tile's row length; FOLD: W, the output row, any 32-bit value ≥ 1) |
 | `0x18` | `c1` | rows per block (TRANSPOSE: tiles per block) |
 | `0x1C` | `c2` | blocks (≥ 1) |
-| `0x20`/`0x24` | `a` | stream A base (byte address, 16-byte aligned) |
+| `0x20`/`0x24` | `a` | stream A base (byte address, 16-byte aligned; FOLD: source column 0 of output channel 0, 2-byte aligned) |
 | `0x28` | `a_s1` | bytes between A's consecutive rows (multiple of 16) |
-| `0x2C` | `a_s2` | bytes between A's blocks |
+| `0x2C` | `a_s2` | bytes between A's blocks (FOLD: between the channels' source rows, signed and even) |
 | `0x30`/`0x34` | `b` | stream B base |
-| `0x38` | `b_s1` | B row stride (TRANSPOSE: bytes between the tile's R source rows) |
-| `0x3C` | `b_s2` | B block stride (TRANSPOSE: bytes between destination granules) |
+| `0x38` | `b_s1` | B row stride (TRANSPOSE: bytes between the tile's R source rows; FOLD: w0, the source columns between output rows) |
+| `0x3C` | `b_s2` | B block stride (TRANSPOSE: bytes between destination granules; FOLD: s0, the signed source column of row 0, column 0) |
 | `0x40`/`0x44` | `c` | stream C base (16-byte aligned; TRANSPOSE: 2-byte aligned) |
 | `0x48` | `c_s1` | C row stride (TRANSPOSE: tile stride) |
 | `0x4C` | `c_s2` | C block stride |
 | `0x50`/`0x54` | `p` | the parameter block (§1.3), 16-byte aligned |
 | `0x58`/`0x5C` | `eps` | NORM: the integer E of `rowops_spec.norm_params` (`round(eps·n·2^2f)` for RMSNorm, `round(eps·n²·2^2f)` for LayerNorm) |
-| `0x60` | `aux` | ROPE: [11:0] HD (the head segment, a multiple of 16, 16 … 128); TRANSPOSE: [3:0] R (rows per tile, 1 … 8; L = `n` ≤ 1024) |
+| `0x60` | `aux` | ROPE: [11:0] HD (the head segment, a multiple of 16, 16 … 128); TRANSPOSE: [3:0] R (rows per tile, 1 … 8; L = `n` ≤ 1024); FOLD: [3:0] s (0 … 15), [10:4] m (1 … 127) |
 | `0x64` | `bq_sh` | [5:0] the left shift of every column's Bq' before it is added (NORM: 24 + g − bb, bb = beta's scale; COPY / ADDX: the bias's scale) |
-| `0x68` | `win_lo` | COPY / ADDX: A rows with index i1 < win_lo read as zeros (default 0) |
-| `0x6C` | `win_hi` | … and rows with i1 ≥ win_hi (default 0xFFFFFFFF): tap stacking's rows outside the sequence |
+| `0x68` | `win_lo` | COPY / ADDX: A rows with index i1 < win_lo read as zeros (default 0); FOLD: the source columns below win_lo give 0 and are not read |
+| `0x6C` | `win_hi` | … and rows with i1 ≥ win_hi (default 0xFFFFFFFF): tap stacking's rows outside the sequence; FOLD: likewise the columns at / above win_hi (an inverted window reads nothing) |
 
 Registers are sampled when `ap_start` is taken; they may be rewritten
-while the job runs.
+while the job runs.  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).
 
 ### 1.3 Streams, rows and the parameter block
 
@@ -71,7 +71,8 @@ past `n` of a row's last word read as 0.  Rows of C are written whole words
 (every beat of a run, WSTRB all ones): the lanes past `n` of the last word
 are written 0, so the caller's buffer or stride gap must cover the whole
 last word — the alignment contract of the other kernels (the scheduler's
-64-byte allocations and `CHUNK_STRIDE` do).  TRANSPOSE is the one op that
+64-byte allocations and `CHUNK_STRIDE` do).  FOLD reads its source rows at any
+element offset and writes one contiguous run (§1.4).  TRANSPOSE is the one op that
 writes with byte strobes (§1.4).
 
 The **parameter block** P gives every column c < n (or one entry for all,
@@ -110,6 +111,7 @@ C++ port.
 | 7 | `TRANSPOSE` | tile (i2, i1): R rows (`aux`) of L = `n` i16 at `a + i2·a_s2 + i1·a_s1 + r·b_s1`; the tile's column d (< L) becomes a granule of R int16 — `out[d][r] = in[r][d]` — at byte address `c + i2·c_s2 + i1·c_s1 + d·b_s2`, written with byte strobes covering exactly its 2R bytes (a granule may straddle two words; `b_s2 = 2R` makes the granules one contiguous run of L·R elements, written as whole words with the lanes past the last element zero — the stream ops' contract — at a 16-byte-aligned `c`) | i16 |
 
 | 8 | `TLOAD` | the tables: A is the 64 KiB table image as rows of int32 (`n = 4096`, `c1 = 4`, `a_s1 = 16384` — any geometry that delivers its 4096 words in order): words 0 … 2047 hold two sigmoid entries {D[i], T[i]} (bits [48:25] / [24:0] of each 64-bit half, i = 2w and 2w + 1; `rowops_spec.sigmoid_table`), words 2048 … 4095 four rsqrt entries (int32, i = 4(w − 2048) …; `rowops_spec.rsqrt_table`); no B, P or C.  Run once after the bitstream, before any MULACT or NORM: the tables live in UltraRAM, which has no initial contents.  `scripts/gen_fixtures.py` writes the image as `tables.hex`; the testbench's oracle builds the same one | A i32 |
+| 9 | `FOLD` | Piper's `TtsPrep` (HOSTOPS_PLAN §11): output channel k < `c2` reads the int16 source row at `a + k·a_s2`; its row r < `c1`, column j < `n` reads the row's column `s0 + r·w0 + j` (`s0 = b_s2`, `w0 = b_s1`) where that lies in `[win_lo, win_hi)`, else 0 — `y = rne(x / (m_x · 2^s))`, `m_x = m` for x < 0 and 1 for x ≥ 0 (`rowops_spec.fold`: LeakyReLU with alpha 1/m and the re-rounding s bits coarser; nothing saturates).  The output is one contiguous run of `c2 · c1 · n` int16 at `c` (whole words, the last word's lanes past the end 0); no B or P; the window's columns are the only ones read.  m = 0 is an empty job | A, C i16 |
 
 Rows are independent; the counts are 32-bit; `n = 0`, `c1 = 0` or `c2 = 0`
 is an empty job (`ap_done` without traffic).  Values outside the
@@ -138,6 +140,7 @@ every counter is sized for the register value.
 | `TtsAttnRelAddNode` (`TtsRelBandRoNode`, `PiperEncoderFrontend(rel_kernel=True)`) | the relative keys as 16 extra K cache rows (a COPY in `VitAttnPrepRoNode`; the q·Kᵀ call yields q·ekᵀ as rows T ..), one TRANSPOSE (R = 1, granule stride 2(T + 1): byte strobes) per key offset onto the diagonals of a zero band state [W + T][T] (W guard rows take the granules of i < −d, so every job reads its scores row from its aligned start), one ADDX of the band onto the scores |
 | `VitEmbedAddNode` (`EmbedAddRoNode`, opt-in: `VitFrontend(iembed=True)`) | one ADDX of the patch embedding (i16, per-column shifts) and the position table as an int32 stream at 2^-15 (shipped as a Q8.8 weight whose words are the int32 image) into the int32 residual |
 | `ConcatNode`, `SliceNode` | COPY |
+| `TtsPrepNode` (`FoldRoNode`, HOSTOPS_PLAN §11; platform `kernels.rowops.fold`) | one FOLD: the int16 calls whose alpha is an exact 1/m at their shift (`rowops_spec.fold_divisor`, checked over every int16), the source rows unreversed, `[slo, shi)` from the runtime utterance window as `tts_prep` clamps it |
 
 ## 2. Architecture
 
@@ -152,6 +155,7 @@ every counter is sized for the register value.
                                    │   ro_norm   (ring 2 URAM, sums, ro_rsqrt, emit)
                                    │   ro_rope   (head-segment buffer)
                                    │   ro_xpose  (tile ≤ 8 rows x 1024 elements, granule strobes)
+                                   │   ro_fold   (row sequencer -> A's external runs; 8 lanes; packer; its own bursts)
                                    │                                     │
    m_axi_gmem0 AW/W/B ◄─────────────┴─ ro_wr_port (strobes) ◄─ C words ◄─┘
 ```
@@ -161,7 +165,9 @@ every counter is sized for the register value.
   FIFOs so RREADY never drops, bursts of at most 64 beats within 4 KiB,
   registered AXI outputs through register slices, 16 outstanding bursts
   per direction.  The write port gains a per-beat strobe input (all ones
-  for every op but TRANSPOSE).  `ro_rd_arb` merges the two read ports' AR
+  for every op but TRANSPOSE).  A read port can also take its runs from
+  outside (`ext_*`, FOLD): each run (a word address and a count) restarts the
+  burst generator once the previous run's bursts are issued.  `ro_rd_arb` merges the two read ports' AR
   streams onto the one channel (round robin, ARID = port) and routes R
   beats by RID; each port's beats stay in order.
 - **Geometry** is the VectorOPKernel's `geom_t` (blocks × runs × words
@@ -221,6 +227,24 @@ every counter is sized for the register value.
   strobes (two beats when a granule straddles a word, split at a 4 KiB
   boundary; one contiguous run of full words, zero tail lanes, when
   `b_s2 = 2R`).
+- **FOLD** (`ro_fold`, HOSTOPS_PLAN §11) has its own row sequencer: per
+  output row (six cycles of 64-bit element arithmetic, ahead of the
+  datapath through a 16-row descriptor FIFO) the valid part `[max(win_lo,
+  base), min(win_hi, base + n))`, the words it lies in — one run on stream
+  A's external-run input, none for an empty part — and the row's start lane
+  δ.  The datapath is eight 16-bit lanes (a word per cycle, the one op
+  wider than four): a two-word window slides one word per group of eight
+  output columns, lane l takes window element δ + l, the columns outside the
+  valid part are zeroed, then the fold without a divider — `u = 2|x|`, one
+  17 × 25 DSP product with `R = ceil(2^24 / m)` (from the ROPE divider in
+  T_CFG2; 2^24 for x ≥ 0), `q1 = P >> 24` and the remainder-is-zero flag
+  `P mod 2^24 < R`, the round at s + 1 bits (`rowops_spec.fold_recip`,
+  equal to the quotient for every int16 and m ≤ 127).  A packer appends
+  each group (8 columns, a row's last `n mod 8`) to the contiguous output,
+  and FOLD cuts it into its own write bursts (≤ 64 words within 4 KiB,
+  offered on the write port's external-burst input after their last word).
+  A row costs `ceil(n / 8)` cycles plus one to load its first word and one
+  to start.
 - **Resources** — `synth_rowops_rtl` on 2026-10-11 (phase 1, out of
   context at 3.333 ns): **WNS +0.025 ns** (Fmax ≈ 302 MHz), **30 947 LUT**
   (27 107 logic, 3 840 memory), 24 774 FF, 6 RAMB36 (the port FIFOs),
@@ -241,7 +265,15 @@ every counter is sized for the register value.
   whole design closes 4 ns with WNS +0.020 ns / WHS +0.010 ns at 93 969
   LUT (80.2 %), 113 020 FF, 136 / 144 BRAM tiles, 55 / 64 URAM and 833
   DSP — the unit and its interconnect cost 31 351 LUT, 25 188 FF, 5 BRAM
-  tiles, 7 URAM and 121 DSP over `f70ce632a97a`.
+  tiles, 7 URAM and 121 DSP over `f70ce632a97a`.  With FOLD (2026-10-14, out of context at
+  3.333 ns): WNS 0.000 ns — the 20 worst paths are the sigmoid UltraRAMs'
+  outputs, a NORM lane and the transposer's reset, none in `ro_fold` —
+  34 675 LUT, 28 259 FF, 6 RAMB36, 7 URAM, 129 DSP: `ro_fold` 3 546 LUT,
+  3 170 FF, 8 DSP, the read port's external runs ≈ 350 LUT.  In context
+  (production bitstream `de968ccc45da`, 2026-10-15, after the kernels' area
+  pass of `doc/plans/AREA_PLAN.md`): 33 340 LUT (3 930 LUTRAM, 437 SRL),
+  26 712 FF, 6 RAMB36, 7 URAM, 129 DSP; the design closes 4 ns with WNS
+  +0.029 ns / WHS +0.010 ns at 89 547 LUT (76.5 %) and 841 DSP.
 
 ## 3. Performance
 
@@ -252,7 +284,7 @@ unit at 85 % of that rate plus 2.5 µs per call.  NORM on int16 rows runs
 at 4 elements per cycle (half a word): BERT's 25 LayerNorms of 256 × 768
 take 25 × 49 k cycles ≈ 5 ms at 250 MHz against 81 ms on the host.
 Cycle counts of the shipped models' job shapes with ideal memory
-(`make perf_rowops_rtl`, 2026-10-11, the four-lane design; one read+write
+(`make perf_rowops_rtl`, 2026-10-11, the four-lane design, FOLD 2026-10-14; one read+write
 port, 128 bits each way):
 
 | job | cycles | µs at 250 MHz | bound |
@@ -267,6 +299,9 @@ port, 128 bits each way):
 | ROPE 256 × 576, HD 64 | 47 933 | 192 | four lanes + the B load per row |
 | TRANSPOSE R 8, L 64, 96 tiles (the q image) | 18 491 | 74 | one granule per cycle out |
 | TLOAD (the 64 KiB table image, once per bitstream) | 8 236 | 33 | two beats per word |
+| FOLD 32 × 24 × 2050 (Piper's last upsampling stage, m 10) | 199 051 | 796 | eight lanes: 0.99 words per cycle |
+| FOLD 64 × 12 × 1026 | 100 713 | 403 | |
+| FOLD 192 × 2 × 132 (a flow coupling, m 1) | 7 273 | 29 | |
 
 Board figures (the DDR behind the port, the PS port's own rate) follow
 with phase 3.
@@ -280,7 +315,7 @@ with phase 3.
   `rowops_spec.py` in 64- / 128-bit integer arithmetic — checked per case on
   the whole output region (every element, the zeroed tail lanes, no stray
   write), ap_done / interrupt behaviour, no traffic on the unused ID.
-- **Fixtures** `hw/test_data/rowops_test_data/` (28 cases: `manifest.txt`,
+- **Fixtures** `hw/test_data/rowops_test_data/` (36 cases: `manifest.txt`,
   `test_NN_{a,b,p,c}.hex` — every op, kinds, tails, the window, the
   broadcast and per-column parameter block, both norms, ROPE at HD 64,
   contiguous and strobed transposes): written by `scripts/gen_fixtures.py`
@@ -334,7 +369,8 @@ log has no multi-driven-signal warning (`Synth 8-4767`) for the unit.
 2. **Bit-exact and no hang.**  Every op's output equals the oracle's on
    every element; every counter is sized for the register value;
    `ap_done` follows every job, empty or not.
-3. **The contract's layouts** (§1.3): whole-word rows with zero tails,
+3. **The contract's layouts** (§1.3): whole-word rows with zero tails (FOLD:
+   one contiguous run, reading only inside its window),
    strobes only in TRANSPOSE, 16-byte-aligned bases and strides (TRANSPOSE's
    C 2-byte).
 4. **250 MHz in context**: the reset registered and `keep`-copied per

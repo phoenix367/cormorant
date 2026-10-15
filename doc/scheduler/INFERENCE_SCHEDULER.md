@@ -157,6 +157,18 @@ step down (RPU_PLAN §8).  `LlmAttnMerge` / `TtsAttnMerge`, the decode
 step's prep and softmax, `TtsEncOut` (its stats add a float32 bias) and
 the embeddings stay host ops (RPU_PLAN §3.1, §3.3).
 
+[HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md) §11 (2026-10-14) adds the unit's
+op 9, **FOLD**, for the Piper chunk's **`TtsPrep`** (`FoldRoNode`, where the
+platform says `kernels.rowops.fold`, `AXI_ROWOPS_FOLD`): one job gathers
+each output row's window of a source row at any element offset, zeroes the
+columns outside the runtime utterance window (`[slo, shi)`, clamped from the
+`lo` / `hi` inputs in the emitted C exactly as `tts_prep` does) and applies
+LeakyReLU with the re-rounding as `rne(x / (m_x · 2^s))` — the C helper's
+double arithmetic bit for bit for every alpha that
+`rowops_spec.fold_divisor` accepts (an exact 1/m, checked over all 65 536
+inputs per call; 0.1 and 0.01 at every shift Piper uses).  The float32
+sources, reversed channels and a finer output exponent stay host ops.
+
 **Host-CPU ops (C code inside `inference_run()`, no hardware call):**
 - **Softmax, LayerNormalization, Gelu, Transpose, Slice / Split, Concat,
   Resize, Gather, OneHot, Cast** — `src/host_nodes.py`, see [§Host-CPU ops](#host-cpu-ops)
@@ -246,7 +258,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1830 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1840 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1229,7 +1241,8 @@ fixed-size `chunk` entry (TTS_PLAN §4).
 - **Host ops** (`src/tts_nodes.py`, domain `axi.llm`): `TtsPrep`,
   `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm`.  Each has
   a numpy reference and a C helper.  tanh / exp come from libm on both
-  sides.
+  sides.  With the row-ops unit the two-input sums, the interleaves and —
+  with its FOLD op — the int16 `TtsPrep` calls run there (§Row-ops unit).
 - **The C helpers (`TTS_C`)** avoid per-element tests on the in-order A53;
   every fast path is bit-identical (`test/test_tts_ops.py`):
   - two-input sums with power-of-two scales, and the three-input average
@@ -1426,7 +1439,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (440 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (455 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1438,10 +1451,10 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 2.8 %, p90 20.3 % over the
-  1303 ConvKernel calls of the 250 MHz campaign `1cedaf2ed816` (2.9 / 18 %
-  on `f70ce632a97a`, where it was fitted — HOSTOPS_PLAN §9.2 re-scored and
-  kept it), refitted there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
+  DDR latency, x and weight runs; median 2.9 %, p90 22.9 % over the
+  1292 ConvKernel calls of the 250 MHz campaign `de968ccc45da` (2.8 / 20.3 %
+  on `1cedaf2ed816`, 2.9 / 18 % on `f70ce632a97a`, where it was fitted —
+  HOSTOPS_PLAN §9.2 and §11.7 re-scored and kept it), refitted there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
   previous fit 36 % high on the x-bound jobs; 18.3 / 45.8 % over the 1 190 of
   `6436623029f7` before — the
   100 MHz set fitted `c2b2a6e5e50e` to 3.1 / 14.6 %, but at 250 MHz a DDR
@@ -1450,7 +1463,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 315 predicted.
+  board (0.12 ms at 250 MHz), 34 300 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

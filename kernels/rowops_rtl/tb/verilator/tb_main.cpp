@@ -77,6 +77,9 @@ struct Case {
   // random-case parameter choices (kept so a P image can be built once the job is placed)
   std::vector<ro::Param> params;
   bool fixture = false;
+  // FOLD: the source rows' length (random cases) and the offset of a within region A
+  // (a reversed stride points a at the last channel; any element alignment)
+  uint64_t fold_L = 0, a_off = 0;
 };
 
 static uint64_t round16(uint64_t b) { return (b + 15) & ~15ull; }
@@ -94,6 +97,16 @@ static void extents(Case& t) {
   if (op == ro::TLOAD) {
     t.ra.bytes = stream_extent(j, j.a_s1, j.a_s2, (uint64_t)kbytes(j.ak()) * j.n);
     t.rb.bytes = 0; t.rc.bytes = 0; t.rp.bytes = 0;
+    return;
+  }
+  if (op == ro::FOLD) {
+    // the source: c2 rows of fold_L int16 |a_s2| apart (a fixture: its image), plus the
+    // element offset; the output one contiguous run
+    const uint64_t s2 = (uint64_t)std::llabs((int64_t)(int32_t)j.a_s2);
+    const uint64_t L = t.fold_L ? t.fold_L : std::min<uint64_t>(j.win_hi, 1u << 20);
+    t.ra.bytes = std::max<uint64_t>(round16((uint64_t)(j.c2 ? j.c2 - 1 : 0) * s2 + 2 * L + 16), t.ra.img.size());
+    t.rb.bytes = 0; t.rp.bytes = 0;
+    t.rc.bytes = round16(2ull * j.c2 * j.c1 * j.n);
     return;
   }
   if (op == ro::XPOSE) {
@@ -252,7 +265,7 @@ struct Tb {
     ro::Job& j = t.j;
     const uint32_t op = j.code();
     // ---- place data ---------------------------------------------------------------
-    fill(j.a, t.ra, op == ro::XPOSE || op == ro::ROPE ? ro::I16 : j.ak(), t.data_mode);
+    fill(j.a - t.a_off, t.ra, op == ro::XPOSE || op == ro::ROPE ? ro::I16 : j.ak(), t.data_mode);
     if (t.rb.bytes) fill(j.b, t.rb, op == ro::ROPE ? ro::I32 : j.bk(), t.data_mode);
     if (t.rp.bytes) {
       if (!t.rp.img.empty()) fill(j.p, t.rp, ro::I16, 0);
@@ -369,7 +382,7 @@ static void place(Case& t, std::mt19937& rng) {
     g_region &= ~15ull;
     return base;
   };
-  t.j.a = next(t.ra.bytes + 64);
+  t.j.a = next(t.ra.bytes + 64) + t.a_off;
   t.j.b = next(t.rb.bytes + 64);
   t.j.c = next(t.rc.bytes + 64);
   t.j.p = next(t.rp.bytes + 64);
@@ -397,8 +410,9 @@ static Case random_case(std::mt19937& rng) {
   Case t;
   ro::Job& j = t.j;
   const uint32_t pick = U(0, 99);
-  const uint32_t code = pick < 20 ? ro::ADDX : pick < 30 ? ro::COPY : pick < 38 ? ro::DEQUANT :
-                        pick < 58 ? ro::MULACT : pick < 78 ? ro::NORM : pick < 90 ? ro::ROPE : ro::XPOSE;
+  const uint32_t code = pick < 18 ? ro::ADDX : pick < 27 ? ro::COPY : pick < 34 ? ro::DEQUANT :
+                        pick < 51 ? ro::MULACT : pick < 68 ? ro::NORM : pick < 78 ? ro::ROPE :
+                        pick < 88 ? ro::XPOSE : ro::FOLD;
   // shape
   const uint32_t shape = U(0, 9);
   j.n  = shape <= 1 ? U(1, 24) : shape <= 6 ? U(1, 800) : shape <= 8 ? U(1, 4096) : 8 * U(1, 128);
@@ -494,6 +508,31 @@ static Case random_case(std::mt19937& rng) {
     j.a_s1 = stride(2ull * j.n); j.a_s2 = block_stride(j.a_s1);
     j.b_s1 = stride(8ull * HD);  j.b_s2 = block_stride(j.b_s1);
     j.c_s1 = stride(2ull * j.n); j.c_s2 = block_stride(j.c_s1);
+  } else if (code == ro::FOLD) {
+    // TtsPrep's shapes and their edges: rows of W = n columns w0 apart from s0 (halos,
+    // negative starts), windows inside / across / outside the rows, reversed channels,
+    // unaligned channel rows, m 1 .. 127, s 0 .. 15
+    const uint32_t L = shape <= 1 ? U(1, 40) : shape <= 7 ? U(8, 1200) : U(1000, 5000);
+    j.n  = shape <= 1 ? U(1, 20) : U(1, std::min<uint32_t>(L + 40, 2100));
+    j.c1 = U(1, shape <= 1 ? 30 : 8);
+    j.c2 = U(1, 4);
+    j.b_s1 = U(0, 2) ? std::max<uint32_t>(1, j.n - U(0, std::min<uint32_t>(j.n - 1, 40))) : U(1, 3 * j.n);
+    j.b_s2 = (uint32_t)((int32_t)U(0, 80) - 40);
+    uint32_t lo = U(0, 3) ? U(0, L / 3) : 0, hi = U(0, 3) ? U(lo, L) : L;
+    if (U(0, 9) == 0) std::swap(lo, hi);                        // an inverted window: nothing read
+    j.win_lo = lo; j.win_hi = hi;
+    static const uint32_t ms[] = {1, 10, 100, 7, 127, 2};
+    const uint32_t m = U(0, 3) ? ms[U(0, 5)] : U(1, 127);
+    const uint32_t sh = U(0, 2) ? U(0, 6) : U(0, 15);
+    j.aux = sh | (m << 4);
+    const uint32_t s2 = 2 * (L + (U(0, 3) ? U(0, 9) : 0));
+    const bool rev = U(0, 4) == 0;
+    j.a_s2 = rev ? (uint32_t)(-(int32_t)s2) : s2;
+    j.op = code;
+    t.fold_L = L;
+    t.a_off = (rev ? (uint64_t)(j.c2 - 1) * s2 : 0) + 2 * U(0, 7);
+    t.data_mode = (int)U(1, 2);
+    t.params.clear();
   } else {                                                      // XPOSE
     const uint32_t R = U(1, 8);
     j.n = shape <= 1 ? U(1, 16) : U(1, 512);
@@ -649,6 +688,22 @@ int main(int argc, char** argv) {
       {"perf_rope_256x576",       opword(ro::ROPE, ro::I16, ro::I32, ro::I16, true, false), 576, 256},
       {"perf_xpose_q_8x64_x96",   opword(ro::XPOSE, ro::I16, ro::I16, ro::I16, false, false), 64, 96},
     };
+    // Piper's TtsPrep calls as FOLD jobs: the last upsampling stage, the one before, a flow coupling
+    struct F { const char* l; uint32_t L, nch, rows, w0, hl, hr, m, s; };
+    const F fs[] = {
+      {"perf_fold_32x24x2050",  49152, 32, 24, 2048, 1, 1, 10, 0},
+      {"perf_fold_64x12x1026",  12288, 64, 12, 1024, 1, 1, 10, 1},
+      {"perf_fold_192x2x132",     256, 192, 2, 128, 2, 2, 1, 4},
+    };
+    for (const F& f : fs) {
+      Case t;
+      ro::Job& j = t.j;
+      j.op = ro::FOLD; j.n = f.w0 + f.hl + f.hr; j.c1 = f.rows; j.c2 = f.nch;
+      j.a_s2 = 2 * f.L; j.b_s1 = f.w0; j.b_s2 = (uint32_t)(-(int32_t)f.hl);
+      j.win_lo = 0; j.win_hi = f.L; j.aux = f.s | (f.m << 4);
+      t.fold_L = f.L; t.data_mode = 1; t.label = f.l;
+      cases.push_back(t);
+    }
     for (const P& p : ps) {
       Case t;
       for (int tries = 0; tries < 20000; tries++) {
@@ -707,7 +762,7 @@ int main(int argc, char** argv) {
       // strides for the (possibly reshaped) job
       ro::Job& j = t.j;
       const uint32_t op = j.code();
-      if (op != ro::XPOSE) {
+      if (op != ro::XPOSE && op != ro::FOLD) {
         auto rb = [&](ro::Kind k) { return (uint32_t)round16((uint64_t)kbytes(k) * j.n); };
         if (j.a_s1 < rb(j.ak())) j.a_s1 = rb(j.ak());
         if (op == ro::ROPE) { if (j.b_s1 < round16(8ull * (j.aux & 0xFFF))) j.b_s1 = (uint32_t)round16(8ull * (j.aux & 0xFFF)); }

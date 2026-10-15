@@ -31,9 +31,9 @@ module mm_walker
 );
   logic        run;
   logic [31:0] bi, n_off, c0;
-  logic [63:0] a_bi, b_bi, c_bi;    // batch slice bases
-  logic [63:0] a_pn, c_pn;          // panel bases
-  logic [63:0] c_st;                // chunk base
+  logic [AB-1:0] a_bi, b_bi, c_bi;  // batch slice bases
+  logic [AB-1:0] a_pn, c_pn;        // panel bases
+  logic [AB-1:0] c_st;              // chunk base
   logic        reuse;               // A is identical for every batch slice
 
   logic [31:0] n_left, m_left;
@@ -71,33 +71,33 @@ module mm_walker
       bi      <= '0;
       n_off   <= '0;
       c0      <= '0;
-      a_bi    <= a_base;  a_pn <= a_base;
-      b_bi    <= b_base;
-      c_bi    <= c_base;  c_pn <= c_base;  c_st <= c_base;
+      a_bi    <= a_base[AB-1:0];  a_pn <= a_base[AB-1:0];
+      b_bi    <= b_base[AB-1:0];
+      c_bi    <= c_base[AB-1:0];  c_pn <= c_base[AB-1:0];  c_st <= c_base[AB-1:0];
       reuse   <= (a_stride == '0) && (cfg.n <= R);
     end else if (run && step_ready) begin
       n_steps <= n_steps + 32'd1;
       if (!last_ch) begin
         c0   <= c0 + {22'b0, cfg.mc_max};
-        c_st <= c_st + {53'b0, cfg.mc_max, 1'b0};
+        c_st <= c_st + AB'({cfg.mc_max, 1'b0});
       end else begin
         c0 <= '0;
         if (!last_pn) begin
           n_off <= n_off + 32'(R);
           // next panel: R rows further in A (R * k elements) and C (R * m)
-          a_pn  <= a_pn + {50'b0, cfg.k, 1'b0} * 64'(R);
-          c_pn  <= c_pn + {31'b0, cfg.m, 1'b0} * 64'(R);
-          c_st  <= c_pn + {31'b0, cfg.m, 1'b0} * 64'(R);
+          a_pn  <= a_pn + AB'({cfg.k, 1'b0}) * AB'(R);
+          c_pn  <= c_pn + AB'({cfg.m, 1'b0}) * AB'(R);
+          c_st  <= c_pn + AB'({cfg.m, 1'b0}) * AB'(R);
         end else begin
           n_off <= '0;
           if (!last_bi) begin
             bi   <= bi + 32'd1;
-            a_bi <= a_bi + {31'b0, a_stride, 1'b0};
-            a_pn <= a_bi + {31'b0, a_stride, 1'b0};
-            b_bi <= b_bi + {31'b0, b_stride, 1'b0};
-            c_bi <= c_bi + {31'b0, c_stride, 1'b0};
-            c_pn <= c_bi + {31'b0, c_stride, 1'b0};
-            c_st <= c_bi + {31'b0, c_stride, 1'b0};
+            a_bi <= a_bi + AB'({a_stride, 1'b0});
+            a_pn <= a_bi + AB'({a_stride, 1'b0});
+            b_bi <= b_bi + AB'({b_stride, 1'b0});
+            c_bi <= c_bi + AB'({c_stride, 1'b0});
+            c_pn <= c_bi + AB'({c_stride, 1'b0});
+            c_st <= c_bi + AB'({c_stride, 1'b0});
           end else begin
             run  <= 1'b0;
             done <= 1'b1;

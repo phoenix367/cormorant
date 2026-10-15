@@ -25,7 +25,8 @@ using i64  = int64_t;
 using u64  = uint64_t;
 using i128 = __int128;
 
-enum Op : uint32_t { COPY = 1, ADDX = 2, DEQUANT = 3, MULACT = 4, NORM = 5, ROPE = 6, XPOSE = 7, TLOAD = 8 };
+enum Op : uint32_t { COPY = 1, ADDX = 2, DEQUANT = 3, MULACT = 4, NORM = 5, ROPE = 6, XPOSE = 7, TLOAD = 8,
+                     FOLD = 9 };
 enum Kind : uint32_t { I16 = 0, I32 = 1, F32 = 2 };
 enum Flag : uint32_t { F_B_EN = 1u << 12, F_P_BCAST = 1u << 13, F_P_KEEP = 1u << 14,
                        F_RELU = 1u << 15, F_NORM_LN = 1u << 16 };
@@ -132,6 +133,15 @@ inline i64 silu_q(i64 gv) {
   return (i64)rne_shr((i128)gv * sig, G_BITS + SIG_BITS - SILU_BITS);
 }
 
+// rne(x / (m_x 2^s)), m_x = m for x < 0, 1 for x >= 0 (rowops_spec.fold_elem: the quotient;
+// the RTL's divider-free form is rowops_spec.fold_recip, equal for every int16, m <= 127)
+inline i64 fold_elem(i64 x, uint32_t m, uint32_t s) {
+  const i64 u = x < 0 ? -x : x, den = (i64)(x < 0 ? m : 1u) << s;
+  i64 q = u / den, r = u - q * den;
+  q += (2 * r > den || (2 * r == den && (q & 1))) ? 1 : 0;
+  return x < 0 ? -q : q;
+}
+
 inline uint32_t float_bits(i64 v, int sh_c) {   // float32(v * 2^-sh_c), IEEE round to nearest even
   if (v == 0) return 0;
   bool neg = v < 0;
@@ -197,6 +207,26 @@ inline std::vector<Write> run(const Job& j, const Mem& m) {
   std::vector<Write> out;
   const uint32_t op = j.code();
   const uint32_t n = j.n;
+  if (op == FOLD) {
+    // channel k reads the int16 row at a + k a_s2 (signed); row r, column c reads its
+    // column b_s2 + r b_s1 + c (b_s2 signed) where that lies in [win_lo, win_hi), else 0;
+    // the output one contiguous run at c, the last word's lanes past the end zero
+    const uint32_t sh = j.aux & 15, dv = (j.aux >> 4) & 127;
+    if (n == 0 || j.c1 == 0 || j.c2 == 0 || dv == 0) return out;
+    Write w{j.c, {}};
+    for (u64 k = 0; k < j.c2; k++)
+      for (u64 r = 0; r < j.c1; r++)
+        for (u64 c = 0; c < n; c++) {
+          const i64 col = (i64)(int32_t)j.b_s2 + (i64)r * j.b_s1 + (i64)c;
+          i64 y = 0;
+          if (col >= (i64)j.win_lo && col < (i64)j.win_hi)
+            y = fold_elem(m.rd16(j.a + (u64)((i64)k * (int32_t)j.a_s2 + 2 * col)), dv, sh);
+          put(w.bytes, y, I16);
+        }
+    while (w.bytes.size() % 16) w.bytes.push_back(0);
+    out.push_back(std::move(w));
+    return out;
+  }
   if (n == 0 || j.c1 == 0 || j.c2 == 0 || n > 4096) return out;
   const Kind ak = j.ak(), bk = j.bk(), ck = j.ck();
   const bool ben = j.b_en(), bcast = j.p_bcast();

@@ -17,6 +17,7 @@ set rtl_files [list \
   $root/rtl/ro_norm.sv \
   $root/rtl/ro_rope.sv \
   $root/rtl/ro_xpose.sv \
+  $root/rtl/ro_fold.sv \
   $root/rtl/ro_core.sv \
   $root/rtl/RowOpsKernel.v \
 ]

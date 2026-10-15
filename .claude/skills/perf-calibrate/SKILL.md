@@ -25,7 +25,11 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | a host-op kind appeared or vanished (an op moved onto a kernel, a new host node — `simulate` reports an unpriced node) | profile every shipped model in the same board window, then `host --merge` with all the profiles (§3); the `board-window` skill does both |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/1cedaf2ed816** (2026-10-12), `f70ce632a97a`'s design with the RowOpsKernel
+Current model: **kv260/de968ccc45da** (2026-10-15), `1cedaf2ed816`'s design with the row-ops unit's
+FOLD (HOSTOPS_PLAN §11) after the kernels' area pass (AREA_PLAN): `cases` (1703, the FOLD calls with
+`kernels.rowops.fold` true) with `1cedaf2ed816`'s 179 ConvKernel refinement calls appended to the case
+list, `run`, `fit`, then three refinement rounds (+103, +84, +31) → 2100 exact calls, repeat spread
+median 0.069 %; `host.json` unchanged.  The model before, kv260/1cedaf2ed816 (2026-10-12), `f70ce632a97a`'s design with the RowOpsKernel
 (the row-ops unit, HOSTOPS_PLAN phase 3) on HP0: a plain campaign — `cases` (1530: the unit's 37
 shipped calls form the new `rowops` family), `run --config perf_config.json --stop-server` (two
 passes of ~2 min; the bench's `calib_runner` needs all five kernels' drivers), `fit`, then `cases
@@ -116,7 +120,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 1cedaf2ed816 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # de968ccc45da today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`

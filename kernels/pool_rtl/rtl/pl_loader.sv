@@ -50,7 +50,7 @@ module pl_loader
   logic [6:0]  g_len;
 
   typedef struct packed {
-    logic [59:0] waddr;
+    logic [WA-1:0] waddr;
     lbd_t        d;
   } run_t;
 
@@ -64,7 +64,7 @@ module pl_loader
   assign g_nw  = g_sum[6:3];
 
   assign rq_in_valid = g_act;
-  assign rq_in.waddr = j.x_w + 60'(g_run_off[31:3]);
+  assign rq_in.waddr = j.x_w[WA-1:0] + WA'(g_run_off[31:3]);
   assign rq_in.d     = '{slot: g_ih[3:0], ch: g_c, shift: g_run_off[2:0], nw: g_nw,
                          row_last: (g_c == g_clast)};
   assign cq_ready    = !g_act;
@@ -118,10 +118,10 @@ module pl_loader
   logic [OW-1:0] outs;             // bursts issued, last beat not yet received
   logic          second;           // the run's second burst is next
   logic          h_v, h_split, h_take;
-  logic [59:0]   h_waddr, h_waddr2;
+  logic [WA-1:0] h_waddr, h_waddr2;
   logic [3:0]    h_len1, h_len2;
   lbd_t          h_d;
-  logic [59:0]   b_waddr;
+  logic [WA-1:0] b_waddr;
   logic [3:0]    b_len;
   logic          b_lastb;          // the run's last burst
   logic          dq_in_ready, issue, wf_pop;
@@ -138,7 +138,7 @@ module pl_loader
       logic [8:0] to_4k;
       to_4k    = 9'd256 - {1'b0, rq.waddr[7:0]};
       h_waddr  <= rq.waddr;
-      h_waddr2 <= {rq.waddr[59:8] + 52'd1, 8'd0};      // = waddr + to_4k
+      h_waddr2 <= {rq.waddr[WA-1:8] + (WA-8)'(1), 8'd0};   // = waddr + to_4k
       h_split  <= (9'(rq.d.nw) > to_4k);
       h_len1   <= (9'(rq.d.nw) > to_4k) ? to_4k[3:0] : rq.d.nw;
       h_len2   <= rq.d.nw - to_4k[3:0];
@@ -175,7 +175,7 @@ module pl_loader
 
   pl_rs #(.W(72)) u_ar (
     .clk, .rst,
-    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({b_waddr, 4'b0, 8'(4'(b_len - 4'd1))}),
+    .in_valid  (issue),   .in_ready  (ar_in_ready), .in_data ({60'(b_waddr), 4'b0, 8'(4'(b_len - 4'd1))}),
     .out_valid (arvalid), .out_ready (arready),     .out_data ({araddr, arlen})
   );
 

@@ -272,13 +272,14 @@ src/
                          model); <= 5 % -> the R5, else the A53 (INFERENCE_RPU_RECOMMENDED in
                          the header, per entry; report.md "Cortex-R5") — RPU_PLAN §9.3
   rowops_spec.py         the row-ops unit's integer specification (rne / sat16, rsqrt and sigmoid
-                         tables, layer_norm / rms_norm / silu_mul / rope, the register constants,
+                         tables, layer_norm / rms_norm / silu_mul / rope, fold, the register constants,
                          the parameter block and the 64 KiB table image)
   rowops_nodes.py        its kernel nodes (LayerNormRoNode; ResAdd / RMSNorm / SiluMul and the prefill
                          AttnPrep — RoPE, the q image, the KV caches — for Llama; ResAddBias /
                          LayerNorm32 / VitAttnPrep for the vision and TTS encoders, TtsRowPrep for
                          the TTS encoder; RPU_PLAN A1: Transpose, TtsSum / TtsInterleave / TtsRelBand,
-                         Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle) + the
+                         Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle; FOLD,
+                         op 9: TtsPrep as FoldRoNode where the platform says kernels.rowops.fold) + the
                          factories graph.py merges over the host ops when the platform has the unit
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
@@ -318,7 +319,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              87 pytest modules, 1830 tests, all pass (test_bert_base.py
+  test_*.py              87 pytest modules, 1840 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

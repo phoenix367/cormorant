@@ -49,7 +49,7 @@ module cv_ywriter
   logic [2:0]  r_sh;                       // lanes before the run in its first word
   logic [8:0]  r_len;
   logic [5:0]  r_nin, r_nout, r_k;         // input words, output words, next output word
-  logic [59:0] r_waddr;                    // word address of output word r_k
+  logic [WA-1:0] r_waddr;                    // word address of output word r_k
   logic [5:0]  r_brem;                     // words left in the current burst
   logic [BW-1:0] r_prev;
 
@@ -100,13 +100,13 @@ module cv_ywriter
         r_nin   <= 6'((run_len + 9'd7) >> 3);
         r_nout  <= 6'((9'(run_e[2:0]) + run_len + 9'd7) >> 3);
         r_k     <= '0;
-        r_waddr <= j.y_w + 60'(run_e[31:3]);
+        r_waddr <= j.y_w + WA'(run_e[31:3]);
         r_brem  <= '0;
         r_prev  <= '0;
       end
     end else if (go) begin
       r_k     <= r_k + 6'd1;
-      r_waddr <= r_waddr + 60'd1;
+      r_waddr <= r_waddr + WA'(1);
       r_prev  <= in_w;
       r_brem  <= (bstart ? b_len : r_brem) - 6'd1;
       if (r_k + 6'd1 == r_nout) r_act <= 1'b0;
@@ -125,13 +125,13 @@ module cv_ywriter
     .clk, .rst, .in_valid (p_v), .in_ready (wf_in_ready), .in_data (p_d),
     .out_valid (wvalid), .out_ready (wready), .out_data ({wlast, wstrb, wdata}), .count (wf_n)
   );
-  logic [67:0] aw_q;
-  cv_fifo #(.W(68), .D(8), .BRAM(1'b0)) u_aw (
+  logic [WA+7:0] aw_q;
+  cv_fifo #(.W(WA + 8), .D(8), .BRAM(1'b0)) u_aw (
     .clk, .rst, .in_valid (go && bstart), .in_ready (aw_in_ready),
     .in_data ({r_waddr, 2'b0, b_len}), .out_valid (awvalid), .out_ready (awready),
     .out_data (aw_q), .count (aw_n)
   );
-  assign awaddr = {aw_q[67:8], 4'b0};
+  assign awaddr = {60'(aw_q[WA+7:8]), 4'b0};
   assign awlen  = {2'b0, 6'(aw_q[5:0] - 6'd1)};
 
   assign bready = 1'b1;

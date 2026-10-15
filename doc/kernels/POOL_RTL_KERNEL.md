@@ -29,7 +29,9 @@ pool_h, pool_w in 1..7; the dilated window at most 16 rows and 64 columns
 (`(pool_h − 1)·dil_h < 16`, `(pool_w − 1)·dil_w < 64`).  Outside it the
 kernel reads and writes nothing and returns at once — and so it does when
 batch, channels, out_h or out_w is 0 (the HLS kernel's behaviour there is
-not defined).
+not defined).  Byte addresses must lie below 2^48: the address arithmetic is 48 bits
+wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14;
+the PS ports address 40 bits, SMMU IOVAs 48).
 
 **Arithmetic** per Q8.8 element (raw int16), accumulator `ap_fixed<32,16>`
 (raw Q16.16, wrapping); the first tap of a window replaces the accumulator:
