@@ -923,6 +923,9 @@ POLICIES = {
                                       inorm=True, isilu=True, irope="prefill"),
     "pow2+sink+p12+vsmx+rowops": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill", res_bits=15,
                                       inorm=True, isilu=True, irope="prefill"),
+    # RPU_PLAN §13 (track A2): the decode prep on the unit too — every step's RoPE the integer one
+    "pow2+sink+p12+vsmx+rowops+drope": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill",
+                                            res_bits=15, inorm=True, isilu=True, irope=True),
 }
 DEFAULT_POLICIES = ("bf16,q88,res_float,res_float+sink,fit+sink,pow2+sink,pow2+sink+p12,pow2+sink+hattn,"
                     "pow2+p12,pow2_tensor+sink+p12,pow2+sink+p12+emb_q88,pow2+sink+p12+fw")

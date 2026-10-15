@@ -25,6 +25,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -38,7 +39,8 @@ from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
 from src.llm_entries import entry_graphs
-from src.llm_nodes import (LlmAttnConvNode, LlmAttnSoftmaxNode, LlmResAddNode, LlmRMSNormNode, LlmSelectRowNode)
+from src.llm_nodes import (LlmAttnConvNode, LlmAttnMergeNode, LlmAttnSoftmaxNode, LlmResAddNode,
+                            LlmRMSNormNode, LlmSelectRowNode)
 from src.nodes import MatmulConvNode, MatmulNode
 from test_cache_coherency import CoherencyChecker
 
@@ -361,6 +363,41 @@ class TestSimVsStudyFpgaDecode(TestSimVsStudy):
         src = CodeGenerator(g, model_path="llama_tiny_decode.onnx").generate_source()
         self.assertIn("llm_cache_flush_rows(", src)
         self.assertNotIn("    llm_cache_flush(kv_", src)
+
+    def test_decode_merge_in_place(self):
+        """RPU_PLAN §13 (A2.0): at T = 1 each P.V output is a contiguous piece
+        of the merged tensor — the P.V calls write it there and the merge
+        emits nothing; the merged buffer is live from the first P.V call;
+        AXI_INPLACE_MERGE=0 keeps the host copy; prefill keeps it too (its
+        rows interleave across the heads)."""
+        fe = self.TINY()[3]
+        g = OnnxGraph(fe.entry("decode"), fuse_act=True, s2d_stem=True)
+        cg = CodeGenerator(g, model_path="llama_tiny_decode.onnx")
+        merges = [sn for sn in g.nodes if isinstance(sn, LlmAttnMergeNode)]
+        self.assertTrue(merges and all(sn.in_place for sn in merges))
+        src = cg.generate_source()
+        self.assertNotIn("llm_attn_merge(_o", src)
+        self.assertEqual(src.count("merged in place"), len(merges))
+        views = cg._view_aliases
+        ev = cg._compute_event_stream()
+        start = {e[1]: i for i, e in enumerate(ev) if e[0] in ("start", "start_sync", "cpu")}
+        iv = cg._compute_live_intervals()
+        for m in merges:
+            G = m.H // m.KV
+            self.assertEqual([views[t.onnx_name][1:] for t in m.inputs],
+                             [(gi * G * m.HD, G * m.HD) for gi in range(m.KV)])
+            pvs = [sn.index for sn in g.nodes
+                   if isinstance(sn, LlmAttnConvNode) and sn.output in m.inputs]
+            self.assertEqual(len(pvs), m.KV)
+            self.assertLessEqual(iv[m.output.onnx_name][0], min(start[i] for i in pvs))
+            self.assertTrue(all(t.onnx_name not in iv for t in m.inputs))
+        with mock.patch.dict(os.environ, {"AXI_INPLACE_MERGE": "0"}):
+            g0 = OnnxGraph(fe.entry("decode"), fuse_act=True, s2d_stem=True)
+            src0 = CodeGenerator(g0, model_path="llama_tiny_decode.onnx").generate_source()
+        self.assertEqual(src0.count("llm_attn_merge(_o"), len(merges))
+        gp = OnnxGraph(fe.entry("prefill", 16), fuse_act=True, s2d_stem=True)
+        CodeGenerator(gp, model_path="llama_tiny_prefill.onnx")
+        self.assertFalse(any(sn.in_place for sn in gp.nodes if isinstance(sn, LlmAttnMergeNode)))
 
 
 class TestOtherShapes(unittest.TestCase):

@@ -45,7 +45,7 @@ from ..graph   import OnnxGraph
 from ..nodes    import (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
                         ReshapeNode, SpaceToDepthNode, SchedulerError)
 from ..host_nodes import HostNode, SliceNode
-from ..llm_nodes import LlmAttnConvNode, LlmKernelNode
+from ..llm_nodes import LlmAttnConvNode, LlmAttnMergeNode, LlmKernelNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
 from ..tensor  import TensorInfo
@@ -78,6 +78,7 @@ class _CoreMixin:
         self._layouts             = self._compute_tensor_layouts()
         self._alloc_sizes         = {k: v.alloc for k, v in self._layouts.items()}
         self._demote_strided_views()
+        self._merge_in_place()
 
     # ------------------------------------------------------------------
     # Buffer aliases: Reshape-family nodes and Slice views
@@ -88,16 +89,31 @@ class _CoreMixin:
         """A Slice piece emitted as a zero-cost sub-buffer view."""
         return isinstance(sn, SliceNode) and sn.is_view
 
+    @staticmethod
+    def _is_inplace_merge(sn) -> bool:
+        """An attention merge whose inputs are views of its output: the P.V
+        calls wrote pv in head order, nothing runs (_merge_in_place)."""
+        return isinstance(sn, LlmAttnMergeNode) and sn.in_place
+
     @classmethod
     def _is_alias_node(cls, sn) -> bool:
         """Nodes that do no work at run time: their output shares (part of)
-        the source's buffer (ReshapeNode, Slice view)."""
-        return isinstance(sn, ReshapeNode) or cls._is_view(sn)
+        the source's buffer (ReshapeNode, Slice view), or their inputs are
+        pieces of the output's (an in-place attention merge)."""
+        return isinstance(sn, ReshapeNode) or cls._is_view(sn) or cls._is_inplace_merge(sn)
 
     def _alias_source_map(self) -> dict:
-        """{output onnx_name: source onnx_name} for every alias node."""
-        return {sn.output.onnx_name: sn.inputs[0].onnx_name
-                for sn in self._graph.nodes if self._is_alias_node(sn)}
+        """{onnx_name: onnx_name of the buffer it lives in} for every alias:
+        a Reshape / Slice view's output -> its source, an in-place merge's
+        inputs -> its output."""
+        out = {}
+        for sn in self._graph.nodes:
+            if self._is_inplace_merge(sn):
+                for t in sn.inputs:
+                    out[t.onnx_name] = sn.output.onnx_name
+            elif self._is_alias_node(sn):
+                out[sn.output.onnx_name] = sn.inputs[0].onnx_name
+        return out
 
     def _alias_root(self, name: str) -> str:
         """Follow Reshape aliases and Slice views down to the buffer that
@@ -131,6 +147,9 @@ class _CoreMixin:
                 root = self._reshape_root(sn.inputs[0].onnx_name)
                 result[sn.output.onnx_name] = (tensors[root].c_name, sn.offset,
                                                sn.output.numel)
+            elif self._is_inplace_merge(sn):
+                for t, off in zip(sn.inputs, sn.view_offsets(), strict=True):
+                    result[t.onnx_name] = (sn.output.c_name, off, t.numel)
         return result
 
     def _demote_strided_views(self) -> None:
@@ -145,6 +164,42 @@ class _CoreMixin:
                 root = self._reshape_root(sn.inputs[0].onnx_name)
                 if not (flat(root) and flat(sn.output.onnx_name)):
                     sn.is_view = False
+
+    def _merge_in_place(self) -> None:
+        """RPU_PLAN §13 (A2.0): an attention merge whose inputs are contiguous
+        pieces of its output (LlmAttnMergeNode.view_offsets: a decode step) is
+        done by the P.V calls themselves — each o_g becomes a view of pv at its
+        group's offset and the merge emits nothing.  Only where every o_g is a
+        flat pool intermediate written by one P.V call and read by the merge
+        alone, pv a flat pool intermediate, every offset 64-byte aligned.
+        ``AXI_INPLACE_MERGE=0`` keeps the host copy."""
+        import os
+        if os.environ.get("AXI_INPLACE_MERGE", "1") == "0":
+            return
+        inter = {t.onnx_name for t in self._graph.intermediate_tensors}
+        producer, readers = {}, {}
+        for sn in self._graph.nodes:
+            producer[sn.output.onnx_name] = sn
+            for t in sn.inputs:
+                readers.setdefault(t.onnx_name, []).append(sn)
+        bpe = self._dtype.bytes_per_elem
+
+        def flat(name):
+            lay = self._layouts.get(name)
+            return lay is None or (lay.n_chunks == 1 and lay.alloc == lay.numel)
+        for sn in self._graph.nodes:
+            if not isinstance(sn, LlmAttnMergeNode):
+                continue
+            offs = sn.view_offsets()
+            pv = sn.output.onnx_name
+            ok = (offs is not None and pv in inter and flat(pv)
+                  and len({t.onnx_name for t in sn.inputs}) == len(sn.inputs))
+            for t, off in zip(sn.inputs, offs or [], strict=False):
+                n = t.onnx_name
+                ok = ok and (n in inter and flat(n) and (off * bpe) % 64 == 0
+                             and isinstance(producer.get(n), LlmAttnConvNode)
+                             and readers.get(n) == [sn])
+            sn.in_place = bool(ok)
 
     def _compute_tensor_layouts(self) -> dict:
         """
@@ -541,9 +596,13 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if self._is_alias_node(sn):
                 continue
-            out = sn.output.onnx_name
+            # an in-place merge's inputs are pieces of its output: their P.V
+            # calls write into it, the first of them starts its life
+            out = resolve(sn.output.onnx_name)
             if out in intermediates:
-                producer_of[out] = sn.index
+                prev = producer_of.get(out)
+                if prev is None or start_event.get(sn.index, 1 << 62) < start_event.get(prev, 1 << 62):
+                    producer_of[out] = sn.index
             for inp in sn.inputs:
                 src = resolve(inp.onnx_name)
                 if src in intermediates and src != out:

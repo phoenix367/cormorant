@@ -105,8 +105,8 @@ image (hence `qk_kw = 1`), a COPY into the K cache and TRANSPOSEs into the
 P·V image — the 16K-key blocks inside [pos, pos + n) as R = K tiles, the
 two boundary blocks as byte-strobed single-element granules; the
 calls are priced at pos = 0, n = T; the numerics are the study's `irope`.
-The decode step's `LlmAttnPrep` (one row) and `LlmAttnMerge` (a 128-byte-row
-gather the unit would not beat) stay host ops; the decode prep invalidates
+The decode step's `LlmAttnPrep` (one row) stays a host op; its
+`LlmAttnMerge` costs nothing since RPU_PLAN §13 (A2.0, below); the decode prep invalidates
 the V-cache lines it writes 2-byte slots into (`llm_cache_inval_rows`): the
 unit wrote them through a port that does not snoop the CPU caches.  The vision encoder's and the Piper encoder's
 `VitAttnPrep` (`VitAttnPrepRoNode`, phase 4b: the q / k / v bias adds as
@@ -258,7 +258,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1840 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1841 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1139,7 +1139,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
 | `LlmAttnSoftmax` with `vsmx = 1` (VectorOPKernel, `LlmAttnSoftmaxVopNode`) | the prefill under policy `…+vsmx` (`LlamaFrontend(vsmx=True)`): per head h' one `OP_SOFTMAX_T` call — s_g columns `h'·T … +T` (row stride `G·T`) → P_g rows `h'·T … +T` at row stride keys, over keys = roundup(pos + n, Q), row t valid over keys `j < min(keys, pos + 1 + t)` (`smx_mask` valid0 = pos + 1, period = T); the integer softmax of `src/vectorop_smx.py` with Cm / Cs from f_s and 1/√HD.  Padded rows t ≥ n are computed too (they feed padded rows only); decode steps keep the host op |
 | `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
-| `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw) |
+| `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw); **in place** where every o_g is a contiguous piece of pv — a decode step (T = 1): o_g = pv[g·G·HD …], so `CodeGenerator._merge_in_place` makes each o_g a view of pv at that offset (the P·V call writes there), the merge emits nothing and pv lives from the first P·V call (RPU_PLAN §13, A2.0: −0.26 / −0.54 ms per token on SmolLM2-135M / 360M); `AXI_INPLACE_MERGE=0` keeps the copy.  Prefill and vision rows interleave across the heads: they need ConvKernel's y pattern (A2.1) |
 
 RoPE uses float32 cos / sin tables `[C][HD/2]` computed by the frontend
 exactly as `llm_study.rope_tables` (host tables).  The ops are the numeric

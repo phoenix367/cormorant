@@ -183,7 +183,8 @@ class _SourceMixin:
         """Host-CPU nodes that run code (all HostNodes except Slice views);
         they share the cached staging arena s_host_stage."""
         return [sn for sn in self._graph.nodes
-                if isinstance(sn, HostNode) and not self._is_view(sn)]
+                if isinstance(sn, HostNode) and not self._is_view(sn)
+                and not self._is_inplace_merge(sn)]
 
     # ------------------------------------------------------------------ #
     # Host-CPU ops (Softmax, LayerNorm, GELU, Transpose, Gather, ...)       #
@@ -243,6 +244,8 @@ class _SourceMixin:
         root = self._alias_root(t.onnx_name)
         for sn in self._graph.nodes:
             if sn.output.onnx_name == root:
+                if self._is_inplace_merge(sn):        # its P.V calls wrote it
+                    return True
                 return bool(getattr(type(sn), "kernel_name", ""))
         return False
 
@@ -2035,8 +2038,12 @@ class _SourceMixin:
             elif kind == 'reshape':
                 sn = nodes_by_idx[ev[1]]
                 # ReshapeNode emits an empty call — keep blank for readability.
-                # A Slice view was set up once in inference_init().
-                if not isinstance(sn, SliceNode):
+                # A Slice view was set up once in inference_init(); an in-place
+                # merge's P.V calls already wrote its output in head order.
+                if self._is_inplace_merge(sn):
+                    body_lines.append("    /* merged in place: the P.V calls wrote "
+                                      f"{sn.output.c_name} (RPU_PLAN §13) */")
+                elif not isinstance(sn, SliceNode):
                     body_lines.append(sn.emit_call(self._layouts))
                 body_lines.append("")
 

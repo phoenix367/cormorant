@@ -1351,6 +1351,19 @@ class LlmAttnMergeNode(LlmNode):
     KV: int = 1
     HD: int = 16
     R:  int = 1
+    # set by the code generator (CodeGenerator._merge_in_place, RPU_PLAN §13):
+    # each o_g is a view of pv and its P.V call writes there, so the merge
+    # emits no code; reference() still assembles pv for the simulation
+    in_place: bool = False
+
+    def view_offsets(self) -> Optional[List[int]]:
+        """Element offset of each input inside the output when every o_g is
+        a contiguous piece of pv — T = 1 (a decode step: o_g = pv[g*G*HD ..
+        (g+1)*G*HD]); None otherwise (rows interleave across the heads)."""
+        if self.T != 1 or self.R != 1:
+            return None
+        G = self.H // self.KV
+        return [g * G * self.HD for g in range(self.KV)]
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):

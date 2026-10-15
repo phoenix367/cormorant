@@ -911,7 +911,7 @@ they are replaced by §13.6's.
 
 | phase | what | gate |
 |---|---|---|
-| **A2.0 — no bitstream** | output views for P·V; the decode merge through `y_off`; the `irope="all"` study | the libraries bit-exact (sched-checks, board); decode −0.3 / −0.55 ms per token; `irope="all"` within the prefill policy's yardstick (top-1, KL, ppl) |
+| **A2.0 — no bitstream** | output views for P·V; the decode merge through `y_off`; the `irope="all"` study — **DONE 2026-10-15 (§13.8)** | the libraries bit-exact (sched-checks, board); decode −0.3 / −0.55 ms per token; `irope="all"` within the prefill policy's yardstick (top-1, KL, ppl) — ✓ (−0.26 / −0.54 ms; the study unchanged) |
 | **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
 | **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
 | **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
@@ -943,3 +943,69 @@ eight days.
   memory planner (`_demote_strided_views` drops them today): its liveness and
   the slot colouring are what A2.0 tests first, on decode, where the pattern
   is dense.
+
+### 13.8 A2.0 results (2026-10-15)
+
+**The decode merge, in place.**  No `y_off` was needed: at T = 1 the P·V
+output o_g `[G][HD]` is the contiguous slice `pv[g·G·HD …]` — 384-byte
+offsets for HD 64, G 3 — so the existing view machinery serves it.
+`LlmAttnMergeNode.view_offsets()` gives the slice offsets (None where rows
+interleave), `CodeGenerator._merge_in_place` marks a merge `in_place` where
+every o_g is a flat pool intermediate written by one `LlmAttnConvNode` and
+read by the merge alone, pv a flat pool intermediate and every offset
+64-byte aligned; the in-place merge is an alias node (no event, no code — a
+comment in the generated C), its inputs views of pv (`_view_aliases`,
+`inference_buf_init_view`), pv live from the first P·V's start
+(`_compute_live_intervals` resolves a writer's output through the alias),
+and a host reader of pv invalidates it as kernel-written
+(`_written_by_kernel`).  The node keeps its `reference()`, so the simulation
+is the same function of the same inputs.  `AXI_INPLACE_MERGE=0` restores the
+copy.  Test: `test_llama.TestSimVsStudyFpgaDecode.test_decode_merge_in_place`
+(the views, the liveness, the opt-out, prefill untouched); the generated C on
+the host emulation (`TestHostEmulation`, coherent and incoherent) and the
+scheduler suite (1 841) pass.
+
+The three chat libraries regenerated: 30 / 32 / 30 decode merges in place
+(SmolLM2-135M / 360M / SmolVLM); the prefill entries keep their 90 / 96 / 90
+host merges until the y pattern.  On the board (`de968ccc45da`): every
+library **bit-exact** (`llm_board.py`: SmolLM2 4 prompts × 33 / 33 logits,
+SmolVLM 2 images × 33 / 33).  A / B in one session (the previous libraries
+built beside, `--remote-dir /root/a2_old`; deep idle off for both):
+
+| library | decode before | decode after | Δ | prefill 16 / 64 / 256 |
+|---|---:|---:|---:|---|
+| SmolLM2-135M | 49.75 ms / token | 49.49 | **−0.26** | 81 / 100 / 405 → 81 / 100 / 404 |
+| SmolLM2-360M | 130.84 | 130.30 | **−0.54** | 192 / 239 / 1 062 → unchanged |
+
+SmolVLM decode 49.38 ms per token, `llm_image` 1.64 s (unchanged).  The chat
+server is redeployed with the three libraries (the R5 driving).
+
+**The decode RoPE on the unit (numerics).**  The study policy
+`pow2+sink+p12+vsmx+rowops+drope` (`llm_study.py`: the shipped policy with
+`irope=True`, every step's RoPE the unit's integer one) against the shipped
+`pow2+sink+p12+vsmx+rowops`, the same prompts, windows and yardsticks as
+HOSTOPS §5.2 / §10.8:
+
+| model | shipped: top-1 all / resp / held · KL tf / held · ppl · identical | `+drope` | time |
+|---|---|---|---|
+| SmolLM2-135M | 0.9750 / 0.9818 / 0.9684 · 0.0023 / 0.0025 · 15.600 · 5 / 12 | the same to the digit · 4 / 12 | 25 min |
+| SmolLM2-360M | 0.9554 / 0.9949 / 0.9762 · 0.0016 / 0.0018 · 12.387 · 8 / 12 | the same · 9 / 12 | 45 min |
+| SmolVLM-256M (`vlm_study.py`, vision `pow2+p12+vgelu+vsmx+rowops`) | features 0.0548, answer top-1 0.9712, KL 0.0033, ppl 12.208, 8 / 24 | the same · 8 / 24 | 65 min |
+
+The teacher-forced and held-out metrics run through the prefill path, where
+the policies agree; the greedy generations (the decode steps) diverge from
+float at other points — 135M 5 → 4 identical, 360M 8 → 9, SmolVLM 8 → 8 —
+inside the spread the earlier gates accepted (HOSTOPS §5.2: 2–6 of 12 across
+the integer specs).  **GO**: A2.4's decode prep on the unit may use the
+unit's RoPE.
+
+Commands (the venv of the studies, `.venv-export`):
+
+```bash
+P=pow2+sink+p12+vsmx+rowops
+.venv-export/bin/python demo/chat/scripts/llm_study.py --assets demo/chat/assets/smollm2-135m-instruct study \
+    --policies $P,$P+drope --out OUT            # the same for smollm2-360m-instruct
+.venv-export/bin/python demo/chat/scripts/vlm_study.py study --combos \
+    "pow2+p12+vgelu+vsmx+rowops/$P,pow2+p12+vgelu+vsmx+rowops/$P+drope" --out OUT
+```
+
