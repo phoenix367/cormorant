@@ -121,6 +121,11 @@ static void start(const call_t *c)
         XConvkernel_Set_pad_left(&s_c, r[14]);
         XConvkernel_Set_has_bias(&s_c, r[15]);
         XConvkernel_Set_is_depthwise(&s_c, r[16]);
+#ifdef XCONVKERNEL_CTRL_ADDR_Y_CS_DATA   /* the y channel pattern (RPU_PLAN §13.2): dense */
+        XConvkernel_Set_y_cs(&s_c, 0u);
+        XConvkernel_Set_y_cn(&s_c, 0u);
+        XConvkernel_Set_y_gs(&s_c, 0u);
+#endif
         XConvkernel_Start(&s_c);
         break;
     case 'P':   /* batch ch in_h in_w out_h out_w ph pw sh sw pt pl dh dw type lp cip */

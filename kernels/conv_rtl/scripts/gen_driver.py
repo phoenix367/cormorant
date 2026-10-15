@@ -53,6 +53,10 @@ g.REGS = [
     ("pad_left",     0xB0, 32, ("A_PAD_LEFT",)),
     ("has_bias",     0xB8, 32, ("A_HAS_BIAS",)),
     ("is_depthwise", 0xC0, 32, ("A_IS_DW",)),
+    # the y channel pattern (RPU_PLAN §13.2): 0 = the dense NCHW output
+    ("y_cs",         0xC8, 32, ("A_Y_CS",)),
+    ("y_cn",         0xD0, 32, ("A_Y_CN",)),
+    ("y_gs",         0xD8, 32, ("A_Y_GS",)),
 ]
 
 if __name__ == "__main__":

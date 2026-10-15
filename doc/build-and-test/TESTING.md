@@ -251,7 +251,7 @@ Each `behavior_test_<k>` depends on its kernel's IP target —
 `package_pool_rtl` — (so it rebuilds its kernel's IP and driver directory) and fails when
 the scoreboard report records any mismatch (see
 [`BUILD_TARGETS.md`](BUILD_TARGETS.md) §RTL behavior tests).  The fixture
-manifests currently hold 212 VectorOP, 63 Conv, 50 Matmul (11 of them GEMV) and 45 Pool
+manifests currently hold 212 VectorOP, 66 Conv, 50 Matmul (11 of them GEMV) and 45 Pool
 cases, and all pass (`VectorOP Test Summary: 212 / 212 passed`, …): each
 kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);

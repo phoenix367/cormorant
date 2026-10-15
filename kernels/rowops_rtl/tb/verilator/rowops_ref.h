@@ -9,13 +9,19 @@
 //
 // Arithmetic: 64-bit integers where the specification's values fit, 128-bit
 // for the norms' sums and products, exactly as the Python's integers.
+//
+// A descriptor chain (ROWOPS_RTL_KERNEL.md §1.6) is its jobs in order, each on the
+// memory as the previous ones left it (run_chain); the parameter RAM the unit keeps
+// between jobs and chains (P_KEEP) is modelled by PState.
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -52,6 +58,36 @@ struct Job {
 };
 
 struct Param { int32_t g = 0; int32_t bq = 0; uint8_t sh_a = 0, sh_b = 0, sh_c = 0; };
+
+// Descriptor chains: at most CHAIN_MAX jobs per start (chain_n above it is clamped); a
+// descriptor is DESC_WORDS 32-bit words, words 0 .. 23 the argument registers 0x10 .. 0x6C
+// in register order, the rest ignored (0 by convention).
+constexpr uint32_t CHAIN_MAX = 16, DESC_WORDS = 32, DESC_BYTES = 4 * DESC_WORDS;
+
+inline std::array<uint32_t, DESC_WORDS> descriptor(const Job& j) {
+  std::array<uint32_t, DESC_WORDS> d{};
+  const u64 w64[4] = {j.a, j.b, j.c, j.p};
+  const uint32_t s1[3] = {j.a_s1, j.b_s1, j.c_s1}, s2[3] = {j.a_s2, j.b_s2, j.c_s2};
+  d[0] = j.op; d[1] = j.n; d[2] = j.c1; d[3] = j.c2;
+  for (int k = 0; k < 3; k++) {                      // a, b, c: lo, hi, s1, s2
+    d[4 + 4 * k] = (uint32_t)w64[k]; d[5 + 4 * k] = (uint32_t)(w64[k] >> 32);
+    d[6 + 4 * k] = s1[k];            d[7 + 4 * k] = s2[k];
+  }
+  d[16] = (uint32_t)j.p;   d[17] = (uint32_t)(j.p >> 32);
+  d[18] = (uint32_t)j.eps; d[19] = (uint32_t)(j.eps >> 32);
+  d[20] = j.aux; d[21] = j.bq_sh; d[22] = j.win_lo; d[23] = j.win_hi;
+  return d;
+}
+
+// The unit's parameter RAM (ro_param): column c's entry at bank c % 4, index c / 4 — a load
+// of n entries rewrites columns 0 .. n - 1, a broadcast load (P_BCAST) index 0 of every
+// bank and sets the broadcast read (every column reads its lane's index 0); a P_KEEP job
+// reads what the last load left.  XPOSE, TLOAD, FOLD and empty jobs neither load nor read it.
+struct PState {
+  bool valid = false, bcast = false;
+  std::vector<Param> ram = std::vector<Param>(4096);
+  const Param& at(uint32_t c) const { return ram[bcast ? (c & 3) : c]; }
+};
 
 // DDR access the oracle needs: bytes at an address (the testbench's sparse memory).
 struct Mem {
@@ -202,11 +238,27 @@ inline std::vector<uint8_t> table_image() {
   return img;
 }
 
-inline std::vector<Write> run(const Job& j, const Mem& m) {
+// One job on the memory image `m`; `ps` (optional) is the parameter RAM before the job,
+// updated by its load.  Without `ps` a P_KEEP job reads its block from p.
+inline std::vector<Write> run(const Job& j, const Mem& m, PState* ps = nullptr) {
   if (j.code() == TLOAD) return {};               // the tables: no DDR output
   std::vector<Write> out;
   const uint32_t op = j.code();
   const uint32_t n = j.n;
+  // The parameter load (ro_core T_CFG2): every stream op, NORM and ROPE with work, unless P_KEEP.
+  const bool p_op = op == COPY || op == ADDX || op == DEQUANT || op == MULACT || op == NORM || op == ROPE;
+  const bool p_go = p_op && n != 0 && j.c1 != 0 && j.c2 != 0 && n <= 4096;
+  const bool keep = (j.op & F_P_KEEP) && ps && ps->valid;
+  if (p_go && !keep && ps) {
+    if (j.p_bcast()) {
+      const Param e = read_param(m, j.p, 0, true);
+      for (int b = 0; b < 4; b++) ps->ram[b] = e;
+    } else {
+      for (uint32_t c = 0; c < n; c++) ps->ram[c] = read_param(m, j.p, c, false);
+    }
+    ps->bcast = j.p_bcast();
+    ps->valid = true;
+  }
   if (op == FOLD) {
     // channel k reads the int16 row at a + k a_s2 (signed); row r, column c reads its
     // column b_s2 + r b_s1 + c (b_s2 signed) where that lies in [win_lo, win_hi), else 0;
@@ -232,6 +284,7 @@ inline std::vector<Write> run(const Job& j, const Mem& m) {
   const bool ben = j.b_en(), bcast = j.p_bcast();
   std::vector<Param> P;
   auto param = [&](uint32_t c) -> const Param& {
+    if (ps && ps->valid && (keep || p_go)) return ps->at(c);
     if (P.empty()) {
       P.resize(bcast ? 1 : n);
       for (uint32_t i = 0; i < P.size(); i++) P[i] = read_param(m, j.p, i, bcast);
@@ -349,6 +402,21 @@ inline std::vector<Write> run(const Job& j, const Mem& m) {
     return out;
   }
   return out;
+}
+
+// A chain: the jobs in order, each reading the memory as the previous ones wrote it (the
+// unit starts a job only after every write of the one before has its response).  Returns
+// the bytes the chain writes with their final values.
+inline std::unordered_map<u64, uint8_t> run_chain(const std::vector<Job>& jobs, const Mem& m, PState* ps) {
+  std::unordered_map<u64, uint8_t> img;
+  Mem view{[&](u64 a) -> uint8_t {
+    auto it = img.find(a);
+    return it != img.end() ? it->second : m.rd8(a);
+  }};
+  for (const Job& j : jobs)
+    for (const Write& w : run(j, view, ps))
+      for (size_t i = 0; i < w.bytes.size(); i++) img[w.addr + i] = w.bytes[i];
+  return img;
 }
 
 }  // namespace ro

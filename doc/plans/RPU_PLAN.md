@@ -912,8 +912,8 @@ they are replaced by §13.6's.
 | phase | what | gate |
 |---|---|---|
 | **A2.0 — no bitstream** | output views for P·V; the decode merge through `y_off`; the `irope="all"` study — **DONE 2026-10-15 (§13.8)** | the libraries bit-exact (sched-checks, board); decode −0.3 / −0.55 ms per token; `irope="all"` within the prefill policy's yardstick (top-1, KL, ppl) — ✓ (−0.26 / −0.54 ms; the study unchanged) |
-| **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
-| **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
+| **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver — **DONE 2026-10-15 (§13.9)** | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
+| **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures — **DONE 2026-10-15 (§13.9)** | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
 | **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
 | **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
 | **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
@@ -1008,4 +1008,69 @@ P=pow2+sink+p12+vsmx+rowops
 .venv-export/bin/python demo/chat/scripts/vlm_study.py study --combos \
     "pow2+p12+vgelu+vsmx+rowops/$P,pow2+p12+vgelu+vsmx+rowops/$P+drope" --out OUT
 ```
+
+### 13.9 A2.1 and A2.2 results (2026-10-15)
+
+**A2.1 — ConvKernel's y channel pattern.**  As §13.2: `y_cs` / `y_cn` /
+`y_gs` at 0xC8 / 0xD0 / 0xD8 (`cv_ctrl_s_axi`), latched with the job, the
+contract (`y_cn` a multiple of 16, ≤ 1280; batch 1 with a pattern) in
+`cv_core`; `job_t` carries `y_cs` (out_h · out_w when 0), `y_cs16`, `y_tpg`
+(tiles per group) and `y_gs`; `cv_drain`'s fill walks the groups (the
+m-tile base `+ y_cs16`, or the next group's base `+ y_gs` every `y_tpg`
+tiles) and its emitter steps `y_cs` per channel.  The C++ model
+(`ConvKernel()` three defaulted arguments, `write_output_tile`'s channel
+base), the Verilator testbench (the registers on every case, the y region /
+poison / stray check over the strided footprint, `--case` and the manifest
+with the three numbers, random strided jobs — attention-like interleaved
+groups, one group with gaps, blocks of groups, odd strides — and patterns
+outside the contract that must write nothing), the fixtures (66: the 63
+unchanged, their manifest rows `0 0 0`; an attention P·V G 3 T 16 HD 64, a
+vision one-group P·V, odd strides at HD 96 with 4 KiB crossings), the
+driver (`gen_driver.py`, ctest `ConvRtlDriver`), the test stand's
+`conv_tb.sv` (the columns, the registers, a strided scoreboard), the host
+emulation's ConvKernel, and every writer of the registers (the generated
+`run_conv*`, `calib_runner.c`, `bench_conv.c`: 0 = dense, behind
+`XCONVKERNEL_CTRL_ADDR_Y_CS_DATA`; the R5 recorder's window 45 → 51 words).
+Gates: the 66 fixtures and 12 × 300 random jobs (seeds 1–4 × fast / rand /
+slow) pass; `ctest -R Conv` 6 / 6; lint clean; the perf shapes' cycles equal
+HEAD's when its testbench makes the same register traffic (the count moves
+by ±5 cycles with the start's phase alone); out of context at 3.333 ns WNS
++0.026 ns, 14 973 LUT, 37 793 FF, 60 BRAM tiles, 48 URAM, 518 DSP — the 20
+worst paths in the weight and x loaders, the drain's worst +0.110 ns (its
+transposer, unchanged).  The test stand: the first run 65 / 66 — the vision
+case's gaps held stale bytes the PS VIP's racing write commits past a burst
+(the previous transfer's byte count at the new address, the row-ops unit's
+bring-up finding); `conv_tb.sv`'s write fix now restores that range from its
+shadow as `hw_128/tb_infra.svh` does; the rerun (from a clean simulation
+directory: the incremental `xvlog` hung once, as in `sim_hw` this session):
+**66 / 66**, the three strided cases included (56 min).
+
+**A2.2 — RowOps descriptor chains.**  As §13.3: `chain` (0x70 / 0x74) and
+`chain_n` (0x78); a chain's descriptors (N ≤ 16, larger clamped) are read on
+port B in one run (bursts ≤ 64 beats inside 4 KiB) into six 16 × 128-bit
+LUTRAMs (beats 0–5; 6–7 discarded), each job loads `j_*` from the RAM's
+registered read through a 2:1 mux and runs the unchanged single-job path,
+`ap_done` once after the last; TLOAD is allowed in a chain.  The C++
+oracle's `run_chain` models the parameter RAM across jobs (P_KEEP); the
+testbench's random chains (every op, N 1 … 16, ~30 % of the jobs reading an
+earlier job's output, write-after-write / -read, P_KEEP within and across
+chains with a decoy block, `chain_n` > 16, junk in words 24–31, the argument
+registers unchanged) and two chain fixtures (a decode attention prep of 7
+jobs, a residual / norm chain of 7: `hw/test_data/rowops_test_data/chains/`).
+Gates: fixtures + 300 random jobs + 300 chains × seeds 1–4 × three timings
+(12 × 638) and a 1 000-chain soak (24 × 1 338) pass; mutants (no wait for the
+B responses, P_KEEP ignored, no clamp) caught; lint clean; the driver check;
+every existing perf shape's cycles unchanged; a 10-job decode prep chain 3 006
+cycles against 2 928 for its jobs one by one, 12 DEQUANTs 14 556 against 14 460
+(+0.3–0.4 µs: the fetch and the job starts — against 6–11 µs per job issued
+by the CPU).  Out of context at 3.333 ns: WNS −0.053 ns (the de968ccc45da
+RTL's −0.067 ns: NORM and sigmoid-URAM paths), +723 LUT (34 189), +1 084 FF,
+no RAM or DSP added, no chain path among the 20 worst (its own +0.19 / +0.27
+ns).  Watch in A2.3: the paths out of `j_aux` (+0.025 … +0.074 ns OOC
+depending on placement) are the design's worst in-context class; per-unit
+copies of `j_aux` are the remedy if the build misses.  The scheduler writes
+`chain` / `chain_n` = 0 on every single job (`run_rowops`, behind
+`XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA`), the host emulation runs a chain's
+descriptors, the R5 window 24 → 27 words; the strict `xvlog` (`xsim_rowops_rtl`)
+needs `--relax` (use before declaration in four files at HEAD).
 

@@ -15,8 +15,9 @@ enable_testing()
 #
 # Targets (each one only when its tool is found):
 #   TestRowOpsRtl          Verilator testbench (vl/Vtb); ctest runs the checked-in
-#                          fixtures (written from the Python specification) and
-#                          random cases against the C++ oracle (tb/verilator/rowops_ref.h)
+#                          fixtures (written from the Python specification, the chain
+#                          fixtures among them), random cases and random descriptor
+#                          chains against the C++ oracle (tb/verilator/rowops_ref.h)
 #   lint_rowops_rtl        verilator --lint-only -Wall
 #   perf_rowops_rtl        cycle counts of the shipped models' job shapes (ideal memory)
 #   rowops_rtl_tb_fst      testbench with FST tracing (vlt/Vtb --trace F.fst)
@@ -40,6 +41,7 @@ set(RO_RTL_WAIVERS "${RO_RTL_DIR}/scripts/lint_waivers.vlt")
 set(RO_RTL_FIXTURES "${RO_RTL_REPO}/hw/test_data/rowops_test_data"
     CACHE PATH "RowOpsKernel fixtures (manifest.txt + test_NN_*.hex) for TestRowOpsRtl")
 set(RO_RTL_RANDOM_CASES 300 CACHE STRING "TestRowOpsRtl: random cases after the fixtures")
+set(RO_RTL_CHAIN_CASES 300 CACHE STRING "TestRowOpsRtl: random descriptor chains after the random cases")
 set(RO_RTL_PERIOD 3.333 CACHE STRING "synth_rowops_rtl: clock period in ns (OOC timing check)")
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -123,7 +125,7 @@ if(RO_RTL_VERILATOR)
 
     add_test(NAME TestRowOpsRtl
              COMMAND "${RO_RTL_TB}" --fixtures "${RO_RTL_FIXTURES}"
-                     --random ${RO_RTL_RANDOM_CASES} --seed 1 --timing rand --quiet)
+                     --random ${RO_RTL_RANDOM_CASES} --chains ${RO_RTL_CHAIN_CASES} --seed 1 --timing rand --quiet)
     message(STATUS "RowOpsKernel RTL: targets TestRowOpsRtl, lint_rowops_rtl, perf_rowops_rtl, rowops_rtl_tb_fst")
 else()
     message(STATUS "RowOpsKernel RTL: Verilator not found — TestRowOpsRtl and lint_rowops_rtl disabled "
@@ -169,9 +171,11 @@ if(RO_RTL_VIVADO)
         COMMENT "RowOpsKernel RTL: Vivado OOC synthesis + P&R (${RO_RTL_PART}, ${RO_RTL_PERIOD} ns)"
         USES_TERMINAL VERBATIM)
 
+    # --relax: ro_norm / ro_rope / ro_xpose use a few signals above their declarations,
+    # which strict xvlog rejects (Verilator and synthesis accept it)
     add_custom_target(xsim_rowops_rtl
-        COMMAND "${_ro_rtl_vivado_bin}/xvlog" -sv ${RO_RTL_SOURCES}
-        COMMAND "${_ro_rtl_vivado_bin}/xelab" -debug off RowOpsKernel -s ro_elab
+        COMMAND "${_ro_rtl_vivado_bin}/xvlog" --relax -sv ${RO_RTL_SOURCES}
+        COMMAND "${_ro_rtl_vivado_bin}/xelab" -relax -debug off RowOpsKernel -s ro_elab
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/xsim"
         COMMENT "RowOpsKernel RTL: xvlog / xelab"
         VERBATIM)

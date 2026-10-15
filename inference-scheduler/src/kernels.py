@@ -282,7 +282,7 @@ KERNEL_REGISTRY: dict = {
     "ConvKernel": KernelDesc(
         name="ConvKernel",
         rpu_lane=2,
-        rpu_reg_words=45,
+        rpu_reg_words=51,              # 0x10 .. 0xDB (the y pattern's 0xC8 / 0xD0 / 0xD8, RPU_PLAN §13.2)
         driver_prefix="xconvkernel",
         c_type="XConvkernel",
         uio_default="ConvKernel_0",
@@ -304,7 +304,7 @@ KERNEL_REGISTRY: dict = {
     "RowOpsKernel": KernelDesc(
         name="RowOpsKernel",
         rpu_lane=4,
-        rpu_reg_words=24,
+        rpu_reg_words=27,              # 0x10 .. 0x7B (the chain's 0x70 / 0x74 / 0x78, RPU_PLAN §13.3)
         driver_prefix="xrowopskernel",
         c_type="XRowopskernel",
         uio_default="RowOpsKernel_0",

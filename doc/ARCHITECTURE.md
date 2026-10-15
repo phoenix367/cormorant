@@ -966,7 +966,7 @@ All builds use `--x-assign unique --x-initial unique`.
 |---|---:|---:|---|
 | VectorOP | 212 | 300 (seed 1) | every Q8.8 input of each activation and of the softmax; ROM currency checks |
 | Matmul | 50 (11 GEMV) | 200 | random reset values (`+verilator+rand+reset+2`) |
-| Conv | 63 | 200 | zero-size and out-of-contract jobs |
+| Conv | 66 | 200 | zero-size and out-of-contract jobs |
 | Pool | 45 | 200 | board-like timing modes |
 | RowOps | 36 | 300 | 1 200 random over 4 seeds; after a TLOAD |
 

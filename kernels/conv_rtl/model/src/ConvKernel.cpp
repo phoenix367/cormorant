@@ -427,8 +427,17 @@ static void write_output_tile(
     unsigned                out_h,
     unsigned                out_w,
     unsigned                batch,
-    ConvGeometry            geom
+    ConvGeometry            geom,
+    unsigned                y_cs,
+    unsigned                y_cn,
+    unsigned                y_gs
 ) {
+    // the y channel pattern (ConvKernel.h): a channel's plane base
+    const unsigned out_hw = out_h * out_w;
+    const unsigned cs     = y_cs ? y_cs : out_hw;
+    auto ch_base = [&](unsigned c) -> unsigned {
+        return y_cn ? (c % y_cn) * cs + (c / y_cn) * y_gs : c * cs;
+    };
     const unsigned m_tiles      = (out_ch + kTileM - 1) / kTileM;
     const unsigned oh_per_chunk = geom.oh_per_chunk;
     const unsigned num_chunks   = geom.num_chunks;
@@ -456,7 +465,7 @@ static void write_output_tile(
                     // First element of this channel's rows [oh_start, oh_end)
                     // plus the segment offset: the run start in elements.
                     const unsigned e =
-                        ((ni * out_ch + m_off + m1) * out_h + oh_start) * out_w
+                        ni * out_ch * out_hw + ch_base(m_off + m1) + oh_start * out_w
                         + seg * kDrainSeg;
                     const unsigned shift = e % kYPortElems;                 // lanes before the run in word 0
                     const unsigned n_in  = (len + kYPortElems - 1) / kYPortElems;
@@ -2064,8 +2073,14 @@ void ConvKernel(
     unsigned      pad_top,
     unsigned      pad_left,
     unsigned      has_bias,
-    unsigned      is_depthwise
+    unsigned      is_depthwise,
+    unsigned      y_cs,
+    unsigned      y_cn,
+    unsigned      y_gs
 ) {
+    // the y pattern's contract (the RTL writes nothing beyond it)
+    if ((y_cn % kTileM) != 0 || y_cn > kMaxOutCh || ((y_cs || y_cn) && batch != 1))
+        return;
     // The DDR requests (the RTL kernel issues the same ones,
     // doc/kernels/CONV_RTL_KERNEL.md): x one read_request per (row, channel)
     // run of <= kMaxLineBufCols / 8 + 1 = 9 words, up to kTileIC = 16 in flight;
@@ -2180,7 +2195,7 @@ void ConvKernel(
         kh, kw, stride_h, stride_w, dilation_h, dilation_w,
         pad_top, pad_left, is_depthwise, geom);
 
-    write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch, geom);
+    write_output_tile(y, acc_stream, out_ch, out_h, out_w, batch, geom, y_cs, y_cn, y_gs);
 
 #ifdef DEBUG_LOAD_DATA_CACHING
     // C-sim token accounting.  The four DATAFLOW stages run sequentially in

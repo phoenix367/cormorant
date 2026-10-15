@@ -1,65 +1,70 @@
 # ConvKernel test fixture manifest
-# idx batch in_ch in_h in_w out_ch out_h out_w kh kw stride_h stride_w dilation_h dilation_w pad_top pad_left has_bias is_depthwise label
-0 1 1 5 5 1 5 5 1 1 1 1 1 1 0 0 0 0 1x1_kernel__1ch__no_bias
-1 1 1 5 5 1 5 5 1 1 1 1 1 1 0 0 0 0 1x1_kernel__1ch__no_bias
-2 1 1 5 5 1 3 3 3 3 1 1 1 1 0 0 0 0 3x3__no_pad__no_bias_____3x3_out
-3 1 1 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 3x3__pad_1__same______5x5_out
-4 1 1 6 6 1 2 2 3 3 2 2 1 1 0 0 0 0 3x3__stride_2_____2x2_out
-5 1 1 5 5 2 5 5 3 3 1 1 1 1 1 1 1 0 3x3__pad_1__has_bias__2_out_ch
-6 2 1 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 batch_2__3x3__pad_1
-7 1 21 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 partial_IC_tile__in_ch_TILE_IC_5_
-8 1 1 5 5 19 5 5 3 3 1 1 1 1 1 1 1 0 partial_M_tile__out_ch_TILE_M_3_
-9 1 1 9 9 1 5 5 3 3 1 1 2 2 0 0 0 0 3x3_dilation_2_____5x5_out
-10 1 1 7 7 1 3 3 5 5 1 1 1 1 0 0 0 0 5x5_kernel_____3x3_out
-11 1 35 14 14 33 14 14 3 3 1 1 1 1 1 1 1 0 14x14__multi-tile_M_and_IC__bias
-12 1 1 6 8 2 4 4 3 5 1 1 1 1 0 0 0 0 non-square__6x8_input__3x5_kernel
-13 1 1 7 7 1 3 3 3 3 2 2 1 1 1 1 0 0 7x7__stride_2__asymmetric_pad__1_1_0_0_
-14 1 32 5 5 32 5 5 1 1 1 1 1 1 0 0 1 0 1x1__IC_TILE_IC_2_M_TILE_M_2_bias__exact_tiles_
-15 1 1 6 6 2 2 4 3 3 2 1 1 1 0 0 0 0 3x3__asymmetric_stride_h_2_w_1_____2x4_out
-16 1 1 7 9 1 5 5 3 3 1 1 1 2 0 0 0 0 3x3__asymmetric_dilation_h_1_w_2_____5x5_out
-17 1 16 3 3 16 1 1 3 3 1 1 1 1 0 0 1 0 3x3_input_3x3_kernel_____1x1_out__C_TILE_IC_M_TILE_M
-18 1 1 5 8 2 5 8 1 5 1 1 1 1 0 2 0 0 1x5_horizontal_filter__pad_left_pad_right_2
-19 3 16 7 7 16 4 4 3 3 2 2 1 1 1 1 1 0 batch_3__C_TILE_IC_M_TILE_M_stride_2__ResNet-style_
-20 1 8 32 32 32 32 32 3 3 1 1 1 1 1 1 1 0 oh-chunking_standard__out_32x32x32__2_chunks_
-21 1 8 16 16 64 16 16 3 3 1 1 1 1 1 1 1 0 M-grouping_standard__out_ch_64__2_M-groups_
-22 1 8 17 17 64 17 17 3 3 1 1 1 1 1 1 1 0 M-grouping__in_h_17___line_buf_rows__residency_cap_
-23 1 3 32 32 40 16 16 7 7 2 2 1 1 3 3 1 0 M-grouping__7x7_s2_stem__ResNet-style_conv0_
-24 2 8 24 16 40 12 16 3 3 2 1 2 2 2 2 1 0 M-grouping__batch_2_dil_2_s_h_2__residency_cap_
-25 1 8 17 17 80 17 17 3 3 1 1 1 1 1 1 1 0 M-grouping_80ch__4_1_tiles___in_h_17_residency_cap
-26 1 3 24 24 80 12 12 7 7 2 2 1 1 3 3 1 0 M-grouping_80ch__7x7_s2_stem_24x24
-27 2 8 24 16 80 12 16 3 3 2 1 2 2 2 2 1 0 M-grouping_80ch__batch_2_dil_2_s_h_2__residency_cap_
-28 1 24 24 20 80 12 10 1 1 2 2 1 1 0 0 1 0 1x1_s2_downsample_24-_80ch_on_24x20__2_M-groups_
-29 2 40 9 13 21 9 13 1 1 1 1 1 1 0 0 0 0 1x1_s1_40-_21ch_on_9x13_batch_2__3_ic-tiles__partial_M_
-30 1 32 40 64 16 40 64 1 1 1 1 1 1 0 0 1 0 1x1_32-_16_on_40x64__2560-element_output_runs
-31 1 8 121 75 8 121 75 1 1 1 1 1 1 0 0 1 0 1x1_8-_8_on_121x75__mid-word_runs__8175-elem_chunks
-32 1 8 8 128 8 8 128 3 3 1 1 1 1 1 1 1 0 wide_input_ow-tiling__in_w_128__3_ow-tiles_
-33 1 4 8 8 4 6 6 3 3 1 1 1 1 0 0 0 1 DW_3x3__4ch__no_pad__no_bias
-34 1 4 8 8 4 8 8 3 3 1 1 1 1 1 1 1 1 DW_3x3__4ch__pad_1__has_bias
-35 1 19 6 6 19 6 6 3 3 1 1 1 1 1 1 0 1 DW_partial_M_tile__ch_TILE_M_3_
-36 1 4 9 9 4 5 5 3 3 1 1 2 2 0 0 0 1 DW_3x3_dilation_2__4ch
-37 1 8 8 8 8 4 4 3 3 2 2 1 1 1 1 0 1 DW_stride_2__8ch__pad_1
-38 2 4 6 6 4 6 6 3 3 1 1 1 1 1 1 0 1 DW_batch_2__4ch__pad_1
-39 1 32 6 6 32 6 6 3 3 1 1 1 1 1 1 1 1 DW_ch_TILE_M_2__exact_tile___bias
-40 1 4 9 9 4 5 5 5 5 1 1 1 1 0 0 0 1 DW_5x5_kernel__4ch_____5x5_out
-41 1 8 8 8 8 4 8 3 3 2 1 1 1 1 1 0 1 DW_asymmetric_stride_h_2_w_1__8ch_____4x8_out
-42 1 32 32 32 32 32 32 3 3 1 1 1 1 1 1 1 1 DW_oh-chunking__32ch__32x32_out__2_chunks_
-43 1 12 33 37 12 33 37 3 3 1 1 1 1 1 1 1 1 DW_3x3_pad_1__12ch__33x37__odd_runs__in_w_8__0_
-44 1 16 27 29 16 14 15 3 3 2 2 1 1 1 1 0 1 DW_3x3_s2_pad_1__16ch__27x29__unaligned_x_rows_
-45 1 16 15 13 32 8 7 3 3 2 2 1 1 1 1 1 0 pairs__3x3_s2_16-_32ch_on_15x13_-__8x7__odd_ow_
-46 1 8 12 16 8 6 8 3 3 2 2 1 1 1 1 0 0 pairs__3x3_s2_8-_8ch_on_12x16_-__6x8__even_ow_
-47 1 40 6 3 21 4 1 3 3 1 1 1 1 0 0 1 0 pairs__out_w_1__40-_21ch_3x3_on_6x3
-48 1 8 6 128 8 3 64 3 3 2 2 1 1 1 1 1 0 pairs__ow-tiling_3x3_s2_in_w_128__tiles_30_30_4_
-49 1 8 4 130 8 4 130 1 1 1 1 1 1 0 0 1 0 pairs__1x1_ow-tiling_in_w_130__tiles_64_64_2_
-50 1 8 13 17 17 7 9 3 3 2 2 2 2 2 2 1 0 pairs__3x3_s2_d2_8-_17ch_on_13x17_-__7x9
-51 1 12 11 13 16 11 13 4 4 1 1 1 1 2 2 1 0 pairs__s2d_stem_12ch_4x4_s1_pad__2_2_1_1__on_11x13
-52 1 19 5 7 19 5 7 1 1 1 1 1 1 0 0 1 1 DW_pairs__1x1_19ch_on_5x7__dummy_position__odd_ow_
-53 1 8 9 11 8 4 5 3 3 2 2 1 1 0 0 0 1 DW_pairs__3x3_s2_8ch_on_9x11_-__4x5__odd_ow_
-54 1 64 28 28 64 28 28 3 3 1 1 1 1 1 1 1 0 3x3_64-_64ch_on_28x28_pad_1__sweep-bound_anchor_
-55 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 saturation__positive_overflow_____AP_MAX
-56 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 saturation__negative_overflow_____AP_MIN
-57 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 1 DW_saturation__positive_overflow_____AP_MAX
-58 1 32 3 32 40 3 16 1 2 1 2 1 1 0 0 0 0 mm-on-conv_1x2_s_1_2___N_40_K_64_M_48__out_3x16_
-59 1 32 2 72 24 2 24 1 3 1 3 1 1 0 0 0 0 mm-on-conv_1x3_s_1_3___N_24_K_96_M_48__out_2x24__2_ow-tiles_
-60 1 32 2 80 20 2 20 1 4 1 4 1 1 0 0 0 0 mm-on-conv_1x4_s_1_4___N_20_K_128_M_40__out_2x20__2_ow-tiles_
-61 1 64 2 32 80 2 32 1 1 1 1 1 1 0 0 0 0 mm-on-conv_1x1__N_80_K_64_M_64__out_2x32__2_M-groups_
-62 1 16 6 128 256 6 64 1 2 1 2 1 1 0 0 0 0 mm-on-conv_1x2__N_256_K_32_M_384__out_6x64__2_oh-chunks_
+# idx batch in_ch in_h in_w out_ch out_h out_w kh kw stride_h stride_w dilation_h dilation_w pad_top pad_left has_bias is_depthwise y_cs y_cn y_gs label
+# (y.hex is dense [batch][out_ch][out_h][out_w]; the kernel writes channel c at
+#  (c mod y_cn) * y_cs + (c div y_cn) * y_gs elements, 0 0 0 = dense)
+0 1 1 5 5 1 5 5 1 1 1 1 1 1 0 0 0 0 0 0 0 1x1_kernel__1ch__no_bias
+1 1 1 5 5 1 5 5 1 1 1 1 1 1 0 0 0 0 0 0 0 1x1_kernel__1ch__no_bias
+2 1 1 5 5 1 3 3 3 3 1 1 1 1 0 0 0 0 0 0 0 3x3__no_pad__no_bias_____3x3_out
+3 1 1 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 0 0 0 3x3__pad_1__same______5x5_out
+4 1 1 6 6 1 2 2 3 3 2 2 1 1 0 0 0 0 0 0 0 3x3__stride_2_____2x2_out
+5 1 1 5 5 2 5 5 3 3 1 1 1 1 1 1 1 0 0 0 0 3x3__pad_1__has_bias__2_out_ch
+6 2 1 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 0 0 0 batch_2__3x3__pad_1
+7 1 21 5 5 1 5 5 3 3 1 1 1 1 1 1 0 0 0 0 0 partial_IC_tile__in_ch_TILE_IC_5_
+8 1 1 5 5 19 5 5 3 3 1 1 1 1 1 1 1 0 0 0 0 partial_M_tile__out_ch_TILE_M_3_
+9 1 1 9 9 1 5 5 3 3 1 1 2 2 0 0 0 0 0 0 0 3x3_dilation_2_____5x5_out
+10 1 1 7 7 1 3 3 5 5 1 1 1 1 0 0 0 0 0 0 0 5x5_kernel_____3x3_out
+11 1 35 14 14 33 14 14 3 3 1 1 1 1 1 1 1 0 0 0 0 14x14__multi-tile_M_and_IC__bias
+12 1 1 6 8 2 4 4 3 5 1 1 1 1 0 0 0 0 0 0 0 non-square__6x8_input__3x5_kernel
+13 1 1 7 7 1 3 3 3 3 2 2 1 1 1 1 0 0 0 0 0 7x7__stride_2__asymmetric_pad__1_1_0_0_
+14 1 32 5 5 32 5 5 1 1 1 1 1 1 0 0 1 0 0 0 0 1x1__IC_TILE_IC_2_M_TILE_M_2_bias__exact_tiles_
+15 1 1 6 6 2 2 4 3 3 2 1 1 1 0 0 0 0 0 0 0 3x3__asymmetric_stride_h_2_w_1_____2x4_out
+16 1 1 7 9 1 5 5 3 3 1 1 1 2 0 0 0 0 0 0 0 3x3__asymmetric_dilation_h_1_w_2_____5x5_out
+17 1 16 3 3 16 1 1 3 3 1 1 1 1 0 0 1 0 0 0 0 3x3_input_3x3_kernel_____1x1_out__C_TILE_IC_M_TILE_M
+18 1 1 5 8 2 5 8 1 5 1 1 1 1 0 2 0 0 0 0 0 1x5_horizontal_filter__pad_left_pad_right_2
+19 3 16 7 7 16 4 4 3 3 2 2 1 1 1 1 1 0 0 0 0 batch_3__C_TILE_IC_M_TILE_M_stride_2__ResNet-style_
+20 1 8 32 32 32 32 32 3 3 1 1 1 1 1 1 1 0 0 0 0 oh-chunking_standard__out_32x32x32__2_chunks_
+21 1 8 16 16 64 16 16 3 3 1 1 1 1 1 1 1 0 0 0 0 M-grouping_standard__out_ch_64__2_M-groups_
+22 1 8 17 17 64 17 17 3 3 1 1 1 1 1 1 1 0 0 0 0 M-grouping__in_h_17___line_buf_rows__residency_cap_
+23 1 3 32 32 40 16 16 7 7 2 2 1 1 3 3 1 0 0 0 0 M-grouping__7x7_s2_stem__ResNet-style_conv0_
+24 2 8 24 16 40 12 16 3 3 2 1 2 2 2 2 1 0 0 0 0 M-grouping__batch_2_dil_2_s_h_2__residency_cap_
+25 1 8 17 17 80 17 17 3 3 1 1 1 1 1 1 1 0 0 0 0 M-grouping_80ch__4_1_tiles___in_h_17_residency_cap
+26 1 3 24 24 80 12 12 7 7 2 2 1 1 3 3 1 0 0 0 0 M-grouping_80ch__7x7_s2_stem_24x24
+27 2 8 24 16 80 12 16 3 3 2 1 2 2 2 2 1 0 0 0 0 M-grouping_80ch__batch_2_dil_2_s_h_2__residency_cap_
+28 1 24 24 20 80 12 10 1 1 2 2 1 1 0 0 1 0 0 0 0 1x1_s2_downsample_24-_80ch_on_24x20__2_M-groups_
+29 2 40 9 13 21 9 13 1 1 1 1 1 1 0 0 0 0 0 0 0 1x1_s1_40-_21ch_on_9x13_batch_2__3_ic-tiles__partial_M_
+30 1 32 40 64 16 40 64 1 1 1 1 1 1 0 0 1 0 0 0 0 1x1_32-_16_on_40x64__2560-element_output_runs
+31 1 8 121 75 8 121 75 1 1 1 1 1 1 0 0 1 0 0 0 0 1x1_8-_8_on_121x75__mid-word_runs__8175-elem_chunks
+32 1 8 8 128 8 8 128 3 3 1 1 1 1 1 1 1 0 0 0 0 wide_input_ow-tiling__in_w_128__3_ow-tiles_
+33 1 4 8 8 4 6 6 3 3 1 1 1 1 0 0 0 1 0 0 0 DW_3x3__4ch__no_pad__no_bias
+34 1 4 8 8 4 8 8 3 3 1 1 1 1 1 1 1 1 0 0 0 DW_3x3__4ch__pad_1__has_bias
+35 1 19 6 6 19 6 6 3 3 1 1 1 1 1 1 0 1 0 0 0 DW_partial_M_tile__ch_TILE_M_3_
+36 1 4 9 9 4 5 5 3 3 1 1 2 2 0 0 0 1 0 0 0 DW_3x3_dilation_2__4ch
+37 1 8 8 8 8 4 4 3 3 2 2 1 1 1 1 0 1 0 0 0 DW_stride_2__8ch__pad_1
+38 2 4 6 6 4 6 6 3 3 1 1 1 1 1 1 0 1 0 0 0 DW_batch_2__4ch__pad_1
+39 1 32 6 6 32 6 6 3 3 1 1 1 1 1 1 1 1 0 0 0 DW_ch_TILE_M_2__exact_tile___bias
+40 1 4 9 9 4 5 5 5 5 1 1 1 1 0 0 0 1 0 0 0 DW_5x5_kernel__4ch_____5x5_out
+41 1 8 8 8 8 4 8 3 3 2 1 1 1 1 1 0 1 0 0 0 DW_asymmetric_stride_h_2_w_1__8ch_____4x8_out
+42 1 32 32 32 32 32 32 3 3 1 1 1 1 1 1 1 1 0 0 0 DW_oh-chunking__32ch__32x32_out__2_chunks_
+43 1 12 33 37 12 33 37 3 3 1 1 1 1 1 1 1 1 0 0 0 DW_3x3_pad_1__12ch__33x37__odd_runs__in_w_8__0_
+44 1 16 27 29 16 14 15 3 3 2 2 1 1 1 1 0 1 0 0 0 DW_3x3_s2_pad_1__16ch__27x29__unaligned_x_rows_
+45 1 16 15 13 32 8 7 3 3 2 2 1 1 1 1 1 0 0 0 0 pairs__3x3_s2_16-_32ch_on_15x13_-__8x7__odd_ow_
+46 1 8 12 16 8 6 8 3 3 2 2 1 1 1 1 0 0 0 0 0 pairs__3x3_s2_8-_8ch_on_12x16_-__6x8__even_ow_
+47 1 40 6 3 21 4 1 3 3 1 1 1 1 0 0 1 0 0 0 0 pairs__out_w_1__40-_21ch_3x3_on_6x3
+48 1 8 6 128 8 3 64 3 3 2 2 1 1 1 1 1 0 0 0 0 pairs__ow-tiling_3x3_s2_in_w_128__tiles_30_30_4_
+49 1 8 4 130 8 4 130 1 1 1 1 1 1 0 0 1 0 0 0 0 pairs__1x1_ow-tiling_in_w_130__tiles_64_64_2_
+50 1 8 13 17 17 7 9 3 3 2 2 2 2 2 2 1 0 0 0 0 pairs__3x3_s2_d2_8-_17ch_on_13x17_-__7x9
+51 1 12 11 13 16 11 13 4 4 1 1 1 1 2 2 1 0 0 0 0 pairs__s2d_stem_12ch_4x4_s1_pad__2_2_1_1__on_11x13
+52 1 19 5 7 19 5 7 1 1 1 1 1 1 0 0 1 1 0 0 0 DW_pairs__1x1_19ch_on_5x7__dummy_position__odd_ow_
+53 1 8 9 11 8 4 5 3 3 2 2 1 1 0 0 0 1 0 0 0 DW_pairs__3x3_s2_8ch_on_9x11_-__4x5__odd_ow_
+54 1 64 28 28 64 28 28 3 3 1 1 1 1 1 1 1 0 0 0 0 3x3_64-_64ch_on_28x28_pad_1__sweep-bound_anchor_
+55 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 0 0 0 saturation__positive_overflow_____AP_MAX
+56 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 0 0 0 0 saturation__negative_overflow_____AP_MIN
+57 1 1 3 3 1 3 3 1 1 1 1 1 1 0 0 1 1 0 0 0 DW_saturation__positive_overflow_____AP_MAX
+58 1 32 3 32 40 3 16 1 2 1 2 1 1 0 0 0 0 0 0 0 mm-on-conv_1x2_s_1_2___N_40_K_64_M_48__out_3x16_
+59 1 32 2 72 24 2 24 1 3 1 3 1 1 0 0 0 0 0 0 0 mm-on-conv_1x3_s_1_3___N_24_K_96_M_48__out_2x24__2_ow-tiles_
+60 1 32 2 80 20 2 20 1 4 1 4 1 1 0 0 0 0 0 0 0 mm-on-conv_1x4_s_1_4___N_20_K_128_M_40__out_2x20__2_ow-tiles_
+61 1 64 2 32 80 2 32 1 1 1 1 1 1 0 0 0 0 0 0 0 mm-on-conv_1x1__N_80_K_64_M_64__out_2x32__2_M-groups_
+62 1 16 6 128 256 6 64 1 2 1 2 1 1 0 0 0 0 0 0 0 mm-on-conv_1x2__N_256_K_32_M_384__out_6x64__2_oh-chunks_
+63 1 16 4 64 48 4 16 1 4 1 4 1 1 0 0 0 0 576 16 64 y_pattern__attention_P_V_G_3_T_16_HD_64__cs_576_cn_16_gs_64_
+64 1 16 4 64 32 4 16 1 4 1 4 1 1 0 0 0 0 768 0 0 y_pattern__vision_P_V_one_group_T_32_HD_64__cs_768_
+65 1 16 6 64 40 6 16 1 4 1 4 1 1 0 0 0 0 199 32 101 y_pattern__odd_strides_HD_96_cn_32__cs_199_gs_101_

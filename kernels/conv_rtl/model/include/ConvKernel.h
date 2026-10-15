@@ -243,5 +243,13 @@ void ConvKernel(
     unsigned      pad_top,
     unsigned      pad_left,
     unsigned      has_bias,
-    unsigned      is_depthwise
+    unsigned      is_depthwise,
+    // The y channel pattern (RPU_PLAN §13.2, registers 0xC8 / 0xD0 / 0xD8):
+    // channel c's plane starts at (c mod y_cn) * y_cs + (c div y_cn) * y_gs
+    // elements — y_cs = 0: out_h * out_w (dense), y_cn = 0: one group.
+    // Contract: y_cn a multiple of kTileM and <= kMaxOutCh, batch == 1 when
+    // y_cs or y_cn is set (else nothing is written, as the RTL).
+    unsigned      y_cs = 0,
+    unsigned      y_cn = 0,
+    unsigned      y_gs = 0
 );

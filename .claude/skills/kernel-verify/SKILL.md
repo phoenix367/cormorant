@@ -20,7 +20,7 @@ HLS ConvKernel).
 | synthesis report | `$BUILD_DIR/kernels/matmul_rtl/synth/` (`timing.rpt`, `utilization.rpt`, the make output's `RESULT` line) | `$BUILD_DIR/kernels/vectorop_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/pool_rtl/synth/` (the same files) | `$BUILD_DIR/kernels/conv_rtl/synth/` (also `timing_paths.rpt`: one path per endpoint) |
 | RTL behaviour test | `behavior_test_matmul` | `behavior_test_vectorop` | `behavior_test_pool` | `behavior_test_conv` |
 | report (under `$BUILD_DIR/kernels/K/kv260/`) | `matmul_op_test_report.json` | `vector_op_test_report.json` | `pooling_test_report.json` | `conv_test_report.json` |
-| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (212 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (63 cases) |
+| checked-in RTL fixtures | `hw/test_data/matmul_test_data/` (50 cases, 11 GEMV) | `hw/test_data/vecop_test_data/` (212 cases) | `hw/test_data/pool_test_data/` (45 cases) | `hw/test_data/conv_test_data/` (66 cases) |
 | fixture target → output | `gen_matmul_test_data` → `$BUILD_DIR/matmul_test_data/` | `gen_vectorop_test_data` → `$BUILD_DIR/vectorop_test_data/` | `gen_pool_test_data` → `$BUILD_DIR/pool_test_data/` | `gen_conv_test_data` → `$BUILD_DIR/conv_test_data/` |
 | test-stand testbench | `hw/cormorant_test_stand/kernels/matmul_op_test/matmul_op_test.srcs/sim_1/new/matmul_tb.sv` | `hw/cormorant_test_stand/kernels/vector_op_test/vector_op_test.srcs/sim_1/new/vectorop_tb.sv` | `hw/cormorant_test_stand/kernels/pooling_test/pooling_test.srcs/sim_1/new/pooling_tb.sv` | `hw/cormorant_test_stand/kernels/conv_test/conv_test.srcs/sim_1/new/conv_tb.sv` |
 | block-design testbench (`hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`) | `mm_regmap.svh`, `mm_classes.svh`, `tb_functions.svh` | `vop_regmap.svh`, `vop_classes.svh`, `tb_functions.svh` | `pk_regmap.svh`, `pk_classes.svh`, `tb_functions.svh` | `conv_regmap.svh`, `conv_classes.svh`, `tb_functions.svh` |
@@ -114,7 +114,7 @@ ctest -R Conv --output-on-failure                     # K=conv (~2 min: TestConv
   --seed 2 --timing slow --quiet` (a failing case prints its `--case "…"`
   line to re-run alone; `--perf` for cycle counts).  Configure checks that
   the platform JSON's `kernels.pool` bounds equal `pl_pkg`'s constants.
-- `lint_conv_rtl` likewise; `TestConvRtl` runs the 63 checked-in fixtures
+- `lint_conv_rtl` likewise; `TestConvRtl` runs the 66 checked-in fixtures
   and 200 random jobs (seed 1) against the C++ model (`model/src/ConvKernel.cpp`, built
   with the Vitis HLS headers into the testbench) on the whole output region,
   under randomised memory timing, with AXI protocol checks and the declared
@@ -289,7 +289,7 @@ make behavior_test_matmul             # or behavior_test_vectorop
   (`VectorOPKernel … total=212 passed=201`, `vector_op_test_report.json`;
   `PoolingKernel … total=45 passed=45`, `[ck] PoolingKernel: PASS  (45/45)`,
   `pooling_test_report.json`; `ConvKernel … total=63 passed=63`,
-  `[ck] ConvKernel: PASS  (63/63)`, `conv_test_report.json`).
+  `[ck] ConvKernel: PASS  (66/63)`, `conv_test_report.json`).
   `failed=0` and `all_passed=True` are mandatory; the make exits non-zero
   otherwise.  **If anything else, stop here** and show the failing cases:
 

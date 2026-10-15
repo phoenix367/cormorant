@@ -203,7 +203,17 @@ struct ConvParams {
     unsigned pad_top, pad_left, pad_bottom, pad_right;
     bool     has_bias;
     bool     is_depthwise;
+    // the y channel pattern (ConvKernel.h; RPU_PLAN §13.2): 0 0 0 = dense
+    unsigned y_cs = 0, y_cn = 0, y_gs = 0;
 };
+
+// element offset of image ni's channel c in y (the y channel pattern)
+static unsigned y_base(const ConvParams& p, unsigned ohw, unsigned ni, unsigned c)
+{
+    const unsigned cs = p.y_cs ? p.y_cs : ohw;
+    const unsigned cb = p.y_cn ? (c % p.y_cn) * cs + (c / p.y_cn) * p.y_gs : c * cs;
+    return ni * p.out_ch * ohw + cb;
+}
 
 // ---------------------------------------------------------------------------
 // §2.32 packed DDR layouts (ConvKernel.h "Weight / bias port width and DDR
@@ -364,7 +374,7 @@ static void dump_test_data(const std::string&         dir,
     write_hex_file(prefix + "y.hex", y_ref);
 
     std::fprintf(g_manifest,
-                 "%d %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %s\n",
+                 "%d %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %s\n",
                  idx,
                  p.batch, p.in_ch, p.in_h, p.in_w,
                  p.out_ch, out_h, out_w,
@@ -374,6 +384,7 @@ static void dump_test_data(const std::string&         dir,
                  p.pad_top, p.pad_left,
                  p.has_bias ? 1u : 0u,
                  p.is_depthwise ? 1u : 0u,
+                 p.y_cs, p.y_cn, p.y_gs,
                  sanitize_label(label).c_str());
 
     std::printf("[DUMP] test_%02d  %-50s  x=%zu w=%zu(packed) b=%zu y=%u\n",
@@ -436,8 +447,16 @@ static int run_test(const char* name, const ConvParams& p,
     const std::vector<WeightWord> b_words = to_weight_words(pad_conv_bias(b_data, p.out_ch));
     const std::vector<XWord>      x_words = to_weight_words(x_data);
 
-    // y: whole words (§2.38), every lane pre-set to the sentinel.
-    const unsigned y_words = y_size / kYPortElems + 1;
+    // y: whole words (§2.38), every lane pre-set to the sentinel; with the
+    // y pattern the buffer spans every channel's plane (gaps between them)
+    const unsigned ohw = out_h * out_w;
+    unsigned y_span = y_size;
+    if (p.y_cs || p.y_cn || p.y_gs) {
+        y_span = 0;
+        for (unsigned c = 0; c < p.out_ch; c++)
+            y_span = std::max(y_span, y_base(p, ohw, 0, c) + ohw);
+    }
+    const unsigned y_words = y_span / kYPortElems + 1;
     YWord sentinel_word = 0;
     for (unsigned l = 0; l < kYPortElems; l++)
         sentinel_word.range(kDataBits * (l + 1) - 1, kDataBits * l) = kYSentinel;
@@ -458,13 +477,17 @@ static int run_test(const char* name, const ConvParams& p,
                p.dilation_h, p.dilation_w,
                p.pad_top, p.pad_left,
                p.has_bias ? 1u : 0u,
-               p.is_depthwise ? 1u : 0u);
+               p.is_depthwise ? 1u : 0u,
+               p.y_cs, p.y_cn, p.y_gs);
 
     int mismatches = 0;
+    std::vector<bool> written(y_words * kYPortElems, false);
     for (unsigned i = 0; i < y_size; i++) {
-        const unsigned lane = i % kYPortElems;
+        const unsigned at = y_base(p, ohw, i / ohw / p.out_ch, i / ohw % p.out_ch) + i % ohw;
+        written[at] = true;
+        const unsigned lane = at % kYPortElems;
         const Data_t got_v = conv_lane_to_data(
-            y_ptr[i / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane));
+            y_ptr[at / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane));
         const double r = static_cast<double>(y_ref[i]);
         const double g = static_cast<double>(got_v);
         if (!vals_close(r, g)) {
@@ -474,8 +497,10 @@ static int run_test(const char* name, const ConvParams& p,
             mismatches++;
         }
     }
-    // Tail pad lanes (past y_size, inside the last word) must be untouched.
-    for (unsigned i = y_size; i < y_words * kYPortElems; i++) {
+    // Tail pad lanes (past the output, inside the last word) and, with the
+    // y pattern, the gaps between the planes must be untouched.
+    for (unsigned i = 0; i < y_words * kYPortElems; i++) {
+        if (written[i]) continue;
         const unsigned lane = i % kYPortElems;
         const ap_uint<kDataBits> bits =
             y_ptr[i / kYPortElems].range(kDataBits * (lane + 1) - 1, kDataBits * lane);
@@ -806,7 +831,9 @@ int main(int argc, char** argv)
             "# ConvKernel test fixture manifest\n"
             "# idx batch in_ch in_h in_w out_ch out_h out_w kh kw "
             "stride_h stride_w dilation_h dilation_w pad_top pad_left "
-            "has_bias is_depthwise label\n");
+            "has_bias is_depthwise y_cs y_cn y_gs label\n"
+            "# (y.hex is dense [batch][out_ch][out_h][out_w]; the kernel writes channel c at\n"
+            "#  (c mod y_cn) * y_cs + (c div y_cn) * y_gs elements, 0 0 0 = dense)\n");
     }
 
     std::mt19937 rng(kSeed);
@@ -1928,6 +1955,36 @@ int main(int argc, char** argv)
                           mm_cases, kw, N, K, M, out_h, out_w);
             total_failures += run_matmul_case(label, N, K, M, kw, out_w, 0.5f, 0.5f, mm_rng);
             mm_cases++;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The y channel pattern (RPU_PLAN §13.2): an attention P.V (MatMul on
+    // ConvKernel, 1 x 4, stride (1, 4)) writing its rows straight into the
+    // merged [T][H * HD] tensor — channel p = h' * T + t of KV group 0 lands
+    // at t * H * HD + h' * HD; the vision one (one head per group: one
+    // level); odd strides (partial strobes) and 4 KiB crossings at HD 96.
+    // Appended last: the earlier fixtures keep their indices.
+    // -----------------------------------------------------------------------
+    {
+        struct YP { const char* name; unsigned oc, oh, ow, ic, cs, cn, gs; };
+        const YP yps[] = {
+            {"y pattern: attention P.V G=3 T=16 HD=64 (cs 576 cn 16 gs 64)", 48, 4, 16, 16, 576, 16, 64},
+            {"y pattern: vision P.V one group T=32 HD=64 (cs 768)",          32, 4, 16, 16, 768,  0,  0},
+            {"y pattern: odd strides HD=96 cn 32 (cs 199 gs 101)",           40, 6, 16, 16, 199, 32, 101},
+        };
+        for (const YP& y : yps) {
+            ConvParams p{};
+            p.batch=1; p.in_ch=y.ic; p.in_h=y.oh; p.in_w=4*y.ow; p.out_ch=y.oc;
+            p.kh=1; p.kw=4; p.stride_h=1; p.stride_w=4;
+            p.dilation_h=1; p.dilation_w=1;
+            p.pad_top=0; p.pad_left=0; p.pad_bottom=0; p.pad_right=0;
+            p.has_bias=false; p.is_depthwise=false;
+            p.y_cs=y.cs; p.y_cn=y.cn; p.y_gs=y.gs;
+            auto x = rand_vec<Data_t>(p.batch*p.in_ch*p.in_h*p.in_w, 0.5f, rng);
+            auto w = rand_vec<Data_t>(p.out_ch*p.in_ch*p.kh*p.kw,    0.25f, rng);
+            auto b = rand_vec<Data_t>(p.out_ch, 0.1f, rng);
+            total_failures += run_test(y.name, p, x, w, b);
         }
     }
 

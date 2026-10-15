@@ -22,11 +22,11 @@
 //
 // Usage:
 //   Vtb [--fixtures DIR] [--random N] [--seed S] [--timing fast|rand|slow]
-//       [--case "N IC H W OC OH OW KH KW SH SW DH DW PT PL BIAS DW"] [--perf]
+//       [--case "N IC H W OC OH OW KH KW SH SW DH DW PT PL BIAS DW [YCS YCN YGS]"] [--perf]
 //       [--case-file F] [--only I,J,...] [--no-oracle] [--quiet] [--max-cycles N]
 //       [--trace FILE]
-//   --case-file reads one --case geometry per line (17 numbers, then an
-//   optional label; '#' comments).  --only runs the listed cases (0-based
+//   --case-file reads one --case geometry per line (17 numbers, the y
+//   pattern's three optional, then an optional label; '#' comments).  --only runs the listed cases (0-based
 //   positions in the list built above).  --no-oracle skips the model oracle
 //   (cycle counts only: the protocol and stray-write checks stay).
 // ---------------------------------------------------------------------------
@@ -73,6 +73,7 @@ enum : uint8_t {
   R_IN_H = 0x50, R_IN_W = 0x58, R_OUT_CH = 0x60, R_OUT_H = 0x68, R_OUT_W = 0x70,
   R_KH = 0x78, R_KW = 0x80, R_SH = 0x88, R_SW = 0x90, R_DH = 0x98, R_DW = 0xA0,
   R_PT = 0xA8, R_PL = 0xB0, R_BIAS = 0xB8, R_DWM = 0xC0,
+  R_YCS = 0xC8, R_YCN = 0xD0, R_YGS = 0xD8,             // the y channel pattern (RPU_PLAN §13.2)
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ struct Case {
   std::string label;
   uint32_t n = 1, ic = 1, h = 1, w = 1, oc = 1, oh = 1, ow = 1, kh = 1, kw = 1;
   uint32_t sh = 1, sw = 1, dh = 1, dw = 1, pt = 0, pl = 0, bias = 0, dwm = 0;
+  uint32_t ycs = 0, ycn = 0, ygs = 0;    // the y channel pattern; 0 0 0 = dense NCHW
   uint64_t x = 0, wt = 0, b = 0, y = 0;  // byte addresses
   std::vector<uint16_t> xv, wv, bv, yv;  // fixture data, packed (empty: random)
   int  data_mode = 0;
@@ -103,6 +105,20 @@ static uint64_t w_elems(const Case& t) { return t.dwm ? t.oc * dw_stride(t) : t.
 static uint64_t b_elems(const Case& t) { return ((uint64_t)t.oc + 7) / 8 * 8; }
 static uint64_t y_elems(const Case& t) { return (uint64_t)t.n * t.oc * t.oh * t.ow; }
 static uint64_t words_of(uint64_t e) { return (e + 7) / 8; }
+static bool y_pattern(const Case& t) { return t.ycs || t.ycn || t.ygs; }
+// element offset of image ni's channel c (ConvKernel.h: (c mod y_cn) * y_cs + (c div y_cn) * y_gs)
+static uint64_t y_base(const Case& t, uint32_t ni, uint32_t c) {
+  const uint64_t hw = (uint64_t)t.oh * t.ow, cs = t.ycs ? t.ycs : hw;
+  const uint64_t cb = t.ycn ? (uint64_t)(c % t.ycn) * cs + (uint64_t)(c / t.ycn) * t.ygs : c * cs;
+  return (uint64_t)ni * t.oc * hw + cb;
+}
+// elements from y to one past the last one the job writes
+static uint64_t y_span(const Case& t) {
+  if (!y_pattern(t)) return y_elems(t);
+  uint64_t e = 0;
+  for (uint32_t c = 0; c < t.oc; c++) e = std::max(e, y_base(t, 0, c) + (uint64_t)t.oh * t.ow);
+  return e;
+}
 
 static bool in_contract(const Case& t) {
   const uint64_t mt = (t.oc + 15) / 16;
@@ -110,7 +126,8 @@ static bool in_contract(const Case& t) {
          t.kh >= 1 && t.kh <= 7 && t.kw >= 1 && t.kw <= 7 && t.sh >= 1 && t.sw >= 1 &&
          t.dh >= 1 && t.dw >= 1 && (t.kh == 1 || t.dh < 16) && (t.kw == 1 || t.dw < 64) &&
          (uint64_t)(t.kh - 1) * t.dh < 16 && (uint64_t)(t.kw - 1) * t.dw < 64 &&
-         (uint64_t)t.ow * mt * 16 <= 65536;
+         (uint64_t)t.ow * mt * 16 <= 65536 &&
+         t.ycn % 16 == 0 && t.ycn <= 1280 && (!y_pattern(t) || t.n == 1 || (!t.ycs && !t.ycn));
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +274,7 @@ struct Tb {
     const uint64_t xw = words_of(x_elems(t)) + 1;            // a run reads up to 7 past the end
     const uint64_t ww = words_of(w_elems(t)) + 1;
     const uint64_t bw = words_of(b_elems(t)) + 1;
-    const uint64_t yw = words_of(y_elems(t)) + 1;
+    const uint64_t yw = words_of(y_span(t)) + 1;
 
     // ---- place data -----------------------------------------------------------------
     if (t.wv.empty() && in_contract(t) && !t.no_oracle) t.wv = pack(t);
@@ -288,7 +305,7 @@ struct Tb {
         hls::burst_maxi<WeightWord> pw(ow_.data()), pb(ob.data());
         hls::burst_maxi<YWord> py(oy.data());
         ConvKernel(px, pw, pb, py, t.n, t.ic, t.h, t.w, t.oc, t.oh, t.ow, t.kh, t.kw, t.sh, t.sw,
-                   t.dh, t.dw, t.pt, t.pl, t.bias, t.dwm);
+                   t.dh, t.dw, t.pt, t.pl, t.bias, t.dwm, t.ycs, t.ycn, t.ygs);
       }
       std::fflush(stdout);
       dup2(saved, 1);
@@ -306,16 +323,20 @@ struct Tb {
     lite.write(R_SH, t.sh); lite.write(R_SW, t.sw); lite.write(R_DH, t.dh); lite.write(R_DW, t.dw);
     lite.write(R_PT, t.pt); lite.write(R_PL, t.pl); lite.write(R_BIAS, t.bias);
     lite.write(R_DWM, t.dwm);
+    lite.write(R_YCS, t.ycs); lite.write(R_YCN, t.ycn); lite.write(R_YGS, t.ygs);   // always: they persist
     lite.write(R_GIE, 1); lite.write(R_IER, 1);
     if (lite.read(R_IN_CH) != t.ic || lite.read(R_Y) != (uint32_t)t.y || lite.read(R_DWM) != t.dwm ||
-        lite.read(R_W + 4) != (uint32_t)(t.wt >> 32) || lite.read(R_DW) != t.dw)
+        lite.read(R_W + 4) != (uint32_t)(t.wt >> 32) || lite.read(R_DW) != t.dw ||
+        lite.read(R_YCS) != t.ycs || lite.read(R_YCN) != t.ycn || lite.read(R_YGS) != t.ygs)
       tb_fatal("register read-back mismatch");
     if (!(lite.read(R_CTRL) & 4)) tb_fatal("kernel not idle before start");
 
-    char geo[160];
-    std::snprintf(geo, sizeof geo, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
-                  t.n, t.ic, t.h, t.w, t.oc, t.oh, t.ow, t.kh, t.kw, t.sh, t.sw, t.dh, t.dw,
-                  t.pt, t.pl, t.bias, t.dwm);
+    char geo[200];
+    int gl = std::snprintf(geo, sizeof geo, "%u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+                           t.n, t.ic, t.h, t.w, t.oc, t.oh, t.ow, t.kh, t.kw, t.sh, t.sw, t.dh, t.dw,
+                           t.pt, t.pl, t.bias, t.dwm);
+    if (y_pattern(t))
+      std::snprintf(geo + gl, sizeof geo - gl, " %u %u %u", t.ycs, t.ycn, t.ygs);
     lite.write(R_CTRL, 1);
     const uint64_t t0 = g_cycle;
     while (!top->__SYM__interrupt) {
@@ -359,13 +380,17 @@ struct Tb {
           if (got != exp) report("hls", 8 * w + l, got, exp);
         }
 #endif
-    if (!t.yv.empty())                                  // fixture: every element vs y.hex
+    const uint64_t ohw = (uint64_t)t.oh * t.ow;
+    if (!t.yv.empty())                                  // fixture: every element vs y.hex (dense)
       for (uint64_t e = 0; e < y_elems(t) && e < t.yv.size(); e++) {
-        const uint16_t got = mem.rd16(t.y + 2 * e);
+        const uint64_t at = y_base(t, (uint32_t)(e / ohw / t.oc), (uint32_t)(e / ohw % t.oc)) + e % ohw;
+        const uint16_t got = mem.rd16(t.y + 2 * at);
         if (got != t.yv[e]) report("fixture", e, got, t.yv[e]);
       }
-    if (!expect_none)
-      for (uint64_t i = 0; i < 2 * y_elems(t); i++) mem.unmark(t.y + i);
+    if (!expect_none)                                   // the planes the job writes (no gap)
+      for (uint32_t ni = 0; ni < t.n; ni++)
+        for (uint32_t c = 0; c < t.oc; c++)
+          for (uint64_t i = 0; i < 2 * ohw; i++) mem.unmark(t.y + 2 * y_base(t, ni, c) + i);
     size_t stray = 0;
     for (auto& kv : mem.written)
       for (int i = 0; i < 4096; i++)
@@ -404,7 +429,7 @@ static void place(Case& t, std::mt19937& rng) {
   t.x  = next(words_of(x_elems(t)) + 1);
   t.wt = next(words_of(w_elems(t)) + 1);
   t.b  = next(words_of(b_elems(t)) + 1);
-  t.y  = next(words_of(y_elems(t)) + 1);
+  t.y  = next(words_of(y_span(t)) + 1);
 }
 
 static uint32_t out_dim(uint32_t in, uint32_t pad0, uint32_t pad1, uint32_t k, uint32_t d, uint32_t s) {
@@ -470,7 +495,27 @@ static Case random_case(std::mt19937& rng) {
                          case 2: t.oh = 0; break; default: t.ow = 0; }
       t.no_oracle = true;
     }
+    if (!t.no_oracle && U(0, 3) == 0) {                  // the y channel pattern (RPU_PLAN §13.2)
+      const uint32_t hw = t.oh * t.ow, tiles = (t.oc + 15) / 16;
+      switch (U(0, 2)) {
+        case 0: {                                        // attention: the groups' planes side by side per row
+          t.ycn = 16 * U(1, tiles);
+          const uint32_t g = (t.oc + t.ycn - 1) / t.ycn;
+          t.ygs = hw + U(0, 20);
+          t.ycs = g * t.ygs + U(0, 30);
+          break;
+        }
+        case 1: t.ycs = hw + U(0, 100); break;           // one group, a gap after every plane
+        default:                                         // blocks of y_cn planes
+          t.ycn = 16 * U(1, tiles);
+          t.ycs = hw + U(0, 9);
+          t.ygs = t.ycn * t.ycs + U(0, 50);
+      }
+      if (U(0, 9) == 0) t.ycn += 8;                      // outside the contract: part of an m-tile
+      if (t.n > 1 && U(0, 1)) t.n = 1;                   // else outside it: a pattern needs one image
+    }
     if (!t.no_oracle && in_contract(t) && (uint64_t)t.ow * ((t.oc + 15) / 16) * 16 > 65536) continue;
+    if (y_span(t) > 600000) continue;
     // keep the job small: elements and MAC instants
     const uint64_t inst = (uint64_t)t.n * t.oh * ((t.ow + 1) / 2) * t.kh * t.kw *
                           (t.dwm ? (t.oc + 15) / 16 : ((t.oc + 15) / 16) * ((t.ic + 15) / 16));
@@ -480,8 +525,8 @@ static Case random_case(std::mt19937& rng) {
   }
   t.data_mode = (int)U(0, 2);
   char buf[128];
-  std::snprintf(buf, sizeof buf, "rand_%s%ux%ux%ux%u_%u_k%ux%u_s%ux%u", t.dwm ? "dw" : "",
-                t.n, t.ic, t.h, t.w, t.oc, t.kh, t.kw, t.sh, t.sw);
+  std::snprintf(buf, sizeof buf, "rand_%s%s%ux%ux%ux%u_%u_k%ux%u_s%ux%u", t.dwm ? "dw" : "",
+                y_pattern(t) ? "yp" : "", t.n, t.ic, t.h, t.w, t.oc, t.kh, t.kw, t.sh, t.sw);
   t.label = buf;
   return t;
 }
@@ -513,10 +558,16 @@ static std::vector<Case> load_fixtures(const std::string& dir) {
     if (tok.size() < 19) continue;
     Case t;
     const int idx = std::stoi(tok[0]);
-    // idx batch in_ch in_h in_w out_ch out_h out_w kh kw sh sw dh dw pt pl has_bias is_dw label
+    // idx batch in_ch in_h in_w out_ch out_h out_w kh kw sh sw dh dw pt pl has_bias is_dw
+    //     [y_cs y_cn y_gs] label
     uint32_t* f17[] = {&t.n, &t.ic, &t.h, &t.w, &t.oc, &t.oh, &t.ow, &t.kh, &t.kw, &t.sh, &t.sw,
                        &t.dh, &t.dw, &t.pt, &t.pl, &t.bias, &t.dwm};
     for (int i = 0; i < 17; i++) *f17[i] = (uint32_t)std::stoul(tok[1 + i]);
+    if (tok.size() >= 22) {
+      t.ycs = (uint32_t)std::stoul(tok[18]);
+      t.ycn = (uint32_t)std::stoul(tok[19]);
+      t.ygs = (uint32_t)std::stoul(tok[20]);
+    }
     t.label = "fx" + tok[0] + "_" + tok.back();
     if (t.label.size() > 44) t.label.resize(44);
     char pre[32];
@@ -595,8 +646,15 @@ int main(int argc, char** argv) {
     is >> t.n >> t.ic >> t.h >> t.w >> t.oc >> t.oh >> t.ow >> t.kh >> t.kw >> t.sh >> t.sw >> t.dh
        >> t.dw >> t.pt >> t.pl >> t.bias >> t.dwm;
     if (!is) tb_fatal("bad case geometry: %s", line.c_str());
-    std::string l;
-    t.label = (is >> l) ? l : label;
+    std::vector<std::string> rest;                     // [y_cs y_cn y_gs] [label]
+    for (std::string w; is >> w;) rest.push_back(w);
+    auto num = [](const std::string& w) { return !w.empty() && w.find_first_not_of("0123456789") == std::string::npos; };
+    size_t k = 0;
+    if (rest.size() >= 3 && num(rest[0]) && num(rest[1]) && num(rest[2])) {
+      t.ycs = (uint32_t)std::stoul(rest[0]); t.ycn = (uint32_t)std::stoul(rest[1]);
+      t.ygs = (uint32_t)std::stoul(rest[2]); k = 3;
+    }
+    t.label = (k < rest.size()) ? rest[k] : label;
     if (t.label.size() > 44) t.label.resize(44);
     return t;
   };

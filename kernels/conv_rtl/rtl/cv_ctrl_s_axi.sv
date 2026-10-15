@@ -10,6 +10,8 @@
 //   0x50 in_h  0x58 in_w  0x60 out_ch  0x68 out_h  0x70 out_w  0x78 kh  0x80 kw
 //   0x88 stride_h  0x90 stride_w  0x98 dilation_h  0xA0 dilation_w
 //   0xA8 pad_top  0xB0 pad_left  0xB8 has_bias  0xC0 is_depthwise
+//   0xC8 y_cs  0xD0 y_cn  0xD8 y_gs — the y channel pattern (RPU_PLAN §13.2;
+//   0 = the dense NCHW output of the HLS kernel)
 //
 // Like the HLS slave, AW and W are taken one after the other and every
 // access gets an OKAY response.  The AXI inputs only reach a few registers:
@@ -69,7 +71,10 @@ module cv_ctrl_s_axi (
   output logic [31:0] pad_top,
   output logic [31:0] pad_left,
   output logic [31:0] has_bias,
-  output logic [31:0] is_depthwise
+  output logic [31:0] is_depthwise,
+  output logic [31:0] y_cs,
+  output logic [31:0] y_cn,
+  output logic [31:0] y_gs
 );
   localparam logic [7:0] A_CTRL = 8'h00, A_GIE = 8'h04, A_IER = 8'h08, A_ISR = 8'h0C,
                           A_X0 = 8'h10, A_X1 = 8'h14, A_WEIGHT0 = 8'h1C, A_WEIGHT1 = 8'h20,
@@ -78,7 +83,8 @@ module cv_ctrl_s_axi (
                           A_OUT_CH = 8'h60, A_OUT_H = 8'h68, A_OUT_W = 8'h70, A_KH = 8'h78,
                           A_KW = 8'h80, A_STRIDE_H = 8'h88, A_STRIDE_W = 8'h90,
                           A_DIL_H = 8'h98, A_DIL_W = 8'hA0, A_PAD_TOP = 8'hA8,
-                          A_PAD_LEFT = 8'hB0, A_HAS_BIAS = 8'hB8, A_IS_DW = 8'hC0;
+                          A_PAD_LEFT = 8'hB0, A_HAS_BIAS = 8'hB8, A_IS_DW = 8'hC0,
+                          A_Y_CS = 8'hC8, A_Y_CN = 8'hD0, A_Y_GS = 8'hD8;
 
   // Write channel ------------------------------------------------------------------
   typedef enum logic [1:0] {WR_IDLE, WR_DATA, WR_RESP} wst_t;
@@ -163,6 +169,9 @@ module cv_ctrl_s_axi (
       pad_left <= '0;
       has_bias <= '0;
       is_depthwise <= '0;
+      y_cs <= '0;
+      y_cn <= '0;
+      y_gs <= '0;
     end else begin
       int_irq <= int_gie && (|int_isr);
 
@@ -217,6 +226,9 @@ module cv_ctrl_s_axi (
           A_PAD_LEFT: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) pad_left[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           A_HAS_BIAS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) has_bias[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           A_IS_DW: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) is_depthwise[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y_CS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y_cs[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y_CN: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y_cn[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_Y_GS: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) y_gs[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end
@@ -282,6 +294,9 @@ module cv_ctrl_s_axi (
         A_PAD_LEFT: rdata <= pad_left;
         A_HAS_BIAS: rdata <= has_bias;
         A_IS_DW: rdata <= is_depthwise;
+        A_Y_CS: rdata <= y_cs;
+        A_Y_CN: rdata <= y_cn;
+        A_Y_GS: rdata <= y_gs;
         default: ;
       endcase
     end

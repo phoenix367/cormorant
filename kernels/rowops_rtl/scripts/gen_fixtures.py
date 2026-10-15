@@ -6,10 +6,17 @@ the whole C region after the job (untouched bytes keep the 0xDE poison).
 The testbench runs them against the RTL and against its own C++ oracle, so
 the oracle is checked against the Python specification by the same files.
 
+Descriptor chains (doc/kernels/ROWOPS_RTL_KERNEL.md §1.6): chains/manifest.txt
++ chains/chain_NN_{mem,out}.hex — one segment per chain holding every job's
+regions (inputs, parameter blocks, the outputs poisoned 0xDE, the gaps 0x5A)
+before and after the chain; later jobs read what earlier ones wrote.
+
     python3 scripts/gen_fixtures.py [--out DIR] [--check]
 
 Formats: 16-byte words as 32 hex digits per line, byte 0 first.  Manifest:
   idx op n c1 c2 a_s1 a_s2 b_s1 b_s2 c_s1 c_s2 eps aux bq_sh win_lo win_hi label
+chains/manifest.txt, one line per job (a, b, c, p: byte offsets into the segment):
+  chain job op n c1 c2 a a_s1 a_s2 b b_s1 b_s2 c c_s1 c_s2 p eps aux bq_sh win_lo win_hi label
 """
 import argparse
 import importlib.util
@@ -34,9 +41,9 @@ F_B_EN, F_P_BCAST, F_P_KEEP, F_RELU, F_NORM_LN = 1 << 12, 1 << 13, 1 << 14, 1 <<
 POISON = 0xDE
 
 
-def opword(code, ak=I16, bk=I16, ck=I16, b_en=False, bcast=False, relu=False, ln=False):
+def opword(code, ak=I16, bk=I16, ck=I16, b_en=False, bcast=False, relu=False, ln=False, p_keep=False):
     return (code | (ak << 4) | (bk << 6) | (ck << 8) | (F_B_EN if b_en else 0) | (F_P_BCAST if bcast else 0)
-            | (F_RELU if relu else 0) | (F_NORM_LN if ln else 0))
+            | (F_RELU if relu else 0) | (F_NORM_LN if ln else 0) | (F_P_KEEP if p_keep else 0))
 
 
 def kbytes(k):
@@ -425,6 +432,272 @@ def build_cases():
     return cases
 
 
+# ---- descriptor chains ------------------------------------------------------------------
+GAP = 0x5A
+
+
+class Seg:
+    """A chain's DDR segment: regions allocated 16-byte aligned with 64-byte gaps (0x5A).
+    `b0` is the image before the chain; the jobs' outputs are computed in order from `b`
+    (the image as the jobs before them left it) and written into it."""
+
+    def __init__(self):
+        self.b0 = bytearray()
+        self.b = bytearray()
+
+    def alloc(self, nbytes, fill=None):
+        assert len(self.b) == len(self.b0)
+        off = round16(len(self.b0) + 64)
+        new = bytes([GAP]) * (off - len(self.b0))
+        new += bytes(fill) if fill is not None else bytes([POISON]) * nbytes
+        new += bytes([POISON]) * max(0, off + nbytes - len(self.b0) - len(new))
+        self.b0 += new
+        self.b += new
+        return off
+
+    def rows(self, off, s1, s2, c1, c2, n, kind):
+        """[c2 * c1][n] int64 of the rows (i2, i1) at off + i2 s2 + i1 s1."""
+        fmt = {I16: "<h", I32: "<i"}[kind]
+        nb = kbytes(kind)
+        out = np.zeros((c2 * c1, n), np.int64)
+        for i2 in range(c2):
+            for i1 in range(c1):
+                o = off + i2 * s2 + i1 * s1
+                out[i2 * c1 + i1] = [struct.unpack_from(fmt, self.b, o + nb * c)[0] for c in range(n)]
+        return out
+
+    def put_rows(self, off, s1, s2, c1, c2, vals, kind):
+        """Whole-word rows: the lanes past n of the last word written 0."""
+        for i2 in range(c2):
+            for i1 in range(c1):
+                data = pack(vals[i2 * c1 + i1], kind)
+                data += bytes(round16(len(data)) - len(data))
+                o = off + i2 * s2 + i1 * s1
+                self.b[o: o + len(data)] = data
+
+
+def stream_formula(x, b, prm, bq_sh, ck, relu=False):
+    """COPY / ADDX per column (rowops_spec's formula: one rounding, saturation, RELU)."""
+    rows, n = x.shape
+    y = np.zeros((rows, n), np.int64)
+    for r in range(rows):
+        for c in range(n):
+            g, bq, sa, sb, sc = prm[0] if len(prm) == 1 else prm[c]
+            v = rne_shr((int(x[r, c]) << sa) + ((int(b[r, c]) << sb) if b is not None else 0) + (bq << bq_sh), sc)
+            v = max(-32768, min(32767, v)) if ck == I16 else max(-(1 << 31), min((1 << 31) - 1, v))
+            y[r, c] = 0 if (relu and v < 0) else v
+    return y
+
+
+def chain_job(label, op, n, c1, c2, a=0, a_s=(0, 0), b=0, b_s=(0, 0), c=0, c_s=(0, 0), p=0, eps=0, aux=0,
+              bq_sh=0, win=(0, 0xFFFFFFFF)):
+    return dict(label=label, op=op, n=n, c1=c1, c2=c2, a=a, a_s1=a_s[0], a_s2=a_s[1], b=b, b_s1=b_s[0],
+                b_s2=b_s[1], c=c, c_s1=c_s[0], c_s2=c_s[1], p=p, eps=eps, aux=aux, bq_sh=bq_sh, win=win)
+
+
+def chain_decode_prep(rng):
+    """A decode step's attention prep (rowops_nodes.AttnPrepRoNode at T = 1, HOSTOPS_PLAN §10,
+    RPU_PLAN §13.4) at a small geometry — HD 16, KV 2, G 2 (H 4), position 5 of a K cache of
+    32 rows, the V image's keys interleaved by 4: RoPE of q and k, the rotated k into the K
+    cache (the groups as blocks), v re-rounded, the q image per group from the rotated q
+    (TRANSPOSE R = G, contiguous), v's granules into the V image (R = 1, byte strobes: the
+    other keys' bytes keep their values), and the q staging zeroed after its transpose."""
+    HD, KV, G, CR, K, pos = 16, 2, 2, 32, 4, 5
+    H = KV * G
+    seg, jobs = Seg(), []
+    # inputs: q, k, v rows (int16), one RoPE cos / sin row
+    q = rng.integers(-32768, 32768, H * HD)
+    k = rng.integers(-32768, 32768, KV * HD)
+    v = rng.integers(-32768, 32768, KV * HD)
+    inv = (1.0 / (10000.0 ** (np.arange(HD // 2) * 2 / HD))).astype(np.float32)
+    ang = (np.float32(pos) * inv).astype(np.float32)
+    cos = np.concatenate([np.cos(ang.astype(np.float64)).astype(np.float32)] * 2).astype(np.float64)
+    sin = np.concatenate([np.sin(ang.astype(np.float64)).astype(np.float32)] * 2).astype(np.float64)
+    c_raw, s_raw = rs.rope_tables_raw(cos[None, :], sin[None, :])
+    o_q = seg.alloc(2 * H * HD, pack(q, I16))
+    o_k = seg.alloc(2 * KV * HD, pack(k, I16))
+    o_v = seg.alloc(2 * KV * HD, pack(v, I16))
+    o_cs = seg.alloc(8 * HD, pack(list(c_raw[0]) + list(s_raw[0]), I32))
+    # the caches hold older positions: their bytes must survive
+    o_kc = seg.alloc(2 * KV * CR * HD, pack(rng.integers(-32768, 32768, KV * CR * HD), I16))
+    VI = 2 * HD * K                                             # bytes of a V image row of K keys
+    o_vi = seg.alloc(KV * (CR // K) * VI, pack(rng.integers(-32768, 32768, KV * (CR // K) * VI // 2), I16))
+    o_qi = seg.alloc(KV * 128)                                  # the q image: 64 bytes per group, 128 apart
+    o_qs = seg.alloc(2 * H * HD)                                # staging rows
+    o_ks = seg.alloc(2 * KV * HD)
+    o_vs = seg.alloc(2 * KV * HD)
+
+    def rope_job(label, src, dst, heads):
+        n = heads * HD
+        f_x = rng.integers(10, 15, (heads, HD))
+        f_out = rng.integers(6, 9, heads)
+        half = HD // 2
+        f_rot = np.concatenate([f_x[:, half:], f_x[:, :half]], 1)
+        fp = np.maximum(f_x, f_rot)
+        prm = [(0, 0, int(fp[h, d] - f_x[h, d]), int(fp[h, d] - f_rot[h, d]), int(fp[h, d] + 23 - f_out[h]))
+               for h in range(heads) for d in range(HD)]
+        o_p = seg.alloc(16 * n, param_bytes(prm))
+        x = seg.rows(src, 0, 0, 1, 1, n, I16).reshape(1, heads, HD)
+        cs = seg.rows(o_cs, 0, 0, 1, 1, 2 * HD, I32)
+        y = rs.rope(x, f_x, cs[:, :HD], cs[:, HD:], f_out[:, None] * np.ones((1, HD), np.int64))
+        seg.put_rows(dst, 0, 0, 1, 1, y.reshape(1, n), I16)
+        jobs.append(chain_job(label, opword(OP["ROPE"], bk=I32, b_en=True), n, 1, 1, a=src, a_s=(round16(2 * n), 0),
+                              b=o_cs, b_s=(8 * HD, 0), c=dst, c_s=(round16(2 * n), 0), p=o_p, aux=HD))
+    rope_job("rope_q", o_q, o_qs, H)
+    rope_job("rope_k", o_k, o_ks, KV)
+    # the rotated k (rope_k's output) into the K cache row pos of every group
+    o_p1 = seg.alloc(16, param_bytes([(0, 0, 0, 0, 0)]))
+    x = seg.rows(o_ks, 0, 2 * HD, 1, KV, HD, I16)
+    seg.put_rows(o_kc + 2 * pos * HD, 2 * HD, 2 * CR * HD, 1, KV, x, I16)
+    jobs.append(chain_job("copy_kcache", opword(OP["COPY"], bcast=True), HD, 1, KV, a=o_ks, a_s=(2 * HD, 2 * HD),
+                          c=o_kc + 2 * pos * HD, c_s=(2 * HD, 2 * CR * HD), p=o_p1))
+    # v re-rounded per column into its staging row
+    prm = [(0, 0, 0, 0, int(rng.integers(0, 4))) for _ in range(KV * HD)]
+    o_p2 = seg.alloc(16 * KV * HD, param_bytes(prm))
+    x = seg.rows(o_v, 0, 0, 1, 1, KV * HD, I16)
+    seg.put_rows(o_vs, 0, 0, 1, 1, stream_formula(x, None, prm, 0, I16), I16)
+    jobs.append(chain_job("copy_v_reround", opword(OP["COPY"]), KV * HD, 1, 1, a=o_v, a_s=(2 * KV * HD, 0),
+                          c=o_vs, c_s=(2 * KV * HD, 0), p=o_p2))
+    # the q image of every group from the rotated q: tile = the group's G heads (rows HD apart)
+    for g in range(KV):
+        rows_ = seg.rows(o_qs + 2 * g * G * HD, 2 * HD, 0, G, 1, HD, I16)
+        img = [int(rows_[r, d]) for d in range(HD) for r in range(G)]
+        seg.put_rows(o_qi + 128 * g, 0, 0, 1, 1, [img], I16)
+    jobs.append(chain_job("xpose_qimage", opword(OP["XPOSE"]), HD, 1, KV, a=o_qs, a_s=(0, 2 * G * HD),
+                          b_s=(2 * HD, 2 * G), c=o_qi, c_s=(0, 128), aux=G))
+    # v's granules into the V image: key pos is lane pos % K of row pos // K, groups VI * CR / K apart
+    c0 = o_vi + (pos // K) * VI + 2 * (pos % K)
+    for g in range(KV):
+        vals = seg.rows(o_vs + 2 * g * HD, 0, 0, 1, 1, HD, I16)[0]
+        for d in range(HD):
+            o = c0 + g * (CR // K) * VI + d * 2 * K
+            seg.b[o: o + 2] = pack([vals[d]], I16)
+    jobs.append(chain_job("xpose_vgranules_r1", opword(OP["XPOSE"]), HD, 1, KV, a=o_vs, a_s=(0, 2 * HD),
+                          b_s=(0, 2 * K), c=c0, c_s=(0, (CR // K) * VI), aux=1))
+    # the q staging zeroed (COPY, window [0, 0)) — after the q image read it
+    seg.put_rows(o_qs, 0, 0, 1, 1, np.zeros((1, H * HD), np.int64), I16)
+    jobs.append(chain_job("copy_zero_qstaging", opword(OP["COPY"], bcast=True), H * HD, 1, 1, a=o_q,
+                          a_s=(2 * H * HD, 0), c=o_qs, c_s=(2 * H * HD, 0), p=o_p1, win=(0, 0)))
+    return jobs, seg
+
+
+def chain_residual_norm(rng):
+    """The residual stream of a decoder layer and Piper's fold at n = 96: the residual add
+    (ADDX, int32), RMSNorm of its output (P loaded), RMSNorm of other rows with P_KEEP (its
+    own p a decoy block), SiLU * up of the normalised rows (the gate at the norm's output
+    exponents), DEQUANT of the residual, FOLD of the SiLU output rows (a halo, the window,
+    m 10, s 1), and a windowed COPY of the residual to int16 with a bias and RELU."""
+    n, c1 = 96, 3
+    seg, jobs = Seg(), []
+    h = np.clip(np.rint(rng.standard_normal((c1, n)) * 2.0 ** 15 * np.array([[1.0], [20.0], [0.05]])),
+                -(1 << 31), (1 << 31) - 1).astype(np.int64)
+    d = rng.integers(-32768, 32768, (c1, n))
+    o_h = seg.alloc(4 * n * c1, pack(h.reshape(-1), I32))
+    o_d = seg.alloc(2 * n * c1, pack(d.reshape(-1), I16))
+    h2 = np.clip(np.rint(rng.standard_normal((2, n)) * 2.0 ** 15 * 3.0), -(1 << 31), (1 << 31) - 1).astype(np.int64)
+    o_h2 = seg.alloc(4 * n * 2, pack(h2.reshape(-1), I32))
+    u = rng.integers(-32768, 32768, (c1, n))
+    o_u = seg.alloc(2 * n * c1, pack(u.reshape(-1), I16))
+    s32, s16 = 4 * n, round16(2 * n)
+    o_r = seg.alloc(s32 * c1)                                   # outputs
+    o_x = seg.alloc(s16 * c1)
+    o_x2 = seg.alloc(s16 * 2)
+    o_m = seg.alloc(s16 * c1)
+    o_f = seg.alloc(s32 * c1)
+    o_c = seg.alloc(s16 * c1)
+    # 0. the residual add: r = h + (d << 7)
+    prm = [(0, 0, 0, 7, 0)]
+    o_p = seg.alloc(16, param_bytes(prm))
+    r = stream_formula(seg.rows(o_h, s32, 0, c1, 1, n, I32), seg.rows(o_d, 2 * n, 0, c1, 1, n, I16), prm, 0, I32)
+    seg.put_rows(o_r, s32, 0, c1, 1, r, I32)
+    jobs.append(chain_job("resadd", opword(OP["ADDX"], ak=I32, bk=I16, ck=I32, b_en=True, bcast=True), n, c1, 1,
+                          a=o_h, a_s=(s32, s32 * c1), b=o_d, b_s=(2 * n, 2 * n * c1), c=o_r, c_s=(s32, s32 * c1),
+                          p=o_p))
+    # 1. RMSNorm of the residual (rowops_spec.rms_norm), per-column output exponents
+    gamma = rng.uniform(0.05, 3.0, n) * rng.choice([-1, 1], n)
+    eps = 1e-5
+    G, g, _b, E = rs.norm_params(gamma, n, eps, 15, rms=True)
+    f_x = rng.integers(7, 11, n)
+    prm = [(int(G[c]), 0, 0, 0, int(24 + g - f_x[c])) for c in range(n)]
+    o_pn = seg.alloc(16 * n, param_bytes(prm))
+    bq_sh = rs.P1_BITS + g - rs.beta_bits(None)
+    x = rs.rms_norm(seg.rows(o_r, s32, 0, c1, 1, n, I32), 15, gamma, eps, f_x)
+    seg.put_rows(o_x, s16, 0, c1, 1, x, I16)
+    jobs.append(chain_job("rms_norm", opword(OP["NORM"], ak=I32), n, c1, 1, a=o_r, a_s=(s32, s32 * c1), c=o_x,
+                          c_s=(s16, s16 * c1), p=o_pn, eps=E, bq_sh=bq_sh))
+    # 2. the same norm of other rows with P_KEEP: p points at a decoy (other gammas)
+    decoy = [(int(-G[c]), 0, 0, 0, int(24 + g - f_x[c]) ^ 1) for c in range(n)]
+    o_pd = seg.alloc(16 * n, param_bytes(decoy))
+    x2 = rs.rms_norm(seg.rows(o_h2, s32, 0, 2, 1, n, I32), 15, gamma, eps, f_x)
+    seg.put_rows(o_x2, s16, 0, 2, 1, x2, I16)
+    jobs.append(chain_job("rms_norm_keep", opword(OP["NORM"], ak=I32, p_keep=True), n, 2, 1, a=o_h2,
+                          a_s=(s32, s32 * 2), c=o_x2, c_s=(s16, s16 * 2), p=o_pd, eps=E, bq_sh=bq_sh))
+    # 3. SiLU * up: the gate is the norm's output at its exponents f_x (rowops_spec.silu_mul)
+    f_u = rng.integers(8, 13, n)
+    f_o = rng.integers(6, 10, n)
+    prm = [(0, 0, int(14 - f_x[c]), 0, int(20 + f_u[c] - f_o[c])) for c in range(n)]
+    o_pm = seg.alloc(16 * n, param_bytes(prm))
+    mres = rs.silu_mul(seg.rows(o_x, s16, 0, c1, 1, n, I16), f_x, seg.rows(o_u, 2 * n, 0, c1, 1, n, I16), f_u, f_o)
+    seg.put_rows(o_m, s16, 0, c1, 1, mres, I16)
+    jobs.append(chain_job("silu_mul", opword(OP["MULACT"], b_en=True), n, c1, 1, a=o_x, a_s=(s16, s16 * c1), b=o_u,
+                          b_s=(2 * n, 2 * n * c1), c=o_m, c_s=(s16, s16 * c1), p=o_pm))
+    # 4. DEQUANT of the residual (int32 at 2^-15 -> float32)
+    o_pq = seg.alloc(16, param_bytes([(0, 0, 0, 0, 15)]))
+    rr = seg.rows(o_r, s32, 0, c1, 1, n, I32)
+    fl = [[struct.unpack("<I", struct.pack("<f", np.float32(int(vv) / 2.0 ** 15)))[0] for vv in row] for row in rr]
+    for i1 in range(c1):
+        seg.b[o_f + i1 * s32: o_f + i1 * s32 + 4 * n] = pack(fl[i1], F32)
+    jobs.append(chain_job("dequant_residual", opword(OP["DEQUANT"], ak=I32, ck=F32, bcast=True), n, c1, 1, a=o_r,
+                          a_s=(s32, s32 * c1), c=o_f, c_s=(s32, s32 * c1), p=o_pq))
+    # 5. FOLD of the SiLU output rows (the channels s16 apart): 2 rows of 44 from -2, 40 apart
+    rows_, w0, hl, W, m, sh = 2, 40, 2, 44, 10, 1
+    src = seg.rows(o_m, s16, 0, c1, 1, n, I16)
+    y = rs.fold(src, rows_, w0, -hl, W, 0, n, m, sh)
+    o_fo = seg.alloc(round16(2 * c1 * rows_ * W))
+    data = pack(y.reshape(-1), I16)
+    seg.b[o_fo: o_fo + round16(len(data))] = data + bytes(round16(len(data)) - len(data))
+    jobs.append(chain_job("fold_silu_rows", OP["FOLD"], W, rows_, c1, a=o_m, a_s=(0, s16), b_s=(w0, (-hl) & 0xFFFFFFFF),
+                          c=o_fo, aux=rs.fold_aux(m, sh), win=(0, n)))
+    # 6. the residual to int16 with a bias and RELU, rows outside [1, 2) read as zeros
+    prm = [(0, int(rng.integers(-3000, 3000)), 0, 0, int(rng.integers(5, 9))) for _ in range(n)]
+    o_pc = seg.alloc(16 * n, param_bytes(prm))
+    xr = seg.rows(o_r, s32, 0, c1, 1, n, I32)
+    xr[[0, 2]] = 0
+    seg.put_rows(o_c, s16, 0, c1, 1, stream_formula(xr, None, prm, 4, I16, relu=True), I16)
+    jobs.append(chain_job("copy_window_relu", opword(OP["COPY"], ak=I32, relu=True), n, c1, 1, a=o_r,
+                          a_s=(s32, s32 * c1), c=o_c, c_s=(s16, s16 * c1), p=o_pc, bq_sh=4, win=(1, 2)))
+    return jobs, seg
+
+
+def build_chains():
+    """The chain fixtures: (jobs, segment before, segment after) per chain."""
+    rng = np.random.default_rng(2028)
+    out = []
+    for build in (chain_decode_prep, chain_residual_norm):
+        jobs, seg = build(rng)
+        assert len(seg.b) == len(seg.b0)
+        out.append((jobs, bytes(seg.b0), bytes(seg.b)))
+    return out
+
+
+def chain_files():
+    """{relative path: text} of the chain fixtures (chains/)."""
+    files = {}
+    lines = ["# RowOpsKernel RTL chain fixtures (scripts/gen_fixtures.py): one line per job, the jobs of a chain "
+             "in order; a b c p are byte offsets into the chain's segment (chain_NN_mem.hex before the chain, "
+             "chain_NN_out.hex after it)",
+             "# chain job op n c1 c2 a a_s1 a_s2 b b_s1 b_s2 c c_s1 c_s2 p eps aux bq_sh win_lo win_hi label"]
+    for ci, (jobs, before, after) in enumerate(build_chains()):
+        files[f"chains/chain_{ci:02d}_mem.hex"] = hexlines(before)
+        files[f"chains/chain_{ci:02d}_out.hex"] = hexlines(after)
+        for ji, j in enumerate(jobs):
+            lines.append(f"{ci} {ji} {j['op']} {j['n']} {j['c1']} {j['c2']} {j['a']} {j['a_s1']} {j['a_s2']} "
+                         f"{j['b']} {j['b_s1']} {j['b_s2']} {j['c']} {j['c_s1']} {j['c_s2']} {j['p']} {j['eps']} "
+                         f"{j['aux']} {j['bq_sh']} {j['win'][0]} {j['win'][1]} {j['label']}")
+    files["chains/manifest.txt"] = "\n".join(lines) + "\n"
+    return files
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--out", default=OUT)
@@ -445,21 +718,23 @@ def main():
                      f"{c.bq_sh} {c.win[0]} {c.win[1]} {c.label}")
     files["tables.hex"] = hexlines(table_image())
     files["manifest.txt"] = "\n".join(lines) + "\n"
+    files.update(chain_files())
     if args.check:
         bad = [f for f, t in files.items()
                if not os.path.exists(os.path.join(args.out, f)) or open(os.path.join(args.out, f)).read() != t]
         if bad:
             print(f"{args.out}: {len(bad)} files differ: {bad[:4]}", file=sys.stderr)
             return 1
-        print(f"{args.out}: {len(cases)} cases up to date")
+        print(f"{args.out}: {len(cases)} cases and the chains up to date")
         return 0
-    os.makedirs(args.out, exist_ok=True)
-    for f in os.listdir(args.out):
-        if f.startswith("test_") and f.endswith(".hex"):
-            os.remove(os.path.join(args.out, f))
+    os.makedirs(os.path.join(args.out, "chains"), exist_ok=True)
+    for d, pre in ((args.out, "test_"), (os.path.join(args.out, "chains"), "chain_")):
+        for f in os.listdir(d):
+            if f.startswith(pre) and f.endswith(".hex"):
+                os.remove(os.path.join(d, f))
     for f, t in files.items():
         open(os.path.join(args.out, f), "w").write(t)
-    print(f"{args.out}: {len(cases)} cases, {len(files)} files")
+    print(f"{args.out}: {len(cases)} cases + the chains, {len(files)} files")
     return 0
 
 

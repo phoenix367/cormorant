@@ -4,7 +4,8 @@
 // level is the Verilog wrapper RowOpsKernel.v (generated from this header by
 // scripts/gen_top_wrapper.py); all logic lives here.
 //
-//   ap_start ─► config ─► [P load: rd_port B ─► ro_param]
+//   ap_start ─► [chain: descriptors, rd_port B ─► descriptor RAM] ─► for each job:
+//               config ─► [P load: rd_port B ─► ro_param]
 //                      ─► rd_port A (ARID 0) ─┐
 //                         rd_port B (ARID 1) ─┴► ro_stream / ro_norm / ro_rope / ro_xpose / ro_fold ─► wr_port
 //                         (one AXI read channel through ro_rd_arb; one write channel)
@@ -116,8 +117,8 @@ module ro_core #(
   // Control slave ------------------------------------------------------------------
   logic        ap_start, ap_done, ap_idle;
   logic [31:0] r_op, r_n, r_rows, r_blocks, r_as1, r_as2, r_bs1, r_bs2, r_cs1, r_cs2;
-  logic [31:0] r_aux, r_bqsh, r_wlo, r_whi;
-  logic [63:0] r_a, r_b, r_c, r_p, r_eps;
+  logic [31:0] r_aux, r_bqsh, r_wlo, r_whi, r_chain_n;
+  logic [63:0] r_a, r_b, r_c, r_p, r_eps, r_chain;
 
   ro_ctrl_s_axi u_ctrl (
     .clk, .rst (rst_c),
@@ -133,11 +134,23 @@ module ro_core #(
     .op (r_op), .n (r_n), .rows (r_rows), .blocks (r_blocks),
     .a (r_a), .a_s1 (r_as1), .a_s2 (r_as2), .b (r_b), .b_s1 (r_bs1), .b_s2 (r_bs2),
     .c (r_c), .c_s1 (r_cs1), .c_s2 (r_cs2), .p (r_p), .eps (r_eps), .aux (r_aux),
-    .bq_sh (r_bqsh), .win_lo (r_wlo), .win_hi (r_whi)
+    .bq_sh (r_bqsh), .win_lo (r_wlo), .win_hi (r_whi), .chain (r_chain), .chain_n (r_chain_n)
   );
 
+  // The ports' stream handshakes (declared here: the job FSM below uses them)
+  logic          a_valid, a_ready, b_valid, b_ready, w_valid, w_ready;
+  logic [BW-1:0] a_data, b_data, w_data;
+  logic [BW/8-1:0] w_strb;
+  logic          a_idle, b_idle, wr_idle;
+
   // Job configuration ------------------------------------------------------------------
-  typedef enum logic [3:0] {T_IDLE, T_LAT, T_CFG0, T_CFG1, T_CFG2, T_PLD, T_PWAIT, T_RUN, T_DONE} tst_t;
+  // T_IDLE -> T_LAT (the job registers j_* load) -> T_CFG0 .. T_CFG2 -> [T_PLD, T_PWAIT]
+  // -> T_RUN -> T_DONE (ap_done).  A chain (chain_n != 0, §1.6) goes T_LAT -> T_DF /
+  // T_DFW (the descriptors fetched into the descriptor RAM) -> T_DLD -> T_LAT (j_* load
+  // from the RAM's registered read, the index moves on) -> ... -> T_RUN, and from T_RUN
+  // back to T_DLD for the next job; T_DONE only after the last.
+  typedef enum logic [3:0] {T_IDLE, T_LAT, T_CFG0, T_CFG1, T_CFG2, T_PLD, T_PWAIT, T_RUN, T_DONE,
+                            T_DF, T_DFW, T_DLD} tst_t;
   tst_t        tstate;
   logic [31:0] j_op, j_n, j_rows, j_blocks, j_as1, j_as2, j_bs1, j_bs2, j_cs1, j_cs2, j_aux, j_bqsh;
   logic [31:0] j_wlo, j_whi;
@@ -240,21 +253,65 @@ module ro_core #(
     end
   end
 
+  // Descriptor chains (§1.6): the chain's state, latched with ap_start.
+  logic        ch_on;                         // this start runs a chain (chain_n != 0)
+  logic        ch_pend;                       // its descriptors are still to be fetched
+  logic        ch_more;                       // a job of the chain follows the current one
+  logic [3:0]  ch_last;                       // min(chain_n, CHAIN_MAX) - 1
+  logic [59:0] ch_base;                       // word address of the descriptor list
+  logic [3:0]  jidx;                          // the descriptor RAM's read index: the next job to load
+  logic        dfe_start, dfe_q, dfe_q2;      // the descriptor fetch's port start
+  logic        dfetch;                        // port B's words are descriptor beats
+  logic        d_we;                          // the registered beat is written to the RAM
+  logic [6:0]  dw, d_at;                      // beats taken: descriptor [6:3], beat [2:0]; the registered one
+  logic [BW-1:0] d_data;
+  geom_t       gd;                            // the list: one run of min(chain_n, 16) * 8 words
+
   always_ff @(posedge clk) begin
     if (rst) begin
       tstate    <= T_IDLE;
       job_start <= 1'b0;
       pld_start <= 1'b0;
+      dfe_start <= 1'b0;
       ld_j      <= 1'b0;
       ld_g      <= 1'b0;
+      ch_on     <= 1'b0;
+      ch_pend   <= 1'b0;
+      ch_more   <= 1'b0;
+      jidx      <= '0;
     end else begin
       job_start <= 1'b0;
       pld_start <= 1'b0;
-      ld_j      <= (tstate == T_IDLE) && ap_start;
+      dfe_start <= 1'b0;
+      ld_j      <= ((tstate == T_IDLE) && ap_start) || (tstate == T_DLD);
       ld_g      <= (tstate == T_CFG1);
+      if ((tstate == T_IDLE) && ap_start) begin
+        ch_on   <= (r_chain_n != '0);
+        ch_pend <= (r_chain_n != '0);
+        ch_more <= 1'b0;
+        ch_last <= (r_chain_n > 32'(CHAIN_MAX)) ? 4'(CHAIN_MAX - 1) : 4'(r_chain_n - 32'd1);
+        ch_base <= r_chain[63:4];
+        jidx    <= '0;
+      end
+      // A chain's job loads its descriptor (ld_j in T_LAT): the read index moves on to the
+      // next one at once (the RAM's output register holds it long before the job ends),
+      // so job_done reaches the state alone, as for a single job.
+      if ((tstate == T_LAT) && ch_on && !ch_pend) begin
+        jidx    <= jidx + 4'd1;
+        ch_more <= jidx != ch_last;
+      end
       case (tstate)
         T_IDLE:  if (ap_start) tstate <= T_LAT;
-        T_LAT:   tstate <= T_CFG0;
+        T_LAT:   if (ch_pend) begin                 // a chain: its descriptors first
+          ch_pend   <= 1'b0;
+          dfe_start <= 1'b1;
+          tstate    <= T_DF;
+        end else begin
+          tstate <= T_CFG0;
+        end
+        T_DF:    tstate <= T_DFW;
+        T_DFW:   if (!dfe_q && !dfe_q2 && !dfetch && !d_we && b_idle) tstate <= T_DLD;
+        T_DLD:   tstate <= T_LAT;                   // the descriptor RAM's registered read is valid; ld_j next
         T_CFG0:  tstate <= T_CFG1;
         T_CFG1:  tstate <= T_CFG2;
         T_CFG2:  begin                          // geometries loaded (ld_g); nrows valid
@@ -273,21 +330,66 @@ module ro_core #(
           job_start <= 1'b1;
           tstate    <= T_RUN;
         end
-        T_RUN:   if (job_done) tstate <= T_DONE;
+        T_RUN:   if (job_done) tstate <= ch_more ? T_DLD : T_DONE;   // every unit idle, every B response back
         T_DONE:  tstate <= T_IDLE;
         default: tstate <= T_IDLE;
       endcase
     end
   end
 
+  // The descriptor fetch: port B reads the list as one run (bursts of <= 64 beats within
+  // 4 KiB, ARID 1) while `loading` keeps its words from the units and ro_param (whose load
+  // is idle: no entry is written); beats 0 .. 5 of every descriptor go to the RAM.
+  assign gd = mk_geom(1'b1, {ch_base, 4'b0}, 32'd0, 32'd1, 32'd0, 32'd1, {24'b0, ({1'b0, ch_last} + 5'd1), 3'b0},
+                      4'd8, 32'd0, 32'hFFFFFFFF);
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      dfetch <= 1'b0;
+      d_we   <= 1'b0;
+    end else begin
+      d_we <= dfetch && b_valid && (dw[2:0] < 3'(DESC_USED));
+      if (dfe_start) begin
+        dfetch <= 1'b1;
+        dw     <= '0;
+      end else if (dfetch && b_valid) begin           // b_ready is high while fetching
+        dw <= dw + 7'd1;
+        if (dw == {ch_last, 3'b111}) dfetch <= 1'b0;
+      end
+    end
+    d_at   <= dw;
+    d_data <= b_data;
+  end
+
+  // The descriptor RAM: one LUTRAM of CHAIN_MAX x 128 bits per used beat (its own write
+  // enable), read at the job index into registers; the job registers load from those.
+  logic [BW-1:0] dq [DESC_USED];
+  for (genvar k = 0; k < DESC_USED; k++) begin : g_dram
+    (* ram_style = "distributed" *) logic [BW-1:0] mem [CHAIN_MAX];
+    logic [BW-1:0] q;
+    always_ff @(posedge clk) begin
+      if (d_we && d_at[2:0] == 3'(k)) mem[d_at[6:3]] <= d_data;
+      q <= mem[jidx];
+    end
+    assign dq[k] = q;
+  end
+
   always_ff @(posedge clk) begin
     if (ld_j) begin
-      j_op <= r_op; j_n <= r_n; j_rows <= r_rows; j_blocks <= r_blocks;
-      j_a <= r_a; j_as1 <= r_as1; j_as2 <= r_as2;
-      j_b <= r_b; j_bs1 <= r_bs1; j_bs2 <= r_bs2;
-      j_c <= r_c; j_cs1 <= r_cs1; j_cs2 <= r_cs2;
-      j_p <= r_p; j_eps <= r_eps; j_aux <= r_aux; j_bqsh <= r_bqsh;
-      j_wlo <= r_wlo; j_whi <= r_whi;
+      if (ch_on) begin                              // the chain's job: its descriptor words
+        j_op <= dq[0][31:0];  j_n   <= dq[0][63:32]; j_rows <= dq[0][95:64]; j_blocks <= dq[0][127:96];
+        j_a  <= dq[1][63:0];  j_as1 <= dq[1][95:64]; j_as2  <= dq[1][127:96];
+        j_b  <= dq[2][63:0];  j_bs1 <= dq[2][95:64]; j_bs2  <= dq[2][127:96];
+        j_c  <= dq[3][63:0];  j_cs1 <= dq[3][95:64]; j_cs2  <= dq[3][127:96];
+        j_p  <= dq[4][63:0];  j_eps <= dq[4][127:64];
+        j_aux <= dq[5][31:0]; j_bqsh <= dq[5][63:32]; j_wlo <= dq[5][95:64]; j_whi <= dq[5][127:96];
+      end else begin
+        j_op <= r_op; j_n <= r_n; j_rows <= r_rows; j_blocks <= r_blocks;
+        j_a <= r_a; j_as1 <= r_as1; j_as2 <= r_as2;
+        j_b <= r_b; j_bs1 <= r_bs1; j_bs2 <= r_bs2;
+        j_c <= r_c; j_cs1 <= r_cs1; j_cs2 <= r_cs2;
+        j_p <= r_p; j_eps <= r_eps; j_aux <= r_aux; j_bqsh <= r_bqsh;
+        j_wlo <= r_wlo; j_whi <= r_whi;
+      end
     end
     if (tstate == T_CFG0) begin
       opc     <= j_op[3:0];
@@ -350,10 +452,11 @@ module ro_core #(
     end
   end
 
-  // Port B serves the parameter load first (gp), then stream B (gb): its
-  // geometry register follows the phase.
+  // Port B serves a chain's descriptor fetch (gd), the parameter load (gp), then
+  // stream B (gb): its geometry register follows the phase.
   always_ff @(posedge clk) begin
     if (pld_start)      gb_cur <= gp;
+    else if (dfe_start) gb_cur <= gd;
     else if (job_start) gb_cur <= gb;
   end
 
@@ -364,8 +467,10 @@ module ro_core #(
     start_q2 <= !rst && start_q;
     pld_q    <= !rst && pld_start;
     pld_q2   <= !rst && pld_q;
+    dfe_q    <= !rst && dfe_start;
+    dfe_q2   <= !rst && dfe_q;
     urst_a   <= rst || job_start;
-    urst_b   <= rst || job_start || pld_start;
+    urst_b   <= rst || job_start || pld_start || dfe_start;
     urst_c   <= rst || job_start;
     urst_d   <= rst || job_start;
     urst_p   <= rst || pld_start;
@@ -375,10 +480,6 @@ module ro_core #(
   assign ap_done = (tstate == T_DONE);
 
   // Ports ------------------------------------------------------------------------------
-  logic          a_valid, a_ready, b_valid, b_ready, w_valid, w_ready;
-  logic [BW-1:0] a_data, b_data, w_data;
-  logic [BW/8-1:0] w_strb;
-  logic          a_idle, b_idle, wr_idle;
   logic          a_arvalid, a_arready, b_arvalid, b_arready, a_rvalid, a_rready, b_rvalid, b_rready;
   logic [63:0]   a_araddr, b_araddr;
   logic [7:0]    a_arlen, b_arlen;
@@ -399,7 +500,7 @@ module ro_core #(
 
   logic b_ext_ready;
   ro_rd_port u_rd_b (
-    .clk, .rst (urst_b), .start (start_q2 || pld_q2), .g (gb_cur),
+    .clk, .rst (urst_b), .start (start_q2 || pld_q2 || dfe_q2), .g (gb_cur),
     .ext_en (1'b0), .ext_valid (1'b0), .ext_ready (b_ext_ready), .ext_waddr ('0), .ext_words ('0),
     .arvalid (b_arvalid), .arready (b_arready), .araddr (b_araddr), .arlen (b_arlen),
     .rvalid  (b_rvalid),  .rready  (b_rready),
@@ -480,9 +581,11 @@ module ro_core #(
     tl_sig_d  <= tl_beat ? a_data[64 +: SIG_W] : a_data[0 +: SIG_W];
     tl_rsq_d  <= tl_beat ? a_data[127:64] : a_data[63:0];
   end
+  // `loading` also covers a chain's descriptor fetch: port B's words reach neither
+  // the units nor ro_param (no load in progress: it accepts nothing).
   always_ff @(posedge clk) begin
     if (rst) loading <= 1'b0;
-    else if (pld_start) loading <= 1'b1;
+    else if (pld_start || dfe_start) loading <= 1'b1;
     else if (job_start) loading <= 1'b0;
   end
 
@@ -496,6 +599,7 @@ module ro_core #(
   // Datapath -----------------------------------------------------------------------------
   logic st_a_ready, st_b_ready, st_idle, st_valid;
   logic [BW-1:0] st_data;
+  logic [PIW-1:0] st_prm_idx, nm_prm_idx;
 
   ro_stream u_st (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_stream),
@@ -511,7 +615,6 @@ module ro_core #(
 
   logic nm_a_ready, nm_idle, nm_valid;
   logic [BW-1:0] nm_data;
-  logic [PIW-1:0] st_prm_idx, nm_prm_idx;
 
   ro_norm u_nm (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_norm),
@@ -570,7 +673,7 @@ module ro_core #(
   assign prm_idx = is_norm ? nm_prm_idx : is_rope ? rp_prm_idx : st_prm_idx;
   assign a_ready = is_norm ? nm_a_ready : is_rope ? rp_a_ready : is_xpose ? xp_a_ready :
                    is_tload ? tl_a_ready : is_fold ? fd_a_ready : st_a_ready;
-  assign b_ready = loading ? prm_in_ready : is_rope ? rp_b_ready : st_b_ready;
+  assign b_ready = loading ? (prm_in_ready || dfetch) : is_rope ? rp_b_ready : st_b_ready;
   assign w_valid = is_norm ? nm_valid : is_rope ? rp_valid : is_xpose ? xp_valid : is_tload ? 1'b0 :
                    is_fold ? fd_valid : st_valid;
   assign w_data  = is_norm ? nm_data : is_rope ? rp_data : is_xpose ? xp_data : is_fold ? fd_data : st_data;

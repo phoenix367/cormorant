@@ -291,6 +291,7 @@ module cv_core
   logic [63:0] r_x, r_w, r_b, r_y;
   logic [31:0] r_batch, r_in_ch, r_in_h, r_in_w, r_out_ch, r_out_h, r_out_w, r_kh, r_kw;
   logic [31:0] r_sh, r_sw, r_dh, r_dw, r_pt, r_pl, r_has_bias, r_dwm;
+  logic [31:0] r_ycs, r_ycn, r_ygs;
 
   cv_ctrl_s_axi u_ctrl (
     .clk, .rst (rst_c),
@@ -307,7 +308,7 @@ module cv_core
     .in_h (r_in_h), .in_w (r_in_w), .out_ch (r_out_ch), .out_h (r_out_h), .out_w (r_out_w),
     .kh (r_kh), .kw (r_kw), .stride_h (r_sh), .stride_w (r_sw), .dilation_h (r_dh),
     .dilation_w (r_dw), .pad_top (r_pt), .pad_left (r_pl), .has_bias (r_has_bias),
-    .is_depthwise (r_dwm)
+    .is_depthwise (r_dwm), .y_cs (r_ycs), .y_cn (r_ycn), .y_gs (r_ygs)
   );
 
   // ===========================================================================
@@ -325,6 +326,7 @@ module cv_core
   logic [2:0]  q_kh, q_kw;
   logic        q_bias, q_dwm, q_kh_ok, q_kw_ok;
   logic [WA-1:0] q_x, q_w, q_b, q_y;
+  logic [31:0] q_ycs, q_ycn, q_ygs;
   logic [31:0] ma, mb, ma_q, mb_q, mp1, mp2, mp3;
   logic [31:0] in_hw, out_hw, row_words, lastw, reach_h, reach_w, n_pos, ch_in, ch_out, pmw;
   logic [31:0] per_sh, per_ow, owpt_sw, owpt_mt, gstep_q;
@@ -406,7 +408,10 @@ module cv_core
   assign contract = (q_batch != '0) && (q_in_ch != '0) && (q_in_ch <= 32'(MAXIC)) &&
                     (q_out_ch != '0) && (q_out_ch <= 32'(MAXOC)) && (q_out_h != '0) &&
                     (q_out_w != '0) && (q_out_w <= 32'(ACCN / TM)) && q_kh_ok && q_kw_ok &&
-                    (q_sh != '0) && (q_sw != '0) && (q_dh != '0) && (q_dw != '0);
+                    (q_sh != '0) && (q_sw != '0) && (q_dh != '0) && (q_dw != '0) &&
+                    // the y pattern: whole m-tiles per group, one image
+                    (q_ycn[3:0] == '0) && (q_ycn <= 32'(MAXOC)) &&
+                    ((q_ycs == '0 && q_ycn == '0) || q_batch == 32'd1);
 
   // the registers, taken every cycle while idle: the job runs on the values
   // of the ap_start cycle (the enable is a state bit, not a function of
@@ -424,6 +429,7 @@ module cv_core
       q_kw_ok <= (r_kw != '0) && (r_kw <= 32'(MAXK)) && ((r_kw == 32'd1) || (r_dw < 32'(LBC)));
       q_bias  <= (r_has_bias != '0);
       q_dwm   <= (r_dwm != '0);
+      {q_ycs, q_ycn, q_ygs} <= {r_ycs, r_ycn, r_ygs};
     end
   end
 
@@ -566,6 +572,10 @@ module cv_core
       j.row_words   <= row_words[12:0];
       j.per_m_words <= pmw[12:0];
       j.dw_words    <= 4'((n_pos[5:0] + 6'd7) >> 3);
+      j.y_cs        <= (q_ycs != '0) ? q_ycs : out_hw;
+      j.y_cs16      <= {((q_ycs != '0) ? q_ycs[27:0] : out_hw[27:0]), 4'b0};
+      j.y_tpg       <= 7'(q_ycn >> 4);
+      j.y_gs        <= q_ygs;
     end
   end
 

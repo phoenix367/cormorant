@@ -51,6 +51,10 @@ g.REGS = [
     ("bq_sh",  0x64, 32, ("A_BQSH",)),
     ("win_lo", 0x68, 32, ("A_WLO",)),
     ("win_hi", 0x6C, 32, ("A_WHI",)),
+    # descriptor chains (doc/kernels/ROWOPS_RTL_KERNEL.md §1.6): the list's base, its job
+    # count (0: the single job of the registers above)
+    ("chain",   0x70, 64, ("A_CH0", "A_CH1")),
+    ("chain_n", 0x78, 32, ("A_CHN",)),
 ]
 
 if __name__ == "__main__":

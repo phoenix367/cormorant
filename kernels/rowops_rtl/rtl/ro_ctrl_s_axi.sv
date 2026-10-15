@@ -12,7 +12,8 @@
 //   0x30/34 b  0x38 b_s1   0x3C b_s2
 //   0x40/44 c  0x48 c_s1   0x4C c_s2
 //   0x50/54 p  0x58/5C eps 0x60 aux  0x64 bq_sh  0x68 win_lo  0x6C win_hi
-//   (doc/kernels/ROWOPS_RTL_KERNEL.md §1.2; scripts/gen_driver.py checks the table)
+//   0x70/74 chain (the descriptor list)  0x78 chain_n (jobs in it; 0: the registers' job)
+//   (doc/kernels/ROWOPS_RTL_KERNEL.md §1.2, §1.6; scripts/gen_driver.py checks the table)
 //
 // Like the HLS slave, AW and W are taken one after the other and every
 // access gets an OKAY response.
@@ -66,7 +67,9 @@ module ro_ctrl_s_axi (
   output logic [31:0] aux,
   output logic [31:0] bq_sh,
   output logic [31:0] win_lo,
-  output logic [31:0] win_hi
+  output logic [31:0] win_hi,
+  output logic [63:0] chain,
+  output logic [31:0] chain_n
 );
   localparam logic [6:0] A_CTRL = 7'h00, A_GIE = 7'h04, A_IER = 7'h08, A_ISR = 7'h0C,
                          A_OP = 7'h10, A_N = 7'h14, A_ROWS = 7'h18, A_BLOCKS = 7'h1C,
@@ -74,7 +77,8 @@ module ro_ctrl_s_axi (
                          A_B0 = 7'h30, A_B1 = 7'h34, A_BS1 = 7'h38, A_BS2 = 7'h3C,
                          A_C0 = 7'h40, A_C1 = 7'h44, A_CS1 = 7'h48, A_CS2 = 7'h4C,
                          A_P0 = 7'h50, A_P1 = 7'h54, A_E0 = 7'h58, A_E1 = 7'h5C,
-                         A_AUX = 7'h60, A_BQSH = 7'h64, A_WLO = 7'h68, A_WHI = 7'h6C;
+                         A_AUX = 7'h60, A_BQSH = 7'h64, A_WLO = 7'h68, A_WHI = 7'h6C,
+                         A_CH0 = 7'h70, A_CH1 = 7'h74, A_CHN = 7'h78;
 
   // Write channel ------------------------------------------------------------------
   // Every AXI-Lite input is registered before it is decoded: the address and
@@ -146,6 +150,7 @@ module ro_ctrl_s_axi (
       a <= '0; a_s1 <= '0; a_s2 <= '0; b <= '0; b_s1 <= '0; b_s2 <= '0;
       c <= '0; c_s1 <= '0; c_s2 <= '0; p <= '0; eps <= '0; aux <= '0; bq_sh <= '0;
       win_lo <= '0; win_hi <= 32'hFFFFFFFF;
+      chain <= '0; chain_n <= '0;
     end else begin
       int_irq <= int_gie && (|int_isr);
 
@@ -199,6 +204,9 @@ module ro_ctrl_s_axi (
           A_BQSH: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) bq_sh[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           A_WLO: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) win_lo[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           A_WHI: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) win_hi[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CH0: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) chain[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CH1: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) chain[32 + 8*k_ +: 8] <= wdata_q[8*k_ +: 8];
+          A_CHN: for (int k_ = 0; k_ < 4; k_++) if (wstrb_q[k_]) chain_n[8*k_ +: 8] <= wdata_q[8*k_ +: 8];
           default: ;
         endcase
       end
@@ -261,6 +269,9 @@ module ro_ctrl_s_axi (
         A_BQSH:   rdata <= bq_sh;
         A_WLO:    rdata <= win_lo;
         A_WHI:    rdata <= win_hi;
+        A_CH0:    rdata <= chain[31:0];
+        A_CH1:    rdata <= chain[63:32];
+        A_CHN:    rdata <= chain_n;
         default: ;
       endcase
     end

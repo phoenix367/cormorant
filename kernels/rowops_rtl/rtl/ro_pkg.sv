@@ -31,6 +31,13 @@ package ro_pkg;
   localparam int SIG_W     = 49;
   localparam int HD_MAX    = 128;       // ROPE head segment
   localparam int R_MAX     = 8;         // TRANSPOSE rows per tile
+  // Descriptor chains (ROWOPS_RTL_KERNEL.md §1.6): chain_n jobs (at most CHAIN_MAX; more
+  // are clamped) read from DDR at `chain` before the first; a descriptor is DESC_BEATS
+  // words of 16 bytes, of which the first DESC_USED hold the 24 argument registers
+  // 0x10 .. 0x6C in register order (the rest is ignored).
+  localparam int CHAIN_MAX  = 16;
+  localparam int DESC_BEATS = 8;
+  localparam int DESC_USED  = 6;
 
   // Op codes (register op[3:0]) and kinds (op[5:4] A, [7:6] B, [9:8] C).
   localparam logic [3:0] OP_COPY = 4'd1, OP_ADDX = 4'd2, OP_DEQUANT = 4'd3, OP_MULACT = 4'd4,

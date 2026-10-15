@@ -55,6 +55,13 @@ package cv_pkg;
     logic [12:0] row_words;            // out_w * m_tiles accumulator words per output row
     logic [12:0] per_m_words;          // packed weight words per output channel (standard)
     logic [3:0]  dw_words;             // ceil(kh * kw / 8) words per channel (depthwise)
+    // the y channel pattern (RPU_PLAN §13.2): channel c of the output starts at
+    // (c mod y_cn) * y_cs + (c div y_cn) * y_gs elements; dense when the
+    // registers are 0 (y_cs = out_hw, no groups)
+    logic [31:0] y_cs;                 // elements from a channel to the next in a group
+    logic [31:0] y_cs16;               // 16 * y_cs: from an m-tile to the next in a group
+    logic [6:0]  y_tpg;                // m-tiles per group (y_cn / 16); 0 = one group
+    logic [31:0] y_gs;                 // elements from a group's first channel to the next's
   } job_t;
 
   // One sweep: (ni, chunk, channel tile, ow-tile, m-group) — the work unit every

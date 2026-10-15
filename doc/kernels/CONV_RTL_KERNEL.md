@@ -23,8 +23,9 @@ write), `0x10/14` x, `0x1C/20` weight, `0x28/2C` bias, `0x34/38` y, `0x40`
 batch, `0x48` in_ch, `0x50` in_h, `0x58` in_w, `0x60` out_ch, `0x68` out_h,
 `0x70` out_w, `0x78` kh, `0x80` kw, `0x88` stride_h, `0x90` stride_w, `0x98`
 dilation_h, `0xA0` dilation_w, `0xA8` pad_top, `0xB0` pad_left, `0xB8`
-has_bias, `0xC0` is_depthwise.  `interrupt` is level high while GIE and a set
-ISR bit.
+has_bias, `0xC0` is_depthwise, `0xC8` y_cs, `0xD0` y_cn, `0xD8` y_gs (the y
+channel pattern, below; RPU_PLAN §13.2 — 0 is the HLS kernel's dense y).
+`interrupt` is level high while GIE and a set ISR bit.
 
 **The contract** (ConvKernel.cpp's `compute_conv_geometry`; the platform
 JSON's `kernels.conv` bounds, checked against `cv_pkg` at configure time):
@@ -34,9 +35,26 @@ rows and 64 columns (`(kh − 1)·dilation_h < 16`, `(kw − 1)·dilation_w <
 ceil(out_ch / 16) · 16 ≤ 65536`), non-zero strides and dilations.  Outside
 it the kernel reads and writes nothing and returns at once — and so it does
 when batch, out_h or out_w is 0 (the HLS kernel's behaviour there is not
-defined).  Depthwise (`is_depthwise`) takes in_ch = out_ch.
+defined).  Depthwise (`is_depthwise`) takes in_ch = out_ch.  The y pattern
+adds: `y_cn` a multiple of 16 (whole m-tiles per group) and at most 1280,
+and batch 1 when `y_cs` or `y_cn` is set.
 
-**DDR layouts** (`ConvKernel.h`): x and y NCHW; weights tile-major
+**The y channel pattern** (RPU_PLAN §13.2): output channel c's plane of
+out_h · out_w elements starts at `(c mod y_cn) · y_cs + (c div y_cn) · y_gs`
+elements after y — `y_cs` 0 means out_h · out_w (dense), `y_cn` 0 one group.
+An attention P·V (MatMul on ConvKernel, channel p = h'·T + t of KV group g)
+writes its rows straight into the merged `[T][H·HD]` tensor with y = the
+merged tensor + g·G·HD, `y_cs = H·HD`, `y_cn = T`, `y_gs = HD`; one head per
+group needs only `y_cs`.  A plane's own pixels stay contiguous (the drain's
+256-pixel segments are linear inside a channel); a run at any element offset
+takes byte strobes and is split at 4 KiB, as every y run.  The drain walks
+it: the fill's m-tile base advances by `16 · y_cs` inside a group and jumps
+to the next group's base (`y_gs` on) every `y_cn / 16` tiles, the emitter's
+channel step is `y_cs` — both chosen at configuration (`y_cs` = out_h ·
+out_w when 0), so the drain's datapath has no new mux.  Every caller writes
+the three registers (they keep their value across jobs).
+
+**DDR layouts** (`ConvKernel.h`): x and y NCHW (y with the pattern above); weights tile-major
 `[out_ch][ic_tiles][kh][kw][16 lanes]`, the last tile 8 lanes when at most 8
 channels remain; depthwise `[out_ch][roundup(kh·kw, 8)]`; bias
 `[roundup(out_ch, 8)]`.  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).  Buffers are 16-byte aligned; y runs are written with
@@ -136,7 +154,10 @@ copies are 8 192 of the 18 123 added), 40 RAMB36 + 24 RAMB18 (the copy adds
 routed, `report_utilization -hierarchical`): 14 827 LUT (4 046 LUTRAM, 512
 SRL: the weight skew left the SRLs, `doc/plans/AREA_PLAN.md`), 37 497 FF,
 40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP; on `1cedaf2ed816` before the area
-pass 18 253 LUT (3 758 LUTRAM, 2 390 SRL), 39 731 FF.  The retired HLS
+pass 18 253 LUT (3 758 LUTRAM, 2 390 SRL), 39 731 FF.  With the y channel
+pattern (RPU_PLAN §13.9, out of context at 300 MHz): WNS +0.026 ns, 14 973
+LUT, 37 793 FF, 60 BRAM tiles, 48 URAM, 518 DSP — the worst paths in the
+weight and x loaders, the drain's own +0.110 ns.  The retired HLS
 kernel, routed in the bitstreams that carried it: 37 233 LUT, 41 457 FF,
 46 RAMB36 + 16 RAMB18, 48 URAM, 803 DSP.
 

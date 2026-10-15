@@ -740,4 +740,4 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` (generated-code default, `INFERENCE_CONVKERNEL_INSTANCE`); the KV260 overlay `dts/kv260/cormorant.dts` names the node `fabric_conv` |
 | **Resources (csynth, post-§2.42)** | 127 BRAM18 (44 %), 48 URAM (75 %), 679 DSP (54 %) |
-| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 63 RTL fixtures) + `TestConvModelGrid` + the 300-case random sweep (`TestConvModelSweep`) |
+| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 66 RTL fixtures) + `TestConvModelGrid` + the 300-case random sweep (`TestConvModelSweep`) |

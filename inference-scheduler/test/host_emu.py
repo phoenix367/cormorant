@@ -363,10 +363,13 @@ _CONV = r"""
 #ifndef EMU_CONV_TILE_IC
 #error EMU_CONV_TILE_IC
 #endif
+/* the y channel pattern's registers (RPU_PLAN §13.2; the generated code guards
+ * their writes with this macro, xconvkernel_hw.h of IPs that have them) */
+#define XCONVKERNEL_CTRL_ADDR_Y_CS_DATA 0xc8
 typedef struct { u64 Ctrl_BaseAddress; u64 x, weight, bias, y;
                  uint32_t batch, in_ch, in_h, in_w, out_ch, out_h, out_w, kh, kw,
                           stride_h, stride_w, dilation_h, dilation_w, pad_top, pad_left,
-                          has_bias, is_depthwise; } XConvkernel;
+                          has_bias, is_depthwise, y_cs, y_cn, y_gs; } XConvkernel;
 static inline int XConvkernel_Initialize(XConvkernel *p, const char *n)
 { (void)n; memset(p, 0, sizeof *p); return 0; }
 static inline void XConvkernel_Set_x(XConvkernel *p, u64 v)      { p->x = v; }
@@ -377,6 +380,7 @@ static inline void XConvkernel_Set_y(XConvkernel *p, u64 v)      { p->y = v; }
 CV_SET(batch) CV_SET(in_ch) CV_SET(in_h) CV_SET(in_w) CV_SET(out_ch) CV_SET(out_h)
 CV_SET(out_w) CV_SET(kh) CV_SET(kw) CV_SET(stride_h) CV_SET(stride_w) CV_SET(dilation_h)
 CV_SET(dilation_w) CV_SET(pad_top) CV_SET(pad_left) CV_SET(has_bias) CV_SET(is_depthwise)
+CV_SET(y_cs) CV_SET(y_cn) CV_SET(y_gs)
 static inline int XConvkernel_IsDone(XConvkernel *p) { (void)p; return 1; }
 static inline int XConvkernel_Release(XConvkernel *p) { (void)p; return 0; }
 /* ConvKernel.h: y[n][m][oh][ow] = sat(floor((bias[m] + sum x * w) / 256)) with
@@ -391,6 +395,10 @@ static inline void XConvkernel_Start(XConvkernel *p)
     const size_t per_m = p->is_depthwise ? (size_t)((KK + 7u) / 8u * 8u)
                                          : (size_t)KK * ((tiles - 1u) * T + last);
     const unsigned P = p->out_h * p->out_w;
+    const unsigned CS = p->y_cs ? p->y_cs : P;          /* the y channel pattern */
+    /* its contract (the RTL writes nothing beyond it) */
+    if ((p->y_cn % 16u) != 0u || p->y_cn > 1280u || ((p->y_cs || p->y_cn) && p->batch != 1u))
+        return;
     const int16_t *X = (const int16_t *)(uintptr_t)p->x;
     const int16_t *W = (const int16_t *)(uintptr_t)p->weight;
     const int16_t *B = (const int16_t *)(uintptr_t)p->bias;
@@ -427,8 +435,11 @@ static inline void XConvkernel_Start(XConvkernel *p)
                         }
                     }
             }
+            const size_t yb = (size_t)n * p->out_ch * P +
+                (p->y_cn ? (size_t)(m % p->y_cn) * CS + (size_t)(m / p->y_cn) * p->y_gs
+                         : (size_t)m * CS);
             for (oh = 0; oh < P; oh++)
-                Y[((size_t)n * p->out_ch + m) * P + oh] = emu_sat(emu_floor_shift(acc[oh], 8));
+                Y[yb + oh] = emu_sat(emu_floor_shift(acc[oh], 8));
         }
     free(acc);
 }
@@ -444,8 +455,11 @@ _ROWOPS = r"""
  * 16-byte words, the lanes past the row zero; TRANSPOSE's scattered granules
  * are written byte-exact. */
 typedef __int128 i128;
+/* descriptor chains (RPU_PLAN §13.3; the generated code guards their writes with
+ * this macro, xrowopskernel_hw.h of IPs that have them) */
+#define XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA 0x78
 typedef struct { u64 Ctrl_BaseAddress; u64 a, b, c, p, eps; uint32_t op, n, rows, blocks, a_s1, a_s2, b_s1, b_s2,
-                 c_s1, c_s2, aux, bq_sh, win_lo, win_hi; } XRowopskernel;
+                 c_s1, c_s2, aux, bq_sh, win_lo, win_hi; u64 chain; uint32_t chain_n; } XRowopskernel;
 static inline int XRowopskernel_Initialize(XRowopskernel *q, const char *nm)
 { (void)nm; memset(q, 0, sizeof *q); return 0; }
 #define RO_SET(f) static inline void XRowopskernel_Set_##f(XRowopskernel *q, u64 v) { q->f = (uint32_t)v; }
@@ -455,7 +469,8 @@ static inline void XRowopskernel_Set_c(XRowopskernel *q, u64 v)   { q->c = v; }
 static inline void XRowopskernel_Set_p(XRowopskernel *q, u64 v)   { q->p = v; }
 static inline void XRowopskernel_Set_eps(XRowopskernel *q, u64 v) { q->eps = v; }
 RO_SET(op) RO_SET(n) RO_SET(rows) RO_SET(blocks) RO_SET(a_s1) RO_SET(a_s2) RO_SET(b_s1) RO_SET(b_s2)
-RO_SET(c_s1) RO_SET(c_s2) RO_SET(aux) RO_SET(bq_sh) RO_SET(win_lo) RO_SET(win_hi)
+RO_SET(c_s1) RO_SET(c_s2) RO_SET(aux) RO_SET(bq_sh) RO_SET(win_lo) RO_SET(win_hi) RO_SET(chain_n)
+static inline void XRowopskernel_Set_chain(XRowopskernel *q, u64 v) { q->chain = v; }
 static inline int XRowopskernel_IsDone(XRowopskernel *q) { (void)q; return 1; }
 static inline int XRowopskernel_IsIdle(XRowopskernel *q) { (void)q; return 1; }
 static inline int XRowopskernel_Release(XRowopskernel *q) { (void)q; return 0; }
@@ -579,7 +594,7 @@ static void ro_fold_job(const XRowopskernel *q)
             }
     for (e *= 2u; e % 16u; e++) d[e] = 0;
 }
-static inline void XRowopskernel_Start(XRowopskernel *q)
+static void ro_job(XRowopskernel *q)
 {
     const uint32_t op = q->op & 15u, n = q->n;
     const unsigned ak = (q->op >> 4) & 3u, bk = (q->op >> 6) & 3u, ck = (q->op >> 8) & 3u;
@@ -701,6 +716,25 @@ static inline void XRowopskernel_Start(XRowopskernel *q)
             }
         }
     free(x); free(vals);
+}
+/* Start: one job from the registers, or (chain_n != 0) the descriptor list at
+ * chain — 128-byte descriptors, words 0..23 the argument registers 0x10..0x6C in
+ * order, at most 16 (the RTL clamps) — run in order (ROWOPS_RTL_KERNEL.md §1.6). */
+static inline void XRowopskernel_Start(XRowopskernel *q)
+{
+    uint32_t k, nj = q->chain_n > 16u ? 16u : q->chain_n;
+    if (!nj) { ro_job(q); return; }
+    for (k = 0; k < nj; k++) {
+        const uint32_t *w = (const uint32_t *)(uintptr_t)(q->chain + 128u * (u64)k);
+        XRowopskernel j = *q;
+        j.op = w[0]; j.n = w[1]; j.rows = w[2]; j.blocks = w[3];
+        j.a = w[4] | (u64)w[5] << 32; j.a_s1 = w[6]; j.a_s2 = w[7];
+        j.b = w[8] | (u64)w[9] << 32; j.b_s1 = w[10]; j.b_s2 = w[11];
+        j.c = w[12] | (u64)w[13] << 32; j.c_s1 = w[14]; j.c_s2 = w[15];
+        j.p = w[16] | (u64)w[17] << 32; j.eps = w[18] | (u64)w[19] << 32;
+        j.aux = w[20]; j.bq_sh = w[21]; j.win_lo = w[22]; j.win_hi = w[23];
+        ro_job(&j);
+    }
 }
 """
 

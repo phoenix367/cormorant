@@ -40,6 +40,11 @@ static void run_once(XConvkernel *k,
     XConvkernel_Set_pad_left(k, pl);
     XConvkernel_Set_has_bias(k, hb);
     XConvkernel_Set_is_depthwise(k, dw2);
+#ifdef XCONVKERNEL_CTRL_ADDR_Y_CS_DATA   /* the y channel pattern (RPU_PLAN §13.2): dense */
+    XConvkernel_Set_y_cs(k, 0u);
+    XConvkernel_Set_y_cn(k, 0u);
+    XConvkernel_Set_y_gs(k, 0u);
+#endif
     XConvkernel_Start(k);
     while (!XConvkernel_IsDone(k)) {}
 }

@@ -14,7 +14,10 @@ IDs, writes on one) on its own PS port — `S_AXI_HP0_FPD` through
 `ap_ctrl_hs`.
 
 Read this before changing the RTL: §1 is the contract the scheduler and
-the drivers program against, §6 the invariants a change must keep.
+the drivers program against, §6 the invariants a change must keep.  Since
+RPU_PLAN A2.2 (2026-10-15, RTL only until the A2.3 bitstream) one start can
+run a **descriptor chain** — up to 16 jobs read from DDR, back to back, one
+interrupt (§1.6).
 
 ## 1. Contract
 
@@ -57,9 +60,13 @@ done, b1 ready), `0x0C` ISR (toggle on write).  Arguments
 | `0x64` | `bq_sh` | [5:0] the left shift of every column's Bq' before it is added (NORM: 24 + g − bb, bb = beta's scale; COPY / ADDX: the bias's scale) |
 | `0x68` | `win_lo` | COPY / ADDX: A rows with index i1 < win_lo read as zeros (default 0); FOLD: the source columns below win_lo give 0 and are not read |
 | `0x6C` | `win_hi` | … and rows with i1 ≥ win_hi (default 0xFFFFFFFF): tap stacking's rows outside the sequence; FOLD: likewise the columns at / above win_hi (an inverted window reads nothing) |
+| `0x70`/`0x74` | `chain` | descriptor chains (§1.6): the byte address of the descriptor list, 16-byte aligned |
+| `0x78` | `chain_n` | jobs in the list: 0 = the one job of the registers 0x10 … 0x6C (every library before RPU_PLAN A2); 1 … 16 = a chain of that many; above 16 is outside the contract (clamped to 16) |
 
-Registers are sampled when `ap_start` is taken; they may be rewritten
-while the job runs.  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).
+`0x7C` is unused.  Registers are sampled when `ap_start` is taken; they may be
+rewritten while the job runs.  A chain neither uses nor changes the argument
+registers 0x10 … 0x6C; `chain_n` keeps its value, so a driver that issues a
+single job after a chain writes `chain_n = 0` first.  Byte addresses must lie below 2^48: the address arithmetic is 48 bits wide and the AXI addresses are zero-extended to 64 (AREA_PLAN, 2026-10-14; the PS ports address 40 bits, SMMU IOVAs 48).
 
 ### 1.3 Streams, rows and the parameter block
 
@@ -142,10 +149,46 @@ every counter is sized for the register value.
 | `ConcatNode`, `SliceNode` | COPY |
 | `TtsPrepNode` (`FoldRoNode`, HOSTOPS_PLAN §11; platform `kernels.rowops.fold`) | one FOLD: the int16 calls whose alpha is an exact 1/m at their shift (`rowops_spec.fold_divisor`, checked over every int16), the source rows unreversed, `[slo, shi)` from the runtime utterance window as `tts_prep` clamps it |
 
+### 1.6 Descriptor chains (RPU_PLAN §13.3, phase A2.2)
+
+With `chain_n` = N ≥ 1, `ap_start` runs N jobs whose arguments come from a
+**descriptor list** in DDR at `chain` instead of from the registers:
+
+- **A descriptor** is 32 little-endian 32-bit words (128 bytes, 8 beats):
+  word k < 24 is the argument register at `0x10 + 4k` — `op`, `n`, `rows`,
+  `blocks`, `a` low / high, `a_s1`, `a_s2`, `b` low / high, `b_s1`, `b_s2`,
+  `c` low / high, `c_s1`, `c_s2`, `p` low / high, `eps` low / high, `aux`,
+  `bq_sh`, `win_lo`, `win_hi` — with the meanings of §1.2 – §1.4; words
+  24 … 31 are ignored (0 by convention).  Descriptor j starts at
+  `chain + 128 j`.
+- **The fetch.**  After `ap_start` the unit reads the whole list — min(N, 16)
+  × 8 beats, one run on port B (ARID 1, bursts of ≤ 64 beats within 4 KiB, as
+  the parameter loads) — into its descriptor RAM, then runs the jobs.  The
+  list must not change until `ap_done`; the caller's buffer holds all
+  N × 128 bytes.
+- **The jobs** run in list order, each exactly as a single job of the same
+  arguments (its parameter load, units, write bursts).  Job j + 1 starts only
+  after every write of job j has its B response, so it reads what job j
+  wrote — as consecutive starts do.  `ap_done`, `ap_ready` and the interrupt
+  come once, after the last job.  Empty jobs (§1.4) are allowed and cost a
+  few cycles.
+- **P_KEEP** keeps the parameter RAM as the previous job left it — the
+  chain's previous job, or for a chain's first job the last job before the
+  start (the fetch does not touch the RAM).
+- **TLOAD** is allowed in a chain (it runs as a single TLOAD would).
+- **N above 16** is outside the contract: the unit runs the first 16
+  descriptors.  Longer lists are split by the software.
+
+Cost (ideal memory, `--perf`): the fetch is the read latency plus 8 cycles
+per descriptor; a chained job saves the start and completion handshake of a
+single job and spends one cycle reading its descriptor — a 10-job chain
+takes ≈ 80 cycles (0.3 µs) more than its jobs run one by one (§3); on the
+board it saves each job's register writes, interrupt and wake.
+
 ## 2. Architecture
 
 ```
- s_axi_ctrl ─► ro_ctrl_s_axi ─► ro_core (job FSM, geometries, op mux)
+ s_axi_ctrl ─► ro_ctrl_s_axi ─► ro_core (job FSM, descriptor RAM, geometries, op mux)
                                    │
    m_axi_gmem0 AR/R ◄─ ro_rd_arb ◄─┼─ ro_rd_port A (ARID 0) ─► A words ─┐
                                    ├─ ro_rd_port B (ARID 1) ─► B words ─┤
@@ -160,6 +203,20 @@ every counter is sized for the register value.
    m_axi_gmem0 AW/W/B ◄─────────────┴─ ro_wr_port (strobes) ◄─ C words ◄─┘
 ```
 
+- **Descriptor chains** (§1.6): with `chain_n` ≠ 0 the job FSM inserts a
+  fetch after `ap_start` (`T_DF` / `T_DFW`): port B walks the list as one run
+  of `gd` (min(N, 16) × 8 words) while `loading` keeps its words from the
+  units and from `ro_param` (no load is open, so the parameter RAM accepts
+  nothing) and `b_ready` is held high; beats 0 … 5 of each descriptor are
+  registered and written into six LUTRAMs of 16 × 128 bits (one per beat,
+  its own write enable), read continuously at the index of the next job
+  into registers.  Each job then passes `T_DLD` (one cycle) and `T_LAT`,
+  where the job registers `j_*` load from those registers instead of from
+  the control slave (a 2:1 mux on the `j_*` inputs, selected by a flag
+  latched at `ap_start`) and the index moves on, and runs the single-job
+  path from `T_CFG0`.  `T_RUN` goes back to `T_DLD` while jobs remain, else
+  to `T_DONE` — `job_done` drives the state alone, as for a single job.
+  Nothing of it lies on a path out of the `j_*` registers.
 - **Ports** are the VectorOPKernel's (`vo_rd_port`, `vo_wr_port`,
   `vo_burstgen`, `vo_fifo`, `vo_rs`, renamed `ro_*`): credit-based read
   FIFOs so RREADY never drops, bursts of at most 64 beats within 4 KiB,
@@ -273,7 +330,22 @@ every counter is sized for the register value.
   (production bitstream `de968ccc45da`, 2026-10-15, after the kernels' area
   pass of `doc/plans/AREA_PLAN.md`): 33 340 LUT (3 930 LUTRAM, 437 SRL),
   26 712 FF, 6 RAMB36, 7 URAM, 129 DSP; the design closes 4 ns with WNS
-  +0.029 ns / WHS +0.010 ns at 89 547 LUT (76.5 %) and 841 DSP.
+  +0.029 ns / WHS +0.010 ns at 89 547 LUT (76.5 %) and 841 DSP.  With the
+  descriptor chains (RPU_PLAN A2.2, 2026-10-15, out of context at 3.333 ns
+  against the same run of the `de968ccc45da` RTL): WNS −0.053 ns (TNS −0.109
+  ns, 6 endpoints; before −0.067 ns, −1.634 ns, 66), WHS +0.032 ns —
+  the 20 worst paths are in NORM, in ro_stream (its lanes, the sigmoid
+  UltraRAM, its `b_ready` cone into port B's FIFO — there before at
+  −0.039 ns, with the same nine levels) and one from FOLD's shift into the
+  transposer; none is chain logic, whose own worst paths have +0.19 ns (out
+  of it) and +0.27 ns (into it).  34 189 LUT (+723: 29 470 logic +337, 4 332
+  LUTRAM +386 — the descriptor RAM), 27 030 FF (+1 084: the RAM's output
+  and input registers), RAMB36, URAM and DSP unchanged.  The worst path out
+  of `j_aux` (the transposer's byte mask, 4 levels as before) moves between
+  runs with the register's placement: +0.074 ns before, +0.025 / +0.029 ns
+  in two runs with the chains.  An earlier variant that advanced the job
+  index at `job_done` put that nine-level cone on the index (+0.031 ns); it
+  now advances when the job's registers load.
 
 ## 3. Performance
 
@@ -303,6 +375,20 @@ port, 128 bits each way):
 | FOLD 64 × 12 × 1026 | 100 713 | 403 | |
 | FOLD 192 × 2 × 132 (a flow coupling, m 1) | 7 273 | 29 | |
 
+Descriptor chains (§1.6; `--perf`, 2026-10-15, every shape above unchanged by
+the chain logic), from `ap_start` to the interrupt, against the same jobs
+started one by one:
+
+| chain | as one chain | its jobs one by one | difference |
+|---|---:|---:|---:|
+| a SmolLM2-135M decode step's attention prep, 10 jobs (RoPE q 576 / k 192, the k row into the K cache, v re-rounded, 3 q-image TRANSPOSEs R 3, 3 V-granule TRANSPOSEs R 1) | 3 006 | 2 928 | +78 (0.31 µs) |
+| `LlmDequant`'s logits row, 12 × DEQUANT 4 096 | 14 556 | 14 460 | +96 (0.38 µs) |
+
+The difference is the fetch (the read latency and 8 beats per descriptor)
+less the start / completion handshakes the chained jobs skip; what a chain
+saves on the board — each job's register writes, wait and wake, ≈ 40 µs per
+job on the A53 (RPU_PLAN §13.1) — is outside this measurement.
+
 Board figures (the DDR behind the port, the PS port's own rate) follow
 with phase 3.
 
@@ -322,14 +408,44 @@ with phase 3.
   (run it from the scheduler's venv: it imports `rowops_spec`) from the
   Python specification itself (`inference-scheduler/src/rowops_spec.py`),
   so the C++ oracle is checked against the Python one by the fixtures and
-  the RTL against both.  CTest `TestRowOpsRtl` runs them and 300 random
-  jobs (seed 1, `RO_RTL_RANDOM_CASES`) under randomised AXI timing; the
-  RTL passed them at every timing and 1 200 random jobs of four seeds on
-  2026-10-11.
+  the RTL against both.  CTest `TestRowOpsRtl` runs them, 300 random
+  jobs (seed 1, `RO_RTL_RANDOM_CASES`) and 300 random chains
+  (`RO_RTL_CHAIN_CASES`) under randomised AXI timing; the RTL passed them
+  at every timing and 1 200 random jobs of four seeds on 2026-10-11, and
+  with the chains (2026-10-15) the 38 fixtures, 300 random jobs and 300
+  random chains for seeds 1 … 4 at `fast`, `rand` and `slow` (12 × 638
+  cases), plus 1 000 chains for seeds 5 … 12 at each timing.
 - `--random N`: random jobs (all ops, kinds, shapes inside and at the
   contract's edges) against the C++ oracle; `--case "..."`; `--perf`
-  (ideal memory cycle counts of the shipped models' job shapes);
-  `--timing fast|rand|slow`.
+  (ideal memory cycle counts of the shipped models' job shapes, and the
+  chains of §3 against their jobs one by one); `--timing fast|rand|slow`.
+- **Chains** (§1.6): `--chains N` runs N random chains after the single
+  jobs (their own random stream, so the single jobs are the same as
+  without it).  A chain has 1 … 16 jobs of the random mix (smaller shapes),
+  now and then a TLOAD; about a third of the later jobs read A (or B) from
+  an earlier job's output, some overwrite an earlier job's output or input;
+  jobs that want P_KEEP get it where the parameter RAM holds a block of the
+  same op, kinds, flags and at least their columns — clones of an earlier
+  loader of the chain or of the previous chain's last one, with a decoy
+  block at their own `p`; `chain_n` above 16 with 16 descriptors, junk in
+  descriptor words 24 … 31, and decoys in the argument registers (which
+  must read back unchanged).  The oracle runs the jobs in order on the
+  memory model (`ro::run_chain`, its parameter RAM `ro::PState` across jobs
+  and chains); every byte the chain writes must equal its final value and
+  nothing else may be written — the descriptor list and every input are
+  read-only.  Two **chain fixtures** (`chains/manifest.txt`, one line per
+  job with a, b, c, p as offsets into the chain's segment;
+  `chain_NN_mem.hex` / `chain_NN_out.hex`, the segment before / after,
+  from `scripts/gen_fixtures.py` and the Python specification): a decode
+  step's attention prep (RoPE of q and k, the rotated k into the K cache,
+  the q image from the rotated q, v's byte-strobed granules into a V image
+  of older keys, the q staging zeroed after its transpose) and a decoder
+  layer's residual stream (ADDX, RMSNorm of its output, RMSNorm with P_KEEP
+  and a decoy block, SiLU · up of the normalised rows, DEQUANT, FOLD of the
+  SiLU rows, a windowed COPY with a bias and RELU).  Mutants caught on
+  2026-10-15: the next job started before the writes' responses (an AXI
+  protocol failure), P_KEEP ignored in chains (64 of 100 chains fail),
+  `chain_n` not clamped (10 of 100).
 - `lint_rowops_rtl` (`verilator --lint-only -Wall` with
   `scripts/lint_waivers.vlt`), `synth_rowops_rtl` (300 MHz out of
   context), `xsim_rowops_rtl` (xvlog / xelab), `RowOpsRtlDriver` (the driver's register
@@ -394,3 +510,11 @@ log has no multi-driven-signal warning (`Synth 8-4767`) for the unit.
    (`RowOpsRtlDriver`), the testbench, the block-design testbench and the
    fact registry (`registers.RowOpsKernel`, registered with phase 2's
    writers), as the other kernels'.
+7. **A chained job is a single job** (§1.6): it enters the job FSM at
+   `T_LAT` with the same `j_*` values a start with those registers would
+   load and follows the same path; the next one starts only after
+   `job_done` (every unit idle, every B response back).  The descriptor
+   fetch keeps port B's words away from the units and the parameter RAM
+   (`loading`), and the chain logic adds no logic on paths out of the
+   `j_*` registers (the transposer's byte mask from `j_aux` is the
+   design's worst in-context path).

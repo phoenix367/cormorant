@@ -65,6 +65,8 @@ module cv_drain
   logic        f_buf;                      // transposer buffer being filled
   logic [1:0]  full;                       // transposer buffers holding a segment (or being scattered)
   logic [31:0] f_mbase;                    // element offset of the tile's channel 0
+  logic [31:0] f_gbase;                    // element offset of the group's channel 0 (the y pattern)
+  logic [6:0]  f_tig;                      // m-tile within the group
   logic        sq_in_ready;
 
   // the fill can start a segment when its buffer is free and the queue has room
@@ -105,6 +107,8 @@ module cv_drain
         f_half   <= 1'b0;
         f_word   <= '0;
         f_mbase  <= dr.y_cbase;
+        f_gbase  <= dr.y_cbase;
+        f_tig    <= '0;
       end
     end else begin
       if (f_issue) begin
@@ -129,7 +133,16 @@ module cv_drain
           f_len   <= (f_runlen >= 13'(DSEG)) ? 9'(DSEG) : f_runlen[8:0];
           f_mt    <= f_mt + 7'd1;
           f_word  <= {5'b0, f_mt + 7'd1};
-          f_mbase <= f_mbase + {j.out_hw[27:0], 4'b0};
+          // the next tile: 16 channels on (y_cs16; 16 * out_hw when dense), or
+          // the next group's first channel (y_gs on from this group's)
+          if (j.y_tpg != '0 && f_tig + 7'd1 == j.y_tpg) begin
+            f_tig   <= '0;
+            f_gbase <= f_gbase + j.y_gs;
+            f_mbase <= f_gbase + j.y_gs;
+          end else begin
+            f_tig   <= f_tig + 7'd1;
+            f_mbase <= f_mbase + j.y_cs16;
+          end
           f_mv    <= mvalid(j.out_ch - {21'b0, f_mt + 7'd1, 4'b0});
           f_two   <= (j.out_ch - {21'b0, f_mt + 7'd1, 4'b0} > 32'd8);
           if (f_mt + 7'd1 == j.m_tiles) f_act <= 1'b0;
@@ -296,7 +309,7 @@ module cv_drain
       end else if (e_go) begin
         if (e_j + 6'd1 == e_nw) begin
           e_j <= '0;
-          e_e <= e_e + j.out_hw;
+          e_e <= e_e + j.y_cs;                // the next channel (out_hw when dense)
           if (e_m1 + 5'd1 == es.mv) begin
             e_act <= 1'b0;
             full[es.buf_i] <= 1'b0;

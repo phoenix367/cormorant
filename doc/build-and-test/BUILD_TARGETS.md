@@ -330,7 +330,7 @@ target's exit code.
 
 `behavior_test_<k>` depends on `package_<k>_rtl` (the IP the test stand's
 `.xpr` is pointed at, `build/rtl_ip/<Name>_ip`).  All four
-pass (212 VectorOP, 63 Conv, 50 Matmul (11 GEMV), 45 Pool cases).  The runs modify
+pass (212 VectorOP, 66 Conv, 50 Matmul (11 GEMV), 45 Pool cases).  The runs modify
 tracked `.bd` / `.xci` / `.xpr` files of `hw/cormorant_test_stand`; do not
 commit them.
 
