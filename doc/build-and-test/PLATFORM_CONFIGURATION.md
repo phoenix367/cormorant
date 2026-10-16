@@ -109,6 +109,7 @@ buffer and persistent accumulator
 | `max_line_buf_rows` | power of 2; `(kh-1)·dilation_h + 1 ≤ max_line_buf_rows` | Line-buffer row capacity |
 | `max_acc_persist_entries` | `out_w · ceil(out_ch / tile_m) · tile_m ≤ max_acc_persist_entries` | URAM persistent-accumulator capacity across in-channel tiles (one `tile_m`-padded output row must fit; stored as 512-bit URAM words — 8 URAM blocks at 65536 — and the `acc_stream` FIFO scales with it) |
 | `max_m_per_group` | — | Number of M-tiles cached together in the weight slab |
+| `y_pattern` | bool; read by the scheduler only (`_conv_hw_config.py`) | The bitstream's ConvKernel has the y channel pattern ([RPU_PLAN §13.2](../plans/RPU_PLAN.md)): the `y_cs` / `y_cn` / `y_gs` registers place channel c at `(c mod y_cn)·y_cs + (c div y_cn)·y_gs`.  When true the scheduler writes the prefill and vision attention P·V straight into the merged tensor (the `LlmAttnMerge` host op disappears); when false they keep the merge.  Every generated `run_conv*` writes the three registers (0 = dense) wherever the driver has them, whatever this says.  Bitstreams up to `de968ccc45da` lack it; `33a799febc56` (A2) has it.  `AXI_CONV_YPATTERN=0` / `1` overrides it |
 
 Models cannot violate `tile_m` / `tile_ic` (any `out_ch` / `in_ch` is
 residual-padded), but the scheduler still reads them: `tile_ic` sets the
@@ -202,6 +203,7 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
 |-------|------|-------------|
 | `unit` | bool | The bitstream carries the row-ops unit, RowOpsKernel ([HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md), [ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)): the fifth kernel lane that runs the transformer's row ops in fixed point.  When true the scheduler puts ONNX / fused `LayerNormalization` (Q8.8, rows ≤ 4096) and the chat frontends' row ops there (`src/rowops_nodes.py`); when false they stay on the host.  `AXI_ROWOPS=0` / `1` overrides it — `1` to generate for a bitstream with the unit before this file says so |
 | `fold` | bool | The unit has op 9, FOLD ([HOSTOPS_PLAN §11](../plans/HOSTOPS_PLAN.md)): Piper's `TtsPrep` — windowed source rows at any element offset, LeakyReLU with alpha = 1/m and the re-rounding — as one job.  When true (and `unit`) the scheduler puts the int16 `TtsPrep` calls whose rule is exact there (`rowops_nodes.FoldRoNode`, `rowops_spec.fold_divisor`); when false they stay on the host.  Bitstreams up to `1cedaf2ed816` lack it; `de968ccc45da` (production since 2026-10-15) has it.  `AXI_ROWOPS_FOLD=0` / `1` overrides it |
+| `chains` | bool | The unit runs descriptor chains ([RPU_PLAN §13.3](../plans/RPU_PLAN.md)): the `chain` / `chain_n` registers, one Start for up to 16 jobs read from DDR.  When true (and `unit`) the scheduler issues a multi-job row-ops node as one chain and puts the decode attention prep on the unit; when false each job is its own Start.  Bitstreams up to `de968ccc45da` lack it; `33a799febc56` (A2) has it.  `AXI_ROWOPS_CHAINS=0` / `1` overrides it |
 
 ---
 
@@ -221,7 +223,8 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
       "max_in_ch":            1024,  "max_out_ch":          1280,
       "max_line_buf_cols":      64,  "max_line_buf_rows":     16,
       "max_acc_persist_entries": 65536,
-      "max_m_per_group":         4
+      "max_m_per_group":         4,
+      "y_pattern":               false
     },
     "matmul": {
       "impl":   "rtl",
@@ -234,7 +237,8 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
     },
     "rowops": {
       "unit": true,
-      "fold": true
+      "fold": true,
+      "chains": false
     },
     "pool": {
       "tile_c":            8,

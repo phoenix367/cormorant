@@ -9,7 +9,10 @@ fixed point.  Where it is false the scheduler keeps those ops on the host
 (``src/rowops_nodes.py``: the kernel nodes are chosen only with the unit).
 ``fold`` says whether its unit has op 9, FOLD (doc/plans/HOSTOPS_PLAN.md §11:
 Piper's TtsPrep — windowed rows, LeakyReLU, the re-rounding); bitstreams up to
-``1cedaf2ed816`` lack it, ``de968ccc45da`` has it.  It needs ``unit``.
+``1cedaf2ed816`` lack it, ``de968ccc45da`` has it.  ``chains`` says whether
+its unit runs descriptor chains (the ``chain`` / ``chain_n`` registers,
+doc/plans/RPU_PLAN.md §13.3: one Start runs up to 16 jobs read from DDR);
+bitstreams up to ``de968ccc45da`` lack it.  Both need ``unit``.
 
 JSON shape (only the fields this module reads)::
 
@@ -17,7 +20,8 @@ JSON shape (only the fields this module reads)::
       "kernels": {
         "rowops": {
           "unit": false,
-          "fold": false
+          "fold": false,
+          "chains": false
         }
       }
     }
@@ -26,8 +30,9 @@ Platform selection as for the other kernels (``_matmul_hw_config``): the
 ``AXI_PLATFORM`` environment variable picks ``platforms/<name>.json``,
 default ``kv260``.  ``AXI_ROWOPS`` (``0`` / ``1``) overrides the JSON for
 the scheduler — ``1`` to generate for a bitstream with the unit before the
-platform file says so, ``0`` for one without it; ``AXI_ROWOPS_FOLD`` likewise
-for ``fold`` (without the unit it is off whatever it says).  A missing or
+platform file says so, ``0`` for one without it; ``AXI_ROWOPS_FOLD`` and
+``AXI_ROWOPS_CHAINS`` likewise for ``fold`` and ``chains`` (without the unit
+they are off whatever they say).  A missing or
 malformed field raises ``RowopsHwConfigError``.
 """
 from __future__ import annotations
@@ -65,9 +70,9 @@ def _flag(section, key: str, path, what: str, env_name: str) -> bool:
 
 
 def resolve(platform_name: str = None) -> Dict[str, object]:
-    """``{"ROWOPS_UNIT": bool, "ROWOPS_FOLD": bool}`` for the given platform
-    (``None``: ``AXI_PLATFORM``, else ``kv260``), ``AXI_ROWOPS`` /
-    ``AXI_ROWOPS_FOLD`` applied."""
+    """``{"ROWOPS_UNIT": bool, "ROWOPS_FOLD": bool, "ROWOPS_CHAINS": bool}``
+    for the given platform (``None``: ``AXI_PLATFORM``, else ``kv260``),
+    ``AXI_ROWOPS`` / ``AXI_ROWOPS_FOLD`` / ``AXI_ROWOPS_CHAINS`` applied."""
     if platform_name is None:
         platform_name = os.environ.get("AXI_PLATFORM", _DEFAULT_PLATFORM)
     path = _PLATFORMS_DIR / f"{platform_name}.json"
@@ -85,13 +90,15 @@ def resolve(platform_name: str = None) -> Dict[str, object]:
         raise RowopsHwConfigError(f"Platform JSON {path}: 'kernels.rowops' is required.") from e
     unit = _flag(section, "unit", path, "the row-ops unit", "AXI_ROWOPS")
     fold = _flag(section, "fold", path, "the unit's op 9, FOLD", "AXI_ROWOPS_FOLD")
-    return {"ROWOPS_UNIT": unit, "ROWOPS_FOLD": unit and fold}
+    chains = _flag(section, "chains", path, "the unit's descriptor chains", "AXI_ROWOPS_CHAINS")
+    return {"ROWOPS_UNIT": unit, "ROWOPS_FOLD": unit and fold, "ROWOPS_CHAINS": unit and chains}
 
 
 _CFG = resolve()
 
-# Exported: whether the platform's bitstream has the row-ops unit, and its FOLD op.
+# Exported: whether the platform's bitstream has the row-ops unit, its FOLD op and its chains.
 ROWOPS_UNIT: bool = _CFG["ROWOPS_UNIT"]
 ROWOPS_FOLD: bool = _CFG["ROWOPS_FOLD"]
+ROWOPS_CHAINS: bool = _CFG["ROWOPS_CHAINS"]
 
-__all__ = ("ROWOPS_UNIT", "ROWOPS_FOLD", "RowopsHwConfigError", "resolve")
+__all__ = ("ROWOPS_UNIT", "ROWOPS_FOLD", "ROWOPS_CHAINS", "RowopsHwConfigError", "resolve")

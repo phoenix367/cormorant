@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--rowops", choices=("auto", "on", "off"), default="auto",
                     help="the residual stream as int32 and the row ops on the row-ops unit "
                          "(policy ...+rowops); auto: where the platform has the unit")
+    ap.add_argument("--drope", choices=("auto", "on", "off"), default="auto",
+                    help="the decode steps' attention prep on the unit too (policy ...+drope); "
+                         "auto: with rowops where the unit runs descriptor chains")
     ap.add_argument("--save", default=None, help="write tokens / logits checksums as JSON")
     args = ap.parse_args()
     t0 = time.time()
@@ -79,10 +82,11 @@ def main():
     cont = set(filter(None, args.second_turn.split(",")))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
-    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops)
+    drope = lp.drope_default(rowops) if args.drope == "auto" else args.drope == "on"
+    policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope)
     cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
     fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn,
-                     vsmx=vsmx, rowops=rowops)
+                     vsmx=vsmx, rowops=rowops, drope=drope)
     cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "

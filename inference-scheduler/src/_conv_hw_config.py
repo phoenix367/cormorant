@@ -30,7 +30,8 @@ JSON shape (only the fields this module reads)::
           "max_line_buf_cols":       64,
           "max_line_buf_rows":       16,
           "max_acc_persist_entries": 65536,
-          "max_m_per_group":         4
+          "max_m_per_group":         4,
+          "y_pattern":               false
         }
       }
     }
@@ -59,6 +60,14 @@ retired, doc/plans/CONV_RTL_PLAN.md phase 3); ``"hls"`` models the bitstreams
 built before (``dbb320fb7297`` and older).  The ``AXI_CONV_IMPL`` environment
 variable overrides it for the scheduler (e.g. ``AXI_CONV_IMPL=hls`` for a
 project on such a bitstream).
+
+``y_pattern`` says whether the bitstream's ConvKernel has the y channel
+pattern (the ``y_cs`` / ``y_cn`` / ``y_gs`` registers, doc/plans/RPU_PLAN.md
+§13.2): the attention P·V of prefill and vision written straight into the
+merged tensor.  Bitstreams up to ``de968ccc45da`` lack it.
+``AXI_CONV_YPATTERN`` (``0`` / ``1``) overrides it.  (Every generated
+``run_conv*`` writes the three registers, 0 when dense, wherever the driver
+has them — whatever this flag says.)
 
 ``tile_ic`` is not used by the validator: ``kTileIC`` is a pure
 unrolling factor (any in_ch is residual-padded); the weight packing reads
@@ -155,7 +164,8 @@ def resolve(platform_name: str = None) -> Dict[str, object]:
 
     ``platform_name=None`` falls back to ``AXI_PLATFORM`` from the env, then
     to the built-in default ``kv260``.  ``CONV_IMPL`` is the JSON's ``impl``
-    unless ``AXI_CONV_IMPL`` is set.  Function-based so tests can probe
+    unless ``AXI_CONV_IMPL`` is set, ``CONV_Y_PATTERN`` its ``y_pattern``
+    unless ``AXI_CONV_YPATTERN`` is.  Function-based so tests can probe
     arbitrary platforms without re-importing this module — module-level
     constants below freeze the default-platform values at import time.
     """
@@ -176,6 +186,17 @@ def resolve(platform_name: str = None) -> Dict[str, object]:
                 f"AXI_CONV_IMPL must be one of {', '.join(IMPLS)}, got {env!r}.")
         impl = env
     out["CONV_IMPL"] = impl
+    yp = section.get("y_pattern")
+    if not isinstance(yp, bool):
+        raise ConvHwConfigError(
+            f"Platform JSON {path}: 'kernels.conv.y_pattern' is required and must be "
+            f"true or false (the bitstream's ConvKernel has the y channel pattern), got {yp!r}.")
+    env = os.environ.get("AXI_CONV_YPATTERN")
+    if env:
+        if env not in ("0", "1"):
+            raise ConvHwConfigError(f"AXI_CONV_YPATTERN must be 0 or 1, got {env!r}.")
+        yp = env == "1"
+    out["CONV_Y_PATTERN"] = yp
     for json_key, py_attr in _REQUIRED:
         if json_key not in section:
             raise ConvHwConfigError(
@@ -208,6 +229,7 @@ CONV_MAX_KH                  : int = _CFG["CONV_MAX_KH"]
 CONV_MAX_KW                  : int = _CFG["CONV_MAX_KW"]
 CONV_MAX_M_PER_GROUP         : int = _CFG["CONV_MAX_M_PER_GROUP"]
 CONV_IMPL                    : str = _CFG["CONV_IMPL"]    # "hls" | "rtl": the cycle model
+CONV_Y_PATTERN               : bool = _CFG["CONV_Y_PATTERN"]   # the y channel pattern (RPU_PLAN §13.2)
 
 # ConvKernel's weight / bias ports are hls::burst_maxi<ap_uint<128>>:
 # kWeightPortBits / kDataBits = 128 / 16 Data_t lanes per beat
@@ -229,6 +251,7 @@ __all__ = (
     "CONV_MAX_KW",
     "CONV_MAX_M_PER_GROUP",
     "CONV_IMPL",
+    "CONV_Y_PATTERN",
     "CONV_WEIGHT_PORT_ELEMS",
     "ConvHwConfigError",
     "resolve",

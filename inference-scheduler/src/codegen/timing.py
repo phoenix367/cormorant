@@ -138,10 +138,12 @@ def simulate(cg, kernel_us: Callable[[object], Optional[float]],
 
 
 def kernel_duration_fn(perf_model, layouts: dict, keys_of: Optional[Callable] = None,
-                       fallback: Optional[Callable] = None):
+                       fallback: Optional[Callable] = None, chains: Optional[dict] = None):
     """``sn -> µs`` of a kernel node: the performance model's price of its
     kernel_calls() (a runtime-keys attention call at ``keys_of(sn)`` keys);
-    ``fallback(sn)`` (e.g. the analytic model) when it cannot be priced."""
+    ``fallback(sn)`` (e.g. the analytic model) when it cannot be priced.
+    ``chains``: the code generator's chained row-ops nodes (``cg._ro_chains``)
+    — their jobs as descriptor chains (PerfModel.chain_adjust_us)."""
     def f(sn):
         if not hasattr(sn, "kernel_calls"):
             return 0.0
@@ -150,6 +152,8 @@ def kernel_duration_fn(perf_model, layouts: dict, keys_of: Optional[Callable] = 
         else:
             calls = sn.kernel_calls(layouts)
         t = perf_model.calls_us(calls)
+        if t is not None and chains and sn.index in chains:
+            t += perf_model.chain_adjust_us(sum(c.count for c in calls))
         if t is None and fallback is not None:
             t = fallback(sn)
         return t

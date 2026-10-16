@@ -470,6 +470,48 @@ class TestHostEmulation(unittest.TestCase):
                         self.assertEqual(rc, 0, out[-3000:])
                         self.assertIn("test_inference PASSED", out)
 
+    def test_prefill_merge_patterned(self):
+        """RPU_PLAN §13.4 (A2.4): with ConvKernel's y channel pattern
+        (kernels.conv.y_pattern) a prefill's P.V calls write the merged tensor
+        through the pattern — y_cs = H*HD, y_cn = T, y_gs = HD — and the merge
+        emits nothing; the generated C on the software kernels equals the
+        simulation.  T = 8 is outside the contract (y_cn % 16) and keeps the
+        merge; without the flag every prefill keeps it."""
+        from src import _conv_hw_config
+        for fx in (tiny, tiny_fpga):
+            _cfg, _W, _f, fe = fx()
+            with mock.patch.object(_conv_hw_config, "CONV_Y_PATTERN", True):
+                gs = graphs(fe, {"prefill8": ("prefill", 8, True), "prefill16": ("prefill", 16, True)})
+                cgs = {n: CodeGenerator(g, model_path=f"llama_tiny_{n}.onnx") for n, g in gs.items()}
+            m8 = [sn for sn in gs["prefill8"].nodes if isinstance(sn, LlmAttnMergeNode)]
+            self.assertTrue(m8 and not any(sn.in_place for sn in m8))
+            g16 = gs["prefill16"]
+            merges = [sn for sn in g16.nodes if isinstance(sn, LlmAttnMergeNode)]
+            self.assertTrue(merges and all(sn.in_place and sn.patterned for sn in merges))
+            views = cgs["prefill16"]._view_aliases
+            for m in merges:
+                G_, T = m.H // m.KV, m.T
+                pvs = {sn.output.onnx_name: sn for sn in g16.nodes if isinstance(sn, LlmAttnConvNode)
+                       and sn.kind == "pv"}
+                for gi, t in enumerate(m.inputs):
+                    self.assertEqual(pvs[t.onnx_name].y_pat, (m.H * m.HD, T, m.HD))
+                    self.assertEqual(views[t.onnx_name][1:],
+                                     (gi * G_ * m.HD, (T - 1) * m.H * m.HD + G_ * m.HD))
+            src = cgs["prefill16"].generate_source()
+            self.assertNotIn("llm_attn_merge(_o", src)
+            self.assertIn("run_conv_at_y(", src)
+            self.assertIn("llm_attn_merge(_o", cgs["prefill8"].generate_source())
+            for inc in (False, True):
+                with self.subTest(fixture=fx.__name__, incoherent=inc), tempfile.TemporaryDirectory() as td:
+                    rc, out = host_emu.build_and_run(cgs["prefill16"], td, cached=True, threads=4,
+                                                     min_elems=1, incoherent=inc)
+                    self.assertEqual(rc, 0, out[-3000:])
+                    self.assertIn("test_inference PASSED", out)
+            # a later generation without the flag: the graph's nodes are reset
+            CodeGenerator(g16, model_path="llama_tiny_prefill16.onnx")
+            self.assertFalse(any(sn.in_place for sn in merges))
+            self.assertTrue(all(sn.y_pat is None for sn in g16.nodes if isinstance(sn, LlmAttnConvNode)))
+
     def test_multi_entry_project(self):
         _cfg, _W, _f, fe = tiny()
         kinds = {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),

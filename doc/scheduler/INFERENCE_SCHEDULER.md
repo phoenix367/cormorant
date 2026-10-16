@@ -105,8 +105,14 @@ image (hence `qk_kw = 1`), a COPY into the K cache and TRANSPOSEs into the
 P·V image — the 16K-key blocks inside [pos, pos + n) as R = K tiles, the
 two boundary blocks as byte-strobed single-element granules; the
 calls are priced at pos = 0, n = T; the numerics are the study's `irope`.
-The decode step's `LlmAttnPrep` (one row) stays a host op; its
-`LlmAttnMerge` costs nothing since RPU_PLAN §13 (A2.0, below); the decode prep invalidates
+The decode step's `LlmAttnPrep` (one row) stays a host op unless the frontend's
+`drope` (RPU_PLAN §13.4; the chat generators' `--drope`, default on with
+`rowops` where the unit runs descriptor chains, policy `…+rowops+drope`) puts
+it on the unit as well: `AttnPrepRoNode` with one row — ROPE of q / k, the q
+image as one TRANSPOSE with R = G (a group's heads as the tile's rows, the
+groups as blocks), the cache rows at the runtime pos; no CPU cache line of the
+caches is written.  Its `LlmAttnMerge` costs nothing since RPU_PLAN §13 (A2.0,
+below); the host decode prep invalidates
 the V-cache lines it writes 2-byte slots into (`llm_cache_inval_rows`): the
 unit wrote them through a port that does not snoop the CPU caches.  The vision encoder's and the Piper encoder's
 `VitAttnPrep` (`VitAttnPrepRoNode`, phase 4b: the q / k / v bias adds as
@@ -114,7 +120,17 @@ COPYs with the bias in the parameter block — `rowops_spec.bias_round`, the
 studies' `iqkv` — and the same image / cache jobs) and the Piper encoder's
 `TtsRowPrep` (`TtsRowPrepRoNode`: a COPY per tap with the bias and ReLU,
 the zeroed rows as window-[0, 0) COPYs; `TtsAttnRelAdd` then recomputes q
-with the unit's integer formula) run on the unit as well.  `test/host_emu.py` models
+with the unit's integer formula) run on the unit as well.  **Descriptor
+chains** (`kernels.rowops.chains`, `AXI_ROWOPS_CHAINS`, RPU_PLAN §13.3): where
+the unit has them every node of two or more jobs (`RowOpsNode.chain_jobs`:
+the attention preps, the row preps, the relative-key band, a re-rowed
+DEQUANT, the pixel shuffle) runs between `ro_chain_begin()` and
+`ro_chain_end()`: `run_rowops()` writes each job as a 128-byte descriptor (the
+argument registers 0x10 … 0x6C) into the node's region at the end of the
+pool, the node's own `kernel_wait(KERNEL_ROWOPS)` calls return at once, and
+the jobs start as chains of at most 16, one register block each (a node's
+region holds every job it can issue, so the Cortex-R5's later replay never
+sees a descriptor rewritten; `CodeGenerator._ro_chains`).  `test/host_emu.py` models
 the unit in C (`xrowopskernel.h`), so every generated project runs on the
 host; `perf_model.family()` prices its calls as the `rowops` family once a
 campaign measures them (phase 3).
@@ -258,7 +274,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1841 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1856 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1139,7 +1155,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 | `LlmAttnSoftmax` | per query column p = (h', t < n), keys j ≤ pos + t: `k = raw_max − raw`, `e = sexp_{f_s}[k]` (a 65 536-entry table per score exponent `f_s = f_q + f_k − 8`, `exp(−k·2^-f_s / √HD)`, libm), sum left to right, `P = round_half_even(e / sum · 2^f_p)` → `P_g[p][j]` (row stride keys), masked keys / rows 0.  Items of 32 columns (one line of a score row) are read once, transposed into a stack buffer, zig-zag over the threads; `e · (2^f_p / sum)` replaces the division except within 1e-7 of a rounding tie (then the exact quotient) — the same integers |
 | `LlmAttnSoftmax` with `vsmx = 1` (VectorOPKernel, `LlmAttnSoftmaxVopNode`) | the prefill under policy `…+vsmx` (`LlamaFrontend(vsmx=True)`): per head h' one `OP_SOFTMAX_T` call — s_g columns `h'·T … +T` (row stride `G·T`) → P_g rows `h'·T … +T` at row stride keys, over keys = roundup(pos + n, Q), row t valid over keys `j < min(keys, pos + 1 + t)` (`smx_mask` valid0 = pos + 1, period = T); the integer softmax of `src/vectorop_smx.py` with Cm / Cs from f_s and 1/√HD.  Padded rows t ≥ n are computed too (they feed padded rows only); decode steps keep the host op |
 | `LlmAttnPV` (ConvKernel) | `o_g[p][d] = floor(Σ_j P_g[p][j]·V_g[j][d] / 2^8)`: weight = P (`out_ch = G·T`), x = the V cache image of KV head g (`in_ch = keys/K`, 1×K, stride (1, K)), output HD pixels |
-| `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw); **in place** where every o_g is a contiguous piece of pv — a decode step (T = 1): o_g = pv[g·G·HD …], so `CodeGenerator._merge_in_place` makes each o_g a view of pv at that offset (the P·V call writes there), the merge emits nothing and pv lives from the first P·V call (RPU_PLAN §13, A2.0: −0.26 / −0.54 ms per token on SmolLM2-135M / 360M); `AXI_INPLACE_MERGE=0` keeps the copy.  Prefill and vision rows interleave across the heads: they need ConvKernel's y pattern (A2.1) |
+| `LlmAttnMerge` | `pv[t][(g·G + h')·HD + d] = o_g[h'·T + t][d]` (raw); **in place** where every o_g is a contiguous piece of pv — a decode step (T = 1): o_g = pv[g·G·HD …], so `CodeGenerator._merge_in_place` makes each o_g a view of pv at that offset (the P·V call writes there), the merge emits nothing and pv lives from the first P·V call (RPU_PLAN §13, A2.0: −0.26 / −0.54 ms per token on SmolLM2-135M / 360M); `AXI_INPLACE_MERGE=0` keeps the copy.  Prefill and vision rows interleave across the heads: with ConvKernel's y channel pattern (`kernels.conv.y_pattern`, `AXI_CONV_YPATTERN`; A2.4) each o_g is a patterned view of pv (`LlmAttnMergeNode.pattern_views`: offset g·G·HD, or r·(T/R)·H·HD + g·HD for a vision row split) and its P·V call writes through `run_conv_at_y()` — `y_cs = H·HD`, `y_cn = T`, `y_gs = HD` (one head per group: `y_cn = 0`); T a multiple of 16 |
 
 RoPE uses float32 cos / sin tables `[C][HD/2]` computed by the frontend
 exactly as `llm_study.rope_tables` (host tables).  The ops are the numeric

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -167,9 +167,36 @@ def _mhz(mhz: float):
     return int(r) if r == int(r) else r
 
 
+def fit_chain(meas: Dict[str, dict], info: Dict[str, dict]) -> Optional[dict]:
+    """The RowOpsKernel descriptor chains' term (doc/plans/RPU_PLAN.md §13.3)
+    from the chained cases (perf_calibrate.chain_cases: one row-ops call k
+    times in one Start): t_k = k * (t_1 - per_job_us) + per_chain_us, t_1 the
+    call's exact entry — per_job_us what a job in a chain saves of its
+    calibrated time (the register writes, the Start, the poll), per_chain_us
+    the chain's own cost (the descriptor fetch, its Start).  Least squares
+    over every measured (call, k); None without chained cases."""
+    xs, ys, calls = [], [], set()
+    for k, m in meas.items():
+        e = info.get(k)
+        if not e or not e.get("chain") or e["base"] not in meas:
+            continue
+        n = int(e["chain"])
+        xs.append(n)
+        ys.append(m["us"] - n * meas[e["base"]]["us"])     # = -per_job * n + per_chain
+        calls.add(e["base"])
+    if len(set(xs)) < 2:
+        return None
+    A = np.stack([-np.asarray(xs, float), np.ones(len(xs))], axis=1)
+    (per_job, per_chain), *_ = np.linalg.lstsq(A, np.asarray(ys, float), rcond=None)
+    res = np.asarray(ys) - A @ np.array([per_job, per_chain])
+    return {"per_job_us": round(float(per_job), 3), "per_chain_us": round(float(per_chain), 3),
+            "points": len(xs), "calls": len(calls), "max_residual_us": round(float(np.abs(res).max()), 3)}
+
+
 def fit(cases: dict, data: dict, clock_mhz: float = 100.0) -> dict:
-    meas = _measured(data)
+    meas_all = _measured(data)
     info = {e["key"]: e for e in cases["cases"]}
+    meas = {k: m for k, m in meas_all.items() if not (info.get(k) or {}).get("chain")}
     fams: Dict[str, List[dict]] = {}
     for k, m in meas.items():
         e = info.get(k)
@@ -190,6 +217,7 @@ def fit(cases: dict, data: dict, clock_mhz: float = 100.0) -> dict:
                         "max_spread": float(max(spreads)) if spreads else None,
                         "noisy": sum(s > NOISY for s in spreads)},
         "call_overhead_us": float(min((m["us"] for m in meas.values()), default=0.0)),
+        **({"rowops_chain": ch} if (ch := fit_chain(meas_all, info)) else {}),
     }
 
 
@@ -209,6 +237,11 @@ def report(model: dict) -> str:
               f"{h['max_rel'] * 100:6.2f}%") if h["n"] else f"{0:10d}"
         lines.append(f"{n:10s} {f['knn']['k']:2d} {t['n']:4d} {t['median_rel'] * 100:8.2f}% "
                      f"{t['max_rel'] * 100:6.2f}% | {hs}")
+    ch = model.get("rowops_chain")
+    if ch:
+        lines.append(f"row-ops chains: a job in a chain {-ch['per_job_us']:+.3f} µs, a chain "
+                     f"{ch['per_chain_us']:+.3f} µs ({ch['points']} points over {ch['calls']} calls, "
+                     f"max residual {ch['max_residual_us']:.3f} µs)")
     return "\n".join(lines)
 
 

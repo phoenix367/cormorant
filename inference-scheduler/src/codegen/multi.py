@@ -130,7 +130,7 @@ class _CombinedCG(CodeGenerator):
 
     def _compute_pool_bytes(self) -> int:
         _layout, total = self._multi.pool_layout()
-        b = total * self._dtype.bytes_per_elem
+        b = total * self._dtype.bytes_per_elem + self._ro_desc_bytes()
         return (b + 4095) & ~4095
 
     def _init_function(self) -> str:

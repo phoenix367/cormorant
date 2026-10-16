@@ -339,7 +339,7 @@ class ReportGenerator:
         hp = default_host_model_path()
         hm = HostModel.load(hp) if hp.exists() else HostModel()
         cg = self.codegen
-        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts), hm.us)
+        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, chains=cg._ro_chains), hm.us)
         by = {sn.index: sn for sn in self.graph.nodes}
         rows.append(f"Predicted time of one `inference_run()`: **{tl.total_us / 1e3:.2f} ms** "
                     f"(performance model {pm.platform}/{pm.bitstream}); CPU busy "

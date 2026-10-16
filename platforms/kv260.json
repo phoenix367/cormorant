@@ -15,7 +15,8 @@
       "max_line_buf_cols":       64,
       "max_line_buf_rows":       16,
       "max_acc_persist_entries": 65536,
-      "max_m_per_group":         4
+      "max_m_per_group":         4,
+      "y_pattern":               false
     },
     "matmul": {
       "impl":   "rtl",
@@ -31,7 +32,8 @@
     },
     "rowops": {
       "unit": true,
-      "fold": true
+      "fold": true,
+      "chains": false
     },
     "pool": {
       "tile_c":            8,

@@ -8,9 +8,9 @@ platform.
 
 | file | written by | holds |
 |---|---|---|
-| `<bitstream-id>.cases.json` | `perf_calibrate.py cases [--refine]` | the calls to measure: every kernel call of the shipped models and of their MatMul tactics, the space-filling set, the refinement calls |
+| `<bitstream-id>.cases.json` | `perf_calibrate.py cases [--refine]` | the calls to measure: every kernel call of the shipped models and of their MatMul tactics, the space-filling set, the refinement calls; with a row-ops unit the descriptor-chain cases (set `chain`, key `<call>#chain<k>`: the six shortest shipped row-ops calls as chains of k = 1, 2, 4, 8, 16 copies — `calib_runner` case `Q`, RPU_PLAN §13.3) |
 | `<bitstream-id>.calib.json` | `perf_calibrate.py run` | the board measurements, two passes (mean / min / max / sd µs per call) |
-| `<bitstream-id>.json` | `perf_calibrate.py fit` | the kernel model: exact µs per measured call, a fitted model per kernel family with its calibrated ranges and held-out error, the determinism check |
+| `<bitstream-id>.json` | `perf_calibrate.py fit` | the kernel model: exact µs per measured call, a fitted model per kernel family with its calibrated ranges and held-out error, the determinism check; `rowops_chain` (where chain cases were measured): `per_job_us`, `per_chain_us` — a chained row-ops node costs its jobs' exact entries − per_job_us a job + per_chain_us a chain (`perf_fit.fit_chain`, `PerfModel.chain_adjust_us`) |
 | `host.json` | `perf_calibrate.py host [--merge]` | the host-op model: measured µs per op signature from board profiles, a fit per op kind (independent of the bitstream); `--merge` adds a new model's kinds and keeps the others |
 
 `<bitstream-id>` is the first 12 hex digits of the SHA-256 of the flat

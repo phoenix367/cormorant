@@ -54,6 +54,12 @@ def fold_enabled() -> bool:
     return _rowops_hw_config.ROWOPS_FOLD
 
 
+def chains_enabled() -> bool:
+    """The platform's unit runs descriptor chains (``_rowops_hw_config.ROWOPS_CHAINS``,
+    ``AXI_ROWOPS_CHAINS``; read at call time, as ``enabled``)."""
+    return _rowops_hw_config.ROWOPS_CHAINS
+
+
 def raw_as_data(raw) -> np.ndarray:
     """Raw int16 words as the float32 values whose Q8.8 encoding is those
     words (exact: every int16 / 256 is a float32)."""
@@ -115,6 +121,13 @@ class RowOpsNode(LlmKernelNode):
     a_advances:         bool = field(default=True, init=False)
     b_advances:         bool = field(default=True, init=False)
     arity:              int  = field(default=1,    init=False)
+
+    def chain_jobs(self, layouts: dict) -> int:   # noqa: ARG002
+        """The most jobs emit_call() issues at run time.  A node of two or more
+        is issued as descriptor chains where the unit has them
+        (``kernels.rowops.chains``, RPU_PLAN §13.3): its region holds this
+        many 128-byte descriptors (CodeGenerator._ro_chained)."""
+        return 1
 
     @staticmethod
     def call(a, a_off, b, b_off, c, c_off, p, op: int, n, rows, blocks, a_s1, a_s2, b_s1, b_s2,
@@ -797,7 +810,12 @@ class AttnPrepRoNode(RowOpsNode):
     expressions; the calls are priced at pos = 0, n = T.  The staging rows
     are DMA states of the entry.  The reference writes the same bytes as the
     host node (the irope numerics): the cache rows [pos, pos + n), the image
-    with zero columns past n.  Decode steps (T = 1) keep the host node."""
+    with zero columns past n.
+
+    A decode step (T = 1, no n input: n = 1; the frontend's drope, RPU_PLAN
+    §13.4) runs the same jobs with one row, its q image one TRANSPOSE for
+    every group — R = G (the group's heads as the tile's rows), the groups as
+    blocks, contiguous granules x_g[d][h'] — and no zeroing."""
     T:   int = 1
     H:   int = 1
     KV:  int = 1
@@ -806,6 +824,7 @@ class AttnPrepRoNode(RowOpsNode):
     Q:   int = 16
     K:   int = 1
     first: bool = False
+    has_n: bool = True                  # False: a decode step, n = T = 1
     v_direct: bool = False
     pq_bc: bool = False
     pk_bc: bool = False
@@ -898,7 +917,11 @@ class AttnPrepRoNode(RowOpsNode):
             jobs.append(("v re-rounded at the V cache's exponents -> vs", self.v, 0, None, 0, self.vs, 0,
                          self.pvb, rs.opword(rs.OP_COPY, p_bcast=self.pv_bc), self.nk, n, 1, sv, 0, 0, 0,
                          sks, 0, 0, 0, NW, False))
-        for g in range(KV):
+        if T == 1:
+            jobs.append(("the q.K^T x image of every group: qs -> qx (the group's heads as the tile's rows)",
+                         self.qs, 0, None, 0, self.output, 0, None, self.op_xpose, HD, 1, KV,
+                         0, G * HD * 2, HD * 2, 2 * G, 0, HD * G * 2, G, 0, NW, False))
+        for g in range(KV if T > 1 else 0):
             jobs.append((f"the q.K^T x image of group {g}: qs -> qx (8-row tiles)", self.qs, g * G * HD * 2,
                          None, 0, self.output, g * HD * G * T * 2, None, self.op_xpose, HD, T // QIMAGE_R, G,
                          QIMAGE_R * sqs, HD * 2, sqs, 2 * G * T, 2 * QIMAGE_R, 2 * T, QIMAGE_R, 0, NW, False))
@@ -926,6 +949,13 @@ class AttnPrepRoNode(RowOpsNode):
                                     a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
                                     win_lo=j[19], win_hi=j[20]) for j in jobs])
 
+    def chain_jobs(self, layouts: dict) -> int:
+        """The jobs emit_call() writes, plus llm_ro_vimage's at most: per KV
+        group one job for the whole 16K-row blocks and three per boundary
+        block (vimage_jobs)."""
+        jobs, _, _ = self._jobs(layouts, 0, self.T)
+        return sum(1 for j in jobs if not j[21]) + (7 * self.KV if self.K > 1 else 0)
+
     def hidden_calls(self, layouts: dict) -> list:
         """The calls a C helper issues (not in emit_call's text): the V image's."""
         from .perf_calls import KernelCall
@@ -946,10 +976,10 @@ class AttnPrepRoNode(RowOpsNode):
     def emit_call(self, layouts: dict) -> str:
         jobs, vsrc, svs = self._jobs(layouts, "_pos", "_n")
         cn = lambda t: "NULL" if t is None else t.c_name   # noqa: E731
+        nv = f"(unsigned){self.n_t.c_name}[0]" if self.has_n else f"{self.T}u"
         lines = ["    {",
                  f"        const unsigned _pos = (unsigned){self.pos.c_name}[0];",
-                 f"        const unsigned _n = llm_ro_clamp_n(_pos, (unsigned){self.n_t.c_name}[0], "
-                 f"{self.T}u, {self.C}u);"]
+                 f"        const unsigned _n = llm_ro_clamp_n(_pos, {nv}, {self.T}u, {self.C}u);"]
         issued = False
         for j in jobs:
             if j[21]:
@@ -984,7 +1014,7 @@ class AttnPrepRoNode(RowOpsNode):
         T, H, KV, HD, C, F = self.T, self.H, self.KV, self.HD, self.C, self.F
         G = H // KV
         pos = _i32(a[self.pos.onnx_name])
-        n, _keys = attn_keys(pos, _i32(a[self.n_t.onnx_name]), T, C, self.Q)
+        n, _keys = attn_keys(pos, _i32(a[self.n_t.onnx_name]) if self.has_n else T, T, C, self.Q)
         ck, cv = a[self.ck.onnx_name], a[self.cv.onnx_name]            # logical state arrays, in place
         qx = np.zeros((KV, HD, G * T))
         if n > 0:
@@ -1023,24 +1053,26 @@ def from_llm_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     _require(len(ins) == 12, node, "inputs: q0, k0, v, pos, n, cache_k, cache_v, cos, sin, qs, ks, vs "
                                    "(may be empty)")
     q0, k0, v, pos, n, ck, cv, _c, _s, qs, ks, vs = ins
-    _require(n is not None, node, "the unit's attention prep needs n (a prefill entry)")
     y = _resolve(tensors, node.output[0], node)
     a, H, KV, HD = _heads_attrs(node)
     G = H // KV
     T = q0.numel // (H * HD)
+    _require(n is not None or T == 1, node, "n may be empty only in a decode step (one row)")
     C = int(ck.shape[0])
     K = int(cv.group_kw)
     Q = int(a.get("key_quantum", KEY_QUANTUM))
     _require(int(a.get("qk_kw", 1)) == 1, node, "the unit writes the q image with qk_kw = 1")
     _require(HD % 16 == 0 and 16 <= HD <= 128, node, f"head_dim {HD}: 16 .. 128, a multiple of 16")
     _require(H * HD <= rs.N_MAX and KV * HD <= rs.N_MAX, node, f"rows of {H * HD} / {KV * HD} beyond {rs.N_MAX}")
-    _require(T % QIMAGE_R == 0, node, f"prefill rows {T} % {QIMAGE_R} (the q image's tiles)")
+    _require(T % QIMAGE_R == 0 or (T == 1 and G <= QIMAGE_R), node,
+             f"prefill rows {T} % {QIMAGE_R} (the q image's tiles); a decode step: at most {QIMAGE_R} heads "
+             "per group")
     _require(C % Q == 0 and Q % (16 * K) == 0, node, "cache rows % key_quantum, key_quantum % 16 x the V interleave")
     _require(q0.numel == T * H * HD and k0.numel == T * KV * HD and v.numel == k0.numel, node, "q / k / v shapes")
     _require(list(y.shape) == [KV, HD, G * T], node, f"qx must be [{KV}][{HD}][{G * T}]")
     for t, w in ((q0, "q0"), (k0, "k0"), (v, "v"), (y, "qx")):
         _require(t.dma is None and t.host is None and not t.is_state, node, f"{w}: an int16 DMA tensor")
-    _require(pos.host == "i32" and n.host == "i32", node, "pos / n: int32 host tensors")
+    _require(pos.host == "i32" and (n is None or n.host == "i32"), node, "pos / n: int32 host tensors")
     for t, w in ((ck, "cache_k"), (cv, "cache_v")):
         _require(t.is_state and not t.is_host and t.group_layout == (KV, HD), node,
                  f"{w} must be a DMA state stored group-major [{KV}][{C}][{HD}]")
@@ -1084,10 +1116,11 @@ def from_llm_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     raw = rope_raw_tensor(tensors, cos, sin)
     pz = zero_param_tensor(tensors)
     tb = tables_tensor(tensors)
-    inputs = [q0, k0, v, pos, n, ck, cv, qs, ks] + ([vs] if vs is not None else []) + [raw, pq, pk] \
-        + ([pvb] if pvb is not None else []) + [pz, tb]
+    inputs = [q0, k0, v, pos] + ([n] if n is not None else []) + [ck, cv, qs, ks] \
+        + ([vs] if vs is not None else []) + [raw, pq, pk] + ([pvb] if pvb is not None else []) + [pz, tb]
     return AttnPrepRoNode(onnx_node=node, inputs=inputs, output=y, index=index, align_elems=align_elems, F=F,
                           T=T, H=H, KV=KV, HD=HD, C=C, Q=Q, K=K, first=int(a.get("first", 0)) != 0,
+                          has_n=n is not None,
                           v_direct=v_direct, pq_bc=pq_bc, pk_bc=pk_bc, pv_bc=pv_bc, fq=fq, cos=cos, sin=sin,
                           q0=q0, k0=k0, v=v, pos=pos, n_t=n, ck=ck, cv=cv, qs=qs, ks=ks, vs=vs, raw=raw,
                           pq=pq, pk=pk, pvb=pvb, pz=pz)
@@ -1375,6 +1408,9 @@ class VitAttnPrepRoNode(RowOpsNode):
                                     a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
                                     win_lo=j[19], win_hi=j[20]) for j in self._jobs(layouts)])
 
+    def chain_jobs(self, layouts: dict) -> int:
+        return len(self._jobs(layouts))
+
     def describe(self) -> str:
         return (f"T={self.T} heads {self.H} head_dim {self.HD} on RowOpsKernel (the biases in the parameter "
                 f"blocks, the q image kw=1, the caches; V interleave {self.K})")
@@ -1560,6 +1596,9 @@ class TtsRowPrepRoNode(RowOpsNode):
                                     a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
                                     win_lo=j[19], win_hi=j[20])
                       for j in self._jobs(layouts, self.T, self.T - 1, 1)])
+
+    def chain_jobs(self, layouts: dict) -> int:
+        return len(self._jobs(layouts, "_n", "_n1", "_nz"))
 
     def describe(self) -> str:
         return (f"[{self.T}][{self.C}] -> taps {self.taps}" + (" + bias" if self.bias is not None else "")
@@ -1840,6 +1879,9 @@ class TtsRelBandRoNode(RowOpsNode):
                                     a_s2=j[13], b_s1=j[14], b_s2=j[15], c_s1=j[16], c_s2=j[17], aux=j[18],
                                     win_lo=j[19], win_hi=j[20]) for j in self._jobs()])
 
+    def chain_jobs(self, layouts: dict) -> int:  # noqa: ARG002
+        return len(self._jobs())
+
     def describe(self) -> str:
         return (f"[{self.T}] keys x [{self.T}] queries + the relative-key band (window {self.W}) on RowOpsKernel: "
                 f"{2 * self.W + 1} diagonal TRANSPOSEs (R = 1) onto the band state + one ADDX")
@@ -2091,6 +2133,9 @@ class DequantRoNode(RowOpsNode):
         return merge([KernelCall.of("RowOpsKernel", op=j[6], n=self.n, rows=j[2], blocks=1, a_s1=j[3], c_s1=j[4],
                                     win_hi=NO_WINDOW) for j in self._jobs(layouts)])
 
+    def chain_jobs(self, layouts: dict) -> int:
+        return len(self._jobs(layouts)) if self.rerow else 1
+
     def describe(self) -> str:
         return (f"rows={self.rows} n={self.n} on RowOpsKernel (DEQUANT: {'int32' if self.a32 else 'int16'} "
                 f"-> float32 DMA" + (f", {len(self.pbs)} chunks of {self.n}" if self.rerow else "") + ")")
@@ -2269,6 +2314,9 @@ class PixelShuffleRoNode(RowOpsNode):
         from .perf_calls import KernelCall, merge
         return merge([KernelCall.of("RowOpsKernel", op=self.opword, n=j[3], rows=j[4], blocks=j[5], a_s1=j[6],
                                     a_s2=j[7], c_s1=j[8], c_s2=j[9], win_hi=NO_WINDOW) for j in self._jobs(layouts)])
+
+    def chain_jobs(self, layouts: dict) -> int:
+        return len(self._jobs(layouts))
 
     def describe(self) -> str:
         return (f"[{self.n * self.n}][{self.D}] -> columns {self.k0}..{self.k0 + self.K - 1} of the x{self.s} "

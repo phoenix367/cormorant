@@ -915,7 +915,7 @@ they are replaced by §13.6's.
 | **A2.1 — ConvKernel y pattern** | §13.2 in RTL, the model, the testbench (random strided jobs: G 1 / 3, T 16 / 64 / 256, HD 64 / 96 — a 4 KiB split), fixtures (+3 columns, 3 strided cases), driver — **DONE 2026-10-15 (§13.9)** | `kernel-verify conv`: fixtures + 300 random × seeds at every memory timing, `ConvRtlDsp`, lint; OOC WNS ≥ 0 at 300 MHz; the perf shapes' cycles unchanged; the behaviour test 100 % |
 | **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures — **DONE 2026-10-15 (§13.9)** | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
 | **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain — **DONE 2026-10-16 (§13.10): `33a799febc56`, WNS +0.022 ns, 90 607 LUT, `sim_hw` 116 / 116** | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
-| **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
+| **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` — **DONE 2026-10-16 (§13.11)** | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
 | **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
 
 Order: A2.0 first (no bitstream; it also builds the output-view machinery
@@ -1125,3 +1125,74 @@ needed.  Archived in `/mnt/data/bitstreams/kv260_250_33a799febc56` (bit,
 HWH, the post-route timing and placed utilization reports, the build log,
 the path query).  Not on the board yet: the overlay, the board gates and the
 promotion are A2.5's, after the scheduler (A2.4).
+
+### 13.11 A2.4 results — the scheduler (2026-10-16)
+
+**Platform flags.**  `kernels.conv.y_pattern` (`AXI_CONV_YPATTERN`,
+`_conv_hw_config.CONV_Y_PATTERN`) and `kernels.rowops.chains`
+(`AXI_ROWOPS_CHAINS`, `_rowops_hw_config.ROWOPS_CHAINS`, needs `unit`) —
+required keys, **false in `platforms/kv260.json` until A2.5** promotes
+`33a799febc56`, so every library generated today is unchanged.
+
+**P·V into the merged tensor (prefill, vision).**
+`LlmAttnMergeNode.pattern_views()`: o_g at `g·G·HD` with `y_cs = H·HD`,
+`y_cn = T`, `y_gs = HD` (T a multiple of 16, ≤ 1280); one head per group (the
+vision encoder, also split by rows: split r at `r·(T/R)·H·HD + g·HD`) without
+the wrap.  `CodeGenerator._merge_in_place` takes them where the platform has
+the pattern, marks the P·V node (`LlmAttnConvNode.y_pat`) and the merge
+emits nothing; the P·V call is `run_conv_at_y()` (an `#error` without the
+driver's registers), the dense `run_conv_at()` byte-identical to before.
+The views' offset rule is ConvKernel's 16 bytes, not a Slice view's 64: the
+CPU never reads or syncs them (the tiny ViT's HD 16 needs it).  A mutant
+`y_gs` fails the host emulation.
+
+**Descriptor chains.**  `RowOpsNode.chain_jobs()` (the most jobs a node
+issues at run time: AttnPrep — its jobs + 7 per KV group for the V image's
+runtime ones —, VitAttnPrep, TtsRowPrep, TtsRelBand, a re-rowed DEQUANT,
+the pixel shuffle) and `CodeGenerator._ro_chains` (nodes of ≥ 2 jobs).  The
+generated C: the node between `ro_chain_begin()` / `ro_chain_end()`;
+`run_rowops()` appends a descriptor to the node's region (a view at the end
+of the pool, 128 B per job, `_ro_desc_bytes` in the advertised pool size);
+`kernel_wait(KERNEL_ROWOPS)` returns at once inside the node; a chain starts
+at 16 jobs and at the end (the node's previous chain waited for first); the
+region is cleaned before each Start.  Every node's emission is unchanged —
+the collect mode turns its calls into descriptors.  The libraries generated
+with the flags: SmolLM2-135M 122 chained nodes, Piper 185.  Mutants (a descriptor's
+row count, the missing clean) fail the host emulation in its incoherent mode.
+Found on the way: `TestLlamaOnUnit`'s prefill host emulation compared
+nothing (a prefill entry has no outputs) — it runs with the head now.
+
+**The decode prep on the unit (`drope`).**  `AttnPrepRoNode` with one row and
+no `n` input: ROPE of q / k, the q image as one TRANSPOSE (R = G — a group's
+heads as the tile's rows —, the groups as blocks, contiguous granules
+x_g[d][h']), the K row and the V granules at the runtime pos, no zeroing.
+`LlamaFrontend(drope=True)` (needs `rowops`); the chat generators
+(`generate_llm_project.py`, `llm_project`, `vlm_project`, the sched-checks)
+take `--drope auto|on|off`, auto = `rowops` and the unit's chains; policy
+`…+rowops+drope` (and `pow2+sink+p12+rowops+drope` without vsmx, for the
+tiny tests).  The tiny Llama's simulation equals the study under both
+policies; on it the integer RoPE happens to round as the double one did.
+
+**Pricing.**  `calib_runner` case `Q`: one row-ops call as a chain of k
+copies (the descriptors written once and cleaned; `R` cases now write
+`chain_n = 0`); `perf_calibrate.py cases` adds the six shortest shipped
+row-ops calls at k = 1, 2, 4, 8, 16 (keys `<call>#chain<k>`, set `chain`);
+`perf_fit.fit_chain` fits t_k = k·(t₁ − per_job_us) + per_chain_us, stored as
+the model's `rowops_chain`; `PerfModel.chain_adjust_us` prices a chained node
+(`kernel_duration_fn(..., chains=cg._ro_chains)` in the timing replay, the
+order search, the report, the timeline and `perf_calibrate simulate`); the
+R5 policy counts one call per chain; the early wake predicts a chained
+node's shortest chain.  Without a measured term a chained node costs what
+its jobs did — A2.5's campaign measures it.
+
+**Gates** (A2 flags on: `AXI_CONV_YPATTERN=1 AXI_ROWOPS_CHAINS=1`).
+- Suites: scheduler 1856 / 1856, chat 188, lint, C simulation 20 / 20.
+- Sched-checks against the studies, under `pow2+sink+p12+vsmx+rowops+drope`:
+  SmolLM2-135M 3 / 3 prompts + the second turn bit-exact (1 063 s),
+  SmolLM2-360M 3 / 3 + the second turn (2 000 s), SmolVLM-256M both images'
+  features (the vision P·V through the pattern) and both answers' prefill +
+  16 decode steps (375 s); BERT 3 / 3 examples (every DDR tensor identical).
+- Host emulation of the generated libraries: SmolLM2-135M (`llm_host_emu`,
+  4 runs × 17 logits, the re-open identical) bit-exact with the simulation;
+  Piper (`tts_host_emu --incoherent`: both utterances' PCM, every encode
+  bucket, the duration predictor) bit-exact with the specification.

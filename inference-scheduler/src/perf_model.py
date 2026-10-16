@@ -278,6 +278,19 @@ class PerfModel:
                                    v.get("knn"))
                          for n, v in d["families"].items()}
         self.call_overhead_us = float(d.get("call_overhead_us", 0.0))
+        # RowOpsKernel descriptor chains (perf_fit.fit_chain, RPU_PLAN §13.3); None:
+        # not measured — a chained node is priced as its jobs called one by one
+        self.rowops_chain: Optional[dict] = d.get("rowops_chain")
+
+    def chain_adjust_us(self, jobs: int) -> float:
+        """What a row-ops node's ``jobs`` cost more (< 0: less) as descriptor
+        chains of at most 16 than as calls one by one: per chain its own
+        cost, per job the saving.  0 where the model has no chain term."""
+        ch = self.rowops_chain
+        if not ch or jobs <= 0:
+            return 0.0
+        chains = -(-int(jobs) // 16)
+        return chains * float(ch["per_chain_us"]) - int(jobs) * float(ch["per_job_us"])
 
     @classmethod
     def load(cls, path) -> "PerfModel":

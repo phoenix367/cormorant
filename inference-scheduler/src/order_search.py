@@ -103,7 +103,7 @@ def plan_order(graph, log: Optional[Callable[[str], None]] = None) -> Optional[d
 
     def keys_of(sn):
         return attn_keys(1, sn.T, sn.T, sn.C, sn.Q)[1]
-    kus = kernel_duration_fn(pm, cg._layouts, keys_of=keys_of)
+    kus = kernel_duration_fn(pm, cg._layouts, keys_of=keys_of, chains=cg._ro_chains)
     missing = [sn for sn in graph.nodes
                if (is_host_op(sn) and hm.us(sn) is None)
                or (getattr(type(sn), "kernel_name", "") and hasattr(sn, "kernel_calls")

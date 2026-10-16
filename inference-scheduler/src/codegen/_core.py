@@ -79,6 +79,7 @@ class _CoreMixin:
         self._alloc_sizes         = {k: v.alloc for k, v in self._layouts.items()}
         self._demote_strided_views()
         self._merge_in_place()
+        self._ro_chains = self._compute_ro_chains()
 
     # ------------------------------------------------------------------
     # Buffer aliases: Reshape-family nodes and Slice views
@@ -148,8 +149,8 @@ class _CoreMixin:
                 result[sn.output.onnx_name] = (tensors[root].c_name, sn.offset,
                                                sn.output.numel)
             elif self._is_inplace_merge(sn):
-                for t, off in zip(sn.inputs, sn.view_offsets(), strict=True):
-                    result[t.onnx_name] = (sn.output.c_name, off, t.numel)
+                for t, (off, count) in zip(sn.inputs, sn.views(), strict=True):
+                    result[t.onnx_name] = (sn.output.c_name, off, count)
         return result
 
     def _demote_strided_views(self) -> None:
@@ -165,15 +166,50 @@ class _CoreMixin:
                 if not (flat(root) and flat(sn.output.onnx_name)):
                     sn.is_view = False
 
+    def _compute_ro_chains(self) -> dict:
+        """{node index: descriptors} of the row-ops nodes issued as descriptor
+        chains (``kernels.rowops.chains``, RPU_PLAN §13.3): every node of two
+        or more jobs (RowOpsNode.chain_jobs) — the generated run_rowops()
+        collects their jobs into the node's region of the pool and starts
+        them as chains of at most 16.  {} where the unit has no chains."""
+        from .. import rowops_nodes
+        if not rowops_nodes.chains_enabled():
+            return {}
+        out = {}
+        for sn in self._graph.nodes:
+            if isinstance(sn, rowops_nodes.RowOpsNode):
+                n = int(sn.chain_jobs(self._layouts))
+                if n >= 2:
+                    out[sn.index] = n
+        return out
+
+    def _ro_desc_bytes(self) -> int:
+        """The descriptor area at the end of the pool: 128 bytes per descriptor
+        of every chained node, + 128 for its alignment."""
+        n = sum(self._ro_chains.values())
+        return 128 * n + 128 if n else 0
+
     def _merge_in_place(self) -> None:
         """RPU_PLAN §13 (A2.0): an attention merge whose inputs are contiguous
         pieces of its output (LlmAttnMergeNode.view_offsets: a decode step) is
         done by the P.V calls themselves — each o_g becomes a view of pv at its
-        group's offset and the merge emits nothing.  Only where every o_g is a
-        flat pool intermediate written by one P.V call and read by the merge
-        alone, pv a flat pool intermediate, every offset 64-byte aligned.
-        ``AXI_INPLACE_MERGE=0`` keeps the host copy."""
+        group's offset and the merge emits nothing.  With ConvKernel's y
+        channel pattern (``kernels.conv.y_pattern``, A2.4) the prefill and
+        vision merges too: o_g a patterned view (LlmAttnMergeNode.pattern_views),
+        its P.V call writing through the pattern (LlmAttnConvNode.y_pat).  Only
+        where every o_g is a flat pool intermediate written by one P.V call and
+        read by the merge alone, pv a flat pool intermediate, every offset
+        16-byte aligned (ConvKernel's y; the CPU never reads or syncs these
+        views — the merge's consumers read pv — so a Slice view's 64-byte rule
+        does not apply).  ``AXI_INPLACE_MERGE=0`` keeps the host copy."""
         import os
+
+        from .. import _conv_hw_config
+        for sn in self._graph.nodes:                 # a graph may be generated twice
+            if isinstance(sn, LlmAttnConvNode):
+                sn.y_pat = None
+            elif isinstance(sn, LlmAttnMergeNode):
+                sn.in_place = sn.patterned = False
         if os.environ.get("AXI_INPLACE_MERGE", "1") == "0":
             return
         inter = {t.onnx_name for t in self._graph.intermediate_tensors}
@@ -190,16 +226,24 @@ class _CoreMixin:
         for sn in self._graph.nodes:
             if not isinstance(sn, LlmAttnMergeNode):
                 continue
-            offs = sn.view_offsets()
+            offs, pats = sn.view_offsets(), None
+            if offs is None and _conv_hw_config.CONV_Y_PATTERN:
+                pats = sn.pattern_views()
+                offs = [v[0] for v in pats] if pats else None
             pv = sn.output.onnx_name
             ok = (offs is not None and pv in inter and flat(pv)
                   and len({t.onnx_name for t in sn.inputs}) == len(sn.inputs))
             for t, off in zip(sn.inputs, offs or [], strict=False):
                 n = t.onnx_name
-                ok = ok and (n in inter and flat(n) and (off * bpe) % 64 == 0
-                             and isinstance(producer.get(n), LlmAttnConvNode)
+                p = producer.get(n)
+                ok = ok and (n in inter and flat(n) and (off * bpe) % 16 == 0
+                             and isinstance(p, LlmAttnConvNode) and p.kind == "pv"
                              and readers.get(n) == [sn])
             sn.in_place = bool(ok)
+            sn.patterned = bool(ok) and pats is not None
+            if sn.patterned:
+                for t, (_off, pat, _span) in zip(sn.inputs, pats, strict=True):
+                    producer[t.onnx_name].y_pat = pat
 
     def _compute_tensor_layouts(self) -> dict:
         """
@@ -832,7 +876,7 @@ class _CoreMixin:
         # the bank phases (src/bank_phase.py) pad slots: the laid-out pool
         # can exceed the no-reuse sum
         _layout, pool_elems = self._compute_pool_layout()
-        total = max(total, pool_elems * bpe)
+        total = max(total, pool_elems * bpe) + self._ro_desc_bytes()
         page = 4096
         return (total + page - 1) & ~(page - 1)
 

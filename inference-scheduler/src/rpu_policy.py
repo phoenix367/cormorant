@@ -151,9 +151,14 @@ def rpu_estimate(cg) -> dict:
     calls = 0
     batches = 0
     pending = False
+    chains = cg._ro_chains
     for ev in events:
         if ev[0] in ("start", "start_sync"):
-            calls += len(_calls_of(by_index[ev[1]], layouts))
+            cs = _calls_of(by_index[ev[1]], layouts)
+            if ev[1] in chains and None not in cs:   # descriptor chains: one Start per 16 jobs
+                calls += -(-sum(c.count for c in cs) // 16)
+            else:
+                calls += len(cs)
             pending = True
         elif ev[0] == "cpu" and pending:
             batches += 1
@@ -175,6 +180,8 @@ def rpu_estimate(cg) -> dict:
         if pm is not None:
             t = pm.calls_us(cs)
             if t is not None:
+                if sn.index in chains:
+                    t += pm.chain_adjust_us(sum(c.count for c in cs))
                 return t
         return sum(estimate_us(c) for c in cs)
 

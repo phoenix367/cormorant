@@ -62,20 +62,35 @@ def rowops_default() -> bool:
     return enabled()
 
 
+def drope_default(rowops: Optional[bool] = None) -> bool:
+    """The decode steps' attention prep on the row-ops unit too (RPU_PLAN §13.4,
+    policy ...+rowops+drope: every step's RoPE the integer one) where the
+    project uses the unit and the unit runs descriptor chains (one chain per
+    layer; issued job by job it would cost the CPU what the host prep does)."""
+    from src.rowops_nodes import chains_enabled
+    rowops = rowops_default() if rowops is None else rowops
+    return bool(rowops) and chains_enabled()
+
+
 def policy(prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
-           vsmx: Optional[bool] = None, rowops: Optional[bool] = None) -> str:
+           vsmx: Optional[bool] = None, rowops: Optional[bool] = None,
+           drope: Optional[bool] = None) -> str:
     """The study policy a project of these attention modes computes (``vsmx`` /
-    ``rowops`` None: vsmx_default() / rowops_default())."""
+    ``rowops`` / ``drope`` None: vsmx_default() / rowops_default() /
+    drope_default())."""
     if (prefill_attn, decode_attn) not in ATTN_POLICIES:
         raise ValueError(f"no policy for prefill attention {prefill_attn!r} with decode "
                          f"attention {decode_attn!r} (decode on the FPGA needs FPGA prefill)")
     base = ATTN_POLICIES[(prefill_attn, decode_attn)]
     vsmx = vsmx_default() if vsmx is None else vsmx
     rowops = rowops_default() if rowops is None else rowops
+    drope = drope_default(rowops) if drope is None else drope
     if (vsmx or rowops) and (prefill_attn, decode_attn) != ("fpga", "fpga"):
         raise ValueError("vsmx / rowops (the softmax and the row ops on the FPGA units) are studied "
                          "with the FPGA attention in prefill and decode only")
-    return base + ("+vsmx" if vsmx else "") + ("+rowops" if rowops else "")
+    if drope and not rowops:
+        raise ValueError("drope (the decode prep on the row-ops unit) needs rowops")
+    return base + ("+vsmx" if vsmx else "") + ("+rowops" if rowops else "") + ("+drope" if drope else "")
 
 
 POLICY = policy()
@@ -123,12 +138,14 @@ def load_model(assets: Optional[str] = None, formats: Optional[str] = None,
 
 def frontend(cfg, W, fmt, ctx: int = CONTEXT, name: str = "smollm2",
              prefill_attn: str = PREFILL_ATTN, decode_attn: str = DECODE_ATTN,
-             vsmx: Optional[bool] = None, rowops: Optional[bool] = None) -> LlamaFrontend:
+             vsmx: Optional[bool] = None, rowops: Optional[bool] = None,
+             drope: Optional[bool] = None) -> LlamaFrontend:
     vsmx = vsmx_default() if vsmx is None else vsmx
     rowops = rowops_default() if rowops is None else rowops
-    policy(prefill_attn, decode_attn, vsmx, rowops)             # a studied combination
+    drope = drope_default(rowops) if drope is None else drope
+    policy(prefill_attn, decode_attn, vsmx, rowops, drope)      # a studied combination
     return LlamaFrontend(cfg, W, fmt, ctx=ctx, name=name, prefill_attn=prefill_attn,
-                         decode_attn=decode_attn, vsmx=vsmx, rowops=rowops)
+                         decode_attn=decode_attn, vsmx=vsmx, rowops=rowops, drope=drope)
 
 
 def entry_models(fe: LlamaFrontend, buckets: Sequence[int] = BUCKETS) -> EntryModels:

@@ -1069,6 +1069,10 @@ class LlmAttnConvNode(LlmKernelNode):
     est_cycles:  Tuple = ()           # ((keys, conv cycles, MatmulKernel cycles), ...)
     static:      bool = False         # no pos / n: keys = C
     has_n:       bool = True          # False: a decode step, n = T
+    # set by the code generator (CodeGenerator._merge_in_place): a P.V call that
+    # writes its rows straight into the merged tensor through ConvKernel's y
+    # channel pattern, (y_cs, y_cn, y_gs) — RPU_PLAN §13.2; None = dense
+    y_pat:       Optional[Tuple[int, int, int]] = None
 
     # Compatibility shims (read by the layout / header passes)
     outer_count:        int  = field(default=1,    init=False)
@@ -1199,18 +1203,21 @@ class LlmAttnConvNode(LlmKernelNode):
             xo, wo = self.group * GTHD, self.group * self.C * self.HD
         else:
             xo, wo = self.group * self.C * self.HD, 0
+        fn, pat = "run_conv_at", ""
+        if self.y_pat is not None:                # the rows straight into the merged tensor
+            fn, pat = "run_conv_at_y", ", " + ", ".join(f"{v}u" for v in self.y_pat)
         if self.static:
             return "\n".join([
-                f"    run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
-                f"                {self.conv_regs(f'{self.C}u')});"])
+                f"    {fn}({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
+                f"                {self.conv_regs(f'{self.C}u')}{pat});"])
         pos = self.inputs[2]
         n = f"(unsigned){self.inputs[3].c_name}[0]" if self.has_n else f"{self.T}u"
         return "\n".join([
             "    {",
             f"        const unsigned _keys = llm_keys((unsigned){pos.c_name}[0],"
             f" {n}, {self.T}u, {self.C}u, {self.Q}u);",
-            f"        run_conv_at({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
-            f"                    {self.conv_regs('_keys')});",
+            f"        {fn}({x.c_name}, {xo}u, {w.c_name}, {wo}u, {self.output.c_name}, 0u,",
+            f"                    {self.conv_regs('_keys')}{pat});",
             "    }",
         ])
 
@@ -1353,8 +1360,11 @@ class LlmAttnMergeNode(LlmNode):
     R:  int = 1
     # set by the code generator (CodeGenerator._merge_in_place, RPU_PLAN §13):
     # each o_g is a view of pv and its P.V call writes there, so the merge
-    # emits no code; reference() still assembles pv for the simulation
+    # emits no code; reference() still assembles pv for the simulation.
+    # patterned: the views are not contiguous — the P.V calls write through
+    # ConvKernel's y channel pattern (pattern_views)
     in_place: bool = False
+    patterned: bool = False
 
     def view_offsets(self) -> Optional[List[int]]:
         """Element offset of each input inside the output when every o_g is
@@ -1364,6 +1374,37 @@ class LlmAttnMergeNode(LlmNode):
             return None
         G = self.H // self.KV
         return [g * G * self.HD for g in range(self.KV)]
+
+    def pattern_views(self) -> Optional[List[Tuple[int, Tuple[int, int, int], int]]]:
+        """(element offset, (y_cs, y_cn, y_gs), span) of each input inside the
+        output when T > 1, where its P.V call can write pv through ConvKernel's
+        y channel pattern (RPU_PLAN §13.2): the call's channel p = h'*T + t of
+        group g lands at (g*G + h')*HD + t*H*HD — y_cs = H*HD, y_cn = T,
+        y_gs = HD; one head per group (G = 1, the vision encoder, also split
+        by rows: split r starts at row r*T/R) needs no wrap, y_cn = 0.  The
+        span is the elements from the view's start to its last one.  None for
+        T = 1 (view_offsets) or where the contract excludes it (y_cn a
+        multiple of 16, at most 1280)."""
+        T, H, KV, HD, R = self.T, self.H, self.KV, self.HD, self.R
+        G = H // KV
+        if T == 1:
+            return None
+        rows, cs = T // R, H * HD
+        if G > 1:
+            if R != 1 or T % 16 or T > 1280:
+                return None
+            cn, gs = T, HD
+        else:
+            cn, gs = 0, 0
+        return [(r * rows * cs + g * G * HD, (cs, cn, gs), (rows - 1) * cs + G * HD)
+                for g in range(KV) for r in range(R)]
+
+    def views(self) -> List[Tuple[int, int]]:
+        """(element offset, element count) of each input's view of the output
+        once merged in place."""
+        if self.patterned:
+            return [(off, span) for off, _p, span in self.pattern_views()]
+        return [(off, t.numel) for off, t in zip(self.view_offsets(), self.inputs, strict=True)]
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):

@@ -184,7 +184,8 @@ def timeline_entry(name: str, cg, tl=None, pm=None, hm=None, measured_us: Option
     graph = cg._graph
     keys_of = keys_of or getattr(tl, "keys_of", None)
     if tl is None:
-        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us if hm else (lambda sn: None))
+        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of, chains=cg._ro_chains),
+                      hm.us if hm else (lambda sn: None))
     by = {sn.index: sn for sn in graph.nodes}
     used = sorted({s[1] for s in tl.spans})
     ref = {idx: k for k, idx in enumerate(used)}

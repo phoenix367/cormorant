@@ -924,6 +924,9 @@ POLICIES = {
     "pow2+sink+p12+vsmx+rowops": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill", res_bits=15,
                                       inorm=True, isilu=True, irope="prefill"),
     # RPU_PLAN §13 (track A2): the decode prep on the unit too — every step's RoPE the integer one
+    # (src/llama.py drope)
+    "pow2+sink+p12+rowops+drope":      dict(_RF, sink=True, fmt="pow2", p_bits=12, res_bits=15,
+                                            inorm=True, isilu=True, irope=True),
     "pow2+sink+p12+vsmx+rowops+drope": dict(_RF, sink=True, fmt="pow2", p_bits=12, vsmx="prefill",
                                             res_bits=15, inorm=True, isilu=True, irope=True),
 }

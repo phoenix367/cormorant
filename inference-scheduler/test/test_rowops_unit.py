@@ -323,10 +323,10 @@ class TestLlamaOnUnit(unittest.TestCase):
         cls.formats = G.calibrate(G.TINY, W)
         cls.fe = G.frontend(G.TINY, W, cls.formats, decode_attn="fpga", rowops=True)
 
-    def _graph(self, td, kind, T=1):
+    def _graph(self, td, kind, T=1, with_head=False):
         import onnx
         path = os.path.join(td, f"{kind}.onnx")
-        onnx.save(self.fe.entry(kind, T), path)
+        onnx.save(self.fe.entry(kind, T, with_head=with_head), path)
         g = OnnxGraph(path)
         return g, CodeGenerator(g, model_path=path)
 
@@ -373,12 +373,130 @@ class TestLlamaOnUnit(unittest.TestCase):
 
     @unittest.skipUnless(host_emu.which_cc(), "C compiler not available on host")
     def test_host_emulated_run_matches_simulation(self):
+        # the prefill with the head: its logits are the output compared (a prefill entry alone
+        # writes only states)
         for kind, T, incoherent in (("decode", 1, False), ("prefill", 16, True), ("head", 1, True)):
             with tempfile.TemporaryDirectory() as td, _unit(True), self.subTest(kind=kind):
-                g, cg = self._graph(td, kind, T)
+                g, cg = self._graph(td, kind, T, with_head=kind == "prefill")
+                self.assertTrue(g.output_tensors, kind)
                 rc, out = host_emu.build_and_run(cg, td, incoherent=incoherent)
                 self.assertEqual(rc, 0, out[-3000:])
                 self.assertEqual(host_emu.failures(out), [])
+
+
+class TestDecodePrepOnUnit(unittest.TestCase):
+    """RPU_PLAN §13.4 (A2.4): the frontend's drope — the decode step's
+    attention prep on the unit too (AttnPrepRoNode with one row: ROPE of q / k,
+    the q image as one TRANSPOSE with R = G, the cache rows at the runtime pos)
+    — bit-exact against the study's ...+rowops+drope and different from the
+    host prep's double RoPE; the generated C equals the simulation, with and
+    without descriptor chains."""
+
+    @classmethod
+    def setUpClass(cls):
+        import gen_llama_models as G
+        cls.G = G
+        cls.W = G.tiny_weights(G.TINY, 0)
+        cls.formats = G.calibrate(G.TINY, cls.W)
+
+    def _fe(self, drope):
+        return self.G.frontend(self.G.TINY, self.W, self.formats, decode_attn="fpga", rowops=True,
+                               drope=drope)
+
+    def test_simulation_matches_study(self):
+        import test_llama as TL
+        from src.codegen import CodeGenerator as CG
+        G = self.G
+        runs = {}
+        for drope in (False, True):
+            with _unit(True):
+                gs = TL.graphs(self._fe(drope), {"decode": ("decode", 1, False), "prefill_8": ("prefill", 8, False),
+                                                 "prefill_16": ("prefill", 16, False), "head": ("head", 1, False)})
+                cgs = {n: CG(g, model_path=n) for n, g in gs.items()}
+            kinds = [type(sn).__name__ for sn in gs["decode"].nodes]
+            self.assertEqual("AttnPrepRoNode" in kinds, drope)
+            self.assertEqual("LlmAttnPrepNode" in kinds, not drope)
+            ses = TL.Session(cgs, [8, 16])
+            prompt = np.random.default_rng(11).integers(2, 256, 13)
+            a = [ses.prefill(list(prompt))]
+            for _ in range(6):
+                a.append(ses.decode(int(np.argmax(a[-1]))))
+            runs[drope] = a
+            sm, sc = G.study_model(G.TINY, self.W, self.formats,
+                                   policy="pow2+sink+p12+rowops" + ("+drope" if drope else ""))
+            st = TL.study.Seq(sc, 64)
+            b = [sm.forward([st], [np.concatenate([[1], prompt])])[0][-1]]
+            for _ in range(6):
+                b.append(sm.forward([st], [np.array([int(np.argmax(b[-1]))])], phase="decode")[0][-1])
+            for i, (x, y) in enumerate(zip(a, b, strict=True)):
+                np.testing.assert_array_equal(x, y, err_msg=f"drope={drope} step {i}")
+        # the prefill is the same (on this model the decode steps' integer RoPE rounds as the
+        # host's double one did; the real models' differ — RPU_PLAN §13.8, the drope study)
+        np.testing.assert_array_equal(runs[False][0], runs[True][0])
+
+    def test_graph_and_source(self):
+        import onnx
+        from src.rowops_nodes import AttnPrepRoNode
+        with tempfile.TemporaryDirectory() as td, _unit(True):
+            path = os.path.join(td, "decode.onnx")
+            onnx.save(self._fe(True).entry("decode", 1), path)
+            g = OnnxGraph(path)
+            cg = CodeGenerator(g, model_path=path)
+            preps = [sn for sn in g.nodes if isinstance(sn, AttnPrepRoNode)]
+            self.assertEqual(len(preps), 2)
+            G_ = preps[0].H // preps[0].KV
+            for sn in preps:
+                self.assertTrue(sn.T == 1 and not sn.has_n and not sn.first)
+                xp = [c for c in sn.kernel_calls(cg._layouts) if c.fields["op"] == rs.opword(rs.OP_XPOSE)
+                      and c.fields["aux"] == G_]
+                self.assertEqual(len(xp), 1)                  # the q image: one job, R = G
+            src = cg.generate_source()
+            self.assertEqual(src.count("llm_cache_flush_rows("),       # no CPU write into the caches:
+                             src.count("static void llm_cache_flush_rows("))   # the helper, never called
+            self.assertEqual(src.count("llm_attn_prep("), src.count("static void llm_attn_prep("))
+
+    @unittest.skipUnless(host_emu.which_cc(), "C compiler not available on host")
+    def test_host_emulated_run_matches_simulation(self):
+        import onnx
+        for chains in (False, True):
+            with tempfile.TemporaryDirectory() as td, _unit(True), self.subTest(chains=chains), \
+                    mock.patch.object(_rowops_hw_config, "ROWOPS_CHAINS", chains):
+                path = os.path.join(td, "decode.onnx")
+                onnx.save(self._fe(True).entry("decode", 1), path)
+                g = OnnxGraph(path)
+                cg = CodeGenerator(g, model_path=path)
+                self.assertEqual(bool(cg._ro_chains), chains)
+                self.assertTrue(g.output_tensors)
+                rc, out = host_emu.build_and_run(cg, td, incoherent=True)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertEqual(host_emu.failures(out), [])
+
+
+class TestRowopsHwConfig(unittest.TestCase):
+    """kernels.rowops: the three flags, required bools; fold and chains need the
+    unit; AXI_ROWOPS_CHAINS overrides chains."""
+
+    def test_chains_flag(self):
+        import json
+        plats = _rowops_hw_config._PLATFORMS_DIR
+        p = plats / "_test_rowops_chains.json"
+        try:
+            for unit, chains, env, want in ((True, False, None, False), (True, True, None, True),
+                                            (False, True, None, False), (True, False, "1", True),
+                                            (True, True, "0", False)):
+                p.write_text(json.dumps({"kernels": {"rowops": {"unit": unit, "fold": False,
+                                                                "chains": chains}}}))
+                with mock.patch.dict(os.environ, {"AXI_ROWOPS_CHAINS": env} if env else {}):
+                    if not env:
+                        os.environ.pop("AXI_ROWOPS_CHAINS", None)
+                    os.environ.pop("AXI_ROWOPS", None)
+                    self.assertEqual(_rowops_hw_config.resolve("_test_rowops_chains")["ROWOPS_CHAINS"], want)
+            p.write_text(json.dumps({"kernels": {"rowops": {"unit": True, "fold": False}}}))
+            with self.assertRaises(_rowops_hw_config.RowopsHwConfigError) as cm:
+                _rowops_hw_config.resolve("_test_rowops_chains")
+            self.assertIn("chains", str(cm.exception))
+        finally:
+            p.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

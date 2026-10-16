@@ -102,8 +102,8 @@ def text_check(args, ids, pix, vm, vcg, fe, tc, Wt, sd, t0):
     tpath = os.path.join(sd, f"formats_{vs.TEXT_FORMATS}.json")
     fte = LlamaFrontend(tcfg, Wt, Formats.from_file(tpath, tcfg), ctx=ls.CTX, name="smolvlm",
                         prefill_attn="fpga", decode_attn=args.decode_attn, image_rows=fe.cfg.n_img,
-                        image_state=fe.image_state, vsmx=args.vsmx, rowops=args.rowops)
-    tpol = lp.policy("fpga", args.decode_attn, args.vsmx, args.rowops)
+                        image_state=fe.image_state, vsmx=args.vsmx, rowops=args.rowops, drope=args.drope)
+    tpol = lp.policy("fpga", args.decode_attn, args.vsmx, args.rowops, args.drope)
     cgs = lp.make_codegens(fte, buckets)
     cgs["vision"] = vcg
     cs = ls.rope_tables(tc, 2 * ls.CTX)
@@ -165,9 +165,13 @@ def main(argv=None) -> int:
     ap.add_argument("--rowops", choices=("auto", "on", "off"), default="auto",
                     help="the residual stream, LayerNorms and residual adds on the row-ops unit "
                          "(policies ...+rowops, doc/plans/HOSTOPS_PLAN.md); auto: where the platform has it")
+    ap.add_argument("--drope", choices=("auto", "on", "off"), default="auto",
+                    help="the text decode steps' attention prep on the unit too (policy ...+drope); "
+                         "auto: with rowops where the unit runs descriptor chains")
     args = ap.parse_args(argv)
     args.vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     args.rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
+    args.drope = lp.drope_default(args.rowops) if args.drope == "auto" else args.drope == "on"
     t0 = time.time()
     sd = lp.study.study_dir(args.assets)
     vpath = os.path.join(sd, f"vision_formats_{vs.VISION_SHIPPED}.json")

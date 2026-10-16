@@ -723,9 +723,15 @@ class _SourceMixin:
             " * It is declared __weak so a deployment can still replace it at link time.\n"
             " */\n"
             + "\n".join(enum_lines) + "\n\n"
+            + ("/* The row-ops node collecting a descriptor chain (run_rowops, RPU_PLAN §13.3),\n"
+               " * or NULL: the waits between its jobs are the unit's, not the CPU's. */\n"
+               "typedef struct ro_chain ro_chain_t;\n"
+               "static ro_chain_t *s_ro_chain = NULL;\n\n" if self._ro_chains else "") +
             "__attribute__((weak))\n"
             "void kernel_wait(kernel_id_t k)\n"
             "{\n"
+            + ("    if (k == KERNEL_ROWOPS && s_ro_chain) return;   /* a chained node: the unit orders its jobs */\n"
+               if self._ro_chains else "") +
             "#ifdef __linux__\n"
             "    if (inference_rpu_active()) { inference_rpu_wait(k); return; }   /* the R5 waits */\n"
             "    if (inference_irq_wait(k)) return;                 /* the kernel's interrupt */\n"
@@ -794,6 +800,172 @@ class _SourceMixin:
         parts.append("")
         return "\n".join(parts)
 
+    def _ro_chain_helpers(self, ro_var: str) -> str:
+        """The descriptor chains' C (RPU_PLAN §13.3, ROWOPS_RTL_KERNEL.md §1.6):
+        the chain state, ro_chain_begin / _add / _end and one ro_chain_t per
+        chained node (its region is set up by inference_init)."""
+        decls = "".join(f"static ro_chain_t s_ro_ch_{i};   /* node [{i}]: {n} descriptors */\n"
+                        for i, n in sorted(self._ro_chains.items()))
+        return (
+            "/*\n"
+            " * Descriptor chains (RPU_PLAN §13.3, doc/kernels/ROWOPS_RTL_KERNEL.md §1.6).  A\n"
+            " * row-ops node of several jobs runs between ro_chain_begin() and ro_chain_end():\n"
+            " * run_rowops() writes each job as a 128-byte descriptor — words 0..23 the\n"
+            " * argument registers 0x10..0x6C in order — into the node's region at the end of\n"
+            " * the pool, kernel_wait(KERNEL_ROWOPS) inside the node returns at once, and the\n"
+            " * jobs start as chains of at most 16 with one register block each: the unit\n"
+            " * runs a chain's jobs in order (each sees the previous one's writes) and raises\n"
+            " * ap_done once.  A node's region holds every job it can issue\n"
+            " * (RowOpsNode.chain_jobs), so no descriptor is rewritten before its chain ran —\n"
+            " * also when the Cortex-R5 replays the Starts later (inference_rpu.h).\n"
+            " */\n"
+            "#ifndef XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA\n"
+            "#error \"chained row-ops nodes need the driver of a unit with descriptor chains "
+            "(kernels.rowops.chains)\"\n"
+            "#endif\n"
+            "struct ro_chain {\n"
+            "    inference_buf_t view;   /* the node's descriptors: a view of the pool */\n"
+            "    unsigned        cap;    /* descriptors it holds */\n"
+            "    unsigned        n;      /* written */\n"
+            "    unsigned        first;  /* the first not started yet */\n"
+            "    int             busy;   /* a chain of the node is in flight */\n"
+            "};\n"
+            + decls +
+            "\n"
+            "static void ro_chain_start(ro_chain_t *c)\n"
+            "{\n"
+            "    if (c->n == c->first) return;\n"
+            "    if (c->busy) {                         /* the node's previous chain first */\n"
+            "        s_ro_chain = NULL;\n"
+            "        kernel_wait(KERNEL_ROWOPS);\n"
+            "        s_ro_chain = c;\n"
+            "    }\n"
+            "    inference_buf_sync_to_device(&c->view);\n"
+            f"    XRowopskernel_Set_chain(&{ro_var}, inference_buf_phys(&c->view) + 128u * (u64)c->first);\n"
+            f"    XRowopskernel_Set_chain_n(&{ro_var}, c->n - c->first);\n"
+            f"    XRowopskernel_Start(&{ro_var});\n"
+            "    c->busy = 1;\n"
+            "    c->first = c->n;\n"
+            "}\n"
+            "\n"
+            "static void ro_chain_add(const uint32_t w[24])\n"
+            "{\n"
+            "    ro_chain_t *c = s_ro_chain;\n"
+            "    uint32_t   *d;\n"
+            "    unsigned    i;\n"
+            "    if (c->n == c->cap) {                  /* past chain_jobs (never): start over */\n"
+            "        ro_chain_start(c);\n"
+            "        s_ro_chain = NULL;\n"
+            "        kernel_wait(KERNEL_ROWOPS);\n"
+            "        s_ro_chain = c;\n"
+            "        c->n = c->first = 0u;\n"
+            "        c->busy = 0;\n"
+            "    }\n"
+            "    d = (uint32_t *)(void *)inference_buf_ptr(&c->view) + 32u * c->n;\n"
+            "    for (i = 0u; i < 24u; i++) d[i] = w[i];\n"
+            "    c->n++;\n"
+            "    if (c->n - c->first == 16u) ro_chain_start(c);   /* the unit runs at most 16 */\n"
+            "}\n"
+            "\n"
+            "static void ro_chain_begin(ro_chain_t *c)\n"
+            "{\n"
+            "    c->n = c->first = 0u;\n"
+            "    c->busy = 0;\n"
+            "    s_ro_chain = c;\n"
+            "}\n"
+            "\n"
+            "static void ro_chain_end(void)\n"
+            "{\n"
+            "    ro_chain_start(s_ro_chain);\n"
+            "    s_ro_chain = NULL;\n"
+            "}\n"
+        )
+
+    @staticmethod
+    def _run_conv_at_fn(conv_var: str, pattern: bool) -> str:
+        """run_conv_at() (dense y) or run_conv_at_y() (the y channel pattern's
+        three registers as arguments, RPU_PLAN §13.2)."""
+        if pattern:
+            head = (
+                "/*\n"
+                " * run_conv_at_y() — run_conv_at() writing y through ConvKernel's y\n"
+                " * channel pattern (RPU_PLAN §13.2): channel c lands at y_off +\n"
+                " * (c mod y_cn) * y_cs + (c div y_cn) * y_gs elements, its out_h * out_w\n"
+                " * pixels contiguous (y_cn = 0: one group).  Batch 1, y_cn a multiple\n"
+                " * of 16.  The attention P.V calls write the merged tensor this way.\n"
+                " */\n"
+                "#ifndef XCONVKERNEL_CTRL_ADDR_Y_CS_DATA\n"
+                "#error \"run_conv_at_y needs the driver of a ConvKernel with the y channel pattern "
+                "(kernels.conv.y_pattern)\"\n"
+                "#endif\n"
+                "static void run_conv_at_y(\n")
+            tail_args = ("    unsigned has_bias, unsigned is_depthwise,\n"
+                         "    unsigned y_cs, unsigned y_cn, unsigned y_gs)\n")
+            pat = (f"    XConvkernel_Set_y_cs        (&{conv_var}, y_cs);\n"
+                   f"    XConvkernel_Set_y_cn        (&{conv_var}, y_cn);\n"
+                   f"    XConvkernel_Set_y_gs        (&{conv_var}, y_gs);\n")
+        else:
+            head = (
+                "/*\n"
+                " * run_conv_at() — run_conv() on sub-buffers: x / weight / y start at\n"
+                " * element offsets x_off / w_off / y_off of their buffers (no bias).\n"
+                " * Used by MatMuls lowered onto ConvKernel whose batch items each\n"
+                " * need their own weights (attention: one call per head); every\n"
+                " * offset is a multiple of INFERENCE_ALIGN_ELEMS (16-byte aligned).\n"
+                " *\n"
+                " * NON-BLOCKING like run_conv(): the caller waits on KERNEL_CONV\n"
+                " * before the next call reprograms the registers.\n"
+                " */\n"
+                "static void run_conv_at(\n")
+            tail_args = "    unsigned has_bias, unsigned is_depthwise)\n"
+            pat = (f"#ifdef XCONVKERNEL_CTRL_ADDR_Y_CS_DATA   /* the y pattern (RPU_PLAN §13.2): dense */\n"
+                   f"    XConvkernel_Set_y_cs        (&{conv_var}, 0u);\n"
+                   f"    XConvkernel_Set_y_cn        (&{conv_var}, 0u);\n"
+                   f"    XConvkernel_Set_y_gs        (&{conv_var}, 0u);\n"
+                   "#endif\n")
+        return (
+            head +
+            "    inference_buf_t *x,      unsigned x_off,\n"
+            "    inference_buf_t *weight, unsigned w_off,\n"
+            "    inference_buf_t *y,      unsigned y_off,\n"
+            "    unsigned batch,\n"
+            "    unsigned in_ch,  unsigned in_h,  unsigned in_w,\n"
+            "    unsigned out_ch, unsigned out_h, unsigned out_w,\n"
+            "    unsigned kh,     unsigned kw,\n"
+            "    unsigned stride_h, unsigned stride_w,\n"
+            "    unsigned dilation_h, unsigned dilation_w,\n"
+            "    unsigned pad_top, unsigned pad_left,\n"
+            + tail_args +
+            "{\n"
+            f"    XConvkernel_Set_x           (&{conv_var},\n"
+            "        inference_buf_phys(x) + (uint64_t)x_off * INFERENCE_BYTES_PER_ELEM);\n"
+            f"    XConvkernel_Set_weight      (&{conv_var},\n"
+            "        inference_buf_phys(weight) + (uint64_t)w_off * INFERENCE_BYTES_PER_ELEM);\n"
+            f"    XConvkernel_Set_bias        (&{conv_var}, (u64)0);\n"
+            f"    XConvkernel_Set_y           (&{conv_var},\n"
+            "        inference_buf_phys(y) + (uint64_t)y_off * INFERENCE_BYTES_PER_ELEM);\n"
+            f"    XConvkernel_Set_batch       (&{conv_var}, batch);\n"
+            f"    XConvkernel_Set_in_ch       (&{conv_var}, in_ch);\n"
+            f"    XConvkernel_Set_in_h        (&{conv_var}, in_h);\n"
+            f"    XConvkernel_Set_in_w        (&{conv_var}, in_w);\n"
+            f"    XConvkernel_Set_out_ch      (&{conv_var}, out_ch);\n"
+            f"    XConvkernel_Set_out_h       (&{conv_var}, out_h);\n"
+            f"    XConvkernel_Set_out_w       (&{conv_var}, out_w);\n"
+            f"    XConvkernel_Set_kh          (&{conv_var}, kh);\n"
+            f"    XConvkernel_Set_kw          (&{conv_var}, kw);\n"
+            f"    XConvkernel_Set_stride_h    (&{conv_var}, stride_h);\n"
+            f"    XConvkernel_Set_stride_w    (&{conv_var}, stride_w);\n"
+            f"    XConvkernel_Set_dilation_h  (&{conv_var}, dilation_h);\n"
+            f"    XConvkernel_Set_dilation_w  (&{conv_var}, dilation_w);\n"
+            f"    XConvkernel_Set_pad_top     (&{conv_var}, pad_top);\n"
+            f"    XConvkernel_Set_pad_left    (&{conv_var}, pad_left);\n"
+            f"    XConvkernel_Set_has_bias    (&{conv_var}, has_bias);\n"
+            f"    XConvkernel_Set_is_depthwise(&{conv_var}, is_depthwise);\n"
+            + pat +
+            f"    XConvkernel_Start(&{conv_var});\n"
+            "}\n"
+        )
+
     def _run_op_helper(self) -> str:
         nodes          = self._graph.nodes
         # All VectorOP ScheduledNodes use run_op() (broadcast via outer/inc params)
@@ -821,8 +993,12 @@ class _SourceMixin:
         need_run_conv_dw = any(isinstance(sn, ConvNode) and sn.sliced for sn in nodes)
         need_run_conv_at = any(
             (isinstance(sn, MatmulConvNode) and sn.calls > 1)
-            or isinstance(sn, LlmAttnConvNode) for sn in nodes
+            or (isinstance(sn, LlmAttnConvNode) and sn.y_pat is None) for sn in nodes
         )
+        # run_conv_at_y: the P.V calls that write the merged tensor through the
+        # y channel pattern (CodeGenerator._merge_in_place, RPU_PLAN §13.2)
+        need_run_conv_at_y = any(isinstance(sn, LlmAttnConvNode) and sn.y_pat is not None
+                                 for sn in nodes)
         need_run_pool = self._has_pool_nodes
         need_run_rowops = self._has_rowops_nodes
 
@@ -838,6 +1014,7 @@ class _SourceMixin:
         elif need_run_matmul:
             titles.append("run_matmul() — MatmulKernel dispatch helper")
         conv_helpers = [n for n, need in (("run_conv()", need_run_conv), ("run_conv_at()", need_run_conv_at),
+                                          ("run_conv_at_y()", need_run_conv_at_y),
                                           ("run_conv_dw_at()", need_run_conv_dw)) if need]
         if conv_helpers:
             titles.append(" / ".join(conv_helpers) + " — ConvKernel dispatch helper"
@@ -1020,6 +1197,8 @@ class _SourceMixin:
         if need_run_rowops:
             from ..kernels import KERNEL_REGISTRY
             ro_var = KERNEL_REGISTRY["RowOpsKernel"].c_var
+            if self._ro_chains:
+                parts.append(self._ro_chain_helpers(ro_var))
             parts.append(
                 "/*\n"
                 " * run_rowops() — the row-ops unit (doc/kernels/ROWOPS_RTL_KERNEL.md): every\n"
@@ -1039,6 +1218,21 @@ class _SourceMixin:
                 "    unsigned c_s1, unsigned c_s2,\n"
                 "    uint64_t eps, unsigned aux, unsigned bq_sh, unsigned win_lo, unsigned win_hi)\n"
                 "{\n"
+                + ("    if (s_ro_chain) {                  /* a chained node: one descriptor (ro_chain_add) */\n"
+                   "        const u64 aa = a ? inference_buf_phys(a) + (u64)a_off : (u64)0;\n"
+                   "        const u64 ba = b ? inference_buf_phys(b) + (u64)b_off : (u64)0;\n"
+                   "        const u64 ca = c ? inference_buf_phys(c) + (u64)c_off : (u64)0;\n"
+                   "        const u64 pa = p ? inference_buf_phys(p) : (u64)0;\n"
+                   "        const uint32_t w[24] = {\n"
+                   "            op, n, rows, blocks,\n"
+                   "            (uint32_t)aa, (uint32_t)(aa >> 32), a_s1, a_s2,\n"
+                   "            (uint32_t)ba, (uint32_t)(ba >> 32), b_s1, b_s2,\n"
+                   "            (uint32_t)ca, (uint32_t)(ca >> 32), c_s1, c_s2,\n"
+                   "            (uint32_t)pa, (uint32_t)(pa >> 32), (uint32_t)eps, (uint32_t)(eps >> 32),\n"
+                   "            aux, bq_sh, win_lo, win_hi };\n"
+                   "        ro_chain_add(w);\n"
+                   "        return;\n"
+                   "    }\n" if self._ro_chains else "") +
                 f"    XRowopskernel_Set_op(&{ro_var}, op);\n"
                 f"    XRowopskernel_Set_n(&{ro_var}, n);\n"
                 f"    XRowopskernel_Set_rows(&{ro_var}, rows);\n"
@@ -1250,62 +1444,9 @@ class _SourceMixin:
             )
 
         if need_run_conv_at:
-            parts.append(
-                "/*\n"
-                " * run_conv_at() — run_conv() on sub-buffers: x / weight / y start at\n"
-                " * element offsets x_off / w_off / y_off of their buffers (no bias).\n"
-                " * Used by MatMuls lowered onto ConvKernel whose batch items each\n"
-                " * need their own weights (attention: one call per head); every\n"
-                " * offset is a multiple of INFERENCE_ALIGN_ELEMS (16-byte aligned).\n"
-                " *\n"
-                " * NON-BLOCKING like run_conv(): the caller waits on KERNEL_CONV\n"
-                " * before the next call reprograms the registers.\n"
-                " */\n"
-                "static void run_conv_at(\n"
-                "    inference_buf_t *x,      unsigned x_off,\n"
-                "    inference_buf_t *weight, unsigned w_off,\n"
-                "    inference_buf_t *y,      unsigned y_off,\n"
-                "    unsigned batch,\n"
-                "    unsigned in_ch,  unsigned in_h,  unsigned in_w,\n"
-                "    unsigned out_ch, unsigned out_h, unsigned out_w,\n"
-                "    unsigned kh,     unsigned kw,\n"
-                "    unsigned stride_h, unsigned stride_w,\n"
-                "    unsigned dilation_h, unsigned dilation_w,\n"
-                "    unsigned pad_top, unsigned pad_left,\n"
-                "    unsigned has_bias, unsigned is_depthwise)\n"
-                "{\n"
-                f"    XConvkernel_Set_x           (&{conv_var},\n"
-                "        inference_buf_phys(x) + (uint64_t)x_off * INFERENCE_BYTES_PER_ELEM);\n"
-                f"    XConvkernel_Set_weight      (&{conv_var},\n"
-                "        inference_buf_phys(weight) + (uint64_t)w_off * INFERENCE_BYTES_PER_ELEM);\n"
-                f"    XConvkernel_Set_bias        (&{conv_var}, (u64)0);\n"
-                f"    XConvkernel_Set_y           (&{conv_var},\n"
-                "        inference_buf_phys(y) + (uint64_t)y_off * INFERENCE_BYTES_PER_ELEM);\n"
-                f"    XConvkernel_Set_batch       (&{conv_var}, batch);\n"
-                f"    XConvkernel_Set_in_ch       (&{conv_var}, in_ch);\n"
-                f"    XConvkernel_Set_in_h        (&{conv_var}, in_h);\n"
-                f"    XConvkernel_Set_in_w        (&{conv_var}, in_w);\n"
-                f"    XConvkernel_Set_out_ch      (&{conv_var}, out_ch);\n"
-                f"    XConvkernel_Set_out_h       (&{conv_var}, out_h);\n"
-                f"    XConvkernel_Set_out_w       (&{conv_var}, out_w);\n"
-                f"    XConvkernel_Set_kh          (&{conv_var}, kh);\n"
-                f"    XConvkernel_Set_kw          (&{conv_var}, kw);\n"
-                f"    XConvkernel_Set_stride_h    (&{conv_var}, stride_h);\n"
-                f"    XConvkernel_Set_stride_w    (&{conv_var}, stride_w);\n"
-                f"    XConvkernel_Set_dilation_h  (&{conv_var}, dilation_h);\n"
-                f"    XConvkernel_Set_dilation_w  (&{conv_var}, dilation_w);\n"
-                f"    XConvkernel_Set_pad_top     (&{conv_var}, pad_top);\n"
-                f"    XConvkernel_Set_pad_left    (&{conv_var}, pad_left);\n"
-                f"    XConvkernel_Set_has_bias    (&{conv_var}, has_bias);\n"
-                f"    XConvkernel_Set_is_depthwise(&{conv_var}, is_depthwise);\n"
-                f"#ifdef XCONVKERNEL_CTRL_ADDR_Y_CS_DATA   /* the y pattern (RPU_PLAN §13.2): dense */\n"
-                f"    XConvkernel_Set_y_cs        (&{conv_var}, 0u);\n"
-                f"    XConvkernel_Set_y_cn        (&{conv_var}, 0u);\n"
-                f"    XConvkernel_Set_y_gs        (&{conv_var}, 0u);\n"
-                "#endif\n"
-                f"    XConvkernel_Start(&{conv_var});\n"
-                "}\n"
-            )
+            parts.append(self._run_conv_at_fn(conv_var, False))
+        if need_run_conv_at_y:
+            parts.append(self._run_conv_at_fn(conv_var, True))
 
         if need_run_conv_dw:
             parts.append(
@@ -1504,6 +1645,19 @@ class _SourceMixin:
                 "     * Each sub-buffer is an aligned view; 64-byte gaps between slots ensure\n"
                 "     * cache-line alignment at every physical base address. */"
             )
+            desc_lines = []
+            if self._ro_chains:                  # the descriptor area after the laid-out pool
+                bpe = self._dtype.bytes_per_elem
+                off = -(-total_pool_elems * bpe // 128) * 128 // bpe
+                desc_lines.append("    /* RowOpsKernel descriptor chains (RPU_PLAN §13.3): each chained node's\n"
+                                  "     * region at the end of the pool, 128 bytes per descriptor */")
+                for i, n in sorted(self._ro_chains.items()):
+                    desc_lines.append(f"    inference_buf_init_view(&s_ro_ch_{i}.view, s_alloc_pool, {off}u, "
+                                      f"{n * 128 // bpe}u);")
+                    desc_lines.append(f"    s_ro_ch_{i}.cap = {n}u;")
+                    off += n * 128 // bpe
+                total_pool_elems = off
+                desc_lines.append("")
             alloc_lines.append(
                 f"    s_alloc_pool = inference_buf_alloc({total_pool_elems}u);"
             )
@@ -1511,6 +1665,7 @@ class _SourceMixin:
                 "    if (!s_alloc_pool) { rc = -1; goto fail; }"
             )
             alloc_lines.append("")
+            alloc_lines += desc_lines
 
         if weights and compact:
             rows = []
@@ -1954,8 +2109,9 @@ class _SourceMixin:
         performance model where it prices the call, else the analytic cost
         model, as the R5 policy prices them (src/rpu_policy.py).  The shortest
         call, so a node of unequal calls wakes early rather than late (late
-        costs a wake-up, early only spin).  A node whose calls cannot be listed
-        (runtime-keyed) is absent."""
+        costs a wake-up, early only spin); a chained row-ops node's shortest
+        chain (its jobs' mean times the last chain's length, + the chain term).
+        A node whose calls cannot be listed (runtime-keyed) is absent."""
         cached = getattr(self, "_expect_us_cache", None)
         if cached is not None:
             return cached
@@ -1972,9 +2128,25 @@ class _SourceMixin:
             for c in cs:
                 p = pm.predict(c) if pm is not None else None
                 us.append(p[0] if p is not None else estimate_us(c))
+            if sn.index in self._ro_chains:              # one Start per chain of <= 16 jobs
+                jobs = sum(c.count for c in cs)
+                last = jobs - 16 * ((jobs - 1) // 16)
+                mean = sum(u * c.count for u, c in zip(us, cs)) / jobs
+                adj = pm.chain_adjust_us(last) if pm is not None else 0.0
+                out[sn.index] = max(0, int(mean * last + adj))
+                continue
             out[sn.index] = max(0, int(min(us)))
         self._expect_us_cache = out
         return out
+
+    def _emit_kernel_call(self, sn) -> str:
+        """A kernel node's call: a chained row-ops node's between
+        ro_chain_begin() and ro_chain_end() (_ro_chain_helpers)."""
+        text = sn.emit_call(self._layouts)
+        if sn.index not in self._ro_chains:
+            return text
+        return (f"    ro_chain_begin(&s_ro_ch_{sn.index});   /* its jobs as descriptor chains */\n"
+                + text + "\n    ro_chain_end();")
 
     def _expect_line(self, sn) -> str:
         """INFERENCE_KERNEL_EXPECT before a node's Start: its calls' predicted
@@ -2075,14 +2247,14 @@ class _SourceMixin:
                 sn = nodes_by_idx[ev[1]]
                 body_lines.append(self._expect_line(sn))
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
-                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append(self._emit_kernel_call(sn))
                 body_lines.append("")
 
             elif kind == 'start_sync':
                 sn = nodes_by_idx[ev[1]]
                 body_lines.append(self._expect_line(sn))
                 body_lines.append(f"    INFERENCE_PROF_BEGIN({sn.index}u);")
-                body_lines.append(sn.emit_call(self._layouts))
+                body_lines.append(self._emit_kernel_call(sn))
                 body_lines.append(f"    INFERENCE_PROF_END({sn.index}u);")
                 body_lines.append("")
 

@@ -138,7 +138,7 @@ every counter is sized for the register value.
 | `VitSumDequantNode` (RPU_PLAN A1, the vision frontend's `rowops`) | the parts summed by ADDX into an int32 row at the finest part exponent (`ResAddBiasRoNode` with a zero bias, then `ResAddRoNode`), DEQUANT into the float32 image-feature state |
 | `LlmSelectRowNode` (`SelectRowRoNode`, the int32 residual) | one COPY (A / C i32) of row n − 1, the base from the runtime n |
 | `VitPixelShuffleNode` (`PixelShuffleRoNode`) | one COPY per source block the column window touches: the output rows (i, j) as rows j × blocks i, the source rows (i·s + b)·n + j·s + a |
-| `LlmAttnPrepNode` (the prefill entries — `AttnPrepRoNode`, HOSTOPS_PLAN §10) | ROPE on q0 (→ a staging row at f_q[h]) and k0 (→ a staging row at f_k[g]), one COPY of the k rows into the K cache (`blocks` = the KV groups), a COPY re-rounding v where the V cache's exponents differ, one TRANSPOSE per KV group of the q rows into the q·Kᵀ x image (tiles of 8 query rows, `kw` 1), the V image per group as TRANSPOSEs: the 16K-row blocks inside [pos, pos + n) with R = group_kw (contiguous granules), the two boundary blocks as R = 1 granules (byte-strobed); a COPY with the window [0, 0) zeroes the q staging once per run |
+| `LlmAttnPrepNode` (the prefill entries — `AttnPrepRoNode`, HOSTOPS_PLAN §10; the decode steps too with the frontends' `drope`, RPU_PLAN §13.4: one row, the q image one TRANSPOSE of R = G with the groups as blocks, no zeroing) | ROPE on q0 (→ a staging row at f_q[h]) and k0 (→ a staging row at f_k[g]), one COPY of the k rows into the K cache (`blocks` = the KV groups), a COPY re-rounding v where the V cache's exponents differ, one TRANSPOSE per KV group of the q rows into the q·Kᵀ x image (tiles of 8 query rows, `kw` 1), the V image per group as TRANSPOSEs: the 16K-row blocks inside [pos, pos + n) with R = group_kw (contiguous granules), the two boundary blocks as R = 1 granules (byte-strobed); a COPY with the window [0, 0) zeroes the q staging once per run |
 | `VitAttnPrepNode`, Piper's (`VitAttnPrepRoNode`, phase 4b) | q0 + bq and v + bv as COPYs with the bias in the parameter block (`rowops_spec.bias_round`: Bq' = round(b·2^fp), fp = `bias_exp`) into staging rows, k0 + bk per head straight into the K cache, one TRANSPOSE of the q rows into every head's image (the heads as blocks), the V image per head as the whole-block TRANSPOSEs (T = C = a multiple of 16K) or, group_kw 1, one COPY with the heads as blocks |
 | `LlmAttnMergeNode`, `TtsAttnMergeNode` | COPY per group (2-level: rows t, heads hh) |
 | `TtsRowPrepNode` (`TtsRowPrepRoNode`, phase 4b) | one COPY per tap of the rows it reads (`rows = n`, the output shifted by the tap's offset) with the bias and `RELU` in the parameter block; the rows the host zeroes (the first tap's row 0, the last tap's row n − 1, every row ≥ n) as COPYs with the window [0, 0) |
@@ -184,6 +184,13 @@ per descriptor; a chained job saves the start and completion handshake of a
 single job and spends one cycle reading its descriptor — a 10-job chain
 takes ≈ 80 cycles (0.3 µs) more than its jobs run one by one (§3); on the
 board it saves each job's register writes, interrupt and wake.
+
+- **The scheduler** (RPU_PLAN §13.3 – 13.4, phase A2.4; `kernels.rowops.chains`): every
+  row-ops node of two or more jobs is issued as chains of at most 16 — the generated
+  `ro_chain_begin()` / `ro_chain_end()` collect its `run_rowops()` calls as descriptors in
+  the node's region at the end of the pool ([INFERENCE_SCHEDULER](../scheduler/INFERENCE_SCHEDULER.md));
+  the calibration's `Q` cases time one call as a chain of k copies (`calib_runner.c`,
+  `perf_calibrate.py`), from which the performance model's `rowops_chain` term is fitted.
 
 ## 2. Architecture
 

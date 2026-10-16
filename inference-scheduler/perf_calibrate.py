@@ -417,6 +417,49 @@ def case_line(cid: str, c: KernelCall, iters: int, warmup: int) -> str:
                      *map(str, sizes), *map(str, c.regs)])
 
 
+# RowOpsKernel descriptor chains (doc/plans/RPU_PLAN.md §13.3): a shipped row-ops
+# call run as one chain of k identical descriptors — the cases key
+# "<the call's key>#chain<k>" — so the fit can price a chained node as its
+# jobs' exact entries plus a chain term (perf_fit.fit_chain)
+CHAIN_KS = (1, 2, 4, 8, 16)
+CHAIN_CALLS = 6                       # the shipped row-ops calls measured as chains
+
+
+def chain_key(base: str, k: int) -> str:
+    return f"{base}#chain{k}"
+
+
+def chain_case_line(cid: str, base: KernelCall, k: int, iters: int, warmup: int) -> str:
+    """A calib_runner Q line: the R call's buffers + the k descriptors, its
+    registers + k."""
+    sizes = buffer_sizes(base) + [64 * k]            # 128 bytes per descriptor
+    return " ".join([cid, "Q", str(iters), str(warmup), str(len(sizes)),
+                     *map(str, sizes), *map(str, base.regs), str(k)])
+
+
+def entry_line(cid: str, e: dict) -> str:
+    """The calib_runner line of a cases entry (a call, or a chain of one)."""
+    if e.get("chain"):
+        return chain_case_line(cid, KernelCall.from_key(e["base"]), e["chain"], e["iters"], e["warmup"])
+    return case_line(cid, KernelCall.from_key(e["key"]), e["iters"], e["warmup"])
+
+
+def chain_cases(cases: Dict[str, dict]) -> List[dict]:
+    """The chained cases: the CHAIN_CALLS shortest shipped row-ops calls (where
+    the per-job saving matters most; ties by key) at every k of CHAIN_KS."""
+    rows = sorted((e for e in cases.values() if e["kernel"] == "RowOpsKernel" and e["set"] == "shipped"),
+                  key=lambda e: (e["est_us"], e["key"]))[:CHAIN_CALLS]
+    out = []
+    for e in rows:
+        for k in CHAIN_KS:
+            est = round(e["est_us"] * k, 3)
+            it, wu = iterations(est)
+            out.append({"key": chain_key(e["key"], k), "kernel": "RowOpsKernel", "set": "chain",
+                        "base": e["key"], "chain": k, "sources": e["sources"][:1], "est_us": est,
+                        "iters": it, "warmup": wu})
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # cases
 # ─────────────────────────────────────────────────────────────────────────────
@@ -450,8 +493,11 @@ def build_cases(models: Iterable[str], seed: int) -> dict:
         c = KernelCall.from_key(e["key"])
         e["est_us"] = round(estimate_us(c), 3)
         e["iters"], e["warmup"] = iterations(e["est_us"])
+    chains = chain_cases(cases)
+    log(f"  descriptor chains: {len(chains)} cases ({CHAIN_CALLS} row-ops calls x k = "
+        f"{', '.join(map(str, CHAIN_KS))})")
     return {"platform": PLATFORM, "seed": seed, "models": list(models),
-            "cases": sorted(cases.values(), key=lambda e: e["key"])}
+            "cases": sorted(cases.values(), key=lambda e: e["key"]) + chains}
 
 
 def default_id(args) -> str:
@@ -622,8 +668,7 @@ def cmd_run(args) -> int:
             fill = 1 if p == 1 else 0x5A
             for chunk in _chunks(todo, args.chunk_seconds):
                 ids = {f"c{i}": e for i, e in enumerate(chunk)}
-                lines = [case_line(cid, KernelCall.from_key(e["key"]), e["iters"], e["warmup"])
-                         for cid, e in ids.items()]
+                lines = [entry_line(cid, e) for cid, e in ids.items()]
                 remote = f"{build_dir}/cases_{p}.txt"
                 session.exec(f"cat > {remote} <<'EOF'\n" + "\n".join(lines) + "\nEOF", timeout=60)
                 cmd = f"{build_dir}/calib_runner {remote} {' '.join(inst)} {fill}"
@@ -796,7 +841,7 @@ def cmd_simulate(args) -> int:
         if one is not None:
             g = _entry_graphs(model, planned)[model]
             cg = CodeGenerator(g, model_path=f"{model}.onnx")
-            tl = simulate(cg, kernel_duration_fn(pm, cg._layouts), hm.us)
+            tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, chains=cg._ro_chains), hm.us)
             rows.append((f"{model}{' plan' if planned else ''}", "inference", tl.total_us / 1e3,
                          one[1], tl, cg, one[0]))
             continue
@@ -810,7 +855,8 @@ def cmd_simulate(args) -> int:
             tag = model
             ms = [m for u in b.get("utts", []) for m in u.get("chunk_ms", [])]
             if ms and "chunk" in cgs:
-                tl = simulate(cgs["chunk"], kernel_duration_fn(pm, cgs["chunk"]._layouts), hm.us)
+                tl = simulate(cgs["chunk"], kernel_duration_fn(pm, cgs["chunk"]._layouts, chains=cgs["chunk"]._ro_chains),
+                              hm.us)
                 rows.append((tag, "chunk", tl.total_us / 1e3, sorted(ms)[len(ms) // 2], tl, cgs["chunk"],
                              prof.get("chunk")))
             # per bucket, the sequence nearest a full bucket: the graph prices T rows,
@@ -823,7 +869,8 @@ def cmd_simulate(args) -> int:
             for T, e in sorted(fullest.items()):
                 entry = f"encode_{T}"
                 if entry in cgs:
-                    tl = simulate(cgs[entry], kernel_duration_fn(pm, cgs[entry]._layouts), hm.us)
+                    tl = simulate(cgs[entry], kernel_duration_fn(pm, cgs[entry]._layouts, chains=cgs[entry]._ro_chains),
+                                  hm.us)
                     rows.append((tag, f"encode {T} ({e['n']} ids)", tl.total_us / 1e3, e["best_ms"], tl,
                                  cgs[entry], prof.get(entry)))
             continue
@@ -833,7 +880,7 @@ def cmd_simulate(args) -> int:
 
             def keys_of(sn):
                 return attn_keys(pos0, n if n is not None else sn.T, sn.T, sn.C, sn.Q)[1]
-            tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of), hm.us)
+            tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of, chains=cg._ro_chains), hm.us)
             tl.cg, tl.keys_of = cg, keys_of            # for --html: the calls as priced
             return tl
         tag = f"{model}{' plan' if planned else ''}"
@@ -925,9 +972,9 @@ def cmd_rowops(args) -> int:
 
                 def keys_of(sn, n=n):
                     return attn_keys(1, n, sn.T, sn.C, sn.Q)[1]
-                kfn = kernel_duration_fn(pm, cg._layouts, keys_of=keys_of)
+                kfn = kernel_duration_fn(pm, cg._layouts, keys_of=keys_of, chains=cg._ro_chains)
             else:
-                kfn = kernel_duration_fn(pm, cg._layouts)
+                kfn = kernel_duration_fn(pm, cg._layouts, chains=cg._ro_chains)
             moved = {"calls": 0, "host": 0.0, "unit": 0.0}
 
             def host_unit(sn, moved=moved):

@@ -278,7 +278,7 @@ class LlamaFrontend:
                  decode_attn: str = "host",
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
                  image_rows: int = 0, image_state: str = "vlm.img", vsmx: bool = False,
-                 rowops: bool = False):
+                 rowops: bool = False, drope: bool = False):
         # vsmx (policy pow2+sink+p12+vsmx, doc/plans/SOFTMAX_PLAN.md): the FPGA
         # prefill's softmax on VectorOPKernel's softmax unit (LlmAttnSoftmax
         # vsmx = 1, src/smx_nodes.py); decode steps keep the host softmax
@@ -293,6 +293,13 @@ class LlamaFrontend:
             # CPU caches: every CPU writer of them must flush, which the host
             # attention of decode_attn "host" does not (HOSTOPS_PLAN §10.5)
             raise ValueError("rowops needs decode_attn 'fpga' (the row-ops unit writes the KV caches)")
+        # drope (policy ...+rowops+drope, RPU_PLAN §13.4): the decode steps' attention
+        # prep on the unit too — every step's RoPE the integer one (rowops_spec.rope),
+        # the step's cache rows and q image written by the unit, no CPU cache line
+        # touched (rowops_nodes.AttnPrepRoNode with one row)
+        self.drope = bool(drope)
+        if self.drope and not self.rowops:
+            raise ValueError("drope needs rowops (the decode prep on the row-ops unit)")
         # image_rows > 0 (a VLM's text model, src/vit.py): the prefill entries'
         # LlmEmbed also reads image_state [image_rows][D] (float32 host state the
         # vision entry writes); ids V .. V + image_rows - 1 select its rows
@@ -482,7 +489,7 @@ class LlamaFrontend:
         qx = self._t(f"{e}.l{li}.qx", [KV, HD, G * T], exp=0)
         prep_in = [q0, k0, v, pos, n, kc, vc, "rope.cos", "rope.sin"]
         prep_attrs = {}
-        if self.rowops and n:
+        if self.rowops and (n or self.drope):
             # the unit's jobs stage the rotated rows in DMA states of the entry
             # (rowops_nodes.AttnPrepRoNode); v is re-rounded only where the V
             # cache's exponents differ from the projection's
@@ -496,7 +503,9 @@ class LlamaFrontend:
                 vs = self._t(f"{e}.ro.vs", [T, KV * HD], exp=0, state=True)
                 self._init(vs, np.zeros((T, KV * HD), np.float32))
             prep_in += [qs, ks, vs]
-            prep_attrs = dict(rowops=1, first=int(li == 0))
+            # first: zero the q staging rows past n once per run (a decode step's one row is
+            # always written)
+            prep_attrs = dict(rowops=1, first=int(li == 0 and bool(n)))
         elif self.rowops:
             # a decode step: the host prep writes 2-byte V slots into lines the
             # unit filled during the prefill — invalidate them first (§10.5)

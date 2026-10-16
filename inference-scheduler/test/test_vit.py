@@ -249,6 +249,40 @@ class TestAttentionSplit(unittest.TestCase):
             self.assertEqual(rc, 0, out[-3000:])
             self.assertIn("test_inference PASSED", out)
 
+    def test_merge_patterned(self):
+        """RPU_PLAN §13.4 (A2.4): with ConvKernel's y channel pattern the
+        vision P.V calls (one head per group, unsplit or split by rows) write
+        the merged tensor through the pattern — y_cs = H*HD, no wrap — and the
+        merge emits nothing; the generated C equals the simulation."""
+        from unittest import mock
+
+        from src import _conv_hw_config
+        from src.llm_nodes import LlmAttnConvNode, LlmAttnMergeNode
+        _cfg, _W, _vm, fe = Tiny.get()
+        for split in (1, 2):
+            fe2 = VitFrontend(fe.cfg, fe.W, fe.fmt, name="vit_tiny", conn_k=CONN_K, attn_split=split)
+            with mock.patch.object(_conv_hw_config, "CONV_Y_PATTERN", True):
+                g = OnnxGraph(fe2.entry(output=True), fuse_act=True, s2d_stem=True)
+                cg = CodeGenerator(g, model_path="vit_tiny_ypat.onnx")
+            merges = [sn for sn in g.nodes if isinstance(sn, LlmAttnMergeNode)]
+            self.assertTrue(merges and all(sn.patterned for sn in merges))
+            pvs = {sn.output.onnx_name: sn for sn in g.nodes
+                   if isinstance(sn, LlmAttnConvNode) and sn.kind == "pv"}
+            views = cg._view_aliases
+            for m in merges:
+                rows = m.T // m.R
+                for i, t in enumerate(m.inputs):
+                    gi, r = divmod(i, m.R)
+                    self.assertEqual(pvs[t.onnx_name].y_pat, (m.H * m.HD, 0, 0))
+                    self.assertEqual(views[t.onnx_name][1:], (r * rows * m.H * m.HD + gi * m.HD,
+                                                              (rows - 1) * m.H * m.HD + m.HD))
+            src = cg.generate_source()
+            self.assertNotIn("llm_attn_merge(", src.split("static void llm_attn_merge")[-1].split("\n}", 1)[-1])
+            with self.subTest(split=split), tempfile.TemporaryDirectory() as td:
+                rc, out = host_emu.build_and_run(cg, td, cached=True, threads=3, min_elems=1, incoherent=True)
+                self.assertEqual(rc, 0, out[-3000:])
+                self.assertIn("test_inference PASSED", out)
+
     def test_bad_split(self):
         _cfg, _W, _vm, fe = Tiny.get()
         with self.assertRaises(ValueError):

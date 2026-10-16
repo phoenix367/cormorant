@@ -6,10 +6,12 @@
  * CASES: one case per line,
  *     id kernel iters warmup nbuf n_0 .. n_{nbuf-1} r_0 r_1 ...
  * kernel = V (VectorOPKernel), M (MatmulKernel), C (ConvKernel), P (PoolingKernel),
- * R (RowOpsKernel); n_i = element counts of the call's buffers (sized by the host:
- * V a b c, M a b c, C x w bias y, P x y, R a b c p); r_i = the register values in the
- * order of src/perf_calls.py FIELDS.  A kernel whose instance is "-" is not
- * opened.  FILL (default 1) is the byte every buffer is filled with — a
+ * R (RowOpsKernel), Q (a RowOpsKernel descriptor chain: the R call k times in one
+ * Start, doc/plans/RPU_PLAN.md §13.3); n_i = element counts of the call's buffers
+ * (sized by the host: V a b c, M a b c, C x w bias y, P x y, R a b c p, Q a b c p and
+ * the k 128-byte descriptors); r_i = the register values in the order of
+ * src/perf_calls.py FIELDS (Q: R's, then k).  A kernel whose instance is "-" is
+ * not opened.  FILL (default 1) is the byte every buffer is filled with — a
  * second pass with another one checks that the timing does not depend on
  * the data.
  *
@@ -32,7 +34,7 @@
 #include "xrowopskernel.h"
 #include "xvectoropkernel.h"
 
-#define MAX_BUF  4
+#define MAX_BUF  5
 #define MAX_REG  24
 #define TIMEOUT_S 20.0
 
@@ -170,8 +172,37 @@ static void start(const call_t *c)
         XRowopskernel_Set_bq_sh(&s_r, 0u);
         XRowopskernel_Set_win_lo(&s_r, r[11]);
         XRowopskernel_Set_win_hi(&s_r, r[12]);
+#ifdef XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA      /* one job, not a chain (a Q case may have run) */
+        XRowopskernel_Set_chain(&s_r, (u64)0);
+        XRowopskernel_Set_chain_n(&s_r, 0u);
+#endif
         XRowopskernel_Start(&s_r);
         break;
+#ifdef XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA
+    case 'Q':   /* the descriptors (chain_descriptors) at addr[4], k = r[13] */
+        XRowopskernel_Set_chain(&s_r, c->addr[4]);
+        XRowopskernel_Set_chain_n(&s_r, r[13]);
+        XRowopskernel_Start(&s_r);
+        break;
+#endif
+    }
+}
+
+/* a Q case's descriptors: the R call's argument registers 0x10 .. 0x6C as words 0 .. 23,
+ * k copies 128 bytes apart (RPU_PLAN §13.3) */
+static void chain_descriptors(const call_t *c, uint32_t *d)
+{
+    const unsigned *r = c->r;
+    unsigned k, i;
+    for (k = 0; k < r[13]; k++, d += 32) {
+        const uint32_t w[24] = {
+            r[0], r[1], r[2], r[3],
+            (uint32_t)c->addr[0], (uint32_t)(c->addr[0] >> 32), r[4], r[5],
+            (uint32_t)c->addr[1], (uint32_t)(c->addr[1] >> 32), r[6], r[7],
+            (uint32_t)c->addr[2], (uint32_t)(c->addr[2] >> 32), r[8], r[9],
+            (uint32_t)c->addr[3], (uint32_t)(c->addr[3] >> 32), 0u, 0u,
+            r[10], 0u, r[11], r[12] };
+        for (i = 0; i < 24u; i++) d[i] = w[i];
     }
 }
 
@@ -181,7 +212,7 @@ static int done(char k)
     case 'V': return (int)XVectoropkernel_IsDone(&s_v);
     case 'M': return (int)XMatmulkernel_IsDone(&s_m);
     case 'C': return (int)XConvkernel_IsDone(&s_c);
-    case 'R': return (int)XRowopskernel_IsDone(&s_r);
+    case 'R': case 'Q': return (int)XRowopskernel_IsDone(&s_r);
     default:  return (int)XPoolingkernel_IsDone(&s_p);
     }
 }
@@ -197,20 +228,26 @@ static double call(const call_t *c)
     return now_us() - t0;
 }
 
-static int kidx(char k) { return k == 'V' ? 0 : k == 'M' ? 1 : k == 'C' ? 2 : k == 'P' ? 3 : k == 'R' ? 4 : -1; }
+static int kidx(char k)
+{
+    return k == 'V' ? 0 : k == 'M' ? 1 : k == 'C' ? 2 : k == 'P' ? 3 : (k == 'R' || k == 'Q') ? 4 : -1;
+}
 
 static int open_kernel(char k, char *const inst[5])
 {
     const int i = kidx(k);
     int rc = -1;
     if (i < 0 || !strcmp(inst[i], "-")) return -1;
+#ifndef XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA
+    if (k == 'Q') return -1;                     /* a unit without descriptor chains */
+#endif
     if (s_open[i]) return 0;
     switch (k) {
     case 'V': rc = XVectoropkernel_Initialize(&s_v, inst[0]); break;
     case 'M': rc = XMatmulkernel_Initialize(&s_m, inst[1]); break;
     case 'C': rc = XConvkernel_Initialize(&s_c, inst[2]); break;
     case 'P': rc = XPoolingkernel_Initialize(&s_p, inst[3]); break;
-    case 'R': rc = XRowopskernel_Initialize(&s_r, inst[4]); break;
+    case 'R': case 'Q': rc = XRowopskernel_Initialize(&s_r, inst[4]); break;
     }
     if (rc == 0) s_open[i] = 1;
     return rc == 0 ? 0 : -1;
@@ -272,6 +309,14 @@ int main(int argc, char **argv)
             memset(inference_buf_ptr(buf[i]), fill, (size_t)(n[i] ? n[i] : 1u) * INFERENCE_BYTES_PER_ELEM);
             inference_buf_sync_to_device(buf[i]);
             c.addr[i] = inference_buf_phys(buf[i]);
+        }
+        if (ok && kernel == 'Q') {
+            if (nbuf < 5 || nreg < 14 || c.r[13] == 0u || (uint64_t)n[4] * INFERENCE_BYTES_PER_ELEM < 128u * c.r[13]) {
+                fprintf(stderr, "calib_runner: bad chain case: %s", line);
+                return 1;
+            }
+            chain_descriptors(&c, (uint32_t *)(void *)inference_buf_ptr(buf[4]));
+            inference_buf_sync_to_device(buf[4]);
         }
         if (ok) {
             for (i = 0; i < warmup && ok; i++)

@@ -319,7 +319,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              87 pytest modules, 1841 tests, all pass (test_bert_base.py
+  test_*.py              88 pytest modules, 1856 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -623,6 +623,16 @@ shortest call — and the wait sleeps on a timer, the line armed, until
 device; `INFERENCE_WAIT=poll` turns it off); otherwise `IsDone()` in a tight loop (bare metal, the host emulation).
 `inference_init()` opens each kernel's UIO interrupt after its driver.  The
 function stays weak, so a deployment can still replace it at link time.
+
+**Row-ops descriptor chains** (`kernels.rowops.chains`, `AXI_ROWOPS_CHAINS`,
+`../doc/plans/RPU_PLAN.md` §13.3): a row-ops node of two or more jobs
+(`RowOpsNode.chain_jobs`) is emitted between `ro_chain_begin(&s_ro_ch_<i>)`
+and `ro_chain_end()`; meanwhile `run_rowops()` writes descriptors into the
+node's region at the end of the pool (`CodeGenerator._ro_chains`) and
+`kernel_wait(KERNEL_ROWOPS)` returns at once (a replaced `kernel_wait` must
+keep that check); the jobs start as chains of ≤ 16.  The performance model
+prices a chained node as its jobs plus `PerfModel.chain_adjust_us` (the
+`rowops_chain` term `perf_calibrate.py` fits from its `Q` cases).
 
 **Event stream** — `CodeGenerator._compute_event_stream()` is the single
 source of truth for the schedule. It walks `graph.nodes` once (or a

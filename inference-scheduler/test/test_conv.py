@@ -276,6 +276,7 @@ class TestConvHwConfigResolver(unittest.TestCase):
                 "max_line_buf_cols":       64,
                 "max_acc_persist_entries": 65536,
                 "max_m_per_group":         4,
+                "y_pattern":               False,
             }},
         }))
         try:
@@ -310,6 +311,32 @@ class TestConvHwConfigResolver(unittest.TestCase):
         finally:
             bad.unlink(missing_ok=True)
 
+    def test_y_pattern_flag(self):
+        """``y_pattern`` is a required bool; ``AXI_CONV_YPATTERN`` overrides it."""
+        import json
+        from unittest import mock
+        from src._conv_hw_config import ConvHwConfigError, resolve
+
+        p = self._platforms_dir() / "_test_conv_ypattern.json"
+        conv = {"impl": "rtl", "tile_m": 16, "tile_ic": 16, "max_kh": 7, "max_kw": 7,
+                "max_in_ch": 1024, "max_out_ch": 1280, "max_line_buf_rows": 16,
+                "max_line_buf_cols": 64, "max_acc_persist_entries": 65536, "max_m_per_group": 4}
+        try:
+            for val, env, want in ((False, None, False), (True, None, True), (False, "1", True),
+                                   (True, "0", False)):
+                p.write_text(json.dumps({"kernels": {"conv": dict(conv, y_pattern=val)}}))
+                envs = {"AXI_CONV_YPATTERN": env} if env else {}
+                with mock.patch.dict(os.environ, envs):
+                    if not env:
+                        os.environ.pop("AXI_CONV_YPATTERN", None)
+                    self.assertEqual(resolve("_test_conv_ypattern")["CONV_Y_PATTERN"], want)
+            p.write_text(json.dumps({"kernels": {"conv": conv}}))
+            with self.assertRaises(ConvHwConfigError) as cm:
+                resolve("_test_conv_ypattern")
+            self.assertIn("y_pattern", str(cm.exception))
+        finally:
+            p.unlink(missing_ok=True)
+
     def test_missing_required_field_raises(self):
         """A platform JSON missing one of the mandatory ``kernels.conv``
         fields (e.g. max_in_ch) must error and name the missing field."""
@@ -330,6 +357,7 @@ class TestConvHwConfigResolver(unittest.TestCase):
                 "max_line_buf_cols":       64,
                 "max_acc_persist_entries": 65536,
                 "max_m_per_group":         4,
+                "y_pattern":               False,
             }},
         }))
         try:
