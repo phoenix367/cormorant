@@ -223,7 +223,7 @@ all (139 ms of host time per 260 ms chunk today — on an R5 that would grow,
 | **B1 — the R5 firmware for one model** | the device-tree overlay (rpu, TCM, reserved memory), the BARE_METAL fixes of §4.1 for the R5 BSP, the IRQ `kernel_wait`, the loader split, an A53 test harness over shared memory; MNIST convnet, then ResNet-18 | bit-exact with the Linux build; the five IRQs seen; latency within 5 % of the Linux build — **DONE 2026-10-13 (§9), as a model-independent firmware replaying the library's recorded kernel calls: the six CNN demos bit-exact, interrupt-driven, +2–5 % on the real models (YOLO +4 %, MobileNet v2 +5 %)** | 5 days |
 | **B2 — the chat path on the R5** | the RPMsg bridge, the sampler on the R5 (fixed point, gated against `libsampler`), `kv260_chat_server.py`'s backend over RPMsg; SmolLM2-135M, then 360M and SmolVLM | the same tokens as the Linux library on the gate prompts; tokens / s not slower; the A53 idle between tokens — **DONE 2026-10-13 in the B1 design (§10): no RPMsg or sampler on the R5 (the A53 keeps the host ops and the output, by the user's direction); protocol v4 + the doorbell; every chat library, BERT and Piper gated bit-exact with the R5 driving; the chat server runs with it (`deploy.py --rpu`); decode +2 % (135M), the bench's A53 CPU 3 s instead of 10 s** | 5 days |
 | **B3 — power** | the APU at 333 MHz (`userspace` governor) or suspended between requests with wake on RPMsg; the measurements of §6 before / after | ≥ 0.5 W off the 4.6 W idle, no latency loss — **started 2026-10-13 (§11): the A53 cores' power-down idle −9 mW (on, as a soak), the R5 asleep between commands (protocol v5) −50 mW idle; the APU clock, the PL and DDR next** | 2 days |
-| **A3 — the Piper and stereo features** | §3.3's unit features (unaligned row start, the windowed copy, the acts, the scaled add, long-row norms) and the correlation on ConvKernel; Piper's chunk and the stereo pass on the R5 | the chunk's host time ≤ 10 ms; stereo ≤ 450 ms; bit-exact | 2 weeks |
+| **A3 — the Piper and stereo features** | §3.3's unit features (unaligned row start, the windowed copy, the acts, the scaled add, long-row norms) and the correlation on ConvKernel; Piper's chunk and the stereo pass on the R5 — **the Piper chunk's sums, gates and PCM planned in §14 (2026-10-16): on the row-ops unit (a GATE op, a SCALE flag), not VectorOP** | the chunk's host time ≤ 10 ms; stereo ≤ 450 ms; bit-exact | 2 weeks |
 
 Order: A1, then B1 and A2 in parallel (A2 is a bitstream; B1 needs none),
 B2, B3, then A3.
@@ -1271,3 +1271,200 @@ soak.  `platforms/kv260.json`: `kernels.conv.y_pattern` and
 archive `/mnt/data/bitstreams/kv260_250_33a799febc56/`.  Still to re-measure
 on this bitstream (the fact registry's warnings): the CNN demos, YOLO and
 stereo quality, the RealSense demo and the cost model's board fit.
+
+## 14. Track A3 plan, the Piper chunk — sums, gates and PCM onto the row-ops unit (2026-10-16)
+
+One bitstream after `33a799febc56` adds two row-ops unit features: a **GATE**
+op and a **SCALE** flag.  The work that needs no bitstream comes first.  The
+goal is the Piper chunk's host work.  Today that is 33 host ops and ≈ 55 ms of
+A53 time per 128-frame chunk (180–188 ms on the board).  After the plan it
+is 10 host ops and ≈ 3.5 ms, which meets A3's "the chunk's host time
+≤ 10 ms" (§5) for the chunk.
+
+§3.3 put the acts and the scaled add on VectorOPKernel.  This plan puts them
+on the row-ops unit instead, for three reasons:
+- **The gate's exponents.**  VectorOP's activation tables are exact per
+  Q8.8 input (2^-8 only).  The gates take 2^-9 / 2^-10 and give 2^-9, and a
+  gate there would be three calls with a rounding between them.
+- **Two read ports.**  VectorOP has two, so a three-input average is two
+  calls, and its int16 partial sum can saturate.
+- **The unit has the rest.**  It already has the sigmoid table (MULACT), a
+  shift per column at any exponent ≤ 14, int32 intermediates, and both
+  operands in one job.
+
+What the plan does **not** do:
+- `TtsFlowOut` ×4 (2.3 ms) and the flows' `TtsPrep` ×5 (0.8 ms) stay.  Both
+  read the flow's float32 state z, which stays on the host by the numerics
+  decision of TTS_PLAN §3.
+- The encoder's `TtsAttnMerge` (23 ms at 400 ids) stays.  It needs A3's
+  unaligned row start (§13).
+
+### 14.1 What runs on the CPU per chunk
+
+Times are from the host-op model (`perf_models/kv260/host.json`, Piper
+profiled 2026-10-01).  Shapes and exponents are from the chunk graph of
+`generate_tts_project.entry_graphs` on `33a799febc56`.
+
+| host op | calls | what | ms |
+|---|---:|---|---:|
+| `TtsSum`, the ÷ 3 stage averages | 3 | `(y0 + y1 + y2) / 3` of the three resblocks of a decoder stage: `[128][1536]` / `[64][12288]` / `[32][49152]`, inputs at the stage's exponent f = 8 / 10 / 11, output at f + 1 | 1.98 + 7.80 + 15.44 = **25.2** |
+| `TtsSum`, the flows' masked post sums | 4 | the skip halves of `rs.0`–`rs.2` (channels 192–383 of `[384][256]`) + `rs.3` `[192][256]` at 2^-11 … 2^-14 → 2^-7 / 2^-8; the columns outside `[lo, hi)` zeroed | 4 × 0.61 = **2.45** |
+| `TtsGate` | 16 | `tanh(x[:192]) · σ(x[192:])` of the in-layer conv's `[384][256]`, f_in 9 / 10 → f_out 9 | 12 × 1.50 + 4 × 0.50 = **19.9** |
+| `TtsPcm` | 1 | `round(tanh(x) · 32767)` of 49 152 samples at 2^-14 → host int16 | **4.82** |
+| `TtsFlowOut`, flow `TtsPrep` | 4 + 5 | float32 state (not in this plan) | 3.1 |
+
+The gate means include outliers.  The timeline of 2026-10-02 showed about
+0.52 ms per gate with 5–7 ms spikes on two of them (perf-calibrate skill §4),
+so the gates are 8–20 ms.  A3a.0 re-profiles the chunk on `33a799febc56`
+first.
+
+### 14.2 Numerics: what moves exactly, what does not (host checks, 2026-10-16)
+
+**Exact (bit for bit):**
+- **The averages.**  2S/3 is never a tie: it is k + r/3.  The C helper's
+  double path therefore equals `rne(2S/3)` for every sum S of three int16.
+  `rne_shr(S · 174 763, 18)` equals it too for all |S| ≤ 3 · 2^15, checked
+  exhaustively; 174 763 = round(2^19 / 3).  An 18-bit G is the smallest that
+  works: G = round(2^18 / 3) misses 21 846 values.
+- **The post sums.**  They are dyadic: the integer sum at the finest
+  exponent, then one round half to even, as `TtsSumRoNode` does for the
+  flows' h sums.
+- **Dropping the post-sum mask.**  The post conv is 1 × 1
+  (`flow.flows.*.post.weight` `[96][192][1]`).  Its output m enters only
+  `TtsFlowOut`, whose `x1 = mask(z1 − m)` uses the same `[lo, hi)`
+  (`_mask_cols(L, 0, 1, lo, hi)` both).  Without the mask, z and the PCM do
+  not change.  Only the `post#in` trace changes, and only in the masked
+  columns.
+- **The PCM.**  It has 65 536 possible inputs.  A table of the
+  specification's own values equals it by construction.
+
+**Not exact — the gate.**  The gate is a product of two transcendental
+functions over 2^32 input pairs, so no table equals libm.
+
+The proposed integer specification (`rowops_spec.gate`):
+- tanh x = 2σ(2x) − 1, with the unit's MULACT sigmoid: 4 096 entries at
+  2^-8, values at 2^-24, linear interpolation, mirrored, 2^24 for |v| ≥ 16.
+- `th = 2·σ_q(a ≪ (15 − f_in)) − 2^24`, `sg = σ_q(b ≪ (14 − f_in))`.
+- `y = sat16(rne_shr(th · sg, 48 − f_out))`.
+
+How far it moves:
+- **tanh alone**, exhaustively over int16: at most 3.8 / 7.9 × 2^-24 off for
+  f_in 9 / 10.
+- **The gate against libm**, 4 M random pairs: 0.8–1.2 × 10^-5 of the outputs
+  differ for uniform int16 inputs, 3.0–5.1 × 10^-5 for N(0, 1.5), always by
+  one LSB (2^-9).  That is about 30 of the chunk's 786 k gate outputs.
+
+It is a numerics change: a study policy and a gate (A3a.0), as every move
+before it.
+
+### 14.3 Row-ops unit: GATE (op 10) and SCALE (op word bit 17)
+
+| feature | definition (per lane) | job |
+|---|---|---|
+| **GATE** (op 10; A, B, C int16, B_EN) | `y = sat16(rne_shr(th · sg, sh_c))` with `th = 2·σ_q(a ≪ sh_a) − 2^24` and `sg = σ_q(b ≪ sh_b)`.  The parameter entry (`P_BCAST`) holds `sh_a = 15 − f_in`, `sh_b = 14 − f_in`, `sh_c = 48 − f_out`.  Contract: `a ≪ sh_a` and `b ≪ sh_b` lie within ±2^22, as MULACT's gv | one gate: `n` 4096, 12 rows; A = x, B = x + 192 · 256 elements, C = the acts |
+| **SCALE** (op word bit 17, COPY / ADDX) | `y = sat_C(rne_shr(Σ · G[c], sh_c))`, where Σ is today's pre-rounding sum `(A ≪ sh_a) [+ (B ≪ sh_b)] + (Bq' ≪ bq_sh)` and G is the parameter entry's int32 (NORM's field; COPY and ADDX ignore it today).  Contract: \|Σ\| < 2^17, 0 ≤ G < 2^26 — one 27 × 18 DSP48E2 per lane | an average: ADDX of the int32 `T = y0 + y1` and y2, with G = 174 763 and `sh_c` = 18 |
+
+**RTL (`ro_stream`).**
+- **GATE.**  It needs two sigmoid lookups per lane: the doubled a and b.
+  That means two more `ro_sig_ram` UltraRAMs beside the two of today, and
+  TLOAD writes all four.  The table image does not change.
+- **GATE's other parts.**  A second interpolation and mirror, and the
+  th · sg product (26 × 25 bits).  That product goes on MULACT's gv · σ
+  multiplier, widened, or on two DSP48E2 of its own per lane.  The rounding
+  and saturation stages are MULACT's.  Full rate: four lanes per cycle.
+- **SCALE.**  One product stage between the sum and the rounding shift.
+  The ops already leave in order, because the shorter ones are carried to
+  s20.
+- **Estimate.**  ≈ 1.5 k LUT, +2 URAM (55 → 57 of 64), +12 DSP48E2.
+
+**No new AXI-Lite register.**  The drivers, the R5 recorder and the
+register map stay as they are.  A library that never issues op 10 or sets
+bit 17 runs as before: no stale-register hazard, unlike A2 (§13.12).
+
+**What moves with it:**
+- `rowops_spec` gains `gate` and the scaled ADDX.
+- The C++ oracle `tb/verilator/rowops_ref.h`.
+- `scripts/gen_fixtures.py`: GATE at f_in 9 / 10, an average, and a sweep
+  job over every int16 a.
+- The testbench's random jobs, and `host_emu`'s unit.
+- The documentation: ROWOPS_RTL_KERNEL §1.2 / §1.4.
+- Not `perf_calls`: the op word is already in the key.
+
+### 14.4 Scheduler and frontend
+
+- **`GateRoNode`.**  `TtsGate` becomes one GATE job where the platform has
+  `kernels.rowops.gate` (`AXI_ROWOPS_GATE`).  Its `reference()` is
+  `rowops_spec.gate`.  On older platforms the host op keeps libm: the
+  platform decides the specification, as it does for NORM and FOLD.
+  `piper_vits.chunk_forward(gate_q=True)` is the study's and the tests'
+  specification.
+- **The stage averages.**  The node is a two-input `TtsSumRoNode` generalised
+  to three inputs and ÷ 3, behind `kernels.rowops.scale`
+  (`AXI_ROWOPS_SCALE`), as two nodes:
+  - The ADDX `T = y0 + y1` into an int32 pool temporary (≤ 6.3 MB, the third
+    stage; the pool is 54 MiB today).
+  - The scaled ADDX `(T + y2) · 174 763 ≫ 18` → int16 at f + 1.
+  
+  The frontend emits the first after the prep of resblock 2's first conv, so
+  that it runs under that conv: the row-ops lane is ≈ 15 % busy in the
+  chunk.  Only the second job is then on the critical path.
+- **The post sums** (no bitstream).  The frontend and the specification drop
+  the mask (§14.2).  The four-input sum becomes a chain of three ADDX: int32
+  temporaries at the finest exponent, then one rounding.  These are existing
+  ops, behind `kernels.rowops.chains`.
+- **The PCM** (no bitstream).  `TtsPcmNode` looks its output up in a
+  65 536-entry int16 table, written by the generator from the specification
+  (`weights/<name>.dat`, the host-table mechanism of `llm_nodes`).
+- **Pricing.**  The campaign of the new bitstream measures the GATE and
+  scaled-ADDX calls of the Piper graph.  `host.json` gets the PCM's new
+  signature (`host --merge`).
+
+### 14.5 Expected effect (estimates)
+
+The unit's measured rates come from the `33a799febc56` model.  It is lane
+bound at 1 ns per element for i16 → i16 / i32 jobs, 1.5 ns with an int32
+operand.
+
+| host op | today | after | how |
+|---|---:|---:|---|
+| ÷ 3 averages | 25.2 ms | ≈ 3.8 ms (6.7 if the first job does not hide) | the scaled ADDX: 2.56 M elements at ≈ 1.5 ns |
+| post sums | 2.45 | ≈ 0.8 | three ADDX, ≈ 4 ns per element in all |
+| gates | 8–20 | ≈ 0.9 | 16 × ≈ 55 µs (49 152 elements, 295 KB) |
+| PCM | 4.8 | ≈ 0.2 | the table |
+| **the chunk** | 180–188 ms | **≈ 135–150 ms** | |
+| the chunk's host ops (R5 batch breaks) | 33 | 10 | `TtsFlowOut` ×4, flow `TtsPrep` ×5, PCM |
+| the chunk's CPU time | ≈ 55 ms | ≈ 3.5 ms | |
+
+### 14.6 Phases and gates
+
+| phase | what | gate |
+|---|---|---|
+| **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.182 dB, 22.9 dB) |
+| **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
+| **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
+| **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
+| **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
+
+Order: A3a.0 first (bit-exact, and the study decides the gate's
+specification), then A3a.1 → A3a.2 → A3a.3 → A3a.4.  Effort: A3a.0 1 day,
+A3a.1 2, A3a.2 ½ plus the build, A3a.3 1½, the board 1 — about six days.
+
+### 14.7 Risks
+
+- **Timing.**  WNS is +0.022 ns.
+  - GATE adds a second table path per lane next to MULACT's.
+  - SCALE adds a product after the sum.
+  - Each gets its own pipeline stages.  The two new UltraRAMs need room
+    in the unit's column.
+  - The reserve: GATE at half rate on today's two table RAMs (two lanes
+    per cycle, ≈ 100 µs a gate, +0.7 ms per chunk), with no URAM added.
+- **The gate study fails.**  Not expected: about 30 values per chunk move by
+  one LSB.  The fallback is a bit-exact host gate on per-exponent double
+  tables (tanh and σ of every int16, 2 × 512 KiB per exponent).  It keeps the
+  16 host ops and roughly halves their time.
+- **The overlap of the average's first job** depends on the issue order.
+  Without `--plan` it is the frontend's order, so the frontend places it.
+  The timing model (`codegen/timing.py`) checks the overlap before the board
+  does.
+- **Old libraries** need no regeneration: no register is added.  Each needs
+  a perf model for the new id only if it is planned (`--plan`).
