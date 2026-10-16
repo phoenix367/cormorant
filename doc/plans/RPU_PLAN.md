@@ -1442,7 +1442,7 @@ operand.
 | **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" — **DONE 2026-10-16 (§14.8): bit-exact, chunk 184.3 → 176.3 ms, the study GO** | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.208 dB, 22.7 dB: OFFLOAD_PLAN §2.2's VectorOP sums) |
 | **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis — **DONE 2026-10-16 (§14.9)** | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
 | **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job — **DONE 2026-10-16 (§14.10): `04259a7af917`, WNS +0.027 ns, 91 805 LUT, 57 URAM, `sim_hw` 123 / 123** | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
-| **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
+| **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases — **DONE 2026-10-16 (§14.11)** | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
 | **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
 
 Order: A3a.0 first (bit-exact, and the study decides the gate's
@@ -1663,3 +1663,82 @@ build, the previous `cormorant_hw_128.runs` moved to
 build outputs (880 MB) to `old_build_hls_kernels`: `/` had 1.6 GB free.
 Not on the board yet.  The board gates and the promotion are A3a.4's,
 after the scheduler (A3a.3).
+
+### 14.11 A3a.3 results — the scheduler (2026-10-16)
+
+**The platform.**  `kernels.rowops.gate` and `kernels.rowops.scale`
+(`AXI_ROWOPS_GATE`, `AXI_ROWOPS_SCALE`) both need `unit`.  They stay false
+in `platforms/kv260.json` until the board promotion (A3a.4), as the A2
+flags did.
+
+**The gates.**  `GateRoNode` (`from_tts_gate`) puts a `TtsGate` on the unit
+as one GATE job: A is the first half of the in-layer conv's output, B the
+second, rows of 4 096 over the flat halves, and one shared parameter block
+per (f_in, f_out).  Its `reference()` is `rowops_spec.gate`.  Without the
+flag the host op keeps libm.
+
+**The averages.**
+- **The split.**  With SCALE, `PiperChunkFrontend(split_avg=True)` emits each
+  stage average as two `TtsSum`s:
+  - `T = y0 + y1` into an int32 DMA tensor, at the finer of y0's and y1's
+    exponents, placed right after the first prep of resblock 2 — the event
+    stream then runs it on the row-ops lane beside that resblock's first
+    conv;
+  - `(T + y2) / 3`, carrying `sbits`, the frontend's bound on |S|.
+- **The node.**  `TtsSumRoNode` gained kinds, SCALE and flat rows.  Whole
+  tensors longer than 4 096 run as rows of 4 096 (the averages: 48, 192
+  and 384 rows).  `rowops_spec.div_scale(div, d, sbits)` finds the smallest
+  exact (G, sh_c) and checks it exhaustively over every |S| ≤ 2^sbits when
+  the node is built.
+  - With the shipped exponents (d = 1) that is G = 349 525, sh_c = 19.
+  - It returns None where ties exist (an even overall divisor); such a sum
+    stays on the host.
+- **Numerics.**  The numbers are the unsplit sum's, bit for bit (the sums
+  are exact).
+- **Refusals.**  A host op takes no int32, so the split without SCALE is
+  refused (`test_split_needs_scale`).
+
+**The specification.**  `generate_tts_project.py` writes `gate_q` (the
+chunk has a `GateRoNode`) and `split_avg` into `project.json`.
+- **The check.**  `tts_board.reference()` reads `gate_q` from the project
+  and caches `_gq` references apart.  So `tts_board.py`, `tts_host_emu.py`
+  and `tts_speech_check.py` check a library against
+  `chunk_forward(gate_q=...)` as generated.
+- **A trap on the way.**  The first host emulation compared against libm's
+  specification: 45 075 / 128 970 samples "mismatched", exactly the study's
+  gate-change counts.
+
+**Elsewhere.**
+- **The host emulation.**  `test/host_emu.py`'s C port of the unit gains GATE
+  (`ro_sig_q`, shared with SiLU) and SCALE.
+- **The perf model.**  GATE and the scaled ADDX are priced by the rowops
+  family (words and lane groups) until A3a.4's campaign measures them.
+- **What stays.**  No register is added, so `rpu_reg_words` and the drivers
+  are unchanged.
+
+**Gates:**
+- **The real library**, generated with both flags on
+  (`AXI_ROWOPS_GATE=1 AXI_ROWOPS_SCALE=1`): 179 nodes (+3, the T sums), 16
+  GATE jobs, pool 54.1 MiB.
+  - `tts_host_emu.py --incoherent`: the PCM of eval00 / eval10 bit-exact
+    with `chunk_forward(gate_q=True)`; the encoder (6 buckets) and the
+    duration predictor bit-exact.
+  - `--lib-check`: the chat backend's samples and z_p bit-exact.
+- **`test_piper.TestPiperChunkGateScale`**:
+  - the simulation equals the gate_q specification over four windows;
+  - the census (16 GATE, 3 T + 3 scaled averages, no host gate or sum);
+  - T's place between the prep and the conv;
+  - emitted calls = priced calls;
+  - the generated C on the host emulation.
+- **More tests.**  `test_rowops_spec.TestScale` (`div_scale` exhaustive,
+  the contract), `test_rowops_unit.TestRowopsHwConfig.test_gate_scale_flags`.
+- **The calibration cases** need no code: `perf_calibrate.py cases` takes the
+  GATE and scaled-ADDX calls from the shipped Piper graph
+  (`generate_tts_project.entry_graphs`, `split_avg_default`) once the flags
+  are on.  `calib_runner`'s R cases size a GATE job's A / B / C by its kinds,
+  as MULACT's.  The timing does not depend on the tables, which the runner
+  never loads.
+- **The other libraries** do not change: with the flags off, the Piper
+  project regenerates byte-identical (timestamps aside) and no other
+  frontend emits a `TtsGate` or an int32 `TtsSum`.  Suites: scheduler 1873,
+  chat 188, lint, csim, facts.

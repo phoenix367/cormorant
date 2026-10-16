@@ -33,7 +33,9 @@
     "rowops": {
       "unit": true,
       "fold": true,
-      "chains": true
+      "chains": true,
+      "gate": false,
+      "scale": false
     },
     "pool": {
       "tile_c":            8,

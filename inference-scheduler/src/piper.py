@@ -160,15 +160,20 @@ class PiperChunkFrontend:
     """Builds the ``chunk`` entry.  ``W``: load_weights(); ``E``: the
     exponents (demo/tts/scripts/piper_study.py calibrate: tensor name ->
     f, conv inputs "<conv>#in"); ``vop_sums`` False builds the library before
-    OFFLOAD_PLAN §2.2 (calibrated decoder exponents, three-input sums)."""
+    OFFLOAD_PLAN §2.2 (calibrated decoder exponents, three-input sums).
+    ``split_avg`` (the row-ops unit's SCALE, RPU_PLAN §14.4): each stage average
+    as T = y0 + y1 into an int32 DMA tensor — emitted after the first prep of
+    resblock 2 so that it runs under that resblock's first conv — then (T + y2) / 3;
+    the same numbers (the sums are exact)."""
 
     def __init__(self, W: Dict[str, np.ndarray], E: Dict[str, int], name: str = "piper",
-                 vop_sums: bool = True):
+                 vop_sums: bool = True, split_avg: bool = False):
         missing = [k for k in exponent_keys() if k not in E]
         if missing:
             raise ValueError(f"exponents missing for {len(missing)} tensors, e.g. {missing[:3]}")
         E = {k: int(v) for k, v in E.items()}
         self.W, self.E, self.name, self.vop_sums = W, vop_exponents(E) if vop_sums else E, name, vop_sums
+        self.split_avg = split_avg
 
     # ---- builder helpers ------------------------------------------------ #
     def _new(self):
@@ -178,12 +183,14 @@ class PiperChunkFrontend:
         self.meta = numeric.empty()
         self.n = 0
 
-    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None):
+    def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, dma=None):
         self.vi[name] = oh.make_tensor_value_info(name, elem, list(shape))
         if exp is not None:
             self.meta["exp"][name] = int(exp)
         if host is not None:
             self.meta["host"][name] = host
+        if dma is not None:
+            self.meta["dma"][name] = dma
         return name
 
     def _uid(self, stem):
@@ -225,10 +232,13 @@ class PiperChunkFrontend:
                                        dilations=[1, dil], pads=[0, 0, 0, 0]))
         return y
 
-    def _sum(self, xs, ch0s, nch, L, key, div=1.0, shape=None):
+    def _sum(self, xs, ch0s, nch, L, key, div=1.0, shape=None, sbits=None):
         y = self._t(self._uid(key), shape or [nch, L], exp=self.E[key])
+        attrs = dict(ch0s=list(ch0s), nch=nch, div=float(div))
+        if sbits is not None:
+            attrs["sbits"] = int(sbits)                # |the exact sum| < 2^sbits (the unit's SCALE)
         self.nodes.append(oh.make_node("TtsSum", list(xs), [y], name=self._uid(f"{key}.sum"),
-                                       domain=LLM_DOMAIN, ch0s=list(ch0s), nch=nch, div=float(div)))
+                                       domain=LLM_DOMAIN, **attrs))
         return y
 
     # ---- the entry --------------------------------------------------------- #
@@ -285,7 +295,7 @@ class PiperChunkFrontend:
             xu = self._t(self._uid(f"dec.up{i}.x"), [n_out, L], exp=E[f"dec.up{i}"])
             self.nodes.append(oh.make_node("TtsInterleave", [yp], [xu], name=self._uid(f"dec.up{i}.il"),
                                            domain=LLM_DOMAIN, s=s))
-            ys = []
+            ys, t_avg = [], None
             for j in range(3):
                 rb = f"dec.rb{i}{j}"
                 kk = RB_KERNELS[j]
@@ -300,13 +310,25 @@ class PiperChunkFrontend:
                         a, r, w0, _ = self._prep(y, L, f"{rb}.c{c}", L=L, k=kk, dil=d, taps=(ta, tb),
                                                  out_ch=n_out, nch=n_out, alpha=0.1, rate=rate,
                                                  frame_off=DEC_OFF)
+                        if self.split_avg and j == 2 and t_avg is None:
+                            # T = y0 + y1, exact in int32, issued under resblock 2's first conv
+                            t_avg = self._t(self._uid(f"dec.st{i}.t"), [n_out, L],
+                                            exp=max(E[f"dec.rb{i}0.y1"], E[f"dec.rb{i}1.y1"]), dma="i32")
+                            self.nodes.append(oh.make_node("TtsSum", ys[:2], [t_avg],
+                                                           name=self._uid(f"dec.st{i}.t.sum"), domain=LLM_DOMAIN,
+                                                           ch0s=[0, 0], nch=n_out, div=1.0))
                         parts.append(self._conv(f"{rb}.c{c}", a, r, w0, wt[:, :, ta:tb],
                                                 bt if ta == 0 else None, dil=d))
                     if self.vop_sums and len(parts) > 1:      # the tap groups first (saturated)
                         parts = [self._sum(parts, [0] * len(parts), n_out, L, f"{rb}.c{c}")]
                     y = self._sum(parts + [y], [0] * (len(parts) + 1), n_out, L, f"{rb}.y{c}")
                 ys.append(y)
-            x = self._sum(ys, [0, 0, 0], n_out, L, f"dec.st{i}", div=3.0)
+            if self.split_avg:                     # (T + y2) / 3, |T + y2| < 2^sbits at the finest exponent
+                fy = [E[f"dec.rb{i}{j}.y1"] for j in range(3)]
+                sbits = sum(1 << (15 + max(fy) - f) for f in fy).bit_length()
+                x = self._sum([t_avg, ys[2]], [0, 0], n_out, L, f"dec.st{i}", div=3.0, sbits=sbits)
+            else:
+                x = self._sum(ys, [0, 0, 0], n_out, L, f"dec.st{i}", div=3.0)
             C = n_out
         a, r, w0, _ = self._prep(x, L, "dec.post", L=L, k=7, out_ch=1, nch=C, alpha=0.01, rate=rate,
                                  frame_off=DEC_OFF)

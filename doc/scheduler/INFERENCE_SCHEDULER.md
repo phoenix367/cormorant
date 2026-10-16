@@ -145,7 +145,15 @@ or a last dim not a multiple of 8); the Piper chunk's **`TtsSum`**s
 with differing exponents or channel offsets (`TtsSumRoNode`: one ADDX with
 per-tensor shifts for two inputs; since RPU_PLAN §14 (A3a.0) the flows'
 four-input post sums as three ADDX through an int32 scratch state,
-`rowops_sum_scratch_<n>`, chained — the ÷ 3 stage averages stay host ops) and
+`rowops_sum_scratch_<n>`, chained; with the unit's SCALE flag
+(`kernels.rowops.scale`, A3a.3) the ÷ 3 stage averages too, split by the
+frontend (`PiperChunkFrontend(split_avg=True)`) into T = y0 + y1 into an
+int32 DMA tensor — placed after resblock 2's first prep, so it runs beside
+that conv — and (T + y2) / 3 as one ADDX + SCALE, `rne_shr(S · G, sh_c)` with
+the exact pair of `rowops_spec.div_scale`; whole tensors longer than 4 096 as
+rows of ≤ 4 096) and, with its GATE op (`kernels.rowops.gate`), **`TtsGate`**
+(`GateRoNode`: one GATE job, tanh · σ from the sigmoid table — the library's
+specification becomes `chunk_forward(gate_q=True)`, `project.json` `gate_q`) and
 **`TtsInterleave`** (`TtsInterleaveRoNode`: one TRANSPOSE of R = the phase
 count, the columns in chunks of ≤ 1 024 as the job's blocks); the Piper
 encoder's **relative-key band** (`PiperEncoderFrontend(rel_kernel=True)`,
@@ -276,7 +284,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1863 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1873 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1263,8 +1271,8 @@ fixed-size `chunk` entry (TTS_PLAN §4).
   §2.2): the decoder keeps one exponent per stage (`piper.vop_exponents`),
   so each residual sum, and each split conv's tap-group sum, adds two whole
   tensors at one exponent — `TtsAddVopNode`, one `ADD` (the exact sum
-  saturated: the host op's bits).  The stage averages stay host ops; the
-  flows' sums run on the row-ops unit (§Row-ops unit).
+  saturated: the host op's bits).  The flows' sums run on the row-ops
+  unit, and with its SCALE flag the stage averages too (§Row-ops unit).
 - **The flows' post sums are not masked** (RPU_PLAN §14.2): the post conv
   is 1 × 1 and its output only reaches `TtsFlowOut`, which masks x1 with the
   same [lo, hi) — z and the PCM are the masked form's bit for bit.

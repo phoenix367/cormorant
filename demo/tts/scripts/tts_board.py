@@ -88,21 +88,24 @@ def write_utts(path: str, zps: dict) -> None:
             f.write(np.ascontiguousarray(zp, "<f4").tobytes())
 
 
-def reference(project: str, W, E, zps: dict) -> dict:
+def reference(project: str, W, E, zps: dict, gate_q: bool = None) -> dict:
     """The specification's samples per utterance, cached in the project by
     name and z_p checksum (a regenerated project — new exponents — starts
-    without the cache)."""
+    without the cache).  ``gate_q`` None: the project's (project.json, the
+    gates on the row-ops unit's GATE, RPU_PLAN §14)."""
+    if gate_q is None:
+        gate_q = bool(json.load(open(os.path.join(project, "project.json"))).get("gate_q", False))
     out = {}
     for n, zp in zps.items():
         key = zlib.crc32(np.ascontiguousarray(zp, "<f4").tobytes())
-        path = os.path.join(project, "reference", f"{n}_{key:08x}.npy")
+        path = os.path.join(project, "reference", f"{n}_{key:08x}{'_gq' if gate_q else ''}.npy")
         if os.path.exists(path):
             ref = np.load(path)
             if ref.shape == (zp.shape[1] * pv.HOP,):
                 out[n] = ref
                 continue
         t0 = time.time()
-        out[n] = pv.synthesize_chunked(W, E, zp).astype(np.int16)
+        out[n] = pv.synthesize_chunked(W, E, zp, gate_q=gate_q).astype(np.int16)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         np.save(path, out[n])
         print(f"  spec {n}: {zp.shape[1]} frames ({time.time() - t0:.0f} s)", flush=True)

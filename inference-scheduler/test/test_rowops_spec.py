@@ -184,6 +184,32 @@ class TestGate(unittest.TestCase):
                                       [0, 512, -512])
 
 
+class TestScale(unittest.TestCase):
+    """SCALE (op bit 17): the sum times G before the rounding; div_scale's exact pairs."""
+
+    def test_avg3(self):
+        S = np.arange(-3 * 32768, 3 * 32768 + 1, dtype=np.int64)
+        np.testing.assert_array_equal(rs.scaled_round(S, rs.AVG3_G, rs.AVG3_SH), rs.rne_div(2 * S, 3))
+
+    def test_div_scale_exact(self):
+        for div, d, bits in ((3, 1, 17), (3, 0, 17), (3, 2, 16), (5, 1, 14), (3, -1, 12)):
+            ds = rs.div_scale(div, d, bits)
+            S = np.arange(-(1 << bits), (1 << bits) + 1, dtype=np.int64)
+            if ds is None:                            # an even denominator: ties the product cannot break
+                self.assertLess(d, 0)
+                continue
+            G, k = ds
+            self.assertLess(G, 1 << rs.SCALE_G_BITS)
+            np.testing.assert_array_equal(rs.scaled_round(S, G, k), rs.rne_div(S << max(d, 0), div << max(-d, 0)))
+        self.assertIsNone(rs.div_scale(2, 1, 10))
+
+    def test_contract(self):
+        with self.assertRaises(ValueError):
+            rs.scaled_round(np.array([1 << 31]), 1, 0)
+        with self.assertRaises(ValueError):
+            rs.scaled_round(np.array([1]), 1 << 25, 0)
+
+
 class TestFold(unittest.TestCase):
     """FOLD (op 9, HOSTOPS_PLAN §11): TtsPrep's LeakyReLU and re-rounding as an
     integer quotient, its divider-free form and the windowed gather."""

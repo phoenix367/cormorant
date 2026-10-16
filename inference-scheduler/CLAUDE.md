@@ -279,7 +279,9 @@ src/
                          LayerNorm32 / VitAttnPrep for the vision and TTS encoders, TtsRowPrep for
                          the TTS encoder; RPU_PLAN A1: Transpose, TtsSum / TtsInterleave / TtsRelBand,
                          Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle; FOLD,
-                         op 9: TtsPrep as FoldRoNode where the platform says kernels.rowops.fold) + the
+                         op 9: TtsPrep as FoldRoNode where the platform says kernels.rowops.fold; RPU_PLAN
+                         §14: GATE, op 10: TtsGate as GateRoNode (kernels.rowops.gate), the SCALE flag:
+                         the split ÷ 3 stage averages as TtsSumRoNodes (kernels.rowops.scale)) + the
                          factories graph.py merges over the host ops when the platform has the unit
   graph.py               OnnxGraph: ONNX parsing, shape inference, tensor registry
   schedule.py            Dag: data-flow DAG over scheduled nodes (+ state RAW / WAR / WAW
@@ -319,7 +321,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              88 pytest modules, 1863 tests, all pass (test_bert_base.py
+  test_*.py              88 pytest modules, 1873 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

@@ -473,8 +473,8 @@ class TestDecodePrepOnUnit(unittest.TestCase):
 
 
 class TestRowopsHwConfig(unittest.TestCase):
-    """kernels.rowops: the three flags, required bools; fold and chains need the
-    unit; AXI_ROWOPS_CHAINS overrides chains."""
+    """kernels.rowops: the five flags, required bools; fold, chains, gate and scale
+    need the unit; AXI_ROWOPS_CHAINS / _GATE / _SCALE override them."""
 
     def test_chains_flag(self):
         import json
@@ -485,7 +485,8 @@ class TestRowopsHwConfig(unittest.TestCase):
                                             (False, True, None, False), (True, False, "1", True),
                                             (True, True, "0", False)):
                 p.write_text(json.dumps({"kernels": {"rowops": {"unit": unit, "fold": False,
-                                                                "chains": chains}}}))
+                                                                "chains": chains, "gate": False,
+                                                                "scale": False}}}))
                 with mock.patch.dict(os.environ, {"AXI_ROWOPS_CHAINS": env} if env else {}):
                     if not env:
                         os.environ.pop("AXI_ROWOPS_CHAINS", None)
@@ -495,6 +496,33 @@ class TestRowopsHwConfig(unittest.TestCase):
             with self.assertRaises(_rowops_hw_config.RowopsHwConfigError) as cm:
                 _rowops_hw_config.resolve("_test_rowops_chains")
             self.assertIn("chains", str(cm.exception))
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_gate_scale_flags(self):
+        """GATE and SCALE (RPU_PLAN §14.3): each its own flag, off without the unit,
+        its environment override; a platform file without them is refused."""
+        import json
+        p = _rowops_hw_config._PLATFORMS_DIR / "_test_rowops_gate.json"
+        envs = ("AXI_ROWOPS", "AXI_ROWOPS_GATE", "AXI_ROWOPS_SCALE")
+        try:
+            for unit, gate, scale, env, want in ((True, True, False, {}, (True, False)),
+                                                 (True, False, True, {}, (False, True)),
+                                                 (False, True, True, {}, (False, False)),
+                                                 (True, False, False, {"AXI_ROWOPS_GATE": "1"}, (True, False)),
+                                                 (True, True, True, {"AXI_ROWOPS_SCALE": "0"}, (True, False))):
+                p.write_text(json.dumps({"kernels": {"rowops": {"unit": unit, "fold": True, "chains": True,
+                                                                "gate": gate, "scale": scale}}}))
+                with mock.patch.dict(os.environ, env):
+                    for e in envs:
+                        if e not in env:
+                            os.environ.pop(e, None)
+                    r = _rowops_hw_config.resolve("_test_rowops_gate")
+                    self.assertEqual((r["ROWOPS_GATE"], r["ROWOPS_SCALE"]), want, (unit, gate, scale, env))
+            p.write_text(json.dumps({"kernels": {"rowops": {"unit": True, "fold": True, "chains": True}}}))
+            with self.assertRaises(_rowops_hw_config.RowopsHwConfigError) as cm:
+                _rowops_hw_config.resolve("_test_rowops_gate")
+            self.assertIn("gate", str(cm.exception))
         finally:
             p.unlink(missing_ok=True)
 

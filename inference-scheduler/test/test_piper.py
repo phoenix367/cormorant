@@ -648,5 +648,112 @@ class TestPiperChunkFold(unittest.TestCase):
         self.assertIn("PASSED", out)
 
 
+_A3_CG = None
+
+
+def _a3(on=True):
+    """The row-ops unit with FOLD, chains, GATE and SCALE (RPU_PLAN §14), patched."""
+    from src import _rowops_hw_config
+    return mock.patch.multiple(_rowops_hw_config, ROWOPS_UNIT=on, ROWOPS_FOLD=on, ROWOPS_CHAINS=on,
+                               ROWOPS_GATE=on, ROWOPS_SCALE=on)
+
+
+def a3_chunk_cg():
+    """The chunk on the unit with GATE and SCALE: the gates as GateRoNodes, the stage
+    averages split (PiperChunkFrontend(split_avg=True))."""
+    global _A3_CG
+    if _A3_CG is None:
+        W, E, _ = chunk_cg()
+        with _a3():
+            _A3_CG = (W, E, CodeGenerator(OnnxGraph(PiperChunkFrontend(W, E, split_avg=True).entry(), fuse_act=True,
+                                                    s2d_stem=True), model_path="piper_chunk_a3.onnx"))
+    return _A3_CG
+
+
+class TestPiperChunkGateScale(unittest.TestCase):
+    """RPU_PLAN §14 (A3a.3): the gates on the unit's GATE equal chunk_forward(gate_q=True),
+    the split stage averages the unsplit ones (exact sums), bit for bit."""
+
+    def test_simulation_matches_specification(self):
+        W, E, cg = a3_chunk_cg()
+        rng = np.random.default_rng(14)
+        zp = (rng.standard_normal((192, FLOW_FRAMES)) * 0.8).astype(np.float32)
+        for lo, hi in ((64, 256), (0, 256), (-64, 121), (70, 90)):
+            z = zp.copy()
+            z[:, :max(lo, 0)] = 0
+            z[:, max(min(hi, FLOW_FRAMES), 0):] = 0
+            with _a3():
+                sim = cg._forward_pass({"zp": z.astype(np.float64), "lo": np.array([lo]),
+                                        "hi": np.array([hi])}, keep=["pcm"])["pcm"]
+            np.testing.assert_array_equal(np.asarray(sim).astype(np.int64),
+                                          pv.chunk_forward(W, E, z, lo, hi, gate_q=True).astype(np.int64),
+                                          err_msg=f"lo {lo} hi {hi}")
+        self.assertFalse(np.array_equal(pv.chunk_forward(W, E, zp, 0, 256, gate_q=True),
+                                        pv.chunk_forward(W, E, zp, 0, 256)))
+
+    def test_census(self):
+        """16 GATE jobs, no host gate; the three averages as T (int16 + int16 -> int32)
+        and the scaled ADDX ((T + y2) * G >> sh_c, rowops_spec.div_scale); every TtsSum
+        on a kernel."""
+        from src import rowops_spec as rs
+        from src.rowops_nodes import GateRoNode, TtsSumRoNode
+        _, _, cg = a3_chunk_cg()
+        kinds = {}
+        for sn in cg._graph.nodes:
+            kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
+        self.assertEqual(kinds.get("GateRoNode"), 16)
+        self.assertNotIn("TtsGateNode", kinds)
+        self.assertNotIn("TtsSumNode", kinds)
+        sums = [sn for sn in cg._graph.nodes if isinstance(sn, TtsSumRoNode)]
+        t = [sn for sn in sums if sn.kinds[2] == rs.K_I32]
+        avg = [sn for sn in sums if sn.G]
+        self.assertEqual((len(t), len(avg)), (3, 3))
+        for sn in avg:
+            self.assertEqual(sn.kinds, (rs.K_I32, rs.K_I16, rs.K_I16))
+            self.assertEqual((sn.G, sn.sh_c), rs.div_scale(3, sn.f_out - max(sn.f_ins), 17))
+            self.assertLessEqual(sn.n, rs.N_MAX)
+        self.assertTrue(all(isinstance(sn, GateRoNode) and sn.nr <= rs.N_MAX
+                            for sn in cg._graph.nodes if sn.onnx_node.op_type == "TtsGate"))
+
+    def test_t_runs_under_resblock_2(self):
+        """T = y0 + y1 comes right after resblock 2's first prep and before its conv,
+        so the event stream runs it beside that conv."""
+        _, _, cg = a3_chunk_cg()
+        names = [sn.onnx_node.name for sn in cg._graph.nodes]
+        for i in range(3):
+            ti = next(k for k, n in enumerate(names) if n.startswith(f"dec.st{i}.t.sum"))
+            prep = next(k for k, n in enumerate(names) if n.startswith(f"dec.rb{i}2.c0.prep"))
+            conv = next(k for k, n in enumerate(names) if n.startswith(f"dec.rb{i}2.c0#"))
+            self.assertEqual((prep + 1, conv), (ti, ti + 1), names[prep:conv + 1])
+
+    def test_kernel_calls_are_the_emitted_ones(self):
+        from test_perf_calls import _Eval, node_emitted_calls
+        from src.rowops_nodes import GateRoNode, TtsSumRoNode
+        _, _, cg = a3_chunk_cg()
+        ev = _Eval(cg.generate_header())
+        for sn in cg._graph.nodes:
+            if isinstance(sn, (GateRoNode, TtsSumRoNode)):
+                self.assertEqual(sn.kernel_calls(cg._layouts), node_emitted_calls(sn, cg, ev), sn.describe())
+
+    def test_split_needs_scale(self):
+        """The split averages without the unit's SCALE are refused (the host op takes no
+        int32); without split_avg nothing changes."""
+        from src.nodes import SchedulerError
+        W, E, _ = chunk_cg()
+        from src import _rowops_hw_config
+        with _a3(), mock.patch.object(_rowops_hw_config, "ROWOPS_SCALE", False):
+            with self.assertRaises(SchedulerError) as cm:
+                OnnxGraph(PiperChunkFrontend(W, E, split_avg=True).entry(), fuse_act=True, s2d_stem=True)
+            self.assertIn("SCALE", str(cm.exception))
+
+    @unittest.skipUnless(shutil.which("cc"), "needs cc")
+    def test_generated_c_matches_simulation(self):
+        _, _, cg = a3_chunk_cg()
+        with tempfile.TemporaryDirectory() as td, _a3():
+            rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
+        self.assertEqual(rc, 0, out[-3000:])
+        self.assertIn("PASSED", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -506,7 +506,7 @@ static void ro_rsqrt_bf(i128 D, u64 *Rm, int *sh)
     *Rm = (u64)y1;
     *sh = 47 + d / 2;
 }
-static int64_t ro_silu_q(int64_t gv)                 /* silu(g) at 2^-20, g = gv 2^-14 */
+static int64_t ro_sig_q(int64_t gv)                  /* sigma(g) at 2^-24, g = gv 2^-14 */
 {
     int64_t a = gv < 0 ? -gv : gv, sig;
     int big = a >= ((int64_t)16 << 14);
@@ -516,7 +516,11 @@ static int64_t ro_silu_q(int64_t gv)                 /* silu(g) at 2^-20, g = gv
     sig = t + ((dlt * frac) >> 6);
     if (big) sig = (int64_t)1 << 24;
     if (gv < 0) sig = ((int64_t)1 << 24) - sig;
-    return (int64_t)ro_rne_shr((i128)gv * sig, 14 + 24 - 20);
+    return sig;
+}
+static int64_t ro_silu_q(int64_t gv)                 /* silu(g) at 2^-20, g = gv 2^-14 */
+{
+    return (int64_t)ro_rne_shr((i128)gv * ro_sig_q(gv), 14 + 24 - 20);
 }
 static uint32_t ro_float_bits(int64_t v, int sh_c)   /* float32(v 2^-sh_c), round to nearest even */
 {
@@ -599,6 +603,7 @@ static void ro_job(XRowopskernel *q)
     const uint32_t op = q->op & 15u, n = q->n;
     const unsigned ak = (q->op >> 4) & 3u, bk = (q->op >> 6) & 3u, ck = (q->op >> 8) & 3u;
     const int ben = (q->op >> 12) & 1u, relu = (q->op >> 15) & 1u, ln = (q->op >> 16) & 1u;
+    const int scale = (q->op >> 17) & 1u;          /* COPY / ADDX: the sum times G (RPU_PLAN §14.3) */
     int64_t *x, *vals;
     u64 i1, i2;
     uint32_t c;
@@ -639,7 +644,7 @@ static void ro_job(XRowopskernel *q)
                 (unsigned long long)q->p, q->a_s1, q->a_s2, q->b_s1, q->b_s2, q->c_s1, q->c_s2);
         abort();
     }
-    if ((op == 4u || op == 5u) && !ro_tables_loaded) abort();   /* a job before the table load */
+    if ((op == 4u || op == 5u || op == 10u) && !ro_tables_loaded) abort();   /* a job before the table load */
     x = (int64_t *)malloc((size_t)n * sizeof *x);
     vals = (int64_t *)malloc((size_t)n * sizeof *vals);
     for (i2 = 0; i2 < q->blocks; i2++)
@@ -647,7 +652,7 @@ static void ro_job(XRowopskernel *q)
             const u64 ra = q->a + i2 * q->a_s2 + i1 * q->a_s1;
             const u64 rb = q->b + i2 * q->b_s2 + i1 * q->b_s1;
             const u64 rc = q->c + i2 * q->c_s2 + i1 * q->c_s1;
-            if (op <= 4u) {                        /* COPY / ADDX / DEQUANT / MULACT */
+            if (op <= 4u || op == 10u) {           /* COPY / ADDX / DEQUANT / MULACT / GATE */
                 const int zero_a = (op == 1u || op == 2u) && (i1 < q->win_lo || i1 >= q->win_hi);
                 for (c = 0; c < n; c++) {
                     const ro_param_t pr = ro_param(q, c);
@@ -656,11 +661,14 @@ static void ro_job(XRowopskernel *q)
                     int64_t r;
                     if (op == 1u || op == 2u) {
                         i128 s = ((i128)xv << pr.sh_a) + ((i128)yv << pr.sh_b) + ((i128)pr.bq << q->bq_sh);
-                        i128 v = ro_rne_shr(s, (int)pr.sh_c);
+                        i128 v = ro_rne_shr(scale ? s * (i128)pr.g : s, (int)pr.sh_c);
                         r = ck == 0u ? ro_sat16(v) : ro_sat32(v);
                         if (relu && r < 0) r = 0;
                     } else if (op == 3u) {
                         r = (int64_t)ro_float_bits(xv, (int)pr.sh_c);
+                    } else if (op == 10u) {               /* GATE: tanh = 2 sigma(2a) - 1 */
+                        const int64_t th = 2 * ro_sig_q(xv << pr.sh_a) - ((int64_t)1 << 24);
+                        r = ro_sat16(ro_rne_shr((i128)th * ro_sig_q(yv << pr.sh_b), (int)pr.sh_c));
                     } else {
                         r = ro_sat16(ro_rne_shr((i128)ro_silu_q(xv << pr.sh_a) * yv, (int)pr.sh_c));
                     }

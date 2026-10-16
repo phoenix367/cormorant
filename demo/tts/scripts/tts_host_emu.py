@@ -120,7 +120,8 @@ def lib_check(project: str, work: str, texts) -> bool:
             zsame = all(a.shape == r.shape and np.array_equal(a, r) for a, r in zip(job.utterances, zref, strict=True))
             ok &= zsame
             got = np.frombuffer(b"".join(out[:-1]), "<i2")
-            want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp) for zp in job.utterances])
+            want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp, gate_q=bool(summary.get("gate_q", False)))
+                                   for zp in job.utterances])
             same = got.shape == want.shape and np.array_equal(got, want)
             ok &= same
             print(f"  [{text[:40]}...] {len(job.utterances)} utterance(s), {job.samples} samples, "

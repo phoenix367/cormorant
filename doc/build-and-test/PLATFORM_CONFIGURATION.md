@@ -204,6 +204,8 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
 | `unit` | bool | The bitstream carries the row-ops unit, RowOpsKernel ([HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md), [ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)): the fifth kernel lane that runs the transformer's row ops in fixed point.  When true the scheduler puts ONNX / fused `LayerNormalization` (Q8.8, rows ≤ 4096) and the chat frontends' row ops there (`src/rowops_nodes.py`); when false they stay on the host.  `AXI_ROWOPS=0` / `1` overrides it — `1` to generate for a bitstream with the unit before this file says so |
 | `fold` | bool | The unit has op 9, FOLD ([HOSTOPS_PLAN §11](../plans/HOSTOPS_PLAN.md)): Piper's `TtsPrep` — windowed source rows at any element offset, LeakyReLU with alpha = 1/m and the re-rounding — as one job.  When true (and `unit`) the scheduler puts the int16 `TtsPrep` calls whose rule is exact there (`rowops_nodes.FoldRoNode`, `rowops_spec.fold_divisor`); when false they stay on the host.  Bitstreams up to `1cedaf2ed816` lack it; `de968ccc45da` (production since 2026-10-15) has it.  `AXI_ROWOPS_FOLD=0` / `1` overrides it |
 | `chains` | bool | The unit runs descriptor chains ([RPU_PLAN §13.3](../plans/RPU_PLAN.md)): the `chain` / `chain_n` registers, one Start for up to 16 jobs read from DDR.  When true (and `unit`) the scheduler issues a multi-job row-ops node as one chain and puts the decode attention prep on the unit; when false each job is its own Start.  Bitstreams up to `de968ccc45da` lack it; `33a799febc56` (A2) has it.  `AXI_ROWOPS_CHAINS=0` / `1` overrides it |
+| `gate` | bool | The unit has op 10, GATE ([RPU_PLAN §14.3](../plans/RPU_PLAN.md)): tanh(a) · σ(b) from its sigmoid table.  When true (and `unit`) Piper's `TtsGate`s run there (`GateRoNode`, the specification `rowops_spec.gate`: within one LSB of libm's, so the library's specification becomes `chunk_forward(gate_q=True)`, recorded as `gate_q` in `project.json`).  Bitstreams up to `33a799febc56` lack it; `04259a7af917` has it.  `AXI_ROWOPS_GATE=0` / `1` overrides it |
+| `scale` | bool | The unit's COPY / ADDX take the SCALE flag (op bit 17: the sum times the column's G before the rounding).  When true (and `unit`) Piper's ÷ 3 stage averages run there, split into T = y0 + y1 (int32) and (T + y2) / 3 (`PiperChunkFrontend(split_avg=True)`, bit-exact).  Bitstreams up to `33a799febc56` lack it; `04259a7af917` has it.  `AXI_ROWOPS_SCALE=0` / `1` overrides it |
 
 ---
 
@@ -238,7 +240,9 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
     "rowops": {
       "unit": true,
       "fold": true,
-      "chains": true
+      "chains": true,
+      "gate": false,
+      "scale": false
     },
     "pool": {
       "tile_c":            8,

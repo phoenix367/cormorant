@@ -429,6 +429,32 @@ AVG3_SH = 18
 AVG3_G = (2 ** (AVG3_SH + 1) + 1) // 3          # round(2^19 / 3) = 174 763
 
 
+def rne_div(num: np.ndarray, den: int) -> np.ndarray:
+    """round half to even of num / den (num int64 array, den > 0): the exact quotient."""
+    q, r = np.divmod(np.asarray(num, np.int64), np.int64(den))
+    up = (2 * r > den) | ((2 * r == den) & ((q & 1) == 1))
+    return q + up
+
+
+@lru_cache(maxsize=None)
+def div_scale(div: int, d: int, s_bits: int) -> Optional[Tuple[int, int]]:
+    """(G, sh_c) with rne_shr(S * G, sh_c) == rne(S * 2^d / div) for every |S| <= 2^s_bits
+    and 0 <= G < 2^SCALE_G_BITS — the SCALE form of a sum divided by an odd ``div`` and
+    re-scaled d bits (the Piper stage average: div 3, d 1) — checked exhaustively; the
+    smallest sh_c that works, None when none does."""
+    if div < 1 or div % 2 == 0 or s_bits > 24:
+        return None
+    S = np.arange(-(1 << s_bits), (1 << s_bits) + 1, dtype=np.int64)
+    exact = rne_div(S << max(d, 0), div << max(-d, 0))
+    for k in range(max(0, -d), 48):
+        G = int(round(2.0 ** (k + d) / div))
+        if G >= (1 << SCALE_G_BITS):
+            return None
+        if G > 0 and np.array_equal(rne_shr_vec(S * G, np.full(S.shape, k)), exact):
+            return G, k
+    return None
+
+
 def scaled_round(s: np.ndarray, G, sh_c) -> np.ndarray:
     """rne_shr(S * G, sh_c) of the pre-rounding sums S (int64; no saturation)."""
     s = np.asarray(s, np.int64)

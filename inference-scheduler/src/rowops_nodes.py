@@ -60,6 +60,18 @@ def chains_enabled() -> bool:
     return _rowops_hw_config.ROWOPS_CHAINS
 
 
+def gate_enabled() -> bool:
+    """The platform's unit has op 10, GATE (``_rowops_hw_config.ROWOPS_GATE``,
+    ``AXI_ROWOPS_GATE``; read at call time, as ``enabled``)."""
+    return _rowops_hw_config.ROWOPS_GATE
+
+
+def scale_enabled() -> bool:
+    """The platform's unit takes the SCALE flag on COPY / ADDX
+    (``_rowops_hw_config.ROWOPS_SCALE``, ``AXI_ROWOPS_SCALE``; read at call time)."""
+    return _rowops_hw_config.ROWOPS_SCALE
+
+
 def raw_as_data(raw) -> np.ndarray:
     """Raw int16 words as the float32 values whose Q8.8 encoding is those
     words (exact: every int16 / 256 is a float32)."""
@@ -1706,27 +1718,43 @@ def from_tts_layernorm(node, tensors, index, align_elems, ctx: HostContext):
 
 @dataclass
 class TtsSumRoNode(RowOpsNode):
-    """An unmasked TtsSum of int16 channel slices on the unit — the host's
-    integer path (the exact sum at fp = the largest of the exponents, one
-    round half to even at f_out, saturate), bit for bit.  Two inputs (the
-    flows' h + the res-skip half, RPU_PLAN §3.1): one ADDX over the ``nch``
-    channel rows of L, the shifts fp - f_in0 / fp - f_in1 / fp - f_out.  Three
-    or four (the flows' post sums, RPU_PLAN §14.4): an ADDX chain through the
-    int32 scratch state ``tmp`` (rowops_sum_scratch) — t = x0 + x1, t += x_j,
-    then y = rne(t + x_last) — the middle jobs in place (each word is read
-    before it is written)."""
+    """An unmasked TtsSum on the unit — the host's integer path (the exact sum at
+    fp = the largest of the exponents, one round half to even at f_out, saturate),
+    bit for bit.
+    - Two inputs: one ADDX over the ``rows`` rows of ``n``, the shifts fp - f_in0 /
+      fp - f_in1 / fp - f_out: the flows' h + the res-skip half (int16 channel
+      slices, RPU_PLAN §3.1), and Piper's stage averages split in two (RPU_PLAN
+      §14.4, the frontend's ``split_avg``) — T = y0 + y1 into an int32 DMA tensor,
+      then (T + y2) / 3 with SCALE: rne_shr(S * G, sh_c), (G, sh_c) =
+      rowops_spec.div_scale (exact for every |S| < 2^sbits).  Whole tensors longer
+      than a unit row run as rows of ``n`` <= N_MAX (``flat``).
+    - Three or four int16 inputs (the flows' post sums, RPU_PLAN §14.4): an ADDX
+      chain through the int32 scratch state ``tmp`` (rowops_sum_scratch) — t = x0 +
+      x1, t += x_j, then y = rne(t + x_last) — the middle jobs in place (each word
+      is read before it is written)."""
     nch: int = 1
     L: int = 1
     ch0s: tuple = (0, 0)
     f_ins: tuple = (0, 0)
     f_out: int = 0
+    kinds: tuple = (rs.K_I16, rs.K_I16, rs.K_I16)     # A, B, C (two inputs)
+    n: int = 0                                         # the row: L (channel rows) or <= N_MAX (flat)
+    rows: int = 0
+    div: int = 1
+    G: int = 0                                         # SCALE's multiplier (0: no SCALE)
+    sh_c: int = 0
     pb: object = field(default=None, repr=False)
     pbs: list = field(default_factory=list, repr=False)
     tmp: object = field(default=None, repr=False)
 
+    def __post_init__(self):
+        if not self.n:
+            self.n, self.rows = self.L, self.nch
+
     @property
     def opword(self) -> int:
-        return rs.opword(rs.OP_ADDX, rs.K_I16, rs.K_I16, rs.K_I16, b_en=True, p_bcast=True)
+        ak, bk, ck = self.kinds
+        return rs.opword(rs.OP_ADDX, ak, bk, ck, b_en=True, p_bcast=True, scale=self.G > 0)
 
     def state_writes(self):
         return [self.tmp] if self.tmp is not None else []
@@ -1734,10 +1762,15 @@ class TtsSumRoNode(RowOpsNode):
     def state_updates(self):
         return self.state_writes()
 
+    @staticmethod
+    def _eb(k: int) -> int:
+        return 2 if k == rs.K_I16 else 4
+
     def _regs(self):
-        LB = self.L * 2
-        return dict(op=self.opword, n=self.L, rows=self.nch, blocks=1, a_s1=LB, a_s2=0, b_s1=LB, b_s2=0,
-                    c_s1=LB, c_s2=0, aux=0, win_lo=0, win_hi=NO_WINDOW)
+        ak, bk, ck = self.kinds
+        return dict(op=self.opword, n=self.n, rows=self.rows, blocks=1, a_s1=self.n * self._eb(ak), a_s2=0,
+                    b_s1=self.n * self._eb(bk), b_s2=0, c_s1=self.n * self._eb(ck), c_s2=0, aux=0, win_lo=0,
+                    win_hi=NO_WINDOW)
 
     def _jobs(self):
         """[(a, a_off, b, b_off, c, P, opword, a_s1, c_s1)] of a sum of three or more."""
@@ -1767,7 +1800,12 @@ class TtsSumRoNode(RowOpsNode):
     def describe(self) -> str:
         k = len(self.ch0s)
         ex = " / ".join(f"2^-{f}" for f in self.f_ins)
-        how = "ADDX" if k == 2 else f"{k - 1} ADDX through an int32 scratch"
+        if k > 2:
+            how = f"{k - 1} ADDX through an int32 scratch"
+        elif self.G:
+            how = f"ADDX + SCALE: / {self.div} as * {self.G} >> {self.sh_c}"
+        else:
+            how = "ADDX" + (" -> int32" if self.kinds[2] == rs.K_I32 else "")
         return f"{k} inputs [{self.nch}][{self.L}] at {ex} -> 2^-{self.f_out} on RowOpsKernel ({how})"
 
     def emit_comment(self) -> str:
@@ -1777,9 +1815,10 @@ class TtsSumRoNode(RowOpsNode):
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         r = self._regs()
         if len(self.ch0s) == 2:
-            return self.call(self.inputs[0].c_name, self.ch0s[0] * self.L * 2, self.inputs[1].c_name,
-                             self.ch0s[1] * self.L * 2, self.output.c_name, 0, self.pb.c_name, r["op"], r["n"],
-                             r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
+            ak, bk, _ck = self.kinds
+            return self.call(self.inputs[0].c_name, self.ch0s[0] * self.L * self._eb(ak), self.inputs[1].c_name,
+                             self.ch0s[1] * self.L * self._eb(bk), self.output.c_name, 0, self.pb.c_name, r["op"],
+                             r["n"], r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
         lines = ["    {"]
         for i, (a, a_off, b, b_off, c, pb, op, a_s1, c_s1) in enumerate(self._jobs()):
             if i:
@@ -1791,12 +1830,16 @@ class TtsSumRoNode(RowOpsNode):
         return "\n".join(lines)
 
     def reference(self, ins, dtype):  # noqa: ARG002
-        fp = max(*self.f_ins, self.f_out)
+        fp = max(*self.f_ins) if self.G else max(*self.f_ins, self.f_out)
         acc = None
         for x, c0, f in zip(ins[:len(self.ch0s)], self.ch0s, self.f_ins, strict=True):
             raw = np.rint(np.asarray(x, np.float64).reshape(-1, self.L)[c0:c0 + self.nch] * 2.0 ** f).astype(np.int64)
             acc = (raw << (fp - f)) if acc is None else acc + (raw << (fp - f))
-        y = rs.sat16(rs.rne_shr_vec(acc, np.full(acc.shape, fp - self.f_out)))
+        if self.G:
+            y = rs.scaled_round(acc, self.G, self.sh_c)
+        else:
+            y = rs.rne_shr_vec(acc, np.full(acc.shape, fp - self.f_out))
+        y = rs.sat16(y) if self.kinds[2] == rs.K_I16 else np.clip(y, rs.I32_LO, rs.I32_HI)
         return (y / 2.0 ** self.f_out).reshape(self.output.shape)
 
 
@@ -1814,11 +1857,62 @@ def sum_scratch_tensor(tensors: dict, numel: int) -> TensorInfo:
     return t
 
 
+def _flat_row(total: int, align_elems: int) -> int:
+    """The longest row <= N_MAX, a multiple of align_elems, that divides ``total``
+    (0 when there is none)."""
+    return next((d for d in range(rs.N_MAX - rs.N_MAX % align_elems, 0, -align_elems) if total % d == 0), 0)
+
+
+def _split_sum(node, tensors, index, align_elems, ctx: HostContext):
+    """A TtsSum with an int32 DMA input or output — the frontend's ``split_avg``
+    (RPU_PLAN §14.4): T = y0 + y1 (int16 -> int32), or (T + y2) / div with SCALE.
+    Whole tensors at one exponent each; the unit only (a host op takes no int32)."""
+    from .host_nodes import _attrs
+    from .tts_nodes import _cl, _exp
+    from .llm_nodes import _resolve
+    a = _attrs(node)
+    xs = [_resolve(tensors, n, node) for n in node.input]
+    y = _resolve(tensors, node.output[0], node)
+    div = float(a.get("div", 1.0))
+    _require(enabled(), node, "an int32 DMA sum needs the row-ops unit (kernels.rowops.unit)")
+    _require(len(xs) == 2 and not a.get("masked"), node, "an int32 DMA sum has two unmasked inputs")
+    _require(all(int(c) == 0 for c in a.get("ch0s", [0, 0])), node, "an int32 DMA sum reads whole tensors")
+    _require(all(t.dma in (None, "i32") and not t.is_host and not t.is_state for t in xs + [y]), node,
+             "an int32 DMA sum: int16 / int32 DMA intermediates")
+    C, L = _cl(y)
+    _require(all(_cl(x) == (C, L) for x in xs), node, "inputs and output of one shape")
+    kinds = tuple(rs.K_I32 if t.dma == "i32" else rs.K_I16 for t in (*xs, y))
+    f_ins, f_out = tuple(_exp(x, node) for x in xs), _exp(y, node)
+    n = L if L <= rs.N_MAX and L % align_elems == 0 else _flat_row(C * L, align_elems)
+    _require(n > 0, node, f"no row of <= {rs.N_MAX} elements divides [{C}][{L}]")
+    rows = C * L // n
+    common = dict(onnx_node=node, output=y, index=index, align_elems=align_elems, F=ctx.frac_bits, nch=C, L=L,
+                  ch0s=(0, 0), f_ins=f_ins, f_out=f_out, kinds=kinds, n=n, rows=rows)
+    name = f"{y.onnx_name}__rowops_p"
+    if div == 1.0:
+        fp = max(*f_ins, f_out)
+        pb, _bc = _pblock(tensors, name, 0, 0, fp - f_ins[0], fp - f_ins[1], fp - f_out, 1)
+        return TtsSumRoNode(inputs=[*xs, pb, tables_tensor(tensors)], pb=pb, **common)
+    _require(scale_enabled(), node, "a sum divided by a constant needs the unit's SCALE (kernels.rowops.scale)")
+    _require(div == int(div) and int(div) % 2 == 1, node, f"a divisor {div:g}: an odd integer")
+    fp = max(f_ins)
+    sbits = int(a.get("sbits", 0))
+    _require(0 < sbits <= 24, node, "the frontend's bound sbits (|S| < 2^sbits) is required, <= 24")
+    ds = rs.div_scale(int(div), f_out - fp, sbits)
+    _require(ds is not None, node, f"no exact SCALE for / {div:g} at 2^{f_out - fp} (|S| < 2^{sbits})")
+    G, sh_c = ds
+    pb, _bc = _pblock(tensors, name, G, 0, fp - f_ins[0], fp - f_ins[1], sh_c, 1)
+    return TtsSumRoNode(inputs=[*xs, pb, tables_tensor(tensors)], pb=pb, div=int(div), G=G, sh_c=sh_c, **common)
+
+
 def from_tts_sum(node, tensors, index, align_elems, ctx: HostContext):
     """TtsSum: the VectorOP ADD or the host op as before; an unmasked sum of two
     to four int16 slices with differing exponents or channel offsets becomes
-    TtsSumRoNode."""
+    TtsSumRoNode, as does the frontend's split stage average (int32 DMA tensors)."""
     from .tts_nodes import TtsAddVopNode, TtsSumNode
+    from .llm_nodes import _resolve
+    if any(_resolve(tensors, n, node).dma == "i32" for n in [*node.input, node.output[0]] if n):
+        return _split_sum(node, tensors, index, align_elems, ctx)
     host = TtsSumNode.from_onnx_node(node, tensors, index, align_elems, ctx)
     if isinstance(host, TtsAddVopNode) or not enabled():
         return host
@@ -1843,6 +1937,75 @@ def from_tts_sum(node, tensors, index, align_elems, ctx: HostContext):
         pbs.append(_pblock(tensors, f"{name}{j - 1}", 0, 0, 0, sh[j], fp - host.f_out if j == k - 1 else 0, 1)[0])
     tmp = sum_scratch_tensor(tensors, host.nch * host.L)
     return TtsSumRoNode(inputs=[*xs, tmp, *pbs, tables_tensor(tensors)], pbs=pbs, tmp=tmp, **common)
+
+
+@dataclass
+class GateRoNode(RowOpsNode):
+    """TtsGate on the unit (op 10, RPU_PLAN §14.3): tanh(x[:n]) * sigma(x[n:]) of
+    x [2n][L] (int16 at f_in) -> y [n][L] at f_out — rowops_spec.gate (tanh = 2
+    sigma(2a) - 1 from the sigmoid table; within one LSB of libm's, the study's
+    'chunk spec + unit gate').  One GATE job: A the first half, B the second, rows
+    of ``nr`` <= N_MAX over the flat halves."""
+    n: int = 1
+    L: int = 1
+    nr: int = 1
+    f_in: int = 0
+    f_out: int = 0
+    pb: object = field(default=None, repr=False)
+
+    @property
+    def opword(self) -> int:
+        return rs.opword(rs.OP_GATE, b_en=True, p_bcast=True)
+
+    def _regs(self):
+        return dict(op=self.opword, n=self.nr, rows=self.n * self.L // self.nr, blocks=1, a_s1=2 * self.nr,
+                    b_s1=2 * self.nr, c_s1=2 * self.nr, win_hi=NO_WINDOW)
+
+    def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
+        from .perf_calls import KernelCall
+        return [KernelCall.of("RowOpsKernel", **self._regs())]
+
+    def describe(self) -> str:
+        return (f"tanh * sigma on [{2 * self.n}][{self.L}] at 2^-{self.f_in} -> 2^-{self.f_out} on RowOpsKernel "
+                f"(GATE)")
+
+    def emit_comment(self) -> str:
+        return (f"    /* [{self.index}] TtsGate({self.inputs[0].onnx_name}) -> {self.output.onnx_name}  "
+                f"{self.describe()} */")
+
+    def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        r = self._regs()
+        x = self.inputs[0].c_name
+        return self.call(x, 0, x, self.n * self.L * 2, self.output.c_name, 0, self.pb.c_name, r["op"], r["n"],
+                         r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
+
+    def reference(self, ins, dtype):  # noqa: ARG002
+        raw = np.rint(np.asarray(ins[0], np.float64).reshape(2 * self.n, self.L) * 2.0 ** self.f_in).astype(np.int64)
+        y = rs.gate(raw[:self.n], raw[self.n:], self.f_in, self.f_out)
+        return (y / 2.0 ** self.f_out).reshape(self.output.shape)
+
+
+def from_tts_gate(node, tensors, index, align_elems, ctx: HostContext):
+    """TtsGate: GateRoNode where the unit has GATE (``kernels.rowops.gate``) and the
+    call fits it, else the host op (libm)."""
+    from .tts_nodes import TtsGateNode
+    host = TtsGateNode.from_onnx_node(node, tensors, index, align_elems, ctx)
+    if not (enabled() and gate_enabled()):
+        return host
+    x, y = host.inputs[0], host.output
+    if any(t.dma or t.is_host or t.is_state for t in (x, y)):
+        return host
+    try:
+        sh = rs.gate_shifts(host.f_in, host.f_out)
+    except ValueError:
+        return host
+    nr = _flat_row(host.n * host.L, align_elems)
+    if not nr:
+        return host
+    pb, _bc = _pblock(tensors, f"rowops_p_gate_{host.f_in}_{host.f_out}", 0, 0, *sh, 1)
+    return GateRoNode(onnx_node=node, inputs=[x, pb, tables_tensor(tensors)], output=y, index=index,
+                      align_elems=align_elems, F=ctx.frac_bits, n=host.n, L=host.L, nr=nr, f_in=host.f_in,
+                      f_out=host.f_out, pb=pb)
 
 
 @dataclass
@@ -2147,6 +2310,7 @@ TTS_OVERRIDES = {
     "TtsLayerNorm": from_tts_layernorm,
     "TtsRowPrep":   from_tts_rowprep,
     "TtsSum":       from_tts_sum,
+    "TtsGate":      from_tts_gate,
     "TtsInterleave": from_tts_interleave,
     "TtsRelBand":   from_tts_rel_band,
 }

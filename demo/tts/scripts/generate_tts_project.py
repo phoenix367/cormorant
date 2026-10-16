@@ -165,6 +165,13 @@ def rowops_default() -> bool:
     return enabled()
 
 
+def split_avg_default() -> bool:
+    """The chunk's ÷ 3 stage averages split in two on the row-ops unit (its SCALE flag,
+    doc/plans/RPU_PLAN.md §14.4) where the platform has it (kernels.rowops.scale)."""
+    from src.rowops_nodes import enabled, scale_enabled
+    return enabled() and scale_enabled()
+
+
 def entry_graphs(assets: str, W: dict = None, vsmx: bool = None, rowops: bool = None) -> list:
     """[(entry, OnnxGraph)] of libpiper_tts.so in project order: "chunk", then
     "encode_<T>" for every bucket of ENC_BUCKETS.  Also what
@@ -182,7 +189,8 @@ def _entries(assets: str, W: dict = None, vsmx: bool = None, rowops: bool = None
     doc = json.load(open(os.path.join(assets, "exponents.json")))
     if "encoder" not in doc:
         raise SystemExit("exponents.json has no \"encoder\" exponents: run piper_study.py encoder first")
-    model = PiperChunkFrontend(W, doc["exponents"], name="piper_lessac_medium").entry()
+    model = PiperChunkFrontend(W, doc["exponents"], name="piper_lessac_medium",
+                               split_avg=split_avg_default()).entry()
     g = OnnxGraph(model, fuse_act=True, s2d_stem=True)
     # the encoder's MatMul weights live in ConvKernel's x image of a kernel
     # width: the largest bucket plans the widths, the others reuse them, so
@@ -247,6 +255,9 @@ def main(argv=None) -> int:
                     "nodes": len(g.nodes), "encode_buckets": list(ENC_BUCKETS),
                     "encode_nodes": {n: len(eg.nodes) for n, eg in entries[1:]}, "vsmx": vsmx,
                     "rowops": rowops, "rel": vsmx and rowops,
+                    # the chunk's gates on the unit's GATE: its specification is chunk_forward(gate_q=True)
+                    "gate_q": any(type(sn).__name__ == "GateRoNode" for sn in g.nodes),
+                    "split_avg": split_avg_default(),
                     "missing_drivers": missing, "generated_s": round(time.time() - t0, 1)})
     json.dump(summary, open(os.path.join(out, "project.json"), "w"), indent=2)
     print(f"project: {out} ({len(g.nodes)} nodes, pool {summary['pool_bytes'] / 2**20:.1f} MiB, "

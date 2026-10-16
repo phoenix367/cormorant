@@ -12,7 +12,10 @@ Piper's TtsPrep — windowed rows, LeakyReLU, the re-rounding); bitstreams up to
 ``1cedaf2ed816`` lack it, ``de968ccc45da`` has it.  ``chains`` says whether
 its unit runs descriptor chains (the ``chain`` / ``chain_n`` registers,
 doc/plans/RPU_PLAN.md §13.3: one Start runs up to 16 jobs read from DDR);
-bitstreams up to ``de968ccc45da`` lack it.  Both need ``unit``.
+bitstreams up to ``de968ccc45da`` lack it.  ``gate`` says whether it has op
+10, GATE, and ``scale`` whether its COPY / ADDX take the SCALE flag (op bit 17)
+— doc/plans/RPU_PLAN.md §14: Piper's TtsGate and ÷ 3 stage averages; bitstreams
+up to ``33a799febc56`` lack both, ``04259a7af917`` has them.  All need ``unit``.
 
 JSON shape (only the fields this module reads)::
 
@@ -21,7 +24,9 @@ JSON shape (only the fields this module reads)::
         "rowops": {
           "unit": false,
           "fold": false,
-          "chains": false
+          "chains": false,
+          "gate": false,
+          "scale": false
         }
       }
     }
@@ -30,9 +35,10 @@ Platform selection as for the other kernels (``_matmul_hw_config``): the
 ``AXI_PLATFORM`` environment variable picks ``platforms/<name>.json``,
 default ``kv260``.  ``AXI_ROWOPS`` (``0`` / ``1``) overrides the JSON for
 the scheduler — ``1`` to generate for a bitstream with the unit before the
-platform file says so, ``0`` for one without it; ``AXI_ROWOPS_FOLD`` and
-``AXI_ROWOPS_CHAINS`` likewise for ``fold`` and ``chains`` (without the unit
-they are off whatever they say).  A missing or
+platform file says so, ``0`` for one without it; ``AXI_ROWOPS_FOLD``,
+``AXI_ROWOPS_CHAINS``, ``AXI_ROWOPS_GATE`` and ``AXI_ROWOPS_SCALE`` likewise
+for ``fold``, ``chains``, ``gate`` and ``scale`` (without the unit they are
+off whatever they say).  A missing or
 malformed field raises ``RowopsHwConfigError``.
 """
 from __future__ import annotations
@@ -70,9 +76,10 @@ def _flag(section, key: str, path, what: str, env_name: str) -> bool:
 
 
 def resolve(platform_name: str = None) -> Dict[str, object]:
-    """``{"ROWOPS_UNIT": bool, "ROWOPS_FOLD": bool, "ROWOPS_CHAINS": bool}``
-    for the given platform (``None``: ``AXI_PLATFORM``, else ``kv260``),
-    ``AXI_ROWOPS`` / ``AXI_ROWOPS_FOLD`` / ``AXI_ROWOPS_CHAINS`` applied."""
+    """``{"ROWOPS_UNIT": bool, "ROWOPS_FOLD": bool, "ROWOPS_CHAINS": bool, "ROWOPS_GATE":
+    bool, "ROWOPS_SCALE": bool}`` for the given platform (``None``: ``AXI_PLATFORM``, else
+    ``kv260``), ``AXI_ROWOPS`` / ``AXI_ROWOPS_FOLD`` / ``_CHAINS`` / ``_GATE`` / ``_SCALE``
+    applied."""
     if platform_name is None:
         platform_name = os.environ.get("AXI_PLATFORM", _DEFAULT_PLATFORM)
     path = _PLATFORMS_DIR / f"{platform_name}.json"
@@ -91,14 +98,21 @@ def resolve(platform_name: str = None) -> Dict[str, object]:
     unit = _flag(section, "unit", path, "the row-ops unit", "AXI_ROWOPS")
     fold = _flag(section, "fold", path, "the unit's op 9, FOLD", "AXI_ROWOPS_FOLD")
     chains = _flag(section, "chains", path, "the unit's descriptor chains", "AXI_ROWOPS_CHAINS")
-    return {"ROWOPS_UNIT": unit, "ROWOPS_FOLD": unit and fold, "ROWOPS_CHAINS": unit and chains}
+    gate = _flag(section, "gate", path, "the unit's op 10, GATE", "AXI_ROWOPS_GATE")
+    scale = _flag(section, "scale", path, "the unit's SCALE flag", "AXI_ROWOPS_SCALE")
+    return {"ROWOPS_UNIT": unit, "ROWOPS_FOLD": unit and fold, "ROWOPS_CHAINS": unit and chains,
+            "ROWOPS_GATE": unit and gate, "ROWOPS_SCALE": unit and scale}
 
 
 _CFG = resolve()
 
-# Exported: whether the platform's bitstream has the row-ops unit, its FOLD op and its chains.
+# Exported: whether the platform's bitstream has the row-ops unit, its FOLD op, its chains,
+# its GATE op and its SCALE flag.
 ROWOPS_UNIT: bool = _CFG["ROWOPS_UNIT"]
 ROWOPS_FOLD: bool = _CFG["ROWOPS_FOLD"]
 ROWOPS_CHAINS: bool = _CFG["ROWOPS_CHAINS"]
+ROWOPS_GATE: bool = _CFG["ROWOPS_GATE"]
+ROWOPS_SCALE: bool = _CFG["ROWOPS_SCALE"]
 
-__all__ = ("ROWOPS_UNIT", "ROWOPS_FOLD", "ROWOPS_CHAINS", "RowopsHwConfigError", "resolve")
+__all__ = ("ROWOPS_UNIT", "ROWOPS_FOLD", "ROWOPS_CHAINS", "ROWOPS_GATE", "ROWOPS_SCALE", "RowopsHwConfigError",
+           "resolve")

@@ -104,7 +104,8 @@ def main(argv=None) -> int:
         if ref is not None:
             job = ref.prepare_speech(SpeechRequest(model=ref.model_id, input=text, seed=i))
             ref.front_end(job)
-            want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp) for zp in job.utterances])
+            want = np.concatenate([tb.pv.synthesize_chunked(W, E, zp, gate_q=bool(summary.get("gate_q", False)))
+                                   for zp in job.utterances])
             tb.write_wav(os.path.join(args.out, f"host_{i}.wav"), want)
             same = want.shape == pcm.shape and np.array_equal(want, pcm)
             rec["bit_exact"] = bool(same)
