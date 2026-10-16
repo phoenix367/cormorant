@@ -95,7 +95,7 @@
     "tokenizer": "assets/smolvlm-256m-instruct/tokenizer.json",
     "_tokenizer_note": "Host path; uploaded to <remote.dir>/smolvlm/tokenizer.json.",
     "cma_mb": 550,
-    "_cma_note": "The 511 MiB pool BO + the image buffer (520-530 MB measured); with --resident auto it swaps with SmolLM2-360M."
+    "_cma_note": "The 495 MiB pool BO + the image buffer (520-530 MB measured); with --resident auto it swaps with SmolLM2-360M."
   },
   "piper": {
     "lib": null,

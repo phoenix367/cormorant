@@ -319,7 +319,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              88 pytest modules, 1856 tests, all pass (test_bert_base.py
+  test_*.py              88 pytest modules, 1858 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -542,7 +542,10 @@ slots even though their node indices look disjoint. Coloring is still
 valid for the strictly-sequential case — every node-index interval is
 also an event-index interval.  Weights, then DMA states, precede the slot
 region; host-memory intermediates get their own arena coloured the same way
-(`_compute_host_layout`).
+(`_compute_host_layout`).  A slot of 64 KiB or more starts on a 4 KiB page of
+the pool (`bank_phase.page_start`): a kernel's bursts never straddle a page
+(MatmulKernel's GEMV linears ran 3–6 % slower on 64-byte-aligned weights,
+`../doc/plans/RPU_PLAN.md` §13.12).
 
 The Dag invariant *"if two tensors share a pool offset, their event
 intervals must be strictly disjoint"* is enforced by

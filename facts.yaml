@@ -205,7 +205,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds its FOLD op'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds ConvKernel''s y channel pattern'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
@@ -221,7 +221,7 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: '\(\+103, \+84, \+31\) → (?P<exact_calls>\d+) exact calls'}
+       regex: 'one refinement round \(\+211\) → (?P<exact_calls>\d+) exact calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
@@ -672,12 +672,15 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
-  value: {bert: 216, smollm2_135m: 297, smollm2_360m: 758, smolvlm_256m: 512, piper: 53}
+  value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: 62bfb4d
-    date: 2026-10-13
-    how: "regenerated for RPU_PLAN B2 (2026-10-13): SmolLM2-135M 296.8, SmolLM2-360M 758.7, SmolVLM 512.3 MiB — the R5's
+    commit: dd0b420
+    date: 2026-10-16
+    how: "regenerated for RPU_PLAN A2.5 (2026-10-16, bitstream 33a799febc56: the y pattern, the descriptor chains,
+          the decode prep on the unit, slots of 64 KiB or more on 4 KiB pages): SmolLM2-135M 298.6, SmolLM2-360M 757.6,
+          SmolVLM 495.4 (the in-place merges and the page alignment), Piper 54.1, BERT 216.3 MiB;
+          regenerated for RPU_PLAN B2 (2026-10-13): SmolLM2-135M 296.8, SmolLM2-360M 758.7, SmolVLM 512.3 MiB — the R5's
           command ring is a buffer of its own, outside the pool; 2026-10-12 (80b1608),
           the projects regenerated for HOSTOPS_PLAN phases 4a-4b (the attention preps' staging states and cos / sin
           table, the row preps): SmolLM2-135M 293.6, SmolLM2-360M 758.0, SmolVLM 511.4, Piper 52.8, BERT 216 MiB (phase
@@ -1196,18 +1199,21 @@ facts:
 - id: piper.encode_ms
   kind: recorded
   title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
-  value: {ids20: 8.5, ids88: 24.1, ids400: 81.7}
+  value: {ids20: 8.3, ids88: 24.3, ids400: 81.7}
   tolerance: {rel: 0.03}                     # the docs round to the ms
   provenance:
-    date: 2026-10-15
-    how: "tts_board.py --profile on de968ccc45da (HOSTOPS_PLAN §11.7: the library regenerated with FOLD, which is in the
+    date: 2026-10-16
+    how: "tts_board.py on 33a799febc56 (RPU_PLAN §13.12: the library regenerated with the row preps, the relative-key
+          band and the attention prep as descriptor chains, the pool's large slots on pages): 20 / 60 / 88 / 162 / 268 /
+          400 ids 8.3 / 12.3 / 24.3 / 48.1 / 79.4 / 81.7 ms — unchanged within 3 %.  Before: tts_board.py --profile on
+          de968ccc45da (HOSTOPS_PLAN §11.7: the library regenerated with FOLD, which is in the
           chunk only; the encoder as of RPU_PLAN A1, 2026-10-13: the relative-key band and the transposes on the unit):
           20 / 60 / 88 / 162 / 268 / 400 ids 8.5 / 12.4 / 24.1 / 48.1 / 79.0 / 81.7 ms.  Before: tts_board.py on
           1cedaf2ed816 (HOSTOPS_PLAN phase 4b, §10.8: the encoder's residual LayerNorms, attention prep
           and row preps on the row-ops unit): 20 / 60 / 88 / 162 / 268 / 400 ids 9.5 / 14.4 / 28.4 / 56.8 / 92.1 / 95.8 ms
           (phase 3, the LayerNorms alone: 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0; f70ce632a97a: 15.7 / 50.6 / 162.0 at
           20 / 88 / 400)"
-    facts: {perf.bitstream_id: de968ccc45da}   # stale on another bitstream
+    facts: {perf.bitstream_id: 33a799febc56}   # stale on another bitstream
   fix: report
   mentions:
     - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
@@ -1262,12 +1268,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: de968ccc45da, dsp: 841, dsp_total: 1248, dsp_pct: 67, lut: 89547, lut_total: 117120, lut_pct: 76.5,
+  value: {bitstream: 33a799febc56, dsp: 841, dsp_total: 1248, dsp_pct: 67, lut: 90607, lut_total: 117120, lut_pct: 77.4,
           bram: 136, bram_total: 144, uram: 55, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-15
-    how: "Vivado placed utilization report of the 250 MHz design with the row-ops unit's FOLD op after the kernels'
+    date: 2026-10-16
+    how: "Vivado placed utilization report of the 250 MHz design with ConvKernel's y channel pattern and the row-ops
+          unit's descriptor chains (RPU_PLAN §13.10, /mnt/data/bitstreams/kv260_250_33a799febc56/: LUT 89 547 -> 90 607 —
+          ConvKernel +269, RowOps +743 —, FF 108 713 -> 109 798, no RAM or DSP added; WNS +0.022 ns); de968ccc45da
+          before it: the 250 MHz design with the row-ops unit's FOLD op after the kernels'
           area pass (HOSTOPS_PLAN §11, AREA_PLAN; /mnt/data/bitstreams/kv260_250_de968ccc45da/: LUT 93 969 -> 89 547,
           FF 113 020 -> 108 713, +8 DSP, BRAM and URAM unchanged; WNS +0.029 ns; the FOLD design before the area pass
           placed at 97 729 LUT and did not route); 1cedaf2ed816 before it: LUT 93 969, DSP 833 — the RowOpsKernel
@@ -1289,7 +1298,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: de968ccc45da}
+    facts: {perf.bitstream_id: 33a799febc56}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

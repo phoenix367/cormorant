@@ -274,7 +274,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1856 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1858 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -544,6 +544,15 @@ Bit-exact by construction — only addresses move (`test/test_bank_phase.py`:
 the phases, the old packing with `bank_phase=False`, the growth bound, a
 multi-entry project, the host emulation).  ResNet-18: 25 groups, all distinct,
 +4 KB of pool; MobileNet v2: 43 groups, +0 KB.
+
+**Pages.**  Every slot of 64 KiB or more — weights, states and
+intermediates alike, with bank phases on or off — starts on a 4 KiB page of
+the pool (`bank_phase.page_start`): a kernel's bursts then never straddle a
+page.  Found on RPU_PLAN A2.5: the decode prep's small parameter blocks
+shifted SmolLM2-360M's weight images from 1 KiB to 64-byte alignment and
+MatmulKernel's GEMV linears ran 3–6 % slower (one in four of its 1 KiB bursts
+split at a 4 KiB boundary); on pages its decode is 1.3 ms per token faster
+than with the old packing, at < 4 KiB per large slot.
 
 ### Key data flow
 
@@ -1455,7 +1464,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (455 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (466 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1479,7 +1488,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 300 predicted.
+  board (0.12 ms at 250 MHz), 34 289 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

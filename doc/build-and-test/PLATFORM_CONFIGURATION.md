@@ -224,7 +224,7 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
       "max_line_buf_cols":      64,  "max_line_buf_rows":     16,
       "max_acc_persist_entries": 65536,
       "max_m_per_group":         4,
-      "y_pattern":               false
+      "y_pattern":               true
     },
     "matmul": {
       "impl":   "rtl",
@@ -238,7 +238,7 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
     "rowops": {
       "unit": true,
       "fold": true,
-      "chains": false
+      "chains": true
     },
     "pool": {
       "tile_c":            8,

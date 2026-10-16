@@ -49,7 +49,7 @@ op (`src/host_nodes.py`: numpy reference + C helper), a pattern fusion
 - DMA pool (int16 weights, one copy — decode reads the prefill image
   through GEMV; KV caches; intermediates) against `cma=1000M` (~954 MiB
   usable, idle CmaFree ~1011 MB).  Pools served today: BERT 216, SmolLM2-135M
-  297, SmolLM2-360M 758, SmolVLM 512 MiB.  Above ~920 MiB: NO-GO without a
+  299, SmolLM2-360M 758, SmolVLM 495 MiB.  Above ~920 MiB: NO-GO without a
   CMA change.  Above what is left beside the others: it swaps under
   `--resident auto` (a warm swap costs 1–2 s, a cold load 20–55 s).
 - Board: 3.9 GB RAM, no swap — host tensors (float32 residual, embedding

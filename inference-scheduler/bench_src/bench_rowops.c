@@ -48,6 +48,11 @@ static void run_once(XRowopskernel *k, uint64_t ap, uint64_t bp, uint64_t cp, ui
     XRowopskernel_Set_bq_sh(k, 0u);
     XRowopskernel_Set_win_lo(k, r[11]);
     XRowopskernel_Set_win_hi(k, r[12]);
+#ifdef XROWOPSKERNEL_CTRL_ADDR_CHAIN_N_DATA   /* one job, not a chain (RPU_PLAN §13.3): the registers
+                                               * keep what the last program wrote */
+    XRowopskernel_Set_chain(k, (u64)0);
+    XRowopskernel_Set_chain_n(k, 0u);
+#endif
     XRowopskernel_Start(k);
     while (!XRowopskernel_IsDone(k)) {}
 }

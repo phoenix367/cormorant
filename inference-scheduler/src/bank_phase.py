@@ -25,8 +25,26 @@ BANK_STRIDE = 1 << BANK_SHIFT           # 16 KB between phases
 BANK_PERIOD = BANK_STRIDE * BANK_COUNT  # 64 KB: the same bank again
 
 BANK_MIN_STREAM = BANK_STRIDE           # a stream shorter than a bank phase is not worth padding for
+# A slot of PAGE_MIN_SLOT bytes or more starts on a PAGE boundary of the pool: a
+# kernel's bursts (MatmulKernel's GEMV streams its weight image in 1 KiB bursts)
+# then never straddle a 4 KiB boundary, which would split each such burst in two
+# — a 64-byte-aligned weight image ran SmolLM2-360M's decode linears 3-6 %
+# slower than a 1 KiB-aligned one (RPU_PLAN §13.12)
+PAGE = 4096
+PAGE_MIN_SLOT = 64 * 1024
 
-__all__ = ["BANK_COUNT", "BANK_MIN_STREAM", "BANK_PERIOD", "BANK_STRIDE", "bank_phase",
+
+def page_start(cursor: int, alloc: int, base_elems: int, bpe: int) -> int:
+    """``cursor`` (elements, relative to the region at ``base_elems``) moved up
+    to a PAGE boundary of the pool for a slot of ``alloc`` elements of at
+    least PAGE_MIN_SLOT bytes; unchanged for a smaller one."""
+    if alloc * bpe < PAGE_MIN_SLOT:
+        return cursor
+    byte = (base_elems + cursor) * bpe
+    return (-(-byte // PAGE) * PAGE) // bpe - base_elems
+
+__all__ = ["BANK_COUNT", "BANK_MIN_STREAM", "BANK_PERIOD", "BANK_STRIDE", "PAGE", "PAGE_MIN_SLOT", "bank_phase",
+           "page_start",
            "place_slots", "vectorop_groups"]
 
 
@@ -100,6 +118,7 @@ def place_slots(slots: Sequence[Tuple[int, Sequence[str]]],
     starts: List[int] = []
     cursor = 0
     for i, (alloc, _names) in enumerate(slots):
+        cursor = page_start(cursor, alloc, base_elems, bpe)
         cons = partners.get(i, ())
         if not cons:
             starts.append(cursor)

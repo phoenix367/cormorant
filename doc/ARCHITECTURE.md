@@ -6,7 +6,7 @@ K26, driven by the Arm cores of the same device.  This document describes
 the hardware in the order of an FPGA architecture document: requirements,
 top-level structure, clocks and reset, memory, datapath, interfaces,
 verification, and implementation.  The numbers are those of the production
-bitstream `de968ccc45da` unless a section says otherwise.
+bitstream `33a799febc56` unless a section says otherwise.
 
 ![Cormorant system architecture](images/architecture.svg)
 
@@ -600,8 +600,8 @@ The depths follow three rules:
 | buffers | one contiguous pool per model library, from CMA (`cma=1000M`) as an XRT buffer object, carved by the scheduler into weights, persistent states and coloured intermediate slots |
 | caching | the pool is mapped cacheable for the A53; the runtime cleans before a kernel reads and invalidates after a kernel writes; the R5's command ring is uncached |
 
-The chat server's model pools are 216 MiB (BERT), 297 MiB (SmolLM2-135M),
-758 MiB (SmolLM2-360M) and 512 MiB (SmolVLM-256M).  That is more than the
+The chat server's model pools are 216 MiB (BERT), 299 MiB (SmolLM2-135M),
+758 MiB (SmolLM2-360M) and 495 MiB (SmolVLM-256M).  That is more than the
 CMA area together, so the server keeps what fits resident and swaps the
 rest.  A large pool can fail to allocate after uploads and builds even with
 enough free CMA.  `inference-scheduler/src/remote/cma.py` drops the page
@@ -1137,7 +1137,7 @@ resources (block RAM, URAM, CLBs) and inside it on LUTs:
 
 | resource | used | available | utilization | against 70–80 % |
 |---|---:|---:|---:|---|
-| CLB LUTs | 89 547 | 117 120 | 76.5 % | within, near the top |
+| CLB LUTs | 90 607 | 117 120 | 77.4 % | within, near the top |
 | — as logic | 69 715 | | 59.5 % | |
 | — as distributed RAM | 18 620 | 57 600 (LUTM) | 32.3 % | |
 | — as shift registers | 1 212 | 57 600 (LUTM) | 2.1 % | |

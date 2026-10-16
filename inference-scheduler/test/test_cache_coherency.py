@@ -69,6 +69,8 @@ _KERNEL_CALLS = {
     # MatMul on ConvKernel, one call per batch item (x, x_off, weight, w_off,
     # y, y_off, ...); asynchronous like run_conv — the next call waits.
     "run_conv_at":   ("KERNEL_CONV",     (0, 2), (4,), False),
+    # the same, writing y through the y channel pattern (+ y_cs, y_cn, y_gs)
+    "run_conv_at_y": ("KERNEL_CONV",     (0, 2), (4,), False),
     "run_pool":      ("KERNEL_POOL",     (0,), (1,), False),
     # the softmax unit (a, a_off, c, c_off, ...; src/smx_nodes.py)
     "run_softmax":   ("KERNEL_VECTOROP", (0,), (2,), False),
@@ -87,7 +89,7 @@ _TOKEN = re.compile(
     # previous call — a no-op when nothing of that lane is in flight yet.
     r"|if\s*\(\s*_i\s*\)\s*kernel_wait\((?P<cwait>KERNEL_\w+)\)"
     r"|kernel_wait\((?P<wait>KERNEL_\w+)\)"
-    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at|conv|pool|softmax|rowops)|llm_ro_vimage)"
+    r"|\b(?P<run>run_(?:op_act|op|matmul_at|matmul|conv_at_y|conv_at|conv|pool|softmax|rowops)|llm_ro_vimage)"
     r"\((?P<args>[^;]*)\);"
     r"|\bllm_cache_flush(?:_rows)?\(\s*(?P<sflush>\w+)\s*,"
     r"|INFERENCE_PROF_BEGIN\((?P<begin>\d+)u\)"

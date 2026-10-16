@@ -2131,7 +2131,7 @@ class _SourceMixin:
             if sn.index in self._ro_chains:              # one Start per chain of <= 16 jobs
                 jobs = sum(c.count for c in cs)
                 last = jobs - 16 * ((jobs - 1) // 16)
-                mean = sum(u * c.count for u, c in zip(us, cs)) / jobs
+                mean = sum(u * c.count for u, c in zip(us, cs, strict=True)) / jobs
                 adj = pm.chain_adjust_us(last) if pm is not None else 0.0
                 out[sn.index] = max(0, int(mean * last + adj))
                 continue

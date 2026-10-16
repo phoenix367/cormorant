@@ -916,7 +916,7 @@ they are replaced by §13.6's.
 | **A2.2 — RowOps chains** | §13.3 in RTL, the C++ oracle (`rowops_ref.h`) running a list, random chains in the testbench (mixed ops, N 1 … 16, P loads and P_KEEP across jobs, windows), 2 chain fixtures — **DONE 2026-10-15 (§13.9)** | fixtures + 300 random chains × 4 seeds at every timing; a chain's cycles = its jobs' + the fetch (≈ 0.4 µs); OOC WNS ≥ 0 |
 | **A2.3 — bitstream** | `build_hw_kv260`, `sim_hw` with a strided conv case and a chain — **DONE 2026-10-16 (§13.10): `33a799febc56`, WNS +0.022 ns, 90 607 LUT, `sim_hw` 116 / 116** | WNS ≥ 0 at 4 ns (today +0.029); LUT ≤ 92 k; `sim_hw` 100 % |
 | **A2.4 — scheduler** | the pattern behind `kernels.conv.y_pattern`, chains behind `kernels.rowops.chains`, the decode prep on the unit, host_emu, the chain term in the perf model and `calib_runner` — **DONE 2026-10-16 (§13.11)** | every suite; sched-checks bit-exact (135M / 360M / VLM, BERT, Piper); the generated projects = the simulation on the host emulation |
-| **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
+| **A2.5 — board** | gates, the 72 benchmarks, the perf campaign, the libraries, the chat server (R5) — **DONE 2026-10-16 (§13.12): production `33a799febc56`** | bit-exact everywhere; 135M decode ≤ 48.5 ms, 360M ≤ 129, 135M prefill 256 ≤ 402, SmolVLM image ≤ 1.63 s; nothing slower; the R5 path's batches per token −30 |
 
 Order: A2.0 first (no bitstream; it also builds the output-view machinery
 the pattern needs), A2.1 and A2.2 in parallel, then one build.  Effort: A2.0
@@ -1196,3 +1196,78 @@ its jobs did — A2.5's campaign measures it.
   4 runs × 17 logits, the re-open identical) bit-exact with the simulation;
   Piper (`tts_host_emu --incoherent`: both utterances' PCM, every encode
   bucket, the duration predictor) bit-exact with the specification.
+
+### 13.12 A2.5 results — the board and production (2026-10-16)
+
+**The bitstream on the board.**  `33a799febc56` loads with `de968ccc45da`'s
+overlay (the HWH differs only in its timestamp and the order of two clock
+connections); the five new registers write and read back
+(`y_cs` / `y_cn` / `y_gs`, `chain`, `chain_n`).  The model set: **159 / 159**.
+The 72 kernel benchmarks against `de968ccc45da`'s baseline: four cases over
+2 % in one run, none of them in the next two (the flags move from run to run:
+`FC-1x1280x1001-packed`'s +11 % is the known bimodal case); the calibration
+says the same — the 1702 calls both campaigns measured: median +0.05 %, p90
++1.0 %.  Recorded as the baseline of `33a799febc56`.
+
+**The campaign** (`perf_models/kv260/33a799febc56.*`): `cases` with the flags
+on (1745: 1146 shipped calls, 569 grid, 30 chain cases), two passes of 62 s,
+one refinement round (+211) → 1926 exact calls, repeat spread median 0.10 %.
+The chain term: a job inside a chain −1.98 µs against the same call alone
+(its register writes, Start and poll), a chain +0.96 µs (30 points over 6
+calls, max residual 3 µs).  The call floor moved 1.82 → 1.87 µs:
+`CALL_OVERHEAD` 455 → 466 with `RTL_CONV_BOARD["ONE"]` / `RTL_COEF["one"]` −11
+— the sums unchanged, and the five libraries regenerate byte-identical with
+the new constants.  The R5 BSP rebuilt for the bitstream
+(`/mnt/data/cormorant_repro/rpu_bsp/33a799febc56`, the bases and interrupt
+lines as before).
+
+**Two traps on the way** (A53-driven A/B runs, 360M):
+- **Stale chain registers.**  A library generated before A2 never writes
+  `chain` / `chain_n` (nor the y pattern): after an A2 library left a chain
+  of 12 behind, every row-ops "job" of the old library started those 12
+  stale descriptors — its prefill 256 then measured 963 ms instead of
+  1 066 and its outputs were wrong (unchecked in those runs).  Zeroing the
+  registers before each old run gave the true baseline (the A2.0 and an A2
+  library without the new features agree bit for bit and in time).  As
+  §13.7 says: no library or project generated before A2 may run on this
+  bitstream; `bench_rowops.c` now writes `chain_n = 0` too (`calib_runner`'s
+  R cases since A2.4).
+- **Weight alignment.**  With the A2 features the 360M decode first measured
+  *slower* (+1.9 ms per token than the same code without them): the decode
+  prep's small parameter blocks shifted every later weight image from 1 KiB
+  to 64-byte alignment, and MatmulKernel's GEMV linears (1 KiB bursts, one
+  in four now split at a 4 KiB boundary) ran 3–6 % slower — the profile:
+  the prep −139 ms over 32 steps, `d` / `g` / `u` / `o` / `q` +26 … +54 µs a
+  call.  Slots of 64 KiB or more now start on a 4 KiB page
+  (`bank_phase.page_start`): the 360M without the A2 features 130.0 → 128.7
+  ms per token, prefill 256 1 073 → 1 050 ms; with them 124.0 / 1 039.
+
+**Production** (R5 driving, deep idle off; the A2.0 libraries with the
+registers zeroed first; every A2 library bit-exact on the board, its library
+check through ctypes and re-open included):
+
+| library | decode before → A2 | prefill 16 / 64 / 256 before → A2 | image |
+|---|---|---|---|
+| SmolLM2-135M | 51.90 → **49.01 ms** (−5.6 %) | 84 / 101 / 402 → 80 / 97 / 393 ms | |
+| SmolLM2-360M | 134.34 → **128.07** (−4.7 %) | 195 / 240 / 1054 → 190 / 233 / 1025 | |
+| SmolVLM-256M | 51.80 → **48.79** (−5.8 %) | 84 / 102 / 403 → 80 / 97 / 395 | 1621 / 1616 → 1620 / 1603 ms |
+| Piper | | | chunk 180–188 ms, RTF 0.136 / 0.170, encode 400 ids 81.7 ms (unchanged), PCM bit-exact |
+
+§13.6's gates: 360M decode ≤ 129 ✓, 135M prefill 256 ≤ 402 ✓, SmolVLM image
+≤ 1.63 s ✓, bit-exact everywhere ✓; 135M decode ≤ 48.5 ✗ by 0.5 ms — the
+gate was set on 2026-10-15's 50.5 ms, today's baseline is 51.9 (the same
+session's A/B: −2.9 ms, more than §13.5's −2.2).  The decode prep on the
+unit and the chains are worth 3–6 ms per token, the in-place prefill merges
+4–29 ms per prefill; the vision encoder's patterned P·V and chained prep
+gain little (−1 … −13 ms an image).  Not measured: the R5's batches per
+token.  The pools: 135M 298.6, 360M 757.6, SmolVLM 495.4, Piper 54.1, BERT
+216.3 MiB.
+
+**Deployed** (2026-10-16 16:39 local): the five libraries installed
+(`llm_board.py` / `tts_board.py`, `deploy.py --regenerate` for BERT), the chat
+server restarted with the R5 (all five models ready), deep idle back on as the
+soak.  `platforms/kv260.json`: `kernels.conv.y_pattern` and
+`kernels.rowops.chains` true; `bitstream_config_kv260.json` (local) names the
+archive `/mnt/data/bitstreams/kv260_250_33a799febc56/`.  Still to re-measure
+on this bitstream (the fact registry's warnings): the CNN demos, YOLO and
+stereo quality, the RealSense demo and the cost model's board fit.

@@ -18,12 +18,23 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/de968ccc45da` is the production design (2026-10-15, HOSTOPS_PLAN §11 and AREA_PLAN:
+`kv260/33a799febc56` is the production design (2026-10-16, RPU_PLAN §13 track A2: `de968ccc45da`'s
+with ConvKernel's y channel pattern and the row-ops unit's descriptor chains, every existing call as
+fast as before — the 1702 calls both models measured: median +0.05 %, p90 +1.0 %): `cases` 1745 (the
+shipped calls of the libraries with `kernels.conv.y_pattern` and `kernels.rowops.chains` — the decode
+steps' attention prep on the unit among them —, the space-filling set, the 30 chain cases), one
+refinement round (+211) → **1926 exact calls**, repeat spread median 0.10 %.  Families (train /
+held-out p90): conv 2.8 / 26.6 %, conv-dw 2.0 / 15.0 %, conv-mm 3.4 / 34.3 %, mm-gemv 4.9 / 18.8 %,
+mm-tiled 1.5 / 6.3 %, pool 3.2 / 40.9 %, vecop 0.5 / 10.1 %, vecop-div 0.6 / 7.0 %, vecop-smx (55
+calls) and rowops (222 calls, train median 2.8 %, no held-out).  The chain term (`rowops_chain`, 30
+points over 6 calls): a job inside a chain −1.98 µs against its call alone, a chain +0.96 µs.
+
+`kv260/de968ccc45da` was the production design before (2026-10-15, HOSTOPS_PLAN §11 and AREA_PLAN:
 `1cedaf2ed816`'s with the row-ops unit's op 9, FOLD — Piper's int16 `TtsPrep` on the unit — and the
 kernels' area pass, every kernel call as fast as before): `cases` 1703 (the shipped calls with
 `kernels.rowops.fold`, the unit's 28 FOLD calls new) plus the 179 ConvKernel refinement calls of
 `1cedaf2ed816`'s list (as `8599aa7a5f12` began from `588d721997cb`'s), two passes of 68 s, three
-refinement rounds (+103, +84, +31) → **2100 exact calls**, repeat spread median 0.069 %.  Families
+refinement rounds (+103, +84, +31) → 2100 exact calls, repeat spread median 0.069 %.  Families
 (train / held-out p90): conv 2.9 / 26.6 %, conv-dw 1.9 / 15.3 %, conv-mm 3.2 / 36.9 %, mm-gemv 4.8 /
 18.3 %, mm-tiled 1.6 / 7.2 %, pool 4.3 / 43.1 %, vecop 0.4 / 23.5 %, vecop-div 0.8 / 8.2 %, vecop-smx
 (55 calls) and rowops (210 calls, train median 2.5 %, no held-out).  `perf_calibrate.py simulate`

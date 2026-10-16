@@ -202,9 +202,9 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
   1000, prefill 0.58 / 1.04 / 3.08 s, CMA used 736–740 MB.
 
 **CMA budget** (`cma=1000M`, ~954 MiB usable, idle CmaFree ~1011 MB, less
-with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 297,
-SmolLM2-360M 758, SmolVLM 512 MiB.  The backend's `cma_mb` = measured CMA
-drop + margin (297 → 330, 758 → 775, 511 → 550); `--resident auto` evicts
+with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 299,
+SmolLM2-360M 758, SmolVLM 495 MiB.  The backend's `cma_mb` = measured CMA
+drop + margin (299 → 330, 758 → 775, 495 → 550); `--resident auto` evicts
 least-recently-used models while CmaFree < `cma_mb` + 32 and retries a failed
 load once after evicting the rest — a pool that fits beside nothing swaps
 with every model (warm swap 1–2 s, cold from SD card 21–59 s).  An

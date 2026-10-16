@@ -699,12 +699,15 @@ class _CoreMixin:
 
     def _place(self, slots, base_elems=0, fixed=None):
         """Start offsets of slots [(alloc_elems, [names])] laid end to end,
-        with the bank phases of _bank_groups kept apart (place_slots)."""
-        from ..bank_phase import place_slots
+        with the bank phases of _bank_groups kept apart (place_slots); a slot
+        of 64 KiB or more starts on a 4 KiB page (bank_phase.page_start)."""
+        from ..bank_phase import page_start, place_slots
         groups = self._bank_groups
         if not groups:
             starts, off = [], 0
+            bpe = self._dtype.bytes_per_elem
             for alloc, _names in slots:
+                off = page_start(off, alloc, base_elems, bpe)
                 starts.append(off)
                 off += alloc
             return starts

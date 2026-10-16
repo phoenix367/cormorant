@@ -13,7 +13,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 
 import host_emu
-from src.bank_phase import BANK_PERIOD, BANK_STRIDE, bank_phase, place_slots
+from src.bank_phase import BANK_PERIOD, BANK_STRIDE, PAGE, PAGE_MIN_SLOT, bank_phase, page_start, place_slots
 from src.codegen import CodeGenerator
 from src.codegen.multi import MultiEntryGenerator
 from src.graph import OnnxGraph
@@ -56,6 +56,42 @@ class TestPlaceSlots(unittest.TestCase):
     def test_unconstrained_slots_pack(self):
         slots = [(100, ["a"]), (200, ["b"]), (300, ["c"])]
         self.assertEqual(place_slots(slots, [], 2), [0, 100, 300])
+
+    def test_large_slots_start_on_a_page(self):
+        """A slot of PAGE_MIN_SLOT bytes or more starts on a 4 KiB page of the
+        pool (RPU_PLAN §13.12: MatmulKernel's 1 KiB GEMV bursts then never
+        straddle a page); a smaller one keeps the 64-byte packing."""
+        big = PAGE_MIN_SLOT // 2                       # elements of 2 bytes
+        slots = [(32, ["a"]), (big, ["b"]), (32, ["c"]), (big, ["d"])]
+        st = place_slots(slots, [], 2)
+        self.assertEqual(st[0], 0)
+        self.assertEqual(st[1], PAGE // 2)                 # 64 bytes in: moved to the page
+        self.assertEqual(st[2], st[1] + big)               # small: packed
+        self.assertEqual((st[3] * 2) % PAGE, 0)
+        # relative to a region that does not start on a page: the absolute pool offset counts
+        self.assertEqual(((page_start(0, big, 96, 2) + 96) * 2) % PAGE, 0)
+        self.assertEqual(page_start(5, big // 2 - 1, 96, 2), 5)  # just below the threshold
+
+    def test_layout_pages_large_weights(self):
+        """The pool layout: a large weight after a small one starts on a page,
+        with bank phases on or off."""
+        n = 64 * 1024
+        rng = np.random.default_rng(3)
+        ws = (rng.standard_normal(24) * 0.5).astype(np.float32)
+        wb = (rng.standard_normal(n) * 0.5).astype(np.float32)
+        g = helper.make_graph(
+            [helper.make_node("Add", ["x", "ws"], ["t"]), helper.make_node("Add", ["y", "wb"], ["u"])],
+            "pages", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [24]),
+                      helper.make_tensor_value_info("y", TensorProto.FLOAT, [n])],
+            [helper.make_tensor_value_info("t", TensorProto.FLOAT, [24]),
+             helper.make_tensor_value_info("u", TensorProto.FLOAT, [n])],
+            initializer=[numpy_helper.from_array(ws, "ws"), numpy_helper.from_array(wb, "wb")])
+        m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 13)])
+        for bp in (True, False):
+            cg = CodeGenerator(OnnxGraph(m), model_path="m.onnx", bank_phase=bp)
+            layout, _total = cg._compute_pool_layout()
+            off = {name: o for name, o, _a in layout}
+            self.assertEqual((off["wb"] * 2) % PAGE, 0, bp)
 
     def test_three_streams_get_three_phases(self):
         k = 64 * 1024                     # 128 KB slots: multiples of the bank period

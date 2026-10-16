@@ -34,6 +34,8 @@ _FN = {
     "run_matmul_at": ("MatmulKernel", 6, FIELDS["MatmulKernel"]),
     "run_conv":      ("ConvKernel", 4, FIELDS["ConvKernel"]),
     "run_conv_at":   ("ConvKernel", 6, FIELDS["ConvKernel"]),
+    # the y channel pattern's registers are no keys (the cycles do not depend on them)
+    "run_conv_at_y": ("ConvKernel", 6, FIELDS["ConvKernel"] + ("_y_cs", "_y_cn", "_y_gs")),
     "run_pool":      ("PoolKernel", 2, FIELDS["PoolKernel"]),
     # the softmax unit (a, a_off, c, c_off, ...); its scale / mask registers are no keys
     "run_softmax":   ("VectorOPKernel", 4, ("size", "op", "outer", "a_inc", "b_inc", "_cm", "_cfg",

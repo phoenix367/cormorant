@@ -395,8 +395,11 @@ class TestSimVsStudyFpgaDecode(TestSimVsStudy):
             g0 = OnnxGraph(fe.entry("decode"), fuse_act=True, s2d_stem=True)
             src0 = CodeGenerator(g0, model_path="llama_tiny_decode.onnx").generate_source()
         self.assertEqual(src0.count("llm_attn_merge(_o"), len(merges))
-        gp = OnnxGraph(fe.entry("prefill", 16), fuse_act=True, s2d_stem=True)
-        CodeGenerator(gp, model_path="llama_tiny_prefill.onnx")
+        # without ConvKernel's y channel pattern (kernels.conv.y_pattern) prefill keeps the copy
+        from src import _conv_hw_config
+        with mock.patch.object(_conv_hw_config, "CONV_Y_PATTERN", False):
+            gp = OnnxGraph(fe.entry("prefill", 16), fuse_act=True, s2d_stem=True)
+            CodeGenerator(gp, model_path="llama_tiny_prefill.onnx")
         self.assertFalse(any(sn.in_place for sn in gp.nodes if isinstance(sn, LlmAttnMergeNode)))
 
 
@@ -508,7 +511,8 @@ class TestHostEmulation(unittest.TestCase):
                     self.assertEqual(rc, 0, out[-3000:])
                     self.assertIn("test_inference PASSED", out)
             # a later generation without the flag: the graph's nodes are reset
-            CodeGenerator(g16, model_path="llama_tiny_prefill16.onnx")
+            with mock.patch.object(_conv_hw_config, "CONV_Y_PATTERN", False):
+                CodeGenerator(g16, model_path="llama_tiny_prefill16.onnx")
             self.assertFalse(any(sn.in_place for sn in merges))
             self.assertTrue(all(sn.y_pat is None for sn in g16.nodes if isinstance(sn, LlmAttnConvNode)))
 
