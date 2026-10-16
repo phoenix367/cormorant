@@ -261,6 +261,26 @@ process names — `pgrep -f 'vivado|xsim'` would match its own shell):
 pgrep -a -x 'vivado|xsimk|xelab|xvlog|vitis-run|vitis_hls' || echo "no Vivado / HLS job running"
 ```
 
+**Hang check — xvlog / xelab (Gate 3 and Gate 5).**  An *incremental*
+compile (`xvlog --incr`, Vivado's default for a simulation fileset) has hung
+three times at 100 % CPU with no output, on a stale database in the
+project's `.sim` directory (2026-10-15 conv_test, 2026-10-16 the hw_128
+`sim_hw` twice).  Both launch scripts now set the fileset's `INCREMENTAL`
+false (`hw/cormorant_hw_128/scripts/sim.tcl`,
+`hw/cormorant_test_stand/scripts/tcl/run_sim.tcl`), so the command line must
+not carry `--incr`; a full compile of the block design takes a few minutes.
+While a run is in the background, check it once it has run longer than
+expected — any hit is a hang, not a slow compile:
+
+```bash
+ps -eo pid,etimes,pcpu,args | awk '$4 ~ /unwrapped.*(xvlog|xelab)$/ && $2 > 600 {print "HUNG compile:", $0}'
+ps -eo args | grep -c '[x]vlog .*--incr'     # must print 0: the scripts disable incremental compiles
+```
+
+On a hang: kill the compile and its `vivado -mode batch` parent, move the
+project's `<project>.sim` directory aside (to `/mnt/data/cormorant_repro/tmp`),
+then run the target again.  Never wait it out — it does not finish.
+
 Run the test in the background and wait for the completion notice:
 
 ```bash
@@ -367,8 +387,8 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    make sim_hw_kv260
    ```
 
-   Pass: `##  TOTAL: 122 / 122 passed` and `##  ALL TESTS PASSED`
-   (VectorOPKernel 29, ConvKernel 19, MatmulKernel 10, PoolingKernel 19, RowOpsKernel 45)
+   Pass: `##  TOTAL: 123 / 123 passed` and `##  ALL TESTS PASSED`
+   (VectorOPKernel 29, ConvKernel 19, MatmulKernel 10, PoolingKernel 19, RowOpsKernel 46)
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
    in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).

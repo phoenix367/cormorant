@@ -1441,7 +1441,7 @@ operand.
 |---|---|---|
 | **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" — **DONE 2026-10-16 (§14.8): bit-exact, chunk 184.3 → 176.3 ms, the study GO** | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.208 dB, 22.7 dB: OFFLOAD_PLAN §2.2's VectorOP sums) |
 | **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis — **DONE 2026-10-16 (§14.9)** | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
-| **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
+| **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job — **DONE 2026-10-16 (§14.10): `04259a7af917`, WNS +0.027 ns, 91 805 LUT, 57 URAM, `sim_hw` 123 / 123** | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
 | **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
 | **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
 
@@ -1553,7 +1553,7 @@ for A3a.1–A3a.4:
   cycle; `ro_core` only routes op 10 to the stream unit and passes the flag.
 
 **Verification:**
-- **Fixtures.**  42 now: 6 new, among them a GATE sweep over every int16 on
+- **Fixtures.**  42 then (43 since A3a.2 split the sweep in two, §14.10): 6 new, among them a GATE sweep over every int16 on
   both sides and Piper's stage average.  The 36 earlier ones and the two
   chain fixtures are unchanged.
 - **Random runs.**  The random mix now holds 11 % GATE jobs and a third of
@@ -1595,6 +1595,71 @@ All three averages' second jobs come to ≈ 3.8 ms, as §14.5 estimated.
   and A3a.2's build is the gate that counts.
 
 **Next.**  A3a.2 is the bitstream with `sim_hw`: `ro_classes.svh` reads the
-manifest, so the 6 new fixtures join its run (122 cases).  A3a.3 then needs,
-besides the nodes, GATE and SCALE in `test/host_emu.py`'s C port of the
-unit.
+manifest, so the new fixtures join its run.  A3a.3 then needs, besides the
+nodes, GATE and SCALE in `test/host_emu.py`'s C port of the unit.
+
+### 14.10 A3a.2 results — `sim_hw` and the bitstream (2026-10-16)
+
+**`sim_hw`: 123 / 123** in 8 min 19 s (VectorOP 29, Conv 19, Matmul 10, Pool
+19, RowOps 46 = 43 fixtures + the table load + the 2 chains).
+
+Two things came first:
+- **The GATE sweep fixture was too large.**  At 16 × 4096 it had 128 KiB
+  images, over `ro_read_hex`'s 64 KiB limit.  It now runs as two jobs of
+  8 × 4096 with unpadded rows (43 fixtures).  The run that tried the
+  oversized one stopped on the AXI protocol checker's X-data fatal: the
+  kernel read DDR the testbench had never written.
+- **xvlog hung again.**  `xvlog --incr` sat at 100 % CPU with no output for
+  19 minutes on a stale incremental database in `cormorant_hw_128.sim`.
+  That is the third time, after the test stand's `conv_test` in A2.1.
+  - **The fix.**  Both launch scripts (`hw/cormorant_hw_128/scripts/sim.tcl`,
+    `hw/cormorant_test_stand/scripts/tcl/run_sim.tcl`) now set the
+    simulation fileset's `INCREMENTAL` false.  `xsim.compile.incremental`,
+    tried first, is not a property: `set_property -name` accepts it silently
+    and does nothing.
+  - **The cost.**  The full compile then took seconds.
+  - **The check.**  CLAUDE.md (Dependencies) and the kernel-verify skill
+    (Gate 3) now carry a command that flags an `xvlog` / `xelab` older than
+    10 minutes as hung.
+
+**The bitstream `04259a7af917`** (hw_128 at `5c21d4a` + the testbench
+change; the block design unchanged, so the HWH's address map equals
+`33a799febc56`'s):
+- **Result.**  `build_hw_kv260` in 131 min: **WNS +0.027 ns, WHS
+  +0.010 ns** at 4 ns, every net routed.
+- **The router worked harder than for production.**  Its first rip-up
+  iteration took 50 min (20 for `33a799febc56`), and it needed nine
+  iterations (four).  WNS ran −1.146 → −0.513 → −0.277 → −0.207 → −0.102 →
+  −0.070 → −0.043 → +0.026 ns, then +0.027 after the post-route physical
+  optimisation.
+- **Area.**  The congestion comes from the unit's two extra UltraRAMs and
+  the wider stream unit beside the column the other kernels share.
+
+| | `33a799febc56` | `04259a7af917` | Δ |
+|---|---:|---:|---:|
+| LUT (placed) | 90 607 | 91 805 | +1 198 |
+| FF | 109 798 | 111 099 | +1 301 |
+| RowOpsKernel LUT / FF | 34 083 / 27 427 | 35 337 / 28 673 | +1 254 / +1 246 (`ro_stream` 9 513 / 7 278) |
+| BRAM / URAM / DSP | 136 / 55 / 841 | 136 / 57 / 845 | 0 / +2 / +4 |
+
+**Paths** (the post-route physopt checkpoint, `a3_paths.txt` in the
+archive):
+- **The worst path is unchanged code**: ConvKernel's MAC-grid adder tree
+  (`u_en` lv1 → lv2) at +0.027 ns, then MatmulKernel's A-buffer writes and
+  the unit's NORM lanes at +0.048 ns.
+- **The new logic has more slack**: the B-side UltraRAM into the shared
+  multiplier +0.111 ns, the bypass into the rounding +0.132 ns.
+
+**The plan's gates:** WNS ≥ 0 ✓, LUT ≤ 93 k ✓, URAM ≤ 57 ✓ (the device's 64
+leave 7), `sim_hw` 100 % ✓.  The margin is as thin as production's
+(+0.022), and the next feature that adds area near the URAM column should
+expect a longer route.
+
+**Archived** in `/mnt/data/bitstreams/kv260_250_04259a7af917`: the bit, the
+HWH, the post-route timing and placed utilization reports, the unit's
+hierarchical utilization, the build log and the path query.  Before the
+build, the previous `cormorant_hw_128.runs` moved to
+`/mnt/data/cormorant_repro/tmp/old_runs_33a7`, and the retired HLS kernels'
+build outputs (880 MB) to `old_build_hls_kernels`: `/` had 1.6 GB free.
+Not on the board yet.  The board gates and the promotion are A3a.4's,
+after the scheduler (A3a.3).

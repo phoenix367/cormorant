@@ -370,6 +370,10 @@ paths the sigmoid UltraRAMs' outputs, as before — none in the operand
 muxes, the bypass or the saturation), 35 323 LUT (+1 134), 28 667 FF
 (+1 637), 6 RAMB36, 9 URAM (+2: the B-side table copies), 133 DSP (+4: the
 B-side interpolations); `ro_stream` 9 110 LUT, 7 233 FF, 4 URAM, 24 DSP.
+In context (bitstream `04259a7af917`, 2026-10-16): 35 337 LUT, 28 673 FF,
+6 RAMB36, 9 URAM, 133 DSP; the design closes 4 ns with WNS +0.027 ns /
+WHS +0.010 ns at 91 805 LUT and 57 / 64 URAM (a longer route: nine
+rip-up iterations, RPU_PLAN §14.10).
 
 ## 3. Performance
 
@@ -427,11 +431,12 @@ with phase 3.
   `rowops_spec.py` in 64- / 128-bit integer arithmetic — checked per case on
   the whole output region (every element, the zeroed tail lanes, no stray
   write), ap_done / interrupt behaviour, no traffic on the unused ID.
-- **Fixtures** `hw/test_data/rowops_test_data/` (42 cases: `manifest.txt`,
+- **Fixtures** `hw/test_data/rowops_test_data/` (43 cases: `manifest.txt`,
   `test_NN_{a,b,p,c}.hex` — every op, kinds, tails, the window, the
   broadcast and per-column parameter block, both norms, ROPE at HD 64,
   contiguous and strobed transposes; since RPU_PLAN A3a.1 GATE at f_in 9,
-  per column with a tail, and over every int16 on both sides (16 × 4096),
+  per column with a tail, and over every int16 on both sides (two jobs of
+  8 × 4096: the block-design testbench takes images of ≤ 64 KiB),
   and SCALE as Piper's stage average, a COPY with per-column G, the window
   and RELU, and a saturating int32 ADDX): written by `scripts/gen_fixtures.py`
   (run it from the scheduler's venv: it imports `rowops_spec`) from the
@@ -447,8 +452,8 @@ with phase 3.
   SCALE (2026-10-16; the random mix gives 11 % GATE jobs and a third of the
   COPY / ADDX jobs SCALE, inside its contract — int32 data from the small
   mode, chains never feed a SCALE job's int32 input from another job): the
-  42 fixtures, 300 random jobs and 300 random chains for seeds 1 … 4 at every
-  timing (12 × 644 cases).  Mutants caught: GATE's B-side mirror swapped,
+  fixtures (42 then; the sweep is two since A3a.2, 43), 300 random jobs and
+  300 random chains for seeds 1 … 4 at every timing (12 × 644 cases).  Mutants caught: GATE's B-side mirror swapped,
   tanh's sign dropped, G off by one, SCALE's RELU dropped (29 – 50 of 294
   cases fail each).
 - `--random N`: random jobs (all ops, kinds, shapes inside and at the

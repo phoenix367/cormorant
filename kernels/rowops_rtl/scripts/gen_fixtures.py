@@ -435,10 +435,11 @@ def build_cases():
     add(fold_case("fold_unaligned_rows", 3, 50, 2, 24, 3, 2, 0, 10, 3, (2, 47), pad=3))
 
     # 19. GATE (op 10, RPU_PLAN §14.3: Piper's TtsGate) — rowops_spec.gate_op per column
-    def gate_case(label, n, c1, prm, a, b, bcast):
+    def gate_case(label, n, c1, prm, a, b, bcast, strides=None):
         sh = np.array([prm[0] if bcast else prm[c] for c in range(n)], np.int64)
         out = {(0, i): [int(v) for v in rs.gate_op(a[i], b[i], sh[:, 2], sh[:, 3], sh[:, 4])] for i in range(c1)}
-        return Case(label, opword(OP["GATE"], b_en=True, bcast=bcast), n, c1, 1, strides_for(n, c1, I16, I16, I16),
+        return Case(label, opword(OP["GATE"], b_en=True, bcast=bcast), n, c1, 1,
+                    strides or strides_for(n, c1, I16, I16, I16),
                     {(0, i): [int(v) for v in a[i]] for i in range(c1)},
                     {(0, i): [int(v) for v in b[i]] for i in range(c1)}, prm, out, (I16, I16, I16))
     n, c1 = 256, 4
@@ -452,10 +453,14 @@ def build_cases():
     prm = [(0, 0, *rs.gate_shifts(int(f_in[c]), int(f_out[c]))) for c in range(n)]
     add(gate_case("gate_percol_tail100x2", n, c1, prm, rng.integers(-32768, 32768, (c1, n)),
                   rng.integers(-32768, 32768, (c1, n)), False))
-    # every int16 on both sides: a ascending, b descending (16 rows of 4096)
+    # every int16 on both sides: a ascending, b descending, as two jobs of 8 rows of 4096
+    # (unpadded rows: each image 64 KiB, the block-design testbench's largest region)
     allv = np.arange(-32768, 32768, dtype=np.int64)
-    add(gate_case("gate_sweep_65536", 4096, 16, [(0, 0, *rs.gate_shifts(10, 9))], allv.reshape(16, 4096),
-                  allv[::-1].reshape(16, 4096), True))
+    for h in range(2):
+        rows = slice(8 * h, 8 * h + 8)
+        add(gate_case(f"gate_sweep_{'lo' if h == 0 else 'hi'}", 4096, 8, [(0, 0, *rs.gate_shifts(10, 9))],
+                      allv.reshape(16, 4096)[rows], allv[::-1].reshape(16, 4096)[rows], True,
+                      strides=(8192, 65536, 8192, 65536, 8192, 65536)))
 
     # 20. SCALE (op bit 17): the sum times G before the rounding (rowops_spec.scaled_round)
     #     the Piper stage average: (T + y2) * round(2^19 / 3) >> 18, T = y0 + y1 int32
