@@ -241,8 +241,8 @@ Read by the scheduler only (`inference-scheduler/src/_rowops_hw_config.py`).
       "unit": true,
       "fold": true,
       "chains": true,
-      "gate": false,
-      "scale": false
+      "gate": true,
+      "scale": true
     },
     "pool": {
       "tile_c":            8,

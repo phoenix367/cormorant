@@ -34,8 +34,8 @@
       "unit": true,
       "fold": true,
       "chains": true,
-      "gate": false,
-      "scale": false
+      "gate": true,
+      "scale": true
     },
     "pool": {
       "tile_c":            8,

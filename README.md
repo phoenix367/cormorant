@@ -54,13 +54,13 @@ Piper figures are from 2026-10-01, at 100 MHz.
 | SmolLM2-135M-Instruct | **19.8 tokens/s** decode, 16-token prefill 0.08 s, 256-token prefill 0.41 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
 | SmolLM2-360M-Instruct | **7.6 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.06 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
 | SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 50 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
-| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.18 s** per 1.49 s of audio (real-time factor 0.13), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
+| Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
 
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
 audio samples are bit-exact with the scheduler's simulation.
-The FPGA design (`hw/cormorant_hw_128`, bitstream `33a799febc56`) uses 67 % of the DSPs
-(841 / 1248), 77.4 % of the LUTs (90 607 / 117 120), 136 / 144 BRAM and
-55 / 64 URAM.
+The FPGA design (`hw/cormorant_hw_128`, bitstream `04259a7af917`) uses 68 % of the DSPs
+(845 / 1248), 78.4 % of the LUTs (91 805 / 117 120), 136 / 144 BRAM and
+57 / 64 URAM.
 
 ---
 

@@ -205,7 +205,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds ConvKernel''s y channel pattern'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds the unit''s GATE op'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
@@ -675,9 +675,11 @@ facts:
   value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54}
   tolerance: 1                               # MiB: the docs round
   provenance:
-    commit: dd0b420
-    date: 2026-10-16
-    how: "regenerated for RPU_PLAN A2.5 (2026-10-16, bitstream 33a799febc56: the y pattern, the descriptor chains,
+    commit: 4e06d65
+    date: 2026-10-17
+    how: "verified for RPU_PLAN A3a.4 (2026-10-17, bitstream 04259a7af917, facts.py verify): Piper 54.3 MiB with GATE /
+          SCALE (the stage averages' int32 T temporaries in pool slots), the others as below; regenerated for RPU_PLAN
+          A2.5 (2026-10-16, bitstream 33a799febc56: the y pattern, the descriptor chains,
           the decode prep on the unit, slots of 64 KiB or more on 4 KiB pages): SmolLM2-135M 298.6, SmolLM2-360M 757.6,
           SmolVLM 495.4 (the in-place merges and the page alignment), Piper 54.1, BERT 216.3 MiB;
           regenerated for RPU_PLAN B2 (2026-10-13): SmolLM2-135M 296.8, SmolLM2-360M 758.7, SmolVLM 512.3 MiB — the R5's
@@ -970,12 +972,13 @@ facts:
   title: the board results of README "Results on the board", and where they are repeated
   value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.5, bert_ms: 266,
           smollm2_135m_tok_s: 19.8, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.6, smolvlm_image_s: 1.6,
-          piper_rtf: 0.13, mnist_convnet_ms: 0.114, mnist_lenet_ms: 1.266, yolov5n_ms: 47.9, yolov5n_fps: 20.9,
+          piper_rtf: 0.11, mnist_convnet_ms: 0.114, mnist_lenet_ms: 1.266, yolov5n_ms: 47.9, yolov5n_fps: 20.9,
           stereo_ms: 469, stereo_fps: 2.13, stereo320_ms: 160}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
     date: 2026-10-15
-    how: "the board window of HOSTOPS_PLAN §11.7 (5a.4) on de968ccc45da (the row-ops unit's FOLD after the kernels'
+    how: "piper_rtf re-measured on 04259a7af917 (RPU_PLAN §14.12, tts_board.py: the 6.88 s sentence at RTF 0.108,
+          the chunk 148 ms — GATE and SCALE); the rest: the board window of HOSTOPS_PLAN §11.7 (5a.4) on de968ccc45da (the row-ops unit's FOLD after the kernels'
           area pass; deep idle on as the soak of RPU_PLAN §11 leaves it, the A53's interrupt waits; every result
           bit-exact): image_classification ResNet-18 p50 20.02 ms, MobileNet v1 / v2 20.51 / 17.52 ms; BERT
           deploy_and_run 50 examples p50 266.3 ms (RPU_PLAN A1's transposes on the unit, 2026-10-13); llm_board
@@ -1199,11 +1202,13 @@ facts:
 - id: piper.encode_ms
   kind: recorded
   title: Piper's tts_encode on the board (ms, by phoneme ids), the text encoder before the first audio
-  value: {ids20: 8.3, ids88: 24.3, ids400: 81.7}
+  value: {ids20: 8.0, ids88: 23.7, ids400: 81.3}
   tolerance: {rel: 0.03}                     # the docs round to the ms
   provenance:
-    date: 2026-10-16
-    how: "tts_board.py on 33a799febc56 (RPU_PLAN §13.12: the library regenerated with the row preps, the relative-key
+    date: 2026-10-17
+    how: "tts_board.py on 04259a7af917 (RPU_PLAN §14.12: the library regenerated with GATE / SCALE, which are in the
+          chunk only): 20 / 60 / 88 / 162 / 268 / 400 ids 8.0 / 11.9 / 23.7 / 47.7 / 78.6 / 81.3 ms.  Before:
+          tts_board.py on 33a799febc56 (RPU_PLAN §13.12: the library regenerated with the row preps, the relative-key
           band and the attention prep as descriptor chains, the pool's large slots on pages): 20 / 60 / 88 / 162 / 268 /
           400 ids 8.3 / 12.3 / 24.3 / 48.1 / 79.4 / 81.7 ms — unchanged within 3 %.  Before: tts_board.py --profile on
           de968ccc45da (HOSTOPS_PLAN §11.7: the library regenerated with FOLD, which is in the
@@ -1213,7 +1218,7 @@ facts:
           and row preps on the row-ops unit): 20 / 60 / 88 / 162 / 268 / 400 ids 9.5 / 14.4 / 28.4 / 56.8 / 92.1 / 95.8 ms
           (phase 3, the LayerNorms alone: 14.2 / 23.6 / 45.5 / 89.8 / 143.5 / 146.0; f70ce632a97a: 15.7 / 50.6 / 162.0 at
           20 / 88 / 400)"
-    facts: {perf.bitstream_id: 33a799febc56}   # stale on another bitstream
+    facts: {perf.bitstream_id: 04259a7af917}   # stale on another bitstream
   fix: report
   mentions:
     - {file: README.md, regex: 'text encoder (?P<ids88>\d+) ms and duration predictor \d+ ms per 88 phonemes'}
@@ -1268,12 +1273,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: 33a799febc56, dsp: 841, dsp_total: 1248, dsp_pct: 67, lut: 90607, lut_total: 117120, lut_pct: 77.4,
-          bram: 136, bram_total: 144, uram: 55, uram_total: 64}
+  value: {bitstream: 04259a7af917, dsp: 845, dsp_total: 1248, dsp_pct: 67.7, lut: 91805, lut_total: 117120, lut_pct: 78.4,
+          bram: 136, bram_total: 144, uram: 57, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-16
-    how: "Vivado placed utilization report of the 250 MHz design with ConvKernel's y channel pattern and the row-ops
+    date: 2026-10-17
+    how: "Vivado placed utilization report of the 250 MHz design with the row-ops unit's GATE op and SCALE flag
+          (RPU_PLAN §14.10, /mnt/data/bitstreams/kv260_250_04259a7af917/: LUT 90 607 -> 91 805 — RowOps +1 254 —,
+          FF 109 798 -> 111 099, +2 URAM, +4 DSP; WNS +0.027 ns after nine rip-up iterations); 33a799febc56 before
+          it: the design with ConvKernel's y channel pattern and the row-ops
           unit's descriptor chains (RPU_PLAN §13.10, /mnt/data/bitstreams/kv260_250_33a799febc56/: LUT 89 547 -> 90 607 —
           ConvKernel +269, RowOps +743 —, FF 108 713 -> 109 798, no RAM or DSP added; WNS +0.022 ns); de968ccc45da
           before it: the 250 MHz design with the row-ops unit's FOLD op after the kernels'
@@ -1298,7 +1306,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 33a799febc56}
+    facts: {perf.bitstream_id: 04259a7af917}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}
@@ -1481,8 +1489,8 @@ facts:
     parts:
       vop: {file: demo/tts/build/piper_project/src/inference.c, regex: '(VectorOPKernel ADD) \*/', all: true,
             transform: 'len(v)'}
-      host: {file: demo/tts/build/piper_project/src/inference.c,
-             regex: '\] (TtsSum)\([^\n]*host CPU, no hardware call', all: true, transform: 'len(v)'}
+      host: {py: "re:len(findall(r'\\] TtsSum\\([^\\n]*host CPU, no hardware call', open('../demo/tts/build/piper_project/src/inference.c').read()))",
+             cwd: inference-scheduler}                # 0 since RPU_PLAN A3a.4: a count, not a match
       stage_exp: {py: "src.piper:' / '.join(str(vop_exponents(json.load(open('../demo/tts/assets/piper-lessac-medium/exponents.json'))['exponents'])[f'dec.up{i}']) for i in range(3))",
                   cwd: inference-scheduler}
   fix: report

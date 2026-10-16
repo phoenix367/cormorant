@@ -6,7 +6,7 @@ K26, driven by the Arm cores of the same device.  This document describes
 the hardware in the order of an FPGA architecture document: requirements,
 top-level structure, clocks and reset, memory, datapath, interfaces,
 verification, and implementation.  The numbers are those of the production
-bitstream `33a799febc56` unless a section says otherwise.
+bitstream `04259a7af917` unless a section says otherwise.
 
 ![Cormorant system architecture](images/architecture.svg)
 
@@ -62,7 +62,7 @@ speech synthesis.  Results on the board with this bitstream at 250 MHz:
 | BERT-base SQuAD | 256 tokens | 266 ms |
 | SmolLM2-135M / 360M | chat decode | 19.8 / 7.6 tokens/s |
 | SmolVLM-256M | one image | 1.6 s |
-| Piper TTS | text | real-time factor 0.13 |
+| Piper TTS | text | real-time factor 0.11 |
 
 Each result is bit-exact with the scheduler's fixed-point simulation of the
 same model.  Accuracy is set by the numerics studies (Q8.8 with calibrated
@@ -1137,29 +1137,31 @@ resources (block RAM, URAM, CLBs) and inside it on LUTs:
 
 | resource | used | available | utilization | against 70–80 % |
 |---|---:|---:|---:|---|
-| CLB LUTs | 90 607 | 117 120 | 77.4 % | within, near the top |
-| — as logic | 69 715 | | 59.5 % | |
-| — as distributed RAM | 18 620 | 57 600 (LUTM) | 32.3 % | |
-| — as shift registers | 1 212 | 57 600 (LUTM) | 2.1 % | |
-| CLB registers | 108 713 | 234 240 | 46.4 % | within |
-| CARRY8 | 3 188 | 14 640 | 21.8 % | within |
-| CLBs (any part used) | 14 573 | 14 640 | 99.5 % | full: almost every CLB holds something |
+| CLB LUTs | 91 805 | 117 120 | 78.4 % | within, near the top |
+| — as logic | 71 331 | | 60.9 % | |
+| — as distributed RAM | 19 004 | 57 600 (LUTM) | 33.0 % | |
+| — as shift registers | 1 470 | 57 600 (LUTM) | 2.6 % | |
+| CLB registers | 111 099 | 234 240 | 47.4 % | within |
+| CARRY8 | 3 260 | 14 640 | 22.3 % | within |
+| CLBs (any part used) | 14 604 | 14 640 | 99.8 % | full: almost every CLB holds something |
 | block RAM tiles | 136 (116 RAMB36 + 40 RAMB18) | 144 | 94.4 % | over |
-| URAM | 55 | 64 | 85.9 % | over |
-| DSP48E2 | 841 | 1 248 | 67.4 % | within |
+| URAM | 57 | 64 | 89.1 % | over |
+| DSP48E2 | 845 | 1 248 | 67.7 % | within |
 | BUFGCE / MMCM | 1 / 1 | 112 / 4 | | |
 | bonded IOB | 0 | 189 | 0 % | |
 
 What this means for the next change:
 - **Block RAM and URAM are the binding resources.**  Eight BRAM tiles and
-  nine URAMs are left.  A new buffer must come from LUTRAM, or from a
+  seven URAMs are left (the row-ops unit's GATE took two, RPU_PLAN §14.10).  A new buffer must come from LUTRAM, or from a
   kernel's existing storage.
 - **LUTs are inside the guideline again, CLBs are not.**  The FOLD design
   did not route at 83.4 % LUTs; the area pass of `doc/plans/AREA_PLAN.md`
   brought it to 76.5 % (−4.4 k against `1cedaf2ed816`, which had no FOLD).
   Almost every CLB still holds something, so placement has little room to
-  spread a congested region; the +0.029 ns slack is the visible consequence.
-- **DSPs have room** (407 left).  Arithmetic is not the limit; memory and
+  spread a congested region; the +0.027 ns slack, and the nine rip-up
+  iterations (131 min) the router needed for `04259a7af917`, are the visible
+  consequence.
+- **DSPs have room** (403 left).  Arithmetic is not the limit; memory and
   routing are.
 
 ### 8.6 Bitstream generation, version control and handoff

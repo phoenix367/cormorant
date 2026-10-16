@@ -1443,7 +1443,7 @@ operand.
 | **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis — **DONE 2026-10-16 (§14.9)** | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
 | **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job — **DONE 2026-10-16 (§14.10): `04259a7af917`, WNS +0.027 ns, 91 805 LUT, 57 URAM, `sim_hw` 123 / 123** | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
 | **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases — **DONE 2026-10-16 (§14.11)** | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
-| **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
+| **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server — **DONE 2026-10-17 (§14.12): production `04259a7af917`, the chunk 176.9 → 148.2 ms** | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
 
 Order: A3a.0 first (bit-exact, and the study decides the gate's
 specification), then A3a.1 → A3a.2 → A3a.3 → A3a.4.  Effort: A3a.0 1 day,
@@ -1742,3 +1742,82 @@ chunk has a `GateRoNode`) and `split_avg` into `project.json`.
   project regenerates byte-identical (timestamps aside) and no other
   frontend emits a `TtsGate` or an int32 `TtsSum`.  Suites: scheduler 1873,
   chat 188, lint, csim, facts.
+
+### 14.12 A3a.4 results — the board and production (2026-10-16/17)
+
+**The bitstream on the board.**  `04259a7af917` loads with the same overlay,
+since the HWH's address map is `33a799febc56`'s.  The five kernel UIO
+devices appear, and the model set passes **159 / 159**.  The 72 kernel
+benchmarks were run three times against `33a799febc56`'s baseline.
+- **No case regressed.**  Each run flagged two or three cases over 2 %, but
+  different ones each time.  No case was over 2 % in all three runs, and
+  every three-run mean is within ±4 % — FC-1x1280x1001-packed's bimodal
+  −10 % among them.  All of these kernels' RTL is unchanged.
+- **Recorded.**  The third run is now the baseline of `04259a7af917`.
+
+**The performance model** (`perf_models/kv260/04259a7af917.*`):
+- **The campaign.**  `cases` 1755: the shipped calls with
+  `kernels.rowops.gate` / `scale` — one GATE call for Piper's 16 gates, the
+  T and scaled-ADDX jobs of the three averages — the space-filling set and
+  30 chain cases.  Two passes of 62 s, then one refinement round (+211).
+- **The result.**  **1936 exact calls**, repeat spread median 0.09 %.
+- **Nothing moved.**  The 1924 calls both models measured differ by a median
+  of 0.00 % and a p90 of +0.40 %.
+- **The new calls on the board**: a gate 54.1 µs (the RTL's `--perf`: 50);
+  the last average's T job 1.63 ms and its scaled job 2.38 ms (2.36).
+- **The chain term** is unchanged: −1.96 / +0.95 µs.
+- **The cost model.**  The call floor fell 1.87 → 1.73 µs: `CALL_OVERHEAD`
+  466 → 434 cycles, with `RTL_CONV_BOARD["ONE"]` / `RTL_COEF["one"]` +32.
+  The sums are unchanged: Piper regenerates identical (timestamps aside),
+  and SmolLM2-135M's kernel calls are identical (only the wait predictions
+  of the new model differ).
+- **The R5 BSP** was rebuilt for the bitstream
+  (`/mnt/data/cormorant_repro/rpu_bsp/04259a7af917`); the kernels' bases and
+  interrupt lines are `33a799febc56`'s.
+
+**The platform flags** `kernels.rowops.gate` / `scale` are now true.  Piper
+is regenerated: 179 nodes, `gate_q` / `split_avg` true, pool 54.3 MiB.
+
+**Piper, A3a.0's library against A3's on this bitstream** (`tts_board.py`
+with the A53 driving, scratch directories; the A3 library bit-exact with
+`chunk_forward(gate_q=True)`, the encoder and the duration predictor
+bit-exact):
+
+| | A3a.0 | A3 |
+|---|---:|---:|
+| chunk, median of 7 | 176.9 ms | **148.2 ms** (−28.7, −16 %) |
+| RTF, 2.15 s / 6.88 s sentence | 0.164 / 0.129 | 0.138 / 0.108 |
+| the 16 gates | 8.0 ms (host, 0.50–0.59 each) | 0.86 ms (54 µs each) |
+| the ÷ 3 averages | 25.2 ms (host) | 3.9 ms (the scaled jobs; the T jobs beside the convs) |
+| encode, 400 ids | 81.25 ms | 81.27 ms |
+
+The chunk is the ≈ 147 ms §14.8 estimated.  The profiler charges the T
+jobs 13.6 ms, but that is their overlap with resblock 2's first convs: a
+kernel node's window runs from its Start to its wait.  The chunk's host
+time is now ≈ 3.7 ms per chunk (`TtsFlowOut` ×4, the flows' float32
+`TtsPrep` ×5, the PCM table): A3's "≤ 10 ms" gate for the chunk.
+
+**The other libraries on the new bitstream**, with the R5 driving
+(`llm_board.py --rpu r5`, the libraries unchanged — no register and no node
+moved):
+
+| library | gate | decode | prefill 16 / 64 / 256 | image |
+|---|---|---|---|---|
+| SmolLM2-135M | logits bit-exact | 49.07 ms / token | 80 / 97 / 393 ms | |
+| SmolLM2-360M | logits bit-exact | 128.07 | 190 / 233 / 1023 | |
+| SmolVLM-256M | logits bit-exact | 48.97 | 80 / 97 / 394 | 1618 / 1610 ms |
+| BERT (`deploy_and_run.py`) | 50 / 50 examples bit-exact | | | 267.1 ms an inference |
+
+These equal A2.5's production numbers.  §14.6's gates: Piper bit-exact,
+the chunk ≤ 155 ms, the encoder unchanged, every other library bit-exact
+as installed — all met.
+
+**Deployed** (2026-10-17 00:47 local):
+- **On the board.**  The A3 Piper library is installed (`tts_board.py
+  --install-only`), and the chat server is redeployed with the R5 on the new
+  BSP (local `chat_config.json` `rpu.bsp_dir`) — all five models ready, a
+  speech request in 0.70 s end to end (1.17 s with the A3a.0 library) — and
+  deep idle is back on as the soak.
+- **On the host.**  `bitstream_config_kv260.json` (local) names
+  `/mnt/data/bitstreams/kv260_250_04259a7af917/`; the previous config is
+  beside it as `bitstream_config_kv260.before.json`.

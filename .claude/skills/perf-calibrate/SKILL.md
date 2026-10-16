@@ -25,10 +25,13 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | a host-op kind appeared or vanished (an op moved onto a kernel, a new host node — `simulate` reports an unpriced node) | profile every shipped model in the same board window, then `host --merge` with all the profiles (§3); the `board-window` skill does both |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/33a799febc56** (2026-10-16), `de968ccc45da`'s design with ConvKernel's y channel
+Current model: **kv260/04259a7af917** (2026-10-17), `33a799febc56`'s design with the row-ops unit's GATE
+op and SCALE flag (RPU_PLAN §14): `cases` (1755, with `kernels.rowops.gate` / `scale` true: Piper's GATE and
+scaled-average calls), `run`, `fit`, one refinement round (+211) → 1936 exact calls, the chain term as
+before.  The model before, kv260/33a799febc56 (2026-10-16), `de968ccc45da`'s design with ConvKernel's y channel
 pattern and the row-ops unit's descriptor chains (RPU_PLAN §13): `cases` (1745, among them 30 chain cases —
 `calib_runner` case `Q`, keys `<call>#chain<k>` —, with `kernels.conv.y_pattern` / `kernels.rowops.chains`
-true), `run`, `fit`, one refinement round (+211) → 1926 exact calls, the `rowops_chain` term (a job in a
+true), `run`, `fit`, one refinement round (+211) → 1926 calls, the `rowops_chain` term (a job in a
 chain −1.98 µs, a chain +0.96 µs); `host.json` unchanged.  The model before, kv260/de968ccc45da
 (2026-10-15), `1cedaf2ed816`'s design with the row-ops unit's
 FOLD (HOSTOPS_PLAN §11) after the kernels' area pass (AREA_PLAN): `cases` (1703, the FOLD calls with
@@ -125,7 +128,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 33a799febc56 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 04259a7af917 today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`

@@ -135,7 +135,7 @@ GEMV_JOB_OVERHEAD    = 200
 # Host-side cost of one kernel call on the board (AXI-Lite register writes
 # through the UIO mapping, Start, the IsDone poll loop), in kernel cycles:
 # the cheapest call of the calibration campaign (a 10-element VectorOP Add,
-# 1.87 us at 250 MHz on 33a799febc56, as are the shortest row-ops calls; the kernels' fixed costs ONE / one are
+# 1.73 us at 250 MHz on 04259a7af917, as are the shortest row-ops calls; the kernels' fixed costs ONE / one are
 # fitted net of it — the whole model was refitted to the campaign of f70ce632a97a, DEPTHWISE_PLAN
 # §8.5: ConvKernel's x port off the CCI made its x-bound jobs 27-67 % faster,
 # so the x-path terms of RTL_CONV_BOARD and the floor 431 -> 443 moved together;
@@ -146,10 +146,11 @@ GEMV_JOB_OVERHEAD    = 200
 # the floor 443 -> 440 with ONE / one +3; re-scored on de968ccc45da, HOSTOPS_PLAN §11.7: kept again,
 # the floor 440 -> 455 with ONE / one -15 (ONE -1: a fitted offset, not a physical cost) — no
 # shipped model's engine choice moves; on 33a799febc56, RPU_PLAN §13.12: the floor 455 -> 466 with
-# ONE / one -11 — only the sums reach a decision, so none moves).  Charged per call to both engines, so it only matters
+# ONE / one -11 — only the sums reach a decision, so none moves; on 04259a7af917, RPU_PLAN §14.12:
+# the floor 466 -> 434 with ONE / one +32, likewise).  Charged per call to both engines, so it only matters
 # where the lowering issues several conv calls for one MatMul (batched
 # attention: one per head).
-CALL_OVERHEAD        = 466
+CALL_OVERHEAD        = 434
 
 
 def _conv_geom(in_ch, out_ch, oh, ow, kh, kw, sh, sw, dh, dw):
@@ -227,7 +228,7 @@ RTL_CONV_SIM = {"CAP": 256, "XL": 0, "PL": 0, "FL": 0, "H": 2, "HAZ": 80, "HZW":
                 "LAT": 10, "ROW": 1, "ONE": 400, "XBEAT": 0.9, "XROW": 12, "RUN": 0,
                 "XLAT": 0, "WLAT": 0, "WBEAT": 1.0, "DPX": 1.1}
 RTL_CONV_BOARD = {"CAP": 383, "XL": 12, "PL": 43, "FL": 122, "H": 15, "HAZ": 0, "HZW": 138,
-                  "LAT": 111, "ROW": 1, "ONE": -12, "XBEAT": 0.66, "XROW": 36, "RUN": 1,
+                  "LAT": 111, "ROW": 1, "ONE": 20, "XBEAT": 0.66, "XROW": 36, "RUN": 1,
                   "XLAT": 0, "WLAT": 44, "WBEAT": 1.34, "DPX": 1.1}
 RTL_CONV_FEATURES = {"CAP": 256, "XL": 0, "PL": 20, "FL": 50, "H": 20, "HAZ": 80, "HZW": 50,
                      "LAT": 10, "ROW": 2, "ONE": 290, "XBEAT": 0.9, "XROW": 12, "RUN": 1,
@@ -502,7 +503,7 @@ RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 # costs more cycles: "steps" 2.97 -> 27.45, "runs" 0.325 -> 2.97); "one" is
 # the job's fixed cost without the host's call overhead (CALL_OVERHEAD).
 RTL_COEF = {"stream": 1.06, "drain": 0.5985, "aload": 0.4719,
-            "steps": 12.5, "runs": 3.065, "one": 56.84}
+            "steps": 12.5, "runs": 3.065, "one": 88.84}
 
 
 def _rtl_lane_planes(planes: int) -> int:

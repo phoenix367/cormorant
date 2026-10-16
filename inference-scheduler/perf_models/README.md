@@ -18,12 +18,21 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/33a799febc56` is the production design (2026-10-16, RPU_PLAN §13 track A2: `de968ccc45da`'s
+`kv260/04259a7af917` is the production design (2026-10-17, RPU_PLAN §14 track A3a: `33a799febc56`'s
+with the row-ops unit's GATE op and SCALE flag, every existing call as fast as before — the 1924 calls
+both models measured: median 0.00 %, p90 +0.40 %): `cases` 1755 (the shipped calls with
+`kernels.rowops.gate` / `scale` — Piper's 16 gates as one GATE call of 54.1 µs, its stage averages as
+T jobs and scaled ADDX jobs, the last 1.63 + 2.38 ms —, the space-filling set, the 30 chain cases), one
+refinement round (+211) → **1936 exact calls**, repeat spread median 0.09 %.  Families as before (train /
+held-out p90: conv 3.1 / 26.6 %, conv-mm 3.3 / 34.9 %, mm-gemv 4.8 / 18.2 %, mm-tiled 1.8 / 8.0 %, pool
+4.0 / 42.3 %, vecop 0.7 / 20.7 %, rowops 232 calls, train median 2.6 %); the chain term −1.96 / +0.95 µs.
+
+`kv260/33a799febc56` before it (2026-10-16, RPU_PLAN §13 track A2: `de968ccc45da`'s
 with ConvKernel's y channel pattern and the row-ops unit's descriptor chains, every existing call as
 fast as before — the 1702 calls both models measured: median +0.05 %, p90 +1.0 %): `cases` 1745 (the
 shipped calls of the libraries with `kernels.conv.y_pattern` and `kernels.rowops.chains` — the decode
 steps' attention prep on the unit among them —, the space-filling set, the 30 chain cases), one
-refinement round (+211) → **1926 exact calls**, repeat spread median 0.10 %.  Families (train /
+refinement round (+211) → 1926 exact calls, repeat spread median 0.10 %.  Families (train /
 held-out p90): conv 2.8 / 26.6 %, conv-dw 2.0 / 15.0 %, conv-mm 3.4 / 34.3 %, mm-gemv 4.9 / 18.8 %,
 mm-tiled 1.5 / 6.3 %, pool 3.2 / 40.9 %, vecop 0.5 / 10.1 %, vecop-div 0.6 / 7.0 %, vecop-smx (55
 calls) and rowops (222 calls, train median 2.8 %, no held-out).  The chain term (`rowops_chain`, 30

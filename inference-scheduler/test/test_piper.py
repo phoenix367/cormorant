@@ -122,13 +122,14 @@ _CG = None
 
 
 def chunk_cg():
-    """The chunk with TtsPrep as host ops (the unit's FOLD off whatever the
-    platform says; fold_chunk_cg is the FOLD variant)."""
+    """The chunk with TtsPrep as host ops and the gates in libm (the unit's FOLD,
+    GATE and SCALE off whatever the platform says; fold_chunk_cg is the FOLD
+    variant, a3_chunk_cg the GATE / SCALE one)."""
     global _CG
     if _CG is None:
         from src import _rowops_hw_config
         W, E = random_weights(), exponents()
-        with mock.patch.object(_rowops_hw_config, "ROWOPS_FOLD", False):
+        with mock.patch.multiple(_rowops_hw_config, ROWOPS_FOLD=False, ROWOPS_GATE=False, ROWOPS_SCALE=False):
             _CG = (W, E, CodeGenerator(OnnxGraph(PiperChunkFrontend(W, E).entry(), fuse_act=True,
                                                  s2d_stem=True), model_path="piper_chunk.onnx"))
     return _CG
@@ -474,8 +475,10 @@ class TestPiperChunk(unittest.TestCase):
     def test_host_sums_variant(self):
         """vop_sums=False (the library before OFFLOAD_PLAN §2.2: calibrated
         decoder exponents, three-input sums on the host) against its spec."""
+        from src import _rowops_hw_config
         W, E, _ = chunk_cg()
-        g = OnnxGraph(PiperChunkFrontend(W, E, vop_sums=False).entry(), fuse_act=True, s2d_stem=True)
+        with mock.patch.multiple(_rowops_hw_config, ROWOPS_GATE=False, ROWOPS_SCALE=False):
+            g = OnnxGraph(PiperChunkFrontend(W, E, vop_sums=False).entry(), fuse_act=True, s2d_stem=True)
         cg = CodeGenerator(g, model_path="piper_chunk_host.onnx")
         rng = np.random.default_rng(4)
         z = (rng.standard_normal((192, FLOW_FRAMES)) * 0.8).astype(np.float32)
@@ -573,9 +576,11 @@ _FOLD_CG = None
 
 
 def _fold(on=True):
-    """The platform gates of the row-ops unit and its FOLD op, patched."""
+    """The platform gates of the row-ops unit and its FOLD op, patched (GATE and
+    SCALE off: the library with libm's gates)."""
     from src import _rowops_hw_config
-    return mock.patch.multiple(_rowops_hw_config, ROWOPS_UNIT=on, ROWOPS_FOLD=on)
+    return mock.patch.multiple(_rowops_hw_config, ROWOPS_UNIT=on, ROWOPS_FOLD=on, ROWOPS_GATE=False,
+                               ROWOPS_SCALE=False)
 
 
 def fold_chunk_cg():

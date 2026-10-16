@@ -39,9 +39,11 @@ flowchart TB
 ## Results (2026-09-30)
 
 - **Output:** bit-exact with the specification on the board.
-- **Library speed:** since 2026-10-15 (the flow inputs, `TtsPrep`, as the
-  row-ops unit's FOLD — HOSTOPS_PLAN §11; a 6.9 s sentence) 0.18 s per chunk,
-  RTF 0.13.  At first about 0.7 s per 1.49 s chunk, an RTF of 0.52;
+- **Library speed:** since 2026-10-17 (the gates and the ÷ 3 stage averages
+  on the row-ops unit's GATE and SCALE — RPU_PLAN §14; a 6.9 s sentence)
+  0.15 s per chunk, RTF 0.11.  From 2026-10-15 (the flow inputs, `TtsPrep`,
+  as the row-ops unit's FOLD — HOSTOPS_PLAN §11) 0.18 s and an RTF of 0.13;
+  at first about 0.7 s per 1.49 s chunk, an RTF of 0.52;
   from 2026-10-07 (kernels at 250 MHz, the decoder's residual sums on
   VectorOPKernel — OFFLOAD_PLAN §4.2) 0.27 s per chunk and an RTF of 0.19.
 - **Text encoder:** 68 ms for 88 phoneme ids (numpy: 335 ms), bit-exact.
