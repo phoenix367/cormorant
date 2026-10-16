@@ -225,16 +225,10 @@ class PiperChunkFrontend:
                                        dilations=[1, dil], pads=[0, 0, 0, 0]))
         return y
 
-    def _sum(self, xs, ch0s, nch, L, key, div=1.0, shape=None, masked=None):
+    def _sum(self, xs, ch0s, nch, L, key, div=1.0, shape=None):
         y = self._t(self._uid(key), shape or [nch, L], exp=self.E[key])
-        attrs = dict(ch0s=list(ch0s), nch=nch, div=float(div))
-        ins = list(xs)
-        if masked:
-            rate, off = masked
-            ins += ["lo", "hi"]
-            attrs.update(masked=1, rate=rate, frame_off=off)
-        self.nodes.append(oh.make_node("TtsSum", ins, [y], name=self._uid(f"{key}.sum"),
-                                       domain=LLM_DOMAIN, **attrs))
+        self.nodes.append(oh.make_node("TtsSum", list(xs), [y], name=self._uid(f"{key}.sum"),
+                                       domain=LLM_DOMAIN, ch0s=list(ch0s), nch=nch, div=float(div)))
         return y
 
     # ---- the entry --------------------------------------------------------- #
@@ -267,8 +261,9 @@ class PiperChunkFrontend:
                 if i < 3:
                     h = self._sum([h, rs], [0, 0], 192, F, f"{e}.h.{i + 1}")
             r3, w3 = fold(F, 96)
-            wn = self._sum(rs_all, [192, 192, 192, 0], 192, F, f"{p}.post#in",
-                           shape=[1, 192, r3, w3], masked=(1, 0))
+            # not masked (doc/plans/RPU_PLAN.md §14.2): the post conv is 1 x 1 and m
+            # only reaches TtsFlowOut's x1 = mask(z1 - m), masked by the same [lo, hi)
+            wn = self._sum(rs_all, [192, 192, 192, 0], 192, F, f"{p}.post#in", shape=[1, 192, r3, w3])
             m = self._conv(f"{p}.post", wn, r3, w3, W[f"{p}.post.weight"], W[f"{p}.post.bias"])
             zn = self._t(self._uid(f"{p}.z"), [192, F], host="f32")
             self.nodes.append(oh.make_node("TtsFlowOut", [z, m, "lo", "hi"], [zn],

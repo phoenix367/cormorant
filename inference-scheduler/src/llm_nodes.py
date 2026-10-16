@@ -147,15 +147,17 @@ RUNTIME_GROUPS = {
 class HostTable:
     """A constant table in host memory (never a DMA buffer)."""
     name:  str               # C identifier (and weights/<name>.dat)
-    kind:  str               # "bf16" | "f32"
-    data:  np.ndarray        # the values (float64 / float32), flat
+    kind:  str               # "bf16" | "f32" | "i16" (integers, e.g. TtsPcm's lookup)
+    data:  np.ndarray        # the values (float64 / float32 / integers), flat
 
     @property
     def c_type(self) -> str:
-        return "uint16_t" if self.kind == "bf16" else "float"
+        return {"bf16": "uint16_t", "i16": "int16_t"}.get(self.kind, "float")
 
     @property
     def storage(self) -> np.ndarray:
+        if self.kind == "i16":
+            return np.asarray(self.data, np.int16).reshape(-1)
         v = np.asarray(self.data, np.float32).reshape(-1)
         if self.kind == "bf16":
             return (v.view(np.uint32) >> np.uint32(16)).astype(np.uint16)
@@ -187,6 +189,8 @@ class HostTable:
         s = self.storage
         if self.kind == "bf16":
             lits = [f"0x{int(v):04X}" for v in s]
+        elif self.kind == "i16":
+            lits = [str(int(v)) for v in s]
         else:
             lits = [_c_float(float(v)) for v in s]
         rows = ",\n".join("    " + ", ".join(lits[i:i + 8]) for i in range(0, len(lits), 8))

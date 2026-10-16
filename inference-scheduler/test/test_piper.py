@@ -25,6 +25,7 @@ from src.codegen import CodeGenerator
 from src.graph import OnnxGraph
 from src.piper import (FLOW_FRAMES, PiperChunkFrontend, PiperEncoderFrontend, encoder_weights, exponent_keys,
                        vop_exponents)
+from src.rowops_nodes import chains_enabled as rowops_chains
 from src.rowops_nodes import enabled as rowops_unit
 
 _SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -515,8 +516,8 @@ class TestPiperChunk(unittest.TestCase):
             kinds[type(sn).__name__] = kinds.get(type(sn).__name__, 0) + 1
         # 37 sums + the 3 split convs' tap-group sums; the decoder's 21 on VectorOP
         # (and any flow sum whose random exponents happen to be equal)
-        # (with the row-ops unit the two-input flow sums are TtsSumRoNodes and the
-        # interleaves TtsInterleaveRoNodes; the masked post sums and the /3 stage sums stay host ops)
+        # (with the row-ops unit the flow sums — h + res and the four-input post sums —
+        # are TtsSumRoNodes and the interleaves TtsInterleaveRoNodes; the /3 stage sums stay host ops)
         sums = kinds.pop("TtsSumNode", 0) + kinds.pop("TtsSumRoNode", 0) + kinds.get("TtsAddVopNode", 0)
         self.assertEqual(sums, 40)
         self.assertGreaterEqual(kinds.pop("TtsAddVopNode"), 21)
@@ -530,6 +531,34 @@ class TestPiperChunk(unittest.TestCase):
             if type(sn).__name__ == "ConvNode":
                 self.assertLessEqual((sn.kw - 1) * sn.dilation_w + 1, 64)
                 self.assertLessEqual(sn.out_w * (-(-sn.out_ch // 16) * 16), 65536)
+
+    def test_post_sums_on_the_unit(self):
+        """The flows' post sums (RPU_PLAN §14.4): unmasked four-input TtsSums on the
+        unit, one chain of three ADDX through one shared int32 scratch state, the
+        emitted calls the priced ones.  The mask could go because the post conv is
+        1 x 1 and its output only reaches TtsFlowOut (which masks x1 itself)."""
+        from test_perf_calls import _Eval, node_emitted_calls
+        from src.rowops_nodes import TtsSumRoNode
+        from src.tts_nodes import TtsFlowOutNode
+        _, _, cg = chunk_cg()
+        if not rowops_unit():
+            self.skipTest("the platform has no row-ops unit")
+        nodes = cg._graph.nodes
+        post = [sn for sn in nodes if isinstance(sn, TtsSumRoNode) and len(sn.ch0s) == 4]
+        self.assertEqual(len(post), 4)
+        self.assertEqual({sn.tmp.onnx_name for sn in post}, {"rowops_sum_scratch_49152"})
+        self.assertTrue(all(sn.tmp.is_state and sn.tmp.dma == "i32" for sn in post))
+        ev = _Eval(cg.generate_header())
+        for sn in post:
+            self.assertEqual(sn.chain_jobs(cg._layouts), 3)
+            self.assertEqual(sn.kernel_calls(cg._layouts), node_emitted_calls(sn, cg, ev), sn.describe())
+            conv = [c for c in nodes if sn.output in c.inputs]
+            self.assertEqual(len(conv), 1)
+            self.assertEqual((type(conv[0]).__name__, conv[0].kh, conv[0].kw), ("ConvNode", 1, 1))
+            users = [u for u in nodes if conv[0].output in u.inputs]
+            self.assertEqual([type(u) for u in users], [TtsFlowOutNode])
+        if rowops_chains():
+            self.assertEqual(sorted(n for i, n in cg._ro_chains.items() if nodes[i] in post), [3] * 4)
 
     @unittest.skipUnless(shutil.which("cc"), "needs cc")
     def test_generated_c_matches_simulation(self):

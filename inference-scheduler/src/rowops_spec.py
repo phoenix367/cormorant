@@ -339,9 +339,10 @@ def sigmoid_table() -> np.ndarray:
                      for i in range(SIG_N + 1)], dtype=np.int64)
 
 
-def silu_q(gv: np.ndarray) -> np.ndarray:
-    """silu(g) at 2^-20 for g = gv * 2^-14 (gv int64): the interpolated sigmoid
-    of |g|, mirrored for g < 0, the product gv * sigma rounded from 2^-38."""
+def sig_q(gv: np.ndarray) -> np.ndarray:
+    """sigma(g) at 2^-24 for g = gv * 2^-14 (gv int64): the interpolated table
+    of |g|, mirrored for g < 0, 2^24 for |g| >= 16."""
+    gv = np.asarray(gv, np.int64)
     a = np.abs(gv)
     big = a >= (16 << G_BITS)
     ai = np.minimum(a, (16 << G_BITS) - 1)
@@ -351,8 +352,13 @@ def silu_q(gv: np.ndarray) -> np.ndarray:
     t0 = T[idx]
     sig = t0 + (((T[idx + 1] - t0) * frac) >> (G_BITS - SIG_STEP))
     sig = np.where(big, 1 << SIG_BITS, sig)
-    sig = np.where(gv < 0, (1 << SIG_BITS) - sig, sig)          # sigma(-x) = 1 - sigma(x)
-    return rne_shr(gv * sig, G_BITS + SIG_BITS - SILU_BITS)      # 2^-38 -> 2^-20
+    return np.where(gv < 0, (1 << SIG_BITS) - sig, sig)          # sigma(-x) = 1 - sigma(x)
+
+
+def silu_q(gv: np.ndarray) -> np.ndarray:
+    """silu(g) at 2^-20 for g = gv * 2^-14 (gv int64): the interpolated sigmoid
+    of |g|, mirrored for g < 0, the product gv * sigma rounded from 2^-38."""
+    return rne_shr(gv * sig_q(gv), G_BITS + SIG_BITS - SILU_BITS)    # 2^-38 -> 2^-20
 
 
 def silu_mul(g_raw: np.ndarray, f_g, u_raw: np.ndarray, f_u, f_out) -> np.ndarray:
@@ -374,6 +380,32 @@ def silu_mul(g_raw: np.ndarray, f_g, u_raw: np.ndarray, f_u, f_out) -> np.ndarra
         cols = k == kk
         y[:, cols] = rne_shr(prod[:, cols], int(kk))
     return sat16(y)
+
+
+# ------------------------------------------------------------------ GATE (op 10)
+# Piper's TtsGate, tanh(a) * sigma(b) (doc/plans/RPU_PLAN.md §14.2): tanh x =
+# 2 sigma(2x) - 1 from the same sigmoid table, the product at 2^-48 rounded once.
+# Not libm: one LSB on ~3-5e-5 of the outputs (a study policy, RPU_PLAN §14.8).
+GATE_BITS = 2 * SIG_BITS      # th * sg at 2^-48
+
+
+def gate_shifts(f_in: int, f_out: int) -> Tuple[int, int, int]:
+    """(sh_a, sh_b, sh_c) of a GATE job: a and b at 2^-f_in, y at 2^-f_out."""
+    if not 1 <= int(f_in) <= G_BITS:
+        raise ValueError(f"gate: input exponent {f_in} outside 1 .. {G_BITS}")
+    sh_c = GATE_BITS - int(f_out)
+    if not 0 <= sh_c <= 63:
+        raise ValueError(f"gate: output exponent {f_out} beyond the shift")
+    return G_BITS + 1 - int(f_in), G_BITS - int(f_in), sh_c
+
+
+def gate(a_raw: np.ndarray, b_raw: np.ndarray, f_in: int, f_out: int) -> np.ndarray:
+    """y = sat16(rne(th * sg / 2^(48 - f_out))) with th = 2 sigma_q(2a) - 2^24 and
+    sg = sigma_q(b) (a, b int16 at 2^-f_in; sigma_q = sig_q at 2^-24)."""
+    sh_a, sh_b, sh_c = gate_shifts(f_in, f_out)
+    th = 2 * sig_q(np.asarray(a_raw, np.int64) << sh_a) - (1 << SIG_BITS)
+    sg = sig_q(np.asarray(b_raw, np.int64) << sh_b)
+    return sat16(rne_shr(th * sg, sh_c))
 
 
 # ------------------------------------------------------------------ FOLD (op 9)

@@ -1439,7 +1439,7 @@ operand.
 
 | phase | what | gate |
 |---|---|---|
-| **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.182 dB, 22.9 dB) |
+| **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" — **DONE 2026-10-16 (§14.8): bit-exact, chunk 184.3 → 176.3 ms, the study GO** | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.208 dB, 22.7 dB: OFFLOAD_PLAN §2.2's VectorOP sums) |
 | **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
 | **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
 | **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
@@ -1468,3 +1468,61 @@ A3a.1 2, A3a.2 ½ plus the build, A3a.3 1½, the board 1 — about six days.
   does.
 - **Old libraries** need no regeneration: no register is added.  Each needs
   a perf model for the new id only if it is planned (`--plan`).
+
+### 14.8 A3a.0 results — no bitstream (2026-10-16)
+
+**The gate study** (`piper_study.py study --policies "chunk spec (the
+library);chunk spec + unit gate"`, 11 sentences, 1 min 40 s):
+
+| policy | SNR mean / min | log-mel distance |
+|---|---|---|
+| chunk spec (the library) | 22.68 / 12.16 dB | 0.2083 dB |
+| chunk spec + unit gate (`rowops_spec.gate`) | 23.03 / 11.97 dB | 0.2082 dB |
+
+**GO.**  The integer gate is as close to float as libm's.  It is not the
+same waveform, though.  The flows amplify the rare 1-LSB gate changes, so
+85–95 % of the PCM samples move: by 1.3 % (eval00) and 3.6 % (eval10) of
+the signal RMS.  Another float noise draw sits at −2.6 dB SNR, so this is
+a different rendering at the same distance from float.  The A3a.3 library
+will equal `chunk_forward(gate_q=True)` bit for bit, and the board gate
+checks that.
+
+**The bit-exact moves** (`tts_board.py`, scratch `--remote-dir`, two chunks
+profiled; the A2.5 library against the A3a.0 one, both bit-exact against
+the mask-free specification):
+
+| | A2.5 | A3a.0 |
+|---|---:|---:|
+| chunk, median of 7 | 184.3 ms | **176.3 ms** (−8.0) |
+| RTF, 6.88 s / 2.15 s utterance | 0.135 / 0.169 | 0.129 / 0.163 |
+| the four post sums | 0.62–0.69 ms each (host) | 0.21 ms each (3 ADDX, chained) |
+| `TtsPcm` | 4.83 ms (libm per sample) | 0.48 ms (the table) |
+| encode, 400 ids | 81.3 ms | 81.4 ms |
+| pool | 54.1 MiB | 54.3 MiB (+192 KiB: `rowops_sum_scratch_49152`) |
+
+The baseline library already matches the mask-free specification, which
+confirms §14.2 on the board.  The new library is installed and the chat
+server redeployed with the R5.  A speech request through `/v1/audio/speech`
+took 1.17 s end to end.
+
+**The gates are cheaper than §14.1 counted.**  In steady state each takes
+0.50–0.59 ms, ≈ 8.5 ms per chunk.  The 5–7 ms spikes are the C helper
+building its per-exponent tanh / σ tables on the first call (f_in 9, then
+10).  That happens once per process, not once per chunk.  Revised estimate
+for A3a.1–A3a.4:
+- the averages 25.5 → ≈ 3.8 ms;
+- the gates 8.5 → ≈ 0.9 ms;
+- the chunk ≈ 176 → **≈ 147 ms**.
+
+**Implementation:**
+- **Specification.**  `rowops_spec.sig_q` / `gate` / `gate_shifts`, with
+  `silu_q` now on `sig_q`.  `piper_vits.chunk_forward(gate_q=)`, and the
+  flows' post sums unmasked (`piper.py` likewise).
+- **The post sums.**  `TtsSumRoNode` takes 2–4 inputs.  Three or more chain
+  ADDX jobs through an int32 DMA state, `sum_scratch_tensor`, registered by
+  the factory and shared by size.
+- **The PCM.**  `HostTable` gains kind `i16`; `tts_nodes.pcm_table` holds the
+  table and `TtsPcmNode` / `tts_pcm` look it up.
+- **Tests:** `test_rowops_spec.TestGate`, `test_piper` (the post sums on the
+  unit; the simulation against the mask-free specification over four
+  windows; both chunk emulations).

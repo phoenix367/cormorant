@@ -1706,75 +1706,143 @@ def from_tts_layernorm(node, tensors, index, align_elems, ctx: HostContext):
 
 @dataclass
 class TtsSumRoNode(RowOpsNode):
-    """A two-input TtsSum of the Piper flows (h + the res-skip half, RPU_PLAN
-    §3.1) on the unit: one ADDX over the ``nch`` channel rows of L — A and B
-    the channel slices [ch0, ch0 + nch) of their [C][L] tensors, the shifts
-    fp - f_in0 / fp - f_in1 / fp - f_out at fp = max of the three exponents:
-    the host's integer path (round half to even, saturate), bit for bit."""
+    """An unmasked TtsSum of int16 channel slices on the unit — the host's
+    integer path (the exact sum at fp = the largest of the exponents, one
+    round half to even at f_out, saturate), bit for bit.  Two inputs (the
+    flows' h + the res-skip half, RPU_PLAN §3.1): one ADDX over the ``nch``
+    channel rows of L, the shifts fp - f_in0 / fp - f_in1 / fp - f_out.  Three
+    or four (the flows' post sums, RPU_PLAN §14.4): an ADDX chain through the
+    int32 scratch state ``tmp`` (rowops_sum_scratch) — t = x0 + x1, t += x_j,
+    then y = rne(t + x_last) — the middle jobs in place (each word is read
+    before it is written)."""
     nch: int = 1
     L: int = 1
     ch0s: tuple = (0, 0)
     f_ins: tuple = (0, 0)
     f_out: int = 0
     pb: object = field(default=None, repr=False)
+    pbs: list = field(default_factory=list, repr=False)
+    tmp: object = field(default=None, repr=False)
 
     @property
     def opword(self) -> int:
         return rs.opword(rs.OP_ADDX, rs.K_I16, rs.K_I16, rs.K_I16, b_en=True, p_bcast=True)
+
+    def state_writes(self):
+        return [self.tmp] if self.tmp is not None else []
+
+    def state_updates(self):
+        return self.state_writes()
 
     def _regs(self):
         LB = self.L * 2
         return dict(op=self.opword, n=self.L, rows=self.nch, blocks=1, a_s1=LB, a_s2=0, b_s1=LB, b_s2=0,
                     c_s1=LB, c_s2=0, aux=0, win_lo=0, win_hi=NO_WINDOW)
 
+    def _jobs(self):
+        """[(a, a_off, b, b_off, c, P, opword, a_s1, c_s1)] of a sum of three or more."""
+        k, L = len(self.ch0s), self.L
+        xs = self.inputs[:k]
+        off = [c0 * L * 2 for c0 in self.ch0s]
+        i16, i32 = rs.K_I16, rs.K_I32
+        jobs = [(xs[0], off[0], xs[1], off[1], self.tmp, self.pbs[0],
+                 rs.opword(rs.OP_ADDX, i16, i16, i32, b_en=True, p_bcast=True), 2 * L, 4 * L)]
+        for j in range(2, k):
+            last = j == k - 1
+            jobs.append((self.tmp, 0, xs[j], off[j], self.output if last else self.tmp, self.pbs[j - 1],
+                         rs.opword(rs.OP_ADDX, i32, i16, i16 if last else i32, b_en=True, p_bcast=True),
+                         4 * L, (2 if last else 4) * L))
+        return jobs
+
     def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
-        from .perf_calls import KernelCall
-        return [KernelCall.of("RowOpsKernel", **self._regs())]
+        from .perf_calls import KernelCall, merge
+        if len(self.ch0s) == 2:
+            return [KernelCall.of("RowOpsKernel", **self._regs())]
+        return merge([KernelCall.of("RowOpsKernel", op=j[6], n=self.L, rows=self.nch, blocks=1, a_s1=j[7],
+                                    b_s1=2 * self.L, c_s1=j[8], win_hi=NO_WINDOW) for j in self._jobs()])
+
+    def chain_jobs(self, layouts: dict) -> int:  # noqa: ARG002
+        return max(len(self.ch0s) - 1, 1)
 
     def describe(self) -> str:
-        return (f"2 inputs [{self.nch}][{self.L}] at 2^-{self.f_ins[0]} / 2^-{self.f_ins[1]} -> 2^-{self.f_out} "
-                f"on RowOpsKernel (ADDX)")
+        k = len(self.ch0s)
+        ex = " / ".join(f"2^-{f}" for f in self.f_ins)
+        how = "ADDX" if k == 2 else f"{k - 1} ADDX through an int32 scratch"
+        return f"{k} inputs [{self.nch}][{self.L}] at {ex} -> 2^-{self.f_out} on RowOpsKernel ({how})"
 
     def emit_comment(self) -> str:
-        return (f"    /* [{self.index}] TtsSum({self.inputs[0].onnx_name}, {self.inputs[1].onnx_name}) -> "
-                f"{self.output.onnx_name}  {self.describe()} */")
+        names = ", ".join(t.onnx_name for t in self.inputs[:len(self.ch0s)])
+        return f"    /* [{self.index}] TtsSum({names}) -> {self.output.onnx_name}  {self.describe()} */"
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         r = self._regs()
-        return self.call(self.inputs[0].c_name, self.ch0s[0] * self.L * 2, self.inputs[1].c_name,
-                         self.ch0s[1] * self.L * 2, self.output.c_name, 0, self.pb.c_name, r["op"], r["n"],
-                         r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
+        if len(self.ch0s) == 2:
+            return self.call(self.inputs[0].c_name, self.ch0s[0] * self.L * 2, self.inputs[1].c_name,
+                             self.ch0s[1] * self.L * 2, self.output.c_name, 0, self.pb.c_name, r["op"], r["n"],
+                             r["rows"], 1, r["a_s1"], 0, r["b_s1"], 0, r["c_s1"], 0, 0, 0, 0, 0, NO_WINDOW)
+        lines = ["    {"]
+        for i, (a, a_off, b, b_off, c, pb, op, a_s1, c_s1) in enumerate(self._jobs()):
+            if i:
+                lines.append("        kernel_wait(KERNEL_ROWOPS);")
+            lines.append(self.call(a.c_name, a_off, b.c_name, b_off, c.c_name, 0, pb.c_name, op, self.L,
+                                   self.nch, 1, a_s1, 0, 2 * self.L, 0, c_s1, 0, 0, 0, 0, 0, NO_WINDOW,
+                                   indent="        "))
+        lines.append("    }")
+        return "\n".join(lines)
 
     def reference(self, ins, dtype):  # noqa: ARG002
         fp = max(*self.f_ins, self.f_out)
         acc = None
-        for x, c0, f in zip(ins[:2], self.ch0s, self.f_ins, strict=True):
+        for x, c0, f in zip(ins[:len(self.ch0s)], self.ch0s, self.f_ins, strict=True):
             raw = np.rint(np.asarray(x, np.float64).reshape(-1, self.L)[c0:c0 + self.nch] * 2.0 ** f).astype(np.int64)
             acc = (raw << (fp - f)) if acc is None else acc + (raw << (fp - f))
         y = rs.sat16(rs.rne_shr_vec(acc, np.full(acc.shape, fp - self.f_out)))
         return (y / 2.0 ** self.f_out).reshape(self.output.shape)
 
 
+SUM_SCRATCH = "rowops_sum_scratch"
+
+
+def sum_scratch_tensor(tensors: dict, numel: int) -> TensorInfo:
+    """The int32 DMA state the multi-input sums chain through (TtsSumRoNode),
+    ``numel`` elements, one per size (shared by every sum of that size)."""
+    name = f"{SUM_SCRATCH}_{numel}"
+    t = tensors.get(name)
+    if t is None:
+        t = TensorInfo(onnx_name=name, shape=[int(numel)], dtype="float32", is_state=True, dma="i32")
+        tensors[name] = t
+    return t
+
+
 def from_tts_sum(node, tensors, index, align_elems, ctx: HostContext):
-    """TtsSum: the VectorOP ADD or the host op as before; a two-input unmasked
-    sum with differing exponents or channel offsets becomes TtsSumRoNode."""
+    """TtsSum: the VectorOP ADD or the host op as before; an unmasked sum of two
+    to four int16 slices with differing exponents or channel offsets becomes
+    TtsSumRoNode."""
     from .tts_nodes import TtsAddVopNode, TtsSumNode
     host = TtsSumNode.from_onnx_node(node, tensors, index, align_elems, ctx)
     if isinstance(host, TtsAddVopNode) or not enabled():
         return host
-    xs = host.inputs[:2]
-    if (len(host.ch0s) != 2 or host.masked or host.div != 1.0 or host.L % align_elems
+    k = len(host.ch0s)
+    xs = host.inputs[:k]
+    if (host.masked or host.div != 1.0 or host.L % align_elems
             or any(t.dma or t.is_host or t.is_state for t in xs + [host.output])
             or any(c0 * host.L % align_elems for c0 in host.ch0s) or host.L > rs.N_MAX):
         return host
     fp = max(*host.f_ins, host.f_out)
     if fp - min(host.f_ins) > 63:
         return host
-    pb, _bc = _pblock(tensors, f"{host.output.onnx_name}__rowops_p", 0, 0, fp - host.f_ins[0], fp - host.f_ins[1],
-                      fp - host.f_out, 1)
-    return TtsSumRoNode(onnx_node=node, inputs=[xs[0], xs[1], pb, tables_tensor(tensors)], output=host.output,
-                        index=index, align_elems=align_elems, F=ctx.frac_bits, nch=host.nch, L=host.L,
-                        ch0s=tuple(host.ch0s), f_ins=tuple(host.f_ins), f_out=host.f_out, pb=pb)
+    sh = [fp - f for f in host.f_ins]
+    common = dict(onnx_node=node, output=host.output, index=index, align_elems=align_elems, F=ctx.frac_bits,
+                  nch=host.nch, L=host.L, ch0s=tuple(host.ch0s), f_ins=tuple(host.f_ins), f_out=host.f_out)
+    name = f"{host.output.onnx_name}__rowops_p"
+    if k == 2:
+        pb, _bc = _pblock(tensors, name, 0, 0, sh[0], sh[1], fp - host.f_out, 1)
+        return TtsSumRoNode(inputs=[xs[0], xs[1], pb, tables_tensor(tensors)], pb=pb, **common)
+    pbs = [_pblock(tensors, f"{name}0", 0, 0, sh[0], sh[1], 0, 1)[0]]
+    for j in range(2, k):
+        pbs.append(_pblock(tensors, f"{name}{j - 1}", 0, 0, 0, sh[j], fp - host.f_out if j == k - 1 else 0, 1)[0])
+    tmp = sum_scratch_tensor(tensors, host.nch * host.L)
+    return TtsSumRoNode(inputs=[*xs, tmp, *pbs, tables_tensor(tensors)], pbs=pbs, tmp=tmp, **common)
 
 
 @dataclass

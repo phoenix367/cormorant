@@ -432,10 +432,21 @@ class TtsInterleaveNode(TtsNode):
         return x.transpose(1, 2, 0).reshape(self.output.shape)
 
 
+def pcm_table(f_in: int) -> np.ndarray:
+    """TtsPcm of every int16 input at 2^-f_in, indexed by its raw 16 bits:
+    clip(round_half_even(tanh(x) * 32767)) — the specification's own values."""
+    raw = np.arange(65536, dtype=np.int64).astype(np.uint16).view(np.int16).astype(np.float64)
+    x = raw * 2.0 ** -int(f_in)
+    return np.clip(np.round(libm_map(math.tanh, x) * 32767.0), -32768, 32767).astype(np.int16)
+
+
 @dataclass
 class TtsPcmNode(TtsNode):
+    """tanh -> int16 PCM: a lookup in the table of every int16 input
+    (pcm_table, written by the generator — doc/plans/RPU_PLAN.md §14.4)."""
     L: int = 1
     f_in: int = 0
+    table: Optional[HostTable] = field(default=None, repr=False)
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -447,13 +458,17 @@ class TtsPcmNode(TtsNode):
         sn._want(y, "i16", "output")
         sn.f_in = _exp(x, node)
         _require(y.numel == x.numel, node, "shapes")
+        sn.table = HostTable(f"_tts_pcm_tab_f{sn.f_in}", "i16", pcm_table(sn.f_in))
         return sn
 
+    def tables(self):
+        return [self.table]
+
     def describe(self):
-        return f"tanh -> int16 PCM, {self.L} samples"
+        return f"tanh -> int16 PCM, {self.L} samples (a 65 536-entry table)"
 
     def c_call(self, ins, out, scratch, direct, dtype):
-        return [f"tts_pcm({ins[0]}, {_p2(-self.f_in)}, {self.L}u, {out});"]
+        return [f"tts_pcm({ins[0]}, {self.table.name}, {self.L}u, {out});"]
 
     def reference(self, ins, dtype):
         x = np.asarray(ins[0], np.float64).reshape(-1)
@@ -1335,15 +1350,11 @@ static void tts_interleave(const Data_t *x, unsigned s, unsigned O, unsigned L, 
     host_parallel(tts_interleave_rows, &a, O, 1u, 1u);
 }
 
-static void tts_pcm(const Data_t *x, double sx, unsigned L, int16_t *y)
+static void tts_pcm(const Data_t *x, const int16_t *tab, unsigned L, int16_t *y)
 {
-    unsigned t;
-    for (t = 0u; t < L; t++) {
-        double r = nearbyint(tanh(llm_ld(x[t], sx)) * 32767.0);
-        if (r > 32767.0) r = 32767.0;
-        if (r < -32768.0) r = -32768.0;
-        y[t] = (int16_t)r;
-    }
+    unsigned t;                         /* tab: every raw int16 input's sample (pcm_table) */
+    for (t = 0u; t < L; t++)
+        y[t] = tab[(uint16_t)x[t]];
 }
 """
 

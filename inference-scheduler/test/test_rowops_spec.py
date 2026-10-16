@@ -146,6 +146,44 @@ def tts_prep_double(x_raw, ch, rows, w0, hl, hr, t0, slo, shi, alpha, f_in, f_ou
     return np.where(ok[None], exact_rne(v, f_out), 0.0)
 
 
+class TestGate(unittest.TestCase):
+    """GATE (op 10, RPU_PLAN §14.2): tanh(a) * sigma(b) from the sigmoid table."""
+
+    def test_shifts(self):
+        self.assertEqual(rs.gate_shifts(9, 9), (6, 5, 39))
+        self.assertEqual(rs.gate_shifts(10, 9), (5, 4, 39))
+        for f_in, f_out in ((0, 9), (15, 9), (9, -16), (9, 49)):
+            with self.assertRaises(ValueError):
+                rs.gate_shifts(f_in, f_out)
+
+    def test_sig_q_mirror_and_silu(self):
+        v = np.arange(-(20 << 14), 20 << 14, 997, dtype=np.int64)
+        np.testing.assert_array_equal(rs.sig_q(-v), (1 << 24) - rs.sig_q(v))
+        self.assertEqual(int(rs.sig_q(np.array([0]))[0]), 1 << 23)
+        np.testing.assert_array_equal(rs.silu_q(v), rs.rne_shr(v * rs.sig_q(v), 18))
+
+    def test_tanh_from_the_table(self):
+        """2 sigma_q(2x) - 1 within 9 x 2^-24 of tanh over every int16 at 2^-9 / 2^-10."""
+        for f_in in (9, 10):
+            a = np.arange(-32768, 32768, dtype=np.int64)
+            th = 2 * rs.sig_q(a << (15 - f_in)) - (1 << 24)
+            err = np.abs(th - np.tanh(a / 2.0 ** f_in) * 2.0 ** 24)
+            self.assertLess(float(err.max()), 9.0, f"f_in {f_in}")
+
+    def test_within_one_lsb_of_libm(self):
+        rng = np.random.default_rng(14)
+        for f_in, f_out in ((9, 9), (10, 9), (12, 12)):
+            a = np.clip(np.rint(rng.normal(0, 1.5, 200_000) * 2 ** f_in), -32768, 32767).astype(np.int64)
+            b = np.clip(np.rint(rng.normal(0, 1.5, 200_000) * 2 ** f_in), -32768, 32767).astype(np.int64)
+            y = rs.gate(a, b, f_in, f_out)
+            ref = np.array([math.tanh(x) for x in a / 2.0 ** f_in]) / (1.0 + np.exp(-(b / 2.0 ** f_in)))
+            d = y - np.clip(np.rint(ref * 2.0 ** f_out), -32768, 32767)
+            self.assertLessEqual(int(np.abs(d).max()), 1, f"f_in {f_in}")
+            self.assertLess(np.count_nonzero(d) / d.size, 1e-3, f"f_in {f_in}")
+        np.testing.assert_array_equal(rs.gate(np.array([0, 32767, -32768]), np.array([5000, 32767, 32767]), 9, 9),
+                                      [0, 512, -512])
+
+
 class TestFold(unittest.TestCase):
     """FOLD (op 9, HOSTOPS_PLAN §11): TtsPrep's LeakyReLU and re-rounding as an
     integer quotient, its divider-free form and the windowed gather."""

@@ -298,6 +298,7 @@ POLICIES = {
     "opt+hc+fw": ("opt+fw", "opt+hc+fw"),
     "opt, int16 chains": ("opt-i16", "opt-i16"),
     "chunk spec (the library)": ("chunk", "chunk"),
+    "chunk spec + unit gate": ("chunk-gq", "chunk-gq"),     # rowops_spec.gate (RPU_PLAN §14.2)
 }
 
 
@@ -336,9 +337,10 @@ def cmd_study(a) -> int:
         if name in ("eval00", "eval10"):
             _write_wav(os.path.join(out_dir, f"{name}_float.wav"), ref)
         for pol, (fp, dp) in policies.items():
-            if fp == "chunk":
+            if fp in ("chunk", "chunk-gq"):
                 Qf = Qd = None
-                wav = pv.synthesize_chunked(W, exp, pv.front_end(W, t["ids"], seed=seed)) / 32767.0
+                wav = pv.synthesize_chunked(W, exp, pv.front_end(W, t["ids"], seed=seed),
+                                            gate_q=fp == "chunk-gq") / 32767.0
             else:
                 Qf, Qd = _quant(pv, fp, exp), _quant(pv, dp, exp)
                 wav = pv.synthesize(W, t["ids"], seed=seed, Q_flow=Qf, Q_dec=Qd)
@@ -349,7 +351,7 @@ def cmd_study(a) -> int:
             peak = max([q.acc_peak for q in (Qf, Qd) if q is not None] + [0.0])
             rows[pol].append((snr, lsd, sat, peak, _pause_floor(ref, err)))
             if name in ("eval00", "eval10") and pol in ("bf16", "q88", "pow2", "opt", "opt+hc", "opt, int16 chains",
-                                                         "chunk spec (the library)"):
+                                                         "chunk spec (the library)", "chunk spec + unit gate"):
                 tag = pol.split(" (")[0].replace("+", "_").replace(", ", "_").replace(" ", "_")
                 _write_wav(os.path.join(out_dir, f"{name}_{tag}.wav"), wav)
         print(f"  {name}: {len(ref) / pv.SR:4.2f} s  " + "  ".join(

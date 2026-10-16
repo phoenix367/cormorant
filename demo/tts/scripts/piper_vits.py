@@ -493,6 +493,14 @@ def _mask(x, lo, hi):
     return y
 
 
+def _gate_q(x, f_in, f_out):
+    """The row-ops unit's GATE (rowops_spec.gate) on x [2n][L] at 2^-f_in:
+    tanh(x[:n]) * sigma(x[n:]) at 2^-f_out (value domain)."""
+    raw = np.rint(np.asarray(x, np.float64) * 2.0 ** f_in).astype(np.int64)
+    n = raw.shape[0] // 2
+    return _rowops().gate(raw[:n], raw[n:], f_in, f_out) * 2.0 ** -f_out
+
+
 def _kconv(x, fx, fy, w, b, dil=1, taps=None):
     """ConvKernel on a 'same' conv over the chunk (zero padding at the chunk
     ends): x on its 2^-fx grid; weight at f_w = fy + 8 - fx, bias at fy;
@@ -550,7 +558,7 @@ def vop_exponents(E):
     return E2
 
 
-def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True):
+def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True, gate_q=False):
     """The library's chunk.  zp [192][FLOW_FRAMES] float32 (z_p, zero
     outside the utterance), [lo, hi) the utterance's frames in chunk
     coordinates, E the exponents (calibrate).  Returns int16 PCM
@@ -559,7 +567,12 @@ def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True):
     ``vop_sums`` (the library since doc/plans/OFFLOAD_PLAN.md §2.2): the
     decoder at vop_exponents(E), a split conv's two tap groups summed and
     saturated first — every residual sum one VectorOP ADD; False: the
-    calibrated exponents, one host sum of three (the library before)."""
+    calibrated exponents, one host sum of three (the library before).
+    ``gate_q``: the WaveNet gates as the row-ops unit's GATE op computes them
+    (rowops_spec.gate: tanh and sigma from its sigmoid table, doc/plans/RPU_PLAN.md
+    §14.2) instead of libm.  The flows' post sums are not masked: the post conv
+    is 1 x 1 and its output only reaches x1 = mask(z1 - m), masked by the same
+    [lo, hi) (RPU_PLAN §14.2) — z and the PCM equal the masked form's."""
     tr = trace if trace is not None else {}
     if vop_sums:
         E = vop_exponents(E)
@@ -575,7 +588,10 @@ def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True):
             xin_in = _rq(_mask(h, lo, hi), E[f"{e}.in.{i}#in"])
             xin = _kconv(xin_in, E[f"{e}.in.{i}#in"], E[f"{e}.in.{i}"],
                          W[f"{e}.in_layers.{i}.weight"], W[f"{e}.in_layers.{i}.bias"])
-            acts = _rq(_libm(math.tanh, xin[:192]) * _libm(_sigmoid, xin[192:]), E[f"{e}.rs.{i}#in"])
+            if gate_q:
+                acts = _gate_q(xin, E[f"{e}.in.{i}"], E[f"{e}.rs.{i}#in"])
+            else:
+                acts = _rq(_libm(math.tanh, xin[:192]) * _libm(_sigmoid, xin[192:]), E[f"{e}.rs.{i}#in"])
             rs = _kconv(acts, E[f"{e}.rs.{i}#in"], E[f"{e}.rs.{i}"],
                         W[f"{e}.res_skip_layers.{i}.weight"], W[f"{e}.res_skip_layers.{i}.bias"])
             rs_all.append(rs)
@@ -584,7 +600,7 @@ def chunk_forward(W, E, zp, lo, hi, dec_off=DEC_OFF, trace=None, vop_sums=True):
                 h = _rq(h + rs[:192], E[f"{e}.h.{i + 1}"])
                 tr[f"{e}.h.{i + 1}"] = h
         wn = rs_all[0][192:] + rs_all[1][192:] + rs_all[2][192:] + rs_all[3]
-        wn_in = _rq(_mask(wn, lo, hi), E[f"{p}.post#in"])
+        wn_in = _rq(wn, E[f"{p}.post#in"])
         m = _kconv(wn_in, E[f"{p}.post#in"], E[f"{p}.post"], W[f"{p}.post.weight"], W[f"{p}.post.bias"])
         tr[f"{p}.post#in"], tr[f"{p}.post"] = wn_in, m
         x1 = _mask((zf[96:].astype(np.float64) - m), lo, hi).astype(np.float32)
@@ -654,7 +670,7 @@ def front_end(W, ids, noise_scale=0.667, length_scale=1.0, noise_w=0.8, seed=0, 
     return (mp + rng.standard_normal(mp.shape) * np.exp(lp) * noise_scale).astype(np.float32)
 
 
-def synthesize_chunked(W, E, zp, vop_sums=True):
+def synthesize_chunked(W, E, zp, vop_sums=True, gate_q=False):
     """Stitch the chunks of an utterance: chunk k covers utterance frames
     [128k - 64, 128k + 192), its output frames [128k, 128k + 128)."""
     T = zp.shape[1]
@@ -664,7 +680,7 @@ def synthesize_chunked(W, E, zp, vop_sums=True):
         chunk = np.zeros((192, FLOW_FRAMES), np.float32)
         a, b = max(start, 0), min(start + FLOW_FRAMES, T)
         chunk[:, a - start:b - start] = zp[:, a:b]
-        pcm = chunk_forward(W, E, chunk, -start, T - start, vop_sums=vop_sums)
+        pcm = chunk_forward(W, E, chunk, -start, T - start, vop_sums=vop_sums, gate_q=gate_q)
         o = (OUT_OFF - DEC_OFF) * HOP
         out.append(pcm[o:o + OUT_FRAMES * HOP])
     return np.concatenate(out)[:T * HOP]

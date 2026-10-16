@@ -141,9 +141,11 @@ for bit: an ONNX **`Transpose`** of an int16 DMA tensor whose collapsed
 shape is a head split / merge (one COPY with the two outer axes swapped) or
 a Kᵀ (one TRANSPOSE of 8-row tiles into granules at the output's row
 stride) — `TransposeRoNode`, BERT's 48 of 49 (the host op for odd strides
-or a last dim not a multiple of 8); the Piper chunk's two-input **`TtsSum`**
+or a last dim not a multiple of 8); the Piper chunk's **`TtsSum`**s
 with differing exponents or channel offsets (`TtsSumRoNode`: one ADDX with
-per-tensor shifts — the masked and the ÷ 3 sums stay host ops) and
+per-tensor shifts for two inputs; since RPU_PLAN §14 (A3a.0) the flows'
+four-input post sums as three ADDX through an int32 scratch state,
+`rowops_sum_scratch_<n>`, chained — the ÷ 3 stage averages stay host ops) and
 **`TtsInterleave`** (`TtsInterleaveRoNode`: one TRANSPOSE of R = the phase
 count, the columns in chunks of ≤ 1 024 as the job's blocks); the Piper
 encoder's **relative-key band** (`PiperEncoderFrontend(rel_kernel=True)`,
@@ -274,7 +276,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1858 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1863 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1261,13 +1263,18 @@ fixed-size `chunk` entry (TTS_PLAN §4).
   §2.2): the decoder keeps one exponent per stage (`piper.vop_exponents`),
   so each residual sum, and each split conv's tap-group sum, adds two whole
   tensors at one exponent — `TtsAddVopNode`, one `ADD` (the exact sum
-  saturated: the host op's bits).  The stage averages and the flows' sums
-  stay host ops.
+  saturated: the host op's bits).  The stage averages stay host ops; the
+  flows' sums run on the row-ops unit (§Row-ops unit).
+- **The flows' post sums are not masked** (RPU_PLAN §14.2): the post conv
+  is 1 × 1 and its output only reaches `TtsFlowOut`, which masks x1 with the
+  same [lo, hi) — z and the PCM are the masked form's bit for bit.
 - **Host ops** (`src/tts_nodes.py`, domain `axi.llm`): `TtsPrep`,
   `TtsGate`, `TtsSum`, `TtsFlowOut`, `TtsInterleave`, `TtsPcm`.  Each has
   a numpy reference and a C helper.  tanh / exp come from libm on both
-  sides.  With the row-ops unit the two-input sums, the interleaves and —
+  sides.  With the row-ops unit the flows' sums, the interleaves and —
   with its FOLD op — the int16 `TtsPrep` calls run there (§Row-ops unit).
+  `TtsPcm` is a lookup in a 65 536-entry int16 table of the specification's
+  own values (`tts_nodes.pcm_table`, `weights/_tts_pcm_tab_f<f>.dat`).
 - **The C helpers (`TTS_C`)** avoid per-element tests on the in-order A53;
   every fast path is bit-identical (`test/test_tts_ops.py`):
   - two-input sums with power-of-two scales, and the three-input average
