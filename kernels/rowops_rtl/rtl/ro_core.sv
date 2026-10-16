@@ -157,7 +157,7 @@ module ro_core #(
   logic [63:0] j_a, j_b, j_c, j_p, j_eps;
   logic [3:0]  opc;
   logic [1:0]  ak, bk, ck;
-  logic        f_ben, f_pbc, f_pkeep, f_relu, f_ln;
+  logic        f_ben, f_pbc, f_pkeep, f_relu, f_ln, f_scale;
   logic        is_stream, is_norm, is_rope, is_xpose, is_tload, is_fold, known, xp_contig;
   logic [35:0] ln_prod;                       // TRANSPOSE: L * R (T_CFG0)
   logic [31:0] lr_words;                      // TRANSPOSE: words of a tile's contiguous run
@@ -401,8 +401,9 @@ module ro_core #(
       f_pkeep <= j_op[F_P_KEEP];
       f_relu  <= j_op[F_RELU];
       f_ln    <= j_op[F_NORM_LN];
+      f_scale <= j_op[F_SCALE];
       is_stream <= (j_op[3:0] == OP_COPY) || (j_op[3:0] == OP_ADDX) || (j_op[3:0] == OP_DEQUANT) ||
-                   (j_op[3:0] == OP_MULACT);
+                   (j_op[3:0] == OP_MULACT) || (j_op[3:0] == OP_GATE);
       is_norm   <= (j_op[3:0] == OP_NORM);
       is_rope   <= (j_op[3:0] == OP_ROPE);
       is_xpose  <= (j_op[3:0] == OP_XPOSE);
@@ -603,7 +604,7 @@ module ro_core #(
 
   ro_stream u_st (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_stream),
-    .op (opc), .ak, .bk, .ck, .b_en (f_ben), .relu (f_relu), .bq_sh (j_bqsh[5:0]),
+    .op (opc), .ak, .bk, .ck, .b_en (f_ben), .relu (f_relu), .scale (f_scale), .bq_sh (j_bqsh[5:0]),
     .n (j_n), .nrows,
     .a_valid (a_valid && is_stream), .a_ready (st_a_ready), .a_data,
     .b_valid (b_valid && !loading && is_stream), .b_ready (st_b_ready), .b_data,

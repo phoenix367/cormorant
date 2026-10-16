@@ -1,15 +1,21 @@
 // ---------------------------------------------------------------------------
 // ro_stream — the element-wise ops of the RowOpsKernel (ROWOPS_RTL_KERNEL.md
-// §1.4): COPY, ADDX, DEQUANT, MULACT.  Stream A (and B) words in, C words
+// §1.4): COPY, ADDX, DEQUANT, MULACT, GATE.  Stream A (and B) words in, C words
 // out, one group of four lanes per cycle (an int16 word in two halves, an
 // int32 / float32 word whole), with every column's parameters from ro_param.
 // Per lane (64-bit integer arithmetic, rne = round half to even):
 //
-//   COPY / ADDX  y = sat_C(rne_shr((a << sh_a) [+ (b << sh_b)] + (bq << bq_sh), sh_c)), relu
+//   COPY / ADDX  y = sat_C(rne_shr(S, sh_c)), relu; S = (a << sh_a) [+ (b << sh_b)] + (bq << bq_sh)
+//                with SCALE: y = sat_C(rne_shr(S * G, sh_c)), relu (|S| < 2^31, 0 <= G < 2^25)
 //   DEQUANT      y = float32(a * 2^-sh_c)
 //   MULACT       y = sat16(rne_shr(silu_q(a << sh_a) * b, sh_c)),
 //                silu_q(gv) = rne_shr(gv * sig, 18), sig the interpolated sigmoid
 //                table of |gv| (ro_sig_ram), mirrored for gv < 0, 2^24 for |gv| >= 16
+//   GATE         y = sat16(rne_shr(th * sg, sh_c)), th = 2 sig(a << sh_a) - 2^24 (tanh),
+//                sg = sig(b << sh_b) — two table reads per lane (four UltraRAM copies)
+//
+// SCALE and GATE share MULACT's gv * sigma multiplier (its operands chosen at s10)
+// and its rounding (s18 - s19); their product bypasses the silu stages (s14 - s16).
 //
 // Lanes past the row's n produce 0 (the output rows' tail lanes).  Rows are
 // consumed and produced back to back: a row starts a new input word and a
@@ -37,6 +43,7 @@ module ro_stream
   input  logic [1:0]    ak, bk, ck,       // kinds of A, B, C
   input  logic          b_en,
   input  logic          relu,
+  input  logic          scale,            // COPY / ADDX: the sum times G (op bit 17)
   input  logic [5:0]    bq_sh,
   input  logic [31:0]   n,                // elements per row
   input  logic [31:0]   nrows,            // rows in the job
@@ -67,20 +74,24 @@ module ro_stream
   localparam int FW   = $clog2(CF_D);
 
   // Job constants -------------------------------------------------------------------------
-  logic        k_a32, k_b32, k_c16, k_ben, k_relu, k_mul, k_deq;
+  logic        k_a32, k_b32, k_c16, k_ben, k_relu, k_m16, k_deq, k_gate, k_scale, k_alt, k_srelu;
   logic [5:0]  k_bqsh;
   logic [31:0] k_n;
   always_ff @(posedge clk)
     if (start) begin
-      k_a32  <= (ak == K_I32);
-      k_b32  <= b_en && (bk == K_I32);
-      k_c16  <= (ck == K_I16);
-      k_ben  <= b_en;
-      k_relu <= relu;
-      k_bqsh <= bq_sh;
-      k_mul  <= (op == OP_MULACT);
-      k_deq  <= (op == OP_DEQUANT);
-      k_n    <= n;
+      k_a32   <= (ak == K_I32);
+      k_b32   <= b_en && (bk == K_I32);
+      k_c16   <= (ck == K_I16);
+      k_ben   <= b_en;
+      k_relu  <= relu;
+      k_bqsh  <= bq_sh;
+      k_m16   <= (op == OP_MULACT) || (op == OP_GATE);         // sat16 of the product path
+      k_deq   <= (op == OP_DEQUANT);
+      k_gate  <= (op == OP_GATE);
+      k_scale <= scale && ((op == OP_COPY) || (op == OP_ADDX));
+      k_alt   <= (op == OP_GATE) || (scale && ((op == OP_COPY) || (op == OP_ADDX)));   // the bypass
+      k_srelu <= relu && scale && ((op == OP_COPY) || (op == OP_ADDX));
+      k_n     <= n;
     end
 
   // Input holders: one word each, consumed in halves when the stream is int16.
@@ -186,14 +197,19 @@ module ro_stream
     end
   end
 
-  // The sigmoid table: two UltraRAM copies, two ports each, one lane per port;
-  // the address issued at s5 answers at s7.
-  logic [11:0]      sig_idx [PB];
-  logic [SIG_W-1:0] sig_q0, sig_q1, sig_q2, sig_q3;
+  // The sigmoid table: four UltraRAM copies, two ports each, one lane per port —
+  // u_sig0 / u_sig1 answer the A side (MULACT's gv, GATE's 2a), u_sig2 / u_sig3 the
+  // B side (GATE's b); the address issued at s5 answers at s7.
+  logic [11:0]      sig_idx [PB], sigb_idx [PB];
+  logic [SIG_W-1:0] sig_q0, sig_q1, sig_q2, sig_q3, sigb_q0, sigb_q1, sigb_q2, sigb_q3;
   ro_sig_ram u_sig0 (.clk, .we (tbl_we), .waddr (tbl_addr), .wdata (tbl_data),
                      .addr_a (sig_idx[0]), .addr_b (sig_idx[1]), .q_a (sig_q0), .q_b (sig_q1));
   ro_sig_ram u_sig1 (.clk, .we (tbl_we), .waddr (tbl_addr), .wdata (tbl_data),
                      .addr_a (sig_idx[2]), .addr_b (sig_idx[3]), .q_a (sig_q2), .q_b (sig_q3));
+  ro_sig_ram u_sig2 (.clk, .we (tbl_we), .waddr (tbl_addr), .wdata (tbl_data),
+                     .addr_a (sigb_idx[0]), .addr_b (sigb_idx[1]), .q_a (sigb_q0), .q_b (sigb_q1));
+  ro_sig_ram u_sig3 (.clk, .we (tbl_we), .waddr (tbl_addr), .wdata (tbl_data),
+                     .addr_a (sigb_idx[2]), .addr_b (sigb_idx[3]), .q_a (sigb_q2), .q_b (sigb_q3));
 
   // Per-lane arithmetic -----------------------------------------------------------------------
   logic [31:0] res [PB];                  // the lane results at s20
@@ -224,14 +240,28 @@ module ro_stream
     logic [24:0]        si9, sig10;                 // the interpolation, sigma
     logic signed [56:0] ps11, ps12, ps13;           // gv * sigma at 2^-38
     logic signed [38:0] s14;                        // silu at 2^-20
-    logic signed [55:0] pu15, pu16, pu17;           // silu * u
+    logic signed [55:0] pu15, pu16;                 // silu * u
+    logic signed [56:0] pg14, pg15, pg16, pm17;     // GATE / SCALE: the product past the silu stages
     rne_t               ra18;
     logic signed [63:0] r19;
     logic signed [31:0] u3, u4, u5, u6, u7, u8, u9, u10, u11, u12, u13, u14;
     logic [5:0]         shc6, shc7, shc8, shc9, shc10, shc11, shc12, shc13, shc14, shc15, shc16, shc17;
+    // GATE: the sigma side (b), as MULACT's path
+    logic signed [31:0] gvb3;
+    logic [31:0]        gab4;
+    logic               bigb5, bigb6, bigb7, bigb8, bigb9, negb4, negb5, negb6, negb7, negb8, negb9;
+    logic [11:0]        idxb5;
+    logic [5:0]         fracb5, fracb6, fracb7, fracb8;
+    logic [SIG_W-1:0]   qb7, qb8;
+    logic [24:0]        sib9;
+    // SCALE: the sum S and G carried to the multiplier
+    logic signed [31:0] sc6, sc7, sc8, sc9;
+    logic [24:0]        g3, g4, g5, g6, g7, g8, g9;
 
-    assign sig_idx[l] = idx5;
-    assign q7 = (l == 0) ? sig_q0 : (l == 1) ? sig_q1 : (l == 2) ? sig_q2 : sig_q3;
+    assign sig_idx[l]  = idx5;
+    assign sigb_idx[l] = idxb5;
+    assign q7  = (l == 0) ? sig_q0 : (l == 1) ? sig_q1 : (l == 2) ? sig_q2 : sig_q3;
+    assign qb7 = (l == 0) ? sigb_q0 : (l == 1) ? sigb_q1 : (l == 2) ? sigb_q2 : sigb_q3;
 
     always_ff @(posedge clk) begin
       // ---- s3: the shifts
@@ -240,6 +270,8 @@ module ro_stream
       bq3  <= 64'(p2[l].bq) <<< k_bqsh;
       shc3 <= p2[l].sh_c;
       gv3  <= x2[l] <<< p2[l].sh_a[4:0];
+      gvb3 <= y2[l] <<< p2[l].sh_b[4:0];
+      g3   <= p2[l].g[24:0];
       u3   <= y2[l];
       fv3  <= x2[l];
       // ---- s4
@@ -248,6 +280,9 @@ module ro_stream
       shc4  <= shc3;
       ga4   <= gv3[31] ? 32'(-gv3) : 32'(gv3);
       neg4  <= gv3[31];
+      gab4  <= gvb3[31] ? 32'(-gvb3) : 32'(gvb3);
+      negb4 <= gvb3[31];
+      g4    <= g3;
       gv4   <= gv3;
       u4    <= u3;
       fneg4 <= fv3[31];
@@ -259,6 +294,11 @@ module ro_stream
       idx5  <= ga4[17:6];
       frac5 <= ga4[5:0];
       neg5  <= neg4;
+      bigb5  <= (gab4 >= (32'd1 << 18));
+      idxb5  <= gab4[17:6];
+      fracb5 <= gab4[5:0];
+      negb5  <= negb4;
+      g5     <= g4;
       gv5   <= gv4;
       u5    <= u4;
       begin
@@ -274,6 +314,9 @@ module ro_stream
       ra6   <= rne_a(sum5, shc5);
       shc6  <= shc5;
       big6  <= big5; neg6 <= neg5; frac6 <= frac5; gv6 <= gv5; u6 <= u5;
+      bigb6 <= bigb5; negb6 <= negb5; fracb6 <= fracb5;
+      sc6   <= 32'(sum5);                              // SCALE: |S| < 2^31 (the contract)
+      g6    <= g5;
       fsh6   <= fmag5 << (6'd31 - flz5[4:0]);
       fexp6  <= 8'd127 + 8'(flz5) - 8'(shc5);       // exponent of 2^lz * 2^-sh_c
       fzero6 <= fzero5;
@@ -282,6 +325,9 @@ module ro_stream
       r7    <= rne_b(ra6);
       shc7  <= shc6;
       big7  <= big6; neg7 <= neg6; frac7 <= frac6; gv7 <= gv6; u7 <= u6;
+      bigb7 <= bigb6; negb7 <= negb6; fracb7 <= fracb6;
+      sc7   <= sc6;
+      g7    <= g6;
       begin
         // mantissa: bits 30..8 of the normalised magnitude, round half to even on bits 7..0
         logic [23:0] m;
@@ -298,7 +344,11 @@ module ro_stream
       c8    <= k_c16 ? 32'(signed'(sat16(r7))) : sat32(r7);
       shc8  <= shc7;
       q8    <= q7;                                    // a fabric register after the UltraRAM
+      qb8   <= qb7;
       frac8 <= frac7;
+      fracb8 <= fracb7; bigb8 <= bigb7; negb8 <= negb7;
+      sc8   <= sc7;
+      g8    <= g7;
       big8  <= big7;
       neg8  <= neg7;
       gv8   <= gv7;
@@ -307,19 +357,32 @@ module ro_stream
       // ---- s9
       c9    <= k_deq ? f8 : (k_relu && c8[31]) ? 32'sd0 : c8;
       si9   <= 25'(((31'(q8[24:0]) << 6) + 31'(q8[48:25]) * 31'(frac8)) >> 6);   // T + floor(D * frac / 64): one DSP multiply-add
+      sib9  <= 25'(((31'(qb8[24:0]) << 6) + 31'(qb8[48:25]) * 31'(fracb8)) >> 6);
       big9  <= big8;
       neg9  <= neg8;
+      bigb9 <= bigb8;
+      negb9 <= negb8;
+      sc9   <= sc8;
+      g9    <= g8;
       gv9   <= gv8;
       shc9  <= shc8;
       u9    <= u8;
       // ---- s10
       c10   <= c9;
+      // the multiplier's operands: MULACT gv * sigma(gv); GATE th * sg; SCALE S * G
       begin
-        logic [24:0] s;
-        s = big9 ? (25'd1 << 24) : si9;                 // |gv| >= 16: sigma = 1
-        sig10 <= neg9 ? ((25'd1 << 24) - s) : s;        // mirrored for gv < 0
+        logic [24:0]        s, sa, sbb, sb;
+        logic signed [25:0] u, th;
+        s   = big9 ? (25'd1 << 24) : si9;               // |gv| >= 16: sigma = 1
+        sa  = neg9 ? ((25'd1 << 24) - s) : s;           // mirrored for gv < 0
+        // tanh = 2 sigma(2a) - 1: si9 lies in [2^23, 2^24), so 2 si9 - 2^24 is its low 23 bits doubled
+        u   = big9 ? (26'sd1 <<< 24) : 26'({1'b0, si9[22:0], 1'b0});
+        th  = neg9 ? -u : u;
+        sbb = bigb9 ? (25'd1 << 24) : sib9;
+        sb  = negb9 ? ((25'd1 << 24) - sbb) : sbb;
+        sig10 <= k_scale ? g9 : k_gate ? sb : sa;
+        gv10  <= k_scale ? sc9 : k_gate ? 32'(th) : gv9;
       end
-      gv10  <= gv9;
       shc10 <= shc9;
       u10   <= u9;
       // ---- s11
@@ -339,18 +402,23 @@ module ro_stream
         s14 <= q + 39'(up);
       end
       c14 <= c13; shc14 <= shc13; u14 <= u13;
+      pg14 <= ps13;
       // ---- s15: silu * u (39 x 17, DSP), registered twice more
       pu15 <= 56'(s14) * 56'(signed'(u14[16:0]));
-      c15 <= c14; shc15 <= shc14;
-      pu16 <= pu15; c16 <= c15; shc16 <= shc15;
-      pu17 <= pu16; c17 <= c16; shc17 <= shc16;
+      c15 <= c14; shc15 <= shc14; pg15 <= pg14;
+      pu16 <= pu15; c16 <= c15; shc16 <= shc15; pg16 <= pg15;
+      pm17 <= k_alt ? pg16 : 57'(pu16);                // GATE / SCALE: the product of s11
+      c17 <= c16; shc17 <= shc16;
       // ---- s18, s19: the rounding
-      ra18 <= rne_a(64'(pu17), shc17);
+      ra18 <= rne_a(64'(pm17), shc17);
       c18  <= c17;
       r19  <= rne_b(ra18);
       c19  <= c18;
       // ---- s20
-      res[l] <= k_mul ? 32'(signed'(sat16(r19))) : c19;
+      if (k_m16)        res[l] <= 32'(signed'(sat16(r19)));                  // MULACT, GATE
+      else if (k_scale) res[l] <= (k_srelu && r19[63]) ? 32'd0 :              // SCALE: sat_C, relu
+                                  k_c16 ? 32'(signed'(sat16(r19))) : sat32(r19);
+      else              res[l] <= c19;
     end
 
     logic unused_lane;

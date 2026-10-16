@@ -399,13 +399,46 @@ def gate_shifts(f_in: int, f_out: int) -> Tuple[int, int, int]:
     return G_BITS + 1 - int(f_in), G_BITS - int(f_in), sh_c
 
 
+def gate_op(a_raw: np.ndarray, b_raw: np.ndarray, sh_a, sh_b, sh_c) -> np.ndarray:
+    """The GATE job per element (ROWOPS_RTL_KERNEL.md §1.4): th = 2 sig_q(a << sh_a) -
+    2^24, sg = sig_q(b << sh_b), y = sat16(rne_shr(th * sg, sh_c)); the shifts
+    broadcast (per column).  Contract: sh_a, sh_b <= 16 (a << sh_a within int32)."""
+    a = np.asarray(a_raw, np.int64)
+    b = np.asarray(b_raw, np.int64)
+    th = 2 * sig_q(a << np.asarray(sh_a, np.int64)) - (1 << SIG_BITS)
+    sg = sig_q(b << np.asarray(sh_b, np.int64))
+    prod = th * sg
+    return sat16(rne_shr_vec(prod, np.broadcast_to(np.asarray(sh_c, np.int64), prod.shape)))
+
+
 def gate(a_raw: np.ndarray, b_raw: np.ndarray, f_in: int, f_out: int) -> np.ndarray:
     """y = sat16(rne(th * sg / 2^(48 - f_out))) with th = 2 sigma_q(2a) - 2^24 and
     sg = sigma_q(b) (a, b int16 at 2^-f_in; sigma_q = sig_q at 2^-24)."""
-    sh_a, sh_b, sh_c = gate_shifts(f_in, f_out)
-    th = 2 * sig_q(np.asarray(a_raw, np.int64) << sh_a) - (1 << SIG_BITS)
-    sg = sig_q(np.asarray(b_raw, np.int64) << sh_b)
-    return sat16(rne_shr(th * sg, sh_c))
+    return gate_op(a_raw, b_raw, *gate_shifts(f_in, f_out))
+
+
+# ------------------------------------------------------------------ SCALE (op bit 17)
+# COPY / ADDX with SCALE multiply the sum by the column's G before the rounding
+# (RPU_PLAN §14.3): y = sat_C(rne_shr(S * G, sh_c)), S = (A << sh_a) [+ (B << sh_b)]
+# + (Bq' << bq_sh).  Contract: |S| < 2^31, 0 <= G < 2^25.  The Piper stage average
+# (y0 + y1 + y2) / 3 one exponent finer is S = T + y2 (T = y0 + y1, int32) with
+# G = AVG3_G, sh_c = AVG3_SH: rne(2 S / 3) for every |S| <= 3 * 2^15 (no ties).
+SCALE_S_BITS = 31
+SCALE_G_BITS = 25
+AVG3_SH = 18
+AVG3_G = (2 ** (AVG3_SH + 1) + 1) // 3          # round(2^19 / 3) = 174 763
+
+
+def scaled_round(s: np.ndarray, G, sh_c) -> np.ndarray:
+    """rne_shr(S * G, sh_c) of the pre-rounding sums S (int64; no saturation)."""
+    s = np.asarray(s, np.int64)
+    if (np.abs(s) >= (1 << SCALE_S_BITS)).any():
+        raise ValueError("SCALE: a sum outside +-2^31")
+    G = np.asarray(G, np.int64)
+    if ((G < 0) | (G >= (1 << SCALE_G_BITS))).any():
+        raise ValueError("SCALE: G outside [0, 2^25)")
+    prod = s * G
+    return rne_shr_vec(prod, np.broadcast_to(np.asarray(sh_c, np.int64), prod.shape))
 
 
 # ------------------------------------------------------------------ FOLD (op 9)
@@ -496,8 +529,10 @@ def fold_aux(m: int, s: int) -> int:
 # register's fields, the kinds and the parameter block's 16-byte entry.
 OP_COPY, OP_ADDX, OP_DEQUANT, OP_MULACT, OP_NORM, OP_ROPE, OP_XPOSE, OP_TLOAD = 1, 2, 3, 4, 5, 6, 7, 8
 OP_FOLD = 9
+OP_GATE = 10                  # RPU_PLAN §14.3
 K_I16, K_I32, K_F32 = 0, 1, 2
 F_B_EN, F_P_BCAST, F_P_KEEP, F_RELU, F_NORM_LN = 1 << 12, 1 << 13, 1 << 14, 1 << 15, 1 << 16
+F_SCALE = 1 << 17             # COPY / ADDX: the sum times G before the rounding (RPU_PLAN §14.3)
 N_MAX = 4096                  # elements per row
 PARAM_BYTES = 16              # one column's entry: int32 G, int32 Bq' (int22), u8 sh_a, sh_b, sh_c
 TABLE_BYTES = 65536           # the image OP_TLOAD reads once per bitstream
@@ -505,11 +540,12 @@ TABLE_WORDS = TABLE_BYTES // 16
 
 
 def opword(op: int, ak: int = K_I16, bk: int = K_I16, ck: int = K_I16, b_en: bool = False,
-           p_bcast: bool = False, p_keep: bool = False, relu: bool = False, ln: bool = False) -> int:
+           p_bcast: bool = False, p_keep: bool = False, relu: bool = False, ln: bool = False,
+           scale: bool = False) -> int:
     """The op register: [3:0] op, [5:4] A kind, [7:6] B kind, [9:8] C kind, the flags."""
     return (int(op) | (int(ak) << 4) | (int(bk) << 6) | (int(ck) << 8) | (F_B_EN if b_en else 0)
             | (F_P_BCAST if p_bcast else 0) | (F_P_KEEP if p_keep else 0) | (F_RELU if relu else 0)
-            | (F_NORM_LN if ln else 0))
+            | (F_NORM_LN if ln else 0) | (F_SCALE if scale else 0))
 
 
 def param_block(G, Bq, sh_a, sh_b, sh_c) -> np.ndarray:

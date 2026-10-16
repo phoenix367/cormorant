@@ -180,7 +180,7 @@ struct Tb {
   bool          chain_dirty = false;      // chain_n != 0 in the unit: a single job writes 0 first
   // what the chains run covered
   struct ChainStats { uint64_t chains = 0, jobs = 0, raw_a = 0, raw_b = 0, waw = 0, war = 0, keep = 0, keep_first = 0,
-                      tload = 0, clamped = 0, junk = 0, ops[10] = {}; } cst;
+                      tload = 0, clamped = 0, junk = 0, ops[11] = {}; } cst;
 #if VM_TRACE
   std::unique_ptr<TraceT> tfp;
 #endif
@@ -300,8 +300,8 @@ struct Tb {
   // P_KEEP bookkeeping (ro_core T_CFG2: the stream ops, NORM and ROPE with work load P unless P_KEEP)
   static bool p_go(const ro::Job& j) {
     const uint32_t op = j.code();
-    return (op == ro::COPY || op == ro::ADDX || op == ro::DEQUANT || op == ro::MULACT || op == ro::NORM ||
-            op == ro::ROPE) && j.n && j.c1 && j.c2 && j.n <= 4096;
+    return (op == ro::COPY || op == ro::ADDX || op == ro::DEQUANT || op == ro::MULACT || op == ro::GATE ||
+            op == ro::NORM || op == ro::ROPE) && j.n && j.c1 && j.c2 && j.n <= 4096;
   }
   static uint32_t p_sig(const ro::Job& j) { return j.op & ~(uint32_t)(ro::F_P_KEEP | ro::F_P_BCAST); }
   static void p_note(PLoad& s, const ro::Job& j) {
@@ -478,7 +478,7 @@ struct Tb {
     for (size_t k = 0; k < N; k++) {
       const Case& t = ch.jobs[k];
       cst.jobs++;
-      cst.ops[t.j.code() % 10]++;
+      cst.ops[t.j.code() % 11]++;
       cst.raw_a += t.dep_a; cst.raw_b += t.dep_b;
       cst.waw += t.link_c == 1; cst.war += t.link_c == 2;
       cst.tload += t.j.code() == ro::TLOAD;
@@ -581,9 +581,9 @@ static void place(Case& t, std::mt19937& rng) {
 }
 
 static uint32_t opword(uint32_t code, ro::Kind ak, ro::Kind bk, ro::Kind ck, bool ben, bool bcast,
-                       bool relu = false, bool ln = false) {
+                       bool relu = false, bool ln = false, bool scale = false) {
   return code | (ak << 4) | (bk << 6) | (ck << 8) | (ben ? ro::F_B_EN : 0) | (bcast ? ro::F_P_BCAST : 0) |
-         (relu ? ro::F_RELU : 0) | (ln ? ro::F_NORM_LN : 0);
+         (relu ? ro::F_RELU : 0) | (ln ? ro::F_NORM_LN : 0) | (scale ? ro::F_SCALE : 0);
 }
 
 static int gamma_scale(double gmax) {
@@ -600,9 +600,9 @@ static Case random_case(std::mt19937& rng, bool small = false) {
   Case t;
   ro::Job& j = t.j;
   const uint32_t pick = U(0, 99);
-  const uint32_t code = pick < 18 ? ro::ADDX : pick < 27 ? ro::COPY : pick < 34 ? ro::DEQUANT :
-                        pick < 51 ? ro::MULACT : pick < 68 ? ro::NORM : pick < 78 ? ro::ROPE :
-                        pick < 88 ? ro::XPOSE : ro::FOLD;
+  const uint32_t code = pick < 17 ? ro::ADDX : pick < 25 ? ro::COPY : pick < 31 ? ro::DEQUANT :
+                        pick < 43 ? ro::MULACT : pick < 54 ? ro::GATE : pick < 68 ? ro::NORM :
+                        pick < 78 ? ro::ROPE : pick < 88 ? ro::XPOSE : ro::FOLD;
   // shape
   const uint32_t shape = U(0, 9);
   j.n  = shape <= 1 ? U(1, 24) : shape <= 6 ? U(1, small ? 320 : 800) : shape <= 8 ? U(1, small ? 1024 : 4096) :
@@ -623,13 +623,25 @@ static Case random_case(std::mt19937& rng, bool small = false) {
                    ck = U(0, 1) ? ro::I32 : ro::I16;
     const bool ben = code == ro::ADDX && U(0, 5) != 0;
     const bool relu = U(0, 3) == 0;
-    j.op = opword(code, ak, bk, ck, ben, bcast, relu);
-    j.bq_sh = U(0, 36);
+    // SCALE (RPU_PLAN §14.3): the sum times G inside the contract, |S| < 2^31 and
+    // 0 <= G < 2^25 — int32 data from the small mode, shifts and the bias bounded
+    const bool scale = U(0, 2) == 0;
+    j.op = opword(code, ak, bk, ck, ben, bcast, relu, false, scale);
+    j.bq_sh = scale ? U(0, 8) : U(0, 36);
+    if (scale && (ak == ro::I32 || (ben && bk == ro::I32))) t.data_mode = 0;
     for (auto& p : t.params) {
-      p.sh_a = ak == ro::I32 ? U(0, 20) : U(0, 36);
-      p.sh_b = bk == ro::I32 ? U(0, 20) : U(0, 36);
-      p.sh_c = U(0, 50);
-      p.g = 0;
+      if (scale) {
+        p.sh_a = ak == ro::I32 ? U(0, 8) : U(0, 14);
+        p.sh_b = bk == ro::I32 ? U(0, 8) : U(0, 14);
+        p.sh_c = U(0, 56);
+        static const int32_t gs[] = {0, 1, 3, 174763, (1 << 25) - 1, 1 << 24};
+        p.g = U(0, 2) ? (int32_t)gs[U(0, 5)] : (int32_t)U(0, (1u << 25) - 1);
+      } else {
+        p.sh_a = ak == ro::I32 ? U(0, 20) : U(0, 36);
+        p.sh_b = bk == ro::I32 ? U(0, 20) : U(0, 36);
+        p.sh_c = U(0, 50);
+        p.g = 0;
+      }
       p.bq = (U(0, 2) == 0) ? 0 : (int32_t)std::uniform_int_distribution<int>(-(1 << 21), (1 << 21) - 1)(rng);
     }
     if (U(0, 4) == 0) { j.win_lo = U(0, j.c1 / 2 + 1); j.win_hi = U(j.win_lo, j.c1 + 1); }
@@ -648,6 +660,18 @@ static Case random_case(std::mt19937& rng, bool small = false) {
       const uint32_t fg = U(8, 14), fu = U(8, 15), fo = U(5, 12);
       p.sh_a = 14 - fg;
       p.sh_c = 20 + fu - fo;
+    }
+    j.a_s1 = stride(2ull * j.n); j.a_s2 = block_stride(j.a_s1);
+    j.b_s1 = stride(2ull * j.n); j.b_s2 = block_stride(j.b_s1);
+    j.c_s1 = stride(2ull * j.n); j.c_s2 = block_stride(j.c_s1);
+  } else if (code == ro::GATE) {
+    // tanh(a << sh_a) * sigma(b << sh_b) (RPU_PLAN §14.3): the shifts up to 16 (a << sh_a
+    // within int32, the contract), the output shift around 48 - f_out (saturating below 33)
+    j.op = opword(code, ro::I16, ro::I16, ro::I16, true, bcast);
+    for (auto& p : t.params) {
+      p.sh_a = U(0, 2) ? U(4, 7) : U(0, 16);
+      p.sh_b = U(0, 2) ? U(3, 6) : U(0, 16);
+      p.sh_c = U(0, 2) ? U(36, 42) : U(26, 52);
     }
     j.a_s1 = stride(2ull * j.n); j.a_s2 = block_stride(j.a_s1);
     j.b_s1 = stride(2ull * j.n); j.b_s2 = block_stride(j.b_s1);
@@ -779,8 +803,8 @@ static Case tload_case() {
 // ---------------------------------------------------------------------------
 static bool loads_p(const ro::Job& j) {
   const uint32_t op = j.code();
-  return (op == ro::COPY || op == ro::ADDX || op == ro::DEQUANT || op == ro::MULACT || op == ro::NORM ||
-          op == ro::ROPE) && j.n && j.c1 && j.c2 && j.n <= 4096;
+  return (op == ro::COPY || op == ro::ADDX || op == ro::DEQUANT || op == ro::MULACT || op == ro::GATE ||
+          op == ro::NORM || op == ro::ROPE) && j.n && j.c1 && j.c2 && j.n <= 4096;
 }
 
 // A job that may keep the parameter RAM of `src` (the same op, kinds, flags, n and
@@ -798,7 +822,7 @@ static Case keep_clone(const Case& src, std::mt19937& rng) {
   }
   fixup_strides(t);
   for (ro::Param& p : t.params) {
-    p.g = ~p.g;
+    p.g = t.j.scale() ? (1 << 25) - 1 - p.g : ~p.g;     // SCALE: G stays in [0, 2^25)
     p.bq = ~p.bq;
     p.sh_c ^= 1;
   }
@@ -864,11 +888,13 @@ static void place_chain(Chain& ch, std::mt19937& rng, bool link = true) {
         if (ch.jobs[i].j.code() != ro::TLOAD && ok(ch.jobs[i], (int)i)) c.push_back((int)i);
       return c.empty() ? -1 : c[U(0, (uint32_t)c.size() - 1)];
     };
-    if (U(0, 9) < 4) {                                 // A <- an earlier job's C
+    // a SCALE job's int32 input keeps its own (small) data: |S| < 2^31 is the contract
+    const bool a_free = !(t.j.scale() && t.j.ak() == ro::I32), b_free = !(t.j.scale() && t.j.bk() == ro::I32);
+    if (U(0, 9) < 4 && a_free) {                       // A <- an earlier job's C
       const int i = pick([&](const Case& s, int) { return s.own_c && s.rc.bytes >= t.ra.bytes; });
       if (i >= 0) { t.j.a = (ch.jobs[i].j.c & ~15ull) + t.a_off; t.dep_a = true; src_a[k] = i; }
     }
-    if (t.rb.bytes && U(0, 9) < 3) {                   // B <- an earlier job's C
+    if (t.rb.bytes && U(0, 9) < 3 && b_free) {         // B <- an earlier job's C
       const int i = pick([&](const Case& s, int) { return s.own_c && s.rc.bytes >= t.rb.bytes; });
       if (i >= 0) { t.j.b = ch.jobs[i].j.c & ~15ull; t.dep_b = true; src_b[k] = i; }
     }
@@ -1154,6 +1180,10 @@ int main(int argc, char** argv) {
       {"perf_ln_1024x768_i32",    opword(ro::NORM, ro::I32, ro::I16, ro::I16, false, false, false, true), 768, 1024},
       {"perf_rope_256x576",       opword(ro::ROPE, ro::I16, ro::I32, ro::I16, true, false), 576, 256},
       {"perf_xpose_q_8x64_x96",   opword(ro::XPOSE, ro::I16, ro::I16, ro::I16, false, false), 64, 96},
+      // Piper's chunk (RPU_PLAN §14): one TtsGate, the last stage average's (T + y2) * G
+      {"perf_gate_12x4096",       opword(ro::GATE, ro::I16, ro::I16, ro::I16, true, true), 4096, 12},
+      {"perf_avg3_384x4096",      opword(ro::ADDX, ro::I32, ro::I16, ro::I16, true, true, false, false, true),
+                                  4096, 384},
     };
     // Piper's TtsPrep calls as FOLD jobs: the last upsampling stage, the one before, a flow coupling
     struct F { const char* l; uint32_t L, nch, rows, w0, hl, hr, m, s; };
@@ -1180,6 +1210,11 @@ int main(int argc, char** argv) {
       t.j.op = p.op; t.j.n = p.n; t.j.c1 = p.c1; t.j.c2 = 1; t.data_mode = 0;
       if ((p.op & 15) == ro::ROPE) t.j.aux = 64;
       if ((p.op & 15) == ro::XPOSE) { t.j.aux = 8; t.j.b_s2 = 2 * 768; t.j.c_s1 = 16; t.j.a_s1 = 8 * 1152; t.j.b_s1 = 1152; }
+      if (p.op & ro::F_SCALE) {                     // the stage average: G = round(2^19 / 3), >> 18
+        t.params.assign(1, ro::Param{});
+        t.params[0].g = 174763; t.params[0].sh_c = 18;
+        t.j.bq_sh = 0; t.j.win_lo = 0; t.j.win_hi = 0xFFFFFFFFu;
+      }
       t.label = p.l;
       cases.push_back(t);
     }
@@ -1278,13 +1313,14 @@ int main(int argc, char** argv) {
   if (tb.cst.chains) {
     const auto& c = tb.cst;
     std::printf("\nchains: %llu (%llu jobs: COPY %llu ADDX %llu DEQUANT %llu MULACT %llu NORM %llu ROPE %llu "
-                "TRANSPOSE %llu TLOAD %llu FOLD %llu); A from an earlier job %llu, B %llu, C over an earlier "
+                "TRANSPOSE %llu TLOAD %llu FOLD %llu GATE %llu); A from an earlier job %llu, B %llu, C over an earlier "
                 "output %llu / input %llu; P_KEEP %llu (%llu first in their chain); chain_n > 16: %llu; "
                 "junk tails %llu\n",
                 (unsigned long long)c.chains, (unsigned long long)c.jobs, (unsigned long long)c.ops[1],
                 (unsigned long long)c.ops[2], (unsigned long long)c.ops[3], (unsigned long long)c.ops[4],
                 (unsigned long long)c.ops[5], (unsigned long long)c.ops[6], (unsigned long long)c.ops[7],
-                (unsigned long long)c.ops[8], (unsigned long long)c.ops[9], (unsigned long long)c.raw_a,
+                (unsigned long long)c.ops[8], (unsigned long long)c.ops[9], (unsigned long long)c.ops[10],
+                (unsigned long long)c.raw_a,
                 (unsigned long long)c.raw_b, (unsigned long long)c.waw, (unsigned long long)c.war,
                 (unsigned long long)c.keep, (unsigned long long)c.keep_first, (unsigned long long)c.clamped,
                 (unsigned long long)c.junk);

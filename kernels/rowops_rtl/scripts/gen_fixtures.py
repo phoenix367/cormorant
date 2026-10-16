@@ -35,15 +35,18 @@ _spec = importlib.util.spec_from_file_location("rowops_spec", SPEC)
 rs = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rs)
 
-OP = dict(COPY=1, ADDX=2, DEQUANT=3, MULACT=4, NORM=5, ROPE=6, XPOSE=7, FOLD=9)
+OP = dict(COPY=1, ADDX=2, DEQUANT=3, MULACT=4, NORM=5, ROPE=6, XPOSE=7, FOLD=9, GATE=10)
 I16, I32, F32 = 0, 1, 2
 F_B_EN, F_P_BCAST, F_P_KEEP, F_RELU, F_NORM_LN = 1 << 12, 1 << 13, 1 << 14, 1 << 15, 1 << 16
+F_SCALE = 1 << 17
 POISON = 0xDE
 
 
-def opword(code, ak=I16, bk=I16, ck=I16, b_en=False, bcast=False, relu=False, ln=False, p_keep=False):
+def opword(code, ak=I16, bk=I16, ck=I16, b_en=False, bcast=False, relu=False, ln=False, p_keep=False,
+           scale=False):
     return (code | (ak << 4) | (bk << 6) | (ck << 8) | (F_B_EN if b_en else 0) | (F_P_BCAST if bcast else 0)
-            | (F_RELU if relu else 0) | (F_NORM_LN if ln else 0) | (F_P_KEEP if p_keep else 0))
+            | (F_RELU if relu else 0) | (F_NORM_LN if ln else 0) | (F_P_KEEP if p_keep else 0)
+            | (F_SCALE if scale else 0))
 
 
 def kbytes(k):
@@ -149,10 +152,11 @@ def rne_shr(v, k):
 
 
 def stream_rows(op, n, c1, c2, ak, bk, ck, params, bq_sh, rng, b_en, relu=False, win=(0, 0xFFFFFFFF),
-                vals_a=None):
-    """COPY / ADDX rows and their expected outputs per the spec's formula."""
-    lo_a, hi_a = (-(1 << 30), 1 << 30) if ak == I32 else (-32768, 32767)
-    lo_b, hi_b = (-(1 << 30), 1 << 30) if bk == I32 else (-32768, 32767)
+                vals_a=None, scale=False, i32_bits=30):
+    """COPY / ADDX rows and their expected outputs per the spec's formula (SCALE: the
+    sum times the column's G before the rounding, rowops_spec.scaled_round)."""
+    lo_a, hi_a = (-(1 << i32_bits), 1 << i32_bits) if ak == I32 else (-32768, 32767)
+    lo_b, hi_b = (-(1 << i32_bits), 1 << i32_bits) if bk == I32 else (-32768, 32767)
     a_rows, b_rows, out = {}, {}, {}
     for i2 in range(c2):
         for i1 in range(c1):
@@ -167,7 +171,7 @@ def stream_rows(op, n, c1, c2, ak, bk, ck, params, bq_sh, rng, b_en, relu=False,
                 g, bq, sa, sb, sc = params[0] if len(params) == 1 else params[c]
                 x = 0 if zero else int(a[c])
                 s = (x << sa) + ((int(b[c]) << sb) if b_en else 0) + (bq << bq_sh)
-                v = rne_shr(s, sc)
+                v = int(rs.scaled_round(np.array([s]), g, sc)[0]) if scale else rne_shr(s, sc)
                 v = max(-32768, min(32767, v)) if ck == I16 else max(-(1 << 31), min((1 << 31) - 1, v))
                 if relu and v < 0:
                     v = 0
@@ -429,6 +433,54 @@ def build_cases():
     add(fold_case("fold_m7_s9_w8", 3, 40, 5, 8, 0, 0, 0, 7, 9, (0, 40)))
     add(fold_case("fold_w1_rows9", 2, 30, 9, 3, 0, 0, 1, 10, 2, (0, 30)))
     add(fold_case("fold_unaligned_rows", 3, 50, 2, 24, 3, 2, 0, 10, 3, (2, 47), pad=3))
+
+    # 19. GATE (op 10, RPU_PLAN §14.3: Piper's TtsGate) — rowops_spec.gate_op per column
+    def gate_case(label, n, c1, prm, a, b, bcast):
+        sh = np.array([prm[0] if bcast else prm[c] for c in range(n)], np.int64)
+        out = {(0, i): [int(v) for v in rs.gate_op(a[i], b[i], sh[:, 2], sh[:, 3], sh[:, 4])] for i in range(c1)}
+        return Case(label, opword(OP["GATE"], b_en=True, bcast=bcast), n, c1, 1, strides_for(n, c1, I16, I16, I16),
+                    {(0, i): [int(v) for v in a[i]] for i in range(c1)},
+                    {(0, i): [int(v) for v in b[i]] for i in range(c1)}, prm, out, (I16, I16, I16))
+    n, c1 = 256, 4
+    a = np.clip(np.rint(rng.normal(0, 1.5, (c1, n)) * 2 ** 9), -32768, 32767).astype(np.int64)
+    b = np.clip(np.rint(rng.normal(0, 1.5, (c1, n)) * 2 ** 9), -32768, 32767).astype(np.int64)
+    a[0, :8] = [-32768, 32767, 0, 1, -1, 8192, -8192, 4096]
+    b[0, :8] = [32767, -32768, 1, 0, -1, -8192, 8192, 32767]
+    add(gate_case("gate_f9_256x4", n, c1, [(0, 0, *rs.gate_shifts(9, 9))], a, b, True))
+    n, c1 = 100, 2
+    f_in, f_out = rng.integers(9, 13, n), rng.integers(7, 11, n)
+    prm = [(0, 0, *rs.gate_shifts(int(f_in[c]), int(f_out[c]))) for c in range(n)]
+    add(gate_case("gate_percol_tail100x2", n, c1, prm, rng.integers(-32768, 32768, (c1, n)),
+                  rng.integers(-32768, 32768, (c1, n)), False))
+    # every int16 on both sides: a ascending, b descending (16 rows of 4096)
+    allv = np.arange(-32768, 32768, dtype=np.int64)
+    add(gate_case("gate_sweep_65536", 4096, 16, [(0, 0, *rs.gate_shifts(10, 9))], allv.reshape(16, 4096),
+                  allv[::-1].reshape(16, 4096), True))
+
+    # 20. SCALE (op bit 17): the sum times G before the rounding (rowops_spec.scaled_round)
+    #     the Piper stage average: (T + y2) * round(2^19 / 3) >> 18, T = y0 + y1 int32
+    n, c1 = 1536, 2
+    prm = [(rs.AVG3_G, 0, 0, 0, rs.AVG3_SH)]
+    T = rng.integers(-32768, 32768, (c1, n)) + rng.integers(-32768, 32768, (c1, n))
+    T[0, :4] = [65534, -65536, 0, 1]
+    vals_a = {(0, i): [int(v) for v in T[i]] for i in range(c1)}
+    a, b, o = stream_rows(OP["ADDX"], n, c1, 1, I32, I16, I16, prm, 0, rng, True, vals_a=vals_a, scale=True)
+    add(Case("scale_avg3_1536x2", opword(OP["ADDX"], ak=I32, bk=I16, ck=I16, b_en=True, bcast=True, scale=True),
+             n, c1, 1, strides_for(n, c1, I32, I16, I16), a, b, prm, o, (I32, I16, I16)))
+    #     COPY i16 -> i32, per-column G, bias, window and RELU
+    n, c1 = 37, 3
+    prm = [(int(rng.integers(0, 1 << 25)), int(rng.integers(-(1 << 21), 1 << 21)), int(rng.integers(0, 15)), 0,
+            int(rng.integers(20, 46))) for _ in range(n)]
+    a, b, o = stream_rows(OP["COPY"], n, c1, 1, I16, I16, I32, prm, 7, rng, False, relu=True, win=(0, 2),
+                          scale=True)
+    add(Case("scale_copy_percol_relu", opword(OP["COPY"], ck=I32, relu=True, scale=True), n, c1, 1,
+             strides_for(n, c1, I16, I16, I32), a, b, prm, o, (I16, I16, I32), bq_sh=7, win=(0, 2)))
+    #     ADDX i32 + i16 -> i32, one G (saturating sums of int32)
+    n, c1 = 24, 2
+    prm = [((1 << 25) - 1, 5, 3, 9, 6)]
+    a, b, o = stream_rows(OP["ADDX"], n, c1, 1, I32, I16, I32, prm, 2, rng, True, scale=True, i32_bits=26)
+    add(Case("scale_addx_i32_sat", opword(OP["ADDX"], ak=I32, bk=I16, ck=I32, b_en=True, bcast=True, scale=True),
+             n, c1, 1, strides_for(n, c1, I32, I16, I32), a, b, prm, o, (I32, I16, I32), bq_sh=2))
     return cases
 
 

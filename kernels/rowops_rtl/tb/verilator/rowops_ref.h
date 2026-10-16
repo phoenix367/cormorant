@@ -32,10 +32,10 @@ using u64  = uint64_t;
 using i128 = __int128;
 
 enum Op : uint32_t { COPY = 1, ADDX = 2, DEQUANT = 3, MULACT = 4, NORM = 5, ROPE = 6, XPOSE = 7, TLOAD = 8,
-                     FOLD = 9 };
+                     FOLD = 9, GATE = 10 };
 enum Kind : uint32_t { I16 = 0, I32 = 1, F32 = 2 };
 enum Flag : uint32_t { F_B_EN = 1u << 12, F_P_BCAST = 1u << 13, F_P_KEEP = 1u << 14,
-                       F_RELU = 1u << 15, F_NORM_LN = 1u << 16 };
+                       F_RELU = 1u << 15, F_NORM_LN = 1u << 16, F_SCALE = 1u << 17 };
 
 constexpr int P1_BITS = 24, RM_BITS = 47, ROPE_BITS = 23, SILU_BITS = 20;
 constexpr int G_BITS = 14, SIG_BITS = 24, SIG_STEP = 8, SIG_N = 4096;
@@ -55,6 +55,7 @@ struct Job {
   bool p_bcast() const { return op & F_P_BCAST; }
   bool relu() const { return op & F_RELU; }
   bool ln() const { return op & F_NORM_LN; }
+  bool scale() const { return op & F_SCALE; }
 };
 
 struct Param { int32_t g = 0; int32_t bq = 0; uint8_t sh_a = 0, sh_b = 0, sh_c = 0; };
@@ -155,8 +156,8 @@ inline const std::vector<i64>& sigmoid_table() {
   return t;
 }
 
-// silu(g) at 2^-20 for g = gv * 2^-14 (rowops_spec.silu_q)
-inline i64 silu_q(i64 gv) {
+// sigma(g) at 2^-24 for g = gv * 2^-14 (rowops_spec.sig_q)
+inline i64 sig_q(i64 gv) {
   const auto& T = sigmoid_table();
   i64 a = gv < 0 ? -gv : gv;
   bool big = a >= ((i64)16 << G_BITS);
@@ -166,7 +167,19 @@ inline i64 silu_q(i64 gv) {
   i64 sig = T[idx] + (((T[idx + 1] - T[idx]) * frac) >> (G_BITS - SIG_STEP));
   if (big) sig = (i64)1 << SIG_BITS;
   if (gv < 0) sig = ((i64)1 << SIG_BITS) - sig;
-  return (i64)rne_shr((i128)gv * sig, G_BITS + SIG_BITS - SILU_BITS);
+  return sig;
+}
+
+// silu(g) at 2^-20 for g = gv * 2^-14 (rowops_spec.silu_q)
+inline i64 silu_q(i64 gv) {
+  return (i64)rne_shr((i128)gv * sig_q(gv), G_BITS + SIG_BITS - SILU_BITS);
+}
+
+// GATE: tanh(a) * sigma(b) as rowops_spec.gate_op (tanh = 2 sigma(2a) - 1 from the table)
+inline i64 gate_q(i64 x, i64 y, const Param& q) {
+  const i64 th = 2 * sig_q(x << q.sh_a) - ((i64)1 << SIG_BITS);
+  const i64 sg = sig_q(y << q.sh_b);
+  return sat16(rne_shr((i128)th * sg, q.sh_c));
 }
 
 // rne(x / (m_x 2^s)), m_x = m for x < 0, 1 for x >= 0 (rowops_spec.fold_elem: the quotient;
@@ -246,7 +259,8 @@ inline std::vector<Write> run(const Job& j, const Mem& m, PState* ps = nullptr) 
   const uint32_t op = j.code();
   const uint32_t n = j.n;
   // The parameter load (ro_core T_CFG2): every stream op, NORM and ROPE with work, unless P_KEEP.
-  const bool p_op = op == COPY || op == ADDX || op == DEQUANT || op == MULACT || op == NORM || op == ROPE;
+  const bool p_op = op == COPY || op == ADDX || op == DEQUANT || op == MULACT || op == GATE || op == NORM ||
+                    op == ROPE;
   const bool p_go = p_op && n != 0 && j.c1 != 0 && j.c2 != 0 && n <= 4096;
   const bool keep = (j.op & F_P_KEEP) && ps && ps->valid;
   if (p_go && !keep && ps) {
@@ -292,7 +306,7 @@ inline std::vector<Write> run(const Job& j, const Mem& m, PState* ps = nullptr) 
     return P[bcast ? 0 : c];
   };
 
-  if (op == COPY || op == ADDX || op == DEQUANT || op == MULACT) {
+  if (op == COPY || op == ADDX || op == DEQUANT || op == MULACT || op == GATE) {
     for (u64 i2 = 0; i2 < j.c2; i2++)
       for (u64 i1 = 0; i1 < j.c1; i1++) {
         const u64 ra = j.a + i2 * j.a_s2 + i1 * j.a_s1;
@@ -308,11 +322,14 @@ inline std::vector<Write> run(const Job& j, const Mem& m, PState* ps = nullptr) 
           i64 r = 0;
           if (op == COPY || op == ADDX) {
             i128 s = ((i128)x << q.sh_a) + ((i128)y << q.sh_b) + ((i128)q.bq << j.bq_sh);
-            i128 v = rne_shr(s, q.sh_c);
+            // SCALE (RPU_PLAN §14.3): S * G before the rounding (|S| < 2^31, 0 <= G < 2^25)
+            i128 v = rne_shr(j.scale() ? s * (i128)q.g : s, q.sh_c);
             r = ck == I16 ? sat16(v) : sat32(v);
             if (j.relu() && r < 0) r = 0;
           } else if (op == DEQUANT) {
             r = (i64)float_bits(x, q.sh_c);
+          } else if (op == GATE) {
+            r = gate_q(x, y, q);
           } else {                                          // MULACT
             i64 gv = x << q.sh_a;
             r = sat16(rne_shr((i128)silu_q(gv) * y, q.sh_c));

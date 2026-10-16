@@ -41,7 +41,7 @@ done, b1 ready), `0x0C` ISR (toggle on write).  Arguments
 
 | offset | name | meaning |
 |---|---|---|
-| `0x10` | `op` | [3:0] op code (§1.4); [5:4] A kind; [7:6] B kind; [9:8] C kind (0 i16, 1 i32, 2 f32 — C only); [12] `B_EN` stream B present; [13] `P_BCAST` one parameter entry for every column; [14] `P_KEEP` keep the parameter RAM of the previous job (no read of `p`); [15] `RELU` (COPY / ADDX: max(y, 0) after saturation); [16] `NORM_LN` (NORM: LayerNorm; 0 RMSNorm) |
+| `0x10` | `op` | [3:0] op code (§1.4); [5:4] A kind; [7:6] B kind; [9:8] C kind (0 i16, 1 i32, 2 f32 — C only); [12] `B_EN` stream B present; [13] `P_BCAST` one parameter entry for every column; [14] `P_KEEP` keep the parameter RAM of the previous job (no read of `p`); [15] `RELU` (COPY / ADDX: max(y, 0) after saturation); [16] `NORM_LN` (NORM: LayerNorm; 0 RMSNorm); [17] `SCALE` (COPY / ADDX: the sum times the column's G before the rounding, RPU_PLAN §14.3) |
 | `0x14` | `n` | elements per row, 1 … 4096 (TRANSPOSE: L, the tile's row length; FOLD: W, the output row, any 32-bit value ≥ 1) |
 | `0x18` | `c1` | rows per block (TRANSPOSE: tiles per block) |
 | `0x1C` | `c2` | blocks (≥ 1) |
@@ -109,16 +109,16 @@ C++ port.
 
 | code | op | definition (per row, per column c) | kinds |
 |---|---|---|---|
-| 1 | `COPY` | `y = sat_C(rne_shr((A[c] << sh_a[c]) + (Bq'[c] << bq_sh), sh_c[c]))`, then `max(y, 0)` with `RELU`; rows outside `[win_lo, win_hi)` read A as 0 | A i16 / i32 → C i16 / i32 |
-| 2 | `ADDX` | `y = sat_C(rne_shr((A[c] << sh_a[c]) + (B[c] << sh_b[c]) + (Bq'[c] << bq_sh), sh_c[c]))`, `RELU` as COPY | A, B, C i16 / i32 (the residual add: A i32, B i16 with `sh_b = 15 − f_d`, `sh_c = 0`) |
+| 1 | `COPY` | `y = sat_C(rne_shr((A[c] << sh_a[c]) + (Bq'[c] << bq_sh), sh_c[c]))`, then `max(y, 0)` with `RELU`; rows outside `[win_lo, win_hi)` read A as 0.  With `SCALE`: `y = sat_C(rne_shr(S · G[c], sh_c[c]))`, S the sum inside (contract: \|S\| < 2^31, 0 ≤ G < 2^25 — `rowops_spec.scaled_round`) | A i16 / i32 → C i16 / i32 |
+| 2 | `ADDX` | `y = sat_C(rne_shr((A[c] << sh_a[c]) + (B[c] << sh_b[c]) + (Bq'[c] << bq_sh), sh_c[c]))`, `RELU` and `SCALE` as COPY | A, B, C i16 / i32 (the residual add: A i32, B i16 with `sh_b = 15 − f_d`, `sh_c = 0`; Piper's stage average: A = y0 + y1 i32, B = y2, `SCALE` with G = round(2^19 / 3) = 174 763, `sh_c` = 18 — rne(2S / 3) exactly) |
 | 3 | `DEQUANT` | `y = float32(A[c] · 2^−sh_c[c])` (IEEE round to nearest even; exact for |A| < 2^24) | A i16 / i32 → C f32 |
 | 4 | `MULACT` | `y = sat16(rne_shr(silu_q(A[c] << sh_a[c]) · B[c], sh_c[c]))` — `silu_q` of `rowops_spec` (the sigmoid table, §2.4); `sh_a = 14 − f_g[c]`, `sh_c = 20 + f_u − f_out` | A, B, C i16 |
 | 5 | `NORM` | `rowops_spec.rms_norm` (`NORM_LN` = 0) or `layer_norm` (= 1) of the row with `E = eps`, `G`, `Bq' << bq_sh`, `sh_c`: exact `S1 = Σ x`, `S2 = Σ x²`, `D = Σ h² + E` or `n·S2 − S1² + E`, `(Rm, sh) = rsqrt_bf(D)`, `P1 = floor(A_c · Rm · 2^(24 − sh))` with `A_c = h` or `n·x − S1`, `y = sat16(rne_shr(P1 · G[c] + (Bq'[c] << bq_sh), sh_c[c]))` | A i16 / i32 → C i16 |
 | 6 | `ROPE` | rows of `n = m · HD` i16: `d = c mod HD`, `rot = −A[c + HD/2]` for `d < HD/2` else `A[c − HD/2]`; B's row holds `cos[0..HD)` then `sin[0..HD)` as int32 words (int24 values at 2^−23, `rowops_spec.rope_tables_raw`); `y = sat16(rne_shr(((A[c]·cos[d]) << sh_a[c]) + ((rot·sin[d]) << sh_b[c]), sh_c[c]))` — `rowops_spec.rope` with per-column exponents | A, C i16; B i32 |
 | 7 | `TRANSPOSE` | tile (i2, i1): R rows (`aux`) of L = `n` i16 at `a + i2·a_s2 + i1·a_s1 + r·b_s1`; the tile's column d (< L) becomes a granule of R int16 — `out[d][r] = in[r][d]` — at byte address `c + i2·c_s2 + i1·c_s1 + d·b_s2`, written with byte strobes covering exactly its 2R bytes (a granule may straddle two words; `b_s2 = 2R` makes the granules one contiguous run of L·R elements, written as whole words with the lanes past the last element zero — the stream ops' contract — at a 16-byte-aligned `c`) | i16 |
-
 | 8 | `TLOAD` | the tables: A is the 64 KiB table image as rows of int32 (`n = 4096`, `c1 = 4`, `a_s1 = 16384` — any geometry that delivers its 4096 words in order): words 0 … 2047 hold two sigmoid entries {D[i], T[i]} (bits [48:25] / [24:0] of each 64-bit half, i = 2w and 2w + 1; `rowops_spec.sigmoid_table`), words 2048 … 4095 four rsqrt entries (int32, i = 4(w − 2048) …; `rowops_spec.rsqrt_table`); no B, P or C.  Run once after the bitstream, before any MULACT or NORM: the tables live in UltraRAM, which has no initial contents.  `scripts/gen_fixtures.py` writes the image as `tables.hex`; the testbench's oracle builds the same one | A i32 |
 | 9 | `FOLD` | Piper's `TtsPrep` (HOSTOPS_PLAN §11): output channel k < `c2` reads the int16 source row at `a + k·a_s2`; its row r < `c1`, column j < `n` reads the row's column `s0 + r·w0 + j` (`s0 = b_s2`, `w0 = b_s1`) where that lies in `[win_lo, win_hi)`, else 0 — `y = rne(x / (m_x · 2^s))`, `m_x = m` for x < 0 and 1 for x ≥ 0 (`rowops_spec.fold`: LeakyReLU with alpha 1/m and the re-rounding s bits coarser; nothing saturates).  The output is one contiguous run of `c2 · c1 · n` int16 at `c` (whole words, the last word's lanes past the end 0); no B or P; the window's columns are the only ones read.  m = 0 is an empty job | A, C i16 |
+| 10 | `GATE` | Piper's `TtsGate` (RPU_PLAN §14): `th = 2·σ_q(A[c] << sh_a[c]) − 2^24` (tanh from the sigmoid table), `sg = σ_q(B[c] << sh_b[c])`, `y = sat16(rne_shr(th · sg, sh_c[c]))` — `rowops_spec.gate_op`; σ_q is MULACT's table (§2.4) at 2^−24; for a gate at 2^−f_in → 2^−f_out `sh_a = 15 − f_in`, `sh_b = 14 − f_in`, `sh_c = 48 − f_out`.  Contract: `sh_a`, `sh_b` ≤ 16.  Within one LSB of libm's tanh · σ (3–5 × 10^−5 of the outputs differ) | A, B, C i16 |
 
 Rows are independent; the counts are 32-bit; `n = 0`, `c1 = 0` or `c2 = 0`
 is an empty job (`ap_done` without traffic).  Values outside the
@@ -201,7 +201,7 @@ board it saves each job's register writes, interrupt and wake.
                                    ├─ ro_rd_port B (ARID 1) ─► B words ─┤
                                    ├─ ro_param  (P: 2 URAM 4096 x 72, 4 banks, 4 entries / cycle)
                                    │                                     ▼
-                                   │   ro_stream (COPY / ADDX / DEQUANT / MULACT; sigmoid table, 2 URAM)
+                                   │   ro_stream (COPY / ADDX / DEQUANT / MULACT / GATE; sigmoid table, 4 URAM)
                                    │   ro_norm   (ring 2 URAM, sums, ro_rsqrt, emit)
                                    │   ro_rope   (head-segment buffer)
                                    │   ro_xpose  (tile ≤ 8 rows x 1024 elements, granule strobes)
@@ -277,6 +277,18 @@ board it saves each job's register writes, interrupt and wake.
   the four lanes, answering two cycles after the address; the
   interpolation and the two products are DSP48E2 work (`gv · σ` 32 × 25,
   `s · u` 39 × 17).
+- **GATE** (RPU_PLAN §14.3) reads the table twice per lane — A's doubled
+  argument through MULACT's path, B's through two more UltraRAM copies
+  (`u_sig2`, `u_sig3`; TLOAD writes all four) with their own interpolation.
+  At s10 the `gv · σ` multiplier takes `th · sg` instead: σ before the
+  mirror lies in [2^23, 2^24), so `2σ − 2^24` is its low 23 bits doubled and
+  tanh costs one negation.  **SCALE** carries the sum S (its low 32 bits)
+  and G (25 bits) from s5 / s3 to the same multiplier.  Both products
+  bypass the silu stages (s14 – s16, three 57-bit registers) into s17 and
+  take MULACT's rounding (s18 – s19); s20 saturates them to int16 (GATE)
+  or the C kind with RELU (SCALE).  Four lanes per cycle: a GATE costs
+  what a MULACT does (A and B through the one read port), a scaled ADDX
+  of int32 + int16 reads 6 bytes per element (2.67 elements per cycle).
 - **ROPE** buffers one head segment (HD ≤ 128 elements = 16 words) of A
   and the row's cos / sin from B (eight lane banks of LUTRAM, one write
   enable each), then emits the segment half a word per cycle through the
@@ -352,7 +364,12 @@ board it saves each job's register writes, interrupt and wake.
   runs with the register's placement: +0.074 ns before, +0.025 / +0.029 ns
   in two runs with the chains.  An earlier variant that advanced the job
   index at `job_done` put that nine-level cone on the index (+0.031 ns); it
-  now advances when the job's registers load.
+  now advances when the job's registers load.  With GATE and SCALE (RPU_PLAN
+A3a.1, 2026-10-16, out of context at 3.333 ns): WNS −0.027 ns (the worst
+paths the sigmoid UltraRAMs' outputs, as before — none in the operand
+muxes, the bypass or the saturation), 35 323 LUT (+1 134), 28 667 FF
+(+1 637), 6 RAMB36, 9 URAM (+2: the B-side table copies), 133 DSP (+4: the
+B-side interpolations); `ro_stream` 9 110 LUT, 7 233 FF, 4 URAM, 24 DSP.
 
 ## 3. Performance
 
@@ -381,6 +398,8 @@ port, 128 bits each way):
 | FOLD 32 × 24 × 2050 (Piper's last upsampling stage, m 10) | 199 051 | 796 | eight lanes: 0.99 words per cycle |
 | FOLD 64 × 12 × 1026 | 100 713 | 403 | |
 | FOLD 192 × 2 × 132 (a flow coupling, m 1) | 7 273 | 29 | |
+| GATE 12 × 4096 (one of Piper's 16 `TtsGate`s, 2026-10-16) | 12 533 | 50 | A and B through the one read port |
+| ADDX + SCALE 384 × 4096, A i32 + B i16 → C i16 (Piper's last stage average) | 589 974 | 2 360 | 6 bytes read per element: 2.67 per cycle |
 
 Descriptor chains (§1.6; `--perf`, 2026-10-15, every shape above unchanged by
 the chain logic), from `ap_start` to the interrupt, against the same jobs
@@ -408,10 +427,13 @@ with phase 3.
   `rowops_spec.py` in 64- / 128-bit integer arithmetic — checked per case on
   the whole output region (every element, the zeroed tail lanes, no stray
   write), ap_done / interrupt behaviour, no traffic on the unused ID.
-- **Fixtures** `hw/test_data/rowops_test_data/` (36 cases: `manifest.txt`,
+- **Fixtures** `hw/test_data/rowops_test_data/` (42 cases: `manifest.txt`,
   `test_NN_{a,b,p,c}.hex` — every op, kinds, tails, the window, the
   broadcast and per-column parameter block, both norms, ROPE at HD 64,
-  contiguous and strobed transposes): written by `scripts/gen_fixtures.py`
+  contiguous and strobed transposes; since RPU_PLAN A3a.1 GATE at f_in 9,
+  per column with a tail, and over every int16 on both sides (16 × 4096),
+  and SCALE as Piper's stage average, a COPY with per-column G, the window
+  and RELU, and a saturating int32 ADDX): written by `scripts/gen_fixtures.py`
   (run it from the scheduler's venv: it imports `rowops_spec`) from the
   Python specification itself (`inference-scheduler/src/rowops_spec.py`),
   so the C++ oracle is checked against the Python one by the fixtures and
@@ -421,7 +443,14 @@ with phase 3.
   at every timing and 1 200 random jobs of four seeds on 2026-10-11, and
   with the chains (2026-10-15) the 38 fixtures, 300 random jobs and 300
   random chains for seeds 1 … 4 at `fast`, `rand` and `slow` (12 × 638
-  cases), plus 1 000 chains for seeds 5 … 12 at each timing.
+  cases), plus 1 000 chains for seeds 5 … 12 at each timing.  With GATE and
+  SCALE (2026-10-16; the random mix gives 11 % GATE jobs and a third of the
+  COPY / ADDX jobs SCALE, inside its contract — int32 data from the small
+  mode, chains never feed a SCALE job's int32 input from another job): the
+  42 fixtures, 300 random jobs and 300 random chains for seeds 1 … 4 at every
+  timing (12 × 644 cases).  Mutants caught: GATE's B-side mirror swapped,
+  tanh's sign dropped, G off by one, SCALE's RELU dropped (29 – 50 of 294
+  cases fail each).
 - `--random N`: random jobs (all ops, kinds, shapes inside and at the
   contract's edges) against the C++ oracle; `--case "..."`; `--perf`
   (ideal memory cycle counts of the shipped models' job shapes, and the

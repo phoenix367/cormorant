@@ -367,8 +367,8 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    make sim_hw_kv260
    ```
 
-   Pass: `##  TOTAL: 116 / 116 passed` and `##  ALL TESTS PASSED`
-   (VectorOPKernel 29, ConvKernel 19, MatmulKernel 10, PoolingKernel 19, RowOpsKernel 39)
+   Pass: `##  TOTAL: 122 / 122 passed` and `##  ALL TESTS PASSED`
+   (VectorOPKernel 29, ConvKernel 19, MatmulKernel 10, PoolingKernel 19, RowOpsKernel 45)
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
    in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).

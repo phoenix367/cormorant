@@ -1440,7 +1440,7 @@ operand.
 | phase | what | gate |
 |---|---|---|
 | **A3a.0 — no bitstream** | the post-sum mask dropped and the post sums as ADDX chains; the PCM table; a fresh chunk profile on `33a799febc56` (`tts_board.py --profile`); the gate study: `piper_study.py study` with a policy "chunk spec + unit gate" — **DONE 2026-10-16 (§14.8): bit-exact, chunk 184.3 → 176.3 ms, the study GO** | Piper bit-exact without the mask (`test_piper`, the host emulation, `tts_board.py` on the board); the study within OFFLOAD_PLAN §2.2's yardstick — log-mel distance ≤ 0.22 dB and SNR within 1 dB of the library's row (0.208 dB, 22.7 dB: OFFLOAD_PLAN §2.2's VectorOP sums) |
-| **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
+| **A3a.1 — RTL** | GATE and SCALE in `ro_stream`; the specification, the oracle, the fixtures, random GATE / SCALE jobs; OOC synthesis — **DONE 2026-10-16 (§14.9)** | `kernel-verify`-style rowops gates: fixtures + random jobs × seeds at every memory timing; GATE over every int16 a against the specification; lint; OOC WNS ≥ 0 at 300 MHz |
 | **A3a.2 — bitstream** | `build_hw_kv260`; `sim_hw` with a GATE job and a SCALE job | WNS ≥ 0 at 4 ns (+0.022 today); URAM ≤ 57; LUT ≤ 93 k; `sim_hw` 100 % |
 | **A3a.3 — scheduler** | `GateRoNode`, the average nodes, the two platform flags, `host_emu`, the calibration cases | every suite; the Piper chunk equals the specification (gate_q) on the host emulation; no other library changes a node |
 | **A3a.4 — board** | upload, model set, benchmarks, the perf campaign (a new id), Piper regenerated and installed, the R5 BSP, the chat server | Piper bit-exact against its specification on the board; the chunk ≤ 155 ms; the encoder unchanged; every other library bit-exact as installed |
@@ -1526,3 +1526,75 @@ for A3a.1–A3a.4:
 - **Tests:** `test_rowops_spec.TestGate`, `test_piper` (the post sums on the
   unit; the simulation against the mask-free specification over four
   windows; both chunk emulations).
+
+### 14.9 A3a.1 results — the RTL (2026-10-16)
+
+**The ops.**
+- **GATE** is op 10.  **SCALE** is op-word bit 17 on COPY and ADDX.  No
+  register is added, so the drivers, the R5 recorder and `RowOpsRtlDriver`
+  are unchanged.
+- **The specification.**  `rowops_spec.gate_op` takes the raw shifts, and
+  `gate` is built on it.  `scaled_round` gives SCALE (|S| < 2^31,
+  0 ≤ G < 2^25); `AVG3_G` = 174 763 and `AVG3_SH` = 18 give the average.
+  `opword(scale=)`, `OP_GATE` and `F_SCALE` complete it.
+- **The C++ oracle.**  `sig_q` is shared by MULACT and `gate_q`, and SCALE
+  is in the COPY / ADDX formula.
+
+**The datapath** (`ro_stream`):
+- **The extra lookup.**  GATE's B side gets its own table lookup on two more
+  UltraRAM copies, with its own interpolation and mirror.
+- **One multiplier.**  At s10 MULACT's `gv · σ` multiplier takes `th · sg`
+  (GATE) or `S · G` (SCALE).  Since σ before the mirror lies in
+  [2^23, 2^24), tanh costs a single negation.
+- **The bypass.**  A 57-bit bypass carries those products past the silu
+  stages into MULACT's rounding.  s20 saturates them to int16 (GATE) or to
+  the C kind with RELU (SCALE).
+- **Unchanged.**  The pipeline depth stays at 21 stages and four lanes per
+  cycle; `ro_core` only routes op 10 to the stream unit and passes the flag.
+
+**Verification:**
+- **Fixtures.**  42 now: 6 new, among them a GATE sweep over every int16 on
+  both sides and Piper's stage average.  The 36 earlier ones and the two
+  chain fixtures are unchanged.
+- **Random runs.**  The random mix now holds 11 % GATE jobs and a third of
+  COPY / ADDX with SCALE, inside its contract.  Fixtures, 300 random jobs
+  and 300 random chains for seeds 1 … 4 at `fast`, `rand` and `slow`:
+  12 × 644 cases pass.
+- **Mutants.**  Four were caught: the B-side mirror swapped, the tanh sign
+  dropped, G off by one, and SCALE's RELU dropped.  A mutant that leaves a
+  signal unused fails the Verilator build (`-Wall`), so it is run with the
+  build checked.
+- **Other checks.**  Lint is clean, the `xsim_rowops_rtl` compile passes,
+  and CTest `RowOps*` passes.
+
+**Cycles with ideal memory** (`--perf`):
+
+| job | cycles | at 250 MHz |
+|---|---:|---:|
+| one gate (12 × 4096) | 12 533 | 50 µs |
+| the last stage average (scaled ADDX, i32 + i16 → i16, 384 × 4096) | 589 974 | 2.36 ms, read-bound at 2.67 elements per cycle |
+
+All three averages' second jobs come to ≈ 3.8 ms, as §14.5 estimated.
+
+**Out of context at 3.333 ns:**
+
+| | A2.2 run (with chains) | now |
+|---|---:|---:|
+| WNS | −0.053 ns | −0.027 ns |
+| LUT | 34 189 | 35 323 (+1 134) |
+| FF | 27 030 | 28 667 (+1 637) |
+| URAM | 7 | 9 (+2) |
+| DSP | 129 | 133 (+4) |
+
+- **Worst paths.**  These remain the sigmoid UltraRAMs' outputs (now four
+  copies), none of them in the new logic; there is no `Synth 8-4767`
+  warning.
+- **The gate as written does not apply.**  §14.6 asked for WNS ≥ 0 at
+  300 MHz out of context, but the unit has not closed that since FOLD
+  (0.000 ns) and the chains (−0.053 ns).  It closes in context at 250 MHz,
+  and A3a.2's build is the gate that counts.
+
+**Next.**  A3a.2 is the bitstream with `sim_hw`: `ro_classes.svh` reads the
+manifest, so the 6 new fixtures join its run (122 cases).  A3a.3 then needs,
+besides the nodes, GATE and SCALE in `test/host_emu.py`'s C port of the
+unit.
