@@ -176,7 +176,8 @@ class TestProtocol(SchemaMixin, unittest.TestCase):
         self.assertEqual(obj["object"], "list")
         self.assertEqual([m["id"] for m in obj["data"]], ["fake", "echo"])
         for m in obj["data"]:
-            self.assertEqual(set(m), {"id", "object", "created", "owned_by"})
+            self.assertEqual(set(m), {"id", "object", "created", "owned_by", "kv260"})
+            self.assertEqual(m["kv260"], {"type": "chat"})
             self.assertEqual(m["object"], "model")
             self.assertIsInstance(m["created"], int)
         st, _, body = self.s.request("GET", "/v1/models/echo")

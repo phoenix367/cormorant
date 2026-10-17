@@ -10,11 +10,14 @@ CMA and the close / re-open cycle; the board's ids for the WER
 
   upload  project sources (demo/asr/build/<model>_project,
           generate_asr_project.py) -> <remote dir>/<model>_project (weights/
-          and build/ excluded)
+          and build/ excluded; remote dir: the chat install directory,
+          demo/chat/chat_config.json remote.dir — where the chat server's
+          moonshine backend loads the library)
   weights weights/*.dat -> <weights dir>/weights (only changed files)
   build   cmake -DINFERENCE_WEIGHTS_DIR=<weights dir> + make asr_bench
           moonshine_<size> (and build_prof/ with -DINFERENCE_PROFILING=ON when
-          --profile); the library copied to <remote dir>/lib/
+          --profile); the library copied to <remote dir>/lib/ (--install-only:
+          these steps only)
   run     asr_bench on utts.bin (the selected utterances), -R repetitions,
           the re-open cycle; with --profile a profiled run over the fullest
           one-part utterance of each bucket (phases encode_<T>, and decode on
@@ -28,7 +31,7 @@ The board lock is held for the whole session.  Stop the chat server first
 
 usage: inference-scheduler/.venv/bin/python demo/asr/scripts/asr_board.py
            [--project demo/asr/build/moonshine-tiny_project] [--utts all | auto | N | UID,...]
-           [--reps 2] [--profile] [--skip-build] [--remote-dir /root/kv260_asr]
+           [--reps 2] [--profile] [--skip-build] [--install-only] [--remote-dir /root/kv260_chat]
            [--weights-dir /root/<lib>_weights] [--jobs-spec 8] [--out results.json] [--spec-only]
 """
 
@@ -57,7 +60,6 @@ sys.path.insert(0, os.path.join(REPO, "demo", "bert_squad", "scripts"))
 import asr_host_emu as he                                           # noqa: E402
 
 DEFAULT_PROJECT = os.path.join(REPO, "demo", "asr", "build", "moonshine-tiny_project")
-REMOTE_DIR = "/root/kv260_asr"
 RUN_DIR = "/tmp/asr_bench"
 SR = 16000
 
@@ -174,28 +176,37 @@ def main(argv=None) -> int:
                     help="also build with the profiler and profile the fullest utterance of each bucket")
     ap.add_argument("--board-lock", default=None)
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--install-only", action="store_true",
+                    help="upload, build and install the library (and its weights); no bench or checks")
     ap.add_argument("--jobs", type=int, default=1, help="make -j on the board (default 1)")
     ap.add_argument("--jobs-spec", type=int, default=8, help="host processes for the specification")
-    ap.add_argument("--remote-dir", default=REMOTE_DIR,
-                    help="<dir>/<model>_project and <dir>/lib/lib<model>.so on the board")
+    ap.add_argument("--remote-dir", default=None,
+                    help="<dir>/<model>_project and <dir>/lib/lib<model>.so on the board (default: "
+                         "remote.dir of demo/chat/chat_config.json, else /root/kv260_chat)")
     ap.add_argument("--weights-dir", default=None, help="default /root/<lib>_weights")
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--spec-only", action="store_true",
                     help="only compute (and cache) the specification's ids; no board")
     ap.add_argument("--out", default=None, help="write the results JSON here")
     args = ap.parse_args(argv)
+    if args.install_only and args.skip_build:
+        ap.error("--install-only builds; it cannot be combined with --skip-build")
+    if args.install_only:
+        args.no_check = True
     project = os.path.abspath(args.project)
     cfg = llm_board.bert_config(args.bert_config)
     summary = json.load(open(os.path.join(project, "project.json")))
     lib = summary["library"]                                     # libmoonshine_<size>.so
     tag = lib.removeprefix("lib").removesuffix(".so")
     weights_dir = args.weights_dir or f"/root/{tag}_weights"
-    remote_proj = f"{args.remote_dir}/{summary['model']}_project"
-    remote_lib = f"{args.remote_dir}/lib/{lib}"
-    utts = select(args.utts)
-    he.write_utts(os.path.join(project, "utts.bin"), [u[2] for u in utts])
+    remote_dir = args.remote_dir or llm_board.chat_remote_dir()
+    remote_proj = f"{remote_dir}/{summary['model']}_project"
+    remote_lib = f"{remote_dir}/lib/{lib}"
+    utts = [] if args.install_only else select(args.utts)
+    if utts:
+        he.write_utts(os.path.join(project, "utts.bin"), [u[2] for u in utts])
     prof_utts = []
-    if args.profile:
+    if args.profile and not args.install_only:
         prof_utts = profile_set(utts if args.utts == "all" else select("all"), summary["buckets"])
         he.write_utts(os.path.join(project, "utts_prof.bin"), [u[2] for u in prof_utts])
     refs = None
@@ -229,6 +240,9 @@ def main(argv=None) -> int:
                                          timeout=30)
                 results["exported"] = [s for s in out.split() if s]
                 print(f"  {lib} exports: {results['exported']}", flush=True)
+                if args.install_only:
+                    print(f"installed {remote_lib} (weights {weights_dir})")
+                    return 0
             sftp = session._client.open_sftp()                   # noqa: SLF001
             session.exec_checked(f"mkdir -p {RUN_DIR}", timeout=15)
             sftp.put(os.path.join(project, "utts.bin"), f"{RUN_DIR}/utts.bin")

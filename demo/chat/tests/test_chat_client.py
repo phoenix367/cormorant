@@ -13,7 +13,7 @@ import unittest
 import wave
 from unittest import mock
 
-from _util import RunningServer, server_mod
+from _util import LOG, RunningServer, server_mod, wait_until
 
 import chat
 from test_speech import FakeSpeechJob, expected_pcm
@@ -112,6 +112,96 @@ class ChatClientAudio(unittest.TestCase):
             self.assertEqual(wav_frames(path), (16000, expected_pcm(3)))
         finally:
             os.unlink(path)
+
+
+class ChatClientModels(unittest.TestCase):
+    """The models' kinds (the kv260 extension of /v1/models): the default chat
+    model skips speech and speech-to-text models; --model / /model with one of
+    them makes it the voice or the transcriber and keeps a chat model for the
+    answers (2026-10-17: a chat request went to moonshine-base); /listen only
+    transcribes — nothing goes to the chat model; a server without a chat
+    model."""
+
+    def setUp(self):
+        import numpy  # noqa: F401  (the fake speech-to-text backend reads WAV with numpy)
+        from test_transcription import asr_backend, wav_bytes
+        self.tts = FakeSpeechJob()
+        self.asr = asr_backend()
+        self.srv = RunningServer({"fake-tts": self.tts, "moonshine-base": self.asr,
+                                  "echo": server_mod.EchoBackend()})
+        self.url = f"http://127.0.0.1:{self.srv.port}/v1"
+        self.dir = tempfile.TemporaryDirectory()
+        self.wav = os.path.join(self.dir.name, "speech.wav")
+        with open(self.wav, "wb") as f:
+            f.write(wav_bytes(numpy.zeros(16000, numpy.int16)))   # 1 s: one part, ids [163]
+
+    def tearDown(self):
+        self.srv.close()
+        self.dir.cleanup()
+
+    def run_chat(self, argv, stdin=""):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            rc = chat.main(["--url", self.url, "--player", "none"] + argv)
+        return rc, out.getvalue()
+
+    def test_default_model_is_a_chat_model(self):
+        rc, text = self.run_chat(["-q", "hello there"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("hello there", text)                     # echo answered
+
+    def test_listen_only_transcribes(self):
+        LOG.clear()
+        rc, text = self.run_chat(["--model", "moonshine-base", "--no-banner"],
+                                 f"/listen {self.wav}\nhello\n/quit\n")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("moonshine-base is a speech-to-text model: /listen uses it; answers come from echo", text)
+        self.assertNotIn("error", text)
+        self.assertEqual(text.count("w163"), 1)                # printed, not sent to the chat model
+        self.assertTrue(wait_until(lambda: sum("POST /v1/chat/completions" in ln for ln in LOG) == 1), LOG)
+        self.assertTrue(any("POST /v1/audio/transcriptions 200" in ln for ln in LOG), LOG)
+        chat_line = next(ln for ln in LOG if "POST /v1/chat/completions" in ln)
+        self.assertIn("prompt=", chat_line)                    # the typed message only: one user turn
+
+    def test_model_command_routes_by_kind(self):
+        rc, text = self.run_chat(["--no-banner"], "/model fake-tts\n/model moonshine-base\n/model\n"
+                                                  f"/listen {self.wav}\n/say hi\n/quit\n")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("fake-tts is a text-to-speech model: /say and /audio use it; answers come from echo", text)
+        self.assertIn("models: fake-tts (text to speech), moonshine-base (speech to text), echo; "
+                      "chatting with echo", text)
+        self.assertEqual(self.tts.jobs[-1].model, "fake-tts")
+        self.assertNotIn("error", text)
+
+    def test_transcribe(self):
+        rc, text = self.run_chat(["--transcribe", self.wav])
+        self.assertEqual((rc, text.strip()), (0, "w163"))
+
+
+class ChatClientNoChatModel(unittest.TestCase):
+    def test_listen_only_transcribes(self):
+        import numpy
+        from test_transcription import asr_backend, wav_bytes
+        srv = RunningServer({"moonshine-base": asr_backend()})
+        with tempfile.TemporaryDirectory() as d:
+            wav = os.path.join(d, "a.wav")
+            with open(wav, "wb") as f:
+                f.write(wav_bytes(numpy.zeros(16000, numpy.int16)))
+            out = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), \
+                        mock.patch.object(sys, "stdin", io.StringIO(f"/listen {wav}\nhello\n/quit\n")):
+                    rc = chat.main(["--url", f"http://127.0.0.1:{srv.port}/v1", "--no-banner"])
+                with contextlib.redirect_stderr(io.StringIO()):
+                    rc_q = chat.main(["--url", f"http://127.0.0.1:{srv.port}/v1", "-q", "hi"])
+            finally:
+                srv.close()
+        text = out.getvalue()
+        self.assertEqual((rc, rc_q), (0, 1))
+        self.assertIn("model (no chat model)", text)
+        self.assertIn("w163", text)
+        self.assertIn("the server serves no chat model; /listen FILE transcribes", text)
+        self.assertNotIn("error", text)
 
 
 class SpeechText(unittest.TestCase):

@@ -20,6 +20,8 @@ demo/chat/
 ├── idefics3.py, vlm_image.py — SmolVLM's chat template with images; data URL -> 512 x 512 pixels (Pillow)
 ├── piper_backend.py         — text to speech: front end, libpiper_tts.so per chunk
 ├── piper_phonemize.py       — espeak-ng through ctypes -> Piper phoneme ids (+ ../tts/scripts/piper_vits.py)
+├── moonshine_backend.py     — speech to text: libmoonshine_<size>.so per part, the tokenizer.json detokenizer
+├── speech_input.py          — uploads -> 16 kHz mono int16 (WAV here, a windowed-sinc resampler; ffmpeg otherwise)
 ├── smollm2_tokenizer.py     — SmolLM2's byte-level BPE (tokenizer.json) + incremental detokenizer
 ├── chatml.py                — SmolLM2's ChatML template, block-wise tokenizing, history trimming
 ├── sampler.py, src/sampler.{c,h} — sampling (libsampler.so; pure-Python fallback, same tokens)
@@ -64,6 +66,9 @@ demo/chat/
   uses.
 - `demo/tts/`: the Piper library (`libpiper_tts.so`) and
   `scripts/piper_vits.py`, the Piper front end.
+- `demo/asr/`: the Moonshine libraries (`libmoonshine_<size>.so`,
+  `scripts/generate_asr_project.py`, `src/asr_api.{c,h}`) and their gates
+  (`asr_host_emu.py`, `asr_board.py`).
 
 ## Adding a backend
 
@@ -99,13 +104,17 @@ server does the rest: streaming, usage, errors, the queue and disconnects.
 A text-to-speech backend sets `speech = True` and implements
 `prepare_speech(req)` (outside the FPGA lock) and `synthesize(job, cancel)`
 (under the lock, yielding audio bytes and a final `Finish`) instead; see
-`piper_backend.py`.
+`piper_backend.py`.  A speech-to-text backend sets `transcription = True`
+and implements `prepare_transcription(req)` (outside the lock: decode the
+upload) and `transcribe(job, cancel)` (under the lock, yielding a
+`Segment` per part and a final `Finish` whose `info["text"]` is the
+transcript); see `moonshine_backend.py`.
 
 ## Tests
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 188 tests, ~45 s
+python3 -m unittest -v                  # 215 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 
@@ -201,6 +210,20 @@ Speech:
     utterance than the server packs, is refused.
   - `piper_phonemize.py` against espeak-ng when it is installed (clause
     terminators, Piper's ids).
+
+Speech to text:
+- `test_transcription.py` — `speech_input.py` (16 kHz PCM passed through
+  sample for sample, stereo mixing, 8 / 24 / 32-bit and float WAV, the
+  extensible forms, the resampler's tone and stop band, ffmpeg's formats);
+  the detokenizer (bytes, specials, the leading space; against the
+  `tokenizers` package on Moonshine's tokenizer.json where both exist);
+  `MoonshineBackend` over a fake library (parts, cancellation between
+  them, the refusals); `/v1/audio/transcriptions` (json / text / srt /
+  vtt / verbose_json, SSE, the aliases, every validation error, a client
+  leaving between parts).
+- The real library through the same backend:
+  `demo/asr/scripts/asr_host_emu.py --lib-check` (host emulation, ids
+  bit-exact with the specification).
 
 Client and deploy:
 - `test_chat_client.py` — `chat.py`'s audio: streaming into a recording

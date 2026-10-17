@@ -614,6 +614,14 @@ facts:
     external: [espeak_Initialize, espeak_SetVoiceByName, espeak_TextToPhonemes]   # libespeak-ng, no header here
     header: demo/tts/src/tts_api.h
 
+- id: ctypes.asr
+  kind: interface
+  title: the chat server's ctypes bindings of libmoonshine_<size>.so
+  check: ctypes_bindings
+  args:
+    files: [demo/chat/moonshine_backend.py]
+    header: demo/asr/src/asr_api.h
+
 - id: ctypes.llm
   kind: interface
   title: the chat server's ctypes bindings of the LLM, VLM, BERT and sampler libraries
@@ -743,12 +751,16 @@ facts:
       smollm2_360m: {file: demo/chat/kv260_chat_server.py, regex: '"--llm-360m-cma-mb", type=float, default=(\d+)\.0', type: int}
       smolvlm_256m: {file: demo/chat/kv260_chat_server.py, regex: '"--vlm-cma-mb", type=float, default=(\d+)\.0', type: int}
       piper: {file: demo/chat/kv260_chat_server.py, regex: '"--tts-cma-mb", type=float, default=(\d+)\.0', type: int}
+      moonshine: {file: demo/chat/kv260_chat_server.py, regex: '"--asr-cma-mb", type=float, default=(\d+)\.0', type: int}
   fix: auto
   mentions:
     - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smollm2_135m>\d+)\), \("dry_multiplier"'}
     - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smollm2_360m>\d+)\),\n\s+\("tokenizer", "assets/smollm2-360m'}
     - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smolvlm_256m>\d+)\),\n\s+\("tokenizer", "assets/smolvlm'}
     - {file: demo/chat/deploy.py, regex: '"/root/piper_weights"\), \("model_id", None\), \("cma_mb", (?P<piper>\d+)\)'}
+    - {file: demo/chat/deploy.py, regex: 'moonshine-base/tokenizer.json"\), \("cma_mb", (?P<moonshine>\d+)\)'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"moonshine": \{[^}]*?"cma_mb": (?P<moonshine>\d+)'}
+    - {file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: 'It needs (?P<moonshine>\d+) MB of CMA'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smollm2": \{[^}]*?"cma_mb": (?P<smollm2_135m>\d+)'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smollm2_360m": \{[^}]*?"cma_mb": (?P<smollm2_360m>\d+)'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smolvlm": \{[^}]*?"cma_mb": (?P<smolvlm_256m>\d+)'}
@@ -932,6 +944,8 @@ facts:
     - {name: DEPLOY.md, file: demo/chat/doc/DEPLOY.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
        transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
     - {name: TEXT_TO_SPEECH.md, file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
+       transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
+    - {name: SPEECH_TO_TEXT.md, file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
        transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}
     - {name: chat README, file: demo/chat/README.md, regex: '`(GET|POST) (/[^`]+)`', all: true, subset: true,
        transform: "dict.fromkeys([m + ' ' + re.sub(r'^/v1(?=/)', '', p).replace('{id}', '*') for m, p in v], 1)"}

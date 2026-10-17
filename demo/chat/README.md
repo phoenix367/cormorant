@@ -8,7 +8,8 @@ Because it speaks the OpenAI protocol, ordinary tools work with it unchanged
 `chat.py`, which needs nothing but Python.
 
 Plan and design decisions: [`doc/plans/CHAT_PLAN.md`](../../doc/plans/CHAT_PLAN.md)
-(text to speech: [`TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md)).
+(text to speech: [`TTS_PLAN.md`](../../doc/plans/TTS_PLAN.md); speech to text:
+[`ASR_PLAN.md`](../../doc/plans/ASR_PLAN.md)).
 
 ![chat.py greets you with the CORMORANT banner, the server and the model](../../doc/images/chat_banner.png)
 
@@ -24,10 +25,11 @@ board, a three-question conversation that the model remembers.
 | `smollm2-360m-instruct` | `smollm2-360m` | The same chat with a larger model: better answers, slower | ~7.7 tokens/s; first token after ~0.2 s | [Generative chat](doc/SMOLLM2.md#smollm2-360m-instruct) |
 | `smolvlm-256m-instruct` | `smolvlm` | Answers questions about images | 1.6 s per image, then ~20 tokens/s | [Chat about images](doc/SMOLVLM.md) |
 | `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md); listen: ▶ [hello](../tts/samples/hello.mp3), ▶ [paragraph](../tts/samples/paragraph.mp3) |
+| `moonshine-base` | `moonshine` | Speech to text (`POST /v1/audio/transcriptions`) | 1.3 s for 10 s of audio | [Speech to text](doc/SPEECH_TO_TEXT.md) |
 
 - **Exact results.**  The board reproduces the host reference bit for bit:
-  the language models' logits match the scheduler's simulation, and Piper's
-  audio samples match its specification.
+  the language models' logits match the scheduler's simulation, Piper's
+  audio samples and Moonshine's transcripts match their specifications.
 - **One board, several models.**  The models share the FPGA: one request
   runs at a time, and models that do not fit in memory together are swapped
   in and out on demand ([Deploying](doc/DEPLOY.md#several-models-on-one-fpga)).
@@ -39,32 +41,35 @@ board, a three-question conversation that the model remembers.
 flowchart LR
     clients["<b>Clients</b> · laptop or board shell<br/>chat.py · curl · openai SDK<br/>llm · aichat"]
     subgraph board["KV260 · Ubuntu 22.04 · Python 3.10 standard library"]
-        server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech<br/>FIFO: one request on the FPGA at a time"]
+        server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech · /v1/audio/transcriptions<br/>FIFO: one request on the FPGA at a time"]
         bert["<b>bert_squad_backend.py</b><br/>squad_text.py: WordPiece,<br/>sliding windows, best span"]
         llm["<b>smollm2_backend.py</b><br/>chatml.py, BPE tokenizer,<br/>prefix cache, libsampler.so"]
         vlm["<b>smolvlm_backend.py</b><br/>idefics3.py, images"]
         tts["<b>piper_backend.py</b><br/>espeak-ng phonemes,<br/>alignment, noise"]
+        asr["<b>moonshine_backend.py</b><br/>speech_input.py: WAV,<br/>resampling, detokenizer"]
         libbert["lib/libbert_squad.so<br/>bert_api.c + the generated<br/>BERT project"]
         libllm["lib/libsmollm2.so, libsmollm2_360m.so<br/>llm_api.c + the generated<br/>SmolLM2 projects"]
         libvlm["lib/libsmolvlm_256m.so<br/>llm_api.c + the generated<br/>SmolVLM project"]
         libtts["lib/libpiper_tts.so<br/>tts_api.c + the generated Piper<br/>encoder and chunk, the duration<br/>predictor in C"]
+        libasr["lib/libmoonshine_base.so<br/>asr_api.c + the generated<br/>Moonshine encoder buckets and decoder"]
         fpga["<b>FPGA</b><br/>ConvKernel · MatmulKernel<br/>VectorOPKernel<br/>weights in CMA"]
     end
     clients -- "HTTP, OpenAI API" --> server
     server -. "JSON / SSE" .-> clients
-    server --> bert & llm & vlm & tts
+    server --> bert & llm & vlm & tts & asr
     bert -- ctypes --> libbert
     llm -- ctypes --> libllm
     vlm -- ctypes --> libvlm
     tts -- ctypes --> libtts
-    libbert & libllm & libvlm & libtts -- "XRT / UIO" --> fpga
+    asr -- ctypes --> libasr
+    libbert & libllm & libvlm & libtts & libasr -- "XRT / UIO" --> fpga
 
     classDef py fill:#1e3a8a,stroke:#93c5fd,color:#ffffff
     classDef lib fill:#3f3f46,stroke:#a1a1aa,color:#ffffff
     classDef hw fill:#14532d,stroke:#4ade80,color:#ffffff
     classDef ext fill:#f4f4f5,stroke:#71717a,color:#18181b
-    class server,bert,llm,vlm,tts py
-    class libbert,libllm,libvlm,libtts lib
+    class server,bert,llm,vlm,tts,asr py
+    class libbert,libllm,libvlm,libtts,libasr lib
     class fpga hw
     class clients ext
 ```
@@ -127,13 +132,14 @@ for.
 | [Generative chat](doc/SMOLLM2.md) | build and serve SmolLM2-135M / 360M; sampling and repetition control; speed; calibration |
 | [Chat about images](doc/SMOLVLM.md) | build and serve SmolVLM-256M; send images |
 | [Text to speech](doc/TEXT_TO_SPEECH.md) | build and serve Piper; `/v1/audio/speech` and its options |
+| [Speech to text](doc/SPEECH_TO_TEXT.md) | build and serve Moonshine; `/v1/audio/transcriptions`, its formats and uploads |
 | [API reference](doc/API.md) | endpoints, request fields, errors, the `kv260` extension, queueing, logs |
 | [Development](doc/DEVELOPMENT.md) | the source files, adding a backend, the tests and the host validation |
 
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 188 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 215 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

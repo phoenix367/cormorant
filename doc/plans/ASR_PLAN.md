@@ -361,7 +361,7 @@ performance model topped up with the new shapes (`perf_calibrate.py`
 `SHIPPED` + `cases --refine` + `run --resume` + `fit`), the host model
 profiled (`host --merge`), `simulate` within ±2 %.
 
-**Phase 4 — the chat server.**  `moonshine_backend.py` (a backend with
+**Phase 4 — the chat server** (done: §7).  `moonshine_backend.py` (a backend with
 `transcription = True`) and `POST /v1/audio/transcriptions` in
 `kv260_chat_server.py`: multipart/form-data (`file`, `model`,
 `response_format` json / text, `language` en), WAV read natively (PCM16, any
@@ -668,3 +668,134 @@ cd inference-scheduler
 .venv/bin/python perf_calibrate.py simulate --profile moonshine-base=/tmp/board_base.json ...
 cd ../demo/chat && $PY deploy.py                  # the server back
 ```
+
+## 7. Phase 4: the chat server (2026-10-17)
+
+**Done.**  The chat server serves Moonshine base as `moonshine-base` on
+OpenAI's transcription API, `POST /v1/audio/transcriptions`; deployed on the
+board beside the five other models.  Through the server a 9.9 s recording
+takes 1.30 s (1.24 s on the FPGA, RTF 0.124), and the transcript equals the
+specification's.  The user guide is `demo/chat/doc/SPEECH_TO_TEXT.md`.
+
+### What was built
+
+- **`demo/chat/moonshine_backend.py`**:
+  - `LibAsrEngine`, the ctypes bindings of `asr_api.h` (fact `ctypes.asr`);
+  - `Detokenizer`, a pure-Python reader of Moonshine's `tokenizer.json`
+    (BPE pieces, `▁` → space, byte fallback, specials skipped, one leading
+    space stripped);
+  - `MoonshineBackend`, which transcribes part by part (`asr_chunks`, then
+    `asr_transcribe` per part, cancellable between parts) and yields a
+    `Segment` per part.
+- **`demo/chat/speech_input.py`**, the upload → 16 kHz mono int16:
+  - WAV is read here: PCM 8–32-bit, IEEE float, `WAVE_FORMAT_EXTENSIBLE`,
+    any rate and channel count;
+  - channels are averaged and resampled by a polyphase Kaiser-windowed sinc
+    (32 zero crossings, cut-off 0.94 of the lower Nyquist rate);
+  - 16 kHz mono 16-bit passes through sample for sample;
+  - other formats go through ffmpeg.
+- **`kv260_chat_server.py`**, the route:
+  - `multipart/form-data`, split at the boundary directly (a 25 MB upload
+    in 17 ms on the host; RFC 2046 delimiter lines);
+  - `response_format` `json` / `text` / `srt` / `vtt` / `verbose_json`,
+    with a segment per part;
+  - `stream` → `transcript.text.delta` / `transcript.text.done` events;
+  - the aliases `whisper-1`, `gpt-4o-transcribe` and
+    `gpt-4o-mini-transcribe`;
+  - `--asr-lib`, `--asr-weights`, `--asr-tokenizer`, `--asr-model-id`,
+    `--asr-cma-mb` (200) and `--asr-max-seconds` (600);
+  - a 32 MB body limit when a speech-to-text model is served.
+  - `chat_backend.py` gains `TranscriptionRequest`, `Segment` and the
+    backend's `transcription` contract.
+- **`deploy.py` and `chat_config.json.example`**: a `moonshine` block
+  (`lib`, `weights_dir`, `tokenizer`, `model_id`, `cma_mb`, `max_seconds`),
+  its preflight checks, `moonshine_backend.py` / `speech_input.py` and the
+  tokenizer uploaded, and the server's arguments.
+- **`asr_board.py --install-only`** builds and installs the library, as
+  `tts_board.py --install-only` does for Piper.  The default remote
+  directory is now the chat install directory, so the library lands in
+  `<dir>/lib/`; phase 3 ran in `/root/kv260_asr`.
+- **`chat.py`**: `--transcribe FILE` prints a transcript, `/listen FILE`
+  prints one in a session; only the text is recognized, nothing goes to
+  the chat model.
+
+### What changed against §3's design
+
+- **The library is installed by `asr_board.py`, not `deploy.py`.**  This
+  matches Piper (`tts_board.py --install-only`) and the LLM libraries
+  (`llm_board.py`); `deploy.py` checks for the library and uploads the
+  tokenizer.
+- **More of OpenAI's API than planned.**  The plan listed `json` / `text`;
+  `srt`, `vtt`, `verbose_json` and streaming came almost free from the
+  per-part segments.
+- **The R5 drives the encoder.**  The server starts the R5 firmware, and
+  the libraries' policy (§5) puts the encode entries on it.  Everything
+  stays bit-exact.  The encode call returns while the R5's batch still
+  runs, because the entry has no output to wait for, so `encode_ms` /
+  `decode_ms` split the same total differently than with the A53 driving.
+
+### Gates
+
+- **`demo/chat/tests/test_transcription.py`** (22 tests; the chat suite has
+  215 with the client tests below):
+  - `speech_input.py` covers every WAV form, the resampler (a 1 kHz tone
+    at 44.1 kHz stereo within 2·10⁻³, a 12 kHz tone at 48 kHz removed, 8 kHz
+    upsampled) and ffmpeg's formats;
+  - the detokenizer is checked against the `tokenizers` package on
+    Moonshine's real tokenizer.json (encoded Unicode text, 30 random id
+    sequences; in `.venv-export`, which has the package);
+  - `MoonshineBackend` runs over a fake library;
+  - the route is tested in every format, with SSE, the aliases and every
+    validation error, plus a client that leaves between parts.
+- **`asr_host_emu.py --lib-check`**: the chat server's backend over the
+  host-built library (ctypes, the upload as WAV, the detokenizer).  On
+  moonshine-tiny all four utterances are bit-exact with the specification,
+  including the 28.4 s one in two parts.
+- **On the board**, the server deployed with `moonshine` in
+  `server.backends`, and all of these ran against it:
+
+  | request | audio | the request | FPGA | |
+  |---|---:|---:|---:|---|
+  | 16 kHz WAV, the first (the model loads: 12.7 s, SmolLM2-360M evicted) | 9.9 s | 14.05 s | 1244 ms | = the specification |
+  | 16 kHz WAV | 9.9 s | 1.30 s | 1235 ms | = the specification |
+  | 44.1 kHz stereo WAV (resampled on the board: 1094 ms) | 9.9 s | 2.66 s | 1233 ms | the same text |
+  | FLAC (ffmpeg on the board: 3091 ms) | 9.9 s | 4.39 s | 1239 ms | the same text |
+  | 16 kHz WAV, `srt` / `json` / `stream` (two parts) | 28.4 s | 4.55 s | 4417 ms | = the specification; streaming: the first part after 2.1 s |
+
+  - `chat.py --transcribe` and `/listen` worked.  (`/listen` then still
+    sent the transcript to the chat model, and SmolLM2-135M answered it;
+    since the fix below it only prints the text.)
+  - The `openai` SDK 3.33.0, unchanged, returned `json`, a typed
+    `TranscriptionVerbose` (`verbose_json`, two segments), `srt` and typed
+    streaming events.
+- **The fact registry** gains `ctypes.asr`, Moonshine's CMA in
+  `chat.cma_mb`, and `SPEECH_TO_TEXT.md` as a consumer of
+  `chat.http_routes`.
+
+### A fix after the deploy: which model answers
+
+`/listen` sent its transcript to the session's model, and a session started
+with `--model moonshine-base` (or `piper-lessac-medium`) got a 400 from
+`/v1/chat/completions`: the client could not tell chat models from the
+speech ones.  And in a chat session `/listen` should only recognize the
+text; it no longer sends anything to the chat model.
+
+- **The server:** `/v1/models` now carries the non-standard
+  `"kv260": {"type": "chat" | "speech" | "transcription"}`.
+- **The client:** `chat.py` picks the first chat model by default.
+  `--model` / `/model` naming a speech-to-text model makes it the one
+  `/listen` uses, and a text-to-speech model the voice of `/say`; the
+  answers to typed messages keep coming from a chat model.  `/listen` prints
+  the transcript and sends nothing to the chat model.
+- **Gates:** `test_chat_client.py` `ChatClientModels` /
+  `ChatClientNoChatModel`, and the session replayed against the board.
+
+### Open
+
+- **Two parts of ~14 s each run in the 24.6 s bucket** (RTF 0.155 for the
+  28.4 s recording, against 0.124 for 9.9 s).  The split is the
+  specification's (`chunks`: the fewest parts); splitting at most into
+  12.3 s parts would use the 512 bucket.
+- **Uploads other than 16 kHz WAV cost host time before the queue**: the
+  resampler 0.11 s per second of 44.1 kHz stereo audio, and ffmpeg 3 s
+  (its start-up on the board).

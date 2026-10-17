@@ -5,7 +5,7 @@ This page lists the endpoints, the request fields it honours, its errors,
 the `kv260` extension, and how requests share the FPGA.  How each model
 interprets a request is in its guide ([Document Q&A](BERT_QA.md),
 [Generative chat](SMOLLM2.md), [Chat about images](SMOLVLM.md),
-[Text to speech](TEXT_TO_SPEECH.md)).
+[Text to speech](TEXT_TO_SPEECH.md), [Speech to text](SPEECH_TO_TEXT.md)).
 
 ## Endpoints
 
@@ -14,9 +14,10 @@ The paths also work without the `/v1` prefix.
 | Endpoint | What it returns |
 |---|---|
 | `GET /health` | the server's state (below); 503 when a model failed to load; no API key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`) |
+| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`, and the non-standard `kv260: {"type"}` — `chat`, `speech` or `transcription`: the endpoint the model serves) |
 | `POST /v1/chat/completions` | a chat answer: `chat.completion`, or with `stream: true` server-sent events (below) |
 | `POST /v1/audio/speech` | speech from the speech backends ([Text to speech](TEXT_TO_SPEECH.md)) |
+| `POST /v1/audio/transcriptions` | the transcript of an uploaded recording from the speech-to-text backends ([Speech to text](SPEECH_TO_TEXT.md)) |
 
 **Streaming chat.**  With `stream: true`, the response is a series of
 `data: {...}` lines holding `chat.completion.chunk` objects:
@@ -35,6 +36,13 @@ connection (HTTP/1.0).
 - **`stream_format: "sse"`:** `speech.audio.delta` events and a final
   `speech.audio.done` with the usage.
 
+**Transcription responses.**  The request is `multipart/form-data` with the
+audio as `file`; the answer is the transcript as `json` (`{"text",
+"usage": {"type": "duration", "seconds"}, "kv260"}`), `text`, `srt`, `vtt`
+or `verbose_json` (a segment per part of at most 24.6 s); with `stream:
+true`, `transcript.text.delta` events (one per part) and a final
+`transcript.text.done` with the whole text.
+
 **`/health`** returns:
 - `status`: `"ok"` or `"error"`;
 - `version`;
@@ -48,6 +56,8 @@ connection (HTTP/1.0).
   - SmolVLM: `image_cache`;
   - Piper: `type`, `sample_rate`, `espeak_voice`, `requests`, `audio_s`,
     `chunks`, `rtf`, `frontend_s`;
+  - Moonshine: `type` (`transcription`), `tokenizer`, `sample_rate`,
+    `max_seconds`, `requests`, `audio_s`, `tokens`, `parts`, `rtf`;
 - `resident`, `cma_free_mb`, `loads`, `unloads`: see
   [residency](DEPLOY.md#several-models-on-one-fpga);
 - `busy`, `waiting`: the FPGA queue;
@@ -57,7 +67,7 @@ connection (HTTP/1.0).
 
 | Field | Notes |
 |---|---|
-| `model` | default: the first backend (the first speech backend for `/audio/speech`) |
+| `model` | default: the first backend (the first speech backend for `/audio/speech`, the first speech-to-text backend for `/audio/transcriptions`) |
 | `messages` | string content or text parts; `image_url` parts (base64 data URLs) for `smolvlm` |
 | `stream`, `stream_options.include_usage` | streaming, as above |
 | `max_tokens` / `max_completion_tokens` | the answer's length cap |
@@ -67,7 +77,9 @@ connection (HTTP/1.0).
 | `n` | 1 only |
 | `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `repeat_last_n`, `dry_*`, `loop_guard` | the generative models' extra sampling fields ([Sampling](SMOLLM2.md#sampling)) |
 
-Anything else is ignored.
+Anything else is ignored.  The speech and transcription fields are in
+their guides ([Text to speech](TEXT_TO_SPEECH.md#requests),
+[Speech to text](SPEECH_TO_TEXT.md#requests)).
 
 ## Errors
 
@@ -78,10 +90,11 @@ so OpenAI clients raise their usual exceptions.
 |---|---|
 | 400 | invalid request; `param` names the field.  `images_not_supported`: an image sent to a text model.  `context_length_exceeded`: a generative prompt that cannot be trimmed to fit |
 | 400 `unsupported_format` | a speech format that needs ffmpeg, without ffmpeg |
-| 400 `model_not_supported` | a chat model at `/audio/speech`, or a speech model at `/chat/completions` |
+| 400 `model_not_supported` | a chat model at `/audio/speech` or `/audio/transcriptions`, a speech or speech-to-text model at `/chat/completions` |
+| 400 `invalid_audio`, `audio_too_long`, `unsupported_language` | an upload that cannot be decoded (not WAV, without ffmpeg) or holds no samples; longer than `--asr-max-seconds`; a language other than English |
 | 401 `invalid_api_key` | missing or wrong API key |
 | 404 `model_not_found` / `unknown_url` | unknown model or URL |
-| 411 / 413 | a body without a length / over 4 MB (32 MB when an image model is served; `--max-body-mb`) |
+| 411 / 413 | a body without a length / over 4 MB (32 MB when an image or speech-to-text model is served; `--max-body-mb`) |
 | 500 `backend_error` | the backend failed; once a stream has started, an SSE `data: {"error": ...}` event instead |
 | 503 `server_busy` | the queue is full, or the request waited longer than `--queue-timeout` (`Retry-After: 5`) |
 | 503 `model_not_loaded` | the model's library could not be loaded |
@@ -112,7 +125,8 @@ tokenizing).
   - while running, it is cancelled at the next step.  For `bert-squad`
     that is the next 256-token window.  For `smollm2` it is the next
     token, or the next prefill chunk with `--llm-prefill-chunk`.  For
-    `piper` it is the next audio chunk.
+    `piper` it is the next audio chunk, for `moonshine` the next part of
+    the recording (at most 24.6 s).
 
 `server.queue_timeout` and `server.max_queue` in `chat_config.json` set
 the two limits.

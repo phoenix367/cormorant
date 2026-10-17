@@ -8,6 +8,12 @@ compared with the specification (moonshine_q.transcribe_long with the
 project's formats, the long ones split at the same quiet points) — the board
 gate without the board.
 
+With --lib-check, libmoonshine_<size>.so is built the same way and driven by
+the chat server's backend (demo/chat/moonshine_backend.py: LibAsrEngine
+through ctypes, MoonshineBackend's parts, the uploaded WAV decoded by
+speech_input.py, the ids decoded by its Detokenizer): every utterance's ids
+must equal the specification's, the transcript is printed.
+
 The utterances are LibriSpeech test-clean ones of the study's evaluation set
 (asr_study.py fetch): by default the shortest and the ones closest to 5 s and
 10 s and the longest (split in two: longer than one encoder pass) — every bucket
@@ -15,7 +21,7 @@ of the default ones.
 
 usage: inference-scheduler/.venv/bin/python demo/asr/scripts/asr_host_emu.py
            [--project demo/asr/build/moonshine-tiny_project] [--utts auto | N | UID,UID,...]
-           [--incoherent]
+           [--incoherent] [--lib-check]
 """
 
 from __future__ import annotations
@@ -153,6 +159,44 @@ def select(which: str):
     return [by_id[w] for w in want]
 
 
+def lib_check(project: str, work: str, utts) -> bool:
+    """The chat server's MoonshineBackend over the host-built library (see the
+    module docstring)."""
+    import wave
+    import io
+    import moonshine_q as mq
+    sys.path.insert(0, os.path.join(REPO, "demo", "chat"))
+    from chat_backend import CancelToken, TranscriptionRequest
+    from moonshine_backend import LibAsrEngine, MoonshineBackend
+    os.environ.setdefault("INFERENCE_HOST_THREADS", "4")
+    summary = json.load(open(os.path.join(project, "project.json")))
+    b = MoonshineBackend(LibAsrEngine(build(project, work, shared=True), project),
+                         os.path.join(project, "weights", "tokenizer.json"), model_id=summary["model"])
+    b.load_host()
+    b.load()
+    m, cfgd, frames = spec(project)
+    ok = True
+    try:
+        for uid, _ref, pcm in utts:
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(np.asarray(pcm, "<i2").tobytes())
+            t0 = time.time()
+            job = b.prepare_transcription(TranscriptionRequest(model=b.model_id, audio=buf.getvalue()))
+            out = list(b.transcribe(job, CancelToken()))
+            ids = [t for sg in out[:-1] for t in sg.tokens]
+            same = ids == mq.transcribe_long(m, cfgd, pcm, frames)
+            ok &= same
+            print(f"  {uid}: {len(pcm) / 16000:.2f} s, {len(out) - 1} part(s) in {time.time() - t0:.0f} s: "
+                  + ("ids bit-exact" if same else "MISMATCH") + f"\n    {out[-1].info['text']}", flush=True)
+    finally:
+        b.close()
+    return ok
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--project", default=DEFAULT_PROJECT)
@@ -160,11 +204,17 @@ def main(argv=None) -> int:
     ap.add_argument("--work", default=None)
     ap.add_argument("--incoherent", action="store_true",
                     help="separate CPU / DDR buffer copies: every cache sync must be right")
+    ap.add_argument("--lib-check", action="store_true",
+                    help="the chat server's backend over a host-built libmoonshine_<size>.so instead")
     args = ap.parse_args(argv)
     import moonshine_q as mq
     project = os.path.abspath(args.project)
     work = args.work or os.path.join(project, "host_emu")
     os.makedirs(work, exist_ok=True)
+    if args.lib_check:
+        ok = lib_check(project, work, select(args.utts))
+        print("LIB CHECK: " + ("MoonshineBackend ids bit-exact with the specification" if ok else "MISMATCH"))
+        return 0 if ok else 1
     exe = build(project, work, args.incoherent)
     utts = select(args.utts)
     t0 = time.time()

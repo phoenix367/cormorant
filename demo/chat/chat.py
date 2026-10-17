@@ -8,6 +8,7 @@ only) for the KV260 chat server; runs on a laptop or on the board.
           [--max-tokens N] [--temperature T] [--timeout S]
           [--audio] [--say TEXT] [--audio-out FILE.wav] [--player CMD|none]
           [--tts-model tts-1] [--voice V] [--speed S] [--no-banner]
+          [--transcribe FILE] [--asr-model whisper-1]
 
 An interactive session in a terminal opens with the CORMORANT banner and a
 box naming the server and the model (--no-banner, or a terminal narrower
@@ -19,16 +20,22 @@ Interactive commands:
   /image FILE    attach an image (JPEG / PNG ...) to your next message (an
                  image model, e.g. smolvlm-256m-instruct); or end a message
                  with it: "What is in this image? /image photo.jpg"
-  /model [M]     list the server's models / switch to M (the history is kept)
+  /model [M]     list the server's models / switch to M (the history is kept); a
+                 text-to-speech model becomes the voice of /say and /audio, a
+                 speech-to-text model the one /listen uses
   /audio [on|off]   read the answers aloud (text to speech on the server,
                  POST /v1/audio/speech; /audio alone toggles)
   /audio save FILE.wav   save the last audio
   /say [TEXT]    speak TEXT, or the last answer again (Ctrl-C stops the audio)
+  /listen FILE   transcribe a recording and print the text (speech to text on
+                 the server, POST /v1/audio/transcriptions: WAV, or mp3 / flac
+                 / ... where the server has ffmpeg); nothing goes to the chat
   /reset         forget the conversation (keeps the system message)
   /help, /quit
 
 With -q the question is asked once and the answer printed (exit code 1 on
-an error); with --audio it is also spoken.  --say TEXT only speaks TEXT.
+an error); with --audio it is also spoken.  --say TEXT only speaks TEXT;
+--transcribe FILE only prints the transcript of FILE.
 Environment: KV260_CHAT_URL, KV260_CHAT_API_KEY (or OPENAI_API_KEY),
 KV260_CHAT_PLAYER.
 
@@ -134,9 +141,80 @@ def call(args, path, body=None):
         raise ApiError(f"cannot reach {args.url}: {e.reason}") from None
 
 
-def models(args):
+def transcribe(args, path):
+    """The transcript of an audio file (POST /audio/transcriptions, multipart)."""
+    with open(os.path.expanduser(path), "rb") as f:
+        data = f.read()
+    boundary = "kv260-" + os.urandom(12).hex()
+    head = "".join(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                   for k, v in (("model", args.asr_model), ("response_format", "json")))
+    name = os.path.basename(path).replace('"', "%22")
+    body = (head + f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n"
+            f"Content-Type: application/octet-stream\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(args.url.rstrip("/") + "/audio/transcriptions", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    if args.api_key:
+        req.add_header("Authorization", f"Bearer {args.api_key}")
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=args.timeout) as r:
+            obj = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read().decode())["error"]["message"]
+        except Exception:                                      # noqa: BLE001
+            msg = e.reason
+        raise ApiError(f"HTTP {e.code}: {msg}") from None
+    except urllib.error.URLError as e:
+        raise ApiError(f"cannot reach {args.url}: {e.reason}") from None
+    if args.verbose or sys.stdout.isatty():
+        k = obj.get("kv260") or {}
+        info = [f"{time.monotonic() - t0:.1f} s"]
+        if k.get("audio_s"):
+            info.append(f"{k['audio_s']:.1f} s of audio")
+        if k.get("parts", 1) > 1:
+            info.append(f"{k['parts']} parts")
+        if k.get("rtf"):
+            info.append(f"RTF {k['rtf']:.2f}")
+        print(f"{DIM}[transcribed: {' · '.join(info)}]{RST}", file=sys.stderr)
+    return obj.get("text", "")
+
+
+def model_types(args):
+    """{id: "chat" | "speech" | "transcription"} of the server's models, in its
+    order (the kv260 extension of /v1/models; a server without it: every
+    model a chat model)."""
     with call(args, "/models") as r:
-        return [m["id"] for m in json.load(r)["data"]]
+        return {m["id"]: (m.get("kv260") or {}).get("type", "chat") for m in json.load(r)["data"]}
+
+
+def models(args):
+    return list(model_types(args))
+
+
+KIND = {"speech": "text to speech", "transcription": "speech to text"}
+
+
+def use_model(args, name, types):
+    """Make `name` the model for what it does: a chat model answers, a speech
+    model reads aloud (--tts-model), a speech-to-text model transcribes
+    (--asr-model).  Returns a note for the user, or None."""
+    kind = types.get(name, "chat")
+    if kind == "speech":
+        args.tts_model = name
+        return (f"{name} is a text-to-speech model: /say and /audio use it"
+                + (f"; answers come from {args.model}" if args.model else ""))
+    if kind == "transcription":
+        args.asr_model = name
+        return (f"{name} is a speech-to-text model: /listen uses it"
+                + (f"; answers come from {args.model}" if args.model else ""))
+    args.model = name
+    return None
+
+
+def model_list(types, current):
+    return ", ".join(m + (f" ({KIND[t]})" if t in KIND else "") for m, t in types.items()) + \
+        f"; chatting with {current or '(no chat model)'}"
 
 
 def ask(args, messages):
@@ -420,10 +498,22 @@ def main(argv=None):
     g.add_argument("--tts-model", default="tts-1", help="speech model (default tts-1: the server's)")
     g.add_argument("--voice", default="alloy", help="voice name (the server may have only one)")
     g.add_argument("--speed", type=float, help="speech speed, 0.25 .. 4")
+    g = ap.add_argument_group("speech to text on the server")
+    g.add_argument("--transcribe", metavar="FILE", help="print the transcript of an audio file and exit")
+    g.add_argument("--asr-model", default="whisper-1",
+                   help="speech-to-text model (default whisper-1: the server's)")
     ap.add_argument("--no-banner", action="store_true",
                     help="no CORMORANT banner at the start of an interactive session")
     args = ap.parse_args(argv)
     audio = Audio()
+
+    if args.transcribe is not None:
+        try:
+            print(transcribe(args, args.transcribe))
+            return 0
+        except (ApiError, OSError, http.client.HTTPException, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     if args.say is not None:
         try:
@@ -435,17 +525,31 @@ def main(argv=None):
 
     try:
         system = read_file(args.doc) if args.doc else args.system
-        if not args.model:
-            args.model = models(args)[0]
+        try:
+            types = model_types(args)
+        except ApiError:
+            if not args.model:
+                raise
+            types = {}                          # --model given: start without the list
     except (ApiError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    chat_models = [m for m, t in types.items() if t == "chat"]
+    note = None
+    if args.model and types.get(args.model, "chat") != "chat":
+        wanted, args.model = args.model, (chat_models[0] if chat_models else None)
+        note = use_model(args, wanted, types)
+    elif not args.model:
+        args.model = chat_models[0] if chat_models else None
     history = []
 
     def convo():
         return ([{"role": "system", "content": system}] if system else []) + history
 
     if args.question:
+        if not args.model:
+            print("error: the server serves no chat model", file=sys.stderr)
+            return 1
         try:
             answer = ask(args, convo() + [user_message(args.question, args.image)])
             if args.audio or args.audio_out:
@@ -457,17 +561,19 @@ def main(argv=None):
 
     pending_image = args.image
     tty = sys.stdin.isatty()
-    plain = (f"{args.url} · model {args.model}"
+    plain = (f"{args.url} · model {args.model or '(no chat model)'}"
              f"{' · document ' + str(len(system.split())) + ' words' if system else ''}"
              f"{' · answers read aloud' if args.audio else ''}"
              f" · /help for commands")
     if tty and sys.stdout.isatty() and not args.no_banner:
-        print_banner([f"server  {args.url}", f"model   {args.model}"]
+        print_banner([f"server  {args.url}", f"model   {args.model or '(no chat model)'}"]
                      + ([f"doc     {len(system.split())} words"] if system else [])
                      + (["audio   answers read aloud"] if args.audio else [])
                      + ["", "/help for commands · /quit to exit"], plain)
     else:
         print(f"{DIM}{plain}{RST}")
+    if note:
+        print(f"{DIM}({note}){RST}")
     while True:
         try:
             line = input("> " if tty else "").strip()
@@ -503,9 +609,12 @@ def main(argv=None):
                     pending_image = path
                     print(f"{DIM}(image {path} goes with your next message){RST}")
             elif cmd == "/model":
+                types = model_types(args)
                 if arg:
-                    args.model = arg
-                print(f"{DIM}models: {', '.join(models(args))}; using {args.model}{RST}")
+                    note = use_model(args, arg, types)
+                    if note:
+                        print(f"{DIM}({note}){RST}")
+                print(f"{DIM}models: {model_list(types, args.model)}{RST}")
             elif cmd == "/audio":
                 sub, _, rest = arg.partition(" ")
                 if sub == "save":
@@ -530,6 +639,16 @@ def main(argv=None):
                     print(f"{DIM}nothing to say yet (/say TEXT){RST}")
                 else:
                     speak(args, text, audio)
+            elif cmd == "/listen":
+                path = image_path(arg)
+                if not arg:
+                    print(f"{DIM}usage: /listen FILE (a recording to transcribe){RST}")
+                    continue
+                if not os.path.isfile(path):
+                    print(f"{DIM}no such file: {path!r}{RST}")
+                    continue
+                text = transcribe(args, path).strip()
+                print(text if text else f"{DIM}(nothing heard in {path}){RST}")
             elif cmd.startswith("/"):
                 print(f"{DIM}unknown command {cmd} (/help){RST}")
             else:
@@ -542,6 +661,10 @@ def main(argv=None):
                     if not text:
                         print(f"{DIM}(image {path} goes with your next message){RST}")
                         continue
+                if not args.model:
+                    print(f"{DIM}(the server serves no chat model; /listen FILE transcribes, "
+                          f"/say TEXT speaks){RST}")
+                    continue
                 history.append(user_message(text, pending_image))
                 pending_image = None
                 history.append({"role": "assistant", "content": ask(args, convo())})

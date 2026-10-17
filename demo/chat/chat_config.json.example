@@ -18,7 +18,7 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice. See doc/DEPLOY.md.",
+    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), moonshine (speech to text), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice, moonshine libmoonshine_base.so and its weights. See doc/DEPLOY.md.",
     "resident": "auto",
     "_resident_note": "auto = keep the FPGA models loaded while CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,
@@ -105,5 +105,18 @@
     "model_id": null,
     "_model_id_note": "null = the model of voice.json (piper-lessac-medium).",
     "cma_mb": 55
+  },
+  "moonshine": {
+    "lib": null,
+    "_lib_note": "null = <remote.dir>/lib/libmoonshine_base.so (Moonshine speech to text, POST /v1/audio/transcriptions; backend name \"moonshine\"). Built and installed with its weights by demo/asr/scripts/asr_board.py --install-only; libmoonshine_tiny.so (with its weights_dir) serves the smaller model.",
+    "weights_dir": "/root/moonshine_base_weights",
+    "_weights_dir_note": "weights/*.dat of the library (asr_board.py uploads them there).",
+    "tokenizer": "../asr/assets/moonshine-base/tokenizer.json",
+    "_tokenizer_note": "The checkpoint's tokenizer.json on the host (demo/asr/scripts/asr_study.py fetch); deploy.py uploads it to <remote.dir>/moonshine/.",
+    "model_id": null,
+    "_model_id_note": "null = from the library's name (libmoonshine_base.so -> moonshine-base).",
+    "cma_mb": 200,
+    "max_seconds": 600,
+    "_max_seconds_note": "The longest audio a request may send (seconds); long audio is transcribed in parts of at most 24.6 s, about 0.13 s of FPGA time per second of audio (base)."
   }
 }

@@ -55,9 +55,11 @@ Piper figures are from 2026-10-01, at 100 MHz.
 | SmolLM2-360M-Instruct | **7.6 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.06 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
 | SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 50 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
+| Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
 
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
-audio samples are bit-exact with the scheduler's simulation.
+audio samples are bit-exact with the scheduler's simulation; Moonshine's
+transcripts with its specification, token for token.
 The FPGA design (`hw/cormorant_hw_128`, bitstream `04259a7af917`) uses 68 % of the DSPs
 (845 / 1248), 78.4 % of the LUTs (91 805 / 117 120), 136 / 144 BRAM and
 57 / 64 URAM.
@@ -153,6 +155,16 @@ program) for Linux with XRT buffers or for bare metal:
   - The decoder's residual sums are VectorOP `Add`s; gates, the other sums,
     LeakyReLU and masks are host ops.
   - Consecutive chunks join into one waveform bit for bit.
+- **Speech to text** — a Moonshine frontend writes the encoder as four
+  length buckets (3.1 / 6.2 / 12.3 / 24.6 s of 16 kHz audio, the valid
+  length a runtime input) and the decoder as one greedy step.
+  - The conv stem runs on ConvKernel over folded rows, with host ops for
+    tanh, GroupNorm and GELU from tables.
+  - The encoder's attention runs on ConvKernel with VectorOP's softmax unit
+    over the valid keys; its LayerNorms, residuals and RoPE run on the
+    row-ops unit, and its GELUs on VectorOP's activation unit.
+  - The decoder reads the cross-attention caches the encoder wrote.
+  - The library splits long audio at quiet points.
 - **Scheduling** — kernels on different lanes run concurrently; one weak
   `kernel_wait()` does the synchronisation; intermediate buffers share pool
   slots by event-stream liveness; cache clean / invalidate calls are emitted
@@ -184,8 +196,9 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/stereo_depth/`](demo/stereo_depth/) | LightStereo-S stereo depth: disparity maps of Middlebury / ETH3D pairs, your rectified pairs or a RealSense D4xx on the board (`--capture`); EPE against the ground truth, depth against the camera's own |
 | [`demo/camera/`](demo/camera/) | MobileNet V1 on live RealSense frames, annotated frames streamed back over SSH |
 | [`demo/bert_squad/`](demo/bert_squad/) | BERT-base extractive question answering on SQuAD 1.1 |
-| [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, and Piper text to speech (`/v1/audio/speech`) |
+| [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, Piper text to speech (`/v1/audio/speech`) and Moonshine speech to text (`/v1/audio/transcriptions`) |
 | [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |
+| [`demo/asr/`](demo/asr/scripts/) | Moonshine speech to text: the study (Whisper and Moonshine screened), the bit-level specification, `libmoonshine_<size>.so` and its host-emulation and board gates (token ids bit-exact with the specification) |
 
 ---
 
@@ -301,7 +314,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 | Layer | Needs | Command |
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1880<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->188<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->215<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |
@@ -336,6 +349,7 @@ own models.
 | SmolLM2-360M-Instruct (Hugging Face safetensors) | context 1024 | chat ([demo/chat](demo/chat/README.md)) |
 | SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](demo/chat/README.md)) |
 | Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](demo/tts/README.md), [demo/chat](demo/chat/doc/TEXT_TO_SPEECH.md)) |
+| Moonshine base / tiny ([UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base), safetensors) | 16 kHz audio, any length (parts of up to 24.6 s) | speech to text ([demo/asr](demo/asr/scripts/), [demo/chat](demo/chat/doc/SPEECH_TO_TEXT.md)) |
 
 ---
 

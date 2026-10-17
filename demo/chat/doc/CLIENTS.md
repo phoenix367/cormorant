@@ -86,7 +86,7 @@ Denver Broncos
 Levi's Stadium in the San Francisco Bay Area at Santa Clara, California.
 [1.1 s · 1/1 window(s) · confidence 0.34 · 166 + 15 tokens]
 > /model
-models: bert-squad; using bert-squad
+models: bert-squad; chatting with bert-squad
 > /reset
 (conversation cleared)
 > What color was emphasized for the 50th anniversary?
@@ -112,6 +112,7 @@ output is piped or redirected.
 | `--no-stream`, `--max-tokens N`, `--temperature T`, `--timeout S` | request settings |
 | `-v` | print the statistics line even when not on a terminal |
 | `--audio`, `--say TEXT`, `--audio-out FILE.wav`, `--tts-model`, `--voice`, `--speed`, `--player CMD` | speech; see [Reading answers aloud](#reading-answers-aloud) |
+| `--transcribe FILE`, `--asr-model` | speech to text; see [Speech to text](#speech-to-text) |
 
 **Commands in the REPL:**
 
@@ -120,8 +121,9 @@ output is piped or redirected.
 | `/doc FILE` | load a document (clears the conversation) |
 | `/system [TEXT]` | set or clear the system message |
 | `/image FILE` | attach an image to the next message (or end a message with it) |
-| `/model [M]` | list the models, or switch to M (the history is kept) |
+| `/model [M]` | list the models (with their kinds), or switch to M (the history is kept); a text-to-speech M becomes the voice of `/say`, a speech-to-text M the one `/listen` uses |
 | `/audio [on\|off]`, `/audio save FILE.wav`, `/say [TEXT]` | speech |
+| `/listen FILE` | transcribe a recording and print the text (nothing is sent to the chat model) |
 | `/reset` | clear the conversation |
 | `/help`, `/quit` | |
 
@@ -178,6 +180,35 @@ An FPGA (Field-Programmable Gate Array) is a type of semiconductor device ...
     (`afplay` on macOS, `winsound` on Windows), or goes to a WAV file whose
     path is printed.
 
+### Speech to text
+
+When the server also serves a speech-to-text model ([Speech to
+text](SPEECH_TO_TEXT.md)), `chat.py` can send recordings:
+
+```
+$ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1 --transcribe nemo.wav
+[transcribed: 1.4 s · 9.9 s of audio · RTF 0.12]
+Nemo builds a fabulous futuristic submarine, the Nautilus, then conducts an underwater campaign of vengeance against his imperialist oppressor.
+$ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1
+> /listen libritts_260_123440_000010_000004_recon.wav
+I almost did. I can remember feeling a little different.
+[transcribed: 1.1 s · 2.9 s of audio · RTF 0.11]
+```
+
+- **`--transcribe FILE`** prints the transcript and exits; **`/listen
+  FILE`** prints it in a session.  Either way only the text is recognized:
+  nothing goes to the chat model, and the conversation is unchanged.
+- **Which model does what.**  The answers come from a chat model; the
+  server's model list says which models are chat, text-to-speech or
+  speech-to-text (its `kv260.type`).  `--model` or `/model` naming a
+  speech-to-text model makes it the one `/listen` uses (and a
+  text-to-speech model the voice of `/say`), and the answers to typed
+  messages keep coming from a chat model.
+- **What is sent:** `POST /v1/audio/transcriptions`, a multipart form with
+  the file and `--asr-model` (default `whisper-1`, which the server maps to
+  its speech-to-text model).  WAV is read by the server itself; mp3 / flac /
+  ogg / m4a need ffmpeg on the board.
+
 ## `curl`
 
 `curl` shows the protocol as it is: the JSON you send and the JSON (or
@@ -190,7 +221,7 @@ errors.
 
 ```
 $ curl -s http://192.168.100.8:8000/v1/models
-{"object": "list", "data": [{"id": "bert-squad", "object": "model", "created": 1790403749, "owned_by": "kv260"}]}
+{"object": "list", "data": [{"id": "bert-squad", "object": "model", "created": 1790403749, "owned_by": "kv260", "kv260": {"type": "chat"}}]}
 ```
 
 **Ask a question** (`POST /v1/chat/completions`).  The request puts the

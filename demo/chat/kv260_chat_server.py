@@ -5,7 +5,8 @@ kv260_chat_server.py — OpenAI-compatible chat server for the KV260
 
 Endpoints
   GET  /health                  status, models, queue (no API key needed)
-  GET  /v1/models               {"object": "list", "data": [model, ...]}
+  GET  /v1/models               {"object": "list", "data": [model, ...]}; each model
+                                with "kv260": {"type": chat | speech | transcription}
   GET  /v1/models/{id}          one model
   POST /v1/chat/completions     stream false -> one chat.completion JSON;
                                 stream true  -> SSE "data: {chat.completion.chunk}"
@@ -18,6 +19,14 @@ Endpoints
                                 ffmpeg; stream_format "sse": speech.audio.delta
                                 events); model aliases tts-1, tts-1-hd,
                                 gpt-4o-mini-tts; any voice name is accepted
+  POST /v1/audio/transcriptions speech to text: multipart/form-data with
+                                "file" (WAV read here, any rate / channels;
+                                mp3 / flac / ogg / m4a / webm through ffmpeg),
+                                "model", "language" (en), "response_format"
+                                (json | text | srt | vtt | verbose_json),
+                                "stream" (transcript.text.delta SSE events);
+                                model aliases whisper-1, gpt-4o-transcribe,
+                                gpt-4o-mini-transcribe
   (the same paths without the /v1 prefix are accepted too)
 
 Backends (chat_backend.Backend; one model id each)
@@ -38,12 +47,18 @@ Backends (chat_backend.Backend; one model id each)
                encoder on the FPGA, the duration predictor in C; espeak-ng
                phonemes, the length regulator and the noise on the host;
                22050 Hz mono)
+  moonshine    model id moonshine-base (the library's size: libmoonshine_base.so
+               or libmoonshine_tiny.so): speech to text with Moonshine on the
+               FPGA (moonshine_backend.py; the audio at 16 kHz in parts of at
+               most 24.6 s split at quiet points, greedy decoding, the
+               transcript decoded on the host; English)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~775 MB, SmolVLM
-~550 MB, Piper ~55 MB of the 1000 MB cma=; idle CmaFree was 626-813 MB).
+~550 MB, Piper ~55 MB, Moonshine base ~200 MB of the 1000 MB cma=; idle CmaFree
+was 626-813 MB).
   auto (default)  the first backend loads at startup, the others when first
                   requested; before a load, models are evicted (least recently
                   used first) while CmaFree < the new model's cma_mb +
@@ -70,7 +85,8 @@ usage:
   kv260_chat_server.py [--host 0.0.0.0] [--port 8000]
                        [--api-key KEY | --api-key-file FILE]
                        [--backend bert-squad] [--backend smollm2] [--backend smollm2-360m]
-                       [--backend smolvlm] [--backend piper] [--backend echo] ...
+                       [--backend smolvlm] [--backend piper] [--backend moonshine]
+                       [--backend echo] ...
                        [--resident auto|one|all] [--cma-margin-mb 32]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]
@@ -80,6 +96,8 @@ usage:
                        [--llm-360m-tokenizer tokenizer.json]
                        [--vlm-lib lib/libsmolvlm_256m.so] [--vlm-weights DIR]
                        [--tts-lib lib/libpiper_tts.so] [--tts-weights DIR] [--ffmpeg PATH]
+                       [--asr-lib lib/libmoonshine_base.so] [--asr-weights DIR]
+                       [--asr-tokenizer tokenizer.json] [--asr-max-seconds 600]
                        [--queue-timeout 120] [--max-queue 16]
 """
 
@@ -113,7 +131,8 @@ for _p in (HERE, os.path.join(HERE, "..", "bert_squad", "scripts")):
         sys.path.insert(0, _p)
 
 from chat_backend import (Backend, BackendError, Cancelled, CancelToken,  # noqa: E402
-                          ChatRequest, Delta, Finish, SpeechRequest, apply_stop)
+                          ChatRequest, Delta, Finish, Segment, SpeechRequest, TranscriptionRequest,
+                          apply_stop)
 
 VERSION = "1.0"
 MAX_BODY = 4 << 20           # bytes; documents go into the messages
@@ -126,6 +145,9 @@ FFMPEG_ARGS = {"mp3": ["-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3"],
                "flac": ["-c:a", "flac", "-f", "flac"]}
 SPEECH_ALIASES = ("tts-1", "tts-1-hd", "gpt-4o-mini-tts")
 MAX_SPEECH_INPUT = 4096       # characters, as OpenAI
+TRANSCRIPTION_ALIASES = ("whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe")
+TRANSCRIPTION_FORMATS = ("json", "text", "srt", "vtt", "verbose_json")
+MAX_UPLOAD = 32 << 20         # request body limit when a speech-to-text model is served (OpenAI: 25 MB files)
 
 
 def log(msg: str) -> None:
@@ -282,6 +304,132 @@ def parse_speech_request(body: Any, default_model: Optional[str]) -> SpeechReque
                          seed=seed, raw=body)
 
 
+def parse_multipart(content_type: str, body: bytes) -> Dict[str, Any]:
+    """multipart/form-data -> {name: str | (bytes, filename)} (a part with a
+    filename is a file; repeated names: the last one wins).  The body is split
+    at the boundary directly (the payloads stay slices: a 25 MB upload costs a
+    few copies, not a parse); each part's headers go through the stdlib's
+    email parser (quoting, RFC 2231 names)."""
+    import email.parser
+    import email.policy
+    hp = email.parser.BytesHeaderParser(policy=email.policy.HTTP)
+    ct = hp.parsebytes(b"Content-Type: " + content_type.encode("latin-1", "replace") + b"\r\n\r\n")
+    boundary = ct.get_param("boundary")
+    if ct.get_content_type() != "multipart/form-data" or not boundary:
+        raise BackendError("Expected a multipart/form-data body (with a boundary) carrying the audio "
+                           "as 'file'.")
+    delim = b"--" + str(boundary).encode("latin-1")
+
+    def delimiter(at: int) -> int:
+        """The next delimiter line at or after `at` (RFC 2046: the boundary, then
+        "--" or optional blanks and CRLF), or -1."""
+        while True:
+            i = body.find(b"\r\n" + delim, at)
+            if i < 0:
+                return -1
+            j = i + 2 + len(delim)
+            k = j
+            while body[k:k + 1] in (b" ", b"\t"):
+                k += 1
+            if body[j:j + 2] == b"--" or body[k:k + 2] == b"\r\n":
+                return i
+            at = i + 1
+
+    pos = 0 if body.startswith(delim) else delimiter(0) + 2
+    if pos < 2 and not body.startswith(delim):
+        raise BackendError("Could not parse the multipart/form-data body: no boundary in it.")
+    out: Dict[str, Any] = {}
+    pos += len(delim)
+    while body[pos:pos + 2] != b"--":
+        eol = body.find(b"\r\n", pos)                         # the rest of the delimiter line
+        hend = body.find(b"\r\n\r\n", eol) if eol >= 0 else -1
+        nxt = delimiter(hend + 2) if hend >= 0 else -1
+        if nxt < 0:
+            raise BackendError("Could not parse the multipart/form-data body: a part is not terminated.")
+        h = hp.parsebytes(body[eol + 2:hend + 2] + b"\r\n")
+        name = h.get_param("name", header="content-disposition")
+        if name:
+            data = body[hend + 4:nxt]
+            fname = h.get_filename()
+            out[str(name)] = (data, fname) if fname is not None else data.decode("utf-8", "replace")
+        pos = nxt + 2 + len(delim)
+    return out
+
+
+def parse_transcription_request(fields: Dict[str, Any], default_model: Optional[str]) -> TranscriptionRequest:
+    """Validate a /v1/audio/transcriptions form (unknown fields — prompt,
+    timestamp_granularities[], chunking_strategy, include[] — are kept in raw
+    and ignored)."""
+    f = fields.get("file")
+    if f is None:
+        raise BackendError("Missing required parameter: 'file'.", "file", code="missing_required_parameter")
+    if not isinstance(f, tuple):
+        raise BackendError("Invalid 'file': expected an uploaded file (a form part with a filename).",
+                           "file")
+    model = fields.get("model", default_model)
+    if not isinstance(model, str) or not model.strip():
+        raise BackendError("Missing required parameter: 'model'.", "model", code="missing_required_parameter")
+    fmt = fields.get("response_format") or "json"
+    if fmt not in TRANSCRIPTION_FORMATS:
+        raise BackendError(f"Invalid value for 'response_format': '{fmt}'. Supported values are: "
+                           f"{', '.join(repr(x) for x in TRANSCRIPTION_FORMATS)}.", "response_format")
+    stream = str(fields.get("stream", "false")).strip().lower()
+    if stream not in ("true", "false", "1", "0", ""):
+        raise BackendError(f"Invalid value for 'stream': '{stream}'. Expected true or false.", "stream")
+    temperature = fields.get("temperature")
+    if temperature not in (None, ""):
+        try:
+            temperature = float(temperature)
+        except ValueError:
+            raise BackendError(f"Invalid type for 'temperature': expected a number, but got "
+                               f"'{temperature}' instead.", "temperature", code="invalid_type") from None
+        if not 0.0 <= temperature <= 1.0:
+            raise BackendError(f"Invalid 'temperature': expected a value between 0 and 1, but got "
+                               f"{temperature} instead.", "temperature", code="invalid_value")
+    else:
+        temperature = None
+    language = fields.get("language") or None
+    if language is not None and not isinstance(language, str):
+        raise BackendError("Invalid 'language': expected a string.", "language")
+    prompt = fields.get("prompt")
+    return TranscriptionRequest(model=model.strip(), audio=f[0], filename=f[1], language=language,
+                                prompt=prompt if isinstance(prompt, str) else None, response_format=fmt,
+                                temperature=temperature, stream=stream in ("true", "1"),
+                                raw={k: v for k, v in fields.items() if k != "file"})
+
+
+def _timestamp(t: float, sep: str) -> str:
+    ms = int(round(t * 1000.0))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d}{sep}{ms % 1000:03d}"
+
+
+def transcript_body(fmt: str, text: str, segments, audio_s: float, info: Dict[str, Any]):
+    """(content type, body bytes) of a finished transcription in `fmt`."""
+    usage = {"type": "duration", "seconds": int(-(-audio_s // 1))}
+    if fmt == "text":
+        return "text/plain; charset=utf-8", (text + "\n").encode()
+    if fmt in ("srt", "vtt"):
+        cues = []
+        for i, sg in enumerate(segments, 1):
+            if not sg.text:
+                continue
+            span = (f"{_timestamp(sg.start, ',' if fmt == 'srt' else '.')} --> "
+                    f"{_timestamp(sg.end, ',' if fmt == 'srt' else '.')}")
+            cues.append((f"{i}\n" if fmt == "srt" else "") + f"{span}\n{sg.text}\n")
+        body = ("WEBVTT\n\n" if fmt == "vtt" else "") + "\n".join(cues)
+        return ("text/vtt" if fmt == "vtt" else "application/x-subrip") + "; charset=utf-8", body.encode()
+    obj: Dict[str, Any] = {"text": text}
+    if fmt == "verbose_json":
+        obj = {"task": "transcribe", "language": "english", "duration": round(audio_s, 3), "text": text,
+               "segments": [{"id": i, "seek": int(round(sg.start * 100)), "start": round(sg.start, 3),
+                             "end": round(sg.end, 3), "text": sg.text, "tokens": sg.tokens,
+                             "temperature": 0.0} for i, sg in enumerate(segments)]}
+    obj["usage"] = usage
+    if info:
+        obj["kv260"] = info
+    return "application/json", json.dumps(obj).encode()
+
+
 def wav_header(samples: Optional[int], rate: int) -> bytes:
     """A 44-byte PCM WAV header, 16-bit mono; samples None = unknown length
     (the sizes say 0xFFFFFFFF, as streaming servers write them)."""
@@ -411,8 +559,11 @@ class ChatServer(ThreadingHTTPServer):
             raise ValueError(f"resident: {resident!r}")
         self.backends = backends
         self.speech_models = [m for m, b in backends.items() if b.speech]
-        self.default_model = next((m for m, b in backends.items() if not b.speech), next(iter(backends)))
+        self.transcription_models = [m for m, b in backends.items() if b.transcription]
+        self.default_model = next((m for m, b in backends.items() if not (b.speech or b.transcription)),
+                                  next(iter(backends)))
         self.default_speech_model = self.speech_models[0] if self.speech_models else None
+        self.default_transcription_model = self.transcription_models[0] if self.transcription_models else None
         self.ffmpeg = ffmpeg
         self.api_key = api_key or None
         self.queue_timeout = queue_timeout
@@ -519,8 +670,13 @@ class ChatServer(ThreadingHTTPServer):
             self.loaded[mid] = False
 
     def model_obj(self, mid: str) -> dict:
-        return {"id": mid, "object": "model", "created": int(self.started),
-                "owned_by": self.backends[mid].owned_by}
+        """An OpenAI model object, with the non-standard "kv260": {"type"} — chat,
+        speech (/v1/audio/speech) or transcription (/v1/audio/transcriptions) — so
+        clients can tell which endpoint a model serves."""
+        b = self.backends[mid]
+        kind = "speech" if b.speech else "transcription" if b.transcription else "chat"
+        return {"id": mid, "object": "model", "created": int(self.started), "owned_by": b.owned_by,
+                "kv260": {"type": kind}}
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -645,6 +801,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             return self._chat()
         if self._path() == "/audio/speech":
             return self._speech()
+        if self._path() == "/audio/transcriptions":
+            return self._transcription()
         self.close_connection = True                           # body left unread
         self._error(404, f"Unknown request URL: POST {urlsplit(self.path).path}.",
                     code="unknown_url")
@@ -701,6 +859,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             if backend.speech:
                 return self._error(400, f"The model '{req.model}' is a text-to-speech model: send "
                                    f"its input to /v1/audio/speech.", param="model",
+                                   code="model_not_supported")
+            if backend.transcription:
+                return self._error(400, f"The model '{req.model}' is a speech-to-text model: send "
+                                   f"audio to /v1/audio/transcriptions.", param="model",
                                    code="model_not_supported")
             if not getattr(backend, "accepts_images", False) and any(
                     m.get("parts") for m in req.messages):
@@ -1078,6 +1240,143 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 
+    # ── speech to text ──
+
+    def _transcription(self) -> None:
+        srv = self.server
+        t0 = time.monotonic()
+        rec: Dict[str, Any] = {"model": "-", "stream": "-"}
+        try:
+            try:
+                raw = self._read_body()
+            except BackendError as e:
+                return self._backend_error(e)
+            if not self._auth():
+                return
+            try:
+                req = parse_transcription_request(
+                    parse_multipart(self.headers.get("Content-Type", ""), raw), srv.default_transcription_model)
+            except BackendError as e:
+                return self._backend_error(e)
+            if req.model not in srv.backends and req.model in TRANSCRIPTION_ALIASES and srv.transcription_models:
+                req.model = srv.transcription_models[0]
+            rec.update(model=req.model, stream=f"{req.response_format}/{int(req.stream)}")
+            backend = srv.backends.get(req.model)
+            if backend is None:
+                return self._error(404, f"The model '{req.model}' does not exist or you do not "
+                                   f"have access to it.", param="model", code="model_not_found")
+            if not backend.transcription:
+                hint = (f"speech-to-text models: {', '.join(srv.transcription_models)}"
+                        if srv.transcription_models else "no speech-to-text model is served")
+                return self._error(400, f"The model '{req.model}' does not transcribe audio; {hint}.",
+                                   param="model", code="model_not_supported")
+            try:
+                job = backend.prepare_transcription(req)
+            except BackendError as e:
+                return self._backend_error(e)
+            except Exception as e:                             # noqa: BLE001
+                traceback.print_exc()
+                return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
+                                   "server_error", code="backend_error")
+            cancel = CancelToken(self._peer_gone)
+            if not self._acquire(cancel, rec, t0):
+                return
+            try:
+                if not self._ensure_loaded(req.model, rec):
+                    return
+                self._transcript(req, backend, job, cancel, rec, t0)
+            finally:
+                srv.fpga.release()
+        except (BrokenPipeError, ConnectionResetError):
+            self._cancelled(rec, "client disconnected")
+        finally:
+            with srv.count_lock:
+                srv.n_requests += 1
+            self._log_request(rec, t0)
+
+    def _transcript(self, req: TranscriptionRequest, backend: Backend, job: Any, cancel: CancelToken,
+                    rec: Dict[str, Any], t0: float) -> None:
+        """Segments from backend.transcribe() -> the transcript in the requested
+        format, or transcript.text.delta SSE events as they come."""
+        gen = backend.transcribe(job, cancel)
+        try:
+            ev = self._next(gen)                  # early errors are still HTTP errors
+        except Cancelled:
+            gen.close()
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except BackendError as e:
+            gen.close()
+            return self._backend_error(e)
+        except Exception as e:                                 # noqa: BLE001
+            gen.close()
+            traceback.print_exc()
+            return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
+                               "server_error", code="backend_error")
+        segments, fin = [], None
+        if req.stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self._chunked = self.request_version == "HTTP/1.1"
+            if self._chunked:
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            self.end_headers()
+        try:
+            while not isinstance(ev, Finish):
+                if isinstance(ev, Segment):
+                    segments.append(ev)
+                    if req.stream and ev.text:
+                        if "ttft_ms" not in rec:
+                            rec["ttft_ms"] = (time.monotonic() - t0) * 1000.0
+                        delta = ev.text if len([s for s in segments if s.text]) == 1 else " " + ev.text
+                        self._sse({"type": "transcript.text.delta", "delta": delta})
+                ev = self._next(gen)
+            fin = ev
+        except (BrokenPipeError, ConnectionResetError):
+            cancel.cancel()
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except Cancelled:
+            return self._cancelled(rec, "cancelled (client disconnected)")
+        except Exception as e:                                 # noqa: BLE001
+            traceback.print_exc()
+            rec["result"] = f"error mid-transcription: {e}"
+            if not req.stream:
+                return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
+                                   "server_error", code="backend_error")
+            self.close_connection = True
+            self._sse({"type": "error", "error": {
+                "message": f"Internal error in the '{req.model}' backend: {e}",
+                "type": "server_error", "param": None, "code": "backend_error"}})
+            if self._chunked:
+                self.wfile.write(b"0\r\n\r\n")
+            return
+        finally:
+            gen.close()
+        rec["fin"] = fin
+        audio_s = float(fin.info.get("audio_s", getattr(job, "audio_s", 0.0)) or 0.0)
+        rec["audio_s"] = audio_s
+        text = fin.info.get("text")
+        if text is None:
+            text = " ".join(s.text for s in segments if s.text)
+        info = {k: v for k, v in fin.info.items() if k not in ("log", "text")}
+        if req.stream:
+            self._sse({"type": "transcript.text.done", "text": text,
+                       "usage": {"type": "duration", "seconds": int(-(-audio_s // 1))}})
+            if self._chunked:
+                self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            return
+        ctype, body = transcript_body(req.response_format, text, segments, audio_s, info)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _log_request(self, rec: Dict[str, Any], t0: float) -> None:
         total = (time.monotonic() - t0) * 1000.0
         fin: Optional[Finish] = rec.get("fin")
@@ -1196,6 +1495,7 @@ def sampler_defaults(args):
 
 SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")
 SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
+MOONSHINE = ("moonshine", "moonshine-base", "moonshine-tiny")
 
 
 def smollm2_backend(args, engine, tokenizer: str, cma_mb: float, model_id: Optional[str],
@@ -1245,9 +1545,14 @@ def build_backends(args) -> Dict[str, Backend]:
             b = PiperBackend(LibTtsEngine(args.tts_lib, args.tts_weights), args.tts_weights,
                              cma_mb=args.tts_cma_mb, model_id=args.tts_model_id,
                              espeak_data=args.tts_espeak_data)
+        elif name in MOONSHINE:
+            from moonshine_backend import LibAsrEngine, MoonshineBackend
+            b = MoonshineBackend(LibAsrEngine(args.asr_lib, args.asr_weights), args.asr_tokenizer,
+                                 cma_mb=args.asr_cma_mb, model_id=args.asr_model_id,
+                                 ffmpeg=args.ffmpeg or None, max_seconds=args.asr_max_seconds)
         else:
             raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, "
-                             f"smollm2-360m, smolvlm, piper, echo)")
+                             f"smollm2-360m, smolvlm, piper, moonshine, echo)")
         if b.model_id in out:
             raise SystemExit(f"backend '{name}' serves model id '{b.model_id}', which another "
                              f"backend already serves (check the --llm-lib / --llm-360m-lib "
@@ -1270,10 +1575,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
                     choices=("bert-squad", *SMOLLM2_135M, *SMOLLM2_360M, "smolvlm",
-                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", "echo"),
+                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", *MOONSHINE, "echo"),
                     help="backend(s) to serve (default: bert-squad); the first chat backend is the "
                          "default model of /v1/chat/completions, the first speech backend that of "
-                         "/v1/audio/speech")
+                         "/v1/audio/speech, the first speech-to-text backend that of "
+                         "/v1/audio/transcriptions")
     ap.add_argument("--resident", choices=("auto", "one", "all"), default="auto",
                     help="which FPGA models stay loaded (see above; default auto)")
     ap.add_argument("--cma-margin-mb", type=float, default=32.0,
@@ -1359,9 +1665,24 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--tts-cma-mb", type=float, default=55.0, help="CMA the Piper library holds (MB)")
     g.add_argument("--tts-espeak-data", default=None, help="espeak-ng-data directory (default: the system's)")
     g.add_argument("--ffmpeg", default=shutil.which("ffmpeg"),
-                   help="ffmpeg for mp3 / opus / aac / flac speech (default: from PATH; '' = none)")
+                   help="ffmpeg for mp3 / opus / aac / flac speech and for transcribing formats other "
+                        "than WAV (default: from PATH; '' = none)")
+    g = ap.add_argument_group("moonshine (speech to text)")
+    g.add_argument("--asr-lib", default=os.path.join(HERE, "lib", "libmoonshine_base.so"),
+                   help="libmoonshine_base.so (or libmoonshine_tiny.so)")
+    g.add_argument("--asr-weights", default=None,
+                   help="weights directory for asr_open(); default: the one the library was built for")
+    g.add_argument("--asr-tokenizer", default=_first_existing(
+        os.path.join(HERE, "moonshine", "tokenizer.json"),
+        os.path.join(HERE, "..", "asr", "assets", "moonshine-base", "tokenizer.json")))
+    g.add_argument("--asr-model-id", default=None,
+                   help="default: from the library's name (libmoonshine_base.so -> moonshine-base)")
+    g.add_argument("--asr-cma-mb", type=float, default=200.0, help="CMA the Moonshine library holds (MB)")
+    g.add_argument("--asr-max-seconds", type=float, default=600.0,
+                   help="the longest audio a request may send (seconds)")
     ap.add_argument("--max-body-mb", type=float, default=None,
-                    help="request body limit (default 4 MB; 32 MB when an image model is served)")
+                    help="request body limit (default 4 MB; 32 MB when an image or speech-to-text model "
+                         "is served)")
     ap.add_argument("--queue-timeout", type=float, default=120.0,
                     help="seconds a request may wait for the FPGA before a 503")
     ap.add_argument("--max-queue", type=int, default=16, help="requests waiting at most")
@@ -1377,7 +1698,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     backends = build_backends(args)
     max_body = (int(args.max_body_mb * (1 << 20)) if args.max_body_mb else
-                (32 << 20) if any(getattr(b, "accepts_images", False) for b in backends.values())
+                MAX_UPLOAD if any(getattr(b, "accepts_images", False) or b.transcription
+                                  for b in backends.values())
                 else MAX_BODY)
     srv = ChatServer((args.host, args.port), backends, api_key=args.api_key,
                      queue_timeout=args.queue_timeout, max_queue=args.max_queue,

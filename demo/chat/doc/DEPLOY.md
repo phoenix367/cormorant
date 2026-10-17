@@ -116,10 +116,10 @@ of `chat_config.json` — `<dir>` below, by default `/root/kv260_chat/`:
 first one is the default model.
 
 ```json
-"backends": ["smollm2-360m", "smollm2", "bert-squad", "smolvlm", "piper"]
+"backends": ["smollm2-360m", "smollm2", "bert-squad", "smolvlm", "piper", "moonshine"]
 ```
 
-(This is the board's setup: all five models, SmolLM2-360M the default.)
+(This is the board's setup: all six models, SmolLM2-360M the default.)
 
 | Backend | Needs on the board | Built by | Config block |
 |---|---|---|---|
@@ -128,13 +128,14 @@ first one is the default model.
 | `smollm2-360m` | `lib/libsmollm2_360m.so`, `/root/smollm2_360m_weights` | [`llm_board.py --install-only`](SMOLLM2.md#smollm2-360m-instruct) | `smollm2_360m` |
 | `smolvlm` | `lib/libsmolvlm_256m.so`, `/root/smolvlm_256m_weights`, `python3-pil` | [`llm_board.py --install-only`](SMOLVLM.md#install) | `smolvlm` |
 | `piper` | `lib/libpiper_tts.so`, `/root/piper_weights`, numpy, `libespeak-ng1` (ffmpeg for mp3 / opus / aac / flac) | [`tts_board.py --install-only`](TEXT_TO_SPEECH.md#install) | `piper` |
+| `moonshine` | `lib/libmoonshine_base.so`, `/root/moonshine_base_weights`, numpy (ffmpeg for uploads other than WAV); the tokenizer.json on the host | [`asr_board.py --install-only`](SPEECH_TO_TEXT.md#install) | `moonshine` |
 | `echo` | nothing (protocol only) | — | — |
 
 - **Who builds the libraries.**  `deploy.py` builds only the BERT library.
   The others are built and installed by their own tools.  The preflight
   reports whether each is at its configured path: `smollm2.lib` (default
   `<dir>/lib/libsmollm2.so`), `smollm2_360m.lib`
-  (`<dir>/lib/libsmollm2_360m.so`), `smolvlm.lib` and `piper.lib` likewise.
+  (`<dir>/lib/libsmollm2_360m.so`), `smolvlm.lib`, `piper.lib` and `moonshine.lib` likewise.
 - **What `deploy.py` uploads for the generative models.**  It always uploads
   the text side (`smollm2_backend.py`, `smollm2_tokenizer.py`, `chatml.py`,
   `sampler.py`).  For each configured model it also uploads that model's
@@ -208,6 +209,7 @@ a margin); the server uses it to decide what to evict.
 | SmolLM2-360M | 758 MiB | 775 | Piper only; swaps with the others |
 | SmolVLM-256M | 495 MiB | 550 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
 | Piper | 53 MiB | 55 | any other model, even SmolLM2-360M |
+| Moonshine base | 185.5 MiB | 200 | BERT, SmolLM2-135M and Piper, or SmolVLM and Piper (by the `cma_mb` sums); swaps with SmolLM2-360M (seen on the board) |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
   every weight (decode reads the prefill image through MatmulKernel's GEMV

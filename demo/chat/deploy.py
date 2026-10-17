@@ -16,8 +16,9 @@ host with inference-scheduler/.venv/bin/python).
               squad_text.py, chat.py, vocab.txt, and the smollm2 side
               (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
               src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/,
-              <dir>/smollm2_360m/, <dir>/smolvlm/), and the piper side
-              (piper_backend.py, piper_phonemize.py, piper_vits.py) to <dir>
+              <dir>/smollm2_360m/, <dir>/smolvlm/, <dir>/moonshine/), the piper
+              side (piper_backend.py, piper_phonemize.py, piper_vits.py) and the
+              moonshine side (moonshine_backend.py, speech_input.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
               (skipped when unchanged; without it the server samples in Python)
   rpu      -> with rpu.enabled (or --rpu BSP_DIR): the Cortex-R5 firmware built
@@ -43,7 +44,13 @@ libpiper_tts.so (piper.lib, default <dir>/lib/libpiper_tts.so) and its voice
 directory (piper.weights_dir, default /root/piper_weights: weights/*.dat,
 voice.json), both installed by demo/tts/scripts/tts_board.py
 --install-only, plus numpy and libespeak-ng1 on the board (ffmpeg for mp3 /
-opus / aac / flac).
+opus / aac / flac).  The moonshine backend (speech to text, POST
+/v1/audio/transcriptions) needs libmoonshine_base.so (moonshine.lib, default
+<dir>/lib/libmoonshine_base.so) and its weights (moonshine.weights_dir,
+default /root/moonshine_base_weights), both installed by
+demo/asr/scripts/asr_board.py --install-only, the tokenizer.json of the
+checkpoint on the host (moonshine.tokenizer), numpy on the board (ffmpeg for
+audio other than WAV).
 
 The board lock (flock on board_lock) is held while deploying.  The running
 server owns the FPGA: other board jobs must wait until `deploy.py --stop`.
@@ -91,7 +98,8 @@ SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
                 CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
                 CHAT / "vlm_image.py", CHAT / "piper_backend.py", CHAT / "piper_phonemize.py",
-                DEMO / "tts" / "scripts" / "piper_vits.py"]
+                DEMO / "tts" / "scripts" / "piper_vits.py", CHAT / "moonshine_backend.py",
+                CHAT / "speech_input.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -173,6 +181,14 @@ def load_config(path: Optional[str]) -> dict:
             tts[k] = v
     if not tts["lib"]:
         tts["lib"] = f"{rem['dir']}/lib/libpiper_tts.so"
+    asr = cfg.setdefault("moonshine", {})
+    for k, v in (("lib", None), ("weights_dir", "/root/moonshine_base_weights"), ("model_id", None),
+                 ("tokenizer", "../asr/assets/moonshine-base/tokenizer.json"), ("cma_mb", 200),
+                 ("max_seconds", 600)):
+        if asr.get(k) is None:
+            asr[k] = v
+    if not asr["lib"]:
+        asr["lib"] = f"{rem['dir']}/lib/libmoonshine_base.so"
     cfg.setdefault("build", {}).setdefault("jobs", 4)
     cfg["build"].setdefault("timeout", 1800)
     cfg["board_lock"] = cfg.get("board_lock") or bcfg.get("board_lock")
@@ -198,6 +214,13 @@ def uses_vlm(cfg: dict) -> bool:
 
 def uses_tts(cfg: dict) -> bool:
     return any(b in ("piper", "piper-lessac-medium") for b in cfg["server"]["backends"])
+
+
+MOONSHINE = ("moonshine", "moonshine-base", "moonshine-tiny")       # kv260_chat_server.py
+
+
+def uses_asr(cfg: dict) -> bool:
+    return any(b in MOONSHINE for b in cfg["server"]["backends"])
 
 
 def sudo(cfg: dict) -> str:
@@ -346,6 +369,28 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
         out, _, rc = session.exec("command -v ffmpeg", timeout=15)
         print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'  ffmpeg (mp3 / opus / aac / flac)':<36} "
               f"{_dim(out.strip() or 'none: speech as wav / pcm only')}")
+    if uses_asr(cfg):
+        asr, how = cfg["moonshine"], "demo/asr/scripts/asr_board.py --install-only (ASR_PLAN §7)"
+        for label, path in (("libmoonshine (moonshine)", asr["lib"]),
+                            ("  weights", f"{asr['weights_dir']}/weights/MANIFEST.json")):
+            _, _, rc = session.exec(f"test -f {shlex.quote(path)}", timeout=15)
+            good = rc == 0
+            print(f"    {_green('OK     ') if good else _red('MISSING')} {label:<36} "
+                  f"{_dim(path if good else path + ' - ' + how)}")
+            ok &= good
+        tok = chat_path(asr["tokenizer"])
+        good = tok.exists()
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'  tokenizer.json (host)':<36} "
+              f"{_dim(str(tok) if good else str(tok) + ' - demo/asr/scripts/asr_study.py fetch')}")
+        ok &= good
+        out, _, rc = session.exec("python3 -c 'import numpy; print(numpy.__version__)'", timeout=30)
+        good = rc == 0
+        print(f"    {_green('OK     ') if good else _red('MISSING')} {'  numpy':<36} "
+              f"{_dim(out.strip() if good else 'apt install python3-numpy')}")
+        ok &= good
+        out, _, rc = session.exec("command -v ffmpeg", timeout=15)
+        print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'  ffmpeg (audio other than WAV)':<36} "
+              f"{_dim(out.strip() or 'none: WAV uploads only')}")
     return ok
 
 
@@ -505,6 +550,10 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
             session.exec_checked(f"mkdir -p {d}/smolvlm", timeout=15)
             sftp.put(str(chat_path(cfg["smolvlm"]["tokenizer"])), f"{d}/smolvlm/tokenizer.json")
             extra += " + smolvlm/tokenizer.json"
+        if uses_asr(cfg):
+            session.exec_checked(f"mkdir -p {d}/moonshine", timeout=15)
+            sftp.put(str(chat_path(cfg["moonshine"]["tokenizer"])), f"{d}/moonshine/tokenizer.json")
+            extra += " + moonshine/tokenizer.json"
     finally:
         sftp.close()
     return step("server", True, t0, f"{len(SERVER_FILES)} files + vocab.txt + src/sampler.[ch]{extra} -> {d}")
@@ -580,6 +629,13 @@ def server_argv(cfg: dict) -> List[str]:
                  "--tts-cma-mb", str(tts["cma_mb"])]
         if tts.get("model_id"):
             argv += ["--tts-model-id", tts["model_id"]]
+    if uses_asr(cfg):
+        asr = cfg["moonshine"]
+        argv += ["--asr-lib", asr["lib"], "--asr-weights", asr["weights_dir"],
+                 "--asr-tokenizer", f"{d}/moonshine/tokenizer.json", "--asr-cma-mb", str(asr["cma_mb"]),
+                 "--asr-max-seconds", str(asr["max_seconds"])]
+        if asr.get("model_id"):
+            argv += ["--asr-model-id", asr["model_id"]]
     if s.get("api_key"):
         argv += ["--api-key-file", f"{d}/api_key"]
     return argv

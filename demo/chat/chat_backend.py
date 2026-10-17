@@ -58,6 +58,22 @@ SpeechRequests instead of ChatRequests —
   The server turns the PCM into the requested format (a WAV header, raw
   PCM, or ffmpeg for mp3 / opus / aac / flac) and streams it; Finish's
   prompt_tokens / completion_tokens are the usage's input / output tokens.
+
+Speech to text (POST /v1/audio/transcriptions): a backend with
+transcription = True serves TranscriptionRequests —
+
+        def prepare_transcription(self, req):   # outside the FPGA lock: decode
+            return job                          # the uploaded audio, validate
+        def transcribe(self, job, cancel):      # under the FPGA lock
+            for part in ...:
+                cancel.check()
+                yield Segment(start, end, text, tokens)
+            yield Finish("stop", info={"text": the whole transcript, ...})
+
+  The server answers in the requested format (json, text, srt, vtt,
+  verbose_json — a segment per Segment) or streams transcript.text.delta
+  events; Finish.info["text"] is the transcript (else the segments' texts
+  joined) and info["audio_s"] the audio's length.
 """
 
 from __future__ import annotations
@@ -137,6 +153,31 @@ class SpeechRequest:
 
 
 @dataclass
+class TranscriptionRequest:
+    """A validated /v1/audio/transcriptions request (the server fills it from
+    the multipart form)."""
+    model: str
+    audio: bytes                           # the uploaded file, as sent
+    filename: Optional[str] = None
+    language: Optional[str] = None         # ISO-639-1, e.g. "en"
+    prompt: Optional[str] = None
+    response_format: str = "json"          # json | text | srt | vtt | verbose_json
+    temperature: Optional[float] = None
+    stream: bool = False
+    raw: Dict[str, Any] = field(default_factory=dict)   # the other form fields
+
+
+@dataclass
+class Segment:
+    """A piece of a transcript: its time span in the audio (seconds), its text
+    and token ids."""
+    start: float
+    end: float
+    text: str
+    tokens: List[int] = field(default_factory=list)
+
+
+@dataclass
 class Delta:
     text: str
 
@@ -161,7 +202,8 @@ class Backend:
     uses_fpga: bool = True                 # False: no device state, always resident
     cma_mb: float = 0.0                    # CMA held while loaded (MB), for --resident auto
     speech: bool = False                   # True: a text-to-speech model (/v1/audio/speech)
-    sample_rate: int = 0                   # speech: PCM samples per second
+    transcription: bool = False            # True: a speech-to-text model (/v1/audio/transcriptions)
+    sample_rate: int = 0                   # speech / transcription: PCM samples per second
 
     def load_host(self) -> None:
         """Host-only resources prepare() needs (tokenizer, template); once,
@@ -192,6 +234,12 @@ class Backend:
         raise BackendError(f"The model '{self.model_id}' does not synthesize speech.", "model")
 
     def synthesize(self, job: Any, cancel: CancelToken) -> Iterator[Union[bytes, Finish]]:
+        raise NotImplementedError
+
+    def prepare_transcription(self, req: TranscriptionRequest) -> Any:
+        raise BackendError(f"The model '{self.model_id}' does not transcribe audio.", "model")
+
+    def transcribe(self, job: Any, cancel: CancelToken) -> Iterator[Union[Segment, Finish]]:
         raise NotImplementedError
 
 
