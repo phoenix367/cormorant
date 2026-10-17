@@ -177,7 +177,7 @@ baselines are checked-in files: tell the user to commit them.
   reboot attempts; the board needs a power cycle.  Never start a second
   board command while one runs.
 - Memory: drop caches + compact before each board run (3.9 GB RAM, no
-  swap, `cma=1000M`).
+  swap, `cma=1400M`).
 - `perf_config.json` driver dirs must be the ones the loaded bitstream
   was built from, or the benchmark programs stale register offsets
   (board-deploy §3: a register that is not there reads 0).

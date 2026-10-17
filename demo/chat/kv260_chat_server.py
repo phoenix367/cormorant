@@ -57,13 +57,15 @@ Backends (chat_backend.Backend; one model id each)
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~775 MB, SmolVLM
-~550 MB, Piper ~55 MB, Moonshine base ~200 MB of the 1000 MB cma=; idle CmaFree
-was 626-813 MB).
+~550 MB, Piper ~55 MB, Moonshine base ~200 MB of the 1400 MB cma=; idle CmaFree
+~1390 MB).
   auto (default)  the first backend loads at startup, the others when first
-                  requested; before a load, models are evicted (least recently
-                  used first) while CmaFree < the new model's cma_mb +
-                  --cma-margin-mb, and once more if the load fails anyway —
-                  so both stay resident when they fit, else they swap
+                  requested; before a load, the page cache is dropped and
+                  memory compacted when CmaFree < the new model's cma_mb +
+                  --cma-margin-mb (free CMA pages hold page cache), then models
+                  are evicted (least recently used first) while it still is,
+                  and once more if the load fails anyway — so models stay
+                  resident while they fit, else they swap
   one             at most one FPGA model at a time: switching models unloads
                   the current one (a swap costs a load, seconds)
   all             everything loads at startup and stays (the old behaviour)
@@ -71,13 +73,17 @@ Loads and evictions happen under the FPGA lock, between requests.
 
 Request parameters honoured: model, messages, stream, stream_options
 .include_usage, max_tokens / max_completion_tokens, temperature, top_p, stop,
-seed, n (= 1 only); other fields are ignored.  Invalid values get
+seed, n (= 1 only), logprobs / top_logprobs (SmolLM2, not streaming); other
+fields are ignored.  Invalid values get
 OpenAI-style JSON errors ({"error": {"message", "type", "param", "code"}}):
 400 bad request, 401 API key, 404 unknown model / URL, 413 body too large,
 503 busy (queue full or timed out) or model not loaded.
 
 One FPGA: requests run one at a time in arrival order; a request waits up to
---queue-timeout seconds (then 503).  A client that disconnects — while queued
+--queue-timeout seconds (then 503).  A chat answer lends the FPGA between two
+tokens to a waiting speech or speech-to-text request on a model already
+loaded, which runs at once and gives it back (a voice client speaks the first
+sentence while the answer goes on; --no-interleave: not).  A client that disconnects — while queued
 or while its answer is computed — cancels its request at the next step (a
 BERT window, a decoder token).  One log line per request on stderr.
 
@@ -87,7 +93,7 @@ usage:
                        [--backend bert-squad] [--backend smollm2] [--backend smollm2-360m]
                        [--backend smolvlm] [--backend piper] [--backend moonshine]
                        [--backend echo] ...
-                       [--resident auto|one|all] [--cma-margin-mb 32]
+                       [--resident auto|one|all] [--cma-margin-mb 32] [--no-interleave]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]
                        [--llm-lib lib/libsmollm2.so] [--llm-weights DIR]
@@ -150,8 +156,14 @@ TRANSCRIPTION_FORMATS = ("json", "text", "srt", "vtt", "verbose_json")
 MAX_UPLOAD = 32 << 20         # request body limit when a speech-to-text model is served (OpenAI: 25 MB files)
 
 
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg: str) -> None:
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", file=sys.stderr, flush=True)
+    """One line on stderr, written whole (a lent FPGA runs two requests' threads at once)."""
+    with _LOG_LOCK:
+        sys.stderr.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+        sys.stderr.flush()
 
 
 # ── request validation ───────────────────────────────────────────────────────
@@ -441,16 +453,29 @@ def wav_header(samples: Optional[int], rate: int) -> bytes:
 
 # ── the FPGA queue ───────────────────────────────────────────────────────────
 
+class _Ticket:
+    __slots__ = ("tag", "lent")
+
+    def __init__(self, tag):
+        self.tag, self.lent = tag, False
+
+
 class FifoLock:
     """A mutex granted in arrival order.  acquire() gives up after `timeout`
     seconds, when `max_waiting` requests already wait, or when
-    `cancelled()` turns true (polled every `poll` seconds)."""
+    `cancelled()` turns true (polled every `poll` seconds).
+
+    The holder may lend() it between two steps of its work: the first waiter
+    whose tag (the model it asked for) passes `eligible` runs at once, out
+    of turn, and its release() gives the lock back to the holder — not to
+    the queue.  A borrower does not lend."""
 
     def __init__(self, max_waiting: int = 16):
         self.max_waiting = max_waiting
         self._cv = threading.Condition()
-        self._queue: "collections.deque[object]" = collections.deque()
+        self._queue: "collections.deque[_Ticket]" = collections.deque()
         self._busy = False
+        self._lent: Optional[_Ticket] = None
 
     @property
     def busy(self) -> bool:
@@ -460,34 +485,54 @@ class FifoLock:
     def waiting(self) -> int:
         return len(self._queue)
 
-    def acquire(self, timeout: float, cancelled=lambda: False, poll: float = 0.25) -> str:
-        """'ok', 'full', 'timeout' or 'cancelled'."""
+    def acquire(self, timeout: float, cancelled=lambda: False, poll: float = 0.25, tag=None) -> str:
+        """'ok', 'full', 'timeout' or 'cancelled'; `tag`: what lend() looks at."""
         with self._cv:
             if not self._busy and not self._queue:
                 self._busy = True
                 return "ok"
             if len(self._queue) >= self.max_waiting:
                 return "full"
-            ticket = object()
+            ticket = _Ticket(tag)
             self._queue.append(ticket)
             deadline = time.monotonic() + timeout
             try:
-                while self._busy or self._queue[0] is not ticket:
+                while not ticket.lent and (self._busy or self._queue[0] is not ticket):
                     left = deadline - time.monotonic()
                     if left <= 0:
                         return "timeout"
                     if cancelled():
                         return "cancelled"
                     self._cv.wait(min(left, poll))
-                self._busy = True
+                if not ticket.lent:
+                    self._busy = True
                 return "ok"
             finally:
                 self._queue.remove(ticket)
                 self._cv.notify_all()
 
+    def lend(self, eligible) -> bool:
+        """The holder, between two steps: run the first waiter whose tag passes
+        eligible(tag) and return once it has released; False when no waiter
+        does (or the caller is a borrower)."""
+        with self._cv:
+            if self._lent is not None:
+                return False
+            t = next((t for t in self._queue if t.tag is not None and eligible(t.tag)), None)
+            if t is None:
+                return False
+            t.lent, self._lent = True, t
+            self._cv.notify_all()
+            while self._lent is t:
+                self._cv.wait()
+            return True
+
     def release(self) -> None:
         with self._cv:
-            self._busy = False
+            if self._lent is not None:          # the borrower: back to the holder
+                self._lent = None
+            else:
+                self._busy = False
             self._cv.notify_all()
 
 
@@ -543,6 +588,21 @@ def read_cma_free_mb(path: str = "/proc/meminfo") -> Optional[float]:
     return None
 
 
+def reclaim_cma() -> bool:
+    """Drop the clean page cache and compact memory, so CmaFree counts what a pool
+    may take: free CMA pages hold page cache and movable process memory, which
+    the kernel would move for an allocation anyway (src/remote/cma.py, from the
+    host).  False where it is not allowed (not root, no /proc/sys/vm)."""
+    try:
+        os.sync()
+        for path, val in (("/proc/sys/vm/drop_caches", "3"), ("/proc/sys/vm/compact_memory", "1")):
+            with open(path, "w") as f:
+                f.write(val)
+        return True
+    except OSError:
+        return False
+
+
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
 class ChatServer(ThreadingHTTPServer):
@@ -553,7 +613,7 @@ class ChatServer(ThreadingHTTPServer):
     def __init__(self, addr, backends: Dict[str, Backend], *, api_key: Optional[str] = None,
                  queue_timeout: float = 120.0, max_queue: int = 16, max_body: int = MAX_BODY,
                  resident: str = "all", cma_margin_mb: float = 32.0, cma_free=read_cma_free_mb,
-                 ffmpeg: Optional[str] = None):
+                 ffmpeg: Optional[str] = None, interleave: bool = True, cma_reclaim=reclaim_cma):
         super().__init__(addr, ChatHandler)
         if resident not in ("all", "one", "auto"):
             raise ValueError(f"resident: {resident!r}")
@@ -569,6 +629,7 @@ class ChatServer(ThreadingHTTPServer):
         self.queue_timeout = queue_timeout
         self.max_body = max_body
         self.fpga = FifoLock(max_queue)
+        self.interleave = interleave            # a chat answer lends the FPGA to speech / transcription
         self.started = time.time()
         self.n_requests = 0
         self.count_lock = threading.Lock()
@@ -576,6 +637,7 @@ class ChatServer(ThreadingHTTPServer):
         self.resident = resident
         self.cma_margin_mb = cma_margin_mb
         self.cma_free = cma_free
+        self.cma_reclaim = cma_reclaim
         self.loaded: Dict[str, bool] = {m: False for m in backends}
         self.last_used: Dict[str, float] = {}
         self.n_loads = self.n_unloads = 0
@@ -599,6 +661,10 @@ class ChatServer(ThreadingHTTPServer):
                 self.unload_model(m, "one model at a time")
         elif b.uses_fpga and others and self.resident == "auto":
             need = b.cma_mb + self.cma_margin_mb
+            free = self.cma_free()
+            if free is not None and free < need and self.cma_reclaim():      # page cache in CMA: not a reason to evict
+                log(f"CmaFree {free:.0f} MB < {need:.0f} MB for '{mid}': page cache dropped, memory compacted "
+                    f"(CmaFree {self.cma_free() or 0:.0f} MB)")
             for m in sorted(others, key=lambda m: self.last_used.get(m, 0.0)):
                 free = self.cma_free()
                 if free is None or free >= need:
@@ -883,7 +949,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
                                    "server_error", code="backend_error")
             cancel = CancelToken(self._peer_gone)
-            if not self._acquire(cancel, rec, t0):
+            if not self._acquire(cancel, rec, t0, req.model):
                 return
             try:
                 if not self._ensure_loaded(req.model, rec):
@@ -902,11 +968,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                 srv.n_requests += 1
             self._log_request(rec, t0)
 
-    def _acquire(self, cancel: CancelToken, rec: Dict[str, Any], t0: float) -> bool:
+    def _acquire(self, cancel: CancelToken, rec: Dict[str, Any], t0: float, model: Optional[str] = None) -> bool:
         """Wait for the FPGA; False (and the response sent) when the request
-        was cancelled, timed out or found the queue full."""
+        was cancelled, timed out or found the queue full.  `model`: the
+        request's, for a chat answer's lend (_lend)."""
         srv = self.server
-        got = srv.fpga.acquire(srv.queue_timeout, cancel.cancelled)
+        got = srv.fpga.acquire(srv.queue_timeout, cancel.cancelled, tag=model)
         rec["queue_ms"] = (time.monotonic() - t0) * 1000.0
         if got == "cancelled":
             self._cancelled(rec, "cancelled while queued")
@@ -942,6 +1009,25 @@ class ChatHandler(BaseHTTPRequestHandler):
         except StopIteration:
             return Finish("stop")
 
+    def _lend(self, mid: str, rec: Dict[str, Any]) -> None:
+        """Between two tokens of a chat answer: the FPGA to a waiting speech or
+        speech-to-text request on another model already loaded (so a client
+        can speak the first sentence while the answer goes on), back to this
+        answer when it is done.  Not to chat requests (an answer would stall
+        for another's), nor to a model that must load first (a load may evict
+        this one)."""
+        srv = self.server
+        if not srv.interleave or not srv.fpga.waiting:
+            return
+
+        def eligible(m):
+            b = srv.backends.get(m)
+            return m != mid and b is not None and (b.speech or b.transcription) and bool(srv.loaded.get(m))
+        t = time.monotonic()
+        if srv.fpga.lend(eligible):
+            rec["lent"] = rec.get("lent", 0) + 1
+            rec["lent_ms"] = rec.get("lent_ms", 0.0) + (time.monotonic() - t) * 1000.0
+
     def _base(self, req: ChatRequest, backend: Backend, obj: str) -> Dict[str, Any]:
         return {"id": self._cid, "object": obj, "created": self._created, "model": req.model,
                 "system_fingerprint": backend.fingerprint}
@@ -953,7 +1039,7 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _info(fin: Finish) -> Dict[str, Any]:
-        return {k: v for k, v in fin.info.items() if k != "log"}
+        return {k: v for k, v in fin.info.items() if k not in ("log", "logprobs")}
 
     def _new_ids(self) -> None:
         self._cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -969,6 +1055,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if "ttft_ms" not in rec:
                         rec["ttft_ms"] = (time.monotonic() - t0) * 1000.0
                     parts.append(ev.text)
+                    self._lend(req.model, rec)
                 else:
                     fin = ev
         except Cancelled:
@@ -986,7 +1073,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         resp["choices"] = [{"index": 0,
                             "message": {"role": "assistant", "content": "".join(parts),
                                         "refusal": None},
-                            "logprobs": None, "finish_reason": fin.reason}]
+                            "logprobs": fin.info.get("logprobs"), "finish_reason": fin.reason}]
         resp["usage"] = self._usage(fin)
         if fin.info:
             resp["kv260"] = self._info(fin)
@@ -1051,6 +1138,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if "ttft_ms" not in rec:
                         rec["ttft_ms"] = (time.monotonic() - t0) * 1000.0
                     self._sse(chunk({"content": ev.text}))
+                self._lend(req.model, rec)
                 ev = self._next(gen)
         except (BrokenPipeError, ConnectionResetError):
             cancel.cancel()
@@ -1128,7 +1216,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
                                    "server_error", code="backend_error")
             cancel = CancelToken(self._peer_gone)
-            if not self._acquire(cancel, rec, t0):
+            if not self._acquire(cancel, rec, t0, req.model):
                 return
             try:
                 if not self._ensure_loaded(req.model, rec):
@@ -1279,7 +1367,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return self._error(500, f"Internal error in the '{req.model}' backend: {e}",
                                    "server_error", code="backend_error")
             cancel = CancelToken(self._peer_gone)
-            if not self._acquire(cancel, rec, t0):
+            if not self._acquire(cancel, rec, t0, req.model):
                 return
             try:
                 if not self._ensure_loaded(req.model, rec):
@@ -1395,9 +1483,11 @@ class ChatHandler(BaseHTTPRequestHandler):
             parts.append(f"audio={rec['audio_s']:.2f}s")
         if "ttft_ms" in rec:
             parts.append(f"ttft={rec['ttft_ms']:.0f}ms")
-            if fin is not None and fin.completion_tokens > 1 and total > rec["ttft_ms"]:
-                rate = (fin.completion_tokens - 1) / ((total - rec["ttft_ms"]) / 1000.0)
-                parts.append(f"tok/s={rate:.1f}")
+            gen_ms = total - rec["ttft_ms"] - rec.get("lent_ms", 0.0)      # the FPGA lent out is not generation
+            if fin is not None and fin.completion_tokens > 1 and gen_ms > 0:
+                parts.append(f"tok/s={(fin.completion_tokens - 1) / (gen_ms / 1000.0):.1f}")
+        if rec.get("lent"):
+            parts.append(f"lent={rec['lent']}/{rec['lent_ms']:.0f}ms")
         parts.append(f"total={total:.0f}ms")
         if fin is not None:
             parts.append(f"finish={fin.reason}")
@@ -1584,6 +1674,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="which FPGA models stay loaded (see above; default auto)")
     ap.add_argument("--cma-margin-mb", type=float, default=32.0,
                     help="--resident auto: CmaFree to keep beyond a model's own need")
+    ap.add_argument("--no-interleave", dest="interleave", action="store_false",
+                    help="a chat answer keeps the FPGA to its end (by default it lends it between two "
+                         "tokens to a waiting speech or speech-to-text request on a loaded model)")
     ap.add_argument("--bert-lib", default=os.path.join(HERE, "lib", "libbert_squad.so"))
     ap.add_argument("--bert-weights", default=None,
                     help="weights directory (holds weights/*.dat); default: the one the library was built for")
@@ -1704,7 +1797,7 @@ def main(argv=None) -> int:
     srv = ChatServer((args.host, args.port), backends, api_key=args.api_key,
                      queue_timeout=args.queue_timeout, max_queue=args.max_queue,
                      resident=args.resident, cma_margin_mb=args.cma_margin_mb, max_body=max_body,
-                     ffmpeg=args.ffmpeg or None)
+                     ffmpeg=args.ffmpeg or None, interleave=args.interleave)
     try:
         for mid, b in backends.items():
             t0 = time.monotonic()

@@ -12,7 +12,7 @@ gaps; you do not fix them.
 - Xilinx Vitis / Vivado 2025.2 are installed at `{{XILINX}}`
   (`{{XILINX}}/Vitis/settings64.sh`).
 - A KV260 at `{{BOARD}}`: `ssh -i {{KEY}} root@{{BOARD}}`, Kria Ubuntu 22.04
-  with XRT and `cma=1000M`, already in use by its owner (see the board rules).
+  with XRT and `cma=1400M`, already in use by its owner (see the board rules).
 - Nothing about the project's internals.  Start at `{{CLONE}}/README.md` and
   follow the links.  When the docs do not say how to go on you may read the
   clone's source to get unstuck — every time you had to is a gap.  Never read

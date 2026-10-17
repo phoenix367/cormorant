@@ -257,7 +257,7 @@ class Client:
         """--input: after the file (and its silence), wait until the server is quiet, then leave."""
         while not self.stop.is_set():
             time.sleep(0.2)
-            if self.eof.is_set() and self.state == "listening" and not self.playing \
+            if self.eof.is_set() and self.state in ("listening", "awake", "dialogue") and not self.playing \
                     and time.monotonic() - self.last_event > self.args.linger:
                 self.stop.set()
                 chan.close()
@@ -295,7 +295,7 @@ class Client:
                 elif self.state == "dialogue" and prev in ("speaking", "thinking", "listening", "awake"):
                     self.say("(your turn — dialogue mode)", DIM)
                 elif self.state == "awake":
-                    self.say("Miranda: yes? (listening for your request)", BOLD)
+                    self.say("(listening for your request)", DIM)
             elif t == "heard":
                 if obj.get("wake"):
                     self.say(f"You: {obj['text']}", BOLD)

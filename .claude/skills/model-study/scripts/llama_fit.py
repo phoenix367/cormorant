@@ -6,7 +6,7 @@ skill, route A), from config.json alone, before downloading the weights:
     Llama block (RMSNorm, rotate-half RoPE without scaling, GQA, SwiGLU with
     SiLU, no q/k/v/o or MLP biases) and one model.safetensors file;
   * parameters, the DMA pool (int16 weights incl. the LM head, int16 KV
-    caches at the context, intermediates) against cma=1000M and the models
+    caches at the context, intermediates) against cma=1400M and the models
     already served (they swap under --resident auto);
   * decode ms / token and 256-token prefill, scaled from the shipped
     SmolLM2 libraries (decode streams every weight once per token; prefill
@@ -28,7 +28,7 @@ import json
 import sys
 from pathlib import Path
 
-CMA_MB = 1000.0
+CMA_MB = 1400.0
 RESIDENT = {"bert-squad": 216, "smollm2-135m": 286, "smollm2-360m": 740, "smolvlm-256m": 495}  # MiB
 INTERM_MIB_PER_HIDDEN = 0.0108  # intermediates: +6.2 MiB (135M, hidden 576), +10.4 (360M, 960)
 DECODE_GBS = 2.89               # weight bytes streamed per second in decode (GEMV, both ports)
@@ -102,7 +102,7 @@ def main(argv=None) -> int:
           f"KV caches at {args.context} tokens {kv_bytes / 2 ** 20:.1f} MiB)")
     free = CMA_MB * 1e6 / 2 ** 20
     beside = [k for k, v in RESIDENT.items() if pool_mib + v <= free - 32]
-    verdict = ("does NOT fit cma=1000M" if pool_mib > free - 32 else
+    verdict = (f"does NOT fit cma={CMA_MB:.0f}M" if pool_mib > free - 32 else
                f"fits; stays resident beside: {', '.join(beside) or 'none (swaps with every model)'}")
     print(f"pool       ~{pool_mib:.0f} MiB of {free:.0f} MiB CMA: {verdict}")
     print(f"speed      decode ~{decode_ms:.0f} ms / token (~{1e3 / decode_ms:.1f} tok/s) at position 32, "

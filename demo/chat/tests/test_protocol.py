@@ -459,6 +459,40 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(lk.acquire(0.1), "ok")
         lk.release()
 
+    def test_fifo_lock_lend(self):
+        """The holder lends the lock to the first eligible waiter, out of turn;
+        its release gives it back to the holder, not to the queue."""
+        lk = server_mod.FifoLock()
+        self.assertEqual(lk.acquire(1.0), "ok")
+        self.assertFalse(lk.lend(lambda tag: True))                   # nobody waits
+        order, res = [], {}
+
+        def waiter(name, tag, hold=0.0, lend=False):
+            r = lk.acquire(5.0, tag=tag)
+            order.append(name)
+            if lend:
+                res["borrower_lends"] = lk.lend(lambda t: True)
+            time.sleep(hold)
+            lk.release()
+            res[name] = r
+        ts = []
+        for i, args in enumerate((("chat2", "llm2"), ("untagged", None), ("tts", "tts", 0.05, True))):
+            ts.append(threading.Thread(target=waiter, args=args))
+            ts[-1].start()
+            self.assertTrue(wait_until(lambda i=i: lk.waiting == i + 1))
+        self.assertTrue(lk.lend(lambda t: t == "tts"))                # tts runs now, then back here
+        self.assertEqual(order, ["tts"])
+        self.assertFalse(res["borrower_lends"])                       # a borrower does not lend
+        self.assertTrue(lk.busy)
+        self.assertEqual(lk.waiting, 2)
+        self.assertFalse(lk.lend(lambda t: t == "tts"))               # chat2 is not eligible, untagged never
+        lk.release()
+        for t in ts:
+            t.join(5)
+        self.assertEqual(order, ["tts", "chat2", "untagged"])
+        self.assertEqual(res, {"tts": "ok", "chat2": "ok", "untagged": "ok", "borrower_lends": False})
+        self.assertFalse(lk.busy)
+
 
 class TestDisconnect(unittest.TestCase):
 

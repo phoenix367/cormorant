@@ -197,19 +197,24 @@ libraries drive the kernels from the A53.
 
 ## Several models on one FPGA
 
-The board has 1000 MB of CMA (`cma=1000M`), and idle CmaFree was
-626–813 MB, so the models' pools do not all fit at once.  Each model
-declares the CMA it needs while loaded (`cma_mb`: its pool plus buffers and
-a margin); the server uses it to decide what to evict.
+The board has 1400 MiB of CMA (`cma=1400M`; Ubuntu's image sets 1000M —
+set it with `src.remote.cma_boot`, [the repo README](../../README.md#5-prepare-the-board-and-load-the-bitstream)),
+and idle CmaFree is about 1390 MB after the deploy's clean-up, so the
+models' pools do not all fit at once.  Each model declares the CMA it needs
+while loaded (`cma_mb`: its pool plus buffers and a margin); the server uses
+it to decide what to evict.  Seen on the board (2026-10-17): SmolLM2-360M,
+SmolLM2-135M, Moonshine base and Piper loaded together — Miranda with the
+360M model beside the chat server's default model; BERT and SmolVLM swap
+in.  With `cma=1000M` SmolLM2-360M stayed only beside Piper.
 
-| Model | Pool | `cma_mb` | Stays loaded (`--resident auto`) beside |
-|---|---:|---:|---|
-| BERT | 216 MiB | 224 | SmolLM2-135M, SmolVLM, Piper |
-| SmolLM2-135M | 299 MiB | 330 | BERT, Piper; SmolVLM only when the CMA is not fragmented |
-| SmolLM2-360M | 758 MiB | 775 | Piper only; swaps with the others |
-| SmolVLM-256M | 495 MiB | 550 | BERT, Piper; SmolLM2-135M only when the CMA is not fragmented; swaps with SmolLM2-360M |
-| Piper | 53 MiB | 55 | any other model, even SmolLM2-360M |
-| Moonshine base | 185.5 MiB | 200 | BERT, SmolLM2-135M and Piper, or SmolVLM and Piper (by the `cma_mb` sums); swaps with SmolLM2-360M (seen on the board) |
+| Model | Pool | `cma_mb` |
+|---|---:|---:|
+| BERT | 216 MiB | 224 |
+| SmolLM2-135M | 299 MiB | 330 |
+| SmolLM2-360M | 758 MiB | 775 |
+| SmolVLM-256M | 495 MiB | 550 |
+| Piper | 53 MiB | 55 |
+| Moonshine base | 185.5 MiB | 200 |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
   every weight (decode reads the prefill image through MatmulKernel's GEMV
@@ -222,7 +227,7 @@ a margin); the server uses it to decide what to evict.
 
 | Mode | Behaviour |
 |---|---|
-| `auto` (default) | The first backend loads at startup, the others too if CmaFree allows, else on their first request. Before a load, other models are evicted, least recently used first, while CmaFree < the new model's `cma_mb` + `--cma-margin-mb` (32). A load that still fails is retried once after evicting the rest. Models that fit together stay resident; the others swap. |
+| `auto` (default) | The first backend loads at startup, the others too if CmaFree allows (in the order of `server.backends`), else on their first request. Before a load, when CmaFree < the new model's `cma_mb` + `--cma-margin-mb` (32), the server drops the page cache and compacts memory (free CMA pages hold page cache), then evicts other models, least recently used first, while it still is. A load that still fails is retried once after evicting the rest. Models that fit together stay resident; the others swap. |
 | `one` | At most one FPGA model; switching models unloads the other. A switch costs a load: BERT 1.6 s, SmolLM2 1.0 s with the weights in the page cache; cold from the SD card BERT 14.3 s, SmolLM2 35.6 s. |
 | `all` | Everything loads at startup and stays (phase 1 behaviour). |
 

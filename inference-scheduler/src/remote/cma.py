@@ -2,7 +2,7 @@
 
 Every FPGA library takes its DMA pool as one contiguous CMA buffer (an XRT
 buffer object): SmolLM2-360M 795 MB, SmolVLM 550 MB, SmolLM2-135M 311 MB
-out of cma=1000M.  The allocation can fail with enough CmaFree when the page
+out of the cma= area (1000M then).  The allocation can fail with enough CmaFree when the page
 cache of uploads and builds sits in the CMA area or has fragmented it — seen
 2026-09-30 (776 MB with 834 MB free) and three times on 2026-10-13 (795 MB
 with 990 MB free, after builds and gates).  Dropping the clean page cache

@@ -270,6 +270,47 @@ class TestSpeechQueueAndDisconnect(unittest.TestCase):
         finally:
             srv.close()
 
+    def test_speech_runs_between_tokens(self):
+        """A chat answer lends the FPGA between two tokens to a speech request on a
+        loaded model (a voice client speaks the first sentence while the answer
+        goes on); not to a model still to load, nor with --no-interleave."""
+        words = " ".join(f"w{i}" for i in range(30))                   # 30 x 50 ms of answer
+        for interleave, warm in ((True, True), (True, False), (False, True)):
+            LOG.clear()
+            srv = RunningServer({"echo": server_mod.EchoBackend(delay=0.05), "fake-tts": FakeSpeechJob()},
+                                interleave=interleave)
+            try:
+                if warm:
+                    self.assertEqual(srv.request("POST", "/v1/audio/speech", {"input": "warm"})[0], 200)
+                out = {}
+
+                def chat():
+                    st, _, body = srv.post({"model": "echo", "stream": True,
+                                            "messages": [{"role": "user", "content": words}]})
+                    out["chat"], out["chat_st"] = time.monotonic(), st
+                    out["text"] = "".join(e["choices"][0]["delta"].get("content", "")
+                                          for e in sse_events(body) if isinstance(e, dict) and e.get("choices"))
+                t = threading.Thread(target=chat)
+                t.start()
+                self.assertTrue(wait_until(lambda: srv.srv.fpga.busy))
+                time.sleep(0.2)
+                t0 = time.monotonic()
+                st, _, pcm = srv.request("POST", "/v1/audio/speech", {"input": "one two", "response_format": "pcm"})
+                took = time.monotonic() - t0
+                t.join(10)
+                self.assertEqual((st, pcm, out["chat_st"]), (200, expected_pcm(2), 200))
+                self.assertEqual(out["text"], words)                    # the answer whole, in order
+                lent = any("model=echo" in ln and "lent=1/" in ln for ln in LOG)
+                if interleave and warm:
+                    self.assertLess(took, 0.5)
+                    self.assertLess(t0 + took, out["chat"])
+                    self.assertTrue(wait_until(lambda: any("model=echo" in ln and "lent=1/" in ln for ln in LOG)))
+                else:
+                    self.assertGreater(took, 0.8, (interleave, warm))   # after the answer
+                    self.assertFalse(lent)
+            finally:
+                srv.close()
+
 
 if __name__ == "__main__":
     unittest.main()

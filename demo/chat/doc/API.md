@@ -74,6 +74,7 @@ true`, `transcript.text.delta` events (one per part) and a final
 | `temperature` (0–2), `top_p` (0–1) | sampling (ignored by `bert-squad`) |
 | `stop` | up to 4 stop strings |
 | `seed` | sampling seed |
+| `logprobs`, `top_logprobs` (0–20) | SmolLM2 only, not with `stream`: `choices[0].logprobs.content`, one entry per generated token (`token`, `logprob`, `bytes`, `top_logprobs`) — the model's distribution before the sampler's penalties, as OpenAI returns it |
 | `n` | 1 only |
 | `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `repeat_last_n`, `dry_*`, `loop_guard` | the generative models' extra sampling fields ([Sampling](SMOLLM2.md#sampling)) |
 
@@ -122,6 +123,21 @@ A transcription's JSON body has one too: timings, parts, tokens, and with
 **One request at a time runs on the FPGA.**  The others wait in a FIFO, in
 the order they reach it, after the host-side preparation (such as
 tokenizing).
+- **A chat answer lends the FPGA.**  Between two of its tokens it hands
+  the FPGA to a waiting `/audio/speech` or `/audio/transcriptions` request
+  for a model that is already loaded.  That request runs at once and gives
+  the FPGA back to the answer, ahead of the queue.  So a voice client can
+  speak an answer's first sentence while the rest is written: Miranda's
+  speech starts 0.5–1.9 s after the request instead of 2.7–3.8 s.  The
+  answer's text arrives later by the speech's FPGA time.
+  - Chat requests are not lent to: one answer would stall for another.
+  - Neither are models that must load first, since a load may evict the
+    answering model.
+  - The request log shows the lends (`lent=3/1212ms`).  The server's
+    `tok/s` leaves them out; the backend's `decode=` rate does not.
+  - On the board an answer with three lends was token for token the same
+    as alone (temperature 0), and the speech sample for sample.
+  - `--no-interleave` keeps the FPGA to the answer's end.
 - **Queue limits.**  A request waits at most `--queue-timeout` (120 s),
   and at most `--max-queue` (16) requests wait at once.  Beyond either
   limit the answer is 503.

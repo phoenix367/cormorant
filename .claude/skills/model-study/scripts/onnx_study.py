@@ -9,7 +9,7 @@ inference scheduler takes as is).
                 Otherwise: nodes per engine (Conv / Matmul / VectorOP / Pool
                 kernels, host CPU, zero-cost views).
   2. memory     the DMA pool: weights + intermediates (slot reuse), against
-                cma=1000M; host-memory tensors.
+                cma=1400M; host-memory tensors.
   3. numerics   the scheduler's bit-level simulation (CodeGenerator, what the
                 generated C computes) against onnxruntime float32 on the
                 SAME grid-quantised inputs: per output rel. L2 / cosine /
@@ -48,7 +48,7 @@ SCHED = REPO / "inference-scheduler"
 if str(SCHED) not in sys.path:
     sys.path.insert(0, str(SCHED))
 
-CMA_MB = 1000.0            # cma=1000M on the board's kernel command line (idle CmaFree ~1011 MB)
+CMA_MB = 1400.0            # cma=1400M on the board's kernel command line (idle CmaFree ~1390 MB)
 
 
 def mib(n_bytes: float) -> float:
@@ -371,7 +371,7 @@ def main(argv=None) -> int:
     m = memory(g, cg)
     res["memory"] = m
     print(f"memory     DMA pool {size(m['pool_mib'])} = weights {size(m['weights_mib'])} + "
-          f"intermediates {size(m['intermediates_mib'])} ({100 * m['cma_share']:.1f} % of cma=1000M); "
+          f"intermediates {size(m['intermediates_mib'])} ({100 * m['cma_share']:.1f} % of cma={CMA_MB:.0f}M); "
           f"host tensors {size(m['host_tensors_mib'])}")
 
     if not args.no_numerics:

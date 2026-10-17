@@ -16,16 +16,19 @@ Miranda: The capital of France is Paris. It's a beautiful city with many famous 
   [first word 0.1 s · answer 1.1 s · speech 5.6 s from 1.3 s]
 (listening)
 You: Hello, Miranda.
-Miranda: yes? (listening for your request)
-You: Tell me something about the moon
-Miranda: The moon, also known as the planet Earth's natural satellite, orbits our planet once every 29 days. ...
-  [first word 0.1 s · answer 4.5 s · speech 21.1 s from 4.9 s]
+Miranda: Hi! How can I help you?
+(listening for your request)
+You: What is the capital of Italy?
+Miranda: The capital of Italy is Rome.
+  [first word 0.1 s · answer 0.5 s · speech 1.7 s from 0.7 s]
 (listening)
 ```
 
-(A recording spoken by Piper on the board, streamed with `--input`: the
-speech recognizer heard its "Hello Miranda" as "Haloma Randa", and Miranda
-still woke.  Lines with `·` were heard without the key phrase.)
+(Recordings spoken by Piper on the board, streamed with `--input`: in the
+first the speech recognizer heard "Hello Miranda" as "Haloma Randa", and
+Miranda still woke.  Lines with `·` were heard without the key phrase.
+"Hello Miranda" alone gets a short answer, and the next sentence is the
+request.)
 
 ## The dialogue mode
 
@@ -73,8 +76,8 @@ flowchart LR
     client["<b>miranda_client.py</b> · laptop<br/>microphone (pw-record ...) · player (pw-play ...)<br/>console"]
     subgraph board["KV260"]
         server["<b>miranda_server.py</b> (CPU)<br/>RTP in · VAD (vad.py) · key phrase (wake.py)<br/>sentences · turns"]
-        chat["<b>kv260_chat_server.py</b><br/>/v1/audio/transcriptions · /v1/chat/completions<br/>/v1/audio/speech · one request on the FPGA at a time"]
-        fpga["<b>FPGA</b><br/>Moonshine base · SmolLM2-135M · Piper"]
+        chat["<b>kv260_chat_server.py</b><br/>/v1/audio/transcriptions · /v1/chat/completions<br/>/v1/audio/speech · one request on the FPGA at a time<br/>(the answer lends it to speech between tokens)"]
+        fpga["<b>FPGA</b><br/>Moonshine base · SmolLM2-360M · Piper"]
     end
     client -- "RTP over UDP: the microphone,<br/>L16 16 kHz, 20 ms packets" --> server
     client <-- "TCP: events, the answer's text,<br/>Miranda's speech (PCM)" --> server
@@ -87,9 +90,9 @@ A session goes through four states:
 | State | What happens | The microphone |
 |---|---|---|
 | `listening` | The VAD cuts the stream into speech segments.  Each segment is transcribed (Moonshine).  A transcript holding the key phrase wakes Miranda, and the text after the phrase is the request. | streamed |
-| `awake` | The key phrase came alone ("Hello Miranda." then a pause).  The next segment is the request, or after `--awake-timeout` (8 s of audio) she listens again.  The key phrase said again restarts the wait. | streamed |
+| `awake` | The key phrase came alone ("Hello Miranda." then a pause).  Miranda answers it ("Hi! How can I help you?", see below), and the next segment is the request, or after `--awake-timeout` (8 s of audio) she listens again.  The key phrase said again restarts the wait. | streamed |
 | `dialogue` | Every segment is a request; no key phrase needed (above).  After the dialogue timeout without speech she goes back to `listening`. | streamed |
-| `thinking` | The request and the earlier turns go to the chat model (SmolLM2-135M), and the answer streams to the console as text. | muted |
+| `thinking` | The request and the earlier turns go to the chat model (SmolLM2-360M), and the answer streams to the console as text. | muted |
 | `speaking` | Finished sentences go to text to speech (Piper) and the speech streams to the client, which plays it.  The client reports when playback is over, and Miranda then listens again. | muted until the player has finished, plus 0.25 s |
 
 - **Voice activity detection** (`vad.py`, numpy on the A53).  It is the
@@ -129,6 +132,14 @@ A session goes through four states:
   Awake or in a dialogue, a transcript that starts with the phrase is the
   phrase said again, not the request.
 
+  "Let's talk" is checked the same way.  A real speaker's "Hello Miranda,
+  let's talk" came out as "It is stock", "a little stoke" and "red stalk",
+  and each was answered as a request.  So a short request (at most three
+  words, not a command) is transcribed once more with "let's talk" checked
+  against the audio, after the key phrase when there was one.  If it holds,
+  the dialogue mode starts.  Piper saying "red stalk" or "it is stock"
+  scores −13.6 / −14.6 there and stays a request.
+
   On the board a clear "Hello Miranda" scores 0, and ordinary speech scores
   below −15 (196 LibriSpeech utterances), and greetings to someone else
   below −10.  A speaker whose "Hello Miranda" Moonshine writes as "Hello,
@@ -153,19 +164,94 @@ A session goes through four states:
     Rhonda", "Veranda" or "Rwanda" do not.
 
   The phrase can be changed with `--wake`.
+- **The key phrase alone.**  "Hello Miranda" with nothing after it gets a
+  short spoken answer — "Hi! How can I help you?", "Yes? What can I do for
+  you?" and two more in turn — and the next segment is the request, without
+  the key phrase.  `--greeting chat` lets the chat model answer instead (it
+  is told to greet back and ask how it can help; SmolLM2-135M ignores that
+  and rambles, so it is not the default), `--greeting off` waits in
+  silence.
+- **The weather.**  "What's the weather like?", "Will it rain tomorrow?",
+  "Do I need an umbrella on Tuesday?", "What's the weather in Paris?" run
+  the weather tool (`weather.py`, no API keys):
+  - **Where:** the board's public IP (api.ipify.org), then its position
+    (ipwho.is, else ip-api.com; an IP's city is approximate — on
+    2026-10-17 one said Tbilisi, the other Batumi), or the place the
+    question names (Open-Meteo's geocoding), or `--location PLACE`.
+  - **The forecast:** Open-Meteo, now or a day of the next week; cached
+    for ten minutes, the position for an hour; 0.6 s when not cached.
+  - **Which questions:** rules decide (`WEATHER_INTENT` in
+    `miranda_server.py`), not the model.  Asked "is this about the
+    weather?", SmolLM2-360M said yes to "Write a song about snow" as surely
+    as to "Will it rain tomorrow?", and SmolLM2-135M said no to both (the
+    chat server's `logprobs` measured it).  The rules take the place
+    ("in Paris") and the day ("tomorrow", "on Friday", "this weekend") from
+    the question; jokes, poems and songs about the weather stay with the
+    chat model.
+  - **The announcement:** as chat services do before a tool call, Miranda
+    first says she is looking it up — "I'm currently checking the current
+    weather in Paris." — while the lookup runs.  The chat model writes it,
+    cut at its first sentence (1.0–1.6 s); it is spoken at once (the chat
+    server lends the FPGA to the speech while the answer is written), so
+    the speech starts 1.5–2.2 s after a weather question instead of 4–6 s.
+    SmolLM2-360M goes on guessing the weather after that sentence ("It's a
+    beautiful day with clear skies", "around 28 degrees"), so a sentence with
+    a number or a weather word is replaced by "Let me check the weather in
+    Paris."  `--no-announce` leaves it out.
+  - **The answer:**
+    - *Rain, umbrella and snow questions* get an answer composed from the
+      numbers: "Probably not, rain is unlikely tomorrow in Tbilisi,
+      Georgia: an 18 percent chance of rain, overcast, 15 to 26 degrees
+      Celsius."  The model said "yes, it will likely rain" to these
+      whatever the data.
+    - *Other weather questions* go to the chat model with the forecast in
+      its system message.  It answers greedily without the repetition and
+      DRY penalties; with the chat server's defaults it turned "13 degrees
+      (feels like 10)" into "10 degrees Celsius (34°F)".
+  - **Options:** `--no-weather` turns the tool off, `--location PLACE`
+    fixes its place.
 - **The answer.**
-  - SmolLM2-135M gets the request and the last 4 turns, with a system
+  - The chat model gets the request and the last 4 turns, with a system
     message asking for one to three short spoken sentences.
   - The answer stops after 3 sentences (`--max-sentences`); the chat server
     stops generating when the stream closes.  An answer cut at
     `--max-tokens` (100) is spoken up to its last whole sentence.
-  - SmolLM2-135M is the default because it stays loaded in CMA next to
-    Moonshine and Piper (330 + 200 + 55 MB).  SmolLM2-360M would swap with
-    them on every turn.
+  - SmolLM2-360M is the default: its answers are coherent and factual, at
+    7.6 tokens/s — speech starts 2.4–3.5 s after the request and three
+    sentences take about 10 s.  SmolLM2-135M (`deploy.py --chat-model
+    smollm2-135m-instruct`) is about 2.5 times faster (0.5–1.9 s and 3–4 s)
+    and wanders.  SmolLM2-360M needs the board at `cma=1400M`
+    ([the repo README](../../README.md#5-prepare-the-board-and-load-the-bitstream)):
+    there it stays loaded with Moonshine, Piper and SmolLM2-135M, while at
+    1000M two of three turns failed (its 795 MB pool did not fit beside
+    Moonshine and Piper).
 - **The FPGA.**  Every model runs through the chat server's API on the
   board's loopback.  The chat server owns the FPGA, runs one request at a
-  time and keeps the models loaded.  So the speech is synthesized after
-  the answer is complete; its text shows on the console as it is written.
+  time and keeps the models loaded.
+- **Speaking while the answer is written.**  The answer goes to text to
+  speech in pieces, paced by the speech still ahead of the player (the
+  audio sent and not played, plus the text not yet spoken, at the turn's
+  measured rate, about 3 words/s):
+  - while less than 2 s is ahead, the next clause goes out as soon as it is
+    written — at a comma after 3 words, or before a joining word (and, but,
+    which, who ...) after 5;
+  - otherwise whole sentences, which sound better; a sentence longer than
+    12 / 16 words is still cut at a clause (Piper encodes a piece before it
+    speaks: 0.9 s to the first audio for a 70-token sentence, 0.4 s for a
+    short one);
+  - never at a comma between capitalised words ("Tbilisi, Georgia": a piece
+    once ended there and the next came 2.2 s later), nor after Mr. / Dr. /
+    an initial / an abbreviation before a lower-case word.
+
+  The log shows each turn's pieces and its gaps (silences the player had,
+  `speech_gaps_ms`).  2026-10-18, a weather question and four long answers,
+  twice each with SmolLM2-360M: the long answers had no gap; the weather
+  answer one of 0.42–0.44 s after the announcement (it had 2.1–2.2 s inside
+  "Tbilisi, Georgia" with fixed word counts).  The speech starts 1.2–1.9 s
+  after the request.  `--no-early-speech`: whole sentences only.
+  - NLTK's Punkt splitter was tried for the sentence ends: on the 144
+    answers in Miranda's log it splits exactly as `Sentences` does, it cuts
+    "e.g. | the", and it would add NLTK and its data to the board.
 - **Not hearing herself.**  The client streams the microphone only while
   the server listens.  It stops before Miranda thinks and stays silent until
   her speech has finished playing.  On the board, 0 packets arrived while
@@ -189,7 +275,7 @@ $PY demo/miranda/deploy.py --status              # | --stop
   on port 8770: TCP for control, UDP for RTP.  It reads the board, ssh and
   the chat server's port and API key from `demo/chat/chat_config.json`.
   Arguments after `--` go to `miranda_server.py` (`--wake`,
-  `--wake-margin`, `--no-wake-check`, `--save-segments DIR`,
+  `--wake-margin`, `--no-wake-check`, `--save-segments DIR`, `--greeting`,
   `--max-sentences`, `--awake-timeout`, `--vad-*`, `--system` ...).
 - **Tuning the key phrase for your voice.**  The server's log shows each
   segment's margin (`journalctl -u kv260-miranda`):
@@ -244,13 +330,23 @@ $PY demo/miranda/deploy.py --status              # | --stop
 
 ## Measured
 
-2026-10-17, the board's chat server with Moonshine base, SmolLM2-135M and
-Piper resident (the session above):
+2026-10-17, the board's chat server with Moonshine base, the chat model and
+Piper resident (the session above, SmolLM2-135M — then the default):
 - **A segment's transcription:** 200–420 ms for 1.3–3.2 s of speech.
-- **The answer:** first word after 0.1–0.2 s; 1.1 s for two sentences, 4.5 s
-  for three long ones.
-- **Speech:** it starts 1.3–4.9 s after the request; Piper makes it faster
-  than it plays.
+- **The answer:** first word after 0.1–0.2 s; with SmolLM2-135M 1.1 s for
+  two sentences, 4.5 s for three long ones; with SmolLM2-360M 9.7–10.6 s
+  for three (7.6 tokens/s).
+- **Speech:** Piper makes it faster than it plays.  It starts 0.5–1.9 s
+  after the request, while the answer is still being written.  Measured on
+  three requests with three-sentence answers (a second run: 1.4 / 1.1 /
+  1.9 s):
+
+  | | speech starts | answer written |
+  |---|---|---|
+  | the FPGA lent between tokens | 1.5 / 0.5 / 1.2 s | 4.4 / 3.1 / 4.3 s |
+  | the answer first (`--no-interleave`, before 2026-10-17) | 2.7 / 3.8 / 3.7 s | 2.3 / 3.5 / 3.3 s |
+
+  The answer takes longer now by the speech's FPGA time.
 - **Warm-up per session:** 0.4 s with the models loaded.  It takes longer
   when the chat server must load them first: Moonshine 12.7 s and
   SmolLM2-135M 22 s in the chat server's log.
@@ -265,13 +361,15 @@ Piper resident (the session above):
 - **Half duplex:** no barge-in; while Miranda speaks she does not listen.
 - **In the dialogue mode everything heard is a request**, including speech
   meant for someone else.  The silence limit and "goodbye" end it.
-- **Speech after the answer:** the FPGA runs one request at a time, so the
-  speech starts once the answer is complete, not sentence by sentence.
-- **Answer quality** is SmolLM2-135M's.
+- **Answer quality** is SmolLM2-360M's.
 - **The key phrase is checked at the start of a segment only.**  Said
   later in a sentence ("So, hello Miranda!"), only the transcript can hold
   it.  The phrase check also needs the segment to fit one encoder pass
   (24.6 s; the VAD cuts at 24 s).
+- **The weather questions are the ones the rules know**: they were checked
+  on 33 weather questions and 27 others about rain, snow, heat or cold
+  that are not about the weather (all right), but other phrasings miss —
+  the chat model then answers without data.
 - **English only.**
 - **Every word said near the microphone is transcribed** (on the board) to
   look for the key phrase.
@@ -279,7 +377,7 @@ Piper resident (the session above):
 ## Tests
 
 ```bash
-cd demo/miranda/tests && ../../../inference-scheduler/.venv/bin/python -m unittest -v   # 22 tests, ~45 s
+cd demo/miranda/tests && ../../../inference-scheduler/.venv/bin/python -m unittest -v   # 31 tests, ~80 s
 ```
 
 They cover:
@@ -297,5 +395,11 @@ They cover:
   phrase, the key phrase alone then the request, the awake timeout, the
   three-sentence cap, the history, and that no audio reached the server
   while it was not listening.
+- the answer to the key phrase alone (`--greeting` fixed, chat, off);
+- "let's talk" checked against the audio of a short request;
+- the weather tool over canned service answers (no network): the place from
+  the IP and its fallback, the caches, the reports and the composed answers,
+  the questions the rules take and leave, and a voice session with weather
+  questions;
 - the dialogue mode: on and off by voice, `--dialogue` ending after
   silence, and the client's switch over the control protocol.

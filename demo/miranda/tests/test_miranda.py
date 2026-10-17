@@ -5,8 +5,11 @@ miranda_server.py, which reaches the KV260 chat server's API served here with
 fake backends (kv260_chat_server.py: a scripted speech-to-text model, the echo
 chat model, a fake text-to-speech model).  No board, no FPGA."""
 
+import dataclasses
+import datetime
 import io
 import json
+import re
 import os
 import socket
 import struct
@@ -30,6 +33,7 @@ for _p in (MIRANDA, CHAT_TESTS):
 import miranda_client as mc                                            # noqa: E402
 import miranda_proto as mp                                             # noqa: E402
 import miranda_server as ms                                            # noqa: E402
+import weather                                                         # noqa: E402
 from vad import Segmenter, Vad                                         # noqa: E402
 from wake import WakePhrase                                            # noqa: E402
 
@@ -214,6 +218,47 @@ class TestWakeAndSentences(unittest.TestCase):
         out.append(s.flush())
         self.assertEqual(out, ["The capital of France is Paris.", "It is lovely!", "A list item here"])
 
+    def test_pieces(self):
+        """Pieces of sentences at clause boundaries: in a hurry (the speech about to run
+        out) the first after 3 words before a comma / 5 before a joining word, else only
+        sentences longer than 12 / 16 words; never "Tbilisi, | Georgia" (2026-10-18: a
+        2.2 s pause there) nor inside "android"."""
+        def run(text, hurry, step=4):
+            sp = ms.Sentences()
+            out = [x for i in range(0, len(text), step) for x in sp.feed_chunks(text[i:i + step], hurry)]
+            return out + [(sp.flush(), True)]
+        w = ("The weather today in Tbilisi, Georgia, is overcast with 15 to 26 degrees Celsius, with a chance of rain "
+             "18 percent. The wind is light.")
+        self.assertEqual(run(w, True), [("The weather today in Tbilisi, Georgia,", False),
+                                        ("is overcast with 15 to 26 degrees Celsius,", False),
+                                        ("with a chance of rain 18 percent.", True), ("The wind is light.", True)])
+        self.assertEqual(run(w, False), [("The weather today in Tbilisi, Georgia, is overcast with 15 to 26 degrees "
+                                          "Celsius,", False), ("with a chance of rain 18 percent.", True),
+                                         ("The wind is light.", True)])
+        self.assertEqual(run("The Moon is our closest neighbor and has been part of culture for ages. Yes.", True),
+                         [("The Moon is our closest neighbor", False), ("and has been part of culture for ages.", True),
+                          ("Yes.", True)])
+        self.assertEqual(run("My android phone and my laptop are both broken today, sadly.", True),
+                         [("My android phone and my laptop are both broken today,", False), ("sadly.", True)])
+        self.assertEqual(run("The capital of Italy is Rome.", True), [("The capital of Italy is Rome.", True)])
+
+    def test_sentences_titles_initials_colons(self):
+        """2026-10-17: "The owner of the house, Mr." was taken for the third sentence and
+        the answer cut there; "Here's my response:" counted as one."""
+        def run(text, step=3):
+            sp = ms.Sentences()
+            out = [x for i in range(0, len(text), step) for x in sp.feed(text[i:i + step])]
+            return out + [sp.flush()]
+        self.assertEqual(run("She chased it around the house. The owner of the house, Mr. Smith, laughed. Then he left."),
+                         ["She chased it around the house.", "The owner of the house, Mr. Smith, laughed.", "Then he left."])
+        self.assertEqual(run("I'll respond as if you were me. Here's my response:\n\nThe story is about Luna. She is happy."),
+                         ["I'll respond as if you were me.", "Here's my response: The story is about Luna.", "She is happy."])
+        self.assertEqual(run("that covers 70% of our planet. it's home to life."),         # SmolLM2's lower-case starts
+                         ["that covers 70% of our planet.", "it's home to life."])
+        self.assertEqual(run("J. K. Rowling wrote it, e.g. the first book. Dr. Who came at 5 p.m. today. No. I disagree!"),
+                         ["J. K. Rowling wrote it, e.g. the first book.", "Dr. Who came at 5 p.m. today.", "No.",
+                          "I disagree!"])
+
 
 class ScriptedAsr(Backend):
     """A speech-to-text model whose transcripts come from a script, one per
@@ -227,6 +272,7 @@ class ScriptedAsr(Backend):
 
     def __init__(self, script):
         self.script, self.calls = list(script), []
+        self.by_audio = {}                      # a segment transcribed again: its entry again
 
     def prepare_transcription(self, req):
         import speech_input
@@ -236,27 +282,159 @@ class ScriptedAsr(Backend):
     def transcribe(self, job, cancel):
         pcm, phrase, min_margin = job
         loud = len(pcm) and float(np.sqrt(np.mean(pcm.astype(np.float64) ** 2))) > 500
-        item = self.script.pop(0) if loud and self.script else ""
-        text, info = item, {}
-        if isinstance(item, tuple):
+        key = pcm.tobytes()
+        if key not in self.by_audio:
+            self.by_audio[key] = self.script.pop(0) if loud and self.script else ""
+        item = self.by_audio[key]
+        text, info, margin, forced = item, {}, None, None
+        if isinstance(item, tuple):                 # (text, margin, forced) for the key phrase
             text, margin, forced = item
-            if phrase:
-                info["wake"] = {"phrase": phrase, "margin": margin, "complete": True,
-                                "passed": margin >= min_margin, "min_margin": min_margin}
-                text = forced if margin >= min_margin else text
+        elif isinstance(item, dict):                # {"text": ..., "phrases": {phrase: (margin, forced)}}
+            text = item["text"]
+            margin, forced = item["phrases"].get(phrase, (None, None))
+        if phrase and margin is not None:
+            info["wake"] = {"phrase": phrase, "margin": margin, "complete": True,
+                            "passed": margin >= min_margin, "min_margin": min_margin}
+            text = forced if margin >= min_margin else text
         self.calls.append((len(pcm) / 16000, text, phrase))
         yield Segment(0.0, len(pcm) / 16000, text, [])
         yield Finish("stop", info={"text": text, "audio_s": len(pcm) / 16000, **info})
 
 
+# ── the weather tool's services, canned (no network in the tests) ──
+
+FORECAST_DAYS = [(datetime.date(2026, 10, 17) + datetime.timedelta(days=i)).isoformat() for i in range(7)]   # Sat ..
+CANNED = {
+    "api.ipify.org": {"ip": "203.0.113.7"},
+    "ipwho.is": {"success": True, "city": "Batumi", "region": "Adjara", "country": "Georgia",
+                 "latitude": 41.65, "longitude": 41.63},
+    "ip-api.com": {"status": "success", "city": "Batumi", "regionName": "Adjara", "country": "Georgia",
+                   "lat": 41.65, "lon": 41.63},
+    "geocoding-api.open-meteo.com/v1/search?name=Paris": {"results": [
+        {"name": "Paris", "admin1": "Ile-de-France", "country": "France", "latitude": 48.85, "longitude": 2.35}]},
+    "geocoding-api.open-meteo.com/v1/search?name=Atlantis": {"generationtime_ms": 0.1},
+    "api.open-meteo.com/v1/forecast": {
+        "current": {"temperature_2m": 18.4, "apparent_temperature": 19.4, "relative_humidity_2m": 80,
+                    "weather_code": 3, "wind_speed_10m": 3.7},
+        "daily": {"time": FORECAST_DAYS, "weather_code": [3, 81, 3, 61, 3, 0, 95],
+                  "temperature_2m_max": [22.2, 21.8, 18.7, 20.0, 19.7, 19.4, 22.4],
+                  "temperature_2m_min": [18.0, 18.1, 16.4, 17.4, 17.3, 15.6, 14.6],
+                  "precipitation_probability_max": [5, 93, 3, 60, 9, None, 16],
+                  "wind_speed_10m_max": [9.2, 29.0, 9.2, 6.3, 7.6, 4.6, 7.2]}},
+}
+
+
+class FakeFetch:
+    def __init__(self, fail=()):
+        self.urls, self.fail = [], set(fail)
+
+    def __call__(self, url):
+        self.urls.append(url)
+        for key, obj in CANNED.items():
+            if key in url:
+                if key in self.fail:
+                    raise OSError(f"{key}: unreachable")
+                return obj
+        raise AssertionError(f"no canned answer for {url}")
+
+
+class WeatherEcho(server_mod.EchoBackend):
+    """The echo model; a request whose system message carries weather data is
+    answered with the data (what the real model is asked to do)."""
+
+    def generate(self, req, cancel):
+        system = req.messages[0]["content"] if req.messages and req.messages[0]["role"] == "system" else ""
+        m = re.search(r"Weather data: (.*?\.) Answer", system)
+        if m:
+            req = dataclasses.replace(req, messages=[{"role": "user", "content": m.group(1)}])
+        elif "you are about to look up" in system:            # the announcement (the request's stop cuts it)
+            req = dataclasses.replace(req, messages=[{"role": "user", "content": "I'm checking the weather now. "
+                                                                              "It is sunny."}])
+        yield from super().generate(req, cancel)
+
+
+class TestWeather(unittest.TestCase):
+    def test_here_and_the_caches(self):
+        f = FakeFetch()
+        w = weather.Weather(fetch=f)
+        p = w.here()
+        self.assertEqual((p.name, p.country, p.source, p.label()), ("Batumi", "Georgia", "ip", "Batumi, Georgia"))
+        self.assertEqual(len(f.urls), 2)                                # ipify, then ipwho.is
+        w.here()
+        w.report(p, "now")
+        w.report(p, "tomorrow")
+        self.assertEqual(len(f.urls), 3)                                # one forecast; the place cached
+        f2 = FakeFetch(fail={"ipwho.is"})
+        self.assertEqual(weather.Weather(fetch=f2).here().lat, 41.65)   # ip-api.com when ipwho.is fails
+        self.assertIn("ip-api.com", f2.urls[-1])
+
+    def test_reports(self):
+        w = weather.Weather(fetch=FakeFetch())
+        p = w.here()
+        self.assertEqual(w.report(p, "now").sentence(), "Weather in Batumi, Georgia now: overcast (it is not raining), 18 degrees "
+                         "Celsius (feels like 19), wind 4 kilometres per hour, humidity 80 percent.")
+        self.assertIn("tomorrow (Sunday 18 October): rain showers, 18 to 22 degrees Celsius, chance of rain 93 percent "
+                      "(rain is likely), wind up to 29 kilometres per hour.", w.report(p, "tomorrow").sentence())
+        self.assertIn("today (Saturday 17 October): overcast, 18 to 22", w.report(p, "today").sentence())
+        self.assertIn("Tuesday (Tuesday 20 October): light rain", w.report(p, "tuesday").sentence())
+        self.assertIn("chance of rain 60 percent (rain is likely)", w.report(p, "tuesday").sentence())
+        self.assertEqual([weather.rain_verdict(x) for x in (29, 30, 59, 60)],
+                         ["rain is unlikely", "rain is possible", "rain is possible", "rain is likely"])
+        self.assertIn("Thursday (Thursday 22 October): clear sky, 16 to 19 degrees Celsius, chance of rain 0 percent "
+                      "(rain is unlikely)",
+                      w.report(p, "thursday").sentence())               # no probability given: 0
+        self.assertIn("today", w.report(p, "saturday").sentence())                 # the weekday of today
+        paris = w.geocode("Paris")
+        self.assertEqual((paris.label(), paris.source), ("Paris, France", "named"))
+        self.assertTrue(w.report(paris, "now").sentence().startswith("Weather in Paris, France now:"))
+        self.assertIsNone(w.geocode("Atlantis"))
+        with self.assertRaises(weather.WeatherError):
+            w.report(p, "someday")
+        # the answers to rain / umbrella / snow questions come from the numbers
+        self.assertEqual(w.report(p, "tomorrow").yes_no("Will it rain tomorrow?"),
+                         "Yes, rain is likely tomorrow in Batumi, Georgia: a 93 percent chance of rain, rain showers, "
+                         "18 to 22 degrees Celsius.")
+        self.assertTrue(w.report(p, "today").yes_no("Will it rain today?").startswith("Probably not, rain is unlikely"))
+        self.assertTrue(w.report(p, "tuesday").yes_no("Do I need an umbrella on Tuesday?").startswith(
+            "Yes, take an umbrella on Tuesday"))
+        self.assertTrue(w.report(p, "thursday").yes_no("Do I need an umbrella?").startswith(
+            "You probably won't need an umbrella"))
+        self.assertTrue(w.report(p, "now").yes_no("Is it raining?").startswith("No, it is not raining in Batumi"))
+        self.assertEqual([weather.a_an(n) for n in (8, 18, 80, 3, 97, 100)], ["an", "an", "an", "a", "a", "a"])
+        self.assertTrue(w.report(p, "tomorrow").yes_no("Will it snow tomorrow?").startswith("No, no snow is forecast"))
+
+    def test_questions(self):
+        for q in ("What's the weather like today?", "Is it going to rain tomorrow?", "How hot will it be on Friday?",
+                  "Do I need an umbrella today?", "Is it cold outside?", "Will it snow in Tbilisi this weekend?",
+                  "What's the temperature right now?", "Is there a storm coming?", "Should we bring an umbrella?",
+                  "How's the weather?", "Will it be a sunny day?", "What's the temperature in Tbilisi?"):
+            self.assertTrue(ms.weather_question(q), q)
+        for q in ("Tell me a joke about the weather.", "What is the boiling temperature of water?",
+                  "I love rainy days, tell me a poem.", "How do clouds form?", "Is coffee better hot or cold?",
+                  "Is it true that cold water boils faster?", "I need a new coat, any shop ideas?",
+                  "Is there a hot dog stand nearby?", "Is it cold in space?", "What's the temperature in space?",
+                  "Where can I buy a warm jacket?", "Explain how wind turbines work."):
+            self.assertFalse(ms.weather_question(q), q)
+        for q, args in (("What is the weather in Paris?", ("Paris", "now")),
+                        ("Tell me the forecast for London tomorrow.", ("London", "tomorrow")),
+                        ("Will it snow in Tbilisi this weekend?", ("Tbilisi", "saturday")),
+                        ("How cold will it be tonight?", ("", "today")),
+                        ("Will it be sunny on Sunday?", ("", "sunday")),
+                        ("Weather in New York in the morning?", ("New York", "now")),
+                        ("Is it cold outside?", ("", "now")),
+                        ("Should I take my umbrella?", ("", "today"))):
+            self.assertEqual(ms.weather_args(q), args, q)
+
+
 class Session(unittest.TestCase):
     def run_session(self, pieces, script, turns=0, server_args=(), client_args=()):
         asr, tts = ScriptedAsr(script), FakeSpeechJob()
-        chat = RunningServer({"echo": server_mod.EchoBackend(), "fake-tts": tts, "fake-asr": asr})
+        chat = RunningServer({"echo": WeatherEcho(), "fake-tts": tts, "fake-asr": asr})
         args = ms.parse_args(["--host", "127.0.0.1", "--port", "0", "--chat-url",
                               f"http://127.0.0.1:{chat.port}/v1", "--chat-model", "echo",
                               "--vad-hangover-ms", "500", *server_args])
-        srv = ms.MirandaServer(args, ms.ChatApi(args.chat_url))
+        self.fetch = FakeFetch()
+        srv = ms.MirandaServer(args, ms.ChatApi(args.chat_url), weather=weather.Weather(fetch=self.fetch))
         threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         d = tempfile.mkdtemp(prefix="miranda_test_")
         wav = os.path.join(d, "in.wav")
@@ -298,11 +476,15 @@ class Session(unittest.TestCase):
         self.assertIn("· good morning everyone", text)
         self.assertIn("You: Hello, Miranda. What is two plus two?", text)
         self.assertIn("Miranda: What is two plus two?", text)                # the echo model
-        self.assertIn("Miranda: yes? (listening for your request)", text)
+        # the key phrase alone: a fixed answer, spoken, then she waits for the request
+        self.assertIn("You: Hello Miranda.\nMiranda: Hi! How can I help you?", text)
+        self.assertEqual(text.count("You: Hello Miranda."), 1)
+        self.assertIn("(listening for your request)", text)
         self.assertIn("You: Tell me a joke", text)
         self.assertIn("Miranda: Tell me a joke", text)
-        self.assertEqual(frames, [5 * PIECE, 4 * PIECE])                    # one fake piece per word
-        self.assertEqual([j.input for j in tts.jobs[-2:]], ["What is two plus two?", "Tell me a joke"])
+        self.assertEqual(frames, [5 * PIECE, 6 * PIECE, 4 * PIECE])         # one fake piece per word
+        self.assertEqual([j.input for j in tts.jobs[-3:]], ["What is two plus two?", "Hi! How can I help you?",
+                                                            "Tell me a joke"])
         # the chat model saw the first turn when it answered the second
         self.assertEqual(len(asr.calls), 1 + 4)                             # the warm-up + four segments
         s = sessions[0]
@@ -327,7 +509,7 @@ class Session(unittest.TestCase):
         self.assertEqual(rc, 0, text)
         self.assertIn("· It's the weather today", text)                    # -15 < -10: not the phrase
         self.assertIn("You: Hello, Miranda, what is two plus two?\nMiranda: what is two plus two?", text)
-        self.assertIn("Miranda: yes? (listening for your request)", text)
+        self.assertIn("Miranda: Hi! How can I help you?\n", text)           # the answer to the phrase alone
         self.assertNotIn("granda", text)
         self.assertIn("You: Tell me a joke\nMiranda: Tell me a joke", text)
         self.assertEqual(sessions[0].turns, 2)
@@ -353,6 +535,72 @@ class Session(unittest.TestCase):
             server_args=["--no-wake-check"])
         self.assertEqual(asr.calls[-1][2], None)
         self.assertIn("· A warm Yuranda, what is two plus two?", text)
+
+    def test_talk_check(self):
+        """A short request may be "let's talk" misheard (the board's log: "It is
+        stock", "red stalk"): checked against the audio once more, it opens the
+        dialogue — after the key phrase and while awake; not when the check fails."""
+        stock = {"text": "Hello, Miranda. It is stock.",
+                 "phrases": {"Hello Miranda": (-1.0, "Hello, Miranda. It is stock."),
+                             "Hello Miranda let's talk": (-4.0, "Hello, Miranda, let's talk.")}}
+        stalk = {"text": "Red stalk.", "phrases": {"Hello Miranda": (-15.0, "Hello Miranda"),
+                                                   "Let's talk": (-3.0, "Let's talk.")}}
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            [("pause", 1.0), ("speech", 1.6), ("pause", 1.5), ("speech", 1.0), ("pause", 1.5)],
+            [stock, "What is two plus two?"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("You: Hello, Miranda, let's talk.", text)
+        self.assertIn("Miranda: Sure, let's talk. I'm listening.", text)
+        self.assertIn("You: What is two plus two?\nMiranda: What is two plus two?", text)   # no key phrase
+        self.assertEqual([c[2] for c in asr.calls[1:]],
+                         ["Hello Miranda", "Hello Miranda let's talk", "Hello Miranda"])
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            [("pause", 1.0), ("speech", 0.8), ("pause", 1.2), ("speech", 0.8), ("pause", 1.5)],
+            ["Hello Miranda", stalk])
+        self.assertIn("Miranda: Hi! How can I help you?", text)
+        self.assertIn("Miranda: Sure, let's talk. I'm listening.", text)
+        self.assertTrue(sessions[0].dialogue)
+        stock["phrases"]["Hello Miranda let's talk"] = (-14.0, "Hello, Miranda, let's talk.")
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            [("pause", 1.0), ("speech", 1.6), ("pause", 1.5)], [stock])
+        self.assertIn("You: Hello, Miranda. It is stock.\nMiranda: It is stock.", text)     # a request after all
+
+    def test_weather(self):
+        """A weather question runs the weather tool and the model answers from its report
+        (the echo model repeats it); a place that does not exist is said so."""
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            [("pause", 1.0), ("speech", 1.4), ("pause", 1.2), ("speech", 1.4), ("pause", 1.2), ("speech", 1.4),
+             ("pause", 1.2), ("speech", 1.4), ("pause", 1.5)],
+            ["Hello Miranda, will it rain to-morrow?", "Hello Miranda, what is the weather in Paris?",
+             "Hello Miranda, what is the weather in Atlantis?", "Hello Miranda, tell me a joke about the weather."])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("Miranda: I'm checking the weather now. Yes, rain is likely tomorrow in Batumi, Georgia: a 93 "
+                      "percent chance of rain, rain showers, 18 to 22 degrees Celsius.", text)   # composed, not the model
+        self.assertIn("Miranda: I'm checking the weather now. Weather in Paris, France now: overcast (it is not "
+                      "raining), 18 degrees Celsius", text)
+        self.assertEqual(text.count("will it rain"), 1)                              # shown as heard, once
+        self.assertIn("Miranda: I'm checking the weather now. I could not find Atlantis.", text)
+        self.assertIn("Miranda: tell me a joke about the weather.", text)          # no tool: the echo
+        self.assertEqual(sum("api.open-meteo.com/v1/forecast" in u for u in self.fetch.urls), 2)   # Batumi, Paris
+        rc, text, *_ = self.run_session([("pause", 1.0), ("speech", 1.4), ("pause", 1.5)],
+                                        ["Hello Miranda, will it rain tomorrow?"], server_args=["--no-announce"])
+        self.assertIn("Miranda: Yes, rain is likely tomorrow", text)
+        rc, text, *_ = self.run_session([("pause", 1.0), ("speech", 1.4), ("pause", 1.5)],
+                                        ["Hello Miranda, will it rain tomorrow?"], server_args=["--no-weather"])
+        self.assertIn("Miranda: will it rain tomorrow?", text)
+        self.assertEqual(self.fetch.urls, [])
+
+    def test_announcement_check(self):
+        """What SmolLM2-360M said as announcements on the board (cut at the first
+        sentence): kept when it only announces, else the fixed sentence."""
+        for said in ("I'm currently checking the current weather in Paris.", "I'm checking the weather now",
+                     "Let me look up tomorrow's weather for you!"):
+            self.assertEqual(ms.announcement(said, "Paris"), (said.strip(" .!") + ".", True), said)
+        for said in ("I'm checking the weather now, it's a beautiful day with clear skies", "Yes, it's likely to snow",
+                     "I'm currently checking the temperature for Tbilisi, which is 32°F", "The weather is nice", "",
+                     "I'm currently checking the weather in Tbilisi with my weather tool, it's not cold outside"):
+            self.assertEqual(ms.announcement(said, "Paris"), ("Let me check the weather in Paris.", False), said)
+        self.assertEqual(ms.announcement("", "")[0], "Let me check the weather.")
 
     def test_answer_stops_after_three_sentences(self):
         rc, text, asr, tts, frames, sessions = self.run_session(
@@ -433,9 +681,27 @@ class Session(unittest.TestCase):
             [("pause", 1.0), ("speech", 0.8), ("pause", 4.0), ("speech", 1.0), ("pause", 1.5)],
             ["Hello Miranda", "this is not for you"], server_args=["--awake-timeout", "2"])
         self.assertEqual(rc, 0, text)
-        self.assertIn("yes? (listening for your request)", text)
-        self.assertIn("· this is not for you", text)                         # heard, but asleep again
-        self.assertEqual(frames, [])
+        self.assertIn("Miranda: Hi! How can I help you?", text)              # answered ...
+        self.assertIn("(listening for your request)", text)
+        self.assertIn("· this is not for you", text)                         # ... heard, but asleep again
+        self.assertEqual(frames, [6 * PIECE])
+
+    def test_greeting_chat_and_off(self):
+        pieces = [("pause", 1.0), ("speech", 0.8), ("pause", 1.2), ("speech", 1.0), ("pause", 1.5)]
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            pieces, ["Hello Miranda", "Tell me a joke"], server_args=["--greeting", "chat"])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("You: Hello Miranda\nMiranda: Hello Miranda!", text)      # the echo model's answer
+        self.assertIn("You: Tell me a joke\nMiranda: Tell me a joke", text)
+        self.assertEqual((frames, sessions[0].turns), ([2 * PIECE, 4 * PIECE], 2))
+        self.assertEqual([m["content"] for m in sessions[0].history][:2], ["Hello Miranda!", "Hello Miranda!"])
+        rc, text, asr, tts, frames, sessions = self.run_session(
+            pieces, ["Hello Miranda", "Tell me a joke"], server_args=["--greeting", "off"])
+        self.assertEqual(rc, 0, text)
+        self.assertNotIn("Miranda: H", text)
+        self.assertIn("(listening for your request)", text)
+        self.assertIn("You: Tell me a joke\nMiranda: Tell me a joke", text)
+        self.assertEqual((frames, sessions[0].turns), ([4 * PIECE], 1))
 
 
 if __name__ == "__main__":

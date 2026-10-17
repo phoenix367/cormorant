@@ -114,7 +114,7 @@ choose (§6.6).
 | processors | 4 × Cortex-A53 at 1.33 GHz (Linux); 2 × Cortex-R5F at 533 MHz (one used, bare metal) |
 | hardware tools | Vivado / Vitis 2025.2 |
 | RTL simulation | Verilator 5.020; xsim (Vivado 2025.2) for the IP and block-design tests |
-| board software | Ubuntu 22.04, kernel 5.15.0-xilinx-zynqmp, XRT 2.13, `cma=1000M` |
+| board software | Ubuntu 22.04, kernel 5.15.0-xilinx-zynqmp, XRT 2.13, `cma=1400M` |
 
 ---
 
@@ -597,7 +597,7 @@ The depths follow three rules:
 | rate | 2133 MT/s (DPLL 1066 MHz, set by the boot firmware), 17 GB/s peak |
 | PS address map | `DDR_LOW` `0x0000_0000`–`0x7FFF_FFFF` (2 GB), `DDR_HIGH` `0x8_0000_0000`–`0x8_7FFF_FFFF` (2 GB) |
 | kernel addressing | physical, 64-bit address fields; the kernels' address arithmetic is 48-bit (bytes) / 44-bit (128-bit words), the upper bits zero — the PS ports' physical space is 40 bits; the SMMU stays in bypass |
-| buffers | one contiguous pool per model library, from CMA (`cma=1000M`) as an XRT buffer object, carved by the scheduler into weights, persistent states and coloured intermediate slots |
+| buffers | one contiguous pool per model library, from CMA (`cma=1400M`) as an XRT buffer object, carved by the scheduler into weights, persistent states and coloured intermediate slots |
 | caching | the pool is mapped cacheable for the A53; the runtime cleans before a kernel reads and invalidates after a kernel writes; the R5's command ring is uncached |
 
 The chat server's model pools are 216 MiB (BERT), 299 MiB (SmolLM2-135M),

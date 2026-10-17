@@ -450,6 +450,31 @@ class TestHTTP(SchemaMixin, unittest.TestCase):
         self.assertGreater(len(ev), len(tok().encode(self.reply)) // 2)      # streamed token by token
         self.assertEqual(extra["finish"], "eos")
 
+    def test_logprobs(self):
+        """OpenAI's logprobs / top_logprobs (non-streaming): one entry per generated
+        token, the model's distribution — the scripted engine puts each token 30
+        above the rest."""
+        st, _, out = self.s.post(self.body(logprobs=True, top_logprobs=3, temperature=0))
+        self.assertEqual(st, 200, out)
+        obj = json.loads(out)
+        ch = obj["choices"][0]
+        ents = ch["logprobs"]["content"]
+        self.assertEqual(len(ents), obj["usage"]["completion_tokens"])
+        self.assertEqual(b"".join(bytes(e["bytes"]) for e in ents).decode(), ch["message"]["content"])
+        for e in ents:
+            self.assertAlmostEqual(e["logprob"], 0.0, places=3)
+            self.assertEqual(len(e["top_logprobs"]), 3)
+            self.assertEqual(e["top_logprobs"][0]["token"], e["token"])
+            self.assertLess(e["top_logprobs"][1]["logprob"], -25.0)
+        self.assertNotIn("logprobs", obj["kv260"])
+        st, _, out = self.s.post(self.body(logprobs=True))
+        self.assertEqual(json.loads(out)["choices"][0]["logprobs"]["content"][0]["top_logprobs"], [])
+        self.assertIsNone(json.loads(self.s.post(self.body())[2])["choices"][0]["logprobs"])
+        for kw, param in (({"logprobs": "yes"}, "logprobs"), ({"logprobs": True, "top_logprobs": 21}, "top_logprobs"),
+                          ({"top_logprobs": 2}, "top_logprobs"), ({"logprobs": True, "stream": True}, "logprobs")):
+            st, _, out = self.s.post(self.body(**kw))
+            self.assertEqual((st, json.loads(out)["error"]["param"]), (400, param), kw)
+
     def test_stream_equals_non_stream_and_length(self):
         for kw in ({}, {"max_tokens": 4}, {"stop": ["capital"]}, {"stop": "😀"}):
             _, _, a = self.s.post(self.body(**kw))
@@ -677,10 +702,17 @@ class FakeBertEngine:
 
 
 class FakeCma:
-    """CmaFree bookkeeping; alloc beyond the total raises like a failed BO."""
+    """CmaFree bookkeeping; alloc beyond the total raises like a failed BO.
+    `cache`: page cache in free CMA pages — CmaFree does not count it, an
+    allocation moves it, reclaim() drops it."""
 
     def __init__(self, total, report=True):
         self.total, self.used, self.report = total, {}, report
+        self.cache, self.reclaims = 0, 0
+
+    def reclaim(self):
+        self.cache, self.reclaims = 0, self.reclaims + 1
+        return True
 
     def alloc(self, who, mb):
         if sum(self.used.values()) + mb > self.total:
@@ -691,7 +723,7 @@ class FakeCma:
         self.used.pop(who, None)
 
     def free_mb(self):
-        return (self.total - sum(self.used.values())) if self.report else None
+        return (self.total - sum(self.used.values()) - self.cache) if self.report else None
 
 
 class CmaScripted(ScriptedEngine):
@@ -726,7 +758,8 @@ class TestResidency(unittest.TestCase):
         backends = {"bert-squad": bert, MID: llm}
         for b in backends.values():
             b.load_host()
-        s = RunningServer(backends, resident=resident, cma_free=cma.free_mb if cma else lambda: None)
+        s = RunningServer(backends, resident=resident, cma_free=cma.free_mb if cma else lambda: None,
+                          cma_reclaim=cma.reclaim if cma else lambda: False)
         s.srv.load_startup()
         return s
 
@@ -768,6 +801,18 @@ class TestResidency(unittest.TestCase):
             self.assertEqual(self.ask(s, MID)[0], 200)
             self.assertEqual(self.ask(s, "bert-squad")[0], 200)
             self.assertEqual((self.bert_eng.closes, self.llm_eng.close_count), (0, 0))
+        finally:
+            s.close()
+
+    def test_auto_reclaims_page_cache_before_evicting(self):
+        cma = FakeCma(1000)
+        cma.cache = 500                                # page cache in the free CMA pages
+        s = self.make("auto", cma)
+        try:
+            self.assertEqual(self.health(s), {"bert-squad": True, MID: False})   # 276 "free" < 392 at startup
+            self.assertEqual(self.ask(s, MID)[0], 200)
+            self.assertEqual(self.health(s), {"bert-squad": True, MID: True})    # reclaimed, nothing evicted
+            self.assertEqual((cma.reclaims, self.bert_eng.closes), (1, 0))
         finally:
             s.close()
 

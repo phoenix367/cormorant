@@ -303,7 +303,10 @@ src/
                          run_remote_perf.py / upload_bitstream.py / perf_calibrate.py)
                          cma.py: the board's CMA clean-up (`python -m src.remote.cma --config CFG
                          [--check] [--min-mb N]`: drop the page cache, compact memory, report CmaFree
-                         and the processes holding FPGA buffers; deploy / llm_board / rpu_board call it)
+                         and the processes holding FPGA buffers; deploy / llm_board / rpu_board call it);
+                         cma_boot.py: the CMA area's size, the kernel's cma= (`python -m src.remote.cma_boot
+                         --config CFG [--set 1400M] [--reboot]`: the boot script via flash-kernel, backups in
+                         /root/cma_backup, the reboot checked)
   codegen/
     __init__.py          CodeGenerator (assembles all mixins)
     _core.py             _compute_event_stream() → list of comment/start/wait/drain/cpu events
@@ -326,7 +329,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              89 pytest modules, 1880 tests, all pass (test_bert_base.py
+  test_*.py              90 pytest modules, 1883 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

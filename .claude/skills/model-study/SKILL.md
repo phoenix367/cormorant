@@ -1,5 +1,5 @@
 ---
-description: Go / no-go feasibility study of a new neural network for the KV260 stack BEFORE porting it — operator coverage and kernel bounds, memory (DMA pool vs cma=1000M, board and host RAM), numeric accuracy of the int16 power-of-two datapath against float, projected latency — ending in a written verdict in a plan doc. Use when asked whether a model can run on the board, to "study" a model, or before adding a model to a demo or the chat server. Llama-family checkpoints go through llama_fit.py + llm_calibrate.py / llm_study.py; any ONNX model through onnx_study.py; other architectures get a study script modelled on vlm_study.py.
+description: Go / no-go feasibility study of a new neural network for the KV260 stack BEFORE porting it — operator coverage and kernel bounds, memory (DMA pool vs cma=1400M, board and host RAM), numeric accuracy of the int16 power-of-two datapath against float, projected latency — ending in a written verdict in a plan doc. Use when asked whether a model can run on the board, to "study" a model, or before adding a model to a demo or the chat server. Llama-family checkpoints go through llama_fit.py + llm_calibrate.py / llm_study.py; any ONNX model through onnx_study.py; other architectures get a study script modelled on vlm_study.py.
 allowed-tools: Bash Read Write Edit
 ---
 
@@ -47,9 +47,9 @@ op (`src/host_nodes.py`: numpy reference + C helper), a pattern fusion
 
 **2.2 Memory.**
 - DMA pool (int16 weights, one copy — decode reads the prefill image
-  through GEMV; KV caches; intermediates) against `cma=1000M` (~954 MiB
-  usable, idle CmaFree ~1011 MB).  Pools served today: BERT 216, SmolLM2-135M
-  299, SmolLM2-360M 758, SmolVLM 495 MiB.  Above ~920 MiB: NO-GO without a
+  through GEMV; KV caches; intermediates) against `cma=1400M` (~1335 MiB
+  usable, idle CmaFree ~1390 MB; 1000M before 2026-10-17).  Pools served today: BERT 216, SmolLM2-135M
+  299, SmolLM2-360M 758, SmolVLM 495 MiB.  Above ~1300 MiB: NO-GO without a
   CMA change.  Above what is left beside the others: it swaps under
   `--resident auto` (a warm swap costs 1–2 s, a cold load 20–55 s).
 - Board: 3.9 GB RAM, no swap — host tensors (float32 residual, embedding

@@ -679,7 +679,7 @@ facts:
 # ── recorded: measured, with provenance ──────────────────────────────────────
 - id: chat.pool_mib
   kind: recorded
-  title: DMA pool of each chat model's library, MiB (what it takes of cma=1000M)
+  title: DMA pool of each chat model's library, MiB (what it takes of the cma= area)
   value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54}
   tolerance: 1                               # MiB: the docs round
   provenance:
@@ -1262,6 +1262,28 @@ facts:
     - {file: doc/images/architecture.svg, fix: report,       # generated: fix architecture.py and rerun it
        regex: '(?P<conv_grid>\d+ × \d+) MAC grid'}
     - {file: doc/images/architecture.svg, fix: report, regex: '(?P<pool_lanes>\d+) channel lanes'}
+
+- id: board.cma_mb
+  kind: value
+  title: the board's CMA area, the kernel's cma= (MiB; src/remote/cma_boot.py sets it), where the docs and the
+    study scripts state it
+  source: {file: inference-scheduler/src/remote/cma_boot.py, regex: '^BOARD = "(\d+)M"', type: int}
+  mentions:
+    - {file: README.md, regex: 'with `cma=(\d+)M` on the kernel command line'}
+    - {file: CLAUDE.md, regex: '`cma=(\d+)M` on the kernel command line'}
+    - {file: demo/chat/README.md, regex: '`cma=(\d+)M` on the kernel command line'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: 'The board has (\d+) MiB of CMA'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '\(`cma=(\d+)M`; Ubuntu'}
+    - {file: doc/ARCHITECTURE.md, regex: 'XRT 2\.13, `cma=(\d+)M`'}
+    - {file: doc/ARCHITECTURE.md, regex: 'from CMA \(`cma=(\d+)M`\)'}
+    - {file: demo/chat/kv260_chat_server.py, regex: 'of the (\d+) MB cma='}
+    - {file: .claude/skills/llm-onboard/SKILL.md, regex: '\(`cma=(\d+)M`, ~'}
+    - {file: .claude/skills/model-study/SKILL.md, regex: 'DMA pool vs cma=(\d+)M'}
+    - {file: .claude/skills/model-study/SKILL.md, regex: 'against `cma=(\d+)M`'}
+    - {file: .claude/skills/perf-regression/SKILL.md, regex: 'swap, `cma=(\d+)M`'}
+    - {file: .claude/skills/docs-audit/templates/new_user_brief.md, regex: 'XRT and `cma=(\d+)M`'}
+    - {file: .claude/skills/model-study/scripts/llama_fit.py, regex: 'CMA_MB = (\d+)\.0'}
+    - {file: .claude/skills/model-study/scripts/onnx_study.py, regex: 'CMA_MB = (\d+)\.0'}
 
 - id: board.pl_clock_mhz
   kind: value

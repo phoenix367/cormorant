@@ -6,7 +6,7 @@ with inference-scheduler/.venv/bin/python).
   check   the KV260 chat server answers on the board and serves a chat, a
           text-to-speech and a speech-to-text model (GET /v1/models: their
           kv260.type) — Miranda's FPGA work goes through it
-  upload  miranda_server.py, miranda_proto.py, vad.py, wake.py -> <dir>/miranda
+  upload  miranda_server.py, miranda_proto.py, vad.py, wake.py, weather.py -> <dir>/miranda
           (<dir>: the chat server's install directory, remote.dir of
           demo/chat/chat_config.json)
   start   a transient systemd unit 'kv260-miranda' (journalctl -u kv260-miranda;
@@ -21,7 +21,7 @@ and may keep running while the chat server is stopped for a board job (its
 requests then fail until the chat server is back).
 
 usage:  deploy.py [--config ../chat/chat_config.json] [--port 8770]
-                  [--chat-model smollm2-135m-instruct] [-- SERVER ARGS...]
+                  [--chat-model smollm2-360m-instruct] [-- SERVER ARGS...]
         deploy.py --stop | --status
 """
 
@@ -44,7 +44,7 @@ import deploy as chat_deploy                                           # noqa: E
 from src.remote import RemoteSession, _green, _red                     # noqa: E402
 
 UNIT = "kv260-miranda"
-FILES = ("miranda_server.py", "miranda_proto.py", "vad.py", "wake.py")
+FILES = ("miranda_server.py", "miranda_proto.py", "vad.py", "wake.py", "weather.py")
 
 
 def kinds(cfg: dict):
@@ -73,7 +73,8 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=None, help="the chat server's config (default demo/chat/chat_config.json)")
     ap.add_argument("--port", type=int, default=8770)
-    ap.add_argument("--chat-model", default="smollm2-135m-instruct")
+    ap.add_argument("--chat-model", default="smollm2-360m-instruct",
+                    help="the chat model (smollm2-135m-instruct: faster, weaker answers)")
     ap.add_argument("--stop", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("server_args", nargs="*", help="more miranda_server.py arguments (after --)")

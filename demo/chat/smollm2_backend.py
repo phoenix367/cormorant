@@ -410,8 +410,50 @@ class Smollm2Backend(Backend):
         if not ids or ids[0] != self.bos or len(ids) < 2:
             raise BackendError("internal: the chat template must start with <|im_start|>", "messages")
         seed = req.seed if req.seed is not None else random.SystemRandom().getrandbits(63)
-        return Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
-                   breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
+        job = Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
+                  breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
+        job.extra["top_logprobs"] = self._logprobs_fields(req)
+        return job
+
+    @staticmethod
+    def _logprobs_fields(req: ChatRequest) -> Optional[int]:
+        """OpenAI's logprobs / top_logprobs -> None (not asked) or 0 .. 20."""
+        raw = req.raw or {}
+        lp, top = raw.get("logprobs"), raw.get("top_logprobs")
+        if lp is not None and not isinstance(lp, bool):
+            raise BackendError("Invalid type for 'logprobs': expected a boolean.", "logprobs", code="invalid_type")
+        if top is not None:
+            if not isinstance(top, int) or isinstance(top, bool) or not 0 <= top <= 20:
+                raise BackendError("Invalid 'top_logprobs': expected an integer between 0 and 20.", "top_logprobs",
+                                   code="invalid_value")
+            if not lp:
+                raise BackendError("'top_logprobs' needs 'logprobs' set to true.", "top_logprobs",
+                                   code="invalid_value")
+        if not lp:
+            return None
+        if req.stream:
+            raise BackendError("'logprobs' is not supported with 'stream' on this server.", "logprobs",
+                               code="unsupported_parameter")
+        return top or 0
+
+    def _logprob_entry(self, logits, t: int, top: int) -> Dict[str, Any]:
+        """OpenAI's logprobs content entry of token t from the step's logits (the
+        model's distribution, before the sampler's penalties)."""
+        import numpy as np
+        x = logits[:self.tok.vocab_size]
+        m = x.max()
+        lp = x - (m + np.log(np.exp(x - m).sum()))
+
+        def ent(i):
+            b = self.tok.token_bytes(int(i))
+            return {"token": b.decode("utf-8", "replace"), "logprob": round(float(lp[i]), 4), "bytes": list(b)}
+        e = ent(t)
+        if top:
+            idx = np.argpartition(-lp, top - 1)[:top]
+            e["top_logprobs"] = [ent(i) for i in idx[np.argsort(-lp[idx], kind="stable")]]
+        else:
+            e["top_logprobs"] = []
+        return e
 
     # ── prompt -> tokens (FPGA) ──
 
@@ -476,11 +518,18 @@ class Smollm2Backend(Backend):
         loop_p = 0
         t_first: Optional[float] = None
         finish = None
+        top = job.extra.get("top_logprobs")
+        lp_entries: List[Dict[str, Any]] = []
+        if top is not None:
+            import numpy as _np
         while True:
             ts = time.monotonic()
             recent = history if last_n < 0 else (history[-last_n:] if last_n > 0 else ())
             hist = history if dry_n < 0 else (history[-dry_n:] if dry_n > 0 else ())
+            raw = _np.array(logits, dtype=_np.float64) if top is not None else None   # the sampler may penalise in place
             t = smp.sample(logits, recent, p, hist=hist)
+            if top is not None and t not in self.eog:
+                lp_entries.append(self._logprob_entry(raw, t, top))
             smp_ms += (time.monotonic() - ts) * 1000.0
             if t_first is None:
                 t_first = time.monotonic()
@@ -549,4 +598,6 @@ class Smollm2Backend(Backend):
                         "decode": f"{rate:.1f}tok/s", "why": finish}}
         if job.dropped:
             info["log"]["trimmed"] = job.dropped
+        if top is not None:
+            info["logprobs"] = {"content": lp_entries, "refusal": None}
         yield Finish(reason, len(prompt), n_gen, info)

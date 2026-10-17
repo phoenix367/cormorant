@@ -234,7 +234,7 @@ SystemVerilog kernels, with Verilator 5.x).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1880 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1883 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -270,7 +270,15 @@ See [doc/build-and-test/BUILD_TARGETS.md](doc/build-and-test/BUILD_TARGETS.md) f
 
 The KV260 runs the Kria Ubuntu 22.04 image (kernel 5.15 `xilinx-zynqmp`) with
 XRT 2.13 (`sudo apt install xrt`), gcc and CMake.  For the BERT and chat demos
-reserve 1 GB of CMA with `cma=1000M` on the kernel command line.
+reserve 1.4 GB of CMA with `cma=1400M` on the kernel command line.  Ubuntu's
+image sets 1000M; this sets the boot script, reboots and checks the size
+(then load the bitstream again):
+
+```bash
+cd inference-scheduler
+.venv/bin/python -m src.remote.cma_boot --config bitstream_config_kv260.json               # report
+.venv/bin/python -m src.remote.cma_boot --config bitstream_config_kv260.json --set 1400M --reboot
+```
 
 Keep the cores out of the PSCI core power-down idle state.  With the board's
 boot firmware (TF-A v2.8, 2023.2) a core can be parked there for good and
@@ -314,8 +322,8 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1880<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->225<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1883<!-- /fact --> tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->229<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

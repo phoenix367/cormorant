@@ -41,7 +41,7 @@ board, a three-question conversation that the model remembers.
 flowchart LR
     clients["<b>Clients</b> · laptop or board shell<br/>chat.py · curl · openai SDK<br/>llm · aichat"]
     subgraph board["KV260 · Ubuntu 22.04 · Python 3.10 standard library"]
-        server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech · /v1/audio/transcriptions<br/>FIFO: one request on the FPGA at a time"]
+        server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech · /v1/audio/transcriptions<br/>FIFO: one request on the FPGA at a time<br/>(a chat answer lends it to speech between tokens)"]
         bert["<b>bert_squad_backend.py</b><br/>squad_text.py: WordPiece,<br/>sliding windows, best span"]
         llm["<b>smollm2_backend.py</b><br/>chatml.py, BPE tokenizer,<br/>prefix cache, libsampler.so"]
         vlm["<b>smolvlm_backend.py</b><br/>idefics3.py, images"]
@@ -78,7 +78,7 @@ flowchart LR
 
 You need:
 - a KV260 prepared as in the [repo README](../../README.md#quick-start):
-  the bitstream loaded and `cma=1000M` on the kernel command line;
+  the bitstream loaded and `cma=1400M` on the kernel command line;
 - the BERT demo's config, `../bert_squad/bert_squad_config.json`, with the
   board's ssh address, UIO names and driver paths
   ([bert_squad README](../bert_squad/README.md#run));
@@ -139,7 +139,7 @@ for.
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 225 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 229 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

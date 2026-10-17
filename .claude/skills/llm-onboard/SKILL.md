@@ -201,7 +201,7 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
 - Reference (360M, bitstream `1d28630fbfa4`): decode 254 / 315 ms at 32 /
   1000, prefill 0.58 / 1.04 / 3.08 s, CMA used 736–740 MB.
 
-**CMA budget** (`cma=1000M`, ~954 MiB usable, idle CmaFree ~1011 MB, less
+**CMA budget** (`cma=1400M`, ~1335 MiB usable, idle CmaFree ~1390 MB, less
 with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 299,
 SmolLM2-360M 758, SmolVLM 495 MiB.  The backend's `cma_mb` = measured CMA
 drop + margin (299 → 330, 758 → 775, 495 → 550); `--resident auto` evicts
