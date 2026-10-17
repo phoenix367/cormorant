@@ -1,8 +1,110 @@
 {
  "platform": "kv260",
- "date": "2026-10-12",
+ "date": "2026-10-17",
  "threads": 4,
  "exact": {
+  "AsrArgmaxNode:1x32768->1": {
+   "us": 158.282
+  },
+  "AsrFrameCountNode:1->1": {
+   "us": 0.579
+  },
+  "AsrFramesNode:197119;1->1x64x14x221": {
+   "us": 1557.541
+  },
+  "AsrFramesNode:197119;1->1x64x20x155": {
+   "us": 1584.781
+  },
+  "AsrFramesNode:393727;1->1x64x28x221": {
+   "us": 3257.083
+  },
+  "AsrFramesNode:393727;1->1x64x40x155": {
+   "us": 3192.232
+  },
+  "AsrFramesNode:49663;1->1x64x4x195": {
+   "us": 384.172
+  },
+  "AsrFramesNode:49663;1->1x64x5x156": {
+   "us": 391.672
+  },
+  "AsrFramesNode:98815;1->1x64x10x156": {
+   "us": 815.716
+  },
+  "AsrFramesNode:98815;1->1x64x7x222": {
+   "us": 800.926
+  },
+  "AsrStemGeluNode:1x288x1x128;1->128x288": {
+   "us": 992.467
+  },
+  "AsrStemGeluNode:1x288x2x128;1->256x288": {
+   "us": 1761.712
+  },
+  "AsrStemGeluNode:1x288x3x171;1->512x288": {
+   "us": 3419.323
+  },
+  "AsrStemGeluNode:1x288x5x205;1->1024x288": {
+   "us": 6647.616
+  },
+  "AsrStemGeluNode:1x416x1x128;1->128x416": {
+   "us": 1293.299
+  },
+  "AsrStemGeluNode:1x416x2x128;1->256x416": {
+   "us": 2555.228
+  },
+  "AsrStemGeluNode:1x416x4x128;1->512x416": {
+   "us": 5003.024
+  },
+  "AsrStemGeluNode:1x416x7x147;1->1024x416": {
+   "us": 9875.818
+  },
+  "AsrStemGeluNode:1x576x10x103;1->1x576x3x343": {
+   "us": 11303.488
+  },
+  "AsrStemGeluNode:1x576x19x108;1->1x576x5x411": {
+   "us": 21683.65
+  },
+  "AsrStemGeluNode:1x576x3x86;1->1x576x1x257": {
+   "us": 3162.042
+  },
+  "AsrStemGeluNode:1x576x5x103;1->1x576x2x257": {
+   "us": 6037.491
+  },
+  "AsrStemGeluNode:1x832x14x74;1->1x832x4x257": {
+   "us": 15884.179
+  },
+  "AsrStemGeluNode:1x832x27x76;1->1x832x7x295": {
+   "us": 30447.71
+  },
+  "AsrStemGeluNode:1x832x4x65;1->1x832x1x257": {
+   "us": 4321.17
+  },
+  "AsrStemGeluNode:1x832x7x74;1->1x832x2x257": {
+   "us": 8284.847
+  },
+  "AsrStemNormNode:1x288x14x220;1->1x288x10x313": {
+   "us": 49984.485
+  },
+  "AsrStemNormNode:1x288x28x220;1->1x288x19x328": {
+   "us": 100192.67
+  },
+  "AsrStemNormNode:1x288x4x194;1->1x288x3x262": {
+   "us": 12322.485
+  },
+  "AsrStemNormNode:1x288x7x221;1->1x288x5x313": {
+   "us": 24687.24
+  },
+  "AsrStemNormNode:1x416x10x155;1->1x416x7x226": {
+   "us": 35784.317
+  },
+  "AsrStemNormNode:1x416x20x154;1->1x416x14x226": {
+   "us": 72436.34
+  },
+  "AsrStemNormNode:1x416x40x154;1->1x416x27x232": {
+   "us": 144288.524
+  },
+  "AsrStemNormNode:1x416x5x155;1->1x416x4x199": {
+   "us": 17868.253
+  },
   "CastNode:1x1x256->1x1x256": {
    "us": 8.206
   },
@@ -66,6 +168,9 @@
   "LlmAttnSoftmaxNode:1024x192;1;1->192x1024": {
    "us": 289.38
   },
+  "LlmAttnSoftmaxNode:1024x1;1->1x1024": {
+   "us": 30.239
+  },
   "LlmAttnSoftmaxNode:1024x3;1->3x1024": {
    "us": 18.568
   },
@@ -75,11 +180,20 @@
   "LlmAttnSoftmaxNode:1024x768;1;1->768x1024": {
    "us": 1513.345
   },
+  "LlmAttnSoftmaxNode:256x1;1->1x256": {
+   "us": 6.639
+  },
   "LlmDequantNode:1x49152->1x49152": {
    "us": 755.948
   },
   "LlmDequantNode:1x49280->1x49280": {
    "us": 758.308
+  },
+  "LlmEmbedNode:1->1x288": {
+   "us": 10.756
+  },
+  "LlmEmbedNode:1->1x416": {
+   "us": 13.955
   },
   "LlmEmbedNode:1->1x576": {
    "us": 23.974
@@ -515,6 +629,50 @@
   }
  },
  "kinds": {
+  "AsrFramesNode": {
+   "coef": [
+    0.0,
+    0.007979130089078018,
+    0.0,
+    0.0
+   ],
+   "n": 8,
+   "median_rel": 0.015692654956757122,
+   "max_rel": 0.03682250150134487
+  },
+  "AsrStemNormNode": {
+   "coef": [
+    0.0464618432913755,
+    0.009252519079973954,
+    0.0,
+    0.0
+   ],
+   "n": 8,
+   "median_rel": 0.00919978193753183,
+   "max_rel": 0.012635449297910462
+  },
+  "AsrStemGeluNode": {
+   "coef": [
+    0.018843028412293523,
+    0.0,
+    1.0436003641947318,
+    175.8916411207372
+   ],
+   "n": 16,
+   "median_rel": 0.0344636135159795,
+   "max_rel": 0.06237802921136704
+  },
+  "AsrFrameCountNode": {
+   "coef": [
+    0.4626214192289939,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "n": 8,
+   "median_rel": 0.17253945705510265,
+   "max_rel": 0.5373785807710061
+  },
   "LlmEmbedNode": {
    "coef": [
     0.0,
@@ -526,17 +684,6 @@
    "median_rel": 0.09289463778338382,
    "max_rel": 0.6928118449686188
   },
-  "LlmAttnPrepNode": {
-   "coef": [
-    0.0004695293021430749,
-    0.0158991927315247,
-    0.0,
-    0.0
-   ],
-   "n": 180,
-   "median_rel": 0.025181049311358367,
-   "max_rel": 0.440940510709339
-  },
   "LlmAttnSoftmaxNode": {
    "coef": [
     0.0,
@@ -547,6 +694,28 @@
    "n": 540,
    "median_rel": 0.20379363239278198,
    "max_rel": 0.6832917722199796
+  },
+  "AsrArgmaxNode": {
+   "coef": [
+    0.0048303952602044495,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "n": 2,
+   "median_rel": 0.0005843979492950976,
+   "max_rel": 0.0005847394703747397
+  },
+  "LlmAttnPrepNode": {
+   "coef": [
+    0.0004695293021430749,
+    0.0158991927315247,
+    0.0,
+    0.0
+   ],
+   "n": 180,
+   "median_rel": 0.025181049311358367,
+   "max_rel": 0.440940510709339
   },
   "LlmAttnMergeNode": {
    "coef": [

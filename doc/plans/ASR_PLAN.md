@@ -354,7 +354,7 @@ on the host, stop at `</s>` or 6.5 tokens per second of audio).  Gates:
 `asr_host_emu.py` (the library on the host emulation equals the
 specification on N utterances), the R5 policy per entry (`rpu_policy.py`).
 
-**Phase 3 — the board.**  `asr_board.py` (board lock, the chat server
+**Phase 3 — the board** (done: §6).  `asr_board.py` (board lock, the chat server
 stopped and restored): bit-exact against the specification on 20
 utterances, the WER of all 200 on the board, latency per bucket; the
 performance model topped up with the new shapes (`perf_calibrate.py`
@@ -552,4 +552,119 @@ a token.
 PY=inference-scheduler/.venv/bin/python
 $PY demo/asr/scripts/generate_asr_project.py --model moonshine-base      # 52 s -> demo/asr/build/moonshine-base_project
 $PY demo/asr/scripts/asr_host_emu.py --project demo/asr/build/moonshine-base_project   # 5 min (tiny 2.4 min)
+```
+
+## 6. Phase 3: the board (2026-10-17)
+
+**Done.**  Both libraries on the KV260 (production bitstream `04259a7af917`):
+every token id of the 200 evaluation utterances bit-exact with the
+specification, so the board's WER is the specification's — moonshine-base
+**2.93 %** (float 3.02 %), moonshine-tiny **4.58 %** (float 4.49 %) — at an
+RTF of **0.131** (base, 1.10 s per utterance) and **0.074** (tiny, 0.63 s).
+
+### The gate (`demo/asr/scripts/asr_board.py`)
+
+Under the board lock, with the chat server stopped: the project uploaded
+to `/root/kv260_asr/<model>_project`, the weights to
+`/root/moonshine_<size>_weights`, `asr_bench` and `libmoonshine_<size>.so`
+built on the board (and a profiling build), the library copied to
+`/root/kv260_asr/lib/`; `asr_bench` on the 200 utterances, two repetitions
+and a re-open; the specification's ids computed on the host in parallel and
+cached (`<project>/reference/`, keyed by the formats and the specification's
+sources); with `--profile` a profiled run over the fullest one-part
+utterance of each bucket.  `asr_study.py score` (in `.venv-export`) decodes
+the board's ids and computes the WER as the study does.
+
+| | moonshine-tiny | moonshine-base |
+|---|---:|---:|
+| ids bit-exact with the specification | 200 / 200 | 200 / 200 |
+| repetitions / re-open identical | yes / yes | yes / yes |
+| WER (board = specification) | 4.58 % (203 errors) | 2.93 % (130 errors) |
+| `encode_128` / `_256` / `_512` / `_1024`, median of the one-part utterances | 60 / 120 / 242 / 578 ms | 108 / 206 / 439 / 961 ms |
+| a decode step, median | 10.0 ms | 18.3 ms |
+| per utterance (mean of 200, 8.4 s of audio), RTF | 626 ms, 0.074 | 1098 ms, 0.131 |
+| `asr_open` warm / cold | 0.22 s / — | 0.40 s / 12.5 s |
+| CMA | — | 184.9 MiB (the pool: 185.5 MiB) |
+| board build (`-j1`), cc1 peak | 69 s, 250 MB | 89 s, 327 MB |
+| `asr_bench` (200 × 2 + re-open) | 252 s | 447 s |
+
+- **The A53 drove every kernel**: `deploy.py --stop` stops the R5
+  firmware with the server.  The libraries' policy puts the encode entries
+  on the R5 when its firmware runs (phase 4, the chat server).
+- **`asr_open` cold** is the weights read from the SD card (190 MB at
+  ~15 MB/s, the page cache dropped); 6.0 s on the first open after the
+  upload, 0.40 s warm.  The CMA readings of the other runs (220–240 MiB
+  base, 128 MiB tiny) include page-cache pages in the CMA area; the one
+  after a dropped cache equals the pool.
+- **Against §2's projection** (base 0.87 s, RTF 0.10, from proxy graphs
+  priced by the performance model): the board is 26 % slower; against the
+  generated project's own predictions (§5, the model before this phase's
+  top-up, every bucket full) the encode medians are −18…+1 % off (the
+  largest bucket the most) and the decode step within 2 %.
+- **The study's transcripts**: tiny's board transcripts equal the
+  study's `opt` texts on 196 / 200 utterances (four differ by a word or a
+  comma, the error count is the same), base's on 200 / 200: the study's
+  tiny run predates the specification's last edit of phase 1, which the
+  board and the cached references follow.
+
+### The performance model and the simulator
+
+Moonshine tiny / base are shipped models of `perf_calibrate.py` (`SHIPPED`,
+their entries built as `generate_asr_project.py` builds them), so the
+bitstream's model `kv260/04259a7af917` prices their calls exactly:
+
+- **Cases**: `cases` 2599 (tiny 454 and base 390 new calls — the attention's
+  at every runtime key count, 64 … 1024 —, the other models' calls since the
+  last campaign), two refinement rounds (+223, +82) → 2904 cases, the 1059
+  not measured yet run in two board sessions (`run --resume`: 2 × 38 s and
+  2 × 3 s); `fit` → **2995 exact calls** (1936 before), repeat spread median
+  0.085 %.  The other models' predictions are unchanged (ResNet-18,
+  MobileNet v1 / v2, BERT within ±0.3 % of their board runs, as before).
+- **Host ops**: `host --merge` with both libraries' profiles adds the
+  kinds `AsrFrames`, `AsrStemNorm`, `AsrStemGelu`, `AsrFrameCount` and
+  `AsrArgmax` (208 exact signatures, 46 kinds; 170 / 41 before).  The
+  stem's host ops scale with the valid frames (`AsrStemNorm` 8.3 ms at 78
+  frames, 12.3 ms at 126 in the 128 bucket), so the profiled run takes each
+  bucket's fullest one-part utterance — a first profile over shorter ones
+  priced the full buckets 5–13 % low.
+- **`simulate`** (`asr_board.py --out` results, the new rows of
+  `perf_calibrate.py`: per bucket its fullest one-part utterance, the
+  attention at its frames; a decode step of the utterance the profile
+  decodes, at half its steps):
+
+  | | tiny predicted | measured | error | base predicted | measured | error |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `encode_128` (3.1 s) | 59.5 ms | 62.7 ms | −5.2 % | 106.7 ms | 112.0 ms | −4.7 % |
+  | `encode_256` (6.1 s) | 122.2 ms | 129.9 ms | −6.0 % | 209.5 ms | 220.7 ms | −5.0 % |
+  | `encode_512` (12.2 s) | 268.2 ms | 273.0 ms | −1.7 % | 473.3 ms | 483.9 ms | −2.2 % |
+  | `encode_1024` (24.5 s) | 724.4 ms | 726.5 ms | −0.3 % | 1169.6 ms | 1174.2 ms | −0.4 % |
+  | decode step (pos ~24) | 11.9 ms | 12.1 ms | −1.8 % | 21.2 ms | 21.6 ms | −1.9 % |
+
+  The small buckets miss the ±2 % target: their per-layer attention —
+  q·Kᵀ, the softmax and P·V per head, short dependent calls on two kernels,
+  and the RoPE / cache prep chains — costs 14–26 µs a call more in the
+  graph than the calibration's back-to-back measurement (issue and
+  wake-up), a share that shrinks with the bucket.  The profile charges the
+  cross-cache prep with the ConvKernel calls it overlaps (its end is
+  recorded after the next layer's MatMuls); the simulator's lanes do not.
+- **The decode step depends on the audio**: 10.0 ms median over the
+  200 utterances, 12.1 ms over the 48 steps of a 12.2 s one (tiny) — the
+  cross attention reads the utterance's frames, the self attention its
+  positions.
+
+### Commands and runtimes
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+cd demo/chat && $PY deploy.py --stop && cd ../..                    # the server owns the FPGA
+$PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project --profile \
+    --out /tmp/board_base.json                    # spec 5 min (cached after), build 3 min, bench 7.5 min
+.venv-export/bin/python demo/asr/scripts/asr_study.py score --model moonshine-base --ids /tmp/board_base.json
+cd inference-scheduler
+.venv/bin/python perf_calibrate.py cases && .venv/bin/python perf_calibrate.py cases --refine   # 7 + 17-25 min
+.venv/bin/python perf_calibrate.py run --config perf_config.json --resume                      # 2 x 38 s
+.venv/bin/python perf_calibrate.py fit
+.venv/bin/python perf_calibrate.py host --merge --profile moonshine-base=/tmp/board_base.json ...
+.venv/bin/python perf_calibrate.py simulate --profile moonshine-base=/tmp/board_base.json ...
+cd ../demo/chat && $PY deploy.py                  # the server back
 ```

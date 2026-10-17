@@ -23,9 +23,14 @@ with the row-ops unit's GATE op and SCALE flag, every existing call as fast as b
 both models measured: median 0.00 %, p90 +0.40 %): `cases` 1755 (the shipped calls with
 `kernels.rowops.gate` / `scale` — Piper's 16 gates as one GATE call of 54.1 µs, its stage averages as
 T jobs and scaled ADDX jobs, the last 1.63 + 2.38 ms —, the space-filling set, the 30 chain cases), one
-refinement round (+211) → **1936 exact calls**, repeat spread median 0.09 %.  Families as before (train /
+refinement round (+211) → 1936 exact calls, repeat spread median 0.09 %.  Families as before (train /
 held-out p90: conv 3.1 / 26.6 %, conv-mm 3.3 / 34.9 %, mm-gemv 4.8 / 18.2 %, mm-tiled 1.8 / 8.0 %, pool
 4.0 / 42.3 %, vecop 0.7 / 20.7 %, rowops 232 calls, train median 2.6 %); the chain term −1.96 / +0.95 µs.
+The Moonshine top-up of the same day (doc/plans/ASR_PLAN.md §6: moonshine-tiny / -base shipped, their
+attention at every runtime key count): `cases` 2599, two refinement rounds (+223, +82) → 2904 cases →
+**2995 exact calls**, repeat spread median 0.085 %; `host.json` 208 exact signatures, 46 kinds (the five
+`Asr*` host ops); `simulate` within ±2.2 % for the 512 / 1024-frame buckets and the decode step, −5…−6 %
+for the 128 / 256 buckets (the attention's short in-graph calls).
 
 `kv260/33a799febc56` before it (2026-10-16, RPU_PLAN §13 track A2: `de968ccc45da`'s
 with ConvKernel's y channel pattern and the row-ops unit's descriptor chains, every existing call as

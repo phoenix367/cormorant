@@ -28,7 +28,9 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 Current model: **kv260/04259a7af917** (2026-10-17), `33a799febc56`'s design with the row-ops unit's GATE
 op and SCALE flag (RPU_PLAN §14): `cases` (1755, with `kernels.rowops.gate` / `scale` true: Piper's GATE and
 scaled-average calls), `run`, `fit`, one refinement round (+211) → 1936 exact calls, the chain term as
-before.  The model before, kv260/33a799febc56 (2026-10-16), `de968ccc45da`'s design with ConvKernel's y channel
+before; the Moonshine top-up of the same day (doc/plans/ASR_PLAN.md §6: moonshine-tiny / -base added to
+`SHIPPED`, `cases` 2599, two refinement rounds +223 / +82, two short `run --resume` sessions) → 2995 exact
+calls, `host.json` merged with both libraries' profiles (`asr_board.py --profile --out`).  The model before, kv260/33a799febc56 (2026-10-16), `de968ccc45da`'s design with ConvKernel's y channel
 pattern and the row-ops unit's descriptor chains (RPU_PLAN §13): `cases` (1745, among them 30 chain cases —
 `calib_runner` case `Q`, keys `<call>#chain<k>` —, with `kernels.conv.y_pattern` / `kernels.rowops.chains`
 true), `run`, `fit`, one refinement round (+211) → 1926 calls, the `rowops_chain` term (a job in a
@@ -158,7 +160,7 @@ bitstream needs one there too.
    while another job holds it; the `deploy.py` it starts for `--stop-server`
    re-enters the lock (the holder marks its environment).  Do not wrap it in a
    shell `flock` on that file — that lock is not marked and it would wait forever.
-7. **Host**: `cases` and `cases --refine` load all ten shipped models (assets under
+7. **Host**: `cases` and `cases --refine` load all twelve shipped models (assets under
    `demo/*/assets`, `demo/chat/assets/<model>`, `demo/tts/assets`).
    - Measured 2026-10-01: 2.2 min for `cases` and 11.4 min for `cases --refine`, with
      an 8.8 GB peak RSS for each.

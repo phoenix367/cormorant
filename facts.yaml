@@ -221,7 +221,7 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: 'one refinement round \(\+211\) → (?P<exact_calls>\d+) exact calls'}
+       regex: 'Moonshine top-up of the same day .*?→ (?P<exact_calls>\d+) exact\s+calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead

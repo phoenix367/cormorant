@@ -23,6 +23,8 @@
   ablate     study with one group of tensor classes left float at a time
   formats    a policy's calibrated exponents -> demo/asr/<model>_<policy>_formats.json
              (src/moonshine.py's formats; provenance alongside)
+  score      the WER of a board run's token ids (asr_board.py's results JSON)
+             beside the study's float and policy WER on the same utterances
   window     Whisper with its encoder window cut to the audio, rounded up
              to buckets of N frames (whisper.cpp's audio_ctx; numpy
              float64): WER, transcripts equal to the 30 s window's
@@ -652,6 +654,34 @@ def _decode_whisper(name, ids):
     return _TOK[name].decode(ids, skip_special_tokens=True).strip()
 
 
+def cmd_score(args):
+    """The WER of a board run's ids (asr_board.py's results JSON: {"ids": {uid: ids}}):
+    decoded with the checkpoint's tokenizer, normalised as the study, against the
+    references; beside the study's float and policy WER on the same utterances."""
+    from tokenizers import Tokenizer
+    run = json.load(open(args.ids))
+    ids = run["ids"]
+    tok = Tokenizer.from_file(os.path.join(model_dir(args.assets, args.model), "tokenizer.json"))
+    refs = transcripts(args.assets, INPUTS["librispeech"]["evaluation"]["part"])
+    uids = [u for u in ids if u in refs]
+    texts = [tok.decode(ids[u], skip_special_tokens=True).strip() for u in uids]
+    w, errs = wer(texts, [refs[u] for u in uids])
+    print(f"{args.model}: {len(uids)} utterances, WER {100 * w:.2f} % ({sum(errs)} errors)")
+    res_path = os.path.join(args.assets, "study", args.model, "results.json")
+    if os.path.exists(res_path):
+        res = json.load(open(res_path))
+        for pname in ("float", args.policy):
+            r = res.get(pname, {}).get("texts", {})
+            if all(u in r for u in uids):
+                ws, _ = wer([r[u] for u in uids], [refs[u] for u in uids])
+                same = sum(r[u] == t for u, t in zip(uids, texts, strict=True))
+                print(f"  study {pname:6s} WER {100 * ws:.2f} %, transcripts equal to the board's: {same}/{len(uids)}")
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump({"model": args.model, "utterances": len(uids), "wer": w, "errors": sum(errs),
+                       "texts": dict(zip(uids, texts, strict=True))}, f, indent=1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--assets", default=ASSETS)
@@ -680,12 +710,17 @@ def main():
     p.add_argument("--model", default="moonshine-base")
     p.add_argument("--policy", default="opt")
     p.add_argument("--out", default=None, help="default demo/asr/<model>_<policy>_formats.json")
+    p = sub.add_parser("score")
+    p.add_argument("--model", default="moonshine-base")
+    p.add_argument("--ids", required=True, help="asr_board.py's results JSON")
+    p.add_argument("--policy", default="opt", help="the study's policy to compare with")
+    p.add_argument("--out", default=None)
     args = ap.parse_args()
     if args.cmd == "ablate":
         args.policies = ",".join("ablate:" + "+".join(g) for g in ABLATE)
         args.cmd = "study"
     {"fetch": cmd_fetch, "select": cmd_select, "screen": cmd_screen, "validate": cmd_validate,
-     "window": cmd_window, "study": cmd_study, "formats": cmd_formats}[args.cmd](args)
+     "window": cmd_window, "study": cmd_study, "formats": cmd_formats, "score": cmd_score}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -15,16 +15,20 @@ on the board, fit the models, write perf_models/<platform>/<bitstream-id>.json.
   fit     fit the kernel models and write the model file + validation report
   host    fit the host-op model (perf_models/<platform>/host.json) from board
           profiles: llm_board.py --profile --out (chat models), tts_board.py
-          --profile --out (piper-lessac-medium), a demo's results.json
-          (--profile-layers); --merge keeps every op kind fitted before
+          --profile --out (piper-lessac-medium), asr_board.py --profile --out
+          (moonshine-tiny / -base), a demo's results.json (--profile-layers);
+          --merge keeps every op kind fitted before
   simulate  predicted vs measured totals per phase (prefill, decode,
-          llm_image, inference, piper's chunk and encode buckets)
+          llm_image, inference, piper's chunk and encode buckets, Moonshine's
+          encode buckets and decode step)
   rowops  the replay of every shipped entry with the host row ops priced as a
           row-ops unit on one PS port (doc/plans/HOSTOPS_PLAN.md §3)
 
 The shipped models (SHIPPED) are the demos' CNNs, BERT, SmolLM2-135M /
-360M, SmolVLM-256M and Piper (the chunk and encode_<T> entries of
-libpiper_tts.so, built by demo/tts/scripts/generate_tts_project.py).
+360M, SmolVLM-256M, Piper (the chunk and encode_<T> entries of
+libpiper_tts.so, built by demo/tts/scripts/generate_tts_project.py) and
+Moonshine tiny / base (the encode_<T> and decode entries of
+libmoonshine_<size>.so, demo/asr/scripts/generate_asr_project.py).
 
 usage:
   .venv/bin/python perf_calibrate.py cases [--models ...]
@@ -64,6 +68,7 @@ PLATFORM = "kv260"
 MODELS_DIR = HERE / "perf_models" / PLATFORM
 CHAT = REPO / "demo" / "chat"
 TTS = REPO / "demo" / "tts"
+ASR = REPO / "demo" / "asr"
 RUNNER_VERSION = 1
 KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P",
            "RowOpsKernel": "R"}
@@ -73,7 +78,7 @@ MHZ = local_kernel_clock_mhz() or 100.0
 
 SHIPPED = ("mnist_convnet", "mnist_lenet", "mobilenet_v1", "mobilenet_v2", "resnet18", "bert",
            "smollm2-135m-instruct", "smolvlm-256m-instruct", "smollm2-360m-instruct",
-           "piper-lessac-medium")
+           "piper-lessac-medium", "moonshine-tiny", "moonshine-base")
 
 
 def log(msg: str) -> None:
@@ -110,6 +115,17 @@ def piper_graphs() -> List[Tuple[str, object]]:
     return gtp.entry_graphs(gtp.DEFAULT_ASSETS)
 
 
+def asr_graphs(name: str) -> List[Tuple[str, object]]:
+    """Moonshine's entries (encode_<T>, decode) exactly as libmoonshine_<size>.so is
+    generated (demo/asr/scripts/generate_asr_project.py: the encode buckets share
+    the largest bucket's weight layouts)."""
+    if str(ASR / "scripts") not in sys.path:
+        sys.path.insert(0, str(ASR / "scripts"))
+    import generate_asr_project as gap
+    cfg, W, fmt = gap.load(str(ASR / "assets" / name), gap.default_formats(name))
+    return gap.entry_graphs(cfg, W, fmt, name=gap.lib_name(name))
+
+
 def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
     """``(entry, OnnxGraph)`` of a shipped model, scheduled as its demo does."""
     from src.graph import OnnxGraph
@@ -139,6 +155,8 @@ def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
             yield e, g
     elif name.startswith("piper-"):
         yield from piper_graphs()
+    elif name.startswith("moonshine-"):
+        yield from asr_graphs(name)
     else:
         raise KeyError(f"unknown shipped model {name!r} (choose from {SHIPPED})")
 
@@ -741,6 +759,10 @@ def _entry_graphs(model: str, planned: bool) -> Dict[str, object]:
         if planned:
             raise SystemExit(f"error: {model}: generate_tts_project.py has no planned build")
         return dict(piper_graphs())
+    if model.startswith("moonshine-"):
+        if planned:
+            raise SystemExit(f"error: {model}: generate_asr_project.py has no planned build")
+        return dict(asr_graphs(model))
     if not (model.startswith("smollm2-") or model.startswith("smolvlm-")):
         from src.graph import OnnxGraph
         (name, g), = shipped_graphs(model)
@@ -884,6 +906,9 @@ def cmd_simulate(args) -> int:
             tl.cg, tl.keys_of = cg, keys_of            # for --html: the calls as priced
             return tl
         tag = f"{model}{' plan' if planned else ''}"
+        if model.startswith("moonshine-"):      # asr_board.py --out: encode buckets, decode steps
+            rows += _asr_rows(tag, b, cgs, run, prof, pm, hm)
+            continue
         if "vision" in cgs and b.get("images"):
             tl = run("vision")
             meas = min(x["ms"] for x in b["images"])
@@ -915,6 +940,44 @@ def cmd_simulate(args) -> int:
         log(f"timeline -> {args.html} ({len(entries)} phases, "
             f"{sum(e['measured_nodes'] for e in entries)} nodes with measured times)")
     return 0
+
+
+def _asr_rows(tag: str, b: dict, cgs: dict, run, prof: dict, pm, hm) -> list:
+    """simulate's rows of an asr_board.py run: per encode bucket the one-part
+    utterance nearest a full bucket (the attention runs over its frames, the
+    rest of the entry over all T rows), and a decode step of the second largest
+    bucket's (its self keys at half its steps, its frames as the cross keys)
+    against its mean step — the utterances asr_board.py --profile profiles, so
+    the host ops are priced at their frame counts and positions."""
+    from src.llm_nodes import attn_keys
+    from src.moonshine import ENC_C, samples, stem_frames
+    one = [u for u in b.get("utts", []) if u.get("parts") == 1 and u.get("steps")]
+    buckets = sorted(int(e.split("_")[1]) for e in cgs if e.startswith("encode_"))
+    fullest = {}
+    for u in one:
+        T = next((t for t in buckets if samples(t) >= u["samples"]), None)
+        if T is not None and u["samples"] >= fullest.get(T, {"samples": -1})["samples"]:
+            fullest[T] = u
+    rows = []
+    for T, u in sorted(fullest.items()):
+        entry = f"encode_{T}"
+        tl = run(entry, 0, stem_frames(u["samples"])[2])
+        rows.append((tag, f"encode {T} ({u['samples'] / 16000:.1f} s)", tl.total_us / 1e3, u["encode_ms"], tl,
+                     tl.cg, prof.get(entry)))
+    if fullest and "decode" in cgs:
+        from src.codegen.timing import kernel_duration_fn, simulate
+        order = sorted(fullest)
+        u = fullest[order[-2] if len(order) > 1 else order[0]]
+        nf, pos = stem_frames(u["samples"])[2], u["steps"] // 2
+        cg = cgs["decode"]
+
+        def keys_of(sn):                      # the cross attention over the frames, the self over pos + 1
+            return attn_keys(nf - 1 if sn.C == ENC_C else pos, 1, sn.T, sn.C, sn.Q)[1]
+        tl = simulate(cg, kernel_duration_fn(pm, cg._layouts, keys_of=keys_of, chains=cg._ro_chains), hm.us)
+        tl.cg, tl.keys_of = cg, keys_of
+        rows.append((tag, f"decode step (pos {pos})", tl.total_us / 1e3, u["decode_ms"] / u["steps"], tl, cg,
+                     prof.get("decode")))
+    return rows
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1020,7 +1083,8 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", nargs="+", default=[], metavar="MODEL[:plan]=RESULTS",
                     help="host / simulate: llm_board.py --profile --out results of a shipped chat "
                          "model's project (':plan' when it was generated with --plan), "
-                         "tts_board.py --profile --out results for piper-lessac-medium, or a demo's "
+                         "tts_board.py --profile --out results for piper-lessac-medium, "
+                         "asr_board.py --profile --out results for moonshine-tiny / -base, or a demo's "
                          "results.json")
     ap.add_argument("--host-model", default=None,
                     help="host / simulate: the host-op model file (default perf_models/kv260/host.json)")
