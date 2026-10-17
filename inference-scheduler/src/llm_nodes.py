@@ -147,17 +147,19 @@ RUNTIME_GROUPS = {
 class HostTable:
     """A constant table in host memory (never a DMA buffer)."""
     name:  str               # C identifier (and weights/<name>.dat)
-    kind:  str               # "bf16" | "f32" | "i16" (integers, e.g. TtsPcm's lookup)
+    kind:  str               # "bf16" | "f32" | "i16" / "i32" (integers, e.g. TtsPcm's lookup)
     data:  np.ndarray        # the values (float64 / float32 / integers), flat
 
     @property
     def c_type(self) -> str:
-        return {"bf16": "uint16_t", "i16": "int16_t"}.get(self.kind, "float")
+        return {"bf16": "uint16_t", "i16": "int16_t", "i32": "int32_t"}.get(self.kind, "float")
 
     @property
     def storage(self) -> np.ndarray:
         if self.kind == "i16":
             return np.asarray(self.data, np.int16).reshape(-1)
+        if self.kind == "i32":
+            return np.asarray(self.data, np.int32).reshape(-1)
         v = np.asarray(self.data, np.float32).reshape(-1)
         if self.kind == "bf16":
             return (v.view(np.uint32) >> np.uint32(16)).astype(np.uint16)
@@ -189,7 +191,7 @@ class HostTable:
         s = self.storage
         if self.kind == "bf16":
             lits = [f"0x{int(v):04X}" for v in s]
-        elif self.kind == "i16":
+        elif self.kind in ("i16", "i32"):
             lits = [str(int(v)) for v in s]
         else:
             lits = [_c_float(float(v)) for v in s]
@@ -1263,7 +1265,12 @@ class LlmAttnSoftmaxNode(LlmNode):
     the P.V call's weight [G*T][keys] (raw at f_p, row stride keys — a
     runtime stride; the tensor is sized [G*T][C]).  Column p = h'*T + t,
     rows t < n: keys j <= pos + t, k = raw_max - raw, e = sexp_f_s[k], sum
-    left to right, P = round_half_even(e / sum * 2^f_p); other entries 0."""
+    left to right, P = round_half_even(e / sum * 2^f_p); other entries 0.
+    Attributes: ``causal`` = 0 — every row t < n over the keys j < pos + n
+    (an encoder's attention over its valid frames, src/moonshine.py; with
+    vsmx = 1 only: the unit's smx_mask, period 0);
+    ``logit_scale`` — the scores' scale (default head_dim^-1/2; a model whose
+    heads are padded for the kernels keeps its own head dim's)."""
     T:     int = 1
     G:     int = 1
     C:     int = 16
@@ -1273,6 +1280,7 @@ class LlmAttnSoftmaxNode(LlmNode):
     fs:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
     fp:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
     has_n: bool = True                                               # False: n = T (decode)
+    causal: bool = True                                              # False: rows over keys < pos + n
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -1288,9 +1296,11 @@ class LlmAttnSoftmaxNode(LlmNode):
                  f"scores [{C}][{G * T}] -> P [{G * T}][{C}]")
         Q = int(a.get("key_quantum", KEY_QUANTUM))
         _require(C % Q == 0 and Q % KEY_QUANTUM == 0, node, f"cache rows {C} % key_quantum {Q}")
+        ls = a.get("logit_scale")                  # a double as a string attribute (exact)
+        scale = float(ls.decode() if isinstance(ls, bytes) else ls) if ls is not None else 1.0 / math.sqrt(HD)
         sn = cls(onnx_node=node, inputs=[s, pos] + ([n] if n is not None else []), output=y,
                  index=index, align_elems=align_elems, T=T, G=G, C=C, Q=Q, group=int(a["group"]),
-                 scale=1.0 / math.sqrt(HD), has_n=n is not None,
+                 scale=scale, has_n=n is not None, causal=int(a.get("causal", 1)) != 0,
                  fs=np.asarray(_attr_ints(a, "s_exp", node, G), np.int64),
                  fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits)
         sn._want(s, None, "scores")
@@ -1301,6 +1311,7 @@ class LlmAttnSoftmaxNode(LlmNode):
         from .smx_nodes import LlmAttnSoftmaxVopNode, vsmx_attr
         if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
             return LlmAttnSoftmaxVopNode.from_host(sn, node)
+        _require(sn.causal, node, "causal = 0 runs on VectorOPKernel's softmax unit only (vsmx = 1)")
         return sn
 
     def c_runtime(self):
@@ -1311,7 +1322,8 @@ class LlmAttnSoftmaxNode(LlmNode):
 
     def describe(self):
         return (f"group {self.group}: {self.G}x{self.T} query columns, score exponents "
-                f"{[int(v) for v in self.fs]}, P at 2^-{[int(v) for v in self.fp]}")
+                f"{[int(v) for v in self.fs]}, P at 2^-{[int(v) for v in self.fp]}"
+                + ("" if self.causal else ", every row over the keys < pos + n"))
 
     def c_call(self, ins, out, scratch, direct, dtype):
         ip = scale_item(self.fp)[1]
@@ -2564,6 +2576,16 @@ static unsigned llm_keys(unsigned pos, unsigned n, unsigned T, unsigned C, unsig
     if (k > C) k = C;
     if (k < q) k = q;
     return k;
+}
+
+/* The valid key count pos + n (n clamped as llm_keys, at least 1) of a non-causal
+ * attention softmax on VectorOPKernel's unit (smx_mask valid0, period 0). */
+static unsigned llm_keys_valid(unsigned pos, unsigned n, unsigned T, unsigned C)
+{
+    if (n > T) n = T;
+    if (pos >= C) n = 0u;
+    else if (n > C - pos) n = C - pos;
+    return pos + n ? (pos + n) & 0xFFFFu : 1u;
 }
 
 /* LlmAttnPrep: rows t < n -> the cache rows pos + t (RoPE(k0), v re-rounded,

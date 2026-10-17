@@ -21,6 +21,8 @@
              tokens, the encoder output's error, saturation
              -> study/<model>/results.json, transcripts.txt
   ablate     study with one group of tensor classes left float at a time
+  formats    a policy's calibrated exponents -> demo/asr/<model>_<policy>_formats.json
+             (src/moonshine.py's formats; provenance alongside)
   window     Whisper with its encoder window cut to the audio, rounded up
              to buckets of N frames (whisper.cpp's audio_ctx; numpy
              float64): WER, transcripts equal to the 30 s window's
@@ -39,6 +41,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -461,29 +464,36 @@ def _calib_one(pcm):
     import moonshine_q as mq
     m = _W["m"]
     m.ch, m.ms = {}, {}
-    mq.transcribe(m, _W["cfg"], pcm)
+    mq.transcribe_long(m, _W["cfg"], pcm)
     return m.ch, m.ms
 
 
 def _eval_one(args):
-    """One utterance under the worker's policy: greedy ids, teacher-forced agreement with
-    float's ids, the encoder output's relative error, saturation counts."""
+    """One utterance under the worker's policy: greedy ids (audio over 24.6 s in chunks
+    split at quiet points, moonshine_q.transcribe_long), teacher-forced agreement with float's ids and
+    the encoder output's relative error (single-chunk utterances; the first chunk's
+    encoder otherwise), saturation counts."""
     import moonshine_np as mn
     import moonshine_q as mq
     pcm, fids = args
     m, cfg = _W["m"], _W["cfg"]
     m.sat.clear()
     m.cnt.clear()
-    xf = m.encode(pcm)
-    xr = mn.encode(cfg, _W["W"], pcm)
+    parts = mq.chunks(pcm)
+    first = pcm[: parts[0][1]]
+    xf = m.encode(first)
+    xr = mn.encode(cfg, _W["W"], first)
     out = {"xf_rel": float(np.linalg.norm(xf - xr) / np.linalg.norm(xr))}
-    ids, _ = mq.transcribe(m, cfg, pcm, xf=xf)
+    if len(parts) == 1:
+        ids, _ = mq.transcribe(m, cfg, pcm, xf=xf)
+        if fids is not None:
+            _, am = mq.transcribe(m, cfg, pcm, forced=fids, xf=xf)
+            want = list(fids) + [cfg["eos_token_id"]]
+            out["tf_agree"] = int(sum(a == b for a, b in zip(am, want)))
+            out["tf_n"] = len(want)
+    else:
+        ids = mq.transcribe_long(m, cfg, pcm)
     out["ids"] = ids
-    if fids is not None:
-        _, am = mq.transcribe(m, cfg, pcm, forced=fids, xf=xf)
-        want = list(fids) + [cfg["eos_token_id"]]
-        out["tf_agree"] = int(sum(a == b for a, b in zip(am, want)))
-        out["tf_n"] = len(want)
     out["sat"], out["cnt"] = dict(m.sat), dict(m.cnt)
     return out
 
@@ -568,8 +578,9 @@ def cmd_study(args):
         r = dict(wer=w, same=same, n=len(utts), xf_rel=float(np.mean([o["xf_rel"] for o in outs])),
                  sat={k: [sat[k], cnt[k]] for k in sorted(sat) if sat[k]}, seconds=time.time() - t0,
                  texts={u: t for (u, _, _), t in zip(utts, texts)})
-        if "tf_agree" in outs[0]:
-            r["tf_top1"] = sum(o["tf_agree"] for o in outs) / sum(o["tf_n"] for o in outs)
+        if any("tf_agree" in o for o in outs):
+            r["tf_top1"] = (sum(o.get("tf_agree", 0) for o in outs)
+                            / sum(o.get("tf_n", 0) for o in outs))
         if pname == "float":
             r["ids"] = {u: o["ids"] for (u, _, _), o in zip(utts, outs)}
         res[pname] = r
@@ -587,6 +598,48 @@ def cmd_study(args):
                     t = res[pname]["texts"][u]
                     if t != ftexts[i]:
                         f.write(f"  {pname:5s} {t}\n")
+
+
+def formats_path(name, policy="opt"):
+    return os.path.normpath(os.path.join(HERE, "..", f"{name}_{policy.replace('+', '_')}_formats.json"))
+
+
+def cmd_formats(args):
+    """The calibrated exponents of a policy (moonshine_q.make_formats from calib.pkl) as
+    the frontend's formats JSON (src/moonshine.py MoonshineFormats): keys
+    class@<part><layer>, the provenance alongside."""
+    import pickle
+    import moonshine_np as mn
+    import moonshine_q as mq
+    name = args.model
+    cal_path = os.path.join(args.assets, "study", name, "calib.pkl")
+    if not os.path.exists(cal_path):
+        sys.exit(f"{cal_path}: run study first (the calibration)")
+    cal = pickle.load(open(cal_path, "rb"))
+    pol = POLICIES[args.policy]
+    cfg, W = mn.load(model_dir(args.assets, name))
+    fmt = mq.make_formats(mq.QM(cfg, W), cal["max"], pol, ms=cal["ms"])
+    exps = {}
+    for (cls, part, layer), v in sorted(fmt.items(), key=lambda kv: str(kv[0])):
+        exps[f"{cls}@{part}{layer}"] = int(v) if np.ndim(v) == 0 else [int(x) for x in np.asarray(v).reshape(-1)]
+    lib = INPUTS["librispeech"]
+    ids = lib["calibration"]["ids"]
+    out = {"model": name, "repo": INPUTS["models"][name]["repo"], "revision": INPUTS["models"][name]["revision"],
+           "checkpoint_sha256": INPUTS["models"][name]["files"]["model.safetensors"],
+           "policy": args.policy, "policy_def": {k: (v if not isinstance(v, dict) else
+                                                     {str(kk): vv for kk, vv in v.items()}) for k, v in pol.items()},
+           "calibration": {"part": lib["calibration"]["part"], "utterances": len(ids),
+                           "ids_sha256": hashlib.sha256(" ".join(ids).encode()).hexdigest(),
+                           "margin": mq.MARGIN},
+           "spec": "demo/asr/scripts/moonshine_q.py", "generated_by": "demo/asr/scripts/asr_study.py formats",
+           "exponents": exps}
+    path = args.out or formats_path(name, args.policy)
+    text = json.dumps(out, indent=1)
+    text = re.sub(r"\[\s+([-\d,\s]+?)\s+\]",                      # a vector on one line
+                  lambda m: "[" + ", ".join(x.strip() for x in m.group(1).split(",")) + "]", text)
+    with open(path, "w") as f:
+        f.write(text + "\n")
+    print(f"{name} {args.policy}: {len(exps)} exponent entries -> {os.path.relpath(path)}")
 
 
 _TOK = {}
@@ -623,12 +676,16 @@ def main():
     p.add_argument("--ablate-base", default="unit")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p = sub.add_parser("formats")
+    p.add_argument("--model", default="moonshine-base")
+    p.add_argument("--policy", default="opt")
+    p.add_argument("--out", default=None, help="default demo/asr/<model>_<policy>_formats.json")
     args = ap.parse_args()
     if args.cmd == "ablate":
         args.policies = ",".join("ablate:" + "+".join(g) for g in ABLATE)
         args.cmd = "study"
     {"fetch": cmd_fetch, "select": cmd_select, "screen": cmd_screen, "validate": cmd_validate,
-     "window": cmd_window, "study": cmd_study}[args.cmd](args)
+     "window": cmd_window, "study": cmd_study, "formats": cmd_formats}[args.cmd](args)
 
 
 if __name__ == "__main__":

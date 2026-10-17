@@ -284,7 +284,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1873 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1879 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1384,6 +1384,62 @@ inputs `left` / `right` `[1][3][H][W]` at `2^-12`, output `disparity`
     against a numpy ConvTranspose, the checkpoint reader on a synthetic
     torch zip, and the whole network with random weights of the real
     shapes, with and without per-channel weights, on host_emu.
+
+### Speech to text (Moonshine)
+
+`src/moonshine.py` builds the entries of a Moonshine speech-to-text model
+(tiny or base, `doc/plans/ASR_PLAN.md`) from its config, checkpoint and the
+calibrated formats (`demo/asr/moonshine-<size>_opt_formats.json`):
+`MoonshineFrontend(cfg, weights, formats).entries()` →
+`encode_<T>` for the buckets T = 128 / 256 / 512 / 1024 encoder frames
+(3.1–24.6 s of audio) and `decode`.  The specification is
+`demo/asr/scripts/moonshine_q.py`; `test/test_moonshine.py` checks both
+entries against it bit for bit and the generated C against the simulation.
+
+- **`encode_<T>`** — inputs `pcm` (int16 at `2^-15`, zero-padded), `n` (the
+  valid samples) and `pos` (0).  The output is the cross-attention K / V of
+  every decoder layer, written into DMA states that `decode` reads.
+  - **The conv stem.**  ConvKernel convs on rows folded to fit its
+    accumulator (Piper's fold), with per-channel exponents (`chexp`) and the
+    biases in the accumulator.
+    - `AsrFrames` writes conv1's 64-phase image of the PCM (127 taps at
+      stride 64 become a 1 × 2 conv).
+    - `AsrStemNorm`: tanh from an int16 table, then the utterance's
+      GroupNorm from exact integer sums.
+    - `AsrStemGelu`: GELU from an int32 table at `2^-16`, written into the
+      next conv's folded input or into the int32 residual.
+    - The tables are generator data, so nothing on the board calls libm
+      for them.
+  - **The layers.**  As a Llama prefill over the bucket's rows (`n` the valid
+    frames, `AsrFrameCount`):
+    - LayerNorm (no beta) and the residual adds on the row-ops unit;
+    - `LlmAttnPrep` with `rowops`: RoPE on the first `rot` of each head's
+      dims;
+    - q·Kᵀ / P·V on ConvKernel;
+    - `LlmAttnSoftmax` on the softmax unit with `causal = 0`: every query
+      row over the valid frames, `smx_mask` period 0;
+    - GELU on the activation unit: `VitGelu` with `approximate = "none"`,
+      the act GELU (erf).
+  - **Heads** are padded to a multiple of 16: 36 → 48, 52 → 64, as zero
+    rows of q / k / v.  Moonshine's interleaved partial rotation becomes the
+    unit's rotate-half on permuted head dims (`head_map`): its pairs (2j,
+    2j + 1) sit at (j, j + HDp / 2), and the pass-through and zero pairs
+    take cos 1, sin 0.  The scores keep the true head dim's scale
+    (`logit_scale`).
+- **`decode`** — inputs `ids`, `pos` and `xpos` (the encoder's valid frames
+  − 1); output `id` (`AsrArgmax`).
+  - The embedding goes into the int32 residual (`LlmEmbed`).
+  - Self attention is a Llama decode step on the unit (`LlmAttnPrep` with
+    one row, the host p12 softmax).
+  - Cross attention runs over the encoder's caches at "position" `xpos`:
+    - `AsrCrossQ` copies the q row into the q image;
+    - the keys are xpos + 1 valid.
+  - `AsrSwiGLU`: fc1's halves plus its bias as two row-ops COPYs with a
+    bias, then MULACT.
+  - The head is tied: the logits sit at one exponent.
+- **Limits.**  A bucket is at most 1024 frames: the softmax unit's column
+  mode reads at most 1024 keys.  Longer audio is split by the library at
+  quiet points (`moonshine_q.chunks`).
 
 ### Multi-entry projects
 

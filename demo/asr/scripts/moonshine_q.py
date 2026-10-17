@@ -17,10 +17,10 @@ Encoder (audio -> [T, d]):
            frame image [t1][2 x 64] (row-ops FOLD) -> c1
   tanh     host table on c1's raw int16 -> t at 2^-15
   GN       GroupNorm(1 group): host, the global mean / variance of t (exact
-           integer sums), per-channel affine -> gn
-  conv2/3  kernel convs (im2col MatMuls), bias + GELU (erf) on VectorOPKernel
-           where GELU's output is at 2^-8 (ADD bias, MUL 2^(8-f), act GELU),
-           else a host table -> g2, g3 = the encoder input h0 (int32 residual)
+           integer sums), per-channel affine -> gn (group_norm)
+  conv2/3  ConvKernel convs (the bias in the accumulator: kconv), GELU (erf) on
+           the host from an int32 table at 2^-16 -> g2 (int16), and conv3's
+           straight into the int32 residual h0 (stem_gelu)
   layers   x = LN(h) (row-ops NORM, no beta), q0 k0 v kernel; RoPE on q0 / k0
            (row-ops ROPE: the first 32 of 36 dims in interleaved pairs,
            permuted into rotate-half order) -> q, k per head; s = q.K^T per
@@ -32,12 +32,16 @@ Encoder (audio -> [T, d]):
 Decoder (one token per step):
   embed    host float32 table -> int32 residual at 2^-15
   self     y = LN(h); q0 k0 v kernel (GEMV); RoPE at the position; K / V
-           caches at k / vc; softmax over the pos + 1 keys
+           caches at k / vc; the host p12 softmax (LlmAttnSoftmax) over the
+           pos + 1 keys
   cross    y2 = LN(h); cq kernel (per head); s = cq.CK^T over the encoder
-           frames (CK / CV kernel outputs from xf, once per utterance)
+           frames (CK / CV kernel outputs from xf, once per utterance), the
+           host p12 softmax
   mlp      y3 = LN(h); fc1 -> u (x half) / g (gate half) + bias (row-ops COPY
            with bias); a = SiLU(g) * u (row-ops MULACT); fc2; h += d + b2
   head     yf = LN(h); logits = yf . E^T (tied, kernel GEMV); argmax
+Audio longer than MAX_FRAMES encoder frames (24.6 s) is transcribed in equal
+chunks (transcribe_long).
 """
 
 from __future__ import annotations
@@ -65,17 +69,57 @@ def p2(e):
 
 
 def gelu(x):
+    """GELU (erf) for the float paths (torch's erf, vectorised)."""
     return 0.5 * x * (1.0 + _erf(np.asarray(x, np.float64) / math.sqrt(2.0)))
+
+
+_ERF = np.vectorize(math.erf, otypes=[np.float64])
+_TANH = np.vectorize(math.tanh, otypes=[np.float64])
+
+
+def gelu_libm(x):
+    """GELU (erf) through libm, in the operation order of vectorop_act.act_values (the
+    unit's specification) — every table of the int16 path."""
+    x = np.asarray(x, np.float64)
+    return x * (0.5 * (1.0 + _ERF(x / math.sqrt(2.0))))
 
 
 _GT = {}
 
 
 def gelu_table(f):
-    """GELU (erf) of every raw int16 at 2^-f (index raw + 32768)."""
+    """GELU (erf) of every raw int16 at 2^-f (index raw + 32768); f = 8: the
+    activation unit's input grid (rounded at 2^-8 it is vectorop_act.kernel_table)."""
     if f not in _GT:
-        _GT[f] = gelu((np.arange(65536) - 32768) / 2.0 ** int(f))
+        _GT[f] = gelu_libm((np.arange(65536) - 32768) / 2.0 ** int(f))
     return _GT[f]
+
+
+_GT16 = {}
+GELU_BITS = 16                       # the stem GELU table's fixed point (int32 at 2^-16)
+
+
+def gelu16_table(f):
+    """The stem's GELU (erf) of every raw int16 at 2^-f as int32 at 2^-16 (round half
+    even, saturated) — the host op's table (computed here, shipped as data: no libm
+    erf on the board)."""
+    if f not in _GT16:
+        v = np.rint(gelu_libm((np.arange(65536) - 32768) / 2.0 ** int(f)) * 2.0 ** GELU_BITS)
+        _GT16[f] = np.clip(v, -2.0 ** 31, 2.0 ** 31 - 1).astype(np.int64)
+    return _GT16[f]
+
+
+def rne_shr(v, k):
+    """round half to even of v / 2^k (int64 v; k may be <= 0), elementwise k."""
+    v = np.asarray(v, np.int64)
+    k = np.broadcast_to(np.asarray(k, np.int64), v.shape)
+    up = np.where(k <= 0, v << np.maximum(-k, 0), 0)
+    kk = np.maximum(k, 1)
+    q = v >> kk
+    r = v - (q << kk)
+    half = np.int64(1) << (kk - 1)
+    rd = q + ((r > half) | ((r == half) & ((q & 1) == 1)))
+    return np.where(k <= 0, up, rd)
 
 
 _TT = {}
@@ -83,12 +127,25 @@ _TT = {}
 
 def tanh_table(f):
     if f not in _TT:
-        _TT[f] = np.tanh((np.arange(65536) - 32768) / 2.0 ** int(f))
+        _TT[f] = _TANH((np.arange(65536) - 32768) / 2.0 ** int(f))
     return _TT[f]
 
 
 def rne(x):
     return np.rint(x)                                  # numpy rounds half to even
+
+
+_SEXP = {}
+
+
+def sexp_table(f, scale):
+    """exp(-k 2^-f scale) for k in [0, 65535] — llm_nodes.sexp_table (libm exp, the
+    same operation order)."""
+    key = (int(f), float(scale))
+    if key not in _SEXP:
+        d = 2.0 ** int(f)
+        _SEXP[key] = np.array([math.exp(-k / d * scale) for k in range(65536)])
+    return _SEXP[key]
 
 
 def layer_norm_fast(x_raw, f_x, gamma, beta, eps, f_out):
@@ -126,20 +183,30 @@ def rope_perm(hd, rot):
     return order
 
 
-def rope_raw_tables(cfg, heads, positions):
-    """int24 cos / sin at 2^-23 [T, hd] in the permuted order (float32 tables as transformers)."""
+def rope_half_tables(cfg, heads, positions):
+    """float32 cos / sin [T][hd / 2] of the rotate-half pairs in the permuted order
+    (llama.rope_tables' scheme: inv_j = float32(1 / theta^(2j / rot)), a =
+    float32(float32(pos) * inv_j), cos = float32(cos(double(a))) libm); the
+    pass-through pairs cos 1, sin 0 — src/moonshine.py builds the same tables."""
     hd = cfg["hidden_size"] // heads
     rot = int(hd * cfg["partial_rotary_factor"])
-    inv = (1.0 / (np.float32(cfg["rope_theta"]) ** (np.arange(0, rot, 2, dtype=np.float32) / np.float32(rot))))
-    ang = (np.asarray(positions, np.float32)[:, None] * inv.astype(np.float32)[None, :]).astype(np.float32)
-    cs, sn = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
-    half, npair = hd // 2, rot // 2
+    th = float(cfg["rope_theta"])
+    inv = np.array([1.0 / (th ** (2 * j / rot)) for j in range(rot // 2)], np.float64).astype(np.float32)
+    ang = (np.asarray(positions, np.float32)[:, None] * inv[None, :]).astype(np.float32)
+    cs = np.vectorize(math.cos, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
+    sn = np.vectorize(math.sin, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
     T = len(positions)
-    c = np.ones((T, hd), np.float64)
-    s = np.zeros((T, hd), np.float64)
-    c[:, :npair], c[:, half:half + npair] = cs, cs
-    s[:, :npair], s[:, half:half + npair] = sn, sn
-    return ls.rowops().rope_tables_raw(c, s)
+    c = np.ones((T, hd // 2), np.float32)
+    s = np.zeros((T, hd // 2), np.float32)
+    c[:, :rot // 2], s[:, :rot // 2] = cs, sn
+    return c, s
+
+
+def rope_raw_tables(cfg, heads, positions):
+    """int24 cos / sin at 2^-23 [T][hd] (both halves) — the unit's B rows."""
+    c, s = rope_half_tables(cfg, heads, positions)
+    c2, s2 = np.concatenate([c, c], 1).astype(np.float64), np.concatenate([s, s], 1).astype(np.float64)
+    return ls.rowops().rope_tables_raw(c2, s2)
 
 
 # ------------------------------------------------------------------ the model
@@ -305,6 +372,62 @@ class QM:
             y = y + self._floor(xr @ Wl, fo + k, co + "_lo")
         return y
 
+    def kconv(self, x, key, ci, co, scope, bias):
+        """A ConvKernel conv with a bias: the kernel seeds the accumulator with the bias
+        rounded at the output's exponent (an int16, numeric.encode_conv_weights), one
+        floor and one saturation: clip(floor(acc / 2^8) + round(b * 2^f_out))."""
+        if not self.q or self.exact(co):
+            y = x @ self.w[key] + bias if not self.q else self.kmm(x, key, ci, co, scope) + bias
+            if not self.q:
+                self._rec(co, scope, y)                 # calibrated with the bias in
+            return ls.bf16(y) if self.bf else y
+        W = self.w[key]
+        fi, fo = self.E(ci, scope, W.shape[0]), self.E(co, scope, W.shape[1])
+        acc = rne(x * p2(fi)) @ W
+        self.accmax[co] = max(self.accmax[co], float(np.abs(acc).max()) / 65536.0 if acc.size else 0.0)
+        braw = np.clip(rne(bias * p2(fo)), I16_LO, I16_HI)
+        r = np.clip(np.floor(acc / 256.0) + braw[None, :], I16_LO, I16_HI)
+        self._count(co, r)
+        return r / p2(fo)
+
+    def group_norm(self, t):
+        """GroupNorm(1 group) of the tanh output t [t1][d] (raw int16 at 2^-15): the host
+        op's arithmetic — S1, S2 exact integer sums over every valid element, in raw units
+        mean = S1 / N, var = S2 / N - mean^2 (double), then per element
+        ((raw - mean) / sqrt(var + eps * 2^30)) * gamma[c] + beta[c]."""
+        g, b = self.W["encoder.groupnorm.weight"], self.W["encoder.groupnorm.bias"]
+        if not self.q or self.exact("t"):
+            mu, var = t.mean(), t.var()
+            return (t - mu) / np.sqrt(var + 1e-5) * g + b
+        raw = np.rint(t * 32768.0).astype(np.int64)
+        N = raw.size
+        S1, S2 = int(raw.sum()), int((raw * raw).sum())
+        mean = float(S1) / N
+        var = float(S2) / N - mean * mean
+        den = math.sqrt(var + 1e-5 * 2.0 ** 30)
+        return ((raw.astype(np.float64) - mean) / den) * g[None, :] + b[None, :]
+
+    def stem_gelu(self, c, ci, co, scope, residual=False):
+        """GELU of a stem conv output (bias included) on the host: the int32 table at
+        2^-16 of c's raw value (per channel exponent), then round half even to co's
+        exponent (int16) or, residual=True, to the int32 residual at 2^-15."""
+        if not self.q or self.exact(ci):
+            y = gelu(c)
+            return self.res(y) if residual else self.host(y, co, scope)
+        fc = self.E(ci, scope, c.shape[-1])
+        t16 = np.empty(c.shape, np.int64)
+        for f in np.unique(fc):
+            cols = fc == f
+            t16[:, cols] = gelu16_table(int(f))[np.rint(c[:, cols] * 2.0 ** f).astype(np.int64) + 32768]
+        if residual:
+            self._rec(co, scope, t16 / 2.0 ** GELU_BITS)
+            return rne_shr(t16, GELU_BITS - RES_BITS) / 2.0 ** RES_BITS
+        fo = self.E(co, scope, c.shape[-1])
+        self._rec(co, scope, t16 / 2.0 ** GELU_BITS)
+        r = np.clip(rne_shr(t16, GELU_BITS - fo[None, :]), I16_LO, I16_HI)
+        self._count(co, r)
+        return r / p2(fo)
+
     def amm(self, a, ea, b, eb, co, scope, eo):
         """A kernel MatMul of two activations (q.K^T, P.V): raw operands at ea / eb
         (the float path records nothing: attention() records per head / whole)."""
@@ -384,7 +507,11 @@ class QM:
         return out.reshape(T, H * self.hd)
 
     def softmax(self, s, fs, cls, scope):
-        """One head's scores s [Tq, S] -> P (vectorop_smx at 2^-p_bits)."""
+        """One head's scores s [Tq, S] -> P at 2^-p_bits: the encoder's on VectorOPKernel's
+        unit (vectorop_smx, column mode), a decoder step's on the host — LlmAttnSoftmax's
+        p12 softmax: k = raw_max - raw, e = exp(-k 2^-f_s scale) (sexp_table), the sum
+        left to right, P = round_half_even(e / sum 2^f_p).  scale = hd^-1/2 (36, not the
+        padded head)."""
         scale = self.hd ** -0.5
         if not self.q or self.exact("s"):
             x = s * scale
@@ -392,8 +519,14 @@ class QM:
             P = e / e.sum(-1, keepdims=True)                   # (P's exponent is p_bits: not recorded)
             return ls.bf16(P) if self.bf else P
         fp = int(self.pol.get("p_bits", 12))
-        cm, cs = ls.vsmx().scale_regs(int(fs), scale)
-        P = ls.vsmx().softmax_raw(np.rint(s * p2(fs)).astype(np.int64), s.shape[-1], cm, cs, fp)
+        raw = np.rint(s * p2(fs)).astype(np.int64)
+        if scope[0] == "e":
+            cm, cs = ls.vsmx().scale_regs(int(fs), scale)
+            P = ls.vsmx().softmax_raw(raw, s.shape[-1], cm, cs, fp)
+            return P / 2.0 ** fp
+        k = raw.max(-1, keepdims=True) - raw
+        e = sexp_table(int(fs), scale)[k]
+        P = np.clip(np.round(e / np.cumsum(e, -1)[..., -1:] * 2.0 ** fp), I16_LO, I16_HI)
         return P / 2.0 ** fp
 
     def attention(self, q, k, v, cls_q, cls_k, cls_v, cls_s, cls_p, cls_pv, scope, H):
@@ -434,17 +567,15 @@ class QM:
         else:
             t = np.tanh(c1)
         t = self.host(t, "t", S)
-        mu, var = t.mean(), t.var()
-        gn = (t - mu) / np.sqrt(var + 1e-5) * self.W["encoder.groupnorm.weight"] + self.W["encoder.groupnorm.bias"]
-        gn = self.host(gn, "gn", S)
+        gn = self.host(self.group_norm(t), "gn", S)
         t2 = (t1 - 7) // 3 + 1
         im = np.concatenate([gn[k: k + 3 * (t2 - 1) + 1: 3] for k in range(7)], 1)
-        c2 = self.kmm(im, ("s", 0, "c2"), "gn7", "c2", S)
-        g2 = self.gelu_bias(c2, self.b[("s", 0, "c2")], "c2", "g2", S)
+        c2 = self.kconv(im, ("s", 0, "c2"), "gn7", "c2", S, self.b[("s", 0, "c2")])
+        g2 = self.stem_gelu(c2, "c2", "g2", S)
         T = (t2 - 3) // 2 + 1
         im = np.concatenate([g2[k: k + 2 * (T - 1) + 1: 2] for k in range(3)], 1)
-        c3 = self.kmm(im, ("s", 0, "c3"), "g2x3", "c3", S)
-        h = self.res(self.gelu_bias(c3, self.b[("s", 0, "c3")], "c3", "g3", S))
+        c3 = self.kconv(im, ("s", 0, "c3"), "g2x3", "c3", S, self.b[("s", 0, "c3")])
+        h = self.stem_gelu(c3, "c3", "g3", S, residual=True)
         pos = np.arange(T)
         W = self.W
         for l in range(self.L):
@@ -519,6 +650,57 @@ class QM:
         ar = R.silu_mul(gb, fgb, ub, fub, fa)
         self._count("a", ar)
         return ar / p2(fa)
+
+
+MAX_FRAMES = 1024                     # the largest encode bucket (24.6 s): the softmax unit's
+                                      # column mode takes 1024 keys
+
+
+def max_samples(frames=MAX_FRAMES):
+    """The most samples whose encoder output fits `frames` frames (384 per frame + 511)."""
+    return 384 * frames + 511
+
+
+SPLIT_SEARCH = 2 * 16000               # a boundary within +-2 s of the equal split
+SPLIT_WIN = 1600                       # ... at the centre of the quietest 0.1 s window
+
+
+def chunks(pcm):
+    """[(start, length)]: audio longer than max_samples() split into the fewest parts,
+    each boundary at the centre of the 0.1 s window of least energy (the sum of the
+    squared int16 samples, exact) within +-2 s of the equal split — the first such
+    window; every part at most max_samples().  Splitting mid-word made greedy decoding
+    loop (2026-10-17: 'the principles of' to the token limit).  The library's policy;
+    the transcripts are joined."""
+    x = np.asarray(pcm).astype(np.int64)
+    n, M = len(x), max_samples()
+    if n <= M:
+        return [(0, n)]
+    k = -(-n // M)
+    e = np.concatenate([[0], np.cumsum(x * x)])
+    bounds = [0]
+    for i in range(1, k):
+        ideal = (i * n) // k
+        lo = max(bounds[-1] + 1, ideal - SPLIT_SEARCH, n - (k - i) * M)
+        hi = min(ideal + SPLIT_SEARCH, bounds[-1] + M)
+        s0, s1 = max(lo - SPLIT_WIN // 2, 0), max(hi - SPLIT_WIN // 2, 0)
+        starts = np.arange(s0, min(s1, n - SPLIT_WIN) + 1)
+        if starts.size == 0:
+            bounds.append(min(max(ideal, lo), hi))
+            continue
+        energy = e[starts + SPLIT_WIN] - e[starts]
+        b = int(starts[int(np.argmin(energy))]) + SPLIT_WIN // 2
+        bounds.append(min(max(b, lo), hi))
+    bounds.append(n)
+    return [(a, b - a) for a, b in zip(bounds[:-1], bounds[1:])]
+
+
+def transcribe_long(m, cfg, pcm):
+    """Greedy transcript of any length: transcribe() per chunk, the ids joined."""
+    ids = []
+    for a, L in chunks(pcm):
+        ids += transcribe(m, cfg, pcm[a:a + L])[0]
+    return ids
 
 
 def transcribe(m, cfg, pcm, forced=None, xf=None):
@@ -677,10 +859,33 @@ def make_formats(m_float, ch, pol, ms=None):
             fmt[(co,) + sc] = np.minimum(m_float.E(co, sc, Wt.shape[1]), fo_max)
     finally:
         m_float.fmt = saved
+    for co, bname in (("c2", "encoder.conv2.bias"), ("c3", "encoder.conv3.bias")):   # the conv bias is an
+        b = np.abs(np.asarray(m_float.W[bname], np.float64))                         # int16 at f_out
+        with np.errstate(divide="ignore"):
+            lim = np.floor(np.log2(32767.0 / np.maximum(b, 1e-30))).astype(np.int64)
+        fmt[(co, "s", 0)] = np.minimum(np.broadcast_to(np.asarray(fmt[(co, "s", 0)]), lim.shape), lim)
     fmt[("logits", "h", 0)] = int(np.min(fmt[("logits", "h", 0)]))  # one exponent: argmax on raw values
     for l in range(m_float.Ld):                                        # cq / ck back to per head
         for c in ("cq", "ck"):
             fmt[(c, "d", l)] = np.asarray(fmt[(c, "d", l)]).reshape(m_float.Hd, hd).min(1)
+    return _vec(fmt)
+
+
+def load_formats(path):
+    """A formats JSON (asr_study.py formats; src/moonshine.py reads the same file) ->
+    the fmt dict of QM: {(class, part, layer): int or vector}."""
+    import json
+    return load_formats_dict(json.load(open(path)))
+
+
+def load_formats_dict(d):
+    """load_formats of the parsed JSON ({"exponents": {class@<part><layer>: ...}})."""
+    import re
+    fmt = {}
+    for k, v in d["exponents"].items():
+        cls, rest = k.split("@")
+        m = re.fullmatch(r"([a-z])(\d+)", rest)
+        fmt[(cls, m.group(1), int(m.group(2)))] = v
     return _vec(fmt)
 
 

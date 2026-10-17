@@ -243,6 +243,11 @@ src/
                          split stripes, exponent solver, per-channel conv weights via chexp)
   stereo_nodes.py        its ops: StereoVop / StereoSoftmax (VectorOP kernel nodes),
                          StereoInstanceNorm / PadEdge / Correlation / Upsample (host) + STEREO_C
+  moonshine.py           Moonshine speech-to-text frontend: config + checkpoint + calibrated formats ->
+                         encode_<T> buckets (the conv stem, the encoder over a runtime valid length, the
+                         cross K / V states) and the decode entry (doc/plans/ASR_PLAN.md)
+  asr_nodes.py           its ops: AsrFrames / AsrStemNorm / AsrStemGelu / AsrFrameCount / AsrArgmax
+                         (host) and AsrCrossPrep / AsrCrossQ / AsrSwiGLU (row-ops nodes) + ASR_C
   numeric.py             axi.numeric metadata: power-of-two exponents (MatMul and Conv weight
                          encoding; chexp: per-channel Conv exponents), host tensors, states
   fusion.py              Constant folding, Split lowering, LayerNorm / GELU fusion,
@@ -321,7 +326,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              88 pytest modules, 1873 tests, all pass (test_bert_base.py
+  test_*.py              89 pytest modules, 1879 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -338,6 +343,8 @@ test/
                          buckets, host_emu; the C duration predictor == its spec),
                          test_stereo_nodes.py / test_stereo.py (the stereo ops, the
                          LightStereo frontend on host_emu),
+                         test_moonshine.py (the Moonshine entries == the specification
+                         demo/asr/scripts/moonshine_q.py, host_emu),
                          test_rowops_spec.py / test_rowops_unit.py (the row-ops unit's
                          specification; its nodes, the Llama / ViT / Piper graphs on it, host_emu),
                          test_bert_base.py (BERT-base on the real model),

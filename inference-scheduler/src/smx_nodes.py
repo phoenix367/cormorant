@@ -259,7 +259,8 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
     """The prefill LlmAttnSoftmax of KV group ``group`` on VectorOPKernel: per
     head h' < G one column-mode call over s_g [C][G*T] (columns h'*T .. +T) ->
     P_g rows h'*T .. +T at the runtime row stride keys = roundup(pos + n, Q);
-    row t valid over keys j < min(keys, pos + 1 + t)."""
+    row t valid over keys j < min(keys, pos + 1 + t) — or, ``causal`` = 0, every
+    row over j < min(keys, pos + n) (smx_mask valid0 = pos + n, period 0)."""
     # a runtime key count (as LlmAttnConvNode's): the timing / calibration price
     # its calls at keys_of(sn) keys, kernel_calls(layouts, keys=...)
     static: ClassVar[bool] = False
@@ -270,6 +271,7 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
     Q:     int = KEY_QUANTUM
     group: int = 0
     has_n: bool = True
+    causal: bool = True
     cm:    List[int] = field(default_factory=list)                 # [G]
     cfg:   List[int] = field(default_factory=list)                 # [G]
 
@@ -290,14 +292,15 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
             cfg.append(b)
         return cls(onnx_node=node, inputs=list(host.inputs), output=host.output, index=host.index,
                    align_elems=host.align_elems, F=host.F, T=host.T, G=host.G, C=host.C, Q=host.Q,
-                   group=host.group, has_n=host.has_n, cm=cm, cfg=cfg)
+                   group=host.group, has_n=host.has_n, causal=host.causal, cm=cm, cfg=cfg)
 
     def reference(self, ins, dtype):  # noqa: ARG002
         T, G, C = self.T, self.G, self.C
         s = np.asarray(ins[0], np.float64).astype(np.int64)                # [C][G*T]
         pos = _i32(ins[1])
-        _, keys = attn_keys(pos, _i32(ins[2]) if self.has_n else T, T, C, self.Q)
-        valid = smx.causal_valid(T, pos + 1, T, keys)                     # [T]
+        n, keys = attn_keys(pos, _i32(ins[2]) if self.has_n else T, T, C, self.Q)
+        valid = (smx.causal_valid(T, pos + 1, T, keys) if self.causal     # [T]
+                 else np.full(T, min(keys, max(pos + n, 1)), np.int64))
         P = np.zeros((G * T, C))
         for h in range(G):
             cs, fp = _unpack(self.cfg[h])
@@ -316,13 +319,14 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
     def describe(self) -> str:
         return (f"group {self.group}: {self.G} heads x {self.T} query rows on VectorOPKernel's "
                 f"softmax unit (column mode; keys = roundup(pos + n, {self.Q}) at run time, "
-                f"causal: row t over keys <= pos + t)")
+                + ("causal: row t over keys <= pos + t)" if self.causal else "every row over keys < pos + n)"))
 
     def emit_comment(self) -> str:
         return (f"    /* [{self.index}] LlmAttnSoftmax({self.inputs[0].onnx_name}) -> "
                 f"{self.output.onnx_name}  group {self.group}: s [keys][{self.G * self.T}] -> "
                 f"P [{self.G * self.T}][keys] on VectorOPKernel's softmax unit, {self.G} call(s); "
-                f"keys = roundup(pos + n, {self.Q}), row t valid to pos + t */")
+                f"keys = roundup(pos + n, {self.Q}), "
+                + ("row t valid to pos + t */" if self.causal else "every row valid to pos + n */"))
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         s, pos = self.inputs[0].c_name, self.inputs[1].c_name
@@ -330,7 +334,9 @@ class LlmAttnSoftmaxVopNode(SmxVopNode):
         lines = ["    {",
                  f"        const unsigned _pos = (unsigned){pos}[0];",
                  f"        const unsigned _keys = llm_keys(_pos, {n}, {self.T}u, {self.C}u, {self.Q}u);",
-                 f"        const unsigned _mask = ((_pos + 1u) & 0xFFFFu) | ({self.T}u << 16);"]
+                 (f"        const unsigned _mask = ((_pos + 1u) & 0xFFFFu) | ({self.T}u << 16);"
+                  if self.causal else
+                  "        const unsigned _mask = llm_keys_valid(_pos, " + n + f", {self.T}u, {self.C}u);")]
         for h in range(self.G):
             if h:
                 lines.append("        kernel_wait(KERNEL_VECTOROP);")

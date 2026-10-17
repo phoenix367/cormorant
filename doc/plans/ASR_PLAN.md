@@ -284,6 +284,7 @@ $PY demo/asr/scripts/asr_study.py study --model moonshine-tiny \
     --policies bf16,unit,opt,unit+in6,unit+in7      # calibration (~20 s) + ~4.5 min per policy, 7 workers
 $PY demo/asr/scripts/asr_study.py study --model moonshine-base --policies bf16,unit,opt,unit+in7   # ~9 min per policy
 $PY demo/asr/scripts/asr_study.py ablate --model moonshine-tiny --ablate-base opt   # 11 groups, ~50 min
+$PY demo/asr/scripts/asr_study.py formats --model moonshine-base   # -> demo/asr/moonshine-base_opt_formats.json (§4)
 inference-scheduler/.venv/bin/python demo/asr/scripts/asr_costs.py --models moonshine-tiny moonshine-base \
     --seconds 4 8 16 30 --ctx 32 128               # proxy graphs on the perf model (~1 min)
 ```
@@ -308,7 +309,7 @@ ops.
 **Model: Moonshine base** (§2), the frontend written for both sizes (tiny
 the same code, a smaller config).
 
-**Phase 1 — the frontend and its specification.**
+**Phase 1 — the frontend and its specification** (done: §4; the design changed where §4 says).
 - `inference-scheduler/src/moonshine.py` (route C, like `vit.py` /
   `piper.py`): config.json + safetensors + the calibrated formats →
   - `encode_<T>` entries, one per length bucket (4 / 8 / 16 / 30 s: 165 /
@@ -370,3 +371,84 @@ by a pure-Python reader of `tokenizer.json` (pieces, `▁` → space, byte
 fallback); `deploy.py` installs the library and the weights; the chat
 client gets `--transcribe FILE` / `/listen FILE`.  Gates: the server tests
 (`demo/chat/tests`), an end-to-end request on the board.
+
+## 4. Phase 1: the frontend (2026-10-17)
+
+**Done.**  `inference-scheduler/src/moonshine.py` builds the `encode_<T>` and
+`decode` entries of either Moonshine size; the scheduler's simulation of them
+equals the specification `demo/asr/scripts/moonshine_q.py` bit for bit, and
+the generated C equals the simulation (`test/test_moonshine.py`).
+
+### What changed against §3's design
+
+- **Buckets: 128 / 256 / 512 / 1024 frames (3.1 / 6.2 / 12.3 / 24.6 s), not
+  up to 30 s.**  ConvKernel writes q·Kᵀ keys-major, so the encoder's softmax is
+  the unit's column mode, which takes at most 1024 keys (`vectorop_smx.MAX_KEYS`);
+  the V caches' 4-way interleave (P·V 2.3–2.6× faster, CHAT_PLAN §16) wants
+  multiples of 64 frames.  Longer audio is split (`moonshine_q.chunks`): into
+  the fewest parts of ≤ 24.6 s, each boundary at the centre of the quietest
+  0.1 s window within ±2 s of the equal split.  An equal split mid-word made
+  greedy decoding loop ("the principles of" until the token limit, +47
+  errors on one utterance); with quiet points the 4 long utterances of the
+  evaluation set cost float 1 error (tiny) / 2 (base).
+- **The stem: ConvKernel convs on folded rows, host ops between them.**  conv1
+  is a 1 × 2 conv over the 64-phase image of the PCM (`AsrFrames` writes it),
+  conv2 / conv3 1 × 7 / 1 × 3 convs over inputs folded into rows of ≤ 65 536
+  accumulators (Piper's fold, `moonshine.fold_dims`), per-channel exponents
+  (`chexp`).  The biases are in ConvKernel's accumulator (one saturation);
+  `AsrStemNorm` (tanh from an int16 table + the GroupNorm from exact integer
+  sums, in double) and `AsrStemGelu` (GELU from an int32 table at 2^−16, then
+  round half even to the next conv's folded input, or for conv3 straight into
+  the int32 residual — no int16 step) write the next conv's layout.  The
+  tables are computed by the generator (libm's `erf` / `tanh` in Python) and
+  shipped as data: nothing on the board calls libm for them.
+- **A decode step's softmaxes run on the host** (LlmAttnSoftmax's p12, as
+  Llama's decode): one query per head, and the unit's column blocks are 16
+  wide.  The encoder's stay on the unit.
+- **Scheduler extensions:** `LlmAttnSoftmax` `causal = 0` (every row over the
+  keys < pos + n; the unit only, `smx_mask` period 0) and `logit_scale` (the
+  true head dim's scale: Moonshine's heads are padded 36 → 48 / 52 → 64);
+  `VitGelu` `approximate = "none"` (the unit's GELU erf act; the erf form has
+  no host path); `HostTable` kind `i32`.  New nodes (`src/asr_nodes.py`): the
+  host ops `AsrFrames`, `AsrStemNorm`, `AsrStemGelu`, `AsrFrameCount`,
+  `AsrArgmax`; the row-ops nodes `AsrCrossPrep` (the cross K / V into the
+  decoder's caches: one COPY for K, the V image's TRANSPOSEs), `AsrCrossQ` (a
+  decode step's cross q into the q image) and `AsrSwiGLU` (fc1's halves plus
+  the bias — two COPYs with a bias — then MULACT).
+- **Inputs:** `encode_<T>` takes `pcm`, `n` (the valid samples) and `pos`
+  (always 0: the attention's start, an input because an int32 constant
+  initializer does not type-check); `decode` takes `ids`, `pos` and `xpos`
+  (the valid frames − 1: the cross attention's keys = xpos + 1).
+
+### The graph per entry (moonshine-tiny, bucket 128)
+
+`encode_128`: 3 ConvNodes and 5 host ops for the stem; per layer 1 row-ops
+attention prep (RoPE, the caches, the q image), 16 ConvKernel attention calls,
+8 softmaxes on VectorOPKernel, 6 MatMuls on ConvKernel, 2 LayerNorms and 2
+residual adds on the row-ops unit, 1 VectorOP GELU (the merge is in place, the
+y pattern); then 6 × 2 cross K / V MatMuls and 6 `AsrCrossPrep`.  `decode`:
+49 GEMVs on MatmulKernel, 192 ConvKernel attention calls (8 heads × 2
+attentions × q·Kᵀ and P·V × 6 layers), 96 host softmaxes, 55 row-ops nodes
+(19 LayerNorms, 18 residual adds, 6 attention preps, 6 cross q images, 6
+SwiGLUs), the embedding and the argmax on the host.
+
+### Gates
+
+- `test_moonshine.py` (6 tests): a random Moonshine (width 80, heads 20 → 32,
+  2 + 2 layers, formats calibrated by the specification on synthetic audio)
+  — the encoder output over a bucket longer than the audio and the logits of
+  4 decode steps equal the specification, two utterances; the graph census;
+  the bucket bounds; the generated C of both entries equals the simulation
+  (host_emu); and, where the assets are, the real moonshine-tiny.
+- The real checkpoints on LibriSpeech (`/mnt/data/.../asr_dev/compare.py`,
+  not in the repo): moonshine-tiny on a 1.9 s and a 7.0 s utterance — the
+  encoder output bit-exact, all 8 / 32 greedy tokens and every step's
+  logits equal ("And often has my mother said while on her lap I laid my
+  head…"); moonshine-base on the same two — bit-exact, 8 / 31 tokens equal.
+- The specification's WER after these changes (the 200 utterances, long ones
+  split at quiet points): moonshine-tiny float 4.49 %, `opt` 4.58 % (203 errors
+  against 199, 8 utterances better / 16 worse, 154 transcripts equal,
+  teacher-forced top-1 0.991); moonshine-base float 3.02 %, `opt` 2.93 % (130
+  against 134, 4 / 5, 180 equal, 0.996) — §2's verdict stands.  The formats:
+  `demo/asr/moonshine-{tiny,base}_opt_formats.json` (`asr_study.py formats`,
+  the calibration's provenance inside).

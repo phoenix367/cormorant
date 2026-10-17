@@ -513,12 +513,17 @@ class VitGeluNode(VitNode):
         f = _resolve(tensors, node.input[0], node)
         y = _resolve(tensors, node.output[0], node)
         n = int(f.shape[-1])
+        erf = _attrs(node).get("approximate", b"tanh") in (b"none", "none")
         if len(node.input) == 4:                  # [f, b, ba, sc]: the VectorOP form
             from .vectorop_act import enabled
             if enabled():
                 return VitGeluVopNode.from_parts(
                     node, f, _resolve(tensors, node.input[2], node),
-                    _resolve(tensors, node.input[3], node), y, index, align_elems, ctx.frac_bits)
+                    _resolve(tensors, node.input[3], node), y, index, align_elems, ctx.frac_bits,
+                    erf=erf)
+        # the host tables are GELU tanh's (vlm_study); the erf form runs on the unit only
+        _require(not erf, node, "approximate 'none' (GELU erf) needs VectorOPKernel's activation unit "
+                                "(the [f, b, ba, sc] form, kernels.vectorop.activations)")
         b = _bias(ctx, tensors, node, 1, n, "bias")
         ff = f.exp_channels(ctx.frac_bits)
         braw = np.round(b.astype(np.float64) * np.power(2.0, ff.astype(np.float64))).astype(np.int64)
@@ -570,7 +575,8 @@ class VitGeluVopNode(LlmKernelNode):
     inputs [f, ba, sc] — f the fc1 output [rows][n] at per-channel exponents, ba /
     sc constant int16 rows [n] (raw values) — output a [rows][n] at 2^-8.  Two
     VectorOP calls, ``rows`` runs of ``n`` elements with the [n] operand
-    repeated: ADD f + ba -> a, then MUL a x sc with act GELU_TANH, in place."""
+    repeated: ADD f + ba -> a, then MUL a x sc with act GELU_TANH (``erf``: act
+    GELU, the node's attribute approximate = "none"), in place."""
 
     kernel_name: ClassVar[str] = "VectorOPKernel"
     uses_activation_unit: ClassVar[bool] = True
@@ -583,6 +589,7 @@ class VitGeluVopNode(LlmKernelNode):
     rows:        int = 1
     n:           int = 1
     F:           int = 8
+    erf:         bool = False
 
     # Compatibility shims (read by the layout / header passes)
     outer_count:        int  = field(default=1,    init=False)
@@ -592,8 +599,17 @@ class VitGeluVopNode(LlmKernelNode):
     b_advances:         bool = field(default=True, init=False)
     arity:              int  = field(default=2,    init=False)
 
+    @property
+    def act(self) -> int:
+        from .nodes import ACT_GELU, ACT_GELU_TANH
+        return ACT_GELU if self.erf else ACT_GELU_TANH
+
+    @property
+    def act_name(self) -> str:
+        return "GELU" if self.erf else "GELU_TANH"
+
     @classmethod
-    def from_parts(cls, node, f, ba, sc, y, index, align_elems, F):
+    def from_parts(cls, node, f, ba, sc, y, index, align_elems, F, erf=False):
         n = int(f.shape[-1])
         for t, what in ((ba, "ba"), (sc, "sc")):
             _require(t.data is not None and t.numel == n and t.exp is None and t.host is None,
@@ -602,37 +618,36 @@ class VitGeluVopNode(LlmKernelNode):
         _require(y.numel == f.numel and y.host is None and f.host is None, node, "shapes / DMA")
         _require(np.all(y.exp_channels(F) == 8), node, "the output must be at 2^-8")
         return cls(onnx_node=node, inputs=[f, ba, sc], output=y, index=index,
-                   align_elems=align_elems, rows=f.numel // n, n=n, F=F)
+                   align_elems=align_elems, rows=f.numel // n, n=n, F=F, erf=bool(erf))
 
     @staticmethod
     def _raw(t) -> np.ndarray:
         return np.rint(np.asarray(t.data, np.float64).reshape(-1) * 256.0).astype(np.int64)
 
     def reference(self, ins, dtype):  # noqa: ARG002
-        from .nodes import ACT_GELU_TANH
         from .vectorop_act import kernel_table
         ff = self.inputs[0].exp_channels(self.F).astype(np.float64)
         raw = np.rint(np.asarray(ins[0], np.float64).reshape(self.rows, self.n) * np.power(2.0, ff)[None, :])
         s = np.clip(raw + self._raw(self.inputs[1])[None, :], -32768, 32767)
         q = np.clip(np.floor(s * self._raw(self.inputs[2])[None, :] / 256.0), -32768, 32767)
-        y = kernel_table(ACT_GELU_TANH)[q.astype(np.int64) + 32768]
+        y = kernel_table(self.act)[q.astype(np.int64) + 32768]
         return y.reshape(self.output.shape)
 
     def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
-        from .nodes import ACT_GELU_TANH, OP_ADD, OP_MUL
+        from .nodes import OP_ADD, OP_MUL
         from .perf_calls import KernelCall
         geo = dict(size=self.n, outer=self.rows, a_inc=self.n, b_inc=0)
         return [KernelCall.of("VectorOPKernel", op=OP_ADD, act=0, **geo),
-                KernelCall.of("VectorOPKernel", op=OP_MUL, act=ACT_GELU_TANH, **geo)]
+                KernelCall.of("VectorOPKernel", op=OP_MUL, act=self.act, **geo)]
 
     def describe(self) -> str:
-        return (f"rows={self.rows} n={self.n} on VectorOPKernel: ADD bias, MUL by 2^(8-f) + GELU_TANH "
+        return (f"rows={self.rows} n={self.n} on VectorOPKernel: ADD bias, MUL by 2^(8-f) + {self.act_name} "
                 f"(input exponents {sorted(set(int(v) for v in self.inputs[0].exp_channels(self.F)))})")
 
     def emit_comment(self) -> str:
         f, a = self.inputs[0].onnx_name, self.output.onnx_name
         return (f"    /* [{self.index}] VitGelu({f}) -> {a}  [{self.rows}][{self.n}] on VectorOPKernel's "
-                f"activation unit: ADD bias (+ half a Q8.8 LSB), MUL by 2^(8-f) with act GELU_TANH */")
+                f"activation unit: ADD bias (+ half a Q8.8 LSB), MUL by 2^(8-f) with act {self.act_name} */")
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
         f, ba, sc = (t.c_name for t in self.inputs)
@@ -640,7 +655,7 @@ class VitGeluVopNode(LlmKernelNode):
         geo = f"{self.n}u, VECTOROP_{{}}, {self.rows}u, {self.n}u, 0u"
         return (f"    run_op({f}, {ba}, {a}, {geo.format('ADD')});\n"
                 f"    kernel_wait(KERNEL_VECTOROP);   /* the MUL reads the ADD's output in place */\n"
-                f"    run_op_act({a}, {sc}, {a}, {geo.format('MUL')}, VECTOROP_ACT_GELU_TANH, 0u);")
+                f"    run_op_act({a}, {sc}, {a}, {geo.format('MUL')}, VECTOROP_ACT_{self.act_name}, 0u);")
 
 
 @dataclass

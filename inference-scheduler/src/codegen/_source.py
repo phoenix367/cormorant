@@ -14,6 +14,7 @@ from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmKernelNo
 from ..vit_nodes import vit_c_helpers
 from ..tts_nodes import tts_c_helpers
 from ..stereo_nodes import stereo_c_helpers
+from ..asr_nodes import asr_c_helpers
 from ._banners  import _banner, _file_banner
 from .._matmul_hw_config import MATMUL_GEMV_MAX_M
 
@@ -305,6 +306,8 @@ class _SourceMixin:
             parts.append(tts_c_helpers())
         if "stereo" in used:
             parts.append(stereo_c_helpers())
+        if "asr" in used:
+            parts.append(asr_c_helpers())
         consts = []
         for sn in host:
             consts.extend(sn.c_file_consts(self._dtype))

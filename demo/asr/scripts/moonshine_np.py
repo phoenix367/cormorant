@@ -28,11 +28,38 @@ SR = 16000
 TOKENS_PER_SECOND = 6.5
 
 
+def read_safetensors(path):
+    """{name: float32 array} of an F32 / F16 / BF16 safetensors file, without the
+    safetensors package (the scheduler's test venv has none)."""
+    import struct
+    out = {}
+    with open(path, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(hlen))
+        base = 8 + hlen
+        for k, info in hdr.items():
+            if k == "__metadata__":
+                continue
+            a, b = info["data_offsets"]
+            f.seek(base + a)
+            raw = np.frombuffer(f.read(b - a), np.uint8)
+            dt = info["dtype"]
+            if dt == "F32":
+                v = raw.view(np.float32)
+            elif dt == "F16":
+                v = raw.view(np.float16).astype(np.float32)
+            elif dt == "BF16":
+                v = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+            else:
+                raise ValueError(f"{k}: dtype {dt}")
+            out[k] = v.reshape(info["shape"]).copy()
+    return out
+
+
 def load(model_dir):
-    from safetensors.numpy import load_file
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
     W = {k.removeprefix("model."): v.astype(np.float64)
-         for k, v in load_file(os.path.join(model_dir, "model.safetensors")).items()}
+         for k, v in read_safetensors(os.path.join(model_dir, "model.safetensors")).items()}
     return cfg, W
 
 
