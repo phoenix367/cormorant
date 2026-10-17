@@ -9,19 +9,31 @@ chat server (POST /v1/audio/transcriptions; doc/plans/ASR_PLAN.md §7).
       quiet points into parts of at most 24.6 s (asr_chunks), each part
       encoded in the smallest bucket that holds it and decoded greedily
       (asr_transcribe); a Segment per part (cancellable between parts),
-      the token ids decoded on the host (tokenizer.json, Detokenizer)
+      the token ids decoded on the host (tokenizer.json, Tokenizer)
 
 The library's transcripts equal the specification demo/asr/scripts/
 moonshine_q.py transcribe_long token for token (ASR_PLAN §6: 200 / 200
 LibriSpeech utterances on the board).  English only; greedy decoding (no
 temperature, no prompt).  Needs numpy on the board (ffmpeg for formats other
 than WAV).
+
+The phrase check (non-standard form fields kv260_wake_phrase and
+kv260_wake_margin; phrase_decode): Moonshine takes no prompt, so a phrase
+expected at the start of the audio — a wake phrase, "Hello Miranda" — is fed
+to the decoder as its first tokens and scored: the margin is the sum, over
+the phrase's tokens the model would not have chosen, of log P(phrase token) -
+log P(the model's choice), the raw logit difference / 2^frac (0: the model
+writes the phrase itself).  Punctuation the model puts between the phrase's
+words is taken as it is.  A margin >= kv260_wake_margin keeps the phrase and
+decodes on greedily from it; below, the transcript is the plain greedy one
+(the same ids as without the check).  The response's kv260.wake says which.
 """
 
 from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import re
 import time
@@ -51,6 +63,8 @@ class LibAsrEngine:
         self.lib = None
         self.sample_rate = self.max_samples = 0
         self.model_name = None
+        self.can_check = False                 # the library has the step functions of phrase_decode
+        self._pcm = None
 
     def _bind(self):
         lib = ctypes.CDLL(os.path.abspath(self.lib_path))
@@ -63,9 +77,18 @@ class LibAsrEngine:
                "asr_chunks": ([i16p, ctypes.c_int, i32p, i32p, ctypes.c_int], ctypes.c_int),
                "asr_last_stats": ([ctypes.POINTER(_Stats)], None),
                "asr_model_name": ([], ctypes.c_char_p)}
+        steps = {"asr_bos": ([], ctypes.c_int), "asr_encode": ([i16p, ctypes.c_int], ctypes.c_int),
+                 "asr_decode_step": ([ctypes.c_int, ctypes.c_int], ctypes.c_int),
+                 "asr_last_logits": ([i32p, ctypes.c_int, i32p], ctypes.c_int),
+                 "asr_logit_frac": ([], ctypes.c_int), "asr_max_steps": ([ctypes.c_int], ctypes.c_int)}
         for name, (args, res) in sig.items():
             f = getattr(lib, name)
             f.argtypes, f.restype = args, res
+        self.can_check = all(hasattr(lib, name) for name in steps)   # libraries before the phrase check: no
+        if self.can_check:
+            for name, (args, res) in steps.items():
+                f = getattr(lib, name)
+                f.argtypes, f.restype = args, res
         return lib
 
     def _err(self, what: str, rc: int) -> AsrLibraryError:
@@ -85,6 +108,9 @@ class LibAsrEngine:
         self.sample_rate, self.max_samples = int(lib.asr_sample_rate()), int(lib.asr_max_samples())
         self.buckets = [int(lib.asr_bucket(i)) for i in range(int(lib.asr_num_buckets()))]
         self.model_name = (lib.asr_model_name() or b"").decode() or None
+        self.eos = int(lib.asr_eos())
+        if self.can_check:
+            self.bos, self.logit_frac = int(lib.asr_bos()), int(lib.asr_logit_frac())
 
     def close(self) -> None:
         if self.lib is not None:
@@ -126,11 +152,42 @@ class LibAsrEngine:
         return [int(v) for v in ids[:n]], {k: getattr(st, k) for k, _ in _Stats._fields_}
 
 
-class Detokenizer:
-    """The token ids -> text of a tokenizer.json with a BPE model whose decoder is
-    Replace("▁" -> " "), ByteFallback, Fuse, Strip(1 leading space) — Moonshine's
-    (and Llama's); special tokens skipped, as tokenizers' decode(...,
-    skip_special_tokens=True)."""
+    # ── the steps of phrase_decode (one part: at most max_samples) ──
+
+    def encode(self, pcm) -> None:
+        import numpy as np
+        self._pcm = np.ascontiguousarray(pcm, np.int16)
+        rc = self.lib.asr_encode(self._ptr(self._pcm, ctypes.c_int16), len(self._pcm))
+        if rc < 0:
+            raise self._err("asr_encode", rc)
+
+    def step(self, token: int, pos: int) -> int:
+        rc = self.lib.asr_decode_step(token, pos)
+        if rc < 0:
+            raise self._err("asr_decode_step", rc)
+        return int(rc)
+
+    def logits(self, tokens) -> List[int]:
+        """The last step's raw logits of tokens (int16 at 2^-logit_frac)."""
+        t = (ctypes.c_int32 * len(tokens))(*tokens)
+        out = (ctypes.c_int32 * len(tokens))()
+        rc = self.lib.asr_last_logits(t, len(tokens), out)
+        if rc < 0:
+            raise self._err("asr_last_logits", rc)
+        return list(out)
+
+    def max_steps(self, n: int) -> int:
+        return int(self.lib.asr_max_steps(n))
+
+
+class Tokenizer:
+    """A tokenizer.json with a BPE model whose decoder is Replace("▁" -> " "),
+    ByteFallback, Fuse, Strip(1 leading space) and whose normalizer prepends "▁"
+    and replaces " " by "▁" (no pre-tokenizer) — Moonshine's (and Llama's).
+    decode: the token ids -> text, special tokens skipped, as tokenizers'
+    decode(..., skip_special_tokens=True); encode: a short text -> ids, as
+    tokenizers' encode(..., add_special_tokens=False) (the merges by rank,
+    bytes for unknown characters) — the phrase of the phrase check."""
 
     _BYTE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
 
@@ -152,6 +209,28 @@ class Detokenizer:
         steps = [d.get("type") for d in (t.get("decoder") or {}).get("decoders", [])]
         if steps != ["Replace", "ByteFallback", "Fuse", "Strip"]:
             raise ValueError(f"{path}: decoder {steps} is not Moonshine's")
+        self.vocab = vocab
+        self._merges = t["model"].get("merges", [])
+        self._rank: Optional[Dict[Tuple[str, str], int]] = None
+        self.unk = vocab.get(t["model"].get("unk_token") or "<unk>", 0)
+
+    def encode(self, text: str) -> List[int]:
+        if self._rank is None:
+            self._rank = {tuple(m.split(" ", 1)) if isinstance(m, str) else tuple(m): i
+                          for i, m in enumerate(self._merges)}
+        sym = list("▁" + text.replace(" ", "▁")) if text else []
+        while len(sym) > 1:
+            best = min(range(len(sym) - 1), key=lambda i: self._rank.get((sym[i], sym[i + 1]), 1 << 30))
+            if (sym[best], sym[best + 1]) not in self._rank:
+                break
+            sym[best:best + 2] = [sym[best] + sym[best + 1]]
+        ids: List[int] = []
+        for p in sym:
+            if p in self.vocab:
+                ids.append(self.vocab[p])
+            else:
+                ids += [self.vocab.get(f"<0x{b:02X}>", self.unk) for b in p.encode("utf-8")]
+        return ids
 
     def decode(self, ids) -> str:
         out: List[str] = []
@@ -179,6 +258,80 @@ class Detokenizer:
         return s[1:] if s.startswith(" ") else s
 
 
+PUNCT = frozenset(",.!?;:")
+WAKE_MARGIN = -10.0                                # kv260_wake_margin's default (nats; ASR_PLAN §8)
+MAX_PHRASE = 64                                    # kv260_wake_phrase's characters
+
+
+@dataclass
+class Phrase:
+    """A phrase to check at the start of the audio: its tokens, and which of
+    them start a word (punctuation the model writes may come before those)."""
+    text: str
+    ids: List[int]
+    word_start: List[bool]
+
+    @classmethod
+    def of(cls, tok: Tokenizer, text: str) -> "Phrase":
+        ids = tok.encode(text)
+        return cls(text, ids, [(tok.pieces[i] or "").startswith("▁") for i in ids])
+
+
+def punct_ids(tok: Tokenizer) -> frozenset:
+    """The tokens that are punctuation alone (",", ".", "?" ...)."""
+    return frozenset(i for i, p in enumerate(tok.pieces) if p and set(p) <= PUNCT)
+
+
+def phrase_decode(eng, pcm, phrase: Phrase, min_margin: float,
+                  punct: frozenset) -> Tuple[List[int], Dict[str, Any], Dict[str, Any]]:
+    """One part (at most eng.max_samples): the phrase fed as the first tokens and
+    scored (the module docstring), then greedy on from it when the margin holds,
+    else the plain greedy transcript (asr_transcribe's ids: the decoder rewrites
+    its cache from position 1 on).  The margin stops being summed once it is
+    below min_margin (complete: False).  ``eng``: LibAsrEngine's encode / step /
+    logits / max_steps / bos / eos / logit_frac.  -> (ids, the engine's stats,
+    the check's result)."""
+    t0 = time.monotonic()
+    S = eng.max_steps(len(pcm))
+    res: Dict[str, Any] = {"phrase": phrase.text, "margin": 0.0, "complete": False, "passed": False}
+    if S < 1 or not phrase.ids:
+        return [], {"encode_ms": 0.0, "decode_ms": 0.0, "steps": 0}, res
+    eng.encode(pcm)
+    t1 = time.monotonic()
+    scale = 2.0 ** -eng.logit_frac
+    first = a = eng.step(eng.bos, 0)
+    steps, ids, j, margin, run = 1, [], 0, 0, 0
+    while j < len(phrase.ids):
+        want = phrase.ids[j]
+        if a != want and j > 0 and phrase.word_start[j] and a in punct and run < 2:
+            t, run = a, run + 1                    # "Hello, Miranda": the model's comma
+        else:
+            if a != want:
+                lw, la = eng.logits([want, a])
+                margin += lw - la
+                if margin * scale < min_margin:
+                    break
+            t, j, run = want, j + 1, 0
+        ids.append(t)
+        if len(ids) >= S:
+            break
+        a = eng.step(t, len(ids))
+        steps += 1
+    res.update(margin=margin * scale, complete=j == len(phrase.ids))
+    if res["complete"] and margin * scale >= min_margin:
+        res["passed"] = True                       # on greedily from the phrase
+    else:
+        ids, a = [], first                         # the plain transcript from its first step
+    while len(ids) < S and a != eng.eos:          # a: the model's token after ids
+        ids.append(a)
+        if len(ids) >= S:
+            break
+        a = eng.step(a, len(ids))
+        steps += 1
+    t2 = time.monotonic()
+    return ids, {"encode_ms": (t1 - t0) * 1000.0, "decode_ms": (t2 - t1) * 1000.0, "steps": steps}, res
+
+
 @dataclass
 class TranscriptionJob:
     pcm: Any                                       # 16 kHz mono int16
@@ -186,6 +339,8 @@ class TranscriptionJob:
     audio_s: float = 0.0
     decode_ms: float = 0.0                         # the upload decoded / resampled (host)
     source: Dict[str, Any] = field(default_factory=dict)
+    wake: Optional[Phrase] = None                  # kv260_wake_phrase
+    wake_margin: float = WAKE_MARGIN
 
 
 class MoonshineBackend(Backend):
@@ -203,6 +358,7 @@ class MoonshineBackend(Backend):
         self.ffmpeg = ffmpeg
         self.max_seconds = max_seconds
         self.detok = detokenizer
+        self._punct: Optional[frozenset] = None
         self.stats = {"requests": 0, "audio_s": 0.0, "fpga_s": 0.0, "tokens": 0, "parts": 0}
 
     def _default_id(self) -> str:
@@ -218,7 +374,7 @@ class MoonshineBackend(Backend):
         if self.detok is None:
             if not os.path.exists(self.tokenizer_path):
                 raise BackendError(f"{self.tokenizer_path} not found (the Moonshine tokenizer.json)")
-            self.detok = Detokenizer(self.tokenizer_path)
+            self.detok = Tokenizer(self.tokenizer_path)
 
     def prepare(self, req):
         raise BackendError(f"The model '{self.model_id}' is a speech-to-text model: send audio to "
@@ -240,8 +396,34 @@ class MoonshineBackend(Backend):
         if audio_s > self.max_seconds:
             raise BackendError(f"Invalid file: {audio_s:.0f} s of audio; this server transcribes at most "
                                f"{self.max_seconds:.0f} s.", "file", code="audio_too_long")
+        wake, margin = self._wake_fields(req.raw)
         return TranscriptionJob(pcm=pcm, response_format=req.response_format, audio_s=audio_s,
-                                decode_ms=(time.monotonic() - t0) * 1000.0, source=src)
+                                decode_ms=(time.monotonic() - t0) * 1000.0, source=src, wake=wake,
+                                wake_margin=margin)
+
+    def _wake_fields(self, raw: Dict[str, Any]) -> Tuple[Optional[Phrase], float]:
+        """kv260_wake_phrase / kv260_wake_margin (non-standard form fields)."""
+        text = raw.get("kv260_wake_phrase")
+        if text in (None, ""):
+            return None, WAKE_MARGIN
+        if not isinstance(text, str) or not text.strip() or len(text.strip()) > MAX_PHRASE:
+            raise BackendError(f"Invalid 'kv260_wake_phrase': a phrase of 1 to {MAX_PHRASE} characters "
+                               f"expected.", "kv260_wake_phrase")
+        margin = raw.get("kv260_wake_margin")
+        if margin in (None, ""):
+            margin = WAKE_MARGIN
+        else:
+            try:
+                margin = float(margin)
+            except (TypeError, ValueError):
+                raise BackendError(f"Invalid type for 'kv260_wake_margin': expected a number, but got "
+                                   f"'{margin}' instead.", "kv260_wake_margin", code="invalid_type") from None
+            if math.isnan(margin) or margin > 0:
+                raise BackendError(f"Invalid 'kv260_wake_margin': expected a number <= 0 (nats), but got "
+                                   f"{margin} instead.", "kv260_wake_margin", code="invalid_value")
+        if self.detok is None:
+            self.load_host()
+        return Phrase.of(self.detok, " ".join(text.split())), margin
 
     # ── FPGA side ──
 
@@ -265,9 +447,13 @@ class MoonshineBackend(Backend):
         enc_ms = dec_ms = 0.0
         steps = 0
         parts = self.engine.chunks(job.pcm)
-        for a, n in parts:
+        wake = None
+        for i, (a, n) in enumerate(parts):
             cancel.check()
-            ids, st = self.engine.transcribe(job.pcm[a:a + n])
+            if job.wake is not None and i == 0:
+                ids, st, wake = self._phrase_part(job, job.pcm[a:a + n], len(parts))
+            else:
+                ids, st = self.engine.transcribe(job.pcm[a:a + n])
             enc_ms += st.get("encode_ms", 0.0)
             dec_ms += st.get("decode_ms", 0.0)
             steps += st.get("steps", 0)
@@ -288,7 +474,28 @@ class MoonshineBackend(Backend):
                 "source": job.source.get("source")}
         info["log"] = {"parts": len(parts), "steps": steps, "input": f"{job.decode_ms:.0f}ms",
                        "fpga": f"{fpga_s * 1000.0:.0f}ms", "rtf": f"{rtf:.3f}" if rtf else "-"}
+        if wake is not None:
+            info["wake"] = wake
+            if "margin" in wake:
+                info["log"]["wake"] = f"{wake['margin']:.2f}{'+' if wake['passed'] else '-'}"
         yield Finish("stop", prompt_tokens=0, completion_tokens=len(ids_all), info=info)
+
+    def _phrase_part(self, job: TranscriptionJob, pcm, parts: int):
+        """The first part with the phrase check -> (ids, stats, kv260.wake)."""
+        eng = self.engine
+        why = (None if getattr(eng, "can_check", False) else
+               f"{getattr(eng, 'lib_path', 'the library')} has no asr_last_logits (regenerate it)")
+        if why is None and parts > 1:
+            why = "the audio is longer than one encoder pass"
+        if why is not None:
+            ids, st = eng.transcribe(pcm)
+            return ids, st, {"phrase": job.wake.text, "passed": False, "error": why}
+        if self._punct is None:
+            self._punct = punct_ids(self.detok)
+        ids, st, res = phrase_decode(eng, pcm, job.wake, job.wake_margin, self._punct)
+        res["margin"] = round(res["margin"], 3)
+        res["min_margin"] = job.wake_margin
+        return ids, st, res
 
     def health(self) -> Dict[str, Any]:
         st = self.stats

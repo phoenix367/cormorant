@@ -1,7 +1,9 @@
 """Speech to text: speech_input.py (WAV forms, the resampler, ffmpeg), the
-tokenizer.json detokenizer and MoonshineBackend of moonshine_backend.py over a
-fake library, and POST /v1/audio/transcriptions of kv260_chat_server.py
-(multipart forms, the response formats, SSE, aliases, OpenAI-style errors).
+tokenizer.json reader, the phrase check (phrase_decode over a scripted
+decoder) and MoonshineBackend of moonshine_backend.py over a fake library, and
+POST /v1/audio/transcriptions of kv260_chat_server.py (multipart forms, the
+response formats, SSE, aliases, the phrase check's fields, OpenAI-style
+errors).
 The real library's transcripts are gated by demo/asr/scripts/asr_host_emu.py
 --lib-check (host) and asr_board.py (board)."""
 
@@ -161,11 +163,11 @@ def tokenizer_file(d):
 
 
 @unittest.skipIf(np is None, "needs numpy")
-class TestDetokenizer(unittest.TestCase):
+class TestTokenizer(unittest.TestCase):
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.path, self.v = tokenizer_file(self.td.name)
-        self.dt = mb.Detokenizer(self.path)
+        self.dt = mb.Tokenizer(self.path)
 
     def tearDown(self):
         self.td.cleanup()
@@ -188,7 +190,7 @@ class TestDetokenizer(unittest.TestCase):
         with open(path, "w") as f:
             json.dump({"model": {"type": "WordPiece", "vocab": {}}}, f)
         with self.assertRaises(ValueError):
-            mb.Detokenizer(path)
+            mb.Tokenizer(path)
 
     def test_matches_tokenizers_on_moonshine(self):
         """The real tokenizer.json against the tokenizers library, where both exist."""
@@ -199,12 +201,21 @@ class TestDetokenizer(unittest.TestCase):
             self.skipTest("needs the tokenizers package")
         if not os.path.exists(real):
             self.skipTest("needs demo/asr/assets/moonshine-base (asr_study.py fetch)")
-        tok, dt = Tokenizer.from_file(real), mb.Detokenizer(real)
+        tok, dt = Tokenizer.from_file(real), mb.Tokenizer(real)
         rng = np.random.default_rng(0)
         texts = ["Hello, world!", "It's 3:45 pm — naïve café ünïcödé ✓ 東京", "  leading spaces"]
         cases = [tok.encode(t).ids for t in texts] + [list(rng.integers(0, 32768, 40)) for _ in range(30)]
         for ids in cases:
             self.assertEqual(dt.decode(ids), tok.decode([int(i) for i in ids], skip_special_tokens=True))
+        words = ["Hello", "Miranda", "hello", "miranda", "Hey", "Jarvis", "OK", "computer", "Mjolnir",
+                 "naïve", "café", "東京", "✓", "Wörter", "x", "don't", "Supercalifragilistic"]
+        phrases = texts + ["Hello Miranda", "Hello, Miranda.", "hello  miranda", " Miranda", ""]
+        phrases += [" ".join(rng.choice(words, rng.integers(1, 5))) for _ in range(200)]
+        for t in phrases:
+            self.assertEqual(dt.encode(t), tok.encode(t, add_special_tokens=False).ids, t)
+        self.assertEqual(dt.encode("Hello Miranda"), [15043, 11612, 5863])
+        self.assertTrue({29892, 29889, 29973} <= mb.punct_ids(dt))            # , . ?
+        self.assertNotIn(15043, mb.punct_ids(dt))
 
 
 class FakeAsrEngine:
@@ -240,6 +251,11 @@ class FakeAsrEngine:
 
 
 class FakeDetok:
+    pieces = ["▁w"] * 8
+
+    def encode(self, text):
+        return [5] * len(text.split())
+
     def decode(self, ids):
         return " ".join(f"w{i}" for i in ids)
 
@@ -247,6 +263,195 @@ class FakeDetok:
 def asr_backend(**kw):
     eng = FakeAsrEngine(**{k: kw.pop(k) for k in ("max_samples", "delay") if k in kw})
     return mb.MoonshineBackend(eng, "unused", detokenizer=FakeDetok(), **kw)
+
+
+# The phrase check's scripted decoder: what it writes after each prefix.
+BOS, EOS = 1, 2
+HELLO, MIR, ANDA, COMMA, QM, HOW, OLD, WHAT, TIME = 10, 11, 12, 13, 14, 20, 21, 22, 23
+PIECES = {HELLO: "▁Hello", MIR: "▁Mir", ANDA: "anda", COMMA: ",", QM: "?", HOW: "▁How", OLD: "▁old",
+          WHAT: "▁what", TIME: "▁time"}
+HOW_OLD = [HOW, OLD, COMMA, MIR, ANDA, QM, WHAT, TIME]             # "How old, Miranda? what time"
+
+
+def chain(seq, top=3000):
+    """{prefix: {next token: raw logit}} of a decoder that writes seq."""
+    return {tuple(seq[:i]): {t: top} for i, t in enumerate(seq)}
+
+
+class FakeTokenizer:
+    def __init__(self):
+        self.pieces = [None] * 32
+        for i, p in PIECES.items():
+            self.pieces[i] = p
+
+    def encode(self, text):
+        return {"Hello": [HELLO], "Miranda": [MIR, ANDA]}.get(text.split()[0], []) + (
+            self.encode(" ".join(text.split()[1:])) if len(text.split()) > 1 else [])
+
+    def decode(self, ids):
+        return "".join(self.pieces[i] for i in ids if 0 <= i < len(self.pieces) and self.pieces[i]
+                       ).replace("▁", " ").strip()
+
+
+class ScriptedEngine(FakeAsrEngine):
+    """A decoder with steps: the cache holds the tokens fed at positions 0 .. pos
+    (a step at an earlier position rewrites from there); after a prefix the raw
+    logits come from `script` (every other token -3000, </s> 0)."""
+
+    can_check, bos, eos, logit_frac = True, BOS, EOS, 8
+
+    def __init__(self, script, S=30, **kw):
+        super().__init__(**kw)
+        self.script, self.S = script, S
+        self.rows, self.lg, self.steps, self.encodes = [], {}, 0, 0
+
+    def max_steps(self, n):
+        return min(self.S, n // 100)
+
+    def encode(self, pcm):
+        self.encodes += 1
+        self.rows = []
+
+    def step(self, token, pos):
+        assert pos <= len(self.rows), (pos, self.rows)
+        self.rows = self.rows[:pos] + [token]
+        self.steps += 1
+        self.lg = dict(self.script.get(tuple(self.rows[1:]), {}))
+        self.lg.setdefault(EOS, 0)
+        best = max(self.lg.values())
+        return min(t for t, v in self.lg.items() if v == best)
+
+    def logits(self, tokens):
+        return [self.lg.get(t, -3000) for t in tokens]
+
+    def transcribe(self, pcm):
+        """asr_transcribe: plain greedy."""
+        self.encode(pcm)
+        ids, a = [], self.step(BOS, 0)
+        while len(ids) < self.max_steps(len(pcm)) and a != EOS:
+            ids.append(a)
+            if len(ids) < self.max_steps(len(pcm)):
+                a = self.step(a, len(ids))
+        return ids, {"encode_ms": 1.0, "decode_ms": 2.0, "steps": self.steps}
+
+
+PHRASE = mb.Phrase("Hello Miranda", [HELLO, MIR, ANDA], [True, True, False]) if np is not None else None
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class TestPhraseCheck(unittest.TestCase):
+    def how_old(self):
+        """The board's log: "How old, Miranda? ..." heard; fed "Hello" the decoder
+        writes the comma, the name and the rest."""
+        sc = chain([HELLO, COMMA, MIR, ANDA, QM, WHAT, TIME])
+        sc.update(chain(HOW_OLD))
+        sc[()] = {HOW: 3000, HELLO: 2000}                          # Hello: 1000 / 256 = 3.906 nats behind
+        sc[(HELLO,)] = {COMMA: 3000, MIR: 2900}
+        return sc
+
+    def check(self, script, min_margin, S=30):
+        eng = ScriptedEngine(script, S=S)
+        ids, st, res = mb.phrase_decode(eng, np.zeros(5000, np.int16), PHRASE, min_margin, frozenset({COMMA, QM}))
+        return eng, ids, st, res
+
+    def plain(self, script, S=30):
+        return ScriptedEngine(script, S=S).transcribe(np.zeros(5000, np.int16))[0]
+
+    def test_kept(self):
+        eng, ids, st, res = self.check(self.how_old(), -6.0)
+        self.assertEqual(ids, [HELLO, COMMA, MIR, ANDA, QM, WHAT, TIME])
+        self.assertEqual(res, {"phrase": "Hello Miranda", "margin": -1000 / 256, "complete": True, "passed": True})
+        self.assertEqual((eng.encodes, st["steps"]), (1, 8))
+
+    def test_dropped_at_once_costs_no_step(self):
+        eng, ids, st, res = self.check(self.how_old(), -3.0)
+        self.assertEqual(ids, self.plain(self.how_old()))
+        self.assertEqual(ids, HOW_OLD)
+        self.assertEqual((res["passed"], res["complete"], res["margin"]), (False, False, -1000 / 256))
+        self.assertEqual(st["steps"], len(HOW_OLD) + 1)            # as many as the plain transcript
+
+    def test_dropped_later_rewrites_the_cache(self):
+        sc = self.how_old()
+        sc[(HELLO,)] = {WHAT: 3000, MIR: 1000}                     # 2000 more behind at the name
+        eng, ids, st, res = self.check(sc, -6.0)
+        self.assertEqual(ids, HOW_OLD)
+        self.assertEqual((res["passed"], res["complete"], res["margin"]), (False, False, -3000 / 256))
+
+    def test_the_phrase_itself(self):
+        seq = [HELLO, MIR, ANDA, WHAT, TIME]
+        eng, ids, st, res = self.check(chain(seq), 0.0)
+        self.assertEqual((ids, res["margin"], res["passed"]), (seq, 0.0, True))
+        self.assertEqual(ids, self.plain(chain(seq)))
+
+    def test_step_limit(self):
+        eng, ids, st, res = self.check(self.how_old(), -6.0, S=3)   # Hello , Mir: the phrase not complete
+        self.assertEqual((ids, res["complete"], res["passed"]), (HOW_OLD[:3], False, False))
+        eng, ids, st, res = self.check(self.how_old(), -6.0, S=4)
+        self.assertEqual((ids, res["passed"]), ([HELLO, COMMA, MIR, ANDA], True))
+        eng, ids, st, res = self.check(self.how_old(), -6.0, S=0)
+        self.assertEqual((ids, eng.encodes), ([], 0))
+
+    def test_punctuation_only_between_words(self):
+        sc = chain([HELLO, MIR, COMMA, ANDA])                      # "Mir, anda": no free comma inside a word
+        eng, ids, st, res = self.check(sc, -100.0)
+        self.assertEqual(ids[:3], [HELLO, MIR, ANDA])
+        self.assertEqual(res["margin"], -6000 / 256)
+        sc = chain([COMMA, HELLO, MIR, ANDA])                      # nor before the first word
+        eng, ids, st, res = self.check(sc, -100.0)
+        self.assertEqual(ids[0], HELLO)
+
+
+@unittest.skipIf(np is None, "needs numpy")
+class TestPhraseFields(unittest.TestCase):
+    def backend(self, eng):
+        return mb.MoonshineBackend(eng, "unused", detokenizer=FakeTokenizer())
+
+    def req(self, n=5000, **raw):
+        return TranscriptionRequest(model="moonshine-base", audio=wav_bytes(np.zeros(n, np.int16)), raw=raw)
+
+    def test_fields(self):
+        from chat_backend import BackendError
+        b = self.backend(ScriptedEngine({}))
+        job = b.prepare_transcription(self.req(kv260_wake_phrase=" Hello   Miranda ", kv260_wake_margin="-4.5"))
+        self.assertEqual((job.wake.text, job.wake.ids, job.wake.word_start, job.wake_margin),
+                         ("Hello Miranda", [HELLO, MIR, ANDA], [True, True, False], -4.5))
+        job = b.prepare_transcription(self.req(kv260_wake_phrase="Hello Miranda"))
+        self.assertEqual(job.wake_margin, mb.WAKE_MARGIN)
+        self.assertIsNone(b.prepare_transcription(self.req(kv260_wake_margin="-1")).wake)
+        for raw, param, code in (({"kv260_wake_phrase": "x" * 65}, "kv260_wake_phrase", None),
+                                 ({"kv260_wake_phrase": "  "}, "kv260_wake_phrase", None),
+                                 ({"kv260_wake_phrase": "Hello", "kv260_wake_margin": "low"}, "kv260_wake_margin",
+                                  "invalid_type"),
+                                 ({"kv260_wake_phrase": "Hello", "kv260_wake_margin": "0.5"}, "kv260_wake_margin",
+                                  "invalid_value")):
+            with self.assertRaises(BackendError) as cm:
+                b.prepare_transcription(self.req(**raw))
+            self.assertEqual(cm.exception.param, param, raw)
+            if code:
+                self.assertEqual(cm.exception.code, code)
+
+    def test_transcribe_reports_the_check(self):
+        b = self.backend(ScriptedEngine(TestPhraseCheck().how_old(), max_samples=16000))
+        b.load()
+        job = b.prepare_transcription(self.req(kv260_wake_phrase="Hello Miranda"))
+        out = list(b.transcribe(job, CancelToken()))
+        self.assertEqual(out[0].tokens, [HELLO, COMMA, MIR, ANDA, QM, WHAT, TIME])
+        self.assertEqual(out[-1].info["text"], "Hello, Miranda? what time")
+        self.assertEqual(out[-1].info["wake"], {"phrase": "Hello Miranda", "margin": -3.906, "complete": True,
+                                                "passed": True, "min_margin": mb.WAKE_MARGIN})
+        self.assertEqual(out[-1].info["log"]["wake"], "-3.91+")
+
+    def test_no_check_without_the_library_or_for_long_audio(self):
+        b = mb.MoonshineBackend(FakeAsrEngine(), "unused", detokenizer=FakeTokenizer())
+        b.load()
+        out = list(b.transcribe(b.prepare_transcription(self.req(kv260_wake_phrase="Hello Miranda")), CancelToken()))
+        self.assertEqual(out[0].tokens, [53])
+        self.assertIn("asr_last_logits", out[-1].info["wake"]["error"])
+        b = self.backend(ScriptedEngine(chain(HOW_OLD), max_samples=4000))
+        b.load()
+        out = list(b.transcribe(b.prepare_transcription(self.req(kv260_wake_phrase="Hello Miranda")), CancelToken()))
+        self.assertEqual(len(out) - 1, 2)
+        self.assertEqual(out[-1].info["wake"]["error"], "the audio is longer than one encoder pass")
 
 
 @unittest.skipIf(np is None, "needs numpy")
@@ -371,6 +576,13 @@ class TestTranscriptionServer(unittest.TestCase):
         self.assertEqual("".join(e["delta"] for e in ev[:-1]), "w163 w163 w83")
         self.assertEqual(ev[-1]["text"], "w163 w163 w83")
         self.assertEqual(ev[-1]["usage"], {"type": "duration", "seconds": 3})
+
+    def test_phrase_check_fields(self):
+        st, _, out = self.post({"kv260_wake_phrase": "Hello Miranda"})
+        self.assertEqual(st, 200, out)
+        self.assertIn("asr_last_logits", json.loads(out)["kv260"]["wake"]["error"])   # the fake has no steps
+        st, _, out = self.post({"kv260_wake_phrase": "Hello Miranda", "kv260_wake_margin": "high"})
+        self.assertEqual((st, json.loads(out)["error"]["param"]), (400, "kv260_wake_margin"))
 
     def test_errors(self):
         cases = [({"model": "moonshine-base"}, [], 400, "missing_required_parameter"),

@@ -403,18 +403,21 @@ class AsrFrameCountNode(AsrNode):
 
 @dataclass
 class AsrArgmaxNode(AsrNode):
-    """logits [1][V] (int16, one exponent) -> id [1] (i32 host): the first maximum."""
-    V: int = 1
+    """logits [1][V] (int16, one exponent fl) -> id [1] (i32 host): the first
+    maximum.  The helper also keeps where the logits are, for the library's
+    asr_last_logits() (demo/asr/src/asr_api.h; generate_asr_project.py writes fl
+    into its glue)."""
+    V:  int = 1
+    fl: int = 8
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
         (lg,) = _llm_inputs(node, tensors)
         y = _resolve(tensors, node.output[0], node)
         sn = cls(onnx_node=node, inputs=[lg], output=y, index=index, align_elems=align_elems,
-                 F=ctx.frac_bits, V=lg.numel)
+                 F=ctx.frac_bits, V=lg.numel, fl=_scalar_exp(lg, ctx.frac_bits, node, "logits"))
         sn._want(lg, None, "logits")
         sn._want(y, "i32", "output")
-        _scalar_exp(lg, ctx.frac_bits, node, "logits")
         _require(y.numel == 1, node, "output [1]")
         return sn
 
@@ -866,6 +869,11 @@ static void asr_gelu_res(const Data_t *x, const int32_t *const *tab, const unsig
     }
 }
 
+/* The logits the last argmax read (valid until the next inference run): the
+ * library's asr_last_logits() (demo/asr/src/asr_api.h). */
+const int16_t *asr_argmax_logits;
+unsigned       asr_argmax_vocab;
+
 /* The first maximum of V int16 logits. */
 static unsigned asr_argmax(const Data_t *lg, unsigned V)
 {
@@ -873,6 +881,8 @@ static unsigned asr_argmax(const Data_t *lg, unsigned V)
     unsigned       i, best = 0u;
     for (i = 1u; i < V; i++)
         if (l[i] > l[best]) best = i;
+    asr_argmax_logits = l;
+    asr_argmax_vocab = V;
     return best;
 }
 """

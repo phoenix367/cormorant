@@ -39,6 +39,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 | plan tactics and the issue order from measured performance (`--plan`), or calibrate a new bitstream | [INFERENCE_SCHEDULER "Planning"](scheduler/INFERENCE_SCHEDULER.md#planning---plan), [TACTICS_PLAN §9](plans/TACTICS_PLAN.md); `perf_calibrate.py` and its data: [`perf_models/`](../inference-scheduler/perf_models/README.md) |
 | see the latest board results | the project [README](../README.md#results-on-the-board) |
 | run the chat server on the board, or use it from a client | the chat server's [README](../demo/chat/README.md), [DEPLOY](../demo/chat/doc/DEPLOY.md) and [CLIENTS](../demo/chat/doc/CLIENTS.md) |
+| talk to the board ("Hello Miranda") | [`demo/miranda`](../demo/miranda/README.md) |
 | fix a board that stops responding | [CHAT_PLAN §18](plans/CHAT_PLAN.md) and [`board/kv260/`](../board/kv260/) |
 | debug a strange RTL simulation failure | [SIMULATION_ISSUES](build-and-test/SIMULATION_ISSUES.md) |
 

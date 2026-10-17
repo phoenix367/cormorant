@@ -199,6 +199,7 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, Piper text to speech (`/v1/audio/speech`) and Moonshine speech to text (`/v1/audio/transcriptions`) |
 | [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |
 | [`demo/asr/`](demo/asr/scripts/) | Moonshine speech to text: the study (Whisper and Moonshine screened), the bit-level specification, `libmoonshine_<size>.so` and its host-emulation and board gates (token ids bit-exact with the specification) |
+| [`demo/miranda/`](demo/miranda/) | Miranda, a voice assistant: say "Hello Miranda" and a request; the console client streams the microphone to the board (RTP), which detects speech (VAD on the CPU), recognizes the key phrase and the request (Moonshine), answers (SmolLM2) and speaks (Piper) through the chat server |
 
 ---
 
@@ -314,7 +315,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 | Layer | Needs | Command |
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1880<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->215<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->225<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

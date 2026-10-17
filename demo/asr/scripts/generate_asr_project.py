@@ -37,6 +37,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(REPO, "inference-scheduler"))
 
+from src.asr_nodes import AsrArgmaxNode                 # noqa: E402
 from src.codegen.multi import MultiEntryGenerator       # noqa: E402
 from src.graph import OnnxGraph                         # noqa: E402
 from src.llama import load_safetensors                  # noqa: E402
@@ -112,10 +113,10 @@ def entry_graphs(cfg: MoonshineConfig, W: dict, fmt: MoonshineFormats, buckets=B
     return [(f"encode_{T}", enc[T]) for T in sorted(buckets)] + [("decode", OnnxGraph(fe.decode_entry()))]
 
 
-def write_glue(out: str, cfg: MoonshineConfig, buckets, active) -> None:
+def write_glue(out: str, cfg: MoonshineConfig, buckets, active, logit_frac: int) -> None:
     """test/asr_glue.h: inference_init() with the project's kernels (``active``:
     the generator's active kernels), the buckets, a dispatcher to their run
-    functions and the model's constants."""
+    functions and the model's constants (``logit_frac``: the logits' exponent)."""
     bs = sorted(buckets)
     cases = "\n".join(f"    case {i}: inference_run_encode_{T}(pcm, n, pos); return;" for i, T in enumerate(bs))
     text = (
@@ -129,6 +130,7 @@ def write_glue(out: str, cfg: MoonshineConfig, buckets, active) -> None:
         f"#define ASR_EOS        {cfg.eos}\n"
         f"#define ASR_MAX_POS    {cfg.max_pos}   /* the decoder's positions */\n"
         f"#define ASR_VOCAB      {cfg.V}\n"
+        f"#define ASR_LOGIT_FRAC {logit_frac}   /* the logits are int16 at 2^-ASR_LOGIT_FRAC */\n"
         f"static const int asr_buckets[ASR_N_BUCKETS] = {{ {', '.join(str(b) for b in bs)} }};\n\n"
         "/* inference_init() with every kernel the project drives (" + ", ".join(kd.name for kd in active)
         + ") */\nstatic int asr_glue_init(void)\n{\n"
@@ -202,7 +204,8 @@ def generate(out: str, cfg: MoonshineConfig, W: dict, fmt: MoonshineFormats, mod
     missing = populate_drivers(out, driver_dirs or {}, cg._active_kernels)
     for name in C_SOURCES:
         shutil.copy2(os.path.join(SRC, name), os.path.join(out, "test", name))
-    write_glue(out, cfg, buckets, cg._active_kernels)
+    (am,) = [sn for sn in dict(entries)["decode"].nodes if isinstance(sn, AsrArgmaxNode)]
+    write_glue(out, cfg, buckets, cg._active_kernels, am.fl)
     patch_cmake(out, cg, model, lib)
     if tokenizer:
         shutil.copy2(tokenizer, os.path.join(out, "weights", "tokenizer.json"))

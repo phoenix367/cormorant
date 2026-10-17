@@ -11,8 +11,13 @@ gate without the board.
 With --lib-check, libmoonshine_<size>.so is built the same way and driven by
 the chat server's backend (demo/chat/moonshine_backend.py: LibAsrEngine
 through ctypes, MoonshineBackend's parts, the uploaded WAV decoded by
-speech_input.py, the ids decoded by its Detokenizer): every utterance's ids
-must equal the specification's, the transcript is printed.
+speech_input.py, the ids decoded by its Tokenizer): every utterance's ids
+must equal the specification's, the transcript is printed.  Then the phrase
+check (kv260_wake_phrase "Hello Miranda") on every one-part utterance, through
+the backend and against phrase_decode over the specification (SpecEngine):
+kept (any margin: the decoder fed the phrase, then greedy on) and dropped (the
+default margin: the plain transcript again, from a cache the phrase wrote) —
+ids and margins equal.
 
 The utterances are LibriSpeech test-clean ones of the study's evaluation set
 (asr_study.py fetch): by default the shortest and the ones closest to 5 s and
@@ -159,6 +164,37 @@ def select(which: str):
     return [by_id[w] for w in want]
 
 
+class SpecEngine:
+    """The specification as phrase_decode's engine (LibAsrEngine's steps): a step
+    at an earlier position drops the self caches from it on — the library
+    rewrites those rows, its attention reads rows 0 .. pos."""
+
+    def __init__(self, m, cfgd, logit_frac: int):
+        self.m, self.cfg, self.logit_frac = m, cfgd, logit_frac
+        self.bos, self.eos = cfgd["decoder_start_token_id"], cfgd["eos_token_id"]
+        self.lg = None
+
+    def max_steps(self, n: int) -> int:
+        import moonshine_np as mn
+        return max(min(mn.max_tokens(n), self.cfg["max_position_embeddings"]) - 1, 0)
+
+    def encode(self, pcm) -> None:
+        self.m.start(self.m.encode(np.asarray(pcm, np.int16)))
+
+    def step(self, token: int, pos: int) -> int:
+        m = self.m
+        if pos < m.pos:
+            m.kc, m.vc, m.pos = [k[:pos] for k in m.kc], [v[:pos] for v in m.vc], pos
+        assert pos == m.pos, (pos, m.pos)
+        raw = np.asarray(m.step(token), np.float64).reshape(-1) * 2.0 ** self.logit_frac
+        self.lg = np.rint(raw).astype(np.int64)
+        assert np.array_equal(self.lg, raw), "logits off the int16 grid"
+        return int(np.argmax(self.lg))
+
+    def logits(self, tokens):
+        return [int(self.lg[t]) for t in tokens]
+
+
 def lib_check(project: str, work: str, utts) -> bool:
     """The chat server's MoonshineBackend over the host-built library (see the
     module docstring)."""
@@ -167,7 +203,7 @@ def lib_check(project: str, work: str, utts) -> bool:
     import moonshine_q as mq
     sys.path.insert(0, os.path.join(REPO, "demo", "chat"))
     from chat_backend import CancelToken, TranscriptionRequest
-    from moonshine_backend import LibAsrEngine, MoonshineBackend
+    from moonshine_backend import WAKE_MARGIN, LibAsrEngine, MoonshineBackend, phrase_decode, punct_ids
     os.environ.setdefault("INFERENCE_HOST_THREADS", "4")
     summary = json.load(open(os.path.join(project, "project.json")))
     b = MoonshineBackend(LibAsrEngine(build(project, work, shared=True), project),
@@ -188,10 +224,28 @@ def lib_check(project: str, work: str, utts) -> bool:
             job = b.prepare_transcription(TranscriptionRequest(model=b.model_id, audio=buf.getvalue()))
             out = list(b.transcribe(job, CancelToken()))
             ids = [t for sg in out[:-1] for t in sg.tokens]
-            same = ids == mq.transcribe_long(m, cfgd, pcm, frames)
+            plain = mq.transcribe_long(m, cfgd, pcm, frames)
+            same = ids == plain
             ok &= same
             print(f"  {uid}: {len(pcm) / 16000:.2f} s, {len(out) - 1} part(s) in {time.time() - t0:.0f} s: "
                   + ("ids bit-exact" if same else "MISMATCH") + f"\n    {out[-1].info['text']}", flush=True)
+            if len(out) - 1 > 1:
+                continue
+            spec_eng = SpecEngine(m, cfgd, b.engine.logit_frac)
+            for margin in ("-1000", str(WAKE_MARGIN)):
+                job = b.prepare_transcription(TranscriptionRequest(
+                    model=b.model_id, audio=buf.getvalue(),
+                    raw={"kv260_wake_phrase": "Hello Miranda", "kv260_wake_margin": margin}))
+                out = list(b.transcribe(job, CancelToken()))
+                got, wake = [t for sg in out[:-1] for t in sg.tokens], out[-1].info["wake"]
+                want, _, res = phrase_decode(spec_eng, pcm, job.wake, job.wake_margin, punct_ids(b.detok))
+                same = got == want and wake["passed"] == res["passed"] and wake["margin"] == round(res["margin"], 3)
+                if not wake["passed"]:
+                    same &= got == plain
+                ok &= same
+                print(f"    phrase check at {margin}: margin {wake['margin']:.3f}, "
+                      + ("kept" if wake["passed"] else "dropped") + (", bit-exact" if same else ", MISMATCH")
+                      + f"\n      {out[-1].info['text']}", flush=True)
     finally:
         b.close()
     return ok
@@ -213,7 +267,8 @@ def main(argv=None) -> int:
     os.makedirs(work, exist_ok=True)
     if args.lib_check:
         ok = lib_check(project, work, select(args.utts))
-        print("LIB CHECK: " + ("MoonshineBackend ids bit-exact with the specification" if ok else "MISMATCH"))
+        print("LIB CHECK: " + ("MoonshineBackend ids and phrase checks bit-exact with the specification"
+                               if ok else "MISMATCH"))
         return 0 if ok else 1
     exe = build(project, work, args.incoherent)
     utts = select(args.utts)

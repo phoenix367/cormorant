@@ -799,3 +799,127 @@ text; it no longer sends anything to the chat model.
 - **Uploads other than 16 kHz WAV cost host time before the queue**: the
   resampler 0.11 s per second of 44.1 kHz stereo audio, and ffmpeg 3 s
   (its start-up on the board).
+
+## 8. The phrase check (2026-10-17)
+
+**Why.**  Miranda (`demo/miranda`) wakes on "Hello Miranda" in the
+transcript of each speech segment.  For one speaker's voice Moonshine wrote
+the phrase as "How old, Miranda", "Oh, Mjolanda", "How old, Muganda", "A
+warm Yuranda" — no fuzzy match on the text can follow it everywhere without
+waking on everything.  Moonshine has no prompt: its tokenizer has `<s>`,
+`</s>`, `<unk>` and 768 unused placeholders, and the decoder starts from
+`<s>` alone.  But the library hands the decoder's tokens to the caller
+(`asr_decode_step`), so the phrase can be fed as the first tokens and
+scored: teacher forcing, how the decoder was trained.
+
+### What was built
+
+- **The library** (`demo/asr/src/asr_api.h`): `asr_last_logits(tokens, n,
+  out)` — the last step's raw int16 logits of the tokens asked for —,
+  `asr_logit_frac()` (their exponent, 8 for both models;
+  `generate_asr_project.py` writes it into `asr_glue.h` as
+  `ASR_LOGIT_FRAC`, from the argmax node) and `asr_max_steps(n)` (the
+  decode steps `asr_transcribe` allows a part).  The generated argmax
+  helper (`src/asr_nodes.py` `ASR_C`) keeps a pointer to the logits it read;
+  an `asr_encode` invalidates it (the encoder's buffers may share the
+  logits' pool slot).  The token ids are unchanged.
+- **The check** (`demo/chat/moonshine_backend.py` `phrase_decode`):
+  - the phrase's tokens from `Tokenizer.encode` (a BPE encoder for
+    `tokenizer.json`, equal to the `tokenizers` library on 200+ phrases;
+    the class was `Detokenizer`);
+  - the margin = Σ (logit[phrase token] − logit[the step's argmax]) / 2^8
+    over the steps where they differ — the log-softmax's normaliser
+    cancels, so no exponential is needed;
+  - punctuation the decoder picks before one of the phrase's words is
+    taken as it is, at no cost (at most two in a row);
+  - once the sum is below the limit it stops (`complete: false`), and the
+    plain transcript continues from the first step's token: the decoder
+    rewrites its self-attention cache from position 1 on, and its
+    attention reads rows 0 .. pos only;
+  - at or above the limit the decoder goes on greedily from the phrase.
+- **The API**: the non-standard form fields `kv260_wake_phrase` (≤ 64
+  characters) and `kv260_wake_margin` (≤ 0, default −10); the response's
+  `kv260.wake` (`phrase`, `margin`, `complete`, `passed`, `min_margin`, or
+  `error` for audio longer than one encoder pass or a library without
+  `asr_last_logits`); the request log's `wake=-2.37+`
+  ([Speech to text](../../demo/chat/doc/SPEECH_TO_TEXT.md#the-phrase-check)).
+- **Miranda**: every segment is checked (`--wake-margin`, default −10;
+  `--no-wake-check`) — while awake or in a dialogue too, so the phrase said
+  again is not taken for the request; its log line shows the margin;
+  `--save-segments DIR` keeps the segments with their transcripts and
+  margins, to tune the limit to a voice.
+
+### Gates
+
+- **Host emulation** (`asr_host_emu.py --lib-check`, moonshine-tiny, 4
+  utterances): the transcripts bit-exact as before, and on the three
+  one-part utterances the check through the backend equal to
+  `phrase_decode` over the specification (`SpecEngine`: a step at an
+  earlier position drops the cache rows from it on) — kept at −1000
+  (margins −18.6 / −25.1 / −27.9, the decoding from the forced phrase) and
+  dropped at the default (the plain transcript after the phrase wrote the
+  cache): ids and margins equal.
+- **Board** (`asr_board.py`, moonshine-base regenerated): 200 / 200
+  utterances bit-exact, re-open identical; installed in the chat server.
+- **Tests**: `test_transcription.py` (a scripted decoder: kept, dropped at
+  the first token with no extra step, dropped later with the cache
+  rewritten, the phrase written by the decoder itself, the step limit,
+  punctuation only between words; the fields; the response) — the chat
+  suite 225; `test_miranda.py` `test_phrase_check` — 22.
+
+### Calibration on the board
+
+Through the chat server's API, `kv260_wake_margin=-1000` (the whole margin);
+Piper's voice at speed 1.0, 0.85 with pink noise at −45 dBFS, and 1.2 at
+−40 dBFS; LibriSpeech test-clean (the study's evaluation set, ≤ 24.5 s):
+
+| Speech | Takes | Margin |
+|---|---:|---|
+| "Hello Miranda …" (17 sentences) | 51 | 0.00; "Hello Miranda." alone −0.44 / −0.24 in two takes |
+| "Haloma Randa …", "Hallo Maranda …" | 6 | 0.00 … −3.95 |
+| "Okay, hello Miranda …" | 3 | −5.2 … −6.2 |
+| "Hello Veranda / Amanda / Melinda / Rwanda / Fernanda" | 15 | −3.3 … −10.6 |
+| "Hi Miranda", "Hey Miranda", "Miranda, …" | 9 | −10.3 … −18.1 |
+| "Hello there / everyone / my friend / Linda / Rhonda", "Hello, Mr. Anderson", "Hello, Mirabel", "Yellow veranda" | 24 | −10.8 … −21.0 |
+| "How old is Miranda?", "Miranda is at home.", "I saw Miranda yesterday." | 9 | −12.5 … −29.6 |
+| Piper saying the mishearings ("How old, Miranda", "Oh, Mjolanda", "How old, Muganda", "A warm Yuranda", "Harew. Hello") | 15 | −15.9 … −22.7 |
+| LibriSpeech utterances | 196 | −15.5 … −41.9 (median −28.6) |
+
+**The limit, −10**, keeps every LibriSpeech utterance out by 5.5 nats and
+the greetings to someone else out, and takes the phrase in any accent the
+decoder still finds within 10 nats (a factor of e^10 below its own choice,
+summed over the phrase).  Names that rhyme with Miranda after "Hello" wake
+her — as the transcript's name path (`wake.py`) already did.
+
+**Cost** (20 LibriSpeech utterances, and 4 "Hello Miranda" ones, each
+transcribed with and without the check): +2.7 ms on average, +33 ms at
+most, for speech without the phrase (the sum usually falls below the limit
+at the first token, and the plain transcript reuses that step); +0 ms for
+the phrase.  The transcripts were the same (24 / 24).
+
+### The speaker's voice
+
+Piper saying the mishearings scores −16 … −23, so it was open whether the
+speaker's "Hello Miranda" would come out near 0 or as low as ordinary
+speech (LibriSpeech reaches −15.5).  The speaker said it ten times into
+Miranda (Miranda's log, 2026-10-17 15:38–15:40):
+- **Checked (listening):** margins −7.67, 0.00, −5.75, −2.68, −2.15 — five
+  of five kept, each transcribed "Hello, Miranda."; the one segment
+  without the phrase −12.38.
+- **Unchecked (awake: Miranda checked only while listening then):**
+  "Hello, Meganda.", "Homey granda", "How old me, Randa?", "Hello,
+  Miranda." — "Homey granda" was answered as the request.  Since then every
+  segment is checked, and the phrase said again while awake waits for the
+  request anew (`test_miranda.py` `test_phrase_check`).
+
+### Commands and runtimes
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+$PY demo/asr/scripts/generate_asr_project.py --model moonshine-base           # ~1 min (also moonshine-tiny)
+$PY demo/asr/scripts/asr_host_emu.py --project demo/asr/build/moonshine-tiny_project --lib-check   # ~3 min
+$PY demo/chat/deploy.py --stop
+$PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project   # 15 min (the specification
+                                                                               # recomputed: its cache key changed)
+$PY demo/chat/deploy.py && $PY demo/miranda/deploy.py
+```

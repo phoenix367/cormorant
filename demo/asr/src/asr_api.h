@@ -57,6 +57,19 @@ int         asr_chunks(const int16_t *pcm, int n, int32_t *starts, int32_t *lens
 int         asr_encode(const int16_t *pcm, int n);
 int         asr_decode_step(int token, int pos);
 
+/* The decoder's scores, to check a phrase against the audio (the phrase fed
+ * as the tokens, demo/chat/moonshine_backend.py phrase_decode): after
+ * asr_decode_step(), the raw logits of n tokens (int16 at 2^-asr_logit_frac();
+ * the step's return value is the first maximum) into logits; returns n.
+ * Valid until the next asr_encode() or asr_transcribe(). */
+int         asr_last_logits(const int32_t *tokens, int n, int32_t *logits);
+int         asr_logit_frac(void);
+
+/* The most decode steps asr_transcribe() runs for a part of n samples (6.5
+ * tokens per second of audio, at most the decoder's positions - 1; 0 below
+ * 0.154 s). */
+int         asr_max_steps(int n);
+
 /* The last asr_transcribe()'s timing (ms) and counts. */
 typedef struct {
     double encode_ms, decode_ms, total_ms;

@@ -39,7 +39,12 @@
 
 _Static_assert(ASR_MAX_SAMPLES == ASR_BUCKET_SAMPLES(ASR_MAX_FRAMES), "the largest bucket's samples");
 
+/* inference.c (src/asr_nodes.py ASR_C): the logits the last argmax read */
+extern const int16_t *asr_argmax_logits;
+extern unsigned       asr_argmax_vocab;
+
 static int         s_open;
+static int         s_stepped;                         /* asr_last_logits(): a decode step since the last encode */
 static char        s_err[512];
 static int16_t     s_pcm[ASR_MAX_SAMPLES];            /* the bucket's samples, zero past n */
 static int32_t     s_xpos = -1;                       /* the encoded audio's frames - 1; -1: none */
@@ -130,6 +135,7 @@ int         asr_bucket(int i)     { return i >= 0 && i < ASR_N_BUCKETS ? asr_buc
 int         asr_bos(void)         { return ASR_BOS; }
 int         asr_eos(void)         { return ASR_EOS; }
 int         asr_vocab(void)       { return ASR_VOCAB; }
+int         asr_logit_frac(void)  { return ASR_LOGIT_FRAC; }
 const char *asr_model_name(void)  { return ASR_MODEL_NAME; }
 const char *asr_weights_dir(void) { return ASR_API_WEIGHTS_DIR; }
 
@@ -234,6 +240,7 @@ int asr_encode(const int16_t *pcm, int n)
     T = asr_buckets[b];
     memcpy(s_pcm, pcm, (size_t)n * sizeof(int16_t));
     memset(s_pcm + n, 0, (size_t)(ASR_BUCKET_SAMPLES(T) - n) * sizeof(int16_t));
+    s_stepped = 0;                        /* the encoder's buffers may share the logits' pool slot */
     asr_glue_encode(b, s_pcm, &nn, &pos);
     s_xpos = nf - 1;
     return T;
@@ -257,7 +264,39 @@ int asr_decode_step(int token, int pos)
         return -2;
     }
     asr_glue_decode(&id, &p, &xp, &out);
+    s_stepped = 1;
     return out;
+}
+
+int asr_last_logits(const int32_t *tokens, int n, int32_t *logits)
+{
+    int i;
+
+    if (!s_open) {
+        set_err("asr_open() first");
+        return -1;
+    }
+    if (!tokens || !logits || n < 0) {
+        set_err("asr_last_logits: bad arguments (n %d)", n);
+        return -2;
+    }
+    if (!s_stepped || !asr_argmax_logits || asr_argmax_vocab != ASR_VOCAB) {
+        set_err("asr_last_logits: asr_decode_step() first");
+        return -3;
+    }
+    for (i = 0; i < n; i++) {
+        if (tokens[i] < 0 || tokens[i] >= ASR_VOCAB) {
+            set_err("asr_last_logits: token %d (0 .. %d)", (int)tokens[i], ASR_VOCAB - 1);
+            return -2;
+        }
+        logits[i] = asr_argmax_logits[tokens[i]];
+    }
+    return n;
+}
+
+int asr_max_steps(int n)
+{
+    return n < 1 ? 0 : token_limit(n) - 1;
 }
 
 /* One part: encode, then greedy steps from <s> until </s> or the token limit

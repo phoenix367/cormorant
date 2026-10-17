@@ -79,7 +79,9 @@ true`, `transcript.text.delta` events (one per part) and a final
 
 Anything else is ignored.  The speech and transcription fields are in
 their guides ([Text to speech](TEXT_TO_SPEECH.md#requests),
-[Speech to text](SPEECH_TO_TEXT.md#requests)).
+[Speech to text](SPEECH_TO_TEXT.md#requests): also the non-standard
+`kv260_wake_phrase` / `kv260_wake_margin`, which check a phrase at the start
+of a recording against the audio).
 
 ## Errors
 
@@ -110,6 +112,10 @@ model:
   confidence, n-best;
 - [SmolLM2 and SmolVLM](SMOLLM2.md#the-kv260-details-and-the-log-line):
   cache reuse, prefill and decode timing, sampler settings.
+
+A transcription's JSON body has one too: timings, parts, tokens, and with
+`kv260_wake_phrase` the phrase check's result `wake`
+([Speech to text](SPEECH_TO_TEXT.md#the-phrase-check)).
 
 ## Sharing the FPGA
 

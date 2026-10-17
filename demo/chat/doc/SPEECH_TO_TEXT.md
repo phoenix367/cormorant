@@ -93,11 +93,65 @@ model ([Clients](CLIENTS.md#speech-to-text)).
 | `stream` | `true`: `transcript.text.delta` events, one per part, then `transcript.text.done` |
 | `language` | `en` (or absent); other languages are refused |
 | `prompt`, `temperature` | accepted and ignored: Moonshine decodes greedily and takes no prompt |
+| `kv260_wake_phrase`, `kv260_wake_margin` | non-standard: check a phrase expected at the start of the recording against the audio ([below](#the-phrase-check)) |
 
 **Segments.**  `srt`, `vtt` and `verbose_json` have a segment per part of
 the recording: the library splits audio longer than 24.6 s at quiet points
 (the quietest 0.1 s within ±2 s of an equal split), so a segment spans up
 to 24.6 s.
+
+## The phrase check
+
+Moonshine takes no prompt, so a recognizer that mishears a wake phrase
+cannot be told to expect it.  The non-standard field `kv260_wake_phrase`
+instead checks the phrase against the audio, at the start of the
+recording:
+
+```
+$ curl http://192.168.100.8:8000/v1/audio/transcriptions -F model=whisper-1 -F file=@haloma.wav
+{"text": "Helumor Renda, what is the capital of France?", ...}
+$ curl http://192.168.100.8:8000/v1/audio/transcriptions -F model=whisper-1 -F file=@haloma.wav -F "kv260_wake_phrase=Hello Miranda"
+{"text": "Hello, Miranda. What is the capital of France?", "usage": {"type": "duration", "seconds": 4}, "kv260": {"audio_s": 3.386, "parts": 1, "tokens": 12, "encode_ms": 110.7, "decode_ms": 302.7, "fpga_ms": 414.0, "input_ms": 1.0, "rtf": 0.122, "source": "wav", "wake": {"phrase": "Hello Miranda", "margin": -2.367, "complete": true, "passed": true, "min_margin": -10.0}}}
+```
+
+(Piper saying "Haloma Randa, what is the capital of France?" — how
+Moonshine once heard Piper's "Hello Miranda" in
+[Miranda](../../miranda/README.md)'s test recording.)
+
+- **How.**  The decoder is fed the phrase's tokens as its first ones
+  (`Hello` `Mir` `anda`).  Where the decoder would have written another
+  token, the margin adds log P(the phrase's token) − log P(its own choice),
+  in nats.  Punctuation it writes between the phrase's words ("Hello,
+  Miranda") is kept and costs nothing.  So the margin is 0 when the decoder
+  writes the phrase itself, and it falls the less the audio sounds like it.
+- **The result.**  At a margin of at least `kv260_wake_margin` (default
+  −10), the decoder goes on from the phrase and the transcript starts with
+  it.  Below, the transcript is the plain one, the same ids as without the
+  check.  `kv260.wake` holds `phrase`, `margin`, `complete` (false: the
+  sum stopped once it was below the limit), `passed` and `min_margin`.
+- **Cost.**  Usually nothing: the sum mostly falls below the limit at the
+  first token, and the plain transcript reuses that step.  On the board,
+  20 LibriSpeech utterances took 2.7 ms longer on average (33 ms at most),
+  and the phrase itself took no extra time.
+- **Margins on the board** (2026-10-17, Piper's voice with noise and
+  speed changes, three takes each; `doc/plans/ASR_PLAN.md` §8):
+
+  | Speech | Margin |
+  |---|---|
+  | "Hello Miranda …" (17 sentences, 51 takes) | 0.00, but "Hello Miranda." alone −0.44 / −0.24 in two of its takes |
+  | "Haloma Randa …", "Hallo Maranda …" | 0.00 to −3.95 |
+  | "Okay, hello Miranda …" | −5.2 to −6.2 |
+  | "Hello Veranda", "Hello Amanda", "Hello Melinda", "Hello Rwanda", "Hello Fernanda" | −3.3 to −10.6 |
+  | "Hi Miranda …", "Hey Miranda …", "Miranda, …" | −10.3 to −18.1 |
+  | other greetings ("Hello there", "Hello everyone", "Hello, Mr. Anderson", "Hello Linda") | −11.3 to −21.0 |
+  | 196 LibriSpeech utterances | −15.5 at most (median −28.6) |
+
+- **Limits.**  Only at the start of the recording, and only for audio that
+  fits one encoder pass (24.6 s; longer audio is transcribed as usual and
+  `kv260.wake` says why it was not checked).  The phrase is cased as the
+  model writes it ("Hello Miranda", not "hello miranda").  A library built
+  before the check (without `asr_last_logits`) transcribes as usual, and
+  `kv260.wake.error` says so.
 
 ## How a request runs
 
@@ -114,7 +168,7 @@ to 24.6 s.
    - the decoder runs greedily, one token per step (~18 ms), until `</s>`
      or 6.5 tokens per second of audio.
 3. **Delivery.**  The token ids become text on the host (the checkpoint's
-   `tokenizer.json`, `moonshine_backend.Detokenizer`).  Streaming
+   `tokenizer.json`, `moonshine_backend.Tokenizer`).  Streaming
    requests get each part's text as soon as it exists.
 4. **Disconnects.**  A client that disconnects stops the transcription at
    the next part.
