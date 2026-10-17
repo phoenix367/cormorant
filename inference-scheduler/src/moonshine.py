@@ -5,7 +5,7 @@ asr_study.py formats) -> the entries of one multi-entry project; the
 specification is demo/asr/scripts/moonshine_q.py (QM with the formats), which
 every entry's simulation equals bit for bit.
 
-  encode_<T>   pcm[384 T + 511] (int16 at 2^-15, the audio zero-padded), n (the
+  encode_<T>   pcm[384 T + 511] (int16 at 2^-15 in host memory), n (the
                valid samples, i32), pos (0, i32: the attention's start; an input,
                not a constant) -> the cross-attention K / V of every decoder
                layer (DMA states, read by decode); T = the bucket's frames
@@ -331,7 +331,7 @@ class MoonshineFrontend:
         N = samples(T)
         t2n = 2 * T + 1
         t1n = 3 * t2n + 4
-        pcm = self._t(f"{e}.pcm", [N], exp=15)
+        pcm = self._t(f"{e}.pcm", [N], exp=15, host="i16")
         n = self._t(f"{e}.n", [1], TensorProto.INT32, host="i32")
         r1, w1, _ = fold_dims(t1n, d, 1, 2)
         r2, w2, W2 = fold_dims(t2n, 2 * d, 3, 7)

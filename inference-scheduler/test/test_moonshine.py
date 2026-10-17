@@ -12,6 +12,7 @@ specification calibrates on synthetic audio (the checkpoints are untracked
 assets); the real moonshine-tiny on one LibriSpeech utterance when its assets
 are there."""
 
+import json
 import os
 import shutil
 import sys
@@ -208,6 +209,42 @@ class TestMoonshineEntries(unittest.TestCase):
                 rc, out = host_emu.build_and_run(cg, os.path.join(td, "p"), timeout=1800)
             self.assertEqual(rc, 0, out[-3000:])
             self.assertIn("PASSED", out)
+
+
+@unittest.skipUnless(rowops_unit() and softmax_unit(), "needs the row-ops unit and the softmax unit")
+@unittest.skipUnless(shutil.which("cc"), "needs cc")
+class TestMoonshineLibrary(unittest.TestCase):
+    """The library (demo/asr: generate_asr_project.py, asr_api.c, asr_bench.c) on the
+    host emulation: buckets 64 / 128, one utterance in the small bucket, one of 7 s split
+    into three parts at quiet points — every token id equal to the specification's
+    transcribe_long, the re-open identical."""
+
+    def test_library_matches_specification(self):
+        import asr_host_emu
+        import generate_asr_project as gap
+        cfg, W, spec, js = setup()
+        pcms = [audio(1.1, 31), audio(7.0, 32)]
+        self.assertEqual(len(mq.chunks(pcms[1], 128)), 3)
+        with tempfile.TemporaryDirectory() as td:
+            fj = os.path.join(td, "formats.json")
+            with open(fj, "w") as f:
+                json.dump(dict(js, policy="opt"), f)
+            proj = os.path.join(td, "p")
+            s = gap.generate(proj, cfg, W, MoonshineFormats(js, cfg), "moonshine-test", (64, 128),
+                             extra={"formats": fj})
+            self.assertEqual(s["buckets"], [64, 128])
+            self.assertEqual(list(s["nodes"]), ["encode_64", "encode_128", "decode"])
+            glue = open(os.path.join(proj, "test", "asr_glue.h")).read()
+            self.assertIn("#define ASR_MAX_SAMPLES 49663", glue)
+            self.assertIn("add_library(moonshine_test SHARED", open(os.path.join(proj, "CMakeLists.txt")).read())
+            exe = asr_host_emu.build(proj, td)
+            res, got = asr_host_emu.run_bench(exe, td, pcms)
+        self.assertTrue(res["reopen"]["identical"])
+        self.assertEqual([u["parts"] for u in res["utts"]], [1, 3])
+        for pcm, ids, u in zip(pcms, got, res["utts"], strict=True):
+            self.assertTrue(u["reps_identical"])
+            self.assertEqual(ids, mq.transcribe_long(spec, CFG, pcm, 128))
+            self.assertGreater(len(ids), 0)
 
 
 _TINY = os.path.join(_REPO, "demo", "asr", "assets", "moonshine-tiny")

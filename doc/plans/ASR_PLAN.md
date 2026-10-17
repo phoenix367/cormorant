@@ -346,7 +346,8 @@ the same code, a smaller config).
   `moonshine_q.QM` bit for bit on real utterances (both sizes), the bucket
   masking equals the unpadded run, host_emu builds the project.
 
-**Phase 2 — the library.**  `demo/asr/scripts/generate_asr_project.py` →
+**Phase 2 — the library** (done: §5; one library per size,
+`libmoonshine_tiny.so` / `libmoonshine_base.so`).  `demo/asr/scripts/generate_asr_project.py` →
 `libmoonshine_asr.so` with a C API `asr_transcribe(pcm, n, ids, max_ids)`:
 choose the bucket, run `encode_<T>`, the greedy loop over `decode` (argmax
 on the host, stop at `</s>` or 6.5 tokens per second of audio).  Gates:
@@ -452,3 +453,103 @@ SwiGLUs), the embedding and the argmax on the host.
   against 134, 4 / 5, 180 equal, 0.996) — §2's verdict stands.  The formats:
   `demo/asr/moonshine-{tiny,base}_opt_formats.json` (`asr_study.py formats`,
   the calibration's provenance inside).
+
+## 5. Phase 2: the library (2026-10-17)
+
+**Done.**  `demo/asr/scripts/generate_asr_project.py` generates the project
+behind `libmoonshine_<size>.so` (`libmoonshine_tiny.so`,
+`libmoonshine_base.so`: one per size, so the chat server can serve both);
+on the host emulation its transcripts equal the specification token for
+token (moonshine-tiny and moonshine-base, four LibriSpeech utterances each —
+every bucket, the longest split in two — and a random model in the
+scheduler suite).
+
+### The project
+
+- **Entries**: `encode_128` / `_256` / `_512` / `_1024` and `decode` in one
+  multi-entry project (`MultiEntryGenerator`).  The largest bucket plans the
+  encoder's MatMul weight layouts (ConvKernel's kernel widths) and the
+  others reuse them (`OnnxGraph(matmul_conv_kw=…)`), so the project keeps
+  one copy of every weight; the decoder's weights are its own.
+- **Glue**: `test/asr_glue.h` (generated): the buckets, `ASR_MAX_SAMPLES`,
+  the model's `<s>` / `</s>` / positions / vocabulary, `inference_init()`
+  with the four kernels and the dispatch to `inference_run_encode_<T>()`.
+- **Targets**: `asr_bench` and the shared `moonshine_<size>` (only the
+  `asr_*` symbols exported) over `test/asr_api.c`; `weights/tokenizer.json`
+  (the checkpoint's) for the caller's detokenizer; `project.json` (buckets,
+  nodes per entry, the formats and their SHA-256) and `layers.json`.
+
+| | moonshine-tiny | moonshine-base |
+|---|---:|---:|
+| nodes: each `encode_<T>` / `decode` | 249 / 406 | 329 / 540 |
+| DMA pool | 94.8 MiB | 185.5 MiB |
+| generation | 31 s, 1.5 GB | 52 s, 2.9 GB |
+| `encode_<T>`, T = 128 / 256 / 512 / 1024, predicted | 56 / 120 / 224 / 477 ms | 101 / 208 / 402 / 836 ms |
+| a `decode` step, predicted | 9.8 ms | 18.6 ms |
+| who drives (`rpu_policy.py`) | encode: the R5 (0.1–0.6 % overhead); decode: the A53 (97 batches, 14 %) | the same (decode 9.8 %) |
+
+The predictions are the bitstream's performance model (`04259a7af917`):
+most of the new ConvKernel shapes are priced by its family models (p90
+error up to ±36 %); phase 3 measures them and tops the model up.  A
+decode step's 97 batches come from its host softmaxes (each flushes the
+R5's batch), so the A53 keeps the decoder.
+
+### The C API (`demo/asr/src/asr_api.h`)
+
+`asr_open(weights_dir)` / `asr_close()` / `asr_last_error()`;
+`asr_transcribe(pcm, n, ids, max_ids)` (16 kHz int16 in, token ids out,
+without `<s>` / `</s>`); the steps `asr_chunks()`, `asr_encode()`,
+`asr_decode_step()` for tests and diagnostics; `asr_last_stats()` (encode /
+decode / total ms, parts, tokens, steps); the constants (sample rate, the
+buckets, `asr_max_samples()`, `<s>`, `</s>`, the vocabulary).
+
+- **Parts**: `asr_chunks` is `moonshine_q.chunks` integer for integer — the
+  window energies exact in int64 (a sliding sum), the first minimum, the
+  same clamps.
+- **Bucket**: the smallest with 384 T + 511 ≥ the part's samples; the
+  samples copied into the entry's buffer, zero past n.
+- **Greedy loop**: from `<s>` at position 0 until `</s>` or the limit of
+  min(⌊n / 16000 × 6.5⌋ + 1, the decoder's positions) tokens, `<s>`
+  included; the cross attention's `xpos` = the part's encoder frames − 1.
+  Audio shorter than 0.154 s has no token and is not encoded.
+
+**The specification** changed with it, without changing a transcript of the
+study: `chunks(pcm, frames)` / `transcribe_long(…, frames)` take the
+library's largest bucket (the hermetic test's library has buckets 64 / 128),
+`transcribe` caps the token limit at the decoder's positions (194 for both
+checkpoints, the model card's cap) and does not encode audio too short for
+a token.
+
+### Gates
+
+- `test_moonshine.py` `TestMoonshineLibrary` (7 tests in the file now): the
+  random Moonshine of §4 generated with buckets 64 / 128, the library and
+  `asr_bench` compiled against the host emulation, a 1.1 s and a 7.0 s
+  utterance (three parts at quiet points) — every token id equals
+  `transcribe_long`, both repetitions and the re-open identical (5 s).
+- `asr_host_emu.py` (the board gate without the board): `asr_bench`
+  compiled with `-Werror` against the host emulation, two repetitions and a
+  re-open, then `transcribe_long` with the project's formats:
+
+  | utterance | audio | bucket | parts | tiny tokens | base tokens |
+  |---|---:|---:|---:|---:|---:|
+  | 5683-32879-0025 | 1.91 s | 128 | 1 | 8 | 8 |
+  | 260-123440-0020 | 5.00 s | 256 | 1 | 19 | 19 |
+  | 8463-294825-0003 | 9.94 s | 512 | 1 | 37 | 37 |
+  | 5639-40744-0031 | 28.42 s | 1024 | 2 | 111 | 112 |
+
+  Every id bit-exact, both repetitions and the re-open identical (tiny
+  144 s, 0.7 GB; base 300 s, 1.4 GB).
+- `asr_chunks` against `moonshine_q.chunks` (a one-off check through
+  ctypes, not in the repo): 25 inputs — silence, noise, tone bursts and a
+  full-scale square wave of one sample over the limit up to 10 min (25
+  parts) — every boundary equal.
+- The scheduler suite: 1880 passed; lint clean; the fact registry updated.
+
+### Commands and runtimes
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+$PY demo/asr/scripts/generate_asr_project.py --model moonshine-base      # 52 s -> demo/asr/build/moonshine-base_project
+$PY demo/asr/scripts/asr_host_emu.py --project demo/asr/build/moonshine-base_project   # 5 min (tiny 2.4 min)
+```

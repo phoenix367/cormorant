@@ -284,7 +284,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1879 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1880 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1396,7 +1396,7 @@ calibrated formats (`demo/asr/moonshine-<size>_opt_formats.json`):
 `demo/asr/scripts/moonshine_q.py`; `test/test_moonshine.py` checks both
 entries against it bit for bit and the generated C against the simulation.
 
-- **`encode_<T>`** — inputs `pcm` (int16 at `2^-15`, zero-padded), `n` (the
+- **`encode_<T>`** — inputs `pcm` (int16 at `2^-15` in host memory, zero-padded), `n` (the
   valid samples) and `pos` (0).  The output is the cross-attention K / V of
   every decoder layer, written into DMA states that `decode` reads.
   - **The conv stem.**  ConvKernel convs on rows folded to fit its
@@ -1439,7 +1439,12 @@ entries against it bit for bit and the generated C against the simulation.
   - The head is tied: the logits sit at one exponent.
 - **Limits.**  A bucket is at most 1024 frames: the softmax unit's column
   mode reads at most 1024 keys.  Longer audio is split by the library at
-  quiet points (`moonshine_q.chunks`).
+  quiet points (`moonshine_q.chunks`, `demo/asr/src/asr_api.c` `asr_chunks`).
+- **The library** (`demo/asr/scripts/generate_asr_project.py`,
+  `doc/plans/ASR_PLAN.md` §5): the four buckets and `decode` in one
+  multi-entry project, the largest bucket planning the encoder's weight
+  layouts for all four; `asr_transcribe()` picks the smallest bucket that
+  holds a part and runs the greedy loop.
 
 ### Multi-entry projects
 

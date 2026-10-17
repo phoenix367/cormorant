@@ -40,8 +40,8 @@ Decoder (one token per step):
   mlp      y3 = LN(h); fc1 -> u (x half) / g (gate half) + bias (row-ops COPY
            with bias); a = SiLU(g) * u (row-ops MULACT); fc2; h += d + b2
   head     yf = LN(h); logits = yf . E^T (tied, kernel GEMV); argmax
-Audio longer than MAX_FRAMES encoder frames (24.6 s) is transcribed in equal
-chunks (transcribe_long).
+Audio longer than MAX_FRAMES encoder frames (24.6 s) is split at quiet points and
+transcribed part by part (chunks, transcribe_long).
 """
 
 from __future__ import annotations
@@ -665,15 +665,16 @@ SPLIT_SEARCH = 2 * 16000               # a boundary within +-2 s of the equal sp
 SPLIT_WIN = 1600                       # ... at the centre of the quietest 0.1 s window
 
 
-def chunks(pcm):
-    """[(start, length)]: audio longer than max_samples() split into the fewest parts,
-    each boundary at the centre of the 0.1 s window of least energy (the sum of the
-    squared int16 samples, exact) within +-2 s of the equal split — the first such
-    window; every part at most max_samples().  Splitting mid-word made greedy decoding
-    loop (2026-10-17: 'the principles of' to the token limit).  The library's policy;
-    the transcripts are joined."""
+def chunks(pcm, frames=MAX_FRAMES):
+    """[(start, length)]: audio longer than max_samples(frames) split into the fewest
+    parts, each boundary at the centre of the 0.1 s window of least energy (the sum of
+    the squared int16 samples, exact) within +-2 s of the equal split — the first such
+    window; every part at most max_samples(frames).  Splitting mid-word made greedy
+    decoding loop (2026-10-17: 'the principles of' to the token limit).  The library's
+    policy (asr_api.c asr_chunks; ``frames``: its largest bucket); the transcripts are
+    joined."""
     x = np.asarray(pcm).astype(np.int64)
-    n, M = len(x), max_samples()
+    n, M = len(x), max_samples(frames)
     if n <= M:
         return [(0, n)]
     k = -(-n // M)
@@ -695,21 +696,25 @@ def chunks(pcm):
     return [(a, b - a) for a, b in zip(bounds[:-1], bounds[1:])]
 
 
-def transcribe_long(m, cfg, pcm):
-    """Greedy transcript of any length: transcribe() per chunk, the ids joined."""
+def transcribe_long(m, cfg, pcm, frames=MAX_FRAMES):
+    """Greedy transcript of any length: transcribe() per chunk, the ids joined
+    (asr_api.c asr_transcribe)."""
     ids = []
-    for a, L in chunks(pcm):
+    for a, L in chunks(pcm, frames):
         ids += transcribe(m, cfg, pcm[a:a + L])[0]
     return ids
 
 
 def transcribe(m, cfg, pcm, forced=None, xf=None):
     """Greedy (or teacher-forced on `forced`): (ids, per-step argmax); xf: the encoder
-    output when already computed."""
+    output when already computed.  Audio too short for one token (< 0.154 s) is not
+    encoded."""
+    limit = min(mn.max_tokens(len(pcm)), cfg["max_position_embeddings"])   # the decoder's positions
+    if forced is None and limit <= 1:
+        return [], []
     m.start(m.encode(pcm) if xf is None else xf)
     tok = cfg["decoder_start_token_id"]
     ids, am = [], []
-    limit = mn.max_tokens(len(pcm))
     steps = (len(forced) + 1) if forced is not None else limit - 1
     for i in range(steps):
         lg = m.step(tok)

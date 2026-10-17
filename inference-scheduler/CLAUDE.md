@@ -326,7 +326,7 @@ test/
                          VectorOP / Matmul / Conv kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              89 pytest modules, 1879 tests, all pass (test_bert_base.py
+  test_*.py              89 pytest modules, 1880 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer
@@ -344,7 +344,8 @@ test/
                          test_stereo_nodes.py / test_stereo.py (the stereo ops, the
                          LightStereo frontend on host_emu),
                          test_moonshine.py (the Moonshine entries == the specification
-                         demo/asr/scripts/moonshine_q.py, host_emu),
+                         demo/asr/scripts/moonshine_q.py, host_emu; the library
+                         demo/asr/src/asr_api.c on host_emu == transcribe_long),
                          test_rowops_spec.py / test_rowops_unit.py (the row-ops unit's
                          specification; its nodes, the Llama / ViT / Piper graphs on it, host_emu),
                          test_bert_base.py (BERT-base on the real model),

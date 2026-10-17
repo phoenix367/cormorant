@@ -5,7 +5,7 @@ generated project computes what it computes, bit for bit.
 
 Host ops (numpy reference + the C helpers of ASR_C):
 
-  AsrFrames     pcm [N] (int16 at 2^-15, a DMA input), n (valid samples, i32)
+  AsrFrames     pcm [N] (int16 at 2^-15, a host input), n (valid samples, i32)
                 -> conv1's polyphase image [1][64][rows][w + 1]:
                 img[c][r][j] = pcm[64 (r w + j) + c] (0 past n) — conv1 (127
                 taps, stride 64; a zero 128th tap) is a 1 x 2 conv over it
@@ -152,7 +152,7 @@ class AsrFramesNode(AsrNode):
         rows, w = int(y.shape[2]), int(y.shape[3]) - 1
         sn = cls(onnx_node=node, inputs=[pcm, n], output=y, index=index, align_elems=align_elems,
                  F=ctx.frac_bits, N=pcm.numel, rows=rows, w=w)
-        sn._want(pcm, None, "pcm")
+        sn._want(pcm, "i16", "pcm")
         sn._want(n, "i32", "n")
         sn._want(y, None, "output")
         _require(_scalar_exp(pcm, ctx.frac_bits, node, "pcm") == 15
@@ -732,7 +732,7 @@ ASR_C = r"""
 /* ---- speech-to-text host ops (src/asr_nodes.py; doc/plans/ASR_PLAN.md) ---- */
 
 /* conv1's polyphase image: img[c][r][j] = pcm[64 (r w + j) + c], 0 past n. */
-static void asr_frames(const Data_t *pcm, unsigned N, unsigned n, unsigned rows, unsigned w, Data_t *img)
+static void asr_frames(const int16_t *pcm, unsigned N, unsigned n, unsigned rows, unsigned w, Data_t *img)
 {
     const unsigned W = w + 1u;
     unsigned       c, r, j;
@@ -742,7 +742,7 @@ static void asr_frames(const Data_t *pcm, unsigned N, unsigned n, unsigned rows,
             Data_t *o = img + ((size_t)c * rows + r) * W;
             for (j = 0u; j < W; j++) {
                 const size_t i = ((size_t)r * w + j) * 64u + c;
-                o[j] = i < n ? pcm[i] : (Data_t)0;
+                o[j] = i < n ? (Data_t)pcm[i] : (Data_t)0;
             }
         }
 }
