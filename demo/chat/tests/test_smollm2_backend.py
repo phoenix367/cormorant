@@ -804,12 +804,29 @@ class TestResidency(unittest.TestCase):
         finally:
             s.close()
 
-    def test_auto_reclaims_page_cache_before_evicting(self):
+    def test_auto_reclaims_page_cache_at_startup(self):
         cma = FakeCma(1000)
         cma.cache = 500                                # page cache in the free CMA pages
         s = self.make("auto", cma)
         try:
-            self.assertEqual(self.health(s), {"bert-squad": True, MID: False})   # 276 "free" < 392 at startup
+            self.assertEqual(self.health(s), {"bert-squad": True, MID: True})    # 276 "free" < 392: reclaimed
+            self.assertEqual(cma.reclaims, 1)
+        finally:
+            s.close()
+        cma = FakeCma(500)                             # MID does not fit beside BERT even after the drop
+        cma.cache = 100
+        s = self.make("auto", cma)
+        try:
+            self.assertEqual((self.health(s), cma.reclaims), ({"bert-squad": True, MID: False}, 1))
+        finally:
+            s.close()
+
+    def test_auto_reclaims_page_cache_before_evicting(self):
+        cma = FakeCma(1000)
+        s = self.make("auto", cma)
+        try:
+            s.srv.unload_model(MID)
+            cma.cache = 500                            # the page cache fills the CMA again
             self.assertEqual(self.ask(s, MID)[0], 200)
             self.assertEqual(self.health(s), {"bert-squad": True, MID: True})    # reclaimed, nothing evicted
             self.assertEqual((cma.reclaims, self.bert_eng.closes), (1, 0))

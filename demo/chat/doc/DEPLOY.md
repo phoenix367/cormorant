@@ -227,7 +227,7 @@ in.  With `cma=1000M` SmolLM2-360M stayed only beside Piper.
 
 | Mode | Behaviour |
 |---|---|
-| `auto` (default) | The first backend loads at startup, the others too if CmaFree allows (in the order of `server.backends`), else on their first request. Before a load, when CmaFree < the new model's `cma_mb` + `--cma-margin-mb` (32), the server drops the page cache and compacts memory (free CMA pages hold page cache), then evicts other models, least recently used first, while it still is. A load that still fails is retried once after evicting the rest. Models that fit together stay resident; the others swap. |
+| `auto` (default) | The first backend loads at startup, the others too if CmaFree allows (in the order of `server.backends`; the page cache dropped first when it does not — the weights just read sit in CMA), else on their first request. Before a load, when CmaFree < the new model's `cma_mb` + `--cma-margin-mb` (32), the server drops the page cache and compacts memory (free CMA pages hold page cache), then evicts other models, least recently used first, while it still is. A load that still fails is retried once after evicting the rest. Models that fit together stay resident; the others swap. |
 | `one` | At most one FPGA model; switching models unloads the other. A switch costs a load: BERT 1.6 s, SmolLM2 1.0 s with the weights in the page cache; cold from the SD card BERT 14.3 s, SmolLM2 35.6 s. |
 | `all` | Everything loads at startup and stays (phase 1 behaviour). |
 

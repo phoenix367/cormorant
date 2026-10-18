@@ -59,8 +59,9 @@ Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~775 MB, SmolVLM
 ~550 MB, Piper ~55 MB, Moonshine base ~200 MB of the 1400 MB cma=; idle CmaFree
 ~1390 MB).
-  auto (default)  the first backend loads at startup, the others when first
-                  requested; before a load, the page cache is dropped and
+  auto (default)  the first backend loads at startup, the others too while
+                  CmaFree allows (the page cache dropped first when it does
+                  not), else when first requested; before a load, the page cache is dropped and
                   memory compacted when CmaFree < the new model's cma_mb +
                   --cma-margin-mb (free CMA pages hold page cache), then models
                   are evicted (least recently used first) while it still is,
@@ -715,13 +716,21 @@ class ChatServer(ThreadingHTTPServer):
         for mid in self.startup_models():
             self.load_model(mid)
         if self.resident == "auto":
+            fresh = False                      # nothing loaded since the last page-cache drop
             for mid, b in self.backends.items():
                 if self.loaded[mid]:
                     continue
+                need = b.cma_mb + self.cma_margin_mb
                 free = self.cma_free()
-                if free is not None and free >= b.cma_mb + self.cma_margin_mb:
+                if free is not None and free < need and not fresh and self.cma_reclaim():   # the weights just
+                    fresh = True                                                             # read sit in CMA
+                    log(f"CmaFree {free:.0f} MB < {need:.0f} MB for '{mid}': page cache dropped, memory "
+                        f"compacted (CmaFree {self.cma_free() or 0:.0f} MB)")
+                    free = self.cma_free()
+                if free is not None and free >= need:
                     try:
                         self.load_model(mid, evict=False)
+                        fresh = False
                     except Exception as e:                     # noqa: BLE001
                         with contextlib.suppress(Exception):
                             b.unload()
