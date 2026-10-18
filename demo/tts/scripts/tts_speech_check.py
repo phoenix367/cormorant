@@ -87,9 +87,13 @@ def main(argv=None) -> int:
         project = os.path.abspath(args.project)
         summary, W, E = tb.load(project)
         E_enc = json.load(open(os.path.join(summary["assets"], "exponents.json")))["encoder"]
-        # the host's twin of the board: the library's encoder is encoder_forward
+        # the host's twin of the board: the library's encoder is encoder_forward with the
+        # project's options (its softmax on the unit, the row-ops unit's norms, the
+        # relative-key band), as tts_host_emu.py and tts_board.py build it
+        vs, ro, rel = (bool(summary.get(k, False)) for k in ("vsmx", "rowops", "rel"))
         ref = PiperBackend(None, os.path.join(project, "weights"),
-                           encoder=tb.pv.library_encoder(tb.pv.encoder_weights(W), E_enc),
+                           encoder=tb.pv.library_encoder(tb.pv.encoder_weights(W), E_enc,
+                                                         vsmx_unit=vs, rowops_unit=ro, rel_kernel=rel),
                            duration=lambda x, z: tb.pv.duration_predictor_seq(W, x, z))
         ref.load_host()
     report, ok = [], True

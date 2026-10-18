@@ -403,6 +403,7 @@ def cmd_encoder(a) -> int:
         n_ids = n_diff = worst = 0
         lsd_f, lsd_cur, lsd_q = [], [], []
         out_dir = os.path.join(a.assets, "study")
+        os.makedirs(out_dir, exist_ok=True)                  # without a `study` run before it
         for name, t in _texts(a, "eval").items():
             seed = zlib.crc32(name.encode())
             ids = t["ids"]
@@ -457,6 +458,7 @@ def cmd_encoder_vsmx(a) -> int:
     doc = json.load(open(os.path.join(a.assets, "exponents.json")))
     exp, E = doc["exponents"], {k: int(v) for k, v in doc["encoder"].items()}
     out_dir = os.path.join(a.assets, "study")
+    os.makedirs(out_dir, exist_ok=True)
     # (softmax on the unit, the residual LayerNorms as the row-ops unit's integer
     # LayerNorm — doc/plans/HOSTOPS_PLAN.md §5, piper_vits.ROWOPS_LN)
     # (+ phase 4b, HOSTOPS_PLAN §10: the whole encoder prep on the unit — the LayerNorms,

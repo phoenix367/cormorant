@@ -277,6 +277,8 @@ def main(argv=None) -> int:
             worst = max(results.values()) if results else 2
             return 0 if worst == 0 else (1 if worst == 1 else 2)
         finally:
+            if cfg.get("cleanup", True):                   # the projects and their builds; the firmware is in /lib/firmware
+                session.exec(f"rm -rf {work}", timeout=60)
             session.close()
 
 

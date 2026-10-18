@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from src.bitstream.board import parse_proc_interrupts, remove_overlay
-from src.bitstream.loader import check_uio_irqs, dtbo_uio_irqs, dtbo_uio_nodes
+from src.bitstream.loader import check_kernels_free, check_uio_irqs, dtbo_uio_irqs, dtbo_uio_nodes
 
 REPO = Path(__file__).resolve().parents[2]
 DTS = REPO / "dts" / "kv260" / "cormorant.dts"
@@ -20,8 +20,9 @@ DTS = REPO / "dts" / "kv260" / "cormorant.dts"
 class FakeSession:
     """exec() answers the commands the board steps send, from a small state."""
 
-    def __init__(self, refuse=False, irqs_before=None, irqs_after=None, overlays=("pl",)):
+    def __init__(self, refuse=False, irqs_before=None, irqs_after=None, overlays=("pl",), uio=()):
         self.refuse = refuse
+        self.uio = list(uio)
         self.irqs_before = irqs_before or {}
         self.irqs_after = irqs_after if irqs_after is not None else self.irqs_before
         self.overlays = list(overlays)
@@ -45,6 +46,8 @@ class FakeSession:
             return "removed\n", "", 0
         if cmd.startswith("ls '/sys/kernel/config/device-tree/overlays'"):
             return "\n".join(self.overlays) + "\n", "", 0
+        if cmd.startswith("for f in /sys/class/uio/uio*/name"):
+            return "".join(f"/dev/uio{i} {name}\n" for i, name in enumerate(self.uio)), "", 0
         if cmd == "cat /proc/interrupts":
             irqs = self.irqs_after if self.rebound else self.irqs_before
             lines = [f" {60 + i}:  0  0  0  0  GICv2 {irq} Level  {name}" for i, (name, irq) in enumerate(irqs.items())]
@@ -115,3 +118,33 @@ class TestDtbo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("dtc"), "needs dtc")
+class TestKernelsFree(unittest.TestCase):
+    """Another overlay with the same kernels stops the upload before the PL is
+    reprogrammed (the 2026-10-18 reproduction: the kernel stacked the second
+    overlay instead of refusing it)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls.tmp = tempfile.mkdtemp(prefix="kernels_free_")
+        cls.dtbo = Path(cls.tmp) / "cormorant.dtbo"
+        subprocess.run(["dtc", "-q", "-@", "-I", "dts", "-O", "dtb", "-o", str(cls.dtbo), str(DTS)], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_taken(self):
+        s = FakeSession(overlays=("k26-starter-kits_image_1", "pl"), uio=("axi-pmon", "fabric_vecop", "fabric_conv"))
+        with self.assertRaises(RuntimeError) as cm:
+            check_kernels_free(s, self.dtbo, "design_cormorant")
+        msg = str(cm.exception)
+        self.assertIn("fabric_conv, fabric_vecop", msg)
+        self.assertIn("(k26-starter-kits_image_1, pl)", msg)
+
+    def test_free(self):
+        s = FakeSession(overlays=("k26-starter-kits_image_1",), uio=("axi-pmon", "rpu_ipi"))
+        check_kernels_free(s, self.dtbo, "pl")

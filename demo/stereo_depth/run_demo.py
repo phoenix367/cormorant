@@ -105,6 +105,8 @@ def main(argv=None) -> int:
     if "epe" in r:
         print(f"  {r['labelled']} pairs with ground truth: EPE {r['epe']:.3f} px, bad-1 {r['bad1']:.2f} %, "
               f"bad-2 {r['bad2']:.2f} %; disparity maps in {r['annotated']}")
+    for line in postprocess.realsense_lines(r["per_pair"]):
+        print(f"  {line}")
     if be:
         print("  disparity vs the scheduler's simulation: "
               + ("bit-exact" if not be["differ"] else f"DIFFER {be['differ']}") + f" ({be['checked']} pairs)")

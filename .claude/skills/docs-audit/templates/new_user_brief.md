@@ -8,11 +8,14 @@ gaps; you do not fix them.
 
 ## What you know (nothing else)
 
-- Host: this Linux PC (8 cores, 46 GB RAM, Python 3, gcc, cmake), GitHub over ssh.
+- Host: this Linux PC (8 cores, 46 GB RAM, Python 3, gcc, cmake), internet access (GitHub, Hugging Face,
+  the datasets the demos download).
 - Xilinx Vitis / Vivado 2025.2 are installed at `{{XILINX}}`
   (`{{XILINX}}/Vitis/settings64.sh`).
 - A KV260 at `{{BOARD}}`: `ssh -i {{KEY}} root@{{BOARD}}`, Kria Ubuntu 22.04
   with XRT and `cma=1400M`, already in use by its owner (see the board rules).
+  A RealSense D435 is plugged into it (USB).  No microphone or speaker on the
+  host: audio paths run on files.
 - Nothing about the project's internals.  Start at `{{CLONE}}/README.md` and
   follow the links.  When the docs do not say how to go on you may read the
   clone's source to get unstuck — every time you had to is a gap.  Never read
@@ -33,17 +36,27 @@ gaps; you do not fix them.
 
 ## Board rules (hard — breaking one ends the run)
 
-- Production data is off limits — never write, move or delete: `/root/kv260_chat`,
-  every `/root/*_weights*` directory you did not create, `/root/backup_pre_gemv`,
-  `/root/arm-smmu`, `/root/fpga-smmu-mem`, `/root/jupyter_notebooks*`,
-  `/lib/firmware/pl.bin`, `/tmp/pl.dtbo`.  The state at the start is in
-  `{{BASE}}/board_before.txt`.
+- Production data is off limits — never write, move or delete anything that
+  exists at the start: every entry of `/root` listed in
+  `{{BASE}}/board_before.txt` (`root_entries`: `kv260_chat`, the `*_weights`
+  directories, `rpu_firmware.elf`, …), `/lib/firmware/pl.bin`,
+  `/lib/firmware/rpu_firmware.elf`, `/tmp/pl.dtbo`, the overlays `rpu` and
+  `rpu-ipi` (you may reuse them as they are).  The owner has stopped the
+  services `kv260-chat` and `kv260-miranda` and removes the production overlay
+  `pl` only if the docs tell you to (see below).
 - Your names end in `_repro`: work dirs `/tmp/repro_<name>`, weights
   `/root/<name>_weights_repro`, the chat install `/root/kv260_chat_repro`.  Set
   them in EVERY config copy before its first run — `.example` defaults are the
   owner's production paths (e.g. `weights_dir` `/root/bert_squad_weights`).
-- If `kv260-chat` is active before you have deployed anything, it is the owner's
-  server: stop board work and report (your `deploy.py` would replace it).
+- If `kv260-chat` or `kv260-miranda` is active before you have deployed
+  anything, it is the owner's: stop board work and report (your `deploy.py`
+  would replace it).  Your chat install is `/root/kv260_chat_repro` (Miranda
+  installs into `<chat dir>/miranda`).
+- The Cortex-R5 firmware: build it as the docs say; on the board always pass
+  `--firmware-name rpu_firmware_repro.elf` (`rpu_board.py`; for the chat
+  server `rpu.firmware` in your config copy) — never the default name, which is
+  the owner's file.  remoteproc0 may run your firmware afterwards; the owner
+  restores it.
 - Loading your own bitstream is allowed; the owner restores production
   afterwards.  If `upload_bitstream.py` refuses because the overlay `pl` is
   applied, remove that overlay as the docs say — never pass `--overlay-name pl`
@@ -58,9 +71,10 @@ gaps; you do not fix them.
   wedges the AXI port).
 - At the end remove everything you created on the board, by explicit path —
   never a glob that could reach a production name: your `_repro` dirs,
-  `/lib/firmware/design_cormorant.bin`, `/tmp/design_cormorant.dtbo`, your
-  overlay directory, the empty work dirs the runners leave; stop your chat
-  server.  Record what you removed and what is left (the PL stays programmed
+  `/lib/firmware/design_cormorant.bin`, `/lib/firmware/rpu_firmware_repro.elf`,
+  `/tmp/design_cormorant.dtbo`, your overlay directory, the empty work dirs the
+  runners leave; stop your chat server and Miranda (`deploy.py --stop`) and your
+  R5 firmware (`rpu_board.py --stop`).  Record what you removed and what is left (the PL stays programmed
   with your bitstream — say so).
 
 ## Long jobs
@@ -79,8 +93,9 @@ gaps; you do not fix them.
 
 ## Order of paths (each one as the clone's docs describe it)
 
-1. The clone: `git log --oneline -3` (the local commits are the owner's
-   unpushed work — part of the docs under test), its size.
+1. The clone: `git log --oneline -3` (local commits, if any, are the owner's
+   unpushed work — part of the docs under test), its size; the README's clone
+   and submodule steps exactly as written (HTTPS).
 2. Kernel C simulation (README Quick start §2, TESTING §2).
 3. Scheduler: venv, test models, unit tests, the CLI on a test model (Quick
    start §3, TESTING §1, USER_GUIDE); the chat app tests.
@@ -89,24 +104,36 @@ gaps; you do not fix them.
    preparation meanwhile), the device-tree overlay.  The RTL tests re-package
    the IPs but leave the driver dirs (`build/kernels/<k>_rtl/driver/`), so they
    can run beside board work.
-5. Board setup (Quick start §5): the tmpfiles rule, `upload_bitstream.py`, the
-   UIO listing.
+5. Board setup (Quick start §5): the CMA size check (`cma_boot`, report only —
+   the board already has `cma=1400M`; never `--set` or `--reboot`), the tmpfiles
+   rule, `upload_bitstream.py`, the UIO listing.
+5b. The Cortex-R5 firmware (`tools/rpu/README.md`, RPU docs): the XSA, the BSP,
+   then `rpu_board.py` on the demos' generated projects (after path 8 has
+   generated them) with `--firmware-name rpu_firmware_repro.elf`, and
+   `--stop` at the end.
 6. On-board tests and benchmarks (Quick start §6, TESTING §4–5,
    REMOTE_TESTING): `run_remote_tests.py`, `run_remote_perf.py`; the USER_GUIDE's
    build-by-hand of a generated project on the board.
-7. RTL tests (TESTING §3): `make behavior_test_<k>` for all four kernels, one at
+7. RTL tests (TESTING §3): `make behavior_test_<k>` for the four kernels that have one, one at
    a time (the test stand must never run two jobs at once; ~45 min in all), then
    `make sim_hw_kv260` (block design, ~8 min).  Read the summaries, not only the
    exit codes.
-8. Demos, each by its README: `demo/mnist`, `demo/image_classification`,
-   `demo/bert_squad`, `demo/chat` (bert-squad and SmolLM2-135M backends: clients,
-   the curl examples, `board_gate.py`), `demo/camera` (read-through only — no
-   RealSense camera).  Only if time allows: SmolVLM-256M (its generation peaks
-   at ~3.3 GiB RAM — never beside another generation).  Skip the SmolLM2-360M
-   generation (7.7 GiB RAM).
+8. Demos, each by its README (`demo/README.md` lists them): `demo/mnist`,
+   `demo/image_classification`, `demo/object_detection`, `demo/stereo_depth`
+   (also `--capture` with the D435), `demo/bert_squad`, `demo/tts` (the
+   library and its board gate), `demo/asr` (Moonshine base: the library and its
+   board gate), `demo/chat` (the bert-squad, SmolLM2-135M, Piper and Moonshine
+   backends: deploy, the clients, the curl examples, `board_gate.py`),
+   `demo/miranda` (deploy on top of your chat server; the client with an audio
+   file as input), `demo/camera` (as far as it goes without a display).  Only if
+   time allows: SmolVLM-256M (its generation peaks at ~3.3 GiB RAM — never
+   beside another generation).  Skip the SmolLM2-360M generation (7.7 GiB RAM).
+9. The test suites as the docs give them (TESTING, README §Testing): the
+   scheduler and chat pytest suites, the run-tests helper, the fact registry.
 
 The 2026-09-29 run took ~2 h 15 min with overlap (Vivado 71 min, RTL tests
-45 min).
+45 min); with today's paths expect 4–6 h (Vivado 1–2 h, the Conv behaviour
+test ~75 min).  Keep going until every path is done or blocked.
 
 ## What counts as a gap
 

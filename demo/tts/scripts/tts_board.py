@@ -387,6 +387,7 @@ def main(argv=None) -> int:
                         for ph, p in res["profiles"].items()}
             sftp.close()
         finally:
+            session.exec(f"rm -rf {RUN_DIR}", timeout=30)   # the run's inputs / outputs, downloaded
             session.close()
     bench = results["bench"]
     o = bench.get("tts_open", {})

@@ -52,7 +52,8 @@ def upload_bitstream(
       3  Build xclbin with MEM_TOPOLOGY via xclbinutil
       4  Upload .bin → /lib/firmware/<overlay_name>.bin
       5  Remove a `pynq` overlay, then any existing overlay of ours (each
-         removal checked in the kernel log)
+         removal checked in the kernel log); stop when another overlay still
+         provides the kernels' UIO devices (check_kernels_free)
       5b Check PL0 (fclk0) = the HWH's PL0 frequency, set it if not
       6  Load bitstream via fpga_manager
       7  Verify fpga_manager state == "operating"
@@ -121,6 +122,7 @@ def upload_bitstream(
     # it first.  remove_overlay stops on a refusal.
     remove_overlay(session, "pynq")
     remove_overlay(session, overlay_name)
+    check_kernels_free(session, dtbo_path, overlay_name)
 
     print(f"\n{_bold('Step 5b')}  PL0 clock (fclk0)")
     check_pl0(session, pl0_mhz, set_if_off=True)
@@ -234,6 +236,22 @@ def _dtbo_uio(dtbo_path) -> list[tuple[str, dict[str, str]]]:
         elif stack and (p := re.match(r"([\w,#-]+)\s*=\s*(.*);$", t)):
             stack[-1][1][p.group(1)] = p.group(2)
     return nodes
+
+
+def check_kernels_free(session: RemoteSession, dtbo_path, overlay_name: str) -> None:
+    """Stop before the PL is reprogrammed when another overlay already provides
+    the kernels: a UIO device with one of the overlay's node names exists once
+    ours is removed (the same design applied under another name).  The kernel
+    may accept ours on top of it, and the lower overlay can then no longer be
+    removed ("overlay #N is not topmost")."""
+    ours = {n.split("@", 1)[0] for n in dtbo_uio_nodes(dtbo_path)}
+    taken = sorted(ours & {name for name, _dev in list_uio_devices(session)})
+    if taken:
+        others = [o for o in list_overlays(session) if o != overlay_name]
+        raise RuntimeError(
+            f"The kernels' UIO devices already exist ({', '.join(taken)}): another overlay provides them"
+            + (f" ({', '.join(others)})" if others else "") + ", the same design loaded under another name.\n"
+            f"Remove it on the board (rmdir {_OVERLAYS_DIR}/<name>) or pass --overlay-name <name>, then run again.")
 
 
 def dtbo_uio_nodes(dtbo_path) -> list[str]:

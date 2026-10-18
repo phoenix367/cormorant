@@ -134,6 +134,8 @@ def run(cfg: dict, project: Path, data: Path, results: Path, stop_server: bool =
         bid, _, _ = session.exec("sha256sum /lib/firmware/pl.bin | cut -c1-12", timeout=30)
         summary["bitstream"] = bid.strip()
         (results / "run.json").write_text(json.dumps(summary, indent=1))
+        if cfg.get("cleanup", True):                       # the project, the inputs and the outputs, downloaded
+            session.exec(f"rm -rf {shlex.quote(work)}", timeout=60)
         return summary
     finally:
         session.close()

@@ -46,5 +46,8 @@
     "_check_images_note": "Images whose head maps are compared bit for bit with the scheduler's simulation (about 20 s each on the host).",
     "conf": 0.25,
     "iou": 0.45
-  }
+  },
+
+  "cleanup": true,
+  "_cleanup_note": "Remove remote.work_dir from the board after the run (the results are downloaded first)."
 }

@@ -15,8 +15,9 @@
 #
 # Lines starting with '~' are volatile (uptime, free space, CMA) and are shown
 # side by side by --compare, not diffed.  Stable lines: firmware SHA-256
-# (pl.bin = the production bitstream id), overlays + status, UIO names,
-# /root listing, repro leftovers, chat service, tmpfiles rule, cpuidle, cma.
+# (pl.bin = the production bitstream id; the R5's rpu_firmware.elf), overlays + status,
+# the remote processors, UIO names, /root listing, repro leftovers, the chat and
+# Miranda services, tmpfiles rule, cpuidle, cma.
 # Nothing here writes on the board.
 set -euo pipefail
 
@@ -50,7 +51,7 @@ OUT=${1:-}
 REMOTE=$(cat <<'EOS'
 LC_ALL=C
 echo "# board snapshot $(date -Is) $(hostname)"
-for f in /lib/firmware/*.bin /lib/firmware/*.dtbo; do
+for f in /lib/firmware/*.bin /lib/firmware/*.dtbo /lib/firmware/*.elf; do
     [ -e "$f" ] && echo "firmware: $(sha256sum "$f" | cut -c1-64) $f"
 done
 echo "firmware_apps: $(ls /lib/firmware/xilinx 2>/dev/null | tr '\n' ' ')"
@@ -63,13 +64,17 @@ if [ -d "$ov" ]; then
 else
     echo "overlay: (no configfs overlays dir)"
 fi
+for r in /sys/class/remoteproc/remoteproc*; do
+    [ -d "$r" ] && echo "remoteproc: $(basename "$r") state=$(cat "$r/state" 2>/dev/null) firmware=$(cat "$r/firmware" 2>/dev/null)"
+done
 echo "uio: $(for f in /sys/class/uio/uio*/name; do [ -e "$f" ] && printf '%s=%s ' "$(basename "$(dirname "$f")")" "$(cat "$f")"; done)"
 echo "root_entries: $(ls -A /root 2>/dev/null | tr '\n' ' ')"
-echo "repro_leftovers: $(ls -d /root/*repro* /tmp/*repro* /lib/firmware/design_cormorant* /tmp/design_cormorant* $ov/design_cormorant 2>/dev/null | tr '\n' ' ')"
+echo "repro_leftovers: $(ls -d /root/*repro* /tmp/*repro* /lib/firmware/design_cormorant* /lib/firmware/*repro* /tmp/design_cormorant* $ov/design_cormorant 2>/dev/null | tr '\n' ' ')"
 if command -v systemctl >/dev/null; then
     echo "chat_service: active=$(systemctl is-active kv260-chat 2>/dev/null) enabled=$(systemctl is-enabled kv260-chat 2>/dev/null)"
+    echo "miranda_service: active=$(systemctl is-active kv260-miranda 2>/dev/null)"
 fi
-echo "server_procs: $(ps -eo args 2>/dev/null | grep -E '[k]v260_chat_server|[t]est_inference|[c]lassify_images|[b]ert_squad( |$)|[k]ernel_perf' | sort | tr '\n' ';')"
+echo "server_procs: $(ps -eo args 2>/dev/null | grep -E '[k]v260_chat_server|[m]iranda_server|[t]est_inference|[c]lassify_images|[b]ert_squad( |$)|[k]ernel_perf' | sort | tr '\n' ';')"
 rule=/etc/tmpfiles.d/kv260-no-cpu-powerdown.conf
 echo "tmpfiles_rule: $( [ -e "$rule" ] && md5sum "$rule" | cut -c1-32 || echo missing)"
 echo "cpuidle_state1_disable: $(cat /sys/devices/system/cpu/cpu*/cpuidle/state1/disable 2>/dev/null | tr '\n' ' ')"

@@ -10,6 +10,7 @@ Makefile
 *.cmake
 !CMakeLists.txt
 !cmake/*.cmake
+!inference-scheduler/runtime/rpu/toolchain-r5.cmake
 
 # -----------------------------------------------------------------------
 # Vitis HLS / Vivado generated output
@@ -70,6 +71,15 @@ TestSimulation
 # Python / inference-scheduler
 # -----------------------------------------------------------------------
 inference-scheduler/.venv/
+# the demos' own venvs (the mnist / image_classification / camera READMEs' setup)
+demo/*/.venv/
+# the CNN demos' downloaded and preprocessed assets (the tracked .gitkeep files and sample image stay)
+demo/mnist/assets/
+demo/image_classification/assets/models/
+demo/image_classification/assets/labels/*
+!demo/image_classification/assets/labels/.gitkeep
+demo/image_classification/assets/preprocessed/*
+!demo/image_classification/assets/preprocessed/.gitkeep
 inference-scheduler/__pycache__/
 inference-scheduler/src/__pycache__/
 inference-scheduler/test/__pycache__/

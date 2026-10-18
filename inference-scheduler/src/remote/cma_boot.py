@@ -107,8 +107,9 @@ class Board:
         for p in SCRIPTS:
             text, _, rc = self.run(f"cat {p}", 30)
             out[p] = kria_value(text) if rc == 0 else None
-        text, _, rc = self.run(f"dumpimage -T script -p 0 -o /tmp/cma_boot.txt {IMAGE} >/dev/null 2>&1; "
-                               "cat /tmp/cma_boot.txt", 60)
+        # the image's script into a temporary file, removed again: a report leaves nothing behind
+        text, _, rc = self.run(f'f=$(mktemp) && dumpimage -T script -p 0 -o "$f" {IMAGE} >/dev/null 2>&1; '
+                               'cat "$f"; rc=$?; rm -f "$f"; exit $rc', 60)
         out[IMAGE] = kria_value(text) if rc == 0 else None
         return out
 

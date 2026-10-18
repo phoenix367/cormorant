@@ -14,6 +14,7 @@ import io
 import json
 import re
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -441,6 +442,7 @@ class Session(unittest.TestCase):
         srv = ms.MirandaServer(args, ms.ChatApi(args.chat_url), weather=weather.Weather(fetch=self.fetch))
         threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         d = tempfile.mkdtemp(prefix="miranda_test_")
+        self.addCleanup(shutil.rmtree, d, True)
         wav = os.path.join(d, "in.wav")
         with wave.open(wav, "wb") as w:
             w.setnchannels(1)
@@ -503,6 +505,7 @@ class Session(unittest.TestCase):
         (2026-10-17, the board's log: "Homey granda" answered as a request) waits
         for the request anew.  --save-segments keeps every segment."""
         seg_dir = tempfile.mkdtemp(prefix="miranda_segs_")
+        self.addCleanup(shutil.rmtree, seg_dir, True)
         rc, text, asr, tts, frames, sessions = self.run_session(
             [("pause", 1.0), ("speech", 1.2), ("pause", 1.2), ("speech", 1.6), ("pause", 1.5),
              ("speech", 0.8), ("pause", 1.2), ("speech", 0.8), ("pause", 1.2), ("speech", 1.0), ("pause", 1.5)],

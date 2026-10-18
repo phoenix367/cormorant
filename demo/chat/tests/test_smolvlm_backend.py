@@ -137,7 +137,8 @@ class TestImages(unittest.TestCase):
                 self.assertEqual(got.size, 512)
                 self.assertEqual(len(got.pixels), 512 * 512 * 3)
                 self.assertEqual(got.sha, im["sha256"],
-                                 f"Pillow {PIL.__version__} vs the fixture's {c['pillow']}")
+                                 f"Pillow {PIL.__version__} vs the fixture's {c['pillow']} (Pillow 13 resizes "
+                                 "differently from 9-12: inference-scheduler/requirements.txt pins < 13)")
         self.assertEqual(cache.get(c["images"][0]["url"]).sha, c["images"][0]["sha256"])
         self.assertEqual(cache.hits, 1)
 

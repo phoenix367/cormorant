@@ -4,12 +4,16 @@ paramiko>=3.0.0
 
 # the test suite (test/, ../demo/chat/tests)
 pytest>=7.0
+# the lint (the run-tests helper's lint suite, the CI workflow's version)
+ruff>=0.15,<0.16
 
 # tools/facts/facts.py — the fact registry checker (../facts.yaml)
 pyyaml>=6.0
 
-# PIL: the YOLO and stereo demos' image prep / overlays, the chat server's image tests
-Pillow>=10.0
+# PIL: the YOLO and stereo demos' image prep / overlays, the chat server's image tests.  Below 13:
+# Pillow 13's LANCZOS resize differs from 9-12's (the board's 9.0.1 included) on the SmolVLM
+# image test's 60 x 180 case, whose reference pixels are the study's
+Pillow>=10.0,<13
 
 # simplify_onnx.py — ONNX preprocessing pipeline
 onnxsim>=0.4.0

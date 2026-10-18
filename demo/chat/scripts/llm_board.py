@@ -478,6 +478,7 @@ def main(argv=None) -> int:
                 print(f"  lib check (ctypes): {results['lib_check']}", flush=True)
             sftp.close()
         finally:
+            session.exec(f"rm -rf {RUN_DIR}", timeout=30)   # the run's inputs / outputs, downloaded
             session.close()
     o = res.get("llm_open", {})
     print(f"llm_open {o.get('open_ms')} ms, CmaFree {o.get('cma_free_kb_before')} -> "

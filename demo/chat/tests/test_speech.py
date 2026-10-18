@@ -268,7 +268,7 @@ class TestSpeechQueueAndDisconnect(unittest.TestCase):
             for t in ts:
                 t.join(30)
             self.assertEqual(sorted(s[0] for s in spans), [200, 200])
-            self.assertFalse(srv.srv.fpga.busy)
+            self.assertTrue(wait_until(lambda: not srv.srv.fpga.busy))   # the release follows the response
             self.assertEqual(srv.srv.n_requests, 2)
         finally:
             srv.close()

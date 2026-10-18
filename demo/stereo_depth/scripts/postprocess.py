@@ -178,6 +178,18 @@ def postprocess(check: int = 2) -> dict:
     return r
 
 
+def realsense_lines(rows) -> list:
+    """One line per RealSense pair: the network's depth against the camera's own."""
+    out = []
+    for x in rows:
+        rs = x.get("realsense") or {}
+        if "within_10pct" in rs:
+            out.append(f"{x['name']}: depth within 10 % of the camera's own on {rs['within_10pct']:.1f} % of the "
+                       f"pixels (median difference {100 * rs['median_rel_diff']:.1f} %, {rs['compared_px']} px, "
+                       f"projector {'on' if rs.get('emitter') else 'off'})")
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
     ap.add_argument("--check", type=int, default=2, help="pairs checked bit for bit against the simulation")
@@ -186,6 +198,8 @@ def main(argv=None) -> int:
     if "epe" in r:
         print(f"{r['labelled']} pairs with ground truth: EPE {r['epe']:.3f} px, bad-1 {r['bad1']:.2f} %, "
               f"bad-2 {r['bad2']:.2f} %")
+    for line in realsense_lines(r["per_pair"]):
+        print(line)
     be = r["bit_exact"]
     if be:
         print("bit-exact against the simulation: " + ("yes" if not be["differ"] else f"NO {be['differ']}")
