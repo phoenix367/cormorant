@@ -7,8 +7,8 @@ pragmas named below, nor the co-simulation code).*
 ## Overview
 
 `MatmulKernel` is a Vitis HLS kernel implementing tiled matrix multiplication
-`C = A × B` on the Xilinx KV260 FPGA. It is one of four hardware kernels in
-the `axi_demo` project. The kernel computes a batch of independent 2-D
+`C = A × B` on the Xilinx KV260 FPGA. It is one of five hardware kernels in
+the Cormorant project. The kernel computes a batch of independent 2-D
 matrix products on row-major matrices, with optional per-operand batch
 broadcasting (a stride of 0 reuses `A` or `B` across every batch step).
 

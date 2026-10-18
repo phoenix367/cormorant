@@ -64,7 +64,7 @@ Not all tensors are candidates for reuse:
 | **Weight** (`is_weight=True`) | Entire `inference_init()` → `inference_deinit()` | No — always live |
 | **DMA state** (`axi.numeric` state without a host kind, e.g. a KV cache) | Persistent across `inference_run()` calls | No — placed after the weights |
 | **Graph input / output** | Passed in by the caller per `inference_run()` call | No — not in pool |
-| **Reshape alias / Slice view** | Points to (part of) the memory of its source | No — no backing storage |
+| **Reshape alias / Slice view** (and the inputs of an in-place attention merge) | Points to (part of) the memory of its source | No — no backing storage |
 | **Host-memory tensor** (`axi.numeric` `host`) | Intermediate in host memory | Yes — in a separate malloc'd arena, same colouring |
 | **Intermediate** | Produced by one node, consumed by one or more later nodes | **Yes** |
 
@@ -197,7 +197,7 @@ Weights `W1`, `B1`, `W2`, `B2` and `Y` are excluded from interval analysis.
 The event stream alternates the Matmul and VectorOP lanes:
 `[1] start(0)`, `[3] wait(Matmul,0)`, `[4] start(1)`, `[6] wait(VectorOP,1)`,
 `[7] start(2)`, `[9] wait(Matmul,2)`, `[10] start(3)`, `[11] drain(VectorOP,3)`
-(the even-numbered events in between are node comments).
+(events 0, 2, 5 and 8 are the node comments).
 
 ```mermaid
 gantt
@@ -288,7 +288,11 @@ align_up(n) = (n + 31) & ~31
 
 A slot's footprint is `max(align_up(tenant.alloc))` (the same as `align_up`
 of the largest tenant): the slot must fit the **largest** tenant, and that
-padded footprint is what advances the pool offset.
+padded footprint is what advances the pool offset.  A slot (or weight) of
+64 KiB or more starts on a 4 KiB page of the pool (`bank_phase.page_start`,
+RPU_PLAN §13.12), and with bank phases on (`--bank-phase`, the default) a
+slot that a binary VectorOP streams with another buffer may be padded to a
+different DRAM bank (SCHEDULER_DAG.md §6).
 
 ---
 
@@ -307,7 +311,7 @@ host-memory intermediates).  The dictionary is keyed by ONNX tensor name.
 Tensors excluded:
 - Weight tensors (`t.is_weight`) and states
 - Graph inputs and outputs
-- Reshape aliases and Slice views (keys of `_alias_source_map()`)
+- Reshape aliases, Slice views and in-place merge inputs (keys of `_alias_source_map()`)
 
 Edge case: if a tensor is produced but never consumed (dead code), its
 end is the drain event of its producer.
@@ -331,8 +335,9 @@ Layout order: all weights first (graph order), then DMA states, then
 intermediates grouped by slot (slot 0 tenants first, then slot 1, …).
 
 `INFERENCE_BUF_POOL_SIZE_BYTES` in the generated header is **not** this
-total: `_compute_pool_bytes()` sums every buffer without reuse (see
-ARCHITECTURE.md §7).  `report.md` "Activation memory" shows the reused size.
+total: `_compute_pool_bytes()` sums every buffer without reuse (or takes the
+laid-out pool when bank-phase padding makes it larger; see
+ARCHITECTURE.md §8.3).  `report.md` "Activation memory" shows the reused size.
 
 ### `_reshape_aliases`
 
@@ -494,7 +499,10 @@ holds the post-activation output of the same spatial resolution).
 |--------|-------------------|---------------------|--------|
 | Weights | 8.12 MiB | 8.12 MiB | — |
 | Intermediates | **19.24 MiB** | **3.06 MiB** | **16.18 MiB (84.1 %)** |
-| **Total pool** | **27.36 MiB** | **11.18 MiB** | **16.18 MiB (59.1 %)** |
+| **Total pool** | **27.36 MiB** | **11.21 MiB** | **16.16 MiB (59.0 %)** |
+
+(The optimised total includes 23 KiB of padding: a weight or slot of 64 KiB
+or more starts on a 4 KiB page, §7.)
 
 Pool layout (batch=1, weights at offset 0):
 

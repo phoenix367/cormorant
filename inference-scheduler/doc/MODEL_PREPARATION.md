@@ -143,7 +143,7 @@ remedies are:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `LogSoftmax`, `ArgMax`, `TopK` in the tail | Classifier head | Strip the tail with `onnx.utils.extract_model(in, out, [model_input], [pre_softmax_tensor])`. A `Softmax` over the last axis runs as a host-CPU op and can stay; the local `mobilenet_v1_1.0_224_no_softmax.onnx` was cut this way before that existed. |
+| `LogSoftmax`, `ArgMax`, `TopK` in the tail | Classifier head | Strip the tail with `onnx.utils.extract_model(in, out, [model_input], [pre_softmax_tensor])`. A `Softmax` over the last axis runs as a host-CPU op (or on VectorOPKernel's softmax unit) and can stay; the local `mobilenet_v1_1.0_224_no_softmax.onnx` was cut this way before that existed. |
 | `BatchNormalization` left after simplify | BN that onnxsim / `fuse_bn_into_conv` could not fold (e.g. `resnet18-v1-7` / `-v2-7`, §1) | Fold BN into the preceding Conv with a custom pass; the scheduler has no BN op. |
 | `Shape`, `Gather` / `Concat` on shapes | Dynamic-shape scaffolding | A `simplify_onnx.py` pass with pinned input shapes (`--batch` / `--input-shape`) constant-folds them. |
 | `Pad` with non-constant pads | Dynamic padding via `Shape`/`Slice` | Re-export the model with constant padding values, or rewrite via `onnx.compose` / `onnx-graphsurgeon`. |

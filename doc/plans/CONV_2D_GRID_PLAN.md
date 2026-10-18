@@ -7,7 +7,9 @@
 > per cycle = 512 MACs (§2.42).  Of §7a's open items, kTileM 8→16 is done and
 > the 2-element drain was superseded by §2.38; the min-chunks policy is still
 > open.  §8 risk 6 went the other way: MatMuls now run on ConvKernel
-> (BERT_PLAN.md 2A).  Current design: CONV_KERNEL.md and CONV_OPTIMISATION.md §3.
+> (BERT_PLAN.md 2A).  Current design: CONV_RTL_KERNEL.md (the SystemVerilog
+> kernel since 2026-10-06, CONV_RTL_PLAN.md); the HLS design, now the C++
+> reference model: CONV_KERNEL.md and CONV_OPTIMISATION.md §3.
 
 Plan for widening the standard-conv MAC array from the current 1-D grid
 (16 input-channel lanes, output channels rotated over time) to a 2-D grid

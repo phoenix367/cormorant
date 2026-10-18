@@ -128,7 +128,7 @@ Some parts need more:
 - Pillow and the SmolVLM tokenizer for the image tests;
 - numpy, ffmpeg and libespeak-ng for the speech tests.
 
-About 60 tests skip until their assets are present:
+About 70 tests skip until their assets are present:
 - the SmolLM2 tokenizer: `scripts/llm_calibrate.py fetch`;
 - the SmolVLM tokenizer: `scripts/vlm_study.py fetch`;
 - BERT's `vocab.txt`: `../bert_squad/scripts/fetch_assets.py vocab`.

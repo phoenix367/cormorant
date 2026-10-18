@@ -29,7 +29,7 @@ code changes; B when build / setup paths, repo contents (new files,
    (`CHECK` — a lead, not a verdict: dated numbers, sample output, per-module
    counts show up too) and writes `area_<name>.md` + `review.md` with the
    counts filled in.  Areas: root (README / CLAUDE.md / doc/README /
-   tools/facts/README), scheduler-ref (doc/scheduler,
+   tools/facts/README), architecture (doc/ARCHITECTURE.md), scheduler-ref (doc/scheduler,
    inference-scheduler/CLAUDE.md), scheduler-guides (inference-scheduler/doc
    — the scheduler docs are ~8 000 lines, hence two agents), kernels
    (references in full, optimisation logs only their current-state parts),
@@ -60,7 +60,7 @@ code changes; B when build / setup paths, repo contents (new files,
 Rules: history stays (dated plan sections, optimisation-log entries,
 before / after tables); a doc that is right about buggy code is reported, not
 bent to the bug; agents do not run syntheses, board commands or the suites
-(seven agents running pytest at once = inconsistent numbers and ~30 min of
+(eight agents running pytest at once = inconsistent numbers and ~30 min of
 CPU).  2026-09-28 found stale port widths, register offsets, fixture and test
 counts, script paths and plan status lines.
 
@@ -78,7 +78,7 @@ $S/scripts/make_clone.sh --list-untracked "$PWD"    # untracked, not-ignored pat
 # not models, assets, build trees, venvs, locks, private board/ dirs
 $S/scripts/make_clone.sh --files $TMPDIR/overlay_files_$D.txt "$PWD" "$D"
 ```
-It clones `git@github.com:phoenix367/cormorant.git` + `git submodule update
+It clones `https://github.com/phoenix367/cormorant.git` + `git submodule update
 --init` exactly as README Quick start §1 (47 MB, ~12 s), applies
 `git diff <origin HEAD> --binary` of the working copy (unpushed commits
 included; the submodules excluded — Vivado dirties them and the clone keeps
@@ -126,7 +126,7 @@ complete, continue it with SendMessage (context intact) instead of a new agent.
        && .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
    cd ../demo/mnist && ../../inference-scheduler/.venv/bin/python run_demo.py --skip-download
    ```
-   Expect ConvMNIST 98.92 % / 0.111 ms, LeNet 97.35 % / 1.249 ms.  "Overlay
+   Expect ConvMNIST 98.92 % / 0.114 ms, LeNet 97.35 % / 1.266 ms (`de968ccc45da`).  "Overlay
    'pl' did not apply" → the agent's `design_cormorant` overlay is still
    there: `rmdir /sys/kernel/config/device-tree/overlays/design_cormorant` on
    the board, run again.
@@ -187,9 +187,9 @@ missing from the SmolLM2 steps, `sim_hw_kv260` failing with exit 0), 10 minor,
 - **The same dtbo under a second overlay name** is rejected by the kernel
   (`err=-22`) while configfs reads "applied"; the PL stays programmed with the
   agent's bitstream until B5.
-- **`build_hw_kv260` and `behavior_test_*` re-synthesise and wipe the driver
-  dirs** — no project generation meanwhile; the brief's driver snapshot lets
-  board work overlap with RTL tests.  Never two test-stand jobs at once.
+- **`build_hw_kv260` and `behavior_test_*` re-package the IPs** — the RTL
+  drivers (`build/kernels/<k>_rtl/driver/`) stay, so board work can overlap
+  with RTL tests.  Never two test-stand jobs at once.
 - **Documented steps dirty tracked files** in the clone (`.bd` / `.xci` /
   `.xpr` of both submodules, the SmolLM2 provenance JSON) — expected.
 - **Excluding all of `hw/`** from the overlay would drop `hw/test_data`

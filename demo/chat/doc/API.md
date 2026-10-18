@@ -48,7 +48,8 @@ true`, `transcript.text.delta` events (one per part) and a final
 - `version`;
 - `models`: one entry per model — `id`, `ready`, `loaded`, and backend
   fields:
-  - every model: `library`, `weights_dir` (Piper: `voice_dir`);
+  - every model: `library`, `weights_dir` (Piper: `voice_dir`; Moonshine:
+    none);
   - BERT: `model_name`, `seq_len`, `max_windows`, `windows_run`;
   - SmolLM2: `vocab_size`, `context_size`, `reserve`, `sampler`,
     `cached_tokens`, `defaults`, `requests`,
@@ -67,7 +68,7 @@ true`, `transcript.text.delta` events (one per part) and a final
 
 | Field | Notes |
 |---|---|
-| `model` | default: the first backend (the first speech backend for `/audio/speech`, the first speech-to-text backend for `/audio/transcriptions`) |
+| `model` | default: the first chat backend (the first speech backend for `/audio/speech`, the first speech-to-text backend for `/audio/transcriptions`) |
 | `messages` | string content or text parts; `image_url` parts (base64 data URLs) for `smolvlm` |
 | `stream`, `stream_options.include_usage` | streaming, as above |
 | `max_tokens` / `max_completion_tokens` | the answer's length cap |

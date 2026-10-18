@@ -17,7 +17,7 @@ as the HLS kernel), in fewer LUTs, FFs and BRAMs and no URAM
 
 **Status (2026-10-04):** the MatmulKernel of the KV260 hardware build and of
 the board (bitstream `1d28630fbfa4`, MATMUL_RTL_PLAN phase 4; since 2026-10-04 `bbb9a37f73f8`,
-the same design plus a PoolingKernel guard); the HLS
+the same design plus a PoolingKernel guard; production `04259a7af917` since 2026-10-17); the HLS
 kernel's synthesis is retired, its C++ reference `ref_matmul_2d` stays and
 writes the fixtures every RTL test checks against.  The bitstream meets
 timing at 100 MHz and passes the test stand's matmul behaviour test
@@ -45,7 +45,7 @@ when its tool is found (Verilator 5.x: `sudo apt install verilator`;
 Vivado 2025.2).
 
 ```bash
-cd build && cmake ..
+mkdir -p build && cd build && cmake ..
 make TestMatmulRtl        # Verilator testbench (kernels/matmul_rtl/vl/Vtb)
 ctest -R MatmulRtl        # TestMatmulRtl: 50 fixtures + 200 random cases (~50 s);
                           # MatmulRtlDriver: the driver's register table vs the RTL
@@ -66,12 +66,15 @@ make sysim_matmul_rtl     # test stand's MatmulKernel block design with this IP,
 
 `synthesize_kv260` / `build_hw_kv260` / `sim_hw_kv260` /
 `behavior_test_matmul` use this IP (`package_matmul_rtl`): Vivado scans
-`build/ip_repo_kv260/`, which links the Conv HLS kernel, this IP and the
-RTL VectorOPKernel ([VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md)) and
-PoolingKernel ([POOL_RTL_KERNEL](POOL_RTL_KERNEL.md)).  After
+`build/ip_repo_kv260/`, which links this IP and the
+RTL VectorOPKernel ([VECTOROP_RTL_KERNEL](VECTOROP_RTL_KERNEL.md)),
+PoolingKernel ([POOL_RTL_KERNEL](POOL_RTL_KERNEL.md)), ConvKernel
+([CONV_RTL_KERNEL](CONV_RTL_KERNEL.md)) and RowOpsKernel
+([ROWOPS_RTL_KERNEL](ROWOPS_RTL_KERNEL.md)).  After
 the IP upgrade the hardware and test-stand scripts reset every kernel
 instance's `C_M_AXI_*_DATA_WIDTH` to its IP's default, so `MatmulKernel_0`'s
-gmem2 becomes 128 (the block designs still say 32, the HLS kernel's width).
+gmem2 becomes 128 (the test stand's block design still says 32, the HLS kernel's width;
+`cormorant_hw_128`'s holds 128).
 Generated projects take the driver from `driver_matmul_rtl`
 (`build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src`, the files the IP
 carries).
@@ -95,7 +98,7 @@ with `python3 kernels/matmul_rtl/scripts/vcdq.py F.vcd table T0 T1 <regex>...`
 a time).
 
 After changing `mm_core`'s ports or parameters, regenerate the Verilog top
-level: `python3 kernels/matmul_rtl/scripts/gen_top_wrapper.py` (run it in
+level: `python3 scripts/gen_top_wrapper.py` (run it in
 `kernels/matmul_rtl/`).
 
 ## Software driver

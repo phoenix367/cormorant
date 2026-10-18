@@ -6,7 +6,7 @@ pragmas named below, nor the co-simulation code).*
 
 ## Overview
 
-`ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of four hardware kernels in the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel tiling (output-channel tile kTileM × input-channel tile kTileIC, 16 × 16) maps onto a 16 × 16 MAC grid that one flat II=1 sweep per `(ic-tile, ow-tile, M-group)` feeds with two output pixels per cycle (§5.1). The inference scheduler also runs MatMuls on this kernel (§8).
+`ConvKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D convolution on NCHW tensors. It is one of five hardware kernels in the Cormorant project, targeting the Xilinx KV260 FPGA. The kernel supports standard convolution (group=1) and depthwise convolution (group=in_ch), optional per-channel bias, padding, stride, and dilation. A two-level channel tiling (output-channel tile kTileM × input-channel tile kTileIC, 16 × 16) maps onto a 16 × 16 MAC grid that one flat II=1 sweep per `(ic-tile, ow-tile, M-group)` feeds with two output pixels per cycle (§5.1). The inference scheduler also runs MatMuls on this kernel (§8).
 
 > **Retired from the hardware build (2026-10-06, CONV_RTL_PLAN phase 3).**
 > The bitstream carries a SystemVerilog drop-in with the same ports,
@@ -49,7 +49,7 @@ request per (channel, 256-pixel segment) run of ≤ 33 words, at most 4
 unacknowledged).  The Vivado block-design instance widths must equal
 the exported IP defaults — 128 bits on all four ports.
 
-**AXI-Lite control registers (`s_axilite bundle=ctrl`) — 21 registers total:**
+**AXI-Lite control registers (`s_axilite bundle=ctrl`) — 24 registers total:**
 
 | Register | Type | Description |
 |----------|------|-------------|
@@ -63,8 +63,9 @@ the exported IP defaults — 128 bits on all four ports.
 | `pad_top`, `pad_left` | `unsigned` | Padding (top row / left column); bottom / right padding is implicit — out-of-range input reads return 0 |
 | `has_bias` | `unsigned` | 0 = skip bias; 1 = add per-channel bias |
 | `is_depthwise` | `unsigned` | 0 = standard (group=1); 1 = depthwise (group=in_ch) |
+| `y_cs`, `y_cn`, `y_gs` | `unsigned` | the y channel pattern (RPU_PLAN §13.2): channel c's plane at `(c mod y_cn)·y_cs + (c div y_cn)·y_gs` elements after `y`; 0 0 0 = dense NCHW ([CONV_RTL_KERNEL](CONV_RTL_KERNEL.md) §1) |
 
-64-bit AXI addressing is configured in the synthesis TCL (`config_interface -m_axi_addr64`).
+64-bit AXI addressing was configured in the retired synthesis TCL (`config_interface -m_axi_addr64`; the RTL kernel's addresses are 64-bit too).
 
 ---
 
@@ -613,7 +614,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 ## 7. Test Coverage (`TestConvModel.cpp`)
 
-`TestConvModel` runs 97 named cases compiled with GCC against the Vitis HLS headers (no HLS tool run): 59 convolution cases and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvModelGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvModelSweep` (`TestConvModel --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match (`ap_fixed<16,8>`, the only configuration that builds). The RTL behavior testbench (`make behavior_test_conv`) uses the 63 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture) and the first 5 MatMul-on-ConvKernel cases.
+`TestConvModel` runs 100 named cases compiled with GCC against the Vitis HLS headers (no HLS tool run): 62 convolution cases (the 3 y-pattern cases among them) and 38 MatMul-on-ConvKernel cases (below). Two more ctest entries: `TestConvModelGrid` (the MAC array of `ConvMacGrid.h` in isolation, including the §2.42 two-pixel / staggered-seed step) and `TestConvModelSweep` (`TestConvModel --sweep 300`, a randomised-geometry sweep bit-exact against the naive oracle). Tolerance: exact match (`ap_fixed<16,8>`, the only configuration that builds). The RTL behavior testbench (`make behavior_test_conv`) uses the 66 pre-baked fixtures under `hw/test_data/conv_test_data/`: 58 of the convolution cases (the space-to-depth stem case on 16×16 is C-sim-only; its 11×13 sibling is a fixture), the first 5 MatMul-on-ConvKernel cases and the 3 y-pattern cases.
 
 **Reference implementations:**
 - `ref_conv()` — naive 7-nested-loop standard convolution
@@ -636,6 +637,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 | Depthwise conv — oh-chunking | 32 ch / 32×32 out (one chunk at the current bound, as above) |
 | **Pixel pairs (§2.42)** | **3×3 s2 with odd (8×7) and even (6×8) out_w; out_w = 1 with 3 ic-tiles; ow-tiling with the tile width rounded to even (3×3 s2 in_w=128 → 30+30+4) and a 1×1 on in_w=130 (64+64+2); 3×3 s2 dilation 2 → 7×9; the space-to-depth stem 12ch 4×4 s1 pad [2,2,1,1] on 11×13; depthwise 1×1 (dummy position) and 3×3 s2 → 4×5; the sweep-bound 3×3 64→64 on 28×28 anchor** |
 | Saturation (ap_fixed only) | std positive overflow → AP_MAX; std negative overflow → AP_MIN; DW positive overflow → AP_MAX |
+| y channel pattern (RPU_PLAN §13.2; RTL fixtures 63–65) | 1×4 s(1,4) P·V shapes writing through `y_cs` / `y_cn` / `y_gs`: attention G = 3, T = 16, HD = 64; a vision one-group P·V (`y_cs` only); odd strides at HD = 96 with 4 KiB crossings |
 | **MatMul on ConvKernel** (`run_matmul_case`, `run_matmul_heads_case`) | RTL fixtures: 1×2 s(1,2) N=40 K=64 M=48; 1×3 s(1,3) and 1×4 s(1,4) with 2 ow-tiles; 1×1 with 2 M-groups; 1×2 N=256 K=32 M=384 (2 oh-chunks). C-sim only: BERT-base classes (QKᵀ / P·V heads, 768-wide 1×2, FFN-down 1×3 with in_ch = 1024, 1×4 in_ch 768, 1×1 in_ch 1024), a saturating case, two offset-pointer head cases (neighbouring lanes checked untouched), 24 random lowered geometries (kw 1–4). Each also checks that the packed filter IS A and that the conv oracle equals the MatMul oracle |
 
 ---
@@ -653,7 +655,7 @@ column, folded into the DSP input registers).  Depthwise zero-fills
 
 **`LlmAttnConvNode` (`llm_nodes.py`)** runs attention as MatMul-on-ConvKernel calls, one per KV group: q·Kᵀ (the K cache is the weight, `out_ch` = keys) and P·V (the V cache as the `1 × kw` input, `in_ch` = keys / kw). In the Llama prefill the key count is a runtime value from the entry's `pos` / `n` written into those registers; the vision encoder (`src/vit.py`) uses a static key count.
 
-**Code-generated `run_conv()` (`_source.py`)** sets all 21 AXI-Lite registers and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case. `run_conv_at()` is the same call with `x` / `weight` / `y` at element offsets into their buffers (no bias) — used when a MatMul on ConvKernel is issued as several calls (one per batch item / attention head, or a row split) and by `LlmAttnConvNode`.
+**Code-generated `run_conv()` (`_source.py`)** sets all 24 AXI-Lite registers (the y pattern's three to 0, dense, when the driver has them) and calls `XConvkernel_Start()` — non-blocking. The `inference_run()` body emits a `kernel_wait(KERNEL_CONV)` later, only when a downstream op needs the Conv output or another op wants to reuse the Conv lane, which lets work on other lanes (e.g. Pool, VectorOP) overlap with the Conv. `bias` may be `NULL` when `has_bias=0`; `gmem2` is not accessed by the kernel in that case. `run_conv_at()` is the same call with `x` / `weight` / `y` at element offsets into their buffers (no bias) — used when a MatMul on ConvKernel is issued as several calls (one per batch item / attention head, or a row split) and by `LlmAttnConvNode`; `run_conv_at_y()` adds the y pattern's three registers (the P·V calls that write the merged tensor, platform `kernels.conv.y_pattern`).
 
 **Layout constraint (`_core.py`):** `ConvKernel` writes a flat NCHW output. If the output tensor feeds a broadcast `VectorOP` node that requires an advancing-strided layout (`n_chunks > 1`), the scheduler raises a `SchedulerError`. Per-channel bias must be passed as the Conv operator's 3rd input, not as a separate downstream `Add` node.
 
@@ -694,7 +696,7 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 | `inference-scheduler/src/nodes.py` | `ConvNode` / `MatmulConvNode` classes (ONNX → kernel params, weight packing) |
 | `inference-scheduler/src/matmul_lowering.py`, `cost_model.py` | MatMul → ConvKernel eligibility, geometry, row split and engine choice |
 | `inference-scheduler/src/llm_nodes.py` | `LlmAttnConvNode` (Llama / vision-encoder attention calls on ConvKernel) |
-| `inference-scheduler/src/codegen/_source.py` | `run_conv()` / `run_conv_at()` code generation |
+| `inference-scheduler/src/codegen/_source.py` | `run_conv()` / `run_conv_at()` / `run_conv_at_y()` code generation |
 | `inference-scheduler/src/codegen/_core.py` | Conv node detection, layout validation |
 | `inference-scheduler/src/codegen/_simulate.py` | Float64 reference simulation |
 
@@ -725,7 +727,7 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 | **ow-tiling** | Auto-splits output along ow when `in_w > kMaxLineBufCols`; tile width rounded to even (pair-aligned, §2.42); (kw-1)·dilation_w cols re-fetched at tile boundaries |
 | **Tile geometry** | oh-chunking / M-grouping / ow-tiling resolved once by `compute_conv_geometry()` and passed to every stage as a `ConvGeometry` struct — one shared divider set, not one per stage (§2.19) |
 | **AXI master ports** | 4 (gmem0 input, gmem1 weight, gmem2 bias, gmem3 output) |
-| **AXI-Lite registers** | 21 (4 DDR addresses + 17 scalars) |
+| **AXI-Lite registers** | 24 (4 DDR addresses + 20 scalars) |
 | **Padding** | Implicit zero-pad (out-of-bounds reads return 0) |
 | **Kernel size limit** | kMaxKH=7, kMaxKW=7 (compile-time; enforced by `ConvNode`, §8) |
 | **Persistent acc constraint** | `out_w·ceil(out_ch/kTileM)·kTileM ≤ kMaxAccPersistEntries` *(larger outputs auto-chunked along oh)* |
@@ -740,4 +742,4 @@ read `platforms/kv260.json` (part, optional board, clock — 150 MHz for the KV2
 | **Driver prefix** | `xconvkernel` |
 | **UIO device name** | `ConvKernel_0` (generated-code default, `INFERENCE_CONVKERNEL_INSTANCE`); the KV260 overlay `dts/kv260/cormorant.dts` names the node `fabric_conv` |
 | **Resources (csynth, post-§2.42)** | 127 BRAM18 (44 %), 48 URAM (75 %), 679 DSP (54 %) |
-| **Test coverage** | 97 named C-sim cases (59 conv + 38 MatMul-on-ConvKernel; 66 RTL fixtures) + `TestConvModelGrid` + the 300-case random sweep (`TestConvModelSweep`) |
+| **Test coverage** | 100 named C-sim cases (62 conv + 38 MatMul-on-ConvKernel; 66 RTL fixtures) + `TestConvModelGrid` + the 300-case random sweep (`TestConvModelSweep`) |

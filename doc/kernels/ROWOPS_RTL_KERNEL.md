@@ -15,7 +15,7 @@ IDs, writes on one) on its own PS port — `S_AXI_HP0_FPD` through
 
 Read this before changing the RTL: §1 is the contract the scheduler and
 the drivers program against, §6 the invariants a change must keep.  Since
-RPU_PLAN A2.2 (2026-10-15, RTL only until the A2.3 bitstream) one start can
+RPU_PLAN A2.2 (2026-10-15; in the bitstreams since A2.3's `33a799febc56`) one start can
 run a **descriptor chain** — up to 16 jobs read from DDR, back to back, one
 interrupt (§1.6).
 
@@ -43,8 +43,8 @@ done, b1 ready), `0x0C` ISR (toggle on write).  Arguments
 |---|---|---|
 | `0x10` | `op` | [3:0] op code (§1.4); [5:4] A kind; [7:6] B kind; [9:8] C kind (0 i16, 1 i32, 2 f32 — C only); [12] `B_EN` stream B present; [13] `P_BCAST` one parameter entry for every column; [14] `P_KEEP` keep the parameter RAM of the previous job (no read of `p`); [15] `RELU` (COPY / ADDX: max(y, 0) after saturation); [16] `NORM_LN` (NORM: LayerNorm; 0 RMSNorm); [17] `SCALE` (COPY / ADDX: the sum times the column's G before the rounding, RPU_PLAN §14.3) |
 | `0x14` | `n` | elements per row, 1 … 4096 (TRANSPOSE: L, the tile's row length; FOLD: W, the output row, any 32-bit value ≥ 1) |
-| `0x18` | `c1` | rows per block (TRANSPOSE: tiles per block) |
-| `0x1C` | `c2` | blocks (≥ 1) |
+| `0x18` | `rows` (c1) | rows per block (TRANSPOSE: tiles per block) |
+| `0x1C` | `blocks` (c2) | blocks (≥ 1) |
 | `0x20`/`0x24` | `a` | stream A base (byte address, 16-byte aligned; FOLD: source column 0 of output channel 0, 2-byte aligned) |
 | `0x28` | `a_s1` | bytes between A's consecutive rows (multiple of 16) |
 | `0x2C` | `a_s2` | bytes between A's blocks (FOLD: between the channels' source rows, signed and even) |
@@ -140,14 +140,15 @@ every counter is sized for the register value.
 | `VitPixelShuffleNode` (`PixelShuffleRoNode`) | one COPY per source block the column window touches: the output rows (i, j) as rows j × blocks i, the source rows (i·s + b)·n + j·s + a |
 | `LlmAttnPrepNode` (the prefill entries — `AttnPrepRoNode`, HOSTOPS_PLAN §10; the decode steps too with the frontends' `drope`, RPU_PLAN §13.4: one row, the q image one TRANSPOSE of R = G with the groups as blocks, no zeroing) | ROPE on q0 (→ a staging row at f_q[h]) and k0 (→ a staging row at f_k[g]), one COPY of the k rows into the K cache (`blocks` = the KV groups), a COPY re-rounding v where the V cache's exponents differ, one TRANSPOSE per KV group of the q rows into the q·Kᵀ x image (tiles of 8 query rows, `kw` 1), the V image per group as TRANSPOSEs: the 16K-row blocks inside [pos, pos + n) with R = group_kw (contiguous granules), the two boundary blocks as R = 1 granules (byte-strobed); a COPY with the window [0, 0) zeroes the q staging once per run |
 | `VitAttnPrepNode`, Piper's (`VitAttnPrepRoNode`, phase 4b) | q0 + bq and v + bv as COPYs with the bias in the parameter block (`rowops_spec.bias_round`: Bq' = round(b·2^fp), fp = `bias_exp`) into staging rows, k0 + bk per head straight into the K cache, one TRANSPOSE of the q rows into every head's image (the heads as blocks), the V image per head as the whole-block TRANSPOSEs (T = C = a multiple of 16K) or, group_kw 1, one COPY with the heads as blocks |
-| `LlmAttnMergeNode`, `TtsAttnMergeNode` | COPY per group (2-level: rows t, heads hh) |
+| `LlmAttnMergeNode`, `TtsAttnMergeNode` | COPY per group (2-level: rows t, heads hh) — not taken: since RPU_PLAN §13 `LlmAttnMerge` emits nothing (decode in place, prefill / vision through ConvKernel's y channel pattern), `TtsAttnMerge` stays on the host |
 | `TtsRowPrepNode` (`TtsRowPrepRoNode`, phase 4b) | one COPY per tap of the rows it reads (`rows = n`, the output shifted by the tap's offset) with the bias and `RELU` in the parameter block; the rows the host zeroes (the first tap's row 0, the last tap's row n − 1, every row ≥ n) as COPYs with the window [0, 0) |
 | `TransposeNode` (`TransposeRoNode`, RPU_PLAN A1: BERT's head splits / merges and Kᵀ) | a head split / merge (the collapsed [D2][D1][n] with strides [n, D2·n, 1]) as one COPY with `rows = D1`, `blocks = D2`; Kᵀ ([B][L][M] with strides [sB, 1, sM]) as one TRANSPOSE of 8-row tiles into granules at the output's row stride M |
-| `TtsSumNode` (two inputs, `TtsSumRoNode`) / `TtsInterleaveNode` (`TtsInterleaveRoNode`) | ADDX over the channel slices with the shifts fp − f at the max exponent / one TRANSPOSE of R = the phase count s, tile = output channel, the columns in ≤ 1 024-wide chunks as blocks |
+| `TtsSumNode` (`TtsSumRoNode`: two inputs; three or four through an int32 scratch, RPU_PLAN §14.4) / `TtsInterleaveNode` (`TtsInterleaveRoNode`) | ADDX over the channel slices with the shifts fp − f at the max exponent (three or four inputs: a chain of ADDX; the stage averages ÷ 3: ADDX into int32, then ADDX with `SCALE`) / one TRANSPOSE of R = the phase count s, tile = output channel, the columns in ≤ 1 024-wide chunks as blocks |
 | `TtsAttnRelAddNode` (`TtsRelBandRoNode`, `PiperEncoderFrontend(rel_kernel=True)`) | the relative keys as 16 extra K cache rows (a COPY in `VitAttnPrepRoNode`; the q·Kᵀ call yields q·ekᵀ as rows T ..), one TRANSPOSE (R = 1, granule stride 2(T + 1): byte strobes) per key offset onto the diagonals of a zero band state [W + T][T] (W guard rows take the granules of i < −d, so every job reads its scores row from its aligned start), one ADDX of the band onto the scores |
 | `VitEmbedAddNode` (`EmbedAddRoNode`, opt-in: `VitFrontend(iembed=True)`) | one ADDX of the patch embedding (i16, per-column shifts) and the position table as an int32 stream at 2^-15 (shipped as a Q8.8 weight whose words are the int32 image) into the int32 residual |
-| `ConcatNode`, `SliceNode` | COPY |
+| `ConcatNode`, `SliceNode` | COPY (not mapped: both stay host copies) |
 | `TtsPrepNode` (`FoldRoNode`, HOSTOPS_PLAN §11; platform `kernels.rowops.fold`) | one FOLD: the int16 calls whose alpha is an exact 1/m at their shift (`rowops_spec.fold_divisor`, checked over every int16), the source rows unreversed, `[slo, shi)` from the runtime utterance window as `tts_prep` clamps it |
+| `TtsGateNode` (`GateRoNode`, RPU_PLAN §14.3; platform `kernels.rowops.gate`) | one GATE: A the tanh half, B the sigmoid half, rows of ≤ 4096 over the flat halves |
 
 ### 1.6 Descriptor chains (RPU_PLAN §13.3, phase A2.2)
 
@@ -346,7 +347,7 @@ board it saves each job's register writes, interrupt and wake.
   outputs, a NORM lane and the transposer's reset, none in `ro_fold` —
   34 675 LUT, 28 259 FF, 6 RAMB36, 7 URAM, 129 DSP: `ro_fold` 3 546 LUT,
   3 170 FF, 8 DSP, the read port's external runs ≈ 350 LUT.  In context
-  (production bitstream `de968ccc45da`, 2026-10-15, after the kernels' area
+  (bitstream `de968ccc45da`, 2026-10-15, after the kernels' area
   pass of `doc/plans/AREA_PLAN.md`): 33 340 LUT (3 930 LUTRAM, 437 SRL),
   26 712 FF, 6 RAMB36, 7 URAM, 129 DSP; the design closes 4 ns with WNS
   +0.029 ns / WHS +0.010 ns at 89 547 LUT (76.5 %) and 841 DSP.  With the
@@ -370,7 +371,7 @@ paths the sigmoid UltraRAMs' outputs, as before — none in the operand
 muxes, the bypass or the saturation), 35 323 LUT (+1 134), 28 667 FF
 (+1 637), 6 RAMB36, 9 URAM (+2: the B-side table copies), 133 DSP (+4: the
 B-side interpolations); `ro_stream` 9 110 LUT, 7 233 FF, 4 URAM, 24 DSP.
-In context (bitstream `04259a7af917`, 2026-10-16): 35 337 LUT, 28 673 FF,
+In context (bitstream `04259a7af917`, 2026-10-16; production since 2026-10-17): 35 337 LUT, 28 673 FF,
 6 RAMB36, 9 URAM, 133 DSP; the design closes 4 ns with WNS +0.027 ns /
 WHS +0.010 ns at 91 805 LUT and 57 / 64 URAM (a longer route: nine
 rip-up iterations, RPU_PLAN §14.10).
@@ -419,8 +420,8 @@ less the start / completion handshakes the chained jobs skip; what a chain
 saves on the board — each job's register writes, wait and wake, ≈ 40 µs per
 job on the A53 (RPU_PLAN §13.1) — is outside this measurement.
 
-Board figures (the DDR behind the port, the PS port's own rate) follow
-with phase 3.
+Board figures (the DDR behind the port, the PS port's own rate) are in
+HOSTOPS_PLAN §9.2 (phase 3, bitstream `1cedaf2ed816`).
 
 ## 4. Verification
 
@@ -494,10 +495,10 @@ with phase 3.
   before its cases (the oracle's table image, checked against the
   fixtures' `tables.hex`), as the driver does once after the bitstream.
 - **The block design** (`make sim_hw_kv260`, `hw/cormorant_hw_128`): the
-  testbench's `ro_classes.svh` runs the table load and the 21 checked-in
-  fixtures through the PS VIP's DDR model on the HP0 port — every A / B / P
+  testbench's `ro_classes.svh` runs the table load, the 43 checked-in
+  fixtures and the 2 chain fixtures through the PS VIP's DDR model on the HP0 port — every A / B / P
   image written, the C region poisoned and compared byte for byte with the
-  fixture — 22 of the design's 97 cases.  Two lessons from bringing it up:
+  fixture — 46 of the design's 123 cases.  Two lessons from bringing it up:
   the PS VIP's DDRC write path races and clobbers bytes just past a burst
   (the previous transfer's byte count at the new address), which the
   testbench undoes from a shadow of every byte written (`tb_infra.svh`);

@@ -6,7 +6,9 @@ activations after any op; bit-exact against the C++ model on every Q8.8
 input, verified at 300 MHz out of context.  Step 2 done — the scheduler
 maps ONNX `Gelu`, `LeakyRelu` and `x · Sigmoid(x)` onto it behind a
 platform capability (§5).  Step 3 done — bitstream `6436623029f7`
-(250 MHz, WNS +0.061 ns) is in production: 156 / 156 models, every
+(250 MHz, WNS +0.061 ns) was in production from 2026-10-06 to 2026-10-07
+(the unit is in every later bitstream; production since 2026-10-17:
+`04259a7af917`): 156 / 156 models, every
 library gate bit-exact, BERT 541 → 525 ms with its GELUs on the FPGA (§6).
 
 ## 1. Why

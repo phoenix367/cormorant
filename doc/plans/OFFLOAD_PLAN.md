@@ -1,6 +1,6 @@
 # SmolVLM and Piper on VectorOP's activation unit; the engine cost model at 250 MHz
 
-**Status (2026-10-07):** phase 1 (SmolVLM) done — gate bit-exact on the board, image 2.33 → 2.19 s; phase 2 (Piper) done — PCM bit-exact on the board, chunk 327 → 272 ms; both libraries in the chat server; phase 3 done — the cost model refitted (no shipped engine choice moved, per-call error halved), the performance model topped up to 1852 exact calls; phase 4 done (libraries deployed, docs and the fact registry updated; uncommitted).
+**Status (2026-10-07):** phase 1 (SmolVLM) done — gate bit-exact on the board, image 2.33 → 2.19 s; phase 2 (Piper) done — PCM bit-exact on the board, chunk 327 → 272 ms; both libraries in the chat server; phase 3 done — the cost model refitted (no shipped engine choice moved, per-call error halved), the performance model topped up to 1852 exact calls; phase 4 done (libraries deployed, docs and the fact registry updated; committed as d05cf0b).
 
 Follows [ACTIVATIONS_PLAN](ACTIVATIONS_PLAN.md) (the activation unit, in the
 production bitstream `6436623029f7`) and [FMAX_250_PLAN](FMAX_250_PLAN.md)

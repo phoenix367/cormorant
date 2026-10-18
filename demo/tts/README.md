@@ -19,7 +19,7 @@ flowchart TB
     fe["<b>Front end</b> · Arm cores<br/>espeak-ng via piper_phonemize"]
     enc["<b>Text encoder</b> · FPGA<br/>libpiper_tts.so tts_encode<br/>encode_#lt;T#gt;: MatMuls + attention on ConvKernel, host ops"]
     dur["<b>Durations, alignment, noise</b> · Arm cores<br/>duration predictor in C (tts_duration)<br/>alignment and noise in numpy (float64)"]
-    dec["<b>Flow + HiFi-GAN</b> · FPGA, per chunk of 128 frames<br/>libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel, 66 convs per chunk<br/>host ops: LeakyReLU, masks, folding, gates, stage averages, interleave; the decoder's residual sums on VectorOPKernel"]
+    dec["<b>Flow + HiFi-GAN</b> · FPGA, per chunk of 128 frames<br/>libpiper_tts.so: reverse flow + HiFi-GAN on ConvKernel, 66 convs per chunk<br/>row-ops unit: LeakyReLU + folding, gates, the flow's sums, stage averages, interleave; the decoder's residual sums on VectorOPKernel<br/>host ops: the flows' float32 inputs and outputs, PCM"]
     pcm(["int16 PCM, 22 050 Hz"])
 
     text --> fe
@@ -52,7 +52,7 @@ flowchart TB
 - **Duration predictor:** 49 ms for 88 ids (numpy: ~160 ms), bit-exact.
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.
-- **Memory:** 53 MiB of CMA.
+- **Memory:** 54 MiB of CMA.
 - **Quality:** the int16 datapath is within 0.19 dB log-mel of float (§3);
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
   one frame (§6); with its softmax on VectorOPKernel 0.39 dB and 0.26%
@@ -113,12 +113,13 @@ The scheduler parts are in `inference-scheduler/`:
 PY=inference-scheduler/.venv/bin/python
 # 1. the voice and its calibrated exponents (TTS_PLAN §3 "Commands")
 $PY demo/tts/scripts/piper_study.py fetch
-/mnt/data/tts_venv/bin/python demo/tts/scripts/piper_study.py phonemize    # venv from requirements-phonemize.txt
+python3 -m venv ~/tts_venv && PIP_CONFIG_FILE=/dev/null ~/tts_venv/bin/pip install -r demo/tts/scripts/requirements-phonemize.txt
+~/tts_venv/bin/python demo/tts/scripts/piper_study.py phonemize    # venv from requirements-phonemize.txt
 $PY demo/tts/scripts/piper_study.py calibrate
 $PY demo/tts/scripts/piper_study.py encoder          # the text encoder's exponents (TTS_PLAN §6)
 $PY demo/tts/scripts/piper_study.py encoder-vsmx     # its softmax on VectorOPKernel against the host's (SOFTMAX_PLAN §5)
 # 2. the library project and its host checks
-$PY demo/tts/scripts/generate_tts_project.py         # -> demo/tts/build/piper_project, 4 s
+$PY demo/tts/scripts/generate_tts_project.py         # -> demo/tts/build/piper_project, 13 s
 $PY demo/tts/scripts/tts_host_emu.py                 # the generated C == the spec on real sentences, 60 s
 $PY demo/tts/scripts/tts_host_emu.py --lib-check     # the chat server's backend over a host-built library
 # 3. the board (the chat server owns the FPGA: stop it first)
@@ -134,8 +135,9 @@ $PY demo/tts/scripts/tts_speech_check.py             # end to end, ~1 min
   - Each pass computes 256 flow frames and a 192-frame decoder window for
     128 output frames; the 64 frames of context on each side cover the
     receptive field.
-  - That context is also the main cost: the ConvKernel spends 0.5 s of
-    the 0.7 s per chunk.
+  - That context is also the main cost: at 100 MHz (TTS_PLAN §4) the
+    ConvKernel spent 0.5 s of the 0.7 s per chunk; the whole chunk takes
+    0.15 s on the production bitstream.
   - Larger chunks would cut the overlap, at the price of first-audio
     latency (TTS_PLAN §4, "Levers").
 - **The front end on the A53.**

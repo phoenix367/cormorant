@@ -4,10 +4,11 @@ Extractive question answering with **BERT-base** (ONNX model zoo
 `bertsquad-12`: 12 layers, hidden 768, 12 heads, sequence 256, 108.7 M
 parameters, fine-tuned on SQuAD 1.1) running on the KV260's
 **ConvKernel** (the MatMuls, with swapped operand roles — BERT_PLAN §2 2A),
-**MatmulKernel** (the two MatMuls ConvKernel cannot take and the attention
-P·V MatMuls) and
-**VectorOPKernel**, with LayerNorm / GELU / Softmax / Transpose / embedding
-lookup on the A53 host.  The demo
+**MatmulKernel** (the two MatMuls ConvKernel cannot take),
+**VectorOPKernel** (with the GELUs on its activation unit and the Softmaxes
+on its softmax unit) and the row-ops unit (**RowOpsKernel**: the LayerNorms
+and 48 of the 49 Transposes), with the embedding lookup on the A53 host.
+The demo
 
   1. tokenizes SQuAD 1.1 dev questions (WordPiece, one 256-token window),
   2. schedules the model with `inference-scheduler` into a C project,
@@ -73,9 +74,9 @@ demo/bert_squad/
 * The scheduler's virtualenv (`inference-scheduler/.venv`, from
   `inference-scheduler/requirements.txt`, see the root README): numpy,
   onnx, paramiko.  All commands below use it.
-* Driver sources for VectorOPKernel, MatmulKernel and ConvKernel (from
-  `build/`: `make driver_vectorop_rtl driver_matmul_rtl
-  driver_conv_rtl`).
+* Driver sources for VectorOPKernel, MatmulKernel, ConvKernel and
+  RowOpsKernel (from `build/`: `make driver_vectorop_rtl driver_matmul_rtl
+  driver_conv_rtl driver_rowops_rtl`).
 * ~6 GB RAM per reference worker (`reference.workers`, default 2) and
   ~3 GB for the project generation.
 * Internet access on the first run: the scripts download ~440 MB of
@@ -84,7 +85,7 @@ demo/bert_squad/
 ### KV260 board
 
 * The all-kernels bitstream, loaded with `fabric_vecop` / `fabric_matmul` /
-  `fabric_conv` UIO devices.  With the scheduler's default
+  `fabric_conv` / `fabric_rowops` UIO devices.  With the scheduler's default
   `--matmul-on-conv auto` (what `generate_project.py` uses) 96 of the 98
   MatMuls run on ConvKernel; the K = 2 token-type MatMul and the M = 2 span
   head stay on MatmulKernel.  With
@@ -93,7 +94,7 @@ demo/bert_squad/
   needs `kernels.matmul.max_k` ≥ 3072 (the FFN down-projection has
   K = 3072; `platforms/kv260.json` has 4096).
 * `gcc`, `cmake ≥ 3.19`, `make`, XRT, root or passwordless `sudo`.
-* ~220 MiB of free CMA (the pool BO is 215 MiB) and 210 MB of disk for the
+* ~220 MiB of free CMA (the pool BO is 216 MiB) and 210 MB of disk for the
   persistent weights directory.
 
 ### Assets
@@ -176,7 +177,7 @@ Without `--plan` / `--plan-report` / `--perf-model` it uses the config's
 ## Sample run
 
 **Phase 1** (2026-09-26: every MatMul on MatmulKernel, host ops unoptimised
-— the current schedule is 13.2× faster, see *Results* below).  Host
+— the current schedule is 45.6× faster, see *Results* below).  Host
 `demo/bert_squad`, board at `192.168.100.8` (KV260, Ubuntu 22.04,
 MatmulKernel `max_k` 4096 bitstream, 100 MHz), first 50 single-window
 questions prepared.  The first run uploaded the weights (76 files, 217 MB,
@@ -368,10 +369,10 @@ are `run_rowops()` calls, the host emulation of `reference.py` follows with the
 `sched+vsmx+iln` policy): p50 288.4 ms, bit-exact (3 / 3 against the
 simulation), EM / F1 88.0 / 90.3.
 **Latest**, 48 of its 49 Transposes on the row-ops unit as well (RPU_PLAN
-track A1, 2026-10-13; measured 2026-10-15 on the production bitstream
-de968ccc45da with the same `sched+vsmx+iln` policy): p50 **266.3 ms**,
-bit-exact (3 / 3 against the simulation, 50 / 50 against the emulation),
-EM / F1 88.0 / 90.3.
+track A1, 2026-10-13; measured 2026-10-15 on bitstream de968ccc45da,
+production until 2026-10-16, with the same `sched+vsmx+iln`
+policy): p50 **266.3 ms**, bit-exact (3 / 3 against the simulation, 50 / 50
+against the emulation), EM / F1 88.0 / 90.3.
 
 ## Options (`deploy_and_run.py`)
 

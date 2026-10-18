@@ -14,10 +14,11 @@
   - Binary VectorOP calls are 24–38 % faster; no other kernel moves.
   - End to end: BERT 427 → 418 ms (−2.1 %), ResNet-18 −1.6 %, SmolVLM image
     −1.1…−1.6 %, Piper −1.3…−1.9 %; the LLM chat models are flat.
-- **Promoted (2026-10-08): `8599aa7a5f12` is the production bitstream** (§5.5).
-  - It has its own performance model (1862 calls) and perf-regression
+- **Promoted (2026-10-08): `8599aa7a5f12` was the production bitstream**
+  until 2026-10-10 / 11 (§5.5).
+  - It has its own performance model (1867 calls) and perf-regression
     baseline.
-  - The chat server runs on it.
+  - The chat server ran on it (until `f70ce632a97a`).
   - `CALL_OVERHEAD` follows the new call floor (434 → 431 cycles, with
     `ONE` / `one` +3): no engine choice moves.
 - **Experiment 3 (2026-10-09), the outputs on `S_AXI_HP0_FPD` on top of
@@ -27,7 +28,9 @@
   418 → 421 ms (+0.8 %), ResNet-18 +0.7 %.  The user chose to try HP2
   instead.
 - **The one that paid (2026-10-10, `DEPTHWISE_PLAN.md` §8.5): ConvKernel's
-  x read port on `S_AXI_HP2_FPD`, bitstream `f70ce632a97a`, production.**
+  x read port on `S_AXI_HP2_FPD`, bitstream `f70ce632a97a`, production
+  2026-10-10 / 11 to 2026-10-12; every later bitstream keeps the x port on
+  HP2 (production since 2026-10-17: `04259a7af917`).**
   Short bursts are what the CCI throttles (§8): the depthwise and
   few-channel 1 × 1 convs −27…−67 %, LightStereo-S 599 → 469 ms, MobileNet
   v2 −14 %, BERT 418 → 364 ms, bit-exact — the outputs' move (§6–§7) lost

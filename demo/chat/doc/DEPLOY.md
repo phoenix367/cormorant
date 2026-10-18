@@ -22,9 +22,9 @@ its config, its model and its generated project.  You need:
   `deploy.py` takes everything board-specific from it: ssh address and key,
   UIO device names, the driver directories, the weights directory and
   the board lock.
-- **The driver sources** of VectorOPKernel, MatmulKernel and ConvKernel
-  (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl`
-  in `build/`).
+- **The driver sources** of VectorOPKernel, MatmulKernel, ConvKernel and
+  RowOpsKernel (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl
+  driver_rowops_rtl` in `build/`).
 - **The BERT model and `vocab.txt`.**  These are downloaded when missing:
   - `deploy.py` fetches `vocab.txt` before it touches the board;
   - generating the BERT project fetches the model (435 MB);
@@ -116,7 +116,7 @@ of `chat_config.json` — `<dir>` below, by default `/root/kv260_chat/`:
 first one is the default model.
 
 ```json
-"backends": ["smollm2-360m", "smollm2", "bert-squad", "smolvlm", "piper", "moonshine"]
+"backends": ["smollm2-360m", "piper", "moonshine", "smollm2", "bert-squad", "smolvlm"]
 ```
 
 (This is the board's setup: all six models, SmolLM2-360M the default.)
@@ -146,7 +146,8 @@ first one is the default model.
   `weights_dir`, `model_id`, `tokenizer`, `cma_mb`) and `server.resident`.
   The `smollm2` block's sampling defaults apply to every generative model.
 - **A library that fails to load.**  The server still starts with the other
-  backends.  Requests for the missing model get 503 `model_not_loaded`.
+  backends (not when it is the first FPGA model or `--resident all`: then
+  the server stops).  Requests for the missing model get 503 `model_not_loaded`.
 
 ## The FPGA and the board lock
 
@@ -198,7 +199,7 @@ libraries drive the kernels from the A53.
 ## Several models on one FPGA
 
 The board has 1400 MiB of CMA (`cma=1400M`; Ubuntu's image sets 1000M —
-set it with `src.remote.cma_boot`, [the repo README](../../README.md#5-prepare-the-board-and-load-the-bitstream)),
+set it with `src.remote.cma_boot`, [the repo README](../../../README.md#5-prepare-the-board-and-load-the-bitstream)),
 and idle CmaFree is about 1390 MB after the deploy's clean-up, so the
 models' pools do not all fit at once.  Each model declares the CMA it needs
 while loaded (`cma_mb`: its pool plus buffers and a margin); the server uses
@@ -213,7 +214,7 @@ in.  With `cma=1000M` SmolLM2-360M stayed only beside Piper.
 | SmolLM2-135M | 299 MiB | 330 |
 | SmolLM2-360M | 758 MiB | 775 |
 | SmolVLM-256M | 495 MiB | 550 |
-| Piper | 53 MiB | 55 |
+| Piper | 54 MiB | 55 |
 | Moonshine base | 185.5 MiB | 200 |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of

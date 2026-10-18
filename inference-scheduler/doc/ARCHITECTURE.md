@@ -14,7 +14,7 @@ does not repeat every rule.
   [`USER_GUIDE.md`](USER_GUIDE.md); the board tools in
   [`REMOTE_TESTING.md`](REMOTE_TESTING.md).
 
-Last revised 2026-10-13.
+Last revised 2026-10-18.
 
 ---
 
@@ -87,7 +87,7 @@ output bit for bit.  Five ideas shape the code.
 ```mermaid
 flowchart TD
     ONNX["ONNX model<br/>simplify_onnx.py prepares it"]
-    FE["Frontends<br/>llama.py · vit.py · piper.py · stereo.py"]
+    FE["Frontends<br/>llama.py · vit.py · piper.py · stereo.py · moonshine.py"]
 
     subgraph OG["OnnxGraph · src/graph.py"]
         direction TB
@@ -132,8 +132,8 @@ The generated project holds `include/inference.h` (API, sizes,
 `run_*()` helpers, host-op C, init, run), `src/inference_buf.c` (DMA
 buffers), `test/test_inference.c` (ramp inputs, run, compare with the
 simulation), `CMakeLists.txt`, `scripts/`, `driver/`, `weights/*.dat`,
-`expected/*.dat`, the runtime files (profiler, DDR counters, R5 recorder,
-`rpu/rpu_host.c`), `report.md` and, with `--plan` / `--plan-report`,
+`expected/*.dat`, the runtime files (profiler, DDR counters, interrupt waits,
+R5 recorder, `rpu/rpu_host.c`), `report.md` and, with `--plan` / `--plan-report`,
 `timeline.html`.
 
 Two drivers run this pipeline:
@@ -171,7 +171,8 @@ run_remote_tests.py, run_remote_perf.py, upload_bitstream.py, rpu_board.py
                          loads the Cortex-R5 firmware and gates projects on it
 runtime/                 files copied verbatim into every project
                          (src/codegen/runtime_files.py): the profiler, its DDR
-                         counters, the Cortex-R5 recorder inference_rpu.[ch]
+                         counters, the interrupt waits inference_irq.[ch], the
+                         Cortex-R5 recorder inference_rpu.[ch]
 runtime/rpu/             the Cortex-R5 firmware (rpu_main.c, rpu_irq.c, the protocol
                          rpu_ctrl.h, lscript.ld, CMake) and the gate rpu_host.c
 bench_src/               kernel benchmarks and calib_runner.c (run_remote_perf.py,
@@ -206,6 +207,8 @@ src/
     tts_nodes.py         axi.llm text-to-speech ops (TtsNode, TtsAddVopNode)
     stereo_nodes.py      axi.llm stereo-depth ops (StereoNode, StereoVopNode,
                          StereoSoftmaxNode)
+    asr_nodes.py         axi.llm speech-to-text ops (AsrNode; the row-ops nodes
+                         AsrCrossPrepRoNode, AsrCrossQRoNode, AsrSwiGLURoNode)
   platform capabilities
     kernels.py           KERNEL_REGISTRY: one KernelDesc per kernel
     _vectorop_hw_config.py, _matmul_hw_config.py, _conv_hw_config.py,
@@ -217,6 +220,7 @@ src/
     vit.py               SmolVLM's vision encoder → the vision graph
     piper.py             Piper (VITS) text to speech → chunk and encode_<T> graphs
     stereo.py            LightStereo-S stereo depth → one graph
+    moonshine.py         Moonshine speech to text → encode_<T> and decode graphs
   schedule and code generation
     schedule.py          Dag: data-flow DAG with persistent-state edges
     layout.py            TensorLayout: a DMA buffer's geometry
@@ -236,7 +240,8 @@ src/
     timeline_html.py     timeline.html
   board tooling
     bitstream/           upload_bitstream.py implementation
-    remote/              SSH session, config, checks, the per-board lock, cma.py
+    remote/              SSH session, config, checks, the per-board lock, cma.py,
+                         cma_boot.py
 
 test/
   host_emu.py            builds a generated project on the PC against software kernels
@@ -257,7 +262,7 @@ the preceding Convs; `doc/MODEL_PREPARATION.md` covers the workflow.
 
 ### 4.2 Frontends
 
-Four frontends build graphs from checkpoints instead of exported ONNX.
+Five frontends build graphs from checkpoints instead of exported ONNX.
 Each writes an ordinary `onnx.ModelProto` with `onnx.helper`: standard
 `MatMul` / `Conv` nodes for the heavy layers, ops of the custom domain
 `axi.llm` for everything else, and the numeric formats in the `axi.numeric`
@@ -271,6 +276,7 @@ RMSNorm / RoPE / SwiGLU / KV-cache structure back out of the export.
 | `VitFrontend` (`src/vit.py`) | SmolVLM's vision / connector weights, formats | `vision` | `Vit*` (`vit_nodes.py`) | the same script for SmolVLM (through `demo/chat/scripts/vlm_project.py`) |
 | `PiperChunkFrontend`, `PiperEncoderFrontend` (`src/piper.py`) | the Piper ONNX export's weights, exponents | `chunk`, `encode_<T>` | `Tts*` (`tts_nodes.py`) | `demo/tts/scripts/generate_tts_project.py` |
 | `LightStereoFrontend` (`src/stereo.py`) | a PyTorch checkpoint (read without torch), calibrated formats | one graph | `Stereo*` (`stereo_nodes.py`) | `demo/stereo_depth/scripts/generate_project.py` |
+| `MoonshineFrontend` (`src/moonshine.py`) | `config.json`, safetensors, calibrated formats | `encode_<T>`, `decode` | `Asr*` (`asr_nodes.py`) | `demo/asr/scripts/generate_asr_project.py` |
 
 Frontend options choose engines by changing what the graph says, not by
 calling into the scheduler.  `vsmx` sets the attribute `vsmx = 1` on the
@@ -280,7 +286,8 @@ the row-ops unit can take; `decode_attn` / `prefill_attn` move the
 attention between the host and ConvKernel.  The node factories (§5.4) read
 those attributes and annotations.  The semantics of every `axi.llm` op are
 in the technical reference: §Llama-family decoders, §Vision encoders,
-§Text to speech (Piper), §Stereo depth (LightStereo).
+§Text to speech (Piper), §Stereo depth (LightStereo), §Speech to text
+(Moonshine).
 
 `src/llm_entries.py` schedules a Llama project's entries together so that
 the project keeps one copy of every weight.  The largest prefill bucket
@@ -422,7 +429,7 @@ and makes one node per ONNX node.  The first matching branch wins:
 
 | # | Match | Factory | Result |
 |---|---|---|---|
-| 1 | domain `axi.llm` | `LLM_OP_FACTORIES`, `VIT_OP_FACTORIES`, `TTS_OP_FACTORIES`, `STEREO_OP_FACTORIES`, then `rowops_nodes.LLM_OVERRIDES` / `VIT_OVERRIDES` / `TTS_OVERRIDES` merged over them | a host node, or a kernel node (`LlmKernelNode`) |
+| 1 | domain `axi.llm` | `LLM_OP_FACTORIES`, `VIT_OP_FACTORIES`, `TTS_OP_FACTORIES`, `STEREO_OP_FACTORIES`, `ASR_OP_FACTORIES`, then `rowops_nodes.LLM_OVERRIDES` / `VIT_OVERRIDES` / `TTS_OVERRIDES` merged over them | a host node, or a kernel node (`LlmKernelNode`) |
 | 2 | `Gelu`, `LeakyRelu`, `Silu` | `vectorop_act.from_onnx` | a VectorOP `ScheduledNode`, or the host `GeluNode` |
 | 3 | `Softmax` | `smx_nodes.from_onnx_softmax` | `SoftmaxVopNode` (softmax unit), or the host `SoftmaxNode` |
 | 4 | `LayerNormalization` | `rowops_nodes.from_onnx_layernorm` | `LayerNormRoNode` (row-ops unit), or the host `LayerNormNode` |
@@ -525,7 +532,7 @@ Each pass records what it did for `report.md`: `gemm_decomposed_count`,
 |---|---|---|---|
 | `VectorOPKernel` | `KERNEL_VECTOROP` | `run_op`, `run_op_act`, `run_softmax` | `ScheduledNode`; `SmxVopNode` family, `VitGeluVopNode`, `TtsAddVopNode`, `StereoVopNode` |
 | `MatmulKernel` | `KERNEL_MATMUL` | `run_matmul`, `run_matmul_at` | `MatmulNode` |
-| `ConvKernel` | `KERNEL_CONV` | `run_conv`, `run_conv_at`, `run_conv_dw_at` | `ConvNode`, `MatmulConvNode`, `LlmAttnConvNode` |
+| `ConvKernel` | `KERNEL_CONV` | `run_conv`, `run_conv_at`, `run_conv_at_y`, `run_conv_dw_at` | `ConvNode`, `MatmulConvNode`, `LlmAttnConvNode` |
 | `PoolKernel` | `KERNEL_POOL` | `run_pool` | `PoolNode` |
 | `RowOpsKernel` | `KERNEL_ROWOPS` | `run_rowops` | `RowOpsNode` family |
 
@@ -538,9 +545,9 @@ default.
 |---|---|---|
 | `_vectorop_hw_config.py` | `kernels.vectorop`: `activations`, `softmax` | `AXI_VECTOROP_ACTIVATIONS`, `AXI_VECTOROP_SOFTMAX` |
 | `_matmul_hw_config.py` | `kernels.matmul`: bounds, `impl`, `gemv_max_m` | `AXI_MATMUL_IMPL` |
-| `_conv_hw_config.py` | `kernels.conv`: bounds, `impl` | `AXI_CONV_IMPL` |
+| `_conv_hw_config.py` | `kernels.conv`: bounds, `impl`, `y_pattern` | `AXI_CONV_IMPL`, `AXI_CONV_YPATTERN` |
 | `_pool_hw_config.py` | `kernels.pool`: bounds | — |
-| `_rowops_hw_config.py` | `kernels.rowops`: `unit` | `AXI_ROWOPS` |
+| `_rowops_hw_config.py` | `kernels.rowops`: `unit`, `fold`, `chains`, `gate`, `scale` | `AXI_ROWOPS`, `AXI_ROWOPS_FOLD`, `AXI_ROWOPS_CHAINS`, `AXI_ROWOPS_GATE`, `AXI_ROWOPS_SCALE` |
 
 Field reference: `doc/build-and-test/PLATFORM_CONFIGURATION.md`.
 
@@ -570,6 +577,7 @@ classDiagram
     LlmNode <|-- VitNode
     LlmNode <|-- TtsNode
     LlmNode <|-- StereoNode
+    LlmNode <|-- AsrNode
     LlmKernelNode <|-- LlmAttnConvNode
     LlmKernelNode <|-- SmxVopNode
     SmxVopNode <|-- StereoSoftmaxNode
@@ -587,7 +595,7 @@ classDiagram
 ```
 
 - `HostNode` (`host_nodes.py`) → `LlmNode` (`llm_nodes.py`) → `VitNode`,
-  `TtsNode`, `StereoNode`: CPU code.
+  `TtsNode`, `StereoNode`, `AsrNode`: CPU code.
 - `LlmKernelNode` (`llm_nodes.py`) → `LlmAttnConvNode`, `SmxVopNode` (→
   `StereoSoftmaxNode`), `RowOpsNode`, `VitGeluVopNode`, `TtsAddVopNode`,
   `StereoVopNode`: kernel calls on tensors that may carry exponents.  The
@@ -701,7 +709,12 @@ MatmulNode.  Technical reference: §MatMul on ConvKernel.
 (`kind "qk"`) or P·V (`kind "pv"`), per KV group.  In a Llama prefill or
 FPGA decode the key count is a run-time dimension, computed from the
 entry's `pos` / `n` inputs and programmed into the registers; the vision
-encoder and Piper's text encoder use a static key count.
+encoder and Piper's text encoder use a static key count.  Where the P·V
+calls can write the merged tensor themselves (a decode step's contiguous
+pieces, or with ConvKernel's y channel pattern, `kernels.conv.y_pattern`,
+through `run_conv_at_y()`), the `LlmAttnMerge` that follows becomes an
+in-place alias that emits nothing (`_CoreMixin._merge_in_place`, RPU_PLAN
+§13; `AXI_INPLACE_MERGE=0` keeps the host copy).
 
 ConvKernel writes a flat NCHW output, so a broadcast consumer that would
 give a Conv / Pool / MatmulConv output a gapped layout is a `SchedulerError`
@@ -720,12 +733,13 @@ PoolingKernel (§17).
 
 The row-ops unit runs a transformer's row operations in fixed point:
 residual adds, LayerNorm / RMSNorm, SiLU · up, dequantisation, RoPE,
-transposes and copies (HOSTOPS_PLAN, RPU_PLAN track A1;
-`doc/kernels/ROWOPS_RTL_KERNEL.md`).  Three modules carry it in the
+transposes and copies, and Piper's FOLD and GATE (HOSTOPS_PLAN, RPU_PLAN
+tracks A1 and A3; `doc/kernels/ROWOPS_RTL_KERNEL.md`).  Three modules carry it in the
 scheduler:
 
 - **`rowops_spec.py` — the specification.**  Plain integer arithmetic for
-  each op (COPY, ADDX, DEQUANT, MULACT, NORM, ROPE, TRANSPOSE, TLOAD), the
+  each op (COPY, ADDX, DEQUANT, MULACT, NORM, ROPE, TRANSPOSE, TLOAD, FOLD,
+  GATE, and the SCALE flag of COPY / ADDX), the
   element kinds (int16 / int32 / float32), the rsqrt and sigmoid tables, the
   16-byte per-column parameter block and the 64 KiB table image.  The
   simulator calls it.  The RTL testbench's C++ oracle
@@ -736,14 +750,17 @@ scheduler:
   `ResAddRoNode` / `ResAddBiasRoNode`, `RMSNormRoNode`, `SiluMulRoNode`,
   `LayerNorm32RoNode`, `AttnPrepRoNode`, `VitAttnPrepRoNode`,
   `TtsRowPrepRoNode`, `TtsSumRoNode`, `TtsInterleaveRoNode`,
-  `TtsRelBandRoNode`, `DequantRoNode`, `SelectRowRoNode`,
-  `PixelShuffleRoNode`, `EmbedAddRoNode`.  Each computes its result with the
+  `TtsRelBandRoNode`, `GateRoNode`, `FoldRoNode`, `DequantRoNode`,
+  `SelectRowRoNode`, `PixelShuffleRoNode`, `EmbedAddRoNode` (and Moonshine's
+  `AsrCrossPrepRoNode`, `AsrCrossQRoNode`, `AsrSwiGLURoNode` in
+  `asr_nodes.py`).  Each computes its result with the
   specification (`reference`), emits `run_rowops()` calls
   (`RowOpsNode.call`) and lists them (`kernel_calls`).  Row strides of a
   gapped input are read from its layout at emit time
   (`row_stride_bytes`).
 - **`_rowops_hw_config.py` — the capability** (`kernels.rowops.unit`,
-  `AXI_ROWOPS`).
+  `AXI_ROWOPS`; the later features `fold`, `chains`, `gate` and `scale`
+  likewise).
 
 **Selection.**  ONNX `LayerNormalization` and `Transpose` reach the unit
 through their dispatch branches (§5.4, rows 4–5).  The `axi.llm` ops reach
@@ -764,6 +781,13 @@ the float values whose Q8.8 encoding is those words, so every weight path
 contents.  `inference_init()` issues one TLOAD job from the
 `rowops_tables` weight and waits for it before any other job.
 
+**Descriptor chains.**  Where the unit runs them (`kernels.rowops.chains`,
+RPU_PLAN §13.3), a node of two or more jobs (`RowOpsNode.chain_jobs`) is
+emitted between `ro_chain_begin()` and `ro_chain_end()`: `run_rowops()`
+writes its jobs as descriptors into the node's area at the end of the pool
+(`_CoreMixin._ro_chains`, 128 bytes a descriptor) and starts them as chains
+of at most 16.
+
 The `rowops-offload` skill (`.claude/skills/rowops-offload/SKILL.md`)
 walks through moving one more host op onto the unit.
 
@@ -777,7 +801,7 @@ round-half-even and saturating write-back).
 - `HostNode` (`host_nodes.py`): `Softmax`, `LayerNormalization`, `Gelu`,
   `Transpose`, `Slice`, `Concat`, `Resize`, `Gather`, `OneHot`, `Cast` —
   wherever no kernel takes them.
-- `LlmNode` and its `Vit` / `Tts` / `Stereo` subclasses: the `axi.llm` ops.
+- `LlmNode` and its `Vit` / `Tts` / `Stereo` / `Asr` subclasses: the `axi.llm` ops.
   Their inputs may be host tensors and states; they declare the states
   they write (`state_writes()` / `state_updates()`) and the tables they
   need (`c_runtime()`).
@@ -805,6 +829,8 @@ bit-identical for any count).  Tables over `TABLE_FILE_BYTES` go to
   `inference_init()` (`inference_buf_init_view()`).  `_CoreMixin` demotes a
   view back to a host copy if a broadcast consumer gives the piece or its
   root a strided layout (`_demote_strided_views`).
+- An in-place `LlmAttnMerge` (`LlmAttnMergeNode.in_place`, §6.5): its inputs
+  are pieces of its output, which the P·V calls wrote.
 
 ---
 
@@ -982,7 +1008,8 @@ flowchart LR
    when their live intervals in the event stream are disjoint (§9.3).
    Alias outputs own no memory.
 
-Slots are 64-byte aligned.  With bank phases on (the default;
+Slots are 64-byte aligned; a slot of 64 KiB or more starts on a 4 KiB page
+of the pool (`bank_phase.page_start`, RPU_PLAN §13.12).  With bank phases on (the default;
 `CodeGenerator(bank_phase=...)`, CLI `--bank-phase`), `bank_phase.place_slots`
 pads the slots of a VectorOP call's streams so that a, b and c start in
 different DRAM banks (`bank_phase.vectorop_groups`).  Only addresses move;
@@ -990,7 +1017,8 @@ results are identical.  Technical reference: §DRAM bank phases.
 
 `_compute_pool_bytes()` is the advisory `INFERENCE_BUF_POOL_SIZE_BYTES`:
 the larger of the sum over all tensors without slot reuse and the laid-out
-pool, rounded up to 4 KiB (`scripts/check_inference_setup.sh` prints it).
+pool, plus the row-ops descriptor area, rounded up to 4 KiB
+(`scripts/check_inference_setup.sh` prints it).
 See also [`BUFFER_REUSE.md`](BUFFER_REUSE.md) and
 [`SCHEDULER_DAG.md`](SCHEDULER_DAG.md) §5–§6.
 
@@ -1180,7 +1208,8 @@ kernel's AXI masters read and write DDR directly.
 `inference_init()` initialises the DMA pool and sets every buffer's view
 into it, loads the weights (ROM arrays or `weights/*.dat`) and flushes them
 once, initialises each active driver, probes the VectorOP units the program
-uses, loads the row-ops tables, and calls `inference_rpu_select()` (Linux).
+uses, opens each kernel's UIO interrupt (`inference_irq_open()`, Linux),
+loads the row-ops tables, and calls `inference_rpu_select()` (Linux).
 LLM and multi-entry projects set the views up with a table-driven loop
 instead of thousands of straight-line statements (`_use_compact_init`;
 GCC's register allocator runs out of memory otherwise), and split a long
@@ -1215,7 +1244,8 @@ run body into `noinline` parts (`_split_run_body`).
   `INFERENCE_HOST_THREADS`.
 - `runtime_files.RUNTIME_FILES` — copied verbatim by both project writers
   (the CLI and `multi.write_project`): the profiler `inference_prof.[ch]`,
-  the DDR counters `inference_ddr.[ch]` with their backend, the R5 recorder
+  the DDR counters `inference_ddr.[ch]` with their backend, the interrupt
+  waits `inference_irq.[ch]`, the R5 recorder
   `inference_rpu.[ch]`, `rpu_ctrl.h` and `rpu/rpu_host.c`.  One list, so a
   file the CMakeLists names cannot be missing from either writer.
 - `driver/` — the drivers copied from `--driver-dir`, or a README naming
@@ -1241,7 +1271,7 @@ packed images, zero-filled gaps.
 A multi-entry project is one library with one `inference_run_<name>()` per
 graph over one weight pool: a Llama model's `decode`, `prefill_<T>` and
 `head`; SmolVLM's text entries plus `vision`; Piper's `chunk` and
-`encode_<T>` buckets.  `MultiEntryGenerator` (`src/codegen/multi.py`) builds
+`encode_<T>` buckets; Moonshine's `encode_<T>` buckets and `decode`.  `MultiEntryGenerator` (`src/codegen/multi.py`) builds
 it from `[(name, OnnxGraph)]` (CLI `--entry NAME=MODEL.onnx`, or the
 frontends' generators).
 
@@ -1634,7 +1664,7 @@ Each architectural invariant above has a test that fails when it breaks.
 | Registry and R5 register counts | `test_kernels_registry.py`, `test_kernels.py` (`rpu_reg_words` against each `gen_driver.py`) |
 | Unit specifications and their nodes | `test_rowops_spec.py`, `test_rowops_unit.py`, `test_softmax_unit.py`, `test_activations.py`, `test_act_fusion.py` |
 | Rewrites and tactics keep the bits | `test_matmul_on_conv.py`, `test_matmul_gemv.py`, `test_fc_conv.py`, `test_dw_slice.py`, `test_bank_phase.py` |
-| Frontends against their specifications | `test_llama.py`, `test_vit.py`, `test_piper.py`, `test_stereo.py`, `test_generate_llm_project.py` |
+| Frontends against their specifications | `test_llama.py`, `test_vit.py`, `test_piper.py`, `test_stereo.py`, `test_moonshine.py`, `test_generate_llm_project.py` |
 | Planning and prediction | `test_planning.py`, `test_timing.py`, `test_rpu_policy.py`, `test_timeline_html.py` |
 | Memory of large-model generation | `test_generator_memory.py` |
 
@@ -1669,7 +1699,8 @@ ops in general.
 
 Follow the `add-host-op` skill (`.claude/skills/add-host-op/SKILL.md`): a
 `HostNode` (ONNX op, `host_nodes.py`) or `LlmNode` (`axi.llm` op,
-`llm_nodes.py` / `vit_nodes.py` / `tts_nodes.py` / `stereo_nodes.py`) with
+`llm_nodes.py` / `vit_nodes.py` / `tts_nodes.py` / `stereo_nodes.py` /
+`asr_nodes.py`) with
 its numpy `reference()` and its C helper side by side, its factory in the
 module's table, the host-op timing model, tests (including `host_emu`)
 and docs.

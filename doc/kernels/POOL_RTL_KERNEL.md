@@ -115,7 +115,7 @@ job reset registered per unit; the AXI ports registered both ways.  In the
 full 250 MHz design (four kernels, WNS +0.074 ns) the last cluster below
 0.1 ns was the line-buffer read (per-channel address registers → banks →
 `rv`, 93 % route): the read address now takes two stages (the 8 bank
-addresses, then a copy per bank) and `rv` loads without an enable.  The HLS kernel in the production bitstream (b3309f424562,
+addresses, then a copy per bank) and `rv` loads without an enable.  The HLS kernel in the then-production bitstream (b3309f424562, 2026-10-05,
 routed): 17 208 LUT (3 520 LUTRAM), 14 936 FF, 3 RAMB36 + 1 RAMB18, 94 DSP.
 
 ## 3. Performance
@@ -183,7 +183,7 @@ read address (its `ucol` is 0), so the second position read word 0 of the
 bank instead of its own.  PoolingKernel.cpp now lets only an in-bounds
 position claim a bank (the fix changes no other output), TestPoolModel has
 two cases for it (the old code fails both against the float reference), and
-they are fixtures 43–44.  The HLS IP in the production bitstream fails both
+they are fixtures 43–44.  The HLS IP in the then-production bitstream (`b3309f424562`) fails both
 on the test stand (8 / 40 and 9 / 72 outputs); no model of the test set or
 the demos has such a pool (the largest pool stride of the 218 models is 4).  The RTL never had the collision: a position's
 bank is its real column's, and two positions of a group never share one.

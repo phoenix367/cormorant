@@ -2,8 +2,8 @@
 
 The inference scheduler is a Python tool that reads an ONNX neural network model
 and emits a complete, self-contained C project that runs inference on the
-**Xilinx KV260 FPGA** using up to four PL kernels — **VectorOPKernel**,
-**MatmulKernel**, **ConvKernel** and **PoolingKernel** — plus host-CPU code for
+**Xilinx KV260 FPGA** using up to five PL kernels — **VectorOPKernel**,
+**MatmulKernel**, **ConvKernel**, **PoolingKernel** and **RowOpsKernel** — plus host-CPU code for
 the ops no kernel implements. The generated code handles weight loading, DMA
 buffer management, cache coherency, and the full per-layer execution loop — all
 without any Python or ONNX runtime on the target.
@@ -97,14 +97,15 @@ void inference_run(inference_buf_t *X, inference_buf_t *Y) {
 The FPGA kernel reads `X` and `bias` from DDR, computes element-wise addition,
 and writes the result to `Y` — all via AXI DMA master ports. The CPU only needs
 to program the AXI-Lite control registers, start the kernel and wait for it
-(`kernel_wait()` polls by default; kernels on different lanes run
-concurrently).
+(`kernel_wait()` sleeps on the kernel's interrupt on Linux —
+`INFERENCE_WAIT=poll` polls — and polls on bare metal; kernels on different
+lanes run concurrently).
 
 ---
 
 ## 2. Supported ONNX Operators
 
-The scheduler maps ONNX operators to one of four hardware kernels, handles
+The scheduler maps ONNX operators to one of five hardware kernels, handles
 them as zero-cost CPU-side transformations, or runs them as host-CPU code
 inside `inference_run()`.  Full semantics and restrictions:
 [technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md).
@@ -124,7 +125,7 @@ inside `inference_run()`.  Full semantics and restrictions:
 | `Gelu` (`approximate` none / tanh, or a fused GELU pattern) | `VECTOROP_GELU` (8), `VECTOROP_GELU_TANH` (9) | unary | `c[i] = a[i] · Φ(a[i])` — or the host op when its constants give another Q8.8 function |
 | `Softmax` (last axis, rows ≤ 2048, 16-byte aligned rows) | `VECTOROP_SOFTMAX` (10) | unary | the softmax unit's integer softmax of each row (within 1 LSB of the exact one; `src/vectorop_smx.py`) — only where the platform has the unit, else the host op |
 
-The last three run in VectorOPKernel's activation unit
+The LeakyRelu, SiLU and Gelu rows run in VectorOPKernel's activation unit
 ([ACTIVATIONS_PLAN](../../doc/plans/ACTIVATIONS_PLAN.md)): the exact function
 of the Q8.8 value rounded to nearest, ties to even — bit-identical to the host
 GELU.  They need a bitstream with the unit: the platform JSON's
@@ -146,11 +147,13 @@ prefill and the vision encoder when their frontends are built with `vsmx=True`
 
 **The row-ops unit (RowOpsKernel)** — where the platform JSON's
 `kernels.rowops.unit` (or `AXI_ROWOPS=1`) says the bitstream has it
-([HOSTOPS_PLAN](../../doc/plans/HOSTOPS_PLAN.md); not in the KV260's hardware
-build yet), a `LayerNormalization` of 16-byte-aligned rows of at most 4 096
+([HOSTOPS_PLAN](../../doc/plans/HOSTOPS_PLAN.md); true for the KV260 since
+bitstream `1cedaf2ed816`), a `LayerNormalization` of 16-byte-aligned rows of at most 4 096
 elements runs on it (`run_rowops()`, the integer specification of
 `src/rowops_spec.py`: within one LSB of the exact function, not bit-identical
-to the host op), and the chat / TTS generators' `--rowops` moves the Llama
+to the host op), a `Transpose` of a 16-bit DMA tensor whose permutation the
+unit's COPY / TRANSPOSE jobs can do runs there as a bit-identical copy
+(`src/rowops_nodes.py`), and the chat / TTS generators' `--rowops` moves the Llama
 decoder's residual adds, RMSNorms and SiLU·up, the vision encoder's residual
 adds and LayerNorms and the Piper encoder's residual LayerNorms there, with
 the residual stream as an int32 DMA tensor.  The program loads the unit's
@@ -158,7 +161,7 @@ tables once in `inference_init()`.
 
 **Broadcasting**: Binary ops support partial ONNX multidirectional broadcasting.
 One input may be smaller than the output — see
-[Architecture: Broadcasting Algorithm](ARCHITECTURE.md#6-broadcasting-algorithm).
+[Architecture: Broadcasting on VectorOPKernel](ARCHITECTURE.md#7-broadcasting-on-vectoropkernel).
 
 **Activation fusion**: a `Relu` / `Clip(0,6)` — or a `LeakyRelu`, SiLU or
 `Gelu` on the activation unit — whose input is produced by a VectorOP node
@@ -216,10 +219,11 @@ All pool variants support configurable stride, padding, and dilation.
 
 Run on the A53 inside `inference_run()` (double arithmetic, round-half-even
 write-back, multi-threaded): `Softmax` (last axis; on VectorOPKernel where the platform has the softmax unit, above), `LayerNormalization`,
-`Gelu`, `Transpose`, `Slice` / `Split` copies, `Concat`, `Resize` (nearest,
+`Gelu`, `Transpose` (`LayerNormalization` and `Transpose` on the row-ops unit where the platform has it, above), `Slice` / `Split` copies, `Concat`, `Resize` (nearest,
 integer upsampling), `Gather` (axis 0), `OneHot`,
 `Cast` (integer ↔ `Data_t`), `SpaceToDepth`, and the Llama decoder,
-vision-encoder (SmolVLM) and text-to-speech (Piper) ops of the custom domain `axi.llm`.
+vision-encoder (SmolVLM), text-to-speech (Piper), stereo-depth (LightStereo-S)
+and speech-to-text (Moonshine) ops of the custom domain `axi.llm`.
 TensorFlow-style LayerNorm and GELU (tanh / erf)
 subgraphs are fused into single host ops first (`--no-fuse-patterns`
 disables it); an unmatched `ReduceMean` / `Pow` / `Sqrt` / `Reciprocal` /
@@ -258,6 +262,8 @@ python3 -m venv .venv
 .venv/bin/python test/gen_parallel_models.py          # Parallel + NOP corner cases
 .venv/bin/python test/gen_bert_models.py              # Tiny BERT-like models (host ops)
 .venv/bin/python test/gen_llama_models.py             # Tiny random Llama (axi.llm ops)
+.venv/bin/python test/gen_activation_models.py        # Activation-unit models (LeakyRelu / SiLU / Gelu)
+.venv/bin/python test/gen_softmax_models.py           # Softmax-unit models
 # or all of them at once:
 .venv/bin/python test/gen_all_models.py
 ```
@@ -291,7 +297,7 @@ python inference_scheduler.py --entry NAME=MODEL.onnx [--entry ...] [options]
 | `--no-s2d-stem` | off | Do not rewrite stride-2 `Conv` layers with ≤ 4 input channels as host `SpaceToDepth(2)` + stride-1 `Conv` ([§Space-to-depth stem](../../doc/scheduler/INFERENCE_SCHEDULER.md#space-to-depth-stem)). |
 | `--fc-conv {auto,always,off}` | `auto` | Run fully-connected `Conv` layers (kernel = the whole unpadded input, one output pixel, e.g. LeNet's 7×7 conv on a 7×7 map) as Flatten + `MatMul` + Reshape + bias `Add` on MatmulKernel (GEMV for one image): `auto` where the cost model estimates it ≥ 20 % faster, `always`, `off` ([§Fully-connected Convs](../../doc/scheduler/INFERENCE_SCHEDULER.md#fully-connected-convs)). Bit-identical unless the sum before the bias saturates. |
 | `--dw-slice {auto,off}` | `auto` | Issue a batch-1 depthwise `Conv` as several ConvKernel calls of 16, 32 or 64 channels (`run_conv_dw_at()`): a call of fewer channels gets taller output-row chunks, so fewer halo rows are read again — `auto` where the cost model estimates it ≥ 5 % faster, `off` keeps one call ([§Depthwise channel slices](../../doc/scheduler/INFERENCE_SCHEDULER.md#depthwise-channel-slices)). Bit-identical.  LightStereo-S: 659 → 599 ms per pair on the board. |
-| `--bank-phase {on,off}` | `on` | Lay the DMA pool out so that a binary VectorOP's a, b and c start in different DRAM banks (byte address bits 14–15 on the KV260): the kernel's three streams then do not collide in one bank — ~20 % faster memory-bound VectorOP calls on the board ([§DRAM bank phases](../../doc/scheduler/INFERENCE_SCHEDULER.md#dram-bank-phases)); `off` packs the slots as before.  Bit-identical; the pool grows by at most 48 KB per constrained slot (ResNet-18 +4 KB). |
+| `--bank-phase {on,off}` | `on` | Lay the DMA pool out so that a binary VectorOP's a, b and c start in different DRAM banks (byte address bits 14–15 on the KV260): the kernel's three streams then do not collide in one bank — ~20 % faster memory-bound VectorOP calls on the board ([§DRAM bank phases](../../doc/scheduler/INFERENCE_SCHEDULER.md#dram-bank-phases)); `off` packs the slots as before.  Bit-identical; the pool grows by at most 48 KB per constrained slot (ResNet-18 +16 KB). |
 | `--no-fuse-patterns` | off | Do not fuse TensorFlow-style LayerNorm / GELU (tanh, erf) subgraphs into host-CPU ops and do not reshape constant VectorOP operands for the kernel's broadcast (`src/fusion.py`, [`doc/scheduler/INFERENCE_SCHEDULER.md` §Pattern fusion](../../doc/scheduler/INFERENCE_SCHEDULER.md#pattern-fusion)). Fusion only changes graphs that contain these patterns. |
 | `--matmul-on-conv {auto,always,off}` | `auto` | Run MatMuls on ConvKernel with swapped operand roles: `auto` where the cost model estimates it faster, `always` for every eligible MatMul, `off` for none ([§MatMul on ConvKernel](../../doc/scheduler/INFERENCE_SCHEDULER.md#matmul-on-convkernel)). Bit-identical either way. |
 | `--no-matmul-on-conv` | off | Same as `--matmul-on-conv off`. |
@@ -355,13 +361,14 @@ Generated project:
   /tmp/single_add_inference/src/ddr/
   /tmp/single_add_inference/test/test_inference.c
   /tmp/single_add_inference/scripts/check_inference_setup.sh
+  /tmp/single_add_inference/rpu/rpu_host.c
   /tmp/single_add_inference/driver/
   /tmp/single_add_inference/report.md
 ```
 
 When MatMuls are lowered onto ConvKernel the summary adds a
 `MatMul->Conv:` line (MatMuls moved, ConvKernel calls, estimated ms on both
-engines at 100 MHz); large weights / host tables / GT arrays add
+engines at the 250 MHz kernel clock); large weights / host tables / GT arrays add
 `Weights :`, `Host tables:` and `Expected :` lines.
 
 ---
@@ -380,10 +387,14 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │   ├── inference.h
 │   │     Public API: Data_t typedef, array-size macros, DMA buffer API,
 │   │     inference_init() / inference_run() / inference_deinit() declarations,
-│   │     UIO instance-name defaults, per-layer name table accessors.
+│   │     UIO instance-name defaults, kernel_id_t and the Cortex-R5 policy
+│   │     (INFERENCE_RPU_*), per-layer name table accessors.
 │   ├── inference_prof.h          Per-layer profiler (no-ops unless
 │   │                             -DINFERENCE_PROFILING=ON; doc/scheduler/PROFILER.md)
-│   └── inference_ddr.h           DDR-traffic counters used by the profiler
+│   ├── inference_ddr.h           DDR-traffic counters used by the profiler
+│   ├── inference_irq.h           kernel_wait() on the kernels' UIO interrupts (Linux)
+│   ├── inference_rpu.h           The Cortex-R5 recorder (Linux; doc/plans/RPU_PLAN.md §9)
+│   └── rpu_ctrl.h                Its protocol with the R5 firmware
 │
 ├── src/
 │   ├── inference.c
@@ -397,9 +408,11 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │   │     Two implementations selected by #ifdef __linux__:
 │   │       Linux:      XRT buffer objects (xclAllocBO / xclMapBO / xclSyncBO),
 │   │                   mapped cacheable by default
-│   │       Bare-metal: malloc() + Xil_DCacheFlushRange / Xil_DCacheInvalidateRange
+│   │       Bare-metal: the inference_buf_pool_set() region, else malloc(),
+│   │                   + Xil_DCacheFlushRange / Xil_DCacheInvalidateRange
 │   │
 │   ├── inference_prof.c, inference_ddr.c, inference_ddr_backend.h
+│   ├── inference_irq.c, inference_rpu.c   (LINUX target only)
 │   └── ddr/zuplus_apm.c          ZynqMP APM DDR-counter backend
 │
 ├── test/
@@ -414,6 +427,10 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │         Preflight checker for the Linux/XRT path. Verifies that xrt.h,
 │         libxrt_core.so, and /dev/dri/renderD* are accessible before a build.
 │
+├── rpu/
+│   └── rpu_host.c                The gate of the project on the Cortex-R5 (LINUX:
+│                                 make rpu_host; rpu_board.py): R5 vs A53, bit for bit
+│
 ├── driver/
 │   │   Hardware kernel driver sources for every active kernel, copied
 │   │   verbatim (flat layout, no per-kernel sub-directories) from the
@@ -423,7 +440,8 @@ engines at 100 MHz); large weights / host tables / GT arrays add
 │   ├── xvectoropkernel.h / .c / _hw.h / _sinit.c / _linux.c
 │   ├── xmatmulkernel.h   / .c / _hw.h / _sinit.c / _linux.c
 │   ├── xconvkernel.h     / .c / _hw.h / _sinit.c / _linux.c
-│   └── xpoolingkernel.h  / .c / _hw.h / _sinit.c / _linux.c
+│   ├── xpoolingkernel.h  / .c / _hw.h / _sinit.c / _linux.c
+│   └── xrowopskernel.h   / .c / _hw.h / _sinit.c / _linux.c
 │
 ├── weights/                      (only when model has large weight tensors
 │   │                              or large host tables)
@@ -468,7 +486,8 @@ typedef uint16_t Data_t;
 
 > **Pool sizing note:** `INFERENCE_BUF_POOL_SIZE_BYTES` is a conservative
 > upper bound — every weight, intermediate and graph I/O buffer 64-byte
-> aligned, **without** slot reuse, rounded up to 4 KiB.  The pool that
+> aligned, **without** slot reuse (or the laid-out pool, when bank-phase
+> padding makes it larger), rounded up to 4 KiB.  The pool that
 > `inference_init()` actually allocates is smaller: intermediate tensors with
 > non-overlapping execution lifetimes share a slot (event-stream liveness,
 > [SCHEDULER_DAG.md](SCHEDULER_DAG.md) §5–§6); `report.md` lists the real
@@ -483,6 +502,10 @@ both Linux (XRT buffer objects) and bare-metal (malloc with identity mapping).
 /* Defined in the header (not opaque) so inference.c can declare static views */
 struct inference_buf { void *virt; uint64_t phys; unsigned count; ... };
 typedef struct inference_buf inference_buf_t;
+
+/* Bare metal: the DMA region the pool is carved from (call before
+ * inference_init(); without it the standalone heap) */
+void   inference_buf_pool_set(uintptr_t base, size_t bytes);
 
 /* Allocate a buffer for n_elem Data_t elements (Linux: one XRT BO, 64-byte
  * rounded, cleaned once) */
@@ -527,15 +550,18 @@ void inference_buf_read_float(const inference_buf_t *buf, float *dst, unsigned n
  * internal weights and intermediate tensors, load weight data, and flush to DDR.
  *
  * One const char * parameter per hardware kernel active in the model, in
- * registry order: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel.
+ * registry order: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel,
+ * RowOpsKernel.
  * Only kernels actually used by the model appear in the signature.
  *
  * Each instance name:
  *   Linux:      UIO sysfs name (the DT node label, e.g. "fabric_vecop" for
  *               dts/kv260/cormorant.dts; `cat /sys/class/uio/uio*/name`)
- *   Bare-metal: device name from xparameters.h, e.g. "VectorOPKernel"
+ *   Bare-metal: the parameters are UINTPTR AXI-Lite base addresses instead
+ *               (INFERENCE_RPU_INIT_ARGS, from xparameters.h)
  * inference.h provides defaults as INFERENCE_<KERNEL>_INSTANCE macros
- * ("VectorOPKernel_0", "MatmulKernel_0", "ConvKernel_0", "PoolKernel_0"),
+ * ("VectorOPKernel_0", "MatmulKernel_0", "ConvKernel_0", "PoolKernel_0",
+ * "RowOpsKernel_0"),
  * overridable with -DINFERENCE_<KERNEL>_INSTANCE=... at CMake configure time.
  *
  * Returns 0 on success, non-zero on failure.
@@ -549,7 +575,8 @@ int inference_init(const char *vectoropkernel_instance);
 int inference_init(const char *vectoropkernel_instance,
                    const char *matmulkernel_instance);
 
-/* Full CNN — all four kernels (actual signature is model-specific): */
+/* Full CNN — four kernels (actual signature is model-specific; a model with
+ * row-ops nodes adds const char *rowopskernel_instance last): */
 int inference_init(const char *vectoropkernel_instance,
                    const char *matmulkernel_instance,
                    const char *convkernel_instance,
@@ -593,7 +620,7 @@ const char *const  *inference_layer_names_ptr(void);
 ```
 
 Build / run-time knobs of the generated library (`INFERENCE_BUF_CACHEABLE`,
-`INFERENCE_HOST_THREADS`, `INFERENCE_PROFILING`) are listed in the technical
+`INFERENCE_HOST_THREADS`, `INFERENCE_PROFILING`, `INFERENCE_WAIT`) are listed in the technical
 reference, [§Generated C API](../../doc/scheduler/INFERENCE_SCHEDULER.md#generated-c-api).
 
 ---
@@ -777,9 +804,11 @@ cmake .. \
 make
 ```
 
-`BARE_METAL` is the default `INFERENCE_TARGET`.  CMake selects each active
-kernel's `driver/x<kernel>_sinit.c` and compiles against the Xilinx
-standalone BSP headers (xil_cache, xparameters).
+`BARE_METAL` is the default `INFERENCE_TARGET`.  CMake compiles against the
+Xilinx standalone BSP headers (xil_cache, xparameters); no `_sinit.c` is
+built: `inference_init()` takes the kernels' AXI-Lite base addresses
+(`INFERENCE_RPU_INIT_ARGS` from `xparameters.h`) and calls each driver's
+`CfgInitialize`.
 
 ### Linux (KV260 Ubuntu / PetaLinux)
 
@@ -792,7 +821,8 @@ cmake .. -DINFERENCE_TARGET=LINUX \
     -DINFERENCE_VECTOROPKERNEL_INSTANCE=\"fabric_vecop\" \
     -DINFERENCE_MATMULKERNEL_INSTANCE=\"fabric_matmul\" \
     -DINFERENCE_CONVKERNEL_INSTANCE=\"fabric_conv\" \
-    -DINFERENCE_POOLKERNEL_INSTANCE=\"fabric_pool\"
+    -DINFERENCE_POOLKERNEL_INSTANCE=\"fabric_pool\" \
+    -DINFERENCE_ROWOPSKERNEL_INSTANCE=\"fabric_rowops\"
 make
 ```
 
@@ -816,11 +846,12 @@ cp <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/*.{c,h} <out
 cp <repo>/build/kernels/conv_rtl/driver/ConvKernel_v1_0/src/*.{c,h} <out_dir>/driver/
 cp <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/*.{c,h} <out_dir>/driver/
 cp <repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/*.{c,h} <out_dir>/driver/
+cp <repo>/build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src/*.{c,h} <out_dir>/driver/
 ```
 
 The drivers are the RTL kernels' (the HLS drivers' API), written by `make
 driver_vectorop_rtl` / `make driver_conv_rtl` / `make driver_matmul_rtl` /
-`make driver_pool_rtl`.
+`make driver_pool_rtl` / `make driver_rowops_rtl`.
 See `driver/README.md`.
 
 ---
@@ -924,7 +955,8 @@ used) followed by these sections:
 | Weight quantization error *(fixed-point only)* | Per-weight `Max \|abs\|` / `NRMSE` / `SQNR (dB)`, with a "Used by" column linking each tensor to the consuming layer and role |
 | Activation memory | Pool slot count after coloring, total pool size, naive baseline, saving in elements/bytes/percent |
 | Hardware lanes | Per-lane usage check (`✓` / `–`) and node count |
-| Applied transformations | Gemm decomposition, activation fusion, MatMul on ConvKernel, planning (`--plan`), space-to-depth stem, fully-connected Conv → MatMul, pattern fusion, constant-broadcast normalisation, host-CPU ops, ReshapeNode folding, buffer-pool reuse summary, cross-lane parallelism (overlapping starts / total starts) — each line only when it applies |
+| Cortex-R5 *(models with kernel calls)* | Who drives the kernels when the R5 firmware runs (`INFERENCE_RPU_RECOMMENDED`): kernel calls and batches per inference, the R5's overhead against the predicted time (`src/rpu_policy.py`) |
+| Applied transformations | Gemm decomposition, activation fusion, MatMul on ConvKernel, planning (`--plan`), space-to-depth stem, fully-connected Conv → MatMul, pattern fusion, SiLU fusion, activation unit, constant-broadcast normalisation, host-CPU ops, ReshapeNode folding, buffer-pool reuse summary, cross-lane parallelism (overlapping starts / total starts) — each line only when it applies |
 | Planning *(`--plan` / `--plan-report` only)* | Predicted time of one `inference_run()` from the performance and host-op models, CPU busy / waiting time, the issue-order result, busy time per lane, and where the CPU waits (the nodes whose kernels it waits for longest) |
 | Layers | One row per `ScheduledNode` with op-specific notes (Conv: `k=⋯·s=⋯·p=⋯`, Pool: type+window, Matmul: shape sizes) plus, for fixed-point dtypes, per-layer truncation `Max \|abs\|` / `NRMSE` / `SQNR (dB)` |
 | Generated artifacts | Every file written for this run |
@@ -1054,8 +1086,8 @@ reshape the input graph before code generation:
 - **Gemm decomposition** count — Gemm nodes rewritten to `MatMul + Add`
   by `OnnxGraph._preprocess_model`.
 - **Activation fusion**, **MatMul on ConvKernel**, **Space-to-depth stem**,
-  **Fully-connected Conv → MatMul**, **Pattern fusion**,
-  **Constant broadcast normalisation**, **Host-CPU ops**
+  **Fully-connected Conv → MatMul**, **Pattern fusion**, **SiLU fusion**,
+  **Activation unit**, **Constant broadcast normalisation**, **Host-CPU ops**
   — counts of the load-time rewrites described in the
   [technical reference](../../doc/scheduler/INFERENCE_SCHEDULER.md) (listed only when
   non-zero).

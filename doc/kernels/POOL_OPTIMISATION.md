@@ -1,7 +1,8 @@
 # PoolingKernel — Optimization Log
 
 This document records the structural and performance optimizations applied to
-`kernels/pool/kernel/PoolingKernel.cpp` after the initial scalar implementation
+`kernels/pool/kernel/PoolingKernel.cpp` (now, without its pragmas, the C++ model
+`kernels/pool_rtl/model/src/PoolingKernel.cpp`) after the initial scalar implementation
 shipped. Each section describes one change, the rationale, and the measured
 HW behavior simulation (`make behavior_test_pool`) impact on the kv260 RTL.
 
@@ -1142,13 +1143,14 @@ violated bound.
 
 ### 4.2. How CMake reads the JSON
 
-`kernels/pool/CMakeLists.txt::pool_load_constants(platform_json prefix)`
+`kernels/pool_rtl/model/CMakeLists.txt::pool_load_constants(platform_json prefix)`
 calls `string(JSON … GET … kernels pool <field>)` for each required
 key, sets `${prefix}_<UPPER_FIELD>` in the parent scope, and errors
 out (`FATAL_ERROR`) on any missing field.  The default-platform
 constants drive `Config.h` for the C-sim build; the per-platform
-synthesis loop calls the function again per platform JSON so each
-synthesised IP gets its own bounds.
+synthesis loop is retired with the HLS kernel, and
+`kernels/pool_rtl/CMakeLists.txt` checks the same fields against the RTL's
+`rtl/pl_pkg.sv` (`FATAL_ERROR` when they differ).
 
 `set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS …)`
 lists every platform JSON, so editing one auto-triggers a reconfigure
@@ -1173,7 +1175,7 @@ specific JSON field to bump.
 
 ### 4.4. Test predictor and cache-extreme verification
 
-The `expected_dup_reads_for(tc)` helper in `TestPoolingSim.cpp` mirrors
+The `expected_dup_reads_for(tc)` helper in `TestPoolModel.cpp` (`TestPoolingSim.cpp` until 2026-10-13) mirrors
 the kernel's load schedule using the same constants, so per-test
 `dup_reads=X/Y` always reports cache-aware expectations.  Verified at
 three cache extremes by setting `max_line_buf_cols` in the JSON and

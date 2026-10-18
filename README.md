@@ -4,10 +4,11 @@
   <img src="doc/images/cormorant.png" alt="Cormorant" width="320"/>
 </p>
 
-Four kernels for the Xilinx Kria KV260 (Conv, VectorOP, MatMul and Pooling,
-all in SystemVerilog) and a Python code generator that compiles
+Five kernels for the Xilinx Kria KV260 (Conv, VectorOP, MatMul, Pooling and
+the row-ops unit, all in SystemVerilog) and a Python code generator that compiles
 ONNX models — CNN classifiers, the YOLOv5n object detector, BERT-base,
-Llama-family decoders, a ViT vision encoder and a VITS text-to-speech model —
+Llama-family decoders, a ViT vision encoder, a VITS text-to-speech model, a
+stereo-depth network and a speech-to-text model —
 into self-contained C projects that drive the
 kernels from Linux on the board.  Everything runs in 16-bit fixed point
 (`ap_fixed<16,8>`, or per-tensor power-of-two exponents), and the board's
@@ -29,18 +30,22 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-15 on the
-production bitstream `de968ccc45da`: the 250 MHz design of
+KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-15 on
+bitstream `de968ccc45da` (production 2026-10-15 to 2026-10-16): the 250 MHz design of
 [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
 ([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
 ([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), its second read port on a PS port of its
 own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)), ConvKernel's x port past the CCI
 ([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8) and the row-ops unit, a fifth kernel
 that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
-inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)).  The board runs the
-A53's interrupt waits and, as a soak test, the cores' deep idle state (about 2 % on
-the chat decode).  The 320×256 stereo figure is from 2026-10-10; the chat-server
-Piper figures are from 2026-10-01, at 100 MHz.
+inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)).  The Piper chunk and
+text-encoder figures and Moonshine's are from 2026-10-17, on the production bitstream
+`04259a7af917` (the row-ops unit's GATE op and SCALE flag,
+[RPU_PLAN](doc/plans/RPU_PLAN.md) §14).  The board runs the A53's interrupt waits
+and, as a soak test, the cores' deep idle state (about 2 % on the chat decode).
+The 320×256 stereo figure and the RealSense comparison are from 2026-10-09
+(bitstream `8599aa7a5f12`); the chat-server Piper figures are from 2026-10-01,
+at 100 MHz.
 
 | Model | Result | Source |
 |---|---|---|
@@ -128,14 +133,15 @@ program) for Linux with XRT buffers or for bare metal:
   where a cost model says it is faster, on ConvKernel with swapped operand
   roles; `Gemm` is decomposed, `Reshape`-class ops and contiguous
   `Split` / `Slice` pieces are free views.
-- **Host-CPU ops** for what no kernel implements — `LayerNormalization`,
-  `Transpose`, `Concat`, `Resize` (nearest upsampling), `Gather`, `OneHot`,
-  `Cast`, `SpaceToDepth`, and `Softmax` / `Gelu` where the VectorOP units do not
-  apply — with the LayerNorm / GELU subgraphs of exported BERT models fused into
-  single ops, and a host thread pool.
+- **Host-CPU ops** for what no kernel implements — `Concat`, `Resize`
+  (nearest upsampling), `Gather`, `OneHot`, `Cast`, `SpaceToDepth`, and
+  `Softmax` / `Gelu` where the VectorOP units do not apply, `LayerNormalization`
+  / `Transpose` where the row-ops unit does not — with the LayerNorm / GELU
+  subgraphs of exported BERT models fused into single ops, and a host thread pool.
 - **Llama-family decoders** — a frontend reads `config.json` + safetensors and
-  builds decode / prefill / head graphs with host ops for RMSNorm, RoPE, SiLU
-  and a float residual stream; attention reads the KV cache on ConvKernel
+  builds decode / prefill / head graphs with RMSNorm, RoPE, SiLU and an int32
+  residual stream on the row-ops unit (host ops and a float residual stream
+  without it); attention reads the KV cache on ConvKernel
   (q·Kᵀ and P·V, prefill and decode), with the prefill's softmax on
   VectorOP's softmax unit.  Per-channel power-of-two exponents fit the model
   into Q8.8.  Several graphs share one library and weight pool (`--entry`).  A
@@ -151,8 +157,9 @@ program) for Linux with XRT buffers or for bare metal:
   - The duration predictor runs as C code in the library.
   - 1-D convolutions are folded into rows.
   - Transposed convolutions run polyphase.
-  - The decoder's residual sums are VectorOP `Add`s; gates, the other sums,
-    LeakyReLU and masks are host ops.
+  - The decoder's residual sums are VectorOP `Add`s; the gates, the other
+    sums, the LeakyReLU preps and the interleaves run on the row-ops unit;
+    the flows' float preps and outputs and the PCM conversion are host ops.
   - Consecutive chunks join into one waveform bit for bit.
 - **Speech to text** — a Moonshine frontend writes the encoder as four
   length buckets (3.1 / 6.2 / 12.3 / 24.6 s of 16 kHz audio, the valid
@@ -207,7 +214,7 @@ Each demo takes a model to a running KV260 program; see
 ### 1. Clone
 
 ```bash
-git clone git@github.com:phoenix367/cormorant.git cormorant && cd cormorant
+git clone https://github.com/phoenix367/cormorant.git cormorant && cd cormorant
 git submodule update --init      # hw/: Vivado block design and RTL test stand (hardware builds only)
 ```
 
@@ -224,7 +231,7 @@ ctest
 
 Or build them one by one: `make TestVectorOpModel TestConvModel TestConvModelGrid
 TestMatmulModel TestPoolModel` (the reference models; + `TestMatmulModelBlas` with a
-BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl` (the
+BLAS) and `TestMatmulRtl TestVectorOpRtl TestPoolRtl TestConvRtl TestRowOpsRtl` (the
 SystemVerilog kernels, with Verilator 5.x).
 
 ### 3. The scheduler and its tests
@@ -243,15 +250,15 @@ python3 ../tools/facts/facts.py install-hook     # optional: git commit checks t
 ```bash
 cd build
 cmake ..
-make synthesize_kv260            # IP export + C drivers of the four kernels and the RowOpsKernel IP (Vivado packaging of the RTL)
+make synthesize_kv260            # IP export + C drivers of the five kernels (Vivado packaging of the RTL)
 make build_hw_kv260              # Vivado: bitstream in hw/cormorant_hw_128/.../impl_1/
 make dtbo_kv260_cormorant        # device-tree overlay: build/dts/kv260/design_cormorant.dtbo
 ```
 
-`make build_hw_kv260` packages the four SystemVerilog kernels itself, so
+`make build_hw_kv260` packages the five SystemVerilog kernels itself, so
 the separate `synthesize_kv260` step is only needed for the C drivers
 (used by the board tests and the demos: `build/kernels/<k>_rtl/driver/`;
-`make driver_vectorop_rtl driver_conv_rtl driver_matmul_rtl driver_pool_rtl`
+`make driver_vectorop_rtl driver_conv_rtl driver_matmul_rtl driver_pool_rtl driver_rowops_rtl`
 writes them alone, with Python and no Vivado) without a bitstream build.
 Do not generate demo or test projects while a driver target rewrites its
 directory.  `hw/cormorant_hw_128/build.sh` uses the `vivado` that Vitis's
@@ -275,6 +282,7 @@ image sets 1000M; this sets the boot script, reboots and checks the size
 
 ```bash
 cd inference-scheduler
+cp bitstream_config_kv260.json.example bitstream_config_kv260.json   # set ssh.host and the paths
 .venv/bin/python -m src.remote.cma_boot --config bitstream_config_kv260.json               # report
 .venv/bin/python -m src.remote.cma_boot --config bitstream_config_kv260.json --set 1400M --reboot
 ```
@@ -297,7 +305,6 @@ Then, from the host:
 
 ```bash
 cd inference-scheduler
-cp bitstream_config_kv260.json.example bitstream_config_kv260.json   # set ssh.host and the paths
 .venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
 # on the board: cat /sys/class/uio/uio*/name  →  axi-pmon (×4, uio0–3), fabric_vecop fabric_matmul fabric_conv fabric_pool fabric_rowops
 ```
@@ -322,7 +329,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 | Layer | Needs | Command |
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1883<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~60 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~70 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

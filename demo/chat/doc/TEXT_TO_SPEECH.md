@@ -17,7 +17,7 @@ TTS_PLAN §4–§7.
   end).  The audio streams while it is being made.
 - **Exactness.**  The samples are bit-exact with the same pipeline run on
   the host.
-- **Memory.**  It needs 55 MB of CMA (a 53 MiB pool).  Under
+- **Memory.**  It needs 55 MB of CMA (a 54 MiB pool).  Under
   `--resident auto` it stays loaded even next to SmolLM2-360M, the largest
   model.
 
@@ -29,7 +29,7 @@ The commands run from the repo root.
    [`demo/tts` commands](../../tts/README.md#commands) (`piper_study.py
    fetch`, `phonemize`, `calibrate` and `encoder`).  It downloads the voice
    and computes its fixed-point exponents into `demo/tts/assets/`.
-2. **Generate the library project** (4 s):
+2. **Generate the library project** (13 s):
 
    ```bash
    PY=inference-scheduler/.venv/bin/python
@@ -104,7 +104,7 @@ chat answer aloud ([Clients](CLIENTS.md#reading-answers-aloud)).
      (`tts_duration`, 18–200 ms);
    - the alignment and the noise are computed in numpy;
    - then the audio is made in chunks of 128 frames (1.49 s of speech):
-     the flow and the HiFi-GAN decoder run on ConvKernel, ~0.7 s per
+     the flow and the HiFi-GAN decoder run on ConvKernel, ~0.15 s per
      chunk.
 3. **Delivery.**  Each chunk's samples go out as soon as they exist.  wav
    and pcm responses carry an exact Content-Length.
@@ -119,5 +119,5 @@ chat answer aloud ([Clients](CLIENTS.md#reading-answers-aloud)).
 - **RTF** (time to make the audio ÷ its length): 0.58–0.79 end to end.
 - **Samples.**  Bit-exact with the same pipeline on the host
   (`demo/tts/scripts/tts_speech_check.py`).
-- **Residency.**  55 MB of CMA (a 53 MiB pool).  With `--resident auto` it
+- **Residency.**  55 MB of CMA (a 54 MiB pool).  With `--resident auto` it
   stays loaded next to SmolLM2-360M.

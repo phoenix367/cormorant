@@ -150,7 +150,7 @@ Resources (out of context, xck26 −2LV, `make synth_conv_rtl`, routed;
 +0.025 ns, WHS +0.031 ns, Fmax ≈ 302 MHz).  Before the second copy: 17 835
 LUT, 39 630 FF (21 507 before the register trees: the patch lanes' per-chain
 copies are 8 192 of the 18 123 added), 40 RAMB36 + 24 RAMB18 (the copy adds
-16 RAMB18), WNS +0.039 ns.  In context (production bitstream `de968ccc45da`,
+16 RAMB18), WNS +0.039 ns.  In context (bitstream `de968ccc45da`, 2026-10-15,
 routed, `report_utilization -hierarchical`): 14 827 LUT (4 046 LUTRAM, 512
 SRL: the weight skew left the SRLs, `doc/plans/AREA_PLAN.md`), 37 497 FF,
 40 RAMB36 + 40 RAMB18, 48 URAM, 518 DSP; on `1cedaf2ed816` before the area
@@ -170,8 +170,8 @@ uses half the instants: the accumulator buffer's ports take one seed read
 and one write-back per cycle).  The drain runs beside the next chunk, the
 weight slab of the next sweep loads beside the current one.  Cycles from
 `ap_start` to `ap_done` with ideal memory (`make perf_conv_rtl`, Verilator;
-the HLS kernel's board times at 100 MHz, the production bitstream, for
-comparison):
+the HLS kernel's board times at 100 MHz on the then-production bitstream
+`dbb320fb7297`, for comparison):
 
 | job (`run_remote_perf.py` ConvKernel benchmarks) | RTL cycles | grid bound | HLS kernel on the board |
 |---|---:|---:|---:|
@@ -221,11 +221,11 @@ kernel's schedule needs the model re-tuned: `test_matmul_on_conv.py`
 | check | where | result |
 |---|---|---|
 | Verilator lint (`-Wall`) | `lint_conv_rtl` | clean |
-| the 63 checked-in fixtures (`hw/test_data/conv_test_data`) | `TestConvRtl` (ctest) | 63 / 63: y.hex and byte-identical to the HLS oracle on the whole output region |
+| the 66 checked-in fixtures (`hw/test_data/conv_test_data`; the three y-pattern cases since RPU_PLAN §13.2) | `TestConvRtl` (ctest) | 66 / 66: y.hex and byte-identical to the HLS oracle on the whole output region |
 | random jobs against the HLS kernel's C++, randomised AXI timing, protocol checks, the declared outstanding limits, no stray write | ctest: 200 (seed 1); by hand about 9 000 over the development, 2 200 on the phase-3 RTL, 4 600 on the register trees (seeds 11–13 and 21–23, fast / slow / random timing) | all bit-exact |
 | the behavioural MAC chain against Vivado's DSP48E2 simulation model, every cycle | `ConvRtlDsp` (ctest) | 199 899 cycles, 0 mismatches |
-| register table vs RTL and the HLS driver | `ConvRtlDriver` (ctest), `gen_driver.py --check --hls-driver` | 21 arguments + 4 control registers agree; the API prototypes are the HLS driver's |
-| the test stand's conv block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_conv_rtl` | 63 / 63 (`check_test_report.py` PASS); 3 768 µs against the HLS IP's 4 903 µs (−23.1 %), every case faster (−4.6 … −52.0 %) |
+| register table vs RTL and the HLS driver | `ConvRtlDriver` (ctest), `gen_driver.py --check --hls-driver` | 24 arguments (the y pattern's `y_cs` / `y_cn` / `y_gs` since RPU_PLAN §13.2) + 4 control registers agree; the API prototypes are the HLS driver's plus those three registers' |
+| the test stand's conv block design in xsim with the RTL IP (upgraded in place of the HLS IP) | `sysim_conv_rtl` | 63 / 63 (`check_test_report.py` PASS); 3 768 µs against the HLS IP's 4 903 µs (−23.1 %), every case faster (−4.6 … −52.0 %); with the y pattern 66 / 66 (RPU_PLAN §13.9) |
 
 The random jobs cover standard and depthwise convolutions, MatMul-on-ConvKernel
 shapes (1 × kw kernels at stride kw, up to 1024 input and 1280 output

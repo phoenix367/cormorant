@@ -4,7 +4,8 @@
 - **The study: GO with plain Q8.8.**  On COCO128 the FPGA datapath gives
   mAP@0.5:0.95 0.343 against float's 0.349 (mAP@0.5 0.543 vs 0.545).
 - **The demo.**  `demo/object_detection` runs YOLOv5n on the board at 63.9 ms
-  per image (15.6 FPS).  The head maps are bit-exact with the scheduler's
+  per image (15.6 FPS, bitstream `8599aa7a5f12`; 46.9 ms on `f70ce632a97a`,
+  DEPTHWISE_PLAN §8.6).  The head maps are bit-exact with the scheduler's
   simulation, and the boxes are drawn on the images.  Concat and Resize are
   new host ops.
 

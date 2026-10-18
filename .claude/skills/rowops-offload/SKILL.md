@@ -1,5 +1,5 @@
 ---
-description: Move a host-CPU op of the inference scheduler onto the row-ops unit (RowOpsKernel) as a kernel node — the node class (jobs, reference, kernel_calls, emit), its factory in the override tables, the frontend flag and study policy, the specification function, the tests (simulation == spec, host emulation, kind counts), the regenerated libraries and the board gate. Written from HOSTOPS_PLAN phases 4a / 4b and RPU_PLAN track A1, with the traps each of them hit. Use when a plan maps a host op onto COPY / ADDX / DEQUANT / MULACT / NORM / ROPE / TRANSPOSE, or when a unit node disagrees with the board.
+description: Move a host-CPU op of the inference scheduler onto the row-ops unit (RowOpsKernel) as a kernel node — the node class (jobs, reference, kernel_calls, emit), its factory in the override tables, the frontend flag and study policy, the specification function, the tests (simulation == spec, host emulation, kind counts), the regenerated libraries and the board gate. Written from HOSTOPS_PLAN phases 4a / 4b and RPU_PLAN track A1, with the traps each of them hit. Use when a plan maps a host op onto COPY / ADDX / DEQUANT / MULACT / NORM / ROPE / TRANSPOSE / FOLD / GATE, or when a unit node disagrees with the board.
 allowed-tools: Bash Read Write Edit
 ---
 
@@ -20,7 +20,10 @@ the `RowOpsKernel` lane: one or more `run_rowops()` jobs, non-blocking,
 | adds two rows with per-column shifts (i16 / i32 in, i16 / i32 out, exact) | ADDX |
 | int16 / int32 → float32 (`y = float32(raw · 2^-sh_c[c])`) | DEQUANT into a `dma: f32` tensor |
 | gathers a matrix's diagonals, transposes rows into granules, interleaves phases | TRANSPOSE (R ≤ 8 rows per tile, L ≤ 1024; `b_s2 = 2R` contiguous, else byte-strobed granules) |
-| needs a runtime-indexed gather, an unaligned row start, float math, tanh / sigmoid, a non-power-of-two scale, rows > 4096 | stays on the host (RPU_PLAN §3.3 lists the kernel features it would need) |
+| multiplies a COPY / ADDX sum by a per-column integer G before the rounding (Piper's ÷ 3) | the `SCALE` flag (op bit 17; platform `kernels.rowops.scale`) |
+| tanh(A) · σ(B) of two int16 rows (Piper's `TtsGate`) | GATE (op 10; platform `kernels.rowops.gate`) |
+| windowed int16 source rows at any element offset, LeakyReLU 1/m, re-rounding (Piper's `TtsPrep`) | FOLD (op 9; platform `kernels.rowops.fold`) |
+| needs a runtime-indexed gather, an unaligned row start, float math, tanh / sigmoid other than GATE's, a non-power-of-two scale other than SCALE's, rows > 4096 | stays on the host (RPU_PLAN §3.3 lists the kernel features it would need) |
 
 Hard rules of the contract that the host emulation did not check until
 RPU_PLAN A1 (it aborts now):
@@ -66,6 +69,7 @@ class XRoNode(RowOpsNode):
                                                       #   blocks, a_s1, a_s2, b_s1, b_s2, c_s1, c_s2, aux, win_lo, win_hi)]
     def reference(self, ins, dtype): ...              # the host op's value, bit for bit, on logical arrays
     def kernel_calls(self, layouts): return merge([KernelCall.of("RowOpsKernel", ...) for j in self._jobs(layouts)])
+    def chain_jobs(self, layouts): return len(self._jobs(layouts))   # > 1: issued as descriptor chains (kernels.rowops.chains)
     def describe(self) / emit_comment(self) / emit_call(self, layouts)   # emit_call: self.call(...) per job,
                                                                          # "kernel_wait(KERNEL_ROWOPS);" between jobs
 ```
@@ -122,7 +126,7 @@ class XRoNode(RowOpsNode):
    `test_rowops_unit`, `test_bert_base`), the `run_rowops(` counts of a
    generated source, "needs the unit" / "flag off keeps the host op".
 5. `python3 ../.claude/agents/run-tests/run_tests.py --suite all`, then
-   `python3 tools/facts/facts.py check` / `fix` (the test count moves).
+   `python3 ../tools/facts/facts.py check` / `fix` (the test count moves).
 
 ## 4. Regenerate, gate, price
 

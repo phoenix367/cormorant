@@ -12,13 +12,13 @@ allowed-tools: Bash Read
 - Board reachable: `ping 192.168.100.8`; SSH key `~/.ssh/kv260-testkey`.
 - Vitis env for `xclbinutil`: `source /mnt/data/xilinx/2025.2/Vitis/settings64.sh`.
 
-## 1. Build the bitstream (~30 min, Vivado)
+## 1. Build the bitstream (~1–2 h, Vivado)
 
-All four kernels are SystemVerilog IPs (`package_<k>_rtl`; the last Vitis
+All five kernels are SystemVerilog IPs (`package_<k>_rtl`; the last Vitis
 HLS kernel, ConvKernel, was retired in CONV_RTL_PLAN phase 3).  The block
 design's `S_AXI_HPC0_FPD` and interconnect crossbar are 128-bit; each
 kernel instance's `C_M_AXI_*_DATA_WIDTH` must equal the IP's own default
-(128 for every data port; the block designs still say 32 for MatmulKernel
+(128 for every data port; the test stand's block design still says 32 for MatmulKernel
 `c`, the retired HLS kernel's width, and the build scripts reset it to the
 IP's 128 after the upgrade, `scripts/ip_defaults.tcl`).  The test stand's
 four block designs use the same widths with a 128-bit PS port since
@@ -31,7 +31,7 @@ verification tree `build/` and its timing baselines:
 
 ```bash
 cmake -S . -B build_hw128 -DAXI_BUS_WIDTH=128     # once (the bus width no longer affects any IP)
-make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # package the four RTL IPs + Vivado
+make -C build_hw128 build_hw_kv260 > /tmp/hw.log 2>&1   # package the five RTL IPs + Vivado
 grep -E "Timing summary|write_bitstream completed|^ERROR" /tmp/hw.log
 ```
 
@@ -39,7 +39,8 @@ WNS must be positive — at **4.000 ns**: the kernels run at 250 MHz from an
 MMCM in the block design (`clk_wiz_0`, `scripts/bd_kernel_clock.tcl`;
 FMAX_250_PLAN), with impl_1's directives set by `scripts/build.tcl`
 (`set_impl_directives`; the default strategy missed by tens of ps).  The
-signed-off bitstream `986cef4866a0` had +0.105 ns; the margin moves by
+first 250 MHz bitstream `986cef4866a0` had +0.105 ns, the production
+`04259a7af917` (2026-10-17) +0.027 ns after nine rip-up iterations; the margin moves by
 ±0.1 ns from build to build, so a kernel change that leaves < +0.05 ns
 deserves a look at the worst paths.  Two checks before any bitstream goes
 to the board: `grep -c 'Synth 8-4767' <runs>/synth_1/runme.log` must be 0
@@ -66,14 +67,14 @@ driver headers and fail preflight.
 
 ```bash
 cd inference-scheduler
-.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json
+.venv/bin/python upload_bitstream.py --config bitstream_config_kv260.json   # a local copy of bitstream_config_kv260.json.example
 ../.claude/skills/board-deploy/scripts/read_kernel_regs.sh   # widths + kernel states
 ```
 
 The loader checks that PL0 (`/sys/devices/platform/fclk0/set_rate`) is at
 the HWH's 100 MHz before programming (Step 5b; it sets it when another loader
 changed it) and again after the xclbin load: the MMCM needs it to lock, and
-a design that does not lock stays in reset.  `read_kernel_regs.sh` must show the HPC0 **and HPC1** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26; the loader derives both from the HWH)
+a design that does not lock stays in reset.  `read_kernel_regs.sh` must show the HPC0, HPC1, HP0 **and HP2** width fields = **0 (128-bit)** (HPC1 carries conv w/b and matmul B since 2026-09-26 and vectorop b since `8599aa7a5f12`, HP0 the row-ops unit, HP2 conv x since `f70ce632a97a`; the loader derives them from the HWH)
 — the AFIFM encoding is 0 = 128, 1 = 64, 2 = 32 (the loader's PYNQ
 table), NOT the other way round.  Until 2026-09-24 the block design
 left `S_AXI_HPC0_FPD` at 32 bits (`PSU__SAXIGP0__DATA_WIDTH`), so the
@@ -103,7 +104,7 @@ interrupt against the overlay (a stale device is rebound); if
 ## 3. Run
 
 ```bash
-.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 159 models, ~10 min
+.venv/bin/python run_remote_tests.py --config remote_config_all_models.json   # 159 models, ~10 min (a local copy of remote_config.json.example)
 cd ../demo/image_classification && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
     && ../../inference-scheduler/.venv/bin/python scripts/deploy_and_run.py --verbose
 cd ../mnist && ../../inference-scheduler/.venv/bin/python scripts/generate_project.py \
@@ -124,7 +125,7 @@ and the model set SEQUENTIALLY — they share the kernels.  Local configs
 must name the VectorOP UIO `fabric_vecop` (the overlay's name after a
 clean boot; older boards showed `fabric`).
 
-Record results in CONV_OPTIMISATION.md (§2.31/§2.33 format) and refresh
+Record results in the kernel's optimisation log (`kernel-verify`'s table; CONV_OPTIMISATION.md §2.31/§2.33 is the format) and refresh
 the demo READMEs' transcripts if latencies moved.
 
 ## 4. When a model hangs or mispredicts

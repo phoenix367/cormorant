@@ -16,7 +16,7 @@ independently into any host application that uses the generated
 `inference` library — the MNIST, image-classification, BERT-SQuAD, chat
 and TTS benches (`bench_mnist.c`, `classify_images.c`, `squad_bench.c`,
 `llm_bench.c`, `tts_bench.c`) all use them (the chat and TTS benches only
-the per-layer profiler).
+the per-layer profiler, as do `detect_images.c`, `stereo_pairs.c` and `asr_bench.c`).
 The per-layer profiles also feed the host-op timing model of the
 scheduler's `--plan` mode ([Other benches](#other-benches)).
 
@@ -198,7 +198,7 @@ typedef struct ddr_backend {
 
 1. Drop `runtime/ddr/<name>.c` exporting `const ddr_backend_t inference_ddr_backend_<name>` with `name` and the function pointers populated (`sample` and `describe` may be NULL).
 2. Add `extern const … inference_ddr_backend_<name>;` plus a registry entry to `BACKENDS[]` in `runtime/inference_ddr.c`.
-3. Add the file to `runtime_files` in `inference_scheduler.py` and to the runtime-file list in `MultiEntryGenerator.write_project()` (`src/codegen/multi.py`) so it gets copied into single- and multi-entry projects.
+3. Add the file to `RUNTIME_FILES` in `src/codegen/runtime_files.py` (the one list `inference_scheduler.py` and `MultiEntryGenerator.write_project()` both copy) so it gets copied into single- and multi-entry projects.
 
 The CMake glob in `_cmake.py` picks up any new `src/ddr/*.c` automatically; no other edits needed.
 
@@ -232,7 +232,7 @@ the KV260 cormorant overlay does not expose the APMs as UIO devices.
 | `0x100..0x190` | MC0..MC9       | 32-bit Metric Counters (0x10 stride) |
 | `0x300` | CTL                  | Bit 0 = MCNTR_ENABLE; bit 1 = MCNTR_RESET |
 
-Each metric selector slot holds a 13-bit field — 5-bit metric in bits
+Each metric selector slot holds an 8-bit field — 5-bit metric in bits
 [4:0], 3-bit slot in [7:5].  Four entries per 32-bit register.
 
 ### Programming sequence
@@ -401,8 +401,8 @@ overrides `cfg.run.profile_layers` to true for that run.
 ### Reporting
 
 Per-model summary printed by `deploy_and_run.py` (example from a
-2026-05 bitstream; the current one runs `mnist_convnet` at 0.111 ms —
-see `demo/mnist/README.md`):
+2026-05 bitstream; on `de968ccc45da`, 2026-10-15, it ran `mnist_convnet` at
+0.114 ms — see the root `README.md`):
 
 ```
 accuracy = 98.92%   mean = 4.548 ms   throughput = 219.9 img/s
@@ -441,6 +441,10 @@ for downstream analysis.
   `mean_us`, `min_us`, `total_us`).
 - **TTS** (`demo/tts/src/tts_bench.c`) — the same, phases `chunk` and
   `encode_<T>`; `demo/tts/scripts/tts_board.py --profile --out FILE`.
+- **ASR** (`demo/asr/src/asr_bench.c`) — the same, phases `encode_<T>` and
+  `decode`; `demo/asr/scripts/asr_board.py --profile --out FILE`.
+- **Object detection, stereo depth** (`detect_images.c`, `stereo_pairs.c`) —
+  no DDR counters; `deploy_and_run.py --profile` puts `layer_stats` in `build/results/run.json`.
 
 `inference-scheduler/perf_calibrate.py host --profile MODEL=RESULTS.json`
 fits the host-op model `perf_models/<platform>/host.json` from these files
@@ -589,6 +593,7 @@ inference-scheduler/src/codegen/
 ├── _header.py               INFERENCE_NUM_LAYERS + accessors decls
 ├── _source.py               static names table + PROF_BEGIN/END wrap
 ├── _cmake.py                INFERENCE_PROFILING option + glob
+├── runtime_files.py         RUNTIME_FILES: the runtime files both project writers copy
 └── multi.py                 multi-entry projects: runtime-file copy,
                              INFERENCE_ENTRY_<NAME>_FIRST_LAYER
 
@@ -613,10 +618,10 @@ To add a Versal NoC DDRMC backend (vaitrace-style):
 2. **`runtime/inference_ddr.c`** — add
    `extern const ddr_backend_t inference_ddr_backend_versal_ddrmc;` and
    place it in `BACKENDS[]` in priority order (most-specific first).
-3. **`inference-scheduler/inference_scheduler.py`** — add
+3. **`inference-scheduler/src/codegen/runtime_files.py`** — add
    `("ddr/versal_ddrmc.c", "src/ddr/versal_ddrmc.c")` to
-   `runtime_files`, and the same pair to the runtime-file list in
-   `src/codegen/multi.py::MultiEntryGenerator.write_project()`.
+   `RUNTIME_FILES`, the list both `inference_scheduler.py` and
+   `src/codegen/multi.py::MultiEntryGenerator.write_project()` copy.
 4. **Tests** — extend `runtime/test/test_inference_ddr.c` with a
    `versal_ddrmc_disabled_via_env` scenario; the existing failure-path
    tests already cover the dispatcher.

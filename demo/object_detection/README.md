@@ -47,7 +47,9 @@ What it needs:
 - the board set up as in the top-level README, with the production bitstream
   loaded;
 - the kernels' driver sources: `make driver_vectorop_rtl driver_conv_rtl
-  driver_pool_rtl` in `build/`, referenced by `local.driver_dirs`.
+  driver_pool_rtl` in `build/`, referenced by `local.driver_dirs`;
+- Pillow in the scheduler's virtualenv (`$PY -m pip install Pillow`; it is
+  not in `inference-scheduler/requirements.txt`).
 
 ## What it does
 
@@ -61,9 +63,10 @@ What it needs:
 
 ## Results (KV260, bitstream `8599aa7a5f12`, 2026-10-08)
 
-**Speed.**  YOLOv5n's FPGA graph takes **46.8 ms per image (21.4 FPS)**.
-Per-layer profile (the kernel lanes overlap, so the parts add up to more
-than the total):
+**Speed.**  YOLOv5n's FPGA graph takes **46.8 ms per image (21.4 FPS)**
+(bitstream `1cedaf2ed816`, 2026-10-12).
+Per-layer profile at 63.9 ms per image, on `8599aa7a5f12` (the kernel lanes
+overlap, so the parts add up to more than the total):
 
 | part | ms |
 |---|---:|

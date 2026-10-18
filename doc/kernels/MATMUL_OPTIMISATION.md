@@ -1,7 +1,8 @@
 # MatmulKernel — Optimization Log
 
 This document records performance investigation and optimization attempts on
-`kernels/matmul/kernel/MatmulKernel.cpp`. Each section describes one change or
+`kernels/matmul/kernel/MatmulKernel.cpp` (now, without its pragmas, the C++ model
+`kernels/matmul_rtl/model/src/MatmulKernel.cpp`). Each section describes one change or
 experiment, the rationale, and the measured HW behavior-simulation
 (`make behavior_test_matmul`) impact on the kv260 RTL.
 
@@ -949,7 +950,7 @@ ResNet-18 311 → 310 ms through their classifiers; predictions identical.
 
 | File | Purpose |
 |---|---|
-| `kernels/matmul/kernel/MatmulKernel.cpp` | HLS kernel (tiled loop nest + the §8b GEMV dataflow) |
+| `kernels/matmul_rtl/model/src/MatmulKernel.cpp` | the HLS kernel without its pragmas, now the C++ reference model (tiled loop nest + the §8b GEMV dataflow; `kernels/matmul/kernel/` until 2026-10-13) |
 | `doc/kernels/MATMUL_KERNEL.md` | Kernel reference (architecture, interface, II=1) |
 | `hw/cormorant_test_stand/kernels/matmul_op_test/` | Vivado RTL behavior-test project |
 | `hw/test_data/matmul_test_data/` | Checked-in RTL fixtures (50 cases incl. 11 GEMV, `manifest.txt` with the `gemv_kw` column) |

@@ -2,9 +2,10 @@
 
 **Status (2026-10-05):** done.  The SystemVerilog MatmulKernel
 (`kernels/matmul_rtl/`) is the KV260's: the default of the build and the
-scheduler, and the board's bitstream (`1d28630fbfa4`, timing met at
-100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than with the HLS
-kernel), bit-exact everywhere and no workload slower; its engine choices
+scheduler, and the board's bitstream since `1d28630fbfa4` (2026-10-04,
+timing met at 100 MHz, 8.7 k LUT / 17.8 k FF / 6 BRAM / 8 URAM fewer than
+with the HLS kernel; production since 2026-10-17: `04259a7af917`,
+250 MHz), bit-exact everywhere and no workload slower; its engine choices
 keep one copy of every weight and run the 16-token LLM prefills 26–32 %
 and MobileNet v1 10 % faster.  The HLS kernel's synthesis is retired; its
 C++ stays as the reference model.  Phase 5 (2026-10-05): the IP declares

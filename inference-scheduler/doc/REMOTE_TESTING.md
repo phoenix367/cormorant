@@ -26,12 +26,13 @@ fails the test.
   .venv/bin/pip install paramiko
   ```
 - Driver sources (for `local.driver_dirs` in the config): the RTL kernels'
-  drivers (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl driver_pool_rtl`):
+  drivers (`make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl driver_pool_rtl driver_rowops_rtl`):
   ```
   <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/
   <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
   <repo>/build/kernels/conv_rtl/driver/ConvKernel_v1_0/src/
   <repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/
+  <repo>/build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src/
   ```
 
 ### Remote board (KV260)
@@ -101,7 +102,7 @@ directories of a build in `<repo>/build`.
 | `ssh.password` | `null` | SSH password; `null` when using key auth |
 | `ssh.connect_timeout` | `15` | TCP connect timeout in seconds |
 | `remote.work_dir` | `"/tmp/inference_hw_tests"` | Base directory on the board; created automatically, cleaned up after the run |
-| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names — `{"KernelName": "sysfs_name"}`. The string in `/sys/class/uio/uio*/name`, **not** a `/dev/uioN` path. Each entry becomes `-DINFERENCE_<KERNELNAME>_INSTANCE`, so for `run_remote_tests.py` the keys must be the `KERNEL_REGISTRY` names `VectorOPKernel`, `MatmulKernel`, `ConvKernel`, **`PoolKernel`** (a `PoolingKernel` key is ignored); `run_remote_perf.py` uses `PoolingKernel`. Empty dict uses the defaults in the generated `inference.h` (`VectorOPKernel_0`, …). |
+| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names — `{"KernelName": "sysfs_name"}`. The string in `/sys/class/uio/uio*/name`, **not** a `/dev/uioN` path. Each entry becomes `-DINFERENCE_<KERNELNAME>_INSTANCE`, so for `run_remote_tests.py` the keys must be the `KERNEL_REGISTRY` names `VectorOPKernel`, `MatmulKernel`, `ConvKernel`, **`PoolKernel`**, `RowOpsKernel` (a `PoolingKernel` key is ignored); `run_remote_perf.py` uses `PoolingKernel`. Empty dict uses the defaults in the generated `inference.h` (`VectorOPKernel_0`, …). |
 | `remote.uio_device` | `null` | **Deprecated.** Old single-string UIO name; treated as `{"VectorOPKernel": value}`. Use `uio_devices` instead. |
 | `remote.driver_dir` | `null` | Path **on the board** to copy all kernel driver sources from |
 | `remote.driver_dirs` | `{}` | Per-kernel paths **on the board**: `{"VectorOPKernel": "/path", ...}` (registry names, as for `uio_devices`) |
@@ -120,8 +121,8 @@ directories of a build in `<repo>/build`.
 
 Two jobs on one board at the same time corrupt each other, so every board
 tool — `run_remote_tests.py`, `run_remote_perf.py`, `perf_calibrate.py run`,
-`upload_bitstream.py`, the demos' `deploy_and_run.py`, the chat
-`deploy.py` / `llm_board.py`, the TTS `tts_board.py` — holds an exclusive `flock` on one file per
+`upload_bitstream.py`, `rpu_board.py`, the demos' `deploy_and_run.py`, the chat
+`deploy.py` / `llm_board.py`, the TTS `tts_board.py`, the ASR `asr_board.py` — holds an exclusive `flock` on one file per
 board for its whole session: `/tmp/kv260-board-<ssh.host>.lock` (the
 config's `board_lock` overrides it; `false` disables it;
 `src/remote/lock.py`).  A second job prints `waiting for board lock …`
@@ -144,7 +145,7 @@ device tree overlay (DTS).  The canonical DTS file for the KV260 is:
 dts/kv260/cormorant.dts
 ```
 
-The four UIO nodes and their names as they appear in `/sys/class/uio/uio*/name`:
+The five UIO nodes and their names as they appear in `/sys/class/uio/uio*/name`:
 
 | Kernel | DTS node label | UIO sysfs name |
 |--------|----------------|----------------|
@@ -162,6 +163,7 @@ grep -B3 'generic-uio' dts/kv260/cormorant.dts
 # fabric_matmul: fabric_matmul@a0010000 {
 # fabric_conv: fabric_conv@a0020000 {
 # fabric_pool: fabric_pool@a0030000 {
+# fabric_rowops: fabric_rowops@a0040000 {
 ```
 
 Verify on the board after loading the DTBO (the Kria Ubuntu image's four
@@ -177,6 +179,7 @@ cat /sys/class/uio/uio*/name
 # fabric_matmul
 # fabric_conv
 # fabric_pool
+# fabric_rowops
 ```
 
 These names are passed to cmake as `-DINFERENCE_VECTOROPKERNEL_INSTANCE`,
@@ -214,12 +217,15 @@ the KV260.  `upload_bitstream.py` automates the full loading sequence, mirroring
 what PYNQ's `Overlay` class does internally:
 
 1. Parse the `.bit` header, byte-swap the payload → raw `.bin`
-2. Parse the `.hwh` — extract PS AXI port-width parameters and memory topology
+2. Parse the `.hwh` — extract PS AXI port-width parameters, memory topology
+   and the PL0 / kernel clocks
 3. Build a minimal xclbin (MEM_TOPOLOGY) locally with `xclbinutil`
 4. Upload `.bin` → `/lib/firmware/<name>.bin` on the board
 5. Remove a `pynq` overlay (PYNQ images insert one on every login shell), then
    any existing configfs DTBO overlay with the same name; each removal is
-   checked in `dmesg`, and a refused one stops the upload (below)
+   checked in `dmesg`, and a refused one stops the upload (below); then PL0
+   (`fclk0`) is checked against the HWH's PL0 frequency (100 MHz, the kernel
+   clock MMCM's input) and set when it differs
 6. Write to `fpga_manager` sysfs — triggers PL reconfiguration
 7. Verify `fpga_manager` state == `operating`
 8. Load the xclbin into the zocl DRM driver (`xclLoadXclBin`) — registers
@@ -346,6 +352,7 @@ cat /sys/class/uio/uio*/name
 # fabric_matmul
 # fabric_conv
 # fabric_pool
+# fabric_rowops
 ```
 
 ### Implementation
@@ -380,7 +387,8 @@ Verify SSH connectivity and all board prerequisites without running any tests:
 .venv/bin/python run_remote_tests.py --config remote_config.json --check-only
 ```
 
-Example output (VectorOPKernel-only model):
+Example output (a config whose `remote.uio_devices` names only
+VectorOPKernel; the check covers every entry there):
 
 ```
 Connecting to root@192.168.100.8:22 …
@@ -395,13 +403,14 @@ Remote prerequisites
     OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio4
 ```
 
-For a model that uses all four kernels:
+With the five kernels of `remote_config.json.example`:
 
 ```
     OK      uio (VectorOPKernel: fabric_vecop)   /dev/uio4
     OK      uio (MatmulKernel: fabric_matmul)    /dev/uio5
     OK      uio (ConvKernel: fabric_conv)        /dev/uio6
     OK      uio (PoolKernel: fabric_pool)        /dev/uio7
+    OK      uio (RowOpsKernel: fabric_rowops)    /dev/uio8
 ```
 
 ### Subset of models
@@ -556,8 +565,8 @@ KV260. Unlike `run_remote_tests.py`, it does **not** check numerical correctness
 
 The script:
 1. Assembles a self-contained C benchmark project locally from `bench_src/`
-   (four standalone binaries, one per kernel, plus `calib_runner` for
-   `perf_calibrate.py` when all four kernels' drivers are present)
+   (five standalone binaries, one per kernel, plus `calib_runner` for
+   `perf_calibrate.py` when all five kernels' drivers are present)
 2. Uploads it to the board once, builds everything in one `cmake` + `make` pass
 3. Runs each test case as a separate binary invocation and parses the JSON output
 4. Prints a formatted table of latency (ms) and throughput (GB/s or GOps/s)
@@ -576,7 +585,7 @@ starting a long benchmark run.
 
 Driver files must be available either locally (`local.driver_dirs`) or on the
 board (`remote.driver_dirs`). The local paths are the RTL kernels' drivers
-(`make driver_matmul_rtl driver_vectorop_rtl driver_conv_rtl driver_pool_rtl`;
+(`make driver_matmul_rtl driver_vectorop_rtl driver_conv_rtl driver_pool_rtl driver_rowops_rtl`;
 see [Prerequisites](#prerequisites)):
 
 ```
@@ -584,6 +593,7 @@ see [Prerequisites](#prerequisites)):
 <repo>/build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src/
 <repo>/build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src/
 <repo>/build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src/
+<repo>/build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src/
 ```
 
 ---
@@ -600,7 +610,7 @@ All keys from the correctness-test config apply (see [Config File Reference](#co
 | Key | Default | Description |
 |-----|---------|-------------|
 | `remote.work_dir` | `"/tmp/inference_hw_tests"` | Temporary build directory on the board |
-| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names (keys `VectorOPKernel`, `MatmulKernel`, `ConvKernel`, `PoolingKernel`); a missing entry falls back to `<Kernel>_0` |
+| `remote.uio_devices` | `{}` | Per-kernel UIO sysfs names (keys `VectorOPKernel`, `MatmulKernel`, `ConvKernel`, `PoolingKernel`, `RowOpsKernel`); a missing entry falls back to `<Kernel>_0` |
 | `local.driver_dirs` | `{}` | Per-kernel local driver source paths; merged before upload |
 | `build.timeout` | `300` | Combined cmake + make timeout in seconds |
 | `run.timeout` | `60` | Per-benchmark binary execution timeout in seconds |
@@ -621,7 +631,8 @@ Each kernel group has three keys:
   },
   "MatmulKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] },
   "ConvKernel":   { "enabled": true, "warmup": 10, "cases": [ ... ] },
-  "PoolingKernel":{ "enabled": true, "warmup": 10, "cases": [ ... ] }
+  "PoolingKernel":{ "enabled": true, "warmup": 10, "cases": [ ... ] },
+  "RowOpsKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] }
 }
 ```
 
@@ -633,21 +644,25 @@ If `"cases"` is omitted or empty that kernel is skipped entirely. If
 
 Each element of `"cases"` is a JSON object with a `"label"` string plus the
 kernel-specific numeric fields listed below. All numeric values are integers.
-An optional `"warmup"` field overrides the per-kernel warmup for that case.
+An optional `"warmup"` field overrides the per-kernel warmup for that case;
+an optional `"layout"` (`"OFF0,OFF1,…"`) places the case's buffers at those
+byte offsets inside one allocation (DRAM bank / page experiments,
+PS_PORTS_PLAN §11).
 
 **VectorOPKernel** — element-wise op benchmark
 
 | Field | Description |
 |-------|-------------|
 | `label` | Display name in the report |
-| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6. Any other value is rejected by `run_remote_perf.py` when it loads the cases (right after the config, before it connects to the board) with `config error: VectorOPKernel case '<label>': unsupported op=…`. |
+| `op` | Opcode: 0=ADD 1=SUB 2=MUL 3=DIV 4=RELU 5=RELU6 6=LEAKY_RELU 7=SILU 8=GELU 9=GELU_TANH 10=SOFTMAX 11=SOFTMAX_T. Any other value is rejected by `run_remote_perf.py` when it loads the cases (right after the config, before it connects to the board) with `config error: VectorOPKernel case '<label>': unsupported op=…`. |
 | `size` | Elements per inner kernel call |
 | `outer` | Outer loop count; `outer=1` is the non-broadcast case |
 | `a_inc` | Stride for A between outer iterations (`size` to advance, `0` to repeat) |
 | `b_inc` | Stride for B between outer iterations (`size` to advance, `0` to repeat) |
 | `iters` | Timed iterations (after warmup) |
 
-Binary ops touch 3 memory ports (A, B, C); unary ops (RELU, RELU6) touch 2.
+Binary ops touch 3 memory ports (A, B, C); unary ops (op ≥ 4: RELU, RELU6,
+the activations, the softmax) touch 2.
 The reported **GB/s** accounts for this: `ports × size × outer × 2B / lat`.
 
 **MatmulKernel** — matrix multiply benchmark
@@ -702,6 +717,13 @@ Reported metric: **GOps/s** = `2 × MACs / lat` where MACs = `batch × out_ch ×
 | `iters` | Timed iterations |
 
 Reported metric: **GB/s** = `(x_bytes + y_bytes) / lat`.
+
+**RowOpsKernel** — row-op job benchmark (`bench_src/bench_rowops.c`): `label`,
+`op` (the op register, `src/rowops_spec.py` `opword`), `n` (elements per
+row), `rows`, `blocks`, the byte strides `a_s1`, `a_s2`, `b_s1`, `b_s2`,
+`c_s1`, `c_s2`, `aux`, `win_lo`, `win_hi` (the registers of
+`src/perf_calls.py` `FIELDS["RowOpsKernel"]`) and `iters`.  Reported metric:
+**GB/s** = bytes moved / `lat`.
 
 ---
 
@@ -946,7 +968,7 @@ choices with a performance model of the loaded bitstream,
 `perf_models/kv260/<bitstream-id>.json` (`perf_models/README.md`).
 `perf_calibrate.py` makes it, once per bitstream: it builds the benchmark
 project of `run_remote_perf.py` (same config format; `calib_runner` needs all
-four kernels' drivers) and measures every kernel call of the shipped models
+five kernels' drivers) and measures every kernel call of the shipped models
 and their MatMul tactics plus a space-filling set, twice.
 
 ```bash
@@ -959,7 +981,7 @@ and their MatMul tactics plus a space-filling set, twice.
 `run` checks that the board runs the bitstream the cases are for
 (`--board-bin`, default `/lib/firmware/<overlay>.bin` with the overlay name
 `upload_bitstream.py` uses for `bitstream_config_kv260.json`: `overlay_name`, else
-the `.dtbo` stem — `pl.bin` today), refuses to run while the
+the `.dtbo` stem — `design_cormorant.bin` with the config above), refuses to run while the
 chat server owns the kernels unless `--stop-server` (stops it and restarts
 it afterwards), and `--resume` keeps the measurements already taken.
 `cases --refine` adds the tactics the fitted model ranks near the best;
@@ -973,7 +995,7 @@ board profiles.  Full workflow:
 
 Models that combine kernels (e.g., `MatMul → Relu`, `Add → MatMul`) need
 every UIO device they use active on the board.  The Cormorant bitstream
-carries all four kernels, so one bitstream covers every test model.
+carries all five kernels, so one bitstream covers every test model.
 
 ### 1. Generate mixed-kernel test models
 
@@ -1007,6 +1029,7 @@ cat /sys/class/uio/uio*/name   # run on the board
 # fabric_matmul
 # fabric_conv
 # fabric_pool
+# fabric_rowops
 ```
 
 See [Bitstream Upload](#bitstream-upload-upload_bitstreampy) for config reference and CLI options.
@@ -1041,7 +1064,7 @@ Tracked templates (copy, then edit the copy):
 | Config file | Script | Purpose |
 |-------------|--------|---------|
 | `bitstream_config_kv260.json.example` | `upload_bitstream.py` | Load Cormorant bitstream + xclbin + DTBO onto the board |
-| `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 159 models over all four kernels |
+| `remote_config.json.example` | `run_remote_tests.py` | Correctness tests — 159 models over all five kernels |
 | `perf_config.json.example` | `run_remote_perf.py`, `perf_calibrate.py run` | Performance benchmarks — 72 cases; the board config of the calibration campaign |
 
 Per-subset copies such as `remote_config_vectorop.json`, `remote_config_conv.json`

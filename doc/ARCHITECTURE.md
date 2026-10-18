@@ -35,7 +35,7 @@ block:
 | **MatmulKernel** | batched C = A · B, tiled; a GEMV mode for one-row products | 128 MACs per cycle (GEMV: 16, port-bound) |
 | **ConvKernel** | 2-D convolution, group 1 or depthwise; MatMuls lowered onto it | 512 MACs per cycle |
 | **PoolingKernel** | Max, Average and Lp pooling, and their global forms | one window beat per cycle |
-| **RowOpsKernel** (the row-ops unit) | row operations of transformers: residual add, RMSNorm / LayerNorm, SiLU · up, RoPE, transposes, copies, dequantisation to float32; Piper's windowed LeakyReLU rows (FOLD) | one 4 × 32-bit word per cycle |
+| **RowOpsKernel** (the row-ops unit) | row operations of transformers: residual add, RMSNorm / LayerNorm, SiLU · up, RoPE, transposes, copies, dequantisation to float32; Piper's windowed LeakyReLU rows (FOLD) and gates (GATE) | one 4 × 32-bit word per cycle |
 
 The kernels share no data path.  Each call reads its operands from DDR and
 writes its results to DDR, and software on the Arm cores chains the calls.
@@ -51,7 +51,8 @@ merit.  The project had no external requirement specification.  Its plans
 set targets as it went: ResNet-18 at ≥ 15 FPS
 ([`RESNET18_15FPS_PLAN.md`](plans/RESNET18_15FPS_PLAN.md), met at 100 MHz
 and exceeded 3× since), interactive chat on SmolLM2, and faster-than-real-time
-speech synthesis.  Results on the board with this bitstream at 250 MHz:
+speech synthesis.  Results on the board at 250 MHz, measured 2026-10-15 on
+`de968ccc45da` (Piper's on `04259a7af917`, 2026-10-17):
 
 | workload | input | result |
 |---|---|---|
@@ -73,7 +74,7 @@ board" table is the reference for these numbers.
 
 There is no power budget beyond the starter kit's own supply and fan.
 Board power is measured with the INA260 on the carrier's 5 V rail
-(RPU_PLAN §11):
+(RPU_PLAN §11, 2026-10-13):
 
 | state | board power |
 |---|---|
@@ -81,9 +82,9 @@ Board power is measured with the INA260 on the carrier's 5 V rail
 | chat server loaded, idle | 4.72–4.77 W |
 | back-to-back SmolLM2-135M chat | 6.2 W |
 
-Vivado's routed power estimate gives 7.51 W on-chip (vectorless, medium
-confidence, junction 42.4 °C).  Of that, the PS8 is 2.44 W, signals 1.80 W,
-CLB logic 1.03 W, DSPs 0.47 W, block RAM 0.46 W, URAM 0.45 W, clocks
+Vivado's routed power estimate gives 7.74 W on-chip (vectorless, medium
+confidence, junction 42.9 °C).  Of that, the PS8 is 2.44 W, signals 1.86 W,
+CLB logic 1.14 W, DSPs 0.50 W, block RAM 0.45 W, URAM 0.48 W, clocks
 0.44 W and PL static 0.34 W.  The estimate assumes default toggle rates
 and does not match the measured load: the whole board draws less than
 Vivado's on-chip total.  The software-side savings are measured:
@@ -95,7 +96,7 @@ Vivado's on-chip total.  The software-side savings are measured:
 | interface | where | use |
 |---|---|---|
 | DDR4, 64-bit, 4 GB | PS DDR controller | all kernel operands and results; the Linux memory |
-| AXI4 (5 data paths) and AXI4-Lite (1 control path) | PS–PL boundary | the kernels' memory traffic and registers (§6) |
+| AXI4 (4 data paths) and AXI4-Lite (1 control path) | PS–PL boundary | the kernels' memory traffic and registers (§6) |
 | PL-to-PS interrupts, 5 lines | PS–PL boundary | kernel completion (§6.3) |
 | Gigabit Ethernet | PS (carrier) | the chat server's HTTP API, development access |
 | USB 3 | PS (carrier) | cameras (RealSense D435, webcam) |
@@ -249,7 +250,7 @@ flowchart LR
 | MatmulKernel | `mm_ctrl_s_axi`, `mm_core`, `mm_walker` (batch → 8-row panel → ≤ 512-column chunk), `mm_rungen` × 2; the units synchronise on monotonic counters | `mm_axi_rd` × 2, `mm_gearbox` × 2 (lane rotation), `mm_awr` → `mm_abuf` (A panel), `mm_xpf` × 2 (tap sets), `mm_lane` × 2 (64 MACs each), `mm_drain`, `mm_packer`, `mm_axi_wr` |
 | ConvKernel | `cv_ctrl_s_axi`, `cv_core` (configuration through one pipelined multiplier and three dividers, about 40 cycles per job; the contract check; the sweep sequencer with a 4-deep descriptor FIFO per unit) | `cv_xload`, `cv_patch` (line buffer), `cv_wload`, `cv_bias`, `cv_engine` (weight cache, MAC grid of 32 `cv_mac_chain`s, two accumulator buffers), `cv_drain` (transposer), `cv_ywriter` |
 | PoolingKernel | `pl_ctrl_s_axi`, `pl_core` (one pipelined multiplier, a 6-step divider, about 30 cycles per job; the chunk sequencer with 4-deep chunk FIFOs) | `pl_loader`, `pl_emit` (line buffer, window beats), `pl_reduce` (accumulators, finaliser), `pl_writer` |
-| RowOpsKernel | `ro_ctrl_s_axi`, `ro_core` (job FSM, geometries, the op multiplexer, the TLOAD table loader), `ro_rd_arb` (round-robin AR merge), the scalar FSM of `ro_norm` | `ro_rd_port` × 2, `ro_param`, `ro_stream` (COPY, ADDX, DEQUANT, MULACT), `ro_norm`, `ro_rope`, `ro_xpose`, `ro_fold` (FOLD: row sequencer, eight lanes, packer, its own write bursts), `ro_wr_port` |
+| RowOpsKernel | `ro_ctrl_s_axi`, `ro_core` (job FSM, geometries, the op multiplexer, the TLOAD table loader, the descriptor chains), `ro_rd_arb` (round-robin AR merge), the scalar FSM of `ro_norm` | `ro_rd_port` × 2, `ro_param`, `ro_stream` (COPY, ADDX, DEQUANT, MULACT, GATE), `ro_norm`, `ro_rope`, `ro_xpose`, `ro_fold` (FOLD: row sequencer, eight lanes, packer, its own write bursts), `ro_wr_port` |
 
 The control path is narrow and slow-changing.  Its timing is kept off the
 datapath's critical paths by registering every configuration product before
@@ -295,9 +296,10 @@ sequenceDiagram
   R->>A: doorbell IPI channel 1 to channel 7, GIC 61, if asked
 ```
 
-The R5 costs 1.0 µs per call and 10.6 µs per batch.  The policy puts an
-entry on the R5 when that overhead is at most 5 % of its predicted
-inference time.  That covers every model but the two sub-3-ms MNIST
+The R5 costs 1.0 µs per call and 10.6 µs per batch, plus 61 µs per
+inference and 38 µs for every further wake from its idle sleep.  The
+policy puts an entry on the R5 when that overhead is at most 5 % of its
+predicted inference time.  That covers every model but the two sub-3-ms MNIST
 networks.  A ResNet-18 inference then costs the A53 0.65 ms of CPU instead
 of 20 ms.  The control block (protocol version 5), the ring format and the
 doorbell handshakes are in §6.4.
@@ -332,7 +334,7 @@ flowchart LR
   PL0 --> BUFGPS["BUFG_PS"]
   BUFGPS --> MMCM["MMCME4_ADV<br/>MMCM_X0Y3<br/>VCO 1000 MHz"]
   MMCM -->|"CLKOUT0 ÷ 4"| BUFGCE["BUFGCE<br/>BUFGCE_X0Y76"]
-  BUFGCE --> G0["clk_out1, 249.9975 MHz<br/>122 171 clock loads, 12 clock regions"]
+  BUFGCE --> G0["clk_out1, 249.9975 MHz<br/>117 155 clock loads, 12 clock regions"]
   G0 --> K["kernels, interconnects,<br/>SmartConnect, reset block"]
   G0 --> PSP["PS AXI port clocks<br/>maxihpm0, saxihpc0/1, saxihp0/2"]
   MMCM -->|"locked"| RST["rst_ps8_0_99M"]
@@ -380,7 +382,7 @@ placement, routing and post-route physical optimisation, at 3.333 ns
 | RowOpsKernel | +0.025 ns | ≈ 302 MHz | 2026-10-11 |
 
 In context the five kernels share the device, the interconnects and the
-paths to the PS.  The whole design closes 4 ns with +0.029 ns (§8.4).  The
+paths to the PS.  The whole design closes 4 ns with +0.027 ns (§8.4).  The
 50 MHz between the out-of-context target and the in-context clock is the
 margin that cross-die routing in the full design consumes.
 
@@ -415,7 +417,7 @@ flowchart LR
   MMCMR --> LOCK["MMCM locked"] --> DCM["dcm_locked"]
   EXT --> SYNC["release synchronised<br/>to clk_out1"]
   DCM --> SYNC
-  SYNC --> PAR["peripheral_aresetn<br/>28 loads"]
+  SYNC --> PAR["peripheral_aresetn<br/>27 loads"]
   PAR --> KR["kernels ap_rst_n"]
   PAR --> IR["interconnect ARESETN,<br/>SmartConnect aresetn"]
   KR --> REG["each kernel: rst register,<br/>keep, max_fanout tree"]
@@ -472,10 +474,10 @@ of the bitstream is loaded, at run time:
    "operating".
 4. It loads a memory-topology-only xclbin into XRT's `zocl`, for the buffer
    objects.
-5. It applies the device-tree overlay `pl.dtbo`: five UIO nodes, `zocl`, and
-   the `afi0` node.  It then checks that every UIO device holds the
-   interrupt the overlay gives it; a device that kept an old one is rebound
-   once.
+5. It applies the device-tree overlay (`design_cormorant.dtbo`): five UIO
+   nodes, `zocl`, and the `afi0` node.  It then checks that every UIO
+   device holds the interrupt the overlay gives it; a device that kept an
+   old one is rebound once.
 6. It writes the AFI port-width registers last, because applying the overlay
    resets them (§8.6).
 
@@ -496,8 +498,8 @@ never debugged over SSH.
 
 ### 4.1 On-chip memory budget
 
-In-context utilization per instance, from the routed design
-(`report_utilization -hierarchical`):
+In-context utilization per instance, from the routed design of
+`de968ccc45da` (2026-10-15; `report_utilization -hierarchical`):
 
 | instance | LUT | of which LUTRAM | SRL | FF | RAMB36 | RAMB18 | URAM | DSP |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -513,9 +515,13 @@ In-context utilization per instance, from the routed design
 | `axi_x_intercon` (HP2) | 69 | 0 | 0 | 312 | 0 | 0 | 0 | 0 |
 | **design** | **89 547** | **18 620** | **1 212** | **108 713** | **116** | **40** | **55** | **841** |
 
+On `04259a7af917` the RowOpsKernel holds 35 337 LUTs (4 314 LUTRAM, 695
+SRL), 28 673 FFs, 6 RAMB36, 9 URAMs and 133 DSPs; the design's totals are
+in §8.5.
+
 Every RAM is inferred from RTL (`report_ram_utilization`: 100 % inferred,
 no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
-`(* rom_style *)` attributes (33 in the RTL).  The rule is:
+`(* rom_style *)` attributes (39 in the RTL).  The rule is:
 - block RAM for FIFOs deep enough to cover the DDR latency;
 - URAM for large single-purpose stores;
 - distributed RAM for shallow or wide-and-shallow buffers that need an
@@ -541,16 +547,16 @@ no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
 | | line buffer | 16 channel banks × 16 rows × 64 columns × 16, two copies | BRAM | | the next output row loads beside the window reads |
 | | column, weight-vector FIFOs | 256 × 256, 512 × 256 | BRAM | SDP | |
 | | transposer | 8 banks × 1024 × 16 | BRAM | | output-channel-major to NCHW |
-| | patch FIFO, replay file, row buffer, bias RAM, y FIFOs | 64 × 512; 2 × 64 × 256; 16 × 32 × 128; 2 × 128 × 128; 32 × 145 + 8 × 68 | LUTRAM | async read | |
+| | patch FIFO, replay file, row buffer, bias RAM, y FIFOs | 64 × 512; 2 × 64 × 256; 16 × 32 × 128; 2 × 128 × 128; 32 × 145 + 8 × 52 | LUTRAM | async read | |
 | | operand skew | none in SRLs | weight-cache read addresses, DSP A registers | | weight lane l reaches DSP l l + 1 cycles late: group k of 4 lanes reads its RAM 4k cycles later, the A1 / A2 / AD registers add the rest; the patch lanes through register copies into the B port |
 | Pool | read FIFO | 256 × 128 | BRAM | SDP | |
 | | line buffer | 8 channels × 8 column banks × 16 rows × 8 words | LUTRAM | async read | window rows |
 | | row buffers, W / AW FIFOs, bundle FIFO | 2 × 8 banks; 32 × 145, 8 × 68; 32 × 32 | LUTRAM | | |
 | | reciprocal table | 64 × 24 | constant logic | | `round(2^23 / d)` for averages |
 | RowOps | parameter RAM | 2 × 4096 × 72 | URAM | port A loads, port B reads; 2-cycle read | per-column G, Bq', shifts (16 bytes per column) |
-| | sigmoid table | 4096 × 49, two copies | URAM | 2 ports each | MULACT's σ, interpolated |
+| | sigmoid table | 4096 × 49, four copies | URAM | 2 ports each | MULACT's and GATE's σ, interpolated |
 | | rsqrt table | 8192 × 32 (two per word) | URAM | | NORM's first reciprocal-sqrt estimate |
-| | norm ring | 2 × 4096 × 128 | URAM | | a row held between the sum pass and the emit pass |
+| | norm ring | 4096 × 128 (2 URAMs) | URAM | | a row held between the sum pass and the emit pass |
 | | read FIFO × 2, write FIFO | 256 × 128, 256 × 144 | BRAM | SDP | |
 | | transpose banks, RoPE buffers, output FIFOs | 8 × 128 × 128; 2 × 16 words; 32 × 128 | LUTRAM | async read | |
 
@@ -601,7 +607,8 @@ The depths follow three rules:
 | caching | the pool is mapped cacheable for the A53; the runtime cleans before a kernel reads and invalidates after a kernel writes; the R5's command ring is uncached |
 
 The chat server's model pools are 216 MiB (BERT), 299 MiB (SmolLM2-135M),
-758 MiB (SmolLM2-360M) and 495 MiB (SmolVLM-256M).  That is more than the
+758 MiB (SmolLM2-360M) and 495 MiB (SmolVLM-256M), beside Piper's 54 MiB
+and Moonshine base's 186 MiB.  That is more than the
 CMA area together, so the server keeps what fits resident and swaps the
 rest.  A large pool can fail to allocate after uploads and builds even with
 enough free CMA.  `inference-scheduler/src/remote/cma.py` drops the page
@@ -722,8 +729,8 @@ calibrate keep one bit of headroom.
 | MatmulKernel | 130 | 128 MACs (`mm_mac`: AREG = BREG = 2, CREG, MREG, PREG; `P = C + A · B`, the accumulator from LUTRAM through C, no cascade) + 1 per run generator |
 | ConvKernel | 518 | the MAC grid: 32 chains of 16 DSP48E2 in a PCIN / PCOUT cascade (2 pixels × 16 output channels × 16 input channels); the seed enters DSP 0's C port, DSP 15 accumulates over window positions; the weight on the A port (AREG = 2, and the AD register on lanes l % 4 ≠ 0: the end of its skew), the patch on the B port (BREG = 1), MREG = PREG = 1; the other 6 in control arithmetic, the configuration multiplier among them |
 | PoolingKernel | 29 | control arithmetic and the finaliser's multiplies (AVG reciprocal, LP2 Horner steps) |
-| RowOpsKernel | 129 | of which the stream ops 20 (32 × 25 and 39 × 17 products), RoPE 16, NORM 77 (44 × 32 emit product, `ro_mul32`), FOLD 8 (one reciprocal product per lane) |
-| **total** | **841 / 1 248** | |
+| RowOpsKernel | 133 | of which the stream ops 24 (32 × 25 and 39 × 17 products), RoPE 16, NORM 77 (44 × 32 emit product, `ro_mul32`), FOLD 8 (one reciprocal product per lane) |
+| **total** | **845 / 1 248** | |
 
 ConvKernel's chains are the only cascaded DSPs: a 16-deep partial-sum chain
 needs no fabric adder tree.  Its operands arrive skewed by the weight
@@ -741,7 +748,7 @@ cycle against Vivado's DSP48E2 unisim model (§7.1).
 | RowOps | ≤ 1 output word (4 × 32-bit) per cycle; NORM 4 elements per cycle; COPY and RoPE half the port rate; FOLD one 8-element source word per cycle | stream ops 21 stages; NORM emit 17; RoPE 10; FOLD 10 | ~2 µs per job | `max(words read, words written) + ~2 µs` |
 
 At system level, the latency budget of a kernel call includes the driver:
-- **From the A53:** the shortest measured call is 3.1 µs, register writes to
+- **From the A53:** the shortest measured call is 1.7 µs, register writes to
   done (the performance model's `call_overhead_us`).
 - **From the R5:** each call adds 1.0 µs.
 
@@ -790,9 +797,9 @@ against each kernel's package constants.
 |---|---|---:|---:|
 | VectorOPKernel | `0xA000_0000` | 7 | 13 |
 | MatmulKernel | `0xA001_0000` | 8 | 13 |
-| ConvKernel | `0xA002_0000` | 8 | 21 |
+| ConvKernel | `0xA002_0000` | 8 | 24 |
 | PoolingKernel | `0xA003_0000` | 8 | 19 |
-| RowOpsKernel | `0xA004_0000` | 7 | 19 |
+| RowOpsKernel | `0xA004_0000` | 7 | 21 |
 
 Every block has the HLS `ap_ctrl_hs` layout:
 
@@ -826,11 +833,11 @@ five lines are concatenated into `pl_ps_irq0[4:0]`:
 
 | kernel | `pl_ps_irq0` bit | SPI | GIC id | used by |
 |---|---:|---:|---:|---|
-| VectorOPKernel | 0 | 89 | 121 | the R5's waits |
-| MatmulKernel | 1 | 90 | 122 | the R5's waits |
-| ConvKernel | 2 | 91 | 123 | the R5's waits |
-| PoolingKernel | 3 | 92 | 124 | the R5's waits |
-| RowOpsKernel | 4 | 93 | 125 | the R5's waits |
+| VectorOPKernel | 0 | 89 | 121 | the A53's and the R5's waits |
+| MatmulKernel | 1 | 90 | 122 | the A53's and the R5's waits |
+| ConvKernel | 2 | 91 | 123 | the A53's and the R5's waits |
+| PoolingKernel | 3 | 92 | 124 | the A53's and the R5's waits |
+| RowOpsKernel | 4 | 93 | 125 | the A53's and the R5's waits |
 
 Both processors use the same record, ISR bit 0 (IER bit 0 set), and raise
 GIE only while they wait.  The R5 sets GIE on a lane before the lane's first
@@ -906,7 +913,7 @@ Every level is checked bit-exactly against the level above it:
 | kernel RTL | each kernel | the reference model, in process | Verilator testbench (§7.2); ctest `Test<K>Rtl`, lint `-Wall` |
 | DSP primitives | ConvKernel's behavioural MAC chain | Vivado's DSP48E2 unisim model, cycle by cycle (199 899 cycles, 0 mismatches) | ctest `ConvRtlDsp` |
 | synthesised netlist | Matmul, VectorOP, Pool | their RTL in lockstep, in xsim | `neteq_<k>_rtl` (`tools/neteq`) |
-| packaged IP | each kernel's IP in the test stand's block design (PS VIP, interconnect, DDR model) | the checked-in fixtures | `behavior_test_<k>`, `sysim_<k>_rtl` (`hw/cormorant_test_stand`) |
+| packaged IP | each kernel's IP but the row-ops unit's, in the test stand's block design (PS VIP, interconnect, DDR model) | the checked-in fixtures | `behavior_test_<k>`, `sysim_<k>_rtl` (`hw/cormorant_test_stand`) |
 | whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 123 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
 | generated software | the generated C against software kernels | the scheduler's simulator | `inference-scheduler/test/host_emu.py`, also with incoherent caches |
 | the board | the bitstream and the libraries | the simulator's expectations, bit for bit | `run_remote_tests.py` (the model suite), every demo and library gate |
@@ -925,7 +932,7 @@ ConvKernel and the row-ops unit have no `neteq` target yet (§9).
 
 ```mermaid
 flowchart LR
-  FIX["fixtures<br/>hw/test_data, from the model's --dump-data"] --> GEN["job source<br/>fixtures, then seeded random jobs"]
+  FIX["fixtures<br/>hw/test_data, from the model's --dump-data<br/>(row-ops: scripts/gen_fixtures.py)"] --> GEN["job source<br/>fixtures, then seeded random jobs"]
   GEN --> DRV["AXI-Lite driver<br/>arguments, ap_start, ap_done"]
   GEN --> ORA["oracle<br/>C++ model in process"]
   DRV --> DUT["Verilated kernel"]
@@ -968,7 +975,7 @@ All builds use `--x-assign unique --x-initial unique`.
 | Matmul | 50 (11 GEMV) | 200 | random reset values (`+verilator+rand+reset+2`) |
 | Conv | 66 | 200 | zero-size and out-of-contract jobs |
 | Pool | 45 | 200 | board-like timing modes |
-| RowOps | 43 | 300 | 1 200 random over 4 seeds; after a TLOAD |
+| RowOps | 43 | 300 + 300 descriptor chains | 1 200 random over 4 seeds; after a TLOAD; 2 chain fixtures |
 
 Thousands more random jobs per kernel were run by hand at each timing mode
 during development (the kernel documents record them).
@@ -991,7 +998,7 @@ changes to the benches.
 ### 7.4 On-chip debug and observability
 
 The production design has no debug cores: no ILA, VIO or debug bridge, and
-no `mark_debug` nets.  With block RAM at 94 % and 20 ps of slack, an ILA
+no `mark_debug` nets.  With block RAM at 94 % and 27 ps of slack, an ILA
 would cost both.  Observability comes from what the system already exposes:
 
 | means | what it shows |
@@ -1048,7 +1055,7 @@ new register, while the hardware description and the drivers showed it.
 | user XDC | `cormorant_hw_128.srcs/constrs_1/new/kernel_clock.xdc` | `MAX_FANOUT 32` on the `s_ready_i_reg` of the `m00` register slices of `axi_interconnect_0` and `axi_rowops_intercon` |
 | I/O delays | — | none: the PL has no pins |
 | false paths, multicycle paths, clock groups, max delay | — | none: one clock domain, and `clk_pl_1` has no loads |
-| RTL attributes | `kernels/*_rtl/rtl/*.sv` | `(* keep *)` 58, `(* keep, max_fanout *)` 5, `(* max_fanout *)` 7, `(* ram_style *)` 31, `(* rom_style *)` 2, `(* shreg_extract *)` 4, `(* srl_style *)` 2, `(* use_dsp *)` 1 |
+| RTL attributes | `kernels/*_rtl/rtl/*.sv` | `(* keep *)` 59, `(* keep, max_fanout *)` 5, `(* max_fanout *)` 7, `(* ram_style *)` 37, `(* rom_style *)` 2, `(* shreg_extract *)` 4, `(* srl_style *)` 1, `(* use_dsp *)` 1 |
 
 The design is timed entirely by the single generated clock.  If a second PL
 clock is ever added, the constraints must gain:
@@ -1084,14 +1091,14 @@ Post-route, post-physical-optimisation, production bitstream:
 
 | metric | value |
 |---|---|
-| WNS (setup) | +0.029 ns |
+| WNS (setup) | +0.027 ns |
 | TNS | 0.000 ns |
 | WHS (hold) | +0.010 ns |
-| endpoints | 517 657 |
+| endpoints | 526 520 |
 | methodology | no timing or CDC warnings; ULMTCS-1 (control-set count warning), CLKC-40 and CLKC-56 (MMCM advisories) |
 
-The 20 worst setup paths are all within 0.029–0.089 ns, most of each path
-routing delay (60–97 %), and spread over:
+On `de968ccc45da` (2026-10-15) the 20 worst setup paths were all within
+0.029–0.089 ns, most of each path routing delay (60–97 %), and spread over:
 - the row-ops unit's transposer: its byte mask from the job's `aux`
   register (the worst path: a CARRY8 and a LUT4; FOLD reads the same
   register), its LUTRAM banks' data from the read port's output FIFO, and a
@@ -1101,6 +1108,13 @@ routing delay (60–97 %), and spread over:
 - ConvKernel's job configuration (`mp3` → `reach_h`), the transposer's
   enable and the replay file's write enable;
 - a PoolingKernel finaliser register and a VectorOP softmax DSP input.
+
+On `04259a7af917` they lie within 0.027–0.098 ns: ConvKernel's patch
+fan-out into the MAC grid (`g_ask` lv1 → lv2, the worst) and its weight
+cache's read registers, addresses and write enable; MatmulKernel's A-buffer
+writes, its read enable and a tap register (`u_xpf`); the row-ops unit's
+NORM lanes and control-register writes (`a3_paths.txt` in the archive,
+RPU_PLAN §14.10).
 
 The area pass moved the worst paths out of the HPC1 crossbar and ConvKernel's
 DSP-chain operand skew (on `1cedaf2ed816`: 0.020–0.061 ns over the
@@ -1121,6 +1135,8 @@ The slack history across production bitstreams at 250 MHz:
 | `f70ce632a97a` | ConvKernel x on HP2, line-buffer copies | +0.098 ns |
 | `1cedaf2ed816` | the RowOpsKernel on HP0 | +0.020 ns |
 | `de968ccc45da` | the row-ops unit's FOLD; the kernels' area pass (`doc/plans/AREA_PLAN.md`: −4.4 k LUT) | +0.029 ns |
+| `33a799febc56` | ConvKernel's y channel pattern; the row-ops unit's descriptor chains | +0.022 ns |
+| `04259a7af917` | the row-ops unit's GATE op and SCALE flag | +0.027 ns |
 
 The default implementation strategy missed 4 ns by tens of picoseconds.
 `build.tcl` therefore runs these directives:
@@ -1186,8 +1202,8 @@ The main repository pins their commits.  The kernels' RTL, packaging
 scripts and drivers live in the main repository.  Each production bitstream
 is archived with its build log, hardware description, timing and
 utilization reports and overlay in `/mnt/data/bitstreams/kv260_250_<id>/`.
-The local, untracked `bitstream_config_kv260.json` names the `.bit` the
-tools load.
+The local, untracked `inference-scheduler/bitstream_config_kv260.json` (from
+its `.json.example`) names the `.bit` the tools load.
 
 **Handoff artefacts:**
 
@@ -1196,7 +1212,7 @@ tools load.
 | `.bit` → `.bin` (header stripped, 32-bit words byte-swapped) | `upload_bitstream.py` | Linux FPGA manager |
 | `.hwh` | Vivado | the loader: the PS port widths, the PL0 frequency, the kernels' clock; the memory-topology xclbin |
 | xclbin (memory topology only) | `xclbinutil` via the loader | XRT `zocl`: the buffer objects |
-| `pl.dtbo` from `dts/kv260/cormorant.dts` | the build | Linux: UIO devices `fabric_vecop`, `fabric_matmul`, `fabric_conv`, `fabric_pool`, `fabric_rowops`; `zocl`; `afi0` |
+| `design_cormorant.dtbo` from `dts/kv260/cormorant.dts` | the build (`make dtbo_kv260_cormorant`) | Linux: UIO devices `fabric_vecop`, `fabric_matmul`, `fabric_conv`, `fabric_pool`, `fabric_rowops`; `zocl`; `afi0` |
 | AFI width registers (AFIFM `0xFD36_0000`–`0xFD3B_0000`, `0xFF9B_0000`; FPD SLCR) | the loader, after the overlay | the PS ports: 128-bit |
 | `.xsa` (`write_hw_platform -fixed -include_bit`) | `tools/rpu/write_xsa.tcl` | `tools/rpu/make_r5_bsp.py`: the R5's standalone BSP (`xparameters.h`, `libxil`), rebuilt when kernels, addresses or interrupts change |
 | C drivers | `kernels/<k>_rtl/scripts/gen_driver.py`, `make driver_<k>_rtl` | the generated model projects, the R5 firmware, the benchmarks |
@@ -1216,8 +1232,8 @@ A new bitstream is promoted to production in this order:
 
 ## 9. Known issues and open items
 
-- **Resource headroom** (§8.5).  BRAM 94 %, URAM 86 %, 99.5 % of the CLBs in
-  use, and +0.029 ns of slack.  The next kernel feature has to recover area or move
+- **Resource headroom** (§8.5).  BRAM 94 %, URAM 89 %, 99.8 % of the CLBs in
+  use, and +0.027 ns of slack.  The next kernel feature has to recover area or move
   storage to LUTRAM.
 - **`pl_clk1`** is enabled in the PS configuration and drives nothing.
 - **Clocking advisories.**  The MMCM could be a PLLE4 (CLKC-40) and has no

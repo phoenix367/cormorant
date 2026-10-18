@@ -1,7 +1,8 @@
 # VectorOPKernel — Optimization Log
 
 This document records performance investigation and optimization work on
-`kernels/vectorop/kernel/VectorOP.cpp`.  Each section describes one change,
+`kernels/vectorop/kernel/VectorOP.cpp` (now, without its pragmas, the C++ model
+`kernels/vectorop_rtl/model/src/VectorOP.cpp`).  Each section describes one change,
 the rationale, the HLS traps met on the way, and the measured HW
 behaviour-simulation (`make behavior_test_vectorop`) impact on the kv260
 RTL test stand (`hw/cormorant_test_stand/kernels/vector_op_test`).

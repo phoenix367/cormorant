@@ -7,7 +7,7 @@ machine without an FPGA.
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
 | 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1883 tests); the chat app (230 tests) |
-| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the four SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
+| 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the five SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
 | 5. **On-device performance** | KV260 over SSH, bitstream loaded | Raw kernel throughput / latency benchmarks |
@@ -81,7 +81,7 @@ tiny random Llama: decode / prefill / head entries, which imports
 
 Some tests run generated C on the host: `test/host_emu.py` compiles a
 project's `inference.c` + `test_inference.c` unchanged against software
-models of the VectorOP / Matmul / Conv drivers (register semantics of the
+models of the VectorOP / Matmul / Conv / RowOps drivers (register semantics of the
 kernels, executed at Start; no Pool model) and a malloc-backed buffer pool,
 runs it, and requires `test_inference PASSED` — the generated host-op code
 (in place on cacheable buffers and staged on non-cacheable ones, lookup
@@ -186,7 +186,7 @@ are in the kernel's reference.
 
 The SystemVerilog VectorOPKernel (`kernels/vectorop_rtl/`,
 [VECTOROP_RTL_KERNEL](../kernels/VECTOROP_RTL_KERNEL.md)) likewise:
-`TestVectorOpRtl` (in plain `make`) runs the 119 checked-in VectorOP
+`TestVectorOpRtl` (in plain `make`) runs the 212 checked-in VectorOP
 fixtures — the ones `TestVectorOpModel --dump-data` writes — plus 300 random
 jobs checked against the C++ model under randomised AXI timing;
 `VectorOpRtlDriver` checks the C driver's register table against the RTL;
@@ -200,11 +200,12 @@ the C++ model under randomised AXI timing; `PoolRtlDriver` checks the
 C driver's register table against the RTL; `make lint_pool_rtl` is its lint.
 
 The SystemVerilog RowOpsKernel (`kernels/rowops_rtl/`,
-[ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md); RTL only, not yet in
-the hardware build) has no C-simulation target: `TestRowOpsRtl` (in plain
+[ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md); in the hardware build
+since bitstream `1cedaf2ed816`) has no C-simulation target: `TestRowOpsRtl` (in plain
 `make`) runs the 43 checked-in RowOps fixtures — written by
 `scripts/gen_fixtures.py` from the Python specification
-`inference-scheduler/src/rowops_spec.py` — plus 300 random jobs checked
+`inference-scheduler/src/rowops_spec.py` — and the 2 descriptor-chain fixtures in `chains/`, plus
+300 random jobs and 300 random descriptor chains checked
 against the testbench's C++ port of that specification under randomised
 AXI timing, after a table-load job (the kernel's tables live in UltraRAM
 and are loaded from DDR once per bitstream; the fixtures' `tables.hex`);
@@ -213,7 +214,7 @@ and are loaded from DDR once per bitstream; the fixtures' `tables.hex`);
 
 The SystemVerilog ConvKernel (`kernels/conv_rtl/`,
 [CONV_RTL_KERNEL](../kernels/CONV_RTL_KERNEL.md)) likewise: `TestConvRtl`
-(in plain `make`) runs the 63 checked-in ConvKernel fixtures — the ones
+(in plain `make`) runs the 66 checked-in ConvKernel fixtures — the ones
 `TestConvModel --dump-data` writes — plus 200 random jobs checked against the
 C++ model under randomised AXI timing; `ConvRtlDriver` checks the C
 driver's register table against the RTL; `ConvRtlDsp` (when Vivado's
@@ -226,12 +227,12 @@ lint.
 ## 3. Hardware simulation (Vivado, no board)
 
 RTL behavioural simulation in Vivado xsim — no board required, but the
-per-kernel IPs (the four RTL kernels' packaging) must exist first.
+per-kernel IPs (the five RTL kernels' packaging) must exist first.
 
 ```bash
 cd build
 
-# Prerequisite: the four kernel IPs (the RTL kernels' packaging, a few minutes);
+# Prerequisite: the five kernel IPs (the RTL kernels' packaging, a few minutes);
 # Vitis's settings64.sh puts vivado and xclbinutil on PATH
 source <Xilinx>/2025.2/Vitis/settings64.sh
 make synthesize_kv260
@@ -242,7 +243,7 @@ make behavior_test_vectorop   # also: behavior_test_conv / _matmul / _pool
 make behavior_test            # all four in sequence
 
 # Block-design behavioural sim against the SystemVerilog testbench
-# (hw/cormorant_hw_128 submodule; ~3 min, all four kernels through the PS VIP)
+# (hw/cormorant_hw_128 submodule; ~8 min, all five kernels through the PS VIP)
 make sim_hw_kv260
 ```
 
@@ -257,9 +258,9 @@ kernel alone on the C-simulation fixtures.  They modify tracked
 files of the `hw/cormorant_test_stand` submodule (`.bd` / `.xci` / `.xpr`);
 do not commit them.
 
-**`sim_hw_kv260`** runs the whole block design (the four kernels, the
+**`sim_hw_kv260`** runs the whole block design (the five kernels, the
 interconnects, the PS VIP's DDR model) against constant-fill test cases
-in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
+(the RowOpsKernel: a table load, its checked-in fixtures and chains) in `hw/cormorant_hw_128/cormorant_hw_128.srcs/sim_1/new/`.  It ends with:
 
 ```
 ##########################################################
@@ -318,8 +319,8 @@ The two fields you must set are:
 - **`ssh.host`** — IP address or hostname of the KV260 (`"kv260.local"` in the example)
 - **`local.driver_dirs`** — paths on your host machine to the
   driver sources for each kernel (`make driver_matmul_rtl` /
-  `driver_vectorop_rtl` / `driver_conv_rtl` / `driver_pool_rtl` write
-  them, the RTL kernels' drivers with the HLS drivers' API; the example's
+  `driver_vectorop_rtl` / `driver_conv_rtl` / `driver_pool_rtl` /
+  `driver_rowops_rtl` write them, the RTL kernels' drivers with the HLS drivers' API; the example's
   `../build/…` paths, relative to `inference-scheduler/`, fit a build in
   `<repo>/build`), e.g.:
 
@@ -335,7 +336,7 @@ overlay all five names are `fabric_vecop`, `fabric_matmul`,
 `fabric_conv`, `fabric_pool` and `fabric_rowops`.  `run_remote_tests.py` keys the map by
 the scheduler's kernel names — `VectorOPKernel`, `MatmulKernel`,
 `ConvKernel`, **`PoolKernel`** (not `PoolingKernel`; the example uses
-these keys).
+these keys), `RowOpsKernel`.
 
 ```bash
 # Verify board prerequisites before running
@@ -357,7 +358,7 @@ For full SSH setup, config reference, and debugging guide see
 ### 4.x On-board correctness set — coverage added 2026-09-25
 
 The on-board set had **144 models** on 2026-09-25 (`remote_config.json.example`
-now lists 148: those plus the four tiny-BERT fixtures `bert_tiny_*`).  The
+now lists 159, the four tiny-BERT fixtures `bert_tiny_*` among the additions).  The
 18 added with the 128-bit port and packed-B work target what those changes
 touch:
 
@@ -388,7 +389,7 @@ only times how fast each kernel runs for a configurable set of
 parameter cases.
 
 The script uploads a single self-contained C benchmark project,
-builds all four kernel binaries in one pass, then runs each case
+builds all five kernel binaries in one pass, then runs each case
 and reports results. Kernels whose driver files are absent are not
 built (their cases fail), so benchmark only what is currently
 deployed with `--kernels` or `"enabled": false`.
@@ -414,7 +415,8 @@ the correctness configs with an additional `benchmarks` section.
   "VectorOPKernel": { "enabled": true, "warmup": 10, "cases": [ ... ] },
   "MatmulKernel":   { "enabled": true, "warmup": 10, "cases": [ ... ] },
   "ConvKernel":     { "enabled": true,  "warmup": 10, "cases": [ ... ] },
-  "PoolingKernel":  { "enabled": true,  "warmup": 10, "cases": [ ... ] }
+  "PoolingKernel":  { "enabled": true,  "warmup": 10, "cases": [ ... ] },
+  "RowOpsKernel":   { "enabled": true,  "warmup": 10, "cases": [ ... ] }
 }
 ```
 
@@ -423,9 +425,9 @@ across the five kernels (18 VectorOPKernel, 24 MatmulKernel — including
 row-major / packed-B twins of the FC and classifier shapes, `b_packed`
 case field, MATMUL_OPTIMISATION §3b, and GEMV twins, `gemv_kw` case
 field, §8b — 10 ConvKernel, 11 PoolingKernel, 9 RowOpsKernel: the row-ops unit's
-LayerNorm / RMSNorm / residual add / SiLU·up / copy shapes of the shipped models, doc/plans/HOSTOPS_PLAN.md).
+LayerNorm / RMSNorm / residual add / SiLU·up / copy / RoPE / transpose shapes of the shipped models, doc/plans/HOSTOPS_PLAN.md).
 
-VectorOPKernel `op` values outside the supported range (0..5) are
+VectorOPKernel `op` values outside the supported range (0..11) are
 rejected when the cases are loaded, before any case runs (right
 after the config, before it connects to the board) — see the *Case fields*
 reference in `REMOTE_TESTING.md`.
@@ -536,7 +538,7 @@ debugging guide see the *Performance Benchmarking* section of
 
 ## UIO device names
 
-After loading the `design_cormorant.dtbo` overlay the four kernels
+After loading the `design_cormorant.dtbo` overlay the five kernels
 appear as:
 
 | Kernel | UIO sysfs name |

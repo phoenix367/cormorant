@@ -47,7 +47,7 @@ fixtures; §8–§10 cover edge cases, invariants, and future work.
 The current scheduler models **one lane per kernel type** —
 VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel (the
 `KERNEL_REGISTRY` key in `src/kernels.py`; the C++ kernel class is
-PoolingKernel) — and assumes exactly one driver instance per lane. This is a framework limitation, not a hardware
+PoolingKernel), RowOpsKernel — and assumes exactly one driver instance per lane. This is a framework limitation, not a hardware
 constraint: a bitstream could in principle provide several Conv IPs at
 distinct AXI-Lite base addresses, and reflecting that would require a
 per-instance `pending` map and a node→instance assignment policy (see
@@ -83,10 +83,11 @@ dataclasses (not subclasses of `ScheduledNode`) that share a
 
 | Class           | `kernel_name`        | Lane                |
 |-----------------|----------------------|---------------------|
-| `ScheduledNode` | `"VectorOPKernel"`   | `KERNEL_VECTOROP`   |
+| `ScheduledNode`; the `SmxVopNode` family, `VitGeluVopNode`, `TtsAddVopNode`, `StereoVopNode` | `"VectorOPKernel"`   | `KERNEL_VECTOROP`   |
 | `MatmulNode`    | `"MatmulKernel"`     | `KERNEL_MATMUL`     |
 | `ConvNode`, `MatmulConvNode`, `LlmAttnConvNode` | `"ConvKernel"` | `KERNEL_CONV` |
 | `PoolNode`      | `"PoolKernel"`       | `KERNEL_POOL`       |
+| the `RowOpsNode` family | `"RowOpsKernel"` | `KERNEL_ROWOPS` |
 | `ReshapeNode`   | `""` (none)          | —                   |
 | `SpaceToDepthNode`, `HostNode` family (incl. the `axi.llm` `LlmNode`s and `VitNode`s) | `""` (none) | — (host CPU) |
 
@@ -94,7 +95,9 @@ dataclasses (not subclasses of `ScheduledNode`) that share a
 `Flatten` / `Identity` (collectively `RESHAPE_OP_TYPES`) and a `Cast`
 within one storage kind. It emits no kernel call; its output buffer is a
 pointer alias of its input.  A `SliceNode` chosen as a sub-buffer view
-behaves the same way (`_is_alias_node`).
+behaves the same way, and so does an `LlmAttnMergeNode` merged in place
+(its inputs are pieces of its output, written by the P·V calls;
+`_is_alias_node`).
 
 ### 2.2 Tensors
 
@@ -106,7 +109,8 @@ Three flavours, distinguished at DAG construction:
   ordered by the state edges of §3.1).
 - **Intermediate** — produced by some node, consumed by zero or more.
   Candidates for buffer-pool reuse.
-- **Alias** — output of a `ReshapeNode` or a Slice view. Excluded from the
+- **Alias** — output of a `ReshapeNode` or a Slice view, or an input of an
+  in-place attention merge. Excluded from the
   buffer pool (it shares its source's slot). Its onnx-name is in
   `_alias_source_map()` (`_reshape_aliases` / `_view_aliases`).
 
@@ -505,7 +509,8 @@ for name, (start_ei, end_ei) in sort_by_start_then_neg_alloc(intervals):
 ```
 
 Each slot is padded up to a 64-byte boundary so every sub-buffer is
-cache-line aligned. Weights are placed before the slot region in
+cache-line aligned; a slot of 64 KiB or more starts on a 4 KiB page of the
+pool (`bank_phase.page_start`). Weights are placed before the slot region in
 declaration order (they live for the entire call and never share),
 followed by the DMA states (persistent across calls, never shared).
 Host-memory intermediates (`axi.numeric` `host` tensors) are coloured the

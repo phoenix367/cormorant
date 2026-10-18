@@ -61,9 +61,9 @@ static: the I/O names and active-kernel set differ per model.
 
 * Python 3.10+
 * `pip install -r requirements.txt`
-* Generated driver sources for the four kernels (ConvKernel's by its HLS
-  synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's by
-  `driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`).  These
+* Generated driver sources for the four kernels (the RTL kernels' by
+  `driver_conv_rtl` / `driver_matmul_rtl` / `driver_vectorop_rtl` /
+  `driver_pool_rtl`).  These
   are produced by the top-level CMake build:
 
   ```bash
@@ -75,7 +75,7 @@ static: the I/O names and active-kernel set differ per model.
 
   The driver sources only describe the kernels' AXI-Lite registers, so they
   are the same for every `AXI_BUS_WIDTH`; the bitstream on the board is the
-  128-bit block design (`-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`), which
+  128-bit block design (`make build_hw_kv260`), which
   the sample numbers below were measured with.
   The default `mnist_config.json.example` assumes the standard build paths;
   override `local.driver_dirs` if you keep the build elsewhere.
@@ -84,7 +84,7 @@ static: the I/O names and active-kernel set differ per model.
 
 * Linux with the cormorant bitstream and overlay loaded
   (`inference-scheduler/upload_bitstream.py`, see the root README), so the
-  four UIO devices appear.  Verify on the board:
+  five UIO devices appear.  Verify on the board:
 
   ```bash
   cat /sys/class/uio/uio*/name
@@ -125,7 +125,9 @@ Or step-by-step (lets you iterate without re-downloading):
 
 Sample output (host `~/projects/axi_demo/demo/mnist`, board at
 `192.168.100.8`, full 10 000-image MNIST test set; the run of 2026-10-05 on
-bitstream `dbb320fb7297`, without `--verbose`, so no per-model bench lines):
+bitstream `dbb320fb7297` at 100 MHz, without `--verbose`, so no per-model
+bench lines; the summary table at the end is the run of 2026-10-06 on
+bitstream `986cef4866a0` at 250 MHz, `doc/plans/FMAX_250_PLAN.md`):
 
 ```
 $ ./run_demo.py
@@ -316,7 +318,7 @@ Edit `mnist_config.json`:
 * **`gdown failed`** — Google Drive sometimes throttles.  Run
   `python3 -m gdown --folder <url> -O assets/models/` manually, or download
   the `.onnx` files via a browser and place them in `assets/models/`.
-* **`Driver file not found: driver/xconvkernel.h`** during cmake — the HLS
+* **`Driver file not found: driver/xconvkernel.h`** during cmake — the kernel
   driver sources weren't on this host.  Either run `make synthesize_kv260`
   in the repo build, or point `local.driver_dirs` at an existing build
   output.

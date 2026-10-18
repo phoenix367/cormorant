@@ -1,5 +1,5 @@
 ---
-description: Run the KV260 performance tests and say whether anything regressed — the 72 kernel benchmarks of run_remote_perf.py (VectorOP, Matmul, Conv, Pool) and, optionally, the MNIST / image-classification / BERT-SQuAD demo latencies — compared case by case with the recorded baseline of the loaded bitstream (baselines/<platform>-<bitstream-id>.json): latency moves above 2 %, failed cases and changed demo results are flagged, a new baseline is recorded on request. Use when asked to run the perf tests or check for a performance regression, after a kernel, bitstream or scheduler change that is already correct on the board, and before quoting board numbers in an optimisation log.
+description: Run the KV260 performance tests and say whether anything regressed — the 72 kernel benchmarks of run_remote_perf.py (VectorOP, Matmul, Conv, Pool, RowOps) and, optionally, the MNIST / image-classification / BERT-SQuAD demo latencies — compared case by case with the recorded baseline of the loaded bitstream (baselines/<platform>-<bitstream-id>.json): latency moves above 2 %, failed cases and changed demo results are flagged, a new baseline is recorded on request. Use when asked to run the perf tests or check for a performance regression, after a kernel, bitstream or scheduler change that is already correct on the board, and before quoting board numbers in an optimisation log.
 allowed-tools: Bash Read
 ---
 
@@ -21,9 +21,9 @@ STAMP=$(date +%Y%m%d_%H%M)
 
 - `inference-scheduler/perf_config.json` exists (local, gitignored copy of
   `perf_config.json.example`: the board's UIO names `fabric_vecop` /
-  `fabric_matmul` / `fabric_conv` / `fabric_pool`, the local driver dirs:
+  `fabric_matmul` / `fabric_conv` / `fabric_pool` / `fabric_rowops`, the local driver dirs:
   the `driver_vectorop_rtl` / `driver_matmul_rtl` / `driver_conv_rtl` /
-  `driver_pool_rtl` outputs).
+  `driver_pool_rtl` / `driver_rowops_rtl` outputs).
 - The kernels are CORRECT on the board (board-deploy §3).  This skill
   measures speed only; a wrong result is not a perf question.
 - Nothing else uses the board.  **Never two board jobs at once** — every

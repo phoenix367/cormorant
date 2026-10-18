@@ -31,7 +31,8 @@ Paths below are relative to `inference-scheduler/` unless noted.
 **Dispatch** (`OnnxGraph.__init__` in `src/graph.py`):
 
 - Domain `axi.llm` goes to
-  `{**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES}`.
+  `{**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES, **STEREO_OP_FACTORIES,
+  **ASR_OP_FACTORIES}` and the row-ops unit's `rowops_nodes.*_OVERRIDES` over them.
 - Otherwise `HOST_OP_FACTORIES` is checked **before** MatMul, Conv, Pool,
   Reshape and VectorOP. Never register an op_type that a kernel runs.
 - A factory may return another node class. For example, `make_cast_node`
@@ -40,10 +41,11 @@ Paths below are relative to `inference-scheduler/` unless noted.
 **Two restrictions:**
 
 - `numeric.check` allows exponent tensors only on MatMuls, on Convs (one
-  exponent per tensor), on Reshape aliases with equal exponents, and on
-  `LlmNode` subclasses and
+  exponent per tensor), on Reshape aliases with equal exponents, on
+  Concat / Transpose copies with one exponent shared by every input and the
+  output, and on `LlmNode` subclasses and
   `is_llm_op` kernel nodes. Host tensors and states are allowed only on the
-  last two. A standard `HostNode` therefore sees Q8.8 values only.
+  last two. Any other standard `HostNode` therefore sees Q8.8 values only.
 - `_check_integer_inputs`: only host ops and buffer aliases may read an
   integer tensor (`t.is_int`, raw int16). A float-only op calls
   `self._reject_int(t)`.
@@ -429,7 +431,7 @@ threads; without it only thread 0 runs.
 ## 9. Docs to update
 
 - `doc/scheduler/INFERENCE_SCHEDULER.md`:
-  - the "Host-CPU ops" bullets (~l. 48);
+  - the "Host-CPU ops" bullets (~l. 198);
   - §Host-CPU ops table, §Pattern fusion table, the §Llama-family decoders
     "Host ops" table and §Vision encoders;
   - the test count.
@@ -439,9 +441,9 @@ threads; without it only thread 0 runs.
   the Node Classes paragraph, and the test count.
 - Other op lists:
   - `README.md` (~l. 99)
-  - `inference-scheduler/doc/USER_GUIDE.md` (~l. 181)
-  - `inference-scheduler/doc/ARCHITECTURE.md` (l. 123, plus the mermaid
-    edge at ~l. 322)
+  - `inference-scheduler/doc/USER_GUIDE.md` (~l. 215)
+  - `inference-scheduler/doc/ARCHITECTURE.md` (~l. 202, plus the dispatch
+    table at ~l. 430)
   - `inference-scheduler/doc/SCHEDULER_DAG.md` (~l. 414)
 - The plan doc that motivated the op (BERT_PLAN, CHAT_PLAN or
   `<MODEL>_PLAN`): the op, its gates and its board time.

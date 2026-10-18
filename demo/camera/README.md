@@ -33,7 +33,7 @@ flowchart LR
 > **Frame rate.** The pipeline keeps one frame in flight, so the display rate
 > is bounded by the per-frame inference time.  The transcript below (May 2026)
 > was recorded with an early ConvKernel: 2.46 s per frame, ~0.4 FPS.  The
-> current kernels run MobileNetV1 in ~73 ms (the
+> current kernels run MobileNetV1 in ~20.5 ms (the
 > [`image_classification/`](../image_classification/) demo); the camera demo
 > has not been re-measured with them, and at that speed the capture,
 > preprocessing, JPEG encoding and the host's SFTP pull
@@ -91,9 +91,9 @@ expensive. So the board runs a **persistent** inference host:
 * Python 3.10+, `pip install -r requirements.txt`
   (gdown, numpy, onnx, onnxsim, paramiko, **opencv-python** for the display
   window — a headless host can use `--save-only` instead).
-* Generated driver sources for the kernels (ConvKernel's by its HLS synthesis;
-  the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's by
-  `driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`):
+* Generated driver sources for the four kernels (the RTL kernels' by
+  `driver_conv_rtl` / `driver_matmul_rtl` / `driver_vectorop_rtl` /
+  `driver_pool_rtl`):
 
   ```bash
   # from the repo root
@@ -104,7 +104,7 @@ expensive. So the board runs a **persistent** inference host:
 
   The driver sources only describe the kernels' AXI-Lite registers, so they
   are the same for every `AXI_BUS_WIDTH` (the bitstream on the board is the
-  128-bit block design, `-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`).
+  128-bit block design, `make build_hw_kv260`).
   Override `local.driver_dirs` if you keep the build tree elsewhere.
 
 ### KV260 board
@@ -282,7 +282,7 @@ Notable behaviour visible in the run:
   measurement* below for the fallback chain.
 - **Per-frame inference latency ≈ 2.46 s** in this run — the
   image-classification demo's MobileNetV1 time with the ConvKernel of
-  that date (it is ~73 ms now); the pipeline is one-frame-in-flight,
+  that date (it is ~20.5 ms now); the pipeline is one-frame-in-flight,
   so display refresh capped at ~0.4 fps.
 
 ### Power measurement

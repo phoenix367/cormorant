@@ -8,9 +8,9 @@ kernels:
   aggregation, the stripe attention and the polyphase deconvolutions.
 - **VectorOPKernel** runs ReLU6 / LeakyReLU, the residual adds and the
   attention product, and both softmaxes on its softmax unit.
-- **MatmulKernel** runs the disparity regression.
 - **The host** runs the correlation volume, the instance norms and the
-  context upsampling, as C code inside the library.
+  disparity regression with the context upsampling, as C code inside the
+  library.
 
 The network is compiled from the checkpoint by the scheduler's LightStereo
 frontend (`inference-scheduler/src/stereo.py`).  Every tensor carries a
@@ -53,7 +53,9 @@ What it needs:
 - the board set up as in the top-level README, with the production bitstream
   loaded (the softmax unit: `8599aa7a5f12` or later);
 - the kernels' driver sources: `make driver_vectorop_rtl driver_matmul_rtl
-  driver_conv_rtl` in `build/`, referenced by `local.driver_dirs`.
+  driver_conv_rtl` in `build/`, referenced by `local.driver_dirs`;
+- Pillow in the scheduler's virtualenv (`$PY -m pip install Pillow`; it is
+  not in `inference-scheduler/requirements.txt`).
 
 No torch is needed: the frontend reads the PyTorch checkpoint with the
 standard library, and the exponents come from the checked-in
@@ -92,14 +94,15 @@ USB 2, 5000M / 10000M is USB 3.
 
 ## Results (KV260, bitstream `f70ce632a97a`, 2026-10-10)
 
-**Speed.**  At 640 × 480 a pair takes **466 ms (2.15 FPS)** — 599 ms on
+**Speed.**  At 640 × 480 a pair takes **466 ms (2.15 FPS)** (`1cedaf2ed816`,
+2026-10-12) — 599 ms on
 `8599aa7a5f12` (2026-10-09), before ConvKernel's x read port left the
 coherent interconnect for `S_AXI_HP2_FPD` and its line-buffer loads were
 overlapped with the window reads (DEPTHWISE_PLAN §8: the depthwise and 1 × 1
 layers 27–67 % faster).  At 320 × 256
-(`run.height` / `run.width`) it takes 160 ms (6.3 FPS), with coarser
-disparities.  Most of the time goes to the MobileNetV2-style layers: 1 × 1
-convs 165 ms, depthwise convs 176 ms, ReLU6 55 ms (the profile is in
+(`run.height` / `run.width`) it takes 160 ms (6.3 FPS, on `8599aa7a5f12`),
+with coarser disparities.  Most of the time goes to the MobileNetV2-style
+layers: 1 × 1 convs 165 ms, depthwise convs 176 ms, ReLU6 55 ms (the profile is in
 STEREO_PLAN §4.3 and §4.5).  The depthwise convs run as 16- / 32- /
 64-channel calls where that is faster (`--dw-slice`, STEREO_PLAN §4.5):
 659 ms per pair before.

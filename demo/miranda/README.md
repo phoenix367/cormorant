@@ -261,7 +261,8 @@ A session goes through four states:
 
 Miranda needs the chat server on the board (`demo/chat`, [Deploying](../chat/doc/DEPLOY.md))
 with a speech-to-text, a chat and a text-to-speech model: `moonshine`,
-`smollm2` and `piper` in `server.backends` of `demo/chat/chat_config.json`.
+`smollm2-360m` (`smollm2` for SmolLM2-135M) and `piper` in `server.backends`
+of `demo/chat/chat_config.json`.
 
 ```bash
 PY=inference-scheduler/.venv/bin/python

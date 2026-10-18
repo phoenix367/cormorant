@@ -22,11 +22,11 @@ project that drives the IP through the auto-generated Xilinx driver APIs.
 
 | Kernel | ONNX ops handled | Notes |
 |--------|-----------------|-------|
-| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)`; `LeakyRelu`, SiLU (`x · Sigmoid(x)`), `Gelu` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` / activation; LeakyReLU, SiLU and GELU run in the activation unit when the platform has it (`kernels.vectorop.activations`, `src/vectorop_act.py`, [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — a `Gelu` it cannot run stays a host op |
+| **VectorOPKernel** | `Add`, `Sub`, `Mul`, `Div`, `Relu`, `Clip(0,6)`; `LeakyRelu`, SiLU (`x · Sigmoid(x)`), `Gelu`; `Softmax` | 1-D element-wise, 8 elements/cycle on 128-bit ports; `act` register fuses a following `Relu` / `Clip(0,6)` / activation; LeakyReLU, SiLU and GELU run in the activation unit when the platform has it (`kernels.vectorop.activations`, `src/vectorop_act.py`, [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — a `Gelu` it cannot run stays a host op; a Q8.8 `Softmax` in the softmax unit when the platform has it (`kernels.vectorop.softmax`, `src/smx_nodes.py`, [§Host-CPU ops](#host-cpu-ops)) |
 | **MatmulKernel** | `MatMul` | Tiled 2-D matrix multiply — the MatMuls the ConvKernel lowering does not take (batch-1 FC layers, `K % 16 ≠ 0`, `M % 8 ≠ 0`, fewer than 16 rows, 4D×3D outer loops, or not estimated faster); B in ConvKernel's image where that is faster or the weight's shared layout (on the HLS kernel of older bitstreams: single-row MatMuls) — its GEMV / image path ([§MatMul GEMV streaming](#matmul-gemv-streaming)) |
 | **ConvKernel** | `Conv`; `MatMul` (lowered) | 2-D NCHW convolution with optional bias, `group = 1` or depthwise (`group = in_ch`); also runs MatMuls with swapped operand roles ([§MatMul on ConvKernel](#matmul-on-convkernel)) |
 | **PoolingKernel** | `MaxPool`, `AveragePool`, `LpPool`, `GlobalMaxPool`, `GlobalAveragePool`, `GlobalLpPool` | 2-D NCHW pooling |
-| **RowOpsKernel** (the row-ops unit, where the platform has it) | `LayerNormalization`; the frontends' `LlmResAdd` / `LlmRMSNorm` / `LlmSiluMul`, `VitResAdd` / `VitLayerNorm`, `TtsResAdd` / `TtsLayerNorm` | the host row ops in fixed point on int16 / int32 DMA rows ([§Hardware Kernels, the row-ops unit](#hardware-kernels)); not in the hardware build until [HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md) phase 3 |
+| **RowOpsKernel** (the row-ops unit, where the platform has it) | `LayerNormalization`, `Transpose` (int16 DMA tensors); the frontends' `LlmResAdd` / `LlmRMSNorm` / `LlmSiluMul`, `VitResAdd` / `VitLayerNorm`, `TtsResAdd` / `TtsLayerNorm` | the host row ops in fixed point on int16 / int32 DMA rows ([§Hardware Kernels, the row-ops unit](#hardware-kernels)); not in the hardware build until [HOSTOPS_PLAN](../plans/HOSTOPS_PLAN.md) phase 3 |
 
 **Zero-cost transformations (no hardware call):**
 - `Reshape`, `Squeeze`, `Unsqueeze`, `Flatten`, `Dropout`, `Identity`
@@ -232,6 +232,11 @@ sources, reversed channels and a finer output exponent stay host ops.
   `StereoCorrelation` and `StereoUpsample` as host ops.  The graph comes
   from `src/stereo.py` ([§Stereo depth (LightStereo)](#stereo-depth-lightstereo)).
   This is what runs LightStereo-S — `STEREO_PLAN.md` §4.
+- **Speech-to-text ops** (domain `axi.llm`, `src/asr_nodes.py`) — `AsrFrames`,
+  `AsrStemNorm`, `AsrStemGelu`, `AsrFrameCount`, `AsrArgmax` as host ops and
+  `AsrCrossPrep` / `AsrCrossQ` / `AsrSwiGLU` as row-ops nodes; the entries
+  come from `src/moonshine.py` ([§Speech to text (Moonshine)](#speech-to-text-moonshine)).
+  This is what runs Moonshine tiny / base — `ASR_PLAN.md` §4–§7.
 - **Space-to-depth stem** — a stride-2 `Conv` whose input has
   `4·C ≤ kTileIC` channels (C ≤ 4 on the KV260; the RGB stem of ResNet-18 /
   MobileNet-style nets) is rewritten as `SpaceToDepth(blocksize=2)` +
@@ -272,11 +277,14 @@ python3 -m venv .venv
 .venv/bin/python test/gen_parallel_models.py    # parallel + NOP corner-case fixtures
 .venv/bin/python test/gen_bert_models.py        # tiny BERT-like models (host ops, fusion)
 .venv/bin/python test/gen_llama_models.py       # tiny random Llama (decoder ops, exponents)
+.venv/bin/python test/gen_activation_models.py  # LeakyRelu / SiLU / Gelu (activation unit)
+.venv/bin/python test/gen_softmax_models.py     # Softmax (softmax unit)
 # (or all of the above at once: .venv/bin/python test/gen_all_models.py)
 
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
-# ... planned from the bitstream's performance model (§Planning)
+# ... planned from the bitstream's performance model (§Planning; without the .bit that
+# bitstream_config_kv260.json names, add --perf-model perf_models/kv260/04259a7af917.json)
 .venv/bin/python inference_scheduler.py model.onnx --plan --out-dir /tmp/out
 
 # A multi-entry project: one library, inference_run_<name>() per graph,
@@ -330,6 +338,12 @@ inference_scheduler.py          CLI, argument parsing
     ├── stereo.py, stereo_nodes.py
     │                           LightStereo-S frontend (checkpoint + formats
     │                           -> one graph) and its axi.llm ops
+    ├── moonshine.py, asr_nodes.py
+    │                           Moonshine speech-to-text frontend (`encode_<T>`,
+    │                           `decode` entries) and its axi.llm ops
+    ├── rowops_spec.py, rowops_nodes.py
+    │                           the row-ops unit's integer specification and
+    │                           its kernel nodes (RowOpsKernel)
     ├── fusion.py               Constant folding, Split lowering, LayerNorm /
     │                           GELU fusion, constant-broadcast normalisation
     ├── matmul_lowering.py      MatMul -> ConvKernel engine choice, geometry, row split
@@ -394,8 +408,9 @@ inference_scheduler.py          CLI, argument parsing
    lists).  Dispatch each node to `MatmulNode` / `ConvNode` / `PoolNode` /
    `ReshapeNode` / `SpaceToDepthNode` / `ScheduledNode` / a host node
    (`host_nodes.HOST_OP_FACTORIES`, or `llm_nodes.LLM_OP_FACTORIES`,
-   `vit_nodes.VIT_OP_FACTORIES`, `tts_nodes.TTS_OP_FACTORIES` and
-   `stereo_nodes.STEREO_OP_FACTORIES` for the `axi.llm` domain) based on
+   `vit_nodes.VIT_OP_FACTORIES`, `tts_nodes.TTS_OP_FACTORIES`,
+   `stereo_nodes.STEREO_OP_FACTORIES` and `asr_nodes.ASR_OP_FACTORIES` for
+   the `axi.llm` domain) based on
    `op_type`; kernel nodes reading an integer tensor are rejected; then
    `numeric.check` (only MatMuls, Convs, Concat / Transpose copies and the
    LLM / TTS / stereo ops touch exponent tensors, only those ops host / state
@@ -552,8 +567,8 @@ every entry's groups and each entry's intermediates against its own and the
 weights' phases.  `INFERENCE_BUF_POOL_SIZE_BYTES` covers the laid-out pool.
 Bit-exact by construction — only addresses move (`test/test_bank_phase.py`:
 the phases, the old packing with `bank_phase=False`, the growth bound, a
-multi-entry project, the host emulation).  ResNet-18: 25 groups, all distinct,
-+4 KB of pool; MobileNet v2: 43 groups, +0 KB.
+multi-entry project, the host emulation).  ResNet-18: 17 groups, all distinct,
++16 KB of pool; MobileNet v2: 43 groups, +0 KB.
 
 **Pages.**  Every slot of 64 KiB or more — weights, states and
 intermediates alike, with bank phases on or off — starts on a 4 KiB page of
@@ -1804,7 +1819,8 @@ style of a GPU profiler (Nsight Systems); the figure in
 
 The same options (`planning.add_plan_args`) are taken by
 `inference_scheduler.py`, `demo/chat/scripts/generate_llm_project.py` and
-the four demo `generate_project.py` scripts (or `"plan"` in their config
+the MNIST, image-classification, camera and BERT demos' `generate_project.py`
+scripts (or `"plan"` in their config
 JSON); `demo/chat/deploy.py --regenerate --plan` plans the BERT project.
 
 The simulator predicts SmolVLM, SmolLM2, BERT and the CNN demos within 2 %
@@ -1857,7 +1873,8 @@ typedef uint16_t Data_t;              // ap_fixed<16,8>
 int  inference_init(const char *vectoropkernel_instance
                     [, const char *matmulkernel_instance]
                     [, const char *convkernel_instance]
-                    [, const char *poolkernel_instance]);
+                    [, const char *poolkernel_instance]
+                    [, const char *rowopskernel_instance]);
 // Bare metal: the same parameters are the kernels' AXI-Lite base addresses (UINTPTR;
 // INFERENCE_RPU_INIT_ARGS names them from the BSP's xparameters.h), and
 // inference_buf_pool_set(base, bytes) gives the DMA buffers their region.
@@ -1910,12 +1927,14 @@ Build / run-time knobs of the generated project:
 | `-DINFERENCE_IRQ_EARLY_US_DEFAULT=N` | `INFERENCE_IRQ_EARLY_US=N` / `off` | 100 | the early wake: the timed sleep ends this long before the call's predicted end (< 0 / `off`: no early wake) |
 
 BERT-base (`bertsquad-12-simplified.onnx`, CLI defaults — 96 MatMuls on
-ConvKernel, 2 on MatmulKernel) for example:
+ConvKernel, 2 on MatmulKernel, the 25 LayerNorms and 48 transposes on the
+row-ops unit) for example:
 
 ```c
 int  inference_init(const char *vectoropkernel_instance,
                     const char *matmulkernel_instance,
-                    const char *convkernel_instance);
+                    const char *convkernel_instance,
+                    const char *rowopskernel_instance);
 void inference_run(inference_buf_t *unique_ids_raw_output_9_0,   /* int64 [1]      */
                    inference_buf_t *segment_ids_0,               /* int64 [1, 256] */
                    inference_buf_t *input_mask_0,                /* int64 [1, 256] */

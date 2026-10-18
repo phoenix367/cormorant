@@ -20,7 +20,7 @@ cd demo/chat
 ../../.venv-export/bin/python scripts/vlm_study.py fetch     # checkpoint + COCO images (pinned hashes)
 ../../.venv-export/bin/python scripts/vlm_study.py formats   # text + vision exponents (~3 min)
 $PY scripts/generate_llm_project.py --model-name smolvlm-256m-instruct
-                                          # -> build/llm_project_smolvlm_256m (~90 s, 3.3 GiB RAM)
+                                          # -> build/llm_project_smolvlm_256m (~110 s, 3.3 GiB RAM)
 $PY deploy.py --stop                      # the server owns the FPGA
 $PY scripts/llm_board.py --project build/llm_project_smolvlm_256m --install-only
                                           # -> <dir>/lib/libsmolvlm_256m.so, /root/smolvlm_256m_weights

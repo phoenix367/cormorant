@@ -38,7 +38,7 @@ Stages, in the order the script keeps:
    profiles).  A MISMATCH is a bug in the generated C against the spec, not
    noise: fix, regenerate and regate that library only.
 3. **Top-up** (`--topup`): `perf_calibrate.py cases` / `run --resume` /
-   `fit`, refinement rounds until one adds no call, then `host --merge`
+   `fit`, refinement rounds until one adds no call (at most three), then `host --merge`
    with every profile the window produced (a new host-op kind is unpriced
    until this step).
 4. **Baseline** (`--baseline`): `run_remote_perf.py` and `compare_perf.py

@@ -38,8 +38,8 @@ policy that keeps the answers close to the float model's is
   two attention products, q·Kᵀ and P·V, run on ConvKernel in prefill and in
   decode (from position ~130 on that is faster than the exact host attention
   the libraries used before, `pow2+sink+p12+mix`: 135M 72.5 instead of
-  81.5 ms per token at position 1000); the softmax between them runs on the
-  host.
+  81.5 ms per token at position 1000); the softmax between them runs on
+  VectorOPKernel's softmax unit in prefill and on the host in decode.
 
 Greedy answers read like the float model's.
 
@@ -106,7 +106,7 @@ The steps, from the repo root:
    ```
 
 3. **Generate the library project** with the scheduler's virtualenv:
-   about 60 s and 3.1 GiB of RAM, giving `build/llm_project` with 326 MB of
+   about 60 s and 3.1 GiB of RAM, giving `build/llm_project` with 335 MB of
    `weights/*.dat`.
 
    ```bash
@@ -145,7 +145,7 @@ Notes on the tools:
   `assets/study/smollm2-135m-instruct/formats_pow2+sink+p12.provenance.json`
   (commit, script hash, date).  Do not commit it unless you recalibrate on
   purpose.
-- **`llm_board.py`** takes ssh, the driver directories and the board lock
+- **`llm_board.py`** takes ssh, the UIO devices and the board lock
   from `../bert_squad/bert_squad_config.json`.
   - **Where it installs.**  The library goes to `<dir>/lib/`, where
     `deploy.py` looks for it; `<dir>` is `remote.dir` of `chat_config.json`,
@@ -172,9 +172,10 @@ library, `libsmollm2_360m.so` (CHAT_PLAN §20): bit-exact on the board,
 with `chat.py`: the third answer recalls the name and the city given in the
 first message, which the 135M model did not manage on the same questions.
 
-- **Memory.**  Its pool is 758 MiB, so under `--resident auto` it swaps
-  with every other FPGA model, the 135M one included; only Piper stays
-  loaded beside it.  Both SmolLM2 sizes can still be served side by side:
+- **Memory.**  Its pool is 758 MiB, so under `--resident auto` it stays
+  loaded beside SmolLM2-135M, Moonshine and Piper (`cma=1400M`; with
+  `cma=1000M` only Piper stayed beside it) and swaps with BERT and SmolVLM.
+  Both SmolLM2 sizes can still be served side by side:
   they take turns on the FPGA.  A swap takes 1–2 s
   with the weights in the page cache.  The first load from the SD card
   takes 53 s for 360M and 21 s for 135M.
@@ -359,7 +360,7 @@ seeds 1 and 2):
 
 - **Side effects.**  Dropping the newline breaker left facts, markdown
   lists and code blocks unchanged.
-- **Cost.**  The sampler takes ~2.5 ms per token, ≈ 1 % of a decode step.
+- **Cost.**  The sampler takes ~2.5 ms per token, ≈ 5 % of a decode step.
 - **Turning the layers off**, per request: `"dry_multiplier": 0`,
   `"repetition_penalty": 1`, `"loop_guard": false`.
 
@@ -393,7 +394,7 @@ Measured on the board (CHAT_PLAN §13.4, §16.3, §17, §19; the kernels at
   107 ms at 256 and 130 ms at 1000.
   - **Why.**  Decode is bound by weight bandwidth.  MatmulKernel's GEMV
     mode streams the 256 MiB of weights through both read ports (at
-    100 MHz ~3.1 GB/s, ~87 ms per token).  The host attention adds the rest, and
+    100 MHz ~3.1 GB/s, ~87 ms per token).  The attention adds the rest, and
     that part grows with the position.
   - **History.**  Decode was ~5 tokens/s before CHAT_PLAN §19.
 - **Prefill.**  0.08 / 0.10 / 0.40 s for 16 / 64 / 256 new tokens at 250 MHz
@@ -450,7 +451,7 @@ cache from an earlier request.
     vectors).
   - `llm_open` takes 0.6–0.7 s with the weights in the page cache.  Cold
     from the SD card it took 35.6 s before §19, when the weight files were
-    538 MB; they are now 326 MB.
+    538 MB; they are now 335 MB.
   - The pool buffer is 299 MiB; before §19 it was 488 MiB, with a second
     copy of the weights.
 

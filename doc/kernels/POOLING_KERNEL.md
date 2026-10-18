@@ -7,8 +7,8 @@ pragmas named below, nor the co-simulation code).*
 ## Overview
 
 `PoolingKernel` is a Vitis HLS kernel implementing ONNX-compliant 2-D
-spatial pooling on NCHW tensors. It is one of four hardware kernels in
-the `axi_demo` project, targeting the Xilinx KV260 FPGA. The kernel
+spatial pooling on NCHW tensors. It is one of five hardware kernels in
+the Cormorant project, targeting the Xilinx KV260 FPGA. The kernel
 supports three pooling families (Max, Average, Lp) including their
 global variants, dilation, padding, and a tunable channel/output-column
 parallelism strategy for II=1 throughput.

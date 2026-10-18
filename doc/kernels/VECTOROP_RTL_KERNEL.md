@@ -7,13 +7,14 @@
 generator.  **2026-10-06:** the activation unit (`vo_act`: LeakyReLU, SiLU,
 GELU, GELU tanh as ops 6–9 and acts 3–6, the `alpha` register;
 [ACTIVATIONS_PLAN](../plans/ACTIVATIONS_PLAN.md)) — verified out of context
-at 300 MHz; in the production bitstream `6436623029f7` (250 MHz, WNS
-+0.061 ns) since 2026-10-06.  **2026-10-07:** the softmax unit (`vo_smx`: ops
+at 300 MHz; in the bitstreams since `6436623029f7` (250 MHz, WNS
++0.061 ns; production from 2026-10-06).  **2026-10-07:** the softmax unit (`vo_smx`: ops
 10 / 11, registers `smx_cm` / `smx_cfg` / `smx_mask`;
 [SOFTMAX_PLAN](../plans/SOFTMAX_PLAN.md)) — in the bitstreams since
-`588d721997cb` (2026-10-07); the production `8599aa7a5f12` (250 MHz, WNS +0.114 ns,
-since 2026-10-08) reads b through its own PS port, HPC1 (a and c on HPC0;
-[PS_PORTS_PLAN](../plans/PS_PORTS_PLAN.md) §5: binary ops 24–38 % faster).
+`588d721997cb` (2026-10-07); the ones since `8599aa7a5f12` (250 MHz, WNS +0.114 ns,
+2026-10-08) read b through its own PS port, HPC1 (a and c on HPC0;
+[PS_PORTS_PLAN](../plans/PS_PORTS_PLAN.md) §5: binary ops 24–38 % faster); production
+`04259a7af917` since 2026-10-17.
 
 A drop-in replacement for the HLS kernel: the same IP (VLNV
 `xilinx.com:hls:VectorOPKernel:1.0`, 155 ports and 35 parameters with the
@@ -199,7 +200,7 @@ memory-bound rate of any unary op, as a separate op or fused after one.
 The softmax (`vo_smx`) runs its phases one after the other per unit — load,
 EXP, the divisions, OUT — at about a third of that rate (ideal memory):
 
-| job | cycles | board (`run_remote_perf`, 250 MHz) |
+| job | cycles | board (`run_remote_perf`, 250 MHz, `588d721997cb`) |
 |---|---:|---:|
 | row mode, rows of n | 75 + rows · (58 + 3 ⌈n / 8⌉) | |
 | BERT head: 256 rows of 256 | 39 056 (0.21 words / cycle) | 0.160 ms |

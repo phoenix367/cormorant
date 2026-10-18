@@ -9,8 +9,8 @@ row-ops unit: LayerNorm and the frontends' residual adds, RMSNorms, SiLU·up on
 int16 / int32 DMA rows — `src/rowops_nodes.py`, `../doc/plans/HOSTOPS_PLAN.md`).
 Ops no kernel implements (Softmax, LayerNorm,
 Gelu, Transpose, Slice / Split copies, Concat, Resize, Gather, OneHot, Cast,
-SpaceToDepth and the `axi.llm` Llama decoder, vision-encoder, text-to-speech
-and stereo depth ops) run as host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
+SpaceToDepth and the `axi.llm` Llama decoder, vision-encoder, text-to-speech,
+stereo depth and speech-to-text ops) run as host-CPU code inside `inference_run()`. Reshape-class ops are buffer aliases with no hardware call;
 Gemm is decomposed to MatMul + Add at load time. Several graphs can share one
 library and weight pool (multi-entry projects, `--entry`). The opt-in `--plan`
 mode picks MatMul tactics and the issue order from the bitstream's measured
@@ -38,6 +38,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_parallel_models.py
 .venv/bin/python test/gen_bert_models.py
 .venv/bin/python test/gen_llama_models.py    # imports ../demo/chat/scripts/llm_study.py
+.venv/bin/python test/gen_activation_models.py
+.venv/bin/python test/gen_softmax_models.py
 
 # Run all tests
 .venv/bin/python -m pytest test/ -v
@@ -163,7 +165,8 @@ left in place, non-depthwise grouped Conv) and a worked example on
 │   ├── inference.h           Public API: Data_t, size macros, DMA buffer API,
 │   │                         init/run/deinit declarations, UIO instance defaults
 │   ├── inference_prof.h      Per-layer profiler (-DINFERENCE_PROFILING=ON)
-│   └── inference_ddr.h       DDR-traffic counters for the profiler
+│   ├── inference_ddr.h       DDR-traffic counters for the profiler
+│   └── inference_irq.h, inference_rpu.h, rpu_ctrl.h   the interrupt waits, the R5 recorder, its protocol
 ├── src/
 │   ├── inference.c           Weight ROM arrays, run_*() helpers, kernel_wait(),
 │   │                         host-op helpers, init/deinit/run bodies
@@ -191,7 +194,8 @@ run_remote_tests.py      On-board correctness runner (SSH)
 run_remote_perf.py       On-board kernel benchmark runner (SSH; bench_src/; --json OUT)
 upload_bitstream.py      Load .bit + xclbin + .dtbo on the board (src/bitstream/)
 perf_calibrate.py        Performance-model campaign for --plan: cases / run / fit / host /
-                         simulate / all (--refine, --resume)
+                         simulate / rowops / all (--refine, --resume)
+tools/fit_cost_model.py  Refit the engine cost model's board terms (src/cost_model.py) to a campaign
 requirements.txt, pyproject.toml (ruff)
 runtime/                 inference_prof / inference_ddr sources copied into projects; inference_rpu.[ch]
                          the Cortex-R5 recorder (src/inference_rpu.c of every project: with
@@ -219,9 +223,12 @@ src/
   nodes.py               ScheduledNode (VectorOP), MatmulNode, ConvNode, MatmulConvNode,
                          PoolNode, ReshapeNode, SpaceToDepthNode
   host_nodes.py          HostNode family (Softmax, LayerNorm, Gelu, Transpose, Slice,
-                         Gather, OneHot, Cast): numpy reference + C helpers
+                         Resize, Concat, Gather, OneHot, Cast): numpy reference + C helpers
+  vectorop_act.py        LeakyRelu / SiLU / Gelu on VectorOPKernel's activation unit (ops 6-9, acts 3-6)
+  vectorop_smx.py, smx_nodes.py
+                         VectorOPKernel's softmax (ops 10 / 11): its integer specification; its nodes
   llm_nodes.py           axi.llm ops (LlmEmbed, LlmRMSNorm, LlmResAdd, LlmAttention,
-                         LlmSiluMul, LlmSelectRow, LlmDequant, LlmAttnPrep /
+                         LlmSiluMul, LlmSelectRow, LlmDequant, LlmToHost, LlmAttnPrep /
                          LlmAttnSoftmax / LlmAttnMerge) + LlmAttnConvNode (FPGA q·Kᵀ / P·V;
                          static keys for the vision encoder)
   llama.py               Llama frontend: config.json + safetensors + formats → entry graphs
@@ -236,8 +243,8 @@ src/
                          the text encoder as `encode_<T>` entries (length buckets, MatMuls and
                          attention on ConvKernel, one weight image shared by the buckets)
   tts_nodes.py           the TTS host ops (TtsPrep / Gate / Sum / FlowOut / Interleave / Pcm; the
-                         encoder's TtsEmbed / RowPrep / AttnSoftmax / AttnMerge / ResNorm / EncOut)
-                         + TTS_C / TTS_ENC_C
+                         encoder's TtsEmbed / RowPrep / AttnSoftmax / AttnRelAdd / AttnMerge / ResNorm /
+                         EncOut) + TTS_C / TTS_ENC_C
   stereo.py              LightStereo-S stereo depth frontend: the PyTorch checkpoint (read without
                          torch) + calibrated formats -> one graph (BN folded, polyphase deconvs,
                          split stripes, exponent solver, per-channel conv weights via chexp)
@@ -268,8 +275,9 @@ src/
   llm_entries.py         Llama entry graphs: prefill kernel widths shared with the
                          GEMV decode, one copy of every weight
   cost_model.py          ConvKernel / MatmulKernel (tiled + GEMV) cycle estimates
-  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py, _rowops_hw_config.py
-                         platform JSON resolvers (kernels.{conv,matmul,pool,rowops})
+  bank_phase.py          DRAM bank phases of the pool slots (--bank-phase), their 4 KiB page starts
+  _conv_hw_config.py, _matmul_hw_config.py, _pool_hw_config.py, _rowops_hw_config.py,
+  _vectorop_hw_config.py platform JSON resolvers (kernels.{conv,matmul,pool,rowops,vectorop})
   rpu_policy.py          who drives the kernels when the Cortex-R5 firmware runs: the R5's
                          overhead (1.0 µs a call, 10.6 µs a batch, 61 µs an inference, 38 µs every
                          further R5 wake, fitted on the board) against
@@ -283,7 +291,8 @@ src/
                          AttnPrep — RoPE, the q image, the KV caches — for Llama; ResAddBias /
                          LayerNorm32 / VitAttnPrep for the vision and TTS encoders, TtsRowPrep for
                          the TTS encoder; RPU_PLAN A1: Transpose, TtsSum / TtsInterleave / TtsRelBand,
-                         Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle; FOLD,
+                         Dequant (into a float32 DMA tensor, dma: f32), SelectRow, PixelShuffle, the
+                         vision EmbedAdd; FOLD,
                          op 9: TtsPrep as FoldRoNode where the platform says kernels.rowops.fold; RPU_PLAN
                          §14: GATE, op 10: TtsGate as GateRoNode (kernels.rowops.gate), the SCALE flag:
                          the split ÷ 3 stage averages as TtsSumRoNodes (kernels.rowops.scale)) + the
@@ -320,13 +329,14 @@ src/
     _cmake.py            generate_cmake()   → CMakeLists.txt
     _banners.py          File-header banner helpers
     multi.py             MultiEntryGenerator (--entry): several graphs, one weight pool
+    runtime_files.py     RUNTIME_FILES: the runtime/ files both project writers copy
     timing.py            simulate(): timed replay of the event stream (lane / CPU busy
                          times, CPU waits) for --plan and perf_calibrate.py simulate
 test/
   gen_*_models.py        Test ONNX model generators; gen_all_models.py runs them all
   helpers.py             _model(), _models_exist() shared by test modules
   host_emu.py            Builds a generated project on the host against software
-                         VectorOP / Matmul / Conv kernels and runs test_inference
+                         VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
   test_*.py              90 pytest modules, 1883 tests, all pass (test_bert_base.py
@@ -397,10 +407,11 @@ the instance to `OnnxGraph` and `CodeGenerator`.
 | `Div` | `OP_DIV` (3) | binary | |
 | `Relu` | `OP_RELU` (4) | unary | b=NULL |
 | `Clip(min=0,max=6)` | `OP_RELU6` (5) | unary | exact bounds required |
+| `LeakyRelu` / SiLU / `Gelu` | `OP_LEAKY_RELU` (6) / `OP_SILU` (7) / `OP_GELU`, `OP_GELU_TANH` (8, 9) | unary | activation unit only (`src/vectorop_act.py`) |
 
 With `OnnxGraph(fuse_act=True)` (CLI default) a following `Relu` /
-`Clip(0,6)` is folded into the producing ScheduledNode (`act`, emitted as
-`run_op_act()`).
+`Clip(0,6)` (with the activation unit also a `LeakyRelu` / SiLU / `Gelu`) is
+folded into the producing ScheduledNode (`act`, emitted as `run_op_act()`).
 
 **MatmulNode** — MatmulKernel: `MatMul`. Tiled 2-D matrix multiply; supports
 batched matmul and row-strided decomposition for alignment-gapped buffers.
@@ -456,7 +467,7 @@ naming the violated bound + the JSON field to bump.  The bounds come
 from the **same platform JSON the C++ build reads**
 (`platforms/<AXI_PLATFORM>.json`, `kernels.pool` object — see
 [`../doc/build-and-test/PLATFORM_CONFIGURATION.md`](../doc/build-and-test/PLATFORM_CONFIGURATION.md)
-for the full field reference across all three kernels, and
+for the full field reference across all five kernels, and
 [`../doc/kernels/POOL_OPTIMISATION.md`](../doc/kernels/POOL_OPTIMISATION.md) §4 for the
 pool-specific knobs); the RTL PoolingKernel's constants
 (`kernels/pool_rtl/rtl/pl_pkg.sv`) must match it, which CMake checks at configure time.
@@ -486,10 +497,12 @@ Requires equal `numel` between source and output.
 stride-2 stem rewrite (`OnnxGraph(s2d_stem=True)`, CLI default).
 
 **HostNode** (`src/host_nodes.py`) — `Softmax`, `LayerNormalization`, `Gelu`,
-`Transpose`, `Slice` (every `Split` output), `Gather`, `OneHot`, `Cast`:
+`Transpose`, `Slice` (every `Split` output), `Resize`, `Concat`, `Gather`, `OneHot`, `Cast`:
 C helpers run inside `inference_run()`, numpy `reference()` for the
 simulator; a contiguous 64-byte-aligned `Slice` piece becomes a zero-cost
-sub-buffer view instead (`OnnxGraph._choose_slice_views`).
+sub-buffer view instead (`OnnxGraph._choose_slice_views`).  Where the platform
+has the units, `Softmax` runs on VectorOPKernel's softmax unit (`src/smx_nodes.py`)
+and `LayerNormalization` on the row-ops unit (`src/rowops_nodes.py`).
 **LlmNode** / **LlmAttnConvNode** (`src/llm_nodes.py`) — the `axi.llm`
 domain ops of the Llama frontend; **VitNode** (`src/vit_nodes.py`, an
 `LlmNode`) — those of the vision encoder.
@@ -600,12 +613,12 @@ scheduler — it answers "which nodes have all their data ready" and
 ### Parallel kernel execution (`kernel_wait`)
 
 Each kernel-bearing node lives on exactly one hardware lane (`Conv`,
-`Pool`, `Matmul`, `VectorOP`); only one of each IP exists on the FPGA.
+`Pool`, `Matmul`, `VectorOP`, `RowOps`); only one of each IP exists on the FPGA.
 The codegen overlaps work across **different** lanes.  Host nodes have no
 lane: they wait for their producers, run inline and are never waited on.
 
 **Helpers** are non-blocking: `run_op()` / `run_op_act()` / `run_matmul()` /
-`run_conv()` / `run_pool()` program the AXI-Lite registers, call
+`run_conv()` / `run_pool()` / `run_rowops()` program the AXI-Lite registers, call
 `XKernel_Start()`, and return immediately. (`run_matmul_at()` — used only
 inside the 4D×3D outer loop where iterations would race on the same Matmul
 registers — remains synchronous; the per-item `run_conv_at()` loop of a
@@ -726,7 +739,7 @@ typedef uint16_t Data_t;              // ap_fixed<16,8> raw bits
 #define INFERENCE_<TENSOR>_CHUNK        chunk_size
 #define INFERENCE_<TENSOR>_CHUNK_STRIDE INFERENCE_ALIGN_UP(INFERENCE_<TENSOR>_CHUNK)
 
-// One instance name per active kernel, registry order (VectorOP, Matmul, Conv, Pool);
+// One instance name per active kernel, registry order (VectorOP, Matmul, Conv, Pool, RowOps);
 // defaults INFERENCE_<KERNEL>_INSTANCE ("VectorOPKernel_0", ...)
 int  inference_init(const char *vectoropkernel_instance /*, ... */);
 // bare metal: int inference_init(UINTPTR vectoropkernel_base /*, ... */);
@@ -807,7 +820,7 @@ Four scripts drive KV260 hardware over SSH:
 |--------|---------|--------|
 | `upload_bitstream.py` | Load the bitstream, xclbin and device-tree overlay | `bitstream_config_kv260.json.example` |
 | `run_remote_tests.py` | **Correctness** — generates a C project per model, builds on board, compares every output element against Python GT | `remote_config.json.example` (159 models) |
-| `run_remote_perf.py` | **Performance** — builds one benchmark project for all four kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (72 cases) |
+| `run_remote_perf.py` | **Performance** — builds one benchmark project for all five kernels, runs parametric cases and reports latency (ms) and throughput (GB/s / GOps/s); `--json OUT` also writes the results as JSON | `perf_config.json.example` (72 cases) |
 | `perf_calibrate.py run` | **Calibration** for `--plan` — times batches of kernel calls with `bench_src/calib_runner.c` (two passes), then `fit` writes `perf_models/<platform>/<bitstream-id>.json` (`../doc/plans/TACTICS_PLAN.md` §4.3) | `--config` in the `run_remote_perf.py` format |
 
 All share the same SSH/driver config schema. See `doc/REMOTE_TESTING.md` for
@@ -817,7 +830,7 @@ the `KERNEL_REGISTRY` names (`PoolKernel`); `run_remote_perf.py` uses
 `PoolingKernel`.
 
 `run_remote_perf.py` validates each `VectorOPKernel` case's `op` against the
-kernel-supported set (`OP_ADD..OP_GELU_TANH`, 0..9) when it loads the cases and
+kernel-supported set (`OP_ADD..OP_SOFTMAX_T`, 0..11) when it loads the cases and
 exits with `config error: VectorOPKernel case '<label>': unsupported op=…`
 before it connects to the board (`_load_cases()` runs right after the config
 is loaded), so a bad case costs no remote build.  A `PoolingKernel` case's
@@ -828,12 +841,13 @@ larger one and wedge the HPC port (`../doc/kernels/POOL_OPTIMISATION.md` §2.14.
 
 ## Driver Sources
 
-Each hardware kernel has its own driver: ConvKernel's generated by Vitis
-HLS synthesis, MatmulKernel's, VectorOPKernel's and PoolingKernel's by
-`make driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl` (the RTL
-kernels', with the HLS drivers' API: `build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src`,
+Each hardware kernel has its own driver, generated by `make driver_conv_rtl` /
+`driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl` / `driver_rowops_rtl` (the RTL
+kernels', with the HLS drivers' API: `build/kernels/conv_rtl/driver/ConvKernel_v1_0/src`,
+`build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src`,
 `build/kernels/vectorop_rtl/driver/VectorOPKernel_v1_0/src`,
-`build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src`).
+`build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src`,
+`build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src`).
 When `--driver-dir` is omitted, `driver/` is left empty except for a stub
 `README.md` listing the files the model's kernels need.
 
@@ -843,3 +857,4 @@ When `--driver-dir` is omitted, `driver/` is left empty except for a stub
 | MatmulKernel | `xmatmulkernel` | `xmatmulkernel.h`, `xmatmulkernel_hw.h`, `xmatmulkernel.c`, … |
 | ConvKernel | `xconvkernel` | `xconvkernel.h`, `xconvkernel_hw.h`, `xconvkernel.c`, … |
 | PoolKernel | `xpoolingkernel` | `xpoolingkernel.h`, `xpoolingkernel_hw.h`, `xpoolingkernel.c`, … |
+| RowOpsKernel | `xrowopskernel` | `xrowopskernel.h`, `xrowopskernel_hw.h`, `xrowopskernel.c`, … |

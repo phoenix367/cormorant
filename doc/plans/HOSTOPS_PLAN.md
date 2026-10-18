@@ -5,9 +5,11 @@ production.**  Bitstream `de968ccc45da` (§11.7, after the kernels' area pass
 of `AREA_PLAN.md`): WNS +0.029 ns, 89 547 LUTs; on the board 159 / 159 models
 and every library bit-exact, the 72 kernel benchmarks equal to
 `1cedaf2ed816`'s; the Piper chunk ≈ 260 → 183 ms (RTF 0.19 → 0.13); the
-chat server runs it (with the R5).  RPU_PLAN track A1 (2026-10-13) moved
-BERT's transposes, the Piper sums / interleaves / relative-key band, the
-dequants, the row select and pixel shuffle onto the unit (BERT 288 → 266 ms).
+chat server ran it (with the R5) until 2026-10-16; FOLD is in every later
+bitstream (production since 2026-10-17: `04259a7af917`, RPU_PLAN §14).
+RPU_PLAN track A1 (2026-10-13) moved BERT's transposes, the Piper sums /
+interleaves / relative-key band, the dequants, the row select and pixel
+shuffle onto the unit (BERT 288 → 266 ms).
 
 **Status (2026-10-12): phase 3 DONE — the unit is in production.  Bitstream
 `1cedaf2ed816` (§9): the RowOpsKernel on `S_AXI_HP0_FPD`, WNS +0.020 ns at

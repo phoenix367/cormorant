@@ -61,9 +61,9 @@ More examples with every client: [Clients](CLIENTS.md).
 BERT reads 256 tokens at a time.  A longer document is split into
 overlapping 256-token windows: the question takes up to 64 tokens, and
 consecutive windows start 128 tokens apart.  Each window is one FPGA
-inference (~1 s), and the best span across all windows is the answer.
+inference (~0.27 s), and the best span across all windows is the answer.
 
-At most `--max-windows` windows (default 8, ≈ 8 s) run per question.  A
+At most `--max-windows` windows (default 8, ≈ 2 s) run per question.  A
 document beyond that is truncated, and the response says so:
 `kv260.truncated` is true, and `chat.py` shows `windows 8/19`.
 `server.max_windows` and `server.doc_stride` in `chat_config.json` set the

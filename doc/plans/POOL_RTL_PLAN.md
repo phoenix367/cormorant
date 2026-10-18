@@ -1,7 +1,8 @@
 # PoolingKernel in SystemVerilog: plan
 
 **Status (2026-10-05):** done.  The SystemVerilog PoolingKernel is the
-hardware build's (bitstream `dbb320fb7297`, in production), bit-exact on the
+hardware build's (first bitstream `dbb320fb7297`, production 2026-10-05 to
+2026-10-06; production since 2026-10-17: `04259a7af917`), bit-exact on the
 board with every pool benchmark 8.6–30.2 % faster than the HLS kernel; the
 HLS synthesis is retired.
 

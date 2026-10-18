@@ -61,9 +61,9 @@ demo/image_classification/
 ### Host
 
 * Python 3.10+, `pip install -r requirements.txt` (paramiko, gdown, Pillow, numpy, onnx, onnxsim).
-* Generated driver sources for the four kernels (ConvKernel's by its HLS
-  synthesis; the RTL MatmulKernel's, VectorOPKernel's and PoolingKernel's by
-  `driver_matmul_rtl` / `driver_vectorop_rtl` / `driver_pool_rtl`):
+* Generated driver sources for the four kernels (the RTL kernels' by
+  `driver_conv_rtl` / `driver_matmul_rtl` / `driver_vectorop_rtl` /
+  `driver_pool_rtl`):
 
   ```bash
   # from the repo root
@@ -74,7 +74,7 @@ demo/image_classification/
 
   The driver sources only describe the kernels' AXI-Lite registers, so they
   are the same for every `AXI_BUS_WIDTH`; the bitstream on the board is the
-  128-bit block design (`-DAXI_BUS_WIDTH=128`, `make build_hw_kv260`), which
+  128-bit block design (`make build_hw_kv260`), which
   the sample numbers below were measured with.
   Override `local.driver_dirs` if you keep the build tree elsewhere.
 
@@ -377,9 +377,9 @@ Edit `image_classification_config.json`:
 * **`gdown failed`** — Google Drive sometimes throttles.  Run
   `python3 -m gdown --folder <url> -O assets/models/` manually, or download
   the `.onnx` file via a browser and place it in `assets/models/`.
-* **`Driver file not found: driver/xconvkernel.h`** during cmake — the HLS
-  driver sources weren't on this host.  Run `make synthesize_kv260` from
-  the repo root, or point `local.driver_dirs` at an existing build output.
+* **`Driver file not found: driver/xconvkernel.h`** during cmake — the kernel
+  driver sources weren't on this host.  Run `make synthesize_kv260` in
+  the repo's `build/`, or point `local.driver_dirs` at an existing build output.
 * **All images classified as "background", or wildly off top-K** — the input
   encoding is wrong for that model.  TF MobileNetV1 wants
   `normalize: "tf"`; the ONNX Model Zoo MobileNetV2 wants

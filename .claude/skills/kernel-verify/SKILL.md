@@ -44,15 +44,15 @@ grep -E '^AXI_BUS_WIDTH:|^CMAKE_HOME_DIRECTORY:' "$BUILD_DIR/CMakeCache.txt"
 
 If `BUILD_DIR` ends up empty, ask the user where the build tree is and
 stop.  `CMAKE_HOME_DIRECTORY` must be this checkout (a build tree of
-another clone runs another clone's sources); `AXI_BUS_WIDTH` should be
-`128` (the block designs are 128-bit).  Every shell that runs a gate needs
+another clone runs another clone's sources); `AXI_BUS_WIDTH` no longer
+matters (informational: every RTL kernel has fixed 128-bit ports).  Every shell that runs a gate needs
 Vitis, and — `/` is nearly full on the maintainer's machine — a temp dir
 elsewhere:
 
 ```bash
 source /mnt/data/xilinx/2025.2/Vitis/settings64.sh   # vitis-run, vivado
 export TMPDIR=/mnt/data/cormorant_repro/tmp          # only if / is short of space (df -h /)
-K=matmul                                            # or vectorop, pool
+K=matmul                                            # or vectorop, pool, conv
 S="${CLAUDE_SKILL_DIR}/scripts"
 cd "$BUILD_DIR"
 ```
@@ -96,13 +96,14 @@ ctest -R Conv --output-on-failure                     # K=conv (~2 min: TestConv
   table against `rtl/mm_ctrl_s_axi.sv`.  Edits to `kernels/matmul_rtl/model/` (the C++
   reference model) change the oracle: then Gate 1b decides whether the
   fixtures move.
-- `lint_vectorop_rtl` likewise; `TestVectorOpRtl` runs the 201 checked-in
+- `lint_vectorop_rtl` likewise; `TestVectorOpRtl` runs the 212 checked-in
   fixtures, 300 random cases (seed 1) and 8 jobs over every Q8.8 input of
-  the activations (ACTIVATIONS_PLAN) against the C++ model under
+  the activations (ACTIVATIONS_PLAN) and 2 of the softmax (SOFTMAX_PLAN) against the C++ model under
   randomised memory timing, with AXI protocol checks and at most 16 bursts
   outstanding per port; `VectorOpRtlDriver` checks the driver table against
   `rtl/vo_ctrl_s_axi.sv`, `VectorOpRtlActRom` that `rtl/vo_act_rom.sv` is
-  what `scripts/gen_act_rom.py` writes.  For more coverage run the testbench by hand:
+  what `scripts/gen_act_rom.py` writes (`VectorOpRtlSmxRom`: `rtl/vo_smx_rom.sv`,
+  `scripts/gen_smx_rom.py`).  For more coverage run the testbench by hand:
   `kernels/vectorop_rtl/vl/Vtb --random 500 --seed 2026 --timing rand --quiet`
   (also `--timing slow`, `--perf` for cycle counts with ideal memory).
 - `lint_pool_rtl` likewise; `TestPoolRtl` runs the 45 checked-in fixtures
@@ -135,7 +136,7 @@ ctest -R Conv --output-on-failure                     # K=conv (~2 min: TestConv
   / `TestMatmulModel PASSED`; 19 of the 58 are GEMV cases),
   `./kernels/matmul_rtl/model/TestMatmulModelBlas` (`24/24 tests passed` /
   `TestMatmulModelBlas PASSED`), `./kernels/vectorop_rtl/model/TestVectorOpModel`
-  (`All 212 tests passed.`), `./kernels/pool_rtl/model/TestPoolModel`
+  (`All 224 tests passed.`), `./kernels/pool_rtl/model/TestPoolModel`
   (`51 / 51 tests passed.`; `[FAIL]` / `failures=N/M` lines with N > 0 are
   regressions).  Counts grow with the suites — the passed count must equal
   the total.
@@ -306,10 +307,10 @@ make behavior_test_matmul             # or behavior_test_vectorop
   [ck] MatmulKernel: PASS  (50/50)  …/matmul_op_test_report.json
   ```
 
-  (`VectorOPKernel … total=212 passed=201`, `vector_op_test_report.json`;
+  (`VectorOPKernel … total=212 passed=212`, `vector_op_test_report.json`;
   `PoolingKernel … total=45 passed=45`, `[ck] PoolingKernel: PASS  (45/45)`,
-  `pooling_test_report.json`; `ConvKernel … total=63 passed=63`,
-  `[ck] ConvKernel: PASS  (66/63)`, `conv_test_report.json`).
+  `pooling_test_report.json`; `ConvKernel … total=66 passed=66`,
+  `[ck] ConvKernel: PASS  (66/66)`, `conv_test_report.json`).
   `failed=0` and `all_passed=True` are mandatory; the make exits non-zero
   otherwise.  **If anything else, stop here** and show the failing cases:
 
@@ -381,7 +382,7 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    (`scripts/gen_driver.py`) and the fact registry
    (`python3 tools/facts/facts.py check registers.MatmulKernel` /
    `registers.VectorOPKernel` / `registers.PoolKernel` / `registers.ConvKernel`).
-2. Run it (all four kernels through the PS VIP, ~4 min):
+2. Run it (all five kernels through the PS VIP, ~8 min):
 
    ```bash
    make sim_hw_kv260
@@ -392,7 +393,7 @@ MatMul packed-B / GEMV image).  Then, besides the test-stand testbench:
    and exit 0 — `scripts/sim.tcl` exits 1 without `ALL TESTS PASSED`.
    Measured 2026-09-29: 68/68 in 237 s wall (again with the RTL MatmulKernel
    in phase 1; 68/68, 241 s, with the RTL VectorOPKernel on 2026-10-05).
-   It uses `$BUILD_DIR/ip_repo_kv260` (the four RTL IPs), so all four
+   It uses `$BUILD_DIR/ip_repo_kv260` (the five RTL IPs), so all five
    must have been packaged in this build tree.  With the RTL ConvKernel
    (CONV_RTL_PLAN phase 1, 2026-10-05) 68/68; with the VectorOP activation unit
    (ACTIVATIONS_PLAN, 2026-10-06, five more VectorOP cases) 73/73 in 333 s

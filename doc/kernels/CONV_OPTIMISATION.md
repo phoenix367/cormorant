@@ -1,7 +1,8 @@
 # ConvKernel — Optimization Log
 
 This document records the structural and performance optimizations applied to
-`kernels/conv/kernel/ConvKernel.cpp` after the initial scalar implementation
+`kernels/conv/kernel/ConvKernel.cpp` (now, without its pragmas, the C++ model
+`kernels/conv_rtl/model/src/ConvKernel.cpp`) after the initial scalar implementation
 shipped. Each section describes one change, the rationale, and the measured
 HW behavior simulation (`make behavior_test_conv`) impact on the kv260 RTL.
 
@@ -2442,7 +2443,7 @@ per-pixel loops with one flat sweep per `(ict, ow_tile, mg)`.  Today
 
 Conv's compile-time bounds live under `kernels.conv` in
 `platforms/<name>.json` — the same single-source-of-truth model
-`kernels/pool` uses.  There are no CMake `CACHE STRING` defaults; the
+`kernels.pool` uses.  There are no CMake `CACHE STRING` defaults; the
 JSON is authoritative and a missing field is a hard configure error.
 See [`PLATFORM_CONFIGURATION.md`](../build-and-test/PLATFORM_CONFIGURATION.md) for the
 schema and the add-a-new-platform workflow.
@@ -2467,17 +2468,20 @@ reads it), and `kMaxMperGroup` is runtime-clamped to the actual
 `m_tiles` (the MatMul-on-ConvKernel cost model reads it).  The other
 eight gate model acceptance (`tile_m` through the padded accumulator
 row): `ConvNode.from_onnx_node` raises `SchedulerError` naming the
-violated bound.
+violated bound.  Beside the bounds the block names the bitstream's kernel:
+`impl` (`CONV_IMPL`, the scheduler's cycle model; `AXI_CONV_IMPL` overrides)
+and `y_pattern` (`CONV_Y_PATTERN`, the y channel pattern's registers).
 
 ### 4.2. How CMake reads the JSON
 
-`kernels/conv/CMakeLists.txt::conv_load_constants(platform_json prefix)`
+`kernels/conv_rtl/model/CMakeLists.txt::conv_load_constants(platform_json prefix)`
 calls `string(JSON … GET … kernels conv <field>)` for each required
 key, sets `${prefix}_<UPPER_FIELD>` in the parent scope, and errors
 out (`FATAL_ERROR`) on any missing field.  The default-platform
 constants drive `Config.h` for the C-sim build; the per-platform
-synthesis loop calls the function again per platform JSON so each
-synthesised IP gets its own bounds.
+synthesis loop is retired with the HLS kernel, and
+`kernels/conv_rtl/CMakeLists.txt` checks the bounds against the RTL's
+`rtl/cv_pkg.sv` (`FATAL_ERROR` when they differ).
 
 `CMAKE_CONFIGURE_DEPENDS` is set on every platform JSON so subsequent
 `make` invocations auto-rerun configure when the JSON changes.
@@ -2500,8 +2504,8 @@ geometries from the new JSON.
 
 ### 4.4. Test predictor and cache-extreme verification
 
-TODO — does `TestConvSim.cpp` have a cache-aware `dup_reads` predictor
-like `TestPoolingSim.cpp`?  If yes, document the cache-extreme matrix;
+TODO — does `TestConvModel.cpp` have a cache-aware `dup_reads` predictor
+like `TestPoolModel.cpp`?  If yes, document the cache-extreme matrix;
 if not, mark as a deferred TODO.
 
 ---

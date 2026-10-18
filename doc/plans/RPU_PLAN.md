@@ -1,5 +1,20 @@
 # The kernels driven from the R5 cores — an OS-free, interrupt-driven runtime (plan)
 
+**Status (2026-10-17):** A1 done (§8: BERT's transposes, the Piper sums,
+interleaves and relative-key band, the dequants on the row-ops unit; BERT
+288 → 265 ms; the Piper encoder 96 → 81 ms at 400 ids, its 75 ms gate
+missed).  B1 and B2 done (§9–§10): a model-independent R5 firmware
+replays the libraries' kernel calls with interrupt-driven waits; every chat
+library, BERT and Piper bit-exact with the R5 driving; the chat server runs
+with it.  B3 started (§11: the R5 asleep between commands, protocol v5,
+−50 mW idle).  The A53 sleeps on the kernels' interrupts too (§12).  A2 done
+(§13: ConvKernel's y channel pattern, the unit's descriptor chains;
+production `33a799febc56`, 2026-10-16).  A3a done (§14: the unit's GATE op
+and SCALE flag; production `04259a7af917`, 2026-10-17; the Piper chunk
+177 → 148 ms).  Open: the rest of B3 (the APU clock, the PL and DDR, §11)
+and the rest of A3 (§3.3: the unaligned row start for the Piper encoder's
+merge, the stereo pass's long-row norms and correlation).
+
 **Status (2026-10-12): phase 0 DONE — the study (§1–§6).  Verdict: GO in two
 tracks.  Track A (§3) moves what is left of the host ops onto the kernels,
 in the order of their cost; the Llama / vision / BERT / CNN paths are within

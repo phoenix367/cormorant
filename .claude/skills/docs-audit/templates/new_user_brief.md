@@ -49,7 +49,7 @@ gaps; you do not fix them.
   applied, remove that overlay as the docs say — never pass `--overlay-name pl`
   (it overwrites `/lib/firmware/pl.bin`).
 - Keep at least 1 GB free on the board's `/` (`df -h /` before every weight
-  upload: BERT 217 MB, SmolLM2-135M 326 MB, SmolVLM 514 MB).
+  upload: BERT 217 MB, SmolLM2-135M 335 MB, SmolVLM 514 MB).
 - One board job at a time (they share the kernels), and none while a chat
   server of yours holds the FPGA (`deploy.py --stop` first).
 - Board unresponsive (ssh / ping failing) for more than 2 min → stop all board
@@ -84,13 +84,11 @@ gaps; you do not fix them.
 2. Kernel C simulation (README Quick start §2, TESTING §2).
 3. Scheduler: venv, test models, unit tests, the CLI on a test model (Quick
    start §3, TESTING §1, USER_GUIDE); the chat app tests.
-4. Hardware build (Quick start §4, BUILD_TARGETS): HLS synthesis, the Vivado
-   bitstream (~70 min — start it early in the background and do host-only demo
-   preparation meanwhile, but no project generation while a synthesis rewrites
-   the driver dirs), the device-tree overlay.  Right after the HLS build copy
-   the driver dirs to `{{BASE}}/drivers_snapshot/` and point every config's
-   `local.driver_dirs` there, so the RTL tests (which re-synthesise and wipe the
-   dirs) can run beside board work.
+4. Hardware build (Quick start §4, BUILD_TARGETS): the IP packaging, the Vivado
+   bitstream (~1–2 h — start it early in the background and do host-only demo
+   preparation meanwhile), the device-tree overlay.  The RTL tests re-package
+   the IPs but leave the driver dirs (`build/kernels/<k>_rtl/driver/`), so they
+   can run beside board work.
 5. Board setup (Quick start §5): the tmpfiles rule, `upload_bitstream.py`, the
    UIO listing.
 6. On-board tests and benchmarks (Quick start §6, TESTING §4–5,
@@ -98,7 +96,7 @@ gaps; you do not fix them.
    build-by-hand of a generated project on the board.
 7. RTL tests (TESTING §3): `make behavior_test_<k>` for all four kernels, one at
    a time (the test stand must never run two jobs at once; ~45 min in all), then
-   `make sim_hw_kv260` (block design, ~3 min).  Read the summaries, not only the
+   `make sim_hw_kv260` (block design, ~8 min).  Read the summaries, not only the
    exit codes.
 8. Demos, each by its README: `demo/mnist`, `demo/image_classification`,
    `demo/bert_squad`, `demo/chat` (bert-squad and SmolLM2-135M backends: clients,

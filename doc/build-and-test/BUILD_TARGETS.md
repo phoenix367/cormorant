@@ -14,7 +14,7 @@ cmake ..
 
 Each kernel also configures on its own, with the same target names
 (`cmake -S kernels/<k> -B <dir>` for `matmul_rtl`, `vectorop_rtl`,
-`pool_rtl`, `conv_rtl` — each with its C++ reference model, `model/` — and
+`pool_rtl`, `conv_rtl` — each with its C++ reference model, `model/` —, `rowops_rtl`, and
 `cmake -S kernels/<k>_rtl/model -B <dir>` for a model alone): `cmake/AxiPlatform.cmake`, which the top level includes too,
 sets `AXI_BUS_WIDTH`, `AXI_PLATFORM` and the platform list.
 
@@ -64,16 +64,16 @@ no hardware.
 
 | Target | Kernel | Description |
 |--------|--------|-------------|
-| `TestVectorOpModel` | VectorOPKernel (C++ model) | All 6 ops across sizes + saturation cases + broadcast / stride-0 / `act` geometry cases |
+| `TestVectorOpModel` | VectorOPKernel (C++ model) | All 10 element-wise ops across sizes + saturation cases + every Q8.8 input of each activation + both softmax modes + broadcast / stride-0 / `act` geometry cases |
 | `TestConvModel` | ConvKernel (C++ model) | Model vs naive reference oracle; also registered as the CTest test `TestConvModelSweep` (`TestConvModel --sweep 300`, randomised geometries, ~1 min) |
 | `TestConvModelGrid` | ConvKernel (C++ model) | MAC-grid unit test on `include/ConvMacGrid.h` alone |
 | `TestMatmulModel` | MatmulKernel (C++ model) | Model vs the `ref_matmul_2d` / `ref_matmul_batch` oracle, all shape cases; `--dump-data` writes the RTL fixtures |
 | `TestMatmulModelBlas` | MatmulKernel (C++ model) | configured model vs `cblas_sgemm`, bit-exact on 2^-8-grid inputs — only if BLAS is found |
 | `TestPoolModel` | PoolingKernel (C++ model) | Max/Average/Lp pooling + global variants; `--dump-data` writes the RTL fixtures |
 | `TestMatmulRtl` | MatmulKernel (RTL) | Verilator testbench of the SystemVerilog kernel; the CTest test runs the 50 checked-in fixtures + 200 random cases (~50 s) — only if Verilator 5.x is found ([below](#rtl-matmulkernel-systemverilog)) |
-| `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 201 checked-in fixtures, 300 random jobs and 8 every-input activation jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
+| `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 212 checked-in fixtures, 300 random jobs, 8 every-input activation jobs and 2 every-input softmax jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
 | `TestPoolRtl` | PoolingKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 45 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-poolingkernel-systemverilog)) |
-| `TestConvRtl` | ConvKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 63 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-convkernel-systemverilog)) |
+| `TestConvRtl` | ConvKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 66 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-convkernel-systemverilog)) |
 
 | Aggregate | Description |
 |-----------|-------------|
@@ -96,12 +96,12 @@ Verilator).
 ## IP export
 
 Every kernel of the hardware build is SystemVerilog, packaged as a Vivado
-IP under `build/rtl_ip/<Name>_ip` (the targets in the four RTL sections
+IP under `build/rtl_ip/<Name>_ip` (the targets in the five RTL sections
 below; Vivado only).
 
 | Target | Description |
 |--------|-------------|
-| `synthesize_kv260` | Aggregate — the five kernel IPs: `package_vectorop_rtl`, `package_conv_rtl`, `package_matmul_rtl`, `package_pool_rtl` and `package_rowops_rtl` (the row-ops unit, not yet in the hardware build) |
+| `synthesize_kv260` | Aggregate — the five kernel IPs: `package_vectorop_rtl`, `package_conv_rtl`, `package_matmul_rtl`, `package_pool_rtl` and `package_rowops_rtl` (the row-ops unit) |
 
 A `synthesize_<platform>` aggregate is generated for every
 `platforms/<platform>.json` file; the IPs are packaged for the part of the
@@ -145,11 +145,11 @@ Python).
 
 The IP is packaged outside `build/kernels/`, in `build/rtl_ip/`.  The
 hardware targets scan `build/ip_repo_kv260/` (target `ip_repo_kv260`: links
-the four RTL IPs), and `behavior_test_matmul` takes the
+the five RTL IPs), and `behavior_test_matmul` takes the
 RTL IP (depending on `package_matmul_rtl`).  After the IP upgrade, both the
 `cormorant_hw_128` scripts and the test stand put every kernel instance's
 `C_M_AXI_*_DATA_WIDTH` back to its IP's default, so `MatmulKernel_0`'s gmem2
-becomes 128 (the block designs still say 32, the HLS kernel's width).
+becomes 128 (the test stand's block design still says 32, the HLS kernel's width).
 Projects take the driver from `driver_matmul_rtl`'s output
 (`build/kernels/matmul_rtl/driver/MatmulKernel_v1_0/src`; the packaged IP
 carries the same files).
@@ -243,7 +243,7 @@ needs only Python).
 | `package_conv_rtl` | Vivado IP `xilinx.com:hls:ConvKernel:1.0` with the driver → `build/rtl_ip/ConvKernel_ip` (+ `.zip`) |
 | `synth_conv_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `CV_RTL_PERIOD` ns (default 3.333) → `build/kernels/conv_rtl/synth/*.rpt` |
 | `xsim_conv_rtl` | `xvlog` / `xelab` parse and elaboration |
-| `sysim_conv_rtl` | The test stand's ConvKernel block design (PS VIP, interconnect, DDR model, the DSP48E2 models) with this IP, on a copy in `build/kernels/conv_rtl/sysim/` (~75 min for the 63 fixtures) |
+| `sysim_conv_rtl` | The test stand's ConvKernel block design (PS VIP, interconnect, DDR model, the DSP48E2 models) with this IP, on a copy in `build/kernels/conv_rtl/sysim/` (~75 min for the 63 fixtures, 2026-10-05) |
 
 As for the other RTL kernels, the IP is packaged in `build/rtl_ip/`,
 `ip_repo_kv260` links it and `behavior_test_conv` takes it (depending on
@@ -262,15 +262,15 @@ the packaged IP carries the same files).
 The row-ops unit of HOSTOPS_PLAN, `kernels/rowops_rtl/`
 ([ROWOPS_RTL_KERNEL](../kernels/ROWOPS_RTL_KERNEL.md)): the host float row
 ops (residual adds, RMSNorm / LayerNorm, SiLU · up, dequantisation, RoPE,
-transposes and copies) in fixed point on one read+write m_axi port — RTL
-only so far (phase 1; the scheduler lane and the bitstream are phases 2–3).
+transposes and copies, Piper's FOLD and GATE) in fixed point on one read+write m_axi port — in
+the hardware build since bitstream `1cedaf2ed816` (phase 3; the scheduler lane is phase 2).
 Each target exists only when its tool is found, as for the other RTL
 kernels; the fixtures come from the Python specification
 (`inference-scheduler/src/rowops_spec.py`), not from a C-simulation target.
 
 | Target | Description |
 |--------|-------------|
-| `TestRowOpsRtl` | Verilator testbench `build/kernels/rowops_rtl/vl/Vtb` (in `all`); CTest runs the 43 checked-in RowOps fixtures (`hw/test_data/rowops_test_data/`) + random jobs (`RO_RTL_RANDOM_CASES`, default 300) against the C++ oracle `tb/verilator/rowops_ref.h` under randomised AXI timing |
+| `TestRowOpsRtl` | Verilator testbench `build/kernels/rowops_rtl/vl/Vtb` (in `all`); CTest runs the 43 checked-in RowOps fixtures (`hw/test_data/rowops_test_data/`) + random jobs (`RO_RTL_RANDOM_CASES`, default 300) and the `chains/` fixtures + random descriptor chains (`RO_RTL_CHAIN_CASES`, default 300) against the C++ oracle `tb/verilator/rowops_ref.h` under randomised AXI timing |
 | `lint_rowops_rtl` | `verilator --lint-only -Wall` with `scripts/lint_waivers.vlt` |
 | `perf_rowops_rtl` | Cycle counts of the shipped models' job shapes (ideal memory) |
 | `rowops_rtl_tb_fst` | The testbench with FST tracing (`vlt/Vtb`; `--case "op n c1 c2 [mode]" --trace FILE`) |
@@ -342,8 +342,8 @@ Require the `hw/cormorant_hw_128` submodule, Vivado, and `dtc`.
 
 | Target | Description |
 |--------|-------------|
-| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-packages the four kernel IPs first when their sources changed. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
-| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 123 cases over the five kernels, ~3 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
+| `build_hw_kv260` | Vivado synthesis + implementation + bitstream of the 128-bit block design (`hw/cormorant_hw_128/build.sh all`); depends on `synthesize_kv260`, so it re-packages the five kernel IPs first when their sources changed. Modifies tracked `.bd` / `.xci` / `.xpr` files of the submodule (do not commit them); the `File not found as '…/design_cormorant_wrapper.dcp'; using path …` warning (an old incremental-synthesis checkpoint path in the `.xpr`) is harmless |
+| `sim_hw_kv260` | Hardware-level simulation of the integrated design (block-design testbench, 123 cases over the five kernels, ~8 min; see [TESTING.md §3](TESTING.md#3-hardware-simulation-vivado-no-board)); `scripts/sim.tcl` exits 1 unless `simulate.log` contains `ALL TESTS PASSED` |
 | `dtbo_kv260_cormorant` | Compile the device-tree blob overlay (`.dtbo`) for the KV260; `dtc`'s `reg_format` / `avoid_default_addr_size` warnings are expected |
 
 ---

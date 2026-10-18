@@ -1,6 +1,6 @@
 # VectorOPKernel in SystemVerilog: plan
 
-**Status (2026-10-05):** done — the SystemVerilog VectorOPKernel is the hardware build's (bitstream `68665fc1833a`, production); the HLS kernel's synthesis is retired.
+**Status (2026-10-05):** done — the SystemVerilog VectorOPKernel is the hardware build's (first bitstream `68665fc1833a`, production from 2026-10-05; production since 2026-10-17: `04259a7af917`); the HLS kernel's synthesis is retired.
 
 A SystemVerilog VectorOPKernel (`kernels/vectorop_rtl/`) to replace the
 Vitis HLS one (`kernels/vectorop/`), the same way the MatmulKernel was

@@ -14,7 +14,7 @@ views of one case:
   found in CONV_RTL_PLAN phase 0.
 - **At the AXI ports, in the real block design** — the test stand's conv
   testbench with its `+VERBOSE` probes (§2): the PS VIP, interconnect and
-  DDR model, xsim with the DSP48E2 models (~20 µs of simulated time per
+  DDR model, xsim with the DSP48E2 models (~1 µs of simulated time per
   wall second: keep the case small).
 
 ## 1. Inside the kernel: Verilator waveforms
@@ -38,13 +38,13 @@ python3 $Q $T/c.vcd 'u_en\.(s_act|eq_valid|eq_ready|slab_in|bias_in|buf_in|haz_o
   the cycle (`+` = after the rising edge), then each signal in hex.
   Hierarchy: `ConvKernel.u_core.` then `u_xl` (x loader), `u_pa` (patch
   producer), `u_wl` (weight loader), `u_bi` (bias), `u_en` (engine:
-  fill `f_*`, issue `s_*`, write-back `wb_*`, `hold_*`), `u_dr` (drain:
+  fill `f_*`, issue `s_*`, write-back `wbc`, `wq*_*`, `hold_*`), `u_dr` (drain:
   fill `f_*`, transposer `t_*`, emitter `e_*`), `u_yw` (y writer), the
   sweep sequencer `qs`, `k`, `s_*` and the job FSM `tstate` in `u_core`.
 - **Where a job stops:** the units' `idle` and the engine's `eq_ready`
   terms (`slab_in`, `bias_in`, `buf_in`, `haz_ok`) name the unit it waits
   for.  **Where a value goes wrong:** follow it — patch beats `pt_data`,
-  the write-back `wb_data` / `wb_addr` (one 16-lane accumulator word per
+  the write-back `wq2_data` / `wq2_addr` (one 16-lane accumulator word per
   pixel), the drain's `d_rdata` → `sat_lo` → the emitter's `yw_data`.
 - Rebuild `vlt/Vtb` after an RTL edit (`make conv_rtl_tb_fst`; `make
   TestConvRtl` builds only `vl/Vtb`).

@@ -3,7 +3,8 @@
 End-to-end demos that take an ONNX model (or, for the chat, a Hugging Face
 checkpoint), compile it to a C inference project with `inference-scheduler`,
 build it on a KV260 board over SSH, and run it on this repo's FPGA kernels
-(Conv / Pool / MatMul / VectorOP) plus host-CPU ops on the board's A53 cores.
+(Conv / Pool / MatMul / VectorOP / RowOps) plus host-CPU ops on the board's
+A53 cores.
 
 The CNN demos (`mnist/`, `image_classification/`, `camera/`) follow the same
 three stages — **download → generate → deploy** — driven by a one-shot
@@ -17,15 +18,15 @@ builds the speech library the server's `piper` backend loads.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
-| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.111 / 1.249 ms per image) |
-| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 20.2 ms = 49.6 FPS at 250 MHz) |
-| [`stereo_depth/`](stereo_depth/) | LightStereo-S (OpenStereo, StereoAnything weights; 640 × 480) | Middlebury MiddEval3-Q / ETH3D pairs, your rectified pairs, a RealSense D4xx on the board (`--capture`) | Disparity maps beside the left image: the network on ConvKernel + VectorOPKernel, the correlation / norms / upsampling on the host (466 ms per pair, 2.15 FPS); EPE 0.667 px on 42 pairs against float's 0.650 on the same input, maps bit-exact vs the scheduler simulation; RealSense pairs: depth within 10 % of the camera's own on 98 % of the pixels (projector on) |
-| [`object_detection/`](object_detection/) | YOLOv5n (Ultralytics v7.0, 640 × 640) | COCO128 images, your JPG/PNG files | Boxes and classes drawn on each image: the network on ConvKernel + VectorOPKernel + PoolingKernel (47 ms per image, 21.4 FPS), decode + NMS on the host; COCO128 mAP@0.5:0.95 0.343 against float's 0.349, head maps bit-exact vs the scheduler simulation |
+| [`mnist/`](mnist/) | MNIST convnet + LeNet | 10 000 MNIST test images | Top-1 accuracy and per-image latency over the full test split (0.111 / 1.249 ms per image) on bitstream `986cef4866a0` |
+| [`image_classification/`](image_classification/) | MobileNetV1 1.0/224, MobileNetV2, ResNet-18 | static JPG/PNG files | Top-5 ImageNet predictions per image, with latency (ResNet-18 20.2 ms = 49.6 FPS at 250 MHz, bitstream `8599aa7a5f12`) |
+| [`stereo_depth/`](stereo_depth/) | LightStereo-S (OpenStereo, StereoAnything weights; 640 × 480) | Middlebury MiddEval3-Q / ETH3D pairs, your rectified pairs, a RealSense D4xx on the board (`--capture`) | Disparity maps beside the left image: the network on ConvKernel + VectorOPKernel, the correlation / norms / upsampling on the host (466 ms per pair, 2.15 FPS) on bitstream `1cedaf2ed816`; EPE 0.667 px on 42 pairs against float's 0.650 on the same input, maps bit-exact vs the scheduler simulation; RealSense pairs: depth within 10 % of the camera's own on 98 % of the pixels (projector on) |
+| [`object_detection/`](object_detection/) | YOLOv5n (Ultralytics v7.0, 640 × 640) | COCO128 images, your JPG/PNG files | Boxes and classes drawn on each image: the network on ConvKernel + VectorOPKernel + PoolingKernel (47 ms per image, 21.4 FPS) on bitstream `1cedaf2ed816`, decode + NMS on the host; COCO128 mAP@0.5:0.95 0.343 against float's 0.349, head maps bit-exact vs the scheduler simulation |
 | [`camera/`](camera/) | MobileNetV1 1.0/224 | live Intel RealSense feed | Live classification on the board; annotated frames stream back over SSH with inference latency and whole-board power |
-| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + RowOpsKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (266 ms per inference) |
-| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium | chat messages (and images), text to speak, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions` and `/v1/audio/speech`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm` and `piper`: question answering over a user-supplied document (~1 s per 256-token window), generative multi-turn chat (SmolLM2-135M ~20.3 tokens/s, 360M ~7.7 tokens/s), questions about images sent as OpenAI `image_url` parts (3.9 s per image, then ~9.5 tokens/s) and text to speech (first sound after 1.0–1.5 s, faster than real time); works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
-| [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.7 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
-| [`miranda/`](miranda/) | Moonshine base, SmolLM2-135M-Instruct, Piper lessac-medium (through the chat server) | the microphone (RTP from a console client) | A voice assistant: "Hello Miranda" and a request; voice activity detection on the board's CPU, the key phrase found in the transcripts, the answer streamed as text and spoken back; the microphone muted while Miranda thinks and speaks; a dialogue mode without the key phrase (by voice, `--dialogue` or `d` + Enter) that ends after silence |
+| [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + RowOpsKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (266 ms per inference) on bitstream `de968ccc45da` |
+| [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium, Moonshine base | chat messages (and images), text to speak, audio to transcribe, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions`, `/v1/audio/speech` and `/v1/audio/transcriptions`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm`, `piper` and `moonshine`: question answering over a user-supplied document (~0.27 s per 256-token window on bitstream `de968ccc45da`), generative multi-turn chat (SmolLM2-135M ~20.3 tokens/s, 360M ~7.7 tokens/s on bitstream `1cedaf2ed816`), questions about images sent as OpenAI `image_url` parts (1.6 s per image, then ~20 tokens/s on bitstream `de968ccc45da`), text to speech (first sound after 1.0–1.5 s at 100 MHz, faster than real time) and speech to text; works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
+| [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.15 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
+| [`miranda/`](miranda/) | Moonshine base, SmolLM2-360M-Instruct, Piper lessac-medium (through the chat server) | the microphone (RTP from a console client) | A voice assistant: "Hello Miranda" and a request; voice activity detection on the board's CPU, the key phrase found in the transcripts, the answer streamed as text and spoken back; the microphone muted while Miranda thinks and speaks; a dialogue mode without the key phrase (by voice, `--dialogue` or `d` + Enter) that ends after silence |
 
 ## Common workflow
 
@@ -59,17 +60,18 @@ performance model; for `chat/` use `deploy.py --regenerate --plan` (BERT) and
 - **Host:** Python 3.10+ and each demo's `requirements.txt` (or the
   scheduler's `.venv`, see above).
 - **Kernel drivers:** build the kernel IP from the repo root first —
-  `cmake .. && make synthesize_kv260` in `build/` (the RTL MatmulKernel's,
-  VectorOPKernel's and PoolingKernel's drivers: `build/kernels/matmul_rtl/driver/`,
-  `build/kernels/vectorop_rtl/driver/`, `build/kernels/pool_rtl/driver/`) — and point
+  `cmake .. && make synthesize_kv260` in `build/` (the five RTL kernels'
+  drivers: `build/kernels/conv_rtl/driver/`, `build/kernels/matmul_rtl/driver/`,
+  `build/kernels/vectorop_rtl/driver/`, `build/kernels/pool_rtl/driver/`,
+  `build/kernels/rowops_rtl/driver/`) — and point
   `local.driver_dirs` at the result.  The driver sources only describe the
   AXI-Lite registers, so they are the same for every `AXI_BUS_WIDTH`.
 - **KV260 board:** Linux with the bitstream and overlay loaded
   (`inference-scheduler/upload_bitstream.py`, see *Quick start* step 5 in
   the [root README](../README.md#quick-start); UIO devices `fabric_vecop` /
-  `fabric_matmul` / `fabric_conv` / `fabric_pool`), `gcc` / `cmake` /
-  `make`, the XRT runtime, and passwordless `sudo`.  The numbers in the
-  demo READMEs were measured with the 128-bit block design
+  `fabric_matmul` / `fabric_conv` / `fabric_pool` / `fabric_rowops`),
+  `gcc` / `cmake` / `make`, the XRT runtime, and passwordless `sudo`.  The
+  numbers in the demo READMEs were measured with the 128-bit block design
   (`hw/cormorant_hw_128`) at 100 MHz, the dated transcripts; since
   FMAX_250_PLAN the kernels run at 250 MHz (the current numbers are in the
   root README's results).  The

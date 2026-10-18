@@ -112,9 +112,10 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
   `--no-weights`), but only if it is empty or holds this model's project —
   another model's project or other files need `--force`.
 - Defaults are the shipped design — keep them: buckets `16,64,256`, context
-  1024, `--prefill-engine conv`, `--prefill-attn fpga --decode-attn fpga`
-  (policy `pow2+sink+p12`: the attention on ConvKernel in prefill and decode,
-  KV_DECODE_PLAN; `--decode-attn host` builds the previous `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
+  1024, `--prefill-engine conv`, `--prefill-attn fpga --decode-attn fpga`,
+  `--vsmx / --rowops / --drope auto` (policy `pow2+sink+p12+vsmx+rowops+drope` on the
+  production platform: the attention on ConvKernel in prefill and decode,
+  KV_DECODE_PLAN; `--decode-attn host --vsmx off --rowops off` builds the previous `pow2+sink+p12+mix`).  `--plan` is optional and bit-identical (needs
   `inference-scheduler/perf_models/kv260/<bitstream-id>.json` of the board's
   bitstream; gains ≤ ~1 %, TACTICS_PLAN §9).
 - **Host RAM peak** (dev PC 46 GB): 135M 3.3 GB / ~60 s, 360M 8.2 GB /
@@ -127,9 +128,9 @@ $PY demo/chat/scripts/generate_llm_project.py --assets demo/chat/assets/$N --mod
   intermediates) close to `llama_fit.py`'s estimate and < ~920; no
   `missing driver files` warning (drivers come from
   `demo/bert_squad/bert_squad_config.json` `local.driver_dirs`; never generate
-  while a conv synthesis rewrites `build*/…/drivers/`).  360M: pool 740.2 MiB,
-  weight files 818 MB, 224 / 224 MatMuls of `prefill_64` / `prefill_256` on
-  ConvKernel (kw 4) and of `prefill_16` on MatmulKernel, 225 decode on GEMV.
+  while a conv synthesis rewrites `build*/…/drivers/`).  360M: pool 757.0 MiB,
+  weight files 834 MB, 224 / 224 MatMuls of `prefill_64` / `prefill_256` on
+  ConvKernel (kw 4), 160 of `prefill_16`'s on ConvKernel and 64 on MatmulKernel, 225 decode on GEMV.
 
 ## 3. Host gates — bit-exact before any board time
 
@@ -140,8 +141,8 @@ $PY demo/chat/scripts/llm_host_emu.py --project demo/chat/build/llm_project_$T \
     --study-json demo/chat/assets/study/$N/gate2.json [--incoherent]
 ```
 
-- `llm_sched_check.py`: scheduler simulation == study emulation of
-  `pow2+sink+p12` (the project's `--decode-attn`), every logits vector, for `factual, summarise,
+- `llm_sched_check.py`: scheduler simulation == study emulation of the
+  project's policy (its `--decode-attn` / `--vsmx` / `--rowops` / `--drope`), every logits vector, for `factual, summarise,
   multi-turn` + a second `factual` turn at position 69, 32 greedy decode steps
   each.  **Gate:** `3/3 prompts bit-exact`, exit 0.  `setup` prints `weights
   saturated` (0 so far).  Keep `--prompts / --second-turn / --decode` at the
@@ -247,7 +248,7 @@ nothing — the id and fingerprint come from the library:
   (two `fake_llm_lib(model_name)` copies side by side, `build_backends`
   order / `cma_mb` / fingerprint, default ids and overrides, one id twice →
   `SystemExit`).  **Gate:** `cd demo/chat/tests && python3 -m unittest -v`
-  (188 before, ~60 skip without tokenizers).
+  (230 before, ~60 skip without tokenizers).
 
 **Deploy and talk to it:**
 
@@ -291,8 +292,8 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
   in `DEPLOY.md` the backends table, the pool table under "The FPGA and the
   board lock" and the by-hand server command; the test count in the README
   and `DEVELOPMENT.md`.
-- `README.md`: the results table (~line 32) and the supported-models table
-  (~line 286); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
+- `README.md`: the results table (~line 45) and the supported-models table
+  (~line 346); `doc/README.md`'s CHAT_PLAN line.  Pools are also quoted in
   `kv260_chat_server.py`'s docstring, `chat_config.json.example`, and
   model-study (`SKILL.md` §2.2, `llama_fit.py` `RESIDENT`).
 - Commit set: code, tests, docs, `llm_models.json`, the provenance JSON.
@@ -304,7 +305,7 @@ curl -s http://192.168.100.8:8000/v1/chat/completions -H 'Content-Type: applicat
 $SPY demo/chat/scripts/vlm_study.py fetch       # pins: vlm_study_inputs.json (not llm_models.json); + COCO images
 $SPY demo/chat/scripts/vlm_study.py validate
 $SPY demo/chat/scripts/vlm_study.py formats     # text + vision formats -> assets/study/smolvlm-256m-instruct/ (~3 min)
-$PY demo/chat/scripts/generate_llm_project.py --model-name smolvlm-256m-instruct   # assets implied; 90 s, 3.3 GiB (CHAT_PLAN §25)
+$PY demo/chat/scripts/generate_llm_project.py --model-name smolvlm-256m-instruct   # assets implied; ~110 s, 3.3 GiB (CHAT_PLAN §25: 90 s)
 $PY demo/chat/scripts/vlm_sched_check.py --text  # vision 2/2 images + text 2/2 prompts x 16 steps bit-exact
 $PY demo/chat/scripts/vlm_host_emu.py [--incoherent]           # HOST EMULATION: logits bit-exact, re-open identical
 $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_smolvlm_256m --decode 16 --reopen [--profile]

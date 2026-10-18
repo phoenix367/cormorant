@@ -143,11 +143,11 @@ bitstream needs one there too.
    `perf_config.json.example` if it is missing. It needs:
    - `remote.uio_devices` keyed **`PoolingKernel`** (the run_remote_perf naming). A
      `remote_config*.json` says `PoolKernel`, and then every pool case fails;
-   - all four `local.driver_dirs`, because `calib_runner` is only built with all four. They
+   - all five `local.driver_dirs`, because `calib_runner` is only built with all five. They
      must hold the register maps of the LOADED bitstream. They point at `build/` (the
-     verification tree), while the bitstream comes from `build_hw128`. All four must print `same`:
+     verification tree), while the bitstream comes from `build_hw128`. All five must print `same`:
      ```bash
-     for f in $(cd ../build_hw128 && ls kernels/{vectorop,conv,matmul,pool}_rtl/driver/*/src/x*_hw.h); do
+     for f in $(cd ../build_hw128 && ls kernels/{vectorop,conv,matmul,pool,rowops}_rtl/driver/*/src/x*_hw.h); do
          cmp -s ../build/$f ../build_hw128/$f && echo "same $f" || echo "DIFF $f"; done
      ```
 4. **Chat server stopped.** It owns the kernels and the CMA.
@@ -190,9 +190,10 @@ Use the same id throughout.
 `N cases -> perf_models/kv260/<id>.cases.json (…); about N min of calls per pass`.
 The grid (seed 2026, a quarter held out) is 569 calls.
 - **The first record** had 1087 cases (518 shipped + 569 grid).
-- **Today's scheduler** gives 1249:
+- **The scheduler of 2026-10-01** gave 1249:
   - the LeNet FC convs have run as MatMul since 8e537bc (+3);
   - Piper adds 159 calls, 139 ConvKernel and 20 MatMul tactics (2026-10-01).
+- **Today's** gives 2599 (04259a7af917: 2000 shipped + 569 grid + 30 chain cases).
 - The file is rewritten from scratch, so run `cases --refine` after it.
 Keep the default `--seed`. Keep all models too: `--models` is for experiments only, because a
 model made from part of the list lacks the exact entries of the models left out.
@@ -200,7 +201,7 @@ model made from part of the list lacks the exact entries of the models left out.
 **run**: builds the bench project on the board (`upload / cmake / make → OK`).
 It refuses with `error: the board runs bitstream X, the cases are for Y`,
 `error: the chat server is running (it owns the kernels); pass --stop-server`
-or `error: calib_runner was not built (all four kernels' drivers are needed)`.
+or `error: calib_runner was not built (all five kernels' drivers are needed)`.
 It then runs two passes (`pass 1: N cases (M done)` … `pass 2: N/N (T s)`,
 `measurements -> …calib.json`). Pass 2 uses a shuffled order and buffers filled with 0x5A
 instead of 1. That is the determinism check. calib.json is saved after every chunk (`--chunk-seconds`, default 60).
@@ -241,7 +242,7 @@ under the planner's 5 % trust threshold.
 - The family errors should be close to the table above. The `note:` line is EXPECTED:
   only GEMV met the §4.3 target of 3 % (caa67f49a5a3; on 1d28630fbfa4 none did, mm-gemv 3.22 %; on bbb9a37f73f8 mm-gemv 2.89 %, on 68665fc1833a 2.91 %, on b3309f424562 0.89 %, on dbb320fb7297 0.79 %).
 - The planner trusts a family prediction only when the family's held-out p90 is at most 5 %
-  (`perf_model.MAX_MODEL_ERROR`). Today (dbb320fb7297: 0.79 / 3.22 %, as on the bitstreams before it) that is mm-gemv and mm-tiled. Every other tactic needs an
+  (`perf_model.MAX_MODEL_ERROR`). Today (04259a7af917: mm-tiled 7.8 %, mm-gemv 18.3 %) that is no family; on dbb320fb7297 (0.79 / 3.22 %) it was mm-gemv and mm-tiled. Every other tactic needs an
   exact entry. That is why the refinement exists.
 - `call_overhead_us` (the minimum measured call) was 3.121 µs.
 
