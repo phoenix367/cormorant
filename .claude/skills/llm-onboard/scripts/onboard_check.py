@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """onboard_check.py — llm-onboard's intake gate for a Llama-family checkpoint
 that passed model-study (llama_fit.py eligible, numerics GO): which steps of
 the SmolLM2 path it can take UNCHANGED and which need code, before an hour of

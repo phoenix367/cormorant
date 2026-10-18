@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # make_fixture.sh <build-dir> <test-index> <out-dir>
 # Copy one dumped ConvKernel test case (from <build-dir>/conv_test_data) into
 # a standalone fixture directory the test stand can run on its own.

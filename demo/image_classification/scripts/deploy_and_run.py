@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 deploy_and_run.py — upload a generated image-classification project to the
 KV260, build it on the board, push the labels + preprocessed images, and

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """generate_tts_project.py — the Piper voice + calibrated exponents -> the KV260
 project behind libpiper_tts.so (doc/plans/TTS_PLAN.md §4).
 

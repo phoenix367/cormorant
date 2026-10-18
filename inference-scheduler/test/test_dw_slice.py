@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Depthwise channel slices (OnnxGraph(dw_slice=...), cost_model.dw_slice,
 doc/scheduler/INFERENCE_SCHEDULER.md §Depthwise channel slices): a batch-1
 depthwise Conv issued as several ConvKernel calls of 16 / 32 / 64 channels

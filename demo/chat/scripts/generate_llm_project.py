@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 generate_llm_project.py — schedule a Llama-family checkpoint with a formats
 JSON (SmolLM2-135M / 360M-Instruct; SmolVLM-256M-Instruct with its vision

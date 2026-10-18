@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Kernel call signatures — the register values that set a kernel call's run
 time (doc/plans/TACTICS_PLAN.md §3).

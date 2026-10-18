@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // MatmulKernel.cpp — the C++ reference model of the RTL MatmulKernel
 // (kernels/matmul_rtl): the fixture generator of its testbench.  Its structure

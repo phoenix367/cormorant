@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_awr — A writer of read port P: stores the port's A-panel rows (gearbox
 // beats of A runs) into the A buffer, splitting K between the two lanes.

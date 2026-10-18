@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // rowops_ref.h — the RowOpsKernel's oracle: a C++ port of the integer
 // specifications of inference-scheduler/src/rowops_spec.py (the file that

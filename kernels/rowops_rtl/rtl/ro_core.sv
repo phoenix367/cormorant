@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_core — the RowOpsKernel (doc/kernels/ROWOPS_RTL_KERNEL.md): the row ops
 // of the transformer graphs on streams of rows, in fixed point.  The IP top

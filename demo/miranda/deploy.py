@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 deploy.py — install and start Miranda's server on the KV260 (run on the host
 with inference-scheduler/.venv/bin/python).

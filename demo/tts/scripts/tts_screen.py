@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """tts_screen.py — screen TTS models for the KV260 by GMAC per second of
 generated audio (doc/plans/TTS_PLAN.md §2).  Host only.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 tts_board.py — build libpiper_tts.so + tts_bench on the KV260 and run the
 TTS board gate (doc/plans/TTS_PLAN.md §4, §6, §7): the PCM of real utterances

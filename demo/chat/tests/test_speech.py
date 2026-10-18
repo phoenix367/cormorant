@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """POST /v1/audio/speech of kv260_chat_server.py against a fake speech
 backend: formats (wav / pcm with a Content-Length, mp3 / flac through ffmpeg,
 chunked), SSE events, model aliases and defaults, OpenAI-style errors, the

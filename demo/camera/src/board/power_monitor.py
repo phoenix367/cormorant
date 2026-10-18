@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 power_monitor.py — board-side SOM power sampling for the KV260 camera demo.
 

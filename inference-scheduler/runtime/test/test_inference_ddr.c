@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * test_inference_ddr.c — exercise the failure-path behaviour of the
  *                       inference_ddr module on hosts that don't have

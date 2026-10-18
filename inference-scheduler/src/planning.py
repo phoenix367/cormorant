@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Planning options — the opt-in ``--plan`` mode of doc/plans/TACTICS_PLAN.md.
 

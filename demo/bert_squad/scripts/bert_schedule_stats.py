@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Work per engine in the schedule the inference scheduler generates for a
 model (BERT_PLAN phase 1 gate (c) / phase-2 sizing): kernel calls and MACs,
 VectorOP element ops, host-op element counts and DMA-buffer traffic, and a

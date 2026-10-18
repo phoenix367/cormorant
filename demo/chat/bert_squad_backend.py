@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """bert_squad_backend.py — backend A of the KV260 chat server: extractive
 question answering with BERT-base SQuAD (bertsquad-12) on the FPGA.
 Python standard library only (ctypes); the text side is

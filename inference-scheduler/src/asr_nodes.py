@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Speech-to-text ops (Moonshine, doc/plans/ASR_PLAN.md §3; the frontend
 src/moonshine.py).  The specification is demo/asr/scripts/moonshine_q.py: the

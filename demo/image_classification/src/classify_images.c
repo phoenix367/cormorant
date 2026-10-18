@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * classify_images.c — KV260 image-classification host for the
  *                     image_classification demo.

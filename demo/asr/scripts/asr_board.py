@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 asr_board.py — build libmoonshine_<size>.so + asr_bench on the KV260 and run
 the ASR board gate (doc/plans/ASR_PLAN.md §6): every token id of the

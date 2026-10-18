@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """smollm2_backend.py — backend B of the KV260 chat server: generative chat
 with SmolLM2-135M-Instruct (libsmollm2.so) or SmolLM2-360M-Instruct
 (libsmollm2_360m.so) on the FPGA (doc/plans/CHAT_PLAN.md §11, §20).  Python standard library only (ctypes); text side in

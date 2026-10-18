@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 LightStereo-S frontend (doc/plans/STEREO_PLAN.md): a rectified stereo pair ->
 a disparity map, every layer on this repo's kernels or host ops.

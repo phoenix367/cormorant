@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tests for saturation handling in simulation and generated code.
 

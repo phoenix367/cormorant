@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for live-interval computation and buffer-slot reuse.
 
 Verifies that _compute_live_intervals() returns correct produce/consume

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """make_r5_bsp.py — the Cortex-R5 standalone BSP of this bitstream (RPU_PLAN B1).
 
 Run with the Vitis Python interpreter (it drives the Vitis server):

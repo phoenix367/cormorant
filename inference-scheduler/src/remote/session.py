@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Persistent SSH + SFTP session for remote board interactions."""
 
 import os

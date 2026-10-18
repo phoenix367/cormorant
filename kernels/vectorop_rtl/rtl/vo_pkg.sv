@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_pkg — shared parameters and types of the VectorOPKernel RTL.
 // ---------------------------------------------------------------------------

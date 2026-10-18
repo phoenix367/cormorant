@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Moonshine speech to text (doc/plans/ASR_PLAN.md §3): the encode_<T> and decode
 entries of src/moonshine.py through the scheduler (the stem host ops and the
 row-ops nodes of src/asr_nodes.py, the encoder's non-causal softmax on

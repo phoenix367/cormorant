@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* sampler.c — see sampler.h.  Build:  cc -O2 -shared -fPIC -o libsampler.so sampler.c -lm */
 #include "sampler.h"
 

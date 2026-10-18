@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_div — unsigned restoring division of an N-bit dividend by a 32-bit
 // divisor, one quotient bit per cycle (N cycles from start to done).  The

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """postprocess.py — the stereo_depth demo's results (doc/plans/STEREO_PLAN.md).
 
 Reads the board's build/results/disparity.bin (float32 [H][W] per pair, at

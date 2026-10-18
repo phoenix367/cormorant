@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
     // Matmul: a, b, c, n, k, m, batch, strides, b_packed, gemv_kw
     for (int t = 0; t < 14; t++) begin
       int n, k, m, bt, pk, kw;

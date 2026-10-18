@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 preprocessing.py — board-side camera-frame preprocessing for the KV260
 camera demo.  Runs ON the KV260 (imported by camera_loop.py).

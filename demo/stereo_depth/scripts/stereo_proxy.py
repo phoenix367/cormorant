@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """stereo_proxy.py — a latency proxy of LightStereo-S for the scheduler (doc/plans/STEREO_PLAN.md).
 
 Builds an ONNX graph with LightStereo-S's layers at a resolution, written

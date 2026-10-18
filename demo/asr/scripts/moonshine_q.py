@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Moonshine on the KV260 int16 datapath: a bit-level emulation of the planned
 partition (doc/plans/ASR_PLAN.md) — the specification the scheduler's
 frontend will have to match — and the float64 reference with the same

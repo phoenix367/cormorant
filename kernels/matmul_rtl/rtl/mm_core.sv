@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_core — Q8.8 GEMM / GEMV kernel for the Kria KV260 (RTL).  The IP top
 // level is the Verilog wrapper MatmulKernel.v (generated from this header by

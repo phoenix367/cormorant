@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """stereo_assets.py — the stereo depth demo's pinned assets (doc/plans/STEREO_PLAN.md).
 
 Standard library only (the demo runs in inference-scheduler/.venv; the study,

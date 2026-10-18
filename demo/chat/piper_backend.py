@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """piper_backend.py — text to speech with Piper (VITS, en_US-lessac-medium) on
 the KV260 for the chat server (POST /v1/audio/speech; doc/plans/TTS_PLAN.md §5).
 

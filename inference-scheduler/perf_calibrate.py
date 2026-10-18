@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 perf_calibrate.py — the calibration campaign of the performance models
 (doc/plans/TACTICS_PLAN.md §4.3).  Once per bitstream: measure kernel calls

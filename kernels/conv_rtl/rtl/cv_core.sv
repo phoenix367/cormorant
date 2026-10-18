@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_core — the RTL ConvKernel: the HLS kernel's ports, registers and
 // results (VLNV xilinx.com:hls:ConvKernel:1.0; ConvKernel.v is the

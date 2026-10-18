@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """stereo_study.py — can the KV260 run a stereo depth network?  (doc/plans/STEREO_PLAN.md)
 
 LightStereo-S (OpenStereo, Guo et al. 2024, arXiv 2406.19833): a MobileNetV2

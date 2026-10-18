@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """wake.py — the key phrase in a transcript ("Hello Miranda"), fuzzily.
 
 The speech recognizer writes the phrase in many ways — "Hello, Miranda.",

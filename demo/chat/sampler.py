@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """sampler.py — next-token sampling for the KV260 chat server (standard
 library only).
 

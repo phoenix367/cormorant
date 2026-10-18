@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Piper (VITS) inference in numpy, with the fixed-point emulation of the
 study's KV260 partition (doc/plans/TTS_PLAN.md §3) and the bit-exact
 specifications of libpiper_tts.so: chunk_forward (§4), encoder_forward (§6)

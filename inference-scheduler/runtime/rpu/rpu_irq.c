@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * rpu_irq.c — the kernel lanes of the Cortex-R5 firmware and their
  * interrupt-driven waits (RPU_PLAN §4.2, §9.4).

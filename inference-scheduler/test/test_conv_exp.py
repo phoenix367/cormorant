@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Convs on tensors with power-of-two exponents (src/numeric.py
 encode_conv_weights, the simulator's _conv_exp): ConvKernel sums raw int16
 products exactly and writes floor(acc / 2^8) saturated, so the weight sits

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // pl_reduce — accumulate window beats and finalise (the HLS
 // process_pool_kernel_tile).

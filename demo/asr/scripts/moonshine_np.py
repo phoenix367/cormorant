@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Moonshine in numpy float64: the study's float reference, validated against
 transformers in asr_study.py validate.
 

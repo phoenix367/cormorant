@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared pieces of the SmolLM2 (Llama-family) decoder on the KV260 —
 doc/plans/CHAT_PLAN.md phase 3: model / formats loading, the entry graphs of the
 multi-entry project, the prefill bucket split the library uses, and a

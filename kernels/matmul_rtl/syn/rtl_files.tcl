@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # RTL source list (compile order) shared by the Vivado scripts.
 set rtl_files [list \
   $root/rtl/mm_pkg.sv \

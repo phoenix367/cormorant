@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the runtime/ inference_prof.{h,c} module.
 
 Compiles inference_prof.c together with runtime/test/test_inference_prof.c

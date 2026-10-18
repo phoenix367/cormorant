@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* sampler.h — next-token sampling for the KV260 chat server (libsampler.so).
  *
  * Operates on the float logits the decoder library returns (llm_decode /

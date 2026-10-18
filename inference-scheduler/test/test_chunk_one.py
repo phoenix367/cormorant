@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for chunk_one model — maximum alignment gap (chunk=1, gap=7)."""
 
 import re

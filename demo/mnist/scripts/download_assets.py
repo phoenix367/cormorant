@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 download_assets.py — fetch MNIST test set + ONNX models for the demo.
 

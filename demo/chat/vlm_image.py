@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """vlm_image.py — images of OpenAI chat requests for SmolVLM
 (doc/plans/CHAT_PLAN.md §23): an `image_url` part's URL (a base64 data URL)
 -> the 512 x 512 RGB pixels the library's llm_image() takes.

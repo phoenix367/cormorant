@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.remote.config — SHARED_DEFAULTS, deep_merge, load_config, UIO helpers."""
 
 import json

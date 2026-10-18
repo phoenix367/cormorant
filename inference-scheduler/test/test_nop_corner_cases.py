@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Corner-case tests for NOP layers (Dropout / Squeeze / Reshape / ...) under
 the parallel-wait code generator.
 

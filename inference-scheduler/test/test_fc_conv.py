@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Fully-connected Convs -> MatMul (src/fc_conv.py, doc/plans/LENET_PLAN.md).
 
 A Conv whose kernel covers its whole unpadded input (one output pixel) is

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Speech to text: speech_input.py (WAV forms, the resampler, ffmpeg), the
 tokenizer.json reader, the phrase check (phrase_decode over a scripted
 decoder) and MoonshineBackend of moonshine_backend.py over a fake library, and

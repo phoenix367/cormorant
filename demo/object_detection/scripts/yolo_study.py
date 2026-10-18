@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """yolo_study.py — model study of YOLOv5n for the KV260 (model-study skill,
 route B; doc/plans/YOLO_PLAN.md §3).  Host only.
 

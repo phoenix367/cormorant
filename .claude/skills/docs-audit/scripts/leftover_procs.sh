@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # leftover_procs.sh — find (and with --kill, stop) host processes a
 # reproduction agent left behind (docs-audit mode B, step 5): every process of
 # this user whose command line mentions DIR or whose cwd is under DIR, plus

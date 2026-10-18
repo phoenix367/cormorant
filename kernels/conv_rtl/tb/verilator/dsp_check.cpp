@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // dsp_check — drives dsp_check.sv with random operands, seeds and accumulate
 // patterns and compares the behavioural chain with the DSP48E2 model every
 // cycle; also checks the chain against a scalar model of the documented timing.

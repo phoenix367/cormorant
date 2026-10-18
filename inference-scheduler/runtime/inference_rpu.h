@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * inference_rpu.h — drive the kernels from the Cortex-R5 (RPU_PLAN track B1).
  *

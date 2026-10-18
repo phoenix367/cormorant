@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """smolvlm_backend.py — backend C of the KV260 chat server: chat with images,
 SmolVLM-256M-Instruct on the FPGA (libsmolvlm_256m.so: the §11 C API plus
 llm_image(); doc/plans/CHAT_PLAN.md §23).  Standard library + Pillow (image

@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate ONNX test models that exercise parallel-kernel scheduling.
 
 Each fixture produces a graph whose dependency DAG has at least two

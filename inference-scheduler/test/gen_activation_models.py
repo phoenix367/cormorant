@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate ONNX test models for VectorOPKernel's activation unit
 (doc/plans/ACTIVATIONS_PLAN.md): LeakyReLU, SiLU, GELU and GELU tanh, as
 ops and fused after an Add / Mul / Div.

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Cache-coherency audit of the emitted inference_run() (BERT_PLAN phase 2B).
 
 The XRT buffer objects are mapped CACHEABLE on the board and the PL kernels'

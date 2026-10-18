@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Host-CPU ops of a SigLIP-style vision encoder — SmolVLM-256M-Instruct's
 (doc/plans/CHAT_PLAN.md §22-§23).  ONNX nodes of the domain ``axi.llm``

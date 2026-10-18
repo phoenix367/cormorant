@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* bench_matmul.c — MatmulKernel latency / GOps/s benchmark
  *
  * args: instance label n k m batch a_batch_stride b_batch_stride b_packed gemv_kw iters [warmup [layout]]

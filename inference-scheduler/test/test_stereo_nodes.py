@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The stereo depth ops (src/stereo_nodes.py, doc/plans/STEREO_PLAN.md) and
 the copies with exponents (numeric.check): every reference against an
 independent float formula, the exponent rules, and a small graph with every

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 prepare_inputs.py — tokenize SQuAD 1.1 dev questions for the KV260 BERT demo.
 

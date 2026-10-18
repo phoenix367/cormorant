@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """demo/bert_squad/scripts/fetch_assets.py against a local HTTP server (no
 network): fresh download, resume of a .part file, md5 / size checks, a web
 page instead of the file, existing files kept, the default model path."""

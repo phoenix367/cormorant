@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 miranda_server.py — Miranda, a voice assistant on the KV260 (runs on the
 board; Python 3 standard library + numpy).

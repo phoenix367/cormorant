@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The CMA boot-size tool (src/remote/cma_boot.py): the size, the boot script
 edit (run with the host's sed on a copy of the board script's layout), the
 board's report — no board."""

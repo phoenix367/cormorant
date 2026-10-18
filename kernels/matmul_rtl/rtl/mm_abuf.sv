@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_abuf — the A panel buffer: one 128-bit x A_D block RAM per (lane, panel
 // row).  RAM (h, r) holds the K elements of panel row r that lane h owns

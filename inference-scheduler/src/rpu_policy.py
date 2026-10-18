@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Who drives the kernels: the A53 itself or the Cortex-R5 firmware
 (doc/plans/RPU_PLAN.md §9.3).  Small models stay on the A53, large ones go to
 the R5.

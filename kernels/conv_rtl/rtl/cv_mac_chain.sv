@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_mac_chain — one column of the MAC grid for one output pixel: a cascade
 // of TIC DSP48E2s computing, per instant E,

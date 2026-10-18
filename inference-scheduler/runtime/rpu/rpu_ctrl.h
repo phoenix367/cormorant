@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * rpu_ctrl.h — the protocol between a generated library on the A53 (Linux,
  * src/inference_rpu.c) and the kernel-driver firmware on the Cortex-R5

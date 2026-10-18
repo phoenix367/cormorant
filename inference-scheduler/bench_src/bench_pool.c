@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* bench_pool.c — PoolingKernel latency / GB/s benchmark
  *
  * layout "OFF_X,OFF_Y": x and y at byte offsets inside one buffer (PS_PORTS_PLAN §11)

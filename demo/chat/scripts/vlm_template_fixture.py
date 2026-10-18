@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 vlm_template_fixture.py — writes demo/chat/tests/data/smolvlm_cases.json, the
 references the stdlib tests of the SmolVLM backend compare against

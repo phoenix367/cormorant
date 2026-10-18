@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for clip_opset10 model — Clip(min=0, max=6) via opset-10 attributes."""
 
 import unittest

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * llm_bench.c — KV260 runner for libsmollm2 (llm_api.c): the phase-3 board
  * gate of doc/plans/CHAT_PLAN.md.

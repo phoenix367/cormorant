@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 The graphs of a Llama multi-entry project (src/llama.py entries: decode,
 prefill_<T>, head) scheduled so that the project keeps ONE copy of every

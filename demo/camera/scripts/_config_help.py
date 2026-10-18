@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared error formatting for the camera demo scripts.
 
 download_assets.py / generate_project.py / deploy_and_run.py and the

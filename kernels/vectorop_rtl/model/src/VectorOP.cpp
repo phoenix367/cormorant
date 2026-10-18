@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // VectorOP.cpp — the C++ reference model of the RTL VectorOPKernel
 // (kernels/vectorop_rtl): its testbench oracle and fixture generator.  Its

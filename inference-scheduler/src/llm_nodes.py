@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Host-CPU ops of a Llama-family decoder (doc/plans/CHAT_PLAN.md §3.2 B2, §10.5).
 

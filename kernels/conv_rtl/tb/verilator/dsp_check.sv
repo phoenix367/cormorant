@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // dsp_check — the behavioural cv_mac_chain against the DSP48E2 primitive
 // (Vivado's unisim simulation model), on the same stimulus.
 module dsp_check

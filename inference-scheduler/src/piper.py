@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Piper (VITS) text-to-speech frontend (doc/plans/TTS_PLAN.md §4): the Piper
 ONNX export's weights + calibrated exponents -> the ``chunk`` entry graph

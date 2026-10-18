@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Build a minimal xclbin containing only a MEM_TOPOLOGY section."""
 
 import json

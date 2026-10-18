@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Verify a cormorant_test_stand JSON scoreboard report.
 
 Used by the per-kernel `behavior_test_<k>` targets in the top-level

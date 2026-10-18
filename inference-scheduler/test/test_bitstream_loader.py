@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """upload_bitstream.py's board steps that guard the overlay stack (src/bitstream/):
 a refused overlay removal stops the upload, and a UIO device that kept an old
 interrupt is rebound — both against a fake SSH session."""

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """RowOpsKernel descriptor chains in the generated code (doc/plans/RPU_PLAN.md
 §13.3, A2.4): with ``kernels.rowops.chains`` a row-ops node of two or more jobs
 collects them as 128-byte descriptors in its region at the end of the pool and

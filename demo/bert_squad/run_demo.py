@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 run_demo.py — one-shot BERT-SQuAD demo: prepare_inputs -> generate_project
 -> deploy_and_run.

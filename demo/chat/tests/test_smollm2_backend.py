@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The smollm2 backend (smollm2_backend.py) against fakes of libsmollm2.so
 (doc/plans/CHAT_PLAN.md §11): tests/fake_llm.py's ScriptedEngine (Python) and
 tests/fake_libsmollm2.c through the real ctypes binding (LibLlmEngine).

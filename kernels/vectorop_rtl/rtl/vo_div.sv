@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_div — Q8.8 division, one lane per cycle, fully pipelined (26 cycles).
 //

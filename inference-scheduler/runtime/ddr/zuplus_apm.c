@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * ddr/zuplus_apm.c — ZU+ MPSoC AXI Performance Monitor backend.
  *

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 `verilator_config
 // Port name fixed by the HLS interface contract.
 lint_off -rule SYMRSVDWORD -file "*/ro_core.sv" -match "*interrupt*"

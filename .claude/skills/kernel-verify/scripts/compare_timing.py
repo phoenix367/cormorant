@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Compare a MatmulKernel / VectorOPKernel / PoolingKernel / ConvKernel behaviour-test report
 against the previous run.
 

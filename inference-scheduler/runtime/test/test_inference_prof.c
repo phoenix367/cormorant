@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * test_inference_prof.c — exercise individual scenarios of the
  *                        inference_prof.{h,c} runtime module.

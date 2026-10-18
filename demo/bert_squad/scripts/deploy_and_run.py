@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 deploy_and_run.py — run the generated BERT-SQuAD project on the KV260 and
 score it.

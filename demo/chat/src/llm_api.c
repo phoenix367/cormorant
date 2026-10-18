@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * llm_api.c — see llm_api.h.  The model-specific glue (entry functions,
  * vocabulary, context, prefill buckets, UIO instances) comes from the

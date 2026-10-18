@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 llm_calibrate.py — the study stage of the Llama decoders from pinned inputs:
 checkpoint and texts fetched and verified, the power-of-two exponents

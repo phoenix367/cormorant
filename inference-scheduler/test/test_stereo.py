@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The LightStereo-S frontend (src/stereo.py, doc/plans/STEREO_PLAN.md): the
 torch-free checkpoint reader, the stripe split, the polyphase deconvs, the
 exponent solver, and the whole network with random weights of the real

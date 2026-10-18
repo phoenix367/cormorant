@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 miranda_client.py — the console client of Miranda, the voice assistant on the
 KV260 (Python 3 standard library only; runs on a laptop).

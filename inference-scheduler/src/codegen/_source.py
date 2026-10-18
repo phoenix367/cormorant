@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Mixin that generates src/inference.c."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for single-pool DMA buffer allocation in generated inference.c (TestPoolAlloc).
 
 Verifies that inference_init() allocates one contiguous pool, carves

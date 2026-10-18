@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 fetch_assets.py — download the BERT-SQuAD demo's assets into
 demo/bert_squad/assets/ (not in git) and check them:

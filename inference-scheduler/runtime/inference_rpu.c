@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * inference_rpu.c — the recorder behind inference_rpu.h.  While the R5
  * drives a run, each driver instance's Ctrl_BaseAddress points at a shadow

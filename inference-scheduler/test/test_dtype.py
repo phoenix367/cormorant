@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.dtype — Float32 path + DataType default implementations.
 
 Most production code paths exercise ApFixed<16,8>, so Float32 and the

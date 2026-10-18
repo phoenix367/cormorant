@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """chatml.py — SmolLM2's chat template (ChatML) and history trimming
 (standard library only).
 

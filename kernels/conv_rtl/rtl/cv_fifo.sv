@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_fifo — synchronous first-word-fall-through FIFO, valid/ready on both
 // sides.

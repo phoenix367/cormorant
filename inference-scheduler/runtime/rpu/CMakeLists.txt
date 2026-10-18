@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # runtime/rpu/CMakeLists.txt — the kernel-driver firmware for the Cortex-R5
 # (RPU_PLAN track B1): rpu_main.c (the command-stream loop behind the control
 # block of rpu_ctrl.h) + rpu_irq.c (the GIC, the kernels' interrupts, the

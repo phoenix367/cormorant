@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_drain — a finished chunk's accumulators to channel-major output words
 // (the HLS Phase 3), while the engine computes the next chunk in the other

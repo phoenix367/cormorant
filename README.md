@@ -20,11 +20,10 @@ image and speech models.
   <em>▶ <a href="https://youtu.be/VVS7ExW0XYQ">Watch the demo</a> (1 min): SmolLM2-360M chatting on the KV260, and remembering the conversation</em>
 </p>
 
-> **About this fork.**  This repository is an independent fork of Cormorant.
-> It is not affiliated with, endorsed by or supported by any company,
-> institution or funding programme.  The original Cormorant code was
-> developed by GradeBuilder S.L.; its copyright notice is kept in
-> [LICENSE](LICENSE) as the Apache License 2.0 requires.
+> **About this fork.**  This repository is an independent fork of Cormorant,
+> developed and maintained by Ivan Gubochkin since the fork.  It is not
+> affiliated with, endorsed by or supported by any company, institution or
+> funding programme.
 
 ---
 
@@ -393,7 +392,8 @@ and every document with a one-line summary:
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).  The original Cormorant code is
-copyright GradeBuilder S.L. (the notice in LICENSE is kept); changes in this
-fork are distributed under the same license.  Third-party code adapted in
-this repository keeps its notices in the source files.
+Copyright 2026 Ivan Gubochkin; portions copyright 2025 GradeBuilder SL — the
+code from GradeBuilder S.L.'s Cormorant up to the fork (commit `ca27075`,
+2026-08-21).  Every source file names its copyright holders in its first
+lines; [NOTICE](NOTICE) explains the notices and lists the third-party code.
+Licensed under the Apache License 2.0 — see [LICENSE](LICENSE).

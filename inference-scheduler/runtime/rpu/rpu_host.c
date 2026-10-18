@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * rpu_host.c — the gate of a generated project on the Cortex-R5 (RPU_PLAN
  * track B1): a Linux program that runs the project's library twice per

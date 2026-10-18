@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_fold — OP_FOLD (op 9, ROWOPS_RTL_KERNEL.md §1.4, HOSTOPS_PLAN.md §11):
 // Piper's TtsPrep.  Output channel k reads the int16 source row at element

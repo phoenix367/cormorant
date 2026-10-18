@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for large-weight external .dat file handling (TestLargeWeightDat)."""
 
 import os

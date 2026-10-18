@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_rope — the ROPE op of the RowOpsKernel (ROWOPS_RTL_KERNEL.md §1.4):
 // rotate-half RoPE on rows of m head segments of HD int16 elements, bit for

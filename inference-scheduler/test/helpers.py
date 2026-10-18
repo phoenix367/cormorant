@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 def _model(name: str) -> str:

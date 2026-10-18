@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * llm_api.h — libsmollm2.so: a Llama-family decoder (SmolLM2-135M-Instruct)
  * on the KV260's FPGA kernels.  The C API of doc/plans/CHAT_PLAN.md §11.

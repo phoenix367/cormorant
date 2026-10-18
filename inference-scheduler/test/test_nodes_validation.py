@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Validation-path tests for src.nodes — exercises every SchedulerError raise
 in the from_onnx_node / validate factories, plus auto_pad branches and
 batched-matmul corner cases.

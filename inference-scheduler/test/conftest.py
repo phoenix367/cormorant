@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import sys
 # Make the inference-scheduler root importable in all test files

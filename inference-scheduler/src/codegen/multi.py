@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Multi-entry projects (doc/plans/CHAT_PLAN.md §3.2 B2): one generated library with
 one ``inference_run_<entry>()`` per graph — e.g. an LLM's decode step, its

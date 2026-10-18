@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The generator's memory savings change no value (doc/plans/CHAT_PLAN.md §25):
 the forward pass's lean mode, OnnxGraph's weightless validation / shape
 inference, the lazy entry models and checkpoints, and the constant arrays

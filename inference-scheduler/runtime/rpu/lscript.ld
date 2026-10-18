@@ -1,4 +1,9 @@
 /*
+ * Copyright 2026 Ivan Gubochkin
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*
  * lscript.ld — the inference firmware on the Cortex-R5 (RPU_PLAN track B1).
  *
  * RPU core 0's own TCMs: 64 KiB of ATCM at 0x00000000 (the vector table,

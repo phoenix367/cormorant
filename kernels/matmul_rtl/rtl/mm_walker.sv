@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_walker — walks the job's loop nest and emits one step descriptor per
 // (batch slice, panel of R rows, column chunk):

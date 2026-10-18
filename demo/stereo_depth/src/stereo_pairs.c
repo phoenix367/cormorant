@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * stereo_pairs.c — KV260 host of the stereo_depth demo (LightStereo-S).
  *

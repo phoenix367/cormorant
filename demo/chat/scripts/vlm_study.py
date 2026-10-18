@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """B0 numeric study for SmolVLM-256M-Instruct on the KV260 Q8.8 datapath.
 
 The VLM = a SigLIP-style vision encoder (12 layers, 768 wide, FFN 3072, 12

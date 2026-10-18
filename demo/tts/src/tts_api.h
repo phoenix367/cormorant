@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * tts_api.h — libpiper_tts.so: the acoustic back end of Piper (VITS) text to
  * speech on the KV260 (doc/plans/TTS_PLAN.md §4): the reverse flow and the

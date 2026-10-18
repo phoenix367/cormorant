@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Host-CPU ops (BERT_PLAN 1b / 1e): the generated C helpers against the
 simulator's reference, bit for bit.
 

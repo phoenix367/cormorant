@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 vlm_sched_check.py — gate: the scheduler simulation of SmolVLM-256M's
 entries equals the numeric study's emulation bit for bit

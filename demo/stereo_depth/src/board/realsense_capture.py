@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """realsense_capture.py — runs ON the KV260: a rectified stereo pair from an
 Intel RealSense D4xx (doc/plans/STEREO_PLAN.md; uploaded by
 scripts/capture.py).

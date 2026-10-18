@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_ctrl_s_axi — AXI4-Lite control slave of the RowOpsKernel: the HLS
 // register-block layout and ap_ctrl_hs behaviour (as the other RTL kernels'

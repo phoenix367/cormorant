@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * tts_api.c — see tts_api.h.  The chunk geometry is src/piper.py's
  * (FLOW_FRAMES 256, OUT_FRAMES 128, DEC_OFF 32, HOP 256), checked against

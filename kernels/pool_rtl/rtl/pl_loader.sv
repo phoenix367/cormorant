@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // pl_loader — the DDR reader (gmem0): every input row a chunk needs, as one
 // (row, channel) run of words each, in the HLS row_loader's order (rows

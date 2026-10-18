@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 MatmulKernel GEMV streaming mode — the selection pass (doc/kernels/
 MATMUL_OPTIMISATION.md §8b, MatmulKernel.h "GEMV streaming mode").

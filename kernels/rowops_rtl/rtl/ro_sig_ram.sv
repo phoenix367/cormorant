@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_sig_ram — the sigmoid table of the MULACT op (ROWOPS_RTL_KERNEL.md §2):
 // entry i = {D[i], T[i]} with T[i] = round(sigma(i / 2^8) * 2^24) and

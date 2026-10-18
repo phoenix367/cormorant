@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """asr_study.py — model study of speech-to-text models for the KV260
 (model-study skill, route C; doc/plans/ASR_PLAN.md).  Host only.
 

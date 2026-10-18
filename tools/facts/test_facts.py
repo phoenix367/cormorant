@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests of tools/facts: the engine on a throw-away repo (value facts with regex
 and marker mentions and their fixes, mention formats, mapping values,
 interfaces with excluded keys and subsets, recorded facts with tolerances,

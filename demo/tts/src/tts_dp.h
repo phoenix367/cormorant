@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * tts_dp.h — Piper's stochastic duration predictor in C, float64, on the
  * host (doc/plans/TTS_PLAN.md §7): the text encoder's x and the noise z ->

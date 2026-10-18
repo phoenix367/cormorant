@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The execution timeline: the spans of src/codegen/timing.simulate (the CPU
 tiles the run, a kernel lane never overlaps itself, every node ends where
 node_end says) and its profiler windows, the page data of src/timeline_html.py

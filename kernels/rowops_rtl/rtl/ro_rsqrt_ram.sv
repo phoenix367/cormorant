@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_rsqrt_ram — the reciprocal square root table of the NORM op
 // (ROWOPS_RTL_KERNEL.md §2): entry i = round(2^47 / sqrt((i + 0.5) * 2^19))

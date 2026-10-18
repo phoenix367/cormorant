@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 facts.py — the project's fact registry (facts.yaml at the repo root): facts
 that code and docs state in several places, where each one is true, and the

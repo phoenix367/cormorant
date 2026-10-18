@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate ONNX test models for VectorOPKernel's softmax unit
 (doc/plans/SOFTMAX_PLAN.md, src/smx_nodes.py): ONNX Softmax on the last axis.
 

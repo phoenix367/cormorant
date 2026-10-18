@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_core — element-wise Q8.8 vector kernel for the Kria KV260 (RTL).  The IP
 // top level is the Verilog wrapper VectorOPKernel.v (generated from this

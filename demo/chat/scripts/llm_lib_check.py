@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 llm_lib_check.py — exercise libsmollm2.so through ctypes the way the chat
 server does (runs ON THE BOARD, Python stdlib only; phase-4 requirements

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """vcdq.py — tiny VCD query tool for debugging without a waveform viewer.
 
   vcdq.py FILE list [PATTERN]              list signals whose path matches PATTERN

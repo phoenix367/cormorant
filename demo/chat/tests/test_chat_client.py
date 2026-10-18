@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """chat.py's audio: /v1/audio/speech streamed into a player (a recording
 stand-in reading stdin, {rate} substituted), --say, -q --audio,
 --audio-out, the REPL's /audio, /audio save and /say, the WAV fallback

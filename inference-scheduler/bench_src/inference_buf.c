@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* inference_buf.c — DMA-capable buffer implementation for kernel benchmarks */
 #include "inference.h"
 

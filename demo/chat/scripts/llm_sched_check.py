@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase-3 / phase-5 gate 2 (doc/plans/CHAT_PLAN.md §13, §16): the inference
 scheduler's fixed-point simulation of SmolLM2-135M must equal the study's
 emulation of the shipped policy BIT FOR BIT on the logits — for a prefill of

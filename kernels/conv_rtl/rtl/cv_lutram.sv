@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_lutram — distributed RAM, one synchronous write port and one
 // asynchronous read port (simple dual port).

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Engine cost model — estimated cycles of one ConvKernel / MatmulKernel call.
 

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Numeric annotations (src/numeric.py, doc/plans/CHAT_PLAN.md §10.5): power-of-two
 exponents, host-memory tensors, states — metadata parsing and validation,
 the element-type helpers, the rank-1 weight encoding and the simulator's

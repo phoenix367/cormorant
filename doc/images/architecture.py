@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 architecture.py — draws doc/images/architecture.svg, the layered system
 diagram of the main README: applications, the software on the board and on

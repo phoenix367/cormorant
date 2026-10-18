@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """src/rowops_spec.py — the integer row-op specifications against the exact
 functions: every output within 1 LSB of the exactly rounded value, the
 reciprocal square root within 2^-24, the helpers exact."""

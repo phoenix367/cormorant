@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """audio8_study.py — model study of Audio8 TTS Preview 0.1B (model-study
 skill, route C; doc/plans/TTS_PLAN.md §1).  Host only.  The study stops at
 the speed gate, so no weights are downloaded:

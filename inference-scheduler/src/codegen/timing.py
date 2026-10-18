@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Timed replay of the event stream (doc/plans/TACTICS_PLAN.md §4.4).
 

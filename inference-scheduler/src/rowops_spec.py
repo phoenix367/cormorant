@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Integer specifications of the row ops a row-ops unit would run
 (doc/plans/HOSTOPS_PLAN.md §5): what the hardware computes, bit for bit,
 written as plain integer arithmetic so that the simulator, the C fallback

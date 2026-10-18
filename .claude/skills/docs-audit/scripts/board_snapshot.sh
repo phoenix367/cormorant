@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # board_snapshot.sh — READ-ONLY snapshot of the KV260's production state,
 # taken before a fresh-clone reproduction and again after the restore
 # (docs-audit mode B, steps 3 and 5).

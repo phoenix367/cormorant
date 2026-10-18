@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # gen_driver.py — writes the C driver of the RTL RowOpsKernel and checks its
 # register table against the RTL.

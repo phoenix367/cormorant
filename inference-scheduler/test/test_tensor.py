@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for ap_fixed<16,8> weight encoding via DataType abstraction."""
 
 import unittest

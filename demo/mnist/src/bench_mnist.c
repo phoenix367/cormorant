@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * bench_mnist.c — MNIST throughput / accuracy benchmark for KV260.
  *

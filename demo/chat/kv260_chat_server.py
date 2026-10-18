@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 kv260_chat_server.py — OpenAI-compatible chat server for the KV260
 (Python 3.8+ standard library only; runs on the board).

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 tts_host_emu.py — run the generated Piper project on the HOST: the generated
 inference.c, tts_api.c, tts_dp.c and tts_bench.c compiled unchanged against

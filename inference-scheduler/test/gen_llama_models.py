@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tiny random Llama fixtures (doc/plans/CHAT_PLAN.md phase 3, gate 1).
 
 A Llama-architecture model small enough to schedule, simulate and run in

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """gen_tb.py TOP.v JOBS.svh OUT.sv — a lockstep RTL-vs-netlist testbench for a
 kernel top (HLS-style AXI ports): every input is shared, the AXI slaves react to
 the RTL instance, and every output of the netlist is compared with the RTL's

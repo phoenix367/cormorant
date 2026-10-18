@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* bench_rowops.c — RowOpsKernel (the row-ops unit) latency / GB/s benchmark
  *
  * args: instance label op n rows blocks a_s1 a_s2 b_s1 b_s2 c_s1 c_s2 aux win_lo win_hi iters [warmup [layout]]

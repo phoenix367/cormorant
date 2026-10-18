@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 chat.py — a small OpenAI-compatible chat client (Python standard library
 only) for the KV260 chat server; runs on a laptop or on the board.

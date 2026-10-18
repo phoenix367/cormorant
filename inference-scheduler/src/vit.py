@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Vision-encoder frontend (SmolVLM-256M-Instruct: a SigLIP-style ViT + the
 Idefics3 connector; doc/plans/CHAT_PLAN.md §22-§23): config.json + the

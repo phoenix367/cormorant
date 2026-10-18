@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """demo/chat/scripts/generate_llm_project.py: the model name comes from the
 checkpoint directory (it names the project, the library and the board's
 weights directory), and an output directory holding another model's project

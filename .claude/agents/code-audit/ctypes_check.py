@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 ctypes_check.py — every ctypes binding in the given Python files against the
 C prototype of the same symbol in the repo's headers / sources.

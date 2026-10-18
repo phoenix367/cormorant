@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """DRAM bank phases for the DMA pool layout (doc/plans/PS_PORTS_PLAN.md §11).
 
 The KV260's DDR controller maps byte address bits 14–15 to the DRAM bank

@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate ONNX test models that combine all three kernel types:
 VectorOPKernel (element-wise), MatmulKernel, and ConvKernel.
 

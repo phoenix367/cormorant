@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """calib_status.py — is a perf_calibrate.py campaign complete?
 
 Reads <dir>/<id>.cases.json and <id>.calib.json (read-only unless

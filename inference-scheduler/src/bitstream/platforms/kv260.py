@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 # KV260 / Zynq UltraScale+ platform constants for bitstream loading.
 #
 # Register tables and metadata are copied verbatim from PYNQ's

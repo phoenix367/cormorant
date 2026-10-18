@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """weather.py — Miranda's weather tool: where the board is, and its forecast.
 
   here()          the board's public IP (api.ipify.org), then its position

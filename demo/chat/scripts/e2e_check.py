@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """End-to-end check of the smollm2 backend on the host (CHAT_PLAN phase 4,
 gate 2): kv260_chat_server.py with `--backend smollm2 --llm-fake float`
 (tests/fake_llm.py's FloatModelEngine: llm_study.py's numpy float64 Llama in

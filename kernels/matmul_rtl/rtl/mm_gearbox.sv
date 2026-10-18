@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_gearbox — turns the raw 128-bit words of one read port into row-aligned
 // beats.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """onnx_study.py — the go / no-go numbers of an ONNX model on the KV260 stack
 (model-study skill, route B: CNNs, BERT-like encoders, any graph the
 inference scheduler takes as is).

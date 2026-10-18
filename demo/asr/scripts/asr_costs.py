@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """asr_costs.py — the ASR candidates priced on the KV260 (doc/plans/ASR_PLAN.md):
 proxy ONNX graphs of each model's encoder (for an audio length) and of one
 decoder step (for a context), with the real shapes and standard ops, scheduled

@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for broadcast_tapped model — broadcast output exposed as a graph output."""
 
 import unittest

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 llm_host_emu.py — run the generated SmolLM2 project on the HOST: the
 generated inference.c, llm_api.c and llm_bench.c compiled unchanged against

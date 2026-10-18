@@ -1,4 +1,7 @@
 #!/bin/sh
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # git pre-commit hook: check the facts of facts.yaml that the staged files
 # touch (every fact when facts.yaml or tools/facts/ is staged) and refuse the
 # commit when one fails.  tools/facts/README.md "Pre-commit hook".

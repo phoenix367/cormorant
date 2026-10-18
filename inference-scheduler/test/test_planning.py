@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Planning mode, phase T0 (doc/plans/TACTICS_PLAN.md §5): the options
 (src/planning.py), the persistent states' DAG edges (src/schedule.py) and

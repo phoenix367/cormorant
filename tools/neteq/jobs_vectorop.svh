@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
     // VectorOP: a, b, c, size, op, outer, a_inc, b_inc, act, alpha (ops 0..9:
     // the activation ops 6..9 among them; acts 0..6; alpha's high bits ignored)
     for (int k = 0; k < 30; k++) begin

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """prepare.py — the object_detection demo's input images (doc/plans/YOLO_PLAN.md).
 
 The first N COCO128 images (with their labels, for the mAP) and every picture

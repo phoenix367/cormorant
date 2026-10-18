@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_rungen — expands step descriptors into the run descriptors of one read
 // port / MAC lane (P = 0 or 1).

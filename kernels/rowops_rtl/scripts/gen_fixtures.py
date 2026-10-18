@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Writes the RowOpsKernel's RTL fixtures from the Python specification
 (inference-scheduler/src/rowops_spec.py): hw/test_data/rowops_test_data/
 manifest.txt + test_NN_{a,b,p,c}.hex — the DDR images of a job's regions and

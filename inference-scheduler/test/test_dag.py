@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.schedule.Dag — data-flow DAG over scheduled nodes."""
 
 import os

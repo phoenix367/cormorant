@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """C code generator package for the inference scheduler."""
 
 from ._core     import _CoreMixin

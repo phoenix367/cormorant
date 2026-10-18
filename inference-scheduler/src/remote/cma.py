@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Clean up the board's CMA area before a large pool is allocated.
 
 Every FPGA library takes its DMA pool as one contiguous CMA buffer (an XRT

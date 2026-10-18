@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """piper_phonemize.py — text -> Piper phoneme ids through espeak-ng (ctypes;
 Python standard library only; runs on the board with the distribution's
 libespeak-ng.so.1 and espeak-ng-data).

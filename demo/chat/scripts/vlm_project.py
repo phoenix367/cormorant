@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared pieces of SmolVLM-256M-Instruct on the KV260 (doc/plans/CHAT_PLAN.md
 §23): the checkpoint and its two calibrated formats (vlm_study.py formats:
 the text model's, the vision encoder's), the frontends — the text model

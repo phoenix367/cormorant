@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // @tasks
   task automatic job(input int n, c, h, w, oh, ow, ph, pw, sh, sw, pt, pl, dh, dw, ty, lp, cip, input int k);
     longint unsigned x, y;

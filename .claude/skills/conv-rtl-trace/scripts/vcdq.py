@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 r"""vcdq.py VCD 'regex1' 'regex2' ... [--from C] [--to C] [--list] [--max N]
 
 Query a VCD of the RTL ConvKernel's Verilator testbench (vlt/Vtb --trace F.fst,

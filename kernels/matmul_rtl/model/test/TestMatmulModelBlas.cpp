@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // TestMatmulModelBlas.cpp — validates MatmulKernel (the configured Data_t build,
 // ap_fixed<16,8> by default) against cblas_sgemm, bit-exactly.

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # package_ip.tcl — packages the RTL RowOpsKernel as a Vivado IP for the
 # block design (doc/kernels/ROWOPS_RTL_KERNEL.md §1.1):

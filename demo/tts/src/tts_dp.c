@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * tts_dp.c — see tts_dp.h.  Rows are time steps ([n][192], time-major), so
  * every stage is independent per row except the depthwise conv, which reads

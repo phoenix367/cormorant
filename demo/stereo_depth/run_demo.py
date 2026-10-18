@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """run_demo.py — stereo depth (LightStereo-S) on the KV260 (doc/plans/STEREO_PLAN.md).
 
   1. fetch     the LightStereo-S checkpoint (StereoAnything weights; Hugging

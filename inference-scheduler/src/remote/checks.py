@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Remote prerequisite checks (cmake, make, gcc, XRT, sudo, UIO devices)."""
 
 from typing import TYPE_CHECKING

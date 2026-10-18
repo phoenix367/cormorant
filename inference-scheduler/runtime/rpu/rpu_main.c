@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * rpu_main.c — the kernel-driver firmware on the Cortex-R5 (RPU_PLAN track
  * B1).  It knows no model: the A53's generated library (src/inference_rpu.c)

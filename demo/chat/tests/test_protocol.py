@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Protocol layer of kv260_chat_server.py against a fake backend: the
 OpenAI chat.completion / chat.completion.chunk schema field by field,
 errors, the FPGA request queue, and client disconnects."""

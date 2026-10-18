@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """deploy.py's vocab step: BERT's vocab.txt is downloaded (through
 demo/bert_squad/scripts/fetch_assets.py, stubbed here) to the BERT config's
 inputs.vocab before any board work; an existing file is left alone; a failed

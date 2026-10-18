@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """rpu_board.py — run a generated project with its kernels driven by the KV260's
 Cortex-R5 (doc/plans/RPU_PLAN.md track B1) and check it against the same
 library driving them from the A53.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """piper_study.py — model study of Piper en_US-lessac-medium (VITS) for the
 KV260 (model-study skill, route C; doc/plans/TTS_PLAN.md §3).  Host only.
 

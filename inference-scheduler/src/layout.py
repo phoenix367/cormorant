@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 TensorLayout: unified DMA buffer layout descriptor for all kernel types.
 

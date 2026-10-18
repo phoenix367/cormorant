@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 deploy.py — install and start the KV260 chat server on the board (run on the
 host with inference-scheduler/.venv/bin/python).

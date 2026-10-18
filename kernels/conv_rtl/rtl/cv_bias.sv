@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_bias — the bias reader (gmem2, the HLS bias_producer): at job start the
 // whole bias vector (ceil(out_ch / 8) words, one burst — two across 4 KiB)

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * tts_bench.c — KV260 runner for libpiper_tts (tts_api.c): the board gate of
  * doc/plans/TTS_PLAN.md §4.

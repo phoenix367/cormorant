@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // axi_models.h — cycle-level AXI4 slave models (sparse DDR, two read ports,
 // one write port) and an AXI4-Lite master for the RowOpsKernel testbench

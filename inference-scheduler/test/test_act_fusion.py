@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Activation fusion (VectorOPKernel `act` register) and the 128-bit port
 alignment contract.
 

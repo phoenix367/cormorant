@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * asr_bench.c — the runner of libmoonshine (asr_api.c): the host-emulation
  * and board gates of doc/plans/ASR_PLAN.md §5.

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Stereo depth ops (doc/plans/STEREO_PLAN.md; frontend src/stereo.py): ONNX
 nodes of the domain ``axi.llm`` on tensors with power-of-two exponents

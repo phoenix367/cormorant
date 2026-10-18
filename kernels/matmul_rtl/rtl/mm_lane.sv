@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_lane — one MAC lane: R x E DSP slices (panel row r, beat lane l) fed by
 // the B beats of one read port and the tap sets of the lane's x prefetcher.

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """scripts/llm_calibrate.py without the network or numpy: the tracked
 manifest's schema, verified downloads (file:// URLs standing in for the
 Hugging Face endpoint), fetch keeping / replacing / copying files, the

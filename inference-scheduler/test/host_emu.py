@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Run a generated project on the HOST: the generated inference.c and
 test/test_inference.c are compiled unchanged against
 

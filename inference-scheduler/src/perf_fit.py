@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Fitting the performance models (``perf_calibrate.py fit``, doc/plans/
 TACTICS_PLAN.md §4.2 / §4.3): from the measurements of a calibration

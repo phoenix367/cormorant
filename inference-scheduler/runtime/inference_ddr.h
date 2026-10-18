@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * inference_ddr.h — whole-run DDR bandwidth counters for generated
  *                   inference projects.

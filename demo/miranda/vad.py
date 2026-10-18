@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """vad.py — voice activity detection on the board's CPU (numpy) for Miranda.
 
 Vad: the statistical likelihood-ratio detector of Sohn, Kim and Sung (IEEE

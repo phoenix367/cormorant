@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """SSH / remote config: shared defaults, merge, load, and UIO helpers."""
 
 import json

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Moonshine speech-to-text frontend (doc/plans/ASR_PLAN.md §3): config.json +
 the checkpoint (safetensors) + the calibrated formats (demo/asr/scripts

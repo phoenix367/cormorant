@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for the runtime/inference_ddr module.
 
 The success path requires an actual Zynq UltraScale+ DDR PMU (or any

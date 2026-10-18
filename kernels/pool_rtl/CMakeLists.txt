@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.19)
 project(PoolingKernelRtl VERSION 1.0 LANGUAGES C CXX)
 

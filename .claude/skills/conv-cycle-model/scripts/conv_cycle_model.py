@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """ConvKernel cycle model: the SystemVerilog kernel (--arch rtl, the default:
 the scheduler's cost_model.rtl_conv_walk) or the retired HLS kernel (--arch 42,
 CONV_OPTIMISATION.md §2.42; 37/38/39/40/41 reproduce the earlier steps for

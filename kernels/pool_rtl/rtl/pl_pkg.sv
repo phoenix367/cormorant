@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // pl_pkg — constants, descriptors and helpers of the RTL PoolingKernel.
 //

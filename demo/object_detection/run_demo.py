@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """run_demo.py — YOLOv5n object detection on the KV260 (doc/plans/YOLO_PLAN.md).
 
   1. fetch     yolov5n.onnx (Ultralytics v7.0) and COCO128, SHA-256 checked;

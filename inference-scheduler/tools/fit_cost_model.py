@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 fit_cost_model.py — refit the engine cost model's board terms to a
 performance-model calibration campaign (doc/plans/OFFLOAD_PLAN.md §2.3).

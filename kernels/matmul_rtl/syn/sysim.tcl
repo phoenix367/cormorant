@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # sysim.tcl — system-level drop-in check: runs the test stand's
 # MatmulKernel block design (Zynq PS VIP + AXI interconnect + DDR model +

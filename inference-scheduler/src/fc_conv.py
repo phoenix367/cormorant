@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Fully-connected Convs -> MatMul (doc/plans/LENET_PLAN.md).
 

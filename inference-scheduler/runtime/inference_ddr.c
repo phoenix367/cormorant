@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * inference_ddr.c — backend dispatcher for whole-run DDR-bandwidth
  *                  measurement.

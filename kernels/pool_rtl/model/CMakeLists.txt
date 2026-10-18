@@ -1,3 +1,7 @@
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 cmake_minimum_required(VERSION 3.19)
 project(PoolingKernelModel VERSION 1.0 LANGUAGES CXX)
 

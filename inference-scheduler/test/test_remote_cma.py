@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The board's CMA clean-up helper (src/remote/cma.py): what it runs and how it
 reads the board's answer — on a fake session, no board."""
 

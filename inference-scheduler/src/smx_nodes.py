@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 VectorOPKernel's softmax in the scheduler (doc/plans/SOFTMAX_PLAN.md §2.3).
 

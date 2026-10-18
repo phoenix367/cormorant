@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """BERT-base (bertsquad-12) gates on the real 435 MB model.
 
 The model is $BERT_SQUAD_MODEL, else

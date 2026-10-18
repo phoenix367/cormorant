@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 The execution timeline as one self-contained HTML file, in the style of a
 GPU profiler (NVIDIA Nsight Systems): one row per lane — the CPU and every

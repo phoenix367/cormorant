@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # vl_unisim.py — a copy of Vivado's DSP48E2 unisim model that Verilator takes.
 #

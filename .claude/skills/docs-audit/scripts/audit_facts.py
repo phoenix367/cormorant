@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """audit_facts.py — helpers for docs-audit mode A (static audit, docs vs code).
 
   audit_facts.py areas  [--repo R]

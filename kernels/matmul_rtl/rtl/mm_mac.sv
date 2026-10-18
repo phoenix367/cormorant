@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_mac — one DSP48E2 multiply-accumulate slice, P = C + A * B, with the
 // accumulator kept outside (the lane's LUTRAM).  Every operand arrives from

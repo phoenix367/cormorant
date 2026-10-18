@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * inference_irq.h — kernel waits on the kernels' interrupts while the A53
  * drives them (Linux, UIO).

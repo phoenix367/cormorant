@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 asr_host_emu.py — run the generated Moonshine project on the HOST: the
 generated inference.c, asr_api.c and asr_bench.c compiled unchanged against the

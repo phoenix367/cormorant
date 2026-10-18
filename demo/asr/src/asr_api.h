@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * asr_api.h — libmoonshine_<size>.so: Moonshine speech to text on the KV260
  * (doc/plans/ASR_PLAN.md §5).  16 kHz mono int16 PCM in, token ids out (the

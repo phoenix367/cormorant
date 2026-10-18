@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Backend A (bert_squad_backend.py) with fake engines: the protocol
 mapping (document / question / follow-ups / hints), sliding windows and
 their cap, max_tokens / stop, cancellation between windows, the HTTP path,

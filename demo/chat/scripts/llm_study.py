@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """B0 numeric go / no-go study: SmolLM2-135M-Instruct on the KV260 Q8.8 datapath.
 
 doc/plans/CHAT_PLAN.md §3.2 B0 (results in §9).  Mirrors the BERT study

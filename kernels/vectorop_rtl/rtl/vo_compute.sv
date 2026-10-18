@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_compute — the element-wise op on the a / b word streams, 8 lanes per
 // cycle (a 6-stage pipeline: input registers, then add / sub / DSP multiply,

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 run_tests.py — run the project's test suites and report a structured status
 (JSON on stdout) for the run-tests agent (.claude/agents/run-tests.md).

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """piper_backend.py with a Python stand-in for libpiper_tts.so and the front
 end: sentence packing, the chunk loop, cancellation, the Finish info and the
 server log; piper_phonemize.py against espeak-ng when it is installed."""

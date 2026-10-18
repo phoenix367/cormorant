@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Space-to-depth stem transform (RESNET18_15FPS_PLAN step 1).
 
 A stride-2 Conv with 4*C <= kTileIC input channels is rewritten as a

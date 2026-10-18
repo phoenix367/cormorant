@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """sim_quality.py — the implemented graph's quality (doc/plans/STEREO_PLAN.md §4).
 
 The frontend (inference-scheduler/src/stereo.py) at each pair's resolution

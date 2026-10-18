@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_param — the per-column parameter block P (ROWOPS_RTL_KERNEL.md §1.3).
 //

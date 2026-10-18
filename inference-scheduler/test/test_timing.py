@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 The timed event-stream replay (src/codegen/timing.py, TACTICS_PLAN §4.4):
 the CPU issues kernel starts without blocking, waits where the event stream

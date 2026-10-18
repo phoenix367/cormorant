@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """generate_asr_project.py — a Moonshine checkpoint + its calibrated formats ->
 the KV260 project behind libmoonshine_<size>.so (doc/plans/ASR_PLAN.md §5).
 

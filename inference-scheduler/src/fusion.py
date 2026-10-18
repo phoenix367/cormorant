@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 ONNX-level lowering and pattern-fusion passes (BERT_PLAN phase 1b / 1c).
 

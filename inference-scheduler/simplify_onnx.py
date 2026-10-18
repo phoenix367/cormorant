@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 simplify_onnx.py — Simplify an ONNX model.
 

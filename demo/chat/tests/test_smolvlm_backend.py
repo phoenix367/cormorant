@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Backend C (smolvlm_backend.py) with a fake engine: the Idefics3 template
 against transformers' processor (tests/data/smolvlm_cases.json), image
 decoding against the study's pixels, and the backend's calls — llm_image()

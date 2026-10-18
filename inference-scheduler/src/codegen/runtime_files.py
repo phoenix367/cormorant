@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The runtime files every generated project carries, copied verbatim from
 inference-scheduler/runtime/ — one list for both project writers (the CLI,
 inference_scheduler.py, and multi-entry projects, multi.write_project), so a

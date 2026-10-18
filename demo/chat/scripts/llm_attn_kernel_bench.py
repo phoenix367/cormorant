@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 llm_attn_kernel_bench.py — what decode attention would cost on the FPGA
 (policy p12, doc/plans/CHAT_PLAN.md §10.5 item 5) next to the shipped host region

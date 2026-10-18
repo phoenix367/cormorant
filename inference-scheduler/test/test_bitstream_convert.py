@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.bitstream.convert — .bit header parser and bit→bin byte-swap."""
 
 import os

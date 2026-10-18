@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """smollm2_tokenizer.py and chatml.py: ids and decoding against the
 transformers reference ids stored in data/smollm2_text_cases.json (written by
 scripts/validate_text.py --write-fixture, which also runs the full >= 2 000

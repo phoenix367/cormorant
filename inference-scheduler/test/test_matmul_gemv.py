@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """MatmulKernel GEMV streaming mode in the scheduler (src/matmul_gemv.py,
 MatmulNode.gemv_kw, MATMUL_OPTIMISATION.md §8b)."""
 

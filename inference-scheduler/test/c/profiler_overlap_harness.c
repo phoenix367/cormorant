@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * profiler_overlap_harness.c — drives inference_prof through an overlapping
  * BEGIN/END pattern that mirrors what the codegen emits for

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Tactics — the implementations a node can take, each with the kernel calls
 it would issue (doc/plans/TACTICS_PLAN.md §4.1).

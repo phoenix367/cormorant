@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * rpu-ipi.dts — the A53's end of the Cortex-R5's doorbell (RPU_PLAN §9.4).
  *

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """idefics3.py — SmolVLM's chat template (Idefics3) with images, and history
 trimming (standard library only; doc/plans/CHAT_PLAN.md §23).
 

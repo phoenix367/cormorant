@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """a64_check.py — compile a generated project's src/inference.c for the
 board's CPU (aarch64) on the dev PC and inspect the object code.
 

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """chat_backend.py — the backend interface of the KV260 chat server
 (kv260_chat_server.py).  Python standard library only.
 

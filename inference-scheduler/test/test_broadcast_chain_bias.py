@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for broadcast_chain_bias model — full-shape bias2 in strided ROM."""
 
 import unittest

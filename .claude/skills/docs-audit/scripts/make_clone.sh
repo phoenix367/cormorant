@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # make_clone.sh — docs-audit mode B, steps 1–2: a fresh clone exactly as the
 # README Quick start §1 says, with the maintainer's unpushed work overlaid as
 # local commits (so the reproduction tests the CURRENT docs).

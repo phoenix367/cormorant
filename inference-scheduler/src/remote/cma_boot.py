@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The size of the KV260's CMA area: the kernel's cma= boot argument.
 
 Every FPGA library takes its DMA pool as one contiguous CMA buffer.  The

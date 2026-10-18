@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """DRAM bank phases in the DMA pool layout (src/bank_phase.py,
 doc/plans/PS_PORTS_PLAN.md §11): the operand streams of a binary VectorOP
 start in different DDR banks (byte address bits 14–15), the other slots keep

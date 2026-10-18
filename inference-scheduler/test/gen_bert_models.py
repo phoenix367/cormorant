@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tiny BERT-like ONNX fixtures (BERT_PLAN phase 1f).
 
 Every model reproduces the structure of bertsquad-12 (onnx model zoo,

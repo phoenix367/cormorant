@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_mul32 — an unsigned 32 x 32 -> 64 multiplier in three pipeline stages
 // (four 16 x 16 DSP products, then two adds), for the NORM scalar unit:

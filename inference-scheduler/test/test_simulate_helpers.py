@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Coverage tests for src.codegen._simulate helper functions and
 edge-case paths.
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """deploy_and_run.py — the object_detection demo on the KV260 (doc/plans/YOLO_PLAN.md).
 
 Uploads build/project (generate_project.py) and build/data (prepare.py) to

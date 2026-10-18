@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """speech_input.py — uploaded audio -> 16 kHz mono int16 samples for the
 speech-to-text backend (POST /v1/audio/transcriptions; doc/plans/ASR_PLAN.md
 §7).  numpy; ffmpeg for anything but WAV.

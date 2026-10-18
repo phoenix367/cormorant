@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_burstgen — walks one operand's run geometry (ro_pkg::geom_t) and emits
 // its INCR bursts: at most MAXB words each, never crossing a 4 KiB boundary,

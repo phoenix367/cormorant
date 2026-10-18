@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The axi.llm host ops (src/llm_nodes.py) one at a time.
 
 Each op is a single-node graph (host-memory and DMA inputs / outputs with

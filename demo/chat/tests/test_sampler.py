@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """sampler.py / src/sampler.c: greedy = argmax, penalties, top-k and top-p
 masks against independent references, the sampled distribution with fixed
 seeds, determinism, and the C library == the Python fallback token for

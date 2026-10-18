@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The TTS C helpers (src/tts_nodes.py tts_c_helpers) op by op against
 an independent numpy model of their contract (double arithmetic, int16
 write-back with round-half-even + saturation, libm tanh / exp): every

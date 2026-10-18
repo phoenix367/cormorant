@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # synth_ooc.tcl — out-of-context synthesis, placement and routing of the
 # VectorOPKernel RTL on the KV260 part, for utilisation and timing reports.

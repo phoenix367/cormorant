@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # write_xsa.tcl — export the hardware platform (XSA) of the implemented block design
 # for the Cortex-R5 BSP (doc/plans/RPU_PLAN.md track B1):
 #

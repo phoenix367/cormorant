@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 kernel_calls() == the emitted C (src/perf_calls.py, doc/plans/TACTICS_PLAN.md
 §3): the performance models, the calibration and the planner key on a

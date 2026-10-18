@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Piper (VITS) text to speech (doc/plans/TTS_PLAN.md §4, §6): the chunk entry
 of src/piper.py through the scheduler (Conv exponents, the TTS host ops
 of src/tts_nodes.py) against the specification demo/tts/scripts/piper_vits.py

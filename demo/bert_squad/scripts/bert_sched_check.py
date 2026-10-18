@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """BERT_PLAN phase 1, gate (b): the inference scheduler's fixed-point
 simulation of bertsquad-12 must equal the study's independent emulation of
 the same partition (bert_study.py policy "sched"; "sched+vsmx" where the

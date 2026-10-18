@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Performance models of one bitstream (doc/plans/TACTICS_PLAN.md §4.2).
 

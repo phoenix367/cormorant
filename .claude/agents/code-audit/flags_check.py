@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 flags_check.py — command-line flags one script passes to another, against the
 flags the other one's argparse accepts.

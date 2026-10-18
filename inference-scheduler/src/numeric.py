@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Numeric annotations beyond the element type (doc/plans/CHAT_PLAN.md §10.5).
 

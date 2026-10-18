@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_act — the LeakyReLU / SiLU / GELU / GELU tanh activations (VectorOP.h
 // ACT_LEAKY_RELU .. ACT_GELU_TANH: the act register, or an activation op's

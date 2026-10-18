@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Shared helpers for the BERT-SQuAD demo scripts: paths, config loading
 (with a copy-pasteable bootstrap message when the config is missing), the
 study module import, and the preprocessed-input readers.

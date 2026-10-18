@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_rd_port — one operand (a on gmem0, b on gmem1): DDR runs -> word stream.
 //

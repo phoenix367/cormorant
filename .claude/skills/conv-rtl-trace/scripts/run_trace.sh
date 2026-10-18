@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # run_trace.sh <build-dir> <fixture-dir> <log-path>
 # Run the conv testbench on one fixture with the +VERBOSE probes enabled.
 set -euo pipefail

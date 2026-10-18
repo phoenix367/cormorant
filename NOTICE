@@ -1,0 +1,23 @@
+Cormorant
+Copyright 2026 Ivan Gubochkin
+
+This product includes software developed by GradeBuilder S.L. (Copyright
+2025 GradeBuilder SL): Cormorant up to commit ca27075 (2026-08-21) of
+https://github.com/GradeBuilderSL/cormorant, licensed under the Apache
+License, Version 2.0. This repository is an independent fork of it.
+
+Every source file names its copyright holders in its first lines:
+
+- "Copyright 2025 GradeBuilder SL": code from that repository, unchanged;
+- "Copyright 2025 GradeBuilder SL" and "Modifications copyright 2026 Ivan
+  Gubochkin": code from that repository, changed in this fork;
+- "Copyright 2026 Ivan Gubochkin": code written in this fork.
+
+Third-party code:
+
+  cmake/FindVitis.cmake      from hlslib, by Johannes de Fine Licht; BSD
+                             3-Clause License (see the file's header)
+  demo/camera/src/board/visualization.py
+                             three helpers adapted from GradeBuilder S.L.'s
+                             kria-camera-demo (Copyright 2026 GradeBuilder SL,
+                             Apache License 2.0)

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # package_ip.tcl — packages the RTL PoolingKernel as a Vivado IP that can
 # replace the Vitis-HLS export in a block design:

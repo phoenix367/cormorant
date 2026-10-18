@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # ---------------------------------------------------------------------------
 # run.sh <kernel> [rtl_dir] [work_dir] — netlist equivalence of one RTL kernel
 # (matmul | vectorop | pool): Vivado synthesises the kernel top out of context

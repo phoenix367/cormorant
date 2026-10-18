@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 llm_board.py — build libsmollm2.so + llm_bench on the KV260 and run the
 phase-3 board gate (doc/plans/CHAT_PLAN.md): logits bit-exact with the scheduler

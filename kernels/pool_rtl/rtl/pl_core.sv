@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // pl_core — 2-D pooling (MaxPool / AveragePool / LpPool, their Global
 // variants) for the Kria KV260, in RTL.  The IP top level is the Verilog

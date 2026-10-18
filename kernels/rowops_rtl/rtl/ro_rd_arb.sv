@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_rd_arb — the two read ports (stream A, stream B) on the one AXI read
 // channel of m_axi_gmem0: AR requests are merged round robin and tagged with

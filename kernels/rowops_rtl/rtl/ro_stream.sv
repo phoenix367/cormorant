@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_stream — the element-wise ops of the RowOpsKernel (ROWOPS_RTL_KERNEL.md
 // §1.4): COPY, ADDX, DEQUANT, MULACT, GATE.  Stream A (and B) words in, C words

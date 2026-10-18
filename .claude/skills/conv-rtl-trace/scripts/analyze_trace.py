@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """analyze_trace.py <verbose tb log> — per-beat analysis of the conv testbench's
 +VERBOSE probes (CK_AXI gmem0 AR/R, gmem3 AW/W/B, CK_ACC acc_stream, process
 done markers).  One block per test in the log."""

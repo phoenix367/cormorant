@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The row-ops unit in the scheduler (doc/plans/HOSTOPS_PLAN.md §6,
 src/rowops_nodes.py): the fifth kernel lane, the table load at init, the
 LayerNorm node — its result is rowops_spec.layer_norm, its C call carries the

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """llama_fit.py — first gate of a Llama-family decoder study (model-study
 skill, route A), from config.json alone, before downloading the weights:
 

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The shared board lock (src/remote/lock.py): one flock per board, taken by
 every board tool, re-entrant for a tool started by a lock holder."""
 

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Host ops of the Piper (VITS) text-to-speech chunk (doc/plans/TTS_PLAN.md
 §4; frontend src/piper.py).  ONNX nodes of the domain ``axi.llm``:

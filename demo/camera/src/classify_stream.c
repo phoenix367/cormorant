@@ -1,3 +1,6 @@
+// Copyright 2025 GradeBuilder SL
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * classify_stream.c — persistent KV260 inference host for the camera demo.
  *

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """BERT-SQuAD numeric feasibility study for the KV260 ap_fixed<16,8> datapath.
 
 Runs bertsquad-12 three ways on SQuAD 1.1 dev examples that fit one 256-token

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """generate_project.py — the stereo_depth demo's KV260 inference project
 (doc/plans/STEREO_PLAN.md).
 

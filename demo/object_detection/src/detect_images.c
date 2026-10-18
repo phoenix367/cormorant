@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * detect_images.c — KV260 host of the object_detection demo (YOLOv5n).
  *

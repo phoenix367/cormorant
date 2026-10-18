@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * bert_api.c — see bert_api.h.  Model-specific glue (buffer order / sizes /
  * roles, inference_init() arguments) comes from the generated bench_glue.h;

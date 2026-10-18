@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 config_keys.py — the keys of an example config (JSON) that no code reads, and
 the keys code reads from that config that the example does not document.

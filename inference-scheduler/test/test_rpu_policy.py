@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The Cortex-R5 policy (src/rpu_policy.py, RPU_PLAN §9.3): small models stay on
 the A53, large ones go to the R5 — the generated header's numbers, the runtime
 hooks of every entry, and the decision itself with a fixed prediction."""

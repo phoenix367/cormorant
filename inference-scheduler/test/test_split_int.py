@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Split / Slice (zero-cost views vs host copies) and integer tensors
 (BERT_PLAN 1b / 1d).  Every generated project is also run on the host
 against the software kernel models (test/host_emu.py)."""

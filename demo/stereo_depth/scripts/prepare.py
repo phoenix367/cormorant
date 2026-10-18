@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """prepare.py — the stereo_depth demo's input pairs (doc/plans/STEREO_PLAN.md).
 
 Rectified pairs with ground truth from Middlebury MiddEval3-Q and ETH3D

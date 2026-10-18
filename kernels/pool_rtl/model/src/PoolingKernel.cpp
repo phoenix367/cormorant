@@ -1,3 +1,7 @@
+// Copyright 2025 GradeBuilder SL
+// Modifications copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // PoolingKernel.cpp — the C++ reference model of the RTL PoolingKernel
 // (kernels/pool_rtl): its testbench oracle and fixture generator.

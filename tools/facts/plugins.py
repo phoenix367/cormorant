@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Check plugins for interface facts (facts.yaml ``check: NAME``, ``args: {...}``).
 

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // vo_smx — the softmax of the RTL VectorOPKernel (OP_SOFTMAX row mode,
 // OP_SOFTMAX_T column mode; doc/plans/SOFTMAX_PLAN.md §2): operand a's word

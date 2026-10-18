@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """The SmolVLM vision encoder (doc/plans/CHAT_PLAN.md §22-§23) on a tiny random
 SigLIP-style ViT (hidden 64, 2 layers, 4 heads of 16, FFN 128, 32 x 32 images
 in 4 x 4 patches = 64 tokens, pixel shuffle x2 -> 16 image tokens of a

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // cv_engine — weight cache, MAC grid and accumulators (the HLS
 // process_conv_kernel_tile's Phases 1-2).

@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 deploy_and_run.py — upload generated MNIST projects to the KV260, build
 them on the board, push the MNIST test set, and run bench_mnist for each

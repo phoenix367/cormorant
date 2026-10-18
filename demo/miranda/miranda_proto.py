@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """miranda_proto.py — the wire formats shared by the Miranda client and server
 (Python standard library only).
 

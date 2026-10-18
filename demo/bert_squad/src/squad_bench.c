@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * squad_bench.c — KV260 BERT-SQuAD runner for the bert_squad demo.
  *

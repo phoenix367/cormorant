@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 tts_speech_check.py — the chat server's text to speech end to end
 (doc/plans/TTS_PLAN.md §5): POST /v1/audio/speech on the board for a few

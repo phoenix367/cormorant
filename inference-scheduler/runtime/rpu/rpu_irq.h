@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* rpu_irq.h — the firmware's kernel lanes and interrupt-driven waits (rpu_irq.c). */
 #ifndef RPU_IRQ_H
 #define RPU_IRQ_H

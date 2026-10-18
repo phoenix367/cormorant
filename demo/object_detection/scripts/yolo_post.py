@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """yolo_post.py — YOLOv5 pre- and post-processing in numpy (doc/plans/YOLO_PLAN.md).
 
 The FPGA graph ends at the three Detect convs (raw head maps [255][ny][nx]

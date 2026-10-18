@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 download_assets.py — fetch the ONNX model + ImageNet labels for the KV260
 camera demo.

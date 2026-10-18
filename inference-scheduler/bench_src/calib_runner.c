@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /* calib_runner.c — batch timing of kernel calls for the performance models
  * (inference-scheduler/perf_calibrate.py, doc/plans/TACTICS_PLAN.md §4.3).
  *

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 MatMul on ConvKernel — the lowering pass of doc/plans/BERT_PLAN.md §2 2A.
 

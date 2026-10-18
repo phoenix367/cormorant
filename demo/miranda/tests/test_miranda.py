@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Miranda on the host: the RTP and control formats (miranda_proto.py), the VAD
 and its segmenter (vad.py), the key phrase (wake.py), the answer's sentences,
 and whole sessions — miranda_client.py streaming a recording to

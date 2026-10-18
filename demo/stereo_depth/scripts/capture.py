@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """capture.py — stereo pairs from a RealSense camera on the KV260
 (doc/plans/STEREO_PLAN.md).
 

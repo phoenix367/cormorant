@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Llama-family frontend: config.json + safetensors weights + calibrated
 formats -> fixed-shape ONNX entry graphs for the scheduler

@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // mm_ctrl_s_axi — AXI4-Lite control slave with the exact register map and
 // ap_ctrl_hs behaviour of the Vitis-HLS MatmulKernel (xmatmulkernel_hw.h):

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """smollm2_tokenizer.py — SmolLM2's byte-level BPE tokenizer in pure Python
 (standard library only; runs on the board's Python 3.8+).
 

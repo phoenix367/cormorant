@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 gen_test_models.py — create minimal ONNX models for testing inference_scheduler.
 

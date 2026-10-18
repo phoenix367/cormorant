@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.report.ReportGenerator and the --no-report CLI flag.
 
 Covers:

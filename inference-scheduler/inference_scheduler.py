@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 inference_scheduler.py — ONNX-to-C project generator for the KV260 kernels
 

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # board_window.sh — one board session for the shipped libraries after a scheduler change:
 # regenerate (host), gate + install + profile each library (board), top up the performance
 # model, benchmark + baseline, bring the chat server back, check the simulator.  Every board

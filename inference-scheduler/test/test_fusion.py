@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Pattern-fusion pre-pass (BERT_PLAN 1c, src/fusion.py).
 
 Matched patterns become one host node and compute exactly what the original

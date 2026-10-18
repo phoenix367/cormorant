@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for src.graph — _shape_from_type_proto edge cases, OnnxGraph
 constructor validation, and Gemm preprocessor error / fallback paths.
 

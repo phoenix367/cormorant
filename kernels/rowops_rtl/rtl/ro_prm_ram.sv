@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_prm_ram — one of ro_param's two UltraRAMs (4096 x 72: two parameter
 // banks): port A writes during the load (keeping its output: the write mode

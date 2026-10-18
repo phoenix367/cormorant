@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """squad_text.py — the text side of BERT-SQuAD, Python standard library only.
 
 Shared by the numeric study (bert_study.py, which re-imports everything

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """moonshine_backend.py — speech to text with Moonshine on the KV260 for the
 chat server (POST /v1/audio/transcriptions; doc/plans/ASR_PLAN.md §7).
 

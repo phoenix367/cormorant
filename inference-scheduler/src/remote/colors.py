@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Terminal colour helpers. Colours are suppressed when stdout is not a TTY."""
 
 import sys

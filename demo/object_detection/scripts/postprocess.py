@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """postprocess.py — the host half of the object_detection demo (doc/plans/YOLO_PLAN.md).
 
 From the board's heads.bin (detect_images.c: the three raw int16 head maps of

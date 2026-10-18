@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 board_gate.py — phase-1 board gate of doc/plans/CHAT_PLAN.md against a running
 server (stdlib only; run from the host or the board):

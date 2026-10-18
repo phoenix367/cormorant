@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# Modifications copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate all test ONNX models to a user-specified directory.
 
 Usage

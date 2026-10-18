@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Run a command under the KV260 board lock, or print the lock path
 (src/remote/lock.py):
 

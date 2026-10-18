@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Tiny BERT fixtures end to end (BERT_PLAN phase 1f; test/gen_bert_models.py).
 
 The fixtures reproduce bertsquad-12's node arrangement at toy size.  Checks:

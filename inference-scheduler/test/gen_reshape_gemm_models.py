@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Generate ONNX test models covering Reshape (buffer-alias) and Gemm (→MatMul+Add)."""
 
 import os

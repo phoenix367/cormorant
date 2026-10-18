@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """
 camera_loop.py — board-side capture → inference → annotate loop for the
 KV260 camera demo.  Runs ON the KV260.

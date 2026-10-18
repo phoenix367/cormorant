@@ -1,3 +1,6 @@
+# Copyright 2025 GradeBuilder SL
+# SPDX-License-Identifier: Apache-2.0
+
 """Compile + run a C harness that exercises inference_prof under the
 overlapping PROF_BEGIN/PROF_END pattern produced by the parallel-wait
 emission, and assert each layer records its own bracket correctly.

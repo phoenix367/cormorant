@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate the pure-Python SmolLM2 tokenizer (smollm2_tokenizer.py) and
 chat template (chatml.py) against transformers (CHAT_PLAN phase 4, gate 1).
 

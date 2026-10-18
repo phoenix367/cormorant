@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 The row-ops unit in the scheduler (doc/plans/HOSTOPS_PLAN.md §6; the kernel:
 kernels/rowops_rtl, doc/kernels/ROWOPS_RTL_KERNEL.md).

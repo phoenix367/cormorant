@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * asr_api.c — see asr_api.h.  The buckets, the model's constants and the run
  * functions come from the generated test/asr_glue.h; ASR_API_WEIGHTS_DIR and

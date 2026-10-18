@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_pkg — shared parameters and types of the RowOpsKernel RTL
 // (doc/kernels/ROWOPS_RTL_KERNEL.md).  The port modules (ro_fifo, ro_rs,

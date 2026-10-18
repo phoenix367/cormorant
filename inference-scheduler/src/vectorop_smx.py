@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 VectorOPKernel's softmax — the integer specification (doc/plans/SOFTMAX_PLAN.md
 §2.1) that the scheduler's simulation, the model studies, the C++ reference

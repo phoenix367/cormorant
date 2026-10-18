@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """squad_text.py: tokenizer, sliding-window features and cross-window span
 decoding against straightforward reference implementations.  Stdlib only;
 uses demo/bert_squad/assets/vocab.txt when present, otherwise a vocabulary

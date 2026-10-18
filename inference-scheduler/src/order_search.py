@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Order search — the issue order from a timed simulation (doc/plans/
 TACTICS_PLAN.md §4.4).

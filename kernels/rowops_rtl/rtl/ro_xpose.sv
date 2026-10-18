@@ -1,3 +1,6 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
 // ---------------------------------------------------------------------------
 // ro_xpose — the TRANSPOSE op of the RowOpsKernel (ROWOPS_RTL_KERNEL.md §1.4):
 // tiles of R (<= 8) rows x L (<= 1024) int16 elements become L granules of R

@@ -1,3 +1,6 @@
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 """
 Host-op timing models (doc/plans/TACTICS_PLAN.md §4.2 "host-op models").
 

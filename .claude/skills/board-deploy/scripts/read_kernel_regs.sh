@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright 2026 Ivan Gubochkin
+# SPDX-License-Identifier: Apache-2.0
+
 # read_kernel_regs.sh [host] — PS AXI slave port widths + kernel ctrl/arg registers on the KV260.
 host=${1:-192.168.100.8}
 ssh -i ~/.ssh/kv260-testkey -o BatchMode=yes -o ConnectTimeout=10 root@"$host" 'python3 - <<EOF
