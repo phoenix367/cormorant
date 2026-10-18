@@ -37,12 +37,14 @@ from pathlib import Path
 AREAS = [
     ("root", "README.md, CLAUDE.md, doc/README.md, the fact registry's README",
      ["README.md", "CLAUDE.md", "doc/README.md", "tools/facts/*"]),
+    ("architecture", "the system architecture (all layers, from the kernels to the servers)",
+     ["doc/ARCHITECTURE.md"]),
     ("scheduler-ref", "scheduler reference", ["doc/scheduler/*", "inference-scheduler/CLAUDE.md",
                                               "inference-scheduler/perf_models/*"]),
     ("scheduler-guides", "scheduler user guides", ["inference-scheduler/doc/*", "inference-scheduler/*"]),
     ("kernels", "kernel references; optimisation logs: current-state parts only", ["doc/kernels/*"]),
     ("build-test", "build & test docs, skills, hw/ submodule READMEs",
-     ["doc/build-and-test/*", ".claude/*", "hw/*", "board/*", "dts/*", "platforms/*"]),
+     ["doc/build-and-test/*", ".claude/*", "hw/*", "board/*", "dts/*", "platforms/*", "tools/*"]),
     ("demos", "demo READMEs", ["demo/*"]),
     ("plans", "status lines at the top + doc/README plans table only; history untouched", ["doc/plans/*"]),
 ]

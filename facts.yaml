@@ -102,6 +102,19 @@ facts:
     - {file: doc/build-and-test/TESTING.md, regex: 'runs the (?P<rowops>\d+) checked-in RowOps fixtures'}
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'runs the (?P<rowops>\d+) checked-in RowOps fixtures'}
     - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'rowops_test_data/` \((?P<rowops>\d+) cases'}
+    # the per-kernel fixture counts that went stale in the 2.0 audit (63 / 119 / 201)
+    - {file: CLAUDE.md, regex: '`TestVectorOpRtl`: the (?P<vecop>\d+) fixtures'}
+    - {file: CLAUDE.md, regex: '`TestPoolRtl`: the (?P<pool>\d+) fixtures'}
+    - {file: CLAUDE.md, regex: '`TestConvRtl`: the (?P<conv>\d+) fixtures'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'runs the (?P<vecop>\d+) checked-in VectorOP\s+fixtures'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'the (?P<pool>\d+) checked-in PoolingKernel fixtures'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'the (?P<conv>\d+) checked-in ConvKernel fixtures'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'VectorOPKernel \(RTL\) \|[^|\n]*CTest runs it on the (?P<vecop>\d+) checked-in fixtures'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'PoolingKernel \(RTL\) \|[^|\n]*CTest runs it on the (?P<pool>\d+) checked-in fixtures'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'ConvKernel \(RTL\) \|[^|\n]*CTest runs it on the (?P<conv>\d+) checked-in fixtures'}
+    - {file: doc/kernels/CONV_RTL_KERNEL.md, regex: 'the (?P<conv>\d+) checked-in fixtures'}
+    - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: 'the (?P<vecop>\d+) checked-in fixtures'}
+    - {file: doc/kernels/POOL_RTL_KERNEL.md, regex: 'the (?P<pool>\d+) checked-in fixtures'}
     - {file: CLAUDE.md, regex: '`TestRowOpsRtl`: the (?P<rowops>\d+) fixtures'}
     - {file: doc/build-and-test/TESTING.md,
        regex: 'manifests currently hold (?P<vecop>\d+) VectorOP, (?P<conv>\d+) Conv, (?P<matmul>\d+) Matmul \((?P<matmul_gemv>\d+) of them GEMV\) and (?P<pool>\d+) Pool'}
@@ -153,6 +166,7 @@ facts:
        regex: '\(VectorOPKernel (?P<vectorop>\d+), ConvKernel (?P<conv>\d+), MatmulKernel (?P<matmul>\d+), PoolingKernel (?P<pool>\d+), RowOpsKernel (?P<rowops>\d+)\)'}
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'block-design testbench, (?P<total>\d+) cases over the five kernels'}
     - {file: doc/ARCHITECTURE.md, regex: 'and the row-ops fixtures, (?P<total>\d+) cases'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: '(?P<rowops>\d+) of the design''s (?P<total>\d+) cases'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'whole-design simulation \((?P<total>\d+) / (?P<total__d>\d+)\)'}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'with this IP passes (?P<total>\d+) / (?P<total__d>\d+) \(Matmul (?P<matmul>\d+) / (?P<matmul__d>\d+)\)'}
     - {file: hw/cormorant_hw_128/README.md, regex: '~8 minutes \((?P<total>\d+) cases: the four kernels'' constant-fill cases — ConvKernel''s with two\s+y channel-pattern cases — and the RowOpsKernel''s (?P<rowops>\d+)'}
@@ -900,7 +914,7 @@ facts:
   fix: auto
   mentions:
     - {file: inference-scheduler/CLAUDE.md, regex: '`remote_config\.json\.example` \((\d+) models\)'}
-    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Correctness tests — (\d+) models over all four kernels'}
+    - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Correctness tests — (\d+) models over all five kernels'}
     - {file: doc/build-and-test/TESTING.md, regex: 'lists every on-board test model \((\d+);'}
     - {file: .claude/skills/board-deploy/SKILL.md, regex: 'remote_config_all_models\.json +# (\d+) models'}
 
@@ -1060,7 +1074,7 @@ facts:
     - {file: demo/stereo_depth/README.md, regex: 'At 320 × 256\s+\(`run.height` / `run.width`\) it takes (?P<stereo320_ms>\d+) ms'}
     - {file: doc/plans/STEREO_PLAN.md, regex: 'At 320 × 256 a pair takes (?P<stereo320_ms>[\d.]+) ms'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
-    - {file: doc/scheduler/PROFILER.md, regex: 'the current one runs `mnist_convnet` at (?P<mnist_convnet_ms>[\d.]+) ms'}
+    - {file: doc/scheduler/PROFILER.md, regex: 'it ran `mnist_convnet` at\s+(?P<mnist_convnet_ms>[\d.]+) ms'}
     - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
     - {file: demo/mnist/README.md, regex: '^  mnist_lenet    OK +[\d.]+% +(?P<mnist_lenet_ms>[\d.]+) '}
     - {file: .claude/skills/docs-audit/SKILL.md, regex: 'Expect ConvMNIST [\d.]+ % / (?P<mnist_convnet_ms>[\d.]+) ms, LeNet [\d.]+ % / (?P<mnist_lenet_ms>[\d.]+) ms'}
@@ -1462,7 +1476,7 @@ facts:
        regex: 'CLI defaults — (?P<on_conv>\d+) MatMuls on\s+ConvKernel, (?P<on_matmul>\d+) on MatmulKernel'}
     - {file: demo/bert_squad/README.md, regex: 'uses\) (?P<on_conv>\d+) of the (?P<matmuls>\d+)\s+MatMuls run on ConvKernel'}
     - {file: demo/bert_squad/scripts/generate_project.py,
-       regex: 'ConvKernel — (?P<on_conv>\d+) of the (?P<matmuls>\d+) MatMuls, BERT_PLAN 2A — and\s+MatmulKernel for the (?P<on_matmul>\d+) that stay'}
+       regex: 'ConvKernel — (?P<on_conv>\d+) of the (?P<matmuls>\d+) MatMuls, BERT_PLAN 2A —,\s+MatmulKernel for the (?P<on_matmul>\d+) that stay'}
     - {file: demo/bert_squad/bert_squad_config.json.example, regex: 'ConvKernel runs (?P<on_conv>\d+) of its (?P<matmuls>\d+) MatMuls'}
   # BERT_PLAN's phase results (96 of 98 in 360 calls, …) are dated
 

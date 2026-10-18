@@ -16,11 +16,11 @@ Suites (--suite, comma-separated; default: scheduler,chat,lint,facts):
              unittest                                                ~15 s
   csim       kernel C simulation: make + ctest in build/ (Vitis HLS headers;
              Verilator for the RTL kernels' TestMatmulRtl / TestVectorOpRtl /
-             TestPoolRtl)  ~3-6 min
+             TestPoolRtl / TestConvRtl / TestRowOpsRtl)  ~3-6 min
   tts-host   demo/tts/scripts/tts_host_emu.py (+ --lib-check): the Piper library's
              generated C on the host vs the specifications (needs the voice assets
              and demo/tts/build/piper_project)                       ~2 min
-  rtl        make behavior_test in build/ (Vivado xsim; re-synthesises; LONG, and
+  rtl        make behavior_test in build/ (Vivado xsim; re-packages the IPs; LONG, and
              it modifies tracked files of the hw/ submodules)       ~1 h
   all        scheduler,chat,lint,facts,csim,tts-host (not rtl)
 Board suites (run_remote_tests.py, run_remote_perf.py, tts_board.py, llm_board.py)

@@ -7,7 +7,7 @@ deploy_and_run.py — run the generated BERT-SQuAD project on the KV260 and
 score it.
 
   weights  -> remote.weights_dir (persistent; only files whose size or
-              checksum changed are uploaded — 208 MB the first time)
+              checksum changed are uploaded — 208 MiB the first time)
   upload   -> project sources (no weights) + inputs.bin to remote.work_dir
   cmake    -> -DINFERENCE_TARGET=LINUX -DINFERENCE_WEIGHTS_DIR=<weights_dir>
   make     -> squad_bench (+ test_inference with run.smoke_test)

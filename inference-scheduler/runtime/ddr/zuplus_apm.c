@@ -134,7 +134,7 @@ static inline void writereg(unsigned off, uint32_t v)
 
 /* Identical to vaitrace's APM::set_metrics_counter(): MSR0 holds the
  * (slot,metric) pair for counters 0-3, MSR1 for 4-7, MSR2 for 8-9.
- * Each entry is a 13-bit field — 5-bit metric in the low 5 bits,
+ * Each entry is an 8-bit field — 5-bit metric in the low 5 bits,
  * 3-bit slot in bits [7:5].  We OR the new entry into the right byte
  * after masking the old value out. */
 static void set_metric(unsigned slot, uint8_t metric, unsigned counter)

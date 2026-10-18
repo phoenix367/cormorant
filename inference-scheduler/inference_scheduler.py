@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.graph            import OnnxGraph
 from src.codegen          import CodeGenerator
 from src.codegen._simulate import LARGE_EXPECTED_THRESHOLD
+from src.cost_model       import KERNEL_MHZ, cycles_to_ms
 from src.kernels           import KERNEL_REGISTRY, mixed_driver_readme
 from src.nodes            import SchedulerError
 from src.planning         import add_plan_args, plan_options_from_args
@@ -474,8 +475,8 @@ def main(argv=None):
     mc = graph.matmul_conv_stats
     if mc["lowered"]:
         print(f"MatMul->Conv: {mc['lowered']} MatMul(s) on ConvKernel "
-              f"({mc['conv_calls']} calls, est {mc['conv_cycles'] / 1e5:.1f} ms vs "
-              f"{mc['matmul_cycles'] / 1e5:.1f} ms on MatmulKernel @100 MHz), "
+              f"({mc['conv_calls']} calls, est {cycles_to_ms(mc['conv_cycles']):.1f} ms vs "
+              f"{cycles_to_ms(mc['matmul_cycles']):.1f} ms on MatmulKernel @{KERNEL_MHZ:g} MHz), "
               f"{mc['kept']} on MatmulKernel", file=sys.stderr)
     print(f"Output dir : {out_dir}", file=sys.stderr)
 

@@ -37,7 +37,7 @@
       "PoolKernel":     "../../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src",
       "RowOpsKernel":     "../../build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel driver sources (the HLS exports; VectorOPKernel's and MatmulKernel's from make driver_vectorop_rtl / driver_matmul_rtl), copied into each project before upload."
+    "_driver_dirs_note": "Per-kernel driver sources (the RTL kernels' drivers: make driver_vectorop_rtl / driver_matmul_rtl / driver_conv_rtl / driver_pool_rtl), copied into each project before upload."
   },
 
   "build": {

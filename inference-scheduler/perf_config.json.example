@@ -35,7 +35,7 @@
       "PoolingKernel": "../build/kernels/pool_rtl/driver/PoolingKernel_v1_0/src",
       "RowOpsKernel": "../build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Per-kernel local driver source paths (relative to inference-scheduler/, where the runner is started), merged and bundled before upload. The output locations of `make synthesize_kv260` in <repo>/build are shown (VectorOPKernel, MatmulKernel: the RTL kernels' drivers, also `make driver_vectorop_rtl driver_matmul_rtl`)."
+    "_driver_dirs_note": "Per-kernel local driver source paths (relative to inference-scheduler/, where the runner is started), merged and bundled before upload. The output locations in <repo>/build are shown: the five RTL kernels' drivers, written by `make synthesize_kv260` or `make driver_<k>_rtl`."
   },
   "build": {
     "jobs": 4,

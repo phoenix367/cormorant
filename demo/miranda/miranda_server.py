@@ -1060,7 +1060,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--no-weather", dest="weather", action="store_false",
                     help="no weather tool (weather.py: the board's public IP -> its position -> Open-Meteo)")
     ap.add_argument("--no-early-speech", dest="early_speech", action="store_false",
-                    help="speak an answer by whole sentences only (by default, when less than 1.5 s of speech is "
+                    help="speak an answer by whole sentences only (by default, when less than 2 s of speech is "
                          "ahead, the next clause goes to speech as soon as it is written)")
     ap.add_argument("--no-announce", dest="announce", action="store_false",
                     help="no spoken announcement of a weather lookup (by default the chat model says it is "

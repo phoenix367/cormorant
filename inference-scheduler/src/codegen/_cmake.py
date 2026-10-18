@@ -129,7 +129,7 @@ class _CmakeMixin:
             f"message(STATUS \"inference: building for target ${{INFERENCE_TARGET}}\")\n"
             f"\n"
             f"# -----------------------------------------------------------------------\n"
-            f"# Verify driver sources (copy from HLS synthesis output or see driver/README.md)\n"
+            f"# Verify driver sources (copy from make driver_<k>_rtl output or see driver/README.md)\n"
             f"# -----------------------------------------------------------------------\n"
             f"{drv_verify_str}\n"
             f"# -----------------------------------------------------------------------\n"

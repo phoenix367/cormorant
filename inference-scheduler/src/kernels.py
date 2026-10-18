@@ -68,7 +68,7 @@ _VECTOROP_DRIVER_FILES: Tuple[str, ...] = (
     "xvectoropkernel.h",
     "xvectoropkernel_hw.h",
     "xvectoropkernel.c",
-    "xvectoropkernel_sinit.c",   # BARE_METAL target
+    "xvectoropkernel_sinit.c",   # copied, not built (bare metal: base addresses)
     "xvectoropkernel_linux.c",   # LINUX target
 )
 
@@ -81,7 +81,7 @@ Required files:
   xvectoropkernel.h
   xvectoropkernel_hw.h
   xvectoropkernel.c
-  xvectoropkernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xvectoropkernel_sinit.c   (copied, not built: bare metal initialises from base addresses)
   xvectoropkernel_linux.c   (used by INFERENCE_TARGET=LINUX)
 
 These are the RTL VectorOPKernel's driver (the HLS driver's API), written by
@@ -107,7 +107,7 @@ _MATMUL_DRIVER_FILES: Tuple[str, ...] = (
     "xmatmulkernel.h",
     "xmatmulkernel_hw.h",
     "xmatmulkernel.c",
-    "xmatmulkernel_sinit.c",     # BARE_METAL target
+    "xmatmulkernel_sinit.c",     # copied, not built (bare metal: base addresses)
     "xmatmulkernel_linux.c",     # LINUX target
 )
 
@@ -120,7 +120,7 @@ Required files:
   xmatmulkernel.h
   xmatmulkernel_hw.h
   xmatmulkernel.c
-  xmatmulkernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xmatmulkernel_sinit.c   (copied, not built: bare metal initialises from base addresses)
   xmatmulkernel_linux.c   (used by INFERENCE_TARGET=LINUX)
 
 These are the RTL MatmulKernel's driver (the HLS driver's API), written by
@@ -146,7 +146,7 @@ _CONV_DRIVER_FILES: Tuple[str, ...] = (
     "xconvkernel.h",
     "xconvkernel_hw.h",
     "xconvkernel.c",
-    "xconvkernel_sinit.c",    # BARE_METAL target
+    "xconvkernel_sinit.c",    # copied, not built (bare metal: base addresses)
     "xconvkernel_linux.c",    # LINUX target
 )
 
@@ -159,7 +159,7 @@ Required files:
   xconvkernel.h
   xconvkernel_hw.h
   xconvkernel.c
-  xconvkernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xconvkernel_sinit.c   (copied, not built: bare metal initialises from base addresses)
   xconvkernel_linux.c   (used by INFERENCE_TARGET=LINUX)
 
 These are the RTL ConvKernel's driver (the HLS driver's API), written by
@@ -185,7 +185,7 @@ _POOL_DRIVER_FILES: Tuple[str, ...] = (
     "xpoolingkernel.h",
     "xpoolingkernel_hw.h",
     "xpoolingkernel.c",
-    "xpoolingkernel_sinit.c",    # BARE_METAL target
+    "xpoolingkernel_sinit.c",    # copied, not built (bare metal: base addresses)
     "xpoolingkernel_linux.c",    # LINUX target
 )
 
@@ -198,7 +198,7 @@ Required files:
   xpoolingkernel.h
   xpoolingkernel_hw.h
   xpoolingkernel.c
-  xpoolingkernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xpoolingkernel_sinit.c   (copied, not built: bare metal initialises from base addresses)
   xpoolingkernel_linux.c   (used by INFERENCE_TARGET=LINUX)
 
 These are the RTL PoolingKernel's driver (the HLS driver's API), written by
@@ -224,7 +224,7 @@ _ROWOPS_DRIVER_FILES: Tuple[str, ...] = (
     "xrowopskernel.h",
     "xrowopskernel_hw.h",
     "xrowopskernel.c",
-    "xrowopskernel_sinit.c",     # BARE_METAL target
+    "xrowopskernel_sinit.c",     # copied, not built (bare metal: base addresses)
     "xrowopskernel_linux.c",     # LINUX target
 )
 
@@ -237,7 +237,7 @@ Required files:
   xrowopskernel.h
   xrowopskernel_hw.h
   xrowopskernel.c
-  xrowopskernel_sinit.c   (used by INFERENCE_TARGET=BARE_METAL)
+  xrowopskernel_sinit.c   (copied, not built: bare metal initialises from base addresses)
   xrowopskernel_linux.c   (used by INFERENCE_TARGET=LINUX)
 
 These are the RowOpsKernel's driver (the HLS drivers' API), written by

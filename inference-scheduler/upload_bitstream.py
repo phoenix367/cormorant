@@ -25,7 +25,7 @@ directory, so configs are portable across checkouts.
     "bitstream": {
       "bit":          "path/to/design.bit",
       "hwh":          "path/to/design.hwh",
-      "dtbo":         "path/to/pl.dtbo",
+      "dtbo":         "path/to/build/dts/kv260/design_cormorant.dtbo",
       "overlay_name": null,
       "xclbinutil":   "xclbinutil"
     }
@@ -41,7 +41,7 @@ Usage:
   # Override individual paths on the CLI
   python upload_bitstream.py --config bitstream_config_kv260.json \\
       --bit   ../hw/.../design_cormorant_wrapper.bit \\
-      --dtbo  ../dts/kv260/pl.dtbo
+      --dtbo  ../build/dts/kv260/design_cormorant.dtbo
 
   # Check board readiness only
   python upload_bitstream.py --config bitstream_config_kv260.json --check-only

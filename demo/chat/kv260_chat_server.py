@@ -1697,7 +1697,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         os.path.join(HERE, "..", "bert_squad", "assets", "vocab.txt")) if os.path.exists(p)),
         os.path.join(HERE, "vocab.txt")))
     ap.add_argument("--max-windows", type=int, default=8,
-                    help="256-token windows per question at most (latency cap, ~1 s each)")
+                    help="256-token windows per question at most (latency cap, ~0.3 s each)")
     ap.add_argument("--doc-stride", type=int, default=128)
     g = ap.add_argument_group("smollm2 (generative chat with SmolLM2-135M; the sampling and "
                               "context options apply to smollm2-360m and smolvlm too)")

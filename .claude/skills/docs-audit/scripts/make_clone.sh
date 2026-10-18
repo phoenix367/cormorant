@@ -17,7 +17,7 @@
 #                    untracked, not-ignored files).  Without it no untracked
 #                    file is copied.
 #   --root DIR       parent of the reproduction dir (default /mnt/data)
-#   --url URL        clone URL (default git@github.com:phoenix367/cormorant.git)
+#   --url URL        clone URL (default https://github.com/phoenix367/cormorant.git)
 #   --min-free-gb N  free space required on DIR's filesystem (default 10)
 #
 # Creates DIR/cormorant_repro_DATE/ with
@@ -37,7 +37,7 @@
 # Never writes to MAIN_REPO.  Never pushes.
 set -euo pipefail
 
-URL=git@github.com:phoenix367/cormorant.git
+URL=https://github.com/phoenix367/cormorant.git
 ROOT=/mnt/data
 MIN_FREE_GB=10
 FILES=

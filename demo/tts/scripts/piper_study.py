@@ -32,7 +32,7 @@ KV260 (model-study skill, route C; doc/plans/TTS_PLAN.md §3).  Host only.
 
 usage: inference-scheduler/.venv/bin/python demo/tts/scripts/piper_study.py
            [--assets DIR] [--perf-model FILE] CMD
-       /mnt/data/tts_venv/bin/python demo/tts/scripts/piper_study.py phonemize
+       ~/tts_venv/bin/python demo/tts/scripts/piper_study.py phonemize   # venv from requirements-phonemize.txt
 """
 
 from __future__ import annotations

@@ -39,9 +39,11 @@ project(axi_kernels)
 #                           Verilator)
 #   make TestConvRtl      — ConvKernel in SystemVerilog (kernels/conv_rtl,
 #                           Verilator)
+#   make TestRowOpsRtl    — RowOpsKernel in SystemVerilog (kernels/rowops_rtl,
+#                           Verilator)
 #
 # IP export targets (requires Vivado; every kernel's HLS synthesis was retired):
-#   make synthesize_<platform>              — all four kernel IPs
+#   make synthesize_<platform>              — all five kernel IPs
 #   make package_vectorop_rtl               — the VectorOPKernel IP
 #   make package_conv_rtl                   — the ConvKernel IP
 #   make package_matmul_rtl                 — the MatmulKernel IP
@@ -255,7 +257,7 @@ endforeach()
 # longer affects them.
 #
 # Usage:
-#   make synthesize_kv260      # build all four kernel IPs first
+#   make synthesize_kv260      # build all five kernel IPs first
 #   make build_hw_kv260        # then run Vivado on the block design
 #
 # Or in one shot (synthesize_kv260 is listed as a dependency):

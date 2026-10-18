@@ -20,7 +20,7 @@
       "PoolKernel": "fabric_pool",
       "RowOpsKernel": "fabric_rowops"
     },
-    "_uio_devices_note": "Per-kernel UIO sysfs names \u2014 the node labels from dts/kv260/cormorant.dts. Verify on the board with: cat /sys/class/uio/uio*/name. To find names for a different bitstream run: grep -B3 generic-uio dts/<platform>/<stem>.dts. Remove kernels not present in your bitstream. Keys are the scheduler kernel names (src/kernels.py: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel).",
+    "_uio_devices_note": "Per-kernel UIO sysfs names \u2014 the node labels from dts/kv260/cormorant.dts. Verify on the board with: cat /sys/class/uio/uio*/name. To find names for a different bitstream run: grep -B3 generic-uio dts/<platform>/<stem>.dts. Remove kernels not present in your bitstream. Keys are the scheduler kernel names (src/kernels.py: VectorOPKernel, MatmulKernel, ConvKernel, PoolKernel, RowOpsKernel).",
     "driver_dir": null,
     "_driver_dir_note": "Path on the REMOTE machine to copy XVectoropkernel driver sources from. Takes precedence over local.driver_dir when set.",
     "cmake_args": []

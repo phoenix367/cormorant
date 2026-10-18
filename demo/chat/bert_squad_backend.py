@@ -19,7 +19,7 @@ Protocol mapping (doc/plans/CHAT_PLAN.md §3.1)
   no document -> a short usage hint (no FPGA work).
 
 Long documents are split into 256-token windows (question <= 64 tokens, doc
-stride 128); every window is one FPGA inference (~1 s), the best span is
+stride 128); every window is one FPGA inference (~0.3 s), the best span is
 chosen across windows (squad_text.best_span_windows), and --max-windows
 (default 8) caps the latency — later windows are skipped and "truncated"
 is reported.

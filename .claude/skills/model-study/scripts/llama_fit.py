@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 CMA_MB = 1400.0
-RESIDENT = {"bert-squad": 216, "smollm2-135m": 286, "smollm2-360m": 740, "smolvlm-256m": 495}  # MiB
+RESIDENT = {"bert-squad": 216, "smollm2-135m": 299, "smollm2-360m": 758, "smolvlm-256m": 495}  # MiB
 INTERM_MIB_PER_HIDDEN = 0.0108  # intermediates: +6.2 MiB (135M, hidden 576), +10.4 (360M, 960)
 DECODE_GBS = 2.89               # weight bytes streamed per second in decode (GEMV, both ports)
 DECODE_FIXED_MS = 5.8           # host ops per token beyond the weight stream

@@ -168,7 +168,7 @@ def main(argv=None) -> int:
         missing = [t for t in ("chat", "speech", "transcription") if t not in k.values()]
         if missing:
             print(_red(f"  check    -> FAIL  the chat server serves no {' / '.join(missing)} model "
-                       f"(server.backends: smollm2, piper, moonshine)"))
+                       f"(server.backends: smollm2-360m, piper, moonshine)"))
             return 1
         if args.chat_model not in k or k[args.chat_model] != "chat":
             print(_red(f"  check    -> FAIL  --chat-model {args.chat_model} is not a chat model of the server "

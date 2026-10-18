@@ -8,11 +8,11 @@ for the BERT-SQuAD demo.
 
   1. inference-scheduler (Python API, CLI defaults: pattern fusion,
      activation fusion) -> CMake C project in build/project/, with the
-     76 large weight tensors as build/project/weights/*.dat (208 MB).
+     102 large weight tensors as build/project/weights/*.dat (208 MiB).
   2. driver/ populated from local.driver_dirs for the active kernels
-     (VectorOPKernel, ConvKernel — 96 of the 98 MatMuls, BERT_PLAN 2A — and
+     (VectorOPKernel, ConvKernel — 96 of the 98 MatMuls, BERT_PLAN 2A —,
      MatmulKernel for the 2 that stay there: the token-type and span-head
-     MatMuls).
+     MatMuls, and RowOpsKernel for the LayerNorms and transposes).
   3. src/squad_bench.c and src/bert_api.{c,h} copied to test/, plus a
      generated test/bench_glue.h: the buffer order of inference_run(), each
      buffer's numel macro and the index of each role (input_ids,

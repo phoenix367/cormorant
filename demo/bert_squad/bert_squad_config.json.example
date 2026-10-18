@@ -15,14 +15,14 @@
     "work_dir": "/tmp/bert_squad_demo",
     "_work_dir_note": "Per-run directory on the board (project sources, build, inputs, logits).",
     "weights_dir": "/root/bert_squad_weights",
-    "_weights_dir_note": "Persistent directory for the 208 MB weights/*.dat. Uploaded once; later runs upload only files whose size or checksum changed.",
+    "_weights_dir_note": "Persistent directory for the 208 MiB weights/*.dat. Uploaded once; later runs upload only files whose size or checksum changed.",
     "uio_devices": {
       "VectorOPKernel": "fabric_vecop",
       "MatmulKernel":   "fabric_matmul",
       "ConvKernel":     "fabric_conv",
       "RowOpsKernel":     "fabric_rowops"
     },
-    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these three kernels (ConvKernel runs 96 of its 98 MatMuls; MatmulKernel the token-type and span-head MatMuls).",
+    "_uio_devices_note": "UIO names of the loaded overlay (cat /sys/class/uio/uio*/name). BERT uses these four kernels (ConvKernel runs 96 of its 98 MatMuls; MatmulKernel the token-type and span-head MatMuls; VectorOPKernel the adds, GELUs and softmaxes; RowOpsKernel the LayerNorms and transposes).",
     "cmake_args": []
   },
 
@@ -33,7 +33,7 @@
       "ConvKernel":     "../../build/kernels/conv_rtl/driver/ConvKernel_v1_0/src",
       "RowOpsKernel":     "../../build/kernels/rowops_rtl/driver/RowOpsKernel_v1_0/src"
     },
-    "_driver_dirs_note": "Kernel driver sources, copied into the project. Build them in build/ with make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl."
+    "_driver_dirs_note": "Kernel driver sources, copied into the project. Build them in build/ with make driver_vectorop_rtl driver_matmul_rtl driver_conv_rtl driver_rowops_rtl."
   },
 
   "model": "assets/models/bertsquad-12-simplified.onnx",

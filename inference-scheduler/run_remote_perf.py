@@ -7,14 +7,15 @@
 run_remote_perf.py — On-device performance benchmark for KV260 hardware kernels.
 
 Generates a self-contained C benchmark project, uploads it to the remote KV260,
-builds all four kernel benchmarks once, then runs each test case and reports
+builds all five kernel benchmarks once, then runs each test case and reports
 latency (ms) and throughput (GB/s for memory-bound kernels, GOps/s for compute).
 
 Test cases cover:
-  VectorOPKernel — all 6 ops, sizes 1K–256K, broadcasting variants
+  VectorOPKernel — add / mul / div / relu / relu6 / softmax (rows, columns), sizes 1K–256K, broadcasting variants
   MatmulKernel   — square and non-square matrices, batch, A-broadcast
   ConvKernel     — 1×1 and 3×3 convolutions typical of CNN architectures
   PoolingKernel  — max/avg pool, global pool variants
+  RowOpsKernel   — LayerNorm / RMSNorm, residual add, SiLU·up, copy, RoPE, transpose
 
 Usage:
   python run_remote_perf.py --config remote_config.json
@@ -545,7 +546,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="JSON config file")
     p.add_argument("--kernels", metavar="K", nargs="+",
                    choices=list(_BENCH_BINARY.keys()),
-                   help="Kernels to benchmark (default: all four)")
+                   help="Kernels to benchmark (default: all five)")
     p.add_argument("--iters", metavar="N", type=int,
                    help="Override iteration count for all test cases")
     p.add_argument("--warmup", metavar="N", type=int,
