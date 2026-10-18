@@ -8,6 +8,9 @@ pytest>=7.0
 # tools/facts/facts.py — the fact registry checker (../facts.yaml)
 pyyaml>=6.0
 
+# PIL: the YOLO and stereo demos' image prep / overlays, the chat server's image tests
+Pillow>=10.0
+
 # simplify_onnx.py — ONNX preprocessing pipeline
 onnxsim>=0.4.0
 onnxoptimizer>=0.3.0

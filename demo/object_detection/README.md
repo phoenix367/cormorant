@@ -47,9 +47,7 @@ What it needs:
 - the board set up as in the top-level README, with the production bitstream
   loaded;
 - the kernels' driver sources: `make driver_vectorop_rtl driver_conv_rtl
-  driver_pool_rtl` in `build/`, referenced by `local.driver_dirs`;
-- Pillow in the scheduler's virtualenv (`$PY -m pip install Pillow`; it is
-  not in `inference-scheduler/requirements.txt`).
+  driver_pool_rtl` in `build/`, referenced by `local.driver_dirs`.
 
 ## What it does
 

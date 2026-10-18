@@ -219,7 +219,8 @@ class Campaign:
         cases = json.loads(cases_p.read_text()) if cases_p.exists() else {"cases": []}
         self.info = {e["key"]: e for e in cases["cases"]}
         self.mhz = float(kernel_clock_mhz(bid, models_dir / f"{bid}.json"))
-        meas = _measured(data)
+        # the row-ops unit's descriptor chains ('<key>#chain<k>', perf_calibrate.chain_key) are not single calls
+        meas = {k: v for k, v in _measured(data).items() if "#" not in k}
         self.floor_key = min(meas, key=lambda k: meas[k]["us"])
         self.floor_us = meas[self.floor_key]["us"]
         self.floor = self.floor_us * self.mhz
