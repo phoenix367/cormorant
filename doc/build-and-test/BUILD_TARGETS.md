@@ -30,8 +30,8 @@ IP-packaging / synthesis / hardware targets require **Vivado 2025.2** — source
 `<Xilinx>/2025.2/Vitis/settings64.sh` (it puts `vivado` and `xclbinutil` on
 `PATH`) before invoking them. The C-simulation targets need only
 the Vitis HLS headers (`ap_fixed.h`, `ap_int.h`, `hls_burst_maxi.h`, found
-via `$XILINX_HLS` / `$XILINX_VITIS`, else the built-in fallback
-`/mnt/data/xilinx/2025.2/Vitis/include`, the maintainer's install):
+via `$XILINX_HLS` / `$XILINX_VITIS`, which `settings64.sh` sets — configure
+says so when they are missing):
 every kernel header includes them unconditionally, so the CMake `float`
 fallback taken when they are missing no longer compiles.
 

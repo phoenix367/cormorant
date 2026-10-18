@@ -255,8 +255,8 @@ none of these nodes and stay.)
 
 Step 5 removes only an overlay of the same name (and `pynq`).  If the
 same design is already loaded under another overlay name (e.g. `pl`), its
-kernels' UIO devices are still there, and the upload stops right after step 5,
-before the PL is reprogrammed: `The kernels' UIO devices already exist
+kernels' UIO devices are still there, and the upload stops after step 3,
+before anything is uploaded or the PL reprogrammed: `The kernels' UIO devices already exist
 (fabric_conv, …): another overlay provides them (pl, …)`.  (The kernel does not
 always refuse a second overlay for the same nodes: on 2026-10-18 it stacked one
 on top, which then makes the lower one impossible to remove.)  If an overlay

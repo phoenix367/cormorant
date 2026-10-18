@@ -38,7 +38,7 @@ reasons, known warnings, typical duration) are in
 
 | suite | what | time |
 |---|---|---|
-| `scheduler` | `inference-scheduler/` pytest `test/` (1885 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
+| `scheduler` | `inference-scheduler/` pytest `test/` (1886 tests, no skips; the first run downloads the 435 MB BERT model) | ~4 min |
 | `chat` | `demo/chat/tests` pytest (230 tests) | ~50 s |
 | `lint` | ruff over `inference-scheduler/` (the CI lint) | 1 s |
 | `facts` | `tools/facts/facts.py check` (`facts.yaml`: counts, register maps, supported ops, CLI and script flags, HTTP routes, ctypes, config keys, platform JSON, pool sizes, board results against code and docs; a failure = a stale or inconsistent fact) + the tool's unittest | ~15 s |
@@ -110,7 +110,8 @@ For every suite, go beyond `status`:
 2. **Skips.**  Every skip whose reason is not in the baseline is
    `unexpected`.  Say what the reason means (e.g. "C compiler not available",
    "onnxruntime not installed").  List the expected ones only by count.
-   The scheduler suite expects no skips.
+   The scheduler suite expects no skips once the Moonshine checkpoints are fetched
+   (`test_moonshine.py`'s `TestMoonshineTiny` skips without them: `demo/asr/scripts/asr_study.py fetch`).
    - `test_bert_base.py` downloads the 435 MB bertsquad-12 model on its
      first run, so a skip there means one of two things:
      - `BERT_SQUAD_DOWNLOAD=0` was set;
