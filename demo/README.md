@@ -14,7 +14,8 @@ three stages — **download → generate → deploy** — driven by a one-shot
 model, vocabulary and SQuAD file downloaded on first use (see its README).
 `chat/` installs a long-running server on the board with `deploy.py` and
 takes its board settings from `bert_squad/bert_squad_config.json`; `tts/`
-builds the speech library the server's `piper` backend loads.
+builds the speech library the server's `piper` backend loads, `asr/` the
+speech-to-text library of its `moonshine` backend.
 
 | Demo | Model | Input | What it shows |
 |------|-------|-------|---------------|
@@ -26,6 +27,7 @@ builds the speech library the server's `piper` backend loads.
 | [`bert_squad/`](bert_squad/) | BERT-base (bertsquad-12) | SQuAD 1.1 dev questions | Extractive QA on ConvKernel + MatmulKernel + VectorOPKernel + RowOpsKernel + host ops: EM / F1 vs the float model, board logits bit-exact vs the scheduler simulation, per-layer time by kind (267 ms per inference) on bitstream `04259a7af917` |
 | [`chat/`](chat/) | BERT-base (bertsquad-12), SmolLM2-135M / 360M-Instruct, SmolVLM-256M-Instruct, Piper lessac-medium, Moonshine base | chat messages (and images), text to speak, audio to transcribe, over HTTP | OpenAI-compatible server running on the board (`/v1/chat/completions`, `/v1/audio/speech` and `/v1/audio/transcriptions`, streaming), backends `bert-squad`, `smollm2`, `smollm2-360m`, `smolvlm`, `piper` and `moonshine`: question answering over a user-supplied document (~0.27 s per 256-token window on bitstream `04259a7af917`), generative multi-turn chat (SmolLM2-135M ~20.4 tokens/s, 360M ~7.8 tokens/s on bitstream `04259a7af917`), questions about images sent as OpenAI `image_url` parts (1.6 s per image, then ~20 tokens/s on bitstream `04259a7af917`), text to speech (first sound after 1.0–1.5 s at 100 MHz, faster than real time) and speech to text; works with `curl`, the `openai` SDK, `llm`, `aichat` and the bundled `chat.py` (which can read answers aloud); [demo video](https://youtu.be/VVS7ExW0XYQ) |
 | [`tts/`](tts/) | Piper en_US-lessac-medium (VITS) | sentences | The numeric study, `libpiper_tts.so` (flow + HiFi-GAN on ConvKernel, 0.15 s per 1.49 s of audio; the text encoder on the FPGA and the duration predictor in C too) and its board gate: audio bit-exact with the specification; the library serves the chat server's `piper` backend |
+| [`asr/`](asr/) | Moonshine base / tiny (UsefulSensors) | LibriSpeech test-clean utterances, your WAV files (through the chat server) | The numeric study, `libmoonshine_<size>.so` (the encoder and the greedy decoder on the FPGA, a 10 s recording in 1.3 s through the server) and its board gate: every token id bit-exact with the specification, WER 2.93 % (base); the library serves the chat server's `moonshine` backend |
 | [`miranda/`](miranda/) | Moonshine base, SmolLM2-360M-Instruct, Piper lessac-medium (through the chat server) | the microphone (RTP from a console client) | A voice assistant: "Hello Miranda" and a request; voice activity detection on the board's CPU, the key phrase found in the transcripts, the answer streamed as text and spoken back; the microphone muted while Miranda thinks and speaks; a dialogue mode without the key phrase (by voice, `--dialogue` or `d` + Enter) that ends after silence |
 
 ## Common workflow

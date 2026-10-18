@@ -223,7 +223,8 @@ what PYNQ's `Overlay` class does internally:
 4. Upload `.bin` → `/lib/firmware/<name>.bin` on the board
 5. Remove a `pynq` overlay (PYNQ images insert one on every login shell), then
    any existing configfs DTBO overlay with the same name; each removal is
-   checked in `dmesg`, and a refused one stops the upload (below); then PL0
+   checked in `dmesg`, and a refused one stops the upload (below), as does a
+   kernel UIO device that another overlay still provides; then PL0
    (`fclk0`) is checked against the HWH's PL0 frequency (100 MHz, the kernel
    clock MMCM's input) and set when it differs
 6. Write to `fpga_manager` sysfs — triggers PL reconfiguration
@@ -253,12 +254,15 @@ reboot the board and run again.  (The R5's `rpu` and `rpu-ipi` overlays touch
 none of these nodes and stay.)
 
 Step 5 removes only an overlay of the same name (and `pynq`).  If the
-same design is already loaded under another overlay name (e.g. `pl`), the
-kernel refuses the new one (`create_overlay: Failed to create overlay
-(err=-22)` in `dmesg`: the other overlay owns the nodes) and step 10 fails
-with `Overlay '<name>' did not apply …`, listing the kernel errors and the
-other loaded overlays.  Remove the other one on the board and run again,
-or reuse its name:
+same design is already loaded under another overlay name (e.g. `pl`), its
+kernels' UIO devices are still there, and the upload stops right after step 5,
+before the PL is reprogrammed: `The kernels' UIO devices already exist
+(fabric_conv, …): another overlay provides them (pl, …)`.  (The kernel does not
+always refuse a second overlay for the same nodes: on 2026-10-18 it stacked one
+on top, which then makes the lower one impossible to remove.)  If an overlay
+still fails to apply for another reason, step 10 stops with `Overlay '<name>'
+did not apply …`, listing the kernel errors and the other loaded overlays.
+Remove the other overlay on the board and run again, or reuse its name:
 
 ```bash
 ls /sys/kernel/config/device-tree/overlays/          # on the board

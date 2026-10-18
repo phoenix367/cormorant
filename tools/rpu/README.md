@@ -8,7 +8,7 @@ bitstream.  Rebuild the BSP after every bitstream whose kernels, addresses
 or interrupts changed.
 
 ```bash
-source /mnt/data/xilinx/2025.2/Vitis/settings64.sh
+source <Xilinx>/2025.2/Vitis/settings64.sh
 vivado -mode batch -nolog -nojournal -source tools/rpu/write_xsa.tcl \
        -tclargs hw/cormorant_hw_128/cormorant_hw_128.xpr $TMPDIR/rpu/cormorant.xsa   # ~1 min
 vitis -s tools/rpu/make_r5_bsp.py $TMPDIR/rpu/cormorant.xsa $TMPDIR/rpu/ws          # ~3 min
@@ -25,6 +25,10 @@ cd inference-scheduler
     --project ../demo/mnist/build/projects/mnist_convnet \
     --project ../demo/image_classification/build/projects/resnet18
 ```
+
+The firmware goes to `/lib/firmware/rpu_firmware.elf`; `--firmware-name NAME`
+picks another file (a board that already runs the chat server's firmware
+keeps it; `rpu.firmware` in `chat_config.json` is the server's).
 
 `rpu_board.py` builds the firmware, uploads it with the overlays
 (`board/kv260/rpu/rpu.dts`: RPU core 0, its TCMs, `zynqmp_r5_remoteproc`;

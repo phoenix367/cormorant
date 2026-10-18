@@ -44,6 +44,10 @@ The commands run from the repo root.
    $PY demo/tts/scripts/tts_board.py --install-only     # <dir>/lib/libpiper_tts.so, /root/piper_weights
    ```
 
+   `--remote-dir DIR` / `--weights-dir DIR` install elsewhere — for a second
+   install beside an existing one; set the same paths in `chat_config.json`
+   (`remote.dir`, `piper.weights_dir`).
+
 **Enable it:**
 1. Add `"piper"` to `server.backends` in `chat_config.json`.  The `piper`
    block sets the library, the voice directory and `cma_mb` (55).

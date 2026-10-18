@@ -47,8 +47,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 # Lint — same invocation CI uses; configuration lives in pyproject.toml.
 # Run from inference-scheduler/ (the dot scopes ruff to the whole package,
 # including the top-level run_remote_*.py / upload_bitstream.py scripts).
-.venv/bin/pip install 'ruff>=0.15,<0.16'
-.venv/bin/ruff check .
+.venv/bin/ruff check .        # ruff is in requirements.txt ('ruff>=0.15,<0.16', CI's version)
 
 # Generate a C inference project
 .venv/bin/python inference_scheduler.py test/models/mixed_ops.onnx --out-dir /tmp/out
@@ -339,7 +338,7 @@ test/
                          VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              90 pytest modules, 1883 tests, all pass (test_bert_base.py
+  test_*.py              90 pytest modules, 1885 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

@@ -803,6 +803,7 @@ facts:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Piper \| (?P<piper>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Moonshine base \| (?P<moonshine_base>[\d.]+) MiB'}
     - {file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: 'CMA \(a (?P<moonshine_base>[\d.]+) MiB pool\)'}
+    - {file: demo/asr/README.md, regex: '\*\*Memory:\*\* base (?P<moonshine_base>[\d.]+) MiB of CMA'}
     - {file: doc/ARCHITECTURE.md, dotall: true, regex: 'beside Piper''s (?P<piper>\d+) MiB\s+and Moonshine base''s (?P<moonshine_base>[\d.]+) MiB'}
     - {file: doc/ARCHITECTURE.md, dotall: true,
        regex: 'pools are (?P<bert>\d+) MiB \(BERT\), (?P<smollm2_135m>\d+) MiB \(SmolLM2-135M\),\s+(?P<smollm2_360m>\d+) MiB \(SmolLM2-360M\) and (?P<smolvlm_256m>\d+) MiB \(SmolVLM-256M\)'}

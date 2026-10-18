@@ -183,7 +183,8 @@ An FPGA (Field-Programmable Gate Array) is a type of semiconductor device ...
 ### Speech to text
 
 When the server also serves a speech-to-text model ([Speech to
-text](SPEECH_TO_TEXT.md)), `chat.py` can send recordings:
+text](SPEECH_TO_TEXT.md)), `chat.py` can send recordings (`nemo.wav`: made
+as in that guide's [Requests](SPEECH_TO_TEXT.md#requests)):
 
 ```
 $ python3 demo/chat/chat.py --url http://192.168.100.8:8000/v1 --transcribe nemo.wav
@@ -224,7 +225,8 @@ $ curl -s http://192.168.100.8:8000/v1/models
 {"object": "list", "data": [{"id": "bert-squad", "object": "model", "created": 1790403749, "owned_by": "kv260", "kv260": {"type": "chat"}}]}
 ```
 
-**Ask a question** (`POST /v1/chat/completions`).  The request puts the
+**Ask a question** (`POST /v1/chat/completions`).  The request (`req.json`
+below, the system message abridged: put `sb50.txt`'s text there) puts the
 document in the system message and the question in the user message; the
 answer is in `choices[0].message.content`.  Besides the standard fields the
 response carries a `kv260` object with the backend's details: here the

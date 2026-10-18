@@ -5,7 +5,7 @@ transcription API, `POST /v1/audio/transcriptions`.  The model is Moonshine
 base (UsefulSensors, MIT; Moonshine tiny with its own library), English
 only; how it was chosen and ported is in
 [ASR_PLAN](../../../doc/plans/ASR_PLAN.md) §1–§7 and
-[`demo/asr/`](../../asr/scripts).
+[`demo/asr/`](../../asr/README.md).
 
 - **Accuracy.**  The board's transcripts equal the fixed-point
   specification token for token (200 / 200 LibriSpeech test-clean
@@ -19,9 +19,11 @@ only; how it was chosen and ported is in
 
 The commands run from the repo root.
 
-1. **Fetch the checkpoint**: `demo/asr/scripts/asr_study.py fetch` (in
-   `.venv-export`; ASR_PLAN §2's commands) downloads Moonshine and the
-   LibriSpeech audio into `demo/asr/assets/`.  The calibrated exponents are
+1. **Fetch the checkpoint**: `demo/asr/scripts/asr_study.py fetch` (it
+   needs only numpy: the scheduler's venv runs it; the study's other steps,
+   ASR_PLAN §2, need `.venv-export`, created as in
+   [Generative chat](SMOLLM2.md#install-smollm2-135m) step 1) downloads
+   Moonshine and the LibriSpeech audio into `demo/asr/assets/`.  The calibrated exponents are
    in the repository (`demo/asr/moonshine-base_opt_formats.json`).
 2. **Generate the library project** (52 s, 2.9 GB):
 
@@ -38,6 +40,10 @@ The commands run from the repo root.
    $PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project --install-only
    #   -> <dir>/lib/libmoonshine_base.so, /root/moonshine_base_weights
    ```
+
+   `--remote-dir DIR` / `--weights-dir DIR` install elsewhere — for a second
+   install beside an existing one; set the same paths in `chat_config.json`
+   (`remote.dir`, `moonshine.weights_dir`).
 
 **Enable it:**
 1. Add `"moonshine"` to `server.backends` in `chat_config.json`.  The
@@ -62,8 +68,10 @@ $ curl http://192.168.100.8:8000/v1/audio/transcriptions -F model=whisper-1 -F f
 Nemo builds a fabulous futuristic submarine, the Nautilus, then conducts an underwater campaign of vengeance against his imperialist oppressor.
 ```
 
-(LibriSpeech test-clean 8463-294825-0003; `-F stream=true` gives
-server-sent events.)  In `kv260`, `fpga_ms` is the library's time;
+(`nemo.wav` is LibriSpeech test-clean 8463-294825-0003, under
+`demo/asr/assets/librispeech/` after `asr_study.py fetch`:
+`ffmpeg -i demo/asr/assets/librispeech/LibriSpeech/test-clean/8463/294825/8463-294825-0003.flac nemo.wav`;
+`-F stream=true` gives server-sent events.)  In `kv260`, `fpga_ms` is the library's time;
 `encode_ms` / `decode_ms` split it as the library sees it — with the
 Cortex-R5 driving the kernels the encoder's batch is still running when
 the call returns (it has no output to wait for), so its time shows up in

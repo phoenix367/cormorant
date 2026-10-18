@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1883 tests); the chat app (230 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1885 tests); the chat app (230 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the five SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,9 +65,10 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1883 tests in 90 modules (all pass, none skipped; the first run
-# downloads the 435 MB bertsquad-12 model for test_bert_base.py)
-.venv/bin/python -m pytest test/ -q
+# Run all 1885 tests in 90 modules (all pass, none skipped; the first run
+# downloads the 435 MB bertsquad-12 model for test_bert_base.py and may skip
+# one test while it does — -rs prints the reason of every skip)
+.venv/bin/python -m pytest test/ -q -rs
 
 # Run a specific module
 .venv/bin/python -m pytest test/test_pool_alloc.py -v
@@ -139,11 +140,12 @@ run with the same venv, from the repo root:
 inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 230 tests
 ```
 
-About 60 of them skip in a fresh clone, until the assets they read are
+About 75 of them skip in a fresh clone (80 under the system python3), until the assets they read are
 present: the SmolLM2 tokenizer (`demo/chat/scripts/llm_calibrate.py fetch`),
 the SmolVLM tokenizer (`demo/chat/scripts/vlm_study.py fetch`), BERT's
 `vocab.txt` (`demo/bert_squad/scripts/fetch_assets.py vocab`)
-and Pillow.
+and, under a python without it, Pillow (the scheduler venv's requirements
+install it).
 
 ---
 

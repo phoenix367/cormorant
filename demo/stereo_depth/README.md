@@ -66,7 +66,8 @@ A D4xx's two infrared cameras are a rectified stereo pair.  `run_demo.py
 `src/board/realsense_capture.py` there: infrared 1 and 2, the camera's
 depth, the calibration, the emitter on and off), runs only those pairs and
 writes `<name>_depth.png`: the left image, the network's depth
-(fx · baseline / disparity) and the camera's own depth.  On the board
+(fx · baseline / disparity) and the camera's own depth; the summary prints
+the comparison per pair (`per_pair[].realsense` in `build/results.json`).  On the board
 (2026-10-18, bitstream `04259a7af917`) a D435 pair takes 467 ms; with the IR projector
 on, the network's depth is within 10 % of the camera's own on 91 % of the pixels
 (median difference 2.7 %), without it on 74 % (4.5 %): blank walls have no

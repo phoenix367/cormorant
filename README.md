@@ -238,7 +238,7 @@ SystemVerilog kernels, with Verilator 5.x).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1883 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1885 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -308,7 +308,8 @@ cd inference-scheduler
 ```
 
 If the same design is already loaded under another overlay name,
-`upload_bitstream.py` stops with `Overlay '<name>' did not apply …`; see
+`upload_bitstream.py` stops before loading anything, with `The kernels' UIO
+devices already exist …`; see
 [REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy).
 
 ### 6. Run on the board
@@ -326,8 +327,8 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1883<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~70 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, and `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1885<!-- /fact --> tests) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~75 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, and `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

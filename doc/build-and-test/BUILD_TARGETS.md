@@ -74,6 +74,7 @@ no hardware.
 | `TestVectorOpRtl` | VectorOPKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 212 checked-in fixtures, 300 random jobs, 8 every-input activation jobs and 2 every-input softmax jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-vectoropkernel-systemverilog)) |
 | `TestPoolRtl` | PoolingKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 45 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-poolingkernel-systemverilog)) |
 | `TestConvRtl` | ConvKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 66 checked-in fixtures and 200 random jobs checked against the C++ model — only if Verilator 5.x is found ([below](#rtl-convkernel-systemverilog)) |
+| `TestRowOpsRtl` | RowOpsKernel (RTL) | Verilator testbench of the SystemVerilog kernel; CTest runs it on the 43 checked-in RowOps fixtures, the descriptor-chain fixtures and random jobs and chains checked against its C++ oracle — only if Verilator 5.x is found ([below](#rtl-rowopskernel-systemverilog)) |
 
 | Aggregate | Description |
 |-----------|-------------|
@@ -243,7 +244,7 @@ needs only Python).
 | `package_conv_rtl` | Vivado IP `xilinx.com:hls:ConvKernel:1.0` with the driver → `build/rtl_ip/ConvKernel_ip` (+ `.zip`) |
 | `synth_conv_rtl` | Vivado out-of-context synthesis + P&R on the platform's part at `CV_RTL_PERIOD` ns (default 3.333) → `build/kernels/conv_rtl/synth/*.rpt` |
 | `xsim_conv_rtl` | `xvlog` / `xelab` parse and elaboration |
-| `sysim_conv_rtl` | The test stand's ConvKernel block design (PS VIP, interconnect, DDR model, the DSP48E2 models) with this IP, on a copy in `build/kernels/conv_rtl/sysim/` (~75 min for the 63 fixtures, 2026-10-05) |
+| `sysim_conv_rtl` | The test stand's ConvKernel block design (PS VIP, interconnect, DDR model, the DSP48E2 models) with this IP, on a copy in `build/kernels/conv_rtl/sysim/` (~75 min; measured 2026-10-05, with the 63 fixtures of then) |
 
 As for the other RTL kernels, the IP is packaged in `build/rtl_ip/`,
 `ip_repo_kv260` links it and `behavior_test_conv` takes it (depending on

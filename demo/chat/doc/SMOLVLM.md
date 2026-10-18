@@ -39,7 +39,9 @@ scheduler's venv, `../../inference-scheduler/.venv/bin/python`.
 3. Run `deploy.py`.
 
 **The board gate.**  To check the library on the board — image prompts,
-logits against the simulation — run the same command without
+logits against the simulation — first compute the reference on the host,
+`$PY scripts/vlm_sched_check.py --text` (the gate's prompts, pixels and
+logits; ~7 min and ~9 GB of RAM), then run the same command without
 `--install-only`:
 `$PY scripts/llm_board.py --project build/llm_project_smolvlm_256m`.
 
