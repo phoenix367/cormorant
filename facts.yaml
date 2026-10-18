@@ -1748,7 +1748,6 @@ facts:
     - {file: README.md, regex: '<Xilinx>/(\d{4}\.\d)/Vitis/settings64\.sh'}
     - {file: CLAUDE.md, regex: '(?:\*\*Xilinx Vitis |/mnt/data/xilinx/)(\d{4}\.\d)'}
     - {file: CMakeLists.txt, regex: 'submodule and Vivado (\d{4}\.\d)\.'}
-    - {file: .claude/agents/run-tests/run_tests.py, regex: 'xilinx/(\d{4}\.\d)/Vitis'}
     - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '(?:\*\*Vitis |<Xilinx>/|xilinx/|Requires Vivado )(\d{4}\.\d)'}
     - {file: doc/build-and-test/TESTING.md, regex: '<Xilinx>/(\d{4}\.\d)/Vitis'}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: '(?:<Xilinx>|/opt/Xilinx)/(\d{4}\.\d)/Vitis'}

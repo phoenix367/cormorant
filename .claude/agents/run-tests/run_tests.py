@@ -71,7 +71,7 @@ SCHED = REPO / "inference-scheduler"
 VENV_PY = SCHED / ".venv" / "bin" / "python"
 RUFF = SCHED / ".venv" / "bin" / "ruff"
 BUILD = REPO / "build"
-VITIS = os.environ.get("VITIS_SETTINGS", "/mnt/data/xilinx/2025.2/Vitis/settings64.sh")
+VITIS = os.environ.get("VITIS_SETTINGS") or os.path.join(os.environ.get("XILINX_VITIS", "<Vitis>"), "settings64.sh")
 BASELINES = HERE / "baselines.json"
 FACTS = REPO / "tools" / "facts"
 

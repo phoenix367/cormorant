@@ -7,14 +7,15 @@
 #   cmake -S rpu -B build-rpu -DCMAKE_TOOLCHAIN_FILE=rpu/toolchain-r5.cmake \
 #         -DBSP_DIR=<platform>/psu_cortexr5_0/<domain>/bsp
 #
-# VITIS_DIR defaults to the Vitis installation this repository documents.
+# VITIS_DIR: -DVITIS_DIR=..., else $XILINX_VITIS (source <Xilinx>/2025.2/Vitis/settings64.sh).
 set(CMAKE_SYSTEM_NAME Generic)
 set(CMAKE_SYSTEM_PROCESSOR arm)
 if(NOT DEFINED VITIS_DIR)
     if(DEFINED ENV{XILINX_VITIS})
         set(VITIS_DIR $ENV{XILINX_VITIS})
     else()
-        set(VITIS_DIR /mnt/data/xilinx/2025.2/Vitis)
+        message(FATAL_ERROR "Vitis not found: source <Xilinx>/2025.2/Vitis/settings64.sh "
+                            "(it sets XILINX_VITIS) or pass -DVITIS_DIR=<Xilinx>/2025.2/Vitis")
     endif()
 endif()
 set(_R5_BIN ${VITIS_DIR}/gnu/armr5/lin/gcc-arm-none-eabi/bin)

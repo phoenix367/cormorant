@@ -21,7 +21,6 @@ find_path(VA_HLS_INCLUDE_DIR NAMES ap_fixed.h
     HINTS
         $ENV{XILINX_HLS}/include
         $ENV{XILINX_VITIS}/include
-        /mnt/data/xilinx/2025.2/Vitis/include
     NO_DEFAULT_PATH
     DOC "Vitis HLS include directory containing ap_fixed.h"
 )
@@ -30,7 +29,8 @@ if(VA_HLS_INCLUDE_DIR)
     message(STATUS "VectorOP: Vitis HLS headers found at ${VA_HLS_INCLUDE_DIR}")
     set(_VA_DATA_TYPE_DEFAULT "ap_fixed<16,8>")
 else()
-    message(STATUS "VectorOP: Vitis HLS headers not found — defaulting to float")
+    message(STATUS "VectorOP: Vitis HLS headers not found — defaulting to float "
+                   "(source <Xilinx>/2025.2/Vitis/settings64.sh: it sets XILINX_HLS)")
     set(_VA_DATA_TYPE_DEFAULT "float")
 endif()
 

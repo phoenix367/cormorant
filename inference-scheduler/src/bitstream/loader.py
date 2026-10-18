@@ -50,7 +50,9 @@ def upload_bitstream(
       1  .bit → .bin (header strip + 32-bit byteswap)
       2  Parse HWH — PS family, AXI port-width parameters, PL0 and kernel clocks
       3  Build xclbin with MEM_TOPOLOGY via xclbinutil
-      4  Upload .bin → /lib/firmware/<overlay_name>.bin
+      4  Upload .bin → /lib/firmware/<overlay_name>.bin — unless no overlay of
+         that name is applied and another one provides the kernels' UIO
+         devices: then stop with nothing uploaded (check_kernels_free)
       5  Remove a `pynq` overlay, then any existing overlay of ours (each
          removal checked in the kernel log); stop when another overlay still
          provides the kernels' UIO devices (check_kernels_free)
@@ -103,6 +105,11 @@ def upload_bitstream(
     print(f"\n{_bold('Step 3')}   Building xclbin (MEM_TOPOLOGY from HWH)")
     xclbin_data = build_xclbin(hwh_path, kv260.BLANK_METADATA, xclbinutil)
     print(f"          {len(xclbin_data):,} bytes")
+
+    # another overlay with these kernels: stop before anything is uploaded (step 5 checks
+    # again once an overlay of the same name is removed)
+    if overlay_name not in list_overlays(session):
+        check_kernels_free(session, dtbo_path, overlay_name)
 
     print(f"\n{_bold('Step 4')}   Uploading → {remote_bin}")
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:

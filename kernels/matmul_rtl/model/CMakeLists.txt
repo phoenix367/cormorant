@@ -34,7 +34,6 @@ find_path(HLS_INCLUDE_DIR NAMES ap_fixed.h
     HINTS
         $ENV{XILINX_HLS}/include
         $ENV{XILINX_VITIS}/include
-        /mnt/data/xilinx/2025.2/Vitis/include
     NO_DEFAULT_PATH
     DOC "Vitis HLS include directory containing ap_fixed.h"
 )
@@ -44,7 +43,8 @@ if(HLS_INCLUDE_DIR)
     set(_MM_HAVE_HLS TRUE)
 else()
     message(STATUS "MatmulKernel: Vitis HLS headers not found — "
-                   "the C-sim targets need them and will not build")
+                   "the C-sim targets need them and will not build "
+                   "(source <Xilinx>/2025.2/Vitis/settings64.sh: it sets XILINX_HLS)")
     set(_MM_HAVE_HLS FALSE)
 endif()
 

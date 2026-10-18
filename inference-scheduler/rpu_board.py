@@ -44,6 +44,7 @@ setup error.  The chat server must be stopped first (demo/chat/deploy.py
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,10 +59,14 @@ REPO = HERE.parent
 FIRMWARE_SRC = HERE / "runtime" / "rpu"
 DTS = REPO / "board" / "kv260" / "rpu" / "rpu.dts"
 DTS_IPI = REPO / "board" / "kv260" / "rpu" / "rpu-ipi.dts"       # the A53's doorbell (rpu_ipi UIO)
-VITIS = Path(os.environ.get("XILINX_VITIS", "/mnt/data/xilinx/2025.2/Vitis"))
+# Vitis: the sourced environment (settings64.sh sets XILINX_VITIS), else the vitis on PATH
+VITIS = (Path(os.environ["XILINX_VITIS"]) if os.environ.get("XILINX_VITIS")
+         else Path(shutil.which("vitis")).resolve().parent.parent if shutil.which("vitis") else None)
 
 
 def build_firmware(bsp_dir: Path, build_dir: Path, log) -> Path:
+    if VITIS is None:
+        raise RuntimeError("Vitis not found: source <Xilinx>/2025.2/Vitis/settings64.sh (it sets XILINX_VITIS)")
     cmd = ["cmake", "-S", str(FIRMWARE_SRC), "-B", str(build_dir),
            f"-DCMAKE_TOOLCHAIN_FILE={FIRMWARE_SRC / 'toolchain-r5.cmake'}", f"-DBSP_DIR={bsp_dir}",
            f"-DVITIS_DIR={VITIS}"]
@@ -278,7 +283,7 @@ def main(argv=None) -> int:
             return 0 if worst == 0 else (1 if worst == 1 else 2)
         finally:
             if cfg.get("cleanup", True):                   # the projects and their builds; the firmware is in /lib/firmware
-                session.exec(f"rm -rf {work}", timeout=60)
+                session.exec(f"rm -rf {work}; rmdir {os.path.dirname(work)} 2>/dev/null", timeout=60)   # the work_dir if empty
             session.close()
 
 

@@ -5,7 +5,7 @@
 
 Run with the Vitis Python interpreter (it drives the Vitis server):
 
-    source /mnt/data/xilinx/2025.2/Vitis/settings64.sh
+    source <Xilinx>/2025.2/Vitis/settings64.sh
     vitis -s tools/rpu/make_r5_bsp.py <cormorant.xsa> <workspace>
 
 It creates a platform component for psu_cortexr5_0 (standalone, no boot

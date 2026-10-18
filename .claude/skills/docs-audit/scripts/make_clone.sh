@@ -208,7 +208,7 @@ fill() {
         -e "s|{{ORIGIN_HEAD}}|${BASE_SHA:0:7}|g" \
         -e "s|{{BOARD}}|${BOARD_HOST:-192.168.100.8}|g" \
         -e "s|{{KEY}}|${BOARD_KEY:-~/.ssh/kv260-testkey}|g" \
-        -e "s|{{XILINX}}|${XILINX_ROOT:-/mnt/data/xilinx/2025.2}|g" "$1"
+        -e "s|{{XILINX}}|${XILINX_ROOT:-${XILINX_VITIS%/Vitis}}|g" "$1"
 }
 fill "$TPL/new_user_brief.md" > "$BASE/brief.md"
 fill "$TPL/GAPS_template.md" > "$BASE/GAPS.md"

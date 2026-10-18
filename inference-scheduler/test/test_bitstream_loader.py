@@ -148,3 +148,20 @@ class TestKernelsFree(unittest.TestCase):
     def test_free(self):
         s = FakeSession(overlays=("k26-starter-kits_image_1",), uio=("axi-pmon", "rpu_ipi"))
         check_kernels_free(s, self.dtbo, "pl")
+
+    def test_upload_stops_before_upload(self):
+        """Under another overlay name nothing reaches the board's /lib/firmware."""
+        from unittest import mock
+        from src.bitstream import loader
+        s = FakeSession(overlays=("k26-starter-kits_image_1", "pl"), uio=("fabric_vecop", "fabric_conv"))
+        with mock.patch.object(loader, "bit_to_bin", return_value=b"bin"), \
+             mock.patch.object(loader, "parse_hwh_ps_params", return_value=("zynq_ultra_ps_e", {})), \
+             mock.patch.object(loader.kv260, "axi_port_width_writes", return_value=[]), \
+             mock.patch.object(loader, "parse_hwh_clocks", return_value={"pl0_mhz": 100, "kernel_mhz": 250}), \
+             mock.patch.object(loader, "build_xclbin", return_value=b"xclbin"), \
+             mock.patch.object(loader, "upload_file") as up:
+            with self.assertRaises(RuntimeError) as cm:
+                loader.upload_bitstream(s, Path("x.bit"), Path("x.hwh"), self.dtbo, "design_cormorant")
+        self.assertIn("another overlay provides them", str(cm.exception))
+        up.assert_not_called()
+        self.assertEqual(s.overlays, ["k26-starter-kits_image_1", "pl"])

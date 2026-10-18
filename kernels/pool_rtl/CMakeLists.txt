@@ -103,7 +103,7 @@ add_test(NAME PoolRtlDriver
 # bounds, as the bitstream).
 # ---------------------------------------------------------------------------
 find_path(PL_RTL_HLS_INCLUDE NAMES ap_fixed.h hls_burst_maxi.h
-    HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include /mnt/data/xilinx/2025.2/Vitis/include
+    HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include
     NO_DEFAULT_PATH
     DOC "Vitis HLS include directory (ap_fixed.h): the testbench's oracle (the C++ model)")
 set(_pl_rtl_oracle_flags)
@@ -204,7 +204,7 @@ endif()
 # Vivado: IP packaging, out-of-context synthesis, xsim
 # ---------------------------------------------------------------------------
 find_program(PL_RTL_VIVADO vivado
-    HINTS $ENV{XILINX_VIVADO}/bin /mnt/data/xilinx/2025.2/Vivado/bin
+    HINTS $ENV{XILINX_VIVADO}/bin
     DOC "Vivado, for packaging the RTL PoolingKernel IP")
 
 if(PL_RTL_VIVADO)

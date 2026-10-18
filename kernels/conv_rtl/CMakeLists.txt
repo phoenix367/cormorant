@@ -107,7 +107,7 @@ add_test(NAME ConvRtlDriver
 # bounds, as the bitstream).
 # ---------------------------------------------------------------------------
 find_path(CV_RTL_HLS_INCLUDE NAMES ap_fixed.h hls_burst_maxi.h
-    HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include /mnt/data/xilinx/2025.2/Vitis/include
+    HINTS $ENV{XILINX_HLS}/include $ENV{XILINX_VITIS}/include
     NO_DEFAULT_PATH
     DOC "Vitis HLS include directory (ap_fixed.h): the testbench's oracle (the C++ model)")
 set(_cv_rtl_oracle_flags)
@@ -203,7 +203,7 @@ if(CV_RTL_VERILATOR)
     # Vivado's DSP48E2 model (what the hardware is): both chains on the same
     # random stimulus, compared every cycle (tb/verilator/dsp_check.*).
     find_file(CV_RTL_UNISIM_DSP DSP48E2.v
-        HINTS $ENV{XILINX_VIVADO}/data/verilog/src/unisims /mnt/data/xilinx/2025.2/Vivado/data/verilog/src/unisims
+        HINTS $ENV{XILINX_VIVADO}/data/verilog/src/unisims
         NO_DEFAULT_PATH DOC "Vivado's DSP48E2 unisim model, for the ConvRtlDsp check")
     if(CV_RTL_UNISIM_DSP)
         get_filename_component(_cv_rtl_glbl "${CV_RTL_UNISIM_DSP}/../../glbl.v" ABSOLUTE)
@@ -238,7 +238,7 @@ endif()
 # Vivado: IP packaging, out-of-context synthesis, xsim
 # ---------------------------------------------------------------------------
 find_program(CV_RTL_VIVADO vivado
-    HINTS $ENV{XILINX_VIVADO}/bin /mnt/data/xilinx/2025.2/Vivado/bin
+    HINTS $ENV{XILINX_VIVADO}/bin
     DOC "Vivado, for packaging the RTL ConvKernel IP")
 
 if(CV_RTL_VIVADO)

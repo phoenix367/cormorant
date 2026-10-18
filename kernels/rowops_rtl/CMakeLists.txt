@@ -139,7 +139,7 @@ endif()
 # Vivado: IP packaging, out-of-context synthesis, xsim
 # ---------------------------------------------------------------------------
 find_program(RO_RTL_VIVADO vivado
-    HINTS $ENV{XILINX_VIVADO}/bin /mnt/data/xilinx/2025.2/Vivado/bin
+    HINTS $ENV{XILINX_VIVADO}/bin
     DOC "Vivado, for packaging the RTL RowOpsKernel IP")
 
 if(RO_RTL_VIVADO)
