@@ -51,17 +51,17 @@ merit.  The project had no external requirement specification.  Its plans
 set targets as it went: ResNet-18 at ≥ 15 FPS
 ([`RESNET18_15FPS_PLAN.md`](plans/RESNET18_15FPS_PLAN.md), met at 100 MHz
 and exceeded 3× since), interactive chat on SmolLM2, and faster-than-real-time
-speech synthesis.  Results on the board at 250 MHz, measured 2026-10-15 on
-`de968ccc45da` (Piper's on `04259a7af917`, 2026-10-17):
+speech synthesis.  Results on the board at 250 MHz, measured 2026-10-18 on the
+production `04259a7af917` (the chat models' and Piper's on 2026-10-17):
 
 | workload | input | result |
 |---|---|---|
 | ResNet-18 | 224 × 224 | 20.0 ms (50 FPS) |
-| MobileNet V1 / V2 | 224 × 224 | 20.5 / 17.5 ms |
-| YOLOv5n | 640 × 640 | 47.9 ms (20.9 FPS) |
+| MobileNet V1 / V2 | 224 × 224 | 20.5 / 17.6 ms |
+| YOLOv5n | 640 × 640 | 47.6 ms (21.0 FPS) |
 | LightStereo-S | 640 × 480 pair | 469 ms |
-| BERT-base SQuAD | 256 tokens | 266 ms |
-| SmolLM2-135M / 360M | chat decode | 19.8 / 7.6 tokens/s |
+| BERT-base SQuAD | 256 tokens | 267 ms |
+| SmolLM2-135M / 360M | chat decode | 20.4 / 7.8 tokens/s |
 | SmolVLM-256M | one image | 1.6 s |
 | Piper TTS | text | real-time factor 0.11 |
 

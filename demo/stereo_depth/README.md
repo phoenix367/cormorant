@@ -53,9 +53,7 @@ What it needs:
 - the board set up as in the top-level README, with the production bitstream
   loaded (the softmax unit: `8599aa7a5f12` or later);
 - the kernels' driver sources: `make driver_vectorop_rtl driver_matmul_rtl
-  driver_conv_rtl` in `build/`, referenced by `local.driver_dirs`;
-- Pillow in the scheduler's virtualenv (`$PY -m pip install Pillow`; it is
-  not in `inference-scheduler/requirements.txt`).
+  driver_conv_rtl` in `build/`, referenced by `local.driver_dirs`.
 
 No torch is needed: the frontend reads the PyTorch checkpoint with the
 standard library, and the exponents come from the checked-in
@@ -69,10 +67,11 @@ A D4xx's two infrared cameras are a rectified stereo pair.  `run_demo.py
 depth, the calibration, the emitter on and off), runs only those pairs and
 writes `<name>_depth.png`: the left image, the network's depth
 (fx · baseline / disparity) and the camera's own depth.  On the board
-(2026-10-09, STEREO_PLAN §4.4) a D435 pair took 657 ms (599 with the depthwise slices,
-STEREO_PLAN §4.5); with the IR projector on, the network's depth is within 10 % of the camera's own on
-98 % of the pixels (median difference 2.4 %), without it on 77 % (4.3 %):
-blank walls have no texture to match.
+(2026-10-18, bitstream `04259a7af917`) a D435 pair takes 467 ms; with the IR projector
+on, the network's depth is within 10 % of the camera's own on 91 % of the pixels
+(median difference 2.7 %), without it on 74 % (4.5 %): blank walls have no
+texture to match.  (The first capture, 2026-10-09 on `8599aa7a5f12`, another
+scene: 657 ms, 98 % / 77 %, STEREO_PLAN §4.4.)
 
 The right camera needs firmware **5.17.3.10** (or a USB 3 link).  librealsense
 makes infrared 2 by splitting the interleaved `Y8I` / `Y12I` formats; firmware
@@ -100,7 +99,7 @@ USB 2, 5000M / 10000M is USB 3.
 coherent interconnect for `S_AXI_HP2_FPD` and its line-buffer loads were
 overlapped with the window reads (DEPTHWISE_PLAN §8: the depthwise and 1 × 1
 layers 27–67 % faster).  At 320 × 256
-(`run.height` / `run.width`) it takes 160 ms (6.3 FPS, on `8599aa7a5f12`),
+(`run.height` / `run.width`) it takes 133 ms (7.5 FPS, on `04259a7af917`; 160 ms on `8599aa7a5f12`),
 with coarser disparities.  Most of the time goes to the MobileNetV2-style
 layers: 1 × 1 convs 165 ms, depthwise convs 176 ms, ReLU6 55 ms (the profile is in
 STEREO_PLAN §4.3 and §4.5).  The depthwise convs run as 16- / 32- /

@@ -1,7 +1,7 @@
 # facts — the fact registry
 
 Many facts in this repo are stated in more than one place. The scheduler's test count is
-quoted in eleven places. The bitstream id is in twenty files. A kernel's registers are in its
+quoted in eleven places. The production bitstream id is in thirty-three files. A kernel's registers are in its
 RTL control block and C++ reference model, its driver, the scheduler, two benchmarks, the calibration runner
 and the timeline viewer.
 
@@ -171,10 +171,10 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | id | kind | what |
 |---|---|---|
 | `scheduler.test_count`, `scheduler.test_modules`, `chat.test_count` | value | the suites' collected counts, quoted in 11, 2 and 8 places |
-| `fixtures.rtl`, `matmul_rtl.random_cases` | value | the checked-in RTL fixtures per kernel (the `hw/test_data` manifests; MatMul split into tiled / GEMV) and `TestMatmulRtl`'s 200 random cases, in the verify skills, BUILD_TARGETS, TESTING, the kernel references and the test stand's README |
-| `sim_hw.cases` | value | the whole-design simulation's cases per kernel (123, from the hw_128 testbench classes and the RowOps manifests) and its sample output in three files |
+| `fixtures.rtl`, `matmul_rtl.random_cases`, `rtl.random_cases` | value | the checked-in RTL fixtures per kernel (the `hw/test_data` manifests; MatMul split into tiled / GEMV) and the random cases each RTL testbench's ctest runs after them (the `*_RTL_RANDOM_CASES` / `RO_RTL_CHAIN_CASES` cache variables), in CLAUDE.md, the verify skills, BUILD_TARGETS, TESTING, the kernel references and the test stand's README |
+| `sim_hw.cases`, `sim_hw.wall_min` | value, recorded | the whole-design simulation's cases per kernel (123, from the hw_128 testbench classes and the RowOps manifests) and its sample output in three files; its wall time (~8 min) in six |
 | `perf.case_count` | value | the 72 kernel benchmarks of `perf_config.json.example` per kernel, in TESTING, REMOTE_TESTING, the perf-regression skill and `compare_perf.py` |
-| `perf.bitstream_id` | value | the committed performance model's bitstream. `exists`: its cases / calib files and the perf-regression baseline |
+| `perf.bitstream_id` | value | the committed performance model's bitstream, = the production bitstream named by the plans' and kernel references' status lines (`fix: report`). `exists`: its cases / calib files and the perf-regression baseline |
 | `perf.model_size` | value | exact calls of the model; host-model signatures and kinds (`fix: report`: dated sentences) |
 | `cli.inference_scheduler` | interface | the CLI flags against `inference-scheduler/CLAUDE.md` § CLI and USER_GUIDE § Options |
 | `registers.{VectorOP,Matmul,Conv,Pool,RowOps}Kernel` | interface | the register maps (`register_map`; each from its RTL control block and driver generator) |
@@ -183,12 +183,15 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `paths.vectorop_driver` | value | where `make driver_vectorop_rtl` writes VectorOPKernel's driver (`kernels/vectorop_rtl/CMakeLists.txt`), in eight example configs, `src/kernels.py`, the CLI's help and six docs |
 | `paths.pool_driver` | value | where `make driver_pool_rtl` writes PoolingKernel's driver (`kernels/pool_rtl/CMakeLists.txt`), in the six example configs that list PoolingKernel, `src/kernels.py` and six docs |
 | `paths.conv_driver`, `paths.rowops_driver` | value | where `make driver_conv_rtl` / `driver_rowops_rtl` write ConvKernel's and RowOpsKernel's drivers, in eight / seven example configs (and CONV_RTL_KERNEL / `src/kernels.py`) |
-| `vectorop.codes` | interface | the `Op` / `Act` enums against `nodes.py`, the CLAUDE.md table, `run_remote_perf._OP_NAMES` and the timeline `DECODE` |
+| `vectorop.codes`, `vectorop.op_count` | interface, value | the `Op` / `Act` enums against `nodes.py`, the CLAUDE.md table, `run_remote_perf._OP_NAMES` and the timeline `DECODE`; the number of ops (twelve) and their code range (0..11) in CLAUDE.md, VECTOROP_KERNEL, TESTING and the scheduler's CLAUDE.md |
+| `kernels.count` | value | the hardware kernels (`KERNEL_REGISTRY`: five), quoted as a word in the README, CLAUDE.md, the docs index, ARCHITECTURE, BUILD_TARGETS, TESTING, the user guide and the run-tests agent |
+| `registers.arg_counts` | value | each RTL kernel's AXI-Lite arguments (the `REGS` table of its `gen_driver.py`: 13 / 13 / 24 / 19 / 21), in the kernel references |
 | `ctypes.tts`, `ctypes.asr`, `ctypes.llm` | interface | the chat server's ctypes bindings against the C headers |
 | `config.chat`, `config.object_detection`, `config.stereo_depth` | interface | `chat_config.json.example` (with 5 waivers) and the two demos' example configs against the code reading them |
-| `chat.pool_mib` | recorded | each chat model's DMA pool (MiB), Piper's included. It is verified against the generated projects in `demo/*/build`, and stale when the layout code changes |
+| `chat.pool_mib` | recorded | each chat model's DMA pool (MiB), Piper's and Moonshine base's included. It is verified against the generated projects in `demo/*/build`, and stale when the layout code changes |
 | `chat.cma_mb` | value | the CMA each chat backend declares (`cma_mb`: the server's defaults, BERT's backend), in `deploy.py`'s defaults, the example config, DEPLOY's table and the model docs |
-| `scheduler.onnx_ops`, `scheduler.axi_llm_ops` | interface | the ops the scheduler accepts (35 ONNX ops, 34 `axi.llm` ops) against the op lists of USER_GUIDE §2, CLAUDE.md and INFERENCE_SCHEDULER.md (`names_in_docs`) |
+| `scheduler.onnx_ops`, `scheduler.axi_llm_ops` | interface | the ops the scheduler accepts (35 ONNX ops; 48 `axi.llm` ops: the Llama, ViT, TTS, stereo and speech-to-text factories) against the op lists of USER_GUIDE §2, CLAUDE.md and INFERENCE_SCHEDULER.md (`names_in_docs`) |
+| `scheduler.model_generators` | interface | the test-model generators `gen_all_models.py` runs, against the generator lists of CLAUDE.md, the scheduler's CLAUDE.md, INFERENCE_SCHEDULER and the user guide (`names_in_docs`) |
 | `scheduler.event_kinds` | interface | the event-stream kinds against the C emitter, the liveness pass, the timed replay and the two docs that list them |
 | `scheduler.file_thresholds` | value | when weights, expected outputs and host tables go to `.dat` files |
 | `planning.thresholds` | value | `--plan`'s minimum gain (3 %), largest trusted family error (5 %) and the order search's minimum gain (0.5 %) |
@@ -213,7 +216,7 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `piper.chunk` | value | Piper's chunk: 128 frames = 1.49 s of audio, 192 decoder frames |
 | `piper.encode_ms` | recorded | Piper's text encoder on the board (`tts_encode`, ms for 20 / 88 / 400 ids), in the README, the TTS README and TEXT_TO_SPEECH; stale on another bitstream |
 | `cost_model.call_overhead` | value | the engine choice's `CALL_OVERHEAD` (434 cycles) = the current performance model's call floor (`call_overhead_us` × `clock_mhz`), in `cost_model.py` and INFERENCE_SCHEDULER |
-| `cost_model.board_fit` | recorded | the cost model's per-call error on its campaign (ConvKernel 2.9 / 22.9 %, MatmulKernel 4.8 / 17.7 %), in `cost_model.py`, INFERENCE_SCHEDULER, CONV_RTL_KERNEL and the conv-cycle-model skill; stale on another bitstream |
+| `cost_model.board_fit` | recorded | the cost model's per-call error on its campaign (ConvKernel 3.2 / 19.3 %, MatmulKernel 4.7 / 17.0 %), in `cost_model.py`, INFERENCE_SCHEDULER, CONV_RTL_KERNEL and the conv-cycle-model skill; stale on another bitstream |
 | `cost_model.conv_anchors` | value | `test_rtl_conv_model`'s board anchors and the model's estimate of BERT's per-head P·V, in the test's docstring and INFERENCE_SCHEDULER |
 | `vlm.vision_gelu`, `piper.vop_sums` | value, optional | from the generated projects: SmolVLM's GELU layers on VectorOP (11 of 12), Piper's sums on VectorOP / the host (21 / 0) and the decoder's stage exponents (8 / 10 / 11), in CLAUDE.md, INFERENCE_SCHEDULER, OFFLOAD_PLAN and `test_piper.py` |
 | `build.make_targets` | interface, optional | every make target that the README and CLAUDE.md name exists in a configured `build/` (`make help`) |

@@ -1368,7 +1368,8 @@ inputs `left` / `right` `[1][3][H][W]` at `2^-12`, output `disparity`
       per output phase of the last polyphase deconv (no full-resolution
       pixel shuffle).
 - **Host ops** (`src/stereo_nodes.py`).
-  - The four instance norms, the replicate pad and the correlation volume.
+  - The four instance norms (`StereoInstanceNorm`), the replicate pad
+    (`StereoPadEdge`) and the correlation volume (`StereoCorrelation`).
     The volume is an exact int64 dot product per pixel and disparity,
     then double: 19 MMAC at 640 × 480, threaded by rows.
   - `StereoUpsample`: the disparity regression Σ P·d, kept exact in int64
@@ -1413,7 +1414,8 @@ entries against it bit for bit and the generated C against the simulation.
 
 - **`encode_<T>`** — inputs `pcm` (int16 at `2^-15` in host memory, zero-padded), `n` (the
   valid samples) and `pos` (0).  The output is the cross-attention K / V of
-  every decoder layer, written into DMA states that `decode` reads.
+  every decoder layer, written into DMA states that `decode` reads
+  (`AsrCrossPrep` on the row-ops unit: the K / V caches' images).
   - **The conv stem.**  ConvKernel convs on rows folded to fit its
     accumulator (Piper's fold), with per-channel exponents (`chexp`) and the
     biases in the accumulator.
@@ -1567,9 +1569,9 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 2.9 %, p90 22.9 % over the
-  1292 ConvKernel calls of the 250 MHz campaign `de968ccc45da` (2.8 / 20.3 %
-  on `1cedaf2ed816`, 2.9 / 18 % on `f70ce632a97a`, where it was fitted —
+  DDR latency, x and weight runs; median 3.2 %, p90 19.3 % over the
+  1838 ConvKernel calls of the 250 MHz campaign `04259a7af917` (2.9 / 22.9 %
+  on `de968ccc45da`, 2.8 / 20.3 % on `1cedaf2ed816`, 2.9 / 18 % on `f70ce632a97a`, where it was fitted —
   HOSTOPS_PLAN §9.2 and §11.7 re-scored and kept it), refitted there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
   previous fit 36 % high on the x-bound jobs; 18.3 / 45.8 % over the 1 190 of
   `6436623029f7` before — the

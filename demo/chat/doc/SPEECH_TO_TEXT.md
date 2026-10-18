@@ -13,7 +13,7 @@ only; how it was chosen and ported is in
   3.02 % / 4.49 % for the float models.
 - **Speed.**  The FPGA work is 0.12–0.16 s per second of audio for base
   (0.074 for tiny); a 10 s recording is transcribed in 1.3 s.
-- **Memory.**  It needs 200 MB of CMA (a 185.5 MiB pool); tiny 95 MiB.
+- **Memory.**  It needs 200 MB of CMA (a 185.8 MiB pool); tiny 95 MiB.
 
 ## Install
 

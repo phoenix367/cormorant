@@ -15,7 +15,7 @@ the Verilator testbench on the 1 042 ConvKernel calls of the calibration
 case list (median error 0.65 %, p90 5.3 %; `vl/Vtb --case-file F
 --no-oracle` gives the cycle counts).  `cost_model.conv_board_cycles` uses
 the board's parameters (`RTL_CONV_BOARD`, the 250 MHz campaign of
-de968ccc45da: median 2.9 %, p90 22.9 %; on 1cedaf2ed816 2.8 / 20.3 %; fitted on f70ce632a97a (2.9 / 18 %); 6436623029f7 before the x port left the CCI 18.3 / 45.8 %; at 100 MHz, c2b2a6e5e50e, 3.1 /
+04259a7af917: median 3.2 %, p90 19.3 %; on de968ccc45da 2.9 / 22.9 %, on 1cedaf2ed816 2.8 / 20.3 %; fitted on f70ce632a97a (2.9 / 18 %); 6436623029f7 before the x port left the CCI 18.3 / 45.8 %; at 100 MHz, c2b2a6e5e50e, 3.1 /
 14.6 % — refit with `inference-scheduler/tools/fit_cost_model.py`); the
 misses are narrow, input-heavy MatMul-on-ConvKernel jobs whose short x runs
 wait on the DDR.  To change the model, change it

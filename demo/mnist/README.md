@@ -126,8 +126,8 @@ Or step-by-step (lets you iterate without re-downloading):
 Sample output (host `~/projects/axi_demo/demo/mnist`, board at
 `192.168.100.8`, full 10 000-image MNIST test set; the run of 2026-10-05 on
 bitstream `dbb320fb7297` at 100 MHz, without `--verbose`, so no per-model
-bench lines; the summary table at the end is the run of 2026-10-06 on
-bitstream `986cef4866a0` at 250 MHz, `doc/plans/FMAX_250_PLAN.md`):
+bench lines; the summary table at the end is the run of 2026-10-18 on the
+production bitstream `04259a7af917` at 250 MHz):
 
 ```
 $ ./run_demo.py
@@ -238,8 +238,8 @@ per-step logs written to demo/mnist/build/logs
 
   Model          Status       Acc   mean(ms)    p50(ms)    p99(ms)        IPS
   ───────────────────────────────────────────────────────────────────────────
-  mnist_convnet  OK       98.92%      0.111      0.110      0.117     9045.6
-  mnist_lenet    OK       97.35%      1.249      1.245      1.314      800.8
+  mnist_convnet  OK       98.92%      0.115      0.114      0.123     8707.0
+  mnist_lenet    OK       97.35%      1.232      1.239      1.276      812.0
 ```
 
 Notable behaviour visible in the run:

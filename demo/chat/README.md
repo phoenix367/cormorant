@@ -21,8 +21,8 @@ board, a three-question conversation that the model remembers.
 | Model (`model` field) | Backend name in the config | What it does | On the board | Guide |
 |---|---|---|---|---|
 | `bert-squad` | `bert-squad` | Answers questions about a document you send, by quoting the passage that answers them | ~0.27 s per 256-token window | [Document Q&A](doc/BERT_QA.md) |
-| `smollm2-135m-instruct` | `smollm2` | Multi-turn chat, streamed token by token | ~20 tokens/s; first token after 0.08–0.41 s | [Generative chat](doc/SMOLLM2.md) |
-| `smollm2-360m-instruct` | `smollm2-360m` | The same chat with a larger model: better answers, slower | ~7.6 tokens/s; first token after ~0.2 s | [Generative chat](doc/SMOLLM2.md#smollm2-360m-instruct) |
+| `smollm2-135m-instruct` | `smollm2` | Multi-turn chat, streamed token by token | ~20 tokens/s; first token after 0.08–0.39 s | [Generative chat](doc/SMOLLM2.md) |
+| `smollm2-360m-instruct` | `smollm2-360m` | The same chat with a larger model: better answers, slower | ~7.8 tokens/s; first token after ~0.2 s | [Generative chat](doc/SMOLLM2.md#smollm2-360m-instruct) |
 | `smolvlm-256m-instruct` | `smolvlm` | Answers questions about images | 1.6 s per image, then ~20 tokens/s | [Chat about images](doc/SMOLVLM.md) |
 | `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md); listen: ▶ [hello](../tts/samples/hello.mp3), ▶ [paragraph](../tts/samples/paragraph.mp3) |
 | `moonshine-base` | `moonshine` | Speech to text (`POST /v1/audio/transcriptions`) | 1.3 s for 10 s of audio | [Speech to text](doc/SPEECH_TO_TEXT.md) |

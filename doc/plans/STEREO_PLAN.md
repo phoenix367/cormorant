@@ -11,7 +11,7 @@ LightStereo-S on the board (§4).
     4.94 %, against float's 0.650 / 4.87 % on the same scaled input.
   - The disparity maps are bit-exact with the scheduler's simulation.
   - At 320 × 256 a pair takes 159.6 ms (6.3 FPS; 163.7 before §4.5), with EPE
-    1.061 px.
+    1.061 px; 133.0 ms (7.5 FPS) on the production `04259a7af917` (2026-10-18).
 - **The implementation.**
   - A frontend (`inference-scheduler/src/stereo.py`) reads the PyTorch
     checkpoint without torch.

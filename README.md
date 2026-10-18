@@ -30,34 +30,32 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-15 on
-bitstream `de968ccc45da` (production 2026-10-15 to 2026-10-16): the 250 MHz design of
+KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-18 on the
+production bitstream `04259a7af917`: the 250 MHz design of
 [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
 ([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
 ([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), its second read port on a PS port of its
 own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)), ConvKernel's x port past the CCI
 ([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8) and the row-ops unit, a fifth kernel
 that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
-inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)).  The Piper chunk and
-text-encoder figures and Moonshine's are from 2026-10-17, on the production bitstream
-`04259a7af917` (the row-ops unit's GATE op and SCALE flag,
-[RPU_PLAN](doc/plans/RPU_PLAN.md) §14).  The board runs the A53's interrupt waits
-and, as a soak test, the cores' deep idle state (about 2 % on the chat decode).
-The 320×256 stereo figure and the RealSense comparison are from 2026-10-09
-(bitstream `8599aa7a5f12`); the chat-server Piper figures are from 2026-10-01,
-at 100 MHz.
+inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)), with its GATE op
+and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14).  The chat models', Piper's
+and Moonshine's figures are from 2026-10-17 on the same bitstream (RPU_PLAN §14.12,
+ASR_PLAN).  The board runs the A53's interrupt waits and, as a soak test, the
+cores' deep idle state (about 2 % on the chat decode).  The chat-server Piper
+figures are from 2026-10-01, at 100 MHz.
 
 | Model | Result | Source |
 |---|---|---|
 | ResNet-18, 224×224 | **20.0 ms (50.0 FPS)** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (20.5 ms with VectorOP's two reads on one PS port; 47.4 ms at 100 MHz, [CONV_RTL_PLAN](doc/plans/CONV_RTL_PLAN.md); 59.9 ms on the HLS ConvKernel, [RESNET18_15FPS_PLAN §3.3](doc/plans/RESNET18_15FPS_PLAN.md)) |
-| MobileNet V1 / V2, 224×224 | **20.5 / 17.5 ms** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
-| LightStereo-S stereo depth, 640×480 | **469 ms (2.13 FPS)** per pair, EPE 0.667 px on 42 Middlebury / ETH3D pairs (float 0.650 on the same input); 160 ms at 320×256; RealSense D435 pairs taken on the board: depth within 10 % of the camera's own on 98 % of the pixels (projector on) | [STEREO_PLAN](doc/plans/STEREO_PLAN.md), [demo/stereo_depth](demo/stereo_depth/README.md) |
-| YOLOv5n object detection, 640×640 | **47.9 ms (20.9 FPS)** per image (the network on the FPGA; decode + NMS on the host), COCO128 mAP@0.5:0.95 0.343 (float 0.349) | [YOLO_PLAN](doc/plans/YOLO_PLAN.md), [demo/object_detection](demo/object_detection/README.md) |
-| MNIST convnet / LeNet | 0.114 / 1.266 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
-| BERT-base SQuAD (bertsquad-12, 256 tokens) | **266 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (427 ms with both VectorOP reads on one PS port), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (525 ms with the softmax on the host), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host too; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
-| SmolLM2-135M-Instruct | **19.8 tokens/s** decode, 16-token prefill 0.08 s, 256-token prefill 0.41 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
-| SmolLM2-360M-Instruct | **7.6 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.06 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
-| SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 50 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
+| MobileNet V1 / V2, 224×224 | **20.5 / 17.6 ms** per image | [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) (41.2 / 38.1 ms at 100 MHz) |
+| LightStereo-S stereo depth, 640×480 | **469 ms (2.13 FPS)** per pair, EPE 0.667 px on 42 Middlebury / ETH3D pairs (float 0.650 on the same input); 133 ms at 320×256; RealSense D435 pairs taken on the board: depth within 10 % of the camera's own on 91 % of the pixels (projector on) | [STEREO_PLAN](doc/plans/STEREO_PLAN.md), [demo/stereo_depth](demo/stereo_depth/README.md) |
+| YOLOv5n object detection, 640×640 | **47.6 ms (21.0 FPS)** per image (the network on the FPGA; decode + NMS on the host), COCO128 mAP@0.5:0.95 0.343 (float 0.349) | [YOLO_PLAN](doc/plans/YOLO_PLAN.md), [demo/object_detection](demo/object_detection/README.md) |
+| MNIST convnet / LeNet | 0.115 / 1.232 ms per image, 98.92 / 97.35 % top-1 (LeNet float 97.37 %) | [LENET_PLAN](doc/plans/LENET_PLAN.md), [demo/mnist](demo/mnist/README.md) |
+| BERT-base SQuAD (bertsquad-12, 256 tokens) | **267 ms** per inference (p50 of 50), EM/F1 equal to float32 | [BERT_PLAN](doc/plans/BERT_PLAN.md) status, [PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md) (427 ms with both VectorOP reads on one PS port), [SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md) (525 ms with the softmax on the host), [ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md) (541 ms with the GELUs on the host too; 839 ms at 100 MHz, [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md)) |
+| SmolLM2-135M-Instruct | **20.4 tokens/s** decode, 16-token prefill 0.08 s, 256-token prefill 0.39 s | [CHAT_PLAN §19](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) |
+| SmolLM2-360M-Instruct | **7.8 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.02 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
+| SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 49 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
 | Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
 
@@ -329,7 +327,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 | Layer | Needs | Command |
 |---|---|---|
 | Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1883<!-- /fact --> tests) |
-| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~70 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary, and Pillow is installed; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
+| Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->230<!-- /fact --> tests; ~70 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, and `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
 | On-board correctness | KV260 over SSH, bitstream loaded | `run_remote_tests.py --config remote_config.json` |

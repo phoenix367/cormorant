@@ -217,7 +217,7 @@ A session goes through four states:
     stops generating when the stream closes.  An answer cut at
     `--max-tokens` (100) is spoken up to its last whole sentence.
   - SmolLM2-360M is the default: its answers are coherent and factual, at
-    7.6 tokens/s — speech starts 2.4–3.5 s after the request and three
+    7.8 tokens/s — speech starts 2.4–3.5 s after the request and three
     sentences take about 10 s.  SmolLM2-135M (`deploy.py --chat-model
     smollm2-135m-instruct`) is about 2.5 times faster (0.5–1.9 s and 3–4 s)
     and wanders.  SmolLM2-360M needs the board at `cma=1400M`
@@ -348,7 +348,7 @@ Piper resident (the session above, SmolLM2-135M — then the default):
 - **A segment's transcription:** 200–420 ms for 1.3–3.2 s of speech.
 - **The answer:** first word after 0.1–0.2 s; with SmolLM2-135M 1.1 s for
   two sentences, 4.5 s for three long ones; with SmolLM2-360M 9.7–10.6 s
-  for three (7.6 tokens/s).
+  for three (7.8 tokens/s).
 - **Speech:** Piper makes it faster than it plays.  It starts 0.5–1.9 s
   after the request, while the answer is still being written.  Measured on
   three requests with three-sentence answers (a second run: 1.4 / 1.1 /

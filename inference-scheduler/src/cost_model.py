@@ -211,9 +211,9 @@ def _loader_row_cycles(ch, cols):
 # 8 weight runs in flight bound them too.  RTL_CONV_SIM is tuned to the
 # Verilator testbench (ideal memory) on the 1 042 ConvKernel calls of the
 # calibration case list — median error 0.65 %, p90 5.3 % —, RTL_CONV_BOARD to
-# the board's: fitted to bitstream f70ce632a97a, re-scored on de968ccc45da
-# at 250 MHz, 1292 calls, median 2.9 %,
-# p90 22.9 % (on 1cedaf2ed816 2.8 / 20.3 %; ConvKernel's x port off the CCI, DEPTHWISE_PLAN §8.5; the set
+# the board's: fitted to bitstream f70ce632a97a, re-scored on 04259a7af917
+# at 250 MHz, 1838 calls, median 3.2 %,
+# p90 19.3 % (on de968ccc45da 2.9 / 22.9 %, on 1cedaf2ed816 2.8 / 20.3 %; ConvKernel's x port off the CCI, DEPTHWISE_PLAN §8.5; the set
 # fitted to 6436623029f7's board scored 35.8 / 77.6 % on it: its x-path terms
 # priced the old port), fitted by tools/fit_cost_model.py — before that, with
 # the shipped calls weighted 0.75 and a
@@ -499,8 +499,8 @@ RTL_TILE   = 32     # packed-B DDR tile width (beats per row = 4 per tile)
 
 # Cycles per term (rtl_matmul_terms), fitted on the board by non-negative
 # least squares (tools/fit_cost_model.py; fitted to f70ce632a97a, re-scored
-# on de968ccc45da at 250 MHz, 414 calls:
-# median 4.8 %, p90 17.7 % (4.7 / 17.6 % on 1cedaf2ed816); 6436623029f7's fit scored 4.5 / 17.7 % there,
+# on 04259a7af917 at 250 MHz, 580 calls:
+# median 4.7 %, p90 17.0 % (4.8 / 17.7 % on de968ccc45da, 4.7 / 17.6 % on 1cedaf2ed816); 6436623029f7's fit scored 4.5 / 17.7 % there,
 # leave-one-out 4.6 / 18.1 %; the 100 MHz set
 # fitted c2b2a6e5e50e to 0.36 / 1.7 % — at 250 MHz a DDR beat or request
 # costs more cycles: "steps" 2.97 -> 27.45, "runs" 0.325 -> 2.97); "one" is

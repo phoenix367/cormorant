@@ -131,6 +131,49 @@ facts:
        regex: '\| VectorOP \| (?P<vecop>\d+) \|.*\n\| Matmul \| (?P<matmul>\d+) \((?P<matmul_gemv>\d+) GEMV\) \|.*\n\| Conv \| (?P<conv>\d+) \|.*\n\| Pool \| (?P<pool>\d+) \|.*\n\| RowOps \| (?P<rowops>\d+) \|'}
   # dated records (kernel-verify's measured runs, MATMUL_RTL_PLAN, optimisation logs) keep their counts
 
+- id: rtl.random_cases
+  kind: value
+  title: the random cases each RTL kernel's ctest runs after its fixtures (the *_RTL_RANDOM_CASES / RO_RTL_CHAIN_CASES cache variables)
+  source:
+    parts:
+      vectorop: {file: kernels/vectorop_rtl/CMakeLists.txt, regex: 'set\(VO_RTL_RANDOM_CASES (\d+) CACHE', type: int}
+      conv: {file: kernels/conv_rtl/CMakeLists.txt, regex: 'set\(CV_RTL_RANDOM_CASES (\d+) CACHE', type: int}
+      pool: {file: kernels/pool_rtl/CMakeLists.txt, regex: 'set\(PL_RTL_RANDOM_CASES (\d+) CACHE', type: int}
+      rowops: {file: kernels/rowops_rtl/CMakeLists.txt, regex: 'set\(RO_RTL_RANDOM_CASES (\d+) CACHE', type: int}
+      rowops_chains: {file: kernels/rowops_rtl/CMakeLists.txt, regex: 'set\(RO_RTL_CHAIN_CASES (\d+) CACHE', type: int}
+  fix: auto
+  mentions:
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`TestVectorOpRtl` \|[^\n]*?fixtures, (?P<vectorop>\d+) random jobs'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`TestPoolRtl` \|[^\n]*?fixtures and (?P<pool>\d+) random jobs'}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '`TestConvRtl` \|[^\n]*?fixtures and (?P<conv>\d+) random jobs'}
+    - {file: doc/build-and-test/TESTING.md, regex: '`TestVectorOpModel --dump-data` writes — plus (?P<vectorop>\d+) random'}
+    - {file: doc/build-and-test/TESTING.md, regex: '`TestPoolModel --dump-data` writes — plus (?P<pool>\d+) random jobs'}
+    - {file: doc/build-and-test/TESTING.md, regex: '`TestConvModel --dump-data` writes — plus (?P<conv>\d+) random jobs'}
+    - {file: doc/build-and-test/TESTING.md, regex: '(?P<rowops>\d+) random jobs and (?P<rowops_chains>\d+) random descriptor chains checked'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: '`TestVectorOpRtl` runs the \d+ checked-in\s+fixtures, (?P<vectorop>\d+) random cases'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'and (?P<pool>\d+) random jobs \(seed 1\) against the C\+\+ model on the whole output'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'and (?P<conv>\d+) random jobs \(seed 1\) against the C\+\+ model \(`model/src/ConvKernel\.cpp`'}
+
+- id: sim_hw.wall_min
+  kind: recorded
+  title: the wall time of make sim_hw_kv260 (the block-design testbench, every case), minutes as the docs round it
+  value: 8
+  tolerance: 1
+  provenance:
+    date: 2026-10-16
+    how: "hw/cormorant_hw_128 simulate.log of the 33a799febc56 / 04259a7af917 design (RPU_PLAN §14.10): 123 / 123 cases,
+          compile end 19:52:56 to the end 19:59:59 (8 min 19 s with the compile, RPU_PLAN.md §14); the ~3 min of the
+          docs before was the 68-case bench of 481e7a1 (2026-09-29)"
+    facts: {sim_hw.cases: {vectorop: 29, conv: 19, matmul: 10, pool: 19, rowops: 46, total: 123}}
+  fix: report
+  mentions:
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: '\d+ cases over the five kernels, ~(\d+) min'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'hw/cormorant_hw_128 submodule; ~(\d+) min, all five kernels'}
+    - {file: .claude/skills/kernel-verify/SKILL.md, regex: 'all five kernels through the PS VIP, ~(\d+) min'}
+    - {file: hw/cormorant_hw_128/README.md, regex: 'The run takes ~(\d+) minutes \(\d+ cases'}
+    - {file: .claude/skills/docs-audit/templates/new_user_brief.md, regex: '`make sim_hw_kv260` \(block design, ~(\d+) min\)'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, regex: 'a combined summary\n\(~(\d+) min\):'}
+
 - id: matmul_rtl.random_cases
   kind: value
   title: the random cases TestMatmulRtl runs after the fixtures (MM_RTL_RANDOM_CASES)
@@ -221,6 +264,22 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
     - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds the unit''s GATE op'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
+    # the status lines of the plans and kernel references (the 2.0 audit): a new bitstream rewrites them by hand
+    - {file: doc/plans/ACTIVATIONS_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/DEPTHWISE_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/FMAX_250_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/HOSTOPS_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/MATMUL_RTL_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/POOL_RTL_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/PS_PORTS_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/SOFTMAX_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/VECTOROP_RTL_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/AREA_PLAN.md, regex: 'since \d{4}-\d{2}-\d{2}, the production `([0-9a-f]{12})`', fix: report}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'On `([0-9a-f]{12})`, production since', fix: report}
+    - {file: doc/plans/RPU_PLAN.md, regex: 'production `([0-9a-f]{12})`, \d{4}-\d{2}-\d{2}; the Piper', fix: report}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'production `([0-9a-f]{12})` since', fix: report}
+    - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: 'production\s+`([0-9a-f]{12})` since', fix: report}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '--perf-model perf_models/kv260/([0-9a-f]{12})\.json'}
   # dated records (TACTICS_PLAN §9, TTS_PLAN, LENET_PLAN) name the bitstream they were measured on: not mentions
 
 - id: perf.model_size
@@ -259,10 +318,14 @@ facts:
   kind: recorded
   title: the engine cost model's per-call error against the board (RTL_CONV_BOARD, RTL_COEF + CALL_OVERHEAD;
     median / p90 %) on the campaign it was fitted to, quoted in the code and the docs that describe the model
-  value: {conv_calls: 1292, conv_median: 2.9, conv_p90: 22.9, matmul_calls: 414, matmul_median: 4.8, matmul_p90: 17.7}
+  value: {conv_calls: 1838, conv_median: 3.2, conv_p90: 19.3, matmul_calls: 580, matmul_median: 4.7, matmul_p90: 17.0}
+  tolerance: 0.05                            # the docs quote one decimal
   provenance:
-    date: 2026-10-15
-    how: "Re-scored on de968ccc45da (HOSTOPS_PLAN §11.7, the campaign of FOLD after the area pass, 2100 exact calls):
+    date: 2026-10-18
+    how: "Re-scored on 04259a7af917 (the production campaign, 2995 exact calls; tools/fit_cost_model.py fit --rounds 0,
+          the row-ops descriptor chains left out): the constants as used ConvKernel 3.2 / 19.3 % over 1838 calls,
+          MatmulKernel 4.7 / 17.0 % over 580 (the same with the call floor 433); RTL_COEF's NNLS proposal (4.7 / 16.7 %)
+          not taken.  Before: re-scored on de968ccc45da (HOSTOPS_PLAN §11.7, the campaign of FOLD after the area pass, 2100 exact calls):
           the constants as used ConvKernel 2.9 / 22.9 % over 1292 calls, MatmulKernel 4.8 / 17.7 % over 414 (the same
           with the new floor); the plain refit's proposal (2.4 / 21.1 % and 4.5 / 17.7 %) NOT taken: tools/fit_cost_model.py
           diff (decision files rebuilt) moves SmolLM2-135M's prefill_16 30 MatMuls from the GEMV to ConvKernel, +167.6 us per
@@ -291,7 +354,7 @@ facts:
           ConvKernel / MatmulKernel calls unchanged): the constants as used ConvKernel 18.6 / 48.3 % over 1265
           calls, MatmulKernel 4.5 / 17.7 % over 414; call floor 431 cycles: CALL_OVERHEAD 434 -> 431 with
           ONE / one +3"
-    facts: {perf.bitstream_id: de968ccc45da}  # a new bitstream: a new campaign, refit or re-score
+    facts: {perf.bitstream_id: 04259a7af917}  # a new bitstream: a new campaign, refit or re-score
   fix: report
   mentions:
     - {file: inference-scheduler/src/cost_model.py,
@@ -694,12 +757,15 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of the cma= area)
-  value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54}
-  tolerance: 1                               # MiB: the docs round
+  value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54, moonshine_base: 185.8}
+  tolerance: 0.5                             # MiB: the docs round to whole MiB (1 let 53 pass for 54.3)
   provenance:
-    commit: 4e06d65
-    date: 2026-10-17
-    how: "verified for RPU_PLAN A3a.4 (2026-10-17, bitstream 04259a7af917, facts.py verify): Piper 54.3 MiB with GATE /
+    commit: 7ac7f53
+    date: 2026-10-18
+    how: "re-verified 2026-10-18 (facts.py verify, bitstream 04259a7af917): the inputs changed since 4e06d65 only by
+          comments (628a351's copyright headers, 0598c4f), the BERT demo project regenerated (216.3 MiB), Moonshine
+          base added (185.8 MiB: the allocation, the row-ops descriptor area and the 4 KiB round-up included;
+          project.json's pool_bytes, ASR_PLAN's 185.5, leaves them out); verified for RPU_PLAN A3a.4 (2026-10-17, bitstream 04259a7af917, facts.py verify): Piper 54.3 MiB with GATE /
           SCALE (the stage averages' int32 T temporaries in pool slots), the others as below; regenerated for RPU_PLAN
           A2.5 (2026-10-16, bitstream 33a799febc56: the y pattern, the descriptor chains,
           the decode prep on the unit, slots of 64 KiB or more on 4 KiB pages): SmolLM2-135M 298.6, SmolLM2-360M 757.6,
@@ -727,6 +793,7 @@ facts:
     smollm2_360m: {file: demo/chat/build/llm_project_smollm2_360m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     smolvlm_256m: {file: demo/chat/build/llm_project_smolvlm_256m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     piper: {file: demo/tts/build/piper_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+    moonshine_base: {file: demo/asr/build/moonshine-base_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
   fix: auto
   mentions:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| BERT \| (?P<bert>\d+) MiB'}
@@ -734,6 +801,9 @@ facts:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolLM2-360M \| (?P<smollm2_360m>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolVLM-256M \| (?P<smolvlm_256m>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Piper \| (?P<piper>\d+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Moonshine base \| (?P<moonshine_base>[\d.]+) MiB'}
+    - {file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: 'CMA \(a (?P<moonshine_base>[\d.]+) MiB pool\)'}
+    - {file: doc/ARCHITECTURE.md, dotall: true, regex: 'beside Piper''s (?P<piper>\d+) MiB\s+and Moonshine base''s (?P<moonshine_base>[\d.]+) MiB'}
     - {file: doc/ARCHITECTURE.md, dotall: true,
        regex: 'pools are (?P<bert>\d+) MiB \(BERT\), (?P<smollm2_135m>\d+) MiB \(SmolLM2-135M\),\s+(?P<smollm2_360m>\d+) MiB \(SmolLM2-360M\) and (?P<smolvlm_256m>\d+) MiB \(SmolVLM-256M\)'}
     - {file: demo/chat/doc/TEXT_TO_SPEECH.md, regex: 'MB of CMA \(a (?P<piper>\d+) MiB pool\)'}
@@ -816,23 +886,38 @@ facts:
       - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
       - {file: doc/scheduler/INFERENCE_SCHEDULER.md, start: '^## Hardware Kernels', end: '^## ', pattern: '\b([A-Z][A-Za-z0-9]*)\b'}
 
-- id: scheduler.axi_llm_ops
+- id: scheduler.model_generators
   kind: interface
-  title: the custom-domain axi.llm ops (LLM / ViT / TTS op factories) in the docs that list them
+  title: the test-model generators gen_all_models.py runs, in the docs that list them one by one
   check: names_in_docs
   args:
-    names: {py: 'src.graph:sorted({**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES})', cwd: inference-scheduler}
+    names: {file: inference-scheduler/test/gen_all_models.py, regex: '^    "(gen_\w+_models)",$', all: true}
     docs:
-      - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'}
+      - {file: CLAUDE.md, start: '^# Generate test models', end: '^# \(or all of the above', pattern: 'test/(gen_\w+_models)\.py', reverse: true}
+      - {file: inference-scheduler/CLAUDE.md, start: '^# Generate all test ONNX models', end: '^# Generate a C inference project',
+         pattern: 'test/(gen_\w+_models)\.py', reverse: true, extra_ok: [gen_all_models]}
+      - {file: doc/scheduler/INFERENCE_SCHEDULER.md, start: '^# Generate all test ONNX models', end: '^# \(or all of the above',
+         pattern: 'test/(gen_\w+_models)\.py', reverse: true}
+      - {file: inference-scheduler/doc/USER_GUIDE.md, start: '^# Generate all test ONNX models', end: '^```',
+         pattern: 'test/(gen_\w+_models)\.py', reverse: true, extra_ok: [gen_all_models]}
+
+- id: scheduler.axi_llm_ops
+  kind: interface
+  title: the custom-domain axi.llm ops (LLM / ViT / TTS / stereo / ASR op factories) in the docs that list them
+  check: names_in_docs
+  args:
+    names: {py: 'src.graph:sorted({**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES, **STEREO_OP_FACTORIES, **ASR_OP_FACTORIES})', cwd: inference-scheduler}
+    docs:
+      - {file: CLAUDE.md, start: '^\| Kernel \| ONNX ops \|', end: '^```', pattern: '`((?:Llm|Vit|Tts|Stereo|Asr)[A-Z][A-Za-z]*)`'}
       - file: doc/scheduler/INFERENCE_SCHEDULER.md      # the summary lists the host ops
         start: '^## Hardware Kernels'
         end: '^## '
-        pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'
+        pattern: '`((?:Llm|Vit|Tts|Stereo|Asr)[A-Z][A-Za-z]*)`'
         skip: [LlmAttnScores, LlmAttnPV]                  # ConvKernel calls, not host ops
       - file: doc/scheduler/INFERENCE_SCHEDULER.md      # the sections that define them
         start: '^### Llama-family decoders'
         end: '^### Multi-entry projects'
-        pattern: '`((?:Llm|Vit|Tts)[A-Z][A-Za-z]*)`'
+        pattern: '`((?:Llm|Vit|Tts|Stereo|Asr)[A-Z][A-Za-z]*)`'
         reverse: true
         extra_ok: [LlmAttnConvNode, LlmNode, VitNode, TtsNode, LlmDecode,
                    LlmKernelNode, VitGeluVopNode, TtsAddVopNode,
@@ -895,6 +980,65 @@ facts:
     - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'held-out p90 is at most (?P<max_model_error_pct>[\d.]+) %'}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: 'kept only if the simulated total drops by (?P<order_min_gain_pct>[\d.]+) % or more'}
     - {file: inference-scheduler/doc/SCHEDULER_DAG.md, regex: 'simulated total drops by at least (?P<order_min_gain_pct>[\d.]+) %'}
+
+- id: kernels.count
+  kind: value
+  title: the hardware kernels (the scheduler's KERNEL_REGISTRY = the IPs the hardware build packages), quoted as a word
+  source: {py: 'src.kernels:len(KERNEL_REGISTRY)', cwd: inference-scheduler}
+  fix: auto
+  mentions:
+    - {file: README.md, regex: '^(\w+) kernels for the Xilinx Kria KV260', format: "['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen'][v].capitalize()"}
+    - {file: README.md, regex: 'C drivers of the (\w+) kernels', format: &words "['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen'][v]"}
+    - {file: README.md, regex: 'packages the (\w+) SystemVerilog kernels', format: *words}
+    - {file: README.md, regex: 'Verilator 5\.x for the (\w+) RTL kernels', format: *words}
+    - {file: CLAUDE.md, regex: 'drives all (\w+) hardware IPs', format: *words}
+    - {file: CLAUDE.md, regex: 'All (\w+) kernels live under `kernels/`', format: *words}
+    - {file: CLAUDE.md, regex: '# Configure all (\w+) kernels at once', format: *words}
+    - {file: CLAUDE.md, regex: '# the (\w+) IPs of the hardware build', format: *words}
+    - {file: CLAUDE.md, regex: 'packages the (\w+) RTL IPs for its part', format: *words}
+    - {file: CLAUDE.md, regex: 'drives up to (\w+) hardware kernels', format: *words}
+    - {file: CLAUDE.md, regex: 'for the (\w+) RTL kernels'' testbenches and lint', format: *words}
+    - {file: doc/README.md, regex: 'the (\w+) SystemVerilog kernels and the C\+\+ reference models', format: *words}
+    - {file: doc/ARCHITECTURE.md, regex: 'The PL holds (\w+) kernels', format: *words}
+    - {file: doc/build-and-test/BUILD_TARGETS.md, regex: 'Aggregate — the (\w+) kernel IPs', format: *words}
+    - {file: doc/build-and-test/TESTING.md, regex: 'the (\w+) SystemVerilog kernels in Verilator', format: *words}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: 'up to (\w+) PL kernels', format: *words}
+    - {file: inference-scheduler/doc/USER_GUIDE.md, regex: 'one of (\w+) hardware kernels', format: *words}
+    - {file: .claude/agents/run-tests.md, regex: 'the (\w+) RTL kernels in Verilator', format: *words}
+
+- id: vectorop.op_count
+  kind: value
+  title: VectorOPKernel's operations (the Op enum), as a count, a word and the code range 0..N-1
+  source: {file: kernels/vectorop_rtl/model/include/VectorOP.h, regex: '^\s*(OP_\w+)\s*=\s*\d+', all: true, transform: 'len(v)'}
+  fix: auto
+  mentions:
+    - {file: CLAUDE.md, regex: '\. (\w+) operations are supported \(', format: "['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen'][v].capitalize()"}
+    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: 'applies one of (\w+) operations', format: *words}
+    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: '\| \*\*Operations\*\* \| (\d+), runtime-selected'}
+    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: 'Operation selector \(`Op` enum, 0–(\d+)\)', format: 'v - 1'}
+    - {file: doc/build-and-test/TESTING.md, regex: 'outside the supported range \(0\.\.(\d+)\)', format: 'v - 1'}
+    - {file: inference-scheduler/CLAUDE.md, regex: '`OP_ADD\.\.OP_SOFTMAX_T`, 0\.\.(\d+)\)', format: 'v - 1'}
+
+- id: registers.arg_counts
+  kind: value
+  title: each RTL kernel's AXI-Lite arguments (the REGS table of its driver generator, = the RTL control block)
+  source:
+    parts:
+      vectorop: {file: kernels/vectorop_rtl/scripts/gen_driver.py, regex: '^g\.REGS = \[(.*?)\n\]', dotall: true, transform: 'len(re.findall(r''\("\w+",\s+0x'', v))'}
+      matmul: {file: kernels/matmul_rtl/scripts/gen_driver.py, regex: '^REGS = \[(.*?)\n\]', dotall: true, transform: 'len(re.findall(r''\("\w+",\s+0x'', v))'}
+      conv: {file: kernels/conv_rtl/scripts/gen_driver.py, regex: '^g\.REGS = \[(.*?)\n\]', dotall: true, transform: 'len(re.findall(r''\("\w+",\s+0x'', v))'}
+      pool: {file: kernels/pool_rtl/scripts/gen_driver.py, regex: '^g\.REGS = \[(.*?)\n\]', dotall: true, transform: 'len(re.findall(r''\("\w+",\s+0x'', v))'}
+      rowops: {file: kernels/rowops_rtl/scripts/gen_driver.py, regex: '^g\.REGS = \[(.*?)\n\]', dotall: true, transform: 'len(re.findall(r''\("\w+",\s+0x'', v))'}
+  fix: auto
+  mentions:
+    - {file: doc/kernels/CONV_KERNEL.md, regex: '— (?P<conv>\d+) registers total'}
+    - {file: doc/kernels/CONV_KERNEL.md, regex: 'sets all (?P<conv>\d+) AXI-Lite registers'}
+    - {file: doc/kernels/CONV_RTL_KERNEL.md, regex: '`gen_driver\.py --check --hls-driver` \| (?P<conv>\d+) arguments'}
+    - {file: doc/kernels/POOL_RTL_KERNEL.md, regex: '`gen_driver\.py --check --hls-driver` \| (?P<pool>\d+) arguments'}
+    - {file: doc/kernels/POOLING_KERNEL.md, regex: '— (?P<pool>\d+) arguments \(2 addresses'}
+    - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: '`gen_driver\.py --check` \| (?P<vectorop>\d+) arg'}
+    - {file: doc/kernels/VECTOROP_KERNEL.md, regex: 'AXI-Lite registers\*\* \| (?P<vectorop>\d+) scalars/pointers'}
+    - {file: doc/kernels/MATMUL_KERNEL.md, regex: 'AXI-Lite registers\*\* \| (?P<matmul>\d+) scalars/pointers'}
 
 - id: perf.shipped_models
   kind: value
@@ -998,15 +1142,23 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.5, bert_ms: 266,
-          smollm2_135m_tok_s: 19.8, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.6, smolvlm_image_s: 1.6,
-          piper_rtf: 0.11, mnist_convnet_ms: 0.114, mnist_lenet_ms: 1.266, yolov5n_ms: 47.9, yolov5n_fps: 20.9,
-          stereo_ms: 469, stereo_fps: 2.13, stereo320_ms: 160}
+  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.6, bert_ms: 267,
+          smollm2_135m_tok_s: 20.4, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.8, smolvlm_image_s: 1.6,
+          piper_rtf: 0.11, mnist_convnet_ms: 0.115, mnist_lenet_ms: 1.232, yolov5n_ms: 47.6, yolov5n_fps: 21.0,
+          stereo_ms: 469, stereo_fps: 2.13, stereo320_ms: 133}
   tolerance: {rel: 0.03}                     # the docs round ("~10 tokens/s")
   provenance:
-    date: 2026-10-15
-    how: "piper_rtf re-measured on 04259a7af917 (RPU_PLAN §14.12, tts_board.py: the 6.88 s sentence at RTF 0.108,
-          the chunk 148 ms — GATE and SCALE); the rest: the board window of HOSTOPS_PLAN §11.7 (5a.4) on de968ccc45da (the row-ops unit's FOLD after the kernels'
+    date: 2026-10-18
+    how: "All on the production 04259a7af917.  2026-10-18, one board session (the chat server and Miranda stopped;
+          every result bit-exact with the scheduler's simulation): image_classification ResNet-18 p50 20.00 ms,
+          MobileNet v1 / v2 20.52 / 17.63 ms; MNIST 0.115 / 1.232 ms (mean); BERT (regenerated) deploy_and_run 50 examples
+          p50 266.8 / mean 266.9 ms, 50 / 50 bit-exact; YOLOv5n run_demo 16 images 47.6 mean / 47.2 p50 ms (21.0 FPS);
+          LightStereo-S run_demo --pairs 0, 44 pairs 468.8 mean / 467.5 p50 ms (2.13 FPS), 320 x 256 (build/config_320.json)
+          14 pairs 133.0 mean / 132.2 p50 ms (7.52 FPS; 160 on 8599aa7a5f12); the chat libraries from RPU_PLAN §14.12
+          (2026-10-17, llm_board.py --rpu r5, the same libraries): SmolLM2-135M 49.07 ms/token = 20.4 tok/s, prefill
+          16 / 64 / 256 80 / 97 / 393 ms; SmolLM2-360M 128.07 ms/token = 7.8 tok/s, prefill 190 / 233 / 1023 ms; SmolVLM
+          llm_image 1.618 s, decode 48.97 ms; piper_rtf (tts_board.py: the 6.88 s sentence at RTF 0.108, the chunk
+          148 ms — GATE and SCALE).  Before: 2026-10-15, the board window of HOSTOPS_PLAN §11.7 (5a.4) on de968ccc45da (the row-ops unit's FOLD after the kernels'
           area pass; deep idle on as the soak of RPU_PLAN §11 leaves it, the A53's interrupt waits; every result
           bit-exact): image_classification ResNet-18 p50 20.02 ms, MobileNet v1 / v2 20.51 / 17.52 ms; BERT
           deploy_and_run 50 examples p50 266.3 ms (RPU_PLAN A1's transposes on the unit, 2026-10-13); llm_board
@@ -1027,7 +1179,7 @@ facts:
           mean / p50 (21.4 FPS; 46.9 before) and LightStereo-S 44 pairs 466.0 mean / 464.9 ms p50 (2.15 FPS; 469 before),
           both bit-exact — no unit ops in their graphs; the 320 x 256 stereo run not repeated.  Before: 2026-10-10 on
           f70ce632a97a (DEPTHWISE_PLAN §8.6)"
-    facts: {perf.bitstream_id: de968ccc45da}   # stale on another bitstream
+    facts: {perf.bitstream_id: 04259a7af917}   # stale on another bitstream
   verify:
     resnet18_ms: {file: demo/image_classification/build/results.json, json: '',
                   transform: "one(x['metrics']['p50_ms'] for x in v if x['name'] == 'resnet18')"}
@@ -1072,7 +1224,7 @@ facts:
     - {file: doc/plans/STEREO_PLAN.md, regex: 'a pair takes\s+\*\*(?P<stereo_ms>\d+) ms \((?P<stereo_fps>[\d.]+) FPS\)\*\*'}
     - {file: README.md, regex: '; (?P<stereo320_ms>\d+) ms at 320×256;'}
     - {file: demo/stereo_depth/README.md, regex: 'At 320 × 256\s+\(`run.height` / `run.width`\) it takes (?P<stereo320_ms>\d+) ms'}
-    - {file: doc/plans/STEREO_PLAN.md, regex: 'At 320 × 256 a pair takes (?P<stereo320_ms>[\d.]+) ms'}
+    - {file: doc/plans/STEREO_PLAN.md, regex: '1\.061 px; (?P<stereo320_ms>[\d.]+) ms \([\d.]+ FPS\) on the production'}
     - {file: demo/README.md, regex: 'full test split \((?P<mnist_convnet_ms>[\d.]+) / (?P<mnist_lenet_ms>[\d.]+) ms per image\)'}
     - {file: doc/scheduler/PROFILER.md, regex: 'it ran `mnist_convnet` at\s+(?P<mnist_convnet_ms>[\d.]+) ms'}
     - {file: demo/mnist/README.md, regex: '^  mnist_convnet  OK +[\d.]+% +(?P<mnist_convnet_ms>[\d.]+) '}
@@ -1126,9 +1278,9 @@ facts:
     how: "demo/object_detection/scripts/yolo_study.py study (YOLO_PLAN §3.2): all 128 COCO128 images, val.py's
           NMS (conf 0.001, IoU 0.6, multi-label); float = onnxruntime on yolov5n_raw.onnx, FPGA = the
           scheduler's simulation (the board equals it bit for bit, §3.3): 0.5427 / 0.3429 against 0.5454 / 0.3486; the board
-          runs of 2026-10-12 on 1cedaf2ed816 and 2026-10-15 on de968ccc45da (run_demo.py, 16 images) bit-exact with the
-          simulation again"
-    facts: {perf.bitstream_id: de968ccc45da}   # the datapath, not the bitstream: any kernel change re-measures
+          runs of 2026-10-12 on 1cedaf2ed816, 2026-10-15 on de968ccc45da and 2026-10-18 on 04259a7af917 (run_demo.py, 16
+          images) bit-exact with the simulation again"
+    facts: {perf.bitstream_id: 04259a7af917}   # the datapath, not the bitstream: any kernel change re-measures
   verify:
     map50: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map50}
     map: {file: demo/object_detection/assets/study/yolo_study.json, json: policies.fpga.map}
@@ -1155,10 +1307,10 @@ facts:
           8599aa7a5f12) EPE 0.6672 / bad-1 12.21 / bad-2 4.94; float on the same fitted input (stereo_study.py study
           --fit 480 640) 0.6500 / 11.81 / 4.87; the simulated graph at native resolution (sim_quality.py --pc 0.05)
           EPE 0.627 (float 0.633); the board run of 2026-10-12 on 1cedaf2ed816 (44 pairs) gives the same EPE 0.667 /
-          12.21 / 4.94, bit-exact with the simulation; on de968ccc45da (2026-10-15, run_demo.py's default 14 pairs, so
-          build/results.json holds their EPE 0.720 on 12 ground-truth pairs — verify after a --pairs 0 run) the
-          disparity again bit-exact with the simulation"
-    facts: {perf.bitstream_id: de968ccc45da}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
+          12.21 / 4.94, bit-exact with the simulation; on de968ccc45da (2026-10-15, run_demo.py's default 14 pairs) the
+          disparity again bit-exact with the simulation; on 04259a7af917 (2026-10-18, --pairs 0: 44 pairs, 42 with ground
+          truth) EPE 0.667 / 12.21 / 4.94 again, bit-exact"
+    facts: {perf.bitstream_id: 04259a7af917}   # the datapath is bit-exact with the simulation on any bitstream with the softmax unit
   verify:
     epe: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['epe'] for x in v if x['name'] == 'lightstereo_s')"}
     bad1: {file: demo/stereo_depth/build/results.json, json: '', transform: "one(x['metrics']['bad1'] for x in v if x['name'] == 'lightstereo_s')"}
@@ -1182,15 +1334,20 @@ facts:
 - id: stereo.realsense
   kind: recorded
   title: LightStereo-S on RealSense D435 pairs taken on the board - latency per pair and how its depth (fx * baseline / disparity) agrees with the camera's own (median relative difference and share of pixels within 10 %, IR projector on / off)
-  value: {ms: 657, on_median: 2.4, on_within10: 97.9, off_median: 4.3, off_within10: 76.7}
-  tolerance: {rel: 0.03}                     # the docs round ("98 %")
+  value: {ms: 467, on_median: 2.7, on_within10: 91.4, off_median: 4.5, off_within10: 74.1}
+  tolerance: {rel: 0.03}                     # the docs round ("91 %")
   provenance:
-    date: 2026-10-09
-    how: "STEREO_PLAN §4.4: run_demo.py --capture on the board (bitstream 8599aa7a5f12; the D435 on firmware
+    date: 2026-10-18
+    how: "run_demo.py --capture on the board (bitstream 04259a7af917): two new 640 x 480 pairs of another scene
+          (median depth 3.8 / 3.6 m), projector on / off, maps bit-exact against the simulation, 466.7 ms per pair;
+          compared where both depths exist (297 881 / 238 726 px): on 2.7 % median, 91.4 % within 10 %; off 4.5 %,
+          74.1 %.  The run's results.json is demo/stereo_depth/build/results_realsense.json (the 8599aa7a5f12 run
+          beside it as results_realsense_8599aa7a5f12.json).  Before, STEREO_PLAN §4.4: run_demo.py --capture on the board (bitstream 8599aa7a5f12; the D435 on firmware
           5.17.3.10 over USB 2), two 640 x 480 pairs with the projector on and off, maps bit-exact against the
           simulation; postprocess.realsense_depth compares where both depths exist (296 632 / 151 667 px).  The
-          run's results.json is kept as demo/stereo_depth/build/results_realsense.json"
-    facts: {perf.bitstream_id: 8599aa7a5f12}
+          run's results.json was kept as demo/stereo_depth/build/results_realsense.json: 657 ms per pair, on 2.4 % /
+          97.9 %, off 4.3 % / 76.7 %"
+    facts: {perf.bitstream_id: 04259a7af917}
   verify:
     ms: {file: demo/stereo_depth/build/results_realsense.json, json: '',
          transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
@@ -1206,12 +1363,10 @@ facts:
   mentions:
     - {file: README.md, regex: 'RealSense D435 pairs taken on the board: depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
     - {file: demo/README.md, regex: 'RealSense pairs: depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
-    - {file: doc/README.md, regex: 'RealSense D435 on the board \(§4\.4\): depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
-    - {file: demo/stereo_depth/README.md,
-       regex: 'a D435 pair took (?P<ms>\d+) ms(?: \([^)]*\))?; with the IR\s+projector on, the network.s depth is within 10 % of the camera.s own on\s+(?P<on_within10>\d+) % of the pixels \(median difference (?P<on_median>[\d.]+) %\), without it on (?P<off_within10>\d+) % \((?P<off_median>[\d.]+) %\)'}
-    - {file: doc/plans/STEREO_PLAN.md, regex: 'Both ran in (?P<ms>\d+) ms per pair'}
-    - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector on \| [\d ]+ \| (?P<on_median>[\d.]+) % \| [\d.]+ % \| (?P<on_within10>[\d.]+) % \|'}
-    - {file: doc/plans/STEREO_PLAN.md, regex: '^\| projector off \(passive\) \| [\d ]+ \| (?P<off_median>[\d.]+) % \| [\d.]+ % \| (?P<off_within10>[\d.]+) % \|'}
+    - {file: doc/README.md, regex: 'RealSense D435 on the board \(§4\.4; recaptured [\d-]+\): depth within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels'}
+    - {file: demo/stereo_depth/README.md, dotall: true,
+       regex: 'a D435 pair takes (?P<ms>\d+) ms; with the IR projector\s+on, the network.s depth is within 10 % of the camera.s own on (?P<on_within10>\d+) % of the pixels\s+\(median difference (?P<on_median>[\d.]+) %\), without it on (?P<off_within10>\d+) % \((?P<off_median>[\d.]+) %\)'}
+    # STEREO_PLAN §4.4 is the dated record of the first capture (2026-10-09, 8599aa7a5f12, another scene)
 
 - id: yolo.model
   kind: value
