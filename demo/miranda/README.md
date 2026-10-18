@@ -175,8 +175,8 @@ A session goes through four states:
   "Do I need an umbrella on Tuesday?", "What's the weather in Paris?" run
   the weather tool (`weather.py`, no API keys):
   - **Where:** the board's public IP (api.ipify.org), then its position
-    (ipwho.is, else ip-api.com; an IP's city is approximate — on
-    2026-10-17 one said Tbilisi, the other Batumi), or the place the
+    (ip-api.com, else ipwho.is; an IP's city is approximate — for the board
+    in Batumi ip-api.com said Batumi, ipwho.is Tbilisi), or the place the
     question names (Open-Meteo's geocoding), or `--location PLACE`.
   - **The forecast:** Open-Meteo, now or a day of the next week; cached
     for ten minutes, the position for an hour; 0.6 s when not cached.
@@ -268,6 +268,7 @@ PY=inference-scheduler/.venv/bin/python
 $PY demo/miranda/deploy.py                       # checks the chat server, uploads, starts kv260-miranda
 python3 demo/miranda/miranda_client.py --server 192.168.100.8
 $PY demo/miranda/deploy.py --status              # | --stop
+$PY demo/miranda/deploy.py --fetch-segments      # the recorded segments (-- --save-segments) -> demo/miranda/build/segments
 ```
 
 - **`deploy.py`** uploads the server to `<chat dir>/miranda` and starts it as
@@ -289,9 +290,20 @@ $PY demo/miranda/deploy.py --status              # | --stop
   capital of France?" in −50 dBFS noise; a margin that stopped below the
   limit is where the sum stopped, the whole one is lower.)  `-- --save-segments DIR` also keeps every
   segment as a WAV file on the board, with its state, transcript and margin
-  in `DIR/segments.jsonl`.  Say "Hello Miranda" a number of times and talk
-  as usual; a `--wake-margin` between the margins of your key phrases and
-  those of your other speech separates them.
+  in `DIR/segments.jsonl`; a later `deploy.py` without it stops the
+  recording (`deploy.py --status` says whether the server records).  Say
+  "Hello Miranda" a number of times and talk as usual; a `--wake-margin`
+  between the margins of your key phrases and those of your other speech
+  separates them.  `deploy.py --fetch-segments [DIR]` downloads the
+  recordings (from the running server's `--save-segments` directory, else
+  `<chat dir>/miranda/segments`) into `DIR`, by default
+  `demo/miranda/build/segments`, and fetches only new or grown files when
+  run again:
+
+  ```bash
+  $PY demo/miranda/deploy.py -- --save-segments /root/kv260_chat/miranda/segments
+  $PY demo/miranda/deploy.py --fetch-segments
+  ```
 - **The client** needs Python 3 and nothing else.
   - **Microphone:** the first recorder found (`pw-record`, `parecord`,
     `arecord`, ffmpeg from PulseAudio), or `--mic "CMD"`.

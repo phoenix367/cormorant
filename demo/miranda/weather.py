@@ -1,7 +1,7 @@
 """weather.py — Miranda's weather tool: where the board is, and its forecast.
 
   here()          the board's public IP (api.ipify.org), then its position
-                  (ipwho.is; ip-api.com when that fails) — an IP's city is
+                  (ip-api.com; ipwho.is when that fails) — an IP's city is
                   approximate; cached for an hour
   geocode(name)   a named place (Open-Meteo's geocoding API)
   report(place, day)
@@ -104,18 +104,20 @@ class Weather:
         return ip
 
     def locate_ip(self, ip: str) -> Place:
+        """ip-api.com, ipwho.is when that fails (2026-10-18: for the board in Batumi
+        ip-api.com said Batumi, ipwho.is Tbilisi)."""
         try:
-            d = self.fetch(IPWHO.format(ip=ip))
-            if d.get("success"):
-                return Place(d.get("city") or "", d.get("region") or "", d.get("country") or "",
-                             float(d["latitude"]), float(d["longitude"]), "ip")
+            d = self.fetch(IPAPI.format(ip=ip))
+            if d.get("status") == "success":
+                return Place(d.get("city") or "", d.get("regionName") or "", d.get("country") or "",
+                             float(d["lat"]), float(d["lon"]), "ip")
         except Exception:                                             # noqa: BLE001 — the second service
             pass
-        d = self.fetch(IPAPI.format(ip=ip))
-        if d.get("status") != "success":
+        d = self.fetch(IPWHO.format(ip=ip))
+        if not d.get("success"):
             raise WeatherError(f"no position for the IP {ip}")
-        return Place(d.get("city") or "", d.get("regionName") or "", d.get("country") or "",
-                     float(d["lat"]), float(d["lon"]), "ip")
+        return Place(d.get("city") or "", d.get("region") or "", d.get("country") or "",
+                     float(d["latitude"]), float(d["longitude"]), "ip")
 
     def here(self) -> Place:
         """The board's position from its public IP (cached)."""

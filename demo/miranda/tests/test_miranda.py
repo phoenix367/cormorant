@@ -306,8 +306,8 @@ class ScriptedAsr(Backend):
 FORECAST_DAYS = [(datetime.date(2026, 10, 17) + datetime.timedelta(days=i)).isoformat() for i in range(7)]   # Sat ..
 CANNED = {
     "api.ipify.org": {"ip": "203.0.113.7"},
-    "ipwho.is": {"success": True, "city": "Batumi", "region": "Adjara", "country": "Georgia",
-                 "latitude": 41.65, "longitude": 41.63},
+    "ipwho.is": {"success": True, "city": "Tbilisi", "region": "Tbilisi", "country": "Georgia",
+                 "latitude": 41.69, "longitude": 44.83},
     "ip-api.com": {"status": "success", "city": "Batumi", "regionName": "Adjara", "country": "Georgia",
                    "lat": 41.65, "lon": 41.63},
     "geocoding-api.open-meteo.com/v1/search?name=Paris": {"results": [
@@ -359,14 +359,15 @@ class TestWeather(unittest.TestCase):
         w = weather.Weather(fetch=f)
         p = w.here()
         self.assertEqual((p.name, p.country, p.source, p.label()), ("Batumi", "Georgia", "ip", "Batumi, Georgia"))
-        self.assertEqual(len(f.urls), 2)                                # ipify, then ipwho.is
+        self.assertEqual(len(f.urls), 2)                                # ipify, then ip-api.com
+        self.assertIn("ip-api.com", f.urls[1])
         w.here()
         w.report(p, "now")
         w.report(p, "tomorrow")
         self.assertEqual(len(f.urls), 3)                                # one forecast; the place cached
-        f2 = FakeFetch(fail={"ipwho.is"})
-        self.assertEqual(weather.Weather(fetch=f2).here().lat, 41.65)   # ip-api.com when ipwho.is fails
-        self.assertIn("ip-api.com", f2.urls[-1])
+        f2 = FakeFetch(fail={"ip-api.com"})
+        self.assertEqual(weather.Weather(fetch=f2).here().name, "Tbilisi")   # ipwho.is when ip-api.com fails
+        self.assertIn("ipwho.is", f2.urls[-1])
 
     def test_reports(self):
         w = weather.Weather(fetch=FakeFetch())

@@ -1064,7 +1064,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                          "checking, a fixed sentence when it guesses the weather instead)")
     ap.add_argument("--location", default=None, metavar="PLACE",
                     help="the weather tool's place when the request names none (default: where the board's "
-                         "public IP is, as ipwho.is / ip-api.com say)")
+                         "public IP is, as ip-api.com / ipwho.is say)")
     ap.add_argument("--greeting", choices=("fixed", "chat", "off"), default="fixed",
                     help="the answer to the key phrase alone, before Miranda waits for the request: fixed "
                          "(the default: \"Hi! How can I help you?\" and others in turn), chat (the chat model "
@@ -1073,7 +1073,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="transcribe without the phrase check (the key phrase only from the transcript)")
     ap.add_argument("--save-segments", default=None, metavar="DIR",
                     help="keep every segment heard as DIR/<time>-<session>-<n>.wav, with its state, "
-                         "transcript and phrase check in DIR/segments.jsonl (to tune --wake-margin)")
+                         "transcript and phrase check in DIR/segments.jsonl (to tune --wake-margin; "
+                         "deploy.py --fetch-segments downloads them)")
     ap.add_argument("--system", default=SYSTEM, help="the chat model's system message")
     ap.add_argument("--max-tokens", type=int, default=100)
     ap.add_argument("--max-sentences", type=int, default=3,

@@ -20,9 +20,16 @@ Miranda's server does not touch the FPGA itself, so it takes no board lock
 and may keep running while the chat server is stopped for a board job (its
 requests then fail until the chat server is back).
 
+--fetch-segments [DIR] downloads the segments the server recorded
+(miranda_server.py --save-segments: a WAV file per segment and
+segments.jsonl) into DIR (default demo/miranda/build/segments), skipping the
+files already there with the same size; it reads the running server's
+--save-segments directory, else <dir>/miranda/segments.  --status says
+whether the server records.
+
 usage:  deploy.py [--config ../chat/chat_config.json] [--port 8770]
                   [--chat-model smollm2-360m-instruct] [-- SERVER ARGS...]
-        deploy.py --stop | --status
+        deploy.py --stop | --status | --fetch-segments [DIR]
 """
 
 from __future__ import annotations
@@ -30,8 +37,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import shlex
 import socket
+import stat
 import sys
 import time
 import urllib.request
@@ -45,6 +54,7 @@ from src.remote import RemoteSession, _green, _red                     # noqa: E
 
 UNIT = "kv260-miranda"
 FILES = ("miranda_server.py", "miranda_proto.py", "vad.py", "wake.py", "weather.py")
+SEGMENTS = os.path.join(HERE, "build", "segments")      # --fetch-segments' default
 
 
 def kinds(cfg: dict):
@@ -68,6 +78,49 @@ def port_open(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def recording(session, d: str):
+    """The running server's --save-segments directory (None: it does not record;
+    False: it does not run)."""
+    out, _, _ = session.exec(f"pid=$(systemctl show -p MainPID --value {UNIT} 2>/dev/null); "
+                             "[ -n \"$pid\" ] && [ \"$pid\" != 0 ] && tr '\\0' '\\n' < /proc/$pid/cmdline",
+                             timeout=15)
+    argv = out.splitlines()
+    if not argv:
+        return False
+    for i, a in enumerate(argv):
+        if a == "--save-segments" and i + 1 < len(argv):
+            return posixpath.join(f"{d}/miranda", argv[i + 1])
+        if a.startswith("--save-segments="):
+            return posixpath.join(f"{d}/miranda", a.split("=", 1)[1])
+    return None
+
+
+def fetch_segments(session, src: str, dest: str) -> int:
+    """Download src's files (WAVs + segments.jsonl) that dest lacks or holds at another size."""
+    sftp = session._client.open_sftp()                     # noqa: SLF001
+    try:
+        try:
+            files = [a for a in sftp.listdir_attr(src) if stat.S_ISREG(a.st_mode or 0)]
+        except FileNotFoundError:
+            print(_red(f"  fetch    -> FAIL  no {src} on the board (record with: deploy.py -- --save-segments {src})"))
+            return 1
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as e:
+            print(_red(f"  fetch    -> FAIL  {e}"))
+            return 1
+        new = [a for a in files if not (os.path.isfile(p := os.path.join(dest, a.filename))
+                                        and os.path.getsize(p) == a.st_size)]
+        for a in sorted(new, key=lambda a: a.filename):
+            sftp.get(posixpath.join(src, a.filename), os.path.join(dest, a.filename))
+    finally:
+        sftp.close()
+    wavs = sum(a.filename.endswith(".wav") for a in files)
+    print(f"  fetch    -> {_green('OK')}  {src}: {wavs} segments, {len(new)} file{'s' * (len(new) != 1)} new or grown "
+          f"({sum(a.st_size for a in new) / 1e6:.1f} MB) -> {dest}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -77,6 +130,9 @@ def main(argv=None) -> int:
                     help="the chat model (smollm2-135m-instruct: faster, weaker answers)")
     ap.add_argument("--stop", action="store_true")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--fetch-segments", nargs="?", const=SEGMENTS, default=None, metavar="DIR",
+                    help="download the segments the server recorded (--save-segments) into DIR "
+                         "(default demo/miranda/build/segments)")
     ap.add_argument("server_args", nargs="*", help="more miranda_server.py arguments (after --)")
     args = ap.parse_args(argv)
     cfg = chat_deploy.load_config(args.config)
@@ -86,6 +142,9 @@ def main(argv=None) -> int:
     session = RemoteSession(cfg["ssh"])
     session.connect()
     try:
+        if args.fetch_segments is not None:
+            src = recording(session, d) or f"{d}/miranda/segments"
+            return fetch_segments(session, src, args.fetch_segments)
         if args.status or args.stop:
             if args.stop:
                 session.exec(f"{su}systemctl stop {UNIT} 2>/dev/null; {su}systemctl reset-failed {UNIT} 2>/dev/null",
@@ -93,6 +152,9 @@ def main(argv=None) -> int:
             out, _, _ = session.exec(f"systemctl is-active {UNIT} 2>/dev/null || true", timeout=15)
             print(f"  {UNIT}: {out.strip() or 'inactive'}")
             print(f"  {host}:{args.port}: {'answers' if port_open(host, args.port) else 'no answer'}")
+            rec = recording(session, d)
+            if rec is not False:
+                print(f"  recording: {rec or 'off'}")
             return 0
         t0 = time.monotonic()
         k = kinds(cfg)
