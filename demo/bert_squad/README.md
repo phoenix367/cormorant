@@ -374,6 +374,23 @@ production until 2026-10-16, with the same `sched+vsmx+iln`
 policy): p50 **266.3 ms**, bit-exact (3 / 3 against the simulation, 50 / 50
 against the emulation), EM / F1 88.0 / 90.3.
 
+**Against the CPU** (2026-10-19, production bitstream 04259a7af917, the same
+50 examples in one session, the chat server stopped): onnxruntime 1.23.2 on
+the board's four Cortex-A53 cores with the published `bertsquad-12.onnx`
+and its int8 dynamic quantisation (`doc/plans/BERT_PLAN.md` §4: setup,
+method, how to reproduce):
+
+| engine | per inference (mean) | FPGA speed-up | EM / F1 | same span as float |
+|---|---:|---:|---|---:|
+| **KV260 FPGA, Q8.8** | **266.9 ms** | – | **88.0 / 90.3** | 49 / 50 |
+| onnxruntime fp32, 4 threads | 3128.6 ms | 11.7× | 88.0 / 90.3 | 50 / 50 |
+| onnxruntime int8 (dynamic), 4 threads | 2054.3 ms | 7.7× | 84.0 / 86.5 | 44 / 50 |
+| onnxruntime fp32, 1 thread | 10 855 ms | 40.7× | | |
+
+onnxruntime fp32 gives the float model's answers (its logits equal the float
+reference to 1e-5) but needs 674 MB of RAM and all four cores; int8 takes
+34 % less time and loses 4 EM points.
+
 ## Options (`deploy_and_run.py`)
 
 | Flag | Effect |

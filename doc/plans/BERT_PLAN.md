@@ -24,7 +24,7 @@ unit, fused into the FFN bias Adds (bitstream `6436623029f7`, ACTIVATIONS_PLAN.m
 p50 525 ms; with the 12 Softmaxes on its softmax unit (bitstream `588d721997cb`,
 SOFTMAX_PLAN.md): p50 427 ms; with VectorOPKernel's b read port on HPC1 (bitstream
 `8599aa7a5f12`, PS_PORTS_PLAN.md): p50 418 ms, bit-exact; with ConvKernel's x read port past the CCI
-(bitstream `1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit): p50 288 ms, bit-exact (364 on `f70ce632a97a`, DEPTHWISE_PLAN.md §8); with 48 of its 49 Transposes on the unit too (RPU_PLAN.md track A1, 2026-10-13; measured on the production bitstream `de968ccc45da`, 2026-10-15): p50 266 ms, bit-exact.  On `04259a7af917`, production since 2026-10-17 (RPU_PLAN.md §14.12): 267.1 ms an inference, 50 / 50 examples bit-exact.
+(bitstream `1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit): p50 288 ms, bit-exact (364 on `f70ce632a97a`, DEPTHWISE_PLAN.md §8); with 48 of its 49 Transposes on the unit too (RPU_PLAN.md track A1, 2026-10-13; measured on the production bitstream `de968ccc45da`, 2026-10-15): p50 266 ms, bit-exact.  On `04259a7af917`, production since 2026-10-17 (RPU_PLAN.md §14.12): 267.1 ms an inference, 50 / 50 examples bit-exact.  Against the CPU (§4, 2026-10-19): onnxruntime on the board's four Cortex-A53 cores takes 3129 ms (fp32) / 2054 ms (int8) — the FPGA is 11.7× / 7.7× faster, at float accuracy.
 
 ## 0. Feasibility (measured 2026-09-26)
 
@@ -511,3 +511,63 @@ predictions identical.
 136 ms (P·V is weight-request-latency bound, §3 Phase 2A); softmax 125 ms
 and LayerNorm 83 ms (double arithmetic); VectorOP 94 ms (bias / residual /
 mask adds — fusable into the conv drain).
+
+## 4. CPU baseline — onnxruntime on the A53 (2026-10-19)
+
+**The FPGA runs BERT-base 11.7× faster than onnxruntime fp32 and 7.7× faster
+than onnxruntime int8 on the board's four Cortex-A53 cores, at the float
+model's accuracy (int8 loses 4 EM points).**
+
+Setup: one session on the KV260 (production bitstream `04259a7af917`), the
+demo's 50 SQuAD examples (`demo/bert_squad/assets/preprocessed/inputs.bin`,
+sequence 256, batch 1), the chat server and Miranda stopped.  onnxruntime
+1.23.2 (the newest release with an aarch64 wheel for the board's Python
+3.10) in a venv of its own: CPU execution provider, `ORT_ENABLE_ALL` graph
+optimisations, `intra_op_num_threads` 4 (or 1), sequential execution.
+Models: the published `bertsquad-12.onnx` (fp32, 435 MB) and an int8 copy
+from onnxruntime's dynamic quantisation (`quantize_dynamic`, `QInt8`
+weights, activations quantised per call; 111 MB).  One warm-up run, then
+each example's `sess.run` timed with `time.perf_counter`.  The logits are
+scored with `deploy_and_run.py`'s `decode_all` / `score` against the gold
+answers and against the float reference of `reference.py`.  The FPGA row
+is `run_demo.py` in the same session (the A53 driving the kernels).
+
+| engine | threads | per inference: mean (min–max) | FPGA speed-up | EM / F1 | same span as float | memory, start-up |
+|---|---:|---:|---:|---|---:|---|
+| **KV260 FPGA, Q8.8** | – | **266.9 ms** (266.7–267.8) | – | **88.0 / 90.3** | 49 / 50 | `inference_init` 0.4 s |
+| onnxruntime fp32 | 4 | 3128.6 ms (3082.8–3172.8) | 11.7× | 88.0 / 90.3 | 50 / 50 | 674 MB RSS; session 3.8 s (30.6 s from a cold page cache) |
+| onnxruntime int8, dynamic | 4 | 2054.3 ms (2030.8–2113.1) | 7.7× | 84.0 / 86.5 | 44 / 50 | 204 MB RSS; session 2.0 s (8.6 s cold) |
+| onnxruntime fp32 | 1 | 10 855 ms (5 examples) | 40.7× | | 5 / 5 | |
+| onnxruntime int8, dynamic | 1 | 7 327 ms (5 examples) | 27.5× | | 4 / 5 | |
+
+- onnxruntime fp32's logits equal the float reference to 1.0e-5, so its
+  answers are the float model's.  The FPGA's Q8.8 logits move one span
+  (#16: "2015" for "2016," — both gold answers, §3).  int8 moves six:
+  EM / F1 −4.0 / −3.8, 94.0 / 95.5 against the float answers, logits off
+  by up to 7.5.
+- The model's 22.95 GMAC (21.74 in the linears, 1.21 in attention, §3)
+  run at 7.3 GMAC/s in fp32 and 11.2 GMAC/s in int8 on four A53s; four
+  threads give 3.5× (fp32) and 3.6× (int8) over one.  The FPGA's 266.9 ms
+  is 86 GMAC/s for the whole inference, host ops included.
+- The onnxruntime runs keep all four cores busy for the whole inference.
+  The FPGA library sleeps on the kernels' interrupts while they run
+  (RPU_PLAN.md §12), and the Cortex-R5 can drive them instead
+  (RPU_PLAN.md §9).
+
+Reproduce (the board's chat server stopped, `demo/chat/deploy.py --stop`):
+
+```bash
+# host: the int8 copy (onnxruntime's quantizer needs onnx and sympy)
+python3 -m venv $TMPDIR/ortq && $TMPDIR/ortq/bin/pip install onnxruntime==1.23.2 onnx sympy
+$TMPDIR/ortq/bin/python -c "from onnxruntime.quantization import quantize_dynamic, QuantType; \
+    quantize_dynamic('inference-scheduler/bertsquad-12.onnx', 'bertsquad-12-int8-dyn.onnx', \
+                     weight_type=QuantType.QInt8)"
+# board: onnxruntime in a venv beside the system Python
+python3 -m venv /root/ort_bench/venv && /root/ort_bench/venv/bin/pip install onnxruntime==1.23.2 numpy
+# copy both models and inputs.bin there; per record of inputs.bin ([N, 3, 256] int16):
+#   feeds = {"input_ids:0", "segment_ids:0", "input_mask:0": the record's rows as int64 [1, 256],
+#            "unique_ids_raw_output___9:0": int64 [1]}
+#   sess.run(["unstack:0", "unstack:1"], feeds)          # start / end logits
+# FPGA, same session
+cd demo/bert_squad && ../../inference-scheduler/.venv/bin/python run_demo.py
+```

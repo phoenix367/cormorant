@@ -17,6 +17,9 @@ study GO (§22), then implemented — bit-exact on the board, 3.9 s per image
 ~9.5 tok/s, served by the chat server with OpenAI image_url parts (§23).
 Generating a library needs 4× less host RAM than before (360M: 30 → 7.7 GiB,
 §25).
+Against the CPU (§26, 2026-10-19): onnxruntime fp32 on the board's four
+A53 cores decodes 2.4× (135M) / 2.1× (360M) slower than the FPGA and
+prefills 256 tokens 10× slower.
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2246,3 +2249,113 @@ one entry's ModelProto while its graph is built, and the int8 exponents.
 Checks: the scheduler suite (1581 pass, 5 skipped, incl. `test_generator_memory.py`); the generated projects
 compared file by file with the old generator's for all three models; and
 `llm_sched_check.py` bit-exact with the study emulation.
+
+## 26. CPU baseline — onnxruntime on the A53 (2026-10-19)
+
+**On the FPGA, SmolLM2 decodes 2.4× (135M) / 2.1× (360M) faster than
+onnxruntime fp32 on the board's four Cortex-A53 cores and prefills 256
+tokens 10× faster, with the A53s nearly idle.  onnxruntime's int8 dynamic
+quantisation makes the CPU's prefill faster but its decode slower, and it
+changes the greedy answers more than the FPGA's Q8.8 does.**  BERT:
+BERT_PLAN.md §4.
+
+Setup — BERT_PLAN.md §4's method: one session on the KV260 (production
+bitstream `04259a7af917`), the chat server and Miranda stopped; onnxruntime
+1.23.2 in its own venv, 4 intra-op threads, `ORT_ENABLE_ALL`.
+- **Models:** the pinned revisions' own ONNX exports (`onnx/model.onnx` of
+  HuggingFaceTB/SmolLM2-135M-Instruct @ `12fd25f` and -360M-Instruct @
+  `a10cc15`, the revisions of `llm_models.json`: fp32, the KV cache as
+  inputs / outputs, onnxruntime's fused operators).  One edit: a Slice
+  before the head MatMul, so that a prefill computes the logits of its last
+  position only, as the FPGA library does (`LlmSelectRow`).  The export
+  computes every position's, and the head is 21 % (135M) / 13 % (360M) of
+  the work per token.  The edited model's logits equal the export's last
+  row exactly.
+- **int8:** onnxruntime's `quantize_dynamic` (`QInt8` weights, activations
+  quantised per call) of the edited model: 137 / 365 MB, the size of the
+  repos' own `model_int8.onnx`.
+- **Protocol** (`llm_bench.c`, `llm_board.py`):
+  - the `<|im_start|>` sink is cached at position 0;
+  - the three chat prompts (factual, summarise, multi-turn) are prefilled
+    from position 1, and the factual prompt's second turn after its answer;
+  - each is followed by 32 greedy steps (argmax, first maximum), timed one
+    by one; decode = the mean of the 128 steps (positions 37–200);
+  - prefill = 16 / 64 / 256 tokens after the sink (the first prompt's ids
+    repeated), best of 3.
+  The KV cache stays in onnxruntime's OrtValues (no copies through numpy).
+- **FPGA:** `llm_board.py --rpu r5` on the chat libraries (the R5 driving,
+  as in the chat server), in the same session.  Logits bit-exact with the
+  scheduler simulation (4 prompts × 33 vectors, both models).
+
+| model | engine | decode: ms / token (tokens / s) | prefill 16 / 64 / 256 tokens | FPGA speed-up: decode, prefill 256 | peak RSS |
+|---|---|---:|---:|---:|---:|
+| SmolLM2-135M | **FPGA, Q8.8** | **48.3 (20.7)** | **80 / 97 / 392 ms** | – | (weights in CMA) |
+| | onnxruntime fp32 | 117.9 (8.5) | 276 / 915 / 3920 ms | 2.4×, 10.0× | 996 MB |
+| | onnxruntime int8, dynamic | 160.3 (6.2) | 277 / 713 / 2825 ms | 3.3×, 7.2× | 513 MB |
+| SmolLM2-360M | **FPGA, Q8.8** | **127.0 (7.9)** | **191 / 233 / 1024 ms** | – | (weights in CMA) |
+| | onnxruntime fp32 | 261.0 (3.8) | 721 / 2607 / 10686 ms | 2.1×, 10.4× | 2295 MB |
+| | onnxruntime int8, dynamic | 279.9 (3.6) | 613 / 1850 / 7105 ms | 2.2×, 6.9× | 1079 MB |
+
+Greedy answers against the float model (onnxruntime fp32): the tokens equal
+to it before the first difference, of 33 (one from the prefill, 32
+decoded).  A second turn continues after the engine's own first answer, so
+it is comparable only where that answer was the same:
+
+| model | engine | factual | its second turn | summarise | multi-turn |
+|---|---|---:|---:|---:|---:|
+| SmolLM2-135M | FPGA | 7 | (another first answer) | 27 | **33** |
+| | onnxruntime int8 | 7 | (another first answer) | 6 | 0 |
+| SmolLM2-360M | FPGA | **33** | 2 | **33** | **33** |
+| | onnxruntime int8 | 21 | (another first answer) | 20 | 0 |
+
+- **Decode** is weight-bandwidth-bound on both sides.  The FPGA streams its
+  int16 weights, half the bytes of fp32, through MatmulKernel's two read
+  ports (§19).  The A53s read the fp32 weights at 4.6 GB/s (135M: 540 MB
+  in 118 ms) and 5.6 GB/s (360M: 1.45 GB in 261 ms).
+- **int8 on the A53.**  Its decode is slower than fp32: dynamic
+  quantisation quantises the activations on every call, and the A53
+  (Armv8.0) has no int8 dot-product instructions, so a one-token step gains
+  nothing from int8 weights.  The prefill's matrix products do gain
+  (28–34 % at 256 tokens).
+- **CPU load.**  onnxruntime keeps all four cores busy.  The whole FPGA
+  bench (open, 4 prompts, 128 decode steps, 9 timed prefills) took 2.2 s
+  (135M) / 4.1 s (360M) of A53 CPU time with the R5 driving.
+- **Cold start** (page cache dropped): the FPGA library's `llm_open` took
+  22.2 / 54.2 s.  onnxruntime's session took 40.4 / 104.8 s in fp32 and
+  11.2 / 27.8 s in int8.
+
+Reproduce (the board's chat server stopped, `demo/chat/deploy.py --stop`):
+
+```bash
+# host: the pinned exports, the last-row edit and the int8 copies
+# (onnxruntime's quantizer needs onnx and sympy: BERT_PLAN.md §4's $TMPDIR/ortq venv)
+HF=https://huggingface.co/HuggingFaceTB
+curl -L -o smollm2_135m.onnx $HF/SmolLM2-135M-Instruct/resolve/12fd25f77366fa6b3b4b768ec3050bf629380bac/onnx/model.onnx
+curl -L -o smollm2_360m.onnx $HF/SmolLM2-360M-Instruct/resolve/a10cc1512eabd3dde888204e902eca88bddb4951/onnx/model.onnx
+$TMPDIR/ortq/bin/python - <<'EOF'
+import numpy as np, onnx
+from onnx import helper, numpy_helper
+from onnxruntime.quantization import quantize_dynamic, QuantType
+for m in ("smollm2_135m", "smollm2_360m"):
+    g = (model := onnx.load(f"{m}.onnx")).graph
+    head = next(n for n in g.node if "logits" in n.output)                 # /lm_head/MatMul
+    g.initializer.extend(numpy_helper.from_array(np.array([v], np.int64), k) for k, v in
+                         (("last_s", -1), ("last_e", np.iinfo(np.int64).max), ("last_a", 1)))
+    g.node.insert(list(g.node).index(head),
+                  helper.make_node("Slice", [head.input[0], "last_s", "last_e", "last_a"], ["last_row"]))
+    head.input[0] = "last_row"
+    next(o for o in g.output if o.name == "logits").type.tensor_type.shape.dim[1].dim_value = 1
+    onnx.save(model, f"{m}_last.onnx")
+    quantize_dynamic(f"{m}_last.onnx", f"{m}_int8_last.onnx", weight_type=QuantType.QInt8)
+EOF
+# the prompts' ids as llm_board.py makes them (from demo/chat/scripts/)
+#   llm_project.with_second_turns(llm_project.tokenize_prompts(["factual", "summarise", "multi-turn"]), ["factual"])
+# board: onnxruntime in a venv beside the system Python; 360M fp32 peaks at 2.3 GB
+python3 -m venv /root/ort_bench/venv && /root/ort_bench/venv/bin/pip install onnxruntime==1.23.2 numpy
+#   per step: input_ids / position_ids int64 [1, n], attention_mask ones [1, past + n], and
+#   past_key_values.<i>.key / .value = the previous step's present.<i>.* (OrtValues, run_with_ort_values)
+# FPGA, same session: the R5 running (inference-scheduler/rpu_board.py --start-only), then per library
+inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py --rpu r5 --remote-dir DIR --weights-dir WDIR
+inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py --rpu r5 \
+    --project demo/chat/build/llm_project_smollm2_360m --remote-dir DIR --weights-dir WDIR_360M
+```
