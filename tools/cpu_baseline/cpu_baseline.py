@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-cpu_baseline.py — the CPU baseline of the FPGA results: BERT-SQuAD and
-SmolLM2 with onnxruntime on the KV260's four Cortex-A53 cores
+cpu_baseline.py — the CPU baseline of the FPGA results: BERT-SQuAD,
+SmolLM2 and SmolVLM with onnxruntime on the KV260's four Cortex-A53 cores
 (doc/plans/BERT_PLAN.md §4, doc/plans/CHAT_PLAN.md §26).
 
   models  bert: bertsquad-12.onnx of the ONNX model zoo (the demo's assets,
@@ -12,10 +12,13 @@ SmolLM2 with onnxruntime on the KV260's four Cortex-A53 cores
           demo/chat/scripts/llm_models.json pins (downloaded), with its head on
           the last position only — a Slice before the head MatMul, as the FPGA
           library computes a prefill's logits; prepare.py checks that the
-          logits equal the export's last row.  Every source is SHA-256-checked
+          logits equal the export's last row; smolvlm: its three exports
+          (vision encoder + connector, token embedding, decoder; the revision
+          demo/chat/scripts/vlm_study_inputs.json pins), the decoder edited
+          likewise.  Every source is SHA-256-checked
           (PINS); the int8 copies are onnxruntime's dynamic quantisation.  On
           the host in build/venv (onnxruntime 1.23.2 = the board's, onnx,
-          sympy), the models in build/ (--work: ~4 GB with both SmolLM2s).
+          sympy), the models in build/ (--work: ~6 GB with both SmolLM2s and SmolVLM).
   board   onnxruntime 1.23.2 in a venv in --remote-dir (beside the system
           Python the chat server uses; pip needs PyPI); the models, the
           inputs and board_bench.py uploaded where their SHA-256 differs; each
@@ -23,10 +26,12 @@ SmolLM2 with onnxruntime on the KV260's four Cortex-A53 cores
           cache is dropped; --remote-dir removed afterwards unless --keep.
   report  bert: latency, EM / F1 against the gold answers (the demo's
           scoring), the spans against fp32's (= the float model's);
-          smollm2: decode ms / token, prefill 16 / 64 / 256 tokens, the greedy
-          tokens against fp32's.  With the FPGA's results — bert:
+          smollm2 / smolvlm: decode ms / token, prefill 16 / 64 / 256 tokens
+          (smolvlm: llm_image, the image through the vision encoder), the
+          greedy tokens against fp32's.  With the FPGA's results — bert:
           demo/bert_squad/build/results.json of run_demo.py (the default);
-          smollm2: an llm_board.py --out JSON (--fpga) — the speed-ups.
+          smollm2 / smolvlm: an llm_board.py --out JSON (--fpga) — the
+          speed-ups.
           Written to build/<model>_results.json (--out).
 
 The chat server owns the FPGA and most of the board's memory: stop it
@@ -35,6 +40,7 @@ The board lock is held for the board part (src/remote/lock.py).
 
 usage:  inference-scheduler/.venv/bin/python tools/cpu_baseline/cpu_baseline.py bert [--fpga RESULTS_JSON]
         ... cpu_baseline.py smollm2 --model 135m|360m [--fpga LLM_BOARD_JSON]
+        ... cpu_baseline.py smolvlm [--fpga LLM_BOARD_JSON] [--images 39769,1268]
         options: [--config demo/bert_squad/bert_squad_config.json] [--engines fp32,int8]
                  [--threads 4,1] [--stop-server] [--keep] [--remote-dir DIR] [--prepare-only]
                  [--out JSON] [--work DIR] [--board-lock FILE]
@@ -78,7 +84,15 @@ PINS = {   # the measured files (CHAT_PLAN §26: the revisions of llm_models.jso
                               "sha256": "1e790f1d6fac94097a6516ed1f07c29049097271d536d538562cd31ffc011a71"},
     "smollm2-360m-instruct": {"revision": "a10cc1512eabd3dde888204e902eca88bddb4951", "size": 1449582810,
                               "sha256": "cf419c37a4f6073a325028245d4cae2e6135765f0f2841dbe6f48c8cd261bbcd"},
+    "smolvlm-256m-instruct": {"revision": "7e3e67edbbed1bf9888184d9df282b700a323964", "parts": {
+        "vision_encoder": {"size": 374316497,
+                           "sha256": "e27ad810eabfa7c881b409e1ca357e7a951541019add228ff73c72718fcf6218"},
+        "embed_tokens": {"size": 113541419,
+                         "sha256": "a68ea4058524059ed0e2873fdbc4f33b93e13ae3d3204938d32d0566d390ae00"},
+        "decoder_model_merged": {"size": 540640302,
+                                 "sha256": "5ae6a66fdf47680433aa6bcc512ae8f0b98c2db01bea055fc76ee37bb0389b78"}}},
 }
+VLM = "smolvlm-256m-instruct"
 
 
 def log(msg: str = "") -> None:
@@ -109,9 +123,8 @@ def download(url: str, dest: Path, size: int) -> None:
     log(f"    done ({time.monotonic() - t0:.0f} s)")
 
 
-def pinned(name: str, candidates: list[Path], url: str, dest: Path) -> Path:
-    """The first candidate with the pinned SHA-256, else url downloaded to dest."""
-    pin = PINS[name]
+def pinned(pin: dict, candidates: list[Path], url: str, dest: Path) -> Path:
+    """The first candidate with the pinned SHA-256 (pin: size, sha256), else url downloaded to dest."""
     for c in candidates + [dest]:
         if c.exists() and c.stat().st_size == pin["size"] and sha256(c) == pin["sha256"]:
             return c
@@ -141,13 +154,19 @@ def derived(src: Path, dst: Path, what: str) -> Path:
     if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
         return dst
     log(f"  {what}: {src.name} -> {dst.name}")
-    subprocess.run([str(host_venv()), str(TOOL / "prepare.py"), what, str(src), str(dst)], check=True)
+    r = subprocess.run([str(host_venv()), str(TOOL / "prepare.py"), what, str(src), str(dst)],
+                       capture_output=True, text=True)
+    if r.returncode:                         # the quantizer's shape-inference chatter only on failure
+        sys.exit(f"prepare.py {what} {src.name} failed:\n{r.stdout[-3000:]}{r.stderr[-3000:]}")
+    for line in r.stdout.splitlines():
+        if line.startswith("  "):            # prepare.py's own lines (the last-row check)
+            log(line)
     return dst
 
 
 def bert_models() -> dict:
     assets = REPO / "demo" / "bert_squad" / "assets" / "models"
-    src = pinned("bert", [assets / "bertsquad-12.onnx", REPO / "inference-scheduler" / "bertsquad-12.onnx"],
+    src = pinned(PINS["bert"], [assets / "bertsquad-12.onnx", REPO / "inference-scheduler" / "bertsquad-12.onnx"],
                  BERT_ZOO, BUILD / "bertsquad-12.onnx")
     models = {"fp32": src, "int8": derived(src, BUILD / "bertsquad-12-int8.onnx", "int8")}
     log("".join(f"  {e}: {m}\n" for e, m in models.items()).rstrip())
@@ -166,7 +185,7 @@ def llm_models(model: str) -> dict:
         sys.exit(f"llm_models.json pins {name} at {spec['revision']}, this tool's PINS at {pin['revision']}: "
                  "update PINS (the export's SHA-256 at the new revision)")
     url = f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/onnx/model.onnx"
-    src = pinned(name, [], url, BUILD / f"{name}.onnx")
+    src = pinned(pin, [], url, BUILD / f"{name}.onnx")
     last = derived(src, BUILD / f"{name}-last-row.onnx", "last-row")
     models = {"fp32": last, "int8": derived(last, BUILD / f"{name}-last-row-int8.onnx", "int8")}
     log("".join(f"  {e}: {m}\n" for e, m in models.items()).rstrip())
@@ -181,6 +200,51 @@ def llm_prompts(a) -> Path:
     p = BUILD / "prompts.json"
     p.write_text(json.dumps({k: [int(t) for t in v] for k, v in ids.items()}))
     return p
+
+
+def vlm_models() -> dict:
+    """{engine: {vision, embed, decoder}}: the pinned exports, the decoder's head
+    on the last position, int8 copies of all three."""
+    pin = PINS[VLM]
+    spec = json.loads((REPO / "demo" / "chat" / "scripts" / "vlm_study_inputs.json").read_text())["model"]
+    if spec["revision"] != pin["revision"]:
+        sys.exit(f"vlm_study_inputs.json pins {VLM} at {spec['revision']}, this tool's PINS at "
+                 f"{pin['revision']}: update PINS (the exports' SHA-256 at the new revision)")
+    src = {part: pinned(p, [], f"https://huggingface.co/{spec['repo']}/resolve/{spec['revision']}/onnx/{part}.onnx",
+                        BUILD / f"{VLM}-{part}.onnx") for part, p in pin["parts"].items()}
+    fp32 = {"vision": src["vision_encoder"], "embed": src["embed_tokens"],
+            "decoder": derived(src["decoder_model_merged"], BUILD / f"{VLM}-decoder-last-row.onnx", "last-row")}
+    models = {"fp32": fp32,
+              "int8": {k: derived(v, v.with_name(v.stem + "-int8.onnx"), "int8") for k, v in fp32.items()}}
+    for e, parts in models.items():
+        log(f"  {e}: " + ", ".join(f"{k} {v.name}" for k, v in parts.items()))
+    return models
+
+
+def vlm_inputs(a) -> tuple:
+    """(prompts JSON, images.bin) of the image prompts as llm_board.py makes
+    them (its vlm_inputs: vlm_study's evaluation prompts, the gate's cached
+    pixels and ids), with the full ids and the image token."""
+    import llm_project as lp
+    import vlm_project as vp
+    import vlm_sched_check as vc
+    import vlm_study as vs
+    assets = vp.default_assets()
+    ids = [int(x) for x in a.images.split(",")]
+    items = [(i, vs.EVAL_PROMPTS[vs.EVAL_IDS.index(i) % len(vs.EVAL_PROMPTS)]
+              if i in vs.EVAL_IDS else vs.EVAL_PROMPTS[0]) for i in ids]
+    sd = lp.study.study_dir(assets)
+    toks = vc.prompt_tokens(items, assets, os.path.join(sd, "sched_check", "prompt_ids.json"))
+    pix = vc.pixels(ids, os.path.join(sd, "sched_check"))
+    image_token = json.loads((Path(assets) / "config.json").read_text())["image_token_id"]
+    p = BUILD / "vlm_prompts.json"
+    p.write_text(json.dumps({"image_token": image_token,
+                             "prompts": [{"name": f"COCO {i}", "ids": [int(t) for t in toks[i]]} for i in ids]}))
+    im = BUILD / "vlm_images.bin"
+    side = pix[ids[0]].shape[0]
+    im.write_bytes(np.array([len(ids), side], "<i4").tobytes()
+                   + b"".join(np.ascontiguousarray(pix[i], np.uint8).tobytes() for i in ids))
+    return p, im
 
 
 # ── board ────────────────────────────────────────────────────────────────────
@@ -250,8 +314,8 @@ def on_board(cfg: dict, a, uploads: dict, runs: list) -> list:
                 if line is None:
                     sys.exit(f"{r['tag']}: no RESULT line\n{out[-2000:]}{err[-2000:]}")
                 res = json.loads(line[len("RESULT: "):])
-                local = out_dir / f"{r['tag']}{Path(r['args'][3]).suffix}"
-                sftp.get(f"{rd}/{r['args'][3]}", str(local))
+                local = out_dir / r["out"]
+                sftp.get(f"{rd}/{r['out']}", str(local))
                 results.append(dict(res, tag=r["tag"], engine=r["engine"], output=str(local)))
                 log(f"  {json.dumps(res)}")
             sftp.close()
@@ -265,19 +329,21 @@ def on_board(cfg: dict, a, uploads: dict, runs: list) -> list:
     return results
 
 
-def runs_for(a, kind: str, inputs: str) -> list:
-    """(engine, threads) runs: the first thread count with --n examples, the
-    others with --n-rest (bert)."""
+def runs_for(a, kind: str, inputs: list) -> list:
+    """(engine, threads) runs: board_bench.py's arguments; bert: the first
+    thread count with --n examples, the others with --n-rest."""
     runs = []
     for t_i, t in enumerate(int(x) for x in a.threads.split(",")):
         for e in a.engines.split(","):
             tag = f"{a.model_name}-{e}-t{t}"
-            args = [kind, f"{e}.onnx", inputs, f"{tag}.{'npz' if kind == 'bert' else 'json'}", "--threads", str(t)]
+            out = f"{tag}.{'npz' if kind == 'bert' else 'json'}"
+            models = [f"{e}-{p}.onnx" for p in ("vision", "embed", "decoder")] if kind == "vlm" else [f"{e}.onnx"]
+            args = [kind, *models, *inputs, out, "--threads", str(t)]
             if kind == "bert":
                 args += ["--n", str(a.n if t_i == 0 else a.n_rest)]
             else:
                 args += ["-k", str(a.k), "-P", a.prefill_lens, "-R", str(a.reps)]
-            runs.append({"tag": tag, "engine": e, "threads": t, "args": args})
+            runs.append({"tag": tag, "engine": e, "threads": t, "out": out, "args": args})
     return runs
 
 
@@ -334,26 +400,38 @@ def llm_report(a, results: list) -> dict:
         fpga = {"source": a.fpga, "decode_ms_mean": b["llm_summary"]["decode_ms_mean"],
                 "prefill": [{"n": p["n"], "best_ms": p["best_ms"]} for p in b["prefill"]],
                 "toks": [[st["tok"] for st in p["steps"]] for p in b["prompts"]]}
+        if b.get("images"):
+            fpga["image_ms"] = float(np.mean([im["ms"] for im in b["images"]]))
     rows = []
     for r in results:
         d = json.loads(Path(r["output"]).read_text())
         rows.append(dict(r, toks=[p["toks"] for p in d["prompts"]], prompt_names=[p["name"] for p in d["prompts"]]))
     ref = next((r for r in rows if r["engine"] == "fp32"), None)
-    log(f"\n{llm_name(a.model)}: decode ms / token (mean of {rows[0]['decode_steps']} steps), "
-        f"prefill best of {a.reps}")
+    vision = bool(rows[0].get("images"))
+    for r in rows:
+        if vision:
+            r["image_ms"] = float(np.mean([im["ms"] for im in r["images"]]))
+    log(f"\n{a.model_name}: decode ms / token (mean of {rows[0]['decode_steps']} steps), "
+        f"prefill best of {a.reps}" + (", llm_image the mean of the images" if vision else ""))
     lens = [p["n"] for p in rows[0]["prefill"]]
-    log(f"  {'engine':24s} {'threads':>7s} {'decode ms (tok/s)':>18s}  "
-        + "  ".join(f"{'prefill ' + str(n):>12s}" for n in lens) + "  FPGA speed-up: decode, prefill")
+    log(f"  {'engine':24s} {'threads':>7s}" + (f" {'image ms':>9s}" if vision else "")
+        + f" {'decode ms (tok/s)':>18s}  " + "  ".join(f"{'prefill ' + str(n):>12s}" for n in lens)
+        + "  FPGA speed-up: " + ("image, " if vision else "") + "decode, prefill")
     if fpga:
-        log(f"  {'FPGA (' + Path(a.fpga).name + ')':24s} {'-':>7s} {fpga['decode_ms_mean']:9.2f} ({1e3 / fpga['decode_ms_mean']:5.2f})  "
+        log(f"  {'FPGA (' + Path(a.fpga).name + ')':24s} {'-':>7s}"
+            + (f" {fpga.get('image_ms', float('nan')):9.0f}" if vision else "")
+            + f" {fpga['decode_ms_mean']:9.2f} ({1e3 / fpga['decode_ms_mean']:5.2f})  "
             + "  ".join(f"{p['best_ms']:9.0f} ms" for p in fpga["prefill"]))
     for r in rows:
         sp = "-"
         if fpga:
             fp = {q["n"]: q["best_ms"] for q in fpga["prefill"]}
-            sp = (f"{r['decode_ms_mean'] / fpga['decode_ms_mean']:.1f}x, "
+            sp = ((f"{r['image_ms'] / fpga['image_ms']:.1f}x, " if vision and fpga.get("image_ms") else "")
+                  + f"{r['decode_ms_mean'] / fpga['decode_ms_mean']:.1f}x, "
                   + " / ".join(f"{p['best_ms'] / fp[p['n']]:.1f}x" for p in r["prefill"] if p["n"] in fp))
-        log(f"  {'onnxruntime ' + r['engine']:24s} {r['threads']:7d} {r['decode_ms_mean']:9.2f} ({1e3 / r['decode_ms_mean']:5.2f})  "
+        log(f"  {'onnxruntime ' + r['engine']:24s} {r['threads']:7d}"
+            + (f" {r['image_ms']:9.0f}" if vision else "")
+            + f" {r['decode_ms_mean']:9.2f} ({1e3 / r['decode_ms_mean']:5.2f})  "
             + "  ".join(f"{p['best_ms']:9.0f} ms" for p in r["prefill"]) + f"  {sp}")
     agree = {}
     if ref:
@@ -363,13 +441,13 @@ def llm_report(a, results: list) -> dict:
         for label, toks in others:
             if len(toks) != len(ref["toks"]):
                 sys.exit(f"{label}: {len(toks)} prompts, onnxruntime's {len(ref['toks'])}: run both with "
-                         "the same --prompts / --second-turn")
+                         "the same --prompts / --second-turn / --images")
             counts = [first_diff(t, f) for t, f in zip(toks, ref["toks"], strict=True)]
             counts = [min(len(t), len(f)) if c is None else c
                       for c, t, f in zip(counts, toks, ref["toks"], strict=True)]
             agree[label] = dict(zip(ref["prompt_names"], counts, strict=True))
             log(f"    {label:24s} " + ", ".join(f"{n} {c}" for n, c in agree[label].items()))
-    return {"model": llm_name(a.model), "fpga": {k: v for k, v in (fpga or {}).items() if k != "toks"} or None,
+    return {"model": a.model_name, "fpga": {k: v for k, v in (fpga or {}).items() if k != "toks"} or None,
             "onnxruntime": [{k: v for k, v in r.items() if k != "toks"} for r in rows], "greedy_agreement": agree}
 
 
@@ -390,10 +468,15 @@ def main(argv=None) -> int:
     pl.add_argument("--threads", default="4", help="intra-op thread counts (default 4)")
     pl.add_argument("--prompts", default="factual,summarise,multi-turn")
     pl.add_argument("--second-turn", default="factual")
-    pl.add_argument("-k", type=int, default=32, help="greedy decode steps per prompt (default 32)")
-    pl.add_argument("--prefill-lens", default="16,64,256")
-    pl.add_argument("--reps", type=int, default=3, help="prefill repetitions, best taken (default 3)")
-    for p in (pb, pl):
+    pv = sub.add_parser("smolvlm", help="SmolVLM-256M with llm_board.py's protocol for images")
+    pv.add_argument("--fpga", default=None, help="the FPGA's results: an llm_board.py --out JSON")
+    pv.add_argument("--threads", default="4", help="intra-op thread counts (default 4)")
+    pv.add_argument("--images", default="39769,1268", help="COCO ids, one image prompt each (llm_board.py's default)")
+    for p in (pl, pv):
+        p.add_argument("-k", type=int, default=32, help="greedy decode steps per prompt (default 32)")
+        p.add_argument("--prefill-lens", default="16,64,256")
+        p.add_argument("--reps", type=int, default=3, help="prefill repetitions, best taken (default 3)")
+    for p in (pb, pl, pv):
         p.add_argument("--config", default=str(BERT_CONFIG),
                        help="the board (ssh, board_lock): the BERT demo's config, as llm_board.py")
         p.add_argument("--engines", default="fp32,int8")
@@ -417,17 +500,25 @@ def main(argv=None) -> int:
         a.model_name = "bert"
         models = bert_models()
         from _common import load_config, preprocessed_dir
-        inputs = preprocessed_dir(load_config(a.config)) / "inputs.bin"
-    else:
+        inputs = [preprocessed_dir(load_config(a.config)) / "inputs.bin"]
+    elif a.cmd == "smollm2":
         a.model_name = llm_name(a.model)
         models = llm_models(a.model)
-        inputs = llm_prompts(a)
+        inputs = [llm_prompts(a)]
+    else:
+        a.model_name = VLM
+        models = vlm_models()
+        inputs = list(vlm_inputs(a))
     if a.prepare_only:
         return 0
-    kind = "bert" if a.cmd == "bert" else "llm"
-    runs = runs_for(a, kind, inputs.name)
-    uploads = {"board_bench.py": TOOL / "board_bench.py", inputs.name: inputs}
-    uploads.update({f"{e}.onnx": models[e] for e in a.engines.split(",")})
+    kind = {"bert": "bert", "smollm2": "llm", "smolvlm": "vlm"}[a.cmd]
+    runs = runs_for(a, kind, [p.name for p in inputs])
+    uploads = {"board_bench.py": TOOL / "board_bench.py", **{p.name: p for p in inputs}}
+    for e in a.engines.split(","):
+        if kind == "vlm":
+            uploads.update({f"{e}-{part}.onnx": m for part, m in models[e].items()})
+        else:
+            uploads[f"{e}.onnx"] = models[e]
     results = on_board(cfg, a, uploads, runs)
     rep = bert_report(a, results) if a.cmd == "bert" else llm_report(a, results)
     rep.update(onnxruntime_version=ORT, date=time.strftime("%Y-%m-%d"))

@@ -18,8 +18,10 @@ study GO (§22), then implemented — bit-exact on the board, 3.9 s per image
 Generating a library needs 4× less host RAM than before (360M: 30 → 7.7 GiB,
 §25).
 Against the CPU (§26, 2026-10-19): onnxruntime fp32 on the board's four
-A53 cores decodes 2.4× (135M) / 2.1× (360M) slower than the FPGA and
-prefills 256 tokens 10× slower.
+A53 cores decodes SmolLM2 / SmolVLM 2.1–2.5× slower than the FPGA, prefills
+256 tokens 10× and encodes an image 8.9× slower; its int8 decodes about as
+fast as the FPGA (360M: 1.2× faster), but prefills 6–7× slower and changes
+the greedy answers more.
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2252,49 +2254,76 @@ compared file by file with the old generator's for all three models; and
 
 ## 26. CPU baseline — onnxruntime on the A53 (2026-10-19)
 
-**On the FPGA, SmolLM2 decodes 2.4× (135M) / 2.1× (360M) faster than
-onnxruntime fp32 on the board's four Cortex-A53 cores and prefills 256
-tokens 10× faster, with the A53s nearly idle.  onnxruntime's int8 dynamic
-quantisation makes the CPU's prefill faster but its decode slower, and it
-changes the greedy answers more than the FPGA's Q8.8 does.**  BERT:
-BERT_PLAN.md §4.
+**Against onnxruntime fp32 on the board's four Cortex-A53 cores, the FPGA
+decodes SmolLM2 2.5× (135M) / 2.1× (360M) and SmolVLM 2.4× faster. It
+prefills 256 tokens 10× faster and encodes an image 8.9× faster, with the
+A53s nearly idle.  onnxruntime's int8 dynamic quantisation closes the
+decode gap: the FPGA stays 1.2× (SmolLM2-135M) / 1.1× (SmolVLM) faster, and
+on SmolLM2-360M the CPU's int8 decodes 1.2× faster than the FPGA's int16.
+It does not close the prefill gap (6.3–7.1× at 64–256 tokens) or the image
+gap (6.4×), and it changes the greedy answers much more than the FPGA's
+Q8.8 does.**  BERT: BERT_PLAN.md §4.
 
 Setup — BERT_PLAN.md §4's method: one session on the KV260 (production
 bitstream `04259a7af917`), the chat server and Miranda stopped; onnxruntime
-1.23.2 in its own venv, 4 intra-op threads, `ORT_ENABLE_ALL`.
-- **Models:** the pinned revisions' own ONNX exports (`onnx/model.onnx` of
-  HuggingFaceTB/SmolLM2-135M-Instruct @ `12fd25f` and -360M-Instruct @
-  `a10cc15`, the revisions of `llm_models.json`: fp32, the KV cache as
-  inputs / outputs, onnxruntime's fused operators).  One edit: a Slice
-  before the head MatMul, so that a prefill computes the logits of its last
-  position only, as the FPGA library does (`LlmSelectRow`).  The export
-  computes every position's, and the head is 21 % (135M) / 13 % (360M) of
-  the work per token.  The edited model's logits equal the export's last
-  row exactly.
+1.23.2 in its own venv, 4 intra-op threads, `ORT_ENABLE_ALL`;
+`tools/cpu_baseline/cpu_baseline.py`.
+- **Models, SmolLM2:** the pinned revisions' own ONNX exports
+  (`onnx/model.onnx` of HuggingFaceTB/SmolLM2-135M-Instruct @ `12fd25f` and
+  -360M-Instruct @ `a10cc15`, the revisions of `llm_models.json`: fp32, the
+  KV cache as inputs / outputs, onnxruntime's fused operators).  One edit: a
+  Slice before the head MatMul, so that a prefill computes the logits of its
+  last position only, as the FPGA library does (`LlmSelectRow`).  The
+  export computes every position's, and the head is 21 % (135M) / 13 %
+  (360M) of the work per token.  The edited model's logits equal the
+  export's last row exactly.
+- **Models, SmolVLM:** its revision's exports — `onnx/vision_encoder.onnx`
+  (with the connector), `embed_tokens.onnx` and `decoder_model_merged.onnx`
+  of HuggingFaceTB/SmolVLM-256M-Instruct @ `7e3e67e`, the revision of
+  `vlm_study_inputs.json` — with the decoder edited likewise.
 - **int8:** onnxruntime's `quantize_dynamic` (`QInt8` weights, activations
-  quantised per call) of the edited model: 137 / 365 MB, the size of the
-  repos' own `model_int8.onnx`.
+  quantised per call), with two exceptions:
+  - Conv is left out: SmolVLM's patch embedding stays fp32, because
+    onnxruntime's CPU `ConvInteger` takes only uint8 weights.
+  - SmolLM2's head is tied: its weight is Transpose(the embedding), computed
+    in the graph.  So the transposed weight is first folded into an
+    initializer of its own, as SmolVLM's export already has it.  The fold is
+    exact, and the quantizer then quantizes the head too.
+
+  The int8 files are 165 / 412 MB (SmolLM2-135M / 360M) and 96 + 28 + 137 MB
+  (SmolVLM).
 - **Protocol** (`llm_bench.c`, `llm_board.py`):
   - the `<|im_start|>` sink is cached at position 0;
-  - the three chat prompts (factual, summarise, multi-turn) are prefilled
-    from position 1, and the factual prompt's second turn after its answer;
-  - each is followed by 32 greedy steps (argmax, first maximum), timed one
-    by one; decode = the mean of the 128 steps (positions 37–200);
+  - SmolLM2: the three chat prompts (factual, summarise, multi-turn) are
+    prefilled from position 1, and the factual prompt's second turn after
+    its answer.  SmolVLM: `llm_board.py`'s two image prompts (COCO 39769
+    and 1268, one 512 × 512 image each, its evaluation questions), each
+    after its image went through the vision encoder (`llm_image`, timed).
+    The embedding lookup is inside the timed prefill and decode steps;
+  - each prompt is followed by 32 greedy steps (argmax, first maximum),
+    timed one by one; decode = their mean (SmolLM2: 128 steps at positions
+    37–200; SmolVLM: 64);
   - prefill = 16 / 64 / 256 tokens after the sink (the first prompt's ids
     repeated), best of 3.
   The KV cache stays in onnxruntime's OrtValues (no copies through numpy).
 - **FPGA:** `llm_board.py --rpu r5` on the chat libraries (the R5 driving,
-  as in the chat server), in the same session.  Logits bit-exact with the
-  scheduler simulation (4 prompts × 33 vectors, both models).
+  as in the chat server), the same day.  Logits bit-exact with the
+  scheduler simulation (SmolLM2: 4 prompts × 33 vectors; SmolVLM: 2 × 33).
 
 | model | engine | decode: ms / token (tokens / s) | prefill 16 / 64 / 256 tokens | FPGA speed-up: decode, prefill 256 | peak RSS |
 |---|---|---:|---:|---:|---:|
 | SmolLM2-135M | **FPGA, Q8.8** | **48.3 (20.7)** | **80 / 97 / 392 ms** | – | (weights in CMA) |
-| | onnxruntime fp32 | 117.9 (8.5) | 276 / 915 / 3920 ms | 2.4×, 10.0× | 996 MB |
-| | onnxruntime int8, dynamic | 160.3 (6.2) | 277 / 713 / 2825 ms | 3.3×, 7.2× | 513 MB |
+| | onnxruntime fp32 | 118.8 (8.4) | 277 / 913 / 3952 ms | 2.5×, 10.1× | 997 MB |
+| | onnxruntime int8, dynamic | 56.1 (17.8) | 177 / 615 / 2726 ms | 1.2×, 6.9× | 328 MB |
 | SmolLM2-360M | **FPGA, Q8.8** | **127.0 (7.9)** | **191 / 233 / 1024 ms** | – | (weights in CMA) |
-| | onnxruntime fp32 | 261.0 (3.8) | 721 / 2607 / 10686 ms | 2.1×, 10.4× | 2295 MB |
-| | onnxruntime int8, dynamic | 279.9 (3.6) | 613 / 1850 / 7105 ms | 2.2×, 6.9× | 1079 MB |
+| | onnxruntime fp32 | 261.5 (3.8) | 721 / 2645 / 10645 ms | 2.1×, 10.4× | 2315 MB |
+| | onnxruntime int8, dynamic | 103.0 (9.7) | 441 / 1661 / 6906 ms | 0.8× (the CPU 1.2× faster), 6.7× | 693 MB |
+
+| SmolVLM-256M | `llm_image` (one 512 × 512 image) | decode: ms / token (tokens / s) | prefill 16 / 64 / 256 tokens | FPGA speed-up: image, decode, prefill 256 | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| **FPGA, Q8.8** | **1614 ms** | **48.1 (20.8)** | **80 / 97 / 394 ms** | – | (weights in CMA) |
+| onnxruntime fp32 | 14307 ms | 116.4 (8.6) | 273 / 909 / 4023 ms | 8.9×, 2.4×, 10.2× | 1532 MB |
+| onnxruntime int8, dynamic | 10358 ms | 54.0 (18.5) | 178 / 612 / 2701 ms | 6.4×, 1.1×, 6.9× | 635 MB |
 
 Greedy answers against the float model (onnxruntime fp32): the tokens equal
 to it before the first difference, of 33 (one from the prefill, 32
@@ -2304,30 +2333,49 @@ it is comparable only where that answer was the same:
 | model | engine | factual | its second turn | summarise | multi-turn |
 |---|---|---:|---:|---:|---:|
 | SmolLM2-135M | FPGA | 7 | (another first answer) | 27 | **33** |
-| | onnxruntime int8 | 7 | (another first answer) | 6 | 0 |
+| | onnxruntime int8 | 7 | (another first answer) | 6 | 5 |
 | SmolLM2-360M | FPGA | **33** | 2 | **33** | **33** |
-| | onnxruntime int8 | 21 | (another first answer) | 20 | 0 |
+| | onnxruntime int8 | 18 | (another first answer) | 0 | 0 |
 
-- **Decode** is weight-bandwidth-bound on both sides.  The FPGA streams its
-  int16 weights, half the bytes of fp32, through MatmulKernel's two read
-  ports (§19).  The A53s read the fp32 weights at 4.6 GB/s (135M: 540 MB
-  in 118 ms) and 5.6 GB/s (360M: 1.45 GB in 261 ms).
-- **int8 on the A53.**  Its decode is slower than fp32: dynamic
-  quantisation quantises the activations on every call, and the A53
-  (Armv8.0) has no int8 dot-product instructions, so a one-token step gains
-  nothing from int8 weights.  The prefill's matrix products do gain
-  (28–34 % at 256 tokens).
-- **CPU load.**  onnxruntime keeps all four cores busy.  The whole FPGA
-  bench (open, 4 prompts, 128 decode steps, 9 timed prefills) took 2.2 s
-  (135M) / 4.1 s (360M) of A53 CPU time with the R5 driving.
+SmolVLM, COCO 39769 / 1268: the FPGA 23 / 27, onnxruntime int8 0 / 5.
+
+- **Decode** is weight-bandwidth-bound on both sides.
+  - The FPGA streams its int16 weights through MatmulKernel's two read
+    ports (§19).
+  - The A53s read the fp32 weights at 4.6 GB/s (135M: 540 MB in 119 ms) and
+    5.5 GB/s (360M: 1.45 GB in 262 ms).
+  - int8 weights are half the bytes of the FPGA's int16 ones.  On 360M that
+    puts the CPU's int8 decode 1.2× ahead of the FPGA.  On 135M and SmolVLM
+    the FPGA stays 1.2× / 1.1× ahead.
+- **Prefill and the image** are compute-bound.  There the FPGA's MAC grid
+  keeps it 6.3–7.1× ahead of int8 from 64 tokens up, and 6.4× ahead on the
+  vision encoder.
+- **Quality.**  Dynamic int8 changes the greedy answers much more than the
+  FPGA's Q8.8 does.  On 360M the FPGA's three answers equal the float
+  model's, while int8's leave them after 18, 0 and 0 tokens.  On SmolVLM
+  the FPGA's leave after 23 / 27 tokens, int8's after 0 / 5.
+- **Corrected the same day.**  This section first measured int8 copies that
+  quantized SmolLM2's embedding for its Gather.  They left the tied head's
+  weight as DequantizeLinear + Transpose of that embedding, and onnxruntime
+  does not constant-fold DequantizeLinear.  So every step dequantized and
+  transposed the whole embedding and ran the head in fp32: 160 / 280 ms per
+  token, slower than fp32.  I first attributed that to the A53 having no
+  int8 dot-product instructions.  Folding the transposed weight into an
+  initializer of its own first (`prepare.py`) makes the head an int8 MatMul:
+  56 / 103 ms.
+- **CPU load.**  onnxruntime keeps all four cores busy.  With the R5
+  driving, a whole FPGA bench (open, the prompts, the decode steps, 9 timed
+  prefills) took 2.2 s (SmolLM2-135M), 4.1 s (360M) and 2.4 s (SmolVLM) of
+  A53 CPU time.
 - **Cold start** (page cache dropped): the FPGA library's `llm_open` took
-  22.2 / 54.2 s.  onnxruntime's session took 40.4 / 104.8 s in fp32 and
-  11.2 / 27.8 s in int8.
+  22.2 / 54.2 / 34.9 s (SmolLM2-135M / 360M / SmolVLM).  onnxruntime's
+  sessions took 40.6 / 104.8 / 71.3 s in fp32 and 14.5 / 32.9 / 20.4 s in
+  int8.
 
 Reproduce with `tools/cpu_baseline/cpu_baseline.py`
 ([README](../../tools/cpu_baseline/README.md)).  It does the steps above:
 the pinned exports (SHA-256-checked), the last-row edit with its check, the
-int8 copies, the prompts as `llm_board.py` tokenizes them, onnxruntime 1.23.2
+int8 copies, the prompts (and SmolVLM's images) as `llm_board.py` makes them, onnxruntime 1.23.2
 in a venv on the board, the timing, and the speed-ups and greedy agreement
 against an `llm_board.py --out` JSON.  It removes what it put on the board.
 The FPGA runs go into directories of their own, so the chat server's
@@ -2343,4 +2391,7 @@ $PY demo/chat/scripts/llm_board.py --rpu r5 --project demo/chat/build/llm_projec
     --remote-dir /root/cmp_chat --weights-dir /root/cmp_smollm2_360m_weights --out /tmp/fpga_360m.json
 $PY tools/cpu_baseline/cpu_baseline.py smollm2 --model 135m --fpga /tmp/fpga_135m.json
 $PY tools/cpu_baseline/cpu_baseline.py smollm2 --model 360m --fpga /tmp/fpga_360m.json
+$PY demo/chat/scripts/llm_board.py --rpu r5 --project demo/chat/build/llm_project_smolvlm_256m \
+    --remote-dir /root/cmp_chat --weights-dir /root/cmp_smolvlm_weights --out /tmp/fpga_vlm.json
+$PY tools/cpu_baseline/cpu_baseline.py smolvlm --fpga /tmp/fpga_vlm.json
 ```

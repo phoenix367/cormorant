@@ -418,25 +418,29 @@ Measured on the board (CHAT_PLAN §13.4, §16.3, §17, §19; the kernels at
 ### Against the CPU
 
 2026-10-19, CHAT_PLAN §26: onnxruntime 1.23.2 on the board's four Cortex-A53
-cores against the FPGA, in one board session.  The CPU runs the pinned
-checkpoints' own ONNX exports (fp32), and their int8 dynamic quantisation,
-with the same prompts and timing as `llm_board.py`:
+cores against the FPGA, on the same board.  The CPU runs the pinned
+checkpoints' own ONNX exports (fp32) and their int8 dynamic quantisation,
+with the same prompts and timing as `llm_board.py`
+([`tools/cpu_baseline`](../../../tools/cpu_baseline/README.md)):
 
 | model | engine | decode | prefill 256 tokens |
 |---|---|---:|---:|
 | SmolLM2-135M | **FPGA** | **20.7 tokens/s** | **0.39 s** |
-| | onnxruntime fp32 | 8.5 tokens/s (2.4× slower) | 3.92 s (10.0×) |
-| | onnxruntime int8 | 6.2 tokens/s (3.3×) | 2.82 s (7.2×) |
+| | onnxruntime fp32 | 8.4 tokens/s (2.5× slower) | 3.95 s (10.1×) |
+| | onnxruntime int8 | 17.8 tokens/s (1.2×) | 2.73 s (6.9×) |
 | SmolLM2-360M | **FPGA** | **7.9 tokens/s** | **1.02 s** |
-| | onnxruntime fp32 | 3.8 tokens/s (2.1×) | 10.69 s (10.4×) |
-| | onnxruntime int8 | 3.6 tokens/s (2.2×) | 7.10 s (6.9×) |
+| | onnxruntime fp32 | 3.8 tokens/s (2.1×) | 10.65 s (10.4×) |
+| | onnxruntime int8 | 9.7 tokens/s (1.2× faster than the FPGA) | 6.91 s (6.7×) |
 
-The CPU keeps all four cores busy.  With the R5 driving the kernels, the
-FPGA library leaves them nearly idle: 2–4 s of A53 CPU time for the whole
-benchmark.  On the 360M model the FPGA's greedy answers equal the float
-model's on all three prompts.  int8's answers leave the float model's after
-21 and 20 tokens (factual, summarise), and at the first token on the
-multi-turn prompt.
+- **Decode** streams the weights, and int8 weights are half the bytes of
+  the FPGA's int16 ones.  So the CPU's int8 decodes about as fast as the
+  FPGA, and faster on 360M.
+- **Prefill** is compute: at 256 tokens the FPGA is 6.7–10.4× faster.
+- **Quality.**  On 360M the FPGA's greedy answers equal the float model's
+  on all three prompts, while int8's leave them after 18, 0 and 0 tokens.
+- **CPU load.**  The CPU runs keep all four cores busy.  With the R5 driving
+  the kernels, the FPGA library leaves them nearly idle: 2–4 s of A53 CPU
+  time for the whole benchmark.
 
 ## Measured
 

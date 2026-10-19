@@ -22,7 +22,16 @@ a model with onnxruntime on the CPU, timed as the FPGA results are.
       the sink (the first prompt's ids repeated), best of R.  The KV cache
       stays in onnxruntime's OrtValues.
 
-Both print one line "RESULT: {...}" (the summary) on stdout and their
+  vlm VISION EMBED DECODER prompts.json images.bin OUT.json [...]
+      SmolVLM's three exports (the vision encoder with its connector, the
+      token embedding, the decoder on inputs_embeds), timed as llm_bench.c
+      times the FPGA library with images: per prompt its image (one 512 x 512
+      RGB, images.bin as llm_board.py writes it) through the vision encoder
+      (llm_image), then the prompt as in llm — its image tokens' embeddings
+      replaced by the image features, the embedding lookup inside the timed
+      prefill and decode steps.
+
+All print one line "RESULT: {...}" (the summary) on stdout and their
 progress on stderr.  CPU execution provider, ORT_ENABLE_ALL, sequential
 execution, --threads intra-op threads.
 """
@@ -31,6 +40,7 @@ import argparse
 import json
 import os
 import resource
+import struct
 import sys
 import time
 
@@ -84,68 +94,139 @@ def bert(a) -> dict:
             "max_ms": round(float(lat.max()), 2)}
 
 
-def llm(a) -> dict:
-    sess, open_ms = session(a.model, a.threads)
-    kv_in = [i for i in sess.get_inputs() if i.name.startswith("past_key_values.")]
-    outs = ["logits"] + [i.name.replace("past_key_values.", "present.") for i in kv_in]
-    ov = ort.OrtValue.ortvalue_from_numpy
+class Decoder:
+    """A decoder export with its KV cache as inputs / outputs, on input_ids or
+    (with an embedding export) inputs_embeds; the cache in OrtValues."""
 
-    def step(ids, past, pos):
+    def __init__(self, model: str, threads: int, embed: str = None):
+        self.sess, self.open_ms = session(model, threads)
+        self.emb = None
+        if embed:
+            self.emb, ms = session(embed, threads)
+            self.open_ms += ms
+        self.kv = [i for i in self.sess.get_inputs() if i.name.startswith("past_key_values.")]
+        self.outs = ["logits"] + [i.name.replace("past_key_values.", "present.") for i in self.kv]
+
+    def embeds(self, ids, rows=None):
+        """inputs_embeds [1, n, D] of ids; rows {position: feature row} replace theirs."""
+        e = self.emb.run(None, {"input_ids": np.asarray(ids, np.int64)[None, :]})[0]
+        for p, r in (rows or {}).items():
+            e[0, p] = r
+        return e
+
+    def step(self, ids, past, pos, rows=None):
         """ids at positions pos.. on top of past -> (last position's logits, new past)."""
+        ov = ort.OrtValue.ortvalue_from_numpy
         n = len(ids)
-        feed = {"input_ids": ov(np.asarray(ids, np.int64)[None, :]),
-                "attention_mask": ov(np.ones((1, pos + n), np.int64)),
-                "position_ids": ov(np.arange(pos, pos + n, dtype=np.int64)[None, :])}
-        feed.update({i.name: v for i, v in zip(kv_in, past, strict=True)})
-        r = sess.run_with_ort_values(outs, feed)
+        x = ({"inputs_embeds": ov(self.embeds(ids, rows))} if self.emb
+             else {"input_ids": ov(np.asarray(ids, np.int64)[None, :])})
+        x.update({"attention_mask": ov(np.ones((1, pos + n), np.int64)),
+                  "position_ids": ov(np.arange(pos, pos + n, dtype=np.int64)[None, :])})
+        x.update({i.name: v for i, v in zip(self.kv, past, strict=True)})
+        r = self.sess.run_with_ort_values(self.outs, x)
         return r[0].numpy()[0, -1], r[1:]
 
-    prompts = json.load(open(a.prompts))
-    names = list(prompts)
-    empty = [ov(np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32)) for i in kv_in]
-    _, sink = step(prompts[names[0]][:1], empty, 0)
-    res = {"open_ms": round(open_ms, 1), "prompts": [], "prefill": []}
-    dec = []
-    past, pos = sink, 1
-    for name in names:
-        cont = name.endswith("/turn2")
-        ids = prompts[name] if cont else prompts[name][1:]
-        if not cont:
-            past, pos = sink, 1
-        pos0 = pos
+    def empty(self):
+        return [ort.OrtValue.ortvalue_from_numpy(np.zeros((1, i.shape[1], 0, i.shape[3]), np.float32))
+                for i in self.kv]
+
+
+def generate(dec: Decoder, res: dict, name: str, ids, past, pos, k: int, rows=None):
+    """Prefill ids at pos, then k greedy steps -> (past, pos, decode step times)."""
+    pos0 = pos
+    t0 = time.perf_counter()
+    lg, past = dec.step(ids, past, pos, rows)
+    pre_ms = (time.perf_counter() - t0) * 1e3
+    pos += len(ids)
+    tok = int(np.argmax(lg))
+    toks, ms = [tok], []
+    for _ in range(k):
         t0 = time.perf_counter()
-        lg, past = step(ids, past, pos)
-        pre_ms = (time.perf_counter() - t0) * 1e3
-        pos += len(ids)
+        lg, past = dec.step([tok], past, pos)
+        ms.append((time.perf_counter() - t0) * 1e3)
+        pos += 1
         tok = int(np.argmax(lg))
-        toks, ms = [tok], []
-        for _ in range(a.k):
-            t0 = time.perf_counter()
-            lg, past = step([tok], past, pos)
-            ms.append((time.perf_counter() - t0) * 1e3)
-            pos += 1
-            tok = int(np.argmax(lg))
-            toks.append(tok)
-        dec += ms
-        res["prompts"].append({"name": name, "n": len(ids), "pos0": pos0, "prefill_ms": round(pre_ms, 2),
-                               "toks": toks, "decode_ms_mean": round(float(np.mean(ms)), 2)})
-        print(f"{name}: {len(ids)} tokens at {pos0}, prefill {pre_ms:.0f} ms, "
-              f"decode {np.mean(ms):.1f} ms / token", file=sys.stderr, flush=True)
-    first = prompts[names[0]][1:]
-    for n in (int(x) for x in a.P.split(",") if x):
+        toks.append(tok)
+    res["prompts"].append({"name": name, "n": len(ids), "pos0": pos0, "prefill_ms": round(pre_ms, 2),
+                           "toks": toks, "decode_ms_mean": round(float(np.mean(ms)), 2)})
+    print(f"{name}: {len(ids)} tokens at {pos0}, prefill {pre_ms:.0f} ms, "
+          f"decode {np.mean(ms):.1f} ms / token", file=sys.stderr, flush=True)
+    return past, pos, ms
+
+
+def prefill_timing(dec: Decoder, res: dict, sink, first, lens: str, reps: int, rows_of=None):
+    """Prefills of n tokens after the sink (first repeated), best of reps."""
+    for n in (int(x) for x in lens.split(",") if x):
         ids = [first[i % len(first)] for i in range(n)]
+        rows = rows_of(n) if rows_of else None
         ts = []
-        for _ in range(a.R):
+        for _ in range(reps):
             t0 = time.perf_counter()
-            step(ids, sink, 1)
+            dec.step(ids, sink, 1, rows)
             ts.append((time.perf_counter() - t0) * 1e3)
         res["prefill"].append({"n": n, "best_ms": round(min(ts), 2), "mean_ms": round(float(np.mean(ts)), 2)})
         print(f"prefill {n}: best {min(ts):.0f} ms", file=sys.stderr, flush=True)
-    res["decode_ms_mean"] = round(float(np.mean(dec)), 2)
-    res["decode_steps"] = len(dec)
+
+
+def finish(a, res: dict, dec_ms: list) -> dict:
+    res["decode_ms_mean"] = round(float(np.mean(dec_ms)), 2)
+    res["decode_steps"] = len(dec_ms)
     with open(a.out, "w") as f:
         json.dump(dict(res, peak_rss_mb=peak_rss_mb()), f)
-    return {k: res[k] for k in ("open_ms", "decode_ms_mean", "decode_steps", "prefill")}
+    return {k: res[k] for k in res if k not in ("prompts",)}
+
+
+def llm(a) -> dict:
+    dec = Decoder(a.model, a.threads)
+    prompts = json.load(open(a.prompts))
+    names = list(prompts)
+    _, sink = dec.step(prompts[names[0]][:1], dec.empty(), 0)
+    res = {"open_ms": round(dec.open_ms, 1), "prompts": [], "prefill": []}
+    dec_ms = []
+    past, pos = sink, 1
+    for name in names:
+        cont = name.endswith("/turn2")
+        if not cont:
+            past, pos = sink, 1
+        past, pos, ms = generate(dec, res, name, prompts[name] if cont else prompts[name][1:], past, pos, a.k)
+        dec_ms += ms
+    prefill_timing(dec, res, sink, prompts[names[0]][1:], a.P, a.R)
+    return finish(a, res, dec_ms)
+
+
+def vlm(a) -> dict:
+    vis, vis_ms = session(a.vision, a.threads)
+    dec = Decoder(a.decoder, a.threads, embed=a.embed)
+    spec = json.load(open(a.prompts))                      # {"image_token", "prompts": [{"name", "ids"}]}
+    with open(a.images, "rb") as f:
+        count, side = struct.unpack("<ii", f.read(8))
+        pix = np.frombuffer(f.read(), np.uint8).reshape(count, side, side, 3)
+    image_token = spec["image_token"]
+    res = {"open_ms": round(vis_ms + dec.open_ms, 1), "prompts": [], "prefill": [], "images": []}
+    _, sink = dec.step(spec["prompts"][0]["ids"][:1], dec.empty(), 0)
+    dec_ms, feats = [], None
+    for i, p in enumerate(spec["prompts"]):
+        # transformers' rescale + normalize: float32((float32(p / 255) - 0.5) / 0.5), [3, H, W]
+        x = ((pix[i].astype(np.float64) * (1 / 255)).astype(np.float32).transpose(2, 0, 1)
+             - np.float32(0.5)) / np.float32(0.5)
+        t0 = time.perf_counter()
+        out = vis.run(None, {"pixel_values": x[None, None],
+                             "pixel_attention_mask": np.ones((1, 1, side, side), bool)})[0]
+        img_ms = (time.perf_counter() - t0) * 1e3
+        feats = out.reshape(-1, out.shape[-1])               # [64, D]: one row per image token
+        res["images"].append({"i": i, "ms": round(img_ms, 2)})
+        print(f"image {i}: {img_ms:.0f} ms", file=sys.stderr, flush=True)
+        ids = p["ids"][1:]
+        rows = dict(zip([j for j, t in enumerate(ids) if t == image_token], feats, strict=True))
+        _, _, ms = generate(dec, res, p["name"], ids, sink, 1, a.k, rows)
+        dec_ms += ms
+    first = spec["prompts"][0]["ids"][1:]
+    img_pos = [j for j, t in enumerate(first) if t == image_token]
+
+    def rows_of(n):            # the first prompt's ids repeated: its image rows from the last image's features
+        return {j: feats[img_pos.index(j % len(first))] for j in range(n) if (j % len(first)) in img_pos}
+    prefill_timing(dec, res, sink, first, a.P, a.R, rows_of)
+    return finish(a, res, dec_ms)
 
 
 def main() -> int:
@@ -161,14 +242,23 @@ def main() -> int:
     m.add_argument("model")
     m.add_argument("prompts")
     m.add_argument("out")
-    m.add_argument("-k", type=int, default=32)
-    m.add_argument("-P", default="16,64,256")
-    m.add_argument("-R", type=int, default=3)
-    for p in (b, m):
+    v = sub.add_parser("vlm")
+    v.add_argument("vision")
+    v.add_argument("embed")
+    v.add_argument("decoder")
+    v.add_argument("prompts")
+    v.add_argument("images")
+    v.add_argument("out")
+    for p in (m, v):
+        p.add_argument("-k", type=int, default=32)
+        p.add_argument("-P", default="16,64,256")
+        p.add_argument("-R", type=int, default=3)
+    for p in (b, m, v):
         p.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
-    r = bert(a) if a.cmd == "bert" else llm(a)
-    r.update(model=os.path.basename(a.model), ort=ort.__version__, threads=a.threads, peak_rss_mb=peak_rss_mb())
+    r = {"bert": bert, "llm": llm, "vlm": vlm}[a.cmd](a)
+    r.update(model=os.path.basename(getattr(a, "model", None) or a.decoder), ort=ort.__version__,
+             threads=a.threads, peak_rss_mb=peak_rss_mb())
     print("RESULT: " + json.dumps(r), flush=True)
     return 0
 

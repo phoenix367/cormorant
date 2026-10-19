@@ -37,9 +37,11 @@ board, a three-question conversation that the model remembers.
   the protocol anywhere ([Deploying](doc/DEPLOY.md#without-the-fpga)).
 - **Faster than the board's CPU.**  Against onnxruntime on the KV260's four
   Cortex-A53 cores, the FPGA answers a BERT question 11.7× faster, at the
-  float model's accuracy.  It decodes SmolLM2 2.1–2.4× faster and prefills
-  256 tokens about 10× faster, and it leaves the cores nearly idle
-  ([BERT](../../doc/plans/BERT_PLAN.md) §4, [SmolLM2](doc/SMOLLM2.md#against-the-cpu)).
+  float model's accuracy.  It encodes an image 8.9× faster and prefills 256
+  tokens about 10× faster.  It decodes 2.1–2.5× faster than fp32 and about
+  as fast as int8, which costs answer quality.  And it leaves the cores
+  nearly idle ([BERT](../../doc/plans/BERT_PLAN.md) §4,
+  [SmolLM2](doc/SMOLLM2.md#against-the-cpu), [SmolVLM](doc/SMOLVLM.md#against-the-cpu)).
 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 300}}}%%

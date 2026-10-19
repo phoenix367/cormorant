@@ -69,6 +69,27 @@ of a user message:
 The request body may be up to 32 MB when an image model is served
 (`--max-body-mb`).
 
+## Against the CPU
+
+2026-10-19, CHAT_PLAN §26: onnxruntime 1.23.2 on the board's four Cortex-A53
+cores against the FPGA, on the same board.  The CPU runs the pinned
+revision's own ONNX exports (the vision encoder with its connector, the
+token embedding and the decoder; fp32) and their int8 dynamic quantisation.
+It uses the same two COCO images, questions and timing as `llm_board.py`
+([`tools/cpu_baseline`](../../../tools/cpu_baseline/README.md)):
+
+| engine | one image (`llm_image`) | decode | prefill 256 tokens |
+|---|---:|---:|---:|
+| **FPGA** | **1.61 s** | **20.8 tokens/s** | **0.39 s** |
+| onnxruntime fp32 | 14.31 s (8.9× slower) | 8.6 tokens/s (2.4×) | 4.02 s (10.2×) |
+| onnxruntime int8 | 10.36 s (6.4×) | 18.5 tokens/s (1.1×) | 2.70 s (6.9×) |
+
+The vision encoder and the prefill are compute, and there the FPGA stays
+6–10× ahead.  Decode streams the weights, and the CPU's int8 comes close.
+int8 answers both images differently from the float model, from the first
+and the sixth token.  The FPGA's answers equal the float model's for their
+first 23 and 27 tokens.
+
 ## Memory and other models
 
 The SmolVLM pool is 495 MiB (`cma_mb` 550 with the image buffer).  Under
