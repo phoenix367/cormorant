@@ -2324,38 +2324,23 @@ it is comparable only where that answer was the same:
   22.2 / 54.2 s.  onnxruntime's session took 40.4 / 104.8 s in fp32 and
   11.2 / 27.8 s in int8.
 
-Reproduce (the board's chat server stopped, `demo/chat/deploy.py --stop`):
+Reproduce with `tools/cpu_baseline/cpu_baseline.py`
+([README](../../tools/cpu_baseline/README.md)).  It does the steps above:
+the pinned exports (SHA-256-checked), the last-row edit with its check, the
+int8 copies, the prompts as `llm_board.py` tokenizes them, onnxruntime 1.23.2
+in a venv on the board, the timing, and the speed-ups and greedy agreement
+against an `llm_board.py --out` JSON.  It removes what it put on the board.
+The FPGA runs go into directories of their own, so the chat server's
+libraries stay untouched:
 
 ```bash
-# host: the pinned exports, the last-row edit and the int8 copies
-# (onnxruntime's quantizer needs onnx and sympy: BERT_PLAN.md §4's $TMPDIR/ortq venv)
-HF=https://huggingface.co/HuggingFaceTB
-curl -L -o smollm2_135m.onnx $HF/SmolLM2-135M-Instruct/resolve/12fd25f77366fa6b3b4b768ec3050bf629380bac/onnx/model.onnx
-curl -L -o smollm2_360m.onnx $HF/SmolLM2-360M-Instruct/resolve/a10cc1512eabd3dde888204e902eca88bddb4951/onnx/model.onnx
-$TMPDIR/ortq/bin/python - <<'EOF'
-import numpy as np, onnx
-from onnx import helper, numpy_helper
-from onnxruntime.quantization import quantize_dynamic, QuantType
-for m in ("smollm2_135m", "smollm2_360m"):
-    g = (model := onnx.load(f"{m}.onnx")).graph
-    head = next(n for n in g.node if "logits" in n.output)                 # /lm_head/MatMul
-    g.initializer.extend(numpy_helper.from_array(np.array([v], np.int64), k) for k, v in
-                         (("last_s", -1), ("last_e", np.iinfo(np.int64).max), ("last_a", 1)))
-    g.node.insert(list(g.node).index(head),
-                  helper.make_node("Slice", [head.input[0], "last_s", "last_e", "last_a"], ["last_row"]))
-    head.input[0] = "last_row"
-    next(o for o in g.output if o.name == "logits").type.tensor_type.shape.dim[1].dim_value = 1
-    onnx.save(model, f"{m}_last.onnx")
-    quantize_dynamic(f"{m}_last.onnx", f"{m}_int8_last.onnx", weight_type=QuantType.QInt8)
-EOF
-# the prompts' ids as llm_board.py makes them (from demo/chat/scripts/)
-#   llm_project.with_second_turns(llm_project.tokenize_prompts(["factual", "summarise", "multi-turn"]), ["factual"])
-# board: onnxruntime in a venv beside the system Python; 360M fp32 peaks at 2.3 GB
-python3 -m venv /root/ort_bench/venv && /root/ort_bench/venv/bin/pip install onnxruntime==1.23.2 numpy
-#   per step: input_ids / position_ids int64 [1, n], attention_mask ones [1, past + n], and
-#   past_key_values.<i>.key / .value = the previous step's present.<i>.* (OrtValues, run_with_ort_values)
-# FPGA, same session: the R5 running (inference-scheduler/rpu_board.py --start-only), then per library
-inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py --rpu r5 --remote-dir DIR --weights-dir WDIR
-inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py --rpu r5 \
-    --project demo/chat/build/llm_project_smollm2_360m --remote-dir DIR --weights-dir WDIR_360M
+PY=inference-scheduler/.venv/bin/python
+# the R5 driving, as in the chat server (rpu_board.py --stop and rm the firmware file after)
+(cd inference-scheduler && .venv/bin/python rpu_board.py --start-only --firmware-name rpu_cmp.elf --bsp-dir BSP_DIR)
+$PY demo/chat/scripts/llm_board.py --rpu r5 --remote-dir /root/cmp_chat \
+    --weights-dir /root/cmp_smollm2_weights --out /tmp/fpga_135m.json
+$PY demo/chat/scripts/llm_board.py --rpu r5 --project demo/chat/build/llm_project_smollm2_360m \
+    --remote-dir /root/cmp_chat --weights-dir /root/cmp_smollm2_360m_weights --out /tmp/fpga_360m.json
+$PY tools/cpu_baseline/cpu_baseline.py smollm2 --model 135m --fpga /tmp/fpga_135m.json
+$PY tools/cpu_baseline/cpu_baseline.py smollm2 --model 360m --fpga /tmp/fpga_360m.json
 ```

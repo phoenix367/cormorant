@@ -538,7 +538,7 @@ is `run_demo.py` in the same session (the A53 driving the kernels).
 | onnxruntime fp32 | 4 | 3128.6 ms (3082.8–3172.8) | 11.7× | 88.0 / 90.3 | 50 / 50 | 674 MB RSS; session 3.8 s (30.6 s from a cold page cache) |
 | onnxruntime int8, dynamic | 4 | 2054.3 ms (2030.8–2113.1) | 7.7× | 84.0 / 86.5 | 44 / 50 | 204 MB RSS; session 2.0 s (8.6 s cold) |
 | onnxruntime fp32 | 1 | 10 855 ms (5 examples) | 40.7× | | 5 / 5 | |
-| onnxruntime int8, dynamic | 1 | 7 327 ms (5 examples) | 27.5× | | 4 / 5 | |
+| onnxruntime int8, dynamic | 1 | 7 327 ms (5 examples) | 27.4× | | 4 / 5 | |
 
 - onnxruntime fp32's logits equal the float reference to 1.0e-5, so its
   answers are the float model's.  The FPGA's Q8.8 logits move one span
@@ -554,20 +554,14 @@ is `run_demo.py` in the same session (the A53 driving the kernels).
   (RPU_PLAN.md §12), and the Cortex-R5 can drive them instead
   (RPU_PLAN.md §9).
 
-Reproduce (the board's chat server stopped, `demo/chat/deploy.py --stop`):
+Reproduce with `tools/cpu_baseline/cpu_baseline.py`
+([README](../../tools/cpu_baseline/README.md)).  It does the steps above:
+the zoo model (SHA-256-checked) and its int8 copy, onnxruntime 1.23.2 in a
+venv on the board, the timing and the scoring, and the speed-ups against the
+FPGA's `results.json`.  It removes what it put on the board.
 
 ```bash
-# host: the int8 copy (onnxruntime's quantizer needs onnx and sympy)
-python3 -m venv $TMPDIR/ortq && $TMPDIR/ortq/bin/pip install onnxruntime==1.23.2 onnx sympy
-$TMPDIR/ortq/bin/python -c "from onnxruntime.quantization import quantize_dynamic, QuantType; \
-    quantize_dynamic('inference-scheduler/bertsquad-12.onnx', 'bertsquad-12-int8-dyn.onnx', \
-                     weight_type=QuantType.QInt8)"
-# board: onnxruntime in a venv beside the system Python
-python3 -m venv /root/ort_bench/venv && /root/ort_bench/venv/bin/pip install onnxruntime==1.23.2 numpy
-# copy both models and inputs.bin there; per record of inputs.bin ([N, 3, 256] int16):
-#   feeds = {"input_ids:0", "segment_ids:0", "input_mask:0": the record's rows as int64 [1, 256],
-#            "unique_ids_raw_output___9:0": int64 [1]}
-#   sess.run(["unstack:0", "unstack:1"], feeds)          # start / end logits
-# FPGA, same session
-cd demo/bert_squad && ../../inference-scheduler/.venv/bin/python run_demo.py
+PY=inference-scheduler/.venv/bin/python
+(cd demo/bert_squad && ../../$PY run_demo.py)                         # the FPGA, results.json
+$PY tools/cpu_baseline/cpu_baseline.py bert --stop-server              # the CPU, the table
 ```
