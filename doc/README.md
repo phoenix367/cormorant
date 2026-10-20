@@ -38,7 +38,7 @@ are in [`demo/chat/doc/`](../demo/chat/README.md#documentation).
 | profile a model on the board | [PROFILER](scheduler/PROFILER.md) |
 | plan tactics and the issue order from measured performance (`--plan`), or calibrate a new bitstream | [INFERENCE_SCHEDULER "Planning"](scheduler/INFERENCE_SCHEDULER.md#planning---plan), [TACTICS_PLAN §9](plans/TACTICS_PLAN.md); `perf_calibrate.py` and its data: [`perf_models/`](../inference-scheduler/perf_models/README.md) |
 | see the latest board results | the project [README](../README.md#results-on-the-board) |
-| compare the FPGA with the board's CPU (onnxruntime on the four A53s: BERT, SmolLM2, SmolVLM) | [`tools/cpu_baseline`](../tools/cpu_baseline/README.md); the results: [BERT_PLAN §4](plans/BERT_PLAN.md), [CHAT_PLAN §26](plans/CHAT_PLAN.md) |
+| compare the FPGA with the board's CPU (onnxruntime on the four A53s: BERT, SmolLM2, SmolVLM, Piper, Moonshine) | [`tools/cpu_baseline`](../tools/cpu_baseline/README.md); the results: [BERT_PLAN §4](plans/BERT_PLAN.md), [CHAT_PLAN §26](plans/CHAT_PLAN.md), [TTS_PLAN §8](plans/TTS_PLAN.md), [ASR_PLAN §9](plans/ASR_PLAN.md) |
 | run the chat server on the board, or use it from a client | the chat server's [README](../demo/chat/README.md), [DEPLOY](../demo/chat/doc/DEPLOY.md) and [CLIENTS](../demo/chat/doc/CLIENTS.md) |
 | talk to the board ("Hello Miranda") | [`demo/miranda`](../demo/miranda/README.md) |
 | fix a board that stops responding | [CHAT_PLAN §18](plans/CHAT_PLAN.md) and [`board/kv260/`](../board/kv260/) |

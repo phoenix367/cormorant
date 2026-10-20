@@ -4,8 +4,9 @@
 
 """
 cpu_baseline.py — the CPU baseline of the FPGA results: BERT-SQuAD,
-SmolLM2 and SmolVLM with onnxruntime on the KV260's four Cortex-A53 cores
-(doc/plans/BERT_PLAN.md §4, doc/plans/CHAT_PLAN.md §26).
+SmolLM2, SmolVLM, Piper and Moonshine with onnxruntime on the KV260's four
+Cortex-A53 cores (doc/plans/BERT_PLAN.md §4, doc/plans/CHAT_PLAN.md §26,
+doc/plans/TTS_PLAN.md §8, doc/plans/ASR_PLAN.md §9).
 
   models  bert: bertsquad-12.onnx of the ONNX model zoo (the demo's assets,
           else downloaded); smollm2: the export onnx/model.onnx at the revision
@@ -15,10 +16,14 @@ SmolLM2 and SmolVLM with onnxruntime on the KV260's four Cortex-A53 cores
           logits equal the export's last row; smolvlm: its three exports
           (vision encoder + connector, token embedding, decoder; the revision
           demo/chat/scripts/vlm_study_inputs.json pins), the decoder edited
-          likewise.  Every source is SHA-256-checked
+          likewise; piper: the voice's own ONNX (demo/tts/assets, the
+          revision piper_study.py pins), fp32 only; moonshine: the
+          onnx-community export (encoder, decoder, decoder with past) whose
+          weights equal the checkpoint asr_study_inputs.json pins.  Every
+          source is SHA-256-checked
           (PINS); the int8 copies are onnxruntime's dynamic quantisation.  On
           the host in build/venv (onnxruntime 1.23.2 = the board's, onnx,
-          sympy), the models in build/ (--work: ~6 GB with both SmolLM2s and SmolVLM).
+          sympy), the models in build/ (--work: ~7 GB with every model).
   board   onnxruntime 1.23.2 in a venv in --remote-dir (beside the system
           Python the chat server uses; pip needs PyPI); the models, the
           inputs and board_bench.py uploaded where their SHA-256 differs; each
@@ -41,6 +46,8 @@ The board lock is held for the board part (src/remote/lock.py).
 usage:  inference-scheduler/.venv/bin/python tools/cpu_baseline/cpu_baseline.py bert [--fpga RESULTS_JSON]
         ... cpu_baseline.py smollm2 --model 135m|360m [--fpga LLM_BOARD_JSON]
         ... cpu_baseline.py smolvlm [--fpga LLM_BOARD_JSON] [--images 39769,1268]
+        ... cpu_baseline.py piper [--fpga TTS_BOARD_JSON] [--utts eval00,eval10]
+        ... cpu_baseline.py moonshine --model base [--fpga ASR_BOARD_JSON] [--utts all]
         options: [--config demo/bert_squad/bert_squad_config.json] [--engines fp32,int8]
                  [--threads 4,1] [--stop-server] [--keep] [--remote-dir DIR] [--prepare-only]
                  [--out JSON] [--work DIR] [--board-lock FILE]
@@ -93,6 +100,17 @@ PINS = {   # the measured files (CHAT_PLAN §26: the revisions of llm_models.jso
                                  "sha256": "5ae6a66fdf47680433aa6bcc512ae8f0b98c2db01bea055fc76ee37bb0389b78"}}},
 }
 VLM = "smolvlm-256m-instruct"
+PINS["piper"] = {"revision": "c10ece1aade47bb51c153c893d14e5bf8e5b7117", "size": 63201294,
+                 "sha256": "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f"}
+PINS["moonshine-base"] = {   # its weights equal UsefulSensors/moonshine-base @ "checkpoint", tensor for tensor
+    "repo": "onnx-community/moonshine-base-ONNX", "revision": "b1e9b6aae3c3c7298f10c3798393fdf38e8fbbad",
+    "checkpoint": "7a73d8d55ac0ba2ef3ae761593f6784b51f96dcf", "parts": {
+        "encoder_model": {"size": 80818781,
+                          "sha256": "153e128e7abd64a74ee47f2c3f585c3171c4d46cbb368b032827934c4e01e779"},
+        "decoder_model": {"size": 165786949,
+                          "sha256": "d957c6418d65baee2842373c6842846c3ed6c9d9fc0ef48d790b110665e18063"},
+        "decoder_with_past_model": {"size": 154634914,
+                                    "sha256": "2d8740fb19673870125ed6f15370dd316c8c43d266e0846a6f456b354cebf169"}}}
 
 
 def log(msg: str = "") -> None:
@@ -247,6 +265,80 @@ def vlm_inputs(a) -> tuple:
     return p, im
 
 
+def piper_models(a) -> dict:
+    """The voice's own ONNX — how Piper itself synthesizes.  fp32 only: the graph is
+    convolutions, and onnxruntime's CPU ConvInteger takes no int8 weights."""
+    if a.engines != "fp32":
+        sys.exit("piper: fp32 only (its convolutions have no int8 kernel in onnxruntime's CPU provider; "
+                 "Piper ships and runs fp32)")
+    pin = PINS["piper"]
+    voice = REPO / "demo" / "tts" / "assets" / "piper-lessac-medium" / "en_US-lessac-medium.onnx"
+    url = (f"https://huggingface.co/rhasspy/piper-voices/resolve/{pin['revision']}/en/en_US/lessac/medium/"
+           "en_US-lessac-medium.onnx")
+    src = pinned(pin, [voice], url, BUILD / "en_US-lessac-medium.onnx")
+    log(f"  fp32: {src}")
+    return {"fp32": src}
+
+
+def piper_inputs(a) -> Path:
+    """The sentences' phoneme ids (texts.json, as tts_board.py's) and the voice's scales."""
+    d = REPO / "demo" / "tts" / "assets" / "piper-lessac-medium"
+    texts = json.loads((d / "texts.json").read_text())
+    voice = json.loads((d / "en_US-lessac-medium.onnx.json").read_text())
+    inf = voice["inference"]
+    p = BUILD / "piper_utts.json"
+    p.write_text(json.dumps({"scales": [inf["noise_scale"], inf["length_scale"], inf["noise_w"]],
+                             "sample_rate": voice["audio"]["sample_rate"],
+                             "utts": [{"name": n, "ids": texts[n]["ids"]} for n in a.utts.split(",")]}))
+    return p
+
+
+def moonshine_models(a) -> dict:
+    """{engine: {encoder, decoder, decoder_with_past}}: the export's plain graphs (the merged
+    decoder hides its MatMuls in If branches, which the quantizer does not enter)."""
+    if a.model != "base":
+        sys.exit("moonshine: base only — the public tiny export (onnx-community/moonshine-tiny-ONNX) holds "
+                 "another checkpoint than the one asr_study_inputs.json pins (its weights differ by up to 0.05)")
+    pin = PINS["moonshine-base"]
+    want = json.loads((REPO / "demo" / "asr" / "scripts" / "asr_study_inputs.json").read_text())
+    want = want["models"]["moonshine-base"]["revision"]
+    if want != pin["checkpoint"]:
+        sys.exit(f"asr_study_inputs.json pins moonshine-base at {want}, the export's weights are {pin['checkpoint']}'s")
+    src = {k: pinned(p, [], f"https://huggingface.co/{pin['repo']}/resolve/{pin['revision']}/onnx/{k}.onnx",
+                     BUILD / f"moonshine-base-{k}.onnx") for k, p in pin["parts"].items()}
+    fp32 = {"encoder": src["encoder_model"], "decoder": src["decoder_model"],
+            "decoder_with_past": src["decoder_with_past_model"]}
+    models = {"fp32": fp32,
+              "int8": {k: derived(v, v.with_name(v.stem + "-int8.onnx"), "int8") for k, v in fp32.items()}}
+    for e, parts in models.items():
+        log(f"  {e}: " + ", ".join(f"{k} {v.name}" for k, v in parts.items()))
+    return models
+
+
+def moonshine_inputs(a) -> tuple:
+    """(utts.bin, parts.json): asr_board.py's utterances, each split as the FPGA
+    library splits it (moonshine_q.chunks), and the greedy limits."""
+    sys.path.insert(0, str(REPO / "demo" / "asr" / "scripts"))
+    import asr_board
+    import moonshine_np as mn
+    import moonshine_q as mq
+    utts = asr_board.select(a.utts)
+    cfg = json.loads((REPO / "demo" / "asr" / "assets" / "moonshine-base" / "config.json").read_text())
+    u = BUILD / "moonshine_utts.bin"
+    with open(u, "wb") as f:
+        f.write(np.array([len(utts)], "<i4").tobytes())
+        for _, _, pcm in utts:
+            f.write(np.array([len(pcm)], "<i4").tobytes() + np.asarray(pcm, "<i2").tobytes())
+    p = BUILD / "moonshine_parts.json"
+    p.write_text(json.dumps({"start": cfg["decoder_start_token_id"], "eos": cfg["eos_token_id"],
+                             "max_positions": cfg["max_position_embeddings"], "max_tokens": mn.max_tokens(10 ** 12),
+                             "tokens_per_second": mn.TOKENS_PER_SECOND, "sample_rate": mn.SR,
+                             "utts": [{"uid": uid, "parts": [[int(x), int(n)] for x, n in mq.chunks(pcm)]}
+                                      for uid, _, pcm in utts]}))
+    log(f"  {len(utts)} utterances, {sum(len(x) for _, _, x in utts) / 16000:.0f} s of audio")
+    return u, p
+
+
 # ── board ────────────────────────────────────────────────────────────────────
 
 def progress(line: str) -> None:
@@ -337,10 +429,13 @@ def runs_for(a, kind: str, inputs: list) -> list:
         for e in a.engines.split(","):
             tag = f"{a.model_name}-{e}-t{t}"
             out = f"{tag}.{'npz' if kind == 'bert' else 'json'}"
-            models = [f"{e}-{p}.onnx" for p in ("vision", "embed", "decoder")] if kind == "vlm" else [f"{e}.onnx"]
+            parts = {"vlm": ("vision", "embed", "decoder"), "asr": ("encoder", "decoder", "decoder_with_past")}
+            models = [f"{e}-{p}.onnx" for p in parts[kind]] if kind in parts else [f"{e}.onnx"]
             args = [kind, *models, *inputs, out, "--threads", str(t)]
             if kind == "bert":
                 args += ["--n", str(a.n if t_i == 0 else a.n_rest)]
+            elif kind in ("tts", "asr"):
+                args += ["-R", str(a.reps)]
             else:
                 args += ["-k", str(a.k), "-P", a.prefill_lens, "-R", str(a.reps)]
             runs.append({"tag": tag, "engine": e, "threads": t, "out": out, "args": args})
@@ -451,6 +546,86 @@ def llm_report(a, results: list) -> dict:
             "onnxruntime": [{k: v for k, v in r.items() if k != "toks"} for r in rows], "greedy_agreement": agree}
 
 
+def piper_report(a, results: list) -> dict:
+    rows = [dict(r, utts=json.loads(Path(r["output"]).read_text())["utts"]) for r in results]
+    fpga = {}
+    if a.fpga:
+        sys.path.insert(0, str(REPO / "demo" / "tts" / "scripts"))
+        import tts_board
+        f = json.loads(Path(a.fpga).read_text())
+        b = f["bench"]
+        order = list(tts_board.encoder_cases(str(REPO / "demo" / "tts" / "assets" / "piper-lessac-medium")))
+        for name, u in zip(f["utts"], b["utts"], strict=True):
+            i = order.index(name) if name in order else None
+            enc = b["encs"][i]["best_ms"] if i is not None else 0.0
+            dur = b.get("durs", [{}] * len(order))[i].get("best_ms", 0.0) if i is not None else 0.0
+            fpga[name] = {"encode_ms": enc, "duration_ms": dur, "chunks_ms": u["best_ms"], "audio_s": u["audio_s"],
+                          "total_ms": enc + dur + u["best_ms"], "rtf": (enc + dur + u["best_ms"]) / 1e3 / u["audio_s"]}
+    log("\npiper-lessac-medium: per sentence (best of the runs), the real-time factor = compute s / audio s")
+    log(f"  {'sentence':10s} {'engine':22s} {'threads':>7s} {'ms':>8s} {'audio s':>8s} {'RTF':>7s}  FPGA speed-up")
+    names = [u["name"] for u in rows[0]["utts"]]
+    for n in names:
+        if n in fpga:
+            g = fpga[n]
+            log(f"  {n:10s} {'FPGA':22s} {'-':>7s} {g['total_ms']:8.0f} {g['audio_s']:8.2f} {g['rtf']:7.3f}  "
+                f"(encoder {g['encode_ms']:.0f} + duration {g['duration_ms']:.1f} + chunks {g['chunks_ms']:.0f} ms)")
+        for r in rows:
+            u = next(x for x in r["utts"] if x["name"] == n)
+            sp = f"{u['rtf'] / fpga[n]['rtf']:.1f}x" if n in fpga else "-"
+            log(f"  {n:10s} {'onnxruntime ' + r['engine']:22s} {r['threads']:7d} {u['best_ms']:8.0f} {u['audio_s']:8.2f} "
+                f"{u['rtf']:7.3f}  {sp}")
+    return {"model": "piper-lessac-medium", "fpga": fpga or None, "onnxruntime": rows}
+
+
+def wer(ids_json: Path) -> dict:
+    """asr_study.py score on {"ids": {uid: ids}}: the WER and the transcripts equal to the float model's."""
+    import re
+    out = subprocess.run([str(REPO / ".venv-export" / "bin" / "python"), str(REPO / "demo" / "asr" / "scripts" /
+                          "asr_study.py"), "score", "--model", "moonshine-base", "--ids", str(ids_json)],
+                         capture_output=True, text=True).stdout
+    m = re.search(r"(\d+) utterances, WER ([\d.]+) %", out)
+    f = re.search(r"study float\s+WER [\d.]+ %, transcripts equal to the board's: (\d+)/(\d+)", out)
+    return {"utterances": int(m[1]) if m else None, "wer": float(m[2]) if m else None,
+            "equal_to_float": int(f[1]) if f else None}
+
+
+def moonshine_report(a, results: list) -> dict:
+    import statistics
+    rows = []
+    for r in results:
+        d = json.loads(Path(r["output"]).read_text())
+        ids = {u["uid"]: u["ids"] for u in d["utts"]}
+        p = Path(r["output"]).with_suffix(".ids.json")
+        p.write_text(json.dumps({"ids": ids}))
+        steps = [u["decode_ms"] / u["steps"] for u in d["utts"] if u["steps"]]
+        rows.append(dict(r, summary=d["summary"], ids=ids, score=wer(p),
+                         step_ms=statistics.median(steps) if steps else None))
+    fpga = None
+    if a.fpga:
+        f = json.loads(Path(a.fpga).read_text())
+        sm = f["bench"]["summary"]
+        steps = [u["decode_ms"] / u["steps"] for u in f["bench"]["utts"] if u.get("steps")]
+        fpga = {"rtf": sm["rtf"], "total_ms": sm["total_ms"], "audio_s": sm.get("audio_s"),
+                "step_ms": statistics.median(steps) if steps else None, "ids": f["ids"], "score": wer(Path(a.fpga))}
+    ref = next((r for r in rows if r["engine"] == "fp32"), None)
+    n = len(rows[0]["ids"])
+    log(f"\nmoonshine-base: {n} utterances (best of {a.reps} runs each); RTF = compute s / audio s")
+    log(f"  {'engine':22s} {'threads':>7s} {'total s':>8s} {'RTF':>7s} {'decode step':>11s} {'WER':>7s} "
+        f"{'= float':>8s} {'= fp32 ids':>10s}  FPGA speed-up")
+    def line(label, thr, total_ms, rtf, step, score, ids, sp):
+        same = f"{sum(ids[u] == ref['ids'][u] for u in ref['ids'])}/{n}" if ref else "-"
+        log(f"  {label:22s} {thr:>7s} {total_ms / 1e3:8.1f} {rtf:7.3f} {step:9.1f}ms {score['wer']:6.2f}% "
+            f"{score['equal_to_float']:>4}/{n:<3} {same:>10s}  {sp}")
+    if fpga:
+        line("FPGA", "-", fpga["total_ms"], fpga["rtf"], fpga["step_ms"], fpga["score"], fpga["ids"], "-")
+    for r in rows:
+        line(f"onnxruntime {r['engine']}", str(r["threads"]), r["summary"]["total_ms"], r["summary"]["rtf"], r["step_ms"],
+             r["score"], r["ids"], f"{r['summary']['rtf'] / fpga['rtf']:.1f}x" if fpga else "-")
+    log("  (the FPGA's encoder entry also writes the cross-attention keys / values; here the decoder's first step does)")
+    return {"model": "moonshine-base", "fpga": {k: v for k, v in (fpga or {}).items() if k != "ids"} or None,
+            "onnxruntime": [{k: v for k, v in r.items() if k != "ids"} for r in rows]}
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main(argv=None) -> int:
@@ -472,14 +647,27 @@ def main(argv=None) -> int:
     pv.add_argument("--fpga", default=None, help="the FPGA's results: an llm_board.py --out JSON")
     pv.add_argument("--threads", default="4", help="intra-op thread counts (default 4)")
     pv.add_argument("--images", default="39769,1268", help="COCO ids, one image prompt each (llm_board.py's default)")
+    pp = sub.add_parser("piper", help="the Piper voice (TTS) on tts_board.py's sentences")
+    pp.add_argument("--fpga", default=None, help="the FPGA's results: a tts_board.py --out JSON")
+    pp.add_argument("--threads", default="4", help="intra-op thread counts (default 4)")
+    pp.add_argument("--utts", default="eval00,eval10", help="texts.json sentences (tts_board.py's default)")
+    pp.add_argument("--reps", type=int, default=3, help="runs per sentence, best taken (default 3)")
+    pp.add_argument("--engines", default="fp32", help="fp32 (the only one: see piper_models)")
+    pm = sub.add_parser("moonshine", help="Moonshine (ASR) on asr_board.py's LibriSpeech utterances")
+    pm.add_argument("--model", choices=("base", "tiny"), default="base")
+    pm.add_argument("--fpga", default=None, help="the FPGA's results: an asr_board.py --out JSON")
+    pm.add_argument("--threads", default="4", help="intra-op thread counts (default 4)")
+    pm.add_argument("--utts", default="all", help="all (200), auto, N or utterance ids (asr_board.py's --utts)")
+    pm.add_argument("--reps", type=int, default=2, help="runs per utterance, best taken (default 2, as asr_board.py)")
     for p in (pl, pv):
         p.add_argument("-k", type=int, default=32, help="greedy decode steps per prompt (default 32)")
         p.add_argument("--prefill-lens", default="16,64,256")
         p.add_argument("--reps", type=int, default=3, help="prefill repetitions, best taken (default 3)")
-    for p in (pb, pl, pv):
+    for p in (pb, pl, pv, pm):
+        p.add_argument("--engines", default="fp32,int8")
+    for p in (pb, pl, pv, pp, pm):
         p.add_argument("--config", default=str(BERT_CONFIG),
                        help="the board (ssh, board_lock): the BERT demo's config, as llm_board.py")
-        p.add_argument("--engines", default="fp32,int8")
         p.add_argument("--stop-server", action="store_true", help="stop the chat server for the run, restart it after")
         p.add_argument("--keep", action="store_true", help="keep --remote-dir (the venv, the models) on the board")
         p.add_argument("--remote-dir", default=None, help="default /root/ort_bench (~/ort_bench for another user)")
@@ -505,22 +693,30 @@ def main(argv=None) -> int:
         a.model_name = llm_name(a.model)
         models = llm_models(a.model)
         inputs = [llm_prompts(a)]
-    else:
+    elif a.cmd == "smolvlm":
         a.model_name = VLM
         models = vlm_models()
         inputs = list(vlm_inputs(a))
+    elif a.cmd == "piper":
+        a.model_name = "piper-lessac-medium"
+        models = piper_models(a)
+        inputs = [piper_inputs(a)]
+    else:
+        a.model_name = f"moonshine-{a.model}"
+        models = moonshine_models(a)
+        inputs = list(moonshine_inputs(a))
     if a.prepare_only:
         return 0
-    kind = {"bert": "bert", "smollm2": "llm", "smolvlm": "vlm"}[a.cmd]
+    kind = {"bert": "bert", "smollm2": "llm", "smolvlm": "vlm", "piper": "tts", "moonshine": "asr"}[a.cmd]
     runs = runs_for(a, kind, [p.name for p in inputs])
     uploads = {"board_bench.py": TOOL / "board_bench.py", **{p.name: p for p in inputs}}
     for e in a.engines.split(","):
-        if kind == "vlm":
+        if kind in ("vlm", "asr"):
             uploads.update({f"{e}-{part}.onnx": m for part, m in models[e].items()})
         else:
             uploads[f"{e}.onnx"] = models[e]
     results = on_board(cfg, a, uploads, runs)
-    rep = bert_report(a, results) if a.cmd == "bert" else llm_report(a, results)
+    rep = {"bert": bert_report, "piper": piper_report, "moonshine": moonshine_report}.get(a.cmd, llm_report)(a, results)
     rep.update(onnxruntime_version=ORT, date=time.strftime("%Y-%m-%d"))
     out = Path(a.out) if a.out else BUILD / f"{a.model_name}_results.json"
     out.write_text(json.dumps(rep, indent=1))

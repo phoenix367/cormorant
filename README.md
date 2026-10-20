@@ -393,7 +393,7 @@ and every document with a one-line summary:
 | [`doc/plans/`](doc/plans/) | project plans and their measured results |
 | [`demo/`](demo/README.md) | one README per demo |
 | [`tools/facts/`](tools/facts/README.md) | the fact registry ([`facts.yaml`](facts.yaml)): facts that code and docs repeat, checked by `facts.py` and a pre-commit hook |
-| [`tools/cpu_baseline/`](tools/cpu_baseline/README.md) | the FPGA's BERT, SmolLM2 and SmolVLM results against onnxruntime on the board's four A53 cores (BERT_PLAN §4, CHAT_PLAN §26) |
+| [`tools/cpu_baseline/`](tools/cpu_baseline/README.md) | the FPGA's BERT, SmolLM2, SmolVLM, Piper and Moonshine results against onnxruntime on the board's four A53 cores (BERT_PLAN §4, CHAT_PLAN §26, TTS_PLAN §8, ASR_PLAN §9) |
 
 ---
 

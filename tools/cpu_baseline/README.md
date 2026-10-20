@@ -4,7 +4,9 @@
 the KV260's four Cortex-A53 cores. It mirrors the FPGA's measurements: the
 same inputs, prompts and timing, on the same board. The results are in
 [BERT_PLAN §4](../../doc/plans/BERT_PLAN.md) (BERT-SQuAD) and
-[CHAT_PLAN §26](../../doc/plans/CHAT_PLAN.md) (SmolLM2-135M / 360M, SmolVLM-256M).
+[CHAT_PLAN §26](../../doc/plans/CHAT_PLAN.md) (SmolLM2-135M / 360M, SmolVLM-256M),
+[TTS_PLAN §8](../../doc/plans/TTS_PLAN.md) (Piper) and [ASR_PLAN §9](../../doc/plans/ASR_PLAN.md)
+(Moonshine-base).
 
 | | BERT-SQuAD | SmolLM2-135M / 360M | SmolVLM-256M |
 |---|---|---|---|
@@ -14,6 +16,15 @@ same inputs, prompts and timing, on the same board. The results are in
 | timing | a warm-up run, then each example's run; 4 threads × 50 examples, 1 thread × 5 | `llm_bench.c`'s protocol: the `<\|im_start\|>` sink cached; each prompt prefilled from position 1, then 32 greedy steps, timed one by one; prefill of 16 / 64 / 256 tokens, best of 3 | the same, each prompt after its image (`llm_image`: the vision encoder, timed); the embedding lookup inside the timed prefill and decode steps |
 | scored | EM / F1 against the gold answers (`deploy_and_run.py`'s scoring), spans against fp32's | greedy tokens against fp32's | greedy tokens against fp32's |
 | FPGA side | `demo/bert_squad/run_demo.py` → `build/results.json` (read by default) | `demo/chat/scripts/llm_board.py --out JSON` (`--fpga JSON`) | `llm_board.py --project demo/chat/build/llm_project_smolvlm_256m --out JSON` (`--fpga JSON`) |
+
+| | Piper (lessac-medium) | Moonshine-base |
+|---|---|---|
+| CPU model | the voice's own ONNX (`en_US-lessac-medium.onnx`, the demo's asset at the revision `piper_study.py` pins) — how Piper itself synthesizes | `onnx-community/moonshine-base-ONNX`'s encoder, decoder and decoder-with-past (fp32), whose weights equal the checkpoint `asr_study_inputs.json` pins tensor for tensor |
+| int8 copy | none: the voice is convolutions, and onnxruntime's CPU `ConvInteger` takes no int8 weights; Piper ships fp32 | `quantize_dynamic` of the three (the merged decoder's `If` branches are not quantized, hence the plain graphs); the tied head folded first |
+| inputs | `tts_board.py`'s sentences (eval00, eval10): `texts.json`'s phoneme ids, the voice's scales | `asr_board.py`'s 200 LibriSpeech utterances, each split where the FPGA library splits it (`moonshine_q.chunks`) |
+| timing | a warm-up, then 3 runs per sentence, each timed with its audio length; the real-time factor | the encoder, then greedy steps to EOS or the part's limit (`moonshine_q.transcribe`), best of 2 per utterance; the real-time factor |
+| scored | — (the duration noise is sampled inside the model: other audio than the FPGA's) | WER (`asr_study.py score`), transcripts equal to the float model's and to fp32's |
+| FPGA side | `demo/tts/scripts/tts_board.py --out JSON` (`--fpga JSON`): its encoder + duration predictor + chunk times per sentence | `demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project --out JSON` (`--fpga JSON`) |
 
 Every source model's SHA-256 is pinned in `cpu_baseline.py` (`PINS`).
 
@@ -45,6 +56,14 @@ $PY tools/cpu_baseline/cpu_baseline.py smollm2 --model 360m --fpga /tmp/fpga_360
 $PY demo/chat/scripts/llm_board.py --rpu r5 --project demo/chat/build/llm_project_smolvlm_256m \
     --remote-dir /root/cmp_chat --weights-dir /root/cmp_smolvlm_weights --out /tmp/fpga_vlm.json
 $PY tools/cpu_baseline/cpu_baseline.py smolvlm --fpga /tmp/fpga_vlm.json
+
+# Piper and Moonshine-base, likewise (tts_board.py / asr_board.py install into --remote-dir too)
+$PY demo/tts/scripts/tts_board.py --remote-dir /root/cmp_chat --weights-dir /root/cmp_piper_weights \
+    --out /tmp/fpga_tts.json
+$PY tools/cpu_baseline/cpu_baseline.py piper --fpga /tmp/fpga_tts.json
+$PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project --utts all \
+    --remote-dir /root/cmp_chat --weights-dir /root/cmp_moonshine_base_weights --out /tmp/fpga_asr.json
+$PY tools/cpu_baseline/cpu_baseline.py moonshine --fpga /tmp/fpga_asr.json
 ```
 
 `--rpu r5` has the Cortex-R5 drive the kernels, as the chat server does: it
@@ -53,7 +72,9 @@ needs the firmware running (`inference-scheduler/rpu_board.py --start-only
 Without the firmware, leave `--rpu` out and the A53 drives them.  Afterwards
 remove what `llm_board.py` installed (`ssh root@BOARD 'rm -rf /root/cmp_chat
 /root/cmp_smollm2_weights /root/cmp_smollm2_360m_weights /root/cmp_smolvlm_weights
-/lib/firmware/rpu_cmp.elf'`).
+/root/cmp_piper_weights /root/cmp_moonshine_base_weights /lib/firmware/rpu_cmp.elf'`).
+`tts_board.py` and `asr_board.py` have no `--rpu`: with the firmware running
+their libraries follow their policy, as in the chat server.
 
 Each run prints a table and writes `tools/cpu_baseline/build/<model>_results.json`
 (`--out`):
@@ -77,8 +98,10 @@ smollm2-135m-instruct: decode ms / token (mean of 128 steps), prefill best of 3
 | `--keep` | keep `--remote-dir` (the venv and the models: a re-run uploads nothing) |
 | `--remote-dir DIR` | the board directory (default `/root/ort_bench`) |
 | `--prepare-only` | only the host part: the models in `build/` |
-| `--work DIR` | the host's work directory (default `tools/cpu_baseline/build`): the venv, the models (~6 GB with both SmolLM2s and SmolVLM), the results |
+| `--work DIR` | the host's work directory (default `tools/cpu_baseline/build`): the venv, the models (~7 GB with every model), the results |
 | `--images 39769,1268` | SmolVLM: the COCO images, one prompt each (`llm_board.py --images`) |
+| `--utts` | Piper: `texts.json` sentences (default `eval00,eval10`); Moonshine: `all` (200), `auto`, N or ids (`asr_board.py --utts`) |
+| `--reps` | runs per sentence / utterance / prefill, best taken (Piper 3, Moonshine 2, SmolLM2 / SmolVLM prefill 3) |
 | `--config CFG` | the board config (default the BERT demo's) |
 
 ## What it does

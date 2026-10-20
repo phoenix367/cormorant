@@ -53,6 +53,11 @@ flowchart TB
 - **Through the chat server:** first audio after 1.0–1.5 s, RTF 0.58–0.79
   end to end.
 - **Memory:** 54 MiB of CMA.
+- **Against the CPU** (2026-10-19, TTS_PLAN §8): the voice's own ONNX under
+  onnxruntime on the board's four A53 cores (how Piper itself synthesizes)
+  runs at a real-time factor of 0.56.  The library runs at 0.17 / 0.14
+  (2.15 s / 6.88 s sentences, end to end: encoder, duration predictor,
+  chunks), 3.3–4.1× faster.
 - **Quality:** the int16 datapath is within 0.19 dB log-mel of float (§3);
   with the int16 encoder, 0.37 dB and 0.35% of the durations changed by
   one frame (§6); with its softmax on VectorOPKernel 0.39 dB and 0.26%

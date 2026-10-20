@@ -48,6 +48,10 @@ flowchart TB
   | per utterance (mean of 200, 8.4 s of audio), real-time factor | 626 ms, 0.074 | 1098 ms, 0.131 |
   | `asr_open`, weights in the page cache | 0.22 s | 0.40 s |
 
+- **Against the CPU** (2026-10-19, ASR_PLAN §9): onnxruntime on the board's
+  four A53 cores, on the same 200 utterances.  Moonshine-base's real-time
+  factor is 0.358 in fp32 (WER 3.02 %, the float model's) and 0.258 in int8
+  (2.98 %).  The board's is 0.130 (2.93 %), 2.8× / 2.0× faster.
 - **Through the chat server** (base, the Cortex-R5 driving the encoder): a
   10 s recording is transcribed in 1.3 s.
 - **Memory:** base 185.8 MiB of CMA (the server reserves 200 MB), tiny

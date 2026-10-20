@@ -923,3 +923,72 @@ $PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_projec
                                                                                # recomputed: its cache key changed)
 $PY demo/chat/deploy.py && $PY demo/miranda/deploy.py
 ```
+
+## 9. CPU baseline: onnxruntime on the A53 (2026-10-19)
+
+**On the board, the FPGA library transcribes with Moonshine-base 2.8×
+faster than onnxruntime fp32 on the four Cortex-A53 cores, and 2.0× faster
+than its int8 dynamic quantization.  Over the 200 LibriSpeech utterances
+(28 min of audio) its real-time factor is 0.130, against 0.358 / 0.258,
+at a WER of 2.93 % against 3.02 % / 2.98 %.**  The method is BERT_PLAN.md
+§4's and CHAT_PLAN.md §26's (`tools/cpu_baseline/cpu_baseline.py
+moonshine`).
+
+- **One session** on the KV260 (production bitstream `04259a7af917`), with
+  the chat server and Miranda stopped.  The R5 firmware runs, so the
+  library follows its policy, as in the chat server.
+- **CPU model:** `onnx-community/moonshine-base-ONNX` @ `b1e9b6a`.  Every
+  one of its weight tensors equals one of the pinned checkpoint's
+  (`UsefulSensors/moonshine-base` @ `7a73d8d`), as stored or transposed.
+  - It runs as the plain graphs: the encoder, the decoder (the first step,
+    which computes the cross-attention keys and values) and the decoder
+    with past.  The merged decoder is not used, because the quantizer does
+    not enter its `If` branches.
+  - fp32, and an int8 copy by `quantize_dynamic`: the convolution stem
+    stays fp32 (Conv excluded), and the tied head is folded first, as for
+    SmolLM2.  onnxruntime 1.23.2, 4 intra-op threads.
+  - The public tiny export holds another checkpoint than the pinned
+    moonshine-tiny (its weights differ by up to 0.05), so tiny is not
+    compared.
+- **Protocol:** `asr_board.py`'s 200 utterances.  Each is split where the
+  FPGA library splits it (`moonshine_q.chunks`: 4 utterances in two
+  parts).  The encoder runs, then greedy steps from the start token to EOS
+  or the part's limit (`moonshine_q.transcribe`).  The best of 2 per
+  utterance is taken, as `asr_board.py` does.  The WER is from
+  `asr_study.py score`.
+- **FPGA:** `asr_board.py`, the best of 2.  All 200 utterances are
+  bit-exact with the specification.
+
+| engine | compute for 1682 s of audio | real-time factor | encode / decode | a decode step (median) | WER | transcripts equal to the float model's | FPGA speed-up |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **FPGA, int16** | **218.2 s** | **0.130** | 44.0 / 174.2 s | 24.4 ms | **2.93 %** | 180 / 200 | – |
+| onnxruntime fp32 | 602.0 s | 0.358 | 289.2 / 312.7 s | 51.0 ms | 3.02 % | 200 / 200 | 2.8× |
+| onnxruntime int8, dynamic | 433.2 s | 0.258 | 240.5 / 192.7 s | 31.2 ms | 2.98 % | 179 / 200 | 2.0× |
+
+- **The encoder** is where the FPGA leads most: 44 s against 289 / 241 s
+  (6.6× / 5.5×).  It is convolutions and attention over up to 1024
+  frames.  int8 leaves the convolution stem in fp32 (onnxruntime's CPU
+  `ConvInteger` has no int8-weight kernel), so its encoder stays close to
+  fp32's.
+- **Decode** streams the decoder's weights per token: 24.4 ms per step on
+  the FPGA against 51.0 (fp32) / 31.2 ms (int8).  The split is not quite
+  like for like.  The cross-attention keys and values are computed in the
+  CPU's first decoder step, while on the FPGA the encoder entry writes
+  them.  The totals do compare.
+- **Quality:** onnxruntime fp32 transcribes exactly like the float model,
+  all 200 transcripts equal, WER 3.02 %.  The FPGA's int16 policy changes
+  20 transcripts, for a slightly lower WER (2.93 %).  int8 changes 21, for
+  2.98 %.
+- **Memory and start-up:** onnxruntime peaks at 826 / 441 MB RSS (fp32 /
+  int8), and its sessions open in 31.8 / 14.2 s from a cold page cache.
+  The FPGA library takes 183 MB of CMA, and `asr_open` 0.38 s.
+
+Reproduce with `tools/cpu_baseline`
+([README](../../tools/cpu_baseline/README.md)):
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+$PY demo/asr/scripts/asr_board.py --project demo/asr/build/moonshine-base_project --utts all \
+    --remote-dir /root/cmp_chat --weights-dir /root/cmp_moonshine_base_weights --out /tmp/fpga_asr.json
+$PY tools/cpu_baseline/cpu_baseline.py moonshine --fpga /tmp/fpga_asr.json
+```

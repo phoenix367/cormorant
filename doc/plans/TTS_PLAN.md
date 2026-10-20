@@ -924,3 +924,57 @@ process) is no longer written, installed or loaded.
   / `tts_duration`, and one that encodes fewer ids than it packs per
   utterance.
 - **The deploy preflight** checks `weights/dp.dat` instead of the npz.
+
+## 8. CPU baseline: onnxruntime on the A53 (2026-10-19)
+
+**The FPGA library synthesizes Piper's speech 3.3–4.1× faster than the
+voice's own ONNX under onnxruntime on the board's four Cortex-A53 cores.
+That ONNX run is how Piper itself synthesizes.  The FPGA takes 0.17 / 0.14
+s per second of audio, the CPU 0.56.**  The method is BERT_PLAN.md §4's and
+CHAT_PLAN.md §26's (`tools/cpu_baseline/cpu_baseline.py piper`).
+
+- **One session** on the KV260 (production bitstream `04259a7af917`), with
+  the chat server and Miranda stopped.  The R5 firmware runs, so the
+  library follows its policy, as in the chat server.
+- **CPU model:** the voice's own ONNX (`en_US-lessac-medium.onnx`, the
+  pinned revision; encoder, duration predictor, flow and HiFi-GAN in one
+  graph), fp32, with onnxruntime 1.23.2 and 4 intra-op threads.  There is
+  no int8: the voice is convolutions, and onnxruntime's CPU `ConvInteger`
+  takes no int8 weights.  Piper ships and runs fp32.
+- **Inputs:** `tts_board.py`'s sentences with `texts.json`'s phoneme ids
+  and the voice's scales (0.667, 1, 0.8).  A warm-up, then 3 runs per
+  sentence, the best taken.
+- **The real-time factor**, compute s / audio s, compares the two: the
+  ONNX samples the duration noise inside the model, so its audio lengths
+  differ from the FPGA's by a few percent.
+- **FPGA:** `tts_board.py`, the best of 3.  The end-to-end time per
+  sentence is the text encoder (FPGA), the duration predictor (C on the
+  A53) and the flow + decoder chunks (FPGA).  PCM, encoder and durations
+  are bit-exact with the specification.
+
+| sentence | engine | per sentence | audio | real-time factor | FPGA speed-up |
+|---|---|---:|---:|---:|---:|
+| eval00, "The birch canoe slid on the smooth planks." (88 ids) | **FPGA** | **368 ms** (encoder 24 + duration 49 + chunks 295) | 2.15 s | **0.171** | – |
+| | onnxruntime fp32 | 1236 ms | 2.22 s | 0.557 | 3.3× |
+| eval10, "Hello! I am a small assistant … Paris." (268 ids) | **FPGA** | **961 ms** (79 + 139 + 743) | 6.88 s | **0.140** | – |
+| | onnxruntime fp32 | 3764 ms | 6.64 s | 0.567 | 4.1× |
+
+- **On the FPGA** the flow and decoder chunks take 77–80 % of the time, at
+  148 ms per 1.49 s chunk.  The duration predictor, on the A53, takes
+  13–15 %.  The last chunk costs a full chunk's 148 ms however little of it
+  is filled, so a short sentence pays more per second of audio.
+- **The CPU** takes the same time per second of audio for both sentences.
+  It peaks at 329 MB RSS, and its session opens in 11.0 s from a cold page
+  cache.
+- **Both** are faster than real time.  The FPGA leaves the cores free for
+  the chat server: the chunks and the encoder run on the kernels.
+
+Reproduce with `tools/cpu_baseline`
+([README](../../tools/cpu_baseline/README.md)):
+
+```bash
+PY=inference-scheduler/.venv/bin/python
+$PY demo/tts/scripts/tts_board.py --remote-dir /root/cmp_chat --weights-dir /root/cmp_piper_weights \
+    --out /tmp/fpga_tts.json                                    # the FPGA (keep the chat server's paths out of it)
+$PY tools/cpu_baseline/cpu_baseline.py piper --fpga /tmp/fpga_tts.json
+```

@@ -31,6 +31,22 @@ a model with onnxruntime on the CPU, timed as the FPGA results are.
       replaced by the image features, the embedding lookup inside the timed
       prefill and decode steps.
 
+  tts MODEL utts.json OUT.json [--threads T] [-R 3]
+      the Piper voice (the published ONNX: encoder, duration predictor,
+      flow, decoder in one graph) on each sentence's phoneme ids with the
+      voice's scales: one warm-up run, then R runs per sentence, each timed
+      with its audio length (the duration noise is sampled inside the model,
+      so the lengths differ slightly); the real-time factor.
+
+  asr ENCODER DECODER DECODER_WITH_PAST utts.bin parts.json OUT.json [...]
+      Moonshine's exports (the encoder; the decoder's first step, which
+      makes the cross-attention keys / values; the later steps) on each
+      utterance (utts.bin as asr_board.py writes it: int16, 16 kHz), part
+      by part as the FPGA library splits it (parts.json, moonshine_q.chunks):
+      the encoder, then greedy steps from the start token to EOS or the
+      part's token limit (moonshine_q.transcribe), R runs per utterance (the
+      same ids each), the best one's time split into encode and decode.
+
 All print one line "RESULT: {...}" (the summary) on stdout and their
 progress on stderr.  CPU execution provider, ORT_ENABLE_ALL, sequential
 execution, --threads intra-op threads.
@@ -229,6 +245,103 @@ def vlm(a) -> dict:
     return finish(a, res, dec_ms)
 
 
+def tts(a) -> dict:
+    sess, open_ms = session(a.model, a.threads)
+    spec = json.load(open(a.utts))
+    scales = np.array(spec["scales"], np.float32)
+    sr = spec["sample_rate"]
+
+    def run(ids):
+        x = np.asarray(ids, np.int64)[None, :]
+        t0 = time.perf_counter()
+        y = sess.run(None, {"input": x, "input_lengths": np.array([x.shape[1]], np.int64), "scales": scales})[0]
+        return (time.perf_counter() - t0) * 1e3, int(y.size)
+
+    run(spec["utts"][0]["ids"])                                          # warm-up
+    res = {"open_ms": round(open_ms, 1), "utts": []}
+    tot_ms = tot_s = 0.0
+    for u in spec["utts"]:
+        runs = [run(u["ids"]) for _ in range(a.R)]
+        ms, n = min(runs)
+        tot_ms += sum(r[0] for r in runs)
+        tot_s += sum(r[1] for r in runs) / sr
+        res["utts"].append({"name": u["name"], "ids": len(u["ids"]), "best_ms": round(ms, 1), "audio_s": round(n / sr, 3),
+                            "rtf": round(ms / 1e3 / (n / sr), 4), "runs": [[round(m, 1), k] for m, k in runs]})
+        print(f"{u['name']}: {len(u['ids'])} ids -> {n / sr:.2f} s audio in {ms:.0f} ms (best of {a.R}), "
+              f"RTF {ms / 1e3 / (n / sr):.3f}", file=sys.stderr, flush=True)
+    res["rtf_mean"] = round(tot_ms / 1e3 / tot_s, 4)
+    with open(a.out, "w") as f:
+        json.dump(dict(res, peak_rss_mb=peak_rss_mb()), f)
+    return {k: res[k] for k in ("open_ms", "rtf_mean")}
+
+
+def asr(a) -> dict:
+    enc, ms_e = session(a.encoder, a.threads)
+    first, ms_f = session(a.decoder, a.threads)
+    rest, ms_r = session(a.decoder_with_past, a.threads)
+    spec = json.load(open(a.parts))
+    with open(a.utts, "rb") as f:
+        count = struct.unpack("<i", f.read(4))[0]
+        pcm = []
+        for _ in range(count):
+            n = struct.unpack("<i", f.read(4))[0]
+            pcm.append(np.frombuffer(f.read(2 * n), "<i2"))
+    out_first = [o.name for o in first.get_outputs()]
+    kv_rest = [i.name for i in rest.get_inputs() if i.name.startswith("past_key_values.")]
+    out_rest = [o.name for o in rest.get_outputs()]
+
+    def part(x):
+        """(ids, encode ms, decode ms, steps) of one part (moonshine_q.transcribe)."""
+        limit = min(int(len(x) / spec["sample_rate"] * spec["tokens_per_second"]) + 1, spec["max_tokens"],
+                    spec["max_positions"])
+        if limit <= 1:
+            return [], 0.0, 0.0, 0
+        t0 = time.perf_counter()
+        hs = enc.run(None, {"input_values": (x.astype(np.float32) / 32768.0)[None]})[0]
+        t1 = time.perf_counter()
+        r = dict(zip(out_first, first.run(None, {"input_ids": np.array([[spec["start"]]], np.int64),
+                                                 "encoder_hidden_states": hs}), strict=True))
+        past = {k: r[k.replace("past_key_values.", "present.")] for k in kv_rest}
+        ids, steps = [], 1
+        t = int(np.argmax(r["logits"][0, -1]))
+        while t != spec["eos"] and steps < limit - 1:
+            ids.append(t)
+            r = dict(zip(out_rest, rest.run(None, {"input_ids": np.array([[t]], np.int64), **past}), strict=True))
+            past.update({k: r[k.replace("past_key_values.", "present.")] for k in kv_rest if ".decoder." in k})
+            steps += 1
+            t = int(np.argmax(r["logits"][0, -1]))
+        if t != spec["eos"]:
+            ids.append(t)
+        t2 = time.perf_counter()
+        return ids, (t1 - t0) * 1e3, (t2 - t1) * 1e3, steps
+
+    res = {"open_ms": round(ms_e + ms_f + ms_r, 1), "utts": []}
+    part(pcm[0][:16000])                                                # warm-up
+    tot_ms = tot_s = 0.0
+    for i, u in enumerate(spec["utts"]):
+        best = None
+        for _ in range(a.R):
+            rs = [part(pcm[i][s:s + n]) for s, n in u["parts"]]
+            r = ([t for x in rs for t in x[0]], sum(x[1] for x in rs), sum(x[2] for x in rs), sum(x[3] for x in rs))
+            if best is not None and r[0] != best[0]:
+                sys.exit(f"{u['uid']}: the runs gave different ids")
+            if best is None or r[1] + r[2] < best[1] + best[2]:
+                best = r
+        audio_s = len(pcm[i]) / spec["sample_rate"]
+        tot_ms += best[1] + best[2]
+        tot_s += audio_s
+        res["utts"].append({"uid": u["uid"], "parts": len(u["parts"]), "audio_s": round(audio_s, 3),
+                            "encode_ms": round(best[1], 2), "decode_ms": round(best[2], 2), "steps": best[3],
+                            "ids": best[0]})
+        print(f"{i + 1}/{len(spec['utts'])} {u['uid']}: {audio_s:.1f} s, encode {best[1]:.0f} ms, "
+              f"decode {best[2]:.0f} ms / {best[3]} steps", file=sys.stderr, flush=True)
+    res["summary"] = {"utterances": len(res["utts"]), "total_ms": round(tot_ms, 1), "audio_s": round(tot_s, 3),
+                      "rtf": round(tot_ms / 1e3 / tot_s, 4)}
+    with open(a.out, "w") as f:
+        json.dump(dict(res, peak_rss_mb=peak_rss_mb()), f)
+    return {"open_ms": res["open_ms"], **res["summary"]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -249,14 +362,27 @@ def main() -> int:
     v.add_argument("prompts")
     v.add_argument("images")
     v.add_argument("out")
+    t = sub.add_parser("tts")
+    t.add_argument("model")
+    t.add_argument("utts")
+    t.add_argument("out")
+    t.add_argument("-R", type=int, default=3)
+    s = sub.add_parser("asr")
+    s.add_argument("encoder")
+    s.add_argument("decoder")
+    s.add_argument("decoder_with_past")
+    s.add_argument("utts")
+    s.add_argument("parts")
+    s.add_argument("out")
+    s.add_argument("-R", type=int, default=2)
     for p in (m, v):
         p.add_argument("-k", type=int, default=32)
         p.add_argument("-P", default="16,64,256")
         p.add_argument("-R", type=int, default=3)
-    for p in (b, m, v):
+    for p in (b, m, v, t, s):
         p.add_argument("--threads", type=int, default=4)
     a = ap.parse_args()
-    r = {"bert": bert, "llm": llm, "vlm": vlm}[a.cmd](a)
+    r = {"bert": bert, "llm": llm, "vlm": vlm, "tts": tts, "asr": asr}[a.cmd](a)
     r.update(model=os.path.basename(getattr(a, "model", None) or a.decoder), ort=ort.__version__,
              threads=a.threads, peak_rss_mb=peak_rss_mb())
     print("RESULT: " + json.dumps(r), flush=True)
