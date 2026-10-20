@@ -6,7 +6,9 @@
 architecture.py — draws doc/images/architecture.svg, the layered system
 diagram of the main README: applications, the software on the board and on
 the host, the FPGA kernels and the Kria KV260, with the cross-cutting
-verification and performance tooling as pillars.
+verification and performance tooling as pillars.  The top two layers are two
+columns: the demos over their CNN projects, the chat server (and Miranda)
+over the libraries it loads.
 
 usage: python3 doc/images/architecture.py   (needs Pillow, for text widths)
 
@@ -35,6 +37,7 @@ SW_FILL, SW_STROKE, SW_CHIP, SW_OLIVE = "#d7eefb", "#e8b6f0", "#9b6bff", "#6f9a3
 HW_FILL, HW_STROKE, HW_CHIP = "#aedcf6", "#3fd09a", "#bdf3d9"
 BOARD_CHIP, BRACE, ARROW = "#e1e1e3", "#9b6bff", "#6b6b70"
 PILLAR_V, PILLAR_P, GEN = "#9d174d", "#86198f", "#7c3aed"   # pillars: white text at > 7:1
+APP_GROUP, SW_GROUP, MIRANDA = "#e6fbee", "#eaf6fd", "#0f766e"    # group boxes; Miranda (a client) apart
 
 out: list[str] = []
 overflow: list[str] = []
@@ -111,48 +114,83 @@ rect(0, 0, W, 96, HEADER_BG, r=0)
 text(W / 2, 48, "Cormorant — system architecture", 38, TITLE, "600")
 y = 130
 
-# applications
+# applications: the demos and the chat server, each a group over its libraries
+P = 16                                   # band padding
+GX0, GW0 = L + P, 400                    # the left column: the demos and their projects
+GX1 = GX0 + GW0 + 16                     # the right column: the chat server and its libraries
+GW1 = R - P - GX1
+
+
+def group(x, y, w, h, title, fill, stroke):
+    """A titled sub-box of a band."""
+    rect(x, y, w, h, fill, stroke, 1.5, 4)
+    text(x + 14, y + 17, title, 15, TITLE, "600", "start")
+
+
+def grid(x, y, w, cols, items, fill, color=TITLE, h=50, gap=12, size=13.5, special=None):
+    """Chips in rows of `cols`; `special` {index: fill}: drawn apart, white text."""
+    cw = (w - gap * (cols - 1)) / cols
+    for k, lines in enumerate(items):
+        r_i, c_i = divmod(k, cols)
+        f = (special or {}).get(k)
+        chip(x + c_i * (cw + gap), y + r_i * (h + 10), cw, h, lines, f or fill, "#ffffff" if f else color,
+             size, True)
+
+
 app_top = y
-rect(L, y, R - L, 96, APP_FILL, APP_STROKE, 2.5, 4)
-chips(L + 22, y + 16, R - L - 44, 64, [
+GH = 30 + 2 * 50 + 10 + 14               # a group: its title, two rows of chips
+rect(L, y, R - L, GH + 2 * 14, APP_FILL, APP_STROKE, 2.5, 4)
+group(GX0, y + 14, GW0, GH, "Demos", APP_GROUP, APP_STROKE)
+grid(GX0 + 14, y + 14 + 30, GW0 - 28, 2, [
     ["Image classification", "ResNet-18 · MobileNet"], ["Object detection", "YOLOv5n"],
-    ["Stereo depth", "LightStereo-S"], ["MNIST", "ConvNet · LeNet"],
-    ["Chat server", "LLM · VLM · BERT"], ["Text to speech", "Piper (VITS)"]],
-    APP_CHIP, TITLE, gap=16, size=14, bold_first=True)
-app_bot = y + 96
+    ["Stereo depth", "LightStereo-S"], ["MNIST", "ConvNet · LeNet"]], APP_CHIP)
+group(GX1, y + 14, GW1, GH, "Chat server — OpenAI-compatible API", APP_GROUP, APP_STROKE)
+grid(GX1 + 14, y + 14 + 30, GW1 - 28, 3, [
+    ["Chat", "SmolLM2-135M · 360M"], ["Chat about images", "SmolVLM-256M"], ["Document Q&A", "BERT-SQuAD"],
+    ["Text to speech", "Piper (VITS)"], ["Speech to text", "Moonshine-base"],
+    ["Miranda voice assistant", "speech → chat → speech"]], APP_CHIP, special={5: MIRANDA})
+app_bot = y + GH + 2 * 14
 y = app_bot
-for cx in (L + 230, (L + R) / 2, R - 230):
-    arrow_down(cx, y + 10, y + 52)
-note((L + R) / 2 + 30, y + 31, "call")
+arrow_down(GX0 + GW0 / 2, y + 10, y + 52)
+note(GX0 + GW0 / 2 + 30, y + 31, "run")
+arrow_down(GX1 + GW1 / 2, y + 10, y + 52)
+note(GX1 + GW1 / 2 + 30, y + 31, "load with ctypes")
 y += 62
 
-# software
+# model libraries: generated C, one per model
 sw_top = y
-rect(L, y, R - L, 92, SW_FILL, SW_STROKE, 2, 4)
-text(L + 20, y + 30, "Model libraries", 19, TITLE, "600", "start")
-text(L + 20, y + 58, "generated C, one per model", 13.5, "#4b5563", anchor="start")
-chips(L + 270, y + 16, R - L - 290, 60, [
-    ["CNN projects", "ResNet · YOLO · stereo"], ["libbert_squad.so", "BERT-base"],
-    ["libsmollm2.so", "SmolLM2 135M, 360M"], ["libsmolvlm_256m.so", "SmolVLM image chat"],
-    ["libpiper_tts.so", "Piper TTS"]], SW_OLIVE, gap=14, size=13.5, bold_first=True)
-lib_bot = y + 92
-y += 152
+LH = 34 + GH + 14
+rect(L, y, R - L, LH, SW_FILL, SW_STROKE, 2, 4)
+text(L + 20, y + 20, "Model libraries", 19, TITLE, "600", "start")
+text(L + 20 + width_of("Model libraries", 19) + 14, y + 21, "generated C, one per model", 13.5, "#4b5563",
+     anchor="start")
+group(GX0, y + 34, GW0, GH, "CNN demo projects", SW_GROUP, SW_STROKE)
+chip(GX0 + 14, y + 34 + 30, GW0 - 28, 2 * 50 + 10,
+     ["One project per model", "ResNet-18 · MobileNet v1, v2", "YOLOv5n · LightStereo-S", "ConvNet · LeNet"],
+     SW_OLIVE, size=13.5, bold_first=True)
+group(GX1, y + 34, GW1, GH, "Chat-server libraries", SW_GROUP, SW_STROKE)
+grid(GX1 + 14, y + 34 + 30, GW1 - 28, 3, [
+    ["libsmollm2.so", "SmolLM2-135M"], ["libsmollm2_360m.so", "SmolLM2-360M"], ["libsmolvlm_256m.so", "SmolVLM-256M"],
+    ["libbert_squad.so", "BERT-base"], ["libpiper_tts.so", "Piper TTS"], ["libmoonshine_base.so", "Moonshine ASR"]],
+    SW_OLIVE, color="#ffffff")
+lib_bot = y + LH
+y += LH + 60
 
 half = (R - L - 20) / 2
 rect(L, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(L + half / 2, y + 28, "Runtime — on the board", 19, TITLE, "600")
 cw = (half - 60) / 2
 rows = [[["XRT buffers in CMA", "cache clean / invalidate"], ["Kernel drivers", "Xilinx driver API, over UIO"]],
-        [["Call recorder", "kernel calls → the R5's ring"], ["Host ops in C", "attention · embeddings"]],
-        [["Cortex-R5 firmware", "replays calls · IRQ waits"], ["Linux on the A53", "Ubuntu 22.04 · XRT 2.13"]]]
+        [["Host ops in C", "attention · embeddings"], ["Interrupt waits", "the A53 sleeps on UIO IRQs"]],
+        [["Call recorder", "kernel calls → the R5's ring"], ["Cortex-R5 firmware", "replays calls · IRQ waits"]]]
 for r_i, row in enumerate(rows):
     for c_i, lines in enumerate(row):
         chip(L + 20 + c_i * (cw + 20), y + 52 + r_i * 66, cw, 56, lines, SW_CHIP, size=13.5, bold_first=True)
 x2 = L + half + 20
 rect(x2, y, half, 250, SW_FILL, SW_STROKE, 2, 4)
 text(x2 + half / 2, y + 28, "Inference scheduler — design time, on the host", 19, TITLE, "600")
-rows = [[["Frontends", "ONNX · Llama · ViT · Piper"], ["Graph + fusion", "LayerNorm · GELU · SiLU"]],
-        [["Kernel mapping", "five lanes · row ops"], ["DAG + event stream", "buffer pool coloring"]],
+rows = [[["Frontends", "ONNX · LLM · ViT · speech · stereo"], ["Graph + fusion", "LayerNorm · GELU · SiLU"]],
+        [["Kernel mapping", "five lanes · row-ops chains"], ["DAG + event stream", "buffer pool coloring"]],
         [["Fixed-point simulator", "the bit-exact expectations"], ["C code generator", "--plan · R5 policy"]]]
 for r_i, row in enumerate(rows):
     for c_i, lines in enumerate(row):
@@ -176,8 +214,8 @@ text(L + 20, y + 40, "FPGA kernels", 19, TITLE, "600", "start")
 text(L + 20, y + 68, "SystemVerilog", 13.5, "#334155", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 74, [
     ["VectorOPKernel", "8 lanes", "act · softmax"], ["MatmulKernel", "128 MACs", "GEMV"],
-    ["ConvKernel", "16 × 16 MAC grid", "512 MACs"], ["PoolingKernel", "8 channel lanes"],
-    ["RowOpsKernel", "row-ops unit", "norm · RoPE · add"]],
+    ["ConvKernel", "16 × 16 MAC grid", "2 pixels · 512 MACs"], ["PoolingKernel", "8 channel lanes"],
+    ["RowOpsKernel", "norm · RoPE · add", "fold · gate · transpose"]],
     HW_CHIP, TITLE, gap=14, size=13.5, bold_first=True)
 y += 110
 for cx in (L + 330, (L + R) / 2, R - 330):
@@ -188,8 +226,8 @@ rect(L, y, R - L, 96, "#ffffff", "#c9cbd1", 2, 4)
 text(L + 20, y + 36, "Kria KV260", 19, TITLE, "600", "start")
 text(L + 20, y + 62, "Zynq UltraScale+ K26", 13.5, "#4b5563", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 60, [
-    ["Programmable logic", "kernels at 250 MHz"], ["4 × Cortex-A53", "Linux, host ops"],
-    ["Cortex-R5", "drives the kernels"], ["4 GB DDR4", "1 GB CMA"],
+    ["Programmable logic", "kernels at 250 MHz"], ["4 × Cortex-A53", "Linux · host ops"],
+    ["Cortex-R5", "drives the kernels"], ["4 GB DDR4", "1.4 GB CMA"],
     ["AXI HPC0/1 · HP0/2", "4 × 128-bit ports"]],
     BOARD_CHIP, TITLE, gap=14, size=13.5, bold_first=True)
 hw_bot = y + 96
@@ -200,7 +238,7 @@ bot = y + 44
 
 # pillars: cross-cutting
 for i, (title, sub) in enumerate((("Verification", "bit-exact: simulator · C-sim · RTL · board · fact registry"),
-                                  ("Performance", "measured models · per-layer profiler · timeline"))):
+                                  ("Performance", "measured models · per-layer profiler · timeline · CPU baseline"))):
     px = 40 + i * 84
     rect(px, sw_top, 70, bot - sw_top, (PILLAR_V, PILLAR_P)[i], r=4)
     cy = (sw_top + bot) / 2

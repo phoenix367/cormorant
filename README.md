@@ -70,14 +70,16 @@ The FPGA design (`hw/cormorant_hw_128`, bitstream `04259a7af917`) uses 68 % of t
 
 ## System architecture
 
-![Cormorant system architecture: the applications use the generated model libraries and the runtime on the board; the inference scheduler generates the libraries on the host; the five FPGA kernels run on the Kria KV260, driven from the A53 or the Cortex-R5](doc/images/architecture.svg)
+![Cormorant system architecture: the demos and the chat server (chat, image chat, document Q&A, text to speech, speech to text; the Miranda voice assistant on top) use the generated model libraries and the runtime on the board; the inference scheduler generates the libraries on the host; the five FPGA kernels run on the Kria KV260, driven from the A53 or the Cortex-R5](doc/images/architecture.svg)
 
-The inference scheduler compiles each model into a C library on the host.
-On the board, the library keeps the weights and buffers in XRT buffers and
-runs what no kernel implements as host ops on the Arm Cortex-A53 cores; its
-kernel calls go either straight to the five FPGA kernels or, for the larger
-models, to firmware on a Cortex-R5 core that replays them with
-interrupt-driven waits while the A53 sleeps.  Every result is checked bit
+The inference scheduler compiles each model into a C library on the host:
+a project per CNN demo, and the libraries the chat server loads.  On the
+board, the library keeps the weights and buffers in XRT buffers and runs
+what no kernel implements as host ops on the Arm Cortex-A53 cores.  Its
+kernel calls go either straight to the five FPGA kernels, with the A53
+sleeping on their interrupts.  For the larger models they go instead to
+firmware on a Cortex-R5 core, which replays them with interrupt-driven
+waits while the A53 sleeps.  Every result is checked bit
 for bit against the scheduler's fixed-point simulation.
 [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) is the hardware architecture
 document (requirements, interconnect and control path, clocks and reset,
