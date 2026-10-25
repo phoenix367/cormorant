@@ -69,11 +69,11 @@ module ro_norm
   logic [31:0] k_n, k_words;
   logic [63:0] k_eps;
   logic [5:0]  k_bqsh;
-  logic [12:0] k_n13;
+  logic [12:0] k_n13;                      // the factor of x in A: n (ln) or 1 (rms; n*S2 is ln's only)
   always_ff @(posedge clk)
     if (start) begin
       k_ln <= ln; k_a32 <= a32; k_n <= n; k_words <= words; k_eps <= eps; k_bqsh <= bq_sh;
-      k_n13 <= n[12:0];
+      k_n13 <= ln ? n[12:0] : 13'd1;
     end
 
   // Ring --------------------------------------------------------------------------------------
@@ -133,14 +133,13 @@ module ro_norm
     end
   end
 
-  // sums: s0 the group, s1 lanes, s2 squares (DSP), s3 the squares' register,
-  // s4 lane sums, s5 accumulate
+  // sums: s0 the group, s1 lanes, s2 squares (DSP) / the lanes' sum, s3 the
+  // squares' register, s4 the squares' sum, s5 accumulate
   logic          sv1, sv2, sv3, sv4, sv5, sl1, sl2, sl3, sl4, sl5;   // valid / last-of-row
   logic [RW-1:0] sb1, sb2, sb3, sb4, sb5;                            // row base
   logic signed [31:0] sx1 [PB];
   logic signed [63:0] sq2 [PB], sq3 [PB];
-  logic signed [31:0] sx2 [PB], sx3 [PB];
-  logic signed [33:0] sum1_4;
+  logic signed [33:0] sum1_2, sum1_3, sum1_4;
   logic signed [65:0] sum2_4;
   logic signed [47:0] acc1;                 // S1 (int32 rows of 4096: < 2^44)
   logic signed [79:0] acc2;                 // S2 (< 2^75)
@@ -161,22 +160,22 @@ module ro_norm
     sv1 <= ld_step; sl1 <= ld_last && (k_a32 || ld_half); sb1 <= ld_base;
     for (int l = 0; l < PB; l++) sx1[l] <= lane_ld(a_data, k_a32, ld_half, l);
     sv2 <= sv1; sl2 <= sl1; sb2 <= sb1;
-    for (int l = 0; l < PB; l++) begin
-      sq2[l] <= 64'(sx1[l]) * 64'(sx1[l]);
-      sx2[l] <= sx1[l];
-    end
-    sv3 <= sv2; sl3 <= sl2; sb3 <= sb2;
-    for (int l = 0; l < PB; l++) begin
-      sq3[l] <= sq2[l];
-      sx3[l] <= sx2[l];
-    end
-    sv4 <= sv3; sl4 <= sl3; sb4 <= sb3;
     begin
       logic signed [33:0] a1;
+      a1 = '0;
+      for (int l = 0; l < PB; l++) a1 = a1 + 34'(sx1[l]);
+      sum1_2 <= a1;
+    end
+    for (int l = 0; l < PB; l++) sq2[l] <= 64'(sx1[l]) * 64'(sx1[l]);
+    sv3 <= sv2; sl3 <= sl2; sb3 <= sb2;
+    for (int l = 0; l < PB; l++) sq3[l] <= sq2[l];
+    sum1_3 <= sum1_2;
+    sv4 <= sv3; sl4 <= sl3; sb4 <= sb3;
+    begin
       logic signed [65:0] a2;
-      a1 = '0; a2 = '0;
-      for (int l = 0; l < PB; l++) begin a1 = a1 + 34'(sx3[l]); a2 = a2 + 66'(sq3[l]); end
-      sum1_4 <= a1;
+      a2 = '0;
+      for (int l = 0; l < PB; l++) a2 = a2 + 66'(sq3[l]);
+      sum1_4 <= sum1_3;
       sum2_4 <= a2;
     end
     sv5 <= sv4; sl5 <= sl4; sb5 <= sb4;
@@ -220,13 +219,14 @@ module ro_norm
   logic [RW-1:0] c_base;
   logic signed [47:0] c_s1;
   logic signed [79:0] c_s2;
-  logic [95:0]   c_v, c_d, c_dsum, c_ns2;  // n*S2 / V / D (unsigned; D >= 1)
-  logic [95:0]   c_sq, c_sqt;              // S1^2
+  // n*S2 / V / D (unsigned; D >= 1) and S1^2: S2 < 2^75, n*S2 and S1^2 <= 2^86, D < 2^88
+  logic [88:0]   c_v, c_d, c_dsum, c_ns2;
+  logic [88:0]   c_sq, c_sqt;
   logic [47:0]   c_sa;                      // |S1|: H = [47:32], L = [31:0]
   logic [31:0]   c_hh;                      // H * H
   logic [63:0]   c_sql, c_sqhl;             // L * L, H * L
-  logic [3:0]    c_bit;                     // n's bit being added (n*S2 = sum n[i] * S2 << i)
-  logic [6:0]    c_e;                       // bit length of D (1 .. 96)
+  logic [3:0]    c_bit;                     // n's bit being added, 12 .. 0 (Horner: n*S2 = 2 (..) + n[i] S2)
+  logic [6:0]    c_e;                       // bit length of D (1 .. 88)
   logic signed [7:0] c_dd;                  // d (even, -32 .. 64)
   logic [31:0]   c_dm, c_y0, c_t, c_u, c_rm;
   logic          c_eneg;                    // 2^30 - u < 0
@@ -245,10 +245,10 @@ module ro_norm
   assign rq_pop   = (cs == C_IDLE) && rq_valid && eq_in_ready;
   assign eq_push  = (cs == C_PUSH);
 
-  function automatic logic [6:0] bitlen96(input logic [95:0] v);
+  function automatic logic [6:0] bitlen89(input logic [88:0] v);
     logic [6:0] r;
     r = '0;
-    for (int i = 0; i < 96; i++) if (v[i]) r = 7'(i + 1);
+    for (int i = 0; i < 89; i++) if (v[i]) r = 7'(i + 1);
     return r;
   endfunction
 
@@ -263,34 +263,35 @@ module ro_norm
         end
         C_LOAD: begin
           c_ns2 <= '0;
-          c_bit <= '0;
+          c_bit <= 4'd12;
           c_sa  <= c_s1[47] ? 48'(-c_s1) : 48'(c_s1);
+          c_s1  <= k_ln ? 48'(-c_s1) : 48'sd0;     // from here on the emitter's addend of A: -S1 or 0
           cs <= k_ln ? C_MULN : C_V;
         end
-        C_MULN: begin                               // n * S2 over the 13 bits of n; the square beside it
-          if (k_n13[c_bit]) c_ns2 <= c_ns2 + (96'(c_s2) << c_bit);
-          c_bit <= c_bit + 4'd1;
+        C_MULN: begin                               // n * S2 over the 13 bits of n, MSB first; the square beside it
+          c_ns2 <= (c_ns2 << 1) + (k_n13[c_bit] ? 89'(c_s2) : 89'd0);
+          c_bit <= c_bit - 4'd1;
           case (c_bit)
-            4'd0: begin mul_a <= c_sa[31:0]; mul_b <= c_sa[31:0]; c_hh <= c_sa[47:32] * c_sa[47:32]; end
-            4'd4: begin c_sql <= mul_p; mul_a <= {16'b0, c_sa[47:32]}; mul_b <= c_sa[31:0]; end
-            4'd8: c_sqhl <= mul_p;
+            4'd12: begin mul_a <= c_sa[31:0]; mul_b <= c_sa[31:0]; c_hh <= c_sa[47:32] * c_sa[47:32]; end
+            4'd8:  begin c_sql <= mul_p; mul_a <= {16'b0, c_sa[47:32]}; end      // mul_b holds L
+            4'd4:  c_sqhl <= mul_p;
             default: ;
           endcase
-          if (c_bit == 4'd12) cs <= C_SQ;
+          if (c_bit == 4'd0) cs <= C_SQ;
         end
-        C_SQ:  begin c_sqt <= (96'(c_sqhl) << 33) + 96'(c_sql); cs <= C_SQ2; end
-        C_SQ2: begin c_sq <= c_sqt + (96'(c_hh) << 64); cs <= C_V; end
+        C_SQ:  begin c_sqt <= (89'(c_sqhl) << 33) + 89'(c_sql); cs <= C_SQ2; end
+        C_SQ2: begin c_sq <= c_sqt + (89'(c_hh) << 64); cs <= C_V; end
         C_V: begin
-          c_v <= k_ln ? (c_ns2 - c_sq) : 96'(c_s2);
+          c_v <= k_ln ? (c_ns2 - c_sq) : 89'(c_s2);
           cs  <= C_D;
         end
-        C_D:  begin c_dsum <= c_v + 96'(k_eps); cs <= C_D2; end
+        C_D:  begin c_dsum <= c_v + 89'(k_eps); cs <= C_D2; end
         C_D2: begin
-          c_d <= (c_dsum == '0 || c_v[95]) ? 96'd1 : c_dsum;   // V < 0 cannot happen for exact sums; guard
+          c_d <= (c_dsum == '0 || c_v[88]) ? 89'd1 : c_dsum;   // V < 0 cannot happen for exact sums; guard
           cs  <= C_LZ;
         end
         C_LZ: begin
-          c_e <= bitlen96(c_d);
+          c_e <= bitlen89(c_d);
           cs  <= C_DM;
         end
         C_DM: begin
@@ -299,7 +300,8 @@ module ro_norm
             d = 8'(signed'({1'b0, c_e})) - 8'sd32;
             if (d[0]) d = d + 8'sd1;
             c_dd <= d;
-            c_dm <= (d >= 8'sd0) ? 32'(c_d >> d[6:0]) : 32'(c_d << (-d));
+            // Dm = D >> d (D << -d for d < 0): D 2^32 shifted right by d + 32 = 2 ceil(e / 2)
+            c_dm <= 32'({c_d, 32'b0} >> {6'(c_e[6:1]) + 6'(c_e[0]), 1'b0});
           end
           cs <= C_ROM;
         end
@@ -308,7 +310,7 @@ module ro_norm
         C_T: begin
           c_y0  <= rom_q;
           mul_a <= c_dm;
-          mul_b <= rom_q;                           // Dm * y0
+          mul_b <= rom_q;                           // Dm * y0; mul_b holds y0 up to C_Y
           cs    <= C_T1;
         end
         C_T1: cs <= C_T2;
@@ -316,8 +318,7 @@ module ro_norm
         C_T3: cs <= C_U;
         C_U: begin
           c_t   <= mul_p[63:32];
-          mul_a <= mul_p[63:32];
-          mul_b <= c_y0;                            // t * y0
+          mul_a <= mul_p[63:32];                    // t * y0
           cs    <= C_U1;
         end
         C_U1: cs <= C_U2;
@@ -328,8 +329,7 @@ module ro_norm
             logic signed [33:0] e;                  // 2^30 - u (signed)
             e = 34'sd1073741824 - 34'(signed'({2'b0, mul_p[63:32]}));
             c_eneg <= e[33];
-            mul_a  <= c_y0;
-            mul_b  <= e[33] ? 32'(-e) : 32'(e);     // y0 * |2^30 - u|
+            mul_a  <= e[33] ? 32'(-e) : 32'(e);     // |2^30 - u| * y0
           end
           c_u <= mul_p[63:32];
           cs  <= C_Y1;
@@ -358,7 +358,7 @@ module ro_norm
     end
   end
 
-  // the rows ready to emit: {base, S1, Rm, k}
+  // the rows ready to emit: {base, -S1 (ln) or 0, Rm, k}
   localparam int EQW = RW + 48 + 32 + 6;
   logic          eq_valid, eq_pop;
   logic [EQW-1:0] eq_q;
@@ -384,7 +384,16 @@ module ro_norm
   assign grp_last = (col_next >= k_n) || ((em_wleft == 32'd1) && (k_a32 || em_half));
   assign eq_pop   = !em_run && eq_valid;
   assign issue    = em_run && room;
-  assign prm_idx  = em_col[PIW+1:2];
+
+  // The parameter index follows the group six cycles behind its issue, so the
+  // entries arrive at stage 8, where the lanes first need them (the emitter
+  // pipeline never stalls; nothing else reads ro_param during a NORM job).
+  (* srl_style = "srl_reg" *) logic [PIW-1:0] pix [6];
+  always_ff @(posedge clk) begin
+    pix[0] <= em_col[PIW+1:2];
+    for (int i = 1; i < 6; i++) pix[i] <= pix[i-1];
+  end
+  assign prm_idx = pix[5];
 
   always_ff @(posedge clk) begin
     if (rst || start) begin
@@ -418,13 +427,14 @@ module ro_norm
 
   // Emitter pipeline.  A group issued in cycle t: stage s data is registered at
   // the end of cycle t + s and valid with v[s] in cycle t + s + 1.  The ring
-  // word read at t is ring_q0 (stage 0), ring_q1 (stage 1); the parameters
-  // read at t (prm_idx) are valid in cycle t + 2; lanes x3 and p3 are stage 2.
+  // word read at t is ring_q0 (stage 0), ring_q1 (stage 1); lanes x3 are stage
+  // 2; the parameters read at t + 6 (prm_idx) are valid in cycle t + 8: p9 is
+  // stage 8.
   logic [NS-1:0] v, lq;                     // valid, last group of the row
   logic [3:0]    nval [NS];
   logic          hf1, hf2;                  // the group's half (int16): stages 0, 1
   logic [3:0]    nv_in;
-  (* shreg_extract = "no" *) logic signed [47:0] s1q [NS];   // S1 along the pipeline (changes per row)
+  (* shreg_extract = "no" *) logic signed [47:0] s1q [NS];   // -S1 or 0 along the pipeline (changes per row)
   (* shreg_extract = "no" *) logic [31:0]   rmq [NS];
   (* shreg_extract = "no" *) logic [5:0]    kq [NS];
 
@@ -435,7 +445,6 @@ module ro_norm
   end
 
   logic signed [31:0] x3 [E32];
-  param_t             p3 [E32];
 
   always_ff @(posedge clk) begin
     if (rst || start) v <= '0;
@@ -446,73 +455,66 @@ module ro_norm
       nval[s] <= nval[s-1]; s1q[s] <= s1q[s-1]; rmq[s] <= rmq[s-1]; kq[s] <= kq[s-1];
     end
     hf1 <= em_half; hf2 <= hf1;
-    // stage 2: lanes from ring_q1, the parameters
-    for (int l = 0; l < E32; l++) begin
+    // stage 2: lanes from ring_q1
+    for (int l = 0; l < E32; l++)
       x3[l] <= k_a32 ? ring_q1[32*l +: 32]
                      : 32'(signed'(hf2 ? ring_q1[EW*(l+4) +: EW] : ring_q1[EW*l +: EW]));
-      p3[l] <= prm_q[l];
-    end
   end
 
   // Per-lane arithmetic (stages 3 .. 14)
   logic [15:0] res [E32];
   for (genvar l = 0; l < E32; l++) begin : g_lane
-    logic signed [47:0] nx4, a5, a6;          // n*x, A
-    logic signed [47:0] s1_4;
+    logic signed [47:0] nx4, a5, a6;          // n*x (ln) or x, A
+    logic signed [47:0] s1_4;                 // -S1 (ln) or 0
     logic signed [79:0] pm7, pm8;             // A * Rm
-    logic signed [47:0] p1_9;                 // floor(A*Rm / 2^k) (|P1| <= 2^31 for valid data)
-    logic signed [79:0] q10, q11;             // P1 * G
-    logic signed [63:0] b10, b11;
-    logic signed [79:0] s12;
+    // floor(A*Rm / 2^k): |P1| < 2^31 for n <= 4096 (A^2 <= n D, Rm 2^-sh ~ 1 / sqrt(D))
+    logic signed [32:0] p1_9;
+    logic signed [63:0] q10, q11;             // P1 * G, the low 64 bits (all the rounding reads)
+    logic signed [21:0] b10;                  // Bq'
+    logic signed [63:0] b11;                  // Bq' << bq_sh
+    logic signed [63:0] s12;
     rne_t               ra13;
     logic signed [63:0] r14;
-    (* shreg_extract = "no" *) param_t p4, p5, p6, p7, p8, p9, p10, p11, p12;
+    param_t             p9;                   // the column's parameters (stage 8)
+    logic [5:0]         shc10, shc11, shc12;
     logic [31:0] rm5, rm6;
     logic [5:0]  k8;
     always_ff @(posedge clk) begin
       // e4
       nx4  <= 48'(x3[l]) * 48'(signed'({1'b0, k_n13}));
       s1_4 <= s1q[2];
-      p4   <= p3[l];
       // e5
-      a5   <= k_ln ? (nx4 - s1_4) : 48'(x3_d[l]);
-      p5   <= p4;
+      a5   <= nx4 + s1_4;
       rm5  <= rmq[3];                        // the group's Rm (set at t + 3), with a5
       // e6: the product's input registers
       a6   <= a5;
       rm6  <= rm5;
-      p6   <= p5;
       // e7: A * Rm
       pm7  <= a6 * 80'(signed'({1'b0, rm6}));
-      p7   <= p6;
       // e8
       pm8  <= pm7;
-      p8   <= p7;
       k8   <= kq[6];                         // valid in t + 7, with pm8
       // e9: the floor shift
-      p1_9 <= 48'(pm8 >>> k8);
-      p9   <= p8;
-      // e10: * G, the bias
-      q10  <= p1_9 * 80'(p9.g);
-      b10  <= 64'(p9.bq) <<< k_bqsh;
-      p10  <= p9;
-      // e11
+      p1_9 <= 33'(pm8 >>> k8);
+      p9   <= prm_q[l];
+      // e10: * G
+      q10  <= 64'(p1_9) * 64'(p9.g);
+      b10  <= p9.bq;
+      shc10 <= p9.sh_c;
+      // e11: the bias
       q11  <= q10;
-      b11  <= b10;
-      p11  <= p10;
+      b11  <= 64'(b10) <<< k_bqsh;
+      shc11 <= shc10;
       // e12
-      s12  <= q11 + 80'(b11);
-      p12  <= p11;
+      s12  <= q11 + b11;
+      shc12 <= shc11;
       // e13, e14: the rounding
-      ra13 <= rne_a(64'(s12), p12.sh_c);
+      ra13 <= rne_a(s12, shc12);
       r14  <= rne_b(ra13);
       // e15
       res[l] <= sat16(r14);
     end
   end
-  // x delayed one stage for the rms path (A = x at e5)
-  logic signed [31:0] x3_d [E32];
-  always_ff @(posedge clk) for (int l = 0; l < E32; l++) x3_d[l] <= x3[l];
 
   // Pack: 4 results per group, 8 per output word (two groups), a row's last
   // group flushes a half word with zeros.

@@ -2,19 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
     // Matmul: a, b, c, n, k, m, batch, strides, b_packed, gemv_kw
-    for (int t = 0; t < 14; t++) begin
+    // (7-9: one K block, so one lane idle after jobs that filled both: its
+    // drain words must be zeroed, mm_drain / mm_lane)
+    for (int t = 0; t < 20; t++) begin
       int n, k, m, bt, pk, kw;
       longint unsigned a, b, c;
-      case (t % 7)
+      case (t % 10)
         0: begin n = 1;  k = 64;  m = 128; kw = 0; pk = 0; end
         1: begin n = 16; k = 48;  m = 40;  kw = 0; pk = 1; end
         2: begin n = 1;  k = 128; m = 64;  kw = 4; pk = 0; end
         3: begin n = 9;  k = 144; m = 96;  kw = 0; pk = 0; end
         4: begin n = 3;  k = 24;  m = 8;   kw = 1; pk = 0; end
         5: begin n = 20; k = 72;  m = 600; kw = 0; pk = 0; end
-        default: begin n = 1; k = 256; m = 64; kw = 8; pk = 0; end
+        6: begin n = 1;  k = 256; m = 64;  kw = 8; pk = 0; end
+        7: begin n = 4;  k = 8;   m = 4;   kw = 0; pk = 0; end
+        8: begin n = 64; k = 16;  m = 4;   kw = 0; pk = 0; end
+        default: begin n = 8; k = 8; m = 8; kw = 0; pk = 0; end
       endcase
-      bt = 1 + (t / 7);
+      bt = 1 + (t / 10);
       a = 64'h1_0000_0000 + t * 64'h100_0000; b = a + 64'h40_0000; c = a + 64'h80_0000;
       wr(8'h10, a[31:0]); wr(8'h14, a[63:32]); wr(8'h1C, b[31:0]); wr(8'h20, b[63:32]);
       wr(8'h28, c[31:0]); wr(8'h2C, c[63:32]); wr(8'h34, n); wr(8'h3C, k); wr(8'h44, m);

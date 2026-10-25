@@ -6,7 +6,8 @@
 //
 // Load: the 16-byte DDR entries arrive as words on `in` (stream B's port,
 // before the job's streams start); entry c goes to bank c % 4 at index
-// c / 4, or — P_BCAST — entry 0 to index 0 of every bank.  Read: index i
+// c / 4, or — P_BCAST — entry 0 to index 0 of every bank (four writes in four
+// cycles from the port's word, which is taken with the last).  Read: index i
 // returns the four entries of columns 4i .. 4i + 3, two cycles later (the
 // four arithmetic lanes of every unit).
 //
@@ -50,26 +51,26 @@ module ro_param
   logic           bcast;                  // the loaded block is one entry: every read returns index 0
   logic [PIW-1:0] rd_i;
   assign rd_i = bcast ? '0 : rd_idx;
-  logic [1:0]     bc_step;                // broadcast: the entry written to bank 1 .. 3
+  logic [1:0]     bc_step;                // broadcast: the bank written this cycle (0 .. 3)
   logic [1:0]     wr_bank, w_bank;        // the next entry's bank / the bank written this cycle
   logic [PIW-1:0] wr_idx, w_idx;
-  param_t         w_data, bc_data;
+  param_t         w_data;
   logic [PRM_W-1:0] w_vec;
-  logic           bc_on, accept, we;
+  logic           accept, we;
   assign w_vec = w_data;
 
-  assign in_ready = ld_busy && !bc_on;
+  // a broadcast entry stays at the port's head until its fourth write
+  assign in_ready = ld_busy && (!bcast || bc_step == 2'd3);
   assign accept   = in_valid && in_ready;
   // the write happens in the accepting cycle (the counters still name its slot)
-  assign we     = accept || bc_on;
-  assign w_bank = bc_on ? bc_step : wr_bank;
-  assign w_idx  = bc_on ? '0 : wr_idx;
-  assign w_data = bc_on ? bc_data : unpack(in_data);
+  assign we     = ld_busy && in_valid;
+  assign w_bank = bcast ? bc_step : wr_bank;
+  assign w_idx  = bcast ? '0 : wr_idx;
+  assign w_data = unpack(in_data);
 
   always_ff @(posedge clk) begin
     if (rst) begin
       ld_busy <= 1'b0;
-      bc_on   <= 1'b0;
     end else begin
       if (ld_start) begin
         ld_busy <= (ld_n != '0);
@@ -77,28 +78,20 @@ module ro_param
         bcast   <= ld_bcast;
         wr_bank <= '0;
         wr_idx  <= '0;
-        bc_on   <= 1'b0;
-      end else if (bc_on) begin                     // the broadcast entry into banks 1 .. 3
-        bc_step <= bc_step + 2'd1;
-        if (bc_step == 2'd3) begin
-          bc_on   <= 1'b0;
-          ld_busy <= 1'b0;
+        bc_step <= '0;
+      end else if (bcast) begin                     // the broadcast entry into banks 0 .. 3
+        if (ld_busy && in_valid) begin
+          bc_step <= bc_step + 2'd1;
+          if (bc_step == 2'd3) ld_busy <= 1'b0;
         end
       end else if (accept) begin
-        if (bcast) begin                            // bank 0 written now; the rest follow
-          bc_data <= unpack(in_data);
-          bc_step <= 2'd1;
-          bc_on   <= 1'b1;
-          ld_left <= '0;
+        ld_left <= ld_left - 32'd1;
+        if (ld_left == 32'd1) ld_busy <= 1'b0;
+        if (wr_bank == 2'd3) begin
+          wr_bank <= 2'd0;
+          wr_idx  <= wr_idx + PIW'(1);
         end else begin
-          ld_left <= ld_left - 32'd1;
-          if (ld_left == 32'd1) ld_busy <= 1'b0;
-          if (wr_bank == 2'd3) begin
-            wr_bank <= 2'd0;
-            wr_idx  <= wr_idx + PIW'(1);
-          end else begin
-            wr_bank <= wr_bank + 2'd1;
-          end
+          wr_bank <= wr_bank + 2'd1;
         end
       end
     end

@@ -27,7 +27,10 @@
 // ---------------------------------------------------------------------------
 module ro_rd_port
   import ro_pkg::*;
-(
+#(
+  parameter bit WIN   = 1'b1,             // the geometries may have a window (ro_burstgen)
+  parameter bit TILES = 1'b1              // ... more than one tile
+) (
   input  logic          clk,
   input  logic          rst,
   input  logic          start,
@@ -84,7 +87,7 @@ module ro_rd_port
     end
   end
 
-  ro_burstgen #(.MAXB(RD_BURST)) u_bg (
+  ro_burstgen #(.MAXB(RD_BURST), .WIN(WIN), .TILES(TILES)) u_bg (
     .clk, .rst, .start ((start && !ext_en) || kick), .g (g_bg),
     .b_valid (bg_valid), .b_ready (bg_ready), .b_waddr (bg_waddr), .b_len (bg_len), .b_zero (bg_zero),
     .done    (bg_done)

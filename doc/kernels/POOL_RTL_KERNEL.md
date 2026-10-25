@@ -73,11 +73,11 @@ ctrl ─► config ─► chunk sequencer ─┬► loader: runs ─► AR (gmem
 | module | role |
 |---|---|
 | `pl_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL VectorOPKernel's); its inputs are registered before they are decoded |
-| `pl_core` | job FSM: latch the registers; the products the chunks need through one pipelined DSP multiplier and `ow_tile` through a 6-step divider (about 30 cycles per job); the contract; the chunk sequencer (batch, channel tile, W-tile — every offset by increments) feeding a 4-deep chunk FIFO per unit; `ap_done` when all units are idle |
+| `pl_core` | job FSM: latch the registers; the products the chunks need through one pipelined DSP multiplier and `ow_tile` through a 6-step divider (about 30 cycles per job); the contract; the job constants the units read (`j`: the latched arguments and these products as they stand, only the rows and the decoded flags registered); the chunk sequencer (batch, channel tile, W-tile — every offset by increments; its end-of-tile tests registered a state ahead) feeding a 4-deep chunk FIFO per unit; `ap_done` when all units are idle |
 | `pl_loader` | a chunk's (row, channel) runs in the HLS order (rows outer, channels inner); one AR burst per run (at most 9 beats), split at 4 KiB; AR issued only when the 256-beat read FIFO can take every beat (RREADY tied high); ≤ 16 bursts awaiting data; a run descriptor (row slot, channel, lane shift, words) per run |
-| `pl_emit` | the line buffer — 8 channels × 8 column banks of 16 rows × 8 words (LUTRAM; one write and one read per bank and cycle), a word written in one cycle with its lanes rotated by the run's alignment (the write registered once more, LX, with its enables, addresses and data copied per bank; the read address in two register stages — the 8 bank addresses, then a copy per channel and bank next to it — and the read data registered next to the bank, WR); per output row a "step" that loads the rows it needs and emits its window beats: per group of 2 output positions, pool_h × pool_w beats of 2 positions × 8 channels, padded taps carrying the pool type's identity, the AVG denominators with the group's last beat |
-| `pl_reduce` | 16 accumulators (2 positions × 8 channels): per beat the contribution (x, \|x\| or x²) and max / add, the stall decision computed per group of 4 lanes from that group's copy of its few control registers; at a group's end a snapshot for the finaliser, which takes one channel (2 lanes) per cycle through a 9-stage pipeline (AVG product with a 64-entry reciprocal ROM, the LP-2 square root as two-cycle Horner steps) into a 32-entry bundle FIFO |
-| `pl_writer` | an output row's bundles into one of two row buffers (8 banks of 2 × 8 × 8 entries, LUTRAM; the bank writes registered); the other buffer's row drained as one run per channel, lanes rotated to the row's alignment, one AW burst per run (split at 4 KiB), a 32-beat W FIFO, ≤ 8 bursts awaiting B |
+| `pl_emit` | the line buffer — 8 channels × 8 column banks of 16 rows × 8 words (LUTRAM; one write and one read per bank and cycle), a word written in one cycle with its lanes rotated by the run's alignment (every lane — only a run's ninth word is masked, which would wrap onto word 0; the write registered once more, LX, with its enables, addresses and data copied per bank; the read address in two register stages — the 8 bank addresses, then a copy per channel and bank next to it — and the read data registered next to the bank, WR); per output row a "step" that loads the rows it needs and emits its window beats: per group of 2 output positions, pool_h × pool_w beats of 2 positions × 8 channels, padded taps carrying the pool type's identity (bits 14:0 from the read register's synchronous reset, bit 15 picked after it), channels past `c_valid` whatever their banks hold (the writer drops them), the AVG denominators with the group's last beat; the tap columns 7-bit local (`col_base` ≥ −64, in-bounds below `hi_lim` ≤ 64) |
+| `pl_reduce` | 16 accumulators (2 positions × 8 channels): per beat the contribution (x or \|x\|, and x² in the DSP's product register) and max / add on one adder per lane (MAX as acc + ~c), the stall decision computed per group of 4 lanes from that group's copy of its few control registers; at a group's end a snapshot for the finaliser, which takes one channel (2 lanes) per cycle through a 9-stage pipeline (AVG product with a 64-entry reciprocal ROM, the other modes floored and saturated by stage 5; the LP-2 square root: one even right shift to m, two-cycle Horner steps, one right shift to the result) into a 32-entry bundle FIFO |
+| `pl_writer` | an output row's bundles into one of two row buffers (8 banks of 2 × 8 × 8 entries, LUTRAM; the bank writes registered), each column at its lane in DDR (a running 3-bit shift per channel, a write address per bank); the other buffer's row drained as one run per channel, one read address for all banks (no lane rotation), one AW burst per run (split at 4 KiB), a 32-beat W FIFO, ≤ 8 bursts awaiting B |
 
 The window beats reach the reducer through a register slice (`pl_rs`), and
 the m_axi ports are registered both ways: AR, AW and W leave through `pl_rs`
@@ -92,10 +92,15 @@ write-only, 16 / 8, 16-beat maximum bursts (the RTL's are at most 9 beats:
 a run of 64 columns at any alignment).  The block design sizes each crossbar
 slot's acceptance from these.
 
-Resources (out of context, xck26 −2LV, `make synth_pool_rtl`): 12 356 LUT
-(3 446 LUTRAM: the line buffer and the row buffers), 11 802 FF, 2 RAMB36 + 2
-RAMB18, 29 DSP; timing met at 300 MHz (WNS +0.110 ns, Fmax ≈ 310 MHz; the PL runs at
-100).  Before the in-context work of 2026-10-06: 11 956 LUT, 8 483 FF, WNS
+Resources (out of context, xck26 −2LV, `make synth_pool_rtl`), after the
+LUT / FF pass of AREA_PLAN §6 (2026-10-24; Vivado 2025.2, place and route at
+3.333 ns): 10 652 LUT (3 408 LUTRAM: the line buffer and the row buffers; 26
+SRL), 10 481 FF, 2 RAMB36 + 2 RAMB18, 29 DSP, WNS +0.184 ns — the production
+RTL (bitstream `04259a7af917`) in the same run 11 826 LUT (3 462 LUTRAM, 42
+SRL), 11 572 FF, WNS +0.145 ns; results and cycle counts unchanged.  After
+the in-context work of 2026-10-06: 12 356 LUT (3 446 LUTRAM), 11 802 FF; timing
+met at 300 MHz (WNS +0.110 ns, Fmax ≈ 310 MHz; the PL runs at
+100).  Before it: 11 956 LUT, 8 483 FF, WNS
 +0.077 ns.
 
 In the block design (the routed 100 MHz `cormorant_hw_128`, 2026-10-05) the
@@ -208,8 +213,29 @@ bank is its real column's, and two positions of a group never share one.
   prefetching step's new rows never alias the rows its window reads — the
   prefetch condition `span_h + stride_h ≤ 16` guarantees that.
 - The two positions of a group read different column banks (`gw = 2` only
-  when `stride_w % 8 ≠ 0`); position 0 wins a bank only by address
+  when `stride_w % 8 ≠ 0`; without it the padded position 1 takes the bank
+  beside position 0's); position 0 wins a bank only by address
   priority, never by being padded.
+- The emitter's tap columns are 7-bit: a tap of a W-tile lies within 63
+  columns of (ow_lo, tap 0) (`(ow_span − 1)·stride_w + reach_w < 64`, from
+  `ow_tile`), so `col_base` + 0 … 63 is exact mod 128 (`col_base` clamped to
+  −64: a tile further left is padded whole).  A wider line buffer widens
+  them (`pl_pkg` `chunk_t`).
+- The line buffer is written on every lane of a run's words: a tap reads
+  only columns 0 … `run_len` − 1 of a slot, a lane before the run (word 0)
+  lands where the run's next word writes the same column, a ninth word
+  (w = LBW) is masked, and the window never reads the slot being loaded.
+- A padded tap is 0 in bits 14:0 (`rv`'s synchronous reset, `rz`) and gets
+  the identity's bit 15 in W2, so the identities may differ in bit 15 only
+  (MAX 0x8000, the others 0; `g_pad_check`).  Channels past `c_valid` carry
+  stale bank contents: the writer must keep dropping them.
+- The row buffers hold every column at its DDR lane: the fill's shift `f_s`
+  (`base_out` mod 8, + `out_hw` per channel, + `out_w` per row) must stay the
+  drain's run alignment (`d_e[2:0]`).
+- The units read the latched arguments and phase A's products directly
+  (`j` is combinational; only the rows and the decoded flags are
+  registered): those registers must hold from T_PB until the next
+  ap_start, and T_DONE waits for every unit to be idle.
 - The finaliser takes a snapshot only when the previous one is done (8
   cycles); a group shorter than 8 beats waits — the HLS kernel's
   `slot_len = max(red_len, 8)`.

@@ -44,8 +44,8 @@ module mm_lane
   output logic            tap_pop,
   input  logic [E-1:0][R-1:0][EW-1:0] tap_data,
 
-  input  logic [31:0]     drn_cnt,
-  output logic [31:0]     cmp_cnt,
+  input  logic [HS-1:0]   drn_cnt,
+  output logic [HS-1:0]   cmp_cnt,
   output logic            active,
 
   input  logic            drd_en,
@@ -76,9 +76,9 @@ module mm_lane
   // Registered "drain has caught up" (drn_cnt == cmp_cnt), evaluated against
   // cmp_cnt's next value: it can only open late (drn_cnt only grows).
   logic        cmp_inc;
-  logic [31:0] cmp_cnt_n;
+  logic [HS-1:0] cmp_cnt_n;
   assign cmp_inc   = (end_step && m_fire) || (!end_step && flushing && fl_cnt == 4'd0);
-  assign cmp_cnt_n = cmp_cnt + {31'b0, cmp_inc};
+  assign cmp_cnt_n = cmp_cnt + HS'(cmp_inc);
   always_ff @(posedge clk) step_q <= !rst && (drn_cnt == cmp_cnt_n);
 
   logic [1:0] row_len_now;
@@ -109,7 +109,7 @@ module mm_lane
       if (end_step) begin
         prev_len <= 2'(DMIN);
         if (m_fire) begin
-          cmp_cnt    <= cmp_cnt + 32'd1;
+          cmp_cnt    <= cmp_cnt + HS'(1);
           active     <= issued_any;
           issued_any <= 1'b0;
           step_open  <= 1'b0;
@@ -120,7 +120,7 @@ module mm_lane
       end else if (flushing) begin
         if (fl_cnt == 4'd0) begin
           flushing   <= 1'b0;
-          cmp_cnt    <= cmp_cnt + 32'd1;
+          cmp_cnt    <= cmp_cnt + HS'(1);
           active     <= 1'b1;
           issued_any <= 1'b0;
           step_open  <= 1'b0;
@@ -228,8 +228,13 @@ module mm_lane
       );
     end
 
-    // drain: the word of row dr3, registered next to the group
-    always_ff @(posedge clk) drd_data[l] <= acc_rd[dr3];
+    // drain: the word of row dr3, registered next to the group.  keep: else
+    // Vivado absorbs this register into mm_drain's DSP48E2 as A1 / B1, which
+    // share RSTA / RSTB with A2 / B2 (the stage that zeroes an idle lane),
+    // and drops that reset
+    (* keep = "true" *) logic [31:0] dq4;
+    always_ff @(posedge clk) dq4 <= acc_rd[dr3];
+    assign drd_data[l] = dq4;
   end
 
 endmodule

@@ -62,8 +62,8 @@ module cv_wload
 
   assign wq_ready = !s_act;
 
-  logic [31:0] nrem;
-  assign nrem = j.out_ch - 32'({wq.mt_base, 4'b0});
+  logic [CHB-1:0] nrem;                    // out_ch <= MAXOC inside the contract
+  assign nrem = CHB'(j.out_ch) - CHB'({wq.mt_base, 4'b0});
 
   logic [8:0] to4k;
   logic [7:0] b_len;
@@ -96,7 +96,7 @@ module cv_wload
       if (!s_act && wq_valid) begin
         s_act    <= 1'b1;
         s_r      <= '0;
-        s_nruns  <= (nrem >= {25'b0, wq.g_n, 4'b0}) ? {4'b0, wq.g_n, 4'b0} : nrem[10:0];
+        s_nruns  <= (nrem >= CHB'({wq.g_n, 4'b0})) ? {4'b0, wq.g_n, 4'b0} : 11'(nrem);
         s_waddr  <= j.w_w + WA'(wq.w_off);
         s_stride <= j.dwm ? {9'b0, j.dw_words} : j.per_m_words;
         s_len    <= j.dwm ? {4'b0, j.dw_words}

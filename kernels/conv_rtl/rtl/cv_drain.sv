@@ -11,10 +11,10 @@
 // them into one of two transposer buffers — 8 channels per cycle, so a tile
 // with more than 8 valid channels takes two cycles per pixel; the emitter
 // reads the other buffer as runs of 8 consecutive pixels of one channel, one
-// output word per cycle, and hands the writer one run per (channel,
-// segment).  Pixel p of channel m1 lives in bank (m1 + p) mod 8 at address
-// m1 * 32 + p / 8, so the fill's 8 channels and the emitter's 8 pixels are
-// each spread over the 8 banks.
+// output word per cycle (its lanes rotated onto the run's alignment in y),
+// and hands the writer one run per (channel, segment).  Pixel p of channel
+// m1 lives in bank (m1 + p) mod 8 at address m1 * 32 + p / 8, so the fill's
+// 8 channels and the emitter's 8 pixels are each spread over the 8 banks.
 // ---------------------------------------------------------------------------
 module cv_drain
   import cv_pkg::*;
@@ -77,9 +77,14 @@ module cv_drain
 
   assign dr_ready = !f_act;
 
-  function automatic logic [4:0] mvalid(input logic [31:0] rem);
-    return (rem >= 32'(TM)) ? 5'(TM) : rem[4:0];
+  function automatic logic [4:0] mvalid(input logic [CHB-1:0] rem);
+    return (rem >= CHB'(TM)) ? 5'(TM) : rem[4:0];
   endfunction
+
+  // the channels from the next m-tile on (out_ch <= MAXOC inside the contract;
+  // past the last tile the value is not used)
+  logic [CHB-1:0] f_nrem;
+  assign f_nrem = CHB'(j.out_ch) - CHB'({f_mt + 7'd1, 4'b0});
 
   // one accumulator read per pixel, every cycle (mv <= 8) or every other
   assign f_issue = f_act && (f_p != f_len) && !full[f_buf] && !f_half;
@@ -105,8 +110,8 @@ module cv_drain
         f_seg0   <= '0;
         f_len    <= (dr.run_len >= 13'(DSEG)) ? 9'(DSEG) : dr.run_len[8:0];
         f_p      <= '0;
-        f_mv     <= mvalid(j.out_ch);
-        f_two    <= (j.out_ch > 32'd8);
+        f_mv     <= mvalid(CHB'(j.out_ch));
+        f_two    <= (CHB'(j.out_ch) > CHB'(8));
         f_half   <= 1'b0;
         f_word   <= '0;
         f_mbase  <= dr.y_cbase;
@@ -146,8 +151,8 @@ module cv_drain
             f_tig   <= f_tig + 7'd1;
             f_mbase <= f_mbase + j.y_cs16;
           end
-          f_mv    <= mvalid(j.out_ch - {21'b0, f_mt + 7'd1, 4'b0});
-          f_two   <= (j.out_ch - {21'b0, f_mt + 7'd1, 4'b0} > 32'd8);
+          f_mv    <= mvalid(f_nrem);
+          f_two   <= (f_nrem > CHB'(8));
           if (f_mt + 7'd1 == j.m_tiles) f_act <= 1'b0;
         end
       end
@@ -330,16 +335,18 @@ module cv_drain
       rd_v2 <= rd_v1;
       rd_v3 <= rd_v2;
     end
-    rd_rot1 <= e_m1[2:0];
+    rd_rot1 <= e_m1[2:0] - e_e[2:0];
     rd_rot2 <= rd_rot1;
     rd_rot3 <= rd_rot2;
   end
 
-  // the word: pixel q of the 8 is in bank (m1 + q) mod 8
+  // the word: pixel q of the 8 is in bank (m1 + q) mod 8, and goes to lane
+  // (q + e) mod 8 — the run's own alignment in y (e = e_e mod 8), so the y
+  // writer only picks each lane from this word or the previous one
   logic [BW-1:0] yw_in;
   always_comb
-    for (int q = 0; q < E; q++)
-      yw_in[q * EW +: EW] = t_rdata[3'(rd_rot3 + 3'(q)) * EW +: EW];
+    for (int l = 0; l < E; l++)
+      yw_in[l * EW +: EW] = t_rdata[3'(rd_rot3 + 3'(l)) * EW +: EW];
 
   cv_fifo #(.W(BW), .D(32), .BRAM(1'b0)) u_yq (
     .clk, .rst, .in_valid (rd_v3), .in_ready (yq_in_ready), .in_data (yw_in),

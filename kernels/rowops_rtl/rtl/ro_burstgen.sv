@@ -9,11 +9,16 @@
 //
 // `start` (one cycle, with `g` stable from then on) begins the walk; `done`
 // is high once the last burst has been taken (and before any start).
+// WIN = 0 / TILES = 0: the port's geometries never have a window (win_lo 0,
+// win_hi 2^32 - 1: no run index reaches it) / always one tile, so the window
+// compares / the tile level are left out.
 // ---------------------------------------------------------------------------
 module ro_burstgen
   import ro_pkg::*;
 #(
-  parameter int MAXB = 64                  // power of two, <= 256
+  parameter int MAXB  = 64,                // power of two, <= 256
+  parameter bit WIN   = 1'b1,              // g.win_lo / win_hi may mark runs outside the window
+  parameter bit TILES = 1'b1               // g.n_tiles may exceed 1
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -41,7 +46,9 @@ module ro_burstgen
   logic [WA-1:0] blk_next;                    // first word of the next block
   logic [31:0] run_i;                       // index of the current run within its block
   logic        zero_cur, zero_next;         // the current / next run is outside the window
-  assign zero_next = ((run_i + 32'd1) < g.win_lo) || ((run_i + 32'd1) >= g.win_hi);
+  logic        zero_first;                  // run 0 is outside the window
+  assign zero_next  = WIN && (((run_i + 32'd1) < g.win_lo) || ((run_i + 32'd1) >= g.win_hi));
+  assign zero_first = WIN && ((32'd0 < g.win_lo) || (32'd0 >= g.win_hi));
 
   // Next burst: min(rem, MAXB, words to the next 4 KiB boundary).  No
   // full-width carry chain follows `len` (300 MHz): the run end is decided
@@ -81,12 +88,13 @@ module ro_burstgen
       active  <= 1'b0;
       b_valid <= 1'b0;
     end else if (start) begin
-      active     <= g.en && (g.n_blk != '0) && (g.n_tiles != '0) && (g.n_runs != '0) && (g.run_words != '0);
+      active     <= g.en && (g.n_blk != '0) && (!TILES || g.n_tiles != '0) && (g.n_runs != '0) &&
+                    (g.run_words != '0);
       blks_left  <= g.n_blk;
       blk1       <= (g.n_blk == 32'd1);
       tiles_left <= g.n_tiles;
-      tile1      <= (g.n_tiles == 32'd1);
-      nt1        <= (g.n_tiles == 32'd1);
+      tile1      <= !TILES || (g.n_tiles == 32'd1);
+      nt1        <= !TILES || (g.n_tiles == 32'd1);
       runs_left  <= g.n_runs;
       run1       <= (g.n_runs == 32'd1);
       nr1        <= (g.n_runs == 32'd1);
@@ -96,7 +104,7 @@ module ro_burstgen
       tile_next  <= g.base_w[WA-1:0] + WA'(g.tile_w);
       blk_next   <= g.base_w[WA-1:0] + WA'(g.blk_w);
       run_i      <= '0;
-      zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
+      zero_cur   <= zero_first;
       b_valid    <= 1'b0;
     end else begin
       if (b_valid && b_ready) b_valid <= 1'b0;
@@ -107,7 +115,7 @@ module ro_burstgen
         b_zero  <= zero_cur;
         if (last) begin
           rem <= g.run_words;
-          if (run1 && tile1) begin          // the block ends
+          if (run1 && (!TILES || tile1)) begin   // the block ends
             if (blk1) active <= 1'b0;
             blks_left  <= blks_left - 32'd1;
             blk1       <= (blks_left == 32'd2);
@@ -120,8 +128,8 @@ module ro_burstgen
             tile_next  <= blk_next + WA'(g.tile_w);
             blk_next   <= blk_next + WA'(g.blk_w);
             run_i      <= '0;
-            zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
-          end else if (run1) begin          // the tile ends
+            zero_cur   <= zero_first;
+          end else if (TILES && run1) begin   // the tile ends
             tiles_left <= tiles_left - 32'd1;
             tile1      <= (tiles_left == 32'd2);
             runs_left  <= g.n_runs;
@@ -130,7 +138,7 @@ module ro_burstgen
             next_run_w <= tile_next + WA'(g.stride_w);
             tile_next  <= tile_next + WA'(g.tile_w);
             run_i      <= '0;
-            zero_cur   <= (32'd0 < g.win_lo) || (32'd0 >= g.win_hi);
+            zero_cur   <= zero_first;
           end else begin
             runs_left  <= runs_left - 32'd1;
             run1       <= (runs_left == 32'd2);

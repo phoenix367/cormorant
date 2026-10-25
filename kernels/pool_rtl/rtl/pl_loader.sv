@@ -48,7 +48,7 @@ module pl_loader
   // Run generator -------------------------------------------------------------------
   // run_off = base_in + ih * in_w + c * in_hw, kept incrementally.
   logic        g_act;
-  logic [31:0] g_ih, g_rows, g_row_off, g_run_off;
+  logic [31:0] g_ih, g_row_off, g_run_off;
   logic [2:0]  g_c, g_clast;
   logic [6:0]  g_len;
 
@@ -79,7 +79,6 @@ module pl_loader
       g_act     <= (j.rows != '0);
       g_ih      <= '0;
       g_c       <= '0;
-      g_rows    <= j.rows;
       g_clast   <= 3'(cq.c_valid - 4'd1);
       g_len     <= cq.run_len;
       g_row_off <= cq.base_in;
@@ -90,7 +89,7 @@ module pl_loader
         g_ih      <= g_ih + 32'd1;
         g_row_off <= g_row_off + j.in_w;
         g_run_off <= g_row_off + j.in_w;
-        if (g_ih + 32'd1 == g_rows) g_act <= 1'b0;
+        if (g_ih + 32'd1 == j.rows) g_act <= 1'b0;
       end else begin
         g_c       <= g_c + 3'd1;
         g_run_off <= g_run_off + j.in_hw;

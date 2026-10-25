@@ -55,14 +55,18 @@ package pl_pkg;
     mode_t       mode;
   } job_t;
 
-  // One (batch, channel tile, W-tile) chunk.
+  // One (batch, channel tile, W-tile) chunk.  A tap of the tile lies within
+  // LBC - 1 columns of (ow_lo, tap 0): (ow_span - 1) * stride_w + reach_w < LBC
+  // (ow_tile), so the emitter's local columns of its taps are 7-bit signed
+  // (col_base + 0 .. 63, col_base >= -64); a tile that starts further left
+  // than -64 is padded whole, whatever its column base.
   typedef struct packed {
     logic [3:0]  c_valid;              // 1 .. 8 channels
     logic [6:0]  ow_span;              // 1 .. 64 output columns
     logic [6:0]  n_groups;             // window groups per output row
     logic [6:0]  run_len;              // input columns read per row (<= 64)
-    logic [31:0] col_base;             // local input column of (ow_lo, tap 0), signed
-    logic [31:0] lo_lim, hi_lim;       // in-bounds local columns: [lo_lim, hi_lim), signed
+    logic [6:0]  col_base;             // local input column of (ow_lo, tap 0): min(iw_start, 0), at least -64 (signed)
+    logic [6:0]  hi_lim;               // in-bounds local columns: [0, hi_lim), in_w - iw_lo clamped to 0 .. 64
     logic [31:0] base_in;              // element of (plane, row 0, iw_lo)
     logic [31:0] base_out;             // element of (plane, out row 0, ow_lo)
   } chunk_t;

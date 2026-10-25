@@ -164,7 +164,9 @@ module vo_smx
   logic [24:0] dv_quo;
   logic        dv_ge;
   logic [27:0] acc [NQ];                    // row: lane sums (S in acc[0] after SRED); column: per query
-  logic [24:0] rr [NQ];                     // R per vector
+  (* ram_style = "distributed" *)
+  logic [24:0] rr [NQ];                     // R per vector (LUTRAM: one write per division)
+  logic        rr_we;
 
   // pipeline valid / OUT tags
   logic [NP-1:0] pv, po;
@@ -262,8 +264,6 @@ module vo_smx
             dv_it  <= dv_it - 5'd1;
             if (dv_it == 5'd1) begin
               dv_busy <= 1'b0;
-              for (int q = 0; q < NQ; q++)
-                if (dv_q == 4'(q)) rr[q] <= (dv_s == '0) ? '0 : {dv_quo[23:0], dv_ge};
               dv_q <= dv_q + 4'd1;
               if (dv_q == k_vl) begin
                 st      <= S_OUT;
@@ -303,6 +303,10 @@ module vo_smx
       endcase
     end
   end
+
+  assign rr_we = !rst && (st == S_DIV) && dv_busy && (dv_it == 5'd1);
+  always_ff @(posedge clk)
+    if (rr_we) rr[dv_q] <= (dv_s == '0) ? '0 : {dv_quo[23:0], dv_ge};
 
   // Valid lengths, maxima, sums -------------------------------------------------------------------
   logic newu;                               // a unit begins: maxima and sums cleared
@@ -394,7 +398,10 @@ module vo_smx
   logic [16:0] lim3 [E];
   logic [18:0] pos3 [E];
   logic [15:0] d4 [E], da5 [E];
-  logic [39:0] dm6 [E], dp7 [E], s8 [E], y9 [E];
+  logic [39:0] dm6 [E], dp7 [E];
+  logic [23:0] s8 [E];                      // (d Cm >> 8 Cs[5:3])[23:0]
+  logic [16:0] y9 [E];                      // (d Cm >> Cs)[16:0]
+  logic [E-1:0] h8, ov9;                    // the bits above them non-zero
   logic [E-1:0] mk4, mk5, mk6, mk7, mk8, mk9;
   logic [11:0] ra10 [E];
   logic [4:0]  sh10 [E], sh11 [E], sh12 [E];
@@ -417,13 +424,21 @@ module vo_smx
       da5[l]  <= d4[l];
       dm6[l]  <= da5[l] * k_cm;
       dp7[l]  <= dm6[l];
-      // r8, r9: y = d Cm >> Cs
-      s8[l]   <= dp7[l] >> {k_cs[5:3], 3'b0};
-      y9[l]   <= s8[l] >> k_cs[2:0];
+      // r8, r9: y = d Cm >> Cs, its low 17 bits and whether the rest is non-zero
+      begin
+        logic [39:0] t8;
+        logic [23:0] t9;
+        t8      = dp7[l] >> {k_cs[5:3], 3'b0};
+        s8[l]   <= t8[23:0];
+        h8[l]   <= t8[39:24] != '0;
+        t9      = s8[l] >> k_cs[2:0];
+        y9[l]   <= t9[16:0];
+        ov9[l]  <= h8[l] || (t9[23:17] != '0);
+      end
       // r10: the table address; e = 0 past the table's 17 bits or on a masked lane
       ra10[l] <= y9[l][11:0];
       sh10[l] <= y9[l][16:12];
-      z10[l]  <= !mk9[l] || (y9[l][39:17] != '0) || (y9[l][16:12] > 5'd16);
+      z10[l]  <= !mk9[l] || ov9[l] || (y9[l][16:12] > 5'd16);
       // r11, r12: the table (vo_smx_rom)
       sh11[l] <= sh10[l];
       sh12[l] <= sh11[l];
@@ -467,7 +482,9 @@ module vo_smx
   logic [24:0] rr15;
   logic [41:0] em16 [E];
   logic [47:0] ep17 [E];
-  logic [38:0] o18 [E], o19 [E];
+  logic [21:0] o18 [E];                     // (e R + k_rnd >> 9 >> 8 k_sft[4:3])[21:0]
+  logic [14:0] o19 [E];                     // P before the saturation
+  logic [E-1:0] h18, sat19;                 // the bits above them non-zero
   logic [EW-1:0] p20 [E];
 
   always_ff @(posedge clk) begin
@@ -478,9 +495,17 @@ module vo_smx
       em16[l] <= ea15[l] * rr15;
       ep17[l] <= 48'(em16[l]) + k_rnd;
       // r18, r19: >> (40 - f_p) = >> 9 >> k_sft;  r20: saturate
-      o18[l]  <= ep17[l][47:9] >> {k_sft[4:3], 3'b0};
-      o19[l]  <= o18[l] >> k_sft[2:0];
-      p20[l]  <= (o19[l][38:15] != '0) ? 16'h7FFF : {1'b0, o19[l][14:0]};
+      begin
+        logic [38:0] t18;
+        logic [21:0] t19;
+        t18     = ep17[l][47:9] >> {k_sft[4:3], 3'b0};
+        o18[l]  <= t18[21:0];
+        h18[l]  <= t18[38:22] != '0;
+        t19     = o18[l] >> k_sft[2:0];
+        o19[l]  <= t19[14:0];
+        sat19[l] <= h18[l] || (t19[21:15] != '0);
+      end
+      p20[l]  <= sat19[l] ? 16'h7FFF : {1'b0, o19[l]};
     end
   end
 

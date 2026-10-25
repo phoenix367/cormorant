@@ -95,15 +95,15 @@ ctrl ─► config ─► sweep sequencer ─┬► x loader: row runs ─► AR
 | module | role |
 |---|---|
 | `cv_ctrl_s_axi` | the AXI-Lite slave (the RTL PoolingKernel's, with this register table); a write's data and strobes are registered at the W handshake and land with BVALID, a read's address at the AR handshake and its data (and the clear-on-read bits) are taken a cycle later |
-| `cv_core` | the reset registered (a copy for the control slave), a unit reset per unit, the three read channels registered at the boundary (RREADY is always high: a pure delay); job FSM: latch the registers (every cycle while idle); the products the job needs through one pipelined DSP multiplier and three dividers (65 536 / row words, the ow-tile and the line-buffer row cap), about 40 cycles per job; the contract; the sweep sequencer (image, chunk, input tile, ow-tile, m-group — offsets by increments) feeding a 4-deep descriptor FIFO per unit; `ap_done` when every unit is idle |
+| `cv_core` | the reset registered (a copy for the control slave), a unit reset per unit, the three read channels registered at the boundary (RREADY is always high: a pure delay); job FSM: latch the registers (every cycle while idle); the products the job needs through one pipelined DSP multiplier and two dividers (65 536 / row words on one; the ow-tile, then the line-buffer row cap on the other, both within the first's time; divisors of 17 and 7 bits, a stride from 64 on taken as 64 — the quotient is 0 either way), about 40 cycles per job; the contract; the job constants the units read (`j`: the latched registers and products as they stand, only `n_win`, `dw_words`, `y_cs`, `y_cs16` registered); the sweep sequencer (image, chunk, input tile, ow-tile, m-group — offsets by increments) feeding a 4-deep descriptor FIFO per unit; `ap_done` when every unit is idle |
 | `cv_xload` | for the first m-group of each (chunk, input tile, ow-tile): the input rows the line buffer lacks, each as one run per channel (≤ 16 beats, split at 4 KiB) into one half of a ping-pong row buffer; AR only into a free half, so RREADY stays high; ≤ 16 bursts outstanding; the row buffer's write through a register stage (the address a copy per bank), a word counted when it lands; out comes one column of 16 channels per cycle.  Its 144-byte runs are what the CCI throttles to ~0.4 beats per cycle: in the block design gmem0 goes to `S_AXI_HP2_FPD` (DEPTHWISE_PLAN §8.5) |
 | `cv_patch` | the line buffer — 16 channel banks of 16 rows × 64 columns (block RAM, row ih mod 16, column iw mod 64), **two copies per bank** so loads and window reads never share a port (each copy written through port A, read through port B: copy 0 for pixel 0 of a pair, copy 1 for pixel 1); a writer that loads, per output row, the new rows from the loader, and an emitter that reads, per pixel pair and window position, one beat of both pixels' 16-lane columns once the writer has finished that output row — the writer runs one output row ahead when the rows it writes cannot alias the rows the emitter reads (`stride_h + reach_h < 16`; DEPTHWISE_PLAN option B3), else it waits as the HLS producer did; lanes outside the input, past the tile's channels or of a pixel outside the ow-tile zero; the banks' ports through a register stage (a copy per 2 banks, each driving both copies) and the reads through the RAMs' output registers: a beat three cycles after its read; a 64-beat patch FIFO |
 | `cv_wload` | per sweep one run per output channel of the slab (standard: n_pos positions × two 8-lane beats, one for a half tile; depthwise: dw_words beats of 8 positions); a run requested only when the 512-vector FIFO can take it all; ≤ 8 bursts outstanding |
-| `cv_bias` | at job start the whole bias vector (one burst, two across 4 KiB) into a 16-lane word per m-tile (LUT RAM; the write through a register stage, the read address registered) |
+| `cv_bias` | at job start the whole bias vector (one burst, two across 4 KiB) into a 16-lane word per m-tile (LUT RAM in two banks, m-tiles 0–63 and 64–79: 64 + 16 words; the write through a register stage, the read address registered) |
 | `cv_engine` | the weight cache (16 columns × 512 words of 16 lanes, 8 columns in block RAM and 8 in UltraRAM; two banks, the next sweep's slab fills while the current one is read; depthwise slabs written as diagonal words, column m1 holding only lane m1); the issue sequencer (one instant per cycle: output row, pixel pair, m-tile, window position; m-tiles 1..G−1 replay the pair's patch beats from a 64-entry file); the MAC grid — 2 pixels × 16 columns of `cv_mac_chain` (16 DSP48E2 each); seeds (the bias for the first input tile, else the stored partial sum) and write-back; two accumulator buffers of 4096 × 16 × 32 bits (UltraRAM), one per chunk parity; every broadcast a register tree (below) |
 | `cv_mac_chain` | one (pixel, column) chain: lane l's product enters DSP l through the PCIN cascade with skewed operands, the seed at DSP 0's C port, DSP 15 accumulates over the window positions (W = P); behavioural model for Verilator, the DSP48E2 primitive for Vivado |
-| `cv_drain` | per finished chunk: per (m-tile, 256-pixel segment) the accumulator words, saturated, scattered into a transposer of 8 block-RAM banks (2 buffers × 16 channels × 32 words; the scatter and the read address through a register per bank, the read through the output register); then one run per channel, 8 pixels per output word |
-| `cv_ywriter` | per run the words shifted onto the y alignment, one AW burst (two across 4 KiB), byte strobes on the run's lanes, a 32-beat W FIFO, ≤ 8 bursts awaiting B |
+| `cv_drain` | per finished chunk: per (m-tile, 256-pixel segment) the accumulator words, saturated, scattered into a transposer of 8 block-RAM banks (2 buffers × 16 channels × 32 words; the scatter and the read address through a register per bank, the read through the output register); then one run per channel, 8 pixels per output word, rotated onto the run's alignment in y (pixel q in lane (q + e) mod 8); only channels below the m-tile's valid count are emitted |
+| `cv_ywriter` | per run each output lane taken from the drain's current or previous word (the drain rotated them onto the y alignment), one AW burst (two across 4 KiB), byte strobes on the run's lanes, a 32-beat W FIFO, ≤ 8 bursts awaiting B |
 
 **Differences from the HLS kernel's structure** (the results are the same):
 no bias initialisation pass (the first input tile seeds from the bias RAM);
@@ -135,9 +135,9 @@ fan-out to several DSP columns):
 
 | signal | tree (from the issue cycle I) |
 |---|---|
-| weight-cache read address | one register (I + 1); a column is four 64-bit RAMs, one per group of 4 lanes, and group k reads 4k cycles later (the address and the column mask delayed once, then a copy per column and group at I + 2 + 4k); the RAM latch, its output register (I + 4 + 4k); the column mask (I + 5 + 4k); lane 4k + r then goes straight (r = 0, 1) or through r − 1 registers to its two DSPs' A ports, whose A1 / A2 (and, r ≠ 0, AD) registers make up the rest of its skew (lane l at the multiplier with the patch at E + l + 1) — no shift registers; the bank is released 12 cycles later (AREA_PLAN, 2026-10-14) |
+| weight-cache read address | one register (I + 1); a column is four 64-bit RAMs, one per group of 4 lanes, and group k reads 4k cycles later (the address delayed once, then a copy per column and group at I + 2 + 4k); the RAM latch, its output register (I + 4 + 4k); one more register in the fabric (I + 5 + 4k; `keep`, else synthesis takes it into the UltraRAM's output pipeline) — no column mask since AREA_PLAN §6: a column past the m-tile's channels feeds only lanes of channels ≥ out_ch; lane 4k + r then goes straight (r = 0, 1) or through r − 1 registers to its two DSPs' A ports, whose A1 / A2 (and, r ≠ 0, AD) registers make up the rest of its skew (lane l at the multiplier with the patch at E + l + 1) — no shift registers; the bank is released 12 cycles later (AREA_PLAN, 2026-10-14) |
 | patch lanes | a root chain I + 1 … I + 6 (zeroed at I + 2 for bubbles); per lane one register (E + l − 2), a copy per column group of 4 (E + l − 1), a copy per chain (E + l), into the DSP's B port |
-| seeds | the accumulator word at I + 3 (output register), the chunk's buffer at I + 4, bias or partial sum and the column mask at I + 5, a copy near the columns at I + 6, per chain gated by the pixel's seed position at E + 1 = I + 7 (the gates: per group, then per chain) |
+| seeds | the issue's accumulator address registered once more (I + 1), the word at I + 4 (output register), the chunk's buffer, the bias or the partial sum selected in one step at I + 5 (no column mask), a copy near the columns at I + 6, per chain gated by the pixel's seed position at E + 1 = I + 7 (the gates: per group, then per chain) |
 | `wfb` | one register, a copy per group, one per chain (into the OPMODE register) |
 | write-back | the pixel multiplexer next to the chains (its select per group, then per column), a middle register, a copy per buffer next to its UltraRAMs: stores at I + LAT + 3 (pixel 0) and one cycle later |
 | weight-cache fill | one register, a copy per column group (each drives 4 columns' RAMs) |
@@ -157,7 +157,14 @@ SRL: the weight skew left the SRLs, `doc/plans/AREA_PLAN.md`), 37 497 FF,
 pass 18 253 LUT (3 758 LUTRAM, 2 390 SRL), 39 731 FF.  With the y channel
 pattern (RPU_PLAN §13.9, out of context at 300 MHz): WNS +0.026 ns, 14 973
 LUT, 37 793 FF, 60 BRAM tiles, 48 URAM, 518 DSP — the worst paths in the
-weight and x loaders, the drain's own +0.110 ns.  The retired HLS
+weight and x loaders, the drain's own +0.110 ns.  After the LUT / FF pass
+of AREA_PLAN §6 (2026-10-24, out of context at 3.333 ns, Vivado 2025.2;
+the production RTL in the same flow 14 973 LUT (4 046 LUTRAM, 511 SRL),
+37 793 FF, WNS +0.026 ns, as above): WNS +0.001 ns — the worst paths the
+sweep sequencer's image test (`s_ni` into the `s_yn` enables, four carry
+levels), the x loader and the patch replay file's write address — 13 749
+LUT (3 898 LUTRAM, 487 SRL), 36 187 FF, 60 BRAM tiles, 48 URAM, 518 DSP;
+results and cycle counts unchanged.  The retired HLS
 kernel, routed in the bitstreams that carried it: 37 233 LUT, 41 457 FF,
 46 RAMB36 + 16 RAMB18, 48 URAM, 803 DSP.
 
@@ -244,11 +251,15 @@ written).
 
 ## 6. Invariants for changes
 
-- **Units latch the job.**  `j` (the latched registers) changes while the
-  next job is configured, before the units' reset; anything a unit still
-  compares after its job (the bias loader's word count) is latched at its
-  start.  `j` is loaded a cycle before the units' reset rises, so a unit may
-  keep a registered copy of the fields it uses (the engine does).
+- **Units read the job from the latched registers.**  `j` is wires: the
+  `q_*` registers (taken every cycle while idle, so they hold from T_PA) and
+  the configuration's products (from their T_PA / T_PB cycle) until the next
+  job's T_PA; only `n_win`, `dw_words`, `y_cs` and `y_cs16` are registered
+  (at `j_ld`, a cycle before T_SEQ).  A unit reads `j` only between its reset
+  at `job_start` and `ap_done`; anything it still compares after its job
+  (the bias loader's word count) is latched at its start.  `j` is complete a
+  cycle before the units' reset rises, so a unit may keep a registered copy
+  of the fields it uses (the engine does).
 - **Weight-cache banks.**  Slab k lives in bank k mod 2.  The fill counts
   slabs begun (`cB`) and filled (`cF`), the issue sweeps started (`cS`) and
   done reading (`cR`): a fill begins only while `cB − cR < 2`, a sweep
@@ -264,10 +275,24 @@ written).
   reads stored partial sums starts only when the previous sweep's
   write-backs are done (no instant in the control line up to its last store,
   `LSTO`) or that sweep was at least `HAZ` = 80 instants long: a word's next
-  read (issue + 1) comes at least L − n_win + 2 cycles after its last
-  instant, its store at issue + LAT + WBS, so `HAZ` ≥ LAT + WBS − 2 + 49
-  (checked at elaboration; 74 now).  A finished chunk goes to the drain in
-  the cycle of its last store.
+  read (issue + 2: the address is registered twice) comes at least
+  L − n_win + 3 cycles after its last instant, its store at
+  issue + LAT + WBS, so `HAZ` ≥ LAT + WBS − 2 + 49 (checked at elaboration
+  with the read at issue + 1, one cycle to spare; 74 now).  A finished
+  chunk goes to the drain in the cycle of its last store.
+- **Lanes of channels ≥ out_ch are don't-care** (AREA_PLAN §6): the weight
+  cache's columns past the m-tile's channels hold stale weights and the
+  seeds are not masked, so those accumulator lanes carry any value; every
+  word's first sweep seeds from the bias (or 0), and the drain emits only
+  the channels below `mv`.  Logic that reads those lanes must mask them.
+- **Channel counts are `CHB` = 11 bits** (`cv_pkg`, `$clog2(MAXOC + 1)`):
+  the sequencer's channels left, the fill's and the weight loader's
+  remainders and the drain's are exact only inside the contract
+  (out_ch ≤ 1280, in_ch ≤ 1024; elaboration fails if `MAXIC` > `MAXOC`).
+- **The y lanes**: the drain rotates a word by `(e_m1 − e_e)[2:0]`, so its
+  pixel q is in lane (q + e) mod 8 of the run's alignment e, and the y
+  writer takes lane l of output word k from word k (l ≥ e mod 8) or k − 1;
+  the two must change together.
 - **The transposer** buffer of a segment is taken from the segment's last
   read on (its scatter takes 4–5 more cycles), so the fill never starts the
   segment after next in it.
@@ -293,8 +318,8 @@ written).
   landed count is a prefix.
 - **Chain timing** (`cv_mac_chain`): lane l's operands at E + l, the seed at
   E + 1, `wfb` at E + 16, the sum at E + 18.  E = issue + `D_E` (6: the
-  weight cache's address tree, latch and output register, the mask, the
-  operand register), so the issue-to-chain-output latency `LAT` = 24; the
+  weight cache's address tree, latch and output register, a fabric register,
+  the operand register), so the issue-to-chain-output latency `LAT` = 24; the
   stores follow `WBS` = 3 registers later.  Every delay line in `cv_engine`
   follows from `D_E`, `LAT` and `WBS`; the seed, patch, `wfb` and write-back
   trees each tap the control line at the stage their depth needs.  A change

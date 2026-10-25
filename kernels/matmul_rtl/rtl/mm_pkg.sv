@@ -46,6 +46,13 @@ package mm_pkg;
   // its first request at t + FLUSH + 3 at the earliest.
   localparam int FLUSH   = 6;
 
+  // The step / panel handshake counters (awr_cnt, xpf_cnt, cmp_cnt, drn_cnt,
+  // the walker's n_steps) count modulo 2^HS: every pair compared differs by at
+  // most 5 (a step queue's 4 entries and the step the drain holds; the
+  // barriers keep awr - xpf and cmp - drn in {0, 1}), so the compares decide
+  // as the full counts would.
+  localparam int HS      = 4;
+
   // Tap FIFO between the x prefetcher and the MAC array (row sets).
   localparam int TAP_D   = 16;
   localparam int TAP_AW  = 4;
@@ -93,9 +100,8 @@ package mm_pkg;
   // Step = one (batch slice, panel, column chunk) of the job.
   typedef struct packed {
     logic [AB-1:0] a_addr;    // byte address of A row n_off
-    logic [AB-1:0] b_addr;    // byte address of this batch slice of B
+    logic [AB-1:0] b_addr;    // byte address of the chunk in this batch slice of B (packed: tile c0 / 32; image: column c0 of plane 0)
     logic [AB-1:0] c_addr;    // byte address of C[n_off][c0]
-    logic [31:0] c0;          // first column of the chunk
     logic [9:0]  mcc;         // columns in the chunk (1..512)
     logic [3:0]  n_valid;     // panel rows (1..R)
     logic        a_load;      // this step (re)loads the A panel

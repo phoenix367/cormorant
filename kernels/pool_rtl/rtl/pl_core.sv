@@ -349,36 +349,50 @@ module pl_core
   // ow_tile is set in T_PB's first cycle, used by its products 2 and 3 (ci 2, 3).
   assign ok_job = contract && (q_batch != '0) && (q_ch != '0) && (q_out_h != '0) && (q_out_w != '0);
 
-  // job constants (stable from T_SEQ on; reach_h ... ohs are phase A's)
+  // job constants.  The latched arguments and phase A's products (reach_h ...
+  // denom) do not change from T_PB until the next ap_start, and T_DONE waits
+  // for every unit to be idle, so the units read those registers directly;
+  // the rows and the decoded flags are registered here (stable from T_SEQ on).
+  logic [31:0] j_rows;
+  logic        j_gw2, j_prefetch, j_cip;
+  mode_t       j_mode;
   always_ff @(posedge clk) begin
     if (tstate == T_PB && ci == 4'd7) begin
       logic [31:0] t;
       t = ohs + reach_h - q_pt;            // the last input row any output row needs (signed)
-      j.x_w      <= q_x[63:4];
-      j.y_w      <= q_y[63:4];
-      j.in_h     <= q_in_h;
-      j.in_w     <= q_in_w;
-      j.out_h    <= q_out_h;
-      j.out_w    <= q_out_w;
-      j.in_hw    <= in_hw;
-      j.out_hw   <= out_hw;
-      j.stride_h <= q_sh;
-      j.stride_w <= q_sw;
-      j.dil_h    <= q_dh;
-      j.dil_w    <= q_dw;
-      j.pad_top  <= q_pt;
-      j.reach_h  <= reach_h;
-      j.rows     <= t[31] ? 32'd0 : ((t >= q_in_h) ? q_in_h : t + 32'd1);
-      j.pool_h   <= q_ph[2:0];
-      j.pool_w   <= q_pw[2:0];
-      j.red_len  <= denom[5:0];
-      j.denom_all <= denom[5:0];
-      j.gw2      <= (q_sw[2:0] != 3'd0);
-      j.prefetch <= (reach_h + 32'd1 + q_sh <= 32'(LBR));
-      j.cip      <= (q_cip != '0);
-      j.mode     <= (q_type == 32'd0) ? M_MAX : (q_type == 32'd1) ? M_AVG :
+      j_rows     <= t[31] ? 32'd0 : ((t >= q_in_h) ? q_in_h : t + 32'd1);
+      j_gw2      <= (q_sw[2:0] != 3'd0);
+      j_prefetch <= (reach_h + 32'd1 + q_sh <= 32'(LBR));
+      j_cip      <= (q_cip != '0);
+      j_mode     <= (q_type == 32'd0) ? M_MAX : (q_type == 32'd1) ? M_AVG :
                     (q_lp == 32'd1) ? M_LP1 : M_LP2;
     end
+  end
+
+  always_comb begin
+    j.x_w       = q_x[63:4];
+    j.y_w       = q_y[63:4];
+    j.in_h      = q_in_h;
+    j.in_w      = q_in_w;
+    j.out_h     = q_out_h;
+    j.out_w     = q_out_w;
+    j.in_hw     = in_hw;
+    j.out_hw    = out_hw;
+    j.stride_h  = q_sh;
+    j.stride_w  = q_sw;
+    j.dil_h     = q_dh;
+    j.dil_w     = q_dw;
+    j.pad_top   = q_pt;
+    j.reach_h   = reach_h;
+    j.rows      = j_rows;
+    j.pool_h    = q_ph[2:0];
+    j.pool_w    = q_pw[2:0];
+    j.red_len   = denom[5:0];
+    j.denom_all = denom[5:0];
+    j.gw2       = j_gw2;
+    j.prefetch  = j_prefetch;
+    j.cip       = j_cip;
+    j.mode      = j_mode;
   end
 
   always_ff @(posedge clk) start_q <= job_start;
@@ -398,6 +412,8 @@ module pl_core
   qst_t        qs;
   logic [31:0] s_ni, s_cleft, s_bin_n, s_bout_n, s_bin_c, s_bout_c, s_owlo, s_awlo;
   logic        k_last;                     // the W-tile is the row's last
+  logic        k_cmore, k_nlast;           // Q_K1 -> Q_PUSH: channels left after this tile, the last batch
+  logic [8:0]  k_hl;                       // Q_KE -> Q_K2: in_w - lo: [6:0], < 0, >= 64
   logic [6:0]  k_span;
   logic [3:0]  k_cv;
   logic [31:0] k_iws, k_iwe;               // first / last input column of the tile (signed)
@@ -423,16 +439,21 @@ module pl_core
         Q_K1: begin
           logic [31:0] left;
           left   = j.out_w - s_owlo;
-          k_last <= (left <= 32'(ow_tile));
-          k_span <= (left <= 32'(ow_tile)) ? 7'(left) : ow_tile;
-          k_cv   <= (s_cleft >= 32'(TC)) ? 4'(TC) : 4'(s_cleft);
-          k_iws  <= s_awlo - q_pl;
-          k_mid  <= s_awlo + owt1_sw;
-          k_rwp  <= reach_w - q_pl;
-          qs     <= Q_KE;
+          k_last  <= (left <= 32'(ow_tile));
+          k_span  <= (left <= 32'(ow_tile)) ? 7'(left) : ow_tile;
+          k_cv    <= (s_cleft >= 32'(TC)) ? 4'(TC) : 4'(s_cleft);
+          k_cmore <= (s_cleft > 32'(TC));
+          k_nlast <= (s_ni + 32'd1 == q_batch);
+          k_iws   <= s_awlo - q_pl;
+          k_mid   <= s_awlo + owt1_sw;
+          k_rwp   <= reach_w - q_pl;
+          qs      <= Q_KE;
         end
         Q_KE: begin
+          logic [31:0] hl;
+          hl     = j.in_w - (k_iws[31] ? 32'd0 : k_iws);
           k_iwe  <= (k_last ? lastw : k_mid) + k_rwp;
+          k_hl   <= {hl[31], hl[30:6] != '0, hl[6:0]};
           qs     <= Q_K2;
         end
         Q_K2: begin
@@ -443,9 +464,9 @@ module pl_core
           k.ow_span  <= k_span;
           k.n_groups <= j.gw2 ? 7'((8'(k_span) + 8'd1) >> 1) : k_span;
           k.run_len  <= 7'(hi - lo + 32'd1);
-          k.col_base <= k_iws - lo;
-          k.lo_lim   <= 32'd0 - lo;
-          k.hi_lim   <= j.in_w - lo;
+          // k_iws - lo = min(k_iws, 0), clamped to -64 (pl_pkg chunk_t)
+          k.col_base <= !k_iws[31] ? 7'd0 : (&k_iws[31:6]) ? k_iws[6:0] : 7'h40;
+          k.hi_lim   <= k_hl[8] ? 7'd0 : k_hl[7] ? 7'd64 : k_hl[6:0];
           k.base_in  <= s_bin_c + lo;
           k.base_out <= s_bout_c + s_owlo;
           qs <= Q_PUSH;
@@ -455,11 +476,11 @@ module pl_core
           if (k_last) begin
             s_owlo <= '0;
             s_awlo <= '0;
-            if (s_cleft > 32'(TC)) begin
+            if (k_cmore) begin
               s_cleft  <= s_cleft - 32'(TC);
               s_bin_c  <= s_bin_c + {in_hw[28:0], 3'b0};
               s_bout_c <= s_bout_c + {out_hw[28:0], 3'b0};
-            end else if (s_ni + 32'd1 == q_batch) begin
+            end else if (k_nlast) begin
               seq_done <= 1'b1;
               qs       <= Q_OFF;
             end else begin

@@ -150,7 +150,7 @@ module ro_core #(
   // T_IDLE -> T_LAT (the job registers j_* load) -> T_CFG0 .. T_CFG2 -> [T_PLD, T_PWAIT]
   // -> T_RUN -> T_DONE (ap_done).  A chain (chain_n != 0, §1.6) goes T_LAT -> T_DF /
   // T_DFW (the descriptors fetched into the descriptor RAM) -> T_DLD -> T_LAT (j_* load
-  // from the RAM's registered read, the index moves on) -> ... -> T_RUN, and from T_RUN
+  // from the RAM's read at the job index, which moves on) -> ... -> T_RUN, and from T_RUN
   // back to T_DLD for the next job; T_DONE only after the last.
   typedef enum logic [3:0] {T_IDLE, T_LAT, T_CFG0, T_CFG1, T_CFG2, T_PLD, T_PWAIT, T_RUN, T_DONE,
                             T_DF, T_DFW, T_DLD} tst_t;
@@ -171,7 +171,9 @@ module ro_core #(
   logic [3:0]  ta, tb, tc;                    // tails
   logic        job_start, start_q, start_q2, job_done;
   logic        pld_start, pld_q, pld_q2;      // the P load's port start
-  geom_t       ga, gb, gc, gp, gb_cur;
+  geom_t       ga, gc, gb_cur;
+  logic        gb_en;                         // stream B is read (ld_g)
+  logic [31:0] gb_words, gp_words;            // words per row of stream B, entries of the P load (T_CFG1)
 
   function automatic void row_words(input logic [1:0] kind, input logic [31:0] n,
                                     output logic [31:0] words, output logic [3:0] tail);
@@ -226,10 +228,11 @@ module ro_core #(
   // ROPE's segments per row, n / HD, and FOLD's reciprocal ceil(2^24 / m) =
   // (2^24 + m - 1) / m: a restoring divider, one bit per cycle, started with the
   // geometries (ld_g); T_CFG2 waits for it (32 cycles, ROPE and FOLD jobs only).
+  // (the divisor is below 2^12, so is the remainder)
   logic        div_busy;
   logic [5:0]  div_cnt;
-  logic [32:0] div_rem;
-  logic [31:0] div_q, div_num, div_den;
+  logic [11:0] div_rem, div_den;
+  logic [31:0] div_q, div_num;
   always_ff @(posedge clk) begin
     if (rst) begin
       div_busy <= 1'b0;
@@ -239,16 +242,16 @@ module ro_core #(
       div_rem  <= '0;
       div_q    <= '0;
       div_num  <= is_fold ? 32'h0100_0000 + 32'(j_aux[10:4]) - 32'd1 : j_n;
-      div_den  <= is_fold ? 32'(j_aux[10:4]) : 32'(j_aux[11:0]);
+      div_den  <= is_fold ? 12'(j_aux[10:4]) : j_aux[11:0];
     end else if (div_busy) begin
-      logic [32:0] t;
-      t = {div_rem[31:0], div_num[31]};
+      logic [12:0] t;
+      t = {div_rem, div_num[31]};
       div_num <= {div_num[30:0], 1'b0};
       if (t >= {1'b0, div_den}) begin
-        div_rem <= t - {1'b0, div_den};
+        div_rem <= 12'(t - {1'b0, div_den});
         div_q   <= {div_q[30:0], 1'b1};
       end else begin
-        div_rem <= t;
+        div_rem <= t[11:0];
         div_q   <= {div_q[30:0], 1'b0};
       end
       div_cnt <= div_cnt + 6'd1;
@@ -265,9 +268,7 @@ module ro_core #(
   logic [3:0]  jidx;                          // the descriptor RAM's read index: the next job to load
   logic        dfe_start, dfe_q, dfe_q2;      // the descriptor fetch's port start
   logic        dfetch;                        // port B's words are descriptor beats
-  logic        d_we;                          // the registered beat is written to the RAM
-  logic [6:0]  dw, d_at;                      // beats taken: descriptor [6:3], beat [2:0]; the registered one
-  logic [BW-1:0] d_data;
+  logic [6:0]  dw;                            // beats taken: descriptor [6:3], beat [2:0]
   geom_t       gd;                            // the list: one run of min(chain_n, 16) * 8 words
 
   always_ff @(posedge clk) begin
@@ -296,9 +297,9 @@ module ro_core #(
         ch_base <= r_chain[63:4];
         jidx    <= '0;
       end
-      // A chain's job loads its descriptor (ld_j in T_LAT): the read index moves on to the
-      // next one at once (the RAM's output register holds it long before the job ends),
-      // so job_done reaches the state alone, as for a single job.
+      // A chain's job loads its descriptor (ld_j in T_LAT, from the RAM's read at jidx): the
+      // read index moves on to the next one at the same edge, so job_done reaches the state
+      // alone, as for a single job.
       if ((tstate == T_LAT) && ch_on && !ch_pend) begin
         jidx    <= jidx + 4'd1;
         ch_more <= jidx != ch_last;
@@ -313,8 +314,8 @@ module ro_core #(
           tstate <= T_CFG0;
         end
         T_DF:    tstate <= T_DFW;
-        T_DFW:   if (!dfe_q && !dfe_q2 && !dfetch && !d_we && b_idle) tstate <= T_DLD;
-        T_DLD:   tstate <= T_LAT;                   // the descriptor RAM's registered read is valid; ld_j next
+        T_DFW:   if (!dfe_q && !dfe_q2 && !dfetch && b_idle) tstate <= T_DLD;
+        T_DLD:   tstate <= T_LAT;                   // ld_j next (jidx stable from here to T_LAT's end)
         T_CFG0:  tstate <= T_CFG1;
         T_CFG1:  tstate <= T_CFG2;
         T_CFG2:  begin                          // geometries loaded (ld_g); nrows valid
@@ -342,15 +343,15 @@ module ro_core #(
 
   // The descriptor fetch: port B reads the list as one run (bursts of <= 64 beats within
   // 4 KiB, ARID 1) while `loading` keeps its words from the units and ro_param (whose load
-  // is idle: no entry is written); beats 0 .. 5 of every descriptor go to the RAM.
+  // is idle: no entry is written); beats 0 .. 5 of every descriptor go to the RAM as they
+  // are taken (the last write, beat 5 of the last descriptor, comes two beats before
+  // dfetch drops).
   assign gd = mk_geom(1'b1, {ch_base, 4'b0}, 32'd0, 32'd1, 32'd0, 32'd1, {24'b0, ({1'b0, ch_last} + 5'd1), 3'b0},
                       4'd8, 32'd0, 32'hFFFFFFFF);
   always_ff @(posedge clk) begin
     if (rst) begin
       dfetch <= 1'b0;
-      d_we   <= 1'b0;
     end else begin
-      d_we <= dfetch && b_valid && (dw[2:0] < 3'(DESC_USED));
       if (dfe_start) begin
         dfetch <= 1'b1;
         dw     <= '0;
@@ -359,21 +360,17 @@ module ro_core #(
         if (dw == {ch_last, 3'b111}) dfetch <= 1'b0;
       end
     end
-    d_at   <= dw;
-    d_data <= b_data;
   end
 
   // The descriptor RAM: one LUTRAM of CHAIN_MAX x 128 bits per used beat (its own write
-  // enable), read at the job index into registers; the job registers load from those.
+  // enable), read asynchronously at the job index; the job registers load from it in T_LAT
+  // (no write after the fetch, jidx stable from T_DLD on).
   logic [BW-1:0] dq [DESC_USED];
   for (genvar k = 0; k < DESC_USED; k++) begin : g_dram
     (* ram_style = "distributed" *) logic [BW-1:0] mem [CHAIN_MAX];
-    logic [BW-1:0] q;
-    always_ff @(posedge clk) begin
-      if (d_we && d_at[2:0] == 3'(k)) mem[d_at[6:3]] <= d_data;
-      q <= mem[jidx];
-    end
-    assign dq[k] = q;
+    always_ff @(posedge clk)
+      if (dfetch && b_valid && dw[2:0] == 3'(k)) mem[dw[6:3]] <= b_data;
+    assign dq[k] = mem[jidx];
   end
 
   always_ff @(posedge clk) begin
@@ -426,6 +423,8 @@ module ro_core #(
       xp_contig <= (j_bs2 == {27'b0, j_aux[3:0], 1'b0});
       lr_words  <= 32'((ln_prod + 36'd7) >> 3);
       lr_tail   <= (ln_prod[2:0] == 3'd0) ? 4'd8 : {1'b0, ln_prod[2:0]};
+      gb_words  <= is_rope ? 32'(j_aux[11:1]) : wb;
+      gp_words  <= f_pbc ? 32'd1 : j_n;
     end
     if (ld_g) begin
       if (is_xpose) begin
@@ -435,33 +434,33 @@ module ro_core #(
                       j_rows, j_as1);
         gc <= mk_geom(go && xp_contig, j_c, j_cs1, j_rows, j_cs2, j_blocks, lr_words, lr_tail,
                       32'd0, 32'hFFFFFFFF);
-        gb <= '0;                                   // no stream B (not the previous job's)
       end else if (is_fold) begin
         // the read runs and the write bursts come from ro_fold (external)
         ga <= mk_geom(1'b0, j_a, 32'd0, 32'd1, 32'd0, 32'd1, 32'd1, 4'd8, 32'd0, 32'hFFFFFFFF);
-        gb <= '0;
         gc <= '0;
       end else if (is_tload) begin
         // the table image: rows of A words (its kinds int32), no B, no C
         ga <= mk_geom(go, j_a, j_as1, j_rows, j_as2, j_blocks, wa, ta, 32'd0, 32'hFFFFFFFF);
-        gb <= '0;
         gc <= '0;
       end else begin
       ga <= mk_geom(go, j_a, j_as1, j_rows, j_as2, j_blocks, wa, ta, j_wlo, j_whi);
-      gb <= mk_geom(go && f_ben, j_b, j_bs1, j_rows, j_bs2, j_blocks,
-                    is_rope ? 32'(j_aux[11:1]) : wb, 4'd8, 32'd0, 32'hFFFFFFFF);
       gc <= mk_geom(go, j_c, j_cs1, j_rows, j_cs2, j_blocks, wc, tc, 32'd0, 32'hFFFFFFFF);
       end
-      gp <= mk_geom(go, j_p, 32'd0, 32'd1, 32'd0, 32'd1, f_pbc ? 32'd1 : j_n, 4'd8, 32'd0, 32'hFFFFFFFF);
+      // no stream B in TRANSPOSE, FOLD and TLOAD (not the previous job's)
+      gb_en <= go && f_ben && !is_xpose && !is_fold && !is_tload;
     end
   end
 
-  // Port B serves a chain's descriptor fetch (gd), the parameter load (gp), then
-  // stream B (gb): its geometry register follows the phase.
+  // Port B serves a chain's descriptor fetch (gd), the parameter load, then stream B: its
+  // geometry register follows the phase, the P load's and stream B's built from the job
+  // registers (stable through the job) and the counts registered in T_CFG1.
   always_ff @(posedge clk) begin
-    if (pld_start)      gb_cur <= gp;
-    else if (dfe_start) gb_cur <= gd;
-    else if (job_start) gb_cur <= gb;
+    if (pld_start)
+      gb_cur <= mk_geom(go, j_p, 32'd0, 32'd1, 32'd0, 32'd1, gp_words, 4'd8, 32'd0, 32'hFFFFFFFF);
+    else if (dfe_start)
+      gb_cur <= gd;
+    else if (job_start)
+      gb_cur <= mk_geom(gb_en, j_b, j_bs1, j_rows, j_bs2, j_blocks, gb_words, 4'd8, 32'd0, 32'hFFFFFFFF);
   end
 
   // Every unit starts a job from reset: the job reset is registered and copied per unit.
@@ -489,12 +488,12 @@ module ro_core #(
   logic [7:0]    a_arlen, b_arlen;
 
   logic        fd_rr_valid, fd_rr_ready;
-  logic [59:0] fd_rr_waddr;
+  logic [WA-1:0] fd_rr_waddr;
   logic [31:0] fd_rr_words;
   ro_rd_port u_rd_a (
     .clk, .rst (urst_a), .start (start_q2), .g (ga),
     .ext_en (is_fold), .ext_valid (fd_rr_valid), .ext_ready (fd_rr_ready),
-    .ext_waddr (fd_rr_waddr), .ext_words (fd_rr_words),
+    .ext_waddr (60'(fd_rr_waddr)), .ext_words (fd_rr_words),
     .arvalid (a_arvalid), .arready (a_arready), .araddr (a_araddr), .arlen (a_arlen),
     .rvalid  (a_rvalid),  .rready  (a_rready),
     .rdata   (m_axi_gmem0_RDATA), .rlast (m_axi_gmem0_RLAST),
@@ -502,8 +501,9 @@ module ro_core #(
     .idle (a_idle)
   );
 
+  // port B's geometries (gd, gp, gb) have one tile and no window
   logic b_ext_ready;
-  ro_rd_port u_rd_b (
+  ro_rd_port #(.WIN(1'b0), .TILES(1'b0)) u_rd_b (
     .clk, .rst (urst_b), .start (start_q2 || pld_q2 || dfe_q2), .g (gb_cur),
     .ext_en (1'b0), .ext_valid (1'b0), .ext_ready (b_ext_ready), .ext_waddr ('0), .ext_words ('0),
     .arvalid (b_arvalid), .arready (b_arready), .araddr (b_araddr), .arlen (b_arlen),
@@ -523,10 +523,10 @@ module ro_core #(
   );
 
   logic        xp_ext_en, xp_ext_valid, xp_ext_ready, xp_ext_done;
-  logic [59:0] xp_ext_waddr;
+  logic [WA-1:0] xp_ext_waddr;
   logic [8:0]  xp_ext_len;
   logic        fd_wb_valid, fd_wb_ready, fd_wb_done, wr_ext_ready;
-  logic [59:0] fd_wb_waddr;
+  logic [WA-1:0] fd_wb_waddr;
   logic [8:0]  fd_wb_len;
   assign xp_ext_ready = wr_ext_ready && !is_fold;
   assign fd_wb_ready  = wr_ext_ready && is_fold;
@@ -595,7 +595,7 @@ module ro_core #(
 
   ro_param u_prm (
     .clk, .rst (urst_p),
-    .ld_start (pld_q2), .ld_bcast (f_pbc), .ld_n (f_pbc ? 32'd1 : j_n), .ld_busy (prm_busy),
+    .ld_start (pld_q2), .ld_bcast (f_pbc), .ld_n (gp_words), .ld_busy (prm_busy),
     .in_valid (b_valid && loading), .in_ready (prm_in_ready), .in_data (b_data),
     .rd_idx (prm_idx), .rd_q (prm_q)
   );
@@ -630,37 +630,59 @@ module ro_core #(
     .idle (nm_idle)
   );
 
-  logic rp_a_ready, rp_b_ready, rp_idle, rp_valid;
-  logic [BW-1:0] rp_data;
+  // The output FIFO of ROPE, TRANSPOSE and FOLD: one unit runs per job, so the three
+  // share one FIFO of 32 beats (TRANSPOSE's strobes beside the data; FOLD's last-word
+  // flag in strobe bit 0), written by the job's unit and reset with the units; each
+  // unit keeps its own credits on the FIFO's count.  FOLD pops it through its burst
+  // former (which sees the head in FOLD jobs only); ROPE's and TRANSPOSE's beats go
+  // straight to the write port.
+  localparam int OQ_D = 32;
+  logic           oq_in_valid, oq_in_ready, oq_valid, oq_ready;
+  logic [BW+15:0] oq_in, oq_out;
+  logic [5:0]     oq_count;
+  logic           rp_o_valid, xp_o_valid, fd_o_valid;
+  logic [BW-1:0]  rp_o_data;
+  logic [BW+15:0] xp_o_data;
+  logic [BW:0]    fd_o_data;
+  logic           fd_q_ready;
+  assign oq_in_valid = rp_o_valid || xp_o_valid || fd_o_valid;
+  assign oq_in       = {xp_o_data[BW+15:BW+1], is_fold ? fd_o_data[BW] : xp_o_data[BW],
+                        is_rope ? rp_o_data : is_fold ? fd_o_data[BW-1:0] : xp_o_data[BW-1:0]};
+  assign oq_ready    = is_fold ? fd_q_ready : w_ready;
+  ro_fifo #(.W(BW + 16), .D(OQ_D), .BRAM(1'b0)) u_oq (
+    .clk, .rst (urst_d || start_q2),
+    .in_valid (oq_in_valid), .in_ready (oq_in_ready), .in_data (oq_in),
+    .out_valid (oq_valid), .out_ready (oq_ready), .out_data (oq_out),
+    .count (oq_count)
+  );
+
+  logic rp_a_ready, rp_b_ready, rp_idle;
   logic [PIW-1:0] rp_prm_idx;
 
   ro_rope u_rp (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_rope),
-    .n (j_n), .nrows, .hd (j_aux[11:0]), .segs (div_q),
+    .n (j_n), .nrows, .hd (j_aux[11:0]), .segs (div_q[12:0]),
     .a_valid (a_valid && is_rope), .a_ready (rp_a_ready), .a_data,
     .b_valid (b_valid && !loading && is_rope), .b_ready (rp_b_ready), .b_data,
     .prm_idx (rp_prm_idx), .prm_q,
-    .c_valid (rp_valid), .c_ready (w_ready), .c_data (rp_data),
+    .o_valid (rp_o_valid), .o_data (rp_o_data), .o_count (oq_count),
     .idle (rp_idle)
   );
 
-  logic xp_a_ready, xp_idle, xp_valid;
-  logic [BW-1:0] xp_data;
-  logic [BW/8-1:0] xp_strb;
+  logic xp_a_ready, xp_idle;
 
   ro_xpose u_xp (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_xpose),
     .L (j_n), .R (j_aux[3:0]), .c1 (j_rows), .c2 (j_blocks), .c_base (j_c), .c_s1 (j_cs1), .c_s2 (j_cs2),
     .g_stride (j_bs2),
     .a_valid (a_valid && is_xpose), .a_ready (xp_a_ready), .a_data,
-    .c_valid (xp_valid), .c_ready (w_ready), .c_data (xp_data), .c_strb (xp_strb),
+    .o_valid (xp_o_valid), .o_data (xp_o_data), .o_count (oq_count),
     .ext_en (xp_ext_en), .ext_valid (xp_ext_valid), .ext_ready (xp_ext_ready),
     .ext_waddr (xp_ext_waddr), .ext_len (xp_ext_len), .ext_done (xp_ext_done),
     .idle (xp_idle)
   );
 
   logic fd_a_ready, fd_idle, fd_valid;
-  logic [BW-1:0] fd_data;
 
   ro_fold u_fd (
     .clk, .rst (urst_d), .start (start_q2), .en (go && is_fold),
@@ -668,7 +690,9 @@ module ro_core #(
     .win_lo (j_wlo), .win_hi (j_whi), .s (j_aux[3:0]), .rcp (div_q[24:0]), .c (j_c),
     .rr_valid (fd_rr_valid), .rr_ready (fd_rr_ready), .rr_waddr (fd_rr_waddr), .rr_words (fd_rr_words),
     .a_valid (a_valid && is_fold), .a_ready (fd_a_ready), .a_data,
-    .c_valid (fd_valid), .c_ready (w_ready), .c_data (fd_data),
+    .o_valid (fd_o_valid), .o_data (fd_o_data), .o_count (oq_count),
+    .q_valid (oq_valid && is_fold), .q_last (oq_out[BW]), .q_ready (fd_q_ready),
+    .c_valid (fd_valid), .c_ready (w_ready),
     .wb_valid (fd_wb_valid), .wb_ready (fd_wb_ready), .wb_waddr (fd_wb_waddr), .wb_len (fd_wb_len),
     .wb_done (fd_wb_done),
     .idle (fd_idle)
@@ -678,10 +702,10 @@ module ro_core #(
   assign a_ready = is_norm ? nm_a_ready : is_rope ? rp_a_ready : is_xpose ? xp_a_ready :
                    is_tload ? tl_a_ready : is_fold ? fd_a_ready : st_a_ready;
   assign b_ready = loading ? (prm_in_ready || dfetch) : is_rope ? rp_b_ready : st_b_ready;
-  assign w_valid = is_norm ? nm_valid : is_rope ? rp_valid : is_xpose ? xp_valid : is_tload ? 1'b0 :
-                   is_fold ? fd_valid : st_valid;
-  assign w_data  = is_norm ? nm_data : is_rope ? rp_data : is_xpose ? xp_data : is_fold ? fd_data : st_data;
-  assign w_strb  = is_xpose ? xp_strb : '1;
+  // (TLOAD and the ops not known write nothing: the output FIFO stays empty)
+  assign w_valid = is_norm ? nm_valid : is_stream ? st_valid : is_fold ? fd_valid : oq_valid;
+  assign w_data  = is_norm ? nm_data : is_stream ? st_data : oq_out[BW-1:0];
+  assign w_strb  = is_xpose ? oq_out[BW+15:BW] : '1;
 
   assign job_done = (tstate == T_RUN) && !job_start && !start_q && !start_q2 &&
                     a_idle && b_idle && st_idle && nm_idle && rp_idle && xp_idle && tl_idle && fd_idle && wr_idle;
@@ -710,6 +734,6 @@ module ro_core #(
   logic unused_top;
   assign unused_top = ^{m_axi_gmem0_RUSER, m_axi_gmem0_RRESP, m_axi_gmem0_BRESP, m_axi_gmem0_BID,
                         m_axi_gmem0_BUSER, j_aux[31:12], tb, wb, xp_ext_en,
-                        is_xpose, known, j_bqsh[31:6], b_ext_ready};
+                        known, j_bqsh[31:6], b_ext_ready, oq_in_ready};
 
 endmodule

@@ -6,10 +6,11 @@
 //
 // Fill: an output row's bundles (OWP adjacent columns of one channel, TC
 // channels per group) go into one of two row buffers, E column banks of
-// 2 x TC x LBW entries (LUTRAM); positions past the W-tile and channels past
-// c_valid are dropped.  Drain: the other buffer's previous row, as one run per
-// channel — word k of a run holds local columns k*E + l - shift — written with
-// byte strobes for the run's own lanes only (other lanes zero, strobe off).
+// 2 x TC x LBW entries (LUTRAM), each column at its lane in DDR; positions past
+// the W-tile and channels past c_valid are dropped.  Drain: the other buffer's
+// previous row, as one run per channel — word k of a run holds local columns
+// k*E + l - shift, bank l of the buffer's word k — written with byte strobes
+// for the run's own lanes only (other lanes zero, strobe off).
 // A run is one AXI burst, split where it crosses 4 KiB; at most WR_OUTS
 // bursts await their B.  The job is done when every B has arrived.
 // ---------------------------------------------------------------------------
@@ -55,6 +56,7 @@ module pl_writer
   logic [31:0] f_oh, f_e;
   logic [6:0]  f_g, f_gpos;
   logic [2:0]  f_c;
+  logic [2:0]  f_s;                        // channel f_c's run shift: (f_e + f_c * out_hw) mod E
   logic        f_buf;
   logic [1:0]  full;                       // row buffer holds a row not yet drained
   logic        drq_in_ready, drq_valid, drq_ready, f_take, f_row_end;
@@ -66,24 +68,32 @@ module pl_writer
   assign fb_ready  = f_take;
   assign f_row_end = f_take && (f_c == 3'd7) && (f_g + 7'd1 == fck.n_groups);
 
-  // row-buffer write ports: bank (column mod E), entry {buffer, channel, column / E}
+  // row-buffer write ports: column col of channel c at its place in the run,
+  // u = col + shift: bank (u mod E), entry {buffer, channel, (u / E) mod LBW}.
+  // u reaches LBC + E - 2, so word LBW wraps onto word 0 — in banks below the
+  // shift, where word 0 holds no column.  The OWP positions are consecutive:
+  // a bank below the first one's takes the next word.
   logic          rb_we [E];
   logic [6:0]    rb_wa [E];
   logic [EW-1:0] rb_wd [E];
   always_comb begin
+    logic [6:0] u0;
+    u0 = f_gpos + 7'(f_s);
     for (int b = 0; b < E; b++) begin
       rb_we[b] = 1'b0;
-      rb_wa[b] = {f_buf, f_c, f_gpos[5:3]};
+      rb_wa[b] = {f_buf, f_c, (3'(b) >= u0[2:0]) ? u0[5:3] : u0[5:3] + 3'd1};
       rb_wd[b] = '0;
     end
     for (int p = 0; p < OWP; p++) begin
       logic [6:0] col;
+      logic [2:0] bk;
       logic       ok;
       col = f_gpos + 7'(p);
+      bk  = u0[2:0] + 3'(p);
       ok  = f_take && (p == 0 || j.gw2) && (col < fck.ow_span) && (4'(f_c) < fck.c_valid);
       if (ok) begin
-        rb_we[col[2:0]] = 1'b1;
-        rb_wd[col[2:0]] = fb[p * EW +: EW];
+        rb_we[bk] = 1'b1;
+        rb_wd[bk] = fb[p * EW +: EW];
       end
     end
   end
@@ -97,10 +107,14 @@ module pl_writer
       f_act <= (cq.n_groups != '0);
       f_oh  <= '0;
       f_e   <= cq.base_out;
+      f_s   <= cq.base_out[2:0];
       f_g   <= '0;
       f_gpos <= '0;
       f_c   <= '0;
     end else if (f_take) begin
+      // the next channel's shift; after channel 7 it is f_e's again (TC * out_hw
+      // is a multiple of E), the next row's f_e + out_w at the row's end
+      f_s <= f_s + j.out_hw[2:0] + (f_row_end ? j.out_w[2:0] : 3'd0);
       if (f_c == 3'd7) begin
         f_c <= '0;
         if (f_g + 7'd1 == fck.n_groups) begin           // the row is complete
@@ -205,18 +219,11 @@ module pl_writer
     end
   end
 
-  // d1: read the banks for word d_k; bank b holds lane (b + shift) mod E of
-  // the run's word, column word d_k (or d_k - 1 where the lane index wrapped)
-  logic [6:0]    rb_ra [E];
+  // d1: read the banks for word d_k (bank l holds lane l of the run's word;
+  // word LBW, the ninth of a run, is word 0)
+  logic [6:0]    rb_ra;
   logic [EW-1:0] rb_rd [E];
-  always_comb
-    for (int b = 0; b < E; b++) begin
-      logic [3:0] bs;
-      logic [3:0] w;
-      bs = 4'(b) + 4'(d_e[2:0]);
-      w  = bs[3] ? ((d_k == 0) ? 4'd0 : d_k - 4'd1) : d_k;
-      rb_ra[b] = {dr.buf_i, d_c[2:0], w[2:0]};
-    end
+  assign rb_ra = {dr.buf_i, d_c[2:0], d_k[2:0]};
 
   // The row-buffer write is registered (bank enables, addresses and data),
   // so the bundle FIFO's handshake ends in registers; a bundle is in its
@@ -236,7 +243,7 @@ module pl_writer
   for (genvar b = 0; b < E; b++) begin : g_rb
     pl_lutram #(.W(EW), .D(2 * TC * LBW)) u_rb (
       .clk, .we (rq_we[b]), .waddr (rq_wa[b]), .wdata (rq_wd[b]),
-      .raddr (rb_ra[b]), .rdata (rb_rd[b])
+      .raddr (rb_ra), .rdata (rb_rd[b])
     );
   end
 
@@ -272,7 +279,7 @@ module pl_writer
         logic       ok;
         col = {d1_k, 3'(l)} - 8'(d1_sh);
         ok  = !col[7] && (col < {1'b0, d1_span});
-        d2_data[l * EW +: EW] <= ok ? d1_rv[3'(l) - d1_sh] : '0;
+        d2_data[l * EW +: EW] <= ok ? d1_rv[l] : '0;
         d2_strb[l * 2 +: 2]   <= ok ? 2'b11 : 2'b00;
       end
       d2_last <= d1_last;

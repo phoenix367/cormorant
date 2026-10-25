@@ -10,8 +10,8 @@
 //   y = sat16(rne_shr(((x * cos[d]) << sh_a[c]) + ((rot * sin[d]) << sh_b[c]), sh_c[c]))
 //
 // Per row: the B row (cos[0..HD) then sin[0..HD) as int32 words, HD/2 words)
-// is loaded into eight lane banks (element e in bank e mod 8 at index
-// e / 8), then the A row's segments stream through two 16-word buffers:
+// is loaded into four lane banks (element e in bank e mod 4 at index
+// e / 4), then the A row's segments stream through two 16-word buffers:
 // segment s fills one while segment s - 1 is emitted from the other, four
 // elements (half a word) per cycle through the four lanes.  HD is a
 // multiple of 16 (16 .. 128), so an element's rotation partner sits in the
@@ -27,7 +27,7 @@ module ro_rope
   input  logic [31:0]   n,                // elements per row (a multiple of HD)
   input  logic [31:0]   nrows,
   input  logic [11:0]   hd,
-  input  logic [31:0]   segs,             // n / HD (the core's divider)
+  input  logic [12:0]   segs,             // n / HD (the core's divider; n <= 4096)
 
   input  logic          a_valid,
   output logic          a_ready,
@@ -39,22 +39,23 @@ module ro_rope
   output logic [PIW-1:0] prm_idx,
   input  param_t        prm_q [PB],
 
-  output logic          c_valid,
-  input  logic          c_ready,
-  output logic [BW-1:0] c_data,
+  // the output words, into the core's output FIFO (shared with TRANSPOSE and FOLD)
+  output logic          o_valid,
+  output logic [BW-1:0] o_data,
+  input  logic [5:0]    o_count,          // the FIFO's entries
 
   output logic          idle
 );
   localparam int SW   = 16;               // words per segment buffer (HD <= 128)
   localparam int NS   = 10;               // pipeline stages s0 .. s9
-  localparam int CF_D = 32;
+  localparam int CF_D = 32;               // the output FIFO's depth
   localparam int FW   = $clog2(CF_D);
 
   // Job constants ---------------------------------------------------------------------------
   logic [31:0] k_n;
   logic [4:0]  k_sw, k_hw;                // words per segment (HD / 8), partner offset (HD / 16)
   logic [6:0]  k_bw;                      // B words per row (HD / 2, up to 64)
-  logic [31:0] k_segs;                    // segments per row (n / HD)
+  logic [12:0] k_segs;                    // segments per row (n / HD)
   always_ff @(posedge clk)
     if (start) begin
       k_n    <= n;
@@ -69,7 +70,7 @@ module ro_rope
   rst_t        rs;
   logic [31:0] rows_left;
   logic [6:0]  b_left;                    // B words still to take for this row
-  logic [31:0] segs_left;                 // A segments still to take for this row
+  logic [12:0] segs_left;                 // A segments still to take for this row
   logic [4:0]  fw;                        // words filled in the current segment
   logic        fpar;                      // the buffer being filled
   logic        full [2];                  // segment buffers ready to emit
@@ -83,39 +84,39 @@ module ro_rope
   logic        epar;                      // the buffer being emitted
   logic [4:0]  ew;                        // word within the segment
   logic        eh;                        // the word's half (lanes 0..3 / 4..7)
-  logic [31:0] seg_out;                   // the segment's index within its row
+  logic [12:0] seg_out;                   // the segment's index within its row
   logic [PIW-1:0] cw;                     // the group's column / 4 within the row
   logic        issue, room, em_active, seg_last_w, row_last_s;
   assign em_active  = full[epar];
   assign seg_last_w = (ew + 5'd1 == k_sw) && eh;
-  assign row_last_s = (seg_out + 32'd1 == k_segs);
+  assign row_last_s = (seg_out + 13'd1 == k_segs);
   assign issue      = em_active && room;
   assign prm_idx    = cw;
 
-  // cos / sin lane banks: element e of cos in bank e % 8 at index e / 8 (16 deep: HD <= 128).
-  // A B word carries elements 4 off .. 4 off + 3 of cos (k < hb) or sin: banks 4 off[0] + i.
-  logic        b_take, bk_cos, bk_hi;
-  logic [3:0]  bk_idx;
-  logic [31:0] cs_q [E], sn_q [E];
+  // cos / sin lane banks: element e of cos in bank e % 4 at index e / 4 (32 deep: HD <= 128),
+  // so lane l of word w's half h reads index {w, h} (element 8w + 4h + l).
+  // A B word carries elements 4 off .. 4 off + 3 of cos (k < hb) or sin: index off of the four banks.
+  logic        b_take, bk_cos;
+  logic [4:0]  bk_idx;
+  logic [31:0] cs_q [PB], sn_q [PB];
   always_comb begin
     logic [6:0] k, hb, off;
     k      = k_bw - b_left;
     hb     = {1'b0, k_bw[6:1]};
     bk_cos = (k < hb);
     off    = bk_cos ? k : k - hb;
-    bk_hi  = off[0];
-    bk_idx = off[4:1];
+    bk_idx = off[4:0];
   end
   assign b_take = b_valid && b_ready;
-  for (genvar b = 0; b < E; b++) begin : g_bank
-    (* ram_style = "distributed" *) logic [31:0] csm [SW], snm [SW];
+  for (genvar b = 0; b < PB; b++) begin : g_bank
+    (* ram_style = "distributed" *) logic [31:0] csm [2 * SW], snm [2 * SW];
     always_ff @(posedge clk)
-      if (b_take && bk_hi == b[2]) begin
-        if (bk_cos) csm[bk_idx] <= b_data[32*(b % 4) +: 32];
-        else        snm[bk_idx] <= b_data[32*(b % 4) +: 32];
+      if (b_take) begin
+        if (bk_cos) csm[bk_idx] <= b_data[32*b +: 32];
+        else        snm[bk_idx] <= b_data[32*b +: 32];
       end
-    assign cs_q[b] = csm[a0_w];
-    assign sn_q[b] = snm[a0_w];
+    assign cs_q[b] = csm[{a0_w, a0_h}];
+    assign sn_q[b] = snm[{a0_w, a0_h}];
   end
   // segment buffers: buffer p's word w at sb[{p, w}]; read at ew and at the partner word
   (* ram_style = "distributed" *) logic [BW-1:0] sb [2 * SW];
@@ -165,8 +166,8 @@ module ro_rope
           full[fpar] <= 1'b1;
           fw         <= '0;
           fpar       <= !fpar;
-          segs_left  <= segs_left - 32'd1;
-          if (segs_left == 32'd1) begin
+          segs_left  <= segs_left - 13'd1;
+          if (segs_left == 13'd1) begin
             rows_left <= rows_left - 32'd1;
             segs_left <= k_segs;
             b_left    <= k_bw;
@@ -184,7 +185,7 @@ module ro_rope
           full[epar] <= 1'b0;
           epar       <= !epar;
           ew         <= '0;
-          seg_out    <= row_last_s ? 32'd0 : seg_out + 32'd1;
+          seg_out    <= row_last_s ? 13'd0 : seg_out + 13'd1;
         end else if (eh) begin
           ew <= ew + 5'd1;
         end
@@ -193,16 +194,17 @@ module ro_rope
   end
 
   // Pipeline: stage s data registered at the end of cycle t + s (issue at t).
-  //   0 the addresses; 1 x / rot / cos / sin read; 2 parameters; 3 products;
-  //   4 the products' registers; 5 shifts; 6 sum; 7 - 8 rounding; 9 saturation
-  //   -> the group
+  //   0 the addresses; 1 x / partner / cos / sin read; 2 parameters; 3 products;
+  //   4 the products' registers; 5 shifts; 6 sum (rot = -partner: the partner's
+  //   product subtracted); 7 - 8 rounding; 9 saturation -> the group
   logic [NS-1:0] v;
   logic          h0;                        // the group's half (the output word's lanes)
+  logic          neg1, neg2;                // rot = -partner (d < HD/2)
   logic signed [15:0] x1 [PB];
-  logic signed [16:0] r1 [PB];              // the partner, negated: 17 bits (-(-32768))
+  logic signed [15:0] r1 [PB];              // the partner
   logic signed [31:0] c1 [PB], s1 [PB];
   logic signed [15:0] x2 [PB];
-  logic signed [16:0] r2 [PB];
+  logic signed [15:0] r2 [PB];
   logic signed [31:0] c2 [PB], s2 [PB];
   param_t p2 [PB];
   logic [15:0] y9 [PB];
@@ -211,12 +213,13 @@ module ro_rope
     if (rst || start) v <= '0;
     else v <= {v[NS-2:0], issue};
     h0 <= eh;
+    neg1 <= a0_neg;
+    neg2 <= neg1;
     for (int l = 0; l < PB; l++) begin
       x1[l] <= sb_x[EW*(l + (a0_h ? 4 : 0)) +: EW];
-      r1[l] <= a0_neg ? -17'(signed'(sb_p[EW*(l + (a0_h ? 4 : 0)) +: EW]))
-                      : 17'(signed'(sb_p[EW*(l + (a0_h ? 4 : 0)) +: EW]));
-      c1[l] <= a0_h ? cs_q[l + 4] : cs_q[l];
-      s1[l] <= a0_h ? sn_q[l + 4] : sn_q[l];
+      r1[l] <= sb_p[EW*(l + (a0_h ? 4 : 0)) +: EW];
+      c1[l] <= cs_q[l];
+      s1[l] <= sn_q[l];
       x2[l] <= x1[l]; r2[l] <= r1[l]; c2[l] <= c1[l]; s2[l] <= s1[l];
       p2[l] <= prm_q[l];
     end
@@ -228,18 +231,23 @@ module ro_rope
     rne_t               ra7;
     logic signed [63:0] r8;
     param_t p3, p4, p5;
+    logic       neg3, neg4, neg5;             // the lane's copy of the partner's sign
     logic [5:0] shc6;
     always_ff @(posedge clk) begin
       px3  <= 48'(x2[l]) * 48'(c2[l]);                // 16 x 32 (DSP), registered once more
       pr3  <= 48'(r2[l]) * 48'(s2[l]);
       p3   <= p2[l];
+      neg3 <= neg2;
       px4  <= px3;
       pr4  <= pr3;
       p4   <= p3;
+      neg4 <= neg3;
       xs5  <= 64'(px4) <<< p4.sh_a;
       rs5  <= 64'(pr4) <<< p4.sh_b;
       p5   <= p4;
-      sum6 <= xs5 + rs5;
+      neg5 <= neg4;
+      // ((-p) s) << k = -((p s) << k) mod 2^64
+      sum6 <= neg5 ? xs5 - rs5 : xs5 + rs5;
       shc6 <= p5.sh_c;
       ra7  <= rne_a(sum6, shc6);
       r8   <= rne_b(ra7);
@@ -262,14 +270,10 @@ module ro_rope
     end
   end
 
-  logic        cf_in_ready;
+  assign o_valid = wv;
+  assign o_data  = wd;
   logic [FW:0] cf_count, inflight;
-  ro_fifo #(.W(BW), .D(CF_D), .BRAM(1'b0)) u_cf (
-    .clk, .rst (rst || start),
-    .in_valid (wv), .in_ready (cf_in_ready), .in_data (wd),
-    .out_valid (c_valid), .out_ready (c_ready), .out_data (c_data),
-    .count (cf_count)
-  );
+  assign cf_count = o_count;
   // every issued group (a half word) holds a credit until its word leaves the pipeline
   always_ff @(posedge clk) begin
     if (rst || start) inflight <= '0;
@@ -280,6 +284,6 @@ module ro_rope
   assign idle = (rs == R_IDLE) && !full[0] && !full[1] && (v == '0) && !wv && (cf_count == '0);
 
   logic unused;
-  assign unused = ^{cf_in_ready, k_n, hq[NS-1]};
+  assign unused = ^{k_n, hq[NS-1]};
 
 endmodule

@@ -438,7 +438,7 @@ module vo_core #(
     .idle (a_idle)
   );
 
-  vo_rd_port u_rd_b (
+  vo_rd_port #(.HAS_BLK(1'b0)) u_rd_b (   // b: one block (mk_geom)
     .clk, .rst (urst_b), .start (start_q2), .g (gb),
     .arvalid (m_axi_gmem1_ARVALID), .arready (m_axi_gmem1_ARREADY),
     .araddr  (m_axi_gmem1_ARADDR),  .arlen   (m_axi_gmem1_ARLEN),

@@ -25,7 +25,7 @@ module ro_wr_port
   input  logic            ext_en,
   input  logic            ext_valid,
   output logic            ext_ready,
-  input  logic [59:0]     ext_waddr,
+  input  logic [WA-1:0]   ext_waddr,
   input  logic [8:0]      ext_len,
   input  logic            ext_done,
 
@@ -68,7 +68,7 @@ module ro_wr_port
   logic [59:0] bg_waddr;
   logic [8:0]  bg_len;
   logic        g_valid, g_ready, g_done;                // the burst source in use
-  logic [59:0] g_waddr;
+  logic [WA-1:0] g_waddr;
   logic [8:0]  g_len;
   geom_t       g_int;
 
@@ -76,13 +76,13 @@ module ro_wr_port
     g_int = g;
     g_int.en = g.en && !ext_en;
   end
-  ro_burstgen #(.MAXB(WR_BURST)) u_bg (
+  ro_burstgen #(.MAXB(WR_BURST), .WIN(1'b0), .TILES(1'b0)) u_bg (   // one tile, no window
     .clk, .rst, .start, .g (g_int),
     .b_valid (bg_valid), .b_ready (bg_ready), .b_waddr (bg_waddr), .b_len (bg_len), .b_zero (bg_zero),
     .done    (bg_done)
   );
   assign g_valid   = ext_en ? ext_valid : bg_valid;
-  assign g_waddr   = ext_en ? ext_waddr : bg_waddr;
+  assign g_waddr   = ext_en ? ext_waddr : bg_waddr[WA-1:0];
   assign g_len     = ext_en ? ext_len   : bg_len;
   assign g_done    = ext_en ? ext_done  : bg_done;
   assign bg_ready  = !ext_en && g_ready;
@@ -107,9 +107,9 @@ module ro_wr_port
   //            so it can only be late (one cycle after a burst's last beat)
   //   ob_ok    fewer than WR_OUTS bursts await B (one cycle late on a B)
   logic          bq_valid;
-  logic [59:0]   bq_waddr, hd_waddr;
+  logic [WA-1:0] bq_waddr, hd_waddr;
   logic [8:0]    bq_len, hd_len;
-  ro_rs #(.W(69)) u_bq (
+  ro_rs #(.W(WA + 9)) u_bq (
     .clk, .rst,
     .in_valid  (g_valid), .in_ready  (g_ready), .in_data ({g_waddr, g_len}),
     .out_valid (bq_valid), .out_ready (issue),    .out_data ({bq_waddr, bq_len}),
@@ -142,12 +142,14 @@ module ro_wr_port
   logic unused_hd;
   assign unused_hd = ^hd_waddr;
 
-  ro_rs #(.W(72)) u_aw (
+  logic [WA-1:0] aw_waddr;
+  ro_rs #(.W(WA + 8)) u_aw (
     .clk, .rst,
-    .in_valid  (issue),   .in_ready  (aw_in_ready), .in_data ({bq_waddr, 4'b0, 8'(bq_len - 9'd1)}),
-    .out_valid (awvalid), .out_ready (awready),     .out_data ({awaddr, awlen}),
+    .in_valid  (issue),   .in_ready  (aw_in_ready), .in_data ({bq_waddr, 8'(bq_len - 9'd1)}),
+    .out_valid (awvalid), .out_ready (awready),     .out_data ({aw_waddr, awlen}),
     .head_data ()
   );
+  assign awaddr = {(60 - WA)'(0), aw_waddr, 4'b0};   // byte addresses below 2^48, zero-extended
 
   // Burst lengths, AW -> W (in issue order).
   ro_fifo #(.W(8), .D(WR_OUTS), .BRAM(1'b0)) u_lq (

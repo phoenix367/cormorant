@@ -28,8 +28,8 @@ module mm_xpf
   output logic            xq_ready,
   input  x_run_t          xq,
 
-  input  logic [1:0][31:0] awr_cnt,
-  output logic [31:0]     xpf_cnt,
+  input  logic [1:0][HS-1:0] awr_cnt,
+  output logic [HS-1:0]   xpf_cnt,
 
   output logic            re,
   output logic [A_AW-1:0] raddr,
@@ -73,8 +73,8 @@ module mm_xpf
 
   // Registered barrier (both A writers are past this lane's panel), evaluated
   // against xpf_cnt's next value: it can only open late, never early.
-  logic [31:0] xpf_cnt_n;
-  assign xpf_cnt_n = xpf_cnt + {31'b0, run_done && plast};
+  logic [HS-1:0] xpf_cnt_n;
+  assign xpf_cnt_n = xpf_cnt + HS'(run_done && plast);
   always_ff @(posedge clk)
     bar_q <= !rst && (awr_cnt[0] != xpf_cnt_n) && (awr_cnt[1] != xpf_cnt_n);
 
@@ -106,7 +106,7 @@ module mm_xpf
       if (run_done) begin
         active <= 1'b0;
         if (plast) begin
-          xpf_cnt <= xpf_cnt + 32'd1;
+          xpf_cnt <= xpf_cnt + HS'(1);
           pan_ok  <= 1'b0;
         end
       end

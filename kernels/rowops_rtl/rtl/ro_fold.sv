@@ -19,9 +19,9 @@
 //                                 ▼                             ▼
 //            step control (a two-word window per row) ─► lanes ─► fold ─► packer
 //                                                                          ▼
-//                       out FIFO ─► burst former ─► write port (external bursts)
+//         (the core's) out FIFO ─► burst former ─► write port (external bursts)
 //
-// Sequencer: per row (six cycles, 64-bit element arithmetic) the valid part
+// Sequencer: per row (six cycles, 33- to 47-bit element arithmetic) the valid part
 // [lo_e, hi_e) = [max(win_lo, base), min(win_hi, base + n)) and the words it
 // lies in, [f, last] — one read run (none when the part is empty) — and the
 // datapath's descriptor: the start lane delta = (A_k + base) mod 8, the
@@ -64,20 +64,26 @@ module ro_fold
   // the read runs of stream A (ro_rd_port's external runs)
   output logic          rr_valid,
   input  logic          rr_ready,
-  output logic [59:0]   rr_waddr,
+  output logic [WA-1:0] rr_waddr,
   output logic [31:0]   rr_words,
 
   input  logic          a_valid,
   output logic          a_ready,
   input  logic [BW-1:0] a_data,
 
-  // the output words and their bursts (ro_wr_port's external bursts)
-  output logic          c_valid,
+  // the output words, into the core's output FIFO (shared with ROPE and TRANSPOSE),
+  // whose head comes back here: the words and their bursts (ro_wr_port's external bursts)
+  output logic          o_valid,
+  output logic [BW:0]   o_data,           // {the job's last word, the word}
+  input  logic [5:0]    o_count,          // the FIFO's entries
+  input  logic          q_valid,          // the FIFO's head ...
+  input  logic          q_last,           // ... is the job's last word
+  output logic          q_ready,          // the head is popped (it goes to the write port)
+  output logic          c_valid,          // the head, offered to the write port (its data: the FIFO's)
   input  logic          c_ready,
-  output logic [BW-1:0] c_data,
   output logic          wb_valid,
   input  logic          wb_ready,
-  output logic [59:0]   wb_waddr,
+  output logic [WA-1:0] wb_waddr,
   output logic [8:0]    wb_len,
   output logic          wb_done,
 
@@ -85,44 +91,54 @@ module ro_fold
 );
   // Job constants ---------------------------------------------------------------------------
   logic        k_en;
-  logic signed [63:0] k_cs;                // a_s2 / 2, sign-extended
-  logic signed [63:0] k_w0, k_s0, k_n, k_wlo, k_whi;
+  logic [46:0] k_cs;                       // a_s2 / 2, sign-extended (element addresses: 47 bits)
+  logic signed [32:0] k_s0;                // s0, sign-extended
+  logic [31:0] k_w0, k_n, k_wlo, k_whi;
   logic [31:0] k_rows;
   logic [3:0]  k_s;
   logic [24:0] k_rcp;
-  logic [16:0] k_lowm;                     // 2^(s + 1) - 1
-  logic [15:0] k_half;                     // 2^s
+  logic [15:0] k_smask;                    // 2^s - 1
   logic [29:0] k_g;                        // groups per row: ceil(n / 8)
   logic [3:0]  k_clast;                    // columns of a row's last group: (n - 1) mod 8 + 1
   always_ff @(posedge clk)
     if (start) begin
       k_en     <= en;
-      k_cs     <= {{33{a_s2[31]}}, a_s2[31:1]};
-      k_w0     <= {32'b0, w0};
-      k_s0     <= {{32{s0[31]}}, s0};
-      k_n      <= {32'b0, n};
-      k_wlo    <= {32'b0, win_lo};
-      k_whi    <= {32'b0, win_hi};
+      k_cs     <= {{16{a_s2[31]}}, a_s2[31:1]};
+      k_w0     <= w0;
+      k_s0     <= {s0[31], s0};
+      k_n      <= n;
+      k_wlo    <= win_lo;
+      k_whi    <= win_hi;
       k_rows   <= rows;
       k_s      <= s;
       k_rcp    <= rcp;
-      k_lowm   <= 17'((18'd2 << s) - 18'd1);
-      k_half   <= 16'd1 << s;
+      k_smask  <= (16'd1 << s) - 16'd1;
       k_g      <= 30'(({1'b0, n} + 33'd7) >> 3);
       k_clast  <= {1'b0, 3'(n - 32'd1)} + 4'd1;
     end
 
   // Sequencer -----------------------------------------------------------------------------
   // Row descriptor: {last row of the job, pre, delta, pstart, words, jlo, jhi}.
+  // The element arithmetic is narrow: the window lies in [0, 2^32) and base only grows
+  // within a channel, so the rows from the first base at / above 2^32 on are empty (a
+  // sticky flag; base itself is exact below 2^32); delta, the word offset and the word
+  // count need A mod 8 only, and the run's first word A / 8 + (A mod 8 + lo) / 8 is a
+  // 44-bit word address (byte addresses below 2^48, as the burst generator's).
   localparam int RDW = 1 + 1 + 3 + 32 + 32 + 32 + 32;
   typedef enum logic [2:0] {Q_IDLE, Q_S0, Q_S1, Q_S2, Q_S3, Q_S4, Q_PUSH} qst_t;
   qst_t               qs;
   logic [31:0]        q_kleft, q_rleft;    // channels / rows of the channel not finished, current included
-  logic signed [63:0] q_A, q_base;         // the channel's element address, the row's source column
-  logic signed [63:0] q_e0, q_hend, q_lo, q_hi, q_f, q_hm1, q_lx;
-  logic signed [63:0] q_jlo, q_jhi;
+  logic [46:0]        q_A;                 // the channel's element address
+  logic signed [32:0] q_base;              // the row's source column (while below 2^32)
+  logic               q_far;               // the row's source column is at / above 2^32: the row is empty
+  logic signed [33:0] q_e0, q_hend;        // A mod 8 + base, base + n
+  logic [31:0]        q_lo;                // max(base, win_lo)
+  logic signed [32:0] q_hi;                // min(base + n, win_hi)
+  logic [32:0]        q_f, q_lx;           // A mod 8 + lo, A mod 8 + hi - 1 (exact for a non-empty part)
+  logic [31:0]        q_hm1, q_jlo, q_jhi;
+  logic [WA-1:0]      q_fw;                // the run's first word
   logic               q_vld, q_lastrow;
-  logic [63:0]        q_fo, q_nw;
+  logic [31:0]        q_fo, q_nw;
   logic               rd_in_ready, rq_in_ready, q_push;
   logic [RDW-1:0]     q_desc;
 
@@ -148,40 +164,46 @@ module ro_fold
 
   always_ff @(posedge clk) begin
     if (start) begin
-      q_A     <= {1'b0, a[63:1]};
-      q_base  <= {{32{s0[31]}}, s0};
+      q_A     <= a[47:1];
+      q_base  <= {s0[31], s0};
+      q_far   <= 1'b0;
       q_kleft <= blocks;
       q_rleft <= rows;
     end else begin
       case (qs)
         Q_S0: begin
-          q_e0      <= q_A + q_base;
-          q_hend    <= q_base + k_n;
-          q_lo      <= (q_base > k_wlo) ? q_base : k_wlo;
+          q_e0      <= 34'(q_A[2:0]) + 34'(q_base);
+          q_hend    <= 34'(q_base) + 34'(k_n);
+          q_lo      <= (q_base > signed'({1'b0, k_wlo})) ? q_base[31:0] : k_wlo;
           q_lastrow <= (q_rleft == 32'd1) && (q_kleft == 32'd1);
         end
-        Q_S1: q_hi <= (q_hend < k_whi) ? q_hend : k_whi;
+        Q_S1: q_hi <= (q_hend < signed'({2'b0, k_whi})) ? 33'(q_hend) : {1'b0, k_whi};
         Q_S2: begin
-          q_vld <= q_hi > q_lo;
-          q_f   <= q_A + q_lo;
-          q_hm1 <= q_hi - 64'sd1;
-          q_jlo <= q_lo - q_base;
-          q_jhi <= q_hi - q_base;
+          q_vld <= !q_far && (q_hi > signed'({1'b0, q_lo}));
+          q_f   <= 33'(q_A[2:0]) + 33'(q_lo);
+          q_hm1 <= q_hi[31:0] - 32'd1;
+          q_jlo <= q_lo - q_base[31:0];
+          q_jhi <= q_hi[31:0] - q_base[31:0];
         end
         Q_S3: begin
-          q_lx <= q_A + q_hm1;
-          q_fo <= 64'((q_f >>> 3) - (q_e0 >>> 3));
+          q_lx <= 33'(q_A[2:0]) + 33'(q_hm1);
+          q_fo <= {2'b0, q_f[32:3]} - {q_e0[33], q_e0[33:3]};
+          q_fw <= q_A[46:3] + WA'(q_f[32:3]);
         end
-        Q_S4: q_nw <= q_vld ? 64'((q_lx >>> 3) - (q_f >>> 3) + 64'sd1) : 64'd0;
+        Q_S4: q_nw <= q_vld ? {2'b0, q_lx[32:3]} - {2'b0, q_f[32:3]} + 32'd1 : 32'd0;
         Q_PUSH: if (q_push) begin
           if (q_rleft == 32'd1) begin            // the channel ends
             q_rleft <= k_rows;
             q_kleft <= q_kleft - 32'd1;
             q_A     <= q_A + k_cs;
             q_base  <= k_s0;
+            q_far   <= 1'b0;
           end else begin
+            logic signed [33:0] nb;
+            nb = 34'(q_base) + 34'(k_w0);
             q_rleft <= q_rleft - 32'd1;
-            q_base  <= q_base + k_w0;
+            q_base  <= nb[32:0];
+            if (!nb[33] && nb[32]) q_far <= 1'b1;
           end
         end
         default: ;
@@ -194,9 +216,8 @@ module ro_fold
     logic        pre;
     logic [31:0] pstart;
     pre    = q_vld && (q_fo == '0);
-    pstart = (q_fo == '0) ? 32'd0 : 32'(q_fo - 64'd1);
-    q_desc = {q_lastrow, pre, q_e0[2:0], pstart, 32'(q_nw),
-              q_vld ? 32'(q_jlo) : 32'd0, q_vld ? 32'(q_jhi) : 32'd0};
+    pstart = (q_fo == '0) ? 32'd0 : q_fo - 32'd1;
+    q_desc = {q_lastrow, pre, q_e0[2:0], pstart, q_nw, q_vld ? q_jlo : 32'd0, q_vld ? q_jhi : 32'd0};
   end
 
   logic           rd_valid, rd_pop;
@@ -210,10 +231,10 @@ module ro_fold
     .count (rd_count)
   );
 
-  ro_fifo #(.W(92), .D(4), .BRAM(1'b0)) u_rrq (
+  ro_fifo #(.W(WA + 32), .D(4), .BRAM(1'b0)) u_rrq (
     .clk, .rst (rst || start),
     .in_valid (q_push && q_nw != '0), .in_ready (rq_in_ready),
-    .in_data ({60'(q_f >>> 3), 32'(q_nw)}),
+    .in_data ({q_fw, q_nw}),
     .out_valid (rr_valid), .out_ready (rr_ready), .out_data ({rr_waddr, rr_words}),
     .count (rq_count)
   );
@@ -235,8 +256,10 @@ module ro_fold
   assign a_ready  = step && need_pop;
   assign rd_pop   = rd_valid && !row_on && k_en;
 
+  // the step's new word: the port's head even in a step without a pop (its lanes lie
+  // outside [jlo, jhi): every word of the row's valid part is popped, and s2 zeroes the rest)
   logic [BW-1:0] new_w;
-  assign new_w = need_pop ? a_data : '0;
+  assign new_w = a_data;
 
   logic [7:0] g_mask;
   always_comb begin
@@ -286,7 +309,7 @@ module ro_fold
   end
 
   // Pipeline (v[i]: stage s(i+1) holds a group): s1 window, s2 lanes, s3 |x|, s4 - s6 the product, s7 q1 / z,
-  // s8 the shift, s9 the rounding, s10 the sign -> the packer.
+  // s8 the shift and the round bits, s9 the rounding with the sign, s10 a register -> the packer.
   localparam int NS = 10;
   logic [NS-1:0] v;
   logic [3:0]    cnt  [NS];               // columns of the group (1..8)
@@ -296,14 +319,14 @@ module ro_fold
   logic [2:0]      dl1;
   logic [7:0]      msk1;
   logic signed [15:0] x2 [E];
-  logic        neg3 [E], neg4 [E], neg5 [E], neg6 [E], neg7 [E], neg8 [E], neg9 [E];
+  logic        neg3 [E], neg4 [E], neg5 [E], neg6 [E], neg7 [E], neg8 [E];
   logic [16:0] u3 [E];
   logic [24:0] rx3 [E];
   logic [41:0] p4 [E], p5 [E], p6 [E];
   logic [17:0] q1_7 [E];
   logic        z7 [E], z8 [E];
-  logic [16:0] q8 [E];
-  logic [16:0] low8 [E];
+  logic [15:0] q8 [E];
+  logic        rb8 [E], st8 [E];          // the round bit q1[s], any bit below it set
   logic [15:0] y9 [E];
   logic [15:0] y10 [E];
 
@@ -327,6 +350,7 @@ module ro_fold
       x2[l] <= msk1[l] ? signed'(win1[EW*t +: EW]) : 16'sd0;
     end
     for (int l = 0; l < E; l++) begin
+      logic up9;
       // s3: u = 2|x|, R_x
       neg3[l] <= x2[l][15];
       u3[l]   <= x2[l][15] ? 17'(-(17'(x2[l])) << 1) : 17'({1'b0, x2[l]} << 1);
@@ -342,17 +366,18 @@ module ro_fold
       q1_7[l] <= p6[l][41:24];
       z7[l]   <= !neg6[l] || ({1'b0, p6[l][23:0]} < k_rcp);
       neg7[l] <= neg6[l];
-      // s8: q = q1 >> (s + 1), the bits below
-      q8[l]   <= 17'(q1_7[l] >> (5'(k_s) + 5'd1));
-      low8[l] <= 17'(q1_7[l]) & k_lowm;
+      // s8: q = q1 >> (s + 1) (< 2^16: q1 <= 2^16), the bits below
+      q8[l]   <= 16'(q1_7[l] >> (5'(k_s) + 5'd1));
+      rb8[l]  <= q1_7[l][{1'b0, k_s}];
+      st8[l]  <= |(q1_7[l][15:0] & k_smask);
       z8[l]   <= z7[l];
       neg8[l] <= neg7[l];
-      // s9: round half to even
-      y9[l]   <= 16'(q8[l]) + ((low8[l] > 17'(k_half)) ||
-                               ((low8[l] == 17'(k_half)) && (!z8[l] || q8[l][0])) ? 16'd1 : 16'd0);
-      neg9[l] <= neg8[l];
-      // s10: the sign
-      y10[l]  <= neg9[l] ? 16'(-y9[l]) : y9[l];
+      // s9: round half to even (up: the bits below q's are above half, or half and the
+      // remainder non-zero or q odd), the sign folded in: -(q + up) = ~q + !up mod 2^16
+      up9      = rb8[l] && (st8[l] || !z8[l] || q8[l][0]);
+      y9[l]   <= (q8[l] ^ {16{neg8[l]}}) + {15'b0, up9 ^ neg8[l]};
+      // s10: a register (the packer's input)
+      y10[l]  <= y9[l];
     end
   end
 
@@ -360,7 +385,7 @@ module ro_fold
   // acc holds o columns (lanes 0 .. o-1; the rest 0); a group of cnt columns
   // (its lanes past cnt are 0) is placed at lane o of a 16-lane line.
   logic [EW-1:0] acc [E];
-  logic [3:0]    o;
+  logic [2:0]    o;                       // 0 .. 7
   logic          pk_v, pk_last, flush;
   logic [BW-1:0] pk_d;
 
@@ -388,11 +413,11 @@ module ro_fold
             pk_d[EW*l +: EW] <= line[l];
             acc[l] <= line[E + l];
           end
-          o     <= 4'(fill - 5'd8);
+          o     <= 3'(fill - 5'd8);
           flush <= jend[NS-1] && (fill != 5'd8);
         end else begin
           for (int l = 0; l < E; l++) acc[l] <= line[l];
-          o     <= 4'(fill);
+          o     <= 3'(fill);
           flush <= jend[NS-1];
         end
       end else if (flush) begin                 // the job's last, partial word
@@ -405,19 +430,17 @@ module ro_fold
     end
   end
 
-  // Output FIFO and credits: every emitted group reserves two entries (the job's
-  // last group may leave two words) until it has left the pipeline.
+  // Output FIFO (the core's) and credits: every emitted group reserves two entries
+  // (the job's last group may leave two words) until it has left the pipeline.
   localparam int CF_D = 32;
   localparam int FW   = $clog2(CF_D);
-  logic        cf_valid, cf_pop, cf_last, cf_in_ready;
+  logic        cf_valid, cf_pop, cf_last;
   logic [FW:0] cf_count, inflight;
-  logic [BW-1:0] cf_data;
-  ro_fifo #(.W(BW + 1), .D(CF_D), .BRAM(1'b0)) u_cf (
-    .clk, .rst (rst || start),
-    .in_valid (pk_v), .in_ready (cf_in_ready), .in_data ({pk_last, pk_d}),
-    .out_valid (cf_valid), .out_ready (cf_pop), .out_data ({cf_last, cf_data}),
-    .count (cf_count)
-  );
+  assign o_valid  = pk_v;
+  assign o_data   = {pk_last, pk_d};
+  assign cf_count = o_count;
+  assign cf_valid = q_valid;
+  assign cf_last  = q_last;
   always_ff @(posedge clk) begin
     if (rst || start) inflight <= '0;
     else inflight <= inflight + (FW+1)'(emit) - (FW+1)'(v[NS-1]);
@@ -425,27 +448,27 @@ module ro_fold
   assign room = ({1'b0, cf_count} + {1'b0, inflight}) < (FW+2)'(CF_D - 4);
 
   // Bursts ---------------------------------------------------------------------------------------
-  logic [59:0] b_next, b_start;            // the next word's address, the open burst's first
+  logic [WA-1:0] b_next, b_start;          // the next word's address, the open burst's first
   logic [6:0]  b_len;                      // words of the open burst
   logic        bq_in_ready, b_end, b_done;
   assign b_end   = (b_len == 7'(WR_BURST - 1)) || (b_next[7:0] == 8'hFF) || cf_last;
-  assign cf_pop  = cf_valid && c_ready && (!b_end || bq_in_ready);
+  assign q_ready = c_ready && (!b_end || bq_in_ready);
+  assign cf_pop  = cf_valid && q_ready;
   assign c_valid = cf_valid && (!b_end || bq_in_ready);
-  assign c_data  = cf_data;
 
   always_ff @(posedge clk) begin
     if (rst) begin
       b_done <= 1'b1;
     end else if (start) begin
-      b_next  <= c[63:4];
-      b_start <= c[63:4];
+      b_next  <= c[47:4];
+      b_start <= c[47:4];
       b_len   <= '0;
       b_done  <= !en;
     end else if (cf_pop) begin
-      b_next <= b_next + 60'd1;
+      b_next <= b_next + WA'(1);
       if (b_end) begin
         b_len   <= '0;
-        b_start <= b_next + 60'd1;
+        b_start <= b_next + WA'(1);
         if (cf_last) b_done <= 1'b1;
       end else begin
         b_len <= b_len + 7'd1;
@@ -455,7 +478,7 @@ module ro_fold
 
   logic       bq_valid;
   logic [3:0] bq_count;
-  ro_fifo #(.W(69), .D(8), .BRAM(1'b0)) u_bq (
+  ro_fifo #(.W(WA + 9), .D(8), .BRAM(1'b0)) u_bq (
     .clk, .rst (rst || start),
     .in_valid (cf_pop && b_end), .in_ready (bq_in_ready), .in_data ({b_start, 9'(b_len) + 9'd1}),
     .out_valid (bq_valid), .out_ready (wb_ready), .out_data ({wb_waddr, wb_len}),
@@ -468,6 +491,6 @@ module ro_fold
                 !cf_valid && wb_done;
 
   logic unused;
-  assign unused = ^{cf_in_ready, rd_count, rq_count, bq_count};
+  assign unused = ^{rd_count, rq_count, bq_count};
 
 endmodule

@@ -27,6 +27,7 @@ package cv_pkg;
   localparam int MAXOC = 1280;         // max_out_ch
   localparam int AWORDS = ACCN / TM;   // accumulator words (TM lanes of 32 bits)
   localparam int MAXMT  = MAXOC / TM;  // m-tiles (80)
+  localparam int CHB    = $clog2(MAXOC + 1);   // bits of a channel count inside the contract (11)
 
   // AXI masters: burst beats and outstanding bursts (the HLS bus parameters)
   localparam int X_BURST = 16,  X_OUTS = 16;

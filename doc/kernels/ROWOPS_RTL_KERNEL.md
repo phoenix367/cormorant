@@ -216,12 +216,12 @@ board it saves each job's register writes, interrupt and wake.
   of `gd` (min(N, 16) × 8 words) while `loading` keeps its words from the
   units and from `ro_param` (no load is open, so the parameter RAM accepts
   nothing) and `b_ready` is held high; beats 0 … 5 of each descriptor are
-  registered and written into six LUTRAMs of 16 × 128 bits (one per beat,
-  its own write enable), read continuously at the index of the next job
-  into registers.  Each job then passes `T_DLD` (one cycle) and `T_LAT`,
-  where the job registers `j_*` load from those registers instead of from
-  the control slave (a 2:1 mux on the `j_*` inputs, selected by a flag
-  latched at `ap_start`) and the index moves on, and runs the single-job
+  written into six LUTRAMs of 16 × 128 bits as they are taken (one per
+  beat, its own write enable), read asynchronously at the index of the next
+  job (no write after the fetch; the index stable from `T_DLD` on).  Each
+  job then passes `T_DLD` (one cycle) and `T_LAT`, where the job registers
+  `j_*` load from that read instead of from the control slave (a 2:1 mux on
+  the `j_*` inputs, selected by a flag latched at `ap_start`) and the index moves on, and runs the single-job
   path from `T_CFG0`.  `T_RUN` goes back to `T_DLD` while jobs remain, else
   to `T_DONE` — `job_done` drives the state alone, as for a single job.
   Nothing of it lies on a path out of the `j_*` registers.
@@ -229,12 +229,27 @@ board it saves each job's register writes, interrupt and wake.
   `vo_burstgen`, `vo_fifo`, `vo_rs`, renamed `ro_*`): credit-based read
   FIFOs so RREADY never drops, bursts of at most 64 beats within 4 KiB,
   registered AXI outputs through register slices, 16 outstanding bursts
-  per direction.  The write port gains a per-beat strobe input (all ones
+  per direction; the burst generators of port B and of the write port
+  leave out the window and the tile level (`WIN` / `TILES` off: their
+  geometries have neither), and the addresses past the generators (the
+  write port's, TRANSPOSE's and FOLD's bursts and runs) are 44-bit words.
+  The write port gains a per-beat strobe input (all ones
   for every op but TRANSPOSE).  A read port can also take its runs from
   outside (`ext_*`, FOLD): each run (a word address and a count) restarts the
   burst generator once the previous run's bursts are issued.  `ro_rd_arb` merges the two read ports' AR
   streams onto the one channel (round robin, ARID = port) and routes R
   beats by RID; each port's beats stay in order.
+- **Output FIFO**: ROPE, TRANSPOSE and FOLD (one runs per job) write into
+  one FIFO of 32 × 144 bits in `ro_core` (`u_oq`: the word, TRANSPOSE's
+  strobes, FOLD's last-word flag in strobe bit 0), each unit keeping its
+  credits on the FIFO's count; FOLD's burst former pops it, ROPE's and
+  TRANSPOSE's beats go straight to the write port.  `ro_stream` and
+  `ro_norm` keep their own output FIFOs.
+- **Control slave** (`ro_ctrl_s_axi`): the argument registers are read
+  back from a LUTRAM shadow (four byte lanes of 32 × 8, written with the
+  registers' byte enables) and a written flag per register — an unwritten
+  register reads its reset value (0; `win_hi` 0xFFFFFFFF) — instead of a
+  read mux over the registers.
 - **Geometry** is the VectorOPKernel's `geom_t` (blocks × runs × words
   with a tail), built per stream from `n`, `c1`, `c2` and the strides; the
   window of COPY / ADDX marks runs that are not read and are replaced by
@@ -251,8 +266,11 @@ board it saves each job's register writes, interrupt and wake.
   reads otherwise, port B reads: four entries per cycle, two cycles after
   the index.
 - **Rounding** (`rne_shr`, the 64-bit round half to even) takes two
-  stages everywhere (`ro_pkg::rne_a`: the shift, the round bit and the
-  sticky bit; `rne_b`: the increment); the DSP products carry two
+  stages everywhere (`ro_pkg::rne_a`: 2x shifted right by k in three 4:1
+  steps, its last bit the round bit, the sticky bit the OR of the bits the
+  steps drop — no mask arithmetic; `rne_b`: the increment); `ro_stream` has
+  one rounding and saturation unit per lane, which every op but DEQUANT
+  takes (s18 – s20); the DSP products carry two
   registers after the multiply (what Vivado folds into the DSP48E2's
   pipeline), the NORM scalar unit's 32 × 32 products go through
   `ro_mul32` (four 16 × 16 products and two adds, three cycles) and the
@@ -263,39 +281,48 @@ board it saves each job's register writes, interrupt and wake.
   (an int16 word in two halves)
   (24 × 24 … 32 × 32 products, 80-bit adders in carry-save), pass 2
   reads the ring and emits.  Between them a sequential scalar unit forms
-  `V = n·S2 − S1²` (or `Σh² + E`), block-floats D, reads the rsqrt table
+  `V = n·S2 − S1²` (or `Σh² + E`; n·S2 by Horner over n's 13 bits beside
+  the S1² products, 89-bit registers: D < 2^88), block-floats D (Dm one
+  shift), reads the rsqrt table
   (`ro_rsqrt_ram`: 8 192 × 32-bit entries, two per word of one UltraRAM
   loaded by TLOAD, index = the 13 leading bits of the mantissa, two
   cycles) and takes one Newton step with 32-bit products.
   Rows ahead are loaded while a row is emitted (the ring holds ≥ 2 rows),
   so the unit runs at the slower of the two ports.  The emit lanes compute
-  `floor(A · Rm · 2^(24 − sh))` (44 × 32-bit product, then a variable
-  right shift), `· G` (32 × 32), `+ Bq'<<bq_sh`, the per-column rounding
-  shift and the saturation.
+  `A = x · (LN ? n : 1) + (LN ? −S1 : 0)`, `floor(A · Rm · 2^(24 − sh))`
+  (44 × 32-bit product, then a variable right shift; P1 33 bits), `· G`
+  (32 × 32, its low 64 bits — all the rounding reads), `+ Bq'<<bq_sh`, the
+  per-column rounding shift and the saturation; the column's parameters
+  are read six cycles after the group's issue, at the stage that uses them.
 - **MULACT**'s sigmoid table (4 096 entries of {T[i], T[i+1] − T[i]},
   49 bits, `rtl/ro_sig_ram.sv`, loaded by TLOAD) gives both ends of the
   interpolation in one read: two UltraRAM copies, two ports each, serve
   the four lanes, answering two cycles after the address; the
   interpolation and the two products are DSP48E2 work (`gv · σ` 32 × 25,
-  `s · u` 39 × 17).
-- **GATE** (RPU_PLAN §14.3) reads the table twice per lane — A's doubled
-  argument through MULACT's path, B's through two more UltraRAM copies
-  (`u_sig2`, `u_sig3`; TLOAD writes all four) with their own interpolation.
+  `s · u` 39 × 17).  gv and GATE's b are words of COPY / ADDX's 64-bit
+  shifts (`x << sh_a`, `y << sh_b`: no 32-bit shifters of their own);
+  DEQUANT takes |x| from gv's path with `sh_a` cleared.
+- **GATE** (RPU_PLAN §14.3) reads the table twice per lane — B's argument
+  through MULACT's path (`u_sig2`, `u_sig3`, the interpolation and the
+  mirror), A's doubled argument through two more UltraRAM copies
+  (`u_sig0`, `u_sig1`; TLOAD writes all four) with their own interpolation.
   At s10 the `gv · σ` multiplier takes `th · sg` instead: σ before the
   mirror lies in [2^23, 2^24), so `2σ − 2^24` is its low 23 bits doubled and
   tanh costs one negation.  **SCALE** carries the sum S (its low 32 bits)
   and G (25 bits) from s5 / s3 to the same multiplier.  Both products
-  bypass the silu stages (s14 – s16, three 57-bit registers) into s17 and
-  take MULACT's rounding (s18 – s19); s20 saturates them to int16 (GATE)
-  or the C kind with RELU (SCALE).  Four lanes per cycle: a GATE costs
+  bypass the silu stages (s14 – s16, three 57-bit registers) into s17,
+  where COPY / ADDX's sum (carried from s5) joins too, and take MULACT's
+  rounding (s18 – s19); s20 saturates to int16 (MULACT, GATE, C i16) or
+  int32, then RELU (COPY / ADDX).  Four lanes per cycle: a GATE costs
   what a MULACT does (A and B through the one read port), a scaled ADDX
   of int32 + int16 reads 6 bytes per element (2.67 elements per cycle).
 - **ROPE** buffers one head segment (HD ≤ 128 elements = 16 words) of A
-  and the row's cos / sin from B (eight lane banks of LUTRAM, one write
-  enable each), then emits the segment half a word per cycle through the
-  four lanes: the partner element is HD/2 away, so the rotation needs the
+  and the row's cos / sin from B (four lane banks of LUTRAM, cos and sin
+  32 × 32 bits each, element e in bank e mod 4: a B word writes all four),
+  then emits the segment half a word per cycle through the four lanes: the partner element is HD/2 away, so the rotation needs the
   whole segment first; HD a multiple of 16 keeps the partner in the same
-  lane HD/16 words away.  Two segment buffers alternate (fill one, emit
+  lane HD/16 words away (`rot = −partner` by subtracting its product in
+  the 64-bit sum).  Two segment buffers alternate (fill one, emit
   the other); the next row's cos / sin wait for the row's last segment to
   leave the buffers (the banks are read at issue), so a row of one
   segment costs a bubble of its B load.
@@ -303,9 +330,12 @@ board it saves each job's register writes, interrupt and wake.
   words (LUTRAM, one asynchronous read port per row; L ≤ 1024), then emits L granules of R elements with their byte
   strobes (two beats when a granule straddles a word, split at a 4 KiB
   boundary; one contiguous run of full words, zero tail lanes, when
-  `b_s2 = 2R`).
+  `b_s2 = 2R`) — both modes' beats from one byte shifter (the packer's lane
+  offset, or the granule's byte offset).
 - **FOLD** (`ro_fold`, HOSTOPS_PLAN §11) has its own row sequencer: per
-  output row (six cycles of 64-bit element arithmetic, ahead of the
+  output row (six cycles of 33- to 47-bit element arithmetic — a sticky
+  flag marks the rows from the first source column at or above 2^32 on,
+  which are empty —, ahead of the
   datapath through a 16-row descriptor FIFO) the valid part `[max(win_lo,
   base), min(win_hi, base + n))`, the words it lies in — one run on stream
   A's external-run input, none for an empty part — and the row's start lane
@@ -315,9 +345,11 @@ board it saves each job's register writes, interrupt and wake.
   valid part are zeroed, then the fold without a divider — `u = 2|x|`, one
   17 × 25 DSP product with `R = ceil(2^24 / m)` (from the ROPE divider in
   T_CFG2; 2^24 for x ≥ 0), `q1 = P >> 24` and the remainder-is-zero flag
-  `P mod 2^24 < R`, the round at s + 1 bits (`rowops_spec.fold_recip`,
+  `P mod 2^24 < R`, the round at s + 1 bits with the sign folded into its
+  add (`rowops_spec.fold_recip`,
   equal to the quotient for every int16 and m ≤ 127).  A packer appends
-  each group (8 columns, a row's last `n mod 8`) to the contiguous output,
+  each group (8 columns, a row's last `n mod 8`) to the contiguous output
+  (through the core's output FIFO),
   and FOLD cuts it into its own write bursts (≤ 64 words within 4 KiB,
   offered on the write port's external-burst input after their last word).
   A row costs `ceil(n / 8)` cycles plus one to load its first word and one
@@ -374,7 +406,12 @@ B-side interpolations); `ro_stream` 9 110 LUT, 7 233 FF, 4 URAM, 24 DSP.
 In context (bitstream `04259a7af917`, 2026-10-16; production since 2026-10-17): 35 337 LUT, 28 673 FF,
 6 RAMB36, 9 URAM, 133 DSP; the design closes 4 ns with WNS +0.027 ns /
 WHS +0.010 ns at 91 805 LUT and 57 / 64 URAM (a longer route: nine
-rip-up iterations, RPU_PLAN §14.10).
+rip-up iterations, RPU_PLAN §14.10).  After the LUT / FF pass of
+AREA_PLAN §6 (2026-10-24, out of context at 3.333 ns, Vivado 2025.2;
+the production RTL in the same run 35 323 LUT (4 332 LUTRAM, 615 SRL),
+28 667 FF, 133 DSP, WNS −0.027 ns, as above): WNS +0.002 ns, 27 150 LUT
+(4 024 LUTRAM, 744 SRL), 22 290 FF, 6 RAMB36, 9 URAM, 125 DSP (−8: NORM's
+narrower P1 · G); results and cycle counts unchanged.
 
 ## 3. Performance
 
@@ -560,3 +597,11 @@ log has no multi-driven-signal warning (`Synth 8-4767`) for the unit.
    (`loading`), and the chain logic adds no logic on paths out of the
    `j_*` registers (the transposer's byte mask from `j_aux` is the
    design's worst in-context path).
+8. **What the area pass relies on** (AREA_PLAN §6): port B and the write
+   port are built without `WIN` / `TILES`, so their geometries keep one
+   tile and no window; ROPE, TRANSPOSE and FOLD share `u_oq` because only
+   the job's unit writes it (a unit that ran beside another would need its
+   own FIFO again); NORM's parameter read trails the issue by six cycles
+   because its emitter never stalls and nothing else reads `ro_param` in a
+   NORM job; a new argument register needs its reset value in
+   `ro_ctrl_s_axi`'s shadow read-back (0, or `win_hi`'s).

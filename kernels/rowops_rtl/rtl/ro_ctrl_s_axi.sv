@@ -19,7 +19,8 @@
 //   (doc/kernels/ROWOPS_RTL_KERNEL.md §1.2, §1.6; scripts/gen_driver.py checks the table)
 //
 // Like the HLS slave, AW and W are taken one after the other and every
-// access gets an OKAY response.
+// access gets an OKAY response.  The arguments are read back from a LUTRAM
+// shadow written beside the registers (no read mux over them).
 // ---------------------------------------------------------------------------
 module ro_ctrl_s_axi (
   input  logic        clk,
@@ -216,6 +217,29 @@ module ro_ctrl_s_axi (
     end
   end
 
+  // Argument read-back ------------------------------------------------------------
+  // The argument registers are read back from a shadow: four byte-lane LUTRAMs of 32 x 8
+  // (one entry per word address) written with the registers' byte enables, instead of a
+  // 26-way read mux over the registers.  A register's `written` flag (cleared by the reset)
+  // says the shadow holds it: the first write after the reset also writes the bytes it does
+  // not strobe, with their reset values, and until then the reset value is read (0; win_hi
+  // 0xFFFFFFFF).  0x7C is never marked: it reads 0.
+  logic [31:0] written;
+  logic        w_arg;
+  logic [31:0] sh_q;
+  assign w_arg = (waddr[6:4] != 3'd0) && (waddr != 7'h7C);
+  for (genvar k = 0; k < 4; k++) begin : g_shadow
+    (* ram_style = "distributed" *) logic [7:0] mem [32];
+    always_ff @(posedge clk)
+      if (w_hs && w_arg && (wstrb_q[k] || !written[waddr[6:2]]))
+        mem[waddr[6:2]] <= wstrb_q[k] ? wdata_q[8*k +: 8] : ((waddr == A_WHI) ? 8'hFF : 8'h00);
+    assign sh_q[8*k +: 8] = mem[raddr[6:2]];
+  end
+  always_ff @(posedge clk) begin
+    if (rst)                written <= '0;
+    else if (w_hs && w_arg) written[waddr[6:2]] <= 1'b1;
+  end
+
   // Read channel -------------------------------------------------------------------
   typedef enum logic [1:0] {RD_IDLE, RD_ADDR, RD_DATA} rst_t;
   rst_t rst_q;
@@ -248,34 +272,7 @@ module ro_ctrl_s_axi (
         A_GIE:    rdata <= {31'b0, int_gie};
         A_IER:    rdata <= {30'b0, int_ier};
         A_ISR:    rdata <= {30'b0, int_isr};
-        A_OP:     rdata <= op;
-        A_N:      rdata <= n;
-        A_ROWS:   rdata <= rows;
-        A_BLOCKS: rdata <= blocks;
-        A_A0:     rdata <= a[31:0];
-        A_A1:     rdata <= a[63:32];
-        A_AS1:    rdata <= a_s1;
-        A_AS2:    rdata <= a_s2;
-        A_B0:     rdata <= b[31:0];
-        A_B1:     rdata <= b[63:32];
-        A_BS1:    rdata <= b_s1;
-        A_BS2:    rdata <= b_s2;
-        A_C0:     rdata <= c[31:0];
-        A_C1:     rdata <= c[63:32];
-        A_CS1:    rdata <= c_s1;
-        A_CS2:    rdata <= c_s2;
-        A_P0:     rdata <= p[31:0];
-        A_P1:     rdata <= p[63:32];
-        A_E0:     rdata <= eps[31:0];
-        A_E1:     rdata <= eps[63:32];
-        A_AUX:    rdata <= aux;
-        A_BQSH:   rdata <= bq_sh;
-        A_WLO:    rdata <= win_lo;
-        A_WHI:    rdata <= win_hi;
-        A_CH0:    rdata <= chain[31:0];
-        A_CH1:    rdata <= chain[63:32];
-        A_CHN:    rdata <= chain_n;
-        default: ;
+        default:  rdata <= written[raddr[6:2]] ? sh_q : ((raddr == A_WHI) ? 32'hFFFFFFFF : 32'h0);
       endcase
     end
   end

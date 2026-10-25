@@ -4,7 +4,8 @@
 // ---------------------------------------------------------------------------
 // cv_lutram — distributed RAM, one synchronous write port and one
 // asynchronous read port (simple dual port).
-// (The x loader's row buffer and the engine's patch replay file are banks of these.)
+// (The x loader's row buffer, the bias RAM and the engine's patch replay file are
+// banks of these.)
 // ---------------------------------------------------------------------------
 module cv_lutram #(
   parameter int W = 16,

@@ -5,7 +5,8 @@
 // vo_burstgen — walks one operand's run geometry (vo_pkg::geom_t) and emits
 // its INCR bursts: at most MAXB words each, never crossing a 4 KiB boundary,
 // never spanning two runs.  One burst per cycle (registered output).  Blocks
-// (g.n_blk) repeat the run pattern from base + b * blk_w.
+// (g.n_blk) repeat the run pattern from base + b * blk_w; without HAS_BLK
+// (ports b and c: g.n_blk is always 1) the walk ends with the first block.
 //
 // `start` (one cycle, with `g` stable from then on) begins the walk; `done`
 // is high once the last burst has been taken (and before any start).
@@ -13,7 +14,8 @@
 module vo_burstgen
   import vo_pkg::*;
 #(
-  parameter int MAXB = 64                  // power of two, <= 256
+  parameter int MAXB = 64,                 // power of two, <= 256
+  parameter bit HAS_BLK = 1'b1             // g.n_blk may exceed 1
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -75,7 +77,7 @@ module vo_burstgen
       active  <= 1'b0;
       b_valid <= 1'b0;
     end else if (start) begin
-      active     <= g.en && (g.n_blk != '0) && (g.n_runs != '0) && (g.run_words != '0);
+      active     <= g.en && (!HAS_BLK || g.n_blk != '0) && (g.n_runs != '0) && (g.run_words != '0);
       blks_left  <= g.n_blk;
       blk1       <= (g.n_blk == 32'd1);
       runs_left  <= g.n_runs;
@@ -95,14 +97,16 @@ module vo_burstgen
         if (last) begin
           rem <= g.run_words;
           if (run1) begin                   // the block ends
-            if (blk1) active <= 1'b0;
-            blks_left  <= blks_left - 32'd1;
-            blk1       <= (blks_left == 32'd2);
-            runs_left  <= g.n_runs;
-            run1       <= nr1;
-            cur_w      <= blk_next;
-            next_run_w <= blk_next + WA'(g.stride_w);
-            blk_next   <= blk_next + WA'(g.blk_w);
+            if (blk1 || !HAS_BLK) active <= 1'b0;
+            if (HAS_BLK) begin
+              blks_left  <= blks_left - 32'd1;
+              blk1       <= (blks_left == 32'd2);
+              runs_left  <= g.n_runs;
+              run1       <= nr1;
+              cur_w      <= blk_next;
+              next_run_w <= blk_next + WA'(g.stride_w);
+              blk_next   <= blk_next + WA'(g.blk_w);
+            end
           end else begin
             runs_left  <= runs_left - 32'd1;
             run1       <= (runs_left == 32'd2);

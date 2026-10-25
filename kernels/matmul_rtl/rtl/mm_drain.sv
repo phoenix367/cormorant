@@ -28,9 +28,9 @@ module mm_drain
   output logic              step_ready,
   input  step_t             step,
 
-  input  logic [1:0][31:0]  cmp_cnt,
+  input  logic [1:0][HS-1:0] cmp_cnt,
   input  logic [1:0]        lane_active,
-  output logic [31:0]       drn_cnt,
+  output logic [HS-1:0]     drn_cnt,
 
   output logic              drd_en,
   output logic [ACC_AW-1:0] drd_addr,
@@ -129,7 +129,7 @@ module mm_drain
             end
             if (last_rd) begin
               state   <= S_IDLE;
-              drn_cnt <= drn_cnt + 32'd1;
+              drn_cnt <= drn_cnt + HS'(1);
             end
           end
         end
@@ -144,7 +144,10 @@ module mm_drain
   // (4) -> registered here (5) -> lane sum (6) -> pair / quad sums (7) ->
   // column select (8) -> saturate (9) -> FIFO.  Stage k holds a request
   // made k cycles earlier; the lane words cross the MAC array between two
-  // registers (mm_lane's drd_data and dq5).
+  // registers (mm_lane's drd_data and a DSP48E2's input registers: stages 5
+  // and 6 are one adder slice per beat lane, A:B and C zeroed through their
+  // resets when a lane had no K block, P its PREG; drd_data is kept out of
+  // the DSP, see mm_lane).
   // tags: element count of the word and the lanes' activity, aligned with
   // the data stages (act0 / act1 change at the next step's S_WAIT, while
   // this step's words are still in the pipeline)
@@ -154,10 +157,10 @@ module mm_drain
   assign cnt0 = (cfg.lk != 2'd0) ? 4'(4'd8 >> cfg.lk)
               : ((w + 7'd1 == dw) ? last_cnt : 4'd8);
 
-  logic [1:0][E-1:0][31:0] dq5;
-  logic [E-1:0][31:0] sum6, sum7, col8;
-  logic [3:0][31:0]   t1_7;
-  logic [1:0][31:0]   t2_7;
+  (* use_dsp = "yes" *) logic [E-1:0][31:0] ab5, c5, sum6;
+  (* use_dsp = "no" *)  logic [E-1:0][31:0] sum7, col8;   // the tap sums in fabric:
+  (* use_dsp = "no" *)  logic [3:0][31:0]   t1_7;         // a DSP after sum6's would
+  (* use_dsp = "no" *)  logic [1:0][31:0]   t2_7;         // chain two ALUs in a cycle
   logic [E-1:0][15:0] sat9;
 
   always_ff @(posedge clk) begin
@@ -167,16 +170,19 @@ module mm_drain
     act <= {act[PIPE-1:1], {act1, act0}};
   end
 
-  // stage 5: the lane words, registered on this side of the MAC array
-  always_ff @(posedge clk) dq5 <= drd_data;
-
-  // stage 6: lane sum
+  // stage 5: the lane words, registered on this side of the MAC array (0 for
+  // an inactive lane); stage 6: lane sum
   always_ff @(posedge clk)
-    for (int l = 0; l < E; l++)
-      sum6[l] <= (act[5][0] ? dq5[0][l] : 32'd0) + (act[5][1] ? dq5[1][l] : 32'd0);
+    for (int l = 0; l < E; l++) begin
+      if (!act[4][0]) ab5[l] <= '0;          // the DSP's RSTA / RSTB
+      else            ab5[l] <= drd_data[0][l];
+      if (!act[4][1]) c5[l] <= '0;           // RSTC
+      else            c5[l] <= drd_data[1][l];
+      sum6[l] <= ab5[l] + c5[l];
+    end
 
   // stages 7-8: GEMV tap reduction (sums of 2 / 4 / 8 neighbouring lanes)
-  logic [3:0][31:0] t1;
+  (* use_dsp = "no" *) logic [3:0][31:0] t1;
   always_comb for (int g = 0; g < 4; g++) t1[g] = sum6[2*g] + sum6[2*g+1];
   always_ff @(posedge clk) begin
     sum7 <= sum6;

@@ -34,8 +34,8 @@ module mm_awr
   input  logic [8:0]      in_beat,
   input  logic [4:0]      in_row,
 
-  input  logic [1:0][31:0] xpf_cnt,
-  output logic [31:0]     awr_cnt,
+  input  logic [1:0][HS-1:0] xpf_cnt,
+  output logic [HS-1:0]   awr_cnt,
 
   output logic            we,
   output logic [1:0]      wrow,
@@ -49,8 +49,8 @@ module mm_awr
 
   // Registered barrier, evaluated against awr_cnt's next value: it can only
   // open late (xpf_cnt only grows), never early.
-  logic [31:0] awr_cnt_n;
-  assign awr_cnt_n = awr_cnt + {31'b0, last_q};
+  logic [HS-1:0] awr_cnt_n;
+  assign awr_cnt_n = awr_cnt + HS'(last_q);
   always_ff @(posedge clk)
     bar_q <= !rst && (xpf_cnt[0] == awr_cnt_n) && (xpf_cnt[1] == awr_cnt_n);
 
@@ -69,7 +69,7 @@ module mm_awr
       we     <= fire && !in_marker;
       last_q <= fire && in_run_last;
       if (fire) passed <= !in_run_last;
-      if (last_q) awr_cnt <= awr_cnt + 32'd1;
+      if (last_q) awr_cnt <= awr_cnt + HS'(1);
     end
   end
 

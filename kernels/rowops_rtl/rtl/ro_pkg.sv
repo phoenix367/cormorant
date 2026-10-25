@@ -107,19 +107,39 @@ package ro_pkg;
     logic               st;       // bits k - 2 .. 0 of x not all zero
   } rne_t;
 
+  // rne_a shifts z = 2x right by k in three 4:1 steps (16 k[5:4], 4 k[3:2],
+  // k[1:0]): y = floor(2x / 2^k), so y[64:1] = floor(x / 2^k) and y[0] = bit
+  // k - 1 of x (0 for k = 0); the bits the steps drop are {x[k-2:0], 0}, the
+  // sticky bit — no mask arithmetic, no bypass for k = 0.
   function automatic rne_t rne_a(input logic signed [63:0] x, input logic [5:0] k);
     rne_t r;
-    logic signed [63:0] y;
-    logic [63:0]        mask;
-    if (k == 6'd0) begin
-      r.q = x; r.rb = 1'b0; r.st = 1'b0;
-    end else begin
-      y    = x >>> (k - 6'd1);
-      r.q  = y >>> 1;
-      r.rb = y[0];
-      mask = (64'd1 << (k - 6'd1)) - 64'd1;
-      r.st = |(x & mask);
-    end
+    logic signed [64:0] z0, z1, z2, z3;
+    logic               s1, s2, s3;
+    z0 = {x, 1'b0};
+    case (k[5:4])
+      2'd0:    z1 = z0;
+      2'd1:    z1 = z0 >>> 16;
+      2'd2:    z1 = z0 >>> 32;
+      default: z1 = z0 >>> 48;
+    endcase
+    s1 = |(z0[47:0] & {{16{k[5:4] == 2'd3}}, {16{k[5]}}, {16{k[5:4] != 2'd0}}});
+    case (k[3:2])
+      2'd0:    z2 = z1;
+      2'd1:    z2 = z1 >>> 4;
+      2'd2:    z2 = z1 >>> 8;
+      default: z2 = z1 >>> 12;
+    endcase
+    s2 = |(z1[11:0] & {{4{k[3:2] == 2'd3}}, {4{k[3]}}, {4{k[3:2] != 2'd0}}});
+    case (k[1:0])
+      2'd0:    z3 = z2;
+      2'd1:    z3 = z2 >>> 1;
+      2'd2:    z3 = z2 >>> 2;
+      default: z3 = z2 >>> 3;
+    endcase
+    s3 = |(z2[2:0] & {k[1:0] == 2'd3, k[1], k[1:0] != 2'd0});
+    r.q  = z3[64:1];
+    r.rb = z3[0];
+    r.st = s1 | s2 | s3;
     return r;
   endfunction
 

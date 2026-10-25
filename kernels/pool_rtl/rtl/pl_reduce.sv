@@ -121,18 +121,25 @@ module pl_reduce
   for (genvar g = 0; g < NG; g++) begin : g_lanes
     logic [LG*EW-1:0] r0x;
     logic r0f, r1f;
-    logic [31:0] r1c [LG];
+    logic [31:0] r1q [LG];                 // x * x (LP-2; the DSP's product register)
+    logic [31:0] r1y [LG];                 // x * 2^8, |x| * 2^8 for LP-1
     logic [31:0] acc [LG];
     logic [LG-1:0][31:0] n;
     // the job's mode, copied per group (it steers the DSPs' operation); it is
     // stable from long before the job's first beat
     (* keep = "true" *) mode_t mode;
     always_ff @(posedge clk) mode <= j.mode;
+    // the contribution c; one adder per lane: the other modes' acc + c, MAX's
+    // acc + ~c = acc - c - 1, negative iff c >= acc (MAX's values are x * 2^8,
+    // below 2^23 in magnitude, so it cannot overflow; at c = acc either is the max)
     always_comb
       for (int i = 0; i < LG; i++) begin
-        if (r1f)                n[i] = r1c[i];
-        else if (mode == M_MAX) n[i] = ($signed(r1c[i]) > $signed(acc[i])) ? r1c[i] : acc[i];
-        else                    n[i] = acc[i] + r1c[i];
+        logic [31:0] c, e;
+        c = (mode == M_LP2) ? r1q[i] : r1y[i];
+        e = acc[i] + (c ^ {32{mode == M_MAX}});
+        if (r1f)                n[i] = c;
+        else if (mode == M_MAX) n[i] = e[31] ? c : acc[i];
+        else                    n[i] = e;
       end
     assign nx[g * LG +: LG] = n;
     always_ff @(posedge clk) begin
@@ -145,11 +152,8 @@ module pl_reduce
           logic signed [31:0] x32;
           x   = signed'(r0x[i * EW +: EW]);
           x32 = 32'(x) <<< 8;
-          case (mode)
-            M_LP1:   r1c[i] <= x[15] ? -x32 : x32;
-            M_LP2:   r1c[i] <= 32'(x * x);
-            default: r1c[i] <= x32;
-          endcase
+          r1q[i] <= 32'(x * x);
+          r1y[i] <= ((mode == M_LP1) && x[15]) ? -x32 : x32;
         end
       end
       if (g_adv[g] && g_r1v[g])
@@ -193,19 +197,21 @@ module pl_reduce
 
   // per lane: 1 operands; 2 AVG product, LP-2 range reduction; 3-8 the three
   // Horner steps, each a product (DSP M register) then the add and floor (P
-  // register); the AVG product's second cycle in 3; 9 scale and output
+  // register); the AVG product's second cycle in 3; 4 the other modes' result,
+  // floored to Q8.8 and saturated in 5; 9 the LP-2 scale and output
   logic [EW-1:0] f_out [OWP];
   for (genvar p = 0; p < OWP; p++) begin : g_fin
     logic signed [31:0] a1, a2, a3;
     logic        [23:0] inv1;
     logic signed [55:0] pr2, pr3;          // AVG: a * inv
     logic        [17:0] m2, m3, m4, m5, m6;   // LP-2: m in [1, 4), 16 fraction bits
-    logic signed [4:0]  k2, k3, k4, k5, k6, k7, k8;
+    logic        [3:0]  e2, e3, e4, e5, e6, e7, e8;   // LP-2: the scale 2^k as e = k + 8
     logic               z2, z3, z4, z5, z6, z7, z8;   // LP-2: a <= 0
     logic signed [26:0] h3;                // c3 * m
     logic signed [41:0] h5, h7;            // t * m
     logic signed [23:0] t4, t6, t8;        // Horner steps, ap_fixed<24,4> raw
-    logic signed [31:0] r4, r5, r6, r7, r8;   // the result of the other modes
+    logic        [23:0] r4;                // the other modes' result, bits 31:8 (Q8.8, floored)
+    logic        [15:0] r5, r6, r7, r8;    // ... saturated
 
     always_ff @(posedge clk) begin
       // 1
@@ -215,40 +221,39 @@ module pl_reduce
       pr2 <= a1 * signed'({1'b0, inv1});
       a2  <= a1;
       begin
-        logic [4:0]        P;
-        logic signed [5:0] tk;
-        logic [31:0]       mr;
-        P = '0;
-        for (int i = 0; i < 31; i++) if (a1[i]) P = 5'(i);
-        tk = (6'(P) - 6'sd16) & ~6'sd1;
-        mr = (tk >= 0) ? (32'(a1) >> tk) : (32'(a1) << (-tk));
-        m2 <= mr[17:0];
-        k2 <= 5'(tk >>> 1);
+        // P = the top set bit of a, 2k = (P - 16) rounded down to even, so
+        // 2k + 16 = 2e with e = P / 2: m = a * 2^-2k is one even right shift
+        logic [3:0] e;
+        e = '0;
+        for (int i = 0; i < 31; i++) if (a1[i]) e = 4'(i >> 1);
+        m2 <= 18'({a1, 16'b0} >> {e, 1'b0});
+        e2 <= e;
         z2 <= (a1 <= 0);
       end
       // 3-4: t1 = floor(c3 * m + c2)
       h3  <= 27'(C3) * signed'({1'b0, m2});
-      pr3 <= pr2;  a3 <= a2;  m3 <= m2;  k3 <= k2;  z3 <= z2;
+      pr3 <= pr2;  a3 <= a2;  m3 <= m2;  e3 <= e2;  z3 <= z2;
       t4  <= 24'((48'(h3) + (48'(C2) <<< 16)) >>> 11);
-      r4  <= (j.mode == M_AVG) ? 32'(pr3 >>> 23) : a3;
-      m4  <= m3;  k4 <= k3;  z4 <= z3;
+      r4  <= 24'(((j.mode == M_AVG) ? 32'(pr3 >>> 23) : a3) >> 8);
+      m4  <= m3;  e4 <= e3;  z4 <= z3;
       // 5-6: t2 = floor(t1 * m + c1)
       h5  <= 42'(t4) * signed'({1'b0, m4});
-      m5  <= m4;  k5 <= k4;  z5 <= z4;  r5 <= r4;
+      m5  <= m4;  e5 <= e4;  z5 <= z4;  r5 <= sat16({r4, 8'h00});
       t6  <= 24'((48'(h5) + (48'(C1) <<< 21)) >>> 16);
-      m6  <= m5;  k6 <= k5;  z6 <= z5;  r6 <= r5;
+      m6  <= m5;  e6 <= e5;  z6 <= z5;  r6 <= r5;
       // 7-8: sqrt(m) = floor(t2 * m + c0)
       h7  <= 42'(t6) * signed'({1'b0, m6});
-      k7  <= k6;  z7 <= z6;  r7 <= r6;
+      e7  <= e6;  z7 <= z6;  r7 <= r6;
       t8  <= 24'((48'(h7) + (48'(C0) <<< 21)) >>> 16);
-      k8  <= k7;  z8 <= z7;  r8 <= r7;
-      // 9: AccData_t(sqrt(m)) scaled by 2^k; Q8.8
+      e8  <= e7;  z8 <= z7;  r8 <= r7;
+      // 9: AccData_t(sqrt(m)) scaled by 2^k, floored to Q8.8 and saturated:
+      // t8 (about sqrt(m) * 2^20) lies in [0, 2^21) (checked for every positive
+      // accumulator), so the result is (t8 >> 4) >> (16 - e), at most
+      // 2^16 - 1, and it saturates only at e = 15
       begin
-        logic signed [31:0] res, rf;
-        res = 32'(t8) >>> 4;
-        res = (k8 >= 0) ? (res <<< k8) : (res >>> (-k8));
-        rf  = (j.mode == M_LP2) ? (z8 ? 32'sd0 : res) : r8;
-        f_out[p] <= sat16(rf);
+        logic [15:0] r;
+        r = t8[20:5] >> ~e8;
+        f_out[p] <= (j.mode != M_LP2) ? r8 : z8 ? 16'h0000 : r[15] ? 16'h7FFF : r;
       end
     end
   end

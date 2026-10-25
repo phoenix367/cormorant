@@ -386,10 +386,17 @@ After both lanes finish a step, `mm_drain` reads each valid row's
 accumulator words from both lanes in lockstep (a request reaches the
 accumulators through the lanes' group registers 3 cycles later; each group
 selects its row's word next to its DSPs, and the word is registered again on
-the drain's side) and computes:
+the drain's side, in the input registers of a DSP48E2) and computes:
 
-- `sum = lane0 + lane1`
-- the kw-tap reduction (a 3-level tree, selected by lk)
+- `sum = lane0 + lane1` — one DSP48E2 per beat lane (lane 0's word on A:B,
+  lane 1's on C, each zeroed through its register's reset when that lane had
+  no K block; the sum in PREG).  `mm_lane`'s `drd_data` register is `keep`:
+  absorbed into the DSP as A1 / B1 it would share RSTA / RSTB with A2 / B2,
+  and Vivado then ties both resets off — an idle lane's stale accumulators
+  are added (the first build of this drain, `9446b3d462b6`, on the board;
+  `neteq_matmul_rtl`'s jobs 7–9 run one K block after two-lane jobs)
+- the kw-tap reduction (a 3-level tree, selected by lk; in fabric — a DSP
+  after the lane sum's would chain two ALUs in one cycle)
 - `C = sat16(sum >>> 8)`: floor, then clamp to Q8.8
 
 — 9 cycles from request to the output FIFO, with the words' element counts
@@ -408,7 +415,9 @@ registered before they are used.
 ### Synchronisation
 
 Units run decoupled, in the style of access/execute, and hand off through
-monotonic counters:
+counters that only grow, kept modulo 2^HS (`mm_pkg::HS` = 4; every pair
+compared differs by at most 5, so the compares decide as the full counts
+would):
 
 | counter | owner | meaning | waited on by |
 |---|---|---|---|
@@ -457,19 +466,25 @@ FC 1×512×1000 3.7 %, and 90 of the 414 calibrated calls by more than 1 %
 
 xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
 
-| | RTL kernel (post-route) | HLS kernel in `cormorant_hw_128` |
+| | RTL kernel (post-route, AREA_PLAN §6) | HLS kernel in `cormorant_hw_128` |
 |---|---|---|
-| LUT (of which LUTRAM) | 16.3 k (6.9 k) | 26.8 k (0.1 k) |
-| FF | 15.3 k | 27.0 k |
+| LUT (of which LUTRAM) | 14.0 k (6.6 k) | 26.8 k (0.1 k) |
+| FF | 11.9 k | 27.0 k |
 | BRAM36 | 38 (32 A panel, 6 FIFOs) | 44 |
 | URAM | 0 | 8 |
-| DSP48E2 | 130 (128 MACs; 1 per run generator) | 128 |
+| DSP48E2 | 138 (128 MACs; 1 per run generator; 8 drain lane sums) | 128 |
 | peak MAC/cycle | 128 (GEMM), 16 (GEMV, port-bound) | 32 (tiled), 16 (GEMV) |
 
-Timing is checked at 300 MHz and met (WNS +0.026 ns, 2026-10-06, after the
-in-context pipelining below; before it +0.002 ns with 18.4 k LUT and 9.5 k
-FF).  The worst paths out of context are once-per-step address updates in
-the walker and run generator.  Nearly every per-cycle decision was moved off
+Timing is checked at 300 MHz and met: after the LUT / FF pass of AREA_PLAN
+§6 (2026-10-24; Vivado 2025.2, place and route at 3.333 ns) 13 954 LUT
+(6 620 LUTRAM, 21 SRL), 11 904 FF, 38 BRAM36, 138 DSP, WNS +0.006 ns — the
+worst path a reset fanout to control registers, route only; the production
+RTL (bitstream `04259a7af917`) in the same run 14 460 LUT (6 656 LUTRAM, 22
+SRL), 13 329 FF, 130 DSP, WNS +0.115 ns; results and cycle counts
+unchanged.  On 2026-10-06, after the in-context pipelining below: 16.3 k LUT
+(6.9 k LUTRAM), 15.3 k FF, WNS +0.026 ns (before it +0.002 ns with 18.4 k LUT
+and 9.5 k FF), the worst paths once-per-step address updates in the walker
+and run generator.  Nearly every per-cycle decision was moved off
 long paths:
 
 - **Barrier counter compares:** registered, and computed against each counter's *next* value so they can only open late, never early.
@@ -552,15 +567,18 @@ changing the RTL.
   `rtl/mm_core.sv`, which holds the control FSM, the per-port instances and
   the AXI tie-offs.  `rtl/mm_pkg.sv` has the shared constants.
 - **Descriptor flow:** `mm_walker` walks (batch slice → panel of R = 8 A rows
-  → column chunk ≤ 512) and emits steps; `mm_rungen` (one per port) turns each
-  step into runs (A rows, B blocks / tiles / planes, or markers); `mm_axi_rd`
-  issues the read bursts; `mm_gearbox` realigns words into row-aligned beats.
+  → column chunk ≤ 512; it counts the slices, rows and columns left down) and
+  emits steps, each with its chunk's base in B (`step.b_addr`); `mm_rungen`
+  (one per port) turns each step into runs (A rows, B blocks / tiles /
+  planes, or markers); `mm_axi_rd` issues the read bursts; `mm_gearbox`
+  realigns words into row-aligned beats.
 - **Compute:** `mm_awr` → `mm_abuf` hold the A panel (32 BRAM36); `mm_xpf`
   builds per-row tap sets; `mm_lane` is 64 × `mm_mac` (DSP48E2, P = C + A·B),
   each with a 64 × 32-bit LUTRAM accumulator.
-- **Output:** `mm_drain` computes lane0 + lane1, reduces the kw taps and
-  saturates; `mm_packer` builds strobed 128-bit beats; `mm_axi_wr` stores
-  whole bursts before AW and waits for the B responses.  `mm_ctrl_s_axi` is
+- **Output:** `mm_drain` computes lane0 + lane1 (a DSP48E2 per beat lane),
+  reduces the kw taps and saturates; `mm_packer` builds strobed 128-bit
+  beats; `mm_axi_wr` stores whole bursts before AW and waits for the B
+  responses.  `mm_ctrl_s_axi` is
   the HLS-compatible AXI-Lite block; `mm_fifo` the LUTRAM / BRAM FIFOs.
 - **Verification and tooling:** `tb/verilator/tb_main.cpp` + `axi_models.h`
   (testbench), `scripts/lint_waivers.vlt`, `scripts/gen_driver.py` (C driver),
@@ -576,7 +594,11 @@ changing the RTL.
   writer's lane / word mapping, the x prefetcher's K-index formula and the
   run generator must agree.
 - **Handshake counters:** units synchronise only through `awr_cnt`,
-  `xpf_cnt`, `cmp_cnt` and `drn_cnt` ([Synchronisation](#synchronisation)).  A
+  `xpf_cnt`, `cmp_cnt` and `drn_cnt` ([Synchronisation](#synchronisation)),
+  and the job ends at `drn_cnt == n_steps`.  All five count modulo 2^HS
+  (`mm_pkg::HS` = 4): a compared pair differs by at most 5 (a step queue's 4
+  entries and the step the drain holds; the barriers keep awr − xpf and
+  cmp − drn in {0, 1}) — deeper step queues need a larger HS.  A
   panel is announced one cycle *after* its last A write lands (a race here
   broke k = 1 once).  Every panel and step must produce exactly one A run or
   marker per port and at least one B run or marker per lane.
@@ -611,7 +633,7 @@ changing the RTL.
   the AXI address outputs are zero-extended to 64 bits.
 - **lk shift arithmetic:** widen `lk` before adding (`{2'b0, lk} + 4'd1`); a
   2-bit `lk + 1` overflows at kw = 8.
-- **Timing:** the kernel meets 300 MHz out of context with little margin (WNS +0.026 ns) and must reach 250 MHz in the block design, where the MAC array spans many DSP columns: keep every signal that reaches the array registered next to its group, keep new logic off long combinational
+- **Timing:** the kernel meets 300 MHz out of context with little margin (WNS +0.006 ns, AREA_PLAN §6) and must reach 250 MHz in the block design, where the MAC array spans many DSP columns: keep every signal that reaches the array registered next to its group, keep new logic off long combinational
   handshake paths; register decisions against a counter's *next* value (see
   `mm_awr`, `mm_xpf`, `mm_lane` and the AXI engines).
 

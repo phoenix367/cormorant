@@ -18,7 +18,9 @@
 // ---------------------------------------------------------------------------
 module vo_rd_port
   import vo_pkg::*;
-(
+#(
+  parameter bit HAS_BLK = 1'b1             // g.n_blk may exceed 1 (port a: the softmax column mode)
+) (
   input  logic          clk,
   input  logic          rst,
   input  logic          start,
@@ -48,7 +50,7 @@ module vo_rd_port
   logic [59:0] bg_waddr;
   logic [8:0]  bg_len;
 
-  vo_burstgen #(.MAXB(RD_BURST)) u_bg (
+  vo_burstgen #(.MAXB(RD_BURST), .HAS_BLK(HAS_BLK)) u_bg (
     .clk, .rst, .start, .g,
     .b_valid (bg_valid), .b_ready (bg_ready), .b_waddr (bg_waddr), .b_len (bg_len),
     .done    (bg_done)

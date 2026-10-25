@@ -347,7 +347,7 @@ module mm_core #(
   // Walker and step queues ----------------------------------------------------------
   logic  w_valid, w_ready, w_done;
   step_t w_step;
-  logic [31:0] n_steps;
+  logic [HS-1:0] n_steps;
   logic [2:0]  sq_in_ready, sq_out_valid, sq_out_ready;
   step_t       sq_out [3];
 
@@ -371,9 +371,9 @@ module mm_core #(
   end
 
   // Per port: run generator, read engine, gearbox, A writer, x prefetcher, lane ----
-  logic [1:0][31:0] awr_cnt, xpf_cnt, cmp_cnt;
+  logic [1:0][HS-1:0] awr_cnt, xpf_cnt, cmp_cnt;
   logic [1:0]       lane_active;
-  logic [31:0]      drn_cnt;
+  logic [HS-1:0]   drn_cnt;
   logic             drd_en;
   logic [ACC_AW-1:0] drd_addr;
   logic [2:0]       drd_row;

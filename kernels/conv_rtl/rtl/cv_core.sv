@@ -392,19 +392,43 @@ module cv_core
     endcase
   end
 
-  // divisions: chunk rows 65536 / (out_w * m_tiles * TM), ow-tile (LBC - window_w) / stride_w,
-  // residency cap (LBR - window_h) / stride_h
-  logic        dv_start, dv0_done, dv1_done, dv2_done;
+  // divisions: chunk rows 65536 / (out_w * m_tiles * TM) on u_dv0 (18 cycles to
+  // its done); the ow-tile (LBC - window_w) / stride_w and then the residency
+  // cap (LBR - window_h) / stride_h on u_dv1 (8 cycles each, so T_DIV still
+  // ends with u_dv0).  The divisors fit 17 / 7 bits: row_words <= ACCN / TM
+  // (checked before T_DIV), and the line-buffer dividends are below LBC, so
+  // a stride from LBC on is taken as LBC (the quotient is 0 either way).
+  logic        dv_start, dv0_done, dv1_start, dv1_done, dv_ph;
   logic [16:0] dv0_q;
-  logic [6:0]  dv1_q;
+  logic [6:0]  dv1_r, dv1_q;               // u_dv1's quotient; the ow-tile's, kept
   logic [4:0]  dv2_q;
   logic        dv_pend0, dv_pend1, dv_pend2;
-  cv_div #(.N(17)) u_dv0 (.clk, .start (dv_start), .dividend (17'h10000),
-                          .divisor ({row_words[27:0], 4'b0}), .quotient (dv0_q), .done (dv0_done));
-  cv_div #(.N(7))  u_dv1 (.clk, .start (dv_start), .dividend (7'(32'(LBC) - reach_w - 32'd1)),
-                          .divisor (q_sw), .quotient (dv1_q), .done (dv1_done));
-  cv_div #(.N(5))  u_dv2 (.clk, .start (dv_start), .dividend (5'(32'(LBR) - reach_h - 32'd1)),
-                          .divisor (q_sh), .quotient (dv2_q), .done (dv2_done));
+  logic        dv1_d1, dv1_d2;             // u_dv1's first / second division done
+  logic [6:0]  dv1_dividend, dv1_divisor;
+
+  // a divisor of the line-buffer divisions: from LBC on the quotient is 0
+  function automatic logic [6:0] dv_clamp(input logic [31:0] d);
+    return (d >= 32'(LBC)) ? 7'(LBC) : 7'(d);
+  endfunction
+
+  assign dv1_start    = dv_start || dv1_d1;
+  assign dv1_d1       = dv1_done && !dv_ph;
+  assign dv1_d2       = dv1_done && dv_ph;
+  assign dv1_dividend = dv_start ? 7'(32'(LBC) - reach_w - 32'd1) : 7'(32'(LBR) - reach_h - 32'd1);
+  assign dv1_divisor  = dv_ph ? dv_clamp(q_sh) : dv_clamp(q_sw);
+  assign dv2_q        = dv1_r[4:0];
+  always_ff @(posedge clk) begin
+    if (dv_start) dv_ph <= 1'b0;
+    else if (dv1_d1) begin
+      dv_ph <= 1'b1;
+      dv1_q <= dv1_r;
+    end
+  end
+
+  cv_div #(.N(17), .DW(17)) u_dv0 (.clk, .start (dv_start), .dividend (17'h10000),
+                                   .divisor ({row_words[12:0], 4'b0}), .quotient (dv0_q), .done (dv0_done));
+  cv_div #(.N(7), .DW(7))   u_dv1 (.clk, .start (dv1_start), .dividend (dv1_dividend),
+                                   .divisor (dv1_divisor), .quotient (dv1_r), .done (dv1_done));
 
   // the contract (beyond it the job reads and writes nothing)
   logic contract;
@@ -487,9 +511,9 @@ module cv_core
         end
         T_DIV: begin
           if (dv0_done) dv_pend0 <= 1'b0;
-          if (dv1_done) dv_pend1 <= 1'b0;
-          if (dv2_done) dv_pend2 <= 1'b0;
-          if (!(dv_pend0 && !dv0_done) && !(dv_pend1 && !dv1_done) && !(dv_pend2 && !dv2_done) &&
+          if (dv1_d1)   dv_pend1 <= 1'b0;
+          if (dv1_d2)   dv_pend2 <= 1'b0;
+          if (!(dv_pend0 && !dv0_done) && !(dv_pend1 && !dv1_d1) && !(dv_pend2 && !dv1_d2) &&
               !dv_start)
             tstate <= T_GEO;
         end
@@ -550,36 +574,47 @@ module cv_core
   assign ap_idle  = (tstate == T_IDLE);
   assign ap_ready = ap_done;
 
-  // the job's constants, from T_SEQ on.  The enable is registered (a cycle
-  // ahead: ci counts up in T_PC) and replicated — it reaches every unit's
-  // copy of the job.
-  (* max_fanout = 96 *) logic j_ld;
+  // the job's constants.  The registers they come from hold from T_PA (q_*)
+  // or their T_PA / T_PB cycle (the products) until the next job's T_PA, and
+  // the units read j only between their reset at job_start and ap_done, so j
+  // is wires; the four fields computed from them are registered at j_ld (a
+  // cycle ahead of T_SEQ: ci counts up in T_PC).
+  logic        j_ld;
+  logic [5:0]  j_n_win;
+  logic [3:0]  j_dw_words;
+  logic [31:0] j_y_cs, j_y_cs16;
   always_ff @(posedge clk) j_ld <= (tstate == T_PC) && (ci == 4'd7);
   always_ff @(posedge clk) begin
     if (j_ld) begin
-      j.x_w <= q_x;  j.w_w <= q_w;  j.b_w <= q_b;  j.y_w <= q_y;
-      j.batch <= q_batch;  j.in_ch <= q_in_ch;  j.in_h <= q_in_h;  j.in_w <= q_in_w;
-      j.out_ch <= q_out_ch;  j.out_h <= q_out_h;  j.out_w <= q_out_w;
-      j.sh <= q_sh;  j.sw <= q_sw;  j.dh <= q_dh;  j.dw <= q_dw;  j.pt <= q_pt;  j.pl <= q_pl;
-      j.kh <= q_kh;  j.kw <= q_kw;
-      j.has_bias <= q_bias;
-      j.dwm      <= q_dwm;
-      j.in_hw    <= in_hw;
-      j.out_hw   <= out_hw;
-      j.ch_out   <= ch_out;
-      j.m_tiles  <= m_tiles;
-      j.ic_tiles <= ic_tiles;
-      j.n_pos    <= n_pos[5:0];
-      j.n_win    <= (n_pos[5:0] < 6'd2) ? 6'd2 : n_pos[5:0];
-      j.reach_h  <= reach_h[3:0];
-      j.row_words   <= row_words[12:0];
-      j.per_m_words <= pmw[12:0];
-      j.dw_words    <= 4'((n_pos[5:0] + 6'd7) >> 3);
-      j.y_cs        <= (q_ycs != '0) ? q_ycs : out_hw;
-      j.y_cs16      <= {((q_ycs != '0) ? q_ycs[27:0] : out_hw[27:0]), 4'b0};
-      j.y_tpg       <= 7'(q_ycn >> 4);
-      j.y_gs        <= q_ygs;
+      j_n_win    <= (n_pos[5:0] < 6'd2) ? 6'd2 : n_pos[5:0];
+      j_dw_words <= 4'((n_pos[5:0] + 6'd7) >> 3);
+      j_y_cs     <= (q_ycs != '0) ? q_ycs : out_hw;
+      j_y_cs16   <= {((q_ycs != '0) ? q_ycs[27:0] : out_hw[27:0]), 4'b0};
     end
+  end
+  always_comb begin
+    j.x_w = q_x;  j.w_w = q_w;  j.b_w = q_b;  j.y_w = q_y;
+    j.batch = q_batch;  j.in_ch = q_in_ch;  j.in_h = q_in_h;  j.in_w = q_in_w;
+    j.out_ch = q_out_ch;  j.out_h = q_out_h;  j.out_w = q_out_w;
+    j.sh = q_sh;  j.sw = q_sw;  j.dh = q_dh;  j.dw = q_dw;  j.pt = q_pt;  j.pl = q_pl;
+    j.kh = q_kh;  j.kw = q_kw;
+    j.has_bias    = q_bias;
+    j.dwm         = q_dwm;
+    j.in_hw       = in_hw;
+    j.out_hw      = out_hw;
+    j.ch_out      = ch_out;
+    j.m_tiles     = m_tiles;
+    j.ic_tiles    = ic_tiles;
+    j.n_pos       = n_pos[5:0];
+    j.n_win       = j_n_win;
+    j.reach_h     = reach_h[3:0];
+    j.row_words   = row_words[12:0];
+    j.per_m_words = pmw[12:0];
+    j.dw_words    = j_dw_words;
+    j.y_cs        = j_y_cs;
+    j.y_cs16      = j_y_cs16;
+    j.y_tpg       = 7'(q_ycn >> 4);
+    j.y_gs        = q_ygs;
   end
 
   always_ff @(posedge clk) start_q <= job_start;
@@ -603,13 +638,17 @@ module cv_core
   // ===========================================================================
   // Three stages per sweep (at most one carry chain per value and stage), then
   // the push: a sweep is at least 2 instants, the shortest real ones dozens.
+  if (MAXIC > MAXOC) begin : g_chb_check
+    $error("cv_core: s_chrem (CHB bits) assumes MAXIC <= MAXOC");
+  end
   typedef enum logic [2:0] {Q_OFF, Q_K1, Q_K2, Q_K3, Q_PUSH} qst_t;
   qst_t        qs;
   logic [31:0] s_ni, s_xn, s_yn;           // image: index, x / y element offsets
   logic [31:0] s_oh, s_ih0, s_yoh;         // chunk: first row, its input row, y offset
   logic        s_par;
   logic [6:0]  s_ct;                       // channel tile (standard: input tile, depthwise: m-tile)
-  logic [31:0] s_xct, s_cwo, s_chrem;      // its x offset, weight offset, channels left
+  logic [31:0] s_xct, s_cwo;               // its x offset, weight offset
+  logic [CHB-1:0] s_chrem;                 // its channels left (<= MAXOC inside the contract)
   logic [12:0] s_ow, s_owe;                // ow-tile: first column, s_ow + owpt
   logic [31:0] s_iws, s_iwe, s_owm;        // its first and (not the last tile) last input column (signed), accumulator word
   logic [6:0]  s_mtb;                      // m-group: first m-tile
@@ -632,7 +671,7 @@ module cv_core
       s_ih0    <= 32'd0 - q_pt;
       s_par    <= 1'b0;
       s_ct     <= '0;
-      s_chrem  <= q_dwm ? q_out_ch : q_in_ch;
+      s_chrem  <= CHB'(q_dwm ? q_out_ch : q_in_ch);
       s_ow     <= '0;
       s_owe    <= {6'b0, owpt};
       s_iws    <= 32'd0 - q_pl;
@@ -660,7 +699,7 @@ module cv_core
           k.par         <= s_par;
           k.half        <= !j.dwm && (s_ct + 7'd1 == j.ic_tiles) && last_half;
           k.x_cbase     <= s_xn + s_xct;
-          k.ch_valid    <= (s_chrem >= 32'(TIC)) ? 5'(TIC) : s_chrem[4:0];
+          k.ch_valid    <= (s_chrem >= CHB'(TIC)) ? 5'(TIC) : s_chrem[4:0];
           k.ih0         <= s_ih0;
           k.ow_start    <= s_ow;
           k.pair_base   <= {s_ow[12:1], 1'b0};
@@ -713,12 +752,12 @@ module cv_core
                 s_ct    <= s_ct + 7'd1;
                 s_xct   <= s_xct + {j.in_hw[27:0], 4'b0};
                 s_cwo   <= s_cwo + (j.dwm ? {24'b0, j.dw_words, 4'b0} : {25'b0, j.n_pos, 1'b0});
-                s_chrem <= s_chrem - 32'(TIC);
+                s_chrem <= s_chrem - CHB'(TIC);
               end else begin
                 s_ct    <= '0;
                 s_xct   <= '0;
                 s_cwo   <= '0;
-                s_chrem <= j.dwm ? j.out_ch : j.in_ch;
+                s_chrem <= CHB'(j.dwm ? j.out_ch : j.in_ch);
                 s_par   <= !s_par;
                 if (!k_last_chunk) begin
                   s_oh  <= s_oh + {19'b0, per};

@@ -68,7 +68,7 @@ module cv_engine
 );
   // ---- the operand pipeline (issue cycle I) ---------------------------------------------
   //   I+1  weight-cache address (one copy), I+2 one copy per column; the RAM
-  //   latch I+3, its output register I+4, the column mask I+5, lane 0's
+  //   latch I+3, its output register I+4, a register I+5, lane 0's
   //   operand register next to the DSPs: E = I + D_E.
   localparam int D_E  = 6;                 // issue -> E (lane 0's operands at the DSPs)
   localparam int LAT  = D_E + TIC + 2;     // issue -> chain output
@@ -79,7 +79,8 @@ module cv_engine
   localparam int WW   = TIC * EW;          // one weight / patch column
   // A sweep that reads stored partial sums may start right behind one at least
   // HAZ instants long: a word's store (issue + LAT + WBS) lands before the
-  // next sweep reads it (issue + 1), at least L - n_win + 2 cycles later.
+  // next sweep reads it (issue + 2), at least L - n_win + 3 cycles later (the
+  // check below still assumes issue + 1: one cycle to spare).
   localparam int HAZ  = 80;
 
   // the weight cache address {bank, tile, khi, kwi} is a bit concatenation
@@ -97,7 +98,7 @@ module cv_engine
   // cycle before the units' reset, so the copy is valid from the reset on
   logic [2:0]  jq_kh, jq_kw;
   logic [5:0]  jq_n_pos, jq_n_win;
-  logic [31:0] jq_out_ch;
+  logic [CHB-1:0] jq_out_ch;
   logic [6:0]  jq_m_tiles;
   logic [12:0] jq_row_words;
   logic        jq_dwm, jq_has_bias;
@@ -106,7 +107,7 @@ module cv_engine
     jq_kw        <= j.kw;
     jq_n_pos     <= j.n_pos;
     jq_n_win     <= j.n_win;
-    jq_out_ch    <= j.out_ch;
+    jq_out_ch    <= CHB'(j.out_ch);    // <= MAXOC inside the contract
     jq_m_tiles   <= j.m_tiles;
     jq_row_words <= j.row_words;
     jq_dwm       <= j.dwm;
@@ -137,7 +138,7 @@ module cv_engine
   logic        f_act, f_dw, f_bank;
   logic [2:0]  f_t, f_gn;
   logic [4:0]  f_m1, f_mv;
-  logic [31:0] f_mrem;
+  logic [CHB-1:0] f_mrem;
   logic [2:0]  f_khi, f_kwi;
   logic [5:0]  f_pos;
   logic [2:0]  f_q;
@@ -153,8 +154,8 @@ module cv_engine
   assign f_ahead  = cB - cR;
   assign fq_ready = !f_act && (f_ahead != 2'd2);
 
-  function automatic logic [4:0] mvalid(input logic [31:0] rem);
-    return (rem >= 32'(TM)) ? 5'(TM) : rem[4:0];
+  function automatic logic [4:0] mvalid(input logic [CHB-1:0] rem);
+    return (rem >= CHB'(TM)) ? 5'(TM) : rem[4:0];
   endfunction
 
   // the fill's write this cycle
@@ -190,7 +191,7 @@ module cv_engine
         f_gn   <= fq.g_n;
         f_t    <= '0;
         f_m1   <= '0;
-        f_mrem <= jq_out_ch - 32'({fq.mt_base, 4'b0});
+        f_mrem <= jq_out_ch - CHB'({fq.mt_base, 4'b0});
         f_init <= 1'b1;
         f_khi  <= '0;
         f_kwi  <= '0;
@@ -218,8 +219,8 @@ module cv_engine
                 f_done_pulse <= 1'b1;
               end else begin
                 f_t    <= f_t + 3'd1;
-                f_mrem <= f_mrem - 32'(TM);
-                f_mv   <= mvalid(f_mrem - 32'(TM));
+                f_mrem <= f_mrem - CHB'(TM);
+                f_mv   <= mvalid(f_mrem - CHB'(TM));
               end
             end
           end
@@ -292,9 +293,13 @@ module cv_engine
   // (cv_mac_chain) — no shift registers (doc/plans/AREA_PLAN.md).  From the
   // issue: the address register (one copy) at I + 1, delayed 4k for group k
   // (one copy), its copy per column and group at I + 2 + 4k (each drives one
-  // RAM), the RAM latch, the RAM's output register, then the column mask (a
-  // column past the m-tile's channels reads zero) at I + 5 + 4k.  The writes
-  // are not delayed: a sweep's bank is released 4 (WQ - 1) cycles later instead.
+  // RAM), the RAM latch, the RAM's output register, then one more register
+  // at I + 5 + 4k (in the fabric, toward the DSP columns: keep, or synthesis
+  // takes it into the UltraRAM's output pipeline).  A column past the
+  // m-tile's channels reads stale weights: it only feeds accumulator lanes
+  // of channels >= out_ch, which every seed from the bias overwrites and the
+  // drain never emits.  The writes are not delayed: a sweep's bank is
+  // released 4 (WQ - 1) cycles later instead.
   // ===========================================================================
   localparam int WQ  = 4;                  // RAM groups per column
   localparam int WQW = WW / WQ;            // 64 bits: 4 lanes
@@ -303,21 +308,13 @@ module cv_engine
   logic [8:0]    wa1;                      // I + 1
   logic [8:0]    wa_dl [1:WSK];            // wa1 delayed: wa_dl[d] at I + 1 + d
   (* keep = "true" *) logic [8:0] wa_q [TM][WQ];   // I + 2 + 4k, per column and group
-  (* keep = "true" *) logic [TM-1:0] mk1;  // the m-tile's valid columns, I + 1
-  (* keep = "true" *) logic [TM-1:0] mk2, mk3, mk4;   // per column, I + 2 .. I + 4
-  logic [TM-1:0] mk_dl [1:WSK];            // mk4 delayed: mk_dl[d] at I + 4 + d
-  logic [WQW-1:0] wr_q [TM][WQ];           // group k's masked word, I + 5 + 4k
+  logic [WQW-1:0] wr_q [TM][WQ];           // group k's word, I + 5 + 4k
 
   for (genvar m = 0; m < TM; m++) begin : g_wc
     localparam int G = m / GW;
     for (genvar k = 0; k < WQ; k++) begin : g_q
-      logic [WQW-1:0] rd0, rd1, rd2;
-      logic           mk;
-      if (k == 0) begin : g_m0
-        assign mk = mk4[m];
-      end else begin : g_mk
-        assign mk = mk_dl[4 * k][m];
-      end
+      logic [WQW-1:0] rd0, rd1;
+      (* keep = "true" *) logic [WQW-1:0] rd2;   // not absorbed into the UltraRAM
       if (m < TM / 2) begin : g_b
         (* ram_style = "block" *) logic [WQW-1:0] mem [WC_WORDS];
         always_ff @(posedge clk) begin
@@ -333,7 +330,7 @@ module cv_engine
       end
       always_ff @(posedge clk) begin
         rd1 <= rd0;                        // the RAM's output register
-        rd2 <= mk ? rd1 : '0;
+        rd2 <= rd1;
       end
       assign wr_q[m][k] = rd2;
     end
@@ -347,7 +344,6 @@ module cv_engine
   logic [12:0] s_oh, s_pair, s_owa, s_word, s_wrow;
   logic [2:0]  s_g, s_khi, s_kwi;
   logic [5:0]  s_pos;
-  logic [31:0] s_mrem0;                    // out_ch - mt_base * TM
   logic [15:0] s_iters, prev_iters;
   logic        pipe_empty;
 
@@ -392,14 +388,6 @@ module cv_engine
     );
   end
 
-  // m-tile g's valid columns
-  logic [31:0] s_mrem;
-  logic [TM-1:0] s_mask;
-  always_comb begin
-    s_mrem = s_mrem0 - {25'b0, s_g, 4'b0};
-    for (int m = 0; m < TM; m++) s_mask[m] = (s_mrem > 32'(m));
-  end
-
   // the bias RAM's read address (cv_bias registers it: the word arrives at
   // I + 1, registered at I + 2)
   assign bias_tile = sd.mt_base + {4'b0, s_g};
@@ -424,7 +412,6 @@ module cv_engine
         s_owa   <= eq.pair_base;
         s_word  <= eq.wrow0;
         s_wrow  <= eq.wrow0;
-        s_mrem0 <= jq_out_ch - 32'({eq.mt_base, 4'b0});
         s_iters <= '0;
         if (eq.chunk_first) own[eq.par] <= B_ENG;
       end else if (adv) begin
@@ -545,21 +532,15 @@ module cv_engine
     for (int k = 1; k <= LSTO; k++) if (ctl_d[k].v) pipe_empty = 1'b0;
   end
 
-  // weights: the address and mask trees (one copy, then one per column)
+  // weights: the address tree (one copy, then one per column and group)
   always_ff @(posedge clk) begin
     wa1 <= {s_bank, s_g[1:0], s_khi, s_kwi};
-    mk1 <= s_mask;
     wa_dl[1] <= wa1;
     for (int d = 2; d <= WSK; d++) wa_dl[d] <= wa_dl[d - 1];
     for (int m = 0; m < TM; m++) begin
       wa_q[m][0] <= wa1;
       for (int k = 1; k < WQ; k++) wa_q[m][k] <= wa_dl[4 * k];
     end
-    mk2 <= mk1;
-    mk3 <= mk2;
-    mk4 <= mk3;
-    mk_dl[1] <= mk4;
-    for (int d = 2; d <= WSK; d++) mk_dl[d] <= mk_dl[d - 1];
   end
 
   // patches: the root chain pd[1..D_E], zeroed at I + 2 for bubbles and
@@ -577,17 +558,22 @@ module cv_engine
   // Accumulator buffers: AWORDS words of TM x 32 bits per chunk parity.  Port
   // A reads (the issue's seeds, or the drain when it owns the buffer), port B
   // writes (the write-back).  Read latency 3: address register, the RAM latch
-  // and its output register.
+  // and its output register.  The issue's address is registered once more
+  // first (aaddr1), so its word arrives at I + 4, where the seed register
+  // selects the buffer, bias or partial sum in one step.
   // ===========================================================================
   logic [TM*32-1:0] acc_rd [2];
   logic [11:0]      a_ra [2];
+  logic [11:0]      aaddr1;                        // I + 1
   (* keep = "true" *) logic             wq2_we   [2];  // the stores: a copy per buffer
   (* keep = "true" *) logic [11:0]      wq2_addr [2];
   (* keep = "true" *) logic [TM*32-1:0] wq2_data [2];
 
-  always_ff @(posedge clk)
+  always_ff @(posedge clk) begin
+    aaddr1 <= aaddr0;
     for (int b = 0; b < 2; b++)
-      a_ra[b] <= (own[b] == B_DRAIN) ? d_addr : aaddr0;
+      a_ra[b] <= (own[b] == B_DRAIN) ? d_addr : aaddr1;
+  end
 
   for (genvar b = 0; b < 2; b++) begin : g_acc
     (* ram_style = "ultra" *) logic [TM*32-1:0] mem [AWORDS];
@@ -609,17 +595,16 @@ module cv_engine
   assign unused_ren = aren0 ^ d_ren;
 
   // ===========================================================================
-  // Seeds.  I + 3: the accumulator word (both buffers); I + 4: the chunk's
-  // buffer; I + 5: bias or partial sum, masked (one copy); I + 6: again, near
+  // Seeds.  I + 4: the accumulator word (both buffers); I + 5: the chunk's
+  // buffer's word or the bias (one copy, one LUT per bit; the lanes of
+  // channels >= out_ch are not masked: never emitted); I + 6: again, near
   // the columns; E + 1 = I + 7: per chain, zero unless the pixel seeds now
   // (pixel 0 at its position 0, pixel 1 at its position 1).
   // ===========================================================================
   logic [TM*EW-1:0] bias_d2, bias_d3, bias_d4;   // I + 2 .. I + 4
-  (* keep = "true" *) logic [TM-1:0] ms1, ms2, ms3, ms4;   // the column mask, I + 1 .. I + 4
-  (* keep = "true" *) logic par3 [NG];            // ctl_d[3].par, I + 3
+  (* keep = "true" *) logic par4 [NG];            // ctl_d[4].par, I + 4
   (* keep = "true" *) logic sb4  [NG];            // ctl_d[4].sbias, I + 4
   logic             hb4;                          // the job has a bias
-  logic [TM*32-1:0] acc_r3;                       // I + 4
   logic [31:0]      sw5 [TM];                     // I + 5
   logic [31:0]      sw6 [TM];                     // I + 6
   (* keep = "true" *) logic sp5 [PIX2][NG];       // pixel x seeds now: per group, I + 5
@@ -630,22 +615,17 @@ module cv_engine
     bias_d2 <= bias_vec;
     bias_d3 <= bias_d2;
     bias_d4 <= bias_d3;
-    ms1 <= s_mask;
-    ms2 <= ms1;
-    ms3 <= ms2;
-    ms4 <= ms3;
     hb4 <= jq_has_bias;
     for (int g = 0; g < NG; g++) begin
-      par3[g]   <= ctl_d[2].par;
+      par4[g]   <= ctl_d[3].par;
       sb4[g]    <= ctl_d[3].sbias;
       sp5[0][g] <= ctl_d[4].v && ctl_d[4].sp0;
       sp5[1][g] <= ctl_d[4].v && ctl_d[4].sp1;
     end
     for (int m = 0; m < TM; m++) begin
-      acc_r3[m * 32 +: 32] <= par3[m / GW] ? acc_rd[1][m * 32 +: 32] : acc_rd[0][m * 32 +: 32];
-      if (!ms4[m])          sw5[m] <= '0;
-      else if (sb4[m / GW]) sw5[m] <= hb4 ? {{8{bias_d4[m * EW + EW - 1]}}, bias_d4[m * EW +: EW], 8'b0} : '0;
-      else                  sw5[m] <= acc_r3[m * 32 +: 32];
+      if (sb4[m / GW])       sw5[m] <= hb4 ? {{8{bias_d4[m * EW + EW - 1]}}, bias_d4[m * EW +: EW], 8'b0} : '0;
+      else if (par4[m / GW]) sw5[m] <= acc_rd[1][m * 32 +: 32];
+      else                   sw5[m] <= acc_rd[0][m * 32 +: 32];
       sw6[m] <= sw5[m];
       sp6[0][m] <= sp5[0][m / GW];
       sp6[1][m] <= sp5[1][m / GW];
@@ -690,7 +670,7 @@ module cv_engine
   end
 
   // A weight lane drives only the two pixels' DSPs of its column.  Lane
-  // l = 4k + r of group k's masked word (at E - 1 + 4k): lanes r = 0, 1 go to
+  // l = 4k + r of group k's word (at E - 1 + 4k): lanes r = 0, 1 go to
   // the DSPs' A ports as they are (AREG 2, and the AD register for r = 1),
   // r = 2, 3 through r - 1 registers first (cv_mac_chain's lane timing:
   // E + l - 1 for r = 0, E + l - 2 otherwise).

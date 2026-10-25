@@ -57,7 +57,7 @@ module vo_wr_port
   logic [59:0] bg_waddr;
   logic [8:0]  bg_len;
 
-  vo_burstgen #(.MAXB(WR_BURST)) u_bg (
+  vo_burstgen #(.MAXB(WR_BURST), .HAS_BLK(1'b0)) u_bg (   // the output: one block
     .clk, .rst, .start, .g,
     .b_valid (bg_valid), .b_ready (bg_ready), .b_waddr (bg_waddr), .b_len (bg_len),
     .done    (bg_done)

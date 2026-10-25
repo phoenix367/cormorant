@@ -5,11 +5,13 @@
 // cv_ywriter — the output writer (gmem3, the HLS write_output_tile).
 //
 // Each run (channel, segment) of len pixels starts at element e of y: its
-// words (8 pixels each, from the drain) are shifted onto DDR words — word k
-// of the run is lanes [8k, 8k + 8) of the shifted run — and written as one
-// burst (two where the run crosses 4 KiB) with byte strobes on the run's own
-// lanes only, so a neighbouring channel's lanes in the first and last words
-// stay intact.  At most Y_OUTS bursts await their B.
+// words (8 pixels each, from the drain, already rotated onto the run's
+// alignment — pixel q of a word in lane (q + e) mod 8) become DDR words —
+// lane l of output word k is lane l of input word k, or of word k - 1 for
+// l < e mod 8 — and are written as one burst (two where the run crosses
+// 4 KiB) with byte strobes on the run's own lanes only, so a neighbouring
+// channel's lanes in the first and last words stay intact.  At most Y_OUTS
+// bursts await their B.
 // ---------------------------------------------------------------------------
 module cv_ywriter
   import cv_pkg::*;
@@ -77,18 +79,20 @@ module cv_ywriter
   assign yw_ready  = go && need_in;
   assign run_ready = !r_act;
 
-  logic [BW-1:0] in_w, out_w;
+  // past the run's last input word (need_in low) and before its first, the
+  // lanes taken from yw_data / r_prev lie outside the run: masked
+  logic [BW-1:0] out_w;
   logic [E*2-1:0] strb;
   always_comb begin
-    in_w  = need_in ? yw_data : '0;
-    out_w = BW'({in_w, r_prev} >> (EW * (E - int'(r_sh))));
     for (int l = 0; l < E; l++) begin
       logic [9:0] pos;
       logic       ok;
       pos = 10'({r_k, 3'(l)});
       ok  = (pos >= {7'b0, r_sh}) && (pos < {7'b0, r_sh} + {1'b0, r_len});
       strb[2 * l +: 2] = {ok, ok};
-      if (!ok) out_w[l * EW +: EW] = '0;
+      if (!ok)               out_w[l * EW +: EW] = '0;
+      else if (3'(l) < r_sh) out_w[l * EW +: EW] = r_prev[l * EW +: EW];
+      else                   out_w[l * EW +: EW] = yw_data[l * EW +: EW];
     end
   end
 
@@ -105,12 +109,11 @@ module cv_ywriter
         r_k     <= '0;
         r_waddr <= j.y_w + WA'(run_e[31:3]);
         r_brem  <= '0;
-        r_prev  <= '0;
       end
     end else if (go) begin
       r_k     <= r_k + 6'd1;
       r_waddr <= r_waddr + WA'(1);
-      r_prev  <= in_w;
+      r_prev  <= yw_data;
       r_brem  <= (bstart ? b_len : r_brem) - 6'd1;
       if (r_k + 6'd1 == r_nout) r_act <= 1'b0;
     end

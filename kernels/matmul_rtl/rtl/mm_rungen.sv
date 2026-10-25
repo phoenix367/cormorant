@@ -58,7 +58,7 @@ module mm_rungen
   logic [8:0]  blk;          // current K block
   logic [4:0]  j;            // plane within the block (chunked image mode)
   logic [4:0]  t, tiles_n;   // tile within the chunk (packed mode)
-  logic [AB-1:0] addr_run, addr_tile, addr_blk, pk_base, base_q;
+  logic [AB-1:0] addr_run, addr_tile, addr_blk;
   logic [AB-1:0] planes24;   // bytes of 24 planes: from a block to plane 8 of the next
   assign planes24 = AB'(cfg.p24);
 
@@ -265,21 +265,16 @@ module mm_rungen
           t       <= '0;
           tiles_n <= 5'((11'(st.mcc) + 11'd31) >> 5);
           elems_last <= 18'(rows_l) * 18'(cfg.lfull[9:0]);
-          // Base of the chunk in B.  Packed: chunk c0 starts at tile c0 / 32
-          // = 16 * chunk index, 16 tiles of 32 x k elements per chunk.  Image:
-          // column c0 of plane 0 (c0 == 0 for a single chunk).
-          if (cfg.pk) base_q <= (st.c0 == '0) ? st.b_addr : pk_base + (AB'(cfg.k) << 10);
-          else        base_q <= st.b_addr + (AB'(st.c0) << ({2'b0, cfg.lk} + 4'd1));
           state <= S_BINIT2;
         end
         S_BINIT2: begin
-          // plus this lane's first K block: block P (16 rows of 32 or 16
-          // planes), or for lane 1 alone in a split block 0 its plane 8
+          // The chunk's base in B (the walker's) plus this lane's first K
+          // block: block P (16 rows of 32 or 16 planes), or for lane 1 alone
+          // in a split block 0 its plane 8
           logic [AB-1:0] first;
-          if (P == 0)          first = base_q;
-          else if (half_start) first = base_q + (cfg.pk ? AB'(512) : AB'({cfg.lfull, 4'b0}));
-          else                 first = base_q + (cfg.pk ? AB'(1024) : AB'({cfg.lfull, 5'b0}));
-          if (cfg.pk) pk_base <= base_q;
+          if (P == 0)          first = st.b_addr;
+          else if (half_start) first = st.b_addr + (cfg.pk ? AB'(512) : AB'({cfg.lfull, 4'b0}));
+          else                 first = st.b_addr + (cfg.pk ? AB'(1024) : AB'({cfg.lfull, 5'b0}));
           addr_tile <= first;
           addr_blk  <= first;
           addr_run  <= first;

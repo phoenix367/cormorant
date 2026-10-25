@@ -114,14 +114,14 @@ ctrl ─► config (7 cycles) ─┬► rd_port a: burstgen ─► AR ─► R F
 |---|---|
 | `vo_ctrl_s_axi` | the AXI-Lite slave (derived from the RTL MatmulKernel's); its inputs are registered before they are decoded (a write takes effect with BVALID, a read is answered one cycle later) |
 | `vo_core` | job FSM: latch the registers, derive the three port geometries (`outer · n_words` as three 16 × 16 partial products, four registered stages), start the units, `ap_done` when all are idle; the latch and the geometry loads are enabled by registered strobes, and the job reset is registered and copied per unit |
-| `vo_burstgen` | one port's bursts: one per cycle, ≤ MAXB words, never across 4 KiB or a run |
+| `vo_burstgen` | one port's bursts: one per cycle, ≤ MAXB words, never across 4 KiB or a run; the block loop only with `HAS_BLK` (port a — the softmax column mode; b and c are always one block) |
 | `vo_rd_port` | AR issued only when the 512-beat read FIFO can take the whole burst (RREADY tied high); tail mask (its run-end flag and lane mask kept in registers); the replay RAM; a small output FIFO |
 | `vo_rs` | a register slice (two entries, both directions registered) on each AR, AW and W output |
 | `vo_compute` | 8 lanes per cycle in a 6-stage pipeline (add / sub, a DSP multiply per lane, select + saturate, ReLU / ReLU6); DIV through `vo_div`; both paths then through `vo_act`; a 32-word output FIFO, entered only with room for every word in flight (one counter from the take to the FIFO); the job's activation (`job_act`) decoded in two registered steps |
-| `vo_act` | the activations 3–6 on the merged 8-lane words, a fixed 7-cycle pipeline (other jobs pass through): per lane `|x|`, the ROM address and past-the-table flag, the ROM read and its output register, `max(x, 0) − m`; LeakyReLU in one DSP48E2 per lane (A / B registers, M, P; the 33-bit product rounded in fabric) |
+| `vo_act` | the activations 3–6 on the merged 8-lane words, a fixed 7-cycle pipeline (other jobs pass through): per lane `\|x\|`, the ROM address and past-the-table flag, the ROM read and its output register, `max(x, 0) − m` with the function's select (stage 5), a copy (stage 6); LeakyReLU in one DSP48E2 per lane (A / B registers, M, P = x · alpha + 2¹⁵: the rounded product is P >> 16 with bit 16 cleared on a tie, P[15:0] = 0 — ties to even without an incrementer) |
 | `vo_act_rom` | generated: the 4 096 × 7 table, two read ports with the block RAM's output register — one BRAM36 (4K × 9) per two lanes |
-| `vo_div` | restoring radix-2 divider on magnitudes, one lane per cycle, 26 stages |
-| `vo_smx` | the softmax (ops 10 / 11), on the a stream and into the write port in place of `vo_compute`: one unit at a time (a row, or 16 query columns), load into an 8-bank buffer (2048 × 16 per bank; column mode skewed so a key row is one write and an output word one read) with the maxima on the way in, then EXP (read, e, the sums), 25-cycle restoring divisions R = ⌊2⁴⁰ / S⌋, OUT (read again, e recomputed, e · R, round, saturate) — EXP and OUT share one 21-stage pipeline (2 DSPs per lane); the 32-word output FIFO with credits as `vo_compute`'s |
+| `vo_div` | non-restoring radix-2 divider on magnitudes, one lane per cycle, 26 stages: the remainder R_i = 2R_(i−1) + bit ∓ \|b\| (− after R_(i−1) ≥ 0) in 16-bit two's complement, the quotient bit R_i ≥ 0, no correction step (checked exhaustively) |
+| `vo_smx` | the softmax (ops 10 / 11), on the a stream and into the write port in place of `vo_compute`: one unit at a time (a row, or 16 query columns), load into an 8-bank buffer (2048 × 16 per bank; column mode skewed so a key row is one write and an output word one read) with the maxima on the way in, then EXP (read, e, the sums), 25-cycle restoring divisions R = ⌊2⁴⁰ / S⌋ (the 16 vectors' R in a LUTRAM, one write per division), OUT (read again, e recomputed, e · R, round, saturate) — EXP and OUT share one 21-stage pipeline (2 DSPs per lane; the shifts by Cs and by 40 − f_p keep only the bits used, 17 and 15, and a flag for any bit above them); the 32-word output FIFO with credits as `vo_compute`'s |
 | `vo_smx_rom` | generated: the 4 096 × 17 exponential table, two read ports with the output register — 4 instances (8 lanes) |
 | `vo_wr_port` | 512-beat FIFO; bursts ≤ 256 words issued on AW once their beats are buffered; ≤ 16 bursts awaiting B; the next bursts wait in a register slice and the issue decision is an AND of registers (`avail`, `av_ok` computed a cycle ahead, `ob_ok`) |
 
@@ -143,7 +143,12 @@ read-write with 2 outstanding bursts, and the crossbar held the reads of a
 job of nine 2-word runs to about four in flight — slower than the HLS
 kernel in the test stand.
 
-Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`), with the
+Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`), after the
+LUT / FF pass of AREA_PLAN §6 (2026-10-24; Vivado 2025.2, place and route at
+3.333 ns): 9 570 LUT (542 LUTRAM, 188 SRL), 10 721 FF, 30 BRAM36, 35 DSP, WNS
++0.210 ns — the production RTL (bitstream `04259a7af917`) in the same run
+10 746 LUT (526 LUTRAM, 187 SRL), 12 196 FF, WNS +0.221 ns; results and cycle
+counts unchanged.  With the
 softmax unit (2026-10-07): 11 672 LUT (491 LUTRAM), 13 751 FF, 30 BRAM36, 35
 DSP; timing met at 300 MHz (WNS +0.175 ns, Fmax ≈ 317 MHz; the worst path the
 argument latch's enable, routing only).  Before it: 6 173
@@ -281,6 +286,9 @@ lockstep, `tools/neteq`), `sysim_vectorop_rtl` — `kernels/vectorop_rtl/CMakeLi
   into the FIFO, so `vo_act` (or any further stage) is covered; the FIFO
   (32 words) must stay deeper than the pipeline from the take to the FIFO
   (5 + 7 stages) for a full word per cycle.
+- Ports b and c are built without `HAS_BLK` (`vo_burstgen` stops after the
+  first block): their geometry (`mk_geom`, `col_geom(1)`) must keep
+  `n_blk = 1`.  Only port a walks blocks.
 - `vo_act` decodes its job constants (mode, ROM segment, `alpha`) two
   register stages after `j_op` / `j_act` / `j_alpha`; the first word of a
   job reaches it many cycles later (AR / R, the FIFOs, the ALU), so the
