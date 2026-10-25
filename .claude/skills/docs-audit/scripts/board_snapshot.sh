@@ -17,7 +17,7 @@
 # side by side by --compare, not diffed.  Stable lines: firmware SHA-256
 # (pl.bin = the production bitstream id; the R5's rpu_firmware.elf), overlays + status,
 # the remote processors, UIO names, /root listing, repro leftovers, the chat and
-# Miranda services, tmpfiles rule, cpuidle, cma.
+# Miranda services and their unit files, tmpfiles rule, cpuidle, cma.
 # Nothing here writes on the board.
 set -euo pipefail
 
@@ -72,8 +72,12 @@ echo "root_entries: $(ls -A /root 2>/dev/null | tr '\n' ' ')"
 echo "repro_leftovers: $(ls -d /root/*repro* /tmp/*repro* /lib/firmware/design_cormorant* /lib/firmware/*repro* /tmp/design_cormorant* $ov/design_cormorant 2>/dev/null | tr '\n' ' ')"
 if command -v systemctl >/dev/null; then
     echo "chat_service: active=$(systemctl is-active kv260-chat 2>/dev/null) enabled=$(systemctl is-enabled kv260-chat 2>/dev/null)"
-    echo "miranda_service: active=$(systemctl is-active kv260-miranda 2>/dev/null)"
+    echo "miranda_service: active=$(systemctl is-active kv260-miranda 2>/dev/null) enabled=$(systemctl is-enabled kv260-miranda 2>/dev/null)"
 fi
+for u in kv260-chat kv260-miranda; do
+    f=/etc/systemd/system/$u.service
+    echo "unit_file: $u $( [ -e "$f" ] && sha256sum "$f" | cut -c1-64 || echo missing)"
+done
 echo "server_procs: $(ps -eo args 2>/dev/null | grep -E '[k]v260_chat_server|[m]iranda_server|[t]est_inference|[c]lassify_images|[b]ert_squad( |$)|[k]ernel_perf' | sort | tr '\n' ';')"
 rule=/etc/tmpfiles.d/kv260-no-cpu-powerdown.conf
 echo "tmpfiles_rule: $( [ -e "$rule" ] && md5sum "$rule" | cut -c1-32 || echo missing)"

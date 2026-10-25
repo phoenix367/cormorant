@@ -170,6 +170,22 @@ def log(msg: str) -> None:
         sys.stderr.flush()
 
 
+def sd_notify(state: str) -> None:
+    """Tell systemd the server's state (READY=1: the models are loaded) when it
+    runs as a Type=notify unit (deploy.py's kv260-chat); nothing otherwise."""
+    addr = os.environ.get("NOTIFY_SOCKET", "")
+    if not addr:
+        return
+    if addr.startswith("@"):                                   # abstract namespace
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(state.encode())
+    except OSError as e:
+        log(f"warning: sd_notify({state}) failed: {e}")
+
+
 # ── request validation ───────────────────────────────────────────────────────
 
 def _type_name(v: Any) -> str:
@@ -1833,9 +1849,11 @@ def main(argv=None) -> int:
     log(f"kv260-chat {VERSION} listening on http://{args.host}:{args.port}/v1  "
         f"models: {', '.join(m + ('' if srv.loaded[m] else ' (loads on request)') for m in backends)}"
         f"  resident: {args.resident}  api key: {'required' if args.api_key else 'none'}")
+    sd_notify("READY=1")
     try:
         srv.serve_forever(poll_interval=0.5)
     finally:
+        sd_notify("STOPPING=1")
         srv.server_close()
         # let a running request finish before the model goes away
         if srv.fpga.acquire(60.0) != "ok":

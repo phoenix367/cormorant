@@ -49,7 +49,7 @@ code changes; B when build / setup paths, repo contents (new files,
    you find repeated in several docs to the registry:
    ```bash
    cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1886: all pass, 0 skip
-   cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 230
+   cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 247
    python3 $S/scripts/audit_facts.py counts --run   # no CHECK line left that is a stale count
    git diff --stat -- ':!*.md'                      # empty: docs only
    ```
@@ -97,7 +97,8 @@ pl.bin SHA-256 (its first 12 hex digits = the bitstream id in
 `perf_models/kv260/`), overlays and status, UIO names, the /root listing,
 `_repro` leftovers, `kv260-chat`, the tmpfiles rule, cpuidle, cma.  If
 `chat_service: active=active`, that is the production server — ask before
-stopping it (`demo/chat/deploy.py --stop`) and restart it in B5.
+stopping it (`demo/chat/deploy.py --stop`) and restart it in B5.  `unit_file:` lines:
+the services' unit files (B5 restores them).
 
 **B4. Launch ONE general-purpose agent in the background** with the text of
 `$B/brief.md` as its prompt (from `templates/new_user_brief.md`: docs only,
@@ -130,7 +131,12 @@ complete, continue it with SendMessage (context intact) instead of a new agent.
    'pl' did not apply" → the agent's `design_cormorant` overlay is still
    there: `rmdir /sys/kernel/config/device-tree/overlays/design_cormorant` on
    the board, run again.
-4. Compare the board with the snapshot — stable lines must be identical:
+4. Restore the units: the agent's `deploy.py` rewrote
+   `/etc/systemd/system/kv260-chat.service` / `kv260-miranda.service` for its
+   `_repro` install.  `demo/chat/deploy.py --no-start` and
+   `demo/miranda/deploy.py --no-start` (production configs) write the owner's
+   again; drop `--no-start` for a service B3 found active.
+5. Compare the board with the snapshot — stable lines must be identical:
    ```bash
    $S/scripts/board_snapshot.sh $B/board_after.txt
    $S/scripts/board_snapshot.sh --compare $B/board_before.txt $B/board_after.txt   # "none — board state restored"

@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1886 tests); the chat app (230 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1886 tests); the chat app (247 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the five SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -138,7 +138,7 @@ The chat server's tests ([`demo/chat/doc/DEVELOPMENT.md`](../../demo/chat/doc/DE
 run with the same venv, from the repo root:
 
 ```bash
-inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 230 tests
+inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 247 tests
 ```
 
 About 75 of them skip in a fresh clone (80 under the system python3), until the assets they read are

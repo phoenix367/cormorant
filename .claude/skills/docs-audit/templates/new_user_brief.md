@@ -43,7 +43,10 @@ gaps; you do not fix them.
   `/lib/firmware/rpu_firmware.elf`, `/tmp/pl.dtbo`, the overlays `rpu` and
   `rpu-ipi` (you may reuse them as they are).  The owner has stopped the
   services `kv260-chat` and `kv260-miranda` and removes the production overlay
-  `pl` only if the docs tell you to (see below).
+  `pl` only if the docs tell you to (see below).  Their unit files
+  `/etc/systemd/system/kv260-chat.service` and `kv260-miranda.service` are
+  the exception: the documented `deploy.py` rewrites them for your install,
+  which is allowed (the owner restores them); never `systemctl enable` them.
 - Your names end in `_repro`: work dirs `/tmp/repro_<name>`, weights
   `/root/<name>_weights_repro`, the chat install `/root/kv260_chat_repro`.  Set
   them in EVERY config copy before its first run — `.example` defaults are the

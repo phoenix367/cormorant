@@ -24,17 +24,33 @@ host with inference-scheduler/.venv/bin/python).
               moonshine side (moonshine_backend.py, speech_input.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
               (skipped when unchanged; without it the server samples in Python)
+  fpga     -> the bitstream the board runs, as a bundle the unit can load by
+              itself (fpga_load.py; inference-scheduler/src/bitstream/bundle.py:
+              the .bin, the overlay, the xclbin, the port widths) from
+              fpga.bitstream_config (default
+              inference-scheduler/bitstream_config_kv260.json) -> <dir>/fpga;
+              stops when that config names another bitstream than the board
+              runs; skipped when the board's bundle is that bitstream's
   rpu      -> with rpu.enabled (or --rpu BSP_DIR): the Cortex-R5 firmware built
               against the bitstream's BSP (inference-scheduler/rpu_board.py,
-              tools/rpu/), uploaded with its two overlays to <dir>/rpu and
-              started (remoteproc): the libraries the server loads then attach
-              by themselves and each entry follows its INFERENCE_RPU_RECOMMENDED
-              (doc/plans/RPU_PLAN.md §9).  --stop stops the firmware with the
-              server.
-  start    -> transient systemd unit 'kv260-chat' (systemd-run: survives the
-              ssh session, not started at boot, logs in journalctl -u
-              kv260-chat) or, with server.launcher = "nohup", a detached
-              process; then waits for GET /health from the host
+              tools/rpu/), uploaded with its two overlays and its start / stop
+              scripts to <dir>/rpu; the unit starts it before the server
+              (remoteproc): the libraries the server loads then attach by
+              themselves and each entry follows its INFERENCE_RPU_RECOMMENDED
+              (doc/plans/RPU_PLAN.md §9).  The firmware stops with the server.
+  unit     -> /etc/systemd/system/kv260-chat.service, not enabled: the server
+              never starts at boot, only by hand — `systemctl start kv260-chat`
+              on the board or `deploy.py --start` (logs: journalctl -u
+              kv260-chat).  Before the server it runs fpga_load.py (the FPGA
+              must be free; the bundle's bitstream is loaded unless it runs —
+              after a boot the board runs the starter-kit design), the R5
+              firmware's start and the CMA clean-up; the server tells systemd
+              when its models are loaded (Type=notify)
+  start    -> systemctl start kv260-chat (or, with server.launcher = "nohup", a
+              detached process); then waits for GET /health from the host
+
+After a boot the board runs the starter-kit design: a deploy first loads the
+last deploy's bundle (fpga_load.py), so its preflight finds the kernels.
 
 The generative backends need their libraries on the board, built by
 scripts/llm_board.py (not by this script): smollm2 (SmolLM2-135M) at
@@ -55,14 +71,19 @@ demo/asr/scripts/asr_board.py --install-only, the tokenizer.json of the
 checkpoint on the host (moonshine.tokenizer), numpy on the board (ffmpeg for
 audio other than WAV).
 
-The board lock (flock on board_lock) is held while deploying.  The running
-server owns the FPGA: other board jobs must wait until `deploy.py --stop`.
-With --hold, deploy.py keeps the lock after starting, follows the server log
-and stops the server (releasing the lock) on Ctrl-C / SIGTERM.
+The board lock (flock on board_lock) is held while deploying and by
+--start.  The running server owns the FPGA: other board jobs must wait until
+`deploy.py --stop`.  A start on the board (systemctl) takes no lock; the unit
+then refuses to start while another process holds the FPGA.  With --hold,
+deploy.py keeps the lock after starting, follows the server log and stops the
+server (releasing the lock) on Ctrl-C / SIGTERM.  --no-start installs
+everything but leaves the server stopped; --uninstall stops it and removes
+the unit (the files in <dir> stay).
 
 usage:  deploy.py [--config chat_config.json] [--regenerate] [--rebuild]
-                  [--hold] [--no-lock] [--board-lock FILE] [--check-only] [-v]
-        deploy.py --stop | --status
+                  [--hold | --no-start] [--no-lock] [--board-lock FILE]
+                  [--check-only] [-v]
+        deploy.py --start | --stop | --status | --uninstall
 """
 
 from __future__ import annotations
@@ -72,6 +93,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import sys
@@ -96,13 +118,14 @@ from src.remote import (RemoteSession, _bold, _dim, _green, _red,  # noqa: E402
 CONFIG = CHAT / "chat_config.json"
 EXAMPLE = CHAT / "chat_config.json.example"
 UNIT = "kv260-chat"
+RPU_MARK = "/run/kv260-chat-rpu"           # rpu_up.sh started the R5 firmware (tmpfs: gone after a boot)
 SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py",
                 CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
                 CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
                 CHAT / "vlm_image.py", CHAT / "piper_backend.py", CHAT / "piper_phonemize.py",
                 DEMO / "tts" / "scripts" / "piper_vits.py", CHAT / "moonshine_backend.py",
-                CHAT / "speech_input.py"]
+                CHAT / "speech_input.py", CHAT / "fpga_load.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -148,6 +171,10 @@ def load_config(path: Optional[str]) -> dict:
                  ("max_windows", 8), ("doc_stride", 128), ("queue_timeout", 120), ("max_queue", 16),
                  ("launcher", "systemd"), ("env", {}), ("resident", "auto")):
         srv.setdefault(k, v)
+    fpga = cfg.setdefault("fpga", {})
+    fpga.setdefault("bitstream_config", "../../inference-scheduler/bitstream_config_kv260.json")
+    if fpga["bitstream_config"]:
+        fpga["bitstream_config"] = str(chat_path(fpga["bitstream_config"]))
     rpu = cfg.setdefault("rpu", {})
     for k, v in (("enabled", False), ("bsp_dir", None), ("firmware", "rpu_firmware.elf")):
         rpu.setdefault(k, v)
@@ -285,8 +312,8 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     good = rc == 0
     print(f"    {_green('OK     ') if good else _red('MISSING')} {'python3 >= 3.8':<36} {_dim(out.strip())}")
     ok &= good
-    out, _, _ = session.exec("command -v systemd-run || echo none", timeout=15)
-    print(f"    {_dim('info   ')} {'systemd-run':<36} {_dim(out.strip())}")
+    out, _, _ = session.exec("command -v systemctl || echo none", timeout=15)
+    print(f"    {_dim('info   ')} {'systemctl':<36} {_dim(out.strip())}")
     out, _, _ = session.exec("grep -E 'CmaFree|CmaTotal' /proc/meminfo | tr -s ' ' | tr '\\n' ' '",
                              timeout=15)
     print(f"    {_dim('info   ')} {'CMA':<36} {_dim(out.strip())}  (the BERT pool BO needs ~216 MiB)")
@@ -397,9 +424,86 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     return ok
 
 
-def start_rpu(session: RemoteSession, cfg: dict) -> bool:
+def board_bitstream(session: RemoteSession, overlay: str) -> Optional[str]:
+    """The id of the bitstream the board runs (its /lib/firmware/<overlay>.bin,
+    as every board tool reads it), None when the overlay is not applied."""
+    out, _, _ = session.exec(f"cat /sys/kernel/config/device-tree/overlays/{overlay}/status 2>/dev/null; "
+                             f"sha256sum /lib/firmware/{overlay}.bin 2>/dev/null", timeout=30)
+    lines = out.split()
+    return lines[1][:12] if len(lines) >= 2 and lines[0] == "applied" else None
+
+
+def load_staged_bitstream(session: RemoteSession, cfg: dict) -> None:
+    """After a boot the board runs the starter-kit design, and the preflight
+    would find no kernels: load the last deploy's bundle (<dir>/fpga) with the
+    host's fpga_load.py, as the unit would.  Nothing when the board runs it, or
+    there is no bundle yet (the first deploy)."""
+    d = cfg["remote"]["dir"]
+    _, _, rc = session.exec(f"test -f {d}/fpga/load.json", timeout=15)
+    if rc != 0:
+        return
+    sftp = session._client.open_sftp()                          # noqa: SLF001
+    try:
+        sftp.put(str(CHAT / "fpga_load.py"), f"{d}/fpga_load.py")
+    finally:
+        sftp.close()
+    _, _, rc = session.exec(f"{sudo(cfg)}python3 {d}/fpga_load.py --check {d}/fpga", timeout=30)
+    if rc == 0:
+        return
+    t0 = time.monotonic()
+    out, err, rc = session.exec(f"{sudo(cfg)}python3 {d}/fpga_load.py {d}/fpga", timeout=180)
+    lines = (out + err).strip().splitlines()
+    step("fpga", rc == 0, t0, (lines[-1] if lines else "") + ("" if rc == 0 else
+         " (the preflight below finds no kernels)"))
+
+
+def stage_fpga(session: RemoteSession, cfg: dict) -> bool:
+    """<dir>/fpga: the bundle fpga_load.py loads after a boot — the bitstream the
+    board runs now, built from fpga.bitstream_config (which must name it)."""
+    from src.bitstream.bundle import BUNDLE_FILES, make_bundle, resolve_bitstream_config
+    from src.perf_calls import bitstream_id
+    t0 = time.monotonic()
+    bcfg = cfg["fpga"]["bitstream_config"]
+    try:
+        bs = resolve_bitstream_config(Path(bcfg))
+    except (OSError, ValueError) as e:
+        return step("fpga", False, t0, f"fpga.bitstream_config: {e}")
+    want = bitstream_id(bs["bit"])
+    have = board_bitstream(session, bs["overlay_name"])
+    if have != want:
+        return step("fpga", False, t0,
+                    f"the board runs {have or 'no bitstream of ours'} (overlay '{bs['overlay_name']}'), "
+                    f"{bcfg} names {want} ({bs['bit']}): load that one (upload_bitstream.py) or point "
+                    f"fpga.bitstream_config at the files of the bitstream the server is deployed on")
+    d = f"{cfg['remote']['dir']}/fpga"
+    out, _, _ = session.exec(f"cat {d}/load.json 2>/dev/null", timeout=15)
+    try:
+        staged = json.loads(out).get("id")
+    except ValueError:
+        staged = None
+    ls, _, _ = session.exec(f"ls {d} 2>/dev/null", timeout=15)
+    if staged == want and all(f in ls.split() for f in BUNDLE_FILES):
+        return step("fpga", True, t0, f"bitstream {want}: the bundle in {d} is unchanged")
+    try:
+        files = make_bundle(**bs)
+    except (OSError, RuntimeError) as e:
+        return step("fpga", False, t0, f"bundle of {want}: {e}")
+    session.exec_checked(f"mkdir -p {d} && rm -f {d}/load.json", timeout=15)
+    sftp = session._client.open_sftp()                          # noqa: SLF001
+    try:
+        for name in BUNDLE_FILES:                               # load.json last: it marks the bundle complete
+            with sftp.open(f"{d}/{name}", "wb") as f:
+                f.write(files[name])
+    finally:
+        sftp.close()
+    return step("fpga", True, t0, f"bitstream {want} -> {d} (the unit loads it when the board does not run it)")
+
+
+def stage_rpu(session: RemoteSession, cfg: dict) -> bool:
     """The Cortex-R5 firmware for the server's libraries: built against the BSP,
-    uploaded with its overlays to <dir>/rpu, started (rpu_board.py's steps)."""
+    uploaded with its overlays to <dir>/rpu with rpu_up.sh (rpu_board.py's
+    start: the overlays once, remoteproc (re)started; fails unless it runs)
+    and rpu_down.sh, which the unit runs before and after the server."""
     import subprocess
     import tempfile
     import rpu_board                                           # inference-scheduler/
@@ -420,13 +524,23 @@ def start_rpu(session: RemoteSession, cfg: dict) -> bool:
         stage.mkdir()
         for f, name in ((elf, r["firmware"]), (dtbo, "rpu.dtbo"), (dtbo_ipi, "rpu-ipi.dtbo")):
             (stage / name).write_bytes(Path(f).read_bytes())
+        # rpu_down.sh stops only a firmware rpu_up.sh started: the unit runs it after a
+        # failed start too, and fpga_load.py may have refused because a board job runs its own
+        (stage / "rpu_up.sh").write_text(rpu_board.firmware_up_script(work, r["firmware"])
+                                         + f'[ "$(cat $R/state)" = running ]\ntouch {RPU_MARK}\n')
+        (stage / "rpu_down.sh").write_text(f"[ -e {RPU_MARK} ] || exit 0\nrm -f {RPU_MARK}\n"
+                                           + rpu_board.FIRMWARE_STOP + "\n")
         session.exec(f"mkdir -p {work}", timeout=30)
         session.upload_dir(stage, work)
-    out, err, rc = session.exec(f"{sudo(cfg)}bash -c {shlex.quote(rpu_board.firmware_up_script(work, r['firmware']))}",
-                                timeout=90)
-    ok = rc == 0 and out.strip().endswith("running")
+    return step("rpu", True, t0, f"firmware {r['firmware']} + overlays + rpu_up.sh / rpu_down.sh -> {work}")
+
+
+def start_rpu(session: RemoteSession, cfg: dict) -> bool:
+    """Run the staged rpu_up.sh (the nohup launcher; the unit runs it itself)."""
+    t0 = time.monotonic()
+    out, err, rc = session.exec(f"{sudo(cfg)}bash {cfg['remote']['dir']}/rpu/rpu_up.sh", timeout=90)
     door = next((ln for ln in out.splitlines() if ln.startswith("doorbell:")), "doorbell: ?")
-    return step("rpu", ok, t0, f"firmware running, {door}" if ok else out + err)
+    return step("rpu", rc == 0, t0, f"firmware running, {door}" if rc == 0 else out + err)
 
 
 def stop_rpu(session: RemoteSession, cfg: dict) -> None:
@@ -644,35 +758,120 @@ def server_argv(cfg: dict) -> List[str]:
     return argv
 
 
-def start_server(session: RemoteSession, cfg: dict) -> bool:
+def systemd_word(arg: str, env: bool = False) -> str:
+    """``arg`` as one word of a unit file's command line, or (``env``) an
+    Environment= assignment: quoted with C escapes when it is not plain, the
+    specifier % doubled, and on command lines the variable sign $ too
+    (systemd.service(5), "Command lines")."""
+    if re.fullmatch(r"[A-Za-z0-9_@+=:,./-]+", arg):
+        return arg
+    q = arg.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("%", "%%")
+    return '"' + (q if env else q.replace("$", "$$")) + '"'
+
+
+def exec_line(argv: List[str]) -> str:
+    return " ".join(systemd_word(a) for a in argv)
+
+
+def chat_unit(cfg: dict) -> str:
+    """kv260-chat.service: before the server fpga_load.py (the FPGA free, the
+    bundle's bitstream loaded), the R5 firmware's start and the CMA clean-up
+    (page-cache pages left in the CMA area by uploads and builds can make the
+    largest pool's contiguous allocation fail although CmaFree is enough —
+    2026-09-30: 776 MB for SmolLM2-360M with 834 MB free, TTS_PLAN §5;
+    inference-scheduler/src/remote/cma.py).  Never enabled by deploy.py."""
+    from src.remote.cma import CLEAN_CMD
+    d, s = cfg["remote"]["dir"], cfg["server"]
+    env = {k: str(v) for k, v in s.get("env", {}).items() if not k.startswith("_")}
+    pre = []
+    if cfg["fpga"]["bitstream_config"]:
+        pre.append(exec_line(["/usr/bin/python3", f"{d}/fpga_load.py", f"{d}/fpga"]))
+    if cfg["rpu"]["enabled"]:
+        pre.append(exec_line(["/bin/bash", f"{d}/rpu/rpu_up.sh"]))
+    pre.append("-" + exec_line(["/bin/sh", "-c", CLEAN_CMD]))
+    post = ["-" + exec_line(["/bin/sh", f"{d}/rpu/rpu_down.sh"])] if cfg["rpu"]["enabled"] else []
+    return "\n".join([
+        "# Installed by demo/chat/deploy.py (demo/chat/doc/DEPLOY.md).  Not enabled: the",
+        f"# server starts only by hand (systemctl start {UNIT}, or deploy.py --start).",
+        "[Unit]",
+        "Description=KV260 OpenAI-compatible chat server",
+        "After=network.target",
+        "",
+        "[Service]",
+        "Type=notify",
+        f"WorkingDirectory={d}",
+        *(f"Environment={systemd_word(f'{k}={v}', env=True)}" for k, v in env.items()),
+        *(f"ExecStartPre={p}" for p in pre),
+        f"ExecStart={exec_line(server_argv(cfg))}",
+        *(f"ExecStopPost={p}" for p in post),
+        "KillSignal=SIGTERM",
+        f"TimeoutStartSec={cfg['health_timeout'] + 120}",
+        "TimeoutStopSec=90",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        ""])
+
+
+def install_unit(session: RemoteSession, cfg: dict, name: str, text: str) -> bool:
+    """/etc/systemd/system/<name>.service = text (systemd reloaded when it
+    changed).  Never enabled here: it stays off at boot unless someone runs
+    systemctl enable."""
+    t0 = time.monotonic()
+    su = sudo(cfg)
+    path = f"/etc/systemd/system/{name}.service"
+    have, _, _ = session.exec(f"cat {path} 2>/dev/null", timeout=15)
+    if have != text:
+        out, err, rc = session.exec(f"printf %s {shlex.quote(text)} | {su}tee {path} > /dev/null && "
+                                    f"{su}systemctl daemon-reload", timeout=60)
+        if rc != 0:
+            return step("unit", False, t0, (out + err).strip())
+    out, _, _ = session.exec(f"systemctl is-enabled {name} 2>/dev/null", timeout=15)
+    state = out.strip() or "?"
+    note = ("not started at boot" if state == "disabled"
+            else _yellow(f"starts at boot: systemctl disable {name} turns that off"))
+    return step("unit", True, t0, f"{path} {'unchanged' if have == text else 'installed'} ({state}: {note})")
+
+
+def uninstall_unit(session: RemoteSession, cfg: dict, name: str) -> None:
+    su = sudo(cfg)
+    session.exec(f"{su}systemctl disable {name} 2>/dev/null; {su}rm -f /etc/systemd/system/{name}.service; "
+                 f"{su}systemctl daemon-reload; {su}systemctl reset-failed {name} 2>/dev/null", timeout=60)
+    print(f"  /etc/systemd/system/{name}.service removed")
+
+
+def unit_installed(session: RemoteSession, name: str) -> bool:
+    return session.exec(f"test -f /etc/systemd/system/{name}.service", timeout=15)[2] == 0
+
+
+def launcher(session: RemoteSession, cfg: dict) -> str:
+    """server.launcher, "nohup" when the board has no systemctl."""
+    if cfg["server"].get("launcher", "systemd") == "systemd":
+        if session.exec("command -v systemctl", timeout=15)[2] == 0:
+            return "systemd"
+        print(_yellow("  systemctl not found; using nohup"))
+    return "nohup"
+
+
+def start_server(session: RemoteSession, cfg: dict, how: str) -> bool:
+    """systemctl start (the unit loads the FPGA, starts the R5 firmware, cleans
+    the CMA area) or, with nohup, the server as a detached process."""
     t0 = time.monotonic()
     d, s = cfg["remote"]["dir"], cfg["server"]
-    argv = " ".join(shlex.quote(a) for a in server_argv(cfg))
-    env = {k: str(v) for k, v in s.get("env", {}).items() if not k.startswith("_")}
-    launcher = s.get("launcher", "systemd")
-    if launcher == "systemd":
-        out, _, rc = session.exec("command -v systemd-run", timeout=15)
-        if rc != 0:
-            print(_yellow("  systemd-run not found; using nohup"))
-            launcher = "nohup"
-    if launcher == "systemd":
-        setenv = " ".join(f"--setenv={shlex.quote(k + '=' + v)}" for k, v in env.items())
-        cmd = (f"{sudo(cfg)}systemd-run --unit={UNIT} --collect "
-               f"--description='KV260 OpenAI-compatible chat server' "
-               f"--working-directory={d} -p KillSignal=SIGTERM -p TimeoutStopSec=90 {setenv} {argv}")
+    from src.remote.cma import clean_cma, describe
+    cma = clean_cma(session, sudo(cfg))["after"]
+    if how == "systemd":
+        cmd = f"{sudo(cfg)}systemctl start --no-block {UNIT}"
     else:
+        if cfg["rpu"]["enabled"] and not start_rpu(session, cfg):
+            return False
+        argv = " ".join(shlex.quote(a) for a in server_argv(cfg))
+        env = {k: str(v) for k, v in s.get("env", {}).items() if not k.startswith("_")}
         envs = " ".join(shlex.quote(f"{k}={v}") for k, v in env.items())
         cmd = (f"cd {d} && {sudo(cfg)}env {envs} setsid nohup {argv} > {d}/server.log 2>&1 "
                f"< /dev/null & echo $! > {d}/server.pid")
-    # Page-cache pages left in the CMA area by uploads and builds can make the
-    # largest pool's contiguous allocation fail although CmaFree is enough
-    # (2026-09-30: 776 MB for SmolLM2-360M with 834 MB free, TTS_PLAN §5;
-    # 2026-10-13: 795 MB with 990 MB free): drop the page cache and compact
-    # memory first (inference-scheduler/src/remote/cma.py).
-    from src.remote.cma import clean_cma, describe
-    cma = clean_cma(session, sudo(cfg))["after"]
     out, err, rc = session.exec(cmd, timeout=60)
-    return step("start", rc == 0, t0, (f"{launcher}: {UNIT} (CMA cleaned: {describe(cma)})"
+    return step("start", rc == 0, t0, (f"{how}: {UNIT} (CMA cleaned: {describe(cma)})"
                                        if rc == 0 else (out + err).strip()))
 
 
@@ -776,8 +975,13 @@ def main(argv=None) -> int:
                     help="keep the board lock, follow the log, stop the server on Ctrl-C / SIGTERM")
     ap.add_argument("--no-lock", action="store_true", help="do not take the board lock (caller holds it)")
     ap.add_argument("--board-lock", default=None, help="override the board lock file")
+    ap.add_argument("--start", action="store_true",
+                    help="start the installed unit (no deploy) and wait for /health")
+    ap.add_argument("--no-start", action="store_true", help="deploy and install the unit, leave the server stopped")
     ap.add_argument("--stop", action="store_true", help="stop the server")
     ap.add_argument("--status", action="store_true", help="show whether the server runs and its /health")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="stop the server and remove its unit (the files in remote.dir stay)")
     ap.add_argument("--check-only", action="store_true", help="remote preflight only")
     ap.add_argument("--rpu", metavar="BSP_DIR", default=None,
                     help="start the Cortex-R5 firmware (built against this BSP) with the server: the "
@@ -785,6 +989,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-rpu", action="store_true", help="no R5 firmware this time (rpu.enabled off)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
+    if args.hold and args.no_start:
+        ap.error("--hold and --no-start exclude each other")
     cfg = load_config(args.config)
     if args.board_lock:
         cfg["board_lock"] = args.board_lock
@@ -793,56 +999,90 @@ def main(argv=None) -> int:
     if args.no_rpu:
         cfg["rpu"]["enabled"] = False
 
-    if args.stop or args.status:
+    if args.stop or args.status or args.uninstall:
         session = connect(cfg)
         try:
-            if args.stop:
+            if args.stop or args.uninstall:
                 state = stop_server(session, cfg)
                 tail(server_log(session, cfg, 6), 6)
+                if args.uninstall:
+                    uninstall_unit(session, cfg, UNIT)
                 return 0 if state == "none" else 1
             out, _, _ = session.exec(f"systemctl is-active {UNIT} 2>/dev/null; "
                                      f"pgrep -fa '[k]v260_chat_server.py' || true", timeout=15)
             print(f"  {UNIT}: {out.strip() or 'not running'}")
+            if unit_installed(session, UNIT):
+                out, _, _ = session.exec(f"systemctl is-enabled {UNIT} 2>/dev/null", timeout=15)
+                state = out.strip() or "?"
+                print(f"  unit: /etc/systemd/system/{UNIT}.service, {state}"
+                      + (" (not started at boot)" if state == "disabled" else ""))
+            else:
+                print("  unit: not installed")
             h = get_health(cfg)
             print(f"  {health_url(cfg)}/health: {json.dumps(h) if h else 'no answer'}")
             return 0 if h and h.get("status") == "ok" else 1
         finally:
             session.close()
 
-    if not args.check_only:
+    if not args.check_only and not args.start:
         ensure_vocab(cfg)                       # before the board work: a download error stops here
-    summary = ensure_project(cfg, args.regenerate, args.plan) if not args.check_only else None
+    summary = ensure_project(cfg, args.regenerate, args.plan) if not (args.check_only or args.start) else None
     lock = None if args.no_lock else lock_path(cfg)
-    stop_on_exit = False
+    stop_on_exit = started = False
     with board_lock(lock):
         session = connect(cfg)
         try:
-            if not preflight(session, cfg):
-                print(_red("\npreflight: remote prerequisites missing"))
-                return 1
-            if args.check_only:
-                print(_green("\npreflight: all checks passed"))
-                return 0
-            print(_bold("\nDeploy"))
-            stop_server(session, cfg, quiet=True)
-            t0 = time.monotonic()
-            w = sync_weights(session, Path(summary["project_dir"]) / "weights",
-                             cfg["remote"]["weights_dir"])
-            if not step("weights", w.ok, t0, w.output):
-                return 1
-            if not upload_and_build(session, cfg, summary, args.rebuild, args.verbose):
-                return 1
-            upload_server(session, cfg)
-            build_sampler(session, cfg)
-            if cfg["rpu"]["enabled"] and not start_rpu(session, cfg):
-                return 1
-            if not start_server(session, cfg):
+            if args.start:
+                how = launcher(session, cfg)
+                if how != "systemd" or not unit_installed(session, UNIT):
+                    print(_red(f"  no {UNIT} unit on the board: deploy first (deploy.py; server.launcher "
+                               f"systemd)"))
+                    return 1
+            else:
+                if not args.check_only and cfg["fpga"]["bitstream_config"]:
+                    load_staged_bitstream(session, cfg)
+                if not preflight(session, cfg):
+                    print(_red("\npreflight: remote prerequisites missing"))
+                    return 1
+                if args.check_only:
+                    print(_green("\npreflight: all checks passed"))
+                    return 0
+                print(_bold("\nDeploy"))
+                # the bundle first: a config naming another bitstream stops before the server does
+                if cfg["fpga"]["bitstream_config"] and not stage_fpga(session, cfg):
+                    return 1
+                stop_server(session, cfg, quiet=True)
+                t0 = time.monotonic()
+                w = sync_weights(session, Path(summary["project_dir"]) / "weights",
+                                 cfg["remote"]["weights_dir"])
+                if not step("weights", w.ok, t0, w.output):
+                    return 1
+                if not upload_and_build(session, cfg, summary, args.rebuild, args.verbose):
+                    return 1
+                upload_server(session, cfg)
+                build_sampler(session, cfg)
+                if cfg["rpu"]["enabled"] and not stage_rpu(session, cfg):
+                    return 1
+                how = launcher(session, cfg)
+                if how == "systemd" and not install_unit(session, cfg, UNIT, chat_unit(cfg)):
+                    return 1
+                if args.no_start:
+                    print(_bold("\n  KV260 chat server installed, not started") + "\n    start             "
+                          + (f"systemctl start {UNIT} (on the board), or demo/chat/deploy.py --start\n"
+                             if how == "systemd" else "demo/chat/deploy.py (server.launcher nohup)\n"))
+                    return 0
+            if not start_server(session, cfg, how):
                 return 1
             h = wait_health(session, cfg)
             if h is None:
                 stop_server(session, cfg)
                 return 1
+            if cfg["rpu"]["enabled"] and how == "systemd":
+                out, _, _ = session.exec("cat /sys/class/remoteproc/remoteproc*/state 2>/dev/null", timeout=15)
+                step("rpu", out.split()[:1] == ["running"], time.monotonic(),
+                     f"R5 firmware {out.strip() or 'absent'}")
             print_ready(cfg, h)
+            started = True
             if args.hold:
                 stop_on_exit = True
 
@@ -861,7 +1101,7 @@ def main(argv=None) -> int:
                 with contextlib.suppress(Exception):
                     stop_server(session, cfg)
             session.close()
-    if not args.hold:
+    if started and not args.hold:
         print(_yellow("note: the server keeps the FPGA busy until `deploy.py --stop`"))
     return 0
 

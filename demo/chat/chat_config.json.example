@@ -26,8 +26,12 @@
     "queue_timeout": 120,
     "max_queue": 16,
     "launcher": "systemd",
-    "_launcher_note": "systemd = a transient unit 'kv260-chat' (systemd-run; logs: journalctl -u kv260-chat; not started at boot); nohup = a detached process (<dir>/server.log, <dir>/server.pid).",
+    "_launcher_note": "systemd = the unit /etc/systemd/system/kv260-chat.service (logs: journalctl -u kv260-chat), installed but not enabled: never started at boot, only by hand (systemctl start kv260-chat on the board, or deploy.py --start); nohup = a detached process (<dir>/server.log, <dir>/server.pid).",
     "env": {}
+  },
+  "fpga": {
+    "bitstream_config": "../../inference-scheduler/bitstream_config_kv260.json",
+    "_note": "The bitstream config (upload_bitstream.py's) that names the bitstream the board runs: deploy.py stages it in <dir>/fpga (the .bin, the overlay, the xclbin from xclbinutil, the port widths), and the unit loads it before the server when the board does not run it (after a boot: fpga_load.py).  deploy.py stops when it names another bitstream than the board runs.  null = no bundle: the bitstream must be loaded before the server starts."
   },
   "rpu": {
     "enabled": false,

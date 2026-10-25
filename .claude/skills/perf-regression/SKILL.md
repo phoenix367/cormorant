@@ -43,6 +43,7 @@ $PY demo/chat/deploy.py --status      # exit 0 = running and healthy
 ```
 ```
   kv260-chat: inactive
+  unit: /etc/systemd/system/kv260-chat.service, disabled (not started at boot)
   http://192.168.100.8:8000/health: no answer          (exit 1: not running)
 ```
 `active` (and a /health answer) = running: note it (step 6 restarts it),
@@ -149,7 +150,8 @@ The image demo times one image (single sample); MNIST 9 950.
 ## 6. Restore
 
 Restart the chat server ONLY if step 1 found it running:
-`$PY demo/chat/deploy.py` (waits for /health).
+`$PY demo/chat/deploy.py --start` (its installed unit; waits for /health),
+or `$PY demo/chat/deploy.py` to redeploy it.
 
 ## 7. Record a baseline — only when the user asks
 

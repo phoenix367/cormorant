@@ -266,16 +266,26 @@ of `demo/chat/chat_config.json`.
 
 ```bash
 PY=inference-scheduler/.venv/bin/python
-$PY demo/miranda/deploy.py                       # checks the chat server, uploads, starts kv260-miranda
+$PY demo/miranda/deploy.py                       # checks the chat server, uploads, installs and starts kv260-miranda
 python3 demo/miranda/miranda_client.py --server 192.168.100.8
-$PY demo/miranda/deploy.py --status              # | --stop
+$PY demo/miranda/deploy.py --status              # | --start | --stop | --uninstall | --no-start
 $PY demo/miranda/deploy.py --fetch-segments      # the recorded segments (-- --save-segments) -> demo/miranda/build/segments
 ```
 
-- **`deploy.py`** uploads the server to `<chat dir>/miranda` and starts it as
-  the transient systemd unit `kv260-miranda` (`journalctl -u kv260-miranda`)
-  on port 8770: TCP for control, UDP for RTP.  It reads the board, ssh and
-  the chat server's port and API key from `demo/chat/chat_config.json`.
+- **`deploy.py`** uploads the server to `<chat dir>/miranda`, installs the
+  systemd unit `/etc/systemd/system/kv260-miranda.service`
+  (`journalctl -u kv260-miranda`) and starts it on port 8770: TCP for
+  control, UDP for RTP.  It reads the board, ssh and the chat server's port
+  and API key from `demo/chat/chat_config.json`.
+- **The unit** is installed but not enabled: after a boot Miranda is off,
+  like the chat server ([its unit](../chat/doc/DEPLOY.md#the-systemd-unit)).
+  `systemctl start kv260-chat kv260-miranda` on the board starts both;
+  Miranda waits until the chat server's models are loaded.  Miranda's unit
+  never starts the chat server by itself: a board job may have stopped it.
+  From the host, `demo/chat/deploy.py --start`, then
+  `demo/miranda/deploy.py --start`.  systemd restarts Miranda when it fails
+  (5 tries in 5 minutes).  `--no-start` installs it without starting it, and
+  then the chat server need not run.
   Arguments after `--` go to `miranda_server.py` (`--wake`,
   `--wake-margin`, `--no-wake-check`, `--save-segments DIR`, `--greeting`,
   `--max-sentences`, `--awake-timeout`, `--vad-*`, `--system` ...).
