@@ -14,7 +14,9 @@ kernels from Linux on the board.  Everything runs in 16-bit fixed point
 (`ap_fixed<16,8>`, or per-tensor power-of-two exponents), and the board's
 outputs are checked bit for bit against the generator's fixed-point
 simulation.  An OpenAI-compatible server on the board serves the chat,
-image and speech models.
+image and speech models.  The block design also brings the board's MIPI
+camera (AR1335 behind the AP1302 ISP) into DDR, so live frames can be
+classified on the board.
 
 <p align="center">
   <a href="https://youtu.be/VVS7ExW0XYQ"><img src="doc/images/chat_demo_thumbnail.png" alt="Video: an LLM chat running on the Kria KV260 FPGA" width="560"/></a><br/>
@@ -30,24 +32,27 @@ image and speech models.
 
 ## Results on the board
 
-KV260, programmable logic at 250 MHz, 16-bit fixed point.  Measured 2026-10-18 on the
-production bitstream `04259a7af917`: the 250 MHz design of
+KV260, programmable logic at 250 MHz, 16-bit fixed point.  The production bitstream
+since 2026-10-28 is `b4e63457057a`: the 250 MHz design of
 [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md) with VectorOPKernel's activation unit
 ([ACTIVATIONS_PLAN](doc/plans/ACTIVATIONS_PLAN.md)) and softmax unit
 ([SOFTMAX_PLAN](doc/plans/SOFTMAX_PLAN.md)), its second read port on a PS port of its
 own ([PS_PORTS_PLAN](doc/plans/PS_PORTS_PLAN.md)), ConvKernel's x port past the CCI
-([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8) and the row-ops unit, a fifth kernel
+([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8), the row-ops unit, a fifth kernel
 that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
 inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)), with its GATE op
-and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14).  The chat models', Piper's
-and Moonshine's figures are from 2026-10-17 on the same bitstream (RPU_PLAN §14.12,
-ASR_PLAN).  The production bitstream since 2026-10-28, `b4e63457057a`, adds the kernels'
-second area pass ([AREA_PLAN](doc/plans/AREA_PLAN.md) §6) and the MIPI camera's capture
-path ([demo/camera](demo/camera/README.md)); every kernel call runs as fast on it
-(AREA_PLAN §6.5), and these figures were not measured again.  The board runs the
-A53's interrupt waits and, as a soak test, the cores' deep idle state (about 2 % on
-the chat decode).  The chat-server Piper
-figures are from 2026-10-01, at 100 MHz.
+and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14), the kernels' second area pass
+([AREA_PLAN](doc/plans/AREA_PLAN.md) §6) and the MIPI camera's capture path
+([demo/camera](demo/camera/README.md)).
+
+The results were measured 2026-10-18 on `04259a7af917`, the production bitstream
+before it (the kernels before their second area pass, no camera path): every
+kernel call runs as fast on `b4e63457057a` (its performance model and the 72
+kernel benchmarks, AREA_PLAN §6.5), and these figures were not measured again.  The
+chat models', Piper's and Moonshine's figures are from 2026-10-17 (RPU_PLAN §14.12,
+ASR_PLAN); the chat-server Piper figures from 2026-10-01, at 100 MHz; the camera's
+from 2026-10-27 on `b4e63457057a`.  The board ran the A53's interrupt waits and, as
+a soak test, the cores' deep idle state (about 2 % on the chat decode).
 
 | Model | Result | Source |
 |---|---|---|
@@ -61,6 +66,7 @@ figures are from 2026-10-01, at 100 MHz.
 | SmolLM2-360M-Instruct | **7.8 tokens/s** decode, 16-token prefill 0.19 s, 256-token prefill 1.02 s, 758 MiB CMA | [CHAT_PLAN §20](doc/plans/CHAT_PLAN.md), [video](https://youtu.be/VVS7ExW0XYQ) (at 100 MHz) |
 | SmolVLM-256M-Instruct (image chat) | **1.6 s** per image for the vision encoder (7.7 s at first), then 49 ms per token decode | [CHAT_PLAN §23, §24](doc/plans/CHAT_PLAN.md), [FMAX_250_PLAN](doc/plans/FMAX_250_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md) |
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
+| MobileNet V1 on the AR1335 MIPI camera, 640×480 | **20.7 ms** per frame, about 16 frames/s end to end with the annotated frames streamed to the host | [demo/camera](demo/camera/README.md) |
 | Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
 
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
@@ -80,11 +86,12 @@ The inference scheduler compiles each model into a C library on the host:
 a project per CNN demo, and the libraries the chat server loads.  On the
 board, the library keeps the weights and buffers in XRT buffers and runs
 what no kernel implements as host ops on the Arm Cortex-A53 cores.  Its
-kernel calls go either straight to the five FPGA kernels, with the A53
-sleeping on their interrupts.  For the larger models they go instead to
-firmware on a Cortex-R5 core, which replays them with interrupt-driven
-waits while the A53 sleeps.  Every result is checked bit
-for bit against the scheduler's fixed-point simulation.
+kernel calls go straight to the five FPGA kernels, with the A53 sleeping on
+their interrupts, or, for the larger models, to firmware on a Cortex-R5
+core, which replays them with interrupt-driven waits while the A53 sleeps.
+Every result is checked bit for bit against the scheduler's fixed-point
+simulation.  Beside the kernels, the block design's camera capture path
+writes the MIPI camera's frames into DDR for the Linux video drivers.
 [`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) is the hardware architecture
 document (requirements, interconnect and control path, clocks and reset,
 memory, datapath, interfaces, verification, timing and utilization); the
@@ -122,6 +129,14 @@ port's move made binary VectorOP calls 24–38 % faster
 and few-channel 1 × 1 convolutions 27–67 % faster
 ([DEPTHWISE_PLAN](doc/plans/DEPTHWISE_PLAN.md) §8).
 MatmulKernel reads A and B through both of its read ports.
+
+The block design also holds the camera capture path
+(`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`): a MIPI CSI-2 receiver for
+the carrier's AR1335 / AP1302 camera (4 lanes, bank 66) and a frame-buffer
+writer that puts NV12 frames into DDR through `S_AXI_HP3_FPD`, on their own
+200 MHz clock, controlled over `M_AXI_HPM0_LPD` by Linux's V4L2 drivers.  It
+shares nothing with the kernels but the device: 7.4 k LUTs, six block RAMs and
+one URAM ([`doc/ARCHITECTURE.md`](doc/ARCHITECTURE.md) §6.6).
 
 ---
 
@@ -257,7 +272,12 @@ cmake ..
 make synthesize_kv260            # IP export + C drivers of the five kernels (Vivado packaging of the RTL)
 make build_hw_kv260              # Vivado: bitstream in hw/cormorant_hw_128/.../impl_1/
 make dtbo_kv260_cormorant        # device-tree overlay: build/dts/kv260/design_cormorant.dtbo
+make dtbo_kv260_cormorant_capture   # the same plus the MIPI camera: build/dts/kv260/design_cormorant_capture.dtbo
 ```
+
+The bitstream has the camera capture path; either overlay drives the kernels,
+and the capture one adds the camera's video pipeline (never apply it over a
+bitstream without the path).
 
 `make build_hw_kv260` packages the five SystemVerilog kernels itself, so
 the separate `synthesize_kv260` step is only needed for the C drivers
@@ -313,9 +333,14 @@ cd inference-scheduler
 # on the board: cat /sys/class/uio/uio*/name  →  axi-pmon (×4, uio0–3), fabric_vecop fabric_matmul fabric_conv fabric_pool fabric_rowops
 ```
 
+For the camera demo, point `dtbo` in `bitstream_config_kv260.json` at the capture
+overlay and keep `overlay_name` `pl` ([demo/camera](demo/camera/README.md)).
+
 If the same design is already loaded under another overlay name,
 `upload_bitstream.py` stops before loading anything, with `The kernels' UIO
-devices already exist …`; see
+devices already exist …`.  It also stops while the Cortex-R5 firmware runs
+(stop the chat server first, `demo/chat/deploy.py --stop`); once the firmware is
+stopped it removes the R5's overlays above ours itself.  See
 [REMOTE_TESTING.md](inference-scheduler/doc/REMOTE_TESTING.md#bitstream-upload-upload_bitstreampy).
 
 ### 6. Run on the board
