@@ -1826,9 +1826,14 @@ the MNIST, image-classification, camera and BERT demos' `generate_project.py`
 scripts (or `"plan"` in their config
 JSON); `demo/chat/deploy.py --regenerate --plan` plans the BERT project.
 
-The simulator predicts SmolVLM, SmolLM2, BERT and the CNN demos within 2 %
-of the board, except SmolLM2-360M (−2.6 … −6.0 %, MATMUL_RTL_PLAN phase
-3a).  Planned builds measured: SmolVLM `llm_image` −1.1 % (vision
+When it was built the simulator predicted SmolVLM, SmolLM2, BERT and the
+CNN demos within 2 % of the board, except SmolLM2-360M (−2.6 … −6.0 %,
+MATMUL_RTL_PLAN phase 3a).  The later checks (`perf_models/README.md`) keep
+the CNNs and BERT within 0.4 %, but put the chat libraries 2.5–6.3 % and
+Moonshine's 128 / 256-frame buckets 5–6 % under the board, and the Piper
+chunk 4.3 % over: the host-op model predates the A53's interrupt waits, and
+its re-profile (`perf_calibrate.py host --merge`) is open.  Planned builds
+measured: SmolVLM `llm_image` −1.1 % (vision
 fc1 geometry) and BERT −1.1 % (issue order), all bit-exact
 (TACTICS_PLAN §9).
 

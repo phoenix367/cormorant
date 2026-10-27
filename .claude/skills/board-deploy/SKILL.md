@@ -39,8 +39,9 @@ WNS must be positive — at **4.000 ns**: the kernels run at 250 MHz from an
 MMCM in the block design (`clk_wiz_0`, `scripts/bd_kernel_clock.tcl`;
 FMAX_250_PLAN), with impl_1's directives set by `scripts/build.tcl`
 (`set_impl_directives`; the default strategy missed by tens of ps).  The
-first 250 MHz bitstream `986cef4866a0` had +0.105 ns, the production
-`04259a7af917` (2026-10-17) +0.027 ns after nine rip-up iterations; the margin moves by
+first 250 MHz bitstream `986cef4866a0` had +0.105 ns, `04259a7af917` (2026-10-17)
++0.027 ns after nine rip-up iterations, the production `b4e63457057a` (2026-10-28)
++0.040 ns after five; the margin moves by
 ±0.1 ns from build to build, so a kernel change that leaves < +0.05 ns
 deserves a look at the worst paths.  Two checks before any bitstream goes
 to the board: `grep -c 'Synth 8-4767' <runs>/synth_1/runme.log` must be 0

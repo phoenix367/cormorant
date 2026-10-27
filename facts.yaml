@@ -238,6 +238,7 @@ facts:
     - {file: doc/build-and-test/TESTING.md, regex: '§8b — (?P<conv>\d+) ConvKernel, (?P<pool>\d+) PoolingKernel, (?P<rowops>\d+) RowOpsKernel:'}
     - {file: inference-scheduler/doc/REMOTE_TESTING.md, regex: 'Performance benchmarks — (?P<total>\d+) cases;'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'say whether anything regressed — the (?P<total>\d+) kernel benchmarks'}
+    - {file: README.md, regex: 'its performance model and the (?P<total>\d+)\s+kernel benchmarks'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'OVERALL: All (?P<total>\d+) cases passed ──` \('}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^compared (?P<total>\d+) cases \(threshold'}
     - {file: .claude/skills/perf-regression/scripts/compare_perf.py, regex: '--json output \(the (?P<total>\d+) kernel cases\)'}
@@ -296,6 +297,30 @@ facts:
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
        regex: 'Current model: \*\*kv260/[0-9a-f]{12}\*\* .*?→ (?P<exact_calls>\d+) exact\s+calls'}
 
+- id: perf.simulate_error
+  kind: recorded
+  title: how far perf_calibrate.py simulate's whole-model predictions are from the board (%) on the latest checks — the
+    CNNs and BERT, the chat libraries (under the board), Moonshine's short buckets (under), the Piper chunk (over)
+  value: {cnn_bert: 0.4, chat_min: 2.5, chat_max: 6.3, moonshine_min: 5, moonshine_max: 6, piper: 4.3}
+  tolerance: 0.05
+  provenance:
+    commit: 19539c2
+    date: 2026-10-17
+    how: "perf_models/README.md: simulate against the board runs of de968ccc45da (2026-10-15: the CNNs and BERT within
+          0.4 %, the Piper chunk +4.3 %, the chat libraries -2.5 ... -6.3 %, the same on 1cedaf2ed816's model) and the
+          Moonshine top-up on 04259a7af917 (2026-10-17: the 512 / 1024-frame buckets and the decode within 2.2 %, the
+          128 / 256 buckets -5 ... -6 %).  The host-op model predates the A53's interrupt waits; stale when host.json
+          changes (the open re-profile).  TACTICS_PLAN §9's \"within 2 %\" (2026-09-28) is the first check's"
+  depends_on: [inference-scheduler/perf_models/kv260/host.json]
+  fix: report
+  mentions:
+    - {file: doc/ARCHITECTURE.md, dotall: true,
+       regex: 'keep the CNNs and BERT within\s+(?P<cnn_bert>[\d.]+) %, but put the chat libraries (?P<chat_min>[\d.]+)–(?P<chat_max>[\d.]+) % and Moonshine''s 128 / 256-frame\s+buckets (?P<moonshine_min>\d+)–(?P<moonshine_max>\d+) % under the board, and the Piper chunk (?P<piper>[\d.]+) % over'}
+    - {file: doc/ARCHITECTURE.md, dotall: true,
+       regex: 'simulator puts the chat libraries and Moonshine''s short buckets (?P<chat_min>[\d.]+)–(?P<chat_max>[\d.]+) %\s+under the board'}
+    - {file: doc/scheduler/INFERENCE_SCHEDULER.md, dotall: true,
+       regex: 'keep\s+the CNNs and BERT within (?P<cnn_bert>[\d.]+) %, but put the chat libraries (?P<chat_min>[\d.]+)–(?P<chat_max>[\d.]+) % and\s+Moonshine''s 128 / 256-frame buckets (?P<moonshine_min>\d+)–(?P<moonshine_max>\d+) % under the board, and the Piper\s+chunk (?P<piper>[\d.]+) % over'}
+
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
   kind: value
@@ -313,6 +338,7 @@ facts:
     - {file: inference-scheduler/src/cost_model.py, regex: '^CALL_OVERHEAD\s+= (?P<cycles>\d+)$'}
     - {file: inference-scheduler/src/cost_model.py, regex: 'a 10-element VectorOP Add,\n# (?P<us>[\d.]+) us at \d+ MHz'}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '`CALL_OVERHEAD` \((?P<cycles>\d+) cycles: the cheapest measured call'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the shortest measured call is (?P<us>[\d.]+) µs', format: 'round(v, 1)'}
 
 - id: cost_model.board_fit
   kind: recorded
@@ -1146,7 +1172,7 @@ facts:
 - id: board.results
   kind: recorded
   title: the board results of README "Results on the board", and where they are repeated
-  value: {resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.6, bert_ms: 267,
+  value: {bitstream: 04259a7af917, resnet18_ms: 20.0, resnet18_fps: 50.0, mobilenet_v1_ms: 20.5, mobilenet_v2_ms: 17.6, bert_ms: 267,
           smollm2_135m_tok_s: 20.4, smollm2_135m_prefill16_s: 0.08, smollm2_360m_tok_s: 7.8, smolvlm_image_s: 1.6,
           piper_rtf: 0.11, mnist_convnet_ms: 0.115, mnist_lenet_ms: 1.232, yolov5n_ms: 47.6, yolov5n_fps: 21.0,
           stereo_ms: 469, stereo_fps: 2.13, stereo320_ms: 133}
@@ -1208,6 +1234,9 @@ facts:
                    transform: "one(x['metrics']['mean_ms'] for x in v if x['name'] == 'lightstereo_s')"}
   fix: report                                # the sentences round and qualify: rewrite them by hand
   mentions:
+    # the bitstream they were measured on, where the docs say so (the production one since is perf.bitstream_id)
+    - {file: README.md, regex: 'The results were measured \d{4}-\d{2}-\d{2} on `(?P<bitstream>[0-9a-f]{12})`'}
+    - {file: doc/ARCHITECTURE.md, regex: 'measured \d{4}-\d{2}-\d{2} on\n`(?P<bitstream>[0-9a-f]{12})`, the production bitstream before'}
     - {file: README.md, regex: '\| ResNet-18, 224×224 \| \*\*(?P<resnet18_ms>[\d.]+) ms \((?P<resnet18_fps>[\d.]+) FPS\)\*\* per image'}
     - {file: README.md, regex: '\| MobileNet V1 / V2, 224×224 \| \*\*(?P<mobilenet_v1_ms>[\d.]+) / (?P<mobilenet_v2_ms>[\d.]+) ms\*\* per image'}
     - {file: README.md, regex: '\*\*(?P<bert_ms>\d+) ms\*\* per inference \(p50'}
@@ -1481,9 +1510,9 @@ facts:
 
 - id: hw.utilization
   kind: recorded
-  title: the production bitstream and its FPGA utilization (README)
+  title: the production bitstream and its FPGA utilization (README, ARCHITECTURE's tables and headroom notes)
   value: {bitstream: b4e63457057a, dsp: 845, dsp_total: 1248, dsp_pct: 67.7, lut: 87013, lut_total: 117120, lut_pct: 74.3,
-          bram: 142, bram_total: 144, uram: 58, uram_total: 64}
+          bram: 142, bram_total: 144, bram_pct: 98.6, uram: 58, uram_total: 64, uram_pct: 90.6, clb_pct: 98.2}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
     date: 2026-10-28
@@ -1525,18 +1554,194 @@ facts:
     lut_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|.*\|\s+([\d.]+) \|$', type: float}
     dsp_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|.*\|\s+([\d.]+) \|$', type: float}
     bram: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| Block RAM Tile\s+\|\s+([\d.]+) ', type: float}
+    bram_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| Block RAM Tile\s+\|.*\|\s+([\d.]+) \|$', type: float}
     uram: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| URAM\s+\|\s+(\d+) ', type: int}
+    uram_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| URAM\s+\|.*\|\s+([\d.]+) \|$', type: float}
+    clb_pct: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB\s+\|.*\|\s+([\d.]+) \|$', type: float}
   fix: report
   mentions:
     - file: README.md
       regex: 'bitstream `(?P<bitstream>[0-9a-f]{12})`\) uses (?P<dsp_pct>\d+) % of the DSPs\s+\((?P<dsp>\d+) / (?P<dsp_total>\d+)\), (?P<lut_pct>[\d.]+) % of the LUTs \((?P<lut>[\d ]+) / (?P<lut_total>[\d ]+)\), (?P<bram>[\d.]+) / (?P<bram_total>\d+) BRAM and\s+(?P<uram>\d+) / (?P<uram_total>\d+) URAM'
+    - {file: README.md, regex: 'The production bitstream\s+since \d{4}-\d{2}-\d{2} is `(?P<bitstream>[0-9a-f]{12})`'}
     - {file: inference-scheduler/perf_models/README.md, regex: '^`kv260/(?P<bitstream>[0-9a-f]{12})` is'}
+    - {file: tools/facts/README.md, regex: 'the production bitstream \(`(?P<bitstream>[0-9a-f]{12})`\) and its DSP'}
     - {file: doc/ARCHITECTURE.md, regex: 'are those of the production\s+bitstream `(?P<bitstream>[0-9a-f]{12})`', dotall: true}
+    - {file: doc/ARCHITECTURE.md, regex: 'the production bitstream before `(?P<bitstream>[0-9a-f]{12})`'}
+    # §4.1 per instance (its design row) and §8.5 against the headroom guideline
+    - {file: doc/ARCHITECTURE.md, regex: 'routed design of the\s+production `(?P<bitstream>[0-9a-f]{12})` \(\d{4}-\d{2}-\d{2}; `report_utilization -hierarchical`\)'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| \*\*design\*\* \| \*\*(?P<lut>[\d ]+)\*\* \| \*\*[\d ]+\*\* \| \*\*[\d ]+\*\* \| \*\*[\d ]+\*\* \| \*\*\d+\*\* \| \*\*\d+\*\* \| \*\*(?P<uram>\d+)\*\* \| \*\*(?P<dsp>\d+)\*\* \|'}
     - {file: doc/ARCHITECTURE.md, regex: '\| CLB LUTs \| (?P<lut>[\d ]+) \| (?P<lut_total>[\d ]+) \| (?P<lut_pct>[\d.]+) % \|'}
-    - {file: doc/ARCHITECTURE.md, regex: '\| block RAM tiles \| (?P<bram>\d+) \(\d+ RAMB36 \+ \d+ RAMB18\) \| (?P<bram_total>\d+) \|'}
-    - {file: doc/ARCHITECTURE.md, regex: '\| URAM \| (?P<uram>\d+) \| (?P<uram_total>\d+) \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| CLBs \(any part used\) \| [\d ]+ \| [\d ]+ \| (?P<clb_pct>[\d.]+) % \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| block RAM tiles \| (?P<bram>\d+) \(\d+ RAMB36 \+ \d+ RAMB18\) \| (?P<bram_total>\d+) \| (?P<bram_pct>[\d.]+) % \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| URAM \| (?P<uram>\d+) \| (?P<uram_total>\d+) \| (?P<uram_pct>[\d.]+) % \|'}
     - {file: doc/ARCHITECTURE.md, regex: '\| DSP48E2 \| (?P<dsp>\d+) \| (?P<dsp_total>[\d ]+) \| (?P<dsp_pct>[\d.]+) % \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\*\*total\*\* \| \*\*(?P<dsp>\d+) / (?P<dsp_total>[\d ]+)\*\*'}
+    # §7.4 (no debug cores) and §9 (resource headroom)
+    - {file: doc/ARCHITECTURE.md, regex: 'With block RAM at (?P<bram_pct>[\d.]+) % and \d+ ps of slack'}
+    - {file: doc/ARCHITECTURE.md, dotall: true,
+       regex: '\*\*Resource headroom\*\* \(§8\.5\)\.\s+BRAM (?P<bram_pct>[\d.]+) % \(two tiles left\), URAM (?P<uram_pct>[\d.]+) %,\s+(?P<clb_pct>[\d.]+) % of the CLBs in use'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'In context in the\nproduction `(?P<bitstream>[0-9a-f]{12})`'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'WNS \+[\d.]+ ns at (?P<lut>[\d ]+) LUT\.'}
+    - {file: demo/camera/README.md, regex: 'first such bitstream is `(?P<bitstream>[0-9a-f]{12})`, production since', fix: report}
     - {file: .claude/skills/perf-calibrate/SKILL.md, regex: 'Current model: \*\*kv260/(?P<bitstream>[0-9a-f]{12})\*\*'}
+    # the hw/ submodule's notes on the bitstream that is production
+    - {file: hw/cormorant_hw_128/CLAUDE.md, dotall: true,
+       regex: 'Bitstream `(?P<bitstream>[0-9a-f]{12})` \(production since.*?WNS\s+\+[\d.]+ ns, WHS \+[\d.]+ ns, (?P<lut>[\d ]+) LUT, (?P<bram>\d+) / (?P<bram_total>\d+) BRAM tiles, (?P<uram>\d+) / (?P<uram_total>\d+) URAM,\s+(?P<dsp>\d+) DSP'}
+    - {file: hw/cormorant_hw_128/README.md, dotall: true,
+       regex: '\(bitstream `(?P<bitstream>[0-9a-f]{12})`, production since \d{4}-\d{2}-\d{2}: (?P<lut>[\d ]+) LUT, (?P<bram>\d+) / (?P<bram_total>\d+) BRAM tiles,\s+(?P<uram>\d+) / (?P<uram_total>\d+) URAM, (?P<dsp>\d+) DSP'}
+
+- id: hw.timing
+  kind: recorded
+  title: the production bitstream's in-context timing at 250 MHz (post-route, post-physopt; WNS / WHS ns, the timed
+    setup endpoints), quoted wherever the docs give the design's slack
+  value: {bitstream: b4e63457057a, wns: 0.040, whs: 0.010, endpoints: 528735}
+  tolerance: 0.0005                          # the docs quote three decimals
+  provenance:
+    date: 2026-10-28
+    how: "Vivado timing summary of b4e63457057a (/mnt/data/bitstreams/kv260_250_b4e63457057a/, the routed design after
+          five rip-up iterations, 38 min of route_design): WNS +0.040, TNS 0, WHS +0.010 ns, 528 735 setup endpoints, the
+          20 worst paths 0.040-0.121 ns (worst_paths.rpt in the archive; ARCHITECTURE §8.4).  04259a7af917 before it:
+          +0.027 / +0.010 ns, 526 520 endpoints, nine rip-up iterations"
+    facts: {perf.bitstream_id: b4e63457057a}
+  verify:
+    wns: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_timing_summary_postroute_physopted.rpt, regex: 'WNS\(ns\)\s+TNS\(ns\).*\n.*\n\s+([-\d.]+)\s', type: float}
+    whs: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_timing_summary_postroute_physopted.rpt, regex: 'WNS\(ns\)\s+TNS\(ns\).*\n.*\n\s+[-\d.]+\s+[-\d.]+\s+\d+\s+\d+\s+([-\d.]+)\s', type: float}
+    endpoints: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_timing_summary_postroute_physopted.rpt, regex: 'WNS\(ns\)\s+TNS\(ns\).*\n.*\n\s+[-\d.]+\s+[-\d.]+\s+\d+\s+(\d+)\s', type: int}
+  fix: report
+  mentions:
+    - {file: CLAUDE.md, regex: 'The design closes 4 ns by a small margin \(\+(?P<wns>[\d.]+) ns with the capture path'}
+    - {file: doc/ARCHITECTURE.md, regex: 'The whole design closes 4 ns with \+(?P<wns>[\d.]+) ns \(§8\.4\)'}
+    - {file: doc/ARCHITECTURE.md, regex: 'With block RAM at [\d.]+ % and (?P<wns>\d+) ps of slack', format: 'round(v * 1000)'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| WNS \(setup\) \| \+(?P<wns>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| WHS \(hold\) \| \+(?P<whs>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| endpoints \| (?P<endpoints>[\d ]+) \|'}
+    - {file: doc/ARCHITECTURE.md, regex: 'On `(?P<bitstream>[0-9a-f]{12})` \(\d{4}-\d{2}-\d{2}\) they lie within (?P<wns>[\d.]+)–'}
+    # the slack history: its last row is the production bitstream
+    - {file: doc/ARCHITECTURE.md, regex: '\| `(?P<bitstream>[0-9a-f]{12})` \| [^|\n]+ \| \+(?P<wns>[\d.]+) ns \|\n\nThe default implementation strategy'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the\s+slack stays small \(\+(?P<wns>[\d.]+) ns,'}
+    - {file: doc/ARCHITECTURE.md, dotall: true, regex: '% of the CLBs in use, and \+(?P<wns>[\d.]+) ns of slack'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: '125 DSP; WNS \+(?P<wns>[\d.]+) ns at [\d ]+ LUT\.'}
+    - {file: .claude/skills/board-deploy/SKILL.md, dotall: true,
+       regex: 'the production `(?P<bitstream>[0-9a-f]{12})` \(\d{4}-\d{2}-\d{2}\)\s+\+(?P<wns>[\d.]+) ns after'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, dotall: true,
+       regex: 'Bitstream `(?P<bitstream>[0-9a-f]{12})` \(production since.*?WNS\s+\+(?P<wns>[\d.]+) ns, WHS \+(?P<whs>[\d.]+) ns'}
+    - {file: hw/cormorant_hw_128/README.md, dotall: true,
+       regex: 'Routed: WNS \+(?P<wns>[\d.]+) ns, WHS \+(?P<whs>[\d.]+) ns\s+\(bitstream `(?P<bitstream>[0-9a-f]{12})`, production since'}
+
+- id: hw.kernel_util
+  kind: recorded
+  title: each kernel's LUTs and DSPs in the production bitstream's routed design (report_utilization -hierarchical),
+    in ARCHITECTURE's per-instance and DSP tables and the kernel references
+  value: {vectorop_lut: 9578, matmul_lut: 14062, conv_lut: 13715, pool_lut: 10749, rowops_lut: 27160,
+          vectorop_dsp: 35, matmul_dsp: 138, conv_dsp: 518, pool_dsp: 29, rowops_dsp: 125}
+  provenance:
+    date: 2026-10-28
+    how: "report_utilization -hierarchical on b4e63457057a's routed checkpoint (the archive's
+          design_cormorant_wrapper_utilization_hierarchical.rpt): the kernels of the second area pass (AREA_PLAN §6:
+          MatmulKernel's drain lane sums in eight DSPs, 130 -> 138; the row-ops unit's NORM 77 -> 69 DSPs, 133 -> 125).
+          04259a7af917 before it: RowOps 35 337 LUT / 133 DSP, Matmul 130 DSP"
+    facts: {perf.bitstream_id: b4e63457057a}
+  fix: report
+  mentions:
+    - {file: doc/ARCHITECTURE.md, regex: '^\| VectorOPKernel \| (?P<vectorop_lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| \d+ \| \d+ \| \d+ \| (?P<vectorop_dsp>\d+) \|$'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| MatmulKernel \| (?P<matmul_lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| \d+ \| \d+ \| \d+ \| (?P<matmul_dsp>\d+) \|$'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| ConvKernel \| (?P<conv_lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| \d+ \| \d+ \| \d+ \| (?P<conv_dsp>\d+) \|$'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| PoolingKernel \| (?P<pool_lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| \d+ \| \d+ \| \d+ \| (?P<pool_dsp>\d+) \|$'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| RowOpsKernel \| (?P<rowops_lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| \d+ \| \d+ \| \d+ \| (?P<rowops_dsp>\d+) \|$'}
+    # §5.3 DSP usage
+    - {file: doc/ARCHITECTURE.md, regex: '^\| VectorOPKernel \| (?P<vectorop_dsp>\d+) \| one multiplier'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| MatmulKernel \| (?P<matmul_dsp>\d+) \| 128 MACs'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| ConvKernel \| (?P<conv_dsp>\d+) \| the MAC grid'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| PoolingKernel \| (?P<pool_dsp>\d+) \| control arithmetic'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| RowOpsKernel \| (?P<rowops_dsp>\d+) \| of which'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'MIPI camera''s capture path\):\n(?P<rowops_lut>[\d ]+) LUT, [\d ]+ FF, \d+ RAMB36, \d+ URAM, (?P<rowops_dsp>\d+) DSP'}
+
+- id: hw.capture_path
+  kind: recorded
+  title: the camera capture path's cost in the production bitstream (its cap_* cells, report_utilization
+    -hierarchical) and its package pins (bonded IOBs)
+  value: {lut: 7428, ramb36: 6, uram: 1, pins: 14}
+  provenance:
+    date: 2026-10-28
+    how: "b4e63457057a's routed checkpoint: the cap_* cells' sum (cap_csi 3 586 LUT, 2 RAMB36, 1 URAM; cap_fb 2 017 LUT,
+          4 RAMB36 — the frame buffer's USE_URAM never took; cap_smc, cap_fifo, cap_iic), the placed report's 14 bonded
+          IOBs (the 10 MIPI pins the receiver IP places, the four of capture.xdc)"
+    facts: {perf.bitstream_id: b4e63457057a}
+  verify:
+    pins: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| Bonded IOB\s+\|\s+(\d+) ', type: int}
+  fix: report
+  mentions:
+    - {file: doc/ARCHITECTURE.md, regex: '^\| the camera capture path \(`cap_\*`, §6\.6\) \| (?P<lut>[\d ]+) \| [\d ]+ \| \d+ \| [\d ]+ \| (?P<ramb36>\d+) \| \d+ \| (?P<uram>\d+) \| \d+ \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '\| bonded IOB \| (?P<pins>\d+) \|'}
+    - {file: doc/ARCHITECTURE.md, regex: 'I/O:\s(?P<pins>\d+) pins for the carrier''s MIPI camera'}
+    - {file: doc/ARCHITECTURE.md, regex: 'is the first to do so: (?P<pins>\d+) bonded IOBs'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the camera''s (?P<pins>\d+) pins: `PACKAGE_PIN`'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the camera''s capture path took (?P<ramb36>\w+) tiles and', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the camera''s capture path took \w+ tiles and (?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: doc/ARCHITECTURE.md, regex: 'with the capture path\s+\(\+(?P<lut>[\d.]+) k\)', format: 'round(v / 1000, 1)'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the camera path\s+took (?P<ramb36>\w+) BRAM tiles', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: doc/ARCHITECTURE.md, regex: 'the camera path\s+took \w+ BRAM tiles and (?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: README.md, regex: 'shares nothing with the kernels but the device: (?P<lut>[\d.]+) k LUTs', format: 'round(v / 1000, 1)'}
+    - {file: README.md, regex: 'k LUTs, (?P<ramb36>\w+) block RAMs and', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: README.md, regex: 'block RAMs and\s+(?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, regex: 'the path takes (?P<ramb36>\w+) RAMB36', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+    - {file: hw/cormorant_hw_128/CLAUDE.md, dotall: true, regex: 'two in the receiver — and (?P<uram>\w+) URAM', format: '["no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"][v]'}
+
+- id: kernels.ooc_wns
+  kind: recorded
+  title: each kernel's out-of-context slack at 300 MHz (3.333 ns; Vivado place and route), the production RTL
+  value: {vectorop: 0.210, matmul: 0.006, conv: 0.001, pool: 0.184, rowops: 0.002}
+  tolerance: 0.0005
+  provenance:
+    commit: be401a1
+    date: 2026-10-24
+    how: "AREA_PLAN §6.2: the second area pass's RTL out of context (synth_<k>_rtl flows, Vivado 2025.2; the RTL before
+          the pass in the same flow: +0.221 / +0.115 / +0.026 / +0.145 / -0.027 ns); in production since
+          b4e63457057a.  Stale when a kernel's RTL changes"
+  depends_on: [kernels/vectorop_rtl/rtl, kernels/matmul_rtl/rtl, kernels/conv_rtl/rtl, kernels/pool_rtl/rtl,
+               kernels/rowops_rtl/rtl]
+  fix: report
+  mentions:
+    # ARCHITECTURE §3.2: the slack and the estimated Fmax, 1 / (3.333 ns - slack)
+    - {file: doc/ARCHITECTURE.md, regex: '^\| VectorOPKernel \| \+(?P<vectorop>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| MatmulKernel \| \+(?P<matmul>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| ConvKernel \| \+(?P<conv>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| PoolingKernel \| \+(?P<pool>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| RowOpsKernel \| \+(?P<rowops>[\d.]+) ns \|'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| VectorOPKernel \| \+[\d.]+ ns \| ≈ (?P<vectorop>\d+) MHz \|', format: 'round(1000 / (3.333 - v))'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| MatmulKernel \| \+[\d.]+ ns \| ≈ (?P<matmul>\d+) MHz \|', format: 'round(1000 / (3.333 - v))'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| ConvKernel \| \+[\d.]+ ns \| ≈ (?P<conv>\d+) MHz \|', format: 'round(1000 / (3.333 - v))'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| PoolingKernel \| \+[\d.]+ ns \| ≈ (?P<pool>\d+) MHz \|', format: 'round(1000 / (3.333 - v))'}
+    - {file: doc/ARCHITECTURE.md, regex: '^\| RowOpsKernel \| \+[\d.]+ ns \| ≈ (?P<rowops>\d+) MHz \|', format: 'round(1000 / (3.333 - v))'}
+    # the kernel references' current resource paragraphs (after the second area pass)
+    - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: '30 BRAM36, 35 DSP, WNS\n\+(?P<vectorop>[\d.]+) ns — the RTL before the pass'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: '138 DSP, WNS \+(?P<matmul>[\d.]+) ns — the'}
+    - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'meets 300 MHz out of context with little margin \(WNS \+(?P<matmul>[\d.]+) ns'}
+    - {file: doc/kernels/CONV_RTL_KERNEL.md, regex: 'as above\): WNS \+(?P<conv>[\d.]+) ns — the worst paths the'}
+    - {file: doc/kernels/POOL_RTL_KERNEL.md, regex: '29 DSP, WNS \+(?P<pool>[\d.]+) ns — the RTL'}
+    - {file: doc/kernels/ROWOPS_RTL_KERNEL.md, regex: 'as above\): WNS \+(?P<rowops>[\d.]+) ns, 27 150 LUT'}
+
+- id: hw.rtl_attributes
+  kind: value
+  title: the synthesis attributes of the five kernels' RTL (kernels/*_rtl/rtl/*.sv), counted per kind, in ARCHITECTURE
+    §4.1 (the RAM / ROM styles) and §8.2
+  source:
+    cmd: >-
+      {python} -c "import glob, json, re;
+      t = ''.join(open(p).read() for p in sorted(glob.glob('kernels/*_rtl/rtl/*.sv')));
+      a = re.findall(r'[(][*]([^*]*)[*][)]', t);
+      n = lambda w: sum(1 for x in a if re.search(r'\b' + w + r'\b', x));
+      k = sum(1 for x in a if re.search(r'\bkeep\b', x) and 'max_fanout' in x);
+      d = dict(keep=n('keep') - k, keep_max_fanout=k, max_fanout=n('max_fanout') - k, ram_style=n('ram_style'),
+      rom_style=n('rom_style'), shreg_extract=n('shreg_extract'), srl_style=n('srl_style'), use_dsp=n('use_dsp'));
+      d['ram_rom'] = d['ram_style'] + d['rom_style']; print(json.dumps(d))"
+    parse: '(\{.*\})'
+    transform: 'json.loads(v)'
+  fix: auto
+  mentions:
+    - {file: doc/ARCHITECTURE.md,
+       regex: '`\(\* keep \*\)` (?P<keep>\d+), `\(\* keep, max_fanout \*\)` (?P<keep_max_fanout>\d+), `\(\* max_fanout \*\)` (?P<max_fanout>\d+), `\(\* ram_style \*\)` (?P<ram_style>\d+), `\(\* rom_style \*\)` (?P<rom_style>\d+), `\(\* shreg_extract \*\)` (?P<shreg_extract>\d+), `\(\* srl_style \*\)` (?P<srl_style>\d+), `\(\* use_dsp \*\)` (?P<use_dsp>\d+)'}
+    - {file: doc/ARCHITECTURE.md, dotall: true, regex: '`\(\* rom_style \*\)` attributes \((?P<ram_rom>\d+)\s+in the RTL\)'}
 
 # ── the board: UIO devices of the overlay ────────────────────────────────────
 - id: board.uio_labels
@@ -1593,6 +1798,33 @@ facts:
                       'rowops': 'RowOpsKernel'}[k]: int(x, 16) for k, x in v.items()}"}
     - {name: ARCHITECTURE interrupt table, file: doc/ARCHITECTURE.md, as: dict,
        regex: '^\| (\w+Kernel) \| \d \| (\d+) \| \d+ \|'}
+
+- id: board.capture_irq_spi
+  kind: interface
+  title: "the camera capture path's interrupts (SPI) — the block design's pl_ps_irq1 bit n is SPI 104 + n (cap_irq: the
+    CSI-2 receiver In0, the frame buffer In1, the I2C controller In3) — in the capture overlay, ARCHITECTURE, the
+    hw_128 docs and bd_mipi_capture.tcl"
+  optional: true                             # the hw/ submodule
+  producer: {file: hw/cormorant_hw_128/cormorant_hw_128.srcs/sources_1/bd/design_cormorant/design_cormorant.bd,
+             json: design.nets,
+             transform: "{p.split('/')[0]: 104 + int(q.split('/In')[1]) for x in v.values() for p in x['ports'] for q in x['ports']
+                          if q.startswith('cap_irq/In') and p.split('/')[0] in ('cap_csi', 'cap_fb', 'cap_iic')}"}
+  consumers:
+    - {name: the capture overlay, file: dts/kv260/cormorant_capture.dts, as: dict, dotall: true,
+       regex: '^\s*(cap_\w+): \w+@[0-9a-f]+ \{[^{}]*?interrupts = <0x00 (0x[0-9a-f]+) 0x04>;',
+       transform: "{k: int(x, 16) for k, x in v.items()}"}
+    - {name: ARCHITECTURE camera interrupt table (SPI), file: doc/ARCHITECTURE.md, as: dict,
+       regex: '^\| `(cap_\w+)` \([^)|]*\) \| \d \| (\d+) \| \d+ \|', transform: "{k: int(x) for k, x in v.items()}"}
+    - {name: ARCHITECTURE camera interrupt table (GIC id), file: doc/ARCHITECTURE.md, as: dict,
+       regex: '^\| `(cap_\w+)` \([^)|]*\) \| \d \| \d+ \| (\d+) \|', transform: "{k: int(x) - 32 for k, x in v.items()}"}
+    - {name: ARCHITECTURE control-path diagram, file: doc/ARCHITECTURE.md,
+       regex: '"interrupts, SPI (\d+), (\d+), (\d+)"', transform: "{k: int(x) for k, x in zip(['cap_csi', 'cap_fb', 'cap_iic'], v)}"}
+    - {name: hw_128 CLAUDE.md, file: hw/cormorant_hw_128/CLAUDE.md,
+       regex: 'into `pl_ps_irq1` \(SPIs (\d+) / (\d+) / (\d+)\)', transform: "{k: int(x) for k, x in zip(['cap_csi', 'cap_fb', 'cap_iic'], v)}"}
+    - {name: hw_128 README, file: hw/cormorant_hw_128/README.md,
+       regex: 'into `pl_ps_irq1` \(SPIs (\d+), (\d+), (\d+)\)', transform: "{k: int(x) for k, x in zip(['cap_csi', 'cap_fb', 'cap_iic'], v)}"}
+    - {name: bd_mipi_capture.tcl, file: hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl, dotall: true,
+       regex: 'In0 cap_csi \(SPI (\d+)\), In1 cap_fb \((\d+)\), In2 0,\s+#\s+In3 cap_iic \((\d+)\)', transform: "{k: int(x) for k, x in zip(['cap_csi', 'cap_fb', 'cap_iic'], v)}"}
 
 # ── assets, limits, the chunk ────────────────────────────────────────────────
 - id: bert.model_mb

@@ -201,13 +201,19 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `chat.http_routes` | interface | the server's routes against API.md, and against the routes six other docs name |
 | `cli.script_calls` | interface | the flags of five script-to-script calls (`deploy.py` → the server, the BERT generator; `e2e_check.py`; `llm_calibrate.py`; `run_remote_tests.py`) |
 | `tts.max_ids` | value | Piper's encoder buckets; the largest (400) is the server's packing size in two files |
-| `board.results` | recorded | the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, MNIST convnet / LeNet, YOLOv5n, LightStereo-S, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 19 other files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
+| `board.results` | recorded | the bitstream they were measured on and the README's headline board results (ResNet-18, MobileNet v1 / v2, BERT, MNIST convnet / LeNet, YOLOv5n, LightStereo-S, the chat models' decode and 135M's 16-token prefill = first token, SmolVLM's image, Piper's RTF), quoted in 19 other files within 3 %; stale on another bitstream; verified against the demos' `results.json` |
 | `yolo.quality`, `stereo.quality`, `stereo.realsense` | recorded | YOLOv5n's COCO128 mAP, LightStereo-S's EPE / bad-pixel rates on the 42 Middlebury / ETH3D pairs and its RealSense D435 depth agreement, each against float, in the README, doc/README, demo/README, the demo's README and its plan; stale on another bitstream |
 | `yolo.model` | value | the SHA-256 of the YOLOv5n release file and the COCO128 archive the demo pins (`yolo_study.py`), in YOLO_PLAN and the demo's README |
 | `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json`; also the RTL MatmulKernel's `K_MAX` and the RTL cost model's packed-B tile |
 | `board.pl_clock_mhz` | value, optional | the kernel clock (the block design's `clk_wiz_0`, 250 MHz since FMAX_250_PLAN) in the README, CLAUDE.md, the docs, the conv-cycle-model script's `PL_MHZ` and the cost model's `KERNEL_MHZ` |
 | `board.cma_mb` | value | the board's `cma=` size (1400 MiB, `src/remote/cma_boot.py`), in the README, CLAUDE.md, the chat docs, the skills and the study scripts |
-| `hw.utilization` | recorded | the production bitstream (`b4e63457057a`) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
+| `hw.utilization` | recorded | the production bitstream (`b4e63457057a`) and its DSP / LUT / BRAM / URAM / CLB use, verified against the local Vivado placed-utilization report; in the README, ARCHITECTURE's tables and headroom notes, the hw_128 docs and the docs that name the production bitstream |
+| `hw.timing` | recorded | the production bitstream's in-context WNS / WHS and timed endpoints, verified against the local timing summary; in CLAUDE.md, ARCHITECTURE (§3.2, §7.4, §8.4's table, worst paths and slack history, §8.5, §9), the row-ops reference, the board-deploy skill and the hw_128 docs |
+| `hw.kernel_util`, `hw.capture_path` | recorded | each kernel's in-context LUTs and DSPs, and the camera capture path's LUTs, RAMB36, URAM and pins (the pins verified against the placed report), in ARCHITECTURE's per-instance and DSP tables, the README and the hw_128 docs; stale on another bitstream |
+| `kernels.ooc_wns` | recorded | each kernel's out-of-context slack at 300 MHz and ARCHITECTURE's estimated Fmax, in ARCHITECTURE and the kernel references; stale when a kernel's RTL changes |
+| `hw.rtl_attributes` | value | the kernels' synthesis attributes (`keep`, `max_fanout`, `ram_style` …), counted from the RTL, in ARCHITECTURE §4.1 and §8.2 |
+| `board.capture_irq_spi` | interface | the camera path's interrupts (`pl_ps_irq1`, SPI 104 + n, from the block design) in the capture overlay, ARCHITECTURE, the hw_128 docs and `bd_mipi_capture.tcl` |
+| `perf.simulate_error` | recorded | `perf_calibrate.py simulate`'s whole-model error on the latest checks, in ARCHITECTURE and INFERENCE_SCHEDULER; stale when `host.json` changes |
 | `board.uio_labels`, `board.uio_map` | interface | the overlay's UIO names (`dts/kv260/cormorant.dts`) and which kernel uses which, in the eight example configs, two doc tables, the README, a skill and the MNIST README |
 | `board.irq_spi` | interface | each kernel's interrupt (`pl_ps_irq0` bit n = SPI 89 + n, from the block design) in the overlay's UIO nodes and ARCHITECTURE.md |
 | `bert.model_mb` | value | the 435 MB BERT download (`fetch_assets.py`), quoted in 11 files |
@@ -267,6 +273,18 @@ far from the call floor its kernel terms were fitted against (~315 cycles at
 measured floor.  CLAUDE.md still said the activation ops were "not yet in a
 bitstream"; its two production-bitstream mentions joined `perf.bitstream_id`.
 Twelve mutations of the new locators were all caught.
+
+The sixth batch (2026-10-28, the production `b4e63457057a`) registered what
+ARCHITECTURE.md had let drift: its out-of-context slack table was a
+fortnight old, its DSP table and per-instance utilization predated the area
+pass, three sections quoted the previous design's slack (+0.027 ns) and
+utilization, its RTL attribute counts were stale and it claimed the
+simulator within ±2 %.  Registering them found three more stale
+statements: the board-deploy skill still called `04259a7af917` the
+production bitstream, INFERENCE_SCHEDULER.md still said the simulator was
+within 2 % of the board on the chat models, and five kernel references
+called the RTL before the area pass "the production RTL".  Twenty-one
+mutations, each a discrepancy fixed that day, were all caught.
 
 ## Adding a fact
 

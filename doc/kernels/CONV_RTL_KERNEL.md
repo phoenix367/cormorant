@@ -159,7 +159,7 @@ pattern (RPU_PLAN §13.9, out of context at 300 MHz): WNS +0.026 ns, 14 973
 LUT, 37 793 FF, 60 BRAM tiles, 48 URAM, 518 DSP — the worst paths in the
 weight and x loaders, the drain's own +0.110 ns.  After the LUT / FF pass
 of AREA_PLAN §6 (2026-10-24, out of context at 3.333 ns, Vivado 2025.2;
-the production RTL in the same flow 14 973 LUT (4 046 LUTRAM, 511 SRL),
+the RTL before the pass in the same flow 14 973 LUT (4 046 LUTRAM, 511 SRL),
 37 793 FF, WNS +0.026 ns, as above): WNS +0.001 ns — the worst paths the
 sweep sequencer's image test (`s_ni` into the `s_yn` enables, four carry
 levels), the x loader and the patch replay file's write address — 13 749

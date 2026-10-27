@@ -146,7 +146,7 @@ kernel in the test stand.
 Resources (out of context, xck26 −2LV, `make synth_vectorop_rtl`), after the
 LUT / FF pass of AREA_PLAN §6 (2026-10-24; Vivado 2025.2, place and route at
 3.333 ns): 9 570 LUT (542 LUTRAM, 188 SRL), 10 721 FF, 30 BRAM36, 35 DSP, WNS
-+0.210 ns — the production RTL (bitstream `04259a7af917`) in the same run
++0.210 ns — the RTL before the pass (bitstream `04259a7af917`) in the same run
 10 746 LUT (526 LUTRAM, 187 SRL), 12 196 FF, WNS +0.221 ns; results and cycle
 counts unchanged.  With the
 softmax unit (2026-10-07): 11 672 LUT (491 LUTRAM), 13 751 FF, 30 BRAM36, 35

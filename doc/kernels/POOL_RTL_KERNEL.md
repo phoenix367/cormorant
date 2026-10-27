@@ -95,8 +95,8 @@ slot's acceptance from these.
 Resources (out of context, xck26 −2LV, `make synth_pool_rtl`), after the
 LUT / FF pass of AREA_PLAN §6 (2026-10-24; Vivado 2025.2, place and route at
 3.333 ns): 10 652 LUT (3 408 LUTRAM: the line buffer and the row buffers; 26
-SRL), 10 481 FF, 2 RAMB36 + 2 RAMB18, 29 DSP, WNS +0.184 ns — the production
-RTL (bitstream `04259a7af917`) in the same run 11 826 LUT (3 462 LUTRAM, 42
+SRL), 10 481 FF, 2 RAMB36 + 2 RAMB18, 29 DSP, WNS +0.184 ns — the RTL
+before the pass (bitstream `04259a7af917`) in the same run 11 826 LUT (3 462 LUTRAM, 42
 SRL), 11 572 FF, WNS +0.145 ns; results and cycle counts unchanged.  After
 the in-context work of 2026-10-06: 12 356 LUT (3 446 LUTRAM), 11 802 FF; timing
 met at 300 MHz (WNS +0.110 ns, Fmax ≈ 310 MHz; the PL runs at

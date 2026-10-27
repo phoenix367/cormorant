@@ -478,8 +478,8 @@ xck26-sfvc784-2LV-c, out of context (`make synth_matmul_rtl`):
 Timing is checked at 300 MHz and met: after the LUT / FF pass of AREA_PLAN
 §6 (2026-10-24; Vivado 2025.2, place and route at 3.333 ns) 13 954 LUT
 (6 620 LUTRAM, 21 SRL), 11 904 FF, 38 BRAM36, 138 DSP, WNS +0.006 ns — the
-worst path a reset fanout to control registers, route only; the production
-RTL (bitstream `04259a7af917`) in the same run 14 460 LUT (6 656 LUTRAM, 22
+worst path a reset fanout to control registers, route only; the RTL before
+the pass (bitstream `04259a7af917`) in the same run 14 460 LUT (6 656 LUTRAM, 22
 SRL), 13 329 FF, 130 DSP, WNS +0.115 ns; results and cycle counts
 unchanged.  On 2026-10-06, after the in-context pipelining below: 16.3 k LUT
 (6.9 k LUTRAM), 15.3 k FF, WNS +0.026 ns (before it +0.002 ns with 18.4 k LUT

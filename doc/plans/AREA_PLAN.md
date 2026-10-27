@@ -194,8 +194,8 @@ an instantiated DSP.
 
 ### 6.2 Results
 
-Out of context (place and route at 3.333 ns, the production RTL in the same
-flow):
+Out of context (place and route at 3.333 ns, the RTL before the pass —
+production `04259a7af917`'s — in the same flow):
 
 | kernel | LUT | FF | DSP | WNS |
 |---|---:|---:|---:|---:|

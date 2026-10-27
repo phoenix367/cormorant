@@ -408,7 +408,7 @@ In context (bitstream `04259a7af917`, 2026-10-16; production from 2026-10-17): 3
 WHS +0.010 ns at 91 805 LUT and 57 / 64 URAM (a longer route: nine
 rip-up iterations, RPU_PLAN §14.10).  After the LUT / FF pass of
 AREA_PLAN §6 (2026-10-24, out of context at 3.333 ns, Vivado 2025.2;
-the production RTL in the same run 35 323 LUT (4 332 LUTRAM, 615 SRL),
+the RTL before the pass in the same run 35 323 LUT (4 332 LUTRAM, 615 SRL),
 28 667 FF, 133 DSP, WNS −0.027 ns, as above): WNS +0.002 ns, 27 150 LUT
 (4 024 LUTRAM, 744 SRL), 22 290 FF, 6 RAMB36, 9 URAM, 125 DSP (−8: NORM's
 narrower P1 · G); results and cycle counts unchanged.  In context in the
