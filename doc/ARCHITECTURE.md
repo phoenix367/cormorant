@@ -76,7 +76,7 @@ board" table is the reference for these numbers.
 
 There is no power budget beyond the starter kit's own supply and fan.
 Board power is measured with the INA260 on the carrier's 5 V rail
-(RPU_PLAN §11, 2026-10-13):
+(RPU_PLAN §11.2, 2026-10-13, on `1cedaf2ed816`):
 
 | state | board power |
 |---|---|
@@ -84,12 +84,18 @@ Board power is measured with the INA260 on the carrier's 5 V rail
 | chat server loaded, idle | 4.72–4.77 W |
 | back-to-back SmolLM2-135M chat | 6.2 W |
 
-Vivado's routed power estimate gives 7.74 W on-chip (vectorless, medium
-confidence, junction 42.9 °C).  Of that, the PS8 is 2.44 W, signals 1.86 W,
-CLB logic 1.14 W, DSPs 0.50 W, block RAM 0.45 W, URAM 0.48 W, clocks
-0.44 W and PL static 0.34 W.  The estimate assumes default toggle rates
-and does not match the measured load: the whole board draws less than
-Vivado's on-chip total.  The software-side savings are measured:
+On `b4e63457057a`, the camera demo classifying live AR1335 frames at about
+16 frames a second reads 4.8–6.6 W, most often 5.3 W (its own INA260
+sampling, 2026-10-28).
+
+Vivado's routed power estimate for `b4e63457057a` gives 7.40 W on-chip
+(vectorless, junction 42.2 °C; low confidence, because the camera's input
+pins have no activity specified — the internal nodes are at medium).  Of
+that, the PS8 is 2.44 W, signals 1.56 W, CLB logic 0.91 W, DSPs 0.51 W,
+URAM 0.48 W, block RAM 0.43 W, clocks 0.42 W, the MMCMs and the D-PHY's PLL
+0.25 W, I/O 0.04 W and PL static 0.36 W.  The estimate assumes default
+toggle rates and does not match the measured load: the whole board draws
+less than Vivado's on-chip total.  The software-side savings are measured:
 - the R5 sleeping between commands saves about 50 mW;
 - the A53 power-down idle state saves about 9 mW.
 
@@ -99,14 +105,16 @@ Vivado's on-chip total.  The software-side savings are measured:
 |---|---|---|
 | DDR4, 64-bit, 4 GB | PS DDR controller | all kernel operands and results; the Linux memory |
 | AXI4 (4 data paths) and AXI4-Lite (1 control path) | PS–PL boundary | the kernels' memory traffic and registers (§6) |
-| PL-to-PS interrupts, 5 lines | PS–PL boundary | kernel completion (§6.3) |
+| AXI4 (1 data path) and AXI4-Lite (1 control path) | PS–PL boundary | the camera capture path's frames (`S_AXI_HP3_FPD`) and its control (`M_AXI_HPM0_LPD`, §6.6) |
+| PL-to-PS interrupts, 5 + 3 lines | PS–PL boundary | kernel completion (§6.3); the camera's receiver, frame buffer and I²C |
+| MIPI CSI-2, 4 lanes; I²C | PL pins: HP bank 66 (CSI-2), HD bank 45 (I²C, the ISP's reset and standby); the carrier's IAS0 connector | the AR1335 camera behind the AP1302 ISP (§6.6) |
 | Gigabit Ethernet | PS (carrier) | the chat server's HTTP API, development access |
 | USB 3 | PS (carrier) | cameras (RealSense D435, webcam) |
 | UART | PS (carrier, FT4232H channel B) | serial console |
 
-The production PL uses no package pins: no PCIe, no Ethernet MAC, no I/O
-standard to choose; the camera capture path adds the carrier's MIPI camera
-(AR1335 / AP1302: CSI-2, I²C, reset) on PL pins (§6.6).
+The kernels use no package pins.  The camera capture path is the only PL
+I/O: 14 pins for the carrier's MIPI camera (CSI-2, I²C, the ISP's reset and
+standby; §6.6).  There is no PCIe and no Ethernet MAC in the PL.
 
 ### 1.5 Device, board and toolchain
 
@@ -127,11 +135,13 @@ standard to choose; the camera capture path adds the carrier's MIPI camera
 ### 2.1 Block diagram
 
 The datapath: every kernel port is a 128-bit AXI4 master, and four PS slave
-ports carry the traffic to DDR.
+ports carry the kernels' traffic to DDR.  A fifth, `S_AXI_HP3_FPD`, carries
+the camera's frames (§6.6); the camera path shares nothing else with the
+kernels.
 
 ```mermaid
 flowchart LR
-  subgraph PL["PL, one 250 MHz clock domain"]
+  subgraph PL["PL: the kernels' 250 MHz domain"]
     VO["VectorOPKernel"]
     MM["MatmulKernel"]
     CV["ConvKernel"]
@@ -142,11 +152,16 @@ flowchart LR
     XI["axi_x_intercon"]
     ROI["axi_rowops_intercon"]
   end
+  subgraph CAP["PL: the camera capture path, 200 MHz"]
+    CSI["cap_csi<br/>CSI-2 receiver"]
+    FB["cap_fb<br/>NV12 frame buffer"]
+  end
   subgraph PS["Zynq UltraScale+ PS"]
     HPC0["S_AXI_HPC0_FPD"]
     HPC1["S_AXI_HPC1_FPD"]
     HP2["S_AXI_HP2_FPD"]
     HP0["S_AXI_HP0_FPD"]
+    HP3["S_AXI_HP3_FPD"]
     CCI["CCI-400"]
     DDRC["DDR controller<br/>DDR4 64-bit, 4 GB"]
   end
@@ -159,10 +174,13 @@ flowchart LR
   CV -->|"w, bias"| MEMI
   CV -->|"x"| XI
   RO -->|"read and write"| ROI
+  CSI -->|"AXI4-Stream video"| FB
+  FB -->|"frames"| HP3
   IC0 --> HPC0 --> CCI
   MEMI --> HPC1 --> CCI
   XI --> HP2 --> DDRC
   ROI --> HP0 --> DDRC
+  HP3 --> DDRC
   CCI --> DDRC
 ```
 
@@ -178,10 +196,16 @@ flowchart LR
   SMC["axi_smc<br/>SmartConnect"]
   K["five kernels' s_axi_ctrl<br/>0xA000_0000 + 64 KiB each"]
   GIC["GICs of the A53 and the R5"]
+  HPML["M_AXI_HPM0_LPD<br/>32-bit, 100 MHz"]
+  CSMC["cap_smc<br/>SmartConnect"]
+  CAPR["the camera path's registers<br/>0x8000_0000, 0x8001_0000, 0x8003_0000"]
   A53 -->|"UIO: the A53 drives"| HPM0
   R5 -->|"MPU device window: the R5 drives"| HPM0
   HPM0 --> SMC --> K
   K -.->|"interrupts, SPI 89 to 93"| GIC
+  A53 -->|"Linux V4L2 and I2C drivers"| HPML
+  HPML --> CSMC --> CAPR
+  CAPR -.->|"interrupts, SPI 104, 105, 107"| GIC
   A53 -->|"records a batch"| RING
   RING --> R5
   A53 -->|"/dev/mem"| TCM
@@ -196,7 +220,14 @@ The block design (`hw/cormorant_hw_128`, `design_cormorant`) contains:
 - the five kernels;
 - four AXI interconnects for data;
 - one SmartConnect for control;
-- an interrupt concatenation.
+- an interrupt concatenation;
+- the camera capture path (`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`,
+  every cell prefixed `cap_`): the MIPI CSI-2 receiver subsystem
+  `cap_csi`, an AXI4-Stream FIFO and subset converter, the frame-buffer
+  writer `cap_fb`, the AXI I²C controller `cap_iic`, the SmartConnect
+  `cap_smc` on `M_AXI_HPM0_LPD`, its clock wizard `cap_clk`, two reset
+  blocks, an interrupt concatenation on `pl_ps_irq1` and two EMIO GPIO
+  slices.
 
 The kernels' IP identifiers keep the `xilinx.com:hls:<Kernel>:1.0` VLNVs of
 the Vitis HLS kernels they replaced, so the block design and its drivers did
@@ -321,8 +352,10 @@ their place is the device's column structure:
 | MatmulKernel | 128 MAC DSPs across columns X0–X5, far from its A-panel BRAMs ([`MATMUL_RTL_KERNEL.md`](kernels/MATMUL_RTL_KERNEL.md)) |
 | all | the wide fan-outs (resets, job start, configuration fields) reach DSP / BRAM / URAM columns across the die, so they go through register trees (§8.3) |
 
-No Pblocks or LOC constraints are used.  Placement is left to Vivado
-(`place_design -directive ExtraTimingOpt`).
+No Pblocks are used, and no LOC constraints beyond the camera's package
+pins (§6.6).  Placement is left to Vivado (`place_design -directive
+ExtraTimingOpt`); it put the camera path in the device's top row of clock
+regions (X0Y3–X2Y3), around its receiver's bit slices in X1Y3.
 
 ---
 
@@ -334,38 +367,62 @@ No Pblocks or LOC constraints are used.  Placement is left to Vivado
 flowchart LR
   IOPLL["PS IOPLL"] --> PL0["pl_clk0<br/>99.999 MHz"]
   IOPLL --> PL1["pl_clk1 100 MHz<br/>enabled, no loads"]
-  PL0 --> BUFGPS["BUFG_PS"]
-  BUFGPS --> MMCM["MMCME4_ADV<br/>MMCM_X0Y3<br/>VCO 1000 MHz"]
-  MMCM -->|"CLKOUT0 ÷ 4"| BUFGCE["BUFGCE<br/>BUFGCE_X0Y76"]
-  BUFGCE --> G0["clk_out1, 249.9975 MHz<br/>117 155 clock loads, 12 clock regions"]
+  PL0 --> BUFGPS["BUFG_PS<br/>BUFG_PS_X0Y72"]
+  BUFGPS --> MMCM["clk_wiz_0: MMCME4_ADV<br/>MMCM_X0Y2<br/>VCO 1000 MHz"]
+  MMCM -->|"CLKOUT0 ÷ 4"| BUFGCE["BUFGCE<br/>BUFGCE_X0Y51"]
+  BUFGCE --> G0["clk_out1, 249.9975 MHz<br/>104 927 clock loads, 12 clock regions"]
   G0 --> K["kernels, interconnects,<br/>SmartConnect, reset block"]
-  G0 --> PSP["PS AXI port clocks<br/>maxihpm0, saxihpc0/1, saxihp0/2"]
+  G0 --> PSP["PS AXI port clocks<br/>maxihpm0_fpd, saxihpc0/1, saxihp0/2"]
   MMCM -->|"locked"| RST["rst_ps8_0_99M"]
+  BUFGPS --> LITE["the camera path's control side<br/>2 514 clock loads: maxihpm0_lpd,<br/>cap_smc, the receiver's AXI-Lite, cap_iic"]
+  BUFGPS --> CMMCM["cap_clk: MMCME4_ADV<br/>MMCM_X0Y3, × 2"]
+  CMMCM --> CBUF["BUFGCE_X0Y77<br/>clk_200M, 7 286 clock loads"]
+  CBUF --> VID["the camera path's video side:<br/>receiver, FIFO, converter,<br/>frame buffer, saxihp3_fpd"]
+  CBUF --> DPLL["the D-PHY's PLLE4, PLL_X0Y7<br/>187.5 MHz; 1.5 GHz to the bit slices"]
+  MIPI["MIPI clock lane, 448 MHz"] --> BS["RX bit slices"] --> BYTE["byte clock 112 MHz<br/>BUFGCE_X0Y94, 691 loads"]
 ```
 
-The design has one PL clock.  `pl_clk0` (100 MHz from the PS's IOPLL) only
-feeds the MMCM.  The MMCM is configured as follows:
+The kernels have one clock.  `pl_clk0` (100 MHz from the PS's IOPLL) feeds
+the kernels' MMCM, `clk_wiz_0`, which is configured as follows:
 - multiply by 10, divide by 1, VCO at 1000 MHz;
 - `CLKOUT0` divided by 4, giving 250 MHz;
 - bandwidth `OPTIMIZED`, output jitter 110 ps, phase error 99 ps.
 
-The one global buffer `BUFGCE` distributes it.  The bitstream thus sets its
-own kernel clock.  The bitstream loader still checks that PL0 is at the 100
-MHz the hardware description expects, and sets it if not.  A wrong PL0 would
-scale the kernel clock with it.  `pl_clk1` is enabled in the PS
-configuration but drives nothing; it is a candidate for removal (§9).  No
-regional or divided clock buffers are used.  Vivado's methodology check
-adds two advisories:
-- CLKC-40: a PLLE4 could replace the MMCM, since one integer output needs no
+One global buffer distributes it to all of the kernels' logic.  The bitstream
+thus sets its own kernel clock.  The bitstream loader still checks that PL0
+is at the 100 MHz the hardware description expects, and sets it if not.  A
+wrong PL0 would scale the kernel clock with it.
+
+The camera capture path (§6.6) brings the other clocks, none of them on the
+kernels' side:
+- `pl_clk0` itself clocks the path's control side (`M_AXI_HPM0_LPD`, its
+  SmartConnect, the receiver's AXI-Lite port, the I²C controller);
+- a second MMCM, `cap_clk`, makes 200 MHz from it: the D-PHY's reference and
+  the video clock of the receiver, the stream FIFO and converter, the frame
+  buffer and `S_AXI_HP3_FPD`;
+- inside the CSI-2 receiver, a PLLE4 makes the bit slices' clocks, and the
+  RX bit slices recover the 112 MHz byte clock from the camera's 448 MHz
+  clock lane (896 Mb/s per lane).
+
+A sixth global buffer carries no clock: Vivado placed EMIO GPIO 0, the frame
+buffer's reset (§3.4), on `BUFGCE_X0Y26` for its 1 134 loads.  `pl_clk1` is
+enabled in the PS configuration but drives nothing; it is a candidate for
+removal (§9).  No regional or divided clock buffers are used.  Vivado's
+methodology check adds three advisories:
+- CLKC-40: a PLLE4 could replace each MMCM, since one integer output needs no
   MMCM;
-- CLKC-56: the MMCM has no LOC.
+- CLKC-56: the MMCMs have no LOC;
+- CLKC-58: neither has the D-PHY's PLL.
 
 ### 3.2 Clock domains and their maximum frequencies
 
 | domain | frequency | source | logic |
 |---|---|---|---|
-| `clk_out1_design_cormorant_clk_wiz_0_0` | 250 MHz (4.000 ns) | MMCM | all PL logic; the PL side of the PS AXI ports |
-| `clk_pl_0` | 100 MHz | PS IOPLL | the MMCM's input only |
+| `clk_out1_design_cormorant_clk_wiz_0_0` | 250 MHz (4.000 ns) | MMCM `clk_wiz_0` | the kernels, their interconnects and SmartConnect; the PL side of their PS AXI ports (500 847 timed endpoints) |
+| `clk_200M_design_cormorant_cap_clk_0` | 200 MHz (5.000 ns) | MMCM `cap_clk` | the camera path's video side and `S_AXI_HP3_FPD` (20 713 endpoints) |
+| `clk_pl_0` | 100 MHz | PS IOPLL | the two MMCMs' input; the camera path's control side and `M_AXI_HPM0_LPD` (5 417 endpoints) |
+| `mipi_phy_if_clk_p_FIFO_WRCLK_OUT` | 112 MHz (8.928 ns) | the camera's clock lane, 448 MHz, through the RX bit slices | the receiver's byte-clock logic (1 961 endpoints) |
+| `GEN_PLL_IN_IP_USP.pll0_clkout0` | 187.5 MHz | the D-PHY's PLLE4, from `cap_clk` | the bit slices' control (16 endpoints) |
 | `clk_pl_1` | 100 MHz | PS IOPLL | none |
 | A53 cluster | 1.33 GHz | PS APLL | Linux, host ops |
 | R5 | 533 MHz | PS (`dpll_to_lpd`) | the kernel-call firmware |
@@ -376,40 +433,60 @@ Vivado synthesis with `PerformanceOptimized`, then `ExtraTimingOpt`
 placement, routing and post-route physical optimisation, at 3.333 ns
 (300 MHz):
 
-| kernel | OOC slack at 300 MHz | est. Fmax OOC | date of the record |
-|---|---|---|---|
-| VectorOPKernel | +0.175 ns | ≈ 317 MHz | 2026-10-07 |
-| MatmulKernel | +0.026 ns | ≈ 302 MHz | 2026-10-06 |
-| ConvKernel | +0.025 ns | ≈ 302 MHz | 2026-10-10 |
-| PoolingKernel | +0.110 ns | ≈ 310 MHz | 2026-10-06 |
-| RowOpsKernel | +0.025 ns | ≈ 302 MHz | 2026-10-11 |
+| kernel | OOC slack at 300 MHz | est. Fmax OOC |
+|---|---|---|
+| VectorOPKernel | +0.210 ns | ≈ 320 MHz |
+| MatmulKernel | +0.006 ns | ≈ 301 MHz |
+| ConvKernel | +0.001 ns | ≈ 300 MHz |
+| PoolingKernel | +0.184 ns | ≈ 318 MHz |
+| RowOpsKernel | +0.002 ns | ≈ 300 MHz |
+
+These are the production RTL's, after the second area pass
+([`AREA_PLAN.md`](plans/AREA_PLAN.md) §6.2, 2026-10-24); the pass traded
+some of Matmul's and Conv's out-of-context slack for area (+0.115 and
++0.026 ns before) and gave the row-ops unit some (−0.027 ns before).
 
 In context the five kernels share the device, the interconnects and the
-paths to the PS.  The whole design closes 4 ns with +0.027 ns (§8.4).  The
+paths to the PS.  The whole design closes 4 ns with +0.040 ns (§8.4).  The
 50 MHz between the out-of-context target and the in-context clock is the
-margin that cross-die routing in the full design consumes.
+margin that routing across the full, almost-full device consumes.
 
 ### 3.3 Clock-domain crossings
 
-Inside the PL there are none.  Every flip-flop, BRAM, URAM and DSP of the
-kernels and interconnects is on `clk_out1`.  Vivado's inter-clock timing
-table is empty, `report_cdc` on the routed design reports no crossing, and
-the methodology report has no `TIMING-*` or CDC warning.
+Inside the kernels there are none.  Every flip-flop, BRAM, URAM and DSP of
+the kernels and their interconnects is on `clk_out1`, and Vivado's clock
+interaction table has no path between `clk_out1` and any other clock.
 
-Every crossing is in hardened PS logic:
+The camera capture path has crossings, all inside Xilinx IP:
+
+| crossing | where | constraint (the IPs' own XDC) |
+|---|---|---|
+| `clk_pl_0` ↔ `cap_clk` | `cap_smc`'s asynchronous FIFOs toward the frame buffer's registers (on the video clock), the receiver's register bank, the reset synchronisers | `set_max_delay -datapath_only` |
+| byte clock → `cap_clk` | inside the CSI-2 receiver's encrypted core (42 clock-enable-controlled crossings) | `set_max_delay -datapath_only` |
+| byte clock ↔ `clk_pl_0`, the D-PHY's PLL ↔ `cap_clk` | the receiver's status and control | false paths |
+
+`report_cdc` on the routed design counts 234 crossing endpoints, all
+safe: none unsafe, none unknown, every one with `ASYNC_REG` where it needs
+it.  The methodology report's two warnings from the path are LUTAR-1, a LUT
+driving the reset of an XPM synchroniser inside the receiver IP, and
+TIMING-18, the I²C pads without I/O delays (§6.6).
+
+At the PS–PL boundary the crossings are in hardened PS logic:
 
 | crossing | between | mechanism |
 |---|---|---|
 | `S_AXI_HPC0/HPC1/HP0/HP2_FPD` | `clk_out1` and the PS's FPD interconnect clock | the ports' AFI FIFOs (asynchronous, in the PS) |
 | `M_AXI_HPM0_FPD` | the FPD clock and `clk_out1` | the same, in the master direction |
-| `pl_ps_irq0[4:0]` | `clk_out1` and the GIC | level signals held until software clears the kernel's ISR, so a synchroniser cannot miss one |
+| `S_AXI_HP3_FPD`, `M_AXI_HPM0_LPD` | `cap_clk` / `clk_pl_0` and the PS | the same, for the camera path |
+| `pl_ps_irq0[4:0]`, `pl_ps_irq1` | `clk_out1` / the camera's clocks and the GIC | level signals held until software clears the source, so a synchroniser cannot miss one |
 | `pl_resetn0` | the PS and `clk_out1` | `rst_ps8_0_99M` synchronises its release (§3.4) |
+| EMIO GPIO 0 / 1 | the PS and `cap_clk` / the ISP | quasi-static resets that software changes while the stream is stopped (§3.4) |
 
-Because there is one domain, the design needs no synchroniser cells, no
-`ASYNC_REG`, no `set_clock_groups` and no `set_max_delay -datapath_only`.
-A future second clock (for example a slower clock for a low-power mode)
-would need all of these; §8.2 lists what the constraints would have to
-gain.
+Because the kernels have one domain, their RTL needs no synchroniser cells,
+no `ASYNC_REG`, no `set_clock_groups` and no `set_max_delay -datapath_only`.
+A second clock inside the kernels (for example a slower clock for a
+low-power mode) would need all of these; §8.2 lists what the constraints
+would have to gain.
 
 ### 3.4 Reset
 
@@ -427,14 +504,25 @@ flowchart LR
   REG --> UNIT["per-unit registered resets<br/>and job resets"]
 ```
 
-- **Sources.**  `pl_resetn0` is the only reset source, from the PS and
-  active low.  It resets the MMCM and is the external reset of the
+- **Sources.**  `pl_resetn0` is the kernels' only reset source, from the PS
+  and active low.  It resets the MMCM and is the external reset of the
   `proc_sys_reset` instance.  The MMCM's `locked` holds the reset block
   until the clock is stable.
 - **Distribution.**  One output, `peripheral_aresetn`, synchronised to
   `clk_out1`, resets the five kernels, the four data interconnects and the
   SmartConnect.  `interconnect_aresetn` is unused, and the interconnects take
   the peripheral reset.
+- **The camera path's resets** are its own.  `cap_rst_lite` (on `clk_pl_0`,
+  from `pl_resetn0`) resets its control side, and `cap_rst_video` (on
+  `cap_clk`, from `pl_resetn0` and `cap_clk`'s `locked`) the receiver's video
+  side, the FIFO and the converter.  Two EMIO GPIOs are software resets that
+  Linux drives through the overlay's `reset-gpios`:
+  - GPIO 0 (Linux GPIO 78) is the frame buffer's `ap_rst_n`, toggled by the
+    frame-buffer driver; it is not synchronised to `cap_clk` (as in AMD's
+    platform), so it must only change while the IP is idle.  It reaches its
+    1 134 loads through a global buffer.
+  - GPIO 1 (Linux GPIO 79) leaves the device as the ISP's reset pin,
+    `ap1302_rst_b`.
 - **Inside the kernels: synchronous only.**  No always block has a reset in
   its sensitivity list.  Each kernel registers `rst <= !ap_rst_n` once, marks
   it `(* keep *)` with a `max_fanout`, and builds a register tree from it.
@@ -471,14 +559,22 @@ of the bitstream is loaded, at run time:
    overlay only when no overlay applied later touches the same nodes
    ("overlay #N is not topmost"), while configfs reports success either way;
    a refused removal would leave the old overlay in the live tree, so the
-   script stops and asks for a reboot.  (The R5's `rpu` and `rpu-ipi`
-   overlays touch none of these nodes and stay.)
+   script stops and asks for a reboot.  The R5's `rpu` and `rpu-ipi`
+   overlays refuse it the same way: they are applied when the chat server or
+   `rpu_board.py` starts the firmware and stay after it stops, and since every
+   overlay here adds to `/__symbols__` the kernel will not remove ours from
+   under them ("#2 overlaps with #4 @/__symbols__", 2026-10-28).  Once the R5
+   has run, a reload needs a reboot (§9).
 3. Linux's FPGA manager programs the PL.  The script checks the state reads
    "operating".
 4. It loads a memory-topology-only xclbin into XRT's `zocl`, for the buffer
    objects.
-5. It applies the device-tree overlay (`design_cormorant.dtbo`): five UIO
-   nodes, `zocl`, and the `afi0` node.  It then checks that every UIO
+5. It applies the device-tree overlay: `design_cormorant_capture.dtbo` on
+   the production bitstream (five UIO nodes, `zocl`, the `afi0` node, and
+   the camera's media pipeline — the receiver, the frame buffer, the I²C
+   controller and the AP1302 behind it, whose driver then loads the ISP's
+   firmware over I²C, about 2 s), or `design_cormorant.dtbo` without the
+   camera.  It then checks that every UIO
    device holds the interrupt the overlay gives it; a device that kept an
    old one is rebound once.
 6. It writes the AFI port-width registers last, because applying the overlay
@@ -525,9 +621,11 @@ The kernels are those of the second area pass
 capture path's six RAMB36 are the frame-buffer writer's line buffers (4) and
 the CSI-2 receiver's (2), its URAM the receiver's.
 
-Every RAM is inferred from RTL (`report_ram_utilization`: 100 % inferred,
-no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
-`(* rom_style *)` attributes (39 in the RTL).  The rule is:
+Every RAM of the kernels is inferred from their RTL, with no XPM or IP
+memories; the camera path's IPs build theirs from XPM macros
+(`report_ram_utilization` counts both as inferred: 100 %).  In the kernels the
+primitive is chosen with `(* ram_style *)` / `(* rom_style *)` attributes (41
+in the RTL).  The rule is:
 - block RAM for FIFOs deep enough to cover the DDR latency;
 - URAM for large single-purpose stores;
 - distributed RAM for shallow or wide-and-shallow buffers that need an
@@ -642,7 +740,9 @@ Arbitration happens at two levels:
    gives every slot 2.
 2. **In the PS.**  HPC0 and HPC1 reach DDR through the CCI-400, where they
    compete with the A53's traffic.  HP0 and HP2 go straight to the DDR
-   controller's ports.
+   controller's ports, and so does HP3, the camera's frame buffer (a
+   640 × 480 NV12 stream at 30 frames a second is 14 MB/s, 1920 × 1080 at 30
+   is 93 MB/s: nothing beside the kernels' GB/s).
 
 The assignment of kernel ports to PS ports is measured, not designed
 (PS_PORTS_PLAN, DEPTHWISE_PLAN §8.5, HOSTOPS_PLAN phase 3):
@@ -759,8 +859,13 @@ At system level, the latency budget of a kernel call includes the driver:
 - **From the R5:** each call adds 1.0 µs.
 
 The scheduler's performance model prices every call from these and from
-per-family fits measured on the board.  It predicts whole-model latency
-within ±2 % ([`doc/plans/TACTICS_PLAN.md`](plans/TACTICS_PLAN.md) §9).
+per-family fits measured on the board.  When it was built it predicted every
+measured workload within 2 % but SmolLM2-360M (−2.6 … −6.0 %)
+([`doc/plans/TACTICS_PLAN.md`](plans/TACTICS_PLAN.md) §9).  The later checks
+(`inference-scheduler/perf_models/README.md`) keep the CNNs and BERT within
+0.4 %, but put the chat libraries 2.5–6.3 % and Moonshine's 128 / 256-frame
+buckets 5–6 % under the board, and the Piper chunk 4.3 % over: the host-op
+model predates the A53's interrupt waits, and a re-profile is open (§9).
 
 ---
 
@@ -796,6 +901,9 @@ declared in each IP's packaging (`kernels/<k>_rtl/syn/package_ip.tcl`), as
 the HLS exports declared them.  The interconnects size their slots from
 them.  The fact registry entry `rtl.axi_masters` checks the declarations
 against each kernel's package constants.
+
+The camera path adds one more master, apart from the kernels: the frame
+buffer's `m_axi_mm_video` (128-bit, write-only) into `S_AXI_HP3_FPD` (§6.6).
 
 ### 6.2 AXI4-Lite control slaves and register maps
 
@@ -845,6 +953,16 @@ five lines are concatenated into `pl_ps_irq0[4:0]`:
 | PoolingKernel | 3 | 92 | 124 | the A53's and the R5's waits |
 | RowOpsKernel | 4 | 93 | 125 | the A53's and the R5's waits |
 
+The camera path's three lines go to `pl_ps_irq1` through their own
+concatenation (`cap_irq`), owned by the Linux drivers of its overlay:
+
+| source | `pl_ps_irq1` bit | SPI | GIC id | driver |
+|---|---:|---:|---:|---|
+| `cap_csi` (CSI-2 receiver) | 0 | 104 | 136 | `xilinx-csi2rxss` |
+| `cap_fb` (frame buffer) | 1 | 105 | 137 | `xilinx-frmbuf` |
+| — (tied 0) | 2 | 106 | 138 | |
+| `cap_iic` (AXI I²C) | 3 | 107 | 139 | `xiic-i2c` |
+
 Both processors use the same record, ISR bit 0 (IER bit 0 set), and raise
 GIE only while they wait.  The R5 sets GIE on a lane before the lane's first
 start in a batch and clears it at the end of the batch.  The A53, when it
@@ -893,8 +1011,12 @@ handler only masks the line.
 
 ### 6.5 AXI4-Stream
 
-None.  The kernels exchange data only through DDR (§2.2), and inside a
-kernel the stages are connected by valid / ready FIFOs, not AXI4-Stream.
+None in the kernels.  They exchange data only through DDR (§2.2), and inside
+a kernel the stages are connected by valid / ready FIFOs, not AXI4-Stream.
+The camera path is a video stream: the CSI-2 receiver's AXI4-Stream video
+output (two YUV 4:2:0 8-bit pixels a beat, `tuser` start of frame, `tlast`
+end of line) through a 512-deep `axis_data_fifo` and an
+`axis_subset_converter` (32 → 48-bit `tdata`) into the frame-buffer writer.
 
 ### 6.6 Pins, I/O standards and termination
 
@@ -910,7 +1032,8 @@ The block design's camera capture path (since 2026-10-27,
 `b4e63457057a`) is the first to do so: 14 bonded IOBs — the AR1335 / AP1302
 camera's 4-lane MIPI CSI-2 link on bank 66 (clock G1, data E1 F2 G3 E4:
 5 differential inputs into the receiver's RX bitslices, 100 Ω termination),
-its I²C (G11 / F10, LVCMOS33) and the ISP's reset and standby (J11 / J10) —
+its I²C (G11 / F10, LVCMOS33) and the ISP's reset and standby (J11 / J10),
+these four on HD bank 45 —
 constrained in `cormorant_hw_128.srcs/constrs_1/new/capture.xdc` and the
 receiver IP's own constraints.  The I²C pads have no input or output delays
 (Vivado's TIMING-18, §8.4): the bus runs at 400 kHz.  The path runs on its own 200 MHz MMCM, its
@@ -934,9 +1057,10 @@ Every level is checked bit-exactly against the level above it:
 | DSP primitives | ConvKernel's behavioural MAC chain | Vivado's DSP48E2 unisim model, cycle by cycle (199 899 cycles, 0 mismatches) | ctest `ConvRtlDsp` |
 | synthesised netlist | Matmul, VectorOP, Pool | their RTL in lockstep, in xsim | `neteq_<k>_rtl` (`tools/neteq`) |
 | packaged IP | each kernel's IP but the row-ops unit's, in the test stand's block design (PS VIP, interconnect, DDR model) | the checked-in fixtures | `behavior_test_<k>`, `sysim_<k>_rtl` (`hw/cormorant_test_stand`) |
-| whole block design | the production block design with all five kernels and the PS VIP | per-kernel constant-fill cases and the row-ops fixtures, 123 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
+| whole block design | the production block design with all five kernels and the PS VIP (the camera path is in it but not exercised: no MIPI stimulus) | per-kernel constant-fill cases and the row-ops fixtures, 123 cases | `sim_hw_kv260` (`hw/cormorant_hw_128` sim_1) |
 | generated software | the generated C against software kernels | the scheduler's simulator | `inference-scheduler/test/host_emu.py`, also with incoherent caches |
 | the board | the bitstream and the libraries | the simulator's expectations, bit for bit | `run_remote_tests.py` (the model suite), every demo and library gate |
+| the camera path | the AR1335 stream through the receiver and the frame buffer into DDR | whole NV12 frames of the requested size (`v4l2-ctl` writes w × h × 3 / 2 bytes a frame), classified live | `demo/camera` with `camera.source` `mipi` |
 | the R5 path | the R5-driven runs | the A53-driven runs, bit for bit | `rpu_board.py`, `llm_board.py --rpu r5` |
 | the A53's interrupt waits | the A53 sleeping on the kernels' interrupts | the A53 polling, bit for bit | `rpu_board.py --mode irq` |
 
@@ -1018,7 +1142,7 @@ changes to the benches.
 ### 7.4 On-chip debug and observability
 
 The production design has no debug cores: no ILA, VIO or debug bridge, and
-no `mark_debug` nets.  With block RAM at 94 % and 27 ps of slack, an ILA
+no `mark_debug` nets.  With block RAM at 98.6 % and 40 ps of slack, an ILA
 would cost both.  Observability comes from what the system already exposes:
 
 | means | what it shows |
@@ -1070,19 +1194,23 @@ new register, while the hardware description and the drivers showed it.
 
 | constraint | where | content |
 |---|---|---|
-| primary clock | the PS IP's generated XDC | `create_clock` on `pl_clk0` (10 ns) |
-| generated clock | derived by Vivado from the MMCM | `clk_out1`, 4 ns |
+| primary clocks | the PS IP's generated XDC; the receiver IP's XDC | `create_clock` on `pl_clk0` (10 ns) and `pl_clk1`; on the camera's clock lane `mipi_phy_if_clk_p` (2.232 ns) |
+| generated clocks | derived by Vivado | `clk_out1` (4 ns) from `clk_wiz_0`; `cap_clk`'s 200 MHz, the D-PHY PLL's clocks and the byte clock from the camera path |
 | user XDC | `cormorant_hw_128.srcs/constrs_1/new/kernel_clock.xdc` | `MAX_FANOUT 32` on the `s_ready_i_reg` of the `m00` register slices of `axi_interconnect_0` and `axi_rowops_intercon` |
-| I/O delays | — | none: the PL has no pins |
-| false paths, multicycle paths, clock groups, max delay | — | none: one clock domain, and `clk_pl_1` has no loads |
-| RTL attributes | `kernels/*_rtl/rtl/*.sv` | `(* keep *)` 59, `(* keep, max_fanout *)` 5, `(* max_fanout *)` 7, `(* ram_style *)` 37, `(* rom_style *)` 2, `(* shreg_extract *)` 4, `(* srl_style *)` 1, `(* use_dsp *)` 1 |
+| user XDC | `cormorant_hw_128.srcs/constrs_1/new/capture.xdc` | the camera's 14 pins: `PACKAGE_PIN`; `DIFF_TERM_ADV TERM_100` on the MIPI pins (the receiver IP gives them `MIPI_DPHY_DCI`); `LVCMOS33` on the four bank-45 pins |
+| I/O delays | — | none: the MIPI inputs are timed inside the receiver's bit slices, and the I²C, reset and standby pins are slow (Vivado's TIMING-18 on the I²C pads) |
+| false paths, max delay | the camera IPs' own XDC | false paths into the XPM synchronisers' first stages and from the frame buffer's configuration registers; `set_max_delay -datapath_only` (5–30 ns) on the Gray-code and handshake buses of the crossings (§3.3) |
+| false paths, multicycle paths, clock groups, max delay in the kernels | — | none: one clock domain, and `clk_pl_1` has no loads |
+| RTL attributes | `kernels/*_rtl/rtl/*.sv` | `(* keep *)` 59, `(* keep, max_fanout *)` 5, `(* max_fanout *)` 6, `(* ram_style *)` 39, `(* rom_style *)` 2, `(* shreg_extract *)` 3, `(* srl_style *)` 2, `(* use_dsp *)` 6 (Matmul's drain: the lane sums in DSPs, the tap sums kept out of them) |
 
-The design is timed entirely by the single generated clock.  If a second PL
-clock is ever added, the constraints must gain:
+The kernels are timed entirely by their single generated clock.  If a second
+clock is ever added to them, the constraints must gain:
 - `set_clock_groups -asynchronous` (or explicit `set_max_delay
   -datapath_only` on each crossing);
 - `ASYNC_REG` on the synchroniser flip-flops;
 - the XPM CDC macros for the crossings themselves.
+
+The camera path's IPs already bring exactly these for their own clocks.
 
 ### 8.3 RTL rules for timing closure
 
@@ -1144,10 +1272,12 @@ PoolingKernel's reader lanes (`mode` → `accd`), ConvKernel's x loader
 into its write FIFO's block-RAM enable.  None is in the capture path, which
 runs on its own clock.
 
-The area pass moved the worst paths out of the HPC1 crossbar and ConvKernel's
-DSP-chain operand skew (on `1cedaf2ed816`: 0.020–0.061 ns over the
-`axi_mem_intercon` address arbiter, the row-ops unit's write FIFO, ConvKernel's
-URAM write data and operand skew, the NORM DSP inputs).
+The first area pass (`de968ccc45da`) had moved the worst paths out of the
+HPC1 crossbar and ConvKernel's DSP-chain operand skew (on `1cedaf2ed816`:
+0.020–0.061 ns over the `axi_mem_intercon` address arbiter, the row-ops
+unit's write FIFO, ConvKernel's URAM write data and operand skew, the NORM
+DSP inputs).  On `b4e63457057a` the HPC1 crossbar leads again, now through
+its s00 register slice instead of the address arbiter.
 
 No single unit dominates.  The next addition will have to find its slack
 across the design, not in one place.
@@ -1230,8 +1360,10 @@ models and baselines apply.
 
 The main repository pins their commits.  The kernels' RTL, packaging
 scripts and drivers live in the main repository.  Each production bitstream
-is archived with its build log, hardware description, timing and
-utilization reports and overlay in `/mnt/data/bitstreams/kv260_250_<id>/`.
+is archived with its build log, hardware description, and timing and
+utilization reports in `/mnt/data/bitstreams/kv260_250_<id>/`; since
+`b4e63457057a` also with its overlays and its hierarchical utilization,
+power, clock and CDC reports.
 The local, untracked `inference-scheduler/bitstream_config_kv260.json` (from
 its `.json.example`) names the `.bit` the tools load.
 
@@ -1257,18 +1389,37 @@ A new bitstream is promoted to production in this order:
 1. its board correctness suite passes;
 2. its performance model is measured (`perf_calibrate.py`);
 3. its baselines are recorded;
-4. the chat server's libraries are regenerated against it.
+4. the chat server is redeployed with its bundle (the bitstream and overlay
+   its unit loads after a boot) and the R5 firmware of its BSP; its libraries
+   are regenerated only when the kernels' calls or registers changed.
+`b4e63457057a`, whose kernels run every call as fast as `04259a7af917`'s,
+needed no regeneration ([`AREA_PLAN.md`](plans/AREA_PLAN.md) §6.5).
 
 ---
 
 ## 9. Known issues and open items
 
-- **Resource headroom** (§8.5).  BRAM 94 %, URAM 89 %, 99.8 % of the CLBs in
-  use, and +0.027 ns of slack.  The next kernel feature has to recover area or move
-  storage to LUTRAM.
+- **Resource headroom** (§8.5).  BRAM 98.6 % (two tiles left), URAM 90.6 %,
+  98.2 % of the CLBs in use, and +0.040 ns of slack.  The next kernel
+  feature has to recover area or move storage to LUTRAM; the camera path
+  took six BRAM tiles and one URAM.
 - **`pl_clk1`** is enabled in the PS configuration and drives nothing.
-- **Clocking advisories.**  The MMCM could be a PLLE4 (CLKC-40) and has no
-  LOC (CLKC-56).  Neither costs timing today.
+- **Clocking advisories.**  Each MMCM could be a PLLE4 (CLKC-40), and
+  neither they nor the D-PHY's PLL have a LOC (CLKC-56, CLKC-58).  None
+  costs timing today.
+- **The camera path's warnings** come with its IPs: LUTAR-1 inside the CSI-2
+  receiver's reset synchroniser, TIMING-18 on the I²C pads (§3.3, §6.6).
+  Its frame-buffer reset is a software GPIO, not synchronised to its clock
+  (§3.4).
+- **A PL reload after the R5 has run needs a reboot** (§3.5).  The R5's
+  `rpu` / `rpu-ipi` overlays stay applied after the firmware stops, and the
+  kernel refuses to remove the kernels' overlay from under them.  Removing
+  them first, once the firmware is stopped, would avoid the reboot; neither
+  loader does yet.
+- **The host-op timing model** predates the A53's interrupt waits: the
+  simulator puts the chat libraries and Moonshine's short buckets 2.5–6.3 %
+  under the board (§5.4).  A re-profile (`perf_calibrate.py host --merge`)
+  is open.
 - **Verification gaps.**  ConvKernel and the row-ops unit have no
   netlist-equivalence target.  No functional or code coverage is measured
   (§7.3).

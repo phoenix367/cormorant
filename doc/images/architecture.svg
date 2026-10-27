@@ -161,8 +161,8 @@
 <text x="1093.8" y="1163.6" font-size="13.5" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">4 GB DDR4</text>
 <text x="1093.8" y="1180.4" font-size="13.5" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">1.4 GB CMA</text>
 <rect x="1195.2" y="1142.0" width="174.8" height="60.0" rx="4" fill="#e1e1e3"/>
-<text x="1282.6" y="1163.6" font-size="13.5" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">AXI HPC0/1 · HP0/2</text>
-<text x="1282.6" y="1180.4" font-size="13.5" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">4 × 128-bit ports</text>
+<text x="1282.6" y="1163.6" font-size="13.5" font-weight="bold" fill="#1f2328" text-anchor="middle" dominant-baseline="central">AXI HPC0/1 · HP0/2/3</text>
+<text x="1282.6" y="1180.4" font-size="13.5" font-weight="normal" fill="#1f2328" text-anchor="middle" dominant-baseline="central">5 × 128-bit, 1 camera</text>
 <rect x="210.0" y="1238.0" width="1180.0" height="44.0" rx="4" fill="#e6dcfb"/>
 <text x="800.0" y="1260.0" font-size="16" font-weight="500" fill="#5b3fc4" text-anchor="middle" dominant-baseline="central">Bitstream and device-tree overlay — Vivado block design (hw/cormorant_hw_128)</text>
 <rect x="40.0" y="374.0" width="70.0" height="908.0" rx="4" fill="#9d174d"/>

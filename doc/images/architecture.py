@@ -228,7 +228,7 @@ text(L + 20, y + 62, "Zynq UltraScale+ K26", 13.5, "#4b5563", anchor="start")
 chips(L + 230, y + 18, R - L - 250, 60, [
     ["Programmable logic", "kernels at 250 MHz"], ["4 × Cortex-A53", "Linux · host ops"],
     ["Cortex-R5", "drives the kernels"], ["4 GB DDR4", "1.4 GB CMA"],
-    ["AXI HPC0/1 · HP0/2", "4 × 128-bit ports"]],
+    ["AXI HPC0/1 · HP0/2/3", "5 × 128-bit, 1 camera"]],
     BOARD_CHIP, TITLE, gap=14, size=13.5, bold_first=True)
 hw_bot = y + 96
 y = hw_bot + 18
