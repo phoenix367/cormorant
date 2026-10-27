@@ -92,7 +92,9 @@ and outlives its overlay, and since it defines `afi0` / `zyxclmm_drm` like
 ours, the kernel refuses to remove our older overlay under it ("not
 topmost": the old overlay stays in the live tree).  PYNQ was removed from
 this board on 2026-10-13 (backup: `/mnt/data/board_backups/kv260_pynq_2026-10-13.tar`).
-The loader still removes `pynq` before its own overlay, stops on any
+The loader still removes `pynq` before its own overlay, and the Cortex-R5's
+`rpu` / `rpu-ipi` overlays applied after it (they stay when the firmware stops;
+while it runs the loader stops before uploading), stops on any
 refused removal (reboot, then run again), unbinds a foreign UIO device at
 one of our addresses, and after applying checks every UIO node's
 interrupt against the overlay (a stale device is rebound); if

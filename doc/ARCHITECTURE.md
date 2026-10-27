@@ -560,11 +560,15 @@ of the bitstream is loaded, at run time:
    ("overlay #N is not topmost"), while configfs reports success either way;
    a refused removal would leave the old overlay in the live tree, so the
    script stops and asks for a reboot.  The R5's `rpu` and `rpu-ipi`
-   overlays refuse it the same way: they are applied when the chat server or
-   `rpu_board.py` starts the firmware and stay after it stops, and since every
-   overlay here adds to `/__symbols__` the kernel will not remove ours from
-   under them ("#2 overlaps with #4 @/__symbols__", 2026-10-28).  Once the R5
-   has run, a reload needs a reboot (§9).
+   overlays would refuse it the same way: they are applied when the chat
+   server or `rpu_board.py` starts the firmware and stay after it stops, and
+   since every overlay here adds to `/__symbols__` the kernel will not remove
+   ours from under them ("#2 overlaps with #4 @/__symbols__", 2026-10-28).
+   So the loader (and the chat unit's `fpga_load.py`) removes the ones applied
+   after ours first, newest first — the live phandles of their labelled nodes
+   give the order, since the kernel numbers an overlay's phandles above every
+   earlier one and configfs keeps no order — and the firmware's next start
+   applies them again.  While the firmware runs it stops before uploading.
 3. Linux's FPGA manager programs the PL.  The script checks the state reads
    "operating".
 4. It loads a memory-topology-only xclbin into XRT's `zocl`, for the buffer
@@ -1411,11 +1415,6 @@ needed no regeneration ([`AREA_PLAN.md`](plans/AREA_PLAN.md) §6.5).
   receiver's reset synchroniser, TIMING-18 on the I²C pads (§3.3, §6.6).
   Its frame-buffer reset is a software GPIO, not synchronised to its clock
   (§3.4).
-- **A PL reload after the R5 has run needs a reboot** (§3.5).  The R5's
-  `rpu` / `rpu-ipi` overlays stay applied after the firmware stops, and the
-  kernel refuses to remove the kernels' overlay from under them.  Removing
-  them first, once the firmware is stopped, would avoid the reboot; neither
-  loader does yet.
 - **The host-op timing model** predates the A53's interrupt waits: the
   simulator puts the chat libraries and Moonshine's short buckets 2.5–6.3 %
   under the board (§5.4).  A re-profile (`perf_calibrate.py host --merge`)

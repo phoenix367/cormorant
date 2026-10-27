@@ -250,8 +250,14 @@ device tree for good, and a new one would land on top of it with its UIO
 devices keeping their old interrupts.  PYNQ's login-shell overlay defines
 `afi0` and `zyxclmm_drm` like ours, so step 5 removes it first; any other
 refusal stops the upload with `The kernel refused to remove overlay …`:
-reboot the board and run again.  (The R5's `rpu` and `rpu-ipi` overlays touch
-none of these nodes and stay.)
+reboot the board and run again.  The Cortex-R5's `rpu` and `rpu-ipi` overlays
+(applied when its firmware starts, left when it stops) refuse ours the same
+way, since every overlay adds to `/__symbols__`: step 5 removes the ones
+applied after ours first, newest first — the live phandles of their labelled
+nodes give the order, configfs keeps none — and the firmware's next start
+applies them again.  While the firmware runs, the upload stops after step 3
+with `The Cortex-R5 firmware is running …`: stop it first
+(`demo/chat/deploy.py --stop`).
 
 Step 5 removes only an overlay of the same name (and `pynq`).  If the
 same design is already loaded under another overlay name (e.g. `pl`), its

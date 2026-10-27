@@ -16,6 +16,7 @@ from .board import (
     _OVERLAYS_DIR,
     upload_file,
     remove_overlay,
+    r5_overlays_above,
     load_bitstream,
     fpga_state,
     read_fclk_hz,
@@ -52,10 +53,13 @@ def upload_bitstream(
       3  Build xclbin with MEM_TOPOLOGY via xclbinutil
       4  Upload .bin → /lib/firmware/<overlay_name>.bin — unless no overlay of
          that name is applied and another one provides the kernels' UIO
-         devices: then stop with nothing uploaded (check_kernels_free)
-      5  Remove a `pynq` overlay, then any existing overlay of ours (each
-         removal checked in the kernel log); stop when another overlay still
-         provides the kernels' UIO devices (check_kernels_free)
+         devices, or the Cortex-R5 firmware runs with its overlays above ours:
+         then stop with nothing uploaded (check_kernels_free, r5_overlays_above)
+      5  Remove a `pynq` overlay, the Cortex-R5's overlays applied after ours
+         (newest first; its firmware's next start applies them again), then
+         any existing overlay of ours (each removal checked in the kernel
+         log); stop when another overlay still provides the kernels' UIO
+         devices (check_kernels_free)
       5b Check PL0 (fclk0) = the HWH's PL0 frequency, set it if not
       6  Load bitstream via fpga_manager
       7  Verify fpga_manager state == "operating"
@@ -110,6 +114,8 @@ def upload_bitstream(
     # again once an overlay of the same name is removed)
     if overlay_name not in list_overlays(session):
         check_kernels_free(session, dtbo_path, overlay_name)
+    # the Cortex-R5's overlays above ours (step 5 removes them): stop here while its firmware runs
+    r5_above = r5_overlays_above(session, overlay_name, dtbo_uio_nodes(dtbo_path)[0].split("@", 1)[0])
 
     print(f"\n{_bold('Step 4')}   Uploading → {remote_bin}")
     with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
@@ -126,8 +132,12 @@ def upload_bitstream(
     # (/etc/profile.d/pynq_venv.sh → pynq-dts/insert_dtbo.py).  It defines
     # afi0 and zyxclmm_drm, nodes ours has too, so once it sits above ours
     # the kernel refuses to remove ours ("overlay #N is not topmost"): remove
-    # it first.  remove_overlay stops on a refusal.
+    # it first.  The Cortex-R5's overlays stay after its firmware stops and refuse
+    # ours the same way (every overlay adds to /__symbols__): the ones applied after
+    # ours go first, newest first.  remove_overlay stops on a refusal.
     remove_overlay(session, "pynq")
+    for name in r5_above:
+        remove_overlay(session, name)
     remove_overlay(session, overlay_name)
     check_kernels_free(session, dtbo_path, overlay_name)
 

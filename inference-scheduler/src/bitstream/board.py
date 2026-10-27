@@ -75,6 +75,60 @@ def remove_overlay(session: RemoteSession, overlay_name: str) -> None:
         raise RuntimeError(f"Failed to remove overlay '{overlay_name}': {out.strip()}")
 
 
+# The Cortex-R5's overlays (rpu_board.firmware_up_script applies them when its firmware
+# starts; they stay when it stops), each with a label its .dts defines.
+R5_OVERLAYS = (("rpu", "tcm_0a"), ("rpu-ipi", "rpu_ipi"))
+_REMOTEPROC = "/sys/class/remoteproc"
+_LIVE_DT = "/sys/firmware/devicetree/base"
+
+
+def r5_overlays_above(session: RemoteSession, overlay_name: str, label: str) -> list[str]:
+    """The Cortex-R5's overlays applied after ours (``overlay_name``, whose
+    nodes include the one labelled ``label``), newest first: the ones to remove
+    before ours, since every overlay adds to /__symbols__ and the kernel
+    refuses to remove ours from under them (``node_overlaps_later_cs: #2
+    overlaps with #4 @/__symbols__``).  The firmware's next start applies them
+    again.  configfs keeps no order (its directories' times are refreshed), but
+    the kernel gives an overlay's nodes phandles above every one before it, so
+    the live phandles of the labelled nodes order the overlays.  Raises while
+    the firmware runs (it drives the kernels) and when a phandle is missing."""
+    names = [overlay_name] + [n for n, _ in R5_OVERLAYS]
+    labels = [label] + [lb for _, lb in R5_OVERLAYS]
+    out, _, _ = session.exec(
+        f"O={_OVERLAYS_DIR}; S={_LIVE_DT}/__symbols__; "
+        f"for n in {' '.join(names)}; do [ -d \"$O/$n\" ] && echo \"overlay $n\"; done; "
+        f"for l in {' '.join(labels)}; do [ -f \"$S/$l\" ] && p=$(tr -d '\\0' < \"$S/$l\") "
+        f"&& [ -f \"{_LIVE_DT}$p/phandle\" ] && echo \"phandle $l $(od -An -tu4 --endian=big "
+        f"\"{_LIVE_DT}$p/phandle\" | tr -d ' ')\"; done; "
+        f"for f in {_REMOTEPROC}/remoteproc*/state; do [ -f \"$f\" ] && echo \"state $(cat \"$f\")\"; done; true",
+        timeout=10)
+    present, phandle, states = set(), {}, []
+    for ln in out.splitlines():
+        w = ln.split()
+        if len(w) == 2 and w[0] == "overlay":
+            present.add(w[1])
+        elif len(w) == 3 and w[0] == "phandle" and w[2].isdigit():
+            phandle[w[1]] = int(w[2])
+        elif len(w) == 2 and w[0] == "state":
+            states.append(w[1])
+    r5 = [(n, lb) for n, lb in R5_OVERLAYS if n in present]
+    if overlay_name not in present or not r5:
+        return []
+    missing = [lb for lb in [label] + [lb for _, lb in r5] if lb not in phandle]
+    if missing:
+        raise RuntimeError(
+            f"Cannot tell whether the Cortex-R5's overlays ({', '.join(n for n, _ in r5)}) sit above "
+            f"'{overlay_name}': no live phandle for {', '.join(missing)}.  Reboot the board, then run again.")
+    above = sorted((n for n, lb in r5 if phandle[lb] > phandle[label]),
+                   key=lambda n: phandle[dict(R5_OVERLAYS)[n]], reverse=True)
+    if above and "running" in states:
+        raise RuntimeError(
+            f"The Cortex-R5 firmware is running, and its overlays ({', '.join(above)}) sit above "
+            f"'{overlay_name}': stop it first (demo/chat/deploy.py --stop, or "
+            f"echo stop > {_REMOTEPROC}/remoteproc0/state), then run again.")
+    return above
+
+
 def load_bitstream(session: RemoteSession, bin_name: str) -> None:
     """Write flags=0 and the .bin filename to the fpga_manager sysfs interface."""
     for cmd in [

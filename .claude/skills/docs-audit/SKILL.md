@@ -48,8 +48,8 @@ code changes; B when build / setup paths, repo contents (new files,
    and fixed by `python3 tools/facts/facts.py check` / `fix`; add a count
    you find repeated in several docs to the registry:
    ```bash
-   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1886: all pass, 0 skip
-   cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 252
+   cd inference-scheduler && .venv/bin/python -m pytest test/ -q                # 1893: all pass, 0 skip
+   cd .. && inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 257
    python3 $S/scripts/audit_facts.py counts --run   # no CHECK line left that is a stale count
    git diff --stat -- ':!*.md'                      # empty: docs only
    ```

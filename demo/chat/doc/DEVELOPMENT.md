@@ -114,7 +114,7 @@ transcript); see `moonshine_backend.py`.
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 252 tests, ~45 s
+python3 -m unittest -v                  # 257 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 

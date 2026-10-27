@@ -6,7 +6,7 @@ machine without an FPGA.
 
 | Layer | Needs | What it validates |
 |-------|-------|-------------------|
-| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1886 tests); the chat app (252 tests) |
+| 1. **Python unit tests** | nothing | Inference scheduler correctness — codegen, DAG, layout, simulation, host ops, Llama / ViT ops, planning (1893 tests); the chat app (257 tests) |
 | 2. **HLS C-sim** | gcc/g++, CMake (Verilator for the RTL kernels) | Each kernel's C++ reference against per-test golden vectors, and the five SystemVerilog kernels in Verilator against the same fixtures (`ctest`) |
 | 3. **RTL behavioural sim** | Vitis, Vivado | Per-kernel test-stand testbenches and the block-design testbench in xsim (no board) |
 | 4. **On-device correctness** | KV260 over SSH, bitstream loaded | End-to-end model output checked against Python-simulated ground truth |
@@ -65,7 +65,7 @@ cd inference-scheduler
 # Generate all test models first (one-time step)
 .venv/bin/python test/gen_all_models.py
 
-# Run all 1886 tests in 90 modules (all pass; the first run downloads the
+# Run all 1893 tests in 90 modules (all pass; the first run downloads the
 # 435 MB bertsquad-12 model for test_bert_base.py; test_moonshine.py's
 # TestMoonshineTiny skips until demo/asr/scripts/asr_study.py fetch has fetched
 # the Moonshine checkpoints, none else — -rs prints the reason of every skip)
@@ -138,7 +138,7 @@ The chat server's tests ([`demo/chat/doc/DEVELOPMENT.md`](../../demo/chat/doc/DE
 run with the same venv, from the repo root:
 
 ```bash
-inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 252 tests
+inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q   # 257 tests
 ```
 
 About 75 of them skip in a fresh clone (80 under the system python3), until the assets they read are

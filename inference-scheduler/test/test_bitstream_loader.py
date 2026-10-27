@@ -2,15 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """upload_bitstream.py's board steps that guard the overlay stack (src/bitstream/):
-a refused overlay removal stops the upload, and a UIO device that kept an old
-interrupt is rebound — both against a fake SSH session."""
+a refused overlay removal stops the upload, the Cortex-R5's overlays above ours
+go first (and stop the upload while its firmware runs), and a UIO device that
+kept an old interrupt is rebound — against a fake SSH session."""
 
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
 
-from src.bitstream.board import parse_proc_interrupts, remove_overlay
+from src.bitstream.board import parse_proc_interrupts, r5_overlays_above, remove_overlay
 from src.bitstream.loader import check_kernels_free, check_uio_irqs, dtbo_uio_irqs, dtbo_uio_nodes
 
 REPO = Path(__file__).resolve().parents[2]
@@ -20,12 +21,15 @@ DTS = REPO / "dts" / "kv260" / "cormorant.dts"
 class FakeSession:
     """exec() answers the commands the board steps send, from a small state."""
 
-    def __init__(self, refuse=False, irqs_before=None, irqs_after=None, overlays=("pl",), uio=()):
+    def __init__(self, refuse=False, irqs_before=None, irqs_after=None, overlays=("pl",), uio=(),
+                 phandles=None, r5_state=None):
         self.refuse = refuse
         self.uio = list(uio)
         self.irqs_before = irqs_before or {}
         self.irqs_after = irqs_after if irqs_after is not None else self.irqs_before
         self.overlays = list(overlays)
+        self.phandles = phandles or {}              # {label: live phandle}
+        self.r5_state = r5_state                    # remoteproc0's state; None: no remoteproc
         self.removed = False
         self.rebound = []
         self.dmesg = ["[  100.000000] zocl-drm axi:zyxclmm_drm: client exits"]
@@ -44,6 +48,12 @@ class FakeSession:
                 self.dmesg += ["[  101.000000] OF: overlay: node_overlaps_later_cs: #2 overlaps with #5 @/axi/afi0",
                                "[  101.000100] OF: overlay: overlay #2 is not topmost"]
             return "removed\n", "", 0
+        if cmd.startswith("O=/sys/kernel/config/device-tree/overlays;"):
+            names = cmd.split("for n in ")[1].split("; do")[0].split()
+            labels = cmd.split("for l in ")[1].split("; do")[0].split()
+            out = "".join(f"overlay {n}\n" for n in names if n in self.overlays)
+            out += "".join(f"phandle {lb} {self.phandles[lb]}\n" for lb in labels if lb in self.phandles)
+            return out + (f"state {self.r5_state}\n" if self.r5_state else ""), "", 0
         if cmd.startswith("ls '/sys/kernel/config/device-tree/overlays'"):
             return "\n".join(self.overlays) + "\n", "", 0
         if cmd.startswith("for f in /sys/class/uio/uio*/name"):
@@ -74,6 +84,57 @@ class TestRemoveOverlay(unittest.TestCase):
         s = FakeSession(refuse=True, overlays=("pl", "rpu", "rpu-ipi"))
         with self.assertRaisesRegex(RuntimeError, "(?s)refused to remove overlay 'pl'.*not topmost.*Reboot"):
             remove_overlay(s, "pl")
+
+
+class TestR5Overlays(unittest.TestCase):
+    """The Cortex-R5's overlays stay after its firmware stops, and the kernel refuses
+    to remove ours from under them (2026-10-28: "#2 overlaps with #4 @/__symbols__").
+    Their order comes from the live phandles (on the board: 155 / 169 / 172)."""
+    ALL = ("k26-starter-kits_image_1", "pl", "rpu", "rpu-ipi")
+
+    def above(self, phandles, overlays=ALL, state="offline"):
+        return r5_overlays_above(FakeSession(overlays=overlays, phandles=phandles, r5_state=state),
+                                 "pl", "fabric_vecop")
+
+    def test_above_ours_newest_first(self):
+        self.assertEqual(self.above({"fabric_vecop": 155, "tcm_0a": 169, "rpu_ipi": 172}), ["rpu-ipi", "rpu"])
+
+    def test_below_ours_left(self):
+        self.assertEqual(self.above({"fabric_vecop": 200, "tcm_0a": 169, "rpu_ipi": 172}), [])
+
+    def test_only_the_ones_above(self):
+        self.assertEqual(self.above({"fabric_vecop": 170, "tcm_0a": 169, "rpu_ipi": 172}), ["rpu-ipi"])
+
+    def test_none_or_not_ours(self):
+        self.assertEqual(self.above({}, overlays=("k26-starter-kits_image_1", "pl")), [])
+        self.assertEqual(self.above({}, overlays=("k26-starter-kits_image_1", "rpu", "rpu-ipi")), [])
+
+    def test_unknown_order_stops(self):
+        with self.assertRaisesRegex(RuntimeError, "Cannot tell.*no live phandle for rpu_ipi.*Reboot"):
+            self.above({"fabric_vecop": 155, "tcm_0a": 169})
+
+    def test_running_firmware_stops(self):
+        with self.assertRaisesRegex(RuntimeError, "Cortex-R5 firmware is running.*rpu-ipi, rpu.*stop it first"):
+            self.above({"fabric_vecop": 155, "tcm_0a": 169, "rpu_ipi": 172}, state="running")
+
+    def test_upload_stops_before_upload(self):
+        """While the firmware runs nothing reaches the board's /lib/firmware, and no
+        overlay is removed."""
+        from unittest import mock
+        from src.bitstream import loader
+        s = FakeSession(overlays=self.ALL, phandles={"fabric_vecop": 155, "tcm_0a": 169, "rpu_ipi": 172},
+                        r5_state="running")
+        with mock.patch.object(loader, "bit_to_bin", return_value=b"bin"), \
+             mock.patch.object(loader, "parse_hwh_ps_params", return_value=("zynq_ultra_ps_e", {})), \
+             mock.patch.object(loader.kv260, "axi_port_width_writes", return_value=[]), \
+             mock.patch.object(loader, "parse_hwh_clocks", return_value={"pl0_mhz": 100, "kernel_mhz": 250}), \
+             mock.patch.object(loader, "build_xclbin", return_value=b"xclbin"), \
+             mock.patch.object(loader, "dtbo_uio_nodes", return_value=["fabric_vecop@a0000000"]), \
+             mock.patch.object(loader, "upload_file") as up:
+            with self.assertRaisesRegex(RuntimeError, "Cortex-R5 firmware is running"):
+                loader.upload_bitstream(s, Path("x.bit"), Path("x.hwh"), Path("x.dtbo"), "pl")
+        up.assert_not_called()
+        self.assertEqual(s.overlays, list(self.ALL))
 
 
 class TestUioIrqs(unittest.TestCase):

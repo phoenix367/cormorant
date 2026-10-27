@@ -28,8 +28,10 @@ FPGA manager is operating and every UIO node of the overlay exists; then PL0
 and the port widths are only checked (and set when they are off).  Otherwise
 — after a boot the board runs the starter-kit design; a board job may have
 loaded another bitstream — it does upload_bitstream.py's board steps
-(inference-scheduler/src/bitstream/loader.py): remove a `pynq` overlay and
-ours, check no other overlay provides the kernels, set PL0, copy the .bin to
+(inference-scheduler/src/bitstream/loader.py): remove a `pynq` overlay, the
+Cortex-R5's overlays applied after ours (they stay when its firmware stops; it
+must not run, and its next start applies them again) and ours, check no other
+overlay provides the kernels, set PL0, copy the .bin to
 /lib/firmware and program it, try the xclbin (zocl has no device before the
 overlay, so this fails as in upload_bitstream.py: logged), apply the overlay
 (after unbinding a foreign UIO device at one of its addresses), write the
@@ -58,6 +60,11 @@ FCLK0 = "/sys/devices/platform/fclk0/set_rate"
 UIO_DRV = "/sys/bus/platform/drivers/uio_pdrv_genirq"
 UIO_CLASS = "/sys/class/uio"
 INTERRUPTS = "/proc/interrupts"
+REMOTEPROC = "/sys/class/remoteproc"
+LIVE_DT = "/sys/firmware/devicetree/base"
+# the Cortex-R5's overlays (rpu_up.sh applies them when its firmware starts; they stay
+# when it stops), each with a label its .dts defines
+R5_OVERLAYS = (("rpu", "tcm_0a"), ("rpu-ipi", "rpu_ipi"))
 XRT_CORE = ("/opt/xilinx/xrt/lib/libxrt_core.so", "/usr/lib/aarch64-linux-gnu/libxrt_core.so",
             "/usr/lib/libxrt_core.so")
 
@@ -194,6 +201,44 @@ def remove_overlay(name: str) -> None:
     log(f"removed overlay '{name}'")
 
 
+def live_phandle(label: str):
+    """The live device tree's phandle of the node labelled ``label``, or None."""
+    try:
+        with open(f"{LIVE_DT}/__symbols__/{label}", "rb") as f:
+            path = f.read().rstrip(b"\0").decode()
+        with open(f"{LIVE_DT}{path}/phandle", "rb") as f:
+            return struct.unpack(">I", f.read(4))[0]
+    except (OSError, struct.error, UnicodeDecodeError):
+        return None
+
+
+def r5_overlays_above(name: str, label: str) -> list:
+    """The Cortex-R5's overlays applied after ours (``name``, whose nodes
+    include the one labelled ``label``), newest first: the ones to remove
+    before ours, since every overlay adds to /__symbols__ and the kernel
+    refuses to remove ours from under them ("node_overlaps_later_cs: #2
+    overlaps with #4 @/__symbols__").  The firmware's next start applies them
+    again.  configfs keeps no order, but the kernel gives an overlay's nodes
+    phandles above every one before it, so the live phandles of the labelled
+    nodes order the overlays.  Refuses while the firmware runs (it drives the
+    kernels) and when a phandle is missing."""
+    r5 = [(n, lb) for n, lb in R5_OVERLAYS if os.path.isdir(f"{OVERLAYS}/{n}")]
+    if not os.path.isdir(f"{OVERLAYS}/{name}") or not r5:
+        return []
+    ph = {lb: live_phandle(lb) for lb in [label] + [lb for _, lb in r5]}
+    missing = [lb for lb, p in ph.items() if p is None]
+    if missing:
+        raise LoadError(f"cannot tell whether the Cortex-R5's overlays ({', '.join(n for n, _ in r5)}) sit "
+                        f"above '{name}': no live phandle for {', '.join(missing)}; reboot the board")
+    above = [n for n, lb in sorted(r5, key=lambda r: ph[r[1]], reverse=True) if ph[lb] > ph[label]]
+    states = ([read(f"{REMOTEPROC}/{d}/state") for d in sorted(os.listdir(REMOTEPROC))]
+              if os.path.isdir(REMOTEPROC) else [])
+    if above and "running" in states:
+        raise LoadError(f"the Cortex-R5 firmware is running and its overlays ({', '.join(above)}) "
+                        f"sit above '{name}': stop it first (echo stop > {REMOTEPROC}/remoteproc0/state)")
+    return above
+
+
 def check_kernels_free(load: dict) -> None:
     """No other overlay provides the kernels' UIO devices (the same design under another name)."""
     taken = sorted({n.split("@")[0] for n in load["uio_nodes"]} & set(uio_devices()))
@@ -324,7 +369,10 @@ def check_irqs(load: dict) -> None:
 
 def load_bundle(load: dict, bundle: str) -> None:
     t0 = time.monotonic()
+    r5_above = r5_overlays_above(load["overlay"], load["uio_nodes"][0].split("@")[0])
     remove_overlay("pynq")
+    for name in r5_above:
+        remove_overlay(name)
     remove_overlay(load["overlay"])
     check_kernels_free(load)
     check_pl0(load["pl0_hz"], set_if_off=True)
