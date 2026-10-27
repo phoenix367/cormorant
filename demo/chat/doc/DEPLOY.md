@@ -133,8 +133,9 @@ of `chat_config.json` — `<dir>` below, by default `/root/kv260_chat/`:
 - the server files and `vocab.txt`.
 
 `server.launcher: "nohup"` runs a detached process instead of the unit,
-logging to `<dir>/server.log`.  It loads no bitstream and survives no
-reboot.
+logging to `<dir>/server.log`, its pid in `<dir>/server.pid`.  It loads no
+bitstream and survives no reboot.  `deploy.py --stop` sends it one SIGTERM
+and waits up to 90 s for it to exit, as the unit's stop does.
 
 **Timing.**  The first deploy builds for about 16 s.  Startup takes 1.6 s
 (`bert_open`: the pool buffer plus 217 MB of weights from the page cache).

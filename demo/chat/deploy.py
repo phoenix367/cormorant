@@ -436,11 +436,19 @@ def board_bitstream(session: RemoteSession, overlay: str) -> Optional[str]:
 def load_staged_bitstream(session: RemoteSession, cfg: dict) -> None:
     """After a boot the board runs the starter-kit design, and the preflight
     would find no kernels: load the last deploy's bundle (<dir>/fpga) with the
-    host's fpga_load.py, as the unit would.  Nothing when the board runs it, or
-    there is no bundle yet (the first deploy)."""
+    host's fpga_load.py, as the unit would.  Nothing when the board runs a
+    bitstream of ours — the bundle's or a newer one the deploy is about to stage
+    (stage_fpga checks it against the config) — or there is no bundle yet (the
+    first deploy)."""
     d = cfg["remote"]["dir"]
-    _, _, rc = session.exec(f"test -f {d}/fpga/load.json", timeout=15)
+    out, _, rc = session.exec(f"cat {d}/fpga/load.json", timeout=15)
     if rc != 0:
+        return
+    try:
+        overlay = json.loads(out)["overlay"]
+    except (ValueError, KeyError):
+        overlay = None
+    if overlay and board_bitstream(session, overlay):
         return
     sftp = session._client.open_sftp()                          # noqa: SLF001
     try:
@@ -548,12 +556,20 @@ def stop_rpu(session: RemoteSession, cfg: dict) -> None:
     session.exec(f"{sudo(cfg)}bash -c {shlex.quote(rpu_board.FIRMWARE_STOP)}", timeout=30)
 
 
+def nohup_stop(cfg: dict) -> str:
+    """One SIGTERM to the server in server.pid (the nohup launcher's), then wait, as
+    systemd does, up to TimeoutStopSec for it to exit; a pid that is no longer the
+    server is left alone."""
+    pid, su = f"{cfg['remote']['dir']}/server.pid", sudo(cfg)
+    alive = "grep -qa kv260_chat_server.py /proc/$p/cmdline 2>/dev/null"
+    return (f"if [ -f {pid} ]; then p=$(cat {pid}); if {alive}; then {su}kill $p; "
+            f"for i in $(seq 900); do {alive} || break; sleep 0.1; done; fi; rm -f {pid}; fi")
+
+
 def stop_server(session: RemoteSession, cfg: dict, quiet: bool = False) -> str:
-    d = cfg["remote"]["dir"]
     su = sudo(cfg)
     session.exec(f"{su}systemctl stop {UNIT} 2>/dev/null; {su}systemctl reset-failed {UNIT} 2>/dev/null; "
-                 f"if [ -f {d}/server.pid ]; then {su}kill $(cat {d}/server.pid) 2>/dev/null; "
-                 f"rm -f {d}/server.pid; fi", timeout=120)
+                 + nohup_stop(cfg), timeout=120)
     # anything else still running the server file (the [k] keeps pkill off this shell)
     session.exec(f"{su}pkill -f '[k]v260_chat_server.py' 2>/dev/null; sleep 0.5", timeout=30)
     out, _, _ = session.exec("pgrep -fa '[k]v260_chat_server.py' || echo none", timeout=15)
@@ -853,11 +869,26 @@ def launcher(session: RemoteSession, cfg: dict) -> str:
     return "nohup"
 
 
+def nohup_start(cfg: dict) -> str:
+    """The server detached, with every output in server.log: the background job is the
+    sudo command alone, so nothing holds the SSH channel (a backgrounded `cd && sudo`
+    list did, and the start timed out).  server.pid gets the server's own pid, written
+    by the shell that execs it, so the stop signals the server itself, not a parent."""
+    d = cfg["remote"]["dir"]
+    pid = f"{d}/server.pid"
+    argv = " ".join(shlex.quote(a) for a in server_argv(cfg))
+    env = {k: str(v) for k, v in cfg["server"].get("env", {}).items() if not k.startswith("_")}
+    envs = " ".join(shlex.quote(f"{k}={v}") for k, v in env.items())
+    return (f"cd {d} && rm -f {pid} && "
+            f"{{ {sudo(cfg)}env {envs} setsid sh -c 'echo $$ > \"$1\"; shift; exec nohup \"$@\"' sh {pid} "
+            f"{argv} > {d}/server.log 2>&1 < /dev/null & }} && "
+            f"for i in $(seq 50); do [ -s {pid} ] && break; sleep 0.1; done; [ -s {pid} ]")
+
+
 def start_server(session: RemoteSession, cfg: dict, how: str) -> bool:
     """systemctl start (the unit loads the FPGA, starts the R5 firmware, cleans
     the CMA area) or, with nohup, the server as a detached process."""
     t0 = time.monotonic()
-    d, s = cfg["remote"]["dir"], cfg["server"]
     from src.remote.cma import clean_cma, describe
     cma = clean_cma(session, sudo(cfg))["after"]
     if how == "systemd":
@@ -865,11 +896,7 @@ def start_server(session: RemoteSession, cfg: dict, how: str) -> bool:
     else:
         if cfg["rpu"]["enabled"] and not start_rpu(session, cfg):
             return False
-        argv = " ".join(shlex.quote(a) for a in server_argv(cfg))
-        env = {k: str(v) for k, v in s.get("env", {}).items() if not k.startswith("_")}
-        envs = " ".join(shlex.quote(f"{k}={v}") for k, v in env.items())
-        cmd = (f"cd {d} && {sudo(cfg)}env {envs} setsid nohup {argv} > {d}/server.log 2>&1 "
-               f"< /dev/null & echo $! > {d}/server.pid")
+        cmd = nohup_start(cfg)
     out, err, rc = session.exec(cmd, timeout=60)
     return step("start", rc == 0, t0, (f"{how}: {UNIT} (CMA cleaned: {describe(cma)})"
                                        if rc == 0 else (out + err).strip()))
@@ -958,7 +985,9 @@ def print_ready(cfg: dict, h: dict) -> None:
         if m.get("type") == "speech":
             print(f"                      curl {url}/audio/speech -H 'Content-Type: application/json' "
                   f"-d '{{\"model\": \"{m['id']}\", \"input\": \"Hello from the FPGA.\"}}' -o hello.wav")
-    print(f"    logs              ssh {cfg['ssh']['user']}@{cfg['ssh']['host']} journalctl -fu {UNIT}")
+    logs = (f"journalctl -fu {UNIT}" if cfg["server"]["launcher"] == "systemd"
+            else f"tail -f {cfg['remote']['dir']}/server.log")
+    print(f"    logs              ssh {cfg['ssh']['user']}@{cfg['ssh']['host']} {logs}")
     print(f"    stop              demo/chat/deploy.py --stop   (the server owns the FPGA until then)\n")
 
 

@@ -1840,10 +1840,21 @@ def main(argv=None) -> int:
         srv.server_close()
         return 1
 
-    def stop(signum, _frame):
-        log(f"signal {signum}: shutting down")
-        threading.Thread(target=srv.shutdown, daemon=True).start()
+    # A handler runs in the main thread between any two bytecodes, also inside another
+    # handler: a second SIGTERM (deploy.py --stop's pkill hit the server and its sudo,
+    # which relays it) re-entered log() under its lock and hung the server.  The handler
+    # takes no lock: it wakes a thread that logs and shuts the server down.
+    stop_r, stop_w = os.pipe()
 
+    def stopper():
+        signum = os.read(stop_r, 1)[0]
+        log(f"signal {signum}: shutting down")
+        srv.shutdown()
+
+    def stop(signum, _frame):
+        os.write(stop_w, bytes([signum]))
+
+    threading.Thread(target=stopper, name="stop", daemon=True).start()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log(f"kv260-chat {VERSION} listening on http://{args.host}:{args.port}/v1  "

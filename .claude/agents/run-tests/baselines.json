@@ -1,7 +1,7 @@
 {
  "_doc": "Written by run_tests.py --record-baseline from a clean whole-suite run; edit by hand to widen. min_tests: fewer is an anomaly; max_skipped / skip_allow (regexes over the skip reason): other skips are unexpected; warning_allow (regexes over 'category: message'): known warnings; typical_duration_s: a run under 40 % of it is an anomaly. No skip is expected in the scheduler suite since test_bert_base.py downloads its model (a skip there means BERT_SQUAD_DOWNLOAD=0 or a failed download); csim's known warning is in the Vitis ap_private.h header and only shows when a test is recompiled.",
  "chat": {
-  "min_tests": 247,
+  "min_tests": 252,
   "max_skipped": 1,
   "skip_allow": [
    "needs the tokenizers package"
