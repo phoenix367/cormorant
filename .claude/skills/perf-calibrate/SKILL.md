@@ -25,7 +25,11 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | a host-op kind appeared or vanished (an op moved onto a kernel, a new host node — `simulate` reports an unpriced node) | profile every shipped model in the same board window, then `host --merge` with all the profiles (§3); the `board-window` skill does both |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/04259a7af917** (2026-10-17), `33a799febc56`'s design with the row-ops unit's GATE
+Current model: **kv260/b4e63457057a** (2026-10-28), `04259a7af917`'s kernels after their second area pass
+(AREA_PLAN §6) with the MIPI camera's capture path, every call as fast as before (the 2995 calls both models
+measured: median +0.02 %, p10 / p90 −0.41 / +0.48 %): the shortcut below — `04259a7af917`'s case list with
+the 121 ConvKernel calls of its calibration that the list had dropped, `run`, `fit`, one refinement round
+(+18) → 3013 exact calls; `host.json` unchanged.  The model before, kv260/04259a7af917 (2026-10-17), `33a799febc56`'s design with the row-ops unit's GATE
 op and SCALE flag (RPU_PLAN §14): `cases` (1755, with `kernels.rowops.gate` / `scale` true: Piper's GATE and
 scaled-average calls), `run`, `fit`, one refinement round (+211) → 1936 exact calls, the chain term as
 before; the Moonshine top-up of the same day (doc/plans/ASR_PLAN.md §6: moonshine-tiny / -base added to
@@ -130,7 +134,7 @@ bitstream needs one there too.
 1. **Ids agree.** Get the local id (the `.bit` named by the untracked
    `bitstream_config_kv260.json`, converted exactly as `upload_bitstream.py` does):
    ```bash
-   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # 04259a7af917 today
+   .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())"   # b4e63457057a today
    ssh -i ~/.ssh/kv260-testkey root@192.168.100.8 'sha256sum /lib/firmware/pl.bin' | cut -c1-12
    ```
    `run` makes this check itself on `--board-bin`, by default `/lib/firmware/<overlay>.bin`

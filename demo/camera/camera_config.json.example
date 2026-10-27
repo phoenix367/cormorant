@@ -46,10 +46,12 @@
   },
 
   "camera": {
+    "source": "realsense",
+    "_source_note": "'realsense': a RealSense camera on USB. 'mipi': the KV260's AR1335 sensor behind the carrier card's AP1302 ISP, through the capture path of a bitstream built with hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl and loaded with the overlay dts/kv260/cormorant_capture.dts (the ISP scales the sensor to width x height, 30 fps; fps is ignored).",
     "width": 640,
     "height": 480,
     "fps": 30,
-    "_note": "RealSense colour stream geometry. The frame is resized to preprocess.input_size before inference."
+    "_note": "Colour stream geometry. The frame is resized to preprocess.input_size before inference."
   },
 
   "run": {

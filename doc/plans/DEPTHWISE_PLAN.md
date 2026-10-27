@@ -6,7 +6,7 @@ CCI onto `S_AXI_HP2_FPD` plus overlapped line-buffer loads (B3), bitstream
 LightStereo-S 599 → 469 ms per pair, MobileNet v2 −14 %, BERT 418 → 364 ms,
 all bit-exact (§8); promoted 2026-10-10 / 11 (§8.6), production until
 2026-10-12 — every later bitstream keeps the x port on HP2 (production
-since 2026-10-17: `04259a7af917`).**  The analysis of §1–§5 (2026-10-09)
+since 2026-10-28: `b4e63457057a`).**  The analysis of §1–§5 (2026-10-09)
 stands; the transposed grid mode (§6) was built and reverted; the UltraRAM
 row store (§8.4) was designed and found unnecessary once the port was right.
 

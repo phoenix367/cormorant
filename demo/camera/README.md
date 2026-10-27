@@ -1,12 +1,14 @@
 # Camera classification KV260 demo
 
-Real-time ImageNet classification from a live **Intel RealSense** camera on
-the KV260 FPGA platform, using **MobileNetV1 1.0/224** running on this
-repo's own kernels (Conv / Pool / VectorOP / MatMul) — no Vitis-AI / DPU.
+Real-time ImageNet classification from a live camera on the KV260 FPGA
+platform — an **Intel RealSense** on USB, or the starter kit's own **AR1335**
+sensor behind the carrier card's AP1302 ISP over MIPI CSI-2 (*MIPI camera*
+below) — using **MobileNetV1 1.0/224** running on this repo's own kernels
+(Conv / Pool / VectorOP / MatMul) — no Vitis-AI / DPU.
 The shipped `mobilenet_v1_1.0_224_no_softmax` variant ends in a 1×1 Conv
 classifier, which the scheduler runs as a MatMul on MatmulKernel (`--fc-conv`).
 
-Connect a RealSense camera to the board, run the orchestrator, and the demo
+Connect a camera to the board, run the orchestrator, and the demo
 will
 
   1. download the MobileNetV1 ONNX model + the ImageNet 1001-class labels,
@@ -21,7 +23,7 @@ will
 ```mermaid
 flowchart LR
     subgraph KV260
-      Cam["RealSense camera"] --> Loop["camera_loop.py<br/>capture + preprocess<br/>+ annotate"]
+      Cam["RealSense (USB) or<br/>AR1335 + AP1302 (MIPI)"] --> Loop["camera_loop.py<br/>capture + preprocess<br/>+ annotate"]
       Loop <-->|"pipe: frame / top-K"| CS["classify_stream<br/>FPGA inference"]
       Loop --> JPG["latest.jpg"]
     end
@@ -33,11 +35,11 @@ flowchart LR
 > **Frame rate.** The pipeline keeps one frame in flight, so the display rate
 > is bounded by the per-frame inference time.  The transcript below (May 2026)
 > was recorded with an early ConvKernel: 2.46 s per frame, ~0.4 FPS.  The
-> current kernels run MobileNetV1 in ~20.5 ms (the
-> [`image_classification/`](../image_classification/) demo); the camera demo
-> has not been re-measured with them, and at that speed the capture,
+> current kernels run MobileNetV1 in ~20.7 ms per frame and the display
+> refreshes at ~16 fps with either camera (October 2026: a RealSense D435,
+> and the MIPI camera's run under *MIPI camera*): at that speed the capture,
 > preprocessing, JPEG encoding and the host's SFTP pull
-> (`display.poll_interval_ms`) also count.  The overlay shows inference
+> (`display.poll_interval_ms`) set the rate.  The overlay shows inference
 > latency, display refresh rate, and whole-board (SOM) power draw.
 
 ## Layout
@@ -56,7 +58,7 @@ demo/camera/
 ├── src/
 │   ├── classify_stream.c                 — persistent board-side inference host
 │   └── board/                            — uploaded to the KV260
-│       ├── camera_loop.py                —   RealSense capture + annotate loop
+│       ├── camera_loop.py                —   RealSense / MIPI capture + annotate loop
 │       ├── preprocessing.py              —   NCHW ap_fixed<16,8> frame encoder
 │       ├── visualization.py              —   OpenCV overlay helpers
 │       └── power_monitor.py              —   whole-board power sampling thread
@@ -78,9 +80,11 @@ expensive. So the board runs a **persistent** inference host:
 - **`classify_stream`** (C, on the board) — calls `inference_init()` *once*,
   then loops forever: read one raw frame from stdin, run inference, write a
   one-line top-K JSON to stdout.
-- **`camera_loop.py`** (Python, on the board) — captures RealSense colour
-  frames, preprocesses them, drives `classify_stream` over a pipe (one frame
-  in flight), annotates the frame, and writes `latest.jpg` atomically.
+- **`camera_loop.py`** (Python, on the board) — captures colour frames
+  (`--source realsense`: pyrealsense2; `--source mipi`: the ISP's NV12
+  frames through V4L2, keeping only the newest), preprocesses them, drives
+  `classify_stream` over a pipe (one frame in flight), annotates the frame,
+  and writes `latest.jpg` atomically.
 - **`deploy_and_run.py`** (host) — builds the project, launches the board
   loop, and SFTP-pulls `latest.jpg` into a display window.
 
@@ -116,7 +120,8 @@ expensive. So the board runs a **persistent** inference host:
 * `gcc`, `cmake ≥ 3.19`, `make`.
 * XRT runtime via `pkg-config xrt` or `/opt/xilinx/xrt`.
 * Passwordless `sudo` for the SSH user (XRT requires root).
-* An **Intel RealSense** camera on USB 3.0.
+* An **Intel RealSense** camera on USB 3.0 — or the MIPI camera (*MIPI
+  camera* below; it needs only OpenCV and numpy on the board).
 * **Board setup** — the board-side capture loop needs these in the Python
   interpreter named by `run.board_python`:
 
@@ -148,6 +153,76 @@ expensive. So the board runs a **persistent** inference host:
   `/usr/local/share/pynq-venv/bin/python3`), install the packages there
   instead. `deploy_and_run.py --check-only` probes all of this for you.
 
+### MIPI camera (AR1335 + AP1302)
+
+The KV260 Vision AI Starter Kit's AR1335 sensor module sits on the carrier
+card's IAS connector behind an onsemi AP1302 ISP, which scales and
+colour-processes the 4208 × 3120 image and sends YUV 4:2:0 over 4-lane MIPI
+CSI-2 into the PL.  It needs a bitstream with the block design's **camera
+capture path** (`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`; the
+`hw/cormorant_hw_128` README's *Camera capture path*): a MIPI CSI-2 receiver
+on bank 66, a frame-buffer writer that puts NV12 frames into DDR through
+`S_AXI_HP3_FPD`, the AXI I²C controller of the ISP's bus and the ISP's reset
+on EMIO GPIO, on their own 200 MHz clock beside the kernels' 250 MHz — the
+first such bitstream is `b4e63457057a`, production since 2026-10-28.  Load
+it with the overlay `dts/kv260/cormorant_capture.dts` — the five kernels of
+`cormorant.dts` plus the camera's V4L2 media pipeline (AP1302 → CSI-2
+receiver → frame buffer → `/dev/videoN`) — and keep the overlay name `pl`,
+in `inference-scheduler/bitstream_config_kv260.json`:
+
+```bash
+make -C build dtbo_kv260_cormorant_capture     # → build/dts/kv260/design_cormorant_capture.dtbo
+```
+```json
+"bitstream": {
+  "bit":  "<the capture build>/design_cormorant_wrapper.bit",
+  "hwh":  "<the capture build>/design_cormorant.hwh",
+  "dtbo": "../build/dts/kv260/design_cormorant_capture.dtbo",
+  "overlay_name": "pl"
+}
+```
+
+Never apply that overlay over a bitstream without the capture path: the
+Linux drivers would access an unmapped PS port.  The drivers (`ap1302`,
+the CSI-2 receiver's, `xilinx-frmbuf`, `xilinx-video`) and the ISP firmware
+(`/lib/firmware/ap1302_ar1335_single_fw.bin`, package
+`linux-firmware-xilinx-ap1302`) come with the Kria Ubuntu 22.04 image, and
+`media-ctl` / `v4l2-ctl` with `v4l-utils-xlnx`.  After the load:
+
+```bash
+media-ctl -p -d /dev/media2      # the one with ap1302.4-003c, ar1335 0, 80000000.csiss, cap_vcap output 0
+                                 # (media2 here: a RealSense on USB takes media0 / media1)
+dmesg | grep ap1302              # "AP1302 revision 0.2.6 detected"
+```
+
+The ISP's firmware goes over I²C at every overlay load (~2 s); a
+`CRC mismatch` line means the driver retried the download (seen once in four
+loads, the first after a bitstream without the path, and the next attempt
+succeeded).  Then set `"camera": {"source": "mipi"}`: the board loop sets
+the ISP's output to `camera.width` × `camera.height` (`media-ctl`) and
+streams NV12 at 30 fps through `v4l2-ctl` (the video node is
+multiplanar-only, which OpenCV's V4L2 backend cannot read); `camera.fps` is
+ignored.  The receiver's own pad formats are set best effort: it refuses
+them (`EINVAL`) on this kernel and streams the ISP's frames anyway.
+
+A 60-second run on `b4e63457057a` (2026-10-27, 640 × 480, `--save-only`):
+
+```
+Preflight (remote)
+    …
+    OK      board python deps (numpy, cv2)
+    OK      media-ctl / v4l2-ctl
+    OK      AP1302 ISP in a media graph  ap1302.4-003c
+    …
+    camera_loop: MIPI 'ap1302.4-003c' -> /dev/video4 streaming 640x480@30
+      frame 0: notebook (36.1%)  infer=20.9ms  display=0.0fps  power=4.8W
+      frame 100: monitor (32.8%)  infer=20.6ms  display=16.2fps  power=6.2W
+      …
+      frame 910: notebook (26.1%)  infer=20.6ms  display=16.2fps  power=5.4W
+    camera_loop: stopping (stop file) after 919 frame(s)
+    classify_stream: 919 frame(s) processed — shutting down
+```
+
 ## Configure
 
 ```bash
@@ -160,8 +235,9 @@ Key fields beyond the SSH / driver paths:
 
 | Field | Meaning |
 |-------|---------|
-| `run.board_python` | Python on the board with pyrealsense2/opencv/numpy |
-| `camera.{width,height,fps}` | RealSense colour stream geometry |
+| `run.board_python` | Python on the board with opencv/numpy (and pyrealsense2 for a RealSense) |
+| `camera.source` | `realsense` (default: USB) or `mipi` (the AR1335 / AP1302 through the capture path, *MIPI camera*) |
+| `camera.{width,height,fps}` | Colour stream geometry (`mipi`: the ISP scales to it; 30 fps, `fps` ignored) |
 | `run.duration_s` | Auto-stop after N seconds (0 = run until `q`) |
 | `run.target_fps` | Throttle the board loop (0 = uncapped) |
 | `display.poll_interval_ms` | How often the host pulls a fresh frame |
@@ -316,7 +392,8 @@ with `run.power_poll_s`.
 | `--plan` (generate script; also `--perf-model`, `--plan-report`, `--pool-budget-mib`) | planning mode ([`doc/plans/TACTICS_PLAN.md`](../../doc/plans/TACTICS_PLAN.md) §9): tactics and issue order from the bitstream's performance model, bit-identical results; or `"plan": true` in the config |
 
 `--check-only` is the fastest way to confirm the board is ready — it probes
-SSH, the kernels' UIO devices, and the board-side RealSense / OpenCV
+SSH, the kernels' UIO devices, and the board-side camera (the RealSense, or
+the ISP's media graph and the V4L2 tools for `mipi`) and OpenCV
 dependencies without uploading anything.
 
 ## Troubleshooting
@@ -325,6 +402,9 @@ dependencies without uploading anything.
 |---------|-----|
 | `board python deps … MISSING` | install pyrealsense2 / opencv / numpy on the board — see *Board setup* |
 | `RealSense camera detected … MISSING` | check the USB 3.0 connection; run `rs-enumerate-devices` on the board |
+| `AP1302 ISP in a media graph … MISSING` (`mipi`) | the loaded bitstream has no capture path, or the overlay is the plain `cormorant.dts` — load the capture bitstream with `cormorant_capture.dts` (*MIPI camera*); then `dmesg \| grep -E "ap1302\|csiss\|frmbuf"` |
+| `media-ctl / v4l2-ctl … MISSING` (`mipi`) | `sudo apt-get install v4l-utils` (the Kria image ships `v4l-utils-xlnx`) |
+| `error: no frame from the camera for 5 s`, `stopping (camera stopped)` (`mipi`) | no frames from the ISP: `v4l2-ctl -d /dev/videoN --stream-mmap --stream-count=10 --verbose` on the board shows whether the pipeline streams |
 | `opencv-python not installed on the host` | `pip install -r requirements.txt`, or run with `--save-only` |
 | display window never updates | the board loop loads the weights and starts the camera before the first frame; watch the per-frame log on the console |
 | every prediction looks wrong | usually a normalize mismatch — `preprocess.normalize` must match how the model was trained (`tf` for the stock MobileNetV1) |

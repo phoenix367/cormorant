@@ -1,8 +1,8 @@
 # The kernels' LUTs — an area pass over the five kernels (2026-10-14)
 
-**Status (2026-10-25): a second pass (§6) cuts the five kernels by 11.8 k LUTs and 11.6 k FFs at equal results and cycles; bitstream `89205c11fded` routes at 79 986 LUTs (68.3 %), WNS +0.031 ns, and on the board is bit-exact (159 / 159 models, the demos, Piper, SmolLM2-135M) at production's speed (§6.4) — not promoted.  Its first build `9446b3d462b6` failed MatmulKernel on the board: Vivado dropped a DSP reset (§6.4).**
+**Status (2026-10-25): a second pass (§6) cuts the five kernels by 11.8 k LUTs and 11.6 k FFs at equal results and cycles; bitstream `89205c11fded` routes at 79 986 LUTs (68.3 %), WNS +0.031 ns, and on the board is bit-exact (159 / 159 models, the demos, Piper, SmolLM2-135M) at production's speed (§6.4).  Promoted 2026-10-28 together with the MIPI camera's capture path as `b4e63457057a` (§6.5).  Its first build `9446b3d462b6` failed MatmulKernel on the board: Vivado dropped a DSP reset (§6.4).**
 
-**Status (2026-10-15): done — the FOLD design routes and was in production from 2026-10-15 to 2026-10-16 (its successors `33a799febc56` and, since 2026-10-17, the production `04259a7af917` build on it).**  Bitstream `de968ccc45da` (`/mnt/data/bitstreams/kv260_250_de968ccc45da/`): WNS +0.029 ns, WHS +0.010 ns at 4 ns, 89 547 LUTs (76.5 %) — 4 422 below the previous production `1cedaf2ed816` and 8 182 below the FOLD build that did not route — 108 713 FF, 136 BRAM tiles, 55 URAM, 841 DSP (§5).  The block-design simulation 112 / 112; on the board every model and library bit-exact and the 72 kernel benchmarks equal to `1cedaf2ed816`'s within the run-to-run noise (HOSTOPS_PLAN §11.7).  Steps 5's replay file and 6 stay open for the next design that needs room.
+**Status (2026-10-15): done — the FOLD design routes and was in production from 2026-10-15 to 2026-10-16 (its successors `33a799febc56`, `04259a7af917` and, since 2026-10-28, the production `b4e63457057a` build on it).**  Bitstream `de968ccc45da` (`/mnt/data/bitstreams/kv260_250_de968ccc45da/`): WNS +0.029 ns, WHS +0.010 ns at 4 ns, 89 547 LUTs (76.5 %) — 4 422 below the previous production `1cedaf2ed816` and 8 182 below the FOLD build that did not route — 108 713 FF, 136 BRAM tiles, 55 URAM, 841 DSP (§5).  The block-design simulation 112 / 112; on the board every model and library bit-exact and the 72 kernel benchmarks equal to `1cedaf2ed816`'s within the run-to-run noise (HOSTOPS_PLAN §11.7).  Steps 5's replay file and 6 stay open for the next design that needs room.
 
 **History (2026-10-14):**  The design with the row-ops unit's
 FOLD op (HOSTOPS_PLAN §11) no longer routes.  It places at 97 729 LUTs
@@ -286,3 +286,24 @@ The RTL is cycle-identical for exactly these geometries (and single-batch)
 at ideal, random and slow memory, so it is not the kernels' logic.  No
 baseline was recorded for `89205c11fded`; promoting it would need the
 performance model (`perf-calibrate`) and the chat server's redeploy.
+
+### 6.5 In production (2026-10-28)
+
+The pass went into production together with the MIPI camera's capture path
+(`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`, `demo/camera`) as
+`b4e63457057a` (`/mnt/data/bitstreams/kv260_250_b4e63457057a/`): 87 013 LUTs
+(74.3 %; the path +7 027 over `89205c11fded`), 142 / 144 BRAM tiles,
+58 / 64 URAM, 845 DSP, WNS +0.040 ns.  On the board (2026-10-27 / 28):
+
+| check | result |
+|---|---|
+| `run_remote_tests.py` (159 models) | 159 / 159 |
+| 72 kernel benchmarks against `04259a7af917`'s baseline (two runs) | every case within the noise except FC-1x1280x1001-packed, 0.375 → 0.401 ms: the case's two modes by buffer placement (0.401 on `04259a7af917` too, 2026-10-24; 0.361 on `b4e63457057a`, 2026-10-27); the first run is `b4e63457057a`'s baseline |
+| the performance model, the 2995 calls both bitstreams measured | median +0.02 %, p10 / p90 −0.41 / +0.48 %; the model of `b4e63457057a` 3013 exact calls after one refinement round (+18) |
+| Miranda through a chat server with the R5 firmware of `b4e63457057a`'s BSP | the wake phrase, Moonshine, SmolLM2-360M and Piper end to end |
+| `demo/camera` with the AR1335 | 8 077 frames, about 21 ms an inference |
+
+The chat libraries were not gated bit for bit again on `b4e63457057a`, and
+the board results the README and `facts.yaml` record (`board.results`, the
+YOLOv5n and stereo results, Piper's encoder times) still name
+`04259a7af917`: every kernel call measuring as fast is what carries them over.

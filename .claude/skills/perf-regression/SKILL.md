@@ -55,9 +55,9 @@ directories on the board.
 ## 2. Bitstream id — which baseline
 
 ```bash
-BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # 04259a7af917
+BID=$($SSH 'sha256sum /lib/firmware/pl.bin' | cut -c1-12); echo $BID      # b4e63457057a
 (cd inference-scheduler && .venv/bin/python -c "from src.perf_calls import local_bitstream_id as f; print(f())")
-ls .claude/skills/perf-regression/baselines/                               # kv260-04259a7af917.json; kv260-33a799febc56.json (no GATE / SCALE); kv260-de968ccc45da.json (no y pattern, no descriptor chains); kv260-1cedaf2ed816.json (no FOLD, before the area pass); kv260-f70ce632a97a.json (no row-ops unit), kv260-8599aa7a5f12.json (ConvKernel x on HPC0); kv260-588d721997cb.json (VectorOP b on HPC0); kv260-6436623029f7.json (no softmax unit); kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
+ls .claude/skills/perf-regression/baselines/                               # kv260-b4e63457057a.json; kv260-04259a7af917.json (before the second area pass and the capture path); kv260-33a799febc56.json (no GATE / SCALE); kv260-de968ccc45da.json (no y pattern, no descriptor chains); kv260-1cedaf2ed816.json (no FOLD, before the area pass); kv260-f70ce632a97a.json (no row-ops unit), kv260-8599aa7a5f12.json (ConvKernel x on HPC0); kv260-588d721997cb.json (VectorOP b on HPC0); kv260-6436623029f7.json (no softmax unit); kv260-986cef4866a0.json (no activation unit); kv260-c2b2a6e5e50e.json (100 MHz), kv260-dbb320fb7297.json (HLS ConvKernel), kv260-b3309f424562.json (HLS PoolingKernel), kv260-68665fc1833a.json (MatmulKernel without bus parameters), kv260-bbb9a37f73f8.json (HLS VectorOPKernel), kv260-1d28630fbfa4.json (no pool guard), kv260-caa67f49a5a3.json (HLS MatmulKernel)
 ```
 The board's id is what gets measured; always pass it (`--bitstream-id
 $BID`).  A local id that differs means the board runs another bitstream
@@ -92,7 +92,7 @@ Output shape (validation run 2026-09-29 14:31 against the 09:53 run, same bitstr
 the id shown is today's bitstream):
 ```
 kernels: baseline run 2026-09-29 09:53 (…/perf_20260929.json)
-platform kv260, bitstream 04259a7af917
+platform kv260, bitstream b4e63457057a
 
   section         case                         base ms     now ms   Δlat %   Δthr %  flag
   VectorOPKernel  ADD-1K                        0.0087     0.0088    +1.15    -0.57
@@ -194,7 +194,8 @@ baselines are checked-in files: tell the user to commit them.
   runs over both bitstreams in one session) the 20–25 µs calls (DIV-4K,
   FC-4x256x256) moved by 1–2 µs, and FC-1x1280x1001-packed takes 0.36 or
   0.40 ms by where its buffers land (bimodal on either bitstream; its
-  baseline holds 0.360).
+  baseline holds 0.360).  b4e63457057a's baseline (2026-10-28) holds the
+  slow mode, 0.401 ms; the same bitstream gave 0.361 the day before.
 - Report: verdict, counts, every flagged case (base → now, Δ %), the
   worst five, and whether a baseline was recorded.  Quote the numbers
   from the compare output, not from memory or the optimisation logs.

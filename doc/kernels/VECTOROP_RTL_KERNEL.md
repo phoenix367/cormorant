@@ -14,7 +14,7 @@ at 300 MHz; in the bitstreams since `6436623029f7` (250 MHz, WNS
 `588d721997cb` (2026-10-07); the ones since `8599aa7a5f12` (250 MHz, WNS +0.114 ns,
 2026-10-08) read b through its own PS port, HPC1 (a and c on HPC0;
 [PS_PORTS_PLAN](../plans/PS_PORTS_PLAN.md) §5: binary ops 24–38 % faster); production
-`04259a7af917` since 2026-10-17.
+`b4e63457057a` since 2026-10-28.
 
 A drop-in replacement for the HLS kernel: the same IP (VLNV
 `xilinx.com:hls:VectorOPKernel:1.0`, 155 ports and 35 parameters with the

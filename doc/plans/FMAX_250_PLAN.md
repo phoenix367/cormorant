@@ -5,7 +5,7 @@ PS-PL AXI ports run at **250 MHz** (an MMCM in the block design); bitstream
 `986cef4866a0` closes 4.000 ns with WNS +0.105 ns, is bit-exact on the board
 everywhere (148 / 148 models, the demos, the chat / TTS gates) and went into
 production on 2026-10-06 (every later bitstream runs at 250 MHz; production
-since 2026-10-17: `04259a7af917`): ResNet-18 47.5 → 20.5 ms, BERT 839 →
+since 2026-10-28: `b4e63457057a`): ResNet-18 47.5 → 20.5 ms, BERT 839 →
 541 ms, SmolLM2-135M 10 → 18.3 tokens/s, Piper RTF 0.30 → 0.24 (§6).  The
 refit of the engine cost model at 250 MHz (§5, phase 4) followed in
 OFFLOAD_PLAN §4.3 (2026-10-07).

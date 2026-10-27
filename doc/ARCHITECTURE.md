@@ -6,7 +6,7 @@ K26, driven by the Arm cores of the same device.  This document describes
 the hardware in the order of an FPGA architecture document: requirements,
 top-level structure, clocks and reset, memory, datapath, interfaces,
 verification, and implementation.  The numbers are those of the production
-bitstream `04259a7af917` unless a section says otherwise.
+bitstream `b4e63457057a` (since 2026-10-28) unless a section says otherwise.
 
 ![Cormorant system architecture](images/architecture.svg)
 
@@ -51,8 +51,10 @@ merit.  The project had no external requirement specification.  Its plans
 set targets as it went: ResNet-18 at ≥ 15 FPS
 ([`RESNET18_15FPS_PLAN.md`](plans/RESNET18_15FPS_PLAN.md), met at 100 MHz
 and exceeded 3× since), interactive chat on SmolLM2, and faster-than-real-time
-speech synthesis.  Results on the board at 250 MHz, measured 2026-10-18 on the
-production `04259a7af917` (the chat models' and Piper's on 2026-10-17):
+speech synthesis.  Results on the board at 250 MHz, measured 2026-10-18 on
+`04259a7af917`, the production bitstream before `b4e63457057a` (the chat models'
+and Piper's on 2026-10-17; `b4e63457057a` runs every kernel call as fast,
+[`AREA_PLAN.md`](plans/AREA_PLAN.md) §6.5):
 
 | workload | input | result |
 |---|---|---|
@@ -102,8 +104,9 @@ Vivado's on-chip total.  The software-side savings are measured:
 | USB 3 | PS (carrier) | cameras (RealSense D435, webcam) |
 | UART | PS (carrier, FT4232H channel B) | serial console |
 
-The PL uses no package pins: no PCIe, no Ethernet MAC, no I/O standard to
-choose (§6.6).
+The production PL uses no package pins: no PCIe, no Ethernet MAC, no I/O
+standard to choose; the camera capture path adds the carrier's MIPI camera
+(AR1335 / AP1302: CSI-2, I²C, reset) on PL pins (§6.6).
 
 ### 1.5 Device, board and toolchain
 
@@ -498,26 +501,29 @@ never debugged over SSH.
 
 ### 4.1 On-chip memory budget
 
-In-context utilization per instance, from the routed design of
-`de968ccc45da` (2026-10-15; `report_utilization -hierarchical`):
+In-context utilization per instance, from the routed design of the
+production `b4e63457057a` (2026-10-28; `report_utilization -hierarchical`):
 
 | instance | LUT | of which LUTRAM | SRL | FF | RAMB36 | RAMB18 | URAM | DSP |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| VectorOPKernel | 10 768 | 526 | 187 | 12 178 | 30 | 0 | 0 | 35 |
-| MatmulKernel | 14 453 | 6 656 | 22 | 13 297 | 38 | 0 | 0 | 130 |
-| ConvKernel | 14 827 | 4 046 | 512 | 37 497 | 40 | 40 | 48 | 518 |
-| PoolingKernel | 11 856 | 3 462 | 42 | 11 283 | 2 | 0 | 0 | 29 |
-| RowOpsKernel | 33 340 | 3 930 | 437 | 26 712 | 6 | 0 | 7 | 129 |
-| `axi_interconnect_0` (HPC0) | 1 874 | 0 | 10 | 3 733 | 0 | 0 | 0 | 0 |
-| `axi_mem_intercon` (HPC1) | 1 278 | 0 | 0 | 2 029 | 0 | 0 | 0 | 0 |
-| `axi_smc` (control) | 929 | 0 | 1 | 971 | 0 | 0 | 0 | 0 |
-| `axi_rowops_intercon` (HP0) | 150 | 0 | 0 | 668 | 0 | 0 | 0 | 0 |
+| VectorOPKernel | 9 578 | 542 | 188 | 10 714 | 30 | 0 | 0 | 35 |
+| MatmulKernel | 14 062 | 6 620 | 22 | 12 113 | 38 | 0 | 0 | 138 |
+| ConvKernel | 13 715 | 3 898 | 487 | 36 174 | 40 | 40 | 48 | 518 |
+| PoolingKernel | 10 749 | 3 408 | 26 | 10 367 | 2 | 0 | 0 | 29 |
+| RowOpsKernel | 27 160 | 4 024 | 744 | 21 742 | 6 | 0 | 9 | 125 |
+| `axi_interconnect_0` (HPC0) | 1 862 | 0 | 10 | 3 734 | 0 | 0 | 0 | 0 |
+| `axi_mem_intercon` (HPC1) | 1 283 | 0 | 0 | 2 030 | 0 | 0 | 0 | 0 |
+| `axi_smc` (control) | 932 | 0 | 1 | 965 | 0 | 0 | 0 | 0 |
+| `axi_rowops_intercon` (HP0) | 149 | 0 | 0 | 667 | 0 | 0 | 0 | 0 |
 | `axi_x_intercon` (HP2) | 69 | 0 | 0 | 312 | 0 | 0 | 0 | 0 |
-| **design** | **89 547** | **18 620** | **1 212** | **108 713** | **116** | **40** | **55** | **841** |
+| the camera capture path (`cap_*`, §6.6) | 7 428 | 624 | 341 | 9 987 | 6 | 0 | 1 | 0 |
+| **design** | **87 013** | **19 116** | **1 822** | **108 908** | **122** | **40** | **58** | **845** |
 
-On `04259a7af917` the RowOpsKernel holds 35 337 LUTs (4 314 LUTRAM, 695
-SRL), 28 673 FFs, 6 RAMB36, 9 URAMs and 133 DSPs; the design's totals are
-in §8.5.
+The kernels are those of the second area pass
+([`AREA_PLAN.md`](plans/AREA_PLAN.md) §6: −11.8 k LUTs against
+`04259a7af917`, whose RowOpsKernel held 35 337 LUTs and 133 DSPs).  The
+capture path's six RAMB36 are the frame-buffer writer's line buffers (4) and
+the CSI-2 receiver's (2), its URAM the receiver's.
 
 Every RAM is inferred from RTL (`report_ram_utilization`: 100 % inferred,
 no XPM or IP memories).  The primitive is chosen with `(* ram_style *)` /
@@ -726,10 +732,10 @@ calibrate keep one bit of headroom.
 | kernel | DSP48E2 | how they are used |
 |---|---:|---|
 | VectorOPKernel | 35 | one multiplier per lane in `vo_compute` (8), one per lane for LeakyReLU in `vo_act` (8, A / B / M / P registers), two per lane in `vo_smx` (16), three 16 × 16 partial products for the job geometry (3) |
-| MatmulKernel | 130 | 128 MACs (`mm_mac`: AREG = BREG = 2, CREG, MREG, PREG; `P = C + A · B`, the accumulator from LUTRAM through C, no cascade) + 1 per run generator |
+| MatmulKernel | 138 | 128 MACs (`mm_mac`: AREG = BREG = 2, CREG, MREG, PREG; `P = C + A · B`, the accumulator from LUTRAM through C, no cascade) + 1 per run generator + 8 for the drain's lane sums, one per beat lane (`AREA_PLAN.md` §6.1) |
 | ConvKernel | 518 | the MAC grid: 32 chains of 16 DSP48E2 in a PCIN / PCOUT cascade (2 pixels × 16 output channels × 16 input channels); the seed enters DSP 0's C port, DSP 15 accumulates over window positions; the weight on the A port (AREG = 2, and the AD register on lanes l % 4 ≠ 0: the end of its skew), the patch on the B port (BREG = 1), MREG = PREG = 1; the other 6 in control arithmetic, the configuration multiplier among them |
 | PoolingKernel | 29 | control arithmetic and the finaliser's multiplies (AVG reciprocal, LP2 Horner steps) |
-| RowOpsKernel | 133 | of which the stream ops 24 (32 × 25 and 39 × 17 products), RoPE 16, NORM 77 (44 × 32 emit product, `ro_mul32`), FOLD 8 (one reciprocal product per lane) |
+| RowOpsKernel | 125 | of which the stream ops 24 (32 × 25 and 39 × 17 products), RoPE 16, NORM 69 (44 × 32 emit product, `ro_mul32`; 77 before the second area pass), FOLD 8 (one reciprocal product per lane) |
 | **total** | **845 / 1 248** | |
 
 ConvKernel's chains are the only cascaded DSPs: a 16-deep partial-sum chain
@@ -892,12 +898,26 @@ kernel the stages are connected by valid / ready FIFOs, not AXI4-Stream.
 
 ### 6.6 Pins, I/O standards and termination
 
-The PL design uses no package pins: 0 of 189 bonded IOBs.  It has no I/O
-constraints, no I/O standards, no termination and no I/O timing.  Every
-external interface is a PS peripheral on MIO or GTR pins, configured by the
-boot firmware (§1.4).  A PL design that adds pins would need the carrier's
-pinout (the KV260 carrier wires its PMOD and Raspberry Pi headers to PL I/O
-banks) and I/O constraints of its own.
+Up to `04259a7af917` the design used no package pins: 0 of 189 bonded IOBs,
+no I/O constraints, no I/O standards, no termination and no I/O timing.
+Every external interface is a PS peripheral on MIO or GTR pins, configured
+by the boot firmware (§1.4).  A PL design that adds pins needs the
+carrier's pinout (the KV260 carrier wires its PMOD and Raspberry Pi headers
+and the camera connectors to PL I/O banks) and I/O constraints of its own.
+
+The block design's camera capture path (since 2026-10-27,
+`hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl`; in the production
+`b4e63457057a`) is the first to do so: 14 bonded IOBs — the AR1335 / AP1302
+camera's 4-lane MIPI CSI-2 link on bank 66 (clock G1, data E1 F2 G3 E4:
+5 differential inputs into the receiver's RX bitslices, 100 Ω termination),
+its I²C (G11 / F10, LVCMOS33) and the ISP's reset and standby (J11 / J10) —
+constrained in `cormorant_hw_128.srcs/constrs_1/new/capture.xdc` and the
+receiver IP's own constraints.  The I²C pads have no input or output delays
+(Vivado's TIMING-18, §8.4): the bus runs at 400 kHz.  The path runs on its own 200 MHz MMCM, its
+control on `M_AXI_HPM0_LPD`, its frames on `S_AXI_HP3_FPD`, its interrupts on
+`pl_ps_irq1`, apart from the kernels (the `hw/cormorant_hw_128` README's
+*Camera capture path*; the overlay `dts/kv260/cormorant_capture.dts`, the
+consumer `demo/camera`).
 
 ---
 
@@ -1091,11 +1111,11 @@ Post-route, post-physical-optimisation, production bitstream:
 
 | metric | value |
 |---|---|
-| WNS (setup) | +0.027 ns |
+| WNS (setup) | +0.040 ns |
 | TNS | 0.000 ns |
 | WHS (hold) | +0.010 ns |
-| endpoints | 526 520 |
-| methodology | no timing or CDC warnings; ULMTCS-1 (control-set count warning), CLKC-40 and CLKC-56 (MMCM advisories) |
+| endpoints | 528 735 |
+| methodology | no CDC warnings; ULMTCS-1 (control-set count warning), CLKC-40, CLKC-56 and CLKC-58 (MMCM / PLL advisories); from the camera's capture path LUTAR-1 (a LUT drives the reset of an XPM synchroniser inside the CSI-2 receiver IP) and TIMING-18 (the I²C pads without I/O delays, §6.6) |
 
 On `de968ccc45da` (2026-10-15) the 20 worst setup paths were all within
 0.029–0.089 ns, most of each path routing delay (60–97 %), and spread over:
@@ -1115,6 +1135,14 @@ cache's read registers, addresses and write enable; MatmulKernel's A-buffer
 writes, its read enable and a tap register (`u_xpf`); the row-ops unit's
 NORM lanes and control-register writes (`a3_paths.txt` in the archive,
 RPU_PLAN §14.10).
+
+On `b4e63457057a` (2026-10-28) they lie within 0.040–0.121 ns: the HPC1
+crossbar's s00 register slice (its `s_ready` into the read payload, the
+worst), the row-ops unit's NORM (`u_nm`) and control-register writes,
+PoolingKernel's reader lanes (`mode` → `accd`), ConvKernel's x loader
+(`u_xl`) and weight-cache write address, and a VectorOP softmax counter
+into its write FIFO's block-RAM enable.  None is in the capture path, which
+runs on its own clock.
 
 The area pass moved the worst paths out of the HPC1 crossbar and ConvKernel's
 DSP-chain operand skew (on `1cedaf2ed816`: 0.020–0.061 ns over the
@@ -1137,6 +1165,7 @@ The slack history across production bitstreams at 250 MHz:
 | `de968ccc45da` | the row-ops unit's FOLD; the kernels' area pass (`doc/plans/AREA_PLAN.md`: −4.4 k LUT) | +0.029 ns |
 | `33a799febc56` | ConvKernel's y channel pattern; the row-ops unit's descriptor chains | +0.022 ns |
 | `04259a7af917` | the row-ops unit's GATE op and SCALE flag | +0.027 ns |
+| `b4e63457057a` | the kernels' second area pass (`doc/plans/AREA_PLAN.md` §6: −11.8 k LUT); the MIPI camera's capture path (§6.6) | +0.040 ns |
 
 The default implementation strategy missed 4 ns by tens of picoseconds.
 `build.tcl` therefore runs these directives:
@@ -1153,30 +1182,31 @@ resources (block RAM, URAM, CLBs) and inside it on LUTs:
 
 | resource | used | available | utilization | against 70–80 % |
 |---|---:|---:|---:|---|
-| CLB LUTs | 91 805 | 117 120 | 78.4 % | within, near the top |
-| — as logic | 71 331 | | 60.9 % | |
-| — as distributed RAM | 19 004 | 57 600 (LUTM) | 33.0 % | |
-| — as shift registers | 1 470 | 57 600 (LUTM) | 2.6 % | |
-| CLB registers | 111 099 | 234 240 | 47.4 % | within |
-| CARRY8 | 3 260 | 14 640 | 22.3 % | within |
-| CLBs (any part used) | 14 604 | 14 640 | 99.8 % | full: almost every CLB holds something |
-| block RAM tiles | 136 (116 RAMB36 + 40 RAMB18) | 144 | 94.4 % | over |
-| URAM | 57 | 64 | 89.1 % | over |
+| CLB LUTs | 87 013 | 117 120 | 74.3 % | within |
+| — as logic | 66 075 | | 56.4 % | |
+| — as distributed RAM | 19 116 | 57 600 (LUTM) | 33.2 % | |
+| — as shift registers | 1 822 | 57 600 (LUTM) | 3.2 % | |
+| CLB registers | 108 908 | 234 240 | 46.5 % | within |
+| CARRY8 | 2 615 | 14 640 | 17.9 % | within |
+| CLBs (any part used) | 14 376 | 14 640 | 98.2 % | full: almost every CLB holds something |
+| block RAM tiles | 142 (122 RAMB36 + 40 RAMB18) | 144 | 98.6 % | over |
+| URAM | 58 | 64 | 90.6 % | over |
 | DSP48E2 | 845 | 1 248 | 67.7 % | within |
-| BUFGCE / MMCM | 1 / 1 | 112 / 4 | | |
-| bonded IOB | 0 | 189 | 0 % | |
+| BUFGCE / MMCM / PLL | 5 / 2 / 1 | 112 / 4 / 8 | | |
+| bonded IOB | 14 | 189 | 7.4 % | the camera (§6.6) |
 
 What this means for the next change:
-- **Block RAM and URAM are the binding resources.**  Eight BRAM tiles and
-  seven URAMs are left (the row-ops unit's GATE took two, RPU_PLAN §14.10).  A new buffer must come from LUTRAM, or from a
-  kernel's existing storage.
-- **LUTs are inside the guideline again, CLBs are not.**  The FOLD design
-  did not route at 83.4 % LUTs; the area pass of `doc/plans/AREA_PLAN.md`
-  brought it to 76.5 % (−4.4 k against `1cedaf2ed816`, which had no FOLD).
-  Almost every CLB still holds something, so placement has little room to
-  spread a congested region; the +0.027 ns slack, and the nine rip-up
-  iterations (131 min) the router needed for `04259a7af917`, are the visible
-  consequence.
+- **Block RAM and URAM are the binding resources.**  Two BRAM tiles and six
+  URAMs are left (the camera's capture path took six tiles and one URAM, the
+  row-ops unit's GATE two URAMs, RPU_PLAN §14.10).  A new buffer must come
+  from LUTRAM, or from a kernel's existing storage.
+- **LUTs are inside the guideline, CLBs are not.**  The FOLD design did not
+  route at 83.4 % LUTs; the two area passes of `doc/plans/AREA_PLAN.md` took
+  4.4 k and 11.8 k LUTs out of the kernels, and with the capture path
+  (+7.4 k) the design sits at 74.3 %.  Almost every CLB still holds
+  something, so placement has little room to spread a congested region; the
+  slack stays small (+0.040 ns, after five rip-up iterations and 38 min of
+  routing; `04259a7af917` needed nine and 131 min for +0.027 ns).
 - **DSPs have room** (403 left).  Arithmetic is not the limit; memory and
   routing are.
 
@@ -1213,6 +1243,7 @@ its `.json.example`) names the `.bit` the tools load.
 | `.hwh` | Vivado | the loader: the PS port widths, the PL0 frequency, the kernels' clock; the memory-topology xclbin |
 | xclbin (memory topology only) | `xclbinutil` via the loader | XRT `zocl`: the buffer objects |
 | `design_cormorant.dtbo` from `dts/kv260/cormorant.dts` | the build (`make dtbo_kv260_cormorant`) | Linux: UIO devices `fabric_vecop`, `fabric_matmul`, `fabric_conv`, `fabric_pool`, `fabric_rowops`; `zocl`; `afi0` |
+| `design_cormorant_capture.dtbo` from `dts/kv260/cormorant_capture.dts` (only with the camera capture path, §6.6) | the build (`make dtbo_kv260_cormorant_capture`) | Linux: the same, plus the camera's V4L2 media pipeline (`ap1302`, the CSI-2 receiver, the frame buffer; `/dev/mediaN`, `/dev/videoN`) |
 | AFI width registers (AFIFM `0xFD36_0000`–`0xFD3B_0000`, `0xFF9B_0000`; FPD SLCR) | the loader, after the overlay | the PS ports: 128-bit |
 | `.xsa` (`write_hw_platform -fixed -include_bit`) | `tools/rpu/write_xsa.tcl` | `tools/rpu/make_r5_bsp.py`: the R5's standalone BSP (`xparameters.h`, `libxil`), rebuilt when kernels, addresses or interrupts change |
 | C drivers | `kernels/<k>_rtl/scripts/gen_driver.py`, `make driver_<k>_rtl` | the generated model projects, the R5 firmware, the benchmarks |

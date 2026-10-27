@@ -403,7 +403,7 @@ paths the sigmoid UltraRAMs' outputs, as before — none in the operand
 muxes, the bypass or the saturation), 35 323 LUT (+1 134), 28 667 FF
 (+1 637), 6 RAMB36, 9 URAM (+2: the B-side table copies), 133 DSP (+4: the
 B-side interpolations); `ro_stream` 9 110 LUT, 7 233 FF, 4 URAM, 24 DSP.
-In context (bitstream `04259a7af917`, 2026-10-16; production since 2026-10-17): 35 337 LUT, 28 673 FF,
+In context (bitstream `04259a7af917`, 2026-10-16; production from 2026-10-17): 35 337 LUT, 28 673 FF,
 6 RAMB36, 9 URAM, 133 DSP; the design closes 4 ns with WNS +0.027 ns /
 WHS +0.010 ns at 91 805 LUT and 57 / 64 URAM (a longer route: nine
 rip-up iterations, RPU_PLAN §14.10).  After the LUT / FF pass of
@@ -411,7 +411,9 @@ AREA_PLAN §6 (2026-10-24, out of context at 3.333 ns, Vivado 2025.2;
 the production RTL in the same run 35 323 LUT (4 332 LUTRAM, 615 SRL),
 28 667 FF, 133 DSP, WNS −0.027 ns, as above): WNS +0.002 ns, 27 150 LUT
 (4 024 LUTRAM, 744 SRL), 22 290 FF, 6 RAMB36, 9 URAM, 125 DSP (−8: NORM's
-narrower P1 · G); results and cycle counts unchanged.
+narrower P1 · G); results and cycle counts unchanged.  In context in the
+production `b4e63457057a` (2026-10-28, with the MIPI camera's capture path):
+27 160 LUT, 21 742 FF, 6 RAMB36, 9 URAM, 125 DSP; WNS +0.040 ns at 87 013 LUT.
 
 ## 3. Performance
 

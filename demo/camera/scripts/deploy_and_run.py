@@ -121,8 +121,26 @@ def preflight_remote(session: RemoteSession, cfg: dict) -> bool:
     ok &= _check_label(f"work_dir parent writable ({parent})",
                        rc == 0 and "writable" in out, work_dir)
 
-    # Board-side Python dependencies for the camera loop.
+    # Board-side Python dependencies for the camera loop, and the camera.
     board_py = cfg["run"].get("board_python", "python3")
+    if camera_source(cfg) == "mipi":
+        out, err, rc = session.exec(f"{shlex.quote(board_py)} -c 'import numpy, cv2'",
+                                    timeout=30)
+        deps_ok = (rc == 0)
+        ok &= _check_label("board python deps (numpy, cv2)", deps_ok,
+                           "" if deps_ok else (err.strip().splitlines()[-1:]
+                                               or ["import failed"])[0])
+        out, _, rc = session.exec(
+            "command -v media-ctl v4l2-ctl >/dev/null || { echo no-tools; exit; }; "
+            "for m in /dev/media*; do media-ctl -d $m -p 2>/dev/null "
+            "| grep -o -m1 'entity [0-9]*: ap1302[^ ]*' && break; done", timeout=30)
+        isp = out.strip().split(": ", 1)[-1] if "ap1302" in out else ""
+        ok &= _check_label("media-ctl / v4l2-ctl", "no-tools" not in out,
+                           "" if "no-tools" not in out else "apt-get install v4l-utils")
+        ok &= _check_label("AP1302 ISP in a media graph", bool(isp),
+                           isp or "load a bitstream with the capture path and "
+                                  "dts/kv260/cormorant_capture.dts")
+        return ok
     probe = (f"{shlex.quote(board_py)} -c "
              "'import numpy, cv2, pyrealsense2 as rs; "
              "print(len(rs.context().query_devices()))'")
@@ -139,6 +157,15 @@ def preflight_remote(session: RemoteSession, cfg: dict) -> bool:
         print(_yellow("    → install on the board: see the demo README "
                       "'Board setup' section"))
     return ok
+
+
+def camera_source(cfg: dict) -> str:
+    """camera.source: 'realsense' (USB, the default) or 'mipi' (the KV260's
+    AR1335 / AP1302 through the bitstream's capture path)."""
+    src = cfg.get("camera", {}).get("source", "realsense")
+    if src not in ("realsense", "mipi"):
+        raise SystemExit(f"camera.source must be 'realsense' or 'mipi', not {src!r}")
+    return src
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -223,6 +250,7 @@ def _build_loop_cmd(cfg: dict, remote_proj: str, remote_assets: str,
         "--input-size":  int(prep.get("input_size", 224)),
         "--normalize":   prep.get("normalize", "tf"),
         "--top-k":       int(run.get("top_k", 5)),
+        "--source":      camera_source(cfg),
         "--width":       int(cam.get("width", 640)),
         "--height":      int(cam.get("height", 480)),
         "--fps":         int(cam.get("fps", 30)),

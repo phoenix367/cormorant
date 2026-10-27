@@ -226,7 +226,9 @@ foreach(_PF IN LISTS AXI_PLATFORM_FILES)
                 OUTPUT  "${_DTBO}"
                 COMMAND "${CMAKE_COMMAND}" -E make_directory "${_DTBO_DIR}"
                 COMMAND "${DTC_EXECUTABLE}" -@ -O dtb -o "${_DTBO}" "${_DTS}"
-                DEPENDS "${_DTS}"
+                # every .dts of the platform: one may /include/ another
+                # (cormorant_capture.dts includes cormorant.dts)
+                DEPENDS ${_DTS_FILES}
                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/dts/${_pname}"
                 COMMENT "DTC: ${_stem}.dts → design_${_stem}.dtbo"
                 VERBATIM

@@ -24,7 +24,7 @@ unit, fused into the FFN bias Adds (bitstream `6436623029f7`, ACTIVATIONS_PLAN.m
 p50 525 ms; with the 12 Softmaxes on its softmax unit (bitstream `588d721997cb`,
 SOFTMAX_PLAN.md): p50 427 ms; with VectorOPKernel's b read port on HPC1 (bitstream
 `8599aa7a5f12`, PS_PORTS_PLAN.md): p50 418 ms, bit-exact; with ConvKernel's x read port past the CCI
-(bitstream `1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit): p50 288 ms, bit-exact (364 on `f70ce632a97a`, DEPTHWISE_PLAN.md §8); with 48 of its 49 Transposes on the unit too (RPU_PLAN.md track A1, 2026-10-13; measured on the production bitstream `de968ccc45da`, 2026-10-15): p50 266 ms, bit-exact.  On `04259a7af917`, production since 2026-10-17 (RPU_PLAN.md §14.12): 267.1 ms an inference, 50 / 50 examples bit-exact.  Against the CPU (§4, 2026-10-19): onnxruntime on the board's four Cortex-A53 cores takes 3129 ms (fp32) / 2054 ms (int8) — the FPGA is 11.7× / 7.7× faster, at float accuracy.
+(bitstream `1cedaf2ed816`, HOSTOPS_PLAN.md phase 3: the 25 LayerNorms on the row-ops unit): p50 288 ms, bit-exact (364 on `f70ce632a97a`, DEPTHWISE_PLAN.md §8); with 48 of its 49 Transposes on the unit too (RPU_PLAN.md track A1, 2026-10-13; measured on the production bitstream `de968ccc45da`, 2026-10-15): p50 266 ms, bit-exact.  On `04259a7af917` (production from 2026-10-17, RPU_PLAN.md §14.12): 267.1 ms an inference, 50 / 50 examples bit-exact; the production `b4e63457057a` since 2026-10-28 runs every kernel call as fast (AREA_PLAN.md §6.5).  Against the CPU (§4, 2026-10-19): onnxruntime on the board's four Cortex-A53 cores takes 3129 ms (fp32) / 2054 ms (int8) — the FPGA is 11.7× / 7.7× faster, at float accuracy.
 
 ## 0. Feasibility (measured 2026-09-26)
 

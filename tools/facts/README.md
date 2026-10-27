@@ -207,7 +207,7 @@ A plugin is `fn(args, ctx) -> [(level, message, where)]`. Register it in
 | `platform.kv260_bounds` | value | the tiles and bounds of the README's kernel table, from `platforms/kv260.json`; also the RTL MatmulKernel's `K_MAX` and the RTL cost model's packed-B tile |
 | `board.pl_clock_mhz` | value, optional | the kernel clock (the block design's `clk_wiz_0`, 250 MHz since FMAX_250_PLAN) in the README, CLAUDE.md, the docs, the conv-cycle-model script's `PL_MHZ` and the cost model's `KERNEL_MHZ` |
 | `board.cma_mb` | value | the board's `cma=` size (1400 MiB, `src/remote/cma_boot.py`), in the README, CLAUDE.md, the chat docs, the skills and the study scripts |
-| `hw.utilization` | recorded | the production bitstream (`04259a7af917`) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
+| `hw.utilization` | recorded | the production bitstream (`b4e63457057a`) and its DSP / LUT / BRAM / URAM use, verified against the local Vivado placed-utilization report |
 | `board.uio_labels`, `board.uio_map` | interface | the overlay's UIO names (`dts/kv260/cormorant.dts`) and which kernel uses which, in the eight example configs, two doc tables, the README, a skill and the MNIST README |
 | `board.irq_spi` | interface | each kernel's interrupt (`pl_ps_irq0` bit n = SPI 89 + n, from the block design) in the overlay's UIO nodes and ARCHITECTURE.md |
 | `bert.model_mb` | value | the 435 MB BERT download (`fetch_assets.py`), quoted in 11 files |

@@ -18,7 +18,18 @@ bitstream the board loads (`/lib/firmware/pl.bin`), computed locally from
 the Vivado `.bit` (`src/perf_calls.py`).  A new bitstream needs a new
 campaign; planning refuses a model made for another one.
 
-`kv260/04259a7af917` is the production design (2026-10-17, RPU_PLAN §14 track A3a: `33a799febc56`'s
+`kv260/b4e63457057a` is the production design (2026-10-28, AREA_PLAN §6.5: `04259a7af917`'s kernels
+after their second area pass, with the MIPI camera's capture path, every call as fast as before — the
+2995 calls both models measured: median +0.02 %, p10 / p90 −0.41 / +0.48 %): `04259a7af917`'s converged
+case list (2904) with the 121 ConvKernel calls its calibration had measured in earlier rounds appended
+(3025 cases, as `8599aa7a5f12` began), two passes of 108 s, one refinement round (+18: BERT 2, SmolLM2-135M
+6, SmolLM2-360M 6, Moonshine tiny 4) → **3013 exact calls**, repeat spread median 0.066 %.  Families
+(train / held-out p90): conv 3.1 / 24.8 %, conv-dw 1.8 / 15.0 %, conv-mm 2.2 / 33.5 %, mm-gemv 4.3 /
+18.5 %, mm-tiled 1.2 / 7.0 %, pool 3.4 / 44.4 %, vecop 0.4 / 18.5 %, vecop-div 0.6 / 7.8 %, vecop-smx (116
+calls) and rowops (316 calls, train median 1.7 %); the chain term −1.95 / +0.93 µs.  `host.json`
+unchanged.
+
+`kv260/04259a7af917` was the production design before (2026-10-17, RPU_PLAN §14 track A3a: `33a799febc56`'s
 with the row-ops unit's GATE op and SCALE flag, every existing call as fast as before — the 1924 calls
 both models measured: median 0.00 %, p90 +0.40 %): `cases` 1755 (the shipped calls with
 `kernels.rowops.gate` / `scale` — Piper's 16 gates as one GATE call of 54.1 µs, its stage averages as
@@ -28,7 +39,7 @@ held-out p90: conv 3.1 / 26.6 %, conv-mm 3.3 / 34.9 %, mm-gemv 4.8 / 18.2 %, mm-
 4.0 / 42.3 %, vecop 0.7 / 20.7 %, rowops 232 calls, train median 2.6 %); the chain term −1.96 / +0.95 µs.
 The Moonshine top-up of the same day (doc/plans/ASR_PLAN.md §6: moonshine-tiny / -base shipped, their
 attention at every runtime key count): `cases` 2599, two refinement rounds (+223, +82) → 2904 cases →
-**2995 exact calls**, repeat spread median 0.085 %; `host.json` 208 exact signatures, 46 kinds (the five
+2995 exact calls, repeat spread median 0.085 %; `host.json` 208 exact signatures, 46 kinds (the five
 `Asr*` host ops); `simulate` within ±2.2 % for the 512 / 1024-frame buckets and the decode step, −5…−6 %
 for the 128 / 256 buckets (the attention's short in-graph calls).
 

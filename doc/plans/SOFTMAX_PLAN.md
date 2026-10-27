@@ -2,8 +2,8 @@
 
 **Status (2026-10-08):** phases 0–5 done — bitstream
 `588d721997cb` (VectorOPKernel's softmax unit; production 2026-10-07 to
-2026-10-08, the unit in every later bitstream, production since 2026-10-17:
-`04259a7af917`), the platform gate
+2026-10-08, the unit in every later bitstream, production since 2026-10-28:
+`b4e63457057a`), the platform gate
 `kernels.vectorop.softmax` on, the chat server's libraries regenerated with
 the softmax on the FPGA and gated bit-exact on the board: BERT 525 → 427 ms,
 SmolVLM image 2.20 → 1.93 s, SmolLM2 prefill-256 811 → 737 ms (135M) /

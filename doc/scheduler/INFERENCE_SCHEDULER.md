@@ -284,7 +284,7 @@ python3 -m venv .venv
 # Generate a complete C inference project from an ONNX model
 .venv/bin/python inference_scheduler.py model.onnx --out-dir /tmp/out
 # ... planned from the bitstream's performance model (§Planning; without the .bit that
-# bitstream_config_kv260.json names, add --perf-model perf_models/kv260/04259a7af917.json)
+# bitstream_config_kv260.json names, add --perf-model perf_models/kv260/b4e63457057a.json)
 .venv/bin/python inference_scheduler.py model.onnx --plan --out-dir /tmp/out
 
 # A multi-entry project: one library, inference_run_<name>() per graph,
@@ -1557,7 +1557,7 @@ sweep (which pays a dummy second position).
 
 **Engine choice** (`--matmul-on-conv auto`, the default): every
 `(kw, out_w | M)` geometry is ranked with `cost_model.conv_cycles` plus
-`CALL_OVERHEAD` (434 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
+`CALL_OVERHEAD` (432 cycles: the cheapest measured call at 250 MHz) per call, and the cheapest is priced on the
 board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
 `kernels.conv.impl` (env `AXI_CONV_IMPL`):
 
@@ -1569,8 +1569,9 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   pixel pair), the drain of chunk n beside chunk n + 1 — with one parameter
   set tuned to the Verilator testbench (`RTL_CONV_SIM`; median error 0.65 %,
   p90 5.3 % over 1 042 calls) and one to the board (`RTL_CONV_BOARD`:
-  DDR latency, x and weight runs; median 3.2 %, p90 19.3 % over the
-  1838 ConvKernel calls of the 250 MHz campaign `04259a7af917` (2.9 / 22.9 %
+  DDR latency, x and weight runs; median 3.2 %, p90 19.1 % over the
+  1856 ConvKernel calls of the 250 MHz campaign `b4e63457057a` (3.2 / 19.3 %
+  on `04259a7af917`, 2.9 / 22.9 %
   on `de968ccc45da`, 2.8 / 20.3 % on `1cedaf2ed816`, 2.9 / 18 % on `f70ce632a97a`, where it was fitted —
   HOSTOPS_PLAN §9.2 and §11.7 re-scored and kept it), refitted there because the x port's move off the CCI (DEPTHWISE_PLAN §8.5) left the
   previous fit 36 % high on the x-bound jobs; 18.3 / 45.8 % over the 1 190 of
@@ -1581,7 +1582,7 @@ board with `cost_model.conv_board_cycles`.  Both follow the ConvKernel of
   `tools/fit_cost_model.py`, which also lists the shipped models' engine
   choices a new set would move ([`OFFLOAD_PLAN.md`](../plans/OFFLOAD_PLAN.md)
   §2.3, §4.3).  BERT's per-head attention P·V conv: 30 576 cycles on the
-  board (0.12 ms at 250 MHz), 34 321 predicted.
+  board (0.12 ms at 250 MHz), 34 323 predicted.
 - **`"hls"`** (bitstreams `dbb320fb7297` and older): the standard path of
   the conv-cycle-model skill (§2.42, `--arch 42`), kept equal to the skill
   script by a test; `conv_board_cycles` adds what the RTL simulation hides:

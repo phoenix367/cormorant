@@ -30,7 +30,7 @@
 - **The one that paid (2026-10-10, `DEPTHWISE_PLAN.md` §8.5): ConvKernel's
   x read port on `S_AXI_HP2_FPD`, bitstream `f70ce632a97a`, production
   2026-10-10 / 11 to 2026-10-12; every later bitstream keeps the x port on
-  HP2 (production since 2026-10-17: `04259a7af917`).**
+  HP2 (production since 2026-10-28: `b4e63457057a`).**
   Short bursts are what the CCI throttles (§8): the depthwise and
   few-channel 1 × 1 convs −27…−67 %, LightStereo-S 599 → 469 ms, MobileNet
   v2 −14 %, BERT 418 → 364 ms, bit-exact — the outputs' move (§6–§7) lost

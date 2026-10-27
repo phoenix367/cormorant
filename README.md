@@ -41,8 +41,12 @@ that runs the transformers' norms, residual adds and SiLU·up and Piper's flow
 inputs in fixed point ([HOSTOPS_PLAN](doc/plans/HOSTOPS_PLAN.md)), with its GATE op
 and SCALE flag ([RPU_PLAN](doc/plans/RPU_PLAN.md) §14).  The chat models', Piper's
 and Moonshine's figures are from 2026-10-17 on the same bitstream (RPU_PLAN §14.12,
-ASR_PLAN).  The board runs the A53's interrupt waits and, as a soak test, the
-cores' deep idle state (about 2 % on the chat decode).  The chat-server Piper
+ASR_PLAN).  The production bitstream since 2026-10-28, `b4e63457057a`, adds the kernels'
+second area pass ([AREA_PLAN](doc/plans/AREA_PLAN.md) §6) and the MIPI camera's capture
+path ([demo/camera](demo/camera/README.md)); every kernel call runs as fast on it
+(AREA_PLAN §6.5), and these figures were not measured again.  The board runs the
+A53's interrupt waits and, as a soak test, the cores' deep idle state (about 2 % on
+the chat decode).  The chat-server Piper
 figures are from 2026-10-01, at 100 MHz.
 
 | Model | Result | Source |
@@ -62,9 +66,9 @@ figures are from 2026-10-01, at 100 MHz.
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
 audio samples are bit-exact with the scheduler's simulation; Moonshine's
 transcripts with its specification, token for token.
-The FPGA design (`hw/cormorant_hw_128`, bitstream `04259a7af917`) uses 68 % of the DSPs
-(845 / 1248), 78.4 % of the LUTs (91 805 / 117 120), 136 / 144 BRAM and
-57 / 64 URAM.
+The FPGA design (`hw/cormorant_hw_128`, bitstream `b4e63457057a`) uses 68 % of the DSPs
+(845 / 1248), 74.3 % of the LUTs (87 013 / 117 120), 142 / 144 BRAM and
+58 / 64 URAM.
 
 ---
 
@@ -200,7 +204,7 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/image_classification/`](demo/image_classification/) | MobileNet V1 / V2 and ResNet-18: top-5 ImageNet predictions for your images |
 | [`demo/object_detection/`](demo/object_detection/) | YOLOv5n object detection (COCO's 80 classes): boxes drawn on COCO128 or your pictures, mAP against float |
 | [`demo/stereo_depth/`](demo/stereo_depth/) | LightStereo-S stereo depth: disparity maps of Middlebury / ETH3D pairs, your rectified pairs or a RealSense D4xx on the board (`--capture`); EPE against the ground truth, depth against the camera's own |
-| [`demo/camera/`](demo/camera/) | MobileNet V1 on live RealSense frames, annotated frames streamed back over SSH |
+| [`demo/camera/`](demo/camera/) | MobileNet V1 on live camera frames — a RealSense on USB, or the KV260's AR1335 / AP1302 MIPI camera through the block design's capture path — annotated frames streamed back over SSH |
 | [`demo/bert_squad/`](demo/bert_squad/) | BERT-base extractive question answering on SQuAD 1.1 |
 | [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, Piper text to speech (`/v1/audio/speech`) and Moonshine speech to text (`/v1/audio/transcriptions`) |
 | [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |

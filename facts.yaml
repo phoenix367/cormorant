@@ -262,7 +262,7 @@ facts:
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'echo \$BID +# ([0-9a-f]{12})'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: 'baselines/ +# kv260-([0-9a-f]{12})\.json'}
     - {file: .claude/skills/perf-regression/SKILL.md, regex: '^platform kv260, bitstream ([0-9a-f]{12})'}
-    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds the unit''s GATE op'}
+    - {file: CLAUDE.md, regex: 'production `([0-9a-f]{12})` adds the kernels'' second area pass'}
     - {file: CLAUDE.md, regex: 'in the production bitstream `([0-9a-f]{12})` \(and'}
     # the status lines of the plans and kernel references (the 2.0 audit): a new bitstream rewrites them by hand
     - {file: doc/plans/ACTIVATIONS_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
@@ -275,8 +275,8 @@ facts:
     - {file: doc/plans/SOFTMAX_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
     - {file: doc/plans/VECTOROP_RTL_PLAN.md, regex: 'production\s+since\s+\d{4}-\d{2}-\d{2}:\s+`([0-9a-f]{12})`', fix: report}
     - {file: doc/plans/AREA_PLAN.md, regex: 'since \d{4}-\d{2}-\d{2}, the production `([0-9a-f]{12})`', fix: report}
-    - {file: doc/plans/BERT_PLAN.md, regex: 'On `([0-9a-f]{12})`, production since', fix: report}
-    - {file: doc/plans/RPU_PLAN.md, regex: 'production `([0-9a-f]{12})`, \d{4}-\d{2}-\d{2}; the Piper', fix: report}
+    - {file: doc/plans/BERT_PLAN.md, regex: 'the production `([0-9a-f]{12})` since \d{4}-\d{2}-\d{2} runs every kernel call', fix: report}
+    - {file: doc/plans/RPU_PLAN.md, regex: 'production\s+`([0-9a-f]{12})`, \d{4}-\d{2}-\d{2}; the Piper', fix: report}
     - {file: doc/kernels/MATMUL_RTL_KERNEL.md, regex: 'production `([0-9a-f]{12})` since', fix: report}
     - {file: doc/kernels/VECTOROP_RTL_KERNEL.md, regex: 'production\s+`([0-9a-f]{12})` since', fix: report}
     - {file: doc/scheduler/INFERENCE_SCHEDULER.md, regex: '--perf-model perf_models/kv260/([0-9a-f]{12})\.json'}
@@ -294,7 +294,7 @@ facts:
   mentions:
     - {file: inference-scheduler/perf_models/README.md, regex: '→\s+\*\*(?P<exact_calls>\d+) exact calls\*\*'}
     - {file: .claude/skills/perf-calibrate/SKILL.md, dotall: true,
-       regex: 'Moonshine top-up of the same day .*?→ (?P<exact_calls>\d+) exact\s+calls'}
+       regex: 'Current model: \*\*kv260/[0-9a-f]{12}\*\* .*?→ (?P<exact_calls>\d+) exact\s+calls'}
 
 # ── the engine cost model (src/cost_model.py; tools/fit_cost_model.py) ──────
 - id: cost_model.call_overhead
@@ -318,11 +318,14 @@ facts:
   kind: recorded
   title: the engine cost model's per-call error against the board (RTL_CONV_BOARD, RTL_COEF + CALL_OVERHEAD;
     median / p90 %) on the campaign it was fitted to, quoted in the code and the docs that describe the model
-  value: {conv_calls: 1838, conv_median: 3.2, conv_p90: 19.3, matmul_calls: 580, matmul_median: 4.7, matmul_p90: 17.0}
+  value: {conv_calls: 1856, conv_median: 3.2, conv_p90: 19.1, matmul_calls: 580, matmul_median: 4.7, matmul_p90: 16.4}
   tolerance: 0.05                            # the docs quote one decimal
   provenance:
-    date: 2026-10-18
-    how: "Re-scored on 04259a7af917 (the production campaign, 2995 exact calls; tools/fit_cost_model.py fit --rounds 0,
+    date: 2026-10-28
+    how: "Re-scored on b4e63457057a (the production campaign, 3013 exact calls; tools/fit_cost_model.py fit --rounds 0,
+          the row-ops descriptor chains left out): the constants as used ConvKernel 3.2 / 19.1 % over 1856 calls,
+          MatmulKernel 4.7 / 16.4 % over 580 (the same with the call floor 431); RTL_COEF's NNLS proposal (4.6 / 16.6 %)
+          not taken.  Before: re-scored on 04259a7af917 (the production campaign, 2995 exact calls; tools/fit_cost_model.py fit --rounds 0,
           the row-ops descriptor chains left out): the constants as used ConvKernel 3.2 / 19.3 % over 1838 calls,
           MatmulKernel 4.7 / 17.0 % over 580 (the same with the call floor 433); RTL_COEF's NNLS proposal (4.7 / 16.7 %)
           not taken.  Before: re-scored on de968ccc45da (HOSTOPS_PLAN §11.7, the campaign of FOLD after the area pass, 2100 exact calls):
@@ -354,7 +357,7 @@ facts:
           ConvKernel / MatmulKernel calls unchanged): the constants as used ConvKernel 18.6 / 48.3 % over 1265
           calls, MatmulKernel 4.5 / 17.7 % over 414; call floor 431 cycles: CALL_OVERHEAD 434 -> 431 with
           ONE / one +3"
-    facts: {perf.bitstream_id: 04259a7af917}  # a new bitstream: a new campaign, refit or re-score
+    facts: {perf.bitstream_id: b4e63457057a}  # a new bitstream: a new campaign, refit or re-score
   fix: report
   mentions:
     - {file: inference-scheduler/src/cost_model.py,
@@ -1479,12 +1482,15 @@ facts:
 - id: hw.utilization
   kind: recorded
   title: the production bitstream and its FPGA utilization (README)
-  value: {bitstream: 04259a7af917, dsp: 845, dsp_total: 1248, dsp_pct: 67.7, lut: 91805, lut_total: 117120, lut_pct: 78.4,
-          bram: 136, bram_total: 144, uram: 57, uram_total: 64}
+  value: {bitstream: b4e63457057a, dsp: 845, dsp_total: 1248, dsp_pct: 67.7, lut: 87013, lut_total: 117120, lut_pct: 74.3,
+          bram: 142, bram_total: 144, uram: 58, uram_total: 64}
   tolerance: 0.5                             # the docs round the percentages
   provenance:
-    date: 2026-10-17
-    how: "Vivado placed utilization report of the 250 MHz design with the row-ops unit's GATE op and SCALE flag
+    date: 2026-10-28
+    how: "Vivado placed utilization report of the 250 MHz design with the kernels' second area pass (AREA_PLAN §6) and
+          the MIPI camera's capture path (hw_128 scripts/bd_mipi_capture.tcl; /mnt/data/bitstreams/kv260_250_b4e63457057a/:
+          LUT 91 805 -> 87 013 — the area pass alone, 89205c11fded, 79 986; the capture path +7 027 —, FF 111 099 -> 108 908,
+          BRAM 136 -> 142 tiles, URAM 57 -> 58, DSP unchanged; WNS +0.040 ns); 04259a7af917 before it: the 250 MHz design with the row-ops unit's GATE op and SCALE flag
           (RPU_PLAN §14.10, /mnt/data/bitstreams/kv260_250_04259a7af917/: LUT 90 607 -> 91 805 — RowOps +1 254 —,
           FF 109 798 -> 111 099, +2 URAM, +4 DSP; WNS +0.027 ns after nine rip-up iterations); 33a799febc56 before
           it: the design with ConvKernel's y channel pattern and the row-ops
@@ -1512,7 +1518,7 @@ facts:
           before it, the HLS ConvKernel: LUT 75 472, DSP 973, BRAM 105; 7d8eefe's b3309f424562 before that,
           the HLS PoolingKernel: LUT 80 914, DSP 1038, BRAM 105.5; 68665fc1833a, the MatmulKernel IP without
           bus parameters: LUT 80 965; bbb9a37f73f8, the HLS VectorOPKernel: LUT 84 561, DSP 1060, BRAM 109.5)"
-    facts: {perf.bitstream_id: 04259a7af917}
+    facts: {perf.bitstream_id: b4e63457057a}
   verify:
     dsp: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| DSPs\s+\|\s+(\d+) ', type: int}
     lut: {file: hw/cormorant_hw_128/cormorant_hw_128.runs/impl_1/design_cormorant_wrapper_utilization_placed.rpt, regex: '^\| CLB LUTs\s+\|\s+(\d+) ', type: int}

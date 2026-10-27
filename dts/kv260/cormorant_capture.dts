@@ -1,0 +1,196 @@
+// Copyright 2026 Ivan Gubochkin
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * The overlay of a bitstream with the camera capture path
+ * (hw/cormorant_hw_128/scripts/bd_mipi_capture.tcl): the five kernels of
+ * cormorant.dts, and the AR1335 sensor behind the carrier card's AP1302 ISP
+ * as a V4L2 media pipeline — AP1302 -> MIPI CSI-2 receiver -> frame buffer
+ * writer (NV12) -> /dev/videoN.  The nodes are those of AMD's kv260-smartcam
+ * overlay (/lib/firmware/xilinx/kv260-smartcam/kv260-smartcam.dtbo), the frame
+ * buffer at 0x80010000 instead of 0xb0010000.  Never apply it over a bitstream
+ * without the capture path: the kernel would access an unmapped LPD port.
+ * The board kernel binds the receiver as 5.0 and the frame buffer as v2.1
+ * (the IPs are 6.0 and 3.0).
+ */
+
+/include/ "cormorant.dts"
+
+/ {
+	fragment@8 {
+		target = <&amba>;
+		overlay8: __overlay__ {
+			/* the capture path's clocks: PL0 (100 MHz) and the MMCM's 200 MHz */
+			cap_clk_100: cap_clk_100 {
+				#clock-cells = <0x00>;
+				compatible = "fixed-factor-clock";
+				clocks = <&zynqmp_clk 71>;
+				clock-div = <1>;
+				clock-mult = <1>;
+			};
+
+			cap_clk_200: cap_clk_200 {
+				#clock-cells = <0x00>;
+				compatible = "fixed-factor-clock";
+				clocks = <&zynqmp_clk 71>;
+				clock-div = <1>;
+				clock-mult = <2>;
+			};
+
+			cap_vdd: cap_vdd {
+				compatible = "regulator-fixed";
+				regulator-name = "ap1302_vdd";
+				regulator-min-microvolt = <2800000>;
+				regulator-max-microvolt = <2800000>;
+				enable-active-high;
+			};
+
+			cap_vaa: cap_vaa {
+				compatible = "regulator-fixed";
+				regulator-name = "ap1302_vaa";
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+			};
+
+			cap_vddio: cap_vddio {
+				compatible = "regulator-fixed";
+				regulator-name = "ap1302_vddio";
+				regulator-min-microvolt = <1200000>;
+				regulator-max-microvolt = <1200000>;
+			};
+
+			/* cap_iic, pl_ps_irq1[3] = SPI 107: the PCA9546 switch, the ISP on channel 0 */
+			cap_iic: i2c@80030000 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				compatible = "xlnx,axi-iic-2.0", "xlnx,xps-iic-2.00.a";
+				reg = <0x00 0x80030000 0x00 0x10000>;
+				clocks = <&cap_clk_100>;
+				clock-names = "s_axi_aclk";
+				interrupt-parent = <&gic>;
+				interrupts = <0x00 0x6b 0x04>;
+				interrupt-names = "iic2intc_irpt";
+
+				i2c-mux@74 {
+					compatible = "nxp,pca9546";
+					reg = <0x74>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					i2c@0 {
+						reg = <0>;
+						#address-cells = <1>;
+						#size-cells = <0>;
+
+						isp@3c {
+							compatible = "onnn,ap1302";
+							reg = <0x3c>;
+							#address-cells = <1>;
+							#size-cells = <0>;
+							reset-gpios = <&gpio 79 1>;	/* EMIO 1, active low */
+							clocks = <&si5332_2>;
+
+							sensors {
+								#address-cells = <1>;
+								#size-cells = <0>;
+								onnn,model = "onnn,ar1335";
+
+								sensor@0 {
+									reg = <0>;
+									vdd-supply = <&cap_vdd>;
+									vaa-supply = <&cap_vaa>;
+									vddio-supply = <&cap_vddio>;
+								};
+							};
+
+							ports {
+								#address-cells = <1>;
+								#size-cells = <0>;
+
+								port@2 {
+									reg = <2>;
+									cap_isp_out: endpoint {
+										remote-endpoint = <&cap_csi_in>;
+										data-lanes = <1 2 3 4>;
+									};
+								};
+							};
+						};
+					};
+				};
+			};
+
+			/* cap_csi, pl_ps_irq1[0] = SPI 104: 4 lanes, YUV 4:2:0 8-bit (0x18), 2 pixels per clock */
+			cap_csi: csiss@80000000 {
+				compatible = "xlnx,mipi-csi2-rx-subsystem-5.0";
+				reg = <0x00 0x80000000 0x00 0x2000>;
+				clock-names = "lite_aclk", "dphy_clk_200M", "video_aclk";
+				clocks = <&cap_clk_100>, <&cap_clk_200>, <&cap_clk_200>;
+				interrupt-parent = <&gic>;
+				interrupts = <0x00 0x68 0x04>;
+				xlnx,csi-pxl-format = <0x18>;
+				xlnx,axis-tdata-width = <32>;
+				xlnx,max-lanes = <4>;
+				xlnx,en-active-lanes;
+				xlnx,ppc = <2>;
+				xlnx,vfb;
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						cap_csi_in: endpoint {
+							data-lanes = <1 2 3 4>;
+							remote-endpoint = <&cap_isp_out>;
+						};
+					};
+
+					port@1 {
+						reg = <1>;
+						cap_csi_out: endpoint {
+							remote-endpoint = <&cap_vcap_in>;
+						};
+					};
+				};
+			};
+
+			/* cap_fb, pl_ps_irq1[1] = SPI 105: NV12 into DDR through HP3; ap_rst_n on EMIO 0 */
+			cap_fb: fb_wr@80010000 {
+				compatible = "xlnx,axi-frmbuf-wr-v2.1";
+				reg = <0x00 0x80010000 0x00 0x10000>;
+				#dma-cells = <1>;
+				interrupt-parent = <&gic>;
+				interrupts = <0x00 0x69 0x04>;
+				xlnx,vid-formats = "nv12";
+				reset-gpios = <&gpio 78 1>;
+				xlnx,dma-addr-width = <32>;
+				xlnx,pixels-per-clock = <2>;
+				xlnx,max-width = <1920>;
+				xlnx,max-height = <1080>;
+				clocks = <&cap_clk_200>;
+				clock-names = "ap_clk";
+			};
+
+			cap_vcap: cap_vcap {
+				compatible = "xlnx,video";
+				dmas = <&cap_fb 0>;
+				dma-names = "port0";
+
+				ports {
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					port@0 {
+						reg = <0>;
+						direction = "input";
+						cap_vcap_in: endpoint {
+							remote-endpoint = <&cap_csi_out>;
+						};
+					};
+				};
+			};
+		};
+	};
+};

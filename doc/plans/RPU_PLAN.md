@@ -10,8 +10,8 @@ with it.  B3 started (§11: the R5 asleep between commands, protocol v5,
 −50 mW idle).  The A53 sleeps on the kernels' interrupts too (§12).  A2 done
 (§13: ConvKernel's y channel pattern, the unit's descriptor chains;
 production `33a799febc56`, 2026-10-16).  A3a done (§14: the unit's GATE op
-and SCALE flag; production `04259a7af917`, 2026-10-17; the Piper chunk
-177 → 148 ms).  Open: the rest of B3 (the APU clock, the PL and DDR, §11)
+and SCALE flag; `04259a7af917` from 2026-10-17, then the production
+`b4e63457057a`, 2026-10-28; the Piper chunk 177 → 148 ms).  Open: the rest of B3 (the APU clock, the PL and DDR, §11)
 and the rest of A3 (§3.3: the unaligned row start for the Piper encoder's
 merge, the stereo pass's long-row norms and correlation).
 
