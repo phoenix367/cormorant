@@ -31,7 +31,9 @@ The shipped models (SHIPPED) are the demos' CNNs, BERT, SmolLM2-135M /
 360M, SmolVLM-256M, Piper (the chunk and encode_<T> entries of
 libpiper_tts.so, built by demo/tts/scripts/generate_tts_project.py) and
 Moonshine tiny / base (the encode_<T> and decode entries of
-libmoonshine_<size>.so, demo/asr/scripts/generate_asr_project.py).
+libmoonshine_<size>.so, demo/asr/scripts/generate_asr_project.py) and
+SmolVLA (the vision, image_<c>, prefix_<C> and expert entries of
+libsmolvla.so, demo/vla/scripts/generate_vla_project.py).
 
 usage:
   .venv/bin/python perf_calibrate.py cases [--models ...]
@@ -72,6 +74,7 @@ MODELS_DIR = HERE / "perf_models" / PLATFORM
 CHAT = REPO / "demo" / "chat"
 TTS = REPO / "demo" / "tts"
 ASR = REPO / "demo" / "asr"
+VLA = REPO / "demo" / "vla"
 RUNNER_VERSION = 1
 KLETTER = {"VectorOPKernel": "V", "MatmulKernel": "M", "ConvKernel": "C", "PoolKernel": "P",
            "RowOpsKernel": "R"}
@@ -81,7 +84,7 @@ MHZ = local_kernel_clock_mhz() or 100.0
 
 SHIPPED = ("mnist_convnet", "mnist_lenet", "mobilenet_v1", "mobilenet_v2", "resnet18", "bert",
            "smollm2-135m-instruct", "smolvlm-256m-instruct", "smollm2-360m-instruct",
-           "piper-lessac-medium", "moonshine-tiny", "moonshine-base")
+           "piper-lessac-medium", "moonshine-tiny", "moonshine-base", "smolvla-base")
 
 
 def log(msg: str) -> None:
@@ -129,6 +132,17 @@ def asr_graphs(name: str) -> List[Tuple[str, object]]:
     return gap.entry_graphs(cfg, W, fmt, name=gap.lib_name(name))
 
 
+def vla_graphs() -> List[Tuple[str, object]]:
+    """SmolVLA's entries (vision, image_<c>, prefix_<C>, expert) exactly as
+    libsmolvla.so is generated (demo/vla/scripts/generate_vla_project.py, the
+    config's cameras)."""
+    if str(VLA / "scripts") not in sys.path:
+        sys.path.insert(0, str(VLA / "scripts"))
+    import generate_vla_project as gvp
+    cfg, W, fmt = gvp.load(gvp.ASSETS, gvp.default_formats())
+    return gvp.entry_graphs(cfg, W, fmt, cfg.cameras)
+
+
 def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
     """``(entry, OnnxGraph)`` of a shipped model, scheduled as its demo does."""
     from src.graph import OnnxGraph
@@ -160,6 +174,8 @@ def shipped_graphs(name: str) -> Iterator[Tuple[str, object]]:
         yield from piper_graphs()
     elif name.startswith("moonshine-"):
         yield from asr_graphs(name)
+    elif name == "smolvla-base":
+        yield from vla_graphs()
     else:
         raise KeyError(f"unknown shipped model {name!r} (choose from {SHIPPED})")
 
@@ -766,6 +782,10 @@ def _entry_graphs(model: str, planned: bool) -> Dict[str, object]:
         if planned:
             raise SystemExit(f"error: {model}: generate_asr_project.py has no planned build")
         return dict(asr_graphs(model))
+    if model == "smolvla-base":
+        if planned:
+            raise SystemExit(f"error: {model}: generate_vla_project.py has no planned build")
+        return dict(vla_graphs())
     if not (model.startswith("smollm2-") or model.startswith("smolvlm-")):
         from src.graph import OnnxGraph
         (name, g), = shipped_graphs(model)

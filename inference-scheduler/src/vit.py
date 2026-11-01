@@ -44,6 +44,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import onnx
 import onnx.helper as oh
+import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 from . import numeric
@@ -56,6 +57,66 @@ RES_BITS = 15           # the int32 DMA residual's exponent with rowops (doc/pla
 IEMBED_DEFAULT = False  # rowops: the patch-embedding add on the unit too (the position table rounded once at
                         # 2^-RES_BITS as an int32 stream; vlm_study's policy ...+rowops+iembed, RPU_PLAN §3.1)
 CONN = "model.connector.modality_projection.proj.weight"
+
+# Row pieces (VitFrontend ``pieces``, doc/plans/VLA_PLAN.md §4): the board's rates on the production
+# bitstream b4e63457057a, in µs per MAC (a linear's rows on either kernel) or per element (the row ops,
+# the host's embedding add) — only for the issue order of the pieces (_Pipe), never for a result.
+PIECE_US_PER_MAC = {"conv": 1 / 123e3, "matmul": 1 / 27e3}     # (MatmulKernel: pieces given explicitly)
+PIECE_US_PER_ELEM = {"rowops_ln": 1.0e-3, "rowops_res": 1.5e-3, "vop_gelu": 1.3e-3, "cpu": 2.0e-3,
+                     "vop_smx": 1.73e-3}
+# the attention's calls (1024 x 1024 x 64 on the board): q.K^T on ConvKernel 1.87 ms, P.V 1.07 ms,
+# the row-mode softmax 1.81 ms
+ATTN_US_PER_MAC = {"qk_conv": 1 / 35.9e3, "pv_conv": 1 / 62.7e3}
+
+
+def default_pieces(n: int) -> Optional[tuple]:
+    """Row pieces of the encoder's ``n`` tokens: two halves on ConvKernel, in
+    multiples of 16 rows (1024 -> 512 + 512); None below 256 rows.  On the
+    board two pieces and four take the same time (VLA_PLAN §4: 1314 ms an
+    image either way), and a MatmulKernel piece loses: beside ConvKernel its
+    calls run ~1.9x slower than alone (1826 ms)."""
+    if n < 256 or n % 16:
+        return None
+    half = n // 32 * 16
+    return ((half, "conv"), (n - half, "conv"))
+
+
+class _Pipe:
+    """The issue order of a row-pieced stretch of the graph: each node is added
+    with its lane, its estimated time and its input / output tensors, and
+    flush() emits them in the order of a greedy list schedule — the earliest
+    estimated start first (each lane serial, inputs written), ties in the order
+    added.  The generated inference_run() issues in list order and waits in
+    order, so every lane gets its next piece as soon as it frees."""
+
+    def __init__(self):
+        self.tasks: list = []
+
+    def add(self, lane: str, us: float, ins, outs, emit) -> None:
+        self.tasks.append((lane, float(us), list(ins), list(outs), emit))
+
+    def flush(self) -> None:
+        here = {o for t in self.tasks for o in t[3]}
+        ready: Dict[str, float] = {}
+        free: Dict[str, float] = {}
+        todo = list(range(len(self.tasks)))
+        while todo:
+            best = None
+            for j in todo:
+                lane, _us, ins, _outs, _emit = self.tasks[j]
+                if any(x in here and x not in ready for x in ins):
+                    continue
+                t0 = max([free.get(lane, 0.0)] + [ready.get(x, 0.0) for x in ins])
+                if best is None or t0 < best[0]:
+                    best = (t0, j)
+            t0, j = best
+            lane, us, _ins, outs, emit = self.tasks[j]
+            free[lane] = t0 + us
+            for o in outs:
+                ready[o] = t0 + us
+            emit()
+            todo.remove(j)
+        self.tasks = []
 
 
 @dataclass
@@ -182,12 +243,27 @@ class VitFrontend:
                  name: str = "vit", image_state: str = "vlm.img", conn_k: int = 4096,
                  qk_kw: Optional[int] = None, pv_kw: Optional[int] = None,
                  attn_split: int = 1, vsmx: bool = False, rowops: bool = False,
-                 iembed: Optional[bool] = None):
+                 iembed: Optional[bool] = None, query_major: Optional[bool] = None,
+                 pieces=None):
         """``attn_split`` R > 1 splits every head's softmax and P.V by query
         rows into R parts (TACTICS_PLAN §4.4): the CPU can then start the
         next ConvKernel call between the parts (--plan's order search).
         ``vsmx`` (policy pow2+p12+vgelu+vsmx, doc/plans/SOFTMAX_PLAN.md): the
-        softmax on VectorOPKernel's softmax unit (VitAttnSoftmax vsmx = 1)."""
+        softmax on VectorOPKernel's softmax unit (VitAttnSoftmax vsmx = 1).
+        ``query_major`` (default: with vsmx and rowops): the scores conv with
+        the roles of q and k swapped (VitAttnPrep query_major = 1: q in the
+        cache rows, k in the image), s [queries][keys], and the unit's row
+        mode over it — the same P, the row mode twice as fast as the column
+        mode's two-beat reads (doc/plans/VLA_PLAN.md §4).
+        ``pieces`` (default with rowops: default_pieces(N); False: none): the
+        rows [(rows, "conv" | "matmul"), ...] the linears, LayerNorms, GELUs
+        and residual adds run in, each linear piece pinned to its kernel
+        (axi.numeric ``engine``; the pieces of a weight read one image of it)
+        and the pieces issued as a pipeline (_Pipe) — MatmulKernel takes a
+        share of every linear, and the row ops of one piece run under the
+        linears of the next; the attention reads q / k / v whole (in-place
+        Concats) and its output by row views, its calls issued as a pipeline
+        too.  Same results."""
         self.cfg = cfg
         self.vsmx = bool(vsmx)
         # rowops (policy ...+rowops, doc/plans/HOSTOPS_PLAN.md §6): the residual stream
@@ -197,6 +273,19 @@ class VitFrontend:
         self.iembed = (self.rowops and IEMBED_DEFAULT) if iembed is None else bool(iembed)
         if self.iembed and not self.rowops:
             raise ValueError("iembed needs rowops")
+        self.query_major = (self.vsmx and self.rowops) if query_major is None else bool(query_major)
+        if self.query_major and not (self.vsmx and self.rowops):
+            raise ValueError("query_major needs vsmx and rowops")
+        if pieces is None:
+            pieces = default_pieces(cfg.N) if self.rowops else None
+        self.pieces = tuple((int(r), str(k)) for r, k in pieces) if pieces else None
+        if self.pieces:
+            if not self.rowops:
+                raise ValueError("pieces need rowops (the residual stream in DMA)")
+            if sum(r for r, _k in self.pieces) != cfg.N or any(r % 16 or k not in ("conv", "matmul")
+                                                                for r, k in self.pieces):
+                raise ValueError(f"pieces {self.pieces}: rows in multiples of 16 adding up to {cfg.N}, "
+                                 "on 'conv' or 'matmul'")
         if attn_split < 1 or cfg.N % (attn_split * 16):
             raise ValueError(f"attn_split {attn_split}: {cfg.N} query rows not in parts of 16")
         self.attn_split = int(attn_split)
@@ -214,7 +303,7 @@ class VitFrontend:
             raise ValueError(f"connector K {cfg.D * cfg.scale ** 2} % chunk {self.conn_k}")
 
     def _vsmx_attr(self) -> dict:
-        return dict(vsmx=1) if self.vsmx else {}
+        return (dict(vsmx=1) if self.vsmx else {}) | (dict(query_major=1) if self.query_major else {})
 
     def choose_qk_kw(self) -> int:
         """Kernel width of the q.K^T calls' q image: the cheapest by the conv
@@ -240,14 +329,16 @@ class VitFrontend:
         self._nodes: List[onnx.NodeProto] = []
         self._vi: Dict[str, onnx.ValueInfoProto] = {}
         self._inits: Dict[str, np.ndarray] = {}      # converted in _model
+        self._int_inits: Dict[str, np.ndarray] = {}  # int64 (a Slice's starts / ends)
         self._meta = numeric.empty()
 
-    def _res(self, name):
-        """A residual-stream tensor [N][D]: float32 host, or with rowops the int32
-        DMA tensor at 2^-RES_BITS."""
+    def _res(self, name, rows=None):
+        """A residual-stream tensor [N][D] (or ``rows`` of it): float32 host, or
+        with rowops the int32 DMA tensor at 2^-RES_BITS."""
+        rows = self.cfg.N if rows is None else rows
         if self.rowops:
-            return self._t(name, [self.cfg.N, self.cfg.D], exp=RES_BITS, dma="i32")
-        return self._t(name, [self.cfg.N, self.cfg.D], host="f32")
+            return self._t(name, [rows, self.cfg.D], exp=RES_BITS, dma="i32")
+        return self._t(name, [rows, self.cfg.D], host="f32")
 
     def _t(self, name, shape, elem=TensorProto.FLOAT, exp=None, host=None, state=False, dma=None):
         if name not in self._vi:
@@ -279,11 +370,11 @@ class VitFrontend:
     def _vec(self, name, arr):
         return self._init(name, np.asarray(arr, np.float32).reshape(-1))
 
-    def _ln(self, h, li, which, out, exp, gname, bname):
+    def _ln(self, h, li, which, out, exp, gname, bname, rows=None):
         c = self.cfg
         g = self._vec(f"v.{which}.g" if li is None else f"v.l{li}.{which}.g", self.W[gname])
         b = self._vec(f"v.{which}.b" if li is None else f"v.l{li}.{which}.b", self.W[bname])
-        self._t(out, [c.N, c.D], exp=exp)
+        self._t(out, [c.N if rows is None else rows, c.D], exp=exp)
         self._node("VitLayerNorm", [h, g, b], [out], out.replace("vision.", "vision.ln_"),
                    domain=LLM_DOMAIN, axi_eps=repr(float(c.eps)))
         return out
@@ -298,8 +389,11 @@ class VitFrontend:
         pin = self._t("vision.patches", [N, 3 * c.P * c.P], exp=0)
         pe = self._matmul(pin, "w.v.pe", patch_weight(W, c), N, "vision.pe", fm.get("pe", 0, D),
                           "vision.patch_embed")
-        h = self._res("vision.h0")
-        if self.iembed:                 # the table as int32 words at 2^-RES_BITS (rounded once), one ADDX
+        h = None if self.pieces else self._res("vision.h0")
+        if self.pieces:
+            pipe = _Pipe()
+            hs = self._embed_pieces(pipe, pe)
+        elif self.iembed:                 # the table as int32 words at 2^-RES_BITS (rounded once), one ADDX
             from .rowops_nodes import EmbedAddRoNode
             b0q = np.clip(np.rint(patch_bias_table(W).astype(np.float64) * 2.0 ** RES_BITS),
                           -2147483648.0, 2147483647.0)
@@ -332,8 +426,10 @@ class VitFrontend:
             self._init(qs, np.zeros((N, D), np.float32))
             self._init(vs, np.zeros((N, D), np.float32))
             prep_extra, prep_attrs = [qs, vs], dict(rowops=1)
+            if self.query_major:
+                prep_attrs["query_major"] = 1
         common = dict(num_heads=H, num_kv_heads=H, head_dim=HD, key_quantum=16 * self.pv_kw)
-        for li in range(L):
+        for li in range(L if not self.pieces else 0):
             lw = f"{VP}encoder.layers.{li}."
             e = f"vision.l{li}"
             x = self._ln(h, li, "ln1", f"{e}.x", fm.get("x", li, D), lw + "layer_norm1.weight",
@@ -344,73 +440,8 @@ class VitFrontend:
                               fm.get("k0", li, D), f"{e}.k_proj")
             v0 = self._matmul(x, f"w.v.l{li}.v", W[lw + "self_attn.v_proj.weight"].T, N, f"{e}.v",
                               fm.get("v", li, D), f"{e}.v_proj")
-            fq, fk, fp = fm.get("q", li, H), fm.get("k", li, H), fm.get("p", li, H)
-            fs = fq + fk - F
-            qx = self._t(f"{e}.qx", [H, HD, N], exp=0)
-            self._node("VitAttnPrep", [q0, k0, v0, kc, vc,
-                                       self._vec(f"v.l{li}.bq", W[lw + "self_attn.q_proj.bias"]),
-                                       self._vec(f"v.l{li}.bk", W[lw + "self_attn.k_proj.bias"]),
-                                       self._vec(f"v.l{li}.bv", W[lw + "self_attn.v_proj.bias"])] + prep_extra,
-                       [qx], f"{e}.attn_prep", domain=LLM_DOMAIN, num_heads=H, head_dim=HD,
-                       qk_kw=kw, q_exp=[int(v) for v in fq], k_exp=[int(v) for v in fk],
-                       v_exp=[int(v) for v in fm.get("vc", li, D)], **prep_attrs)
-            R = self.attn_split
-            s = [self._t(f"{e}.s{g}", [N, N], exp=0) for g in range(H)]
-            if R == 1:
-                p = [self._t(f"{e}.p{g}", [N, N], exp=0) for g in range(H)]
-                o = [self._t(f"{e}.o{g}", [N, HD], exp=0) for g in range(H)]
-            else:
-                p = o = None
-                pr = [[self._t(f"{e}.p{g}r{r}", [N // R, N], exp=0) for r in range(R)]
-                      for g in range(H)]
-                orr = [[self._t(f"{e}.o{g}r{r}", [N // R, HD], exp=0) for r in range(R)]
-                       for g in range(H)]
-
-            def qk(g, qx=qx, s=s, e=e):
-                self._node("LlmAttnScores", [kc, qx], [s[g]], f"{e}.qk{g}", domain=LLM_DOMAIN,
-                           group=g, qk_kw=kw, **common)
-
-            def softmax(g, s=s, p=p, e=e, fs=fs, fp=fp):
-                self._node("VitAttnSoftmax", [s[g]], [p[g]], f"{e}.softmax{g}", domain=LLM_DOMAIN,
-                           head_dim=HD, s_exp=[int(fs[g])], p_exp=[int(fp[g])], **self._vsmx_attr())
-
-            def pv_(g, p=p, o=o, e=e):
-                self._node("LlmAttnPV", [p[g], vc], [o[g]], f"{e}.pv{g}", domain=LLM_DOMAIN,
-                           group=g, **common)
-            # ConvKernel runs qk(g+1) under softmax(g); pv(g) then qk(g+2)
-            # follow right away, so the CPU waits only for the short P.V to
-            # free the lane (qk(g+1) after softmax(g) waited for the longer
-            # qk before the next softmax)
-            def softmax_r(g, r, s=s, pr=None if R == 1 else pr, e=e, fs=fs, fp=fp, R=R):
-                self._node("VitAttnSoftmax", [s[g]], [pr[g][r]], f"{e}.softmax{g}r{r}",
-                           domain=LLM_DOMAIN, head_dim=HD, s_exp=[int(fs[g])],
-                           p_exp=[int(fp[g])], cols=[r * (N // R), N // R], **self._vsmx_attr())
-
-            def pv_r(g, r, pr=None if R == 1 else pr, orr=None if R == 1 else orr, e=e):
-                self._node("LlmAttnPV", [pr[g][r], vc], [orr[g][r]], f"{e}.pv{g}r{r}",
-                           domain=LLM_DOMAIN, group=g, **common)
-            qk(0)
-            if H > 1:
-                qk(1)
-            for g in range(H):
-                if R == 1:
-                    softmax(g)
-                    pv_(g)
-                else:
-                    for r in range(R):
-                        softmax_r(g, r)
-                    for r in range(R):
-                        pv_r(g, r)
-                if g + 2 < H:
-                    qk(g + 2)
-            pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
-            if R == 1:
-                self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
-                           num_heads=H, num_kv_heads=H, head_dim=HD)
-            else:
-                self._node("LlmAttnMerge", [t for g in range(H) for t in orr[g]], [pv],
-                           f"{e}.attn_merge", domain=LLM_DOMAIN, num_heads=H, num_kv_heads=H,
-                           head_dim=HD, row_splits=R)
+            pv = self._attention(li, e, lw, q0, k0, v0, kc, vc, kw, prep_extra, prep_attrs,
+                                 common)
             ov = self._matmul(pv, f"w.v.l{li}.o", W[lw + "self_attn.out_proj.weight"].T, N, f"{e}.o",
                               fm.get("o", li, D), f"{e}.o_proj")
             h1 = self._res(f"{e}.h1")
@@ -432,8 +463,11 @@ class VitFrontend:
             self._node("VitResAdd", [h1, d, self._vec(f"v.l{li}.b2", W[lw + "mlp.fc2.bias"])], [h2],
                        f"{e}.res_mlp", domain=LLM_DOMAIN)
             h = h2
-        xf = self._ln(h, None, "post", "vision.xf", fm.get("xf", L, D),
-                      VP + "post_layernorm.weight", VP + "post_layernorm.bias")
+        if self.pieces:
+            xf = self._layers_pieces(pipe, hs, kc, vc, kw, prep_extra, prep_attrs, common)
+        else:
+            xf = self._ln(h, None, "post", "vision.xf", fm.get("xf", L, D),
+                          VP + "post_layernorm.weight", VP + "post_layernorm.bias")
         K = D * c.scale ** 2
         fxs = fm.get("xs", L, K)
         Wc = W[CONN].T                                                   # [K][Dt]
@@ -473,12 +507,217 @@ class VitFrontend:
         self._node("LlmDequant", [acc], [img], "vision.image_features", domain=LLM_DOMAIN)
         return self._model([pin], [])
 
+    # ---- row pieces (``pieces``) ------------------------------------------------ #
+    def _rows(self):
+        """[(piece, first row, rows, engine)]."""
+        out, r0 = [], 0
+        for i, (n, eng) in enumerate(self.pieces):
+            out.append((i, r0, n, eng))
+            r0 += n
+        return out
+
+    def _slice_rows(self, x, r0, n, y, exp):
+        """y = x[r0 : r0 + n] — a view (the scheduler's Slice views)."""
+        s, e = f"vision.rows{r0}.s", f"vision.rows{r0}.e"
+        self._int_inits.setdefault(s, np.array([r0], np.int64))
+        self._int_inits.setdefault(e, np.array([r0 + n], np.int64))
+        self._int_inits.setdefault("vision.axis0", np.array([0], np.int64))
+        self._t(y, [n, self.cfg.D], exp=exp)
+        self._node("Slice", [x, s, e, "vision.axis0"], [y], y.replace("vision.", "vision.slice_"))
+        return y
+
+    def _concat_rows(self, parts, y, cols, exp):
+        """y = the pieces one after the other (a Concat done in place by the
+        pieces' kernels, CodeGenerator._merge_in_place)."""
+        self._t(y, [self.cfg.N, cols], exp=exp)
+        self._node("Concat", list(parts), [y], y.replace("vision.", "vision.cat_"), axis=0)
+        return y
+
+    def _mm_piece(self, pipe, x, wname, W, n, y, exp, name, eng):
+        self._init(wname, W)
+        self._t(y, [n, W.shape[1]], exp=exp)
+        self._meta["engine"][y] = eng
+        pipe.add(eng, n * W.shape[0] * W.shape[1] * PIECE_US_PER_MAC[eng], [x], [y],
+                 lambda: self._node("MatMul", [x, wname], [y], name))
+        return y
+
+    def _ln_piece(self, pipe, h, li, which, out, exp, gname, bname, n):
+        pipe.add("rowops", n * self.cfg.D * PIECE_US_PER_ELEM["rowops_ln"], [h], [out],
+                 lambda: self._ln(h, li, which, out, exp, gname, bname, rows=n))
+        return out
+
+    def _res_piece(self, pipe, h, d, bname, b, y, name, n):
+        self._res(y, n)
+        bv = self._vec(bname, b)
+        pipe.add("rowops", n * self.cfg.D * PIECE_US_PER_ELEM["rowops_res"], [h, d], [y],
+                 lambda: self._node("VitResAdd", [h, d, bv], [y], name, domain=LLM_DOMAIN))
+        return y
+
+    def _embed_pieces(self, pipe, pe):
+        """h_i = VitEmbedAdd(pe[rows of piece i], the table's rows): the residual
+        stream in pieces from the start (int32 DMA rows are never sliced)."""
+        c, fm, W = self.cfg, self.fmt, self.W
+        table = patch_bias_table(W)
+        hs = []
+        for i, r0, n, _eng in self._rows():
+            pe_i = self._slice_rows(pe, r0, n, f"vision.pe.p{i}", fm.get("pe", 0, c.D))
+            h = self._res(f"vision.h0.p{i}", n)
+            if self.iembed:
+                from .rowops_nodes import EmbedAddRoNode
+                b0q = np.clip(np.rint(table[r0:r0 + n].astype(np.float64) * 2.0 ** RES_BITS),
+                              -2147483648.0, 2147483647.0)
+                tab = self._init(f"vision.b0i.p{i}", EmbedAddRoNode.table_words(b0q))
+                lane, attrs = "rowops", dict(rowops=1)
+            else:
+                tab = self._init(f"vision.b0.p{i}", table[r0:r0 + n])
+                lane, attrs = "cpu", {}
+            pipe.add(lane, n * c.D * PIECE_US_PER_ELEM["rowops_res" if self.iembed else "cpu"], [pe_i], [h],
+                     lambda pe_i=pe_i, tab=tab, h=h, i=i, attrs=attrs:
+                     self._node("VitEmbedAdd", [pe_i, tab], [h], f"vision.embed.p{i}", domain=LLM_DOMAIN, **attrs))
+            hs.append(h)
+        return hs
+
+    def _layers_pieces(self, pipe, hs, kc, vc, kw, prep_extra, prep_attrs, common):
+        """The encoder layers over the row pieces ``hs`` (``pipe`` holds the
+        embedding's), then the post LayerNorm -> xf [N][D] (in place)."""
+        c, fm, W = self.cfg, self.fmt, self.W
+        D, FF, L = c.D, c.FF, c.L
+        rows = self._rows()
+        for li in range(L):
+            lw = f"{VP}encoder.layers.{li}."
+            e = f"vision.l{li}"
+            qkv = {"q0": [], "k0": [], "v": []}
+            for i, _r0, n, eng in rows:
+                x = self._ln_piece(pipe, hs[i], li, "ln1", f"{e}.x.p{i}", fm.get("x", li, D),
+                                   lw + "layer_norm1.weight", lw + "layer_norm1.bias", n)
+                for key, w, proj in (("q0", "q", "q_proj"), ("k0", "k", "k_proj"), ("v", "v", "v_proj")):
+                    qkv[key].append(self._mm_piece(pipe, x, f"w.v.l{li}.{w}", W[lw + f"self_attn.{proj}.weight"].T,
+                                                   n, f"{e}.{key}.p{i}", fm.get(key, li, D), f"{e}.{proj}.p{i}",
+                                                   eng))
+            pipe.flush()
+            q0, k0, v0 = (self._concat_rows(qkv[key], f"{e}.{key}", D, fm.get(key, li, D))
+                          for key in ("q0", "k0", "v"))
+            pv = self._attention(li, e, lw, q0, k0, v0, kc, vc, kw, prep_extra, prep_attrs, common)
+            b1 = self._vec(f"v.l{li}.b1", W[lw + "mlp.fc1.bias"])
+            vop = _gelu_vop_rows(self._inits[b1], fm.get("f", li, FF), fm.get("a", li, FF), FF)
+            extra = [] if vop is None else [self._vec(f"v.l{li}.gelu_ba", vop[0]),
+                                            self._vec(f"v.l{li}.gelu_sc", vop[1])]
+            for i, r0, n, eng in rows:
+                pv_i = self._slice_rows(pv, r0, n, f"{e}.pv.p{i}", fm.pv(li))
+                o = self._mm_piece(pipe, pv_i, f"w.v.l{li}.o", W[lw + "self_attn.out_proj.weight"].T, n,
+                                   f"{e}.o.p{i}", fm.get("o", li, D), f"{e}.o_proj.p{i}", eng)
+                h1 = self._res_piece(pipe, hs[i], o, f"v.l{li}.bo", W[lw + "self_attn.out_proj.bias"],
+                                     f"{e}.h1.p{i}", f"{e}.res_attn.p{i}", n)
+                x2 = self._ln_piece(pipe, h1, li, "ln2", f"{e}.x2.p{i}", fm.get("x2", li, D),
+                                    lw + "layer_norm2.weight", lw + "layer_norm2.bias", n)
+                f = self._mm_piece(pipe, x2, f"w.v.l{li}.f1", W[lw + "mlp.fc1.weight"].T, n, f"{e}.f.p{i}",
+                                   fm.get("f", li, FF), f"{e}.fc1.p{i}", eng)
+                a = self._t(f"{e}.a.p{i}", [n, FF], exp=fm.get("a", li, FF))
+                pipe.add("vectorop" if vop is not None else "cpu", n * FF * PIECE_US_PER_ELEM["vop_gelu"], [f], [a],
+                         lambda f=f, a=a, i=i, b1=b1, extra=extra, e=e:    # flushed in the next layer
+                         self._node("VitGelu", [f, b1] + extra, [a], f"{e}.gelu.p{i}", domain=LLM_DOMAIN))
+                d = self._mm_piece(pipe, a, f"w.v.l{li}.f2", W[lw + "mlp.fc2.weight"].T, n, f"{e}.d.p{i}",
+                                   fm.get("d", li, D), f"{e}.fc2.p{i}", eng)
+                hs[i] = self._res_piece(pipe, h1, d, f"v.l{li}.b2", W[lw + "mlp.fc2.bias"],
+                                        f"{e}.h2.p{i}", f"{e}.res_mlp.p{i}", n)
+        xs = [self._ln_piece(pipe, hs[i], None, "post", f"vision.xf.p{i}", fm.get("xf", L, D),
+                             VP + "post_layernorm.weight", VP + "post_layernorm.bias", n)
+              for i, _r0, n, _eng in rows]
+        pipe.flush()
+        return self._concat_rows(xs, "vision.xf", D, fm.get("xf", L, D))
+
+    def _attention(self, li, e, lw, q0, k0, v0, kc, vc, kw, prep_extra, prep_attrs, common):
+        """Layer ``li``'s attention: VitAttnPrep of q0 / k0 / v0 (the K / V caches, the
+        q.K^T image), per head q.K^T, the softmax and P.V, the merge -> pv [N][D]."""
+        c, fm, W = self.cfg, self.fmt, self.W
+        N, D, H, HD = c.N, c.D, c.H, c.HD
+        fq, fk, fp = fm.get("q", li, H), fm.get("k", li, H), fm.get("p", li, H)
+        fs = fq + fk - F
+        qx = self._t(f"{e}.qx", [H, HD, N], exp=0)
+        self._node("VitAttnPrep", [q0, k0, v0, kc, vc,
+                                   self._vec(f"v.l{li}.bq", W[lw + "self_attn.q_proj.bias"]),
+                                   self._vec(f"v.l{li}.bk", W[lw + "self_attn.k_proj.bias"]),
+                                   self._vec(f"v.l{li}.bv", W[lw + "self_attn.v_proj.bias"])] + prep_extra,
+                   [qx], f"{e}.attn_prep", domain=LLM_DOMAIN, num_heads=H, head_dim=HD,
+                   qk_kw=kw, q_exp=[int(v) for v in fq], k_exp=[int(v) for v in fk],
+                   v_exp=[int(v) for v in fm.get("vc", li, D)], **prep_attrs)
+        R = self.attn_split
+        s = [self._t(f"{e}.s{g}", [N, N], exp=0) for g in range(H)]
+        if R == 1:
+            p = [self._t(f"{e}.p{g}", [N, N], exp=0) for g in range(H)]
+            o = [self._t(f"{e}.o{g}", [N, HD], exp=0) for g in range(H)]
+        else:
+            p = o = None
+            pr = [[self._t(f"{e}.p{g}r{r}", [N // R, N], exp=0) for r in range(R)]
+                  for g in range(H)]
+            orr = [[self._t(f"{e}.o{g}r{r}", [N // R, HD], exp=0) for r in range(R)]
+                   for g in range(H)]
+
+        def qk(g, qx=qx, s=s, e=e):
+            self._node("LlmAttnScores", [kc, qx], [s[g]], f"{e}.qk{g}", domain=LLM_DOMAIN,
+                       group=g, qk_kw=kw, **common)
+
+        def softmax(g, s=s, p=p, e=e, fs=fs, fp=fp):
+            self._node("VitAttnSoftmax", [s[g]], [p[g]], f"{e}.softmax{g}", domain=LLM_DOMAIN,
+                       head_dim=HD, s_exp=[int(fs[g])], p_exp=[int(fp[g])], **self._vsmx_attr())
+
+        def pv_(g, p=p, o=o, e=e):
+            self._node("LlmAttnPV", [p[g], vc], [o[g]], f"{e}.pv{g}", domain=LLM_DOMAIN,
+                       group=g, **common)
+        # ConvKernel runs qk(g+1) under softmax(g); pv(g) then qk(g+2)
+        # follow right away, so the CPU waits only for the short P.V to
+        # free the lane (qk(g+1) after softmax(g) waited for the longer
+        # qk before the next softmax)
+        def softmax_r(g, r, s=s, pr=None if R == 1 else pr, e=e, fs=fs, fp=fp, R=R):
+            self._node("VitAttnSoftmax", [s[g]], [pr[g][r]], f"{e}.softmax{g}r{r}",
+                       domain=LLM_DOMAIN, head_dim=HD, s_exp=[int(fs[g])],
+                       p_exp=[int(fp[g])], cols=[r * (N // R), N // R], **self._vsmx_attr())
+
+        def pv_r(g, r, pr=None if R == 1 else pr, orr=None if R == 1 else orr, e=e):
+            self._node("LlmAttnPV", [pr[g][r], vc], [orr[g][r]], f"{e}.pv{g}r{r}",
+                       domain=LLM_DOMAIN, group=g, **common)
+        if self.pieces and R == 1:
+            # the heads as a pipeline (_Pipe): q.K^T and P.V on ConvKernel, the softmax
+            pipe, macs = _Pipe(), N * N * HD
+            for g in range(H):
+                pipe.add("conv", macs * ATTN_US_PER_MAC["qk_conv"], [qx], [s[g]], lambda g=g: qk(g))
+                pipe.add("vectorop", N * N * PIECE_US_PER_ELEM["vop_smx"], [s[g]], [p[g]],
+                         lambda g=g: softmax(g))
+                pipe.add("conv", macs * ATTN_US_PER_MAC["pv_conv"], [p[g]], [o[g]], lambda g=g: pv_(g))
+            pipe.flush()
+        else:
+            qk(0)
+            if H > 1:
+                qk(1)
+            for g in range(H):
+                if R == 1:
+                    softmax(g)
+                    pv_(g)
+                else:
+                    for r in range(R):
+                        softmax_r(g, r)
+                    for r in range(R):
+                        pv_r(g, r)
+                if g + 2 < H:
+                    qk(g + 2)
+        pv = self._t(f"{e}.pv", [N, D], exp=fm.pv(li))
+        if R == 1:
+            self._node("LlmAttnMerge", o, [pv], f"{e}.attn_merge", domain=LLM_DOMAIN,
+                       num_heads=H, num_kv_heads=H, head_dim=HD)
+        else:
+            self._node("LlmAttnMerge", [t for g in range(H) for t in orr[g]], [pv],
+                       f"{e}.attn_merge", domain=LLM_DOMAIN, num_heads=H, num_kv_heads=H,
+                       head_dim=HD, row_splits=R)
+        return pv
+
     def _model(self, inputs, outputs):
         g = graph_with_initializers(
             self._nodes, f"{self.name}_vision",
             [self._vi[n] for n in inputs], [self._vi[n] for n in outputs], self._inits,
             value_info=[vi for n, vi in self._vi.items() if n not in inputs and n not in outputs])
-        self._inits = {}
+        for n, arr in self._int_inits.items():
+            g.initializer.append(nph.from_array(np.asarray(arr, np.int64), n))
+        self._inits, self._int_inits = {}, {}
         m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 17), oh.make_opsetid(LLM_DOMAIN, 1)],
                           producer_name="inference-scheduler/src/vit.py")
         m.ir_version = 8
@@ -494,4 +733,5 @@ class VitFrontend:
         return m
 
 
-__all__ = ("VitConfig", "VisionFormats", "VitFrontend", "patch_weight", "patch_bias_table", "patches")
+__all__ = ("VitConfig", "VisionFormats", "VitFrontend", "default_pieces", "patch_weight", "patch_bias_table",
+           "patches")

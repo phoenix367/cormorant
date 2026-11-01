@@ -19,6 +19,7 @@ in 4 x 4 patches = 64 tokens, pixel shuffle x2 -> 16 image tokens of a
     against vlm_study.TextModel; the GELU tables against the study's.
 """
 
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -460,6 +461,92 @@ class TestVisionRowops(unittest.TestCase):
             states = cg.initial_states()
             out = cg._forward_pass({"vision.patches": patches(im, cfg.P).astype(np.float64)}, states=states)
             np.testing.assert_array_equal(out["vision.image"], vm.forward(im))
+
+    def test_query_major(self):
+        """query_major (the default with vsmx and rowops): q in the K cache rows and k
+        in the image, the softmax in the unit's row mode — the same image features as
+        the keys-major scores and the column mode."""
+        from src import _rowops_hw_config
+        from src.smx_nodes import OP_SOFTMAX, OP_SOFTMAX_T, VitAttnSoftmaxVopNode
+        cfg, _vm, g, cg = self.models()
+        smx = [sn for sn in g.nodes if isinstance(sn, VitAttnSoftmaxVopNode)]
+        self.assertTrue(smx and all(sn.query_major for sn in smx))
+        self.assertEqual({c.fields["op"] for sn in smx for c in sn.kernel_calls({})}, {OP_SOFTMAX})
+        _c, W, _m, fe = Tiny.get()
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            g2 = OnnxGraph(VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=True,
+                                       query_major=False).entry(output=True), fuse_act=True, s2d_stem=True)
+            cg2 = CodeGenerator(g2, model_path="vit_tiny_km.onnx")
+        smx2 = [sn for sn in g2.nodes if isinstance(sn, VitAttnSoftmaxVopNode)]
+        self.assertEqual({c.fields["op"] for sn in smx2 for c in sn.kernel_calls({})}, {OP_SOFTMAX_T})
+        for im in images(2, 5):
+            x = {"vision.patches": patches(im, cfg.P).astype(np.float64)}
+            np.testing.assert_array_equal(cg._forward_pass(x, states=cg.initial_states())["vision.image"],
+                                          cg2._forward_pass(x, states=cg2.initial_states())["vision.image"])
+        with self.assertRaisesRegex(ValueError, "query_major needs vsmx and rowops"):
+            VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, query_major=True)
+
+    def test_pieces(self):
+        """``pieces`` (default_pieces at N >= 256): the linears, LayerNorms, GELUs and
+        residual adds by row pieces, each linear piece on its pinned kernel (one image
+        of every weight), q / k / v and xf concatenated in place, pv read through row
+        views — the study's image features bit for bit, and the generated C too."""
+        from src import _rowops_hw_config
+        from src.host_nodes import ConcatNode, SliceNode
+        from src.nodes import MatmulConvNode, MatmulNode
+        from src.vit import default_pieces
+        self.assertEqual(default_pieces(1024), ((512, "conv"), (512, "conv")))
+        self.assertEqual(default_pieces(272), ((128, "conv"), (144, "conv")))
+        self.assertIsNone(default_pieces(64))
+        cfg, vm, _g, _cg = self.models()
+        _c, W, _m, fe = Tiny.get()
+        pieces = ((16, "conv"), (16, "conv"), (16, "conv"), (16, "matmul"))
+        for iembed in (False, True):
+            with self.subTest(iembed=iembed), \
+                    mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                    mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+                fe2 = VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=True,
+                                  iembed=iembed, pieces=pieces)
+                g = OnnxGraph(fe2.entry(output=True), fuse_act=True, s2d_stem=True)
+                cg = CodeGenerator(g, model_path="vit_tiny_pieces.onnx")
+                L = cfg.L
+                piece = re.compile(r"\.p\d+$")
+                mm = [sn for sn in g.nodes if type(sn) is MatmulNode and piece.search(sn.output.onnx_name)]
+                conv = [sn for sn in g.nodes if isinstance(sn, MatmulConvNode) and piece.search(sn.output.onnx_name)]
+                self.assertEqual((len(mm), len(conv)), (6 * L, 18 * L))
+                kws = {sn.inputs[1].onnx_name: sn.kw for sn in conv}
+                for sn in mm:                                   # MatmulKernel reads ConvKernel's image
+                    self.assertEqual(sn.gemv_kw, kws[sn.inputs[1].onnx_name], sn.output.onnx_name)
+                cats = [sn for sn in g.nodes if isinstance(sn, ConcatNode)]
+                self.assertEqual(len(cats), 3 * L + 1)
+                self.assertTrue(all(sn.in_place for sn in cats))
+                views = [sn for sn in g.nodes if isinstance(sn, SliceNode)]
+                self.assertEqual(len(views), 4 * (L + 1))
+                self.assertTrue(all(sn.is_view for sn in views))
+                vm2 = vm
+                if iembed:
+                    Wv = {k[len("model."):]: v for k, v in W.items()}
+                    vc = vs.VCfg(TINY_CFG["vision_config"])
+                    vm2 = vs.VisionModel(Wv, vs.kernel_weights(Wv, vc), vc, TINY_CFG["scale_factor"],
+                                         vs.VPOLICIES[vs.vision_policy(True, True, True, iembed=True)], vm.fmt)
+                    vm2.conn_k = CONN_K
+                for im in images(2, 9):
+                    out = cg._forward_pass({"vision.patches": patches(im, cfg.P).astype(np.float64)},
+                                           states=cg.initial_states())
+                    np.testing.assert_array_equal(out["vision.image"], vm2.forward(im))
+                src = cg.generate_source()
+                self.assertNotIn("host_concat(", src)
+                if host_emu.which_cc():           # the host's embedding add reads views of pe: the syncs
+                    with tempfile.TemporaryDirectory() as td:
+                        rc, out = host_emu.build_and_run(cg, td, timeout=1800, incoherent=not iembed)
+                    self.assertEqual(rc, 0, out[-3000:])
+                    self.assertEqual(host_emu.failures(out), [])
+        with self.assertRaisesRegex(ValueError, "pieces need rowops"):
+            VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, pieces=pieces)
+        with self.assertRaisesRegex(ValueError, "adding up to"):
+            VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=CONN_K, vsmx=True, rowops=True,
+                        pieces=((16, "conv"), (40, "matmul")))
 
     def test_differs_from_the_host_norms(self):
         cfg, vm, _g, _cg = self.models()

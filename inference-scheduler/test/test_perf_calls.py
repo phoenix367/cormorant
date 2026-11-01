@@ -226,6 +226,19 @@ class TestEmittedCalls(unittest.TestCase):
         g = OnnxGraph(fe.entry(), fuse_act=True, s2d_stem=True)
         cg = CodeGenerator(g, model_path="vit_tiny.onnx")
         self.assertGreater(self._check(g, cg, "vit_tiny"), 20)
+        # the row pieces on both MatMul kernels
+        from unittest import mock
+
+        from src import _rowops_hw_config, _vectorop_hw_config
+        from src.vit import VitFrontend
+        cfg, W = Tiny.get()[0], Tiny.get()[1]
+        with mock.patch.object(_vectorop_hw_config, "VECTOROP_SOFTMAX", True), \
+                mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+            fe2 = VitFrontend(cfg, W, fe.fmt, name="vit_tiny", conn_k=fe.conn_k, vsmx=True, rowops=True,
+                              pieces=((16, "conv"), (16, "conv"), (16, "conv"), (16, "matmul")))
+            g = OnnxGraph(fe2.entry(), fuse_act=True, s2d_stem=True)
+            cg = CodeGenerator(g, model_path="vit_tiny_pieces.onnx")
+        self.assertGreater(self._check(g, cg, "vit_tiny_pieces"), 100)
 
     def test_runtime_keys(self):
         path = os.path.join(HERE, "models", "llama_tiny_prefill8.onnx")

@@ -165,8 +165,9 @@ def image_choice(sn, users: list, io, kw_hint: Dict[str, int], mode: str,
     tiled = matmul_cycles(sn.n, sn.k, sn.m, sn.batch, b_packed=bool(sn.b_packed))
     gemv = gemv_cycles(sn.n, sn.k, sn.m, sn.batch, kw)
     # the RTL kernel reads a shared weight in its image whatever n is:
-    # the tiled path would need the packed layout as a second copy
-    shared = cost_model.MATMUL_IMPL == "rtl" and b.onnx_name in kw_hint
+    # the tiled path would need the packed layout as a second copy (a weight
+    # this graph's ConvKernel lowering re-imaged has no other copy at all)
+    shared = cost_model.MATMUL_IMPL == "rtl" and (b.onnx_name in kw_hint or b.packed_data is not None)
     return kw, relayout, mode != "auto" or gemv < tiled or shared, tiled, gemv
 
 

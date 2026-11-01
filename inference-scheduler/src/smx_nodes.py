@@ -17,7 +17,10 @@ exact softmax within one LSB of P.  Three node kinds issue it:
   * ``VitAttnSoftmaxVopNode`` — a ``VitAttnSoftmax`` with the attribute
     ``vsmx = 1`` (the vision frontend's ``vsmx`` option, the study policy
     ``pow2+p12+vgelu+vsmx``): one ``OP_SOFTMAX_T`` call — the keys-major
-    scores s [C][T] -> P [nc][C], every key valid.
+    scores s [C][T] -> P [nc][C], every key valid; with ``query_major = 1``
+    (the scores query-major, s [T][C]: src/vit.py's query_major) one
+    ``OP_SOFTMAX`` call over the rows instead — the same integer softmax, the
+    row mode's contiguous runs at twice the column mode's rate.
   * ``LlmAttnSoftmaxVopNode`` — a prefill ``LlmAttnSoftmax`` with ``vsmx = 1``
     (the Llama frontend's ``vsmx`` option, ``pow2+sink+p12+vsmx``): per head
     of the group one ``OP_SOFTMAX_T`` call over the runtime key count
@@ -204,50 +207,70 @@ def from_onnx_softmax(node, tensors, index: int, align_elems: int, ctx: HostCont
 class VitAttnSoftmaxVopNode(SmxVopNode):
     """VitAttnSoftmax on VectorOPKernel (column mode): s [C][T] raw scores at
     2^-f_s -> P [nc][C] raw at 2^-f_p, query columns c0 .. c0 + nc - 1,
-    every key valid."""
+    every key valid.  ``query_major``: s [T][C] (a row per query), the row
+    mode over the rows c0 .. c0 + nc - 1 — the same P."""
     T:   int = 1
     C:   int = 16
     c0:  int = 0
     nc:  int = 0
     cm:  int = 0
     cfg: int = 0
+    query_major: bool = False
 
     @classmethod
     def from_host(cls, host, node):
         """``host``: the VitAttnSoftmaxNode the attribute vsmx = 1 replaces."""
         T, C, c0, nc = host.T, host.C, host.c0, host.nc
+        qm = int(_attrs(node).get("query_major", 0)) != 0
         _require(enabled(), node, "vsmx = 1 needs VectorOPKernel's softmax unit "
                                   "(kernels.vectorop.softmax, AXI_VECTOROP_SOFTMAX)")
-        _require(C <= smx.MAX_KEYS, node, f"{C} keys (the unit takes {smx.MAX_KEYS})")
-        _require(nc % COL_BLOCK == 0 and c0 % 8 == 0 and T % 8 == 0 and C % 8 == 0, node,
-                 f"columns [{c0}, {nc}] of {T}, {C} keys: the unit takes blocks of "
-                 f"{COL_BLOCK} columns at 16-byte aligned rows")
+        _require(C <= (smx.MAX_ROW if qm else smx.MAX_KEYS), node,
+                 f"{C} keys (the unit takes {smx.MAX_ROW if qm else smx.MAX_KEYS})")
+        if qm:
+            _require(T == C and C % 8 == 0, node, f"query-major scores [{T}][{C}]: square, 16-byte aligned rows")
+        else:
+            _require(nc % COL_BLOCK == 0 and c0 % 8 == 0 and T % 8 == 0 and C % 8 == 0, node,
+                     f"columns [{c0}, {nc}] of {T}, {C} keys: the unit takes blocks of "
+                     f"{COL_BLOCK} columns at 16-byte aligned rows")
         cm, cfg = regs(host.fs, host.scale, host.fp)
         return cls(onnx_node=node, inputs=list(host.inputs), output=host.output, index=host.index,
-                   align_elems=host.align_elems, F=host.F, T=T, C=C, c0=c0, nc=nc, cm=cm, cfg=cfg)
+                   align_elems=host.align_elems, F=host.F, T=T, C=C, c0=c0, nc=nc, cm=cm, cfg=cfg,
+                   query_major=qm)
 
     def reference(self, ins, dtype):  # noqa: ARG002
-        s = np.asarray(ins[0], np.float64).astype(np.int64)[:, self.c0:self.c0 + self.nc]  # [C][nc]
         cs, fp = _unpack(self.cfg)
+        s = np.asarray(ins[0], np.float64).astype(np.int64)
+        if self.query_major:                                     # s [T][C]: the rows c0 ..
+            return smx.softmax_raw(s[self.c0:self.c0 + self.nc], self.C, self.cm, cs, fp).astype(np.float64)
+        s = s[:, self.c0:self.c0 + self.nc]                      # [C][nc]
         return smx.softmax_cols(s, self.C, self.cm, cs, fp).astype(np.float64)
 
     def kernel_calls(self, layouts: dict) -> list:  # noqa: ARG002
         from .perf_calls import KernelCall
+        if self.query_major:
+            return [KernelCall.of("VectorOPKernel", op=OP_SOFTMAX, size=self.C, outer=self.nc,
+                                  a_inc=self.C, b_inc=self.C, act=0)]
         return [KernelCall.of("VectorOPKernel", op=OP_SOFTMAX_T, size=self.C, outer=self.nc,
                               a_inc=self.T, b_inc=self.C, act=0)]
 
     def describe(self) -> str:
-        cols = f" (columns {self.c0}..{self.c0 + self.nc - 1})" if (self.c0, self.nc) != (0, self.T) else ""
+        cols = f" (queries {self.c0}..{self.c0 + self.nc - 1})" if (self.c0, self.nc) != (0, self.T) else ""
         cs, fp = _unpack(self.cfg)
-        return (f"{self.T} query columns{cols} x {self.C} keys on VectorOPKernel's softmax unit "
-                f"(column mode; Cm {self.cm} >> {cs}, P at 2^-{fp})")
+        mode = "row mode, query-major scores" if self.query_major else "column mode"
+        return (f"{self.T} queries{cols} x {self.C} keys on VectorOPKernel's softmax unit "
+                f"({mode}; Cm {self.cm} >> {cs}, P at 2^-{fp})")
 
     def emit_comment(self) -> str:
+        shape, mode = ((f"[{self.T}][{self.C}]", "row mode") if self.query_major
+                       else (f"[{self.C}][{self.T}]", "column mode"))
         return (f"    /* [{self.index}] VitAttnSoftmax({self.inputs[0].onnx_name}) -> "
-                f"{self.output.onnx_name}  s [{self.C}][{self.T}] -> P [{self.nc}][{self.C}] on "
-                f"VectorOPKernel's softmax unit (column mode) */")
+                f"{self.output.onnx_name}  s {shape} -> P [{self.nc}][{self.C}] on "
+                f"VectorOPKernel's softmax unit ({mode}) */")
 
     def emit_call(self, layouts: dict) -> str:  # noqa: ARG002
+        if self.query_major:
+            return self.call(self.inputs[0].c_name, self.c0 * self.C, self.output.c_name, 0, self.C,
+                             OP_SOFTMAX, self.nc, self.C, self.C, self.cm, self.cfg, mask_reg(self.C))
         return self.call(self.inputs[0].c_name, self.c0, self.output.c_name, 0, self.C,
                          OP_SOFTMAX_T, self.nc, self.T, self.C, self.cm, self.cfg,
                          mask_reg(self.C))

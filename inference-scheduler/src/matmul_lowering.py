@@ -301,6 +301,65 @@ def shared_weight_layouts(nodes: list) -> Dict[str, int]:
     return out
 
 
+ENGINES = ("conv", "matmul")
+
+
+def pinned_weight_images(nodes: list, engine: Dict[str, str], readers: Dict[str, list], io,
+                         kw_override: Dict[str, int], kw_choices: Optional[Sequence[int]],
+                         is_ap_fixed_16_8: bool) -> Dict[str, int]:
+    """{constant B name: kw} — one image for a weight read by several MatMuls
+    the model pins to an engine (``engine``, axi.numeric: {MatMul output:
+    "conv" | "matmul"}, the row pieces of a linear split between the kernels,
+    src/vit.py): all its readers MatMuls with equal (k, m), every one pinned.
+    The kw prices cheapest summed over the readers — ConvKernel's best plan
+    at kw, MatmulKernel's image path at kw (1 / 2 / 4 / 8 only, so it reads
+    the same buffer)."""
+    out: Dict[str, int] = {}
+    done = set()
+    for sn in nodes:
+        if not isinstance(sn, MatmulNode):
+            continue
+        b = sn.inputs[1]
+        if b.onnx_name in done:
+            continue
+        done.add(b.onnx_name)
+        users = readers.get(b.onnx_name, [])
+        if (len(users) < 2 or b.data is None or b.packed_data is not None or b.onnx_name in io
+                or not all(isinstance(u, MatmulNode) and u.inputs[1] is b and u.inputs[0] is not b
+                           and (u.k, u.m) == (sn.k, sn.m) and u.output.onnx_name in engine
+                           for u in users)):
+            continue
+        conv = [u for u in users if engine[u.output.onnx_name] == "conv"]
+        mm = [u for u in users if engine[u.output.onnx_name] == "matmul"]
+        kws = list(range(1, CONV_MAX_KW + 1))
+        if kw_choices is not None:
+            kws = [k for k in kws if k in kw_choices]
+        if b.onnx_name in kw_override:
+            kws = [k for k in kws if k == kw_override[b.onnx_name]]
+        if mm:
+            if cost_model.MATMUL_IMPL != "rtl":
+                raise SchedulerError(f"MatMul weight '{b.onnx_name}': pinned to both kernels needs the RTL "
+                                     "MatmulKernel (it reads ConvKernel's image)")
+            kws = [k for k in kws if k in _MM_IMAGE_KWS and all(_image_ok(u, k, is_ap_fixed_16_8) for u in mm)]
+        best = None
+        for k in kws:
+            cyc = 0.0
+            for u in conv:
+                ps = conv_plans(u, [k])
+                if not ps:
+                    break
+                cyc += ps[0].board_cycles
+            else:
+                cyc += sum(gemv_cycles(u.n, u.k, u.m, u.batch, k) for u in mm)
+                if best is None or cyc < best[0]:
+                    best = (cyc, k)
+        if best is None:
+            raise SchedulerError(f"MatMul weight '{b.onnx_name}': no image both pinned engines read "
+                                 f"(readers {[u.output.onnx_name for u in users]})")
+        out[b.onnx_name] = best[1]
+    return out
+
+
 def _readers(nodes) -> Dict[str, list]:
     readers: Dict[str, list] = {}
     for sn in nodes:
@@ -411,7 +470,8 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
                   kw_override: Optional[Dict[str, int]] = None,
                   kw_choices: Optional[Sequence[int]] = None,
                   gemv_mode: str = "auto", gemv_hint: Optional[Dict[str, int]] = None,
-                  perf_model=None, plan_log: Optional[list] = None) -> Tuple[list, dict]:
+                  perf_model=None, plan_log: Optional[list] = None,
+                  engine: Optional[Dict[str, str]] = None) -> Tuple[list, dict]:
     """Return ``(new_nodes, stats)``: ``nodes`` with every MatmulNode that
     should run on ConvKernel replaced by a MatmulConvNode (same index,
     inputs and output), and the constant Bs that use a ``kw > 1`` layout
@@ -437,24 +497,39 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
     takes the cheapest one when it is priced at least ``PLAN_MIN_GAIN``
     below the baseline; a baseline the model cannot price is kept.  A
     MatMul kept on MatmulKernel carries the layout in ``plan_kw`` for the
-    GEMV pass.  Each decision is appended to ``plan_log``."""
+    GEMV pass.  Each decision is appended to ``plan_log``.
+
+    ``engine`` ({MatMul output: "conv" | "matmul"}, the model's axi.numeric
+    ``engine``) pins those MatMuls to a kernel, whatever the mode, the cost
+    model or the planner say; a weight all of whose readers are pinned gets
+    one image for all of them (pinned_weight_images), which MatmulKernel's
+    pinned readers read through their image path (``plan_kw``)."""
     from .matmul_gemv import normalize_mode as gemv_normalize
     mode = normalize_mode(mode)
     gemv_mode = gemv_normalize(gemv_mode)
     kw_override = kw_override or {}
     stats = {"lowered": 0, "kept": 0, "conv_calls": 0,
              "conv_cycles": 0.0, "matmul_cycles": 0.0}
-    if mode == "off":
+    if mode == "off" and not engine:
         stats["kept"] = sum(isinstance(sn, MatmulNode) for sn in nodes)
         return nodes, stats
     readers = _readers(nodes)
     io = set(graph_io)
+    engine = engine or {}
+    images = pinned_weight_images(nodes, engine, readers, io, kw_override, kw_choices,
+                                  is_ap_fixed_16_8) if engine else {}
     out = []
     for sn in nodes:
         if not isinstance(sn, MatmulNode):
             out.append(sn)
             continue
-        if ineligible_reason(sn, is_ap_fixed_16_8) is not None:
+        pin_engine = engine.get(sn.output.onnx_name)
+        if pin_engine is not None:
+            node = _lower_pinned(sn, pin_engine, images.get(sn.inputs[1].onnx_name), readers, io,
+                                 kw_override, kw_choices, is_ap_fixed_16_8, stats)
+            out.append(node)
+            continue
+        if mode == "off" or ineligible_reason(sn, is_ap_fixed_16_8) is not None:
             stats["kept"] += 1
             out.append(sn)
             continue
@@ -510,30 +585,74 @@ def lower_matmuls(nodes: list, *, mode: str = "auto", is_ap_fixed_16_8: bool = T
         if p.kw > 1:
             if not relayout_ok:                      # pragma: no cover — kw_options
                 raise SchedulerError("internal: kw > 1 for a B that cannot be re-laid out")
-            b.packed_data = conv_lowered_b_image(b.data, sn.k, sn.m, p.kw)
-            b.packed_note = (f"ConvKernel x image of a MatMul-on-ConvKernel B, kw={p.kw}:"
-                             f" x[c][{p.kw}*p + j] = B[(c/16)*{16 * p.kw} + j*16 + c%16][p]"
-                             f" = [{sn.k // p.kw}][{sn.m * p.kw}]"
-                             + (f" x {b.data.size // (sn.k * sn.m)} slices"
-                                if b.data.size != sn.k * sn.m else ""))
-        node = MatmulConvNode(
-            onnx_node=sn.onnx_node, inputs=list(sn.inputs), output=sn.output,
-            index=sn.index, align_elems=sn.align_elems,
-            n=sn.n, k=sn.k, m=sn.m, batch=sn.batch,
-            a_batch_stride=sn.a_batch_stride, b_batch_stride=sn.b_batch_stride,
-            c_batch_stride=sn.c_batch_stride,
-            kw=p.kw, out_h=p.out_h, out_w=p.out_w, conv_n=p.conv_n,
-            conv_batch=p.conv_batch, calls=p.calls,
-            a_call_stride=p.a_call_stride, b_call_stride=p.b_call_stride,
-            c_call_stride=p.c_call_stride, b_relayout=p.kw > 1,
-            est_conv_cycles=p.board_cycles, est_matmul_cycles=mm_cyc,
-        )
-        stats["lowered"] += 1
-        stats["conv_calls"] += p.calls
-        stats["conv_cycles"] += p.board_cycles
-        stats["matmul_cycles"] += mm_cyc
-        out.append(node)
+            _reimage(b, sn, p.kw)
+        out.append(_conv_node(sn, p, mm_cyc, stats))
     return out, stats
+
+
+def _reimage(b, sn, kw: int) -> None:
+    """Re-image constant B as ConvKernel's x image at ``kw`` (once)."""
+    if b.packed_data is not None:
+        return
+    b.packed_data = conv_lowered_b_image(b.data, sn.k, sn.m, kw)
+    b.packed_note = (f"ConvKernel x image of a MatMul-on-ConvKernel B, kw={kw}:"
+                     f" x[c][{kw}*p + j] = B[(c/16)*{16 * kw} + j*16 + c%16][p]"
+                     f" = [{sn.k // kw}][{sn.m * kw}]"
+                     + (f" x {b.data.size // (sn.k * sn.m)} slices"
+                        if b.data.size != sn.k * sn.m else ""))
+
+
+def _conv_node(sn, p: ConvPlan, mm_cyc: float, stats: dict) -> MatmulConvNode:
+    stats["lowered"] += 1
+    stats["conv_calls"] += p.calls
+    stats["conv_cycles"] += p.board_cycles
+    stats["matmul_cycles"] += mm_cyc
+    return MatmulConvNode(
+        onnx_node=sn.onnx_node, inputs=list(sn.inputs), output=sn.output,
+        index=sn.index, align_elems=sn.align_elems,
+        n=sn.n, k=sn.k, m=sn.m, batch=sn.batch,
+        a_batch_stride=sn.a_batch_stride, b_batch_stride=sn.b_batch_stride,
+        c_batch_stride=sn.c_batch_stride,
+        kw=p.kw, out_h=p.out_h, out_w=p.out_w, conv_n=p.conv_n,
+        conv_batch=p.conv_batch, calls=p.calls,
+        a_call_stride=p.a_call_stride, b_call_stride=p.b_call_stride,
+        c_call_stride=p.c_call_stride, b_relayout=p.kw > 1,
+        est_conv_cycles=p.board_cycles, est_matmul_cycles=mm_cyc,
+    )
+
+
+def _lower_pinned(sn, pin: str, image_kw: Optional[int], readers, io, kw_override, kw_choices,
+                  is_ap_fixed_16_8: bool, stats: dict):
+    """A MatMul the model pins to ``pin`` (lower_matmuls' ``engine``): its
+    MatmulConvNode at the best plan (in the weight's shared image
+    ``image_kw`` where it has one), or the MatmulNode itself — reading that
+    image through its image path (``plan_kw``)."""
+    b = sn.inputs[1]
+    if pin == "matmul":
+        stats["kept"] += 1
+        if image_kw is not None:
+            sn.plan_kw = image_kw
+        return sn
+    why = ineligible_reason(sn, is_ap_fixed_16_8)
+    if why is not None:
+        raise SchedulerError(f"MatMul '{sn.output.onnx_name}' pinned to ConvKernel: {why}")
+    if image_kw is not None:
+        kws = [image_kw]
+    else:
+        relayout_ok = (b.data is not None and b.packed_data is None and b.onnx_name not in io
+                       and len(readers.get(b.onnx_name, [])) == 1)
+        kws = list(range(1, CONV_MAX_KW + 1)) if relayout_ok else [1]
+        if kw_choices is not None:
+            kws = [k for k in kws if k in kw_choices]
+        if b.onnx_name in kw_override:
+            kws = [k for k in kws if k == kw_override[b.onnx_name]]
+    plans = conv_plans(sn, kws)
+    if not plans:
+        raise SchedulerError(f"MatMul '{sn.output.onnx_name}' pinned to ConvKernel: no plan at kw {kws}")
+    p = plans[0]
+    if p.kw > 1:
+        _reimage(b, sn, p.kw)
+    return _conv_node(sn, p, matmul_plan_cycles(sn, kw_override.get(b.onnx_name)), stats)
 
 
 __all__ = (
@@ -546,6 +665,8 @@ __all__ = (
     "matmul_plan_cycles",
     "shared_weight_layouts",
     "lower_matmuls",
+    "ENGINES",
+    "pinned_weight_images",
     "PLAN_MIN_GAIN",
     "plan_conv_calls",
     "plan_tiled_calls",

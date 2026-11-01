@@ -539,6 +539,71 @@ class TestCodegen(_Models):
 # Cost model                                                                    #
 # --------------------------------------------------------------------------- #
 
+class TestEnginePin(unittest.TestCase):
+    """axi.numeric ``engine`` (src/matmul_lowering.py): MatMuls pinned to a
+    kernel whatever the cost model says — the row pieces of one linear split
+    between ConvKernel and MatmulKernel read one image of the weight
+    (pinned_weight_images) and write the pieces of one output (an in-place
+    Concat)."""
+
+    def model(self, path, engine, k=64, m=128, rows=(48, 32)):
+        from src import numeric
+        rng = np.random.default_rng(3)
+        ins = [f"X{i}" for i in range(len(rows))]
+        nodes = [oh.make_node("MatMul", [x, "W"], [f"Y{i}"], name=f"mm{i}") for i, x in enumerate(ins)]
+        nodes.append(oh.make_node("Concat", [f"Y{i}" for i in range(len(rows))], ["C"], axis=0))
+        nodes.append(oh.make_node("Relu", ["C"], ["Z"], name="relu"))
+        _save(path, nodes, [_f32(x, [r, k]) for x, r in zip(ins, rows, strict=True)],
+              [_f32("Z", [sum(rows), m])], {"W": _grid(rng, (k, m), 0.25)})
+        mdl = onnx.load(path)
+        meta = numeric.empty()
+        meta["engine"] = engine
+        p = mdl.metadata_props.add()
+        p.key, p.value = numeric.METADATA_KEY, numeric.to_metadata(meta)
+        onnx.save(mdl, path)
+        return path
+
+    def test_split_between_the_kernels(self):
+        from src.host_nodes import ConcatNode
+        from src.matmul_lowering import _MM_IMAGE_KWS
+        with tempfile.TemporaryDirectory() as td:
+            for mode in ("auto", "off"):
+                with self.subTest(mode=mode):
+                    path = self.model(os.path.join(td, f"pin_{mode}.onnx"), {"Y0": "conv", "Y1": "matmul"})
+                    g, cg = _gen(path, mode)
+                    conv = [sn for sn in g.nodes if isinstance(sn, MatmulConvNode)]
+                    mm = [sn for sn in g.nodes if type(sn) is MatmulNode]
+                    self.assertEqual(([sn.output.onnx_name for sn in conv], [sn.output.onnx_name for sn in mm]),
+                                     (["Y0"], ["Y1"]))
+                    kw = conv[0].kw
+                    self.assertIn(kw, _MM_IMAGE_KWS)
+                    self.assertEqual(mm[0].gemv_kw, kw)          # MatmulKernel reads the same image
+                    self.assertEqual(conv[0].inputs[1].packed_data is not None, kw > 1)
+                    self.assertTrue([sn for sn in g.nodes if isinstance(sn, ConcatNode)][0].in_place)
+                    rng = np.random.default_rng(5)
+                    feeds = {"X0": _grid(rng, (48, 64), 2.0), "X1": _grid(rng, (32, 64), 2.0)}
+                    a = cg._forward_pass(feeds)
+                    w = g.nodes[0].inputs[1].data.reshape(64, 128)
+                    want = np.floor(np.concatenate([feeds["X0"], feeds["X1"]]) @ w * 256) / 256
+                    np.testing.assert_array_equal(a["Z"], np.maximum(want, 0))
+                    if host_emu.which_cc():
+                        with tempfile.TemporaryDirectory() as td2:
+                            rc, out = host_emu.build_and_run(cg, td2)
+                        self.assertEqual(rc, 0, out[-2000:])
+                        self.assertEqual(host_emu.failures(out), [])
+
+    def test_errors(self):
+        from src.numeric import NumericError
+        from src.nodes import SchedulerError
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaisesRegex(NumericError, "conv.*matmul"):
+                _gen(self.model(os.path.join(td, "bad.onnx"), {"Y0": "dsp"}))
+            with self.assertRaisesRegex(NumericError, "not in the graph"):
+                _gen(self.model(os.path.join(td, "missing.onnx"), {"Q": "conv"}))
+            with matmul_impl("hls"), self.assertRaisesRegex(SchedulerError, "RTL MatmulKernel"):
+                _gen(self.model(os.path.join(td, "hls.onnx"), {"Y0": "conv", "Y1": "matmul"}))
+
+
 class TestCostModel(unittest.TestCase):
 
     @unittest.skipUnless(os.path.isfile(_SKILL), "conv-cycle-model skill script not found")

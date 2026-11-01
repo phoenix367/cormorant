@@ -880,7 +880,8 @@ class OnnxGraph:
             graph_io=self._input_names + self._output_names,
             kw_override=matmul_conv_kw, kw_choices=matmul_conv_kws,
             gemv_mode=matmul_gemv, gemv_hint=matmul_gemv_kw,
-            perf_model=perf_model, plan_log=self.plan_log)
+            perf_model=perf_model, plan_log=self.plan_log,
+            engine=self.numeric.get("engine"))
         self.matmul_gemv_stats = choose_gemv(
             self._nodes, mode=matmul_gemv,
             is_ap_fixed_16_8=(_dtype.name == AP_FIXED_16_8.name),

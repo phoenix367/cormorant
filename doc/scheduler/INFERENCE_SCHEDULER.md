@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1898 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1903 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -924,6 +924,16 @@ piece itself never reaches a graph output.  The codegen demotes a view to
 a host copy when a broadcast consumer gives the piece or its root a strided
 layout.  BERT's final `Split` feeds the graph outputs, so it is copied.
 
+**Concat in place.**  A `Concat` whose inputs are contiguous pieces of its
+output (the dims before its axis all 1: rows) is done by the kernels that
+write them (`CodeGenerator._merge_in_place`, like an in-place attention
+merge): each input becomes a view of the output, its producer writes there
+and the Concat emits nothing (`ConcatNode.in_place`).  Only where every
+input is a flat pool intermediate written by one kernel node and read by
+the Concat alone, at a 64-byte offset, and the output a flat pool
+intermediate; anything else stays a host copy.  The vision encoder's q / k /
+v and post-norm row pieces use it.
+
 ### Pattern fusion
 
 `src/fusion.py`, `OnnxGraph(fuse_patterns=True)` — ON by default in the
@@ -988,7 +998,8 @@ outputs exactly (printed with `%d`).
  "host":      {"tensor": "f32" | "i32" | "i16"},
  "state":     ["kv.k.l0", "h_last", ...],
  "layout":    {"kv.k.l0": [3, 64]},
- "test_fill": {"pos": 3}}
+ "test_fill": {"pos": 3},
+ "engine":    {"vision.l0.q0.p4": "matmul"}}
 ```
 
 Models without it are unaffected (every existing generated project is
@@ -1012,11 +1023,24 @@ at `f_y`, both raw int16, re-packed into the kernel's image; its
 simulation (`_SimulateMixin._conv_exp`) sums raw products exactly, wraps to
 int32 and floors (`test/test_conv_exp.py`).  Only MatMuls (constant B),
 such Convs (constant weight and bias, unannotated), Concat / Transpose (raw
-copies: every input and the output at one per-tensor exponent) and the LLM /
+copies: every input and the output at one per-tensor exponent; a Concat or a
+Slice that keeps the last axis whole also with the same per-channel exponents
+on every tensor — rows of a per-channel tensor) and the LLM /
 TTS / stereo host ops and kernel nodes may touch exponent tensors; a weight
 read by two MatMuls with different exponents, a last-axis exponent on a
 Conv, an exponent on a VectorOP / Pool tensor, or a Reshape that changes a
 per-channel exponent's channels is rejected.
+
+**Engine pins (`engine`).**  `{MatMul output: "conv" | "matmul"}` puts
+those MatMuls on ConvKernel or MatmulKernel whatever the cost model, the
+`--matmul-on-conv` mode or the planner say (`matmul_lowering.lower_matmuls`).
+A constant weight all of whose readers are pinned MatMuls of one (k, m) —
+the row pieces of a linear — gets one image for all of them (`matmul_lowering.pinned_weight_images`: the kw cheapest
+summed over the readers, among the images MatmulKernel's image path reads,
+1 / 2 / 4 / 8, when one of them stays on MatmulKernel; that reader then
+reads it there, `plan_kw`).  The vision encoder's row pieces use it, all
+on ConvKernel: beside ConvKernel a MatmulKernel piece ran ~1.9x slower than
+alone on the board ([`VLA_PLAN.md`](../plans/VLA_PLAN.md) §4).
 
 **Per-channel Conv exponents (`chexp`).**  One exponent per channel
 (axis 1) of a 4-D Conv tensor (`TensorInfo.chexp`; `exp` is then None),
@@ -1249,6 +1273,23 @@ policy pow2+p12, which the simulation reproduces bit for bit):
     P.V into R query-row parts (`VitAttnSoftmax` attribute `cols`,
     `LlmAttnMerge` `row_splits`).  Bit-identical, but it simulates no
     faster, and `--plan` does not use it (TACTICS_PLAN §9, T4).
+  - `VitFrontend(query_major=…)` (default with `vsmx` and `rowops`): the
+    attention prep swaps q and k (`VitAttnPrep` `query_major = 1`: k into the
+    image, q into the cache rows), so the scores come out query-major,
+    s [queries][keys], and `VitAttnSoftmax` `query_major = 1` runs one
+    `OP_SOFTMAX` (row mode) call: the same P, 1.81 ms a head on the board
+    against the column mode's 3.76 ([`VLA_PLAN.md`](../plans/VLA_PLAN.md) §4).
+  - `VitFrontend(pieces=…)` (default with `rowops`: `vit.default_pieces`,
+    two halves, 1024 rows → 512 + 512): every linear, LayerNorm, GELU and
+    residual add runs per row piece, each linear piece pinned to its kernel
+    (`axi.numeric` `engine`, ConvKernel by default; the pieces of a weight read
+    one image of it), the residual stream kept in pieces from the patch
+    embedding (views of `pe`) to the post-norm; q / k / v and the post-norm
+    output are `Concat`s done in place and the attention output is read by
+    row `Slice` views.  The frontend issues the pieces — and the heads'
+    q·Kᵀ, softmax and P·V — in the order of a greedy list schedule over
+    estimated lane times (`vit._Pipe`), so the row ops of one piece run under
+    the other piece's linears: 1372 → 1314 ms an image on the board.
   - `LlmAttnMerge` joins the heads.
 - **Connector:** K = 12 288 exceeds every kernel, so it runs as three
   K-chunk MatMuls (`VitPixelShuffle` writes each chunk's columns) summed by

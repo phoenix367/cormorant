@@ -23,11 +23,15 @@ after their second area pass, with the MIPI camera's capture path, every call as
 2995 calls both models measured: median +0.02 %, p10 / p90 −0.41 / +0.48 %): `04259a7af917`'s converged
 case list (2904) with the 121 ConvKernel calls its calibration had measured in earlier rounds appended
 (3025 cases, as `8599aa7a5f12` began), two passes of 108 s, one refinement round (+18: BERT 2, SmolLM2-135M
-6, SmolLM2-360M 6, Moonshine tiny 4) → **3013 exact calls**, repeat spread median 0.066 %.  Families
+6, SmolLM2-360M 6, Moonshine tiny 4) → 3013 exact calls, repeat spread median 0.066 %.  Families
 (train / held-out p90): conv 3.1 / 24.8 %, conv-dw 1.8 / 15.0 %, conv-mm 2.2 / 33.5 %, mm-gemv 4.3 /
 18.5 %, mm-tiled 1.2 / 7.0 %, pool 3.4 / 44.4 %, vecop 0.4 / 18.5 %, vecop-div 0.6 / 7.8 %, vecop-smx (116
 calls) and rowops (316 calls, train median 1.7 %); the chain term −1.95 / +0.93 µs.  `host.json`
-unchanged.
+unchanged.  Topped up on 2026-11-01 (`doc/plans/VLA_PLAN.md` §4): SmolVLA in `perf_calibrate.SHIPPED`
+(`vla_graphs`, the entries of `generate_vla_project.py`) and the vision encoder's new calls (the row-mode
+softmax, the row pieces; the MatmulKernel pieces and q·Kᵀ heads it tried before dropping them) —
+`cases` + `cases --refine` (2900 + 304), two `run --resume` sessions (441 + 79 calls) and `fit` →
+**3533 exact calls**, repeat spread median 0.061 %.
 
 `kv260/04259a7af917` was the production design before (2026-10-17, RPU_PLAN §14 track A3a: `33a799febc56`'s
 with the row-ops unit's GATE op and SCALE flag, every existing call as fast as before — the 1924 calls

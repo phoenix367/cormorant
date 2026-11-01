@@ -11,7 +11,7 @@ import numpy as np
 
 from ..nodes    import (ACT_NAMES, OP_NAMES, OP_SOFTMAX, ConvNode, MatmulConvNode, MatmulNode,
                         ScheduledNode, SchedulerError, SpaceToDepthNode)
-from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, HostNode,
+from ..host_nodes import (HOST_C_COMMON, HOST_C_HELPER_ORDER, HOST_C_POOL, ConcatNode, HostNode,
                           SliceNode, host_c_helper)
 from ..llm_nodes import (LLM_C_DMA, RUNTIME_GROUPS, LlmAttnConvNode, LlmKernelNode, LlmNode,
                          llm_c_helpers)
@@ -250,7 +250,7 @@ class _SourceMixin:
         root = self._alias_root(t.onnx_name)
         for sn in self._graph.nodes:
             if sn.output.onnx_name == root:
-                if self._is_inplace_merge(sn):        # its P.V calls wrote it
+                if self._is_inplace_merge(sn):        # its P.V calls / the inputs' kernels wrote it
                     return True
                 return bool(getattr(type(sn), "kernel_name", ""))
         return False
@@ -2241,7 +2241,10 @@ class _SourceMixin:
                 # ReshapeNode emits an empty call — keep blank for readability.
                 # A Slice view was set up once in inference_init(); an in-place
                 # merge's P.V calls already wrote its output in head order.
-                if self._is_inplace_merge(sn):
+                if isinstance(sn, ConcatNode) and self._is_inplace_merge(sn):
+                    body_lines.append("    /* concatenated in place: the inputs' kernels wrote "
+                                      f"{sn.output.c_name} */")
+                elif self._is_inplace_merge(sn):
                     body_lines.append("    /* merged in place: the P.V calls wrote "
                                       f"{sn.output.c_name} (RPU_PLAN §13) */")
                 elif not isinstance(sn, SliceNode):

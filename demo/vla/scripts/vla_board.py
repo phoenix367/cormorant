@@ -17,7 +17,10 @@ cycle identical.
   build   cmake -DINFERENCE_WEIGHTS_DIR=<weights dir> + make vla_bench smolvla
           (the library copied to <remote dir>/lib/)
   run     vla_bench on samples.bin (the selected samples, two cameras each),
-          -R repetitions, the re-open cycle
+          -R repetitions, the re-open cycle; with --profile also the profiled
+          build (build_prof/, -DINFERENCE_PROFILING=ON) on the first sample: the
+          per-layer times of one image (phase vision) and of one chunk (phase act),
+          grouped by kind in the results JSON
   check   every chunk against the specification, computed on the host in
           parallel and cached in <project>/reference/ (keyed by the formats and
           the specification's sources)
@@ -61,6 +64,35 @@ DEFAULT_PROJECT = os.path.join(REPO, "demo", "vla", "build", "smolvla_base_proje
 RUN_DIR = "/tmp/vla_bench"
 
 
+def profiles(out: str) -> dict:
+    """{phase: the profiler's LAYERS_JSON} of vla_bench's "PROFILE_PHASE: <phase>" lines."""
+    res, phase = {}, None
+    for line in out.splitlines():
+        if line.startswith("PROFILE_PHASE:"):
+            phase = line.split(":", 1)[1].strip()
+        elif line.startswith("LAYERS_JSON:") and phase:
+            res[phase] = json.loads(line[len("LAYERS_JSON:"):])
+            phase = None
+    return res
+
+
+def profile_summary(project: str, prof: dict) -> dict:
+    """Per phase: the layers that ran (name, op, total ms) and the total per op type (the
+    kernel brackets overlap host work: their sum is not the wall time)."""
+    names = {ly["i"]: ly for ly in json.load(open(os.path.join(project, "layers.json")))}
+    out = {}
+    for ph, p in prof.items():
+        layers = [{"i": ly["i"], "name": ly.get("name"), "op": names.get(ly["i"], {}).get("op"),
+                   "calls": ly.get("calls"), "total_ms": ly.get("total_us", 0) / 1000.0}
+                  for ly in p.get("layers", []) if ly.get("calls")]
+        by_op = {}
+        for ly in layers:
+            by_op[ly["op"]] = by_op.get(ly["op"], 0.0) + ly["total_ms"]
+        out[ph] = {"by_op_ms": dict(sorted(by_op.items(), key=lambda kv: -kv[1])), "layers": layers}
+        print(f"  profile {ph}: " + ", ".join(f"{k} {v:.0f}" for k, v in out[ph]["by_op_ms"].items()) + " ms")
+    return out
+
+
 def main(argv=None) -> int:
     import llm_board
     from deploy_and_run import _stream_exec, board_lock, lock_path, sync_weights
@@ -74,6 +106,7 @@ def main(argv=None) -> int:
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--board-lock", default=None)
     ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument("--profile", action="store_true", help="also build with the profiler and profile sample 0")
     ap.add_argument("--jobs", type=int, default=1, help="make -j on the board (default 1)")
     ap.add_argument("--jobs-spec", type=int, default=6, help="host processes for the specification")
     ap.add_argument("--spec-python", default=he.SPEC_PYTHON)
@@ -117,7 +150,7 @@ def main(argv=None) -> int:
                 if not s.ok:
                     return 1
                 t0 = time.monotonic()
-                llm_board.build(session, remote_proj, cfg, summary["active_kernels"], False, args.jobs,
+                llm_board.build(session, remote_proj, cfg, summary["active_kernels"], args.profile, args.jobs,
                                 args.weights_dir, targets=f"vla_bench {tag}")
                 print(f"  build ({time.monotonic() - t0:.0f} s)", flush=True)
                 session.exec_checked(f"mkdir -p {os.path.dirname(remote_lib)} && "
@@ -137,6 +170,17 @@ def main(argv=None) -> int:
             results["bench"] = he.parse(out)
             local = os.path.join(project, "actions_board.bin")
             sftp.get(f"{RUN_DIR}/actions.bin", local)
+            if args.profile:
+                he.write_samples(os.path.join(project, "samples_prof.bin"), ins[:1])
+                sftp.put(os.path.join(project, "samples_prof.bin"), f"{RUN_DIR}/samples_prof.bin")
+                # the profile lines are long (one JSON object per entry's every layer): to a file
+                out, err, rc = _stream_exec(session, f"cd {RUN_DIR} && {remote_proj}/build_prof/vla_bench "
+                                            f"-i samples_prof.bin -o actions_prof.bin -R 1 > prof.txt", timeout=3600,
+                                            on_stderr_line=lambda ln: print("    " + ln, flush=True))
+                print(f"  vla_bench [profile] rc={rc}", flush=True)
+                local_prof = os.path.join(project, "profile_board.txt")
+                sftp.get(f"{RUN_DIR}/prof.txt", local_prof)
+                results["profile"] = profile_summary(project, profiles(open(local_prof).read()))
             sftp.close()
         finally:
             session.exec(f"rm -rf {RUN_DIR}", timeout=30)

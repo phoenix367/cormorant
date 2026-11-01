@@ -1435,11 +1435,27 @@ class ResizeNode(_CopyNode):
 class ConcatNode(HostNode):
     """ONNX Concat as host copies: input k's [outer][c_k * inner] rows go to
     the output rows at their offset (outer = the product of the dims before
-    the axis) — bit-exact, dtype-agnostic."""
+    the axis) — bit-exact, dtype-agnostic.  With outer = 1 the inputs are
+    contiguous pieces of the output, and where each is written by one kernel
+    node and read by the Concat alone, the code generator makes them views of
+    the output (``in_place``, CodeGenerator._merge_in_place): the kernels
+    write the output and the Concat emits nothing."""
     helpers: ClassVar[Tuple[str, ...]] = ("concat",)
     axis:  int = 1
     outer: int = 1
     rows:  List[int] = field(default_factory=list)
+    in_place: bool = False      # set by the code generator
+
+    def view_offsets(self) -> Optional[List[int]]:
+        """Element offset of each input inside the output (outer = 1: the
+        inputs are contiguous pieces of it), else None."""
+        if self.outer != 1:
+            return None
+        return [int(v) for v in np.cumsum([0] + self.rows[:-1])]
+
+    def views(self) -> List[Tuple[int, int]]:
+        """(element offset, element count) of each input's view of the output."""
+        return list(zip(self.view_offsets(), self.rows, strict=True))
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):

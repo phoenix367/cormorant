@@ -12,7 +12,8 @@ a JSON object
      "host":      {tensor: "f32" | "i32" | "i16"},
      "state":     [tensor, ...],
      "layout":    {tensor: [G, D]},
-     "test_fill": {tensor: int}}
+     "test_fill": {tensor: int},
+     "engine":    {MatMul output: "conv" | "matmul"}}
 
 * ``exp`` — power-of-two exponents: a fixed-point tensor stores raw int16
   with value ``raw * 2^-f`` (f = 8 is ap_fixed<16,8> itself).  The kernels
@@ -49,6 +50,10 @@ a JSON object
   input image (``TensorInfo.group_kw``, R % 16K == 0).  A state
   without a host kind is a DMA state: a persistent buffer in the CMA pool
   that host ops write (flushing what a kernel will read) and kernels read.
+* ``engine`` — pins a MatMul to ConvKernel or MatmulKernel whatever the
+  cost model says (src/matmul_lowering.py): the row pieces of a linear
+  split between the two kernels, which then read one image of the weight
+  (src/vit.py's row pieces).
 
 Models without the key are unaffected (every generated project of a model
 without it is byte-identical to before).
@@ -75,7 +80,8 @@ DMA_KINDS = ("i32", "f32")      # int32 at a power-of-two exponent; float32 (the
 
 
 def empty() -> dict:
-    return {"exp": {}, "chexp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}, "dma": {}}
+    return {"exp": {}, "chexp": {}, "host": {}, "state": [], "test_fill": {}, "layout": {}, "dma": {},
+            "engine": {}}
 
 
 def parse(model) -> dict:
@@ -155,6 +161,10 @@ def apply(tensors: dict, meta: dict, dtype) -> None:
             t.packed_data = None
     for name in meta["test_fill"]:
         _get(tensors, name, "test_fill")
+    for name, e in meta.get("engine", {}).items():
+        _get(tensors, name, "engine")
+        if e not in ("conv", "matmul"):
+            raise NumericError(f"engine of '{name}': \"conv\" or \"matmul\", got {e!r}")
     for name, gd in meta.get("layout", {}).items():
         t = _get(tensors, name, "layout")
         if len(gd) not in (2, 3):
@@ -300,11 +310,13 @@ def encode_conv_weights(nodes, dtype) -> Dict[str, int]:
 def check(nodes, dtype) -> None:
     """Only MatMuls (constant B), Convs (per-tensor exponents; constant
     weight and bias, encoded by encode_conv_weights), Concat / Transpose
-    (raw copies: one exponent on every input and the output) and the LLM /
-    TTS / stereo ops (host ops and the FPGA kernel calls) may touch tensors
-    with exponents; only those host ops touch host tensors and states."""
+    (raw copies: one exponent on every input and the output; a Concat or a
+    Slice that keeps the last axis whole also with the same per-channel
+    exponents — row pieces, src/vit.py) and the LLM / TTS / stereo ops (host
+    ops and the FPGA kernel calls) may touch tensors with exponents; only
+    those host ops touch host tensors and states."""
     from .nodes import ConvNode, MatmulNode, ReshapeNode
-    from .host_nodes import ConcatNode, TransposeNode
+    from .host_nodes import ConcatNode, SliceNode, TransposeNode
     from .llm_nodes import LlmNode
     for sn in nodes:
         label = f"{sn.onnx_node.op_type} node '{sn.onnx_node.name or sn.onnx_node.op_type}'"
@@ -334,13 +346,22 @@ def check(nodes, dtype) -> None:
                                        f"exponent (per-channel exponents are along the last "
                                        f"axis, which is not a Conv's channel axis)")
             continue
-        if isinstance(sn, (ConcatNode, TransposeNode)) and any(t.exp is not None for t in ts):
+        if isinstance(sn, (ConcatNode, TransposeNode, SliceNode)) and any(t.exp is not None for t in ts):
             # raw copies: right for any exponent the inputs and the output share
             es = {None if t.exp is None or np.ndim(t.exp) else int(np.asarray(t.exp)) for t in ts}
-            if len(es) != 1 or None in es:
-                raise NumericError(f"{label}: a copy's inputs and output must carry one and the same "
-                                   f"per-tensor exponent")
-            continue
+            if len(es) == 1 and None not in es and not isinstance(sn, SliceNode):
+                continue
+            # rows of tensors with per-channel exponents along the last axis
+            rank = len(sn.output.shape)
+            rows = ((isinstance(sn, ConcatNode) and sn.axis != rank - 1)
+                    or (isinstance(sn, SliceNode) and sn.starts[-1] == 0 and sn.steps[-1] == 1
+                        and sn.out_dims[-1] == int(sn.inputs[0].shape[-1])))
+            if rows and all(t.exp is not None and len(t.shape) == rank for t in ts):
+                ce = [t.exp_channels(dtype.frac_bits) for t in ts]
+                if all(np.array_equal(c, ce[0]) for c in ce):
+                    continue
+            raise NumericError(f"{label}: a copy's inputs and output must carry one and the same "
+                               f"per-tensor exponent (or, for rows, the same per-channel ones)")
         if isinstance(sn, ReshapeNode):
             src, out = sn.inputs[0], sn.output
             if src.exp is not None or out.exp is not None:

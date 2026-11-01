@@ -464,6 +464,7 @@ class VitAttnSoftmaxNode(VitNode):
         from .smx_nodes import VitAttnSoftmaxVopNode, vsmx_attr
         if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
             return VitAttnSoftmaxVopNode.from_host(sn, node)
+        _require(not int(a.get("query_major", 0)), node, "query_major scores need vsmx = 1 (the unit's row mode)")
         return sn
 
     def c_runtime(self):

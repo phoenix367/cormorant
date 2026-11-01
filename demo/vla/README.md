@@ -32,28 +32,31 @@ flowchart TB
     class cams,task,act io
 ```
 
-## Results (2026-11-01, production bitstream `b4e63457057a`)
+## Results (2026-11-01, production bitstream `b4e63457057a`, with the faster vision encoder of VLA_PLAN §4)
 
 - **Speed** on the board, two cameras (480 × 640, as the SO100 datasets), the
   A53 driving the kernels:
 
   | step | time |
   |---|---:|
-  | each camera's image (resize + vision encoder) | 1.66 s |
-  | the prefix (16 VLM layers over 141 rows) | 0.48 s |
+  | each camera's image (resize + vision encoder) | 1.31 s |
+  | the prefix (16 VLM layers over 141 rows) | 0.47 s |
   | ten denoising steps | 0.86 s |
-  | **a chunk of 50 actions** | **4.65 s** |
+  | **a chunk of 50 actions** | **3.96 s** |
 
-  One camera: 2.78 s (prefix 0.30 s, steps 0.82 s); three: 6.53 s (prefix
-  0.66 s, steps 0.89 s).  `vla_open` loads 794 MB of weights: 1.4 s from the
-  page cache, 17 s from the SD card the first time.
+  One camera: 2.44 s (prefix 0.30 s, steps 0.83 s); three: 5.51 s (prefix
+  0.67 s, steps 0.90 s).  The vision encoder went from 1.66 to 1.31 s per
+  image in VLA_PLAN §4: its scores query-major for the softmax unit's row
+  mode, its linears and row ops in two pipelined row pieces.  `vla_open`
+  loads 794 MB of weights: 1.4 s from the page cache, 17 s from the SD card
+  the first time.
 - **Output:** on 24 SO100 evaluation samples every action bit-exact with the
   specification (`scripts/smolvla_q.py`), the repetitions and the close /
-  re-open identical (VLA_PLAN §3).  The
+  re-open identical (VLA_PLAN §3, §4).  The
   specification's actions are within 4.0 % (relative L2) of the float model's
   with the same noise; the policy's own spread between two noise samples is
   66 %, lerobot's default bf16 inference 1.4 % (VLA_PLAN §1).
-- **Memory:** 703 MiB of CMA (the chat server must be stopped), the 94 MB
+- **Memory:** 701 MiB of CMA (the chat server must be stopped), the 94 MB
   embedding table in host memory.
 
 ## Use

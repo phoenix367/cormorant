@@ -15,7 +15,11 @@
  * Every sample runs ``reps`` times (the chunks must be identical); -r closes
  * and reopens the library after the samples and runs the first one again
  * (identical).  Result lines on stdout (JSON after the tag): VLA_OPEN,
- * VLA_SAMPLE (one per sample), VLA_REOPEN, VLA_SUMMARY.
+ * VLA_SAMPLE (one per sample), VLA_REOPEN, VLA_SUMMARY.  Built with
+ * -DINFERENCE_PROFILING=ON, the first sample once more under the per-layer
+ * profiler: "PROFILE_PHASE: vision" (its first camera's image) and
+ * "PROFILE_PHASE: act" (the prefix and the steps), each followed by the
+ * profiler's "LAYERS_JSON: {...}".
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -28,6 +32,10 @@
 #include <unistd.h>
 
 #include "vla_api.h"
+#if INFERENCE_PROFILING
+#  include "inference.h"
+#  include "inference_prof.h"
+#endif
 
 typedef struct {
     int       cams;
@@ -89,6 +97,25 @@ bad:
     return -1;
 }
 
+#if INFERENCE_PROFILING
+/* The per-layer profile of one sample: camera 0's image, then the chunk. */
+static void profile(const sample_t *s, float *act)
+{
+    int c;
+    for (c = 1; c < s->cams; c++)
+        vla_set_image(c, s->rgb[c], s->h[c], s->w[c]);
+    inference_prof_reset();
+    vla_set_image(0, s->rgb[0], s->h[0], s->w[0]);
+    printf("PROFILE_PHASE: vision\n");
+    inference_prof_dump_json(stdout);
+    inference_prof_reset();
+    vla_act(s->cams, s->ids, s->n_ids, s->state, s->n_state, s->noise, act);
+    printf("PROFILE_PHASE: act\n");
+    inference_prof_dump_json(stdout);
+    fflush(stdout);
+}
+#endif
+
 /* One sample: every camera's image, then the chunk; per-camera image times into img_ms. */
 static int run(const sample_t *s, float *act, double *img_ms)
 {
@@ -143,6 +170,10 @@ int main(int argc, char **argv)
            now_ms() - t0, vla_cameras(), vla_chunk(), vla_action_size(), vla_steps());
     if (load(in, &s, &n))
         return 1;
+#if INFERENCE_PROFILING
+    if (inference_prof_init(inference_num_layers(), inference_layer_names_ptr()) != 0)
+        fprintf(stderr, "warning: inference_prof_init failed\n");
+#endif
     na = (size_t)vla_chunk() * (size_t)vla_action_size();
     act = (float *)malloc(na * sizeof(float));
     act2 = (float *)malloc(na * sizeof(float));
@@ -183,6 +214,9 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
     fclose(fo);
+#if INFERENCE_PROFILING
+    profile(&s[0], act2);
+#endif
     if (reopen) {
         int same;
         vla_close();

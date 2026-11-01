@@ -370,6 +370,47 @@ class TestDataMovement(_Base):
             self.assertIsInstance(g.nodes[0], ConcatNode)
             np.testing.assert_array_equal(a["Y"], np.concatenate(xs, axis=axis))
 
+    def test_concat_in_place(self):
+        """A Concat of contiguous pieces, each written by one kernel node and read
+        by the Concat alone, is done by the kernels: the pieces are views of the
+        output (CodeGenerator._merge_in_place); off the leading axis, or with a
+        piece read elsewhere too, it stays a host copy."""
+        rng = np.random.default_rng(17)
+        w = nph.from_array(_grid(rng, (32, 48), -1, 1).astype(np.float32), "W")
+        xs = {"X0": _grid(rng, (48, 32), -4, 4), "X1": _grid(rng, (16, 32), -4, 4)}
+
+        def model(name, axis=0, extra_reader=False):
+            nodes = [oh.make_node("MatMul", ["X0", "W"], ["A"], name="mm0"),
+                     oh.make_node("MatMul", ["X1", "W"], ["B"], name="mm1"),
+                     oh.make_node("Concat", ["A", "B"], ["C"], axis=axis),
+                     oh.make_node("Relu", ["C"], ["Y"])]
+            outs = [_vi("Y", [64, 48] if axis == 0 else [48, 96])]
+            if extra_reader:
+                nodes.append(oh.make_node("Relu", ["B"], ["Z"]))
+                outs.append(_vi("Z", [16, 48]))
+            ins = [_vi("X0", [48, 32]), _vi("X1", [16, 32])] if axis == 0 else \
+                [_vi("X0", [48, 32]), _vi("X1", [48, 32])]
+            return _save(self.d, nodes, ins, outs, [w], name=name)
+        for name, axis, extra, in_place in (("cat_inplace", 0, False, True), ("cat_shared", 0, True, False),
+                                            ("cat_axis1", 1, False, False)):
+            with self.subTest(name):
+                feeds = xs if axis == 0 else {"X0": xs["X0"], "X1": _grid(rng, (48, 32), -4, 4)}
+                g = OnnxGraph(model(name, axis, extra), dtype=DT, matmul_on_conv="off")
+                cg = CodeGenerator(g, model_path=name, dtype=DT)
+                cat = [sn for sn in g.nodes if isinstance(sn, ConcatNode)][0]
+                self.assertEqual(cat.in_place, in_place)
+                src = cg.generate_source()
+                self.assertEqual("concatenated in place" in src, in_place)
+                self.assertEqual("host_concat(" in src, not in_place)
+                a = cg._forward_pass({k: np.asarray(v, np.float64) for k, v in feeds.items()})
+                want = np.concatenate([a["A"], a["B"]], axis=axis)
+                np.testing.assert_array_equal(a["Y"], np.maximum(want, 0))
+                if host_emu.which_cc():
+                    with tempfile.TemporaryDirectory() as td:
+                        rc, out = host_emu.build_and_run(cg, td)
+                    self.assertEqual(rc, 0, out[-2000:])
+                    self.assertEqual(host_emu.failures(out), [])
+
     def test_resize_nearest_upsample(self):
         import onnxruntime as ort
         rng = np.random.default_rng(16)

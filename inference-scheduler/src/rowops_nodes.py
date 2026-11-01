@@ -1339,7 +1339,11 @@ class VitAttnPrepRoNode(RowOpsNode):
         whole-block TRANSPOSEs of ``vimage_jobs`` (T % 16K == 0: no boundary
         rows).
 
-    Every job is static (no runtime n)."""
+    Every job is static (no runtime n).  With the attribute ``query_major``
+    (src/vit.py) the factory swaps q and k: k takes the image path (the x
+    image of the scores conv) and q the K cache rows (its weight), so the
+    scores come out query-major, s [T][C] — the same integer dot products —
+    for the softmax unit's row mode."""
     T:  int = 1
     H:  int = 1
     HD: int = 16
@@ -1514,6 +1518,10 @@ def from_vit_attn_prep(node, tensors, index, align_elems, ctx: HostContext):
     fk = np.asarray(_attr_ints(a, "k_exp", node, H), np.int64)
     fv = np.asarray(_attr_ints(a, "v_exp", node, D), np.int64)
     bq, bk, bv = (_bias(ctx, tensors, node, i, D, w) for i, w in ((5, "bq"), (6, "bk"), (7, "bv")))
+    if int(a.get("query_major", 0)):
+        # the scores query-major: k takes the image path, q the cache rows (T == C: the jobs are symmetric)
+        _require(ekr is None, node, "query_major with key rows (Piper's rel_kernel)")
+        q0, k0, bq, bk, fq, fk = k0, q0, bk, bq, fk, fq
     try:
         bqq, saq, scq = rs.bias_params(bq, _exps(q0, F), np.repeat(fq, HD))
         bkq, sak, sck = rs.bias_params(bk, _exps(k0, F), np.repeat(fk, HD))

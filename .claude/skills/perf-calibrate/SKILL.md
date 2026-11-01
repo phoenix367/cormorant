@@ -25,7 +25,9 @@ with `.venv/bin/python`. Put the subcommand FIRST, because `--models` and
 | a host-op kind appeared or vanished (an op moved onto a kernel, a new host node — `simulate` reports an unpriced node) | profile every shipped model in the same board window, then `host --merge` with all the profiles (§3); the `board-window` skill does both |
 | hw submodule bump that leaves the `.bit` unchanged (sim / testbench only) | nothing, because the id is the hash of the `.bin`, not the commit. hw_128 bbfacf6 changed only the testbench, and the `.bit` built at d7ce129 still hashes to caa67f49a5a3 |
 
-Current model: **kv260/b4e63457057a** (2026-10-28), `04259a7af917`'s kernels after their second area pass
+Current model: **kv260/b4e63457057a** (2026-10-28; topped up 2026-11-01 with SmolVLA in `SHIPPED` and the
+vision encoder's row-mode softmax and row pieces, VLA_PLAN §4: `cases` 2900, `cases --refine` +304, two
+`run --resume` sessions of 441 and 79 calls → 3533 exact calls), `04259a7af917`'s kernels after their second area pass
 (AREA_PLAN §6) with the MIPI camera's capture path, every call as fast as before (the 2995 calls both models
 measured: median +0.02 %, p10 / p90 −0.41 / +0.48 %): the shortcut below — `04259a7af917`'s case list with
 the 121 ConvKernel calls of its calibration that the list had dropped, `run`, `fit`, one refinement round
@@ -164,7 +166,7 @@ bitstream needs one there too.
    while another job holds it; the `deploy.py` it starts for `--stop-server`
    re-enters the lock (the holder marks its environment).  Do not wrap it in a
    shell `flock` on that file — that lock is not marked and it would wait forever.
-7. **Host**: `cases` and `cases --refine` load all twelve shipped models (assets under
+7. **Host**: `cases` and `cases --refine` load all thirteen shipped models (assets under
    `demo/*/assets`, `demo/chat/assets/<model>`, `demo/tts/assets`).
    - Measured 2026-10-01: 2.2 min for `cases` and 11.4 min for `cases --refine`, with
      an 8.8 GB peak RSS for each.
@@ -197,7 +199,7 @@ The grid (seed 2026, a quarter held out) is 569 calls.
 - **The scheduler of 2026-10-01** gave 1249:
   - the LeNet FC convs have run as MatMul since 8e537bc (+3);
   - Piper adds 159 calls, 139 ConvKernel and 20 MatMul tactics (2026-10-01).
-- **Today's** gives 2599 (04259a7af917: 2000 shipped + 569 grid + 30 chain cases).
+- **Today's** gives 2900 (b4e63457057a with SmolVLA, 2026-11-01: 2301 shipped + 569 grid + 30 chain cases).
 - The file is rewritten from scratch, so run `cases --refine` after it.
 Keep the default `--seed`. Keep all models too: `--models` is for experiments only, because a
 model made from part of the list lacks the exact entries of the models left out.

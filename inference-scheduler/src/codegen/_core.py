@@ -48,7 +48,7 @@ from typing import List, Optional
 from ..graph   import OnnxGraph
 from ..nodes    import (ScheduledNode, MatmulNode, MatmulConvNode, ConvNode, PoolNode,
                         ReshapeNode, SpaceToDepthNode, SchedulerError)
-from ..host_nodes import HostNode, SliceNode
+from ..host_nodes import ConcatNode, HostNode, SliceNode
 from ..llm_nodes import LlmAttnConvNode, LlmAttnMergeNode, LlmKernelNode
 from ..kernels  import KernelDesc, KERNEL_REGISTRY
 from ..schedule import Dag
@@ -96,9 +96,10 @@ class _CoreMixin:
 
     @staticmethod
     def _is_inplace_merge(sn) -> bool:
-        """An attention merge whose inputs are views of its output: the P.V
-        calls wrote pv in head order, nothing runs (_merge_in_place)."""
-        return isinstance(sn, LlmAttnMergeNode) and sn.in_place
+        """An attention merge or a Concat whose inputs are views of its output:
+        the P.V calls / the inputs' kernels wrote it, nothing runs
+        (_merge_in_place)."""
+        return isinstance(sn, (LlmAttnMergeNode, ConcatNode)) and sn.in_place
 
     @classmethod
     def _is_alias_node(cls, sn) -> bool:
@@ -205,7 +206,13 @@ class _CoreMixin:
         read by the merge alone, pv a flat pool intermediate, every offset
         16-byte aligned (ConvKernel's y; the CPU never reads or syncs these
         views — the merge's consumers read pv — so a Slice view's 64-byte rule
-        does not apply).  ``AXI_INPLACE_MERGE=0`` keeps the host copy."""
+        does not apply).  ``AXI_INPLACE_MERGE=0`` keeps the host copy.
+
+        A Concat of contiguous pieces (ConcatNode.view_offsets: the dims
+        before its axis are 1) likewise, where every input is a flat pool
+        intermediate written by one kernel node and read by the Concat alone,
+        at a 64-byte offset, and the output a flat pool intermediate: the
+        kernels write the output's pieces (a row-split linear, src/vit.py)."""
         import os
 
         from .. import _conv_hw_config
@@ -214,6 +221,8 @@ class _CoreMixin:
                 sn.y_pat = None
             elif isinstance(sn, LlmAttnMergeNode):
                 sn.in_place = sn.patterned = False
+            elif isinstance(sn, ConcatNode):
+                sn.in_place = False
         if os.environ.get("AXI_INPLACE_MERGE", "1") == "0":
             return
         inter = {t.onnx_name for t in self._graph.intermediate_tensors}
@@ -248,6 +257,20 @@ class _CoreMixin:
             if sn.patterned:
                 for t, (_off, pat, _span) in zip(sn.inputs, pats, strict=True):
                     producer[t.onnx_name].y_pat = pat
+        for sn in self._graph.nodes:
+            if not isinstance(sn, ConcatNode):
+                continue
+            offs = sn.view_offsets()
+            y = sn.output.onnx_name
+            ok = (offs is not None and y in inter and flat(y) and not sn.output.is_host
+                  and len({t.onnx_name for t in sn.inputs}) == len(sn.inputs))
+            for t, off in zip(sn.inputs, offs or [], strict=False):
+                n = t.onnx_name
+                p = producer.get(n)
+                ok = ok and (n in inter and flat(n) and not t.is_host and (off * bpe) % 64 == 0
+                             and p is not None and bool(getattr(type(p), "kernel_name", ""))
+                             and not self._is_alias_node(p) and readers.get(n) == [sn])
+            sn.in_place = bool(ok)
 
     def _compute_tensor_layouts(self) -> dict:
         """

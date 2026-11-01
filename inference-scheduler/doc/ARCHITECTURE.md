@@ -831,6 +831,10 @@ bit-identical for any count).  Tables over `TABLE_FILE_BYTES` go to
   root a strided layout (`_demote_strided_views`).
 - An in-place `LlmAttnMerge` (`LlmAttnMergeNode.in_place`, §6.5): its inputs
   are pieces of its output, which the P·V calls wrote.
+- An in-place `Concat` (`ConcatNode.in_place`, `_CoreMixin._merge_in_place`):
+  its inputs are contiguous row pieces of its output, each written by one
+  kernel node and read by the Concat alone, so they are views of the output
+  (the vision encoder's row pieces, `src/vit.py`).
 
 ---
 

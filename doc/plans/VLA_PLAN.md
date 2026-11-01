@@ -325,11 +325,13 @@ drives the kernels; the R5's firmware was not running.
 
 Timing (`vla_bench`, medians; the image includes the resize):
 
-| cameras | each image | prefix | ten steps | **a chunk of 50 actions** |
+Before §4's faster vision encoder:
+
+| cameras | each image | prefix | ten steps | a chunk of 50 actions |
 |---:|---:|---:|---:|---:|
-| 1 | 1.66 s | 0.30 s | 0.82 s | **2.78 s** |
-| 2 | 1.66 s | 0.47 s | 0.86 s | **4.65 s** |
-| 3 | 1.66 s | 0.66 s | 0.89 s | **6.53 s** |
+| 1 | 1.66 s | 0.30 s | 0.82 s | 2.78 s |
+| 2 | 1.66 s | 0.47 s | 0.86 s | 4.65 s |
+| 3 | 1.66 s | 0.66 s | 0.89 s | 6.53 s |
 
 The bitstream's performance model predicted 1.59 s, 0.23 / 0.36 / 0.47 s and
 0.89 s. The prefix runs 30–40 % over its prediction because the model does
@@ -343,7 +345,8 @@ holds no FPGA buffer.
 ### What next
 
 - **The vision encoder is 70 % of a two-camera chunk.** SmolVLM's encoder
-  measures the same 1.6 s per image, so making it faster serves both models.
+  measures the same 1.6 s per image, so making it faster serves both models
+  (done: 1.66 → 1.31 s, §4).
   Lerobot's asynchronous inference would also hide some of it: start the next
   chunk while the robot executes this one.
 - **One camera is enough for many tasks.** `vla_act(1, …)` gives a chunk in
@@ -360,4 +363,132 @@ holds no FPGA buffer.
   normalisation stats.
 - **The performance model.** SmolVLA's kernel calls are not in
   `perf_calibrate.SHIPPED` yet. A top-up would let `--plan` price them, and
-  the prefix's predictions include its host ops.
+  the prefix's predictions include its host ops (the kernel calls done in §4;
+  the host ops still need a profile merged into `host.json`).
+
+## 4. A faster vision encoder (2026-11-01)
+
+**Result: 1.66 → 1.31 s per camera image (−21 %), a two-camera chunk 4.65 →
+3.96 s (−15 %), every action of the 24 samples still bit-exact** (production
+bitstream `b4e63457057a`, no spec change). The encoder is SmolVLM2's SigLIP
+(12 layers, 1024 patches, D 768, 12 heads of 64), the same shape as SmolVLM's,
+so SmolVLM's library gains the same once regenerated.
+
+### Where the time went
+
+The bitstream's performance model priced the old entry's calls at 1.59 s, and
+the board measured 1.66 s with the resize. Per kind:
+
+| calls | ms | |
+|---|---:|---|
+| the linears (76 MatMuls on ConvKernel, ~96 % of its MAC peak) | 706 | |
+| the softmax, column mode (`OP_SOFTMAX_T`) | 542 | 3.76 ms a head |
+| q·Kᵀ / P·V on ConvKernel | 270 / 154 | 1.87 / 1.07 ms a head |
+| the attention prep, GELU, residual adds, LayerNorms | 57 / 44 / 29 / 20 | |
+
+The attention was softmax-bound: 45 ms a layer on VectorOPKernel against
+ConvKernel's 35. The column mode reads its keys-major scores two beats per
+key row; the row mode measured 1.81 ms for the same 1024 × 1024
+(`run_remote_perf.py`).
+
+### What changed (`src/vit.py`, all bit-identical)
+
+- **Query-major scores.** `VitAttnPrep` `query_major = 1`
+  (`rowops_nodes.from_vit_attn_prep`) swaps q and k: k goes through the image
+  path into the q·Kᵀ conv's x image and q into the "K cache" rows, its
+  weight. So the conv writes s [queries][keys] (the same integer dot
+  products), and `VitAttnSoftmax` `query_major = 1` runs one `OP_SOFTMAX`
+  (row mode) call (`smx_nodes.VitAttnSoftmaxVopNode`). Default with `vsmx` and
+  `rowops`. **1372 ms** an image.
+- **Row pieces, pipelined.** The linears, LayerNorms, GELUs and residual
+  adds run in two row halves, pinned to ConvKernel by the new `axi.numeric`
+  key `engine`. The pieces of a weight share one image
+  (`matmul_lowering.pinned_weight_images`): before, a weight read by two
+  MatMuls fell back to kw 1, half the speed. The residual stream stays in
+  pieces from the patch embedding (`Slice` views of `pe`) to the post-norm.
+  q / k / v and the post-norm output are `Concat`s the kernels do in place
+  (`CodeGenerator._merge_in_place`), and the attention output is read by row
+  `Slice` views. A row `Concat` / `Slice` of per-channel exponent tensors is
+  now a valid raw copy (`numeric.check`). The frontend issues the nodes in
+  the order of a greedy list schedule over estimated lane times
+  (`vit._Pipe`), so one piece's row ops run under the other's linears. The
+  heads' q·Kᵀ / softmax / P·V go the same way. **1314 ms**, with two pieces
+  or four.
+
+### What did not work: MatmulKernel beside ConvKernel
+
+MatmulKernel sits idle through the whole encoder. Two levers gave it work,
+priced on the performance model's standalone measurements:
+
+- a fifth row piece of every linear on MatmulKernel, reading ConvKernel's
+  weight image through its image path (balanced at 176 of 1024 rows);
+- q·Kᵀ of 8 of 12 heads on MatmulKernel (the cache rows times the image,
+  row-major).
+
+Simulated, they gave 1164 ms with the piece and 1038 ms with the heads too.
+**On the board they lost**: 1826 ms
+with both, and 1354 ms with the heads alone against 1314 without. Beside
+ConvKernel, MatmulKernel's calls ran ~1.9× slower than alone (an fc1 piece's
+bracket 34 ms against 19.7 measured alone; q·Kᵀ 2.6 → ~5 ms). The two kernels
+share DDR through the coherent PS ports, and a linear on MatmulKernel re-reads
+its weight for every row group. The performance model measures each call
+alone and cannot see this.
+
+The code was removed. Its patch, with the q·Kᵀ node `LlmAttnScoresMmNode`
+and `run_matmul_off()`, is kept outside the repo on the maintainer's machine.
+The engine pin keeps both kernels (`test_matmul_on_conv.TestEnginePin`
+splits a linear between them, bit-exact).
+
+### Board runs (`vla_board.py`, the A53 driving, a camera image with its resize)
+
+| vision entry | per image | two-camera chunk | simulated (kernels) |
+|---|---:|---:|---:|
+| before: keys-major, column-mode softmax | 1660 ms | 4650 ms | 1590 ms |
+| query-major, row-mode softmax | 1372 ms | 4074 ms | 1317 ms |
+| + 4 row pieces (256), pipelined | 1314 ms | 3963 ms | 1211 ms |
+| + 2 row pieces (512), pipelined — **shipped** | **1313 ms** | **3956 ms** | 1214 ms |
+| 4 pieces + q·Kᵀ of 8 heads on MatmulKernel | 1354 ms | 4037 ms | — |
+| 4 ConvKernel + 1 MatmulKernel piece + the heads | 1826 ms | 4985 ms | 1038 ms |
+
+Every variant was bit-exact (2 samples each). The shipped one passed the
+full gate: 24 / 24 samples, the repetitions and the re-open identical. The
+prefix and the ten steps are unchanged; per camera count (`vla_bench`,
+medians; the 1- and 3-camera runs on the gate's first 4 samples twice, the
+third camera the top view again):
+
+| cameras | each image | prefix | ten steps | **a chunk of 50 actions** |
+|---:|---:|---:|---:|---:|
+| 1 | 1.31 s | 0.30 s | 0.83 s | **2.44 s** |
+| 2 | 1.31 s | 0.47 s | 0.86 s | **3.96 s** |
+| 3 | 1.31 s | 0.67 s | 0.90 s | **5.51 s** |
+
+The pool is 701 MiB (703 before: q / k / v and the post-norm output are
+written in place).
+
+The kernel model predicts the shipped entry at 1214 ms against the board's
+1313 ms with the resize. About 55 ms of that is the resize and the image
+copy, as before; the other ~45 ms are waits the model does not see. In the
+simulation, ConvKernel's only remaining idle time is the attention prep:
+4.8 ms a layer, 57 ms an image. A prep per row piece would hide most of it
+(the V image's 64-row blocks fit pieces of 256 or 512).
+
+### The performance model
+
+`perf_calibrate.SHIPPED` now includes SmolVLA (`vla_graphs`: the entries of
+`generate_vla_project.py`). Three `cases` / `cases --refine` rounds and two
+`run --resume` sessions measured 441 + 79 new calls → 3533 exact calls in
+`perf_models/kv260/b4e63457057a.json`, every call of the vision entry among
+them. The A53's early wake depends on these predictions. The row-mode softmax
+at its family fit (2.96 ms against 1.81) would have woken every wait about
+1 ms late.
+
+### Tests
+
+- `test_vit.TestVisionRowops`: `test_query_major` (the same image features as
+  keys-major) and `test_pieces` (pieces on both kernels: engines, one image,
+  in-place Concats, views; == the study's spec; host emulation with separate
+  CPU / DDR copies).
+- `test_host_ops.TestDataMovement.test_concat_in_place`.
+- `test_matmul_on_conv.TestEnginePin`.
+- `test_perf_calls`: the pieced entry's calls == the emitted C.
+- The full library on the host emulation: `vla_host_emu.py`, bit-exact.
