@@ -11,7 +11,6 @@ import tempfile
 import unittest
 
 import numpy as np
-import onnx
 import onnx.helper as oh
 from onnx import TensorProto as TP
 
@@ -28,13 +27,11 @@ from src.nodes import MatmulNode, conv_lowered_b_image  # noqa: E402
 
 
 def _model(nodes, inputs, outputs, inits):
+    """The model in memory (OnnxGraph takes a ModelProto): no file to clean up."""
     g = oh.make_graph(nodes, "t", inputs, outputs, initializer=inits)
     m = oh.make_model(g, opset_imports=[oh.make_opsetid("", 13)])
     m.ir_version = 8
-    d = tempfile.mkdtemp()
-    path = os.path.join(d, "m.onnx")
-    onnx.save(m, path)
-    return path
+    return m
 
 
 def _fc(n, k, m, seed=0, extra_reader=False):
