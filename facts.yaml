@@ -1301,6 +1301,47 @@ facts:
 
 # ── the README's hardware claims ─────────────────────────────────────────────
 
+- id: board.vla_results
+  kind: recorded
+  title: SmolVLA on the board (doc/plans/VLA_PLAN.md §1, §3) and its accuracy against float, where they are repeated
+  value: {bitstream: b4e63457057a, chunk1_s: 2.78, chunk2_s: 4.65, chunk3_s: 6.53, image_s: 1.66, prefix2_s: 0.47,
+          steps2_s: 0.86, rel_pct: 4.0}
+  tolerance: {rel: 0.03}
+  provenance:
+    date: 2026-11-01
+    how: "vla_board.py -n 24 on b4e63457057a (the chat server stopped, the A53 driving; the 24 SO100 evaluation
+          samples twice each and the re-open, all bit-exact with smolvla_q's specification): image 1658 ms per
+          camera, prefix 471 ms, ten steps 859 ms, a chunk from two cameras 4647 ms (median); the one-off timing of
+          1 / 3 cameras (the third the top view again; 4 samples x 2): 2.78 / 6.53 s (prefix 0.30 / 0.66 s, steps
+          0.82 / 0.89 s).  rel_pct: vla_study.py study --torch --policies pow2+p12+vgelu+vsmx+rowops (the final
+          specification, 24 samples): relative L2 of the actions against float with the same noise, mean 4.03 %"
+    facts: {perf.bitstream_id: b4e63457057a}   # stale on another bitstream
+  verify:
+    chunk2_s: {file: demo/vla/build/smolvla_base_project/board_gate.json, json: latency.chunk_ms_median,
+               transform: "v / 1000"}
+    image_s: {file: demo/vla/build/smolvla_base_project/board_gate.json, json: latency.image_ms_median,
+              transform: "v / 1000"}
+    prefix2_s: {file: demo/vla/build/smolvla_base_project/board_gate.json, json: latency.prefix_ms_median,
+                transform: "v / 1000"}
+    steps2_s: {file: demo/vla/build/smolvla_base_project/board_gate.json, json: latency.expert_ms_median,
+               transform: "v / 1000"}
+  fix: report
+  mentions:
+    - {file: README.md, regex: 'SmolVLA \(vision-language-action, `lerobot/smolvla_base`\) \| \*\*(?P<chunk2_s>[\d.]+) s\*\* per chunk of 50 actions from two 480×640 cameras \((?P<image_s>[\d.]+) s per camera image, (?P<prefix2_s>[\d.]+) s prefix, (?P<steps2_s>[\d.]+) s for the ten denoising steps\); actions within (?P<rel_pct>[\d.]+) % of float'}
+    - {file: doc/README.md, regex: 'action chunks within (?P<rel_pct>[\d.]+) % of float with the same noise'}
+    - {file: doc/README.md, regex: 'SO100 samples\): (?P<chunk2_s>[\d.]+) s per chunk of 50 actions from two cameras'}
+    - {file: CLAUDE.md, regex: '`vla_board.py`: (?P<chunk2_s>[\d.]+) s per chunk\s+of 50 actions from two cameras', dotall: true}
+    - {file: demo/vla/README.md, regex: '\| each camera.s image \(resize \+ vision encoder\) \| (?P<image_s>[\d.]+) s \|'}
+    - {file: demo/vla/README.md, regex: '\| the prefix \(16 VLM layers over 141 rows\) \| (?P<prefix2_s>[\d.]+) s \|'}
+    - {file: demo/vla/README.md, regex: '\| ten denoising steps \| (?P<steps2_s>[\d.]+) s \|'}
+    - {file: demo/vla/README.md, regex: '\| \*\*a chunk of 50 actions\*\* \| \*\*(?P<chunk2_s>[\d.]+) s\*\* \|'}
+    - {file: demo/vla/README.md, regex: 'One camera: (?P<chunk1_s>[\d.]+) s \(prefix [\d.]+ s, steps [\d.]+ s\); three: (?P<chunk3_s>[\d.]+) s', dotall: true}
+    - {file: demo/vla/README.md, regex: 'actions are within (?P<rel_pct>[\d.]+) % \(relative L2\)'}
+    - {file: doc/plans/VLA_PLAN.md, regex: 'keeps the action chunks within (?P<rel_pct>[\d.]+) % of\s+float', dotall: true}
+    - {file: doc/plans/VLA_PLAN.md, regex: '\| 1 \| (?P<image_s>[\d.]+) s \| [\d.]+ s \| [\d.]+ s \| \*\*(?P<chunk1_s>[\d.]+) s\*\* \|'}
+    - {file: doc/plans/VLA_PLAN.md, regex: '\| 2 \| [\d.]+ s \| (?P<prefix2_s>[\d.]+) s \| (?P<steps2_s>[\d.]+) s \| \*\*(?P<chunk2_s>[\d.]+) s\*\* \|'}
+    - {file: doc/plans/VLA_PLAN.md, regex: '\| 3 \| [\d.]+ s \| [\d.]+ s \| [\d.]+ s \| \*\*(?P<chunk3_s>[\d.]+) s\*\* \|'}
+
 - id: yolo.quality
   kind: recorded
   title: YOLOv5n's COCO128 mAP, the FPGA datapath (the scheduler's simulation = the board) against float

@@ -47,6 +47,7 @@ from .vit_nodes import VIT_OP_FACTORIES
 from .tts_nodes import TTS_OP_FACTORIES
 from .stereo_nodes import STEREO_OP_FACTORIES
 from .asr_nodes import ASR_OP_FACTORIES
+from .vla_nodes import VLA_OP_FACTORIES
 from . import cost_model
 from . import fusion
 from . import matmul_lowering
@@ -802,8 +803,9 @@ class OnnxGraph:
             node = _detached_node(node)
             if node.domain == LLM_DOMAIN:
                 factories = {**LLM_OP_FACTORIES, **VIT_OP_FACTORIES, **TTS_OP_FACTORIES,
-                             **STEREO_OP_FACTORIES, **ASR_OP_FACTORIES, **rowops_nodes.LLM_OVERRIDES,
-                             **rowops_nodes.VIT_OVERRIDES, **rowops_nodes.TTS_OVERRIDES}
+                             **STEREO_OP_FACTORIES, **ASR_OP_FACTORIES, **VLA_OP_FACTORIES,
+                             **rowops_nodes.LLM_OVERRIDES, **rowops_nodes.VIT_OVERRIDES,
+                             **rowops_nodes.TTS_OVERRIDES}
                 if node.op_type not in factories:
                     raise SchedulerError(
                         f"Node '{node.name or node.op_type}': unknown {LLM_DOMAIN} op "

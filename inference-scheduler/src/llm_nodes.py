@@ -1271,7 +1271,10 @@ class LlmAttnSoftmaxNode(LlmNode):
     left to right, P = round_half_even(e / sum * 2^f_p); other entries 0.
     Attributes: ``causal`` = 0 — every row t < n over the keys j < pos + n
     (an encoder's attention over its valid frames, src/moonshine.py; with
-    vsmx = 1 only: the unit's smx_mask, period 0);
+    vsmx = 1 only: the unit's smx_mask, period 0); ``causal`` = 2 — every row
+    over the keys j < pos + n - 1 (a prefix-LM's prefix, src/smolvla.py: its last
+    valid row, which alone attends its own key, is vla_nodes.VlaStateAttn's;
+    vsmx = 1 only);
     ``logit_scale`` — the scores' scale (default head_dim^-1/2; a model whose
     heads are padded for the kernels keeps its own head dim's)."""
     T:     int = 1
@@ -1284,6 +1287,7 @@ class LlmAttnSoftmaxNode(LlmNode):
     fp:    Optional[np.ndarray] = field(default=None, repr=False)   # [G]
     has_n: bool = True                                               # False: n = T (decode)
     causal: bool = True                                              # False: rows over keys < pos + n
+    prefix_lm: bool = False                                          # causal 2: rows over keys < pos + n - 1
 
     @classmethod
     def from_onnx_node(cls, node, tensors, index, align_elems, ctx: HostContext):
@@ -1303,7 +1307,8 @@ class LlmAttnSoftmaxNode(LlmNode):
         scale = float(ls.decode() if isinstance(ls, bytes) else ls) if ls is not None else 1.0 / math.sqrt(HD)
         sn = cls(onnx_node=node, inputs=[s, pos] + ([n] if n is not None else []), output=y,
                  index=index, align_elems=align_elems, T=T, G=G, C=C, Q=Q, group=int(a["group"]),
-                 scale=scale, has_n=n is not None, causal=int(a.get("causal", 1)) != 0,
+                 scale=scale, has_n=n is not None, causal=int(a.get("causal", 1)) == 1,
+                 prefix_lm=int(a.get("causal", 1)) == 2,
                  fs=np.asarray(_attr_ints(a, "s_exp", node, G), np.int64),
                  fp=np.asarray(_attr_ints(a, "p_exp", node, G), np.int64), F=ctx.frac_bits)
         sn._want(s, None, "scores")
@@ -1314,7 +1319,7 @@ class LlmAttnSoftmaxNode(LlmNode):
         from .smx_nodes import LlmAttnSoftmaxVopNode, vsmx_attr
         if vsmx_attr(node):                       # the vsmx policy: VectorOP's softmax unit
             return LlmAttnSoftmaxVopNode.from_host(sn, node)
-        _require(sn.causal, node, "causal = 0 runs on VectorOPKernel's softmax unit only (vsmx = 1)")
+        _require(sn.causal, node, "causal = 0 / 2 runs on VectorOPKernel's softmax unit only (vsmx = 1)")
         return sn
 
     def c_runtime(self):

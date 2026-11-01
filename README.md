@@ -68,6 +68,7 @@ a soak test, the cores' deep idle state (about 2 % on the chat decode).
 | Piper en_US-lessac-medium (text to speech, 22 050 Hz) | **0.15 s** per 1.49 s of audio (real-time factor 0.11), text encoder 24 ms and duration predictor 49 ms per 88 phonemes; through the chat server the first sound after 1.0–1.5 s, real-time factor 0.58–0.79 end to end (at 100 MHz); listen: ▶ [hello](demo/tts/samples/hello.mp3), ▶ [paragraph](demo/tts/samples/paragraph.mp3) | [TTS_PLAN §4–§7](doc/plans/TTS_PLAN.md), [OFFLOAD_PLAN](doc/plans/OFFLOAD_PLAN.md), [samples](demo/tts/README.md#samples) |
 | MobileNet V1 on the AR1335 MIPI camera, 640×480 | **20.7 ms** per frame, about 16 frames/s end to end with the annotated frames streamed to the host | [demo/camera](demo/camera/README.md) |
 | Moonshine base (speech to text, English) | **1.10 s** per LibriSpeech utterance (8.4 s of audio on average, RTF 0.13), WER 2.93 % (float 3.02 %); through the chat server 1.3 s for 10 s of audio | [ASR_PLAN §6–§7](doc/plans/ASR_PLAN.md), [Speech to text](demo/chat/doc/SPEECH_TO_TEXT.md) |
+| SmolVLA (vision-language-action, `lerobot/smolvla_base`) | **4.65 s** per chunk of 50 actions from two 480×640 cameras (1.66 s per camera image, 0.48 s prefix, 0.86 s for the ten denoising steps); actions within 4.0 % of float with the same noise (the policy's own spread between two noise samples: 66 %), bit-exact with the specification on 24 SO100 samples | [VLA_PLAN](doc/plans/VLA_PLAN.md), [demo/vla](demo/vla/README.md) |
 
 The BERT, SmolLM2 and SmolVLM logits, the YOLOv5n head maps and the Piper
 audio samples are bit-exact with the scheduler's simulation; Moonshine's
@@ -224,6 +225,7 @@ Each demo takes a model to a running KV260 program; see
 | [`demo/chat/`](demo/chat/) | An OpenAI-compatible server on the board, usable from `chat.py` (which can read answers aloud) or any OpenAI client: BERT document QA, SmolLM2-135M / 360M generative chat, SmolVLM-256M chat about images, Piper text to speech (`/v1/audio/speech`) and Moonshine speech to text (`/v1/audio/transcriptions`) |
 | [`demo/tts/`](demo/tts/) | Piper text to speech: the numeric study, `libpiper_tts.so` and its board gate (audio bit-exact with the specification) |
 | [`demo/asr/`](demo/asr/scripts/) | Moonshine speech to text: the study (Whisper and Moonshine screened), the bit-level specification, `libmoonshine_<size>.so` and its host-emulation and board gates (token ids bit-exact with the specification) |
+| [`demo/vla/`](demo/vla/) | SmolVLA vision-language-action: camera frames + a task + the robot's state -> 50 actions; the study, the bit-level specification, `libsmolvla.so` (with a ctypes wrapper) and its host-emulation and board gates (actions bit-exact with the specification) |
 | [`demo/miranda/`](demo/miranda/) | Miranda, a voice assistant: say "Hello Miranda" and a request; the console client streams the microphone to the board (RTP), which detects speech (VAD on the CPU), recognizes the key phrase and the request (Moonshine), answers (SmolLM2) and speaks (Piper) through the chat server |
 
 ---
@@ -259,7 +261,7 @@ SystemVerilog kernels, with Verilator 5.x).
 cd inference-scheduler
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python test/gen_all_models.py          # the test ONNX models
-.venv/bin/python -m pytest test/ -q              # 1893 tests (the first run downloads the 435 MB BERT model)
+.venv/bin/python -m pytest test/ -q              # 1898 tests (the first run downloads the 435 MB BERT model)
 .venv/bin/python inference_scheduler.py mymodel.onnx --out-dir /tmp/mymodel
 python3 ../tools/facts/facts.py install-hook     # optional: git commit checks the facts of facts.yaml it touches
 ```
@@ -358,7 +360,7 @@ or run a demo: `cd demo/<name>` and follow its README.
 
 | Layer | Needs | Command |
 |---|---|---|
-| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1893<!-- /fact --> tests) |
+| Scheduler unit tests | Python | `cd inference-scheduler && .venv/bin/python -m pytest test/ -q` (<!-- fact:scheduler.test_count -->1898<!-- /fact --> tests) |
 | Chat app tests | Python | `inference-scheduler/.venv/bin/python -m pytest demo/chat/tests -q` (<!-- fact:chat.test_count -->257<!-- /fact --> tests; ~75 skip until `llm_calibrate.py fetch` / `vlm_study.py fetch` have downloaded the tokenizers, and `demo/bert_squad/scripts/fetch_assets.py vocab` the BERT vocabulary; the speech tests use numpy, ffmpeg and libespeak-ng when present) |
 | Kernel C simulation | Vitis HLS headers, gcc, CMake (Verilator 5.x for the five RTL kernels) | `make -j8 && ctest` in `build/` |
 | RTL behaviour tests | Vitis, Vivado, `hw/` submodules | `make behavior_test` |
@@ -395,6 +397,7 @@ own models.
 | SmolVLM-256M-Instruct (Hugging Face safetensors) | one 512×512 image + text, context 1024 | chat about images ([demo/chat](demo/chat/README.md)) |
 | Piper en_US-lessac-medium ([rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) ONNX) | text, up to 4096 characters (espeak-ng phonemes) | text to speech ([demo/tts](demo/tts/README.md), [demo/chat](demo/chat/doc/TEXT_TO_SPEECH.md)) |
 | Moonshine base / tiny ([UsefulSensors/moonshine-base](https://huggingface.co/UsefulSensors/moonshine-base), safetensors) | 16 kHz audio, any length (parts of up to 24.6 s) | speech to text ([demo/asr](demo/asr/scripts/), [demo/chat](demo/chat/doc/SPEECH_TO_TEXT.md)) |
+| SmolVLA ([lerobot/smolvla_base](https://huggingface.co/lerobot/smolvla_base), safetensors) | 1–3 camera frames (any size), a task's tokens, the robot's state | robot actions: a chunk of 50 ([demo/vla](demo/vla/README.md)) |
 
 ---
 
