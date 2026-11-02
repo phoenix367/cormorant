@@ -29,6 +29,8 @@ first (demo/chat/deploy.py --stop) — it owns the FPGA.
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_board.py
            [--project demo/chat/build/llm_project] [--prompts factual,summarise,multi-turn]
            [--decode 32] [--prefill-lens 16,64,256] [--decode-at 32,256,512,768,1000]
+           (prompts: the model's gate prompts, llm_project.gate_prompts; prefill lengths
+           at most the context - 1)
            [--decode-at-steps 8] [--profile] [--reopen]
            [--study-json gate2.json] [--board-lock FILE] [--skip-build]
        ... llm_board.py --install-only      (deploy: upload, build, install; no bench)
@@ -122,6 +124,27 @@ def write_prompts(path: str, ids: dict) -> list:
             f.write(struct.pack("<i", -len(t) if cont else len(t)))
             f.write(np.asarray(t, "<i4").tobytes())
     return names
+
+
+def gate_ids(project: str, prompts: Optional[str] = None, second_turn: Optional[str] = None) -> dict:
+    """{name: token ids} of the gate prompts of the project's model (default:
+    llm_project.gate_prompts) with their second-turn continuations."""
+    assets = json.load(open(os.path.join(project, "project.json"))).get("assets")
+    gp, gt = lp.gate_prompts(assets)
+    prompts = gp if prompts is None else prompts
+    second_turn = gt if second_turn is None else second_turn
+    return lp.with_second_turns(lp.tokenize_prompts(prompts.split(","), assets=assets),
+                                [n for n in second_turn.split(",") if n], assets=assets)
+
+
+def lib_check_args(project: str, ids: dict) -> str:
+    """llm_lib_check.py's prompt, second turn and context for the project's
+    model (JSON; the script's defaults are SmolLM2-135M's)."""
+    summary = json.load(open(os.path.join(project, "project.json")))
+    name = next(n for n in ids if not n.endswith("/turn2"))
+    turn2 = ids.get(name + "/turn2") or next((v for n, v in ids.items() if n.endswith("/turn2")), [])
+    return json.dumps({"prompt": ids[name][1:], "turn2": turn2, "context": summary["context"]},
+                      separators=(",", ":"))
 
 
 def upload_project(session, local: str, remote: str, skip=()) -> int:
@@ -292,7 +315,8 @@ def check_logits(project: str, names: list, ids: dict, res: dict, logits_path: s
     fe = lp.frontend(cfg, W, fmt, ctx=summary["context"],
                      prefill_attn=summary.get("prefill_attn", "host"),
                      decode_attn=summary.get("decode_attn", "host"),
-                     vsmx=summary.get("vsmx", False))
+                     vsmx=summary.get("vsmx", False), rowops=summary.get("rowops"),
+                     drope=summary.get("drope"))
     cgs = lp.make_codegens(fe, summary["buckets"])
     raw = np.fromfile(logits_path, "<f4").reshape(-1, cfg.V)
     study = json.load(open(study_json)) if study_json and os.path.exists(study_json) else {}
@@ -350,11 +374,13 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--project", default=DEFAULT_PROJECT)
     ap.add_argument("--bert-config", default=None)
-    ap.add_argument("--prompts", default="factual,summarise,multi-turn")
-    ap.add_argument("--second-turn", default="factual",
-                    help="prompts followed by a second-turn continuation ('' = none)")
+    ap.add_argument("--prompts", default=None, help="default: the model's gate prompts")
+    ap.add_argument("--second-turn", default=None,
+                    help="prompts followed by a second-turn continuation ('' = none; default: the "
+                         "first gate prompt)")
     ap.add_argument("--decode", type=int, default=32)
-    ap.add_argument("--prefill-lens", default="16,64,256")
+    ap.add_argument("--prefill-lens", default=None,
+                    help="prefill timing lengths (default 16,64,256, at most the context - 1)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--decode-at", default="",
                     help="decode ms / token at these positions (prefill to each, then steps)")
@@ -390,6 +416,8 @@ def main(argv=None) -> int:
     layers = json.load(open(os.path.join(args.project, "layers.json")))
     if args.install_only and args.skip_build:
         ap.error("--install-only builds; it cannot be combined with --skip-build")
+    if args.prefill_lens is None:
+        args.prefill_lens = ",".join(str(min(p, summary["context"] - 1)) for p in (16, 64, 256))
     local_prompts = os.path.join(args.project, "prompts.bin")
     vlm = bool(summary.get("vision"))
     args.vlm_images = None
@@ -400,8 +428,7 @@ def main(argv=None) -> int:
         args.vlm_images = os.path.join(args.project, "images.bin")
         names = [f"COCO {i}" for i, _ in v_items]
     elif not args.install_only:
-        ids = lp.with_second_turns(lp.tokenize_prompts(args.prompts.split(",")),
-                                   [n for n in args.second_turn.split(",") if n])
+        ids = gate_ids(args.project, args.prompts, args.second_turn)
         names = write_prompts(local_prompts, ids)
     results = {"project": summary, "prompts": [] if args.install_only else names}
     with board_lock(lock_path(cfg, args.board_lock)):
@@ -470,8 +497,9 @@ def main(argv=None) -> int:
                     for ph, p in pres["profiles"].items()}
             if not args.no_lib_check:
                 sftp.put(os.path.join(HERE, "llm_lib_check.py"), f"{RUN_DIR}/llm_lib_check.py")
+                la = "" if vlm else " " + shlex.quote(lib_check_args(args.project, ids))
                 out, err, rc = session.exec(f"cd {RUN_DIR} && python3 llm_lib_check.py "
-                                            f"{lib}", timeout=1800)
+                                            f"{lib}{la}", timeout=1800)
                 line = next((ln for ln in out.splitlines() if ln.startswith("LLM_LIB_CHECK:")), None)
                 results["lib_check"] = json.loads(line.split(":", 1)[1]) if line else {
                     "error": (out + err)[-2000:]}

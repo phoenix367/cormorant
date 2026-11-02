@@ -318,8 +318,10 @@ class TestProtocol(SchemaMixin, unittest.TestCase):
         self._err(st, out, 404, "model", "model_not_found")
         st, _, out = self.s.request("GET", "/v1/nothing")
         self._err(st, out, 404, None, "unknown_url")
-        st, _, out = self.s.request("POST", "/v1/completions", {"prompt": "x"})
+        st, _, out = self.s.request("POST", "/v1/nothing", {"prompt": "x"})
         self._err(st, out, 404, None, "unknown_url")
+        st, _, out = self.s.request("POST", "/v1/completions", {"prompt": "x"})   # a chat-only model
+        self._err(st, out, 400, "model", "model_not_supported")
 
     def test_backend_crash_is_500(self):
         st, _, out = self.s.post(chat_body("crash"))

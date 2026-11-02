@@ -58,6 +58,41 @@
         "kl_held": 0.001794,
         "identical": 8
       }
+    },
+    "stories15m": {
+      "repo": "nickypro/tinyllama-15M",
+      "revision": "a97e01fa7d54c088df9dc1b53d581a863ce08cd6",
+      "license": "mit",
+      "files": {
+        "config.json": "894c283ab2d3373b3dd4b88a1a868f4292c5cab5f0e75976fbdf993eccb24766",
+        "generation_config.json": "95ac031bf2524d1a09cbedff7f1b7d11ea31deb7130b1839af973eab3a20197f",
+        "model.safetensors": "b9e8d4614e24c89e99502000294af0aab73e9266029357377578e0a504b7f8d9",
+        "tokenizer.json": "8eea70c4866c4f1320ba096fc986ac82038a8374dbe135212ba7628835b4a6f1",
+        "tokenizer_config.json": "33d29c87e41f7dd1efb0434d852730320c82970f292be452d820539bce417052",
+        "special_tokens_map.json": "ff3b4a612c4e447acb02d40071bddd989fe0da87eb5b7fe0dbadfc4f74de7531"
+      },
+      "formats": {
+        "policy": "pow2+sink+p12",
+        "sha256": "660b18674f3d54e2fbf34e4457391144e9cc3e4ad7c23b6307c79e2015bc4b0f"
+      },
+      "texts": {
+        "calib_tinystories_valid.txt": {
+          "sha256": "625dc2708712e313ba69b258c439c6ecdf6d34705abf333da3ad38743c4fa612"
+        },
+        "heldout_tinystories_valid.txt": {
+          "sha256": "8c19ee609a76ae106738f7e2f8466d970eee13b17dd856ef1326158723131349"
+        }
+      },
+      "study": {
+        "policy": "pow2+sink+p12",
+        "ppl": 3.32367,
+        "float_ppl": 3.314127,
+        "top1_all": 0.98803,
+        "top1_resp": 0.988228,
+        "top1_held": 0.986601,
+        "kl_held": 0.000779,
+        "identical": 1
+      }
     }
   },
   "texts": {

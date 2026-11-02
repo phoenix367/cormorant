@@ -786,12 +786,14 @@ facts:
 - id: chat.pool_mib
   kind: recorded
   title: DMA pool of each chat model's library, MiB (what it takes of the cma= area)
-  value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54, moonshine_base: 185.8}
+  value: {bert: 216, smollm2_135m: 299, smollm2_360m: 758, smolvlm_256m: 495, piper: 54, moonshine_base: 185.8,
+          stories15m: 34.8}
   tolerance: 0.5                             # MiB: the docs round to whole MiB (1 let 53 pass for 54.3)
   provenance:
     commit: 7ac7f53
     date: 2026-10-18
-    how: "re-verified 2026-10-18 (facts.py verify, bitstream 04259a7af917): the inputs changed since 4e06d65 only by
+    how: "stories15m added 2026-11-02 (CHAT_PLAN §27: build/llm_project_stories15m, 34.8 MiB with the descriptor
+          area and the 4 KiB round-up; project.json's pool_bytes 34.6); re-verified 2026-10-18 (facts.py verify, bitstream 04259a7af917): the inputs changed since 4e06d65 only by
           comments (628a351's copyright headers, 0598c4f), the BERT demo project regenerated (216.3 MiB), Moonshine
           base added (185.8 MiB: the allocation, the row-ops descriptor area and the 4 KiB round-up included;
           project.json's pool_bytes, ASR_PLAN's 185.5, leaves them out); verified for RPU_PLAN A3a.4 (2026-10-17, bitstream 04259a7af917, facts.py verify): Piper 54.3 MiB with GATE /
@@ -823,6 +825,7 @@ facts:
     smolvlm_256m: {file: demo/chat/build/llm_project_smolvlm_256m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     piper: {file: demo/tts/build/piper_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
     moonshine_base: {file: demo/asr/build/moonshine-base_project/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
+    stories15m: {file: demo/chat/build/llm_project_stories15m/include/inference.h, regex: 'INFERENCE_BUF_POOL_SIZE_BYTES\s+(\d+)u', transform: 'round(int(v) / 2**20, 1)'}
   fix: auto
   mentions:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| BERT \| (?P<bert>\d+) MiB'}
@@ -831,6 +834,10 @@ facts:
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| SmolVLM-256M \| (?P<smolvlm_256m>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Piper \| (?P<piper>\d+) MiB'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| Moonshine base \| (?P<moonshine_base>[\d.]+) MiB'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| stories15m \| (?P<stories15m>[\d.]+) MiB'}
+    - {file: demo/chat/doc/STORIES.md, regex: '`cma_mb` 50 \(the pool is (?P<stories15m>[\d.]+) MiB\)'}
+    - {file: demo/chat/chat_config.json.example, regex: 'The (?P<stories15m>[\d.]+) MiB pool BO \(33 MB'}
+    - {file: doc/plans/CHAT_PLAN.md, regex: 'Pool \*\*(?P<stories15m>[\d.]+) MiB\*\* \(weights 30.7'}
     - {file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: 'CMA \(a (?P<moonshine_base>[\d.]+) MiB pool\)'}
     - {file: demo/asr/README.md, regex: '\*\*Memory:\*\* base (?P<moonshine_base>[\d.]+) MiB of CMA'}
     - {file: doc/ARCHITECTURE.md, dotall: true, regex: 'beside Piper''s (?P<piper>\d+) MiB\s+and Moonshine base''s (?P<moonshine_base>[\d.]+) MiB'}
@@ -866,6 +873,7 @@ facts:
       smolvlm_256m: {file: demo/chat/kv260_chat_server.py, regex: '"--vlm-cma-mb", type=float, default=(\d+)\.0', type: int}
       piper: {file: demo/chat/kv260_chat_server.py, regex: '"--tts-cma-mb", type=float, default=(\d+)\.0', type: int}
       moonshine: {file: demo/chat/kv260_chat_server.py, regex: '"--asr-cma-mb", type=float, default=(\d+)\.0', type: int}
+      stories15m: {file: demo/chat/kv260_chat_server.py, regex: '"--stories-cma-mb", type=float, default=(\d+)\.0', type: int}
   fix: auto
   mentions:
     - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smollm2_135m>\d+)\), \("dry_multiplier"'}
@@ -873,6 +881,13 @@ facts:
     - {file: demo/chat/deploy.py, regex: '\("cma_mb", (?P<smolvlm_256m>\d+)\),\n\s+\("tokenizer", "assets/smolvlm'}
     - {file: demo/chat/deploy.py, regex: '"/root/piper_weights"\), \("model_id", None\), \("cma_mb", (?P<piper>\d+)\)'}
     - {file: demo/chat/deploy.py, regex: 'moonshine-base/tokenizer.json"\), \("cma_mb", (?P<moonshine>\d+)\)'}
+    - {file: demo/chat/deploy.py, regex: '\("model_id", None\), \("cma_mb", (?P<stories15m>\d+)\),\n\s+\("tokenizer", "assets/stories15m'}
+    - {file: demo/chat/stories_backend.py, regex: '^    cma_mb = (?P<stories15m>\d+)\.0$'}
+    - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"stories15m": \{[^}]*?"cma_mb": (?P<stories15m>\d+)'}
+    - {file: demo/chat/kv260_chat_server.py, regex: 'stories15m ~(?P<stories15m>\d+) MB$'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '^\| stories15m \| [\d.]+ MiB \| (?P<stories15m>\d+) \|'}
+    - {file: demo/chat/doc/DEPLOY.md, regex: '--stories-cma-mb (?P<stories15m>\d+)`'}
+    - {file: demo/chat/doc/STORIES.md, regex: '`cma_mb` (?P<stories15m>\d+) \(the pool'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"moonshine": \{[^}]*?"cma_mb": (?P<moonshine>\d+)'}
     - {file: demo/chat/doc/SPEECH_TO_TEXT.md, regex: 'It needs (?P<moonshine>\d+) MB of CMA'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"smollm2": \{[^}]*?"cma_mb": (?P<smollm2_135m>\d+)'}

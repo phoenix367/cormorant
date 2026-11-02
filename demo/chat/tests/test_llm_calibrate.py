@@ -103,7 +103,15 @@ class TestManifest(unittest.TestCase):
         for name, spec in m["models"].items():
             with self.subTest(model=name):
                 self.assertRegex(spec["revision"], r"^[0-9a-f]{40}$")
-                self.assertEqual(sorted(spec["files"]), sorted(lc.CHECKPOINT_FILES))
+                if "texts" in spec:                 # a text-profile model (stories15m): its repo's files
+                    self.assertLessEqual(set(spec["files"]), set(lc.CHECKPOINT_FILES))
+                    self.assertLessEqual({"config.json", "model.safetensors", "tokenizer.json",
+                                          "tokenizer_config.json"}, set(spec["files"]))
+                    self.assertEqual(len(spec["texts"]), 2)
+                    for t in spec["texts"].values():
+                        self.assertRegex(t["sha256"], HEX64)
+                else:
+                    self.assertEqual(sorted(spec["files"]), sorted(lc.CHECKPOINT_FILES))
                 for h in spec["files"].values():
                     self.assertRegex(h, HEX64)
                 self.assertEqual(spec["formats"]["policy"], "pow2+sink+p12")
@@ -118,7 +126,8 @@ class TestManifest(unittest.TestCase):
     def test_texts_match_llm_study_fetch(self):
         """The text names are those llm_study.py fetch writes."""
         src = lc.STUDY.read_text()
-        for name in lc.load_manifest()["texts"]:
+        m = lc.load_manifest()
+        for name in list(m["texts"]) + [n for s in m["models"].values() for n in s.get("texts", {})]:
             self.assertIn(f'"{name}"', src)
 
     def test_study_dir_matches_llm_study(self):

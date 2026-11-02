@@ -1,0 +1,42 @@
+{
+  "model": "stories15m",
+  "repo": "nickypro/tinyllama-15M",
+  "revision": "a97e01fa7d54c088df9dc1b53d581a863ce08cd6",
+  "policy": "pow2+sink+p12",
+  "formats": "study/stories15m/formats_pow2+sink+p12.json",
+  "formats_sha256": "660b18674f3d54e2fbf34e4457391144e9cc3e4ad7c23b6307c79e2015bc4b0f",
+  "manifest_sha256": "660b18674f3d54e2fbf34e4457391144e9cc3e4ad7c23b6307c79e2015bc4b0f",
+  "status": "reproduced",
+  "inputs": {
+    "config.json": "894c283ab2d3373b3dd4b88a1a868f4292c5cab5f0e75976fbdf993eccb24766",
+    "generation_config.json": "95ac031bf2524d1a09cbedff7f1b7d11ea31deb7130b1839af973eab3a20197f",
+    "model.safetensors": "b9e8d4614e24c89e99502000294af0aab73e9266029357377578e0a504b7f8d9",
+    "tokenizer.json": "8eea70c4866c4f1320ba096fc986ac82038a8374dbe135212ba7628835b4a6f1",
+    "tokenizer_config.json": "33d29c87e41f7dd1efb0434d852730320c82970f292be452d820539bce417052",
+    "special_tokens_map.json": "ff3b4a612c4e447acb02d40071bddd989fe0da87eb5b7fe0dbadfc4f74de7531",
+    "calib_tinystories_valid.txt": "625dc2708712e313ba69b258c439c6ecdf6d34705abf333da3ad38743c4fa612",
+    "heldout_tinystories_valid.txt": "8c19ee609a76ae106738f7e2f8466d970eee13b17dd856ef1326158723131349"
+  },
+  "code": {
+    "git_commit": "9270e25638f62438f689142ff12c9bdbde43b1f3",
+    "llm_study_modified": true,
+    "llm_study_sha256": "b3d898e4f270fb855a346ca036ed36ea98a721343e8eeeab20dff9d4b81c2be7"
+  },
+  "environment": {
+    "python": "3.12.3",
+    "numpy": "2.5.3",
+    "tokenizers": "0.23.2",
+    "blas": "scipy-openblas 0.3.34.106.0",
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu": "Intel(R) Core(TM) i5-8300H CPU @ 2.30GHz"
+  },
+  "command": [
+    "llm_study.py",
+    "formats",
+    "--assets",
+    "assets/stories15m",
+    "--base",
+    "pow2+sink+p12"
+  ],
+  "created": "2026-11-02T13:58:19+0400"
+}

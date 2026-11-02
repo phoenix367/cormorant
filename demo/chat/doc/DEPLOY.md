@@ -202,22 +202,26 @@ first one is the default model.
 | `smolvlm` | `lib/libsmolvlm_256m.so`, `/root/smolvlm_256m_weights`, `python3-pil` | [`llm_board.py --install-only`](SMOLVLM.md#install) | `smolvlm` |
 | `piper` | `lib/libpiper_tts.so`, `/root/piper_weights`, numpy, `libespeak-ng1` (ffmpeg for mp3 / opus / aac / flac) | [`tts_board.py --install-only`](TEXT_TO_SPEECH.md#install) | `piper` |
 | `moonshine` | `lib/libmoonshine_base.so`, `/root/moonshine_base_weights`, numpy (ffmpeg for uploads other than WAV); the tokenizer.json on the host | [`asr_board.py --install-only`](SPEECH_TO_TEXT.md#install) | `moonshine` |
+| `stories15m` | `lib/libstories15m.so`, `/root/stories15m_weights` | [`llm_board.py --install-only`](STORIES.md#install) | `stories15m` |
 | `echo` | nothing (protocol only) | — | — |
 
 - **Who builds the libraries.**  `deploy.py` builds only the BERT library.
   The others are built and installed by their own tools.  The preflight
   reports whether each is at its configured path: `smollm2.lib` (default
   `<dir>/lib/libsmollm2.so`), `smollm2_360m.lib`
-  (`<dir>/lib/libsmollm2_360m.so`), `smolvlm.lib`, `piper.lib` and `moonshine.lib` likewise.
+  (`<dir>/lib/libsmollm2_360m.so`), `smolvlm.lib`, `piper.lib`, `moonshine.lib` and
+  `stories15m.lib` likewise.
 - **What `deploy.py` uploads for the generative models.**  It always uploads
   the text side (`smollm2_backend.py`, `smollm2_tokenizer.py`, `chatml.py`,
-  `sampler.py`).  For each configured model it also uploads that model's
-  `tokenizer.json` (the block's `tokenizer`, by default from the untracked
-  `assets/<model>/`) to `<dir>/smollm2/`, `<dir>/smollm2_360m/` or
-  `<dir>/smolvlm/`.
+  `sampler.py`; for stories15m `stories_backend.py`, `llama_tokenizer.py`).
+  For each configured model it also uploads that model's `tokenizer.json`
+  (the block's `tokenizer`, by default from the untracked `assets/<model>/`)
+  to `<dir>/smollm2/`, `<dir>/smollm2_360m/`, `<dir>/smolvlm/` or
+  `<dir>/stories15m/`.
 - **What the server receives.**  It gets each model's config block (`lib`,
   `weights_dir`, `model_id`, `tokenizer`, `cma_mb`) and `server.resident`.
-  The `smollm2` block's sampling defaults apply to every generative model.
+  The `smollm2` block's sampling defaults apply to the SmolLM2 and SmolVLM
+  models; `stories15m` has its own (`temperature`, `top_p`, `reserve`).
 - **A library that fails to load.**  The server still starts with the other
   backends (not when it is the first FPGA model or `--resident all`: then
   the server stops).  Requests for the missing model get 503 `model_not_loaded`.
@@ -293,6 +297,7 @@ in.  With `cma=1000M` SmolLM2-360M stayed only beside Piper.
 | SmolVLM-256M | 495 MiB | 550 |
 | Piper | 54 MiB | 55 |
 | Moonshine base | 185.8 MiB | 200 |
+| stories15m | 34.8 MiB | 50 |
 
 - **What is in a pool.**  SmolLM2-135M's, for example, holds one copy of
   every weight (decode reads the prefill image through MatmulKernel's GEMV
@@ -340,6 +345,12 @@ python3 /root/kv260_chat/kv260_chat_server.py --backend smollm2 --backend smollm
     --bert-lib /root/kv260_chat/lib/libbert_squad.so --bert-weights /root/bert_squad_weights \
     --vocab /root/kv260_chat/vocab.txt [--resident auto|one|all]
 ```
+
+A story model is added the same way: `--backend stories15m --stories-lib
+/root/kv260_chat/lib/libstories15m.so --stories-tokenizer
+/root/kv260_chat/stories15m/tokenizer.json --stories-cma-mb 50` (with
+`--llm-sampler-lib`; its sampling defaults are `--stories-temperature`,
+`--stories-top-p`, `--stories-reserve`).
 
 Stop the unit first (`deploy.py --stop`): only one process may own the
 FPGA.

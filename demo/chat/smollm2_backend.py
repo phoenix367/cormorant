@@ -31,7 +31,8 @@ window: 64 recent tokens of prompt + answer; 0 = off, -1 = everything), and
 the DRY fields dry_multiplier, dry_base, dry_allowed_length,
 dry_penalty_last_n (the DRY window over prompt + answer; -1 = the whole
 context, 0 = off) and dry_sequence_breakers (strings; a token containing any
-of them cuts a repeat match; special tokens always do).  Unset ones take the
+of them cuts a repeat match; special tokens always do), and min_tokens (vLLM's:
+no end-of-generation token before that many answer tokens).  Unset ones take the
 server defaults (the model card's temperature 0.2, top_p 0.9; top_k 50 as HF
 generate; DRY on at the usual 0.8 / 1.75 / 2 over the whole context with
 breakers ":", "\"", "*"; repetition_penalty 1.1 over the last 64 tokens;
@@ -416,6 +417,7 @@ class Smollm2Backend(Backend):
         job = Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
                   breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)
         job.extra["top_logprobs"] = self._logprobs_fields(req)
+        job.extra["min_tokens"] = self._extra(req.raw or {}, "min_tokens", 0, None, integer=True) or 0
         return job
 
     @staticmethod
@@ -483,6 +485,11 @@ class Smollm2Backend(Backend):
             pos += n
         return logits
 
+    def _decoder(self, job: Job):
+        """The incremental detokenizer of the answer (a base model's
+        continuation keeps its leading space: stories_backend.py)."""
+        return self.tok.incremental_decoder()
+
     def generate(self, job: Job, cancel: CancelToken):
         eng, tok, smp, p = self.engine, self.tok, self.sampler, job.params
         t0 = time.monotonic()
@@ -515,7 +522,7 @@ class Smollm2Backend(Backend):
         history = list(prompt)
         last_n = job.last_n
         dry_n = job.dry_last_n
-        dec = tok.incremental_decoder()
+        dec = self._decoder(job)
         ss = StopStream(job.stops)
         n_gen, n_decode, lib_ms, smp_ms = 0, 0, 0.0, 0.0
         loop_p = 0
@@ -530,6 +537,9 @@ class Smollm2Backend(Backend):
             recent = history if last_n < 0 else (history[-last_n:] if last_n > 0 else ())
             hist = history if dry_n < 0 else (history[-dry_n:] if dry_n > 0 else ())
             raw = _np.array(logits, dtype=_np.float64) if top is not None else None   # the sampler may penalise in place
+            if n_gen < job.extra.get("min_tokens", 0):           # min_tokens: no end yet
+                for e in self.eog:
+                    logits[e] = -1e30
             t = smp.sample(logits, recent, p, hist=hist)
             if top is not None and t not in self.eog:
                 lp_entries.append(self._logprob_entry(raw, t, top))

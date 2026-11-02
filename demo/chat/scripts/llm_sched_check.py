@@ -41,7 +41,6 @@ sys.path.insert(0, HERE)
 import llm_project as lp                                   # noqa: E402
 import llm_study as study                                  # noqa: E402
 
-DEFAULT_PROMPTS = "factual,summarise,multi-turn"
 def study_model(W, fd, cfg, policy=None):
     """llm_study.Model of the shipped policy with the formats JSON."""
     sc = study.Cfg.__new__(study.Cfg)
@@ -57,14 +56,15 @@ def study_model(W, fd, cfg, policy=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--prompts", default=DEFAULT_PROMPTS)
+    ap.add_argument("--prompts", default=None,
+                    help="default: factual,summarise,multi-turn (a text profile: dragon,long,dialogue)")
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
     ap.add_argument("--assets", default=None)
     ap.add_argument("--formats", default=None)
-    ap.add_argument("--second-turn", default="factual",
+    ap.add_argument("--second-turn", default=None,
                     help="prompts continued by a second turn after their decode steps "
-                         "(comma list, '' = none)")
+                         "(comma list, '' = none; default: the first gate prompt)")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN)
     ap.add_argument("--decode-attn", choices=("fpga", "host"), default=lp.DECODE_ATTN)
     ap.add_argument("--vsmx", choices=("auto", "on", "off"), default="auto",
@@ -80,16 +80,21 @@ def main():
     args = ap.parse_args()
     t0 = time.time()
     buckets = tuple(int(b) for b in args.buckets.split(","))
-    ids = lp.tokenize_prompts(args.prompts.split(","))
-    turn2 = lp.second_turn_ids() if args.second_turn else []
+    assets = args.assets or lp.default_assets()
+    gp, gt = lp.gate_prompts(assets)
+    args.prompts = gp if args.prompts is None else args.prompts
+    args.second_turn = gt if args.second_turn is None else args.second_turn
+    ctx = lp.context(assets)
+    ids = lp.tokenize_prompts(args.prompts.split(","), assets=assets)
+    turn2 = lp.second_turn_ids(assets=assets) if args.second_turn else []
     cont = set(filter(None, args.second_turn.split(",")))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"
     rowops = lp.rowops_default() if args.rowops == "auto" else args.rowops == "on"
     drope = lp.drope_default(rowops) if args.drope == "auto" else args.drope == "on"
     policy = lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope)
-    cfg, W, fmt, fd = lp.load_model(args.assets, args.formats)
-    fe = lp.frontend(cfg, W, fmt, prefill_attn=args.prefill_attn, decode_attn=args.decode_attn,
-                     vsmx=vsmx, rowops=rowops, drope=drope)
+    cfg, W, fmt, fd = lp.load_model(assets, args.formats)
+    fe = lp.frontend(cfg, W, fmt, ctx=ctx, prefill_attn=args.prefill_attn,
+                     decode_attn=args.decode_attn, vsmx=vsmx, rowops=rowops, drope=drope)
     cgs = lp.make_codegens(fe, buckets)
     sm, sc = study_model(W, fd, cfg, policy)
     print(f"setup {time.time() - t0:.0f} s: entries {sorted(cgs)}, policy {policy}, "
@@ -98,8 +103,8 @@ def main():
     bad, report = 0, {}
     for name, toks in ids.items():
         t1 = time.time()
-        assert toks[0] == 1, "chat prompts start with <|im_start|> (the sink)"
-        sess = lp.SimSession(cgs, buckets=buckets)
+        assert toks[0] == 1, "prompts start with token 1, <|im_start|> / <s> (the sink)"
+        sess = lp.SimSession(cgs, ctx=ctx, buckets=buckets)
         seq = study.Seq(sc, len(toks) + len(turn2) + 2 * args.decode + 2)
         rec = {"prompt_tokens": len(toks)}
         turns = [("prompt", toks[1:])] + ([("turn2", turn2)] if name in cont else [])

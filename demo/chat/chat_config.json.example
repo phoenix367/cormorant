@@ -18,7 +18,7 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), moonshine (speech to text), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice, moonshine libmoonshine_base.so and its weights. See doc/DEPLOY.md.",
+    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), moonshine (speech to text), stories15m (story writing, also POST /v1/completions), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice, moonshine libmoonshine_base.so and its weights, stories15m libstories15m.so. See doc/DEPLOY.md.",
     "resident": "auto",
     "_resident_note": "auto = keep the FPGA models loaded while CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,
@@ -82,6 +82,22 @@
     "_tokenizer_note": "Host path; uploaded to <remote.dir>/smollm2_360m/tokenizer.json.",
     "cma_mb": 775,
     "_cma_note": "The 758 MiB pool BO; with --resident auto it swaps with the other FPGA models."
+  },
+  "stories15m": {
+    "_comment": "stories15M (Karpathy's llama2.c model trained on TinyStories, CHAT_PLAN §27): a base model that continues stories, served when server.backends contains stories15m — POST /v1/completions continues the prompt; on /v1/chat/completions a message starts a new story ('write a story about X' one from an opening made of it) and 'continue' goes on with the last one. Its own sampling defaults (the smollm2 block's sampler library and loop guard apply).",
+    "lib": null,
+    "_lib_note": "null = <remote.dir>/lib/libstories15m.so (llm_board.py --project build/llm_project_stories15m --install-only builds it).",
+    "weights_dir": null,
+    "model_id": null,
+    "_model_id_note": "null = the library's llm_model_name() (stories15m).",
+    "tokenizer": "assets/stories15m/tokenizer.json",
+    "_tokenizer_note": "Host path; uploaded to <remote.dir>/stories15m/tokenizer.json.",
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "reserve": 128,
+    "_reserve_note": "Tokens of the 256-token context kept free for the continuation when a long story is trimmed to its end (max_tokens if smaller).",
+    "cma_mb": 50,
+    "_cma_note": "The 34.6 MiB pool BO (33 MB measured)."
   },
   "build": {
     "jobs": 4,

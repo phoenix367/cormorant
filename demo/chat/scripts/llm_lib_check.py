@@ -19,7 +19,9 @@ of doc/plans/CHAT_PLAN.md §12):
     open; more free is no leak — the page cache leaves the CMA area while
     the pool is held), llm_open() again, the first result again.
 
-usage (on the board): python3 llm_lib_check.py [/root/kv260_chat/lib/libsmollm2.so]
+usage (on the board): python3 llm_lib_check.py [/root/kv260_chat/lib/libsmollm2.so [JSON]]
+JSON (llm_board.py passes it): {"prompt": ids after the sink, "turn2": ids, "context": n} of
+another model (default: SmolLM2-135M's ChatML conversation, context 1024).
 prints one JSON line "LLM_LIB_CHECK: {...}" and exits 0 when every check passed.
 """
 import ctypes
@@ -35,6 +37,10 @@ PROMPT = [9690, 198, 2683, 359, 253, 5356, 5646, 11173, 3365, 3398, 4945, 28, 70
           19712, 2, 198, 1, 4093, 198, 1780, 314, 260, 3575, 282, 4649, 47, 2, 198, 1, 520,
           9531, 198]
 TURN2 = [2, 198, 1, 4093, 198, 1780, 314, 2256, 2476, 47, 2, 198, 1, 520, 9531, 198]
+CONTEXT = 1024
+if len(sys.argv) > 2:                      # another model's prompt (llm_board.lib_check_args)
+    _a = json.loads(sys.argv[2])
+    PROMPT, TURN2, CONTEXT = _a["prompt"], _a["turn2"], _a["context"]
 
 
 def cma_free():
@@ -99,7 +105,8 @@ def main():
     one = prefill(PROMPT)
     L.llm_truncate(1)
     chunks = None
-    for a, b in ((0, 5), (5, 22), (22, len(PROMPT))):
+    n = len(PROMPT)
+    for a, b in ((0, n // 6), (n // 6, 2 * n // 3), (2 * n // 3, n)):    # 135M: 0-5, 5-22, 22-34
         chunks = prefill(PROMPT[a:b])
     res["chunked_prefill_identical"] = chunks == one
     res["position_after_prefill"] = L.llm_position()
@@ -138,7 +145,7 @@ def main():
     L.llm_close()
     res["cma_free_kb"]["after_final_close"] = cma_free()
     ok = (res["only_llm_exports"] and res["chunked_prefill_identical"] and res["threads_identical"]
-          and res["reopen_identical"] and c0 - c2 < 4096 and V > 0 and C == 1024)
+          and res["reopen_identical"] and c0 - c2 < 4096 and V > 0 and C == CONTEXT)
     res["ok"] = ok
     print("LLM_LIB_CHECK: " + json.dumps(res))
     return 0 if ok else 1

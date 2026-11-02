@@ -53,12 +53,25 @@ Exit 0 = the table's left column applies; exit 1 = do the CODE items first.
 | 3–4 gates | unchanged | `llm_project.tokenize_prompts()` / `second_turn_ids()` always tokenize with 135M's tokenizer into shared caches (`assets/study/phase3_prompt_ids.json`, `phase5_second_turn_ids.json`); `llm_lib_check.py` hard-codes 135M ids and `context == 1024` |
 | 5 serve | **needs a backend entry (code, §5B)** — or repoint an existing slot (config only, replaces that model, §5A) | `smollm2_tokenizer.py` (raises on another pipeline), `chatml.py`, the backend's `<|im_start|>` sink |
 
+**A base model without a chat template** (stories15m, CHAT_PLAN §27) has its
+"otherwise" column done: `llm_calibrate.py add` pins the files its repo has
+and, when `tokenizer_config.json` has no chat template, its own texts
+(TinyStories for stories15m — choose the model's domain in `llm_study.py`
+`STORY_TEXTS`); `llm_study.Profile` "text" gives story prompts, the context of
+`max_position_embeddings`, generation ending at `<s>` / `</s>`; the gates take
+the model's prompts / second turn / context (`llm_project.gate_prompts`,
+`context`); a Llama-2 SentencePiece tokenizer runs on the board as
+`llama_tokenizer.py` (`validate_text.py --model <name>`); serving is
+`stories_backend.py` (`/v1/completions` + a story chat) — a new base model
+needs only its own prompt texts and a backend tuple like `STORIES`.
+
 Not possible on this path today (model-study route C, or a bitstream / CMA
 change): non-Llama blocks (biases, LayerNorm, GELU MLP, partial rotary,
 `rope_scaling`, sliding window, MoE — the frontend ignores unknown config
 keys silently, so trust `llama_fit.py`, not a successful generation); pools
 above ~920 MiB (≈ 440 M int16 params with the KV caches); K > 4096; a context
-other than 1024 (`llm_lib_check.py` requires it); another VLM
+not a multiple of 64 (the V cache's P·V image, `pv_kw` 4; 16 works at a lower
+P·V speed); another VLM
 (the `vlm_*` scripts and the `smolvlm` backend are wired to SmolVLM-256M).
 
 ## 1. Pin + calibrate (`llm_calibrate.py`, stdlib; study steps in `$SPY`)
@@ -205,7 +218,7 @@ $PY demo/chat/scripts/llm_board.py --project demo/chat/build/llm_project_$T \
 **CMA budget** (`cma=1400M`, ~1335 MiB usable, idle CmaFree ~1390 MB, less
 with page cache in CMA).  Served pools: BERT 216, SmolLM2-135M 299,
 SmolLM2-360M 758, SmolVLM 495 MiB.  The backend's `cma_mb` = measured CMA
-drop + margin (299 → 330, 758 → 775, 495 → 550); `--resident auto` evicts
+drop + margin (299 → 330, 758 → 775, 495 → 550), stories15m 33 → 50; `--resident auto` evicts
 least-recently-used models while CmaFree < `cma_mb` + 32 and retries a failed
 load once after evicting the rest — a pool that fits beside nothing swaps
 with every model (warm swap 1–2 s, cold from SD card 21–59 s).  An

@@ -102,6 +102,21 @@ CONTEXT = 1024                          # positions incl. the sink (CHAT_PLAN de
 BUCKETS = (16, 64, 256)                 # prefill entries (rows per call)
 
 
+def context(assets: Optional[str] = None) -> int:
+    """The library's context: CONTEXT, or a shorter max_position_embeddings
+    (stories15m: 256; llm_study.Profile)."""
+    return study.Profile(assets or default_assets()).ctx
+
+
+def gate_prompts(assets: Optional[str] = None) -> Tuple[str, str]:
+    """(prompts, second-turn prompts) of the gates (llm_sched_check.py,
+    llm_host_emu.py, llm_board.py): three chat prompts with a second turn on
+    the first — a text profile's three story beginnings likewise."""
+    if study.Profile(assets or default_assets()).chat:
+        return "factual,summarise,multi-turn", "factual"
+    return "dragon,long,dialogue", "dragon"
+
+
 def _main_checkout() -> str:
     """The main checkout (a git worktree shares its untracked .venv-export)."""
     try:
@@ -293,31 +308,51 @@ class SimSession:
 
 # A chat's second turn (phase 5 gates): appended to a prompt's decoded answer —
 # the answer's <|im_end|>, a new user message and the assistant header — and
-# prefilled at the position the decode steps reached.
+# prefilled at the position the decode steps reached.  A text profile's second
+# turn is more story text after the continuation (STORY_SECOND).
 SECOND_TURN = [{"role": "user", "content": "Tell me one more fact about it."}]
+STORY_SECOND = "Then something surprising happened."
 
 
-def second_turn_ids(cache: Optional[str] = None) -> List[int]:
+def _cache_dir(assets: Optional[str], prof) -> str:
+    """Where the token-id caches live: assets/study for the chat models (one
+    tokenizer, SmolLM2's), the model's study directory for a text profile."""
+    assets = assets or default_assets()
+    return (os.path.join(os.path.dirname(os.path.abspath(assets)), "study") if prof.chat
+            else study.study_dir(assets))
+
+
+def second_turn_ids(cache: Optional[str] = None, assets: Optional[str] = None) -> List[int]:
     """Token ids of "<|im_end|>\\n" + the SECOND_TURN user block + the
-    generation prompt (tokenized once with .venv-export's tokenizers, cached)."""
-    cache = cache or os.path.join(os.path.dirname(default_assets()), "study",
-                                  "phase5_second_turn_ids.json")
+    generation prompt (a text profile: STORY_SECOND without <s>) — tokenized
+    once with .venv-export's tokenizers, cached."""
+    assets = assets or default_assets()
+    prof = study.Profile(assets)
+    cache = cache or os.path.join(_cache_dir(assets, prof), "phase5_second_turn_ids.json"
+                                  if prof.chat else "second_turn_ids.json")
     if not os.path.exists(cache):
-        code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
-                "t = s.Tok(s.default_assets()); "
-                "txt = '<|im_end|>\\n' + ''.join('<|im_start|>' + m['role'] + '\\n' + m['content'] "
-                "+ '<|im_end|>\\n' for m in %r) + '<|im_start|>assistant\\n'; "
-                "json.dump([int(i) for i in t.encode(txt)], open(%r, 'w'))"
-                % (HERE, SECOND_TURN, cache))
+        if prof.chat:
+            code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
+                    "t = s.Tok(s.default_assets()); "
+                    "txt = '<|im_end|>\\n' + ''.join('<|im_start|>' + m['role'] + '\\n' + m['content'] "
+                    "+ '<|im_end|>\\n' for m in %r) + '<|im_start|>assistant\\n'; "
+                    "json.dump([int(i) for i in t.encode(txt)], open(%r, 'w'))"
+                    % (HERE, SECOND_TURN, cache))
+        else:
+            code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
+                    "t = s.Tok(%r); json.dump([int(i) for i in t.plain(%r)], open(%r, 'w'))"
+                    % (HERE, assets, STORY_SECOND, cache))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
         subprocess.run([EXPORT_PY, "-c", code], check=True)
     with open(cache) as f:
         return json.load(f)
 
 
-def with_second_turns(ids: Dict[str, List[int]], names: Sequence[str]) -> Dict[str, List[int]]:
+def with_second_turns(ids: Dict[str, List[int]], names: Sequence[str],
+                      assets: Optional[str] = None) -> Dict[str, List[int]]:
     """ids plus a "<name>/turn2" continuation right after each prompt in names."""
     out: Dict[str, List[int]] = {}
-    t2 = second_turn_ids() if names else []
+    t2 = second_turn_ids(assets=assets) if names else []
     for n, t in ids.items():
         out[n] = t
         if n in names:
@@ -325,18 +360,28 @@ def with_second_turns(ids: Dict[str, List[int]], names: Sequence[str]) -> Dict[s
     return out
 
 
-def tokenize_prompts(names: Optional[Sequence[str]] = None, cache: Optional[str] = None
-                     ) -> Dict[str, List[int]]:
+def tokenize_prompts(names: Optional[Sequence[str]] = None, cache: Optional[str] = None,
+                     assets: Optional[str] = None) -> Dict[str, List[int]]:
     """Token ids of llm_study.PROMPTS (chat template, incl. the leading
-    <|im_start|>) — tokenized once with the tokenizers package of
-    .venv-export (subprocess) and cached as JSON."""
-    cache = cache or os.path.join(os.path.dirname(default_assets()), "study",
-                                  "phase3_prompt_ids.json")
+    <|im_start|>; a text profile: STORY_PROMPTS after <s>) — tokenized once
+    with the tokenizers package of .venv-export (subprocess) and cached as
+    JSON."""
+    assets = assets or default_assets()
+    prof = study.Profile(assets)
+    cache = cache or os.path.join(_cache_dir(assets, prof), "phase3_prompt_ids.json"
+                                  if prof.chat else "prompt_ids.json")
     if not os.path.exists(cache):
-        code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
-                "t = s.Tok(s.default_assets()); "
-                "json.dump({n: [int(i) for i in t.encode(s.chatml(m))] for n, m in s.PROMPTS}, "
-                "open(%r, 'w'))" % (HERE, cache))
+        if prof.chat:
+            code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
+                    "t = s.Tok(s.default_assets()); "
+                    "json.dump({n: [int(i) for i in t.encode(s.chatml(m))] for n, m in s.PROMPTS}, "
+                    "open(%r, 'w'))" % (HERE, cache))
+        else:
+            code = ("import json, sys; sys.path.insert(0, %r); import llm_study as s; "
+                    "a = %r; t = s.Tok(a); p = s.Profile(a); "
+                    "json.dump({n: [int(i) for i in p.prompt_ids(t, m)] for n, m in p.prompts}, "
+                    "open(%r, 'w'))" % (HERE, assets, cache))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
         subprocess.run([EXPORT_PY, "-c", code], check=True)
     with open(cache) as f:
         ids = json.load(f)

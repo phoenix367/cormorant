@@ -26,6 +26,7 @@ board, a three-question conversation that the model remembers.
 | `smolvlm-256m-instruct` | `smolvlm` | Answers questions about images | 1.6 s per image, then ~20 tokens/s | [Chat about images](doc/SMOLVLM.md) |
 | `piper-lessac-medium` | `piper` | Text to speech (`POST /v1/audio/speech`) | first sound after 1.0–1.5 s, faster than real time | [Text to speech](doc/TEXT_TO_SPEECH.md); listen: ▶ [hello](../tts/samples/hello.mp3), ▶ [paragraph](../tts/samples/paragraph.mp3) |
 | `moonshine-base` | `moonshine` | Speech to text (`POST /v1/audio/transcriptions`) | 1.3 s for 10 s of audio | [Speech to text](doc/SPEECH_TO_TEXT.md) |
+| `stories15m` | `stories15m` | Writes children's stories: continues the text it is given (`POST /v1/completions`, or a chat: a story's opening, "write a story about …", "continue") | ~166 tokens/s (130–150 greedy through the API); first token after ~20 ms | [Stories](doc/STORIES.md) |
 
 - **Exact results.**  The board reproduces the host reference bit for bit:
   the language models' logits match the scheduler's simulation, Piper's
@@ -143,13 +144,14 @@ for.
 | [Chat about images](doc/SMOLVLM.md) | build and serve SmolVLM-256M; send images |
 | [Text to speech](doc/TEXT_TO_SPEECH.md) | build and serve Piper; `/v1/audio/speech` and its options |
 | [Speech to text](doc/SPEECH_TO_TEXT.md) | build and serve Moonshine; `/v1/audio/transcriptions`, its formats and uploads |
+| [Stories](doc/STORIES.md) | build and serve stories15m; `/v1/completions`, a base model's requests |
 | [API reference](doc/API.md) | endpoints, request fields, errors, the `kv260` extension, queueing, logs |
 | [Development](doc/DEVELOPMENT.md) | the source files, adding a backend, the tests and the host validation |
 
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 257 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 280 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

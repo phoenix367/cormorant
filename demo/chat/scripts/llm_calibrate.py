@@ -12,8 +12,11 @@ llm_models.json (tracked) pins every input and the expected output:
   models.<name>  Hugging Face repo + revision, the SHA-256 of each checkpoint
                  file, the calibration policy and the SHA-256 of its formats
                  JSON (what generate_llm_project.py builds the library from),
-                 optionally the shipped policy's study metrics;
-  texts          the WikiText-2 held-out / calibration texts (SHA-256).
+                 optionally the shipped policy's study metrics and its own
+                 texts (a base model without a chat template, stories15m: the
+                 TinyStories held-out / calibration stories, SHA-256);
+  texts          the WikiText-2 held-out / calibration texts (SHA-256) of the
+                 chat models.
 
   fetch MODEL      checkpoint at the pinned revision -> assets/<model>/, texts
                    (llm_study.py fetch, or a verified copy from another model's
@@ -100,6 +103,20 @@ def save_manifest(m: dict, path: Path = MANIFEST) -> None:
         f.write("\n")
 
 
+def model_texts(m: dict, model: str) -> dict:
+    """{file: {"sha256"}} of the model's held-out / calibration texts: its own
+    (a text-profile model, llm_study.Profile) or the shared WikiText-2 pair."""
+    return model_spec(m, model).get("texts") or m["texts"]
+
+
+def chat_model(d: Path) -> bool:
+    """llm_study.Profile's test: a chat template in tokenizer_config.json."""
+    try:
+        return "chat_template" in json.loads((Path(d) / "tokenizer_config.json").read_text())
+    except OSError:
+        return True
+
+
 def model_spec(m: dict, model: str) -> dict:
     try:
         return m["models"][model]
@@ -144,7 +161,7 @@ def verify_inputs(m: dict, model: str, root: Path) -> Dict[str, str]:
     spec = model_spec(m, model)
     d = root / model
     want = dict(spec["files"])
-    want.update({n: t["sha256"] for n, t in m["texts"].items()})
+    want.update({n: t["sha256"] for n, t in model_texts(m, model).items()})
     got, bad = {}, []
     for name, h in want.items():
         p = d / name
@@ -256,8 +273,9 @@ def cmd_fetch(m: dict, model: str, root: Path, py: Optional[str], base_url: str 
         t0 = time.time()
         download(f"{base_url}/{spec['repo']}/resolve/{spec['revision']}/{name}", p, want)
         print(f"  {name}: downloaded, SHA-256 matches ({time.time() - t0:.0f} s)", flush=True)
+    texts = model_texts(m, model)
     missing = []
-    for name, t in m["texts"].items():
+    for name, t in texts.items():
         p = d / name
         if p.exists() and sha256_file(p) == t["sha256"]:
             print(f"  {name}: present, SHA-256 matches")
@@ -271,11 +289,11 @@ def cmd_fetch(m: dict, model: str, root: Path, py: Optional[str], base_url: str 
             missing.append(name)
     if missing:                                     # llm_study.py fetch writes both texts
         run_study(study_python(py), ["fetch", "--assets", str(d)])
-        for name in m["texts"]:
+        for name in texts:
             got = sha256_file(d / name)
-            if got != m["texts"][name]["sha256"]:
+            if got != texts[name]["sha256"]:
                 raise CalibrationError(f"{name}: fetched text has SHA-256 {got}, pinned "
-                                       f"{m['texts'][name]['sha256']} — the dataset changed")
+                                       f"{texts[name]['sha256']} — the dataset changed")
             print(f"  {name}: fetched, SHA-256 matches")
 
 
@@ -385,19 +403,30 @@ def cmd_study(m: dict, model: str, root: Path, py: Optional[str], *, quick: bool
 
 
 def cmd_add(m: dict, model: str, repo: str, revision: str, root: Path,
-            manifest_path: Path = MANIFEST, base_url: str = HF) -> None:
+            manifest_path: Path = MANIFEST, base_url: str = HF, py: Optional[str] = None) -> None:
     with urllib.request.urlopen(f"{base_url}/api/models/{repo}/revision/{revision}", timeout=60) as r:
         info = json.load(r)
     sha = info["sha"]
     d = root / model
     files = {}
+    # the files the repo has: a SentencePiece checkpoint (stories15m) has no vocab.json / merges.txt
+    have = {s["rfilename"] for s in info.get("siblings") or []}
     for name in CHECKPOINT_FILES:
+        if have and name not in have:
+            if name in ("config.json", "model.safetensors", "tokenizer.json"):
+                raise CalibrationError(f"{repo} @ {sha[:12]}: no {name}")
+            continue
         p = d / name
         files[name] = download(f"{base_url}/{repo}/resolve/{sha}/{name}", p, None)
         print(f"  {name}: {files[name][:16]}…", flush=True)
     m["models"][model] = {"repo": repo, "revision": sha,
                           "license": (info.get("cardData") or {}).get("license"),
                           "files": files, "formats": {"policy": "pow2+sink+p12", "sha256": None}}
+    if not chat_model(d):                           # its own texts (llm_study.py fetch), pinned now
+        run_study(study_python(py), ["fetch", "--assets", str(d)])
+        m["models"][model]["texts"] = {p.name: {"sha256": sha256_file(p)} for p in sorted(d.iterdir())
+                                       if p.name.startswith(("heldout_", "calib_"))}
+        print(f"  texts: {', '.join(m['models'][model]['texts'])}")
     save_manifest(m, manifest_path)
     print(f"add {model}: {repo} @ {sha} pinned in {manifest_path}; next: "
           f"`fetch {model}` (texts), `calibrate {model} --record`")
@@ -428,7 +457,7 @@ def main(argv=None) -> int:
         if args.command == "add":
             if not args.repo:
                 ap.error("add needs --repo")
-            cmd_add(m, args.model, args.repo, args.revision, root, mpath)
+            cmd_add(m, args.model, args.repo, args.revision, root, mpath, py=args.study_python)
             return 0
         if args.command in ("fetch", "all"):
             cmd_fetch(m, args.model, root, args.study_python)

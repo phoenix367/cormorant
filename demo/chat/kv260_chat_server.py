@@ -14,6 +14,11 @@ Endpoints
   POST /v1/chat/completions     stream false -> one chat.completion JSON;
                                 stream true  -> SSE "data: {chat.completion.chunk}"
                                 lines, then "data: [DONE]"
+  POST /v1/completions          a base model's text completion (stories15m;
+                                OpenAI's legacy completions): {"model", "prompt",
+                                "max_tokens" (default 16), "echo", ...} -> one
+                                text_completion JSON, or SSE text_completion
+                                chunks with stream true
   POST /v1/audio/speech         text to speech: {"model", "input", "voice",
                                 "response_format", "speed", "stream_format",
                                 "seed"} -> the audio, streamed chunk by chunk
@@ -55,13 +60,19 @@ Backends (chat_backend.Backend; one model id each)
                FPGA (moonshine_backend.py; the audio at 16 kHz in parts of at
                most 24.6 s split at quiet points, greedy decoding, the
                transcript decoded on the host; English)
+  stories15m   model id stories15m: story writing with Karpathy's llama2.c
+               stories15M (trained on TinyStories) on the FPGA
+               (stories_backend.py, libstories15m.so; a base model:
+               /v1/completions continues the prompt; on /v1/chat/completions
+               a message starts a new story, "write a story about X" one from
+               an opening made of it, "continue" goes on with the last one)
   echo         repeats the last user message word by word; no FPGA — for
                trying clients against the protocol
 
 Residency (--resident): which FPGA models are loaded (the CMA pool is tight:
 BERT holds ~224 MB, SmolLM2-135M ~330 MB, SmolLM2-360M ~775 MB, SmolVLM
-~550 MB, Piper ~55 MB, Moonshine base ~200 MB of the 1400 MB cma=; idle CmaFree
-~1390 MB).
+~550 MB, Piper ~55 MB, Moonshine base ~200 MB, stories15m ~50 MB
+of the 1400 MB cma=; idle CmaFree ~1390 MB).
   auto (default)  the first backend loads at startup, the others too while
                   CmaFree allows (the page cache dropped first when it does
                   not), else when first requested; before a load, the page cache is dropped and
@@ -77,8 +88,10 @@ Loads and evictions happen under the FPGA lock, between requests.
 
 Request parameters honoured: model, messages, stream, stream_options
 .include_usage, max_tokens / max_completion_tokens, temperature, top_p, stop,
-seed, n (= 1 only), logprobs / top_logprobs (SmolLM2, not streaming); other
-fields are ignored.  Invalid values get
+seed, n (= 1 only), logprobs / top_logprobs (SmolLM2, not streaming); on
+/v1/completions prompt (a string, or an array of one) and echo instead of
+messages — suffix, logprobs and best_of > 1 are refused; other fields are
+ignored.  Invalid values get
 OpenAI-style JSON errors ({"error": {"message", "type", "param", "code"}}):
 400 bad request, 401 API key, 404 unknown model / URL, 413 body too large,
 503 busy (queue full or timed out) or model not loaded.
@@ -96,7 +109,7 @@ usage:
                        [--api-key KEY | --api-key-file FILE]
                        [--backend bert-squad] [--backend smollm2] [--backend smollm2-360m]
                        [--backend smolvlm] [--backend piper] [--backend moonshine]
-                       [--backend echo] ...
+                       [--backend stories15m] [--backend echo] ...
                        [--resident auto|one|all] [--cma-margin-mb 32] [--no-interleave]
                        [--bert-lib lib/libbert_squad.so] [--bert-weights DIR]
                        [--vocab vocab.txt] [--max-windows 8] [--doc-stride 128]
@@ -104,6 +117,8 @@ usage:
                        [--llm-tokenizer tokenizer.json] [--llm-* sampling defaults]
                        [--llm-360m-lib lib/libsmollm2_360m.so] [--llm-360m-weights DIR]
                        [--llm-360m-tokenizer tokenizer.json]
+                       [--stories-lib lib/libstories15m.so] [--stories-weights DIR]
+                       [--stories-tokenizer tokenizer.json]
                        [--vlm-lib lib/libsmolvlm_256m.so] [--vlm-weights DIR]
                        [--tts-lib lib/libpiper_tts.so] [--tts-weights DIR] [--ffmpeg PATH]
                        [--asr-lib lib/libmoonshine_base.so] [--asr-weights DIR]
@@ -267,6 +282,16 @@ def parse_chat_request(body: Any, default_model: str) -> ChatRequest:
                                f"are: {', '.join(repr(r) for r in ROLES)}.", f"messages.[{i}].role")
         text, parts = _content(m, i)
         messages.append({"role": role, "content": text} | ({"parts": parts} if parts else {}))
+    max_tokens = _number(body, "max_completion_tokens", 1, None, integer=True)
+    if max_tokens is None:
+        max_tokens = _number(body, "max_tokens", 1, None, integer=True)
+    return ChatRequest(model=model, messages=messages, max_tokens=max_tokens, raw=body,
+                       **_generation_fields(body))
+
+
+def _generation_fields(body: dict) -> Dict[str, Any]:
+    """stream, stop, seed, temperature, top_p of a chat or text completion
+    body (and n, which must be 1)."""
     stream = body.get("stream", False)
     if stream is None:
         stream = False
@@ -276,9 +301,6 @@ def parse_chat_request(body: Any, default_model: str) -> ChatRequest:
     n = _number(body, "n", 1, None, integer=True)
     if n not in (None, 1):
         raise BackendError("Invalid 'n': this server generates one choice per request (n = 1).", "n")
-    max_tokens = _number(body, "max_completion_tokens", 1, None, integer=True)
-    if max_tokens is None:
-        max_tokens = _number(body, "max_tokens", 1, None, integer=True)
     stop = body.get("stop")
     if stop is None:
         stop = []
@@ -290,9 +312,46 @@ def parse_chat_request(body: Any, default_model: str) -> ChatRequest:
     else:
         raise BackendError("Invalid 'stop': expected a string or an array of strings.", "stop")
     seed = _number(body, "seed", -2 ** 63, 2 ** 63 - 1, integer=True)
-    return ChatRequest(model=model, messages=messages, stream=stream, max_tokens=max_tokens,
-                       temperature=_number(body, "temperature", 0, 2),
-                       top_p=_number(body, "top_p", 0, 1), stop=stop, seed=seed, raw=body)
+    return dict(stream=stream, stop=stop, seed=seed, temperature=_number(body, "temperature", 0, 2),
+                top_p=_number(body, "top_p", 0, 1))
+
+
+COMPLETION_MAX_TOKENS = 16              # OpenAI's default for /v1/completions
+
+
+def parse_completion_request(body: Any, default_model: str) -> ChatRequest:
+    """Validate a /v1/completions body (OpenAI's legacy completions; unknown
+    fields are ignored): a ChatRequest with `prompt` and no messages."""
+    if not isinstance(body, dict):
+        raise BackendError("The request body must be a JSON object.")
+    model = body.get("model", default_model)
+    if not isinstance(model, str) or not model:
+        raise BackendError("Invalid 'model': expected a non-empty string.", "model")
+    prompt = body.get("prompt")
+    if prompt is None:
+        raise BackendError("Missing required parameter: 'prompt'.", "prompt",
+                           code="missing_required_parameter")
+    if isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], str):
+        prompt = prompt[0]
+    if not isinstance(prompt, str):
+        raise BackendError("Invalid 'prompt': this server takes one string (or an array of one "
+                           "string); token arrays and batches are not supported.", "prompt")
+    for key in ("suffix", "logprobs"):
+        if body.get(key) is not None and body.get(key) != "":
+            raise BackendError(f"'{key}' is not supported on /v1/completions by this server.", key,
+                               code="unsupported_parameter")
+    best_of = _number(body, "best_of", 1, None, integer=True)
+    if best_of not in (None, 1):
+        raise BackendError("Invalid 'best_of': this server generates one choice per request "
+                           "(best_of = 1).", "best_of")
+    echo = body.get("echo", False)
+    if echo is not None and not isinstance(echo, bool):
+        raise BackendError(f"Invalid type for 'echo': expected a boolean, but got "
+                           f"{_type_name(echo)} instead.", "echo")
+    max_tokens = _number(body, "max_tokens", 1, None, integer=True)
+    return ChatRequest(model=model, messages=[], prompt=prompt, raw=body,
+                       max_tokens=COMPLETION_MAX_TOKENS if max_tokens is None else max_tokens,
+                       **_generation_fields(body))
 
 
 def parse_speech_request(body: Any, default_model: Optional[str]) -> SpeechRequest:
@@ -766,11 +825,13 @@ class ChatServer(ThreadingHTTPServer):
     def model_obj(self, mid: str) -> dict:
         """An OpenAI model object, with the non-standard "kv260": {"type"} — chat,
         speech (/v1/audio/speech) or transcription (/v1/audio/transcriptions) — so
-        clients can tell which endpoint a model serves."""
+        clients can tell which endpoint a model serves; "completions": true for a
+        chat model that also serves /v1/completions (a base model)."""
         b = self.backends[mid]
         kind = "speech" if b.speech else "transcription" if b.transcription else "chat"
+        kv = {"type": kind} | ({"completions": True} if b.completions else {})
         return {"id": mid, "object": "model", "created": int(self.started), "owned_by": b.owned_by,
-                "kv260": {"type": kind}}
+                "kv260": kv}
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -893,6 +954,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         self._status = 200
         if self._path() == "/chat/completions":
             return self._chat()
+        if self._path() == "/completions":
+            return self._chat(completion=True)
         if self._path() == "/audio/speech":
             return self._speech()
         if self._path() == "/audio/transcriptions":
@@ -922,9 +985,10 @@ class ChatHandler(BaseHTTPRequestHandler):
             "busy": srv.fpga.busy, "waiting": srv.fpga.waiting,
             "requests": srv.n_requests, "uptime_s": round(time.time() - srv.started, 1)})
 
-    # ── chat completions ──
+    # ── chat completions (and a base model's text completions) ──
 
-    def _chat(self) -> None:
+    def _chat(self, completion: bool = False) -> None:
+        """POST /v1/chat/completions, or with `completion` /v1/completions."""
         srv = self.server
         t0 = time.monotonic()
         rec: Dict[str, Any] = {"model": "-", "stream": "-"}
@@ -942,7 +1006,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                                    "(HINT: This likely means you aren't using your HTTP library "
                                    "correctly. The API expects a JSON payload.)")
             try:
-                req = parse_chat_request(body, srv.default_model)
+                if completion:                                 # default: the first base model
+                    req = parse_completion_request(body, next(
+                        (m for m, b in srv.backends.items() if b.completions), srv.default_model))
+                else:
+                    req = parse_chat_request(body, srv.default_model)
             except BackendError as e:
                 return self._backend_error(e)
             rec.update(model=req.model, stream=int(req.stream))
@@ -958,6 +1026,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return self._error(400, f"The model '{req.model}' is a speech-to-text model: send "
                                    f"audio to /v1/audio/transcriptions.", param="model",
                                    code="model_not_supported")
+            if completion and not backend.completions:
+                bases = [m for m, b in srv.backends.items() if b.completions]
+                return self._error(400, f"The model '{req.model}' is a chat model: send its messages "
+                                   f"to /v1/chat/completions ("
+                                   + (f"/v1/completions serves {', '.join(bases)})." if bases else
+                                      "no model served here takes /v1/completions)."),
+                                   param="model", code="model_not_supported")
             if not getattr(backend, "accepts_images", False) and any(
                     m.get("parts") for m in req.messages):
                 vlms = [m for m, b in srv.backends.items() if getattr(b, "accepts_images", False)]
@@ -1069,12 +1144,13 @@ class ChatHandler(BaseHTTPRequestHandler):
     def _info(fin: Finish) -> Dict[str, Any]:
         return {k: v for k, v in fin.info.items() if k not in ("log", "logprobs")}
 
-    def _new_ids(self) -> None:
-        self._cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+    def _new_ids(self, req=None) -> None:
+        self._cid = ("cmpl-" if req is not None and req.prompt is not None else "chatcmpl-") + \
+            uuid.uuid4().hex[:24]
         self._created = int(time.time())
 
     def _complete(self, req, backend, gen, rec, t0) -> None:
-        self._new_ids()
+        self._new_ids(req)
         parts, fin = [], None
         try:
             while fin is None:
@@ -1097,11 +1173,17 @@ class ChatHandler(BaseHTTPRequestHandler):
         finally:
             gen.close()
         rec["fin"] = fin
-        resp = self._base(req, backend, "chat.completion")
-        resp["choices"] = [{"index": 0,
-                            "message": {"role": "assistant", "content": "".join(parts),
-                                        "refusal": None},
-                            "logprobs": fin.info.get("logprobs"), "finish_reason": fin.reason}]
+        if req.prompt is not None:                             # /v1/completions
+            resp = self._base(req, backend, "text_completion")
+            text = (req.prompt if req.raw.get("echo") else "") + "".join(parts)
+            resp["choices"] = [{"text": text, "index": 0, "logprobs": None,
+                                "finish_reason": fin.reason}]
+        else:
+            resp = self._base(req, backend, "chat.completion")
+            resp["choices"] = [{"index": 0,
+                                "message": {"role": "assistant", "content": "".join(parts),
+                                            "refusal": None},
+                                "logprobs": fin.info.get("logprobs"), "finish_reason": fin.reason}]
         resp["usage"] = self._usage(fin)
         if fin.info:
             resp["kv260"] = self._info(fin)
@@ -1118,14 +1200,19 @@ class ChatHandler(BaseHTTPRequestHandler):
         self._write(b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n\n")
 
     def _stream(self, req, backend, gen, cancel, rec, t0) -> None:
-        self._new_ids()
+        self._new_ids(req)
         include_usage = bool(isinstance(req.raw.get("stream_options"), dict)
                              and req.raw["stream_options"].get("include_usage"))
-        base = self._base(req, backend, "chat.completion.chunk")
+        text_mode = req.prompt is not None                     # /v1/completions
+        base = self._base(req, backend, "text_completion" if text_mode else "chat.completion.chunk")
 
         def chunk(delta, finish=None):
-            c = dict(base, choices=[{"index": 0, "delta": delta, "logprobs": None,
-                                     "finish_reason": finish}])
+            if text_mode:                                      # delta: {"content": text} or {}
+                ch = {"text": delta.get("content", ""), "index": 0, "logprobs": None,
+                      "finish_reason": finish}
+            else:
+                ch = {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
+            c = dict(base, choices=[ch])
             if include_usage:
                 c["usage"] = None
             return c
@@ -1157,7 +1244,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.end_headers()
         fin = None
         try:
-            self._sse(chunk({"role": "assistant", "content": ""}))
+            if not text_mode:
+                self._sse(chunk({"role": "assistant", "content": ""}))
+            elif req.raw.get("echo") and req.prompt:
+                self._sse(chunk({"content": req.prompt}))
             while True:
                 if isinstance(ev, Finish):
                     fin = ev
@@ -1613,6 +1703,7 @@ def sampler_defaults(args):
 
 SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")
 SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
+STORIES = ("stories15m",)
 MOONSHINE = ("moonshine", "moonshine-base", "moonshine-tiny")
 
 
@@ -1647,6 +1738,16 @@ def build_backends(args) -> Dict[str, Backend]:
             b = smollm2_backend(args, llm_engine(args, args.llm_360m_lib, args.llm_360m_weights),
                                 args.llm_360m_tokenizer, args.llm_360m_cma_mb,
                                 args.llm_360m_model_id, default_model_id="smollm2-360m-instruct")
+        elif name in STORIES:
+            from sampler import SamplerParams
+            from stories_backend import StoriesBackend
+            b = StoriesBackend(
+                llm_engine(args, args.stories_lib, args.stories_weights), args.stories_tokenizer,
+                sampler_lib=args.llm_sampler_lib,
+                defaults=SamplerParams(temperature=args.stories_temperature, top_p=args.stories_top_p,
+                                       top_k=0, repetition_penalty=1.0, dry_multiplier=0.0),
+                reserve=args.stories_reserve, model_id=args.stories_model_id,
+                cma_mb=args.stories_cma_mb, loop_guard=not args.llm_no_loop_guard)
         elif name in ("smolvlm", "smolvlm-256m-instruct"):
             from smolvlm_backend import LibVlmEngine, SmolvlmBackend
             b = SmolvlmBackend(
@@ -1670,7 +1771,7 @@ def build_backends(args) -> Dict[str, Backend]:
                                  ffmpeg=args.ffmpeg or None, max_seconds=args.asr_max_seconds)
         else:
             raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, "
-                             f"smollm2-360m, smolvlm, piper, moonshine, echo)")
+                             f"smollm2-360m, smolvlm, piper, moonshine, stories15m, echo)")
         if b.model_id in out:
             raise SystemExit(f"backend '{name}' serves model id '{b.model_id}', which another "
                              f"backend already serves (check the --llm-lib / --llm-360m-lib "
@@ -1693,7 +1794,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
                     choices=("bert-squad", *SMOLLM2_135M, *SMOLLM2_360M, "smolvlm",
-                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", *MOONSHINE, "echo"),
+                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", *MOONSHINE,
+                             *STORIES, "echo"),
                     help="backend(s) to serve (default: bert-squad); the first chat backend is the "
                          "default model of /v1/chat/completions, the first speech backend that of "
                          "/v1/audio/speech, the first speech-to-text backend that of "
@@ -1767,6 +1869,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         os.path.join(HERE, "smollm2_360m", "tokenizer.json"),
         os.path.join(HERE, "assets", "smollm2-360m-instruct", "tokenizer.json")))
     g.add_argument("--llm-360m-cma-mb", type=float, default=775.0,
+                   help="CMA the loaded model holds (MB), for --resident auto")
+    g = ap.add_argument_group("stories15m (story writing with stories15M, a base model; its own "
+                              "sampling defaults, the --llm-sampler-lib and loop guard apply)")
+    g.add_argument("--stories-lib", default=os.path.join(HERE, "lib", "libstories15m.so"))
+    g.add_argument("--stories-model-id", default=None,
+                   help="model id to serve (default: the library's llm_model_name(), else stories15m)")
+    g.add_argument("--stories-weights", default=None,
+                   help="weights directory for llm_open(); default: the one the library was built for")
+    g.add_argument("--stories-tokenizer", default=_first_existing(
+        os.path.join(HERE, "stories15m", "tokenizer.json"),
+        os.path.join(HERE, "assets", "stories15m", "tokenizer.json")))
+    g.add_argument("--stories-temperature", type=float, default=0.8,
+                   help="default temperature (0: greedy)")
+    g.add_argument("--stories-top-p", type=float, default=0.9, help="default top_p")
+    g.add_argument("--stories-reserve", type=int, default=128,
+                   help="tokens of the 256-token context kept free for the continuation when a long "
+                        "story is trimmed (max_tokens if smaller)")
+    g.add_argument("--stories-cma-mb", type=float, default=50.0,
                    help="CMA the loaded model holds (MB), for --resident auto")
     g = ap.add_argument_group("smolvlm (chat about images; the llm sampling defaults apply)")
     g.add_argument("--vlm-lib", default=os.path.join(HERE, "lib", "libsmolvlm_256m.so"))

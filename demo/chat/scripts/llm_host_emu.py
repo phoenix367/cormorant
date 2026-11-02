@@ -14,7 +14,7 @@ _simulate", through the library's own prefill split and entry calls.
 
 usage: inference-scheduler/.venv/bin/python demo/chat/scripts/llm_host_emu.py
            [--project demo/chat/build/llm_project] [--prompts factual,summarise,multi-turn]
-           [--decode 32]
+           [--decode 32]    (prompts: the model's gate prompts, llm_project.gate_prompts)
 """
 
 from __future__ import annotations
@@ -76,12 +76,13 @@ def build(project: str, work: str, incoherent: bool = False) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--project", default=llm_board.DEFAULT_PROJECT)
-    ap.add_argument("--prompts", default="factual,summarise,multi-turn")
+    ap.add_argument("--prompts", default=None, help="default: the model's gate prompts")
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--work", default=None)
     ap.add_argument("--study-json", default=None)
-    ap.add_argument("--second-turn", default="factual",
-                    help="prompts followed by a second-turn continuation ('' = none)")
+    ap.add_argument("--second-turn", default=None,
+                    help="prompts followed by a second-turn continuation ('' = none; default: the "
+                         "first gate prompt)")
     ap.add_argument("--incoherent", action="store_true",
                     help="separate CPU / DDR buffer copies: every cache sync must be right")
     args = ap.parse_args(argv)
@@ -89,8 +90,7 @@ def main(argv=None) -> int:
     work = args.work or os.path.join(project, "host_emu")
     os.makedirs(work, exist_ok=True)
     exe = build(project, work, args.incoherent)
-    ids = lp.with_second_turns(lp.tokenize_prompts(args.prompts.split(",")),
-                               [n for n in args.second_turn.split(",") if n])
+    ids = llm_board.gate_ids(project, args.prompts, args.second_turn)
     prompts = os.path.join(work, "prompts.bin")
     names = llm_board.write_prompts(prompts, ids)
     logits = os.path.join(work, "logits_host.bin")

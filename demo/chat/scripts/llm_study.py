@@ -76,6 +76,12 @@ Exponents come from a float calibration run over a separate set (WikiText-2
 validation + 3 extra prompts), one bit of headroom (MARGIN), see make_formats.
 Policies: POLICIES below; recommended pow2+sink+p12 (doc/plans/CHAT_PLAN.md §9).
 
+Profiles (Profile): a checkpoint with a chat template (SmolLM2) is studied as
+above; a base model without one (stories15m, CHAT_PLAN §27) on story
+beginnings after <s> (STORY_PROMPTS), TinyStories held-out / calibration
+stories joined by <s>, its max_position_embeddings as the context (256), and
+generation ending at <s> or </s>.
+
 Usage (.venv-export: torch CPU, transformers, safetensors, numpy):
   PY=/home/ivan/projects/axi_demo/.venv-export/bin/python
   $PY demo/chat/scripts/llm_study.py fetch        # WikiText-2 held-out / calibration text -> assets
@@ -220,6 +226,81 @@ def chatml(messages):
     return s + "<|im_start|>assistant\n"
 
 
+# A base model without a chat template (stories15m: Karpathy's llama2.c model trained on
+# TinyStories) is studied on story beginnings in the style of its training data
+LONG_STORY = (
+    "Once upon a time, in a small village near a big forest, there lived a girl named Lucy. "
+    "Lucy had a red hat and a little brown dog called Max. Every morning, Lucy and Max walked "
+    "to the river to look at the fish. One sunny day, Lucy saw something shiny in the water. "
+    "It was a golden key! Lucy picked it up and looked at it. \"What does this key open?\" she "
+    "asked Max. Max wagged his tail and ran into the forest. Lucy followed him past the tall "
+    "trees and the big rocks until they came to an old wooden door in a hill.")
+
+STORY_PROMPTS = [
+    ("dragon", "Once upon a time, there was a little dragon named Sparky. Sparky could not breathe "
+               "fire like the other dragons."),
+    ("park", "Lily and her brother Tom went to the park. They saw a big red ball under a tree."),
+    ("kitten", "One day, a small kitten got stuck in a tall tree."),
+    ("rain", "It was a rainy day and Ben was sad because he could not play outside."),
+    ("boat", "Mia had a toy boat. She liked to sail it in the bath."),
+    ("birthday", "Today was Sam's birthday. His mom made a big chocolate cake."),
+    ("teddy", "Anna could not find her teddy bear anywhere."),
+    ("garden", "Grandpa had a beautiful garden with many flowers."),
+    ("moon", "Once upon a time, a little girl wanted to touch the moon."),
+    ("friends", "Tim and Sue were best friends. One day, they had a fight about a red crayon."),
+    ("dialogue", "\"Can I play with your truck?\" asked Max. Leo looked at his shiny new truck and"),
+    ("long", LONG_STORY),
+]
+STORY_CALIB = ["The little bird sang a happy song.", "Once upon a time, there was a big brown bear.",
+               "Max liked to run fast."]
+STORY_END = "\n<|endoftext|>\n"        # separates the stories of the TinyStories text files
+STORY_TEXTS = (("heldout_tinystories_valid.txt", 100, 48),    # (file, first row, stories)
+               ("calib_tinystories_valid.txt", 5000, 16))
+
+
+class Profile:
+    """How a checkpoint is studied and gated.  "chat" (a chat template in
+    tokenizer_config.json: SmolLM2): ChatML prompts, WikiText-2 texts, context
+    CTX, generation ends at <|im_end|>.  "text" (none: stories15m): story
+    beginnings after <s>, TinyStories texts (stories joined by <s>, as the model
+    was trained), the context of max_position_embeddings (at most CTX),
+    generation ends at <s> (the next story) or </s>.  Position 0 is token 1
+    either way (<|im_start|> / <s>): the attention sink."""
+
+    def __init__(self, assets):
+        try:
+            with open(os.path.join(assets, "tokenizer_config.json")) as f:
+                self.chat = "chat_template" in json.load(f)
+        except OSError:
+            self.chat = True
+        with open(os.path.join(assets, "config.json")) as f:
+            mp = json.load(f).get("max_position_embeddings") or CTX
+        self.kind = "chat" if self.chat else "text"
+        self.ctx = CTX if self.chat else min(CTX, int(mp))
+        self.eog = (EOS,) if self.chat else (1, 2)
+        self.prompts = PROMPTS if self.chat else STORY_PROMPTS
+        self.texts = (("heldout_wikitext2_test.txt", "calib_wikitext2_valid.txt") if self.chat
+                      else tuple(n for n, _, _ in STORY_TEXTS))
+        self.windows = 3 * (CTX // self.ctx)        # held-out windows: 3 x 1024 tokens either way
+
+    def prompt_ids(self, tok, p):
+        """Token ids of one PROMPTS / STORY_PROMPTS entry, from the sink on."""
+        ids = tok.encode(chatml(p) if self.chat else p)
+        assert ids[0] == 1, "the prompt must start with token 1 (the sink)"
+        return ids
+
+    def heldout_ids(self, tok, assets, name):
+        """The held-out / calibration token stream (no sink): WikiText as it is;
+        the stories joined by <s>, as llama2.c trained the model."""
+        text = open(os.path.join(assets, name), encoding="utf-8").read()
+        if self.chat:
+            return tok.encode(text)
+        out = []
+        for i, s in enumerate(text.split(STORY_END)):
+            out += ([1] if i else []) + tok.plain(s).tolist()
+        return np.array(out, np.int64)
+
+
 class Tok:
     def __init__(self, assets):
         from tokenizers import Tokenizer
@@ -227,6 +308,10 @@ class Tok:
 
     def encode(self, text):
         return np.array(self.t.encode(text).ids, np.int64)
+
+    def plain(self, text):
+        """Without the special tokens the post-processor adds (<s> of a Llama tokenizer)."""
+        return np.array(self.t.encode(text, add_special_tokens=False).ids, np.int64)
 
     def decode(self, ids):
         return self.t.decode([int(i) for i in ids], skip_special_tokens=True)
@@ -243,6 +328,17 @@ def wikitext_detok(s):
 
 def cmd_fetch(args):
     import urllib.request
+    if not Profile(args.assets).chat:
+        url = "https://datasets-server.huggingface.co/rows?dataset=roneneldan/TinyStories&config=default"
+        for name, off, n in STORY_TEXTS:
+            with urllib.request.urlopen(f"{url}&split=validation&offset={off}&length={n}") as r:
+                rows = json.load(r)["rows"]
+            text = STORY_END.join(x["row"]["text"].strip() for x in rows)
+            path = os.path.join(args.assets, name)
+            open(path, "w", encoding="utf-8").write(text)
+            print(f"{path}: {len(rows)} stories, {len(text)} chars (TinyStories validation rows "
+                  f"{off}..{off + len(rows) - 1}, CDLA-Sharing-1.0)")
+        return
     url = "https://datasets-server.huggingface.co/rows?dataset=Salesforce/wikitext&config=wikitext-2-raw-v1"
     for split, name, nchars in (("test", "heldout_wikitext2_test.txt", 24000),
                                 ("validation", "calib_wikitext2_valid.txt", 8000)):
@@ -643,7 +739,7 @@ class Model:
             P = vsmx().softmax_raw(raw, mask.sum(-1), cm, cs, int(fp))
             return P * p2(-int(fp))
         if not self.q or self.exact("s"):
-            x = np.where(mask, s * 0.125, -np.inf)
+            x = np.where(mask, s * (1.0 / math.sqrt(self.cfg.HD)), -np.inf)
             e = np.exp(x - x.max(-1, keepdims=True))
         else:
             raw = np.rint(s * p2(fs)).astype(np.int64)
@@ -699,7 +795,7 @@ class Model:
             # one round-half-even write-back of the [T, H*HD] output at f_pv
             for h in range(cfg.H):
                 g = self.grp[h]
-                x = np.where(mask, (q[:, h] @ K[g].T) * 0.125, -np.inf)
+                x = np.where(mask, (q[:, h] @ K[g].T) * (1.0 / math.sqrt(HD)), -np.inf)
                 e = np.exp(x - x.max(-1, keepdims=True))
                 out[:, h] = (e / np.cumsum(e, -1)[..., -1:]) @ V[g]
             return self.host(out.reshape(T, -1), "pv", l, self.E("pv", l)).reshape(T, cfg.H, HD)
@@ -816,9 +912,10 @@ class Model:
         return [logits[offs[i]:offs[i + 1]] for i in range(len(seqs))]
 
 
-def greedy(model, prompts, max_new=MAX_NEW):
-    """Greedy decoding, stop at <|im_end|>.  Prefill per prompt, then batched
-    one-token decode steps over the still-active prompts."""
+def greedy(model, prompts, max_new=MAX_NEW, eog=(EOS,)):
+    """Greedy decoding, stop at an end-of-generation token (<|im_end|>; a text
+    profile's <s> / </s>).  Prefill per prompt, then batched one-token decode
+    steps over the still-active prompts."""
     cfg = model.cfg
     seqs = [Seq(cfg, len(p) + max_new) for p in prompts]
     nxt = [int(np.argmax(model.forward([s], [p])[0][-1])) for s, p in zip(seqs, prompts)]
@@ -827,7 +924,7 @@ def greedy(model, prompts, max_new=MAX_NEW):
     while active:
         for i in active:
             out[i].append(nxt[i])
-        active = [i for i in active if nxt[i] != EOS and len(out[i]) < max_new]
+        active = [i for i in active if nxt[i] not in eog and len(out[i]) < max_new]
         if not active:
             break
         lg = model.forward([seqs[i] for i in active], [np.array([nxt[i]]) for i in active],
@@ -1031,30 +1128,35 @@ def load_all(assets):
     return cfg, W
 
 
-def build_data(assets, tok, quick):
-    """Chat prompts; held-out windows and the calibration text start with
-    <|im_start|> (position 0 of every chat sequence, the attention sink) followed
-    by plain text, so every sequence has the same position-0 token."""
-    prompts = [(name, tok.encode(chatml(m))) for name, m in PROMPTS]
-    text = open(os.path.join(assets, "heldout_wikitext2_test.txt"), encoding="utf-8").read()
-    ids = tok.encode(text)
-    win = 256 if quick else CTX
-    nwin = 1 if quick else 3
+def build_data(assets, tok, quick, prof=None):
+    """Chat prompts (a text profile: story beginnings); held-out windows and the
+    calibration text start with token 1 (<|im_start|> / <s>: position 0 of every
+    sequence, the attention sink) followed by plain text, so every sequence has
+    the same position-0 token.  CTX tokens of calibration text either way (a
+    text profile's shorter context: several windows)."""
+    prof = prof or Profile(assets)
+    prompts = [(name, prof.prompt_ids(tok, m)) for name, m in prof.prompts]
+    ids = prof.heldout_ids(tok, assets, prof.texts[0])
+    win = min(256, prof.ctx) if quick else prof.ctx
+    nwin = 1 if quick else prof.windows
     assert len(ids) >= (win - 1) * nwin, len(ids)
     held = [np.concatenate([[1], ids[i * (win - 1):(i + 1) * (win - 1)]]) for i in range(nwin)]
-    ctext = open(os.path.join(assets, "calib_wikitext2_valid.txt"), encoding="utf-8").read()
-    calib = [np.concatenate([[1], tok.encode(ctext)[:CTX - 1]])] + [tok.encode(chatml(m)) for m in CALIB_PROMPTS]
+    cids = prof.heldout_ids(tok, assets, prof.texts[1])
+    w = prof.ctx - 1
+    calib = [np.concatenate([[1], cids[i * w:(i + 1) * w]]) for i in range(CTX // prof.ctx)]
+    calib += ([tok.encode(chatml(m)) for m in CALIB_PROMPTS] if prof.chat
+              else [prof.prompt_ids(tok, t) for t in STORY_CALIB])
     if quick:
         prompts = prompts[:4]
     return prompts, held, calib
 
 
-def run_policy(name, model, prompts, held, ref, max_new, log, do_greedy=True):
+def run_policy(name, model, prompts, held, ref, max_new, log, do_greedy=True, eog=(EOS,)):
     """Evaluate one model.  ref None -> this is the float reference: returns it."""
     t0 = time.time()
     res = dict(policy=name)
     # greedy generations
-    gens = greedy(model, [p for _, p in prompts], max_new) if do_greedy else None
+    gens = greedy(model, [p for _, p in prompts], max_new, eog) if do_greedy else None
     res["gens"] = gens
     if do_greedy:
         log(f"  [{name}] greedy {sum(len(g) for g in gens)} tokens  {time.time() - t0:.0f}s")
@@ -1137,17 +1239,18 @@ def cmd_study(args):
     t0 = time.time()
     cfg, W = load_all(assets)
     tok = Tok(assets)
-    prompts, held, calib = build_data(assets, tok, args.quick)
-    held = held[:args.windows]
+    prof = Profile(assets)
+    prompts, held, calib = build_data(assets, tok, args.quick, prof)
+    held = held[:args.windows or prof.windows]
     max_new = 32 if args.quick else args.max_new
     cs = rope_tables(cfg, 2 * CTX)
-    log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  prompts {len(prompts)} "
+    log(f"study {time.strftime('%Y-%m-%d %H:%M:%S')}  {prof.kind} profile, context {prof.ctx}, prompts {len(prompts)} "
         f"(tokens {[len(p) for _, p in prompts]}), held-out {len(held)} x {len(held[0])}, max_new {max_new}")
     pols = args.policies.split(",")
     # float reference (always) + calibration
     fm = Model(W, cfg, None, cos_sin=cs)
     fm0 = Model(W, cfg, None, cos_sin=cs, base=fm)          # computes the position-0 sink
-    ref = run_policy("float", fm, prompts, held, None, max_new, log)
+    ref = run_policy("float", fm, prompts, held, None, max_new, log, eog=prof.eog)
     ref_stats = ref["stats"]
     cal = {}
     for sink in (False, True):                              # per-channel calibration maxima
@@ -1164,7 +1267,8 @@ def cmd_study(args):
         pol = POLICIES[name]
         fmt = make_formats(pol, cal[bool(pol.get("sink"))], W, cfg)
         m = Model(W, cfg, pol, fmt, cos_sin=cs, sink_model=fm0)
-        r = run_policy(name, m, prompts, held, ref, max_new, log, do_greedy=not args.nogreedy)
+        r = run_policy(name, m, prompts, held, ref, max_new, log, do_greedy=not args.nogreedy,
+                       eog=prof.eog)
         r["formats"] = {"@".join(str(x) for x in k): v for k, v in fmt.items()}
         r["weights_saturated"] = m.wsat
         results[name] = r
@@ -1259,13 +1363,14 @@ def cmd_ablate(args):
     os.makedirs(out_dir, exist_ok=True)
     cfg, W = load_all(assets)
     tok = Tok(assets)
-    prompts, held, calib = build_data(assets, tok, args.quick)
+    prof = Profile(assets)
+    prompts, held, calib = build_data(assets, tok, args.quick, prof)
     held = held[:1]
     cs = rope_tables(cfg, 2 * CTX)
     say = lambda m: print(m, flush=True)
     fm = Model(W, cfg, None, cos_sin=cs)
     fm0 = Model(W, cfg, None, cos_sin=cs, base=fm)
-    ref = run_policy("float", fm, prompts, held, None, args.max_new, lambda m: None)
+    ref = run_policy("float", fm, prompts, held, None, args.max_new, lambda m: None, eog=prof.eog)
     base = dict(POLICIES[args.base])
     cm = Model(W, cfg, None, cos_sin=cs, base=fm, sink=bool(base.get("sink")), sink_model=fm0, record_ch=True)
     for c in calib:
@@ -1278,7 +1383,8 @@ def cmd_ablate(args):
     say(f"{'variant':24s} {'top1 tf':>8s} {'top1 held':>9s} {'KL tf':>8s} {'KL held':>8s} {'ppl':>7s}   (float ppl {ref['ppl']:.3f})")
     for name, extra in variants:
         m = Model(W, cfg, dict(base, **extra), fmt, cos_sin=cs, sink_model=fm0)
-        r = run_policy(name, m, prompts, held, ref, args.max_new, lambda m: None, do_greedy=False)
+        r = run_policy(name, m, prompts, held, ref, args.max_new, lambda m: None, do_greedy=False,
+                       eog=prof.eog)
         a = r["agree"]
         say(f"{name:24s} {a['tf_all'] / a['tf_all_n']:8.4f} {a['h_all'] / a['h_all_n']:9.4f} "
             f"{a['tf_kl'] / a['tf_all_n']:8.4f} {a['h_kl'] / a['h_all_n']:8.4f} {r['ppl']:7.3f}")
@@ -1324,20 +1430,29 @@ def cmd_validate(args):
     assets = args.assets
     cfg, W = load_all(assets)
     tok = Tok(assets)
+    prof = Profile(assets)
     htok = AutoTokenizer.from_pretrained(assets)
     ok = 0
-    for name, msgs in PROMPTS + [("calib", m) for m in CALIB_PROMPTS]:
-        r = htok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
-        r = r["input_ids"] if not isinstance(r, list) else r
-        ok += int(list(r) == tok.encode(chatml(msgs)).tolist())
-    print(f"chat template + tokenizer: {ok}/{len(PROMPTS) + len(CALIB_PROMPTS)} prompts identical to HF apply_chat_template")
+    if prof.chat:
+        for name, msgs in PROMPTS + [("calib", m) for m in CALIB_PROMPTS]:
+            r = htok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
+            r = r["input_ids"] if not isinstance(r, list) else r
+            ok += int(list(r) == tok.encode(chatml(msgs)).tolist())
+        print(f"chat template + tokenizer: {ok}/{len(PROMPTS) + len(CALIB_PROMPTS)} prompts identical to HF apply_chat_template")
+    else:
+        texts = [t for _, t in STORY_PROMPTS] + STORY_CALIB + [LONG_STORY + "\n\n\"Yes!\" 3 + 4 = 7. Ünïcödé ok."]
+        ok = sum(int(list(htok(t)["input_ids"]) == tok.encode(t).tolist()) for t in texts)
+        print(f"tokenizer: {ok}/{len(texts)} texts identical to HF AutoTokenizer")
     hf = AutoModelForCausalLM.from_pretrained(assets, dtype=torch.float32, attn_implementation="eager").eval()
     fm = Model(W, cfg, None)
-    prompts = [tok.encode(chatml(m)) for _, m in PROMPTS]
-    text = open(os.path.join(assets, "heldout_wikitext2_test.txt"), encoding="utf-8").read()
-    held = tok.encode(text)[:CTX]
+    prompts = [prof.prompt_ids(tok, m) for _, m in prof.prompts]
+    if prof.chat:
+        text = open(os.path.join(assets, "heldout_wikitext2_test.txt"), encoding="utf-8").read()
+        held = tok.encode(text)[:CTX]
+    else:
+        held = np.concatenate([[1], prof.heldout_ids(tok, assets, prof.texts[0])[:prof.ctx - 1]])
     worst = 0.0
-    for name, ids in [("prompt0", prompts[0]), ("prompt4", prompts[4]), ("heldout1024", held)]:
+    for name, ids in [("prompt0", prompts[0]), ("prompt4", prompts[4]), (f"heldout{len(held)}", held)]:
         with torch.no_grad():
             tl = hf(torch.tensor(ids[None])).logits[0].double().numpy()
         nl = teacher_forced(fm, ids)
@@ -1347,12 +1462,13 @@ def cmd_validate(args):
               f"  argmax agree {(tl.argmax(-1) == nl.argmax(-1)).mean():.4f}")
     n_new = args.max_new
     t0 = time.time()
-    ng = greedy(fm, prompts, n_new)
+    ng = greedy(fm, prompts, n_new, prof.eog)
     same = 0
     for i, ids in enumerate(prompts):
         with torch.no_grad():
             o = hf.generate(torch.tensor(ids[None]), attention_mask=torch.ones(1, len(ids), dtype=torch.long),
-                            max_new_tokens=n_new, do_sample=False, eos_token_id=EOS, pad_token_id=EOS)
+                            max_new_tokens=n_new, do_sample=False, eos_token_id=list(prof.eog),
+                            pad_token_id=prof.eog[-1])
         tg = o[0, len(ids):].tolist()
         same += int(tg == ng[i])
         if tg != ng[i]:
@@ -1372,7 +1488,8 @@ def cmd_costs(args):
     print(f"parameters: layers {lin / 1e6:.2f} M ({per_layer / 1e6:.3f} M/layer), embedding / LM head {emb / 1e6:.2f} M (tied), total {(lin + emb) / 1e6:.2f} M")
     print(f"weights at 16 bit: {2 * (lin + emb) / 1e6:.1f} MB; + a second (packed-B LM head) copy of the embedding {2 * emb / 1e6:.1f} MB")
     kv_tok = 2 * L * KV * HD * 2
-    print(f"KV cache: {kv_tok} B/token ({kv_tok / 1024:.1f} KiB), context {CTX}: {kv_tok * CTX / 2**20:.1f} MiB")
+    ctx = Profile(args.assets).ctx
+    print(f"KV cache: {kv_tok} B/token ({kv_tok / 1024:.1f} KiB), context {ctx}: {kv_tok * ctx / 2**20:.1f} MiB")
     bw = 1.5e9
     for ctx in (64, 256, 512, 1024):
         mac = lin + emb + L * H * HD * ctx * 2
@@ -1398,7 +1515,8 @@ def main():
     ap.add_argument("--max-new", type=int, default=MAX_NEW)
     ap.add_argument("--quick", action="store_true", help="4 prompts, 32 new tokens, one 256-token held-out window")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--windows", type=int, default=3, help="held-out windows (1024 tokens each)")
+    ap.add_argument("--windows", type=int, default=None,
+                    help="held-out windows of the context's length (default: 3 x 1024 tokens)")
     ap.add_argument("--nogreedy", action="store_true", help="skip the policies' greedy generations")
     args = ap.parse_args()
     {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate,

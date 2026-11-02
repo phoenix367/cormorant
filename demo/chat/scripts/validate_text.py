@@ -30,8 +30,15 @@ chat template (chatml.py) against transformers (CHAT_PLAN phase 4, gate 1).
   --write-fixture writes demo/chat/tests/data/smollm2_text_cases.json (a
   subset with the reference ids) for the stdlib unit tests.
 
+  --model stories15m: the pure-Python Llama-2 tokenizer (llama_tokenizer.py)
+  against the `tokenizers` library on the same strings plus the TinyStories
+  texts and the special-token cases (ids with and without <s>, decode, the
+  incremental decoder under every split, random id sequences); no template.
+  --write-fixture then writes tests/data/stories15m_text_cases.json.
+
 Usage (.venv-export: transformers, tokenizers):
   /home/ivan/projects/axi_demo/.venv-export/bin/python demo/chat/scripts/validate_text.py [--write-fixture]
+  /home/ivan/projects/axi_demo/.venv-export/bin/python demo/chat/scripts/validate_text.py --model stories15m
 """
 import argparse
 import json
@@ -225,10 +232,88 @@ def conversations():
     return conv
 
 
+LLAMA_CASES = ["Hello<s>world", "<s>", "</s>x", " <unk> ", "a <s>b", " <s>", "x </s>", "a  <s>",
+               "<s><s>", " <s> <s>", "<unk></s>", "a\n<s>", "Once upon a time", " Once", "  Once",
+               "Once upon a time, there was a little dragon named Sparky.\n\nThe end.",
+               "\"Can I play?\" asked Max.", "x\x00y\x7f", "tab\there", "€100 — naïve 😀"]
+
+
+def main_llama(model: str, write_fixture: bool) -> int:
+    """The Llama-2 tokenizer of a text-profile checkpoint against `tokenizers`."""
+    from tokenizers import Tokenizer as Ref
+    from llama_tokenizer import Tokenizer as Llama
+    assets = os.path.join(CHAT, "assets", model)
+    path = os.path.join(assets, "tokenizer.json")
+    tok, ref = Llama(path), Ref.from_file(path)
+    strings = make_strings() + LLAMA_CASES
+    for name in ("heldout_tinystories_valid.txt", "calib_tinystories_valid.txt"):
+        p = os.path.join(assets, name)
+        if os.path.exists(p):
+            strings += open(p, encoding="utf-8").read().split("\n<|endoftext|>\n")
+    bad, cases, n_tok, t_ours = 0, [], 0, 0.0
+    for s in strings:
+        t = time.perf_counter()
+        ours = tok.encode(s)
+        t_ours += time.perf_counter() - t
+        want = ref.encode(s).ids
+        n_tok += len(want)
+        ok = ours == want and tok.encode(s, add_special_tokens=False) == ref.encode(
+            s, add_special_tokens=False).ids
+        plain = [i for i in want if i not in tok.special_ids]
+        dec = tok.decode(ours)
+        ok &= dec == ref.decode(plain) and tok.decode(ours, False) == ref.decode(want, skip_special_tokens=False)
+        for cut in (0, len(ours) // 3, len(ours) // 2, len(ours)):
+            for strip in (True, False):
+                inc = tok.incremental_decoder(strip_first=strip)
+                ok &= (inc.add_many(ours[:cut]) + inc.add_many(ours[cut:]) + inc.flush()
+                       == tok.decode(ours, strip_first=strip))
+        if not ok:
+            bad += 1
+            if bad <= 10:
+                print(f"MISMATCH {s[:80]!r}\n  ours {ours[:30]}\n  ref  {want[:30]}")
+        cases.append((s, want))
+    print(f"tokenizer: {len(strings) - bad}/{len(strings)} strings identical (ids with and without <s>, "
+          f"decode with and without special tokens, incremental decode); {n_tok} tokens, encode "
+          f"{n_tok / t_ours / 1e3:.0f} k tok/s")
+    rng = random.Random(99)
+    bad_dec = 0
+    pool = [tok.vocab[f"<0x{b:02X}>"] for b in range(256)] + [0, 1, 2, 13, 29871] + \
+        [tok.vocab[f"<0x{b:02X}>"] for b in (0xE2, 0x82, 0xAC, 0xF0, 0x9F)] * 8
+    for k in range(2000):
+        ids = ([rng.randrange(tok.vocab_size) for _ in range(rng.randint(1, 30))] if k % 2 else
+               [rng.choice(pool) for _ in range(rng.randint(1, 30))])     # partial UTF-8 runs
+        a, b = tok.decode(ids, False), ref.decode(ids, skip_special_tokens=False)
+        c, d = tok.decode(ids), ref.decode([i for i in ids if i not in tok.special_ids])
+        inc = tok.incremental_decoder()
+        e = "".join(inc.add(i) for i in ids) + inc.flush()
+        if not (a == b and c == d == e):
+            bad_dec += 1
+            if bad_dec <= 5:
+                print(f"DECODE MISMATCH {ids}: {a!r} / {b!r}; {c!r} / {d!r} / {e!r}")
+    print(f"decode of random id sequences: {2000 - bad_dec}/2000 identical (with and without special "
+          f"tokens, incremental)")
+    if write_fixture:
+        fixture = os.path.join(CHAT, "tests", "data", f"{model}_text_cases.json")
+        rng = random.Random(5)
+        sub = [c for c in cases if len(c[0]) <= 400]
+        sub = sub[:120] + rng.sample(sub[120:], 380) + [c for c in cases if c[0] in LLAMA_CASES]
+        with open(fixture, "w", encoding="utf-8") as f:
+            json.dump({"source": f"tokenizers {model}/tokenizer.json via "
+                                 f"demo/chat/scripts/validate_text.py --model {model} --write-fixture",
+                       "strings": [{"text": s, "ids": ids} for s, ids in sub]},
+                      f, ensure_ascii=True, indent=None, separators=(",", ":"))
+        print(f"wrote {fixture} ({os.path.getsize(fixture) // 1024} KiB)")
+    return 0 if bad == bad_dec == 0 else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--write-fixture", action="store_true")
+    ap.add_argument("--model", default=None,
+                    help="a text-profile checkpoint in assets/ (stories15m): its Llama-2 tokenizer")
     args = ap.parse_args()
+    if args.model:
+        return main_llama(args.model, args.write_fixture)
     import re
     import transformers
     from transformers import AutoTokenizer

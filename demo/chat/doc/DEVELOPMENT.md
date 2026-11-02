@@ -17,12 +17,14 @@ demo/chat/
 ├── bert_squad_backend.py    — document / question mapping, windows, libbert_squad.so
 ├── smollm2_backend.py       — SmolLM2: prompt, prefix cache, decode loop, libsmollm2.so (CHAT_PLAN §11 API)
 ├── smolvlm_backend.py       — SmolVLM: images (llm_image), prefix cache keyed by image content
+├── stories_backend.py       — stories15m: a base model's text completion (/v1/completions) and story chat
 ├── idefics3.py, vlm_image.py — SmolVLM's chat template with images; data URL -> 512 x 512 pixels (Pillow)
 ├── piper_backend.py         — text to speech: front end, libpiper_tts.so per chunk
 ├── piper_phonemize.py       — espeak-ng through ctypes -> Piper phoneme ids (+ ../tts/scripts/piper_vits.py)
 ├── moonshine_backend.py     — speech to text: libmoonshine_<size>.so per part, the tokenizer.json detokenizer
 ├── speech_input.py          — uploads -> 16 kHz mono int16 (WAV here, a windowed-sinc resampler; ffmpeg otherwise)
 ├── smollm2_tokenizer.py     — SmolLM2's byte-level BPE (tokenizer.json) + incremental detokenizer
+├── llama_tokenizer.py       — the Llama-2 SentencePiece BPE (stories15m's tokenizer.json) + detokenizer
 ├── chatml.py                — SmolLM2's ChatML template, block-wise tokenizing, history trimming
 ├── sampler.py, src/sampler.{c,h} — sampling (libsampler.so; pure-Python fallback, same tokens)
 ├── chat.py                  — stdlib REPL / one-shot client
@@ -30,7 +32,7 @@ demo/chat/
 ├── chat_config.json.example
 ├── src/llm_api.{c,h}, src/llm_bench.c — the LLM libraries' C API (CHAT_PLAN §11) and a standalone benchmark
 ├── scripts/
-│   ├── generate_llm_project.py — schedule SmolLM2 / SmolVLM into build/llm_project[_<model>]
+│   ├── generate_llm_project.py — schedule SmolLM2 / SmolVLM / stories15m into build/llm_project[_<model>]
 │   │                          (libsmollm2.so, ...); takes the planning options (--plan, ...)
 │   ├── llm_board.py         — build / install the library on the board, board gate, timings,
 │   │                          per-layer profiles (--profile; --out saves them as profile_layers)
@@ -39,7 +41,8 @@ demo/chat/
 │   ├── llm_host_emu.py      — the generated C on the host against software kernels
 │   ├── llm_lib_check.py     — libsmollm2.so through ctypes (runs on the board)
 │   ├── llm_attn_kernel_bench.py — decode attention on the FPGA vs host (CHAT_PLAN §13.4)
-│   ├── llm_study.py         — numeric study, calibrated formats JSON (.venv-export)
+│   ├── llm_study.py         — numeric study, calibrated formats JSON (.venv-export); a chat or a
+│   │                          text profile (a base model without a chat template: story prompts)
 │   ├── llm_calibrate.py     — the study stage from pinned inputs: fetch, calibrate, check, study
 │   ├── llm_models.json      — pinned checkpoints / texts (SHA-256) and the expected formats hashes
 │   ├── requirements-study.txt — the .venv-export versions that reproduce those hashes
@@ -47,7 +50,8 @@ demo/chat/
 │   ├── vlm_project.py, vlm_sched_check.py, vlm_host_emu.py — SmolVLM entries, gate (sim == study), C on the host
 │   ├── vlm_template_fixture.py — tests/data/smolvlm_cases.json (template ids, image pixels; .venv-export)
 │   ├── vlm_study_inputs.json — its pinned checkpoint revision, file and COCO image hashes
-│   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export)
+│   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export;
+│                              validate_text.py --model stories15m: the Llama tokenizer vs tokenizers)
 ├── doc/                     — these guides
 ├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/
 └── tests/                   — unittest: protocol, text modules, sampler, backends, fakes; board_gate.py
@@ -114,7 +118,7 @@ transcript); see `moonshine_backend.py`.
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 257 tests, ~45 s
+python3 -m unittest -v                  # 280 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 
@@ -131,6 +135,7 @@ Some parts need more:
 About 70 tests skip until their assets are present:
 - the SmolLM2 tokenizer: `scripts/llm_calibrate.py fetch`;
 - the SmolVLM tokenizer: `scripts/vlm_study.py fetch`;
+- the stories15m tokenizer: `scripts/llm_calibrate.py fetch stories15m`;
 - BERT's `vocab.txt`: `../bert_squad/scripts/fetch_assets.py vocab`.
 
 **What each test module covers.**
@@ -173,6 +178,14 @@ Generative chat:
   - UTF-8 across tokens, seeds and parameters, library errors;
   - residency: `one` / `auto` / `all` switching between `bert-squad` and
     `smollm2`, with fake engines and a fake CMA pool.
+- `test_stories_backend.py` — stories15m: the Llama tokenizer against 520
+  `tokenizers`-tokenized strings (`tests/data/stories15m_text_cases.json`,
+  `validate_text.py --model stories15m --write-fixture`), special tokens,
+  the continuation detokenizer; the story a conversation tells; the backend
+  (prompt trimming, `<s>` / `</s>` ending a story, the leading space kept)
+  over a scripted engine and over `fake_libsmollm2.c` through
+  `build_backends`; `POST /v1/completions` (schema, `echo`, streaming,
+  OpenAI's default `max_tokens`, refused fields, a chat model's 400).
 - `test_llm_calibrate.py` — the calibration tool.
   - `llm_models.json`'s schema.
   - Verified downloads and fetch, with file:// standing in for Hugging

@@ -181,6 +181,39 @@ class ChatClientModels(unittest.TestCase):
         self.assertEqual((rc, text.strip()), (0, "w163"))
 
 
+class ChatClientBaseModel(unittest.TestCase):
+    """A base model (kv260 "completions": stories15m) is a chat model to the
+    client; switching to it, or starting with it, prints how to use it."""
+
+    def setUp(self):
+        class Story(server_mod.EchoBackend):
+            model_id = "stories-fake"
+            completions = True
+        self.srv = RunningServer({"echo": server_mod.EchoBackend(), "stories-fake": Story()})
+        self.url = f"http://127.0.0.1:{self.srv.port}/v1"
+
+    def tearDown(self):
+        self.srv.close()
+
+    def run_chat(self, argv, stdin=""):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(sys, "stdin", io.StringIO(stdin)):
+            rc = chat.main(["--url", self.url, "--player", "none", "--no-banner"] + argv)
+        return rc, out.getvalue()
+
+    def test_note(self):
+        note = "stories-fake writes children's stories: type how one begins"
+        rc, text = self.run_chat([], "/model stories-fake\nLily found a ball.\n/quit\n")
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(text.count(note), 1)
+        self.assertIn("chatting with stories-fake", text)
+        self.assertIn("Lily found a ball.", text.split(note)[1])             # the fake echoes the message
+        rc, text = self.run_chat(["--model", "stories-fake"], "/quit\n")
+        self.assertEqual(text.count(note), 1)
+        rc, text = self.run_chat(["--model", "echo"], "/model echo\n/quit\n")
+        self.assertNotIn(note, text)
+
+
 class ChatClientNoChatModel(unittest.TestCase):
     def test_listen_only_transcribes(self):
         import numpy

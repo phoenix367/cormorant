@@ -309,6 +309,7 @@ the presence_penalty and `f` the frequency_penalty.
 | `dry_penalty_last_n` (extra) | −1 | DRY window over prompt + answer; −1 the whole context, 0 off |
 | `dry_sequence_breakers` (extra) | `[":", "\"", "*"]` | a token containing one of these (and every special token) cuts a run, so lists, dialogue and markdown are not penalised; newline is deliberately not one (see [Repetition control](#repetition-control)) |
 | `loop_guard` (extra) | true | end the answer when it ends in one block repeated verbatim 3 times (≥ 24 tokens): `finish_reason` "stop", `kv260.finish` "loop" |
+| `min_tokens` (extra, vLLM's) | 0 | no end-of-generation token before this many answer tokens (stories15m's chat: 1 for a new story, 16 for "continue") |
 | `seed` | random | the seed used is returned as `kv260.seed`; same seed + same logits → same answer |
 
 - **Where the defaults come from.**

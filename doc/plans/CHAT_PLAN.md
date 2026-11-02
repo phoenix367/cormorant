@@ -22,6 +22,10 @@ A53 cores decodes SmolLM2 / SmolVLM 2.1–2.5× slower than the FPGA, prefills
 256 tokens 10× and encodes an image 8.9× slower; its int8 decodes about as
 fast as the FPGA (360M: 1.2× faster), but prefills 6–7× slower and changes
 the greedy answers more.
+stories15M (Karpathy's llama2.c model trained on TinyStories, 2026-11-02): a base
+model that continues stories — bit-exact on the board, 6.0 ms per token
+(~166 tok/s), served on POST /v1/completions and as a story continuation on
+/v1/chat/completions (§27).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2395,3 +2399,142 @@ $PY demo/chat/scripts/llm_board.py --rpu r5 --project demo/chat/build/llm_projec
     --remote-dir /root/cmp_chat --weights-dir /root/cmp_smolvlm_weights --out /tmp/fpga_vlm.json
 $PY tools/cpu_baseline/cpu_baseline.py smolvlm --fpga /tmp/fpga_vlm.json
 ```
+
+
+## 27. stories15M — a TinyStories base model (2026-11-02)
+
+**Verdict: GO, implemented and served.**  The pow2+sink+p12 policy keeps
+float's perplexity to 0.3 % (bf16: 0.1 %); the library is bit-exact with the
+study emulation on the board, decodes in 6.0 ms per token (~166 tok/s) and
+holds 33 MB of CMA.
+
+**Model.**  `nickypro/tinyllama-15M` @ a97e01f (MIT): Andrej Karpathy's
+llama2.c `stories15M` (trained on TinyStories) converted to the Hugging Face
+Llama format, float16 safetensors, 30 MB.  6 layers, hidden 288, 6 / 6 heads
+of **48**, FFN 768, vocab 32000 (the Llama-2 SentencePiece tokenizer: BPE with
+byte fallback, `<s>` = 1, `</s>` = 2), tied embedding, RoPE theta 10000, **256
+positions**, no chat template.  It continues a story; in training every story
+starts with `<s>`, so after a story it writes `<s>` and starts the next.
+Assets: `demo/chat/assets/stories15m/` (not in git); pinned with its own texts
+in `llm_models.json` (`llm_calibrate.py add stories15m --repo
+nickypro/tinyllama-15M`).
+
+**What a base model needed** (the first checkpoint without SmolLM2's
+tokenizer and ChatML; `llm_study.Profile`):
+- the study's "text" profile, chosen when `tokenizer_config.json` has no chat
+  template: twelve story beginnings instead of the chat prompts, the context
+  of `max_position_embeddings` (256), held-out and calibration text from the
+  TinyStories validation split (`heldout_tinystories_valid.txt`: rows
+  100–147, `calib_tinystories_valid.txt`: rows 5000–5015, CDLA-Sharing-1.0)
+  with the stories joined by `<s>` as llama2.c trained the model, 12 held-out
+  windows of 256 tokens (3 × 1024 tokens, as the chat models), generation
+  ending at `<s>` or `</s>`.  The sink is `<s>` (token 1, as `<|im_start|>`
+  is for the chat models);
+- the float reference's softmax scale is 1/√head_dim; it was a hard-coded
+  0.125, the value for head_dim 64 (the SmolLM2 formats reproduce their
+  hashes unchanged);
+- `llm_calibrate.py add` pins the files the repo has (no `vocab.json` /
+  `merges.txt`) and, for a text-profile model, its own texts;
+- the gates take the model's prompts, second turn and context
+  (`llm_project.gate_prompts` / `context`; per-model token caches in its study
+  directory; `llm_lib_check.py` gets them as JSON from `llm_board.py`; the
+  bench's prefill lengths are clipped to the context: 16 / 64 / 255);
+- the board's tokenizer: `llama_tokenizer.py`, pure Python —
+  `scripts/validate_text.py --model stories15m`: 3044 / 3044 strings
+  identical to `tokenizers` (ids with and without `<s>`, decode, the
+  incremental decoder), 2000 / 2000 random id sequences.  Two `tokenizers`
+  details it reproduces: an added token is matched in its normalized form
+  (`▁<s>`: special only after a space or at the start), and `tokenizers` 0.23
+  decodes special tokens even with skip_special_tokens (" </s>"); the backend
+  never decodes them.
+
+**Numerics** (`llm_study.py study --assets assets/stories15m`, 394 s):
+
+| policy | top-1 all | top-1 resp | top-1 held | top-5 held | KL held | ppl (float 3.314) | greedy identical |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bf16 | 0.9924 | 0.9948 | 0.9948 | 1.0000 | 0.0002 | 3.312 | 5 / 12 |
+| q88 | 0.8928 | 0.8895 | 0.8889 | 0.9967 | 0.0764 | 3.557 | 0 / 12 |
+| fit+sink | 0.8961 | 0.8927 | 0.8863 | 0.9964 | 0.0729 | 3.560 | 0 / 12 |
+| pow2+sink | 0.9782 | 0.9778 | 0.9794 | 1.0000 | 0.0032 | 3.331 | 1 / 12 |
+| pow2+sink+p12 | 0.9880 | 0.9882 | 0.9866 | 1.0000 | 0.0008 | 3.324 | 1 / 12 |
+| pow2+p12 (no sink) | 0.9897 | 0.9902 | 0.9879 | 1.0000 | 0.0008 | 3.323 | 3 / 12 |
+| pow2+sink+p12+fw (float weights) | 0.9956 | 0.9961 | 0.9967 | 1.0000 | 0.0003 | 3.315 | 8 / 12 |
+| **pow2+sink+p12+vsmx+rowops+drope** (the library) | 0.9880 | 0.9889 | 0.9902 | 1.0000 | 0.0008 | **3.322** | 2 / 12 |
+
+Unlike SmolLM2, no attention sink dominates (the residual stream peaks at 16,
+not 25 982; res_float and res_float+sink are equal) — what breaks Q8.8 is
+the weights' resolution: they are small, and only the power-of-two exponents
+(`pow2`: the weights at f_w = f_out + 8 − f_in) keep them.  The rest of the
+gap is the weights' rounding (`+fw` closes most of it).  No weight saturates,
+the largest accumulator is 163 of 32768.  The greedy texts are coherent
+stories that drift from float's in wording only
+(`assets/study/stories15m/generations.txt`).  `validate`: 16 / 16 texts
+tokenized as HF does, logits within 2.3e-5 of torch float32, greedy 12 / 12;
+formats: 86 exponent entries (`calibrate --record`, `check`: REPRODUCED).
+
+**Project** (`generate_llm_project.py --assets assets/stories15m` →
+`build/llm_project_stories15m`, 24 s, 0.6 GB): context 256, buckets 16 / 64
+/ 256, the shipped design (FPGA attention in prefill and decode, the softmax
+unit, the row-ops unit with drope).  Pool **34.8 MiB** (weights 30.7 — the
+LM head's 32000 × 288 is 17.6 —, KV caches 2.3, intermediates 1.7), host
+tables 35.2 MiB (the float32 embedding), weight files 68 MB.
+
+**Gates.**  `llm_sched_check.py` (98 s): 3 / 3 prompts bit-exact × 32 decode
+steps and a second turn at position 64.  `llm_host_emu.py`: bit-exact, also
+`--incoherent`.  Board (`llm_board.py --reopen --profile --decode-at
+32,128,240`): logits bit-exact on all 4 × 33 vectors, greedy tokens = the
+study emulation's; lib check: exports, chunked prefill, threads, re-open all
+identical, vocab 32000, context 256.
+
+**Board** (production bitstream `b4e63457057a`):
+
+| | stories15m |
+|---|---:|
+| decode at position 32 / 128 / 240 | 5.7 / 6.3 / 6.8 ms (175 / 159 / 147 tok/s) |
+| prefill 16 / 64 / 255 tokens | 8 / 12 / 32 ms |
+| `llm_open` cold / warm | 4.5 s / 0.15 s |
+| CMA used | 33 MB |
+
+Decode per token (profile): LM head 2.5 ms (the 32000 × 288 head on
+MatmulKernel's tiled path), the 42 linears 1.95 ms, row-ops unit 0.5 ms,
+attention q·Kᵀ / P·V 0.4 / 0.4 ms, the decode softmax on the host 0.3 ms.
+
+**Serving it** (`stories_backend.py`, backend `stories15m`, config block
+`stories15m`, `--stories-*`; `deploy.py`).  A base model takes text, not
+messages:
+- **POST /v1/completions** (new; OpenAI's legacy completions): the prompt's
+  continuation, a `text_completion` object or SSE chunks; `echo`; OpenAI's
+  default `max_tokens` 16; `suffix`, `logprobs` and `best_of` > 1 refused.
+  Other models answer it with 400 `model_not_supported`; `/v1/models` marks
+  the model `"completions": true`.
+- **/v1/chat/completions** (`stories_backend.plan_chat`): each message
+  starts a new story with it as the opening; a request — "Write / tell me a
+  story about X" — starts one from the opening "Once upon a time, there was
+  X", which the answer repeats; "continue", "go on", "more", "what happened
+  next?" … go on with the last story (the earlier turns read the same way),
+  "...text" with the text first; system messages are ignored.  The first
+  version read the whole conversation as one story: a request or "continue"
+  was appended to the old story as text, and after 128 tokens of story the
+  start was cut off (on the board: "continue" gave "… his walk, with a happy
+  heart."); and "continue" after a story that had ended returned nothing —
+  the model's next token was `<s>`, so a chat answer now has a
+  `min_tokens` (the new extra field, vLLM's: no end-of-generation token
+  before that many tokens) of 1 for a new story and 16 for "continue".
+  `chat.py` prints how to use a base model when it is selected.
+- `<s>` + the text; a story longer than the context less the reserve (128)
+  keeps its most recent tokens (`kv260.trimmed_tokens`); generation ends at
+  `<s>` or `</s>` (finish "eos"); a completion keeps the continuation's
+  leading space, a chat answer drops it.
+- Its own sampling defaults: temperature 0.8, top_p 0.9 (llama2.c's run.c:
+  1.0 / 0.9), no top-k, repetition penalty or DRY (character names repeat in
+  these stories), the loop guard on.
+
+On the board, served beside the six other models (`--resident auto`; with
+stories15m loaded CmaFree was 104 MB): greedy completions equal the gate's
+33 tokens for the three gate prompts, TTFT 12–23 ms, decode 132–148 tok/s
+through the API; with the default sampling ~95 tok/s (the sampler over the
+32000 logits costs ~4 ms per token); a whole story (194 tokens, ended by
+`<s>`) in about 2 s.  The BERT board gate stayed 50 / 50.
+
+Open: the LM head on MatmulKernel's GEMV path (40 % of a decode step);
+`logprobs` on /v1/completions.

@@ -367,7 +367,9 @@ def main(argv=None) -> int:
     ap.add_argument("--vision-formats", default=None,
                     help="a VLM's vision formats (default: its study dir)")
     ap.add_argument("--buckets", default=",".join(map(str, lp.BUCKETS)))
-    ap.add_argument("--context", type=int, default=lp.CONTEXT)
+    ap.add_argument("--context", type=int, default=None,
+                    help=f"positions incl. the sink (default {lp.CONTEXT}, or a shorter "
+                         f"max_position_embeddings: stories15m 256)")
     ap.add_argument("--prefill-engine", choices=("conv", "matmul"), default="conv")
     ap.add_argument("--prefill-attn", choices=("fpga", "host"), default=lp.PREFILL_ATTN,
                     help="prefill attention on ConvKernel (fpga) or the host xattn region")
@@ -405,6 +407,8 @@ def main(argv=None) -> int:
         args.out_dir = (DEFAULT_OUT if args.model_name == DEFAULT_MODEL
                         else f"{DEFAULT_OUT}_{tag}")
     check_out_dir(os.path.abspath(args.out_dir), args.model_name, args.force)
+    if args.context is None:
+        args.context = lp.context(args.assets)
     t0 = time.time()
     buckets = sorted(int(b) for b in args.buckets.split(","))
     vsmx = lp.vsmx_default() if args.vsmx == "auto" else args.vsmx == "on"

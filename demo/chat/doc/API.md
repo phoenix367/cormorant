@@ -5,7 +5,8 @@ This page lists the endpoints, the request fields it honours, its errors,
 the `kv260` extension, and how requests share the FPGA.  How each model
 interprets a request is in its guide ([Document Q&A](BERT_QA.md),
 [Generative chat](SMOLLM2.md), [Chat about images](SMOLVLM.md),
-[Text to speech](TEXT_TO_SPEECH.md), [Speech to text](SPEECH_TO_TEXT.md)).
+[Text to speech](TEXT_TO_SPEECH.md), [Speech to text](SPEECH_TO_TEXT.md),
+[Stories](STORIES.md)).
 
 ## Endpoints
 
@@ -14,8 +15,9 @@ The paths also work without the `/v1` prefix.
 | Endpoint | What it returns |
 |---|---|
 | `GET /health` | the server's state (below); 503 when a model failed to load; no API key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`, and the non-standard `kv260: {"type"}` — `chat`, `speech` or `transcription`: the endpoint the model serves) |
+| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`, and the non-standard `kv260: {"type"}` — `chat`, `speech` or `transcription`: the endpoint the model serves; `"completions": true` on a model that also serves `/v1/completions`) |
 | `POST /v1/chat/completions` | a chat answer: `chat.completion`, or with `stream: true` server-sent events (below) |
+| `POST /v1/completions` | a base model's continuation of a text (`stories15m`; OpenAI's legacy completions): `text_completion`, or with `stream: true` server-sent events ([Stories](STORIES.md)) |
 | `POST /v1/audio/speech` | speech from the speech backends ([Text to speech](TEXT_TO_SPEECH.md)) |
 | `POST /v1/audio/transcriptions` | the transcript of an uploaded recording from the speech-to-text backends ([Speech to text](SPEECH_TO_TEXT.md)) |
 
@@ -29,6 +31,17 @@ The paths also work without the `/v1` prefix.
 
 The transfer is chunked (HTTP/1.1, keep-alive), or ends by closing the
 connection (HTTP/1.0).
+
+**Text completions** (`POST /v1/completions`): `{"model", "prompt": a
+string (or an array of one), "max_tokens" (default 16, as OpenAI's), "echo",
+...}` and the chat's sampling fields; the answer is a `text_completion`
+object (`choices[0].text`, `finish_reason`, `usage`, `kv260`), with `echo`
+the prompt in front.  Streamed, `text_completion` chunks carry the text
+(the prompt first with `echo`); the last one has the `finish_reason` (and
+the `kv260` details), then the usage chunk with
+`stream_options.include_usage`, then `data: [DONE]`.  `suffix`, `logprobs`
+and `best_of` > 1 are refused; a model without `"completions": true` answers
+400 `model_not_supported`.
 
 **Speech responses.**  The audio arrives as it is synthesized:
 - **wav / pcm:** with an exact Content-Length;
@@ -54,7 +67,7 @@ true`, `transcript.text.delta` events (one per part) and a final
   - SmolLM2: `vocab_size`, `context_size`, `reserve`, `sampler`,
     `cached_tokens`, `defaults`, `requests`,
     `prompt/reused/prefilled/generated_tokens`;
-  - SmolVLM: `image_cache`;
+  - SmolVLM: `image_cache`; stories15m: the SmolLM2 fields;
   - Piper: `type`, `sample_rate`, `espeak_voice`, `requests`, `audio_s`,
     `chunks`, `rtf`, `frontend_s`;
   - Moonshine: `type` (`transcription`), `tokenizer`, `sample_rate`,
@@ -68,8 +81,9 @@ true`, `transcript.text.delta` events (one per part) and a final
 
 | Field | Notes |
 |---|---|
-| `model` | default: the first chat backend (the first speech backend for `/audio/speech`, the first speech-to-text backend for `/audio/transcriptions`) |
+| `model` | default: the first chat backend (the first speech backend for `/audio/speech`, the first speech-to-text backend for `/audio/transcriptions`, the first base model for `/completions`) |
 | `messages` | string content or text parts; `image_url` parts (base64 data URLs) for `smolvlm` |
+| `prompt`, `echo` | `/v1/completions` only (above), instead of `messages` |
 | `stream`, `stream_options.include_usage` | streaming, as above |
 | `max_tokens` / `max_completion_tokens` | the answer's length cap |
 | `temperature` (0–2), `top_p` (0–1) | sampling (ignored by `bert-squad`) |
@@ -77,7 +91,7 @@ true`, `transcript.text.delta` events (one per part) and a final
 | `seed` | sampling seed |
 | `logprobs`, `top_logprobs` (0–20) | SmolLM2 only, not with `stream`: `choices[0].logprobs.content`, one entry per generated token (`token`, `logprob`, `bytes`, `top_logprobs`) — the model's distribution before the sampler's penalties, as OpenAI returns it |
 | `n` | 1 only |
-| `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `repeat_last_n`, `dry_*`, `loop_guard` | the generative models' extra sampling fields ([Sampling](SMOLLM2.md#sampling)) |
+| `top_k`, `repetition_penalty`, `presence_penalty`, `frequency_penalty`, `repeat_last_n`, `dry_*`, `loop_guard`, `min_tokens` | the generative models' extra sampling fields ([Sampling](SMOLLM2.md#sampling)) |
 
 Anything else is ignored.  The speech and transcription fields are in
 their guides ([Text to speech](TEXT_TO_SPEECH.md#requests),
@@ -94,7 +108,7 @@ so OpenAI clients raise their usual exceptions.
 |---|---|
 | 400 | invalid request; `param` names the field.  `images_not_supported`: an image sent to a text model.  `context_length_exceeded`: a generative prompt that cannot be trimmed to fit |
 | 400 `unsupported_format` | a speech format that needs ffmpeg, without ffmpeg |
-| 400 `model_not_supported` | a chat model at `/audio/speech` or `/audio/transcriptions`, a speech or speech-to-text model at `/chat/completions` |
+| 400 `model_not_supported` | a chat model at `/audio/speech` or `/audio/transcriptions`, a speech or speech-to-text model at `/chat/completions`, a model other than a base model at `/completions` |
 | 400 `invalid_audio`, `audio_too_long`, `unsupported_language` | an upload that cannot be decoded (not WAV, without ffmpeg) or holds no samples; longer than `--asr-max-seconds`; a language other than English |
 | 401 `invalid_api_key` | missing or wrong API key |
 | 404 `model_not_found` / `unknown_url` | unknown model or URL |
@@ -113,7 +127,9 @@ model:
 - [`bert-squad`](BERT_QA.md#the-kv260-details): windows, answer span,
   confidence, n-best;
 - [SmolLM2 and SmolVLM](SMOLLM2.md#the-kv260-details-and-the-log-line):
-  cache reuse, prefill and decode timing, sampler settings.
+  cache reuse, prefill and decode timing, sampler settings;
+  [stories15m](STORIES.md) the same, and `trimmed_tokens` when a long story
+  was cut to its end.
 
 A transcription's JSON body has one too: timings, parts, tokens, and with
 `kv260_wake_phrase` the phrase check's result `wake`

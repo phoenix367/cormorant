@@ -265,6 +265,22 @@ class TestGenerate(unittest.TestCase):
             with self.assertRaises(BackendError, msg=bad):
                 b.prepare(req([("user", "x")], raw=bad))
 
+    def test_min_tokens(self):
+        """min_tokens (vLLM's extra field): no end-of-generation token before
+        that many answer tokens — the scripted reply ends at once."""
+        hi = tok().encode("Hi")[0]
+
+        def logits(seq):
+            v = [0.0] * 49152
+            v[IM_END], v[hi] = 30.0, 20.0
+            return v
+        b = backend(ScriptedEngine(logits_fn=logits))
+        for n in (0, 4):
+            pieces, fin = run(b, req([("user", "Say nothing.")], raw={"min_tokens": n} if n else {}))
+            self.assertEqual((fin.completion_tokens, fin.info["finish"]), (n, "eos"))
+        with self.assertRaises(BackendError):
+            b.prepare(req([("user", "x")], raw={"min_tokens": -1}))
+
     def test_defaults_apply(self):
         eng = ScriptedEngine(tok().encode("x"))
         b = backend(eng, defaults=SamplerParams(temperature=0.2, top_p=0.9, top_k=50))

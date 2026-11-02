@@ -46,6 +46,10 @@ Contract:
   * Parameters the backend cannot honour must be rejected in prepare() or
     documented (e.g. temperature for an extractive model).
 
+Text completion (POST /v1/completions): a backend with completions = True (a
+base model, stories_backend.py) gets the same ChatRequest with `prompt` set
+and no messages, and generates its continuation the same way.
+
 Text to speech (POST /v1/audio/speech): a backend with speech = True serves
 SpeechRequests instead of ChatRequests —
 
@@ -130,7 +134,8 @@ class CancelToken:
 
 @dataclass
 class ChatRequest:
-    """A validated /v1/chat/completions request (the server fills it)."""
+    """A validated /v1/chat/completions request (the server fills it), or a
+    /v1/completions one: then `prompt` is the text and `messages` is empty."""
     model: str
     messages: List[Dict[str, str]]         # [{"role", "content": str}, ...]
     stream: bool = False
@@ -140,6 +145,7 @@ class ChatRequest:
     stop: List[str] = field(default_factory=list)   # up to 4 strings
     seed: Optional[int] = None
     raw: Dict[str, Any] = field(default_factory=dict)   # the request JSON, for extras
+    prompt: Optional[str] = None           # /v1/completions: the text to continue
 
 
 @dataclass
@@ -204,6 +210,7 @@ class Backend:
     fingerprint: Optional[str] = None      # -> "system_fingerprint"
     uses_fpga: bool = True                 # False: no device state, always resident
     cma_mb: float = 0.0                    # CMA held while loaded (MB), for --resident auto
+    completions: bool = False              # True: also serves /v1/completions (a base model)
     speech: bool = False                   # True: a text-to-speech model (/v1/audio/speech)
     transcription: bool = False            # True: a speech-to-text model (/v1/audio/transcriptions)
     sample_rate: int = 0                   # speech / transcription: PCM samples per second

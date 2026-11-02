@@ -19,7 +19,8 @@ host with inference-scheduler/.venv/bin/python).
               squad_text.py, chat.py, vocab.txt, and the smollm2 side
               (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
               src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/,
-              <dir>/smollm2_360m/, <dir>/smolvlm/, <dir>/moonshine/), the piper
+              <dir>/smollm2_360m/, <dir>/smolvlm/, <dir>/moonshine/,
+              <dir>/stories15m/; stories_backend.py, llama_tokenizer.py), the piper
               side (piper_backend.py, piper_phonemize.py, piper_vits.py) and the
               moonshine side (moonshine_backend.py, speech_input.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
@@ -56,8 +57,11 @@ The generative backends need their libraries on the board, built by
 scripts/llm_board.py (not by this script): smollm2 (SmolLM2-135M) at
 smollm2.lib (default <dir>/lib/libsmollm2.so), smollm2-360m at
 smollm2_360m.lib (default <dir>/lib/libsmollm2_360m.so), smolvlm at
-smolvlm.lib (default <dir>/lib/libsmolvlm_256m.so); preflight reports whether
-they are there.  The smollm2 block's sampling defaults apply to all three.
+smolvlm.lib (default <dir>/lib/libsmolvlm_256m.so), stories15m at
+stories15m.lib (default <dir>/lib/libstories15m.so); preflight reports whether
+they are there.  The smollm2 block's sampling defaults apply to the first
+three; the stories15m block has its own (temperature 0.8, top_p 0.9, reserve
+128 of its 256-token context).
 The piper backend (text to speech, POST /v1/audio/speech) needs
 libpiper_tts.so (piper.lib, default <dir>/lib/libpiper_tts.so) and its voice
 directory (piper.weights_dir, default /root/piper_weights: weights/*.dat,
@@ -125,7 +129,8 @@ SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
                 CHAT / "vlm_image.py", CHAT / "piper_backend.py", CHAT / "piper_phonemize.py",
                 DEMO / "tts" / "scripts" / "piper_vits.py", CHAT / "moonshine_backend.py",
-                CHAT / "speech_input.py", CHAT / "fpga_load.py"]
+                CHAT / "speech_input.py", CHAT / "fpga_load.py", CHAT / "stories_backend.py",
+                CHAT / "llama_tokenizer.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -205,6 +210,14 @@ def load_config(path: Optional[str]) -> dict:
             vlm[k] = v
     if not vlm["lib"]:
         vlm["lib"] = f"{rem['dir']}/lib/libsmolvlm_256m.so"
+    sto = cfg.setdefault("stories15m", {})
+    for k, v in (("lib", None), ("weights_dir", None), ("model_id", None), ("cma_mb", 50),
+                 ("tokenizer", "assets/stories15m/tokenizer.json"), ("temperature", 0.8),
+                 ("top_p", 0.9), ("reserve", 128)):
+        if sto.get(k) is None:
+            sto[k] = v
+    if not sto["lib"]:
+        sto["lib"] = f"{rem['dir']}/lib/libstories15m.so"
     tts = cfg.setdefault("piper", {})
     for k, v in (("lib", None), ("weights_dir", "/root/piper_weights"), ("model_id", None), ("cma_mb", 55)):
         if tts.get(k) is None:
@@ -228,6 +241,7 @@ def load_config(path: Optional[str]) -> dict:
 
 SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")    # kv260_chat_server.py
 SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
+STORIES = ("stories15m",)
 
 
 def uses_llm(cfg: dict) -> bool:
@@ -236,6 +250,10 @@ def uses_llm(cfg: dict) -> bool:
 
 def uses_llm_360m(cfg: dict) -> bool:
     return any(b in SMOLLM2_360M for b in cfg["server"]["backends"])
+
+
+def uses_stories(cfg: dict) -> bool:
+    return any(b in STORIES for b in cfg["server"]["backends"])
 
 
 def uses_vlm(cfg: dict) -> bool:
@@ -346,7 +364,9 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     for used, key, label, how in (
             (uses_llm(cfg), "smollm2", "libsmollm2.so (smollm2)", "llm_board.py --install-only"),
             (uses_llm_360m(cfg), "smollm2_360m", "libsmollm2_360m.so (smollm2-360m)",
-             "llm_board.py --project build/llm_project_smollm2_360m --install-only (CHAT_PLAN §20)")):
+             "llm_board.py --project build/llm_project_smollm2_360m --install-only (CHAT_PLAN §20)"),
+            (uses_stories(cfg), "stories15m", "libstories15m.so (stories15m)",
+             "llm_board.py --project build/llm_project_stories15m --install-only (CHAT_PLAN §27)")):
         if not used:
             continue
         lib = cfg[key]["lib"]
@@ -679,6 +699,10 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
             sftp.put(str(chat_path(cfg["smollm2_360m"]["tokenizer"])),
                      f"{d}/smollm2_360m/tokenizer.json")
             extra += " + smollm2_360m/tokenizer.json"
+        if uses_stories(cfg):
+            session.exec_checked(f"mkdir -p {d}/stories15m", timeout=15)
+            sftp.put(str(chat_path(cfg["stories15m"]["tokenizer"])), f"{d}/stories15m/tokenizer.json")
+            extra += " + stories15m/tokenizer.json"
         if uses_vlm(cfg):
             session.exec_checked(f"mkdir -p {d}/smolvlm", timeout=15)
             sftp.put(str(chat_path(cfg["smolvlm"]["tokenizer"])), f"{d}/smolvlm/tokenizer.json")
@@ -722,7 +746,9 @@ def server_argv(cfg: dict) -> List[str]:
     for b in s["backends"]:
         argv += ["--backend", b]
     argv += ["--resident", str(s["resident"])]
-    if uses_llm(cfg) or uses_llm_360m(cfg) or uses_vlm(cfg):   # the sampling defaults serve all
+    # the sampling defaults serve all three SmolLM2 models; stories15m takes the sampler
+    # library and the loop guard from them
+    if uses_llm(cfg) or uses_llm_360m(cfg) or uses_vlm(cfg) or uses_stories(cfg):
         llm = cfg["smollm2"]
         argv += ["--llm-lib", llm["lib"], "--llm-tokenizer", f"{d}/smollm2/tokenizer.json",
                  "--llm-sampler-lib", f"{d}/lib/libsampler.so", "--llm-context", str(llm["context"]),
@@ -748,6 +774,16 @@ def server_argv(cfg: dict) -> List[str]:
             argv += ["--llm-360m-weights", l360["weights_dir"]]
         if l360.get("model_id"):
             argv += ["--llm-360m-model-id", l360["model_id"]]
+    if uses_stories(cfg):
+        sto = cfg["stories15m"]
+        argv += ["--stories-lib", sto["lib"], "--stories-tokenizer", f"{d}/stories15m/tokenizer.json",
+                 "--stories-cma-mb", str(sto["cma_mb"]), "--stories-temperature",
+                 str(sto["temperature"]), "--stories-top-p", str(sto["top_p"]),
+                 "--stories-reserve", str(sto["reserve"])]
+        if sto.get("weights_dir"):
+            argv += ["--stories-weights", sto["weights_dir"]]
+        if sto.get("model_id"):
+            argv += ["--stories-model-id", sto["model_id"]]
     if uses_vlm(cfg):
         vlm = cfg["smolvlm"]
         argv += ["--vlm-lib", vlm["lib"], "--vlm-tokenizer", f"{d}/smolvlm/tokenizer.json",
@@ -982,6 +1018,10 @@ def print_ready(cfg: dict, h: dict) -> None:
     for m in h["models"]:
         if m["id"].startswith("smollm2-"):
             print(f"                      python3 demo/chat/chat.py --url {url} --model {m['id']}")
+        if m["id"] == "stories15m":
+            print(f"                      curl {url}/completions -H 'Content-Type: application/json' "
+                  f"-d '{{\"model\": \"stories15m\", \"prompt\": \"Once upon a time\", "
+                  f"\"max_tokens\": 200}}'")
         if m.get("type") == "speech":
             print(f"                      curl {url}/audio/speech -H 'Content-Type: application/json' "
                   f"-d '{{\"model\": \"{m['id']}\", \"input\": \"Hello from the FPGA.\"}}' -o hello.wav")

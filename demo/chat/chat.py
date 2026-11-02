@@ -186,9 +186,18 @@ def transcribe(args, path):
 def model_types(args):
     """{id: "chat" | "speech" | "transcription"} of the server's models, in its
     order (the kv260 extension of /v1/models; a server without it: every
-    model a chat model)."""
+    model a chat model).  The base models among them (kv260 "completions":
+    stories15m) go to args.base_models."""
     with call(args, "/models") as r:
-        return {m["id"]: (m.get("kv260") or {}).get("type", "chat") for m in json.load(r)["data"]}
+        data = json.load(r)["data"]
+    args.base_models = {m["id"] for m in data if (m.get("kv260") or {}).get("completions")}
+    return {m["id"]: (m.get("kv260") or {}).get("type", "chat") for m in data}
+
+
+def base_model_note(name):
+    return (f"{name} writes children's stories: type how one begins (\"Lily found a red ball.\") "
+            f"or ask for one (\"Write a story about a cat\"); each message starts a new story, "
+            f"\"continue\" goes on with the last one")
 
 
 def models(args):
@@ -212,7 +221,7 @@ def use_model(args, name, types):
         return (f"{name} is a speech-to-text model: /listen uses it"
                 + (f"; answers come from {args.model}" if args.model else ""))
     args.model = name
-    return None
+    return base_model_note(name) if name in getattr(args, "base_models", ()) else None
 
 
 def model_list(types, current):
@@ -544,6 +553,8 @@ def main(argv=None):
         note = use_model(args, wanted, types)
     elif not args.model:
         args.model = chat_models[0] if chat_models else None
+    if note is None and args.model in getattr(args, "base_models", ()):
+        note = base_model_note(args.model)
     history = []
 
     def convo():
