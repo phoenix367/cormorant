@@ -100,10 +100,11 @@ Then add `"stories15m"` to `server.backends` in `chat_config.json` and run
 `cma_mb` 50 (the pool is 34.8 MiB), `temperature` 0.8, `top_p` 0.9,
 `reserve` 128.
 
-**The tokenizer** on the board is `llama_tokenizer.py`, the Llama-2
-SentencePiece pipeline of the checkpoint's `tokenizer.json` in pure Python;
+**The tokenizer** on the board is `hf_tokenizer.py` (imported as
+`llama_tokenizer.py`), which runs the checkpoint's `tokenizer.json` — the
+Llama-2 SentencePiece pipeline — in pure Python;
 `scripts/validate_text.py --model stories15m` checks it against
-`tokenizers` (3044 strings and 2000 id sequences identical) and writes the
+`tokenizers` (3928 strings and 2000 id sequences identical) and writes the
 fixture of the unit tests.
 
 **Gates** before serving, as for any generative model ([Development](DEVELOPMENT.md)):

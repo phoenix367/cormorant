@@ -35,6 +35,12 @@
 #  define LLM_IMAGE_TOKENS 0
 #endif
 
+#ifndef LLM_SINK_TOKEN                /* a glue header from before the sink export */
+#  define LLM_SINK_TOKEN (-1)
+#endif
+#ifndef LLM_POLICY
+#  define LLM_POLICY ""
+#endif
 #ifndef LLM_API_WEIGHTS_DIR
 #  define LLM_API_WEIGHTS_DIR "."
 #endif
@@ -159,6 +165,8 @@ int         llm_vocab_size(void)    { return LLM_VOCAB; }
 int         llm_context_size(void)  { return LLM_CONTEXT; }
 int         llm_position(void)      { return s_open ? s_pos : 0; }
 const char *llm_model_name(void)    { return LLM_MODEL_NAME; }
+int         llm_sink_token(void)    { return LLM_SINK_TOKEN; }
+const char *llm_policy(void)        { return LLM_POLICY; }
 const char *llm_weights_dir(void)   { return LLM_API_WEIGHTS_DIR; }
 int         llm_num_buckets(void)   { return (int)LLM_N_BUCKETS; }
 

@@ -30,6 +30,10 @@ Unseen models, step 1 (2026-11-02): a config, a tensor or an exponent the
 stack does not implement is refused instead of dropped; a checkpoint's names
 and profile (sink, end ids, context) come from its own files; the gates
 tokenize per model; the served libraries regenerate byte-identical (§28).
+Step 2 (2026-11-02): one tokenizer for every tokenizer.json, the checkpoint's
+own chat template, RoPE scaling / partial rotation / Granite / Phi-3 folded
+into the plain block (checked against transformers), any LLM served from a
+chat_config.json entry with no code (§29).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2640,3 +2644,123 @@ scaling); chat templates rendered from the checkpoint (Jinja) instead of
 `chatml()`; one tokenizer driven by tokenizer.json; a per-model serving
 descriptor with the library exporting its sink token, pool size and policy;
 the VLM scripts on the same pipeline.
+
+
+## 29. Unseen models, step 2 — generic tokenizer, templates, blocks, serving (2026-11-02)
+
+Step 1 (§28) made an unsupported checkpoint loud; step 2 makes as much as
+possible of what a new checkpoint brings work without code.
+
+**Tokenizer** (`demo/chat/hf_tokenizer.py`, the standard library only).  One
+interpreter of tokenizer.json's pipeline replaces the three hand-written
+tokenizers (SmolLM2's byte-level BPE, Llama-2's SentencePiece BPE,
+Moonshine's copy of it): normalizers (NFC / NFD / NFKC / NFKD, Lowercase,
+Strip, Prepend, Replace, Sequence), pre-tokenizers (ByteLevel, Split with its
+five behaviours — the Unicode classes of Qwen2's / Llama-3's regexes
+translated for Python's `re` from tables equal to the reference —, Digits,
+Metaspace, Sequence), BPE with byte fallback, `ignore_merges`, `fuse_unk`,
+added tokens with every flag, the decoders (ByteLevel, Replace, ByteFallback,
+Fuse, Strip, Metaspace, BPEDecoder, Sequence), TemplateProcessing and the
+other post-processors, an incremental decoder for streaming.  What it does
+not implement (WordPiece, Unigram, a precompiled normalizer, regex features
+`re` cannot express exactly) raises naming the part — `onboard_check.py`
+reports it.  `scripts/validate_text.py --all` compares it with `tokenizers`
+on SmolLM2-135M, SmolVLM-256M, stories15m, Moonshine base / tiny and six
+families fetched for it (`scripts/tokenizer_assets.json`: Qwen2.5-0.5B,
+TinyLlama-1.1B, Phi-3-mini, Llama-3.2-1B, Gemma-3-270M, Mistral-7B v0.1):
+about 4 000 strings each (ids with and without special tokens, decode, the
+incremental decoder) and 2 000 random id sequences — identical.  Encoding is
+as fast as the old modules or faster (SmolLM2, a 60 k-character text: 23.4 →
+21.5 ms warm; a 17-turn chat 1.5 → 1.0 ms).  `smollm2_tokenizer.py` /
+`llama_tokenizer.py` remain as aliases for older importers; the server uses
+`hf_tokenizer` alone.
+
+**Chat templates** (`demo/chat/chat_template.py`, jinja2).  The checkpoint's
+own template (`tokenizer_config.json`, `chat_template.jinja` or `.json`),
+rendered as transformers' `apply_chat_template` does — its sandboxed
+environment, `tojson`, `raise_exception`, `strftime_now`, `{% generation %}`,
+the special tokens as variables — and tokenized whole without added special
+tokens.  The study prompts with it (`chatml()` is gone from `llm_study.py`;
+the second turn is what the template writes after an answer), and so does
+the server (`chatml.py` stays only as the tests' hand-written SmolLM2
+reference; `idefics3.py` keeps SmolVLM's image prompts).  SmolLM2's 16 study
+conversations and the second turn render as before (HF = chatml = the new
+renderer); the board has Ubuntu's `python3-jinja2` 3.0.3.
+
+**The profile on the server** (`demo/chat/llm_profile.py`, from
+`scripts/llm_model.py`).  The sink is the special token every rendering
+starts with — two probe conversations, with and without a system message,
+must agree (the sink is precomputed for one token); the stop set is the
+end-of-generation ids plus every special token tokenizer_config.json names
+(SmolLM2: `<|endoftext|>`, `<|im_start|>`, `<|im_end|>` — the old fixed set;
+stories15m gains `<unk>`, SmolVLM `<|im_start|>`, tokens neither model emits
+in an answer).  `deploy.py` uploads the files it reads beside tokenizer.json.
+
+**Blocks** (`src/llm_arch.py`, `src/llm_weights.py`, `src/rope.py`; the study
+loads them by path).  Model types `llama`, `mistral` (a window no shorter
+than the context), `granite`, `phi3`, and both config formats of RoPE
+(`rope_theta` + `rope_scaling`, transformers 5's `rope_parameters`).  What
+they add over the plain block is folded into it, once, for the study and the
+frontend alike — `llm_weights.Prepared`, a read-through view of the
+checkpoint under the plain names:
+
+| extra | how |
+|---|---|
+| RoPE scaling linear / llama3 / dynamic / yarn / longrope | the inverse frequencies (`rope.inv_freq`; dynamic is the identity within the context, longrope's short factors) |
+| yarn / longrope attention factor | factor² on the rotated rows of W_q (the tables keep |cos|, |sin| ≤ 1 for the unit's int24 tables) |
+| partial rotation | q / k head dims permuted so the rotated pairs sit at (j, j + HD/2) and the pass-through pairs get cos 1, sin 0 (`rope.perm`, Moonshine's scheme) |
+| Granite's multipliers | embedding on the table, residual on W_o / W_down, attention ratio on W_q, 1 / logits_scaling on the head |
+| Phi-3's fused qkv_proj / gate_up_proj | split rows |
+| the LM head | the embedding when tied, else lm_head.weight (logits scaling folded) |
+
+`llm_study.py validate-arch` saves a tiny random checkpoint of each block
+with transformers (no download) and compares the study's float model with
+transformers' logits: llama, llama tied, linear, llama3, dynamic, yarn,
+mistral, granite, phi3, phi3 with partial rotation and longrope — all 10
+within float32 precision (max |diff| ≤ 1.8e-5 at |logit| ~6, every argmax
+equal; 7 s, a chat test runs it where `.venv-export` exists).  The frontend
+equals the study bit for bit on Granite, Phi-3 (fused, partial, longrope)
+and Llama-3 scaling, on the host path and with every row op and attention
+prep on the row-ops unit (`test_llama.py`).  Still refused (new numerics):
+biases (Qwen2), LayerNorm, a GELU MLP (Gemma), QK-norm, softcapping, a
+window shorter than the context.
+
+**The library** exports its sink token and policy (`llm_sink_token()`,
+`llm_policy()`; `LLM_SINK_TOKEN` / `LLM_POLICY` in `llm_glue.h`): the server
+refuses a library whose sink is not the template's first token (a library of
+another checkpoint) and takes the fingerprint from the policy
+(`kv260-smollm2-135m-pow2+sink+p12+vsmx+rowops+drope`).
+
+**Serving: a registry.**  `kv260_chat_server.py --llm-model
+NAME=DESCRIPTOR.json` (`{kind: chat | text | vlm, lib, tokenizer, weights,
+model_id, cma_mb, reserve, sampling}`) builds every LLM backend through one
+function; the four legacy flag groups make the same descriptors.  In
+`chat_config.json` any model generate_llm_project.py built is served with
+`"llm_models": {"<name>": {}}` and its name in `server.backends` — the kind
+from the checkpoint, the library and board names from the name, `cma_mb`
+from its project's pool (× 1.05 + 16, the shipped values within a few tens
+of MB); `deploy.py` uploads the tokenizer with its files to `<dir>/<tag>/`
+and the descriptor to `<dir>/models/<name>.json`, and checks the library,
+the tokenizer and `cma_mb` in its preflight.  Adding a model to the server
+was ~20 edits in 4 files (the 360M, 693cfb4) or a backend of its own (the
+stories, ~15 files); it is now one config entry.
+
+**Verification.**  The four libraries regenerate byte-identical through the
+new frontend (the view, the RoPE module) apart from the timestamps; with the
+exports only `llm_glue.h` and `llm_api.c` change.  `llm_calibrate.py check`
+REPRODUCED for SmolLM2-135M / 360M and stories15m.  On the board
+(2026-11-03, production bitstream): all four rebuilt libraries pass their
+gates — logits bit-exact (SmolLM2-135M, 360M and stories15m 4 × 33 vectors,
+SmolVLM 2 × 17), the library check (only `llm_*` exports, the two new ones
+among them; chunked prefill, threads, re-open identical) — and the deploy
+serves all seven models through descriptors, none dropped.  Through the API,
+the greedy answer to the study's "factual" prompt (37 tokens with SmolLM2's
+default system prompt, rendered by the board's Jinja 3.0.3) equals the
+study's `pow2+sink+p12` text for SmolLM2-135M and 360M; stories15m's greedy
+completion is the one of §27; SmolVLM describes an image.  The 360M's gate
+reference (`gate2.json`, 2026-09-28) predated the vsmx / rowops / drope
+policy: its second turn's greedy tokens differed from the board's (whose
+logits equal the simulation's); `llm_sched_check.py --save` regenerated it
+— 3 / 3 prompts and the second turn bit-exact, and only that entry changed.
+Tests: scheduler 1920, chat 334.
+

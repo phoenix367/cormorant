@@ -149,6 +149,13 @@ def ckpt():
     return _src("checkpoint")
 
 
+def weights():
+    """inference-scheduler/src/llm_weights.py: the plain block's view of a
+    checkpoint (fused projections, partial rotation, multipliers folded in) and,
+    as its .rope, src/rope.py — the frontend's own."""
+    return _src("llm_weights")
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 sys.path.insert(0, HERE)
@@ -157,7 +164,6 @@ from llm_model import CTX, DEFAULT_MODEL, ProfileError, default_assets, study_di
 
 
 # ------------------------------------------------------------------ data
-DEFAULT_SYSTEM = "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
 MAX_NEW = 128
 
 PARAGRAPH = (
@@ -194,24 +200,6 @@ CALIB_PROMPTS = [
     [{"role": "user", "content": "Write a haiku about winter."}],
     [{"role": "user", "content": "How do I reverse a list in Python?"}],
 ]
-
-
-def chatml(messages):
-    """SmolLM2's chat template (tokenizer_config.json), add_generation_prompt=True."""
-    s = ""
-    if messages[0]["role"] != "system":
-        s += "<|im_start|>system\n" + DEFAULT_SYSTEM + "<|im_end|>\n"
-    return s + "".join(_chatml_block(m) for m in messages) + "<|im_start|>assistant\n"
-
-
-def _chatml_block(m):
-    return "<|im_start|>" + m["role"] + "\n" + m["content"] + "<|im_end|>\n"
-
-
-def chatml_turn(messages):
-    """The next turn after a generated answer: the answer's <|im_end|>, the
-    messages and the generation prompt."""
-    return "<|im_end|>\n" + "".join(_chatml_block(m) for m in messages) + "<|im_start|>assistant\n"
 
 
 # A chat's second turn (the phase-5 gates, llm_project.second_turn_ids): appended
@@ -256,15 +244,13 @@ STORY_TEXTS = (("heldout_tinystories_valid.txt", 100, 48),    # (file, first row
 class Profile(llm_model.Profile):
     """llm_model.Profile (chat or text, sink, end-of-generation ids, context —
     from the checkpoint's files) plus what the study prompts and measures with.
-    "chat" (a ChatML template: SmolLM2): PROMPTS rendered by chatml, WikiText-2
-    texts.  "text" (no template: stories15m): story beginnings after the BOS,
+    "chat" (SmolLM2): PROMPTS rendered by the checkpoint's own chat template
+    (demo/chat/chat_template.py, as apply_chat_template), WikiText-2 texts.
+    "text" (no template: stories15m): story beginnings after the BOS,
     TinyStories texts joined by the BOS, as llama2.c trained the model."""
 
     def __init__(self, assets):
         super().__init__(assets)
-        if self.chat and not ("<|im_start|>" in self.template and "<|im_end|>" in self.template):
-            raise ProfileError(f"{assets}: the chat template is not ChatML; the study renders "
-                               f"ChatML only (chatml)")
         self.prompts = PROMPTS if self.chat else STORY_PROMPTS
         self.texts = (("heldout_wikitext2_test.txt", "calib_wikitext2_valid.txt") if self.chat
                       else tuple(n for n, _, _ in STORY_TEXTS))
@@ -274,14 +260,17 @@ class Profile(llm_model.Profile):
         chat rendering as it is (the template writes every special token, so
         none is added: Llama-family templates contain the BOS), a text after
         the BOS."""
-        ids = (tok.plain(chatml(p)) if self.chat
+        ids = (tok.plain(self.chat_template.render(p)) if self.chat
                else np.concatenate([[self.sink], tok.plain(p)]).astype(np.int64))
         assert ids[0] == self.sink, f"the prompt must start with token {self.sink} (the sink)"
         return ids
 
     def second_turn_ids(self, tok):
-        """A second turn's token ids (SECOND_TURN / STORY_SECOND), no sink."""
-        return tok.plain(chatml_turn(SECOND_TURN) if self.chat else STORY_SECOND)
+        """A second turn's token ids, no sink: what the template writes after an
+        answer to the first prompt up to SECOND_TURN's generation prompt; a text
+        profile's STORY_SECOND."""
+        return tok.plain(self.chat_template.turn(self.prompts[0][1], SECOND_TURN) if self.chat
+                         else STORY_SECOND)
 
     def heldout_ids(self, tok, assets, name):
         """The held-out / calibration token stream (no sink): WikiText as it is;
@@ -379,15 +368,17 @@ class Cfg:
         self.L, self.D, self.H, self.KV, self.HD = a.L, a.D, a.H, a.KV, a.HD
         self.F, self.V, self.eps, self.theta = a.FF, a.V, a.eps, a.theta
         self.tied, self.max_pos = a.tied, a.max_pos
+        # what llm_weights / rope fold into the plain block (llm_arch.LlamaConfig)
+        self.rot, self.rope_scaling, self.window = a.rot, a.rope_scaling, a.window
+        self.emb_mult, self.res_mult, self.attn_mult, self.logit_div = (a.emb_mult, a.res_mult,
+                                                                          a.attn_mult, a.logit_div)
 
 
 def rope_tables(cfg, n):
-    """float32 cos / sin [n, HD] (the host RoPE tables; HF's float32 math up to 1 ulp)."""
-    half = cfg.HD // 2
-    inv = np.array([1.0 / (cfg.theta ** (2 * j / cfg.HD)) for j in range(half)], np.float64).astype(np.float32)
-    ang = (np.arange(n, dtype=np.float32)[:, None] * inv[None, :]).astype(np.float32)   # float32 multiply
-    c = np.vectorize(math.cos, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
-    s = np.vectorize(math.sin, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
+    """float32 cos / sin [n, HD] (the host RoPE tables; HF's float32 math up to 1 ulp):
+    src/rope.py's half tables (scaling, partial rotation) for both halves."""
+    lw = weights()
+    c, s = lw.rope.half_tables(lw.rope_spec(cfg), n)
     return (np.concatenate([c, c], 1).astype(np.float64), np.concatenate([s, s], 1).astype(np.float64))
 
 
@@ -472,13 +463,10 @@ LINEARS = {"q": ("self_attn.q_proj", "x", "q0"), "k": ("self_attn.k_proj", "x", 
 
 
 def lm_weight(W, cfg):
-    """The LM head as Hugging Face builds it: the embedding when tied (a stored
-    lm_head is ignored), else lm_head.weight (src/llama.py lm_weight)."""
-    if getattr(cfg, "tied", True):
-        return W["model.embed_tokens.weight"]
-    if "lm_head.weight" not in W:
-        raise ValueError("tie_word_embeddings is false but the checkpoint has no lm_head.weight")
-    return W["lm_head.weight"]
+    """The LM head as Hugging Face builds it (llm_weights.Prepared): the embedding
+    when tied (a stored lm_head is ignored), else lm_head.weight; logits_scaling
+    folded in."""
+    return weights().prepare(cfg, W)["lm_head.weight"]
 
 
 def p2(e):
@@ -533,6 +521,7 @@ class Model:
         self.sink_model = sink_model
         self._sink = {}
         self.record_ch = record_ch
+        W = weights().prepare(cfg, W)       # the plain block's tensors, as the frontend reads them
         L, H, KV = cfg.L, cfg.H, cfg.KV
         self.grp = np.arange(H) // (H // KV)
         self.cos, self.sin = cos_sin if cos_sin is not None else rope_tables(cfg, 2 * CTX)
@@ -1057,6 +1046,7 @@ def make_formats(pol, ch, W, cfg):
     "s" per head)."""
     if not pol or not pol.get("fmt"):
         return {}
+    W = weights().prepare(cfg, W)
     kind, per_tensor = pol["fmt"], pol.get("per_tensor", False)
     L, H, KV, HD = cfg.L, cfg.H, cfg.KV, cfg.HD
     grp = np.arange(H) // (H // KV)
@@ -1129,7 +1119,7 @@ def load_all(assets):
     """(Cfg, the checkpoint's tensors) — a read-recording view: the first float
     Model checks that it used every tensor."""
     cfg = Cfg(assets)
-    return cfg, ckpt().Tracked(load_safetensors(assets))
+    return cfg, weights().prepare(cfg, ckpt().Tracked(load_safetensors(assets)))
 
 
 def build_data(assets, tok, quick, prof=None):
@@ -1488,6 +1478,80 @@ def cmd_validate(args):
     print(f"max |logit diff| {worst:.2e}")
 
 
+# ------------------------------------------------------------------ the blocks vs transformers
+# Tiny random checkpoints of every block llm_arch.py / llm_weights.py / rope.py implement:
+# (transformers config class, its extra keys).  `validate-arch` saves each with
+# transformers and compares this study's float model with transformers' own.
+TINY_ARCH = dict(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
+                 num_key_value_heads=2, vocab_size=96, max_position_embeddings=2048, rms_norm_eps=1e-5,
+                 rope_theta=10000.0, initializer_range=0.2)        # logits far from uniform
+ARCH_CASES = {
+    "llama":            ("LlamaConfig", {}),
+    "llama-tied":       ("LlamaConfig", {"tie_word_embeddings": True}),
+    "llama-linear":     ("LlamaConfig", {"rope_scaling": {"rope_type": "linear", "factor": 4.0}}),
+    "llama-llama3":     ("LlamaConfig", {"rope_scaling": {"rope_type": "llama3", "factor": 8.0,
+                                                          "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                                                          "original_max_position_embeddings": 64}}),
+    "llama-dynamic":    ("LlamaConfig", {"rope_scaling": {"rope_type": "dynamic", "factor": 2.0}}),
+    "llama-yarn":       ("LlamaConfig", {"rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                                                          "original_max_position_embeddings": 512}}),
+    "mistral":          ("MistralConfig", {"sliding_window": 4096, "head_dim": 16}),
+    "granite":          ("GraniteConfig", {"embedding_multiplier": 12.0, "residual_multiplier": 0.22,
+                                           "attention_multiplier": 0.05, "logits_scaling": 8.0}),
+    "phi3":             ("Phi3Config", {"pad_token_id": 0}),
+    "phi3-partial-longrope": ("Phi3Config", {
+        "pad_token_id": 0, "partial_rotary_factor": 0.75, "original_max_position_embeddings": 512,
+        "rope_scaling": {"type": "longrope", "short_factor": [1.0, 1.1, 1.3, 1.6, 2.0, 2.5],
+                         "long_factor": [2.0] * 6}}),
+}
+
+
+def cmd_validate_arch(args):
+    """Every ARCH_CASES block: a tiny random checkpoint saved by transformers,
+    parsed by llm_arch (no problem), read whole by llm_weights (check_consumed),
+    this study's float64 model's logits against transformers' float32 ones on
+    a random sequence; exit 1 on a mismatch."""
+    import tempfile
+    import torch
+    import transformers
+    torch.set_num_threads(min(8, os.cpu_count() or 1))
+    names = args.cases.split(",") if args.cases else list(ARCH_CASES)
+    bad = []
+    with tempfile.TemporaryDirectory() as td:
+        for name in names:
+            cls, extra = ARCH_CASES[name]
+            conf = getattr(transformers, cls)(**{**TINY_ARCH, **extra})
+            torch.manual_seed(0)
+            hf = transformers.AutoModelForCausalLM.from_config(conf, attn_implementation="eager").float().eval()
+            with torch.no_grad():                      # norms off 1, so a wrong norm shows
+                for n_, p_ in hf.named_parameters():
+                    if n_.endswith("norm.weight"):
+                        p_.add_(torch.randn_like(p_) * 0.2)
+            d = os.path.join(td, name)
+            hf.save_pretrained(d)
+            try:
+                cfg, W = load_all(d)
+                fm = Model(W, cfg, None)
+            except Exception as e:                     # noqa: BLE001  (the guard, an unread tensor)
+                print(f"{name:24s} REFUSED: {e}")
+                bad.append(name)
+                continue
+            ids = np.random.default_rng(1).integers(0, cfg.V, 96)
+            with torch.no_grad():
+                tl = hf(torch.tensor(ids[None])).logits[0].double().numpy()
+            nl = teacher_forced(fm, ids)
+            d_max = float(np.abs(tl - nl).max())
+            agree = float((tl.argmax(-1) == nl.argmax(-1)).mean())
+            ok = d_max < 1e-4 * max(1.0, float(np.abs(tl).max())) and agree == 1.0
+            print(f"{name:24s} logits max|torch f32 - numpy f64| {d_max:.2e} (max|logit| "
+                  f"{np.abs(tl).max():.2f}), argmax agree {agree:.3f}  {'ok' if ok else 'MISMATCH'}")
+            if not ok:
+                bad.append(name)
+    if bad:
+        raise SystemExit(f"validate-arch: {', '.join(bad)} differ from transformers")
+    print(f"validate-arch: {len(names)}/{len(names)} blocks equal transformers")
+
+
 # ------------------------------------------------------------------ cost model
 def cmd_costs(args):
     cfg = Cfg(args.assets)
@@ -1517,7 +1581,9 @@ def cmd_costs(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("cmd", choices=["fetch", "validate", "study", "ablate", "formats", "costs"])
+    ap.add_argument("cmd", choices=["fetch", "validate", "validate-arch", "study", "ablate", "formats",
+                                    "costs"])
+    ap.add_argument("--cases", default=None, help="validate-arch: comma-separated ARCH_CASES (default all)")
     ap.add_argument("--base", default="pow2+sink+p12",
                     help="ablate: the policy whose formats are ablated; formats: the policy to export")
     ap.add_argument("--assets", default=default_assets())
@@ -1529,8 +1595,8 @@ def main():
                     help="held-out windows of the context's length (default: 3 x 1024 tokens)")
     ap.add_argument("--nogreedy", action="store_true", help="skip the policies' greedy generations")
     args = ap.parse_args()
-    {"fetch": cmd_fetch, "validate": cmd_validate, "study": cmd_study, "ablate": cmd_ablate,
-     "formats": cmd_formats, "costs": cmd_costs}[args.cmd](args)
+    {"fetch": cmd_fetch, "validate": cmd_validate, "validate-arch": cmd_validate_arch, "study": cmd_study,
+     "ablate": cmd_ablate, "formats": cmd_formats, "costs": cmd_costs}[args.cmd](args)
 
 
 if __name__ == "__main__":

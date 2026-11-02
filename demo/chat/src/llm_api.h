@@ -15,8 +15,9 @@
  * (llm_last_error() says why).  Not thread-safe: one call at a time — but
  * calls may come from different threads (no thread-local state).
  *
- * Position 0 of the cache is always <|im_start|> (the precomputed sink):
- * callers pass the conversation's token ids AFTER that leading token, and
+ * Position 0 of the cache is always the sink token (llm_sink_token(): the
+ * first token of every prompt, <|im_start|> for SmolLM2; its K / V rows are
+ * precomputed): callers pass the conversation's token ids AFTER it, and
  * reuse the cache across turns by llm_truncate() to the common prefix and
  * prefilling only the new tokens.  Logits are the LM head's output
  * converted from its fixed-point exponents to float.  No sampling here.
@@ -66,6 +67,8 @@ int         llm_image(const uint8_t *rgb);
 
 /* Extras (not in the §11 contract; used by llm_bench and diagnostics). */
 const char *llm_model_name(void);                /* e.g. "smollm2-135m-instruct" */
+int         llm_sink_token(void);                /* the token of position 0 (-1: not recorded) */
+const char *llm_policy(void);                    /* e.g. "pow2+sink+p12+vsmx+rowops+drope" */
 const char *llm_weights_dir(void);               /* INFERENCE_WEIGHTS_DIR of the build */
 int         llm_num_buckets(void);               /* prefill buckets (rows per call) ... */
 int         llm_bucket(int i);                   /* ... ascending */

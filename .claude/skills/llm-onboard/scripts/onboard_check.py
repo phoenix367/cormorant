@@ -10,9 +10,12 @@ assets directory (after `llm_calibrate.py add` / `fetch`).
 
 What llama_fit.py does not check, and where the path hard-codes SmolLM2:
   * tokenizer.json   the server's pure-Python tokenizer (demo/chat/
-                     smollm2_tokenizer.py) accepts SmolLM2's pipeline only
-                     (byte-level BPE, Digits(individual) + ByteLevel, no
-                     normalizer) and raises otherwise;
+                     hf_tokenizer.py) interprets the pipeline (BPE with the
+                     usual normalizers, pre-tokenizers, decoders and added
+                     tokens) and raises ValueError naming a part it does not
+                     support (a WordPiece / Unigram model, a Precompiled
+                     normalizer, ...); validate_text.py --assets checks a
+                     loaded one against `tokenizers`;
   * special ids      <|im_start|> = 1 is the attention sink everywhere
                      (llm_study.py sink_token 1 and held-out windows,
                      llm_sched_check.py's assert), <|im_end|> = 2 is
@@ -137,20 +140,15 @@ def main(argv=None) -> int:
         print(f"error: {tj.name} / {tcj.name} missing in {d}", file=sys.stderr)
         return 2
     sys.path.insert(0, str(CHAT))
-    from llama_tokenizer import Tokenizer as LlamaTokenizer        # noqa: E402  (stdlib only)
-    from smollm2_tokenizer import Tokenizer as Smollm2Tokenizer    # noqa: E402
-    tok, errs = None, []
-    for label, cls in (("SmolLM2's byte-level BPE (smollm2_tokenizer.py)", Smollm2Tokenizer),
-                       ("Llama-2's SentencePiece BPE (llama_tokenizer.py)", LlamaTokenizer)):
-        try:
-            tok = cls(str(tj))
-            reuse.append(f"tokenizer.json pipeline: {label}, {tok.vocab_size} tokens")
-            break
-        except ValueError as e:
-            errs.append(str(e))
-    if tok is None:
-        code.append(f"tokenizer.json: neither board tokenizer loads it ({'; '.join(errs)}) — the "
-                    f"server's tokenizer and its validation (validate_text.py) need the pipeline")
+    from hf_tokenizer import Tokenizer                             # noqa: E402  (stdlib only)
+    tok = None
+    try:
+        tok = Tokenizer(str(tj))
+        reuse.append(f"tokenizer.json pipeline: hf_tokenizer.py, {tok.vocab_size} tokens — check it "
+                     f"against `tokenizers`: $SPY demo/chat/scripts/validate_text.py --assets {d}")
+    except ValueError as e:
+        code.append(f"tokenizer.json: hf_tokenizer.py refuses it — {e}; the server's tokenizer "
+                    f"(demo/chat/hf_tokenizer.py) needs that part, validate_text.py its check")
     V = int(tc["vocab_size"])
     if tok is not None and tok.vocab_size > V:
         code.append(f"tokenizer size {tok.vocab_size} > config vocab_size {V}: ids beyond the "

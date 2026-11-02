@@ -16,11 +16,12 @@ host with inference-scheduler/.venv/bin/python).
   vocab    -> BERT's vocab.txt (the BERT config's inputs.vocab), downloaded
               first when missing (demo/bert_squad/scripts/fetch_assets.py)
   server   -> kv260_chat_server.py, chat_backend.py, bert_squad_backend.py,
-              squad_text.py, chat.py, vocab.txt, and the smollm2 side
-              (smollm2_backend.py, smollm2_tokenizer.py, chatml.py, sampler.py,
-              src/sampler.{c,h}; tokenizer.json -> <dir>/smollm2/,
-              <dir>/smollm2_360m/, <dir>/smolvlm/, <dir>/moonshine/,
-              <dir>/stories15m/; stories_backend.py, llama_tokenizer.py), the piper
+              squad_text.py, chat.py, vocab.txt, and the LLM side
+              (smollm2_backend.py, stories_backend.py, smolvlm_backend.py,
+              hf_tokenizer.py, chat_template.py, llm_profile.py, sampler.py,
+              src/sampler.{c,h}; each served model's tokenizer.json and the
+              files beside it -> <dir>/<tag>/, its descriptor ->
+              <dir>/models/<name>.json; moonshine's tokenizer -> <dir>/moonshine/), the piper
               side (piper_backend.py, piper_phonemize.py, piper_vits.py) and the
               moonshine side (moonshine_backend.py, speech_input.py) to <dir>
   sampler  -> cc -O2 -shared -fPIC src/sampler.c -> <dir>/lib/libsampler.so
@@ -125,12 +126,12 @@ UNIT = "kv260-chat"
 RPU_MARK = "/run/kv260-chat-rpu"           # rpu_up.sh started the R5 firmware (tmpfs: gone after a boot)
 SERVER_FILES = [CHAT / "kv260_chat_server.py", CHAT / "chat_backend.py",
                 CHAT / "bert_squad_backend.py", CHAT / "chat.py", BERT_SCRIPTS / "squad_text.py",
-                CHAT / "smollm2_backend.py", CHAT / "smollm2_tokenizer.py", CHAT / "chatml.py",
+                CHAT / "smollm2_backend.py",
+                CHAT / "chat_template.py", CHAT / "llm_profile.py", CHAT / "hf_tokenizer.py",
                 CHAT / "sampler.py", CHAT / "smolvlm_backend.py", CHAT / "idefics3.py",
                 CHAT / "vlm_image.py", CHAT / "piper_backend.py", CHAT / "piper_phonemize.py",
                 DEMO / "tts" / "scripts" / "piper_vits.py", CHAT / "moonshine_backend.py",
-                CHAT / "speech_input.py", CHAT / "fpga_load.py", CHAT / "stories_backend.py",
-                CHAT / "llama_tokenizer.py"]
+                CHAT / "speech_input.py", CHAT / "fpga_load.py", CHAT / "stories_backend.py"]
 SAMPLER_SRC = [CHAT / "src" / "sampler.c", CHAT / "src" / "sampler.h"]
 
 
@@ -242,22 +243,81 @@ def load_config(path: Optional[str]) -> dict:
 SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")    # kv260_chat_server.py
 SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
 STORIES = ("stories15m",)
+SMOLVLM = ("smolvlm", "smolvlm-256m-instruct")
+# The served LLMs' legacy config blocks: backend names -> (block, kind, board subdirectory,
+# the install command llm_board.py needs)
+LEGACY_LLM = ((SMOLLM2_135M, "smollm2", "chat", "smollm2", "llm_board.py --install-only"),
+              (SMOLLM2_360M, "smollm2_360m", "chat", "smollm2_360m",
+               "llm_board.py --project build/llm_project_smollm2_360m --install-only (CHAT_PLAN §20)"),
+              (STORIES, "stories15m", "text", "stories15m",
+               "llm_board.py --project build/llm_project_stories15m --install-only (CHAT_PLAN §27)"),
+              (SMOLVLM, "smolvlm", "vlm", "smolvlm", "llm_board.py --install-only (CHAT_PLAN §23)"))
 
 
-def uses_llm(cfg: dict) -> bool:
-    return any(b in SMOLLM2_135M for b in cfg["server"]["backends"])
+def cma_mb_of(pool_bytes: int) -> int:
+    """A model's cma_mb from its pool: the pool, buffers and a margin (the shipped
+    models' values follow it within a few tens of MB: 299 MiB -> 330, 35 -> 50)."""
+    return int(round(pool_bytes / 2**20 * 1.05 + 16))
 
 
-def uses_llm_360m(cfg: dict) -> bool:
-    return any(b in SMOLLM2_360M for b in cfg["server"]["backends"])
+def _llm_model_entry(cfg: dict, name: str, spec: dict) -> dict:
+    """llm_models.<name> of the config -> a served model: everything not given is
+    derived — its checkpoint directory (assets/<name>), the kind from it
+    (llm_profile.py: a chat template or not; a vision tower: vlm), the library
+    and the board names from the name (scripts/llm_model.py), cma_mb from the
+    generated project's pool (project.json)."""
+    sys.path.insert(0, str(CHAT / "scripts"))
+    import llm_model
+    assets = chat_path(spec.get("assets") or f"assets/{name}")
+    project = chat_path(spec["project"]) if spec.get("project") else Path(llm_model.project_dir(name))
+    kind = spec.get("kind")
+    if kind is None and (assets / "config.json").exists():
+        conf = json.loads((assets / "config.json").read_text())
+        kind = ("vlm" if "vision_config" in conf
+                else "chat" if llm_model.chat_template(str(assets)) else "text")
+    cma = spec.get("cma_mb")
+    if cma is None and (project / "project.json").exists():
+        cma = cma_mb_of(json.loads((project / "project.json").read_text())["pool_bytes"])
+    return {"backend": name, "kind": kind or "chat", "sub": llm_model.tag(name),
+            "lib": spec.get("lib") or llm_model.board_paths(name, cfg["remote"]["dir"])["lib"],
+            "weights_dir": spec.get("weights_dir"), "model_id": spec.get("model_id"),
+            "tokenizer": str(chat_path(spec["tokenizer"]) if spec.get("tokenizer") else assets / "tokenizer.json"),
+            "cma_mb": cma, "reserve": spec.get("reserve"), "sampling": spec.get("sampling") or {},
+            "install": f"llm_board.py --project {os.path.relpath(project, CHAT)} --install-only"}
 
 
-def uses_stories(cfg: dict) -> bool:
-    return any(b in STORIES for b in cfg["server"]["backends"])
+def llm_entries(cfg: dict) -> List[dict]:
+    """The served LLMs, in server.backends order: llm_models.<name> entries (any
+    model generate_llm_project.py built) and the legacy blocks (smollm2,
+    smollm2_360m, stories15m, smolvlm)."""
+    out, models = [], cfg.get("llm_models") or {}
+    for b in cfg["server"]["backends"]:
+        if b in models:
+            out.append(_llm_model_entry(cfg, b, models[b]))
+            continue
+        for names, key, kind, sub, install in LEGACY_LLM:
+            if b in names:
+                blk = cfg.get(key, {})
+                sampling = ({k: blk[k] for k in ("temperature", "top_p") if blk.get(k) is not None}
+                            if kind == "text" else {})
+                out.append({"backend": b, "kind": kind, "sub": sub, "lib": blk.get("lib"),
+                            "weights_dir": blk.get("weights_dir"), "model_id": blk.get("model_id"),
+                            "tokenizer": str(chat_path(blk["tokenizer"])) if blk.get("tokenizer") else None,
+                            "cma_mb": blk.get("cma_mb"), "sampling": sampling,
+                            "reserve": blk.get("reserve") if kind == "text" else None, "install": install})
+    return out
+
+
+def llm_descriptor(cfg: dict, e: dict) -> dict:
+    """The descriptor kv260_chat_server.py --llm-model reads (llm_backend)."""
+    d = cfg["remote"]["dir"]
+    return {"kind": e["kind"], "lib": e["lib"], "weights": e["weights_dir"],
+            "tokenizer": f"{d}/{e['sub']}/tokenizer.json", "model_id": e["model_id"],
+            "cma_mb": e["cma_mb"], "reserve": e["reserve"], "sampling": e["sampling"]}
 
 
 def uses_vlm(cfg: dict) -> bool:
-    return any(b in ("smolvlm", "smolvlm-256m-instruct") for b in cfg["server"]["backends"])
+    return any(e["kind"] == "vlm" for e in llm_entries(cfg))
 
 
 def uses_tts(cfg: dict) -> bool:
@@ -361,36 +421,24 @@ def preflight(session: RemoteSession, cfg: dict) -> bool:
     out, _, rc = session.exec("command -v cc || command -v gcc", timeout=15)
     print(f"    {_dim('info   ') if rc == 0 else _yellow('MISSING')} {'C compiler (libsampler.so)':<36} "
           f"{_dim(out.strip() or 'none: the server samples in Python (slower)')}")
-    for used, key, label, how in (
-            (uses_llm(cfg), "smollm2", "libsmollm2.so (smollm2)", "llm_board.py --install-only"),
-            (uses_llm_360m(cfg), "smollm2_360m", "libsmollm2_360m.so (smollm2-360m)",
-             "llm_board.py --project build/llm_project_smollm2_360m --install-only (CHAT_PLAN §20)"),
-            (uses_stories(cfg), "stories15m", "libstories15m.so (stories15m)",
-             "llm_board.py --project build/llm_project_stories15m --install-only (CHAT_PLAN §27)")):
-        if not used:
-            continue
-        lib = cfg[key]["lib"]
+    for e in llm_entries(cfg):
+        lib = e["lib"]
         _, _, rc = session.exec(f"test -f {shlex.quote(lib)}", timeout=15)
         good = rc == 0
+        label = f"{os.path.basename(lib)} ({e['backend']})"
         print(f"    {_green('OK     ') if good else _red('MISSING')} {label:<36} "
-              f"{_dim(lib if good else lib + ' - ' + how)}")
+              f"{_dim(lib if good else lib + ' - ' + e['install'])}")
         ok &= good
-        tok = chat_path(cfg[key]["tokenizer"])
-        good = tok.exists()
+        good = bool(e["tokenizer"]) and Path(e["tokenizer"]).exists()
         print(f"    {_green('OK     ') if good else _red('MISSING')} {'  tokenizer.json (host)':<36} "
-              f"{_dim(str(tok))}")
+              f"{_dim(str(e['tokenizer']))}")
+        ok &= good
+        good = e["cma_mb"] is not None
+        if not good:
+            print(f"    {_red('MISSING')} {'  cma_mb':<36} "
+                  f"{_dim('llm_models.' + e['backend'] + '.cma_mb, or generate its project first')}")
         ok &= good
     if uses_vlm(cfg):
-        lib = cfg["smolvlm"]["lib"]
-        _, _, rc = session.exec(f"test -f {shlex.quote(lib)}", timeout=15)
-        good = rc == 0
-        print(f"    {_green('OK     ') if good else _red('MISSING')} {'libsmolvlm_256m.so (smolvlm)':<36} "
-              f"{_dim(lib if good else lib + ' - llm_board.py --install-only (CHAT_PLAN §23)')}")
-        ok &= good
-        tok = chat_path(cfg["smolvlm"]["tokenizer"])
-        good = tok.exists()
-        print(f"    {_green('OK     ') if good else _red('MISSING')} {'SmolVLM tokenizer.json (host)':<36} {_dim(str(tok))}")
-        ok &= good
         out, _, rc = session.exec("python3 -c 'import PIL; print(PIL.__version__)'", timeout=30)
         good = rc == 0
         print(f"    {_green('OK     ') if good else _red('MISSING')} {'Pillow (image decoding)':<36} "
@@ -664,6 +712,25 @@ def ensure_vocab(cfg: dict) -> Path:
     return bert_common.ensure_asset("vocab", vocab_path(cfg))
 
 
+# Uploaded beside tokenizer.json when the checkpoint has them: the chat template and
+# the special tokens it is rendered with (chat_template.py), what llm_profile.py reads —
+# the end-of-generation ids, the BOS, the context
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+                   "chat_template.jinja", "chat_template.json", "generation_config.json",
+                   "config.json")
+
+
+def upload_tokenizer(sftp, tokenizer: Path, dest: str) -> int:
+    """tokenizer.json and the TOKENIZER_FILES beside it -> dest/; the number uploaded."""
+    n = 0
+    for name in TOKENIZER_FILES:
+        src = tokenizer if name == "tokenizer.json" else tokenizer.parent / name
+        if src.exists():
+            sftp.put(str(src), f"{dest}/{name}")
+            n += 1
+    return n
+
+
 def upload_server(session: RemoteSession, cfg: dict) -> bool:
     t0 = time.monotonic()
     d = cfg["remote"]["dir"]
@@ -690,27 +757,20 @@ def upload_server(session: RemoteSession, cfg: dict) -> bool:
     try:
         for p in SAMPLER_SRC:
             sftp.put(str(p), f"{d}/src/{p.name}")
-        if uses_llm(cfg):
-            session.exec_checked(f"mkdir -p {d}/smollm2", timeout=15)
-            sftp.put(str(chat_path(cfg["smollm2"]["tokenizer"])), f"{d}/smollm2/tokenizer.json")
-            extra = " + smollm2/tokenizer.json"
-        if uses_llm_360m(cfg):
-            session.exec_checked(f"mkdir -p {d}/smollm2_360m", timeout=15)
-            sftp.put(str(chat_path(cfg["smollm2_360m"]["tokenizer"])),
-                     f"{d}/smollm2_360m/tokenizer.json")
-            extra += " + smollm2_360m/tokenizer.json"
-        if uses_stories(cfg):
-            session.exec_checked(f"mkdir -p {d}/stories15m", timeout=15)
-            sftp.put(str(chat_path(cfg["stories15m"]["tokenizer"])), f"{d}/stories15m/tokenizer.json")
-            extra += " + stories15m/tokenizer.json"
-        if uses_vlm(cfg):
-            session.exec_checked(f"mkdir -p {d}/smolvlm", timeout=15)
-            sftp.put(str(chat_path(cfg["smolvlm"]["tokenizer"])), f"{d}/smolvlm/tokenizer.json")
-            extra += " + smolvlm/tokenizer.json"
+        entries = llm_entries(cfg)
+        if entries:
+            session.exec_checked(f"mkdir -p {d}/models", timeout=15)
+        for e in entries:
+            session.exec_checked(f"mkdir -p {d}/{e['sub']}", timeout=15)
+            n = upload_tokenizer(sftp, Path(e["tokenizer"]), f"{d}/{e['sub']}")
+            with sftp.open(f"{d}/models/{e['backend']}.json", "w") as f:
+                f.write(json.dumps(llm_descriptor(cfg, e), indent=1))
+            extra += f" + {e['sub']}/tokenizer.json" + (f" (+{n - 1})" if n > 1 else "") + \
+                f" + models/{e['backend']}.json"
         if uses_asr(cfg):
             session.exec_checked(f"mkdir -p {d}/moonshine", timeout=15)
-            sftp.put(str(chat_path(cfg["moonshine"]["tokenizer"])), f"{d}/moonshine/tokenizer.json")
-            extra += " + moonshine/tokenizer.json"
+            n = upload_tokenizer(sftp, chat_path(cfg["moonshine"]["tokenizer"]), f"{d}/moonshine")
+            extra += " + moonshine/tokenizer.json" + (f" (+{n - 1})" if n > 1 else "")
     finally:
         sftp.close()
     return step("server", True, t0, f"{len(SERVER_FILES)} files + vocab.txt + src/sampler.[ch]{extra} -> {d}")
@@ -746,52 +806,27 @@ def server_argv(cfg: dict) -> List[str]:
     for b in s["backends"]:
         argv += ["--backend", b]
     argv += ["--resident", str(s["resident"])]
-    # the sampling defaults serve all three SmolLM2 models; stories15m takes the sampler
-    # library and the loop guard from them
-    if uses_llm(cfg) or uses_llm_360m(cfg) or uses_vlm(cfg) or uses_stories(cfg):
-        llm = cfg["smollm2"]
-        argv += ["--llm-lib", llm["lib"], "--llm-tokenizer", f"{d}/smollm2/tokenizer.json",
-                 "--llm-sampler-lib", f"{d}/lib/libsampler.so", "--llm-context", str(llm["context"]),
-                 "--llm-reserve", str(llm["reserve"]), "--llm-temperature", str(llm["temperature"]),
-                 "--llm-top-p", str(llm["top_p"]), "--llm-top-k", str(llm["top_k"]),
-                 "--llm-repetition-penalty", str(llm["repetition_penalty"]),
-                 "--llm-dry-multiplier", str(llm["dry_multiplier"]),
-                 "--llm-dry-base", str(llm["dry_base"]),
-                 "--llm-dry-allowed-length", str(llm["dry_allowed_length"]),
-                 "--llm-dry-penalty-last-n", str(llm["dry_penalty_last_n"]),
-                 "--llm-dry-sequence-breakers", json.dumps(llm["dry_sequence_breakers"]),
-                 *([] if llm["loop_guard"] else ["--llm-no-loop-guard"]),
-                 "--llm-cma-mb", str(llm["cma_mb"])]
-        if llm.get("weights_dir"):
-            argv += ["--llm-weights", llm["weights_dir"]]
-        if llm.get("model_id"):
-            argv += ["--llm-model-id", llm["model_id"]]
-    if uses_llm_360m(cfg):
-        l360 = cfg["smollm2_360m"]
-        argv += ["--llm-360m-lib", l360["lib"], "--llm-360m-tokenizer",
-                 f"{d}/smollm2_360m/tokenizer.json", "--llm-360m-cma-mb", str(l360["cma_mb"])]
-        if l360.get("weights_dir"):
-            argv += ["--llm-360m-weights", l360["weights_dir"]]
-        if l360.get("model_id"):
-            argv += ["--llm-360m-model-id", l360["model_id"]]
-    if uses_stories(cfg):
-        sto = cfg["stories15m"]
-        argv += ["--stories-lib", sto["lib"], "--stories-tokenizer", f"{d}/stories15m/tokenizer.json",
-                 "--stories-cma-mb", str(sto["cma_mb"]), "--stories-temperature",
-                 str(sto["temperature"]), "--stories-top-p", str(sto["top_p"]),
-                 "--stories-reserve", str(sto["reserve"])]
-        if sto.get("weights_dir"):
-            argv += ["--stories-weights", sto["weights_dir"]]
-        if sto.get("model_id"):
-            argv += ["--stories-model-id", sto["model_id"]]
-    if uses_vlm(cfg):
-        vlm = cfg["smolvlm"]
-        argv += ["--vlm-lib", vlm["lib"], "--vlm-tokenizer", f"{d}/smolvlm/tokenizer.json",
-                 "--vlm-cma-mb", str(vlm["cma_mb"])]
-        if vlm.get("weights_dir"):
-            argv += ["--vlm-weights", vlm["weights_dir"]]
-        if vlm.get("model_id"):
-            argv += ["--vlm-model-id", vlm["model_id"]]
+    # every served LLM through its descriptor (llm_descriptor, uploaded with its tokenizer);
+    # the smollm2 block's sampling and context options are the chat models' defaults, the
+    # sampler library and the loop guard serve every LLM
+    entries = llm_entries(cfg)
+    if entries:
+        llm = cfg.get("smollm2", {})
+        argv += ["--llm-sampler-lib", f"{d}/lib/libsampler.so"]
+        for flag, key in (("--llm-context", "context"), ("--llm-reserve", "reserve"),
+                          ("--llm-temperature", "temperature"), ("--llm-top-p", "top_p"),
+                          ("--llm-top-k", "top_k"), ("--llm-repetition-penalty", "repetition_penalty"),
+                          ("--llm-dry-multiplier", "dry_multiplier"), ("--llm-dry-base", "dry_base"),
+                          ("--llm-dry-allowed-length", "dry_allowed_length"),
+                          ("--llm-dry-penalty-last-n", "dry_penalty_last_n")):
+            if llm.get(key) is not None:
+                argv += [flag, str(llm[key])]
+        if llm.get("dry_sequence_breakers") is not None:
+            argv += ["--llm-dry-sequence-breakers", json.dumps(llm["dry_sequence_breakers"])]
+        if llm.get("loop_guard") is False:
+            argv += ["--llm-no-loop-guard"]
+        for e in entries:
+            argv += ["--llm-model", f"{e['backend']}={d}/models/{e['backend']}.json"]
     if uses_tts(cfg):
         tts = cfg["piper"]
         argv += ["--tts-lib", tts["lib"], "--tts-weights", tts["weights_dir"],
@@ -1018,12 +1053,12 @@ def print_ready(cfg: dict, h: dict) -> None:
     print(f"    API key           {key}")
     print(f"    try               python3 demo/chat/chat.py --url {url} --doc some.txt")
     for m in h["models"]:
-        if m["id"].startswith("smollm2-"):
-            print(f"                      python3 demo/chat/chat.py --url {url} --model {m['id']}")
-        if m["id"] == "stories15m":
+        if m.get("completions"):                      # a base model: text completion
             print(f"                      curl {url}/completions -H 'Content-Type: application/json' "
-                  f"-d '{{\"model\": \"stories15m\", \"prompt\": \"Once upon a time\", "
+                  f"-d '{{\"model\": \"{m['id']}\", \"prompt\": \"Once upon a time\", "
                   f"\"max_tokens\": 200}}'")
+        elif m.get("type") == "chat" and m["id"] != "bert-squad":
+            print(f"                      python3 demo/chat/chat.py --url {url} --model {m['id']}")
         if m.get("type") == "speech":
             print(f"                      curl {url}/audio/speech -H 'Content-Type: application/json' "
                   f"-d '{{\"model\": \"{m['id']}\", \"input\": \"Hello from the FPGA.\"}}' -o hello.wav")

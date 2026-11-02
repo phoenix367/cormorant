@@ -21,10 +21,13 @@ demo/chat/
 ├── idefics3.py, vlm_image.py — SmolVLM's chat template with images; data URL -> 512 x 512 pixels (Pillow)
 ├── piper_backend.py         — text to speech: front end, libpiper_tts.so per chunk
 ├── piper_phonemize.py       — espeak-ng through ctypes -> Piper phoneme ids (+ ../tts/scripts/piper_vits.py)
-├── moonshine_backend.py     — speech to text: libmoonshine_<size>.so per part, the tokenizer.json detokenizer
+├── moonshine_backend.py     — speech to text: libmoonshine_<size>.so per part, detokenizing with hf_tokenizer.py
 ├── speech_input.py          — uploads -> 16 kHz mono int16 (WAV here, a windowed-sinc resampler; ffmpeg otherwise)
-├── smollm2_tokenizer.py     — SmolLM2's byte-level BPE (tokenizer.json) + incremental detokenizer
-├── llama_tokenizer.py       — the Llama-2 SentencePiece BPE (stories15m's tokenizer.json) + detokenizer
+├── hf_tokenizer.py          — every model's tokenizer: the tokenizer.json pipeline as `tokenizers` runs it
+│                              (BPE; normalizers, pre-tokenizers, added tokens, decoders, post-processor;
+│                              Oniguruma regexes as Python re with Unicode 16 tables) + incremental decoder
+├── smollm2_tokenizer.py, llama_tokenizer.py — hf_tokenizer.py under the names the SmolLM2 / stories backends
+│                              import (BOS / EOS fallbacks <|im_start|> / <|im_end|>, <s> / </s>)
 ├── chatml.py                — SmolLM2's ChatML template, block-wise tokenizing, history trimming
 ├── sampler.py, src/sampler.{c,h} — sampling (libsampler.so; pure-Python fallback, same tokens)
 ├── chat.py                  — stdlib REPL / one-shot client
@@ -52,10 +55,11 @@ demo/chat/
 │   ├── vlm_project.py, vlm_sched_check.py, vlm_host_emu.py — SmolVLM entries, gate (sim == study), C on the host
 │   ├── vlm_template_fixture.py — tests/data/smolvlm_cases.json (template ids, image pixels; .venv-export)
 │   ├── vlm_study_inputs.json — its pinned checkpoint revision, file and COCO image hashes
-│   └── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export;
-│                              validate_text.py --model stories15m: the Llama tokenizer vs tokenizers)
+│   ├── validate_text.py, e2e_check.py — tokenizer / template / greedy answers vs transformers (.venv-export;
+│   │                          --model stories15m / --assets DIR / --all: hf_tokenizer.py vs tokenizers)
+│   └── tokenizer_assets.json — the tokenizers of other families validate_text.py --all checks (revision + SHA-256)
 ├── doc/                     — these guides
-├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/
+├── assets/                  — not in git: <model>/ (Hugging Face checkpoint, texts), study/, tokenizers/<name>/
 └── tests/                   — unittest: protocol, text modules, sampler, backends, fakes; board_gate.py
 ```
 
@@ -124,7 +128,7 @@ transcript); see `moonshine_backend.py`.
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 299 tests, ~45 s
+python3 -m unittest -v                  # 334 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 
@@ -142,6 +146,8 @@ About 70 tests skip until their assets are present:
 - the SmolLM2 tokenizer: `scripts/llm_calibrate.py fetch`;
 - the SmolVLM tokenizer: `scripts/vlm_study.py fetch`;
 - the stories15m tokenizer: `scripts/llm_calibrate.py fetch stories15m`;
+- the tokenizers of other model families (Qwen2.5, TinyLlama, Phi-3,
+  Llama-3.2, Gemma-3, Mistral): `scripts/validate_text.py --fetch`;
 - BERT's `vocab.txt`: `../bert_squad/scripts/fetch_assets.py vocab`.
 
 **What each test module covers.**
@@ -165,6 +171,21 @@ Document Q&A:
   that replaying the demo's board logits gives the demo's spans.
 
 Generative chat:
+- `test_hf_tokenizer.py` — `hf_tokenizer.py`, the tokenizer of every model.
+  - Each pipeline part on small synthetic `tokenizer.json` dicts, with the
+    values the `tokenizers` library gives for them: the Oniguruma → `re`
+    translation (Qwen2 / Llama-3 split patterns, case folding, Unicode 16
+    classes, empty matches), the normalizers (NFC / NFKC with the
+    reference's Unicode 9 data, Lowercase), every Split behaviour,
+    ByteLevel, Digits, Metaspace, BPE options (byte fallback, unk fusing,
+    `ignore_merges`, subword prefix / suffix), added-token flags and ids,
+    the decoders and the incremental decoder under every split, the
+    post-processors.
+  - Every unsupported part raises `ValueError` naming it; the Unicode
+    tables agree with `unicodedata`; the compatibility shims.
+  - The tokenizers of other families (`validate_text.py --fetch`) against
+    the reference ids in `tests/data/hf_tokenizer_cases.json`
+    (`validate_text.py --all --write-fixture`).
 - `test_smollm2_text.py` — the tokenizer, the detokenizer and trimming.
   - Tokenizer ids and decoding against 500 transformers-tokenized strings
     and 34 template conversations (`tests/data/smollm2_text_cases.json`,
@@ -193,7 +214,7 @@ Generative chat:
     server's default;
   - residency: `one` / `auto` / `all` switching between `bert-squad` and
     `smollm2`, with fake engines and a fake CMA pool.
-- `test_stories_backend.py` — stories15m: the Llama tokenizer against 520
+- `test_stories_backend.py` — stories15m: its tokenizer against 520
   `tokenizers`-tokenized strings (`tests/data/stories15m_text_cases.json`,
   `validate_text.py --model stories15m --write-fixture`), special tokens,
   the continuation detokenizer; the story a conversation tells; the backend
@@ -291,6 +312,9 @@ from the repo root:
 PY=.venv-export/bin/python
 $PY demo/chat/scripts/validate_text.py  # tokenizer on 2960 strings, decode, 34 chat templates
 $PY demo/chat/scripts/e2e_check.py      # chat.py -> server (--llm-fake float) == HF greedy, 9 answers
+$PY demo/chat/scripts/validate_text.py --fetch   # the pinned tokenizers of other families
+$PY demo/chat/scripts/validate_text.py --all     # hf_tokenizer.py vs tokenizers: every tokenizer, regexes, parts
+$PY demo/chat/scripts/validate_text.py --assets demo/chat/assets/<model>   # a new checkpoint's tokenizer
 ```
 
 **Tokenizer reference.**  `validate_text.py` compares against transformers'
@@ -304,3 +328,26 @@ that **drops tokenizer.json's `Digits` pre-tokenizer**.  It differs on 249
 of the strings, all of them explained by that: a numeral after two or more
 whitespace characters (e.g. `"  1"` → `Ġ Ġ 1` instead of `ĠĠ 1`), or
 non-ASCII numerals.  `e2e_check.py` uses the faithful pipeline.
+
+**Every tokenizer.**  `validate_text.py --all` checks `hf_tokenizer.py`
+against the `tokenizers` library (0.23) for SmolLM2-135M, SmolVLM-256M,
+stories15m, Moonshine base / tiny and the tokenizers pinned in
+`scripts/tokenizer_assets.json` (Qwen2.5-0.5B, TinyLlama-1.1B, Phi-3-mini,
+Llama-3.2-1B, Gemma-3-270M, Mistral-7B v0.1; `--fetch` downloads only their
+tokenizer files into `assets/tokenizers/`): on ~4 000 strings each (the
+corpus above, a Unicode corpus — combining sequences, NFC / NFKC and
+case-sensitive characters, every script's digits, Unicode 16 / 17
+letters, invisible and bidi characters, emoji, CJK — and each tokenizer's
+added tokens in context) the ids with and without special tokens and with
+special-token strings as text, decode with and without special tokens, the
+incremental decoder token by token and split in two, and decoding as a
+continuation are identical; so are 2000 random id sequences each.  `--regex`
+(also in `--all`) splits the corpus and one string of every code point with
+the GPT-2, Qwen2, Llama-3 and GPT-4o patterns and patterns using every
+other class: identical to `tokenizers`' Split.  `--synthetic` runs each
+supported pipeline part on small `tokenizer.json` dicts.
+
+One difference is deliberate: `decode(skip_special_tokens=True)` skips the
+special tokens by id.  `tokenizers` compares their decoded string, so a
+special token the normalizer changes (stories15m's `"▁<s>"`) stays in its
+output; the check counts those decodes separately.

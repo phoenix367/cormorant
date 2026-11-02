@@ -56,7 +56,6 @@ Decode attention (``decode_attn``, with prefill_attn "fpga"):
 from __future__ import annotations
 
 import json
-import math
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -66,9 +65,11 @@ import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 from . import numeric
+from . import rope
 from .checkpoint import LazySafetensors, load_safetensors
 from .llm_arch import LlamaConfig
 from .llm_nodes import LLM_DOMAIN
+from .llm_weights import prepare, rope_spec
 
 # The shift of the kernels' output (floor(acc / 2^F)); ap_fixed<16,8>.
 F = 8
@@ -80,16 +81,11 @@ RES_BITS = 15           # the int32 DMA residual's exponent (rowops; HOSTOPS_PLA
 # ------------------------------------------------------------------ #
 
 def rope_tables(cfg: LlamaConfig, n: int):
-    """float32 cos / sin [n][HD/2] exactly as llm_study.rope_tables:
-    inv_j = float32(1 / theta^(2j/HD)), a = float32(float32(pos) * inv_j),
-    cos = float32(cos(double(a))) (libm)."""
-    half = cfg.HD // 2
-    inv = np.array([1.0 / (cfg.theta ** (2 * j / cfg.HD)) for j in range(half)],
-                   np.float64).astype(np.float32)
-    ang = (np.arange(n, dtype=np.float32)[:, None] * inv[None, :]).astype(np.float32)
-    c = np.vectorize(math.cos, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
-    s = np.vectorize(math.sin, otypes=[np.float64])(ang.astype(np.float64)).astype(np.float32)
-    return c, s
+    """float32 cos / sin [n][HD/2] as llm_study.rope_tables (src/rope.py:
+    inv_j = float32(1 / theta^(2j/HD)) or its scaling, a = float32(float32(pos)
+    * inv_j), cos = float32(cos(double(a))) (libm); partial rotation's
+    pass-through pairs cos 1, sin 0)."""
+    return rope.half_tables(rope_spec(cfg), n)
 
 
 # The linears: (key, file name, input class, output class) — llm_study.LINEARS
@@ -211,9 +207,14 @@ class LlamaFrontend:
         self.image_rows = int(image_rows)
         self.image_state = image_state
         self.cfg = cfg
-        self.W = weights
+        # the plain block's tensors: fused projections split, partial rotation's q / k
+        # permutation and the multipliers folded in (src/llm_weights.py, the study's too)
+        self.W = prepare(cfg, weights)
         self.fmt = formats
         self.C = int(ctx)
+        if cfg.window is not None and cfg.window < self.C:
+            raise ValueError(f"sliding window {cfg.window} < context {self.C}: windowed attention "
+                             f"is not implemented")
         self.name = name
         if prefill_attn not in ("fpga", "host"):
             raise ValueError(f"prefill_attn must be 'fpga' or 'host', got {prefill_attn!r}")
@@ -246,12 +247,8 @@ class LlamaFrontend:
         return self.W[f"model.layers.{li}.{fname}.weight"]
 
     def lm_weight(self) -> np.ndarray:
-        """The LM head as Hugging Face builds it: the embedding when tied (a
-        stored lm_head is then ignored), else lm_head.weight, which must exist."""
-        if self.cfg.tied:
-            return self.W["model.embed_tokens.weight"]
-        if "lm_head.weight" not in self.W:
-            raise ValueError("tie_word_embeddings is false but the checkpoint has no lm_head.weight")
+        """The LM head as Hugging Face builds it (llm_weights.Prepared): the
+        embedding when tied, else lm_head.weight; logits_scaling folded in."""
         return self.W["lm_head.weight"]
 
     def _cache_init(self, li: int, which: str) -> np.ndarray:

@@ -378,21 +378,26 @@ class TestLibraryChecks(unittest.TestCase):
         self.assertEqual(b.ctx, 96)
 
     def test_end_of_generation_ids(self):
+        """The stop ids are the tokenizer directory's (llm_profile.Profile.stop_ids):
+        SmolLM2's <|im_end|> and every special token its tokenizer_config.json
+        names; a directory that names no end token is refused, not served with
+        answers that end only at max_tokens."""
         t = tok()
         b = backend(ScriptedEngine(t.encode("x")))
         self.assertEqual(b.eog, {t.special[n] for n in ("<|im_end|>", "<|endoftext|>", "<|im_start|>")})
-
-        class Other(Smollm2Backend):
-            eog_tokens = ("<|im_end|>", "<|eot_id|>")   # a missing name is skipped
-        b = Other(ScriptedEngine(), TOKENIZER, sampler_lib="/nonexistent")
-        b.load_host()
-        self.assertEqual(b.eog, {t.special["<|im_end|>"]})
-        Other.eog_tokens = ("<|eot_id|>", "<|end|>")    # none of them: refused, not an endless answer
-        b = Other(ScriptedEngine(), TOKENIZER, sampler_lib="/nonexistent")
-        with self.assertRaises(RuntimeError) as cm:
-            b.load_host()
-        self.assertIn("end-of-generation tokens <|eot_id|>, <|end|>", str(cm.exception))
-        self.assertIsNone(b.tok)
+        self.assertEqual(b.bos, t.special["<|im_start|>"])
+        import shutil
+        import llm_profile
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(TOKENIZER, d)
+            tcfg = json.load(open(os.path.join(os.path.dirname(TOKENIZER), "tokenizer_config.json")))
+            with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
+                json.dump({"chat_template": tcfg["chat_template"]}, f)
+            b = Smollm2Backend(ScriptedEngine(), os.path.join(d, "tokenizer.json"), sampler_lib="/nonexistent")
+            with self.assertRaises(llm_profile.ProfileError) as cm:
+                b.load_host()
+            self.assertIn("no end-of-generation token", str(cm.exception))
+            self.assertIsNone(b.tok)
 
 
 @unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
@@ -645,6 +650,22 @@ class TestHTTP(SchemaMixin, unittest.TestCase):
 @unittest.skipUnless(HAVE and fake_llm_lib(), "tokenizer or C compiler missing")
 class TestCtypesEngine(unittest.TestCase):
     """LibLlmEngine (the real ctypes binding) over tests/fake_libsmollm2.c."""
+
+    def test_sink_and_policy_exports(self):
+        """llm_sink_token() must be the tokenizer's first prompt token (a library
+        of another checkpoint is refused); llm_policy() names the fingerprint."""
+        b = Smollm2Backend(LibLlmEngine(fake_llm_lib(sink=1), self.dir), TOKENIZER,
+                           sampler_lib="/nonexistent")
+        b.load_host()
+        self.assertEqual((b.lib_sink, b.bos, b.fingerprint), (1, 1, "kv260-smollm2-135m-fake"))
+        b = Smollm2Backend(LibLlmEngine(fake_llm_lib(sink=7), self.dir), TOKENIZER,
+                           sampler_lib="/nonexistent")
+        with self.assertRaises(RuntimeError) as cm:
+            b.load_host()
+        self.assertIn("sink token is 7", str(cm.exception))
+        b = Smollm2Backend(LibLlmEngine(fake_llm_lib(), self.dir), TOKENIZER,   # a library from before
+                           sampler_lib="/nonexistent")                          # the export
+        self.assertEqual((b.lib_sink, b.fingerprint), (None, "kv260-smollm2-135m-pow2+sink+p12"))
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="fakellm_")

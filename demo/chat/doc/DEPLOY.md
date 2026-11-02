@@ -203,7 +203,27 @@ first one is the default model.
 | `piper` | `lib/libpiper_tts.so`, `/root/piper_weights`, numpy, `libespeak-ng1` (ffmpeg for mp3 / opus / aac / flac) | [`tts_board.py --install-only`](TEXT_TO_SPEECH.md#install) | `piper` |
 | `moonshine` | `lib/libmoonshine_base.so`, `/root/moonshine_base_weights`, numpy (ffmpeg for uploads other than WAV); the tokenizer.json on the host | [`asr_board.py --install-only`](SPEECH_TO_TEXT.md#install) | `moonshine` |
 | `stories15m` | `lib/libstories15m.so`, `/root/stories15m_weights` | [`llm_board.py --install-only`](STORIES.md#install) | `stories15m` |
+| any other LLM `<name>` | `lib/lib<tag>.so`, `/root/<tag>_weights` | `llm_board.py --project build/llm_project_<tag> --install-only` | `llm_models.<name>` |
 | `echo` | nothing (protocol only) | — | — |
+
+**Any other LLM** that `generate_llm_project.py` built is served by name,
+with no code (CHAT_PLAN §29): list `<name>` in `server.backends` and add
+
+```json
+"llm_models": {"<name>": {}}
+```
+
+Everything else is derived: the checkpoint is `assets/<name>/`; its kind
+from it (`chat` with a chat template, `text` for a base model — also on
+`POST /v1/completions` —, `vlm` with a vision tower); the library
+`<dir>/lib/lib<tag>.so` (`<tag>`: the name without `-instruct`, `-` and `.`
+as `_`); `cma_mb` from `build/llm_project_<tag>/project.json` (the pool × 1.05
++ 16 MB).  Overrides: `assets`, `project`, `kind`, `lib`, `weights_dir`,
+`model_id`, `cma_mb`, `reserve` and `sampling` (`{temperature, top_p, top_k,
+repetition_penalty, ...}`; else the `smollm2` block's defaults, a text
+model's own 0.8 / 0.9).  The tokenizer and what the server reads beside it —
+the chat template, the special tokens, the end-of-generation ids
+(`llm_profile.py`) — go to `<dir>/<tag>/`.
 
 - **Who builds the libraries.**  `deploy.py` builds only the BERT library.
   The others are built and installed by their own tools.  The preflight
@@ -212,16 +232,23 @@ first one is the default model.
   (`<dir>/lib/libsmollm2_360m.so`), `smolvlm.lib`, `piper.lib`, `moonshine.lib` and
   `stories15m.lib` likewise.
 - **What `deploy.py` uploads for the generative models.**  It always uploads
-  the text side (`smollm2_backend.py`, `smollm2_tokenizer.py`, `chatml.py`,
-  `sampler.py`; for stories15m `stories_backend.py`, `llama_tokenizer.py`).
-  For each configured model it also uploads that model's `tokenizer.json`
-  (the block's `tokenizer`, by default from the untracked `assets/<model>/`)
-  to `<dir>/smollm2/`, `<dir>/smollm2_360m/`, `<dir>/smolvlm/` or
-  `<dir>/stories15m/`.
-- **What the server receives.**  It gets each model's config block (`lib`,
-  `weights_dir`, `model_id`, `tokenizer`, `cma_mb`) and `server.resident`.
-  The `smollm2` block's sampling defaults apply to the SmolLM2 and SmolVLM
-  models; `stories15m` has its own (`temperature`, `top_p`, `reserve`).
+  the text side (`smollm2_backend.py`, the tokenizers, `chat_template.py`,
+  `llm_profile.py`, `sampler.py`, `stories_backend.py`, ...).  For each
+  served model it also uploads its `tokenizer.json` and the files beside it
+  that the server reads (`tokenizer_config.json`, `special_tokens_map.json`,
+  `chat_template.jinja` / `.json`, `generation_config.json`, `config.json`;
+  from the block's `tokenizer`, by default the untracked `assets/<model>/`)
+  to `<dir>/<tag>/` (`smollm2`, `smollm2_360m`, `smolvlm`, `stories15m`, …),
+  and its descriptor to `<dir>/models/<name>.json`.
+- **What the server receives.**  `--llm-model <name>=<dir>/models/<name>.json`
+  per model (`kind`, `lib`, `weights`, `tokenizer`, `model_id`, `cma_mb`,
+  `reserve`, `sampling`) and `server.resident`.  The `smollm2` block's
+  sampling and context options are the chat models' defaults; a text model
+  (stories15m) has its own (`temperature`, `top_p`, `reserve`).  The chat
+  template is the checkpoint's own, rendered with the board's
+  `python3-jinja2` as Hugging Face's `apply_chat_template` does; a library
+  whose sink token (`llm_sink_token()`) is not the first token of the
+  template's prompts is refused.
 - **A model that fails to start.**  A backend whose host side (its
   tokenizer, the end-of-generation tokens, the library's vocabulary) or
   whose startup load fails is dropped, its traceback in the server log.
@@ -359,7 +386,11 @@ A story model is added the same way: `--backend stories15m --stories-lib
 /root/kv260_chat/lib/libstories15m.so --stories-tokenizer
 /root/kv260_chat/stories15m/tokenizer.json --stories-cma-mb 50` (with
 `--llm-sampler-lib`; its sampling defaults are `--stories-temperature`,
-`--stories-top-p`, `--stories-reserve`).
+`--stories-top-p`, `--stories-reserve`).  Any LLM, these four included, can
+also come as a descriptor — what `deploy.py` passes: `--llm-model
+<name>=<file>.json --backend <name>`, the file `{"kind": "chat" | "text" |
+"vlm", "lib": ..., "tokenizer": ..., "cma_mb": ..., "model_id": null,
+"weights": null, "reserve": null, "sampling": {}}`.
 
 Stop the unit first (`deploy.py --stop`): only one process may own the
 FPGA.

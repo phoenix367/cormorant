@@ -60,8 +60,9 @@ class TestConfigGuard(unittest.TestCase):
 
     def test_unimplemented_math_refused(self):
         for key, value in (("attention_bias", True), ("mlp_bias", True), ("hidden_act", "gelu"),
-                           ("rope_scaling", {"rope_type": "llama3", "factor": 32.0}),
-                           ("partial_rotary_factor", 0.5), ("sliding_window", 4096),
+                           ("rope_scaling", {"rope_type": "su", "factor": 32.0}),
+                           ("rope_scaling", {"rope_type": "llama3", "factor": 32.0}),   # parameters missing
+                           ("partial_rotary_factor", 0.3), ("sliding_window", 512),
                            ("rope_interleaved", True), ("final_logit_softcapping", 30.0)):
             with self.subTest(key=key):
                 p = problems({**SMOLLM2, key: value})
@@ -73,13 +74,40 @@ class TestConfigGuard(unittest.TestCase):
     def test_other_block_and_unknown_keys_refused(self):
         p = problems({**SMOLLM2, "model_type": "qwen2"})
         self.assertTrue(any("qwen2" in x for x in p), p)
-        p = problems({**SMOLLM2, "embedding_multiplier": 12.0})          # Granite's
-        self.assertTrue(any("embedding_multiplier" in x and "unknown" in x for x in p), p)
+        p = problems({**SMOLLM2, "query_pre_attn_scalar": 256})           # Gemma's
+        self.assertTrue(any("query_pre_attn_scalar" in x and "unknown" in x for x in p), p)
         c = dict(SMOLLM2)
         del c["hidden_size"]
         self.assertTrue(any("hidden_size" in x and "missing" in x for x in problems(c)))
         # every problem at once, not the first only
         self.assertEqual(len(problems({**SMOLLM2, "mlp_bias": True, "foo": 1})), 2)
+
+    def test_foldable_extras(self):
+        """What src/llm_weights.py / src/rope.py fold into the plain block."""
+        c = LlamaConfig.from_dict(SMOLLM2)
+        self.assertTrue(c.plain)
+        llama3 = {"rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                  "original_max_position_embeddings": 8192}
+        c = LlamaConfig.from_dict({**SMOLLM2, "rope_scaling": llama3})
+        self.assertEqual(c.rope_scaling["rope_type"], "llama3")
+        self.assertTrue(c.plain)                                   # tables only
+        # transformers 5's format
+        c = LlamaConfig.from_dict({**{k: v for k, v in SMOLLM2.items() if k not in ("rope_theta", "rope_scaling")},
+                                   "rope_parameters": {"rope_type": "default", "rope_theta": 500000.0}})
+        self.assertEqual((c.theta, c.rope_scaling), (500000.0, None))
+        c = LlamaConfig.from_dict({**SMOLLM2, "model_type": "granite", "embedding_multiplier": 12.0,
+                                   "residual_multiplier": 0.22, "attention_multiplier": 0.0078125,
+                                   "logits_scaling": 8.0})
+        self.assertEqual((c.emb_mult, c.res_mult, c.attn_mult, c.logit_div), (12.0, 0.22, 0.0078125, 8.0))
+        self.assertFalse(c.plain)
+        c = LlamaConfig.from_dict({**SMOLLM2, "model_type": "phi3", "partial_rotary_factor": 0.75,
+                                   "sliding_window": 2047, "original_max_position_embeddings": 4096,
+                                   "rope_scaling": {"type": "longrope", "short_factor": [1.0] * 24,
+                                                    "long_factor": [2.0] * 24}})
+        self.assertEqual((c.rot, c.window), (48, 2047))
+        self.assertEqual(c.rope_scaling["original_max_position_embeddings"], 4096)
+        self.assertFalse(c.plain)
+        self.assertEqual(problems({**SMOLLM2, "model_type": "mistral", "sliding_window": 4096}), [])
 
     def test_defaults_and_unchecked(self):
         c = {k: v for k, v in SMOLLM2.items() if k not in ("num_key_value_heads", "rope_theta")}

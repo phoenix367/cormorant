@@ -212,7 +212,7 @@ are refused at startup.
 flowchart LR
     msg(["messages"])
     subgraph prepare["prepare() · no FPGA"]
-        tpl["chatml.py<br/>template, trim"] --> tok["smollm2_tokenizer.py<br/>BPE, block cache"]
+        tpl["chatml.py<br/>template, trim"] --> tok["hf_tokenizer.py<br/>BPE, block cache"]
     end
     subgraph generate["generate() · under the FPGA lock"]
         pre["prefix cache<br/>llm_truncate(common prefix)<br/>llm_prefill(new tokens only)"]

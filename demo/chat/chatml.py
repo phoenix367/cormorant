@@ -1,8 +1,11 @@
 # Copyright 2026 Ivan Gubochkin
 # SPDX-License-Identifier: Apache-2.0
 
-"""chatml.py — SmolLM2's chat template (ChatML) and history trimming
-(standard library only).
+"""chatml.py — SmolLM2's chat template (ChatML) written out in Python, with
+its block-wise prompt builder (standard library only): the reference the
+tests check chat_template.py's rendering of the checkpoint's own Jinja
+template against.  The server renders that template (chat_template.py,
+doc/plans/CHAT_PLAN.md §29); this module is not deployed.
 
 The template is the `chat_template` of SmolLM2-135M-Instruct's
 tokenizer_config.json, rendered exactly as transformers'

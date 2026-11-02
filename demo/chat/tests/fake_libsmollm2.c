@@ -13,7 +13,8 @@
  * default 49152 1024): llm_vocab_size() / llm_context_size() answer before
  * llm_open().  fake_llm_counters() exposes calls for the tests.  With
  * -DFAKE_MODEL_NAME='"<id>"' it also exports llm_model_name() (the served
- * model id; two such copies stand in for libsmollm2.so + libsmollm2_360m.so).
+ * model id; two such copies stand in for libsmollm2.so + libsmollm2_360m.so),
+ * with -DFAKE_SINK=<id> llm_sink_token() and llm_policy() ("fake").
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -45,6 +46,10 @@ int         llm_context_size(void) { return s_ctx; }
 long       *fake_llm_counters(void) { return s_counters; }
 #ifdef FAKE_MODEL_NAME
 const char *llm_model_name(void) { return FAKE_MODEL_NAME; }
+#endif
+#ifdef FAKE_SINK
+int         llm_sink_token(void) { return FAKE_SINK; }
+const char *llm_policy(void) { return "fake"; }
 #endif
 
 static int read_ids(FILE *f, int32_t *out, int max)

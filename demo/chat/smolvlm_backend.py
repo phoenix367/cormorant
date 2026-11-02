@@ -35,7 +35,6 @@ from smollm2_backend import Job, LibLlmEngine, Smollm2Backend
 from vlm_image import Image, ImageCache, ImageError
 
 MODEL_ID = "smolvlm-256m-instruct"
-EOG_TOKENS = ("<end_of_utterance>", "<|im_end|>", "<|endoftext|>")
 
 
 class LibVlmEngine(LibLlmEngine):
@@ -79,7 +78,6 @@ class SmolvlmBackend(Smollm2Backend):
     model_id = MODEL_ID
     fingerprint = "kv260-smolvlm-256m-pow2+sink+p12"
     accepts_images = True
-    eog_tokens = EOG_TOKENS
     cma_mb = 550.0                      # fallback = --vlm-cma-mb's default: the 495 MiB pool BO + the
                                         # image buffer (520-530 MB measured)
 
@@ -87,8 +85,6 @@ class SmolvlmBackend(Smollm2Backend):
                  max_images: int = 8, **kw):
         kw.setdefault("model_id", MODEL_ID)
         super().__init__(engine, tokenizer_path, **kw)
-        if self.model_id == MODEL_ID:
-            self.fingerprint = "kv260-smolvlm-256m-pow2+sink+p12"
         self.images = image_cache or ImageCache()
         self.max_images = max_images
         self.stats["images"] = 0
@@ -223,4 +219,4 @@ def _no_image_markers(text: str) -> str:
     return text
 
 
-__all__ = ("MODEL_ID", "LibVlmEngine", "SmolvlmBackend", "EOG_TOKENS")
+__all__ = ("MODEL_ID", "LibVlmEngine", "SmolvlmBackend")

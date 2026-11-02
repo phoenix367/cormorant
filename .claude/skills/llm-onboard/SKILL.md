@@ -40,12 +40,18 @@ python3 .claude/skills/llm-onboard/scripts/onboard_check.py demo/chat/assets/$N 
 ```
 
 It checks what `llama_fit.py` does not: every linear's K ≤ MatmulKernel
-`max_k` (4096), a checkpoint file, the tokenizer pipeline one of the board's
-tokenizers accepts (`smollm2_tokenizer.py` / `llama_tokenizer.py`), the
+`max_k` (4096), a checkpoint file, that the board's tokenizer loads the
+checkpoint's `tokenizer.json` (`demo/chat/hf_tokenizer.py` interprets the
+pipeline — BPE with the usual normalizers, pre-tokenizers, decoders and added
+tokens — so a new model needs no tokenizer code; a part it does not support is
+named as a CODE item), the
 profile `llm_model.Profile` derives (chat or text, the sink token, the
 end-of-generation ids, the context), SmolLM2's chat template, tokenizer size
 ≤ `vocab_size`, the pin, and the names the tools derive from `$N`.  Exit 0 =
-the table's left column applies; exit 1 = do the CODE items first.
+the table's left column applies; exit 1 = do the CODE items first.  Check
+the tokenizer against `tokenizers` before calibrating: `$SPY
+demo/chat/scripts/validate_text.py --assets demo/chat/assets/$N` must print
+OK (ids, decode, incremental decode identical on ~4 000 strings).
 
 What is per model by itself (CHAT_PLAN §28): `src/llm_arch.py` parses
 config.json for the study and the frontend and refuses every key it does not
@@ -60,10 +66,16 @@ the prompts tokenize differently from Hugging Face.
 
 | step | SmolLM2-text checkpoint (exit 0: SmolLM2 tokenizer + ChatML, e.g. the 360M) | otherwise |
 |---|---|---|
-| 1 pin / calibrate / study | unchanged | `llm_study.py` renders ChatML (`chatml()`) and refuses another template |
+| 1 pin / calibrate / study | unchanged | — (the checkpoint's own chat template is rendered, `chat_template.py`; `llm_study.py validate-arch` checks the blocks against transformers) |
 | 2 generate | unchanged (`--assets --model-name`) | K > 4096: split K in `src/llama.py` |
 | 3–4 gates | unchanged | — |
-| 5 serve | **needs a backend entry (code, §5B)** — or repoint an existing slot (config only, replaces that model, §5A) | a tokenizer pipeline neither board tokenizer loads, a template other than ChatML (`chatml.py`), the backend's `<|im_start|>` sink |
+| 5 serve | an `llm_models` entry in `chat_config.json` (config only, §5) | a tokenizer pipeline the board's tokenizer refuses |
+
+Blocks beyond the plain Llama one that need no code (CHAT_PLAN §29): RoPE
+scaling (linear, llama3, dynamic, yarn, longrope), partial rotation,
+Granite's multipliers, Phi-3's fused projections, Mistral (a window ≥ the
+context) — `src/llm_weights.py` / `src/rope.py` fold them into the plain
+block for the study and the frontend alike.
 
 **A base model without a chat template** (stories15m, CHAT_PLAN §27) has its
 "otherwise" column done: `llm_calibrate.py add` pins the files its repo has
@@ -72,15 +84,16 @@ and, when `tokenizer_config.json` has no chat template, its own texts
 `STORY_TEXTS`); `llm_study.Profile` "text" gives story prompts, the context of
 `max_position_embeddings`, generation ending at `<s>` / `</s>`; the gates take
 the model's prompts / second turn / context (`llm_project.gate_prompts`,
-`context`); a Llama-2 SentencePiece tokenizer runs on the board as
-`llama_tokenizer.py` (`validate_text.py --model <name>`); serving is
+`context`); its tokenizer runs on the board as `hf_tokenizer.py`, like every
+model's (`validate_text.py --model <name>`); serving is
 `stories_backend.py` (`/v1/completions` + a story chat) — a new base model
 needs only its own prompt texts and a backend tuple like `STORIES`.
 
 Not possible on this path today (model-study route C, or a bitstream / CMA
-change): non-Llama blocks (biases, LayerNorm, GELU MLP, partial rotary,
-`rope_scaling`, sliding window, MoE — `src/llm_arch.py` refuses them, and an
-unknown config key until it is listed as harmless in `HARMLESS`); pools
+change): blocks with new numerics (q/k/v or MLP biases — Qwen2 —, LayerNorm,
+a GELU MLP, QK-norm, softcapping, a sliding window shorter than the context,
+MoE — `src/llm_arch.py` refuses them, and an unknown config key until it is
+listed as harmless in `HARMLESS`); pools
 above ~920 MiB (≈ 440 M int16 params with the KV caches); K > 4096; a context
 not a multiple of 64 (the V cache's P·V image, `pv_kw` 4; 16 works at a lower
 P·V speed); another VLM
@@ -240,40 +253,34 @@ compact memory (command above) and retry; do the same before a deploy so
 
 ## 5. Serve it
 
-**A. Zero code — repoint a slot** (how 360M was first served, §20
-"Deploying it"; replaces that slot's model).  In `demo/chat/chat_config.json`
-set the `smollm2_360m` (or `smollm2`) block: `lib` →
-`<remote.dir>/lib/lib$T.so`, `tokenizer` → `assets/$N/tokenizer.json`,
-`cma_mb`, `weights_dir` null (the build's).  The server serves the
-library's `llm_model_name()` (= `$N`); `model_id` overrides it.
+No code (CHAT_PLAN §29): in your local `demo/chat/chat_config.json` add the
+model to `server.backends` and
 
-**B. A backend of its own** — the `smollm2-360m` pattern (commit 693cfb4);
-`smollm2_backend.py` and the test helpers (`fake_llm_lib(model_name)`) need
-nothing — the id and fingerprint come from the library:
-- `demo/chat/kv260_chat_server.py`: docstring (backends, residency CMA
-  line, usage); a tuple like `SMOLLM2_360M = ("smollm2-360m",
-  "smollm2-360m-instruct")`; its branch in `build_backends()` →
-  `smollm2_backend(args, llm_engine(args, args.llm_X_lib, args.llm_X_weights),
-  args.llm_X_tokenizer, args.llm_X_cma_mb, args.llm_X_model_id,
-  default_model_id="$N")`; `--backend` choices and the unknown-backend message;
-  an argument group `--llm-X-lib` (default `HERE/lib/lib$T.so`),
-  `--llm-X-model-id`, `--llm-X-weights`, `--llm-X-tokenizer`
-  (`_first_existing(HERE/$T/tokenizer.json, HERE/assets/$N/tokenizer.json)`),
-  `--llm-X-cma-mb`.
-- `demo/chat/deploy.py`: docstring; the block's defaults in `load_config()`
-  (`lib` → `<dir>/lib/lib$T.so`, `weights_dir`, `model_id`, `cma_mb`,
-  `tokenizer`); the tuple + `uses_llm_X()`; the `preflight()` entry (library
-  and tokenizer); `upload_server()` tokenizer → `<dir>/$T/tokenizer.json`;
-  `server_argv()` — its options, **and add `uses_llm_X(cfg)` to the
-  condition that passes the shared `--llm-*` sampling defaults and
-  `--llm-sampler-lib`**; `print_ready()` hints only ids starting `smollm2-`.
-- `demo/chat/chat_config.json.example`: the block and `_backends_note`;
-  your local `chat_config.json` (untracked): the block + `server.backends`.
-- `demo/chat/tests/test_smollm2_backend.py`: a `TestTwoSizes`-style class
-  (two `fake_llm_lib(model_name)` copies side by side, `build_backends`
-  order / `cma_mb` / fingerprint, default ids and overrides, one id twice →
-  `SystemExit`).  **Gate:** `cd demo/chat/tests && python3 -m unittest -v`
-  (230 before, ~60 skip without tokenizers).
+```json
+"llm_models": {"$N": {}}
+```
+
+`deploy.py` derives the rest — the checkpoint `assets/$N/`, the kind (`chat`:
+a chat template, rendered on the board from the checkpoint's own files with
+`python3-jinja2` as `apply_chat_template` does; `text`: a base model, also on
+`POST /v1/completions`; `vlm`: a vision tower), the library
+`<remote.dir>/lib/lib$T.so`, `cma_mb` from
+`build/llm_project_$T/project.json` (pool × 1.05 + 16; set it after the board
+gate's measured CMA if it differs) — uploads the tokenizer with the files
+beside it to `<remote.dir>/$T/` and a descriptor to
+`<remote.dir>/models/$N.json`, and passes `--llm-model $N=<that file>`.
+Overrides: `assets`, `project`, `kind`, `lib`, `weights_dir`, `model_id`,
+`cma_mb`, `reserve`, `sampling` (demo/chat/doc/DEPLOY.md "Choosing the
+models").  The server checks at startup: the tokenizer loads
+(`onboard_check.py` reports an unsupported pipeline), the library's
+vocabulary ≥ the tokenizer's, the library's `llm_sink_token()` = the first
+token of the template's prompts; a backend that fails is dropped, the rest
+are served.
+
+The four legacy blocks (`smollm2`, `smollm2_360m`, `stories15m`, `smolvlm`)
+go through the same descriptors; their `--llm-*` / `--llm-360m-*` /
+`--stories-*` / `--vlm-*` flags remain for running the server by hand.
+`demo/chat/tests/test_llm_registry.py` covers both paths.
 
 **Deploy and talk to it:**
 

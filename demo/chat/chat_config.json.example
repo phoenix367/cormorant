@@ -18,7 +18,7 @@
     "backends": [
       "bert-squad"
     ],
-    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), moonshine (speech to text), stories15m (story writing, also POST /v1/completions), echo; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice, moonshine libmoonshine_base.so and its weights, stories15m libstories15m.so. See doc/DEPLOY.md.",
+    "_backends_note": "Any of bert-squad, smollm2 (SmolLM2-135M), smollm2-360m, smolvlm, piper (text to speech), moonshine (speech to text), stories15m (story writing, also POST /v1/completions), echo, or an llm_models name; the first is the default model. Each one but bert-squad and echo needs its library on the board (see its block): smollm2 libsmollm2.so, smollm2-360m libsmollm2_360m.so, smolvlm libsmolvlm_256m.so and Pillow, piper libpiper_tts.so and its voice, moonshine libmoonshine_base.so and its weights, stories15m libstories15m.so, an llm_models entry lib<tag>.so. See doc/DEPLOY.md.",
     "resident": "auto",
     "_resident_note": "auto = keep the FPGA models loaded while CmaFree allows, else swap them on demand (least recently used first); one = one FPGA model at a time; all = load everything at startup.",
     "max_windows": 8,
@@ -100,6 +100,8 @@
     "cma_mb": 50,
     "_cma_note": "The 34.6 MiB pool BO (33 MB measured)."
   },
+  "llm_models": {},
+  "_llm_models_note": "Any other LLM generate_llm_project.py built, served by name (list the name in server.backends): {\"<name>\": {}} takes everything from the name - its checkpoint assets/<name> (tokenizer.json and the files beside it), its kind (chat: a chat template; text: a base model, also on /v1/completions; vlm: a vision tower), its library <dir>/lib/lib<tag>.so (llm_board.py --install-only installs it), cma_mb from build/llm_project_<tag>/project.json (pool x 1.05 + 16). Overrides: assets, project, kind, lib, weights_dir, model_id, cma_mb, reserve, sampling ({temperature, top_p, top_k, repetition_penalty, ...}: else the smollm2 block's defaults; a text model's own 0.8 / 0.9).",
   "build": {
     "jobs": 4,
     "timeout": 1800

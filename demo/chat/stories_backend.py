@@ -47,8 +47,7 @@ import time
 from typing import List, Optional, Sequence, Tuple
 
 from chat_backend import BackendError, ChatRequest, Delta
-from llama_tokenizer import Tokenizer
-from sampler import SamplerParams, make_sampler
+from sampler import SamplerParams
 from smollm2_backend import Job, Smollm2Backend
 
 MODEL_ID = "stories15m"
@@ -137,7 +136,6 @@ def plan_chat(messages: Sequence[dict]) -> Tuple[str, str, str]:
 class StoriesBackend(Smollm2Backend):
     model_id = MODEL_ID
     fingerprint = "kv260-stories15m-pow2+sink+p12"
-    eog_tokens = ("<s>", "</s>")
     cma_mb = 50.0
     completions = True
 
@@ -157,14 +155,7 @@ class StoriesBackend(Smollm2Backend):
         if self.tok is not None:
             return
         t0 = time.monotonic()
-        tok = Tokenizer(self.tokenizer_path)
-        if self.lib_vocab:
-            self._check_vocab(self.lib_vocab, tok)
-        self.eog = self._eog_ids(tok)
-        self.tok = tok
-        self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
-        self.bos = self.tok.bos_id
-        self._set_breakers(self.dry_breakers)
+        self._load_text_side()                       # the stop ids, the BOS as the sink
         self.host_load_s = time.monotonic() - t0
 
     def prepare(self, req: ChatRequest) -> Job:

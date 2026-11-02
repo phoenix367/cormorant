@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1915 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1920 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1133,7 +1133,11 @@ tensor no graph read) + the calibrated formats JSON of `demo/chat/scripts/llm_st
 across entries) and `axi.llm` host ops for the rest; every tensor except
 weights / states is prefixed with the entry name.  Nothing beyond
 config.json is model specific (SmolLM2-360M or another Llama checkpoint is
-a regeneration); a class the formats lack is an error, not a default.  Entries (T rows, C = context incl. the sink):
+a regeneration); a class the formats lack is an error, not a default.
+Mistral, Granite and Phi-3 checkpoints, RoPE scaling and partial rotation
+are read through `src/llm_weights.py` / `src/rope.py`, which fold their
+extras into the plain block for the frontend and the study alike
+(doc/plans/CHAT_PLAN.md §29).  Entries (T rows, C = context incl. the sink):
 
 | entry | inputs | outputs | |
 |---|---|---|---|

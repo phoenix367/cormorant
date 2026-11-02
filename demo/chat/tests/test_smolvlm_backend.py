@@ -170,7 +170,9 @@ class TestBackend(unittest.TestCase):
         img = tok().special["<image>"]
         self.assertEqual(sum(1 for t in ids if t == img), 64)
         self.assertEqual(fin.info["finish"], "eos")
-        self.assertEqual(b.eog, {tok().special[t] for t in ("<end_of_utterance>", "<|im_end|>", "<|endoftext|>")})
+        # llm_profile.Profile.stop_ids: <end_of_utterance> and the config's special tokens
+        self.assertEqual(b.eog, {tok().special[t] for t in ("<end_of_utterance>", "<|im_end|>", "<|endoftext|>",
+                                                            "<|im_start|>")})
 
     def test_prefix_reuse_by_image_content(self):
         eng = FakeVlmEngine(self.reply)

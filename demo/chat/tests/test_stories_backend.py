@@ -216,9 +216,10 @@ class TestGenerate(unittest.TestCase):
         text, fin = run(b, chat(("system", "ignored"), ("user", "Once upon a time")))
         self.assertEqual((text, fin.info["story"]), (a1.lstrip(), "new"))   # a message of its own: no space
         # "continue": the same story goes on, its first turn reused from the cache
-        eng.restart(cont(" He ran home."))
+        more = " He ran home and told his mother about the big brown dog in the park."   # > min_tokens
+        eng.restart(cont(more))
         text, fin = run(b, chat(("user", "Once upon a time"), ("assistant", text), ("user", "Go on, please.")))
-        self.assertEqual((text, fin.info["story"]), ("He ran home.", "continue"))
+        self.assertEqual((text, fin.info["story"]), (more.lstrip(), "continue"))
         story = tok().encode("Once upon a time there was a dog.")
         self.assertEqual(fin.prompt_tokens, len(story))
         self.assertLess(fin.info["prefill_tokens"], len(story) - 1)
@@ -285,7 +286,8 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(b.completions)
         self.assertEqual((b.model_id, b.fingerprint, b.cma_mb), (MID, "kv260-stories15m-pow2+sink+p12", 50.0))
         b.load_host()
-        self.assertEqual(b.eog, {BOS, EOS})                            # <s> and </s> end a story
+        # <s> and </s> end a story (llm_profile.Profile.stop_ids: with <unk>, which the config names)
+        self.assertEqual(b.eog, {tok().special["<unk>"], BOS, EOS})
 
 
 @unittest.skipUnless(HAVE, "demo/chat/assets/stories15m/tokenizer.json not present")

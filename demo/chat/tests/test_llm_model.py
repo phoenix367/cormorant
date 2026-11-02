@@ -22,7 +22,8 @@ CHATML = ("{% for message in messages %}{% if loop.first and messages[0]['role']
           "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
           "{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}")
 LLAMA3 = ("{{- bos_token }}{% for message in messages %}{{ '<|start_header_id|>' + message['role'] "
-          "+ '<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}{% endfor %}")
+          "+ '<|end_header_id|>\n\n' + message['content'] + '<|eot_id|>' }}{% endfor %}"
+          "{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}")
 
 
 class _Ckpt(unittest.TestCase):
@@ -106,8 +107,9 @@ class TestProfile(_Ckpt):
         with self.assertRaises(lm.ProfileError):
             lm.Profile(d)
 
-    def test_llm_study_renders_chatml_only(self):
-        """llm_study.Profile refuses another template (it would prompt with ChatML)."""
+    def test_llm_study_renders_the_checkpoints_template(self):
+        """llm_study.Profile prompts with the checkpoint's own template (a
+        Llama-3-style one here), the second turn from the same template."""
         try:
             import numpy  # noqa: F401
         except ImportError:
@@ -116,9 +118,31 @@ class TestProfile(_Ckpt):
         d = self.ckpt("llama-3-mini", {"max_position_embeddings": 4096, "bos_token_id": 128000,
                                        "eos_token_id": 128009},
                       {"<|begin_of_text|>": 128000, "<|eot_id|>": 128009, "<|start_header_id|>": 128006},
-                      {"chat_template": LLAMA3})
-        with self.assertRaises(lm.ProfileError):
-            llm_study.Profile(d)
+                      {"chat_template": LLAMA3, "bos_token": "<|begin_of_text|>"})
+        p = llm_study.Profile(d)
+        self.assertEqual(p.sink, 128000)
+        text = p.chat_template.render(p.prompts[0][1])
+        self.assertTrue(text.startswith("<|begin_of_text|><|start_header_id|>user"), text[:60])
+        turn = p.chat_template.turn(p.prompts[0][1], llm_study.SECOND_TURN)
+        self.assertTrue(turn.startswith("<|eot_id|><|start_header_id|>user"), turn)
+
+
+EXPORT_PY = os.path.join(os.path.dirname(os.path.dirname(CHAT)), ".venv-export", "bin", "python")
+
+
+@unittest.skipUnless(os.path.exists(EXPORT_PY), ".venv-export (torch, transformers) not created")
+class TestBlocksVsTransformers(unittest.TestCase):
+    """llm_study.py validate-arch: a tiny random checkpoint of every block the
+    stack implements (Llama and its RoPE scalings, Mistral, Granite, Phi-3 with
+    partial rotation and longrope), saved by transformers, through llm_arch /
+    llm_weights / rope, against transformers' own logits."""
+
+    def test_validate_arch(self):
+        import subprocess
+        r = subprocess.run([EXPORT_PY, os.path.join(CHAT, "scripts", "llm_study.py"), "validate-arch"],
+                           capture_output=True, text=True, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stdout[-3000:] + r.stderr[-3000:])
+        self.assertIn("blocks equal transformers", r.stdout)
 
 
 class TestNames(unittest.TestCase):

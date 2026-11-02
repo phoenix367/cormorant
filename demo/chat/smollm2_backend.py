@@ -3,12 +3,16 @@
 
 """smollm2_backend.py — backend B of the KV260 chat server: generative chat
 with SmolLM2-135M-Instruct (libsmollm2.so) or SmolLM2-360M-Instruct
-(libsmollm2_360m.so) on the FPGA (doc/plans/CHAT_PLAN.md §11, §20).  Python standard library only (ctypes); text side in
-smollm2_tokenizer.py and chatml.py, sampling in sampler.py (libsampler.so).
+(libsmollm2_360m.so) — or any other Llama-family chat model generate_llm_project.py built — on the
+FPGA (doc/plans/CHAT_PLAN.md §11, §20, §29).  Python standard library only (ctypes) and jinja2; text
+side in hf_tokenizer.py (the checkpoint's tokenizer.json), chat_template.py (its chat template) and
+llm_profile.py (its sink and stop ids), sampling in sampler.py (libsampler.so).
 
-prepare()  (no FPGA)  messages -> ChatML prompt ids (SmolLM2's template: the
-           default system prompt when the conversation has none; a
-           "developer" message counts as "system"), history trimmed to leave
+prepare()  (no FPGA)  messages -> prompt ids through the checkpoint's own chat
+           template, found beside the tokenizer (chat_template.py, as
+           apply_chat_template: SmolLM2's adds its default system prompt when
+           the conversation has none; a "developer" message counts as
+           "system"), history trimmed to leave
            `reserve` tokens of the context for the answer (the oldest turns
            go first; the system message and the last message always stay;
            400 context_length_exceeded if they alone do not fit), sampling
@@ -17,8 +21,8 @@ generate() (FPGA lock) prefix-cache reuse: the token list currently in the
            KV cache is kept between requests; the library is truncated to the
            common prefix with the new prompt and only the new tokens are
            prefilled (a multi-turn chat prefills just the new turn).  Position
-           0 is the precomputed <|im_start|> sink: the prompt's leading
-           <|im_start|> is never passed in.  Then decode + sample one token at
+           0 is the precomputed sink — the token every rendering starts with
+           (SmolLM2: <|im_start|>) — which is never passed in.  Then decode + sample one token at
            a time until an end-of-generation token (<|im_end|>, <|endoftext|>,
            <|im_start|>), a stop string, max_tokens or a full context; every
            token's text is streamed as a Delta (UTF-8 completed across tokens,
@@ -59,7 +63,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import chatml
+import chat_template
+import llm_profile
 from chat_backend import (Backend, BackendError, Cancelled, CancelToken, ChatRequest, Delta,
                           Finish, StopStream)
 from sampler import SamplerParams, make_sampler
@@ -94,10 +99,9 @@ def loop_period(gen: Sequence[int]) -> int:
         if tail[p:] == tail[:-p]:
             return p
     return 0
-from smollm2_tokenizer import Tokenizer
+from hf_tokenizer import Tokenizer
 
 MODEL_ID = "smollm2-135m-instruct"
-EOG_TOKENS = ("<|im_end|>", "<|endoftext|>", "<|im_start|>")
 
 
 class LlmLibraryError(RuntimeError):
@@ -141,6 +145,10 @@ class LibLlmEngine:
             f.argtypes, f.restype = args, res
         if hasattr(lib, "llm_model_name"):             # optional: older / fake libraries
             lib.llm_model_name.argtypes, lib.llm_model_name.restype = [], ctypes.c_char_p
+        if hasattr(lib, "llm_sink_token"):
+            lib.llm_sink_token.argtypes, lib.llm_sink_token.restype = [], ctypes.c_int
+        if hasattr(lib, "llm_policy"):
+            lib.llm_policy.argtypes, lib.llm_policy.restype = [], ctypes.c_char_p
         return lib
 
     def _err(self, what: str, rc: int) -> LlmLibraryError:
@@ -154,6 +162,14 @@ class LibLlmEngine:
         if not hasattr(lib, "llm_model_name"):
             return ""
         return (lib.llm_model_name() or b"").decode("utf-8", "replace")
+
+    def exports(self) -> Tuple[Optional[int], str]:
+        """(sink token, numeric policy) the library records (llm_sink_token() /
+        llm_policy(); None / "" for a library built before them)."""
+        lib = self.lib if self.lib is not None else self._bind()
+        sink = int(lib.llm_sink_token()) if hasattr(lib, "llm_sink_token") else -1
+        policy = (lib.llm_policy() or b"").decode() if hasattr(lib, "llm_policy") else ""
+        return (sink if sink >= 0 else None), policy
 
     def sizes(self) -> Tuple[int, int]:
         """(vocabulary, context) from llm_vocab_size() / llm_context_size(),
@@ -241,6 +257,23 @@ def _common_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     return i
 
 
+def _plain_encoder(tok):
+    """tok.encode without special tokens added — a rendered template writes
+    them itself, as apply_chat_template tokenizes."""
+    return lambda text: tok.encode(text, add_special_tokens=False)
+
+
+def engine_exports(engine) -> Tuple[Optional[int], str]:
+    """(sink token, policy) an engine's library records (exports()); None / ""
+    where it does not tell."""
+    if not callable(getattr(engine, "exports", None)):
+        return None, ""
+    try:
+        return engine.exports()
+    except (OSError, AttributeError):
+        return None, ""
+
+
 def engine_sizes(engine) -> Tuple[int, int]:
     """(vocabulary, context) an engine reports before it opens (its sizes());
     0 where it cannot tell."""
@@ -257,7 +290,7 @@ class Smollm2Backend(Backend):
     model_id = MODEL_ID
     owned_by = "kv260"
     fingerprint = "kv260-smollm2-135m-pow2+sink+p12"
-    eog_tokens = EOG_TOKENS
+    tokenizer_class = Tokenizer
     cma_mb = 330.0                      # fallback = --llm-cma-mb's default (SmolLM2-135M's pool BO +
                                         # buffers); the server passes each size's own
 
@@ -278,7 +311,10 @@ class Smollm2Backend(Backend):
             except (OSError, AttributeError):
                 model_id = None
         self.model_id = model_id or default_model_id or type(self).model_id
-        self.fingerprint = f"kv260-{self.model_id.removesuffix('-instruct')}-pow2+sink+p12"
+        # the library's sink token and numeric policy (llm_sink_token() / llm_policy();
+        # a library built before them: None / "")
+        self.lib_sink, policy = engine_exports(engine)
+        self.fingerprint = f"kv260-{self.model_id.removesuffix('-instruct')}-{policy or 'pow2+sink+p12'}"
         self.tokenizer_path = tokenizer_path
         self.sampler_lib = sampler_lib
         self.defaults = defaults or SamplerParams(temperature=0.2, top_p=0.9, top_k=50,
@@ -300,7 +336,7 @@ class Smollm2Backend(Backend):
         if cma_mb is not None:
             self.cma_mb = cma_mb
         self.tok: Optional[Tokenizer] = None
-        self.builder: Optional[chatml.PromptBuilder] = None
+        self.builder: Optional[chat_template.PromptBuilder] = None
         self.sampler = None
         self._prep_lock = threading.Lock()
         self._cached: Optional[List[int]] = None     # tokens at KV positions 1.. (after the sink)
@@ -313,16 +349,33 @@ class Smollm2Backend(Backend):
         if self.tok is not None:
             return
         t0 = time.monotonic()
-        tok = Tokenizer(self.tokenizer_path)
+        tok = self._load_text_side()
+        if self.profile.chat_template is None:
+            raise RuntimeError(f"{os.path.dirname(os.path.abspath(self.tokenizer_path))}: no chat "
+                               f"template (tokenizer_config.json, chat_template.jinja / .json beside "
+                               f"tokenizer.json) — a base model is served as a text model")
+        self.builder = chat_template.PromptBuilder(self.profile.chat_template, _plain_encoder(tok))
+        if self.builder.ids([{"role": "user", "content": "Hi"}])[0] != self.bos:
+            raise RuntimeError(f"the chat template's prompts do not start with the sink token {self.bos}")
+        self.host_load_s = time.monotonic() - t0
+
+    def _load_text_side(self):
+        """The tokenizer, the profile of its directory (llm_profile.py: the sink,
+        the stop ids), the sampler; checked against the library's vocabulary and
+        sink token.  Sets self.tok, self.profile, self.eog, self.bos."""
+        tok = self.tokenizer_class(self.tokenizer_path)
         if self.lib_vocab:
             self._check_vocab(self.lib_vocab, tok)
-        self.eog = self._eog_ids(tok)
+        self.profile = llm_profile.Profile(os.path.dirname(os.path.abspath(self.tokenizer_path)))
+        self.eog = frozenset(self.profile.stop_ids)
+        self.bos = self.profile.sink                 # position 0, never passed in
+        if self.lib_sink is not None and self.lib_sink != self.bos:
+            raise RuntimeError(f"the library's sink token is {self.lib_sink}, the tokenizer's prompts "
+                               f"start with {self.bos}: a library generated for another checkpoint")
         self.tok = tok
-        self.builder = chatml.PromptBuilder(self.tok.encode)
         self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
-        self.bos = self.tok.special["<|im_start|>"]
         self._set_breakers(self.dry_breakers)
-        self.host_load_s = time.monotonic() - t0
+        return tok
 
     def _check_vocab(self, lib_vocab: int, tok) -> None:
         """The library may have more vocabulary rows than the tokenizer has
@@ -331,17 +384,6 @@ class Smollm2Backend(Backend):
         if lib_vocab < tok.vocab_size:
             raise RuntimeError(f"the library's vocabulary ({lib_vocab}) is smaller than the "
                                f"tokenizer's ({tok.vocab_size})")
-
-    def _eog_ids(self, tok) -> frozenset:
-        """The ids of the end-of-generation tokens (eog_tokens) the tokenizer
-        has; none at all is an error, as an answer would end only at max_tokens
-        or a full context.  (A model's own list, generation_config.json's
-        eos_token_id, will plug in here.)"""
-        ids = frozenset(tok.special[t] for t in self.eog_tokens if t in tok.special)
-        if not ids:
-            raise RuntimeError(f"{self.tokenizer_path}: none of the end-of-generation tokens "
-                               f"{', '.join(self.eog_tokens)} is in the tokenizer")
-        return ids
 
     def _vocab_logits(self, logits):
         """The logits of the tokenizer's vocabulary: a library with padded
@@ -470,11 +512,12 @@ class Smollm2Backend(Backend):
         with self._prep_lock:
             try:
                 ids, _, dropped = self.builder.fit(msgs, budget)
-            except chatml.ContextTooLong as e:
+            except chat_template.ContextTooLong as e:
                 raise BackendError(f"{e} This model's context is {self.ctx} tokens.", "messages",
                                    code="context_length_exceeded") from None
         if not ids or ids[0] != self.bos or len(ids) < 2:
-            raise BackendError("internal: the chat template must start with <|im_start|>", "messages")
+            raise BackendError(f"internal: the chat template must start with the sink token {self.bos}",
+                               "messages")
         seed = req.seed if req.seed is not None else random.SystemRandom().getrandbits(63)
         job = Job(req, ids, params, seed, req.max_tokens, list(req.stop), last_n, dry_n,
                   breakers, loop_guard, dropped, (time.monotonic() - t0) * 1000.0)

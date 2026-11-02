@@ -1,0 +1,58 @@
+{
+  "_comment": "Tokenizer files of other model families, pinned by revision and SHA-256, that validate_text.py --all checks hf_tokenizer.py against (the `tokenizers` package); --fetch downloads them into demo/chat/assets/tokenizers/<name>/ (not in git). Only the tokenizer files: tokenizer.json, tokenizer_config.json, special_tokens_map.json.",
+  "tokenizers": {
+    "Qwen2.5-0.5B-Instruct": {
+      "repo": "Qwen/Qwen2.5-0.5B-Instruct",
+      "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+      "files": {
+        "tokenizer.json": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+        "tokenizer_config.json": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583"
+      }
+    },
+    "TinyLlama-1.1B-Chat-v1.0": {
+      "repo": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "revision": "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
+      "files": {
+        "tokenizer.json": "bcd04f0eadf90287bd26e1a183ac487d8a141b09b06aecb7725bbdd343640f2e",
+        "tokenizer_config.json": "7b41ba7d0eb91e77914ca3dafde559ea3e19878769b7e68409e89bed5222e77a",
+        "special_tokens_map.json": "82d96d7a9e6ced037f12394b7ea6a5b02e6ca87e0d11edaa8d60d9be857ce7db"
+      }
+    },
+    "Phi-3-mini-4k-instruct": {
+      "repo": "microsoft/Phi-3-mini-4k-instruct",
+      "revision": "f39ac1d28e925b323eae81227eaba4464caced4e",
+      "files": {
+        "tokenizer.json": "072ab882d6c7192a42f78790945d16c064691321a73251a4b18f6a380f0fbe39",
+        "tokenizer_config.json": "32f66c2bab499baaa8341819ad9a13342f957501ce1e989bcb90853a01336cc0",
+        "special_tokens_map.json": "810adc6e6c6ef2f56c285ef930d243358a3a9f05e36a01c5a10bafc6fac4609b"
+      }
+    },
+    "Llama-3.2-1B-Instruct": {
+      "repo": "unsloth/Llama-3.2-1B-Instruct",
+      "revision": "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+      "files": {
+        "tokenizer.json": "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b",
+        "tokenizer_config.json": "9ddd255c19fe319c8d4e891163540382e9fbda99f394674f2a929efc47d57458",
+        "special_tokens_map.json": "94e708c3f5e64acf85bbe5ad01467a1248faadb73e83b41793087ecced586e8f"
+      }
+    },
+    "gemma-3-270m-it": {
+      "repo": "unsloth/gemma-3-270m-it",
+      "revision": "23cf460f6bb16954176b3ddcc8d4f250501458a9",
+      "files": {
+        "tokenizer.json": "4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795",
+        "tokenizer_config.json": "be2182df1ad0ea735d336418896eb06e5cc2f59136e7aaeac5de2ec2197742ac",
+        "special_tokens_map.json": "45a857d8a2495d0be30a5d2d6de03278195eb028b6e0b8efc248bfa697d65f05"
+      }
+    },
+    "Mistral-7B-Instruct-v0.1": {
+      "repo": "mistralai/Mistral-7B-Instruct-v0.1",
+      "revision": "ec5deb64f2c6e6fa90c1abf74a91d5c93a9669ca",
+      "files": {
+        "tokenizer.json": "11c08db21487c885d8c792180f0be237f6a261b89a46f128a6a80a3aa4bd1720",
+        "tokenizer_config.json": "475361439e5c012de9dffdedc416a66a50f1a29f7aa80b375ba014fb13d6bb8a",
+        "special_tokens_map.json": "6fa06efa2785e450051989a6f8fb4416b10149ded485ddd3f127a40734f5cfd0"
+      }
+    }
+  }
+}

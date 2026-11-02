@@ -21,7 +21,7 @@ the previous block's "\\n" (a pre-token boundary), so the prompt's ids are
 the concatenation of the blocks' ids — tokenized and cached one by one;
 image content does not enter a block's text (the caller keeps the images).
 
-Trimming (fit): as chatml.py — the system message (if first) and the last
+Trimming (fit): as chat_template.py — the system message (if first) and the last
 message stay, older messages go from the front (an assistant message left
 at the front goes with its user turn) until the prompt fits the budget;
 images inside dropped messages go with them.
@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
-from chatml import ContextTooLong
+from chat_template import ContextTooLong
 
 IM_START = "<|im_start|>"
 END_OF_UTTERANCE = "<end_of_utterance>"

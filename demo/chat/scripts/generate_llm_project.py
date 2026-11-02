@@ -179,7 +179,7 @@ static inline void llm_glue_vision(inference_buf_t *patches)
 
 
 def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buckets,
-              vcfg=None) -> None:
+              vcfg=None, sink: int = 1, policy: str = "") -> None:
     active = mg._active_kernels
     buckets = sorted(buckets)
     costs = lp.bucket_costs(buckets)
@@ -199,6 +199,8 @@ def emit_glue(out: str, mg: MultiEntryGenerator, model_name: str, cfg, ctx, buck
 #include "inference.h"
 
 #define LLM_MODEL_NAME  "{model_name}"
+#define LLM_SINK_TOKEN  {sink}           /* position 0: the precomputed attention sink */
+#define LLM_POLICY      "{policy}"
 #define LLM_VOCAB       {cfg.V}
 #define LLM_CONTEXT     {ctx}
 #define LLM_N_BUCKETS   {len(buckets)}u
@@ -470,7 +472,10 @@ def main(argv=None) -> int:
     missing = populate_drivers(out, dd, mg._active_kernels)
     for name in C_SOURCES:
         shutil.copy2(os.path.join(SRC, name), os.path.join(out, "test", name))
-    emit_glue(out, mg, args.model_name, cfg, args.context, buckets, vcfg)
+    with open(formats_paths[0]) as f:
+        sink = int(json.load(f).get("sink_token", 1))          # the token the sink K / V rows are of
+    emit_glue(out, mg, args.model_name, cfg, args.context, buckets, vcfg, sink=sink,
+              policy=lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope))
     patch_cmake(out, mg)
     layers = write_layers(out, mg)
     summary.update({

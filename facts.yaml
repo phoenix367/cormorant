@@ -1976,10 +1976,12 @@ facts:
   optional: true                             # demo/chat/build: generate_llm_project.py --model-name smolvlm-256m-instruct
   source:
     parts:
+      # distinct layers: a layer's GELU runs in two pipelined row pieces (VLA_PLAN §4: .p0 / .p1)
       on_vop: {file: demo/chat/build/llm_project_smolvlm_256m/src/inference.c,
-               regex: "(on VectorOPKernel's activation unit): ADD bias", all: true, transform: 'len(v)'}
+               regex: "VitGelu\\(vision\\.l(\\d+)\\.[^\\n]*on VectorOPKernel's activation unit: ADD bias",
+               all: true, transform: 'len(set(v))'}
       layers: {file: demo/chat/build/llm_project_smolvlm_256m/src/inference.c,
-               regex: '/\* \[\d+\] (VitGelu)\(vision', all: true, transform: 'len(v)'}
+               regex: '/\* \[\d+\] VitGelu\(vision\.l(\d+)\.', all: true, transform: 'len(set(v))'}
   fix: report
   mentions:
     - {file: CLAUDE.md, regex: '(?P<on_vop>\d+) of (?P<layers>\d+) layers, `doc/plans/OFFLOAD_PLAN\.md` §2\.1'}

@@ -151,7 +151,7 @@ import time
 import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1041,7 +1041,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         srv = self.server
         models = []
         for mid, b in srv.backends.items():
-            m = {"id": mid, "ready": mid not in srv.load_errors, "loaded": srv.loaded.get(mid, False)}
+            m = {"id": mid, "ready": mid not in srv.load_errors, "loaded": srv.loaded.get(mid, False),
+                 **model_kind(b)}
             if mid in srv.load_errors:
                 m["error"] = srv.load_errors[mid]
             try:
@@ -1756,7 +1757,7 @@ def llm_engine(args, lib: str, weights: Optional[str]):
         import fake_llm
         if args.llm_fake == "float":
             return fake_llm.FloatModelEngine(context_size=args.llm_context)
-        from smollm2_tokenizer import Tokenizer
+        from hf_tokenizer import Tokenizer
         reply = Tokenizer(args.llm_tokenizer).encode(
             "This is the scripted fake of libsmollm2.so (kv260_chat_server.py --llm-fake scripted).")
         return fake_llm.ScriptedEngine(reply, context_size=args.llm_context, delay=args.echo_delay)
@@ -1775,61 +1776,99 @@ def sampler_defaults(args):
 SMOLLM2_135M = ("smollm2", "smollm2-135m", "smollm2-135m-instruct")
 SMOLLM2_360M = ("smollm2-360m", "smollm2-360m-instruct")
 STORIES = ("stories15m",)
+SMOLVLM = ("smolvlm", "smolvlm-256m-instruct")
 MOONSHINE = ("moonshine", "moonshine-base", "moonshine-tiny")
 
 
-def smollm2_backend(args, engine, tokenizer: str, cma_mb: float, model_id: Optional[str],
-                    default_model_id: Optional[str] = None) -> Backend:
-    """A SmolLM2 backend over `engine`; the --llm-* sampling and context
-    options apply to every SmolLM2 size."""
+# A served LLM (generate_llm_project.py's library) as a descriptor — deploy.py writes one
+# per model (<dir>/models/<name>.json, --llm-model NAME=PATH); the legacy --llm-* /
+# --llm-360m-* / --stories-* / --vlm-* groups make the same from their flags:
+#   kind      "chat" (a chat template: Smollm2Backend), "text" (a base model:
+#             StoriesBackend, /v1/completions), "vlm" (SmolvlmBackend)
+#   lib, weights, tokenizer (its directory holds the template, llm_profile.py's files),
+#   model_id (default: the library's llm_model_name()), cma_mb, reserve,
+#   sampling (overrides of the --llm-* sampling defaults; a text model's own defaults)
+TEXT_SAMPLING = {"temperature": 0.8, "top_p": 0.9, "top_k": 0, "repetition_penalty": 1.0,
+                 "dry_multiplier": 0.0}
+
+
+def llm_backend(args, desc: dict, default_model_id: Optional[str] = None) -> Backend:
+    """The backend of a descriptor (see above)."""
+    from sampler import SamplerParams
+    kind = desc.get("kind", "chat")
+    if kind not in ("chat", "text", "vlm"):
+        raise SystemExit(f"llm model kind {kind!r}: chat, text or vlm")
+    common = dict(sampler_lib=args.llm_sampler_lib, loop_guard=not args.llm_no_loop_guard,
+                  cma_mb=desc.get("cma_mb"), model_id=desc.get("model_id"))
+    if kind == "text":
+        from stories_backend import StoriesBackend
+        return StoriesBackend(llm_engine(args, desc["lib"], desc.get("weights")), desc["tokenizer"],
+                              defaults=SamplerParams(**{**TEXT_SAMPLING, **(desc.get("sampling") or {})}),
+                              reserve=desc.get("reserve") or 128, **common)
+    base = sampler_defaults(args)
+    defaults = SamplerParams(**{**{k: getattr(base, k) for k in ("temperature", "top_p", "top_k",
+                                                                 "repetition_penalty", "dry_multiplier",
+                                                                 "dry_base", "dry_allowed_length")},
+                                **(desc.get("sampling") or {})})
+    kw = dict(common, defaults=defaults, dry_penalty_last_n=args.llm_dry_penalty_last_n,
+              dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
+              context_size=args.llm_context, reserve=desc.get("reserve") or args.llm_reserve,
+              repeat_last_n=args.llm_repeat_last_n, prefill_chunk=args.llm_prefill_chunk)
+    if kind == "vlm":
+        from smolvlm_backend import LibVlmEngine, SmolvlmBackend
+        return SmolvlmBackend(LibVlmEngine(desc["lib"], desc.get("weights")), desc["tokenizer"], **kw)
     from smollm2_backend import Smollm2Backend
-    return Smollm2Backend(
-        engine, tokenizer, sampler_lib=args.llm_sampler_lib, defaults=sampler_defaults(args),
-        dry_penalty_last_n=args.llm_dry_penalty_last_n,
-        dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
-        loop_guard=not args.llm_no_loop_guard, context_size=args.llm_context,
-        reserve=args.llm_reserve, repeat_last_n=args.llm_repeat_last_n,
-        prefill_chunk=args.llm_prefill_chunk, cma_mb=cma_mb, model_id=model_id,
-        default_model_id=default_model_id)
+    return Smollm2Backend(llm_engine(args, desc["lib"], desc.get("weights")), desc["tokenizer"],
+                          default_model_id=default_model_id, **kw)
+
+
+def legacy_llm(args, name: str) -> Optional[Tuple[dict, Optional[str]]]:
+    """(descriptor, default model id) of a backend name the flag groups define."""
+    if name in SMOLLM2_135M:
+        return (dict(kind="chat", lib=args.llm_lib, weights=args.llm_weights, tokenizer=args.llm_tokenizer,
+                     cma_mb=args.llm_cma_mb, model_id=args.llm_model_id), None)
+    if name in SMOLLM2_360M:
+        return (dict(kind="chat", lib=args.llm_360m_lib, weights=args.llm_360m_weights,
+                     tokenizer=args.llm_360m_tokenizer, cma_mb=args.llm_360m_cma_mb,
+                     model_id=args.llm_360m_model_id), "smollm2-360m-instruct")
+    if name in STORIES:
+        return (dict(kind="text", lib=args.stories_lib, weights=args.stories_weights,
+                     tokenizer=args.stories_tokenizer, cma_mb=args.stories_cma_mb,
+                     model_id=args.stories_model_id, reserve=args.stories_reserve,
+                     sampling={"temperature": args.stories_temperature, "top_p": args.stories_top_p}), None)
+    if name in SMOLVLM:
+        return (dict(kind="vlm", lib=args.vlm_lib, weights=args.vlm_weights, tokenizer=args.vlm_tokenizer,
+                     cma_mb=args.vlm_cma_mb, model_id=args.vlm_model_id), None)
+    return None
+
+
+def llm_models(args) -> Dict[str, dict]:
+    """--llm-model NAME=DESCRIPTOR.json -> {name: descriptor}."""
+    out = {}
+    for spec in args.llm_model or []:
+        name, sep, path = spec.partition("=")
+        if not sep or not name or not path:
+            raise SystemExit(f"--llm-model {spec!r}: NAME=DESCRIPTOR.json")
+        with open(path) as f:
+            out[name] = json.load(f)
+    return out
 
 
 def build_backends(args) -> Dict[str, Backend]:
     out: Dict[str, Backend] = {}
+    described = llm_models(args)
     for name in args.backend or ["bert-squad"]:
-        if name == "echo":
+        legacy = None if name in described else legacy_llm(args, name)
+        if name in described:
+            b = llm_backend(args, described[name])
+        elif legacy is not None:
+            b = llm_backend(args, *legacy)
+        elif name == "echo":
             b: Backend = EchoBackend(delay=args.echo_delay)
         elif name == "bert-squad":
             from bert_squad_backend import BertSquadBackend, LibBertEngine
             b = BertSquadBackend(LibBertEngine(args.bert_lib, args.bert_weights), args.vocab,
                                  max_windows=args.max_windows, doc_stride=args.doc_stride)
-        elif name in SMOLLM2_135M:
-            b = smollm2_backend(args, llm_engine(args, args.llm_lib, args.llm_weights),
-                                args.llm_tokenizer, args.llm_cma_mb, args.llm_model_id)
-        elif name in SMOLLM2_360M:
-            b = smollm2_backend(args, llm_engine(args, args.llm_360m_lib, args.llm_360m_weights),
-                                args.llm_360m_tokenizer, args.llm_360m_cma_mb,
-                                args.llm_360m_model_id, default_model_id="smollm2-360m-instruct")
-        elif name in STORIES:
-            from sampler import SamplerParams
-            from stories_backend import StoriesBackend
-            b = StoriesBackend(
-                llm_engine(args, args.stories_lib, args.stories_weights), args.stories_tokenizer,
-                sampler_lib=args.llm_sampler_lib,
-                defaults=SamplerParams(temperature=args.stories_temperature, top_p=args.stories_top_p,
-                                       top_k=0, repetition_penalty=1.0, dry_multiplier=0.0),
-                reserve=args.stories_reserve, model_id=args.stories_model_id,
-                cma_mb=args.stories_cma_mb, loop_guard=not args.llm_no_loop_guard)
-        elif name in ("smolvlm", "smolvlm-256m-instruct"):
-            from smolvlm_backend import LibVlmEngine, SmolvlmBackend
-            b = SmolvlmBackend(
-                LibVlmEngine(args.vlm_lib, args.vlm_weights), args.vlm_tokenizer,
-                sampler_lib=args.llm_sampler_lib, defaults=sampler_defaults(args),
-                dry_penalty_last_n=args.llm_dry_penalty_last_n,
-                dry_sequence_breakers=tuple(json.loads(args.llm_dry_sequence_breakers)),
-                loop_guard=not args.llm_no_loop_guard, context_size=args.llm_context,
-                reserve=args.llm_reserve, repeat_last_n=args.llm_repeat_last_n,
-                prefill_chunk=args.llm_prefill_chunk, cma_mb=args.vlm_cma_mb,
-                model_id=args.vlm_model_id)
         elif name in ("piper", "piper-lessac-medium"):
             from piper_backend import LibTtsEngine, PiperBackend
             b = PiperBackend(LibTtsEngine(args.tts_lib, args.tts_weights), args.tts_weights,
@@ -1842,7 +1881,8 @@ def build_backends(args) -> Dict[str, Backend]:
                                  ffmpeg=args.ffmpeg or None, max_seconds=args.asr_max_seconds)
         else:
             raise SystemExit(f"unknown backend '{name}' (known: bert-squad, smollm2, "
-                             f"smollm2-360m, smolvlm, piper, moonshine, stories15m, echo)")
+                             f"smollm2-360m, smolvlm, piper, moonshine, stories15m, echo, and the "
+                             f"--llm-model names)")
         if b.model_id in out:
             raise SystemExit(f"backend '{name}' serves model id '{b.model_id}', which another "
                              f"backend already serves (check the --llm-lib / --llm-360m-lib "
@@ -1864,10 +1904,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                     help="require 'Authorization: Bearer KEY' on /v1/* (env KV260_CHAT_API_KEY)")
     ap.add_argument("--api-key-file", default=None, help="read the API key from a file")
     ap.add_argument("--backend", action="append",
-                    choices=("bert-squad", *SMOLLM2_135M, *SMOLLM2_360M, "smolvlm",
-                             "smolvlm-256m-instruct", "piper", "piper-lessac-medium", *MOONSHINE,
-                             *STORIES, "echo"),
-                    help="backend(s) to serve (default: bert-squad); the first chat backend is the "
+                    help="backend(s) to serve (default: bert-squad): bert-squad, smollm2, smollm2-360m, "
+                         "smolvlm, stories15m, piper, moonshine, echo or a --llm-model name; the first "
+                         "chat backend is the "
                          "default model of /v1/chat/completions, the first speech backend that of "
                          "/v1/audio/speech, the first speech-to-text backend that of "
                          "/v1/audio/transcriptions")
@@ -1888,8 +1927,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--max-windows", type=int, default=8,
                     help="256-token windows per question at most (latency cap, ~0.3 s each)")
     ap.add_argument("--doc-stride", type=int, default=128)
+    ap.add_argument("--llm-model", action="append", metavar="NAME=DESCRIPTOR.json",
+                    help="an LLM library to serve as backend NAME (list it in --backend too): a JSON "
+                         "descriptor {kind: chat | text | vlm, lib, tokenizer, weights, model_id, "
+                         "cma_mb, reserve, sampling} (deploy.py writes them; see llm_backend)")
     g = ap.add_argument_group("smollm2 (generative chat with SmolLM2-135M; the sampling and "
-                              "context options apply to smollm2-360m and smolvlm too)")
+                              "context options apply to every chat / vlm model)")
     g.add_argument("--llm-lib", default=os.path.join(HERE, "lib", "libsmollm2.so"))
     g.add_argument("--llm-model-id", default=None,
                    help="model id to serve (default: the library's llm_model_name(), else "

@@ -28,6 +28,10 @@ board, a three-question conversation that the model remembers.
 | `moonshine-base` | `moonshine` | Speech to text (`POST /v1/audio/transcriptions`) | 1.3 s for 10 s of audio | [Speech to text](doc/SPEECH_TO_TEXT.md) |
 | `stories15m` | `stories15m` | Writes children's stories: continues the text it is given (`POST /v1/completions`, or a chat: a story's opening, "write a story about …", "continue") | ~166 tokens/s (130–150 greedy through the API); first token after ~20 ms | [Stories](doc/STORIES.md) |
 
+- **Other models.**  Any Llama-family checkpoint the generator builds
+  (Mistral, Granite and Phi-3 blocks, RoPE scaling and partial rotation
+  included) is served from one `llm_models` entry in `chat_config.json`,
+  with its own tokenizer and chat template ([Deploying](doc/DEPLOY.md#choosing-the-models)).
 - **Exact results.**  The board reproduces the host reference bit for bit:
   the language models' logits match the scheduler's simulation, Piper's
   audio samples and Moonshine's transcripts match their specifications.
@@ -54,7 +58,7 @@ flowchart LR
     subgraph board["KV260 · Ubuntu 22.04 · Python 3.10 standard library"]
         server["<b>kv260_chat_server.py</b><br/>/v1/models · /v1/chat/completions<br/>/v1/audio/speech · /v1/audio/transcriptions<br/>FIFO: one request on the FPGA at a time<br/>(a chat answer lends it to speech between tokens)"]
         bert["<b>bert_squad_backend.py</b><br/>squad_text.py: WordPiece,<br/>sliding windows, best span"]
-        llm["<b>smollm2_backend.py</b><br/>chatml.py, BPE tokenizer,<br/>prefix cache, libsampler.so"]
+        llm["<b>smollm2_backend.py</b><br/>chatml.py, hf_tokenizer.py,<br/>prefix cache, libsampler.so"]
         vlm["<b>smolvlm_backend.py</b><br/>idefics3.py, images"]
         tts["<b>piper_backend.py</b><br/>espeak-ng phonemes,<br/>alignment, noise"]
         asr["<b>moonshine_backend.py</b><br/>speech_input.py: WAV,<br/>resampling, detokenizer"]
@@ -151,7 +155,7 @@ for.
 ## Tests
 
 ```bash
-cd demo/chat/tests && python3 -m unittest      # 299 tests, ~45 s, no board needed
+cd demo/chat/tests && python3 -m unittest      # 334 tests, ~45 s, no board needed
 ```
 
 Some tests skip until the tokenizers they read are downloaded; see

@@ -411,14 +411,14 @@ class TestOtherShapes(unittest.TestCase):
     head_dim 64, FFN 2560 — its K = 2560 down-projection needs kw >= 3 on
     ConvKernel) and plain multi-head attention, 2 random layers each."""
 
-    def _run(self, cfg, seed):
-        W = G.tiny_weights(cfg, seed)
+    def _run(self, cfg, seed, W=None, policy=G.MIX_POLICY, **fe_kw):
+        W = W if W is not None else G.tiny_weights(cfg, seed)
         formats = G.calibrate(cfg, W, n_seq=2, length=20)
-        fe = G.frontend(cfg, W, formats, ctx=48, name="shape")
+        fe = G.frontend(cfg, W, formats, ctx=48, name="shape", **fe_kw)
         gs = graphs(fe, {"decode": ("decode", 1, False), "prefill_16": ("prefill", 16, False),
                          "head": ("head", 1, False)})
         cgs = {n: CodeGenerator(g, model_path=n) for n, g in gs.items()}
-        sm, sc = G.study_model(cfg, W, formats, policy=G.MIX_POLICY)
+        sm, sc = G.study_model(cfg, W, formats, policy=policy)
         rng = np.random.default_rng(seed)
         prompt = rng.integers(2, cfg["vocab_size"], 12)
         ses = Session(cgs, [16])
@@ -454,6 +454,53 @@ class TestOtherShapes(unittest.TestCase):
 
     def test_multi_head_attention(self):
         self._run(dict(G.TINY, num_key_value_heads=4), 4)
+
+    # ── blocks folded into the plain one (src/llm_weights.py, src/rope.py; CHAT_PLAN §29) ──
+    GRANITE = dict(G.TINY, model_type="granite", embedding_multiplier=4.0, residual_multiplier=0.5,
+                   attention_multiplier=0.1, logits_scaling=2.0)
+    PHI3 = dict(G.TINY, model_type="phi3", partial_rotary_factor=0.75, max_position_embeddings=128,
+                original_max_position_embeddings=32, tie_word_embeddings=False,
+                rope_scaling={"type": "longrope", "short_factor": [1.0, 1.2, 1.5, 2.0, 2.5, 3.0],
+                              "long_factor": [4.0] * 6})
+    LLAMA3 = dict(G.TINY, max_position_embeddings=2048,
+                  rope_scaling={"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                                "high_freq_factor": 4.0, "original_max_position_embeddings": 16})
+
+    @staticmethod
+    def fused(cfg, seed):
+        """Phi-3's checkpoint layout: q / k / v and gate / up as one tensor each, an LM head."""
+        W = G.tiny_weights(dict(cfg, tie_word_embeddings=True), seed)
+        out = {k: v for k, v in W.items() if not any(p in k for p in ("q_proj", "k_proj", "v_proj",
+                                                                         "gate_proj", "up_proj"))}
+        for li in range(cfg["num_hidden_layers"]):
+            pre = f"model.layers.{li}."
+            out[pre + "self_attn.qkv_proj.weight"] = np.concatenate(
+                [W[pre + f"self_attn.{x}_proj.weight"] for x in "qkv"])
+            out[pre + "mlp.gate_up_proj.weight"] = np.concatenate(
+                [W[pre + "mlp.gate_proj.weight"], W[pre + "mlp.up_proj.weight"]])
+        out["lm_head.weight"] = G.bf16(np.random.default_rng(seed + 7).normal(
+            0, 0.05, W["model.embed_tokens.weight"].shape).astype(np.float32))
+        return out
+
+    def test_granite_multipliers(self):
+        self._run(self.GRANITE, 5)
+
+    def test_phi3_fused_partial_longrope(self):
+        self._run(self.PHI3, 6, W=self.fused(self.PHI3, 6))
+
+    def test_llama3_scaling(self):
+        self._run(self.LLAMA3, 7)
+
+    def test_folded_blocks_on_the_unit(self):
+        """The same with the residual stream, norms, SiLU * up and every
+        attention prep on the row-ops unit (the integer RoPE over the permuted
+        partial rotation's pass-through pairs)."""
+        from unittest import mock
+        from src import _rowops_hw_config
+        for name, cfg, W in (("granite", self.GRANITE, None), ("phi3", self.PHI3, self.fused(self.PHI3, 6))):
+            with self.subTest(name), mock.patch.object(_rowops_hw_config, "ROWOPS_UNIT", True):
+                self._run(cfg, 6, W=W, policy="pow2+sink+p12+rowops+drope", decode_attn="fpga",
+                          rowops=True, drope=True)
 
 
 class TestHostEmulation(unittest.TestCase):

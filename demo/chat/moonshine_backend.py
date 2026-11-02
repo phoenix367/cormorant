@@ -12,7 +12,7 @@ chat server (POST /v1/audio/transcriptions; doc/plans/ASR_PLAN.md §7).
       quiet points into parts of at most 24.6 s (asr_chunks), each part
       encoded in the smallest bucket that holds it and decoded greedily
       (asr_transcribe); a Segment per part (cancellable between parts),
-      the token ids decoded on the host (tokenizer.json, Tokenizer)
+      the token ids decoded on the host (tokenizer.json, hf_tokenizer.py)
 
 The library's transcripts equal the specification demo/asr/scripts/
 moonshine_q.py transcribe_long token for token (ASR_PLAN §6: 200 / 200
@@ -35,7 +35,6 @@ decodes on greedily from it; below, the transcript is the plain greedy one
 from __future__ import annotations
 
 import ctypes
-import json
 import math
 import os
 import re
@@ -43,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+import hf_tokenizer
 from chat_backend import Backend, BackendError, CancelToken, Finish, Segment, TranscriptionRequest
 
 LANGUAGES = ("en", "english")
@@ -183,82 +183,23 @@ class LibAsrEngine:
         return int(self.lib.asr_max_steps(n))
 
 
-class Tokenizer:
-    """A tokenizer.json with a BPE model whose decoder is Replace("▁" -> " "),
-    ByteFallback, Fuse, Strip(1 leading space) and whose normalizer prepends "▁"
-    and replaces " " by "▁" (no pre-tokenizer) — Moonshine's (and Llama's).
-    decode: the token ids -> text, special tokens skipped, as tokenizers'
-    decode(..., skip_special_tokens=True); encode: a short text -> ids, as
-    tokenizers' encode(..., add_special_tokens=False) (the merges by rank,
-    bytes for unknown characters) — the phrase of the phrase check."""
-
-    _BYTE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+class Tokenizer(hf_tokenizer.Tokenizer):
+    """Moonshine's tokenizer.json (Llama-2's SentencePiece BPE, its 771 added
+    tokens not normalized) through hf_tokenizer.py: decode() the token ids ->
+    text, special tokens and unknown ids skipped, as tokenizers'
+    decode(..., skip_special_tokens=True); encode() a short text -> ids, as
+    tokenizers' encode(..., add_special_tokens=False) — the phrase of the
+    phrase check; ``pieces`` the token strings (None: no token)."""
 
     def __init__(self, path: str):
-        with open(path, encoding="utf-8") as f:
-            t = json.load(f)
-        if t.get("model", {}).get("type") != "BPE":
-            raise ValueError(f"{path}: a BPE tokenizer expected, not {t.get('model', {}).get('type')}")
-        vocab = t["model"]["vocab"]
-        size = max([*vocab.values(), *(a["id"] for a in t.get("added_tokens", []))]) + 1
-        self.pieces: List[Optional[str]] = [None] * size
-        for p, i in vocab.items():
-            self.pieces[i] = p
-        self.special = set()
-        for a in t.get("added_tokens", []):
-            self.pieces[a["id"]] = a["content"]
-            if a.get("special"):
-                self.special.add(a["id"])
-        steps = [d.get("type") for d in (t.get("decoder") or {}).get("decoders", [])]
-        if steps != ["Replace", "ByteFallback", "Fuse", "Strip"]:
-            raise ValueError(f"{path}: decoder {steps} is not Moonshine's")
-        self.vocab = vocab
-        self._merges = t["model"].get("merges", [])
-        self._rank: Optional[Dict[Tuple[str, str], int]] = None
-        self.unk = vocab.get(t["model"].get("unk_token") or "<unk>", 0)
+        super().__init__(path)
+        self.pieces: List[Optional[str]] = self.id_to_token
 
     def encode(self, text: str) -> List[int]:
-        if self._rank is None:
-            self._rank = {tuple(m.split(" ", 1)) if isinstance(m, str) else tuple(m): i
-                          for i, m in enumerate(self._merges)}
-        sym = list("▁" + text.replace(" ", "▁")) if text else []
-        while len(sym) > 1:
-            best = min(range(len(sym) - 1), key=lambda i: self._rank.get((sym[i], sym[i + 1]), 1 << 30))
-            if (sym[best], sym[best + 1]) not in self._rank:
-                break
-            sym[best:best + 2] = [sym[best] + sym[best + 1]]
-        ids: List[int] = []
-        for p in sym:
-            if p in self.vocab:
-                ids.append(self.vocab[p])
-            else:
-                ids += [self.vocab.get(f"<0x{b:02X}>", self.unk) for b in p.encode("utf-8")]
-        return ids
+        return super().encode(text, add_special_tokens=False)
 
     def decode(self, ids) -> str:
-        out: List[str] = []
-        buf = bytearray()
-
-        def flush():
-            if buf:
-                try:
-                    out.append(buf.decode("utf-8"))
-                except UnicodeDecodeError:
-                    out.append("�" * len(buf))
-                buf.clear()
-        for i in ids:
-            if i in self.special or not 0 <= i < len(self.pieces) or self.pieces[i] is None:
-                continue
-            p = self.pieces[i]
-            m = self._BYTE.fullmatch(p)
-            if m:
-                buf.append(int(m.group(1), 16))
-                continue
-            flush()
-            out.append(p.replace("▁", " "))
-        flush()
-        s = "".join(out)
-        return s[1:] if s.startswith(" ") else s
+        return super().decode(ids)
 
 
 PUNCT = frozenset(",.!?;:")
