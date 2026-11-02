@@ -29,7 +29,8 @@ entry) into the multi-entry KV260 project behind the chat library
      the other planning options: doc/plans/TACTICS_PLAN.md).
   3. src/codegen/multi.py: ONE project, weights deduplicated, the KV cache /
      sink and h_last as shared states -> <out>/ (CMake project, weights/*.dat
-     incl. the host tables: the bf16 embedding, RoPE cos / sin).
+     incl. the host tables: the embedding (bf16, or int16 at the residual's
+     exponent: stories15m), RoPE cos / sin).
   4. driver/ for the active kernels, test/llm_api.{c,h}, test/llm_bench.c,
      a generated test/llm_glue.h (entry functions, vocabulary, context,
      buckets), CMake targets llm_bench and smollm2 (libsmollm2.so: only the

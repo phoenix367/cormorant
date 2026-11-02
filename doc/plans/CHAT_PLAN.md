@@ -2477,7 +2477,10 @@ formats: 86 exponent entries (`calibrate --record`, `check`: REPRODUCED).
 / 256, the shipped design (FPGA attention in prefill and decode, the softmax
 unit, the row-ops unit with drope).  Pool **34.8 MiB** (weights 30.7 — the
 LM head's 32000 × 288 is 17.6 —, KV caches 2.3, intermediates 1.7), host
-tables 35.2 MiB (the float32 embedding), weight files 68 MB.
+tables 17.6 MiB, weight files 50 MB.  The embedding is float16 in the
+checkpoint (not bf16-exact), every value below 0.43: it is stored as int16
+at the residual's 2^-15 — the raw values the int32 residual takes, bit-exact
+with the float32 table it replaced (35.2 MiB; `llm_nodes.res32_table`).
 
 **Gates.**  `llm_sched_check.py` (98 s): 3 / 3 prompts bit-exact × 32 decode
 steps and a second turn at position 64.  `llm_host_emu.py`: bit-exact, also

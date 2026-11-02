@@ -124,6 +124,31 @@ class TestOpsOnHost(unittest.TestCase):
                 y = cg._graph.nodes[0].reference([np.array([0, 49, 60, -3, 7])], Q)
                 np.testing.assert_array_equal(y, tab[[0, 49, 49, 0, 7]])        # clamped
 
+    def test_embed_res32_int16_table(self):
+        """Into the int32 residual (2^-15) an f32 table that fits is int16 at
+        2^-15 (the raw values llm_embed32 writes); one that does not, and a
+        bf16 table, stay as they are."""
+        small = (RNG.normal(0, 0.2, (50, 16)).clip(-0.99, 0.99)).astype(np.float32)
+        small[3, :4] = [0.5 * 2.0 ** -15, 1.5 * 2.0 ** -15, -0.5 * 2.0 ** -15, 32767.5 * 2.0 ** -16]  # ties
+        big = small.copy()
+        big[7, 5] = 1.25                                                   # 40960 > int16 at 2^-15
+        bf = (small.view(np.uint32) & np.uint32(0xFFFF0000)).view(np.float32)
+        for kind, tab in (("i16", small), ("f32", big), ("bf16", bf)):
+            m = model([node("LlmEmbed", ["ids", "E"], ["h"]), node("LlmDequant", ["h"], ["yd"]),
+                       node("LlmToHost", ["yd"], ["y"])],
+                      [vi("ids", I32, [5])], [vi("y", F32, [5, 16])], [nph.from_array(tab, "E")],
+                      {"host": {"ids": "i32", "y": "f32"}, "dma": {"h": "i32", "yd": "f32"},
+                       "exp": {"h": 15}},
+                      [vi("h", F32, [5, 16]), vi("yd", F32, [5, 16])])
+            with self.subTest(kind=kind):
+                cg = emulate(self, m, "embed_res32_" + kind, incoherent=True)
+                sn = cg._graph.nodes[0]
+                self.assertEqual(sn.table.kind, kind)
+                self.assertEqual(sn.table.nbytes, tab.size * (4 if kind == "f32" else 2))
+                ids = np.array([3, 49, 60, -3, 7])
+                want = np.rint(tab[[3, 49, 49, 0, 7]].astype(np.float64) * 2.0 ** 15) / 2.0 ** 15
+                np.testing.assert_array_equal(sn.reference([ids], Q), want)
+
     def test_dequant_and_select_row(self):
         m = model([node("LlmDequant", ["x"], ["y"])], [vi("x", F32, [1, 40])],
                   [vi("y", F32, [1, 40])], (), {"host": {"y": "f32"}, "exp": {"x": exps(40, 7, 11)}})

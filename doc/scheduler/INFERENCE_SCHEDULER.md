@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1903 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1904 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1200,7 +1200,7 @@ even on write-back, NaN → 0 — with per-channel exponents; each op's C and
 
 | op | semantics |
 |---|---|
-| `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32; `weights/<name>.dat` when > 64 KiB), index clamped |
+| `LlmEmbed` | `h[t] = table[ids[t]]` from a host-memory table (bf16 when exact, else f32 — into the int32 residual int16 at its exponent when every value fits, `res32_table`; `weights/<name>.dat` when > 64 KiB), index clamped |
 | `LlmResAdd` | `h' = float32((double)h + d)`; with `rowops=True` the residual is an int32 DMA tensor at 2^-15 and the add runs on the row-ops unit (`ResAddRoNode`, exact), as do `LlmRMSNorm` and `LlmSiluMul` (`RMSNormRoNode`, `SiluMulRoNode`) — [§Hardware Kernels, the row-ops unit](#hardware-kernels) |
 | `LlmRMSNorm` | `ss = Σ h²`, `r = 1 / sqrt(ss / n + ε)`, `y = (h·r)·γ` (γ float32) |
 | `LlmAttention` | rows t < n: `RoPE(k0[t])` → K cache row `pos + t` at its exponent, `v[t]` re-rounded into the V cache; per (t, head): `RoPE(q)` in double, `s_j = dot8(q, k_j) · HD^-½` over keys `j ≤ pos + t` (8 lane sums over d ascending, combined `((0+1)+(2+3))+((4+5)+(6+7))`), `e_j = exp(s_j − max)`, `p_j = e_j / Σe`, `o = Σ_j p_j v_j`; rows ≥ n → 0; 4 host threads over (row, head).  A decode step (n = 1, `llm_attn_decode`) runs on all host threads in one pool dispatch, in phases separated by spin barriers — scores per (KV group, key quarter) with the group's heads sharing each K row, exp per (group, key quarter), Σe per head left to right, p per (group, key quarter), P·V per (group, lane quarter) — with the power-of-two cache scales folded out exactly (`q·2^-f` against the raw K row; P·V over raw V rows, scaled once, while p ≥ 2^-900) and NEON kernels on aarch64 (no FMA): bit-identical to the per-head code for any thread count |

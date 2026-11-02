@@ -123,3 +123,7 @@ bit-exact with the simulation on the three story prompts and a second turn.
   positions 32 / 128 / 240; prefill 8 / 12 / 32 ms for 16 / 64 / 255 tokens;
   `llm_open` 4.5 s cold, 0.15 s warm; 33 MB of CMA.  The LM head (32000 × 288)
   is 2.5 ms of a decode step.
+- **Memory**: 33 MB of CMA (the pool: weights 30.7 MiB, KV caches 2.3,
+  intermediates 1.7), and in normal memory the embedding table, 17.6 MiB —
+  int16 at the residual's 2^-15, exact for this checkpoint's float16 values
+  (CHAT_PLAN §27) — and the tokenizer, ~17 MiB of Python objects.

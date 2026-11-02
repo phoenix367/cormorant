@@ -11,7 +11,8 @@ it).  They are the float regions of the numeric policy pow2+sink+p12+xattn of
 demo/chat/scripts/llm_study.py, whose ``Model`` is the specification:
 
   LlmEmbed     ids (i32 host) -> h (f32 host) = table[id] (a host-memory
-               bf16 / f32 table, not a DMA weight)
+               bf16 / f32 table, not a DMA weight; into the int32 residual an
+               f32 table is int16 at the residual's exponent where it fits)
   LlmResAdd    h (f32), d (int16 at its exponents) -> float32(h + d)
   LlmRMSNorm   h (f32) -> y (int16):  ss = sum h_i^2 left to right,
                r = 1 / sqrt(ss / n + eps), y_i = (h_i * r) * gamma_i
@@ -212,6 +213,21 @@ def table_kind(values: np.ndarray) -> str:
     return "bf16" if not (v.view(np.uint32) & np.uint32(0xFFFF)).any() else "f32"
 
 
+def res32_table(table: HostTable, exps: np.ndarray) -> HostTable:
+    """An f32 table read only into the int32 residual (one exponent f for every
+    channel) as int16 at 2^-f: the raw values llm_embed32 writes (round half to
+    even), half the bytes.  The table as it is when a value does not fit int16
+    (or the exponents differ, or it is already 16-bit)."""
+    e = np.asarray(exps, np.int64).reshape(-1)
+    if table.kind != "f32" or (e != e[0]).any():
+        return table
+    f = int(e[0])
+    q = np.rint(np.asarray(table.data, np.float32).astype(np.float64) * 2.0 ** f)
+    if q.min() < -32768 or q.max() > 32767:
+        return table
+    return HostTable(f"{table.name}_q{f}", "i16", q.astype(np.int16))
+
+
 def scale_item(exps: np.ndarray) -> Tuple[str, str, RuntimeItem]:
     """(scale name, inverse-scale name, runtime item) for a per-channel
     exponent vector: two double arrays 2^-f and 2^f built at init with ldexp
@@ -267,9 +283,9 @@ def _f32(v):
 
 def _res32(v: np.ndarray, f) -> np.ndarray:
     """The int32 DMA residual's value grid: round half to even at 2^f, saturated
-    to int32 (llm_study res32; exact in float64)."""
+    to int32 (llm_study res32; exact in float64; + 0.0: an int32 has no -0)."""
     f = np.asarray(f, np.float64)
-    raw = np.clip(np.rint(np.asarray(v, np.float64) * np.power(2.0, f)), -2147483648.0, 2147483647.0)
+    raw = np.clip(np.rint(np.asarray(v, np.float64) * np.power(2.0, f)), -2147483648.0, 2147483647.0) + 0.0
     return raw / np.power(2.0, f)
 
 
@@ -416,7 +432,10 @@ class LlmEmbedNode(LlmNode):
     """h[t] = table[ids[t]] (float32 host rows); the index is clamped to
     [0, rows) like Gather.  With a third input — image rows [R][d] (float32
     host, the vision entry's state, src/vit.py) — ids rows .. rows + R - 1
-    select image row id - rows (the index clamped to [0, rows + R))."""
+    select image row id - rows (the index clamped to [0, rows + R)).  Into
+    the int32 residual without image rows, an f32 table whose values all fit
+    is stored as int16 at the residual's exponent (``res32_table``: the same
+    raw values, half the host memory — stories15m's float16 checkpoint)."""
     rows:       int = 1
     d:          int = 1
     n:          int = 1
@@ -441,6 +460,8 @@ class LlmEmbedNode(LlmNode):
                  F=ctx.frac_bits)
         sn._want(ids, "i32", "ids")
         sn.res32 = sn._want_residual(y, "output")
+        if sn.res32 and img is None:
+            sn.table = res32_table(sn.table, y.exp_channels(sn.F))
         if img is not None:
             if img.dma != "f32":                    # float32 host, or the unit's DEQUANT output (DMA)
                 sn._want(img, "f32", "image rows")
@@ -459,6 +480,8 @@ class LlmEmbedNode(LlmNode):
                 + (f" + {self.image_rows} image rows" if self.image_rows else ""))
 
     def c_call(self, ins, out, scratch, direct, dtype):
+        if self.table.kind == "i16":
+            return [f"llm_embed16({ins[0]}, {self.n}u, {self.table.name}, {self.rows}u, {self.d}u, {out});"]
         bf = self.table.kind == "bf16"
         t16, t32 = (self.table.name, "NULL") if bf else ("NULL", self.table.name)
         img = f"{ins[1]}, {self.image_rows}u, " if self.image_rows else ""
@@ -470,6 +493,10 @@ class LlmEmbedNode(LlmNode):
 
     def reference(self, ins, dtype):
         k = np.asarray(ins[0], np.float64).reshape(-1).astype(np.int64)
+        if self.table.kind == "i16":
+            q = np.asarray(self.table.data, np.int16).reshape(self.rows, self.d)
+            out = q[np.clip(k, 0, self.rows - 1)] / np.power(2.0, self.output.exp_channels(self.F))[None, :]
+            return out.reshape(self.output.shape)
         tab = np.asarray(self.table.data, np.float32).reshape(self.rows, self.d)
         if not self.image_rows:
             out = tab[np.clip(k, 0, self.rows - 1)].astype(np.float64)
@@ -1672,7 +1699,7 @@ static int llm_load_table(void **dst, const char *name, size_t bytes)
     return 0;
 }
 
-/* ---- LlmEmbed: h[t] = table[ids[t]] (bf16 or f32 rows; index clamped) ---- */
+/* ---- LlmEmbed: h[t] = table[ids[t]] (bf16 or f32 rows, int16: llm_embed16; index clamped) ---- */
 typedef struct {
     const int32_t  *ids;
     const uint16_t *t16;
@@ -1757,6 +1784,39 @@ static void llm_embed32(const int32_t *ids, unsigned n, const uint16_t *t16, con
     llm_embed32_t a;
     a.ids = ids; a.t16 = t16; a.t32 = t32; a.rows = rows; a.d = d; a.scale = ldexp(1.0, f); a.h = h;
     host_parallel(llm_embed32_range, &a, n, host_row_grain(d), 1u);
+}
+
+/* LlmEmbed into the int32 residual from an int16 table already at its exponent
+ * (res32_table: the raw values llm_embed32 writes, half the bytes). */
+typedef struct {
+    const int32_t *ids;
+    const int16_t *tq;
+    unsigned       rows, d;
+    int32_t       *h;
+} llm_embed16_t;
+
+static void llm_embed16_range(void *p, unsigned t0, unsigned t1)
+{
+    const llm_embed16_t *a = (const llm_embed16_t *)p;
+    unsigned t, i;
+    for (t = t0; t < t1; t++) {
+        long           k = (long)a->ids[t];
+        int32_t       *h = a->h + (size_t)t * a->d;
+        const int16_t *r;
+        if (k < 0) k = 0;
+        if (k >= (long)a->rows) k = (long)a->rows - 1;
+        r = a->tq + (size_t)k * a->d;
+        for (i = 0u; i < a->d; i++)
+            h[i] = r[i];
+    }
+}
+
+static void llm_embed16(const int32_t *ids, unsigned n, const int16_t *tq, unsigned rows,
+                        unsigned d, int32_t *h)
+{
+    llm_embed16_t a;
+    a.ids = ids; a.tq = tq; a.rows = rows; a.d = d; a.h = h;
+    host_parallel(llm_embed16_range, &a, n, host_row_grain(d), 1u);
 }
 
 /* ---- LlmResAdd: y = float32((double)h + x·sx) ---- */
