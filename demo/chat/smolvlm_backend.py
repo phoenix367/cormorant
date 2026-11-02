@@ -79,7 +79,9 @@ class SmolvlmBackend(Smollm2Backend):
     model_id = MODEL_ID
     fingerprint = "kv260-smolvlm-256m-pow2+sink+p12"
     accepts_images = True
-    cma_mb = 520.0                      # fallback; the 495 MiB pool BO + the image buffer
+    eog_tokens = EOG_TOKENS
+    cma_mb = 550.0                      # fallback = --vlm-cma-mb's default: the 495 MiB pool BO + the
+                                        # image buffer (520-530 MB measured)
 
     def __init__(self, engine, tokenizer_path: str, *, image_cache: Optional[ImageCache] = None,
                  max_images: int = 8, **kw):
@@ -99,7 +101,6 @@ class SmolvlmBackend(Smollm2Backend):
             return
         super().load_host()
         self.builder = idefics3.PromptBuilder(self.tok.encode)
-        self.eog = frozenset(self.tok.special[t] for t in EOG_TOKENS if t in self.tok.special)
         self.image_tok = self.tok.special[idefics3.IMAGE]
 
     def load(self) -> None:

@@ -66,17 +66,24 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import llm_model                                    # noqa: E402  (standard library only)
+
 CHAT = HERE.parent
 REPO = CHAT.parent.parent
 ASSETS = CHAT / "assets"
 MANIFEST = HERE / "llm_models.json"
 STUDY = HERE / "llm_study.py"
-DEFAULT_MODEL = "smollm2-135m-instruct"          # llm_study.DEFAULT_MODEL: study files in assets/study
+DEFAULT_MODEL = llm_model.DEFAULT_MODEL           # its study files in assets/study (llm_model.LEGACY)
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 SHIPPED_POLICIES = "bf16,pow2+sink+p12,pow2+sink+p12+mix"
 SHIPPED = "pow2+sink+p12"             # FPGA attention in prefill and decode (doc/plans/KV_DECODE_PLAN.md)
 CHECKPOINT_FILES = ("config.json", "generation_config.json", "model.safetensors", "tokenizer.json",
                     "tokenizer_config.json", "special_tokens_map.json", "vocab.json", "merges.txt")
+# pinned too when the repository has them: chat templates kept beside the
+# tokenizer config, added tokens, a sharded checkpoint's index (+ its shards)
+EXTRA_FILES = ("chat_template.jinja", "chat_template.json", "added_tokens.json",
+               "model.safetensors.index.json")
 
 
 class CalibrationError(RuntimeError):
@@ -110,11 +117,8 @@ def model_texts(m: dict, model: str) -> dict:
 
 
 def chat_model(d: Path) -> bool:
-    """llm_study.Profile's test: a chat template in tokenizer_config.json."""
-    try:
-        return "chat_template" in json.loads((Path(d) / "tokenizer_config.json").read_text())
-    except OSError:
-        return True
+    """llm_model.Profile's test: the checkpoint has a chat template."""
+    return llm_model.chat_template(str(d)) is not None
 
 
 def model_spec(m: dict, model: str) -> dict:
@@ -126,8 +130,8 @@ def model_spec(m: dict, model: str) -> dict:
 
 
 def study_dir(root: Path, model: str) -> Path:
-    """llm_study.study_dir for assets under ``root``."""
-    return root / "study" if model == DEFAULT_MODEL else root / "study" / model
+    """llm_model.study_dir for assets under ``root``."""
+    return Path(llm_model.study_dir(str(root / model)))
 
 
 def provenance_path(root: Path, model: str, policy: str) -> Path:
@@ -136,14 +140,21 @@ def provenance_path(root: Path, model: str, policy: str) -> Path:
     return root / "study" / model / f"formats_{policy}.provenance.json"
 
 
+def hf_request(url: str) -> urllib.request.Request:
+    """A request with HF_TOKEN's bearer token, when set (gated repositories)."""
+    headers = {"User-Agent": "axi_demo-llm_calibrate/1"}
+    if os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+    return urllib.request.Request(url, headers=headers)
+
+
 def download(url: str, dest: Path, want: Optional[str]) -> str:
     """Stream url into dest (via a .part file) and return its SHA-256; with
     ``want`` a mismatch removes the file and raises."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     h = hashlib.sha256()
-    req = urllib.request.Request(url, headers={"User-Agent": "axi_demo-llm_calibrate/1"})
-    with urllib.request.urlopen(req, timeout=120) as r, open(part, "wb") as f:
+    with urllib.request.urlopen(hf_request(url), timeout=120) as r, open(part, "wb") as f:
         for block in iter(lambda: r.read(1 << 20), b""):
             h.update(block)
             f.write(block)
@@ -404,21 +415,28 @@ def cmd_study(m: dict, model: str, root: Path, py: Optional[str], *, quick: bool
 
 def cmd_add(m: dict, model: str, repo: str, revision: str, root: Path,
             manifest_path: Path = MANIFEST, base_url: str = HF, py: Optional[str] = None) -> None:
-    with urllib.request.urlopen(f"{base_url}/api/models/{repo}/revision/{revision}", timeout=60) as r:
+    with urllib.request.urlopen(hf_request(f"{base_url}/api/models/{repo}/revision/{revision}"),
+                                timeout=60) as r:
         info = json.load(r)
     sha = info["sha"]
     d = root / model
     files = {}
-    # the files the repo has: a SentencePiece checkpoint (stories15m) has no vocab.json / merges.txt
+    # the files the repo has: a SentencePiece checkpoint (stories15m) has no vocab.json / merges.txt,
+    # a sharded one model.safetensors.index.json and its shards instead of model.safetensors
     have = {s["rfilename"] for s in info.get("siblings") or []}
-    for name in CHECKPOINT_FILES:
+    sharded = bool(have) and "model.safetensors" not in have and "model.safetensors.index.json" in have
+    names = list(CHECKPOINT_FILES) + [n for n in EXTRA_FILES if n in have]
+    while names:
+        name = names.pop(0)
         if have and name not in have:
-            if name in ("config.json", "model.safetensors", "tokenizer.json"):
+            if name in ("config.json", "tokenizer.json") or (name == "model.safetensors" and not sharded):
                 raise CalibrationError(f"{repo} @ {sha[:12]}: no {name}")
             continue
         p = d / name
         files[name] = download(f"{base_url}/{repo}/resolve/{sha}/{name}", p, None)
         print(f"  {name}: {files[name][:16]}…", flush=True)
+        if name == "model.safetensors.index.json" and sharded:
+            names += sorted(set(json.loads(p.read_text())["weight_map"].values()))
     m["models"][model] = {"repo": repo, "revision": sha,
                           "license": (info.get("cardData") or {}).get("license"),
                           "files": files, "formats": {"policy": "pow2+sink+p12", "sha256": None}}

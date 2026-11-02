@@ -182,12 +182,8 @@ def text_prompt_ids(tok, text):
 
 # ------------------------------------------------------------------ weights / configs
 class TCfg(ls.Cfg):
-    def __init__(self, c):                       # text_config
-        self.L = c["num_hidden_layers"]; self.D = c["hidden_size"]; self.H = c["num_attention_heads"]
-        self.KV = c["num_key_value_heads"]; self.F = c["intermediate_size"]; self.V = c["vocab_size"]
-        self.HD = c.get("head_dim") or self.D // self.H
-        self.eps = float(c["rms_norm_eps"]); self.theta = float(c["rope_theta"])
-        self.tied = False
+    def __init__(self, c):                       # text_config, through llm_arch (untied: lm_head)
+        self._set(ls.arch().LlamaConfig.from_dict({**c, "tie_word_embeddings": False}))
 
 
 class VCfg:

@@ -32,7 +32,7 @@ model gets `build/llm_project_$T`, `lib/lib$T.so`, `/root/${T}_weights`,
 ## 0. Intake — what is reused, what needs code
 
 Preconditions: a GO section in CHAT_PLAN (model-study route A; `llama_fit.py`
-eligible — plain Llama block, one `model.safetensors`, pool < ~920 MiB).
+eligible — plain Llama block, `model.safetensors` or a sharded index, pool < ~920 MiB).
 After step 1's `add` (it downloads the checkpoint):
 
 ```bash
@@ -40,18 +40,30 @@ python3 .claude/skills/llm-onboard/scripts/onboard_check.py demo/chat/assets/$N 
 ```
 
 It checks what `llama_fit.py` does not: every linear's K ≤ MatmulKernel
-`max_k` (4096), a single safetensors file, the tokenizer pipeline the board's
-`smollm2_tokenizer.py` accepts, `<|im_start|>` = 1 / `<|im_end|>` = 2,
-SmolLM2's chat template, tokenizer.json byte-identical to 135M's, tokenizer
-size = `vocab_size`, the pin, and the names the tools derive from `$N`.
-Exit 0 = the table's left column applies; exit 1 = do the CODE items first.
+`max_k` (4096), a checkpoint file, the tokenizer pipeline one of the board's
+tokenizers accepts (`smollm2_tokenizer.py` / `llama_tokenizer.py`), the
+profile `llm_model.Profile` derives (chat or text, the sink token, the
+end-of-generation ids, the context), SmolLM2's chat template, tokenizer size
+≤ `vocab_size`, the pin, and the names the tools derive from `$N`.  Exit 0 =
+the table's left column applies; exit 1 = do the CODE items first.
+
+What is per model by itself (CHAT_PLAN §28): `src/llm_arch.py` parses
+config.json for the study and the frontend and refuses every key it does not
+implement; `generate_llm_project.py` refuses a checkpoint tensor no graph
+read (`src/checkpoint.py check_consumed`: a bias, an extra norm); sharded
+checkpoints load; `llm_calibrate.py add` pins the repo's files (chat
+templates, added tokens, the shards; `HF_TOKEN` for gated repos);
+`scripts/llm_model.py` gives the names and the profile from the checkpoint's
+own files; the gates tokenize with the model's own tokenizer into its study
+directory (`prompt_ids.json`, `second_turn_ids.json`); `validate` fails when
+the prompts tokenize differently from Hugging Face.
 
 | step | SmolLM2-text checkpoint (exit 0: SmolLM2 tokenizer + ChatML, e.g. the 360M) | otherwise |
 |---|---|---|
-| 1 pin / calibrate / study | unchanged | `add` fetches a fixed 8-file list; `llm_study.py` hard-codes ChatML (`chatml()`), sink id 1, EOS 2 |
-| 2 generate | unchanged (`--assets --model-name`) | K > 4096: split K in `src/llama.py`; shards: `load_safetensors` |
-| 3–4 gates | unchanged | `llm_project.tokenize_prompts()` / `second_turn_ids()` always tokenize with 135M's tokenizer into shared caches (`assets/study/phase3_prompt_ids.json`, `phase5_second_turn_ids.json`); `llm_lib_check.py` hard-codes 135M ids and `context == 1024` |
-| 5 serve | **needs a backend entry (code, §5B)** — or repoint an existing slot (config only, replaces that model, §5A) | `smollm2_tokenizer.py` (raises on another pipeline), `chatml.py`, the backend's `<|im_start|>` sink |
+| 1 pin / calibrate / study | unchanged | `llm_study.py` renders ChatML (`chatml()`) and refuses another template |
+| 2 generate | unchanged (`--assets --model-name`) | K > 4096: split K in `src/llama.py` |
+| 3–4 gates | unchanged | — |
+| 5 serve | **needs a backend entry (code, §5B)** — or repoint an existing slot (config only, replaces that model, §5A) | a tokenizer pipeline neither board tokenizer loads, a template other than ChatML (`chatml.py`), the backend's `<|im_start|>` sink |
 
 **A base model without a chat template** (stories15m, CHAT_PLAN §27) has its
 "otherwise" column done: `llm_calibrate.py add` pins the files its repo has
@@ -67,8 +79,8 @@ needs only its own prompt texts and a backend tuple like `STORIES`.
 
 Not possible on this path today (model-study route C, or a bitstream / CMA
 change): non-Llama blocks (biases, LayerNorm, GELU MLP, partial rotary,
-`rope_scaling`, sliding window, MoE — the frontend ignores unknown config
-keys silently, so trust `llama_fit.py`, not a successful generation); pools
+`rope_scaling`, sliding window, MoE — `src/llm_arch.py` refuses them, and an
+unknown config key until it is listed as harmless in `HARMLESS`); pools
 above ~920 MiB (≈ 440 M int16 params with the KV caches); K > 4096; a context
 not a multiple of 64 (the V cache's P·V image, `pv_kw` 4; 16 works at a lower
 P·V speed); another VLM

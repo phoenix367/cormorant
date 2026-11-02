@@ -26,6 +26,10 @@ stories15M (Karpathy's llama2.c model trained on TinyStories, 2026-11-02): a bas
 model that continues stories — bit-exact on the board, 6.0 ms per token
 (~166 tok/s), served on POST /v1/completions and as a story continuation on
 /v1/chat/completions (§27).
+Unseen models, step 1 (2026-11-02): a config, a tensor or an exponent the
+stack does not implement is refused instead of dropped; a checkpoint's names
+and profile (sink, end ids, context) come from its own files; the gates
+tokenize per model; the served libraries regenerate byte-identical (§28).
 Not done:
 q/k/v + gate/up fusion, int8 weights.  §7 is the pre-implementation estimate; measured numbers are in
 §13.4, §16.3, §17 and §19.  Builds on doc/plans/BERT_PLAN.md (BERT-base SQuAD at
@@ -2541,3 +2545,98 @@ through the API; with the default sampling ~95 tok/s (the sampler over the
 
 Open: the LM head on MatmulKernel's GEMV path (40 % of a decode step);
 `logprobs` on /v1/completions.
+
+
+## 28. Unseen models, step 1 — guards and per-model identity (2026-11-02)
+
+A review of the LLM stack for adaptability found that an unsupported
+checkpoint could come out **wrong with every gate passing**: the study
+(`llm_study.py`, the specification) and the frontend (`src/llama.py`) parsed
+config.json separately, read only the tensors they knew, and implemented the
+same fixed Llama block, so whatever both dropped — Qwen2's q/k/v biases,
+Llama-3's `rope_scaling`, Gemma's (1 + w) norms, Granite's multipliers — made
+them agree on the wrong model.  Several "generic" parts were SmolLM2's: token
+1 as the sink, EOS 2, the gates' prompts tokenized with the 135M's tokenizer
+into a shared cache, a missing exponent defaulting to 2^-8.  Step 1 makes
+these loud or per model; step 2 generalizes (the architecture descriptor,
+chat templates, tokenizers, the serving registry).
+
+**Guards.**
+
+| what | where | before |
+|---|---|---|
+| config.json: one parser for the study, the frontend, the VLM text model, `llama_fit.py`; `problems()` lists every key not read, not known harmless (Hugging Face bookkeeping, generation defaults) and not at the plain block's value (biases, activation, RoPE scaling / partial / interleaved, sliding window, softcapping, extra norms) — an unknown key is refused until someone checks it | `src/llm_arch.py` | each read ~10 keys, ignored the rest |
+| every checkpoint tensor read: `LazySafetensors` / `Tracked` record reads; the generator after building every entry and the study's first float model raise on the rest | `src/checkpoint.py check_consumed` | unread tensors dropped |
+| a class@layer the formats lack | `Formats.get` | 2^-8 |
+| the LM head as Hugging Face builds it: the embedding when tied, else `lm_head.weight`, which must exist | `lm_weight` (frontend and study) | `lm_head` if present, else the embedding |
+| prompts that tokenize differently from Hugging Face | `llm_study.py validate` exits 1 | printed a count |
+| a chat template other than ChatML | `llm_study.Profile` | rendered as ChatML anyway |
+
+**Checkpoints.**  `src/checkpoint.py` reads one `model.safetensors` or the
+shards of `model.safetensors.index.json` (frontend, study, VLM);
+`llm_calibrate.py add` pins the files the repository has — the shards,
+`chat_template.jinja` / `.json`, `added_tokens.json` — and sends `HF_TOKEN`
+for gated repositories.
+
+**Identity** (`demo/chat/scripts/llm_model.py`, the standard library only).
+The names — tag, project directory, board paths, study directory, with
+SmolLM2-135M's original ones as data (`LEGACY`) instead of four code paths —
+and the profile, from the checkpoint's own files:
+
+- chat or text: a chat template in `tokenizer_config.json` (a string or a
+  named list), `chat_template.jinja` or `chat_template.json`;
+- the sink: the first token every rendering starts with — the BOS where the
+  template writes `bos_token` first (Llama-3, Mistral, Gemma), else the
+  special token whose text comes first (ChatML: `<|im_start|>`); a text
+  model's BOS;
+- the end-of-generation ids: `generation_config.json`'s and `config.json`'s
+  `eos_token_id` (an int or a list) and `tokenizer_config.json`'s
+  `eos_token`; a text model also stops at its BOS;
+- the context: `max_position_embeddings`, at most 1024.
+
+For the shipped models this gives what the constants said (SmolLM2: sink 1,
+end (2), 1024; stories15m: 1, (1, 2), 256; SmolVLM: 1, (49279), 1024).
+`llm_study.Profile` extends it with the study's prompts and texts; chat
+prompts are encoded as rendered, with no special token added by the
+tokenizer (a template that writes its BOS would have got two), and the
+formats JSON's `sink_token` is the profile's.  The gates' prompt and
+second-turn ids (`llm_project.tokenize_prompts` / `second_turn_ids`) come
+from the model's own tokenizer, cached in its study directory
+(`prompt_ids.json`, `second_turn_ids.json`); `llm_sched_check.py` takes the
+sink from the profile.  `onboard_check.py` reports the derived profile and
+accepts either board tokenizer.
+
+**Serving.**  A library may have more vocabulary rows than the tokenizer has
+tokens (Qwen2.5, Phi-3 pad them): the sampler, logprobs and `min_tokens` see
+the tokenizer's rows (a view, no copy), only a smaller library is refused.
+The context and vocabulary are read from the library when the backend is
+built (`llm_context_size()` / `llm_vocab_size()` are compile-time constants),
+so a model that is not resident trims right from its first request.  An
+empty end-of-generation set is a load error.  A backend whose host side or
+startup load fails is dropped with its traceback — left out of /v1/models,
+listed under `/health` `"unavailable"`, 503 `model_not_loaded` for its
+requests — and the others are served; the server exits only when none is
+left.  The class `cma_mb` fallbacks match the shipped values (SmolLM2 330,
+SmolVLM 550; registered in facts.yaml `chat.cma_mb`).
+
+**Fixed on the way.**  `vlm_host_emu.py` rebuilt the frontends without the
+project's `rowops` / `drope` (a `--rowops off` project would have been
+replayed with the platform's default; `llm_board.py` passed them).
+
+**Verification.**  The four served libraries (SmolLM2-135M / 360M, SmolVLM,
+stories15m) regenerated from the previous commit and from this one are
+byte-identical apart from the "Generated at" lines (weights, sources,
+project.json); `llm_calibrate.py check` REPRODUCED for SmolLM2-135M (33 s),
+360M (96 s) and stories15m (4 s); the prompt, second-turn and held-out ids
+of all three equal the previous ones.  Tests: scheduler 1915 (11 new in
+`test_llm_arch.py`: the guard, sharded / dtype loading, unread tensors, the
+strict formats, the tied head), chat 299 (`test_llm_model.py` and the
+serving cases).  No board run: the libraries did not change.
+
+Open (step 2): one architecture descriptor with the weight transforms shared
+by the study and the frontend (fused projections, (1 + w), √d, multipliers,
+partial / interleaved RoPE through moonshine's row permutation, RoPE
+scaling); chat templates rendered from the checkpoint (Jinja) instead of
+`chatml()`; one tokenizer driven by tokenizer.json; a per-model serving
+descriptor with the library exporting its sink token, pool size and policy;
+the VLM scripts on the same pipeline.

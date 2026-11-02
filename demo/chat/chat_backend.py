@@ -30,7 +30,9 @@ Contract:
     run at startup or under the FPGA lock, when the server makes the model
     resident or evicts it for another one (--resident; a backend's cma_mb
     says how much CMA it holds when loaded, uses_fpga = False backends are
-    always resident).  load() may run again after unload().
+    always resident).  load() may run again after unload().  A backend
+    whose load_host() or startup load() raises is dropped (logged, not
+    served); the server serves the others.
   * prepare() may raise BackendError (-> an OpenAI-style 4xx JSON error);
     it must not touch the FPGA.
   * generate() yields zero or more Delta(text) and then exactly one Finish.

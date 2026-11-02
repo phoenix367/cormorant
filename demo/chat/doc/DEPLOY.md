@@ -168,8 +168,8 @@ order:
 3. **The CMA clean-up:** drop the page cache, compact memory.
 4. **The server.**  The unit is `Type=notify`: the server tells systemd
    once its startup models are loaded, so `systemctl start` returns only
-   then.  A server that fails to load, or takes longer than
-   `health_timeout` + 120 s, fails the start.  After a boot, with the
+   then.  A server left with no model to serve, or one that takes longer
+   than `health_timeout` + 120 s, fails the start.  After a boot, with the
    board's six backends, the whole start took 112 s (2026-10-25), nearly
    all of it the models' weights read from the SD card.
 
@@ -222,9 +222,18 @@ first one is the default model.
   `weights_dir`, `model_id`, `tokenizer`, `cma_mb`) and `server.resident`.
   The `smollm2` block's sampling defaults apply to the SmolLM2 and SmolVLM
   models; `stories15m` has its own (`temperature`, `top_p`, `reserve`).
-- **A library that fails to load.**  The server still starts with the other
-  backends (not when it is the first FPGA model or `--resident all`: then
-  the server stops).  Requests for the missing model get 503 `model_not_loaded`.
+- **A model that fails to start.**  A backend whose host side (its
+  tokenizer, the end-of-generation tokens, the library's vocabulary) or
+  whose startup load fails is dropped, its traceback in the server log.
+  The server starts with the others (the next FPGA model loads in its
+  place): `/v1/models` leaves the model out, `/health` lists it under
+  `unavailable` (the deploy's health step names it), and requests for it
+  get 503 `model_not_loaded` with the reason.  It is never loaded or
+  evicted later; the server exits only when no backend is left.
+- **A model that fails to load later.**  A model not loaded at startup
+  (`--resident one` / `auto`) loads on its first request; when that load
+  fails, the request gets 503 `model_not_loaded` and `/health` turns
+  `error` until a load succeeds.
 
 ## The FPGA and the board lock
 

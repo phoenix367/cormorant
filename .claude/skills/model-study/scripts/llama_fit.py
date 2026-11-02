@@ -27,9 +27,23 @@ usage: python3 .claude/skills/model-study/scripts/llama_fit.py CONFIG.json|DIR [
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[4]
+
+
+def llm_arch():
+    """inference-scheduler/src/llm_arch.py (the standard library only): the config
+    guard the frontend and the study apply."""
+    path = REPO / "inference-scheduler" / "src" / "llm_arch.py"
+    spec = importlib.util.spec_from_file_location("_axi_src_llm_arch", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 CMA_MB = 1400.0
 RESIDENT = {"bert-squad": 216, "smollm2-135m": 299, "smollm2-360m": 758, "smolvlm-256m": 495}  # MiB
@@ -63,26 +77,16 @@ def main(argv=None) -> int:
     HD = c.get("head_dim") or D // H
     tied = c.get("tie_word_embeddings", True)
 
-    issues = []
+    # the frontend's and the study's own guard (src/llm_arch.py): another block, a key at a
+    # value they do not implement, an unknown key
+    issues = list(llm_arch().problems(c))
     arch = (c.get("architectures") or ["?"])[0]
-    if c.get("model_type") != "llama" and arch != "LlamaForCausalLM":
-        issues.append(f"model_type {c.get('model_type')!r} / {arch}: not a Llama block "
-                      f"(the frontend and the study implement Llama only)")
-    if c.get("rope_scaling"):
-        issues.append(f"rope_scaling {c['rope_scaling']}: not implemented (plain rotate-half RoPE)")
-    if c.get("hidden_act", "silu") != "silu":
-        issues.append(f"hidden_act {c['hidden_act']!r}: SwiGLU with SiLU only")
-    for k in ("attention_bias", "mlp_bias"):
-        if c.get(k):
-            issues.append(f"{k}: biases are not implemented")
     if D % H or HD * H != D and "head_dim" not in c:
         issues.append(f"hidden {D} / heads {H}: head_dim not integral")
     if H % KV:
         issues.append(f"{H} heads over {KV} KV heads: not a GQA grouping")
-    if files and "model.safetensors" not in files:
-        shards = [f for f in files if f.endswith(".safetensors")]
-        issues.append("no single model.safetensors" + (f" (sharded: {len(shards)} files; merge them "
-                      "or extend load_safetensors)" if shards else ""))
+    if files and "model.safetensors" not in files and "model.safetensors.index.json" not in files:
+        issues.append("no model.safetensors / model.safetensors.index.json")
 
     per_layer = D * H * HD + 2 * D * KV * HD + H * HD * D + 3 * D * F + 2 * D
     params = V * D + L * per_layer + D + (0 if tied else V * D)

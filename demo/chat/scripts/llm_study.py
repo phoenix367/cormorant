@@ -106,78 +106,58 @@ another Llama checkpoint (e.g. assets/smollm2-360m-instruct).  Results:
 others (study_dir).
 Deterministic: greedy decoding only, no sampling, fixed data.
 """
-import argparse, collections, json, math, os, struct, subprocess, sys, time
+import argparse, collections, json, math, os, sys, time
 import numpy as np
 
-_VSMX = None
+_SRC = {}
 
 
-_ROWOPS = None
+def _src(name):
+    """inference-scheduler/src/<name>.py (numpy / the standard library only),
+    loaded by path once, without the scheduler package."""
+    if name not in _SRC:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
+                         "inference-scheduler", "src", name + ".py")
+        spec = importlib.util.spec_from_file_location("_axi_src_" + name, p)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod                  # dataclasses look their module up
+        spec.loader.exec_module(mod)
+        _SRC[name] = mod
+    return _SRC[name]
 
 
 def rowops():
-    """inference-scheduler/src/rowops_spec.py (numpy only), loaded by path: the
-    row-ops unit's integer specifications (doc/plans/HOSTOPS_PLAN.md §5)."""
-    global _ROWOPS
-    if _ROWOPS is None:
-        import importlib.util
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
-                         "inference-scheduler", "src", "rowops_spec.py")
-        spec = importlib.util.spec_from_file_location("rowops_spec", p)
-        _ROWOPS = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_ROWOPS)
-    return _ROWOPS
+    """inference-scheduler/src/rowops_spec.py: the row-ops unit's integer
+    specifications (doc/plans/HOSTOPS_PLAN.md §5)."""
+    return _src("rowops_spec")
 
 
 def vsmx():
-    """inference-scheduler/src/vectorop_smx.py (numpy only), loaded by path: the
-    FPGA softmax's specification without the scheduler package."""
-    global _VSMX
-    if _VSMX is None:
-        import importlib.util
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
-                         "inference-scheduler", "src", "vectorop_smx.py")
-        spec = importlib.util.spec_from_file_location("vectorop_smx", p)
-        _VSMX = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_VSMX)
-    return _VSMX
+    """inference-scheduler/src/vectorop_smx.py: the FPGA softmax's specification."""
+    return _src("vectorop_smx")
+
+
+def arch():
+    """inference-scheduler/src/llm_arch.py: the config parser and its guard,
+    shared with the scheduler frontend (doc/plans/CHAT_PLAN.md §28)."""
+    return _src("llm_arch")
+
+
+def ckpt():
+    """inference-scheduler/src/checkpoint.py: the safetensors reader."""
+    return _src("checkpoint")
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-DEFAULT_MODEL = "smollm2-135m-instruct"
-REL = os.path.join("demo", "chat", "assets", DEFAULT_MODEL)
-
-
-def study_dir(assets):
-    """Where the study results and formats of the model in ``assets`` live:
-    <assets>/../study for the default SmolLM2-135M (its original place),
-    <assets>/../study/<model dir> for any other checkpoint (the tokenizer-only
-    prompt caches of llm_project.py stay in <assets>/../study)."""
-    base = os.path.join(os.path.dirname(os.path.abspath(assets)), "study")
-    name = os.path.basename(os.path.normpath(assets))
-    return base if name == DEFAULT_MODEL else os.path.join(base, name)
-
-
-def default_assets():
-    if os.environ.get("SMOLLM_ASSETS"):
-        return os.environ["SMOLLM_ASSETS"]
-    cands = [os.path.join(REPO, REL)]
-    try:  # a git worktree shares the main checkout's untracked assets
-        common = subprocess.check_output(["git", "-C", REPO, "rev-parse", "--git-common-dir"],
-                                         text=True, stderr=subprocess.DEVNULL).strip()
-        cands.append(os.path.join(os.path.dirname(os.path.abspath(os.path.join(REPO, common))), REL))
-    except Exception:
-        pass
-    for c in cands:
-        if os.path.exists(os.path.join(c, "config.json")):
-            return c
-    return cands[0]
+sys.path.insert(0, HERE)
+import llm_model                                    # noqa: E402
+from llm_model import CTX, DEFAULT_MODEL, ProfileError, default_assets, study_dir  # noqa: E402,F401
 
 
 # ------------------------------------------------------------------ data
 DEFAULT_SYSTEM = "You are a helpful AI assistant named SmolLM, trained by Hugging Face"
-EOS = 2            # <|im_end|>
-CTX = 1024         # context length (CHAT_PLAN decision)
 MAX_NEW = 128
 
 PARAGRAPH = (
@@ -221,9 +201,24 @@ def chatml(messages):
     s = ""
     if messages[0]["role"] != "system":
         s += "<|im_start|>system\n" + DEFAULT_SYSTEM + "<|im_end|>\n"
-    for m in messages:
-        s += "<|im_start|>" + m["role"] + "\n" + m["content"] + "<|im_end|>\n"
-    return s + "<|im_start|>assistant\n"
+    return s + "".join(_chatml_block(m) for m in messages) + "<|im_start|>assistant\n"
+
+
+def _chatml_block(m):
+    return "<|im_start|>" + m["role"] + "\n" + m["content"] + "<|im_end|>\n"
+
+
+def chatml_turn(messages):
+    """The next turn after a generated answer: the answer's <|im_end|>, the
+    messages and the generation prompt."""
+    return "<|im_end|>\n" + "".join(_chatml_block(m) for m in messages) + "<|im_start|>assistant\n"
+
+
+# A chat's second turn (the phase-5 gates, llm_project.second_turn_ids): appended
+# to a prompt's decoded answer and prefilled at the position the decode reached.
+# A text profile's second turn is more story text after the continuation.
+SECOND_TURN = [{"role": "user", "content": "Tell me one more fact about it."}]
+STORY_SECOND = "Then something surprising happened."
 
 
 # A base model without a chat template (stories15m: Karpathy's llama2.c model trained on
@@ -258,46 +253,45 @@ STORY_TEXTS = (("heldout_tinystories_valid.txt", 100, 48),    # (file, first row
                ("calib_tinystories_valid.txt", 5000, 16))
 
 
-class Profile:
-    """How a checkpoint is studied and gated.  "chat" (a chat template in
-    tokenizer_config.json: SmolLM2): ChatML prompts, WikiText-2 texts, context
-    CTX, generation ends at <|im_end|>.  "text" (none: stories15m): story
-    beginnings after <s>, TinyStories texts (stories joined by <s>, as the model
-    was trained), the context of max_position_embeddings (at most CTX),
-    generation ends at <s> (the next story) or </s>.  Position 0 is token 1
-    either way (<|im_start|> / <s>): the attention sink."""
+class Profile(llm_model.Profile):
+    """llm_model.Profile (chat or text, sink, end-of-generation ids, context —
+    from the checkpoint's files) plus what the study prompts and measures with.
+    "chat" (a ChatML template: SmolLM2): PROMPTS rendered by chatml, WikiText-2
+    texts.  "text" (no template: stories15m): story beginnings after the BOS,
+    TinyStories texts joined by the BOS, as llama2.c trained the model."""
 
     def __init__(self, assets):
-        try:
-            with open(os.path.join(assets, "tokenizer_config.json")) as f:
-                self.chat = "chat_template" in json.load(f)
-        except OSError:
-            self.chat = True
-        with open(os.path.join(assets, "config.json")) as f:
-            mp = json.load(f).get("max_position_embeddings") or CTX
-        self.kind = "chat" if self.chat else "text"
-        self.ctx = CTX if self.chat else min(CTX, int(mp))
-        self.eog = (EOS,) if self.chat else (1, 2)
+        super().__init__(assets)
+        if self.chat and not ("<|im_start|>" in self.template and "<|im_end|>" in self.template):
+            raise ProfileError(f"{assets}: the chat template is not ChatML; the study renders "
+                               f"ChatML only (chatml)")
         self.prompts = PROMPTS if self.chat else STORY_PROMPTS
         self.texts = (("heldout_wikitext2_test.txt", "calib_wikitext2_valid.txt") if self.chat
                       else tuple(n for n, _, _ in STORY_TEXTS))
-        self.windows = 3 * (CTX // self.ctx)        # held-out windows: 3 x 1024 tokens either way
 
     def prompt_ids(self, tok, p):
-        """Token ids of one PROMPTS / STORY_PROMPTS entry, from the sink on."""
-        ids = tok.encode(chatml(p) if self.chat else p)
-        assert ids[0] == 1, "the prompt must start with token 1 (the sink)"
+        """Token ids of one PROMPTS / STORY_PROMPTS entry, from the sink on: a
+        chat rendering as it is (the template writes every special token, so
+        none is added: Llama-family templates contain the BOS), a text after
+        the BOS."""
+        ids = (tok.plain(chatml(p)) if self.chat
+               else np.concatenate([[self.sink], tok.plain(p)]).astype(np.int64))
+        assert ids[0] == self.sink, f"the prompt must start with token {self.sink} (the sink)"
         return ids
+
+    def second_turn_ids(self, tok):
+        """A second turn's token ids (SECOND_TURN / STORY_SECOND), no sink."""
+        return tok.plain(chatml_turn(SECOND_TURN) if self.chat else STORY_SECOND)
 
     def heldout_ids(self, tok, assets, name):
         """The held-out / calibration token stream (no sink): WikiText as it is;
-        the stories joined by <s>, as llama2.c trained the model."""
+        the stories joined by the BOS, as llama2.c trained the model."""
         text = open(os.path.join(assets, name), encoding="utf-8").read()
         if self.chat:
-            return tok.encode(text)
+            return tok.plain(text)
         out = []
         for i, s in enumerate(text.split(STORY_END)):
-            out += ([1] if i else []) + tok.plain(s).tolist()
+            out += ([self.bos] if i else []) + tok.plain(s).tolist()
         return np.array(out, np.int64)
 
 
@@ -357,37 +351,34 @@ def cmd_fetch(args):
 
 # ------------------------------------------------------------------ weights / config
 def load_safetensors(path):
-    """bf16 / f16 / f32 safetensors -> dict of float32 arrays (bf16 upcast exactly)."""
-    with open(path, "rb") as f:
-        n = struct.unpack("<Q", f.read(8))[0]
-        hdr = json.loads(f.read(n))
-        blob = np.frombuffer(f.read(), np.uint8)
-    out = {}
-    for name, m in hdr.items():
-        if name == "__metadata__":
-            continue
-        a, b = m["data_offsets"]
-        raw = blob[a:b]
-        if m["dtype"] == "BF16":
-            arr = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-        elif m["dtype"] == "F16":
-            arr = raw.view(np.float16).astype(np.float32)
-        elif m["dtype"] == "F32":
-            arr = raw.view(np.float32).copy()
-        else:
-            raise ValueError(m["dtype"])
-        out[name] = arr.reshape(m["shape"])
-    return out
+    """bf16 / f16 / f32 safetensors -> dict of float32 arrays (bf16 upcast exactly);
+    a file, or a checkpoint directory (sharded too): src/checkpoint.py."""
+    return ckpt().load_safetensors(path)
 
 
 class Cfg:
+    """config.json through inference-scheduler/src/llm_arch.py — the parser and
+    guard the scheduler frontend uses too — under the study's names."""
+
     def __init__(self, assets):
-        c = json.load(open(os.path.join(assets, "config.json")))
-        self.L = c["num_hidden_layers"]; self.D = c["hidden_size"]; self.H = c["num_attention_heads"]
-        self.KV = c["num_key_value_heads"]; self.F = c["intermediate_size"]; self.V = c["vocab_size"]
-        self.HD = c.get("head_dim") or self.D // self.H
-        self.eps = float(c["rms_norm_eps"]); self.theta = float(c["rope_theta"])
-        self.tied = c.get("tie_word_embeddings", True)
+        self._set(arch().LlamaConfig.from_file(os.path.join(assets, "config.json")))
+
+    @classmethod
+    def from_dict(cls, c, check=True):
+        """From a config.json dict (a VLM's text_config, a test's tiny model)."""
+        return cls.from_config(arch().LlamaConfig.from_dict(c, check))
+
+    @classmethod
+    def from_config(cls, a):
+        """From an llm_arch.LlamaConfig (the frontend's, src/llama.py)."""
+        cfg = cls.__new__(cls)
+        cfg._set(a)
+        return cfg
+
+    def _set(self, a):
+        self.L, self.D, self.H, self.KV, self.HD = a.L, a.D, a.H, a.KV, a.HD
+        self.F, self.V, self.eps, self.theta = a.FF, a.V, a.eps, a.theta
+        self.tied, self.max_pos = a.tied, a.max_pos
 
 
 def rope_tables(cfg, n):
@@ -480,6 +471,16 @@ LINEARS = {"q": ("self_attn.q_proj", "x", "q0"), "k": ("self_attn.k_proj", "x", 
            "g": ("mlp.gate_proj", "x2", "g"), "u": ("mlp.up_proj", "x2", "u"), "d": ("mlp.down_proj", "a", "d")}
 
 
+def lm_weight(W, cfg):
+    """The LM head as Hugging Face builds it: the embedding when tied (a stored
+    lm_head is ignored), else lm_head.weight (src/llama.py lm_weight)."""
+    if getattr(cfg, "tied", True):
+        return W["model.embed_tokens.weight"]
+    if "lm_head.weight" not in W:
+        raise ValueError("tie_word_embeddings is false but the checkpoint has no lm_head.weight")
+    return W["lm_head.weight"]
+
+
 def p2(e):
     return np.power(2.0, e)
 
@@ -539,7 +540,7 @@ class Model:
         self.gpost = [W[f"model.layers.{l}.post_attention_layernorm.weight"].astype(np.float64) for l in range(L)]
         self.gfin = W["model.norm.weight"].astype(np.float64)
         E = W["model.embed_tokens.weight"]
-        lm = W["lm_head.weight"] if "lm_head.weight" in W else E
+        lm = lm_weight(W, cfg)
         self.stats = Stats(L)
         self.wsat = 0
         if base is not None and not self.q:
@@ -550,6 +551,9 @@ class Model:
                 for key, (name, ci, co) in LINEARS.items():
                     self.w[(l, key)] = self._enc(W[f"model.layers.{l}.{name}.weight"].T, l, key, ci, co)
             self.w[(L, "lm")] = self._enc(lm.T, L, "lm", "xf", "logits")
+        if base is None and hasattr(W, "unread"):
+            # every tensor read: one this model does not use is a block feature it does not implement
+            ckpt().check_consumed(W, "llm_study.Model", ignore=("lm_head.weight",) if cfg.tied else ())
         if not self.q or self.pol.get("emb") == "float":
             self.emb = E                                  # bf16 values as float32 (host table)
         else:
@@ -912,7 +916,7 @@ class Model:
         return [logits[offs[i]:offs[i + 1]] for i in range(len(seqs))]
 
 
-def greedy(model, prompts, max_new=MAX_NEW, eog=(EOS,)):
+def greedy(model, prompts, max_new, eog):
     """Greedy decoding, stop at an end-of-generation token (<|im_end|>; a text
     profile's <s> / </s>).  Prefill per prompt, then batched one-token decode
     steps over the still-active prompts."""
@@ -1106,8 +1110,7 @@ def make_formats(pol, ch, W, cfg):
     # (LINEARS order: v is capped before o reads it)
     for l in range(L + 1):
         for key, (name, ci, co) in (LINEARS.items() if l < L else [("lm", (None, "xf", "logits"))]):
-            Wt = (W[f"model.layers.{l}.{name}.weight"] if l < L
-                  else W.get("lm_head.weight", W["model.embed_tokens.weight"])).T
+            Wt = (W[f"model.layers.{l}.{name}.weight"] if l < L else lm_weight(W, cfg)).T
             if ci == "pv" and ("pv", l) not in fmt:
                 fvc = np.asarray(fmt.get(("vc", l), fmt[("v", l)]))
                 fvc = np.full(KV * HD, fvc) if fvc.ndim == 0 else fvc
@@ -1123,16 +1126,17 @@ def make_formats(pol, ch, W, cfg):
 
 # ------------------------------------------------------------------ study
 def load_all(assets):
+    """(Cfg, the checkpoint's tensors) — a read-recording view: the first float
+    Model checks that it used every tensor."""
     cfg = Cfg(assets)
-    W = load_safetensors(os.path.join(assets, "model.safetensors"))
-    return cfg, W
+    return cfg, ckpt().Tracked(load_safetensors(assets))
 
 
 def build_data(assets, tok, quick, prof=None):
     """Chat prompts (a text profile: story beginnings); held-out windows and the
-    calibration text start with token 1 (<|im_start|> / <s>: position 0 of every
-    sequence, the attention sink) followed by plain text, so every sequence has
-    the same position-0 token.  CTX tokens of calibration text either way (a
+    calibration text start with the sink token (<|im_start|> / <s>: position 0 of
+    every sequence) followed by plain text, so every sequence has the same
+    position-0 token.  CTX tokens of calibration text either way (a
     text profile's shorter context: several windows)."""
     prof = prof or Profile(assets)
     prompts = [(name, prof.prompt_ids(tok, m)) for name, m in prof.prompts]
@@ -1140,18 +1144,17 @@ def build_data(assets, tok, quick, prof=None):
     win = min(256, prof.ctx) if quick else prof.ctx
     nwin = 1 if quick else prof.windows
     assert len(ids) >= (win - 1) * nwin, len(ids)
-    held = [np.concatenate([[1], ids[i * (win - 1):(i + 1) * (win - 1)]]) for i in range(nwin)]
+    held = [np.concatenate([[prof.sink], ids[i * (win - 1):(i + 1) * (win - 1)]]) for i in range(nwin)]
     cids = prof.heldout_ids(tok, assets, prof.texts[1])
     w = prof.ctx - 1
-    calib = [np.concatenate([[1], cids[i * w:(i + 1) * w]]) for i in range(CTX // prof.ctx)]
-    calib += ([tok.encode(chatml(m)) for m in CALIB_PROMPTS] if prof.chat
-              else [prof.prompt_ids(tok, t) for t in STORY_CALIB])
+    calib = [np.concatenate([[prof.sink], cids[i * w:(i + 1) * w]]) for i in range(CTX // prof.ctx)]
+    calib += [prof.prompt_ids(tok, m) for m in (CALIB_PROMPTS if prof.chat else STORY_CALIB)]
     if quick:
         prompts = prompts[:4]
     return prompts, held, calib
 
 
-def run_policy(name, model, prompts, held, ref, max_new, log, do_greedy=True, eog=(EOS,)):
+def run_policy(name, model, prompts, held, ref, max_new, log, do_greedy=True, *, eog):
     """Evaluate one model.  ref None -> this is the float reference: returns it."""
     t0 = time.time()
     res = dict(policy=name)
@@ -1411,8 +1414,9 @@ def cmd_formats(args):
     if pol.get("sink"):
         m = Model(W, cfg, pol, fmt, sink_model=fm)
         s = Seq(cfg, 1)
-        m._write_sink(s, 1)
-        out["sink_token"] = 1
+        sink = Profile(args.assets).sink
+        m._write_sink(s, sink)
+        out["sink_token"] = sink
         out["sink_k_raw"] = [np.rint(s.k[l][:, 0] * p2(m.Eh("k", l, cfg.KV))[:, None]).astype(int).tolist() for l in range(cfg.L)]
         out["sink_v_raw"] = [np.rint(s.v[l][:, 0] * p2(m.Ev("vc", l, cfg.KV * cfg.HD).reshape(cfg.KV, cfg.HD))).astype(int).tolist()
                              for l in range(cfg.L)]
@@ -1434,23 +1438,29 @@ def cmd_validate(args):
     htok = AutoTokenizer.from_pretrained(assets)
     ok = 0
     if prof.chat:
-        for name, msgs in PROMPTS + [("calib", m) for m in CALIB_PROMPTS]:
+        convs = [m for _, m in PROMPTS] + CALIB_PROMPTS
+        for msgs in convs:
             r = htok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=True)
             r = r["input_ids"] if not isinstance(r, list) else r
-            ok += int(list(r) == tok.encode(chatml(msgs)).tolist())
-        print(f"chat template + tokenizer: {ok}/{len(PROMPTS) + len(CALIB_PROMPTS)} prompts identical to HF apply_chat_template")
+            ok += int(list(r) == prof.prompt_ids(tok, msgs).tolist())
+        n = len(convs)
+        print(f"chat template + tokenizer: {ok}/{n} prompts identical to HF apply_chat_template")
     else:
         texts = [t for _, t in STORY_PROMPTS] + STORY_CALIB + [LONG_STORY + "\n\n\"Yes!\" 3 + 4 = 7. Ünïcödé ok."]
-        ok = sum(int(list(htok(t)["input_ids"]) == tok.encode(t).tolist()) for t in texts)
-        print(f"tokenizer: {ok}/{len(texts)} texts identical to HF AutoTokenizer")
+        ok = sum(int(list(htok(t)["input_ids"]) == prof.prompt_ids(tok, t).tolist()) for t in texts)
+        n = len(texts)
+        print(f"tokenizer: {ok}/{n} texts identical to HF AutoTokenizer")
+    if ok != n:
+        # the prompts, the calibration and the gates would run on other ids than HF's
+        raise SystemExit(f"validate: {n - ok} of {n} prompts tokenize differently from Hugging Face")
     hf = AutoModelForCausalLM.from_pretrained(assets, dtype=torch.float32, attn_implementation="eager").eval()
     fm = Model(W, cfg, None)
     prompts = [prof.prompt_ids(tok, m) for _, m in prof.prompts]
     if prof.chat:
         text = open(os.path.join(assets, "heldout_wikitext2_test.txt"), encoding="utf-8").read()
-        held = tok.encode(text)[:CTX]
+        held = tok.plain(text)[:CTX]
     else:
-        held = np.concatenate([[1], prof.heldout_ids(tok, assets, prof.texts[0])[:prof.ctx - 1]])
+        held = np.concatenate([[prof.sink], prof.heldout_ids(tok, assets, prof.texts[0])[:prof.ctx - 1]])
     worst = 0.0
     for name, ids in [("prompt0", prompts[0]), ("prompt4", prompts[4]), (f"heldout{len(held)}", held)]:
         with torch.no_grad():

@@ -115,7 +115,9 @@ class LibLlmEngine:
         int llm_decode(int32_t token, float *logits);
 
     Every int function returns >= 0 on success; a negative rc raises
-    LlmLibraryError with llm_last_error()."""
+    LlmLibraryError with llm_last_error().  The vocabulary and context sizes
+    are the library's compile-time constants, callable before llm_open()
+    (sizes())."""
 
     def __init__(self, lib_path: str, weights_dir: Optional[str] = None):
         self.lib_path = lib_path
@@ -152,6 +154,15 @@ class LibLlmEngine:
         if not hasattr(lib, "llm_model_name"):
             return ""
         return (lib.llm_model_name() or b"").decode("utf-8", "replace")
+
+    def sizes(self) -> Tuple[int, int]:
+        """(vocabulary, context) from llm_vocab_size() / llm_context_size(),
+        also kept in vocab_size / context_size (the library is loaded, the
+        model is not opened); a size the library does not report is 0."""
+        lib = self.lib if self.lib is not None else self._bind()
+        self.vocab_size = max(0, int(lib.llm_vocab_size()))
+        self.context_size = max(0, int(lib.llm_context_size()))
+        return self.vocab_size, self.context_size
 
     def open(self) -> None:
         if self.lib is not None:
@@ -230,12 +241,25 @@ def _common_prefix(a: Sequence[int], b: Sequence[int]) -> int:
     return i
 
 
+def engine_sizes(engine) -> Tuple[int, int]:
+    """(vocabulary, context) an engine reports before it opens (its sizes());
+    0 where it cannot tell."""
+    if not callable(getattr(engine, "sizes", None)):
+        return 0, 0
+    try:
+        v, c = engine.sizes()
+    except (OSError, AttributeError):                       # the library does not load: load() says why
+        return 0, 0
+    return int(v or 0), int(c or 0)
+
+
 class Smollm2Backend(Backend):
     model_id = MODEL_ID
     owned_by = "kv260"
     fingerprint = "kv260-smollm2-135m-pow2+sink+p12"
-    cma_mb = 360.0                      # fallback (the §10.6 estimate); the server passes
-                                        # --llm-cma-mb (510: the 488 MiB pool BO, CHAT_PLAN §16.3)
+    eog_tokens = EOG_TOKENS
+    cma_mb = 330.0                      # fallback = --llm-cma-mb's default (SmolLM2-135M's pool BO +
+                                        # buffers); the server passes each size's own
 
     def __init__(self, engine, tokenizer_path: str, *, sampler_lib: Optional[str] = None,
                  defaults: Optional[SamplerParams] = None, context_size: int = 1024,
@@ -264,7 +288,12 @@ class Smollm2Backend(Backend):
         self.dry_breakers = tuple(dry_sequence_breakers)
         self._breaker_ids: Dict[Tuple[str, ...], List[int]] = {}
         self._breakers_set: Optional[Tuple[str, ...]] = None      # what the sampler holds
-        self.ctx = context_size
+        # The library's vocabulary and context are compile-time constants, known
+        # before llm_open(): ctx trims right from the first request, also while the
+        # model is not resident (--resident auto); context_size stands in only for
+        # an engine that cannot tell before it opens.
+        self.lib_vocab, lib_ctx = engine_sizes(engine)
+        self.ctx = lib_ctx or context_size
         self.reserve = reserve
         self.repeat_last_n = repeat_last_n
         self.prefill_chunk = prefill_chunk
@@ -284,13 +313,46 @@ class Smollm2Backend(Backend):
         if self.tok is not None:
             return
         t0 = time.monotonic()
-        self.tok = Tokenizer(self.tokenizer_path)
+        tok = Tokenizer(self.tokenizer_path)
+        if self.lib_vocab:
+            self._check_vocab(self.lib_vocab, tok)
+        self.eog = self._eog_ids(tok)
+        self.tok = tok
         self.builder = chatml.PromptBuilder(self.tok.encode)
         self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
-        self.eog = frozenset(self.tok.special[t] for t in EOG_TOKENS if t in self.tok.special)
         self.bos = self.tok.special["<|im_start|>"]
         self._set_breakers(self.dry_breakers)
         self.host_load_s = time.monotonic() - t0
+
+    def _check_vocab(self, lib_vocab: int, tok) -> None:
+        """The library may have more vocabulary rows than the tokenizer has
+        tokens (Qwen2.5 and Phi-3 pad their embeddings; the rows past the
+        tokenizer's are never sampled: _vocab_logits), not fewer."""
+        if lib_vocab < tok.vocab_size:
+            raise RuntimeError(f"the library's vocabulary ({lib_vocab}) is smaller than the "
+                               f"tokenizer's ({tok.vocab_size})")
+
+    def _eog_ids(self, tok) -> frozenset:
+        """The ids of the end-of-generation tokens (eog_tokens) the tokenizer
+        has; none at all is an error, as an answer would end only at max_tokens
+        or a full context.  (A model's own list, generation_config.json's
+        eos_token_id, will plug in here.)"""
+        ids = frozenset(tok.special[t] for t in self.eog_tokens if t in tok.special)
+        if not ids:
+            raise RuntimeError(f"{self.tokenizer_path}: none of the end-of-generation tokens "
+                               f"{', '.join(self.eog_tokens)} is in the tokenizer")
+        return ids
+
+    def _vocab_logits(self, logits):
+        """The logits of the tokenizer's vocabulary: a library with padded
+        embedding rows returns more, which are never sampled or reported (a
+        view of a ctypes array, no copy)."""
+        n = self.tok.vocab_size
+        if len(logits) == n:
+            return logits
+        if isinstance(logits, ctypes.Array):
+            return (ctypes.c_float * n).from_buffer(logits)
+        return logits[:n]
 
     def breaker_ids(self, breakers: Tuple[str, ...]) -> List[int]:
         """Token ids that cut a DRY match: every special token, and every token
@@ -314,11 +376,11 @@ class Smollm2Backend(Backend):
     def load(self) -> None:
         self.load_host()
         self.engine.open()
-        if self.engine.vocab_size != self.tok.vocab_size:
-            v = self.engine.vocab_size
+        try:
+            self._check_vocab(self.engine.vocab_size, self.tok)
+        except RuntimeError:
             self.engine.close()
-            raise RuntimeError(f"the library's vocabulary ({v}) is not the tokenizer's "
-                               f"({self.tok.vocab_size})")
+            raise
         self.ctx = self.engine.context_size
         self._cached = None
 
@@ -509,7 +571,7 @@ class Smollm2Backend(Backend):
             eng.truncate(1 + reuse)
             self._cached = body[:reuse]
             new = body[reuse:]
-            logits = self._prefill_new(job, body, reuse, cancel)
+            logits = self._vocab_logits(self._prefill_new(job, body, reuse, cancel))
         except Cancelled:                                   # between calls: the cache is consistent
             raise
         except Exception:                                   # the library's state is unknown
@@ -573,7 +635,7 @@ class Smollm2Backend(Backend):
             cancel.check()
             tl = time.monotonic()
             cached_now, self._cached = self._cached, None
-            logits = eng.decode(t)
+            logits = self._vocab_logits(eng.decode(t))
             cached_now.append(t)
             self._cached = cached_now
             lib_ms += (time.monotonic() - tl) * 1000.0

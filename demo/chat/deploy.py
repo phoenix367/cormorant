@@ -966,8 +966,10 @@ def wait_health(session: RemoteSession, cfg: dict) -> Optional[dict]:
     while time.monotonic() - t0 < cfg["health_timeout"]:
         h = get_health(cfg)
         if h and h.get("status") == "ok":
+            gone = [m["id"] for m in h.get("unavailable") or ()]
             step("health", True, t0, f"{health_url(cfg)}/health: models "
-                 f"{', '.join(m['id'] for m in h['models'])}")
+                 f"{', '.join(m['id'] for m in h['models'])}"
+                 + (_yellow(f"; not available: {', '.join(gone)} (see the server log)") if gone else ""))
             return h
         out, _, _ = session.exec(f"systemctl is-active {UNIT} 2>/dev/null || "
                                  f"(test -f {cfg['remote']['dir']}/server.pid && "

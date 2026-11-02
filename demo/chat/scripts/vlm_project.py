@@ -76,8 +76,7 @@ def load(assets: Optional[str] = None, text_formats: Optional[str] = None,
     tcfg = LlamaConfig.from_dict({**cj["text_config"],
                                   "tie_word_embeddings": cj.get("tie_word_embeddings", False)})
     vcfg = VitConfig.from_dict(cj)
-    path = os.path.join(assets, "model.safetensors")
-    W = LazySafetensors(path) if lazy else load_safetensors(path)
+    W = LazySafetensors(assets) if lazy else load_safetensors(assets)     # one file or shards
     tnames = {k.replace("model.text_model.", "model."): k for k in W
               if k.startswith("model.text_model.")}
     if "lm_head.weight" in W:

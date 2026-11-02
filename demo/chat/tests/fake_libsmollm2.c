@@ -8,9 +8,10 @@
  * llm_open(dir) reads dir/script.txt: line 1 = the generation prompt ids
  * (e.g. "1 520 9531 198"), line 2 = the reply ids.  After the last occurrence
  * of the generation prompt the next token is reply[k] (then <|im_end|> = 2);
- * logits are 0 except 30 at that token.  Context and vocabulary sizes come
- * from dir/sizes.txt ("vocab ctx") if present (default 49152 1024).
- * fake_llm_counters() exposes calls for the tests.  With
+ * logits are 0 except 30 at that token.  The vocabulary and context sizes
+ * are compile-time constants, as the real library's (-DFAKE_VOCAB=, -DFAKE_CTX=;
+ * default 49152 1024): llm_vocab_size() / llm_context_size() answer before
+ * llm_open().  fake_llm_counters() exposes calls for the tests.  With
  * -DFAKE_MODEL_NAME='"<id>"' it also exports llm_model_name() (the served
  * model id; two such copies stand in for libsmollm2.so + libsmollm2_360m.so).
  */
@@ -20,8 +21,18 @@
 #include <string.h>
 
 #define MAXS 4096
+#ifndef FAKE_VOCAB
+#define FAKE_VOCAB 49152
+#endif
+#ifndef FAKE_CTX
+#define FAKE_CTX 1024
+#endif
+#if FAKE_CTX > MAXS
+#error "FAKE_CTX > MAXS"
+#endif
 
-static int     s_open, s_vocab = 49152, s_ctx = 1024, s_pos;
+static const int s_vocab = FAKE_VOCAB, s_ctx = FAKE_CTX;
+static int     s_open, s_pos;
 static int32_t s_seq[MAXS];
 static int32_t s_gen[64], s_ngen;
 static int32_t s_reply[MAXS], s_nreply;
@@ -29,8 +40,8 @@ static char    s_err[256];
 static long    s_counters[4];                /* opens, prefill tokens, decodes, truncates */
 
 const char *llm_last_error(void) { return s_err; }
-int         llm_vocab_size(void) { return s_open ? s_vocab : -1; }
-int         llm_context_size(void) { return s_open ? s_ctx : -1; }
+int         llm_vocab_size(void) { return s_vocab; }
+int         llm_context_size(void) { return s_ctx; }
 long       *fake_llm_counters(void) { return s_counters; }
 #ifdef FAKE_MODEL_NAME
 const char *llm_model_name(void) { return FAKE_MODEL_NAME; }
@@ -73,16 +84,6 @@ int llm_open(const char *weights_dir)
     s_ngen = read_ids(f, s_gen, 64);
     s_nreply = read_ids(f, s_reply, MAXS);
     fclose(f);
-    snprintf(path, sizeof path, "%s/sizes.txt", weights_dir);
-    f = fopen(path, "r");
-    if (f) {
-        if (fscanf(f, "%d %d", &s_vocab, &s_ctx) != 2 || s_ctx > MAXS) {
-            fclose(f);
-            snprintf(s_err, sizeof s_err, "fake: bad sizes.txt");
-            return -4;
-        }
-        fclose(f);
-    }
     s_seq[0] = 1;                                /* <|im_start|>, the sink */
     s_pos = 1;
     s_open = 1;

@@ -67,8 +67,10 @@ from typing import Optional, Tuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import llm_model                                                    # noqa: E402
 import llm_project as lp                                           # noqa: E402
 import vlm_project as vp                                           # noqa: E402
+from src.checkpoint import check_consumed                          # noqa: E402
 from src.codegen.multi import MultiEntryGenerator                  # noqa: E402
 from src.llm_entries import entry_graphs                         # noqa: E402
 from src.host_nodes import HostNode                                # noqa: E402
@@ -86,8 +88,7 @@ from src.vit_nodes import (VitAttnPrepNode, VitAttnSoftmaxNode,    # noqa: E402
 CHAT = os.path.dirname(HERE)
 SRC = os.path.join(CHAT, "src")
 C_SOURCES = ("llm_api.c", "llm_api.h", "llm_bench.c")
-DEFAULT_OUT = os.path.join(CHAT, "build", "llm_project")
-DEFAULT_MODEL = "smollm2-135m-instruct"
+DEFAULT_MODEL = llm_model.DEFAULT_MODEL
 
 KINDS = ("MatMul linear", "LM head", "attention (host)", "attention q.K^T (FPGA)",
          "attention P.V (FPGA)", "attention softmax (host)", "attention prep (host)",
@@ -404,9 +405,7 @@ def main(argv=None) -> int:
     args.model_name, args.assets = resolve_model(args.model_name, args.assets,
                                                  args.allow_name_mismatch)
     if args.out_dir is None:
-        tag = args.model_name.removesuffix("-instruct").replace("-", "_").replace(".", "_")
-        args.out_dir = (DEFAULT_OUT if args.model_name == DEFAULT_MODEL
-                        else f"{DEFAULT_OUT}_{tag}")
+        args.out_dir = llm_model.project_dir(args.model_name, os.path.join(CHAT, "build"))
     check_out_dir(os.path.abspath(args.out_dir), args.model_name, args.force)
     if args.context is None:
         args.context = lp.context(args.assets)
@@ -429,6 +428,7 @@ def main(argv=None) -> int:
               f"{cfg.H}/{cfg.KV}, vocab {cfg.V}, context {args.context}, buckets {buckets}",
               flush=True)
         models = vp.entry_models(fe, fe_v, buckets)
+        read = m.Wt                         # a view of the whole checkpoint's read record
         del m
     else:
         cfg, W, fmt, _fd = lp.load_model(args.assets, args.formats, lazy=True)
@@ -441,9 +441,14 @@ def main(argv=None) -> int:
               f"prefill attention {args.prefill_attn}, decode attention {args.decode_attn}, "
               f"policy {lp.policy(args.prefill_attn, args.decode_attn, vsmx, rowops, drope)}", flush=True)
         models = lp.entry_models(fe, buckets)
+        read = W
         del W
     entries = build_entries(models, args.prefill_engine,
                             log=lambda m: print(m, flush=True), plan=plan_options_from_args(args))
+    # every checkpoint tensor went into a graph: one left over belongs to a block feature
+    # the frontend does not implement (a bias, an extra norm), which would be dropped silently
+    check_consumed(read, args.model_name, ignore=("lm_head.weight",) if cfg.tied else ())
+    del read
     del models, fe                      # the frontends hold the float32 checkpoint
     if vcfg:
         del fe_v

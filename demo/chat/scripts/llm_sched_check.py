@@ -43,9 +43,7 @@ import llm_study as study                                  # noqa: E402
 
 def study_model(W, fd, cfg, policy=None):
     """llm_study.Model of the shipped policy with the formats JSON."""
-    sc = study.Cfg.__new__(study.Cfg)
-    sc.L, sc.D, sc.H, sc.KV, sc.F, sc.V, sc.HD = cfg.L, cfg.D, cfg.H, cfg.KV, cfg.FF, cfg.V, cfg.HD
-    sc.eps, sc.theta, sc.tied = cfg.eps, cfg.theta, cfg.tied
+    sc = study.Cfg.from_config(cfg)
     fmt = {}
     for k, v in fd["exponents"].items():
         c, l = k.split("@")
@@ -85,6 +83,7 @@ def main():
     args.prompts = gp if args.prompts is None else args.prompts
     args.second_turn = gt if args.second_turn is None else args.second_turn
     ctx = lp.context(assets)
+    sink = lp.llm_model.Profile(assets).sink           # position 0 of every prompt
     ids = lp.tokenize_prompts(args.prompts.split(","), assets=assets)
     turn2 = lp.second_turn_ids(assets=assets) if args.second_turn else []
     cont = set(filter(None, args.second_turn.split(",")))
@@ -103,7 +102,7 @@ def main():
     bad, report = 0, {}
     for name, toks in ids.items():
         t1 = time.time()
-        assert toks[0] == 1, "prompts start with token 1, <|im_start|> / <s> (the sink)"
+        assert toks[0] == sink, f"prompts start with the sink token {sink} (<|im_start|> / <s>)"
         sess = lp.SimSession(cgs, ctx=ctx, buckets=buckets)
         seq = study.Seq(sc, len(toks) + len(turn2) + 2 * args.decode + 2)
         rec = {"prompt_tokens": len(toks)}
@@ -112,7 +111,7 @@ def main():
         for ti, (tname, tt) in enumerate(turns):
             pos0 = sess.pos
             a = sess.prefill(tt)
-            b = sm.forward([seq], [np.asarray(([1] if ti == 0 else []) + list(tt), np.int64)])[0][-1]
+            b = sm.forward([seq], [np.asarray(([sink] if ti == 0 else []) + list(tt), np.int64)])[0][-1]
             steps, gen = [], []
             for step in range(args.decode + 1):
                 eq = np.array_equal(a, b)

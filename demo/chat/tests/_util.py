@@ -121,10 +121,14 @@ def sampler_lib():
     return build_c(os.path.join(CHAT, "src", "sampler.c"), "libsampler.so")
 
 
-def fake_llm_lib(model_name=None):
+def fake_llm_lib(model_name=None, vocab=None, context=None):
     """tests/fake_libsmollm2.c built; with model_name a copy of its own that
-    reports it from llm_model_name()."""
-    if model_name is None:
-        return build_c(os.path.join(HERE, "fake_libsmollm2.c"), "libfakellm.so")
-    return build_c(os.path.join(HERE, "fake_libsmollm2.c"), f"libfakellm_{model_name}.so",
-                   (f'FAKE_MODEL_NAME="{model_name}"',))
+    reports it from llm_model_name(), with vocab / context one of those sizes
+    (compile-time constants, as the real libraries')."""
+    name, defines = "libfakellm", []
+    for tag, key, v in (("", "FAKE_MODEL_NAME", model_name), ("v", "FAKE_VOCAB", vocab),
+                        ("c", "FAKE_CTX", context)):
+        if v is not None:
+            name += f"_{tag}{v}"
+            defines.append(f'{key}="{v}"' if key == "FAKE_MODEL_NAME" else f"{key}={int(v)}")
+    return build_c(os.path.join(HERE, "fake_libsmollm2.c"), name + ".so", defines)

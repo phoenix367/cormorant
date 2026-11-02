@@ -56,6 +56,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import llm_model                                                    # noqa: E402
 import llm_project as lp                                           # noqa: E402
 
 BERT_SCRIPTS = os.path.join(lp.REPO, "demo", "bert_squad", "scripts")
@@ -63,28 +64,23 @@ sys.path.insert(0, BERT_SCRIPTS)
 from deploy_and_run import _stream_exec, board_lock, lock_path, sync_weights  # noqa: E402
 from src.remote import RemoteSession, _dim, _green, _red           # noqa: E402
 
-DEFAULT_PROJECT = os.path.join(os.path.dirname(HERE), "build", "llm_project")
+DEFAULT_PROJECT = llm_model.project_dir(llm_model.DEFAULT_MODEL)
 REMOTE_DIR = "/root/kv260_chat"
-WEIGHTS_DIR = "/root/smollm2_weights"
+WEIGHTS_DIR = llm_model.LEGACY[llm_model.DEFAULT_MODEL]["weights"]
 RUN_DIR = "/tmp/llm_bench"
-DEFAULT_MODEL = "smollm2-135m-instruct"
+DEFAULT_MODEL = llm_model.DEFAULT_MODEL
 
 
 def board_paths(model: str, remote_dir: str = REMOTE_DIR,
                 weights_dir: Optional[str] = None) -> dict:
-    """Board locations of a model's library, project sources and weights.
-    SmolLM2-135M keeps the original ones (the chat server's defaults); any
-    other model gets its own, named after it — smollm2-360m-instruct:
-    <remote dir>/lib/libsmollm2_360m.so, <remote dir>/llm_project_smollm2_360m,
-    /root/smollm2_360m_weights.  ``remote_dir`` is the chat install directory
-    (chat_config.json remote.dir, --remote-dir); ``weights_dir`` overrides
-    the weights directory (--weights-dir)."""
-    if model == DEFAULT_MODEL:
-        return {"lib": f"{remote_dir}/lib/libsmollm2.so", "proj": f"{remote_dir}/llm_project",
-                "weights": weights_dir or WEIGHTS_DIR}
-    tag = model.removesuffix("-instruct").replace("-", "_").replace(".", "_")
-    return {"lib": f"{remote_dir}/lib/lib{tag}.so", "proj": f"{remote_dir}/llm_project_{tag}",
-            "weights": weights_dir or f"/root/{tag}_weights"}
+    """Board locations of a model's library, project sources and weights
+    (llm_model.board_paths): smollm2-360m-instruct -> <remote dir>/lib/
+    libsmollm2_360m.so, <remote dir>/llm_project_smollm2_360m,
+    /root/smollm2_360m_weights; SmolLM2-135M keeps its original names (the chat
+    server's defaults).  ``remote_dir`` is the chat install directory
+    (chat_config.json remote.dir, --remote-dir); ``weights_dir`` overrides the
+    weights directory (--weights-dir)."""
+    return llm_model.board_paths(model, remote_dir, weights_dir)
 
 
 def chat_remote_dir(path: Optional[str] = None) -> str:

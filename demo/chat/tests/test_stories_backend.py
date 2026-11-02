@@ -284,6 +284,8 @@ class TestGenerate(unittest.TestCase):
                          (0.8, 0.9, 0, 1.0, 0.0))
         self.assertTrue(b.completions)
         self.assertEqual((b.model_id, b.fingerprint, b.cma_mb), (MID, "kv260-stories15m-pow2+sink+p12", 50.0))
+        b.load_host()
+        self.assertEqual(b.eog, {BOS, EOS})                            # <s> and </s> end a story
 
 
 @unittest.skipUnless(HAVE, "demo/chat/assets/stories15m/tokenizer.json not present")
@@ -397,7 +399,7 @@ class TestCtypesEngine(unittest.TestCase):
     prefix reuse across requests."""
 
     def setUp(self):
-        self.lib = fake_llm_lib(MID)
+        self.lib = fake_llm_lib(MID, vocab=32000, context=256)
         if self.lib is None:
             self.skipTest("no C compiler")
         self.dir = tempfile.mkdtemp(prefix="fakestories_")
@@ -405,8 +407,6 @@ class TestCtypesEngine(unittest.TestCase):
         self.reply = " there was a big red ball."
         with open(os.path.join(self.dir, "script.txt"), "w") as f:      # after "▁time": the reply, then </s>
             f.write(f"{plain('time')[0]}\n" + " ".join(map(str, cont(self.reply))) + "\n")
-        with open(os.path.join(self.dir, "sizes.txt"), "w") as f:
-            f.write("32000 256\n")
 
     def test_server_builds_and_runs(self):
         from _util import server_mod
@@ -419,6 +419,7 @@ class TestCtypesEngine(unittest.TestCase):
         b = bs[MID]
         self.assertIsInstance(b.engine, LibLlmEngine)
         self.assertEqual((b.cma_mb, b.reserve, b.defaults.temperature), (50.0, 128, 0.0))
+        self.assertEqual((b.ctx, b.engine.vocab_size, b.engine.is_open), (256, 32000, False))   # before llm_open
         b.load_host()
         b.load()
         try:

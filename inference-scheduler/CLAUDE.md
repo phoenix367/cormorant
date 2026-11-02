@@ -232,6 +232,10 @@ src/
                          static keys for the vision encoder)
   llama.py               Llama frontend: config.json + safetensors + formats → entry graphs
                          (image_rows: a VLM text model's prefill reads image-feature rows)
+  llm_arch.py            the Llama config parser and its guard (problems(): every config.json key
+                         the block does not implement, an unknown one); the study loads it by path
+  checkpoint.py          safetensors checkpoints (one file or shards; bf16 / f16 / f32 → float32),
+                         LazySafetensors / Tracked record the tensors read, check_consumed
   vit.py                 Vision-encoder frontend (SmolVLM: SigLIP ViT + Idefics3 connector)
                          → the `vision` entry of a multi-entry project (attn_split=R:
                          softmax / P·V in R query-row parts, default 1; with rowops + vsmx
@@ -340,7 +344,7 @@ test/
                          VectorOP / Matmul / Conv / RowOps kernels and runs test_inference
   models/                Generated ONNX models (single_add.onnx, etc.)
   c/                     C harness for test_profiler_overlap.py
-  test_*.py              91 pytest modules, 1904 tests, all pass (test_bert_base.py
+  test_*.py              92 pytest modules, 1915 tests, all pass (test_bert_base.py
                          downloads bertsquad-12, 435 MB, on its first run) — includes
                          test_dag.py (DAG correctness), test_parallel_waits.py (split
                          start/wait emission), test_nop_corner_cases.py (NOP-layer

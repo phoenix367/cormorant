@@ -7,8 +7,11 @@ tests/fake_libsmollm2.c through the real ctypes binding (LibLlmEngine).
 Streaming schema, multi-turn prefix-cache reuse (only new tokens are
 prefilled; the sink never is), stop strings split across tokens, max_tokens,
 cancellation, context-full handling and trimming, UTF-8 across tokens,
-sampling parameters and seeds, library errors, and lazy loading / eviction
-between bert-squad and smollm2 (--resident)."""
+sampling parameters and seeds, library errors, what the backend takes from
+the library and the tokenizer (a padded vocabulary, the context before the
+model is opened, the end-of-generation ids), the backends' cma_mb
+fallbacks, and lazy loading / eviction between bert-squad and smollm2
+(--resident)."""
 
 import json
 import os
@@ -297,6 +300,101 @@ class TestGenerate(unittest.TestCase):
                                                               {"role": "user", "content": "hi"}])))
 
 
+class Unsized(ScriptedEngine):
+    """An engine that reports its sizes only once open."""
+
+    def sizes(self):
+        return 0, 0
+
+
+@unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
+class TestLibraryChecks(unittest.TestCase):
+    """What the backend takes from the library and the tokenizer: a padded
+    vocabulary (more rows than tokens) never sampled or reported, a smaller
+    one refused, the context known before the model is opened, the
+    end-of-generation ids."""
+
+    def padded(self, reply, pad=64):
+        V = tok().vocab_size
+        eng = ScriptedEngine(reply, vocab_size=V + pad)
+
+        def logits(seq):                                # a padded row above every real one
+            v = [0.0] * (V + pad)
+            v[eng._script(seq)], v[V + 10] = 30.0, 50.0
+            return v
+        eng.logits_fn = logits
+        return eng
+
+    def test_padded_vocabulary(self):
+        t = tok()
+        reply = "Padded rows are never sampled."
+        for lib in (sampler_lib(), "/nonexistent"):    # libsampler.so (when cc builds it) and Python
+            if lib is None:
+                continue
+            eng = self.padded(t.encode(reply))
+            b = Smollm2Backend(eng, TOKENIZER, sampler_lib=lib, loop_guard=False,
+                               defaults=SamplerParams(temperature=0.0))
+            b.load_host()
+            b.load()
+            self.assertEqual((b.sampler.n, b.health()["vocab_size"]), (t.vocab_size, t.vocab_size + 64))
+            for kw in ({}, {"temperature": 1.0, "seed": 3, "raw": {"top_k": 0, "min_tokens": 2}}):
+                pieces, fin = run(b, req([("user", "hi")], **kw))
+                self.assertEqual(("".join(pieces), fin.info["finish"]), (reply, "eos"), (lib, kw))
+            _, fin = run(b, req([("user", "hi")], raw={"logprobs": True, "top_logprobs": 3}))
+            ents = fin.info["logprobs"]["content"]
+            self.assertEqual(b"".join(bytes(e["bytes"]) for e in ents).decode(), reply)
+            for e in ents:                              # the distribution over the tokenizer's rows
+                self.assertAlmostEqual(e["logprob"], 0.0, places=3)
+                self.assertEqual(e["top_logprobs"][0]["token"], e["token"])
+
+    def test_smaller_vocabulary_is_an_error(self):
+        V = tok().vocab_size
+        b = Smollm2Backend(ScriptedEngine(vocab_size=V - 1), TOKENIZER, sampler_lib="/nonexistent")
+        with self.assertRaises(RuntimeError) as cm:     # known before open: at startup
+            b.load_host()
+        self.assertIn(f"vocabulary ({V - 1}) is smaller than the tokenizer's ({V})", str(cm.exception))
+        self.assertIsNone(b.tok)
+        eng = Unsized(vocab_size=V - 1)
+        b = Smollm2Backend(eng, TOKENIZER, sampler_lib="/nonexistent")
+        b.load_host()
+        with self.assertRaises(RuntimeError):           # known once open: the library is closed again
+            b.load()
+        self.assertEqual((eng.is_open, eng.close_count), (False, 1))
+
+    def test_context_before_open(self):
+        t = tok()
+        eng = ScriptedEngine(t.encode("ok"), context_size=96)
+        b = Smollm2Backend(eng, TOKENIZER, sampler_lib="/nonexistent", context_size=1024, reserve=32)
+        self.assertEqual((b.ctx, eng.is_open), (96, False))
+        m = [{"role": "user", "content": f"question {i} " + "blah " * 8} for i in range(8)]
+        job = b.prepare(req(m))                         # trimmed for 96 before any load
+        self.assertGreater(job.dropped, 0)
+        self.assertLessEqual(len(job.ids), 96 - 32)
+        self.assertEqual(b.health()["context_size"], 96)
+        # an engine that cannot tell before it opens: context_size until load()
+        b = Smollm2Backend(Unsized(context_size=96), TOKENIZER, sampler_lib="/nonexistent", context_size=1024)
+        self.assertEqual(b.ctx, 1024)
+        b.load()
+        self.assertEqual(b.ctx, 96)
+
+    def test_end_of_generation_ids(self):
+        t = tok()
+        b = backend(ScriptedEngine(t.encode("x")))
+        self.assertEqual(b.eog, {t.special[n] for n in ("<|im_end|>", "<|endoftext|>", "<|im_start|>")})
+
+        class Other(Smollm2Backend):
+            eog_tokens = ("<|im_end|>", "<|eot_id|>")   # a missing name is skipped
+        b = Other(ScriptedEngine(), TOKENIZER, sampler_lib="/nonexistent")
+        b.load_host()
+        self.assertEqual(b.eog, {t.special["<|im_end|>"]})
+        Other.eog_tokens = ("<|eot_id|>", "<|end|>")    # none of them: refused, not an endless answer
+        b = Other(ScriptedEngine(), TOKENIZER, sampler_lib="/nonexistent")
+        with self.assertRaises(RuntimeError) as cm:
+            b.load_host()
+        self.assertIn("end-of-generation tokens <|eot_id|>, <|end|>", str(cm.exception))
+        self.assertIsNone(b.tok)
+
+
 @unittest.skipUnless(HAVE, "demo/chat/assets/smollm2-135m-instruct/tokenizer.json not present")
 class TestDry(unittest.TestCase):
     """DRY in the backend: request fields, breaker tokens from the tokenizer,
@@ -556,12 +654,9 @@ class TestCtypesEngine(unittest.TestCase):
         import shutil
         shutil.rmtree(self.dir, True)
 
-    def write(self, reply_ids, sizes=None):
+    def write(self, reply_ids):
         with open(os.path.join(self.dir, "script.txt"), "w") as f:
             f.write(" ".join(map(str, GEN_PROMPT)) + "\n" + " ".join(map(str, reply_ids)) + "\n")
-        if sizes:
-            with open(os.path.join(self.dir, "sizes.txt"), "w") as f:
-                f.write("%d %d\n" % sizes)
 
     def test_generate_and_reuse(self):
         import ctypes
@@ -596,14 +691,52 @@ class TestCtypesEngine(unittest.TestCase):
             eng.open()
         self.assertIn("cannot open", str(cm.exception))
         self.assertFalse(eng.is_open)
-        self.write(tok().encode("x " * 200), sizes=(49152, 48))
-        eng = LibLlmEngine(fake_llm_lib(), self.dir)
+        self.write(tok().encode("x " * 200))
+        eng = LibLlmEngine(fake_llm_lib(context=48), self.dir)
         b = backend(eng, reserve=8)
         try:
             self.assertEqual((eng.context_size, b.ctx), (48, 48))
             pieces, fin = run(b, req([("user", "go")]))
             self.assertEqual(fin.info["finish"], "context_full")
             self.assertEqual(eng.position(), 48)
+        finally:
+            b.close()
+
+    def test_sizes_before_open(self):
+        """llm_vocab_size() / llm_context_size() before llm_open(): the backend's
+        context is the library's from the start (the server's --llm-context
+        1024 stands in only when it cannot tell)."""
+        from _util import server_mod
+        self.write(tok().encode(self.reply))
+        lib = fake_llm_lib(context=48)
+        eng = LibLlmEngine(lib, self.dir)
+        self.assertEqual((eng.sizes(), eng.is_open), ((49152, 48), False))
+        args = server_mod.parse_args(["--backend", "smollm2", "--llm-lib", lib, "--llm-weights", self.dir,
+                                      "--llm-tokenizer", TOKENIZER, "--llm-sampler-lib", "/nonexistent",
+                                      "--llm-reserve", "16"])
+        b = server_mod.build_backends(args)[MID]
+        self.assertEqual((args.llm_context, b.ctx, b.engine.is_open), (1024, 48, False))
+        self.assertEqual(b.health()["context_size"], 48)
+        self.assertLessEqual(len(b.prepare(req([("user", "hi")])).ids), 48 - 16)
+        with self.assertRaises(BackendError) as cm:     # 48 - 16 before the model is loaded, not 1024 - 16
+            b.prepare(req([("user", "word " * 60)]))
+        self.assertIn("context is 48 tokens", cm.exception.message)
+        missing = Smollm2Backend(LibLlmEngine(os.path.join(self.dir, "none.so")), TOKENIZER, context_size=512)
+        self.assertEqual(missing.ctx, 512)              # no library to ask: load() will say why
+
+    def test_padded_library(self):
+        """A library with 64 more vocabulary rows than the tokenizer (ctypes
+        logits of 49216 floats, the sampler over the first 49152)."""
+        t = tok()
+        self.write(t.encode(self.reply))
+        eng = LibLlmEngine(fake_llm_lib(vocab=t.vocab_size + 64), self.dir)
+        b = backend(eng)
+        try:
+            self.assertEqual((eng.vocab_size, len(eng.logits)), (t.vocab_size + 64,) * 2)
+            pieces, fin = run(b, req([("user", "hello")]))
+            self.assertEqual(("".join(pieces), fin.info["finish"]), (self.reply, "eos"))
+            pieces, _ = run(b, req([("user", "hello")], temperature=0.8, seed=1, raw={"top_k": 0}))
+            self.assertEqual("".join(pieces), self.reply)
         finally:
             b.close()
 
@@ -695,6 +828,26 @@ class TestTwoSizes(unittest.TestCase):
             server_mod.build_backends(self.args("--backend", "smollm2", "--backend", "smollm2-135m"))
 
 
+class TestCmaDefaults(unittest.TestCase):
+
+    def test_fallbacks_are_the_server_defaults(self):
+        """A backend's own cma_mb (when the server passes none) is the server's
+        flag default for its model (deploy.py's and the example config's are
+        facts.yaml's chat.cma_mb); SmolLM2-360M has no class of its own, the
+        server always passes --llm-360m-cma-mb."""
+        import inspect
+        from _util import server_mod
+        from moonshine_backend import MoonshineBackend
+        from piper_backend import PiperBackend
+        from smolvlm_backend import SmolvlmBackend
+        from stories_backend import StoriesBackend
+        a = server_mod.parse_args([])
+        self.assertEqual((Smollm2Backend.cma_mb, SmolvlmBackend.cma_mb, StoriesBackend.cma_mb),
+                         (a.llm_cma_mb, a.vlm_cma_mb, a.stories_cma_mb))
+        for cls, flag in ((PiperBackend, a.tts_cma_mb), (MoonshineBackend, a.asr_cma_mb)):
+            self.assertEqual(inspect.signature(cls.__init__).parameters["cma_mb"].default, flag, cls)
+
+
 # ── residency: lazy loading and eviction between bert-squad and smollm2 ──────
 
 class FakeBertEngine:
@@ -773,7 +926,7 @@ class TestResidency(unittest.TestCase):
         bert = BertSquadBackend(self.bert_eng, VOCAB_TXT)
         self.llm_eng = CmaScripted(cma, tok().encode("Generated."))
         llm = Smollm2Backend(self.llm_eng, TOKENIZER, sampler_lib=sampler_lib() or "/nonexistent",
-                             defaults=SamplerParams(temperature=0.0))
+                             defaults=SamplerParams(temperature=0.0), cma_mb=360)   # what CmaScripted takes
         backends = {"bert-squad": bert, MID: llm}
         for b in backends.values():
             b.load_host()

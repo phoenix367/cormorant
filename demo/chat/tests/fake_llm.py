@@ -3,8 +3,8 @@
 
 """Fake decoder engines with the §11 contract of libsmollm2.so (doc/plans/CHAT_PLAN.md),
 at the level smollm2_backend.LibLlmEngine exposes it (open / close /
-position / truncate / prefill / decode, vocab_size / context_size, logits as
-a ctypes float array):
+position / truncate / prefill / decode, vocab_size / context_size and
+sizes() before open, logits as a ctypes float array):
 
   ScriptedEngine   fast, for protocol tests: the next token comes from a
                    script (by default: after every "<|im_start|>assistant\\n"
@@ -70,6 +70,9 @@ class _Base:
     @property
     def is_open(self):
         return self.opened
+
+    def sizes(self):
+        return self.vocab_size, self.context_size
 
     def info(self):
         return {"library": type(self).__name__, "vocab_size": self.vocab_size,

@@ -137,6 +137,7 @@ def plan_chat(messages: Sequence[dict]) -> Tuple[str, str, str]:
 class StoriesBackend(Smollm2Backend):
     model_id = MODEL_ID
     fingerprint = "kv260-stories15m-pow2+sink+p12"
+    eog_tokens = ("<s>", "</s>")
     cma_mb = 50.0
     completions = True
 
@@ -156,9 +157,12 @@ class StoriesBackend(Smollm2Backend):
         if self.tok is not None:
             return
         t0 = time.monotonic()
-        self.tok = Tokenizer(self.tokenizer_path)
+        tok = Tokenizer(self.tokenizer_path)
+        if self.lib_vocab:
+            self._check_vocab(self.lib_vocab, tok)
+        self.eog = self._eog_ids(tok)
+        self.tok = tok
         self.sampler = make_sampler(self.tok.vocab_size, self.sampler_lib)
-        self.eog = frozenset((self.tok.bos_id, self.tok.eos_id))
         self.bos = self.tok.bos_id
         self._set_breakers(self.dry_breakers)
         self.host_load_s = time.monotonic() - t0

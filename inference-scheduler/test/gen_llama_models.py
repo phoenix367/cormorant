@@ -43,9 +43,9 @@ OUT_DIR = os.path.join(HERE, "models")   # gen_all_models.py sets it
 POLICY = "pow2+sink+p12+xattn"      # the calibration (p12 formats) and host-attention policy
 MIX_POLICY = "pow2+sink+p12+mix"    # the default frontend (FPGA prefill attention)
 FPGA_POLICY = "pow2+sink+p12"       # decode attention on the FPGA too (decode_attn="fpga")
-TINY = dict(hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-            head_dim=16, intermediate_size=128, vocab_size=256, rms_norm_eps=1e-5,
-            rope_theta=10000.0, tie_word_embeddings=True)
+TINY = dict(model_type="llama", hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
+            num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256,
+            rms_norm_eps=1e-5, rope_theta=10000.0, tie_word_embeddings=True)
 TINY_CTX = 32
 
 
@@ -76,13 +76,7 @@ def tiny_weights(cfg: dict, seed: int = 0) -> dict:
 
 def study_cfg(cfg: dict):
     """llm_study.Cfg for an in-memory config dict."""
-    c = study.Cfg.__new__(study.Cfg)
-    c.L, c.D, c.H = cfg["num_hidden_layers"], cfg["hidden_size"], cfg["num_attention_heads"]
-    c.KV, c.F, c.V = cfg["num_key_value_heads"], cfg["intermediate_size"], cfg["vocab_size"]
-    c.HD = cfg.get("head_dim") or c.D // c.H
-    c.eps, c.theta = float(cfg["rms_norm_eps"]), float(cfg["rope_theta"])
-    c.tied = cfg.get("tie_word_embeddings", True)
-    return c
+    return study.Cfg.from_dict(cfg)
 
 
 def calibrate(cfg: dict, W: dict, policy: str = POLICY, seed: int = 1, n_seq: int = 4,

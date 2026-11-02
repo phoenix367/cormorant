@@ -3,7 +3,8 @@
 
 """Protocol layer of kv260_chat_server.py against a fake backend: the
 OpenAI chat.completion / chat.completion.chunk schema field by field,
-errors, the FPGA request queue, and client disconnects."""
+errors, the FPGA request queue, client disconnects, and backends dropped
+at startup."""
 
 import json
 import socket
@@ -561,6 +562,122 @@ class TestDisconnect(unittest.TestCase):
             self.assertTrue(wait_until(lambda: any("[cancelled while queued]" in x for x in LOG)))   # the log line follows the response
         finally:
             s.close()
+
+
+class Loading(FakeBackend):
+    """A FakeBackend that counts its loads, closes and unloads; `host_error` /
+    `load_error` make load_host() / load() raise."""
+
+    def __init__(self, host_error=None, load_error=None, speech=False, completions=False, **kw):
+        super().__init__(**kw)
+        self.host_error, self.load_error, self.speech = host_error, load_error, speech
+        self.completions = completions
+        self.loads = self.unloads = self.closes = 0
+
+    def load_host(self):
+        if self.host_error:
+            raise RuntimeError(self.host_error)
+
+    def load(self):
+        self.loads += 1
+        if self.load_error:
+            raise RuntimeError(self.load_error)
+
+    def unload(self):
+        self.unloads += 1
+
+    def close(self):
+        self.closes += 1
+
+
+class TestStartupFailures(unittest.TestCase):
+    """A backend whose host side or startup load fails is dropped; the others
+    are served, the dropped one is never loaded or evicted again and its
+    requests get a 503 that says why; nothing left to serve is exit 1."""
+
+    def start(self, backends, resident="auto"):
+        import contextlib
+        import io
+        LOG.clear()
+        s = RunningServer(backends, resident=resident, cma_free=lambda: None, cma_reclaim=lambda: False)
+        self.addCleanup(s.close)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):                 # the tracebacks
+            s.srv.load_hosts()
+            s.srv.load_startup()
+        return s, err.getvalue()
+
+    def test_host_side_failure(self):
+        bad, good = Loading(host_error="tokenizer.json: no such file"), Loading()
+        s, tb = self.start({"broken": bad, "fake": good})
+        self.assertIn("RuntimeError: tokenizer.json: no such file", tb)
+        self.assertIn("error: 'broken': host side failed (tokenizer.json: no such file); serving without it", LOG)
+        self.assertEqual((list(s.srv.backends), bad.loads, bad.closes), (["fake"], 0, 1))
+        st, _, out = s.request("GET", "/v1/models")
+        self.assertEqual([m["id"] for m in json.loads(out)["data"]], ["fake"])
+        for method, path, body in (("GET", "/v1/models/broken", None),
+                                   ("POST", "/v1/chat/completions", chat_body(model="broken"))):
+            st, _, out = s.request(method, path, body)
+            e = json.loads(out)["error"]
+            self.assertEqual((st, e["code"], e["param"]), (503, "model_not_loaded", "model"), path)
+            self.assertIn("its host side failed at startup (tokenizer.json: no such file)", e["message"])
+        body = chat_body()
+        del body["model"]                                     # the first chat backend served
+        st, _, out = s.post(body)
+        self.assertEqual((st, json.loads(out)["model"]), (200, "fake"))
+        st, _, out = s.request("GET", "/health")
+        h = json.loads(out)
+        self.assertEqual((st, h["status"], [m["id"] for m in h["models"]]), (200, "ok", ["fake"]))
+        self.assertEqual(h["unavailable"], [{"id": "broken", "type": "chat",
+                                             "error": "its host side failed at startup (tokenizer.json: no such file)"}])
+
+    def test_startup_load_failure(self):
+        for resident in ("one", "auto", "all"):
+            with self.subTest(resident=resident):
+                bad, nxt, other = Loading(load_error="CMA exhausted"), Loading(), Loading()
+                s, tb = self.start({"broken": bad, "fake": nxt, "other": other}, resident)
+                self.assertIn("RuntimeError: CMA exhausted", tb)
+                self.assertIn("error: 'broken' did not load at startup (CMA exhausted); serving without it", LOG)
+                self.assertNotIn("broken", s.srv.loaded)
+                self.assertTrue(s.srv.loaded["fake"])         # the next FPGA model loads in its place
+                self.assertEqual((bad.loads, bad.unloads, bad.closes), (1, 1, 1))
+                for model in ("other", "fake", "other"):      # loads and evictions never touch it again
+                    self.assertEqual(s.post(chat_body(model=model))[0], 200, model)
+                st, _, out = s.post(chat_body(model="broken"))
+                self.assertEqual((st, json.loads(out)["error"]["code"]), (503, "model_not_loaded"))
+                self.assertEqual((bad.loads, bad.unloads, bad.closes), (1, 1, 1))
+                if resident == "one":
+                    self.assertEqual((nxt.unloads, other.unloads), (2, 1))     # they swapped
+
+    def test_defaults_name_a_dropped_model(self):
+        """An alias / the default of a kind whose only backend was dropped
+        (a speech model, a base model) names that backend."""
+        s, _ = self.start({"fake": Loading(), "voice": Loading(host_error="no espeak-ng", speech=True),
+                           "story": Loading(host_error="no tokenizer", completions=True)})
+        for path, body, mid in (("/v1/audio/speech", {"model": "tts-1", "input": "hi"}, "voice"),
+                                ("/v1/audio/speech", {"input": "hi"}, "voice"),
+                                ("/v1/completions", {"prompt": "Once"}, "story")):
+            st, _, out = s.request("POST", path, body)
+            e = json.loads(out)["error"]
+            self.assertEqual((st, e["code"]), (503, "model_not_loaded"), body)
+            self.assertIn(f"The model '{mid}' is not available: its host side failed", e["message"])
+        h = json.loads(s.request("GET", "/health")[2])
+        self.assertEqual([(u["id"], u["type"], u.get("completions")) for u in h["unavailable"]],
+                         [("voice", "speech", None), ("story", "chat", True)])
+
+    def test_nothing_left_is_exit_1(self):
+        import contextlib
+        import io
+        LOG.clear()
+        build = server_mod.build_backends
+        server_mod.build_backends = lambda args: {"broken": Loading(host_error="bad tokenizer")}
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = server_mod.main(["--host", "127.0.0.1", "--port", "0"])
+        finally:
+            server_mod.build_backends = build
+        self.assertEqual(rc, 1)
+        self.assertIn("error: no model left to serve (broken did not start)", LOG)
 
 
 class TestHelpers(unittest.TestCase):

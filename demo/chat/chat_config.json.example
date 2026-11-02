@@ -50,6 +50,7 @@
     "tokenizer": "assets/smollm2-135m-instruct/tokenizer.json",
     "_tokenizer_note": "Host path (demo/chat/assets is untracked); uploaded to <remote.dir>/smollm2/tokenizer.json.",
     "context": 1024,
+    "_context_note": "Trimming context only for an engine that cannot report its own before it is opened (--llm-fake); every library reports its own (llm_context_size()), which wins.",
     "reserve": 256,
     "_reserve_note": "Answer tokens kept free when the history is trimmed (max_tokens if smaller).",
     "temperature": 0.2,

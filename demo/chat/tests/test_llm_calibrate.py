@@ -131,8 +131,9 @@ class TestManifest(unittest.TestCase):
             self.assertIn(f'"{name}"', src)
 
     def test_study_dir_matches_llm_study(self):
-        src = lc.STUDY.read_text()
-        self.assertIn(f'DEFAULT_MODEL = "{lc.DEFAULT_MODEL}"', src)
+        """One naming rule (llm_model) for the study, the calibration and the board."""
+        import llm_model
+        self.assertEqual(lc.DEFAULT_MODEL, llm_model.DEFAULT_MODEL)
         root = Path("/a")
         self.assertEqual(lc.study_dir(root, lc.DEFAULT_MODEL), root / "study")
         self.assertEqual(lc.study_dir(root, "m2"), root / "study" / "m2")

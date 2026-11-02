@@ -18,7 +18,9 @@ metadata (src/numeric.py).  Nothing is model specific beyond what
 config.json says (layers, hidden, heads, KV heads, head_dim, FFN, vocab,
 RoPE theta, RMSNorm eps, tied embedding), so a SmolLM2-360M or another
 Llama-architecture checkpoint only needs its formats (llm_study.py formats)
-and a regeneration.
+and a regeneration.  src/llm_arch.py refuses a config.json this block does
+not implement, and generate_llm_project.py a checkpoint with tensors it did
+not read (src/checkpoint.py check_consumed).
 
 Entries (T = rows per call, C = context incl. the position-0 sink):
 
@@ -55,10 +57,7 @@ from __future__ import annotations
 
 import json
 import math
-import struct
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import onnx
@@ -67,6 +66,8 @@ import onnx.numpy_helper as nph
 from onnx import TensorProto
 
 from . import numeric
+from .checkpoint import LazySafetensors, load_safetensors
+from .llm_arch import LlamaConfig
 from .llm_nodes import LLM_DOMAIN
 
 # The shift of the kernels' output (floor(acc / 2^F)); ap_fixed<16,8>.
@@ -77,110 +78,6 @@ RES_BITS = 15           # the int32 DMA residual's exponent (rowops; HOSTOPS_PLA
 # ------------------------------------------------------------------ #
 # Config / weights                                                     #
 # ------------------------------------------------------------------ #
-
-@dataclass
-class LlamaConfig:
-    L: int                  # layers
-    D: int                  # hidden size
-    H: int                  # attention heads
-    KV: int                 # key / value heads
-    HD: int                 # head dim
-    FF: int                 # MLP intermediate size
-    V: int                  # vocabulary
-    eps: float
-    theta: float
-    tied: bool = True
-
-    @classmethod
-    def from_dict(cls, c: dict) -> "LlamaConfig":
-        H = int(c["num_attention_heads"])
-        D = int(c["hidden_size"])
-        return cls(L=int(c["num_hidden_layers"]), D=D, H=H,
-                   KV=int(c.get("num_key_value_heads", H)),
-                   HD=int(c.get("head_dim") or D // H),
-                   FF=int(c["intermediate_size"]), V=int(c["vocab_size"]),
-                   eps=float(c["rms_norm_eps"]), theta=float(c.get("rope_theta", 10000.0)),
-                   tied=bool(c.get("tie_word_embeddings", True)))
-
-    @classmethod
-    def from_file(cls, path: str) -> "LlamaConfig":
-        with open(path) as f:
-            return cls.from_dict(json.load(f))
-
-
-def _st_float32(raw: np.ndarray, dtype: str) -> np.ndarray:
-    """A safetensors tensor's bytes -> float32 (bf16 upcast exactly)."""
-    if dtype == "BF16":
-        return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-    if dtype == "F16":
-        return raw.view(np.float16).astype(np.float32)
-    if dtype == "F32":
-        return raw.view(np.float32).copy()
-    raise ValueError(f"dtype {dtype}")
-
-
-def _st_header(f) -> Tuple[int, dict]:
-    n = struct.unpack("<Q", f.read(8))[0]
-    return 8 + n, json.loads(f.read(n))
-
-
-def load_safetensors(path: str) -> Dict[str, np.ndarray]:
-    """bf16 / f16 / f32 safetensors -> float32 arrays (bf16 upcast exactly)."""
-    with open(path, "rb") as f:
-        _, hdr = _st_header(f)
-        blob = np.frombuffer(f.read(), np.uint8)
-    out = {}
-    for name, m in hdr.items():
-        if name == "__metadata__":
-            continue
-        a, b = m["data_offsets"]
-        try:
-            arr = _st_float32(blob[a:b], m["dtype"])
-        except ValueError:
-            raise ValueError(f"{name}: dtype {m['dtype']}") from None
-        out[name] = arr.reshape(m["shape"])
-    return out
-
-
-class LazySafetensors(Mapping):
-    """``load_safetensors`` without the float32 copy of the checkpoint: the
-    file is memory-mapped and a tensor becomes float32 when read — every read
-    converts anew and nothing is kept (the same values as load_safetensors).
-    For frontends that build one entry at a time (generate_llm_project.py).
-    ``select({name: name in the file})`` gives a renamed subset."""
-
-    def __init__(self, path: str, names: Optional[Dict[str, str]] = None):
-        with open(path, "rb") as f:
-            off, hdr = _st_header(f)
-        self.path = path
-        self._blob = np.memmap(path, np.uint8, mode="r", offset=off)
-        self._meta = {k: v for k, v in hdr.items() if k != "__metadata__"}
-        self._names = names if names is not None else {k: k for k in self._meta}
-
-    def select(self, names: Dict[str, str]) -> "LazySafetensors":
-        out = object.__new__(LazySafetensors)
-        out.path, out._blob, out._meta = self.path, self._blob, self._meta
-        out._names = {n: self._names[f] for n, f in names.items()}
-        return out
-
-    def __getitem__(self, name: str) -> np.ndarray:
-        m = self._meta[self._names[name]]
-        a, b = m["data_offsets"]
-        try:
-            arr = _st_float32(np.asarray(self._blob[a:b]), m["dtype"])
-        except ValueError:
-            raise ValueError(f"{name}: dtype {m['dtype']}") from None
-        return arr.reshape(m["shape"])
-
-    def __contains__(self, name) -> bool:
-        return name in self._names
-
-    def __iter__(self):
-        return iter(self._names)
-
-    def __len__(self) -> int:
-        return len(self._names)
-
 
 def rope_tables(cfg: LlamaConfig, n: int):
     """float32 cos / sin [n][HD/2] exactly as llm_study.rope_tables:
@@ -223,8 +120,13 @@ class Formats:
             return cls(json.load(f), cfg)
 
     def get(self, cls_: str, layer: int, n: int) -> np.ndarray:
-        """Exponent vector of length n (a scalar is broadcast; missing = F)."""
-        v = self.exp.get(f"{cls_}@{layer}", F)
+        """Exponent vector of length n (a scalar is broadcast).  A class the
+        calibration did not write is an error, not a default: a new tensor
+        class (or a misspelled one) would otherwise run at 2^-F silently."""
+        try:
+            v = self.exp[f"{cls_}@{layer}"]
+        except KeyError:
+            raise KeyError(f"formats: no exponent for {cls_}@{layer} (policy {self.policy!r})") from None
         return np.broadcast_to(np.asarray(v, np.int64), (n,)).copy()
 
     def heads(self, cls_: str, layer: int, n_heads: int) -> np.ndarray:
@@ -344,8 +246,13 @@ class LlamaFrontend:
         return self.W[f"model.layers.{li}.{fname}.weight"]
 
     def lm_weight(self) -> np.ndarray:
-        W = self.W
-        return W["lm_head.weight"] if "lm_head.weight" in W else W["model.embed_tokens.weight"]
+        """The LM head as Hugging Face builds it: the embedding when tied (a
+        stored lm_head is then ignored), else lm_head.weight, which must exist."""
+        if self.cfg.tied:
+            return self.W["model.embed_tokens.weight"]
+        if "lm_head.weight" not in self.W:
+            raise ValueError("tie_word_embeddings is false but the checkpoint has no lm_head.weight")
+        return self.W["lm_head.weight"]
 
     def _cache_init(self, li: int, which: str) -> np.ndarray:
         c = self.cfg

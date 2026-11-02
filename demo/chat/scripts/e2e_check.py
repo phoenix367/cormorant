@@ -32,6 +32,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CHAT = os.path.dirname(HERE)
 ASSETS = os.environ.get("SMOLLM_ASSETS", os.path.join(CHAT, "assets", "smollm2-135m-instruct"))
 sys.path.insert(0, CHAT)
+sys.path.insert(0, HERE)
+import llm_model                                    # noqa: E402
 
 ONE_SHOT = [
     (None, "What is the capital of France?"),
@@ -63,14 +65,15 @@ def main():
     torch.set_num_threads(os.cpu_count())
     hf_tok = transformers.TokenizersBackend.from_pretrained(ASSETS)
     hf = AutoModelForCausalLM.from_pretrained(ASSETS, dtype=torch.float32, attn_implementation="eager").eval()
+    eog = llm_model.Profile(ASSETS).eog
 
     def reference(messages):
         ids = hf_tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
         ids = list(ids["input_ids"] if not isinstance(ids, list) else ids)
         with torch.no_grad():
             out = hf.generate(torch.tensor([ids]), attention_mask=torch.ones(1, len(ids), dtype=torch.long),
-                              max_new_tokens=args.max_tokens, do_sample=False, eos_token_id=2,
-                              pad_token_id=2)
+                              max_new_tokens=args.max_tokens, do_sample=False,
+                              eos_token_id=list(eog), pad_token_id=eog[-1])
         return hf_tok.decode(out[0, len(ids):].tolist(), skip_special_tokens=True)
 
     sampler_lib = None

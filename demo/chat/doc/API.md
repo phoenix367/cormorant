@@ -14,8 +14,8 @@ The paths also work without the `/v1` prefix.
 
 | Endpoint | What it returns |
 |---|---|
-| `GET /health` | the server's state (below); 503 when a model failed to load; no API key needed |
-| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`, and the non-standard `kv260: {"type"}` — `chat`, `speech` or `transcription`: the endpoint the model serves; `"completions": true` on a model that also serves `/v1/completions`) |
+| `GET /health` | the server's state (below); 503 when a model failed to load on request; no API key needed |
+| `GET /v1/models`, `GET /v1/models/{id}` | the model list / one model object (`id`, `object`, `created`, `owned_by`, and the non-standard `kv260: {"type"}` — `chat`, `speech` or `transcription`: the endpoint the model serves; `"completions": true` on a model that also serves `/v1/completions`); a model dropped at startup is not listed |
 | `POST /v1/chat/completions` | a chat answer: `chat.completion`, or with `stream: true` server-sent events (below) |
 | `POST /v1/completions` | a base model's continuation of a text (`stories15m`; OpenAI's legacy completions): `text_completion`, or with `stream: true` server-sent events ([Stories](STORIES.md)) |
 | `POST /v1/audio/speech` | speech from the speech backends ([Text to speech](TEXT_TO_SPEECH.md)) |
@@ -72,6 +72,10 @@ true`, `transcript.text.delta` events (one per part) and a final
     `chunks`, `rtf`, `frontend_s`;
   - Moonshine: `type` (`transcription`), `tokenizer`, `sample_rate`,
     `max_seconds`, `requests`, `audio_s`, `tokens`, `parts`, `rtf`;
+- `unavailable`: the models dropped at startup, their host side or their
+  startup load failed (`id`, the `kv260` fields of their model object,
+  `error`); the others are served
+  ([A model that fails to start](DEPLOY.md#choosing-the-models));
 - `resident`, `cma_free_mb`, `loads`, `unloads`: see
   [residency](DEPLOY.md#several-models-on-one-fpga);
 - `busy`, `waiting`: the FPGA queue;
@@ -115,7 +119,7 @@ so OpenAI clients raise their usual exceptions.
 | 411 / 413 | a body without a length / over 4 MB (32 MB when an image or speech-to-text model is served; `--max-body-mb`) |
 | 500 `backend_error` | the backend failed; once a stream has started, an SSE `data: {"error": ...}` event instead |
 | 503 `server_busy` | the queue is full, or the request waited longer than `--queue-timeout` (`Retry-After: 5`) |
-| 503 `model_not_loaded` | the model's library could not be loaded |
+| 503 `model_not_loaded` | the model's library could not be loaded, or the model was dropped at startup (the message says why) |
 
 ## The `kv260` object
 

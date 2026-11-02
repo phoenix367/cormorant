@@ -27,7 +27,7 @@ decided; read the matching section before starting a similar model.
 
 | route | the model | tools |
 |---|---|---|
-| **A** | Llama-family decoder: RMSNorm, rotate-half RoPE (no scaling), GQA, SwiGLU / SiLU, no biases, one `model.safetensors` | `scripts/llama_fit.py`, then `demo/chat/scripts/llm_calibrate.py` + `llm_study.py` (the frontend `src/llama.py` exists) |
+| **A** | Llama-family decoder: RMSNorm, rotate-half RoPE (no scaling), GQA, SwiGLU / SiLU, no biases, `model.safetensors` or a sharded index (`src/llm_arch.py` refuses anything else) | `scripts/llama_fit.py`, then `demo/chat/scripts/llm_calibrate.py` + `llm_study.py` (the frontend `src/llama.py` exists) |
 | **B** | an ONNX graph the scheduler takes as is — CNNs, BERT-like encoders | `scripts/onnx_study.py` (+ the task metric on real data) |
 | **C** | anything else — another decoder family, a new vision tower, ops the census lists MISSING | a new `<model>_study.py` modelled on `vlm_study.py` (§5) |
 

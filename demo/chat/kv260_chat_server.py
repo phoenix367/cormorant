@@ -84,7 +84,11 @@ of the 1400 MB cma=; idle CmaFree ~1390 MB).
   one             at most one FPGA model at a time: switching models unloads
                   the current one (a swap costs a load, seconds)
   all             everything loads at startup and stays (the old behaviour)
-Loads and evictions happen under the FPGA lock, between requests.
+Loads and evictions happen under the FPGA lock, between requests.  A backend
+whose host side (tokenizer, ...) or startup load fails is dropped, its
+traceback logged: /v1/models leaves it out, /health lists it under
+"unavailable", a request for it gets 503 model_not_loaded, and the others are
+served (exit 1 only when none is left).
 
 Request parameters honoured: model, messages, stream, stream_options
 .include_usage, max_tokens / max_completion_tokens, temperature, top_p, stop,
@@ -684,6 +688,13 @@ def reclaim_cma() -> bool:
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
+def model_kind(b: Backend) -> Dict[str, Any]:
+    """What a backend serves (its model object's "kv260"): {"type": chat,
+    speech or transcription}, with "completions": true for a base model."""
+    kind = "speech" if b.speech else "transcription" if b.transcription else "chat"
+    return {"type": kind} | ({"completions": True} if b.completions else {})
+
+
 class ChatServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -697,12 +708,8 @@ class ChatServer(ThreadingHTTPServer):
         if resident not in ("all", "one", "auto"):
             raise ValueError(f"resident: {resident!r}")
         self.backends = backends
-        self.speech_models = [m for m, b in backends.items() if b.speech]
-        self.transcription_models = [m for m, b in backends.items() if b.transcription]
-        self.default_model = next((m for m, b in backends.items() if not (b.speech or b.transcription)),
-                                  next(iter(backends)))
-        self.default_speech_model = self.speech_models[0] if self.speech_models else None
-        self.default_transcription_model = self.transcription_models[0] if self.transcription_models else None
+        self.unavailable: Dict[str, Dict[str, Any]] = {}      # dropped at startup: id -> {type, ..., error}
+        self._index()
         self.ffmpeg = ffmpeg
         self.api_key = api_key or None
         self.queue_timeout = queue_timeout
@@ -720,6 +727,53 @@ class ChatServer(ThreadingHTTPServer):
         self.loaded: Dict[str, bool] = {m: False for m in backends}
         self.last_used: Dict[str, float] = {}
         self.n_loads = self.n_unloads = 0
+
+    def _index(self) -> None:
+        """The served models of each kind and the defaults: the first chat
+        backend (else the first backend), base model, speech backend and
+        speech-to-text backend served — a kind whose backends were all
+        dropped defaults to its first dropped one, whose requests get the 503
+        that says why."""
+        bs = self.backends
+
+        def first(models, key, value):
+            return next(iter(models), None) or next(
+                (m for m, u in self.unavailable.items() if u.get(key) == value), None)
+        self.speech_models = [m for m, b in bs.items() if b.speech]
+        self.transcription_models = [m for m, b in bs.items() if b.transcription]
+        chat = [m for m, b in bs.items() if not (b.speech or b.transcription)]
+        self.default_model = first(chat, "type", "chat") or next(iter(bs), None)
+        self.default_completion_model = first([m for m, b in bs.items() if b.completions], "completions", True)
+        self.default_speech_model = first(self.speech_models, "type", "speech")
+        self.default_transcription_model = first(self.transcription_models, "type", "transcription")
+
+    def drop(self, mid: str, why: str) -> None:
+        """Stop serving `mid` (its host side or its startup load failed): out of
+        the model list and the residency (never loaded or evicted again),
+        closed; a request for it gets 503 model_not_loaded with `why`."""
+        b = self.backends.pop(mid)
+        self.loaded.pop(mid, None)
+        self.last_used.pop(mid, None)
+        self.load_errors.pop(mid, None)
+        with contextlib.suppress(Exception):
+            b.close()
+        self.unavailable[mid] = dict(model_kind(b), error=why)
+        self._index()
+
+    def load_hosts(self) -> None:
+        """Every backend's host side (load_host()), at startup; a backend whose
+        host side fails is dropped (logged with its traceback)."""
+        for mid, b in list(self.backends.items()):
+            t0 = time.monotonic()
+            try:
+                b.load_host()
+            except Exception as e:                             # noqa: BLE001
+                traceback.print_exc()
+                log(f"error: '{mid}': host side failed ({e}); serving without it")
+                self.drop(mid, f"its host side failed at startup ({e})")
+                continue
+            if time.monotonic() - t0 > 0.05:
+                log(f"'{mid}': host side ready in {time.monotonic() - t0:.1f} s")
 
     # Loads and unloads run at startup / shutdown or under the FPGA lock.
 
@@ -791,8 +845,21 @@ class ChatServer(ThreadingHTTPServer):
         return [m for m, b in self.backends.items() if not b.uses_fpga or m == first]
 
     def load_startup(self) -> None:
-        for mid in self.startup_models():
-            self.load_model(mid)
+        """The startup loads; a model of startup_models() that does not load is
+        dropped (logged with its traceback) and the list is taken again (the
+        next FPGA model may be the first now)."""
+        while True:
+            mid = next((m for m in self.startup_models() if not self.loaded[m]), None)
+            if mid is None:
+                break
+            try:
+                self.load_model(mid)
+            except Exception as e:                             # noqa: BLE001
+                traceback.print_exc()
+                with contextlib.suppress(Exception):
+                    self.backends[mid].unload()
+                log(f"error: '{mid}' did not load at startup ({e}); serving without it")
+                self.drop(mid, f"it did not load at startup ({e})")
         if self.resident == "auto":
             fresh = False                      # nothing loaded since the last page-cache drop
             for mid, b in self.backends.items():
@@ -828,10 +895,8 @@ class ChatServer(ThreadingHTTPServer):
         clients can tell which endpoint a model serves; "completions": true for a
         chat model that also serves /v1/completions (a base model)."""
         b = self.backends[mid]
-        kind = "speech" if b.speech else "transcription" if b.transcription else "chat"
-        kv = {"type": kind} | ({"completions": True} if b.completions else {})
         return {"id": mid, "object": "model", "created": int(self.started), "owned_by": b.owned_by,
-                "kv260": kv}
+                "kv260": model_kind(b)}
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -873,6 +938,15 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def _backend_error(self, e: BackendError) -> None:
         self._error(e.status, e.message, e.type, e.param, e.code)
+
+    def _no_model(self, mid: str) -> None:
+        """404 for an unknown model; 503 for one dropped at startup, with why."""
+        gone = self.server.unavailable.get(mid)
+        if gone is not None:
+            return self._error(503, f"The model '{mid}' is not available: {gone['error']}.",
+                               "server_error", param="model", code="model_not_loaded")
+        self._error(404, f"The model '{mid}' does not exist or you do not have access to it.",
+                    param="model", code="model_not_found")
 
     def _auth(self) -> bool:
         key = self.server.api_key
@@ -944,8 +1018,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if mid in self.server.backends:
                     self._send_json(200, self.server.model_obj(mid))
                 else:
-                    self._error(404, f"The model '{mid}' does not exist or you do not have "
-                                f"access to it.", param="model", code="model_not_found")
+                    self._no_model(mid)
             return
         self._error(404, f"Unknown request URL: GET {urlsplit(self.path).path}.",
                     code="unknown_url")
@@ -980,6 +1053,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         free = srv.cma_free()
         self._send_json(200 if ok else 503, {
             "status": "ok" if ok else "error", "version": VERSION, "models": models,
+            "unavailable": [{"id": m, **u} for m, u in srv.unavailable.items()],
             "resident": srv.resident, "cma_free_mb": None if free is None else round(free, 1),
             "loads": srv.n_loads, "unloads": srv.n_unloads,
             "busy": srv.fpga.busy, "waiting": srv.fpga.waiting,
@@ -1007,8 +1081,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                                    "correctly. The API expects a JSON payload.)")
             try:
                 if completion:                                 # default: the first base model
-                    req = parse_completion_request(body, next(
-                        (m for m, b in srv.backends.items() if b.completions), srv.default_model))
+                    req = parse_completion_request(body, srv.default_completion_model or srv.default_model)
                 else:
                     req = parse_chat_request(body, srv.default_model)
             except BackendError as e:
@@ -1016,8 +1089,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             rec.update(model=req.model, stream=int(req.stream))
             backend = srv.backends.get(req.model)
             if backend is None:
-                return self._error(404, f"The model '{req.model}' does not exist or you do not "
-                                   f"have access to it.", param="model", code="model_not_found")
+                return self._no_model(req.model)
             if backend.speech:
                 return self._error(400, f"The model '{req.model}' is a text-to-speech model: send "
                                    f"its input to /v1/audio/speech.", param="model",
@@ -1309,13 +1381,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                 req = parse_speech_request(body, srv.default_speech_model)
             except BackendError as e:
                 return self._backend_error(e)
-            if req.model not in srv.backends and req.model in SPEECH_ALIASES and srv.speech_models:
-                req.model = srv.speech_models[0]
+            if req.model not in srv.backends and req.model in SPEECH_ALIASES and srv.default_speech_model:
+                req.model = srv.default_speech_model
             rec.update(model=req.model, stream=f"{req.response_format}/{req.stream_format}")
             backend = srv.backends.get(req.model)
             if backend is None:
-                return self._error(404, f"The model '{req.model}' does not exist or you do not "
-                                   f"have access to it.", param="model", code="model_not_found")
+                return self._no_model(req.model)
             if not backend.speech:
                 hint = (f"speech models: {', '.join(srv.speech_models)}" if srv.speech_models
                         else "no speech model is served")
@@ -1464,13 +1535,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                     parse_multipart(self.headers.get("Content-Type", ""), raw), srv.default_transcription_model)
             except BackendError as e:
                 return self._backend_error(e)
-            if req.model not in srv.backends and req.model in TRANSCRIPTION_ALIASES and srv.transcription_models:
-                req.model = srv.transcription_models[0]
+            if (req.model not in srv.backends and req.model in TRANSCRIPTION_ALIASES
+                    and srv.default_transcription_model):
+                req.model = srv.default_transcription_model
             rec.update(model=req.model, stream=f"{req.response_format}/{int(req.stream)}")
             backend = srv.backends.get(req.model)
             if backend is None:
-                return self._error(404, f"The model '{req.model}' does not exist or you do not "
-                                   f"have access to it.", param="model", code="model_not_found")
+                return self._no_model(req.model)
             if not backend.transcription:
                 hint = (f"speech-to-text models: {', '.join(srv.transcription_models)}"
                         if srv.transcription_models else "no speech-to-text model is served")
@@ -1831,7 +1902,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--llm-sampler-lib", default=None,
                    help="libsampler.so (default lib/libsampler.so; pure Python if it is missing)")
     g.add_argument("--llm-context", type=int, default=1024,
-                   help="context size for trimming before the library is loaded (it reports its own)")
+                   help="context size for trimming when the engine cannot report its own before it "
+                        "is opened (--llm-fake's; the libraries report theirs: llm_context_size())")
     g.add_argument("--llm-reserve", type=int, default=256,
                    help="answer tokens to keep free when trimming the history (max_tokens if smaller)")
     g.add_argument("--llm-temperature", type=float, default=0.2, help="default temperature (0: greedy)")
@@ -1947,16 +2019,16 @@ def main(argv=None) -> int:
                      resident=args.resident, cma_margin_mb=args.cma_margin_mb, max_body=max_body,
                      ffmpeg=args.ffmpeg or None, interleave=args.interleave)
     try:
-        for mid, b in backends.items():
-            t0 = time.monotonic()
-            b.load_host()
-            if time.monotonic() - t0 > 0.05:
-                log(f"'{mid}': host side ready in {time.monotonic() - t0:.1f} s")
-        srv.load_startup()
+        srv.load_hosts()                       # a backend that fails here or in its startup
+        srv.load_startup()                     # load is dropped; the others are served
     except Exception as e:                                     # noqa: BLE001
         traceback.print_exc()
         log(f"error: loading failed: {e}")
         srv.close_models()
+        srv.server_close()
+        return 1
+    if not srv.backends:
+        log(f"error: no model left to serve ({', '.join(srv.unavailable)} did not start)")
         srv.server_close()
         return 1
 
@@ -1978,8 +2050,9 @@ def main(argv=None) -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     log(f"kv260-chat {VERSION} listening on http://{args.host}:{args.port}/v1  "
-        f"models: {', '.join(m + ('' if srv.loaded[m] else ' (loads on request)') for m in backends)}"
-        f"  resident: {args.resident}  api key: {'required' if args.api_key else 'none'}")
+        f"models: {', '.join(m + ('' if srv.loaded[m] else ' (loads on request)') for m in srv.backends)}"
+        + (f"  not available: {', '.join(srv.unavailable)}" if srv.unavailable else "")
+        + f"  resident: {args.resident}  api key: {'required' if args.api_key else 'none'}")
     sd_notify("READY=1")
     try:
         srv.serve_forever(poll_interval=0.5)

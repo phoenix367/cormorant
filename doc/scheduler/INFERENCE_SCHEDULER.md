@@ -292,7 +292,7 @@ python3 -m venv .venv
 .venv/bin/python inference_scheduler.py --entry decode=test/models/llama_tiny_decode.onnx \
     --entry head=test/models/llama_tiny_head.onnx --out-dir /tmp/multi
 
-# Run the full test suite (1904 tests; test_bert_base.py downloads bertsquad-12 on its first run)
+# Run the full test suite (1915 tests; test_bert_base.py downloads bertsquad-12 on its first run)
 .venv/bin/python -m pytest test/ -v
 ```
 
@@ -1124,14 +1124,16 @@ exponent inputs with the raw ramp; host outputs are compared bit for bit
 `src/llama.py` + `src/llm_nodes.py` (doc/plans/CHAT_PLAN.md §3.2 B1–B2, §12).
 The **frontend** writes fixed-shape ONNX entry graphs directly from a
 checkpoint — `config.json` (layers, hidden, heads, KV heads, head_dim, FFN,
-vocab, RoPE θ, RMSNorm ε, tied embedding) + `model.safetensors` + the
-calibrated formats JSON of `demo/chat/scripts/llm_study.py formats`
+vocab, RoPE θ, RMSNorm ε, tied embedding; parsed by `src/llm_arch.py`, which
+refuses any key the block does not implement) + the safetensors checkpoint
+(`src/checkpoint.py`: one file or shards; `generate_llm_project.py` refuses a
+tensor no graph read) + the calibrated formats JSON of `demo/chat/scripts/llm_study.py formats`
 (exponents per `class@layer`, the sink K / V rows) — with one standard
 `MatMul` per linear (weights `w.l<i>.<q|k|v|o|g|u|d>` = Wᵀ, shared by name
 across entries) and `axi.llm` host ops for the rest; every tensor except
 weights / states is prefixed with the entry name.  Nothing beyond
 config.json is model specific (SmolLM2-360M or another Llama checkpoint is
-a regeneration).  Entries (T rows, C = context incl. the sink):
+a regeneration); a class the formats lack is an error, not a default.  Entries (T rows, C = context incl. the sink):
 
 | entry | inputs | outputs | |
 |---|---|---|---|

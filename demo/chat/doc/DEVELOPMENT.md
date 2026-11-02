@@ -37,6 +37,8 @@ demo/chat/
 │   ├── llm_board.py         — build / install the library on the board, board gate, timings,
 │   │                          per-layer profiles (--profile; --out saves them as profile_layers)
 │   ├── llm_project.py       — shared model / formats loading, library simulation (SimSession)
+│   ├── llm_model.py         — a checkpoint's names (tag, project, board paths, study dir) and
+│   │                          profile (chat / text, sink, end ids, context) from its own files
 │   ├── llm_sched_check.py   — scheduler simulation == study emulation, bit for bit (gate 2)
 │   ├── llm_host_emu.py      — the generated C on the host against software kernels
 │   ├── llm_lib_check.py     — libsmollm2.so through ctypes (runs on the board)
@@ -102,6 +104,10 @@ class MyBackend(Backend):
   streams.
 - **`Finish.info`** is returned under `kv260`; its `log` dict goes to the
   log line.
+- **A backend that cannot start** raises from `load_host()` or `load()`
+  with a message that says why: at startup the server drops that backend
+  alone and serves the others
+  ([A model that fails to start](DEPLOY.md#choosing-the-models)).
 
 Register the backend in `build_backends()` in `kv260_chat_server.py`.  The
 server does the rest: streaming, usage, errors, the queue and disconnects.
@@ -118,7 +124,7 @@ transcript); see `moonshine_backend.py`.
 
 ```bash
 cd demo/chat/tests
-python3 -m unittest -v                  # 280 tests, ~45 s
+python3 -m unittest -v                  # 299 tests, ~45 s
 python3 board_gate.py --url http://<board>:8000/v1     # against a running server
 ```
 
@@ -144,7 +150,10 @@ Server and protocol:
 - `test_protocol.py` — the `chat.completion` / `chat.completion.chunk`
   schema field by field, errors, the FIFO queue and its timeout, and
   disconnects (streaming, non-streaming, while queued), with a fake
-  backend.
+  backend.  A backend whose host side or startup load fails is dropped:
+  left out of `/v1/models`, listed under `/health`'s `unavailable`, 503
+  with the reason, never loaded or evicted again (`--resident one` /
+  `auto` / `all`), exit 1 when none is left.
 
 Document Q&A:
 - `test_squad_text.py` — sliding windows, max-context flags and
@@ -169,13 +178,19 @@ Generative chat:
   - C equals Python, token for token.
 - `test_smollm2_backend.py` — the backend against `tests/fake_llm.py`
   (scripted logits) and `tests/fake_libsmollm2.c` (the same library
-  contract as a C library, through the real ctypes binding).  It covers:
+  contract as a C library, its sizes compile-time constants as the real
+  libraries', through the real ctypes binding).  It covers:
   - the streaming schema;
   - multi-turn prefix reuse: exactly the new tokens are prefilled, the
     sink never;
   - stop strings across tokens, `max_tokens`, cancellation, a full
     context and trimming;
   - UTF-8 across tokens, seeds and parameters, library errors;
+  - the library and the tokenizer: a padded vocabulary (more rows than
+    tokens) never sampled or reported, a smaller one refused, the context
+    known before the model is opened, the end-of-generation ids (none of
+    them found: refused); every backend's `cma_mb` fallback is the
+    server's default;
   - residency: `one` / `auto` / `all` switching between `bert-squad` and
     `smollm2`, with fake engines and a fake CMA pool.
 - `test_stories_backend.py` — stories15m: the Llama tokenizer against 520
@@ -186,6 +201,9 @@ Generative chat:
   over a scripted engine and over `fake_libsmollm2.c` through
   `build_backends`; `POST /v1/completions` (schema, `echo`, streaming,
   OpenAI's default `max_tokens`, refused fields, a chat model's 400).
+- `test_llm_model.py` — a checkpoint's names and profile (`scripts/llm_model.py`)
+  from SmolLM2-, stories15m-, Llama-3- and template-file-shaped checkpoints;
+  `llm_study.Profile` refusing a template other than ChatML.
 - `test_llm_calibrate.py` — the calibration tool.
   - `llm_models.json`'s schema.
   - Verified downloads and fetch, with file:// standing in for Hugging

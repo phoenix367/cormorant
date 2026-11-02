@@ -63,7 +63,8 @@ def check(project, items, lib_ids, pix, res, logits_path, decode, log=print):
     m = vp.load(summary["assets"], tp, vpth)
     fe_t, fe_v = vp.frontends(m, ctx=summary["context"], name=summary["model"],
                               decode_attn=summary.get("decode_attn", "host"),
-                              vsmx=summary.get("vsmx", False))
+                              vsmx=summary.get("vsmx", False), rowops=summary.get("rowops"),
+                              drope=summary.get("drope"))     # the project's policy (llm_board.check_logits)
     cgs = vp.make_codegens(fe_t, fe_v, summary["buckets"])
     raw = np.fromfile(logits_path, "<f4").reshape(-1, m.tcfg.V)
     rep, k = {}, 0

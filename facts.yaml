@@ -883,6 +883,11 @@ facts:
     - {file: demo/chat/deploy.py, regex: 'moonshine-base/tokenizer.json"\), \("cma_mb", (?P<moonshine>\d+)\)'}
     - {file: demo/chat/deploy.py, regex: '\("model_id", None\), \("cma_mb", (?P<stories15m>\d+)\),\n\s+\("tokenizer", "assets/stories15m'}
     - {file: demo/chat/stories_backend.py, regex: '^    cma_mb = (?P<stories15m>\d+)\.0$'}
+    # the other backends' own fallbacks (used when the server passes none)
+    - {file: demo/chat/smollm2_backend.py, regex: '^    cma_mb = (?P<smollm2_135m>\d+)\.0 '}
+    - {file: demo/chat/smolvlm_backend.py, regex: '^    cma_mb = (?P<smolvlm_256m>\d+)\.0 '}
+    - {file: demo/chat/piper_backend.py, regex: 'cma_mb: float = (?P<piper>\d+)\.0, model_id'}
+    - {file: demo/chat/moonshine_backend.py, regex: 'cma_mb: float = (?P<moonshine>\d+)\.0, model_id'}
     - {file: demo/chat/chat_config.json.example, dotall: true, regex: '"stories15m": \{[^}]*?"cma_mb": (?P<stories15m>\d+)'}
     - {file: demo/chat/kv260_chat_server.py, regex: 'stories15m ~(?P<stories15m>\d+) MB$'}
     - {file: demo/chat/doc/DEPLOY.md, regex: '^\| stories15m \| [\d.]+ MiB \| (?P<stories15m>\d+) \|'}
